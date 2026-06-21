@@ -1413,7 +1413,7 @@ fn init_object_header(ptr: *mut u8, class_id: ClassId, num_fields: usize, identi
 }
 
 /// Shared-heap allocation path (with lock). Used for TLAB misses and large objects.
-fn alloc_object_shared(
+pub(crate) fn alloc_object_shared(
     shared: &SharedVm,
     thread: &mut JvmThread,
     class_id: ClassId,
@@ -7800,6 +7800,360 @@ fn resume_from_ir_deopt(
     }
     push_frame_and_fire_entry(thread, frame);
     Some(CachedCallResult::FramePushed)
+}
+
+/// real-frame-deopt Step 3 — Object-aware sibling of `ir_deopt_frame_values`.
+/// Maps reconstructed `FrameValue`s to interpreter `Value`s INCLUDING object
+/// references; refuses (returns `None`) on any variant the clean Step-3 pilot
+/// must not fabricate: `Float`, the unresolved machine forms
+/// (`Register`/`StackSlot`/`StackSlotRef` — these are resolved by the jit-crate
+/// `x64_deopt_entry` before stashing and must never reach the sink),
+/// `VirtualObject`/`VirtualObjectRef` (scalar-replaced; Steps 5-6), and
+/// `Unsupported` (the cat-2 `long`/`double` sentinel — never fabricate a cat-2
+/// slot). `Object(addr)` → `Value::Object(Some(ObjectRef::from_raw))` (or null
+/// for `addr == 0`); `Int`/`Undefined` map exactly as the int-only path.
+fn ir_deopt_frame_values_with_objects(
+    vals: &[cratonvm_jit::deopt::FrameValue],
+) -> Option<Vec<Value>> {
+    use cratonvm_jit::deopt::FrameValue;
+    vals.iter()
+        .map(|v| match v {
+            FrameValue::Int(i) => Some(Value::Int(*i as i32)),
+            FrameValue::Undefined => Some(Value::Int(0)),
+            FrameValue::Object(addr) => {
+                let obj = if *addr == 0 {
+                    None
+                } else {
+                    // SAFETY: `addr` is a live heap object address captured in
+                    // the deopt frame by `x64_deopt_entry`; `from_raw` only
+                    // debug-asserts non-null / alignment.
+                    Some(unsafe { ObjectRef::from_raw(*addr as usize as *mut u8) })
+                };
+                Some(Value::Object(obj))
+            }
+            // Cat-2 / unresolved / virtual / FP — bail to the safe re-run path.
+            _ => None,
+        })
+        .collect()
+}
+
+/// real-frame-deopt Step 3 — build the interpreter `Frame` for an Object-bearing
+/// deopt, GC-rooting the reconstructed oops across the pool refill. Returns the
+/// built `Frame` (NOT pushed onto `thread.frames`) with the oops still pinned in
+/// `thread.native_pin_roots` above the caller's watermark — the CALLER must
+/// `native_pin_roots.truncate(pin_base)` after discarding the frame (the
+/// wrapper [`build_validate_discard_ir_deopt`] does this unconditionally).
+/// `None` if the frame is out-of-scope (inlined caller chain / held monitors) or
+/// carries an unmappable slot (cat-2/Unsupported/virtual/FP/unresolved).
+///
+/// GC-rooting: the oops are pinned BEFORE `refill_pools_from_shared` (whose
+/// `acquire()` may GC). While pinned they are scanned (`memory/roots.rs`) and
+/// forwarded in place by a moving collector (`memory/gc.rs`); after refill each
+/// oop is RE-READ from its (forwarded) pin slot into the frame, so the frame
+/// never holds a stale pre-GC address. NO JVM allocation occurs between the
+/// re-read and the return (`Frame::new_pooled` / `ValueStack::push` are
+/// Rust-side only), so no GC can stale the built frame. `stress` forces a GC
+/// immediately before refill — the ONLY sanctioned injection point — to
+/// exercise the forward-in-place path (tests / `CRATONVM_GC_STRESS`).
+fn build_deopt_frame_inner(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    cached: &Arc<CachedBytecodeMethod>,
+    rframe: &cratonvm_jit::deopt::ReconstructedFrame,
+    stress: bool,
+) -> Option<crate::runtime::frame::Frame> {
+    // Phase-A scope: single non-inlined frame, no held monitors (same guard as
+    // `resume_from_ir_deopt`).
+    if !rframe.caller_frames.is_empty() || !rframe.monitors.is_empty() {
+        return None;
+    }
+    let locals = ir_deopt_frame_values_with_objects(&rframe.locals)?;
+    let stack_vals = ir_deopt_frame_values_with_objects(&rframe.stack)?;
+
+    // ROOT the reconstructed oops BEFORE the GC-capable refill (locals then
+    // stack — the order the re-read below relies on).
+    let pin_base = thread.native_pin_roots.len();
+    for v in locals.iter().chain(stack_vals.iter()) {
+        if let Value::Object(Some(obj)) = v {
+            thread.native_pin_roots.push(*obj);
+        }
+    }
+
+    // Stress hook: the ONLY sanctioned GC injection point — before refill, while
+    // every reconstructed oop is pinned (a GC after the re-read would stale the
+    // unrooted `*_fwd` vecs / the un-pushed frame; there is none, by construction).
+    if stress {
+        maybe_gc_forced_pub(shared, thread);
+    }
+
+    thread.refill_pools_from_shared(
+        &shared.operand_stack_pool,
+        &shared.tag_pool,
+        cached.max_locals as usize,
+        (cached.max_stack as usize).max(16) + 8,
+    );
+
+    // Re-read each oop from its (possibly forwarded) pin slot, in push order, so
+    // the frame carries the current address, never the stale `Object(u64)`.
+    let mut k = pin_base;
+    let mut locals_fwd = Vec::with_capacity(locals.len());
+    for v in &locals {
+        match v {
+            Value::Object(Some(_)) => {
+                let fwd = thread.native_pin_roots[k];
+                k += 1;
+                locals_fwd.push(Value::Object(Some(fwd)));
+            }
+            other => locals_fwd.push(*other),
+        }
+    }
+    let mut stack_fwd = Vec::with_capacity(stack_vals.len());
+    for v in &stack_vals {
+        match v {
+            Value::Object(Some(_)) => {
+                let fwd = thread.native_pin_roots[k];
+                k += 1;
+                stack_fwd.push(Value::Object(Some(fwd)));
+            }
+            other => stack_fwd.push(*other),
+        }
+    }
+
+    // Build the Frame as a LOCAL (never pushed onto thread.frames), so the
+    // subsequent re-run sees identical interpreter state after it is discarded.
+    let mut frame = crate::runtime::frame::Frame::new_pooled(
+        cached.declaring_class_id,
+        cached.class_name.clone(),
+        cached.method_name.clone(),
+        cached.method_descriptor.clone(),
+        cached.source_file.clone(),
+        cached.code.clone(),
+        cached.exception_table.clone(),
+        cached.max_stack,
+        cached.max_locals,
+        &locals_fwd,
+        &mut thread.locals_pool,
+        &mut thread.stacks_pool,
+    );
+    for v in &stack_fwd {
+        // A clean pilot never overflows the padded stack. If it somehow did,
+        // recycle the frame's pooled buffers before bailing — `Frame` has no
+        // `Drop` impl (recycling is explicit), so a plain `?`-return would leak
+        // them. The caller then releases the pins and re-runs.
+        if frame.stack.push(*v).is_err() {
+            frame.recycle(&mut thread.locals_pool, &mut thread.stacks_pool);
+            return None;
+        }
+    }
+    frame.pc = rframe.bci as usize;
+    Some(frame)
+}
+
+/// real-frame-deopt Step 4 — RESUME a real (Object-bearing) deopt at the trapping
+/// bci instead of re-running the whole method from entry (the payoff that kills
+/// the side-effect double-execution).
+///
+/// Builds the interpreter `Frame` from the reconstructed locals/stack (oops
+/// GC-rooted across the pool refill — see [`build_deopt_frame_inner`]), then
+/// PUSHES it onto `thread.frames` so the interpreter resumes there.
+///
+/// The GC-rooting HANDOFF is the load-bearing invariant: the temporary
+/// `native_pin_roots` pins are held ACROSS `push_frame_and_fire_entry` (which may
+/// fire entry hooks that allocate / GC) and released only AFTER the push — once
+/// pushed, the frame's locals/stack are themselves GC roots (scanned by the
+/// normal interpreter-frame root walk), so the reconstructed oops are rooted by
+/// the pins, then by BOTH pins and frame, then by the frame alone, with no
+/// unrooted window. Returns `Some(FramePushed)` on a clean resume, or `None`
+/// (re-run) for an out-of-scope / unmappable frame — releasing any partial pins
+/// in both cases.
+///
+/// Gated by `CRATONVM_DEOPT_REAL` at the sink; the pre-existing
+/// `CRATONVM_IR_DEOPT_RESUME` int-only path (`resume_from_ir_deopt`) runs first
+/// and is left intact.
+fn resume_real_ir_deopt(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    cached: &Arc<CachedBytecodeMethod>,
+    rframe: &cratonvm_jit::deopt::ReconstructedFrame,
+) -> Option<CachedCallResult> {
+    let pin_base = thread.native_pin_roots.len();
+    match build_deopt_frame_inner(shared, thread, cached, rframe, false) {
+        Some(frame) => {
+            // Push FIRST, pins STILL installed: during the push the oops are
+            // rooted by the pins, and once pushed also by the frame. Only THEN
+            // release the pins — the frame roots them from here on.
+            push_frame_and_fire_entry(thread, frame);
+            thread.native_pin_roots.truncate(pin_base);
+            Some(CachedCallResult::FramePushed)
+        }
+        None => {
+            // Out-of-scope / unmappable: release any partial pins, fall back to
+            // the whole-method re-run.
+            thread.native_pin_roots.truncate(pin_base);
+            None
+        }
+    }
+}
+
+#[cfg(test)]
+mod deopt_step3_tests {
+    use super::*;
+    use crate::config::VmConfig;
+    use crate::threading::jvm_thread::ThreadId;
+    use cratonvm_jit::deopt::{FrameValue, ReconstructedFrame};
+    use std::sync::Arc;
+
+    fn minimal_cached() -> Arc<CachedBytecodeMethod> {
+        Arc::new(CachedBytecodeMethod {
+            declaring_class_id: cratonvm_types::ClassId::new(0),
+            class_name: Arc::from("T"),
+            method_name: Arc::from("m"),
+            method_descriptor: Arc::from("()V"),
+            source_file: None,
+            code: Arc::from(&[0xb1u8][..]), // return
+            exception_table: Arc::from(Vec::new().into_boxed_slice()),
+            max_stack: 8,
+            max_locals: 4,
+            num_params: 0,
+            is_synchronized: false,
+            is_static: true,
+        })
+    }
+
+    fn rframe(locals: Vec<FrameValue>, stack: Vec<FrameValue>, bci: u32) -> ReconstructedFrame {
+        ReconstructedFrame {
+            method_key: "T.m".to_string(),
+            bci,
+            locals,
+            stack,
+            monitors: Vec::new(),
+            caller_frames: Vec::new(),
+        }
+    }
+
+    /// Pure mapper: Int/Undefined/Object map; cat-2 `Unsupported` + virtual bail.
+    #[test]
+    fn maps_int_and_object_refuses_cat2_and_virtual() {
+        let got = ir_deopt_frame_values_with_objects(&[
+            FrameValue::Int(42),
+            FrameValue::Undefined,
+            FrameValue::Object(0x1000),
+            FrameValue::Object(0),
+        ]);
+        assert_eq!(
+            got,
+            Some(vec![
+                Value::Int(42),
+                Value::Int(0),
+                Value::Object(Some(unsafe { ObjectRef::from_raw(0x1000usize as *mut u8) })),
+                Value::Object(None),
+            ])
+        );
+        assert!(ir_deopt_frame_values_with_objects(&[FrameValue::Unsupported]).is_none());
+        assert!(ir_deopt_frame_values_with_objects(&[FrameValue::VirtualObjectRef(0)]).is_none());
+    }
+
+    /// Build a frame with an Int local, a real Object local, and an Int on the
+    /// operand stack; assert the built frame's locals/stack/pc.
+    #[test]
+    fn builds_int_and_object_frame() {
+        let shared = Arc::new(SharedVm::new(VmConfig::default()));
+        let mut thread = JvmThread::new(ThreadId(0), "test");
+        let cached = minimal_cached();
+
+        let obj = shared.heap.alloc_object(cratonvm_types::ClassId::new(7), 0);
+        let addr = obj.as_ptr() as usize as u64;
+        let rf = rframe(
+            vec![FrameValue::Int(42), FrameValue::Object(addr)],
+            vec![FrameValue::Int(7)],
+            5,
+        );
+
+        let pin_base = thread.native_pin_roots.len();
+        let frame = build_deopt_frame_inner(&shared, &mut thread, &cached, &rf, false)
+            .expect("clean pilot must build");
+        assert_eq!(frame.pc, 5);
+        assert_eq!(frame.get_local(0), Value::Int(42));
+        assert!(matches!(frame.get_local(1), Value::Object(Some(_))));
+        assert_eq!(frame.stack.len(), 1);
+        assert_eq!(frame.stack.peek_at(0), Value::Int(7));
+        drop(frame);
+        thread.native_pin_roots.truncate(pin_base);
+    }
+
+    /// An unmappable (cat-2 `Unsupported`) slot bails to `None` (re-run) and
+    /// leaks no pins / pushes no frame.
+    #[test]
+    fn refuses_unmappable_without_leaking_pins() {
+        let shared = Arc::new(SharedVm::new(VmConfig::default()));
+        let mut thread = JvmThread::new(ThreadId(0), "test");
+        let cached = minimal_cached();
+        let rf = rframe(vec![FrameValue::Unsupported], vec![], 0);
+        assert!(resume_real_ir_deopt(&shared, &mut thread, &cached, &rf).is_none());
+        assert_eq!(thread.native_pin_roots.len(), 0);
+        assert_eq!(thread.frames.len(), 0);
+    }
+
+    /// Step-4 GC-rooting HANDOFF — the load-bearing invariant: after
+    /// `resume_real_ir_deopt` pushes the frame and releases the temporary pins,
+    /// a forced GC must STILL find the reconstructed oop — via the PUSHED FRAME
+    /// (its locals are the root now), not the released pins. A handoff mistake
+    /// here would be a production UAF under the gate.
+    #[test]
+    fn resumed_frame_roots_oops_after_pin_release() {
+        let shared = Arc::new(SharedVm::new(VmConfig::default()));
+        let mut thread = JvmThread::new(ThreadId(0), "test");
+        let cached = minimal_cached();
+        let obj = shared.heap.alloc_object(cratonvm_types::ClassId::new(7), 0);
+        let addr = obj.as_ptr() as usize as u64;
+        let rf = rframe(vec![FrameValue::Object(addr)], vec![], 3);
+
+        let pin_base = thread.native_pin_roots.len();
+        let r = resume_real_ir_deopt(&shared, &mut thread, &cached, &rf)
+            .expect("clean pilot must resume");
+        assert!(matches!(r, CachedCallResult::FramePushed));
+        // Pins released after the push; the pushed frame is the sole root now.
+        assert_eq!(thread.native_pin_roots.len(), pin_base);
+        assert_eq!(thread.frames.len(), 1);
+
+        // Force a GC: the oop must survive via the pushed frame (and be forwarded
+        // in place under a moving collector).
+        maybe_gc_forced_pub(&shared, &mut thread);
+
+        let frame = thread.frames.last().expect("resumed frame is on the stack");
+        assert_eq!(frame.pc, 3);
+        match frame.get_local(0) {
+            Value::Object(Some(o)) => {
+                assert_eq!(shared.heap.class_id_of(o), cratonvm_types::ClassId::new(7));
+            }
+            other => panic!("local 0 must survive GC via the pushed frame, got {other:?}"),
+        }
+    }
+
+    /// The reconstructed Object survives a forced GC during the build (rooted via
+    /// `native_pin_roots`); the built frame holds the live (forwarded) ref.
+    #[test]
+    fn object_survives_forced_gc_during_build() {
+        let shared = Arc::new(SharedVm::new(VmConfig::default()));
+        let mut thread = JvmThread::new(ThreadId(0), "test");
+        let cached = minimal_cached();
+
+        let obj = shared.heap.alloc_object(cratonvm_types::ClassId::new(7), 0);
+        let addr = obj.as_ptr() as usize as u64;
+        let rf = rframe(vec![FrameValue::Object(addr)], vec![], 0);
+
+        let pin_base = thread.native_pin_roots.len();
+        let frame = build_deopt_frame_inner(&shared, &mut thread, &cached, &rf, /* stress */ true)
+            .expect("must build under a forced GC");
+        match frame.get_local(0) {
+            Value::Object(Some(o)) => {
+                assert_eq!(shared.heap.class_id_of(o), cratonvm_types::ClassId::new(7));
+            }
+            other => panic!("local 0 must be a live object, got {other:?}"),
+        }
+        drop(frame);
+        thread.native_pin_roots.truncate(pin_base);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -19577,6 +19931,19 @@ fn execute_jit_call(
         if let Some(rframe) = cratonvm_jit::deopt::take_last_deopt() {
             if ir_deopt_resume_enabled() {
                 if let Some(r) = resume_from_ir_deopt(shared, thread, cached, &rframe) {
+                    return Ok(r);
+                }
+            }
+            // real-frame-deopt Step 4: under CRATONVM_DEOPT_REAL, RESUME the
+            // Object-bearing deopt at the trapping bci — build the interpreter
+            // frame (GC-rooting the oops across the pool refill AND the push
+            // handoff), push it, and resume there instead of re-running the whole
+            // method from entry. On an out-of-scope / unmappable frame this
+            // returns None and falls through to the re-run below. Gate-OFF
+            // (default): skipped → byte-identical; the int-only
+            // CRATONVM_IR_DEOPT_RESUME path above is untouched.
+            if cratonvm_jit::deopt_real_enabled() {
+                if let Some(r) = resume_real_ir_deopt(shared, thread, cached, &rframe) {
                     return Ok(r);
                 }
             }

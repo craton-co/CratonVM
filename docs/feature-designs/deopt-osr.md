@@ -319,6 +319,125 @@ only); the **new** work in *this* doc is Steps 5–9.
    threshold is made not-entrant and the next call re-enters cleanly (no use of
    freed boxes); `DeoptimizationLog` reports the rate. *Risk:* med.
 
+## Progress (branch `feat/deopt-osr-scaffolding`)
+
+Landed and build-verified (`cargo check -p cratonvm-jit` + `-p cratonvm-vm`
+green; `cargo test -p cratonvm-vm --lib deopt_materialize` = 3 passed) on the
+feature branch. All additive and gated **unreachable in production**
+(`can_deopt_resume` stays `false`, so nothing resumes / OSR-exits yet):
+
+- **Scaffolding (partial).** `CompiledMethod` gains `can_deopt_resume` /
+  `can_osr_exit` / `compilation_epoch` (default `false`/`false`/`0`);
+  `DeoptReason::OsrExit`; the read-once `CRATONVM_DEOPT_REAL` /
+  `CRATONVM_DEOPT_VERIFY` gates (`jit::deopt_real_enabled` /
+  `deopt_verify_enabled`).
+- **Steps 5+6 — virtual-object re-materialization (two-phase, cycle-safe).** New
+  `vm/src/runtime/deopt_materialize.rs`: `TempRootScope` (RAII temporary GC-root
+  set over the thread's `native_pin_roots`) + `materialize_virtual_objects`.
+  *Phase 1* allocates + header-inits + **immediately-roots** a shell for every
+  distinct virtual object (by `VirtualObjectState::id`) reachable from the frame,
+  reading shell addresses back from the in-place-forwarded pin set after the
+  optional stress GC (correct under a moving collector). *Phase 2* fills each
+  shell's fields — primitive / already-real `Object` / nested `VirtualObject` /
+  `VirtualObjectRef` — GC-barrier-correct like `putfield` (SATB pre + post card
+  barrier), resolving shared/cyclic references via the Phase-1 shell map, then
+  rewrites the frame's top-level slots to real `Object`s. To make sharing/cycles
+  representable (the whole point of two-phase), the jit deopt model gained
+  `VirtualObjectState::id` + `FrameValue::VirtualObjectRef(id)`. The jit-crate
+  `materialize_virtual_objects` panic stub points here. Acceptance tests (live
+  VM): `shells_materialize_and_survive_forced_gc` (N shells survive a forced GC
+  while pinned), `materializes_primitive_and_object_fields` (field stores + frame
+  rewrite), `materializes_two_object_cycle` (A↔B materializes with the
+  cross-references wired, under stress GC).
+
+- **x64 deopt-exit Step 1 (companion `real-frame-deopt-x64-backport.md`).** The
+  production single-pass x64 backend now records a precise deopt-exit snapshot at
+  the speculative-BCE loop-header guard: `Compiler.{deopt_points,deopt_boxes}` +
+  `emit_deopt_snapshot_at_guard(bci)` (builds a `FrameState` from regalloc
+  provenance — `Register` / `StackSlot` / `StackSlotRef` via the pure, unit-tested
+  `frame_value_for_slot`, plus the positive oop source
+  `local_oop_masks`/`local_oop_reached`/`stack_oop_marks`), transferred to
+  `CompiledMethod` at finalize. EMIT-AND-DISCARD and verified inert:
+  `find_deopt_point` / `deopt_points` have no live-path consumer, so the
+  `i64::MIN` re-run is unchanged. The primitive width/type source and
+  register-resident-oop typing are deferred (gated later by `can_deopt_resume`).
+
+- **x64 deopt-exit Step 2 — in-stub 3-arg trampoline (stash-only).** `x64_deopt_entry`
+  (jit `deopt.rs`) mirrors `ir_deopt_entry` but takes the spilled 16-GPR file, so
+  `FrameValue::Register(r)` resolves against the **live** register `r` (vs the IR
+  path's default-zeros). It stashes `LAST_DEOPT` and returns `i64::MIN` — **no**
+  `set_jit_deopt_pending` (the interpreter sink's `take_last_deopt()`-keyed block
+  runs first and clears it), so the entry has no vm dependency and lives in the
+  jit crate, baked directly by the stub (no `jit-api`/helper-pointer change). The
+  frame-deopt stub (in `emit_deopt_stubs`, gated `deopt_real_enabled() && reason==2`)
+  spills RAX..R15 into a 128-byte `SavedRegisters` region reserved in the frame
+  (`deopt_regs_base`), sets the 3 args (Win RCX/RDX/R8, SysV RDI/RSI/RDX), CALLs
+  the entry **before** the epilogue, returns the sentinel. Gate OFF (default) ⇒
+  `deopt_regs_size=0` + the uncommon-trap path emits byte-identically. Designed via
+  an Understand→adversarial-Verify workflow (the keying, spill-order, and
+  ordering were the load-bearing risks). Verified: `x64_deopt_entry` unit tests
+  (Register-resolution + null-safety) pass; full jit suite green except a
+  PRE-EXISTING dev crash (`intrinsic_arraycopy`, filed separately) — no regression,
+  gate-off byte-identical. STASH ONLY — no resume (Step 4); the emitted stub's
+  end-to-end execution is not yet driven by a runtime test (needs a BCE compile+invoke
+  harness — folds into the Step-4 resume test).
+
+- **x64 deopt-exit Step 3 — build + validate the interpreter Frame at the sink
+  (no resume).** At the interpreter deopt sink, under `CRATONVM_DEOPT_REAL`, the
+  stashed `ReconstructedFrame` is now turned into a real interpreter `Frame`:
+  `ir_deopt_frame_values_with_objects` maps Int + **Object** refs (refusing
+  cat-2/`Unsupported`/virtual/FP/unresolved → re-run); `build_deopt_frame_inner`
+  GC-roots the reconstructed oops in `native_pin_roots` **before**
+  `refill_pools_from_shared` (whose `acquire()` may GC), **re-reads** each oop
+  from its forwarded pin slot after refill (moving-GC correct), builds the Frame
+  via `Frame::new_pooled` at the trapping bci, and returns it; the wrapper
+  `build_validate_discard_ir_deopt` discards it and STILL re-runs (CacheMiss) —
+  a live soak of the reconstruction/rooting/build machinery, no resume yet.
+  Designed via an Understand→adversarial-Verify workflow whose GC-rooting
+  reviewer caught the real bugs (cache-forwarded-ref staleness → re-read from
+  pins + stress-GC only before refill; `debug_assert` pin-leak → single
+  guaranteed truncate, validation moved to tests). Gate-OFF (default):
+  byte-identical (the build is inside `if deopt_real_enabled()`; the existing
+  `CRATONVM_IR_DEOPT_RESUME` int-resume path is untouched). Verified: 4 unit
+  tests pass (mapper; refuse-unmappable-without-pin-leak; build int+object frame;
+  **Object survives a forced GC during the build**); vm lib compiles green, no
+  new warnings; `memory::roots` tests pass in isolation (the full-suite failures
+  are pre-existing parallel-test pollution, surfaced only because the `oscache`
+  compile-break — `task_f849e93a` — was temp-patched to run the suite, and reverted).
+
+- **x64 deopt-exit Step 4 — FLIP THE RESUME.** The payoff: under `CRATONVM_DEOPT_REAL`
+  the sink now RESUMES an Object-bearing deopt at the trapping bci
+  (`resume_real_ir_deopt`: build the frame → `push_frame_and_fire_entry` →
+  return `FramePushed`) instead of re-running the whole method from entry —
+  killing the side-effect double-execution. The load-bearing **GC-rooting
+  handoff**: the temporary `native_pin_roots` pins are held ACROSS the push (so
+  the oops are rooted by the pins, then by both pins and frame) and released only
+  AFTER the frame is on `thread.frames` (its locals/stack are then GC roots), so
+  there is no unrooted window. Designed via an Understand→adversarial-Verify
+  workflow whose 3 reviewers (GC-handoff/UAF, sink control-flow, gate/re-entrancy)
+  each independently returned **"ship as-is"** — confirming no unrooted window,
+  consistent moving-GC forwarding, correct skip-of-saved-args on resume
+  (the args are re-homed in the resumed frame's locals), two default-off gates,
+  no int-path overlap, no stale `LAST_DEOPT`. The one non-blocking finding (a
+  pooled-buffer leak on the unreachable `.ok()?` bail) is hardened
+  (`frame.recycle` before bail). Gate-OFF (default): byte-identical. Verified: 5
+  unit tests pass, incl. the load-bearing **`resumed_frame_roots_oops_after_pin_release`**
+  (force a GC AFTER push+pin-release → the oop survives via the pushed frame).
+  STILL OWED: the end-to-end BCE compile→invoke runtime test (drive the Step-2
+  stub → `x64_deopt_entry` → sink for real) is infra-blocked — the jit crate's
+  `#[cfg(feature="vm-tests")]` tests reference a non-existent `crate::vm::SharedVm`
+  (can't compile), and the gate override doesn't cross the jit↔vm boundary; it
+  needs a `pub` (non-`cfg(test)`) override + a cratonvm_gc-direct array, or a full
+  vm-crate invoke. The resume *correctness* (the UAF-risk) is unit-tested +
+  3-way adversarially verified; only the through-the-JIT execution path is unproven.
+
+Not yet done: the **end-to-end BCE runtime test** (above); x64 deopt-exit **Steps 5-6**
+of the backport (coverage-gate `can_deopt_resume` finalize + eager-deopt
+`CRATONVM_DEOPT_VERIFY` differential verifier, widen guards beyond the BCE pilot);
+deopt-osr **Step 7+** (OSR-exit map emission + flip) + the x64
+`emit_osr_exit_map_at` / `osr_exit_points` scaffolding; and wiring
+`materialize_virtual_objects` into the resume path (resume virtual-bearing frames).
+
 ## Risks & open questions
 
 - **GC during materialization (Step 5/6).** A GC between shell allocations with
