@@ -1593,6 +1593,61 @@ Both are long-only, so inert for the int path.
 `lshl`/`lshr`/`lushr`/`land`/`lor`/`lxor`; `ldiv`/`lrem` (long deopt-resume);
 then `double`/`float` (XMM); then long/double call args + returns.
 
+## Increment 27 (long sub-slice — shifts/bitwise + `lcmp`/branches) landed
+
+Status: **landed** on `dev`, under **`CRATONVM_JIT_IR_LONG`** (default-OFF). Adds
+the long compare/shift/bitwise opcodes, so long methods with comparisons,
+branches, and loops take the IR path. (Numbered 27 on the long track; the
+concurrent virtual-dispatch work independently also used "Increment 26" for
+`invokevirtual`/`invokeinterface` — a harmless parallel-authoring artifact.)
+
+**What landed**
+- **`jit/src/ir.rs`** — builder arms for `lshl`(0x79)/`lshr`(0x7b)/`lushr`(0x7d)
+  → `Op::Shl`/`Shr`/`UShr` typed `Long` (the lowerer is already width-aware: the
+  x86 64-bit shift masks the count to 6 bits, exactly `lshl`'s `count & 0x3f`),
+  `land`(0x7f)/`lor`(0x81)/`lxor`(0x83) → `Op::And`/`Or`/`Xor` typed `Long` (those
+  are already 64-bit), and `lcmp`(0x94) → a **new `Op::LCmp`** (3-way signed
+  compare of two longs → int {-1,0,1}). All are 1-byte opcodes (the length
+  walkers' default arm sizes them). `Op::LCmp` feeds the existing `if<cond>`
+  arm unchanged (`lcmp; iflt` ⇒ `a < b`).
+- **`jit/src/ir_lower.rs`** — `Op::LCmp` lowers to a 64-bit `CMP` + signed
+  `SETG`/`SETL` + `(a>b) − (a<b)`, sign-extended to 64 bits so a 32- or 64-bit
+  consumer both read the {-1,0,1} correctly.
+- **`jit/src/ir.rs` (phi typing fix)** — long/double merge & loop-carried
+  `Op::Phi` nodes are now typed from their inputs (`phi_data_type`) instead of
+  the historical hardcoded `Int`. **This closes a latent hole the inc-26
+  adversarial review found**: codegen was already correct (phi copies are
+  unconditionally 64-bit; consumers use their own `ty`), but `frame_value_for`
+  reads the phi's own type and would truncate a long to 32 bits on a deopt-frame
+  resume. Masked today (long-eligible methods have no deopt point and
+  `ir_deopt_entry` is unwired), but inc-27's long branches make long phis common,
+  so it is fixed now. Scoped to category-2 to avoid perturbing `Ref`/`Float` phis;
+  codegen-neutral.
+
+No gate change: these opcodes already trip `method_uses_category2`, so they were
+already admitted by `ir_emit_long` (double/float- and int-div-free); they just
+needed builder support. Unhandled long opcodes (`ldiv`/`lrem`, wide `iload`)
+still bail to single-pass.
+
+**Tests** — `jit/tests/ir_vs_singlepass.rs` (IR == single-pass == host, full i64):
+`ir_vs_singlepass_long_shifts` (lshl/lshr/lushr, count masked to 6 bits, incl.
+`i64::MIN`), `…_long_bitwise` (land/lor/lxor), `…_long_lcmp_branch` (lcmp + `ifge`
+long-min), and `…_long_loop_phi_lcmp` (a long accumulator loop with a long-fed
+condition — `lcmp` + a backward long branch + a **long loop phi** + wide
+`lload`/`lstore`, all together). jit lib **820/820**, differential **38/38**,
+`cratonvm-vm` builds clean.
+
+**Live soak** (`CRATONVM_JIT_IR_LONG` toggled): `scratch/irlong/IrLong3.java`
+(`mix` — shifts + bitwise + `ldc2_w` + `lcmp` min; `acc` — a `lcmp`-conditioned
+long accumulator loop) == HotSpot (`540002100000`) gate-ON and gate-OFF, both
+methods take the IR path (`CRATONVM_DBG_IR_LONG`, 2 emit lines). No regression:
+the inc-25 `IrLong` and inc-26 `IrLong2` probes still == HotSpot with the gate
+on, and bt10/14/16/18 == HotSpot.
+
+**Remaining long sub-slices**: `ldiv`/`lrem` (need the long deopt-resume — and
+the `i64::MIN`-return/sentinel collision, both spun off as separate tasks); then
+`double`/`float` (XMM); then long/double *call* args + returns.
+
 ## Implementation steps (ordered)
 
 1. **φ/branch lowering repro + fix** (Front 1.1) — unblocks everything.
