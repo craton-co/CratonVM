@@ -14,7 +14,7 @@
 #![allow(dead_code)]
 
 use std::cell::Cell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::CStr;
 use std::os::raw::c_char;
 use std::sync::Arc;
@@ -81,6 +81,71 @@ pub const JNI_FUNCTION_COUNT: usize = 234;
 pub const JNI_INVOKE_FUNCTION_COUNT: usize = 8;
 
 // ---------------------------------------------------------------------------
+// Descriptor cache (bounded LRU)
+// ---------------------------------------------------------------------------
+
+/// Maximum number of parsed descriptors retained in the thread-local cache.
+const DESCRIPTOR_CACHE_CAPACITY: usize = 1024;
+
+/// A small bounded LRU cache for parsed method descriptors.
+///
+/// Previously this was a plain `HashMap` capped at [`DESCRIPTOR_CACHE_CAPACITY`]
+/// that was `clear()`ed wholesale once full, which caused a periodic full-flush:
+/// every entry — including hot, frequently-reused descriptors — was discarded at
+/// once, re-incurring a parse storm. This LRU instead evicts only a single
+/// (least-recently-used) entry when at capacity, so hot descriptors survive.
+///
+/// Recency is tracked with a monotonic tick stamped on each access. The eviction
+/// scan is O(n) but runs only on insertion-while-full, not on every lookup.
+struct DescriptorCache {
+    /// descriptor string → (parsed param-type tags, last-access tick)
+    map: HashMap<String, (Vec<u8>, u64)>,
+    /// Monotonically increasing access counter; larger = more recently used.
+    tick: u64,
+}
+
+impl DescriptorCache {
+    fn new() -> Self {
+        Self {
+            map: HashMap::new(),
+            tick: 0,
+        }
+    }
+
+    /// Look up `descriptor`, marking it most-recently-used on a hit.
+    fn get(&mut self, descriptor: &str) -> Option<&[u8]> {
+        self.tick = self.tick.wrapping_add(1);
+        let tick = self.tick;
+        match self.map.get_mut(descriptor) {
+            Some(entry) => {
+                entry.1 = tick;
+                Some(&entry.0)
+            }
+            None => None,
+        }
+    }
+
+    /// Insert `descriptor → types`, evicting the single least-recently-used
+    /// entry first if the cache is at capacity.
+    fn insert(&mut self, descriptor: &str, types: Vec<u8>) {
+        if self.map.len() >= DESCRIPTOR_CACHE_CAPACITY && !self.map.contains_key(descriptor) {
+            // Evict exactly one entry: the least-recently-used (smallest tick).
+            if let Some(lru_key) = self
+                .map
+                .iter()
+                .min_by_key(|(_, (_, t))| *t)
+                .map(|(k, _)| k.clone())
+            {
+                self.map.remove(&lru_key);
+            }
+        }
+        self.tick = self.tick.wrapping_add(1);
+        let tick = self.tick;
+        self.map.insert(descriptor.to_owned(), (types, tick));
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Thread-Local VM Context
 // ---------------------------------------------------------------------------
 
@@ -134,8 +199,8 @@ thread_local! {
     /// Thread-local cache for parsed method descriptors.
     /// Maps descriptor string → parsed parameter type tags, avoiding
     /// repeated parsing of the same descriptor in hot JNI call paths.
-    static JNI_DESCRIPTOR_CACHE: std::cell::RefCell<HashMap<String, Vec<u8>>> =
-        std::cell::RefCell::new(HashMap::new());
+    static JNI_DESCRIPTOR_CACHE: std::cell::RefCell<DescriptorCache> =
+        std::cell::RefCell::new(DescriptorCache::new());
 }
 
 /// Set the JNI thread-local context before entering native code.
@@ -283,14 +348,12 @@ fn parse_param_types_cached(descriptor: &str) -> Vec<u8> {
     JNI_DESCRIPTOR_CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
         if let Some(cached) = cache.get(descriptor) {
-            return cached.clone();
+            return cached.to_vec();
         }
         let types = parse_param_types_inner(descriptor);
-        // Cap cache size to avoid unbounded growth in long-running JVMs
-        if cache.len() >= 1024 {
-            cache.clear();
-        }
-        cache.insert(descriptor.to_owned(), types.clone());
+        // Bounded LRU: evicts a single least-recently-used entry when full,
+        // avoiding the periodic full-flush thrash of a wholesale clear().
+        cache.insert(descriptor, types.clone());
         types
     })
 }
@@ -518,8 +581,11 @@ fn jni_call_static(clazz: JClass, mid: JMethodID, args: *const JValue) -> Option
 
 pub struct JniGlobalRefs {
     /// Raw `Box<ObjectRef>` pointers (stored as usize for Send/Sync).
-    /// Each entry owns its allocation until `remove` is called.
-    entries: Vec<usize>,
+    /// Each entry owns its allocation until `remove` is called. Keyed by the
+    /// pointer itself so `resolve`/`remove` are O(1) on this hot path (the
+    /// handle is just `raw | 1`, so the untagged pointer is a unique key —
+    /// distinct `Box` allocations never collide).
+    entries: HashSet<usize>,
 }
 
 // Safety: `JniGlobalRefs` is stored behind `parking_lot::Mutex<>` in `SharedVm`.
@@ -534,7 +600,7 @@ unsafe impl Sync for JniGlobalRefs {}
 impl JniGlobalRefs {
     pub fn new() -> Self {
         Self {
-            entries: Vec::new(),
+            entries: HashSet::new(),
         }
     }
 
@@ -542,7 +608,7 @@ impl JniGlobalRefs {
     pub fn add(&mut self, obj: ObjectRef) -> JObject {
         let boxed: Box<ObjectRef> = Box::new(obj);
         let raw = Box::into_raw(boxed) as usize; // OWNERSHIP: transferred to self.entries, freed by JniGlobalRefs::remove() or Drop impl
-        self.entries.push(raw);
+        self.entries.insert(raw);
         (raw | 1) as JObject
     }
 
@@ -552,8 +618,7 @@ impl JniGlobalRefs {
             return false; // not a global ref handle
         }
         let raw = (handle & !1) as usize;
-        if let Some(pos) = self.entries.iter().position(|&e| e == raw) {
-            self.entries.swap_remove(pos);
+        if self.entries.remove(&raw) {
             // Safety: raw was created by Box::into_raw and we own it.
             unsafe { drop(Box::from_raw(raw as *mut ObjectRef)) };
             true
@@ -6415,6 +6480,57 @@ mod tests {
                 "cached hit disagree on {desc}"
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // DescriptorCache (bounded LRU)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn descriptor_cache_get_hit_and_miss() {
+        let mut cache = DescriptorCache::new();
+        assert_eq!(cache.get("(I)V"), None);
+        cache.insert("(I)V", vec![b'I']);
+        assert_eq!(cache.get("(I)V"), Some(&[b'I'][..]));
+        assert_eq!(cache.get("(J)V"), None);
+    }
+
+    #[test]
+    fn descriptor_cache_evicts_one_not_all_when_full() {
+        let mut cache = DescriptorCache::new();
+        // Fill to capacity with unique descriptors.
+        for i in 0..DESCRIPTOR_CACHE_CAPACITY {
+            cache.insert(&format!("(I{i})V"), vec![b'I']);
+        }
+        assert_eq!(cache.map.len(), DESCRIPTOR_CACHE_CAPACITY);
+
+        // Touch every entry except the first so it becomes the LRU victim.
+        for i in 1..DESCRIPTOR_CACHE_CAPACITY {
+            assert!(cache.get(&format!("(I{i})V")).is_some());
+        }
+
+        // Insert one more: exactly one entry is evicted (the untouched LRU),
+        // NOT the whole cache — hot entries survive.
+        cache.insert("(NEW)V", vec![b'L']);
+        assert_eq!(cache.map.len(), DESCRIPTOR_CACHE_CAPACITY);
+        assert_eq!(cache.get("(I0)V"), None, "LRU entry should be evicted");
+        assert!(cache.get("(NEW)V").is_some(), "new entry present");
+        assert!(
+            cache.get("(I1)V").is_some(),
+            "recently-used entry must survive (no full flush)"
+        );
+    }
+
+    #[test]
+    fn descriptor_cache_reinsert_existing_key_no_eviction() {
+        let mut cache = DescriptorCache::new();
+        for i in 0..DESCRIPTOR_CACHE_CAPACITY {
+            cache.insert(&format!("(I{i})V"), vec![b'I']);
+        }
+        // Re-inserting an existing key must not evict — it overwrites in place.
+        cache.insert("(I0)V", vec![b'J']);
+        assert_eq!(cache.map.len(), DESCRIPTOR_CACHE_CAPACITY);
+        assert_eq!(cache.get("(I0)V"), Some(&[b'J'][..]));
     }
 
     // -----------------------------------------------------------------------
