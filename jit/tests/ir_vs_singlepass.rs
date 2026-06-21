@@ -403,6 +403,105 @@ fn ir_vs_singlepass_long_ldc2w_constant() {
 }
 
 #[test]
+fn ir_vs_singlepass_long_shifts() {
+    // inc 27: long shifts. long f(long a, int n){ return (a<<n) + (a>>n) + (a>>>n); }
+    //   a@0-1, n@2.  lload_0; iload_2; lshl; lload_0; iload_2; lshr; ladd;
+    //   lload_0; iload_2; lushr; ladd; lreturn
+    let code = vec![
+        0x1e, 0x1c, 0x79, // a << n
+        0x1e, 0x1c, 0x7b, 0x61, // + (a >> n)
+        0x1e, 0x1c, 0x7d, 0x61, // + (a >>> n)
+        0xad,
+    ];
+    check_long(
+        "lshifts",
+        "(JI)J",
+        code,
+        3,
+        2,
+        &[
+            // host: JVM masks the shift count to 6 bits (count & 0x3f) for long.
+            (vec![1, 1], {
+                let a = 1i64;
+                (a << (1 & 63)).wrapping_add(a >> (1 & 63)).wrapping_add((a as u64 >> (1 & 63)) as i64)
+            }),
+            (vec![-1, 4], {
+                let a = -1i64;
+                (a << 4).wrapping_add(a >> 4).wrapping_add((a as u64 >> 4) as i64)
+            }),
+            (vec![0x1234_5678_9abc_def0u64 as i64, 40], {
+                let a = 0x1234_5678_9abc_def0u64 as i64;
+                (a << (40 & 63)).wrapping_add(a >> (40 & 63)).wrapping_add((a as u64 >> (40 & 63)) as i64)
+            }),
+            (vec![i64::MIN, 1], {
+                let a = i64::MIN;
+                (a << 1).wrapping_add(a >> 1).wrapping_add((a as u64 >> 1) as i64)
+            }),
+        ],
+    );
+}
+
+#[test]
+fn ir_vs_singlepass_long_bitwise() {
+    // inc 27: long bitwise. long f(long a, long b){ return (a & b) | (a ^ b); }
+    //   lload_0; lload_2; land; lload_0; lload_2; lxor; lor; lreturn
+    let code = vec![
+        0x1e, 0x20, 0x7f, // a & b
+        0x1e, 0x20, 0x83, // a ^ b
+        0x81, // |
+        0xad,
+    ];
+    check_long(
+        "lbitwise",
+        "(JJ)J",
+        code,
+        4,
+        2,
+        &[
+            (vec![0x0f0f_0f0f_0f0f_0f0fu64 as i64, 0x00ff_00ff_00ff_00ffu64 as i64], {
+                let (a, b) = (0x0f0f_0f0f_0f0f_0f0fu64 as i64, 0x00ff_00ff_00ff_00ffu64 as i64);
+                (a & b) | (a ^ b)
+            }),
+            (vec![-1, 0], -1),
+            (vec![0, -1], -1),
+            (vec![i64::MIN, i64::MAX], {
+                let (a, b) = (i64::MIN, i64::MAX);
+                (a & b) | (a ^ b)
+            }),
+        ],
+    );
+}
+
+#[test]
+fn ir_vs_singlepass_long_lcmp_branch() {
+    // inc 27: lcmp + a long-fed branch. long min(long a, long b){ return a<b?a:b; }
+    //   lload_0; lload_2; lcmp; ifge ELSE; lload_0; lreturn; ELSE: lload_2; lreturn
+    //   pc0 lload_0; pc1 lload_2; pc2 lcmp; pc3 ifge +5(->pc8);
+    //   pc6 lload_0; pc7 lreturn; pc8 lload_2; pc9 lreturn
+    let code = vec![
+        0x1e, 0x20, 0x94, // a, b, lcmp
+        0x9c, 0x00, 0x05, // ifge +5 -> pc 8 (else: a >= b -> return b)
+        0x1e, 0xad, // then (a < b): return a
+        0x20, 0xad, // else: return b
+    ];
+    check_long(
+        "lmin",
+        "(JJ)J",
+        code,
+        4,
+        2,
+        &[
+            (vec![3, 4], 3),
+            (vec![4, 3], 3),
+            (vec![5, 5], 5),
+            (vec![-1, i64::MIN], i64::MIN),
+            (vec![i64::MAX, i64::MIN], i64::MIN),
+            (vec![0x1_0000_0000, 0xffff_ffff], 0xffff_ffff),
+        ],
+    );
+}
+
+#[test]
 fn ir_vs_singlepass_add() {
     // int add(int a, int b) { return a + b; }
     //   iload_0; iload_1; iadd; ireturn
