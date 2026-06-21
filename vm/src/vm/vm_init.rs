@@ -375,6 +375,14 @@ pub struct SharedVm {
     /// so it can't run during `SharedVm::new`.
     pub main_thread_group: RwLock<Option<ObjectRef>>,
 
+    /// Pre-allocated singleton `java.lang.OutOfMemoryError`, thrown when the
+    /// heap is too full to even materialize a fresh exception object (the
+    /// OOM-during-OOM case — see `runtime::exceptions::ensure_singleton_oom`,
+    /// which fills this once before user `main`). Kept alive permanently by the
+    /// GC root scan (`memory::roots`). `None` until pre-allocated; the OOM-throw
+    /// sites fall back to their prior behaviour while it is empty.
+    pub singleton_oom: RwLock<Option<ObjectRef>>,
+
     /// System properties: populated with platform defaults + user overrides.
     pub system_properties: RwLock<HashMap<String, String>>,
 
@@ -627,6 +635,15 @@ pub struct SharedVm {
     /// allocation-storm regression tests to assert that GC frequency
     /// stays below the 0.2 Hz target under synthetic 25 MB/s load.
     pub gc_cycle_count: std::sync::atomic::AtomicU64,
+
+    /// Consecutive allocation-failure GCs that freed almost nothing (post-GC
+    /// heap still ≥98% full). When this reaches the GC-overhead limit
+    /// (`runtime::interpreter::gc_overhead_limit_exceeded`), the allocation
+    /// paths surface a catchable `OutOfMemoryError` (the pre-allocated
+    /// `singleton_oom`) instead of spinning in an O(n²) GC death-spiral on a
+    /// heap that is full of live (retained) objects. Reset to 0 by any
+    /// productive forced GC. Mirrors HotSpot's `UseGCOverheadLimit`.
+    pub gc_unproductive_streak: std::sync::atomic::AtomicU32,
 
     /// T19.3.G1 — total bytes allocated across all TLAB and
     /// slow-path heap allocations since VM start.
@@ -2323,6 +2340,7 @@ impl SharedVm {
             system_err: RwLock::new(None),
             system_in: RwLock::new(None),
             main_thread_group: RwLock::new(None),
+            singleton_oom: RwLock::new(None),
             system_properties: RwLock::new(sys_props),
             lambda_proxies: RwLock::new(FxHashMap::default()),
             lambda_proxy_hosts: RwLock::new(FxHashMap::default()),
@@ -2376,6 +2394,7 @@ impl SharedVm {
             tlab_refill_count: std::sync::atomic::AtomicU64::new(0),
             tlab_hit_count: std::sync::atomic::AtomicU64::new(0),
             gc_cycle_count: std::sync::atomic::AtomicU64::new(0),
+            gc_unproductive_streak: std::sync::atomic::AtomicU32::new(0),
             bytes_allocated_total: std::sync::atomic::AtomicU64::new(0),
             // T10.9.E — lazy per-(ClassId, slot_index) field descriptor cache.
             field_descriptor_cache: parking_lot::RwLock::new(

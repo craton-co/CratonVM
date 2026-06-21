@@ -179,6 +179,16 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
         }
     }
 
+    // 8c. Pre-allocated singleton OutOfMemoryError — thrown on a 100%-full heap
+    //     when a fresh exception cannot be materialized. Must survive every GC
+    //     permanently (it is held only by `SharedVm`, not any Java field), so a
+    //     moving collector cannot reclaim it and leave the OOM-fallback dangling.
+    {
+        if let Some(oom_ref) = *shared.singleton_oom.read() {
+            roots.push(oom_ref);
+        }
+    }
+
     // 9. JNI global references — prevent GC from collecting objects held by native code.
     {
         shared.jni_global_refs.lock().collect_roots(&mut roots);

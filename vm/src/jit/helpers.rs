@@ -1211,6 +1211,12 @@ pub unsafe extern "C" fn jit_newarray(vm_ptr: i64, atype: i64, length: i64) -> i
         // StopTheWorldToken.)
         crate::runtime::interpreter::maybe_gc_forced_pub(vm, thread);
     }
+    // GC-overhead limit: if forced GCs keep freeing almost nothing, the heap is
+    // full of live objects — surface OOM now instead of limping on slivers
+    // (death-spiral). Mirrors the interpreter's alloc paths.
+    if crate::runtime::interpreter::gc_overhead_limit_exceeded(vm) {
+        return jit_newarray_oom(vm, length as usize);
+    }
     // Retry after GC. On a second failure the heap is genuinely exhausted —
     // surface a catchable `java/lang/OutOfMemoryError` exactly as the
     // interpreter's `gc_alloc_array` does, instead of the old non-fallible
@@ -1261,9 +1267,12 @@ fn jit_newarray_oom(vm: &SharedVm, length: usize) -> i64 {
 /// `*_full` fallible paths so the old-generation spill of the non-fallible
 /// `alloc_object` / `alloc_array` is preserved before OOM is reported.
 ///
-/// If the OOME object itself cannot be constructed (heap too exhausted to even
-/// allocate the throwable), the flag is left unset and `0` returned — the legacy
-/// behaviour, never worse.
+/// If a fresh OOME object cannot be constructed (heap too exhausted to even
+/// allocate the throwable / its message), fall back to the pre-allocated
+/// singleton `OutOfMemoryError` (`SharedVm::singleton_oom`) so the OOM stays
+/// catchable on a 100%-full heap instead of the materialization hard-aborting.
+/// If the singleton is also absent (pre-allocation hasn't run yet), the flag is
+/// left unset and `0` returned — the legacy behaviour, never worse.
 #[cold]
 fn jit_alloc_oom(vm: &SharedVm, msg: &str) -> i64 {
     if let Some((thread, _guard)) = unsafe { jit_thread_mut() } {
@@ -1274,7 +1283,12 @@ fn jit_alloc_oom(vm: &SharedVm, msg: &str) -> i64 {
             Some(msg),
         ) {
             set_jit_pending_exception(exc);
+            return 0;
         }
+    }
+    // Fresh creation failed (or no JIT thread) — use the pre-allocated singleton.
+    if let Some(oom) = *vm.singleton_oom.read() {
+        set_jit_pending_exception(oom);
     }
     0
 }
@@ -1466,6 +1480,14 @@ pub unsafe extern "C" fn jit_new_object(vm_ptr: i64, class_id_raw: i64, num_fiel
         }
     }
 
+    // GC-overhead limit (see jit_newarray): bail to catchable OOM if forced GCs
+    // keep freeing almost nothing, instead of death-spiralling on slivers.
+    if crate::runtime::interpreter::gc_overhead_limit_exceeded(vm) {
+        return jit_alloc_oom(
+            vm,
+            &format!("Java heap space (new_object class_id {class_id_raw} fields {num_fields})"),
+        );
+    }
     // Fallible young → old-gen alloc (preserves alloc_object's old-gen spill);
     // on exhaustion surface a catchable OutOfMemoryError instead of the hard
     // abort in alloc_young. The `new` codegen's emit_post_alloc_oom_check bails
@@ -1585,6 +1607,14 @@ pub unsafe extern "C" fn jit_anewarray_object(
         }
     }
 
+    // GC-overhead limit (see jit_newarray): bail to catchable OOM if forced GCs
+    // keep freeing almost nothing, instead of death-spiralling on slivers.
+    if crate::runtime::interpreter::gc_overhead_limit_exceeded(vm) {
+        return jit_alloc_oom(
+            vm,
+            &format!("Java heap space (anewarray component {component_class_id_raw} length {length})"),
+        );
+    }
     // Fallible young → humongous/old-gen alloc (preserves alloc_array's spill);
     // on exhaustion surface a catchable OutOfMemoryError instead of the hard
     // abort in alloc_young. The `anewarray` codegen's emit_post_alloc_oom_check

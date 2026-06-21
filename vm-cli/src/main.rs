@@ -2265,6 +2265,14 @@ fn run() -> Result<()> {
             })?;
     }
 
+    // Pre-allocate the singleton java.lang.OutOfMemoryError while the heap is
+    // still fresh, so a later 100%-full-heap OOM (in either user code or a
+    // premain) can be thrown without allocating the throwable — which would
+    // otherwise hard-abort in the non-fallible String allocator. Idempotent and
+    // best-effort: if the class isn't loadable yet it leaves the slot empty and
+    // the OOM paths keep their prior behaviour.
+    cratonvm_vm::runtime::exceptions::ensure_singleton_oom(&vm.shared, &mut vm.main_thread);
+
     // WP2.4-C — run every `-javaagent:` agent's `premain(String,
     // Instrumentation)` hook BEFORE the application's `main`. Per the
     // `java.lang.instrument` package spec, agent failures are warnings
