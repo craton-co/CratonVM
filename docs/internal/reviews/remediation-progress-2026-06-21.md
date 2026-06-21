@@ -3,6 +3,19 @@
 Companion to the full audit: [`full-review-2026-06-20.md`](full-review-2026-06-20.md) (every finding, file:line).
 This doc tracks what the multi-agent remediation has **landed on `dev`** and how to **continue** the rest.
 
+## UPDATE (2026-06-21, later) — Wave 3b landed
+The **GC-root cluster is now 8/9 done** (all build-green, merged in order). Added since the first cut:
+- `oscache.rs` (registry adopter; needed a build-fix: `SendPtr` wrapper in the registry `Vec` + `ObjectRef::as_ptr().is_null()` — `ObjectRef` has **no `is_null()`** method, note for future agents).
+- `value_stack.rs` (symmetric scan/remap for smuggled jobject in Long-tagged slot).
+- `native-collections/src/lib.rs` (poison-safe overlay locks + ArrayList OOM cap + recycled-identity generations/prune).
+- `nio_selector.rs` + `scheduled_pump.rs` (runnable_ptr → `AtomicUsize`) + `xnio_async.rs` (Weak registry) — each exposes `gc_scan_*`/`gc_update_*`; **the orchestrator wired the call sites** into `roots.rs::collect_roots` and `gc.rs::update_all_roots` (commit `fix(gc): wire …`). Pattern to copy for future native-* roots.
+- `satb.rs` (per-thread SATB buffers → `Arc<Mutex<>>` + global `Weak` registry; `flush_all_thread_satb_buffers` called from `deactivate_and_drain` at the remark STW).
+- Cleanup: MSRV `1.77→1.80` (`Cargo.toml` + `clippy.toml`) cleared ~90 `incompatible_msrv` lints; gc/gpu/reader clippy autofix + crate-level allows.
+
+**Only remaining GC-root item:** `vm/src/native/jni.rs` — implicit JNI local-ref frame on native entry + array pinning for `GetPrimitiveArrayCritical`/`Get*ArrayElements` under moving GC. This is **cross-file** (needs a heap "pinned set" in `gc` + a frame push/pop in `vm_exec.rs` JNI entry), so it needs a small multi-file plan rather than a single-file agent.
+
+Everything below is the original plan; the GC-root cluster items above are now DONE except JNI.
+
 ## Orchestration model (how this was/ is run)
 - One Opus agent per finding-cluster, each in an **isolated git worktree** on a **properly-named branch**, editing a **disjoint set of files** (no two in-flight agents touch the same file). Agents only write code/docs; they do **not** build.
 - The orchestrator merges branches into `dev` in **severity order (critical → high → medium)** with one-line commit subjects, formats the changed files, and runs the build gate. Merges are seamless because file ownership is disjoint.
