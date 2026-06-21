@@ -17706,6 +17706,8 @@ fn try_jit_upgrade_with_gate(
                 // inc 24: invokespecial → Op::Call, gated default-OFF (its own
                 // soak). `CRATONVM_JIT_IR_CALL_SPECIAL=1` opts in.
                 std::env::var_os("CRATONVM_JIT_IR_CALL_SPECIAL").is_some(),
+                // inc 25: long methods → IR path, gated default-OFF.
+                std::env::var_os("CRATONVM_JIT_IR_LONG").is_some(),
             )?;
             let entry = compiled.entry_ptr() as usize; // Cast: JIT entry point to address
             let needs_ctx = compiled.needs_context();
@@ -17814,6 +17816,8 @@ fn try_jit_upgrade_with_gate(
         std::env::var("CRATONVM_JIT_IR_CALL").map_or(true, |v| v != "0"),
         // inc 24: invokespecial → Op::Call, gated default-OFF (its own soak).
         std::env::var_os("CRATONVM_JIT_IR_CALL_SPECIAL").is_some(),
+        // inc 25: long methods → IR path, gated default-OFF.
+        std::env::var_os("CRATONVM_JIT_IR_LONG").is_some(),
     )?;
     let ret = crate::jit::return_type(&cached.method_descriptor);
     let heap = compiled.needs_heap();
@@ -18385,6 +18389,8 @@ fn try_jit_compile_callee_slow(
         std::env::var("CRATONVM_JIT_IR_CALL").map_or(true, |v| v != "0"),
         // inc 24: invokespecial → Op::Call, gated default-OFF (its own soak).
         std::env::var_os("CRATONVM_JIT_IR_CALL_SPECIAL").is_some(),
+        // inc 25: long methods → IR path, gated default-OFF.
+        std::env::var_os("CRATONVM_JIT_IR_LONG").is_some(),
     )?;
     if std::env::var_os("CRATONVM_DBG_JITC").is_some() {
         eprintln!(

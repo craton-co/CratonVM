@@ -539,6 +539,45 @@ impl IrBuilder {
         }
     }
 
+    /// Re-lay-out the parameter locals with the JVM category-2 two-slot
+    /// convention and type each `Param` node. inc 25: [`Self::new`] packs every
+    /// parameter one-per-slot typed `Int`, which is only correct for an
+    /// all-category-1 signature. A `long`/`double` parameter occupies **two**
+    /// JVM local slots, so a following parameter's value node sits two slots
+    /// higher — e.g. `(long a, long b)` puts `a` at slot 0 and `b` at slot 2,
+    /// matching `lload_2` for `b`. The `Param` node *index* stays the JIT-arg
+    /// index (the lowerer reads param `i` from prologue slot `(i+1)*8`, one
+    /// register per parameter); only the `locals` placement and the node type
+    /// change. `param_types` is in JIT-arg order (one entry per parameter).
+    /// Must be called before [`Self::build`].
+    pub fn set_param_types(&mut self, param_types: &[IrType]) {
+        let cat2 = |t: &IrType| matches!(t, IrType::Long | IrType::Double);
+        // Clear the parameter region so a stale one-per-slot placement (from
+        // `new`) cannot shadow a now-two-slot-wide layout.
+        let total: usize = param_types
+            .iter()
+            .map(|t| if cat2(t) { 2 } else { 1 })
+            .sum();
+        for s in 0..total.min(self.locals.len()) {
+            self.locals[s] = NO_NODE;
+        }
+        let mut jvm_slot = 0usize;
+        for (i, &ty) in param_types.iter().enumerate() {
+            if let Some(pid) = self
+                .graph
+                .nodes
+                .iter()
+                .position(|n| matches!(n.op, Op::Param(idx) if idx as usize == i))
+            {
+                self.graph.nodes[pid].ty = ty;
+                if jvm_slot < self.locals.len() {
+                    self.locals[jvm_slot] = pid as NodeId;
+                }
+            }
+            jvm_slot += if cat2(&ty) { 2 } else { 1 };
+        }
+    }
+
     /// Supply the resolved instance-field layout (`pc → (field_index,
     /// type_tag)`) the builder uses to lower `getfield` into an `Op::Load`.
     /// Must be called before [`Self::build`]; absent / non-int-category

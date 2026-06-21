@@ -1392,6 +1392,86 @@ soak the gating step before the flip.
 marshalling, gated on the IR path handling category-2 values); virtual /
 interface dispatch via inline caches (the bug-24-sensitive area).
 
+## Increment 25 (category-2 foundation — `long` arithmetic on the IR path) landed
+
+Status: **landed** on `dev`, **default-OFF behind `CRATONVM_JIT_IR_LONG`**. The
+first slice of the category-2 (64-bit value) foundation the "next refinements"
+above are gated on. Until now the IR pipeline typed every value as 32-bit `Int`
+and `method_uses_category2` bailed the *whole* pipeline on any `long`/`double`
+opcode (so even pushing a long needed `lload`, which bailed). This slice admits
+**long-arithmetic leaf methods** to the optimizing IR path.
+
+**Key finding — most of the machinery already existed.** The IR builder already
+lowers `ladd`/`lsub`/`lmul`/`lneg`/`i2l`/`l2i`/`lconst`/`lload_0..3`/
+`lstore_0..3`/`lreturn` to `IrType::Long` nodes, and the lowerer already emits
+correct 64-bit code for them (`ADD/SUB/IMUL/NEG` with `REX.W`, `Op::I2L`=MOVSXD,
+`Op::L2I`=MOV EAX,EAX, `Op::Const(Long)`=`MOV RAX,imm64`, `Return`=RAX). It was
+**dammed** by two things, both fixed here:
+1. **The cat-2 gate** bailed before the builder ran.
+2. **The two-slot parameter layout was wrong.** `IrBuilder::new` types every
+   `Param` `Int` and packs them one-per-slot (`Param(i)` at `locals[i]`). But a
+   `long`/`double` occupies **two** JVM local slots, so `(long a, long b)` reads
+   `b` via `lload_2` — and `locals[2]` was empty (b had been placed at
+   `locals[1]`). The result was a silent miscompile of every multi-long-param
+   method.
+
+**What landed**
+- **`jit/src/ir.rs`** — `IrBuilder::set_param_types(&[IrType])` re-lays-out the
+  parameter locals with the JVM two-slot convention (a `long`/`double` param
+  advances the slot cursor by 2) and types each `Param` from the descriptor. The
+  `Param` node *index* stays the JIT-arg index (the lowerer reads param `i` from
+  prologue slot `(i+1)*8` — one register per parameter, unchanged); only the
+  `locals` placement and node type change.
+- **`jit/src/lib.rs`** — a new `try_compile` parameter `ir_emit_long`. When on,
+  the gate is relaxed to admit a method that uses `long` **iff** it is (a)
+  double/float-free (`method_uses_double`) and (b) int-`idiv`/`irem`-free
+  (`method_has_int_div`). The latter keeps a `long` value off a deopt point
+  (the div guard's resume cannot yet reconstruct a `long` slot — a follow-up, the
+  same deferral the FP-slot resume already documents), so a `long` is only ever
+  live in a safepoint-free leaf. `ir_param_types(descriptor, is_static)` computes
+  the JIT-arg-order types fed to `set_param_types`. A `CRATONVM_DBG_IR_LONG`
+  diagnostic prints when a long method actually takes the IR path (the
+  non-vacuity proof for the live soak). Unhandled long opcodes (`ldiv`/`lrem`,
+  `lshl`/`land`/…, `lcmp`, `ldc2_w`, wide `lload`/`lstore`) still hit the
+  builder's catch-all and bail to single-pass — the safe fallback.
+- **`vm/src/runtime/interpreter.rs`** — the 3 `try_compile` sites pass
+  `ir_emit_long` from `CRATONVM_JIT_IR_LONG` (default-OFF).
+
+**Soundness.** `set_param_types` is only invoked when `ir_emit_long` is on, and
+for an all-category-1 signature it reproduces the existing one-slot layout
+exactly (inert). The relaxation is double/float- and int-div-free, so the only
+new methods admitted are long-arithmetic leaves the builder fully lowers; the
+64-bit lowering was already proven by the single-pass long path it mirrors.
+
+**Tests**
+- `jit/tests/ir_vs_singlepass.rs` — four executing differentials (full i64):
+  `ir_vs_singlepass_long_add` (64-bit wrap + a genuinely-64-bit add a 32-bit op
+  would truncate), `…_long_two_slot_params` (`a*b-b` via `lload_2` — the layout
+  fix), `…_long_mixed_int_long_param` (`int a` at slot 0, `long b` at slots 1-2),
+  `…_long_to_int_return` (`l2i` truncation). IR == single-pass == host.
+- `jit/src/lib.rs::ir_long_wiring_routes_through_ir_only_with_flag` — proves a
+  long method routes through the IR pipeline (`IR_LOWER_COMPILES == 1`) **iff**
+  `ir_emit_long` is on (guards against a vacuous single-pass fall-through).
+- jit lib **819/819**, differential **30/30**, `cratonvm-vm` builds clean.
+
+**Live soak** (worktree `CratonVM-irlong`, `CRATONVM_JIT_IR_LONG` toggled):
+- `scratch/irlong/IrLong.java` (`mix` — a pure long leaf; `loop` — a long
+  accumulator with an int-counter loop, both slots 0-3 / short forms) == HotSpot
+  (`3588644437398634000`) gate-ON **and** gate-OFF, and `CRATONVM_DBG_IR_LONG`
+  confirms **both** methods take the IR path (2 emit lines — non-vacuous).
+- No regression with `CRATONVM_JIT_IR_LONG=1`: bt10/14/16/18 == HotSpot
+  (`135854 / 3222190 / 14985902 / 68332206` — bt is long-heavy, so a long
+  miscompile would move the checksum), and the invokestatic `IrCall` probe ==
+  HotSpot (`23762906400000`, no cross-gate interference).
+
+**Limitations (this is a first slice) / next sub-slices**, in rough order:
+wide `lload`/`lstore` (slots ≥ 4) and `ldc2_w` (long constants); `lcmp` +
+long-fed branches; `lshl`/`lshr`/`lushr`/`land`/`lor`/`lxor`; `ldiv`/`lrem` (need
+the long deopt-resume so a `long` can be live at the div guard); then the
+**`double`/`float`** half (XMM registers + FP-slot deopt resume); and finally
+**long/double *call* args + returns** (`static_call_shape` category-2 marshalling
+— the original "category-2 call args" item, now unblocked at the value level).
+
 ## Implementation steps (ordered)
 
 1. **φ/branch lowering repro + fix** (Front 1.1) — unblocks everything.
