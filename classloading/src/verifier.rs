@@ -66,7 +66,7 @@ use std::sync::OnceLock;
 
 use cratonvm_reader::class_access_flags::{ClassAccessFlags, MethodAccessFlags};
 use cratonvm_reader::class_file_version::ClassFileVersion;
-use cratonvm_reader::constant_pool::ConstantPool;
+use cratonvm_reader::constant_pool::{ConstantPool, ConstantPoolEntry};
 use cratonvm_reader::instruction::Instruction;
 use cratonvm_reader::method::ClassFileMethod;
 use cratonvm_reader::stack_map::StackMapTable;
@@ -74,7 +74,7 @@ use cratonvm_reader::stack_map::StackMapTable;
 use super::class::{find_method_recursive, Class, ClassStore};
 use super::verify_frame::VerificationFrame;
 use super::verify_insn::verify_instruction;
-use super::vtype::{ClassHierarchy, VType};
+use super::vtype::{param_types_from_descriptor, ClassHierarchy, VType};
 use cratonvm_types::error::LinkageError;
 
 /// Verify a class: structural (Pass 2) + bytecode (Pass 3).
@@ -409,6 +409,14 @@ fn verify_method_typestate(
         handler_targets.insert(entry.handler_pc, catch);
     }
 
+    // SPEC-COMPLIANCE FIX (MED): map each `new` bytecode offset to the class
+    // it creates, so `invokespecial <init>` can enforce the JVMS §4.10.1.9
+    // owner-match (the `new`-site type must equal the constructor's owner).
+    // `VType::Uninitialized(offset)` carries only the offset, so this side
+    // table supplies the class name the type-state pass otherwise lacks.
+    let mut new_site_classes: std::collections::HashMap<u16, std::sync::Arc<str>> =
+        std::collections::HashMap::new();
+
     let mut pc = 0usize;
     let mut current = initial;
     let mut verified = true;
@@ -478,6 +486,24 @@ fn verify_method_typestate(
                 method_name: method.name.to_string(),
                 message: format!("failed to decode instruction at offset {pc}: {e}"),
             })?;
+
+        // Record the class created by a `new` so a later `invokespecial
+        // <init>` on the resulting `Uninitialized(pc)` can be owner-matched.
+        if let Instruction::New(idx) = &insn {
+            if let Some(created) = cp.get_class_name_arc(*idx) {
+                new_site_classes.insert(pc as u16, created);
+            }
+        }
+        // SPEC-COMPLIANCE FIX (MED): owner-match for `invokespecial <init>`
+        // before the receiver is consumed (JVMS §4.10.1.9).
+        check_new_init_owner_match(
+            &insn,
+            &current,
+            cp,
+            &new_site_classes,
+            class_name,
+            &method.name,
+        )?;
 
         let result = verify_instruction(
             &insn,
@@ -576,6 +602,14 @@ fn verify_pre_java7_inference(
     let mut enqueued: std::collections::HashSet<usize> = std::collections::HashSet::new();
     enqueued.insert(0);
 
+    // SPEC-COMPLIANCE FIX (MED): `new`-offset → created-class side table for
+    // the `invokespecial <init>` owner-match (JVMS §4.10.1.9). Accumulated
+    // across the worklist run; an `Uninitialized(offset)` receiver can only
+    // reach an `<init>` after the dominating `new` at `offset` was decoded, so
+    // the entry is present by the time the check runs.
+    let mut new_site_classes: std::collections::HashMap<u16, std::sync::Arc<str>> =
+        std::collections::HashMap::new();
+
     let max_iterations = bytecode.len().saturating_mul(4).max(256);
     let mut iterations = 0usize;
 
@@ -604,6 +638,24 @@ fn verify_pre_java7_inference(
                 method_name: method.name.to_string(),
                 message: format!("failed to decode instruction at offset {pc}: {e}"),
             })?;
+
+        // Record the class created by a `new` so a later `invokespecial
+        // <init>` on the resulting `Uninitialized(pc)` can be owner-matched.
+        if let Instruction::New(idx) = &insn {
+            if let Some(created) = cp.get_class_name_arc(*idx) {
+                new_site_classes.insert(pc as u16, created);
+            }
+        }
+        // SPEC-COMPLIANCE FIX (MED): owner-match for `invokespecial <init>`
+        // before the receiver is consumed (JVMS §4.10.1.9).
+        check_new_init_owner_match(
+            &insn,
+            &current,
+            cp,
+            &new_site_classes,
+            class_name,
+            &method.name,
+        )?;
 
         let result = verify_instruction(
             &insn,
@@ -1000,6 +1052,112 @@ fn instruction_branch_targets(insn: &Instruction, pc: usize) -> Vec<u16> {
         // is dynamic, not encoded in the instruction. Not checked here.
         _ => Vec::new(),
     }
+}
+
+/// Resolve the owner class, method name, and descriptor of a `Methodref` /
+/// `InterfaceMethodref` constant-pool entry referenced by an
+/// `invokespecial`/`invoke*` index.
+///
+/// Returns `Some((owner_class_name, method_name, descriptor))` when the index
+/// names a (interface-)method reference whose owner and `NameAndType` both
+/// resolve. Used by [`check_new_init_owner_match`] to recover the
+/// constructor's declaring class and arity for the JVMS §4.10.1.9
+/// owner-match check.
+fn resolve_invoked_owner_and_name(
+    cp: &ConstantPool,
+    index: u16,
+) -> Option<(std::sync::Arc<str>, std::sync::Arc<str>, std::sync::Arc<str>)> {
+    let (class_index, name_and_type_index) = match cp.get(index)? {
+        ConstantPoolEntry::MethodReference {
+            class_index,
+            name_and_type_index,
+        }
+        | ConstantPoolEntry::InterfaceMethodReference {
+            class_index,
+            name_and_type_index,
+        } => (*class_index, *name_and_type_index),
+        _ => return None,
+    };
+    let owner = cp.get_class_name_arc(class_index)?;
+    let (name, desc) = cp.get_name_and_type(name_and_type_index)?;
+    Some((owner, std::sync::Arc::from(name), std::sync::Arc::from(desc)))
+}
+
+/// JVMS §4.10.1.9 owner-match check for `invokespecial <init>`.
+///
+/// When `insn` is an `invokespecial` of an `<init>` whose receiver (after the
+/// constructor arguments are accounted for) is an `Uninitialized(offset)`
+/// value, the type created by the `new` at `offset` must be the *same class*
+/// as the constructor's declaring class. The plain type-state pass cannot
+/// enforce this on its own because `VType::Uninitialized(offset)` carries only
+/// the bytecode offset, not the class name — so we thread `new_site_classes`
+/// (populated when each `new` instruction is decoded) and compare here.
+///
+/// This runs **before** `verify_instruction` consumes the frame, reading the
+/// receiver non-destructively from `frame.stack`. The receiver sits just below
+/// the constructor's argument slots, so we skip exactly the argument width
+/// (category-2 args occupy two slots) to find it.
+///
+/// A mismatch (`new C; ... ; invokespecial D.<init>` with `C != D`) is a
+/// `VerifyError`; the `new`-site type and the constructor owner disagree, which
+/// would let a constructor run against the wrong uninitialized object shape.
+/// `UninitializedThis` receivers are handled by `verify_instruction` itself
+/// (the current-class / superclass check) and are ignored here.
+fn check_new_init_owner_match(
+    insn: &Instruction,
+    frame: &VerificationFrame,
+    cp: &ConstantPool,
+    new_site_classes: &std::collections::HashMap<u16, std::sync::Arc<str>>,
+    class_name: &str,
+    method_name: &str,
+) -> Result<(), LinkageError> {
+    let index = match insn {
+        Instruction::Invokespecial(index) => *index,
+        _ => return Ok(()),
+    };
+    let (owner, invoked_name, descriptor) = match resolve_invoked_owner_and_name(cp, index) {
+        Some(triple) => triple,
+        None => return Ok(()), // unresolved ref — verify_instruction reports it
+    };
+    if &*invoked_name != "<init>" {
+        return Ok(());
+    }
+
+    // Count the operand-stack slots the constructor arguments occupy so we can
+    // index past them to the receiver. Category-2 params take two slots.
+    let arg_slots: usize = param_types_from_descriptor(&descriptor)
+        .iter()
+        .map(|t| if t.is_category2() { 2 } else { 1 })
+        .sum();
+
+    // Receiver is the slot directly beneath the argument slots. If the stack
+    // is too shallow, the type-state pass will report the underflow — bail.
+    let depth = frame.stack.len();
+    if depth < arg_slots + 1 {
+        return Ok(());
+    }
+    let receiver = &frame.stack[depth - arg_slots - 1];
+
+    if let VType::Uninitialized(offset) = receiver {
+        // Look up the class created by the `new` at `offset`. If we never saw
+        // the `new` (e.g. the uninitialized value arrived via a declared
+        // StackMapTable frame rather than a decoded `new`), we can't compare —
+        // skip rather than risk a false rejection.
+        if let Some(new_class) = new_site_classes.get(offset) {
+            if **new_class != *owner {
+                return Err(LinkageError::VerifyError {
+                    class_name: class_name.to_string(),
+                    method_name: method_name.to_string(),
+                    message: format!(
+                        "invokespecial <init>: constructor owner {owner} does not match \
+                         the type {new_class} created by `new` at offset {offset} \
+                         (JVMS §4.10.1.9)"
+                    ),
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 /// True if `version` predates StackMapTable (Java 6 and earlier).
@@ -2384,5 +2542,187 @@ mod tests {
         assert!(!is_pre_java7(&ClassFileVersion::JAVA_7));
         assert!(!is_pre_java7(&ClassFileVersion::JAVA_8));
         assert!(!is_pre_java7(&ClassFileVersion::JAVA_25));
+    }
+
+    // -----------------------------------------------------------------
+    // MED — invokespecial <init> new-site owner-match (JVMS §4.10.1.9)
+    // -----------------------------------------------------------------
+
+    /// Constant pool whose entry #6 is a `Methodref` to `D.<init>()V`.
+    fn init_owner_cp() -> ConstantPool {
+        ConstantPool::new(vec![
+            ConstantPoolEntry::Tombstone,               // 0
+            ConstantPoolEntry::Utf8("D".into()),        // 1
+            ConstantPoolEntry::ClassReference { name_index: 1 }, // 2 (owner D)
+            ConstantPoolEntry::Utf8("<init>".into()),   // 3
+            ConstantPoolEntry::Utf8("()V".into()),      // 4
+            ConstantPoolEntry::NameAndType {
+                name_index: 3,
+                descriptor_index: 4,
+            }, // 5
+            ConstantPoolEntry::MethodReference {
+                class_index: 2,
+                name_and_type_index: 5,
+            }, // 6 (D.<init>()V)
+        ])
+    }
+
+    fn owner_match_frame() -> VerificationFrame {
+        // A frame with a single `Uninitialized(0)` receiver on the stack.
+        let mut frame =
+            VerificationFrame::initial_frame("Test", "test", "()V", true, 1, 4);
+        frame.push(VType::Uninitialized(0)).unwrap();
+        frame
+    }
+
+    #[test]
+    fn invokespecial_init_owner_mismatch_rejected() {
+        // `new C` (recorded at offset 0) followed by `invokespecial D.<init>`
+        // is a JVMS §4.10.1.9 violation: the new-site type C must equal the
+        // constructor owner D.
+        let cp = init_owner_cp();
+        let frame = owner_match_frame();
+        let mut new_site_classes = std::collections::HashMap::new();
+        new_site_classes.insert(0u16, std::sync::Arc::<str>::from("C")); // new C, not D
+
+        let res = check_new_init_owner_match(
+            &Instruction::Invokespecial(6),
+            &frame,
+            &cp,
+            &new_site_classes,
+            "Test",
+            "test",
+        );
+        assert!(
+            res.is_err(),
+            "invokespecial D.<init> on an object created by `new C` must be rejected, \
+             got {res:?}"
+        );
+    }
+
+    #[test]
+    fn invokespecial_init_owner_match_accepted() {
+        // `new D` followed by `invokespecial D.<init>` is well-formed.
+        let cp = init_owner_cp();
+        let frame = owner_match_frame();
+        let mut new_site_classes = std::collections::HashMap::new();
+        new_site_classes.insert(0u16, std::sync::Arc::<str>::from("D")); // new D == owner
+
+        let res = check_new_init_owner_match(
+            &Instruction::Invokespecial(6),
+            &frame,
+            &cp,
+            &new_site_classes,
+            "Test",
+            "test",
+        );
+        assert!(
+            res.is_ok(),
+            "invokespecial D.<init> on an object created by `new D` must be accepted, \
+             got {res:?}"
+        );
+    }
+
+    #[test]
+    fn invokespecial_init_unknown_new_site_is_skipped() {
+        // If the `new` site was never recorded (e.g. the uninitialized value
+        // arrived via a declared StackMapTable frame), we cannot compare —
+        // the check must be a no-op rather than a false rejection.
+        let cp = init_owner_cp();
+        let frame = owner_match_frame();
+        let new_site_classes: std::collections::HashMap<u16, std::sync::Arc<str>> =
+            std::collections::HashMap::new(); // offset 0 not present
+
+        let res = check_new_init_owner_match(
+            &Instruction::Invokespecial(6),
+            &frame,
+            &cp,
+            &new_site_classes,
+            "Test",
+            "test",
+        );
+        assert!(
+            res.is_ok(),
+            "an unrecorded new-site must skip the owner-match (no false reject), \
+             got {res:?}"
+        );
+    }
+
+    #[test]
+    fn invokespecial_init_owner_match_end_to_end_rejected() {
+        // End-to-end through the pre-Java-7 linear walk: a Java-5 method that
+        // does `new C; dup; invokespecial D.<init>()V`. The class also carries
+        // a jsr method so the per-method routing engages (escape hatch on so
+        // the jsr method is tolerated and the owner mismatch is the only cause
+        // of failure).
+        //
+        // Bytecode of the offending method:
+        //   0: new #2  (creates D per cp, but we point new at a *different*
+        //               class via a dedicated cp below)
+        //   3: dup
+        //   4: invokespecial #? D.<init>()V
+        //   7: return
+        //
+        // We build a bespoke cp where the `new` index names C and the
+        // constructor names D.
+        let cp = ConstantPool::new(vec![
+            ConstantPoolEntry::Tombstone,                        // 0
+            ConstantPoolEntry::Utf8("C".into()),                 // 1
+            ConstantPoolEntry::ClassReference { name_index: 1 }, // 2 (new C)
+            ConstantPoolEntry::Utf8("D".into()),                 // 3
+            ConstantPoolEntry::ClassReference { name_index: 3 }, // 4 (owner D)
+            ConstantPoolEntry::Utf8("<init>".into()),            // 5
+            ConstantPoolEntry::Utf8("()V".into()),               // 6
+            ConstantPoolEntry::NameAndType {
+                name_index: 5,
+                descriptor_index: 6,
+            }, // 7
+            ConstantPoolEntry::MethodReference {
+                class_index: 4,
+                name_and_type_index: 7,
+            }, // 8 (D.<init>()V)
+        ]);
+
+        // new #2 (C); dup; invokespecial #8 (D.<init>); return
+        let code = vec![
+            0xbb, 0x00, 0x02, // 0: new C
+            0x59, // 3: dup
+            0xb7, 0x00, 0x08, // 4: invokespecial D.<init>
+            0xb1, // 7: return
+        ];
+
+        let mut class = make_pre_java7_jsr_class(
+            "subroutine",
+            "()V",
+            1,
+            1,
+            vec![
+                0xa8, 0x00, 0x06, // 0: jsr +6 → 6
+                0xb1, // 3: return
+                0x00, 0x00, // 4..5: pad
+                0x4b, // 6: astore_0
+                0xa9, 0x00, // 7: ret 0
+            ],
+            vec![],
+        );
+        class.constant_pool = cp;
+        class.methods.push(ClassFileMethod {
+            access_flags: MethodAccessFlags::PUBLIC,
+            name: Arc::from("makeMismatch"),
+            descriptor: Arc::from("()V"),
+            attributes: vec![LazyAttribute::new_decoded(Attribute::Code(CodeAttribute {
+                max_stack: 2,
+                max_locals: 1,
+                code: cratonvm_reader::ByteView::from_vec(code),
+                exception_table: vec![],
+                attributes: vec![],
+            }))],
+        });
+
+        let res = verify_class_bytecode_inner(&class, &PermissiveHierarchy, true);
+        assert!(
+            res.is_err(),
+            "new C; invokespecial D.<init> must be rejected by the owner-match, got {res:?}"
+        );
     }
 }
