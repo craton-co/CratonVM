@@ -78,8 +78,12 @@ pub enum DeoptAction {
 /// A single value in an interpreter frame (local or stack slot).
 #[derive(Debug, Clone, PartialEq)]
 pub enum FrameValue {
-    /// Integer constant.
+    /// Integer constant (cat-1: JVM `int`/`boolean`/`byte`/`char`/`short`).
     Int(i64),
+    /// Category-2 `long` constant. Distinct from [`FrameValue::Int`] so the
+    /// resume builds a `Value::Long` (occupying one compact operand-stack slot
+    /// and two JVM local slots) rather than a truncated `Value::Int`.
+    Long(i64),
     /// Float constant (stored as raw bits).
     Float(u64),
     /// Object reference (heap address, 0 for null).
@@ -96,6 +100,12 @@ pub enum FrameValue {
     /// `Value::Int`) for ref-typed locals/stack slots such as an instance
     /// method's `this`.
     StackSlotRef(i32),
+    /// Value at a native stack slot offset, holding a category-2 **long** (the
+    /// lowerer spills the full 64-bit value). Resolves to [`FrameValue::Long`] —
+    /// the raw 64-bit word read from the slot IS the long value. Distinct from
+    /// `StackSlot` (which is a cat-1 `int`) so the resume builds a `Value::Long`
+    /// with correct cat-2 two-slot local placement (`real-frame-deopt` cat-2).
+    StackSlotLong(i32),
     /// Scalar-replaced object that must be re-materialized.
     VirtualObject(VirtualObjectState),
     /// A reference to another scalar-replaced object in the same deopt frame, by
@@ -839,6 +849,13 @@ fn resolve_value(v: &FrameValue, regs: &SavedRegisters, rbp: u64) -> FrameValue 
             // the guard captured it.
             FrameValue::Object(unsafe { addr.read_unaligned() })
         }
+        FrameValue::StackSlotLong(off) => {
+            let addr = (rbp as i64 + *off as i64) as u64 as *const i64;
+            // SAFETY: see function-level contract — frame is live, slot in-frame.
+            // The lowerer spills the full 64-bit `long`, so the raw word IS the
+            // value; the resume builds a `Value::Long` (cat-2) from it.
+            FrameValue::Long(unsafe { addr.read_unaligned() })
+        }
         other => other.clone(),
     }
 }
@@ -1086,24 +1103,31 @@ mod tests {
 
     /// `resolve_value` (via `reconstruct_frame_from_machine_state`) reads a
     /// `StackSlotRef` slot as an `Object` (the raw word IS the heap pointer),
-    /// a `StackSlot` slot as an `Int`, and passes `Unsupported` through — so
-    /// the resume can build a real `Value::Object` for ref slots instead of a
-    /// truncated `Value::Int`.
+    /// a `StackSlot` slot as an `Int`, a `StackSlotLong` slot as a cat-2 `Long`
+    /// (the full 64-bit word), and passes `Unsupported` through — so the resume
+    /// can build a real `Value::Object`/`Value::Long` for ref/long slots instead
+    /// of a truncated `Value::Int`.
     #[test]
     fn reconstruct_resolves_typed_slots() {
         // A fake native frame. `resolve_value` reads `*(rbp + off)`; the IR
-        // convention stores spills below rbp, so we point `rbp` into the middle
-        // of the buffer and use negative offsets.
-        //   buf[0] @ rbp-16 (ref slot), buf[1] @ rbp-8 (int slot).
-        let buf: [u64; 3] = [0x1111_2222_3333_4444, 0x0000_0000_DEAD_BEEF, 0];
-        let rbp = (&buf[2] as *const u64) as u64;
+        // convention stores spills below rbp, so we point `rbp` past the buffer
+        // and use negative offsets.
+        //   buf[0] @ rbp-24 (ref), buf[1] @ rbp-16 (int), buf[2] @ rbp-8 (long).
+        let buf: [u64; 4] = [
+            0x1111_2222_3333_4444,
+            0x0000_0000_DEAD_BEEF,
+            0xFEDC_BA98_7654_3210, // a full 64-bit long (high bits set)
+            0,
+        ];
+        let rbp = (&buf[3] as *const u64) as u64;
         let regs = SavedRegisters::default();
         let fs = FrameState {
             method_key: "T.m:()V".to_string(),
             bci: 3,
             locals: vec![
-                FrameValue::StackSlotRef(-16),
-                FrameValue::StackSlot(-8),
+                FrameValue::StackSlotRef(-24),
+                FrameValue::StackSlot(-16),
+                FrameValue::StackSlotLong(-8),
                 FrameValue::Unsupported,
             ],
             stack: Vec::new(),
@@ -1121,7 +1145,9 @@ mod tests {
         let rf = reconstruct_frame_from_machine_state(&dp, &regs, rbp);
         assert_eq!(rf.locals[0], FrameValue::Object(0x1111_2222_3333_4444));
         assert_eq!(rf.locals[1], FrameValue::Int(0xDEAD_BEEF));
-        assert_eq!(rf.locals[2], FrameValue::Unsupported);
+        // StackSlotLong reads the full 64-bit word (NOT truncated to i32).
+        assert_eq!(rf.locals[2], FrameValue::Long(0xFEDC_BA98_7654_3210u64 as i64));
+        assert_eq!(rf.locals[3], FrameValue::Unsupported);
     }
 
     // -- DeoptReason -------------------------------------------------------

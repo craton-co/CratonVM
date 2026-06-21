@@ -227,6 +227,14 @@ pub fn update_all_roots(
         shared.jni_global_refs.lock().update_after_gc(pointer_map);
     }
 
+    // 9a. Native upcall table — rewrite each live slot's callback `target` to its
+    //     post-relocation address so the legacy `pe_upcall_invoke` dispatch path
+    //     does not read a stale pointer after a moving collection (root scan in
+    //     roots.rs section 9a).
+    {
+        shared.upcall_table.lock().update_after_gc(pointer_map);
+    }
+
     // 9b. NIO selector side-table — the `sun.nio.ch.SelectionKeyImpl` registry
     // (nio_selector `sk_table` + per-selector key state) stores raw channel /
     // selector / attachment / key ObjectRefs. Without remapping them after a

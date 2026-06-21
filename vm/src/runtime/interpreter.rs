@@ -7676,43 +7676,66 @@ fn ir_deopt_resume_enabled() -> bool {
     *FLAG.get_or_init(|| std::env::var_os("CRATONVM_IR_DEOPT_RESUME").is_some())
 }
 
-/// Map a reconstructed frame's locals/stack `FrameValue`s to interpreter
-/// `Value`s. Handles the two type-source kinds the producer can emit today:
-/// a cat-1 `Int` slot and an object-reference slot (`StackSlotRef`, resolved
-/// in-stub to the raw heap-pointer word). Any other variant —
-/// `Float`/`Long`/`Double`/`Unsupported`/`VirtualObject`, or an unresolved
-/// `Register`/`StackSlot` (which should never reach here) — returns `None`,
-/// signalling the caller to fall back to the safe re-run path rather than
-/// materialise a mistyped or truncated slot.
+/// Map ONE reconstructed `FrameValue` (already resolved in-stub against the
+/// machine state) to an interpreter `Value`. Handles the type-source kinds the
+/// producer can emit today: a cat-1 `Int`, a cat-2 `Long`, and an
+/// object-reference (`StackSlotRef`, resolved in-stub to a raw heap-pointer
+/// word). Returns `None` for any not-yet-reconstructable variant
+/// (`Float`/`Double`/`Unsupported`/`VirtualObject`/`VirtualObjectRef`, or an
+/// unresolved `Register`/`StackSlot*` which should never reach here), so the
+/// caller falls back to the safe re-run path rather than materialise a mistyped
+/// slot.
 ///
-/// `Object(w)` is the `real-frame-deopt` type source for ref-typed locals
-/// (e.g. an instance method's `this`): `w` is the raw heap pointer captured
-/// **in-stub** at the guard (0 == null). No Java allocation runs between that
-/// capture and the frame push (`refill_pools_from_shared` only recycles Rust
-/// buffers — see `resume_from_ir_deopt`), so the pointer stays valid and needs
-/// no temporary GC root here; once the frame is pushed its locals are scanned
-/// as roots. (A GC-backed `VirtualObject` materialisation — which *does*
-/// allocate — is Phase B and is still rejected via the `None` arm.)
-///
-/// LIMITATION: a `long`/`double` is tagged `Unsupported` by the producer (it
-/// occupies two interpreter slots and a single `Value` cannot be re-expanded
-/// 1:1 here), so any method with a category-2 slot live at a guard falls back
-/// to re-run. See `real-frame-deopt.md` (cat-2 two-slot expansion follow-up).
-fn ir_deopt_frame_values(vals: &[cratonvm_jit::deopt::FrameValue]) -> Option<Vec<Value>> {
+/// `Object(w)` is the `real-frame-deopt` type source for ref-typed slots (e.g.
+/// an instance method's `this`): `w` is the raw heap pointer captured **in-stub**
+/// at the guard (0 == null). No Java allocation runs between that capture and the
+/// frame push (`refill_pools_from_shared` only recycles Rust buffers — see
+/// `resume_from_ir_deopt`), so the pointer stays valid and needs no temporary GC
+/// root here; once the frame is pushed its slots are scanned as roots. (A
+/// GC-backed `VirtualObject` materialisation — which *does* allocate — is Phase
+/// B and is still rejected via the `None` arm.)
+fn fv_to_value(v: &cratonvm_jit::deopt::FrameValue) -> Option<Value> {
     use cratonvm_jit::deopt::FrameValue;
-    vals.iter()
-        .map(|v| match v {
-            FrameValue::Int(i) => Some(Value::Int(*i as i32)),
-            FrameValue::Object(w) => Some(match *w {
-                0 => Value::Object(None),
-                // SAFETY: `w` is a live, 8-byte-aligned heap pointer read
-                // synchronously at the guard; no GC has run since (see above).
-                p => Value::Object(Some(unsafe { ObjectRef::from_raw(p as *mut u8) })),
-            }),
-            FrameValue::Undefined => Some(Value::Int(0)),
-            _ => None,
-        })
-        .collect()
+    match v {
+        FrameValue::Int(i) => Some(Value::Int(*i as i32)),
+        FrameValue::Long(l) => Some(Value::Long(*l)),
+        FrameValue::Object(w) => Some(match *w {
+            0 => Value::Object(None),
+            // SAFETY: `w` is a live, 8-byte-aligned heap pointer read
+            // synchronously at the guard; no GC has run since (see above).
+            p => Value::Object(Some(unsafe { ObjectRef::from_raw(p as *mut u8) })),
+        }),
+        FrameValue::Undefined => Some(Value::Int(0)),
+        _ => None,
+    }
+}
+
+/// Map the reconstructed **operand stack** `FrameValue`s to interpreter
+/// `Value`s, 1:1. The interpreter's operand stack is a *compact* value stack —
+/// one slot per value, including a cat-2 `long` (`push_long` advances by one
+/// compact slot, KIND_LONG) — and the IR abstract stack likewise carries one
+/// entry per `long`, so no two-slot expansion is needed here.
+fn ir_deopt_frame_values(vals: &[cratonvm_jit::deopt::FrameValue]) -> Option<Vec<Value>> {
+    vals.iter().map(fv_to_value).collect()
+}
+
+/// Map the reconstructed **locals** `FrameValue`s to a *compact* interpreter
+/// arg list for `Frame::new_pooled`. Unlike the operand stack, JVM local slots
+/// are category-2 *two-slot*: a `long` at slot `i` reserves the upper half at
+/// `i+1`, which the snapshot records as `Undefined` (NO_NODE). `copy_args_to_locals`
+/// (inside `new_pooled`) re-expands each cat-2 arg back into its two slots, so we
+/// must hand it a COMPACT list (one entry per long) — passing the JVM-slot-indexed
+/// snapshot verbatim, with its placeholder, would mis-align every subsequent
+/// local. We therefore skip the reserved upper-half slot after each `Long`.
+fn ir_deopt_locals(vals: &[cratonvm_jit::deopt::FrameValue]) -> Option<Vec<Value>> {
+    use cratonvm_jit::deopt::FrameValue;
+    let mut out = Vec::with_capacity(vals.len());
+    let mut i = 0;
+    while i < vals.len() {
+        out.push(fv_to_value(&vals[i])?);
+        i += if matches!(vals[i], FrameValue::Long(_)) { 2 } else { 1 };
+    }
+    Some(out)
 }
 
 /// Resume interpretation from an IR-path deopt: build a frame for the deopting
@@ -7749,7 +7772,9 @@ fn resume_from_ir_deopt(
     if !rframe.monitors.is_empty() {
         return bail("held monitors");
     }
-    let locals = match ir_deopt_frame_values(&rframe.locals) {
+    // Locals use the cat-2-aware compactor (a `long` is two JVM slots, re-expanded
+    // by copy_args_to_locals); the operand stack is compact (one slot per value).
+    let locals = match ir_deopt_locals(&rframe.locals) {
         Some(l) => l,
         None => return bail("unmappable local slot"),
     };
@@ -18285,15 +18310,18 @@ fn try_jit_upgrade_with_gate(
                 // probes == HotSpot, ON==OFF). `CRATONVM_JIT_IR_CALL=0` is the
                 // opt-out — restores single-pass dispatch for invokestatic.
                 std::env::var("CRATONVM_JIT_IR_CALL").map_or(true, |v| v != "0"),
-                // inc 24: invokespecial → Op::Call, gated default-OFF (its own
-                // soak). `CRATONVM_JIT_IR_CALL_SPECIAL=1` opts in.
-                std::env::var_os("CRATONVM_JIT_IR_CALL_SPECIAL").is_some(),
-                // inc 25: long methods → IR path, gated default-OFF.
-                std::env::var_os("CRATONVM_JIT_IR_LONG").is_some(),
+                // inc 24/29: invokespecial → Op::Call. Now default-ON;
+                // `CRATONVM_JIT_IR_CALL_SPECIAL=0` opts out.
+                std::env::var("CRATONVM_JIT_IR_CALL_SPECIAL").map_or(true, |v| v != "0"),
+                // inc 25/29: long methods → IR path. Now default-ON; `CRATONVM_JIT_IR_LONG=0` opts out.
+                std::env::var("CRATONVM_JIT_IR_LONG").map_or(true, |v| v != "0"),
                 // inc 26: invokevirtual/invokeinterface → Op::Call (dynamic
                 // dispatch via the helper), gated default-OFF (its own soak).
                 // `CRATONVM_JIT_IR_CALL_VIRTUAL=1` opts in.
                 std::env::var_os("CRATONVM_JIT_IR_CALL_VIRTUAL").is_some(),
+                // inc 30: double/float XMM value tier, gated default-OFF (its
+                // own soak). `CRATONVM_JIT_IR_FP=1` opts in.
+                std::env::var_os("CRATONVM_JIT_IR_FP").is_some(),
             )?;
             let entry = compiled.entry_ptr() as usize; // Cast: JIT entry point to address
             let needs_ctx = compiled.needs_context();
@@ -18400,13 +18428,16 @@ fn try_jit_upgrade_with_gate(
         // Gap B: int-only invokestatic → Op::Call. Now default-ON (inc 23);
         // `CRATONVM_JIT_IR_CALL=0` is the opt-out (single-pass dispatch).
         std::env::var("CRATONVM_JIT_IR_CALL").map_or(true, |v| v != "0"),
-        // inc 24: invokespecial → Op::Call, gated default-OFF (its own soak).
-        std::env::var_os("CRATONVM_JIT_IR_CALL_SPECIAL").is_some(),
-        // inc 25: long methods → IR path, gated default-OFF.
-        std::env::var_os("CRATONVM_JIT_IR_LONG").is_some(),
+        // inc 24/29: invokespecial → Op::Call. Now default-ON; `CRATONVM_JIT_IR_CALL_SPECIAL=0` opts out.
+        std::env::var("CRATONVM_JIT_IR_CALL_SPECIAL").map_or(true, |v| v != "0"),
+        // inc 25/29: long methods → IR path. Now default-ON; `CRATONVM_JIT_IR_LONG=0` opts out.
+        std::env::var("CRATONVM_JIT_IR_LONG").map_or(true, |v| v != "0"),
         // inc 26: invokevirtual/invokeinterface → Op::Call (dynamic dispatch via
         // the helper), gated default-OFF (its own soak). `=1` opts in.
         std::env::var_os("CRATONVM_JIT_IR_CALL_VIRTUAL").is_some(),
+        // inc 30: double/float XMM value tier, gated default-OFF (its own soak).
+        // `CRATONVM_JIT_IR_FP=1` opts in.
+        std::env::var_os("CRATONVM_JIT_IR_FP").is_some(),
     )?;
     let ret = crate::jit::return_type(&cached.method_descriptor);
     let heap = compiled.needs_heap();
@@ -18976,13 +19007,16 @@ fn try_jit_compile_callee_slow(
         // Gap B: int-only invokestatic → Op::Call. Now default-ON (inc 23);
         // `CRATONVM_JIT_IR_CALL=0` is the opt-out (single-pass dispatch).
         std::env::var("CRATONVM_JIT_IR_CALL").map_or(true, |v| v != "0"),
-        // inc 24: invokespecial → Op::Call, gated default-OFF (its own soak).
-        std::env::var_os("CRATONVM_JIT_IR_CALL_SPECIAL").is_some(),
-        // inc 25: long methods → IR path, gated default-OFF.
-        std::env::var_os("CRATONVM_JIT_IR_LONG").is_some(),
+        // inc 24/29: invokespecial → Op::Call. Now default-ON; `CRATONVM_JIT_IR_CALL_SPECIAL=0` opts out.
+        std::env::var("CRATONVM_JIT_IR_CALL_SPECIAL").map_or(true, |v| v != "0"),
+        // inc 25/29: long methods → IR path. Now default-ON; `CRATONVM_JIT_IR_LONG=0` opts out.
+        std::env::var("CRATONVM_JIT_IR_LONG").map_or(true, |v| v != "0"),
         // inc 26: invokevirtual/invokeinterface → Op::Call (dynamic dispatch via
         // the helper), gated default-OFF (its own soak). `=1` opts in.
         std::env::var_os("CRATONVM_JIT_IR_CALL_VIRTUAL").is_some(),
+        // inc 30: double/float XMM value tier, gated default-OFF (its own soak).
+        // `CRATONVM_JIT_IR_FP=1` opts in.
+        std::env::var_os("CRATONVM_JIT_IR_FP").is_some(),
     )?;
     if std::env::var_os("CRATONVM_DBG_JITC").is_some() {
         eprintln!(
@@ -22537,13 +22571,15 @@ mod tests {
     // real-frame-deopt — IR-path deopt frame-value mapping (type source)
     // -----------------------------------------------------------------------
 
-    /// `ir_deopt_frame_values` maps the producer's type-source variants to the
-    /// right interpreter `Value`s: a cat-1 `Int` stays an `Int`, an object-ref
-    /// slot (`StackSlotRef` already resolved in-stub to a raw heap word) becomes
-    /// `Value::Object` (null word → `None`, non-null word → the pointer
-    /// verbatim — NOT a truncated `Int`), and `Undefined` is a zero slot. Any
-    /// not-yet-reconstructable variant (`Unsupported` cat-2, `Float`-in-slot,
-    /// or a `VirtualObject`) returns `None`, forcing the safe re-run path.
+    /// `ir_deopt_frame_values` (the operand-stack mapper) maps the producer's
+    /// type-source variants to the right interpreter `Value`s, 1:1: a cat-1 `Int`
+    /// stays an `Int`, a cat-2 `Long` becomes a `Value::Long` (the compact stack
+    /// is one slot per value), an object-ref slot (`StackSlotRef` already resolved
+    /// in-stub to a raw heap word) becomes `Value::Object` (null word → `None`,
+    /// non-null word → the pointer verbatim — NOT a truncated `Int`), and
+    /// `Undefined` is a zero slot. Any not-yet-reconstructable variant
+    /// (`Unsupported`, `Float`-in-slot, or a `VirtualObject`) returns `None`,
+    /// forcing the safe re-run path.
     #[test]
     fn ir_deopt_frame_values_maps_object_and_int() {
         use cratonvm_jit::deopt::FrameValue;
@@ -22553,9 +22589,10 @@ mod tests {
             FrameValue::Object(0),
             FrameValue::Object(raw),
             FrameValue::Int(42),
+            FrameValue::Long(0xFEDC_BA98_7654_3210u64 as i64),
             FrameValue::Undefined,
         ])
-        .expect("Int/Object/Undefined are all mappable");
+        .expect("Int/Long/Object/Undefined are all mappable");
         assert_eq!(mapped[0], Value::Object(None), "null word → null ref");
         match mapped[1] {
             Value::Object(Some(r)) => assert_eq!(
@@ -22565,17 +22602,53 @@ mod tests {
             other => panic!("expected a non-null object reference, got {other:?}"),
         }
         assert_eq!(mapped[2], Value::Int(42));
-        assert_eq!(mapped[3], Value::Int(0), "Undefined → zero slot");
+        assert_eq!(
+            mapped[3],
+            Value::Long(0xFEDC_BA98_7654_3210u64 as i64),
+            "a cat-2 long must keep all 64 bits (not truncate to Int)"
+        );
+        assert_eq!(mapped[4], Value::Int(0), "Undefined → zero slot");
 
         // Not-yet-reconstructable variants force the safe re-run (None).
         assert!(
             ir_deopt_frame_values(&[FrameValue::Unsupported]).is_none(),
-            "a category-2 (long/double) slot must re-run, not resume"
+            "an Unsupported slot must re-run, not resume"
         );
         assert!(
             ir_deopt_frame_values(&[FrameValue::Float(0)]).is_none(),
             "an FP-in-slot must re-run until XMM resolution lands"
         );
+    }
+
+    /// `ir_deopt_locals` produces a COMPACT arg list: the JVM-slot-indexed
+    /// snapshot reserves the upper half of a cat-2 `long` as an `Undefined`
+    /// placeholder at the next slot, which must be SKIPPED (Frame::new_pooled's
+    /// copy_args_to_locals re-expands the long into its two slots). A `long`
+    /// local followed by an int must yield exactly `[Long, Int]`, not
+    /// `[Long, <placeholder>, Int]`.
+    #[test]
+    fn ir_deopt_locals_compacts_cat2() {
+        use cratonvm_jit::deopt::FrameValue;
+        // JVM-slot layout for `(long a, int x)`: a@0, <upper-half>@1, x@2.
+        let locals = ir_deopt_locals(&[
+            FrameValue::Long(7),
+            FrameValue::Undefined, // reserved upper half of the long — skipped
+            FrameValue::Int(9),
+        ])
+        .expect("Long/Undefined/Int are all mappable");
+        assert_eq!(
+            locals,
+            vec![Value::Long(7), Value::Int(9)],
+            "the long's reserved upper-half placeholder must be dropped"
+        );
+
+        // A genuine (non-long) Undefined local is kept as a zero slot.
+        assert_eq!(
+            ir_deopt_locals(&[FrameValue::Int(1), FrameValue::Undefined]),
+            Some(vec![Value::Int(1), Value::Int(0)]),
+        );
+        // An unmappable slot still forces re-run.
+        assert!(ir_deopt_locals(&[FrameValue::Unsupported]).is_none());
     }
 
     // -----------------------------------------------------------------------

@@ -4164,6 +4164,18 @@ pub fn try_compile(
     // default-OFF behind `CRATONVM_JIT_IR_CALL_VIRTUAL` at the VM call sites
     // until it soaks.
     ir_emit_virtual_calls: bool,
+    // inc 30 (double/float XMM value tier): `true` admits a `float`/`double`-using
+    // method to the optimizing IR path (the `method_uses_fp` gate otherwise bails
+    // it to single-pass). The lowerer marshals FP values through XMM
+    // (`addsd`/`cvttsd2si`/…); FP value arithmetic (`fadd`/`dmul`/…), FP
+    // constants (`fconst`/`dconst`), FP-local load/store, and the int/long⇄FP
+    // conversions lower. `frem`/`drem`, FP compares/branches, FP array ops, and
+    // FP params/returns/call-args still bail (their builder arms are absent), as
+    // do int-div-bearing and `ldc2_w`-bearing FP methods (a follow-up). `false`
+    // (the default) preserves the int/long/ref IR path byte-for-byte: no
+    // FP-opcode method is admitted, so the builder never sees an FP opcode. Gated
+    // default-OFF behind `CRATONVM_JIT_IR_FP` at the VM call sites until it soaks.
+    ir_emit_fp: bool,
 ) -> Option<CompiledMethod> {
     // round-7 fix (bug 1): short-circuit re-attempts on methods the
     // backend already permanently bailed on.  Avoids ~50µs of wasted
@@ -4218,6 +4230,7 @@ pub fn try_compile(
         ir_emit_special_calls,
         ir_emit_long,
         ir_emit_virtual_calls,
+        ir_emit_fp,
         &mut backend_attempted,
     );
 
@@ -4359,6 +4372,9 @@ fn try_compile_inner(
     // `invokeinterface` to `Op::Call` (dynamic dispatch via the helper). See
     // `try_compile`. Default-OFF at the VM call sites.
     ir_emit_virtual_calls: bool,
+    // inc 30: admit a float/double-using method to the IR path (XMM value
+    // tier). See `try_compile`. Default-OFF at the VM call sites.
+    ir_emit_fp: bool,
     // round-7 fix (bug 1): set to `true` immediately before invoking
     // the heavy `x64::compile` path so the outer wrapper can tell a
     // permanent backend bail (worth bail-listing) from an early
@@ -4507,15 +4523,35 @@ fn try_compile_inner(
     // keeps the historical IR-first behaviour.
     if optimize
         && ir::ir_compatible(&scan)
-        && (!method_uses_category2(code, code_len, &cached.method_descriptor)
+        && ((!method_uses_category2(code, code_len, &cached.method_descriptor)
+                // inc 30: the pure int/long/ref IR path stays FP-free, so a
+                // float-using (cat-1) method is no longer admitted here — it
+                // routes through the FP clause below (or bails to single-pass
+                // when the FP gate is off, exactly as it does today).
+                && !method_uses_fp(code, code_len, &cached.method_descriptor))
             // inc 25: admit a long-using method when the long gate is on, as
             // long as it is double/float-free AND int-div/rem-free. The latter
             // keeps a `long` value off a deopt point (div emits a guard whose
             // resume cannot yet reconstruct a `long` slot — a follow-up), so a
             // long is only ever live in a leaf with no safepoint.
             || (ir_emit_long
-                && !method_uses_double(code, code_len, &cached.method_descriptor)
-                && !method_has_int_div(code, code_len)))
+                && !method_uses_fp(code, code_len, &cached.method_descriptor)
+                && !method_has_int_div(code, code_len))
+            // inc 30: admit a float/double-using method when the FP gate is on.
+            // Scope (mirrors the long track's first increment): FP is used only
+            // INTERNALLY — the signature must be FP-free (`!fp_in_descriptor`),
+            // because FP params/returns ride XMM registers the prologue/epilogue
+            // do not yet marshal (a follow-on, the "also unlocks double call
+            // args + returns" item). Excludes int-div (would strand an FP value
+            // at the div deopt — whose resume can't yet reconstruct an FP slot,
+            // same discipline as the long gate) and `ldc2_w` (the builder does
+            // not yet disambiguate long-vs-double constant bits; such a method
+            // bails — a follow-up).
+            || (ir_emit_fp
+                && fp_in_body(code, code_len)
+                && !fp_in_descriptor(&cached.method_descriptor)
+                && !method_has_int_div(code, code_len)
+                && scan.ldc2w_ops.is_empty()))
     {
         // Includes the implicit `this` slot for instance methods — see
         // `prologue_param_slots` above.
@@ -5804,6 +5840,93 @@ fn is_double_opcode(op: u8) -> bool {
     )
 }
 
+/// inc 30: float-typed opcodes (the cat-1 FP opcodes, complementing
+/// `is_double_opcode`). Together they enumerate the full FP opcode space the IR
+/// builder can now lower (or must bail on). `f2d`/`d2f` (0x8d/0x90) appear in
+/// both sets — harmless, the union is OR'd.
+fn is_float_opcode(op: u8) -> bool {
+    matches!(
+        op,
+        0x0b..=0x0d          // fconst_0..2
+        | 0x17 | 0x22..=0x25 // fload, fload_0..3
+        | 0x30 | 0x51        // faload, fastore
+        | 0x38 | 0x43..=0x46 // fstore, fstore_0..3
+        | 0x62 | 0x66 | 0x6a | 0x6e | 0x72 // fadd, fsub, fmul, fdiv, frem
+        | 0x76               // fneg
+        | 0x86 | 0x89        // i2f, l2f
+        | 0x8b | 0x8c | 0x8d // f2i, f2l, f2d
+        | 0x90               // d2f
+        | 0x95 | 0x96        // fcmpl, fcmpg
+        | 0xae               // freturn
+    )
+}
+
+/// inc 30: any float OR double opcode in the body. A method containing one is an
+/// FP method and (when FP-free in its signature) is admitted to the IR path only
+/// via the `ir_emit_fp` gate clause — so with the gate off no FP opcode ever
+/// reaches the IR builder.
+fn fp_in_body(code: &[u8], code_len: usize) -> bool {
+    let mut pc = 0;
+    while pc < code_len {
+        if is_double_opcode(code[pc]) || is_float_opcode(code[pc]) {
+            return true;
+        }
+        pc += crate::scev::bytecode_len(code, pc, code_len);
+    }
+    false
+}
+
+/// inc 30: a `float`/`double` appears in the method's signature (any `F`/`D`
+/// parameter or the return type). Such a method needs XMM-register argument /
+/// return marshalling the IR prologue/epilogue do not yet emit, so it is kept
+/// off the FP IR path (a follow-on). Mirrors `method_uses_double`'s descriptor
+/// walk but matches both `F` and `D`.
+fn fp_in_descriptor(descriptor: &str) -> bool {
+    let b = descriptor.as_bytes();
+    let mut i = 1;
+    while i < b.len() && b[i] != b')' {
+        match b[i] {
+            b'F' | b'D' => return true,
+            b'L' => {
+                i += 1;
+                while i < b.len() && b[i] != b';' {
+                    i += 1;
+                }
+                i += 1;
+            }
+            b'[' => {
+                // Skip the whole array type — arrays are references (cat-1).
+                i += 1;
+                while i < b.len() && b[i] == b'[' {
+                    i += 1;
+                }
+                if i < b.len() && b[i] == b'L' {
+                    i += 1;
+                    while i < b.len() && b[i] != b';' {
+                        i += 1;
+                    }
+                    i += 1;
+                } else if i < b.len() {
+                    i += 1;
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    if let Some(rp) = b.iter().position(|&c| c == b')') {
+        if matches!(b.get(rp + 1), Some(b'F') | Some(b'D')) {
+            return true;
+        }
+    }
+    false
+}
+
+/// inc 30: the method uses `float`/`double` anywhere — signature OR body. Used by
+/// the int/long IR-path clauses to stay FP-free.
+fn method_uses_fp(code: &[u8], code_len: usize, descriptor: &str) -> bool {
+    fp_in_descriptor(descriptor) || fp_in_body(code, code_len)
+}
+
 /// inc 25: an int `idiv`/`irem` in the body. Such a method gets a div guard
 /// whose deopt resume cannot yet reconstruct a `long` slot, so admitting a long
 /// method with an int division could strand a live `long` at the deopt — bail
@@ -6077,7 +6200,7 @@ mod tests {
         IR_LOWER_COMPILES.with(|c| c.set(0));
         let c2 = try_compile(
             &cached, None, None, None, None, None, None, None, None, None, &helpers, None, None,
-            None, None, true, false, false, false, false,
+            None, None, true, false, false, false, false, false,
         );
         let c2_used_ir = IR_LOWER_COMPILES.with(|c| c.get());
         assert!(c2.is_some(), "optimize=true (C2) must compile `add`");
@@ -6090,7 +6213,7 @@ mod tests {
         IR_LOWER_COMPILES.with(|c| c.set(0));
         let c1 = try_compile(
             &cached, None, None, None, None, None, None, None, None, None, &helpers, None, None,
-            None, None, false, false, false, false, false,
+            None, None, false, false, false, false, false, false,
         );
         let c1_used_ir = IR_LOWER_COMPILES.with(|c| c.get());
         assert!(
@@ -6174,6 +6297,7 @@ mod tests {
             false,
             false,
             false,
+            false,
         );
         assert!(c2.is_some(), "optimize=true (C2) must compile `get`");
         assert_eq!(
@@ -6189,7 +6313,7 @@ mod tests {
         IR_LOWER_COMPILES.with(|c| c.set(0));
         let _ = try_compile(
             &cached, None, None, None, None, None, None, None, None, None, &helpers, None, None,
-            None, None, true, false, false, false, false,
+            None, None, true, false, false, false, false, false,
         );
         assert_eq!(
             IR_LOWER_COMPILES.with(|c| c.get()),
@@ -6611,6 +6735,7 @@ mod tests {
             false,
             false,
             false,
+            false,
         );
         assert!(r.is_some(), "an elidable `new` method must compile via IR");
         assert_eq!(
@@ -6638,6 +6763,7 @@ mod tests {
             None,
             None,
             true,
+            false,
             false,
             false,
             false,
@@ -6713,6 +6839,7 @@ mod tests {
             false, // ir_emit_special_calls (testing invokestatic, not special)
             false, // ir_emit_long
             false, // ir_emit_virtual_calls
+            false, // ir_emit_fp
         );
         assert!(
             with.is_some(),
@@ -6751,6 +6878,7 @@ mod tests {
             false, // ir_emit_special_calls OFF
             false, // ir_emit_long OFF
             false, // ir_emit_virtual_calls OFF
+            false, // ir_emit_fp OFF
         );
         assert_eq!(
             IR_LOWER_COMPILES.with(|c| c.get()),
@@ -6810,6 +6938,7 @@ mod tests {
             true,  // ir_emit_special_calls ON
             false, // ir_emit_long
             false, // ir_emit_virtual_calls OFF
+            false, // ir_emit_fp OFF
         );
         assert!(
             with.is_some(),
@@ -6837,6 +6966,7 @@ mod tests {
             false, // ir_emit_special_calls OFF
             false, // ir_emit_long OFF
             false, // ir_emit_virtual_calls OFF
+            false, // ir_emit_fp OFF
         );
         assert_eq!(
             IR_LOWER_COMPILES.with(|c| c.get()),
@@ -6879,7 +7009,7 @@ mod tests {
         IR_LOWER_COMPILES.with(|c| c.set(0));
         let with = try_compile(
             &cached, None, None, None, None, None, None, None, None, None, &helpers, None, None,
-            None, None, true, false, false, true, false,
+            None, None, true, false, false, true, false, false,
         );
         assert!(with.is_some(), "long method must compile with ir_emit_long");
         assert_eq!(
@@ -6892,12 +7022,67 @@ mod tests {
         IR_LOWER_COMPILES.with(|c| c.set(0));
         let _without = try_compile(
             &cached, None, None, None, None, None, None, None, None, None, &helpers, None, None,
-            None, None, true, false, false, false, false,
+            None, None, true, false, false, false, false, false,
         );
         assert_eq!(
             IR_LOWER_COMPILES.with(|c| c.get()),
             0,
             "without ir_emit_long, a long method must NOT take the IR pipeline"
+        );
+    }
+
+    /// inc 30 (FP value tier): a method that uses `float`/`double` internally
+    /// (with an FP-free `int` signature) routes through the IR pipeline ONLY when
+    /// `ir_emit_fp` is on. Single-pass also compiles the method, so result
+    /// equality alone would not prove the IR path ran — `IR_LOWER_COMPILES`
+    /// proves it (==1 with the flag, ==0 without → vacuous single-pass fallback).
+    #[test]
+    fn ir_fp_wiring_routes_through_ir_only_with_flag() {
+        use std::sync::Arc;
+
+        // `static int f(int a) { return (int)((float)a + 2.0f); }`
+        //   iload_0; i2f; fconst_2; fadd; f2i; ireturn
+        let cached = CachedBytecodeMethod {
+            declaring_class_id: cratonvm_types::ClassId::new(1),
+            class_name: Arc::from("pkg/F"),
+            method_name: Arc::from("f"),
+            method_descriptor: Arc::from("(I)I"),
+            source_file: None,
+            code: Arc::from([0x1a, 0x86, 0x0d, 0x62, 0x8b, 0xac, 0x00, 0x00].as_slice()),
+            exception_table: Arc::from(Vec::new().as_slice()),
+            max_stack: 4,
+            max_locals: 1,
+            num_params: 1,
+            is_synchronized: false,
+            is_static: true,
+        };
+        // SAFETY: all-zero `JitRuntimeHelpers` is valid; this test only COMPILES
+        // (never executes), and a pure FP-arithmetic method calls no helper.
+        let helpers: JitRuntimeHelpers = unsafe { std::mem::zeroed() };
+
+        // ir_emit_fp = true → the FP method takes the IR pipeline.
+        IR_LOWER_COMPILES.with(|c| c.set(0));
+        let with = try_compile(
+            &cached, None, None, None, None, None, None, None, None, None, &helpers, None, None,
+            None, None, true, false, false, false, false, true,
+        );
+        assert!(with.is_some(), "FP method must compile with ir_emit_fp");
+        assert_eq!(
+            IR_LOWER_COMPILES.with(|c| c.get()),
+            1,
+            "an FP method must route through the IR pipeline when ir_emit_fp is on"
+        );
+
+        // ir_emit_fp = false → method_uses_fp bails the IR path → single-pass.
+        IR_LOWER_COMPILES.with(|c| c.set(0));
+        let _without = try_compile(
+            &cached, None, None, None, None, None, None, None, None, None, &helpers, None, None,
+            None, None, true, false, false, false, false, false,
+        );
+        assert_eq!(
+            IR_LOWER_COMPILES.with(|c| c.get()),
+            0,
+            "without ir_emit_fp, an FP method must NOT take the IR pipeline"
         );
     }
 
@@ -6951,6 +7136,7 @@ mod tests {
             false, // ir_emit_special_calls OFF
             false, // ir_emit_long
             true,  // ir_emit_virtual_calls ON
+            false, // ir_emit_fp OFF
         );
         assert!(
             with.is_some(),
@@ -6978,6 +7164,7 @@ mod tests {
             true,  // ir_emit_special_calls ON
             false, // ir_emit_long
             false, // ir_emit_virtual_calls OFF
+            false, // ir_emit_fp OFF
         );
         assert_eq!(
             IR_LOWER_COMPILES.with(|c| c.get()),

@@ -670,6 +670,22 @@ fn sc_is_blocking(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     }
 }
 
+/// `isBound()Z` for a (server) socket channel. Not a method on the abstract
+/// `java.nio.channels.ServerSocketChannel`, but `sun.nio.ch.ServerSocketAdaptor`
+/// (returned by our `ssc_socket`) and Netty's `NioServerSocketChannel.isActive()`
+/// call `isBound()` on the channel/adaptor. We track "bound" as "a non-zero local
+/// port has been assigned" — `ssc_bind` sets `F_LOCAL_PORT` to the actual bound
+/// port (never 0 on success), and `ssc_open` initializes it to 0.
+fn ssc_is_bound(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    match obj_or_none(args, 0) {
+        Some(o) => {
+            let bound = cf_get(ctx, o, F_LOCAL_PORT).as_int().unwrap_or(0) > 0;
+            Ok(Some(Value::Int(if bound { 1 } else { 0 })))
+        }
+        _ => Ok(Some(Value::Int(0))),
+    }
+}
+
 fn sc_is_connected(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     match obj_or_none(args, 0) {
         Some(o) => Ok(Some(cf_get(ctx, o, F_CONNECTED))),
@@ -1724,6 +1740,39 @@ pub fn register_socket_channel_real(r: &mut NativeMethodRegistry) {
     let ssc = "java/nio/channels/ServerSocketChannel";
     let sscimpl = "sun/nio/ch/ServerSocketChannelImpl";
 
+    // -- SelectorProvider factory methods (JDK 21+ / Netty) --
+    // Netty's `NioServerSocketChannel`/`NioSocketChannel` build their JDK channel
+    // by calling `provider.openServerSocketChannel()` / `provider.openSocketChannel()`
+    // DIRECTLY on the cached `SelectorProvider` instance (on Windows JDK 21+ that is
+    // `sun.nio.ch.WEPollSelectorProvider`), NOT the static
+    // `ServerSocketChannel.open()` / `SocketChannel.open()` handled below. The real
+    // provider builds a JDK `ServerSocketChannelImpl`/`SocketChannelImpl` that is not a
+    // valid CratonVM channel — Netty's `AbstractChannel.register0` then sees
+    // `isOpen() == false` and throws `ClosedChannelException`, killing the Vert.x/Netty
+    // HTTP server bind (Keycloak/Quarkus). Route these provider factories to our own
+    // channel factories (which `ServerSocketChannel.open()` already uses). Register on
+    // BOTH the concrete provider and its declaring base so we match regardless of
+    // whether native dispatch keys on the receiver's concrete class or the resolved
+    // method's class. `ssc_open`/`sc_open` ignore the receiver arg, so the instance
+    // form is safe.
+    for prov in [
+        "sun/nio/ch/WEPollSelectorProvider",
+        "sun/nio/ch/SelectorProviderImpl",
+    ] {
+        r.register(
+            prov,
+            "openServerSocketChannel",
+            "()Ljava/nio/channels/ServerSocketChannel;",
+            ssc_open,
+        );
+        r.register(
+            prov,
+            "openSocketChannel",
+            "()Ljava/nio/channels/SocketChannel;",
+            sc_open,
+        );
+    }
+
     // -- SocketChannel factory + lifecycle --
     for c in [sc, scimpl] {
         r.register(c, "open", "()Ljava/nio/channels/SocketChannel;", sc_open);
@@ -1856,6 +1905,13 @@ pub fn register_socket_channel_real(r: &mut NativeMethodRegistry) {
         r.register(c, "socket", "()Ljava/net/ServerSocket;", ssc_socket);
         r.register(c, "isOpen", "()Z", sc_is_open);
         r.register(c, "isBlocking", "()Z", sc_is_blocking);
+        // `isBound()Z` is not declared on the abstract `ServerSocketChannel`, but
+        // `sun.nio.ch.ServerSocketAdaptor.isBound()` (returned by `socket()`) and
+        // Netty's `NioServerSocketChannel.isActive()` call it on our channel
+        // object (whose runtime class is `java/nio/channels/ServerSocketChannel`).
+        // Our native dispatch resolves by (class, name, desc), so registering it
+        // here makes the call succeed instead of NoSuchMethodError.
+        r.register(c, "isBound", "()Z", ssc_is_bound);
         r.register(
             c,
             "configureBlocking",
@@ -1917,6 +1973,18 @@ pub fn register_socket_channel_real(r: &mut NativeMethodRegistry) {
         r.register(
             c,
             "getLocalAddress",
+            "()Ljava/net/SocketAddress;",
+            ssc_local_address,
+        );
+        // Package-private `localAddress()` is what `sun.nio.ch.ServerSocketAdaptor`
+        // (returned by `socket()`, via getInetAddress/getLocalPort) and Netty read the
+        // bound address through. It lives on `ServerSocketChannelImpl`, not the abstract
+        // `ServerSocketChannel`, so register it on our channel object too (mirrors the
+        // SocketChannel side above). Without it the bind Runnable throws NoSuchMethodError
+        // (swallowed by the event loop), so listen() never fully completes.
+        r.register(
+            c,
+            "localAddress",
             "()Ljava/net/SocketAddress;",
             ssc_local_address,
         );

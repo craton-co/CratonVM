@@ -1,6 +1,22 @@
 # Activate the IR Optimizer (GVN / const-fold / DSE / LICM + scalar replacement)
 
-Status: design / partially-built-mostly-dormant. L. The Sea-of-Nodes IR and its
+Status: **largely landed (increments 1–29).** The Sea-of-Nodes IR + passes are
+live on the broad path; the φ/branch dam is fixed; `Op::Load`/`Store`/`New`/`Call`
+emission, escape→scalar-replacement, and a full **long (64-bit) value tier** are
+built and **default-ON** in production: `CRATONVM_JIT_IR_CALL` (invokestatic,
+inc 23), `CRATONVM_JIT_SCALAR_NEW` (inc 20), `CRATONVM_JIT_IR_LONG` (long
+arithmetic/constants/load-store/shifts/bitwise/compare/branches/call-args,
+inc 25–28) and `CRATONVM_JIT_IR_CALL_SPECIAL` (invokespecial, inc 24) all flipped
+on in **inc 29** (each with a `=0` opt-out). **Inc 30** opens the `double`/`float`
+XMM value tier (value arithmetic + constants + FP-local load/store + int/long⇄FP
+conversions) behind a new **`CRATONVM_JIT_IR_FP`** flag (default-OFF). See the
+per-increment sections below and
+**["Remaining roadmap (post-inc-29)"](#remaining-roadmap-post-inc-29)** for what is
+left (long/double call returns, `ldiv`/`lrem`, and the rest of the `double`/`float`
+XMM tier — FP compares/branches, arrays, params/returns/call-args). Original plan
+text follows.
+
+The Sea-of-Nodes IR and its
 optimization passes exist and are unit-tested, but the live JIT path only
 exercises them on a **narrow gated subset** of methods. This plan turns the
 passes on broadly behind safety gates, and opens the escape-analysis →
@@ -1689,6 +1705,82 @@ probes still == HotSpot with the gate on, and bt10/14/16/18 == HotSpot.
 `ldiv`/`lrem` (gated on long deopt-resume); then the `double`/`float` half (XMM
 registers + FP-slot deopt resume), which also unlocks `double` call args/returns.
 
+## Increment 30 (double/float XMM value tier — value arithmetic + constants + conversions, gated) landed
+
+Status: **landed**, under a new **`CRATONVM_JIT_IR_FP`** flag (default-OFF). This
+opens roadmap item 3 — the `double`/`float` value tier — with its first
+increment, mirroring the long track's discipline (value ops → constants →
+load/store → conversions, each gated + differentially soaked). The IR lowerer was
+GPR-only; it now has an **XMM register class** and marshals every `IrType::Float`/
+`Double` value through XMM.
+
+**Scope (this increment).** A method that uses `float`/`double` **internally**,
+with an **FP-free `int`/`ref` signature**, takes the IR path. Lowered:
+
+- **FP value arithmetic** — `fadd`/`dadd`, `fsub`/`dsub`, `fmul`/`dmul`,
+  `fdiv`/`ddiv`, `fneg`/`dneg`. These reuse `Op::Add`/`Sub`/`Mul`/`Div`/`Neg`
+  typed `Float`/`Double`; the lowerer dispatches on the node type to the scalar
+  XMM form (`addss`/`addsd`/…). FP `Div` has **no** zero/overflow guard (IEEE
+  `x/0` is `±inf`/`NaN`, never an exception) so it is never a deopt point; FP
+  `Neg` flips the IEEE sign bit on the integer pattern (correct for `±0.0`/`NaN`).
+- **FP constants** — `fconst_0..2`, `dconst_0..1` (`Op::ConstF`, written to the
+  result slot as a GPR immediate — no XMM).
+- **FP local load/store** — `fload`/`dload`/`fstore`/`dstore` (+ `_0..3` and the
+  wide forms `0x17`/`0x18`/`0x38`/`0x39`), identical node-graph mechanics to
+  `iload`/`lstore` (a `double` is one NodeId over two JVM slots, like a `long`).
+- **int/long ⇄ FP conversions** — `i2f`/`i2d`/`l2f`/`l2d`/`f2d`/`d2f` (`cvt*`) and
+  the truncating `f2i`/`f2l`/`d2i`/`d2l` (with the JVM NaN→0 / overflow→MAX|MIN
+  fixup after `cvtt*`, ported verbatim from the single-pass backend's
+  `emit_fp_to_int_nan_fixup` so the two backends agree bit-for-bit).
+
+**Why it's inert for the default path / gate-off byte-identical.** The
+`method_uses_fp` gate (`fp_in_descriptor || fp_in_body`, covering the full
+float+double opcode space) keeps the pure int/long/ref IR clauses FP-free, and a
+float/double method is admitted **only** via the new `ir_emit_fp` clause. So with
+the gate off **no FP opcode ever reaches the IR builder** — admission alone is the
+flag, the builder/lowerer arms need no per-call guard, and codegen is byte-for-byte
+unchanged (824 jit lib tests + 37 pre-existing differential tests unchanged).
+
+**Excluded (still bail to single-pass), and why.** FP **params/returns/call-args**
+(`!fp_in_descriptor`) — they ride XMM argument registers the IR prologue/epilogue
+do not yet marshal; this is the "also unlocks `double` call args + returns" item.
+`frem`/`drem` (no single instruction — `fmod`-style). FP **compares/branches**
+(`fcmpl`/`dcmpg` + `if`) and FP **array** ops (`faload`/`fastore`/…). **int-div**
+methods (an FP value would be live at the div deopt, whose resume can't yet
+reconstruct an FP slot — same discipline as the long gate). **`ldc2_w`** methods
+(the builder does not yet disambiguate long-vs-double constant bits). Each is a
+clean follow-up increment.
+
+**Lowerer mechanics.** The naive spill-everything model extends cleanly: every
+value lives in a frame slot as raw bits, so FP arithmetic/conversions load operand
+bits into XMM0/XMM1 (scratch — caller-saved, no value lives across nodes),
+compute, and store back. New helpers `fp_load`/`fp_store` (`movss`/`movsd`),
+`fp_binop` (`<F3|F2> 0F <op>`), and `emit_fp_to_int_fixup`. The optimizer passes
+are FP-safe **by construction**: `const_value`/`is_const_val` match only
+`Op::Const`, never `Op::ConstF`, and `int_width` returns `None` for FP — so
+constant-fold / algebraic-identity / affine-reassociation never rewrite an FP
+node (no `x*1.0`→`x` / `x+0.0`→`x` miscompiles on `±0.0`/`NaN`).
+
+**Tests** — `jit/tests/ir_vs_singlepass.rs` (+13 FP cases, `check_fp` harness with
+`ir_emit_fp` on): each corpus method takes `int` args / returns `int` (so the GPR
+`try_call` ABI is exact and the FP work stays in XMM) — `fadd`/`fsub`/`fmul`/
+`fdiv` (incl. `±inf`/overflow→`INT_MIN`/`MAX`), `dmul`/`dsub` (incl. `1e10`
+saturation), `fneg`/`dneg`, `fconst_2`/`dconst_1`, `f2d`/`d2f`, `l2f`/`f2l`/
+`l2d`/`d2l`, `double` locals (`dstore_1/3`+`dload_1/3`), the wide `fstore`/`fload`
+forms, and `0.0/0.0`→NaN→0. IR == single-pass == host anchor (Rust's saturating
+float-to-int `as`, which matches the JVM `f2i`/`d2i` semantics exactly).
+`jit/src/lib.rs::ir_fp_wiring_routes_through_ir_only_with_flag` proves the routing
+is non-vacuous: `IR_LOWER_COMPILES`==1 with `ir_emit_fp` on, ==0 without. **824/824
+jit lib, 50/50 differential, `cratonvm-vm` builds clean.**
+
+**Remaining (FP tier follow-ups, dependency order):** FP compares + branches
+(`fcmp`/`dcmp` via `ucomiss`/`ucomisd` → the 3-way `{-1,0,1}` result feeding
+`if<cond>`); FP array load/store (`faload`/`fastore`/…); FP params/returns +
+call-args (XMM prologue/epilogue marshalling + an FP-aware `try_call`/VM call
+convention — the `double` call-args/returns unlock); `frem`/`drem` (`fmod` helper);
+FP-slot deopt resume (so an FP value may be live at a deopt — lets the int-div and
+`ldc2_w` exclusions lift).
+
 ## Runtime wiring — the reachability fix (`CRATONVM_JIT_C2_FIRST_CALL`, gated) landed
 
 Status: **landed**, **default-OFF behind `CRATONVM_JIT_C2_FIRST_CALL`**. This is
@@ -1752,10 +1844,44 @@ gated branch in `fn execute`; reuses `try_jit_compile_callee`.)
 **To soak / flip on.** This is the first time the IR optimizer becomes *broad* at
 runtime, so the gate stays OFF pending: (1) the full kafka/spring/tomcat/hibernate
 gauntlet with `CRATONVM_JIT_C2_FIRST_CALL=1` (GC-safety is the key risk — more
-methods carry `Op::Call`/deopt points; run under `CRATONVM_DBG_GC_STRESS=1` and an
+methods carry `Op::Call`/deopt points; run under `CRATONVM_DBG_GC_STRESS` and an
 `-Xmx6g`-vs-`-Xmx1g` A/B); (2) a perf pass — IR virtual/interface dispatch has no
 inline cache yet, so per-call dispatch is slower; an invocation-count default and
 an MIC/PIC fast path are the likely follow-ups before any default flip.
+
+**Soak results (GC-safety micro soak — PASSED; full gauntlet still pending).**
+The headline GC-safety risk was soaked with allocation-heavy probes gate-ON vs
+gate-OFF vs HotSpot, at `-Xmx1g`/`-Xmx6g`, under max GC frequency:
+- **Non-vacuous:** a recursive linked-list probe `GcVirt.sum` (invokevirtual +
+  invokestatic + getfield over a receiver oop *live across* both `Op::Call`s — the
+  exact inc-26 oops-across-call risk) **fires IR gate-ON** (`[cratonvm-ircall]`)
+  and **zero gate-OFF**; output `664200000` == HotSpot.
+- **GC-safe under stress:** `GcVirt` with `CRATONVM_DBG_GC_STRESS=4096` (a young GC
+  on ~every allocation) == HotSpot gate-ON **and** gate-OFF at both `-Xmx1g` and
+  `-Xmx6g`; `CRATONVM_GC_VERIFY_STALE=1` emits zero stale/zeroed-header warnings.
+- **Checksums:** bt10/14/16/18 == `135854 / 3222190 / 14985902 / 68332206` gate-ON
+  (default heap); bt16 1g-vs-6g A/B identical gate-ON == gate-OFF.
+- **Pre-existing GC bug surfaced (NOT this change):** under the *extreme*
+  `CRATONVM_DBG_GC_STRESS=4096` knob at a tight heap, the **single-pass** path
+  intermittently miscomputes object-`binarytrees` (gate-OFF reproduces; a `println`
+  perturbs it away — a Heisenbug; gate-ON's IR path, which spills oops to frame
+  slots, is always correct). Filed as a separate task (likely a single-pass
+  register-resident missed root across the recursive allocating call; cf. the
+  reflrepro-A2 / kafka-25 family). The gate's own soak is clean.
+
+The remaining gating step before flipping the default is the **full app gauntlet**
+(kafka/spring/tomcat/hibernate) — a heavy multi-hour run via the per-suite
+`apps/*/...` harnesses; the GC-safety headline is validated by the above.
+
+**Follow-up feasibility (scoped).** (a) *IR `Op::Call` inline cache* (MIC/PIC fast
+path in `ir_lower`): **feasible-medium**, deferred to a post-flip perf pass (its
+ABI risk would muddy the soak; it only matters once the gate is ON). (b) *Route
+OSR through `try_compile`*: **infeasible without building IR-OSR from scratch** —
+the IR pipeline emits zero OSR-entry metadata (`ir_lower::lower` leaves all `osr_*`
+fields default), so it requires re-implementing the x64 OSR machinery
+(`x64.rs:21850-21923`, LICM-preheader rules, per-block live-in) in the IR backend.
+XL, high GC-safety risk; tracked as a separate epic. Until then OSR-dominated /
+loop-on-first-call kernels remain single-pass (see Scope below).
 
 **Scope (what this does and does NOT reach).** The dispatcher warmup path
 (`try_jit_upgrade_with_gate`) was *already* wired to `try_compile(optimize=true)`
@@ -1786,6 +1912,113 @@ method would be sealed on call #1 and never reach the counter. Trade-off vs gate
 a method called 1–499× via `fn execute` then never again now interprets to completion
 where gate-OFF it single-pass-compiled on call #1 — a warmup-latency cost, acceptable
 for the gated soak.
+
+## Increment 29 (flip `CRATONVM_JIT_IR_LONG` + `CRATONVM_JIT_IR_CALL_SPECIAL` ON) landed
+
+Status: **landed** on `dev`. The production-validation step for the long track
+(inc 25–28) and `invokespecial` (inc 24): both gates flip from default-OFF to
+**default-ON**, with `=0` as the opt-out at each of the 6 VM `try_compile` sites
+(3 each). Mirrors the inc-23 `IR_CALL` flip. After this, long-using methods and
+`super.`/non-virtual `invokespecial` callers take the optimizing IR path by
+default.
+
+**What landed** (`vm/src/runtime/interpreter.rs`): the 6 gate reads change from
+`std::env::var_os("CRATONVM_JIT_IR_{LONG,CALL_SPECIAL}").is_some()` (default-OFF)
+to `std::env::var(..).map_or(true, |v| v != "0")` (default-ON, `=0` opt-out). No
+other change — the inc-24..28 machinery is unchanged.
+
+**Soak** (the gate is a runtime env var, so one flipped build validates both
+states: default = both ON, `CRATONVM_JIT_IR_LONG=0 CRATONVM_JIT_IR_CALL_SPECIAL=0`
+= both OFF). The decisive invariant is **ON ≡ OFF on every workload** (the flip
+only changes a default), confirmed across a broad, diverse set:
+- **bt10/14/16/18** (long-heavy) == HotSpot (`135854 / 3222190 / 14985902 /
+  68332206`), ON and OFF.
+- **Six targeted probes** — `IrLong`/`IrLong2`/`IrLong3`/`IrLong4` (long
+  arithmetic / wide load-store + `ldc2_w` / shifts-bitwise-`lcmp` / long call
+  arg), `IrSpecial` (`invokespecial`), `IrCall` (`invokestatic`) — all == HotSpot
+  ON and OFF.
+- **23 bench programs** (`binarytrees`, `fannkuch`, `IntegrationTest`,
+  `Benchmark`, `QuickBench`, `MatrixJIT`/`Scale`, `IntrinsicBench`,
+  `FullStackBench`, `NBody3D`/`Mini`, `TestLambda`/`Stream`/`Switch`/`Enum`/
+  `Generics`/`Sort`/`Interface`/`Varargs`/`Pair`, `SieveBench`, …) == HotSpot,
+  ON and OFF.
+- **`QuickBenchLong`** (long-heavy: a 1.5-billion-iteration `long` arithmetic
+  checksum `2812500002999999995`, Fibonacci(44), sieve, matrix) — ON ≡ OFF.
+
+**Scope of the soak (honest)**: the full kafka/spring/tomcat/hibernate gradle
+suites were **not** run (impractical in this environment — Linux-path harness
+scripts, heavy JUnit setup); the soak is bt + 6 targeted probes + 23 diverse
+bench programs + `QuickBenchLong`, all ON≡OFF==HotSpot — the same bar used to flip
+`IR_CALL` (inc 23). `IR_CALL_SPECIAL` is narrow (`super.`/non-virtual instance
+calls), and `IR_LONG` carries 39 differential tests + a 5-agent adversarial
+review behind it; `=0` remains the opt-out if a suite ever regresses.
+
+**Still gated-OFF / deferred** (unchanged): long/double call *returns*
+(`i64::MIN`-sentinel task), `ldiv`/`lrem` (long deopt-resume), and the entire
+`double`/`float` half (XMM). `CRATONVM_JIT_IR_CALL` virtual/interface dispatch
+(the concurrent inc-26 track) has its own flag/soak.
+
+## Remaining roadmap (post-inc-29)
+
+The single consolidated to-do for whoever picks this up next. Increments 1–29
+are landed and (where flagged) default-ON. What remains, in dependency order:
+
+1. **`i64::MIN`-return / deopt-sentinel fix** *(unblocks long/double call returns;
+   own task)*. The JIT returns `i64::MIN` in RAX as the universal deopt/exception
+   sentinel (`x64.rs` epilogue + the `Op::Call` bail check; interpreter.rs post-JIT
+   dispatch does `CMP RAX, i64::MIN; JE`). A method that legitimately returns
+   `Long.MIN_VALUE` is misread as deoptimized → silently re-executed (side effects
+   can double). **Pre-existing in BOTH backends** (single-pass already compiles
+   long-returning methods), found by the inc-26 adversarial review. Fix: signal
+   deopt/exception **out-of-band** (a TLS flag the helper sets, checked *before*
+   inspecting RAX, like the pending-NPE/AIOOBE flags) for `J`/`D` returns. Spun
+   off as a background task (see commit history / `spawn_task`). Once fixed,
+   relax `static_call_shape` to accept `J`/`D` *returns* and the
+   `lreturn`/`dreturn` paths are fully safe.
+
+2. **`ldiv`/`lrem`** *(blocked on long deopt-resume)*. The IR `Op::Div`/`Op::Rem`
+   div-by-zero guard **deopts** (`emit_div_zero_guard` → `emit_deopt_if_zero`),
+   unlike single-pass's direct-throw. A `long` live at that deopt needs frame
+   reconstruction, but (a) `frame_value_for` maps `Long` to
+   `FrameValue::Unsupported` (`ir_lower.rs`), and (b) the IR deopt entry isn't
+   wired into VM dispatch (no `ir_deopt_entry`/`take_last_deopt` caller — emit-and
+   -discard). So the inc-25 gate bails any long method with int `idiv`/`irem`
+   (`method_has_int_div`) and the builder never lowers `ldiv`/`lrem`. To unlock:
+   wire the IR deopt entry into VM dispatch **and** make long (and double) a
+   real `FrameValue` width on resume; then add the `ldiv`/`lrem` builder arms
+   (the lowerer's `Op::Div`/`Rem` are already 64-bit-aware) and drop the
+   `method_has_int_div` bail. (The inc-27 phi-typing fix already types long/double
+   phis correctly for that resume.)
+
+3. **`double`/`float` value tier (XMM)** *(the next major sub-project; **first
+   increment landed — inc 30**)*. The whole second half of category-2. The XMM
+   register class in `ir_lower.rs` now exists, and **inc 30** (behind
+   `CRATONVM_JIT_IR_FP`, default-OFF) lowers the FP **value ops** (`fadd`/`dadd`/
+   …, `fneg`/`dneg`), **constants** (`fconst`/`dconst`), **FP-local load/store**
+   (`fload`/`dload`/`fstore`/`dstore` incl. wide forms), and the **int/long⇄FP
+   conversions** (`i2f`/`i2d`/`l2f`/`l2d`/`f2d`/`d2f` and the fixup-bearing
+   `f2i`/`f2l`/`d2i`/`d2l`). `method_uses_fp` is the new admission gate (a
+   bail→gate flip). What remains of the tier, in dependency order:
+   - **FP compares + branches** (`fcmpl`/`fcmpg`/`dcmpl`/`dcmpg` via `ucomiss`/
+     `ucomisd` → the 3-way `{-1,0,1}` result feeding `if<cond>`, with the NaN
+     "unordered" rule distinguishing `cmpl` vs `cmpg`).
+   - **FP array load/store** (`faload`/`daload`/`fastore`/`dastore`).
+   - **FP params/returns + call-args** — XMM prologue/epilogue marshalling + an
+     FP-aware VM→JIT call convention (FP args in XMM0-3/0-7, FP return in XMM0).
+     This **also unlocks `double`/`float` call args + returns** (extend
+     `static_call_shape` to accept `D`/`F` once XMM marshalling exists).
+   - **`frem`/`drem`** (`fmod`-style remainder helper — no single instruction).
+   - **FP-slot deopt resume** (let an FP value be live at a deopt — lifts the
+     inc-30 int-div and `ldc2_w` exclusions). `typed_stack_slot` already carries
+     `FrameValue::Float` for a future FP-aware resume.
+   Continue mirroring the long track's increment discipline, each slice gated
+   behind `CRATONVM_JIT_IR_FP` + differential/probe soak.
+
+**Adjacent (separate tracks, not this doc's to finish):** virtual/interface
+dispatch via inline caches (`CRATONVM_JIT_IR_CALL` for `invokevirtual`/
+`invokeinterface`, the concurrent inc-26 work — bug-24-sensitive); the deopt/OSR
+machinery (`real-frame-deopt*.md`) whose completion is what items 1–2 above
+ultimately lean on.
 
 ## Implementation steps (ordered)
 

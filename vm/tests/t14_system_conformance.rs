@@ -24,6 +24,44 @@ fn read_ws(rel: &str) -> String {
     std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()))
 }
 
+/// Whitespace-stripped copy of a source file. `registry.register(...)` calls
+/// are frequently wrapped across several lines by rustfmt, so a per-line text
+/// scan misses them (and conflicts with `cargo fmt`). Matching against the
+/// whitespace-free form makes the `("class", "method", "descriptor")` tuple
+/// detectable regardless of line wrapping.
+fn compact_ws(src: &str) -> String {
+    src.chars().filter(|c| !c.is_whitespace()).collect()
+}
+
+/// True if the (whitespace-free) source contains a
+/// `register("class", "method", "descriptor", ...)` call in any wrapping.
+fn registers(compact: &str, class: &str, method: &str, desc: &str) -> bool {
+    compact.contains(&format!("\"{class}\",\"{method}\",\"{desc}\""))
+}
+
+/// The ~240 chars following a `"class","method"` registration key in the
+/// whitespace-free source — i.e. the descriptor + handler argument, used to
+/// assert a registration is wired to a real impl rather than a stub closure.
+fn reg_args<'a>(compact: &'a str, class: &str, method: &str) -> Option<&'a str> {
+    let key = format!("\"{class}\",\"{method}\"");
+    let i = compact.find(&key)?;
+    let start = i + key.len();
+    let end = (start + 240).min(compact.len());
+    Some(&compact[start..end])
+}
+
+/// The handler argument of a specific `register("class","method","desc", H)`
+/// call: the text from just after the (class, method, descriptor) tuple up to
+/// the call-terminating `;`. Bounded to the single call so it cannot spill into
+/// an adjacent registration (e.g. a neighbouring stub returning `Object(None)`).
+fn reg_handler<'a>(compact: &'a str, class: &str, method: &str, desc: &str) -> Option<&'a str> {
+    let key = format!("\"{class}\",\"{method}\",\"{desc}\"");
+    let i = compact.find(&key)?;
+    let rest = &compact[i + key.len()..];
+    let end = rest.find(';').map(|e| e + 1).unwrap_or(rest.len());
+    Some(&rest[..end])
+}
+
 // ===========================================================================
 // T14.1 — Phase 1 bootstrap methods registered
 // ===========================================================================
@@ -48,18 +86,11 @@ const SYSTEM_NATIVES: &[(&str, &str)] = &[
 
 #[test]
 fn t14_all_system_natives_registered() {
-    let lib = read_ws("native-builtins/src/lib.rs");
+    let compact = compact_ws(&read_ws("native-builtins/src/lib.rs"));
     let mut missing: Vec<String> = Vec::new();
 
     for &(method, descriptor) in SYSTEM_NATIVES {
-        let method_pat = format!("\"{}\"", method);
-        let desc_pat = format!("\"{}\"", descriptor);
-        let found = lib.lines().any(|line| {
-            line.contains("\"java/lang/System\"")
-                && line.contains(&method_pat)
-                && line.contains(&desc_pat)
-        });
-        if !found {
+        if !registers(&compact, "java/lang/System", method, descriptor) {
             missing.push(format!("{method}{descriptor}"));
         }
     }
@@ -86,6 +117,7 @@ fn t14_all_system_natives_registered() {
 fn t14_init_phases_use_named_functions() {
     let lib = read_ws("native-builtins/src/lib.rs");
 
+    let compact = compact_ws(&lib);
     let patterns = [
         ("initPhase1", "native_system_init_phase1"),
         ("initPhase2", "native_system_init_phase2"),
@@ -93,11 +125,8 @@ fn t14_init_phases_use_named_functions() {
     ];
 
     for (method, func) in &patterns {
-        let found = lib.lines().any(|line| {
-            line.contains("\"java/lang/System\"")
-                && line.contains(&format!("\"{}\"", method))
-                && line.contains(func)
-        });
+        let found =
+            reg_args(&compact, "java/lang/System", method).is_some_and(|w| w.contains(func));
         assert!(
             found,
             "T14: initPhase method '{}' not wired to '{}'",
@@ -126,18 +155,11 @@ const VM_NATIVES: &[(&str, &str)] = &[
 
 #[test]
 fn t14_all_vm_natives_registered() {
-    let lib = read_ws("native-builtins/src/lib.rs");
+    let compact = compact_ws(&read_ws("native-builtins/src/lib.rs"));
     let mut missing: Vec<String> = Vec::new();
 
     for &(method, descriptor) in VM_NATIVES {
-        let method_pat = format!("\"{}\"", method);
-        let desc_pat = format!("\"{}\"", descriptor);
-        let found = lib.lines().any(|line| {
-            line.contains("\"jdk/internal/misc/VM\"")
-                && line.contains(&method_pat)
-                && line.contains(&desc_pat)
-        });
-        if !found {
+        if !registers(&compact, "jdk/internal/misc/VM", method, descriptor) {
             missing.push(format!("{method}{descriptor}"));
         }
     }
@@ -162,25 +184,26 @@ fn t14_all_vm_natives_registered() {
 
 #[test]
 fn t14_vm_get_saved_property_not_stub() {
-    let lib = read_ws("native-builtins/src/lib.rs");
+    let compact = compact_ws(&read_ws("native-builtins/src/lib.rs"));
 
-    // Find the getSavedProperty registration line
-    let line = lib
-        .lines()
-        .find(|l| l.contains("\"jdk/internal/misc/VM\"") && l.contains("\"getSavedProperty\""))
-        .expect("getSavedProperty registration not found");
+    // Find the getSavedProperty registration handler (any line-wrapping).
+    let args = reg_handler(
+        &compact,
+        "jdk/internal/misc/VM",
+        "getSavedProperty",
+        "(Ljava/lang/String;)Ljava/lang/String;",
+    )
+    .expect("getSavedProperty registration not found");
 
-    // Must NOT be an inline closure returning null
+    // Must NOT be an inline stub closure (whitespace-stripped form).
     assert!(
-        !line.contains("|_ctx, _args|"),
-        "T14: VM.getSavedProperty still uses a stub closure: {}",
-        line.trim(),
+        !args.contains("|_ctx,_args|"),
+        "T14: VM.getSavedProperty still uses a stub closure",
     );
     // Must point to the real implementation
     assert!(
-        line.contains("native_vm_get_saved_property"),
-        "T14: VM.getSavedProperty not wired to native_vm_get_saved_property: {}",
-        line.trim(),
+        args.contains("native_vm_get_saved_property"),
+        "T14: VM.getSavedProperty not wired to native_vm_get_saved_property",
     );
     eprintln!("[T14.4] ✓ VM.getSavedProperty uses real implementation");
 }
@@ -191,23 +214,24 @@ fn t14_vm_get_saved_property_not_stub() {
 
 #[test]
 fn t14_vm_get_runtime_arguments_not_stub() {
-    let lib = read_ws("native-builtins/src/lib.rs");
+    let compact = compact_ws(&read_ws("native-builtins/src/lib.rs"));
 
-    let line = lib
-        .lines()
-        .find(|l| l.contains("\"jdk/internal/misc/VM\"") && l.contains("\"getRuntimeArguments\""))
-        .expect("getRuntimeArguments registration not found");
+    let args = reg_handler(
+        &compact,
+        "jdk/internal/misc/VM",
+        "getRuntimeArguments",
+        "()[Ljava/lang/String;",
+    )
+    .expect("getRuntimeArguments registration not found");
 
-    // Must NOT return null
+    // Must NOT return null and must be wired to the named function.
     assert!(
-        !line.contains("Object(None)"),
-        "T14: VM.getRuntimeArguments still returns null: {}",
-        line.trim(),
+        !args.contains("Object(None)"),
+        "T14: VM.getRuntimeArguments still returns null",
     );
     assert!(
-        line.contains("native_vm_get_runtime_arguments"),
-        "T14: VM.getRuntimeArguments not wired to named function: {}",
-        line.trim(),
+        args.contains("native_vm_get_runtime_arguments"),
+        "T14: VM.getRuntimeArguments not wired to named function",
     );
     eprintln!("[T14.5] ✓ VM.getRuntimeArguments returns empty array (not null)");
 }

@@ -105,7 +105,16 @@ pub struct G1Region {
     /// Per-region remembered set.
     pub rset: RememberedSet,
     /// Whether this region is pinned (JEP 423: JNI critical region pinning).
+    /// Mirror of `pin_count > 0` — the CSet-selection filters read this flag.
     pub pinned: bool,
+    /// Number of live JNI-critical pins on this region (refcount). Overlapping
+    /// critical sections on arrays in the same region — or nested checkouts of
+    /// one array — must refcount: a single bool would let an inner `Release`
+    /// clear the pin while an outer section is still live, re-admitting the
+    /// region to the collection set and relocating an array a native pointer's
+    /// copy-back still depends on. Maintained by [`G1Collector::pin_region`] /
+    /// [`G1Collector::unpin_region`].
+    pub pin_count: u32,
     /// Survivor age (number of young GCs survived).
     pub age: u8,
     /// Per-region mark bitmap for concurrent marking.
@@ -138,6 +147,7 @@ impl G1Region {
             gc_efficiency: 0.0,
             rset: RememberedSet::default(),
             pinned: false,
+            pin_count: 0,
             age: 0,
             mark_bitmap,
         }
@@ -148,6 +158,14 @@ impl G1Region {
         self.data.len().saturating_sub(self.cursor)
     }
 
+    /// Step 7 — estimated time (ns) to evacuate this region's live data, used
+    /// by pause-target collection-set sizing. Evacuation cost is dominated by
+    /// copying the region's live bytes (plus per-slot reference rewriting);
+    /// `ns_per_byte` is the collector's rolling `evac_ns_per_byte` calibration.
+    pub fn estimated_evac_cost_ns(&self, ns_per_byte: u64) -> u64 {
+        (self.live_bytes as u64).saturating_mul(ns_per_byte)
+    }
+
     /// Reset this region to Free state.
     fn reset(&mut self) {
         self.region_type = RegionType::Free;
@@ -156,6 +174,7 @@ impl G1Region {
         self.gc_efficiency = 0.0;
         self.rset.clear();
         self.pinned = false;
+        self.pin_count = 0;
         self.age = 0;
         // Round-2 fix (HIGH — GC #5): clear stale mark bits so they don't
         // pollute the next concurrent-mark cycle. The Vec is never
@@ -267,6 +286,16 @@ pub struct G1Collector {
     collection_count: AtomicU64,
     /// Total pause time in milliseconds across all collections.
     total_pause_ms: AtomicU64,
+
+    /// Step 7 (pause-target CSet sizing) — rolling per-region copy-cost
+    /// calibration: an EMA of observed evacuation cost in **nanoseconds per
+    /// live byte copied**, refreshed from each *mixed* collection (the
+    /// collections that actually evacuate old regions). `estimated_evac_cost_ns`
+    /// multiplies a region's `live_bytes` by this to bound the mixed collection
+    /// set against `max_gc_pause_ms`. Initialised to 4 ns/byte (~250 MB/s,
+    /// matching `region::Region::estimated_evac_cost_ns`) and clamped positive.
+    /// Relaxed: a statistics/scheduling signal, not a correctness guard.
+    evac_ns_per_byte: AtomicU64,
 
     /// Current old-gen bytes (for IHOP tracking).
     old_gen_bytes: AtomicUsize,
@@ -390,6 +419,7 @@ impl G1Collector {
             satb_queue: Arc::new(SatbQueue::new()),
             collection_count: AtomicU64::new(0),
             total_pause_ms: AtomicU64::new(0),
+            evac_ns_per_byte: AtomicU64::new(4),
             old_gen_bytes: AtomicUsize::new(0),
             marking_threshold_bytes: AtomicUsize::new(ihop_threshold),
             string_dedup_table: Mutex::new(FxHashMap::default()),
@@ -873,7 +903,12 @@ impl G1Collector {
     /// 3. **Cap:** at most `old_cset_region_threshold_percent` of all
     ///    regions (defaults to 10%), with a minimum of one region so
     ///    a tiny heap still makes progress.
-    /// 4. **Deterministic:** ties broken by ascending region index.
+    /// 4. **Pause-target cap (Step 7):** on top of the percentage cap, stop
+    ///    adding old regions once their estimated copy time (rolling
+    ///    `evac_ns_per_byte` × `live_bytes`) would exceed `max_gc_pause_ms`,
+    ///    always keeping ≥1 region. Deferred regions are reclaimed in a later
+    ///    mixed cycle.
+    /// 5. **Deterministic:** ties broken by ascending region index.
     ///
     /// This helper is exposed publicly so tests and external policy
     /// hooks can inspect the selection without running a full mixed
@@ -896,11 +931,23 @@ impl G1Collector {
                 .unwrap_or(std::cmp::Ordering::Equal)
                 .then_with(|| a.0.cmp(&b.0))
         });
-        candidates
-            .into_iter()
-            .take(max_old)
-            .map(|(i, _)| i)
-            .collect()
+        // Step 7 — pause-target cap, mirroring the inline `mixed_collection`
+        // path: bound the old CSet by the `max_gc_pause_ms` copy-time budget
+        // (rolling `evac_ns_per_byte` × `live_bytes`) on top of the percentage
+        // cap, always keeping at least one region for forward progress.
+        let budget_ns = self.config.max_gc_pause_ms.saturating_mul(1_000_000);
+        let ns_per_byte = self.evac_ns_per_byte.load(Ordering::Relaxed).max(1);
+        let mut cost_ns: u64 = 0;
+        let mut out: Vec<usize> = Vec::new();
+        for (i, _) in candidates.into_iter().take(max_old) {
+            let cost = regions[i].estimated_evac_cost_ns(ns_per_byte);
+            if !out.is_empty() && cost_ns.saturating_add(cost) > budget_ns {
+                break;
+            }
+            out.push(i);
+            cost_ns = cost_ns.saturating_add(cost);
+        }
+        out
     }
 
     /// Perform a mixed collection. Evacuates young + selected old regions.
@@ -952,8 +999,27 @@ impl G1Collector {
                 .then_with(|| a.0.cmp(&b.0))
         });
 
+        // Step 7 — pause-target CSet sizing. On top of the percentage cap
+        // (`max_old`), bound the OLD collection set by an estimated copy-time
+        // budget so a mixed pause stays near `max_gc_pause_ms`. Per-region cost
+        // uses the rolling `evac_ns_per_byte` calibration. Always include at
+        // least one old region for forward progress; stop before the budget is
+        // exceeded — the deferred regions are reclaimed in a later mixed cycle
+        // (`mixed_gc_remaining`). The percentage cap remains the hard upper
+        // bound; the budget only binds when a single mixed GC would copy enough
+        // live old data to blow the target (a genuinely long pause).
+        let budget_ns = self.config.max_gc_pause_ms.saturating_mul(1_000_000);
+        let ns_per_byte = self.evac_ns_per_byte.load(Ordering::Relaxed).max(1);
+        let mut old_cost_ns: u64 = 0;
+        let mut old_selected: usize = 0;
         for (idx, _) in old_candidates.into_iter().take(max_old) {
+            let cost = regions[idx].estimated_evac_cost_ns(ns_per_byte);
+            if old_selected > 0 && old_cost_ns.saturating_add(cost) > budget_ns {
+                break;
+            }
             cset.push(idx);
+            old_cost_ns = old_cost_ns.saturating_add(cost);
+            old_selected += 1;
         }
 
         let cset_set: std::collections::HashSet<usize> = cset.iter().copied().collect();
@@ -1071,7 +1137,12 @@ impl G1Collector {
             }
         }
 
-        let pause_ms = start.elapsed().as_millis() as u64;
+        let elapsed = start.elapsed();
+        let pause_ms = elapsed.as_millis() as u64;
+        // Step 7 — recalibrate the rolling copy-cost from this mixed cycle's
+        // actual pause / bytes copied, so the next mixed CSet is sized against
+        // real wall-clock throughput.
+        self.update_evac_cost(elapsed.as_nanos() as u64, bytes_copied);
         // Relaxed ordering: statistics counters for monitoring/logging only.
         self.collection_count.fetch_add(1, Ordering::Relaxed);
         self.total_pause_ms.fetch_add(pause_ms, Ordering::Relaxed);
@@ -2127,20 +2198,49 @@ impl G1Collector {
     // Region Pinning (JEP 423)
     // -----------------------------------------------------------------------
 
-    /// Pin a region, preventing it from being evacuated during GC.
+    /// Pin a region, preventing it from being evacuated during GC. Refcounted:
+    /// each `pin_region` must be balanced by exactly one [`unpin_region`], so
+    /// overlapping JNI critical sections on the same region pin/unpin
+    /// independently.
     pub fn pin_region(&self, region_idx: usize) {
         let mut regions = self.regions.lock();
         if region_idx < regions.len() {
-            regions[region_idx].pinned = true;
+            let r = &mut regions[region_idx];
+            r.pin_count = r.pin_count.saturating_add(1);
+            r.pinned = true;
         }
     }
 
-    /// Unpin a region, allowing it to be collected again.
+    /// Unpin a region, allowing it to be collected again once its pin count
+    /// returns to zero. Tolerant of an unbalanced call (count already zero), so
+    /// a stray double-`Release` from native code cannot wrongly clear a pin
+    /// another section still holds.
     pub fn unpin_region(&self, region_idx: usize) {
         let mut regions = self.regions.lock();
         if region_idx < regions.len() {
-            regions[region_idx].pinned = false;
+            let r = &mut regions[region_idx];
+            r.pin_count = r.pin_count.saturating_sub(1);
+            if r.pin_count == 0 {
+                r.pinned = false;
+            }
         }
+    }
+
+    /// Pin the region backing the object at `addr` (a JNI critical section) and
+    /// return its index for the matching [`unpin_region`], or `None` if `addr`
+    /// is not in any region. Refcounted via [`pin_region`].
+    ///
+    /// G1's only object-moving paths — `young_collection` and
+    /// `mixed_collection` — exclude pinned regions from the collection set, and
+    /// no full-GC compaction path exists, so this guarantees the object stays
+    /// at `addr` until every pin is released. That is what lets
+    /// `GetPrimitiveArrayCritical`'s detached copy be copied back to the *same*
+    /// object at `Release` (its Get-time handle would otherwise go stale once
+    /// the array was evacuated). See the design doc §3.2.5.
+    pub fn pin_region_for_addr(&self, addr: usize) -> Option<usize> {
+        let idx = self.lookup_region_for_addr(addr)?;
+        self.pin_region(idx);
+        Some(idx)
     }
 
     /// Check if a region is pinned.
@@ -2189,6 +2289,23 @@ impl G1Collector {
     // -----------------------------------------------------------------------
 
     /// Log a GC event if logging is enabled.
+    /// Step 7 — refresh the rolling `evac_ns_per_byte` calibration from a
+    /// completed mixed collection. Observed cost = whole pause / bytes copied
+    /// (deliberately includes the fixed scan overhead, so it slightly
+    /// *over*-estimates → a smaller, safer collection set). Smoothed with a
+    /// slow EMA (1/8 weight on the new sample) and clamped to a sane band so a
+    /// single anomalous cycle cannot wreck the estimate. No-op when nothing was
+    /// copied (no signal).
+    fn update_evac_cost(&self, pause_ns: u64, bytes_copied: usize) {
+        if bytes_copied == 0 || pause_ns == 0 {
+            return;
+        }
+        let observed = (pause_ns / bytes_copied as u64).clamp(1, 4096);
+        let prev = self.evac_ns_per_byte.load(Ordering::Relaxed).max(1);
+        let next = (prev.saturating_mul(7).saturating_add(observed)) / 8;
+        self.evac_ns_per_byte.store(next.max(1), Ordering::Relaxed);
+    }
+
     fn log_gc_event(&self, collection_type: &G1CollectionType, pause_ms: u64, stats: &GcStats) {
         if !self.gc_log_enabled.load(Ordering::Relaxed) {
             return;
@@ -4077,6 +4194,88 @@ mod tests {
         assert_eq!(result.pointer_map[&old_addr], roots[0].as_ptr() as usize);
     }
 
+    /// MOVING-GC empirical confirmation for the JNI non-critical
+    /// `Get/Release<Type>ArrayElements` copy-back handle.
+    ///
+    /// When a G1 young evacuation relocates an array between `GetArrayElements`
+    /// and `ReleaseArrayElements`, the raw `array` jobject the native side holds
+    /// (a CratonVM local ref is exactly `obj.as_ptr()`, captured at Get) becomes
+    /// a stale from-space pointer. The OLD copy-back re-resolved THAT pointer via
+    /// `is_heap_addr` (as `jobject_to_obj` does for a local ref) and therefore
+    /// either silently dropped (region freed → `None`) or wrote into a recycled
+    /// object. The FIX records a *remappable* handle instead — a JNI global ref,
+    /// whose boxed `ObjectRef` `update_after_gc` rewrites through the very
+    /// `pointer_map` produced here — so the copy-back follows the array.
+    ///
+    /// This reproduces the exact relocation and proves BOTH halves: (a) the
+    /// stale raw handle no longer resolves to a live heap address, and (b) the
+    /// remapped handle resolves to the array's new location with data intact and
+    /// a copy-back write lands in the live array.
+    #[test]
+    fn jni_array_raw_handle_stale_after_evacuation_but_remap_survives() {
+        let gc = make_collector();
+        let arr = gc.alloc_array(ClassId::new(0), ArrayElementType::Int, 3);
+        gc.set_array_element(arr, 0, Value::Int(111)).unwrap();
+        gc.set_array_element(arr, 1, Value::Int(222)).unwrap();
+        gc.set_array_element(arr, 2, Value::Int(333)).unwrap();
+
+        // The raw `array` jobject value native code holds across the window,
+        // captured BEFORE the GC (exactly what the old Release re-resolved).
+        let stale_handle = arr.as_ptr() as usize;
+
+        // `roots` models the remappable keep-alive handle: a JNI global ref boxes
+        // an `ObjectRef` that the collector rewrites in place via this same
+        // pointer-map mechanism (`JniGlobalRefs::update_after_gc`).
+        let mut roots = vec![arr];
+        let result = gc.young_collection(&mut roots, &NoopMonitors);
+        let remapped = roots[0];
+        let new_addr = remapped.as_ptr() as usize;
+
+        // The evacuation actually MOVED the array (otherwise the test is vacuous).
+        assert_eq!(result.pointer_map.get(&stale_handle), Some(&new_addr));
+        assert_ne!(
+            stale_handle, new_addr,
+            "array must relocate for this test to be meaningful"
+        );
+
+        // (a) BUG path: the old raw handle is now stale — its region was
+        // evacuated and freed, so the local-ref re-resolve fails. The old
+        // copy-back would silently drop the native mutations here.
+        assert!(
+            !gc.is_addr_in_live_region(stale_handle),
+            "evacuated array's old address should be a freed region"
+        );
+        assert!(
+            gc.is_heap_addr(stale_handle).is_none(),
+            "stale local-ref handle must not resolve to a live object"
+        );
+
+        // (b) FIX path: the remapped handle resolves to the array's CURRENT
+        // location with the data preserved across the copy.
+        assert!(gc.is_addr_in_live_region(new_addr));
+        assert_eq!(gc.array_length(remapped), 3);
+        assert_eq!(
+            gc.get_array_element(remapped, 0).unwrap().as_int(),
+            Some(111)
+        );
+        assert_eq!(
+            gc.get_array_element(remapped, 1).unwrap().as_int(),
+            Some(222)
+        );
+        assert_eq!(
+            gc.get_array_element(remapped, 2).unwrap().as_int(),
+            Some(333)
+        );
+
+        // A write through the remapped handle (the actual copy-back) is visible
+        // in the live array — never in the dead from-space copy.
+        gc.set_array_element(remapped, 1, Value::Int(999)).unwrap();
+        assert_eq!(
+            gc.get_array_element(remapped, 1).unwrap().as_int(),
+            Some(999)
+        );
+    }
+
     // -- Mixed collection --
 
     #[test]
@@ -4246,6 +4445,66 @@ mod tests {
         let gc = make_collector();
         gc.pin_region(9999); // should not panic
         assert!(!gc.is_pinned(9999));
+    }
+
+    #[test]
+    fn pin_region_for_addr_keeps_jni_critical_array_in_place() {
+        // Step 6 (JEP 423): GetPrimitiveArrayCritical pins the backing array's
+        // region so a moving young/mixed collection cannot relocate it before
+        // the copy-back at Release. Without the pin the object is evacuated and
+        // its Get-time address goes stale (copy-back to a vacated/recycled slot
+        // — data loss or corruption).
+        let gc = make_collector();
+        let obj = gc.alloc_object(ClassId::new(1), 1);
+        gc.set_field(obj, 0, Value::Int(123));
+        let addr = obj.as_ptr() as usize;
+
+        let idx = gc
+            .pin_region_for_addr(addr)
+            .expect("freshly allocated object must live in a region");
+        // Resolves to the same region `region_for_ptr` would.
+        let expected = {
+            let regions = gc.regions.lock();
+            gc.region_for_ptr(&regions, obj.as_ptr()).unwrap()
+        };
+        assert_eq!(idx, expected);
+        assert!(gc.is_pinned(idx));
+
+        // A young GC must NOT relocate the pinned array.
+        let mut roots = vec![obj];
+        let result = gc.young_collection(&mut roots, &NoopMonitors);
+        assert_eq!(
+            result.stats.objects_copied, 0,
+            "pinned region must be excluded from the collection set"
+        );
+        assert_eq!(
+            roots[0].as_ptr(),
+            obj.as_ptr(),
+            "pinned JNI-critical array must not move"
+        );
+        // The data the copy-back would read is intact and at the same address.
+        assert_eq!(gc.get_field(obj, 0).as_int(), Some(123));
+
+        gc.unpin_region(idx);
+        assert!(!gc.is_pinned(idx));
+    }
+
+    #[test]
+    fn region_pin_refcount_balances() {
+        // Overlapping critical sections on arrays in the same region (or nested
+        // checkouts of one array) must refcount: one Release cannot unpin while
+        // another section is still live.
+        let gc = make_collector();
+        gc.pin_region(0);
+        gc.pin_region(0);
+        assert!(gc.is_pinned(0));
+        gc.unpin_region(0);
+        assert!(gc.is_pinned(0), "still pinned after 1 of 2 unpins");
+        gc.unpin_region(0);
+        assert!(!gc.is_pinned(0), "unpinned after the final unpin");
+        // An extra (unbalanced) unpin is tolerated and stays unpinned.
+        gc.unpin_region(0);
+        assert!(!gc.is_pinned(0));
     }
 
     // -- String deduplication --
@@ -5088,6 +5347,76 @@ mod tests {
         assert_eq!(r.estimated_evac_cost_ns(), 1000);
         let r_empty = make_old_region(0, 1000, 0);
         assert_eq!(r_empty.estimated_evac_cost_ns(), 0);
+    }
+
+    // -- Step 7: pause-target CSet sizing --
+
+    #[test]
+    fn g1region_estimated_evac_cost_scales_with_live_and_rate() {
+        // G1Region cost = live_bytes * ns_per_byte (the rolling calibration).
+        let gc = make_collector();
+        gc.with_regions_mut(|rs| {
+            rs[0].live_bytes = 1000;
+        });
+        let regions = gc.regions.lock();
+        assert_eq!(regions[0].estimated_evac_cost_ns(4), 4000);
+        assert_eq!(regions[0].estimated_evac_cost_ns(1), 1000);
+        assert_eq!(regions[0].estimated_evac_cost_ns(0), 0);
+    }
+
+    #[test]
+    fn evac_cost_ema_calibrates_toward_observed() {
+        // The rolling copy-cost EMA starts at 4 ns/byte and moves toward the
+        // observed cost; a cycle that copied nothing is no signal.
+        let gc = make_collector();
+        assert_eq!(gc.evac_ns_per_byte.load(Ordering::Relaxed), 4);
+        for _ in 0..100 {
+            gc.update_evac_cost(100, 1); // observed 100 ns/byte
+        }
+        let after = gc.evac_ns_per_byte.load(Ordering::Relaxed);
+        assert!(
+            (5..=100).contains(&after),
+            "EMA must rise from 4 toward 100, got {after}"
+        );
+        // No bytes copied / zero pause => no change.
+        let frozen = gc.evac_ns_per_byte.load(Ordering::Relaxed);
+        gc.update_evac_cost(1_000_000, 0);
+        gc.update_evac_cost(0, 1_000);
+        assert_eq!(gc.evac_ns_per_byte.load(Ordering::Relaxed), frozen);
+    }
+
+    #[test]
+    fn mixed_cset_old_selection_respects_pause_budget() {
+        // With a tight pause target the time-budget cap bounds the old CSet
+        // (always >=1); with a generous target only the percentage cap applies.
+        // Four old regions, each 125_000 live bytes => 0.5ms at 4 ns/byte.
+        let build = |pause_ms: u64| {
+            let mut cfg = small_config();
+            cfg.max_gc_pause_ms = pause_ms;
+            cfg.old_cset_region_threshold_percent = 100; // percentage cap won't bind
+            let gc = G1Collector::new(cfg);
+            gc.with_regions_mut(|rs| {
+                for r in rs.iter_mut().take(4) {
+                    r.region_type = RegionType::Old;
+                    r.live_bytes = 125_000; // 0.5ms at the default 4 ns/byte
+                    r.gc_efficiency = 0.1;
+                }
+            });
+            gc
+        };
+        let tight = build(1).select_old_regions_for_mixed_gc();
+        assert!(!tight.is_empty(), "always keep >=1 old region for progress");
+        assert!(
+            tight.len() < 4,
+            "pause budget must cap the old CSet below the 4 available, got {}",
+            tight.len()
+        );
+        let generous = build(10_000).select_old_regions_for_mixed_gc();
+        assert_eq!(
+            generous.len(),
+            4,
+            "a generous pause target leaves only the percentage cap"
+        );
     }
 
     #[test]

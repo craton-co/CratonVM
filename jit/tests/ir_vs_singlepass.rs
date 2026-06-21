@@ -113,7 +113,7 @@ fn compile_opt(
 ) -> Option<CompiledMethod> {
     try_compile(
         cm, None, None, None, None, None, None, None, None, None, helpers, None, None, None, None,
-        optimize, false, false, false, false,
+        optimize, false, false, false, false, false,
     )
 }
 
@@ -165,8 +165,62 @@ fn compile_long_opt(
 ) -> Option<CompiledMethod> {
     try_compile(
         cm, None, None, None, None, None, None, None, None, None, helpers, None, None, None, None,
-        optimize, false, false, true, false,
+        optimize, false, false, true, false, false,
     )
+}
+
+/// Like [`compile_opt`] but with the `ir_emit_fp` gate ON (inc 30), so the IR
+/// pipeline admits a method that uses `float`/`double` internally (FP-free
+/// signature). The single-pass side is unaffected.
+fn compile_fp_opt(
+    cm: &CachedBytecodeMethod,
+    helpers: &JitRuntimeHelpers,
+    optimize: bool,
+) -> Option<CompiledMethod> {
+    try_compile(
+        cm, None, None, None, None, None, None, None, None, None, helpers, None, None, None, None,
+        optimize, false, false, false, false, true,
+    )
+}
+
+/// Compile an FP-using `(name, code)` both ways (IR with `ir_emit_fp` on vs
+/// single-pass) and assert IR == single-pass == `expected` (low 32 bits — every
+/// FP corpus method takes int args and returns an int, so the GPR i64-arg /
+/// i64-ret `try_call` ABI is exact and the FP work stays internal to XMM). The
+/// host-computed `expected` is the IEEE-754 anchor catching a *shared* bug.
+fn check_fp(
+    name: &str,
+    descriptor: &str,
+    code: Vec<u8>,
+    max_locals: u16,
+    num_params: u16,
+    cases: &[(Vec<i64>, i32)],
+) {
+    let helpers = dummy_helpers();
+    let cm = cached(name, descriptor, code, max_locals, num_params);
+    let ir = compile_fp_opt(&cm, &helpers, true)
+        .unwrap_or_else(|| panic!("{name}: optimize=true (IR, FP) failed to compile"));
+    let sp = compile_fp_opt(&cm, &helpers, false)
+        .unwrap_or_else(|| panic!("{name}: optimize=false (single-pass) failed to compile"));
+    for (args, expected) in cases {
+        // SAFETY: both bodies were produced by the JIT from valid FP bytecode
+        // with an int signature; the i64-arg / i64-ret ABI matches `try_call`,
+        // no helper is reachable.
+        let r_sp = unsafe { sp.try_call(args) }
+            .unwrap_or_else(|e| panic!("{name}: single-pass call {args:?}: {e:?}"));
+        let r_ir = unsafe { ir.try_call(args) }
+            .unwrap_or_else(|e| panic!("{name}: IR call {args:?}: {e:?}"));
+        assert_eq!(
+            r_ir as i32, r_sp as i32,
+            "{name}: IR vs single-pass DIVERGE for {args:?}: IR={}, single-pass={}",
+            r_ir as i32, r_sp as i32,
+        );
+        assert_eq!(
+            r_ir as i32, *expected,
+            "{name}: both backends agree but disagree with host for {args:?}: got {}, expected {expected}",
+            r_ir as i32,
+        );
+    }
 }
 
 /// Compile a long-using `(name, code)` both ways and assert IR == single-pass ==
@@ -365,6 +419,7 @@ fn compile_long_ldc2w(
         false,
         true,
         false, // ir_emit_virtual_calls
+        false, // ir_emit_fp
     )
 }
 
@@ -907,6 +962,7 @@ fn compile_opt_fields(
         false,
         false,
         false,
+        false, // ir_emit_fp
     )
 }
 
@@ -1366,6 +1422,7 @@ fn compile_with_dispatch(
         true, // ir_emit_special_calls (inc 24, invokespecial — inert without 0xb7)
         true, // ir_emit_long (inc 28 — long call args; inert for non-long callers)
         true, // ir_emit_virtual_calls (inc 26, invokevirtual/interface)
+        false, // ir_emit_fp (inc 30 — inert for these int/long callers)
     )
 }
 
@@ -1756,4 +1813,302 @@ fn ir_vs_singlepass_invokeinterface_instance_call() {
         );
         drop(obj);
     }
+}
+
+// ── inc 30: double/float XMM value tier ──────────────────────────────────
+//
+// Each corpus method takes `int` args and returns an `int`, computing with
+// `float`/`double` internally — so the GPR i64-arg / i64-ret `try_call` ABI is
+// exact and the FP work stays in XMM (FP params/returns are a follow-on). The
+// host anchor is computed with Rust's float-to-int `as` cast, which saturates
+// (NaN→0, ±overflow→MIN/MAX, truncate toward zero) — exactly the JVM `f2i`/`d2i`
+// semantics the JIT must reproduce, so it catches a bug shared by both backends.
+
+#[test]
+fn ir_vs_singlepass_fadd_round_trip() {
+    // int f(int a, int b) { return (int)((float)a + (float)b); }
+    //   iload_0; i2f; iload_1; i2f; fadd; f2i; ireturn
+    check_fp(
+        "fadd",
+        "(II)I",
+        vec![0x1a, 0x86, 0x1b, 0x86, 0x62, 0x8b, 0xac],
+        2,
+        2,
+        &[
+            (vec![3, 4], 7),
+            (vec![-5, 10], 5),
+            // both < 2^24, so the float sum is exact
+            (vec![1_000_000, 2_000_000], 3_000_000),
+        ],
+    );
+}
+
+#[test]
+fn ir_vs_singlepass_fsub_fmul() {
+    // int f(int a, int b) { return (int)((float)a - (float)b); }
+    check_fp(
+        "fsub",
+        "(II)I",
+        vec![0x1a, 0x86, 0x1b, 0x86, 0x66, 0x8b, 0xac],
+        2,
+        2,
+        &[(vec![10, 3], 7), (vec![3, 10], -7), (vec![-4, -9], 5)],
+    );
+    // int f(int a, int b) { return (int)((float)a * (float)b); }
+    check_fp(
+        "fmul",
+        "(II)I",
+        vec![0x1a, 0x86, 0x1b, 0x86, 0x6a, 0x8b, 0xac],
+        2,
+        2,
+        &[(vec![3, 4], 12), (vec![-5, 6], -30), (vec![7, 0], 0)],
+    );
+}
+
+#[test]
+fn ir_vs_singlepass_fdiv_with_inf_overflow() {
+    // int f(int a, int b) { return (int)((float)a / (float)b); }
+    //   iload_0; i2f; iload_1; i2f; fdiv; f2i; ireturn
+    check_fp(
+        "fdiv",
+        "(II)I",
+        vec![0x1a, 0x86, 0x1b, 0x86, 0x6e, 0x8b, 0xac],
+        2,
+        2,
+        &[
+            (vec![7, 2], 3),    // 3.5 → 3 (toward zero)
+            (vec![-7, 2], -3),  // -3.5 → -3
+            (vec![10, 3], 3),   // 3.333…
+            (vec![5, 0], i32::MAX),   // +inf → INT_MAX (NaN/overflow fixup)
+            (vec![-5, 0], i32::MIN),  // -inf → INT_MIN
+        ],
+    );
+}
+
+#[test]
+fn ir_vs_singlepass_dmul_with_overflow() {
+    // int f(int a, int b) { return (int)((double)a * (double)b); }
+    //   iload_0; i2d; iload_1; i2d; dmul; d2i; ireturn
+    check_fp(
+        "dmul",
+        "(II)I",
+        vec![0x1a, 0x87, 0x1b, 0x87, 0x6b, 0x8e, 0xac],
+        2,
+        2,
+        &[
+            (vec![3, 4], 12),
+            (vec![-7, 6], -42),
+            (vec![100_000, 100_000], i32::MAX), // 1e10 → INT_MAX
+            (vec![-100_000, 100_000], i32::MIN), // -1e10 → INT_MIN
+        ],
+    );
+    // int f(int a, int b) { return (int)((double)a - (double)b); }  — dsub
+    check_fp(
+        "dsub",
+        "(II)I",
+        vec![0x1a, 0x87, 0x1b, 0x87, 0x67, 0x8e, 0xac],
+        2,
+        2,
+        &[(vec![10, 3], 7), (vec![3, 10], -7)],
+    );
+}
+
+#[test]
+fn ir_vs_singlepass_fp_negation() {
+    // int f(int a) { return (int)(-((float)a)); }  — fneg (sign-bit flip)
+    check_fp(
+        "fneg",
+        "(I)I",
+        vec![0x1a, 0x86, 0x76, 0x8b, 0xac],
+        1,
+        1,
+        &[(vec![5], -5), (vec![-5], 5), (vec![0], 0), (vec![123456], -123456)],
+    );
+    // int f(int a) { return (int)(-((double)a)); }  — dneg
+    check_fp(
+        "dneg",
+        "(I)I",
+        vec![0x1a, 0x87, 0x77, 0x8e, 0xac],
+        1,
+        1,
+        &[(vec![5], -5), (vec![-5], 5), (vec![0], 0)],
+    );
+}
+
+#[test]
+fn ir_vs_singlepass_fp_constants() {
+    // int f(int a) { return (int)((float)a + 2.0f); }  — fconst_2
+    check_fp(
+        "fconst2",
+        "(I)I",
+        vec![0x1a, 0x86, 0x0d, 0x62, 0x8b, 0xac],
+        1,
+        1,
+        &[(vec![5], 7), (vec![-3], -1), (vec![100], 102)],
+    );
+    // int f(int a) { return (int)((double)a + 1.0); }  — dconst_1
+    check_fp(
+        "dconst1",
+        "(I)I",
+        vec![0x1a, 0x87, 0x0f, 0x63, 0x8e, 0xac],
+        1,
+        1,
+        &[(vec![5], 6), (vec![-3], -2)],
+    );
+}
+
+#[test]
+fn ir_vs_singlepass_fp_fp_conversions() {
+    // int f(int a) { return (int)(double)(float)a; }  — i2f; f2d; d2i
+    check_fp(
+        "f2d",
+        "(I)I",
+        vec![0x1a, 0x86, 0x8d, 0x8e, 0xac],
+        1,
+        1,
+        &[(vec![5], 5), (vec![-3], -3), (vec![16_777_216], 16_777_216)],
+    );
+    // int f(int a) { double d = a; float fv = (float)d; return (int)fv; }  — d2f
+    check_fp(
+        "d2f",
+        "(I)I",
+        vec![0x1a, 0x87, 0x90, 0x8b, 0xac],
+        1,
+        1,
+        &[(vec![5], 5), (vec![-100], -100)],
+    );
+}
+
+#[test]
+fn ir_vs_singlepass_long_fp_conversions() {
+    // int f(int a) { long L = a; float fv = L; return (int)fv; }  — i2l; l2f; f2i
+    check_fp(
+        "l2f",
+        "(I)I",
+        vec![0x1a, 0x85, 0x89, 0x8b, 0xac],
+        1,
+        1,
+        &[(vec![1000], 1000), (vec![-7], -7)],
+    );
+    // int f(int a) { float fv = a; long L = (long)fv; return (int)L; }  — i2f; f2l; l2i
+    check_fp(
+        "f2l",
+        "(I)I",
+        vec![0x1a, 0x86, 0x8c, 0x88, 0xac],
+        1,
+        1,
+        &[(vec![1000], 1000), (vec![-7], -7)],
+    );
+    // int f(int a) { long L=a; double d=L; long r=(long)d; return (int)r; }
+    //   i2l; l2d; d2l; l2i
+    check_fp(
+        "l2d_d2l",
+        "(I)I",
+        vec![0x1a, 0x85, 0x8a, 0x8f, 0x88, 0xac],
+        1,
+        1,
+        &[(vec![1000], 1000), (vec![-7], -7), (vec![123_456], 123_456)],
+    );
+}
+
+#[test]
+fn ir_vs_singlepass_double_locals() {
+    // int f(int a) { double x = a; double y = x*x; return (int)(y + x); }
+    //   iload_0; i2d; dstore_1; dload_1; dload_1; dmul; dstore_3; dload_3;
+    //   dload_1; dadd; d2i; ireturn   — exercises dstore_1/3 + dload_1/3 (cat-2
+    //   locals: x at slots 1-2, y at slots 3-4).
+    check_fp(
+        "dlocals",
+        "(I)I",
+        vec![
+            0x1a, 0x87, 0x48, 0x27, 0x27, 0x6b, 0x4a, 0x29, 0x27, 0x63, 0x8e, 0xac,
+        ],
+        5,
+        1,
+        &[(vec![5], 30), (vec![10], 110), (vec![-3], 6), (vec![0], 0)],
+    );
+}
+
+#[test]
+fn ir_vs_singlepass_wide_fp_load_store() {
+    // int f(int a) { float fv = a; return (int)fv; }  with fv at slot 5, forcing
+    // the wide fstore/fload forms: iload_0; i2f; fstore 5; fload 5; f2i; ireturn.
+    check_fp(
+        "wide_fls",
+        "(I)I",
+        vec![0x1a, 0x86, 0x38, 0x05, 0x17, 0x05, 0x8b, 0xac],
+        6,
+        1,
+        &[(vec![5], 5), (vec![-100], -100), (vec![42], 42)],
+    );
+}
+
+#[test]
+fn ir_vs_singlepass_fp_nan_to_zero() {
+    // int f() { float x = 0.0f; return (int)(x / x); }  — 0.0/0.0 = NaN → 0.
+    //   fconst_0; fconst_0; fdiv; f2i; ireturn
+    check_fp(
+        "fnan",
+        "()I",
+        vec![0x0b, 0x0b, 0x6e, 0x8b, 0xac],
+        0,
+        0,
+        &[(vec![], 0)],
+    );
+    // int f() { double x = 0.0; return (int)(x / x); }  — dconst_0; dconst_0;
+    //   ddiv; d2i; ireturn
+    check_fp(
+        "dnan",
+        "()I",
+        vec![0x0e, 0x0e, 0x6f, 0x8e, 0xac],
+        0,
+        0,
+        &[(vec![], 0)],
+    );
+}
+
+#[test]
+fn ir_vs_singlepass_fp_to_long_fixup() {
+    // Exercise the 64-bit (`is_long`) NaN/overflow fixup branch — the long-result
+    // conversions f2l/d2l — across all three arms (NaN→0, +inf→LONG_MAX,
+    // -inf→LONG_MIN). The result is returned as `(int)(long)…` = the low 32 bits
+    // of the saturated long: LONG_MAX (0x7FFF…FF) → -1, LONG_MIN (0x8000…0) → 0,
+    // 0L → 0. Inf/NaN are built deterministically from `x/0` (no float rounding).
+
+    // (int)(long)(1.0/0.0) = (int)(+inf) → (int)LONG_MAX = -1.   d2l, +overflow
+    check_fp(
+        "d2l_pinf",
+        "()I",
+        vec![0x0f, 0x0e, 0x6f, 0x8f, 0x88, 0xac], // dconst_1; dconst_0; ddiv; d2l; l2i; ireturn
+        0,
+        0,
+        &[(vec![], -1)],
+    );
+    // (int)(long)(-1.0/0.0) = (int)(-inf) → (int)LONG_MIN = 0.   d2l, -overflow
+    check_fp(
+        "d2l_ninf",
+        "()I",
+        vec![0x0f, 0x77, 0x0e, 0x6f, 0x8f, 0x88, 0xac], // dconst_1; dneg; dconst_0; ddiv; d2l; l2i; ireturn
+        0,
+        0,
+        &[(vec![], 0)],
+    );
+    // (int)(long)(0.0/0.0) = (int)(long)NaN = 0.   d2l, NaN
+    check_fp(
+        "d2l_nan",
+        "()I",
+        vec![0x0e, 0x0e, 0x6f, 0x8f, 0x88, 0xac], // dconst_0; dconst_0; ddiv; d2l; l2i; ireturn
+        0,
+        0,
+        &[(vec![], 0)],
+    );
+    // (int)(long)(1.0f/0.0f) = (int)(+inf) → (int)LONG_MAX = -1.   f2l, +overflow
+    check_fp(
+        "f2l_pinf",
+        "()I",
+        vec![0x0c, 0x0b, 0x6e, 0x8c, 0x88, 0xac], // fconst_1; fconst_0; fdiv; f2l; l2i; ireturn
+        0,
+        0,
+        &[(vec![], -1)],
+    );
 }

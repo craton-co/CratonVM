@@ -172,8 +172,149 @@ Author note: this doc is grounded in a read of `gc/src/{g1,g1_concurrent,zgc,zgc
   - Remaining for Step 5: the GAP A fix shipped a per-slot remap correction; a
     fuller moving-GC stress test (multi-thread precise-JIT frame + FFM upcall
     relocated under `-XX:+UseG1GC`) asserting no staleness is still worthwhile.
-- Steps 6–10 — not started. Next highest-value: Step 8 (opt-in G1 gauntlet
-  validation).
+- **Step 6 (JNI-critical region pinning under G1) — DONE** (branch
+  `feat/g1-jni-critical-pin`). The §3.2.5 gap, refined: the merged force-copy fix
+  (#24) closes the *data-movement* half — `GetPrimitiveArrayCritical` hands native
+  code a detached **copy**, never a heap pointer, so relocating the source is
+  harmless to the native reads. But `ReleasePrimitiveArrayCritical`'s **copy-back**
+  re-resolves the array's *Get-time* handle (`jobject_to_obj(copy.array)`, a raw
+  local-ref address); the keep-alive pin is "keep-alive ONLY, not no-relocation",
+  so under G1 a young/mixed evacuation mid-section moves the array and that handle
+  goes stale → the copy-back silently drops (CSet region freed → `is_heap_addr`
+  None) or writes back into a recycled object (corruption). G1 makes this reachable
+  (unconditional young/mixed evacuation); the generational young-from is swapped
+  not freed and critical sections are short, so it stayed latent there — matching
+  the doc's "G1 makes this exploitable".
+  - **Fix:** drive the existing (previously test-only) `G1Region` pin machinery
+    from the critical path. `jni_get_primitive_array_critical` calls
+    `VmHeap::pin_critical_region(array)` → `G1Collector::pin_region_for_addr`
+    (lock-free `lookup_region_for_addr` + refcounted `pin_region`), recording the
+    pinned region index(es) in the `CriticalCopy`;
+    `jni_release_primitive_array_critical` calls `unpin_critical_regions` on the
+    **final** release (NOT `JNI_COMMIT` mode 1, whose section continues and must
+    stay pinned). G1's only object-moving paths — `young_collection` /
+    `mixed_collection` — exclude pinned regions from the collection set, and there
+    is no full-GC compaction path, so a pinned array cannot move while checked out
+    → the copy-back resolves the same object.
+  - **Refcounted** (`G1Region.pin_count`, mirrored by the existing `pinned` bool
+    the CSet filters read): overlapping critical sections on arrays in the same
+    region, and nested checkouts of one array, pin/unpin independently — a single
+    `bool` would let an inner Release clear a pin an outer section still holds.
+    No-op (empty pin set) on the generational collector.
+  - **GetStringCritical** needs no pinning: it delegates to `GetStringChars`
+    (copy) and strings are immutable, so `Release` frees the copy with **no
+    copy-back** — there is no stale-handle write to guard.
+  - **Scope note:** the *non-critical* `Get<Type>ArrayElements` force-copy path
+    has the same latent copy-back staleness under G1, but region pinning is the
+    wrong fix there (the JNI spec permits long-lived element copies; pinning would
+    hold regions arbitrarily long) — it needs a remappable copy-back handle.
+    Pre-existing, tracked as a separate follow-up.
+  - **Validation:** `cratonvm-gc` g1 tests green — new
+    `pin_region_for_addr_keeps_jni_critical_array_in_place` (a young GC leaves a
+    pinned array's address unchanged + data intact) and `region_pin_refcount_balances`;
+    full g1 suite + `cratonvm-cli` build green; FieldStress checksum unchanged
+    under `-XX:+UseG1GC`.
+- **Step 7 (pause-target CSet sizing) — DONE** (branch `feat/g1-pause-cset-sizing`,
+  merged to dev `ff370857`). `max_gc_pause_ms` (200) previously did **not** bound
+  the mixed collection set — old regions entered the CSet only under the
+  percentage cap (`old_cset_region_threshold_percent`, 10%), so a mixed pause
+  could grow unbounded with old-gen occupancy (§3.3). Added a **time-budget cap**
+  on top of the percentage cap:
+  - `G1Region::estimated_evac_cost_ns(ns_per_byte) = live_bytes × ns_per_byte`
+    (copying live data dominates evacuation cost).
+  - A **rolling** `evac_ns_per_byte` calibration (EMA, default 4 ns/byte ≈
+    250 MB/s), refreshed from each *mixed* collection's actual
+    `pause / bytes_copied` so the budget tracks real wall-clock copy throughput
+    (the §3.3 "rolling per-region copy cost"). Calibrated from mixed GCs **only**
+    — young collections would bias it high (fixed root-scan overhead amortized
+    over few survivors).
+  - Both the inline `mixed_collection` CSet build (production) and the
+    `select_old_regions_for_mixed_gc` helper now stop adding old regions once
+    their estimated copy time would exceed `max_gc_pause_ms`, always keeping ≥1
+    region for progress; deferred regions are reclaimed in a later mixed cycle
+    (`mixed_gc_remaining`). The percentage cap stays the hard upper bound; the
+    budget only binds when one mixed GC would copy enough live old data to blow
+    the target (a genuinely long pause), so at the 200ms default it is
+    conservative and rarely binds.
+  - The standalone `select_evacuation_candidates`/`crate::region` prototype
+    already had this algorithm but on a *different* region type, unused by the
+    real collector — Step 7 brings it to the production `G1Region` path.
+  - **Tests:** `g1region_estimated_evac_cost_scales_with_live_and_rate`,
+    `evac_cost_ema_calibrates_toward_observed`,
+    `mixed_cset_old_selection_respects_pause_budget`; all 93 g1 unit tests +
+    `cratonvm-cli` build green (also verified on the merged dev alongside the
+    `af64d03d` JNI copy-back follow-up).
+  - **Owed:** empirical pause-vs-target validation on a real workload (§5) still
+    needs the pause-logging enhancement *and* a non-crashing G1 run — currently
+    blocked by the gpu-bench-cpu SIGSEGV (Step 8 finding).
+- **Step 8 (opt-in G1 gauntlet validation) — IN PROGRESS. First cut found a real
+  G1 SIGSEGV; G1 is NOT yet gauntlet-ready** (branch `feat/g1-step8-correction`).
+  - **METHODOLOGY CORRECTION (supersedes the earlier "no divergence" claim,
+    commit `92d3349d`/merge `ea1e35f2`).** That first run used a pre-existing
+    release binary built at **11:15** which *predated* the Step-1 `-XX:+UseG1GC`
+    flag merge (`7c6fdb35`, **12:54**), so it silently fell back to **Generational**
+    — every "CV-G1" column was Generational-vs-Generational, not a G1 validation.
+    Caught via the `--verbose:gc` startup line printing the *Generational arm's*
+    `[GC] Verbose GC logging enabled (generational collector)` message (G1 has no
+    such message) plus the absence of G1-specific `[GC YoungOnly]` collection
+    logs. **Lesson — always verify the collector is actually selected before
+    claiming a G1 result** (guard: zero "(generational collector)" messages +
+    G1-only `[GC YoungOnly]` lines under `RUST_LOG=cratonvm_gc=info --verbose:gc`).
+    Re-validated on a binary where `-XX:+UseG1GC` genuinely selects G1 (verified).
+  - **G1-SPECIFIC CRASH (the headline finding) — `gpu-bench-cpu` `CpuOnlyBench`
+    SIGSEGVs under G1.** `rc=139`, **3/3 deterministic** under `-XX:+UseG1GC` at
+    `--Xmx 512m`; **3/3 PASS** under Generational. A hard segfault (no stack — it
+    crashes before the 120s watchdog), i.e. a genuine **moving-GC memory-safety
+    bug** on a real workload — exactly the class Steps 1–6 targeted, and totally
+    masked while the run was accidentally Generational. Root-cause is a focused
+    GC-debugging follow-up (spawned task).
+  - **Checksum parity on verified G1 (G1 == Generational == HotSpot)** — both
+    low-GC and GC-stress: `fib44`=701408733, `sieve250k`=22044,
+    `matrix800`=15359906451, and crucially the heavy-evacuation
+    **`bintrees18`@8g=68332206** are byte-identical. So G1 itself does **not**
+    lose / duplicate / corrupt objects under sustained young+mixed evacuation —
+    the gpu-bench crash is a distinct memory-safety fault, not a tracing bug.
+  - **G1 heap inefficiency (not a correctness bug, but a real gap).** `bintrees16`
+    @1g and `bintrees18`@4g/@6g raise a *catchable* `OutOfMemoryError` under **G1**
+    at heaps where **Generational completes** (G1 region overhead/fragmentation
+    needs a larger `-Xmx` — `bintrees18` fits gen in 4g but needs ~8g on G1). NB
+    this is why the bogus first cut "passed" `bintrees18`@4g — that was gen; real
+    G1 cannot fit it in 4g.
+  - **App-suite no-regression on real G1**: **h2-testall-fast** PASS==PASS.
+    **hibernate-smoke** was RED on **both** collectors (non-GC: ByteBuddy
+    `JavaDispatcher$DynamicClassLoader.proxy` `jsr/ret` verifier rejection) —
+    **now FIXED** and GREEN by default on both collectors. Root cause: the
+    HIGH-sec commit `ecfc3b30` made *every* `jsr/jsr_w/ret` method a hard
+    `VerifyError`, but that class is **major 49 (Java 5)** where the opcodes are
+    *legal* (JVMS §4.9.1 forbids them only at major ≥ 51) and HotSpot loads it.
+    Fix (`classloading/src/verifier.rs`): version-gate the rejection — accept
+    structurally-validated subroutines at major ≤ 50 (HotSpot's load decision),
+    keep the hard `VerifyError` at major ≥ 51 (genuinely malformed; HotSpot
+    rejects too). `CRATONVM_ALLOW_JSR_RET=1` is no longer needed for legal old
+    classes; it remains an any-version override. Verified: `HIB_SMOKE_OK` rc=0
+    under CratonVM **default flags** == HotSpot; 98/98 verifier unit tests green.
+    FieldStress (Step 4) stays 4495525842000 under G1.
+  - **Throughput**: `matrix800` G1/gen = **1.05** (CV-G1 5410ms vs CV-default
+    5163ms; CV-G1 ≈ 2.6× HotSpot-G1 2069ms — the interpreter+baseline-JIT gap).
+  - **Pause-time**: NOT obtained. CratonVM's per-collection `[GC ...] pause=Nms`
+    line (`g1.rs::log_gc_event`, `tracing::info!`) is only surfaced via
+    `RUST_LOG=cratonvm_gc=info`+`--verbose:gc` and is **millisecond-granular**
+    (`as_millis()` rounds sub-ms young pauses to 0); the GC-stress benches also
+    OOM under G1 before producing a long pause series. A small enhancement
+    (microsecond + a structured/visible sink — the §7 scaffolding item 6, only
+    half-built) is the prerequisite for §5 p50/p99.
+  - Harness (untracked scratch in the worktree): `g1-step8-revalidate.sh` (now
+    GUARDS collector selection up front), `g1-step8-benchparity.sh`,
+    `g1-step8-appsuites.sh`.
+  - **Remaining for Step 8**: (1) root-cause + fix the `gpu-bench-cpu` G1 SIGSEGV
+    (blocker); (2) confirm GC-stress checksum parity on G1 at an adequate heap;
+    (3) address/quantify the G1 heap-efficiency gap; (4) the pause-logging
+    enhancement + p50/p99 + throughput; (5) the daemon boot/e2e comparison —
+    itself gated on 3 tracked **non-G1** upstream bugs that stop WildFly/ES/Kafka/
+    Spring Boot reaching *ready* even on Generational (non-TTY stdout SEGV/hang,
+    ARRAY-LEN-GUARD, GC-clinit; see `apps/TARGET_APPS.md`).
+- Steps 9 (parallel evacuation), 10 (default flip) — not started; gated on Step 8
+  (a clean gauntlet, starting with the gpu-bench-cpu SIGSEGV fix).
 
 ---
 

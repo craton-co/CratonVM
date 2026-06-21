@@ -1500,6 +1500,30 @@ impl GenerationalHeap {
             return;
         }
         if index >= num_slots {
+            // DBG (CRATONVM_DBG_SWEEP_ZERO): if this OOB receiver was recently
+            // ZEROED by the non-moving sweep, name its ORIGINAL class and the GC
+            // that reclaimed it — turns "set_field on java/lang/Object[0]" into
+            // "set_field on a SWEPT <UserClass>", naming the root-coverage gap.
+            if let Some((cid, kind, cycle, reason, initiator, blocked)) =
+                sweep_zero_lookup(obj_ref.as_ptr() as usize)
+            {
+                let orig_name = crate::gc::resolve_class_info(cid)
+                    .map(|(n, _)| n)
+                    .unwrap_or_else(|| "<unresolved>".to_string());
+                eprintln!(
+                    "[SWEEP-ZERO-HIT] set_field receiver {:p} was a SWEPT {} \
+                     (orig class_id={} kind={}) reclaimed at cycle={} reason={} \
+                     initiator_tid={} blocked={}",
+                    obj_ref.as_ptr(),
+                    orig_name,
+                    cid,
+                    kind,
+                    cycle,
+                    reason,
+                    initiator,
+                    blocked,
+                );
+            }
             // Out-of-bounds writes are dropped rather than corrupting the
             // neighboring object. The diagnostic distinguishes between two
             // distinct bug classes (matches the same split in `get_field`

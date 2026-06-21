@@ -407,7 +407,19 @@ pub struct BackgroundCompiler {
 impl BackgroundCompiler {
     /// Request shutdown and join the worker thread.
     pub fn shutdown(&mut self) {
-        self.core.shutdown.store(true, Ordering::Release);
+        // Set the shutdown flag while holding the queue lock the worker parks
+        // on. Without this, a lost-wakeup race deadlocks `join()`: the worker
+        // can load `shutdown == false` (under the queue lock), then this thread
+        // could store `true` + `notify_all` before the worker reaches
+        // `wake.wait()`, so the worker parks AFTER the notify and never wakes.
+        // Holding the lock here forces our store to land either while the worker
+        // is already parked (so `notify_all` wakes it) or before it re-checks
+        // the flag — `parking_lot::Condvar::wait` registers the waiter before
+        // releasing the lock, so no notification can be missed.
+        {
+            let _q = self.core.queue.lock();
+            self.core.shutdown.store(true, Ordering::Release);
+        }
         self.core.wake.notify_all();
         if let Some(h) = self.handle.take() {
             let _ = h.join();

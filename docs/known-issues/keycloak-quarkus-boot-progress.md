@@ -719,6 +719,126 @@ VM's real file layer).
 > `scripts/build-kcboot-sym.bat` (full-symbol build). Boot needs
 > `CRATONVM_REAL_AGROAL=1` (+ `CRATONVM_REAL_NET_SOCKETS=1` for a real listen).
 
+> **MILESTONE (2026-06-21) — the real Vert.x/Netty HTTP server SERVES under CratonVM.**
+> Validated in isolation with a minimal `Vertx.vertx().createHttpServer().listen(8080)`
+> repro (`scratch/vertx/`, real Vert.x 4.5.27 + Netty jars from the Keycloak dist):
+> `curl localhost:8080` → **HTTP 200** + the request handler fires (`HANDLED request path=/`).
+> This is Keycloak/Quarkus's HTTP foundation (Vert.x → Netty NIO). Required gates:
+> `CRATONVM_REAL_VERTX=1` + `CRATONVM_REAL_NET_SOCKETS=1`. Five commits, each a real VM bug,
+> found by fix→build→validate iteration with the new `run() Ok/Err` diagnostic +
+> `CRATONVM_DBG_SELECTOR` + cdb:
+> 1. **`e7fec84f`** — route `sun/nio/ch/WEPollSelectorProvider.{openSelector,openServerSocketChannel,
+>    openSocketChannel}` to CratonVM's selector/`ssc_open`/`sc_open`. JDK 21+ Windows defaults to
+>    the wepoll selector provider; Netty's `NioEventLoop`/`NioServerSocketChannel` call
+>    `provider.openX()` DIRECTLY (bypassing the static `Selector.open()`/`ServerSocketChannel.open()`
+>    CratonVM intercepts), so the real `WEPoll`/`ServerSocketChannelImpl` path ran →
+>    `UnsatisfiedLinkError: sun/nio/ch/WEPoll.eventSize()I` + `ClosedChannelException`.
+> 2. **`185fb300`** — `ServerSocketChannel.isBound()`/`localAddress()` natives (impl-methods on
+>    `ServerSocketChannelImpl` that `ServerSocketAdaptor`/Netty call on our abstract-class channel
+>    object). → port 8080 binds, `LISTENING` fires.
+> 3. **`5f8f96b1`** — `CRATONVM_REAL_VERTX` gate (mirrors `real_agroal`): suppresses the synthetic
+>    `vertx_eventloop` natives so the REAL Netty `NioEventLoop.run()` drives `Selector.select()`
+>    (the synthetic loop ran only tasks/timers and never polled the selector). cdb confirmed the
+>    real Netty event-loop threads then sit in `nio_selector::selector_select`→`WSAPoll`.
+> 4. **`0670dc5f`** — populate the selector's LIVE `selectedKeys` field on select. `WSAPoll` DID
+>    detect the accept (`CRATONVM_DBG_SELECTOR`: `EXIT n=1`/connection) but Netty served nothing
+>    because it reflectively REPLACES `SelectorImpl.selectedKeys` with its own `SelectedSelectionKeySet`
+>    and reads the FIELD; CratonVM only mirrored readyOps into `sk_table` + overrode `selectedKeys()`
+>    on-demand (Tomcat/ES path) and never wrote the field. `populate_selected_keys_field()` adds each
+>    ready key to the field (JDK-faithful; null-safe; on-demand path unchanged so Tomcat/ES unaffected).
+>
+> **The real Agroal H2/JDBC path also runs** (these gates are additive to `CRATONVM_REAL_AGROAL=1`).
+> NB: the earlier `VertxImpl.init` "shim mismatch" hypothesis (b18c6e32 on `dev`) was a RED HERRING —
+> the real blockers were the WEPoll selector routing + the Netty `selectedKeys`-field. The synthetic
+> `vertx_eventloop` natives are now bypassed by the gate, not the bug.
+>
+> **OPEN — full Keycloak boot still blocked EARLIER (the original silent-exit, Gap 9 core).** With
+> ALL gates, the full boot runs ~7 min then **self-terminates SILENTLY** at the post-Hibernate-Validator
+> phase (the slow ValidatorFactory build + RESTEasy deploy over Keycloak's hundreds of constraints/
+> endpoints) — BEFORE reaching the (now-working) Vert.x HTTP startup. No diagnostic fires: NOT
+> main-vm `run()` returning (the new `run() Ok/Err` log is silent), NOT `System.exit`
+> (`native_system_exit` eprintln absent), NOT a Rust panic (the panic hook eprintln's), NOT a GC
+> OOM/abort signal, NOT the crash handler. So a background thread terminates the process via a path
+> that bypasses every hook. Pinning it via `cdb` launched with a breakpoint on
+> `ntdll!NtTerminateProcess` (catches exit/abort/terminate from any thread → calling stack).
+> This silent exit + the silent post-Hibernate logging are the remaining full-boot walls (Gap 9's
+> throughput + invisible-failure core). The HTTP layer is no longer a blocker.
+>
+> **REFINED (2026-06-21, memory monitor + parked-state cdb with ALL gates) — it is NOT throughput at
+> the end; main PARKS, then exits.** A 15 s WS/CPU monitor shows the boot reaches a PARKED state at
+> ~4 min (WS flat ~1083 MB, CPU flat ~108–115 s — i.e. IDLE, not computing) and stays idle ~5 min,
+> then self-exits (~570 s; the bare run reported code 127). cdb of the PARKED process (with
+> `CRATONVM_REAL_VERTX=1` + `CRATONVM_REAL_NET_SOCKETS=1`) shows only 5 threads — `main` (launcher
+> join, NtWaitForSingleObject), `main-vm` (parked in `LockSupport.park` ← `ParkState::park_interruptible`
+> ← `native_lock_support_park`, i.e. the AQS condition inside `ApplicationLifecycleManager.waitForExit`),
+> `Thread-1` (Cleaner `ReferenceQueue.remove`), `Thread-2` (Timer) — and **ZERO `vert.x-eventloop`/Netty
+> threads**. So **`application.start()` RETURNS (main reaches `waitForExit`) WITHOUT ever running the
+> Vert.x HTTP server startup** — exactly the original "main parks prematurely in waitForExit" symptom.
+> The Vert.x serving chain fixed above is correct (isolated repro serves) but is NEVER REACHED by the
+> full boot. **So the true Gap-9 core blocker is UPSTREAM of HTTP: the Quarkus startup/recorder-deploy
+> chain (`ApplicationImpl.<clinit>` deploy steps → `doStart` STARTUP_TASKS) completes/returns without
+> running the HTTP-server (`VertxHttpRecorder`/`VertxCoreRecorder`) deploy+startup step** (no Vert.x
+> instance is created → no event loops → no bind), yet `start()` reports success and main parks.
+> NEXT (deep, multi-session): trace the deploy chain to find where the HTTP-server startup step is and
+> why it doesn't run/take effect (a step is skipped, a recorder returns a null/no-op RuntimeValue, or
+> the chain is truncated after RESTEasy-deploy) — plus the silent post-park exit (~570 s) and the
+> logging-flush visibility. This is squarely the Quarkus recorder-framework work (cf. Gaps 5–7).
+
+> **BREAKTHROUGH (2026-06-21) — the silent-exit was a NO-OP SHIM on `Application.start`; gating it
+> off unblocks RUNTIME_INIT and makes the failure VISIBLE.** SMOKING GUN: `quarkus_staticinit.rs`
+> registered `io.quarkus.runtime.Application.start([String])V` (+ `stop`/`awaitShutdown`) as a no-op
+> (`native_app_lifecycle_no_op`). `Application.start()` → generated `ApplicationImpl.doStart()` is the
+> **RUNTIME_INIT** phase (Vert.x HTTP listen, datasource connect, Infinispan, Narayana JTA, …). The
+> STATIC_INIT `<clinit>` deploy steps (ArC / RESTEasy-metadata / Hibernate) run as real bytecode (Gaps
+> 4–7), which is why the boot reached RESTEasy deploy — but the no-op SKIPPED all of RUNTIME_INIT, so no
+> HTTP server, no Vert.x threads, and `start()` "succeeded" → main parked at `waitForExit`, then silently
+> exited. **FIX: `CRATONVM_REAL_QUARKUS_START` gate** (opt-in, mirrors `real_agroal`/`real_vertx`)
+> suppresses the no-op so the real `start()`→`doStart()` bytecode runs (commit on
+> `fix/keycloak-gap8-datasource`). With it + `REAL_AGROAL`/`REAL_VERTX`/`REAL_NET_SOCKETS`, the full boot
+> **now runs RUNTIME_INIT** — the log shows Infinispan (`Virtual threads support: enabled`), Narayana JTA,
+> **Vert.x** (`io.vertx.core.logging…`) and **Netty** (`io.netty.util.ResourceLeakDetector`,
+> `InternalThreadLocalMap`) all INITIALIZING (none of which happened before) — and the failure is now
+> LOUD instead of silent (Keycloak's own `ExecutionExceptionHandler`: *"ERROR: Failed to start server in
+> (development) mode"* + the cause + `[cratonvm] System.exit(1) called`). So the doc's #1 blocker
+> (invisible failures) is resolved for the full boot.
+>
+> **NEXT GAP (now visible + being fixed): JBoss-LogManager `LoggerNode` NPE.** RUNTIME_INIT logging
+> config fails with *"Cannot invoke org.jboss.logmanager.LoggerNode.setUseParentHandlers(boolean) because
+> this.loggerNode is null"*. CratonVM uses synthetic `org/jboss/logmanager/Logger` objects with NO
+> `loggerNode` and intercepts the loggerNode-deref methods (getLevel/setLevel/isLoggable/logRaw/
+> getUseParentHandlers/…), but `setUseParentHandlers(Z)V` was MISSING from that list, so its real bytecode
+> derefs the null node. FIX: add a null-safe no-op `org/jboss/logmanager/Logger.setUseParentHandlers(Z)V`
+> (logmanager.rs, mirroring the JUL override + the constant `getUseParentHandlers`). Building + validating;
+> expect the boot to advance to the next RUNTIME_INIT gap (then iterate toward `Listening`). The boot is
+> now an iterative, VISIBLE gap-walk through RUNTIME_INIT, not a silent wall.
+>
+> **GAP-WALK PROGRESS (2026-06-21):**
+> - ✅ `setUseParentHandlers` fixed → boot advanced; the log now shows **Netty configuring its event
+>   loops** (`io.netty.channel.MultithreadEventLoopGroup -Dio.netty.eventLoopThreads: 64`,
+>   `NioEventLoop` `-Dio.netty.noKeySetOptimization`/`selectorAutoRebuildThreshold`) + the Quarkus
+>   thread-pool — i.e. RUNTIME_INIT is well underway.
+> - ⏳ NEXT GAP (now the active frontier): **Hibernate SessionFactory build fails** —
+>   *"[PersistenceUnit: keycloak-default] Unable to build Hibernate SessionFactory ... Cannot invoke
+>   `com.github.benmanes.caffeine.cache.LocalCacheFactory.newInstance(Caffeine, AsyncCacheLoader, boolean)`
+>   because `factory` is null"*. Caffeine 3.2.3's `LocalCacheFactory` is an INTERFACE that dynamically
+>   loads a generated per-feature cache-impl class via `MethodHandles.Lookup` (`LOOKUP.findClass` /
+>   `findConstructor`, cached in `FACTORIES` via `computeIfAbsent(name, ::newFactory)`); under CratonVM
+>   `loadFactory(name)` returns null (a `MethodHandles.Lookup.findClass`/`findConstructor` or
+>   `computeIfAbsent` gap on Caffeine's generated classes), so `factory.newInstance(...)` NPEs. NOT a
+>   no-op-stub; a real MethodHandles/reflection sub-investigation (lang_invoke.rs). Fix it, then continue
+>   the gap-walk (next likely: the H2 datasource connect, then the Vert.x HTTP listen — at which point the
+>   already-fixed serving chain should bind 8080).
+> - Benign/teardown noise seen (not the blocker): `SQLServerDriver`/`oracle.jdbc.OracleConnection`
+>   missing-driver clinit (unused drivers); a `VarHandleReferences$FieldInstanceReadWrite.<init>`
+>   NoSuchMethodError from `org.jboss.threads…clearThreadLocals` during teardown.
+>
+> **STATUS:** Gap 9 transformed from a silent wall into a visible, advancing RUNTIME_INIT gap-walk.
+> 8 fixes merged to `dev` (merge `498fae5f`): the Vert.x/Netty HTTP serving chain (4) + the
+> `CRATONVM_REAL_QUARKUS_START` gate + `setUseParentHandlers` + docs. Boot order now: STATIC_INIT
+> `<clinit>` (ArC/RESTEasy-metadata/Hibernate-metadata) → RUNTIME_INIT (logging ✅ → Netty event loops ✅
+> → Hibernate SessionFactory build ❌ Caffeine). Required gates: `CRATONVM_REAL_AGROAL` +
+> `CRATONVM_REAL_VERTX` + `CRATONVM_REAL_NET_SOCKETS` + `CRATONVM_REAL_QUARKUS_START` (all opt-in).
+
 ### Quarkus ArC (`CRATONVM_REAL_ARC`) — REACHED and running
 Real ArC bytecode RUNS during the boot — `Arc.initialize` → container →
 `InstanceImpl` bean resolution/creation all execute as real bytecode, and ArC

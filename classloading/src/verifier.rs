@@ -41,24 +41,40 @@
 //! `jsr` / `jsr_w` / `ret` cannot be type-state-verified by our worklist
 //! verifier at all.
 //!
-//! **SECURITY FIX (HIGH).** The previous behaviour routed such methods to
-//! a *structural-only* fallback: it decoded instructions and checked
-//! branch/handler bounds but performed **no** operand-stack / local
-//! type-state verification, then accepted the method. A permissive
-//! verifier is a memory-safety hole — unverified bytecode would reach the
-//! interpreter/JIT with no type-consistency guarantee. We now **reject**
-//! by default: the structural sanity scan still runs (so malformed
-//! bytecode is still caught), but the type-verification bypass is a hard
-//! `VerifyError` rather than silent acceptance. The legacy structural-only
-//! acceptance remains available behind the `CRATONVM_ALLOW_JSR_RET` opt-in
-//! escape hatch (see [`allow_jsr_ret`]).
+//! **SECURITY FIX (HIGH), version-gated policy.** An earlier revision routed
+//! *every* subroutine-using method to a *structural-only* fallback (decode +
+//! branch/handler bounds, but **no** operand-stack / local type-state check)
+//! and accepted it. A permissive verifier is a memory-safety hole — but the
+//! follow-on fix that *rejected every* subroutine-using method over-corrected:
+//! it refused to load legal pre-Java-7 class files that HotSpot loads, which
+//! regressed real applications (e.g. ByteBuddy 1.14's
+//! `JavaDispatcher$DynamicClassLoader.proxy`, a Java 5 / major-49 class whose
+//! `try-finally` compiles to a double-`jsr` subroutine).
+//!
+//! The policy is therefore gated on the **class-file version**, mirroring the
+//! JVMS §4.9.1 static constraint (`jsr`/`jsr_w`/`ret` are legal at major ≤ 50,
+//! forbidden at major ≥ 51):
+//!   * **major ≤ 50 (Java 6 and earlier):** the opcodes are legal and HotSpot
+//!     loads the class. CratonVM runs the structural sanity scan (so malformed
+//!     bytecode is still caught) and then **accepts** — the same load decision
+//!     HotSpot makes. The residual gap (no subroutine type-state check) is the
+//!     same reduced guarantee already extended to trusted bootstrap classes,
+//!     bounded to genuinely-legal bytecode, until a full §4.10.2.5 subroutine
+//!     verifier lands (tracked follow-up).
+//!   * **major ≥ 51 (Java 7+):** the opcodes are forbidden; the class is
+//!     malformed. CratonVM **rejects** it with a hard `VerifyError`, matching
+//!     HotSpot. (Java 7+ classes are otherwise required to ship `StackMapTable`
+//!     and never legitimately emit `jsr`/`ret`.)
+//!
+//! The `CRATONVM_ALLOW_JSR_RET` opt-in escape hatch (see [`allow_jsr_ret`])
+//! forces structural-only acceptance regardless of version, for deployments
+//! that must load otherwise-malformed jars and accept the reduced guarantee.
 //!
 //! Methods that do **not** use subroutines are verified strictly via the
-//! existing `bytecode_verifier::verify_bytecode` path, so the rejection
-//! is bounded to the exact set of methods that the worklist verifier
-//! cannot model. Java 7+ classes (which never emit `jsr`/`ret` and are
-//! required to ship `StackMapTable`) are unaffected — the fast path
-//! delegates to `bytecode_verifier::verify_bytecode` unchanged.
+//! existing `bytecode_verifier::verify_bytecode` path, so the relaxation is
+//! bounded to the exact set of methods that the worklist verifier cannot
+//! model. Java 7+ classes that ship `StackMapTable` and no subroutines take
+//! the fast path through `bytecode_verifier::verify_bytecode` unchanged.
 
 #[cfg(test)]
 use std::sync::Arc;
@@ -97,21 +113,23 @@ pub fn verify_class(
 /// anywhere in the class) delegates to
 /// [`super::bytecode_verifier::verify_bytecode`] verbatim. Otherwise,
 /// each method is verified individually:
-///   * methods using subroutines → structural sanity scan, then a hard
-///     `VerifyError` (SECURITY FIX HIGH), because our worklist verifier
-///     collapses two distinct `ReturnAddress` values into `Top` at the
-///     subroutine entry and so cannot type-check them — accepting them
-///     unverified is a memory-safety hole. The legacy structural-only
-///     acceptance is available behind the `CRATONVM_ALLOW_JSR_RET`
-///     escape hatch (see [`allow_jsr_ret`]);
+///   * methods using subroutines → structural sanity scan, then a
+///     **version-gated** decision: a hard `VerifyError` when the class-file
+///     version forbids the opcodes (major ≥ 51, JVMS §4.9.1 — the class is
+///     malformed and HotSpot rejects it too), or structural-only acceptance
+///     when the version permits them (major ≤ 50, where HotSpot loads the
+///     class). Our worklist verifier collapses two distinct `ReturnAddress`
+///     values into `Top` at a shared subroutine entry and so cannot
+///     type-state-check legal subroutines yet; the `CRATONVM_ALLOW_JSR_RET`
+///     escape hatch (see [`allow_jsr_ret`]) forces acceptance at any version;
 ///   * everything else → the same per-method type-state algorithm that
 ///     `bytecode_verifier::verify_bytecode` runs (StackMapTable-driven
 ///     for Java 7+, worklist-based for Java 6 and earlier).
 ///
-/// The per-method routing is what isolates the rejection: a non-JSR
-/// method in the same class as a JSR method is still strictly
-/// type-state-verified, so a real bug in the non-JSR method will not
-/// be masked by the rejection of the JSR method.
+/// The per-method routing isolates the decision: a non-JSR method in the same
+/// class as a JSR method is still strictly type-state-verified, so a real bug
+/// in the non-JSR method is neither masked by acceptance of a legal subroutine
+/// nor by rejection of an illegal one.
 ///
 /// This is the JSR-aware Pass 3 entry point; consumers that previously
 /// called [`super::bytecode_verifier::verify_bytecode`] should call
@@ -120,28 +138,25 @@ pub fn verify_class(
 /// version ≤ 50 qualifies).
 /// Cached verdict for the `CRATONVM_ALLOW_JSR_RET` escape hatch.
 ///
-/// SECURITY FIX (HIGH): pre-Java-7 methods that use `jsr` / `jsr_w` / `ret`
-/// cannot be type-state-verified by our worklist verifier (it collapses the
-/// two distinct `ReturnAddress` values at a shared subroutine entry into
-/// `Top`; see the module-level docs). The previous behaviour routed such
-/// methods to a *structural-only* fallback that decoded instructions and
-/// checked branch/handler bounds but performed **no** operand-stack / local
-/// type-state verification. A permissive verifier is a memory-safety hole:
-/// unverified bytecode reaches the interpreter/JIT with no guarantee that the
-/// operand stack and locals are type-consistent.
+/// SECURITY FIX (HIGH): methods that use `jsr` / `jsr_w` / `ret` cannot be
+/// type-state-verified by our worklist verifier (it collapses the two distinct
+/// `ReturnAddress` values at a shared subroutine entry into `Top`; see the
+/// module-level docs). The default policy is **version-gated** (JVMS §4.9.1):
+/// such methods are accepted after their structural scan when the class-file
+/// version legitimately permits the opcodes (major ≤ 50, matching HotSpot's
+/// load decision) and rejected when the version forbids them (major ≥ 51, where
+/// the class is malformed). The full §4.10.2.5 subroutine-inlining verifier is
+/// non-trivial (~1k LOC of bytecode rewriting) and not yet implemented, so for
+/// legal pre-Java-7 classes the structural decode/bounds checks run (to surface
+/// malformed bytecode) but the type-state check inside the subroutine is
+/// deferred to that follow-up.
 ///
-/// The safe default is therefore to **reject** any class whose method uses a
-/// subroutine opcode (VerifyError-equivalent) rather than silently accept it
-/// unverified. The full §4.10.2.5 subroutine-inlining verifier is non-trivial
-/// (~1k LOC of bytecode rewriting) and not yet implemented, so until it lands
-/// the structural decode/bounds checks still run (to surface malformed
-/// bytecode) but the type-verification bypass is a hard rejection.
-///
-/// Setting `CRATONVM_ALLOW_JSR_RET` to a non-empty, non-`"0"` value opts back
-/// into the legacy structural-only acceptance for environments that must load
-/// legacy pre-Java-7 jars and accept the reduced verification guarantee. Off
-/// by default. Read once at process start (the env can't change mid-run),
-/// mirroring the `OnceLock` pattern used elsewhere in this crate.
+/// Setting `CRATONVM_ALLOW_JSR_RET` to a non-empty, non-`"0"` value forces the
+/// structural-only acceptance at **any** class-file version (including the
+/// malformed major ≥ 51 case), for environments that must load such jars and
+/// accept the reduced verification guarantee. Off by default. Read once at
+/// process start (the env can't change mid-run), mirroring the `OnceLock`
+/// pattern used elsewhere in this crate.
 static ALLOW_JSR_RET: OnceLock<bool> = OnceLock::new();
 
 /// `true` when `CRATONVM_ALLOW_JSR_RET` is set to a non-empty, non-`"0"`
@@ -203,6 +218,35 @@ fn verify_class_bytecode_inner(
     // silently downgrade its non-JSR sibling methods to lenient mode.
     let strict = !super::bytecode_verifier::class_is_bootstrap_trusted(class);
 
+    // POLICY: whether subroutine-using methods may be accepted under the
+    // structural-only fallback. Two independent paths permit acceptance:
+    //
+    //   1. The class-file version is pre-Java-7 (major ≤ 50), where
+    //      `jsr` / `jsr_w` / `ret` are **legal** bytecode (JVMS §4.9.1 forbids
+    //      them only at version 51.0 and above). HotSpot loads such a class —
+    //      its type-inference verifier applies §4.10.2.5 subroutine inlining.
+    //      CratonVM's worklist verifier cannot yet model subroutine inlining
+    //      (it collapses the two distinct `ReturnAddress` values at a shared
+    //      subroutine entry into `Top`), so it falls back to the structural
+    //      scan and accepts — matching the *load decision* HotSpot makes for
+    //      the same class. The residual gap (no operand-stack/local type-state
+    //      check inside the subroutine) is the same reduced guarantee CratonVM
+    //      already extends to trusted bootstrap classes, and is bounded to
+    //      genuinely-legal old bytecode. Full §4.10.2.5 subroutine type-state
+    //      verification is tracked as follow-up work.
+    //
+    //   2. The `CRATONVM_ALLOW_JSR_RET` escape hatch is set, which forces
+    //      structural-only acceptance regardless of version (for deployments
+    //      that must load otherwise-malformed jars).
+    //
+    // A class-file version ≥ 51 that contains a subroutine opcode is
+    // **malformed** — JVMS §4.9.1 forbids `jsr`/`jsr_w`/`ret` at 51.0+, so
+    // HotSpot rejects it and so does CratonVM unless the escape hatch is set.
+    // This is the SECURITY FIX (HIGH) boundary: the hard rejection is retained
+    // exactly where the bytecode is illegal, and lifted where it is legal.
+    let legal_pre_java7_subroutines = class.version.major <= ClassFileVersion::JAVA_6.major;
+    let accept_subroutines = allow_jsr || legal_pre_java7_subroutines;
+
     // At least one method in this class uses jsr/ret. Walk methods
     // individually so we can apply the structural-only fallback to the
     // subroutine-using ones while still type-state-verifying the rest.
@@ -211,28 +255,28 @@ fn verify_class_bytecode_inner(
             continue;
         }
         if method_uses_jsr_or_ret(method) {
-            // SECURITY FIX (HIGH): subroutine-using method. We still run the
-            // structural sanity scan first so malformed bytecode (truncated
-            // instructions, out-of-range jumps, ill-formed handler ranges) is
-            // rejected exactly as before. We then make the *type-verification
-            // bypass* a hard rejection: our worklist verifier cannot model the
-            // §4.10.2.5 subroutine-inlining rules, so accepting these methods
-            // would let unverified bytecode through — a memory-safety hole.
-            //
-            // The legacy structural-only acceptance is available behind the
-            // `CRATONVM_ALLOW_JSR_RET` opt-in escape hatch for callers that
-            // must load legacy pre-Java-7 jars and accept the reduced
-            // guarantee; the default is to reject.
+            // Subroutine-using method. We always run the structural sanity scan
+            // first so malformed bytecode (truncated instructions, out-of-range
+            // jumps, ill-formed handler ranges) is rejected exactly as before,
+            // regardless of the accept/reject decision below.
             verify_method_structural_only(class, method)?;
-            if !allow_jsr {
+            // SECURITY FIX (HIGH), version-gated: reject the type-verification
+            // bypass only where the bytecode is *illegal* (class-file version
+            // ≥ 51, where §4.9.1 forbids these opcodes). For legal pre-Java-7
+            // versions — or under the `CRATONVM_ALLOW_JSR_RET` escape hatch —
+            // accept the structurally-validated method, matching HotSpot's load
+            // decision. See the `accept_subroutines` derivation above.
+            if !accept_subroutines {
                 return Err(LinkageError::VerifyError {
                     class_name: class.name.to_string(),
                     method_name: method.name.to_string(),
-                    message: "method uses jsr/jsr_w/ret subroutine opcodes, which cannot be \
-                              type-checked by this verifier; refusing to load it unverified \
-                              (set CRATONVM_ALLOW_JSR_RET=1 to opt into legacy structural-only \
-                              acceptance)"
-                        .to_string(),
+                    message: format!(
+                        "method uses jsr/jsr_w/ret subroutine opcodes, which are forbidden in \
+                         class-file version {}.0 and above (JVMS §4.9.1); refusing to load this \
+                         malformed class (set CRATONVM_ALLOW_JSR_RET=1 to opt into legacy \
+                         structural-only acceptance)",
+                        class.version.major
+                    ),
                 });
             }
         } else {
@@ -2114,16 +2158,17 @@ mod tests {
         }
     }
 
-    /// SECURITY FIX (HIGH): a synthetic method that mirrors the
+    /// A synthetic method that mirrors the
     /// `TypePool$AbstractBase$Hierarchical.clear` shape from
     /// ByteBuddy 1.12.12 — two distinct `jsr` call sites that target
     /// the same subroutine. Our worklist verifier cannot type-check it
-    /// (it merges `ReturnAddress(3)` and `ReturnAddress(6)` into `Top`),
-    /// so the default policy must **reject** it (refuse to load it
-    /// unverified) rather than silently accept it via the structural-only
-    /// fallback. The legacy structural-only acceptance is still reachable
-    /// through the `CRATONVM_ALLOW_JSR_RET` escape hatch, modelled here by
-    /// the `allow_jsr = true` branch.
+    /// (it merges `ReturnAddress(3)` and `ReturnAddress(6)` into `Top`).
+    ///
+    /// Version-gated policy: at a **legal pre-Java-7 version (major 49)** the
+    /// opcodes are permitted (JVMS §4.9.1) and HotSpot loads the class, so
+    /// CratonVM accepts it after the structural scan — by default, with no
+    /// escape hatch. The escape hatch is exercised here only to confirm it is
+    /// also a path to acceptance.
     ///
     /// Bytecode:
     /// ```text
@@ -2136,7 +2181,7 @@ mod tests {
     ///  10: ret 0        ← return via the stored address
     /// ```
     #[test]
-    fn jsr_double_call_site_rejected_by_default_accepted_with_escape_hatch() {
+    fn jsr_double_call_site_pre_java7_accepted_by_default() {
         let class = make_pre_java7_jsr_class(
             "clear",
             "()V",
@@ -2152,20 +2197,61 @@ mod tests {
             ],
             vec![],
         );
-        // Default policy (escape hatch off): structurally well-formed, but
-        // the subroutine opcodes can't be type-checked → hard rejection.
+        // Default policy (escape hatch off): legal pre-Java-7 version, so the
+        // structurally well-formed subroutine method is accepted — this is the
+        // regression fix (ByteBuddy `JavaDispatcher$DynamicClassLoader.proxy`).
+        let accepted_default = verify_class_bytecode_inner(&class, &PermissiveHierarchy, false);
+        assert!(
+            accepted_default.is_ok(),
+            "legal pre-Java-7 (major 49) subroutine method must be accepted by \
+             default (HotSpot loads it), got {accepted_default:?}"
+        );
+        // Escape hatch on: also accepted (structural-only).
+        let accepted_hatch = verify_class_bytecode_inner(&class, &PermissiveHierarchy, true);
+        assert!(
+            accepted_hatch.is_ok(),
+            "with CRATONVM_ALLOW_JSR_RET the structurally-valid subroutine method \
+             must be accepted (structural-only), got {accepted_hatch:?}"
+        );
+    }
+
+    /// The same double-`jsr` shape, but stamped with a **Java 7+ class-file
+    /// version (major 51)** where JVMS §4.9.1 *forbids* `jsr`/`jsr_w`/`ret`.
+    /// Such a class is malformed; HotSpot rejects it and so must CratonVM by
+    /// default. The `CRATONVM_ALLOW_JSR_RET` escape hatch still forces
+    /// structural-only acceptance for deployments that must load such jars.
+    #[test]
+    fn jsr_double_call_site_java7plus_rejected_by_default_accepted_with_escape_hatch() {
+        let mut class = make_pre_java7_jsr_class(
+            "clear",
+            "()V",
+            1,
+            1,
+            vec![
+                0xa8, 0x00, 0x09, // 0: jsr +9
+                0xa8, 0x00, 0x06, // 3: jsr +6
+                0xb1, // 6: return
+                0x00, 0x00, // 7..8: nop padding (unreachable)
+                0x4b, // 9: astore_0
+                0xa9, 0x00, // 10: ret 0
+            ],
+            vec![],
+        );
+        // Forbidden at major ≥ 51 — mark the class as Java 7.
+        class.version = ClassFileVersion::JAVA_7;
+        // Default policy: malformed (subroutine opcode at version ≥ 51) → reject.
         let rejected = verify_class_bytecode_inner(&class, &PermissiveHierarchy, false);
         assert!(
             rejected.is_err(),
-            "subroutine-using method must be rejected by default (no unverified \
-             acceptance via structural-only fallback), got {rejected:?}"
+            "subroutine opcode at class-file version 51+ is forbidden (JVMS §4.9.1) \
+             and must be rejected by default, got {rejected:?}"
         );
-        // Escape hatch on: legacy structural-only acceptance.
+        // Escape hatch on: structural-only acceptance regardless of version.
         let accepted = verify_class_bytecode_inner(&class, &PermissiveHierarchy, true);
         assert!(
             accepted.is_ok(),
             "with CRATONVM_ALLOW_JSR_RET the structurally-valid subroutine method \
-             must be accepted (structural-only), got {accepted:?}"
+             must be accepted even at version 51+, got {accepted:?}"
         );
     }
 
@@ -2203,9 +2289,10 @@ mod tests {
     /// ```
     /// The exception table protects [0..15) with handler at 15, which
     /// in real bytecode would be the `try { parent.clear() } catch (any)`
-    /// shape that the Java 5 javac emits for `try-finally`.
+    /// shape that the Java 5 javac emits for `try-finally`. At this legal
+    /// pre-Java-7 version the class is accepted by default (HotSpot loads it).
     #[test]
-    fn jsr_finally_handler_double_call_site_rejected_by_default_accepted_with_escape_hatch() {
+    fn jsr_finally_handler_double_call_site_pre_java7_accepted_by_default() {
         // Build the bytecode array first so we can reference precise
         // offsets in the exception table without juggling magic numbers.
         let code: Vec<u8> = vec![
@@ -2242,19 +2329,22 @@ mod tests {
             },
         ];
         let class = make_pre_java7_jsr_class("clear", "()V", 1, 3, code, exc);
-        // Default: refuse to load the unverifiable subroutine method.
-        let rejected = verify_class_bytecode_inner(&class, &PermissiveHierarchy, false);
+        // Legal pre-Java-7 (major 49) version: HotSpot loads this try-finally
+        // double-jsr shape, so CratonVM accepts it after the structural scan —
+        // by default, no escape hatch required.
+        let accepted_default = verify_class_bytecode_inner(&class, &PermissiveHierarchy, false);
         assert!(
-            rejected.is_err(),
+            accepted_default.is_ok(),
             "ByteBuddy clear()-shape (try-finally with double-jsr to one \
-             subroutine) must be rejected by default, got {rejected:?}"
+             subroutine) at a legal pre-Java-7 version must be accepted by \
+             default, got {accepted_default:?}"
         );
-        // Escape hatch: legacy structural-only acceptance.
-        let accepted = verify_class_bytecode_inner(&class, &PermissiveHierarchy, true);
+        // Escape hatch: also accepted (structural-only).
+        let accepted_hatch = verify_class_bytecode_inner(&class, &PermissiveHierarchy, true);
         assert!(
-            accepted.is_ok(),
+            accepted_hatch.is_ok(),
             "with CRATONVM_ALLOW_JSR_RET the structurally-valid clear()-shape \
-             must be accepted (structural-only), got {accepted:?}"
+             must be accepted (structural-only), got {accepted_hatch:?}"
         );
     }
 
@@ -2446,13 +2536,13 @@ mod tests {
     }
 
     /// SECURITY FIX (HIGH): the default-policy rejection of a
-    /// subroutine-using method must surface as a `VerifyError` whose
-    /// message names the `jsr/jsr_w/ret` cause and the
-    /// `CRATONVM_ALLOW_JSR_RET` escape hatch, so the refusal is
-    /// diagnosable rather than an opaque failure.
+    /// subroutine-using method at a *forbidden* class-file version
+    /// (major ≥ 51) must surface as a `VerifyError` whose message names
+    /// the `jsr/jsr_w/ret` cause and the `CRATONVM_ALLOW_JSR_RET` escape
+    /// hatch, so the refusal is diagnosable rather than an opaque failure.
     #[test]
     fn jsr_default_rejection_is_a_verify_error_with_diagnostic() {
-        let class = make_pre_java7_jsr_class(
+        let mut class = make_pre_java7_jsr_class(
             "clear",
             "()V",
             1,
@@ -2466,6 +2556,9 @@ mod tests {
             ],
             vec![],
         );
+        // Java 7+ (major 51): subroutine opcodes are forbidden → rejected by
+        // default with a diagnostic message.
+        class.version = ClassFileVersion::JAVA_7;
         match verify_class_bytecode_inner(&class, &PermissiveHierarchy, false) {
             Err(LinkageError::VerifyError {
                 method_name,
