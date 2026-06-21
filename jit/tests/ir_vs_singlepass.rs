@@ -1364,7 +1364,7 @@ fn compile_with_dispatch(
         true, // optimize (C2 / IR pipeline)
         true, // ir_emit_calls (Gap B, invokestatic)
         true, // ir_emit_special_calls (inc 24, invokespecial — inert without 0xb7)
-        false, // ir_emit_long (inc 25 — call tests don't use long)
+        true, // ir_emit_long (inc 28 — long call args; inert for non-long callers)
         true, // ir_emit_virtual_calls (inc 26, invokevirtual/interface)
     )
 }
@@ -1538,6 +1538,67 @@ fn ir_vs_singlepass_invokestatic_reference_arg() {
             "reference-arg marshalling for x={xval}, n={n}"
         );
         drop(obj);
+    }
+}
+
+#[test]
+fn ir_vs_singlepass_invokestatic_long_arg() {
+    // inc 28: a LONG argument is marshalled as ONE i64 slot (full 64-bit). The
+    // method passes a long + an int to a static call returning int; the stub
+    // reads BOTH halves of the long arg0 (so a truncated marshalling would
+    // diverge) plus the int arg1.
+    //   static int f(long a, int n) { return g(a, n); }   // g:(JI)I
+    //   lload_0; iload_2; invokestatic #2; ireturn
+    unsafe extern "C" fn longarg_dispatch(
+        _vm: i64,
+        _info: i64,
+        args_ptr: i64,
+        num_args: i64,
+    ) -> i64 {
+        assert_eq!(num_args, 2, "longarg_dispatch expects (long, int)");
+        let p = args_ptr as *const i64;
+        let a = *p; // arg0 = the FULL 64-bit long (one slot)
+        let n = *p.add(1) as i32 as i64; // arg1 = int
+        let hi = (a >> 32) as i32 as i64; // high 32 bits — 0 if truncated
+        let lo = a as i32 as i64; // low 32 bits
+        hi.wrapping_add(lo).wrapping_add(n) as i32 as i64
+    }
+    fn host(a: i64, n: i64) -> i32 {
+        let hi = (a >> 32) as i32;
+        let lo = a as i32;
+        hi.wrapping_add(lo).wrapping_add(n as i32)
+    }
+    let mut helpers = dummy_helpers();
+    helpers.invoke_dispatch = longarg_dispatch as *const () as usize;
+    let code = vec![0x1e, 0x1c, 0xb8, 0x00, 0x02, 0xac];
+    let cm = cached("f", "(JI)I", code, 3, 2);
+    let resolver = |cp: u16| -> Option<(String, String, String)> {
+        if cp == 2 {
+            Some(("pkg/Helper".into(), "g".into(), "(JI)I".into()))
+        } else {
+            None
+        }
+    };
+    let ir = compile_with_dispatch(&cm, &helpers, &resolver)
+        .expect("IR compile of long-arg invokestatic method");
+    assert!(ir.needs_context());
+    let dummy_vm = [0u8; 64];
+    for (a, n) in [
+        (3i64, 7i64),
+        (0x1234_5678_9abc_def0u64 as i64, 11), // high bits non-zero
+        (-1, 2),
+        (i64::MIN, 1),
+        (0, 0),
+    ] {
+        // SAFETY: finalized Op::Call body taking (vm, long a, int n); the dummy
+        // VM buffer is never dereferenced by the stub.
+        let r = unsafe { ir.try_call_with_context(dummy_vm.as_ptr() as i64, &[a, n]) }
+            .unwrap_or_else(|e| panic!("call a={a},n={n}: {e:?}"));
+        assert_eq!(
+            r as i32,
+            host(a, n),
+            "long-arg marshalling (full 64-bit) for a={a}, n={n}"
+        );
     }
 }
 
