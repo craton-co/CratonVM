@@ -62,7 +62,8 @@
 //! a single firing point for all redefine flows so JVMTI agents see
 //! every transformation regardless of which API initiated it.
 
-use std::sync::{OnceLock, RwLock};
+use std::collections::HashMap;
+use std::sync::{Once, OnceLock, PoisonError, RwLock};
 
 use cratonvm_native_api::{NativeCallback, NativeContext, NativeMethodRegistry};
 use cratonvm_types::{
@@ -101,10 +102,93 @@ fn transformer_chain() -> &'static RwLock<Vec<TransformerEntry>> {
     INSTANCE.get_or_init(|| RwLock::new(Vec::new()))
 }
 
+// ---------------------------------------------------------------------------
+// GC-root integration
+// ---------------------------------------------------------------------------
+//
+// The transformer chain stores live Java `ClassFileTransformer` instances as
+// raw `ObjectRef`s (`TransformerEntry::transformer_ref`). Those references are
+// process-global state that the collector's stack/static walk never reaches,
+// so without the registration below a moving collection would (a) reclaim a
+// transformer no Java root still points at — Mockito/JaCoCo register a
+// transformer once and hold it only on the Java agent side — and (b) leave
+// every surviving `transformer_ref` pointing at the object's *old* address
+// after compaction. Either one yields a use-after-free or a dispatch onto a
+// relocated object the next time `run_transformer_chain` invokes `transform`.
+//
+// We close that hole by registering this subsystem with the native-root
+// registry: `scan_transformer_roots` folds every held ref into the root set
+// (so the mark phase keeps the transformer alive) and `remap_transformer_refs`
+// rewrites each held ref through the collector's relocation map after a moving
+// collection. Registration is lazy and exactly-once (see
+// [`add_transformer_entry`]).
+
+/// Push every live transformer `ObjectRef` held by the chain into `roots`
+/// so the collector treats it as a GC root. Null refs are skipped.
+///
+/// A GC must never miss a root, so on lock poisoning we recover the inner
+/// guard and scan anyway rather than silently dropping the roots (a poisoned
+/// chain still holds valid `ObjectRef`s that must survive the collection).
+fn scan_transformer_roots(roots: &mut Vec<ObjectRef>) {
+    let chain = transformer_chain()
+        .read()
+        .unwrap_or_else(PoisonError::into_inner);
+    for entry in chain.iter() {
+        // `transformer_ref` is a non-null `ObjectRef`; the null-transformer
+        // case is filtered out before an entry is ever pushed (see
+        // `native_add_transformer0`). Guard anyway in case a future caller
+        // seeds a sentinel.
+        if !entry.transformer_ref.as_ptr().is_null() {
+            roots.push(entry.transformer_ref);
+        }
+    }
+}
+
+/// Rewrite every held transformer `ObjectRef` through the collector's
+/// `old-addr -> new-addr` relocation `map` after a moving collection. Refs
+/// absent from the map were not relocated and are left unchanged.
+///
+/// As with [`scan_transformer_roots`], recover from lock poisoning rather than
+/// skip: an un-remapped ref left pointing at a relocated object is a
+/// use-after-free, so the remap must run even on a poisoned lock.
+fn remap_transformer_refs(map: &HashMap<usize, usize>) {
+    let mut chain = transformer_chain()
+        .write()
+        .unwrap_or_else(PoisonError::into_inner);
+    for entry in chain.iter_mut() {
+        let old_addr = entry.transformer_ref.as_ptr() as usize;
+        if let Some(&new_addr) = map.get(&old_addr) {
+            // SAFETY: `new_addr` is the relocated address the collector
+            // assigned to this same live object; it is non-null and
+            // heap-aligned by construction of the relocation map. Mirrors the
+            // remap convention used throughout `memory::gc`.
+            entry.transformer_ref = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+        }
+    }
+}
+
+/// Register [`scan_transformer_roots`]/[`remap_transformer_refs`] with the
+/// native-root registry exactly once. Idempotent and cheap to call on every
+/// transformer add; the `Once` collapses all but the first call to a load.
+fn ensure_transformer_root_source_registered() {
+    static REGISTERED: Once = Once::new();
+    REGISTERED.call_once(|| {
+        crate::memory::native_roots::register_native_root_source(
+            scan_transformer_roots,
+            remap_transformer_refs,
+        );
+    });
+}
+
 /// Append `(transformer, canRetransform)` to the global chain. Used by
 /// both the `addTransformer0` native and the `addTransformer` helper on
 /// `cratonvm/Instrument`.  Order: appended at the end.
 pub fn add_transformer_entry(entry: TransformerEntry) {
+    // Lazily wire the chain into the GC root set on first use. Doing it here
+    // (rather than at startup) keeps the registry untouched for workloads that
+    // never install a transformer, and guarantees the source is live before
+    // any transformer ref can be reachable only from the chain.
+    ensure_transformer_root_source_registered();
     if let Ok(mut chain) = transformer_chain().write() {
         chain.push(entry);
     }
@@ -1621,6 +1705,72 @@ mod tests {
         assert_eq!(transformer_count(), 2);
         reset_transformer_chain();
         assert_eq!(transformer_count(), 0);
+    }
+
+    #[test]
+    fn scan_transformer_roots_yields_every_ref() {
+        reset_transformer_chain();
+        add_transformer_entry(TransformerEntry {
+            transformer_ref: fake_objref(0x1000),
+            can_retransform: true,
+            native_method_prefix: None,
+        });
+        add_transformer_entry(TransformerEntry {
+            transformer_ref: fake_objref(0x2000),
+            can_retransform: false,
+            native_method_prefix: None,
+        });
+        let mut roots = Vec::new();
+        scan_transformer_roots(&mut roots);
+        let addrs: Vec<usize> = roots.iter().map(|r| r.as_ptr() as usize).collect();
+        assert_eq!(addrs, vec![0x1000, 0x2000]);
+        reset_transformer_chain();
+    }
+
+    #[test]
+    fn scan_transformer_roots_empty_chain_pushes_nothing() {
+        reset_transformer_chain();
+        let mut roots = Vec::new();
+        scan_transformer_roots(&mut roots);
+        assert!(roots.is_empty());
+    }
+
+    #[test]
+    fn remap_transformer_refs_rewrites_relocated_entries() {
+        reset_transformer_chain();
+        add_transformer_entry(TransformerEntry {
+            transformer_ref: fake_objref(0x1000),
+            can_retransform: true,
+            native_method_prefix: None,
+        });
+        add_transformer_entry(TransformerEntry {
+            transformer_ref: fake_objref(0x2000),
+            can_retransform: false,
+            native_method_prefix: None,
+        });
+        // Relocate only the first entry; the second is absent from the map
+        // and must be left untouched.
+        let mut map: HashMap<usize, usize> = HashMap::new();
+        map.insert(0x1000, 0x9000);
+        remap_transformer_refs(&map);
+        let snap = snapshot_transformer_chain();
+        assert_eq!(snap[0].transformer_ref.as_ptr() as usize, 0x9000);
+        assert_eq!(snap[1].transformer_ref.as_ptr() as usize, 0x2000);
+        reset_transformer_chain();
+    }
+
+    #[test]
+    fn remap_transformer_refs_empty_map_is_noop() {
+        reset_transformer_chain();
+        add_transformer_entry(TransformerEntry {
+            transformer_ref: fake_objref(0x3000),
+            can_retransform: true,
+            native_method_prefix: None,
+        });
+        remap_transformer_refs(&HashMap::new());
+        let snap = snapshot_transformer_chain();
+        assert_eq!(snap[0].transformer_ref.as_ptr() as usize, 0x3000);
+        reset_transformer_chain();
     }
 
     #[test]
