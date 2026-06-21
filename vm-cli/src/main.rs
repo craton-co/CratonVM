@@ -3338,9 +3338,26 @@ fn main() {
             // watchdog on THIS (main-vm) thread — the one that runs the
             // interpreter — not the launcher thread that just joins it.
             cratonvm_vm::runtime::stwhang_watch::arm_from_env();
-            if let Err(e) = run() {
-                eprintln!("{e:#}");
-                std::process::exit(1);
+            // Diagnosability (Keycloak Gap 9): the boot can exit SILENTLY — `run()`
+            // returns `Ok` (e.g. waitForExit returned / VM main finished) or an `Err`
+            // whose `Display` ({e:#}) renders empty, so the prior `eprintln!("{e:#}")`
+            // could print nothing before `exit(1)`. Always surface the outcome
+            // (Display AND Debug) and flush stderr so a startup failure that ends the
+            // process is never invisible. Additive logging only — no behaviour change.
+            use std::io::Write as _;
+            match run() {
+                Ok(()) => {
+                    eprintln!(
+                        "[cratonvm] main-vm run() returned Ok — VM main exiting normally"
+                    );
+                    let _ = std::io::stderr().flush();
+                }
+                Err(e) => {
+                    eprintln!("[cratonvm] main-vm run() returned Err: {e:#}");
+                    eprintln!("[cratonvm] main-vm run() Err (debug): {e:?}");
+                    let _ = std::io::stderr().flush();
+                    std::process::exit(1);
+                }
             }
         })
         .expect("failed to spawn main-vm thread");

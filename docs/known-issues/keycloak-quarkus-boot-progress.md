@@ -8,14 +8,18 @@
 > `AgroalDataSourceConfigurationSupplier.get()` returned a bare-interface config → real
 > `DataSourceProvider`/`io.agroal.pool.DataSource` bytecode hit `AbstractMethodError` on
 > `dataSourceImplementation()`. With the gate the real Agroal pool runs over the real H2 driver and
-> (under JIT) the boot advances **past the entire DB layer** into RESTEasy Reactive deployment. The
-> **new frontier is Gap 9** — a *nondeterministic* wedge of the Quarkus "JPA Startup Thread" in Rust
-> native code, root-caused to the tracked **multi-thread-in-JIT-under-STW GC root-scanning gap**
-> (`cross_thread_jit_gap_hits` in `cratonvm_vm::jit::conservative_roots`), i.e. a STW GC dropping a
-> live JIT root held by a peer thread — the precise-JIT-stack-maps program's work, NOT a Keycloak
-> bug. Plus raw throughput (~15× HotSpot). See Gap 8/9 below. This branch is merged up to `dev`
-> (53 commits, incl. the `5085b137` "forward monitor + native roots on safepoint-resume" GC fix and
-> the ES GC root-cause wave) to validate Gap 9 against the latest GC root-safety code.
+> (under JIT) the boot advances **past the entire DB layer** into RESTEasy Reactive deployment.
+> **Gap 9 — SEE THE 2026-06-20 RE-CHARACTERIZATION BLOCK below (before "### Quarkus ArC").** The
+> earlier framing here — "a nondeterministic wedge of the Quarkus *JPA Startup Thread* in Rust native
+> code, root-caused to the multi-thread-in-JIT-under-STW GC root-scanning gap" — is **REFUTED by
+> direct evidence** (full-symbol cdb + watchdog Java-frame dump): there is NO wedged JPA thread (the
+> only sleeping daemon is the benign Cleaner doing `ReferenceQueue.remove`); `main` reaches
+> `waitForExit` (Quarkus thinks startup finished) but the **Vert.x/Netty HTTP server never starts**
+> (no event-loop threads) and HTTP never binds; the `cross_thread_jit_gap` warning fires only
+> intermittently (an unreliable red herring). Gap 9 is really **(throughput) + (a silent,
+> nondeterministic failure where the HTTP server doesn't come up)**, with the fatal cause INVISIBLE
+> (the #1 blocker). Plus raw throughput (~15× HotSpot). See the re-characterization for the localized
+> Vert.x-startup gap and the prioritized next steps.
 
 Goal: reach and validate the **real Quarkus ArC** CDI path (`CRATONVM_REAL_ARC`,
 the `quarkus_arc.rs` shim's replacement). ArC's `Arc.initialize()` runs **late**
@@ -600,6 +604,104 @@ VM's real file layer).
 > JDK `saveConvert` escaping + the real `#`-prefixed comment format; fixed `props_collect_keys`
 > likewise. Affects every `Properties.store` consumer; surfaced here because H2's `AUTO_SERVER`
 > `FileLock` does a save→load→equals watchdog that an entry-less file fails ("Concurrent update").
+
+> **RE-CHARACTERIZATION (2026-06-20, full-symbol cdb + watchdog Java-frame dump + ATHROW
+> across ~7 boots) — Gap 9 is NOT a JPA-Startup-Thread Rust sleep-poll wedge; it is a
+> SLOW, NONDETERMINISTIC boot that reaches RESTEasy deployment and then fails SILENTLY,
+> never binding HTTP. The earlier "sleep-poll / register-resident-root / native-stall"
+> framing is superseded by direct evidence.** Built a full-symbol binary
+> (`scripts/build-kcboot-sym.bat`: `CARGO_PROFILE_RELEASE_DEBUG=1 STRIP=none` →
+> `target-kcboot-sym/`; the default release PDB is `strip=debuginfo` and resolves every
+> Rust frame to `core::net::socket_addr::impl$6::fmt+<huge>` — useless) and used `cdb`
+> + the built-in `CRATONVM_DBG_HANGWALK` all-threads native dumper + the
+> `--stack-dump-on-timeout` Java-frame watchdog + `CRATONVM_DBG_ATHROW`.
+>
+> **What the boot actually does (gate ON, `CRATONVM_REAL_AGROAL=1`):**
+> - The Java-frame watchdog shows only THREE Java threads: `main` (the Java main thread),
+>   `Thread-1` (a daemon doing `ReferenceQueue.remove(timeout)` — a Cleaner/Reference
+>   consumer, BENIGN), `Thread-2` (`java.util.TimerThread` in `Object.wait()`, BENIGN).
+>   There is **no wedged "JPA Startup Thread"** — the prior "Thread-1 stuck in a Rust
+>   sleep-poll" reading was a transient/misread.
+> - cdb (full symbols) confirms `main` parks in `LockSupport.park`
+>   (`ParkState::park_interruptible`, jvm_thread.rs:176, via the AQS `ConditionObject`)
+>   inside `ApplicationLifecycleManager.waitForExit` → `KeycloakMain.run` (the
+>   `QuarkusApplication.run`) → i.e. **`application.start()` RETURNED — Quarkus considers
+>   startup "complete"** — yet the log is frozen at Hibernate Validator and **port 8080 is
+>   NOT bound** (verified live: process alive, `curl` → 000, no `Listening` log). The
+>   launcher OS `main` is just `handler.join()`ing main-vm (NtWaitForSingleObject).
+> - The "frozen at Hibernate Validator" log is MISLEADING: the boot continues SILENTLY
+>   past "Loaded expression factory via original TCCL". `CRATONVM_DBG_ATHROW` shows it
+>   actively building the Hibernate Validator `PredefinedScopeValidatorFactoryImpl`
+>   (constraint metadata over Keycloak's many `@…` validation annotations — the only
+>   exceptions are BENIGN, caught `NoSuchMethodException`/`ValidationException(javafx
+>   ObservableValue)`/`UnsatisfiedResolutionException(MapStringConverter)`/`HibernateException(/hibernate.properties)`),
+>   and the watchdog caught `main` in **real RESTEasy Reactive deployment**
+>   (`ApplicationImpl.<clinit>` pc≈750 → `ResteasyReactiveProcessor$setupDeployment.deploy_41`
+>   → `RuntimeDeploymentManager.deploy` → `RuntimeResourceDeployment.buildResourceMethod`
+>   over Keycloak's hundreds of REST endpoints). So the boot reaches RESTEasy deploy — it
+>   does NOT "stall at Hibernate Validator".
+>
+> **Thread dump of the parked process (cdb, 6 OS threads) — the Vert.x HTTP server NEVER
+> STARTS.** The only threads are: `main` (launcher, NtWaitForSingleObject joining main-vm),
+> `main-vm` (Java main, parked in `LockSupport.park`/`waitForExit`), `Thread-1` (in
+> `ZwCreateTimer2` = a Rust `std::thread::sleep` — this is the BENIGN Cleaner's
+> `ReferenceQueue.remove(timeout)` poll; **this is exactly the "Rust sleep-poll" the prior
+> session saw and MISATTRIBUTED to a wedged "JPA Startup Thread"**), `Thread-2`
+> (`TimerThread`), and two idle Windows thread-pool workers
+> (`ZwWaitForWorkViaWorkerFactory`). **There are NO `vert.x-eventloop-thread-*` / Netty NIO
+> threads** — a live Quarkus HTTP server always spawns them. So even though `main` reaches
+> `waitForExit` (Quarkus thinks startup finished), the Vert.x/Netty HTTP server start task
+> ran without actually starting the server (no event loops, no bind). **The functional gap
+> is therefore localized to the Vert.x/Netty HTTP server startup (`VertxHttpRecorder` /
+> `VertxCoreRecorder`), NOT the DB / Hibernate / RESTEasy-deploy path (which all run).**
+>
+> **The failure is SILENT and NONDETERMINISTIC (across ~7 boots):** the process ends as
+> (a) all-threads-parked wedge, (b) `main` parked at `waitForExit` then a silent process
+> exit after ~50 s, or (c) a silent `exit(1)` under JIT — with **no error, no exception,
+> no panic, no `System.exit` log** (the doc's "logging gap 5b" / invisible-failure
+> blocker, strongly re-confirmed as the #1 obstacle). HTTP never binds in ANY run, even
+> with `CRATONVM_REAL_NET_SOCKETS=1` (the server-socket path is real-bytecode-capable via
+> `ServerSocketAdaptor`, proven for Tomcat, so the bind SHOULD work once startup truly
+> completes). The `cross_thread_jit_gap` (GC×JIT multi-thread root-scan) warning fires
+> only INTERMITTENTLY (2/4 captured runs, incl. a `--nojit` run) → unreliable indicator,
+> consistent with the doc's "conservative red herring".
+>
+> **The dominant, measured problem is THROUGHPUT.** Two large taxes: (1) **logging** —
+> CratonVM's JBoss-LogManager bridge (`native-builtins/src/logmanager.rs`) emits EVERY
+> record and defers level-filtering to the Rust `tracing` subscriber ("levels are
+> inherited from the process-wide tracing subscriber"), so Keycloak's `--log-level`/
+> `quarkus.log.level` does NOT suppress the per-certificate TRACE/DEBUG truststore flood
+> (~31 k lines) — a real, general, fixable throughput bug; (2) CPU-bound metadata builds
+> (ValidatorFactory over hundreds of constraints, RESTEasy deploy over hundreds of
+> endpoints) under interpreter / JIT-warmup. HotSpot reaches `Listening` in ~21 s; under
+> CratonVM the boot is many minutes and dies before binding.
+>
+> **Prioritized next steps (each a real sub-task):**
+> 1. **Diagnosability FIRST (the unblocker):** make the silent failure VISIBLE. Pin the
+>    exact silent-exit path (it is NOT Java `System.exit` — `native_system_exit` eprintln's
+>    and that line never appears; NOT a printed `run()` Err or panic). Candidate: an
+>    abnormal/daemon-only VM exit or a buffered-then-lost final log. Add an unconditional,
+>    flushed eprintln at every `std::process::exit` site + on the JVM "last non-daemon
+>    thread exited" path, and flush the JBoss-LogManager/console handler on exit. Until the
+>    fatal cause is printable, every further step is guesswork (exactly the doc's takeaway).
+> 2. **Throughput:** honor the Java-configured log level in the JBoss-LogManager bridge
+>    (don't emit filtered-out records); profile/JIT-cover the ValidatorFactory + RESTEasy
+>    `buildResourceMethod` hot loops.
+> 3. **GC×JIT precise roots:** the tracked precise-JIT-stack-maps / cross-thread-STW-root
+>    program (worktree `CratonVM-pjsm`) — re-test once (1) makes failures visible, using
+>    `CRATONVM_STRICT_JIT_ROOTS=1` to force any real drop fatal.
+> 4. **Vert.x HTTP server startup (now-localized functional gap):** the thread dump proves
+>    the server never starts (no event-loop threads) even though startup "completes". Trace
+>    the Quarkus HTTP start task (`VertxHttpRecorder.startServerAfterFailedStart`/`doServerStart`,
+>    `VertxCoreRecorder.initialize`, the Netty NIO `ServerSocketChannel` bind) under
+>    `CRATONVM_REAL_NET_SOCKETS=1` to find why it spawns no event loops / does not bind /
+>    fails silently. This is the gap between "Quarkus thinks it started" and a real
+>    `Listening on http://localhost:8080`.
+>
+> Repro harness for this session: `scratch/gap9-*.sh` (boot variants),
+> `scratch/gap9-wait-and-cdb.sh` (wait-for-wedge + cdb all-thread dump),
+> `scripts/build-kcboot-sym.bat` (full-symbol build). Boot needs
+> `CRATONVM_REAL_AGROAL=1` (+ `CRATONVM_REAL_NET_SOCKETS=1` for a real listen).
 
 ### Quarkus ArC (`CRATONVM_REAL_ARC`) — REACHED and running
 Real ArC bytecode RUNS during the boot — `Arc.initialize` → container →
