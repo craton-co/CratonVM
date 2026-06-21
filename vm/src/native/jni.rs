@@ -196,16 +196,17 @@ thread_local! {
     /// Entries are keyed by the returned pointer (`buf.as_mut_ptr() as usize`).
     static JNI_CRITICAL_COPIES: std::cell::RefCell<HashMap<usize, CriticalCopy>> =
         std::cell::RefCell::new(HashMap::new());
-    /// GC-correctness (vm-jni-roots #2): maps a DIRECT (no-copy) data pointer we
-    /// handed back to native code -> the base address of the backing array
-    /// object that we PINNED in `cratonvm_gc::pinned` for the lifetime of the
-    /// handout. `GetPrimitiveArrayCritical` / no-copy `Get<Type>ArrayElements`
-    /// return `array_data_ptr` (object base + header) and a moving GC must not
-    /// relocate or reclaim the array while the native pointer is live, so we pin
-    /// the object base. The matching `Release` only receives the data pointer,
-    /// not the array object, so we record `data_ptr -> object_base` here and
-    /// look it up to UNPIN. Refcounted in `pinned`, so overlapping critical
-    /// sections on the same array are safe.
+    /// GC-correctness (vm-jni-roots #2): maps a copy-buffer pointer we handed
+    /// back to native code -> the base address of the backing array object that
+    /// we PINNED in `cratonvm_gc::pinned` for KEEP-ALIVE during the handout.
+    /// `GetPrimitiveArrayCritical` / `Get<Type>ArrayElements` always hand out a
+    /// detached copy (never a heap pointer), so a GC must not RECLAIM the source
+    /// array before the copy-back at `Release`; we pin the object base to keep it
+    /// alive. (Relocation of the source is harmless — native code holds the copy,
+    /// not a heap pointer — so this is keep-alive only, not no-relocation.) The
+    /// matching `Release` only receives the buffer pointer, not the array object,
+    /// so we record `buffer_ptr -> object_base` here and look it up to UNPIN.
+    /// Refcounted in `pinned`, so overlapping checkouts of the same array are safe.
     static JNI_CRITICAL_PINS: std::cell::RefCell<HashMap<usize, usize>> =
         std::cell::RefCell::new(HashMap::new());
     /// Thread-local cache for parsed method descriptors.
@@ -833,14 +834,19 @@ pub fn update_local_refs_after_gc(pointer_map: &std::collections::HashMap<usize,
 // JNI critical-section array pinning (vm-jni-roots #2)
 // ---------------------------------------------------------------------------
 
-/// Pin the array object `oref` (so a moving GC neither relocates nor reclaims
-/// it) and remember which `data_ptr` we handed to native code so the matching
-/// `Release` can find and unpin it. Called on every DIRECT (no-copy)
-/// `GetPrimitiveArrayCritical` / `Get<Type>ArrayElements` handout.
+/// Pin the source array object `oref` for **keep-alive** — so a GC will not
+/// reclaim it while native code holds the copy we handed out — and remember the
+/// copy-buffer `data_ptr` so the matching `Release` can find and unpin it.
+/// Called on every `GetPrimitiveArrayCritical` / `Get<Type>ArrayElements`
+/// handout.
 ///
-/// `data_ptr` is the pointer returned to the native caller (object base +
-/// header), while the pin is keyed on the OBJECT BASE (`oref.as_ptr()`) because
-/// that is the address a moving collector tests in its relocation decision.
+/// NOTE: this is keep-alive ONLY. Data-movement safety is provided by handing
+/// native code a detached COPY (never a direct heap pointer), so the pin is NOT
+/// relied upon for no-relocation — see the `cratonvm_gc::pinned` module doc.
+///
+/// `data_ptr` is the copy-buffer pointer returned to the native caller (the key
+/// the matching `Release` passes back), while the pin is keyed on the OBJECT
+/// BASE (`oref.as_ptr()`), the address a collector tests against the pin set.
 fn pin_critical_array(oref: ObjectRef, data_ptr: usize) {
     let base = oref.as_ptr() as usize;
     if base == 0 || data_ptr == 0 {
@@ -854,8 +860,8 @@ fn pin_critical_array(oref: ObjectRef, data_ptr: usize) {
 
 /// Undo a [`pin_critical_array`] for the buffer at `data_ptr`. Looks up the
 /// pinned object base recorded at Get time and unpins it (refcounted, so an
-/// overlapping critical section keeps the array pinned until its own Release).
-/// A `data_ptr` that was never a direct handout (e.g. a copy-path buffer) is
+/// overlapping Get on the same array keeps it pinned until its own Release).
+/// A `data_ptr` we never handed out (foreign pointer / double-release) is
 /// absent from the map and ignored.
 fn unpin_critical_array(data_ptr: usize) {
     if data_ptr == 0 {
@@ -2453,41 +2459,36 @@ new_prim_array!(jni_new_float_array, ArrayElementType::Float); // 181
 new_prim_array!(jni_new_double_array, ArrayElementType::Double); // 182
 
 // ---- Indices 183-190: Get<Type>ArrayElements ----
-// Returns a pointer to the raw array data.
+// Returns a pointer to a native-endian COPY of the array data.
 //
-// PERF (jni-arrayelems-perf): the previous implementation ALWAYS materialised a
-// full per-element copy (a `get_array_element` + `match` loop over the whole
-// array) and reported `is_copy = JNI_TRUE` — an O(n) copy on every call, even
-// for ordinary contiguous primitive arrays whose in-heap layout is already a
-// flat native-endian block. The heap stores primitives exactly as the C side
-// expects them: `write_prim_element`/`read_prim_element` use native-endian
-// widths (boolean/byte=1, char/short=2, int/float=4, long/double=8) that match
-// the `JBoolean/JByte/JChar/JShort/JInt/JLong/JFloat/JDouble` typedefs
-// one-for-one, so a `*mut $rust_type` view over the array body is bit-identical
-// to the copy the old loop produced.
+// GC-correctness (vm-jni-roots #2): we ALWAYS hand native code a detached copy
+// of the array body and report `is_copy = JNI_TRUE` — never a raw pointer into
+// the live, in-heap array. This VM ships *moving* collectors (the generational
+// young-gen copy and the G1 evacuator both relocate live objects); a direct
+// body pointer handed to C would dangle the instant a GC fired while native
+// code held it — a use-after-free / heap-corruption hole. The JNI spec
+// explicitly permits returning a copy (`is_copy = JNI_TRUE`), so a copy is the
+// only collector-agnostic correct choice for this heap. (HotSpot can return a
+// direct pointer because it pins the array's page/region for the window; this
+// VM closes the same gap with the copy instead. A prior revision handed out the
+// direct `array_data_ptr` for ordinary arrays on a "heap never moves" premise
+// the VM does not actually hold — that was the bug this restores.)
 //
-// We therefore hand out a DIRECT pointer into the (pinned, non-moving) array
-// body with `is_copy = JNI_FALSE` whenever the array is contiguous, avoiding the
-// copy entirely. This mirrors the long-established `GetPrimitiveArrayCritical`
-// fast path (see `jni_get_primitive_array_critical`), which already returns the
-// same `array_data_ptr` directly: ordinary arrays live in the non-moving
-// generational heap / a single G1 region and are not relocated across a GC while
-// native code holds the pointer (the codebase's "our heap doesn't move objects
-// between GC" contract, cf. `GetStringCritical`).
+// The copy is built via the region-safe per-element accessor, so it works
+// uniformly for ordinary contiguous arrays AND G1 *humongous* arrays (whose
+// payload spans non-contiguous regions and have no flat data pointer). It is
+// registered in `JNI_ARRAY_ELEM_BUFFERS` so the matching
+// `Release<Type>ArrayElements` copies any mutations back and frees it.
 //
-// GC SAFETY / Release semantics: a direct pointer is deliberately NOT recorded
-// in `JNI_ARRAY_ELEM_BUFFERS`. `Release<Type>ArrayElements` looks the pointer up
-// and, finding no entry, treats it as a no-op — which is exactly right: native
-// writes already landed in the live array body (nothing to copy back) and there
-// is no separate buffer to free. Consistent with the JNI spec, when
-// `is_copy == JNI_FALSE` the `JNI_ABORT` release mode cannot undo in-place
-// writes, identical to the critical-section direct path.
-//
-// The COPY path is preserved verbatim for the one case that genuinely requires
-// it: a G1 *humongous* array, whose payload spans non-contiguous regions and so
-// has no flat data pointer (`array_data_ptr` returns `None`). There we still
-// build a contiguous buffer, register it, and report `is_copy = JNI_TRUE` so
-// Release copies any mutations back and frees it.
+// Keep-alive: while the copy is outstanding the SOURCE array is pinned in the
+// process-global `cratonvm_gc::pinned` set (refcounted) so it cannot be
+// reclaimed before the copy-back at Release. The pin provides ONLY keep-alive —
+// data-movement safety already comes from the copy — so no per-object
+// no-relocation enforcement in the collectors is required (see the
+// `cratonvm_gc::pinned` module doc). The array is also independently kept alive
+// for the duration of the native call by `native_pin_roots` (when it is a
+// method argument) or the implicit JNI local frame (a ref the native created),
+// so the pin is belt-and-suspenders for collectors that scan the pin set.
 macro_rules! get_array_elements {
     ($name:ident, $rust_type:ty, $value_variant:ident, $default:expr) => {
         extern "C" fn $name(
@@ -2498,30 +2499,19 @@ macro_rules! get_array_elements {
             if array == 0 {
                 return std::ptr::null_mut();
             }
-            // `(ptr, is_copy_flag)` — `is_copy_flag` is JNI_FALSE for the direct
-            // (no-copy) pointer and JNI_TRUE for the humongous copy buffer.
             let result = with_shared_vm(|shared| {
                 let oref = jobject_to_obj(array)?;
-                // FAST PATH: ordinary contiguous array → hand out the live body
-                // pointer, no copy. `array_data_ptr` returns `None` only for a
-                // G1 humongous array (non-contiguous payload), which falls
-                // through to the copy path below.
-                if let Some(base) = shared.heap.array_data_ptr(oref) {
-                    // The data region is a native-endian block of `$rust_type`
-                    // (see `write_prim_element`), so this reinterpretation is the
-                    // same bit pattern the per-element copy loop would have built.
-                    //
-                    // GC-correctness (vm-jni-roots #2): this is a DIRECT pointer
-                    // into the live array body. Pin the array so a moving GC will
-                    // not relocate or reclaim it while native code holds the
-                    // pointer; unpinned by `Release<Type>ArrayElements`.
-                    pin_critical_array(oref, base as usize);
-                    return Some((base as *mut $rust_type, JNI_FALSE));
-                }
-                // SLOW PATH (G1 humongous): materialise a contiguous copy via the
-                // region-safe per-element accessor, register it for Release.
+                // Materialise a detached, native-endian copy via the region-safe
+                // per-element accessor (works for ordinary AND G1-humongous
+                // arrays). See the module comment above for why a copy — not a
+                // direct heap pointer — is what we hand to native code.
                 let len = shared.heap.array_length(oref);
-                let mut buf: Vec<$rust_type> = Vec::with_capacity(len);
+                // `len.max(1)` guarantees a real, uniquely-addressed allocation
+                // even for a zero-length array, so its buffer pointer is never a
+                // shared dangling sentinel that would collide in the maps below.
+                // Release uses the STORED capacity (not `len`), so over-allocating
+                // by one element for the empty case stays sound.
+                let mut buf: Vec<$rust_type> = Vec::with_capacity(len.max(1));
                 for i in 0..len {
                     let val = match shared.heap.get_array_element(oref, i) {
                         Ok(v) => v,
@@ -2534,19 +2524,20 @@ macro_rules! get_array_elements {
                     buf.push(elem);
                 }
                 let ptr = buf.as_mut_ptr();
-                // BUG FIX (vm-jni-roots #2): record (ptr -> (len, cap)) so
-                // Release uses the EXACT layout we allocated. `buf` was created
-                // with `Vec::with_capacity(len)` then filled via `push`, so its
-                // capacity is `len` and its initialised count is `buf.len()`
-                // (== len unless an element fetch broke early). We store BOTH:
-                // `buf.len()` bounds the copy-back (never read uninitialised
-                // tail) and `buf.capacity()` is the size `Vec::from_raw_parts`
-                // requires for a sound free.
+                // Record (ptr -> (len, cap)) so Release uses the EXACT layout we
+                // allocated. `buf.len()` bounds the copy-back (never read an
+                // uninitialised tail) and `buf.capacity()` is the size
+                // `Vec::from_raw_parts` requires for a sound free.
                 let buf_len = buf.len();
                 let buf_cap = buf.capacity();
                 JNI_ARRAY_ELEM_BUFFERS.with(|c| {
                     c.borrow_mut().insert(ptr as usize, (buf_len, buf_cap));
                 });
+                // Keep-alive ONLY (not no-relocation): pin the source array so it
+                // cannot be reclaimed before the copy-back at Release; unpinned by
+                // `Release<Type>ArrayElements`. Data-movement safety comes from
+                // the copy above.
+                pin_critical_array(oref, ptr as usize);
                 std::mem::forget(buf); // OWNERSHIP: buffer transferred to native caller, freed by Release<Type>ArrayElements via Vec::from_raw_parts
                 Some((ptr, JNI_TRUE))
             })
@@ -2583,12 +2574,12 @@ macro_rules! release_array_elements {
             if elems.is_null() {
                 return;
             }
-            // GC-correctness (vm-jni-roots #2): if this was a DIRECT (no-copy)
-            // handout, `elems` is the live array body and we pinned the array at
-            // Get time; unpin it now (no-op for the copy path, whose pointer was
-            // never recorded in JNI_CRITICAL_PINS). Done before the copy-buffer
-            // lookup so the direct path — which has no JNI_ARRAY_ELEM_BUFFERS
-            // entry and returns early below — still releases its pin.
+            // GC-correctness (vm-jni-roots #2): release the keep-alive pin taken
+            // on the source array at Get time (every handout is a copy and was
+            // pinned for keep-alive). Refcounted, so an overlapping Get on the
+            // same array keeps it pinned until its own Release. Tolerant of an
+            // unknown `elems` (double-release / foreign pointer) — see
+            // `unpin_critical_array`.
             unpin_critical_array(elems as usize);
             // BUG FIX (vm-jni-roots #2): look up the (initialised_len, capacity)
             // recorded for THIS buffer at Get time. Never re-derive the length
@@ -3306,7 +3297,9 @@ fn critical_decode_element(et: ArrayElementType, src: &[u8]) -> Value {
 }
 
 // ---- Index 222: GetPrimitiveArrayCritical ----
-// Returns a direct pointer to the array data (no copy if possible).
+// Returns a pointer to a native-endian COPY of the array data (is_copy=JNI_TRUE);
+// see the `Get<Type>ArrayElements` module comment for why we never hand out a
+// direct heap pointer under this VM's moving collectors.
 extern "C" fn jni_get_primitive_array_critical(
     _env: JNIEnv,
     array: JArray,
@@ -3317,66 +3310,52 @@ extern "C" fn jni_get_primitive_array_critical(
     }
     with_shared_vm(|shared| {
         let oref = jobject_to_obj(array)?;
-        match shared.heap.array_data_ptr(oref) {
-            // Ordinary (single-region) array: hand out the live, contiguous
-            // payload pointer — no copy, release is a no-op.
-            Some(ptr) => {
-                // GC-correctness (vm-jni-roots #2): direct pointer into the live
-                // array body. Pin the array so a moving GC will not relocate or
-                // reclaim it while native code holds it; unpinned by
-                // `ReleasePrimitiveArrayCritical`.
-                pin_critical_array(oref, ptr as usize);
-                if !is_copy.is_null() {
-                    unsafe {
-                        *is_copy = JNI_FALSE;
-                    } // Direct pointer, no copy
-                }
-                Some(ptr as *mut std::ffi::c_void)
-            }
-            // G1 humongous array: the payload spans non-contiguous regions, so
-            // the JNI contract's "direct pointer" cannot be honoured. Fall
-            // back to the same copy-out / copy-back scheme the non-critical
-            // `Get<Type>ArrayElements` path uses: materialise a contiguous
-            // buffer via the region-safe accessor, hand it out, and register
-            // it so `ReleasePrimitiveArrayCritical` copies any mutations back
-            // and frees it.
-            None => {
-                let element_type = shared.heap.array_element_type(oref)?;
-                let stride = critical_stride(element_type);
-                if stride == 0 {
-                    return None; // reference array — not a primitive critical
-                }
-                let len = shared.heap.array_length(oref);
-                let mut buf: Vec<u8> = vec![0u8; len * stride];
-                for i in 0..len {
-                    let v = match shared.heap.get_array_element(oref, i) {
-                        Ok(v) => v,
-                        Err(_) => break,
-                    };
-                    let off = i * stride;
-                    critical_encode_element(v, element_type, &mut buf[off..off + stride]);
-                }
-                let ptr = buf.as_mut_ptr();
-                std::mem::forget(buf); // OWNERSHIP: transferred to native caller, reclaimed by jni_release_primitive_array_critical
-                JNI_CRITICAL_COPIES.with(|c| {
-                    c.borrow_mut().insert(
-                        ptr as usize,
-                        CriticalCopy {
-                            array,
-                            element_type,
-                            len,
-                            stride,
-                        },
-                    );
-                });
-                if !is_copy.is_null() {
-                    unsafe {
-                        *is_copy = JNI_TRUE;
-                    } // Copy, not a direct pointer
-                }
-                Some(ptr as *mut std::ffi::c_void)
-            }
+        // FORCE-COPY (vm-jni-roots #2): never hand out a raw pointer into the
+        // live array body. The VM's moving collectors would relocate the array
+        // out from under the native critical pointer (UAF). Materialise a
+        // detached, native-endian copy via the region-safe per-element accessor,
+        // register it for copy-back, and report `is_copy = JNI_TRUE`. The JNI
+        // spec permits returning a copy from GetPrimitiveArrayCritical; it is the
+        // only collector-agnostic correct choice for this heap. Works uniformly
+        // for ordinary AND G1-humongous arrays.
+        let element_type = shared.heap.array_element_type(oref)?;
+        let stride = critical_stride(element_type);
+        if stride == 0 {
+            return None; // reference array — not a primitive critical
         }
+        let len = shared.heap.array_length(oref);
+        let mut buf: Vec<u8> = vec![0u8; len * stride];
+        for i in 0..len {
+            let v = match shared.heap.get_array_element(oref, i) {
+                Ok(v) => v,
+                Err(_) => break,
+            };
+            let off = i * stride;
+            critical_encode_element(v, element_type, &mut buf[off..off + stride]);
+        }
+        let ptr = buf.as_mut_ptr();
+        std::mem::forget(buf); // OWNERSHIP: transferred to native caller, reclaimed by jni_release_primitive_array_critical
+        JNI_CRITICAL_COPIES.with(|c| {
+            c.borrow_mut().insert(
+                ptr as usize,
+                CriticalCopy {
+                    array,
+                    element_type,
+                    len,
+                    stride,
+                },
+            );
+        });
+        // Keep-alive ONLY (not no-relocation): pin the source array so it cannot
+        // be reclaimed before the copy-back at Release. Unpinned by
+        // `ReleasePrimitiveArrayCritical`. Data safety comes from the copy.
+        pin_critical_array(oref, ptr as usize);
+        if !is_copy.is_null() {
+            unsafe {
+                *is_copy = JNI_TRUE;
+            } // Always a copy under this VM's moving GC
+        }
+        Some(ptr as *mut std::ffi::c_void)
     })
     .flatten()
     .unwrap_or(std::ptr::null_mut())
@@ -3392,17 +3371,18 @@ extern "C" fn jni_release_primitive_array_critical(
     if carray.is_null() {
         return;
     }
-    // GC-correctness (vm-jni-roots #2): release the GC pin taken at Get time for
-    // a DIRECT (no-copy) critical pointer. No-op for the humongous copy path,
-    // whose buffer pointer was never recorded in JNI_CRITICAL_PINS.
+    // GC-correctness (vm-jni-roots #2): release the keep-alive pin taken on the
+    // source array at Get time. Refcounted; tolerant of an unknown `carray`
+    // (double-release / foreign pointer) — see `unpin_critical_array`.
     unpin_critical_array(carray as usize);
-    // Fast path: for ordinary arrays we handed out a direct pointer and
-    // recorded nothing, so there is nothing to copy back or free.
+    // Every GetPrimitiveArrayCritical handout is a registered copy buffer. If
+    // `carray` is not one we handed out (foreign pointer / already released),
+    // there is nothing to copy back or free.
     let copy = JNI_CRITICAL_COPIES.with(|c| c.borrow_mut().remove(&(carray as usize)));
     let Some(copy) = copy else {
         return;
     };
-    // Humongous fallback buffer. mode 0 = copy back + free, JNI_COMMIT (1) =
+    // Copy buffer. mode 0 = copy back + free, JNI_COMMIT (1) =
     // copy back, don't free, JNI_ABORT (2) = free without copy back.
     if mode != 2 {
         with_shared_vm(|shared| {
