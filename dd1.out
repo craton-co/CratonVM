@@ -1,4 +1,0 @@
-warmup sum=7571499
-OK div ArithmeticException: / by zero
-OK rem ArithmeticException: / by zero
-RESULT div=true rem=true

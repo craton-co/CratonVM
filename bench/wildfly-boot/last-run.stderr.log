@@ -1,5 +1,0 @@
-﻿[rustjvm] stack-dump watchdog armed: will dump + abort after 120s
-2026-05-15T13:31:31.719587Z  WARN rustjvm_vm::vm::vm_util: Post-clinit fixup: org/jboss/modules/Module.BOOT_MODULE_LOADER populated with empty AtomicReference
-WARNING: Failed to load the specified log manager class org.jboss.logmanager.LogManager
-2026-05-15T13:32:29.031694Z  WARN rustjvm_vm::vm::vm_util: Post-clinit fixup: BigInteger ZERO/ONE/TWO/NEGATIVE_ONE/TEN populated (5/5)
-
