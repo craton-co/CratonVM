@@ -386,6 +386,16 @@ mod tests {
         g1.satb_pre_barrier(b_addr);
         g1.set_field(a, 0, Value::Object(None));
 
+        // Test-isolation (Step 3): immediately spill this thread's SATB buffer
+        // into *this* collector's queue shards, so b_addr no longer lives in the
+        // process-global thread-local buffer. G1's `remark` now drains that
+        // global registry (finding #18 fix); without this spill a sibling test's
+        // `remark`/`deactivate_and_drain` running in parallel could pull b_addr
+        // into *its* queue before our own drain below — a shared-registry
+        // parallel-test artifact, not a real bug (the whole suite is green
+        // single-threaded). The shards are per-queue, so once spilled it is safe.
+        crate::satb::flush_thread_satb_buffer(g1.satb_queue());
+
         // Let the worker observe the new state.
         std::thread::sleep(Duration::from_millis(30));
 
@@ -405,6 +415,53 @@ mod tests {
             "SATB log must capture B's overwritten reference (got {:?})",
             drained
         );
+    }
+
+    /// finding #18 regression — G1's `remark` must drain the per-thread SATB
+    /// buffer, not just the global shards.
+    ///
+    /// `remark` drains with `drain()` (not `deactivate_and_drain`, which runs
+    /// only at end-of-cycle `cleanup`, where stragglers are *discarded*), so
+    /// before the fix it never pulled in a thread's partially-full local buffer:
+    /// a reference overwritten since that thread's last ~256-entry spill was
+    /// excluded from the remark snapshot and its target swept while reachable
+    /// (UAF). `remark` now drains the registry first.
+    ///
+    /// A narrow log→remark window plus a direct per-object `is_marked` check
+    /// (not a global count) keep this robust against the process-global SATB
+    /// registry shared with parallel tests.
+    #[test]
+    fn remark_drains_thread_local_satb_buffer() {
+        let g1 = small_collector();
+        let obj = g1.alloc_object(ClassId::new(1), 0);
+        let addr = obj.as_ptr() as usize;
+
+        // Activate the SATB barrier, then log `addr` into THIS thread's local
+        // buffer only — one entry is far below the 256-entry spill threshold, so
+        // it never reaches a shard. The shard drain alone (pre-fix remark) would
+        // miss it.
+        g1.start_concurrent_mark();
+        g1.satb_pre_barrier(addr);
+        assert!(
+            g1.satb_queue().is_empty(),
+            "the single entry must still be purely thread-local (not spilled)"
+        );
+
+        // remark must drain the thread-local buffer into the gray set; drain the
+        // worklist so the gray entry is actually marked.
+        g1.remark(&[]);
+        g1.concurrent_mark_step(usize::MAX);
+
+        g1.with_regions_mut(|regions| {
+            let marked = regions.iter().any(|r| {
+                let base = r.data.as_ptr() as usize;
+                addr >= base && addr < base + r.data.len() && r.mark_bitmap.is_marked(addr)
+            });
+            assert!(
+                marked,
+                "remark must drain the thread-local SATB buffer and mark its ref"
+            );
+        });
     }
 
     /// Test #3 — live data is unchanged after a full concurrent-mark cycle.
