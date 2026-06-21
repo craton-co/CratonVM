@@ -1340,10 +1340,13 @@ mod tests {
         proc.discover_reference(ReferenceType::Finalizer, 1, 100, None);
         proc.discover_reference(ReferenceType::Finalizer, 2, 200, None);
         proc.discover_reference(ReferenceType::Finalizer, 3, 300, None);
-        let _result = proc.process_references(&always_dead, 100, 0);
-        assert_eq!(proc.dequeue_for_finalization(), Some(100));
-        assert_eq!(proc.dequeue_for_finalization(), Some(200));
-        assert_eq!(proc.dequeue_for_finalization(), Some(300));
+        let result = proc.process_references(&always_dead, 100, 0);
+        // Once-only emission (bc math-ec 0x4 fix, 2026-06-10): process_references
+        // now DRAINS the dead finalizers into the result in FIFO discovery order
+        // rather than leaving them in the internal queue, so the interpreter
+        // consumes them exactly once. The internal queue is therefore empty
+        // afterwards.
+        assert_eq!(result.to_finalize, vec![100, 200, 300]);
         assert_eq!(proc.dequeue_for_finalization(), None);
     }
 
@@ -1409,9 +1412,12 @@ mod tests {
     #[test]
     fn update_after_gc_finalization_queue() {
         let mut proc = ReferenceProcessor::new();
-        proc.discover_reference(ReferenceType::Finalizer, 1, 100, None);
-        let _result = proc.process_references(&always_dead, 100, 0);
-        assert_eq!(proc.finalization_queue, vec![100]);
+        // process_references now DRAINS the finalization queue into its result
+        // (once-only emission, see finalization_queue_fifo), so populate the
+        // internal queue directly to isolate update_after_gc's relocation of a
+        // still-pending entry (an object moved by a GC between enqueue and
+        // consumption).
+        proc.finalization_queue.push_back(100);
         let mut map = HashMap::new();
         map.insert(100, 9999);
         proc.update_after_gc(&map);
@@ -1590,9 +1596,10 @@ mod tests {
     #[test]
     fn update_after_gc_finalization_null_skipped() {
         let mut proc = ReferenceProcessor::new();
-        proc.discover_reference(ReferenceType::Finalizer, 1, 0xBEEF, None);
-        let _result = proc.process_references(&always_dead, 100, 0);
-        assert_eq!(proc.finalization_queue, vec![0xBEEF]);
+        // Populate the queue directly — process_references now drains it (see
+        // finalization_queue_fifo) — to isolate update_after_gc's null-target
+        // skip behaviour.
+        proc.finalization_queue.push_back(0xBEEF);
         let mut map = HashMap::new();
         map.insert(0xBEEF, 0usize); // null target
         proc.update_after_gc(&map);
