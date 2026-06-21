@@ -2763,22 +2763,96 @@ extern "C" fn jni_define_class(
     _env: JNIEnv,
     name: *const c_char,
     _loader: JObject,
-    _buf: *const u8,
-    _len: JSize,
+    buf: *const u8,
+    len: JSize,
 ) -> JClass {
-    // DefineClass from raw bytes: parse the name and load the class via the
-    // standard class manager path. Full bytecode injection is not yet supported.
-    let class_name = match unsafe { cstr_to_str(name) } {
-        Some(s) => s.replace('.', "/"),
-        None => return 0,
-    };
-    with_shared_vm(|shared| {
+    // DefineClass from raw bytes: define the class from the caller-supplied
+    // `buf[..len]` bytecode via the same `define_class` path the interpreter
+    // uses for `ClassLoader.defineClass` / agent retransform, so JNI/agent code
+    // that synthesises classes at runtime gets the bytes it actually passed —
+    // not a same-named class loaded from the classpath.
+    //
+    // Per JNI, `name` may be NULL (the name is then taken from the class file);
+    // when supplied it is the expected binary name. The bytecode buffer is
+    // mandatory: a NULL/empty/negative-length buffer is a hard error.
+    if buf.is_null() || len <= 0 {
+        raise_jni_no_class_def_found("DefineClass called with a null or empty bytecode buffer");
+        return 0;
+    }
+    // The class name may be NULL (JNI allows deriving it from the class file).
+    let class_name = unsafe { cstr_to_str(name) }.map(|s| s.replace('.', "/"));
+
+    // SAFETY: the caller guarantees `buf` points to `len` readable bytes for
+    // the duration of the call (standard JNI DefineClass contract). We copy the
+    // bytes out immediately so the slice does not outlive this borrow.
+    let bytes: Vec<u8> = unsafe { std::slice::from_raw_parts(buf, len as usize) }.to_vec();
+
+    let result = with_shared_vm(|shared| {
+        // If the caller did not supply a name, the class manager will derive it
+        // from the class file's `this_class` entry; use the empty string as a
+        // placeholder that `define_class` overrides from the bytes.
+        let define_name = class_name.as_deref().unwrap_or("");
         let mut cm = shared.class_manager.write();
-        let class_id = cm.load_class(&class_name).ok()?;
-        Some(class_id.as_u32() as JClass)
+        let cid = cm
+            .define_class(
+                define_name,
+                &bytes,
+                cratonvm_types::ClassLoaderId::Application,
+            )
+            .ok()?;
+        drop(cm);
+        // Mirror the interpreter's defineClass path: invalidate any JIT code
+        // that may have inlined from a previously-loaded class of this name so
+        // a redefinition is honoured rather than served stale.
+        if let Some(n) = class_name.as_deref() {
+            let _ = shared.jit_cache.write().invalidate_for_class(n);
+            let _ = shared.invalidate_jit_for_class(n);
+        }
+        Some(cid.as_u32() as JClass)
     })
-    .flatten()
-    .unwrap_or(0)
+    .flatten();
+
+    match result {
+        Some(c) => c,
+        None => {
+            // Defining from the supplied bytes failed (malformed class file,
+            // linkage error, or no VM context). Surface it as a real Java
+            // exception instead of silently substituting a classpath class.
+            let label = class_name.as_deref().unwrap_or("<unnamed>");
+            raise_jni_no_class_def_found(&format!(
+                "DefineClass failed to define class {label} from the supplied bytecode"
+            ));
+            0
+        }
+    }
+}
+
+/// Raise a `NoClassDefFoundError` on the current thread so a failed
+/// `DefineClass` surfaces as a real Java exception rather than a fabricated
+/// null/0 return. Mirrors [`raise_jni_aioobe`].
+fn raise_jni_no_class_def_found(msg: &str) {
+    let raised =
+        with_jni_context(
+            |shared, thread| match crate::runtime::exceptions::create_exception_object(
+                shared,
+                thread,
+                "java/lang/NoClassDefFoundError",
+                Some(msg),
+            ) {
+                Ok(exc) => {
+                    let handle = obj_to_jobject(exc);
+                    JNI_PENDING_EXCEPTION.with(|cell| cell.set(handle));
+                    true
+                }
+                Err(_) => false,
+            },
+        )
+        .unwrap_or(false);
+    if !raised {
+        // No thread context or allocation failed: flag the pending-exception
+        // sentinel so the condition is not silently swallowed.
+        JNI_PENDING_EXCEPTION.with(|cell| cell.set(u64::MAX));
+    }
 }
 
 // ---- Index 7: FromReflectedMethod ----
