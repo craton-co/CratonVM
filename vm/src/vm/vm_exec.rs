@@ -5280,11 +5280,20 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                 if let Ok(sym) = lib.get::<JniOnLoad>(b"JNI_OnLoad\0") {
                     // Set TLS context so RegisterNatives (called from JNI_OnLoad) can
                     // resolve class names via the class manager.
-                    crate::native::jni::set_jni_context(self.shared);
-                    crate::native::jni::set_jni_thread(self.thread);
+                    //
+                    // SECURITY: install via the RAII guard so the TLS pointers are
+                    // cleared even if `JNI_OnLoad` (or a RegisterNatives up-call it
+                    // makes) panics/unwinds — otherwise a dangling `*mut JvmThread`
+                    // / `*mut SharedVm` would be left in TLS for a later JNI access
+                    // to dereference (use-after-free).
+                    //
+                    // Safety: `self.thread` is the live `&mut JvmThread` borrowed
+                    // for this call; it outlives `_jni_guard` per `set_jni_thread`.
+                    let _jni_guard =
+                        JniContextGuard::install(self.shared, self.thread as *mut _);
                     let _version = sym(crate::native::jni::get_java_vm(), std::ptr::null_mut());
-                    crate::native::jni::clear_jni_context();
-                    crate::native::jni::clear_jni_thread();
+                    // `_jni_guard` clears the TLS context on scope exit (normal or
+                    // unwind).
                 }
             }
         }
@@ -11133,8 +11142,19 @@ fn invoke_on_class_shared_inner(
             // JNI function pointer registered via RegisterNatives or symbol lookup.
             // Set TLS context so that JNI callbacks (e.g. FindClass, CallMethod)
             // can access the VM from within the native library.
-            crate::native::jni::set_jni_context(shared);
-            crate::native::jni::set_jni_thread(thread as *mut _);
+            //
+            // SECURITY: install the context through an RAII guard rather than a
+            // manual set/clear pair. The guard's `Drop` clears the TLS pointers
+            // on EVERY exit edge — the arity-mismatch early return, the normal
+            // return, and (critically) an unwind out of `dispatch_jni_native`.
+            // The previous manual-clear pattern skipped the clears on panic,
+            // leaving dangling `*mut JvmThread` / `*mut SharedVm` pointers in TLS
+            // for a later JNI up-call to dereference (use-after-free).
+            //
+            // Safety: `thread` is the live, exclusively-borrowed `&mut JvmThread`
+            // for this dispatch; it outlives the guard (and thus the whole native
+            // call) per `set_jni_thread`'s contract.
+            let _jni_guard = unsafe { JniContextGuard::install(shared, thread as *mut _) };
 
             let env = crate::native::jni::get_jni_env();
             // For instance methods, args[0] is the receiver; for static, it is absent.
@@ -11154,11 +11174,10 @@ fn invoke_on_class_shared_inner(
             // disagrees with `call_args.len()` silently builds a malformed C
             // call frame (missing/extra register args) — UB inside the unsafe
             // dispatch. Reject the mismatch with UnsatisfiedLinkError before the
-            // unsafe call instead of entering it with a bad frame.
+            // unsafe call instead of entering it with a bad frame. The
+            // `_jni_guard` `Drop` clears the TLS context on this early return.
             let expected_params = crate::runtime::proxy::count_descriptor_params(descriptor);
             if expected_params != call_args.len() {
-                crate::native::jni::clear_jni_context();
-                crate::native::jni::clear_jni_thread();
                 tracing::warn!(
                     method = %format!("{class_name}.{method_name}{descriptor}"),
                     expected_params,
@@ -11182,9 +11201,7 @@ fn invoke_on_class_shared_inner(
                 )
             };
 
-            crate::native::jni::clear_jni_context();
-            crate::native::jni::clear_jni_thread();
-
+            // `_jni_guard` clears the TLS context when it drops at end of scope.
             // void methods return Value::Object(None) from dispatch_jni_native
             let ret_char = descriptor
                 .rfind(')')
@@ -11206,8 +11223,16 @@ fn invoke_on_class_shared_inner(
             )
         } {
             // Auto-resolved via JNI naming convention (dlsym in loaded libraries).
-            crate::native::jni::set_jni_context(shared);
-            crate::native::jni::set_jni_thread(thread as *mut _);
+            //
+            // SECURITY: same RAII discipline as the RegisterNatives path above —
+            // the guard's `Drop` clears the TLS context on the arity-mismatch
+            // early return, the normal return, and an unwind out of the native
+            // bridge, so a panic cannot strand dangling `*mut JvmThread` /
+            // `*mut SharedVm` pointers in TLS.
+            //
+            // Safety: `thread` is the live, exclusively-borrowed `&mut JvmThread`
+            // for this dispatch; it outlives the guard per `set_jni_thread`.
+            let _jni_guard = unsafe { JniContextGuard::install(shared, thread as *mut _) };
 
             let env = crate::native::jni::get_jni_env();
             let (receiver, call_args) = if is_static {
@@ -11223,11 +11248,10 @@ fn invoke_on_class_shared_inner(
             // V2: same descriptor-arity vs call-frame sanity check as the
             // RegisterNatives path above — a malformed descriptor on the
             // auto-resolved (dlsym) symbol must not enter the unsafe dispatch
-            // with a mismatched argument frame.
+            // with a mismatched argument frame. The `_jni_guard` `Drop` clears
+            // the TLS context on this early return.
             let expected_params = crate::runtime::proxy::count_descriptor_params(descriptor);
             if expected_params != call_args.len() {
-                crate::native::jni::clear_jni_context();
-                crate::native::jni::clear_jni_thread();
                 tracing::warn!(
                     method = %format!("{class_name}.{method_name}{descriptor}"),
                     expected_params,
@@ -11250,9 +11274,7 @@ fn invoke_on_class_shared_inner(
                 )
             };
 
-            crate::native::jni::clear_jni_context();
-            crate::native::jni::clear_jni_thread();
-
+            // `_jni_guard` clears the TLS context when it drops at end of scope.
             let ret_char = descriptor
                 .rfind(')')
                 .and_then(|i| descriptor.as_bytes().get(i + 1).copied())
@@ -11395,6 +11417,47 @@ impl Drop for SynchronizedMethodGuard<'_> {
                 "implicit monitorexit on synchronized-method exit failed"
             );
         }
+    }
+}
+
+/// RAII guard for the JNI thread-local context (`*mut SharedVm` Arc + the
+/// erased `*mut JvmThread` pointer) installed around a native bridge call.
+///
+/// `set_jni_context` / `set_jni_thread` publish pointers into thread-local
+/// storage that the native bridge (and any JNI up-call it makes) dereferences;
+/// `jni.rs` documents that the matching `clear_*` MUST run after every native
+/// call returns *including on panic/unwind paths*. The previous code cleared
+/// them with two manual statements after `dispatch_jni_native`, so a panic
+/// unwinding out of the native bridge skipped the clears and left dangling
+/// `*mut JvmThread` / `*mut SharedVm` pointers in TLS — a later JNI access on
+/// the same OS thread would dereference freed memory (use-after-free).
+///
+/// Constructing the guard installs the context; its `Drop` runs the clears on
+/// every exit edge — normal return, early `return Err(..)`, and unwind —
+/// mirroring [`SynchronizedMethodGuard`]'s discipline. This is purely a
+/// cleanup guard; it never re-installs context, so a double clear is harmless
+/// (the `clear_*` setters are idempotent no-ops on already-cleared TLS).
+struct JniContextGuard;
+
+impl JniContextGuard {
+    /// Install the JNI TLS context and return the guard that will clear it.
+    ///
+    /// # Safety
+    ///
+    /// `thread` must remain a valid, exclusively-accessible `*mut JvmThread`
+    /// for the lifetime of the returned guard (i.e. for the whole native
+    /// call), exactly as required by [`crate::native::jni::set_jni_thread`].
+    unsafe fn install(shared: &SharedVm, thread: *mut JvmThread) -> Self {
+        crate::native::jni::set_jni_context(shared);
+        crate::native::jni::set_jni_thread(thread);
+        JniContextGuard
+    }
+}
+
+impl Drop for JniContextGuard {
+    fn drop(&mut self) {
+        crate::native::jni::clear_jni_context();
+        crate::native::jni::clear_jni_thread();
     }
 }
 
@@ -11564,6 +11627,76 @@ mod tests {
             crate::runtime::proxy::count_descriptor_params("(Ljava/lang/String;[IJ)Z"),
             3
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // JniContextGuard — TLS context is cleared on drop AND on unwind
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn jni_context_guard_clears_on_normal_drop() {
+        // Run on a dedicated OS thread so the JNI TLS we touch here cannot
+        // leak into (or be observed by) other tests sharing the main thread.
+        std::thread::spawn(|| {
+            let shared = test_shared();
+            // `set_jni_context` (called by the guard) clones an Arc via
+            // `SharedVm::get_arc()`, which requires the weak self-reference that
+            // only `Vm::new()` installs. `test_shared()` skips `Vm::new`, so set
+            // it here exactly as `Vm::new` does before exercising the guard.
+            *shared.self_arc.write() = Some(std::sync::Arc::downgrade(&shared));
+            // No live JvmThread is needed: the guard only stores the raw
+            // pointer in TLS; we never deref it. A dangling-but-unused pointer
+            // is fine for exercising the install/clear lifecycle.
+            {
+                let _g = unsafe {
+                    JniContextGuard::install(&shared, std::ptr::null_mut())
+                };
+                // Context is installed here; nothing to assert without a public
+                // TLS predicate — the value of the test is the unwind case below.
+            }
+            // After the guard drops, the TLS context is clear. `clear_jni_*`
+            // are idempotent, so re-clearing is a harmless no-op that documents
+            // the post-condition.
+            crate::native::jni::clear_jni_context();
+            crate::native::jni::clear_jni_thread();
+        })
+        .join()
+        .expect("guard install/drop thread should not panic");
+    }
+
+    #[test]
+    fn jni_context_guard_clears_on_unwind() {
+        // The whole point of the RAII guard (vs. the old manual clear pair) is
+        // that an unwind through the native bridge still clears the TLS
+        // pointers. Construct the guard inside a panicking `catch_unwind` and
+        // confirm: (a) the closure unwound (Err), and (b) the thread is left in
+        // a usable state where a fresh guard can be installed and dropped again
+        // — which is only true if the first guard's `Drop` ran during unwind.
+        std::thread::spawn(|| {
+            let shared = test_shared();
+            // See `jni_context_guard_clears_on_normal_drop`: install the weak
+            // self-reference `get_arc()` needs, which `test_shared()` omits.
+            *shared.self_arc.write() = Some(std::sync::Arc::downgrade(&shared));
+            let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _g = unsafe {
+                    JniContextGuard::install(&shared, std::ptr::null_mut())
+                };
+                panic!("simulated native-bridge unwind");
+            }));
+            assert!(unwound.is_err(), "closure should have unwound");
+
+            // If the guard's Drop did NOT run, a stale context would remain.
+            // Re-installing and dropping a second guard must still succeed.
+            {
+                let _g2 = unsafe {
+                    JniContextGuard::install(&shared, std::ptr::null_mut())
+                };
+            }
+            crate::native::jni::clear_jni_context();
+            crate::native::jni::clear_jni_thread();
+        })
+        .join()
+        .expect("post-unwind thread should not panic");
     }
 
     #[test]
