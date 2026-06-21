@@ -67,6 +67,8 @@ are planned but not yet enabled.
 | `jfr` | Java Flight Recorder |
 | `vm` | VM runtime engine |
 | `vm-cli` | Command-line entry point |
+| `libcratonvm` | C-ABI shared library for embedding (cdylib/staticlib `libjvm` substitute, JNI Invocation API) |
+| `cratonvm-embed` | Curated, semver-stable Rust facade for embedding CratonVM |
 
 ### Writing Tests
 
