@@ -364,6 +364,7 @@ fn compile_long_ldc2w(
         false,
         false,
         true,
+        false, // ir_emit_virtual_calls
     )
 }
 
