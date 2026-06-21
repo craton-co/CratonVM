@@ -12702,8 +12702,21 @@ pub(crate) fn register_p58_gzip_streams(r: &mut NativeMethodRegistry) {
     r.register(zo, "write", "([BII)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         if let Some(Value::Object(Some(src))) = args.get(1) {
-            let off = args.get(2).and_then(|v| v.as_int()).unwrap_or(0) as usize;
-            let len = args.get(3).and_then(|v| v.as_int()).unwrap_or(0) as usize;
+            // Validate signed off/len against the array length BEFORE casting to
+            // usize. A negative len would sign-extend into a huge usize and
+            // abort `Vec::with_capacity`; OutputStream.write([BII) contractually
+            // throws IndexOutOfBoundsException on bad bounds.
+            let off = args.get(2).and_then(|v| v.as_int()).unwrap_or(0);
+            let len = args.get(3).and_then(|v| v.as_int()).unwrap_or(0);
+            let arr_len = ctx.array_length(*src) as i64;
+            if off < 0 || len < 0 || (off as i64) + (len as i64) > arr_len {
+                return Err(RuntimeError::ArrayIndexOutOfBoundsException {
+                    index: if off < 0 { off } else { off.wrapping_add(len) },
+                }
+                .into());
+            }
+            let off = off as usize;
+            let len = len as usize;
             let mut bytes = Vec::with_capacity(len);
             for i in 0..len {
                 if let Value::Int(b) = ctx.get_array_element(*src, off + i) {
@@ -30568,8 +30581,21 @@ pub(crate) fn register_p68_crypto_mac(r: &mut NativeMethodRegistry) {
     r.register(mac, "update", "([BII)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         if let Some(Value::Object(Some(arr))) = args.get(1) {
-            let off = args.get(2).and_then(|v| v.as_int()).unwrap_or(0) as usize;
-            let len = args.get(3).and_then(|v| v.as_int()).unwrap_or(0) as usize;
+            // Validate signed off/len against the array length BEFORE casting to
+            // usize. A negative len would sign-extend into a huge usize and
+            // abort `Vec::with_capacity`; reject out-of-range ranges with
+            // IndexOutOfBoundsException as the JDK Mac/SPI does.
+            let off = args.get(2).and_then(|v| v.as_int()).unwrap_or(0);
+            let len = args.get(3).and_then(|v| v.as_int()).unwrap_or(0);
+            let arr_len = ctx.array_length(*arr) as i64;
+            if off < 0 || len < 0 || (off as i64) + (len as i64) > arr_len {
+                return Err(RuntimeError::ArrayIndexOutOfBoundsException {
+                    index: if off < 0 { off } else { off.wrapping_add(len) },
+                }
+                .into());
+            }
+            let off = off as usize;
+            let len = len as usize;
             let mut bytes = Vec::with_capacity(len);
             for i in 0..len {
                 if let Value::Int(b) = ctx.get_array_element(*arr, off + i) {
@@ -49826,5 +49852,101 @@ mod nb_phases_late_robustness_fix_tests {
         // (Reads process env; default branch returns Some(default).)
         let cap = gzip_max_inflated_bytes();
         assert!(cap.map(|c| c > 0).unwrap_or(true));
+    }
+}
+
+#[cfg(test)]
+mod cert_verify_bounds_security_tests {
+    use super::*;
+
+    // HIGH (cert-verify): In the default (non-legacy) build the no-op
+    // `verify(PublicKey)` natives MUST NOT be registered, so the real
+    // `java.security.cert` / `X509CertImpl.verify` bytecode performs the genuine
+    // signature check and throws on a bad signature. A registered no-op native
+    // here would silently certify any certificate against any key.
+    #[cfg(not(feature = "legacy-synthetic-crypto"))]
+    #[test]
+    fn verify_natives_not_registered_in_default_build() {
+        let mut r = NativeMethodRegistry::new();
+        register_p68_security_cert(&mut r);
+        assert!(
+            r.find(
+                "java/security/cert/Certificate",
+                "verify",
+                "(Ljava/security/PublicKey;)V"
+            )
+            .is_none(),
+            "Certificate.verify must fall through to real bytecode in the default build"
+        );
+        assert!(
+            r.find(
+                "java/security/cert/X509Certificate",
+                "verify",
+                "(Ljava/security/PublicKey;)V"
+            )
+            .is_none(),
+            "X509Certificate.verify must fall through to real bytecode in the default build"
+        );
+    }
+
+    // Under the legacy feature the natives exist (and now throw on failure).
+    #[cfg(feature = "legacy-synthetic-crypto")]
+    #[test]
+    fn verify_natives_registered_under_legacy_feature() {
+        let mut r = NativeMethodRegistry::new();
+        register_p68_security_cert(&mut r);
+        assert!(r
+            .find(
+                "java/security/cert/Certificate",
+                "verify",
+                "(Ljava/security/PublicKey;)V"
+            )
+            .is_some());
+        assert!(r
+            .find(
+                "java/security/cert/X509Certificate",
+                "verify",
+                "(Ljava/security/PublicKey;)V"
+            )
+            .is_some());
+    }
+
+    // MEDIUM (alloc DoS): the bounds-checked natives stay registered; the guard
+    // lives inside the closure. Verify the offset/length predicate that gates
+    // `Vec::with_capacity` rejects negative/huge args before allocation.
+    #[test]
+    fn bounds_predicate_rejects_negative_and_overflowing_ranges() {
+        // Mirror of the in-native check: off < 0 || len < 0 || off+len > arr_len,
+        // evaluated in i64 so a negative i32 cannot sign-extend into a huge usize.
+        fn bad(off: i32, len: i32, arr_len: i64) -> bool {
+            off < 0 || len < 0 || (off as i64) + (len as i64) > arr_len
+        }
+        // Negative length (the abort/over-allocation case).
+        assert!(bad(0, -1, 16));
+        // Negative offset.
+        assert!(bad(-1, 4, 16));
+        // i32::MIN length must not be treated as a valid (huge) usize.
+        assert!(bad(0, i32::MIN, 16));
+        // Range exceeding the array.
+        assert!(bad(8, 16, 16));
+        // Valid ranges are accepted.
+        assert!(!bad(0, 16, 16));
+        assert!(!bad(4, 8, 16));
+        assert!(!bad(0, 0, 0));
+    }
+
+    #[test]
+    fn mac_and_zip_byterange_natives_remain_registered() {
+        let mut r = NativeMethodRegistry::new();
+        register_p68_crypto_mac(&mut r);
+        assert!(r
+            .find("javax/crypto/Mac", "update", "([BII)V")
+            .is_some());
+
+        let mut r2 = NativeMethodRegistry::new();
+        register_p58_gzip_streams(&mut r2);
+        assert!(r2
+            .find("java/util/zip/ZipOutputStream", "write", "([BII)V")
+            .is_some());
     }
 }
