@@ -113,7 +113,7 @@ fn compile_opt(
 ) -> Option<CompiledMethod> {
     try_compile(
         cm, None, None, None, None, None, None, None, None, None, helpers, None, None, None, None,
-        optimize, false, false,
+        optimize, false, false, false,
     )
 }
 
@@ -509,6 +509,7 @@ fn compile_opt_fields(
         None,
         None,
         optimize,
+        false,
         false,
         false,
     )
@@ -968,6 +969,7 @@ fn compile_with_dispatch(
         true, // optimize (C2 / IR pipeline)
         true, // ir_emit_calls (Gap B, invokestatic)
         true, // ir_emit_special_calls (inc 24, invokespecial — inert without 0xb7)
+        true, // ir_emit_virtual_calls (inc 25, invokevirtual/interface)
     )
 }
 
@@ -1195,6 +1197,105 @@ fn ir_vs_singlepass_invokespecial_instance_call() {
             r,
             xval as i64 + n,
             "invokespecial receiver marshalling for x={xval}, n={n}"
+        );
+        drop(obj);
+    }
+}
+
+#[test]
+fn ir_vs_singlepass_invokevirtual_instance_call() {
+    // inc 25: a resolved `invokevirtual` lowers to `Op::Call` with the receiver
+    // marshalled as arg0 and `invoke_kind == 0`. Identical machine-level shape
+    // to the inc-24 invokespecial test (receiver-first, `num_jit_args == 2`,
+    // `needs_context`); only the opcode (0xb6) and dispatch kind differ. The
+    // stub reads field 0 off the receiver and returns `recv.x + n`.
+    //   int f(Corpus o, int n) { return o.g(n); }   // g virtual → invokevirtual
+    //   aload_0; iload_1; invokevirtual #2; ireturn
+    unsafe extern "C" fn recv_dispatch(_vm: i64, _info: i64, args_ptr: i64, num_args: i64) -> i64 {
+        assert_eq!(num_args, 2, "recv_dispatch expects (receiver, int)");
+        let p = args_ptr as *const i64;
+        let recv = *p; // arg0 = the receiver pointer
+        let n = *p.add(1) as i32 as i64; // arg1 = int
+        let off = HEADER_SIZE + FIELD_CELL_PAYLOAD32_OFFSET; // field 0 int payload
+        let x = std::ptr::read_unaligned((recv as *const u8).add(off) as *const i32) as i64;
+        x + n
+    }
+    let mut helpers = dummy_helpers();
+    helpers.invoke_dispatch = recv_dispatch as *const () as usize;
+    let code = vec![0x2a, 0x1b, 0xb6, 0x00, 0x02, 0xac];
+    let cm = cached("f", "(Lpkg/Corpus;I)I", code, 2, 2);
+    let resolver = |cp: u16| -> Option<(String, String, String)> {
+        if cp == 2 {
+            Some(("pkg/Corpus".into(), "g".into(), "(I)I".into()))
+        } else {
+            None
+        }
+    };
+    let ir = compile_with_dispatch(&cm, &helpers, &resolver)
+        .expect("IR compile of invokevirtual instance method");
+    assert!(ir.needs_context(), "an Op::Call method must report needs_context");
+    let dummy_vm = [0u8; 64];
+    for (xval, n) in [(5i32, 7i64), (-3, 2), (0, 0), (i32::MAX, 1)] {
+        let obj = make_object(&[xval]);
+        let args = [obj.as_ptr() as i64, n];
+        // SAFETY: `obj` is a live, correctly-laid-out synthetic object; its
+        // address is the receiver (arg0), `n` is arg1; the stub only reads field 0.
+        let r = unsafe { ir.try_call_with_context(dummy_vm.as_ptr() as i64, &args) }
+            .unwrap_or_else(|e| panic!("call x={xval},n={n}: {e:?}"));
+        assert_eq!(
+            r,
+            xval as i64 + n,
+            "invokevirtual receiver marshalling for x={xval}, n={n}"
+        );
+        drop(obj);
+    }
+}
+
+#[test]
+fn ir_vs_singlepass_invokeinterface_instance_call() {
+    // inc 25: a resolved `invokeinterface` lowers to `Op::Call` with the receiver
+    // marshalled as arg0 and `invoke_kind == 2`. The decisive extra coverage vs.
+    // the invokevirtual test is the FIVE-byte instruction encoding
+    // (0xb9, cp_hi, cp_lo, count, 0): the builder and both length walkers must
+    // advance pc += 5, or the trailing `ireturn` is mis-located and the method
+    // either bails or miscompiles. The stub reads field 0 off the receiver.
+    //   int f(Iface o, int n) { return o.g(n); }   // g interface → invokeinterface
+    //   aload_0; iload_1; invokeinterface #2, 2, 0; ireturn
+    unsafe extern "C" fn recv_dispatch(_vm: i64, _info: i64, args_ptr: i64, num_args: i64) -> i64 {
+        assert_eq!(num_args, 2, "recv_dispatch expects (receiver, int)");
+        let p = args_ptr as *const i64;
+        let recv = *p;
+        let n = *p.add(1) as i32 as i64;
+        let off = HEADER_SIZE + FIELD_CELL_PAYLOAD32_OFFSET;
+        let x = std::ptr::read_unaligned((recv as *const u8).add(off) as *const i32) as i64;
+        x + n
+    }
+    let mut helpers = dummy_helpers();
+    helpers.invoke_dispatch = recv_dispatch as *const () as usize;
+    // invokeinterface is 5 bytes: opcode, cp_hi, cp_lo, count(=2: receiver+int), 0.
+    let code = vec![0x2a, 0x1b, 0xb9, 0x00, 0x02, 0x02, 0x00, 0xac];
+    let cm = cached("f", "(Lpkg/Iface;I)I", code, 2, 2);
+    let resolver = |cp: u16| -> Option<(String, String, String)> {
+        if cp == 2 {
+            Some(("pkg/Iface".into(), "g".into(), "(I)I".into()))
+        } else {
+            None
+        }
+    };
+    let ir = compile_with_dispatch(&cm, &helpers, &resolver)
+        .expect("IR compile of invokeinterface instance method");
+    assert!(ir.needs_context(), "an Op::Call method must report needs_context");
+    let dummy_vm = [0u8; 64];
+    for (xval, n) in [(5i32, 7i64), (-3, 2), (0, 0), (i32::MAX, 1)] {
+        let obj = make_object(&[xval]);
+        let args = [obj.as_ptr() as i64, n];
+        // SAFETY: as above — receiver is arg0, `n` is arg1; the stub reads field 0.
+        let r = unsafe { ir.try_call_with_context(dummy_vm.as_ptr() as i64, &args) }
+            .unwrap_or_else(|e| panic!("call x={xval},n={n}: {e:?}"));
+        assert_eq!(
+            r,
+            xval as i64 + n,
+            "invokeinterface (5-byte) receiver marshalling for x={xval}, n={n}"
         );
         drop(obj);
     }
