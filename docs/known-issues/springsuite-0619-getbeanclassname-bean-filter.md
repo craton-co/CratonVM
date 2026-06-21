@@ -10,8 +10,22 @@
 | **CratonVM** | FAIL — `IllegalArgumentException: Target object must not be null` |
 | **HotSpot JDK 25** | OK (LookupMethodTests 7/7; instance is `…AbstractBean$$SpringCGLIB$$0`) |
 | **CratonVM HEAD** | found `c4536b94`; primary **FIXED on dev `3b16e985`+**; bug-B2 **mostly FIXED on dev 2026-06-21** |
-| **Status** | 🟢 **MOSTLY FIXED** — primary bean-filter FIXED; **bug-B2 (CGLIB method-injection) now implemented** (`LookupMethodTests` 6/7, `LookupAnnotationTests` 6/10). Two narrow residuals remain (generic-type disambiguation + `@Lookup` null-bean). |
-| **Suggested owner** | residual: generic-aware `getBeanProvider(ResolvableType)` lookup |
+| **Status** | 🟢 **MOSTLY FIXED** — primary bean-filter FIXED; bug-B2 method-injection implemented; **generic-type disambiguation FIXED on dev `a67ec290`** (`LookupMethodTests` **7/7**, `LookupAnnotationTests` **9/10**). One narrow residual: `@Lookup` null-bean (`withNullBean`, 1 test). |
+| **Suggested owner** | residual: `withNullBean` — overload-aware override mapping + `NullBean`→`null` unwrap |
+
+> **GENERIC-TYPE FIX LANDED 2026-06-21** (dev `a67ec290`, JDK 25). `build_lookup_subclass`'s
+> by-type, no-arg path now emits Spring's generic-aware resolution —
+> `getBeanProvider(ResolvableType.forMethodReturnType(getClass().getSuperclass().getDeclaredMethod(name))).getObject()`
+> — instead of `getBean(Ret.class)`, so `NumberStore<Double>` vs `NumberStore<Float>` disambiguate.
+> **`LookupMethodTests` 6/7 → 7/7; `LookupAnnotationTests` 6/10 → 9/10.** Verified vs HotSpot via a
+> JUnit-platform runner over `spring-beans/build/cratonvm-testcp.txt`: stable across 4 JIT runs **and**
+> under `--nojit` (7/7, no hang). **The two blockers from the earlier reverted attempt no longer
+> reproduce** — the flaky JIT `InterceptingExecutableInvoker.invokeVoid` "expected int got ref" and the
+> `--nojit` hang were cleared by intervening JNI/JIT merge fixes. Remaining residual = `withNullBean`
+> (by-name `@Lookup("testBean")` to a null-producing prototype): needs (a) overload-aware override
+> mapping so `get()` is recognised by-name despite the overloaded by-type `get(String)` (the override
+> map is keyed by method name only), and (b) a `bean.equals(null) ? null : bean` NullBean unwrap on the
+> by-name path.
 
 > **bug-B2 FIX 2026-06-21** (`cratonvm-spring0620-b2`, dev `7c66d89f`+, JDK 25). Method-injection
 > (`<lookup-method>` / `@Lookup`) is now implemented. The bean class is abstract, so the
