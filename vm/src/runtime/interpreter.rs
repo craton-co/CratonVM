@@ -17755,11 +17755,11 @@ fn try_jit_upgrade_with_gate(
                 // probes == HotSpot, ON==OFF). `CRATONVM_JIT_IR_CALL=0` is the
                 // opt-out — restores single-pass dispatch for invokestatic.
                 std::env::var("CRATONVM_JIT_IR_CALL").map_or(true, |v| v != "0"),
-                // inc 24: invokespecial → Op::Call, gated default-OFF (its own
-                // soak). `CRATONVM_JIT_IR_CALL_SPECIAL=1` opts in.
-                std::env::var_os("CRATONVM_JIT_IR_CALL_SPECIAL").is_some(),
-                // inc 25: long methods → IR path, gated default-OFF.
-                std::env::var_os("CRATONVM_JIT_IR_LONG").is_some(),
+                // inc 24/29: invokespecial → Op::Call. Now default-ON;
+                // `CRATONVM_JIT_IR_CALL_SPECIAL=0` opts out.
+                std::env::var("CRATONVM_JIT_IR_CALL_SPECIAL").map_or(true, |v| v != "0"),
+                // inc 25/29: long methods → IR path. Now default-ON; `CRATONVM_JIT_IR_LONG=0` opts out.
+                std::env::var("CRATONVM_JIT_IR_LONG").map_or(true, |v| v != "0"),
                 // inc 26: invokevirtual/invokeinterface → Op::Call (dynamic
                 // dispatch via the helper), gated default-OFF (its own soak).
                 // `CRATONVM_JIT_IR_CALL_VIRTUAL=1` opts in.
@@ -17870,10 +17870,10 @@ fn try_jit_upgrade_with_gate(
         // Gap B: int-only invokestatic → Op::Call. Now default-ON (inc 23);
         // `CRATONVM_JIT_IR_CALL=0` is the opt-out (single-pass dispatch).
         std::env::var("CRATONVM_JIT_IR_CALL").map_or(true, |v| v != "0"),
-        // inc 24: invokespecial → Op::Call, gated default-OFF (its own soak).
-        std::env::var_os("CRATONVM_JIT_IR_CALL_SPECIAL").is_some(),
-        // inc 25: long methods → IR path, gated default-OFF.
-        std::env::var_os("CRATONVM_JIT_IR_LONG").is_some(),
+        // inc 24/29: invokespecial → Op::Call. Now default-ON; `CRATONVM_JIT_IR_CALL_SPECIAL=0` opts out.
+        std::env::var("CRATONVM_JIT_IR_CALL_SPECIAL").map_or(true, |v| v != "0"),
+        // inc 25/29: long methods → IR path. Now default-ON; `CRATONVM_JIT_IR_LONG=0` opts out.
+        std::env::var("CRATONVM_JIT_IR_LONG").map_or(true, |v| v != "0"),
         // inc 26: invokevirtual/invokeinterface → Op::Call (dynamic dispatch via
         // the helper), gated default-OFF (its own soak). `=1` opts in.
         std::env::var_os("CRATONVM_JIT_IR_CALL_VIRTUAL").is_some(),
@@ -18446,10 +18446,10 @@ fn try_jit_compile_callee_slow(
         // Gap B: int-only invokestatic → Op::Call. Now default-ON (inc 23);
         // `CRATONVM_JIT_IR_CALL=0` is the opt-out (single-pass dispatch).
         std::env::var("CRATONVM_JIT_IR_CALL").map_or(true, |v| v != "0"),
-        // inc 24: invokespecial → Op::Call, gated default-OFF (its own soak).
-        std::env::var_os("CRATONVM_JIT_IR_CALL_SPECIAL").is_some(),
-        // inc 25: long methods → IR path, gated default-OFF.
-        std::env::var_os("CRATONVM_JIT_IR_LONG").is_some(),
+        // inc 24/29: invokespecial → Op::Call. Now default-ON; `CRATONVM_JIT_IR_CALL_SPECIAL=0` opts out.
+        std::env::var("CRATONVM_JIT_IR_CALL_SPECIAL").map_or(true, |v| v != "0"),
+        // inc 25/29: long methods → IR path. Now default-ON; `CRATONVM_JIT_IR_LONG=0` opts out.
+        std::env::var("CRATONVM_JIT_IR_LONG").map_or(true, |v| v != "0"),
         // inc 26: invokevirtual/invokeinterface → Op::Call (dynamic dispatch via
         // the helper), gated default-OFF (its own soak). `=1` opts in.
         std::env::var_os("CRATONVM_JIT_IR_CALL_VIRTUAL").is_some(),
