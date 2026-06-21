@@ -158,6 +158,22 @@ impl Observation {
 // Classification & status (design §3.3 / §3.5)
 // ===========================================================================
 
+/// An observable channel the oracle compares (design §3.3). Each disagreement
+/// a [`compare`](crate::oracle::compare) reports is tagged with the channel it
+/// came from, so the ledger and the run summary can say *what* diverged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Channel {
+    /// Process exit code (a CratonVM timeout is reported here too).
+    ExitCode,
+    /// Uncaught-exception identity (fqcn + message + ordered frames).
+    Exception,
+    /// Program stdout (strict after normalization).
+    Stdout,
+    /// Program stderr (contextual; not gated by default).
+    Stderr,
+}
+
 /// How a confirmed divergence is triaged — this is the bisection the human
 /// currently does by hand (`--nojit` to isolate JIT bugs, GC-mode flips, …).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

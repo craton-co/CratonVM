@@ -5,18 +5,21 @@
 //! `docs/feature-designs/differential-fuzzer.md`).
 //!
 //! Subcommands: `run` (A/B the corpus), `gen` (generate programs), `min`
-//! (minimize a repro), `gate` (CI gate). In **Step 0** every subcommand is a
-//! documented stub that prints its plan and exits cleanly; only the gate's
-//! **exit-code contract** is already live so CI can adopt the step from day one
-//! and it just passes on an empty corpus.
+//! (minimize a repro), `gate` (CI gate). As of **Step 1**, `run` is wired —
+//! it compiles each seed once, runs it on CratonVM and HotSpot, diffs the four
+//! channels, and (with `--update-ledger`) writes the ledger. `gen` / `min` are
+//! still stubs; `gate` honors the §3.5 exit-code contract (the committed-ledger
+//! new-vs-known verdict lands in Step 3).
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode, Stdio};
+use std::process::ExitCode;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use clap::{Args, Parser, Subcommand};
 
+use cratonvm_difftest::harness;
 use cratonvm_difftest::ledger::{self, Ledger};
-use cratonvm_difftest::runner::{self, Mode, DEFAULT_TIMEOUT};
+use cratonvm_difftest::runner::{self, Mode, RunError, RunnerConfig, DEFAULT_TIMEOUT};
 
 /// Gate / run exit-code contract (design §3.5). These describe the *divergence
 /// verdict* of a completed run; structural CLI errors are clap's domain.
@@ -122,6 +125,43 @@ fn default_corpus() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("corpus")
 }
 
+impl RunArgs {
+    /// Resolve the flags into a [`RunnerConfig`], filling defaults.
+    fn to_runner_config(&self) -> RunnerConfig {
+        RunnerConfig {
+            corpus: self.corpus.clone().unwrap_or_else(default_corpus),
+            modes: if self.modes.is_empty() {
+                vec![Mode::JitOn]
+            } else {
+                self.modes.clone()
+            },
+            timeout: Duration::from_secs(self.timeout_secs),
+            jdk_home: self.jdk.clone(),
+            allow_jdk_downgrade: self.allow_jdk_downgrade,
+            ledger: self
+                .ledger
+                .clone()
+                .unwrap_or_else(ledger::default_ledger_path),
+            update_ledger: self.update_ledger,
+        }
+    }
+}
+
+/// Host tag (`os-arch`) for the ledger header.
+fn host_tag() -> String {
+    format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH)
+}
+
+/// Unix-epoch seconds as a string, for the ledger `captured_at` (Step 3 aligns
+/// this with `capture-hotspot-baseline`'s ISO-8601 convention).
+fn captured_at() -> String {
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    format!("epoch:{secs}")
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
@@ -137,20 +177,55 @@ fn main() -> ExitCode {
 // ---------------------------------------------------------------------------
 
 fn cmd_run(args: &RunArgs) -> ExitCode {
-    let corpus = args.corpus.clone().unwrap_or_else(default_corpus);
-    let modes: Vec<&str> = args.modes.iter().map(|m| m.label()).collect();
-    println!("difftest run — planned, not yet wired (Step 1).");
-    println!("  corpus : {}", corpus.display());
-    println!("  modes  : {}", modes.join(", "));
-    println!("  timeout: {}s", args.timeout_secs);
+    let config = args.to_runner_config();
+    let mode = config.modes.first().copied().unwrap_or(Mode::JitOn);
     println!(
-        "  ledger : {}",
-        args.ledger
-            .clone()
-            .unwrap_or_else(ledger::default_ledger_path)
-            .display()
+        "difftest run — corpus {} | cratonvm[{}] vs java | timeout {}s",
+        config.corpus.display(),
+        mode.label(),
+        config.timeout.as_secs()
     );
-    println!("  -> Step 1 will A/B each program (cratonvm per-mode vs java) and write the ledger.");
+
+    let summary = match harness::run_corpus(&config) {
+        Ok(s) => s,
+        Err(
+            e @ (RunError::CratonvmBinaryMissing | RunError::JavaMissing | RunError::EmptyCorpus),
+        ) => {
+            eprintln!(
+                "difftest run: {e} — bootstrap, exit {} (non-fatal).",
+                exit::BOOTSTRAP
+            );
+            return ExitCode::from(exit::BOOTSTRAP);
+        }
+        Err(e) => {
+            eprintln!("difftest run: {e}");
+            return ExitCode::from(exit::BOOTSTRAP);
+        }
+    };
+
+    print!("{}", harness::render_summary(&summary));
+
+    if config.update_ledger {
+        let jdk =
+            runner::jdk_version(config.jdk_home.as_deref()).unwrap_or_else(|| "unknown".into());
+        let ledger = summary.to_ledger(host_tag(), captured_at(), jdk);
+        match ledger.save(&config.ledger) {
+            Ok(()) => println!("wrote ledger: {}", config.ledger.display()),
+            Err(e) => eprintln!(
+                "difftest run: could not write ledger {}: {e}",
+                config.ledger.display()
+            ),
+        }
+    } else if summary.diverged() > 0 {
+        println!(
+            "(re-run with --update-ledger to record the {} divergence(s) in {})",
+            summary.diverged(),
+            config.ledger.display()
+        );
+    }
+
+    // `run` is a report, not a gate: a successful run exits 0 regardless of
+    // divergences (the `gate` subcommand is what fails CI on them).
     ExitCode::from(exit::OK)
 }
 
@@ -191,7 +266,7 @@ fn cmd_gate(args: &RunArgs) -> ExitCode {
         .clone()
         .unwrap_or_else(ledger::default_ledger_path);
 
-    let program_count = count_programs(&corpus);
+    let program_count = harness::discover_programs(&corpus).len();
     if program_count == 0 {
         eprintln!(
             "difftest gate: corpus {} is empty — bootstrap, exit {} (non-fatal).",
@@ -201,7 +276,7 @@ fn cmd_gate(args: &RunArgs) -> ExitCode {
         return ExitCode::from(exit::BOOTSTRAP);
     }
 
-    if !java_available(args.jdk.as_deref()) {
+    if !runner::java_available(args.jdk.as_deref()) {
         eprintln!(
             "difftest gate: `java` not found (set --jdk / DIFFTEST_JAVA_HOME / PATH) — \
              bootstrap, exit {} (non-fatal).",
@@ -235,35 +310,4 @@ fn cmd_gate(args: &RunArgs) -> ExitCode {
         exit::OK
     );
     ExitCode::from(exit::OK)
-}
-
-/// Count runnable programs (`*.java` / `*.class`) directly under `dir`.
-/// Missing/unreadable directory ⇒ 0 (treated as an empty corpus).
-fn count_programs(dir: &Path) -> usize {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return 0;
-    };
-    entries
-        .filter_map(Result::ok)
-        .filter(|e| {
-            matches!(
-                e.path().extension().and_then(|s| s.to_str()),
-                Some("java") | Some("class")
-            )
-        })
-        .count()
-}
-
-/// Whether a usable `java` is reachable. Spawns `<java> -version` (fast and
-/// self-terminating) and treats any spawn failure as "unavailable".
-fn java_available(jdk_home: Option<&Path>) -> bool {
-    let java = runner::java_executable(jdk_home);
-    Command::new(java)
-        .arg("-version")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
 }
