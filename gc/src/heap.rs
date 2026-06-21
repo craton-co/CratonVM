@@ -863,7 +863,9 @@ impl Heap {
         // potential GC. Rooting here is the strictly-correct first half.
         let jni_pins: Vec<ObjectRef> = crate::pinned::pinned_addrs()
             .into_iter()
-            .map(|addr| ObjectRef::from_raw(addr as *mut u8))
+            // SAFETY: addresses come from the JNI pin set — live, pinned object
+            // addresses registered by Get*Critical and not yet released.
+            .map(|addr| unsafe { ObjectRef::from_raw(addr as *mut u8) })
             .collect();
 
         // Part F: walk GPU pinned refs as additional roots. We splice them onto
@@ -955,7 +957,9 @@ impl Heap {
         // array is not reclaimed and is remapped to its post-GC address.
         let jni_pins: Vec<ObjectRef> = crate::pinned::pinned_addrs()
             .into_iter()
-            .map(|addr| ObjectRef::from_raw(addr as *mut u8))
+            // SAFETY: addresses come from the JNI pin set — live, pinned object
+            // addresses registered by Get*Critical and not yet released.
+            .map(|addr| unsafe { ObjectRef::from_raw(addr as *mut u8) })
             .collect();
 
         #[cfg(feature = "gpu-offload")]
@@ -1004,8 +1008,12 @@ impl Heap {
             let mut combined: Vec<ObjectRef> = Vec::with_capacity(caller_len + jni_pins.len());
             combined.extend_from_slice(roots);
             combined.extend_from_slice(&jni_pins);
-            let (result, dead_finalizers) =
-                crate::gc::collect_with_finalizers(&mut from, &mut to, &mut combined, finalizer_addrs);
+            let (result, dead_finalizers) = crate::gc::collect_with_finalizers(
+                &mut from,
+                &mut to,
+                &mut combined,
+                finalizer_addrs,
+            );
             roots.copy_from_slice(&combined[..caller_len]);
             (result, dead_finalizers)
         };
