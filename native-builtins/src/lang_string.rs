@@ -4733,6 +4733,7 @@ pub(crate) fn register_phase52_string_buffer(r: &mut NativeMethodRegistry) {
 mod tests {
     use super::*;
     use crate::test_utils::mock_ctx;
+    use cratonvm_types::ArrayElementType;
 
     // -----------------------------------------------------------------------
     // Pure helper functions (no context needed)
