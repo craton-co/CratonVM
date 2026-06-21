@@ -11,7 +11,17 @@
 > (`=0` opt-out). Now `oneShot`/`sumPoints`/`sumBoxes` scalar-replace `1/1`
 > (verified via a new `CRATONVM_DBG_SCALAR_NEW` live-fire diagnostic), bt10/14/16/18
 > == HotSpot (default-on and opt-out), jit 803/803 + harness 21/21. See
-> `activate-ir-optimizer.md` increment 20. **Gap B (`Op::Call`) remains.**
+> `activate-ir-optimizer.md` increment 20.
+
+> **UPDATE (session 4, increments 21–23): Gap B is CLOSED too.** `Op::Call` for
+> `invokestatic` landed (inc 21 int-only/oop-free; inc 22 lifted to oops-live-
+> across-call via the conservative IR-frame GC scan) and is now **default-ON**
+> (inc 23, `CRATONVM_JIT_IR_CALL=0` opt-out). Soak: gate-ON ≡ gate-OFF on
+> bt10/14/16/18 == HotSpot, the `IrCall`/`IrCallGc`(+`DBG_GC_STRESS`)/
+> `IrCallGcCatch` probes == HotSpot, and a ~20-program bench differential ==
+> HotSpot; jit 804/804 + harness 25/25. Remaining frontier: `invokespecial`/
+> virtual dispatch + category-2 (long/float/double) args. See
+> `activate-ir-optimizer.md` increments 21–23.
 
 Supersedes [`ir-jit-handoff-2026-06-20.md`](ir-jit-handoff-2026-06-20.md).
 Authoritative per-increment detail: [`activate-ir-optimizer.md`](activate-ir-optimizer.md)

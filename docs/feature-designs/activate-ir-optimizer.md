@@ -1243,6 +1243,64 @@ path handling category-2 values, which `method_uses_category2` currently
 excludes); virtual/special/interface dispatch via inline caches (the
 bug-24-sensitive area).
 
+## Increment 23 (Gap B — `CRATONVM_JIT_IR_CALL` flipped default-ON) landed
+
+Status: **landed** on `dev`. Closes Gap B's production-validation step: the
+`Op::Call` path for `invokestatic` (inc 21 + the oops-across-call widening of
+inc 22) is now the **default**, with `CRATONVM_JIT_IR_CALL=0` as the opt-out
+safety net (restores single-pass dispatch for `invokestatic`-bearing methods).
+This is the inc-19→20 pattern applied to Gap B: the feature landed inert and
+soak-gated; this increment is the soak + flip.
+
+**What landed** (`vm/src/runtime/interpreter.rs`): the three `try_compile` call
+sites that fed `ir_emit_calls` from `std::env::var_os("CRATONVM_JIT_IR_CALL")
+.is_some()` (default-OFF) now read
+`std::env::var("CRATONVM_JIT_IR_CALL").map_or(true, |v| v != "0")` (default-ON,
+`=0` opt-out) — byte-for-byte the scalar-new flip (inc 20). No other change; the
+inc-21/22 machinery (`Op::Call` lowering, the oop-free→oops-across-call gate, the
+conservative IR-frame GC scan) is unchanged.
+
+**The soak (the gating prerequisite).** Because the gate is a *runtime* env var,
+the post-flip default and the opt-out are the SAME binary toggled by the var, so
+one release build validated both. The decisive invariant is **gate-ON ≡ gate-OFF
+on every check** — the flip only changes a default, so any ON≠OFF would be the
+flip's fault, and there were none:
+
+- **bt10/14/16/18** == HotSpot (`135854 / 3222190 / 14985902 / 68332206`)
+  gate-ON (default) **and** gate-OFF (`=0`).
+- **IR-call probes** (`scratch/ircall/`, gitignored): `IrCall` ==
+  `23762906400000`, `IrCallGc` == `2721637800000` (including under
+  `CRATONVM_DBG_GC_STRESS=1` — a young GC on every allocation, the maximal
+  oops-across-call stress for inc 22), `IrCallGcCatch` large-heap == `completed
+  total=272016378000000` — all == HotSpot, gate-ON and gate-OFF.
+- **~20-program bench differential** (gate-ON vs gate-OFF, timing masked,
+  cross-checked to HotSpot): `binarytrees`, `fannkuch`, `IntegrationTest`,
+  `GenPair`, `FieldCheck`, `NBody3D`, `Benchmark` (all 10 kernel checksums),
+  `QuickBench`, `MatrixJIT`, `MatrixScale`, `IntrinsicBench` (checksums),
+  `FullStackBench`, `TestLambda`/`TestStream`/`TestSwitch`/`TestEnum`/
+  `TestGenerics` — all **ON==OFF==HotSpot**.
+- **jit lib 804/804**, **`ir_vs_singlepass` 25/25**, release VM build clean.
+
+**The one non-match is pre-existing and orthogonal.** `NBodyMini` prints a `double`
+in plain-decimal where HotSpot uses scientific notation
+(`0.000000000018033933843323614` vs `1.8033933843323614E-11`) — *value-identical*,
+reproduced by the pre-flip `dev` binary, and unrelated to `invokestatic` dispatch
+(it is a `Double.toString` notation gap). Gate-ON == gate-OFF on it, so the flip
+did not cause or change it.
+
+**Scope note (why the gauntlet risk is bounded).** The IR_CALL path fires only on
+`invokestatic` with int/ref (not category-2) args+return in a method with no
+`new`/`anewarray`. `long`/`float`/`double`-bearing hot methods (e.g.
+`QuickBenchLong`) bail via `method_uses_category2`, and virtual/special/interface
+dispatch never takes this path — so most real-app hot methods bypass it entirely.
+The full kafka/spring/tomcat/hibernate suites were **not** re-run here (heavy; the
+narrow slice rarely fires); the GC-stress oops-across-call probe is the targeted
+proof of the inc-22 risk, and `=0` remains the opt-out if a suite ever regresses.
+
+**Next refinements** (unchanged from inc 22, now the live frontier):
+`invokespecial` of a statically-resolved target; category-2 (long/float/double)
+args + return; virtual/special/interface dispatch via inline caches.
+
 ## Implementation steps (ordered)
 
 1. **φ/branch lowering repro + fix** (Front 1.1) — unblocks everything.
