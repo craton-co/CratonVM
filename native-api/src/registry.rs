@@ -1208,6 +1208,27 @@ pub trait NativeContext {
 
     // -- VM stats methods (for JMX) --
 
+    /// Effective available-processor count, honoring container/cgroup CPU
+    /// limits when `-XX:+UseContainerSupport` is active. This backs
+    /// `Runtime.availableProcessors()` and the JMX `OperatingSystemMXBean`.
+    ///
+    /// The default (used by mock/test contexts) returns the host hardware
+    /// thread count; the VM overrides it to prefer the cgroup-derived count
+    /// from `VmConfig::container_effective_processors` when present.
+    fn available_processor_count(&self) -> i32 {
+        std::thread::available_parallelism()
+            .map(|n| n.get() as i32)
+            .unwrap_or(1)
+    }
+
+    /// Maximum heap size in bytes, as reported by `Runtime.maxMemory()` and the
+    /// JMX `MemoryMXBean`. The default (mock/test contexts) is the historical
+    /// 256 MiB placeholder; the VM overrides it to return the configured
+    /// `-Xmx` (which is itself container-aware once sized from a cgroup limit).
+    fn max_heap_bytes(&self) -> i64 {
+        256 * 1024 * 1024
+    }
+
     /// Returns the total number of bytes allocated on the heap.
     fn heap_allocated_bytes(&self) -> usize;
 

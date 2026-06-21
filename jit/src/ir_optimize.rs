@@ -3452,13 +3452,19 @@ mod tests {
         let (mut g, region, preheader, _iv) = loop_probe();
         let mem = 2;
         let a = g.add(
-            Op::New { class_id: 1, num_fields: 1 },
+            Op::New {
+                class_id: 1,
+                num_fields: 1,
+            },
             IrType::Ref,
             vec![preheader],
             None,
         );
         let b = g.add(
-            Op::New { class_id: 2, num_fields: 1 },
+            Op::New {
+                class_id: 2,
+                num_fields: 1,
+            },
             IrType::Ref,
             vec![preheader],
             None,
@@ -3501,7 +3507,10 @@ mod tests {
         let (mut g, region, preheader, _iv) = loop_probe();
         let mem = 2;
         let a = g.add(
-            Op::New { class_id: 1, num_fields: 1 },
+            Op::New {
+                class_id: 1,
+                num_fields: 1,
+            },
             IrType::Ref,
             vec![preheader],
             None,
@@ -3540,7 +3549,10 @@ mod tests {
         let (mut g, region, preheader, _iv) = loop_probe();
         let mem = 2;
         let a = g.add(
-            Op::New { class_id: 1, num_fields: 1 },
+            Op::New {
+                class_id: 1,
+                num_fields: 1,
+            },
             IrType::Ref,
             vec![preheader],
             None,
@@ -3581,7 +3593,10 @@ mod tests {
         let mem = 2;
         let p = g.add(Op::Param(0), IrType::Ref, vec![g.entry], None);
         let b = g.add(
-            Op::New { class_id: 2, num_fields: 1 },
+            Op::New {
+                class_id: 2,
+                num_fields: 1,
+            },
             IrType::Ref,
             vec![preheader],
             None,
@@ -3657,19 +3672,28 @@ mod tests {
         let (mut g, region, preheader, _iv) = loop_probe();
         let mem = 2;
         let a = g.add(
-            Op::New { class_id: 1, num_fields: 1 },
+            Op::New {
+                class_id: 1,
+                num_fields: 1,
+            },
             IrType::Ref,
             vec![preheader],
             None,
         );
         let b = g.add(
-            Op::New { class_id: 2, num_fields: 1 },
+            Op::New {
+                class_id: 2,
+                num_fields: 1,
+            },
             IrType::Ref,
             vec![preheader],
             None,
         );
         let c = g.add(
-            Op::New { class_id: 3, num_fields: 1 },
+            Op::New {
+                class_id: 3,
+                num_fields: 1,
+            },
             IrType::Ref,
             vec![preheader],
             None,
@@ -3713,13 +3737,19 @@ mod tests {
         let (mut g, region, preheader, _iv) = loop_probe();
         let mem = 2;
         let a = g.add(
-            Op::New { class_id: 1, num_fields: 1 },
+            Op::New {
+                class_id: 1,
+                num_fields: 1,
+            },
             IrType::Ref,
             vec![preheader],
             None,
         );
         let b = g.add(
-            Op::New { class_id: 2, num_fields: 1 },
+            Op::New {
+                class_id: 2,
+                num_fields: 1,
+            },
             IrType::Ref,
             vec![preheader],
             None,
@@ -3759,13 +3789,19 @@ mod tests {
         let (mut g, region, preheader, _iv) = loop_probe();
         let mem = 2;
         let a = g.add(
-            Op::New { class_id: 1, num_fields: 1 },
+            Op::New {
+                class_id: 1,
+                num_fields: 1,
+            },
             IrType::Ref,
             vec![preheader],
             None,
         );
         let b = g.add(
-            Op::New { class_id: 2, num_fields: 1 },
+            Op::New {
+                class_id: 2,
+                num_fields: 1,
+            },
             IrType::Ref,
             vec![preheader],
             None,

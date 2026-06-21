@@ -187,6 +187,17 @@ pub struct VmConfig {
     /// auto-size heap and thread pools inside Docker/Kubernetes.
     pub use_container_support: bool,
 
+    /// Effective processor count to report from `Runtime.availableProcessors()`
+    /// and the JMX `OperatingSystemMXBean`, derived from the cgroup CPU
+    /// quota/period when running under `-XX:+UseContainerSupport`.
+    ///
+    /// `None` (the default) means "report the host hardware thread count".
+    /// The launcher sets this from `container::detect_container()` only when
+    /// container support is enabled, so the `-XX:-UseContainerSupport` toggle is
+    /// honored transitively (disabled → left `None` → host count). Embedding-API
+    /// callers may set it directly to pin a count.
+    pub container_effective_processors: Option<u32>,
+
     /// HotSpot `-XX:±ShowCodeDetailsInExceptionMessages` (JEP 358). When
     /// `true`, the interpreter routes the *non-invoke* null-deref opcodes
     /// (getfield/putfield/arraylength/array-access/monitor/athrow) through the
@@ -350,6 +361,7 @@ impl Default for VmConfig {
             heap_dump_on_oom: false,
             heap_dump_path: None,
             use_container_support: true,
+            container_effective_processors: None,
             // JEP 358: default ON to match HotSpot (messages verified
             // byte-identical). Opt out via -XX:-ShowCodeDetailsInExceptionMessages.
             show_code_details_in_exception_messages: true,

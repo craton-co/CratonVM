@@ -4281,6 +4281,26 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         self.shared.heap.allocated_bytes()
     }
 
+    fn available_processor_count(&self) -> i32 {
+        // Container-aware: prefer the cgroup-derived count the launcher stored
+        // under `-XX:+UseContainerSupport`; otherwise fall back to the host
+        // hardware thread count. (Disabling container support leaves the field
+        // `None`, so the toggle is honored here transitively.)
+        if let Some(n) = self.shared.config.container_effective_processors {
+            return n.max(1) as i32;
+        }
+        std::thread::available_parallelism()
+            .map(|n| n.get() as i32)
+            .unwrap_or(1)
+    }
+
+    fn max_heap_bytes(&self) -> i64 {
+        // Report the configured `-Xmx`, which the launcher already sized from
+        // the cgroup memory limit when running container-aware. Honest and
+        // container-correct in place of the old hardcoded 256 MiB.
+        self.shared.config.max_heap_size as i64
+    }
+
     fn loaded_class_count(&self) -> usize {
         self.shared.class_manager.read().loaded_count()
     }

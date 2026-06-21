@@ -1611,18 +1611,41 @@ fn run() -> Result<()> {
         config = config.with_java_home(jh.clone());
     }
 
+    // Container/cgroup awareness (HotSpot's `-XX:+UseContainerSupport`, on by
+    // default). When enabled, read the cgroup memory/CPU limits once so the
+    // ergonomic default heap is sized off the container limit and
+    // `Runtime.availableProcessors()` honors the CPU quota. `-XX:-UseContainer
+    // Support` skips detection entirely, so every limit reverts to host values.
+    // On non-Linux hosts `detect_container()` reports "not containerized" with
+    // all limits `None`, so this is a no-op there.
+    let container_info = if args.disable_container_support {
+        None
+    } else {
+        Some(cratonvm_vm::runtime::container::detect_container())
+    };
+    let container_mem_limit = container_info.as_ref().and_then(|i| i.memory_limit);
+    // CPU count for Runtime.availableProcessors() / the JMX OS bean. Only set
+    // when a cgroup quota was actually detected; `None` ⇒ report host count.
+    config.container_effective_processors =
+        container_info.as_ref().and_then(|i| i.effective_cpu_count);
+
     if let Some(max_heap_str) = &args.max_heap {
         let size = parse_size(max_heap_str)
             .with_context(|| format!("Invalid heap size: {max_heap_str}"))?;
         config = config.with_max_heap_size(size);
-    } else if let Some(ergo) = ergonomic_default_max_heap() {
-        // No explicit -Xmx: size the heap like a stock JDK (1/4 physical RAM)
-        // instead of the fixed 256 MB library default, so Spring/Mockito/JUnit
-        // workloads don't thrash GC into a pseudo-hang. See
-        // `ergonomic_default_max_heap`.
+    } else if let Some(ergo) = ergonomic_default_max_heap(container_mem_limit) {
+        // No explicit -Xmx: size the heap like a stock JDK (1/4 of host RAM, or
+        // of the cgroup limit inside a container) instead of the fixed 256 MB
+        // library default, so Spring/Mockito/JUnit workloads don't thrash GC
+        // into a pseudo-hang. See `ergonomic_default_max_heap`.
         if args.verbose_gc {
+            let basis = if container_mem_limit.is_some() {
+                "1/4 container memory limit"
+            } else {
+                "1/4 physical RAM"
+            };
             eprintln!(
-                "[cratonvm] ergonomic default max heap: {} MB (1/4 physical RAM; \
+                "[cratonvm] ergonomic default max heap: {} MB ({basis}; \
                  set -Xmx or CRATONVM_DEFAULT_HEAP_ERGONOMICS=0 to override)",
                 ergo / (1024 * 1024)
             );
@@ -3478,28 +3501,102 @@ fn physical_ram_bytes() -> Option<u64> {
 /// enough room. (If the heap is ever made lazily-committed, the cap can grow
 /// or be removed to fully match HotSpot.)
 ///
+/// When running under `-XX:+UseContainerSupport` inside a memory-constrained
+/// container, the basis for the fraction is the **cgroup memory limit** rather
+/// than host RAM — HotSpot's `MaxRAMPercentage` applies to the container limit,
+/// not the host total, so on a 64 GB host with `--memory=512m` the default heap
+/// is sized off 512 MB, not 64 GB. `container_mem_limit` is the detected cgroup
+/// limit (or `None` when uncontained / container support is off); the basis is
+/// then `min(physical RAM, cgroup limit)`.
+///
 /// Opt out with `CRATONVM_DEFAULT_HEAP_ERGONOMICS=0` (fixed 256 MB default), or
 /// override the cap with `CRATONVM_DEFAULT_HEAP_MAX_MB=<N>`. An explicit `-Xmx`
 /// always wins over all of this.
-fn ergonomic_default_max_heap() -> Option<usize> {
+fn ergonomic_default_max_heap(container_mem_limit: Option<u64>) -> Option<usize> {
     if std::env::var("CRATONVM_DEFAULT_HEAP_ERGONOMICS").as_deref() == Ok("0") {
         return None;
     }
-    const FLOOR: u64 = 256 * 1024 * 1024;
-    const MAX_ERGONOMIC_HEAP: u64 = 4 * 1024 * 1024 * 1024; // 4 GiB
     let cap = std::env::var("CRATONVM_DEFAULT_HEAP_MAX_MB")
         .ok()
         .and_then(|s| s.trim().parse::<u64>().ok())
-        .map(|mb| mb * 1024 * 1024)
+        .map(|mb| mb.saturating_mul(1024 * 1024))
         .unwrap_or(MAX_ERGONOMIC_HEAP);
     let phys = physical_ram_bytes()?;
-    let chosen = (phys / 4).clamp(FLOOR, cap.max(FLOOR));
-    usize::try_from(chosen).ok()
+    // Inside a memory-constrained container, size from the smaller of host RAM
+    // and the cgroup limit so the default heap never overshoots the container.
+    let basis = match container_mem_limit {
+        Some(limit) => phys.min(limit),
+        None => phys,
+    };
+    Some(clamp_ergonomic_heap(basis, cap))
+}
+
+/// Floor for the ergonomic default heap (the historical 256 MB baseline).
+const ERGONOMIC_HEAP_FLOOR: u64 = 256 * 1024 * 1024;
+/// Default cap for the ergonomic default heap (4 GiB). See
+/// [`ergonomic_default_max_heap`] for why the cap exists (eager arena commit).
+const MAX_ERGONOMIC_HEAP: u64 = 4 * 1024 * 1024 * 1024;
+
+/// Pure clamp for the ergonomic default heap: take 1/4 of `basis`, cap it at
+/// `cap` (itself floored so a tiny `CRATONVM_DEFAULT_HEAP_MAX_MB` can't drop
+/// below the 256 MB floor), floor it at 256 MB, and finally bound it by `basis`
+/// itself so a tiny container is never handed more than its whole limit.
+fn clamp_ergonomic_heap(basis: u64, cap: u64) -> usize {
+    let quarter = basis / 4;
+    let capped = quarter.min(cap.max(ERGONOMIC_HEAP_FLOOR));
+    let floored = capped.max(ERGONOMIC_HEAP_FLOOR);
+    let bounded = floored.min(basis);
+    usize::try_from(bounded).unwrap_or(usize::MAX)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------------
+    // Ergonomic default-heap clamp — pure math, exercised directly so the
+    // container-vs-host basis logic is covered without a real cgroupfs.
+    // -----------------------------------------------------------------------
+
+    const MIB: u64 = 1024 * 1024;
+    const GIB: u64 = 1024 * MIB;
+
+    #[test]
+    fn ergo_clamp_quarter_of_large_host() {
+        // 16 GiB basis → 1/4 = 4 GiB, exactly the default cap.
+        assert_eq!(clamp_ergonomic_heap(16 * GIB, MAX_ERGONOMIC_HEAP), 4 * GIB as usize);
+    }
+
+    #[test]
+    fn ergo_clamp_capped_for_huge_host() {
+        // 64 GiB basis → 1/4 = 16 GiB, capped to the 4 GiB default.
+        assert_eq!(clamp_ergonomic_heap(64 * GIB, MAX_ERGONOMIC_HEAP), 4 * GIB as usize);
+    }
+
+    #[test]
+    fn ergo_clamp_floored_small_basis() {
+        // 4 GiB basis → 1/4 = 1 GiB (above the 256 MiB floor).
+        assert_eq!(clamp_ergonomic_heap(4 * GIB, MAX_ERGONOMIC_HEAP), GIB as usize);
+        // 512 MiB basis → 1/4 = 128 MiB, raised to the 256 MiB floor.
+        assert_eq!(clamp_ergonomic_heap(512 * MIB, MAX_ERGONOMIC_HEAP), (256 * MIB) as usize);
+    }
+
+    #[test]
+    fn ergo_clamp_never_exceeds_basis() {
+        // A 256 MiB container: 1/4 = 64 MiB, the floor would push it to
+        // 256 MiB — but it must never exceed the basis itself, so it stays
+        // at exactly 256 MiB (not above), and a 200 MiB basis stays at 200.
+        assert_eq!(clamp_ergonomic_heap(256 * MIB, MAX_ERGONOMIC_HEAP), (256 * MIB) as usize);
+        assert_eq!(clamp_ergonomic_heap(200 * MIB, MAX_ERGONOMIC_HEAP), (200 * MIB) as usize);
+    }
+
+    #[test]
+    fn ergo_clamp_custom_cap_floored() {
+        // A tiny cap override can't drop the result below the 256 MiB floor.
+        assert_eq!(clamp_ergonomic_heap(16 * GIB, 64 * MIB), (256 * MIB) as usize);
+        // A 2 GiB cap bites on a big host (8 GiB → 1/4 = 2 GiB).
+        assert_eq!(clamp_ergonomic_heap(8 * GIB, 2 * GIB), (2 * GIB) as usize);
+    }
 
     // -----------------------------------------------------------------------
     // insert_program_args_separator tests — `java`-launcher positional

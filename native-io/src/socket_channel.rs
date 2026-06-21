@@ -2189,8 +2189,8 @@ fn ss_wrapper_local_port(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     // The binding native records the actual OS-assigned port in the shared native-api
     // registry keyed by identity hash (object fields can't carry it — the real layout's
     // low slots are reference-typed, so an int does not round-trip). Read it back.
-    let p = cratonvm_native_api::server_socket_ports::get(ctx.identity_hash_code(this))
-        .unwrap_or(0);
+    let p =
+        cratonvm_native_api::server_socket_ports::get(ctx.identity_hash_code(this)).unwrap_or(0);
     Ok(Some(Value::Int(p)))
 }
 

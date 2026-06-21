@@ -188,7 +188,12 @@ fn int_arg(args: &[Value], idx: usize) -> i32 {
 
 /// Read the real SPI handle (KEM mirror → `ML_KEM_Impls$K*`; Encapsulator /
 /// Decapsulator mirror → `KEMSpi$*Spi`) out of the appended synthetic slot.
-fn read_spi(ctx: &mut dyn NativeContext, this: ObjectRef, class_name: &str, off: usize) -> Option<ObjectRef> {
+fn read_spi(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    class_name: &str,
+    off: usize,
+) -> Option<ObjectRef> {
     let base = synthetic_base_offset(ctx, class_name);
     match ctx.get_field(this, base + off) {
         Value::Object(Some(o)) => Some(o),
@@ -307,7 +312,11 @@ fn drive_new_consumer(
     let base = synthetic_base_offset(ctx, mirror_class);
     let mirror = alloc_concurrent_synthetic(ctx, mirror_class, base + SPI_PRIVATE_SLOTS);
     let consumer_spi = ctx.read_native_pin(pin, consumer_spi);
-    ctx.set_field(mirror, base + SPI_OFF_HANDLE, Value::Object(Some(consumer_spi)));
+    ctx.set_field(
+        mirror,
+        base + SPI_OFF_HANDLE,
+        Value::Object(Some(consumer_spi)),
+    );
     ctx.unpin_native_roots(pin);
     Ok(Some(Value::Object(Some(mirror))))
 }
@@ -347,7 +356,10 @@ fn kem_new_encapsulator_pk_sr(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
 }
 
 // newEncapsulator(PublicKey, AlgorithmParameterSpec, SecureRandom)
-fn kem_new_encapsulator_pk_spec_sr(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+fn kem_new_encapsulator_pk_spec_sr(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = this_arg(args)?;
     let pk = Value::Object(opt_obj(args, 1));
     let spec = Value::Object(opt_obj(args, 2));

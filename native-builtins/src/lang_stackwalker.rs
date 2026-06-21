@@ -145,7 +145,8 @@ fn populate_sfi(
         }
         None => (None, None),
     };
-    let mut sf = alloc_concurrent_synthetic(ctx, "java/lang/StackFrameInfo", STACK_FRAME_INFO_FIELDS);
+    let mut sf =
+        alloc_concurrent_synthetic(ctx, "java/lang/StackFrameInfo", STACK_FRAME_INFO_FIELDS);
     let h_sf = ctx.pin_native_root(sf);
     let mut ste = alloc_concurrent_synthetic(ctx, "java/lang/StackTraceElement", 4);
     let h_ste = ctx.pin_native_root(ste);
@@ -206,7 +207,11 @@ fn populate_sfi(
     // `StackTraceElement.of`.
     ctx.set_field(ste, 0, Value::Object(Some(cls_str)));
     ctx.set_field(ste, 1, Value::Object(Some(meth_str)));
-    ctx.set_field(ste, 2, file_str.map_or(Value::Object(None), |s| Value::Object(Some(s))));
+    ctx.set_field(
+        ste,
+        2,
+        file_str.map_or(Value::Object(None), |s| Value::Object(Some(s))),
+    );
     ctx.set_field(ste, 3, Value::Int(entry.line_number));
     ctx.set_field_by_name(sf, "ste", Value::Object(Some(ste)));
 

@@ -3191,8 +3191,8 @@ pub(crate) fn register_callsite_dynamic_invoker_bridge(r: &mut NativeMethodRegis
                 // Derive the invoker's descriptor from the current target so
                 // `mh.type()` / arity checks see the right shape; default to a
                 // nullary Object-returning type when the target is unreadable.
-                let desc = callsite_target_desc(ctx, this)
-                    .unwrap_or_else(|| format!("(){DESC_OBJECT}"));
+                let desc =
+                    callsite_target_desc(ctx, this).unwrap_or_else(|| format!("(){DESC_OBJECT}"));
                 let handle = alloc_method_handle(ctx, "", "", &desc, MH_KIND_DYNAMIC_INVOKER);
                 ctx.set_field(handle, MH_BOUND, Value::Object(Some(this)));
                 Ok(Some(Value::Object(Some(handle))))
@@ -3270,7 +3270,8 @@ pub(crate) fn register_method_handle_combinator_extras_bridge(r: &mut NativeMeth
             ctx.set_field(wrapper, 0, Value::Object(Some(target)));
             ctx.set_field(wrapper, 1, Value::Int(count));
             let desc = mh_read_desc(ctx, target).unwrap_or_default();
-            let adapter = alloc_method_handle(ctx, "__adapter__", "collect", &desc, MH_KIND_COLLECT);
+            let adapter =
+                alloc_method_handle(ctx, "__adapter__", "collect", &desc, MH_KIND_COLLECT);
             ctx.set_field(adapter, MH_BOUND, Value::Object(Some(wrapper)));
             Ok(Some(Value::Object(Some(adapter))))
         },
@@ -3338,12 +3339,17 @@ pub(crate) fn register_method_handle_combinator_extras_bridge(r: &mut NativeMeth
         "java/lang/invoke/MutableCallSite",
         "java/lang/invoke/VolatileCallSite",
     ] {
-        r.register(cs, "setTarget", "(Ljava/lang/invoke/MethodHandle;)V", |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            let new_target = args.get(1).copied().unwrap_or(Value::Object(None));
-            ctx.set_field_by_name(this, "target", new_target);
-            Ok(None)
-        });
+        r.register(
+            cs,
+            "setTarget",
+            "(Ljava/lang/invoke/MethodHandle;)V",
+            |ctx, args| {
+                let this = obj_arg(args, 0)?;
+                let new_target = args.get(1).copied().unwrap_or(Value::Object(None));
+                ctx.set_field_by_name(this, "target", new_target);
+                Ok(None)
+            },
+        );
     }
 
     r.set_category(__prev_cat);
