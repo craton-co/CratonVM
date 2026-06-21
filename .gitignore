@@ -61,3 +61,9 @@ build-*.log
 
 # stray developer probe output
 /dd1.out
+
+# stray repro probe output under docs/internal
+docs/internal/**/cld*.out
+
+# machine-specific / personal dev scripts (not for the OSS repo)
+scripts/internal/

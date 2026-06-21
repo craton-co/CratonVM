@@ -14,7 +14,7 @@ JCA crypto, array-store/exception semantics, and reflection/annotations.
 ## Running
 
 ```bash
-# Builds target/release/cratonvm.exe first (build-maindev.bat / build-cpu.bat), then:
+# Builds target/release/cratonvm.exe first (build-cpu.bat), then:
 bash regression-suite/run.sh
 ```
 

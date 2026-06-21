@@ -27,7 +27,7 @@ TIMEOUT="${TIMEOUT:-120}"
 #   ONLY="RConcurrent" bash regression-suite/run.sh
 CLASSES="${ONLY:-RCollections RStrings RNumbers RSerial RCrypto RExceptions RReflect RJitGc}"
 
-[ -x "$CV" ] || { echo "ERROR: CratonVM binary not found: $CV (build with build-maindev.bat / build-cpu.bat)"; exit 3; }
+[ -x "$CV" ] || { echo "ERROR: CratonVM binary not found: $CV (build with build-cpu.bat)"; exit 3; }
 [ -x "$JAVAC" ] || { echo "ERROR: javac not found: $JAVAC (set JDK=...)"; exit 3; }
 
 echo "== compiling regression-suite =="
