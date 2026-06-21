@@ -214,8 +214,44 @@ Author note: this doc is grounded in a read of `gc/src/{g1,g1_concurrent,zgc,zgc
     pinned array's address unchanged + data intact) and `region_pin_refcount_balances`;
     full g1 suite + `cratonvm-cli` build green; FieldStress checksum unchanged
     under `-XX:+UseG1GC`.
-- Steps 7–10 — not started. Next highest-value: Step 8 (opt-in G1 gauntlet
-  validation); Step 7 (pause-target CSet sizing) is best done with gauntlet data.
+- **Step 8 (opt-in G1 gauntlet validation) — FIRST CUT DONE; no G1 divergence
+  found** (branch `feat/g1-step8-validation`). Validated `-XX:+UseG1GC` on the
+  deterministic checksum benches and the GC-heavy passing app suites; zero
+  G1-specific regression vs the Generational baseline or HotSpot.
+  - **Checksum parity (G1 == Generational == HotSpot)** via `bench/BenchSuite`:
+    `fib44`=701408733, `sieve250k`=22044, `matrix800`=15359906451, `bintrees16`@1g
+    =14985902, and the canonical GC-stress bench **`bintrees18`@4g=68332206** are
+    byte-identical across all three engines. bintrees is the decisive signal:
+    thousands of short-lived trees force heavy young+mixed evacuation, so a moving
+    collector that lost/duplicated/corrupted an object would diverge in the
+    checksum — it does not. (`bintrees18`/`20` raise a *catchable*
+    `OutOfMemoryError` on CratonVM below ~4g under **both** collectors — a
+    CratonVM heap-efficiency characteristic vs HotSpot's gen GC, identical on
+    Generational and G1, not a G1 fault.)
+  - **App-suite no-regression (G1 vs Generational baseline)**: every suite green
+    on Generational is also green on G1 — **h2-testall-fast** (the H2 DB test
+    suite, heavy allocation) PASS==PASS; **gpu-bench-cpu** PASS==PASS.
+    **hibernate-smoke** is RED on **both** collectors identically — root cause is
+    a *non-GC* bytecode-verifier regression (ByteBuddy
+    `JavaDispatcher$DynamicClassLoader.proxy` uses `jsr/ret`, rejected by the
+    hardened verifier; opt-out `CRATONVM_ALLOW_JSR_RET=1`) — so it is excluded
+    from the G1 comparison, not a G1 regression. FieldStress (Step 4) stays
+    4495525842000 under G1.
+  - **Method/scope**: the deterministic benches + these suites are collector-core
+    and do **not** exercise the Step 6 JNI-critical or GAP-C Panama paths, so the
+    result is Step-6-independent (Step 6 itself is covered by its unit tests +
+    the FieldStress G1 checksum). Harness (untracked, in the worktree):
+    `g1-step8-benchparity.sh` / `g1-step8-appsuites.sh` — default vs `-XX:+UseG1GC`,
+    HotSpot as ground truth; logs under `test-infra/suite-results/g1-step8-*`.
+  - **Remaining for Step 8** (the rest of the multi-session campaign, §5): the big
+    server daemons (WildFly / ES / Kafka / Spring Boot) do not yet reach *ready*
+    on the **default Generational** collector either (3 tracked **non-G1** upstream
+    bugs — non-TTY stdout SEGV/hang, ARRAY-LEN-GUARD, GC-clinit; see
+    `apps/TARGET_APPS.md`), so a G1-vs-Generational daemon boot/e2e comparison is
+    gated on those landing first. Pause-time p50/p99, throughput, and the
+    multi-hour soak under G1 are still to measure.
+- Steps 7, 9, 10 — not started. Step 7 (pause-target CSet sizing) is best done
+  once the daemon gauntlet yields sustained-allocation pause data.
 
 ---
 
