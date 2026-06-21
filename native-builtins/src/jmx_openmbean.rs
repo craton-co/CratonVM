@@ -621,11 +621,27 @@ fn type_descriptor_to_class_mirror(ctx: &mut dyn NativeContext, desc: &str) -> O
         Some(b'V') => ctx.primitive_class_mirror("void"),
         Some(b'L') => {
             // "Lpkg/Cls;" → load `pkg/Cls`, return its mirror.
-            let internal = &desc[1..desc.len() - 1];
-            match ctx.ensure_class_initialized(internal) {
-                Ok(cid) => ctx.get_class_mirror(cid),
-                Err(_) => {
-                    // Fall back to Object mirror.
+            //
+            // Validate the descriptor before slicing: a well-formed object
+            // descriptor is at least `L;` (3 bytes incl. a non-empty name is
+            // the norm, but `L;` is the minimum that ends in `;`) and must be
+            // terminated by `;`. Attacker-controlled descriptors such as `L`
+            // (no terminator) or `Lfoo` (missing `;`) would otherwise either
+            // panic on the `desc[1..desc.len() - 1]` slice (start > end when
+            // len < 2) or silently chop the final name character. Operate on
+            // bytes and `str::from_utf8` the internal name; fall back to the
+            // Object mirror on any malformed input instead of slicing blindly.
+            let bytes = desc.as_bytes();
+            let internal = if bytes.len() >= 3 && bytes[bytes.len() - 1] == b';' {
+                std::str::from_utf8(&bytes[1..bytes.len() - 1]).ok()
+            } else {
+                None
+            };
+            match internal.map(|name| ctx.ensure_class_initialized(name)) {
+                Some(Ok(cid)) => ctx.get_class_mirror(cid),
+                _ => {
+                    // Malformed descriptor or load failure — fall back to the
+                    // Object mirror.
                     match ctx.ensure_class_initialized(OBJECT_INTERNAL) {
                         Ok(cid) => ctx.get_class_mirror(cid),
                         Err(_) => {
@@ -1694,6 +1710,32 @@ mod tests {
             Value::Int(0) => {}
             other => panic!("expected size=0, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_type_descriptor_to_class_mirror_malformed_l_no_panic() {
+        // Regression: attacker-controlled object descriptors with a missing
+        // terminating `;` (or shorter than the minimum `L_;`) must not panic
+        // on the internal-name slice. They should resolve to a non-null
+        // fallback mirror instead.
+        let mut ctx = mock_ctx();
+        for desc in ["L", "L;", "Lfoo", "Ljava/lang/String", "[", "[L"] {
+            let m = type_descriptor_to_class_mirror(&mut ctx, desc);
+            assert!(
+                !m.as_ptr().is_null(),
+                "malformed descriptor {:?} produced a null mirror",
+                desc
+            );
+        }
+    }
+
+    #[test]
+    fn test_type_descriptor_to_class_mirror_wellformed_l_no_panic() {
+        // A well-formed object descriptor must still be accepted without
+        // panicking after the bounds hardening.
+        let mut ctx = mock_ctx();
+        let m = type_descriptor_to_class_mirror(&mut ctx, "Ljava/lang/Object;");
+        assert!(!m.as_ptr().is_null());
     }
 
     #[test]
