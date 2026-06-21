@@ -1020,6 +1020,16 @@ fn vh_static_slot(
     class: &str,
     field: &str,
 ) -> Option<(ClassId, usize)> {
+    // Mirror HotSpot: the first ACCESS through a static-field VarHandle triggers
+    // the holder class's `<clinit>` (as `getstatic`/`putstatic` would). Without
+    // this, a static field read via `findStaticVarHandle().get()` on a not-yet-
+    // initialized class returns the field's default (`null`/0) instead of the
+    // value its `<clinit>` assigns — e.g. Caffeine's `LocalCacheFactory.newFactory`
+    // reads `<generated>.FACTORY` (set in that class's `<clinit>`) and got `null`,
+    // failing every Hibernate SessionFactory build. Idempotent + cheap once the
+    // class is initialized; the recursive-init guard handles the in-`<clinit>`
+    // case (the initializing thread may access the field during its own clinit).
+    let _ = ctx.ensure_class_initialized(class);
     let cid = ctx.class_id_by_name(class)?;
     let idx = ctx.static_field_index_by_name(cid, field)?;
     Some((cid, idx))
