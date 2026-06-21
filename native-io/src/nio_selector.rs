@@ -1724,6 +1724,7 @@ fn selector_select_native(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     refresh_selector_handles(ctx, id);
     let n = selector_select(id, timeout)?;
     apply_ready_ops(ctx, id);
+    populate_selected_keys_field(ctx, obj, id);
     Ok(Some(Value::Int(n)))
 }
 
@@ -1752,6 +1753,47 @@ fn apply_ready_ops(_ctx: &mut dyn NativeContext, id: i32) {
     }
 }
 
+/// Push the ready SelectionKeys into the selector's LIVE `selectedKeys` field Set.
+///
+/// CratonVM normally surfaces readiness two ways: (a) `apply_ready_ops` mirrors
+/// readyOps into `sk_table` (so `key.readyOps()` works), and (b) it overrides
+/// `Selector.selectedKeys()` to BUILD a fresh set on demand from the ready keys
+/// (how Tomcat/ES consume readiness). But **Netty** reflectively REPLACES
+/// `sun.nio.ch.SelectorImpl.selectedKeys` (+ `publicSelectedKeys`) with its own
+/// `SelectedSelectionKeySet` and reads THAT field directly in `processSelectedKeys()`
+/// — it never calls `selectedKeys()`. Since CratonVM never wrote to the field, Netty's
+/// set stayed empty and a bound Vert.x/Netty server accepted nothing (the connection
+/// was detected + drained into `pending_accepted`, but the reactor was never told).
+/// Mirror the JDK native `doSelect`: add each ready key to the selector's current
+/// `selectedKeys` field. Idempotent for a JDK HashSet (dedups); Netty resets its set
+/// before each select. Skips silently when the field is null / not a Set (then nothing
+/// reads it and the on-demand `selectedKeys()` path is authoritative).
+fn populate_selected_keys_field(ctx: &mut dyn NativeContext, selector: ObjectRef, id: i32) {
+    let Value::Object(Some(set)) = ctx.get_field_by_name(selector, "selectedKeys") else {
+        return;
+    };
+    // Collect ready key objects OUTSIDE the selectors() lock — invoke_virtual runs
+    // Java bytecode (Set.add) that may re-enter selector code.
+    let ready: Vec<ObjectRef> = {
+        let regs = selectors().read();
+        let Some(s) = regs.get(&id) else { return };
+        let st = s.lock();
+        st.keys
+            .values()
+            .filter(|k| !k.cancelled && k.ready_ops != 0)
+            .filter_map(|k| k.key_obj)
+            .collect()
+    };
+    for key in ready {
+        let _ = ctx.invoke_virtual(
+            set,
+            "add",
+            "(Ljava/lang/Object;)Z",
+            &[Value::Object(Some(key))],
+        );
+    }
+}
+
 /// `SelectorImpl.selectNow0()` → int
 fn selector_select_now_native(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let Some(Value::Object(Some(obj))) = args.first().copied() else {
@@ -1767,6 +1809,7 @@ fn selector_select_now_native(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     refresh_selector_handles(ctx, id);
     let n = selector_select(id, 0)?;
     apply_ready_ops(ctx, id);
+    populate_selected_keys_field(ctx, obj, id);
     Ok(Some(Value::Int(n)))
 }
 
