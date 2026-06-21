@@ -178,11 +178,11 @@ fn main() -> ExitCode {
 
 fn cmd_run(args: &RunArgs) -> ExitCode {
     let config = args.to_runner_config();
-    let mode = config.modes.first().copied().unwrap_or(Mode::JitOn);
+    let modes: Vec<&str> = config.modes.iter().map(|m| m.label()).collect();
     println!(
         "difftest run — corpus {} | cratonvm[{}] vs java | timeout {}s",
         config.corpus.display(),
-        mode.label(),
+        modes.join(","),
         config.timeout.as_secs()
     );
 
