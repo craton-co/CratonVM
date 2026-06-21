@@ -1956,6 +1956,33 @@ impl G1Collector {
             }
         }
 
+        // 2) SATB completeness (finding #18): before draining the global
+        //    shards, pull in every live mutator's partially-full per-thread
+        //    buffer. The fast-path barrier only spills a thread's local buffer
+        //    into the shards when it fills (~256 entries) or when that thread
+        //    self-flushes; references a thread overwrote since its last spill
+        //    live only in its local buffer, invisible to the shard `drain()`
+        //    below. Excluded from the remark snapshot, the still-live objects
+        //    they point at are swept while reachable (use-after-free).
+        //
+        //    G1's remark uses `drain()` (not `deactivate_and_drain()`, which
+        //    runs only at end-of-cycle `cleanup` where stragglers are
+        //    discarded), so this is the one place that must drain the registry.
+        //    Sound only because `remark` runs at the STW safepoint (final
+        //    remark; and the initial-mark call, where buffers are typically
+        //    empty): no mutator is mid-barrier, so nothing re-fills a buffer
+        //    after we drain it. Draining every buffer here from the collector
+        //    removes the dependence on each mutator self-flushing at the
+        //    safepoint — the external, unenforced contract finding #18 flagged.
+        //
+        //    No `debug_assert!` that all registered buffers are now empty: the
+        //    registry is process-global and this crate cannot observe the VM's
+        //    STW state, so such a check races with any concurrent SATB user
+        //    (notably the parallel test harness) and would flake. The contract
+        //    is instead verified deterministically by
+        //    `satb::tests::flush_all_captures_every_parked_mutator_buffer`.
+        crate::satb::flush_all_thread_satb_buffers(&self.satb_queue);
+
         // 2) SATB — every overwritten reference becomes a root.
         let satb_entries = self.satb_queue.drain();
         for addr in satb_entries {

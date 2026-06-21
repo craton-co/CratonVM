@@ -364,6 +364,9 @@ mod tests {
     fn register_for_test(cache: &OscCache) {
         let ptr = &cache.inner as *const OscMap;
         let mut guard = cache_registry().lock();
+        // `SendPtr` is `Copy + Send` but deliberately not `PartialEq`, so
+        // dedup by comparing the wrapped raw pointer, mirroring the production
+        // `register_with_gc` idiom above.
         if !guard.iter().any(|s| s.0 == ptr) {
             guard.push(SendPtr(ptr));
         }

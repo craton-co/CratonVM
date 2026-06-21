@@ -5,6 +5,59 @@ Author note: this doc is grounded in a read of `gc/src/{g1,g1_concurrent,zgc,zgc
 `vm/src/config.rs`, `vm/src/vm/vm_init.rs`, `vm/src/runtime/interpreter.rs`, and
 `docs/internal/reviews/full-review-2026-06-20.md` (findings #18, the `gc-collectors` section, and the docs-governance row).
 
+### Implementation progress
+
+- **Step 1 (CLI flag wiring) — DONE** (branch `feat/g1-cli-flag`). `-XX:+UseG1GC`
+  now selects the G1 backend; `-XX:-UseG1GC` reverts to Generational; any other
+  `-XX:+Use*GC` (Serial/Parallel/Z/Shenandoah/Epsilon) warns and falls back to
+  Generational (lenient-with-warning, §3.1). Generational remains the default —
+  G1 is opt-in. Implementation: `parse_gc_algorithm()` in `vm/src/config.rs`;
+  `-XX:+Use<name>GC` → `--XX:UseGc <name>` rewrite + `gc_selector` clap field +
+  config-apply in `vm-cli/src/main.rs`. Unit-tested (parser + normalize +
+  full-pipeline + last-wins). The existing `vm_init.rs` `GcAlgorithm`→`GcBackend`
+  map and `-XX:+PrintFlagsFinal` collector string already reflect the selection
+  truthfully. Still open within §3.1.3: JMX `GarbageCollectorMXBean` names
+  ("G1 Young/Old Generation").
+- **Step 2 (doc truth-up) — DONE** (branch `feat/g1-cli-flag`). Reconciled the
+  docs-governance gap now that G1 is selectable: `README.md` (feature bullet +
+  crate-tree line), `CONTRIBUTING.md` (the `gc` crate row dropped "no G1"), and
+  `ARCHITECTURE.md` (Generational = default safety net, G1 = opt-in via
+  `-XX:+UseG1GC`, ZGC = simulation + a built-but-undispatched `ZgcRealHeap`).
+- **Step 3 (SATB drain enforcement, finding #18) — G1 path DONE** (branch
+  `feat/g1-cli-flag`). The per-thread SATB buffer registry + collector-side
+  `flush_all_thread_satb_buffers` already existed (and are wired into
+  `SatbQueue::deactivate_and_drain`), but G1's `remark` drains with `drain()`,
+  not `deactivate_and_drain` — the latter runs only at end-of-cycle `cleanup`,
+  which *discards* stragglers. So G1 remark never drained the registry: a
+  reference a mutator overwrote since its last ~256-entry spill sat in that
+  thread's local buffer, excluded from the remark snapshot → the still-live
+  target is swept while reachable (UAF). Fix: `G1Collector::remark` now calls
+  `flush_all_thread_satb_buffers(&self.satb_queue)` before the shard `drain()`,
+  at the STW safepoint — removing the dependence on every mutator self-flushing
+  (the external, unenforced contract finding #18 flagged). Regression test:
+  `g1_concurrent::tests::remark_drains_thread_local_satb_buffer` — a ref logged
+  into a thread-local buffer (never spilled to a shard) is marked only because
+  `remark` drains the registry. The existing
+  `satb::tests::{flush_all_thread_satb_buffers_reaches_global_queue,
+  deactivate_and_drain_includes_thread_local_buffer}` already cover the drain
+  mechanism itself.
+  - The design's hot-path `debug_assert!`(registry all-empty after drain) was
+    **intentionally omitted**: the registry is process-global and the gc crate
+    cannot observe the VM's STW state, so the check races with any concurrent
+    SATB user (the parallel test harness itself) and would flake.
+  - Test isolation: because `remark` now drains the *process-global* registry,
+    a parallel test that holds a non-empty thread-local buffer across a wide
+    window can have its entries stolen into a sibling's queue. This is a
+    shared-registry test artifact, not a production issue (one heap, true STW);
+    the suite is green single-threaded. `satb_captures_mutator_writes_during_
+    concurrent_mark` was made robust by spilling its buffer to its own queue
+    shards immediately after the barrier (per-queue shards are isolated).
+  - Generational `ConcurrentMarker::remark` already drains the registry (its
+    remark calls `deactivate_and_drain` → `flush_all`), so it is unaffected.
+    Applying the same discipline uniformly is a small follow-up.
+- Steps 4–10 — not started. Next highest-value: Step 8 (opt-in G1 gauntlet
+  validation) and Step 5 (moving-GC root-parity audit under G1).
+
 ---
 
 ## 1. Problem & motivation

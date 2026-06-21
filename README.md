@@ -30,7 +30,7 @@ and [docs/SECURITY_HARDENING.md](docs/SECURITY_HARDENING.md).
 
 - **Bytecode interpreter** with 140+ fast-path opcodes
 - **x86-64 JIT compiler** (x64 core ~32,000 lines, ~140 bytecodes, 26 optimization rounds; experimental AArch64 backend) with OSR, LICM, bounds-check elimination, AVX2 SIMD, and precise JIT stack maps (default-on)
-- **Generational garbage collector** (young/old, write barriers, card table; non-moving sweep + selective promotion default; experimental region-based G1 and a feature-gated ZGC stub)
+- **Generational garbage collector** (young/old, write barriers, card table; non-moving sweep + selective promotion default; opt-in region-based G1 via `-XX:+UseG1GC`, experimental; plus a feature-gated ZGC stub)
 - **Multi-threading** with monitors, locks, barriers, and virtual threads
 - **Lambda/invokedynamic** support via LambdaMetafactory
 - **Thousands of native method registrations** (java.lang, java.util, java.io/nio, java.time, java.util.concurrent, JCA crypto, ...)
@@ -260,7 +260,7 @@ cratonvm/
   cuda-bridge/         - Thin CUDA Driver API bridge for GPU offload
   craton-gpu/          - Build-time Java annotation sources for GPU offload (@Parallel etc.)
   classloading/        - Class loading & bytecode verification
-  gc/                  - GC: generational young/old (moving + non-moving sweep, default), plus an experimental region-based G1 (dispatched but not yet CLI-selectable) and a feature-gated ZGC stub; native-root registry + JNI pin set
+  gc/                  - GC: generational young/old (moving + non-moving sweep, default), plus an opt-in region-based G1 (selectable via -XX:+UseG1GC, experimental) and a feature-gated ZGC stub; native-root registry + JNI pin set
   jfr/                 - Java Flight Recorder
   vm/                  - Virtual machine runtime
   vm-cli/              - Command-line entry point
