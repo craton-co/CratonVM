@@ -4213,6 +4213,92 @@ pub fn register_io_natives(registry: &mut NativeMethodRegistry) {
     registry.register("java/io/FileOutputStream", "flush", "()V", native_fos_flush);
     registry.register("java/io/FileOutputStream", "close", "()V", native_fos_close);
 
+    // FOS-FIX addendum: the `<init>` overrides are intentionally NOT registered
+    // for the default (real-JDK) build — there the real bytecode constructor
+    // runs and allocates the `fd` `FileDescriptor`. But in `synthetic-jdk` mode
+    // there is no real-JDK bytecode, so without these `new FileOutputStream(path)`
+    // raises NoSuchMethodError. The synthetic streams use the legacy slot-0
+    // `FdId` layout that these `<init>` natives and the `write`/`flush`/`close`
+    // natives above all agree on, so they are safe here and only here.
+    #[cfg(feature = "synthetic-jdk")]
+    {
+        registry.register(
+            "java/io/FileOutputStream",
+            "<init>",
+            "(Ljava/lang/String;)V",
+            native_fos_init_string,
+        );
+        registry.register(
+            "java/io/FileOutputStream",
+            "<init>",
+            "(Ljava/lang/String;Z)V",
+            native_fos_init_string_append,
+        );
+        registry.register(
+            "java/io/FileOutputStream",
+            "<init>",
+            "(Ljava/io/File;)V",
+            native_fos_init_file,
+        );
+        registry.register(
+            "java/io/FileOutputStream",
+            "<init>",
+            "(Ljava/io/File;Z)V",
+            native_fos_init_file_append,
+        );
+        // FileInputStream `<init>(String)` is likewise dropped in the default
+        // (real-JDK) build (see FIS-FIX above) where the real ctor allocates the
+        // `fd` and calls `open0`. In synthetic mode there is no bytecode ctor, so
+        // route `<init>(String)` straight to the same logic `open0` runs.
+        registry.register(
+            "java/io/FileInputStream",
+            "<init>",
+            "(Ljava/lang/String;)V",
+            native_fis_open0,
+        );
+        // Public FileInputStream read surface. In real-JDK mode the bytecode
+        // read()/read(byte[])/read(byte[],i,i)/available()/skip()/close() call
+        // the internal read0/readBytes/available0/skip0 natives registered
+        // above; synthetic mode has no bytecode, so wire the public methods
+        // straight to the same native implementations.
+        registry.register("java/io/FileInputStream", "read", "()I", native_fis_read);
+        registry.register(
+            "java/io/FileInputStream",
+            "read",
+            "([BII)I",
+            native_fis_read_bytes,
+        );
+        registry.register("java/io/FileInputStream", "read", "([B)I", |ctx, args| {
+            // read(byte[] b) == readBytes(b, 0, b.length)
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(Some(Value::Int(-1))),
+            };
+            let arr = match args.get(1) {
+                Some(Value::Object(Some(a))) => *a,
+                _ => return Ok(Some(Value::Int(-1))),
+            };
+            let len = ctx.array_length(arr) as i32;
+            native_fis_read_bytes(
+                ctx,
+                &[
+                    Value::Object(Some(this)),
+                    Value::Object(Some(arr)),
+                    Value::Int(0),
+                    Value::Int(len),
+                ],
+            )
+        });
+        registry.register(
+            "java/io/FileInputStream",
+            "available",
+            "()I",
+            native_fis_available,
+        );
+        registry.register("java/io/FileInputStream", "skip", "(J)J", native_fis_skip);
+        registry.register("java/io/FileInputStream", "close", "()V", native_fis_close);
+    }
+
     // --- JDK 25 real bytecode uses different method names for I/O natives ---
     // FileInputStream: open0, read0, readBytes, skip0, available0 etc.
     registry.register("java/io/FileInputStream", "initIDs", "()V", native_noop);

@@ -46520,12 +46520,26 @@ fn json_escape(s: &str) -> String {
 /// Read exactly four hex digits as a u16 from the char iterator, advancing it.
 /// Returns None if fewer than four hex digits are available (malformed `\u`).
 fn json_read_u16_hex(chars: &mut std::str::Chars<'_>) -> Option<u16> {
+    // A `\u` escape is a fixed 4-char window. On a malformed escape we must
+    // still CONSUME the full window (up to end-of-input) so the caller emits a
+    // single replacement char rather than leaving the trailing chars behind
+    // (e.g. `\uZZZZ` → "\u{FFFD}", not "\u{FFFD}ZZZ"). Only a genuine
+    // truncation (end-of-input before 4 chars) returns early — there is nothing
+    // left to consume.
     let mut code: u16 = 0;
+    let mut valid = true;
     for _ in 0..4 {
-        let d = chars.next()?.to_digit(16)?;
-        code = code.wrapping_shl(4) | (d as u16);
+        let c = chars.next()?; // None == real EOF: nothing more to consume
+        match c.to_digit(16) {
+            Some(d) => code = code.wrapping_shl(4) | (d as u16),
+            None => valid = false, // consume the char, but mark the escape malformed
+        }
     }
-    Some(code)
+    if valid {
+        Some(code)
+    } else {
+        None
+    }
 }
 
 /// Unescape a JSON string value (handles \\n, \\t, \\uXXXX, etc.).

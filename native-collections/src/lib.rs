@@ -33402,6 +33402,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "synthetic-jdk")]
     fn scheduled_executor_registered() {
         let r = build_registry();
         let stpe = "java/util/concurrent/ScheduledThreadPoolExecutor";

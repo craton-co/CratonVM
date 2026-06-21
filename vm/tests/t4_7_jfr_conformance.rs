@@ -31,8 +31,20 @@ use cratonvm_jfr::stream::EventStream;
 // ---------------------------------------------------------------------------
 
 /// Create a FlightRecorder pre-populated with built-in event types.
-fn make_recorder() -> FlightRecorder {
-    create_flight_recorder()
+/// Process-global per-thread event rings are shared across every test in this
+/// binary, and `drain_per_thread_into_repository` drains ALL rings — so tests
+/// running in parallel (or leftovers from a prior test) cross-contaminate each
+/// other's event counts. Serialize the JFR tests on a single lock and discard
+/// any events left on the rings, so each test observes only what it emits.
+static JFR_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn make_recorder() -> (FlightRecorder, std::sync::MutexGuard<'static, ()>) {
+    let guard = JFR_SERIAL
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    // Drop any events a prior test left on the per-thread rings.
+    let _ = cratonvm_jfr::global_ring_registry().drain_all();
+    (create_flight_recorder(), guard)
 }
 
 /// Build a simple event with the given type ID and timestamps.
@@ -92,7 +104,7 @@ fn jfr_temp_dir(test_name: &str) -> std::path::PathBuf {
 /// is in the Running state.
 #[test]
 fn t4_7_1_jfr_event_recording_start_stop() {
-    let mut fr = make_recorder();
+    let (mut fr, _serial) = make_recorder();
 
     // Phase 1: Create a new recording -- state should be New.
     let rid = fr.new_recording(RecordingSettings::new("t4_7_1_conformance"));
@@ -160,6 +172,10 @@ fn t4_7_1_jfr_event_recording_start_stop() {
         200_000,
     );
 
+    // Events are emitted into the lock-free per-thread rings; materialize them
+    // into the recording's repository before querying counts (API contract —
+    // see Recording::drain_per_thread_into_repository).
+    fr.drain_per_thread_into_repository();
     {
         let rec = fr.get_recording(rid).unwrap();
         assert_eq!(
@@ -232,7 +248,7 @@ fn t4_7_1_jfr_event_recording_start_stop() {
 /// objects can be active at the same time.
 #[test]
 fn t4_7_1_jfr_multiple_simultaneous_recordings() {
-    let mut fr = make_recorder();
+    let (mut fr, _serial) = make_recorder();
 
     let r1 = fr.new_recording(RecordingSettings::new("recording-A"));
     let r2 = fr.new_recording(RecordingSettings::new("recording-B"));
@@ -244,6 +260,7 @@ fn t4_7_1_jfr_multiple_simultaneous_recordings() {
     // Emit one event -- both recordings should capture it.
     cratonvm_jfr::builtin::emit_gc_event(&mut fr, 1, "G1", "Alloc", 1000, 500);
 
+    fr.drain_per_thread_into_repository();
     assert_eq!(fr.get_recording(r1).unwrap().event_count(), 1);
     assert_eq!(fr.get_recording(r2).unwrap().event_count(), 1);
 
@@ -251,6 +268,7 @@ fn t4_7_1_jfr_multiple_simultaneous_recordings() {
     fr.stop_recording(r1);
     cratonvm_jfr::builtin::emit_gc_event(&mut fr, 2, "G1", "Alloc", 2000, 300);
 
+    fr.drain_per_thread_into_repository();
     assert_eq!(fr.get_recording(r1).unwrap().event_count(), 1);
     assert_eq!(fr.get_recording(r2).unwrap().event_count(), 2);
 
@@ -271,7 +289,7 @@ fn t4_7_1_jfr_multiple_simultaneous_recordings() {
 /// This mirrors `Recording.dump(Path)` from the Java API.
 #[test]
 fn t4_7_2_jfr_recording_dump_produces_valid_file() {
-    let mut fr = make_recorder();
+    let (mut fr, _serial) = make_recorder();
 
     let rid = fr.new_recording(RecordingSettings::new("t4_7_2_dump_test"));
     fr.start_recording(rid);
@@ -360,7 +378,7 @@ fn t4_7_2_jfr_recording_dump_produces_valid_file() {
         .expect("read_jfr_header must succeed on a valid dump");
     assert_eq!(header.magic, JFR_MAGIC);
     assert_eq!(header.major, 2);
-    assert_eq!(header.minor, 0);
+    assert_eq!(header.minor, JFR_VERSION_MINOR);
     assert_eq!(header.file_size, bytes_written);
     assert_eq!(header.file_state, 1, "file_state must be COMPLETE (1)");
     assert_eq!(
@@ -391,7 +409,7 @@ fn t4_7_2_jfr_recording_dump_produces_valid_file() {
 /// produces a structurally valid JFR file.
 #[test]
 fn t4_7_2_jfr_dump_empty_recording_produces_valid_file() {
-    let mut fr = make_recorder();
+    let (mut fr, _serial) = make_recorder();
     let rid = fr.new_recording(RecordingSettings::new("empty_dump"));
     fr.start_recording(rid);
     // No events emitted.
@@ -411,7 +429,7 @@ fn t4_7_2_jfr_dump_empty_recording_produces_valid_file() {
     let header = cratonvm_jfr::read_jfr_header(&dump_path).expect("header must be valid");
     assert_eq!(header.magic, JFR_MAGIC);
     assert_eq!(header.major, 2);
-    assert_eq!(header.minor, 0);
+    assert_eq!(header.minor, JFR_VERSION_MINOR);
     assert_eq!(header.file_state, 1);
 
     let _ = std::fs::remove_file(&dump_path);
@@ -434,7 +452,7 @@ fn t4_7_2_jfr_dump_empty_recording_produces_valid_file() {
 /// - Stream closure
 #[test]
 fn t4_7_3_jfr_event_stream_consumes_events() {
-    let mut fr = make_recorder();
+    let (mut fr, _serial) = make_recorder();
 
     // Look up a known built-in event type ID for filtering.
     // Verify that built-in event types are registered.
@@ -470,6 +488,7 @@ fn t4_7_3_jfr_event_stream_consumes_events() {
     cratonvm_jfr::builtin::emit_gc_event(&mut fr, 2, "G1 Mixed", "Evacuation", 3_000_000, 300_000);
 
     // Poll the stream -- should see all 3 new events.
+    fr.drain_per_thread_into_repository();
     {
         let rec = fr.get_recording(rid).unwrap();
         let events = stream.poll(rec.repository());
@@ -499,6 +518,7 @@ fn t4_7_3_jfr_event_stream_consumes_events() {
         4_000_000,
         100_000,
     );
+    fr.drain_per_thread_into_repository();
     {
         let rec = fr.get_recording(rid).unwrap();
         let events = stream.poll(rec.repository());
@@ -521,7 +541,7 @@ fn t4_7_3_jfr_event_stream_consumes_events() {
 /// T4.7.3 extended: Verify type-filtered streaming and callback invocation.
 #[test]
 fn t4_7_3_jfr_event_stream_filtered_with_callback() {
-    let mut fr = make_recorder();
+    let (mut fr, _serial) = make_recorder();
 
     let gc_type_id = fr
         .type_registry
@@ -554,6 +574,7 @@ fn t4_7_3_jfr_event_stream_filtered_with_callback() {
     cratonvm_jfr::builtin::emit_class_load_event(&mut fr, "Foo", "app", "app", 4000, 100);
 
     // Poll: only GC events should pass the filter.
+    fr.drain_per_thread_into_repository();
     {
         let rec = fr.get_recording(rid).unwrap();
         let events = stream.poll(rec.repository());
@@ -583,7 +604,7 @@ fn t4_7_3_jfr_event_stream_filtered_with_callback() {
 /// T4.7.3 extended: Verify `next_event()` delivers events one at a time.
 #[test]
 fn t4_7_3_jfr_event_stream_next_event() {
-    let mut fr = make_recorder();
+    let (mut fr, _serial) = make_recorder();
     let rid = fr.new_recording(RecordingSettings::new("next_event_test"));
     fr.start_recording(rid);
 
@@ -594,6 +615,7 @@ fn t4_7_3_jfr_event_stream_next_event() {
     cratonvm_jfr::builtin::emit_gc_event(&mut fr, 2, "G1", "B", 200, 50);
     cratonvm_jfr::builtin::emit_gc_event(&mut fr, 3, "G1", "C", 300, 50);
 
+    fr.drain_per_thread_into_repository();
     let rec = fr.get_recording(rid).unwrap();
     let repo = rec.repository();
 
