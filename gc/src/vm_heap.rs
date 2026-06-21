@@ -238,6 +238,21 @@ impl VmHeap {
         }
     }
 
+    /// Fallible twin of [`alloc_object`](Self::alloc_object): same (no-GC)
+    /// allocation path including the old-generation spill, but returns `None`
+    /// on true heap exhaustion instead of aborting the VM. Lets the JIT
+    /// object-alloc helper raise a catchable `OutOfMemoryError`.
+    pub fn try_alloc_object_full(
+        &self,
+        class_id: ClassId,
+        num_fields: usize,
+    ) -> Option<ObjectRef> {
+        match self {
+            VmHeap::Generational(h) => h.try_alloc_object_full(class_id, num_fields),
+            VmHeap::G1(h) => h.try_alloc_object(class_id, num_fields),
+        }
+    }
+
     /// Fallible twin of [`alloc_array`](Self::alloc_array): same (no-GC)
     /// allocation path, but returns `None` on true heap exhaustion instead of
     /// aborting the VM. Lets native callers (e.g. `ArrayList(int)`) raise a

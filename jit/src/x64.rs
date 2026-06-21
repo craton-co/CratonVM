@@ -5688,17 +5688,19 @@ struct Compiler {
     /// dispatch-aware route that drains the pending JIT exception (the
     /// `!has_dispatch` fast path returns the raw value without draining).
     emitted_athrow: bool,
-    /// A `newarray` (0xbc) OOM bail (`emit_post_alloc_oom_check`) was emitted in
-    /// this method. Forces `has_dispatch` for the SAME thread-availability
-    /// reason as `direct_calls` above: the fallible `jit_newarray` helper reads
-    /// the per-thread `JIT_THREAD` TLS (via `jit_thread_mut()`) BOTH to run the
-    /// allocation-failure STW GC (helpers.rs:1201) and to construct the
-    /// catchable `OutOfMemoryError` (helpers.rs:1265). The `!has_dispatch` fast
-    /// entry path skips `set_jit_thread`, so without this a JIT'd allocating
-    /// method would run `jit_newarray` with a null thread — no GC on young-gen
-    /// pressure, and on genuine exhaustion the OOME is never created so the
-    /// `i64::MIN` bail sentinel leaks as the method's (truncated) return value
-    /// (e.g. `new int[N]` silently yields 0) instead of throwing.
+    /// An allocation OOM bail (`emit_post_alloc_oom_check`) was emitted in this
+    /// method — by `newarray` (0xbc), `anewarray` (0xbd), or `new` (0xbb).
+    /// Forces `has_dispatch` for the SAME thread-availability reason as
+    /// `direct_calls` above: the fallible alloc helpers (`jit_newarray` /
+    /// `jit_anewarray_object` / `jit_new_object`) read the per-thread
+    /// `JIT_THREAD` TLS (via `jit_thread_mut()`) BOTH to run the
+    /// allocation-failure STW GC and to construct the catchable
+    /// `OutOfMemoryError` / `NegativeArraySizeException`. The `!has_dispatch`
+    /// fast entry path skips `set_jit_thread`, so without this a JIT'd
+    /// allocating method would run the helper with a null thread — no GC on
+    /// young-gen pressure, and on genuine exhaustion the throwable is never
+    /// created so the `i64::MIN` bail sentinel leaks as the method's (truncated)
+    /// return value (e.g. `new int[N]` silently yields 0) instead of throwing.
     emitted_alloc_oom_check: bool,
     /// Forward branch patches: (native offset of rel32, target bytecode PC).
     forward_patches: Vec<(usize, usize)>,
@@ -20612,6 +20614,13 @@ impl Compiler {
                         // finalizer queue and the slow path obviously
                         // can young-GC.
                         self.emit_oop_map_for_safepoint();
+                        // Heap-exhaustion guard: both the inline-TLAB slow path
+                        // and the slow-path helper return the 0/null sentinel on
+                        // OOM (jit_new_object -> jit_alloc_oom). Bail before the
+                        // null is pushed and dereferenced by a following
+                        // getfield/putfield. (Scalar-replaced `new` never reaches
+                        // here, so its dummy-zero push is unaffected.)
+                        self.emit_post_alloc_oom_check();
                         self.push_from_rax();
                         // The result is an object reference.
                         self.mark_top_as_oop();
@@ -20642,6 +20651,11 @@ impl Compiler {
                     self.emit_call_absolute(self.helpers.anewarray_object);
                     // T1.1.a — `anewarray` is a GC-triggering safepoint.
                     self.emit_oop_map_for_safepoint();
+                    // Heap-exhaustion / negative-length guard: jit_anewarray_object
+                    // returns the 0/null sentinel on OOM (-> jit_alloc_oom) or on
+                    // a negative length (-> jit_negative_array_size). Bail before
+                    // the null is pushed and dereferenced.
+                    self.emit_post_alloc_oom_check();
                     self.push_from_rax();
                     // The result is a reference array — an object reference.
                     self.mark_top_as_oop();
