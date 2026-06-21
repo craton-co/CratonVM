@@ -175,6 +175,13 @@ pub enum Op {
     /// Result: `Int` ∈ {-1, 0, 1} = sign(left − right), signed. Typically feeds
     /// an `if<cond>` against zero (`lcmp; iflt` ⇒ `left < right`).
     LCmp,
+    /// FP 3-way compare (`fcmpl`/`fcmpg`/`dcmpl`/`dcmpg`). Inputs:
+    /// `[left, right]` (both `Float` or both `Double`). Result: `Int` ∈
+    /// {-1, 0, 1} feeding an `if<cond>` against zero, exactly like [`Op::LCmp`].
+    /// `double` selects `ucomisd` vs `ucomiss`. `nan_greater` is the JVMS
+    /// unordered rule: a NaN operand yields `+1` for the `g` variants
+    /// (`fcmpg`/`dcmpg`) and `-1` for the `l` variants (`fcmpl`/`dcmpl`).
+    FCmp { double: bool, nan_greater: bool },
 
     // ── Type conversion ──────────────────────────────────────────────
     I2L,
@@ -1312,6 +1319,30 @@ impl IrBuilder {
                     self.push(r);
                     pc += 1;
                 }
+                // fcmpl / fcmpg / dcmpl / dcmpg — FP 3-way compare → int
+                // {-1,0,1}, like `lcmp` but with the JVMS NaN-unordered rule:
+                // a NaN operand yields -1 for the `l` variants (fcmpl/dcmpl) and
+                // +1 for the `g` variants (fcmpg/dcmpg). The result feeds the
+                // same `if<cond>`-against-0 arm as `lcmp`. Only reachable under
+                // the FP gate (`method_uses_fp` ⇒ `ir_emit_fp`); the lowerer
+                // emits `ucomiss`/`ucomisd` (see `Op::FCmp`).
+                0x95 | 0x96 | 0x97 | 0x98 => {
+                    let b = self.pop();
+                    let a = self.pop();
+                    let double = op == 0x97 || op == 0x98; // dcmpl / dcmpg
+                    let nan_greater = op == 0x96 || op == 0x98; // fcmpg / dcmpg
+                    let r = self.add_data(
+                        Op::FCmp {
+                            double,
+                            nan_greater,
+                        },
+                        IrType::Int,
+                        vec![a, b],
+                        pc,
+                    );
+                    self.push(r);
+                    pc += 1;
+                }
                 // iinc
                 0x84 => {
                     let idx = code[pc + 1] as usize;
@@ -1744,6 +1775,14 @@ impl IrBuilder {
                         let ty = match ret_type {
                             b'V' => IrType::Void,
                             b'L' | b'[' => IrType::Ref,
+                            // A `J` (long) return is a 64-bit value node so
+                            // downstream category-2 ops (lstore/lreturn/ladd/…)
+                            // type-check; `static_call_shape` only admits `J`
+                            // returns once the i64::MIN-sentinel collision is
+                            // disambiguated at the call site (see `Op::Call`
+                            // lowering). `D`/`F` returns stay rejected by the
+                            // shape gate until the XMM value tier exists.
+                            b'J' => IrType::Long,
                             _ => IrType::Int,
                         };
                         let call = self.graph.add(Op::Call { info_ptr }, ty, inputs, Some(pc));
@@ -1813,6 +1852,11 @@ impl IrBuilder {
                     let ty = match ret_type {
                         b'V' => IrType::Void,
                         b'L' | b'[' => IrType::Ref,
+                        // A `J` (long) return is a 64-bit value node so
+                        // downstream category-2 ops type-check; `static_call_shape`
+                        // only admits `J` returns once the i64::MIN-sentinel
+                        // collision is disambiguated at the call site.
+                        b'J' => IrType::Long,
                         _ => IrType::Int,
                     };
                     let call = self.graph.add(Op::Call { info_ptr }, ty, inputs, Some(pc));
@@ -1846,6 +1890,11 @@ impl IrBuilder {
                     let ty = match ret_type {
                         b'V' => IrType::Void,
                         b'L' | b'[' => IrType::Ref,
+                        // A `J` (long) return is a 64-bit value node so
+                        // downstream category-2 ops type-check; `static_call_shape`
+                        // only admits `J` returns once the i64::MIN-sentinel
+                        // collision is disambiguated at the call site.
+                        b'J' => IrType::Long,
                         _ => IrType::Int,
                     };
                     let call = self.graph.add(Op::Call { info_ptr }, ty, inputs, Some(pc));

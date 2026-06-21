@@ -313,8 +313,33 @@ Author note: this doc is grounded in a read of `gc/src/{g1,g1_concurrent,zgc,zgc
     itself gated on 3 tracked **non-G1** upstream bugs that stop WildFly/ES/Kafka/
     Spring Boot reaching *ready* even on Generational (non-TTY stdout SEGV/hang,
     ARRAY-LEN-GUARD, GC-clinit; see `apps/TARGET_APPS.md`).
-- Steps 9 (parallel evacuation), 10 (default flip) — not started; gated on Step 8
-  (a clean gauntlet, starting with the gpu-bench-cpu SIGSEGV fix).
+- **Step 9 (parallel evacuation) — FOUNDATION DONE; full parallelization is a gated
+  follow-up** (branch `feat/g1-parallel-evac-foundation`). The behaviour-identical
+  groundwork + design landed; the multi-threaded evacuator itself is deliberately
+  deferred (see the §3.4 "Sequencing caveat" — it must not land on a base with the
+  open gpu-bench-cpu G1 SIGSEGV).
+  - **Landed (behaviour-identical, checksum-neutral):** `evacuate_object` now
+    returns `Option<(*mut u8, bool)>` where the bool is `fresh` (`true` iff this
+    call performed the copy). The two `scan_and_evacuate_refs` ref-scan sites take
+    their work_list-push decision from `fresh` instead of a separate
+    `pointer_map.contains_key(...)` pre-check — removing the explicit evacuation
+    TOCTOU the code documented (the freshness now comes from the evacuation
+    outcome, which the parallel evacuator will derive from the atomic
+    CAS-forwarding install without changing the call sites). The root-loop and
+    RSet-source call sites destructure-and-ignore `fresh` (unchanged unconditional
+    push) to keep this increment minimal; they get `fresh`-gated when
+    parallelizing. All 94 g1 unit tests stay green + `cratonvm-cli` build green.
+  - **Scaffolding:** `CRATONVM_G1_PARALLEL_EVAC` opt-out flag declared (read-once
+    `OnceLock`, default off, `#[allow(dead_code)]` until wired) per §7 item 5.
+  - **Design:** the full four-piece parallel protocol (atomic header
+    CAS-forwarding · concurrent `pointer_map` · per-worker GC-TLAB allocation
+    replacing the one big `regions.lock()` · sharded/work-stealing work_list) and
+    its differential validation are specified in §3.4.
+  - **Remaining:** implement the four pieces behind the flag, differential-validate
+    (byte-identical checksums parallel vs serial), soak — only AFTER the gpu-bench
+    SIGSEGV is fixed.
+- Step 10 (default flip) — not started; gated on a clean gauntlet (Step 8) +
+  pause/throughput within band + a sustained soak (§5).
 
 ---
 
@@ -553,11 +578,53 @@ This is where a concurrent collector earns trust. Concrete work:
 
 ### 3.4 Parallel evacuation (throughput, later phase)
 
-`gc_worker_threads` exists but evacuation is single-threaded. Parallelizing is **out of scope for
-initial selectability** but is the main throughput lever for large heaps. Prerequisite (documented
-in `g1.rs:1204-1224`): convert `pointer_map` to a concurrent map with `entry().or_insert_with`
-dedup, and shard the work_list per worker. Sequenced as a distinct phase (§4 step 7) so the
-collector is *correct and selectable* before it is *fast*.
+`gc_worker_threads` (default 4) exists but evacuation is single-threaded. Parallelizing is **out of
+scope for initial selectability** but is the main throughput lever for large heaps. Sequenced as a
+distinct phase so the collector is *correct and selectable* before it is *fast*, gated behind
+`CRATONVM_G1_PARALLEL_EVAC` (default off) and differential-validated before any default flip.
+
+**Sequencing caveat (hard):** parallel evacuation must NOT land — even gated — on a base with an
+open moving-GC memory-safety bug. The single-threaded evacuator must first be proven memory-safe
+across the gauntlet; the **gpu-bench-cpu G1 SIGSEGV** (Step 8 finding, `task_b53503fd`) is the
+current blocker.
+
+**Foundation already landed (Step 9, behaviour-identical):** `evacuate_object` now returns
+`(new_ptr, fresh)`, where `fresh` is the dedup signal — `true` iff this call performed the copy.
+The ref-scan sites (`scan_and_evacuate_refs`) take their work_list-push decision from `fresh`
+instead of a separate `pointer_map.contains_key(...)` pre-check, removing the explicit TOCTOU the
+old code documented. In the parallel evacuator `fresh` becomes the outcome of the atomic forwarding
+install (below) — the call sites don't change again. The `CRATONVM_G1_PARALLEL_EVAC` opt-out flag
+is declared (read-once `OnceLock`, default off) per §7.
+
+**The remaining parallel protocol (the follow-up), four pieces in dependency order:**
+
+1. **Atomic forwarding (the core).** Replace the `pointer_map.get`/`insert` dedup with a CAS on the
+   object header's `forwarding_ptr` (already a field): a worker reads `forwarding_ptr`; if non-null
+   the object is already evacuated (not fresh) — use it; else it allocates a destination, copies,
+   and `CAS(forwarding_ptr, null → new)`. CAS win = this worker owns the copy (`fresh = true`); CAS
+   loss = abandon the dest allocation and use the winner's pointer (`fresh = false`). The mark-word
+   transfer must re-read after the CAS. CSet objects live in from-space and are not mutated by
+   mutators during STW, so only worker-vs-worker races exist.
+2. **Concurrent `pointer_map`.** Still needed to remap roots / refs in non-CSet regions. Convert
+   `HashMap<usize,usize>` → a `DashMap` (add the dep) or per-worker shards merged at end-of-pause;
+   inserts become idempotent `entry().or_insert(new)` keyed by the winning forward.
+3. **Per-worker allocation.** Today `young/mixed_collection` hold `self.regions.lock()` for the
+   *entire* pause and bump-allocate via `alloc_in_type_locked`. N workers can't share that. Give
+   each worker a GC-TLAB: a short critical section to claim/retire a Survivor/Old region, then
+   lock-free bump within it (`cursor` → `AtomicUsize` at the claim/retire boundary). The single big
+   lock is replaced by claim/retire + per-worker bump.
+4. **Sharded / work-stealing work_list.** Replace the single `Vec<*mut u8>` with per-worker deques
+   + work-stealing (Chase-Lev, or a shared `Mutex<Vec>` with per-worker local batches as a first
+   cut). Termination = all deques empty + an atomic active-worker count at zero. The RSet-source
+   scan (`scan_source_region_for_cset_refs`) and `verify_no_dangling_into_cset` must also gate their
+   pushes on `fresh` (today they push unconditionally — fine single-threaded, redundant in
+   parallel).
+
+**Validation (§4 step 9 / §5):** differential — the deterministic benches (e.g. `bintrees18@8g`)
+under `CRATONVM_G1_PARALLEL_EVAC=1` must produce **byte-identical checksums** vs serial G1 vs
+HotSpot, across worker counts; plus a parallel-evac soak with no leak/corruption. Parallel evac
+stays **opt-in** until soak-clean; flipping it on (with a demonstrated large-heap throughput win) is
+part of Step 10.
 
 ---
 

@@ -4541,14 +4541,17 @@ fn try_compile_inner(
                 // routes through the FP clause below (or bails to single-pass
                 // when the FP gate is off, exactly as it does today).
                 && !method_uses_fp(code, code_len, &cached.method_descriptor))
-            // inc 25: admit a long-using method when the long gate is on, as
-            // long as it is double/float-free AND int-div/rem-free. The latter
-            // keeps a `long` value off a deopt point (div emits a guard whose
-            // resume cannot yet reconstruct a `long` slot — a follow-up), so a
-            // long is only ever live in a leaf with no safepoint.
+            // inc 25/30(ldiv): admit a long-using method when the long gate is
+            // on, as long as it is double/float-free. (inc 25 also required
+            // int-div/rem-free, because a `long` live at a div guard's deopt
+            // could not be reconstructed; long deopt-resume now makes `long` a
+            // real `FrameValue` width — `StackSlotLong`/`Long` → `Value::Long`,
+            // the locals mapper collapsing the cat-2 two-slot snapshot — so a
+            // `long` may now be live at an `idiv`/`irem`/`ldiv`/`lrem` deopt.
+            // The precise resume reconstructs it; an unmappable frame falls back
+            // to the safe whole-method re-run.)
             || (ir_emit_long
-                && !method_uses_fp(code, code_len, &cached.method_descriptor)
-                && !method_has_int_div(code, code_len))
+                && !method_uses_fp(code, code_len, &cached.method_descriptor))
             // inc 30: admit a float/double-using method when the FP gate is on.
             // Scope (mirrors the long track's first increment): FP is used only
             // INTERNALLY — the signature must be FP-free (`!fp_in_descriptor`),
@@ -5988,9 +5991,11 @@ pub fn static_call_shape(descriptor: &str) -> Option<(usize, u8)> {
             // an int/ref. Only reachable under `ir_emit_long` (producing a long
             // requires a category-2 opcode → `method_uses_category2`), so this is
             // inert for the default int/ref path. `double`/`float` args (XMM) are
-            // still rejected; a `long`/`double`/`float` RETURN is still rejected
-            // below (a `Long.MIN_VALUE` result would collide with the `i64::MIN`
-            // deopt sentinel — deferred to the out-of-band-signal fix).
+            // still rejected; a `double`/`float` RETURN is still rejected below
+            // (needs the XMM value tier). A `long` (`J`) RETURN is now accepted
+            // (post-inc-29): the `Long.MIN_VALUE`/`i64::MIN` deopt-sentinel
+            // collision is disambiguated at the call site via the out-of-band
+            // `dispatch_threw` peek (see `ir_lower.rs::Op::Call`).
             b'J' => {
                 num_args += 1;
                 i += 1;
@@ -6026,7 +6031,15 @@ pub fn static_call_shape(descriptor: &str) -> Option<(usize, u8)> {
     let ret = return_type(descriptor);
     match ret {
         b'I' | b'Z' | b'B' | b'C' | b'S' | b'V' | b'L' | b'[' => Some((num_args, ret)),
-        // J / D / F return — not handled.
+        // `J` (long) return: accepted post-inc-29. The result is one i64 slot in
+        // RAX (the compact JIT ABI); the IR builder types the `Op::Call` node as
+        // `IrType::Long`, and the call-site post-invoke check disambiguates a
+        // legitimate `Long.MIN_VALUE` return from the `i64::MIN` deopt sentinel
+        // via the out-of-band `dispatch_threw` peek. Only reachable under
+        // `ir_emit_long` (consuming a long result needs a category-2 opcode), so
+        // inert for the default int/ref path.
+        b'J' => Some((num_args, ret)),
+        // `D` / `F` return — still rejected (needs the XMM value tier).
         _ => None,
     }
 }

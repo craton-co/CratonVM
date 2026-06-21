@@ -934,6 +934,20 @@ pub fn take_last_deopt() -> Option<ReconstructedFrame> {
     LAST_DEOPT.with(|c| c.borrow_mut().take())
 }
 
+/// Peek (without clearing) whether a deopt frame is currently stashed.
+///
+/// Used by the VM's post-invoke sentinel-disambiguation helper
+/// (`jit_dispatch_threw`): an IR-path deopt of a *dispatched callee* stashes a
+/// frame here and returns the `i64::MIN` sentinel WITHOUT setting the VM-side
+/// `JIT_DEOPT_PENDING` flag (this thread-local lives in the jit crate, which has
+/// no access to the VM flag). The disambiguation helper must therefore treat a
+/// stashed frame as a genuine deopt so a compiled caller bails instead of
+/// mistaking the sentinel for a legitimate `Long.MIN_VALUE` return. Non-clearing
+/// so the interpreter's outer `take_last_deopt` still consumes it.
+pub fn has_last_deopt() -> bool {
+    LAST_DEOPT.with(|c| c.borrow().is_some())
+}
+
 /// Deopt trampoline entry — called from JIT code when a guard fails.
 ///
 /// The trampoline loads a pointer to the guard's `DeoptimizationPoint` into

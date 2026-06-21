@@ -545,6 +545,52 @@ pub extern "C" fn jit_set_deopt_pending() {
     set_jit_deopt_pending();
 }
 
+/// `i64::MIN`-sentinel disambiguation for `J`/`D` (long/double) call returns —
+/// PEEK (non-clearing) of every out-of-band exception/deopt signal.
+///
+/// A compiled caller signals a callee exception/deopt by the dispatch helpers'
+/// `i64::MIN` return in RAX. For `int`/ref/void returns that is unambiguous (no
+/// such legitimate value), so the post-invoke check is a plain
+/// `CMP RAX, i64::MIN; JE bail`. But a callee that *legitimately* returns
+/// `Long.MIN_VALUE` (a `J`/`D` whose bits equal `i64::MIN`) returns the SAME
+/// value with NO pending-signal flag set — so a `J`/`D` call site cannot tell the
+/// two apart from RAX alone.
+///
+/// At a `J`/`D` call site the backend therefore emits, ONLY on the (rare)
+/// `RAX == i64::MIN` branch, a `CALL` here. We peek (do not clear) every signal a
+/// dispatch helper or its callee could have raised before returning `i64::MIN`:
+///
+///   * `JIT_PENDING_EXCEPTION`  — an explicit/native throwable (athrow, NPE-on
+///     -receiver, re-stashed callee exception),
+///   * `JIT_PENDING_NPE`        — a void-return-store / null-receiver NPE,
+///   * `JIT_PENDING_AIOOBE`     — a bounds-check failure,
+///   * `JIT_DEOPT_PENDING`      — the generic out-of-band deopt flag (set by
+///     `jit_throw_aioobe` / `jit_uncommon_trap` / the x64 stubs), and
+///   * a stashed IR-deopt frame (`cratonvm_jit::deopt::has_last_deopt`) — an
+///     IR-path deopt of a dispatched callee returns `i64::MIN` WITHOUT the VM
+///     flag (the stash lives in the jit crate).
+///
+/// Returns `1` iff ANY is pending (the `i64::MIN` is a genuine sentinel — the
+/// caller bails through its epilogue, and the interpreter's post-JIT path drains
+/// the still-set flag and routes/resumes), `0` iff none is pending (the
+/// `i64::MIN` is a real `Long.MIN_VALUE` return — the caller keeps it). The peek
+/// is non-destructive so the outer interpreter drain still observes the flag.
+///
+/// SAFETY: no pointer arguments; only reads thread-locals. Safe to call from
+/// JIT-compiled code immediately after a dispatch returns `i64::MIN`.
+pub extern "C" fn jit_dispatch_threw() -> i64 {
+    let pending = jit_pending_exception_is_set()
+        || JIT_PENDING_NPE.with(|e| e.get())
+        || JIT_PENDING_AIOOBE.with(|e| e.get().is_some())
+        || JIT_DEOPT_PENDING.with(|e| e.get())
+        || cratonvm_jit::deopt::has_last_deopt();
+    if pending {
+        1
+    } else {
+        0
+    }
+}
+
 /// JEP 358 (helpful NPE), inline-codegen path — `extern "C"` trampoline for the
 /// per-action inline null-check failure stubs emitted in
 /// `jit/src/x64.rs::emit_null_check_store_stubs`.
@@ -4613,6 +4659,52 @@ mod tests {
     }
 
     #[test]
+    fn jit_dispatch_threw_peeks_all_signals_nondestructively() {
+        // The J/D-call-site disambiguation peek: `1` ⇒ a genuine exception/deopt
+        // is pending (caller bails), `0` ⇒ the `i64::MIN` in RAX is a legitimate
+        // `Long.MIN_VALUE` return (caller keeps it). It must read EVERY signal a
+        // dispatch could leave, and must NOT clear any (the interpreter drain
+        // still needs them).
+        let _ = take_jit_deopt_pending();
+        let _ = take_jit_pending_npe();
+        let _ = take_jit_pending_aioobe();
+
+        // Nothing pending → legitimate value.
+        assert_eq!(
+            jit_dispatch_threw(),
+            0,
+            "no pending signal must report 0 (a legitimate Long.MIN_VALUE return)"
+        );
+
+        // Out-of-band deopt flag → genuine sentinel, peeked non-destructively.
+        set_jit_deopt_pending();
+        assert_eq!(jit_dispatch_threw(), 1, "a pending deopt must report 1 (bail)");
+        assert_eq!(jit_dispatch_threw(), 1, "the peek must be non-clearing");
+        assert!(
+            take_jit_deopt_pending(),
+            "the deopt flag must survive the peek for the interpreter drain"
+        );
+        assert_eq!(jit_dispatch_threw(), 0, "drained → back to 0");
+
+        // Pending NPE (e.g. a null-receiver dispatch) → 1, non-clearing.
+        set_jit_pending_npe();
+        assert_eq!(jit_dispatch_threw(), 1, "a pending NPE must report 1");
+        assert!(take_jit_pending_npe(), "NPE flag must survive the peek");
+        let _ = take_jit_pending_npe_action();
+        assert_eq!(jit_dispatch_threw(), 0);
+
+        // Pending AIOOBE (a bounds-check failure) → 1, non-clearing.
+        stash_jit_pending_aioobe(5, 3);
+        assert_eq!(jit_dispatch_threw(), 1, "a pending AIOOBE must report 1");
+        assert_eq!(
+            take_jit_pending_aioobe(),
+            Some((5, 3)),
+            "AIOOBE payload must survive the peek"
+        );
+        assert_eq!(jit_dispatch_threw(), 0, "fully drained → 0");
+    }
+
+    #[test]
     fn jit_throw_aioobe_sets_deopt_pending() {
         let _ = take_jit_deopt_pending();
         let _ = take_jit_pending_aioobe();
@@ -5435,6 +5527,11 @@ pub fn build_helpers() -> JitRuntimeHelpers {
         // code so the interpreter drain can attach the right action-only
         // message.
         jit_npe_with_action: jit_npe_with_action as *const () as usize,
+        // i64::MIN-sentinel disambiguation for J/D (long/double) call returns —
+        // peeked by a compiled caller on the rare `RAX == i64::MIN` branch to
+        // tell a genuine callee exception/deopt apart from a legitimate
+        // `Long.MIN_VALUE` return.
+        dispatch_threw: jit_dispatch_threw as *const () as usize,
     }
 }
 

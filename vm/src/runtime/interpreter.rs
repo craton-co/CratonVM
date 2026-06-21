@@ -8078,6 +8078,33 @@ mod deopt_step3_tests {
         assert!(ir_deopt_frame_values_with_objects(&[FrameValue::VirtualObjectRef(0)]).is_none());
     }
 
+    /// ldiv/lrem long deopt-resume: a `long` reconstructs as a full-64-bit
+    /// `Value::Long`, and the LOCALS mapper COLLAPSES the JVM-two-slot snapshot
+    /// (a `long` reserves its upper half as `Undefined`) into the compact arg
+    /// list `copy_args_to_locals` re-expands — so a local after a `long` is not
+    /// mis-aligned. The operand-stack mapper keeps one entry per `long` (already
+    /// compact). A regression in either mapper silently corrupts a resumed
+    /// long-bearing frame at an `ldiv`/`lrem` (or int-div) deopt.
+    #[test]
+    fn long_locals_collapse_and_compact_stack() {
+        // locals: long a@0-1, int n@2  →  JVM-slot-indexed [Long, Undefined, Int].
+        // Collapses to one entry per long (upper-half placeholder dropped) so the
+        // int stays adjacent for the cat-2 re-expansion inside new_pooled.
+        assert_eq!(
+            ir_deopt_locals(&[
+                FrameValue::Long(0x7_0000_0000),
+                FrameValue::Undefined,
+                FrameValue::Int(9),
+            ]),
+            Some(vec![Value::Long(0x7_0000_0000), Value::Int(9)]),
+        );
+        // Operand stack is already compact (one entry per long) — no collapse.
+        assert_eq!(
+            ir_deopt_frame_values(&[FrameValue::Long(123), FrameValue::Long(0)]),
+            Some(vec![Value::Long(123), Value::Long(0)]),
+        );
+    }
+
     /// Build a frame with an Int local, a real Object local, and an Int on the
     /// operand stack; assert the built frame's locals/stack/pc.
     #[test]
