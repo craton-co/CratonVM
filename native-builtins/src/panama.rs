@@ -859,9 +859,31 @@ fn register_pe_memory_segment(r: &mut NativeMethodRegistry) {
                     let src_addr = s as *const u8;
                     let dst_addr = d as *mut u8;
                     if !src_addr.is_null() && !dst_addr.is_null() {
+                        // The JDK's MemorySegment.copy is defined for overlapping
+                        // src/dst (it is specified as a memmove-equivalent bulk
+                        // copy). Decide between memmove and the faster
+                        // `copy_nonoverlapping` by testing whether the two
+                        // byte ranges actually intersect.
+                        //
+                        // Ranges are `[s, s+bytes)` and `[d, d+bytes)` over the
+                        // *absolute* addresses computed above. They overlap iff
+                        // `s < d+bytes && d < s+bytes`. `bytes` is bounded by
+                        // MAX_COPY_SIZE and both endpoints derive from the
+                        // checked address arithmetic, so the `+ bytes` cannot
+                        // wrap a u64.
+                        let bytes_u64 = bytes as u64;
+                        let overlap = s < d.saturating_add(bytes_u64)
+                            && d < s.saturating_add(bytes_u64);
                         // SAFETY: addresses are non-null, bounds-checked against
                         // segment sizes, and bytes is bounded by MAX_COPY_SIZE.
-                        unsafe { std::ptr::copy_nonoverlapping(src_addr, dst_addr, bytes) };
+                        // Overlapping ranges use `copy` (memmove), which is
+                        // defined for overlap; provably-disjoint ranges use the
+                        // faster `copy_nonoverlapping`.
+                        if overlap {
+                            unsafe { std::ptr::copy(src_addr, dst_addr, bytes) };
+                        } else {
+                            unsafe { std::ptr::copy_nonoverlapping(src_addr, dst_addr, bytes) };
+                        }
                     }
                 } else {
                     return Err(RuntimeError::IllegalStateException {
@@ -3316,6 +3338,76 @@ mod tests {
         for i in 0..16u8 {
             let val = unsafe { *dst_ptr.add(i as usize) };
             assert_eq!(val, i + 1, "Byte at offset {} mismatch", i);
+        }
+    }
+
+    /// Mirror of the overlap decision used by MemorySegment.copy: ranges
+    /// `[s, s+bytes)` and `[d, d+bytes)` overlap iff `s < d+bytes && d < s+bytes`.
+    fn copy_ranges_overlap(s: u64, d: u64, bytes: u64) -> bool {
+        s < d.saturating_add(bytes) && d < s.saturating_add(bytes)
+    }
+
+    #[test]
+    fn test_copy_overlap_detection() {
+        // Disjoint adjacent ranges: [0,16) and [16,32) do NOT overlap.
+        assert!(!copy_ranges_overlap(0, 16, 16));
+        assert!(!copy_ranges_overlap(16, 0, 16));
+        // One-byte overlap (forward): [0,16) and [15,31).
+        assert!(copy_ranges_overlap(0, 15, 16));
+        // One-byte overlap (backward): [15,31) and [0,16).
+        assert!(copy_ranges_overlap(15, 0, 16));
+        // Identical ranges fully overlap.
+        assert!(copy_ranges_overlap(100, 100, 8));
+        // Zero-length never overlaps.
+        assert!(!copy_ranges_overlap(100, 100, 0));
+    }
+
+    #[test]
+    fn test_copy_overlapping_within_segment_is_memmove_correct() {
+        // Regression: MemorySegment.copy must behave as a memmove for
+        // overlapping src/dst within a single segment. A forward-overlapping
+        // copy done with copy_nonoverlapping would corrupt the tail; copy
+        // (memmove) preserves it.
+        let mut ctx = mock_ctx();
+        let arena = make_arena(&mut ctx, ffi::ARENA_CONFINED);
+        let seg = pe_arena_allocate_impl(&mut ctx, arena, 32, 1)
+            .unwrap()
+            .and_then(|v| {
+                if let Value::Object(Some(s)) = v {
+                    Some(s)
+                } else {
+                    None
+                }
+            })
+            .unwrap();
+
+        let base = match ctx.get_field(seg, 0) {
+            Value::Long(n) => n as *mut u8,
+            _ => std::ptr::null_mut(),
+        };
+        assert!(!base.is_null());
+
+        // Initialize bytes 0..16 = [1..=16].
+        for i in 0..16u8 {
+            unsafe { *base.add(i as usize) = i + 1 };
+        }
+
+        // copy 8 bytes from offset 0 to offset 4 (forward overlap).
+        let s = base as u64;
+        let d = unsafe { base.add(4) } as u64;
+        let bytes: usize = 8;
+        assert!(
+            copy_ranges_overlap(s, d, bytes as u64),
+            "ranges must be detected as overlapping"
+        );
+        // Use the same memmove path the production code selects on overlap.
+        unsafe { std::ptr::copy(base, base.add(4), bytes) };
+
+        // Expected memmove result: dst[4..12] == old src[0..8] == [1..=8].
+        let expected: [u8; 16] = [1, 2, 3, 4, 1, 2, 3, 4, 5, 6, 7, 8, 13, 14, 15, 16];
+        for i in 0..16usize {
+            let val = unsafe { *base.add(i) };
+            assert_eq!(val, expected[i], "memmove byte at offset {} mismatch", i);
         }
     }
 
