@@ -1934,12 +1934,18 @@ impl SharedVm {
                 native_methods.len()
             );
         }
-        // T7: Register AWT/Swing/Java2D native methods for desktop support
-        cratonvm_native_awt::register_awt_natives(&mut native_methods);
-        tracing::info!(
-            "AWT/Swing native methods registered (total: {})",
-            native_methods.len()
-        );
+        // T7: Register AWT/Swing/Java2D native methods for desktop support.
+        // Gated behind the (default-on) `awt` feature: `cratonvm-native-awt`
+        // sets `publish = false`, so it is an optional dependency. The default
+        // build enables `awt` and registers these natives exactly as before.
+        #[cfg(feature = "awt")]
+        {
+            cratonvm_native_awt::register_awt_natives(&mut native_methods);
+            tracing::info!(
+                "AWT/Swing native methods registered (total: {})",
+                native_methods.len()
+            );
+        }
         // Build system properties from platform defaults + user overrides.
         //
         // WP1.11 (2026-04-24) — System property fidelity: populate the full
