@@ -1355,8 +1355,12 @@ mod tests {
             let fkey = key_from_parts(i ^ 0xFFFF, i, i);
             state.cache_field(fkey, sample_field(i));
 
-            let pkey: PromotedInvokeKey =
-                (ClassId::new(i as u32), (i % 64) as u16, false, Some(ClassId::new((i + 1) as u32)));
+            let pkey: PromotedInvokeKey = (
+                ClassId::new(i as u32),
+                (i % 64) as u16,
+                false,
+                Some(ClassId::new((i + 1) as u32)),
+            );
             state.insert_promoted_invoke(
                 pkey,
                 CachedInvokeTarget::VirtualBytecode {

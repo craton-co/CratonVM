@@ -2833,8 +2833,8 @@ mod tests {
         assert!(!object_payload_is_plausible(0x1001)); // unaligned, above guard
         assert!(!object_payload_is_plausible(8)); // aligned but below guard
         assert!(!object_payload_is_plausible(NULL_GUARD_PAGE - 8)); // aligned, just under guard
-        // Accepted: the guard-page boundary is inclusive, and anything aligned
-        // above it.
+                                                                    // Accepted: the guard-page boundary is inclusive, and anything aligned
+                                                                    // above it.
         assert!(object_payload_is_plausible(NULL_GUARD_PAGE)); // 0x1000, aligned
         assert!(object_payload_is_plausible(0x1234_5678_ABC0));
         assert!(object_payload_is_plausible(PAYLOAD_MASK & !0b111)); // max aligned 47-bit

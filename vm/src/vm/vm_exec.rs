@@ -5407,8 +5407,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                     //
                     // Safety: `self.thread` is the live `&mut JvmThread` borrowed
                     // for this call; it outlives `_jni_guard` per `set_jni_thread`.
-                    let _jni_guard =
-                        JniContextGuard::install(self.shared, self.thread as *mut _);
+                    let _jni_guard = JniContextGuard::install(self.shared, self.thread as *mut _);
                     let _version = sym(crate::native::jni::get_java_vm(), std::ptr::null_mut());
                     // `_jni_guard` clears the TLS context on scope exit (normal or
                     // unwind).
@@ -7112,7 +7111,14 @@ pub(super) fn proxy_invoke_handler(
         "(Ljava/lang/Object;Ljava/lang/reflect/Method;[Ljava/lang/Object;)Ljava/lang/Object;",
         &invoke_args,
     );
-    proxy_wrap_undeclared_if_needed(ctx.shared, ctx.thread, proxy, method_name, descriptor, result)
+    proxy_wrap_undeclared_if_needed(
+        ctx.shared,
+        ctx.thread,
+        proxy,
+        method_name,
+        descriptor,
+        result,
+    )
 }
 
 /// Dispatch a method call on an annotation proxy object.
@@ -7466,12 +7472,19 @@ fn proxy_wrap_undeclared_if_needed(
     // `proxy_resolve_declaring_class_mirror` lands on the exact declaring
     // interface, so its `Exceptions` attribute is authoritative for (name,desc).
     let decl_mirror = proxy_resolve_declaring_class_mirror(shared, proxy, method_name, descriptor);
-    let decl_cid = shared.class_mirrors_reverse.read().get(&decl_mirror).copied();
+    let decl_cid = shared
+        .class_mirrors_reverse
+        .read()
+        .get(&decl_mirror)
+        .copied();
     if let Some(decl_cid) = decl_cid {
         for ex_name in proxy_method_declared_exceptions(shared, decl_cid, method_name, descriptor) {
             if let Ok(ex_cid) = shared.load_class_concurrent(&ex_name) {
                 if thrown_cid == ex_cid
-                    || shared.class_manager.read().is_subclass_of(thrown_cid, ex_cid)
+                    || shared
+                        .class_manager
+                        .read()
+                        .is_subclass_of(thrown_cid, ex_cid)
                 {
                     return Err(MethodCallFailed::ExceptionThrown(thrown));
                 }
@@ -7539,7 +7552,10 @@ fn proxy_method_declared_exceptions(
                     return exception_indices
                         .iter()
                         .filter_map(|idx| {
-                            class.constant_pool.get_class_name(*idx).map(|s| s.to_string())
+                            class
+                                .constant_pool
+                                .get_class_name(*idx)
+                                .map(|s| s.to_string())
                         })
                         .collect();
                 }
@@ -12001,9 +12017,7 @@ mod tests {
             // pointer in TLS; we never deref it. A dangling-but-unused pointer
             // is fine for exercising the install/clear lifecycle.
             {
-                let _g = unsafe {
-                    JniContextGuard::install(&shared, std::ptr::null_mut())
-                };
+                let _g = unsafe { JniContextGuard::install(&shared, std::ptr::null_mut()) };
                 // Context is installed here; nothing to assert without a public
                 // TLS predicate — the value of the test is the unwind case below.
             }
@@ -12031,9 +12045,7 @@ mod tests {
             // self-reference `get_arc()` needs, which `test_shared()` omits.
             *shared.self_arc.write() = Some(std::sync::Arc::downgrade(&shared));
             let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let _g = unsafe {
-                    JniContextGuard::install(&shared, std::ptr::null_mut())
-                };
+                let _g = unsafe { JniContextGuard::install(&shared, std::ptr::null_mut()) };
                 panic!("simulated native-bridge unwind");
             }));
             assert!(unwound.is_err(), "closure should have unwound");
@@ -12041,9 +12053,7 @@ mod tests {
             // If the guard's Drop did NOT run, a stale context would remain.
             // Re-installing and dropping a second guard must still succeed.
             {
-                let _g2 = unsafe {
-                    JniContextGuard::install(&shared, std::ptr::null_mut())
-                };
+                let _g2 = unsafe { JniContextGuard::install(&shared, std::ptr::null_mut()) };
             }
             crate::native::jni::clear_jni_context();
             crate::native::jni::clear_jni_thread();

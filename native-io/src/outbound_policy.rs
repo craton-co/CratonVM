@@ -849,7 +849,9 @@ mod tests {
         assert_eq!(v6_to_ipv4_compatible(&Ipv6Addr::UNSPECIFIED), None);
         assert_eq!(v6_to_ipv4_compatible(&Ipv6Addr::LOCALHOST), None);
         // And they must not be classified as link-local metadata.
-        assert!(!is_link_local_metadata_ip(&IpAddr::V6(Ipv6Addr::UNSPECIFIED)));
+        assert!(!is_link_local_metadata_ip(&IpAddr::V6(
+            Ipv6Addr::UNSPECIFIED
+        )));
         assert!(!is_link_local_metadata_ip(&IpAddr::V6(Ipv6Addr::LOCALHOST)));
     }
 
