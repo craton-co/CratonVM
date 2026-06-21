@@ -5,7 +5,7 @@ If you want to contribute, this is the place to start.
 
 ## Crate Layout
 
-The workspace has 17 member crates plus a `fuzz` harness (18 Cargo.toml files in total):
+The workspace has 19 member crates (the `fuzz` harness is a separate, standalone workspace, not a member):
 
 ```
 cratonvm/
@@ -22,12 +22,15 @@ cratonvm/
   cuda-bridge/         cuda-bridge                  Thin CUDA Driver API bridge for GPU offload
   craton-gpu/          craton-gpu                   GPU offload runtime integration
   classloading/        cratonvm-classloading        Class loading & bytecode verification
-  gc/                  cratonvm-gc                  Garbage collectors (semi-space, G1, ZGC)
+  gc/                  cratonvm-gc                  Garbage collectors (default generational semi-space; G1 region-based; experimental feature-gated zgc stub)
   jfr/                 cratonvm-jfr                 Java Flight Recorder
   vm/                  cratonvm-vm                  VM runtime engine
   vm-cli/              cratonvm-cli                 CLI entry point
-  fuzz/                cratonvm-fuzz                libfuzzer harness (workspace member, nightly-only)
+  libcratonvm/         libcratonvm                  C-ABI shared library for embedding (cdylib/staticlib libjvm substitute)
+  cratonvm-embed/      cratonvm-embed               Semver-stable Rust facade for embedding CratonVM
 ```
+
+The `fuzz/` directory is its own standalone workspace (`cratonvm-fuzz`, nightly-only libFuzzer harness) and is *not* a member of this workspace — its `#![no_main]` `fuzz_target!` expansion trips the production lints, so it builds separately via `cargo +nightly fuzz build`.
 
 **Dependency flow:**
 ```
@@ -35,6 +38,9 @@ vm-cli -> vm -> {classloading, gc, jit, native-builtins, native-collections,
                  native-io, native-awt, jfr}
                  -> {reader, types, native-api, jit-api, jit-cuda,
                      cuda-bridge, craton-gpu}
+
+libcratonvm  -> vm   (C-ABI / JNI Invocation API embedding shim)
+cratonvm-embed -> vm (curated, semver-stable Rust embedding facade)
 ```
 
 ## reader — Class File Parser
@@ -60,7 +66,7 @@ independently to inspect `.class` files.
 
 ## vm — Virtual Machine
 
-The VM is the core of the project (~323,000+ LoC across 17 workspace member crates plus a `fuzz` harness — 18 Cargo.toml files in total). It contains six
+The VM is the core of the project (~323,000+ LoC across 19 workspace member crates, plus the separate `fuzz` harness workspace). It contains six
 major subsystems (several now extracted into their own crates):
 
 ### Runtime (`vm/src/runtime/`)
@@ -94,7 +100,7 @@ Implements JVMS Ch. 5: loading, linking, and initialization. Extracted into the
 
 ### Memory (`gc/` crate)
 
-Garbage collectors (semi-space, G1, ZGC). Extracted into the `cratonvm-gc` crate.
+Garbage collectors, extracted into the `cratonvm-gc` crate. The default is the generational semi-space collector (Cheney moving young gen + non-moving sweep). A region-based G1 collector is also present (selectable via `-XX:+UseG1GC`). ZGC is an experimental, feature-gated simulation stub (`--features zgc`, off by default) and not a production collector.
 
 - **`heap.rs`** — Object/array layout and allocation (semi-space).
 - **`gen_heap.rs`** — Generational heap: young gen (copying) + old gen.

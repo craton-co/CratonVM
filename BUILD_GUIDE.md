@@ -91,7 +91,8 @@ binary-trees workload) and `--nojit` to isolate interpreter-only timings.
 
 ## Workspace layout
 
-The workspace has 17 member crates plus a `fuzz` harness (18 `Cargo.toml` files
-in total). See [ARCHITECTURE.md](ARCHITECTURE.md) for the detailed structure and
+The workspace has 19 member crates (including `libcratonvm` and `cratonvm-embed`,
+the C-ABI and Rust embedding crates); the `fuzz` harness is a separate, standalone
+workspace, not a member. See [ARCHITECTURE.md](ARCHITECTURE.md) for the detailed structure and
 [CONTRIBUTING.md](CONTRIBUTING.md#project-structure) for the per-crate purpose
 table.
