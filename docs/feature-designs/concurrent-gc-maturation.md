@@ -214,44 +214,65 @@ Author note: this doc is grounded in a read of `gc/src/{g1,g1_concurrent,zgc,zgc
     pinned array's address unchanged + data intact) and `region_pin_refcount_balances`;
     full g1 suite + `cratonvm-cli` build green; FieldStress checksum unchanged
     under `-XX:+UseG1GC`.
-- **Step 8 (opt-in G1 gauntlet validation) — FIRST CUT DONE; no G1 divergence
-  found** (branch `feat/g1-step8-validation`). Validated `-XX:+UseG1GC` on the
-  deterministic checksum benches and the GC-heavy passing app suites; zero
-  G1-specific regression vs the Generational baseline or HotSpot.
-  - **Checksum parity (G1 == Generational == HotSpot)** via `bench/BenchSuite`:
-    `fib44`=701408733, `sieve250k`=22044, `matrix800`=15359906451, `bintrees16`@1g
-    =14985902, and the canonical GC-stress bench **`bintrees18`@4g=68332206** are
-    byte-identical across all three engines. bintrees is the decisive signal:
-    thousands of short-lived trees force heavy young+mixed evacuation, so a moving
-    collector that lost/duplicated/corrupted an object would diverge in the
-    checksum — it does not. (`bintrees18`/`20` raise a *catchable*
-    `OutOfMemoryError` on CratonVM below ~4g under **both** collectors — a
-    CratonVM heap-efficiency characteristic vs HotSpot's gen GC, identical on
-    Generational and G1, not a G1 fault.)
-  - **App-suite no-regression (G1 vs Generational baseline)**: every suite green
-    on Generational is also green on G1 — **h2-testall-fast** (the H2 DB test
-    suite, heavy allocation) PASS==PASS; **gpu-bench-cpu** PASS==PASS.
-    **hibernate-smoke** is RED on **both** collectors identically — root cause is
-    a *non-GC* bytecode-verifier regression (ByteBuddy
-    `JavaDispatcher$DynamicClassLoader.proxy` uses `jsr/ret`, rejected by the
-    hardened verifier; opt-out `CRATONVM_ALLOW_JSR_RET=1`) — so it is excluded
-    from the G1 comparison, not a G1 regression. FieldStress (Step 4) stays
+- **Step 8 (opt-in G1 gauntlet validation) — IN PROGRESS. First cut found a real
+  G1 SIGSEGV; G1 is NOT yet gauntlet-ready** (branch `feat/g1-step8-correction`).
+  - **METHODOLOGY CORRECTION (supersedes the earlier "no divergence" claim,
+    commit `92d3349d`/merge `ea1e35f2`).** That first run used a pre-existing
+    release binary built at **11:15** which *predated* the Step-1 `-XX:+UseG1GC`
+    flag merge (`7c6fdb35`, **12:54**), so it silently fell back to **Generational**
+    — every "CV-G1" column was Generational-vs-Generational, not a G1 validation.
+    Caught via the `--verbose:gc` startup line printing the *Generational arm's*
+    `[GC] Verbose GC logging enabled (generational collector)` message (G1 has no
+    such message) plus the absence of G1-specific `[GC YoungOnly]` collection
+    logs. **Lesson — always verify the collector is actually selected before
+    claiming a G1 result** (guard: zero "(generational collector)" messages +
+    G1-only `[GC YoungOnly]` lines under `RUST_LOG=cratonvm_gc=info --verbose:gc`).
+    Re-validated on a binary where `-XX:+UseG1GC` genuinely selects G1 (verified).
+  - **G1-SPECIFIC CRASH (the headline finding) — `gpu-bench-cpu` `CpuOnlyBench`
+    SIGSEGVs under G1.** `rc=139`, **3/3 deterministic** under `-XX:+UseG1GC` at
+    `--Xmx 512m`; **3/3 PASS** under Generational. A hard segfault (no stack — it
+    crashes before the 120s watchdog), i.e. a genuine **moving-GC memory-safety
+    bug** on a real workload — exactly the class Steps 1–6 targeted, and totally
+    masked while the run was accidentally Generational. Root-cause is a focused
+    GC-debugging follow-up (spawned task).
+  - **Checksum parity on verified G1 (G1 == Generational == HotSpot)** — both
+    low-GC and GC-stress: `fib44`=701408733, `sieve250k`=22044,
+    `matrix800`=15359906451, and crucially the heavy-evacuation
+    **`bintrees18`@8g=68332206** are byte-identical. So G1 itself does **not**
+    lose / duplicate / corrupt objects under sustained young+mixed evacuation —
+    the gpu-bench crash is a distinct memory-safety fault, not a tracing bug.
+  - **G1 heap inefficiency (not a correctness bug, but a real gap).** `bintrees16`
+    @1g and `bintrees18`@4g/@6g raise a *catchable* `OutOfMemoryError` under **G1**
+    at heaps where **Generational completes** (G1 region overhead/fragmentation
+    needs a larger `-Xmx` — `bintrees18` fits gen in 4g but needs ~8g on G1). NB
+    this is why the bogus first cut "passed" `bintrees18`@4g — that was gen; real
+    G1 cannot fit it in 4g.
+  - **App-suite no-regression on real G1**: **h2-testall-fast** PASS==PASS.
+    **hibernate-smoke** RED on **both** collectors (non-GC: ByteBuddy
+    `JavaDispatcher$DynamicClassLoader.proxy` `jsr/ret` verifier rejection, opt-out
+    `CRATONVM_ALLOW_JSR_RET=1`) — excluded, not G1. FieldStress (Step 4) stays
     4495525842000 under G1.
-  - **Method/scope**: the deterministic benches + these suites are collector-core
-    and do **not** exercise the Step 6 JNI-critical or GAP-C Panama paths, so the
-    result is Step-6-independent (Step 6 itself is covered by its unit tests +
-    the FieldStress G1 checksum). Harness (untracked, in the worktree):
-    `g1-step8-benchparity.sh` / `g1-step8-appsuites.sh` — default vs `-XX:+UseG1GC`,
-    HotSpot as ground truth; logs under `test-infra/suite-results/g1-step8-*`.
-  - **Remaining for Step 8** (the rest of the multi-session campaign, §5): the big
-    server daemons (WildFly / ES / Kafka / Spring Boot) do not yet reach *ready*
-    on the **default Generational** collector either (3 tracked **non-G1** upstream
-    bugs — non-TTY stdout SEGV/hang, ARRAY-LEN-GUARD, GC-clinit; see
-    `apps/TARGET_APPS.md`), so a G1-vs-Generational daemon boot/e2e comparison is
-    gated on those landing first. Pause-time p50/p99, throughput, and the
-    multi-hour soak under G1 are still to measure.
+  - **Throughput**: `matrix800` G1/gen = **1.05** (CV-G1 5410ms vs CV-default
+    5163ms; CV-G1 ≈ 2.6× HotSpot-G1 2069ms — the interpreter+baseline-JIT gap).
+  - **Pause-time**: NOT obtained. CratonVM's per-collection `[GC ...] pause=Nms`
+    line (`g1.rs::log_gc_event`, `tracing::info!`) is only surfaced via
+    `RUST_LOG=cratonvm_gc=info`+`--verbose:gc` and is **millisecond-granular**
+    (`as_millis()` rounds sub-ms young pauses to 0); the GC-stress benches also
+    OOM under G1 before producing a long pause series. A small enhancement
+    (microsecond + a structured/visible sink — the §7 scaffolding item 6, only
+    half-built) is the prerequisite for §5 p50/p99.
+  - Harness (untracked scratch in the worktree): `g1-step8-revalidate.sh` (now
+    GUARDS collector selection up front), `g1-step8-benchparity.sh`,
+    `g1-step8-appsuites.sh`.
+  - **Remaining for Step 8**: (1) root-cause + fix the `gpu-bench-cpu` G1 SIGSEGV
+    (blocker); (2) confirm GC-stress checksum parity on G1 at an adequate heap;
+    (3) address/quantify the G1 heap-efficiency gap; (4) the pause-logging
+    enhancement + p50/p99 + throughput; (5) the daemon boot/e2e comparison —
+    itself gated on 3 tracked **non-G1** upstream bugs that stop WildFly/ES/Kafka/
+    Spring Boot reaching *ready* even on Generational (non-TTY stdout SEGV/hang,
+    ARRAY-LEN-GUARD, GC-clinit; see `apps/TARGET_APPS.md`).
 - Steps 7, 9, 10 — not started. Step 7 (pause-target CSet sizing) is best done
-  once the daemon gauntlet yields sustained-allocation pause data.
+  once the pause-logging enhancement + daemon gauntlet yield real pause data.
 
 ---
 
