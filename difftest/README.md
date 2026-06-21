@@ -44,7 +44,13 @@ cargo build -p cratonvm-cli            # produces target/debug/cratonvm
 difftest run --corpus difftest/seeds --modes jit-on,nojit
 
 # Generate programs biased toward the bug history (Step 4).
-difftest gen --count 500 --out difftest/corpus
+difftest gen --family arith --count 500 --seed 1 --out difftest/corpus
+difftest run --corpus difftest/corpus      # then A/B them
+
+# Mutate a compiled seed's constant pool and A/B each mutant (Step 5).
+difftest mutate difftest/seeds/StringConcatIndy.java --count 50 --seed 1
+# Panic-fuzz the mutator in-process (needs nightly + cargo install cargo-fuzz):
+cargo +nightly fuzz run difftest_bytecode   # from the fuzz/ dir
 
 # Minimize a confirmed-divergent program (Step 6).
 difftest min difftest/corpus/Found_0042.java
