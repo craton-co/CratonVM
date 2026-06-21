@@ -1161,7 +1161,16 @@ fn al_set_size(ctx: &mut dyn NativeContext, this: ObjectRef, size: i32) {
 }
 
 /// Ensure the backing array has room for at least `min_cap` elements.
-fn al_ensure_capacity(ctx: &mut dyn NativeContext, this: ObjectRef, min_cap: usize) -> ObjectRef {
+/// Maximum backing-array length. Mirrors HotSpot's `ArrayList.MAX_ARRAY_SIZE`
+/// guard (a value safely below `Integer.MAX_VALUE`): a required capacity beyond
+/// this is unsatisfiable and yields `OutOfMemoryError`.
+const AL_MAX_CAPACITY: usize = 1 << 30; // ~1 billion elements
+
+fn al_ensure_capacity(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    min_cap: usize,
+) -> Result<ObjectRef, MethodCallFailed> {
     let (data, _size) = al_state(ctx, this);
     let old_cap = data.map_or(0, |d| ctx.array_length(d));
 
@@ -1169,18 +1178,34 @@ fn al_ensure_capacity(ctx: &mut dyn NativeContext, this: ObjectRef, min_cap: usi
         // `old_cap == 0` implies the backing array is None (e.g. a freshly
         // constructed list asked to ensure capacity 0). Unwrapping would
         // panic, so allocate an empty array as the None-safe fallback.
-        return data.unwrap_or_else(|| alloc_ref_array(ctx, 0));
+        return Ok(data.unwrap_or_else(|| alloc_ref_array(ctx, 0)));
+    }
+
+    // A required capacity past the max array length is unsatisfiable. HotSpot's
+    // `ArrayList.grow`/`newCapacity` throws `OutOfMemoryError` in this case; the
+    // previous code instead returned the OLD (undersized) buffer, after which the
+    // caller wrote at index `size >= old_cap` (out of bounds of the returned
+    // array — a dropped element) and still bumped `size`, leaving `size` larger
+    // than the backing array so a later `get` read uninitialized/stale storage.
+    // Throw the catchable OOM instead (same idiom as `native_al_init_capacity`).
+    if min_cap > AL_MAX_CAPACITY {
+        return Err(RuntimeError::OutOfMemoryError {
+            message: "Required array length too large".to_string(),
+        }
+        .into());
     }
 
     // Grow: max(old_cap * 1.5, min_cap) — matches Java's ArrayList strategy.
     // Use >> 1 for integer 1.5x, with minimum growth of 1 (handles old_cap == 0).
     let growth = std::cmp::max(old_cap >> 1, 1);
-    let new_cap = std::cmp::max(old_cap + growth, min_cap);
-    // Cap at a sane maximum to prevent OOM from absurd allocations.
-    const AL_MAX_CAPACITY: usize = 1 << 30; // ~1 billion elements
-    if new_cap > AL_MAX_CAPACITY {
-        return data.unwrap_or_else(|| alloc_ref_array(ctx, 0));
-    }
+    // The 1.5x preferred growth may overshoot the max even though `min_cap`
+    // itself fits (large `old_cap`). Mirror HotSpot's `hugeLength`: clamp the
+    // preferred capacity down to the satisfiable `min_cap` rather than throwing
+    // — only an out-of-range *required* capacity (handled above) is an error.
+    let new_cap = std::cmp::min(
+        std::cmp::max(old_cap.saturating_add(growth), min_cap),
+        AL_MAX_CAPACITY,
+    );
     let new_buf = alloc_ref_array(ctx, new_cap);
 
     // Copy old content. Prefer the bulk intrinsic so the VM can use
@@ -1198,7 +1223,7 @@ fn al_ensure_capacity(ctx: &mut dyn NativeContext, this: ObjectRef, min_cap: usi
     }
 
     al_set_data(ctx, this, new_buf);
-    new_buf
+    Ok(new_buf)
 }
 
 fn register_arraylist_natives(r: &mut NativeMethodRegistry) {
@@ -1446,7 +1471,7 @@ pub fn native_al_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     let elem = args.get(1).copied().unwrap_or(Value::Object(None));
     let (_, size) = al_state(ctx, this);
     let size = size as usize;
-    let buf = al_ensure_capacity(ctx, this, size + 1);
+    let buf = al_ensure_capacity(ctx, this, size + 1)?;
     ctx.set_array_element(buf, size, elem);
     al_set_size(ctx, this, (size + 1) as i32);
     Ok(Some(Value::Int(1))) // returns true
@@ -1472,7 +1497,7 @@ pub fn native_al_add_at(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         );
     }
     let index = index as usize;
-    let buf = al_ensure_capacity(ctx, this, size + 1);
+    let buf = al_ensure_capacity(ctx, this, size + 1)?;
     // Shift elements right
     for i in (index..size).rev() {
         let val = ctx.get_array_element(buf, i);
@@ -1876,7 +1901,7 @@ fn native_al_ensure_capacity(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
         Some(Value::Int(c)) => std::cmp::max(*c, 0) as usize,
         _ => return Ok(None),
     };
-    al_ensure_capacity(ctx, this, min_cap);
+    al_ensure_capacity(ctx, this, min_cap)?;
     Ok(None)
 }
 
@@ -1947,7 +1972,7 @@ fn native_al_add_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     if let (Some(other_data), true) = (other_data, other_size > 0) {
         let (_, my_size) = al_state(ctx, this);
         let my_size = my_size as usize;
-        let buf = al_ensure_capacity(ctx, this, my_size + other_size);
+        let buf = al_ensure_capacity(ctx, this, my_size + other_size)?;
         if !ctx.bulk_array_copy(other_data, 0, buf, my_size, other_size) {
             for i in 0..other_size {
                 let val = ctx.get_array_element(other_data, i);
@@ -1978,7 +2003,7 @@ fn native_al_add_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     }
     let (_, my_size) = al_state(ctx, this);
     let my_size = my_size as usize;
-    let buf = al_ensure_capacity(ctx, this, my_size + elems.len());
+    let buf = al_ensure_capacity(ctx, this, my_size + elems.len())?;
     for (i, val) in elems.iter().enumerate() {
         ctx.set_array_element(buf, my_size + i, *val);
     }
