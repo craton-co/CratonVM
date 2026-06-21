@@ -1463,9 +1463,23 @@ fn verify_ldc(
             name_and_type_index,
             ..
         }) => {
-            // Dynamic constant — resolve type from NameAndType
+            // Dynamic constant — resolve type from NameAndType.
             if let Some((_, descriptor)) = cp.get_name_and_type(*name_and_type_index) {
                 let vtype = VType::from_field_descriptor(descriptor);
+                // SPEC-COMPLIANCE FIX (MED): `ldc` (and `ldc_w`) load a
+                // *category-1* value only — JVMS §6.5 ldc requires the
+                // referenced entry to NOT be `long`/`double`. A Dynamic
+                // constant whose declared type is category-2 must be loaded
+                // with `ldc2_w`; accepting it under `ldc` would push the
+                // `Long`/`Double` base WITHOUT its paired `Top` upper half,
+                // corrupting the verifier's category-2 slot model (every
+                // subsequent stack offset would be off by one). Reject it.
+                if vtype.is_category2() {
+                    return Err(verify_err(
+                        "ldc: Dynamic constant has a category-2 type (long/double); \
+                         ldc loads category-1 only — use ldc2_w",
+                    ));
+                }
                 frame.push(vtype)?;
             } else {
                 return Err(verify_err("ldc: invalid Dynamic constant pool entry"));
@@ -1480,7 +1494,7 @@ fn verify_ldc(
     ok_through()
 }
 
-/// Verify ldc2_w: push Long or Double.
+/// Verify ldc2_w: push Long or Double (the category-2 forms).
 fn verify_ldc2w(
     frame: &mut VerificationFrame,
     cp: &ConstantPool,
@@ -1494,6 +1508,34 @@ fn verify_ldc2w(
         Some(ConstantPoolEntry::Double(_)) => {
             frame.push(VType::Double)?;
             frame.push(VType::Top)?;
+        }
+        Some(ConstantPoolEntry::Dynamic {
+            name_and_type_index,
+            ..
+        }) => {
+            // SPEC-COMPLIANCE FIX (MED): `ldc2_w` is the category-2 loader and
+            // since Java 11 may reference a Dynamic constant whose resolved
+            // type is `long`/`double` (JVMS §6.5 ldc2_w). Push the base plus
+            // its paired `Top` upper half so the category-2 slot model stays
+            // consistent. A category-1 Dynamic constant under `ldc2_w` is
+            // ill-formed (it belongs under `ldc`) — reject it.
+            let descriptor = cp.get_name_and_type(*name_and_type_index).map(|(_, d)| d);
+            match descriptor {
+                Some(d) => {
+                    let vtype = VType::from_field_descriptor(d);
+                    if !vtype.is_category2() {
+                        return Err(verify_err(
+                            "ldc2_w: Dynamic constant has a category-1 type; \
+                             ldc2_w loads category-2 (long/double) only — use ldc",
+                        ));
+                    }
+                    frame.push(vtype)?;
+                    frame.push(VType::Top)?;
+                }
+                None => {
+                    return Err(verify_err("ldc2_w: invalid Dynamic constant pool entry"));
+                }
+            }
         }
         _ => {
             return Err(verify_err(&format!(
@@ -1840,6 +1882,133 @@ mod tests {
             frame.pop().unwrap(),
             VType::ObjectRef(Arc::from("java/lang/String"))
         );
+    }
+
+    /// Constant pool with two Dynamic constants for the ldc/ldc2_w
+    /// category tests: index #3 is a category-1 Dynamic (`I`), index #6 is
+    /// a category-2 Dynamic (`J`).
+    fn dynamic_cp() -> ConstantPool {
+        ConstantPool::new(vec![
+            ConstantPoolEntry::Tombstone,            // 0
+            ConstantPoolEntry::Utf8("d".into()),     // 1
+            ConstantPoolEntry::Utf8("I".into()),     // 2 (category-1 descriptor)
+            ConstantPoolEntry::NameAndType {
+                name_index: 1,
+                descriptor_index: 2,
+            }, // 3 (NameAndType for cat-1)
+            ConstantPoolEntry::Dynamic {
+                bootstrap_method_attr_index: 0,
+                name_and_type_index: 3,
+            }, // 4 (category-1 Dynamic)
+            ConstantPoolEntry::Utf8("J".into()),     // 5 (category-2 descriptor)
+            ConstantPoolEntry::NameAndType {
+                name_index: 1,
+                descriptor_index: 5,
+            }, // 6 (NameAndType for cat-2)
+            ConstantPoolEntry::Dynamic {
+                bootstrap_method_attr_index: 0,
+                name_and_type_index: 6,
+            }, // 7 (category-2 Dynamic)
+        ])
+    }
+
+    #[test]
+    fn ldc_of_category2_dynamic_is_rejected() {
+        // SPEC-COMPLIANCE FIX (MED): `ldc` of a Dynamic constant whose type
+        // is category-2 (long/double) must be rejected — pushing it without
+        // the paired `Top` would corrupt the verifier stack model.
+        let cp = dynamic_cp();
+        let h = MockHierarchy;
+        let mut frame = make_frame(1, 4);
+
+        let res = verify_instruction(
+            &Instruction::Ldc(7), // category-2 Dynamic
+            0,
+            &mut frame,
+            &cp,
+            "Test",
+            "test",
+            "()V",
+            &h,
+        );
+        assert!(
+            res.is_err(),
+            "ldc of a category-2 Dynamic constant must be rejected, got {res:?}"
+        );
+        // The frame must be untouched on rejection (no half-pushed cat-2).
+        assert_eq!(frame.stack_depth(), 0);
+    }
+
+    #[test]
+    fn ldc_of_category1_dynamic_is_accepted() {
+        // A category-1 Dynamic constant is the legal `ldc` case: pushes a
+        // single slot, no Top.
+        let cp = dynamic_cp();
+        let h = MockHierarchy;
+        let mut frame = make_frame(1, 4);
+
+        verify_instruction(
+            &Instruction::Ldc(4), // category-1 Dynamic (`I`)
+            0,
+            &mut frame,
+            &cp,
+            "Test",
+            "test",
+            "()V",
+            &h,
+        )
+        .expect("ldc of a category-1 Dynamic must verify");
+        assert_eq!(frame.stack_depth(), 1);
+        assert_eq!(frame.pop().unwrap(), VType::Int);
+    }
+
+    #[test]
+    fn ldc2w_of_category2_dynamic_pushes_top_slot() {
+        // `ldc2_w` is the correct loader for a category-2 Dynamic constant:
+        // it must push the Long/Double base plus its paired Top upper half.
+        let cp = dynamic_cp();
+        let h = MockHierarchy;
+        let mut frame = make_frame(1, 4);
+
+        verify_instruction(
+            &Instruction::Ldc2W(7), // category-2 Dynamic (`J`)
+            0,
+            &mut frame,
+            &cp,
+            "Test",
+            "test",
+            "()V",
+            &h,
+        )
+        .expect("ldc2_w of a category-2 Dynamic must verify");
+        assert_eq!(frame.stack_depth(), 2);
+        assert_eq!(frame.pop().unwrap(), VType::Top);
+        assert_eq!(frame.pop().unwrap(), VType::Long);
+    }
+
+    #[test]
+    fn ldc2w_of_category1_dynamic_is_rejected() {
+        // A category-1 Dynamic under `ldc2_w` is ill-formed (belongs under
+        // `ldc`) and must be rejected.
+        let cp = dynamic_cp();
+        let h = MockHierarchy;
+        let mut frame = make_frame(1, 4);
+
+        let res = verify_instruction(
+            &Instruction::Ldc2W(4), // category-1 Dynamic (`I`)
+            0,
+            &mut frame,
+            &cp,
+            "Test",
+            "test",
+            "()V",
+            &h,
+        );
+        assert!(
+            res.is_err(),
+            "ldc2_w of a category-1 Dynamic constant must be rejected, got {res:?}"
+        );
+        assert_eq!(frame.stack_depth(), 0);
     }
 
     #[test]

@@ -35,18 +35,26 @@
 //! handler. ByteBuddy 1.12 (compiled `--release 5`) ships several
 //! `TypePool$AbstractBase$Hierarchical.clear` is one example.
 //!
-//! Per JVMS §4.10.2 the type-inference verifier "MAY be lenient" on
-//! pre-Java-7 class files. HotSpot's hand-written subroutine-inlining
-//! verifier handles these correctly; reproducing it here is non-trivial
-//! (~1k LOC of bytecode rewriting). Until that work lands, we relax
-//! Pass 3 for methods that contain `jsr` / `jsr_w` / `ret`: we still
-//! perform a *structural* sanity scan (every instruction decodes; every
-//! branch target lies inside the bytecode array; every exception handler
-//! range is well-formed) but we skip the type-state worklist that would
-//! otherwise reject the legitimate post-merge `astore`.
+//! HotSpot's hand-written subroutine-inlining verifier handles these
+//! correctly; reproducing it here is non-trivial (~1k LOC of bytecode
+//! rewriting). Until that work lands, a method that contains
+//! `jsr` / `jsr_w` / `ret` cannot be type-state-verified by our worklist
+//! verifier at all.
+//!
+//! **SECURITY FIX (HIGH).** The previous behaviour routed such methods to
+//! a *structural-only* fallback: it decoded instructions and checked
+//! branch/handler bounds but performed **no** operand-stack / local
+//! type-state verification, then accepted the method. A permissive
+//! verifier is a memory-safety hole — unverified bytecode would reach the
+//! interpreter/JIT with no type-consistency guarantee. We now **reject**
+//! by default: the structural sanity scan still runs (so malformed
+//! bytecode is still caught), but the type-verification bypass is a hard
+//! `VerifyError` rather than silent acceptance. The legacy structural-only
+//! acceptance remains available behind the `CRATONVM_ALLOW_JSR_RET` opt-in
+//! escape hatch (see [`allow_jsr_ret`]).
 //!
 //! Methods that do **not** use subroutines are verified strictly via the
-//! existing `bytecode_verifier::verify_bytecode` path, so the relaxation
+//! existing `bytecode_verifier::verify_bytecode` path, so the rejection
 //! is bounded to the exact set of methods that the worklist verifier
 //! cannot model. Java 7+ classes (which never emit `jsr`/`ret` and are
 //! required to ship `StackMapTable`) are unaffected — the fast path
@@ -54,10 +62,11 @@
 
 #[cfg(test)]
 use std::sync::Arc;
+use std::sync::OnceLock;
 
 use cratonvm_reader::class_access_flags::{ClassAccessFlags, MethodAccessFlags};
 use cratonvm_reader::class_file_version::ClassFileVersion;
-use cratonvm_reader::constant_pool::ConstantPool;
+use cratonvm_reader::constant_pool::{ConstantPool, ConstantPoolEntry};
 use cratonvm_reader::instruction::Instruction;
 use cratonvm_reader::method::ClassFileMethod;
 use cratonvm_reader::stack_map::StackMapTable;
@@ -65,7 +74,7 @@ use cratonvm_reader::stack_map::StackMapTable;
 use super::class::{find_method_recursive, Class, ClassStore};
 use super::verify_frame::VerificationFrame;
 use super::verify_insn::verify_instruction;
-use super::vtype::{ClassHierarchy, VType};
+use super::vtype::{param_types_from_descriptor, ClassHierarchy, VType};
 use cratonvm_types::error::LinkageError;
 
 /// Verify a class: structural (Pass 2) + bytecode (Pass 3).
@@ -88,27 +97,80 @@ pub fn verify_class(
 /// anywhere in the class) delegates to
 /// [`super::bytecode_verifier::verify_bytecode`] verbatim. Otherwise,
 /// each method is verified individually:
-///   * methods using subroutines → structural-only fallback (no
-///     type-state worklist, since our worklist verifier collapses two
-///     distinct `ReturnAddress` values into `Top` at the subroutine
-///     entry, which the spec-compliant inlining verifier would not);
+///   * methods using subroutines → structural sanity scan, then a hard
+///     `VerifyError` (SECURITY FIX HIGH), because our worklist verifier
+///     collapses two distinct `ReturnAddress` values into `Top` at the
+///     subroutine entry and so cannot type-check them — accepting them
+///     unverified is a memory-safety hole. The legacy structural-only
+///     acceptance is available behind the `CRATONVM_ALLOW_JSR_RET`
+///     escape hatch (see [`allow_jsr_ret`]);
 ///   * everything else → the same per-method type-state algorithm that
 ///     `bytecode_verifier::verify_bytecode` runs (StackMapTable-driven
 ///     for Java 7+, worklist-based for Java 6 and earlier).
 ///
-/// The per-method routing is what isolates the relaxation: a non-JSR
+/// The per-method routing is what isolates the rejection: a non-JSR
 /// method in the same class as a JSR method is still strictly
 /// type-state-verified, so a real bug in the non-JSR method will not
-/// be masked by the tolerated failure in the JSR method.
+/// be masked by the rejection of the JSR method.
 ///
 /// This is the JSR-aware Pass 3 entry point; consumers that previously
 /// called [`super::bytecode_verifier::verify_bytecode`] should call
 /// this function instead for any class that may legitimately contain
 /// pre-Java-7 subroutine bytecode (every classpath class with major
 /// version ≤ 50 qualifies).
+/// Cached verdict for the `CRATONVM_ALLOW_JSR_RET` escape hatch.
+///
+/// SECURITY FIX (HIGH): pre-Java-7 methods that use `jsr` / `jsr_w` / `ret`
+/// cannot be type-state-verified by our worklist verifier (it collapses the
+/// two distinct `ReturnAddress` values at a shared subroutine entry into
+/// `Top`; see the module-level docs). The previous behaviour routed such
+/// methods to a *structural-only* fallback that decoded instructions and
+/// checked branch/handler bounds but performed **no** operand-stack / local
+/// type-state verification. A permissive verifier is a memory-safety hole:
+/// unverified bytecode reaches the interpreter/JIT with no guarantee that the
+/// operand stack and locals are type-consistent.
+///
+/// The safe default is therefore to **reject** any class whose method uses a
+/// subroutine opcode (VerifyError-equivalent) rather than silently accept it
+/// unverified. The full §4.10.2.5 subroutine-inlining verifier is non-trivial
+/// (~1k LOC of bytecode rewriting) and not yet implemented, so until it lands
+/// the structural decode/bounds checks still run (to surface malformed
+/// bytecode) but the type-verification bypass is a hard rejection.
+///
+/// Setting `CRATONVM_ALLOW_JSR_RET` to a non-empty, non-`"0"` value opts back
+/// into the legacy structural-only acceptance for environments that must load
+/// legacy pre-Java-7 jars and accept the reduced verification guarantee. Off
+/// by default. Read once at process start (the env can't change mid-run),
+/// mirroring the `OnceLock` pattern used elsewhere in this crate.
+static ALLOW_JSR_RET: OnceLock<bool> = OnceLock::new();
+
+/// `true` when `CRATONVM_ALLOW_JSR_RET` is set to a non-empty, non-`"0"`
+/// value. Computed once and cached for the process lifetime. See
+/// [`ALLOW_JSR_RET`].
+fn allow_jsr_ret() -> bool {
+    *ALLOW_JSR_RET.get_or_init(|| {
+        std::env::var("CRATONVM_ALLOW_JSR_RET")
+            .map(|v| v != "0" && !v.is_empty())
+            .unwrap_or(false)
+    })
+}
+
 pub fn verify_class_bytecode(
     class: &Class,
     hierarchy: &dyn ClassHierarchy,
+) -> Result<(), LinkageError> {
+    // The JSR/RET escape-hatch verdict is read once from the environment
+    // (`CRATONVM_ALLOW_JSR_RET`); `false` (the default) means subroutine-using
+    // methods are rejected after their structural scan. Threaded through the
+    // inner function so tests can exercise both policies deterministically
+    // without depending on the process-wide `OnceLock`.
+    verify_class_bytecode_inner(class, hierarchy, allow_jsr_ret())
+}
+
+fn verify_class_bytecode_inner(
+    class: &Class,
+    hierarchy: &dyn ClassHierarchy,
+    allow_jsr: bool,
 ) -> Result<(), LinkageError> {
     // Identify methods that use subroutines (jsr / jsr_w / ret). The scan
     // is opcode-only; we do not need to fully decode the bytecode to
@@ -149,12 +211,30 @@ pub fn verify_class_bytecode(
             continue;
         }
         if method_uses_jsr_or_ret(method) {
-            // Subroutine-using method: structural sanity only. JVMS
-            // §4.10.2 explicitly says the type-inference verifier MAY
-            // be lenient, and our worklist implementation does not
-            // perform the subroutine inlining that §4.10.2.5 requires
-            // for these methods.
+            // SECURITY FIX (HIGH): subroutine-using method. We still run the
+            // structural sanity scan first so malformed bytecode (truncated
+            // instructions, out-of-range jumps, ill-formed handler ranges) is
+            // rejected exactly as before. We then make the *type-verification
+            // bypass* a hard rejection: our worklist verifier cannot model the
+            // §4.10.2.5 subroutine-inlining rules, so accepting these methods
+            // would let unverified bytecode through — a memory-safety hole.
+            //
+            // The legacy structural-only acceptance is available behind the
+            // `CRATONVM_ALLOW_JSR_RET` opt-in escape hatch for callers that
+            // must load legacy pre-Java-7 jars and accept the reduced
+            // guarantee; the default is to reject.
             verify_method_structural_only(class, method)?;
+            if !allow_jsr {
+                return Err(LinkageError::VerifyError {
+                    class_name: class.name.to_string(),
+                    method_name: method.name.to_string(),
+                    message: "method uses jsr/jsr_w/ret subroutine opcodes, which cannot be \
+                              type-checked by this verifier; refusing to load it unverified \
+                              (set CRATONVM_ALLOW_JSR_RET=1 to opt into legacy structural-only \
+                              acceptance)"
+                        .to_string(),
+                });
+            }
         } else {
             // Non-subroutine method: full type-state verification.
             // Performs the same algorithm as
@@ -329,6 +409,14 @@ fn verify_method_typestate(
         handler_targets.insert(entry.handler_pc, catch);
     }
 
+    // SPEC-COMPLIANCE FIX (MED): map each `new` bytecode offset to the class
+    // it creates, so `invokespecial <init>` can enforce the JVMS §4.10.1.9
+    // owner-match (the `new`-site type must equal the constructor's owner).
+    // `VType::Uninitialized(offset)` carries only the offset, so this side
+    // table supplies the class name the type-state pass otherwise lacks.
+    let mut new_site_classes: std::collections::HashMap<u16, std::sync::Arc<str>> =
+        std::collections::HashMap::new();
+
     let mut pc = 0usize;
     let mut current = initial;
     let mut verified = true;
@@ -398,6 +486,24 @@ fn verify_method_typestate(
                 method_name: method.name.to_string(),
                 message: format!("failed to decode instruction at offset {pc}: {e}"),
             })?;
+
+        // Record the class created by a `new` so a later `invokespecial
+        // <init>` on the resulting `Uninitialized(pc)` can be owner-matched.
+        if let Instruction::New(idx) = &insn {
+            if let Some(created) = cp.get_class_name_arc(*idx) {
+                new_site_classes.insert(pc as u16, created);
+            }
+        }
+        // SPEC-COMPLIANCE FIX (MED): owner-match for `invokespecial <init>`
+        // before the receiver is consumed (JVMS §4.10.1.9).
+        check_new_init_owner_match(
+            &insn,
+            &current,
+            cp,
+            &new_site_classes,
+            class_name,
+            &method.name,
+        )?;
 
         let result = verify_instruction(
             &insn,
@@ -496,6 +602,14 @@ fn verify_pre_java7_inference(
     let mut enqueued: std::collections::HashSet<usize> = std::collections::HashSet::new();
     enqueued.insert(0);
 
+    // SPEC-COMPLIANCE FIX (MED): `new`-offset → created-class side table for
+    // the `invokespecial <init>` owner-match (JVMS §4.10.1.9). Accumulated
+    // across the worklist run; an `Uninitialized(offset)` receiver can only
+    // reach an `<init>` after the dominating `new` at `offset` was decoded, so
+    // the entry is present by the time the check runs.
+    let mut new_site_classes: std::collections::HashMap<u16, std::sync::Arc<str>> =
+        std::collections::HashMap::new();
+
     let max_iterations = bytecode.len().saturating_mul(4).max(256);
     let mut iterations = 0usize;
 
@@ -524,6 +638,24 @@ fn verify_pre_java7_inference(
                 method_name: method.name.to_string(),
                 message: format!("failed to decode instruction at offset {pc}: {e}"),
             })?;
+
+        // Record the class created by a `new` so a later `invokespecial
+        // <init>` on the resulting `Uninitialized(pc)` can be owner-matched.
+        if let Instruction::New(idx) = &insn {
+            if let Some(created) = cp.get_class_name_arc(*idx) {
+                new_site_classes.insert(pc as u16, created);
+            }
+        }
+        // SPEC-COMPLIANCE FIX (MED): owner-match for `invokespecial <init>`
+        // before the receiver is consumed (JVMS §4.10.1.9).
+        check_new_init_owner_match(
+            &insn,
+            &current,
+            cp,
+            &new_site_classes,
+            class_name,
+            &method.name,
+        )?;
 
         let result = verify_instruction(
             &insn,
@@ -920,6 +1052,112 @@ fn instruction_branch_targets(insn: &Instruction, pc: usize) -> Vec<u16> {
         // is dynamic, not encoded in the instruction. Not checked here.
         _ => Vec::new(),
     }
+}
+
+/// Resolve the owner class, method name, and descriptor of a `Methodref` /
+/// `InterfaceMethodref` constant-pool entry referenced by an
+/// `invokespecial`/`invoke*` index.
+///
+/// Returns `Some((owner_class_name, method_name, descriptor))` when the index
+/// names a (interface-)method reference whose owner and `NameAndType` both
+/// resolve. Used by [`check_new_init_owner_match`] to recover the
+/// constructor's declaring class and arity for the JVMS §4.10.1.9
+/// owner-match check.
+fn resolve_invoked_owner_and_name(
+    cp: &ConstantPool,
+    index: u16,
+) -> Option<(std::sync::Arc<str>, std::sync::Arc<str>, std::sync::Arc<str>)> {
+    let (class_index, name_and_type_index) = match cp.get(index)? {
+        ConstantPoolEntry::MethodReference {
+            class_index,
+            name_and_type_index,
+        }
+        | ConstantPoolEntry::InterfaceMethodReference {
+            class_index,
+            name_and_type_index,
+        } => (*class_index, *name_and_type_index),
+        _ => return None,
+    };
+    let owner = cp.get_class_name_arc(class_index)?;
+    let (name, desc) = cp.get_name_and_type(name_and_type_index)?;
+    Some((owner, std::sync::Arc::from(name), std::sync::Arc::from(desc)))
+}
+
+/// JVMS §4.10.1.9 owner-match check for `invokespecial <init>`.
+///
+/// When `insn` is an `invokespecial` of an `<init>` whose receiver (after the
+/// constructor arguments are accounted for) is an `Uninitialized(offset)`
+/// value, the type created by the `new` at `offset` must be the *same class*
+/// as the constructor's declaring class. The plain type-state pass cannot
+/// enforce this on its own because `VType::Uninitialized(offset)` carries only
+/// the bytecode offset, not the class name — so we thread `new_site_classes`
+/// (populated when each `new` instruction is decoded) and compare here.
+///
+/// This runs **before** `verify_instruction` consumes the frame, reading the
+/// receiver non-destructively from `frame.stack`. The receiver sits just below
+/// the constructor's argument slots, so we skip exactly the argument width
+/// (category-2 args occupy two slots) to find it.
+///
+/// A mismatch (`new C; ... ; invokespecial D.<init>` with `C != D`) is a
+/// `VerifyError`; the `new`-site type and the constructor owner disagree, which
+/// would let a constructor run against the wrong uninitialized object shape.
+/// `UninitializedThis` receivers are handled by `verify_instruction` itself
+/// (the current-class / superclass check) and are ignored here.
+fn check_new_init_owner_match(
+    insn: &Instruction,
+    frame: &VerificationFrame,
+    cp: &ConstantPool,
+    new_site_classes: &std::collections::HashMap<u16, std::sync::Arc<str>>,
+    class_name: &str,
+    method_name: &str,
+) -> Result<(), LinkageError> {
+    let index = match insn {
+        Instruction::Invokespecial(index) => *index,
+        _ => return Ok(()),
+    };
+    let (owner, invoked_name, descriptor) = match resolve_invoked_owner_and_name(cp, index) {
+        Some(triple) => triple,
+        None => return Ok(()), // unresolved ref — verify_instruction reports it
+    };
+    if &*invoked_name != "<init>" {
+        return Ok(());
+    }
+
+    // Count the operand-stack slots the constructor arguments occupy so we can
+    // index past them to the receiver. Category-2 params take two slots.
+    let arg_slots: usize = param_types_from_descriptor(&descriptor)
+        .iter()
+        .map(|t| if t.is_category2() { 2 } else { 1 })
+        .sum();
+
+    // Receiver is the slot directly beneath the argument slots. If the stack
+    // is too shallow, the type-state pass will report the underflow — bail.
+    let depth = frame.stack.len();
+    if depth < arg_slots + 1 {
+        return Ok(());
+    }
+    let receiver = &frame.stack[depth - arg_slots - 1];
+
+    if let VType::Uninitialized(offset) = receiver {
+        // Look up the class created by the `new` at `offset`. If we never saw
+        // the `new` (e.g. the uninitialized value arrived via a declared
+        // StackMapTable frame rather than a decoded `new`), we can't compare —
+        // skip rather than risk a false rejection.
+        if let Some(new_class) = new_site_classes.get(offset) {
+            if **new_class != *owner {
+                return Err(LinkageError::VerifyError {
+                    class_name: class_name.to_string(),
+                    method_name: method_name.to_string(),
+                    message: format!(
+                        "invokespecial <init>: constructor owner {owner} does not match \
+                         the type {new_class} created by `new` at offset {offset} \
+                         (JVMS §4.10.1.9)"
+                    ),
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 /// True if `version` predates StackMapTable (Java 6 and earlier).
@@ -1868,13 +2106,16 @@ mod tests {
         }
     }
 
-    /// F3 acceptance: a synthetic method that mirrors the
+    /// SECURITY FIX (HIGH): a synthetic method that mirrors the
     /// `TypePool$AbstractBase$Hierarchical.clear` shape from
     /// ByteBuddy 1.12.12 — two distinct `jsr` call sites that target
-    /// the same subroutine, where the worklist verifier would merge
-    /// `ReturnAddress(3)` and `ReturnAddress(6)` into `Top` and reject
-    /// the subroutine's leading `astore_0`. With the JSR-aware
-    /// relaxation this method must verify cleanly.
+    /// the same subroutine. Our worklist verifier cannot type-check it
+    /// (it merges `ReturnAddress(3)` and `ReturnAddress(6)` into `Top`),
+    /// so the default policy must **reject** it (refuse to load it
+    /// unverified) rather than silently accept it via the structural-only
+    /// fallback. The legacy structural-only acceptance is still reachable
+    /// through the `CRATONVM_ALLOW_JSR_RET` escape hatch, modelled here by
+    /// the `allow_jsr = true` branch.
     ///
     /// Bytecode:
     /// ```text
@@ -1886,11 +2127,8 @@ mod tests {
     ///   9: astore_0     ← subroutine entry: store the merged returnAddress
     ///  10: ret 0        ← return via the stored address
     /// ```
-    ///
-    /// Without the fix this method would be rejected with
-    /// `astore: expected reference, found Top`.
     #[test]
-    fn jsr_double_call_site_to_same_subroutine_is_accepted() {
+    fn jsr_double_call_site_rejected_by_default_accepted_with_escape_hatch() {
         let class = make_pre_java7_jsr_class(
             "clear",
             "()V",
@@ -1906,11 +2144,20 @@ mod tests {
             ],
             vec![],
         );
-        let res = verify_class_bytecode(&class, &PermissiveHierarchy);
+        // Default policy (escape hatch off): structurally well-formed, but
+        // the subroutine opcodes can't be type-checked → hard rejection.
+        let rejected = verify_class_bytecode_inner(&class, &PermissiveHierarchy, false);
         assert!(
-            res.is_ok(),
-            "two-jsr-to-one-subroutine pattern (ByteBuddy clear() shape) \
-             must be accepted by the JSR-aware Pass 3 path, got {res:?}"
+            rejected.is_err(),
+            "subroutine-using method must be rejected by default (no unverified \
+             acceptance via structural-only fallback), got {rejected:?}"
+        );
+        // Escape hatch on: legacy structural-only acceptance.
+        let accepted = verify_class_bytecode_inner(&class, &PermissiveHierarchy, true);
+        assert!(
+            accepted.is_ok(),
+            "with CRATONVM_ALLOW_JSR_RET the structurally-valid subroutine method \
+             must be accepted (structural-only), got {accepted:?}"
         );
     }
 
@@ -1950,7 +2197,7 @@ mod tests {
     /// in real bytecode would be the `try { parent.clear() } catch (any)`
     /// shape that the Java 5 javac emits for `try-finally`.
     #[test]
-    fn jsr_finally_handler_double_call_site_is_accepted() {
+    fn jsr_finally_handler_double_call_site_rejected_by_default_accepted_with_escape_hatch() {
         // Build the bytecode array first so we can reference precise
         // offsets in the exception table without juggling magic numbers.
         let code: Vec<u8> = vec![
@@ -1987,19 +2234,29 @@ mod tests {
             },
         ];
         let class = make_pre_java7_jsr_class("clear", "()V", 1, 3, code, exc);
-        let res = verify_class_bytecode(&class, &PermissiveHierarchy);
+        // Default: refuse to load the unverifiable subroutine method.
+        let rejected = verify_class_bytecode_inner(&class, &PermissiveHierarchy, false);
         assert!(
-            res.is_ok(),
+            rejected.is_err(),
             "ByteBuddy clear()-shape (try-finally with double-jsr to one \
-             subroutine, including a catch-any that re-jsr's into the \
-             finally body) must verify cleanly, got {res:?}"
+             subroutine) must be rejected by default, got {rejected:?}"
+        );
+        // Escape hatch: legacy structural-only acceptance.
+        let accepted = verify_class_bytecode_inner(&class, &PermissiveHierarchy, true);
+        assert!(
+            accepted.is_ok(),
+            "with CRATONVM_ALLOW_JSR_RET the structurally-valid clear()-shape \
+             must be accepted (structural-only), got {accepted:?}"
         );
     }
 
     /// Sanity: structural validation still rejects malformed bytecode
     /// in JSR-using methods. A `jsr` whose 16-bit offset points past
     /// the end of the bytecode array is rejected by the structural
-    /// fallback, even though the type-state pass is skipped.
+    /// fallback. Exercised with the escape hatch ON so the failure is
+    /// attributable to the structural pass and not to the default
+    /// subroutine rejection — the structural scan must still run (and
+    /// reject) even when JSR methods are tolerated.
     #[test]
     fn jsr_with_out_of_range_target_is_rejected() {
         let class = make_pre_java7_jsr_class(
@@ -2013,11 +2270,11 @@ mod tests {
             ],
             vec![],
         );
-        let res = verify_class_bytecode(&class, &PermissiveHierarchy);
+        let res = verify_class_bytecode_inner(&class, &PermissiveHierarchy, true);
         assert!(
             res.is_err(),
-            "out-of-range jsr target must still be rejected by structural pass, \
-             got {res:?}"
+            "out-of-range jsr target must still be rejected by structural pass \
+             even with the escape hatch on, got {res:?}"
         );
     }
 
@@ -2043,17 +2300,13 @@ mod tests {
         );
     }
 
-    /// Sanity: when a *failing* JSR method (one whose worklist
-    /// verification trips on the merge-of-returnAddresses bug)
-    /// appears BEFORE a non-JSR method with a type-state bug, both
-    /// problems must be classified correctly: the JSR failure is
-    /// tolerated, then the non-JSR failure must be re-detected.
-    ///
-    /// Without per-method iteration, the whole-class verifier surfaces
-    /// only the first error (the JSR one) — we tolerate it and never
-    /// see the non-JSR one. The retry loop in `verify_class_bytecode`
-    /// must re-run after tolerating the JSR method to surface the
-    /// non-JSR problem.
+    /// Sanity: when a JSR method (tolerated under the escape hatch)
+    /// appears BEFORE a non-JSR method with a type-state bug, the
+    /// non-JSR failure must still be re-detected — tolerating the JSR
+    /// method must not short-circuit verification of the rest of the
+    /// class. Exercised with the escape hatch ON so the JSR method is
+    /// accepted (structural-only) rather than triggering the default
+    /// rejection, isolating the non-JSR bug as the cause of failure.
     #[test]
     fn failing_jsr_method_does_not_mask_later_real_bug() {
         // Build the ByteBuddy clear() shape (which fails the worklist
@@ -2086,20 +2339,20 @@ mod tests {
                 attributes: vec![],
             }))],
         });
-        let res = verify_class_bytecode(&class, &PermissiveHierarchy);
+        let res = verify_class_bytecode_inner(&class, &PermissiveHierarchy, true);
         assert!(
             res.is_err(),
-            "non-JSR type-state bug must be detected even when a failing \
+            "non-JSR type-state bug must be detected even when a tolerated \
              JSR method precedes it, got {res:?}"
         );
     }
 
-    /// Sanity: when a JSR method appears BEFORE a non-JSR method with a
-    /// type-state bug (stack underflow), the non-JSR method's bug must
-    /// still be caught. The whole-class verifier walks methods in
-    /// declaration order, so without iteration logic that re-runs after
-    /// each tolerated JSR failure, the second method's bug would be
-    /// missed.
+    /// Sanity: when a JSR method (tolerated under the escape hatch)
+    /// appears BEFORE a non-JSR method with a type-state bug (stack
+    /// underflow), the non-JSR method's bug must still be caught.
+    /// Exercised with the escape hatch ON: the JSR method is accepted
+    /// structurally, so the failure can only come from the non-JSR bug —
+    /// proving the per-method routing still type-state-verifies siblings.
     #[test]
     fn type_state_bug_after_jsr_method_still_detected() {
         let mut class = make_pre_java7_jsr_class(
@@ -2130,7 +2383,7 @@ mod tests {
                 attributes: vec![],
             }))],
         });
-        let res = verify_class_bytecode(&class, &PermissiveHierarchy);
+        let res = verify_class_bytecode_inner(&class, &PermissiveHierarchy, true);
         assert!(
             res.is_err(),
             "type-state bug in non-JSR method must be caught even when a \
@@ -2139,10 +2392,12 @@ mod tests {
     }
 
     /// Sanity: a class with a mix of JSR-using and non-JSR methods
-    /// applies the relaxation only to the JSR ones. The non-JSR method
-    /// here is malformed (truncated bytecode for `getstatic`) and must
-    /// be rejected even though another method in the same class uses
-    /// `jsr`.
+    /// applies the structural-only tolerance only to the JSR ones (under
+    /// the escape hatch). The non-JSR method here is malformed (truncated
+    /// bytecode for `getstatic`) and must be rejected even though another
+    /// method in the same class uses `jsr`. Exercised with the escape
+    /// hatch ON so the failure is attributable to the malformed non-JSR
+    /// method, not the default subroutine rejection.
     #[test]
     fn mixed_jsr_and_non_jsr_methods_isolate_relaxation() {
         let mut class = make_pre_java7_jsr_class(
@@ -2174,12 +2429,50 @@ mod tests {
                 attributes: vec![],
             }))],
         });
-        let res = verify_class_bytecode(&class, &PermissiveHierarchy);
+        let res = verify_class_bytecode_inner(&class, &PermissiveHierarchy, true);
         assert!(
             res.is_err(),
             "malformed non-JSR method in a mixed class must still be rejected, \
              got {res:?}"
         );
+    }
+
+    /// SECURITY FIX (HIGH): the default-policy rejection of a
+    /// subroutine-using method must surface as a `VerifyError` whose
+    /// message names the `jsr/jsr_w/ret` cause and the
+    /// `CRATONVM_ALLOW_JSR_RET` escape hatch, so the refusal is
+    /// diagnosable rather than an opaque failure.
+    #[test]
+    fn jsr_default_rejection_is_a_verify_error_with_diagnostic() {
+        let class = make_pre_java7_jsr_class(
+            "clear",
+            "()V",
+            1,
+            1,
+            vec![
+                0xa8, 0x00, 0x06, // 0: jsr +6 → 6
+                0xb1, // 3: return
+                0x00, 0x00, // 4..5: pad
+                0x4b, // 6: astore_0
+                0xa9, 0x00, // 7: ret 0
+            ],
+            vec![],
+        );
+        match verify_class_bytecode_inner(&class, &PermissiveHierarchy, false) {
+            Err(LinkageError::VerifyError {
+                method_name,
+                message,
+                ..
+            }) => {
+                assert_eq!(method_name, "clear");
+                assert!(
+                    message.contains("jsr") && message.contains("CRATONVM_ALLOW_JSR_RET"),
+                    "rejection message must name the jsr/ret cause and the escape \
+                     hatch, got: {message}"
+                );
+            }
+            other => panic!("expected VerifyError for default jsr rejection, got {other:?}"),
+        }
     }
 
     /// Sanity: the JSR scanner must not be fooled by a `tableswitch`
@@ -2249,5 +2542,187 @@ mod tests {
         assert!(!is_pre_java7(&ClassFileVersion::JAVA_7));
         assert!(!is_pre_java7(&ClassFileVersion::JAVA_8));
         assert!(!is_pre_java7(&ClassFileVersion::JAVA_25));
+    }
+
+    // -----------------------------------------------------------------
+    // MED — invokespecial <init> new-site owner-match (JVMS §4.10.1.9)
+    // -----------------------------------------------------------------
+
+    /// Constant pool whose entry #6 is a `Methodref` to `D.<init>()V`.
+    fn init_owner_cp() -> ConstantPool {
+        ConstantPool::new(vec![
+            ConstantPoolEntry::Tombstone,               // 0
+            ConstantPoolEntry::Utf8("D".into()),        // 1
+            ConstantPoolEntry::ClassReference { name_index: 1 }, // 2 (owner D)
+            ConstantPoolEntry::Utf8("<init>".into()),   // 3
+            ConstantPoolEntry::Utf8("()V".into()),      // 4
+            ConstantPoolEntry::NameAndType {
+                name_index: 3,
+                descriptor_index: 4,
+            }, // 5
+            ConstantPoolEntry::MethodReference {
+                class_index: 2,
+                name_and_type_index: 5,
+            }, // 6 (D.<init>()V)
+        ])
+    }
+
+    fn owner_match_frame() -> VerificationFrame {
+        // A frame with a single `Uninitialized(0)` receiver on the stack.
+        let mut frame =
+            VerificationFrame::initial_frame("Test", "test", "()V", true, 1, 4);
+        frame.push(VType::Uninitialized(0)).unwrap();
+        frame
+    }
+
+    #[test]
+    fn invokespecial_init_owner_mismatch_rejected() {
+        // `new C` (recorded at offset 0) followed by `invokespecial D.<init>`
+        // is a JVMS §4.10.1.9 violation: the new-site type C must equal the
+        // constructor owner D.
+        let cp = init_owner_cp();
+        let frame = owner_match_frame();
+        let mut new_site_classes = std::collections::HashMap::new();
+        new_site_classes.insert(0u16, std::sync::Arc::<str>::from("C")); // new C, not D
+
+        let res = check_new_init_owner_match(
+            &Instruction::Invokespecial(6),
+            &frame,
+            &cp,
+            &new_site_classes,
+            "Test",
+            "test",
+        );
+        assert!(
+            res.is_err(),
+            "invokespecial D.<init> on an object created by `new C` must be rejected, \
+             got {res:?}"
+        );
+    }
+
+    #[test]
+    fn invokespecial_init_owner_match_accepted() {
+        // `new D` followed by `invokespecial D.<init>` is well-formed.
+        let cp = init_owner_cp();
+        let frame = owner_match_frame();
+        let mut new_site_classes = std::collections::HashMap::new();
+        new_site_classes.insert(0u16, std::sync::Arc::<str>::from("D")); // new D == owner
+
+        let res = check_new_init_owner_match(
+            &Instruction::Invokespecial(6),
+            &frame,
+            &cp,
+            &new_site_classes,
+            "Test",
+            "test",
+        );
+        assert!(
+            res.is_ok(),
+            "invokespecial D.<init> on an object created by `new D` must be accepted, \
+             got {res:?}"
+        );
+    }
+
+    #[test]
+    fn invokespecial_init_unknown_new_site_is_skipped() {
+        // If the `new` site was never recorded (e.g. the uninitialized value
+        // arrived via a declared StackMapTable frame), we cannot compare —
+        // the check must be a no-op rather than a false rejection.
+        let cp = init_owner_cp();
+        let frame = owner_match_frame();
+        let new_site_classes: std::collections::HashMap<u16, std::sync::Arc<str>> =
+            std::collections::HashMap::new(); // offset 0 not present
+
+        let res = check_new_init_owner_match(
+            &Instruction::Invokespecial(6),
+            &frame,
+            &cp,
+            &new_site_classes,
+            "Test",
+            "test",
+        );
+        assert!(
+            res.is_ok(),
+            "an unrecorded new-site must skip the owner-match (no false reject), \
+             got {res:?}"
+        );
+    }
+
+    #[test]
+    fn invokespecial_init_owner_match_end_to_end_rejected() {
+        // End-to-end through the pre-Java-7 linear walk: a Java-5 method that
+        // does `new C; dup; invokespecial D.<init>()V`. The class also carries
+        // a jsr method so the per-method routing engages (escape hatch on so
+        // the jsr method is tolerated and the owner mismatch is the only cause
+        // of failure).
+        //
+        // Bytecode of the offending method:
+        //   0: new #2  (creates D per cp, but we point new at a *different*
+        //               class via a dedicated cp below)
+        //   3: dup
+        //   4: invokespecial #? D.<init>()V
+        //   7: return
+        //
+        // We build a bespoke cp where the `new` index names C and the
+        // constructor names D.
+        let cp = ConstantPool::new(vec![
+            ConstantPoolEntry::Tombstone,                        // 0
+            ConstantPoolEntry::Utf8("C".into()),                 // 1
+            ConstantPoolEntry::ClassReference { name_index: 1 }, // 2 (new C)
+            ConstantPoolEntry::Utf8("D".into()),                 // 3
+            ConstantPoolEntry::ClassReference { name_index: 3 }, // 4 (owner D)
+            ConstantPoolEntry::Utf8("<init>".into()),            // 5
+            ConstantPoolEntry::Utf8("()V".into()),               // 6
+            ConstantPoolEntry::NameAndType {
+                name_index: 5,
+                descriptor_index: 6,
+            }, // 7
+            ConstantPoolEntry::MethodReference {
+                class_index: 4,
+                name_and_type_index: 7,
+            }, // 8 (D.<init>()V)
+        ]);
+
+        // new #2 (C); dup; invokespecial #8 (D.<init>); return
+        let code = vec![
+            0xbb, 0x00, 0x02, // 0: new C
+            0x59, // 3: dup
+            0xb7, 0x00, 0x08, // 4: invokespecial D.<init>
+            0xb1, // 7: return
+        ];
+
+        let mut class = make_pre_java7_jsr_class(
+            "subroutine",
+            "()V",
+            1,
+            1,
+            vec![
+                0xa8, 0x00, 0x06, // 0: jsr +6 → 6
+                0xb1, // 3: return
+                0x00, 0x00, // 4..5: pad
+                0x4b, // 6: astore_0
+                0xa9, 0x00, // 7: ret 0
+            ],
+            vec![],
+        );
+        class.constant_pool = cp;
+        class.methods.push(ClassFileMethod {
+            access_flags: MethodAccessFlags::PUBLIC,
+            name: Arc::from("makeMismatch"),
+            descriptor: Arc::from("()V"),
+            attributes: vec![LazyAttribute::new_decoded(Attribute::Code(CodeAttribute {
+                max_stack: 2,
+                max_locals: 1,
+                code: cratonvm_reader::ByteView::from_vec(code),
+                exception_table: vec![],
+                attributes: vec![],
+            }))],
+        });
+
+        let res = verify_class_bytecode_inner(&class, &PermissiveHierarchy, true);
+        assert!(
+            res.is_err(),
+            "new C; invokespecial D.<init> must be rejected by the owner-match, got {res:?}"
+        );
     }
 }
