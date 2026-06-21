@@ -1657,8 +1657,14 @@ pub(crate) fn invoke_to_string(
                 return Ok(formatted);
             }
             Value::Long(v) => return Ok(v.to_string()),
-            Value::Float(v) => return Ok(format!("{}", v)),
-            Value::Double(v) => return Ok(format!("{}", v)),
+            // Use the Java-spec formatters (NOT raw `{}`), so a boxed Double/Float
+            // rendered via String.valueOf(Object) / StringBuilder.append(Object) /
+            // object string-concat matches `Double.toString` — incl. the
+            // 10^-3..10^7 scientific-notation threshold, "Infinity", and "-0.0".
+            // Raw `format!("{}")` dropped the ".0", printed "inf"/"-0", and never
+            // used E-notation (e.g. boxed 1e7 -> "10000000.0", -0.0 -> "-0").
+            Value::Float(v) => return Ok(format_float(v)),
+            Value::Double(v) => return Ok(format_double(v)),
             _ => {} // Not a primitive wrapper
         }
     }
@@ -4044,13 +4050,15 @@ pub(crate) fn format_arg(ctx: &mut dyn NativeContext, val: &Value, spec: char) -
             'f' => format!("{:.6}", v),
             'e' => format!("{:e}", *v as f64),
             'E' => format!("{:E}", *v as f64),
-            _ => format!("{}", v),
+            // `%s`/no-spec of a float -> Java Double.toString form, not raw `{}`.
+            _ => format_float(*v),
         },
         Value::Double(v) => match spec {
             'f' => format!("{:.6}", v),
             'e' => format!("{:e}", v),
             'E' => format!("{:E}", v),
-            _ => format!("{}", v),
+            // `%s`/no-spec of a double -> Java Double.toString form, not raw `{}`.
+            _ => format_double(*v),
         },
         _ => "?".to_string(),
     }

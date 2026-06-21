@@ -2117,14 +2117,13 @@ fn try_build_method_injection(
     // Only abstract bean classes need a synthesised concrete subclass.
     let super_internal = ctx.class_name_of_id(super_cid)?;
     let super_flags = ctx.class_access_flags(super_cid);
-    let hmo = ctx.invoke_virtual(mbd, "hasMethodOverrides", "()Z", &[]);
-    eprintln!(
-        "[B2DBG] try_mi super={super_internal} flags={super_flags:#x} hasMethodOverrides={hmo:?}"
-    );
     if super_flags & ACC_INTERFACE != 0 {
         return None;
     }
-    let has_overrides = matches!(hmo, Ok(Some(Value::Int(n))) if n != 0);
+    let has_overrides = matches!(
+        ctx.invoke_virtual(mbd, "hasMethodOverrides", "()Z", &[]),
+        Ok(Some(Value::Int(n))) if n != 0
+    );
     if !has_overrides && super_flags & ACC_ABSTRACT == 0 {
         return None; // concrete, no overrides → ordinary path
     }
@@ -2245,30 +2244,17 @@ fn try_build_method_injection(
     }
 
     let (new_name, bytes) = crate::cglib_enhancer::build_lookup_subclass(&super_internal, &specs);
-    eprintln!(
-        "[B2DBG] super={super_internal} specs={} lookups={} new_name={new_name} bytes={}",
-        specs.len(),
-        specs.iter().filter(|s| s.is_lookup).count(),
-        bytes.len()
-    );
     let opts = DefineClassFull {
         override_name: Some(new_name.clone()),
         skip_verification: true,
         ..Default::default()
     };
-    match ctx.define_class_full(&new_name, &bytes, 0, opts) {
-        Ok(c) => eprintln!("[B2DBG] define_class_full OK cid={c:?}"),
-        Err(e) => {
-            eprintln!("[B2DBG] define_class_full FAILED: {e}");
-            return None;
-        }
+    if ctx.define_class_full(&new_name, &bytes, 0, opts).is_err() {
+        return None;
     }
     let inst = match ctx.new_object(&new_name) {
         Ok(Some(Value::Object(Some(o)))) => o,
-        other => {
-            eprintln!("[B2DBG] new_object({new_name}) returned {other:?}");
-            return None;
-        }
+        _ => return None,
     };
     let _ = ctx.invoke(&new_name, "<init>", "()V", &[Value::Object(Some(inst))]);
     // Hand the owning factory to the generated lookup overrides.
@@ -2354,10 +2340,6 @@ fn s_instantiation_strategy_instantiate(
     // mirrors `Class.newInstance` JDK semantics. Returning null is the
     // safest behaviour: downstream Spring will surface a
     // BeanInstantiationException it can recover from.
-    eprintln!(
-        "[B2DBG] shim instantiate class_name={class_name} cid_by_name={:?}",
-        ctx.class_id_by_name(&class_name)
-    );
     if let Some(cid) = ctx.class_id_by_name(&class_name) {
         // bug-B2: method-injection (`<lookup-method>` / `@Lookup`). The bean class
         // is abstract; synthesise + instantiate a concrete CGLIB-style subclass

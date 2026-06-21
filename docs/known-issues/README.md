@@ -15,9 +15,10 @@ the ~30 docs map to **one root-cause family + ~15 distinct standalone bugs**, of
 
 1. **Family A — GC root coverage under JIT** (one root cause, several manifestations). Open members:
    **A2** (register-only/native-return reclaim + non-moving-sweep walk) and **A4** (Fork6 FJP
-   multi-thread, gated). **A1/A3 are FIXED.** `springsuite-bug-04` and `spring-bug-10` are Family-A
-   manifestations seen from the Spring suite (same root cause, different entry points), and the
-   suite-scale field evidence in `jit-junit-discovery-reflection-corruption.md` is the same race.
+   multi-thread, gated). **A1/A3 are FIXED.** `spring-bug-10` is a Family-A manifestation seen from
+   the Spring suite (same root cause, different entry point); `springsuite-bug-04` was the same race
+   but **no longer reproduces** (doc removed). The suite-scale field evidence in
+   `jit-junit-discovery-reflection-corruption.md` is the same race.
 2. **Standalone B** — JUnit `@Timeout` interceptor double-`proceed()` (open).
 3. **Standalone C** — deep JIT→JIT recursion native-stack overflow (latent; only with an unmerged experiment).
 4. **bug-06 F5** — reflection native returns null vs a `Class`/`Method` (open, unattributed).
@@ -62,10 +63,13 @@ the ~30 docs map to **one root-cause family + ~15 distinct standalone bugs**, of
     - ✅ **Unsafe off-heap DirectBuffer (bug-A + bug-A2) FULLY RESOLVED** — `PooledDataBufferTests`
       **10/10**, `LeakAwareDataBufferFactoryTests` 2/2. The bug-A2 Netty `refCnt` AIOOBE no longer
       reproduces. Archived → [`docs/internal/fixed-suite-bugs/springsuite-0619-unsafe-offheap-directbuffer.md`](../internal/fixed-suite-bugs/springsuite-0619-unsafe-offheap-directbuffer.md).
-    - 🟡 **getBeanClassName bean-filter (bug-B) PARTIAL** — primary filter fix holds (no "hiding bean"
-      warning), but **bug-B2 OPEN**: `LookupMethodTests` 0/7 / `LookupAnnotationTests` 0/10 still fail
-      `Target object must not be null` (CGLIB **method-injection** enhancer makes a null instance).
-      Kept in this folder: [getBeanClassName bean-filter / bug-B2](springsuite-0619-getbeanclassname-bean-filter.md).
+    - 🟢 **getBeanClassName bean-filter (bug-B) MOSTLY FIXED** — primary filter fix holds, and
+      **bug-B2 (CGLIB method-injection) is now implemented 2026-06-21**: the instantiate shim
+      synthesises a concrete subclass overriding each abstract `<lookup-method>`/`@Lookup` method via
+      `bf.getBean(...)`. `LookupMethodTests` **0/7 → 6/7**, `LookupAnnotationTests` **0/10 → 6/10**
+      (no more "Target object must not be null"). Narrow residual: generic-type disambiguation
+      (`NumberStore<Double>` vs `<Float>` → `getBean(Class)` ambiguity; needs `ResolvableType`) + the
+      `@Lookup` null-bean case. [bug-B / bug-B2 doc](springsuite-0619-getbeanclassname-bean-filter.md).
     - Still untriaged from the sweep: `ReactiveAdapterRegistry$MutinyRegistrar` NCDFE, XML
       "Unexpected failure during bean definition parsing", "Unnamed bean definition", spring-jdbc
       mass-TIMEOUT, scheduler `StringIndexOutOfBounds`, and `DataBufferUtilsTests` TIMEOUT
@@ -81,7 +85,7 @@ the ~30 docs map to **one root-cause family + ~15 distinct standalone bugs**, of
     `restClient.close()`: GC-frequency-driven and `rs_cache`-PRESENCE-triggered (a latent
     GC-STW-vs-reactor-shutdown race exposed by snapshot timing), **NOT** a socket/OP_WRITE bug and **NOT** an
     rs_cache correctness bug. Reliably avoided by `CRATONVM_ROOTSNAP_CACHE=0` (suite-level — do NOT flip the
-    global default). Supersedes [reactor-worker-thread-leak-at-shutdown.md](reactor-worker-thread-leak-at-shutdown.md).
+    global default). Supersedes the former `reactor-worker-thread-leak-at-shutdown.md` (removed — see git history).
 
 FIXED bugs whose standalone docs were **removed** from this folder (resolved; full writeups in
 `git` history or [`docs/internal/fixed-suite-bugs/`](../internal/fixed-suite-bugs/)): A1 (reflection
@@ -233,7 +237,7 @@ and already-consolidated ones (fam5/6) were left in place.
 
 | Bug | Category | Status | Doc |
 |---|---|---|---|
-| String constant corrupted → `Object` under load | VM-CORRECTNESS / GC | 🟢 **NOT REPRODUCED 2026-06-20** — a 45-class single-JVM spring-core batch on dev ran clean (0 `status=java.lang.Object`, all OK, rc=0). Family-A precise-maps default-on + `toArray` recursion fixed. Pending one larger cross-module batch before archival. | [springsuite-bug-04-string-constant-corrupted-under-load.md](springsuite-bug-04-string-constant-corrupted-under-load.md) |
+| String constant corrupted → `Object` under load | VM-CORRECTNESS / GC | ✅ **RESOLVED / NOT REPRODUCED 2026-06-20** — a 45-class single-JVM spring-core batch on dev ran clean (0 `status=java.lang.Object`, all OK, rc=0); Family-A precise-maps default-on + `toArray` recursion fixed. Doc removed (writeup in git history). | _(removed)_ |
 | `MergedAnnotations` hang | VM-HANG | ✅ **FIXED 2026-06-20** (`8795b88d`) — was the `ReferencePipeline.toArray(IntFunction)` self-recursion; `MergedAnnotationsTests` now 174/178 (residual 4 = synthesis mismatch, cf. bug-06 F6) | [toArray-recursion fix](../internal/fixed-suite-bugs/springsuite-0620-toarray-referencepipeline-recursion.md) |
 | Serializable proxy round-trip | VM-CORRECTNESS (proxy + serialization) | ✅ **RESOLVED on `dev`** — the standalone serialize→deserialize JDK-proxy repro round-trips correctly; `SerializableTypeWrapperTests` generic-type-render residual tracked on branch `fix/generic-array-type-tostring`. Doc removed. | _(removed)_ |
 | JUnit-platform execution `LoadError` | VM-CORRECTNESS / dispatch | 🔴 **OPEN** — JUnit platform internals; Family-A GC-root race (NOT related to the now-fixed bug-04, which was a non-`Comparable` compare exception-type bug, not a GC race) | [spring-bug-10-junit-platform-execution-loaderr.md](spring-bug-10-junit-platform-execution-loaderr.md) |
@@ -241,9 +245,10 @@ and already-consolidated ones (fam5/6) were left in place.
 | Mockito `mockStatic` + mock dispatch | VM-CORRECTNESS (Mockito dispatch) | ✅ **FIXED on `dev`** — the dispatch/shadowing half landed (doc removed). A narrow **residual** remains open (the `mockStatic` capturing-lambda stub is bypassed by a stale JIT call site; works with `--nojit`). | open residual: [kafka-bug-B-mockstatic-capturing-lambda-jit.md](kafka-bug-B-mockstatic-capturing-lambda-jit.md) |
 | `WeakHashMap` stream infinite hang | VM-HANG → JIT codegen | ✅ **FIXED on `dev`** (`1cd0ab26`, JIT ban; verified; doc removed). The underlying `dup_x1` field-post-increment codegen weakness is tracked in the [JIT regalloc family doc](jit-regalloc-callee-saved-clobber-family.md). | _(removed)_ |
 
-> `springsuite-bug-04` and `spring-bug-10` are **Family A** (GC-root-coverage-under-JIT)
-> manifestations seen from the Spring suite — same root cause as A1–A4 above, different
-> entry points. Fixing precise JIT stack roots should clear them; tracked there.
+> `spring-bug-10` is a **Family A** (GC-root-coverage-under-JIT) manifestation seen from the
+> Spring suite — same root cause as A1–A4 above, a different entry point. Fixing precise JIT
+> stack roots should clear it; tracked there. (`springsuite-bug-04` was the same race but no
+> longer reproduces — doc removed.)
 
 ## The springrepos handoff (mostly fixed)
 
