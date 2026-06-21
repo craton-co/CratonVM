@@ -263,6 +263,24 @@ impl OscCache {
     }
 }
 
+impl Drop for OscCache {
+    /// Remove this cache's backing map from the process-global registry on
+    /// teardown, so the GC never dereferences a pointer to a freed `OscMap`.
+    ///
+    /// `insert_if_absent` / `get_or_insert_with` register `&self.inner` via
+    /// [`register_with_gc`] on first use, but nothing un-registered it: a
+    /// production cache outlives the VM, so this never bit real code, but it
+    /// is a latent use-after-free for any teardown path. It *did* bite the
+    /// unit tests, which create and drop many short-lived caches sharing the
+    /// one global registry — a dropped cache left a dangling pointer that a
+    /// later `scan_osc_cache_roots` / `remap_osc_cache_refs` would read.
+    /// Deregistering on `Drop` keeps the registry tracking only live maps.
+    fn drop(&mut self) {
+        let ptr = &self.inner as *const OscMap;
+        cache_registry().lock().retain(|s| s.0 != ptr);
+    }
+}
+
 /// A borrow handle into the cache. Currently an alias, but exposed
 /// separately so future work can narrow the API surface (e.g. restrict
 /// clear() to a privileged handle).

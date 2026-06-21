@@ -4521,15 +4521,26 @@ fn try_compile_inner(
         // `prologue_param_slots` above.
         let num_params = prologue_param_slots;
         let mut builder = ir::IrBuilder::new(num_params, cached.max_locals as usize);
-        // inc 25: when long methods are admitted, re-lay-out the parameter
-        // locals with the JVM two-slot category-2 convention (a `long`/`double`
-        // param occupies two slots) and type each `Param` from the descriptor —
-        // otherwise `lload`/`lstore` of a second long param reads the wrong
-        // slot. Inert for an all-category-1 signature (identical 1-slot layout),
-        // so only done when the long gate is on.
+        // Type each `Param` node from the descriptor. Two consumers depend on
+        // this:
+        //   * inc 25 (long gate): re-lay-out the parameter locals with the JVM
+        //     two-slot category-2 convention (a `long`/`double` param occupies
+        //     two slots) so `lload`/`lstore` of a later long param reads the
+        //     right slot.
+        //   * real-frame-deopt type source: a ref-typed param (an instance
+        //     method's `this`, an object/array argument) must be `IrType::Ref`
+        //     so the deopt snapshot tags its slot `StackSlotRef` → `Value::Object`
+        //     on resume, instead of a truncated `Value::Int`. Without this the
+        //     receiver of an instance method that deopts at, e.g., a div-by-zero
+        //     guard would resume with a garbage `this`.
+        // For an all-category-1 signature this is layout-identical to `new`'s
+        // one-slot-per-param placement — only the node *type* changes, which is
+        // codegen-neutral (spill/reload are always 64-bit REX.W; ref operands
+        // are never width-sensitive arithmetic), so it is now applied
+        // unconditionally rather than only under the long gate.
+        let ptypes = ir_param_types(&cached.method_descriptor, cached.is_static);
+        builder.set_param_types(&ptypes);
         if ir_emit_long {
-            let ptypes = ir_param_types(&cached.method_descriptor, cached.is_static);
-            builder.set_param_types(&ptypes);
             // inc 26: resolve `ldc2_w` long constants (pc → i64) so the builder
             // can lower them to `Op::Const(Long)`. A double constant is excluded
             // upstream (its consuming double opcode trips `method_uses_double`),

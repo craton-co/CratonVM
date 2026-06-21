@@ -1,47 +1,67 @@
 # Real-Frame Deoptimization (the keystone)
 
-> **Increment landed — IR-path deopt type source (oop + cat-2 safety).** The
-> reconstruct→resume pipeline already existed on the IR path (gated
-> `CRATONVM_IR_DEOPT_RESUME`, fired live by the div-by-zero guard
-> `emit_div_zero_guard`), but it was **integer-only and silently unsafe for
-> object/cat-2 slots**: `resolve_value` turned every `StackSlot` into `Int`, so a
-> ref slot (e.g. an instance method's `this`) resolved to a *truncated pointer*
-> that still passed the resume's all-`Int` check — resuming with a garbage `this`.
-> What shipped (the doc's "single most under-scoped item" — the type source):
-> - **Typed slot locations** (`jit/src/deopt.rs`): `FrameValue::StackSlotRef(i32)`
->   (resolves to `Object(word)` — the raw slot word IS the heap pointer) and
->   `FrameValue::Unsupported` (a live slot that can't yet be precisely
->   reconstructed — cat-2 `long`/`double`, FP-in-slot — which forces the **safe
->   re-run** instead of fabricating/truncating a value).
-> - **IR producer** (`jit/src/ir_lower.rs`): `frame_value_for` now routes each
->   spilled value by its IR `ty` via `typed_stack_slot` — `Ref`→`StackSlotRef`,
->   `Int`→`StackSlot`, `Long`/`Double`/`Float`→`Unsupported` (long constants too).
+> **Increment landed — object/ref resume now fires LIVE on BOTH call paths.**
+> The type source's *jit half* (typed slot locations in `jit/src/deopt.rs`:
+> `FrameValue::StackSlotRef(i32)`→`Object(word)` and `FrameValue::Unsupported`;
+> `typed_stack_slot` in `jit/src/ir_lower.rs`) was on dev, but its **VM half had
+> never been committed** — a concurrent session swept it before commit (see
+> [[shared-worktree-dev-switches-under-you]]). Three pieces were missing, so the
+> object arm was inert *and latently unsound*: `ir_deopt_frame_values` still
+> returned `None` for `Object` (forcing re-run), the claimed vm test and the
+> `PRECISE/FALLBACK` diagnostic did not exist, and — the load-bearing gap — the
+> **producer never tagged ref slots `Ref`** on the default path (`set_param_types`
+> was gated behind the default-OFF long flag), so an instance method's `this` was
+> typed `Int` → would have resumed as a *truncated pointer*. This increment
+> finishes the type source and makes it live:
 > - **VM resume** (`vm/src/runtime/interpreter.rs`): `ir_deopt_frame_values` maps
->   `Object`→`Value::Object` (a real reference), keeps `Int`/`Undefined`, and
->   returns `None` (→ re-run) for `Unsupported`/`Float`/virtual/unresolved — the
->   safety contract that a not-yet-resumable slot re-runs rather than resumes with
->   garbage. The oop is read synchronously at the guard (no intervening Java
->   alloc, hence no GC) so the pointer stays valid.
-> - **Diagnostic:** `CRATONVM_DBG_DEOPT` traces each deopt as `PRECISE resume …`
->   (with the reconstructed locals) or `FALLBACK re-run … (reason)`.
-> - **Validation.** jit `reconstruct_resolves_typed_slots` (StackSlotRef→Object,
->   StackSlot→Int, Unsupported pass-through) + vm `ir_deopt_frame_values_maps_object_and_int`;
->   68 jit-deopt + 17 ir_lower + the vm test all green. **Live end-to-end PROOF**
->   (debug binary, JDK 25, `CRATONVM_IR_DEOPT_RESUME=1`): a pure-int IR-compiled
->   method `d(II)I` div-by-zero deopts and **precisely resumes at the div bci**
->   (`[cratonvm-deopt] PRECISE resume … at bci=2`), throwing `ArithmeticException`
->   correctly — the mechanism fires on a live VM.
-> - **Honest scope / next step.** The object/cat-2 arms are **unit-validated, not
->   yet live-exercised**: the *current* IR-path selection routes object-bearing
->   and side-effecting methods (e.g. an instance `g(I)I`, anything with
->   `putstatic`) to the **single-pass x64 backend**, which has no IR deopt — so
->   they never reach this resume today. This increment is the *correct
->   prerequisite* (the type source the x64 backport doc names as most-under-scoped)
->   that makes object resume sound once a producer compiles such methods —
->   **broaden the IR-path selection to object/side-effecting methods, or land the
->   x64 backport** (which compiles everything) to make it fire live. Cat-2
->   two-slot expansion + FP-slot resolution + `materialize_virtual_objects`
->   (still a panic stub) remain the follow-ups.
+>   `Object(w)`→`Value::Object` (`0`→null, else the raw word IS the `ObjectRef`
+>   pointer), keeps `Int`/`Undefined`, returns `None`→re-run for
+>   `Unsupported`/`Float`/`VirtualObject`/unresolved. GC-safe with no temporary
+>   root: `refill_pools_from_shared` only recycles Rust buffers, so no Java
+>   alloc/GC runs between the in-stub oop capture and the frame push. `resume_from_ir_deopt`
+>   now populates the operand stack **before** `push_frame_and_fire_entry` (adversarial-
+>   review hardening) so that when the JVMTI MethodEntry callback fires — the one
+>   alloc-capable step in the window — *both* locals and operand-stack reconstructed
+>   oops are already in GC-scanned frame slots, not held only in a Rust `Vec`.
+> - **Producer ref-typing** (`jit/src/lib.rs`): `set_param_types`
+>   (descriptor→`IrType`; `this`/`L`/`[`→`Ref`) is now applied **unconditionally**
+>   on the IR path. Layout-identical for a cat-1 signature (only the node *type*
+>   changes); codegen-neutral — spills/reloads are 64-bit REX.W so a pointer is
+>   never truncated, the `ty==Int` arms are arithmetic-only (never a `Ref` param),
+>   and escape analysis / the optimizer don't branch on the tag and already test
+>   `Ref` params. This is what makes a ref local reconstruct as `StackSlotRef`→
+>   `Object` instead of a truncated `Int`.
+> - **Both deopt sinks resume** (`interpreter.rs`): precise resume is now wired
+>   into `execute_jit_call_decoded` (the instance-method invocation-tier-up path),
+>   not just `execute_jit_call` (the static MIC path) — the design's step-4 "apply
+>   the identical branch at the slow sink". Safe because the decoded path's caller
+>   (`execute_invokevirtual_cached`) already popped the operand-stack args (so a
+>   resume frame pushes onto a clean stack), and `resume_from_ir_deopt` bails
+>   side-effect-free before any frame mutation (so falling through to re-run after
+>   an unmappable frame double-pushes nothing).
+> - **Diagnostic:** `CRATONVM_DBG_DEOPT` now traces each resume decision as
+>   `PRECISE resume <m> at bci=<n> locals=[..]` or `FALLBACK re-run <m> (<reason>)`.
+> - **Validation.** 819 jit lib tests green (the producer change is codegen-neutral;
+>   the lone failing `intrinsic_arraycopy` integration test fails *identically on
+>   base dev* — pre-existing, exercises `x64::compile` directly, untouched here) +
+>   vm `ir_deopt_frame_values_maps_object_and_int`. **Live end-to-end PROOF**
+>   (debug binary, JDK 25, `CRATONVM_IR_DEOPT_RESUME=1 CRATONVM_DBG_DEOPT=1`):
+>   a STATIC `sd(LBox;I)I` (invokestatic → fast `execute_jit_call` sink) AND an
+>   INSTANCE `d(I)I` (invokevirtual → `execute_jit_call_decoded` sink) both
+>   div-by-zero deopt and **precisely resume at the `idiv` bci** with the ref
+>   param/receiver reconstructed as `Object(Some(ObjectRef{..}))` — NOT a
+>   truncated `Int` — throwing `ArithmeticException` correctly. Object/ref resume
+>   is now **live-exercised on both call paths**, not merely unit-validated.
+> - **Still gated default-OFF** (`CRATONVM_IR_DEOPT_RESUME`); production re-runs
+>   (correct for the side-effect-free div trigger today). **Remaining follow-ups:**
+>   **cat-2 two-slot expansion** — a `long`/`double` is one IR stack entry but TWO
+>   interpreter slots (`Value::Long` + `Value::Uninitialized` high-half), and
+>   `copy_args_to_locals` applies its own cat-2 slot-skip, so the resume cannot map
+>   1:1; tagged `Unsupported`→re-run until a slot-expanding builder lands.
+>   **FP/XMM-slot resolution** (needs `SavedRegisters.xmm[16]` + a width source).
+>   `materialize_virtual_objects` (Phase B, GC-backed; still a panic stub).
+>   Inlined-frame chains + monitor re-entry. The x64 single-pass backport
+>   ([`real-frame-deopt-x64-backport.md`](real-frame-deopt-x64-backport.md)).
 
 Status: design / not started. XL. **This is the keystone** — almost every
 other aggressive JIT optimization (speculative guards, aggressive inlining,
