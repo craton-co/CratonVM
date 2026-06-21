@@ -644,6 +644,9 @@ pub extern "C" fn jit_npe_with_action(code: i64) {
 // The `JIT_THREAD_BORROWED` flag + `JitThreadGuard` enforce the "no aliasing
 // borrow" half of this invariant in debug builds; release builds are unaffected.
 #[inline]
+// SAFETY: invoked on the thread that installed `JIT_THREAD`, so no other
+// `&mut JvmThread` is live; the returned exclusive borrow is unique for the
+// guard's lifetime.
 unsafe fn jit_thread_mut() -> Option<(&'static mut JvmThread, JitThreadGuard)> {
     let ptr = JIT_THREAD.with(|t| t.get());
     if ptr.is_null() {
@@ -700,6 +703,9 @@ unsafe fn jit_thread_mut() -> Option<(&'static mut JvmThread, JitThreadGuard)> {
 /// exactly `args_slice.len()` valid i64 arg slots; on overflow we don't
 /// dereference the table at all.
 #[inline]
+// SAFETY: `entry` is a live JIT-compiled `extern "C"` code pointer produced by
+// the compiler; it is transmuted to a fn signature matching the (with/without
+// NativeContext) arity actually called below.
 unsafe fn try_call_compiled_entry(
     entry: usize,
     needs_ctx: bool,
@@ -710,18 +716,26 @@ unsafe fn try_call_compiled_entry(
     if needs_ctx {
         Some(match n {
             0 => {
+                // SAFETY: `entry` is a live JIT-compiled extern "C" entry (caller contract);
+                // the 0-arg with-ctx callee takes exactly (vm_ptr) per the JIT ABI.
                 let f: unsafe extern "C" fn(i64) -> i64 = std::mem::transmute(entry);
                 f(vm_ptr)
             }
             1 => {
+                // SAFETY: `entry` is a live JIT-compiled extern "C" entry; the 1-arg with-ctx
+                // callee takes (vm_ptr, arg0) per the JIT ABI.
                 let f: unsafe extern "C" fn(i64, i64) -> i64 = std::mem::transmute(entry);
                 f(vm_ptr, args_slice[0])
             }
             2 => {
+                // SAFETY: `entry` is a live JIT-compiled extern "C" entry; the 2-arg with-ctx
+                // callee takes (vm_ptr, arg0, arg1) per the JIT ABI.
                 let f: unsafe extern "C" fn(i64, i64, i64) -> i64 = std::mem::transmute(entry);
                 f(vm_ptr, args_slice[0], args_slice[1])
             }
             3 => {
+                // SAFETY: `entry` is a live JIT-compiled extern "C" entry; the 3-arg with-ctx
+                // callee takes (vm_ptr, arg0, arg1, arg2) per the JIT ABI.
                 let f: unsafe extern "C" fn(i64, i64, i64, i64) -> i64 = std::mem::transmute(entry);
                 f(vm_ptr, args_slice[0], args_slice[1], args_slice[2])
             }
@@ -734,22 +748,32 @@ unsafe fn try_call_compiled_entry(
     } else {
         Some(match n {
             0 => {
+                // SAFETY: `entry` is a live JIT-compiled extern "C" entry (caller contract);
+                // the 0-arg no-ctx callee takes no arguments per the JIT ABI.
                 let f: unsafe extern "C" fn() -> i64 = std::mem::transmute(entry);
                 f()
             }
             1 => {
+                // SAFETY: `entry` is a live JIT-compiled extern "C" entry; the 1-arg no-ctx
+                // callee takes (arg0) per the JIT ABI.
                 let f: unsafe extern "C" fn(i64) -> i64 = std::mem::transmute(entry);
                 f(args_slice[0])
             }
             2 => {
+                // SAFETY: `entry` is a live JIT-compiled extern "C" entry; the 2-arg no-ctx
+                // callee takes (arg0, arg1) per the JIT ABI.
                 let f: unsafe extern "C" fn(i64, i64) -> i64 = std::mem::transmute(entry);
                 f(args_slice[0], args_slice[1])
             }
             3 => {
+                // SAFETY: `entry` is a live JIT-compiled extern "C" entry; the 3-arg no-ctx
+                // callee takes (arg0, arg1, arg2) per the JIT ABI.
                 let f: unsafe extern "C" fn(i64, i64, i64) -> i64 = std::mem::transmute(entry);
                 f(args_slice[0], args_slice[1], args_slice[2])
             }
             4 => {
+                // SAFETY: `entry` is a live JIT-compiled extern "C" entry; the 4-arg no-ctx
+                // callee takes (arg0, arg1, arg2, arg3) per the JIT ABI.
                 let f: unsafe extern "C" fn(i64, i64, i64, i64) -> i64 = std::mem::transmute(entry);
                 f(args_slice[0], args_slice[1], args_slice[2], args_slice[3])
             }
@@ -767,6 +791,9 @@ unsafe fn try_call_compiled_entry(
 /// are stashed via `handle_jit_dispatch_error` so the interpreter post-JIT
 /// path can route them through the caller's exception table.
 #[inline(never)]
+// SAFETY: called from a JIT helper with a live `SharedVm` and the current
+// `JvmThread` set up, so resuming interpretation / routing through the caller's
+// exception table operates on valid VM state.
 unsafe fn bail_to_interpreter(
     vm: &SharedVm,
     thread: &mut JvmThread,
@@ -1138,6 +1165,9 @@ unsafe fn heap_from_vm(vm_ptr: i64) -> &'static VmHeap {
 // false`: a single Acquire load and an early return. We invoke it
 // unconditionally at the top of every GC-triggering JIT helper so the
 // invariant holds without a separate JIT-emitted safepoint stub.
+// SAFETY: every caller is a JIT helper invoked from compiled code; `vm_ptr` is
+// either 0 (handled by the early return) or a live `SharedVm` pointer per the
+// universal JIT-helper caller contract.
 #[inline]
 unsafe fn jit_safepoint_flush_satb(vm_ptr: i64) {
     if vm_ptr == 0 {
@@ -1295,7 +1325,10 @@ pub unsafe extern "C" fn jit_newarray(vm_ptr: i64, atype: i64, length: i64) -> i
 /// purely additive and never makes a previously-handled case worse.
 #[cold]
 fn jit_newarray_oom(vm: &SharedVm, length: usize) -> i64 {
-    jit_alloc_oom(vm, &format!("Java heap space (alloc_array length {})", length))
+    jit_alloc_oom(
+        vm,
+        &format!("Java heap space (alloc_array length {})", length),
+    )
 }
 
 /// Shared OOM signal for the fallible JIT allocation helpers — `jit_newarray`
@@ -1321,6 +1354,8 @@ fn jit_newarray_oom(vm: &SharedVm, length: usize) -> i64 {
 /// left unset and `0` returned — the legacy behaviour, never worse.
 #[cold]
 fn jit_alloc_oom(vm: &SharedVm, msg: &str) -> i64 {
+    // SAFETY: called only from a JIT alloc helper on the thread that installed the
+    // JIT thread pointer; no other `&mut JvmThread` borrow is live here.
     if let Some((thread, _guard)) = unsafe { jit_thread_mut() } {
         if let Ok(exc) = crate::runtime::exceptions::create_exception_object(
             vm,
@@ -1351,6 +1386,8 @@ fn jit_alloc_oom(vm: &SharedVm, msg: &str) -> i64 {
 /// unset and `0` returned.
 #[cold]
 fn jit_negative_array_size(vm: &SharedVm, length: i64) -> i64 {
+    // SAFETY: called only from a JIT array helper on the thread that installed the
+    // JIT thread pointer; no other `&mut JvmThread` borrow is live here.
     if let Some((thread, _guard)) = unsafe { jit_thread_mut() } {
         if let Ok(exc) = crate::runtime::exceptions::create_exception_object(
             vm,
@@ -1368,6 +1405,9 @@ fn jit_negative_array_size(vm: &SharedVm, length: i64) -> i64 {
 /// allocation trace and converts the `ObjectRef` into the raw `i64` pointer the
 /// JIT caller expects. Factored out so the fast and slow paths stay identical.
 #[inline]
+// SAFETY: `obj_ref` is a freshly-allocated, non-null array object whose header
+// the allocator initialized; the function only writes that array's own
+// length/element slots within bounds.
 unsafe fn jit_newarray_finish(obj_ref: ObjectRef, atype: i64, length: i64) -> i64 {
     let raw = obj_ref.as_ptr();
     if crate::runtime::env_cache::jit_newarray_trace() {
@@ -1658,7 +1698,9 @@ pub unsafe extern "C" fn jit_anewarray_object(
     if crate::runtime::interpreter::gc_overhead_limit_exceeded(vm) {
         return jit_alloc_oom(
             vm,
-            &format!("Java heap space (anewarray component {component_class_id_raw} length {length})"),
+            &format!(
+                "Java heap space (anewarray component {component_class_id_raw} length {length})"
+            ),
         );
     }
     // Fallible young → humongous/old-gen alloc (preserves alloc_array's spill);
@@ -1666,11 +1708,14 @@ pub unsafe extern "C" fn jit_anewarray_object(
     // abort in alloc_young. The `anewarray` codegen's emit_post_alloc_oom_check
     // bails on the 0/null sentinel and routes the OOME through the method's
     // exception table (matching the interpreter's gc_alloc_array).
-    let Some(arr) = heap.try_alloc_array_full(class_id, ArrayElementType::Reference, length as usize)
+    let Some(arr) =
+        heap.try_alloc_array_full(class_id, ArrayElementType::Reference, length as usize)
     else {
         return jit_alloc_oom(
             vm,
-            &format!("Java heap space (anewarray component {component_class_id_raw} length {length})"),
+            &format!(
+                "Java heap space (anewarray component {component_class_id_raw} length {length})"
+            ),
         );
     };
     arr.as_ptr() as i64
@@ -2107,6 +2152,9 @@ pub unsafe extern "C" fn jit_getfield(obj_ptr: i64, field_index: i64) -> i64 {
 /// writes; match it. `obj_ptr` must be non-null and canonical (the caller's
 /// null check + the JIT's receiver discipline guarantee this — a non-canonical
 /// receiver would fault on the header read exactly as the raw write would).
+// SAFETY: `obj_ptr` must be non-null and canonical (caller's null check + the
+// JIT's receiver discipline guarantee this); only the object's `num_slots`
+// header word at offset 16 is read to bounds-check `field_index`.
 #[inline]
 unsafe fn jit_putfield_slot_in_bounds(obj_ptr: i64, field_index: i64) -> bool {
     if field_index < 0 {
@@ -2221,7 +2269,10 @@ pub unsafe extern "C" fn jit_putfield_double(obj_ptr: i64, field_index: i64, val
     let ptr = (obj_ptr as *mut u8).add(HEADER_SIZE + field_index as usize * SLOT_SIZE);
     // Atomic per-word store (concurrent-GC torn-read safety; see
     // `write_value_atomic`).
-    cratonvm_types::write_value_atomic(ptr as *mut Value, Value::Double(f64::from_bits(val as u64)));
+    cratonvm_types::write_value_atomic(
+        ptr as *mut Value,
+        Value::Double(f64::from_bits(val as u64)),
+    );
 }
 
 // SAFETY: Called from JIT-compiled code. vm_ptr must be a valid SharedVm pointer.
@@ -3282,6 +3333,8 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
         let mut buf = String::new();
         if !p.is_null() && num_args > 0 {
             for i in 0..(num_args as usize).min(4) {
+                // SAFETY: `p` is non-null (checked above) and `i < num_args`, so
+                // `p.add(i)` stays inside the JIT-provided args slice (debug path only).
                 let v = unsafe { *p.add(i) };
                 buf.push_str(&format!(" arg{}=0x{:x}", i, v));
             }
@@ -4789,6 +4842,8 @@ mod tests {
             Some((4, 4)),
             "iaload OOB-high must set pending AIOOBE (index, length)"
         );
+        // SAFETY: `arr_ptr` is a valid test array header built above; `jit_iaload`
+        // bounds-checks the index and signals AIOOBE rather than reading OOB.
         let lo = unsafe { jit_iaload(arr_ptr, -1) };
         assert_eq!(
             lo,
@@ -4929,6 +4984,8 @@ mod tests {
             oob_hi, 0,
             "getfield on an out-of-range slot must not read OOB"
         );
+        // SAFETY: `obj_ptr` is a valid test object header built above; `jit_getfield`
+        // bounds-checks the slot index and returns 0 rather than reading OOB.
         let oob_far = unsafe { jit_getfield(obj_ptr, 5) };
         assert_eq!(oob_far, 0, "getfield far past num_slots must not read OOB");
         let oob_neg = unsafe { jit_getfield(obj_ptr, -1) };
@@ -5242,6 +5299,8 @@ mod tests {
         // with the requested length, confirming the post-GC retry took
         // the regular `alloc_array` path (not some salvage / abort
         // shortcut).
+        // SAFETY: `result` is the non-zero array pointer just returned by the
+        // successful `jit_newarray` call above, so it is a live, aligned heap object.
         let arr = unsafe { ObjectRef::from_raw(result as usize as *mut u8) };
         assert_eq!(
             vm_box.heap.array_length(arr),
@@ -5268,6 +5327,9 @@ mod tests {
 /// Returns `null` if invoked from a thread that did not call
 /// `set_jit_thread` (defensive — the JIT fast path treats a null thread
 /// pointer as "skip the inline bump, fall through to slow path").
+// SAFETY: takes no pointer arguments; only reads the per-thread `JIT_THREAD` TLS
+// slot and returns it (null if `set_jit_thread` was never called). Safe to call
+// from JIT-compiled code.
 #[no_mangle]
 pub unsafe extern "C" fn jit_get_current_thread() -> *mut JvmThread {
     // WS1: Rust<->JIT boundary — invalidate the per-thread JIT-scan cache
@@ -5336,6 +5398,10 @@ mod savebase_watcher {
     }
     const DUPLICATE_SAME_ACCESS: u32 = 0x2;
 
+    // SAFETY: `h` must be a valid, suspended thread HANDLE owned by this watcher;
+    // the CONTEXT is a correctly aligned 1232-byte buffer and the offsets written
+    // (ContextFlags/Dr0/Dr7) match the Win32 x64 CONTEXT layout passed to
+    // SetThreadContext.
     unsafe fn set_dr_on(h: isize, addr: u64, dr7: u64) -> i32 {
         #[repr(C, align(16))]
         struct Ctx([u8; 1232]);
@@ -5349,6 +5415,9 @@ mod savebase_watcher {
 
     /// Worker-side: publish the current reset savebase address; start the watcher
     /// thread on first call (duplicating the worker's thread handle for it).
+    // SAFETY: called on the worker thread; the Win32 handle-duplication and thread
+    // spawn use only valid pseudo-handles (GetCurrentProcess/GetCurrentThread) and
+    // store the duplicated real handle for the watcher to Suspend/Resume.
     pub unsafe fn publish(addr: usize) {
         ARM_ADDR.store(addr, Ordering::Relaxed);
         if STARTED.swap(true, Ordering::SeqCst) {
@@ -5370,9 +5439,16 @@ mod savebase_watcher {
             "[WATCH] watcher thread started; worker savebase @0x{:016X}",
             addr
         );
+        // SAFETY: `watcher_loop` only Suspend/Resume/SetThreadContext's the
+        // duplicated worker HANDLE stored in `WORKER_HANDLE`; no shared Rust state
+        // is aliased mutably across threads (all coordination is via atomics).
         std::thread::spawn(|| unsafe { watcher_loop() });
     }
 
+    // SAFETY: runs on the dedicated watcher thread; the only handle it touches is
+    // the duplicated worker HANDLE in `WORKER_HANDLE` (valid until process exit),
+    // and the Suspend→SetThreadContext→Resume sequence keeps the worker quiesced
+    // while its debug registers are written.
     unsafe fn watcher_loop() {
         let mut set_addr = 0usize;
         loop {
@@ -5406,6 +5482,9 @@ mod savebase_watcher {
 
 // Naked trampoline: read `[rsp]` (the true return address into reset's prologue)
 // at entry, tail-jump to the inner handler with it in RDX (ARG1).
+// SAFETY: naked fn — its body is hand-written asm that reads the on-stack return
+// address and tail-jumps to `arm_savebase_watch_inner` with the extern "C" ABI
+// preserved (`addr` in RCX/ARG0, the return address placed in RDX/ARG1).
 #[cfg(windows)]
 #[unsafe(naked)]
 pub unsafe extern "C" fn jit_arm_savebase_watch(addr: i64) {
@@ -5416,6 +5495,10 @@ pub unsafe extern "C" fn jit_arm_savebase_watch(addr: i64) {
     );
 }
 
+// SAFETY: called only from the `jit_arm_savebase_watch` naked trampoline with the
+// extern "C" ABI it sets up; `ra` is the JIT return address read off the stack and
+// `addr` is a savebase slot address that is validated (non-null, 8-byte aligned)
+// before use.
 #[cfg(windows)]
 unsafe extern "C" fn arm_savebase_watch_inner(addr: i64, ra: usize) {
     if crate::runtime::crash_handler::savebase_watch_caught() {
@@ -5434,11 +5517,14 @@ unsafe extern "C" fn arm_savebase_watch_inner(addr: i64, ra: usize) {
 // Disarm is watcher-managed (it disarms on catch), so the epilogue helper is a
 // no-op; the cross-frame filter in the VEH separates the live corruptor from a
 // coincidental -2 write to the reused stack slot after reset returns.
+// SAFETY: empty body — takes no arguments and dereferences nothing.
 #[cfg(windows)]
 pub unsafe extern "C" fn jit_disarm_savebase_watch() {}
 
+// SAFETY: non-Windows stub with an empty body — takes no pointer it dereferences.
 #[cfg(not(windows))]
 pub unsafe extern "C" fn jit_arm_savebase_watch(_addr: i64) {}
+// SAFETY: non-Windows stub with an empty body — dereferences nothing.
 #[cfg(not(windows))]
 pub unsafe extern "C" fn jit_disarm_savebase_watch() {}
 
