@@ -451,6 +451,91 @@ pub fn class_id_from_mirror(shared: &SharedVm, mirror: ObjectRef) -> Option<Clas
     shared.class_mirrors_reverse.read().get(&mirror).copied()
 }
 
+/// Absolute heap-slot indices of the `java/lang/Class` instance fields that
+/// the mirror populator writes through.
+///
+/// Resolved **by name** (and validated by descriptor) against the loaded
+/// `java/lang/Class` rather than hardcoded to a particular JDK's field order:
+/// the JDK's private layout of `java.lang.Class` is an implementation detail
+/// that has reordered between releases, so baking in JDK-25 slot numbers
+/// (name=1, modifiers=6, primitive=7, …) silently writes the wrong field —
+/// or out of bounds — against any other layout. By-name resolution keeps the
+/// mirror correct regardless of the loaded class's field order.
+///
+/// Each entry is `Some(absolute_index)` only when the field exists with a
+/// matching descriptor; callers skip writes for `None` slots so a layout that
+/// lacks a given field is simply left at its heap-zero default.
+#[derive(Default, Clone, Copy)]
+struct ClassMirrorSlots {
+    /// `name : Ljava/lang/String;`
+    name: Option<usize>,
+    /// `modifiers : I` (HotSpot declares it `char` on some builds; both decode
+    /// to an `int` slot, so we accept either descriptor).
+    modifiers: Option<usize>,
+    /// `primitive : Z`
+    primitive: Option<usize>,
+    /// `classRedefinedCount : I`
+    class_redefined_count: Option<usize>,
+    /// `reflectionData : Ljava/lang/ref/SoftReference;`
+    reflection_data: Option<usize>,
+}
+
+/// Legacy fixed slot layout used for the **synthetic** `java/lang/Class` stub
+/// (whose fields are unnamed `_fN` placeholders, so by-name resolution finds
+/// nothing). These match the slots the VM's synthetic natives read directly:
+/// name at slot 1, primitive at slot 7, classRedefinedCount at slot 12. Only
+/// emitted when the allocated mirror actually has the slot.
+const LEGACY_NAME_SLOT: usize = 1;
+const LEGACY_PRIMITIVE_SLOT: usize = 7;
+const LEGACY_CLASS_REDEFINED_COUNT_SLOT: usize = 12;
+
+/// Resolve the [`ClassMirrorSlots`] for the loaded `java/lang/Class`.
+///
+/// `class` is the `java/lang/Class` definition whose instance-field layout we
+/// mirror. For a real classfile we resolve each field **by name** (validated by
+/// descriptor): `find_own_field` returns the **absolute** slot index (the same
+/// index `VmHeap::set_field` takes), so the result is layout-independent and
+/// survives JDK field reorderings.
+///
+/// A synthetic stub has only unnamed `_fN` placeholder fields (often zero of
+/// them), so by-name resolution finds nothing; for it we fall back to the
+/// historical fixed slot numbers the synthetic-mode natives expect, gated by
+/// `mirror_field_count` — the number of slots the mirror is actually allocated
+/// with (`CLASS_MIRROR_NUM_FIELDS` in synthetic mode, not the stub's own field
+/// table) — so we never hand back an out-of-bounds index.
+fn resolve_class_mirror_slots(
+    class: &crate::classloading::Class,
+    mirror_field_count: usize,
+) -> ClassMirrorSlots {
+    if class.is_synthetic_stub {
+        let slot = |s: usize| (s < mirror_field_count).then_some(s);
+        return ClassMirrorSlots {
+            name: slot(LEGACY_NAME_SLOT),
+            modifiers: None, // synthetic natives don't read a modifiers slot
+            primitive: slot(LEGACY_PRIMITIVE_SLOT),
+            class_redefined_count: slot(LEGACY_CLASS_REDEFINED_COUNT_SLOT),
+            reflection_data: None,
+        };
+    }
+    // Real classfile: resolve by name. Accept a field only when its descriptor
+    // matches one of the expected forms — this rejects an unrelated same-named
+    // field in a divergent layout instead of writing the wrong type into it.
+    let resolve = |name: &str, descriptors: &[&str]| -> Option<usize> {
+        class
+            .find_own_field(name)
+            .filter(|(_, f)| !f.is_static() && descriptors.contains(&&*f.descriptor))
+            .map(|(idx, _)| idx)
+    };
+    ClassMirrorSlots {
+        name: resolve("name", &["Ljava/lang/String;"]),
+        // `modifiers` is `int` in current JDKs; accept `char` defensively.
+        modifiers: resolve("modifiers", &["I", "C"]),
+        primitive: resolve("primitive", &["Z"]),
+        class_redefined_count: resolve("classRedefinedCount", &["I"]),
+        reflection_data: resolve("reflectionData", &["Ljava/lang/ref/SoftReference;"]),
+    }
+}
+
 /// Whether the `CRATONVM_DBG_TOARRAY` diagnostic is enabled.
 ///
 /// Resolved once from the environment and cached for the process lifetime,
@@ -467,10 +552,13 @@ fn dbg_toarray_enabled() -> bool {
 /// `a.getClass() == a.getClass()` is always true.
 ///
 /// Layout: the mirror is sized to the real `java/lang/Class` class
-/// (`num_total_fields`, ≈19 in JDK 25; 2 for the synthetic stub).  In the
-/// real-JDK layout we populate the `name` (slot 1), `modifiers` (slot 6),
-/// and `primitive` (slot 7) instance fields so JDK bytecode that reads
-/// them directly via `getfield` sees correct values.
+/// (`num_total_fields`, ≈19 in JDK 25; 2 for the synthetic stub).  We populate
+/// the `name`, `modifiers` and `primitive` instance fields — and
+/// `classRedefinedCount` / `reflectionData` when present — so JDK bytecode that
+/// reads them directly via `getfield` sees correct values. The target slots are
+/// resolved **by name** off the loaded `java/lang/Class` (see
+/// [`resolve_class_mirror_slots`]) so the mirror stays correct regardless of the
+/// JDK's private field order.
 ///
 /// The class_id ↔ mirror mapping is maintained by `SharedVm.class_mirrors`
 /// (forward) and `SharedVm.class_mirrors_reverse` (reverse), which lets
@@ -536,43 +624,16 @@ pub fn get_or_create_class_mirror(shared: &SharedVm, class_id: ClassId) -> Objec
 
     let mirror = shared.heap.alloc_object(class_class_id, mirror_field_count);
 
-    // Populate the real JDK 25 `java.lang.Class` instance field layout:
-    //
-    //   Slot 0:  cachedConstructor  (Constructor<T>)  → null
-    //   Slot 1:  name               (String)          → class name
-    //   Slot 2:  module             (Module)           → null
-    //   Slot 3:  classLoader        (ClassLoader)      → null
-    //   Slot 4:  classData          (Object)           → null
-    //   Slot 5:  signers            (Object[])         → null
-    //   Slot 6:  modifiers          (char/int)         → access_flags
-    //   Slot 7:  primitive          (boolean/int)      → false (0)
-    //   Slot 8:  packageName        (String)           → null
-    //   Slot 9:  componentType      (Class<?>)         → null
-    //   Slot 10: protectionDomain   (ProtectionDomain) → null
-    //   Slot 11: reflectionData     (SoftReference)    → null
-    //   Slot 12: classRedefinedCount (int)             → 0
-    //   Slot 13: genericInfo        (ClassRepository)  → null
-    //   Slot 14: enumConstants      (T[])              → null
-    //   Slot 15: enumConstantDirectory (Map)           → null
-    //   Slot 16: annotationData     (AnnotationData)   → null
-    //   Slot 17: annotationType     (AnnotationType)   → null
-    //   Slot 18: classValueMap      (ClassValueMap)    → null
-    //
-    // Null Object fields default to zero/null in the heap already,
-    // so we only need to explicitly set non-null / non-zero fields.
-
-    // Slot 0: store class_id as Int for legacy compatibility (mirror_class_id
-    // fallback and internal VM code that reads field 0). In real-JDK mode this
-    // "occupies" the cachedConstructor slot, but JDK bytecode that reads
-    // cachedConstructor will get an Int which it treats as an invalid reference
-    // (effectively null) — safe because cachedConstructor is checked with `if
-    // (cachedConstructor == null)` patterns.
-    shared
-        .heap
-        .set_field(mirror, 0, Value::Int(class_id.as_u32() as i32));
-
-    // Slot 1: name → class name String (same slot in both synthetic and real JDK)
-    let (class_name, access_flags) = {
+    // Populate the `java.lang.Class` mirror. The JDK lays out `Class`'s private
+    // instance fields (`name`, `modifiers`, `primitive`, `classRedefinedCount`,
+    // `reflectionData`, …) in an order that is an implementation detail and has
+    // changed between releases, so rather than hardcoding JDK-25 slot numbers
+    // we resolve each field's heap slot **by name** off the loaded
+    // `java/lang/Class`. `set_field` writes the same default null/zero into
+    // every other slot during allocation, so we only set the fields whose
+    // value differs from that default — and only when the field is present in
+    // the loaded layout (synthetic stubs resolve nothing).
+    let (class_name, access_flags, slots) = {
         let cm = shared.class_manager.read();
         let name = cm
             .get_class(class_id)
@@ -582,32 +643,53 @@ pub fn get_or_create_class_mirror(shared: &SharedVm, class_id: ClassId) -> Objec
             .get_class(class_id)
             .map(|c| c.access_flags.bits())
             .unwrap_or(0u16);
-        (name, flags)
+        // Resolve the mirror's writable slots off the `java/lang/Class`
+        // definition (not the mirrored class), since they describe the
+        // *mirror object's* layout.
+        let slots = cm
+            .get_class(class_class_id)
+            .map(|c| resolve_class_mirror_slots(c, mirror_field_count))
+            .unwrap_or_default();
+        (name, flags, slots)
     };
-    let name_obj = create_java_string(shared, &class_name);
+
+    // Slot 0: store class_id as Int for legacy compatibility (mirror_class_id
+    // fallback and internal VM code that reads field 0). This is a VM-internal
+    // convention, not a JDK field, so it stays at a fixed slot. In real-JDK
+    // mode it "occupies" the first instance slot (`cachedConstructor`), but
+    // JDK bytecode that reads `cachedConstructor` gets an Int which it treats
+    // as an invalid reference (effectively null) — safe because the field is
+    // always read under an `if (cachedConstructor == null)` guard.
     shared
         .heap
-        .set_field(mirror, 1, Value::Object(Some(name_obj)));
+        .set_field(mirror, 0, Value::Int(class_id.as_u32() as i32));
 
-    // Populate the real JDK 25 `java.lang.Class` extended fields when the
-    // mirror has the full field count (19 fields in real-JDK mode).
-    // This is critical for Class.reflectionData() which reads
-    // classRedefinedCount (slot 12) directly via bytecode.
-    if mirror_field_count > 6 {
-        // Slot 6: modifiers (access flags as int)
+    // name → class name String.
+    if let Some(idx) = slots.name {
+        let name_obj = create_java_string(shared, &class_name);
         shared
             .heap
-            .set_field(mirror, 6, Value::Int(access_flags as i32));
+            .set_field(mirror, idx, Value::Object(Some(name_obj)));
     }
-    if mirror_field_count > 7 {
-        // Slot 7: primitive → false (0) for regular class mirrors
-        shared.heap.set_field(mirror, 7, Value::Int(0));
+    // modifiers → access flags as int.
+    if let Some(idx) = slots.modifiers {
+        shared
+            .heap
+            .set_field(mirror, idx, Value::Int(access_flags as i32));
     }
-    if mirror_field_count > 12 {
-        // Slot 11: reflectionData → null (SoftReference<ReflectionData>)
-        shared.heap.set_field(mirror, 11, Value::Object(None));
-        // Slot 12: classRedefinedCount → 0 (critical for Class.reflectionData())
-        shared.heap.set_field(mirror, 12, Value::Int(0));
+    // primitive → false (0) for regular class mirrors.
+    if let Some(idx) = slots.primitive {
+        shared.heap.set_field(mirror, idx, Value::Int(0));
+    }
+    // reflectionData → null (SoftReference<ReflectionData>); already the heap
+    // default, but set explicitly to document the contract.
+    if let Some(idx) = slots.reflection_data {
+        shared.heap.set_field(mirror, idx, Value::Object(None));
+    }
+    // classRedefinedCount → 0 (critical for Class.reflectionData(), which reads
+    // it directly via bytecode).
+    if let Some(idx) = slots.class_redefined_count {
+        shared.heap.set_field(mirror, idx, Value::Int(0));
     }
 
     mirrors.insert(class_id, mirror);
@@ -669,23 +751,33 @@ pub fn get_or_create_primitive_mirror(shared: &SharedVm, prim_name: &str) -> Obj
 
     let mirror = shared.heap.alloc_object(class_class_id, mirror_field_count);
 
-    // Slot 0: Int(-1) marks this as a primitive Class mirror (legacy convention).
+    // Resolve the writable `java/lang/Class` mirror slots by name (see
+    // `get_or_create_class_mirror` for why this is layout-independent).
+    let slots = {
+        let cm = shared.class_manager.read();
+        cm.get_class(class_class_id)
+            .map(|c| resolve_class_mirror_slots(c, mirror_field_count))
+            .unwrap_or_default()
+    };
+
+    // Slot 0: Int(-1) marks this as a primitive Class mirror (legacy
+    // VM-internal convention, not a JDK field — fixed slot).
     shared.heap.set_field(mirror, 0, Value::Int(-1));
 
-    // Slot 1: primitive type name as String
-    let name_obj = create_java_string(shared, prim_name);
-    shared
-        .heap
-        .set_field(mirror, 1, Value::Object(Some(name_obj)));
-
-    // Extended fields for real-JDK mode
-    if mirror_field_count > 7 {
-        // Slot 7: primitive → true (1) — this IS a primitive mirror
-        shared.heap.set_field(mirror, 7, Value::Int(1));
+    // name → primitive type name as String.
+    if let Some(idx) = slots.name {
+        let name_obj = create_java_string(shared, prim_name);
+        shared
+            .heap
+            .set_field(mirror, idx, Value::Object(Some(name_obj)));
     }
-    if mirror_field_count > 12 {
-        // Slot 12: classRedefinedCount → 0
-        shared.heap.set_field(mirror, 12, Value::Int(0));
+    // primitive → true (1): this IS a primitive mirror.
+    if let Some(idx) = slots.primitive {
+        shared.heap.set_field(mirror, idx, Value::Int(1));
+    }
+    // classRedefinedCount → 0.
+    if let Some(idx) = slots.class_redefined_count {
+        shared.heap.set_field(mirror, idx, Value::Int(0));
     }
 
     mirrors.insert(prim_name.to_string(), mirror);
@@ -1421,6 +1513,31 @@ mod tests {
             }
             _ => panic!("Expected name string in field 1"),
         }
+    }
+
+    /// Regression: the synthetic-stub `java/lang/Class` mirror is allocated
+    /// with only `CLASS_MIRROR_NUM_FIELDS` (2) slots, yet the legacy fixed
+    /// layout would place `primitive` at slot 7 and `classRedefinedCount` at
+    /// slot 12. `resolve_class_mirror_slots` must gate those against the
+    /// allocated field count so the populator never writes out of bounds —
+    /// only slots 0 (class_id) and 1 (name) are touched on a 2-field mirror.
+    #[test]
+    fn class_mirror_synthetic_stub_respects_field_count() {
+        let shared = test_shared();
+        let mirror = get_or_create_class_mirror(&shared, ClassId::new(123));
+        // The synthetic-stub mirror is sized to CLASS_MIRROR_NUM_FIELDS (2),
+        // while the legacy fixed layout would place `primitive` at slot 7 and
+        // `classRedefinedCount` at slot 12. Reaching this line at all proves
+        // the slot gate kept those writes in bounds (an ungated write would
+        // have panicked in `set_field`).
+        let n = shared.heap.num_fields(mirror);
+        assert!(n >= CLASS_MIRROR_NUM_FIELDS);
+        // Slot 0 holds the class id; the legacy name slot (1) holds the name.
+        assert_eq!(shared.heap.get_field(mirror, 0), Value::Int(123));
+        assert!(matches!(
+            shared.heap.get_field(mirror, LEGACY_NAME_SLOT),
+            Value::Object(Some(_))
+        ));
     }
 
     // -----------------------------------------------------------------------
