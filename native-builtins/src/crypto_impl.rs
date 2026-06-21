@@ -1083,26 +1083,123 @@ fn secure_random_entropy_seed() -> u64 {
     }
 }
 
-/// Fetch (lazily initialising from OS entropy) the DRBG state for `key`,
-/// derive `buf.len()` output bytes from it, and advance the state.  This is the
-/// single output path used by both `nextBytes` and `generateSeed`.
-fn secure_random_fill(key: i32, buf: &mut [u8]) {
-    let mut guard = SECURE_RANDOM_STATE.write();
-    let map = guard.get_or_insert_with(std::collections::HashMap::new);
-    let (seed, counter) = map
-        .entry(key)
-        .or_insert_with(|| (secure_random_entropy_seed(), 0u64));
+/// Fill `buf` with cryptographically-strong random bytes.  This is the single
+/// output path used by both `nextBytes` and `generateSeed`.
+///
+/// nb-crypto-impl VULN(secrand): the PRIOR implementation derived every output
+/// byte as `splitmix64(seed ^ counter)` over a per-instance state seeded with a
+/// SINGLE 64-bit OS draw.  splitmix64 is an invertible bijection, so the whole
+/// stream carried at most 64 bits of entropy: an attacker who observed ~8
+/// consecutive output bytes could invert the mixer to recover `seed ^ counter`,
+/// then reproduce every past and future byte from that `SecureRandom`.  That is
+/// a catastrophic break of `java.security.SecureRandom`'s contract.
+///
+/// FIX: draw EVERY output byte directly from the OS CSPRNG
+/// (`os_random_bytes` → `RtlGenRandom` / `/dev/urandom`).  `java.security.
+/// SecureRandom` does NOT promise reproducibility for an unseeded instance, so
+/// this is spec-compliant.  The `key` argument is retained for signature
+/// stability but is no longer consulted — output no longer depends on any
+/// per-instance, identity-hash-keyed DRBG state (see VULN(secrand-collision)),
+/// which also closes the identity-hash aliasing hazard.
+///
+/// On the rare event that the OS source is unavailable, fall back to a fresh
+/// ChaCha20 keystream re-keyed from `secure_random_entropy_seed` (which itself
+/// mixes nanosecond timing, PID and thread id when the OS source is down).  The
+/// fallback is far stronger than the broken splitmix64 stream — ChaCha20 is a
+/// CSPRNG, not an invertible 64-bit mixer — and the primary path is always the
+/// OS CSPRNG.
+fn secure_random_fill(_key: i32, buf: &mut [u8]) {
+    // Primary path: straight from the OS CSPRNG. Retry once on a transient
+    // failure before degrading to the software fallback.
+    if os_random_bytes(buf) {
+        return;
+    }
+    if os_random_bytes(buf) {
+        return;
+    }
+    // OS entropy unavailable — derive a one-shot ChaCha20 key/nonce from a fresh
+    // entropy mix and run the keystream. This block is re-keyed on every call
+    // (no persistent, predictable state survives between draws).
+    tracing::warn!("OS entropy unavailable for SecureRandom — using ChaCha20 fallback");
+    let mut key = [0u8; 32];
+    for chunk in key.chunks_mut(8) {
+        let n = chunk.len();
+        chunk.copy_from_slice(&secure_random_entropy_seed().to_le_bytes()[..n]);
+    }
+    let mut nonce = [0u8; 12];
+    for chunk in nonce.chunks_mut(4) {
+        let n = chunk.len();
+        let word = secure_random_entropy_seed() as u32;
+        chunk.copy_from_slice(&word.to_le_bytes()[..n]);
+    }
+    chacha20_keystream_fill(&key, &nonce, buf);
+}
+
+/// ChaCha20 keystream generator (RFC 8439).  Used ONLY as the software fallback
+/// inside `secure_random_fill` when the OS CSPRNG is unavailable; it writes its
+/// raw keystream into `buf` (i.e. XOR against an implicit zero plaintext).
+fn chacha20_keystream_fill(key: &[u8; 32], nonce: &[u8; 12], buf: &mut [u8]) {
+    #[inline]
+    fn quarter_round(s: &mut [u32; 16], a: usize, b: usize, c: usize, d: usize) {
+        s[a] = s[a].wrapping_add(s[b]);
+        s[d] = (s[d] ^ s[a]).rotate_left(16);
+        s[c] = s[c].wrapping_add(s[d]);
+        s[b] = (s[b] ^ s[c]).rotate_left(12);
+        s[a] = s[a].wrapping_add(s[b]);
+        s[d] = (s[d] ^ s[a]).rotate_left(8);
+        s[c] = s[c].wrapping_add(s[d]);
+        s[b] = (s[b] ^ s[c]).rotate_left(7);
+    }
+    let mut state0 = [0u32; 16];
+    // Constants "expand 32-byte k".
+    state0[0] = 0x6170_7865;
+    state0[1] = 0x3320_646e;
+    state0[2] = 0x7962_2d32;
+    state0[3] = 0x6b20_6574;
+    for i in 0..8 {
+        state0[4 + i] = u32::from_le_bytes([
+            key[4 * i],
+            key[4 * i + 1],
+            key[4 * i + 2],
+            key[4 * i + 3],
+        ]);
+    }
+    // state[12] is the block counter; state[13..16] are the 96-bit nonce.
+    for i in 0..3 {
+        state0[13 + i] = u32::from_le_bytes([
+            nonce[4 * i],
+            nonce[4 * i + 1],
+            nonce[4 * i + 2],
+            nonce[4 * i + 3],
+        ]);
+    }
+    let mut counter: u32 = 0;
     let mut pos = 0;
     while pos < buf.len() {
-        // Same per-block mixing as `SecureRandom::next_bytes`'s seeded branch:
-        // splitmix64 over `seed ^ counter`, advancing the counter each block.
-        let mut state = *seed ^ *counter;
-        let val = splitmix64(&mut state);
-        *counter = counter.wrapping_add(1);
-        let bytes = val.to_le_bytes();
-        let to_copy = (buf.len() - pos).min(8);
-        buf[pos..pos + to_copy].copy_from_slice(&bytes[..to_copy]);
+        let mut working = state0;
+        working[12] = counter;
+        let mut x = working;
+        for _ in 0..10 {
+            // Column rounds.
+            quarter_round(&mut x, 0, 4, 8, 12);
+            quarter_round(&mut x, 1, 5, 9, 13);
+            quarter_round(&mut x, 2, 6, 10, 14);
+            quarter_round(&mut x, 3, 7, 11, 15);
+            // Diagonal rounds.
+            quarter_round(&mut x, 0, 5, 10, 15);
+            quarter_round(&mut x, 1, 6, 11, 12);
+            quarter_round(&mut x, 2, 7, 8, 13);
+            quarter_round(&mut x, 3, 4, 9, 14);
+        }
+        let mut block = [0u8; 64];
+        for i in 0..16 {
+            let word = x[i].wrapping_add(working[i]);
+            block[4 * i..4 * i + 4].copy_from_slice(&word.to_le_bytes());
+        }
+        let to_copy = (buf.len() - pos).min(64);
+        buf[pos..pos + to_copy].copy_from_slice(&block[..to_copy]);
         pos += to_copy;
+        counter = counter.wrapping_add(1);
     }
 }
 
@@ -5345,6 +5442,37 @@ mod tests {
         let mut s1 = 42u64;
         let mut s2 = 42u64;
         assert_eq!(splitmix64(&mut s1), splitmix64(&mut s2));
+    }
+
+    // -----------------------------------------------------------------------
+    // ChaCha20 keystream (SecureRandom OS-entropy fallback) — RFC 7539 vector
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn chacha20_keystream_rfc7539_zero_key() {
+        // RFC 7539 §2.3.2 derived: ChaCha20 keystream for an all-zero 256-bit
+        // key, all-zero 96-bit nonce, starting block counter 0. This is the
+        // canonical "ChaCha20 of zeros" reference output.
+        let key = [0u8; 32];
+        let nonce = [0u8; 12];
+        let mut out = [0u8; 64];
+        chacha20_keystream_fill(&key, &nonce, &mut out);
+        assert_eq!(
+            hex(&out),
+            "76b8e0ada0f13d90405d6ae55386bd28bdd219b8a08ded1aa836efcc8b770dc7\
+             da41597c5157488d7724e03fb8d84a376a43b8f41518a11cc387b669b2ee6586"
+        );
+    }
+
+    #[test]
+    fn chacha20_keystream_spans_multiple_blocks() {
+        // A request larger than one 64-byte block must keep advancing the
+        // counter: the second block differs from the first (no repetition).
+        let key = [7u8; 32];
+        let nonce = [3u8; 12];
+        let mut out = [0u8; 128];
+        chacha20_keystream_fill(&key, &nonce, &mut out);
+        assert_ne!(&out[..64], &out[64..], "blocks must not repeat");
     }
 
     // -----------------------------------------------------------------------
