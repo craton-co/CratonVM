@@ -172,8 +172,50 @@ Author note: this doc is grounded in a read of `gc/src/{g1,g1_concurrent,zgc,zgc
   - Remaining for Step 5: the GAP A fix shipped a per-slot remap correction; a
     fuller moving-GC stress test (multi-thread precise-JIT frame + FFM upcall
     relocated under `-XX:+UseG1GC`) asserting no staleness is still worthwhile.
-- Steps 6–10 — not started. Next highest-value: Step 8 (opt-in G1 gauntlet
-  validation).
+- **Step 6 (JNI-critical region pinning under G1) — DONE** (branch
+  `feat/g1-jni-critical-pin`). The §3.2.5 gap, refined: the merged force-copy fix
+  (#24) closes the *data-movement* half — `GetPrimitiveArrayCritical` hands native
+  code a detached **copy**, never a heap pointer, so relocating the source is
+  harmless to the native reads. But `ReleasePrimitiveArrayCritical`'s **copy-back**
+  re-resolves the array's *Get-time* handle (`jobject_to_obj(copy.array)`, a raw
+  local-ref address); the keep-alive pin is "keep-alive ONLY, not no-relocation",
+  so under G1 a young/mixed evacuation mid-section moves the array and that handle
+  goes stale → the copy-back silently drops (CSet region freed → `is_heap_addr`
+  None) or writes back into a recycled object (corruption). G1 makes this reachable
+  (unconditional young/mixed evacuation); the generational young-from is swapped
+  not freed and critical sections are short, so it stayed latent there — matching
+  the doc's "G1 makes this exploitable".
+  - **Fix:** drive the existing (previously test-only) `G1Region` pin machinery
+    from the critical path. `jni_get_primitive_array_critical` calls
+    `VmHeap::pin_critical_region(array)` → `G1Collector::pin_region_for_addr`
+    (lock-free `lookup_region_for_addr` + refcounted `pin_region`), recording the
+    pinned region index(es) in the `CriticalCopy`;
+    `jni_release_primitive_array_critical` calls `unpin_critical_regions` on the
+    **final** release (NOT `JNI_COMMIT` mode 1, whose section continues and must
+    stay pinned). G1's only object-moving paths — `young_collection` /
+    `mixed_collection` — exclude pinned regions from the collection set, and there
+    is no full-GC compaction path, so a pinned array cannot move while checked out
+    → the copy-back resolves the same object.
+  - **Refcounted** (`G1Region.pin_count`, mirrored by the existing `pinned` bool
+    the CSet filters read): overlapping critical sections on arrays in the same
+    region, and nested checkouts of one array, pin/unpin independently — a single
+    `bool` would let an inner Release clear a pin an outer section still holds.
+    No-op (empty pin set) on the generational collector.
+  - **GetStringCritical** needs no pinning: it delegates to `GetStringChars`
+    (copy) and strings are immutable, so `Release` frees the copy with **no
+    copy-back** — there is no stale-handle write to guard.
+  - **Scope note:** the *non-critical* `Get<Type>ArrayElements` force-copy path
+    has the same latent copy-back staleness under G1, but region pinning is the
+    wrong fix there (the JNI spec permits long-lived element copies; pinning would
+    hold regions arbitrarily long) — it needs a remappable copy-back handle.
+    Pre-existing, tracked as a separate follow-up.
+  - **Validation:** `cratonvm-gc` g1 tests green — new
+    `pin_region_for_addr_keeps_jni_critical_array_in_place` (a young GC leaves a
+    pinned array's address unchanged + data intact) and `region_pin_refcount_balances`;
+    full g1 suite + `cratonvm-cli` build green; FieldStress checksum unchanged
+    under `-XX:+UseG1GC`.
+- Steps 7–10 — not started. Next highest-value: Step 8 (opt-in G1 gauntlet
+  validation); Step 7 (pause-target CSet sizing) is best done with gauntlet data.
 
 ---
 

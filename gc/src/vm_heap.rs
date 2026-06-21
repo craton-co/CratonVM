@@ -601,6 +601,38 @@ impl VmHeap {
         dispatch!(self, set_array_element(obj, index, value))
     }
 
+    /// JNI critical-section region pinning (Step 6 / JEP 423). Pin the G1
+    /// region backing `obj` so a moving collection cannot relocate the array
+    /// while a native `GetPrimitiveArrayCritical` section holds a detached copy
+    /// that must be copied back to *this* object at `Release`. Returns the
+    /// pinned region indices for the matching [`Self::unpin_critical_regions`].
+    ///
+    /// No-op (returns empty) on the generational collector: the copy-back
+    /// staleness is reachable in practice only under G1's aggressive young/mixed
+    /// evacuation, which is the documented Step 6 target (design doc §3.2.5);
+    /// the array's liveness is independently held by the `cratonvm_gc::pinned`
+    /// keep-alive set at the JNI call site.
+    pub fn pin_critical_region(&self, obj: ObjectRef) -> Vec<usize> {
+        match self {
+            VmHeap::Generational(_) => Vec::new(),
+            VmHeap::G1(h) => h
+                .pin_region_for_addr(obj.as_ptr() as usize)
+                .into_iter()
+                .collect(),
+        }
+    }
+
+    /// Release a pin set taken by [`Self::pin_critical_region`] at
+    /// `GetPrimitiveArrayCritical`. No-op on the generational collector / for an
+    /// empty set.
+    pub fn unpin_critical_regions(&self, region_indices: &[usize]) {
+        if let VmHeap::G1(h) = self {
+            for &idx in region_indices {
+                h.unpin_region(idx);
+            }
+        }
+    }
+
     /// Read an array element with auto-unboxing of wrapper types.
     /// G1 falls back to plain get_array_element (no unboxing support yet).
     pub fn get_array_element_unboxing(&self, obj: ObjectRef, index: usize) -> Result<Value, i32> {
