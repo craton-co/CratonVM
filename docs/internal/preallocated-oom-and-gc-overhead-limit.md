@@ -86,19 +86,22 @@ JIT-off, 64m JIT-on, 64m JIT-off** (3–7s), where it previously aborted. No
 regression: bintrees10/14/18 = 135854/3222190/68332206 (reroute doesn't fire at
 8g), sieve250k=22044, IrCall inc-22, BigArrayOom caught.
 
-## Known residual (layer 5 — non-moving-sweep perf, separate)
+## "Layer 5" was a MEASUREMENT ARTIFACT — not a real issue
 
-`ObjAllocOom.objLoop` at **16m + JIT-on** no longer aborts (stale=0, no FATAL)
-and *does* eventually OOM — the GC-overhead streak reaches the limit (9 ≥ 8) —
-but only ~9 forced GCs occur in 70s, so it catches too slowly to be usable. The
-time is spent in the *regular* (non-forced) non-moving young GC at a tight heap,
-freeing slivers via promotion while old fills. This is a non-moving-sweep
-performance pathology (specific to tight-heap + JIT-active + fully-retained
-allocation), not the promotion abort and not a correctness defect (no abort, no
-crash, correct eventual OOM). The other three configs are fast. Tracked
-separately. Possible directions: extend overhead/productivity tracking to the
-regular young-GC path so the death-spiral is cut sooner, or speed up the
-non-moving sweep at small heaps.
+An earlier write-up of this doc claimed `ObjAllocOom.objLoop` at **16m + JIT-on**
+caught "too slowly (~70s)". That was **CPU contention from concurrent `cargo`
+builds**, not a VM pathology: every slow reading was taken while a release build
+saturated the machine (bt18 also read 60–76 s in those windows vs its ~23–35 s
+normal). Measured cleanly (no build running), objLoop @16m JIT-on completes in
+**1–2 s** (caught + "alive after OOM", == HotSpot), and `CRATONVM_DBG_DEOPT`
+reports **0 deopts** — refuting both the "slow non-moving GC" and the
+"deopt-thrash" theories. **All four configs** (16m/64m × JIT on/off) catch fast.
+The heap-full catchable-OOM work is complete.
+
+Lesson: do not trust VM wall-clock or GC-frequency numbers gathered while a build
+(or any CPU hog) is running — they inflate 3–14×. (The layer-4 collector *abort*
+fix above is real and load-independent — a deterministic `process::abort()` — and
+stands.)
 
 ## Note
 
