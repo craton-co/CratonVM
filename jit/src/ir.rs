@@ -171,6 +171,10 @@ pub enum Op {
     // ── Comparison ───────────────────────────────────────────────────
     /// Integer compare.  Inputs: `[left, right]`.  Result: `Int` (0/1).
     Cmp(CmpOp),
+    /// Long 3-way compare (`lcmp`). Inputs: `[left, right]` (both `Long`).
+    /// Result: `Int` ∈ {-1, 0, 1} = sign(left − right), signed. Typically feeds
+    /// an `if<cond>` against zero (`lcmp; iflt` ⇒ `left < right`).
+    LCmp,
 
     // ── Type conversion ──────────────────────────────────────────────
     I2L,
@@ -1183,6 +1187,71 @@ impl IrBuilder {
                     let b = self.pop();
                     let a = self.pop();
                     let r = self.add_data(Op::Xor, IrType::Int, vec![a, b], pc);
+                    self.push(r);
+                    pc += 1;
+                }
+                // inc 27: long shifts + bitwise. The shift count is an `int` (one
+                // slot) on top of the `long` value; the lowerer's `Op::Shl/Shr/
+                // UShr` are width-aware (64-bit shift masks the count to 6 bits,
+                // matching `lshl`'s `count & 0x3f`), and `Op::And/Or/Xor` are
+                // already 64-bit (correct for both Int and Long). These are
+                // 1-byte opcodes (the length walkers' default arm sizes them
+                // correctly). Long-only → inert for the int path.
+                // lshl
+                0x79 => {
+                    let b = self.pop();
+                    let a = self.pop();
+                    let r = self.add_data(Op::Shl, IrType::Long, vec![a, b], pc);
+                    self.push(r);
+                    pc += 1;
+                }
+                // lshr
+                0x7b => {
+                    let b = self.pop();
+                    let a = self.pop();
+                    let r = self.add_data(Op::Shr, IrType::Long, vec![a, b], pc);
+                    self.push(r);
+                    pc += 1;
+                }
+                // lushr
+                0x7d => {
+                    let b = self.pop();
+                    let a = self.pop();
+                    let r = self.add_data(Op::UShr, IrType::Long, vec![a, b], pc);
+                    self.push(r);
+                    pc += 1;
+                }
+                // land
+                0x7f => {
+                    let b = self.pop();
+                    let a = self.pop();
+                    let r = self.add_data(Op::And, IrType::Long, vec![a, b], pc);
+                    self.push(r);
+                    pc += 1;
+                }
+                // lor
+                0x81 => {
+                    let b = self.pop();
+                    let a = self.pop();
+                    let r = self.add_data(Op::Or, IrType::Long, vec![a, b], pc);
+                    self.push(r);
+                    pc += 1;
+                }
+                // lxor
+                0x83 => {
+                    let b = self.pop();
+                    let a = self.pop();
+                    let r = self.add_data(Op::Xor, IrType::Long, vec![a, b], pc);
+                    self.push(r);
+                    pc += 1;
+                }
+                // lcmp — inc 27. 3-way signed compare of two longs → int
+                // {-1,0,1}; usually feeds an `if<cond>` against 0 (the existing
+                // 0x99..0x9e arm), so `lcmp; iflt` becomes `left < right`.
+                0x94 => {
+                    let b = self.pop();
+                    let a = self.pop();
+                    let r = self.add_data(Op::LCmp, IrType::Int, vec![a, b], pc);
                     self.push(r);
                     pc += 1;
                 }
