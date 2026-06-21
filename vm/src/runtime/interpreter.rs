@@ -3990,7 +3990,7 @@ pub fn execute(
     // regression suites (bc-asn1/crypto/crypto-prng went rc=0 -> rc=124).
     // The uncached invoke path is not a safe consumer of the thread-local
     // frame pools as-is; reverted to the proven `new_from_arcs` path.
-    let frame = Frame::new_from_arcs(
+    let mut frame = Frame::new_from_arcs(
         class_id,
         std::sync::Arc::from(class_name_str.as_str()),
         std::sync::Arc::from(method_name),
@@ -4002,6 +4002,22 @@ pub fn execute(
         code_attr.max_locals,
         args,
     );
+
+    // GC-safety: if the JIT early-compile path produced an exception, root its
+    // oop on the operand stack BEFORE `push_frame_and_fire_entry` fires the
+    // JVMTI MethodEntry callback. That callback may allocate Java heap and
+    // trigger a moving young-gen GC; an oop reachable only through the
+    // `jit_early_exception` Rust local across the fire would be unrooted and
+    // could be relocated, leaving a stale pointer for the handler walk /
+    // propagation below. The frame's operand stack is GC-scanned, so we read
+    // the (possibly relocated) reference back from it after the fire. The
+    // pre-fire push is best-effort (`let _ =`): if it does not take — e.g. a
+    // `max_stack == 0` method, which by definition has no operand-using
+    // handler — we fall back to the original local, no worse than before.
+    // Mirrors `route_jit_exception_through_method` / `resume_from_ir_deopt`.
+    if let Some(exc) = jit_early_exception {
+        let _ = frame.stack.push(Value::Object(Some(exc)));
+    }
 
     // Push frame onto thread
     if crate::runtime::env_cache::frame_trace() {
@@ -4017,9 +4033,17 @@ pub fn execute(
 
     // If the JIT early-compile path encountered a Java exception from a callee,
     // route it through this method's exception table before interpreter execution.
-    if let Some(exc) = jit_early_exception {
+    if jit_early_exception.is_some() {
         // The frame has been pushed. Search its exception table for a handler.
         let frame_idx = thread.frames.len() - 1;
+        // Re-read the exception oop from the (GC-scanned) operand stack: a GC
+        // during the MethodEntry callback may have relocated it, and only the
+        // scanned frame slot was updated — not the original Rust local. Fall
+        // back to the local if the pre-fire push did not take.
+        let exc = match thread.frames[frame_idx].stack.pop() {
+            Ok(Value::Object(Some(r))) => r,
+            _ => jit_early_exception.expect("jit_early_exception is_some"),
+        };
         // The JIT executed the entire method body as native code, so there is
         // no live throw-site PC. Previously this passed the freshly-pushed
         // frame's `last_instr_pc` (always 0) to the PC-ranged search, which
@@ -7507,7 +7531,7 @@ fn route_jit_exception_through_method(
         (cached.max_stack as usize).max(16) + 8,
     );
 
-    let frame = crate::runtime::frame::Frame::new_pooled(
+    let mut frame = crate::runtime::frame::Frame::new_pooled(
         cached.declaring_class_id,
         cached.class_name.clone(),
         cached.method_name.clone(),
@@ -7521,6 +7545,20 @@ fn route_jit_exception_through_method(
         &mut thread.locals_pool,
         &mut thread.stacks_pool,
     );
+    // GC-safety: push the live exception oop onto the handler frame's operand
+    // stack BEFORE `push_frame_and_fire_entry`. That helper fires a JVMTI
+    // MethodEntry callback (when a listener is active); the callback can
+    // allocate Java heap and trigger a young-gen GC that relocates live oops
+    // (gen_heap.rs selective promotion). If `exc` were pushed only AFTER the
+    // fire, it would be reachable solely through this Rust local across the
+    // callback — unrooted — and a relocation/collection would leave a stale
+    // pointer on the operand stack. Populating the GC-scanned frame slot first
+    // keeps it rooted across the callback. Mirrors the same ordering fix in
+    // `resume_from_ir_deopt`.
+    frame
+        .stack
+        .push(Value::Object(Some(exc)))
+        .map_err(|e| MethodCallFailed::InternalError(VmError::Runtime(e)))?;
     if crate::runtime::env_cache::frame_trace() {
         eprintln!(
             "[FRAME_PUSH/jit_exc_route] depth={} {}.{}{}",
@@ -7532,11 +7570,8 @@ fn route_jit_exception_through_method(
     }
     push_frame_and_fire_entry(thread, frame);
     let new_idx = thread.frames.len() - 1;
-    // Push exception onto operand stack; set PC to handler.
-    thread.frames[new_idx]
-        .stack
-        .push(Value::Object(Some(exc)))
-        .map_err(|e| MethodCallFailed::InternalError(VmError::Runtime(e)))?;
+    // Exception is already on the operand stack (rooted before the fire above);
+    // just position the PC at the handler.
     thread.frames[new_idx].pc = handler_pc;
     // Silence unused parameter warning — caller_frame_idx is kept for
     // future extensions (e.g. return-value coercion into the caller).
