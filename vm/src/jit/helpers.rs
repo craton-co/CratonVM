@@ -156,6 +156,15 @@ thread_local! {
     /// consumed by the interpreter after JIT code returns `i64::MIN`.
     static JIT_PENDING_AIOOBE: Cell<Option<(i64, i64)>> = const { Cell::new(None) };
 
+    /// Pending `ArithmeticException` ("/ by zero") from a JIT integer-division
+    /// zero-divisor guard. Set by `jit_throw_arithmetic`, consumed by the
+    /// interpreter post-JIT-return path the same way as `JIT_PENDING_AIOOBE`:
+    /// the helper returns `i64::MIN` to signal deopt; the interpreter detects the
+    /// sentinel, takes this flag, and throws a real `ArithmeticException` through
+    /// the method's exception table — instead of re-running the method from entry
+    /// (which double-executed side effects preceding the trap).
+    static JIT_PENDING_ARITHMETIC: Cell<bool> = const { Cell::new(false) };
+
     /// Pending NullPointerException from a JIT array helper (`jit_iaload`,
     /// `jit_aaload`, `jit_arraylength` called with a null array reference).
     /// Consumed by the interpreter post-JIT-return path the same way as
@@ -458,6 +467,22 @@ pub(crate) fn jit_pending_exception_is_set() -> bool {
 /// Returns `Some((index, length))` if an AIOOBE was pending.
 pub fn take_jit_pending_aioobe() -> Option<(i64, i64)> {
     JIT_PENDING_AIOOBE.with(|e| e.take())
+}
+
+/// Take (consume) a pending `ArithmeticException` ("/ by zero") set by the JIT
+/// integer-division zero-divisor guard. Returns `true` if one was pending.
+/// Mirrors [`take_jit_pending_aioobe`]; the interpreter's post-JIT drain throws
+/// a real `ArithmeticException` through the method's exception table.
+pub fn take_jit_pending_arithmetic() -> bool {
+    JIT_PENDING_ARITHMETIC.with(|e| e.take())
+}
+
+/// Re-stash a previously taken pending-arithmetic flag. Mirrors
+/// [`stash_jit_pending_aioobe`] for the OSR drain-without-route path, so a
+/// div-by-zero raised in OSR-compiled code with no in-frame handler survives the
+/// OSR→interpreter handoff and is surfaced by the next JIT-return drain.
+pub(crate) fn stash_jit_pending_arithmetic() {
+    JIT_PENDING_ARITHMETIC.with(|e| e.set(true));
 }
 
 /// Take (consume) a pending NPE from a JIT array helper (`jit_iaload`,
@@ -2815,6 +2840,30 @@ pub unsafe extern "C" fn jit_throw_aioobe(index: i64, length: i64) -> i64 {
     // doesn't mistake a method legitimately returning `Long.MIN_VALUE` for one.
     set_jit_deopt_pending();
     i64::MIN // deopt sentinel — interpreter will detect and throw AIOOBE
+}
+
+/// Direct-throw for `ArithmeticException` ("/ by zero") — the div-by-zero
+/// sibling of [`jit_throw_aioobe`]. The x64 `idiv`/`irem`/`ldiv`/`lrem`
+/// zero-divisor guard jumps to a stub that calls this and immediately runs the
+/// method epilogue. We set the pending-arithmetic flag and the out-of-band deopt
+/// signal, then return the `i64::MIN` sentinel; the interpreter's JIT-return
+/// drain throws a real `ArithmeticException` through the method's exception table
+/// WITHOUT re-running the method from entry. Re-running (the previous
+/// `uncommon_trap` path) double-executed any side effect that preceded the trap,
+/// diverging from HotSpot.
+///
+/// Same Windows platform rationale as [`jit_throw_aioobe`]: JIT frames have no
+/// SEH unwind tables, so a Rust panic/unwind here would terminate the process;
+/// thread-local stashing sidesteps that.
+// SAFETY: Called from JIT-compiled code at a div-by-zero guard. Sets two
+// thread-locals and returns a sentinel; no pointer dereferences.
+pub unsafe extern "C" fn jit_throw_arithmetic() -> i64 {
+    // WS1: Rust<->JIT boundary — invalidate the per-thread JIT-scan cache
+    // (see conservative_roots::note_jit_boundary).
+    crate::jit::conservative_roots::note_jit_boundary();
+    JIT_PENDING_ARITHMETIC.with(|e| e.set(true));
+    set_jit_deopt_pending();
+    i64::MIN // deopt sentinel — interpreter will detect and throw ArithmeticException
 }
 
 /// RBC.6 (athrow codegen) — stash the thrown exception object as the
@@ -5486,6 +5535,7 @@ pub fn build_helpers() -> JitRuntimeHelpers {
         checkcast: jit_checkcast as *const () as usize,
         instanceof_check: jit_instanceof as *const () as usize,
         throw_aioobe: jit_throw_aioobe as *const () as usize,
+        throw_arithmetic: jit_throw_arithmetic as *const () as usize,
         invoke_dispatch: jit_invoke_dispatch as *const () as usize,
         invoke_virtual_mic: jit_invoke_virtual_mic as *const () as usize,
         write_barrier: jit_write_barrier as *const () as usize,

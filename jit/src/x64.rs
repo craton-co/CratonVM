@@ -13545,6 +13545,27 @@ impl Compiler {
             let stub_off = self.buf.pos();
             stub_offsets.insert(key, stub_off);
 
+            // reason 3 = divide-by-zero: direct-throw `ArithmeticException`
+            // instead of `jit_uncommon_trap` (which re-runs the method from
+            // entry, double-executing any side effect that preceded the trap —
+            // a HotSpot divergence). `jit_throw_arithmetic()` takes no args, sets
+            // the pending-arithmetic + deopt flags, and returns the `i64::MIN`
+            // sentinel in RAX; the interpreter's JIT-return drain throws the
+            // exception through this method's own exception table (no re-run).
+            // Mirrors the bounds-check `jit_throw_aioobe` stub. Checked BEFORE the
+            // frame-deopt trampoline below so reason 3 always direct-throws,
+            // regardless of the deopt-osr gate.
+            if reason == 3 {
+                // CALL jit_throw_arithmetic (returns i64::MIN sentinel in RAX).
+                self.emit_call_absolute(self.helpers.throw_arithmetic);
+                // RAX already holds i64::MIN from the helper return; run the
+                // standard epilogue (preserves RAX) and return to the caller.
+                self.emit_epilogue();
+                let rel32 = (stub_off as i32) - (patch_off as i32 + 4); // Cast: x86-64 rel32 displacement
+                self.buf.try_patch_i32(patch_off, rel32).ok(); // on Err try_patch_i32 set buf.overflowed; compile bails
+                continue;
+            }
+
             // deopt-osr Step 2 — route the BCE pilot guard (reason 2) and the
             // deopt-osr Step 8 OSR-exit trigger (reason 7) to the in-stub 3-arg
             // frame-deopt trampoline, under CRATONVM_DEOPT_REAL with a recorded
@@ -22699,6 +22720,7 @@ mod tests {
             checkcast: sentinel,
             instanceof_check: sentinel,
             throw_aioobe: sentinel,
+            throw_arithmetic: sentinel,
             invoke_dispatch: sentinel,
             invoke_virtual_mic: sentinel,
             write_barrier: sentinel,
