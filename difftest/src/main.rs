@@ -17,6 +17,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use clap::{Args, Parser, Subcommand};
 
+use cratonvm_difftest::generate::{self, TargetFamily};
 use cratonvm_difftest::harness;
 use cratonvm_difftest::ledger::{self, Ledger};
 use cratonvm_difftest::runner::{self, Mode, RunError, RunnerConfig, DEFAULT_TIMEOUT};
@@ -110,11 +111,19 @@ struct RunArgs {
 
 #[derive(Args)]
 struct GenArgs {
-    /// Number of programs to generate.
-    #[arg(long, default_value_t = 100)]
+    /// Number of programs to generate (per family).
+    #[arg(long, default_value_t = 20)]
     count: usize,
 
-    /// Where to write generated programs (default: `difftest/corpus`).
+    /// Target family: `arith` | `concat` | `exceptions` | `all`.
+    #[arg(long, default_value = "arith")]
+    family: String,
+
+    /// PRNG seed — the same seed reproduces the exact corpus.
+    #[arg(long, default_value_t = 1)]
+    seed: u64,
+
+    /// Where to write generated `.java` programs (default: `difftest/corpus`).
     #[arg(long)]
     out: Option<PathBuf>,
 }
@@ -247,12 +256,46 @@ fn cmd_run(args: &RunArgs) -> ExitCode {
 
 fn cmd_gen(args: &GenArgs) -> ExitCode {
     let out = args.out.clone().unwrap_or_else(default_corpus);
-    println!("difftest gen — planned, not yet wired (Step 4).");
-    println!("  count: {}", args.count);
-    println!("  out  : {}", out.display());
+
+    // Resolve the family selection (`all` ⇒ every family).
+    let families: Vec<TargetFamily> = if args.family == "all" {
+        TargetFamily::all().to_vec()
+    } else {
+        match TargetFamily::from_label(&args.family) {
+            Some(f) => vec![f],
+            None => {
+                eprintln!(
+                    "difftest gen: unknown --family {:?} (expected arith|concat|exceptions|all)",
+                    args.family
+                );
+                return ExitCode::from(exit::BOOTSTRAP);
+            }
+        }
+    };
+
+    if let Err(e) = std::fs::create_dir_all(&out) {
+        eprintln!("difftest gen: cannot create {}: {e}", out.display());
+        return ExitCode::from(exit::BOOTSTRAP);
+    }
+
+    let mut written = 0usize;
+    for family in families {
+        for prog in generate::generate(family, args.count, args.seed) {
+            let path = out.join(format!("{}.java", prog.name));
+            match std::fs::write(&path, &prog.source) {
+                Ok(()) => written += 1,
+                Err(e) => eprintln!("difftest gen: cannot write {}: {e}", path.display()),
+            }
+        }
+    }
+
     println!(
-        "  -> Step 4 will emit type-directed self-printing Java weighted toward the bug history."
+        "difftest gen — wrote {written} program(s) (family={}, seed={}) to {}",
+        args.family,
+        args.seed,
+        out.display()
     );
+    println!("  next: difftest run --corpus {}", out.display());
     ExitCode::from(exit::OK)
 }
 
