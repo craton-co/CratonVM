@@ -74,8 +74,8 @@ type OscMap = RwLock<FxHashMap<ClassId, ObjectRef>>;
 /// `RwLock`) because registration is rare (once per VM) and the GC scan
 /// only needs a short read of the pointer list before re-locking each
 /// map individually.
-fn cache_registry() -> &'static Mutex<Vec<*const OscMap>> {
-    static REGISTRY: OnceLock<Mutex<Vec<*const OscMap>>> = OnceLock::new();
+fn cache_registry() -> &'static Mutex<Vec<SendPtr>> {
+    static REGISTRY: OnceLock<Mutex<Vec<SendPtr>>> = OnceLock::new();
     REGISTRY.get_or_init(|| Mutex::new(Vec::new()))
 }
 
@@ -86,6 +86,7 @@ fn cache_registry() -> &'static Mutex<Vec<*const OscMap>> {
 // threads for GC scanning is sound under the VM's safepoint model — the
 // GC observes them only at a stop-the-world safepoint, when no other
 // thread mutates the maps.
+#[derive(Clone, Copy)]
 struct SendPtr(*const OscMap);
 // SAFETY: see the comment above `SendPtr`.
 unsafe impl Send for SendPtr {}
@@ -101,10 +102,7 @@ pub fn scan_osc_cache_roots(roots: &mut Vec<ObjectRef>) {
     // Snapshot the pointer list under the registry lock, then release it
     // before touching the per-cache locks to keep lock ordering simple
     // (registry -> map, never the reverse).
-    let snapshot: Vec<SendPtr> = {
-        let guard = cache_registry().lock();
-        guard.iter().map(|&p| SendPtr(p)).collect()
-    };
+    let snapshot: Vec<SendPtr> = cache_registry().lock().clone();
     for SendPtr(ptr) in snapshot {
         // SAFETY: `ptr` points at a live `OscMap` owned by a `SharedVm`
         // (see `OscMap` lifetime note above). We re-lock through its own
@@ -113,7 +111,7 @@ pub fn scan_osc_cache_roots(roots: &mut Vec<ObjectRef>) {
         for desc in map.read().values() {
             // `ObjectRef` is non-null by construction; the guard is
             // belt-and-suspenders against a future nullable value type.
-            if !desc.is_null() {
+            if !desc.as_ptr().is_null() {
                 roots.push(*desc);
             }
         }
@@ -128,17 +126,14 @@ pub fn scan_osc_cache_roots(roots: &mut Vec<ObjectRef>) {
 /// Registered with the native-root registry via [`register_with_gc`];
 /// must be a bare `fn` for that API.
 pub fn remap_osc_cache_refs(map: &HashMap<usize, usize>) {
-    let snapshot: Vec<SendPtr> = {
-        let guard = cache_registry().lock();
-        guard.iter().map(|&p| SendPtr(p)).collect()
-    };
+    let snapshot: Vec<SendPtr> = cache_registry().lock().clone();
     for SendPtr(ptr) in snapshot {
         // SAFETY: see `scan_osc_cache_roots`. We take the *write* lock
         // because we mutate the stored refs in place.
         let osc_map = unsafe { &*ptr };
         let mut guard = osc_map.write();
         for desc in guard.values_mut() {
-            if desc.is_null() {
+            if desc.as_ptr().is_null() {
                 continue;
             }
             let old = desc.as_ptr() as usize;
@@ -165,10 +160,10 @@ fn register_with_gc(inner: &OscMap) {
     let ptr = inner as *const OscMap;
     {
         let mut guard = cache_registry().lock();
-        if guard.contains(&ptr) {
+        if guard.iter().any(|s| s.0 == ptr) {
             return;
         }
-        guard.push(ptr);
+        guard.push(SendPtr(ptr));
     }
 
     // Wire the scan/remap pair into the VM-wide native-root registry
