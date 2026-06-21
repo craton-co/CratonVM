@@ -5386,6 +5386,24 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     );
 
     // --- java.lang.Math / StrictMath (native transcendental functions) ---
+    //
+    // VULN / LIMITATION (StrictMath bit-reproducibility): `java.lang.StrictMath`
+    // is contractually required to produce bit-for-bit identical results across
+    // every platform and VM — its spec mandates the fdlibm algorithms (the same
+    // code the reference JDK ships) for sin/cos/tan/asin/acos/atan/atan2/exp/
+    // log/log10/sqrt/cbrt/pow/sinh/cosh/tanh/hypot/expm1/log1p. CratonVM
+    // currently registers the SAME backing implementation for both `Math` and
+    // `StrictMath` (lang_math::register_math_natives), which delegates the
+    // transcendental functions to the host platform's libm. Platform libm is
+    // NOT guaranteed to be fdlibm-equivalent (last-ULP results vary by OS / libc
+    // / CPU), so StrictMath here can differ from HotSpot in the low bits and
+    // VIOLATES the StrictMath bit-reproducibility contract. This is a known,
+    // documented deviation: it does not affect memory safety and is acceptable
+    // for the app-gauntlet workloads (which do not rely on golden last-ULP
+    // StrictMath vectors), but a portable fdlibm-style implementation for the
+    // affected functions should replace the libm delegation in lang_math.rs
+    // before any StrictMath-bit-exact workload is supported. Tracked against the
+    // 2026-06-20 review finding `nb-lang / StrictMath delegates to platform libm`.
     lang_math::register_math_natives(registry, "java/lang/Math");
     lang_math::register_math_natives(registry, "java/lang/StrictMath");
 
@@ -11340,6 +11358,15 @@ pub fn register_synthetic_overrides(registry: &mut NativeMethodRegistry) {
     register_time_natives(registry);
 
     // --- Math natives (Step 5) ---
+    //
+    // VULN / LIMITATION (StrictMath bit-reproducibility): StrictMath shares the
+    // SAME backing transcendental implementation as Math here, which delegates
+    // to the host platform libm. Platform libm is not guaranteed fdlibm-exact,
+    // so StrictMath results may differ from HotSpot in the low bits, violating
+    // the StrictMath bit-for-bit reproducibility contract. Known, documented
+    // deviation (no memory-safety impact); replace with a portable fdlibm impl
+    // in lang_math.rs before supporting StrictMath-bit-exact workloads. See the
+    // matching note at the other Math/StrictMath registration site above.
     register_math_natives(registry, "java/lang/Math");
     register_math_natives(registry, "java/lang/StrictMath");
 
@@ -28711,6 +28738,81 @@ pub(crate) fn bi_mod_inverse_str(a: &str, m: &str) -> Option<String> {
     Some(inv)
 }
 
+#[cfg(test)]
+mod biginteger_modpow_modinverse_tests {
+    use super::{bi_mod_inverse_str, bi_mod_pow_str};
+
+    // --- modPow sign handling (the registered native delegates to these
+    //     helpers; these tests pin the underlying arithmetic that the old
+    //     sign-stripping native got wrong) ---
+
+    #[test]
+    fn modpow_positive() {
+        // 3^4 mod 7 = 81 mod 7 = 4
+        assert_eq!(bi_mod_pow_str("3", "4", "7"), "4");
+    }
+
+    #[test]
+    fn modpow_negative_base_reduced_mod_m() {
+        // (-3)^2 mod 7: -3 ≡ 4 (mod 7); 4^2 = 16 ≡ 2 (mod 7).
+        // The old native stripped the sign and computed 3^2 = 9 ≡ 2 — same
+        // residue for an even exponent, so use an ODD exponent to expose it:
+        // (-3)^3 mod 7: 4^3 = 64 ≡ 1 (mod 7); sign-stripped 3^3 = 27 ≡ 6.
+        assert_eq!(bi_mod_pow_str("-3", "3", "7"), "1");
+        assert_ne!(bi_mod_pow_str("-3", "3", "7"), "6");
+    }
+
+    #[test]
+    fn modpow_large_operands() {
+        // 2^256 mod 1000000007. The intermediate 2^256 is far beyond i128, so
+        // this exercises the arbitrary-precision string path end to end.
+        // Cross-checked: Python pow(2, 256, 1000000007) == 792845266.
+        assert_eq!(bi_mod_pow_str("2", "256", "1000000007"), "792845266");
+
+        // Same exponent with a modulus that is itself larger than i128
+        // (Mersenne prime 2^61 - 1): since 2^61 ≡ 1, 2^256 ≡ 2^(256 mod 61) =
+        // 2^12 = 4096. Cross-checked: pow(2, 256, 2305843009213693951) == 4096.
+        assert_eq!(
+            bi_mod_pow_str("2", "256", "2305843009213693951"),
+            "4096"
+        );
+    }
+
+    // --- modInverse: real arbitrary-precision inverse + non-invertible None ---
+
+    #[test]
+    fn modinverse_small() {
+        // 3 * 5 = 15 ≡ 1 (mod 7), so 3^-1 ≡ 5 (mod 7).
+        assert_eq!(bi_mod_inverse_str("3", "7"), Some("5".to_string()));
+    }
+
+    #[test]
+    fn modinverse_negative_base() {
+        // -3 ≡ 4 (mod 7); 4^-1 ≡ 2 (mod 7) since 4*2 = 8 ≡ 1.
+        assert_eq!(bi_mod_inverse_str("-3", "7"), Some("2".to_string()));
+    }
+
+    #[test]
+    fn modinverse_non_coprime_is_none() {
+        // gcd(4, 8) = 4 != 1 -> not invertible (native maps None -> ArithmeticException).
+        assert_eq!(bi_mod_inverse_str("4", "8"), None);
+        // gcd(6, 9) = 3 != 1.
+        assert_eq!(bi_mod_inverse_str("6", "9"), None);
+    }
+
+    #[test]
+    fn modinverse_large_operands_not_silent_one() {
+        // A large prime modulus far beyond i128; the old i128 fallback returned
+        // a silent "1" for inputs this size. Verify a real inverse: with
+        // m = 2^61 - 1 (Mersenne prime 2305843009213693951) and a = 2,
+        // 2^-1 mod m = (m+1)/2 = 1152921504606846976.
+        assert_eq!(
+            bi_mod_inverse_str("2", "2305843009213693951"),
+            Some("1152921504606846976".to_string())
+        );
+    }
+}
+
 /// `BigInteger.toByteArray()` — two's-complement big-endian byte encoding,
 /// with the minimal length needed to represent the value (always at least
 /// one byte). Sign-extends.
@@ -29448,7 +29550,19 @@ fn register_biginteger_natives(registry: &mut NativeMethodRegistry) {
         Ok(Some(Value::Int(1)))
     });
 
-    // modPow(exponent, modulus) -> BigInteger (binary exponentiation, string-based)
+    // modPow(exponent, modulus) -> BigInteger
+    //
+    // Matches `java.math.BigInteger.modPow` semantics exactly (do NOT strip
+    // operand signs — the previous implementation `trim_start_matches('-')` on
+    // base AND exponent silently produced wrong results):
+    //   * modulus.signum() <= 0  -> ArithmeticException("BigInteger: modulus not positive")
+    //   * the base is reduced into the canonical nonnegative residue [0, m)
+    //     BEFORE exponentiation (a negative base is congruent to base + m, not
+    //     to |base|), so e.g. (-3)^2 mod 7 == 2, not 9 mod 7.
+    //   * a negative exponent is legal iff the base is invertible mod m: the
+    //     result is modInverse(base, m)^|exp| mod m. If gcd(base, m) != 1 we
+    //     throw ArithmeticException("BigInteger not invertible.") — matching the
+    //     exception the JDK propagates from the internal modInverse.
     registry.register(
         bi,
         "modPow",
@@ -29457,28 +29571,56 @@ fn register_biginteger_natives(registry: &mut NativeMethodRegistry) {
             let this = obj_arg(args, 0)?;
             let exp_obj = obj_arg(args, 1)?;
             let mod_obj = obj_arg(args, 2)?;
-            let base = bi_read(ctx, this).trim_start_matches('-').to_string();
-            let exp = bi_read(ctx, exp_obj).trim_start_matches('-').to_string();
-            let modulus = bi_read(ctx, mod_obj).trim_start_matches('-').to_string();
-            if modulus == "0" || modulus == "1" {
+            // Signed decimal strings (bi_read preserves the leading '-').
+            let base = bi_read(ctx, this);
+            let exp = bi_read(ctx, exp_obj);
+            let modulus = bi_read(ctx, mod_obj);
+            // JDK: modulus must be strictly positive.
+            if modulus.starts_with('-') || modulus == "0" {
+                return Err(RuntimeError::ArithmeticException {
+                    message: "BigInteger: modulus not positive".to_string(),
+                }
+                .into());
+            }
+            if modulus == "1" {
                 return Ok(Some(Value::Object(Some(bi_alloc(ctx, "0")))));
             }
-            let mut result = "1".to_string();
-            let mut b = bi_mod_unsigned(&base, &modulus);
-            let mut e = exp;
-            while e != "0" {
-                let rem = bi_mod_unsigned(&e, "2");
-                if rem == "1" {
-                    result = bi_mod_unsigned(&bi_mul_unsigned(&result, &b), &modulus);
-                }
-                e = bi_div_unsigned(&e, "2");
-                b = bi_mod_unsigned(&bi_mul_unsigned(&b, &b), &modulus);
-            }
+            // For a negative exponent, invert the (sign-reduced) base first and
+            // raise the inverse to |exp|. bi_mod_inverse_str returns None when
+            // gcd(base, m) != 1 (base not invertible).
+            let result = if exp.starts_with('-') {
+                let inv = match bi_mod_inverse_str(&base, &modulus) {
+                    Some(inv) => inv,
+                    None => {
+                        return Err(RuntimeError::ArithmeticException {
+                            message: "BigInteger not invertible.".to_string(),
+                        }
+                        .into());
+                    }
+                };
+                let abs_exp = exp.trim_start_matches('-');
+                bi_mod_pow_str(&inv, abs_exp, &modulus)
+            } else {
+                // Non-negative exponent: bi_mod_pow_str reduces the (possibly
+                // negative) base into [0, m) internally.
+                bi_mod_pow_str(&base, &exp, &modulus)
+            };
             Ok(Some(Value::Object(Some(bi_alloc(ctx, &result)))))
         },
     );
 
     // modInverse(modulus) -> BigInteger (extended Euclidean algorithm)
+    //
+    // Uses the arbitrary-precision string extended-Euclidean helper
+    // (bi_mod_inverse_str) for ALL operand sizes. The previous implementation
+    // only handled values that fit in i128 and silently returned 1 for anything
+    // larger (e.g. every RSA-sized modulus) AND never threw on non-coprime
+    // input — both dangerous if a crypto path reaches it. Per the JDK contract:
+    //   * modulus.signum() <= 0  -> ArithmeticException("BigInteger: modulus not positive")
+    //   * gcd(this, m) != 1      -> ArithmeticException("BigInteger not invertible.")
+    // bi_mod_inverse_str reduces a (possibly negative) base mod m internally and
+    // returns the canonical inverse in [0, m); it yields None exactly when the
+    // input is not invertible.
     registry.register(
         bi,
         "modInverse",
@@ -29486,31 +29628,26 @@ fn register_biginteger_natives(registry: &mut NativeMethodRegistry) {
         |ctx, args| {
             let this = obj_arg(args, 0)?;
             let mod_obj = obj_arg(args, 1)?;
-            let a_str = bi_read(ctx, this).trim_start_matches('-').to_string();
-            let m_str = bi_read(ctx, mod_obj).trim_start_matches('-').to_string();
-            // Use i128 for numbers that fit, fallback to 1 for larger
-            if let (Ok(a), Ok(m)) = (a_str.parse::<i128>(), m_str.parse::<i128>()) {
-                if m <= 1 {
-                    return Ok(Some(Value::Object(Some(bi_alloc(ctx, "0")))));
+            let a_str = bi_read(ctx, this);
+            let m_str = bi_read(ctx, mod_obj);
+            if m_str.starts_with('-') || m_str == "0" {
+                return Err(RuntimeError::ArithmeticException {
+                    message: "BigInteger: modulus not positive".to_string(),
                 }
-                let (mut old_r, mut r) = (a % m, m);
-                let (mut old_s, mut s) = (1i128, 0i128);
-                while r != 0 {
-                    let q = old_r / r;
-                    let temp_r = r;
-                    r = old_r - q * r;
-                    old_r = temp_r;
-                    let temp_s = s;
-                    s = old_s - q * s;
-                    old_s = temp_s;
-                }
-                let result = ((old_s % m) + m) % m;
-                return Ok(Some(Value::Object(Some(bi_alloc(
-                    ctx,
-                    &result.to_string(),
-                )))));
+                .into());
             }
-            Ok(Some(Value::Object(Some(bi_alloc(ctx, "1")))))
+            // Modulus 1: every value is congruent to 0, and 0 is its own (only)
+            // residue; the JDK returns 0 here (a^-1 mod 1 == 0).
+            if m_str == "1" {
+                return Ok(Some(Value::Object(Some(bi_alloc(ctx, "0")))));
+            }
+            match bi_mod_inverse_str(&a_str, &m_str) {
+                Some(inv) => Ok(Some(Value::Object(Some(bi_alloc(ctx, &inv))))),
+                None => Err(RuntimeError::ArithmeticException {
+                    message: "BigInteger not invertible.".to_string(),
+                }
+                .into()),
+            }
         },
     );
     registry.set_category(__prev_cat);
