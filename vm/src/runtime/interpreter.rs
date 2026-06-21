@@ -7175,23 +7175,34 @@ fn find_exception_handler_any_pc(
 /// its own `catch (Throwable)` (Jetty `start.jar` launcher: the launcher's
 /// usage-error handling never ran, surfacing a misleading inner NPE instead).
 ///
-/// Mirroring `route_jit_exception_through_method`: skip catch-all
-/// (`catch_type == 0`, i.e. `finally`) entries — without a known PC they
-/// could swallow an exception thrown outside their region — but match typed
-/// handlers by exception class, which is sound regardless of throw site.
+/// Mirroring `route_jit_exception_through_method`: without a known PC we
+/// cannot range-check a handler, so a catch-all (`catch_type == 0`, i.e.
+/// `finally`) is only honoured when its protected region covers the **whole
+/// method** (`start_pc == 0 && end_pc >= code_len`) — such an entry catches a
+/// throw at any PC, so running it is sound regardless of the (unknown) throw
+/// site. This preserves `finally` / synchronized-monitor-exit cleanup for the
+/// dominant method-wide case instead of dropping it. Narrower catch-all
+/// regions are still skipped (they could swallow an out-of-region exception),
+/// and typed handlers match by exception class as before.
 fn find_exception_handler_pc_unknown(
     shared: &SharedVm,
     frame: &Frame,
     exc: ObjectRef,
 ) -> Option<(usize, ObjectRef)> {
     let exc_class_id = shared.heap.class_id_of(exc);
+    // `frame.code` is padded with 2 trailing bytes for the interpreter's
+    // speculative reads; the real bytecode length is `len() - 2`.
+    let code_len = frame.code.len().saturating_sub(2);
     let mut cm_guard = shared.class_manager.read();
     cm_guard.get_class(frame.class_id)?;
     for entry in frame.exception_table().iter() {
-        // PC unknown → cannot verify range membership; conservatively skip
-        // catch-all entries (they would catch anything) but still allow
-        // typed handlers to match on exception class.
+        // PC unknown → cannot verify range membership. Honour a catch-all only
+        // when it spans the entire method (always covers the throw site);
+        // otherwise skip it (it could catch an out-of-region exception).
         if entry.catch_type == 0 {
+            if entry.start_pc == 0 && entry.end_pc as usize >= code_len {
+                return Some((entry.handler_pc as usize, exc));
+            }
             continue;
         }
         let owning_class = cm_guard.get_class(frame.class_id)?;
@@ -7307,10 +7318,14 @@ fn find_exception_handler_impl(
 /// `throw_pc` is the bytecode PC of the throw site within the JIT'd method,
 /// if known. Pass `usize::MAX` when the throw-site PC cannot be recovered
 /// (the JIT currently does not record one in `JIT_PENDING_EXCEPTION`); in
-/// that case, catch-all (`catch_type == 0`, i.e. `finally`) entries are
-/// skipped because they would otherwise unconditionally swallow exceptions
-/// thrown from outside the protected region. Typed handlers still match by
-/// exception class since that is safe regardless of the throw site.
+/// that case a catch-all (`catch_type == 0`, i.e. `finally`) entry is honoured
+/// only when its protected region spans the **whole method**
+/// (`start_pc == 0 && end_pc >= code_len`) — such an entry covers any throw
+/// site, so running it is sound and preserves `finally` /
+/// synchronized-monitor-exit cleanup. Narrower catch-all regions are skipped
+/// (they could swallow an exception thrown outside the protected region).
+/// Typed handlers still match by exception class since that is safe regardless
+/// of the throw site.
 ///
 /// If a matching handler is found, a bytecode frame for the JIT'd method
 /// is pushed with `pc` at the handler and the exception on the operand
@@ -7331,6 +7346,10 @@ fn route_jit_exception_through_method(
     }
 
     let pc_unknown = throw_pc == usize::MAX;
+    // `cached.code` is padded with 2 trailing bytes for speculative reads;
+    // the real bytecode length is `len() - 2`. Used to recognise a catch-all
+    // whose region covers the whole method when the throw PC is unknown.
+    let code_len = cached.code.len().saturating_sub(2);
     let exc_class_id = shared.heap.class_id_of(exc);
     let mut handler_pc: Option<usize> = None;
     // HIGH — same fast-path treatment as `find_exception_handler`:
@@ -7345,12 +7364,17 @@ fn route_jit_exception_through_method(
         // in the method (the original bug here).
         //
         // When the throw PC is unknown (`usize::MAX`, sentinel), we cannot
-        // verify range membership. In that case we conservatively skip
-        // catch-all entries (they would catch anything) but still allow
-        // typed handlers to match on exception class — wrong-type
-        // exceptions cannot be silently swallowed that way.
+        // verify range membership. A catch-all (`catch_type == 0`) is honoured
+        // only when its protected region spans the whole method
+        // (`start_pc == 0 && end_pc >= code_len`) — it then covers the
+        // (unknown) throw site, so running its `finally` / monitor-exit
+        // cleanup is sound. Narrower catch-all regions are skipped (they could
+        // catch an out-of-region exception); typed handlers still match on
+        // exception class — wrong-type exceptions cannot be silently swallowed.
         if pc_unknown {
-            if entry.catch_type == 0 {
+            if entry.catch_type == 0
+                && !(entry.start_pc == 0 && entry.end_pc as usize >= code_len)
+            {
                 continue;
             }
         } else if throw_pc < entry.start_pc as usize || throw_pc >= entry.end_pc as usize {
@@ -23061,6 +23085,75 @@ mod tests {
         let unwound_pc = post_invoke_pc.saturating_sub(1);
         assert!(unwound_pc >= entry.start_pc as usize);
         assert!(unwound_pc < entry.end_pc as usize);
+    }
+
+    // Regression guard for the JIT-unknown-PC unwind path
+    // (`find_exception_handler_pc_unknown` / `route_jit_exception_through_method`):
+    // when the throw-site PC cannot be recovered, a catch-all / `finally`
+    // entry must still be honoured *iff* its protected region spans the whole
+    // method (`start_pc == 0 && end_pc >= code_len`), so `finally` /
+    // synchronized-monitor-exit cleanup is not silently skipped. A narrower
+    // catch-all is rejected (it could swallow an out-of-region exception).
+    // This exercises the exact predicate both functions use; `code_len` is the
+    // *unpadded* bytecode length (`code.len() - 2`).
+    #[test]
+    fn pc_unknown_catch_all_honored_only_for_whole_method() {
+        use cratonvm_reader::attribute::ExceptionTableEntry;
+
+        // Padded bytecode (real body is 40 bytes; +2 trailing padding bytes).
+        let padded_code_len = 42usize;
+        let code_len = padded_code_len.saturating_sub(2);
+        assert_eq!(code_len, 40);
+
+        // The predicate factored out of the unwind loop.
+        let honored = |e: &ExceptionTableEntry| {
+            e.catch_type == 0 && e.start_pc == 0 && e.end_pc as usize >= code_len
+        };
+
+        // Whole-method finally: start at 0, end at the code length → honored.
+        let whole = ExceptionTableEntry {
+            start_pc: 0,
+            end_pc: 40,
+            handler_pc: 40,
+            catch_type: 0,
+        };
+        assert!(honored(&whole), "method-wide finally must run");
+
+        // `end_pc` past the body (e.g. equal to padded len) still covers it.
+        let whole_over = ExceptionTableEntry {
+            end_pc: 41,
+            ..whole
+        };
+        assert!(honored(&whole_over));
+
+        // Narrow catch-all that does NOT start at 0 → skipped (could catch an
+        // out-of-region throw when the PC is unknown).
+        let narrow_start = ExceptionTableEntry {
+            start_pc: 4,
+            end_pc: 40,
+            handler_pc: 40,
+            catch_type: 0,
+        };
+        assert!(!honored(&narrow_start));
+
+        // Catch-all that ends before the method end → skipped.
+        let narrow_end = ExceptionTableEntry {
+            start_pc: 0,
+            end_pc: 20,
+            handler_pc: 20,
+            catch_type: 0,
+        };
+        assert!(!honored(&narrow_end));
+
+        // A *typed* handler (catch_type != 0) is never honored by this
+        // catch-all predicate; it matches by exception class elsewhere.
+        let typed = ExceptionTableEntry {
+            start_pc: 0,
+            end_pc: 40,
+            handler_pc: 40,
+            catch_type: 7,
+        };
+        assert!(!honored(&typed));
     }
 
     // -----------------------------------------------------------------------
