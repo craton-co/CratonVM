@@ -1,0 +1,42 @@
+[package]
+name = "cratonvm-difftest"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Semantic differential fuzzer: runs Java programs on CratonVM and a real JDK and diffs observable behavior"
+readme = "README.md"
+# Corpus / seed / regression trees are committed for reproducibility but
+# excluded from `cargo package` so we don't ship opaque .class fixtures or a
+# growing corpus blob in the published crate.
+exclude = [
+    "seeds/**",
+    "corpus/**",
+    "regression/**",
+    "**/*.class",
+]
+
+[[bin]]
+name = "difftest"
+path = "src/main.rs"
+
+[dependencies]
+# Step 0 is deliberately lightweight: the runner drives the `cratonvm` binary
+# and `java` as subprocesses (see docs/feature-designs/differential-fuzzer.md
+# §3.2), so it needs no VM source crate. Deps on `cratonvm-vm` /
+# `cratonvm-reader` / `cratonvm-classloading` are added only when a later step
+# wires the in-process micro-method tier (Step 1) and the bytecode verifier
+# re-check (Step 5) — keeping the scaffold's build fast and its blast radius
+# zero.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+
+[lints]
+workspace = true
