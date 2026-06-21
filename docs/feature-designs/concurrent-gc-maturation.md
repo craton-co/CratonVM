@@ -214,6 +214,39 @@ Author note: this doc is grounded in a read of `gc/src/{g1,g1_concurrent,zgc,zgc
     pinned array's address unchanged + data intact) and `region_pin_refcount_balances`;
     full g1 suite + `cratonvm-cli` build green; FieldStress checksum unchanged
     under `-XX:+UseG1GC`.
+- **Step 7 (pause-target CSet sizing) — DONE** (branch `feat/g1-pause-cset-sizing`,
+  merged to dev `ff370857`). `max_gc_pause_ms` (200) previously did **not** bound
+  the mixed collection set — old regions entered the CSet only under the
+  percentage cap (`old_cset_region_threshold_percent`, 10%), so a mixed pause
+  could grow unbounded with old-gen occupancy (§3.3). Added a **time-budget cap**
+  on top of the percentage cap:
+  - `G1Region::estimated_evac_cost_ns(ns_per_byte) = live_bytes × ns_per_byte`
+    (copying live data dominates evacuation cost).
+  - A **rolling** `evac_ns_per_byte` calibration (EMA, default 4 ns/byte ≈
+    250 MB/s), refreshed from each *mixed* collection's actual
+    `pause / bytes_copied` so the budget tracks real wall-clock copy throughput
+    (the §3.3 "rolling per-region copy cost"). Calibrated from mixed GCs **only**
+    — young collections would bias it high (fixed root-scan overhead amortized
+    over few survivors).
+  - Both the inline `mixed_collection` CSet build (production) and the
+    `select_old_regions_for_mixed_gc` helper now stop adding old regions once
+    their estimated copy time would exceed `max_gc_pause_ms`, always keeping ≥1
+    region for progress; deferred regions are reclaimed in a later mixed cycle
+    (`mixed_gc_remaining`). The percentage cap stays the hard upper bound; the
+    budget only binds when one mixed GC would copy enough live old data to blow
+    the target (a genuinely long pause), so at the 200ms default it is
+    conservative and rarely binds.
+  - The standalone `select_evacuation_candidates`/`crate::region` prototype
+    already had this algorithm but on a *different* region type, unused by the
+    real collector — Step 7 brings it to the production `G1Region` path.
+  - **Tests:** `g1region_estimated_evac_cost_scales_with_live_and_rate`,
+    `evac_cost_ema_calibrates_toward_observed`,
+    `mixed_cset_old_selection_respects_pause_budget`; all 93 g1 unit tests +
+    `cratonvm-cli` build green (also verified on the merged dev alongside the
+    `af64d03d` JNI copy-back follow-up).
+  - **Owed:** empirical pause-vs-target validation on a real workload (§5) still
+    needs the pause-logging enhancement *and* a non-crashing G1 run — currently
+    blocked by the gpu-bench-cpu SIGSEGV (Step 8 finding).
 - **Step 8 (opt-in G1 gauntlet validation) — IN PROGRESS. First cut found a real
   G1 SIGSEGV; G1 is NOT yet gauntlet-ready** (branch `feat/g1-step8-correction`).
   - **METHODOLOGY CORRECTION (supersedes the earlier "no divergence" claim,
@@ -280,8 +313,8 @@ Author note: this doc is grounded in a read of `gc/src/{g1,g1_concurrent,zgc,zgc
     itself gated on 3 tracked **non-G1** upstream bugs that stop WildFly/ES/Kafka/
     Spring Boot reaching *ready* even on Generational (non-TTY stdout SEGV/hang,
     ARRAY-LEN-GUARD, GC-clinit; see `apps/TARGET_APPS.md`).
-- Steps 7, 9, 10 — not started. Step 7 (pause-target CSet sizing) is best done
-  once the pause-logging enhancement + daemon gauntlet yield real pause data.
+- Steps 9 (parallel evacuation), 10 (default flip) — not started; gated on Step 8
+  (a clean gauntlet, starting with the gpu-bench-cpu SIGSEGV fix).
 
 ---
 
