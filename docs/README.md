@@ -7,21 +7,25 @@ and [`ARCHITECTURE.md`](../ARCHITECTURE.md) for the system design.
 ## Getting started
 
 - [INSTALL.md](INSTALL.md) — install pre-built binaries or build from source.
-- [CONFIG.md](CONFIG.md) — configuration reference for the `cratonvm` launcher flags.
+- [CONFIG.md](CONFIG.md) — configuration reference for the `cratonvm` launcher flags and `CRATONVM_*` env vars.
+- [CONTAINER.md](CONTAINER.md) — container / cgroup awareness and ergonomic resource defaults.
 - [PLATFORMS.md](PLATFORMS.md) — platform support matrix; which host OS supports which syscall-touching features.
 - [TROUBLESHOOTING.md](TROUBLESHOOTING.md) — common issues and their solutions.
 
 ## Using and embedding
 
-- [internal/embedding.md](internal/embedding.md) — host `cratonvm-vm` inside a Rust application.
+- [EMBEDDING.md](EMBEDDING.md) — embed CratonVM via the C-ABI (`libcratonvm`) or the Rust facade (`cratonvm-embed`).
+- [internal/embedding.md](internal/embedding.md) — host `cratonvm-vm` inside a Rust application (internal notes).
 - [internal/gc-tuning.md](internal/gc-tuning.md) — tune heap and GC behaviour for a given workload.
 - [PROFILING.md](PROFILING.md) — measure and improve CratonVM performance.
+- [COVERAGE.md](COVERAGE.md) — generate code coverage with `cargo-llvm-cov` (local + CI).
 
 ## Reference and status
 
 - [JDK_COVERAGE.md](JDK_COVERAGE.md) — JDK class/method coverage, auto-generated from the native crates.
 - [internal/jck-compliance.md](internal/jck-compliance.md) — internal JCK compliance estimate matrix.
 - [legal.md](legal.md) — JCK licensing and legal requirements.
+- [SECURITY_HARDENING.md](SECURITY_HARDENING.md) — sandboxing, egress/SSRF policy, and crypto-hardening reference (companion to [`SECURITY.md`](../SECURITY.md)).
 - [CRYPTO_STATUS.md](CRYPTO_STATUS.md) — per-algorithm cryptographic implementation status (companion to [`SECURITY.md`](../SECURITY.md)).
 - [internal/javafx-status.md](internal/javafx-status.md) — JavaFX as an out-of-tree, non-core module.
 - [PRESENTATION.md](PRESENTATION.md) — JIT performance results write-up.
@@ -36,6 +40,16 @@ and [`ARCHITECTURE.md`](../ARCHITECTURE.md) for the system design.
 - [internal/app-jvm-bugs/jvm-no-synthetic-stubs.md](internal/app-jvm-bugs/jvm-no-synthetic-stubs.md) — project rule: run real Java classes, no synthetic stubs.
 - [internal/feature_roadmap_interpreter_intrinsic_table.md](internal/feature_roadmap_interpreter_intrinsic_table.md) — interpreter intrinsic table roadmap.
 - [internal/feature_roadmap_jit_intrinsics.md](internal/feature_roadmap_jit_intrinsics.md) — roadmap for JIT-inlined intrinsics beyond `java.lang.Math`.
+
+## Design proposals (forward-looking)
+
+Grounded engineering designs for larger, not-yet-landed features. See [`feature-designs/`](feature-designs/):
+
+- [feature-designs/precise-jit-maps-default.md](feature-designs/precise-jit-maps-default.md) — precise JIT stack maps as the validated default.
+- [feature-designs/deopt-osr.md](feature-designs/deopt-osr.md) — real-frame deoptimization + virtual-object rematerialization + precise OSR.
+- [feature-designs/concurrent-gc-maturation.md](feature-designs/concurrent-gc-maturation.md) — mature G1 into a selectable, validated collector.
+- [feature-designs/foreign-thread-attach.md](feature-designs/foreign-thread-attach.md) — foreign-thread attach with safepoint participation.
+- [feature-designs/differential-fuzzer.md](feature-designs/differential-fuzzer.md) — semantic differential fuzzer vs HotSpot.
 
 ## Open investigations
 

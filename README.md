@@ -36,7 +36,7 @@ and [docs/SECURITY_HARDENING.md](docs/SECURITY_HARDENING.md).
 - **Thousands of native method registrations** (java.lang, java.util, java.io/nio, java.time, java.util.concurrent, JCA crypto, ...)
 - **JNI & embedding** — JNI Invocation API, implicit local-reference frames, a GC pin set for critical sections, and a stable C-ABI embedding library (`libcratonvm`) + Rust facade (`cratonvm-embed`)
 - **Security hardening** — fail-closed I/O confinement, outbound-network egress policy (cloud-metadata/SSRF block + optional DNS resolution), HTTP request-body caps and anti-smuggling, and an OS-CSPRNG–backed `SecureRandom` (see [Security & sandboxing](#security--sandboxing))
-- **Container/cgroup awareness** — cgroup-derived default heap sizing (see [docs/CONTAINER.md](docs/CONTAINER.md))
+- **Container/cgroup awareness** — cgroup v1/v2 memory & CPU detection + a container-aware default-heap helper (launcher wiring is a documented follow-up; see [docs/CONTAINER.md](docs/CONTAINER.md))
 - **Observability** — Java Flight Recorder (JFR), and a `cargo-llvm-cov` coverage CI job (see [docs/COVERAGE.md](docs/COVERAGE.md))
 - **GPU offload** (opt-in) — Java bytecode → PTX lowering for CUDA
 - **6,000+ tests**, plus a HotSpot-differential regression suite; CI enforces `cargo build`, `cargo fmt --check`, and `clippy -D warnings`

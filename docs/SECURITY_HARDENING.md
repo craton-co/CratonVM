@@ -49,6 +49,7 @@ JDK-faithful) except where a numeric default is listed.
 | `CRATONVM_UNTRUSTED_CODE` | **Untrusted-code profile.** Same confinement as above, but if it cannot be enabled it emits a **loud warning** instead of failing closed. | off |
 | `CRATONVM_REQUIRE_POLICY` | When set, a **missing** `java.policy` **denies** (fail-closed) instead of the JDK-default allow-all. The absence of an explicitly-loaded policy can then never be mistaken for a grant. Must be set before the first permission check. (`security_manager.rs`.) | off (allow-all on no policy, JDK-parity) |
 | `CRATONVM_BLOCK_PRIVATE_NETS` | Extends the default egress policy to also deny loopback (`127.0.0.0/8`, `::1`) and the RFC1918 private ranges (`10/8`, `172.16/12`, `192.168/16`) plus their IPv6 equivalents (`fc00::/7` ULA and IPv4-mapped private v6), so a confined workload can't reach internal services by SSRF. The link-local metadata block is **always on** regardless. (`outbound_policy.rs`.) | off |
+| `CRATONVM_RESOLVE_OUTBOUND_HOST` | Resolve outbound **hostnames** and apply the per-IP egress policy to every resolved address (deny if any is blocked) — closes the DNS-alias/rebind bypass for direct `check_outbound`/`default_policy` callers. (`outbound_policy.rs`.) | off (no DNS in policy) |
 | `CRATONVM_HARDEN_MANIFEST_CLASSPATH` | Treats a JAR's `Class-Path:` manifest attribute as **untrusted**: out-of-tree / escaping entries are dropped (with a debug log) instead of silently honoured. (`classloading/src/class_path.rs`.) | off (HotSpot parity) |
 | `CRATONVM_HTTP_MAX_BODY` | Max accepted inbound request-body size (bytes) for the embedded `com.sun.net.httpserver`. Larger bodies are rejected with `413`. `0` / unparseable → default. (`net_phase_e.rs`.) | `8388608` (8 MiB) |
 | `CRATONVM_ZIP_MAX_ENTRY_BYTES` | Max *declared* uncompressed size (bytes) of a single zip/JAR entry that will be inflated into memory — a decompression-bomb guard. Paired with an always-on `1000:1` compression-ratio cap. `0` / unparseable → default. (`native-io/src/zip_real_jar.rs`.) | `536870912` (512 MiB) |
@@ -86,17 +87,20 @@ hardening-relevant highlights:
   bit-loop GHASH (both classic cache-timing oracles, Bernstein 2005) were
   deleted (`crypto_impl.rs`, comment "C18").
 
-What is still **best-effort / not constant-time**:
+What is still **best-effort / not fully constant-time**:
 
-- **RSA private-key operations are *not* constant-time and use no message
-  blinding.** Signing/decryption are a plain `m.modpow(&key.d, &key.n)` over the
-  in-tree `BigUint` (`crypto_impl.rs`), with no Montgomery-ladder constant-time
-  guarantee, no CRT, and no blinding factor. This is adequate for functional
-  JCA compatibility but should **not** be relied on as side-channel-resistant.
-  If you need hardened RSA, terminate it in audited native crypto outside the VM.
-
-(If a future change adds RSA blinding or constant-time modexp, this section and
-`CRYPTO_STATUS.md` should be updated together.)
+- **RSA private-key operations use base blinding but are not fully
+  constant-time.** Signing/decryption apply RSA **base blinding**
+  (`rsa_private_modpow_blinded` / `rsa_random_coprime` in `crypto_impl.rs`): the
+  secret-exponent `modpow` runs on a random, ciphertext-independent operand, so
+  the **message-dependent** timing/branch channel is removed. The underlying
+  `BigUint::modpow` is still variable-time (no Montgomery-ladder constant-time
+  guarantee, no CRT), so the fixed exponent `d` still drives a non-constant-time
+  modexp. This is adequate for functional JCA compatibility and removes the
+  most practical timing oracle, but should **not** be relied on as fully
+  side-channel-resistant. ECDSA scalar/nonce paths remain variable-time
+  (documented in-code). For hardened RSA/ECDSA, terminate it in audited native
+  crypto outside the VM. Keep this section and `CRYPTO_STATUS.md` in sync.
 
 ## Network hardening
 
@@ -115,6 +119,15 @@ The native blocking-connect path runs every outbound target through an
   against **each resolved IP**, closing the DNS-rebind / hostname-alias escape
   (e.g. `metadata.google.internal` → `169.254.169.254`). This mirrors the
   non-blocking path's `resolve_and_vet`.
+- **Optional active hostname resolution** via `CRATONVM_RESOLVE_OUTBOUND_HOST`:
+  when set, outbound **hostnames** are resolved and the per-IP policy is applied
+  to **every** resolved address (deny if any is blocked), closing the alias
+  bypass even for callers that hit `check_outbound`/`default_policy` directly
+  rather than going through `policy_connect`. Off by default (the documented
+  no-DNS, low-latency, TOCTOU-free default posture).
+- **IPv4-mapped/compatible IPv6** literals (`::ffff:169.254.169.254`,
+  `::a.b.c.d`) are unwrapped and run through the v4 metadata/link-local check, so
+  they cannot bypass the metadata block as a v6 address.
 - **Optional private-net block** via `CRATONVM_BLOCK_PRIVATE_NETS` (see table).
 - **Embeddable.** `set_policy(fn)` installs a custom `PolicyFn`; `reset_policy()`
   restores the default. A denial maps to a Java `IOException`.
@@ -134,11 +147,26 @@ HTTP-request-smuggling vectors with a `400`:
 - **Conflicting / duplicate `Content-Length`** headers (and comma-lists with
   differing members) — instead of letting "the last one win".
 - **Unparseable `Content-Length`.**
+- **`Transfer-Encoding` desync.** `Transfer-Encoding: chunked` is now honored
+  (the body is decoded by chunked framing, capped by `CRATONVM_HTTP_MAX_BODY`);
+  a request carrying **both** `Transfer-Encoding` and `Content-Length`, or an
+  unknown transfer coding, is rejected with `400` — closing the TE/CL desync that
+  previously read zero body bytes and left the chunked payload unread on a
+  keep-alive connection.
 
 It also bounds memory: the advertised length is checked against
 `CRATONVM_HTTP_MAX_BODY` **before** any allocation, bytes already buffered with
 the header count toward the cap, and the body buffer is allocated with bounded
 (never the raw client-advertised) capacity. Oversized → `413`.
+
+### Outbound HTTP client
+
+The built-in HTTP client (`http_client.rs`) **strips credential headers**
+(`Authorization`, `Proxy-Authorization`, `Cookie`) when a redirect crosses to a
+different origin (scheme/host/port), so a redirect to an attacker host cannot
+exfiltrate the caller's credentials. It also bounds the chunked reader's
+size-line/trailer accumulation (anti-DoS) and handles the HTTP/2 `PADDED` flag on
+`HEADERS` frames.
 
 ### Decompression-bomb guard
 

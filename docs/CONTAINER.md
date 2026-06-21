@@ -137,12 +137,17 @@ CRATONVM_DEFAULT_HEAP_ERGONOMICS=0 cratonvm -cp /app Main
 
 Be honest about the seams here:
 
-* **Detector — implemented, not consumed.** `detect_container()`,
+* **Detector + bridge helper — implemented, not yet wired.** `detect_container()`,
   `effective_memory_limit()`, and `effective_available_processors()` are present
-  and unit-tested in `vm/src/runtime/container.rs`, but at the time of writing
-  they have **no production callers**. The cgroup memory limit does **not** yet
-  feed the heap sizer, and the cgroup CPU count does **not** yet back
-  `Runtime.availableProcessors()`.
+  and unit-tested in `vm/src/runtime/container.rs`. A container-aware bridge,
+  **`suggested_default_max_heap(&ContainerInfo, fallback)`**, also exists there —
+  it derives a default max-heap of **1/4 of the cgroup memory limit**, floored at
+  16 MiB and capped at 8 GiB, returning the `fallback` when not containerized.
+  But at the time of writing these have **no production callers** (the helper is
+  exercised only by its tests): the cgroup memory limit does **not** yet feed the
+  launcher's heap sizer, and the cgroup CPU count does **not** yet back
+  `Runtime.availableProcessors()`. Wiring `suggested_default_max_heap` into the
+  launcher's `--Xmx`-default path is the documented follow-up.
 * **Ergonomic default heap uses physical RAM, not the cgroup limit.**
   `ergonomic_default_max_heap()` calls `physical_ram_bytes()` (which on Linux
   reads `/proc/meminfo` `MemTotal`, i.e. the *host* total), **not**
