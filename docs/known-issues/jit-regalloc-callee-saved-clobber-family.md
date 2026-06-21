@@ -105,6 +105,21 @@ The family is being chipped away, not stuck:
   virtual-dispatch *bail* using the static call-site class, fixed in
   `jit/.../helpers.rs::bail_to_interpreter`.
 
+### Length-table hardening (2026-06-21) — defense-in-depth against the CM-FASTMATH class
+
+The CM-FASTMATH bug was a `bc_len` length-table desync (missing `ldc*`). An audit of the two
+JIT instruction-length twins found three more 5-byte opcodes absent from both
+`regalloc.rs::bc_len` and `x64.rs::bytecode_len_at`: **`invokedynamic` (0xba), `goto_w` (0xc8),
+`jsr_w` (0xc9)** — they fell through to the `_ => 1` arm, a 4-byte under-count that would desync
+every PC-stepping consumer (liveness, branch-target precompute, DCE, OSR/unroll, oop maps), the
+exact class of liveness-desync miscompile CM-FASTMATH was. **Currently latent** — `jit_scan`'s
+catch-all rejects all three (no compiled method contains them today, same as `wide`/0xc4) — but
+the tables are documented to stay correct as defense-in-depth, and `invokedynamic` JIT support is
+being explored. Added to both twins with regression tests (`bc_len_five_byte_ops`,
+`test_bytecode_len_invoke`); the `loop_analysis.rs` and `vm/.../skip_list.rs` length tables
+already handled them. Tied to the family because a wrong length here is precisely how the
+register-clobber surfaces.
+
 So individual manifestations are tractable once a reproducer or a precise codegen site is found;
 what remains open is the **general** clobber.
 

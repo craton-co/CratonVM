@@ -570,6 +570,346 @@ fn build_enhancer_class(
     (new_name, bytes)
 }
 
+// ===========================================================================
+// Method-injection (lookup-method / @Lookup) subclass generation — bug-B2.
+//
+// Spring's `<lookup-method>` / `@Lookup` declares an ABSTRACT bean class whose
+// abstract methods must be implemented by a CGLIB subclass that returns a bean
+// from the owning factory on each call. The previous instantiation shim refused
+// to instantiate abstract classes (returned null → "Target object must not be
+// null"). Here we emit a concrete subclass:
+//   * `$$beanFactory` field (Object) holding the owning BeanFactory.
+//   * default `<init>()V` → super.<init>().
+//   * for each abstract method that has a lookup override: an override returning
+//     `(Ret) bf.getBean(name|Ret.class[, boxedArgs])`.
+//   * for each abstract method WITHOUT an override: a body that throws
+//     `AbstractMethodError` (so the subclass is concrete/instantiable and calling
+//     an un-declared lookup fails exactly as on CGLIB).
+// The owning factory is stored into `$$beanFactory` by the instantiation shim
+// right after `new_object` (no BeanFactoryAware callback needed here).
+// ===========================================================================
+
+/// One abstract method to materialise on the generated lookup subclass.
+pub struct LookupMethodSpec {
+    /// Method name.
+    pub name: String,
+    /// JVM descriptor, e.g. `(Ljava/lang/String;)Lorg/.../TestBean;`.
+    pub descriptor: String,
+    /// Internal name of the (reference) return type, e.g. `org/.../TestBean`.
+    pub return_internal: String,
+    /// `Some(name)` → resolve by bean name; `None` → resolve by return type.
+    pub bean_name: Option<String>,
+    /// `true` → emit a `getBean` override; `false` → emit a throwing stub.
+    pub is_lookup: bool,
+}
+
+/// Shared constant-pool indices used by every emitted lookup override.
+struct LookupCp {
+    code_attr_name_idx: u16,
+    bf_field_ref: u16,
+    beanfactory_cast_idx: u16,
+    object_class_idx: u16,
+    getbean_name_ref: u16,
+    getbean_name_args_ref: u16,
+    getbean_type_ref: u16,
+    getbean_type_args_ref: u16,
+    valueof_int: u16,
+    valueof_long: u16,
+    valueof_float: u16,
+    valueof_double: u16,
+    valueof_bool: u16,
+    valueof_byte: u16,
+    valueof_char: u16,
+    valueof_short: u16,
+    ame_class_idx: u16,
+    ame_init_ref: u16,
+}
+
+/// Push a small int constant (`iconst`/`bipush`/`sipush`).
+fn push_int(code: &mut Vec<u8>, v: i32) {
+    match v {
+        -1..=5 => code.push((0x03 + v) as u8), // iconst_m1..iconst_5
+        -128..=127 => {
+            code.push(0x10); // bipush
+            code.push(v as i8 as u8);
+        }
+        _ => {
+            code.push(0x11); // sipush
+            code.extend_from_slice(&(v as i16).to_be_bytes());
+        }
+    }
+}
+
+/// Split a method descriptor into its parameter descriptor strings.
+fn parse_param_descriptors(desc: &str) -> Vec<String> {
+    let inner = match (desc.find('('), desc.find(')')) {
+        (Some(a), Some(b)) if b > a => &desc[a + 1..b],
+        _ => return Vec::new(),
+    };
+    let bytes = inner.as_bytes();
+    let mut i = 0;
+    let mut out = Vec::new();
+    while i < bytes.len() {
+        let start = i;
+        while i < bytes.len() && bytes[i] == b'[' {
+            i += 1;
+        }
+        if i >= bytes.len() {
+            break;
+        }
+        if bytes[i] == b'L' {
+            while i < bytes.len() && bytes[i] != b';' {
+                i += 1;
+            }
+            i += 1; // consume ';'
+        } else {
+            i += 1; // single-char primitive
+        }
+        out.push(inner[start..i.min(inner.len())].to_string());
+    }
+    out
+}
+
+/// Emit `load + box` for one parameter at `slot`, leaving a reference on the
+/// operand stack (primitives boxed via `valueOf`).
+fn emit_load_box(code: &mut Vec<u8>, cp: &LookupCp, p: &str, slot: u16) {
+    let b = |x: u16| x.to_be_bytes();
+    // load instruction (indexed forms work for any slot)
+    let (load_op, valueof): (u8, Option<u16>) = match p {
+        "I" => (0x15, Some(cp.valueof_int)),
+        "Z" => (0x15, Some(cp.valueof_bool)),
+        "B" => (0x15, Some(cp.valueof_byte)),
+        "C" => (0x15, Some(cp.valueof_char)),
+        "S" => (0x15, Some(cp.valueof_short)),
+        "J" => (0x16, Some(cp.valueof_long)),
+        "F" => (0x17, Some(cp.valueof_float)),
+        "D" => (0x18, Some(cp.valueof_double)),
+        _ => (0x19, None), // aload (reference / array)
+    };
+    code.push(load_op);
+    code.push(slot as u8);
+    if let Some(vref) = valueof {
+        code.push(0xB8); // invokestatic Boxtype.valueOf
+        code.extend_from_slice(&b(vref));
+    }
+}
+
+/// Wrap a code body into a `method_info` (ACC_PUBLIC, single Code attribute).
+fn wrap_method(
+    name_idx: u16,
+    desc_idx: u16,
+    code_attr_name_idx: u16,
+    code: &[u8],
+    max_stack: u16,
+    max_locals: u16,
+) -> Vec<u8> {
+    let mut code_attr = Vec::new();
+    code_attr.extend_from_slice(&max_stack.to_be_bytes());
+    code_attr.extend_from_slice(&max_locals.to_be_bytes());
+    code_attr.extend_from_slice(&(code.len() as u32).to_be_bytes());
+    code_attr.extend_from_slice(code);
+    code_attr.extend_from_slice(&0u16.to_be_bytes()); // exception_table_length
+    code_attr.extend_from_slice(&0u16.to_be_bytes()); // attributes_count
+    let mut method = Vec::new();
+    method.extend_from_slice(&0x0001u16.to_be_bytes()); // ACC_PUBLIC
+    method.extend_from_slice(&name_idx.to_be_bytes());
+    method.extend_from_slice(&desc_idx.to_be_bytes());
+    method.extend_from_slice(&1u16.to_be_bytes()); // attributes_count = 1 (Code)
+    method.extend_from_slice(&code_attr_name_idx.to_be_bytes());
+    method.extend_from_slice(&(code_attr.len() as u32).to_be_bytes());
+    method.extend_from_slice(&code_attr);
+    method
+}
+
+/// Number of local-variable slots the params occupy (long/double take 2).
+fn param_slots(params: &[String]) -> u16 {
+    let mut n = 0u16;
+    for p in params {
+        n += if p == "J" || p == "D" { 2 } else { 1 };
+    }
+    n
+}
+
+/// Build the bytes for `build_lookup_subclass`'s `<OriginalName>$$SpringCGLIB$$N`.
+/// Returns the chosen internal name and the class-file bytes.
+pub fn build_lookup_subclass(
+    super_internal_name: &str,
+    methods: &[LookupMethodSpec],
+) -> (String, Vec<u8>) {
+    let counter = ENHANCER_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let new_name = format!("{super_internal_name}$$SpringCGLIB$$LM{counter:x}");
+    let mut cw = ClassWriter::new();
+
+    let this_class_idx = cw.add_class(&new_name);
+    let super_class_idx = cw.add_class(super_internal_name);
+
+    let init_name_idx = cw.add_utf8("<init>");
+    let void_no_arg_desc_idx = cw.add_utf8("()V");
+    let code_attr_name_idx = cw.add_utf8("Code");
+    let super_init_methodref = cw.add_methodref(super_class_idx, "<init>", "()V");
+
+    let bf_field_name_idx = cw.add_utf8("$$beanFactory");
+    let object_desc_idx = cw.add_utf8("Ljava/lang/Object;");
+    let bf_field_ref = cw.add_fieldref(this_class_idx, "$$beanFactory", "Ljava/lang/Object;");
+
+    let beanfactory_cast_idx = cw.add_class("org/springframework/beans/factory/BeanFactory");
+    let object_class_idx = cw.add_class("java/lang/Object");
+    let getbean_name_ref = cw.add_interface_methodref(
+        beanfactory_cast_idx,
+        "getBean",
+        "(Ljava/lang/String;)Ljava/lang/Object;",
+    );
+    let getbean_name_args_ref = cw.add_interface_methodref(
+        beanfactory_cast_idx,
+        "getBean",
+        "(Ljava/lang/String;[Ljava/lang/Object;)Ljava/lang/Object;",
+    );
+    let getbean_type_ref = cw.add_interface_methodref(
+        beanfactory_cast_idx,
+        "getBean",
+        "(Ljava/lang/Class;)Ljava/lang/Object;",
+    );
+    let getbean_type_args_ref = cw.add_interface_methodref(
+        beanfactory_cast_idx,
+        "getBean",
+        "(Ljava/lang/Class;[Ljava/lang/Object;)Ljava/lang/Object;",
+    );
+    let integer_cls = cw.add_class("java/lang/Integer");
+    let valueof_int = cw.add_methodref(integer_cls, "valueOf", "(I)Ljava/lang/Integer;");
+    let long_cls = cw.add_class("java/lang/Long");
+    let valueof_long = cw.add_methodref(long_cls, "valueOf", "(J)Ljava/lang/Long;");
+    let float_cls = cw.add_class("java/lang/Float");
+    let valueof_float = cw.add_methodref(float_cls, "valueOf", "(F)Ljava/lang/Float;");
+    let double_cls = cw.add_class("java/lang/Double");
+    let valueof_double = cw.add_methodref(double_cls, "valueOf", "(D)Ljava/lang/Double;");
+    let bool_cls = cw.add_class("java/lang/Boolean");
+    let valueof_bool = cw.add_methodref(bool_cls, "valueOf", "(Z)Ljava/lang/Boolean;");
+    let byte_cls = cw.add_class("java/lang/Byte");
+    let valueof_byte = cw.add_methodref(byte_cls, "valueOf", "(B)Ljava/lang/Byte;");
+    let char_cls = cw.add_class("java/lang/Character");
+    let valueof_char = cw.add_methodref(char_cls, "valueOf", "(C)Ljava/lang/Character;");
+    let short_cls = cw.add_class("java/lang/Short");
+    let valueof_short = cw.add_methodref(short_cls, "valueOf", "(S)Ljava/lang/Short;");
+    let ame_class_idx = cw.add_class("java/lang/AbstractMethodError");
+    let ame_init_ref = cw.add_methodref(ame_class_idx, "<init>", "()V");
+
+    let cp = LookupCp {
+        code_attr_name_idx,
+        bf_field_ref,
+        beanfactory_cast_idx,
+        object_class_idx,
+        getbean_name_ref,
+        getbean_name_args_ref,
+        getbean_type_ref,
+        getbean_type_args_ref,
+        valueof_int,
+        valueof_long,
+        valueof_float,
+        valueof_double,
+        valueof_bool,
+        valueof_byte,
+        valueof_char,
+        valueof_short,
+        ame_class_idx,
+        ame_init_ref,
+    };
+
+    let ctor = emit_default_ctor(
+        init_name_idx,
+        void_no_arg_desc_idx,
+        code_attr_name_idx,
+        super_init_methodref,
+    );
+    let bf_field = emit_bean_factory_field(bf_field_name_idx, object_desc_idx);
+    let mut method_bytes: Vec<Vec<u8>> = vec![ctor];
+
+    let b = |x: u16| x.to_be_bytes();
+    for m in methods {
+        let name_idx = cw.add_utf8(&m.name);
+        let desc_idx = cw.add_utf8(&m.descriptor);
+        let params = parse_param_descriptors(&m.descriptor);
+        let mlocals = 1 + param_slots(&params);
+
+        if !m.is_lookup {
+            // throwing stub: new AME; dup; invokespecial <init>; athrow
+            let mut code = Vec::new();
+            code.push(0xBB); // new
+            code.extend_from_slice(&b(cp.ame_class_idx));
+            code.push(0x59); // dup
+            code.push(0xB7); // invokespecial
+            code.extend_from_slice(&b(cp.ame_init_ref));
+            code.push(0xBF); // athrow
+            method_bytes.push(wrap_method(name_idx, desc_idx, code_attr_name_idx, &code, 2, mlocals));
+            continue;
+        }
+
+        let rettype_class_idx = cw.add_class(&m.return_internal);
+        let name_string_idx = m.bean_name.as_ref().map(|bn| cw.add_string(bn));
+
+        let mut code: Vec<u8> = Vec::new();
+        // bf = (BeanFactory) this.$$beanFactory
+        code.push(0x2A); // aload_0
+        code.push(0xB4); // getfield
+        code.extend_from_slice(&b(cp.bf_field_ref));
+        code.push(0xC0); // checkcast BeanFactory
+        code.extend_from_slice(&b(cp.beanfactory_cast_idx));
+        // selector: name string (by name) or return Class (by type)
+        code.push(0x13); // ldc_w
+        match name_string_idx {
+            Some(s) => code.extend_from_slice(&b(s)),
+            None => code.extend_from_slice(&b(rettype_class_idx)),
+        }
+        let has_args = !params.is_empty();
+        if has_args {
+            push_int(&mut code, params.len() as i32);
+            code.push(0xBD); // anewarray
+            code.extend_from_slice(&b(cp.object_class_idx));
+            let mut slot = 1u16;
+            for (i, p) in params.iter().enumerate() {
+                code.push(0x59); // dup
+                push_int(&mut code, i as i32);
+                emit_load_box(&mut code, &cp, p, slot);
+                slot += if p == "J" || p == "D" { 2 } else { 1 };
+                code.push(0x53); // aastore
+            }
+            let r = if name_string_idx.is_some() {
+                cp.getbean_name_args_ref
+            } else {
+                cp.getbean_type_args_ref
+            };
+            code.push(0xB9); // invokeinterface
+            code.extend_from_slice(&b(r));
+            code.push(0x03); // count = this + (name|class) + array
+            code.push(0x00);
+        } else {
+            let r = if name_string_idx.is_some() {
+                cp.getbean_name_ref
+            } else {
+                cp.getbean_type_ref
+            };
+            code.push(0xB9);
+            code.extend_from_slice(&b(r));
+            code.push(0x02);
+            code.push(0x00);
+        }
+        code.push(0xC0); // checkcast Ret
+        code.extend_from_slice(&b(rettype_class_idx));
+        code.push(0xB0); // areturn
+        method_bytes.push(wrap_method(name_idx, desc_idx, code_attr_name_idx, &code, 8, mlocals));
+    }
+
+    let access_flags: u16 = 0x0001 | 0x0020 | 0x1000; // PUBLIC | SUPER | SYNTHETIC
+    let bytes = cw.finish(
+        access_flags,
+        this_class_idx,
+        super_class_idx,
+        &[],
+        &[bf_field],
+        &method_bytes,
+    );
+    (new_name, bytes)
+}
+
 // ---------------------------------------------------------------------------
 // Native intercept
 // ---------------------------------------------------------------------------

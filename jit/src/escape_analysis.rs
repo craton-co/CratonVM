@@ -365,6 +365,24 @@ fn build_connection_graph(graph: &Graph) -> ConnectionGraph {
                 cg.set_escape(id, EscapeState::NoEscape);
             }
 
+            // Parameters: a reference passed in from the caller is, by
+            // definition, already reachable from outside this method.  Anything
+            // published into a parameter's field — the classic lazy-init
+            // `this.field = new ...; return this.field;` getter — is visible to
+            // the caller after we return, so a Param holder must carry an
+            // escaping state.  Without this, `this`/argument holders defaulted
+            // to `NoEscape` and the store-publish rule below never fired for
+            // them, letting a value stored into `this.field` be wrongly
+            // scalar-replaced (which elides the `putfield`, leaving the field
+            // null and the getter returning `null` under JIT — keycloak
+            // `CredentialModelTest.canCreateDefaultCredentialModel`).  This
+            // realises the assumption the store rule's comment already makes
+            // ("covers Param/Call holders").  Marking a primitive param is
+            // harmless: primitives are never allocations or field holders.
+            Op::Param(_) => {
+                cg.set_escape(id, EscapeState::GlobalEscape);
+            }
+
             // Phi nodes: deferred edges to all reference inputs.
             Op::Phi => {
                 for &inp in &node.inputs {
@@ -1166,6 +1184,49 @@ mod tests {
         assert_eq!(
             result.escape_states.get(&inner),
             Some(&EscapeState::GlobalEscape)
+        );
+    }
+
+    #[test]
+    fn test_value_stored_into_param_field_escapes() {
+        // Regression for the keycloak `CredentialModelTest` lazy-init getter:
+        //
+        //   Map getAdditionalParameters() {
+        //       if (additionalParameters == null)
+        //           additionalParameters = new MultivaluedHashMap<>();
+        //       return additionalParameters;
+        //   }
+        //
+        // `this` is `Param(0)`.  The freshly allocated map is published into a
+        // field of `this`, so the caller can reach it after the method returns.
+        // It MUST be treated as escaping and MUST NOT be scalar-replaced —
+        // scalar-replacing it elides the `putfield`, leaving the instance field
+        // null and the getter returning `null` under JIT (a value that can
+        // never legitimately be null on a correct JVM).
+        let mut g = Graph::new();
+        let this = g.add_node(Op::Param(0), vec![]);
+        let map = g.add_node(
+            Op::New {
+                class_id: 7,
+                num_fields: 0,
+            },
+            vec![],
+        );
+        let _store = g.add_node(Op::Store(0), vec![this, map]);
+        // Reload the field and return it, as the real getter does.
+        let load = g.add_node(Op::Load(0), vec![this]);
+        g.nodes[1].inputs.push(load); // Return node
+        g.nodes[load].uses.push(1);
+
+        let result = analyze_escapes(&g);
+        assert_ne!(
+            result.escape_states.get(&map),
+            Some(&EscapeState::NoEscape),
+            "object published into a parameter's field must escape"
+        );
+        assert!(
+            result.scalar_replaceable.is_empty(),
+            "a published object must not be scalar-replaced (would drop the putfield)"
         );
     }
 

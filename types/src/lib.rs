@@ -11,11 +11,13 @@ pub mod access_flags;
 mod class_id;
 pub mod compact_value;
 pub mod error;
+pub mod float_format;
 mod heap_types;
 pub mod intern;
 mod value;
 
 pub use class_id::{ClassId, ClassLoaderId};
+pub use float_format::{java_double_to_string, java_float_to_string};
 pub use compact_value::{CompactTag, CompactValue, CompactValueError};
 pub use heap_types::{
     array_data_size, array_data_size_checked, element_byte_size, ArrayElementType, ObjectHeader,

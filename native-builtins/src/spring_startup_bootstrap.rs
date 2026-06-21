@@ -33,7 +33,7 @@
 //!     and a handful of other bean-class / config-data accessors.
 //! These cover real gaps elsewhere in the bootstrap and are documented inline.
 
-use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_native_api::{DefineClassFull, NativeContext, NativeMethodRegistry};
 use cratonvm_types::error::MethodCallResult;
 use cratonvm_types::{ObjectRef, Value};
 use parking_lot::Mutex;
@@ -2094,6 +2094,192 @@ fn return_null_object(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCa
     Ok(Some(Value::Object(None)))
 }
 
+/// bug-B2: method-injection (`<lookup-method>` / `@Lookup`). A lookup-method
+/// bean is declared on an ABSTRACT class; the old shim refused to instantiate
+/// abstract classes and returned null → "Target object must not be null". Real
+/// Spring uses CGLIB to generate a concrete subclass implementing each abstract
+/// lookup method via the owning factory. We do the same: read the bean's method
+/// overrides, enumerate the still-abstract methods, emit a concrete subclass
+/// (`cglib_enhancer::build_lookup_subclass`), instantiate it, and store the
+/// owning factory into its `$$beanFactory` field so the generated overrides can
+/// resolve beans. Returns `Some(instance)` on success, `None` to fall through to
+/// the ordinary instantiation path.
+fn try_build_method_injection(
+    ctx: &mut dyn NativeContext,
+    mbd: ObjectRef,
+    owner: Value,
+    super_cid: cratonvm_types::ClassId,
+) -> Option<Value> {
+    use std::collections::{HashMap, HashSet};
+    const ACC_ABSTRACT: u16 = 0x0400;
+    const ACC_INTERFACE: u16 = 0x0200;
+
+    // Only abstract bean classes need a synthesised concrete subclass.
+    let super_internal = ctx.class_name_of_id(super_cid)?;
+    let super_flags = ctx.class_access_flags(super_cid);
+    let hmo = ctx.invoke_virtual(mbd, "hasMethodOverrides", "()Z", &[]);
+    eprintln!(
+        "[B2DBG] try_mi super={super_internal} flags={super_flags:#x} hasMethodOverrides={hmo:?}"
+    );
+    if super_flags & ACC_INTERFACE != 0 {
+        return None;
+    }
+    let has_overrides = matches!(hmo, Ok(Some(Value::Int(n))) if n != 0);
+    if !has_overrides && super_flags & ACC_ABSTRACT == 0 {
+        return None; // concrete, no overrides → ordinary path
+    }
+
+    // Read the lookup overrides: method name → optional bean name.
+    let mut overrides: HashMap<String, Option<String>> = HashMap::new();
+    if let Ok(Some(Value::Object(Some(mo)))) = ctx.invoke_virtual(
+        mbd,
+        "getMethodOverrides",
+        "()Lorg/springframework/beans/factory/support/MethodOverrides;",
+        &[],
+    ) {
+        if let Ok(Some(Value::Object(Some(set)))) =
+            ctx.invoke_virtual(mo, "getOverrides", "()Ljava/util/Set;", &[])
+        {
+            if let Ok(Some(Value::Object(Some(arr)))) =
+                ctx.invoke_virtual(set, "toArray", "()[Ljava/lang/Object;", &[])
+            {
+                let n = ctx.array_length(arr);
+                for i in 0..n {
+                    if let Value::Object(Some(ovr)) = ctx.get_array_element(arr, i) {
+                        let mname = match ctx.invoke_virtual(
+                            ovr,
+                            "getMethodName",
+                            "()Ljava/lang/String;",
+                            &[],
+                        ) {
+                            Ok(Some(Value::Object(Some(s)))) => {
+                                ctx.read_string(s).unwrap_or_default()
+                            }
+                            _ => continue,
+                        };
+                        // LookupOverride has getBeanName(); ReplaceOverride does not
+                        // (→ Err → by-type).
+                        let bname = match ctx.invoke_virtual(
+                            ovr,
+                            "getBeanName",
+                            "()Ljava/lang/String;",
+                            &[],
+                        ) {
+                            Ok(Some(Value::Object(Some(s)))) => {
+                                let v = ctx.read_string(s).unwrap_or_default();
+                                if v.is_empty() {
+                                    None
+                                } else {
+                                    Some(v)
+                                }
+                            }
+                            _ => None,
+                        };
+                        overrides.insert(mname, bname);
+                    }
+                }
+            }
+        }
+    }
+
+    // Enumerate methods up the hierarchy; a method needs implementing if it is
+    // abstract somewhere and never concrete.
+    let mut all: Vec<(String, String, bool)> = Vec::new();
+    let mut cursor = Some(super_cid);
+    while let Some(cid) = cursor {
+        for m in ctx.declared_methods(cid) {
+            if m.name.starts_with('<') {
+                continue;
+            }
+            all.push((
+                m.name.clone(),
+                m.descriptor.clone(),
+                m.access_flags & ACC_ABSTRACT != 0,
+            ));
+        }
+        cursor = ctx.superclass_of(cid);
+    }
+    let mut concrete: HashSet<(String, String)> = HashSet::new();
+    for (n, d, is_abs) in &all {
+        if !is_abs {
+            concrete.insert((n.clone(), d.clone()));
+        }
+    }
+    let mut seen: HashSet<(String, String)> = HashSet::new();
+    let mut specs: Vec<crate::cglib_enhancer::LookupMethodSpec> = Vec::new();
+    for (n, d, is_abs) in &all {
+        if !is_abs || concrete.contains(&(n.clone(), d.clone())) {
+            continue;
+        }
+        if !seen.insert((n.clone(), d.clone())) {
+            continue;
+        }
+        let ret = match d.split(')').nth(1) {
+            Some(r) => r,
+            None => continue,
+        };
+        let ref_ret = ret.starts_with('L') && ret.ends_with(';');
+        let return_internal = if ref_ret {
+            ret[1..ret.len() - 1].to_string()
+        } else {
+            "java/lang/Object".to_string()
+        };
+        // Only reference-returning abstract methods with a declared override are
+        // implementable as lookups; everything else gets a throwing stub (keeps
+        // the subclass concrete, matching CGLIB's behaviour for non-lookup
+        // abstract methods).
+        let (is_lookup, bean_name) = match overrides.get(n) {
+            Some(b) if ref_ret => (true, b.clone()),
+            _ => (false, None),
+        };
+        specs.push(crate::cglib_enhancer::LookupMethodSpec {
+            name: n.clone(),
+            descriptor: d.clone(),
+            return_internal,
+            bean_name,
+            is_lookup,
+        });
+    }
+    if specs.is_empty() {
+        return None; // no abstract methods to implement → ordinary path
+    }
+
+    let (new_name, bytes) = crate::cglib_enhancer::build_lookup_subclass(&super_internal, &specs);
+    eprintln!(
+        "[B2DBG] super={super_internal} specs={} lookups={} new_name={new_name} bytes={}",
+        specs.len(),
+        specs.iter().filter(|s| s.is_lookup).count(),
+        bytes.len()
+    );
+    let opts = DefineClassFull {
+        override_name: Some(new_name.clone()),
+        skip_verification: true,
+        ..Default::default()
+    };
+    match ctx.define_class_full(&new_name, &bytes, 0, opts) {
+        Ok(c) => eprintln!("[B2DBG] define_class_full OK cid={c:?}"),
+        Err(e) => {
+            eprintln!("[B2DBG] define_class_full FAILED: {e}");
+            return None;
+        }
+    }
+    let inst = match ctx.new_object(&new_name) {
+        Ok(Some(Value::Object(Some(o)))) => o,
+        other => {
+            eprintln!("[B2DBG] new_object({new_name}) returned {other:?}");
+            return None;
+        }
+    };
+    let _ = ctx.invoke(&new_name, "<init>", "()V", &[Value::Object(Some(inst))]);
+    // Hand the owning factory to the generated lookup overrides.
+    ctx.set_field_by_name(inst, "$$beanFactory", owner);
+    tracing::debug!(
+        "[spring-shim] method-injection: instantiated {new_name} (super={super_internal}, lookups={})",
+        specs.iter().filter(|s| s.is_lookup).count()
+    );
+    Some(Value::Object(Some(inst)))
+}
+
 /// sportme: SimpleInstantiationStrategy.instantiate(RootBeanDefinition,
 /// String beanName, BeanFactory owner) → Object.
 ///
@@ -2168,7 +2354,18 @@ fn s_instantiation_strategy_instantiate(
     // mirrors `Class.newInstance` JDK semantics. Returning null is the
     // safest behaviour: downstream Spring will surface a
     // BeanInstantiationException it can recover from.
+    eprintln!(
+        "[B2DBG] shim instantiate class_name={class_name} cid_by_name={:?}",
+        ctx.class_id_by_name(&class_name)
+    );
     if let Some(cid) = ctx.class_id_by_name(&class_name) {
+        // bug-B2: method-injection (`<lookup-method>` / `@Lookup`). The bean class
+        // is abstract; synthesise + instantiate a concrete CGLIB-style subclass
+        // whose abstract lookup methods resolve beans from the owning factory.
+        let owner = args.get(3).cloned().unwrap_or(Value::Object(None));
+        if let Some(inst) = try_build_method_injection(ctx, mbd, owner, cid) {
+            return Ok(Some(inst));
+        }
         let flags = ctx.class_access_flags(cid);
         let abstract_bit = cratonvm_types::access_flags::ACC_ABSTRACT;
         let iface_bit = cratonvm_types::access_flags::ACC_INTERFACE;

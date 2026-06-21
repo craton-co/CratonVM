@@ -1293,48 +1293,19 @@ fn value_to_string(
     }
 }
 
-/// Format a float value like Java does.
+/// Format a float value like Java's `Float.toString` (string-concat path).
+/// Delegates to the shared `cratonvm_types` formatter so the JLS layout —
+/// including the 10^-3..10^7 scientific-notation threshold — stays consistent
+/// with `Double.toString`/`StringBuilder.append`. The old local `format!("{v}")`
+/// never used E-notation, so `1e8f` concatenated as "100000000.0" not "1.0E8".
 fn format_float(v: f32) -> String {
-    if v.is_nan() {
-        "NaN".to_string()
-    } else if v.is_infinite() {
-        if v > 0.0 {
-            "Infinity".to_string()
-        } else {
-            "-Infinity".to_string()
-        }
-    } else if v == 0.0 && v.is_sign_negative() {
-        "-0.0".to_string()
-    } else {
-        let s = format!("{v}");
-        if !s.contains('.') && !s.contains('E') && !s.contains('e') {
-            format!("{s}.0")
-        } else {
-            s
-        }
-    }
+    cratonvm_types::java_float_to_string(v)
 }
 
-/// Format a double value like Java does.
+/// Format a double value like Java's `Double.toString` (string-concat path).
+/// See `format_float`.
 fn format_double(v: f64) -> String {
-    if v.is_nan() {
-        "NaN".to_string()
-    } else if v.is_infinite() {
-        if v > 0.0 {
-            "Infinity".to_string()
-        } else {
-            "-Infinity".to_string()
-        }
-    } else if v == 0.0 && v.is_sign_negative() {
-        "-0.0".to_string()
-    } else {
-        let s = format!("{v}");
-        if !s.contains('.') && !s.contains('E') && !s.contains('e') {
-            format!("{s}.0")
-        } else {
-            s
-        }
-    }
+    cratonvm_types::java_double_to_string(v)
 }
 
 // ---------------------------------------------------------------------------
