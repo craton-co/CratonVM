@@ -49,6 +49,13 @@ pub enum DeoptReason {
     NotCompiled,
     /// Unreached code executed.
     UnreachedCode,
+    /// OSR-exit — a running JIT/OSR frame bailed mid-loop back to the
+    /// interpreter at a loop bci (not a guard bci). Distinct from
+    /// `UncommonTrap` so OSR-exit events are countable separately in the
+    /// `DeoptimizationLog`; for `recommend_action` policy it currently falls
+    /// through to the count-based default, exactly like `UncommonTrap`
+    /// (see `docs/feature-designs/deopt-osr.md`, scaffolding).
+    OsrExit,
 }
 
 /// What the runtime should do after a deopt.
@@ -91,6 +98,14 @@ pub enum FrameValue {
     StackSlotRef(i32),
     /// Scalar-replaced object that must be re-materialized.
     VirtualObject(VirtualObjectState),
+    /// A reference to another scalar-replaced object in the same deopt frame, by
+    /// its [`VirtualObjectState::id`]. Represents shared references and cycles:
+    /// each object is *defined* exactly once by its `VirtualObject(state)`
+    /// occurrence, and every other edge to it (including a back-edge that would
+    /// otherwise nest infinitely) is a `VirtualObjectRef(id)`. Materialization
+    /// resolves it to the shell allocated for that id in Phase 1; it never
+    /// resolves to a machine value, so `resolve_value` passes it through.
+    VirtualObjectRef(usize),
     /// Undefined / uninitialized.
     Undefined,
     /// A live slot whose precise value can't yet be reconstructed for resume
@@ -104,6 +119,11 @@ pub enum FrameValue {
 /// State of a scalar-replaced object that needs heap materialization.
 #[derive(Debug, Clone, PartialEq)]
 pub struct VirtualObjectState {
+    /// Identity of this scalar-replaced object within its deopt frame. Distinct
+    /// objects have distinct ids; `FrameValue::VirtualObjectRef(id)` edges (and
+    /// the materializer's shell map) resolve against it, which is what lets the
+    /// two-phase materialization rebuild shared references and cycles.
+    pub id: usize,
     pub class_id: u32,
     pub num_fields: usize,
     pub field_values: Vec<FrameValue>,
@@ -744,7 +764,10 @@ pub fn materialize_virtual_objects(frame: &FrameState) -> Vec<(usize, u64)> {
 /// deopt path before the GC-backed materialization above is implemented, this
 /// stub makes the mistake impossible to miss: it never returns a fabricated
 /// address — it panics. Replace it with the GC-allocating implementation
-/// described above when the live-deopt heap plumbing lands.
+/// described above when the live-deopt heap plumbing lands. The vm-side
+/// scaffolding (the `TempRootScope` GC-root primitive + the heap-threaded
+/// entry point) now lives in `cratonvm_vm::runtime::deopt_materialize`
+/// (deopt-osr Step 5/6).
 #[cfg(not(test))]
 pub fn materialize_virtual_objects(frame: &FrameState) -> Vec<(usize, u64)> {
     // Hard guard: virtual-object re-materialization needs a live heap/allocator
@@ -917,6 +940,91 @@ pub extern "C" fn ir_deopt_entry(point: *const DeoptimizationPoint, rbp: u64) ->
     let frame = reconstruct_frame_from_machine_state(point, &regs, rbp);
     LAST_DEOPT.with(|c| *c.borrow_mut() = Some(frame));
     i64::MIN
+}
+
+/// real-frame-deopt x64 Step 2 — the 3-arg frame-deopt trampoline entry.
+///
+/// The x64 single-pass backend's frame-deopt stub spills all 16 GPRs into an
+/// in-frame [`SavedRegisters`] region and calls here with a pointer to it, so —
+/// unlike [`ir_deopt_entry`] (which passes a default-zero register file because
+/// the IR lowerer keeps every live value in a frame slot) — a
+/// `FrameValue::Register(r)` resolves against the **live** spilled GPR `r`.
+///
+/// Mirrors `ir_deopt_entry` otherwise: stashes the reconstructed frame in
+/// `LAST_DEOPT` and returns the `i64::MIN` deopt sentinel. It deliberately does
+/// **not** set the VM's out-of-band deopt-pending flag — the interpreter's
+/// real-frame-deopt detection (`vm/src/runtime/interpreter.rs`) keys on
+/// `result == i64::MIN && take_last_deopt().is_some()`, runs before the
+/// `deopt_signaled` path, and clears the stash so it cannot leak to the next JIT
+/// call. STASH ONLY — no resume yet (that is Step 4).
+///
+/// # Safety
+/// `point` and `regs` must be non-null and valid for the trapping frame, and
+/// `rbp` its still-live base — guaranteed by the emitting stub, which calls this
+/// after spilling and before the epilogue.
+pub extern "C" fn x64_deopt_entry(
+    point: *const DeoptimizationPoint,
+    rbp: u64,
+    regs: *const SavedRegisters,
+) -> i64 {
+    if point.is_null() || regs.is_null() {
+        return i64::MIN;
+    }
+    // SAFETY: contract documented above.
+    let point = unsafe { &*point };
+    let regs = unsafe { &*regs };
+    let frame = reconstruct_frame_from_machine_state(point, regs, rbp);
+    LAST_DEOPT.with(|c| *c.borrow_mut() = Some(frame));
+    i64::MIN
+}
+
+#[cfg(test)]
+mod x64_deopt_entry_tests {
+    use super::*;
+
+    /// The 3-arg entry resolves `FrameValue::Register(r)` against the PASSED
+    /// register file (proving the in-stub spill + 3-arg wiring), where
+    /// `ir_deopt_entry`'s default-zeros path would yield 0; constants pass
+    /// through; and the frame is stashed for `take_last_deopt`.
+    #[test]
+    fn resolves_registers_against_passed_regfile_and_stashes() {
+        let mut regs = SavedRegisters::default();
+        regs.gpr[3] = 0xDEAD_BEEF; // architectural reg 3 (RBX) holds a live value
+        let point = DeoptimizationPoint {
+            native_offset: 0,
+            bci: 7,
+            reason: DeoptReason::BoundsCheck,
+            action: DeoptAction::Reinterpret,
+            speculation_id: 0,
+            frame_state: FrameState {
+                method_key: String::new(),
+                bci: 7,
+                locals: vec![FrameValue::Register(3), FrameValue::Int(5)],
+                stack: vec![FrameValue::Register(3)],
+                monitors: Vec::new(),
+                caller: None,
+            },
+        };
+        let _ = take_last_deopt(); // clear any prior stash
+        let r = x64_deopt_entry(&point, 0, &regs as *const SavedRegisters);
+        assert_eq!(r, i64::MIN, "entry returns the deopt sentinel");
+
+        let frame = take_last_deopt().expect("entry stashes a reconstructed frame");
+        assert_eq!(frame.bci, 7);
+        // Register(3) resolved to gpr[3]; Int passes through.
+        assert_eq!(frame.locals[0], FrameValue::Int(0xDEAD_BEEF));
+        assert_eq!(frame.locals[1], FrameValue::Int(5));
+        assert_eq!(frame.stack[0], FrameValue::Int(0xDEAD_BEEF));
+    }
+
+    /// Null args are tolerated (return the sentinel, stash nothing).
+    #[test]
+    fn null_args_return_sentinel_without_stash() {
+        let _ = take_last_deopt();
+        let r = x64_deopt_entry(std::ptr::null(), 0, std::ptr::null());
+        assert_eq!(r, i64::MIN);
+        assert!(take_last_deopt().is_none());
+    }
 }
 
 /// Count how many virtual objects need materialization across locals and
@@ -1158,6 +1266,7 @@ mod tests {
     #[test]
     fn virtual_object_state_fields() {
         let vo = VirtualObjectState {
+            id: 0,
             class_id: 42,
             num_fields: 2,
             field_values: vec![FrameValue::Int(1), FrameValue::Object(0)],
@@ -1523,6 +1632,7 @@ mod tests {
             bci: 0,
             locals: vec![
                 FrameValue::VirtualObject(VirtualObjectState {
+                    id: 0,
                     class_id: 1,
                     num_fields: 1,
                     field_values: vec![FrameValue::Int(10)],
@@ -1530,6 +1640,7 @@ mod tests {
                 FrameValue::Int(5),
             ],
             stack: vec![FrameValue::VirtualObject(VirtualObjectState {
+                id: 1,
                 class_id: 2,
                 num_fields: 0,
                 field_values: Vec::new(),

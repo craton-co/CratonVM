@@ -21,6 +21,7 @@ pub mod alloc_fastpath;
 pub mod build_tool_compat;
 pub mod container;
 pub mod crash_handler;
+pub mod deopt_materialize;
 pub mod diagnostics;
 pub mod fx_collections;
 pub mod gc_integration;
