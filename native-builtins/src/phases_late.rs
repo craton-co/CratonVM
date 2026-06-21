@@ -7396,6 +7396,36 @@ fn p57_no_such_file(ctx: &mut dyn NativeContext, path: &str) -> MethodCallFailed
     MethodCallFailed::ExceptionThrown(exc)
 }
 
+/// Build a *typed* `java.security.SignatureException` for a certificate whose
+/// signature could not be verified, and return it wrapped as a thrown Java
+/// exception.
+///
+/// `Certificate.verify(PublicKey)` is contractually required to throw on a bad
+/// signature — silently returning success is a certificate-verification
+/// vulnerability, because a caller treats `verify()` returning normally as
+/// proof that the certificate is trustworthy. Constructing the real
+/// `java.security.SignatureException` via `new_object_initialized` gives the
+/// thrown object the genuine `ClassId`, so handlers that
+/// `catch (SignatureException)` (or any superclass: `GeneralSecurityException`,
+/// `Exception`) match it correctly. If the class cannot be constructed we fall
+/// back to a `SecurityException` rather than swallowing the failure — the
+/// invariant is that verification failure NEVER returns normally.
+#[cfg(feature = "legacy-synthetic-crypto")]
+fn p68_signature_failure(ctx: &mut dyn NativeContext, msg: &str) -> MethodCallFailed {
+    let detail = ctx.create_string(msg);
+    if let Ok(Some(Value::Object(Some(exc)))) = ctx.new_object_initialized(
+        "java/security/SignatureException",
+        "(Ljava/lang/String;)V",
+        &[Value::Object(Some(detail))],
+    ) {
+        return MethodCallFailed::ExceptionThrown(exc);
+    }
+    RuntimeError::SecurityException {
+        message: msg.to_string(),
+    }
+    .into()
+}
+
 // --- jar-filesystem path encoding ---------------------------------------
 //
 // `FileSystemProvider.newFileSystem(Path jar, Map)` mounts the interior of a
@@ -32409,25 +32439,39 @@ pub(crate) fn register_p68_security_cert(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(None)))
         },
     );
+    // SECURITY: `Certificate.verify(PublicKey)` MUST throw on a bad signature.
+    // In the default build we deliberately DO NOT register a native override:
+    // the real `java.security.cert` / `X509CertImpl.verify(PublicKey)` bytecode
+    // then runs and performs the genuine signature check, throwing
+    // `SignatureException` (or `InvalidKeyException` / `CertificateException`)
+    // on failure. A no-op native that always returns `Ok(None)` would silently
+    // certify any certificate against any key — a verification-bypass
+    // vulnerability — so it is gated entirely behind the legacy feature.
+    #[cfg(feature = "legacy-synthetic-crypto")]
     r.register(
         cert,
         "verify",
         "(Ljava/security/PublicKey;)V",
         |ctx, args| {
-            #[cfg(feature = "legacy-synthetic-crypto")]
             if let Some(Value::Object(Some(this))) = args.get(0) {
                 let cert_id = match ctx.get_field(*this, 2) {
                     Value::Long(id) => id as u64,
                     _ => 0,
                 };
                 if let Some(parsed) = crypto_impl::cert_get(cert_id) {
+                    // Fail-closed: the legacy synthetic path can only attest to
+                    // the signature it is able to verify with the material it
+                    // holds. If verification does not succeed we throw rather
+                    // than returning normally, so a caller never mistakes an
+                    // unverifiable certificate for a verified one.
                     if !parsed.verify_signature(&parsed.public_key_bytes) {
-                        // For non-self-signed certs, verification with own key is expected to fail
-                        // We don't throw here as this is best-effort
+                        return Err(p68_signature_failure(
+                            ctx,
+                            "certificate signature verification failed",
+                        ));
                     }
                 }
             }
-            let _ = (ctx, args);
             Ok(None)
         },
     );
@@ -32643,23 +32687,33 @@ pub(crate) fn register_p68_security_cert(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(None)))
         },
     );
+    // SECURITY: see the `Certificate.verify` note above. The default build does
+    // NOT register this native, so the real `X509CertImpl.verify(PublicKey)`
+    // bytecode performs the genuine signature check and throws on failure.
+    // Previously this discarded the `verify_signature` result and always
+    // returned success, certifying any certificate against any key.
+    #[cfg(feature = "legacy-synthetic-crypto")]
     r.register(
         x509,
         "verify",
         "(Ljava/security/PublicKey;)V",
         |ctx, args| {
-            #[cfg(feature = "legacy-synthetic-crypto")]
             if let Some(Value::Object(Some(this))) = args.get(0) {
                 let cert_id = match ctx.get_field(*this, 2) {
                     Value::Long(id) => id as u64,
                     _ => 0,
                 };
                 if let Some(parsed) = crypto_impl::cert_get(cert_id) {
-                    // Best-effort verification — doesn't throw on failure for now
-                    let _ = parsed.verify_signature(&parsed.public_key_bytes);
+                    // Fail-closed: propagate a verification failure as a thrown
+                    // SignatureException instead of discarding the result.
+                    if !parsed.verify_signature(&parsed.public_key_bytes) {
+                        return Err(p68_signature_failure(
+                            ctx,
+                            "certificate signature verification failed",
+                        ));
+                    }
                 }
             }
-            let _ = (ctx, args);
             Ok(None)
         },
     );
