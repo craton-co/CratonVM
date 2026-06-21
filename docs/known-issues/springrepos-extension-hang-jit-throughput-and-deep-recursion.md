@@ -41,6 +41,35 @@ fix below).
 > buildSrc-specific — it gates *any* first Groovy parse, and is a more minimal repro
 > than `SpringRepositoriesExtensionTests` for the §5–§6 work.
 
+> **DEAD END (investigated 2026-06-21, do not repeat) — the compile-bail count is a
+> RED HERRING; class-loading is NOT the bottleneck.** A tempting hypothesis is "almost
+> nothing JIT-compiles during the Groovy/ANTLR bootstrap, so it runs interpreted and is
+> slow." `CRATONVM_DBG_JITC=1` shows ~173 `compile-bail`s on the trivial-script probe,
+> ~119 of them ANTLR. **But this is not a fixable signal.** Two experiments (each a full
+> release build, both reverted) prove it:
+> 1. **Prewarm `new`-site classes** at tier-up (load+init the classes a method's `new`
+>    sites construct, so `resolve_jit_new_site` stops returning `None`) → compile-bails
+>    **173 → 173**, ANTLR **119 → 119**. Zero change.
+> 2. **Prewarm *all* referenced classes** (walk the holder constant pool, load+init every
+>    `CONSTANT_Class` + every Field/Method/InterfaceMethod owner) → **173/119 → 174/118**
+>    (i.e. noise). Zero change. Wall-clock identical on/off.
+>
+> Why: `backend_attempted=false` is **not** an unresolved-class miss. The still-bailing
+> set includes `java/util/BitSet.get` (**native — no bytecode to compile**) and
+> `java/lang/String.compareTo` (**always loaded** — bootstrap). These bail for *intrinsic*
+> non-compilability (native / unsupported bytecode), and most of the 173 are legitimately
+> non-compilable and always interpreted — not a bottleneck. Loading classes can never help.
+>
+> Also: **wall-clock is machine-contention-dominated** here — the *same* probe measured
+> 33 s and 81 s on this multi-session box (on==off), so the bootstrap's true cost cannot be
+> measured reliably without a quiet machine.
+>
+> **Prerequisite for real progress (not done): a sampling profiler over the interpreter
+> dispatch loop (a frame histogram), to find the genuinely hot method(s).** The single
+> watchdog stack snapshot (`deserialize → BitSet`) is one sample, not a profile — do not
+> treat it, or the compile-bail list, as the bottleneck. The reverted experiments used a
+> `CRATONVM_JIT_NO_PREWARM_NEW` gate; neither the gate nor the prewarm is on dev.
+
 ---
 
 ## 1. The test decomposes into THREE independent defects (earlier reports conflated them)
