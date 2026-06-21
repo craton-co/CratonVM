@@ -1471,6 +1471,80 @@ the long deopt-resume so a `long` can be live at the div guard); then the
 **`double`/`float`** half (XMM registers + FP-slot deopt resume); and finally
 **long/double *call* args + returns** (`static_call_shape` category-2 marshalling
 — the original "category-2 call args" item, now unblocked at the value level).
+## Increment 26 (Gap B — `invokevirtual`/`invokeinterface` → `Op::Call`, gated) landed
+
+Status: **landed**, **default-OFF behind `CRATONVM_JIT_IR_CALL_VIRTUAL`**. Extends
+the `Op::Call` lever from static (inc 21–23) + special (inc 24) to **dynamic
+dispatch** — `invokevirtual` (0xb6) and `invokeinterface` (0xb9). It lands inert
++ validated (unit + differential); flipping it on is a follow-up (like inc 21→23),
+gated on the broader app-gauntlet soak since it puts a *polymorphic* dispatch path
+live by default.
+
+**Why it is sound without an inline cache.** The crucial design point: the
+generic `jit_invoke_dispatch` helper (`vm/src/jit/helpers.rs`) — already baked
+into every `Op::Call` and already used by the static/special path — **already
+handles `invoke_kind` 0 (virtual) and 2 (interface)**. For those kinds it routes
+through `bail_to_interpreter` → `virtual_dispatch_class` (the receiver's *runtime*
+class) → `invoke_or_native`, i.e. a full vtable/itable resolution on the receiver.
+So the IR path emits **no inline cache** (MIC/PIC) in the generated code — it bakes
+the static call-site `class/name/descriptor` into the `JitInvokeInfo` and lets the
+helper resolve the real target each call. This **structurally sidesteps the bug-24
+inline-cache-slot UAF** (an inline-cache concern that does not exist on this path)
+at the cost of a per-call dispatch (an inline-cache fast path is a later perf
+refinement, not a correctness prerequisite). The deltas vs. inc 24 are exactly:
+`invoke_kind = 0`/`2`, and the receiver marshalled as arg0 (the single-pass
+backend does the identical thing, so dispatch args are byte-identical).
+
+**GC-safety** is unchanged from inc 22/24: the IR lowerer spills every value to a
+frame slot (no oop in a register across a call), the GC is non-moving while a JIT
+frame is active, and the conservative IR-frame scan roots the receiver + reference
+args live across the call — so no oop map is needed.
+
+**What landed**
+- **`jit/src/ir.rs`** — the `invokevirtual` (0xb6) arm joins the `invokestatic`
+  (0xb8) `Op::Call` arm (same body, both 3-byte); a new `invokeinterface` (0xb9)
+  arm emits the same `Op::Call` but advances **`pc += 5`** (the 0xb9 encoding is
+  opcode, cp_hi, cp_lo, count, 0). **Both length walkers** (`find_branch_targets`,
+  `find_loop_headers`) gained `0xb6` in the 3-byte arm and a new 5-byte `0xb9` arm
+  — previously 0xb6/0xb9 fell into `_ => pc += 1`, harmless only while the builder
+  bailed on them; now that they lower, a mis-walked length would mis-locate a
+  branch target (the §5 "both length walkers must agree" gotcha).
+- **`jit/src/lib.rs`** — a new `try_compile` parameter `ir_emit_virtual_calls`.
+  The Gap-B gate now admits `invokevirtual`/`invokeinterface` (under the new flag)
+  alongside static/special; for them it sets `num_args = static_call_shape(desc) +
+  1` (the receiver) and `invoke_kind = 0`/`2`. `static_call_shape` still rejects
+  category-2 args/returns, so only int/reference receivers+args+returns are
+  admitted.
+- **`vm/src/runtime/interpreter.rs`** — the 3 `try_compile` sites pass
+  `ir_emit_virtual_calls` from `CRATONVM_JIT_IR_CALL_VIRTUAL` (default-OFF).
+
+**Tests**
+- `jit/tests/ir_vs_singlepass.rs::ir_vs_singlepass_invokevirtual_instance_call` —
+  **executes** the IR-emitted virtual call (receiver arg0, `num_jit_args = 2`,
+  `needs_context`); IR == host across sign/zero edges.
+- `…::ir_vs_singlepass_invokeinterface_instance_call` — same, for the **5-byte**
+  `invokeinterface` encoding (the decisive extra coverage: a wrong `pc += 5` would
+  mis-locate the trailing `ireturn`).
+- `jit/src/lib.rs::ir_virtual_call_wiring_routes_through_ir_only_with_flag` —
+  crosses the flags to prove `invokevirtual` routes through the IR pipeline
+  (`IR_LOWER_COMPILES == 1`) **iff** `ir_emit_virtual_calls` is on (non-vacuous:
+  single-pass also dispatches invokevirtual).
+- jit lib **819/819**, differential harness **28/28**, `cratonvm-vm` builds clean.
+
+**To soak / flip on** (the remaining production step, like inc 21→23): the IR
+re-compile path fires only in a release build with the tiered/background C2
+recompiler active (the first-call path is single-pass), so the live soak is a
+**release** run of `CRATONVM_JIT_IR_CALL_VIRTUAL=1` across the
+kafka/spring/tomcat/hibernate gauntlet + bt10/14/16/18 checksums (must stay
+`135854 / 3222190 / 14985902 / 68332206`) with a polymorphic probe `==` HotSpot
+gate-ON and gate-OFF (and under `CRATONVM_DBG_GC_STRESS=1` for the receiver-live-
+across-dispatch GC path), then default the flag on. The widened reach (every
+virtual/interface call site, polymorphic receiver oop live across the call) makes
+the gauntlet soak the gating step before the flip.
+
+**Next refinements**: category-2 (long/float/double) args + return; an optional
+monomorphic/polymorphic inline-cache fast path for the IR virtual `Op::Call` (a
+perf, not correctness, item).
 
 ## Implementation steps (ordered)
 

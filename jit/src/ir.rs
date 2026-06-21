@@ -1367,12 +1367,18 @@ impl IrBuilder {
                         pc += 3;
                     }
                 }
-                // invokestatic — lower a resolved static call to `Op::Call`
-                // (Gap B). Only emitted for an oop-free method (the caller
-                // populates `invoke_info` only then), so no object reference is
-                // ever live across the call → GC-safe without an oop map. A pc
-                // not in `invoke_info` bails to single-pass.
-                0xb8 => {
+                // invokestatic (0xb8) and invokevirtual (0xb6) — lower a resolved
+                // call to `Op::Call` (Gap B). `invokestatic` has no receiver;
+                // `invokevirtual` marshals the receiver as arg0 (the caller's
+                // `invoke_info` entry already counts it in `num_args`, and the
+                // leaked `JitInvokeInfo` carries `invoke_kind == 0` so
+                // `invoke_dispatch` resolves the actual target on the receiver's
+                // runtime class — full virtual dispatch through the generic helper,
+                // no inline cache in the emitted code). GC-safe by the same
+                // conservative IR-frame scan that roots reference args (inc 22).
+                // Both are 3-byte instructions. A pc not in `invoke_info` (gate
+                // off, or a non-emittable invoke present) bails to single-pass.
+                0xb6 | 0xb8 => {
                     let (info_ptr, num_args, ret_type) = match self.invoke_info.get(&pc) {
                         Some(&t) => t,
                         None => return None,
@@ -1406,6 +1412,39 @@ impl IrBuilder {
                         self.push(call);
                     }
                     pc += 3;
+                }
+                // invokeinterface (0xb9) — identical to the invokevirtual path
+                // (receiver arg0, `invoke_kind == 2`, dynamic dispatch via the
+                // helper) except it is a FIVE-byte instruction (opcode, cp_hi,
+                // cp_lo, count, 0). The trailing count/0 bytes are not consumed by
+                // the builder (the descriptor was resolved from the cp index by
+                // the caller); only the pc advance differs.
+                0xb9 => {
+                    let (info_ptr, num_args, ret_type) = match self.invoke_info.get(&pc) {
+                        Some(&t) => t,
+                        None => return None,
+                    };
+                    let mut args = Vec::with_capacity(num_args);
+                    for _ in 0..num_args {
+                        args.push(self.pop());
+                    }
+                    args.reverse();
+                    let mut inputs = Vec::with_capacity(2 + num_args);
+                    inputs.push(self.ctrl);
+                    inputs.push(self.mem);
+                    inputs.extend(args);
+                    let returns_value = ret_type != b'V';
+                    let ty = match ret_type {
+                        b'V' => IrType::Void,
+                        b'L' | b'[' => IrType::Ref,
+                        _ => IrType::Int,
+                    };
+                    let call = self.graph.add(Op::Call { info_ptr }, ty, inputs, Some(pc));
+                    self.mem = call;
+                    if returns_value {
+                        self.push(call);
+                    }
+                    pc += 5;
                 }
                 // dup
                 0x59 => {
@@ -1762,9 +1801,16 @@ fn find_branch_targets(code: &[u8], code_len: usize) -> Vec<usize> {
             0x10 | 0x15 | 0x19 | 0x36 | 0x3a => {
                 pc += 2;
             }
-            // 3-byte opcodes
-            0x11 | 0x84 | 0xb4 | 0xb5 | 0xb7 | 0xb8 | 0xbb => {
+            // 3-byte opcodes (incl. the 3-byte method invokes: invokevirtual
+            // 0xb6, invokespecial 0xb7, invokestatic 0xb8)
+            0x11 | 0x84 | 0xb4 | 0xb5 | 0xb6 | 0xb7 | 0xb8 | 0xbb => {
                 pc += 3;
+            }
+            // 5-byte opcodes: invokeinterface (0xb9) — opcode, cp_hi, cp_lo,
+            // count, 0. The trailing count/0 bytes MUST be skipped or a later
+            // branch target would be mis-located (the builder now lowers 0xb9).
+            0xb9 => {
+                pc += 5;
             }
             _ => {
                 // Unknown opcode — skip (builder will also bail)
@@ -1847,8 +1893,12 @@ fn find_loop_headers(code: &[u8], code_len: usize) -> HashSet<usize> {
             | 0xb1 => pc += 1,
             // 2-byte opcodes
             0x10 | 0x15 | 0x19 | 0x36 | 0x3a => pc += 2,
-            // 3-byte opcodes
-            0x11 | 0x84 | 0xb4 | 0xb5 | 0xb7 | 0xb8 | 0xbb => pc += 3,
+            // 3-byte opcodes (incl. invokevirtual 0xb6 / invokespecial 0xb7 /
+            // invokestatic 0xb8 — the 3-byte method invokes)
+            0x11 | 0x84 | 0xb4 | 0xb5 | 0xb6 | 0xb7 | 0xb8 | 0xbb => pc += 3,
+            // 5-byte: invokeinterface (0xb9) — skip its count/0 trailer so a
+            // backward branch target after it is located correctly.
+            0xb9 => pc += 5,
             _ => pc += 1,
         }
     }
