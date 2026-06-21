@@ -1928,6 +1928,103 @@ impl BigUint {
     }
 }
 
+// ---------------------------------------------------------------------------
+// RSA private-operation blinding (timing side-channel mitigation).
+//
+// nb-crypto-impl VULN(2): `BigUint::modpow` is a *variable-time* square-and-
+// multiply whose per-bit branch pattern and limb-routine timing depend on both
+// the exponent and the operand magnitudes. When the operand is an
+// attacker-influenced message/ciphertext and the exponent is the secret RSA
+// `d`, the running time directly leaks information that, across many adaptive
+// queries, recovers `d` (the classic RSA timing attack, Kocher '96 / Brumley-
+// Boneh '03). We cannot make `modpow` itself constant-time without routing to
+// an audited crate (out of scope here), but we CAN remove the *message-
+// dependent* channel by RSA base blinding: the secret-exponent modpow then runs
+// on a uniformly random, message-independent operand, so its timing reveals
+// nothing about the actual message/ciphertext.
+// ---------------------------------------------------------------------------
+
+/// Draw a random `BigUint` in `[2, n)` that is coprime to `n`, using the OS
+/// CSPRNG directly (`os_random_bytes`). Returns `None` only if the OS source is
+/// unavailable for every retry (callers then proceed unblinded rather than
+/// fail). Trivial moduli (`n < 3`) also yield `None` — there is no usable
+/// blinding factor and such a modulus is never a real RSA key.
+fn rsa_random_coprime(n: &BigUint) -> Option<BigUint> {
+    if n.cmp(&BigUint::from_u64(3)) == std::cmp::Ordering::Less {
+        return None;
+    }
+    let byte_len = (n.bit_length() + 7) / 8;
+    if byte_len == 0 {
+        return None;
+    }
+    let two = BigUint::from_u64(2);
+    // Bounded retries: rejection (out-of-range / non-coprime) is rare for an RSA
+    // modulus, and an unbounded loop on a pathological OS-entropy failure would
+    // hang the signing path.
+    for _ in 0..64 {
+        let mut bytes = vec![0u8; byte_len];
+        if !os_random_bytes(&mut bytes) {
+            return None;
+        }
+        let mut r = BigUint::from_bytes_be(&bytes).modulo(n);
+        if r.cmp(&two) == std::cmp::Ordering::Less {
+            r = two.clone();
+        }
+        // Coprimality is required so `r` is invertible mod `n`.
+        let (g, _, _, _, _) = BigUint::extended_gcd(&r, n);
+        if g.is_one() {
+            return Some(r);
+        }
+    }
+    None
+}
+
+/// Compute `base^d mod n` with RSA base blinding, given the public exponent `e`.
+///
+/// Blinding identity (gcd(r, n) == 1): `(base * r^e)^d == base^d * r^{e*d} ==
+/// base^d * r (mod n)`, so `base^d == (base * r^e)^d * r^{-1} (mod n)`. The
+/// single secret-exponent modpow runs on the random, message-independent
+/// operand `base * r^e`. Falls back to a plain `modpow` only if a blinding
+/// factor cannot be drawn (OS entropy down) — never silently producing a wrong
+/// result.
+fn rsa_private_modpow_blinded(base: &BigUint, d: &BigUint, e: &BigUint, n: &BigUint) -> BigUint {
+    if let Some(r) = rsa_random_coprime(n) {
+        if let Some(r_inv) = r.modinv(n) {
+            let re = r.modpow(e, n);
+            let blinded = base.mul(&re).modulo(n);
+            let s_blinded = blinded.modpow(d, n);
+            return s_blinded.mul(&r_inv).modulo(n);
+        }
+    }
+    base.modpow(d, n)
+}
+
+/// Compute `base^d mod n` with blinding when the public exponent `e` is NOT
+/// available (the `Cipher` decrypt path only carries `(n, d)`).
+///
+/// Without `e` we cannot use the `r^e` identity, so we use two independent
+/// secret-exponent modpows on uniformly random, message-independent operands:
+///   * `m_blinded = (base * r)^d mod n  = base^d * r^d`
+///   * `rd        = r^d mod n`
+///   * `base^d    = m_blinded * (r^d)^{-1} mod n`
+/// Both modpows operate on data independent of `base`, so the *message-
+/// dependent* timing channel that a decryption-timing attacker exploits is
+/// removed. Residual: the fixed exponent `d` still drives a variable-time
+/// modpow, so a fixed (message-independent) timing profile of `d` remains —
+/// eliminating that requires a constant-time core (out of scope; see VULN(2)).
+/// Falls back to a single plain `modpow` if blinding material is unavailable.
+fn rsa_private_modpow_blinded_no_e(base: &BigUint, d: &BigUint, n: &BigUint) -> BigUint {
+    if let Some(r) = rsa_random_coprime(n) {
+        let rd = r.modpow(d, n);
+        if let Some(rd_inv) = rd.modinv(n) {
+            let blinded = base.mul(&r).modulo(n);
+            let m_blinded = blinded.modpow(d, n);
+            return m_blinded.mul(&rd_inv).modulo(n);
+        }
+    }
+    base.modpow(d, n)
+}
+
 impl PartialEq for BigUint {
     fn eq(&self, other: &Self) -> bool {
         self.cmp(other) == std::cmp::Ordering::Equal
@@ -2100,7 +2197,11 @@ impl Rsa {
             return Vec::new();
         };
         let m = BigUint::from_bytes_be(&em);
-        let s = m.modpow(&key.d, &key.n);
+        // Base-blinded private exponentiation: removes the message-dependent
+        // timing channel of the variable-time `modpow` (VULN(2)). The public
+        // exponent `e` is available on `RsaPrivateKey`, so use the efficient
+        // single-secret-modpow `r^e` blinding.
+        let s = rsa_private_modpow_blinded(&m, &key.d, &key.e, &key.n);
         s.to_bytes_be_padded(k)
     }
 
@@ -2577,7 +2678,11 @@ pub fn rsa_cipher_decrypt(
         ));
     }
     let c = BigUint::from_bytes_be(ct);
-    let m = c.modpow(&d_big, &n_big);
+    // Blinded private exponentiation (VULN(2)): the `Cipher` decrypt path only
+    // carries `(n, d)` — the public exponent `e` is not threaded here — so use
+    // the no-`e` two-modpow blinding to remove the message-dependent (adaptive
+    // ciphertext) timing channel that an RSA decryption-timing attacker probes.
+    let m = rsa_private_modpow_blinded_no_e(&c, &d_big, &n_big);
     let em = m.to_bytes_be_padded(k);
     match pad {
         RsaCipherPadding::Pkcs1 => rsa_pkcs1_type2_unpad(&em),
@@ -3194,6 +3299,25 @@ impl Ecdsa {
                 continue;
             }
 
+            // nb-crypto-impl VULN(2) — ECDSA variable-time residual (UNFIXED):
+            // unlike the RSA private path above (which is now base-blinded), this
+            // EC scalar path is NOT blinded. The secret-dependent operations that
+            // remain variable-time are, precisely:
+            //   1. `EcPoint::scalar_mul(&g, &k)` — the double-and-add ladder
+            //      branches on each bit of the per-signature nonce `k`, so its
+            //      timing/power profile leaks `k`'s bit pattern. Recovering even a
+            //      few bits of `k` across several signatures breaks the key
+            //      (lattice/HNP attack), because `d = (s*k - z) / r mod n`.
+            //   2. `k_big.modinv(&n_big)` — the extended-GCD inversion of the
+            //      secret nonce runs in input-dependent time (its quotient
+            //      sequence depends on `k`), a second `k`-dependent channel.
+            //   3. `r_big.mul(&d_big)` — the limb multiply by the long-term secret
+            //      `d` is not constant-time, leaking `d` directly.
+            // Implementing scalar blinding (k' = k + e*n, and projective/Montgomery
+            // ladder scalar_mul) here is a larger rewrite of the EC core than the
+            // RSA `r^e` blinding; per scope it is documented rather than fixed.
+            // For an adversary-exposed EC signer prefer the audited `p256`/`ecdsa`
+            // crates (RFC 6979 nonce + constant-time scalar mul).
             let r_point = EcPoint::scalar_mul(&g, &k);
             if r_point.infinity {
                 continue;
@@ -5990,10 +6114,56 @@ mod tests {
         assert!(!Rsa::verify_sha256(&pk, &bad, &sig), "tampered payload");
     }
 
+    #[test]
+    fn rsa_blinding_matches_plain_modpow() {
+        // Base blinding MUST be functionally transparent: the blinded private
+        // exponentiation has to produce exactly the same result as the plain
+        // `modpow` for every operand. Use the textbook RSA instance
+        // (n=3233, e=17, d=2753) so the math is checkable by hand, plus a sweep
+        // of operands to catch any reduction/inverse mistake.
+        let n = BigUint::from_u64(3233);
+        let e = BigUint::from_u64(17);
+        let d = BigUint::from_u64(2753);
+        for base_v in [2u64, 7, 42, 65, 1000, 3232] {
+            let base = BigUint::from_u64(base_v);
+            let expected = base.modpow(&d, &n);
+            // With public exponent (RSA sign path).
+            let with_e = rsa_private_modpow_blinded(&base, &d, &e, &n);
+            assert!(
+                with_e == expected,
+                "blinded(with e) mismatch for base {}",
+                base_v
+            );
+            // Without public exponent (RSA Cipher decrypt path).
+            let no_e = rsa_private_modpow_blinded_no_e(&base, &d, &n);
+            assert!(
+                no_e == expected,
+                "blinded(no e) mismatch for base {}",
+                base_v
+            );
+        }
+    }
+
+    #[test]
+    fn rsa_random_coprime_is_in_range_and_coprime() {
+        // The blinding factor must be coprime to n (so it is invertible) and a
+        // non-trivial value in [2, n).
+        let n = BigUint::from_u64(3233); // 53 * 61
+        let r = rsa_random_coprime(&n).expect("OS entropy available in test");
+        assert!(
+            r.cmp(&BigUint::from_u64(2)) != std::cmp::Ordering::Less,
+            "r >= 2"
+        );
+        assert!(r.cmp(&n) == std::cmp::Ordering::Less, "r < n");
+        let (g, _, _, _, _) = BigUint::extended_gcd(&r, &n);
+        assert!(g.is_one(), "gcd(r, n) == 1");
+    }
+
     // RSA `Cipher` round-trip: encrypt with the public key, decrypt with the
     // private key, for every supported padding. Exercises the EME-PKCS1-v1_5
     // and EME-OAEP (SHA-1 / SHA-256) encode/decode paths used by the keycloak
-    // JWE RSA1_5 / RSA-OAEP / RSA-OAEP-256 transformations.
+    // JWE RSA1_5 / RSA-OAEP / RSA-OAEP-256 transformations. Also covers the
+    // base-blinded decrypt path (blinding must not change the plaintext).
     #[test]
     fn rsa_cipher_roundtrip_all_paddings() {
         let (pk, sk) = Rsa::generate_keypair(2048);
