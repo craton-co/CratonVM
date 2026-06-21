@@ -199,7 +199,12 @@ fn kc26_invokedynamic_makeconcat_and_altmetafactory() {
         "[KC26.8b] LambdaMetafactory.altMetafactory must be supported"
     );
     assert!(
-        src.contains("fallback_unrecognized_bsm"),
+        // The graceful fallback for an unrecognized bootstrap method is the
+        // generic bootstrap path (`bootstrap_generic`) plus the loud
+        // BootstrapMethodError fallback (`raise_bootstrap_method_error`). The
+        // old probe looked for `fallback_unrecognized_bsm`, an identifier that
+        // never existed in the source; assert the real mechanism instead.
+        src.contains("bootstrap_generic") && src.contains("raise_bootstrap_method_error"),
         "[KC26.8c] Graceful fallback for unrecognized BSMs must exist"
     );
     println!("[KC26.8] \u{2713} makeConcat + altMetafactory + BSM fallback present");
