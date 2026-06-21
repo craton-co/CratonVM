@@ -194,6 +194,16 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
         shared.jni_global_refs.lock().collect_roots(&mut roots);
     }
 
+    // 9a. Native upcall table — each live slot holds a `target: ObjectRef` for the
+    //     Java callback the legacy `pe_upcall_invoke` dispatch path invokes.
+    //     Un-rooted, a moving GC could reclaim/relocate the target out from under
+    //     a still-registered upcall (the Panama closure registry remaps its own
+    //     copy, but this table's copy was previously neither scanned nor remapped
+    //     — see gc.rs section 9a counterpart).
+    {
+        shared.upcall_table.lock().collect_roots(&mut roots);
+    }
+
     // 9b. JNI LOCAL references (vm-jni-roots #1).
     //
     //     Previously only global refs (section 9) were rooted. The per-thread

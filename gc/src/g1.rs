@@ -4117,6 +4117,88 @@ mod tests {
         assert_eq!(result.pointer_map[&old_addr], roots[0].as_ptr() as usize);
     }
 
+    /// MOVING-GC empirical confirmation for the JNI non-critical
+    /// `Get/Release<Type>ArrayElements` copy-back handle.
+    ///
+    /// When a G1 young evacuation relocates an array between `GetArrayElements`
+    /// and `ReleaseArrayElements`, the raw `array` jobject the native side holds
+    /// (a CratonVM local ref is exactly `obj.as_ptr()`, captured at Get) becomes
+    /// a stale from-space pointer. The OLD copy-back re-resolved THAT pointer via
+    /// `is_heap_addr` (as `jobject_to_obj` does for a local ref) and therefore
+    /// either silently dropped (region freed → `None`) or wrote into a recycled
+    /// object. The FIX records a *remappable* handle instead — a JNI global ref,
+    /// whose boxed `ObjectRef` `update_after_gc` rewrites through the very
+    /// `pointer_map` produced here — so the copy-back follows the array.
+    ///
+    /// This reproduces the exact relocation and proves BOTH halves: (a) the
+    /// stale raw handle no longer resolves to a live heap address, and (b) the
+    /// remapped handle resolves to the array's new location with data intact and
+    /// a copy-back write lands in the live array.
+    #[test]
+    fn jni_array_raw_handle_stale_after_evacuation_but_remap_survives() {
+        let gc = make_collector();
+        let arr = gc.alloc_array(ClassId::new(0), ArrayElementType::Int, 3);
+        gc.set_array_element(arr, 0, Value::Int(111)).unwrap();
+        gc.set_array_element(arr, 1, Value::Int(222)).unwrap();
+        gc.set_array_element(arr, 2, Value::Int(333)).unwrap();
+
+        // The raw `array` jobject value native code holds across the window,
+        // captured BEFORE the GC (exactly what the old Release re-resolved).
+        let stale_handle = arr.as_ptr() as usize;
+
+        // `roots` models the remappable keep-alive handle: a JNI global ref boxes
+        // an `ObjectRef` that the collector rewrites in place via this same
+        // pointer-map mechanism (`JniGlobalRefs::update_after_gc`).
+        let mut roots = vec![arr];
+        let result = gc.young_collection(&mut roots, &NoopMonitors);
+        let remapped = roots[0];
+        let new_addr = remapped.as_ptr() as usize;
+
+        // The evacuation actually MOVED the array (otherwise the test is vacuous).
+        assert_eq!(result.pointer_map.get(&stale_handle), Some(&new_addr));
+        assert_ne!(
+            stale_handle, new_addr,
+            "array must relocate for this test to be meaningful"
+        );
+
+        // (a) BUG path: the old raw handle is now stale — its region was
+        // evacuated and freed, so the local-ref re-resolve fails. The old
+        // copy-back would silently drop the native mutations here.
+        assert!(
+            !gc.is_addr_in_live_region(stale_handle),
+            "evacuated array's old address should be a freed region"
+        );
+        assert!(
+            gc.is_heap_addr(stale_handle).is_none(),
+            "stale local-ref handle must not resolve to a live object"
+        );
+
+        // (b) FIX path: the remapped handle resolves to the array's CURRENT
+        // location with the data preserved across the copy.
+        assert!(gc.is_addr_in_live_region(new_addr));
+        assert_eq!(gc.array_length(remapped), 3);
+        assert_eq!(
+            gc.get_array_element(remapped, 0).unwrap().as_int(),
+            Some(111)
+        );
+        assert_eq!(
+            gc.get_array_element(remapped, 1).unwrap().as_int(),
+            Some(222)
+        );
+        assert_eq!(
+            gc.get_array_element(remapped, 2).unwrap().as_int(),
+            Some(333)
+        );
+
+        // A write through the remapped handle (the actual copy-back) is visible
+        // in the live array — never in the dead from-space copy.
+        gc.set_array_element(remapped, 1, Value::Int(999)).unwrap();
+        assert_eq!(
+            gc.get_array_element(remapped, 1).unwrap().as_int(),
+            Some(999)
+        );
+    }
+
     // -- Mixed collection --
 
     #[test]

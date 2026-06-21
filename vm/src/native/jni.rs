@@ -149,6 +149,32 @@ impl DescriptorCache {
 // Thread-Local VM Context
 // ---------------------------------------------------------------------------
 
+/// Per-outstanding-buffer bookkeeping for `Get<Type>ArrayElements`. Recorded at
+/// Get, consumed at the matching `Release<Type>ArrayElements`.
+///
+/// `len`/`cap` are the EXACT `Vec` layout we allocated so Release can copy back
+/// and free soundly (see [`JNI_ARRAY_ELEM_BUFFERS`]). `array_gref` is a JNI
+/// **global ref** minted for the source array at Get: unlike a raw heap pointer
+/// (which a moving GC silently invalidates), a global ref is rewritten by
+/// `update_after_gc`/`update_all_roots` after every relocating collection
+/// (generational young-copy and G1 evacuation alike), so Release resolves the
+/// array's CURRENT address and the copy-back lands in the live array — never a
+/// freed/recycled region. It also keeps the array alive across the
+/// (spec-permitted, arbitrarily long) Get/Release window.
+#[derive(Clone, Copy)]
+struct ArrayElemBuffer {
+    /// Number of elements actually initialised — bounds the copy-back loop so
+    /// we never read an uninitialised tail.
+    len: usize,
+    /// Original `Vec` capacity — MUST be passed to `Vec::from_raw_parts` for a
+    /// sound free.
+    cap: usize,
+    /// Remappable handle to the source array (a JNI global ref, bit 0 set).
+    /// Resolved at Release to the array's post-GC location; deleted on the
+    /// final (freeing) Release.
+    array_gref: JObject,
+}
+
 thread_local! {
     /// Holds an `Arc<SharedVm>` while inside a JNI native call.
     ///
@@ -180,11 +206,16 @@ thread_local! {
     /// length/capacity, corrupting the allocator. We now key the allocation by
     /// its returned pointer at Get time and use the STORED count for both the
     /// copy-back loop and `from_raw_parts`, never re-deriving from the handle.
-    /// Value is `(initialised_len, capacity)`: `initialised_len` is the number
-    /// of elements actually written (bounds the copy-back loop so we never read
-    /// uninitialised memory) and `capacity` is the original `Vec` allocation
-    /// size that MUST be passed to `Vec::from_raw_parts` for a sound free.
-    static JNI_ARRAY_ELEM_BUFFERS: std::cell::RefCell<HashMap<usize, (usize, usize)>> =
+    ///
+    /// MOVING-GC FIX (vm-jni-roots #2, G1 follow-up): the value also carries a
+    /// remappable [`ArrayElemBuffer::array_gref`] — a JNI global ref to the
+    /// source array — so Release resolves the array's CURRENT address even if a
+    /// moving collector (generational young-copy or G1 evacuation) relocated it
+    /// during the window. The previous keep-alive object-pin was address-keyed
+    /// and never remapped, so the copy-back re-resolved a STALE raw `array`
+    /// handle and either silently dropped (region freed) or wrote into a
+    /// recycled object. See [`ArrayElemBuffer`].
+    static JNI_ARRAY_ELEM_BUFFERS: std::cell::RefCell<HashMap<usize, ArrayElemBuffer>> =
         std::cell::RefCell::new(HashMap::new());
     /// Tracks temporary contiguous buffers handed out by
     /// `GetPrimitiveArrayCritical` when the underlying array is a G1
@@ -2480,15 +2511,22 @@ new_prim_array!(jni_new_double_array, ArrayElementType::Double); // 182
 // registered in `JNI_ARRAY_ELEM_BUFFERS` so the matching
 // `Release<Type>ArrayElements` copies any mutations back and frees it.
 //
-// Keep-alive: while the copy is outstanding the SOURCE array is pinned in the
-// process-global `cratonvm_gc::pinned` set (refcounted) so it cannot be
-// reclaimed before the copy-back at Release. The pin provides ONLY keep-alive —
-// data-movement safety already comes from the copy — so no per-object
-// no-relocation enforcement in the collectors is required (see the
-// `cratonvm_gc::pinned` module doc). The array is also independently kept alive
-// for the duration of the native call by `native_pin_roots` (when it is a
-// method argument) or the implicit JNI local frame (a ref the native created),
-// so the pin is belt-and-suspenders for collectors that scan the pin set.
+// Keep-alive AND copy-back correctness under a MOVING GC: at Get we mint a JNI
+// **global ref** for the SOURCE array and stash its handle in the buffer's
+// `JNI_ARRAY_ELEM_BUFFERS` entry. A global ref is both (a) a GC root — so the
+// array cannot be reclaimed before the copy-back at Release — and, crucially,
+// (b) *remappable*: `collect_roots` scans it and `update_after_gc` /
+// `update_all_roots` rewrite the boxed `ObjectRef` to the object's new address
+// after every relocating collection (generational young-copy and G1 evacuation
+// alike). So `Release<Type>ArrayElements` resolves the array's CURRENT location
+// through that handle, and the (possibly mutated) copy is written back into the
+// live array — never a freed CSet region (silent data loss) or a recycled
+// object (corruption). This replaces the previous keep-alive object-pin for
+// this path, which was address-keyed and therefore went stale under a move; the
+// global ref is deleted on the final Release. (The JNI spec permits holding the
+// copy arbitrarily long, so region pinning — used by the *critical* path — is
+// the wrong tool here: it would starve the collector for the whole window. A
+// remappable handle imposes no such no-relocation constraint.)
 macro_rules! get_array_elements {
     ($name:ident, $rust_type:ty, $value_variant:ident, $default:expr) => {
         extern "C" fn $name(
@@ -2530,14 +2568,23 @@ macro_rules! get_array_elements {
                 // `Vec::from_raw_parts` requires for a sound free.
                 let buf_len = buf.len();
                 let buf_cap = buf.capacity();
+                // Mint a REMAPPABLE keep-alive handle for the source array: a JNI
+                // global ref. It keeps the array alive for the whole Get/Release
+                // window AND is rewritten by the GC on every relocating
+                // collection, so the copy-back at Release follows the array to
+                // its current address (see the module comment above). Deleted on
+                // the final Release.
+                let array_gref = shared.jni_global_refs.lock().add(oref);
                 JNI_ARRAY_ELEM_BUFFERS.with(|c| {
-                    c.borrow_mut().insert(ptr as usize, (buf_len, buf_cap));
+                    c.borrow_mut().insert(
+                        ptr as usize,
+                        ArrayElemBuffer {
+                            len: buf_len,
+                            cap: buf_cap,
+                            array_gref,
+                        },
+                    );
                 });
-                // Keep-alive ONLY (not no-relocation): pin the source array so it
-                // cannot be reclaimed before the copy-back at Release; unpinned by
-                // `Release<Type>ArrayElements`. Data-movement safety comes from
-                // the copy above.
-                pin_critical_array(oref, ptr as usize);
                 std::mem::forget(buf); // OWNERSHIP: buffer transferred to native caller, freed by Release<Type>ArrayElements via Vec::from_raw_parts
                 Some((ptr, JNI_TRUE))
             })
@@ -2571,32 +2618,36 @@ get_array_elements!(jni_get_double_array_elements, JDouble, Double, 0.0); // 190
 macro_rules! release_array_elements {
     ($name:ident, $rust_type:ty, $value_constructor:expr) => {
         extern "C" fn $name(_env: JNIEnv, array: JArray, elems: *mut $rust_type, mode: JInt) {
+            // The raw `array` handle the caller passes back is deliberately NOT
+            // trusted to locate the array: it is a from-space pointer that a
+            // moving GC may have invalidated during the Get/Release window. We
+            // resolve the array through the remappable global ref recorded at Get
+            // (see below), which the GC keeps current across relocations.
+            let _ = array;
             if elems.is_null() {
                 return;
             }
-            // GC-correctness (vm-jni-roots #2): release the keep-alive pin taken
-            // on the source array at Get time (every handout is a copy and was
-            // pinned for keep-alive). Refcounted, so an overlapping Get on the
-            // same array keeps it pinned until its own Release. Tolerant of an
-            // unknown `elems` (double-release / foreign pointer) — see
-            // `unpin_critical_array`.
-            unpin_critical_array(elems as usize);
-            // BUG FIX (vm-jni-roots #2): look up the (initialised_len, capacity)
-            // recorded for THIS buffer at Get time. Never re-derive the length
-            // from the array handle — the array may have moved/realloc'd under a
-            // moving GC, the handle may be aliased/stale, or `array_length` may
-            // read 0, any of which made the old code build the copy-back loop
-            // and `Vec::from_raw_parts` with a wrong length → heap corruption.
+            // BUG FIX (vm-jni-roots #2): look up the `ArrayElemBuffer` recorded
+            // for THIS buffer at Get time. Never re-derive the length from the
+            // array handle — the array may have moved/realloc'd under a moving
+            // GC, the handle may be aliased/stale, or `array_length` may read 0,
+            // any of which made the old code build the copy-back loop and
+            // `Vec::from_raw_parts` with a wrong length → heap corruption.
             //
             // For mode != 1 (i.e. modes that free) we `remove` the entry so the
             // pointer can never be double-freed; for JNI_COMMIT (1, no free) we
-            // only `get` so a later release can still find it.
+            // only `get` so a later release can still find it (and its global
+            // ref stays alive for that later release).
             let entry = if mode != 1 {
                 JNI_ARRAY_ELEM_BUFFERS.with(|c| c.borrow_mut().remove(&(elems as usize)))
             } else {
                 JNI_ARRAY_ELEM_BUFFERS.with(|c| c.borrow().get(&(elems as usize)).copied())
             };
-            let (stored_len, stored_cap) = match entry {
+            let ArrayElemBuffer {
+                len: stored_len,
+                cap: stored_cap,
+                array_gref,
+            } = match entry {
                 Some(v) => v,
                 // Unknown pointer — not one we handed out (or already released).
                 // Do nothing rather than risk a wrong-length free.
@@ -2604,13 +2655,16 @@ macro_rules! release_array_elements {
             };
             // mode 0 = copy back and free, JNI_COMMIT = copy back don't free,
             // JNI_ABORT = free without copy back
-            if mode != 2 && array != 0 {
-                // Copy back to array (mode 0 or JNI_COMMIT=1). Bound the loop by
-                // BOTH our initialised length and the live array length so we
-                // neither read past the end of our buffer nor write out of the
+            if mode != 2 {
+                // Copy back to the array (mode 0 or JNI_COMMIT=1). Resolve the
+                // array's CURRENT address through the remappable global ref — the
+                // GC rewrote it to follow any relocation since Get, so the write
+                // lands in the live array, not a freed/recycled region. Bound the
+                // loop by BOTH our initialised length and the live array length so
+                // we neither read past the end of our buffer nor write out of the
                 // array's bounds if it has since shrunk.
                 with_shared_vm(|shared| {
-                    let oref = jobject_to_obj(array)?;
+                    let oref = shared.jni_global_refs.lock().resolve(array_gref)?;
                     let arr_len = shared.heap.array_length(oref);
                     let copy_len = stored_len.min(arr_len);
                     for i in 0..copy_len {
@@ -2622,8 +2676,15 @@ macro_rules! release_array_elements {
                 });
             }
             if mode != 1 {
-                // Free buffer (mode 0 or JNI_ABORT=2) using the EXACT length and
-                // capacity we recorded at allocation time.
+                // Final (freeing) release (mode 0 or JNI_ABORT=2): delete the
+                // remappable global ref (drops the keep-alive root for the array)
+                // and free the buffer using the EXACT length and capacity we
+                // recorded at allocation time. On JNI_COMMIT (1) both the entry
+                // and its global ref intentionally persist for a later release.
+                with_shared_vm(|shared| {
+                    shared.jni_global_refs.lock().remove(array_gref);
+                    Some(())
+                });
                 unsafe {
                     drop(Vec::from_raw_parts(elems, stored_len, stored_cap));
                 }
@@ -6423,7 +6484,13 @@ mod tests {
             buf.push(i);
         }
         let ptr = buf.as_mut_ptr();
-        let stored = (buf.len(), buf.capacity());
+        let stored = ArrayElemBuffer {
+            len: buf.len(),
+            cap: buf.capacity(),
+            // No live VM here; this test exercises only the layout plumbing, so
+            // a sentinel global-ref handle is fine (never resolved).
+            array_gref: 0,
+        };
         std::mem::forget(buf);
         JNI_ARRAY_ELEM_BUFFERS.with(|c| {
             c.borrow_mut().insert(ptr as usize, stored);
@@ -6433,7 +6500,7 @@ mod tests {
         // layout and reconstruct exactly. A spurious "handle length" of 0 or 99
         // must be irrelevant.
         let entry = JNI_ARRAY_ELEM_BUFFERS.with(|c| c.borrow_mut().remove(&(ptr as usize)));
-        let (len, cap) = entry.expect("buffer must be tracked");
+        let ArrayElemBuffer { len, cap, .. } = entry.expect("buffer must be tracked");
         assert_eq!(len, 5);
         assert_eq!(cap, 5);
         // Sound free using the stored layout (NOT a re-derived length).
