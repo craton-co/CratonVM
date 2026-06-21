@@ -4092,6 +4092,14 @@ pub fn try_compile(
     // on single-pass (the builder bails). Gated default-OFF behind
     // `CRATONVM_JIT_IR_CALL_SPECIAL` at the VM call sites until it soaks.
     ir_emit_special_calls: bool,
+    // inc 25 (category-2 foundation): `true` lets the optimizing IR path take
+    // **long**-using methods (the `method_uses_category2` gate otherwise bails
+    // the whole pipeline on any long/double opcode). Only long is admitted —
+    // double/float and int div/rem still bail (the latter to keep a `long`
+    // off a deopt point, since long deopt-resume is a follow-up). `false` (the
+    // default) preserves the int/ref-only IR path. Gated default-OFF behind
+    // `CRATONVM_JIT_IR_LONG` at the VM call sites until it soaks.
+    ir_emit_long: bool,
 ) -> Option<CompiledMethod> {
     // round-7 fix (bug 1): short-circuit re-attempts on methods the
     // backend already permanently bailed on.  Avoids ~50µs of wasted
@@ -4144,6 +4152,7 @@ pub fn try_compile(
         optimize,
         ir_emit_calls,
         ir_emit_special_calls,
+        ir_emit_long,
         &mut backend_attempted,
     );
 
@@ -4278,6 +4287,9 @@ fn try_compile_inner(
     // inc 24 (Gap B): additionally lower resolved non-`<init>` `invokespecial`
     // to `Op::Call`. See `try_compile`. Default-OFF at the VM call sites.
     ir_emit_special_calls: bool,
+    // inc 25: admit long-using methods to the IR path. See `try_compile`.
+    // Default-OFF at the VM call sites.
+    ir_emit_long: bool,
     // round-7 fix (bug 1): set to `true` immediately before invoking
     // the heavy `x64::compile` path so the outer wrapper can tell a
     // permanent backend bail (worth bail-listing) from an early
@@ -4426,12 +4438,30 @@ fn try_compile_inner(
     // keeps the historical IR-first behaviour.
     if optimize
         && ir::ir_compatible(&scan)
-        && !method_uses_category2(code, code_len, &cached.method_descriptor)
+        && (!method_uses_category2(code, code_len, &cached.method_descriptor)
+            // inc 25: admit a long-using method when the long gate is on, as
+            // long as it is double/float-free AND int-div/rem-free. The latter
+            // keeps a `long` value off a deopt point (div emits a guard whose
+            // resume cannot yet reconstruct a `long` slot — a follow-up), so a
+            // long is only ever live in a leaf with no safepoint.
+            || (ir_emit_long
+                && !method_uses_double(code, code_len, &cached.method_descriptor)
+                && !method_has_int_div(code, code_len)))
     {
         // Includes the implicit `this` slot for instance methods — see
         // `prologue_param_slots` above.
         let num_params = prologue_param_slots;
         let mut builder = ir::IrBuilder::new(num_params, cached.max_locals as usize);
+        // inc 25: when long methods are admitted, re-lay-out the parameter
+        // locals with the JVM two-slot category-2 convention (a `long`/`double`
+        // param occupies two slots) and type each `Param` from the descriptor —
+        // otherwise `lload`/`lstore` of a second long param reads the wrong
+        // slot. Inert for an all-category-1 signature (identical 1-slot layout),
+        // so only done when the long gate is on.
+        if ir_emit_long {
+            let ptypes = ir_param_types(&cached.method_descriptor, cached.is_static);
+            builder.set_param_types(&ptypes);
+        }
         // Thread the resolved instance-field layout (pc → (field_index,
         // type_tag)) into the builder so it can lower an int-category
         // `getfield` into `Op::Load`. A field the resolver can't resolve is
@@ -4697,6 +4727,24 @@ fn try_compile_inner(
                         // per-call toggle test can prove `optimize=false` skips it.
                         #[cfg(test)]
                         IR_LOWER_COMPILES.with(|c| c.set(c.get() + 1));
+                        // inc 25 soak diagnostic: prove a long method actually
+                        // took the IR path at runtime (single-pass also compiles
+                        // longs, so a live "== HotSpot" probe alone is vacuous).
+                        if ir_emit_long
+                            && std::env::var_os("CRATONVM_DBG_IR_LONG").is_some()
+                            && method_uses_category2(
+                                code,
+                                code_len,
+                                &cached.method_descriptor,
+                            )
+                        {
+                            eprintln!(
+                                "[cratonvm-irlong] {}.{}{}: long method took the IR pipeline",
+                                cached.class_name,
+                                cached.method_name,
+                                cached.method_descriptor,
+                            );
+                        }
                         return Some(compiled);
                     }
                 }
@@ -5511,6 +5559,152 @@ pub fn count_param_slots(descriptor: &str) -> usize {
     slots
 }
 
+/// inc 25: the IR-builder parameter types in JIT-arg order (one per parameter,
+/// `this` first for an instance method). Drives `IrBuilder::set_param_types`,
+/// which lays the params out across JVM local slots with the category-2 two-slot
+/// convention. Mirrors `count_param_slots`' one-slot-per-parameter counting.
+fn ir_param_types(descriptor: &str, is_static: bool) -> Vec<ir::IrType> {
+    let mut types = Vec::new();
+    if !is_static {
+        types.push(ir::IrType::Ref); // implicit `this`
+    }
+    let b = descriptor.as_bytes();
+    let mut i = 1; // skip '('
+    while i < b.len() && b[i] != b')' {
+        match b[i] {
+            b'J' => {
+                types.push(ir::IrType::Long);
+                i += 1;
+            }
+            b'D' => {
+                types.push(ir::IrType::Double);
+                i += 1;
+            }
+            b'F' => {
+                types.push(ir::IrType::Float);
+                i += 1;
+            }
+            b'L' => {
+                types.push(ir::IrType::Ref);
+                i += 1;
+                while i < b.len() && b[i] != b';' {
+                    i += 1;
+                }
+                i += 1;
+            }
+            b'[' => {
+                types.push(ir::IrType::Ref);
+                i += 1;
+                while i < b.len() && b[i] == b'[' {
+                    i += 1;
+                }
+                if i < b.len() && b[i] == b'L' {
+                    i += 1;
+                    while i < b.len() && b[i] != b';' {
+                        i += 1;
+                    }
+                    i += 1;
+                } else if i < b.len() {
+                    i += 1;
+                }
+            }
+            _ => {
+                types.push(ir::IrType::Int); // I Z B C S
+                i += 1;
+            }
+        }
+    }
+    types
+}
+
+/// inc 25: like `method_uses_category2`, but flags only **double** (the part the
+/// long slice does NOT yet handle). A `D` parameter/return or any double-typed
+/// opcode disqualifies the method; `long` and `float` do not (long is handled,
+/// float bails at the builder's opcode catch-all). Used to admit long-only
+/// methods to the IR path while keeping double/XMM on single-pass.
+fn method_uses_double(code: &[u8], code_len: usize, descriptor: &str) -> bool {
+    let b = descriptor.as_bytes();
+    let mut i = 1;
+    while i < b.len() && b[i] != b')' {
+        match b[i] {
+            b'D' => return true,
+            b'L' => {
+                i += 1;
+                while i < b.len() && b[i] != b';' {
+                    i += 1;
+                }
+                i += 1;
+            }
+            b'[' => {
+                i += 1;
+                while i < b.len() && b[i] == b'[' {
+                    i += 1;
+                }
+                if i < b.len() && b[i] == b'L' {
+                    i += 1;
+                    while i < b.len() && b[i] != b';' {
+                        i += 1;
+                    }
+                    i += 1;
+                } else if i < b.len() {
+                    i += 1;
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    if let Some(rp) = b.iter().position(|&c| c == b')') {
+        if matches!(b.get(rp + 1), Some(b'D')) {
+            return true;
+        }
+    }
+    let mut pc = 0;
+    while pc < code_len {
+        if is_double_opcode(code[pc]) {
+            return true;
+        }
+        pc += crate::scev::bytecode_len(code, pc, code_len);
+    }
+    false
+}
+
+/// Double-typed opcodes (subset of `is_category2_opcode` that is double, not
+/// long). `ldc2_w` (0x14) is deliberately omitted — it is long/double-ambiguous,
+/// but the IR builder does not lower it (bails to single-pass), and any double
+/// *constant* must be consumed by a double opcode listed here, so a double
+/// `ldc2_w` method is caught regardless.
+fn is_double_opcode(op: u8) -> bool {
+    matches!(
+        op,
+        0x0e | 0x0f          // dconst_0, dconst_1
+        | 0x18 | 0x26..=0x29 // dload, dload_0..3
+        | 0x31 | 0x52        // daload, dastore
+        | 0x39 | 0x47..=0x4a // dstore, dstore_0..3
+        | 0x63 | 0x67 | 0x6b | 0x6f | 0x73 // dadd, dsub, dmul, ddiv, drem
+        | 0x77               // dneg
+        | 0x87 | 0x8a | 0x8d // i2d, l2d, f2d
+        | 0x8e | 0x8f | 0x90 // d2i, d2l, d2f
+        | 0x97 | 0x98        // dcmpl, dcmpg
+        | 0xaf               // dreturn
+    )
+}
+
+/// inc 25: an int `idiv`/`irem` in the body. Such a method gets a div guard
+/// whose deopt resume cannot yet reconstruct a `long` slot, so admitting a long
+/// method with an int division could strand a live `long` at the deopt — bail
+/// to single-pass until long deopt-resume lands. (Long `ldiv`/`lrem` already
+/// bail: the builder does not lower them.)
+fn method_has_int_div(code: &[u8], code_len: usize) -> bool {
+    let mut pc = 0;
+    while pc < code_len {
+        if matches!(code[pc], 0x6c | 0x70) {
+            return true;
+        }
+        pc += crate::scev::bytecode_len(code, pc, code_len);
+    }
+    false
+}
+
 /// Gap B (inc 22): classify a static-call descriptor for the `Op::Call` slice.
 /// Returns `Some((num_args, ret_type))` iff EVERY parameter is a single-slot
 /// value the marshaller can pass as one i64 — an int-category primitive
@@ -5755,7 +5949,7 @@ mod tests {
         IR_LOWER_COMPILES.with(|c| c.set(0));
         let c2 = try_compile(
             &cached, None, None, None, None, None, None, None, None, None, &helpers, None, None,
-            None, None, true, false, false,
+            None, None, true, false, false, false,
         );
         let c2_used_ir = IR_LOWER_COMPILES.with(|c| c.get());
         assert!(c2.is_some(), "optimize=true (C2) must compile `add`");
@@ -5768,7 +5962,7 @@ mod tests {
         IR_LOWER_COMPILES.with(|c| c.set(0));
         let c1 = try_compile(
             &cached, None, None, None, None, None, None, None, None, None, &helpers, None, None,
-            None, None, false, false, false,
+            None, None, false, false, false, false,
         );
         let c1_used_ir = IR_LOWER_COMPILES.with(|c| c.get());
         assert!(
@@ -5850,6 +6044,7 @@ mod tests {
             true,
             false,
             false,
+            false,
         );
         assert!(c2.is_some(), "optimize=true (C2) must compile `get`");
         assert_eq!(
@@ -5865,7 +6060,7 @@ mod tests {
         IR_LOWER_COMPILES.with(|c| c.set(0));
         let _ = try_compile(
             &cached, None, None, None, None, None, None, None, None, None, &helpers, None, None,
-            None, None, true, false, false,
+            None, None, true, false, false, false,
         );
         assert_eq!(
             IR_LOWER_COMPILES.with(|c| c.get()),
@@ -6285,6 +6480,7 @@ mod tests {
             true,
             false,
             false,
+            false,
         );
         assert!(r.is_some(), "an elidable `new` method must compile via IR");
         assert_eq!(
@@ -6312,6 +6508,7 @@ mod tests {
             None,
             None,
             true,
+            false,
             false,
             false,
         );
@@ -6383,6 +6580,7 @@ mod tests {
             true, // optimize
             true, // ir_emit_calls
             false, // ir_emit_special_calls (testing invokestatic, not special)
+            false, // ir_emit_long
         );
         assert!(
             with.is_some(),
@@ -6419,6 +6617,7 @@ mod tests {
             true,  // optimize
             false, // ir_emit_calls OFF
             false, // ir_emit_special_calls OFF
+            false, // ir_emit_long OFF
         );
         assert_eq!(
             IR_LOWER_COMPILES.with(|c| c.get()),
@@ -6476,6 +6675,7 @@ mod tests {
             true,  // optimize
             false, // ir_emit_calls (invokestatic) OFF
             true,  // ir_emit_special_calls ON
+            false, // ir_emit_long
         );
         assert!(
             with.is_some(),
@@ -6501,11 +6701,68 @@ mod tests {
             true,  // optimize
             true,  // ir_emit_calls (invokestatic) ON
             false, // ir_emit_special_calls OFF
+            false, // ir_emit_long OFF
         );
         assert_eq!(
             IR_LOWER_COMPILES.with(|c| c.get()),
             0,
             "without ir_emit_special_calls, invokespecial must NOT take the IR pipeline"
+        );
+    }
+
+    /// inc 25: a long-using method routes through the IR pipeline ONLY with
+    /// `ir_emit_long` — otherwise `method_uses_category2` bails the whole
+    /// pipeline to single-pass. Guards against a vacuous validation: the
+    /// integration harness compiles `optimize=true` either way (single-pass is
+    /// the fall-through), so result-equality alone would not prove the IR path
+    /// ran — `IR_LOWER_COMPILES` does.
+    #[test]
+    fn ir_long_wiring_routes_through_ir_only_with_flag() {
+        use std::sync::Arc;
+
+        // `static long add(long a, long b) { return a + b; }`
+        //   lload_0; lload_2; ladd; lreturn
+        let cached = CachedBytecodeMethod {
+            declaring_class_id: cratonvm_types::ClassId::new(1),
+            class_name: Arc::from("pkg/L"),
+            method_name: Arc::from("add"),
+            method_descriptor: Arc::from("(JJ)J"),
+            source_file: None,
+            code: Arc::from([0x1e, 0x20, 0x61, 0xad, 0x00, 0x00].as_slice()),
+            exception_table: Arc::from(Vec::new().as_slice()),
+            max_stack: 4,
+            max_locals: 4,
+            num_params: 2,
+            is_synchronized: false,
+            is_static: true,
+        };
+        // SAFETY: all-zero `JitRuntimeHelpers` is valid; this test only COMPILES
+        // (never executes), and a pure long-arithmetic method calls no helper.
+        let helpers: JitRuntimeHelpers = unsafe { std::mem::zeroed() };
+
+        // ir_emit_long = true → the long method takes the IR pipeline.
+        IR_LOWER_COMPILES.with(|c| c.set(0));
+        let with = try_compile(
+            &cached, None, None, None, None, None, None, None, None, None, &helpers, None, None,
+            None, None, true, false, false, true,
+        );
+        assert!(with.is_some(), "long method must compile with ir_emit_long");
+        assert_eq!(
+            IR_LOWER_COMPILES.with(|c| c.get()),
+            1,
+            "a long method must route through the IR pipeline when ir_emit_long is on"
+        );
+
+        // ir_emit_long = false → method_uses_category2 bails → single-pass.
+        IR_LOWER_COMPILES.with(|c| c.set(0));
+        let _without = try_compile(
+            &cached, None, None, None, None, None, None, None, None, None, &helpers, None, None,
+            None, None, true, false, false, false,
+        );
+        assert_eq!(
+            IR_LOWER_COMPILES.with(|c| c.get()),
+            0,
+            "without ir_emit_long, a long method must NOT take the IR pipeline"
         );
     }
 

@@ -113,7 +113,7 @@ fn compile_opt(
 ) -> Option<CompiledMethod> {
     try_compile(
         cm, None, None, None, None, None, None, None, None, None, helpers, None, None, None, None,
-        optimize, false, false,
+        optimize, false, false, false,
     )
 }
 
@@ -151,6 +151,140 @@ fn check(
             r_ir as i32, *expected,
             "{name}: both backends agree but disagree with host for {args:?}: got {}, expected {expected}",
             r_ir as i32,
+        );
+    }
+}
+
+/// Like [`compile_opt`] but with the `ir_emit_long` gate ON (inc 25), so the IR
+/// pipeline admits long-using methods. The single-pass side is unaffected
+/// (`ir_emit_long` is consulted only on the optimizing path).
+fn compile_long_opt(
+    cm: &CachedBytecodeMethod,
+    helpers: &JitRuntimeHelpers,
+    optimize: bool,
+) -> Option<CompiledMethod> {
+    try_compile(
+        cm, None, None, None, None, None, None, None, None, None, helpers, None, None, None, None,
+        optimize, false, false, true,
+    )
+}
+
+/// Compile a long-using `(name, code)` both ways and assert IR == single-pass ==
+/// `expected` over the FULL 64 bits (a `long` method). The JIT ABI passes each
+/// parameter as one i64 register and returns the result in RAX, so `try_call`
+/// args/return are full i64. (Routing through the IR path — not a vacuous
+/// single-pass fall-through — is separately proven by `ir_long_wiring_…` in
+/// `lib.rs` via `IR_LOWER_COMPILES`.)
+fn check_long(
+    name: &str,
+    descriptor: &str,
+    code: Vec<u8>,
+    max_locals: u16,
+    num_params: u16,
+    cases: &[(Vec<i64>, i64)],
+) {
+    let helpers = dummy_helpers();
+    let cm = cached(name, descriptor, code, max_locals, num_params);
+    let ir = compile_long_opt(&cm, &helpers, true)
+        .unwrap_or_else(|| panic!("{name}: optimize=true (IR, long) failed to compile"));
+    let sp = compile_long_opt(&cm, &helpers, false)
+        .unwrap_or_else(|| panic!("{name}: optimize=false (single-pass) failed to compile"));
+    for (args, expected) in cases {
+        // SAFETY: both bodies were produced by the JIT from valid long bytecode;
+        // the i64-arg / i64-ret ABI matches `try_call`, no helper is reachable.
+        let r_sp = unsafe { sp.try_call(args) }
+            .unwrap_or_else(|e| panic!("{name}: single-pass call {args:?}: {e:?}"));
+        let r_ir = unsafe { ir.try_call(args) }
+            .unwrap_or_else(|e| panic!("{name}: IR call {args:?}: {e:?}"));
+        assert_eq!(
+            r_ir, r_sp,
+            "{name}: IR vs single-pass DIVERGE (full i64) for {args:?}: IR={r_ir}, single-pass={r_sp}",
+        );
+        assert_eq!(
+            r_ir, *expected,
+            "{name}: both backends agree but disagree with host for {args:?}: got {r_ir}, expected {expected}",
+        );
+    }
+}
+
+#[test]
+fn ir_vs_singlepass_long_add() {
+    // long add(long a, long b) { return a + b; }
+    //   lload_0; lload_2; ladd; lreturn
+    let code = vec![0x1e, 0x20, 0x61, 0xad];
+    check_long(
+        "ladd",
+        "(JJ)J",
+        code,
+        4,
+        2,
+        &[
+            (vec![3, 4], 7),
+            (vec![i64::MAX, 1], i64::MIN), // 64-bit wrap
+            // genuinely 64-bit (a 32-bit ADD would drop the high word):
+            (vec![0x1_0000_0000, 0x2_0000_0000], 0x3_0000_0000),
+            (vec![-5, -7], -12),
+        ],
+    );
+}
+
+#[test]
+fn ir_vs_singlepass_long_two_slot_params() {
+    // long f(long a, long b) { return a*b - b; }  — exercises lload_2 (b at JVM
+    // slot 2, the heart of the cat-2 two-slot param layout fix).
+    //   lload_0; lload_2; lmul; lload_2; lsub; lreturn
+    let code = vec![0x1e, 0x20, 0x69, 0x20, 0x65, 0xad];
+    check_long(
+        "lmulsub",
+        "(JJ)J",
+        code,
+        4,
+        2,
+        &[
+            (vec![3, 4], 8),                              // 12 - 4
+            (vec![0x1_0000_0000, 3], 0x3_0000_0000 - 3),  // 64-bit mul
+            (vec![-2, 5], -15),                           // -10 - 5
+        ],
+    );
+}
+
+#[test]
+fn ir_vs_singlepass_long_mixed_int_long_param() {
+    // long f(int a, long b) { return (long)a + b; }  — int param `a` at slot 0
+    // (1 slot), long `b` at slots 1-2; lload_1 must read b.
+    //   iload_0; i2l; lload_1; ladd; lreturn
+    let code = vec![0x1a, 0x85, 0x1f, 0x61, 0xad];
+    check_long(
+        "mixedil",
+        "(IJ)J",
+        code,
+        3,
+        2,
+        &[
+            (vec![5, 7], 12),
+            (vec![-1, 0x1_0000_0000], 0x1_0000_0000 - 1), // i2l sign-extends a
+            (vec![100, -50], 50),
+        ],
+    );
+}
+
+#[test]
+fn ir_vs_singlepass_long_to_int_return() {
+    // int f(long a, long b) { return (int)(a + b); }  — l2i truncates to low 32.
+    //   lload_0; lload_2; ladd; l2i; ireturn
+    let code = vec![0x1e, 0x20, 0x61, 0x88, 0xac];
+    let helpers = dummy_helpers();
+    let cm = cached("l2iret", "(JJ)I", code, 4, 2);
+    let ir = compile_long_opt(&cm, &helpers, true).expect("IR long");
+    let sp = compile_long_opt(&cm, &helpers, false).expect("single-pass");
+    for (a, b) in [(3i64, 4i64), (0x1_0000_0005, 0x1_0000_0002), (i64::MAX, 1)] {
+        let r_ir = unsafe { ir.try_call(&[a, b]) }.unwrap();
+        let r_sp = unsafe { sp.try_call(&[a, b]) }.unwrap();
+        assert_eq!(r_ir as i32, r_sp as i32, "l2i IR vs single-pass for ({a},{b})");
+        assert_eq!(
+            r_ir as i32,
+            a.wrapping_add(b) as i32,
+            "l2i vs host for ({a},{b})"
         );
     }
 }
@@ -509,6 +643,7 @@ fn compile_opt_fields(
         None,
         None,
         optimize,
+        false,
         false,
         false,
     )
@@ -968,6 +1103,7 @@ fn compile_with_dispatch(
         true, // optimize (C2 / IR pipeline)
         true, // ir_emit_calls (Gap B, invokestatic)
         true, // ir_emit_special_calls (inc 24, invokespecial — inert without 0xb7)
+        false, // ir_emit_long (inc 25 — call tests don't use long)
     )
 }
 
