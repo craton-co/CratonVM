@@ -28,24 +28,43 @@ reproduces. The crash ticket is **CLOSED**. The remaining failures are functiona
 The 3 Groovy classes no longer crash; they now run far enough to emit a `RESULT`
 (or hang in compilation), exactly the "deep Groovy compiler internals × CratonVM"
 residual the original analysis flagged for handoff.
-- **Dominant, recurring failure:** `NullPointerException: Cannot invoke
-  "java.lang.Class.getPackageName()" because "c" is null` (3/8 in
-  `GroovyScriptEvaluatorTests`, plus 1/2 in the dynamic-bean-property test). This is
-  the **defineClass-returns-null** signature — the *same* NPE shape documented for
-  Gradle's `LookupClassDefiner` (`native-builtins/src/lib.rs` ~9285, the
-  `lookup_define::register_lookup_define_class` fix). Groovy's
-  `GroovyClassLoader` defines the generated script class via a path that yields a
-  **null `Class`**, so downstream `c.getPackageName()` NPEs. **Fix direction:** make
-  the Groovy class-definition path (`ClassLoader.defineClass`/`defineClass1` →
+- **Primary root cause — ANTLR ATN parse THROUGHPUT (same family as
+  [[springrepos-extension-hang-jit-throughput-and-deep-recursion]]).** A standalone
+  probe (`GScriptProbe`: `new GroovyScriptEvaluator().evaluate(new
+  StaticScriptSource("return 3 * 2"))` — the isolated `groovyScriptFromString` path)
+  returns `6` on HotSpot **instantly**, but on CratonVM **hangs and is aborted by the
+  120 s stack-dump watchdog**. The watchdog stack dump pins the single `main` thread
+  frozen in:
+  `GScriptProbe.main → GroovyScriptEvaluator.evaluate → GroovyShell.parse →
+  GroovyClassLoader.doParseClass → CompilationUnit.compile → GroovyParser.<clinit> →
+  groovyjarjarantlr4 ATNDeserializer.deserialize → BitSet.get/<init>` — i.e. it never
+  finishes **deserialising the ANTLR parser ATN** in `GroovyParser`'s static
+  initialiser. This is the **same ANTLR ATN cold-path JIT-throughput problem** that
+  doc tracks (Groovy bootstrap = "one-time ATN deserialize + metaclass ~55 s"; the
+  assert/`BitSet`-heavy ANTLR code runs interpreted-slow). The 3 dev fixes there
+  (`43f5fe03`/`05b9622a`/`2fbabc0b`) help but do **not** close it for this Groovy
+  entry path. This also explains the **non-determinism**: when the slow ATN parse
+  squeaks through before a timeout the test *completes* (with the class-gen failures
+  below); when it doesn't, it *hangs* — `GroovyBeanDefinitionReaderTests`, the
+  `GScriptProbe` standalone probe, and a `CRATONVM_DBG_NPE_STACK=1` rerun of
+  `GroovyScriptEvaluatorTests` all timed out, while the plain
+  `GroovyScriptEvaluatorTests` run completed 0/8.
+- **Secondary, downstream class-gen failure (only when compilation proceeds):**
+  `GroovyScriptEvaluatorTests` shows `NullPointerException: Cannot invoke
+  "java.lang.Class.getPackageName()" because "c" is null` (3/8, + 1/2 in the
+  dynamic-bean-property test) — the **defineClass-returns-null** signature, the *same*
+  NPE shape documented for Gradle's `LookupClassDefiner` (`native-builtins/src/lib.rs`
+  ~9285, `lookup_define::register_lookup_define_class`). Groovy's `GroovyClassLoader`
+  defines the generated script class via a path that yields a **null `Class`**, so
+  downstream `c.getPackageName()` NPEs; the rest are `ScriptCompilationException` +
+  `AssertionFailedError`. **Fix direction:** (1) the ANTLR ATN throughput is the
+  load-bearing item — pursue the springrepos cold-path work (let the ATN
+  deserialize/sim methods JIT-compile); (2) separately, make the Groovy
+  class-definition path (`ClassLoader.defineClass`/`defineClass1` →
   `define_class_via_full`, `native-builtins/src/classloader.rs`) return a real mirror
-  for Groovy's generated classes the way the Gradle path was fixed; the remaining 8
-  failures cascade from that null class + `ScriptCompilationException`.
-- **`GroovyBeanDefinitionReaderTests` still HANGS** (300 s timeout) — the residual
-  "compile/execute hang" is *not* fully closed for this class (the others now
-  complete). Single-threaded, in Groovy's compile path. Same handoff.
-- **Flaky:** `GroovyScriptEvaluatorTests` completed (0/8) on one run and hung at 200 s
-  on a `CRATONVM_DBG_NPE_STACK=1` rerun — Groovy bootstrap/compile timing is
-  non-deterministic on this VM, consistent with the deep-runtime instability.
+  for Groovy's generated classes the way the Gradle path was fixed.
+- **`GroovyBeanDefinitionReaderTests` still HANGS** (300 s timeout) — same ANTLR
+  parse-throughput hang; not closed for this class. Same handoff.
 
 ### `SimpleAsyncTaskSchedulerTests` — RECLASSIFY (not a crash; CompletableFuture/threading)
 Completes **6/10**, no SIGSEGV (confirming the earlier "batch CRASH was a

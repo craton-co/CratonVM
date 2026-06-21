@@ -30,6 +30,16 @@ fix below).
 > `apps/spring-boot/buildSrc/runner` harness (~55 s Groovy bootstrap, watchdog must be
 > disabled) rather than the spring-framework KRun harness used for the other tickets
 > in this batch; the commit-level verification above is the check performed.
+>
+> **Cross-link / second reproducer:** the Spring `GroovyScriptEvaluator` cluster in
+> [[spring-bug-11]] hits this **same ANTLR ATN cold-path**. A standalone probe
+> (`new GroovyScriptEvaluator().evaluate(new StaticScriptSource("return 3 * 2"))`) —
+> a *trivial* script — returns instantly on HotSpot but on dev `0c904c04` **hangs >120 s
+> and trips the stack-dump watchdog**, frozen in
+> `GroovyParser.<clinit> → ATNDeserializer.deserialize → BitSet.get/<init>` (never
+> finishing the one-time ATN deserialize). So this cold-path throughput is not
+> buildSrc-specific — it gates *any* first Groovy parse, and is a more minimal repro
+> than `SpringRepositoriesExtensionTests` for the §5–§6 work.
 
 ---
 
