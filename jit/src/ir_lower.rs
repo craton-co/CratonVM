@@ -1219,7 +1219,7 @@ impl<'a> Lowerer<'a> {
                 //    `D`/`F` returns until the XMM value tier.)
                 self.emit_mov_reg_imm64(R10, i64::MIN as u64);
                 self.buf.emit(&[0x4C, 0x39, 0xD0]); // CMP RAX, R10
-                if matches!(node.ty, IrType::Long | IrType::Double) {
+                if matches!(node.ty, IrType::Long | IrType::Double | IrType::Float) {
                     // JNE .keep — common path: not the sentinel, keep real RAX.
                     self.buf.emit(&[0x0F, 0x85]);
                     let keep_patch = self.buf.pos();

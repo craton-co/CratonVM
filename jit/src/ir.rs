@@ -1787,6 +1787,8 @@ impl IrBuilder {
                             // 32); admitted by `static_call_shape`, the call-site
                             // sentinel check already disambiguates it.
                             b'D' => IrType::Double,
+                            // A `F` (float) return is a 32-bit value node (inc 33).
+                            b'F' => IrType::Float,
                             _ => IrType::Int,
                         };
                         let call = self.graph.add(Op::Call { info_ptr }, ty, inputs, Some(pc));
@@ -1863,6 +1865,8 @@ impl IrBuilder {
                         b'J' => IrType::Long,
                         // A `D` (double) return is a 64-bit value node (inc 32).
                         b'D' => IrType::Double,
+                        // A `F` (float) return is a 32-bit value node (inc 33).
+                        b'F' => IrType::Float,
                         _ => IrType::Int,
                     };
                     let call = self.graph.add(Op::Call { info_ptr }, ty, inputs, Some(pc));
@@ -1903,6 +1907,8 @@ impl IrBuilder {
                         b'J' => IrType::Long,
                         // A `D` (double) return is a 64-bit value node (inc 32).
                         b'D' => IrType::Double,
+                        // A `F` (float) return is a 32-bit value node (inc 33).
+                        b'F' => IrType::Float,
                         _ => IrType::Int,
                     };
                     let call = self.graph.add(Op::Call { info_ptr }, ty, inputs, Some(pc));
@@ -2049,21 +2055,26 @@ impl IrBuilder {
                     pc += 1;
                 }
 
-                // dreturn (inc 32) — a `double` return is a clean 64-bit value
-                // whose bits ride RAX (the JIT i64 return ABI); the interpreter's
-                // post-JIT path reads `result as u64` → `f64::from_bits`, and
-                // `lower_terminator`'s `Op::Return` already does `load_to_rax`
-                // from the value's slot (which holds the 64-bit double bits), so
-                // no XMM return marshalling is needed. Identical to `lreturn`.
-                // (`freturn` (0xae) is intentionally absent — a `float` return's
-                // 32 bits would ride RAX with garbage upper bits; deferred until
-                // the float-return slice. Such a method bails to single-pass.)
-                // Only reachable under the FP gate (`returns_double` ⇒ the
-                // `ir_emit_fp` clause); the `Long.MIN_VALUE`/`-0.0` ↔ `i64::MIN`
-                // deopt-sentinel collision on a `D` call result is handled by the
-                // item-1 `dispatch_threw` peek (the call site checks
-                // `IrType::Double`).
-                0xaf => {
+                // freturn (inc 33) / dreturn (inc 32) — an FP return rides RAX as
+                // bits (the JIT i64 return ABI): the interpreter's post-JIT path
+                // reads `result as u64`→`f64::from_bits` (`D`) or `result as u32`
+                // →`f32::from_bits` (`F`), and `lower_terminator`'s `Op::Return`
+                // does `load_to_rax` from the value's slot, so no XMM return
+                // marshalling is needed. Identical to `lreturn`/`ireturn`.
+                //
+                // `float` (inc 33): the slot holds 32 bits; `load_to_rax` reads 64,
+                // so RAX's UPPER 32 are stale — harmless because every consumer
+                // reads only the low 32 (`result as u32`; downstream `MOVSS`). The
+                // one hazard is a `+0.0f` whose stale upper bits make RAX ==
+                // `i64::MIN`: on a `F` CALL result the call-site `dispatch_threw`
+                // peek (extended to `IrType::Float`) disambiguates it, and the
+                // restore (RAX=`i64::MIN`, low-32=0) preserves `+0.0f` — `i64::MIN`
+                // has low-63 = 0, so only `+0.0f` can ever collide.
+                //
+                // Reachable only under the FP gate; the `-0.0`/`Long.MIN_VALUE` ↔
+                // `i64::MIN` collision on a `D`/`F` call result is handled by the
+                // item-1 `dispatch_threw` peek.
+                0xae | 0xaf => {
                     let val = self.pop();
                     let ret =
                         self.graph

@@ -2277,6 +2277,108 @@ fn ir_vs_singlepass_invokestatic_double_return() {
     }
 }
 
+// ── float RETURNS — method-level freturn + F call returns (inc 33) ───────────
+//
+// A `float` result rides the LOW 32 of RAX; consumers read only the low 32
+// (interpreter `result as u32`; downstream `MOVSS`), so stale upper bits are
+// harmless EXCEPT the `+0.0f`/`i64::MIN`-bits collision on a call result, which
+// the call-site `dispatch_threw` peek (now `IrType::Float`) catches.
+
+#[test]
+fn ir_vs_singlepass_float_return() {
+    // static float f(int x) { return (float)x + 1.0f; }
+    //   iload_0; i2f; fconst_1; fadd; freturn
+    let code = vec![0x1a, 0x86, 0x0c, 0x62, 0xae];
+    let cm = cached("fret", "(I)F", code, 1, 1);
+    let helpers = dummy_helpers();
+    let ir = compile_fp_opt(&cm, &helpers, true)
+        .expect("IR compile of float-returning method (FP gate)");
+    let sp =
+        compile_fp_opt(&cm, &helpers, false).expect("single-pass compile of float-returning method");
+    for x in [0i64, 5, -3, 100, -100, i32::MIN as i64] {
+        // float bits ride the low 32 of RAX (stale upper bits are masked).
+        let r_ir = f32::from_bits(unsafe { ir.try_call(&[x]) }.unwrap() as u32);
+        let r_sp = f32::from_bits(unsafe { sp.try_call(&[x]) }.unwrap() as u32);
+        let expected = x as f32 + 1.0f32;
+        assert_eq!(r_ir.to_bits(), expected.to_bits(), "IR float-return for x={x}");
+        assert_eq!(r_sp.to_bits(), expected.to_bits(), "single-pass float-return for x={x}");
+    }
+}
+
+#[test]
+fn ir_vs_singlepass_invokestatic_float_return() {
+    // static float f(int x) { return g(x) + 1.0f; }   // g:(I)F
+    //   iload_0; invokestatic #2; fconst_1; fadd; freturn
+    unsafe extern "C" fn fret_dispatch(_vm: i64, _i: i64, args_ptr: i64, _n: i64) -> i64 {
+        let x = unsafe { *(args_ptr as *const i64) } as i32;
+        // g(x) = (float)x * 0.5f, returned as float bits.
+        ((x as f32) * 0.5f32).to_bits() as i64
+    }
+    unsafe extern "C" fn never_threw() -> i64 {
+        0
+    }
+    let mut helpers = dummy_helpers();
+    helpers.invoke_dispatch = fret_dispatch as *const () as usize;
+    helpers.dispatch_threw = never_threw as *const () as usize;
+    let code = vec![0x1a, 0xb8, 0x00, 0x02, 0x0c, 0x62, 0xae];
+    let cm = cached("f", "(I)F", code, 1, 1);
+    let resolver = |cp: u16| -> Option<(String, String, String)> {
+        if cp == 2 {
+            Some(("pkg/Helper".into(), "g".into(), "(I)F".into()))
+        } else {
+            None
+        }
+    };
+    let ir = compile_with_dispatch_fp(&cm, &helpers, &resolver)
+        .expect("IR compile of float-call-returning method");
+    let dummy_vm = [0u8; 64];
+    for x in [4i64, 5, -6, 0, 1000] {
+        let r = f32::from_bits(
+            unsafe { ir.try_call_with_context(dummy_vm.as_ptr() as i64, &[x]) }.unwrap() as u32,
+        );
+        let expected = (x as f32) * 0.5f32 + 1.0f32;
+        assert_eq!(r.to_bits(), expected.to_bits(), "F call-return for x={x}");
+    }
+}
+
+#[test]
+fn ir_vs_singlepass_float_return_min_bits_collision() {
+    // The float collision: a `+0.0f` call result whose RAX bits == i64::MIN (low
+    // 32 = 0 = +0.0f, upper 32 = 0x8000_0000 stale) must NOT be misread as the
+    // deopt sentinel. `dispatch_threw` reports no signal, the caller keeps it, and
+    // the low 32 (+0.0f) flows on → +0.0f + 1.0f = 1.0f. (i64::MIN has low-63 = 0,
+    // so ONLY +0.0f can ever collide for a float.)
+    unsafe extern "C" fn min_bits_dispatch(_vm: i64, _i: i64, _a: i64, _n: i64) -> i64 {
+        i64::MIN // low 32 = 0 = +0.0f bits; upper 32 = stale 0x8000_0000
+    }
+    unsafe extern "C" fn never_threw() -> i64 {
+        0
+    }
+    let mut helpers = dummy_helpers();
+    helpers.invoke_dispatch = min_bits_dispatch as *const () as usize;
+    helpers.dispatch_threw = never_threw as *const () as usize;
+    // static float f(int x) { return g(x) + 1.0f; }
+    let code = vec![0x1a, 0xb8, 0x00, 0x02, 0x0c, 0x62, 0xae];
+    let cm = cached("f", "(I)F", code, 1, 1);
+    let resolver = |cp: u16| -> Option<(String, String, String)> {
+        if cp == 2 {
+            Some(("pkg/Helper".into(), "g".into(), "(I)F".into()))
+        } else {
+            None
+        }
+    };
+    let ir = compile_with_dispatch_fp(&cm, &helpers, &resolver).expect("compile");
+    let dummy_vm = [0u8; 64];
+    let r = f32::from_bits(
+        unsafe { ir.try_call_with_context(dummy_vm.as_ptr() as i64, &[7]) }.unwrap() as u32,
+    );
+    assert_eq!(
+        r.to_bits(),
+        1.0f32.to_bits(),
+        "a +0.0f call-return whose RAX bits == i64::MIN must be kept (→ +0.0f + 1.0f = 1.0f), not bailed"
+    );
+}
+
 #[test]
 fn ir_vs_singlepass_fp_constants() {
     // int f(int a) { return (int)((float)a + 2.0f); }  — fconst_2

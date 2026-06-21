@@ -4554,20 +4554,20 @@ fn try_compile_inner(
                 && !method_uses_fp(code, code_len, &cached.method_descriptor))
             // inc 30: admit a float/double-using method when the FP gate is on.
             // Scope: FP PARAMS still ride XMM the prologue does not yet marshal,
-            // so `!fp_in_params`. inc 32 relaxes the RETURN side: a `double`
-            // return is admitted (`!returns_float` allows `D`/int/void/ref/long,
-            // excludes only `F`), because a `double` result's bits ride RAX (the
-            // i64 return ABI) — no XMM return marshalling — and the `dreturn`
-            // builder arm + the `Op::Return` `load_to_rax` already handle it. A
-            // `float` return (`returns_float`) stays excluded: its 32 bits would
-            // ride RAX with garbage upper bits (a follow-on). Excludes int-div
-            // (would strand an FP value at the div deopt — whose resume can't yet
-            // reconstruct an FP slot) and `ldc2_w` (the builder does not yet
-            // disambiguate long-vs-double constant bits).
+            // so `!fp_in_params`. The RETURN side is now fully open (inc 32:
+            // `double`; inc 33: `float`): an FP result's bits ride RAX (the i64
+            // return ABI) — no XMM return marshalling — via the `dreturn`/
+            // `freturn` builder arms + `Op::Return`'s `load_to_rax` (the
+            // interpreter reads `result as u64`/`as u32` → `from_bits`). A
+            // `float`'s 32-bit upper-stale-bits / `i64::MIN` collision on a call
+            // result is handled by the call-site `dispatch_threw` peek. Still
+            // excludes FP *params* (`fp_in_params`), int-div (would strand an FP
+            // value at the div deopt — whose resume can't yet reconstruct an FP
+            // slot), and `ldc2_w` (the builder does not yet disambiguate long-vs-
+            // double constant bits).
             || (ir_emit_fp
                 && fp_in_body(code, code_len)
                 && !fp_in_params(&cached.method_descriptor)
-                && !returns_float(&cached.method_descriptor)
                 && !method_has_int_div(code, code_len)
                 && scan.ldc2w_ops.is_empty()))
     {
@@ -5978,14 +5978,6 @@ fn fp_in_params(descriptor: &str) -> bool {
     false
 }
 
-/// inc 32: the method returns `float` specifically. A `float` result's 32 bits
-/// would ride RAX with garbage upper bits (the JIT i64 return ABI), so float
-/// returns stay off the FP IR path for now; `double` returns (clean 64-bit in
-/// RAX) ARE admitted. `return_type` yields the descriptor's return byte.
-fn returns_float(descriptor: &str) -> bool {
-    return_type(descriptor) == b'F'
-}
-
 /// inc 30: the method uses `float`/`double` anywhere — signature OR body. Used by
 /// the int/long IR-path clauses to stay FP-free.
 fn method_uses_fp(code: &[u8], code_len: usize, descriptor: &str) -> bool {
@@ -6097,7 +6089,12 @@ pub fn static_call_shape(descriptor: &str) -> Option<(usize, u8)> {
         // already matches `IrType::Double`). `D`/`F` *args* are still rejected
         // (the arg loop above) — they ride XMM the marshaller does not yet emit.
         b'D' => Some((num_args, ret)),
-        // `F` return — still rejected (32-bit-in-RAX subtlety, a follow-on).
+        // `F` (float) return: accepted (inc 33). The 32-bit result rides the low
+        // 32 of RAX (the i64 return ABI); the IR builder types the `Op::Call`
+        // `IrType::Float` and the call-site `dispatch_threw` peek disambiguates a
+        // `+0.0f`-with-stale-upper-bits ↔ `i64::MIN` collision. `D`/`F` *args* are
+        // still rejected (the arg loop) — they ride XMM the marshaller lacks.
+        b'F' => Some((num_args, ret)),
         _ => None,
     }
 }

@@ -2052,9 +2052,19 @@ are landed and (where flagged) default-ON. What remains, in dependency order:
        is handled by the item-1 `dispatch_threw` peek. Validated: `ir_vs_singlepass`
        `…_double_return` + `…_invokestatic_double_return`; E2E (incl. a `-0.0`
        call-return → `1.0/-0.0 = -Infinity`) `== HotSpot`.
-     - **Remaining:** `float` returns (32-bit-in-RAX upper-bits subtlety), FP
-       *params* + `D`/`F` call-*args* (XMM prologue/epilogue marshalling + an
-       FP-aware VM→JIT call convention — FP args in XMM0-3/0-7).
+     - ✅ **`float` returns — DONE (inc 33).** A `float` result rides the LOW 32
+       of RAX; every consumer reads only the low 32 (interpreter `result as u32`
+       → `f32::from_bits`; downstream `MOVSS`), so the `load_to_rax`-from-slot
+       stale upper bits are harmless. The one hazard — a `+0.0f` whose stale upper
+       bits make RAX == `i64::MIN` on a `F` CALL result — is caught by the
+       call-site `dispatch_threw` peek (extended to `IrType::Float`/`b'F'` in both
+       backends; only `+0.0f` can collide since `i64::MIN` has low-63 = 0). The
+       gate dropped `!returns_float` (now just `!fp_in_params`); `freturn` (0xae)
+       joins `dreturn`; `static_call_shape` accepts a `F` return. Validated:
+       `ir_vs_singlepass` `…_float_return`/`…_invokestatic_float_return`/
+       `…_float_return_min_bits_collision`; E2E `== HotSpot`.
+     - **Remaining:** FP *params* + `D`/`F` call-*args* (XMM prologue/epilogue
+       marshalling + an FP-aware VM→JIT call convention — FP args in XMM0-3/0-7).
    - **`frem`/`drem`** (`fmod`-style remainder helper — no single instruction).
    - **FP-slot deopt resume** (let an FP value be live at a deopt — lifts the
      inc-30 int-div and `ldc2_w` exclusions). `typed_stack_slot` already carries
