@@ -3,6 +3,15 @@
 Companion to the full audit: [`full-review-2026-06-20.md`](full-review-2026-06-20.md) (every finding, file:line).
 This doc tracks what the multi-agent remediation has **landed on `dev`** and how to **continue** the rest.
 
+## UPDATE (2026-06-21, swarm) — ALL mediums + perf + S/M features landed
+Ran 5 background Workflow swarms (9 agents each, disjoint files, one branch each, merged in order with a build gate):
+- **Mediums M1–M4 = 36 fixes** merged + build-green. Covers: http-client cred-strip/chunk-cap/h2-PADDED, BigInteger signs, SharedSecrets init, TC_ARRAY cap, jmx panic, getChars bounds, DirectByteBuffer Layout, interpreter finally, varhandle RMW; gc reference-liveness + concurrent-mark race + zgc ref-proc, libcratonvm per-VM handle table (+the libcratonvm HIGH), Lookup access control, x509 hostname, panama overlap, concurrent_extras heap-check, jni DefineClass/Call*MethodV/A, Class-mirror by-name fields; jfr UAF, aarch64 range-check, JIT code-cache cap, AOT SHA-256 integrity, crash-handler write loop, lock-order release gate, vthread shared timer, ObjectRef Send/Sync justification, gc_integration dead-code; cuda module name, jit-cuda reduction dataflow, native-awt image/cocoa/win32/renderer bounds, quarkus-arc default-off gate; CONFIG.md env-var docs + known-issues status.
+- **Perf + S/M features (PF1) = 9** merged + build-green: net buffer pool, O(1) logging/global-ref/regex maps, bounded deopt history, metaspace bump fast-path; cargo-llvm-cov CI workflow, cgroup-aware default-heap helper, libcratonvm/cratonvm-embed README + readme= (crates.io pages).
+
+**Operational lessons (IMPORTANT for future waves):**
+1. **Incremental-build false-greens.** Per-wave `cargo build --workspace` can report exit 0 while NOT recompiling a just-merged crate (cargo incremental missed the change). Two real errors (aot.rs E0401 from M3, jni.rs HashSet `drain()` arity from PF1) slipped past per-wave greens and were caught only by a FORCED rebuild (`touch` a changed file in each crate, then build). **Always force-recompile touched crates before declaring green.** After that forced rebuild the whole workspace is 0-errors green.
+2. **Stray external WIP in the main worktree.** Twice, uncommitted edits to native-builtins (`kem.rs`/`lang_invoke.rs`/`lang_stackwalker.rs`/`lang_system.rs`) and `jit/src/ir_optimize.rs` appeared in the main worktree (not from my agents). I **parked them in `git stash`** (`git stash list` → entries labeled "non-remediation WIP") to keep builds coherent. **The owning session should `git stash pop`/recover these** — I did not discard them.
+
 ## UPDATE (2026-06-21, later) — Wave 3b landed
 The **GC-root cluster is now 8/9 done** (all build-green, merged in order). Added since the first cut:
 - `oscache.rs` (registry adopter; needed a build-fix: `SendPtr` wrapper in the registry `Vec` + `ObjectRef::as_ptr().is_null()` — `ObjectRef` has **no `is_null()`** method, note for future agents).
