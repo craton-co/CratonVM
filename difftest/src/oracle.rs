@@ -22,6 +22,7 @@
 //! per-mode verdicts into a `Classification` (`JitOnly`, …) is Step 2.
 
 use crate::ledger::{Channel, Classification, JvmException, Observation};
+use crate::runner::Mode;
 
 /// Per-channel normalization knobs. The **default is strict** (every knob
 /// off): a seed must explicitly opt into a normalizer via its header pragma so
@@ -236,39 +237,55 @@ fn compare_exception(
     }
 }
 
-/// Classify a divergence given the per-mode agreement map (design §3.3).
+/// One CratonVM mode's outcome, distilled for classification: did it diverge
+/// from HotSpot, and did it hang / crash?
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ModeVerdict {
+    pub mode: Mode,
+    pub diverged: bool,
+    pub timed_out: bool,
+    /// Exited by signal/abort (no exit code, and not a timeout).
+    pub crashed: bool,
+}
+
+/// Classify a divergence from the per-mode verdict map (design §3.3) — the
+/// automation of the manual `--nojit` bisection. Returns `None` when **every**
+/// mode agreed with HotSpot.
 ///
-/// `jit_on_diverges` is whether the default (JIT) mode diverged from HotSpot;
-/// `other_modes` is `(mode_label, diverged)` for every non-default mode that
-/// ran. Step 1 only runs one mode, so this is exercised by Step 2's fan-out;
-/// it is provided now so the ledger schema is stable.
-pub fn classify(
-    cratonvm: &Observation,
-    jit_on_diverges: bool,
-    other_modes: &[(crate::runner::Mode, bool)],
-) -> Option<Classification> {
-    if cratonvm.timed_out {
+/// Decision order:
+/// 1. **Hang** — any mode timed out (dominates; the most urgent bucket).
+/// 2. **Crash** — any mode exited by signal/abort.
+/// 3. **JitOnly** — the interpreter (`nojit`) ran and *agreed*, but a JIT-
+///    enabled mode (`jit-on` / `low-jit-threshold`) diverged ⇒ a JIT bug.
+/// 4. **GcMode** — `jit-on` and `nojit` both agree, but a GC mode (`moving-gc`)
+///    diverged ⇒ the divergence is GC-specific.
+/// 5. **Universal** — otherwise (the bug is in the shared interpreter/native
+///    path, present with and without the JIT).
+pub fn classify(modes: &[ModeVerdict]) -> Option<Classification> {
+    if modes.iter().any(|m| m.timed_out) {
         return Some(Classification::Hang);
     }
-    if cratonvm.exit_code.is_none() {
+    if modes.iter().any(|m| m.crashed) {
         return Some(Classification::Crash);
     }
-    if !jit_on_diverges && other_modes.iter().all(|(_, d)| !d) {
+    if !modes.iter().any(|m| m.diverged) {
         return None; // everything agreed
     }
-    // jit-on diverges but the interpreter (nojit) agrees ⇒ a JIT bug.
-    let nojit_agrees = other_modes
-        .iter()
-        .any(|(m, diverged)| *m == crate::runner::Mode::NoJit && !diverged);
-    if jit_on_diverges && nojit_agrees {
+
+    // Look up a specific mode's diverged status (None = that mode wasn't run).
+    let diverged = |want: Mode| modes.iter().find(|m| m.mode == want).map(|m| m.diverged);
+    let jit_modes_diverge =
+        diverged(Mode::JitOn) == Some(true) || diverged(Mode::LowJitThreshold) == Some(true);
+
+    // JitOnly needs the interpreter baseline (nojit) to have run AND agreed.
+    if diverged(Mode::NoJit) == Some(false) && jit_modes_diverge {
         return Some(Classification::JitOnly);
     }
-    // Only a GC mode diverged.
-    let only_gc = other_modes
-        .iter()
-        .any(|(m, diverged)| *m == crate::runner::Mode::MovingGc && *diverged)
-        && !jit_on_diverges;
-    if only_gc {
+    // GcMode: both the interpreter and default-GC JIT agree, a GC mode diverges.
+    if diverged(Mode::JitOn) == Some(false)
+        && diverged(Mode::NoJit) != Some(true)
+        && diverged(Mode::MovingGc) == Some(true)
+    {
         return Some(Classification::GcMode);
     }
     Some(Classification::Universal)
@@ -389,21 +406,65 @@ mod tests {
         }
     }
 
-    #[test]
-    fn classify_jit_only() {
-        use crate::runner::Mode;
-        let o = obs("", "", Some(0));
-        let c = classify(&o, true, &[(Mode::NoJit, false)]);
-        assert_eq!(c, Some(Classification::JitOnly));
+    fn mv(mode: Mode, diverged: bool) -> ModeVerdict {
+        ModeVerdict {
+            mode,
+            diverged,
+            timed_out: false,
+            crashed: false,
+        }
     }
 
     #[test]
-    fn classify_hang_and_crash() {
-        let mut t = obs("", "", None);
-        t.timed_out = true;
-        assert_eq!(classify(&t, false, &[]), Some(Classification::Hang));
-        let crash = obs("", "", None);
-        assert_eq!(classify(&crash, true, &[]), Some(Classification::Crash));
+    fn classify_all_agree_is_none() {
+        let modes = [mv(Mode::JitOn, false), mv(Mode::NoJit, false)];
+        assert_eq!(classify(&modes), None);
+    }
+
+    #[test]
+    fn classify_jit_only() {
+        // jit-on diverges, nojit agrees ⇒ JitOnly (the --nojit bisection).
+        let modes = [mv(Mode::JitOn, true), mv(Mode::NoJit, false)];
+        assert_eq!(classify(&modes), Some(Classification::JitOnly));
+    }
+
+    #[test]
+    fn classify_universal_when_both_diverge() {
+        // The ExceptionId case: an interpreter/native gap shows in BOTH modes.
+        let modes = [mv(Mode::JitOn, true), mv(Mode::NoJit, true)];
+        assert_eq!(classify(&modes), Some(Classification::Universal));
+    }
+
+    #[test]
+    fn classify_gc_mode() {
+        // jit-on + nojit agree, only the moving-GC mode diverges.
+        let modes = [
+            mv(Mode::JitOn, false),
+            mv(Mode::NoJit, false),
+            mv(Mode::MovingGc, true),
+        ];
+        assert_eq!(classify(&modes), Some(Classification::GcMode));
+    }
+
+    #[test]
+    fn classify_low_threshold_is_jit_only() {
+        // A JIT bug that only trips when compilation is forced early.
+        let modes = [
+            mv(Mode::JitOn, false),
+            mv(Mode::NoJit, false),
+            mv(Mode::LowJitThreshold, true),
+        ];
+        assert_eq!(classify(&modes), Some(Classification::JitOnly));
+    }
+
+    #[test]
+    fn classify_hang_and_crash_dominate() {
+        let mut hang = mv(Mode::JitOn, true);
+        hang.timed_out = true;
+        assert_eq!(classify(&[hang]), Some(Classification::Hang));
+        let mut crash = mv(Mode::JitOn, true);
+        crash.crashed = true;
+        assert_eq!(classify(&[crash]), Some(Classification::Crash));
     }
 
     #[test]

@@ -2,43 +2,82 @@
 // Copyright 2024-2026 Craton Software Company
 
 //! Run orchestration: discover the corpus, compile each program once with
-//! `javac`, run the resulting `.class` on CratonVM and HotSpot, and diff.
+//! `javac`, run the resulting `.class` on CratonVM (across the mode matrix) and
+//! HotSpot, diff, and classify.
 //!
 //! This is the seam between the process mechanics ([`crate::runner`]) and the
 //! comparison ([`crate::oracle`]). The same compiled `.class` runs on both VMs
 //! (design §3.1, the wrapper-free path).
 //!
-//! ## Status: Step 1
+//! ## Status: Step 2
 //!
-//! Runs the **first configured CratonVM mode** (default `jit-on`) vs HotSpot
-//! and diffs the four channels. The per-mode fan-out + `Classification` join is
-//! Step 2; until then a divergence is classified coarsely
-//! (`Hang`/`Crash`/`Universal`).
+//! For each program HotSpot runs **once** (the deterministic reference) and
+//! CratonVM runs **once per configured [`Mode`]**; the per-mode agree/diverge
+//! map feeds [`oracle::classify`] to auto-label the divergence
+//! (`JitOnly`/`GcMode`/`Universal`/`Hang`/`Crash`) — automating the manual
+//! `--nojit` bisection.
 
 use std::path::{Path, PathBuf};
 
 use crate::ledger::{Channel, Classification, Ledger, LedgerEntry, LedgerStatus, Observation};
-use crate::oracle::{self, Normalizer, Verdict};
+use crate::oracle::{self, ModeVerdict, Normalizer, Verdict};
 use crate::runner::{self, Mode, RunError, RunnerConfig};
 
-/// One program's A/B result.
+/// One CratonVM mode's outcome for a single program.
+#[derive(Debug, Clone)]
+pub struct ModeOutcome {
+    pub mode: Mode,
+    pub cratonvm: Observation,
+    pub verdict: Verdict,
+}
+
+impl ModeOutcome {
+    fn to_mode_verdict(&self) -> ModeVerdict {
+        ModeVerdict {
+            mode: self.mode,
+            diverged: !self.verdict.agrees(),
+            timed_out: self.cratonvm.timed_out,
+            crashed: self.cratonvm.exit_code.is_none() && !self.cratonvm.timed_out,
+        }
+    }
+}
+
+/// One program's A/B result across the whole mode matrix.
 #[derive(Debug, Clone)]
 pub struct ProgramResult {
     /// The main class name that was run.
     pub program: String,
     /// The corpus source file (`.java` / `.class`).
     pub source: PathBuf,
-    /// The CratonVM mode used (Step 1: the first configured mode).
-    pub mode: Mode,
-    pub cratonvm: Observation,
+    /// The HotSpot reference observation (run once).
     pub hotspot: Observation,
-    pub verdict: Verdict,
+    /// One outcome per configured CratonVM mode.
+    pub modes: Vec<ModeOutcome>,
 }
 
 impl ProgramResult {
-    /// Coarse single-mode classification (refined by Step 2's mode matrix).
+    /// True when at least one mode disagreed with HotSpot.
+    pub fn diverged(&self) -> bool {
+        self.modes.iter().any(|m| !m.verdict.agrees())
+    }
+
+    /// The triage label from the per-mode verdict map (`None` = all agreed).
     pub fn classification(&self) -> Option<Classification> {
-        oracle::classify(&self.cratonvm, !self.verdict.agrees(), &[])
+        let verdicts: Vec<ModeVerdict> = self
+            .modes
+            .iter()
+            .map(ModeOutcome::to_mode_verdict)
+            .collect();
+        oracle::classify(&verdicts)
+    }
+
+    /// The CratonVM observation to record in the ledger: the first *diverging*
+    /// mode (the one that exhibits the bug), else the first mode.
+    pub fn representative(&self) -> Option<&ModeOutcome> {
+        self.modes
+            .iter()
+            .find(|m| !m.verdict.agrees())
+            .or_else(|| self.modes.first())
     }
 }
 
@@ -58,9 +97,9 @@ impl RunSummary {
         self.results.len()
     }
 
-    /// Programs whose VMs disagreed.
+    /// Programs whose VMs disagreed in at least one mode.
     pub fn diverged(&self) -> usize {
-        self.results.iter().filter(|r| !r.verdict.agrees()).count()
+        self.results.iter().filter(|r| r.diverged()).count()
     }
 
     /// Build a fresh `Ledger` (every divergence a `New` entry) from this run.
@@ -69,15 +108,19 @@ impl RunSummary {
     pub fn to_ledger(&self, host: String, captured_at: String, jdk: String) -> Ledger {
         let mut ledger = Ledger::new(host, captured_at.clone(), jdk);
         for (i, r) in self.results.iter().enumerate() {
-            if r.verdict.agrees() {
+            if !r.diverged() {
                 continue;
             }
+            let cratonvm = r
+                .representative()
+                .map(|m| m.cratonvm.clone())
+                .unwrap_or_else(Observation::empty);
             ledger.entries.push(LedgerEntry {
                 id: format!("div-{i:04}"),
                 class: r.program.clone(),
                 repro_path: r.source.to_string_lossy().into_owned(),
                 classification: r.classification().unwrap_or(Classification::Universal),
-                cratonvm: r.cratonvm.clone(),
+                cratonvm,
                 hotspot: r.hotspot.clone(),
                 status: LedgerStatus::New,
                 first_seen: captured_at.clone(),
@@ -108,8 +151,8 @@ pub fn discover_programs(corpus: &Path) -> Vec<PathBuf> {
     out
 }
 
-/// Run the whole corpus: compile each program once, run it on the first
-/// configured CratonVM mode and HotSpot, and diff.
+/// Run the whole corpus: compile each program once, run HotSpot once and
+/// CratonVM in every configured mode, diff, and classify.
 ///
 /// Prerequisites are checked up front so callers can skip cleanly:
 /// the `cratonvm` binary must resolve, `java`/`javac` must be reachable, and
@@ -123,7 +166,11 @@ pub fn run_corpus(config: &RunnerConfig) -> Result<RunSummary, RunError> {
     if programs.is_empty() {
         return Err(RunError::EmptyCorpus);
     }
-    let mode = config.modes.first().copied().unwrap_or(Mode::JitOn);
+    let modes = if config.modes.is_empty() {
+        vec![Mode::JitOn]
+    } else {
+        config.modes.clone()
+    };
     let jdk = config.jdk_home.as_deref();
     let normalizer = Normalizer::strict();
 
@@ -161,20 +208,29 @@ pub fn run_corpus(config: &RunnerConfig) -> Result<RunSummary, RunError> {
             (dir, cls)
         };
 
-        let mut cratonvm =
-            runner::run_cratonvm(&bin, &classpath, &main_class, mode, config.timeout)?;
-        cratonvm.exception = oracle::parse_exception(&cratonvm.stderr);
+        // HotSpot is the deterministic reference — run it once and reuse it
+        // across every CratonVM mode.
         let mut hotspot = runner::run_hotspot(&classpath, &main_class, jdk, config.timeout)?;
         hotspot.exception = oracle::parse_exception(&hotspot.stderr);
 
-        let verdict = oracle::compare(&cratonvm, &hotspot, &normalizer);
+        let mut outcomes = Vec::with_capacity(modes.len());
+        for &mode in &modes {
+            let mut cratonvm =
+                runner::run_cratonvm(&bin, &classpath, &main_class, mode, config.timeout)?;
+            cratonvm.exception = oracle::parse_exception(&cratonvm.stderr);
+            let verdict = oracle::compare(&cratonvm, &hotspot, &normalizer);
+            outcomes.push(ModeOutcome {
+                mode,
+                cratonvm,
+                verdict,
+            });
+        }
+
         summary.results.push(ProgramResult {
             program: main_class,
             source,
-            mode,
-            cratonvm,
             hotspot,
-            verdict,
+            modes: outcomes,
         });
     }
 
@@ -183,26 +239,33 @@ pub fn run_corpus(config: &RunnerConfig) -> Result<RunSummary, RunError> {
 }
 
 /// Render a one-line-per-program human summary of a run (used by `difftest
-/// run`). Divergences list the channels that disagreed.
+/// run`). A divergence shows its classification and the per-mode channels that
+/// disagreed.
 pub fn render_summary(summary: &RunSummary) -> String {
     use std::fmt::Write as _;
     let mut s = String::new();
     for r in &summary.results {
-        match &r.verdict {
-            Verdict::Agree => {
-                let _ = writeln!(s, "  OK    {} [{}]", r.program, r.mode.label());
-            }
-            Verdict::Diverge(diffs) => {
-                let channels: Vec<&str> = diffs.iter().map(|d| channel_label(d.channel)).collect();
-                let _ = writeln!(
-                    s,
-                    "  DIFF  {} [{}] — {}",
-                    r.program,
-                    r.mode.label(),
-                    channels.join(", ")
-                );
-            }
+        if !r.diverged() {
+            let _ = writeln!(s, "  OK    {}", r.program);
+            continue;
         }
+        let class = r
+            .classification()
+            .map(classification_label)
+            .unwrap_or("divergent");
+        let per_mode: Vec<String> = r
+            .modes
+            .iter()
+            .filter(|m| !m.verdict.agrees())
+            .map(|m| format!("{}:{}", m.mode.label(), verdict_channels(&m.verdict)))
+            .collect();
+        let _ = writeln!(
+            s,
+            "  DIFF  {} [{}] — {}",
+            r.program,
+            class,
+            per_mode.join(" ")
+        );
     }
     for (prog, reason) in &summary.skipped {
         let _ = writeln!(s, "  SKIP  {prog} — {reason}");
@@ -217,12 +280,34 @@ pub fn render_summary(summary: &RunSummary) -> String {
     s
 }
 
+/// The channels that disagreed in one verdict, e.g. `stdout,exception`.
+fn verdict_channels(v: &Verdict) -> String {
+    match v {
+        Verdict::Agree => String::new(),
+        Verdict::Diverge(diffs) => diffs
+            .iter()
+            .map(|d| channel_label(d.channel))
+            .collect::<Vec<_>>()
+            .join(","),
+    }
+}
+
 fn channel_label(c: Channel) -> &'static str {
     match c {
         Channel::ExitCode => "exit-code",
         Channel::Exception => "exception",
         Channel::Stdout => "stdout",
         Channel::Stderr => "stderr",
+    }
+}
+
+fn classification_label(c: Classification) -> &'static str {
+    match c {
+        Classification::JitOnly => "jit-only",
+        Classification::GcMode => "gc-mode",
+        Classification::Universal => "universal",
+        Classification::Hang => "hang",
+        Classification::Crash => "crash",
     }
 }
 
@@ -233,10 +318,39 @@ fn channel_label(c: Channel) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::oracle::ChannelDiff;
+
+    // A completed run has a real exit code; `exit_code: None` would (correctly)
+    // be read as a signal-kill ⇒ Crash, so these fixtures set `Some(0)`.
+    fn diverging_outcome(mode: Mode) -> ModeOutcome {
+        ModeOutcome {
+            mode,
+            cratonvm: Observation {
+                stdout: "42".into(),
+                exit_code: Some(0),
+                ..Observation::empty()
+            },
+            verdict: Verdict::Diverge(vec![ChannelDiff {
+                channel: Channel::Stdout,
+                cratonvm: "42".into(),
+                hotspot: "43".into(),
+            }]),
+        }
+    }
+
+    fn agreeing_outcome(mode: Mode) -> ModeOutcome {
+        ModeOutcome {
+            mode,
+            cratonvm: Observation {
+                exit_code: Some(0),
+                ..Observation::empty()
+            },
+            verdict: Verdict::Agree,
+        }
+    }
 
     #[test]
     fn discover_finds_java_and_class_sorted() {
-        // The committed seeds dir is a stable fixture.
         let seeds = Path::new(env!("CARGO_MANIFEST_DIR")).join("seeds");
         let progs = discover_programs(&seeds);
         assert!(!progs.is_empty(), "seeds dir should have programs");
@@ -246,7 +360,6 @@ mod tests {
                 Some("java") | Some("class")
             )
         }));
-        // Sorted order is deterministic.
         let mut sorted = progs.clone();
         sorted.sort();
         assert_eq!(progs, sorted);
@@ -258,36 +371,42 @@ mod tests {
     }
 
     #[test]
-    fn summary_counts_and_ledger() {
-        // A synthetic summary with one agreement and one divergence.
+    fn program_classifies_jit_only() {
+        // jit-on diverges, nojit agrees ⇒ JitOnly + representative is jit-on.
+        let r = ProgramResult {
+            program: "J".into(),
+            source: PathBuf::from("seeds/J.java"),
+            hotspot: Observation::empty(),
+            modes: vec![
+                diverging_outcome(Mode::JitOn),
+                agreeing_outcome(Mode::NoJit),
+            ],
+        };
+        assert!(r.diverged());
+        assert_eq!(r.classification(), Some(Classification::JitOnly));
+        assert_eq!(r.representative().unwrap().mode, Mode::JitOn);
+    }
+
+    #[test]
+    fn summary_counts_classifies_and_ledger() {
         let agree = ProgramResult {
             program: "A".into(),
             source: PathBuf::from("seeds/A.java"),
-            mode: Mode::JitOn,
-            cratonvm: Observation::empty(),
             hotspot: Observation::empty(),
-            verdict: Verdict::Agree,
+            modes: vec![agreeing_outcome(Mode::JitOn), agreeing_outcome(Mode::NoJit)],
         };
-        let diverge = ProgramResult {
+        // Both modes diverge ⇒ Universal (the ExceptionId shape).
+        let universal = ProgramResult {
             program: "B".into(),
             source: PathBuf::from("seeds/B.java"),
-            mode: Mode::JitOn,
-            cratonvm: Observation {
-                stdout: "42".into(),
-                ..Observation::empty()
-            },
-            hotspot: Observation {
-                stdout: "43".into(),
-                ..Observation::empty()
-            },
-            verdict: Verdict::Diverge(vec![crate::oracle::ChannelDiff {
-                channel: Channel::Stdout,
-                cratonvm: "42".into(),
-                hotspot: "43".into(),
-            }]),
+            hotspot: Observation::empty(),
+            modes: vec![
+                diverging_outcome(Mode::JitOn),
+                diverging_outcome(Mode::NoJit),
+            ],
         };
         let summary = RunSummary {
-            results: vec![agree, diverge],
+            results: vec![agree, universal],
             skipped: vec![],
         };
         assert_eq!(summary.total(), 2);
@@ -296,11 +415,13 @@ mod tests {
         let ledger = summary.to_ledger("host".into(), "t".into(), "25".into());
         assert_eq!(ledger.entries.len(), 1);
         assert_eq!(ledger.entries[0].class, "B");
+        assert_eq!(ledger.entries[0].classification, Classification::Universal);
         assert_eq!(ledger.entries[0].status, LedgerStatus::New);
 
         let rendered = render_summary(&summary);
         assert!(rendered.contains("OK    A"));
-        assert!(rendered.contains("DIFF  B"));
-        assert!(rendered.contains("stdout"));
+        assert!(rendered.contains("DIFF  B [universal]"));
+        assert!(rendered.contains("jit-on:stdout"));
+        assert!(rendered.contains("nojit:stdout"));
     }
 }
