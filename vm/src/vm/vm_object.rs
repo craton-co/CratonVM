@@ -55,6 +55,26 @@ pub fn create_java_string(shared: &SharedVm, text: &str) -> ObjectRef {
     str_obj
 }
 
+/// Fallible, pooled twin of [`create_java_string`]: returns `None` instead of
+/// aborting the process when the heap is too full to allocate the `String`.
+/// Used by exception materialization (`create_exception_object`) so a detail
+/// message can be built when there is room, but a 100%-full heap surfaces a
+/// catchable `OutOfMemoryError` (caller falls back to the pre-allocated
+/// singleton) rather than the VM hard-aborting.
+pub fn try_create_java_string(shared: &SharedVm, text: &str) -> Option<ObjectRef> {
+    if let Some(&obj) = shared.string_pool.read().get(text) {
+        return Some(obj);
+    }
+    let mut pool = shared.string_pool.write();
+    if let Some(&obj) = pool.get(text) {
+        return Some(obj);
+    }
+    let units: Vec<u16> = text.encode_utf16().collect();
+    let str_obj = try_alloc_java_string_object_from_units(shared, &units)?;
+    pool.insert(text.to_string(), str_obj);
+    Some(str_obj)
+}
+
 /// Create a Java String object from a Rust `&str` **without** consulting or
 /// populating the interned-string pool.
 ///
@@ -95,8 +115,28 @@ fn alloc_java_string_object(shared: &SharedVm, text: &str) -> ObjectRef {
 ///
 /// Shared core of [`alloc_java_string_object`] (which simply `encode_utf16`s a
 /// Rust `&str`) and [`create_java_string_from_units`] (surrogate-bearing
-/// constants). Performs no pool lookup or insertion.
+/// constants). Performs no pool lookup or insertion. Aborts the process on heap
+/// exhaustion — the long-standing contract for the ~all callers that cannot
+/// recover. Catchable-OOM callers (exception materialization) must use the
+/// fallible [`try_alloc_java_string_object_from_units`] instead.
 fn alloc_java_string_object_from_units(shared: &SharedVm, units: &[u16]) -> ObjectRef {
+    try_alloc_java_string_object_from_units(shared, units).unwrap_or_else(|| {
+        eprintln!(
+            "FATAL: heap exhausted allocating java/lang/String ({} units)",
+            units.len()
+        );
+        std::process::abort();
+    })
+}
+
+/// Fallible twin of [`alloc_java_string_object_from_units`]: returns `None`
+/// instead of aborting when the heap is too full to allocate the `String`
+/// object or its backing array. Used by exception materialization so a
+/// `java.lang.OutOfMemoryError` can be surfaced (or the pre-allocated singleton
+/// thrown) on a 100%-full heap rather than the VM hard-aborting. Goes through
+/// the fallible-with-old-gen heap paths (`try_alloc_object_full` /
+/// `try_alloc_array_full`).
+fn try_alloc_java_string_object_from_units(shared: &SharedVm, units: &[u16]) -> Option<ObjectRef> {
     // Load java/lang/String class and resolve field count (cached after first call).
     // The field count is cached in an AtomicUsize to avoid lock contention:
     // once resolved, subsequent calls skip the class_manager *write* lock entirely.
@@ -161,7 +201,9 @@ fn alloc_java_string_object_from_units(shared: &SharedVm, units: &[u16]) -> Obje
             (id, count)
         }
     };
-    let str_obj = shared.heap.alloc_object(string_class_id, field_count);
+    let str_obj = shared
+        .heap
+        .try_alloc_object_full(string_class_id, field_count)?;
 
     let compact = shared
         .compact_strings
@@ -175,10 +217,11 @@ fn alloc_java_string_object_from_units(shared: &SharedVm, units: &[u16]) -> Obje
         // Field 3: boolean hashIsZero (false)
         if units.iter().all(|&u| u <= 0xFF) {
             // LATIN1: one byte per char
-            let byte_array =
-                shared
-                    .heap
-                    .alloc_array(ClassId::new(0), ArrayElementType::Byte, units.len());
+            let byte_array = shared.heap.try_alloc_array_full(
+                ClassId::new(0),
+                ArrayElementType::Byte,
+                units.len(),
+            )?;
             for (i, &u) in units.iter().enumerate() {
                 let _ = shared
                     .heap
@@ -200,10 +243,11 @@ fn alloc_java_string_object_from_units(shared: &SharedVm, units: &[u16]) -> Obje
             // byte-swaps every non-LATIN-1 char and corrupts e.g.
             // `CharacterData00`'s packed lookup tables.
             let byte_len = units.len() * 2;
-            let byte_array =
-                shared
-                    .heap
-                    .alloc_array(ClassId::new(0), ArrayElementType::Byte, byte_len);
+            let byte_array = shared.heap.try_alloc_array_full(
+                ClassId::new(0),
+                ArrayElementType::Byte,
+                byte_len,
+            )?;
             for (i, &unit) in units.iter().enumerate() {
                 // Little-endian: low byte at even index, high byte at odd index.
                 let lo = (unit & 0xFF) as u8;
@@ -227,10 +271,11 @@ fn alloc_java_string_object_from_units(shared: &SharedVm, units: &[u16]) -> Obje
         // ---- Legacy / synthetic layout ----
         // Field 0: char[] value (UTF-16)
         // Field 1: int hash
-        let char_array =
-            shared
-                .heap
-                .alloc_array(ClassId::new(0), ArrayElementType::Char, units.len());
+        let char_array = shared.heap.try_alloc_array_full(
+            ClassId::new(0),
+            ArrayElementType::Char,
+            units.len(),
+        )?;
         for (i, &ch) in units.iter().enumerate() {
             let _ = shared
                 .heap
@@ -243,7 +288,7 @@ fn alloc_java_string_object_from_units(shared: &SharedVm, units: &[u16]) -> Obje
         shared.heap.set_field(str_obj, 1, Value::Int(0));
     }
 
-    str_obj
+    Some(str_obj)
 }
 
 /// Bulk-read a compact `byte[]` array payload into a `Vec<u8>`.

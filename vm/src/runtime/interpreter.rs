@@ -611,6 +611,10 @@ fn maybe_gc_forced(shared: &SharedVm, thread: &mut JvmThread) {
     // TLAB bugs. Surfaced as a SIGSEGV in the moving collector's post-copy
     // `pointer_map` walk under multi-threaded churn (TestFileStoreConcurrency).
     thread.tlab.retire();
+    // GC-overhead accounting: live set BEFORE the collection (post-TLAB-retire),
+    // so `note_gc_productivity` can compute how much this forced GC actually
+    // freed (`before - after`). See `note_gc_productivity` / `gc_overhead_limit_exceeded`.
+    let before_live = shared.heap.allocated_bytes();
     // Round-5 fix (CRIT — UAF): see comment in `maybe_gc`. The forced
     // path is also an initiator path; drain its per-thread SATB buffer
     // before scanning roots.
@@ -634,6 +638,7 @@ fn maybe_gc_forced(shared: &SharedVm, thread: &mut JvmThread) {
         shared
             .gc_cycle_count
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        note_gc_productivity(shared, before_live);
     } else {
         if shared.gc_barrier.request_stw(thread.thread_id, alive_count) {
             shared.gc_barrier.wait_for_all();
@@ -653,10 +658,82 @@ fn maybe_gc_forced(shared: &SharedVm, thread: &mut JvmThread) {
             shared
                 .gc_cycle_count
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            note_gc_productivity(shared, before_live);
         } else {
             safepoint_check(shared, thread);
         }
     }
+}
+
+/// Default number of consecutive unproductive allocation-failure GCs (each
+/// leaving the heap ≥98% full) after which the allocation paths declare OOM
+/// instead of continuing to GC-thrash. Overridable via
+/// `CRATONVM_GC_OVERHEAD_LIMIT` (set to `0` to disable the limit entirely).
+const GC_OVERHEAD_LIMIT_CYCLES: u32 = 8;
+
+/// After a forced (allocation-failure) GC completes, record whether it was
+/// *productive* — i.e. whether it actually relieved heap pressure. Measured as
+/// the bytes it freed: `before - after` live bytes, where `before` is the live
+/// set at `maybe_gc_forced` entry (post-TLAB-retire) and `after` is the live set
+/// once the collection finishes. A forced GC that freed < 2% of total heap
+/// capacity counts toward the GC-overhead streak; one that freed more resets it.
+///
+/// The *freed-amount* signal (not post-GC fullness) is the right one for a
+/// generational heap: in a retained-allocation death-spiral the young semi-space
+/// is emptied every cycle (so total *fullness* sits near young/total ≈ 50% and
+/// never looks exhausted), yet the GC frees ~nothing net because every survivor
+/// is promoted into an already-full old generation. `before - after` captures
+/// exactly that — promotion is not freeing, so it does not reset the streak.
+/// Forced GCs only happen on genuine allocation failure (young full *and*
+/// promotion blocked), so this never fires during ordinary young-GC churn.
+fn note_gc_productivity(shared: &SharedVm, before_live: usize) {
+    let cap = shared.heap.heap_capacity();
+    if cap == 0 {
+        return;
+    }
+    let after_live = shared.heap.allocated_bytes();
+    let freed = before_live.saturating_sub(after_live);
+    // unproductive: freed < 2% of capacity
+    let unproductive = (freed as u128) * 100 < (cap as u128) * 2;
+    let streak = if unproductive {
+        shared
+            .gc_unproductive_streak
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1
+    } else {
+        shared
+            .gc_unproductive_streak
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        0
+    };
+    if std::env::var_os("CRATONVM_DBG_GC_OVERHEAD").is_some() {
+        eprintln!(
+            "[GC_OVERHEAD] before={before_live} after={after_live} freed={freed} cap={cap} unproductive={unproductive} streak={streak}"
+        );
+    }
+}
+
+/// Returns `true` when the heap has GC-thrashed past the overhead limit — i.e.
+/// `GC_OVERHEAD_LIMIT_CYCLES` consecutive forced GCs each freed < 2% of the
+/// heap. The allocation-failure paths call this right after `maybe_gc_forced`
+/// and, when it is `true`, surface a catchable `OutOfMemoryError` (the
+/// pre-allocated `singleton_oom`) instead of retrying into an O(n²) death-spiral
+/// on a heap full of live (retained) objects. Mirrors HotSpot's
+/// `UseGCOverheadLimit`. Disabled (always `false`) when
+/// `CRATONVM_GC_OVERHEAD_LIMIT=0`.
+pub fn gc_overhead_limit_exceeded(shared: &SharedVm) -> bool {
+    let limit = match std::env::var("CRATONVM_GC_OVERHEAD_LIMIT") {
+        Ok(v) => match v.trim().parse::<u32>() {
+            Ok(0) => return false, // explicitly disabled
+            Ok(n) => n,
+            Err(_) => GC_OVERHEAD_LIMIT_CYCLES,
+        },
+        Err(_) => GC_OVERHEAD_LIMIT_CYCLES,
+    };
+    shared
+        .gc_unproductive_streak
+        .load(std::sync::atomic::Ordering::Relaxed)
+        >= limit
 }
 
 /// Force a GC cycle from a native method (e.g. System.gc()).
@@ -1346,6 +1423,18 @@ fn alloc_object_shared(
     // Retire TLAB before GC — its memory is in the arena that will be collected
     thread.tlab.retire();
     maybe_gc_forced(shared, thread);
+    // GC-overhead limit: if repeated forced GCs have freed almost nothing, the
+    // heap is full of live objects — declare OOM now rather than retrying into a
+    // death-spiral (a sliver freed each cycle would otherwise let allocation
+    // limp on, GC-thrashing). The catch site / drain surfaces the singleton.
+    if gc_overhead_limit_exceeded(shared) {
+        maybe_dump_heap_on_oom(shared);
+        return Err(MethodCallFailed::InternalError(VmError::Runtime(
+            RuntimeError::OutOfMemoryError {
+                message: format!("Java heap space (alloc_object with {} fields)", num_fields),
+            },
+        )));
+    }
     shared
         .heap
         .try_alloc_object(class_id, num_fields)
@@ -1414,6 +1503,16 @@ fn gc_alloc_array(
     // Retire TLAB before GC
     thread.tlab.retire();
     maybe_gc_forced(shared, thread);
+    // GC-overhead limit (see alloc_object_shared): bail to OOM if the heap is
+    // GC-thrashing rather than spinning on slivers.
+    if gc_overhead_limit_exceeded(shared) {
+        maybe_dump_heap_on_oom(shared);
+        return Err(MethodCallFailed::InternalError(VmError::Runtime(
+            RuntimeError::OutOfMemoryError {
+                message: format!("Java heap space (alloc_array length {})", length),
+            },
+        )));
+    }
     shared
         .heap
         .try_alloc_array(class_id, element_type, length)
