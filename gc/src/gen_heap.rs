@@ -2333,8 +2333,20 @@ impl GenerationalHeap {
         // it runs. Opt out with `CRATONVM_NO_GC_PROMOTION_GUARD` (reverts to the
         // moving collector, which may abort the process on a full heap).
         let promotion_oom_risk = std::env::var_os("CRATONVM_NO_GC_PROMOTION_GUARD").is_none() && {
-            let old_free = self.old_gen_capacity().saturating_sub(self.old_gen_used());
-            old_free < self.young_from_used()
+            // The moving collector's promotion abort needs BOTH generations
+            // nearly full at once: old gen cannot absorb the aged survivors AND
+            // the young to-space cannot hold the (then unpromotable) surviving
+            // set. Gate on exactly that precondition (each ≥ 90% full). A large
+            // young object over a near-empty old gen — e.g. the
+            // `large_array_survives_gc` / `multiple_large_arrays_survive_gc`
+            // tests, where young is big and old is ~empty — must still use the
+            // moving (compacting) collector, so old-gen fullness is required too.
+            let old_cap = self.old_gen_capacity();
+            let young_cap = self.young_semi_capacity();
+            old_cap > 0
+                && young_cap > 0
+                && (self.old_gen_used() as u128) * 10 >= (old_cap as u128) * 9
+                && (self.young_from_used() as u128) * 10 >= (young_cap as u128) * 9
         };
         if (crate::gc_quiescence::is_active() || promotion_oom_risk) && !force_moving {
             tracing::debug!(
