@@ -171,6 +171,10 @@ pub enum Op {
     // ── Comparison ───────────────────────────────────────────────────
     /// Integer compare.  Inputs: `[left, right]`.  Result: `Int` (0/1).
     Cmp(CmpOp),
+    /// Long 3-way compare (`lcmp`). Inputs: `[left, right]` (both `Long`).
+    /// Result: `Int` ∈ {-1, 0, 1} = sign(left − right), signed. Typically feeds
+    /// an `if<cond>` against zero (`lcmp; iflt` ⇒ `left < right`).
+    LCmp,
 
     // ── Type conversion ──────────────────────────────────────────────
     I2L,
@@ -552,6 +556,29 @@ impl IrBuilder {
         self.ldc2w_info = info;
     }
 
+    /// inc 27: the data type for a merge / loop-carried `Op::Phi`, derived from
+    /// its value inputs (`inputs[0]` is the region/merge control). A `long`
+    /// (or `double`) value makes the phi that type, so `frame_value_for`
+    /// resolves the correct 64-bit width on a deopt-frame resume — the phi was
+    /// historically hardcoded `Int`, which would truncate a long on resume.
+    /// Codegen is unaffected (phi copies are unconditionally 64-bit `MOV`s and
+    /// every consumer picks width from its own `node.ty`); only the (currently
+    /// unwired) deopt-resume path reads the phi's own type. Scoped to category-2
+    /// (long/double) to avoid perturbing `Ref`/`Float` phi handling; defaults to
+    /// `Int` otherwise (the prior behaviour).
+    fn phi_data_type(&self, inputs: &[NodeId]) -> IrType {
+        for &n in inputs.iter().skip(1) {
+            if n != NO_NODE {
+                if let Some(node) = self.graph.nodes.get(n as usize) {
+                    if matches!(node.ty, IrType::Long | IrType::Double) {
+                        return node.ty;
+                    }
+                }
+            }
+        }
+        IrType::Int
+    }
+
     /// Re-lay-out the parameter locals with the JVM category-2 two-slot
     /// convention and type each `Param` node. inc 25: [`Self::new`] packs every
     /// parameter one-per-slot typed `Int`, which is only correct for an
@@ -745,9 +772,8 @@ impl IrBuilder {
             for snap in &state.local_snapshots {
                 inputs.push(snap.get(i).copied().unwrap_or(NO_NODE));
             }
-            let phi = self
-                .graph
-                .add(Op::Phi, IrType::Int, inputs, Some(target_pc));
+            let phi_ty = self.phi_data_type(&inputs);
+            let phi = self.graph.add(Op::Phi, phi_ty, inputs, Some(target_pc));
             local_phis[i] = phi;
             self.locals[i] = phi;
         }
@@ -761,9 +787,8 @@ impl IrBuilder {
             for snap in &state.stack_snapshots {
                 inputs.push(snap.get(i).copied().unwrap_or(NO_NODE));
             }
-            let phi = self
-                .graph
-                .add(Op::Phi, IrType::Int, inputs, Some(target_pc));
+            let phi_ty = self.phi_data_type(&inputs);
+            let phi = self.graph.add(Op::Phi, phi_ty, inputs, Some(target_pc));
             stack_phis[i] = phi;
             self.stack[i] = phi;
         }
@@ -859,9 +884,8 @@ impl IrBuilder {
                     for snap in &state.local_snapshots {
                         phi_inputs.push(snap.get(local_idx).copied().unwrap_or(NO_NODE));
                     }
-                    let phi = self
-                        .graph
-                        .add(Op::Phi, IrType::Int, phi_inputs, Some(target_pc));
+                    let phi_ty = self.phi_data_type(&phi_inputs);
+                    let phi = self.graph.add(Op::Phi, phi_ty, phi_inputs, Some(target_pc));
                     self.locals[local_idx] = phi;
                 }
             }
@@ -1183,6 +1207,71 @@ impl IrBuilder {
                     let b = self.pop();
                     let a = self.pop();
                     let r = self.add_data(Op::Xor, IrType::Int, vec![a, b], pc);
+                    self.push(r);
+                    pc += 1;
+                }
+                // inc 27: long shifts + bitwise. The shift count is an `int` (one
+                // slot) on top of the `long` value; the lowerer's `Op::Shl/Shr/
+                // UShr` are width-aware (64-bit shift masks the count to 6 bits,
+                // matching `lshl`'s `count & 0x3f`), and `Op::And/Or/Xor` are
+                // already 64-bit (correct for both Int and Long). These are
+                // 1-byte opcodes (the length walkers' default arm sizes them
+                // correctly). Long-only → inert for the int path.
+                // lshl
+                0x79 => {
+                    let b = self.pop();
+                    let a = self.pop();
+                    let r = self.add_data(Op::Shl, IrType::Long, vec![a, b], pc);
+                    self.push(r);
+                    pc += 1;
+                }
+                // lshr
+                0x7b => {
+                    let b = self.pop();
+                    let a = self.pop();
+                    let r = self.add_data(Op::Shr, IrType::Long, vec![a, b], pc);
+                    self.push(r);
+                    pc += 1;
+                }
+                // lushr
+                0x7d => {
+                    let b = self.pop();
+                    let a = self.pop();
+                    let r = self.add_data(Op::UShr, IrType::Long, vec![a, b], pc);
+                    self.push(r);
+                    pc += 1;
+                }
+                // land
+                0x7f => {
+                    let b = self.pop();
+                    let a = self.pop();
+                    let r = self.add_data(Op::And, IrType::Long, vec![a, b], pc);
+                    self.push(r);
+                    pc += 1;
+                }
+                // lor
+                0x81 => {
+                    let b = self.pop();
+                    let a = self.pop();
+                    let r = self.add_data(Op::Or, IrType::Long, vec![a, b], pc);
+                    self.push(r);
+                    pc += 1;
+                }
+                // lxor
+                0x83 => {
+                    let b = self.pop();
+                    let a = self.pop();
+                    let r = self.add_data(Op::Xor, IrType::Long, vec![a, b], pc);
+                    self.push(r);
+                    pc += 1;
+                }
+                // lcmp — inc 27. 3-way signed compare of two longs → int
+                // {-1,0,1}; usually feeds an `if<cond>` against 0 (the existing
+                // 0x99..0x9e arm), so `lcmp; iflt` becomes `left < right`.
+                0x94 => {
+                    let b = self.pop();
+                    let a = self.pop();
+                    let r = self.add_data(Op::LCmp, IrType::Int, vec![a, b], pc);
                     self.push(r);
                     pc += 1;
                 }

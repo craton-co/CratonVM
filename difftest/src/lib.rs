@@ -11,7 +11,7 @@
 //!
 //! Design: `docs/feature-designs/differential-fuzzer.md`.
 //!
-//! ## Status: Step 5 — bytecode-mutation tier
+//! ## Status: complete (Steps 0–7)
 //!
 //! The runner spawns the `cratonvm` binary and a real `java` as subprocesses,
 //! compiles a `.java` program once with `javac`, and runs the same `.class` on
@@ -20,11 +20,12 @@
 //! mode** ([`runner::Mode`]) against one HotSpot run, classifies each
 //! divergence, runs the determinism pre-flight + re-confirmation, and
 //! [`gate`](harness::gate)s a run against the committed [`ledger::Ledger`].
-//! [`generate`] emits a seeded, reproducible, type-directed corpus. Step 5
-//! wires [`mutate`] — a format-aware, in-place constant-pool bytecode mutator
-//! (always-valid mutants) driven differentially by `difftest mutate` and
-//! panic-fuzzed in-process by `fuzz/fuzz_targets/difftest_bytecode.rs`. The
-//! ddmin source minimizer is the remaining Step-6 work.
+//! [`generate`] emits a seeded type-directed corpus; [`mutate`] is the
+//! format-aware bytecode mutator (also a libFuzzer target +
+//! OSS-Fuzz-onboarded); [`minimize`] ddmin-shrinks a confirmed divergence to a
+//! minimal repro under `difftest/regression/`. The macro tier reuses
+//! `difftest run` over any directory of real programs (`--check-determinism`
+//! to reject flaky ones); see `README.md`.
 //!
 //! The cooperating pieces, each its own module:
 //!
@@ -36,7 +37,7 @@
 //! | [`harness`]     | compile + run + diff + gate | wired (matrix) |
 //! | [`generate`]    | corpus generator (§3.1)     | wired (3 families) |
 //! | [`mutate`]      | bytecode mutator (§3.1 t3)  | wired          |
-//! | [`minimize`]    | shrink a repro (§3.4)       | stub → Step 6  |
+//! | [`minimize`]    | ddmin shrink (§3.4)         | wired          |
 
 pub mod generate;
 pub mod harness;

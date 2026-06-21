@@ -21,10 +21,19 @@ code (`#![no_main]`, `#[no_mangle] extern "C" fn rust_fuzzer_test_input`,
 | `fuzz_asn1`       | `cratonvm_native_builtins::jca::asn1::*` and `x509_manager::parse_certificate`       | TLV header walker, OID decoder, AlgorithmIdentifier, SubjectPublicKeyInfo, Extensions, full X.509 v1/v2/v3.     |
 | `fuzz_keystore`   | `cratonvm_native_builtins::keystore::{load_jks, load_pkcs12, load_keystore}`         | JKS HMAC-SHA1 keystore format, PKCS#12 (.p12/.pfx), and the magic-sniffing dispatcher.                          |
 | `fuzz_tls_record` | `cratonvm_native_builtins::tls::tls_impl::TlsRecordLayer::decode_record`             | 5-byte TLS record header parse, fragment-length clamp, encode/decode round-trip.                                |
+| `difftest_bytecode` | `cratonvm_difftest::mutate::{numeric_constants, mutate_constant}`                  | Constant-pool walk + in-place numeric-constant mutation (length-preserving invariant) — the semantic differential fuzzer's bytecode tier. |
 
 The unifying property each target enforces is **panic-freedom**:
 arbitrary input may produce `Err(_)`, but must never panic, abort,
 or unwind through the parser.
+
+`difftest_bytecode` additionally asserts the mutator is **length-preserving**
+(an in-place constant edit must not resize the class). It is the *fast,
+panic-only* half of the semantic differential fuzzer (design
+`docs/feature-designs/differential-fuzzer.md` §3.1 tier 3 / §4 Step 5);
+divergent inputs are promoted out-of-process to `difftest mutate`, which forks
+`java` and diffs CratonVM against HotSpot (libFuzzer's in-process model forbids
+forking in the hot loop).
 
 ## Running
 
@@ -115,7 +124,7 @@ COPY build.sh $SRC/
 #!/bin/bash -eu
 cd $SRC/cratonvm/fuzz
 cargo +nightly fuzz build -O
-TARGETS="fuzz_classfile fuzz_jimage fuzz_stack_map fuzz_asn1 fuzz_keystore fuzz_tls_record"
+TARGETS="fuzz_classfile fuzz_jimage fuzz_stack_map fuzz_asn1 fuzz_keystore fuzz_tls_record difftest_bytecode"
 for t in $TARGETS; do
     cp target/x86_64-unknown-linux-gnu/release/$t $OUT/$t
 done

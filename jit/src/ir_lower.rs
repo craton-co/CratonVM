@@ -752,6 +752,23 @@ impl<'a> Lowerer<'a> {
                 self.buf.emit(&[0x0F, 0xB6, 0xC0]);
                 self.store_rax(slot);
             }
+            // inc 27: `lcmp` 3-way signed compare of two longs → int {-1,0,1}.
+            // result = (a > b) − (a < b), using signed SETcc on a 64-bit CMP, then
+            // sign-extended to 64 bits so a 32- or 64-bit consumer both read it
+            // correctly (the typical consumer is an `if<cond>` against 0).
+            Op::LCmp => {
+                let slot = self.alloc_slot(id);
+                self.load_to_rax(self.slot_of(node.inputs[0])); // a
+                self.load_to_rcx(self.slot_of(node.inputs[1])); // b
+                self.buf.emit(&[0x48, 0x39, 0xC8]); // CMP RAX, RCX (signed, 64-bit)
+                self.buf.emit(&[0x0F, 0x9F, 0xC0]); // SETG AL  (a > b)
+                self.buf.emit(&[0x0F, 0x9C, 0xC2]); // SETL DL  (a < b)
+                self.buf.emit(&[0x0F, 0xB6, 0xC0]); // MOVZX EAX, AL
+                self.buf.emit(&[0x0F, 0xB6, 0xD2]); // MOVZX EDX, DL
+                self.buf.emit(&[0x29, 0xD0]); // SUB EAX, EDX  → {-1,0,1}
+                self.buf.emit(&[0x48, 0x63, 0xC0]); // MOVSXD RAX, EAX (sign-extend)
+                self.store_rax(slot);
+            }
             Op::I2L => {
                 let slot = self.alloc_slot(id);
                 self.load_to_rax(self.slot_of(node.inputs[0]));

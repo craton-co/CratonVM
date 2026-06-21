@@ -124,9 +124,18 @@ jobs:
   # forced on. It exits 3 (non-fatal) if `java` or the cratonvm binary is
   # absent. A *new* CratonVM↔HotSpot divergence on a seed fails the build;
   # tracked `known` divergences (e.g. ExceptionId's message-parity gaps) pass.
+  #
+  # ADVISORY for now (`continue-on-error`): the committed difftest/ledger.json
+  # baseline was captured on a Windows dev host. The recorded divergence text is
+  # Java-semantic (exception messages, no paths), so it *should* reproduce
+  # byte-identically on this Linux runner — but until that's confirmed by a
+  # green CI run, a platform-drift must not red-flag dev. Regenerate the ledger
+  # here (`difftest run --update-ledger`, mark entries `known`) and DROP
+  # `continue-on-error` to make the gate blocking.
   difftest-gate:
     name: Semantic differential gate
     runs-on: ubuntu-latest
+    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
 
