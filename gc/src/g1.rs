@@ -1768,6 +1768,17 @@ impl G1Collector {
         pool: Vec<usize>,
         roots: &mut [ObjectRef],
     ) -> (HashMap<usize, usize>, usize, usize) {
+        // One-shot confirmation that the parallel evacuator is genuinely active
+        // (the gauntlet lesson: never assume a gated path was taken — verify).
+        {
+            static LOGGED: AtomicBool = AtomicBool::new(false);
+            if !LOGGED.swap(true, Ordering::Relaxed) {
+                tracing::info!(
+                    "g1: parallel evacuation ACTIVE ({} workers, CRATONVM_G1_PARALLEL_EVAC)",
+                    self.parallel_worker_count()
+                );
+            }
+        }
         let pool_next = AtomicUsize::new(0);
         let queue: Mutex<Vec<usize>> = Mutex::new(Vec::new());
         let outstanding = AtomicUsize::new(0);
