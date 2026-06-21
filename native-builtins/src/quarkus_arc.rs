@@ -343,9 +343,53 @@ fn reset_container_state() {
 // Registration entry point
 // ---------------------------------------------------------------------------
 
+/// Returns `true` when the synthetic ArC shim has been explicitly opted
+/// into. This module is a SYNTHETIC stub: it fakes Quarkus' build-time CDI
+/// bean discovery instead of running the real ArC bytecode. Per the project
+/// rule "real Java bytecode runs by DEFAULT; synthetic shims are
+/// experimental opt-in", this shim is OFF by default. It is enabled only via
+/// either:
+///
+/// * the `synthetic-quarkus-arc` cargo feature (compile-time), or
+/// * the `CRATONVM_SYNTHETIC_QUARKUS_ARC=1` environment variable (runtime).
+///
+/// When neither is set, [`register_quarkus_arc_natives`] registers nothing
+/// and the VM defers to whatever real `io.quarkus.arc.*` bytecode is on the
+/// classpath.
+///
+/// Note: `cfg!(feature = "synthetic-quarkus-arc")` evaluates to `false` when
+/// the feature is not declared in `Cargo.toml`, so this stays sound whether
+/// or not the feature has been added to the manifest.
+fn synthetic_arc_opted_in() -> bool {
+    cfg!(feature = "synthetic-quarkus-arc")
+        || std::env::var("CRATONVM_SYNTHETIC_QUARKUS_ARC").as_deref() == Ok("1")
+}
+
 /// Register every `io.quarkus.arc.*` native we implement. Called from
 /// `register_essential_natives` in `lib.rs` after T19.3.
+///
+/// DEFAULT-OFF: this is a synthetic shim (see [`synthetic_arc_opted_in`]).
+/// Unless the caller opts in via the `synthetic-quarkus-arc` cargo feature or
+/// the `CRATONVM_SYNTHETIC_QUARKUS_ARC=1` env var, this is a no-op and the VM
+/// runs whatever real ArC bytecode is on the classpath instead.
 pub fn register_quarkus_arc_natives(registry: &mut NativeMethodRegistry) {
+    if !synthetic_arc_opted_in() {
+        tracing::debug!(
+            "quarkus.arc: synthetic ArC shim disabled (default); set \
+             CRATONVM_SYNTHETIC_QUARKUS_ARC=1 or enable the \
+             `synthetic-quarkus-arc` feature to opt in"
+        );
+        return;
+    }
+    tracing::info!("quarkus.arc: synthetic ArC shim enabled (opt-in)");
+    register_quarkus_arc_natives_unconditional(registry);
+}
+
+/// Perform the actual native registration, ignoring the opt-in gate.
+/// Separated out so the gate lives in exactly one place and tests can
+/// exercise the registration mechanics without depending on the ambient
+/// feature/env configuration.
+fn register_quarkus_arc_natives_unconditional(registry: &mut NativeMethodRegistry) {
     let __prev_cat = registry.current_category();
     registry.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
     register_arc_facade(registry);
@@ -1225,7 +1269,9 @@ mod tests {
     #[test]
     fn register_quarkus_arc_natives_registers_all_expected_entries() {
         let mut r = NativeMethodRegistry::new();
-        register_quarkus_arc_natives(&mut r);
+        // Exercise the registration mechanics directly, independent of the
+        // opt-in gate (which is tested separately below).
+        register_quarkus_arc_natives_unconditional(&mut r);
         // Key facade entries
         assert!(r.find(CLS_ARC, "initialize", "()V").is_some());
         assert!(r
@@ -1262,6 +1308,48 @@ mod tests {
                 "()Ljakarta/enterprise/inject/Instance;"
             )
             .is_some());
+    }
+
+    #[test]
+    fn synthetic_shim_is_default_off_and_env_opt_in_enables_it() {
+        // Serialize on the shared guard: this test mutates a process-wide
+        // env var that other tests would otherwise observe.
+        let _g = state_guard().lock();
+        let prev = std::env::var("CRATONVM_SYNTHETIC_QUARKUS_ARC").ok();
+
+        // Default (no opt-in, feature not declared): registers nothing.
+        std::env::remove_var("CRATONVM_SYNTHETIC_QUARKUS_ARC");
+        if !cfg!(feature = "synthetic-quarkus-arc") {
+            assert!(
+                !synthetic_arc_opted_in(),
+                "shim must be off by default without opt-in"
+            );
+            let mut r_off = NativeMethodRegistry::new();
+            register_quarkus_arc_natives(&mut r_off);
+            assert!(
+                r_off.find(CLS_ARC, "initialize", "()V").is_none(),
+                "default path must not register the synthetic ArC shim"
+            );
+        }
+
+        // Opt-in via env var: registers the full shim.
+        std::env::set_var("CRATONVM_SYNTHETIC_QUARKUS_ARC", "1");
+        assert!(
+            synthetic_arc_opted_in(),
+            "env var must enable the synthetic shim"
+        );
+        let mut r_on = NativeMethodRegistry::new();
+        register_quarkus_arc_natives(&mut r_on);
+        assert!(
+            r_on.find(CLS_ARC, "initialize", "()V").is_some(),
+            "opt-in path must register the synthetic ArC shim"
+        );
+
+        // Restore the prior env state for sibling tests.
+        match prev {
+            Some(v) => std::env::set_var("CRATONVM_SYNTHETIC_QUARKUS_ARC", v),
+            None => std::env::remove_var("CRATONVM_SYNTHETIC_QUARKUS_ARC"),
+        }
     }
 
     #[test]

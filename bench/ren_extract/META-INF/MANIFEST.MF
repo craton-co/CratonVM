@@ -1,9 +1,0 @@
-Manifest-Version: 1.0
-Specification-Title: jdk-streams
-Specification-Version: 0.16.1
-Specification-Vendor: org.renaissance
-Implementation-Title: jdk-streams
-Implementation-Version: 0.16.1
-Implementation-Vendor: org.renaissance
-Implementation-Vendor-Id: org.renaissance
-

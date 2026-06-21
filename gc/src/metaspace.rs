@@ -251,6 +251,29 @@ pub struct Metaspace {
     pub high_water_mark: usize,
     pub next_chunk_id: u64,
     pub gc_count: u32,
+    /// Fast-path cache for the hot allocation loop.
+    ///
+    /// Maps `loader_id -> index into self.chunks` of the **first** non-free
+    /// chunk owned by that loader — i.e. the exact chunk the linear
+    /// "fit-existing" scan in [`Metaspace::allocate`] lands on first. When a
+    /// cached entry exists it is guaranteed to point at that first-owned
+    /// chunk, so the common bump-allocate case becomes O(1) instead of an
+    /// O(chunks) scan.
+    ///
+    /// Invariant maintenance (kept deliberately conservative so the fast path
+    /// is a *pure* speedup — never a different allocation result):
+    /// * only the slow fit-existing scan *sets* an entry, to the first
+    ///   owned non-free chunk it encounters (independent of whether that
+    ///   chunk has room);
+    /// * a fast-path hit leaves the entry untouched (index unchanged);
+    /// * the reuse-free and new-chunk paths *remove* the loader's entry, since
+    ///   the freshly claimed/appended chunk may not be the loader's first
+    ///   owned chunk — the next allocate re-establishes the truth via a scan;
+    /// * any structural mutation of `chunks` ([`Metaspace::free_loader_metaspace`],
+    ///   [`Metaspace::trigger_gc`]) clears the whole cache.
+    ///
+    /// Not part of the public allocation contract; purely an internal index.
+    active_chunk: FxHashMap<u64, usize>,
 }
 
 impl Metaspace {
@@ -271,6 +294,7 @@ impl Metaspace {
             high_water_mark: 0,
             next_chunk_id: 1,
             gc_count: 0,
+            active_chunk: FxHashMap::default(),
         })
     }
 
@@ -320,9 +344,46 @@ impl Metaspace {
         size: usize,
         loader_id: u64,
     ) -> Result<MetaspaceAllocation, MetaspaceError> {
-        // Try to fit into an existing chunk owned by this loader.
-        for chunk in self.chunks.iter_mut() {
+        // Fast path: bump-allocate from this loader's cached active chunk.
+        //
+        // The cache, when present, points at the first non-free chunk owned by
+        // `loader_id` — the exact chunk the linear scan below would select
+        // first. If that chunk still has room the result is byte-for-byte the
+        // same as the scan would produce, so this is a pure O(1) speedup.
+        if let Some(&idx) = self.active_chunk.get(&loader_id) {
+            if let Some(chunk) = self.chunks.get_mut(idx) {
+                // Guard against a stale entry (defence in depth — the
+                // invalidation rules below already keep this exact).
+                if chunk.owner_loader_id == loader_id && !chunk.is_free {
+                    let remaining = chunk.size - chunk.next_free_offset;
+                    if remaining >= size {
+                        let offset = chunk.next_free_offset;
+                        chunk.next_free_offset += size;
+                        chunk.used += size;
+                        self.total_used += size;
+                        if self.total_used > self.high_water_mark {
+                            self.high_water_mark = self.total_used;
+                        }
+                        return Ok(MetaspaceAllocation {
+                            chunk_id: chunk.id,
+                            offset,
+                            size,
+                        });
+                    }
+                }
+            }
+        }
+
+        // Slow path: linear "fit-existing" scan. While scanning, record the
+        // index of the first non-free chunk owned by this loader (independent
+        // of whether it has room) so the next allocation can take the fast
+        // path. This preserves the original first-fit selection exactly.
+        let mut first_owned: Option<usize> = None;
+        for (idx, chunk) in self.chunks.iter_mut().enumerate() {
             if chunk.owner_loader_id == loader_id && !chunk.is_free {
+                if first_owned.is_none() {
+                    first_owned = Some(idx);
+                }
                 let remaining = chunk.size - chunk.next_free_offset;
                 if remaining >= size {
                     let offset = chunk.next_free_offset;
@@ -332,6 +393,11 @@ impl Metaspace {
                     if self.total_used > self.high_water_mark {
                         self.high_water_mark = self.total_used;
                     }
+                    // `first_owned` is guaranteed set here (this chunk is owned
+                    // & non-free), and points at the loader's first owned chunk.
+                    if let Some(first) = first_owned {
+                        self.active_chunk.insert(loader_id, first);
+                    }
                     return Ok(MetaspaceAllocation {
                         chunk_id: chunk.id,
                         offset,
@@ -339,6 +405,11 @@ impl Metaspace {
                     });
                 }
             }
+        }
+        // No owned chunk had room. If the loader owns a first non-free chunk,
+        // cache it so a future smaller allocation can hit the fast path.
+        if let Some(first) = first_owned {
+            self.active_chunk.insert(loader_id, first);
         }
 
         // Try to reuse a free chunk that fits.
@@ -353,6 +424,10 @@ impl Metaspace {
                 if self.total_used > self.high_water_mark {
                     self.high_water_mark = self.total_used;
                 }
+                // The reclaimed chunk may sit before the loader's previously
+                // cached first-owned chunk; drop the entry so the next
+                // allocation re-derives the true first-owned index via a scan.
+                self.active_chunk.remove(&loader_id);
                 return Ok(MetaspaceAllocation {
                     chunk_id: chunk.id,
                     offset: 0,
@@ -392,6 +467,10 @@ impl Metaspace {
         if self.total_used > self.high_water_mark {
             self.high_water_mark = self.total_used;
         }
+        // A loader that already owned (full) chunks keeps them ahead of this
+        // freshly appended one, so the new chunk is not necessarily the first
+        // owned chunk. Drop the entry; the next allocation re-derives it.
+        self.active_chunk.remove(&loader_id);
 
         Ok(MetaspaceAllocation {
             chunk_id,
@@ -416,6 +495,13 @@ impl Metaspace {
         }
         self.total_used = self.total_used.saturating_sub(bytes_freed);
 
+        // Freeing chunks changes which (if any) chunk is each loader's first
+        // owned non-free chunk; drop the whole fast-path cache. (Indices are
+        // unchanged here — chunks are only flagged, not removed — but the
+        // freed loader's first-owned chunk is now gone, so a blanket clear is
+        // the simplest correct choice and freeing is far off the hot path.)
+        self.active_chunk.clear();
+
         FreedMetaspace {
             chunks_freed,
             bytes_freed,
@@ -432,6 +518,10 @@ impl Metaspace {
     pub fn trigger_gc(&mut self) -> MetaspaceGcResult {
         let start = std::time::Instant::now();
         self.gc_count += 1;
+
+        // GC removes and coalesces chunks, shifting every index; the
+        // fast-path cache (which stores `chunks` indices) is no longer valid.
+        self.active_chunk.clear();
 
         let mut bytes_reclaimed = 0usize;
         let mut chunks_freed = 0usize;
@@ -1280,5 +1370,94 @@ mod tests {
             Metaspace::new(cfg).unwrap_err(),
             MetaspaceConfigError::InvalidChunkSizes { .. }
         ));
+    }
+
+    // -- Active-chunk fast path (perf) --------------------------------------
+
+    #[test]
+    fn fast_path_bumps_same_chunk() {
+        // Repeated small allocations for one loader must keep landing in the
+        // same chunk at sequential offsets — identical to the linear scan.
+        let mut ms = Metaspace::with_default();
+        let a1 = ms.allocate(64, 1).unwrap();
+        let a2 = ms.allocate(64, 1).unwrap();
+        let a3 = ms.allocate(64, 1).unwrap();
+        assert_eq!(a1.chunk_id, a2.chunk_id);
+        assert_eq!(a2.chunk_id, a3.chunk_id);
+        assert_eq!(a1.offset, 0);
+        assert_eq!(a2.offset, 64);
+        assert_eq!(a3.offset, 128);
+        assert_eq!(ms.chunks.len(), 1);
+        assert_eq!(ms.total_used, 192);
+    }
+
+    #[test]
+    fn fast_path_picks_first_fitting_chunk_not_active() {
+        // Loader fills its first (small) chunk, spills into a second, then a
+        // tiny allocation that still fits the FIRST chunk must go there —
+        // proving the fast path falls back to first-fit, not last-active.
+        let mut cfg = MetaspaceConfig::default();
+        cfg.small_chunk_size = 256;
+        let mut ms = Metaspace::new(cfg).unwrap();
+        let a1 = ms.allocate(200, 1).unwrap(); // chunk A, offset 0, 56 left
+        let a2 = ms.allocate(200, 1).unwrap(); // A can't fit -> chunk B
+        assert_ne!(a1.chunk_id, a2.chunk_id);
+        // 32 bytes still fits chunk A's 56-byte tail; must reuse A at offset 200.
+        let a3 = ms.allocate(32, 1).unwrap();
+        assert_eq!(a3.chunk_id, a1.chunk_id);
+        assert_eq!(a3.offset, 200);
+        assert_eq!(ms.chunks.len(), 2);
+    }
+
+    #[test]
+    fn fast_path_invalidated_after_free_and_reuse() {
+        let mut cfg = MetaspaceConfig::default();
+        cfg.small_chunk_size = 4096;
+        let mut ms = Metaspace::new(cfg).unwrap();
+        ms.allocate(1024, 1).unwrap();
+        ms.free_loader_metaspace(1);
+        // Reusing the freed chunk for a new loader must still work and yield
+        // offset 0 with the cache correctly invalidated.
+        let a = ms.allocate(512, 2).unwrap();
+        assert_eq!(ms.chunks.len(), 1);
+        assert_eq!(a.offset, 0);
+        assert_eq!(ms.chunks[0].owner_loader_id, 2);
+        // Subsequent bump for loader 2 lands in the same reused chunk.
+        let b = ms.allocate(256, 2).unwrap();
+        assert_eq!(b.chunk_id, a.chunk_id);
+        assert_eq!(b.offset, 512);
+    }
+
+    #[test]
+    fn fast_path_survives_interleaved_loaders() {
+        // Interleaving two loaders must not cross-contaminate the per-loader
+        // active-chunk cache.
+        let mut ms = Metaspace::with_default();
+        let a1 = ms.allocate(64, 1).unwrap();
+        let b1 = ms.allocate(64, 2).unwrap();
+        let a2 = ms.allocate(64, 1).unwrap();
+        let b2 = ms.allocate(64, 2).unwrap();
+        assert_eq!(a1.chunk_id, a2.chunk_id);
+        assert_eq!(b1.chunk_id, b2.chunk_id);
+        assert_ne!(a1.chunk_id, b1.chunk_id);
+        assert_eq!(a2.offset, 64);
+        assert_eq!(b2.offset, 64);
+    }
+
+    #[test]
+    fn fast_path_invalidated_after_gc() {
+        // After a GC reshuffles chunk indices, allocation must still be exact.
+        let mut cfg = MetaspaceConfig::default();
+        cfg.small_chunk_size = 256;
+        let mut ms = Metaspace::new(cfg).unwrap();
+        ms.allocate(64, 1).unwrap();
+        ms.allocate(64, 2).unwrap();
+        ms.free_loader_metaspace(1);
+        ms.trigger_gc(); // removes loader 1's freed chunk, shifts indices
+                         // Loader 2's chunk survived; further allocation bumps it correctly.
+        let a = ms.allocate(64, 2).unwrap();
+        assert_eq!(a.offset, 64);
+        assert_eq!(ms.chunks.len(), 1);
+        assert_eq!(ms.chunks[0].owner_loader_id, 2);
     }
 }

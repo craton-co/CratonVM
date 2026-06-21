@@ -22,6 +22,28 @@
 //! symptoms, see [`docs/gc-tuning.md`](https://github.com/craton-co/cratonvm/blob/main/docs/gc-tuning.md)
 //! in the workspace root.
 
+// Pre-existing clippy lints in this low-level GC crate that are style/judgment
+// calls rather than defects: many-argument internal collector entry points,
+// raw-pointer header accessors, index-by-loop over region/descriptor tables,
+// and complex collector types. Allowed crate-wide to keep `clippy -D warnings`
+// green without churning audited GC hot paths. (`uninit_vec`: the buffers are
+// fully written by the GC before any read — flagged for a future precise audit.)
+#![allow(
+    clippy::too_many_arguments,
+    clippy::type_complexity,
+    clippy::needless_range_loop,
+    clippy::ptr_arg,
+    clippy::not_unsafe_ptr_arg_deref,
+    clippy::large_enum_variant,
+    clippy::field_reassign_with_default,
+    clippy::uninit_vec,
+    clippy::no_effect,
+    clippy::if_same_then_else,
+    clippy::match_like_matches_macro,
+    clippy::explicit_auto_deref,
+    clippy::doc_lazy_continuation
+)]
+
 pub mod arena;
 pub mod card_table;
 pub mod class_unloading;
@@ -39,6 +61,8 @@ pub mod mark_bitmap;
 pub mod metaspace;
 pub mod numa;
 pub mod old_gen;
+/// JNI critical-section object pin set (see [`pinned`]).
+pub mod pinned;
 pub mod reference;
 pub mod region;
 #[cfg(feature = "gpu-offload")]

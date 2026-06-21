@@ -4140,11 +4140,7 @@ mod tests {
         // the exact calculation so future rounding tweaks don't break.
         let expected = cfg.heap_size * 70 / 100;
         let actual = gc.marking_threshold_bytes();
-        let diff = if actual > expected {
-            actual - expected
-        } else {
-            expected - actual
-        };
+        let diff = actual.abs_diff(expected);
         assert!(
             diff * 100 <= expected,
             "ihop threshold {actual} deviates from {expected} by more than 1 %"

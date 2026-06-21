@@ -343,6 +343,12 @@ impl ExecutableBuffer {
     /// Allocate a new executable buffer with the given capacity.
     pub fn new(capacity: usize) -> Option<Self> {
         let ptr = platform::alloc_executable(capacity)?;
+        // Account the committed executable memory. `COMMITTED_JIT_CODE_BYTES`
+        // tracks currently-mapped code and is the quantity the code-cache cap
+        // bounds; the `try_compile` gate reads it to decide whether to keep
+        // compiling. Bumped here (not in `Drop`, which fires only on the rare
+        // free path) so the figure reflects live mappings.
+        COMMITTED_JIT_CODE_BYTES.fetch_add(capacity, std::sync::atomic::Ordering::Relaxed);
         // Register this region for code pointer validation.
         if let Ok(mut regions) = jit_code_regions().lock() {
             regions.register(ptr, capacity);
@@ -561,6 +567,103 @@ impl ExecutableBuffer {
 pub static RETAINED_JIT_CODE_BYTES: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
+// ---------------------------------------------------------------------------
+// JIT code-cache cap (bounded growth)
+// ---------------------------------------------------------------------------
+//
+// Compiled code is intentionally RETAINED for the process lifetime (see
+// `ExecutableBuffer`'s `Drop`): baked-in direct `CALL rel32` targets and cached
+// MIC/PIC entry pointers have no back-reference mechanism, so reclamation would
+// dangle them. That makes the code cache monotonically growing — a long-running
+// workload that compiles many methods (or repeatedly re-compiles via OSR /
+// deopt churn) keeps mapping new executable regions with no upper bound.
+//
+// Since safe reclamation isn't feasible here, we apply a CAP-AND-STOP policy:
+// once the retained code (committed via `ExecutableBuffer::new`) reaches the
+// cap, `try_compile` refuses further compilation and the affected methods stay
+// in the interpreter. This bounds executable-memory growth at the cost of some
+// lost throughput past the cap; correctness is unaffected because the
+// interpreter can always run any method.
+
+/// Bytes of JIT code currently committed (mapped) by live `ExecutableBuffer`s.
+///
+/// Bumped in [`ExecutableBuffer::new`] and decremented only when a region is
+/// actually returned to the OS (the `CRATONVM_JIT_FREE_CODE=1` path). Because
+/// code is normally retained for the process lifetime, this rises monotonically
+/// in the default configuration and is the quantity the code-cache cap bounds.
+/// Distinct from [`RETAINED_JIT_CODE_BYTES`], which only counts buffers whose
+/// owner was dropped (cache eviction) but whose memory was leaked.
+pub static COMMITTED_JIT_CODE_BYTES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Default code-cache cap, in bytes (256 MiB). HotSpot's default
+/// `ReservedCodeCacheSize` is ~240 MiB on 64-bit, so this is a comparable,
+/// deliberately generous bound that real workloads rarely approach.
+const DEFAULT_JIT_CODE_CACHE_CAP_BYTES: usize = 256 * 1024 * 1024;
+
+/// Number of `try_compile` calls refused because the code-cache cap was hit.
+static JIT_CODE_CACHE_CAP_REFUSALS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Set once, the first time the cap is hit, so the warning is logged exactly once.
+static JIT_CODE_CACHE_CAP_LOGGED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Configured upper bound (in bytes) on total retained JIT code.
+///
+/// Overridable via `CRATONVM_JIT_CODE_CACHE_MAX_MB` (an integer number of
+/// mebibytes); `0` disables the cap entirely (unbounded growth, the legacy
+/// behaviour). An unparseable value falls back to the default. Cached on first
+/// read so the env lookup happens at most once.
+pub fn jit_code_cache_cap_bytes() -> usize {
+    static CACHE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| match std::env::var("CRATONVM_JIT_CODE_CACHE_MAX_MB") {
+        Ok(s) => match s.trim().parse::<usize>() {
+            // `0` is an explicit "disable the cap" sentinel (treated as
+            // `usize::MAX` so the at-capacity check is always false).
+            Ok(0) => usize::MAX,
+            // Saturate the MiB→bytes multiply so a huge value can't wrap.
+            Ok(mb) => mb.saturating_mul(1024 * 1024),
+            Err(_) => DEFAULT_JIT_CODE_CACHE_CAP_BYTES,
+        },
+        Err(_) => DEFAULT_JIT_CODE_CACHE_CAP_BYTES,
+    })
+}
+
+/// Number of compilations refused so far because the code-cache cap was hit.
+/// Diagnostic only.
+pub fn jit_code_cache_cap_refusals() -> u64 {
+    JIT_CODE_CACHE_CAP_REFUSALS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Returns `true` if retained JIT code has reached the configured cap, meaning
+/// new compilation should be refused (the method stays in the interpreter).
+///
+/// We compare against `COMMITTED_JIT_CODE_BYTES`, which `ExecutableBuffer::new`
+/// bumps for every committed allocation (method bodies, OSR trampolines, deopt
+/// stubs) — the same quantity the cap is meant to bound. Logs a one-time warning
+/// the first time the cap is reached.
+fn jit_code_cache_at_capacity() -> bool {
+    let cap = jit_code_cache_cap_bytes();
+    if cap == usize::MAX {
+        return false; // cap disabled
+    }
+    let used = COMMITTED_JIT_CODE_BYTES.load(std::sync::atomic::Ordering::Relaxed);
+    if used < cap {
+        return false;
+    }
+    // At/over the cap: warn exactly once, then keep refusing silently.
+    if !JIT_CODE_CACHE_CAP_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        eprintln!(
+            "[cratonvm-jit] code-cache cap reached: {} bytes retained >= cap {} bytes; \
+             new methods will stay in the interpreter. \
+             Raise the limit with CRATONVM_JIT_CODE_CACHE_MAX_MB (0 disables it).",
+            used, cap
+        );
+    }
+    true
+}
+
 impl Drop for ExecutableBuffer {
     fn drop(&mut self) {
         if self.ptr.is_null() {
@@ -595,6 +698,9 @@ impl Drop for ExecutableBuffer {
             if let Ok(mut regions) = jit_code_regions().lock() {
                 regions.deregister(self.ptr);
             }
+            // This region is being returned to the OS, so it no longer counts
+            // against the code-cache cap.
+            COMMITTED_JIT_CODE_BYTES.fetch_sub(self.capacity, std::sync::atomic::Ordering::Relaxed);
             platform::free_executable(self.ptr, self.capacity);
             return;
         }
@@ -3990,6 +4096,19 @@ pub fn try_compile(
         &cached.method_descriptor,
     ) {
         JIT_BAIL_SHORTCIRCUITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return None;
+    }
+
+    // Code-cache cap (bounded growth). Compiled code is retained for the
+    // process lifetime with no safe reclamation path (see the cap notes near
+    // `COMMITTED_JIT_CODE_BYTES`), so once the retained code reaches the
+    // configured cap we refuse further compilation and let the method run in
+    // the interpreter. This is checked here — before any scan/IR/lowering — so
+    // a saturated cache spends no work on methods it won't emit. Not bail-
+    // listed: the refusal is capacity-driven, not a permanent backend bail, so
+    // if headroom later reappears (a region is freed) the method may compile.
+    if jit_code_cache_at_capacity() {
+        JIT_CODE_CACHE_CAP_REFUSALS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         return None;
     }
 
@@ -7778,5 +7897,66 @@ mod tests {
         let code = vec![0xb1]; // return (void)
         let r = jit_scan(&code, code.len(), "()V");
         assert!(r.is_some(), "void return must scan");
+    }
+
+    // ── JIT code-cache cap tests ────────────────────────────────────
+    //
+    // These avoid mutating `CRATONVM_JIT_CODE_CACHE_MAX_MB`: `jit_code_cache_cap_bytes`
+    // caches its value in a process-wide `OnceLock`, so an env-var test would be
+    // order-dependent and could poison the cache for the rest of the suite. We
+    // exercise the observable behaviour through `COMMITTED_JIT_CODE_BYTES` and the
+    // public accessors instead.
+
+    #[test]
+    fn code_cache_cap_default_is_nonzero_and_below_disable_sentinel() {
+        let cap = jit_code_cache_cap_bytes();
+        // Whatever the env says, a sane cap is either a real byte bound or the
+        // explicit "disabled" sentinel — never an accidental 0 that would refuse
+        // all compilation.
+        assert!(cap > 0, "cap must never be zero");
+        // The compiled-in default is a generous, finite bound.
+        assert_eq!(DEFAULT_JIT_CODE_CACHE_CAP_BYTES, 256 * 1024 * 1024);
+    }
+
+    #[test]
+    fn code_cache_not_at_capacity_when_committed_is_small() {
+        // In the test process essentially no JIT code is committed, so with any
+        // realistic cap (or the disabled sentinel) we must be under capacity and
+        // therefore still willing to compile.
+        let cap = jit_code_cache_cap_bytes();
+        if cap == usize::MAX {
+            // Cap disabled in this environment: at-capacity is unconditionally false.
+            assert!(!jit_code_cache_at_capacity());
+            return;
+        }
+        let committed = COMMITTED_JIT_CODE_BYTES.load(std::sync::atomic::Ordering::Relaxed);
+        // Sanity: the test process hasn't committed a quarter-gig of code.
+        assert!(committed < cap, "unexpectedly large committed code in test");
+        assert!(!jit_code_cache_at_capacity());
+    }
+
+    #[test]
+    fn code_cache_committed_counter_tracks_buffer_allocation() {
+        // Allocating a buffer bumps the committed counter by its capacity; the
+        // cap is enforced against exactly this quantity.
+        let before = COMMITTED_JIT_CODE_BYTES.load(std::sync::atomic::Ordering::Relaxed);
+        let buf = ExecutableBuffer::new(4096).expect("alloc failed");
+        let after = COMMITTED_JIT_CODE_BYTES.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            after >= before + 4096,
+            "committed counter must rise by at least the requested capacity"
+        );
+        // Default-config Drop leaks the region (no decrement), so the counter
+        // does not fall back here — that's the intended monotonic behaviour the
+        // cap bounds.
+        drop(buf);
+    }
+
+    #[test]
+    fn code_cache_cap_refusals_accessor_is_monotonic() {
+        // The accessor reads the global refusal counter; it never decreases.
+        let a = jit_code_cache_cap_refusals();
+        let b = jit_code_cache_cap_refusals();
+        assert!(b >= a);
     }
 }

@@ -134,13 +134,24 @@ pub fn reset_policy() {
 ///
 /// We also block the broader IPv4 link-local range (`169.254.0.0/16`)
 /// and IPv6 link-local (`fe80::/10`) when the target is an unresolved
-/// hostname that *parses* as one of those. We deliberately do NOT do
-/// DNS resolution here — that would double the latency of every
+/// hostname that *parses* as one of those. By default we deliberately do
+/// NOT do DNS resolution here — that would double the latency of every
 /// connect and create a TOCTOU window between the policy check and
 /// the actual connect. The connect site itself does the DNS work, so
 /// blocking at the literal-IP layer catches the direct-IP SSRF that
-/// guest code typically attempts; embedders that want resolution-aware
-/// policy can install their own via `set_policy`.
+/// guest code typically attempts, and `policy_connect` additionally
+/// re-vets every *resolved* `SocketAddr` it is about to dial (the
+/// always-on, TOCTOU-free DNS-alias defence). Embedders that want
+/// resolution-aware policy can install their own via `set_policy`, or
+/// opt into in-policy resolution (see below).
+///
+/// DNS-ALIAS HARDENING (2026-06-21): when the opt-in
+/// `CRATONVM_RESOLVE_OUTBOUND_HOST` env flag is engaged AND the target is a
+/// hostname (not an IP literal), the default policy resolves the name and
+/// applies the same IP block to EVERY resolved address — denying if ANY of
+/// them lands in a blocked range. This closes the DNS-alias bypass for
+/// callers that invoke `check_outbound` directly without going through
+/// `policy_connect`. Off by default (preserves the no-DNS posture above).
 ///
 /// V2 HARDENING (2026-06-10): when the opt-in `CRATONVM_BLOCK_PRIVATE_NETS`
 /// env flag is engaged, the default policy *additionally* denies loopback
@@ -155,21 +166,104 @@ pub fn reset_policy() {
 fn default_policy(target: &str) -> PolicyDecision {
     let host = host_part(target);
     if let Ok(ip) = host.parse::<IpAddr>() {
-        if is_link_local_metadata_ip(&ip) {
-            return PolicyDecision::Deny(format!(
-                "link-local cloud-metadata address {ip} is blocked by default policy"
-            ));
-        }
-        // Opt-in (CRATONVM_BLOCK_PRIVATE_NETS): also deny loopback + RFC1918
-        // private ranges so an untrusted workload can't reach internal
-        // services. Default-off; the link-local block above always runs.
-        if block_private_nets_enabled() && is_private_or_loopback_ip(&ip) {
-            return PolicyDecision::Deny(format!(
-                "private/loopback address {ip} is blocked (CRATONVM_BLOCK_PRIVATE_NETS)"
-            ));
+        return classify_ip(&ip);
+    }
+    // The host is not an IP literal — it's a hostname.
+    //
+    // DNS-ALIAS HARDENING (2026-06-21): without resolving the name, a
+    // hostname that resolves to a metadata / private IP (e.g.
+    // `metadata.google.internal` → `169.254.169.254`, or an attacker-
+    // controlled name that resolves into RFC1918) bypasses the IP-based
+    // block, since the literal-string check above never fires. When the
+    // opt-in `CRATONVM_RESOLVE_OUTBOUND_HOST` flag is engaged we resolve
+    // the name here and apply the same per-IP block to EVERY resolved
+    // address — denying if ANY of them lands in a blocked range.
+    //
+    // This is **off by default**: the env-less default deliberately does
+    // NOT resolve (see the module doc) to avoid doubling connect latency
+    // and to avoid a TOCTOU window between the policy check and the actual
+    // connect — `policy_connect` already re-vets each *resolved*
+    // `SocketAddr` it is about to dial, which is the TOCTOU-free
+    // enforcement point. The flag exists so embedders that call
+    // `check_outbound` directly (without going through `policy_connect`)
+    // can still get resolution-aware blocking from the built-in policy.
+    if resolve_outbound_host_enabled() {
+        if let Some(decision) = resolve_and_classify_host(host) {
+            return decision;
         }
     }
     PolicyDecision::Allow
+}
+
+/// Apply the built-in block ranges to a single resolved-or-literal IP.
+/// Factored out of `default_policy` so the literal-IP path and the
+/// hostname-resolution path (`resolve_and_classify_host`) share one
+/// classifier — they must stay byte-for-byte identical so a hostname alias
+/// cannot reach anything a literal IP could not.
+fn classify_ip(ip: &IpAddr) -> PolicyDecision {
+    if is_link_local_metadata_ip(ip) {
+        return PolicyDecision::Deny(format!(
+            "link-local cloud-metadata address {ip} is blocked by default policy"
+        ));
+    }
+    // Opt-in (CRATONVM_BLOCK_PRIVATE_NETS): also deny loopback + RFC1918
+    // private ranges so an untrusted workload can't reach internal
+    // services. Default-off; the link-local block above always runs.
+    if block_private_nets_enabled() && is_private_or_loopback_ip(ip) {
+        return PolicyDecision::Deny(format!(
+            "private/loopback address {ip} is blocked (CRATONVM_BLOCK_PRIVATE_NETS)"
+        ));
+    }
+    PolicyDecision::Allow
+}
+
+/// Resolve `host` (a bare hostname, no port) and apply [`classify_ip`] to
+/// every address it resolves to, returning the first `Deny` — i.e. deny if
+/// ANY resolved address is in a blocked range. Returns `None` when nothing
+/// is blocked (so the caller falls through to `Allow`), and also `None`
+/// when resolution itself fails: a name that does not resolve cannot be
+/// connected anyway, and we deliberately do not turn a transient DNS error
+/// into a policy denial (the connect site surfaces the real DNS error).
+///
+/// `host` is appended with a throwaway `:0` port so we can reuse
+/// `ToSocketAddrs`, which only resolves `host:port` shapes. The port is
+/// irrelevant — we only inspect the resolved `IpAddr`s.
+fn resolve_and_classify_host(host: &str) -> Option<PolicyDecision> {
+    let resolved = (host, 0u16).to_socket_addrs().ok()?;
+    for sa in resolved {
+        let ip = sa.ip();
+        if let PolicyDecision::Deny(reason) = classify_ip(&ip) {
+            return Some(PolicyDecision::Deny(format!(
+                "hostname {host} resolves to blocked address {ip}: {reason}"
+            )));
+        }
+    }
+    None
+}
+
+/// Cached `CRATONVM_RESOLVE_OUTBOUND_HOST` flag. Same tri-state atomic
+/// encoding and presence/`0`/`false`/`off`/`no` semantics as
+/// `block_private_nets_enabled`. Off by default so the standard policy keeps
+/// its no-DNS, low-latency, TOCTOU-free posture (resolution-aware blocking
+/// at the literal-IP layer in `policy_connect` is the always-on path).
+static RESOLVE_OUTBOUND_HOST: AtomicU64 = AtomicU64::new(0);
+
+fn resolve_outbound_host_enabled() -> bool {
+    match RESOLVE_OUTBOUND_HOST.load(Ordering::Relaxed) {
+        2 => true,
+        1 => false,
+        _ => {
+            let on = match std::env::var("CRATONVM_RESOLVE_OUTBOUND_HOST") {
+                Ok(v) => {
+                    let v = v.trim().to_ascii_lowercase();
+                    !(v.is_empty() || v == "0" || v == "false" || v == "off" || v == "no")
+                }
+                Err(_) => false,
+            };
+            RESOLVE_OUTBOUND_HOST.store(if on { 2 } else { 1 }, Ordering::Relaxed);
+            on
+        }
+    }
 }
 
 /// Cached `CRATONVM_BLOCK_PRIVATE_NETS` flag. Read once on first connect so
@@ -297,8 +391,56 @@ fn host_part(target: &str) -> &str {
 fn is_link_local_metadata_ip(ip: &IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => is_v4_link_local(v4),
-        IpAddr::V6(v6) => is_v6_link_local_or_metadata(v6),
+        IpAddr::V6(v6) => {
+            // SSRF FIX (2026-06-21): an IPv4-mapped IPv6 literal
+            // (`::ffff:a.b.c.d`) tunnels the v4 link-local block. Without
+            // unwrapping it here, `::ffff:169.254.169.254` (AWS IMDS) and
+            // `::ffff:169.254.170.2` (ECS task-role credentials) parse as
+            // `IpAddr::V6`, skip the v4 metadata check, and only reach
+            // `is_v6_link_local_or_metadata` — which matches fe80::/10 and
+            // `fd00:ec2::254` but NOT the mapped v4 range — so they reached
+            // the metadata service. Mirror `is_private_or_loopback_ip`:
+            // classify by the embedded v4 octets first. We also fold in the
+            // deprecated IPv4-compatible form (`::a.b.c.d`, RFC 4291
+            // §2.5.5.1) so that legacy representation can't slip the same
+            // block either.
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return is_v4_link_local(&v4);
+            }
+            if let Some(v4) = v6_to_ipv4_compatible(v6) {
+                return is_v4_link_local(&v4);
+            }
+            is_v6_link_local_or_metadata(v6)
+        }
     }
+}
+
+/// Unwrap the deprecated IPv4-compatible IPv6 form `::a.b.c.d` (RFC 4291
+/// §2.5.5.1): the high 96 bits are zero and the low 32 bits hold an IPv4
+/// address. `std` has `to_ipv4_mapped` for `::ffff:a.b.c.d` but no direct
+/// accessor for the compatible form (`Ipv6Addr::to_ipv4` conflates the two
+/// and also matches `::1`/`::`), so we decode it explicitly here. Returns
+/// `None` for the unspecified (`::`) and loopback (`::1`) addresses, which
+/// are not link-local v4 tunnels and must fall through to the v6 classifier.
+fn v6_to_ipv4_compatible(v6: &Ipv6Addr) -> Option<Ipv4Addr> {
+    let segs = v6.segments();
+    // High 96 bits (segments 0..=5) must all be zero for the compatible form.
+    if segs[0..6].iter().any(|&s| s != 0) {
+        return None;
+    }
+    let v4 = Ipv4Addr::new(
+        (segs[6] >> 8) as u8,
+        (segs[6] & 0xff) as u8,
+        (segs[7] >> 8) as u8,
+        (segs[7] & 0xff) as u8,
+    );
+    // Exclude `::` (0.0.0.0) and `::1` (0.0.0.1) — these are the
+    // unspecified / loopback v6 addresses, not embedded v4 link-local
+    // tunnels; let the v6 classifier handle them.
+    if v4.is_unspecified() || v4 == Ipv4Addr::new(0, 0, 0, 1) {
+        return None;
+    }
+    Some(v4)
 }
 
 fn is_v4_link_local(v4: &Ipv4Addr) -> bool {
@@ -653,5 +795,153 @@ mod tests {
         let imds: IpAddr = "169.254.169.254".parse().unwrap();
         assert!(!is_private_or_loopback_ip(&imds));
         assert!(is_link_local_metadata_ip(&imds));
+    }
+
+    /// SSRF FIX (2026-06-21): IPv4-mapped IPv6 literals must NOT bypass the
+    /// always-on cloud-metadata / link-local block. `::ffff:169.254.169.254`
+    /// (AWS IMDS) and `::ffff:169.254.170.2` (ECS task-role creds) parse as
+    /// `IpAddr::V6` but tunnel a v4 link-local address — they previously
+    /// skipped the v4 check and were allowed through.
+    #[test]
+    fn link_local_block_unwraps_ipv4_mapped_v6() {
+        let blocked = [
+            "::ffff:169.254.169.254", // AWS / GCP / Azure IMDS
+            "::ffff:169.254.170.2",   // ECS task-role credentials
+            "::ffff:169.254.0.0",     // bottom of the /16
+            "::ffff:169.254.255.255", // top of the /16
+        ];
+        for s in blocked {
+            let ip: IpAddr = s.parse().unwrap();
+            assert!(
+                is_link_local_metadata_ip(&ip),
+                "IPv4-mapped link-local must be blocked: {s}"
+            );
+        }
+        // A mapped *public* v4 address must still be allowed (no false
+        // positive that would break legitimate IPv4-mapped connects).
+        let public_mapped: IpAddr = "::ffff:8.8.8.8".parse().unwrap();
+        assert!(!is_link_local_metadata_ip(&public_mapped));
+    }
+
+    /// The deprecated IPv4-compatible form `::a.b.c.d` (RFC 4291 §2.5.5.1)
+    /// must also be unwrapped — otherwise it is a second tunnel past the v4
+    /// link-local block. `::` and `::1` must NOT be misread as embedded v4.
+    #[test]
+    fn link_local_block_unwraps_ipv4_compatible_v6() {
+        // `::169.254.169.254` — note Rust formats embedded-v4 zeros-high as a
+        // bare v6 literal, so we build it from segments to be explicit.
+        let imds_compat = Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0xa9fe, 0xa9fe);
+        assert_eq!(
+            v6_to_ipv4_compatible(&imds_compat),
+            Some(Ipv4Addr::new(169, 254, 169, 254))
+        );
+        assert!(is_link_local_metadata_ip(&IpAddr::V6(imds_compat)));
+
+        // A compatible *public* v4 (e.g. 8.8.8.8 == 0x0808:0808) is allowed.
+        let public_compat = Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0x0808, 0x0808);
+        assert_eq!(
+            v6_to_ipv4_compatible(&public_compat),
+            Some(Ipv4Addr::new(8, 8, 8, 8))
+        );
+        assert!(!is_link_local_metadata_ip(&IpAddr::V6(public_compat)));
+
+        // `::` (unspecified) and `::1` (loopback) are not v4 tunnels.
+        assert_eq!(v6_to_ipv4_compatible(&Ipv6Addr::UNSPECIFIED), None);
+        assert_eq!(v6_to_ipv4_compatible(&Ipv6Addr::LOCALHOST), None);
+        // And they must not be classified as link-local metadata.
+        assert!(!is_link_local_metadata_ip(&IpAddr::V6(
+            Ipv6Addr::UNSPECIFIED
+        )));
+        assert!(!is_link_local_metadata_ip(&IpAddr::V6(Ipv6Addr::LOCALHOST)));
+    }
+
+    /// End-to-end: the default policy denies an IPv4-mapped IMDS literal in
+    /// both bracketed-with-port and bare forms — exactly the inputs that
+    /// previously slipped through the always-on block.
+    #[test]
+    fn default_policy_denies_ipv4_mapped_metadata() {
+        assert!(matches!(
+            default_policy("[::ffff:169.254.169.254]:80"),
+            PolicyDecision::Deny(_)
+        ));
+        assert!(matches!(
+            default_policy("::ffff:169.254.170.2"),
+            PolicyDecision::Deny(_)
+        ));
+    }
+
+    /// DNS-ALIAS (2026-06-21): the per-IP classifier shared by the literal
+    /// and resolution paths must give identical verdicts — a hostname alias
+    /// can never reach anything a literal IP could not. Tested directly so
+    /// the assertion does not race the process-global env caches.
+    #[test]
+    fn classify_ip_matches_literal_policy_for_metadata() {
+        let imds: IpAddr = "169.254.169.254".parse().unwrap();
+        assert!(matches!(classify_ip(&imds), PolicyDecision::Deny(_)));
+        let ecs: IpAddr = "169.254.170.2".parse().unwrap();
+        assert!(matches!(classify_ip(&ecs), PolicyDecision::Deny(_)));
+        // IPv4-mapped metadata is blocked through the shared classifier too.
+        let mapped: IpAddr = "::ffff:169.254.169.254".parse().unwrap();
+        assert!(matches!(classify_ip(&mapped), PolicyDecision::Deny(_)));
+        // A public address passes (no false positives).
+        let public: IpAddr = "8.8.8.8".parse().unwrap();
+        assert!(matches!(classify_ip(&public), PolicyDecision::Allow));
+    }
+
+    /// DNS-ALIAS resolution plumbing, exercised offline: a *literal* IP
+    /// passed as the "host" string is resolved by `ToSocketAddrs` WITHOUT a
+    /// DNS query (it short-circuits), so we can assert the resolve+classify
+    /// machinery blocks a metadata address and passes a public one without
+    /// touching the network. This is the same path a real hostname that
+    /// resolves to these addresses would take.
+    #[test]
+    fn resolve_and_classify_blocks_metadata_offline() {
+        // 169.254.169.254 is always blocked (link-local metadata, no flag).
+        match resolve_and_classify_host("169.254.169.254") {
+            Some(PolicyDecision::Deny(msg)) => {
+                assert!(msg.contains("resolves to blocked address"), "msg={msg}");
+                assert!(msg.contains("169.254.169.254"), "msg={msg}");
+            }
+            other => panic!("expected Deny for IMDS, got {other:?}"),
+        }
+        // A public literal resolves but is not blocked → None (caller Allows).
+        assert_eq!(resolve_and_classify_host("8.8.8.8"), None);
+        // A name that cannot resolve must not become a policy denial — the
+        // connect site surfaces the real DNS error instead.
+        assert_eq!(
+            resolve_and_classify_host("invalid.invalid.this-tld-does-not-exist"),
+            None
+        );
+    }
+
+    /// IPv4-mapped metadata must also be caught on the resolution path (not
+    /// just the literal path) — `::ffff:169.254.169.254` as a resolved
+    /// address is blocked via the shared `classify_ip`. Exercised offline by
+    /// passing the literal v6 string (no DNS query).
+    #[test]
+    fn resolve_and_classify_blocks_ipv4_mapped_metadata_offline() {
+        match resolve_and_classify_host("::ffff:169.254.169.254") {
+            Some(PolicyDecision::Deny(_)) => {}
+            other => panic!("expected Deny for mapped IMDS, got {other:?}"),
+        }
+    }
+
+    /// The `CRATONVM_RESOLVE_OUTBOUND_HOST` flag parses presence and the
+    /// `0`/`false`/`off`/`no` disablers identically to the private-nets flag.
+    /// We can't flip the cached process-global atomic per-test, so assert the
+    /// parsing predicate directly via the same logic the cache uses.
+    #[test]
+    fn resolve_outbound_flag_parsing_semantics() {
+        // Mirror the disabler set the cache uses; presence (non-disabler) = on.
+        let is_on = |v: &str| {
+            let v = v.trim().to_ascii_lowercase();
+            !(v.is_empty() || v == "0" || v == "false" || v == "off" || v == "no")
+        };
+        for off in ["", " ", "0", "false", "FALSE", "Off", "no", "NO"] {
+            assert!(!is_on(off), "expected disabled for {off:?}");
+        }
+        for on in ["1", "true", "yes", "on", "anything"] {
+            assert!(is_on(on), "expected enabled for {on:?}");
+        }
     }
 }

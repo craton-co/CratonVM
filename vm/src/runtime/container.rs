@@ -290,6 +290,71 @@ pub fn effective_memory_limit(info: &ContainerInfo, config_max: usize) -> usize 
     }
 }
 
+/// Numerator of the fraction of the container memory limit used as the
+/// default maximum heap. `1/4` mirrors HotSpot's default
+/// `MaxRAMPercentage` (25%) under `-XX:+UseContainerSupport`.
+const DEFAULT_HEAP_FRACTION_NUM: u64 = 1;
+/// Denominator of [`DEFAULT_HEAP_FRACTION_NUM`].
+const DEFAULT_HEAP_FRACTION_DEN: u64 = 4;
+
+/// Upper bound on the container-derived default heap, in bytes (8 GiB).
+///
+/// Even on a very large container we do not want the *default* (un-tuned)
+/// heap to balloon arbitrarily; an explicit `-Xmx` always overrides this.
+const DEFAULT_HEAP_CAP: u64 = 8 * 1024 * 1024 * 1024;
+
+/// Lower bound on the container-derived default heap, in bytes (16 MiB).
+///
+/// Guards against pathologically small cgroup limits producing a heap so
+/// tiny the VM cannot start.
+const DEFAULT_HEAP_FLOOR: u64 = 16 * 1024 * 1024;
+
+/// Suggest a container-aware default maximum heap size, in bytes.
+///
+/// When a cgroup memory limit is present, returns a sane fraction
+/// (currently 1/4, matching HotSpot's default `MaxRAMPercentage` under
+/// `-XX:+UseContainerSupport`) of that limit, clamped to
+/// `[DEFAULT_HEAP_FLOOR, DEFAULT_HEAP_CAP]`. The clamp never raises the
+/// result above the cgroup limit itself.
+///
+/// When no cgroup memory limit is known (non-containerized, non-Linux, or
+/// "unlimited"), returns `fixed_default` unchanged — so callers get exactly
+/// today's behavior outside containers.
+///
+/// This is a *pure* suggestion: it reads only `info` and the supplied
+/// fallback and has no side effects, so it is safe to call from the heap
+/// sizer. The result is intended to be used only when the user did **not**
+/// pass an explicit `-Xmx`; an explicit maximum must still take precedence
+/// in the caller.
+///
+/// TODO(wiring): call this from the VM heap-sizing path
+/// (`VmConfig`/`vm_init.rs`) to seed `max_heap_size` when the user did not
+/// specify `-Xmx`, e.g.:
+/// `config.max_heap_size = container::suggested_default_max_heap(&info, config.max_heap_size);`
+/// guarded by "no explicit -Xmx provided". Kept separate here so this stays
+/// a behavior-preserving pure addition.
+pub fn suggested_default_max_heap(info: &ContainerInfo, fixed_default: usize) -> usize {
+    match info.memory_limit {
+        Some(limit) => {
+            // Compute fraction in u64 to avoid usize overflow on 32-bit
+            // targets and to keep the arithmetic platform-independent.
+            let fraction = limit / DEFAULT_HEAP_FRACTION_DEN * DEFAULT_HEAP_FRACTION_NUM;
+
+            // Clamp to the cap, then to the floor — but never exceed the
+            // actual cgroup limit (a tiny container must not be handed the
+            // floor if the floor is larger than the whole limit).
+            let capped = std::cmp::min(fraction, DEFAULT_HEAP_CAP);
+            let floored = std::cmp::max(capped, DEFAULT_HEAP_FLOOR);
+            let bounded = std::cmp::min(floored, limit);
+
+            // Saturate when converting to usize (e.g. a >4 GiB suggestion on
+            // a 32-bit host) so we never wrap.
+            usize::try_from(bounded).unwrap_or(usize::MAX)
+        }
+        None => fixed_default,
+    }
+}
+
 /// Return the effective number of available processors.
 ///
 /// Uses the cgroup-derived CPU count if available, otherwise falls back
@@ -413,6 +478,82 @@ mod tests {
             effective_memory_limit(&info, 512 * 1024 * 1024),
             512 * 1024 * 1024
         );
+    }
+
+    // ── suggested_default_max_heap ────────────────────────────────────
+
+    #[test]
+    fn suggested_heap_no_cgroup_returns_fixed_default() {
+        let info = ContainerInfo::non_containerized();
+        let fixed = 256 * 1024 * 1024;
+        assert_eq!(suggested_default_max_heap(&info, fixed), fixed);
+    }
+
+    #[test]
+    fn suggested_heap_quarter_of_limit() {
+        // 4 GiB container → 1/4 = 1 GiB default heap.
+        let info = ContainerInfo {
+            memory_limit: Some(4 * 1024 * 1024 * 1024),
+            ..ContainerInfo::non_containerized()
+        };
+        assert_eq!(
+            suggested_default_max_heap(&info, 256 * 1024 * 1024),
+            1024 * 1024 * 1024
+        );
+    }
+
+    #[test]
+    fn suggested_heap_capped_for_large_container() {
+        // 64 GiB container → 1/4 = 16 GiB, capped to 8 GiB.
+        let info = ContainerInfo {
+            memory_limit: Some(64 * 1024 * 1024 * 1024),
+            ..ContainerInfo::non_containerized()
+        };
+        assert_eq!(
+            suggested_default_max_heap(&info, 256 * 1024 * 1024),
+            DEFAULT_HEAP_CAP as usize
+        );
+    }
+
+    #[test]
+    fn suggested_heap_floored_but_within_limit() {
+        // 32 MiB container → 1/4 = 8 MiB, below the 16 MiB floor, but the
+        // floor must not exceed the whole 32 MiB limit, so we get 16 MiB.
+        let info = ContainerInfo {
+            memory_limit: Some(32 * 1024 * 1024),
+            ..ContainerInfo::non_containerized()
+        };
+        assert_eq!(
+            suggested_default_max_heap(&info, 256 * 1024 * 1024),
+            DEFAULT_HEAP_FLOOR as usize
+        );
+    }
+
+    #[test]
+    fn suggested_heap_tiny_container_never_exceeds_limit() {
+        // 8 MiB container: 1/4 = 2 MiB → floor would be 16 MiB, but the
+        // limit is only 8 MiB, so the suggestion must be clamped to 8 MiB.
+        let info = ContainerInfo {
+            memory_limit: Some(8 * 1024 * 1024),
+            ..ContainerInfo::non_containerized()
+        };
+        assert_eq!(
+            suggested_default_max_heap(&info, 256 * 1024 * 1024),
+            8 * 1024 * 1024
+        );
+    }
+
+    #[test]
+    fn suggested_heap_is_pure_independent_of_fixed_default_when_containerized() {
+        // The fixed default is ignored when a cgroup limit is present.
+        let info = ContainerInfo {
+            memory_limit: Some(2 * 1024 * 1024 * 1024),
+            ..ContainerInfo::non_containerized()
+        };
+        let a = suggested_default_max_heap(&info, 1);
+        let b = suggested_default_max_heap(&info, usize::MAX);
+        assert_eq!(a, b);
+        assert_eq!(a, 512 * 1024 * 1024); // 1/4 of 2 GiB
     }
 
     // ── effective_available_processors ────────────────────────────────

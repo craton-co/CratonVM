@@ -58,3 +58,6 @@ build-wt.*
 build-*.out
 check-wt.*
 build-*.log
+
+# stray developer probe output
+/dd1.out

@@ -66,7 +66,7 @@
 use std::collections::HashMap;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
 use parking_lot::{Condvar, Mutex};
@@ -249,11 +249,20 @@ struct FutureState {
 
 impl IoFutureInner {
     pub(crate) fn new_waiting() -> Arc<Self> {
-        Arc::new(Self {
+        let inner = Arc::new(Self {
             status: AtomicU8::new(STATUS_WAITING),
             state: Mutex::new(FutureState::default()),
             cv: Condvar::new(),
-        })
+        });
+        // Register in the GC-scan registry so the moving collector can root
+        // and remap every `ObjectRef` this future holds (notifier targets,
+        // attachments, and the success result) for as long as the future is
+        // reachable. The registry holds a `Weak`, so it never keeps a settled
+        // future alive — the strong owner is the handle map (and/or a live
+        // JVM object). Dead/settled-and-unreachable entries are pruned lazily
+        // on the next scan. See `gc_scan_xnio_future_roots`.
+        register_live_future(&inner);
+        inner
     }
 
     /// Attempt to transition the status from WAITING to `new_status`.
@@ -394,6 +403,122 @@ pub(crate) fn register_future(inner: Arc<IoFutureInner>) -> i64 {
 
 pub(crate) fn lookup_future(handle: i64) -> Option<Arc<IoFutureInner>> {
     registries().futures.lock().get(&handle).cloned()
+}
+
+// ---------------------------------------------------------------------------
+// GC root registry for live IoFutures
+// ---------------------------------------------------------------------------
+//
+// A pending `IoFuture` holds JVM `ObjectRef`s that are NOT otherwise reachable
+// by the collector: each `NotifierEntry.notifier` / `.attachment` and the
+// success `FutureState.result` (when it is a `Value::Object`). These live
+// inside an `Arc<IoFutureInner>` that can be handed across threads
+// (`addNotifier` on one thread, `setResult` on another) and held across
+// arbitrary VM allocations and moving-GC cycles. Without rooting they can be
+// reclaimed or relocated underneath us → UAF / wrong-notifier dispatch.
+//
+// We keep a process-global registry of `Weak<IoFutureInner>`. `Weak` (not
+// `Arc`) is deliberate: the strong owner is the handle map in `registries()`
+// (and any live JVM object whose slot carries the handle), so this registry
+// must never be the thing that keeps a future alive — otherwise a settled,
+// otherwise-unreachable future would leak forever. The GC hooks upgrade each
+// `Weak`; entries that fail to upgrade are dead and pruned in place, so the
+// registry self-cleans without a per-settle hook and stays bounded by the
+// live-future count.
+
+fn live_futures() -> &'static Mutex<Vec<Weak<IoFutureInner>>> {
+    static LIVE: OnceLock<Mutex<Vec<Weak<IoFutureInner>>>> = OnceLock::new();
+    LIVE.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// Add a freshly-created future to the GC-scan registry. Called once from
+/// `IoFutureInner::new_waiting` (the sole construction site). Opportunistically
+/// drops already-dead `Weak`s so the vector cannot grow without bound across a
+/// long-lived process that never triggers a moving GC.
+fn register_live_future(inner: &Arc<IoFutureInner>) {
+    let mut live = live_futures().lock();
+    live.retain(|w| w.strong_count() > 0);
+    live.push(Arc::downgrade(inner));
+}
+
+/// GC root scan: push every JVM `ObjectRef` held by a live, pending-or-settled
+/// `IoFuture` so the collector treats them as reachable. Companion remap is
+/// [`gc_update_xnio_future_refs`]; the two MUST visit the identical set of
+/// refs (scan/remap symmetry) or a moving GC would leave a stale pointer.
+///
+/// For each live future we push, in order:
+///   * every `NotifierEntry.notifier`,
+///   * every present, non-null `NotifierEntry.attachment`,
+///   * the `FutureState.result` ref when it is `Value::Object(Some(_))`.
+///
+/// Null refs are skipped (`ObjectRef` has no `is_null()`; null is
+/// `as_ptr().is_null()`). Dead `Weak`s are pruned in place. `parking_lot`
+/// mutexes do not poison, so no recovery dance is needed — but the locks here
+/// are leaf locks (no Java allocation happens while held), so the GC can never
+/// self-deadlock on them.
+pub fn gc_scan_xnio_future_roots(roots: &mut Vec<cratonvm_types::ObjectRef>) {
+    let mut live = live_futures().lock();
+    live.retain(|weak| {
+        let Some(inner) = weak.upgrade() else {
+            return false; // future is gone — drop the dead Weak
+        };
+        let state = inner.state.lock();
+        for entry in &state.notifiers {
+            if !entry.notifier.as_ptr().is_null() {
+                roots.push(entry.notifier);
+            }
+            if let Some(att) = entry.attachment {
+                if !att.as_ptr().is_null() {
+                    roots.push(att);
+                }
+            }
+        }
+        if let Some(Value::Object(Some(r))) = state.result {
+            if !r.as_ptr().is_null() {
+                roots.push(r);
+            }
+        }
+        true
+    });
+}
+
+/// Post-move remap (companion to [`gc_scan_xnio_future_roots`]). After a moving
+/// collection relocates objects, rewrite every `ObjectRef` held by a live
+/// future to its new address via `map`. Visits the IDENTICAL set of refs the
+/// scan reports, so no live root is missed and every moved ref is repointed.
+///
+/// `map` is keyed by old address (`as_ptr() as usize`) → new address. A ref not
+/// present in `map` did not move and is left untouched. Dead `Weak`s are pruned.
+pub fn gc_update_xnio_future_refs(map: &std::collections::HashMap<usize, usize>) {
+    if map.is_empty() {
+        return;
+    }
+    let remap = |slot: &mut ObjectRef| {
+        let old = slot.as_ptr() as usize;
+        if let Some(&new) = map.get(&old) {
+            debug_assert!(new != 0, "GC pointer map contains null address");
+            // SAFETY: `new` is a live, 8-byte-aligned heap address produced by
+            // the moving collector for the object previously at `old`.
+            *slot = unsafe { ObjectRef::from_raw(new as *mut u8) };
+        }
+    };
+    let mut live = live_futures().lock();
+    live.retain(|weak| {
+        let Some(inner) = weak.upgrade() else {
+            return false;
+        };
+        let mut state = inner.state.lock();
+        for entry in &mut state.notifiers {
+            remap(&mut entry.notifier);
+            if let Some(att) = entry.attachment.as_mut() {
+                remap(att);
+            }
+        }
+        if let Some(Value::Object(Some(r))) = state.result.as_mut() {
+            remap(r);
+        }
+        true
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -2168,5 +2293,147 @@ mod tests {
         .unwrap();
         // Bool is encoded as Int(0/1).
         assert_eq!(got, Value::Int(1));
+    }
+
+    // ------------------------------------------------------------------
+    // GC root scan / remap (UAF fix).
+    //
+    // The registry is process-global and shared with the other tests
+    // (which may run in parallel), so these assertions check *containment*
+    // of the specific refs under test, never exact registry-wide counts.
+    // ------------------------------------------------------------------
+
+    fn ptr_of(r: ObjectRef) -> usize {
+        r.as_ptr() as usize
+    }
+
+    #[test]
+    fn t19_7_e_gc_scan_reports_pending_notifier_and_attachment() {
+        let mut ctx = mock_ctx();
+        let (_fr, fut) = new_future(&mut ctx);
+        let notifier = alloc_concurrent_synthetic(&mut ctx, "org/xnio/IoFuture$Notifier", 1);
+        let attachment = ctx.create_string("att");
+        // addNotifier while WAITING stashes (notifier, attachment).
+        native_iof_add_notifier(
+            &mut ctx,
+            &[
+                Value::Object(Some(fut)),
+                Value::Object(Some(notifier)),
+                Value::Object(Some(attachment)),
+            ],
+        )
+        .unwrap();
+
+        let mut roots = Vec::new();
+        gc_scan_xnio_future_roots(&mut roots);
+        let addrs: Vec<usize> = roots.iter().map(|r| ptr_of(*r)).collect();
+        assert!(
+            addrs.contains(&ptr_of(notifier)),
+            "scan must root the pending notifier"
+        );
+        assert!(
+            addrs.contains(&ptr_of(attachment)),
+            "scan must root the notifier attachment"
+        );
+    }
+
+    #[test]
+    fn t19_7_e_gc_scan_reports_object_result_after_set() {
+        let mut ctx = mock_ctx();
+        let (fr, _fut) = new_future(&mut ctx);
+        let result = ctx.create_string("payload");
+        native_future_result_set_result(
+            &mut ctx,
+            &[Value::Object(Some(fr)), Value::Object(Some(result))],
+        )
+        .unwrap();
+
+        let mut roots = Vec::new();
+        gc_scan_xnio_future_roots(&mut roots);
+        let addrs: Vec<usize> = roots.iter().map(|r| ptr_of(*r)).collect();
+        assert!(
+            addrs.contains(&ptr_of(result)),
+            "scan must root the settled Object result (held until get())"
+        );
+    }
+
+    #[test]
+    fn t19_7_e_gc_remap_repoints_notifier_attachment_and_result() {
+        let mut ctx = mock_ctx();
+        let (fr, fut) = new_future(&mut ctx);
+        let notifier = alloc_concurrent_synthetic(&mut ctx, "org/xnio/IoFuture$Notifier", 1);
+        let attachment = ctx.create_string("att");
+        native_iof_add_notifier(
+            &mut ctx,
+            &[
+                Value::Object(Some(fut)),
+                Value::Object(Some(notifier)),
+                Value::Object(Some(attachment)),
+            ],
+        )
+        .unwrap();
+        let result = ctx.create_string("payload");
+        native_future_result_set_result(
+            &mut ctx,
+            &[Value::Object(Some(fr)), Value::Object(Some(result))],
+        )
+        .unwrap();
+
+        // Fabricate fresh, 8-byte-aligned destination addresses. The refs are
+        // never dereferenced here — we only assert the stored pointer flipped.
+        let new_notifier = 0x4000usize;
+        let new_attachment = 0x5000usize;
+        let new_result = 0x6000usize;
+        let mut map = std::collections::HashMap::new();
+        map.insert(ptr_of(notifier), new_notifier);
+        map.insert(ptr_of(attachment), new_attachment);
+        map.insert(ptr_of(result), new_result);
+
+        gc_update_xnio_future_refs(&map);
+
+        // Reach the inner directly and confirm the stored refs were repointed.
+        let inner = inner_from_future(&ctx, fut).unwrap();
+        let state = inner.state.lock();
+        // setResult drains notifiers, so the result ref is the live one to check.
+        assert_eq!(
+            state.result.map(|v| match v {
+                Value::Object(Some(r)) => ptr_of(r),
+                _ => 0,
+            }),
+            Some(new_result),
+            "result ref must be remapped to its new address"
+        );
+        // A post-settle scan must now report the remapped result address and
+        // none of the stale ones (scan/remap symmetry).
+        drop(state);
+        let mut roots = Vec::new();
+        gc_scan_xnio_future_roots(&mut roots);
+        let addrs: Vec<usize> = roots.iter().map(|r| ptr_of(*r)).collect();
+        assert!(addrs.contains(&new_result), "scan sees remapped result");
+        assert!(
+            !addrs.contains(&ptr_of(result)),
+            "stale pre-move result address must not survive"
+        );
+    }
+
+    #[test]
+    fn t19_7_e_gc_remap_empty_map_is_noop() {
+        let mut ctx = mock_ctx();
+        let (fr, _fut) = new_future(&mut ctx);
+        let result = ctx.create_string("payload");
+        native_future_result_set_result(
+            &mut ctx,
+            &[Value::Object(Some(fr)), Value::Object(Some(result))],
+        )
+        .unwrap();
+        // Empty pointer map → no relocation happened → refs unchanged.
+        gc_update_xnio_future_refs(&std::collections::HashMap::new());
+        let mut roots = Vec::new();
+        gc_scan_xnio_future_roots(&mut roots);
+        let addrs: Vec<usize> = roots.iter().map(|r| ptr_of(*r)).collect();
+        assert!(
+            addrs.contains(&ptr_of(result)),
+            "empty remap leaves the result ref untouched"
+        );
     }
 }

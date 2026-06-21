@@ -7,7 +7,7 @@
 //! deoptimization management, and inline caching to bridge
 //! compiled native code with the bytecode interpreter.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -459,17 +459,33 @@ pub struct DeoptStats {
 pub struct DeoptimizationManager {
     pub deopt_count: u64,
     pub recompilation_queue: Vec<RecompilationRequest>,
-    pub deopt_history: Vec<DeoptEvent>,
+    /// Bounded ring of recent events (oldest trimmed once it exceeds
+    /// `MAX_DEOPT_HISTORY`). Purely diagnostic — no decision reads its length,
+    /// so trimming never affects observable deopt behavior.
+    pub deopt_history: VecDeque<DeoptEvent>,
+    /// O(1) per-method deopt counter driving blacklist/recompile decisions.
+    /// Never trimmed, so decisions are independent of `deopt_history` bounding.
+    deopt_count_by_method: FxHashMap<u64, u32>,
+    /// Incrementally maintained per-reason tally for `get_stats` (avoids a full
+    /// `deopt_history` rescan and survives history trimming).
+    deopt_count_by_reason: FxHashMap<String, u64>,
     pub max_deopts_before_blacklist: u32,
     pub blacklisted_methods: FxHashSet<u64>,
 }
+
+/// Upper bound on retained deopt events. Older events are dropped from the
+/// front once this is exceeded; decision counters are kept separately and are
+/// unaffected by trimming.
+const MAX_DEOPT_HISTORY: usize = 4096;
 
 impl DeoptimizationManager {
     pub fn new() -> Self {
         Self {
             deopt_count: 0,
             recompilation_queue: Vec::new(),
-            deopt_history: Vec::new(),
+            deopt_history: VecDeque::new(),
+            deopt_count_by_method: FxHashMap::default(),
+            deopt_count_by_reason: FxHashMap::default(),
             max_deopts_before_blacklist: 10,
             blacklisted_methods: FxHashSet::default(),
         }
@@ -479,17 +495,36 @@ impl DeoptimizationManager {
     pub fn record_deopt(&mut self, event: DeoptEvent) -> DeoptAction {
         let method_id = event.method_id;
         self.deopt_count += 1;
-        self.deopt_history.push(event.clone());
+
+        // Maintain the per-reason tally incrementally so get_stats() is O(1)
+        // per reason rather than an O(history) rescan, and so it stays accurate
+        // after the bounded history trims old events below.
+        *self
+            .deopt_count_by_reason
+            .entry(event.reason.as_str().to_string())
+            .or_insert(0) += 1;
+
+        // Bounded ring: drop the oldest event once the cap is exceeded. Only
+        // the diagnostic history is trimmed — the decision counters below are
+        // kept separately and never trimmed, so behavior is unchanged.
+        self.deopt_history.push_back(event.clone());
+        if self.deopt_history.len() > MAX_DEOPT_HISTORY {
+            self.deopt_history.pop_front();
+        }
+
+        // O(1) per-method counter replaces the former O(n) history rescan.
+        // Counted whether or not the method is already blacklisted, matching
+        // the prior behavior where the just-pushed event was always included
+        // in the linear count.
+        let method_deopts = {
+            let c = self.deopt_count_by_method.entry(method_id).or_insert(0);
+            *c += 1;
+            *c
+        };
 
         if self.blacklisted_methods.contains(&method_id) {
             return DeoptAction::InterpretForever;
         }
-
-        let method_deopts = self
-            .deopt_history
-            .iter()
-            .filter(|e| e.method_id == method_id)
-            .count() as u32;
 
         if method_deopts >= self.max_deopts_before_blacklist {
             self.blacklisted_methods.insert(method_id);
@@ -530,15 +565,13 @@ impl DeoptimizationManager {
     }
 
     pub fn get_stats(&self) -> DeoptStats {
-        let mut by_reason: FxHashMap<String, u64> = FxHashMap::default();
-        for e in &self.deopt_history {
-            *by_reason.entry(e.reason.as_str().to_string()).or_insert(0) += 1;
-        }
         DeoptStats {
             total_deopts: self.deopt_count,
             recompilations: self.recompilation_queue.len() as u64,
             blacklisted: self.blacklisted_methods.len(),
-            by_reason,
+            // Incrementally maintained, so this reflects every recorded deopt
+            // even after the bounded history has trimmed old events.
+            by_reason: self.deopt_count_by_reason.clone(),
         }
     }
 }
@@ -1304,6 +1337,41 @@ mod tests {
         mgr.register_osr(1, 10, e2);
         assert_eq!(mgr.osr_count(), 1);
         assert_eq!(mgr.lookup_osr(1, 10).unwrap().compiled_entry_point, 0x2000);
+    }
+
+    #[test]
+    fn deopt_history_is_bounded() {
+        let mut mgr = DeoptimizationManager::new();
+        let n = (MAX_DEOPT_HISTORY as u64) + 100;
+        for i in 0..n {
+            mgr.record_deopt(DeoptEvent {
+                method_id: i, // distinct ids so none is blacklisted
+                reason: DeoptReason::NullCheck,
+                bci: 0,
+                timestamp: i,
+            });
+        }
+        // History is capped, but the running total still counts every event.
+        assert_eq!(mgr.deopt_history.len(), MAX_DEOPT_HISTORY);
+        assert_eq!(mgr.deopt_count, n);
+        // Per-reason stats survive history trimming (not a rescan of history).
+        assert_eq!(*mgr.get_stats().by_reason.get("NullCheck").unwrap(), n);
+    }
+
+    #[test]
+    fn deopt_decision_independent_of_history_trim() {
+        // Even after the bounded history has churned past its cap on other
+        // methods, the per-method counter still blacklists at the threshold.
+        let mut mgr = DeoptimizationManager::new();
+        for i in 0..(MAX_DEOPT_HISTORY as u64 + 50) {
+            mgr.record_deopt(DeoptEvent {
+                method_id: 7, // same id every time → must blacklist at 10
+                reason: DeoptReason::ClassCheck,
+                bci: 0,
+                timestamp: i,
+            });
+        }
+        assert!(mgr.is_blacklisted(7));
     }
 
     #[test]

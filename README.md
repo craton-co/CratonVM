@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/craton-co/cratonvm/actions/workflows/ci.yml/badge.svg)](https://github.com/craton-co/cratonvm/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
-[![Rust](https://img.shields.io/badge/rust-1.77%2B-orange.svg)](https://www.rust-lang.org/)
+[![Rust](https://img.shields.io/badge/rust-1.80%2B-orange.svg)](https://www.rust-lang.org/)
 
 A Java Virtual Machine written entirely in Rust with a custom x86-64 JIT compiler.
 
@@ -171,7 +171,7 @@ cargo run --release -p cratonvm-cli -- --Xmx 1g --classpath . BigProgram
 
 ## Building from Source
 
-Requires **Rust 1.77+** and optionally **JDK 17+** (for compiling test Java classes).
+Requires **Rust 1.80+** and optionally **JDK 17+** (for compiling test Java classes).
 
 ```bash
 git clone https://github.com/craton-co/cratonvm.git
@@ -216,7 +216,7 @@ cargo fmt --all --check
 
 ## Architecture
 
-The workspace has 17 member crates plus a `fuzz` harness (18 Cargo.toml files in total):
+The workspace has 19 member crates (the `fuzz` harness is a separate, standalone workspace, not a member):
 
 ```
 cratonvm/
@@ -237,7 +237,9 @@ cratonvm/
   jfr/                 - Java Flight Recorder
   vm/                  - Virtual machine runtime
   vm-cli/              - Command-line entry point
-  fuzz/                - libfuzzer harness (workspace member, nightly-only)
+  libcratonvm/         - C-ABI shared library for embedding (cdylib/staticlib libjvm substitute)
+  cratonvm-embed/      - Semver-stable Rust facade for embedding CratonVM
+  fuzz/                - libfuzzer harness (separate workspace, nightly-only)
 ```
 
 - **Bytecode interpreter** — fast-path dispatch with 140+ opcodes

@@ -23,24 +23,30 @@ const ARRAY_LENGTH_OFFSET: usize = 12;
 
 /// Runtime helpers for the intrinsic tests. The fill/equals intrinsics emit
 /// no `CALL` on the success path; the ONLY helper they can reach is
-/// `bastore`, invoked by the shared null-check stub when `Arrays.fill` is
-/// handed a null array. We wire that to a benign no-op so the null test
-/// observes the deopt sentinel (`i64::MIN`) rather than panicking.
+/// `jit_npe_with_action`, invoked by the shared null-check stub
+/// (`emit_null_check_store_stubs` in `x64.rs`) when `Arrays.fill` is handed a
+/// null array — the stub sets `JIT_PENDING_NPE` + the JEP-358 action code, then
+/// loads the `i64::MIN` deopt sentinel and runs the epilogue. We wire that to a
+/// benign no-op so the null test observes the deopt sentinel rather than
+/// panicking. (Historically the stub triggered the NPE via a `bastore` to the
+/// zeroed array arg; it now calls the dedicated `jit_npe_with_action` helper for
+/// JEP-358 helpful messages.)
 fn arrays_helpers() -> JitRuntimeHelpers {
     unsafe extern "C" fn stub() {
         panic!("ARRAYS_OPS intrinsic test invoked an unexpected runtime helper");
     }
-    // No-op bastore: the null-check stub zeroes the array arg then calls
-    // this; a real `jit_bastore` would set JIT_PENDING_NPE. For the test we
-    // only need it to return without crashing.
-    unsafe extern "C" fn noop_bastore() {}
+    // No-op jit_npe_with_action: the shared null-check stub calls this with the
+    // JEP-358 action code, then loads `i64::MIN` and runs the epilogue. The real
+    // helper sets JIT_PENDING_NPE; for the test we only need it to return without
+    // crashing so the call yields the deopt sentinel.
+    unsafe extern "C" fn noop_npe_with_action() {}
     let s = stub as *const () as usize;
     JitRuntimeHelpers {
         newarray: s,
         new_object: s,
         anewarray_object: s,
         baload: s,
-        bastore: noop_bastore as *const () as usize,
+        bastore: s,
         iaload: s,
         iastore: s,
         aaload: s,
@@ -77,7 +83,7 @@ fn arrays_helpers() -> JitRuntimeHelpers {
         frame_record: 0,
         shadow_stack_offset_in_thread: 0,
         throw_exception: s,
-        jit_npe_with_action: s,
+        jit_npe_with_action: noop_npe_with_action as *const () as usize,
     }
 }
 

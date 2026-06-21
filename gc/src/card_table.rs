@@ -407,8 +407,8 @@ impl CardTable {
     /// Clamps the result to `base_addr + region_size`.
     pub fn card_end_addr(&self, card_index: usize) -> usize {
         let next_index = card_index.saturating_add(1);
-        let offset = next_index.checked_mul(CARD_SIZE).unwrap_or(usize::MAX);
-        let end = self.base_addr.checked_add(offset).unwrap_or(usize::MAX);
+        let offset = next_index.saturating_mul(CARD_SIZE);
+        let end = self.base_addr.saturating_add(offset);
         let region_end = self.base_addr.saturating_add(self.region_size);
         end.min(region_end)
     }

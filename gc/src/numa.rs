@@ -145,7 +145,7 @@ impl NumaTopology {
     /// Returns 0 if the CPU is unknown.
     pub fn node_of_cpu(&self, cpu: u32) -> usize {
         for (idx, cpus) in self.node_cpus.iter().enumerate() {
-            if cpus.iter().any(|&c| c == cpu) {
+            if cpus.contains(&cpu) {
                 return idx;
             }
         }
@@ -661,7 +661,7 @@ impl StringDeduplicator {
             age: 0,
         };
         self.next_backing_id += 1;
-        self.table.entry(hash).or_insert_with(Vec::new).push(entry);
+        self.table.entry(hash).or_default().push(entry);
         self.stats.table_entries += 1;
         self.stats.table_size = self.table.len();
         self.stats.update_ratio();

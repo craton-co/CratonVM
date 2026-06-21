@@ -81,6 +81,7 @@ use crate::heap::{
     array_data_size, read_prim_element, write_prim_element, ArrayElementType, ObjectHeader,
     ObjectKind, GC_FLAG_MARKED, HEADER_SIZE, SLOT_SIZE,
 };
+use crate::reference::{ReferenceProcessingResult, ReferenceProcessor, ReferenceType};
 use cratonvm_types::{ClassId, ObjectRef, Value};
 
 // ---------------------------------------------------------------------------
@@ -1407,6 +1408,17 @@ pub struct ZgcRealHeap {
     gc_threshold: usize,
     /// Lifetime collection counter (observability).
     gc_count: AtomicUsize,
+    /// Shared `java.lang.ref` reference processor.
+    ///
+    /// Weak/soft/phantom/cleaner/finalizer references discovered on this
+    /// backend are registered here (via [`Self::discover_reference`]) and
+    /// processed at the end of every [`Self::collect_garbage`] cycle by the
+    /// *same* [`ReferenceProcessor`] the generational and G1 collectors use —
+    /// the canonical HotSpot-ordered clearing/enqueue path in
+    /// `gc::reference`. This closes the gap where the ZGC-backed heap performed
+    /// NO reference processing, so finalizers/cleaners and `WeakReference`
+    /// semantics silently broke under this collector.
+    ref_processor: Mutex<ReferenceProcessor>,
 }
 
 // SAFETY: identical argument to `Heap`/`G1Collector` (heap.rs:143). The only
@@ -1434,7 +1446,32 @@ impl ZgcRealHeap {
             allocated: AtomicUsize::new(0),
             gc_threshold: cap * ZGC_REAL_GC_THRESHOLD_PERCENT / 100,
             gc_count: AtomicUsize::new(0),
+            ref_processor: Mutex::new(ReferenceProcessor::new()),
         }
+    }
+
+    /// Register a discovered `java.lang.ref.Reference` with this heap's shared
+    /// [`ReferenceProcessor`].
+    ///
+    /// The runtime calls this during marking (the same point the generational
+    /// and G1 backends discover references) so the next
+    /// [`Self::collect_garbage`] can clear/enqueue it per Java semantics.
+    /// `reference_obj` is the address of the `Reference` object, `referent`
+    /// the object it points at, and `queue` the associated `ReferenceQueue`
+    /// (if any).
+    pub fn discover_reference(
+        &self,
+        ref_type: ReferenceType,
+        reference_obj: ObjectRef,
+        referent: ObjectRef,
+        queue: Option<ObjectRef>,
+    ) {
+        self.ref_processor.lock().discover_reference(
+            ref_type,
+            reference_obj.as_ptr() as usize,
+            referent.as_ptr() as usize,
+            queue.map(|q| q.as_ptr() as usize),
+        );
     }
 
     /// Number of collections performed so far.
@@ -1551,6 +1588,89 @@ impl ZgcRealHeap {
             return None;
         }
         Some(num_slots)
+    }
+
+    /// True iff the object at `base` carries the [`GC_FLAG_MARKED`] bit set by
+    /// the current cycle's mark phase. `base == 0` (null) is treated as not
+    /// live. Used as the `is_marked` predicate handed to the shared
+    /// [`ReferenceProcessor`] so weak/soft/phantom clearing observes the exact
+    /// liveness the trace computed.
+    fn is_marked_addr(&self, base: usize) -> bool {
+        if base == 0 {
+            return false;
+        }
+        // SAFETY: every address reachable here is either a registered live
+        // allocation base (whose first HEADER_SIZE bytes are a valid header)
+        // or null (handled above). Reference referents/objects discovered for
+        // this heap are always such bases.
+        let header = self.header_mut(base as *mut u8);
+        header.gc_flags & GC_FLAG_MARKED != 0
+    }
+
+    /// Run the shared [`ReferenceProcessor`] against the just-completed mark.
+    ///
+    /// Called by [`Self::collect_garbage`] AFTER the mark phase has set the
+    /// [`GC_FLAG_MARKED`] bits but BEFORE the sweep clears them and reclaims
+    /// dead objects, so the `is_marked` snapshot is exactly the live set the
+    /// trace computed and any still-live `Reference` object can have its
+    /// referent field nulled in place.
+    ///
+    /// This is the SAME `gc::reference` path the generational and G1 backends
+    /// drive (HotSpot ordering: soft → weak → final → phantom); it is invoked
+    /// here, not reimplemented. Clearing nulls field 0 (the `referent`) of each
+    /// soft/weak `Reference` whose referent died, mirroring the VM-level
+    /// `process_references_after_gc` writer.
+    ///
+    /// Residual (documented, out of scope for this non-moving STW backend):
+    /// (a) discovery is caller-driven via [`Self::discover_reference`]; this
+    /// method does not itself scan the heap for `Reference` subclasses — that
+    /// classification needs class-layout knowledge the GC layer intentionally
+    /// does not own. (b) enqueue/finalize actions are surfaced in the returned
+    /// [`ReferenceProcessingResult`] for the runtime to drain; the GC does not
+    /// run finalizers. (c) `free_heap_mb` for the soft-ref LRU policy is
+    /// approximated from outstanding allocation against the threshold.
+    fn process_references(&self) -> ReferenceProcessingResult {
+        // Approximate free heap (MB) for the SoftReference LRU policy: bytes
+        // below the GC trigger threshold that are not currently outstanding.
+        let free_bytes = self
+            .gc_threshold
+            .saturating_sub(self.allocated.load(Ordering::Relaxed));
+        let free_mb = free_bytes / (1024 * 1024);
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+
+        let mut rp = self.ref_processor.lock();
+        let is_marked = |addr: usize| self.is_marked_addr(addr);
+        let result = rp.process_references(&is_marked, free_mb, now_ms);
+
+        // Null the referent (field 0) of every soft/weak Reference whose
+        // referent was cleared this cycle. Each is emitted EXACTLY ONCE (the
+        // processor flags `clear_emitted`), matching the VM-level writer and
+        // avoiding the recycled-address corruption documented in
+        // `gc::reference`.
+        for ref_obj in rp.take_newly_cleared() {
+            // The Reference object must itself be live (marked) to write into;
+            // a dead Reference is about to be swept, so skip it.
+            if self.is_marked_addr(ref_obj) {
+                self.set_field(
+                    // SAFETY: `ref_obj` is a registered live allocation base.
+                    unsafe { ObjectRef::from_raw(ref_obj as *mut u8) },
+                    0,
+                    Value::Object(None),
+                );
+            }
+        }
+
+        // Drop bookkeeping for Reference objects that did not survive this
+        // cycle so the registry does not grow without bound and stale indices
+        // are rebuilt. (Non-moving: addresses are stable, so no
+        // `update_after_gc` relocation is needed.)
+        let is_live = |addr: usize| self.is_marked_addr(addr);
+        rp.remove_collected(&is_live);
+
+        result
     }
 }
 
@@ -1774,6 +1894,33 @@ impl GarbageCollector for ZgcRealHeap {
             }
             header.gc_flags |= GC_FLAG_MARKED;
             self.enumerate_references(addr as *mut u8, &mut work);
+        }
+
+        // ---- Reference processing ---------------------------------------
+        // Run the shared `gc::reference` processor while the mark bits still
+        // reflect this cycle's live set (sweep clears them below). This
+        // clears/enqueues weak/soft/phantom/cleaner/finalizer references per
+        // HotSpot ordering — without it, finalizers/cleaners and
+        // `WeakReference` semantics silently broke under this backend. The
+        // enqueue/finalize actions are surfaced for the runtime to drain; the
+        // referent-null writes are applied in place here.
+        let ref_result = self.process_references();
+        if !ref_result.to_enqueue.is_empty()
+            || !ref_result.to_finalize.is_empty()
+            || !ref_result.cleaner_actions.is_empty()
+        {
+            // The non-moving STW GC clears referents in place but does not run
+            // finalizers or notify ReferenceQueues itself — that is the
+            // runtime's job (cf. interpreter `process_references_after_gc`).
+            // Surface the pending work so it is observable rather than silently
+            // dropped when this backend is driven directly via the trait.
+            tracing::debug!(
+                target: "zgc",
+                to_enqueue = ref_result.to_enqueue.len(),
+                to_finalize = ref_result.to_finalize.len(),
+                cleaner_actions = ref_result.cleaner_actions.len(),
+                "zgc real: reference processing produced pending enqueue/finalize/cleaner work"
+            );
         }
 
         // ---- Sweep phase -------------------------------------------------
@@ -2719,5 +2866,68 @@ mod tests {
             heap.alloc_object(ClassId::new(1), 8);
         }
         assert!(heap.needs_gc());
+    }
+
+    // -- Reference processing under the ZGC-backed heap --------------------
+
+    #[test]
+    fn real_weak_ref_cleared_when_referent_dies() {
+        let heap = ZgcRealHeap::new();
+        // A live Reference object (field 0 = referent) and a referent that
+        // becomes unreachable after we drop it from the roots.
+        let weak = heap.alloc_object(ClassId::new(1), 1);
+        let referent = heap.alloc_object(ClassId::new(2), 0);
+        heap.set_field(weak, 0, Value::Object(Some(referent)));
+        heap.discover_reference(ReferenceType::Weak, weak, referent, None);
+
+        let stw = StopTheWorldToken::new();
+        // Root only the Reference object; the referent is otherwise dead.
+        let mut roots = [weak];
+        heap.collect_garbage(&stw, &mut roots, &NoMonitors);
+
+        // The weak reference's referent (field 0) must be nulled in place.
+        assert_eq!(heap.get_field(weak, 0), Value::Object(None));
+    }
+
+    #[test]
+    fn real_weak_ref_kept_when_referent_live() {
+        let heap = ZgcRealHeap::new();
+        let weak = heap.alloc_object(ClassId::new(1), 1);
+        let referent = heap.alloc_object(ClassId::new(2), 0);
+        heap.set_field(weak, 0, Value::Object(Some(referent)));
+        heap.discover_reference(ReferenceType::Weak, weak, referent, None);
+
+        let stw = StopTheWorldToken::new();
+        // Root both: the referent stays strongly reachable, so the weak ref
+        // must NOT be cleared.
+        let mut roots = [weak, referent];
+        heap.collect_garbage(&stw, &mut roots, &NoMonitors);
+
+        match heap.get_field(weak, 0) {
+            Value::Object(Some(r)) => assert_eq!(r.as_ptr(), referent.as_ptr()),
+            other => panic!("weak referent must survive, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn real_phantom_ref_enqueued_but_not_cleared() {
+        let heap = ZgcRealHeap::new();
+        let queue = heap.alloc_object(ClassId::new(9), 0);
+        let phantom = heap.alloc_object(ClassId::new(1), 1);
+        let referent = heap.alloc_object(ClassId::new(2), 0);
+        heap.set_field(phantom, 0, Value::Object(Some(referent)));
+        heap.discover_reference(ReferenceType::Phantom, phantom, referent, Some(queue));
+
+        let stw = StopTheWorldToken::new();
+        // Root the phantom Reference and its queue; the referent is dead.
+        let mut roots = [phantom, queue];
+        heap.collect_garbage(&stw, &mut roots, &NoMonitors);
+
+        // Java 9+: a phantom reference's referent field is NOT nulled by the
+        // collector, so field 0 still points at the (now-dead) referent.
+        match heap.get_field(phantom, 0) {
+            Value::Object(Some(r)) => assert_eq!(r.as_ptr(), referent.as_ptr()),
+            other => panic!("phantom referent must not be cleared, got {other:?}"),
+        }
     }
 }

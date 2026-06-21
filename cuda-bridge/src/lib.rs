@@ -247,12 +247,39 @@ fn intern_kernel_name(name: &str) -> &'static str {
     leaked
 }
 
+/// Mint a process-unique PTX module name.
+///
+/// cudarc registers each loaded module in a per-device/per-context map
+/// keyed by the name handed to `load_ptx`, and resolves kernels by that
+/// same key. A constant name therefore makes every `DeviceModule` alias
+/// the same map slot, so a later load silently overwrites an earlier one.
+/// A monotonic counter guarantees every load gets its own slot; `u64`
+/// never wraps in practice (one load per nanosecond for ~585 years), so a
+/// plain `fetch_add` with no overflow handling is sufficient.
+fn next_module_name() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("cratonvm_mod_{n}")
+}
+
 /// A loaded PTX module containing one or more named kernel entry points.
 pub struct DeviceModule(backend::DeviceModuleInner);
 
 impl DeviceModule {
     /// Load a PTX text module and resolve the named kernels.
+    ///
+    /// AUDIT 2026-06-21 (FINDING — unique module name): the module name
+    /// previously passed to the backend was the constant `"module"`.
+    /// cudarc keys its per-device/per-context module map by that name, so a
+    /// second `DeviceModule` loaded with the same constant clobbered the
+    /// first — kernels in module B would resolve against module A's PTX (or
+    /// fail outright). Each load now mints a process-unique name via a
+    /// monotonic counter ([`next_module_name`]); the backend retains it in
+    /// `DeviceModuleInner::module_name` so subsequent `get_func` lookups
+    /// stay consistent and multiple modules coexist.
     pub fn from_ptx(ctx: &DeviceContext, ptx: &str, kernel_names: &[&str]) -> Result<Self> {
+        let module_name = next_module_name();
         // cudarc 0.13's `CudaDevice::load_ptx` keeps the kernel-name
         // slice alive for the lifetime of the loaded module, so the
         // backend requires `&[&'static str]`. The public surface stays
@@ -271,11 +298,11 @@ impl DeviceModule {
         {
             let static_names: Vec<&'static str> =
                 kernel_names.iter().map(|n| intern_kernel_name(n)).collect();
-            backend::DeviceModuleInner::from_ptx(&ctx.0, ptx, "module", &static_names).map(Self)
+            backend::DeviceModuleInner::from_ptx(&ctx.0, ptx, &module_name, &static_names).map(Self)
         }
         #[cfg(not(feature = "cuda"))]
         {
-            backend::DeviceModuleInner::from_ptx(&ctx.0, ptx, "module", kernel_names).map(Self)
+            backend::DeviceModuleInner::from_ptx(&ctx.0, ptx, &module_name, kernel_names).map(Self)
         }
     }
 
@@ -984,5 +1011,27 @@ mod stub_tests {
         *arg_slot.lock().unwrap() = Some(ev);
         let seen = buf_slot.lock().unwrap().as_ref().map(|e| e.id());
         assert_eq!(seen, Some(ev_id));
+    }
+
+    /// AUDIT 2026-06-21: every PTX load must get a process-unique module
+    /// name so cudarc's per-context module map does not have one
+    /// `DeviceModule` clobber another. Verify the minted names are
+    /// well-formed and never repeat across successive calls.
+    #[test]
+    fn module_names_are_unique() {
+        const N: usize = 1024;
+        let names: Vec<String> = (0..N).map(|_| next_module_name()).collect();
+        for name in &names {
+            assert!(
+                name.starts_with("cratonvm_mod_"),
+                "unexpected module name {name:?}"
+            );
+        }
+        let distinct: std::collections::HashSet<&String> = names.iter().collect();
+        assert_eq!(
+            distinct.len(),
+            N,
+            "module names must be unique across loads"
+        );
     }
 }

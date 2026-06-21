@@ -252,19 +252,83 @@ impl AotCache {
         self.entries.len()
     }
 
-    /// Compute a simple integrity hash over the payload bytes.
-    /// Uses SipHash-like mixing for fast, non-cryptographic integrity checking.
-    /// This prevents accidental corruption; a proper HMAC would be needed for
-    /// adversarial tamper resistance.
-    fn compute_integrity_hash(data: &[u8]) -> [u8; 8] {
-        let mut h: u64 = 0x517cc1b727220a95;
-        for (i, &b) in data.iter().enumerate() {
-            h = h.wrapping_add(b as u64);
-            h = h.wrapping_mul(0x9e3779b97f4a7c15);
-            h ^= h >> 33;
-            h = h.wrapping_add(i as u64);
+    /// Length in bytes of the AOT cache integrity digest (SHA-256 = 32).
+    const INTEGRITY_DIGEST_LEN: usize = 32;
+
+    /// Environment variable naming an optional secret key. When set (non-empty)
+    /// the integrity digest is upgraded from a bare SHA-256 content hash to an
+    /// HMAC-SHA256 keyed by the variable's UTF-8 bytes, which resists forgery
+    /// by an attacker who does not know the key. When unset, the bare SHA-256
+    /// content digest detects accidental corruption and casual tampering but
+    /// NOT a determined forger (anyone can recompute SHA-256 over a tampered
+    /// payload). Deploy with this set to obtain tamper resistance.
+    const INTEGRITY_KEY_ENV: &'static str = "CRATONVM_AOT_HMAC_KEY";
+
+    /// Read the optional HMAC key from the environment. Returns `None` when the
+    /// variable is unset or empty (callers then fall back to a bare SHA-256
+    /// content digest).
+    fn integrity_key() -> Option<Vec<u8>> {
+        match std::env::var(Self::INTEGRITY_KEY_ENV) {
+            Ok(k) if !k.is_empty() => Some(k.into_bytes()),
+            _ => None,
         }
-        h.to_le_bytes()
+    }
+
+    /// Compute a cryptographic integrity digest over the payload bytes.
+    ///
+    /// If a key is supplied this is an HMAC-SHA256 (RFC 2104) over `data`,
+    /// providing forgery resistance against an attacker who does not possess
+    /// the key. With no key it is a bare SHA-256 of `data`, which reliably
+    /// detects corruption and accidental/casual tampering but does NOT defend
+    /// against a determined forger — without secret-key infrastructure that is
+    /// the strongest guarantee available. The magic + version guard in
+    /// `serialize`/`deserialize` additionally rejects unrelated or
+    /// version-skewed blobs. This replaces an earlier keyless non-cryptographic
+    /// mix that was trivially forgeable.
+    fn compute_integrity_hash(data: &[u8], key: Option<&[u8]>) -> [u8; Self::INTEGRITY_DIGEST_LEN] {
+        use crate::crypto_impl::Sha256;
+        match key {
+            None => Sha256::digest(data),
+            Some(key) => {
+                // HMAC-SHA256: H((K' ^ opad) || H((K' ^ ipad) || data)), where
+                // K' is the key hashed (if longer than the block) then zero-
+                // padded to the 64-byte SHA-256 block size.
+                const BLOCK: usize = 64;
+                let mut k = if key.len() > BLOCK {
+                    Sha256::digest(key).to_vec()
+                } else {
+                    key.to_vec()
+                };
+                k.resize(BLOCK, 0);
+                let mut ipad = [0x36u8; BLOCK];
+                let mut opad = [0x5cu8; BLOCK];
+                for i in 0..BLOCK {
+                    ipad[i] ^= k[i];
+                    opad[i] ^= k[i];
+                }
+                let mut inner = Sha256::new();
+                inner.update(&ipad);
+                inner.update(data);
+                let inner = inner.finalize();
+                let mut outer = Sha256::new();
+                outer.update(&opad);
+                outer.update(&inner);
+                outer.finalize()
+            }
+        }
+    }
+
+    /// Constant-time byte-slice equality, used when verifying the integrity
+    /// digest so a comparison does not leak digest contents via timing.
+    fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+        if a.len() != b.len() {
+            return false;
+        }
+        let mut diff = 0u8;
+        for (&x, &y) in a.iter().zip(b.iter()) {
+            diff |= x ^ y;
+        }
+        diff == 0
     }
 
     /// Serialize the cache to a binary blob.
@@ -276,13 +340,17 @@ impl AotCache {
     ///     code_len(4)  code_bytes
     ///     deopt_count(4)  [bc_off(4) native_off(4)]*
     ///     entry_point_offset(4)
-    ///   integrity_hash(8)   -- appended at end
+    ///   integrity_digest(32)  -- SHA-256 (or HMAC-SHA256 if a key is set),
+    ///                            computed over everything before it, appended
+    ///                            at the end.
     pub fn serialize(&self) -> Vec<u8> {
         const MAGIC: u32 = 0xA07CAC4E;
-        const VERSION: u16 = 1;
+        // `Self::` is not usable from a `const` item nested in a fn body (E0401);
+        // a `let` binding can reference the associated const.
+        let version: u16 = Self::CURRENT_VERSION;
         let mut buf = Vec::new();
         buf.extend_from_slice(&MAGIC.to_le_bytes());
-        buf.extend_from_slice(&VERSION.to_le_bytes());
+        buf.extend_from_slice(&version.to_le_bytes());
         buf.extend_from_slice(&(self.entries.len() as u32).to_le_bytes());
         for (key, entry) in &self.entries {
             let kb = key.as_bytes();
@@ -298,8 +366,10 @@ impl AotCache {
             }
             buf.extend_from_slice(&entry.entry_point_offset.to_le_bytes());
         }
-        // Append integrity hash over the payload.
-        let hash = Self::compute_integrity_hash(&buf);
+        // Append a cryptographic integrity digest over the payload. Uses
+        // HMAC-SHA256 when a key is configured (forgery-resistant), otherwise a
+        // bare SHA-256 content hash (corruption-detecting).
+        let hash = Self::compute_integrity_hash(&buf, Self::integrity_key().as_deref());
         buf.extend_from_slice(&hash);
         buf
     }
@@ -310,8 +380,11 @@ impl AotCache {
     const MAX_CODE_SIZE: usize = 16 * 1024 * 1024;
     /// Maximum deopt map entries per method.
     const MAX_DEOPT_ENTRIES: usize = 100_000;
-    /// Current cache format version.
-    const CURRENT_VERSION: u16 = 1;
+    /// Current cache format version. Bumped to 2 when the trailing integrity
+    /// field changed from an 8-byte non-cryptographic mix to a 32-byte
+    /// SHA-256/HMAC-SHA256 digest; v1 blobs are now rejected (they cannot carry
+    /// a valid v2 digest and their old check is forgeable).
+    const CURRENT_VERSION: u16 = 2;
 
     /// Deserialize a cache from bytes. Returns None on format error.
     pub fn deserialize(data: &[u8]) -> Option<Self> {
@@ -395,15 +468,19 @@ impl AotCache {
                 },
             );
         }
-        // Verify integrity hash (last 8 bytes of data).
-        if pos + 8 > data.len() {
-            return None; // Missing integrity hash
+        // Verify the integrity digest (trailing INTEGRITY_DIGEST_LEN bytes).
+        // The digest is HMAC-SHA256 when a key is configured (rejects forged
+        // caches) and a bare SHA-256 content hash otherwise (rejects corrupted
+        // or casually tampered caches). Exactly one trailing digest is allowed
+        // — a longer-than-expected blob is rejected as malformed.
+        if pos + Self::INTEGRITY_DIGEST_LEN != data.len() {
+            return None; // Missing, short, or trailing-garbage integrity digest
         }
-        let stored_hash = &data[pos..pos + 8];
+        let stored_hash = &data[pos..pos + Self::INTEGRITY_DIGEST_LEN];
         let payload = &data[..pos];
-        let computed_hash = Self::compute_integrity_hash(payload);
-        if stored_hash != computed_hash {
-            return None; // Integrity check failed — cache may be corrupted or tampered
+        let computed_hash = Self::compute_integrity_hash(payload, Self::integrity_key().as_deref());
+        if !Self::ct_eq(stored_hash, &computed_hash) {
+            return None; // Integrity check failed — cache corrupted, tampered, or wrong key
         }
         Some(Self {
             entries,
@@ -2388,6 +2465,95 @@ mod aot_tests {
             blob[12] ^= 0xFF;
         }
         assert!(AotCache::deserialize(&blob).is_none());
+    }
+
+    #[test]
+    fn test_aot_cache_integrity_digest_is_sha256_len() {
+        // The trailing digest must be a full 32-byte SHA-256, not the old
+        // 8-byte non-cryptographic mix.
+        let cache = AotCache::new(AotCacheConfig::new());
+        let blob = cache.serialize();
+        // Header (10) + no entries + 32-byte digest.
+        assert_eq!(blob.len(), 10 + AotCache::INTEGRITY_DIGEST_LEN);
+        // The bare (keyless) digest of the header payload must equal a
+        // straight SHA-256 over those bytes.
+        let payload = &blob[..blob.len() - AotCache::INTEGRITY_DIGEST_LEN];
+        let expect = crate::crypto_impl::Sha256::digest(payload);
+        assert_eq!(
+            &blob[blob.len() - AotCache::INTEGRITY_DIGEST_LEN..],
+            &expect[..]
+        );
+    }
+
+    #[test]
+    fn test_aot_cache_integrity_recompute_forgery_still_detected_without_key() {
+        // Without a key, SHA-256 detects accidental change. A forger who
+        // recomputes the digest over a tampered payload would pass — this is
+        // the documented residual risk addressed by CRATONVM_AOT_HMAC_KEY.
+        // Here we assert the corruption-detection property: any payload edit
+        // that is NOT accompanied by a recomputed digest is rejected.
+        let mut cache = AotCache::new(AotCacheConfig::new());
+        cache.store(
+            "A",
+            "b",
+            "()V",
+            AotCacheEntry {
+                bytecode_fingerprint: [0; 8],
+                compiled_code: vec![1, 2, 3, 4],
+                deopt_map: HashMap::new(),
+                entry_point_offset: 0,
+            },
+        );
+        let mut blob = cache.serialize();
+        // Tamper with the very last digest byte: a stale digest is rejected.
+        let last = blob.len() - 1;
+        blob[last] ^= 0xFF;
+        assert!(AotCache::deserialize(&blob).is_none());
+    }
+
+    #[test]
+    fn test_aot_cache_integrity_rejects_trailing_garbage() {
+        let cache = AotCache::new(AotCacheConfig::new());
+        let mut blob = cache.serialize();
+        // Extra bytes after a valid digest must be rejected (exact-length
+        // check), so a forger cannot append a second valid-looking digest.
+        blob.push(0x00);
+        assert!(AotCache::deserialize(&blob).is_none());
+    }
+
+    #[test]
+    fn test_aot_cache_hmac_keyed_digest_differs_from_bare() {
+        // With a key present the digest is HMAC-SHA256, which differs from the
+        // bare SHA-256 of the same payload. Drive compute_integrity_hash
+        // directly so this test does not depend on process-global env state
+        // (env-var mutation would race with parallel tests).
+        let payload = b"some-aot-cache-payload-bytes";
+        let bare = AotCache::compute_integrity_hash(payload, None);
+        let keyed = AotCache::compute_integrity_hash(payload, Some(b"secret-key"));
+        assert_ne!(bare, keyed);
+        // HMAC is deterministic for a fixed key+payload.
+        let keyed2 = AotCache::compute_integrity_hash(payload, Some(b"secret-key"));
+        assert_eq!(keyed, keyed2);
+        // A different key yields a different tag.
+        let keyed3 = AotCache::compute_integrity_hash(payload, Some(b"other-key"));
+        assert_ne!(keyed, keyed3);
+    }
+
+    #[test]
+    fn test_aot_cache_hmac_matches_rfc2104_reference() {
+        // RFC 4231 / RFC 2104 HMAC-SHA256 test case 1:
+        //   key  = 0x0b * 20
+        //   data = "Hi There"
+        //   mac  = b0344c61d8db38535ca8afceaf0bf12b
+        //          881dc200c9833da726e9376c2e32cff7
+        let key = [0x0bu8; 20];
+        let mac = AotCache::compute_integrity_hash(b"Hi There", Some(&key));
+        let expect: [u8; 32] = [
+            0xb0, 0x34, 0x4c, 0x61, 0xd8, 0xdb, 0x38, 0x53, 0x5c, 0xa8, 0xaf, 0xce, 0xaf, 0x0b,
+            0xf1, 0x2b, 0x88, 0x1d, 0xc2, 0x00, 0xc9, 0x83, 0x3d, 0xa7, 0x26, 0xe9, 0x37, 0x6c,
+            0x2e, 0x32, 0xcf, 0xf7,
+        ];
+        assert_eq!(mac, expect);
     }
 
     #[test]

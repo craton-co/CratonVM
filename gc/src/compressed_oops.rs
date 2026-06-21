@@ -505,7 +505,7 @@ mod tests {
 
     #[test]
     fn shift_zero_for_small_heap() {
-        assert_eq!(CompressedOops::determine_shift(1 * GB), 0);
+        assert_eq!(CompressedOops::determine_shift(GB), 0);
         assert_eq!(CompressedOops::determine_shift(4 * GB), 0);
     }
 

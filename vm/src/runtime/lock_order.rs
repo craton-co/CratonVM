@@ -46,12 +46,21 @@
 //!
 //! ## Enforcement strategy
 //!
-//! Each [`OrderedMutex`] / [`OrderedRwLock`] carries a [`LockLevel`]. In debug
-//! builds we maintain a per-thread bit-set of currently-held levels. On every
-//! acquire we assert that the attempted level is strictly less than the
-//! *minimum* currently-held level — the binding constraint for "descending".
-//! In release builds the wrapper is zero-cost (the tracking module is
-//! compiled out).
+//! Each [`OrderedMutex`] / [`OrderedRwLock`] carries a [`LockLevel`]. When
+//! enforcement is active we maintain a per-thread bit-set of currently-held
+//! levels. On every acquire we assert that the attempted level is strictly
+//! less than the *minimum* currently-held level — the binding constraint for
+//! "descending".
+//!
+//! Enforcement is **always on in debug builds**. In release builds it is
+//! **off by default** (a single cached `AtomicU8` load gates the whole fast
+//! path, so the wrapper is effectively zero-cost) but can be **opted in at
+//! runtime** by setting the environment variable `CRATONVM_LOCK_ORDER_CHECK`
+//! to a truthy value (`1`, `true`, `yes`, or `on`, case-insensitive). This
+//! lets production builds turn on deadlock-ordering checks without a rebuild,
+//! e.g. when reproducing a suspected lock-order bug in the field. The env var
+//! is read once and cached; flipping it after the first lock acquisition has
+//! no effect. See [`tracking::enforced`].
 //!
 //! ## Usage
 //!
@@ -161,13 +170,57 @@ impl fmt::Display for LockOrderViolation {
 impl std::error::Error for LockOrderViolation {}
 
 // ---------------------------------------------------------------------------
-// Thread-local tracking (debug builds only)
+// Thread-local tracking
 // ---------------------------------------------------------------------------
 
-#[cfg(debug_assertions)]
 mod tracking {
     use super::LockLevel;
     use std::cell::Cell;
+    use std::sync::atomic::{AtomicU8, Ordering};
+
+    // Cached enforcement decision. 0 = undetermined, 1 = off, 2 = on. Reading
+    // it is a single relaxed atomic load on the lock fast path, so when
+    // enforcement is off the per-acquire cost is negligible.
+    static ENFORCE: AtomicU8 = AtomicU8::new(0);
+
+    /// Whether lock-order enforcement is active for this process.
+    ///
+    /// In debug builds this is always `true`. In release builds it defaults to
+    /// `false` but can be opted in at runtime by setting the environment
+    /// variable `CRATONVM_LOCK_ORDER_CHECK` to a truthy value (`1`, `true`,
+    /// `yes`, or `on`, case-insensitive). The decision is computed on the first
+    /// call and cached; later changes to the environment have no effect.
+    #[inline]
+    pub(super) fn enforced() -> bool {
+        match ENFORCE.load(Ordering::Relaxed) {
+            1 => false,
+            2 => true,
+            _ => {
+                let on = compute_enforced();
+                // Idempotent: every caller computes the same value, so a racing
+                // store is harmless. Use a plain store rather than CAS.
+                ENFORCE.store(if on { 2 } else { 1 }, Ordering::Relaxed);
+                on
+            }
+        }
+    }
+
+    fn compute_enforced() -> bool {
+        // Always enforce in debug builds; the env opt-in is for release.
+        if cfg!(debug_assertions) {
+            return true;
+        }
+        match std::env::var("CRATONVM_LOCK_ORDER_CHECK") {
+            Ok(v) => {
+                let v = v.trim();
+                v.eq_ignore_ascii_case("1")
+                    || v.eq_ignore_ascii_case("true")
+                    || v.eq_ignore_ascii_case("yes")
+                    || v.eq_ignore_ascii_case("on")
+            }
+            Err(_) => false,
+        }
+    }
 
     // Bit-set of currently held lock levels for this thread.
     // Index `i` corresponds to `LockLevel` with discriminant `i`.
@@ -224,6 +277,44 @@ mod tracking {
             _ => unreachable!(),
         }
     }
+
+    /// Check the descending-order invariant for `level` against the locks
+    /// currently held by this thread, then record `level` as held.
+    ///
+    /// No-op (and skips touching the thread-local) when enforcement is off, so
+    /// the only cost on the disabled fast path is the cached [`enforced`] load.
+    ///
+    /// # Panics
+    ///
+    /// Panics with a [`super::LockOrderViolation`] message if `level` is not
+    /// strictly less than the minimum currently-held level.
+    #[inline]
+    pub(super) fn check_and_acquire(level: LockLevel) {
+        if !enforced() {
+            return;
+        }
+        if let Some(held) = lowest_held() {
+            assert!(
+                level < held,
+                "{}",
+                super::LockOrderViolation {
+                    attempted: level,
+                    held,
+                }
+            );
+        }
+        acquire(level);
+    }
+
+    /// Mirror of [`check_and_acquire`] for guard drop: releases `level` iff
+    /// enforcement is active. Must be paired with a `check_and_acquire(level)`
+    /// — `enforced()` is cached, so both observe the same decision.
+    #[inline]
+    pub(super) fn release_if_enforced(level: LockLevel) {
+        if enforced() {
+            release(level);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -232,10 +323,12 @@ mod tracking {
 
 /// A `Mutex<T>` wrapper that enforces lock-ordering discipline.
 ///
-/// In debug builds, acquiring this lock asserts that the calling thread holds
-/// no lock at an equal or **lower** [`LockLevel`] (the descending-order rule
-/// documented at the top of this module). In release builds the check is
-/// compiled away entirely, making this a zero-cost wrapper.
+/// When enforcement is active, acquiring this lock asserts that the calling
+/// thread holds no lock at an equal or **lower** [`LockLevel`] (the
+/// descending-order rule documented at the top of this module). Enforcement is
+/// always on in debug builds and opt-in at runtime in release builds via
+/// `CRATONVM_LOCK_ORDER_CHECK`; when off, the only per-acquire cost is a single
+/// cached atomic load (see [`tracking::enforced`]).
 pub struct OrderedMutex<T> {
     inner: Mutex<T>,
     level: LockLevel,
@@ -254,28 +347,17 @@ impl<T> OrderedMutex<T> {
         }
     }
 
-    /// Acquire the mutex, enforcing descending lock order in debug builds.
+    /// Acquire the mutex, enforcing descending lock order when enforcement is
+    /// active (always in debug builds; in release when
+    /// `CRATONVM_LOCK_ORDER_CHECK` is set — see this module's docs).
     ///
     /// # Panics
     ///
-    /// In debug builds, panics if the calling thread already holds a lock at
-    /// an equal or *lower* level (which would invert the documented descending
-    /// hierarchy and risk deadlock).
+    /// When enforcement is active, panics if the calling thread already holds a
+    /// lock at an equal or *lower* level (which would invert the documented
+    /// descending hierarchy and risk deadlock).
     pub fn lock(&self) -> LockResult<OrderedMutexGuard<'_, T>> {
-        #[cfg(debug_assertions)]
-        {
-            if let Some(held) = tracking::lowest_held() {
-                assert!(
-                    self.level < held,
-                    "{}",
-                    LockOrderViolation {
-                        attempted: self.level,
-                        held,
-                    }
-                );
-            }
-            tracking::acquire(self.level);
-        }
+        tracking::check_and_acquire(self.level);
 
         match self.inner.lock() {
             Ok(guard) => Ok(OrderedMutexGuard {
@@ -312,7 +394,6 @@ impl<T: fmt::Debug> fmt::Debug for OrderedMutex<T> {
 /// builds.
 pub struct OrderedMutexGuard<'a, T> {
     guard: MutexGuard<'a, T>,
-    #[allow(dead_code)]
     level: LockLevel,
 }
 
@@ -331,8 +412,7 @@ impl<T> std::ops::DerefMut for OrderedMutexGuard<'_, T> {
 
 impl<T> Drop for OrderedMutexGuard<'_, T> {
     fn drop(&mut self) {
-        #[cfg(debug_assertions)]
-        tracking::release(self.level);
+        tracking::release_if_enforced(self.level);
     }
 }
 
@@ -369,22 +449,10 @@ impl<T> OrderedRwLock<T> {
     ///
     /// # Panics
     ///
-    /// In debug builds, panics on lock-order violation (see [`OrderedMutex::lock`]).
+    /// When enforcement is active, panics on lock-order violation (see
+    /// [`OrderedMutex::lock`]).
     pub fn read(&self) -> LockResult<OrderedRwLockReadGuard<'_, T>> {
-        #[cfg(debug_assertions)]
-        {
-            if let Some(held) = tracking::lowest_held() {
-                assert!(
-                    self.level < held,
-                    "{}",
-                    LockOrderViolation {
-                        attempted: self.level,
-                        held,
-                    }
-                );
-            }
-            tracking::acquire(self.level);
-        }
+        tracking::check_and_acquire(self.level);
 
         match self.inner.read() {
             Ok(guard) => Ok(OrderedRwLockReadGuard {
@@ -405,22 +473,10 @@ impl<T> OrderedRwLock<T> {
     ///
     /// # Panics
     ///
-    /// In debug builds, panics on lock-order violation (see [`OrderedMutex::lock`]).
+    /// When enforcement is active, panics on lock-order violation (see
+    /// [`OrderedMutex::lock`]).
     pub fn write(&self) -> LockResult<OrderedRwLockWriteGuard<'_, T>> {
-        #[cfg(debug_assertions)]
-        {
-            if let Some(held) = tracking::lowest_held() {
-                assert!(
-                    self.level < held,
-                    "{}",
-                    LockOrderViolation {
-                        attempted: self.level,
-                        held,
-                    }
-                );
-            }
-            tracking::acquire(self.level);
-        }
+        tracking::check_and_acquire(self.level);
 
         match self.inner.write() {
             Ok(guard) => Ok(OrderedRwLockWriteGuard {
@@ -455,7 +511,6 @@ impl<T: fmt::Debug> fmt::Debug for OrderedRwLock<T> {
 /// RAII read guard for [`OrderedRwLock`].
 pub struct OrderedRwLockReadGuard<'a, T> {
     guard: RwLockReadGuard<'a, T>,
-    #[allow(dead_code)]
     level: LockLevel,
 }
 
@@ -468,8 +523,7 @@ impl<T> std::ops::Deref for OrderedRwLockReadGuard<'_, T> {
 
 impl<T> Drop for OrderedRwLockReadGuard<'_, T> {
     fn drop(&mut self) {
-        #[cfg(debug_assertions)]
-        tracking::release(self.level);
+        tracking::release_if_enforced(self.level);
     }
 }
 
@@ -482,7 +536,6 @@ impl<T: fmt::Debug> fmt::Debug for OrderedRwLockReadGuard<'_, T> {
 /// RAII write guard for [`OrderedRwLock`].
 pub struct OrderedRwLockWriteGuard<'a, T> {
     guard: RwLockWriteGuard<'a, T>,
-    #[allow(dead_code)]
     level: LockLevel,
 }
 
@@ -501,8 +554,7 @@ impl<T> std::ops::DerefMut for OrderedRwLockWriteGuard<'_, T> {
 
 impl<T> Drop for OrderedRwLockWriteGuard<'_, T> {
     fn drop(&mut self) {
-        #[cfg(debug_assertions)]
-        tracking::release(self.level);
+        tracking::release_if_enforced(self.level);
     }
 }
 
@@ -945,5 +997,39 @@ mod tests {
         let g = m.lock().unwrap();
         let dbg = format!("{:?}", g);
         assert!(dbg.contains("99"));
+    }
+
+    // -- Enforcement gating --------------------------------------------------
+
+    // The test runner is a debug build (`cfg!(debug_assertions)` is true), so
+    // enforcement is unconditionally active and the `#[should_panic]` tests
+    // above exercise the real checking path. This test pins that invariant: if
+    // someone ever runs the suite in release without setting the env var, the
+    // `enforced()`-gated paths would silently stop checking and most of the
+    // panic tests would fail loudly here first.
+    #[test]
+    fn enforcement_active_in_debug_builds() {
+        assert!(
+            cfg!(debug_assertions),
+            "test runner is expected to be a debug build"
+        );
+        assert!(
+            tracking::enforced(),
+            "lock-order enforcement must be active in debug builds"
+        );
+    }
+
+    // Acquiring then releasing must leave the per-thread held-set empty so a
+    // later same-or-higher acquisition is allowed — verifies the
+    // `release_if_enforced` path stays balanced with `check_and_acquire`.
+    #[test]
+    fn acquire_release_is_balanced() {
+        let a = OrderedMutex::new((), LockLevel::Monitors);
+        {
+            let _g = a.lock().unwrap();
+        }
+        // Nothing held now: a higher-level lock must be acquirable.
+        let b = OrderedMutex::new((), LockLevel::ClassManager);
+        let _gb = b.lock().unwrap();
     }
 }

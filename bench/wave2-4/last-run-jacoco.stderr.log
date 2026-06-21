@@ -1,3 +1,0 @@
-﻿[rustjvm] stack-dump watchdog armed: will dump + abort after 45s
-[2m2026-04-26T14:30:02.116000Z[0m [33m WARN[0m [2mrustjvm_vm::runtime::agent_loader[0m[2m:[0m javaagent: premain of `org.jacoco.agent.rt.internal_4742761.PreMain` threw java/lang/NullPointerException (continuing)
-

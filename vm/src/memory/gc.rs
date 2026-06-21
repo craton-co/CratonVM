@@ -363,6 +363,14 @@ pub fn update_all_roots(
     //      `NoSuchMethodError: java/lang/Object.handle` storm under GC pressure).
     cratonvm_native_builtins::net_phase_e::gc_update_re10_handler_refs(pointer_map);
 
+    //      ScheduledThreadPoolExecutor pending runnables + XNIO IoFuture
+    //      notifier/attachment/result refs: relocate the stored ObjectRefs after
+    //      a moving GC so the pump / future-settle invokes the live object, not a
+    //      vacated from-space slot. Root-scan companions in `roots.rs`; the NIO
+    //      sk_table remap is wired separately above (`sk_table_update_after_gc`).
+    cratonvm_native_builtins::scheduled_pump::gc_update_scheduled_refs(pointer_map);
+    cratonvm_native_builtins::xnio_async::gc_update_xnio_future_refs(pointer_map);
+
     // 20. Blocked-thread root maintenance (the H2 TestScript stale-receiver
     //     SEGV fix). Threads parked in a blocking native (Object.wait /
     //     Thread.join / LockSupport.park / ReferenceQueue.remove) are
@@ -386,6 +394,15 @@ pub fn update_all_roots(
     shared
         .thread_registry
         .update_thread_objs_after_gc(pointer_map);
+
+    // 22. Uniform native-root registry — the post-move companion to
+    //     `roots.rs` step 21 (`scan_all_native_roots`). Fans out to every
+    //     subsystem that registered via `crate::memory::native_roots`,
+    //     repointing each held ObjectRef through `pointer_map`. Each registered
+    //     remap self-guards the empty (non-moving) map; the whole fan-out is a
+    //     no-op until a subsystem registers, so behaviour is byte-identical to
+    //     baseline on the default path.
+    crate::memory::native_roots::remap_all_native_roots(pointer_map);
 
     // Post-GC verification: check that no frame refs still point to relocated addresses.
     verify_no_stale_refs(thread, pointer_map);

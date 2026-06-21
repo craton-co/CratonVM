@@ -30,7 +30,12 @@ exclude = [
 # synthetic test suite or to debug against Rust-side stubs, pass
 # `--features synthetic-jdk` explicitly. See `docs/roadmap.md` NEW-11
 # for the rationale and the census-driven migration plan.
-default = ["experimental-tls", "experimental-jmx", "experimental-serialization", "experimental-aot", "experimental-debug"]
+default = ["awt", "experimental-tls", "experimental-jmx", "experimental-serialization", "experimental-aot", "experimental-debug"]
+# AWT/Swing/Java2D desktop natives. On by default so the standard build
+# registers them exactly as before. `cratonvm-native-awt` sets
+# `publish = false`, so this feature is what makes the dependency optional:
+# `cargo publish -p cratonvm-vm --no-default-features` can drop it.
+awt = ["dep:cratonvm-native-awt"]
 synthetic-jdk = ["cratonvm-native-builtins/synthetic-jdk", "cratonvm-native-collections/synthetic-jdk", "cratonvm-native-io/synthetic-jdk"]
 experimental-tls = ["cratonvm-native-builtins/experimental-tls"]
 experimental-jmx = ["cratonvm-native-builtins/experimental-jmx"]
@@ -64,7 +69,13 @@ iced-x86 = { version = "1.21", default-features = false, features = ["std", "dec
 cratonvm-classloading = { path = "../classloading", version = "0.3.0" }
 cratonvm-gc = { path = "../gc", version = "0.3.0" }
 cratonvm-jfr = { path = "../jfr", version = "0.3.0" }
-cratonvm-native-awt = { path = "../native-awt", version = "0.3.0" }
+# PUBLISH-BLOCKER FIX: `cratonvm-native-awt` sets `publish = false`, and
+# crates.io forbids publishing a crate with a non-optional, unpublished
+# normal dependency. Making it optional behind the (default-on) `awt`
+# feature keeps the default build/test behavior identical (AWT natives are
+# still registered) while allowing `cargo publish` of `cratonvm-vm` with
+# `--no-default-features` to exclude the unpublished crate.
+cratonvm-native-awt = { path = "../native-awt", version = "0.3.0", optional = true }
 # Optional, only pulled in by the `gpu-offload` feature. See the feature
 # table above. With `gpu-offload` off, these crates are not linked.
 cuda-bridge = { path = "../cuda-bridge", version = "0.3.0", optional = true, package = "cratonvm-cuda-bridge" }

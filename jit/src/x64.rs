@@ -2021,6 +2021,32 @@ const ALL_SPILL_GPRS: [u8; 14] = [
     RAX, RCX, RDX, RBX, RSI, RDI, R8, R9, R10, R11, R12, R13, R14, R15,
 ];
 
+/// Register-only operand-stack-oop soundness — whether `flush_scratch_registers`
+/// (the standard pre-call / pre-backward-branch / pre-return flush) ALSO spills
+/// `StackSlot::CalleeSaved` operand-stack entries that hold an object reference
+/// to a canonical frame slot.
+///
+/// **DEFAULT ON** (opt out with `CRATONVM_JIT_NO_CALLEE_OOP_FLUSH`). Closes a JIT
+/// GC-root soundness hole that is *independent* of the env-gated
+/// `CRATONVM_JIT_SAFEPOINT_REG_SPILL` family: a callee-saved register pushed onto
+/// the operand stack as a "zero-cost push" (no code emitted until the value is
+/// consumed) survives a GC-capable call un-spilled by ABI, so a live oop residing
+/// ONLY in that register at the safepoint is invisible to the conservative
+/// `[scanner_sp, entry_sp)` frame scan → the object can be reclaimed → use-after-
+/// free. `flush_scratch_registers` already spills the `Scratch`/`Xmm` operand
+/// entries before every call; this extends the same flush to the `CalleeSaved`
+/// reference entries it previously left in registers (exactly the register homes
+/// `collect_live_oop_homes` already recognizes, but which the default
+/// conservative scan — shadow stack off — never sees). The spill is value-
+/// preserving and consumers transparently read the new `StackSlot::Frame` home,
+/// so it can only ADD a root, never remove one or change a computed value. When
+/// off, the legacy (unsound) flush is restored for A/B bisection only.
+fn flush_callee_saved_oops_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| std::env::var_os("CRATONVM_JIT_NO_CALLEE_OOP_FLUSH").is_none())
+}
+
 fn compute_branch_targets(code: &[u8], code_len: usize) -> Vec<bool> {
     let mut targets = vec![false; code_len];
     let mut pc = 0usize;
@@ -5700,17 +5726,19 @@ struct Compiler {
     /// dispatch-aware route that drains the pending JIT exception (the
     /// `!has_dispatch` fast path returns the raw value without draining).
     emitted_athrow: bool,
-    /// A `newarray` (0xbc) OOM bail (`emit_post_alloc_oom_check`) was emitted in
-    /// this method. Forces `has_dispatch` for the SAME thread-availability
-    /// reason as `direct_calls` above: the fallible `jit_newarray` helper reads
-    /// the per-thread `JIT_THREAD` TLS (via `jit_thread_mut()`) BOTH to run the
-    /// allocation-failure STW GC (helpers.rs:1201) and to construct the
-    /// catchable `OutOfMemoryError` (helpers.rs:1265). The `!has_dispatch` fast
-    /// entry path skips `set_jit_thread`, so without this a JIT'd allocating
-    /// method would run `jit_newarray` with a null thread — no GC on young-gen
-    /// pressure, and on genuine exhaustion the OOME is never created so the
-    /// `i64::MIN` bail sentinel leaks as the method's (truncated) return value
-    /// (e.g. `new int[N]` silently yields 0) instead of throwing.
+    /// An allocation OOM bail (`emit_post_alloc_oom_check`) was emitted in this
+    /// method — by `newarray` (0xbc), `anewarray` (0xbd), or `new` (0xbb).
+    /// Forces `has_dispatch` for the SAME thread-availability reason as
+    /// `direct_calls` above: the fallible alloc helpers (`jit_newarray` /
+    /// `jit_anewarray_object` / `jit_new_object`) read the per-thread
+    /// `JIT_THREAD` TLS (via `jit_thread_mut()`) BOTH to run the
+    /// allocation-failure STW GC and to construct the catchable
+    /// `OutOfMemoryError` / `NegativeArraySizeException`. The `!has_dispatch`
+    /// fast entry path skips `set_jit_thread`, so without this a JIT'd
+    /// allocating method would run the helper with a null thread — no GC on
+    /// young-gen pressure, and on genuine exhaustion the throwable is never
+    /// created so the `i64::MIN` bail sentinel leaks as the method's (truncated)
+    /// return value (e.g. `new int[N]` silently yields 0) instead of throwing.
     emitted_alloc_oom_check: bool,
     /// Forward branch patches: (native offset of rel32, target bytecode PC).
     forward_patches: Vec<(usize, usize)>,
@@ -6001,6 +6029,16 @@ struct Compiler {
     /// NO stores — isolates the effect of the stores from the effect of the
     /// frame-size perturbation (the SB-CRASH-04 "FIX == NOSTORE" methodology).
     safepoint_reg_spill_nostore: bool,
+    /// Register-only operand-stack-oop soundness (DEFAULT ON; opt out with
+    /// `CRATONVM_JIT_NO_CALLEE_OOP_FLUSH`) — whether `flush_scratch_registers`
+    /// also spills `StackSlot::CalleeSaved` operand-stack entries marked as
+    /// references to a frame slot before each pre-call/branch/return flush, so a
+    /// live oop that lives ONLY in a callee-saved register across a GC-capable
+    /// call is on the stack and visible to the conservative root scan. Distinct
+    /// from `safepoint_reg_spill` (which blind-spills register-mapped *locals*
+    /// and is env-gated off): this targets register-resident operand-stack
+    /// *temporaries* and is on by default. See `flush_callee_saved_oops_enabled`.
+    flush_callee_saved_oops: bool,
     /// Frame offset (positive; first slot at `[rbp - reg_spill_base]`) of the
     /// reserved callee-saved-register spill area: one 8-byte slot per entry in
     /// `alloc_used_regs`, same order. 0 when `safepoint_reg_spill` is off.
@@ -6184,6 +6222,11 @@ impl Compiler {
         let safepoint_reg_spill = safepoint_reg_spill_enabled();
         let safepoint_reg_spill_all = safepoint_reg_spill_all();
         let safepoint_reg_spill_nostore = safepoint_reg_spill_nostore();
+        // Register-only operand-stack-oop soundness (DEFAULT ON): flush
+        // `CalleeSaved` operand-stack reference entries in `flush_scratch_
+        // registers` so a live oop held only in a callee-saved register across a
+        // GC-capable call is visible to the conservative root scan.
+        let flush_callee_saved_oops = flush_callee_saved_oops_enabled();
         // Shadow stack reserves TWO frame slots: the cached thread pointer and
         // a saved `top` watermark (restored in the epilogue to unwind any
         // unbalanced safepoint push — e.g. the `invokespecial <init>` push that
@@ -6409,6 +6452,7 @@ impl Compiler {
             safepoint_reg_spill,
             safepoint_reg_spill_all,
             safepoint_reg_spill_nostore,
+            flush_callee_saved_oops,
             reg_spill_base,
             safepoint_pcs: FxHashSet::default(),
             mapped_safepoint_pcs: FxHashSet::default(),
@@ -12316,6 +12360,47 @@ impl Compiler {
             // that wants RAX intact.
             self.emit_movq_mem_rbp_from_xmm(off, xmm);
             self.stack[idx] = StackSlot::Frame(off);
+        }
+        // GC-root soundness (DEFAULT ON; opt out `CRATONVM_JIT_NO_CALLEE_OOP_FLUSH`)
+        // — also flush `CalleeSaved` operand-stack entries that hold an object
+        // reference to a frame slot. A `CalleeSaved` push is a "zero-cost push":
+        // the value stays in a callee-saved register (which survives a call by
+        // ABI) until consumed, so the `Scratch`/`Xmm` flushes above leave a live
+        // oop residing ONLY in a register across a GC-capable call. That oop is
+        // invisible to the conservative `[scanner_sp, entry_sp)` frame scan (the
+        // default path: shadow stack off, `safepoint_reg_spill` env-gated off) →
+        // the object can be reclaimed → use-after-free. Spilling it to its frame
+        // home (and retargeting the slot to `Frame`, exactly as the Scratch/Xmm
+        // passes do) puts it on the scanned stack. The spill is value-preserving
+        // and every consumer reads the slot's recorded home, so this can only ADD
+        // a root, never change a computed value. Only entries marked as oops are
+        // spilled (the parallel `stack_oop_marks`); a non-oop callee-saved temp is
+        // ABI-preserved across the call and needs no spill. Pre-call flush only —
+        // this runs at every `flush_scratch_registers` site, which is the project's
+        // canonical pre-call/branch/return flush point.
+        if self.flush_callee_saved_oops {
+            let callee_oop_slots: Vec<(usize, u8)> = self
+                .stack
+                .iter()
+                .enumerate()
+                .filter_map(|(i, slot)| {
+                    if let StackSlot::CalleeSaved(reg) = *slot {
+                        // Only reference entries need to be made GC-visible; the
+                        // parallel mark vector stays valid after we retarget the
+                        // slot to `Frame` (a frame home is just as much an oop).
+                        if self.stack_oop_marks.get(i).copied().unwrap_or(false) {
+                            return Some((i, reg));
+                        }
+                    }
+                    None
+                })
+                .collect();
+            for (idx, reg) in callee_oop_slots {
+                let off = self.next_spill_offset;
+                self.next_spill_offset += 8;
+                self.emit_store_local(off, reg);
+                self.stack[idx] = StackSlot::Frame(off);
+            }
         }
         // Clear scratch XMM tracking — all flushed
         self.scratch_xmm_in_use = 0;
@@ -20624,6 +20709,13 @@ impl Compiler {
                         // finalizer queue and the slow path obviously
                         // can young-GC.
                         self.emit_oop_map_for_safepoint();
+                        // Heap-exhaustion guard: both the inline-TLAB slow path
+                        // and the slow-path helper return the 0/null sentinel on
+                        // OOM (jit_new_object -> jit_alloc_oom). Bail before the
+                        // null is pushed and dereferenced by a following
+                        // getfield/putfield. (Scalar-replaced `new` never reaches
+                        // here, so its dummy-zero push is unaffected.)
+                        self.emit_post_alloc_oom_check();
                         self.push_from_rax();
                         // The result is an object reference.
                         self.mark_top_as_oop();
@@ -20654,6 +20746,11 @@ impl Compiler {
                     self.emit_call_absolute(self.helpers.anewarray_object);
                     // T1.1.a — `anewarray` is a GC-triggering safepoint.
                     self.emit_oop_map_for_safepoint();
+                    // Heap-exhaustion / negative-length guard: jit_anewarray_object
+                    // returns the 0/null sentinel on OOM (-> jit_alloc_oom) or on
+                    // a negative length (-> jit_negative_array_size). Bail before
+                    // the null is pushed and dereferenced.
+                    self.emit_post_alloc_oom_check();
                     self.push_from_rax();
                     // The result is a reference array — an object reference.
                     self.mark_top_as_oop();

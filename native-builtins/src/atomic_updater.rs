@@ -674,47 +674,29 @@ fn native_aifu_decrement_and_get(ctx: &mut dyn NativeContext, args: &[Value]) ->
 // AtomicIntegerFieldUpdater base that the synthetic `$RustJvmImpl` subclass does
 // not inherit, so they were NoSuchMethodError before (breaking Reactor, which
 // uses them on field updaters for backpressure/state). getAnd* return the OLD
-// value; addAndGet returns the NEW value. CAS loop mirrors `getAndAdd`.
+// value; addAndGet returns the NEW value. All three route through the VM's
+// unbounded `atomic_fetch_add_int` primitive (a single LOCK XADD that loops
+// until commit and surfaces a field-type mismatch as a catchable exception) —
+// exactly like `getAndAdd`/`incrementAndGet`/`decrementAndGet` above. The
+// previous bounded CAS loop silently returned a fabricated 0 (and applied no
+// update) after 1024 contended retries — a lost update under contention.
 fn native_aifu_get_and_increment(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = arg_obj_or_npe(args, 0, "updater")?;
     let target = require_target(args, 1)?;
     let slot = impl_slot(ctx, this).unwrap_or(0);
-    for _ in 0..1024 {
-        let current = match ctx.get_field_volatile(target, slot) {
-            Value::Int(v) => v,
-            _ => 0,
-        };
-        if ctx.compare_and_swap_field(
-            target,
-            slot,
-            Value::Int(current),
-            Value::Int(current.wrapping_add(1)),
-        ) {
-            return Ok(Some(Value::Int(current)));
-        }
-    }
-    Ok(Some(Value::Int(0)))
+    // getAndIncrement returns the OLD value — exactly the previous value
+    // reported by a fetch-add of +1.
+    let prev = ctx.atomic_fetch_add_int(target, slot, 1)?;
+    Ok(Some(Value::Int(prev)))
 }
 
 fn native_aifu_get_and_decrement(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = arg_obj_or_npe(args, 0, "updater")?;
     let target = require_target(args, 1)?;
     let slot = impl_slot(ctx, this).unwrap_or(0);
-    for _ in 0..1024 {
-        let current = match ctx.get_field_volatile(target, slot) {
-            Value::Int(v) => v,
-            _ => 0,
-        };
-        if ctx.compare_and_swap_field(
-            target,
-            slot,
-            Value::Int(current),
-            Value::Int(current.wrapping_sub(1)),
-        ) {
-            return Ok(Some(Value::Int(current)));
-        }
-    }
-    Ok(Some(Value::Int(0)))
+    // getAndDecrement returns the OLD value (previous value of fetch-add -1).
+    let prev = ctx.atomic_fetch_add_int(target, slot, -1)?;
+    Ok(Some(Value::Int(prev)))
 }
 
 fn native_aifu_add_and_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -725,17 +707,10 @@ fn native_aifu_add_and_get(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         _ => 0,
     };
     let slot = impl_slot(ctx, this).unwrap_or(0);
-    for _ in 0..1024 {
-        let current = match ctx.get_field_volatile(target, slot) {
-            Value::Int(v) => v,
-            _ => 0,
-        };
-        let new_val = current.wrapping_add(delta);
-        if ctx.compare_and_swap_field(target, slot, Value::Int(current), Value::Int(new_val)) {
-            return Ok(Some(Value::Int(new_val)));
-        }
-    }
-    Ok(Some(Value::Int(0)))
+    // addAndGet returns the NEW value: fetch-add reports the previous value,
+    // so add the delta back to recover the post-update value.
+    let prev = ctx.atomic_fetch_add_int(target, slot, delta)?;
+    Ok(Some(Value::Int(prev.wrapping_add(delta))))
 }
 
 // ---------------------------------------------------------------------------
@@ -823,47 +798,25 @@ fn native_alfu_get_and_add(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
 
 // Long variants of getAndIncrement/getAndDecrement/addAndGet — see the int
 // equivalents for rationale (synthetic `$RustJvmImpl` doesn't inherit the base's
-// concrete methods).
+// concrete methods). All three route through the unbounded
+// `atomic_fetch_add_long` primitive, replacing a bounded CAS loop that returned
+// a fabricated 0 (applying no update) on contended loop exhaustion.
 fn native_alfu_get_and_increment(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = arg_obj_or_npe(args, 0, "updater")?;
     let target = require_target(args, 1)?;
     let slot = impl_slot(ctx, this).unwrap_or(0);
-    for _ in 0..1024 {
-        let current = match ctx.get_field_volatile(target, slot) {
-            Value::Long(v) => v,
-            _ => 0,
-        };
-        if ctx.compare_and_swap_field(
-            target,
-            slot,
-            Value::Long(current),
-            Value::Long(current.wrapping_add(1)),
-        ) {
-            return Ok(Some(Value::Long(current)));
-        }
-    }
-    Ok(Some(Value::Long(0)))
+    // getAndIncrement returns the OLD value (previous value of fetch-add +1).
+    let prev = ctx.atomic_fetch_add_long(target, slot, 1)?;
+    Ok(Some(Value::Long(prev)))
 }
 
 fn native_alfu_get_and_decrement(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = arg_obj_or_npe(args, 0, "updater")?;
     let target = require_target(args, 1)?;
     let slot = impl_slot(ctx, this).unwrap_or(0);
-    for _ in 0..1024 {
-        let current = match ctx.get_field_volatile(target, slot) {
-            Value::Long(v) => v,
-            _ => 0,
-        };
-        if ctx.compare_and_swap_field(
-            target,
-            slot,
-            Value::Long(current),
-            Value::Long(current.wrapping_sub(1)),
-        ) {
-            return Ok(Some(Value::Long(current)));
-        }
-    }
-    Ok(Some(Value::Long(0)))
+    // getAndDecrement returns the OLD value (previous value of fetch-add -1).
+    let prev = ctx.atomic_fetch_add_long(target, slot, -1)?;
+    Ok(Some(Value::Long(prev)))
 }
 
 fn native_alfu_add_and_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -874,17 +827,10 @@ fn native_alfu_add_and_get(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         _ => 0,
     };
     let slot = impl_slot(ctx, this).unwrap_or(0);
-    for _ in 0..1024 {
-        let current = match ctx.get_field_volatile(target, slot) {
-            Value::Long(v) => v,
-            _ => 0,
-        };
-        let new_val = current.wrapping_add(delta);
-        if ctx.compare_and_swap_field(target, slot, Value::Long(current), Value::Long(new_val)) {
-            return Ok(Some(Value::Long(new_val)));
-        }
-    }
-    Ok(Some(Value::Long(0)))
+    // addAndGet returns the NEW value: fetch-add reports the previous value,
+    // so add the delta back to recover the post-update value.
+    let prev = ctx.atomic_fetch_add_long(target, slot, delta)?;
+    Ok(Some(Value::Long(prev.wrapping_add(delta))))
 }
 
 // ---------------------------------------------------------------------------
@@ -2289,5 +2235,180 @@ mod tests {
         );
         assert_eq!(ref_descriptor_to_internal_name("[I"), None);
         assert_eq!(ref_descriptor_to_internal_name("I"), None);
+    }
+
+    // -----------------------------------------------------------------
+    // getAndIncrement / getAndDecrement / addAndGet return semantics.
+    //
+    // These accessors previously used a bounded CAS loop that, on
+    // contended loop exhaustion, returned a fabricated `0` and applied
+    // NO update. They now delegate to the unbounded `atomic_fetch_add_*`
+    // primitive. getAnd* must return the OLD value (and bump the slot);
+    // addAndGet must return the NEW value. The tests assert both the
+    // return value and the committed slot value so a regression to the
+    // bogus-0 fallthrough (which left the slot unchanged) would fail.
+    // -----------------------------------------------------------------
+
+    /// Build an int updater over field `n` (slot 0) of a fresh `Counter`
+    /// instance and return `(um, updater, target)`.
+    fn int_updater_over_slot0(start: i32) -> (UpdaterMock, ObjectRef, ObjectRef) {
+        let mut um = UpdaterMock::new();
+        let (tmirror, tcid) = make_class_mirror_um(&mut um, "Counter");
+        um.add_field(tcid, "n", "I", 0x0040, 0, false);
+        let name = um.create_string("n");
+        let updater = match native_aifu_new_updater(
+            &mut um,
+            &[Value::Object(Some(tmirror)), Value::Object(Some(name))],
+        )
+        .unwrap()
+        .unwrap()
+        {
+            Value::Object(Some(o)) => o,
+            _ => panic!(),
+        };
+        let target = um.alloc_object(tcid, 1);
+        um.set_field(target, 0, Value::Int(start));
+        (um, updater, target)
+    }
+
+    /// Build a long updater over field `v` (slot 0) of a fresh `LongHolder`.
+    fn long_updater_over_slot0(start: i64) -> (UpdaterMock, ObjectRef, ObjectRef) {
+        let mut um = UpdaterMock::new();
+        let (tmirror, tcid) = make_class_mirror_um(&mut um, "LongHolder");
+        um.add_field(tcid, "v", "J", 0x0040, 0, false);
+        let name = um.create_string("v");
+        let updater = match native_alfu_new_updater(
+            &mut um,
+            &[Value::Object(Some(tmirror)), Value::Object(Some(name))],
+        )
+        .unwrap()
+        .unwrap()
+        {
+            Value::Object(Some(o)) => o,
+            _ => panic!(),
+        };
+        let target = um.alloc_object(tcid, 1);
+        um.set_field(target, 0, Value::Long(start));
+        (um, updater, target)
+    }
+
+    #[test]
+    fn t19_h5_aifu_get_and_increment_returns_old_and_bumps_slot() {
+        let (mut um, updater, target) = int_updater_over_slot0(41);
+        let ret = native_aifu_get_and_increment(
+            &mut um,
+            &[Value::Object(Some(updater)), Value::Object(Some(target))],
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(ret, Value::Int(41), "getAndIncrement returns the OLD value");
+        assert_eq!(um.get_field(target, 0), Value::Int(42), "slot is bumped");
+    }
+
+    #[test]
+    fn t19_h5_aifu_get_and_decrement_returns_old_and_bumps_slot() {
+        let (mut um, updater, target) = int_updater_over_slot0(7);
+        let ret = native_aifu_get_and_decrement(
+            &mut um,
+            &[Value::Object(Some(updater)), Value::Object(Some(target))],
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(ret, Value::Int(7), "getAndDecrement returns the OLD value");
+        assert_eq!(
+            um.get_field(target, 0),
+            Value::Int(6),
+            "slot is decremented"
+        );
+    }
+
+    #[test]
+    fn t19_h5_aifu_add_and_get_returns_new_value() {
+        let (mut um, updater, target) = int_updater_over_slot0(100);
+        let ret = native_aifu_add_and_get(
+            &mut um,
+            &[
+                Value::Object(Some(updater)),
+                Value::Object(Some(target)),
+                Value::Int(-30),
+            ],
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(ret, Value::Int(70), "addAndGet returns the NEW value");
+        assert_eq!(
+            um.get_field(target, 0),
+            Value::Int(70),
+            "slot holds new value"
+        );
+    }
+
+    #[test]
+    fn t19_h5_alfu_get_and_increment_returns_old_and_bumps_slot() {
+        let (mut um, updater, target) = long_updater_over_slot0(9_000_000_000);
+        let ret = native_alfu_get_and_increment(
+            &mut um,
+            &[Value::Object(Some(updater)), Value::Object(Some(target))],
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            ret,
+            Value::Long(9_000_000_000),
+            "getAndIncrement returns the OLD value"
+        );
+        assert_eq!(um.get_field(target, 0), Value::Long(9_000_000_001));
+    }
+
+    #[test]
+    fn t19_h5_alfu_get_and_decrement_returns_old_and_bumps_slot() {
+        let (mut um, updater, target) = long_updater_over_slot0(1);
+        let ret = native_alfu_get_and_decrement(
+            &mut um,
+            &[Value::Object(Some(updater)), Value::Object(Some(target))],
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(ret, Value::Long(1), "getAndDecrement returns the OLD value");
+        assert_eq!(um.get_field(target, 0), Value::Long(0));
+    }
+
+    #[test]
+    fn t19_h5_alfu_add_and_get_returns_new_value() {
+        let (mut um, updater, target) = long_updater_over_slot0(1_000);
+        let ret = native_alfu_add_and_get(
+            &mut um,
+            &[
+                Value::Object(Some(updater)),
+                Value::Object(Some(target)),
+                Value::Long(250),
+            ],
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(ret, Value::Long(1_250), "addAndGet returns the NEW value");
+        assert_eq!(um.get_field(target, 0), Value::Long(1_250));
+    }
+
+    #[test]
+    fn t19_h5_int_accessors_accumulate_across_calls() {
+        // Sequential calls must accumulate (no fabricated-0 reset): the
+        // old bounded-loop fallthrough would have lost updates and broken
+        // this monotonic progression under contention.
+        let (mut um, updater, target) = int_updater_over_slot0(0);
+        for i in 0..5 {
+            let old = native_aifu_get_and_increment(
+                &mut um,
+                &[Value::Object(Some(updater)), Value::Object(Some(target))],
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(
+                old,
+                Value::Int(i),
+                "each getAndIncrement returns prior count"
+            );
+        }
+        assert_eq!(um.get_field(target, 0), Value::Int(5));
     }
 }

@@ -1869,6 +1869,59 @@ pub fn sk_table_update_after_gc<S: std::hash::BuildHasher>(
     }
 }
 
+/// GC root-scan hook — push every live `ObjectRef` reachable only through
+/// the selector tables onto `roots` so the moving GC keeps them alive (and
+/// records them for relocation). The orchestrator in `vm/src/memory/gc.rs`
+/// calls this during root enumeration; the symmetric post-compaction remap
+/// is `sk_table_update_after_gc` above.
+///
+/// Symmetry contract: this scans the EXACT same set of refs that
+/// `sk_table_update_after_gc` remaps — the per-selector `key_obj`
+/// (`SelectableKind`-bearing `KeyState`s in `selectors()`) plus each
+/// `SkState`'s `channel`, `selector`, and `attachment`. A ref that is
+/// remapped after GC but not rooted before it could be reclaimed (or
+/// relocated to an unmarked slot), so scan and remap must cover the
+/// identical fields.
+///
+/// Without this hook a SelectionKey whose only live references are in
+/// `sk_table` / the selector `keys` map is invisible to the collector:
+/// it can be swept before `sk_table_update_after_gc` ever runs (a UAF the
+/// remap cannot repair), or moved to a slot the scan never marked live.
+///
+/// `ObjectRef` is internally non-null, but we defensively skip any ref
+/// whose `as_ptr()` is null (the canonical null test — there is no
+/// `ObjectRef::is_null` that applies here) so a malformed entry can never
+/// inject a null root.
+pub fn gc_scan_selector_roots(roots: &mut Vec<cratonvm_types::ObjectRef>) {
+    let mut push = |obj: cratonvm_types::ObjectRef| {
+        if !obj.as_ptr().is_null() {
+            roots.push(obj);
+        }
+    };
+    // Lock order: `selectors()` before `sk_table()` — matches
+    // `sk_table_update_after_gc` and `apply_ready_ops`, so a concurrent GC
+    // hook can never deadlock against the remap path.
+    {
+        let regs = selectors().read();
+        for sel in regs.values() {
+            let st = sel.lock();
+            for k in st.keys.values() {
+                if let Some(obj) = k.key_obj {
+                    push(obj);
+                }
+            }
+        }
+    }
+    let table = sk_table().read();
+    for state in table.values() {
+        push(state.channel);
+        push(state.selector);
+        if let Some(att) = state.attachment {
+            push(att);
+        }
+    }
+}
+
 fn sk_state_get_field<F: FnOnce(&SkState) -> Value>(
     ctx: &mut dyn NativeContext,
     key: ObjectRef,
@@ -3157,5 +3210,100 @@ mod tests {
         let mut reg = cratonvm_native_api::NativeMethodRegistry::new();
         register_nio_selector_real(&mut reg);
         // No assertion on internal counts — just that it runs without panic.
+    }
+
+    /// Build a fake 8-byte-aligned `ObjectRef` from a small ordinal. Never
+    /// dereferenced — `gc_scan_selector_roots` only compares pointer
+    /// identity, so a synthetic non-heap pointer is sufficient here.
+    fn fake_ref(ordinal: usize) -> ObjectRef {
+        // 8-byte aligned, non-null, well clear of the low page.
+        let ptr = ((ordinal + 1) * 8 + 0x1_0000) as *mut u8;
+        // SAFETY: non-null and 8-byte aligned; only used for identity, the
+        // pointer is never read through.
+        unsafe { ObjectRef::from_raw(ptr) }
+    }
+
+    #[test]
+    fn gc_scan_selector_roots_collects_sk_table_and_key_obj_refs() {
+        // Seed a `SkState` carrying channel + selector + attachment, plus a
+        // per-selector `key_obj`, then prove the root scan reports every one
+        // — i.e. exactly the refs `sk_table_update_after_gc` remaps.
+        let channel = fake_ref(0x5100);
+        let selector = fake_ref(0x5200);
+        let attachment = fake_ref(0x5300);
+        let key_obj = fake_ref(0x5400);
+
+        // Unique key so the row is isolated from any other test's entries in
+        // the process-wide table.
+        let sk_key = 0x7E57_0001_u32 as i32;
+        {
+            let mut table = sk_table().write();
+            table.insert(
+                sk_key,
+                SkState {
+                    channel,
+                    selector,
+                    interest_ops: OP_READ,
+                    ready_ops: 0,
+                    attachment: Some(attachment),
+                    cancelled: false,
+                },
+            );
+        }
+
+        // A selector whose key carries a non-null `key_obj`.
+        let id = selector_open();
+        let fd = fake_fd();
+        selector_register(id, fd, OP_READ, Some(key_obj), 0x7E57_0002_u32 as i32, None).unwrap();
+
+        let mut roots: Vec<ObjectRef> = Vec::new();
+        gc_scan_selector_roots(&mut roots);
+
+        let contains = |r: ObjectRef| roots.iter().any(|x| x.as_ptr() == r.as_ptr());
+        assert!(contains(channel), "channel must be rooted");
+        assert!(contains(selector), "selector must be rooted");
+        assert!(contains(attachment), "attachment must be rooted");
+        assert!(contains(key_obj), "per-selector key_obj must be rooted");
+
+        // No null roots may ever be injected.
+        assert!(
+            roots.iter().all(|r| !r.as_ptr().is_null()),
+            "scan must never push a null root"
+        );
+
+        // Cleanup the process-wide seed so sibling tests are unaffected.
+        sk_table().write().remove(&sk_key);
+        selector_close(id);
+    }
+
+    #[test]
+    fn gc_scan_selector_roots_skips_absent_attachment() {
+        // An entry with no attachment contributes only channel + selector.
+        let channel = fake_ref(0x6100);
+        let selector = fake_ref(0x6200);
+        let sk_key = 0x7E57_0003_u32 as i32;
+        {
+            let mut table = sk_table().write();
+            table.insert(
+                sk_key,
+                SkState {
+                    channel,
+                    selector,
+                    interest_ops: 0,
+                    ready_ops: 0,
+                    attachment: None,
+                    cancelled: false,
+                },
+            );
+        }
+
+        let mut roots: Vec<ObjectRef> = Vec::new();
+        gc_scan_selector_roots(&mut roots);
+
+        let contains = |r: ObjectRef| roots.iter().any(|x| x.as_ptr() == r.as_ptr());
+        assert!(contains(channel), "channel must be rooted");
+        assert!(contains(selector), "selector must be rooted");
+
+        sk_table().write().remove(&sk_key);
     }
 }

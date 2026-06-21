@@ -11,6 +11,7 @@
 
 use std::fmt;
 use std::ptr::NonNull;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// A JVM runtime value.
 ///
@@ -90,6 +91,119 @@ fn debug_assert_aligned(ptr: *mut u8) {
     );
 }
 
+// ---------------------------------------------------------------------------
+// MED (full-review-2026-06-20 #row "ObjectRef Send+Sync sound only by accident
+// of the single-threaded scheduler"): single-OS-thread invariant tripwire.
+// ---------------------------------------------------------------------------
+//
+// The `unsafe impl Send/Sync for ObjectRef` below is justified *today* only
+// because every Java thread runs on a single OS thread under cooperative
+// scheduling (see soundness argument point (4)). That is a runtime property
+// the type system cannot encode. This tripwire turns it into a checkable,
+// fail-loud invariant: it records the first OS thread to construct an
+// `ObjectRef` and aborts if a *different* OS thread ever constructs one.
+//
+// It is **opt-in**, gated on the `CRATONVM_ASSERT_SINGLE_OS_THREAD` env var,
+// for two reasons:
+//   * the default (production) path must pay no atomic-load cost in the hot
+//     object-construction path beyond a single relaxed load;
+//   * the crate test harness (and parallel `cargo test`) legitimately
+//     constructs `ObjectRef`s from many worker threads, so an always-on guard
+//     would spuriously trip. Production VM launches that have NOT yet enabled
+//     multi-OS-thread Java execution can set the var to get a loud failure the
+//     instant a future threading change violates the assumption these
+//     `unsafe impl`s rest on — exactly the "fail loudly rather than silently
+//     becoming unsound" the review asks for.
+//
+// Sentinel `0` means "no thread recorded yet". `std::thread::ThreadId` is not
+// a stable integer, so we derive a non-zero u64 token from it via its `Hash`.
+const SINGLE_THREAD_GUARD_UNSET: u64 = 0;
+static SINGLE_THREAD_GUARD: AtomicU64 = AtomicU64::new(SINGLE_THREAD_GUARD_UNSET);
+
+/// Derive a stable, non-zero u64 token for the current OS thread.
+///
+/// `ThreadId`'s integer value is intentionally opaque, so we hash it. The low
+/// bit is forced on to guarantee the result never collides with the
+/// `SINGLE_THREAD_GUARD_UNSET` sentinel (`0`).
+#[inline]
+fn current_thread_token() -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    std::thread::current().id().hash(&mut hasher);
+    hasher.finish() | 1
+}
+
+/// Returns `true` if the single-OS-thread tripwire is enabled.
+///
+/// Read once and cached for the process lifetime so the hot construction path
+/// pays only a single relaxed atomic load, not an `std::env::var` syscall.
+#[inline]
+fn single_thread_guard_enabled() -> bool {
+    // 0 = unknown, 1 = disabled, 2 = enabled.
+    static CACHED: AtomicU64 = AtomicU64::new(0);
+    match CACHED.load(Ordering::Relaxed) {
+        1 => false,
+        2 => true,
+        _ => {
+            let on = std::env::var_os("CRATONVM_ASSERT_SINGLE_OS_THREAD")
+                .map(|v| v != "0" && v != "")
+                .unwrap_or(false);
+            CACHED.store(if on { 2 } else { 1 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// Core of the single-OS-thread tripwire, factored out so it can be unit
+/// tested directly against an arbitrary guard cell without touching the
+/// process-global one.
+///
+/// Records `token` as the owning thread on first observation; on any later
+/// observation, returns `Err(recorded)` if `token` differs from the recorded
+/// owner. Returns `Ok(())` when the invariant holds.
+#[inline]
+fn check_single_thread_against(guard: &AtomicU64, token: u64) -> Result<(), u64> {
+    // CAS the sentinel to claim ownership; if another thread already claimed
+    // it, `compare_exchange` fails and hands back the recorded owner.
+    match guard.compare_exchange(
+        SINGLE_THREAD_GUARD_UNSET,
+        token,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    ) {
+        Ok(_) => Ok(()), // we are the first; invariant trivially holds.
+        Err(recorded) if recorded == token => Ok(()), // same thread again.
+        Err(recorded) => Err(recorded), // a *different* OS thread — violation.
+    }
+}
+
+/// Assert the single-OS-thread invariant the `Send`/`Sync` impls rely on, if
+/// the tripwire is enabled. Cold and never-inlined so the enabled-check stays
+/// a cheap predictable branch on the hot path.
+#[cold]
+#[inline(never)]
+fn single_thread_guard_violation(recorded: u64, token: u64) -> ! {
+    panic!(
+        "ObjectRef constructed on a second OS thread (recorded={recorded:#x}, \
+         current={token:#x}). The `unsafe impl Send/Sync for ObjectRef` is sound \
+         only under single-OS-thread Java execution; multi-OS-thread execution \
+         requires re-deriving Send/Sync (handle indirection or per-thread \
+         transfer barriers). See the soundness note in types/src/value.rs."
+    );
+}
+
+/// Hot-path entry: enforce the single-OS-thread invariant when the tripwire is
+/// armed. A no-op (single relaxed load) otherwise.
+#[inline]
+fn enforce_single_os_thread() {
+    if single_thread_guard_enabled() {
+        let token = current_thread_token();
+        if let Err(recorded) = check_single_thread_against(&SINGLE_THREAD_GUARD, token) {
+            single_thread_guard_violation(recorded, token);
+        }
+    }
+}
+
 impl ObjectRef {
     /// Create a new object reference from a raw pointer.
     ///
@@ -123,6 +237,9 @@ impl ObjectRef {
         // assertion text and check site are identical.
         // SAFETY: callers guarantee `ptr` is non-null and 8-byte aligned.
         debug_assert_aligned(ptr);
+        // MED tripwire: assert the single-OS-thread invariant the Send/Sync
+        // impls rely on (opt-in via CRATONVM_ASSERT_SINGLE_OS_THREAD).
+        enforce_single_os_thread();
         Self {
             ptr: unsafe { NonNull::new_unchecked(ptr) },
         }
@@ -144,6 +261,9 @@ impl ObjectRef {
         // via the shared `debug_assert_aligned` helper for consistency with
         // `from_raw`.
         debug_assert_aligned(ptr.as_ptr());
+        // MED tripwire: assert the single-OS-thread invariant the Send/Sync
+        // impls rely on (opt-in via CRATONVM_ASSERT_SINGLE_OS_THREAD).
+        enforce_single_os_thread();
         Self { ptr }
     }
 
@@ -204,6 +324,16 @@ impl ObjectRef {
 // If any of those cannot be guaranteed, this `unsafe impl` becomes unsound and
 // must be replaced (e.g. with a handle indirection or an explicit `!Send`
 // marker plus per-thread transfer barriers). Do NOT silently rely on it.
+//
+// TRIPWIRE: the single-OS-thread invariant in point (4) — the *only* property
+// that makes (1)-(3) hold today — is enforced at runtime by
+// `enforce_single_os_thread()` in `ObjectRef::from_raw` / `from_raw_nonnull`,
+// opt-in via the `CRATONVM_ASSERT_SINGLE_OS_THREAD` env var. With the tripwire
+// armed, the first OS thread to construct an `ObjectRef` claims ownership and
+// any construction from a *second* OS thread aborts loudly with a pointer to
+// this note. That turns "sound by accident of the scheduler" into a guarded
+// assumption that fails fast the instant a future multi-OS-thread Java
+// execution path violates it, rather than silently becoming unsound.
 unsafe impl Send for ObjectRef {}
 unsafe impl Sync for ObjectRef {}
 
@@ -583,5 +713,80 @@ mod tests {
         let ptr = 0xDEAD_BEE0_u64 as *mut u8;
         let obj = unsafe { ObjectRef::from_raw(ptr) };
         assert_eq!(obj.as_ptr(), ptr);
+    }
+
+    // ---- single-OS-thread Send/Sync tripwire ----
+
+    #[test]
+    fn current_thread_token_is_nonzero_and_stable() {
+        // Must never collide with the SINGLE_THREAD_GUARD_UNSET sentinel,
+        // otherwise a freshly-claimed guard would look unclaimed.
+        let a = current_thread_token();
+        let b = current_thread_token();
+        assert_ne!(a, SINGLE_THREAD_GUARD_UNSET);
+        assert_eq!(a, b, "token must be stable for the same OS thread");
+    }
+
+    #[test]
+    fn single_thread_guard_first_claim_then_same_thread_ok() {
+        // A fresh guard cell: first claim succeeds, repeat from the same token
+        // succeeds (no violation), exercising the cooperative-scheduler case.
+        let guard = AtomicU64::new(SINGLE_THREAD_GUARD_UNSET);
+        let token = current_thread_token();
+        assert_eq!(check_single_thread_against(&guard, token), Ok(()));
+        assert_eq!(check_single_thread_against(&guard, token), Ok(()));
+        // The owner is now recorded as our token.
+        assert_eq!(guard.load(Ordering::Acquire), token);
+    }
+
+    #[test]
+    fn single_thread_guard_detects_second_thread() {
+        // Simulate a second OS thread by claiming the guard with one token,
+        // then probing with a different one — must report a violation that
+        // hands back the recorded owner.
+        let guard = AtomicU64::new(SINGLE_THREAD_GUARD_UNSET);
+        let first = 0xAAAA_AAAA_AAAA_AAA1_u64; // low bit set, like real tokens
+        let second = 0xBBBB_BBBB_BBBB_BBB1_u64;
+        assert_eq!(check_single_thread_against(&guard, first), Ok(()));
+        assert_eq!(check_single_thread_against(&guard, second), Err(first));
+        // Recorded owner is unchanged by a failed probe.
+        assert_eq!(guard.load(Ordering::Acquire), first);
+    }
+
+    #[test]
+    fn single_thread_guard_concurrent_claim_loses_one() {
+        // Two threads racing to construct the first ObjectRef: exactly one
+        // wins the CAS; the other observes the winner's token and (since the
+        // tokens differ) would trip the tripwire. This proves the guard does
+        // not silently accept a genuine second OS thread.
+        let guard = std::sync::Arc::new(AtomicU64::new(SINGLE_THREAD_GUARD_UNSET));
+        let g2 = std::sync::Arc::clone(&guard);
+        let token_a = 0x1111_1111_1111_1111_u64;
+        let token_b = 0x2222_2222_2222_2223_u64;
+        let handle = std::thread::spawn(move || check_single_thread_against(&g2, token_b));
+        let r_a = check_single_thread_against(&guard, token_a);
+        let r_b = handle.join().unwrap();
+        // Exactly one of the two distinct tokens wins the claim.
+        let recorded = guard.load(Ordering::Acquire);
+        assert!(recorded == token_a || recorded == token_b);
+        // The winner sees Ok, the loser sees Err(recorded-winner).
+        let oks = [r_a, r_b].iter().filter(|r| r.is_ok()).count();
+        assert_eq!(oks, 1, "exactly one claimant may win");
+        let errs = [r_a, r_b];
+        let err = errs.iter().find(|r| r.is_err()).unwrap();
+        assert_eq!(*err, Err(recorded));
+    }
+
+    #[test]
+    fn send_sync_invariant_layout_holds() {
+        // The Send/Sync impls assume ObjectRef stays a bare pointer-sized
+        // value (no added synchronization state). Re-assert it here so a field
+        // addition that would invalidate the soundness argument is caught.
+        assert_eq!(
+            std::mem::size_of::<ObjectRef>(),
+            std::mem::size_of::<*mut u8>()
+        );
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<ObjectRef>();
     }
 }

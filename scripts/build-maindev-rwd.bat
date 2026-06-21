@@ -1,15 +1,25 @@
 @echo off
-REM Incremental release build for the MAIN dev checkout (verify cherry-picked fixes compile).
-REM libffi cached (prior build present); renamed toolchain survives peer taskkill.
+REM Incremental release-with-debug build for the MAIN dev checkout (verify cherry-picked fixes compile).
+REM Uses the standard cargo/rustc on PATH by default; set CARGO and/or RUSTC to
+REM override (e.g. a renamed, kill-proof toolchain). The cargo registry root is
+REM taken from CARGO_HOME (default %USERPROFILE%\.cargo), and the libffi-sys
+REM include dirs are discovered there and prepended to INCLUDE before vcvars.
 cd /d "%~dp0"
-set "FFI1=C:\Users\Victor\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\libffi-sys-2.3.0"
-set "FFI2=C:\Users\Victor\.cargo\registry\src\index.crates.io-6f17d22bba15001f\libffi-sys-2.3.0"
-set "INCLUDE=%FFI1%\libffi;%FFI1%\libffi\include;%FFI1%\include\msvc;%FFI1%\libffi\src\x86;%FFI2%\libffi;%FFI2%\libffi\include;%FFI2%\include\msvc;%FFI2%\libffi\src\x86"
+if not defined CARGO_HOME set "CARGO_HOME=%USERPROFILE%\.cargo"
+set "INCLUDE="
+for /d %%D in ("%CARGO_HOME%\registry\src\*\libffi-sys-*") do call :addffi "%%~fD"
 call "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
 set VCINSTALLDIR=
 set VSCMD_ARG_TGT_ARCH=
 set CARGO_TARGET_DIR=
 set RUST_MIN_STACK=536870912
 set PATH=%PATH%;C:\Program Files\Git\usr\bin;C:\ProgramData\chocolatey\bin
-set "RUSTC=C:\Users\Victor\.rustup\toolchains\stable-x86_64-pc-windows-msvc\bin\rsc_cv20.exe"
-"C:\Users\Victor\.rustup\toolchains\stable-x86_64-pc-windows-msvc\bin\cgo_cv20.exe" build --profile release-with-debug -p cratonvm-cli %*
+if not defined RUSTC set "RUSTC=rustc"
+if not defined CARGO set "CARGO=cargo"
+"%CARGO%" build --profile release-with-debug -p cratonvm-cli %*
+goto :eof
+
+:addffi
+set "FFI=%~1"
+set "INCLUDE=%INCLUDE%%FFI%\libffi;%FFI%\libffi\include;%FFI%\include\msvc;%FFI%\libffi\src\x86;"
+goto :eof

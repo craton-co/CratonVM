@@ -611,6 +611,10 @@ fn maybe_gc_forced(shared: &SharedVm, thread: &mut JvmThread) {
     // TLAB bugs. Surfaced as a SIGSEGV in the moving collector's post-copy
     // `pointer_map` walk under multi-threaded churn (TestFileStoreConcurrency).
     thread.tlab.retire();
+    // GC-overhead accounting: live set BEFORE the collection (post-TLAB-retire),
+    // so `note_gc_productivity` can compute how much this forced GC actually
+    // freed (`before - after`). See `note_gc_productivity` / `gc_overhead_limit_exceeded`.
+    let before_live = shared.heap.allocated_bytes();
     // Round-5 fix (CRIT — UAF): see comment in `maybe_gc`. The forced
     // path is also an initiator path; drain its per-thread SATB buffer
     // before scanning roots.
@@ -634,6 +638,7 @@ fn maybe_gc_forced(shared: &SharedVm, thread: &mut JvmThread) {
         shared
             .gc_cycle_count
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        note_gc_productivity(shared, before_live);
     } else {
         if shared.gc_barrier.request_stw(thread.thread_id, alive_count) {
             shared.gc_barrier.wait_for_all();
@@ -653,10 +658,82 @@ fn maybe_gc_forced(shared: &SharedVm, thread: &mut JvmThread) {
             shared
                 .gc_cycle_count
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            note_gc_productivity(shared, before_live);
         } else {
             safepoint_check(shared, thread);
         }
     }
+}
+
+/// Default number of consecutive unproductive allocation-failure GCs (each
+/// leaving the heap ≥98% full) after which the allocation paths declare OOM
+/// instead of continuing to GC-thrash. Overridable via
+/// `CRATONVM_GC_OVERHEAD_LIMIT` (set to `0` to disable the limit entirely).
+const GC_OVERHEAD_LIMIT_CYCLES: u32 = 8;
+
+/// After a forced (allocation-failure) GC completes, record whether it was
+/// *productive* — i.e. whether it actually relieved heap pressure. Measured as
+/// the bytes it freed: `before - after` live bytes, where `before` is the live
+/// set at `maybe_gc_forced` entry (post-TLAB-retire) and `after` is the live set
+/// once the collection finishes. A forced GC that freed < 2% of total heap
+/// capacity counts toward the GC-overhead streak; one that freed more resets it.
+///
+/// The *freed-amount* signal (not post-GC fullness) is the right one for a
+/// generational heap: in a retained-allocation death-spiral the young semi-space
+/// is emptied every cycle (so total *fullness* sits near young/total ≈ 50% and
+/// never looks exhausted), yet the GC frees ~nothing net because every survivor
+/// is promoted into an already-full old generation. `before - after` captures
+/// exactly that — promotion is not freeing, so it does not reset the streak.
+/// Forced GCs only happen on genuine allocation failure (young full *and*
+/// promotion blocked), so this never fires during ordinary young-GC churn.
+fn note_gc_productivity(shared: &SharedVm, before_live: usize) {
+    let cap = shared.heap.heap_capacity();
+    if cap == 0 {
+        return;
+    }
+    let after_live = shared.heap.allocated_bytes();
+    let freed = before_live.saturating_sub(after_live);
+    // unproductive: freed < 2% of capacity
+    let unproductive = (freed as u128) * 100 < (cap as u128) * 2;
+    let streak = if unproductive {
+        shared
+            .gc_unproductive_streak
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1
+    } else {
+        shared
+            .gc_unproductive_streak
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        0
+    };
+    if std::env::var_os("CRATONVM_DBG_GC_OVERHEAD").is_some() {
+        eprintln!(
+            "[GC_OVERHEAD] before={before_live} after={after_live} freed={freed} cap={cap} unproductive={unproductive} streak={streak}"
+        );
+    }
+}
+
+/// Returns `true` when the heap has GC-thrashed past the overhead limit — i.e.
+/// `GC_OVERHEAD_LIMIT_CYCLES` consecutive forced GCs each freed < 2% of the
+/// heap. The allocation-failure paths call this right after `maybe_gc_forced`
+/// and, when it is `true`, surface a catchable `OutOfMemoryError` (the
+/// pre-allocated `singleton_oom`) instead of retrying into an O(n²) death-spiral
+/// on a heap full of live (retained) objects. Mirrors HotSpot's
+/// `UseGCOverheadLimit`. Disabled (always `false`) when
+/// `CRATONVM_GC_OVERHEAD_LIMIT=0`.
+pub fn gc_overhead_limit_exceeded(shared: &SharedVm) -> bool {
+    let limit = match std::env::var("CRATONVM_GC_OVERHEAD_LIMIT") {
+        Ok(v) => match v.trim().parse::<u32>() {
+            Ok(0) => return false, // explicitly disabled
+            Ok(n) => n,
+            Err(_) => GC_OVERHEAD_LIMIT_CYCLES,
+        },
+        Err(_) => GC_OVERHEAD_LIMIT_CYCLES,
+    };
+    shared
+        .gc_unproductive_streak
+        .load(std::sync::atomic::Ordering::Relaxed)
+        >= limit
 }
 
 /// Force a GC cycle from a native method (e.g. System.gc()).
@@ -1346,6 +1423,18 @@ fn alloc_object_shared(
     // Retire TLAB before GC — its memory is in the arena that will be collected
     thread.tlab.retire();
     maybe_gc_forced(shared, thread);
+    // GC-overhead limit: if repeated forced GCs have freed almost nothing, the
+    // heap is full of live objects — declare OOM now rather than retrying into a
+    // death-spiral (a sliver freed each cycle would otherwise let allocation
+    // limp on, GC-thrashing). The catch site / drain surfaces the singleton.
+    if gc_overhead_limit_exceeded(shared) {
+        maybe_dump_heap_on_oom(shared);
+        return Err(MethodCallFailed::InternalError(VmError::Runtime(
+            RuntimeError::OutOfMemoryError {
+                message: format!("Java heap space (alloc_object with {} fields)", num_fields),
+            },
+        )));
+    }
     shared
         .heap
         .try_alloc_object(class_id, num_fields)
@@ -1414,6 +1503,16 @@ fn gc_alloc_array(
     // Retire TLAB before GC
     thread.tlab.retire();
     maybe_gc_forced(shared, thread);
+    // GC-overhead limit (see alloc_object_shared): bail to OOM if the heap is
+    // GC-thrashing rather than spinning on slivers.
+    if gc_overhead_limit_exceeded(shared) {
+        maybe_dump_heap_on_oom(shared);
+        return Err(MethodCallFailed::InternalError(VmError::Runtime(
+            RuntimeError::OutOfMemoryError {
+                message: format!("Java heap space (alloc_array length {})", length),
+            },
+        )));
+    }
     shared
         .heap
         .try_alloc_array(class_id, element_type, length)
@@ -7076,23 +7175,34 @@ fn find_exception_handler_any_pc(
 /// its own `catch (Throwable)` (Jetty `start.jar` launcher: the launcher's
 /// usage-error handling never ran, surfacing a misleading inner NPE instead).
 ///
-/// Mirroring `route_jit_exception_through_method`: skip catch-all
-/// (`catch_type == 0`, i.e. `finally`) entries — without a known PC they
-/// could swallow an exception thrown outside their region — but match typed
-/// handlers by exception class, which is sound regardless of throw site.
+/// Mirroring `route_jit_exception_through_method`: without a known PC we
+/// cannot range-check a handler, so a catch-all (`catch_type == 0`, i.e.
+/// `finally`) is only honoured when its protected region covers the **whole
+/// method** (`start_pc == 0 && end_pc >= code_len`) — such an entry catches a
+/// throw at any PC, so running it is sound regardless of the (unknown) throw
+/// site. This preserves `finally` / synchronized-monitor-exit cleanup for the
+/// dominant method-wide case instead of dropping it. Narrower catch-all
+/// regions are still skipped (they could swallow an out-of-region exception),
+/// and typed handlers match by exception class as before.
 fn find_exception_handler_pc_unknown(
     shared: &SharedVm,
     frame: &Frame,
     exc: ObjectRef,
 ) -> Option<(usize, ObjectRef)> {
     let exc_class_id = shared.heap.class_id_of(exc);
+    // `frame.code` is padded with 2 trailing bytes for the interpreter's
+    // speculative reads; the real bytecode length is `len() - 2`.
+    let code_len = frame.code.len().saturating_sub(2);
     let mut cm_guard = shared.class_manager.read();
     cm_guard.get_class(frame.class_id)?;
     for entry in frame.exception_table().iter() {
-        // PC unknown → cannot verify range membership; conservatively skip
-        // catch-all entries (they would catch anything) but still allow
-        // typed handlers to match on exception class.
+        // PC unknown → cannot verify range membership. Honour a catch-all only
+        // when it spans the entire method (always covers the throw site);
+        // otherwise skip it (it could catch an out-of-region exception).
         if entry.catch_type == 0 {
+            if entry.start_pc == 0 && entry.end_pc as usize >= code_len {
+                return Some((entry.handler_pc as usize, exc));
+            }
             continue;
         }
         let owning_class = cm_guard.get_class(frame.class_id)?;
@@ -7208,10 +7318,14 @@ fn find_exception_handler_impl(
 /// `throw_pc` is the bytecode PC of the throw site within the JIT'd method,
 /// if known. Pass `usize::MAX` when the throw-site PC cannot be recovered
 /// (the JIT currently does not record one in `JIT_PENDING_EXCEPTION`); in
-/// that case, catch-all (`catch_type == 0`, i.e. `finally`) entries are
-/// skipped because they would otherwise unconditionally swallow exceptions
-/// thrown from outside the protected region. Typed handlers still match by
-/// exception class since that is safe regardless of the throw site.
+/// that case a catch-all (`catch_type == 0`, i.e. `finally`) entry is honoured
+/// only when its protected region spans the **whole method**
+/// (`start_pc == 0 && end_pc >= code_len`) — such an entry covers any throw
+/// site, so running it is sound and preserves `finally` /
+/// synchronized-monitor-exit cleanup. Narrower catch-all regions are skipped
+/// (they could swallow an exception thrown outside the protected region).
+/// Typed handlers still match by exception class since that is safe regardless
+/// of the throw site.
 ///
 /// If a matching handler is found, a bytecode frame for the JIT'd method
 /// is pushed with `pc` at the handler and the exception on the operand
@@ -7232,6 +7346,10 @@ fn route_jit_exception_through_method(
     }
 
     let pc_unknown = throw_pc == usize::MAX;
+    // `cached.code` is padded with 2 trailing bytes for speculative reads;
+    // the real bytecode length is `len() - 2`. Used to recognise a catch-all
+    // whose region covers the whole method when the throw PC is unknown.
+    let code_len = cached.code.len().saturating_sub(2);
     let exc_class_id = shared.heap.class_id_of(exc);
     let mut handler_pc: Option<usize> = None;
     // HIGH — same fast-path treatment as `find_exception_handler`:
@@ -7246,12 +7364,16 @@ fn route_jit_exception_through_method(
         // in the method (the original bug here).
         //
         // When the throw PC is unknown (`usize::MAX`, sentinel), we cannot
-        // verify range membership. In that case we conservatively skip
-        // catch-all entries (they would catch anything) but still allow
-        // typed handlers to match on exception class — wrong-type
-        // exceptions cannot be silently swallowed that way.
+        // verify range membership. A catch-all (`catch_type == 0`) is honoured
+        // only when its protected region spans the whole method
+        // (`start_pc == 0 && end_pc >= code_len`) — it then covers the
+        // (unknown) throw site, so running its `finally` / monitor-exit
+        // cleanup is sound. Narrower catch-all regions are skipped (they could
+        // catch an out-of-region exception); typed handlers still match on
+        // exception class — wrong-type exceptions cannot be silently swallowed.
         if pc_unknown {
-            if entry.catch_type == 0 {
+            if entry.catch_type == 0 && !(entry.start_pc == 0 && entry.end_pc as usize >= code_len)
+            {
                 continue;
             }
         } else if throw_pc < entry.start_pc as usize || throw_pc >= entry.end_pc as usize {
@@ -16342,7 +16464,13 @@ fn try_osr(
             {
                 if let Some((entry, needs_ctx)) =
                     // Eager direct-call callee compile — optimized (C2) tier.
-                    try_jit_compile_callee(shared, &callee_class, &callee_method, &callee_desc, true)
+                    try_jit_compile_callee(
+                        shared,
+                        &callee_class,
+                        &callee_method,
+                        &callee_desc,
+                        true,
+                    )
                 {
                     direct_calls2.push((
                         ipc,
@@ -17570,8 +17698,11 @@ fn try_jit_upgrade_with_gate(
                 // Early-compile path is the optimized (C2-equivalent) tier — the
                 // tiered C1 routing only flows through the background worker.
                 true,
-                // Gap B: int-only invokestatic → Op::Call, gated default-OFF.
-                std::env::var_os("CRATONVM_JIT_IR_CALL").is_some(),
+                // Gap B: int-only invokestatic → Op::Call. Now default-ON
+                // (inc 23, soaked: bt10/14/16/18 == HotSpot + IrCall/IrCallGc
+                // probes == HotSpot, ON==OFF). `CRATONVM_JIT_IR_CALL=0` is the
+                // opt-out — restores single-pass dispatch for invokestatic.
+                std::env::var("CRATONVM_JIT_IR_CALL").map_or(true, |v| v != "0"),
             )?;
             let entry = compiled.entry_ptr() as usize; // Cast: JIT entry point to address
             let needs_ctx = compiled.needs_context();
@@ -17675,8 +17806,9 @@ fn try_jit_upgrade_with_gate(
         },
         // Inline mutator compile path is the optimized (C2-equivalent) tier.
         true,
-        // Gap B: int-only invokestatic → Op::Call, gated default-OFF.
-        std::env::var_os("CRATONVM_JIT_IR_CALL").is_some(),
+        // Gap B: int-only invokestatic → Op::Call. Now default-ON (inc 23);
+        // `CRATONVM_JIT_IR_CALL=0` is the opt-out (single-pass dispatch).
+        std::env::var("CRATONVM_JIT_IR_CALL").map_or(true, |v| v != "0"),
     )?;
     let ret = crate::jit::return_type(&cached.method_descriptor);
     let heap = compiled.needs_heap();
@@ -18243,8 +18375,9 @@ fn try_jit_compile_callee_slow(
         // Inline JIT-dispatch callers pass `true` (optimized C2); the background
         // tiered worker passes the C1/C2 value derived from the task's tier.
         optimize,
-        // Gap B: int-only invokestatic → Op::Call, gated default-OFF.
-        std::env::var_os("CRATONVM_JIT_IR_CALL").is_some(),
+        // Gap B: int-only invokestatic → Op::Call. Now default-ON (inc 23);
+        // `CRATONVM_JIT_IR_CALL=0` is the opt-out (single-pass dispatch).
+        std::env::var("CRATONVM_JIT_IR_CALL").map_or(true, |v| v != "0"),
     )?;
     if std::env::var_os("CRATONVM_DBG_JITC").is_some() {
         eprintln!(
@@ -22957,6 +23090,75 @@ mod tests {
         let unwound_pc = post_invoke_pc.saturating_sub(1);
         assert!(unwound_pc >= entry.start_pc as usize);
         assert!(unwound_pc < entry.end_pc as usize);
+    }
+
+    // Regression guard for the JIT-unknown-PC unwind path
+    // (`find_exception_handler_pc_unknown` / `route_jit_exception_through_method`):
+    // when the throw-site PC cannot be recovered, a catch-all / `finally`
+    // entry must still be honoured *iff* its protected region spans the whole
+    // method (`start_pc == 0 && end_pc >= code_len`), so `finally` /
+    // synchronized-monitor-exit cleanup is not silently skipped. A narrower
+    // catch-all is rejected (it could swallow an out-of-region exception).
+    // This exercises the exact predicate both functions use; `code_len` is the
+    // *unpadded* bytecode length (`code.len() - 2`).
+    #[test]
+    fn pc_unknown_catch_all_honored_only_for_whole_method() {
+        use cratonvm_reader::attribute::ExceptionTableEntry;
+
+        // Padded bytecode (real body is 40 bytes; +2 trailing padding bytes).
+        let padded_code_len = 42usize;
+        let code_len = padded_code_len.saturating_sub(2);
+        assert_eq!(code_len, 40);
+
+        // The predicate factored out of the unwind loop.
+        let honored = |e: &ExceptionTableEntry| {
+            e.catch_type == 0 && e.start_pc == 0 && e.end_pc as usize >= code_len
+        };
+
+        // Whole-method finally: start at 0, end at the code length → honored.
+        let whole = ExceptionTableEntry {
+            start_pc: 0,
+            end_pc: 40,
+            handler_pc: 40,
+            catch_type: 0,
+        };
+        assert!(honored(&whole), "method-wide finally must run");
+
+        // `end_pc` past the body (e.g. equal to padded len) still covers it.
+        let whole_over = ExceptionTableEntry {
+            end_pc: 41,
+            ..whole
+        };
+        assert!(honored(&whole_over));
+
+        // Narrow catch-all that does NOT start at 0 → skipped (could catch an
+        // out-of-region throw when the PC is unknown).
+        let narrow_start = ExceptionTableEntry {
+            start_pc: 4,
+            end_pc: 40,
+            handler_pc: 40,
+            catch_type: 0,
+        };
+        assert!(!honored(&narrow_start));
+
+        // Catch-all that ends before the method end → skipped.
+        let narrow_end = ExceptionTableEntry {
+            start_pc: 0,
+            end_pc: 20,
+            handler_pc: 20,
+            catch_type: 0,
+        };
+        assert!(!honored(&narrow_end));
+
+        // A *typed* handler (catch_type != 0) is never honored by this
+        // catch-all predicate; it matches by exception class elsewhere.
+        let typed = ExceptionTableEntry {
+            start_pc: 0,
+            end_pc: 40,
+            handler_pc: 40,
+            catch_type: 7,
+        };
+        assert!(!honored(&typed));
     }
 
     // -----------------------------------------------------------------------

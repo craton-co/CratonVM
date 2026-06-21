@@ -11,6 +11,7 @@
 //! - `gc+heap=debug:stderr` — gc+heap at debug to stderr
 //! - `gc*=trace:file=gc.log:time,level,tags` — GC trace to file with decorators
 
+use std::collections::HashMap;
 use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
@@ -461,8 +462,8 @@ pub struct UnifiedLogger {
     rules: Vec<LogRule>,
     start_time: Instant,
     pid: u32,
-    /// Open file handles for `File` outputs, keyed by canonical path string.
-    file_handles: Mutex<Vec<(PathBuf, File)>>,
+    /// Open file handles for `File` outputs, keyed by path for O(1) lookup.
+    file_handles: Mutex<HashMap<PathBuf, File>>,
 }
 
 impl fmt::Debug for UnifiedLogger {
@@ -510,7 +511,7 @@ impl UnifiedLogger {
             rules,
             start_time: Instant::now(),
             pid: std::process::id(),
-            file_handles: Mutex::new(Vec::new()),
+            file_handles: Mutex::new(HashMap::new()),
         })
     }
 
@@ -660,9 +661,9 @@ impl UnifiedLogger {
             Err(poisoned) => poisoned.into_inner(),
         };
 
-        // Find or create the file handle
-        let file = if let Some(pos) = handles.iter().position(|(p, _)| p == path) {
-            &mut handles[pos].1
+        // Find or create the file handle (O(1) keyed lookup).
+        let file = if handles.contains_key(path) {
+            handles.get_mut(path).expect("present (just checked)")
         } else {
             let f = match OpenOptions::new().create(true).append(true).open(path) {
                 Ok(f) => f,
@@ -675,9 +676,7 @@ impl UnifiedLogger {
                     return;
                 }
             };
-            handles.push((path.to_path_buf(), f));
-            let last = handles.len() - 1;
-            &mut handles[last].1
+            handles.entry(path.to_path_buf()).or_insert(f)
         };
 
         let _ = writeln!(file, "{line}");
@@ -1220,6 +1219,37 @@ mod tests {
         );
 
         // Clean up
+        let _ = std::fs::remove_file(&log_path);
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn file_output_reuses_handle_and_appends() {
+        // Exercises the find-or-create handle lookup: repeated logs to the same
+        // path must reuse the cached handle (one map entry) and append in order.
+        let dir = std::env::temp_dir().join("cratonvm_unified_log_reuse_test");
+        let _ = std::fs::create_dir_all(&dir);
+        let log_path = dir.join("reuse.log");
+        let _ = std::fs::remove_file(&log_path);
+
+        let spec = format!("gc=info:file={}", log_path.display());
+        let logger = UnifiedLogger::parse(&spec).unwrap();
+        logger.log(&[LogTag::Gc], LogLevel::Info, "first");
+        logger.log(&[LogTag::Gc], LogLevel::Info, "second");
+        logger.log(&[LogTag::Gc], LogLevel::Info, "third");
+
+        // Exactly one cached handle for the single path.
+        {
+            let handles = logger.file_handles.lock().unwrap();
+            assert_eq!(handles.len(), 1);
+        }
+
+        let contents = std::fs::read_to_string(&log_path).unwrap();
+        let first = contents.find("first").expect("first present");
+        let second = contents.find("second").expect("second present");
+        let third = contents.find("third").expect("third present");
+        assert!(first < second && second < third, "append order: {contents}");
+
         let _ = std::fs::remove_file(&log_path);
         let _ = std::fs::remove_dir(&dir);
     }
