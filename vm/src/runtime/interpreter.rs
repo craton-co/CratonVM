@@ -14155,6 +14155,58 @@ pub fn coerce_lambda_args(
     Ok(())
 }
 
+/// Bug B: distinguish the SAM from a same-name, same-arity *overloaded default*
+/// method on the functional interface. A functional interface may declare
+/// default methods named like the SAM with the same arity but different
+/// parameter types — e.g. `AnnotationFilter`'s SAM `matches(String)` plus
+/// defaults `matches(Class)` / `matches(Annotation)`. The arity guard in
+/// `try_lambda_dispatch` can't tell them apart, so `FILTER.matches(someClass)`
+/// was wrongly routed into the `matches(String)` lambda body (passing a Class
+/// where a String was expected → the lambda always returned false).
+///
+/// Returns `false` when the call is such an overloaded default (so the caller
+/// falls through and runs the real default method, which converts the argument
+/// and re-invokes the SAM). Only CONCRETE (non-`Object`) reference SAM params
+/// are checked; generic/erased (`Object`) and primitive params are skipped, so
+/// the hot stream/lambda path stays byte-identical. A param is treated as
+/// compatible unless the runtime arg is a non-null object provably NOT an
+/// instance of the SAM param type (mirrors the `instanceof` opcode's checks).
+pub(crate) fn lambda_args_sam_compatible(
+    shared: &SharedVm,
+    sam_descriptor: &str,
+    args: &[Value],
+) -> bool {
+    let (params, _ret) = split_method_descriptor(sam_descriptor);
+    for (i, pd) in params.iter().enumerate() {
+        if !pd.starts_with('L') || pd.as_str() == "Ljava/lang/Object;" {
+            continue; // generic/erased or non-reference param — never second-guess
+        }
+        let arg = match args.get(i) {
+            Some(Value::Object(Some(a))) => *a,
+            _ => continue, // null / primitive / missing — don't second-guess
+        };
+        let target = &pd[1..pd.len() - 1];
+        let arg_cid = shared.heap.class_id_of(arg);
+        let (target_cid, base) = {
+            let cm = shared.class_manager.read();
+            match cm.get_loaded_class_id(target) {
+                Some(tcid) => (tcid, arg_cid == tcid || cm.is_subclass_of(arg_cid, tcid)),
+                None => continue, // SAM param type not loaded — can't judge → compatible
+            }
+        };
+        if base
+            || lambda_proxy_satisfies(shared, arg_cid, target_cid)
+            || synthetic_implements(shared, arg_cid, target)
+            || proxy_instance_satisfies_target(shared, arg, target)
+            || annotation_proxy_satisfies_target(shared, arg, target)
+        {
+            continue;
+        }
+        return false; // arg provably not an instance of a concrete SAM param → overloaded default
+    }
+    true
+}
+
 /// Try to dispatch a method call on a lambda proxy object.
 ///
 /// Returns:
@@ -14245,6 +14297,14 @@ pub(crate) fn try_lambda_dispatch(
     // re-invokes the SAM with the right arity.
     if method_name == &*call_site.sam_method_name
         && split_method_descriptor(&call_site.sam_descriptor).0.len() != call_args.len()
+    {
+        return Ok(None);
+    }
+    // Bug B: same name + same arity but mismatched parameter types is an
+    // overloaded interface default (e.g. AnnotationFilter.matches(Class) vs the
+    // SAM matches(String)), not the SAM. Fall through so the real default runs.
+    if method_name == &*call_site.sam_method_name
+        && !lambda_args_sam_compatible(shared, &call_site.sam_descriptor, call_args)
     {
         return Ok(None);
     }

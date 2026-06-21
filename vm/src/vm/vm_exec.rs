@@ -4850,6 +4850,14 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                     .0
                     .len()
                     == args.len()
+                // Bug B: skip same-name/same-arity overloaded interface defaults
+                // whose parameter types don't match the SAM (e.g.
+                // AnnotationFilter.matches(Class) vs the SAM matches(String)).
+                && crate::runtime::interpreter::lambda_args_sam_compatible(
+                    self.shared,
+                    &lcs.sam_descriptor,
+                    args,
+                )
         }) {
             // Lambda dispatch: read captured values from proxy fields, then
             // prepend them to the invocation args.
