@@ -5984,10 +5984,29 @@ fn parse_http_request(mut stream: TcpStream) -> Option<PendingRequest> {
     // one win. Two differing Content-Length values (or a malformed one) are a
     // classic request-smuggling vector, so we reject the request with 400.
     let mut content_length: Option<usize> = None;
+    // VULN-FIX [nb-net-phase-e]: collect the full Transfer-Encoding declaration.
+    // Previously this parser framed the body STRICTLY by Content-Length and never
+    // inspected Transfer-Encoding, so a peer sending `Transfer-Encoding: chunked`
+    // (with no Content-Length, or with a lying one) got content_length=0: we read
+    // ZERO body bytes and left the entire chunked payload unread in the socket
+    // buffer. On a keep-alive connection the next request then mis-parses that
+    // leftover payload — classic request-smuggling / body desync (RFC 7230
+    // §3.3.3). We now accumulate every transfer coding (a single value may be a
+    // comma list, and multiple header lines are equivalent to one comma-joined
+    // list per RFC 7230 §3.2.2) and resolve the framing after the loop.
+    let mut transfer_codings: Vec<String> = Vec::new();
     for line in lines {
         if let Some(colon) = line.find(':') {
             let k = line[..colon].trim().to_string();
             let v = line[colon + 1..].trim().to_string();
+            if k.eq_ignore_ascii_case("transfer-encoding") {
+                for coding in v.split(',') {
+                    let c = coding.trim();
+                    if !c.is_empty() {
+                        transfer_codings.push(c.to_ascii_lowercase());
+                    }
+                }
+            }
             if k.eq_ignore_ascii_case("content-length") {
                 // A header value may itself be a comma-separated list of equal
                 // values (RFC 9110 §8.6); any unparseable or conflicting value
@@ -6022,11 +6041,97 @@ fn parse_http_request(mut stream: TcpStream) -> Option<PendingRequest> {
             headers.push((k, v));
         }
     }
+    let max_body = http_max_request_body();
+    // VULN-FIX [nb-net-phase-e]: resolve message framing per RFC 7230 §3.3.3.
+    // Transfer-Encoding, when present, takes precedence over Content-Length and
+    // determines how the body is delimited. Handle it BEFORE the Content-Length
+    // path below.
+    if !transfer_codings.is_empty() {
+        // RFC 7230 §3.3.1: a sender MUST NOT apply chunked more than once, and
+        // for a request to be framed by chunked it must be the FINAL coding.
+        // We only support `chunked` (optionally as the sole/last coding) and the
+        // no-op `identity`; anything else (gzip/deflate/compress, or chunked not
+        // last) is something we cannot safely de-frame, so we reject rather than
+        // guess at the body boundary (a guess is exactly the smuggling hazard).
+        let last_is_chunked = transfer_codings.last().map(|c| c == "chunked") == Some(true);
+        let chunked_count = transfer_codings.iter().filter(|c| *c == "chunked").count();
+        let only_identity_or_chunked = transfer_codings
+            .iter()
+            .all(|c| c == "chunked" || c == "identity");
+        if !last_is_chunked || chunked_count != 1 || !only_identity_or_chunked {
+            // Unknown/unsupported transfer coding, or chunked applied more than
+            // once / not last — reject instead of mis-framing the body.
+            http_reject_and_close(&mut stream, 400);
+            return None;
+        }
+        // RFC 7230 §3.3.3 (3): if a message is received with BOTH a
+        // Transfer-Encoding and a Content-Length, the Content-Length MUST be
+        // treated as suspect — a strong signal of request smuggling. Reject
+        // outright rather than trusting either framing.
+        if content_length.is_some() {
+            http_reject_and_close(&mut stream, 400);
+            return None;
+        }
+        // The chunked body may not have fully arrived with the header (we read
+        // in ~1 KiB blocks above). Keep reading until the terminating zero-size
+        // chunk `0\r\n\r\n` is present, bounding the accumulated raw size at the
+        // cap so a peer can't stream unbounded data (chunked has no advertised
+        // length) and exhaust memory. The cap also covers the inter-chunk
+        // framing overhead, which is acceptable for a defensive upper bound.
+        let mut raw = buf[sep + 4..].to_vec();
+        if raw.len() > max_body {
+            http_reject_and_close(&mut stream, 413);
+            return None;
+        }
+        // Completeness is decided by actually walking the chunk framing with the
+        // shared decoder rather than by scanning for a `0\r\n\r\n` byte pattern:
+        // that pattern can legitimately occur INSIDE chunk data, which would
+        // truncate the body early. `http_decode_chunked` returns `Ok` only once
+        // the full framing (through the terminating zero chunk) is present, so we
+        // read more whenever it still errors — until we succeed, the peer closes,
+        // the read times out, or we hit the byte cap.
+        let body = loop {
+            match http_decode_chunked(&raw) {
+                Ok(b) => break b,
+                Err(_) => match stream.read(&mut tmp) {
+                    Ok(0) => {
+                        // Peer closed before a complete, valid chunked body.
+                        http_reject_and_close(&mut stream, 400);
+                        return None;
+                    }
+                    Ok(n) => {
+                        raw.extend_from_slice(&tmp[..n]);
+                        if raw.len() > max_body {
+                            http_reject_and_close(&mut stream, 413);
+                            return None;
+                        }
+                    }
+                    Err(_) => {
+                        // Read timeout / I/O error with an incomplete body.
+                        http_reject_and_close(&mut stream, 400);
+                        return None;
+                    }
+                },
+            }
+        };
+        // The decoded payload must itself stay within the cap (the raw cap bounds
+        // framing + data, but enforce on the decoded size too, defensively).
+        if body.len() > max_body {
+            http_reject_and_close(&mut stream, 413);
+            return None;
+        }
+        return Some(PendingRequest {
+            stream,
+            method,
+            uri,
+            headers,
+            body,
+        });
+    }
     let content_length = content_length.unwrap_or(0);
     // VULN-FIX [nb-net-phase-e]: bound the advertised body length BEFORE we read
     // or allocate anything. Without this a remote peer could send a huge
     // Content-Length and stream gigabytes, exhausting process memory.
-    let max_body = http_max_request_body();
     if content_length > max_body {
         http_reject_and_close(&mut stream, 413);
         return None;
@@ -7120,5 +7225,146 @@ mod tests {
         let (stream, _) = listener.accept().unwrap();
         let req = parse_http_request(stream).unwrap();
         assert_eq!(req.body, b"hello");
+    }
+
+    // VULN-FIX [nb-net-phase-e] regression: a chunked request body (no
+    // Content-Length) must be fully decoded, not silently ignored. Without the
+    // fix the parser framed solely by Content-Length (defaulting to 0), read
+    // zero body bytes, and left the chunked payload unread → keep-alive desync.
+    #[test]
+    fn re10_chunked_request_body_is_fully_read() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+            c.write_all(
+                b"POST /x HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n\
+                  5\r\nhello\r\n5\r\nworld\r\n0\r\n\r\n",
+            )
+            .unwrap();
+        });
+        let (stream, _) = listener.accept().unwrap();
+        let req = parse_http_request(stream).unwrap();
+        assert_eq!(req.body, b"helloworld");
+    }
+
+    // VULN-FIX [nb-net-phase-e] regression: a chunked body that arrives in
+    // multiple TCP reads (split across the header boundary and between chunks)
+    // must still be reassembled completely.
+    #[test]
+    fn re10_chunked_request_body_split_across_reads() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+            // Header + first partial chunk, then the rest in a second write.
+            c.write_all(b"POST /x HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc")
+                .unwrap();
+            c.flush().unwrap();
+            std::thread::sleep(Duration::from_millis(50));
+            c.write_all(b"\r\n4\r\ndefg\r\n0\r\n\r\n").unwrap();
+            c.flush().unwrap();
+        });
+        let (stream, _) = listener.accept().unwrap();
+        let req = parse_http_request(stream).unwrap();
+        assert_eq!(req.body, b"abcdefg");
+    }
+
+    // VULN-FIX [nb-net-phase-e] regression: Transfer-Encoding AND Content-Length
+    // together is a request-smuggling vector (RFC 7230 §3.3.3) and must be
+    // rejected with 400 rather than framed by either header.
+    #[test]
+    fn re10_te_and_content_length_together_rejected_with_400() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+            c.write_all(
+                b"POST /x HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\
+                  Transfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+            )
+            .unwrap();
+            let mut resp = Vec::new();
+            let _ = c.read_to_end(&mut resp);
+            resp
+        });
+        let (stream, _) = listener.accept().unwrap();
+        assert!(parse_http_request(stream).is_none());
+        let resp = handle.join().unwrap();
+        let text = String::from_utf8_lossy(&resp);
+        assert!(
+            text.starts_with("HTTP/1.1 400"),
+            "expected 400 response, got: {text}"
+        );
+    }
+
+    // VULN-FIX [nb-net-phase-e] regression: an unknown / unsupported transfer
+    // coding (here gzip, which we cannot de-frame) must be rejected with 400
+    // instead of guessing at the body boundary.
+    #[test]
+    fn re10_unknown_transfer_encoding_rejected_with_400() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+            c.write_all(b"POST /x HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: gzip\r\n\r\n")
+                .unwrap();
+            let mut resp = Vec::new();
+            let _ = c.read_to_end(&mut resp);
+            resp
+        });
+        let (stream, _) = listener.accept().unwrap();
+        assert!(parse_http_request(stream).is_none());
+        let resp = handle.join().unwrap();
+        let text = String::from_utf8_lossy(&resp);
+        assert!(
+            text.starts_with("HTTP/1.1 400"),
+            "expected 400 response, got: {text}"
+        );
+    }
+
+    // VULN-FIX [nb-net-phase-e] regression: `chunked` must be the FINAL coding
+    // to frame the body (RFC 7230 §3.3.1). A list ending in a non-chunked
+    // coding (e.g. `chunked, gzip`) is unsafe to de-frame → 400.
+    #[test]
+    fn re10_chunked_not_last_rejected_with_400() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+            c.write_all(b"POST /x HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked, gzip\r\n\r\n")
+                .unwrap();
+            let mut resp = Vec::new();
+            let _ = c.read_to_end(&mut resp);
+            resp
+        });
+        let (stream, _) = listener.accept().unwrap();
+        assert!(parse_http_request(stream).is_none());
+        let resp = handle.join().unwrap();
+        let text = String::from_utf8_lossy(&resp);
+        assert!(
+            text.starts_with("HTTP/1.1 400"),
+            "expected 400 response, got: {text}"
+        );
+    }
+
+    // VULN-FIX [nb-net-phase-e] regression: a legitimate `identity` coding
+    // followed by `chunked` (the only non-chunked coding we accept) still frames
+    // by chunked and decodes the body.
+    #[test]
+    fn re10_identity_then_chunked_is_accepted() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+            c.write_all(
+                b"POST /x HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: identity, chunked\r\n\r\n\
+                  2\r\nhi\r\n0\r\n\r\n",
+            )
+            .unwrap();
+        });
+        let (stream, _) = listener.accept().unwrap();
+        let req = parse_http_request(stream).unwrap();
+        assert_eq!(req.body, b"hi");
     }
 }
