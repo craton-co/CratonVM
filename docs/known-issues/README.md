@@ -28,11 +28,10 @@ the ~30 docs map to **one root-cause family + ~15 distinct standalone bugs**, of
 6. **`spring-bug-08`** — serializable JDK-proxy round-trip (open).
 7. **`spring-bug-11` residual** — Groovy hang at `BEGIN` (the SIGSEGV half is FIXED via bug-12; open).
 8. **`kafka-bug-B`** — Mockito `mockStatic` + `mock`/`mockConstruction` dispatch: the dispatch/shadowing
-   half is **FIXED on `dev`** (doc now under `internal/fixed-suite-bugs/`); a narrow **residual** stays
-   open — a `mockStatic` capturing-lambda stub bypassed by a stale JIT call site
+   half is **FIXED on `dev`** (doc removed); a narrow **residual** stays open — a `mockStatic`
+   capturing-lambda stub bypassed by a stale JIT call site
    ([kafka-bug-B-mockstatic-capturing-lambda-jit.md](kafka-bug-B-mockstatic-capturing-lambda-jit.md), works with `--nojit`).
-9. ~~**`kafka-bug-C`**~~ — `WeakHashMap.values().stream()` infinite hang: **FIXED on `dev`** (`1cd0ab26`);
-   doc relocated to `internal/fixed-suite-bugs/`.
+9. ~~**`kafka-bug-C`**~~ — `WeakHashMap.values().stream()` infinite hang: **FIXED on `dev`** (`1cd0ab26`; doc removed).
 10. **Hibernate JTA** (Narayana) — ✅ **RESOLVED 2026-06-20** (docs → [`docs/internal/`](../internal/)).
     L0 fixed on dev; **L1 was never broken (refuted)**; **L2 = an `accept()` deadlock** (global `s2_registry`
     lock held across blocking `accept()`) + `getLocalPort()==0`, both fixed on branch `fix/hib-jta-xa-loopback`
@@ -84,11 +83,13 @@ the ~30 docs map to **one root-cause family + ~15 distinct standalone bugs**, of
     rs_cache correctness bug. Reliably avoided by `CRATONVM_ROOTSNAP_CACHE=0` (suite-level — do NOT flip the
     global default). Supersedes [reactor-worker-thread-leak-at-shutdown.md](reactor-worker-thread-leak-at-shutdown.md).
 
-FIXED docs kept for the trail: A1 (`jit-junit-discovery-…`), A3 (`SB-SUITE-CRASH-04`), the Hibernate
-JAXB class-load rescan storm (HIB-DEV-03), the JSON-function `al_state` SIGSEGV, the reversed
-stack-trace order, and the springrepos hang (3 fixes landed; `dev` passes the test). 2026-06-20:
-the `ReferencePipeline.toArray(IntFunction)` recursion and the off-heap DirectBuffer (bug-A/A2) docs
-moved to [`docs/internal/fixed-suite-bugs/`](../internal/fixed-suite-bugs/).
+FIXED bugs whose standalone docs were **removed** from this folder (resolved; full writeups in
+`git` history or [`docs/internal/fixed-suite-bugs/`](../internal/fixed-suite-bugs/)): A1 (reflection
+mirror-array pinning), A3 (register-invisibility — precise maps default-on), the Hibernate JAXB
+class-load rescan storm (HIB-DEV-03), the JSON-function `al_state` SIGSEGV, the reversed stack-trace
+order, the `ReferencePipeline.toArray(IntFunction)` recursion, and the off-heap DirectBuffer
+(bug-A/A2). The springrepos hang is mostly fixed (`dev` passes the test; only the latent
+deep-recursion item remains — see below).
 
 ### Consolidations applied (2026-06-18)
 - The two Hibernate-JTA docs (`hibernate-jta-narayana-…` + `hibernate-jta-txcontrol-getinetaddress-per-class-report`)
@@ -128,9 +129,9 @@ current (incomplete/buggy) implementation of that.
 
 | # | Manifestation | Repro | Status | Doc |
 |---|---|---|---|---|
-| **A1** | Reflection mirror-array builders held an `ObjectRef` array in a Rust local across allocating calls (`Field[]`/`Method[]`/annotation arrays) | `wildfly-suite/repro/MinRepro` | ✅ **FIXED on dev** (`pin_native_root` sweep) | [jit-junit-discovery-reflection-corruption.md](jit-junit-discovery-reflection-corruption.md) |
+| **A1** | Reflection mirror-array builders held an `ObjectRef` array in a Rust local across allocating calls (`Field[]`/`Method[]`/annotation arrays) | `wildfly-suite/repro/MinRepro` | ✅ **FIXED on dev** (`pin_native_root` sweep) | _(doc removed; resolved)_ |
 | **A2** | **`implausible object size` young-sweep-walker crash** (reflection/String-array allocation churn) — a *distinct* bug, NOT the register root | `wildfly-suite/repro/ReflRepro` | 🔴 **OPEN** — precise maps do **not** fix it (still crashes; verified 2026-06-17) | [reflrepro-register-resident-jit-root-handoff.md](reflrepro-register-resident-jit-root-handoff.md) |
-| **A3** | **Register-invisibility** — a live oop sits only in a CPU register at a young-GC safepoint, invisible to the stack-only scan (single thread) | `apps/spring-boot/buildSrc/runner/MinRegexProbe` | ✅ **FIXED on dev** (`32649b56`, precise maps default-on) | [SB-SUITE-CRASH-04-jit-inline-new-heap-corruption.md](SB-SUITE-CRASH-04-jit-inline-new-heap-corruption.md) |
+| **A3** | **Register-invisibility** — a live oop sits only in a CPU register at a young-GC safepoint, invisible to the stack-only scan (single thread) | `apps/spring-boot/buildSrc/runner/MinRegexProbe` | ✅ **FIXED on dev** (`32649b56`, precise maps default-on) | _(doc removed; resolved)_ |
 | **A4** | Multi-thread: live `ForkJoinTask`s reclaimed under **FJP worker threads** + a **lost-tag** interpreter local | `scratch/xworker/Fork6` (needs `CRATONVM_REAL_FORKJOINPOOL=1`) | 🟡 **OPEN / inconclusive** — a separate real-FJP CAS failure now masks the reclaim test (same with/without precise) | [fork6-fjp-multithread-jit-root-reclamation.md](fork6-fjp-multithread-jit-root-reclamation.md) |
 
 > ## ✅ FIX (2026-06-17, dev `32649b56`): **precise JIT oop maps, default-on** — closes the register-invisibility root-scan gap (A3)
@@ -218,7 +219,7 @@ clustered ~529 genuine assertion mismatches into 6 families. Families 1–4 are 
 | # | Bug | Status | Doc |
 |---|---|---|---|
 | **F5** | Reflection native returns `null` where HotSpot returns a `Class`/`Method` (`getDeclaredMethod on null` ×28). Common paths **verified clean** (`Refl5` == HotSpot); the failing narrow generic/proxy path is not yet attributed to a test. **Do not** touch `synthetic_class_mirror` slot 0 (refuted hypothesis). | 🔴 **OPEN** — needs per-test attribution | [bug06-fam5-reflection-getdeclaredmethod-null.md](bug06-fam5-reflection-getdeclaredmethod-null.md) |
-| **F6** | Spring annotation **synthesis** (`@AliasFor`/`MergedAnnotation`/`MirrorSets`) value mismatches + `AnnotationUtilsTests` aborts with a fixed ~2 GB alloc (reproduces on the pre-fix binary → pre-existing, a wrong size computation, not the `findLoadedClass` fix). | 🔴 **OPEN** — `[[spring-bug-01]]` umbrella | [bug06-fam6-annotation-synthesis-mergedannotation.md](bug06-fam6-annotation-synthesis-mergedannotation.md) |
+| **F6** | Spring annotation **synthesis** (`@AliasFor`/`MergedAnnotation`/`MirrorSets`) value mismatches (the `AnnotationUtilsTests` "~2 GB OOM" half was the `toArray` self-recursion, now **FIXED**). | 🔴 **OPEN** — `[[spring-bug-01]]` umbrella | _(doc removed; tracked on branch `fix/bug06-fam6-repeatable-merge`)_ |
 
 ## Consolidated suite bug docs (open & distinct — copied in 2026-06-18)
 
@@ -234,11 +235,11 @@ and already-consolidated ones (fam5/6) were left in place.
 |---|---|---|---|
 | String constant corrupted → `Object` under load | VM-CORRECTNESS / GC | 🟢 **NOT REPRODUCED 2026-06-20** — a 45-class single-JVM spring-core batch on dev ran clean (0 `status=java.lang.Object`, all OK, rc=0). Family-A precise-maps default-on + `toArray` recursion fixed. Pending one larger cross-module batch before archival. | [springsuite-bug-04-string-constant-corrupted-under-load.md](springsuite-bug-04-string-constant-corrupted-under-load.md) |
 | `MergedAnnotations` hang | VM-HANG | ✅ **FIXED 2026-06-20** (`8795b88d`) — was the `ReferencePipeline.toArray(IntFunction)` self-recursion; `MergedAnnotationsTests` now 174/178 (residual 4 = synthesis mismatch, cf. bug-06 F6) | [toArray-recursion fix](../internal/fixed-suite-bugs/springsuite-0620-toarray-referencepipeline-recursion.md) |
-| Serializable proxy round-trip | VM-CORRECTNESS (proxy + serialization) | 🔴 **OPEN** | [spring-bug-08-serializable-proxy-roundtrip.md](spring-bug-08-serializable-proxy-roundtrip.md) |
+| Serializable proxy round-trip | VM-CORRECTNESS (proxy + serialization) | ✅ **RESOLVED on `dev`** — the standalone serialize→deserialize JDK-proxy repro round-trips correctly; `SerializableTypeWrapperTests` generic-type-render residual tracked on branch `fix/generic-array-type-tostring`. Doc removed. | _(removed)_ |
 | JUnit-platform execution `LoadError` | VM-CORRECTNESS / dispatch | 🔴 **OPEN** — JUnit platform internals; Family-A GC-root race (NOT related to the now-fixed bug-04, which was a non-`Comparable` compare exception-type bug, not a GC race) | [spring-bug-10-junit-platform-execution-loaderr.md](spring-bug-10-junit-platform-execution-loaderr.md) |
 | Groovy / scheduler crashes (rc=139) | VM-CRASH | 🟡 **PARTIAL** — Groovy SIGSEGV fixed via the bug-12 HashMap-layout fix; residual = a separate Groovy **hang at BEGIN** (inventory, needs per-cluster trace) | [spring-bug-11-groovy-and-scheduler-crashes.md](spring-bug-11-groovy-and-scheduler-crashes.md) |
-| Mockito `mockStatic` + mock dispatch | VM-CORRECTNESS (Mockito dispatch) | ✅ **FIXED on `dev`** — the dispatch/shadowing half landed; doc relocated to internal. A narrow **residual** remains open (the `mockStatic` capturing-lambda stub is bypassed by a stale JIT call site; works with `--nojit`). | dispatch fix: [`../internal/fixed-suite-bugs/kafka-bug-B-mockito-mockstatic-mock-dispatch.md`](../internal/fixed-suite-bugs/kafka-bug-B-mockito-mockstatic-mock-dispatch.md) · open residual: [kafka-bug-B-mockstatic-capturing-lambda-jit.md](kafka-bug-B-mockstatic-capturing-lambda-jit.md) |
-| `WeakHashMap` stream infinite hang | VM-HANG → JIT codegen | ✅ **FIXED on `dev`** (`1cd0ab26`, JIT ban; verified) — doc relocated to internal. (The underlying `dup_x1` field-post-increment codegen weakness is tracked in the JIT regalloc family doc, not here.) | [`../internal/fixed-suite-bugs/kafka-bug-C-weakhashmap-stream-infinite-hang.md`](../internal/fixed-suite-bugs/kafka-bug-C-weakhashmap-stream-infinite-hang.md) |
+| Mockito `mockStatic` + mock dispatch | VM-CORRECTNESS (Mockito dispatch) | ✅ **FIXED on `dev`** — the dispatch/shadowing half landed (doc removed). A narrow **residual** remains open (the `mockStatic` capturing-lambda stub is bypassed by a stale JIT call site; works with `--nojit`). | open residual: [kafka-bug-B-mockstatic-capturing-lambda-jit.md](kafka-bug-B-mockstatic-capturing-lambda-jit.md) |
+| `WeakHashMap` stream infinite hang | VM-HANG → JIT codegen | ✅ **FIXED on `dev`** (`1cd0ab26`, JIT ban; verified; doc removed). The underlying `dup_x1` field-post-increment codegen weakness is tracked in the [JIT regalloc family doc](jit-regalloc-callee-saved-clobber-family.md). | _(removed)_ |
 
 > `springsuite-bug-04` and `spring-bug-10` are **Family A** (GC-root-coverage-under-JIT)
 > manifestations seen from the Spring suite — same root cause as A1–A4 above, different
@@ -255,57 +256,24 @@ items are **its "defect #2" (= family A3 above)** and **bug C** (the cold-path
 deep-recursion overflow). It is kept for that context and the deep-recursion
 stack-guard design.
 
-## Standalone — Hibernate JAXB class-load storm (✅ FIXED)
+## Resolved standalone bugs (full writeups in `docs/internal/`)
 
-[hibernate-jaxb-classload-synthetic-stub-rescan-storm.md](hibernate-jaxb-classload-synthetic-stub-rescan-storm.md)
-— HIB-DEV-03. The **dominant** layer of the JAXB-XML-mapping hang. **Not** GC/JIT,
-**not** `retainAll`. Every `HashMap`/`LinkedHashMap` node insert allocates a
-`cratonvm/synthetic/AnonymousObject$N` whose synthetic-stub "upgrade" re-ran a
-**full classpath scan** (`find_class_bytes_delegated`) — O(num_jars) — on *every
-allocation*; with the ~250-JAR Hibernate classpath, map-heavy JAXB model building
-crawled to a `rc=124` timeout. ✅ **FIXED** (`fix/hib-dev-03-jaxb-classload`):
-memoize the known-absent result in `ClassManager`, re-armed on classpath
-extension. A/B: 20 000-node put loop 20 120 ms → 132 ms (now classpath-independent
-≈ HotSpot's allocation scaling). Unmasks the deeper JTA/socket cluster below.
+These were open here and are now **fixed / do-not-reproduce**; the detailed writeups live under
+[`docs/internal/`](../internal/):
 
-## Standalone — Hibernate JTA cluster (Narayana XA + socket loopback) — ✅ RESOLVED
-
-[docs/internal/hibernate-jta-narayana-xa-completion-and-socket-loopback.md](../internal/hibernate-jta-narayana-xa-completion-and-socket-loopback.md)
-— found in the full Hibernate ORM 8.x suite census (dev, 2026-06-17); **re-investigated &
-resolved 2026-06-20**. **Not** a GC/JIT issue. Three "layers": (0) `ServerSocket.getInetAddress()`
-→ null → `TxControl.<clinit>` NPE — **fixed on dev** (`net_phase_e.rs` `getInetAddress`, `ada6cebf`);
-(1) Narayana **XA completion** — **was never broken on dev (REFUTED)**: `XaProbe`/`HibBoot` show
-`enlist=true → XA.commit(onePhase=true) → commit OK`, the H2 connection commits+releases, `truncate`
-does not block; (2) the default-mode "loopback never pairs" hang — **real root cause = a process-wide
-`accept()` deadlock** (the global `s2_registry` lock was held across the blocking `TcpListener::accept()`,
-so Narayana's Listener thread blocked the main thread's `SocketProcessId` bind) **plus** a separate
-`new ServerSocket(0).getLocalPort()==0` bug. Both **fixed** on branch `fix/hib-jta-xa-loopback`
-(`e0426050`, pending merge). A full Hibernate 8.1 + Narayana 7.3.4 + H2 begin/persist/commit/read-back/
-truncate cycle now passes in default (synthetic-socket) mode.
-
-## Standalone — Hibernate JAXB/ByteBuddy bootstrap slow (XML mapping hangs) — ✅ RESOLVED / no-repro
-
-[docs/internal/hibernate-jaxb-classloading-bytebuddy-bootstrap-slow.md](../internal/hibernate-jaxb-classloading-bytebuddy-bootstrap-slow.md)
-— full-suite census (dev, 2026-06-17); **re-verified 2026-06-20**. The dominant class-load rescan storm is
-**fixed on dev** (`1db07c35`/`25c42e13`). The residual ByteBuddy `MethodGraph` bootstrap hang **does not
-reproduce**: a programmatic JOINED-inheritance bootstrap (forcing `JoinedSubclassEntityPersister` +
-`MethodGraph$Compiler$Default.doAnalyze`) completes in ~16s `--nojit` (census mode), well under the 600s
-timeout. The original `retainAll` framing was refuted.
-
-## Standalone — JUnit 5 `@ExtendWith` meta-annotation `ParameterResolver` — ⚠️ MISDIAGNOSED (does-not-reproduce)
-
-[docs/internal/junit5-extendwith-meta-annotation-parameterresolver.md](../internal/junit5-extendwith-meta-annotation-parameterresolver.md)
-— first flagged 2026-06-20 as a composed-`@ExtendWith` discovery gap (`No ParameterResolver registered for
-[EntityManagerFactoryScope]`), then **corrected**: it is **not** a meta-annotation bug. `AnnoProbe` shows
-annotation discovery is byte-identical to HotSpot on CratonVM (`findRepeatableAnnotations`=10,
-`getAnnotationsByType`=3, container unwrap all correct), and the real `JtaCustomAfterCompletionTest` **passes
-5/5 via the JUnit launcher** — including default (synthetic-socket) mode with the Layer-2 fix. The single
-early failure was a non-reproducing transient; if it recurs it belongs to the open Family-A reflection-under-GC
-race, not annotation synthesis. So the **real Hibernate JTA JUnit test now runs end-to-end on CratonVM**.
+- **Hibernate JAXB class-load storm** (HIB-DEV-03) — ✅ FIXED (`fix/hib-dev-03-jaxb-classload`): the
+  synthetic-stub "upgrade" re-ran a full O(num_jars) classpath scan on every map-node allocation; memoizing
+  the known-absent result dropped a 20k-node put loop 20 120 ms → 132 ms.
+- **Hibernate JTA cluster** (Narayana XA + socket loopback) — ✅ RESOLVED. L0 `getInetAddress` NPE fixed on
+  dev (`ada6cebf`); L1 XA-completion was never broken (refuted); L2 was a process-wide `accept()` deadlock +
+  `getLocalPort()==0`, fixed on `fix/hib-jta-xa-loopback`. → [`docs/internal/hibernate-jta-narayana-xa-completion-and-socket-loopback.md`](../internal/hibernate-jta-narayana-xa-completion-and-socket-loopback.md).
+- **Hibernate JAXB/ByteBuddy bootstrap slow** — ✅ RESOLVED / no-repro (`1db07c35`/`25c42e13`). → [`docs/internal/hibernate-jaxb-classloading-bytebuddy-bootstrap-slow.md`](../internal/hibernate-jaxb-classloading-bytebuddy-bootstrap-slow.md).
+- **JUnit 5 `@ExtendWith` meta-annotation `ParameterResolver`** — ⚠️ MISDIAGNOSED / does-not-reproduce;
+  annotation discovery is byte-identical to HotSpot and `JtaCustomAfterCompletionTest` passes 5/5. → [`docs/internal/junit5-extendwith-meta-annotation-parameterresolver.md`](../internal/junit5-extendwith-meta-annotation-parameterresolver.md).
 
 ## Standalone — Hibernate deserialized SessionFactory is null
 
-[hibernate-deserialization-sessionfactory-reconnect-null.md](hibernate-deserialization-sessionfactory-reconnect-null.md)
+[docs/internal/hibernate-deserialization-sessionfactory-reconnect-null.md](../internal/hibernate-deserialization-sessionfactory-reconnect-null.md)
 — full-suite census (dev, 2026-06-17). 5 serialization round-trip tests NPE
 (`getMappingMetamodel`/`getClassLoaderService` on null) because a deserialized
 `EntityManager`/`SessionFactory` doesn't reconnect to the live factory. Generic
@@ -314,16 +282,16 @@ race, not annotation synthesis. So the **real Hibernate JTA JUnit test now runs 
 
 ## Hibernate full-suite census (dev 2026-06-17) — additional docs
 
-Per-run bug reports relocated here from the (gitignored) `apps/hibernate-orm/cratonvm-bug-reports/dev-run-20260617/`:
-- [hibernate-json-function-sigsegv-al_state-foreign-receiver.md](hibernate-json-function-sigsegv-al_state-foreign-receiver.md) — ✅ **FIXED** (`al_state` ArrayList-layout guard; 4 `function.json.*` SIGSEGV classes).
-- [hibernate-throwable-stacktrace-order-reversed-FIXED.md](hibernate-throwable-stacktrace-order-reversed-FIXED.md) — ✅ **FIXED** (`getStackTrace()`/`printStackTrace()` were reversed).
-- ~~hibernate-jta-txcontrol-getinetaddress-per-class-report.md~~ — consolidated 2026-06-18, then **moved to [`docs/internal/`](../internal/hibernate-jta-txcontrol-getinetaddress-per-class-report.md) 2026-06-20** (Layer 0 fixed on dev; a redirect stub into the resolved JTA doc).
+Per-run bug reports from the (gitignored) `apps/hibernate-orm/cratonvm-bug-reports/dev-run-20260617/`.
+(The JSON-function `al_state` SIGSEGV and the reversed stack-trace order were **FIXED** and their docs
+removed; the JTA `getInetAddress` per-class report was consolidated into the resolved JTA doc in
+[`docs/internal/`](../internal/).)
 - [hibernate-hang-clusters-summary.md](../internal/hibernate-hang-clusters-summary.md) — census overview (now in `docs/internal/`); **H1/H2/H3 resolved 2026-06-20**, **H4 root-caused** (its own open doc below).
 - [hql-antlr-parser-cold-prediction-throughput.md](hql-antlr-parser-cold-prediction-throughput.md) — 🔴 **OPEN** (census H4, root-caused 2026-06-20). `function.json.JsonArrayUnnestTest` "hang" is the **HQL/ANTLR parser**, not JSON: cold full-context prediction runs interpreted (~1000× HotSpot) because the ATN-simulation hot methods (`closure_`, `closureCheckingStopState`, `mergeArrays`, …) are declined by the single-pass JIT backend (instrumented via `CRATONVM_DBG_JITC`). Terminates (2-item select = 52s), warm re-parse = 0.65s; deferred JIT-backend-coverage cluster. Mitigation: run the suite in one shared JVM.
 
 Also fixed on dev this run (no standalone doc — see commit): `Locale.toLanguageTag()` dropped all subtags for real Locales (`13e8c761`).
 
-- [hibernate-wrong-result-assertion-failures.md](../internal/fixed-suite-bugs/hibernate-wrong-result-assertion-failures.md) — cluster of CV-only wrong-result assertion FAILs (UniqueConstraintBatching 1-vs-0, DetachedBag true-vs-false, EntityGraphBatchSize, immutable+converter deser, …); each likely a separate root cause. 🔴 open (handoff).
+- **Hibernate wrong-result assertion failures** — cluster of CV-only wrong-result assertion FAILs (UniqueConstraintBatching 1-vs-0, DetachedBag true-vs-false, EntityGraphBatchSize, immutable+converter deser, …); each likely a separate root cause. 🔴 open (handoff; standalone doc not preserved).
 
 ## Consolidation log
 
