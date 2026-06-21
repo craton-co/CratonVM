@@ -63,13 +63,14 @@ the ~30 docs map to **one root-cause family + ~15 distinct standalone bugs**, of
     - ✅ **Unsafe off-heap DirectBuffer (bug-A + bug-A2) FULLY RESOLVED** — `PooledDataBufferTests`
       **10/10**, `LeakAwareDataBufferFactoryTests` 2/2. The bug-A2 Netty `refCnt` AIOOBE no longer
       reproduces. Archived → [`docs/internal/fixed-suite-bugs/springsuite-0619-unsafe-offheap-directbuffer.md`](../internal/fixed-suite-bugs/springsuite-0619-unsafe-offheap-directbuffer.md).
-    - 🟢 **getBeanClassName bean-filter (bug-B) MOSTLY FIXED** — primary filter fix holds, and
-      **bug-B2 (CGLIB method-injection) is now implemented 2026-06-21**: the instantiate shim
-      synthesises a concrete subclass overriding each abstract `<lookup-method>`/`@Lookup` method via
-      `bf.getBean(...)`. `LookupMethodTests` **0/7 → 6/7**, `LookupAnnotationTests` **0/10 → 6/10**
-      (no more "Target object must not be null"). Narrow residual: generic-type disambiguation
-      (`NumberStore<Double>` vs `<Float>` → `getBean(Class)` ambiguity; needs `ResolvableType`) + the
-      `@Lookup` null-bean case. [bug-B / bug-B2 doc](springsuite-0619-getbeanclassname-bean-filter.md).
+    - ✅ **getBeanClassName bean-filter (bug-B) FIXED** — primary filter fix holds, and **bug-B2
+      (CGLIB method-injection) is fully implemented 2026-06-21** (commit `ffa71253`): the instantiate
+      shim synthesises a concrete subclass overriding each abstract `<lookup-method>`/`@Lookup` method
+      via `bf.getBean(name|args)` (NullBean→null), `bf.getBeanProvider(ResolvableType.forMethodReturnType(m)).getObject()`
+      for generic by-type, with overload-aware + child-precedence override matching.
+      **`LookupMethodTests` 0/7 → 7/7** (JIT and `--nojit`), **`LookupAnnotationTests` 0/10 → 10/10**.
+      (The "flaky JIT `invokeVoid`" turned out to be a one-byte emitter typo — `IFEQ` vs `IFNULL` —
+      not a VM defect.) [bug-B / bug-B2 doc](springsuite-0619-getbeanclassname-bean-filter.md).
     - Still untriaged from the sweep: `ReactiveAdapterRegistry$MutinyRegistrar` NCDFE, XML
       "Unexpected failure during bean definition parsing", "Unnamed bean definition", spring-jdbc
       mass-TIMEOUT, scheduler `StringIndexOutOfBounds`, and `DataBufferUtilsTests` TIMEOUT
