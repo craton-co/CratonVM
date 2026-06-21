@@ -100,7 +100,7 @@ Implements JVMS Ch. 5: loading, linking, and initialization. Extracted into the
 
 ### Memory (`gc/` crate)
 
-Garbage collectors, extracted into the `cratonvm-gc` crate. The default is the generational semi-space collector (Cheney moving young gen + non-moving sweep). A region-based G1 collector is also present (selectable via `-XX:+UseG1GC`). ZGC is an experimental, feature-gated simulation stub (`--features zgc`, off by default) and not a production collector.
+Garbage collectors, extracted into the `cratonvm-gc` crate. The default is the generational semi-space collector (Cheney moving young gen + non-moving sweep). A region-based G1 collector is also present and opt-in selectable via `-XX:+UseG1GC` (experimental; Generational remains the default safety net during G1 maturation — see `docs/feature-designs/concurrent-gc-maturation.md`). ZGC is experimental and feature-gated (`--features zgc`, off by default): a metadata-only simulation plus a real STW mark-sweep heap (`ZgcRealHeap`) that is built but not yet wired into the backend dispatch (`GcBackend`), so neither is a selectable production collector.
 
 - **`heap.rs`** — Object/array layout and allocation (semi-space).
 - **`gen_heap.rs`** — Generational heap: young gen (copying) + old gen.

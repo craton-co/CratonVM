@@ -18,7 +18,12 @@ Author note: this doc is grounded in a read of `gc/src/{g1,g1_concurrent,zgc,zgc
   map and `-XX:+PrintFlagsFinal` collector string already reflect the selection
   truthfully. Still open within §3.1.3: JMX `GarbageCollectorMXBean` names
   ("G1 Young/Old Generation").
-- Steps 2–10 — not started. Next highest-value: Step 3 (SATB drain enforcement,
+- **Step 2 (doc truth-up) — DONE** (branch `feat/g1-cli-flag`). Reconciled the
+  docs-governance gap now that G1 is selectable: `README.md` (feature bullet +
+  crate-tree line), `CONTRIBUTING.md` (the `gc` crate row dropped "no G1"), and
+  `ARCHITECTURE.md` (Generational = default safety net, G1 = opt-in via
+  `-XX:+UseG1GC`, ZGC = simulation + a built-but-undispatched `ZgcRealHeap`).
+- Steps 3–10 — not started. Next highest-value: Step 3 (SATB drain enforcement,
   the gating safety item, finding #18) and Step 8 (opt-in G1 gauntlet validation).
 
 ---
