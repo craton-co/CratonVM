@@ -7708,41 +7708,62 @@ fn build_deopt_frame_inner(
         &mut thread.stacks_pool,
     );
     for v in &stack_fwd {
-        // A clean pilot never overflows the padded stack; bail (caller releases
-        // the pins) if it somehow does. No panic between pin-push and the
-        // caller's truncate.
-        frame.stack.push(*v).ok()?;
+        // A clean pilot never overflows the padded stack. If it somehow did,
+        // recycle the frame's pooled buffers before bailing — `Frame` has no
+        // `Drop` impl (recycling is explicit), so a plain `?`-return would leak
+        // them. The caller then releases the pins and re-runs.
+        if frame.stack.push(*v).is_err() {
+            frame.recycle(&mut thread.locals_pool, &mut thread.stacks_pool);
+            return None;
+        }
     }
     frame.pc = rframe.bci as usize;
     Some(frame)
 }
 
-/// real-frame-deopt Step 3 — BUILD + VALIDATE + DISCARD an Object-bearing deopt
-/// frame, then fall back to re-run (NO resume; that is Step 4).
+/// real-frame-deopt Step 4 — RESUME a real (Object-bearing) deopt at the trapping
+/// bci instead of re-running the whole method from entry (the payoff that kills
+/// the side-effect double-execution).
 ///
-/// Under `CRATONVM_DEOPT_REAL` the sink calls this on every real BCE-pilot deopt
-/// to exercise the reconstruction + GC-rooting + frame-building machinery LIVE
-/// (shaking out bugs before Step 4 flips the actual resume), WITHOUT the risk of
-/// resuming: the built frame is dropped (it was never pushed onto
-/// `thread.frames`) and the temporary pins are released, so the subsequent
-/// re-run (`CacheMiss`) sees identical interpreter state. Returns `Some(())` if a
-/// clean pilot frame built, else `None` — both re-run.
-fn build_validate_discard_ir_deopt(
+/// Builds the interpreter `Frame` from the reconstructed locals/stack (oops
+/// GC-rooted across the pool refill — see [`build_deopt_frame_inner`]), then
+/// PUSHES it onto `thread.frames` so the interpreter resumes there.
+///
+/// The GC-rooting HANDOFF is the load-bearing invariant: the temporary
+/// `native_pin_roots` pins are held ACROSS `push_frame_and_fire_entry` (which may
+/// fire entry hooks that allocate / GC) and released only AFTER the push — once
+/// pushed, the frame's locals/stack are themselves GC roots (scanned by the
+/// normal interpreter-frame root walk), so the reconstructed oops are rooted by
+/// the pins, then by BOTH pins and frame, then by the frame alone, with no
+/// unrooted window. Returns `Some(FramePushed)` on a clean resume, or `None`
+/// (re-run) for an out-of-scope / unmappable frame — releasing any partial pins
+/// in both cases.
+///
+/// Gated by `CRATONVM_DEOPT_REAL` at the sink; the pre-existing
+/// `CRATONVM_IR_DEOPT_RESUME` int-only path (`resume_from_ir_deopt`) runs first
+/// and is left intact.
+fn resume_real_ir_deopt(
     shared: &SharedVm,
     thread: &mut JvmThread,
     cached: &Arc<CachedBytecodeMethod>,
     rframe: &cratonvm_jit::deopt::ReconstructedFrame,
-) -> Option<()> {
+) -> Option<CachedCallResult> {
     let pin_base = thread.native_pin_roots.len();
-    // Build then immediately discard (the `.is_some()` drops the built Frame).
-    let built = build_deopt_frame_inner(shared, thread, cached, rframe, false).is_some();
-    // ALWAYS release the temporary pins — single truncate, no panic in between,
-    // so nothing leaks regardless of build success/failure.
-    thread.native_pin_roots.truncate(pin_base);
-    if built {
-        Some(())
-    } else {
-        None
+    match build_deopt_frame_inner(shared, thread, cached, rframe, false) {
+        Some(frame) => {
+            // Push FIRST, pins STILL installed: during the push the oops are
+            // rooted by the pins, and once pushed also by the frame. Only THEN
+            // release the pins — the frame roots them from here on.
+            push_frame_and_fire_entry(thread, frame);
+            thread.native_pin_roots.truncate(pin_base);
+            Some(CachedCallResult::FramePushed)
+        }
+        None => {
+            // Out-of-scope / unmappable: release any partial pins, fall back to
+            // the whole-method re-run.
+            thread.native_pin_roots.truncate(pin_base);
+            None
+        }
     }
 }
 
@@ -7832,15 +7853,53 @@ mod deopt_step3_tests {
         thread.native_pin_roots.truncate(pin_base);
     }
 
-    /// An unmappable (cat-2 `Unsupported`) slot bails to `None` and leaks no pins.
+    /// An unmappable (cat-2 `Unsupported`) slot bails to `None` (re-run) and
+    /// leaks no pins / pushes no frame.
     #[test]
     fn refuses_unmappable_without_leaking_pins() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
         let cached = minimal_cached();
         let rf = rframe(vec![FrameValue::Unsupported], vec![], 0);
-        assert!(build_validate_discard_ir_deopt(&shared, &mut thread, &cached, &rf).is_none());
+        assert!(resume_real_ir_deopt(&shared, &mut thread, &cached, &rf).is_none());
         assert_eq!(thread.native_pin_roots.len(), 0);
+        assert_eq!(thread.frames.len(), 0);
+    }
+
+    /// Step-4 GC-rooting HANDOFF — the load-bearing invariant: after
+    /// `resume_real_ir_deopt` pushes the frame and releases the temporary pins,
+    /// a forced GC must STILL find the reconstructed oop — via the PUSHED FRAME
+    /// (its locals are the root now), not the released pins. A handoff mistake
+    /// here would be a production UAF under the gate.
+    #[test]
+    fn resumed_frame_roots_oops_after_pin_release() {
+        let shared = Arc::new(SharedVm::new(VmConfig::default()));
+        let mut thread = JvmThread::new(ThreadId(0), "test");
+        let cached = minimal_cached();
+        let obj = shared.heap.alloc_object(cratonvm_types::ClassId::new(7), 0);
+        let addr = obj.as_ptr() as usize as u64;
+        let rf = rframe(vec![FrameValue::Object(addr)], vec![], 3);
+
+        let pin_base = thread.native_pin_roots.len();
+        let r = resume_real_ir_deopt(&shared, &mut thread, &cached, &rf)
+            .expect("clean pilot must resume");
+        assert!(matches!(r, CachedCallResult::FramePushed));
+        // Pins released after the push; the pushed frame is the sole root now.
+        assert_eq!(thread.native_pin_roots.len(), pin_base);
+        assert_eq!(thread.frames.len(), 1);
+
+        // Force a GC: the oop must survive via the pushed frame (and be forwarded
+        // in place under a moving collector).
+        maybe_gc_forced_pub(&shared, &mut thread);
+
+        let frame = thread.frames.last().expect("resumed frame is on the stack");
+        assert_eq!(frame.pc, 3);
+        match frame.get_local(0) {
+            Value::Object(Some(o)) => {
+                assert_eq!(shared.heap.class_id_of(o), cratonvm_types::ClassId::new(7));
+            }
+            other => panic!("local 0 must survive GC via the pushed frame, got {other:?}"),
+        }
     }
 
     /// The reconstructed Object survives a forced GC during the build (rooted via
@@ -19631,14 +19690,18 @@ fn execute_jit_call(
                     return Ok(r);
                 }
             }
-            // real-frame-deopt Step 3: under CRATONVM_DEOPT_REAL, BUILD + VALIDATE
-            // the Object-bearing interpreter frame from the reconstructed locals/
-            // stack (GC-rooting the oops across pool refill), then DISCARD it and
-            // STILL re-run below (NO resume yet — that is Step 4). A live soak of
-            // the reconstruction / rooting / build machinery. Gate-OFF (default):
-            // skipped, so behaviour is byte-identical to today.
+            // real-frame-deopt Step 4: under CRATONVM_DEOPT_REAL, RESUME the
+            // Object-bearing deopt at the trapping bci — build the interpreter
+            // frame (GC-rooting the oops across the pool refill AND the push
+            // handoff), push it, and resume there instead of re-running the whole
+            // method from entry. On an out-of-scope / unmappable frame this
+            // returns None and falls through to the re-run below. Gate-OFF
+            // (default): skipped → byte-identical; the int-only
+            // CRATONVM_IR_DEOPT_RESUME path above is untouched.
             if cratonvm_jit::deopt_real_enabled() {
-                let _ = build_validate_discard_ir_deopt(shared, thread, cached, &rframe);
+                if let Some(r) = resume_real_ir_deopt(shared, thread, cached, &rframe) {
+                    return Ok(r);
+                }
             }
             for i in 0..np {
                 let (cv, is_long) = saved_args[i];

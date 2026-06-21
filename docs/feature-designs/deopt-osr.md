@@ -405,15 +405,38 @@ feature branch. All additive and gated **unreachable in production**
   are pre-existing parallel-test pollution, surfaced only because the `oscache`
   compile-break — `task_f849e93a` — was temp-patched to run the suite, and reverted).
 
-Not yet done: x64 deopt-exit **Step 4** (flip the resume — `push_frame_and_fire_entry`
-→ FramePushed — behind `CRATONVM_DEOPT_REAL`; + the end-to-end BCE compile→invoke
-runtime test that drives the Step-2 stub → entry → sink), then **Step 5+** of the
-backport (coverage-gate finalize + eager-deopt `CRATONVM_DEOPT_VERIFY` differential
-verifier, widen guards); deopt-osr **Step 7+** (OSR-exit map emission + flip) + the
-x64 `emit_osr_exit_map_at` / `osr_exit_points` scaffolding; and wiring
-`materialize_virtual_objects` into the live resume path (flip `can_deopt_resume`
-for virtual-bearing frames). Until the resume lands, the build is discarded and
-the method re-runs from entry.
+- **x64 deopt-exit Step 4 — FLIP THE RESUME.** The payoff: under `CRATONVM_DEOPT_REAL`
+  the sink now RESUMES an Object-bearing deopt at the trapping bci
+  (`resume_real_ir_deopt`: build the frame → `push_frame_and_fire_entry` →
+  return `FramePushed`) instead of re-running the whole method from entry —
+  killing the side-effect double-execution. The load-bearing **GC-rooting
+  handoff**: the temporary `native_pin_roots` pins are held ACROSS the push (so
+  the oops are rooted by the pins, then by both pins and frame) and released only
+  AFTER the frame is on `thread.frames` (its locals/stack are then GC roots), so
+  there is no unrooted window. Designed via an Understand→adversarial-Verify
+  workflow whose 3 reviewers (GC-handoff/UAF, sink control-flow, gate/re-entrancy)
+  each independently returned **"ship as-is"** — confirming no unrooted window,
+  consistent moving-GC forwarding, correct skip-of-saved-args on resume
+  (the args are re-homed in the resumed frame's locals), two default-off gates,
+  no int-path overlap, no stale `LAST_DEOPT`. The one non-blocking finding (a
+  pooled-buffer leak on the unreachable `.ok()?` bail) is hardened
+  (`frame.recycle` before bail). Gate-OFF (default): byte-identical. Verified: 5
+  unit tests pass, incl. the load-bearing **`resumed_frame_roots_oops_after_pin_release`**
+  (force a GC AFTER push+pin-release → the oop survives via the pushed frame).
+  STILL OWED: the end-to-end BCE compile→invoke runtime test (drive the Step-2
+  stub → `x64_deopt_entry` → sink for real) is infra-blocked — the jit crate's
+  `#[cfg(feature="vm-tests")]` tests reference a non-existent `crate::vm::SharedVm`
+  (can't compile), and the gate override doesn't cross the jit↔vm boundary; it
+  needs a `pub` (non-`cfg(test)`) override + a cratonvm_gc-direct array, or a full
+  vm-crate invoke. The resume *correctness* (the UAF-risk) is unit-tested +
+  3-way adversarially verified; only the through-the-JIT execution path is unproven.
+
+Not yet done: the **end-to-end BCE runtime test** (above); x64 deopt-exit **Steps 5-6**
+of the backport (coverage-gate `can_deopt_resume` finalize + eager-deopt
+`CRATONVM_DEOPT_VERIFY` differential verifier, widen guards beyond the BCE pilot);
+deopt-osr **Step 7+** (OSR-exit map emission + flip) + the x64
+`emit_osr_exit_map_at` / `osr_exit_points` scaffolding; and wiring
+`materialize_virtual_objects` into the resume path (resume virtual-bearing frames).
 
 ## Risks & open questions
 
