@@ -12,6 +12,30 @@ pub enum GcAlgorithm {
     G1,
 }
 
+/// Map a garbage-collector selector name to a supported [`GcAlgorithm`].
+///
+/// The input is the collector identifier from a HotSpot `-XX:+Use<name>GC`
+/// flag with the `Use`/`GC` wrapper already stripped (e.g. `"G1"`,
+/// `"Generational"`), matched case-insensitively with surrounding whitespace
+/// trimmed. Returns:
+///
+/// - `Some(GcAlgorithm::G1)` for `g1`,
+/// - `Some(GcAlgorithm::Generational)` for `generational`,
+/// - `None` for collectors CratonVM does not implement (`Serial`, `Parallel`,
+///   `Z`, `Shenandoah`, `Epsilon`) or any unrecognized name.
+///
+/// On `None` the launcher warns and falls back to the default `Generational`
+/// collector. HotSpot instead errors on an unknown `-XX:+Use*GC`; CratonVM is
+/// deliberately lenient so a `java` drop-in keeps booting — see
+/// `docs/feature-designs/concurrent-gc-maturation.md` §3.1.
+pub fn parse_gc_algorithm(name: &str) -> Option<GcAlgorithm> {
+    match name.trim().to_ascii_lowercase().as_str() {
+        "g1" => Some(GcAlgorithm::G1),
+        "generational" => Some(GcAlgorithm::Generational),
+        _ => None,
+    }
+}
+
 /// Configuration for the JVM instance.
 ///
 /// Mirrors common JVM `-X` flags and provides defaults suitable for development.
@@ -913,6 +937,39 @@ mod tests {
         assert!(config.boot_classpath.is_empty());
         assert!(config.ext_classpath.is_empty());
         assert!(config.java_home.is_none());
+        // Generational is the default and the safety net during G1 maturation.
+        assert_eq!(config.gc_algorithm, GcAlgorithm::Generational);
+    }
+
+    #[test]
+    fn parse_gc_algorithm_supported() {
+        assert_eq!(parse_gc_algorithm("g1"), Some(GcAlgorithm::G1));
+        assert_eq!(parse_gc_algorithm("G1"), Some(GcAlgorithm::G1));
+        assert_eq!(
+            parse_gc_algorithm("Generational"),
+            Some(GcAlgorithm::Generational)
+        );
+        // Case-insensitive + surrounding whitespace tolerated.
+        assert_eq!(
+            parse_gc_algorithm("  gEnErAtIoNaL  "),
+            Some(GcAlgorithm::Generational)
+        );
+    }
+
+    #[test]
+    fn parse_gc_algorithm_unsupported_is_none() {
+        // Known HotSpot collectors CratonVM does not implement → None so the
+        // launcher warns and falls back to Generational.
+        for name in ["Serial", "Parallel", "Z", "Shenandoah", "Epsilon"] {
+            assert_eq!(
+                parse_gc_algorithm(name),
+                None,
+                "{name} should be unsupported"
+            );
+        }
+        // Garbage / empty input is also None.
+        assert_eq!(parse_gc_algorithm("nonsense"), None);
+        assert_eq!(parse_gc_algorithm(""), None);
     }
 
     #[test]

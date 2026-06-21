@@ -239,6 +239,16 @@ struct Args {
     #[arg(long = "XX:-UseContainerSupport")]
     disable_container_support: bool,
 
+    /// Garbage-collector selector. Carries the collector name from a HotSpot
+    /// `-XX:+Use<name>GC` flag (with the `Use`/`GC` wrapper stripped by
+    /// `normalize_java_launcher_argv`), e.g. `G1` for `-XX:+UseG1GC`. CratonVM
+    /// honours `G1` and the default `Generational`; any other collector warns
+    /// and falls back to Generational. Repeated flags follow HotSpot last-wins
+    /// (`overrides_with` self → no `ArgumentConflict` on a second occurrence).
+    /// See docs/feature-designs/concurrent-gc-maturation.md §3.1.
+    #[arg(long = "XX:UseGc", value_name = "NAME", overrides_with = "gc_selector")]
+    gc_selector: Option<String>,
+
     /// Unified logging spec (-Xlog:tag[+tag]*[=level][:output[:decorators]]).
     /// Example: --Xlog gc*=info:stdout:time,level,tags
     #[arg(long = "Xlog", value_name = "SPEC")]
@@ -531,6 +541,7 @@ const VALUE_TAKING_OPTS: &[&str] = &[
     "--java-home",
     "--Xverify",
     "--XX:SharedArchiveFile",
+    "--XX:UseGc",
     "--Xshare",
     "--XX:AOTMode",
     "--XX:AOTCache",
@@ -969,13 +980,39 @@ fn normalize_java_launcher_argv(args: Vec<String>) -> Vec<String> {
                 i += 1;
             }
         }
+        // GC selector: `-XX:+Use<Name>GC` -> `--XX:UseGc <Name>`. The collector
+        // name (`<Name>` between `Use` and `GC`) is forwarded verbatim; the
+        // config-apply step (`parse_gc_algorithm`) honours `G1` / `Generational`
+        // and warns-and-falls-back for any other collector. Emitting a value
+        // option (rather than acting here) means a later `-XX:+Use...GC`
+        // overrides an earlier one via clap last-wins, matching HotSpot.
+        //
+        // `-XX:-UseG1GC` explicitly turns G1 off -> revert to the default
+        // Generational. Other `-XX:-Use<Name>GC` ("do not use collector X")
+        // select nothing and fall through to the silent-ignore arm below.
+        //
+        // Guarded so `-XX:+UseStringDeduplication`, `-XX:+UseCompressedOops`,
+        // etc. (no `GC` suffix) do NOT match and keep their existing handling.
+        else if let Some(name) = a
+            .strip_prefix("-XX:+Use")
+            .and_then(|core| core.strip_suffix("GC"))
+            .filter(|core| !core.is_empty())
+        {
+            out.push("--XX:UseGc".into());
+            out.push(name.to_string());
+            i += 1;
+        } else if a == "-XX:-UseG1GC" {
+            out.push("--XX:UseGc".into());
+            out.push("Generational".into());
+            i += 1;
+        }
         // Any other `-XX:...` flag is a HotSpot tuning knob CratonVM does not
         // implement (`-XX:MetaspaceSize`, `-XX:MaxMetaspaceSize`,
-        // `-XX:+ExitOnOutOfMemoryError`, `-XX:+HeapDumpOnOutOfMemoryError`,
-        // GC selectors, …). Recognized `-XX:` flags are rewritten by the
-        // branches above; everything else is silently ignored so a Maven
-        // Surefire / Gradle fork — which passes these unconditionally —
-        // launches instead of clap aborting with "unexpected argument '-X'".
+        // `-XX:+ExitOnOutOfMemoryError`, `-XX:+HeapDumpOnOutOfMemoryError`, …).
+        // Recognized `-XX:` flags are rewritten by the branches above;
+        // everything else is silently ignored so a Maven Surefire / Gradle
+        // fork — which passes these unconditionally — launches instead of clap
+        // aborting with "unexpected argument '-X'".
         else if a.starts_with("-XX:") {
             if std::env::var_os("CRATONVM_DBG_ARGS").is_some() {
                 eprintln!("[cratonvm] ignoring unimplemented HotSpot flag: {a}");
@@ -1697,6 +1734,29 @@ fn run() -> Result<()> {
     }
     if let Some(output_path) = &args.aot_cache_output {
         config.aot_cache_output = Some(output_path.clone());
+    }
+
+    // Garbage-collector selection (`-XX:+UseG1GC` / `-XX:-UseG1GC` / any other
+    // `-XX:+Use*GC`, normalized to `--XX:UseGc <name>`). Absent → keep the
+    // default (`Generational`, the safety net during G1 maturation). A
+    // recognized selector (`g1` | `generational`) sets `gc_algorithm`; an
+    // unsupported collector (Serial/Parallel/Z/Shenandoah/Epsilon) warns and
+    // falls back to Generational so a `java` drop-in keeps booting. G1 is
+    // already wired into the `GcBackend` dispatch (vm_init.rs) and the
+    // safepoint driver; this is the missing reachability edge. See
+    // docs/feature-designs/concurrent-gc-maturation.md §3.1.
+    if let Some(sel) = &args.gc_selector {
+        match cratonvm_vm::config::parse_gc_algorithm(sel) {
+            Some(algo) => config.gc_algorithm = algo,
+            None => {
+                eprintln!(
+                    "Warning: unsupported garbage collector -XX:+Use{sel}GC; CratonVM \
+                     implements G1 (-XX:+UseG1GC) and the default Generational collector. \
+                     Falling back to Generational."
+                );
+                config.gc_algorithm = cratonvm_vm::config::GcAlgorithm::Generational;
+            }
+        }
     }
 
     // Missing native audit. NEW-10: `--dump-missing-natives FILE` and
@@ -4149,6 +4209,68 @@ mod tests {
         // `-XX:+UseContainerSupport` is the default; gets dropped.
         let out = normalize_java_launcher_argv(argv(&["java", "-XX:+UseContainerSupport", "Main"]));
         assert_eq!(out, argv(&["java", "Main"]));
+    }
+
+    #[test]
+    fn hotspot_xx_useg1gc_normalizes_to_selector() {
+        // `-XX:+UseG1GC` -> `--XX:UseGc G1` (value option, adjacent value).
+        let out = normalize_java_launcher_argv(argv(&["java", "-XX:+UseG1GC", "Main"]));
+        assert_eq!(out, argv(&["java", "--XX:UseGc", "G1", "Main"]));
+        // `-XX:-UseG1GC` explicitly reverts to the default Generational.
+        let out = normalize_java_launcher_argv(argv(&["java", "-XX:-UseG1GC", "Main"]));
+        assert_eq!(out, argv(&["java", "--XX:UseGc", "Generational", "Main"]));
+    }
+
+    #[test]
+    fn hotspot_xx_unsupported_gc_is_forwarded_not_dropped() {
+        // Unsupported collectors are forwarded verbatim; the warn-and-fallback
+        // happens at config-apply time (`parse_gc_algorithm`), not here.
+        for (flag, name) in [
+            ("-XX:+UseParallelGC", "Parallel"),
+            ("-XX:+UseSerialGC", "Serial"),
+            ("-XX:+UseZGC", "Z"),
+            ("-XX:+UseShenandoahGC", "Shenandoah"),
+        ] {
+            let out = normalize_java_launcher_argv(argv(&["java", flag, "Main"]));
+            assert_eq!(out, argv(&["java", "--XX:UseGc", name, "Main"]), "{flag}");
+        }
+    }
+
+    #[test]
+    fn hotspot_xx_non_gc_use_flags_not_mistaken_for_selector() {
+        // `-XX:+Use*` flags that do NOT end in `GC` must keep their existing
+        // handling (silently ignored) and must not become a GC selector.
+        for flag in ["-XX:+UseStringDeduplication", "-XX:+UseCompressedOops"] {
+            let out = normalize_java_launcher_argv(argv(&["java", flag, "Main"]));
+            assert_eq!(out, argv(&["java", "Main"]), "{flag}");
+        }
+    }
+
+    #[test]
+    fn hotspot_useg1gc_reaches_clap_as_selector_after_pipeline() {
+        // End-to-end: `-XX:+UseG1GC` survives the full pre-clap pipeline and
+        // lands in `Args::gc_selector`, the field the config-apply step reads.
+        let argv0: Vec<String> = argv(&["java", "-XX:+UseG1GC", "-classpath", "x", "Main"]);
+        let stage1 = insert_program_args_separator(argv0);
+        let stage2 = normalize_java_launcher_argv(stage1);
+        let (stage3, _props) = extract_system_properties(stage2);
+        let (stage4, _hot) = extract_hotspot_flags(stage3);
+        let parsed = Args::try_parse_from(stage4).expect("clap must accept -XX:+UseG1GC");
+        assert_eq!(parsed.gc_selector.as_deref(), Some("G1"));
+        assert_eq!(parsed.class_name.as_deref(), Some("Main"));
+    }
+
+    #[test]
+    fn hotspot_repeated_gc_flags_last_wins() {
+        // HotSpot honours the last `-XX:+Use*GC`; clap's `Set` action keeps the
+        // last value, so a `-XX:+UseParallelGC -XX:+UseG1GC` pair selects G1.
+        let argv0: Vec<String> = argv(&["java", "-XX:+UseParallelGC", "-XX:+UseG1GC", "Main"]);
+        let stage1 = insert_program_args_separator(argv0);
+        let stage2 = normalize_java_launcher_argv(stage1);
+        let (stage3, _props) = extract_system_properties(stage2);
+        let (stage4, _hot) = extract_hotspot_flags(stage3);
+        let parsed = Args::try_parse_from(stage4).expect("clap must accept repeated GC flags");
+        assert_eq!(parsed.gc_selector.as_deref(), Some("G1"));
     }
 
     #[test]

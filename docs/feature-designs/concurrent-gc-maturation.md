@@ -5,6 +5,22 @@ Author note: this doc is grounded in a read of `gc/src/{g1,g1_concurrent,zgc,zgc
 `vm/src/config.rs`, `vm/src/vm/vm_init.rs`, `vm/src/runtime/interpreter.rs`, and
 `docs/internal/reviews/full-review-2026-06-20.md` (findings #18, the `gc-collectors` section, and the docs-governance row).
 
+### Implementation progress
+
+- **Step 1 (CLI flag wiring) — DONE** (branch `feat/g1-cli-flag`). `-XX:+UseG1GC`
+  now selects the G1 backend; `-XX:-UseG1GC` reverts to Generational; any other
+  `-XX:+Use*GC` (Serial/Parallel/Z/Shenandoah/Epsilon) warns and falls back to
+  Generational (lenient-with-warning, §3.1). Generational remains the default —
+  G1 is opt-in. Implementation: `parse_gc_algorithm()` in `vm/src/config.rs`;
+  `-XX:+Use<name>GC` → `--XX:UseGc <name>` rewrite + `gc_selector` clap field +
+  config-apply in `vm-cli/src/main.rs`. Unit-tested (parser + normalize +
+  full-pipeline + last-wins). The existing `vm_init.rs` `GcAlgorithm`→`GcBackend`
+  map and `-XX:+PrintFlagsFinal` collector string already reflect the selection
+  truthfully. Still open within §3.1.3: JMX `GarbageCollectorMXBean` names
+  ("G1 Young/Old Generation").
+- Steps 2–10 — not started. Next highest-value: Step 3 (SATB drain enforcement,
+  the gating safety item, finding #18) and Step 8 (opt-in G1 gauntlet validation).
+
 ---
 
 ## 1. Problem & motivation
