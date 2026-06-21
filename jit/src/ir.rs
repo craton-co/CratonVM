@@ -681,6 +681,24 @@ impl IrBuilder {
         self.graph.add(Op::Const(val), IrType::Long, vec![], None)
     }
 
+    /// FP value tier (inc 30): a `float` constant, stored as its raw 32-bit
+    /// IEEE-754 bit pattern (zero-extended into the `u64` payload). Typed
+    /// `IrType::Float` so the lowerer marshals it through XMM. No dedup — GVN
+    /// collapses duplicates. (`const_value`/`is_const_val` in `ir_optimize`
+    /// match only `Op::Const`, never `Op::ConstF`, so the integer fold/identity
+    /// passes never touch a float constant — FP arithmetic is never mis-folded.)
+    fn fconst(&mut self, val: f32) -> NodeId {
+        self.graph
+            .add(Op::ConstF(val.to_bits() as u64), IrType::Float, vec![], None)
+    }
+
+    /// FP value tier (inc 30): a `double` constant, stored as its raw 64-bit
+    /// IEEE-754 bit pattern. Typed `IrType::Double`.
+    fn dconst(&mut self, val: f64) -> NodeId {
+        self.graph
+            .add(Op::ConstF(val.to_bits()), IrType::Double, vec![], None)
+    }
+
     // ── Merge / phi handling ─────────────────────────────────────────
 
     /// Register a branch target that may need a merge node.
@@ -1329,6 +1347,259 @@ impl IrBuilder {
                     self.push(r);
                     pc += 1;
                 }
+
+                // ── FP value tier (inc 30) ───────────────────────────────────
+                //
+                // The whole block below is reached ONLY when the method was
+                // admitted via the `ir_emit_fp` gate clause in `lib.rs`
+                // (`method_uses_fp` ⇒ FP-gate-only). With the gate off, no
+                // FP-opcode method enters the builder, so these arms are inert
+                // and gate-off codegen is byte-identical. A float is one NodeId
+                // (cat-1); a double is one NodeId occupying two JVM local slots
+                // (cat-2, exactly like `long` — the high-half slot is untouched).
+                //
+                // The lowerer (`ir_lower.rs`) marshals every `IrType::Float`/
+                // `Double` value through XMM. The optimizer passes are FP-safe by
+                // construction: `const_value`/`is_const_val` match only
+                // `Op::Const`, never `Op::ConstF`, and `int_width` returns `None`
+                // for FP, so fold/identity/reassociation never rewrite FP nodes.
+
+                // fconst_0 / fconst_1 / fconst_2
+                0x0b => {
+                    let c = self.fconst(0.0);
+                    self.push(c);
+                    pc += 1;
+                }
+                0x0c => {
+                    let c = self.fconst(1.0);
+                    self.push(c);
+                    pc += 1;
+                }
+                0x0d => {
+                    let c = self.fconst(2.0);
+                    self.push(c);
+                    pc += 1;
+                }
+                // dconst_0 / dconst_1
+                0x0e => {
+                    let c = self.dconst(0.0);
+                    self.push(c);
+                    pc += 1;
+                }
+                0x0f => {
+                    let c = self.dconst(1.0);
+                    self.push(c);
+                    pc += 1;
+                }
+
+                // fload / dload — read a FP local. Identical node-graph mechanics
+                // to `iload`/`lload`: the value is a single NodeId held at
+                // `locals[idx]` (a double's high-half slot `idx+1` is untouched).
+                // fload (wide index)
+                0x17 => {
+                    let idx = code[pc + 1] as usize;
+                    self.push(self.locals[idx]);
+                    pc += 2;
+                }
+                // dload (wide index)
+                0x18 => {
+                    let idx = code[pc + 1] as usize;
+                    self.push(self.locals[idx]);
+                    pc += 2;
+                }
+                // fload_0..3
+                0x22..=0x25 => {
+                    let idx = (op - 0x22) as usize;
+                    self.push(self.locals[idx]);
+                    pc += 1;
+                }
+                // dload_0..3
+                0x26..=0x29 => {
+                    let idx = (op - 0x26) as usize;
+                    self.push(self.locals[idx]);
+                    pc += 1;
+                }
+                // fstore / dstore — write a FP local (same mechanics as
+                // `istore`/`lstore`; a double leaves the high-half slot `idx+1`
+                // untouched).
+                // fstore (wide index)
+                0x38 => {
+                    let idx = code[pc + 1] as usize;
+                    let val = self.pop();
+                    self.locals[idx] = val;
+                    pc += 2;
+                }
+                // dstore (wide index)
+                0x39 => {
+                    let idx = code[pc + 1] as usize;
+                    let val = self.pop();
+                    self.locals[idx] = val;
+                    pc += 2;
+                }
+                // fstore_0..3
+                0x43..=0x46 => {
+                    let idx = (op - 0x43) as usize;
+                    let val = self.pop();
+                    self.locals[idx] = val;
+                    pc += 1;
+                }
+                // dstore_0..3
+                0x47..=0x4a => {
+                    let idx = (op - 0x47) as usize;
+                    let val = self.pop();
+                    self.locals[idx] = val;
+                    pc += 1;
+                }
+
+                // FP arithmetic — `Op::Add/Sub/Mul/Div/Neg` typed `Float`/
+                // `Double`. The lowerer dispatches on the node type to the XMM
+                // scalar form (`addss`/`addsd`/…). FP `Div` has NO div-zero /
+                // overflow guard (IEEE division by zero is `±inf`/`NaN`, never an
+                // exception), so unlike int `Div` it never deopts. `frem`/`drem`
+                // (0x72/0x73) are intentionally absent — JVM FP remainder is
+                // `fmod`-style, not a single instruction; such a method bails to
+                // single-pass.
+                // fadd / dadd
+                0x62 => {
+                    let b = self.pop();
+                    let a = self.pop();
+                    let r = self.add_data(Op::Add, IrType::Float, vec![a, b], pc);
+                    self.push(r);
+                    pc += 1;
+                }
+                0x63 => {
+                    let b = self.pop();
+                    let a = self.pop();
+                    let r = self.add_data(Op::Add, IrType::Double, vec![a, b], pc);
+                    self.push(r);
+                    pc += 1;
+                }
+                // fsub / dsub
+                0x66 => {
+                    let b = self.pop();
+                    let a = self.pop();
+                    let r = self.add_data(Op::Sub, IrType::Float, vec![a, b], pc);
+                    self.push(r);
+                    pc += 1;
+                }
+                0x67 => {
+                    let b = self.pop();
+                    let a = self.pop();
+                    let r = self.add_data(Op::Sub, IrType::Double, vec![a, b], pc);
+                    self.push(r);
+                    pc += 1;
+                }
+                // fmul / dmul
+                0x6a => {
+                    let b = self.pop();
+                    let a = self.pop();
+                    let r = self.add_data(Op::Mul, IrType::Float, vec![a, b], pc);
+                    self.push(r);
+                    pc += 1;
+                }
+                0x6b => {
+                    let b = self.pop();
+                    let a = self.pop();
+                    let r = self.add_data(Op::Mul, IrType::Double, vec![a, b], pc);
+                    self.push(r);
+                    pc += 1;
+                }
+                // fdiv / ddiv
+                0x6e => {
+                    let b = self.pop();
+                    let a = self.pop();
+                    let r = self.add_data(Op::Div, IrType::Float, vec![a, b], pc);
+                    self.push(r);
+                    pc += 1;
+                }
+                0x6f => {
+                    let b = self.pop();
+                    let a = self.pop();
+                    let r = self.add_data(Op::Div, IrType::Double, vec![a, b], pc);
+                    self.push(r);
+                    pc += 1;
+                }
+                // fneg / dneg
+                0x76 => {
+                    let a = self.pop();
+                    let r = self.add_data(Op::Neg, IrType::Float, vec![a], pc);
+                    self.push(r);
+                    pc += 1;
+                }
+                0x77 => {
+                    let a = self.pop();
+                    let r = self.add_data(Op::Neg, IrType::Double, vec![a], pc);
+                    self.push(r);
+                    pc += 1;
+                }
+
+                // FP ⇄ integer / FP ⇄ FP conversions. All are pure single-input
+                // `Op` variants the lowerer maps to a `cvt*` XMM instruction.
+                // i2f / i2d
+                0x86 => {
+                    let a = self.pop();
+                    let r = self.add_data(Op::I2F, IrType::Float, vec![a], pc);
+                    self.push(r);
+                    pc += 1;
+                }
+                0x87 => {
+                    let a = self.pop();
+                    let r = self.add_data(Op::I2D, IrType::Double, vec![a], pc);
+                    self.push(r);
+                    pc += 1;
+                }
+                // l2f / l2d
+                0x89 => {
+                    let a = self.pop();
+                    let r = self.add_data(Op::L2F, IrType::Float, vec![a], pc);
+                    self.push(r);
+                    pc += 1;
+                }
+                0x8a => {
+                    let a = self.pop();
+                    let r = self.add_data(Op::L2D, IrType::Double, vec![a], pc);
+                    self.push(r);
+                    pc += 1;
+                }
+                // f2i / f2l / f2d
+                0x8b => {
+                    let a = self.pop();
+                    let r = self.add_data(Op::F2I, IrType::Int, vec![a], pc);
+                    self.push(r);
+                    pc += 1;
+                }
+                0x8c => {
+                    let a = self.pop();
+                    let r = self.add_data(Op::F2L, IrType::Long, vec![a], pc);
+                    self.push(r);
+                    pc += 1;
+                }
+                0x8d => {
+                    let a = self.pop();
+                    let r = self.add_data(Op::F2D, IrType::Double, vec![a], pc);
+                    self.push(r);
+                    pc += 1;
+                }
+                // d2i / d2l / d2f
+                0x8e => {
+                    let a = self.pop();
+                    let r = self.add_data(Op::D2I, IrType::Int, vec![a], pc);
+                    self.push(r);
+                    pc += 1;
+                }
+                0x8f => {
+                    let a = self.pop();
+                    let r = self.add_data(Op::D2L, IrType::Long, vec![a], pc);
+                    self.push(r);
+                    pc += 1;
+                }
+                0x90 => {
+                    let a = self.pop();
+                    let r = self.add_data(Op::D2F, IrType::Float, vec![a], pc);
+                    self.push(r);
+                    pc += 1;
+                }
+
                 // getfield — read an instance field as an `Op::Load`.
                 //
                 // Slice 1 (read-only) of the field/call IR frontier: only
@@ -1931,8 +2202,10 @@ fn find_branch_targets(code: &[u8], code_len: usize) -> Vec<usize> {
             | 0xb1 => {
                 pc += 1;
             }
-            // 2-byte opcodes (inc 26: + 0x16 lload, 0x37 lstore)
-            0x10 | 0x15 | 0x16 | 0x19 | 0x36 | 0x37 | 0x3a => {
+            // 2-byte opcodes (inc 26: + 0x16 lload, 0x37 lstore; inc 30: + the
+            // wide FP load/store forms 0x17 fload, 0x18 dload, 0x38 fstore,
+            // 0x39 dstore — each is opcode + 1-byte local index).
+            0x10 | 0x15 | 0x16 | 0x17 | 0x18 | 0x19 | 0x36 | 0x37 | 0x38 | 0x39 | 0x3a => {
                 pc += 2;
             }
             // 3-byte opcodes (the 3-byte method invokes: invokevirtual 0xb6,
@@ -2025,8 +2298,10 @@ fn find_loop_headers(code: &[u8], code_len: usize) -> HashSet<usize> {
             | 0xac
             | 0xad
             | 0xb1 => pc += 1,
-            // 2-byte opcodes (inc 26: + 0x16 lload, 0x37 lstore)
-            0x10 | 0x15 | 0x16 | 0x19 | 0x36 | 0x37 | 0x3a => pc += 2,
+            // 2-byte opcodes (inc 26: + 0x16 lload, 0x37 lstore; inc 30: + the
+            // wide FP load/store forms 0x17 fload, 0x18 dload, 0x38 fstore,
+            // 0x39 dstore).
+            0x10 | 0x15 | 0x16 | 0x17 | 0x18 | 0x19 | 0x36 | 0x37 | 0x38 | 0x39 | 0x3a => pc += 2,
             // 3-byte opcodes (invokevirtual 0xb6 / invokespecial 0xb7 /
             // invokestatic 0xb8 — the 3-byte method invokes; inc 26: + 0x14 ldc2_w)
             0x11 | 0x14 | 0x84 | 0xb4 | 0xb5 | 0xb6 | 0xb7 | 0xb8 | 0xbb => pc += 3,

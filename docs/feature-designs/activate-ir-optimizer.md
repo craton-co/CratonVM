@@ -7,10 +7,14 @@ built and **default-ON** in production: `CRATONVM_JIT_IR_CALL` (invokestatic,
 inc 23), `CRATONVM_JIT_SCALAR_NEW` (inc 20), `CRATONVM_JIT_IR_LONG` (long
 arithmetic/constants/load-store/shifts/bitwise/compare/branches/call-args,
 inc 25–28) and `CRATONVM_JIT_IR_CALL_SPECIAL` (invokespecial, inc 24) all flipped
-on in **inc 29** (each with a `=0` opt-out). See the per-increment sections below
-and **["Remaining roadmap (post-inc-29)"](#remaining-roadmap-post-inc-29)** for
-what is left (long/double call returns, `ldiv`/`lrem`, and the `double`/`float`
-XMM tier). Original plan text follows.
+on in **inc 29** (each with a `=0` opt-out). **Inc 30** opens the `double`/`float`
+XMM value tier (value arithmetic + constants + FP-local load/store + int/long⇄FP
+conversions) behind a new **`CRATONVM_JIT_IR_FP`** flag (default-OFF). See the
+per-increment sections below and
+**["Remaining roadmap (post-inc-29)"](#remaining-roadmap-post-inc-29)** for what is
+left (long/double call returns, `ldiv`/`lrem`, and the rest of the `double`/`float`
+XMM tier — FP compares/branches, arrays, params/returns/call-args). Original plan
+text follows.
 
 The Sea-of-Nodes IR and its
 optimization passes exist and are unit-tested, but the live JIT path only
@@ -1701,6 +1705,82 @@ probes still == HotSpot with the gate on, and bt10/14/16/18 == HotSpot.
 `ldiv`/`lrem` (gated on long deopt-resume); then the `double`/`float` half (XMM
 registers + FP-slot deopt resume), which also unlocks `double` call args/returns.
 
+## Increment 30 (double/float XMM value tier — value arithmetic + constants + conversions, gated) landed
+
+Status: **landed**, under a new **`CRATONVM_JIT_IR_FP`** flag (default-OFF). This
+opens roadmap item 3 — the `double`/`float` value tier — with its first
+increment, mirroring the long track's discipline (value ops → constants →
+load/store → conversions, each gated + differentially soaked). The IR lowerer was
+GPR-only; it now has an **XMM register class** and marshals every `IrType::Float`/
+`Double` value through XMM.
+
+**Scope (this increment).** A method that uses `float`/`double` **internally**,
+with an **FP-free `int`/`ref` signature**, takes the IR path. Lowered:
+
+- **FP value arithmetic** — `fadd`/`dadd`, `fsub`/`dsub`, `fmul`/`dmul`,
+  `fdiv`/`ddiv`, `fneg`/`dneg`. These reuse `Op::Add`/`Sub`/`Mul`/`Div`/`Neg`
+  typed `Float`/`Double`; the lowerer dispatches on the node type to the scalar
+  XMM form (`addss`/`addsd`/…). FP `Div` has **no** zero/overflow guard (IEEE
+  `x/0` is `±inf`/`NaN`, never an exception) so it is never a deopt point; FP
+  `Neg` flips the IEEE sign bit on the integer pattern (correct for `±0.0`/`NaN`).
+- **FP constants** — `fconst_0..2`, `dconst_0..1` (`Op::ConstF`, written to the
+  result slot as a GPR immediate — no XMM).
+- **FP local load/store** — `fload`/`dload`/`fstore`/`dstore` (+ `_0..3` and the
+  wide forms `0x17`/`0x18`/`0x38`/`0x39`), identical node-graph mechanics to
+  `iload`/`lstore` (a `double` is one NodeId over two JVM slots, like a `long`).
+- **int/long ⇄ FP conversions** — `i2f`/`i2d`/`l2f`/`l2d`/`f2d`/`d2f` (`cvt*`) and
+  the truncating `f2i`/`f2l`/`d2i`/`d2l` (with the JVM NaN→0 / overflow→MAX|MIN
+  fixup after `cvtt*`, ported verbatim from the single-pass backend's
+  `emit_fp_to_int_nan_fixup` so the two backends agree bit-for-bit).
+
+**Why it's inert for the default path / gate-off byte-identical.** The
+`method_uses_fp` gate (`fp_in_descriptor || fp_in_body`, covering the full
+float+double opcode space) keeps the pure int/long/ref IR clauses FP-free, and a
+float/double method is admitted **only** via the new `ir_emit_fp` clause. So with
+the gate off **no FP opcode ever reaches the IR builder** — admission alone is the
+flag, the builder/lowerer arms need no per-call guard, and codegen is byte-for-byte
+unchanged (824 jit lib tests + 37 pre-existing differential tests unchanged).
+
+**Excluded (still bail to single-pass), and why.** FP **params/returns/call-args**
+(`!fp_in_descriptor`) — they ride XMM argument registers the IR prologue/epilogue
+do not yet marshal; this is the "also unlocks `double` call args + returns" item.
+`frem`/`drem` (no single instruction — `fmod`-style). FP **compares/branches**
+(`fcmpl`/`dcmpg` + `if`) and FP **array** ops (`faload`/`fastore`/…). **int-div**
+methods (an FP value would be live at the div deopt, whose resume can't yet
+reconstruct an FP slot — same discipline as the long gate). **`ldc2_w`** methods
+(the builder does not yet disambiguate long-vs-double constant bits). Each is a
+clean follow-up increment.
+
+**Lowerer mechanics.** The naive spill-everything model extends cleanly: every
+value lives in a frame slot as raw bits, so FP arithmetic/conversions load operand
+bits into XMM0/XMM1 (scratch — caller-saved, no value lives across nodes),
+compute, and store back. New helpers `fp_load`/`fp_store` (`movss`/`movsd`),
+`fp_binop` (`<F3|F2> 0F <op>`), and `emit_fp_to_int_fixup`. The optimizer passes
+are FP-safe **by construction**: `const_value`/`is_const_val` match only
+`Op::Const`, never `Op::ConstF`, and `int_width` returns `None` for FP — so
+constant-fold / algebraic-identity / affine-reassociation never rewrite an FP
+node (no `x*1.0`→`x` / `x+0.0`→`x` miscompiles on `±0.0`/`NaN`).
+
+**Tests** — `jit/tests/ir_vs_singlepass.rs` (+13 FP cases, `check_fp` harness with
+`ir_emit_fp` on): each corpus method takes `int` args / returns `int` (so the GPR
+`try_call` ABI is exact and the FP work stays in XMM) — `fadd`/`fsub`/`fmul`/
+`fdiv` (incl. `±inf`/overflow→`INT_MIN`/`MAX`), `dmul`/`dsub` (incl. `1e10`
+saturation), `fneg`/`dneg`, `fconst_2`/`dconst_1`, `f2d`/`d2f`, `l2f`/`f2l`/
+`l2d`/`d2l`, `double` locals (`dstore_1/3`+`dload_1/3`), the wide `fstore`/`fload`
+forms, and `0.0/0.0`→NaN→0. IR == single-pass == host anchor (Rust's saturating
+float-to-int `as`, which matches the JVM `f2i`/`d2i` semantics exactly).
+`jit/src/lib.rs::ir_fp_wiring_routes_through_ir_only_with_flag` proves the routing
+is non-vacuous: `IR_LOWER_COMPILES`==1 with `ir_emit_fp` on, ==0 without. **824/824
+jit lib, 50/50 differential, `cratonvm-vm` builds clean.**
+
+**Remaining (FP tier follow-ups, dependency order):** FP compares + branches
+(`fcmp`/`dcmp` via `ucomiss`/`ucomisd` → the 3-way `{-1,0,1}` result feeding
+`if<cond>`); FP array load/store (`faload`/`fastore`/…); FP params/returns +
+call-args (XMM prologue/epilogue marshalling + an FP-aware `try_call`/VM call
+convention — the `double` call-args/returns unlock); `frem`/`drem` (`fmod` helper);
+FP-slot deopt resume (so an FP value may be live at a deopt — lets the int-div and
+`ldc2_w` exclusions lift).
+
 ## Runtime wiring — the reachability fix (`CRATONVM_JIT_C2_FIRST_CALL`, gated) landed
 
 Status: **landed**, **default-OFF behind `CRATONVM_JIT_C2_FIRST_CALL`**. This is
@@ -1910,17 +1990,29 @@ are landed and (where flagged) default-ON. What remains, in dependency order:
    `method_has_int_div` bail. (The inc-27 phi-typing fix already types long/double
    phis correctly for that resume.)
 
-3. **`double`/`float` value tier (XMM)** *(the next major sub-project; unblocked)*.
-   The whole second half of category-2. Needs an XMM register class in
-   `ir_lower.rs` (the IR lowerer is currently GPR-only), the FP opcodes
-   (`fadd`/`dadd`/…, `fcmpl`/`dcmpg`/…, `f2d`/`i2d`/`d2l`/…, `fconst`/`dconst`,
-   the `double` half of `ldc2_w`, `fload`/`dload`/`faload`/…), FP-slot deopt
-   resume, and `method_uses_double` flipped from a bail to a gate. This **also
-   unlocks `double` call args + returns** (extend `static_call_shape` to accept
-   `D`/`F` once XMM marshalling exists). Mirror the long track's increment
-   discipline (value ops → constants → load/store → compare/branches → call
-   args), each gated behind a new `CRATONVM_JIT_IR_FP` flag + differential/probe
-   soak.
+3. **`double`/`float` value tier (XMM)** *(the next major sub-project; **first
+   increment landed — inc 30**)*. The whole second half of category-2. The XMM
+   register class in `ir_lower.rs` now exists, and **inc 30** (behind
+   `CRATONVM_JIT_IR_FP`, default-OFF) lowers the FP **value ops** (`fadd`/`dadd`/
+   …, `fneg`/`dneg`), **constants** (`fconst`/`dconst`), **FP-local load/store**
+   (`fload`/`dload`/`fstore`/`dstore` incl. wide forms), and the **int/long⇄FP
+   conversions** (`i2f`/`i2d`/`l2f`/`l2d`/`f2d`/`d2f` and the fixup-bearing
+   `f2i`/`f2l`/`d2i`/`d2l`). `method_uses_fp` is the new admission gate (a
+   bail→gate flip). What remains of the tier, in dependency order:
+   - **FP compares + branches** (`fcmpl`/`fcmpg`/`dcmpl`/`dcmpg` via `ucomiss`/
+     `ucomisd` → the 3-way `{-1,0,1}` result feeding `if<cond>`, with the NaN
+     "unordered" rule distinguishing `cmpl` vs `cmpg`).
+   - **FP array load/store** (`faload`/`daload`/`fastore`/`dastore`).
+   - **FP params/returns + call-args** — XMM prologue/epilogue marshalling + an
+     FP-aware VM→JIT call convention (FP args in XMM0-3/0-7, FP return in XMM0).
+     This **also unlocks `double`/`float` call args + returns** (extend
+     `static_call_shape` to accept `D`/`F` once XMM marshalling exists).
+   - **`frem`/`drem`** (`fmod`-style remainder helper — no single instruction).
+   - **FP-slot deopt resume** (let an FP value be live at a deopt — lifts the
+     inc-30 int-div and `ldc2_w` exclusions). `typed_stack_slot` already carries
+     `FrameValue::Float` for a future FP-aware resume.
+   Continue mirroring the long track's increment discipline, each slice gated
+   behind `CRATONVM_JIT_IR_FP` + differential/probe soak.
 
 **Adjacent (separate tracks, not this doc's to finish):** virtual/interface
 dispatch via inline caches (`CRATONVM_JIT_IR_CALL` for `invokevirtual`/
