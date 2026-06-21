@@ -679,7 +679,7 @@ impl Default for JniGlobalRefs {
 
 impl Drop for JniGlobalRefs {
     fn drop(&mut self) {
-        for raw in self.entries.drain(..) {
+        for raw in self.entries.drain() {
             // Safety: raw was created by Box::into_raw and we own it.
             unsafe { drop(Box::from_raw(raw as *mut ObjectRef)) };
         }

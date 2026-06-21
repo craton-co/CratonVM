@@ -345,10 +345,12 @@ impl AotCache {
     ///                            at the end.
     pub fn serialize(&self) -> Vec<u8> {
         const MAGIC: u32 = 0xA07CAC4E;
-        const VERSION: u16 = Self::CURRENT_VERSION;
+        // `Self::` is not usable from a `const` item nested in a fn body (E0401);
+        // a `let` binding can reference the associated const.
+        let version: u16 = Self::CURRENT_VERSION;
         let mut buf = Vec::new();
         buf.extend_from_slice(&MAGIC.to_le_bytes());
-        buf.extend_from_slice(&VERSION.to_le_bytes());
+        buf.extend_from_slice(&version.to_le_bytes());
         buf.extend_from_slice(&(self.entries.len() as u32).to_le_bytes());
         for (key, entry) in &self.entries {
             let kb = key.as_bytes();
