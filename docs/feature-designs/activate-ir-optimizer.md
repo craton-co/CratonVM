@@ -1764,10 +1764,44 @@ gated branch in `fn execute`; reuses `try_jit_compile_callee`.)
 **To soak / flip on.** This is the first time the IR optimizer becomes *broad* at
 runtime, so the gate stays OFF pending: (1) the full kafka/spring/tomcat/hibernate
 gauntlet with `CRATONVM_JIT_C2_FIRST_CALL=1` (GC-safety is the key risk — more
-methods carry `Op::Call`/deopt points; run under `CRATONVM_DBG_GC_STRESS=1` and an
+methods carry `Op::Call`/deopt points; run under `CRATONVM_DBG_GC_STRESS` and an
 `-Xmx6g`-vs-`-Xmx1g` A/B); (2) a perf pass — IR virtual/interface dispatch has no
 inline cache yet, so per-call dispatch is slower; an invocation-count default and
 an MIC/PIC fast path are the likely follow-ups before any default flip.
+
+**Soak results (GC-safety micro soak — PASSED; full gauntlet still pending).**
+The headline GC-safety risk was soaked with allocation-heavy probes gate-ON vs
+gate-OFF vs HotSpot, at `-Xmx1g`/`-Xmx6g`, under max GC frequency:
+- **Non-vacuous:** a recursive linked-list probe `GcVirt.sum` (invokevirtual +
+  invokestatic + getfield over a receiver oop *live across* both `Op::Call`s — the
+  exact inc-26 oops-across-call risk) **fires IR gate-ON** (`[cratonvm-ircall]`)
+  and **zero gate-OFF**; output `664200000` == HotSpot.
+- **GC-safe under stress:** `GcVirt` with `CRATONVM_DBG_GC_STRESS=4096` (a young GC
+  on ~every allocation) == HotSpot gate-ON **and** gate-OFF at both `-Xmx1g` and
+  `-Xmx6g`; `CRATONVM_GC_VERIFY_STALE=1` emits zero stale/zeroed-header warnings.
+- **Checksums:** bt10/14/16/18 == `135854 / 3222190 / 14985902 / 68332206` gate-ON
+  (default heap); bt16 1g-vs-6g A/B identical gate-ON == gate-OFF.
+- **Pre-existing GC bug surfaced (NOT this change):** under the *extreme*
+  `CRATONVM_DBG_GC_STRESS=4096` knob at a tight heap, the **single-pass** path
+  intermittently miscomputes object-`binarytrees` (gate-OFF reproduces; a `println`
+  perturbs it away — a Heisenbug; gate-ON's IR path, which spills oops to frame
+  slots, is always correct). Filed as a separate task (likely a single-pass
+  register-resident missed root across the recursive allocating call; cf. the
+  reflrepro-A2 / kafka-25 family). The gate's own soak is clean.
+
+The remaining gating step before flipping the default is the **full app gauntlet**
+(kafka/spring/tomcat/hibernate) — a heavy multi-hour run via the per-suite
+`apps/*/...` harnesses; the GC-safety headline is validated by the above.
+
+**Follow-up feasibility (scoped).** (a) *IR `Op::Call` inline cache* (MIC/PIC fast
+path in `ir_lower`): **feasible-medium**, deferred to a post-flip perf pass (its
+ABI risk would muddy the soak; it only matters once the gate is ON). (b) *Route
+OSR through `try_compile`*: **infeasible without building IR-OSR from scratch** —
+the IR pipeline emits zero OSR-entry metadata (`ir_lower::lower` leaves all `osr_*`
+fields default), so it requires re-implementing the x64 OSR machinery
+(`x64.rs:21850-21923`, LICM-preheader rules, per-block live-in) in the IR backend.
+XL, high GC-safety risk; tracked as a separate epic. Until then OSR-dominated /
+loop-on-first-call kernels remain single-pass (see Scope below).
 
 **Scope (what this does and does NOT reach).** The dispatcher warmup path
 (`try_jit_upgrade_with_gate`) was *already* wired to `try_compile(optimize=true)`
