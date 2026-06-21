@@ -412,6 +412,15 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     //     Remap companion in `gc.rs` (`gc_update_re10_handler_refs`).
     cratonvm_native_builtins::net_phase_e::gc_scan_re10_handler_roots(&mut roots);
 
+    // 21. Uniform native-root registry. Any native subsystem holding ObjectRefs
+    //     in a process-global side-table can register a scan callback here
+    //     instead of hand-wiring a new `gc_scan_*` call into this function (see
+    //     `crate::memory::native_roots`). Fans out to every registered source;
+    //     a no-op (byte-identical to baseline) until a subsystem registers, so
+    //     it is safe to land ahead of any adopter. The matching post-move remap
+    //     is `native_roots::remap_all_native_roots` in `gc.rs`.
+    crate::memory::native_roots::scan_all_native_roots(&mut roots);
+
     roots
 }
 
