@@ -54,16 +54,16 @@ fn runs_seed_corpus_and_writes_ledger() {
     }
 
     let ledger_path = std::env::temp_dir().join("difftest_seed_diff_ledger.json");
-    // Fan out across the interpreter/JIT axis so divergences auto-classify.
+    // Fan out across the interpreter/JIT axis so divergences auto-classify, and
+    // exercise the determinism pre-flight + re-confirmation.
     let modes = vec![Mode::JitOn, Mode::NoJit];
     let config = RunnerConfig {
-        corpus: seeds_dir(),
         modes: modes.clone(),
-        timeout: DEFAULT_TIMEOUT,
-        jdk_home: None,
-        allow_jdk_downgrade: false,
         ledger: ledger_path.clone(),
         update_ledger: true,
+        determinism_check: true,
+        reconfirm: true,
+        ..RunnerConfig::for_corpus(seeds_dir())
     };
 
     let expected = harness::discover_programs(&config.corpus).len();

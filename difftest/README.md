@@ -8,12 +8,12 @@ eyeball the diff" loop that produced nearly every bug in `docs/internal/*` and
 
 Full design: [`docs/feature-designs/differential-fuzzer.md`](../docs/feature-designs/differential-fuzzer.md).
 
-> **Status: Step 0 — scaffolding.** The crate builds green and ships the shared
-> types, binary-resolution helpers, the `run` / `gen` / `min` / `gate` CLI, and
-> the gate's exit-code contract. **No generation, mutation, or real diffing is
-> wired yet** — every stub returns an empty / `Unimplemented` result and never
-> panics. Each later step (see the design doc §4) is a small, independently
-> mergeable, build-green PR.
+> **Status: Step 3 — determinism pre-flight + ledger gate.** `run` A/Bs the
+> corpus across the CratonVM mode matrix vs HotSpot and auto-classifies each
+> divergence; `gate` adds the twice-on-HotSpot determinism filter, divergence
+> re-confirmation, and the committed-ledger verdict (the §3.5 exit codes).
+> `gen` / `min` remain stubs (Steps 4 / 6). Each step (design doc §4) is a
+> small, independently mergeable, build-green PR.
 
 ## Layout
 
@@ -23,10 +23,12 @@ difftest/
     ledger.rs    divergence records + the committed JSON ledger (§3.5)
     runner.rs    two-VM A/B executor: binary resolution + mode matrix (§3.2)
     oracle.rs    per-channel compare + normalize + classify (§3.3)
+    harness.rs   compile + run the matrix + diff + gate (§3.5)
     generate.rs  corpus generator (§3.1)        [stub → Step 4]
     minimize.rs  reproducer shrinker (§3.4)      [stub → Step 6]
     main.rs      the `difftest` CLI
   seeds/         curated self-printing .java programs (the first corpus)
+  ledger.json    committed known-divergence ledger (the gate's baseline)
   corpus/        live corpus (generated / promoted inputs)   [grows at runtime]
   regression/    minimized, committed repros of confirmed divergences
 ```

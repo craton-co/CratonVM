@@ -11,19 +11,20 @@
 //!
 //! Design: `docs/feature-designs/differential-fuzzer.md`.
 //!
-//! ## Status: Step 2 — mode matrix + auto-classification
+//! ## Status: Step 3 — determinism pre-flight + ledger gate
 //!
-//! The runner spawns the `cratonvm` binary and a real `java` as subprocesses
-//! (timeout-guarded capture of stdout/stderr/exit-code), compiles a `.java`
-//! seed once with `javac`, and runs the same `.class` on both VMs; the oracle
-//! parses the uncaught-exception banner and diffs the four channels (exit code,
-//! exception identity, stdout, stderr) under strict-by-default normalization.
-//! The [`harness`] now fans CratonVM out across **every configured mode**
-//! ([`runner::Mode`]) against one HotSpot run and feeds the per-mode
-//! agree/diverge map into [`oracle::classify`], auto-labeling each divergence
-//! (`JitOnly`/`GcMode`/`Universal`/`Hang`/`Crash`) — the automated `--nojit`
-//! bisection. Generation, bytecode mutation, minimization, the determinism
-//! pre-flight, and the committed-ledger gate verdict remain Step-3+ work.
+//! The runner spawns the `cratonvm` binary and a real `java` as subprocesses,
+//! compiles a `.java` seed once with `javac`, and runs the same `.class` on
+//! both VMs; the oracle diffs the four channels (exit code, exception identity,
+//! stdout, stderr) under strict-by-default normalization. The [`harness`] fans
+//! CratonVM across **every configured mode** ([`runner::Mode`]) against one
+//! HotSpot run and [`oracle::classify`]s each divergence
+//! (`JitOnly`/`GcMode`/`Universal`/`Hang`/`Crash`). Step 3 adds the
+//! **determinism pre-flight** (twice-on-HotSpot reject), **divergence
+//! re-confirmation** (drop transients), and [`harness::gate`] — the
+//! committed-[`ledger::Ledger`] diff that drives the §3.5 exit codes
+//! (0 ok / 1 new-or-drift / 2 fixed-reopened / 3 bootstrap). Source generation,
+//! bytecode mutation, and minimization remain Step-4+ work.
 //!
 //! The cooperating pieces, each its own module:
 //!
