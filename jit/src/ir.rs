@@ -495,6 +495,12 @@ pub struct IrBuilder {
     /// live across the call — found by the conservative GC scan of the spilled
     /// frame, sound because GC is non-moving while a JIT frame is active).
     invoke_info: HashMap<usize, (usize, usize, u8)>,
+    /// inc 26: resolved `ldc2_w` (0x14) long-constant values (`pc → i64`). Set by
+    /// [`Self::set_ldc2w_info`]; an `ldc2_w` pc not present bails to single-pass.
+    /// Only long constants are admitted — a double `ldc2_w` is excluded upstream
+    /// (its consuming double opcode trips `method_uses_double`), so a present
+    /// value is always the `long` bit pattern.
+    ldc2w_info: HashMap<usize, i64>,
 }
 
 impl IrBuilder {
@@ -536,7 +542,14 @@ impl IrBuilder {
             new_info: HashMap::new(),
             trivial_init_pcs: HashSet::new(),
             invoke_info: HashMap::new(),
+            ldc2w_info: HashMap::new(),
         }
+    }
+
+    /// inc 26: supply resolved `ldc2_w` long-constant values (`pc → i64`). Must
+    /// be called before [`Self::build`]; an `ldc2_w` pc not present bails.
+    pub fn set_ldc2w_info(&mut self, info: HashMap<usize, i64>) {
+        self.ldc2w_info = info;
     }
 
     /// Re-lay-out the parameter locals with the JVM category-2 two-slot
@@ -974,6 +987,15 @@ impl IrBuilder {
                     self.push(self.locals[idx]);
                     pc += 1;
                 }
+                // lload (wide index) — inc 26. A long is one NodeId slot; the
+                // value lives at `locals[idx]` (the high half slot `idx+1` is
+                // never read by valid bytecode). Long-only, so inert for the int
+                // path.
+                0x16 => {
+                    let idx = code[pc + 1] as usize;
+                    self.push(self.locals[idx]);
+                    pc += 2;
+                }
                 // aload — push an object reference local (same node-graph
                 // mechanics as iload: a reference is just a NodeId on the
                 // abstract stack; its only consumer in the IR slice we lower is
@@ -1029,6 +1051,14 @@ impl IrBuilder {
                     let val = self.pop();
                     self.locals[idx] = val;
                     pc += 1;
+                }
+                // lstore (wide index) — inc 26. Stores the long NodeId at
+                // `locals[idx]` (high half slot `idx+1` untouched). Long-only.
+                0x37 => {
+                    let idx = code[pc + 1] as usize;
+                    let val = self.pop();
+                    self.locals[idx] = val;
+                    pc += 2;
                 }
                 // iadd
                 0x60 => {
@@ -1565,6 +1595,21 @@ impl IrBuilder {
                     self.push(c);
                     pc += 1;
                 }
+                // ldc2_w (long constant from the constant pool) — inc 26. The
+                // resolved long value comes from `set_ldc2w_info` (`pc → i64`);
+                // an absent pc bails to single-pass. A double `ldc2_w` is
+                // excluded upstream (its consuming double opcode trips
+                // `method_uses_double`), so a present value is the long bits.
+                // (`ldc2_w` is 3 bytes: opcode + 2-byte CP index.)
+                0x14 => {
+                    let val = match self.ldc2w_info.get(&pc) {
+                        Some(&v) => v,
+                        None => return None,
+                    };
+                    let c = self.lconst(val);
+                    self.push(c);
+                    pc += 3;
+                }
 
                 // tableswitch / lookupswitch — lower as a CMP-equality chain
                 // (the same shape the single-pass backend emits): each case is
@@ -1758,12 +1803,12 @@ fn find_branch_targets(code: &[u8], code_len: usize) -> Vec<usize> {
             | 0xb1 => {
                 pc += 1;
             }
-            // 2-byte opcodes
-            0x10 | 0x15 | 0x19 | 0x36 | 0x3a => {
+            // 2-byte opcodes (inc 26: + 0x16 lload, 0x37 lstore)
+            0x10 | 0x15 | 0x16 | 0x19 | 0x36 | 0x37 | 0x3a => {
                 pc += 2;
             }
-            // 3-byte opcodes
-            0x11 | 0x84 | 0xb4 | 0xb5 | 0xb7 | 0xb8 | 0xbb => {
+            // 3-byte opcodes (inc 26: + 0x14 ldc2_w)
+            0x11 | 0x14 | 0x84 | 0xb4 | 0xb5 | 0xb7 | 0xb8 | 0xbb => {
                 pc += 3;
             }
             _ => {
@@ -1845,10 +1890,10 @@ fn find_loop_headers(code: &[u8], code_len: usize) -> HashSet<usize> {
             | 0xac
             | 0xad
             | 0xb1 => pc += 1,
-            // 2-byte opcodes
-            0x10 | 0x15 | 0x19 | 0x36 | 0x3a => pc += 2,
-            // 3-byte opcodes
-            0x11 | 0x84 | 0xb4 | 0xb5 | 0xb7 | 0xb8 | 0xbb => pc += 3,
+            // 2-byte opcodes (inc 26: + 0x16 lload, 0x37 lstore)
+            0x10 | 0x15 | 0x16 | 0x19 | 0x36 | 0x37 | 0x3a => pc += 2,
+            // 3-byte opcodes (inc 26: + 0x14 ldc2_w)
+            0x11 | 0x14 | 0x84 | 0xb4 | 0xb5 | 0xb7 | 0xb8 | 0xbb => pc += 3,
             _ => pc += 1,
         }
     }

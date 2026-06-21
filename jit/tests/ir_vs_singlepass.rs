@@ -290,6 +290,118 @@ fn ir_vs_singlepass_long_to_int_return() {
 }
 
 #[test]
+fn ir_vs_singlepass_long_wide_load_store() {
+    // inc 26: long params/locals at JVM slots >= 4 use the WIDE `lload` (0x16) /
+    // `lstore` (0x37) forms (not the short `lload_2`/`lstore_3`).
+    // long f(long a, long b, long c) { long d = a + b; long e = c - d; return d * e; }
+    //   a@0-1 b@2-3 c@4-5 d@6-7 e@8-9
+    //   lload_0; lload_2; ladd; lstore 6; lload 4; lload 6; lsub; lstore 8;
+    //   lload 6; lload 8; lmul; lreturn
+    let code = vec![
+        0x1e, 0x20, 0x61, // d = a + b
+        0x37, 0x06, // lstore 6 (d)
+        0x16, 0x04, // lload 4 (c)
+        0x16, 0x06, // lload 6 (d)
+        0x65, // lsub  -> c - d
+        0x37, 0x08, // lstore 8 (e)
+        0x16, 0x06, // lload 6 (d)
+        0x16, 0x08, // lload 8 (e)
+        0x69, // lmul -> d * e
+        0xad, // lreturn
+    ];
+    check_long(
+        "lwide",
+        "(JJJ)J",
+        code,
+        10,
+        3,
+        &[
+            // host uses wrapping ops to match the JVM's 64-bit `long` semantics.
+            (vec![3, 4, 100], {
+                let d = 3i64.wrapping_add(4);
+                let e = 100i64.wrapping_sub(d);
+                d.wrapping_mul(e) // 7 * 93 = 651
+            }),
+            (vec![0x1_0000_0000, 1, 0x4_0000_0000], {
+                let d = 0x1_0000_0000i64.wrapping_add(1);
+                let e = 0x4_0000_0000i64.wrapping_sub(d);
+                d.wrapping_mul(e) // overflows 64-bit → wraps
+            }),
+            (vec![-2, -3, 10], {
+                let d = (-2i64).wrapping_add(-3);
+                let e = 10i64.wrapping_sub(d);
+                d.wrapping_mul(e)
+            }),
+        ],
+    );
+}
+
+/// Like [`compile_long_opt`] but also supplies an `ldc2_w` long-constant resolver
+/// (inc 26) so the IR builder can lower long constants from the constant pool.
+fn compile_long_ldc2w(
+    cm: &CachedBytecodeMethod,
+    helpers: &JitRuntimeHelpers,
+    optimize: bool,
+    ldc2w: &dyn Fn(u16) -> Option<i64>,
+) -> Option<CompiledMethod> {
+    try_compile(
+        cm,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some(ldc2w),
+        None,
+        helpers,
+        None,
+        None,
+        None,
+        None,
+        optimize,
+        false,
+        false,
+        true,
+    )
+}
+
+#[test]
+fn ir_vs_singlepass_long_ldc2w_constant() {
+    // inc 26: `ldc2_w` long constants. long f(long a) { return a * C1 + C2; }
+    //   lload_0; ldc2_w #1; lmul; ldc2_w #2; ladd; lreturn
+    const C1: i64 = 1_000_000_007;
+    const C2: i64 = 0x7FFF_FFFF_0000_002A; // a large 64-bit constant (not 32-bit)
+    let code = vec![
+        0x1e, // lload_0 (a)
+        0x14, 0x00, 0x01, // ldc2_w #1 (C1)
+        0x69, // lmul
+        0x14, 0x00, 0x02, // ldc2_w #2 (C2)
+        0x61, // ladd
+        0xad, // lreturn
+    ];
+    let ldc2w = |cp: u16| -> Option<i64> {
+        match cp {
+            1 => Some(C1),
+            2 => Some(C2),
+            _ => None,
+        }
+    };
+    let helpers = dummy_helpers();
+    let cm = cached("lldc", "(J)J", code, 2, 1);
+    let ir = compile_long_ldc2w(&cm, &helpers, true, &ldc2w).expect("IR long ldc2_w");
+    let sp = compile_long_ldc2w(&cm, &helpers, false, &ldc2w).expect("single-pass");
+    for a in [3i64, 0, -7, 0x1_0000_0000, i64::MAX] {
+        let r_ir = unsafe { ir.try_call(&[a]) }.unwrap();
+        let r_sp = unsafe { sp.try_call(&[a]) }.unwrap();
+        let host = a.wrapping_mul(C1).wrapping_add(C2);
+        assert_eq!(r_ir, r_sp, "ldc2_w IR vs single-pass for a={a}");
+        assert_eq!(r_ir, host, "ldc2_w vs host for a={a}");
+    }
+}
+
+#[test]
 fn ir_vs_singlepass_add() {
     // int add(int a, int b) { return a + b; }
     //   iload_0; iload_1; iadd; ireturn

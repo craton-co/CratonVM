@@ -4461,6 +4461,22 @@ fn try_compile_inner(
         if ir_emit_long {
             let ptypes = ir_param_types(&cached.method_descriptor, cached.is_static);
             builder.set_param_types(&ptypes);
+            // inc 26: resolve `ldc2_w` long constants (pc → i64) so the builder
+            // can lower them to `Op::Const(Long)`. A double constant is excluded
+            // upstream (its consuming double opcode trips `method_uses_double`),
+            // so every resolved value here is a long bit pattern. An unresolved
+            // `ldc2_w` is omitted → that opcode bails to single-pass.
+            if !scan.ldc2w_ops.is_empty() {
+                if let Some(resolver) = cp_ldc2w_resolver {
+                    let mut lm = std::collections::HashMap::with_capacity(scan.ldc2w_ops.len());
+                    for &(pc, cp_idx) in &scan.ldc2w_ops {
+                        if let Some(v) = resolver(cp_idx) {
+                            lm.insert(pc, v);
+                        }
+                    }
+                    builder.set_ldc2w_info(lm);
+                }
+            }
         }
         // Thread the resolved instance-field layout (pc → (field_index,
         // type_tag)) into the builder so it can lower an int-category

@@ -1472,6 +1472,53 @@ the long deopt-resume so a `long` can be live at the div guard); then the
 **long/double *call* args + returns** (`static_call_shape` category-2 marshalling
 — the original "category-2 call args" item, now unblocked at the value level).
 
+## Increment 26 (long sub-slice — wide `lload`/`lstore` + `ldc2_w`) landed
+
+Status: **landed** on `dev`, under the existing **`CRATONVM_JIT_IR_LONG`**
+(default-OFF). Extends inc 25's long path with the two opcodes that block most
+real long methods: the **wide** `lload` (0x16) / `lstore` (0x37) forms (a long
+param/local at JVM slot ≥ 4 — inc 25 only had the short `lload_0..3`/
+`lstore_0..3`) and **`ldc2_w`** (0x14, a long constant from the constant pool).
+Both are long-only, so inert for the int path.
+
+**What landed**
+- **`jit/src/ir.rs`** — builder arms for `0x16`/`0x37` (read the 1-byte index,
+  push/pop the long NodeId at `locals[idx]`; the high-half slot `idx+1` is never
+  read by valid bytecode) and `0x14` (look up the resolved value in a new
+  `ldc2w_info: HashMap<pc, i64>` and emit `Op::Const(Long)` via the existing
+  `lconst` helper; an absent pc bails to single-pass). `set_ldc2w_info` is the
+  setter. **Both length walkers** (`find_branch_targets`, `find_loop_headers`)
+  gained `0x16`/`0x37` (2-byte) and `0x14` (3-byte) — without this a long method
+  with these opcodes would mis-parse its branch targets / loop headers.
+- **`jit/src/lib.rs`** — when `ir_emit_long` is on, build `ldc2w_info` from
+  `scan.ldc2w_ops` + the existing `cp_ldc2w_resolver` and call `set_ldc2w_info`.
+  A **double** `ldc2_w` cannot reach here: any double constant is consumed by a
+  double-typed opcode, which trips `method_uses_double` and bails the method —
+  so every resolved value is a `long` bit pattern (handled as a full 64-bit
+  `Op::Const`).
+
+**Tests**
+- `jit/tests/ir_vs_singlepass.rs::ir_vs_singlepass_long_wide_load_store` —
+  `long f(long a, long b, long c){ long d=a+b; long e=c-d; return d*e; }` exercises
+  wide `lload 4`/`lload 6`/`lstore 6`/`lstore 8` (locals at slots 4/6/8); IR ==
+  single-pass == host over the full i64 (incl. a 64-bit-overflow case).
+- `…_long_ldc2w_constant` — `long f(long a){ return a*C1 + C2; }` with a resolver
+  supplying `C1`/`C2` (one a large constant with bit 63 set); IR == single-pass ==
+  host (proves the long const is loaded at full 64-bit width, no truncation).
+- jit lib **819/819**, differential **32/32**, `cratonvm-vm` builds clean.
+
+**Live soak** (`CRATONVM_JIT_IR_LONG` toggled): `scratch/irlong/IrLong2.java`
+(`hash(long,long,long)` — 3 long params so `c` uses wide `lload 4`, a long local
+`h` at slot 6 using wide `lstore`/`lload`, and `ldc2_w` constants `1125899906842597L`
+/ `31L`) == HotSpot (`4898113815606063616`) gate-ON and gate-OFF, and
+`CRATONVM_DBG_IR_LONG` confirms it takes the IR path. No regression: the inc-25
+`IrLong` probe still == HotSpot with the gate on, and bt10/14/16/18 == HotSpot
+(`135854 / 3222190 / 14985902 / 68332206`).
+
+**Remaining long sub-slices** (unchanged order): `lcmp` + long-fed branches;
+`lshl`/`lshr`/`lushr`/`land`/`lor`/`lxor`; `ldiv`/`lrem` (long deopt-resume);
+then `double`/`float` (XMM); then long/double call args + returns.
+
 ## Implementation steps (ordered)
 
 1. **φ/branch lowering repro + fix** (Front 1.1) — unblocks everything.
