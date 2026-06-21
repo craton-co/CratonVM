@@ -441,17 +441,24 @@ impl VmHeap {
         unsafe { ObjectRef::from_raw(addr) }
     }
 
-    /// Read the compact header for an object. Thin wrapper over the
-    /// backend-specific path. Used by [`Self::load_and_forward`].
+    /// Decode the first 8 bytes of an object's header as a compact
+    /// 64-bit [`CompactHeader`]. The return is a *copy* of that word so
+    /// the caller can inspect it without holding a borrow into the heap.
     ///
-    /// The return is a *copy* of the 64-bit header word wrapped in a
-    /// `CompactHeader` so the caller can inspect it without holding
-    /// a borrow into the heap.
+    /// NOTE: this is **only** meaningful for a backend that actually
+    /// adopts the compact header format. Every current `VmHeap` backend
+    /// (`Heap`, `GenerationalHeap`, `G1Collector`) lays objects out with
+    /// the full 32-byte [`ObjectHeader`], whose first 8 bytes are
+    /// `class_id`/`identity_hash_code` — not a compact header — so this
+    /// method has no in-tree callers today. In particular it is **not**
+    /// used by [`Self::load_and_forward`], which reads the legacy
+    /// `ObjectHeader.forwarding_ptr` field directly (see that method's
+    /// backend-compatibility note).
     #[inline]
     pub fn get_compact_header(&self, obj: ObjectRef) -> crate::compact_header::CompactHeader {
-        // Every heap backend lays out the object header as a 64-bit
-        // word at offset 0 from the ObjectRef pointer. Read the
-        // word directly and reinterpret as a CompactHeader.
+        // Read the 64-bit word at offset 0 from the ObjectRef pointer and
+        // reinterpret it as a CompactHeader. Only correct once a backend
+        // stores compact headers there (see the doc-comment above).
         //
         // SAFETY: ObjectRef is a validated heap address pointing at
         // a live object header. The load is aligned (headers are
