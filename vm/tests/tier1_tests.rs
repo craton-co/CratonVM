@@ -1001,15 +1001,24 @@ fn t1_brooks_barrier_follows_forwarding_pointer() {
     let shared = Arc::new(SharedVm::new(VmConfig::default()));
     let old = shared.heap.alloc_object(ClassId::new(1), 2);
     let new_obj = shared.heap.alloc_object(ClassId::new(1), 2);
-    // Directly install a forwarding pointer on `old`'s header. The
-    // CompactHeader API is the path stop-the-world GC uses during
-    // evacuation; we exercise it here without running the collector.
-    use cratonvm_gc::compact_header::{CompactHeader, LockState};
-    let ptr = old.as_ptr() as *mut u64;
-    let mut header = unsafe { CompactHeader::from_raw(std::ptr::read(ptr)) };
-    header.set_forwarding_ptr(new_obj.as_ptr() as usize);
-    assert_eq!(header.lock_state(), LockState::Forwarded);
-    unsafe { std::ptr::write(ptr, header.raw()) };
+    // Directly install a forwarding pointer on `old`'s header exactly the
+    // way the live stop-the-world collector does. Every `VmHeap` backend
+    // lays objects out with the full 32-byte `ObjectHeader`, and
+    // `gen_heap::forward_object` records relocation by writing the legacy
+    // `ObjectHeader.forwarding_ptr` field (offset 24) — NOT the compact
+    // 64-bit header word at offset 0 (which, in a full header, is
+    // `class_id`/`identity_hash_code`, not the mark word). The read-barrier
+    // `load_and_forward` reads that same `forwarding_ptr` field via
+    // `is_forwarded()`/`forwarding_address()`, so the test must install
+    // forwarding through `ObjectHeader` to exercise the real path.
+    //
+    // SAFETY: `old` is a live object allocated above; its first
+    // `ObjectHeader` bytes are valid and mutable, and `forwarding_ptr`
+    // is null until we write it here.
+    unsafe {
+        let hdr = old.as_ptr() as *mut cratonvm_gc::ObjectHeader;
+        std::ptr::addr_of_mut!((*hdr).forwarding_ptr).write(new_obj.as_ptr() as *mut u8);
+    }
     // Now the barrier should follow the forwarding pointer.
     let forwarded = shared.heap.load_and_forward(old);
     assert_eq!(forwarded.as_ptr(), new_obj.as_ptr());
