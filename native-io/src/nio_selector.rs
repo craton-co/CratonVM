@@ -3254,8 +3254,7 @@ mod tests {
         // A selector whose key carries a non-null `key_obj`.
         let id = selector_open();
         let fd = fake_fd();
-        selector_register(id, fd, OP_READ, Some(key_obj), 0x7E57_0002_u32 as i32, None)
-            .unwrap();
+        selector_register(id, fd, OP_READ, Some(key_obj), 0x7E57_0002_u32 as i32, None).unwrap();
 
         let mut roots: Vec<ObjectRef> = Vec::new();
         gc_scan_selector_roots(&mut roots);

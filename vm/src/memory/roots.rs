@@ -412,6 +412,19 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     //     Remap companion in `gc.rs` (`gc_update_re10_handler_refs`).
     cratonvm_native_builtins::net_phase_e::gc_scan_re10_handler_roots(&mut roots);
 
+    //     NIO SelectionKey table: channel/selector/attachment/key_obj ObjectRefs
+    //     live only in `sk_table`; remap was already wired (gc.rs
+    //     `sk_table_update_after_gc`) but the root SCAN was missing, so a key
+    //     reachable only through sk_table could be swept before the remap ran.
+    cratonvm_native_io::nio_selector::gc_scan_selector_roots(&mut roots);
+    //     ScheduledThreadPoolExecutor pending runnables (stored as relocatable
+    //     addresses; remap companion `scheduled_pump::gc_update_scheduled_refs`).
+    cratonvm_native_builtins::scheduled_pump::gc_scan_scheduled_roots(&mut roots);
+    //     XNIO IoFuture notifier/attachment/result refs held across allocations
+    //     until the future settles (remap companion
+    //     `xnio_async::gc_update_xnio_future_refs`).
+    cratonvm_native_builtins::xnio_async::gc_scan_xnio_future_roots(&mut roots);
+
     // 21. Uniform native-root registry. Any native subsystem holding ObjectRefs
     //     in a process-global side-table can register a scan callback here
     //     instead of hand-wiring a new `gc_scan_*` call into this function (see
