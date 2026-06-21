@@ -4021,12 +4021,9 @@ fn cm_construct_via_context(
         "()Lio/smallrye/config/DefaultValuesConfigSource;",
         &[],
     ) {
-        if let Ok(Some(Value::Object(Some(bdefs)))) = ctx.invoke_virtual(
-            builder,
-            "getDefaultValues",
-            "()Ljava/util/Map;",
-            &[],
-        ) {
+        if let Ok(Some(Value::Object(Some(bdefs)))) =
+            ctx.invoke_virtual(builder, "getDefaultValues", "()Ljava/util/Map;", &[])
+        {
             let _ = ctx.invoke_virtual(
                 dvcs,
                 "addDefaults",
@@ -50170,9 +50167,7 @@ mod cert_verify_bounds_security_tests {
     fn mac_and_zip_byterange_natives_remain_registered() {
         let mut r = NativeMethodRegistry::new();
         register_p68_crypto_mac(&mut r);
-        assert!(r
-            .find("javax/crypto/Mac", "update", "([BII)V")
-            .is_some());
+        assert!(r.find("javax/crypto/Mac", "update", "([BII)V").is_some());
 
         let mut r2 = NativeMethodRegistry::new();
         register_p58_gzip_streams(&mut r2);

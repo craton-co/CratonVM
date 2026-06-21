@@ -2315,7 +2315,11 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(ret, Value::Int(7), "getAndDecrement returns the OLD value");
-        assert_eq!(um.get_field(target, 0), Value::Int(6), "slot is decremented");
+        assert_eq!(
+            um.get_field(target, 0),
+            Value::Int(6),
+            "slot is decremented"
+        );
     }
 
     #[test]
@@ -2332,7 +2336,11 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(ret, Value::Int(70), "addAndGet returns the NEW value");
-        assert_eq!(um.get_field(target, 0), Value::Int(70), "slot holds new value");
+        assert_eq!(
+            um.get_field(target, 0),
+            Value::Int(70),
+            "slot holds new value"
+        );
     }
 
     #[test]
@@ -2395,7 +2403,11 @@ mod tests {
             )
             .unwrap()
             .unwrap();
-            assert_eq!(old, Value::Int(i), "each getAndIncrement returns prior count");
+            assert_eq!(
+                old,
+                Value::Int(i),
+                "each getAndIncrement returns prior count"
+            );
         }
         assert_eq!(um.get_field(target, 0), Value::Int(5));
     }

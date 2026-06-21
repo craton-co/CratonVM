@@ -1066,7 +1066,11 @@ fn instruction_branch_targets(insn: &Instruction, pc: usize) -> Vec<u16> {
 fn resolve_invoked_owner_and_name(
     cp: &ConstantPool,
     index: u16,
-) -> Option<(std::sync::Arc<str>, std::sync::Arc<str>, std::sync::Arc<str>)> {
+) -> Option<(
+    std::sync::Arc<str>,
+    std::sync::Arc<str>,
+    std::sync::Arc<str>,
+)> {
     let (class_index, name_and_type_index) = match cp.get(index)? {
         ConstantPoolEntry::MethodReference {
             class_index,
@@ -1080,7 +1084,11 @@ fn resolve_invoked_owner_and_name(
     };
     let owner = cp.get_class_name_arc(class_index)?;
     let (name, desc) = cp.get_name_and_type(name_and_type_index)?;
-    Some((owner, std::sync::Arc::from(name), std::sync::Arc::from(desc)))
+    Some((
+        owner,
+        std::sync::Arc::from(name),
+        std::sync::Arc::from(desc),
+    ))
 }
 
 /// JVMS §4.10.1.9 owner-match check for `invokespecial <init>`.
@@ -2551,11 +2559,11 @@ mod tests {
     /// Constant pool whose entry #6 is a `Methodref` to `D.<init>()V`.
     fn init_owner_cp() -> ConstantPool {
         ConstantPool::new(vec![
-            ConstantPoolEntry::Tombstone,               // 0
-            ConstantPoolEntry::Utf8("D".into()),        // 1
+            ConstantPoolEntry::Tombstone,                        // 0
+            ConstantPoolEntry::Utf8("D".into()),                 // 1
             ConstantPoolEntry::ClassReference { name_index: 1 }, // 2 (owner D)
-            ConstantPoolEntry::Utf8("<init>".into()),   // 3
-            ConstantPoolEntry::Utf8("()V".into()),      // 4
+            ConstantPoolEntry::Utf8("<init>".into()),            // 3
+            ConstantPoolEntry::Utf8("()V".into()),               // 4
             ConstantPoolEntry::NameAndType {
                 name_index: 3,
                 descriptor_index: 4,
@@ -2569,8 +2577,7 @@ mod tests {
 
     fn owner_match_frame() -> VerificationFrame {
         // A frame with a single `Uninitialized(0)` receiver on the stack.
-        let mut frame =
-            VerificationFrame::initial_frame("Test", "test", "()V", true, 1, 4);
+        let mut frame = VerificationFrame::initial_frame("Test", "test", "()V", true, 1, 4);
         frame.push(VType::Uninitialized(0)).unwrap();
         frame
     }

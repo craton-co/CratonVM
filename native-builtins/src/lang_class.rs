@@ -1362,10 +1362,12 @@ fn validate_for_name_dotted(dotted_name: &str) -> Result<(), MethodCallFailed> {
         || dotted_name.contains('\\')
         || dotted_name.contains("..");
     if reject {
-        return Err(cratonvm_types::error::RuntimeError::ClassNotFoundException {
-            class_name: dotted_name.to_string(),
-        }
-        .into());
+        return Err(
+            cratonvm_types::error::RuntimeError::ClassNotFoundException {
+                class_name: dotted_name.to_string(),
+            }
+            .into(),
+        );
     }
     Ok(())
 }
@@ -8686,10 +8688,7 @@ fn directly_and_indirectly_present(
     let mut indirect: Vec<cratonvm_native_api::AnnotationData> = Vec::new();
     let mut container_pos: Option<usize> = None;
     if let Some(cdesc) = container_desc {
-        if let Some(cpos) = annotations
-            .iter()
-            .position(|a| a.type_descriptor == cdesc)
-        {
+        if let Some(cpos) = annotations.iter().position(|a| a.type_descriptor == cdesc) {
             container_pos = Some(cpos);
             if let Some((_, AEV::Array(elems))) = annotations[cpos]
                 .elements
@@ -8728,10 +8727,7 @@ fn directly_and_indirectly_present(
 
 /// If the annotation type `ann_class_id` is `@Repeatable`, return the type
 /// descriptor of its container annotation (read from `@Repeatable`'s `value()`).
-fn repeatable_container_desc(
-    ctx: &mut dyn NativeContext,
-    ann_class_id: ClassId,
-) -> Option<String> {
+fn repeatable_container_desc(ctx: &mut dyn NativeContext, ann_class_id: ClassId) -> Option<String> {
     use cratonvm_native_api::AnnotationElementValue as AEV;
     let ann_type_annotations = ctx.class_annotations(ann_class_id);
     let repeatable = ann_type_annotations
@@ -8786,11 +8782,8 @@ fn class_annotations_by_type_impl(
     let container_desc = repeatable_container_desc(ctx, ann_class_id);
 
     let this_annotations = ctx.class_annotations(class_id);
-    let mut matching = directly_and_indirectly_present(
-        &this_annotations,
-        &target_desc,
-        container_desc.as_deref(),
-    );
+    let mut matching =
+        directly_and_indirectly_present(&this_annotations, &target_desc, container_desc.as_deref());
 
     // `getAnnotationsByType` follows the @Inherited chain when (and only when)
     // nothing is directly/indirectly present on this class.
@@ -8882,11 +8875,8 @@ pub(crate) fn native_method_get_annotations_by_type(
     // have no `@Inherited` semantics, so there is no superclass walk. The prior
     // code only unwrapped the container when no direct match existed, dropping
     // the contained annotations whenever a direct one was also present.
-    let matching = directly_and_indirectly_present(
-        &annotations,
-        &target_desc,
-        container_desc.as_deref(),
-    );
+    let matching =
+        directly_and_indirectly_present(&annotations, &target_desc, container_desc.as_deref());
 
     // GC-safe: `create_annotation_proxy` allocates (see `build_mirror_array`).
     let arr = build_mirror_array(ctx, matching.len(), |ctx, i| {
@@ -14510,8 +14500,7 @@ mod tests {
         // Rejection must surface as ClassNotFoundException carrying the
         // (dotted) name — indistinguishable from an ordinary miss.
         match validate_for_name_dotted("java/lang/String") {
-            Err(MethodCallFailed::ExceptionThrown(_))
-            | Err(MethodCallFailed::InternalError(_)) => {
+            Err(MethodCallFailed::ExceptionThrown(_)) | Err(MethodCallFailed::InternalError(_)) => {
                 // The conversion of RuntimeError::ClassNotFoundException into
                 // MethodCallFailed is what the production path relies on; any
                 // error variant proves the name was rejected rather than

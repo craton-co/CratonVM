@@ -6343,7 +6343,12 @@ fn re10_read_headers(ctx: &mut dyn NativeContext, map: ObjectRef) -> Vec<(String
     loop {
         let it = ctx.read_native_pin(it_pin, it0);
         let has = matches!(
-            ctx.invoke("java/util/Iterator", "hasNext", "()Z", &[Value::Object(Some(it))]),
+            ctx.invoke(
+                "java/util/Iterator",
+                "hasNext",
+                "()Z",
+                &[Value::Object(Some(it))]
+            ),
             Ok(Some(Value::Int(1)))
         );
         if !has {
@@ -7461,8 +7466,10 @@ mod tests {
         std::thread::spawn(move || {
             let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
             // Header + first partial chunk, then the rest in a second write.
-            c.write_all(b"POST /x HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc")
-                .unwrap();
+            c.write_all(
+                b"POST /x HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc",
+            )
+            .unwrap();
             c.flush().unwrap();
             std::thread::sleep(Duration::from_millis(50));
             c.write_all(b"\r\n4\r\ndefg\r\n0\r\n\r\n").unwrap();

@@ -1889,9 +1889,9 @@ mod tests {
     /// a category-2 Dynamic (`J`).
     fn dynamic_cp() -> ConstantPool {
         ConstantPool::new(vec![
-            ConstantPoolEntry::Tombstone,            // 0
-            ConstantPoolEntry::Utf8("d".into()),     // 1
-            ConstantPoolEntry::Utf8("I".into()),     // 2 (category-1 descriptor)
+            ConstantPoolEntry::Tombstone,        // 0
+            ConstantPoolEntry::Utf8("d".into()), // 1
+            ConstantPoolEntry::Utf8("I".into()), // 2 (category-1 descriptor)
             ConstantPoolEntry::NameAndType {
                 name_index: 1,
                 descriptor_index: 2,
@@ -1900,7 +1900,7 @@ mod tests {
                 bootstrap_method_attr_index: 0,
                 name_and_type_index: 3,
             }, // 4 (category-1 Dynamic)
-            ConstantPoolEntry::Utf8("J".into()),     // 5 (category-2 descriptor)
+            ConstantPoolEntry::Utf8("J".into()), // 5 (category-2 descriptor)
             ConstantPoolEntry::NameAndType {
                 name_index: 1,
                 descriptor_index: 5,

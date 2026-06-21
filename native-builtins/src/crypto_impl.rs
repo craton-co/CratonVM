@@ -1154,12 +1154,8 @@ fn chacha20_keystream_fill(key: &[u8; 32], nonce: &[u8; 12], buf: &mut [u8]) {
     state0[2] = 0x7962_2d32;
     state0[3] = 0x6b20_6574;
     for i in 0..8 {
-        state0[4 + i] = u32::from_le_bytes([
-            key[4 * i],
-            key[4 * i + 1],
-            key[4 * i + 2],
-            key[4 * i + 3],
-        ]);
+        state0[4 + i] =
+            u32::from_le_bytes([key[4 * i], key[4 * i + 1], key[4 * i + 2], key[4 * i + 3]]);
     }
     // state[12] is the block counter; state[13..16] are the 96-bit nonce.
     for i in 0..3 {

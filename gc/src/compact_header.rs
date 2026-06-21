@@ -388,7 +388,9 @@ impl CompactHeader {
             // the overflow tag plus its token inline. Never truncates.
             let token = forwarding_overflow().intern(addr);
             debug_assert!(token <= Self::FORWARD_MAX_TOKEN);
-            self.write_forward_field(Self::FORWARD_OVERFLOW_TAG | (token & Self::FORWARD_PAYLOAD_MASK));
+            self.write_forward_field(
+                Self::FORWARD_OVERFLOW_TAG | (token & Self::FORWARD_PAYLOAD_MASK),
+            );
         }
     }
 
@@ -1307,14 +1309,20 @@ mod tests {
         h.set_forwarding_ptr(max_inline);
         assert_eq!(h.forwarding_ptr(), max_inline);
         // Fast path: the overflow tag is clear -> encoded inline, not in the table.
-        assert_eq!(h.read_forward_field() & CompactHeader::FORWARD_OVERFLOW_TAG, 0);
+        assert_eq!(
+            h.read_forward_field() & CompactHeader::FORWARD_OVERFLOW_TAG,
+            0
+        );
 
         // One object slot (8 bytes) higher cannot be encoded inline.
         let just_over = max_inline + 8;
         let mut h2 = CompactHeader::new_object(9, 1);
         h2.set_forwarding_ptr(just_over);
         assert_eq!(h2.forwarding_ptr(), just_over);
-        assert_ne!(h2.read_forward_field() & CompactHeader::FORWARD_OVERFLOW_TAG, 0);
+        assert_ne!(
+            h2.read_forward_field() & CompactHeader::FORWARD_OVERFLOW_TAG,
+            0
+        );
     }
 
     /// Sweep of representative addresses straddling the inline/overflow split,
@@ -1326,17 +1334,21 @@ mod tests {
             8,
             0x1000,
             0x0FFF_FFF8,
-            CompactHeader::FORWARD_INLINE_MAX_ADDR,        // last inline
-            CompactHeader::FORWARD_INLINE_MAX_ADDR + 8,    // first overflow
-            12usize * 1024 * 1024 * 1024,                  // 12 GB
-            0xFF_FFFF_FFF8,                                // ~1 TB, aligned
+            CompactHeader::FORWARD_INLINE_MAX_ADDR, // last inline
+            CompactHeader::FORWARD_INLINE_MAX_ADDR + 8, // first overflow
+            12usize * 1024 * 1024 * 1024,           // 12 GB
+            0xFF_FFFF_FFF8,                         // ~1 TB, aligned
         ];
         for &addr in &addrs {
             let mut h = CompactHeader::new_object(0x5151, 4);
             h.set_forwarding_ptr(addr);
             assert!(h.is_forwarded(), "addr={addr:#x}");
             assert_eq!(h.forwarding_ptr(), addr, "addr={addr:#x}");
-            assert_eq!(h.narrow_klass(), 0x5151, "klass clobbered at addr={addr:#x}");
+            assert_eq!(
+                h.narrow_klass(),
+                0x5151,
+                "klass clobbered at addr={addr:#x}"
+            );
         }
     }
 
@@ -1350,7 +1362,9 @@ mod tests {
     /// for documentation/ordering; correctness does not depend on it.
     #[test]
     fn forwarding_overflow_table_clears() {
-        let _guard = OVERFLOW_TABLE_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = OVERFLOW_TABLE_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
 
         let addr = 20usize * 1024 * 1024 * 1024; // 20 GB -> overflow path
         let mut h = CompactHeader::new_object(1, 0);
