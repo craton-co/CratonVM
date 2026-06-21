@@ -747,6 +747,26 @@ VM's real file layer).
 > `ntdll!NtTerminateProcess` (catches exit/abort/terminate from any thread → calling stack).
 > This silent exit + the silent post-Hibernate logging are the remaining full-boot walls (Gap 9's
 > throughput + invisible-failure core). The HTTP layer is no longer a blocker.
+>
+> **REFINED (2026-06-21, memory monitor + parked-state cdb with ALL gates) — it is NOT throughput at
+> the end; main PARKS, then exits.** A 15 s WS/CPU monitor shows the boot reaches a PARKED state at
+> ~4 min (WS flat ~1083 MB, CPU flat ~108–115 s — i.e. IDLE, not computing) and stays idle ~5 min,
+> then self-exits (~570 s; the bare run reported code 127). cdb of the PARKED process (with
+> `CRATONVM_REAL_VERTX=1` + `CRATONVM_REAL_NET_SOCKETS=1`) shows only 5 threads — `main` (launcher
+> join, NtWaitForSingleObject), `main-vm` (parked in `LockSupport.park` ← `ParkState::park_interruptible`
+> ← `native_lock_support_park`, i.e. the AQS condition inside `ApplicationLifecycleManager.waitForExit`),
+> `Thread-1` (Cleaner `ReferenceQueue.remove`), `Thread-2` (Timer) — and **ZERO `vert.x-eventloop`/Netty
+> threads**. So **`application.start()` RETURNS (main reaches `waitForExit`) WITHOUT ever running the
+> Vert.x HTTP server startup** — exactly the original "main parks prematurely in waitForExit" symptom.
+> The Vert.x serving chain fixed above is correct (isolated repro serves) but is NEVER REACHED by the
+> full boot. **So the true Gap-9 core blocker is UPSTREAM of HTTP: the Quarkus startup/recorder-deploy
+> chain (`ApplicationImpl.<clinit>` deploy steps → `doStart` STARTUP_TASKS) completes/returns without
+> running the HTTP-server (`VertxHttpRecorder`/`VertxCoreRecorder`) deploy+startup step** (no Vert.x
+> instance is created → no event loops → no bind), yet `start()` reports success and main parks.
+> NEXT (deep, multi-session): trace the deploy chain to find where the HTTP-server startup step is and
+> why it doesn't run/take effect (a step is skipped, a recorder returns a null/no-op RuntimeValue, or
+> the chain is truncated after RESTEasy-deploy) — plus the silent post-park exit (~570 s) and the
+> logging-flush visibility. This is squarely the Quarkus recorder-framework work (cf. Gaps 5–7).
 
 ### Quarkus ArC (`CRATONVM_REAL_ARC`) — REACHED and running
 Real ArC bytecode RUNS during the boot — `Arc.initialize` → container →
