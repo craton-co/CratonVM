@@ -580,8 +580,23 @@ fn zerocopy_enabled() -> bool {
     *FLAG.get_or_init(|| std::env::var_os("CRATONVM_GPU_NO_ZEROCOPY").is_none())
 }
 
+/// Returns `true` only when `obj`'s header describes a primitive array whose
+/// element type is exactly `expected`. This is the gate the zero-copy
+/// direct-transfer path must clear before reinterpreting the heap arena as a
+/// `&[$ty]`: `from_raw_parts(src as *const $ty, len)` reads
+/// `len * size_of::<$ty>()` bytes, so a mismatched element width (e.g. an
+/// `int[]` viewed as `long[]`) — or a non-array object whose `array_length`
+/// field aliases unrelated bytes — would read or write off the end of the
+/// real payload, corrupting the heap. The staged fallback validates kind +
+/// element type inside `host_view_*` / `write_back_*`; the zero-copy branch
+/// skips those helpers, so it must perform the same check itself.
+fn zerocopy_shape_ok(obj: ObjectRef, heap: &VmHeap, expected: ArrayElementType) -> bool {
+    let header = heap.get_header(obj);
+    header.kind == ObjectKind::Array && header.element_type == expected
+}
+
 macro_rules! direct_xfer {
-    ($up:ident, $down:ident, $ty:ty, $host_view:path, $write_back:path, $what:literal) => {
+    ($up:ident, $down:ident, $ty:ty, $elem:expr, $host_view:path, $write_back:path, $what:literal) => {
         #[doc = concat!("Upload a Java `", $what, "` to a fresh device buffer, reading the heap")]
         #[doc = "arena directly when the array is contiguous (else staged via a host `Vec`)."]
         pub fn $up(
@@ -591,12 +606,19 @@ macro_rules! direct_xfer {
             token: &SafepointToken<'_>,
         ) -> DeviceResult<DeviceBuffer<$ty>> {
             let len = heap.get_header(obj).array_length as usize;
-            if zerocopy_enabled() && len != 0 {
+            // Only take the zero-copy fast path once we have proven the object
+            // really is an array of the expected element type — otherwise the
+            // raw `from_raw_parts` below would read past the payload (OOB).
+            // A failed check (wrong kind / element type) falls through to the
+            // staged path, whose `host_view_*` asserts produce a clean panic.
+            if zerocopy_enabled() && len != 0 && zerocopy_shape_ok(obj, heap, $elem) {
                 if let Some(src) = heap.array_data_ptr(obj) {
-                    // SAFETY: `obj` is a live contiguous array of `len` elements
-                    // at `src` (native-aligned primitive storage); the held
-                    // `token` pins the GC, so the arena cannot move and no Java
-                    // thread observes it during this read-only upload.
+                    // SAFETY: `obj` is a live contiguous `$elem` array of `len`
+                    // elements at `src` (native-aligned primitive storage, kind
+                    // + element type verified by `zerocopy_shape_ok`, so the
+                    // payload is exactly `len * size_of::<$ty>()` bytes); the
+                    // held `token` pins the GC, so the arena cannot move and no
+                    // Java thread observes it during this read-only upload.
                     let slice = unsafe { std::slice::from_raw_parts(src as *const $ty, len) };
                     return DeviceBuffer::from_host(ctx, slice);
                 }
@@ -613,9 +635,16 @@ macro_rules! direct_xfer {
             token: &SafepointToken<'_>,
         ) -> DeviceResult<()> {
             let len = heap.get_header(obj).array_length as usize;
-            if zerocopy_enabled() && len != 0 {
+            // As in `$up`: validate kind + element type before reinterpreting
+            // the arena as `&mut [$ty]`, or a mismatched element width would
+            // write `len * size_of::<$ty>()` bytes off the end of the real
+            // payload, corrupting the heap. A failed check falls through to
+            // the staged path (`write_back_*` re-asserts the shape).
+            if zerocopy_enabled() && len != 0 && zerocopy_shape_ok(obj, heap, $elem) {
                 if let Some(dst) = heap.array_data_ptr(obj) {
-                    // SAFETY: live contiguous array of `len` elements at `dst`;
+                    // SAFETY: live contiguous `$elem` array of `len` elements at
+                    // `dst` (kind + element type verified by `zerocopy_shape_ok`,
+                    // so the payload is exactly `len * size_of::<$ty>()` bytes);
                     // GC paused (token) so this dispatch thread has exclusive
                     // access to the arena for the device→host copy.
                     let slice = unsafe { std::slice::from_raw_parts_mut(dst as *mut $ty, len) };
@@ -634,6 +663,7 @@ direct_xfer!(
     upload_obj_i32,
     download_obj_i32,
     i32,
+    ArrayElementType::Int,
     host_view_i32,
     write_back_i32,
     "int[]"
@@ -642,6 +672,7 @@ direct_xfer!(
     upload_obj_i64,
     download_obj_i64,
     i64,
+    ArrayElementType::Long,
     host_view_i64,
     write_back_i64,
     "long[]"
@@ -650,6 +681,7 @@ direct_xfer!(
     upload_obj_f32,
     download_obj_f32,
     f32,
+    ArrayElementType::Float,
     host_view_f32,
     write_back_f32,
     "float[]"
@@ -658,6 +690,7 @@ direct_xfer!(
     upload_obj_f64,
     download_obj_f64,
     f64,
+    ArrayElementType::Double,
     host_view_f64,
     write_back_f64,
     "double[]"
@@ -813,6 +846,37 @@ mod tests {
         let arr = heap.alloc_array(TEST_CID, ArrayElementType::Int, 3);
         let src = vec![1_i32, 2]; // wrong length on purpose
         write_back_i32(arr, &heap, &src, &token);
+    }
+
+    #[test]
+    fn zerocopy_shape_ok_accepts_matching_element_type() {
+        // The zero-copy direct-transfer fast path keys off this gate before
+        // reinterpreting the heap arena as a typed slice. It must accept an
+        // array only when both the kind *and* the element type line up.
+        let heap = fresh_heap();
+        let arr = heap.alloc_array(TEST_CID, ArrayElementType::Int, 4);
+        assert!(zerocopy_shape_ok(arr, &heap, ArrayElementType::Int));
+    }
+
+    #[test]
+    fn zerocopy_shape_ok_rejects_element_type_mismatch() {
+        // An `int[]` reinterpreted as `long[]` would read 8 bytes per element
+        // off a 4-byte-per-element payload → OOB read / heap corruption. The
+        // gate must reject it so the caller falls back to the staged path.
+        let heap = fresh_heap();
+        let arr = heap.alloc_array(TEST_CID, ArrayElementType::Int, 4);
+        assert!(!zerocopy_shape_ok(arr, &heap, ArrayElementType::Long));
+        assert!(!zerocopy_shape_ok(arr, &heap, ArrayElementType::Double));
+        assert!(!zerocopy_shape_ok(arr, &heap, ArrayElementType::Float));
+    }
+
+    #[test]
+    fn zerocopy_shape_ok_rejects_non_array_object() {
+        // A non-array object whose bytes happen to alias the `array_length`
+        // slot must not be treated as a typed array by the zero-copy path.
+        let heap = fresh_heap();
+        let obj = heap.alloc_object(TEST_CID, 2);
+        assert!(!zerocopy_shape_ok(obj, &heap, ArrayElementType::Int));
     }
 
     #[test]
