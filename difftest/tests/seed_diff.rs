@@ -54,14 +54,16 @@ fn runs_seed_corpus_and_writes_ledger() {
     }
 
     let ledger_path = std::env::temp_dir().join("difftest_seed_diff_ledger.json");
+    // Fan out across the interpreter/JIT axis so divergences auto-classify, and
+    // exercise the determinism pre-flight + re-confirmation.
+    let modes = vec![Mode::JitOn, Mode::NoJit];
     let config = RunnerConfig {
-        corpus: seeds_dir(),
-        modes: vec![Mode::JitOn],
-        timeout: DEFAULT_TIMEOUT,
-        jdk_home: None,
-        allow_jdk_downgrade: false,
+        modes: modes.clone(),
         ledger: ledger_path.clone(),
         update_ledger: true,
+        determinism_check: true,
+        reconfirm: true,
+        ..RunnerConfig::for_corpus(seeds_dir())
     };
 
     let expected = harness::discover_programs(&config.corpus).len();
@@ -82,20 +84,29 @@ fn runs_seed_corpus_and_writes_ledger() {
         "every discovered seed should produce a result"
     );
 
-    // Each result carries observations from both VMs and a definite verdict.
+    // Each result ran HotSpot once and every configured CratonVM mode.
     for r in &summary.results {
-        assert!(
-            r.cratonvm.exit_code.is_some() || r.cratonvm.timed_out,
-            "{} cratonvm produced no exit status",
-            r.program
-        );
         assert!(
             r.hotspot.exit_code.is_some() || r.hotspot.timed_out,
             "{} hotspot produced no exit status",
             r.program
         );
-        // A divergent result must classify to *something*.
-        if !r.verdict.agrees() {
+        assert_eq!(
+            r.modes.len(),
+            modes.len(),
+            "{} should have one outcome per mode",
+            r.program
+        );
+        for m in &r.modes {
+            assert!(
+                m.cratonvm.exit_code.is_some() || m.cratonvm.timed_out,
+                "{} cratonvm[{}] produced no exit status",
+                r.program,
+                m.mode.label()
+            );
+        }
+        // A divergent result must auto-classify to a precise label.
+        if r.diverged() {
             assert!(
                 r.classification().is_some(),
                 "{} diverged but did not classify",

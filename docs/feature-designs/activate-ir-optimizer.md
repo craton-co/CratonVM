@@ -1471,6 +1471,223 @@ the long deopt-resume so a `long` can be live at the div guard); then the
 **`double`/`float`** half (XMM registers + FP-slot deopt resume); and finally
 **long/double *call* args + returns** (`static_call_shape` category-2 marshalling
 — the original "category-2 call args" item, now unblocked at the value level).
+## Increment 26 (Gap B — `invokevirtual`/`invokeinterface` → `Op::Call`, gated) landed
+
+Status: **landed**, **default-OFF behind `CRATONVM_JIT_IR_CALL_VIRTUAL`**. Extends
+the `Op::Call` lever from static (inc 21–23) + special (inc 24) to **dynamic
+dispatch** — `invokevirtual` (0xb6) and `invokeinterface` (0xb9). It lands inert
++ validated (unit + differential); flipping it on is a follow-up (like inc 21→23),
+gated on the broader app-gauntlet soak since it puts a *polymorphic* dispatch path
+live by default.
+
+**Why it is sound without an inline cache.** The crucial design point: the
+generic `jit_invoke_dispatch` helper (`vm/src/jit/helpers.rs`) — already baked
+into every `Op::Call` and already used by the static/special path — **already
+handles `invoke_kind` 0 (virtual) and 2 (interface)**. For those kinds it routes
+through `bail_to_interpreter` → `virtual_dispatch_class` (the receiver's *runtime*
+class) → `invoke_or_native`, i.e. a full vtable/itable resolution on the receiver.
+So the IR path emits **no inline cache** (MIC/PIC) in the generated code — it bakes
+the static call-site `class/name/descriptor` into the `JitInvokeInfo` and lets the
+helper resolve the real target each call. This **structurally sidesteps the bug-24
+inline-cache-slot UAF** (an inline-cache concern that does not exist on this path)
+at the cost of a per-call dispatch (an inline-cache fast path is a later perf
+refinement, not a correctness prerequisite). The deltas vs. inc 24 are exactly:
+`invoke_kind = 0`/`2`, and the receiver marshalled as arg0 (the single-pass
+backend does the identical thing, so dispatch args are byte-identical).
+
+**GC-safety** is unchanged from inc 22/24: the IR lowerer spills every value to a
+frame slot (no oop in a register across a call), the GC is non-moving while a JIT
+frame is active, and the conservative IR-frame scan roots the receiver + reference
+args live across the call — so no oop map is needed.
+
+**What landed**
+- **`jit/src/ir.rs`** — the `invokevirtual` (0xb6) arm joins the `invokestatic`
+  (0xb8) `Op::Call` arm (same body, both 3-byte); a new `invokeinterface` (0xb9)
+  arm emits the same `Op::Call` but advances **`pc += 5`** (the 0xb9 encoding is
+  opcode, cp_hi, cp_lo, count, 0). **Both length walkers** (`find_branch_targets`,
+  `find_loop_headers`) gained `0xb6` in the 3-byte arm and a new 5-byte `0xb9` arm
+  — previously 0xb6/0xb9 fell into `_ => pc += 1`, harmless only while the builder
+  bailed on them; now that they lower, a mis-walked length would mis-locate a
+  branch target (the §5 "both length walkers must agree" gotcha).
+- **`jit/src/lib.rs`** — a new `try_compile` parameter `ir_emit_virtual_calls`.
+  The Gap-B gate now admits `invokevirtual`/`invokeinterface` (under the new flag)
+  alongside static/special; for them it sets `num_args = static_call_shape(desc) +
+  1` (the receiver) and `invoke_kind = 0`/`2`. `static_call_shape` still rejects
+  category-2 args/returns, so only int/reference receivers+args+returns are
+  admitted.
+- **`vm/src/runtime/interpreter.rs`** — the 3 `try_compile` sites pass
+  `ir_emit_virtual_calls` from `CRATONVM_JIT_IR_CALL_VIRTUAL` (default-OFF).
+
+**Tests**
+- `jit/tests/ir_vs_singlepass.rs::ir_vs_singlepass_invokevirtual_instance_call` —
+  **executes** the IR-emitted virtual call (receiver arg0, `num_jit_args = 2`,
+  `needs_context`); IR == host across sign/zero edges.
+- `…::ir_vs_singlepass_invokeinterface_instance_call` — same, for the **5-byte**
+  `invokeinterface` encoding (the decisive extra coverage: a wrong `pc += 5` would
+  mis-locate the trailing `ireturn`).
+- `jit/src/lib.rs::ir_virtual_call_wiring_routes_through_ir_only_with_flag` —
+  crosses the flags to prove `invokevirtual` routes through the IR pipeline
+  (`IR_LOWER_COMPILES == 1`) **iff** `ir_emit_virtual_calls` is on (non-vacuous:
+  single-pass also dispatches invokevirtual).
+- jit lib **819/819**, differential harness **28/28**, `cratonvm-vm` builds clean.
+
+**To soak / flip on** (the remaining production step, like inc 21→23): the IR
+re-compile path fires only in a release build with the tiered/background C2
+recompiler active (the first-call path is single-pass), so the live soak is a
+**release** run of `CRATONVM_JIT_IR_CALL_VIRTUAL=1` across the
+kafka/spring/tomcat/hibernate gauntlet + bt10/14/16/18 checksums (must stay
+`135854 / 3222190 / 14985902 / 68332206`) with a polymorphic probe `==` HotSpot
+gate-ON and gate-OFF (and under `CRATONVM_DBG_GC_STRESS=1` for the receiver-live-
+across-dispatch GC path), then default the flag on. The widened reach (every
+virtual/interface call site, polymorphic receiver oop live across the call) makes
+the gauntlet soak the gating step before the flip.
+
+**Next refinements**: category-2 (long/float/double) args + return; an optional
+monomorphic/polymorphic inline-cache fast path for the IR virtual `Op::Call` (a
+perf, not correctness, item).
+
+## Increment 26 (long sub-slice — wide `lload`/`lstore` + `ldc2_w`) landed
+
+Status: **landed** on `dev`, under the existing **`CRATONVM_JIT_IR_LONG`**
+(default-OFF). Extends inc 25's long path with the two opcodes that block most
+real long methods: the **wide** `lload` (0x16) / `lstore` (0x37) forms (a long
+param/local at JVM slot ≥ 4 — inc 25 only had the short `lload_0..3`/
+`lstore_0..3`) and **`ldc2_w`** (0x14, a long constant from the constant pool).
+Both are long-only, so inert for the int path.
+
+**What landed**
+- **`jit/src/ir.rs`** — builder arms for `0x16`/`0x37` (read the 1-byte index,
+  push/pop the long NodeId at `locals[idx]`; the high-half slot `idx+1` is never
+  read by valid bytecode) and `0x14` (look up the resolved value in a new
+  `ldc2w_info: HashMap<pc, i64>` and emit `Op::Const(Long)` via the existing
+  `lconst` helper; an absent pc bails to single-pass). `set_ldc2w_info` is the
+  setter. **Both length walkers** (`find_branch_targets`, `find_loop_headers`)
+  gained `0x16`/`0x37` (2-byte) and `0x14` (3-byte) — without this a long method
+  with these opcodes would mis-parse its branch targets / loop headers.
+- **`jit/src/lib.rs`** — when `ir_emit_long` is on, build `ldc2w_info` from
+  `scan.ldc2w_ops` + the existing `cp_ldc2w_resolver` and call `set_ldc2w_info`.
+  A **double** `ldc2_w` cannot reach here: any double constant is consumed by a
+  double-typed opcode, which trips `method_uses_double` and bails the method —
+  so every resolved value is a `long` bit pattern (handled as a full 64-bit
+  `Op::Const`).
+
+**Tests**
+- `jit/tests/ir_vs_singlepass.rs::ir_vs_singlepass_long_wide_load_store` —
+  `long f(long a, long b, long c){ long d=a+b; long e=c-d; return d*e; }` exercises
+  wide `lload 4`/`lload 6`/`lstore 6`/`lstore 8` (locals at slots 4/6/8); IR ==
+  single-pass == host over the full i64 (incl. a 64-bit-overflow case).
+- `…_long_ldc2w_constant` — `long f(long a){ return a*C1 + C2; }` with a resolver
+  supplying `C1`/`C2` (one a large constant with bit 63 set); IR == single-pass ==
+  host (proves the long const is loaded at full 64-bit width, no truncation).
+- jit lib **819/819**, differential **32/32**, `cratonvm-vm` builds clean.
+
+**Live soak** (`CRATONVM_JIT_IR_LONG` toggled): `scratch/irlong/IrLong2.java`
+(`hash(long,long,long)` — 3 long params so `c` uses wide `lload 4`, a long local
+`h` at slot 6 using wide `lstore`/`lload`, and `ldc2_w` constants `1125899906842597L`
+/ `31L`) == HotSpot (`4898113815606063616`) gate-ON and gate-OFF, and
+`CRATONVM_DBG_IR_LONG` confirms it takes the IR path. No regression: the inc-25
+`IrLong` probe still == HotSpot with the gate on, and bt10/14/16/18 == HotSpot
+(`135854 / 3222190 / 14985902 / 68332206`).
+
+**Remaining long sub-slices** (unchanged order): `lcmp` + long-fed branches;
+`lshl`/`lshr`/`lushr`/`land`/`lor`/`lxor`; `ldiv`/`lrem` (long deopt-resume);
+then `double`/`float` (XMM); then long/double call args + returns.
+
+## Increment 27 (long sub-slice — shifts/bitwise + `lcmp`/branches) landed
+
+Status: **landed** on `dev`, under **`CRATONVM_JIT_IR_LONG`** (default-OFF). Adds
+the long compare/shift/bitwise opcodes, so long methods with comparisons,
+branches, and loops take the IR path. (Numbered 27 on the long track; the
+concurrent virtual-dispatch work independently also used "Increment 26" for
+`invokevirtual`/`invokeinterface` — a harmless parallel-authoring artifact.)
+
+**What landed**
+- **`jit/src/ir.rs`** — builder arms for `lshl`(0x79)/`lshr`(0x7b)/`lushr`(0x7d)
+  → `Op::Shl`/`Shr`/`UShr` typed `Long` (the lowerer is already width-aware: the
+  x86 64-bit shift masks the count to 6 bits, exactly `lshl`'s `count & 0x3f`),
+  `land`(0x7f)/`lor`(0x81)/`lxor`(0x83) → `Op::And`/`Or`/`Xor` typed `Long` (those
+  are already 64-bit), and `lcmp`(0x94) → a **new `Op::LCmp`** (3-way signed
+  compare of two longs → int {-1,0,1}). All are 1-byte opcodes (the length
+  walkers' default arm sizes them). `Op::LCmp` feeds the existing `if<cond>`
+  arm unchanged (`lcmp; iflt` ⇒ `a < b`).
+- **`jit/src/ir_lower.rs`** — `Op::LCmp` lowers to a 64-bit `CMP` + signed
+  `SETG`/`SETL` + `(a>b) − (a<b)`, sign-extended to 64 bits so a 32- or 64-bit
+  consumer both read the {-1,0,1} correctly.
+- **`jit/src/ir.rs` (phi typing fix)** — long/double merge & loop-carried
+  `Op::Phi` nodes are now typed from their inputs (`phi_data_type`) instead of
+  the historical hardcoded `Int`. **This closes a latent hole the inc-26
+  adversarial review found**: codegen was already correct (phi copies are
+  unconditionally 64-bit; consumers use their own `ty`), but `frame_value_for`
+  reads the phi's own type and would truncate a long to 32 bits on a deopt-frame
+  resume. Masked today (long-eligible methods have no deopt point and
+  `ir_deopt_entry` is unwired), but inc-27's long branches make long phis common,
+  so it is fixed now. Scoped to category-2 to avoid perturbing `Ref`/`Float` phis;
+  codegen-neutral.
+
+No gate change: these opcodes already trip `method_uses_category2`, so they were
+already admitted by `ir_emit_long` (double/float- and int-div-free); they just
+needed builder support. Unhandled long opcodes (`ldiv`/`lrem`, wide `iload`)
+still bail to single-pass.
+
+**Tests** — `jit/tests/ir_vs_singlepass.rs` (IR == single-pass == host, full i64):
+`ir_vs_singlepass_long_shifts` (lshl/lshr/lushr, count masked to 6 bits, incl.
+`i64::MIN`), `…_long_bitwise` (land/lor/lxor), `…_long_lcmp_branch` (lcmp + `ifge`
+long-min), and `…_long_loop_phi_lcmp` (a long accumulator loop with a long-fed
+condition — `lcmp` + a backward long branch + a **long loop phi** + wide
+`lload`/`lstore`, all together). jit lib **820/820**, differential **38/38**,
+`cratonvm-vm` builds clean.
+
+**Live soak** (`CRATONVM_JIT_IR_LONG` toggled): `scratch/irlong/IrLong3.java`
+(`mix` — shifts + bitwise + `ldc2_w` + `lcmp` min; `acc` — a `lcmp`-conditioned
+long accumulator loop) == HotSpot (`540002100000`) gate-ON and gate-OFF, both
+methods take the IR path (`CRATONVM_DBG_IR_LONG`, 2 emit lines). No regression:
+the inc-25 `IrLong` and inc-26 `IrLong2` probes still == HotSpot with the gate
+on, and bt10/14/16/18 == HotSpot.
+
+**Remaining long sub-slices**: `ldiv`/`lrem` (need the long deopt-resume — and
+the `i64::MIN`-return/sentinel collision, both spun off as separate tasks); then
+`double`/`float` (XMM); then long/double *call* args + returns.
+
+## Increment 28 (long *call args* — the original category-2-call-args goal) landed
+
+Status: **landed** on `dev`, under **`CRATONVM_JIT_IR_LONG`** (default-OFF).
+Delivers part of the roadmap's original "category-2 call args" item: an `Op::Call`
+may now take a **`long` argument**. This is the payoff of the inc-25..27 long
+value work — a long is now a first-class IR value, so passing one to a call is a
+marshalling question, and the answer is "one i64 slot."
+
+**What landed** (`jit/src/lib.rs`): `static_call_shape` accepts a `J` (long)
+parameter, counting it as **one** arg — the compact JIT ABI passes each parameter
+in one i64 register (`count_param_slots` already counts `J` as 1), the IR builder
+treats a long as one operand-stack node, and the `Op::Call` marshaller stores
+each arg as one i64. So **no lowerer change** was needed — a long arg is
+marshalled exactly like an int/ref. `double`/`float` args (XMM) stay rejected,
+and a `long`/`double`/`float` **return** stays rejected (a `Long.MIN_VALUE` result
+would collide with the `i64::MIN` deopt/exception sentinel — the spun-off
+out-of-band-signal task; long *returns* wait on it).
+
+**Why it's inert for the default path**: producing a long to pass requires a
+category-2 opcode (`lload`/`lconst`/`ldc2_w`/…), which trips
+`method_uses_category2`, so a long-arg-call method is only ever admitted under
+`ir_emit_long`. The `J`-arg acceptance is unreachable on the default int/ref path.
+
+**Tests** — `jit/tests/ir_vs_singlepass.rs::ir_vs_singlepass_invokestatic_long_arg`:
+`int f(long a, int n){ return g(a, n); }` executes through a stub `invoke_dispatch`
+that reads **both halves** of the long arg0 (a truncated marshalling would
+diverge) plus the int arg1. IR == host across sign/width edge cases (incl.
+`i64::MIN`, a constant with high bits set). jit lib **820/820**, differential
+**39/39**, `cratonvm-vm` builds clean.
+
+**Live soak** (`CRATONVM_JIT_IR_LONG` toggled): `scratch/irlong/IrLong4.java`
+(`f(long base)` passes `base + i` — a long — to `g(long,int)int` in a hot loop;
+both take the IR path) == HotSpot (`2336681890816`) gate-ON and gate-OFF, and
+`CRATONVM_DBG_IR_CALL` confirms the long-arg call lowers to `Op::Call`
+(non-vacuous). No regression: the inc-25/26/27 `IrLong`/`IrLong2`/`IrLong3`
+probes still == HotSpot with the gate on, and bt10/14/16/18 == HotSpot.
+
+**Remaining**: long/double call *returns* (gated on the `i64::MIN`-sentinel fix);
+`ldiv`/`lrem` (gated on long deopt-resume); then the `double`/`float` half (XMM
+registers + FP-slot deopt resume), which also unlocks `double` call args/returns.
 
 ## Implementation steps (ordered)
 

@@ -113,7 +113,7 @@ fn compile_opt(
 ) -> Option<CompiledMethod> {
     try_compile(
         cm, None, None, None, None, None, None, None, None, None, helpers, None, None, None, None,
-        optimize, false, false, false,
+        optimize, false, false, false, false,
     )
 }
 
@@ -165,7 +165,7 @@ fn compile_long_opt(
 ) -> Option<CompiledMethod> {
     try_compile(
         cm, None, None, None, None, None, None, None, None, None, helpers, None, None, None, None,
-        optimize, false, false, true,
+        optimize, false, false, true, false,
     )
 }
 
@@ -287,6 +287,266 @@ fn ir_vs_singlepass_long_to_int_return() {
             "l2i vs host for ({a},{b})"
         );
     }
+}
+
+#[test]
+fn ir_vs_singlepass_long_wide_load_store() {
+    // inc 26: long params/locals at JVM slots >= 4 use the WIDE `lload` (0x16) /
+    // `lstore` (0x37) forms (not the short `lload_2`/`lstore_3`).
+    // long f(long a, long b, long c) { long d = a + b; long e = c - d; return d * e; }
+    //   a@0-1 b@2-3 c@4-5 d@6-7 e@8-9
+    //   lload_0; lload_2; ladd; lstore 6; lload 4; lload 6; lsub; lstore 8;
+    //   lload 6; lload 8; lmul; lreturn
+    let code = vec![
+        0x1e, 0x20, 0x61, // d = a + b
+        0x37, 0x06, // lstore 6 (d)
+        0x16, 0x04, // lload 4 (c)
+        0x16, 0x06, // lload 6 (d)
+        0x65, // lsub  -> c - d
+        0x37, 0x08, // lstore 8 (e)
+        0x16, 0x06, // lload 6 (d)
+        0x16, 0x08, // lload 8 (e)
+        0x69, // lmul -> d * e
+        0xad, // lreturn
+    ];
+    check_long(
+        "lwide",
+        "(JJJ)J",
+        code,
+        10,
+        3,
+        &[
+            // host uses wrapping ops to match the JVM's 64-bit `long` semantics.
+            (vec![3, 4, 100], {
+                let d = 3i64.wrapping_add(4);
+                let e = 100i64.wrapping_sub(d);
+                d.wrapping_mul(e) // 7 * 93 = 651
+            }),
+            (vec![0x1_0000_0000, 1, 0x4_0000_0000], {
+                let d = 0x1_0000_0000i64.wrapping_add(1);
+                let e = 0x4_0000_0000i64.wrapping_sub(d);
+                d.wrapping_mul(e) // overflows 64-bit → wraps
+            }),
+            (vec![-2, -3, 10], {
+                let d = (-2i64).wrapping_add(-3);
+                let e = 10i64.wrapping_sub(d);
+                d.wrapping_mul(e)
+            }),
+        ],
+    );
+}
+
+/// Like [`compile_long_opt`] but also supplies an `ldc2_w` long-constant resolver
+/// (inc 26) so the IR builder can lower long constants from the constant pool.
+fn compile_long_ldc2w(
+    cm: &CachedBytecodeMethod,
+    helpers: &JitRuntimeHelpers,
+    optimize: bool,
+    ldc2w: &dyn Fn(u16) -> Option<i64>,
+) -> Option<CompiledMethod> {
+    try_compile(
+        cm,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some(ldc2w),
+        None,
+        helpers,
+        None,
+        None,
+        None,
+        None,
+        optimize,
+        false,
+        false,
+        true,
+        false, // ir_emit_virtual_calls
+    )
+}
+
+#[test]
+fn ir_vs_singlepass_long_ldc2w_constant() {
+    // inc 26: `ldc2_w` long constants. long f(long a) { return a * C1 + C2; }
+    //   lload_0; ldc2_w #1; lmul; ldc2_w #2; ladd; lreturn
+    const C1: i64 = 1_000_000_007;
+    const C2: i64 = 0x7FFF_FFFF_0000_002A; // a large 64-bit constant (not 32-bit)
+    let code = vec![
+        0x1e, // lload_0 (a)
+        0x14, 0x00, 0x01, // ldc2_w #1 (C1)
+        0x69, // lmul
+        0x14, 0x00, 0x02, // ldc2_w #2 (C2)
+        0x61, // ladd
+        0xad, // lreturn
+    ];
+    let ldc2w = |cp: u16| -> Option<i64> {
+        match cp {
+            1 => Some(C1),
+            2 => Some(C2),
+            _ => None,
+        }
+    };
+    let helpers = dummy_helpers();
+    let cm = cached("lldc", "(J)J", code, 2, 1);
+    let ir = compile_long_ldc2w(&cm, &helpers, true, &ldc2w).expect("IR long ldc2_w");
+    let sp = compile_long_ldc2w(&cm, &helpers, false, &ldc2w).expect("single-pass");
+    for a in [3i64, 0, -7, 0x1_0000_0000, i64::MAX] {
+        let r_ir = unsafe { ir.try_call(&[a]) }.unwrap();
+        let r_sp = unsafe { sp.try_call(&[a]) }.unwrap();
+        let host = a.wrapping_mul(C1).wrapping_add(C2);
+        assert_eq!(r_ir, r_sp, "ldc2_w IR vs single-pass for a={a}");
+        assert_eq!(r_ir, host, "ldc2_w vs host for a={a}");
+    }
+}
+
+#[test]
+fn ir_vs_singlepass_long_shifts() {
+    // inc 27: long shifts. long f(long a, int n){ return (a<<n) + (a>>n) + (a>>>n); }
+    //   a@0-1, n@2.  lload_0; iload_2; lshl; lload_0; iload_2; lshr; ladd;
+    //   lload_0; iload_2; lushr; ladd; lreturn
+    let code = vec![
+        0x1e, 0x1c, 0x79, // a << n
+        0x1e, 0x1c, 0x7b, 0x61, // + (a >> n)
+        0x1e, 0x1c, 0x7d, 0x61, // + (a >>> n)
+        0xad,
+    ];
+    check_long(
+        "lshifts",
+        "(JI)J",
+        code,
+        3,
+        2,
+        &[
+            // host: JVM masks the shift count to 6 bits (count & 0x3f) for long.
+            (vec![1, 1], {
+                let a = 1i64;
+                (a << (1 & 63)).wrapping_add(a >> (1 & 63)).wrapping_add((a as u64 >> (1 & 63)) as i64)
+            }),
+            (vec![-1, 4], {
+                let a = -1i64;
+                (a << 4).wrapping_add(a >> 4).wrapping_add((a as u64 >> 4) as i64)
+            }),
+            (vec![0x1234_5678_9abc_def0u64 as i64, 40], {
+                let a = 0x1234_5678_9abc_def0u64 as i64;
+                (a << (40 & 63)).wrapping_add(a >> (40 & 63)).wrapping_add((a as u64 >> (40 & 63)) as i64)
+            }),
+            (vec![i64::MIN, 1], {
+                let a = i64::MIN;
+                (a << 1).wrapping_add(a >> 1).wrapping_add((a as u64 >> 1) as i64)
+            }),
+        ],
+    );
+}
+
+#[test]
+fn ir_vs_singlepass_long_bitwise() {
+    // inc 27: long bitwise. long f(long a, long b){ return (a & b) | (a ^ b); }
+    //   lload_0; lload_2; land; lload_0; lload_2; lxor; lor; lreturn
+    let code = vec![
+        0x1e, 0x20, 0x7f, // a & b
+        0x1e, 0x20, 0x83, // a ^ b
+        0x81, // |
+        0xad,
+    ];
+    check_long(
+        "lbitwise",
+        "(JJ)J",
+        code,
+        4,
+        2,
+        &[
+            (vec![0x0f0f_0f0f_0f0f_0f0fu64 as i64, 0x00ff_00ff_00ff_00ffu64 as i64], {
+                let (a, b) = (0x0f0f_0f0f_0f0f_0f0fu64 as i64, 0x00ff_00ff_00ff_00ffu64 as i64);
+                (a & b) | (a ^ b)
+            }),
+            (vec![-1, 0], -1),
+            (vec![0, -1], -1),
+            (vec![i64::MIN, i64::MAX], {
+                let (a, b) = (i64::MIN, i64::MAX);
+                (a & b) | (a ^ b)
+            }),
+        ],
+    );
+}
+
+#[test]
+fn ir_vs_singlepass_long_lcmp_branch() {
+    // inc 27: lcmp + a long-fed branch. long min(long a, long b){ return a<b?a:b; }
+    //   lload_0; lload_2; lcmp; ifge ELSE; lload_0; lreturn; ELSE: lload_2; lreturn
+    //   pc0 lload_0; pc1 lload_2; pc2 lcmp; pc3 ifge +5(->pc8);
+    //   pc6 lload_0; pc7 lreturn; pc8 lload_2; pc9 lreturn
+    let code = vec![
+        0x1e, 0x20, 0x94, // a, b, lcmp
+        0x9c, 0x00, 0x05, // ifge +5 -> pc 8 (else: a >= b -> return b)
+        0x1e, 0xad, // then (a < b): return a
+        0x20, 0xad, // else: return b
+    ];
+    check_long(
+        "lmin",
+        "(JJ)J",
+        code,
+        4,
+        2,
+        &[
+            (vec![3, 4], 3),
+            (vec![4, 3], 3),
+            (vec![5, 5], 5),
+            (vec![-1, i64::MIN], i64::MIN),
+            (vec![i64::MAX, i64::MIN], i64::MIN),
+            (vec![0x1_0000_0000, 0xffff_ffff], 0xffff_ffff),
+        ],
+    );
+}
+
+#[test]
+fn ir_vs_singlepass_long_loop_phi_lcmp() {
+    // inc 27: a long loop-carried accumulator with a long-fed loop condition —
+    // exercises Op::LCmp + a backward long branch + a long loop phi (now typed
+    // Long, not Int) + wide lload/lstore, all together. No int counter (avoids
+    // the not-yet-handled wide iload), no idiv/call (stays safepoint-free).
+    //   long f(long a, long limit){ long s=0; while (s < limit) s = s + a; return s; }
+    //   a@0-1, limit@2-3, s@4-5
+    let code = vec![
+        0x09, // lconst_0
+        0x37, 0x04, // lstore 4 (s=0)
+        // LOOP (pc 3):
+        0x16, 0x04, // lload 4 (s)
+        0x20, // lload_2 (limit)
+        0x94, // lcmp
+        0x9c, 0x00, 0x0c, // ifge +12 -> END (pc 19) if s >= limit
+        0x16, 0x04, // lload 4 (s)
+        0x1e, // lload_0 (a)
+        0x61, // ladd
+        0x37, 0x04, // lstore 4 (s = s + a)
+        0xa7, 0xff, 0xf3, // goto -13 -> LOOP (pc 3)
+        // END (pc 19):
+        0x16, 0x04, // lload 4 (s)
+        0xad, // lreturn
+    ];
+    check_long(
+        "lloop",
+        "(JJ)J",
+        code,
+        6,
+        2,
+        &[
+            (vec![3, 10], {
+                let (a, limit) = (3i64, 10i64);
+                let mut s = 0i64;
+                while s < limit {
+                    s = s.wrapping_add(a);
+                }
+                s
+            }),
+            (vec![5, 5], 5),
+            (vec![1, 64], 64),
+            (vec![7, 50], 56),
+            (vec![100, 1], 100),
+        ],
+    );
 }
 
 #[test]
@@ -643,6 +903,7 @@ fn compile_opt_fields(
         None,
         None,
         optimize,
+        false,
         false,
         false,
         false,
@@ -1103,7 +1364,8 @@ fn compile_with_dispatch(
         true, // optimize (C2 / IR pipeline)
         true, // ir_emit_calls (Gap B, invokestatic)
         true, // ir_emit_special_calls (inc 24, invokespecial — inert without 0xb7)
-        false, // ir_emit_long (inc 25 — call tests don't use long)
+        true, // ir_emit_long (inc 28 — long call args; inert for non-long callers)
+        true, // ir_emit_virtual_calls (inc 26, invokevirtual/interface)
     )
 }
 
@@ -1280,6 +1542,67 @@ fn ir_vs_singlepass_invokestatic_reference_arg() {
 }
 
 #[test]
+fn ir_vs_singlepass_invokestatic_long_arg() {
+    // inc 28: a LONG argument is marshalled as ONE i64 slot (full 64-bit). The
+    // method passes a long + an int to a static call returning int; the stub
+    // reads BOTH halves of the long arg0 (so a truncated marshalling would
+    // diverge) plus the int arg1.
+    //   static int f(long a, int n) { return g(a, n); }   // g:(JI)I
+    //   lload_0; iload_2; invokestatic #2; ireturn
+    unsafe extern "C" fn longarg_dispatch(
+        _vm: i64,
+        _info: i64,
+        args_ptr: i64,
+        num_args: i64,
+    ) -> i64 {
+        assert_eq!(num_args, 2, "longarg_dispatch expects (long, int)");
+        let p = args_ptr as *const i64;
+        let a = *p; // arg0 = the FULL 64-bit long (one slot)
+        let n = *p.add(1) as i32 as i64; // arg1 = int
+        let hi = (a >> 32) as i32 as i64; // high 32 bits — 0 if truncated
+        let lo = a as i32 as i64; // low 32 bits
+        hi.wrapping_add(lo).wrapping_add(n) as i32 as i64
+    }
+    fn host(a: i64, n: i64) -> i32 {
+        let hi = (a >> 32) as i32;
+        let lo = a as i32;
+        hi.wrapping_add(lo).wrapping_add(n as i32)
+    }
+    let mut helpers = dummy_helpers();
+    helpers.invoke_dispatch = longarg_dispatch as *const () as usize;
+    let code = vec![0x1e, 0x1c, 0xb8, 0x00, 0x02, 0xac];
+    let cm = cached("f", "(JI)I", code, 3, 2);
+    let resolver = |cp: u16| -> Option<(String, String, String)> {
+        if cp == 2 {
+            Some(("pkg/Helper".into(), "g".into(), "(JI)I".into()))
+        } else {
+            None
+        }
+    };
+    let ir = compile_with_dispatch(&cm, &helpers, &resolver)
+        .expect("IR compile of long-arg invokestatic method");
+    assert!(ir.needs_context());
+    let dummy_vm = [0u8; 64];
+    for (a, n) in [
+        (3i64, 7i64),
+        (0x1234_5678_9abc_def0u64 as i64, 11), // high bits non-zero
+        (-1, 2),
+        (i64::MIN, 1),
+        (0, 0),
+    ] {
+        // SAFETY: finalized Op::Call body taking (vm, long a, int n); the dummy
+        // VM buffer is never dereferenced by the stub.
+        let r = unsafe { ir.try_call_with_context(dummy_vm.as_ptr() as i64, &[a, n]) }
+            .unwrap_or_else(|e| panic!("call a={a},n={n}: {e:?}"));
+        assert_eq!(
+            r as i32,
+            host(a, n),
+            "long-arg marshalling (full 64-bit) for a={a}, n={n}"
+        );
+    }
+}
+
+#[test]
 fn ir_vs_singlepass_invokespecial_instance_call() {
     // inc 24: a resolved non-`<init>` `invokespecial` (a private / `super.` /
     // otherwise non-virtual instance call) lowers to `Op::Call` with the
@@ -1331,6 +1654,105 @@ fn ir_vs_singlepass_invokespecial_instance_call() {
             r,
             xval as i64 + n,
             "invokespecial receiver marshalling for x={xval}, n={n}"
+        );
+        drop(obj);
+    }
+}
+
+#[test]
+fn ir_vs_singlepass_invokevirtual_instance_call() {
+    // inc 25: a resolved `invokevirtual` lowers to `Op::Call` with the receiver
+    // marshalled as arg0 and `invoke_kind == 0`. Identical machine-level shape
+    // to the inc-24 invokespecial test (receiver-first, `num_jit_args == 2`,
+    // `needs_context`); only the opcode (0xb6) and dispatch kind differ. The
+    // stub reads field 0 off the receiver and returns `recv.x + n`.
+    //   int f(Corpus o, int n) { return o.g(n); }   // g virtual → invokevirtual
+    //   aload_0; iload_1; invokevirtual #2; ireturn
+    unsafe extern "C" fn recv_dispatch(_vm: i64, _info: i64, args_ptr: i64, num_args: i64) -> i64 {
+        assert_eq!(num_args, 2, "recv_dispatch expects (receiver, int)");
+        let p = args_ptr as *const i64;
+        let recv = *p; // arg0 = the receiver pointer
+        let n = *p.add(1) as i32 as i64; // arg1 = int
+        let off = HEADER_SIZE + FIELD_CELL_PAYLOAD32_OFFSET; // field 0 int payload
+        let x = std::ptr::read_unaligned((recv as *const u8).add(off) as *const i32) as i64;
+        x + n
+    }
+    let mut helpers = dummy_helpers();
+    helpers.invoke_dispatch = recv_dispatch as *const () as usize;
+    let code = vec![0x2a, 0x1b, 0xb6, 0x00, 0x02, 0xac];
+    let cm = cached("f", "(Lpkg/Corpus;I)I", code, 2, 2);
+    let resolver = |cp: u16| -> Option<(String, String, String)> {
+        if cp == 2 {
+            Some(("pkg/Corpus".into(), "g".into(), "(I)I".into()))
+        } else {
+            None
+        }
+    };
+    let ir = compile_with_dispatch(&cm, &helpers, &resolver)
+        .expect("IR compile of invokevirtual instance method");
+    assert!(ir.needs_context(), "an Op::Call method must report needs_context");
+    let dummy_vm = [0u8; 64];
+    for (xval, n) in [(5i32, 7i64), (-3, 2), (0, 0), (i32::MAX, 1)] {
+        let obj = make_object(&[xval]);
+        let args = [obj.as_ptr() as i64, n];
+        // SAFETY: `obj` is a live, correctly-laid-out synthetic object; its
+        // address is the receiver (arg0), `n` is arg1; the stub only reads field 0.
+        let r = unsafe { ir.try_call_with_context(dummy_vm.as_ptr() as i64, &args) }
+            .unwrap_or_else(|e| panic!("call x={xval},n={n}: {e:?}"));
+        assert_eq!(
+            r,
+            xval as i64 + n,
+            "invokevirtual receiver marshalling for x={xval}, n={n}"
+        );
+        drop(obj);
+    }
+}
+
+#[test]
+fn ir_vs_singlepass_invokeinterface_instance_call() {
+    // inc 25: a resolved `invokeinterface` lowers to `Op::Call` with the receiver
+    // marshalled as arg0 and `invoke_kind == 2`. The decisive extra coverage vs.
+    // the invokevirtual test is the FIVE-byte instruction encoding
+    // (0xb9, cp_hi, cp_lo, count, 0): the builder and both length walkers must
+    // advance pc += 5, or the trailing `ireturn` is mis-located and the method
+    // either bails or miscompiles. The stub reads field 0 off the receiver.
+    //   int f(Iface o, int n) { return o.g(n); }   // g interface → invokeinterface
+    //   aload_0; iload_1; invokeinterface #2, 2, 0; ireturn
+    unsafe extern "C" fn recv_dispatch(_vm: i64, _info: i64, args_ptr: i64, num_args: i64) -> i64 {
+        assert_eq!(num_args, 2, "recv_dispatch expects (receiver, int)");
+        let p = args_ptr as *const i64;
+        let recv = *p;
+        let n = *p.add(1) as i32 as i64;
+        let off = HEADER_SIZE + FIELD_CELL_PAYLOAD32_OFFSET;
+        let x = std::ptr::read_unaligned((recv as *const u8).add(off) as *const i32) as i64;
+        x + n
+    }
+    let mut helpers = dummy_helpers();
+    helpers.invoke_dispatch = recv_dispatch as *const () as usize;
+    // invokeinterface is 5 bytes: opcode, cp_hi, cp_lo, count(=2: receiver+int), 0.
+    let code = vec![0x2a, 0x1b, 0xb9, 0x00, 0x02, 0x02, 0x00, 0xac];
+    let cm = cached("f", "(Lpkg/Iface;I)I", code, 2, 2);
+    let resolver = |cp: u16| -> Option<(String, String, String)> {
+        if cp == 2 {
+            Some(("pkg/Iface".into(), "g".into(), "(I)I".into()))
+        } else {
+            None
+        }
+    };
+    let ir = compile_with_dispatch(&cm, &helpers, &resolver)
+        .expect("IR compile of invokeinterface instance method");
+    assert!(ir.needs_context(), "an Op::Call method must report needs_context");
+    let dummy_vm = [0u8; 64];
+    for (xval, n) in [(5i32, 7i64), (-3, 2), (0, 0), (i32::MAX, 1)] {
+        let obj = make_object(&[xval]);
+        let args = [obj.as_ptr() as i64, n];
+        // SAFETY: as above — receiver is arg0, `n` is arg1; the stub reads field 0.
+        let r = unsafe { ir.try_call_with_context(dummy_vm.as_ptr() as i64, &args) }
+            .unwrap_or_else(|e| panic!("call x={xval},n={n}: {e:?}"));
+        assert_eq!(
+            r,
+            xval as i64 + n,
+            "invokeinterface (5-byte) receiver marshalling for x={xval}, n={n}"
         );
         drop(obj);
     }

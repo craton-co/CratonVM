@@ -432,25 +432,93 @@ pub mod helpful_npe {
         producer_bci: Option<usize>,
     }
 
-    /// Decode the whole method forward, simulating operand-stack heights and
-    /// recording, for each slot live *immediately before* `target_bci`, which
-    /// bci produced it. Returns the slot vector at `target_bci`, or `None` if
-    /// the method couldn't be cleanly simulated up to that point (unknown /
-    /// branch-dependent stack shape) — in which case the caller emits an
-    /// action-only message.
+    /// The absolute jump targets of a branch / switch at `pc`, or `None` for a
+    /// non-branch. Offsets in the bytecode are relative to the branch's own bci.
+    fn branch_targets(instr: &Instruction, pc: usize) -> Option<Vec<usize>> {
+        use Instruction::*;
+        let rel = |off: i64| -> usize { (pc as i64 + off).max(0) as usize };
+        let v = match instr {
+            Goto(o) | Ifeq(o) | Ifne(o) | Iflt(o) | Ifge(o) | Ifgt(o) | Ifle(o)
+            | IfIcmpeq(o) | IfIcmpne(o) | IfIcmplt(o) | IfIcmpge(o) | IfIcmpgt(o) | IfIcmple(o)
+            | IfAcmpeq(o) | IfAcmpne(o) | Ifnull(o) | Ifnonnull(o) | Jsr(o) => {
+                vec![rel(*o as i64)]
+            }
+            GotoW(o) | JsrW(o) => vec![rel(*o as i64)],
+            Tableswitch {
+                default, offsets, ..
+            } => {
+                let mut t = vec![rel(*default as i64)];
+                t.extend(offsets.iter().map(|o| rel(*o as i64)));
+                t
+            }
+            Lookupswitch { default, pairs } => {
+                let mut t = vec![rel(*default as i64)];
+                t.extend(pairs.iter().map(|(_, o)| rel(*o as i64)));
+                t
+            }
+            _ => return None,
+        };
+        Some(v)
+    }
+
+    /// The bci that begins the basic block containing `trap_bci`: the largest
+    /// *block leader* `<= trap_bci`, where leaders are bci 0, every branch /
+    /// switch target, and the instruction immediately after any block-ending
+    /// opcode (branch, `return`, `athrow`, `ret`).
     ///
-    /// This is intentionally a *linear* simulation (no control-flow join
-    /// modelling): JEP 358 reconstruction is syntactic and approximate, and a
-    /// straight-line walk covers the overwhelmingly common "load receiver then
-    /// invoke" shape. Any opcode whose stack effect we don't model, or any
-    /// backward branch target landing inside the prefix, makes us bail.
+    /// Simulating the operand stack from this point — rather than from method
+    /// entry — is what lets the reconstruction succeed inside a method with
+    /// preceding `try/catch` blocks: the linear walk no longer has to cross the
+    /// intervening `goto`s and exception handlers (which it can't model and
+    /// would bail on); it starts straight-line at the trapping statement's own
+    /// block, where the operand stack is empty (javac emits each statement with
+    /// an empty stack).
+    fn block_start_for(code: &[u8], trap_bci: usize) -> usize {
+        let mut leaders: Vec<usize> = vec![0];
+        let mut pc = 0usize;
+        while pc < code.len() {
+            let Ok((instr, next)) = Instruction::decode(code, pc) else {
+                break;
+            };
+            let ender = if let Some(targets) = branch_targets(&instr, pc) {
+                leaders.extend(targets);
+                true
+            } else {
+                instr.is_return() || matches!(instr, Instruction::Athrow | Instruction::Ret(_))
+            };
+            if ender {
+                leaders.push(next); // the next instruction begins a fresh block
+            }
+            if next <= pc {
+                break;
+            }
+            pc = next;
+        }
+        leaders
+            .into_iter()
+            .filter(|&l| l <= trap_bci)
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Simulate operand-stack heights forward from the start of `target_bci`'s
+    /// basic block (see [`block_start_for`]), recording for each slot live
+    /// *immediately before* `target_bci` which bci produced it. Returns the
+    /// slot vector at `target_bci`, or `None` if the block couldn't be cleanly
+    /// simulated up to that point (an unmodeled opcode in the prefix) — in which
+    /// case the caller emits an action-only message.
+    ///
+    /// Starting at the block leader (not method entry) is what makes the
+    /// reconstruction robust inside methods with `try/catch` / loops: the walk
+    /// is straight-line within one block, so it never has to model the
+    /// control-flow joins a linear from-entry walk would bail on.
     fn simulate_to(
         code: &[u8],
         target_bci: usize,
         resolver: &dyn CpResolver,
     ) -> Option<Vec<Slot>> {
         let mut stack: Vec<Slot> = Vec::new();
-        let mut pc = 0usize;
+        let mut pc = block_start_for(code, target_bci);
         let mut guard = 0u32;
         while pc < code.len() {
             if pc == target_bci {

@@ -63,13 +63,14 @@ the ~30 docs map to **one root-cause family + ~15 distinct standalone bugs**, of
     - ✅ **Unsafe off-heap DirectBuffer (bug-A + bug-A2) FULLY RESOLVED** — `PooledDataBufferTests`
       **10/10**, `LeakAwareDataBufferFactoryTests` 2/2. The bug-A2 Netty `refCnt` AIOOBE no longer
       reproduces. Archived → [`docs/internal/fixed-suite-bugs/springsuite-0619-unsafe-offheap-directbuffer.md`](../internal/fixed-suite-bugs/springsuite-0619-unsafe-offheap-directbuffer.md).
-    - 🟢 **getBeanClassName bean-filter (bug-B) MOSTLY FIXED** — primary filter fix holds, and
-      **bug-B2 (CGLIB method-injection) is now implemented 2026-06-21**: the instantiate shim
-      synthesises a concrete subclass overriding each abstract `<lookup-method>`/`@Lookup` method via
-      `bf.getBean(...)`. `LookupMethodTests` **0/7 → 6/7**, `LookupAnnotationTests` **0/10 → 6/10**
-      (no more "Target object must not be null"). Narrow residual: generic-type disambiguation
-      (`NumberStore<Double>` vs `<Float>` → `getBean(Class)` ambiguity; needs `ResolvableType`) + the
-      `@Lookup` null-bean case. [bug-B / bug-B2 doc](springsuite-0619-getbeanclassname-bean-filter.md).
+    - ✅ **getBeanClassName bean-filter (bug-B) FIXED** — primary filter fix holds, and **bug-B2
+      (CGLIB method-injection) is fully implemented 2026-06-21** (commit `ffa71253`): the instantiate
+      shim synthesises a concrete subclass overriding each abstract `<lookup-method>`/`@Lookup` method
+      via `bf.getBean(name|args)` (NullBean→null), `bf.getBeanProvider(ResolvableType.forMethodReturnType(m)).getObject()`
+      for generic by-type, with overload-aware + child-precedence override matching.
+      **`LookupMethodTests` 0/7 → 7/7** (JIT and `--nojit`), **`LookupAnnotationTests` 0/10 → 10/10**.
+      (The "flaky JIT `invokeVoid`" turned out to be a one-byte emitter typo — `IFEQ` vs `IFNULL` —
+      not a VM defect.) [bug-B / bug-B2 doc](springsuite-0619-getbeanclassname-bean-filter.md).
     - Still untriaged from the sweep: `ReactiveAdapterRegistry$MutinyRegistrar` NCDFE, XML
       "Unexpected failure during bean definition parsing", "Unnamed bean definition", spring-jdbc
       mass-TIMEOUT, scheduler `StringIndexOutOfBounds`, and `DataBufferUtilsTests` TIMEOUT
@@ -240,8 +241,8 @@ and already-consolidated ones (fam5/6) were left in place.
 | String constant corrupted → `Object` under load | VM-CORRECTNESS / GC | ✅ **RESOLVED / NOT REPRODUCED 2026-06-20** — a 45-class single-JVM spring-core batch on dev ran clean (0 `status=java.lang.Object`, all OK, rc=0); Family-A precise-maps default-on + `toArray` recursion fixed. Doc removed (writeup in git history). | _(removed)_ |
 | `MergedAnnotations` hang | VM-HANG | ✅ **FIXED 2026-06-20** (`8795b88d`) — was the `ReferencePipeline.toArray(IntFunction)` self-recursion; `MergedAnnotationsTests` now 174/178 (residual 4 = synthesis mismatch, cf. bug-06 F6) | [toArray-recursion fix](../internal/fixed-suite-bugs/springsuite-0620-toarray-referencepipeline-recursion.md) |
 | Serializable proxy round-trip | VM-CORRECTNESS (proxy + serialization) | ✅ **RESOLVED on `dev`** — the standalone serialize→deserialize JDK-proxy repro round-trips correctly; `SerializableTypeWrapperTests` generic-type-render residual tracked on branch `fix/generic-array-type-tostring`. Doc removed. | _(removed)_ |
-| JUnit-platform execution `LoadError` | VM-CORRECTNESS / dispatch | 🔴 **OPEN** — JUnit platform internals; Family-A GC-root race (NOT related to the now-fixed bug-04, which was a non-`Comparable` compare exception-type bug, not a GC race) | [spring-bug-10-junit-platform-execution-loaderr.md](spring-bug-10-junit-platform-execution-loaderr.md) |
-| Groovy / scheduler crashes (rc=139) | VM-CRASH | 🟡 **PARTIAL** — Groovy SIGSEGV fixed via the bug-12 HashMap-layout fix; residual = a separate Groovy **hang at BEGIN** (inventory, needs per-cluster trace) | [spring-bug-11-groovy-and-scheduler-crashes.md](spring-bug-11-groovy-and-scheduler-crashes.md) |
+| JUnit-platform execution `LoadError` | VM-CORRECTNESS / dispatch | 🔴 **OPEN** — JUnit platform internals; Family-A GC-root race (NOT related to the now-fixed bug-04, which was a non-`Comparable` compare exception-type bug, not a GC race) | [spring-bug-10-junit-platform-execution-loaderr.md](../internal/spring-bug-10-junit-platform-execution-loaderr.md) |
+| Groovy / scheduler crashes (rc=139) | VM-CRASH | 🟡 **PARTIAL** — Groovy SIGSEGV fixed via the bug-12 HashMap-layout fix; residual = a separate Groovy **hang at BEGIN** (inventory, needs per-cluster trace) | [spring-bug-11-groovy-and-scheduler-crashes.md](../internal/spring-bug-11-groovy-and-scheduler-crashes.md) |
 | Mockito `mockStatic` + mock dispatch | VM-CORRECTNESS (Mockito dispatch) | ✅ **FIXED on `dev`** — the dispatch/shadowing half landed (doc removed). A narrow **residual** remains open (the `mockStatic` capturing-lambda stub is bypassed by a stale JIT call site; works with `--nojit`). | open residual: [kafka-bug-B-mockstatic-capturing-lambda-jit.md](kafka-bug-B-mockstatic-capturing-lambda-jit.md) |
 | `WeakHashMap` stream infinite hang | VM-HANG → JIT codegen | ✅ **FIXED on `dev`** (`1cd0ab26`, JIT ban; verified; doc removed). The underlying `dup_x1` field-post-increment codegen weakness is tracked in the [JIT regalloc family doc](jit-regalloc-callee-saved-clobber-family.md). | _(removed)_ |
 

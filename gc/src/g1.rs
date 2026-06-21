@@ -1859,8 +1859,13 @@ impl G1Collector {
                 } else {
                     // SAFETY: slot_idx < num_slots, within the allocated object.
                     let slot_ptr = unsafe { obj_ptr.add(HEADER_SIZE + payload_off) };
-                    // SAFETY: slot_ptr is a properly aligned Value within the object.
-                    unsafe { std::ptr::read(slot_ptr as *const Value) }
+                    // Concurrent-mark torn-read fix: this scan runs concurrently
+                    // with JIT-compiled field stores, which write the 16-byte
+                    // slot directly (bypassing the regions-lock-serialized
+                    // `set_field`). Read the slot as two atomic words so the
+                    // access is well-defined and cannot splice a garbage pointer.
+                    // SAFETY: slot_ptr is a properly aligned live Value slot.
+                    unsafe { cratonvm_types::read_value_atomic(slot_ptr as *const Value) }
                 };
                 if let Value::Object(Some(ref_obj)) = value {
                     let ref_ptr = ref_obj.as_ptr();
@@ -1955,6 +1960,33 @@ impl G1Collector {
                 push_with_cap(&mut worklist, addr);
             }
         }
+
+        // 2) SATB completeness (finding #18): before draining the global
+        //    shards, pull in every live mutator's partially-full per-thread
+        //    buffer. The fast-path barrier only spills a thread's local buffer
+        //    into the shards when it fills (~256 entries) or when that thread
+        //    self-flushes; references a thread overwrote since its last spill
+        //    live only in its local buffer, invisible to the shard `drain()`
+        //    below. Excluded from the remark snapshot, the still-live objects
+        //    they point at are swept while reachable (use-after-free).
+        //
+        //    G1's remark uses `drain()` (not `deactivate_and_drain()`, which
+        //    runs only at end-of-cycle `cleanup` where stragglers are
+        //    discarded), so this is the one place that must drain the registry.
+        //    Sound only because `remark` runs at the STW safepoint (final
+        //    remark; and the initial-mark call, where buffers are typically
+        //    empty): no mutator is mid-barrier, so nothing re-fills a buffer
+        //    after we drain it. Draining every buffer here from the collector
+        //    removes the dependence on each mutator self-flushing at the
+        //    safepoint — the external, unenforced contract finding #18 flagged.
+        //
+        //    No `debug_assert!` that all registered buffers are now empty: the
+        //    registry is process-global and this crate cannot observe the VM's
+        //    STW state, so such a check races with any concurrent SATB user
+        //    (notably the parallel test harness) and would flake. The contract
+        //    is instead verified deterministically by
+        //    `satb::tests::flush_all_captures_every_parked_mutator_buffer`.
+        crate::satb::flush_all_thread_satb_buffers(&self.satb_queue);
 
         // 2) SATB — every overwritten reference becomes a root.
         let satb_entries = self.satb_queue.drain();

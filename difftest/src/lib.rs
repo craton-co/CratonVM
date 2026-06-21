@@ -11,31 +11,38 @@
 //!
 //! Design: `docs/feature-designs/differential-fuzzer.md`.
 //!
-//! ## Status: Step 1 — real two-VM runner + four-channel oracle
+//! ## Status: complete (Steps 0–7)
 //!
-//! The runner now spawns the `cratonvm` binary and a real `java` as
-//! subprocesses (timeout-guarded capture of stdout/stderr/exit-code), compiles
-//! a `.java` seed once with `javac`, and runs the same `.class` on both VMs;
-//! the oracle parses the uncaught-exception banner and diffs the four channels
-//! (exit code, exception identity, stdout, stderr) under strict-by-default
-//! normalization. The [`harness`] ties them together over a corpus. Generation,
-//! bytecode mutation, minimization, the per-mode `Classification` join, and the
-//! committed-ledger gate verdict remain stubs/Step-2+ work.
+//! The runner spawns the `cratonvm` binary and a real `java` as subprocesses,
+//! compiles a `.java` program once with `javac`, and runs the same `.class` on
+//! both VMs; the oracle diffs the four channels under strict-by-default
+//! normalization; the [`harness`] fans CratonVM across **every configured
+//! mode** ([`runner::Mode`]) against one HotSpot run, classifies each
+//! divergence, runs the determinism pre-flight + re-confirmation, and
+//! [`gate`](harness::gate)s a run against the committed [`ledger::Ledger`].
+//! [`generate`] emits a seeded type-directed corpus; [`mutate`] is the
+//! format-aware bytecode mutator (also a libFuzzer target +
+//! OSS-Fuzz-onboarded); [`minimize`] ddmin-shrinks a confirmed divergence to a
+//! minimal repro under `difftest/regression/`. The macro tier reuses
+//! `difftest run` over any directory of real programs (`--check-determinism`
+//! to reject flaky ones); see `README.md`.
 //!
 //! The cooperating pieces, each its own module:
 //!
-//! | Module          | Role (design §)            | State       |
-//! |-----------------|----------------------------|-------------|
-//! | [`ledger`]      | divergence record + JSON   | wired       |
-//! | [`runner`]      | two-VM A/B executor (§3.2) | wired (1 mode) |
-//! | [`oracle`]      | diff + classify (§3.3)     | wired       |
-//! | [`harness`]     | compile + run + diff corpus | wired       |
-//! | [`generate`]    | corpus generator (§3.1)    | stub → Step 4 |
-//! | [`minimize`]    | shrink a repro (§3.4)      | stub → Step 6 |
+//! | Module          | Role (design §)             | State          |
+//! |-----------------|-----------------------------|----------------|
+//! | [`ledger`]      | divergence record + JSON    | wired          |
+//! | [`runner`]      | two-VM A/B executor (§3.2)  | wired (matrix) |
+//! | [`oracle`]      | diff + classify (§3.3)      | wired          |
+//! | [`harness`]     | compile + run + diff + gate | wired (matrix) |
+//! | [`generate`]    | corpus generator (§3.1)     | wired (3 families) |
+//! | [`mutate`]      | bytecode mutator (§3.1 t3)  | wired          |
+//! | [`minimize`]    | ddmin shrink (§3.4)         | wired          |
 
 pub mod generate;
 pub mod harness;
 pub mod ledger;
 pub mod minimize;
+pub mod mutate;
 pub mod oracle;
 pub mod runner;

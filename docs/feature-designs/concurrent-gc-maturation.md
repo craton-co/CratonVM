@@ -5,6 +5,176 @@ Author note: this doc is grounded in a read of `gc/src/{g1,g1_concurrent,zgc,zgc
 `vm/src/config.rs`, `vm/src/vm/vm_init.rs`, `vm/src/runtime/interpreter.rs`, and
 `docs/internal/reviews/full-review-2026-06-20.md` (findings #18, the `gc-collectors` section, and the docs-governance row).
 
+### Implementation progress
+
+- **Step 1 (CLI flag wiring) — DONE** (branch `feat/g1-cli-flag`). `-XX:+UseG1GC`
+  now selects the G1 backend; `-XX:-UseG1GC` reverts to Generational; any other
+  `-XX:+Use*GC` (Serial/Parallel/Z/Shenandoah/Epsilon) warns and falls back to
+  Generational (lenient-with-warning, §3.1). Generational remains the default —
+  G1 is opt-in. Implementation: `parse_gc_algorithm()` in `vm/src/config.rs`;
+  `-XX:+Use<name>GC` → `--XX:UseGc <name>` rewrite + `gc_selector` clap field +
+  config-apply in `vm-cli/src/main.rs`. Unit-tested (parser + normalize +
+  full-pipeline + last-wins). The existing `vm_init.rs` `GcAlgorithm`→`GcBackend`
+  map and `-XX:+PrintFlagsFinal` collector string already reflect the selection
+  truthfully. Still open within §3.1.3: JMX `GarbageCollectorMXBean` names
+  ("G1 Young/Old Generation").
+- **Step 2 (doc truth-up) — DONE** (branch `feat/g1-cli-flag`). Reconciled the
+  docs-governance gap now that G1 is selectable: `README.md` (feature bullet +
+  crate-tree line), `CONTRIBUTING.md` (the `gc` crate row dropped "no G1"), and
+  `ARCHITECTURE.md` (Generational = default safety net, G1 = opt-in via
+  `-XX:+UseG1GC`, ZGC = simulation + a built-but-undispatched `ZgcRealHeap`).
+- **Step 3 (SATB drain enforcement, finding #18) — G1 path DONE** (branch
+  `feat/g1-cli-flag`). The per-thread SATB buffer registry + collector-side
+  `flush_all_thread_satb_buffers` already existed (and are wired into
+  `SatbQueue::deactivate_and_drain`), but G1's `remark` drains with `drain()`,
+  not `deactivate_and_drain` — the latter runs only at end-of-cycle `cleanup`,
+  which *discards* stragglers. So G1 remark never drained the registry: a
+  reference a mutator overwrote since its last ~256-entry spill sat in that
+  thread's local buffer, excluded from the remark snapshot → the still-live
+  target is swept while reachable (UAF). Fix: `G1Collector::remark` now calls
+  `flush_all_thread_satb_buffers(&self.satb_queue)` before the shard `drain()`,
+  at the STW safepoint — removing the dependence on every mutator self-flushing
+  (the external, unenforced contract finding #18 flagged). Regression test:
+  `g1_concurrent::tests::remark_drains_thread_local_satb_buffer` — a ref logged
+  into a thread-local buffer (never spilled to a shard) is marked only because
+  `remark` drains the registry. The existing
+  `satb::tests::{flush_all_thread_satb_buffers_reaches_global_queue,
+  deactivate_and_drain_includes_thread_local_buffer}` already cover the drain
+  mechanism itself.
+  - The design's hot-path `debug_assert!`(registry all-empty after drain) was
+    **intentionally omitted**: the registry is process-global and the gc crate
+    cannot observe the VM's STW state, so the check races with any concurrent
+    SATB user (the parallel test harness itself) and would flake.
+  - Test isolation: because `remark` now drains the *process-global* registry,
+    a parallel test that holds a non-empty thread-local buffer across a wide
+    window can have its entries stolen into a sibling's queue. This is a
+    shared-registry test artifact, not a production issue (one heap, true STW);
+    the suite is green single-threaded. `satb_captures_mutator_writes_during_
+    concurrent_mark` was made robust by spilling its buffer to its own queue
+    shards immediately after the barrier (per-queue shards are isolated).
+  - Generational `ConcurrentMarker::remark` already drains the registry (its
+    remark calls `deactivate_and_drain` → `flush_all`), so it is unaffected.
+    Applying the same discipline uniformly is a small follow-up.
+- **Step 4 (atomic concurrent-mark slot reads) — DONE via atomic-per-word
+  read/write** (branch `feat/g1-atomic-mark-reads`). The design's literal "8-byte
+  reference-word load" was infeasible; the implemented fix reads/writes the whole
+  16-byte slot as two `AtomicU64` words instead. Findings that shaped it:
+  - The *standalone* `ConcurrentMarker::scan_object` (`concurrent_mark.rs`) is
+    already mitigated: 8-byte ref-array elements use a single-word `u64` read;
+    16-byte object slots read under `collector::volatile_stripe_lock` + SeqCst
+    fences. G1's own concurrent scan `scan_object_refs` (`g1.rs`) is **not** —
+    it does a plain non-atomic `ptr::read::<Value>` (the §2.8 g1.rs sites).
+  - The design's primary fix — *"8-byte atomic load of the reference word"* — is
+    **not portable**: `Value` is `repr(Rust)` (line ~22; `repr(C)` would grow it
+    to 24 bytes and break JIT slot layout), so the discriminant/payload offsets
+    are compiler-private — there is no stable "reference word" to load. And the
+    mutator write (`set_field`) is a non-atomic `ptr::write::<Value>`, so even an
+    atomic read would be **mixed-atomicity UB** unless every writer (interpreter,
+    JIT raw stores, natives) also becomes atomic — a cross-cutting, perf-critical
+    change far beyond a marker tweak.
+  - The design's alternative — *"prove + assert STW-only"* — fits the **other
+    three** g1.rs Value reads (`scan_and_evacuate_refs`,
+    `scan_source_region_for_cset_refs`, `verify_no_dangling_into_cset`: all in
+    the STW evacuation path) but **not** `scan_object_refs`, which is genuinely
+    concurrent.
+  - The `concurrent_mark.rs` **stripe-lock** approach is **ruled out for G1**:
+    `scan_object_refs` runs holding `self.regions.lock()`, while the volatile
+    write path is `set_field_volatile` → stripe → `set_field` → `regions.lock()`.
+    Adding a stripe lock under the regions lock inverts the order (regions→stripe
+    vs stripe→regions) → **deadlock**.
+  - **Key narrowing:** the *interpreter* write path (`set_field`) takes
+    `regions.lock()` — the same lock the marker holds for the whole
+    `concurrent_mark_step` — so interpreter writes are already serialized against
+    the marker read (no race). The **only** genuinely concurrent writer is the
+    JIT: `jit_putfield_*` write the 16-byte slot **directly** (bypassing
+    `set_field`/the regions lock). So the race is JIT-write ↔ marker-read, and it
+    is benign in practice (typed-field tag invariance → no spliced garbage
+    pointer) — formal UB, not a reachable memory-safety hole.
+  - **Implemented fix (atomic-per-word):** `types::{read_value_atomic,
+    write_value_atomic}` read/write a slot as two relaxed `AtomicU64` words —
+    copying all 16 bytes, so **no `repr(Rust)` layout assumption**, and
+    perf-neutral on x86 (a 16-byte `ptr::write` was already two stores). Applied
+    to the marker reads (`g1::scan_object_refs`, `concurrent_mark::scan_object` —
+    the latter keeps its stripe lock for volatile-write serialization) and to all
+    five `jit_putfield_*` writes plus `jit_putfield_object`'s SATB old-value read.
+    The regions lock is left intact (no deadlock; §3.3 says don't pre-optimize it
+    — defer to gauntlet measurement). `Relaxed` suffices: marking *correctness* is
+    carried by the SATB pre-barrier, not this access's ordering.
+  - **Validation:** build + `cratonvm-gc` (709, parallel) + `cratonvm-types` (283)
+    green; a JIT field-stress program (`scratch/step4/FieldStress.java`,
+    exercising all five putfields + GC churn) yields a **byte-identical checksum
+    `4495525842000` across HotSpot, cratonvm-generational, and cratonvm
+    `-XX:+UseG1GC`** (the G1 run drives Step 1 flag → G1 marking → atomic
+    read/write end-to-end). Note: the 8-byte reference-*array* read/`jit_aastore`
+    path is single-word (cannot tear) and left as-is; the three STW evacuation
+    Value reads are non-concurrent and unchanged.
+- **Step 5 (moving-GC root-parity audit under G1) — AUDIT DONE; 1 of 4 gaps
+  fixed, 3 documented** (branch `feat/g1-root-parity`). A 25-agent fan-out audited
+  every root/side-table category for G1-evacuation parity (each adversarially
+  verified). Core finding: the interpreter GC spine is collector-agnostic
+  (`collect_roots` → `collect_garbage` → `update_all_roots` with G1's
+  `GcResult.pointer_map`), so the large majority of sources (interpreter frames,
+  statics/mirrors/interns, monitors, native_pin_roots, native-root registry incl.
+  OscCache, weak/soft/phantom references, XNIO futures, JNI globals) have automatic
+  parity. Four genuine gaps surfaced (each verified against the code by hand):
+  - **GAP B — non-initiator JIT precise-map remap (HIGH, G1-specific) — FIXED.**
+    `apply_pointer_map_to_thread` (the path a thread parked at the STW barrier runs
+    on *itself* when it resumes) remapped frames/monitors/shadow-stack/native-pins
+    but NOT `remap_active_jit_frames` (the precise JIT oop-map RBP-chain remap the
+    initiator does at `gc.rs:73`). With `CRATONVM_PRECISE_JIT_MAPS` on, a
+    non-initiator's JIT-frame oops stayed stale after a move → UAF. G1-specific:
+    G1 moves unconditionally, while the generational collector falls back to a
+    non-moving sweep whenever any thread is in JIT (`gc_quiescence`). Fix: add the
+    thread-local `remap_active_jit_frames(pointer_map)` to
+    `apply_pointer_map_to_thread` (inert when no precise-map frame is live).
+  - **GAP A — smuggled-jobject remap skipped after CSet free (HIGH, G1-specific)
+    — DOCUMENTED, fix is non-trivial.** `value_stack::update_object_refs`'s
+    *ambiguous Long/Double smuggle arm* gates the rewrite on a POST-GC
+    `heap.is_heap_addr(old_ptr)` (value_stack.rs:1365). Under G1 the CSet region is
+    reset to `Free` during evacuation, and `is_heap_addr` skips Free regions
+    (g1.rs:2828), so a genuinely-moved jobject's old address now reads "not in
+    heap" → the rewrite is SKIPPED → stale (UAF; the JNI long-as-jobject path,
+    e.g. WildFly jboss-modules). The generational collector is safe because its
+    `young_from` is swapped, never freed, so `is_heap_addr(old_ptr)` still returns
+    `Some`. NOTE the *object-tagged* arm (value_stack.rs:1304-1325) was already
+    fixed for this (it gates on `pointer_map` membership, not `is_heap_addr` — the
+    H2 stale-stack crash). The Long/Double arm can't simply drop the guard: it
+    disambiguates a real smuggled jobject from a coincidental primitive long whose
+    bits collide with a `pointer_map` key (tested by
+    `frame.rs::update_local_refs_preserves_collision_long_matching_pointer_map_key`).
+    A correct fix keeps that disambiguation while surviving CSet-free — cleanest:
+    have G1 keep just-collected CSet address ranges queryable during the remap
+    window (a `was_in_collection_set(old_ptr)` accepted alongside `is_heap_addr`),
+    mirroring gen's "from-space still resolvable during remap". Needs its own
+    focused change + the frame.rs collision tests re-run.
+  - **GAP C — Panama/FFM upcall targets never rooted (MEDIUM, both collectors)
+    — FIXED.** The libffi upcall trampoline dispatched to a Java target reachable
+    only through a leaked `UpcallUserdata.target` (an `ObjectRef`) that nothing
+    scanned or remapped — a moving-GC UAF on the next upcall once the target was
+    collected or relocated. Fix: make `UpcallUserdata.target` an `AtomicUsize`
+    (remappable in place; the trampoline loads it per dispatch), hold the leaked
+    userdata pointer in `UPCALL_REGISTRY`, and export
+    `panama::{gc_scan_upcall_target_roots, gc_update_upcall_target_refs}` wired into
+    the VM root scan (`roots.rs`) and `update_all_roots` (`gc.rs`) — the same
+    `gc_scan_*`/`gc_update_*` idiom xnio/selector/classloader use. Regression test
+    `upcall_target_root_scan_and_remap_gap_c`; the existing
+    `new18_upcall_libffi_closure_dispatches_to_java` exercises the atomic-load
+    trampoline read. (Note: the *legacy* `ctx.register_upcall` slot-table copy is a
+    separate, pre-existing un-rooted path — out of scope here.)
+  - **GAP D — ec_watch table not remapped on multi-thread GC paths (LOW,
+    diagnostic-only) — FIXED.** Added the missing `ec_watch::remap` after
+    `update_all_roots` in the multi-threaded `maybe_gc_forced` and
+    `force_gc_from_native` initiator paths (the single-threaded paths already had
+    it). Diagnostic consistency only — no production UAF.
+  - The audit also DOWNGRADED a `monitor_on_exit` over-claim: it is reachable via
+    local-0 / class-mirror in the normal case, so it is in `pointer_map`; the
+    residual (a method overwriting local 0) is pre-existing and not G1-specific.
+  - Remaining for Step 5: the GAP A fix shipped a per-slot remap correction; a
+    fuller moving-GC stress test (multi-thread precise-JIT frame + FFM upcall
+    relocated under `-XX:+UseG1GC`) asserting no staleness is still worthwhile.
+- Steps 6–10 — not started. Next highest-value: Step 8 (opt-in G1 gauntlet
+  validation).
+
 ---
 
 ## 1. Problem & motivation

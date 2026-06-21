@@ -152,6 +152,16 @@ impl Observation {
             wall_ms: 0,
         }
     }
+
+    /// A copy with run-specific timing zeroed, so a committed ledger entry is
+    /// stable across regenerations and a drift comparison can use plain
+    /// equality without `wall_ms` jitter tripping it.
+    pub fn canonical(&self) -> Observation {
+        Observation {
+            wall_ms: 0,
+            ..self.clone()
+        }
+    }
 }
 
 // ===========================================================================
@@ -273,12 +283,16 @@ impl Ledger {
     }
 }
 
-/// Default ledger path: `bench/differential-divergences.json` at the workspace
-/// root (continuity with the §2.1 harness, which already writes there).
+/// Default ledger path: the committed `difftest/ledger.json`.
+///
+/// The design (§3.5) nominally reused `bench/differential-divergences.json` for
+/// continuity with the §2.1 harness, but `bench/` is **gitignored** in this
+/// repo — a committed known-divergence ledger must be tracked, so it lives in
+/// the crate dir (the design's own open-question #2 alternative).
 pub fn default_ledger_path() -> PathBuf {
     crate::runner::workspace_root()
-        .join("bench")
-        .join("differential-divergences.json")
+        .join("difftest")
+        .join("ledger.json")
 }
 
 // ===========================================================================

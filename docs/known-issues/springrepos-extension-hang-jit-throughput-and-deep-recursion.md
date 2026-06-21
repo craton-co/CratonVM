@@ -19,6 +19,28 @@ fix, commit `1d523351`). Three additional general JIT/classloader fixes landed o
 crash it surfaces is precisely diagnosed (a native stack overflow, design for the
 fix below).
 
+> **CHECKED 2026-06-21 against dev `0c904c04`.** All four load-bearing commits this
+> doc relies on are confirmed present on the current dev tip (git ancestry):
+> `1d523351` (root-snapshot/hang fix), `43f5fe03` (pdcache), `05b9622a`
+> (AssertionError preload), `2fbabc0b` (hashCode/equals-override compile). The doc's
+> account is accurate and the two residuals (§5 cold-path throughput, §6–§7
+> deep-recursion native stack overflow + stack-banging guard) remain **non-blockers /
+> open handoff**, unchanged. A fresh test-level re-run of
+> `SpringRepositoriesExtensionTests` was **not** repeated here — it uses the separate
+> `apps/spring-boot/buildSrc/runner` harness (~55 s Groovy bootstrap, watchdog must be
+> disabled) rather than the spring-framework KRun harness used for the other tickets
+> in this batch; the commit-level verification above is the check performed.
+>
+> **Cross-link / second reproducer:** the Spring `GroovyScriptEvaluator` cluster in
+> [[spring-bug-11]] hits this **same ANTLR ATN cold-path**. A standalone probe
+> (`new GroovyScriptEvaluator().evaluate(new StaticScriptSource("return 3 * 2"))`) —
+> a *trivial* script — returns instantly on HotSpot but on dev `0c904c04` **hangs >120 s
+> and trips the stack-dump watchdog**, frozen in
+> `GroovyParser.<clinit> → ATNDeserializer.deserialize → BitSet.get/<init>` (never
+> finishing the one-time ATN deserialize). So this cold-path throughput is not
+> buildSrc-specific — it gates *any* first Groovy parse, and is a more minimal repro
+> than `SpringRepositoriesExtensionTests` for the §5–§6 work.
+
 ---
 
 ## 1. The test decomposes into THREE independent defects (earlier reports conflated them)

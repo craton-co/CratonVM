@@ -653,6 +653,13 @@ fn maybe_gc_forced(shared: &SharedVm, thread: &mut JvmThread) {
                 .collect_garbage(&stw, &mut roots, &shared.monitors);
             process_references_after_gc(shared, &result.pointer_map);
             update_all_roots(shared, thread, &result.pointer_map);
+            // Step 5 GAP D: remap the ec_watch corruption-watch table across this
+            // multi-threaded forced collection too. The single-threaded GC paths
+            // already do (mirrors the `update_all_roots` -> `ec_watch::remap`
+            // pairing at maybe_gc:419 / maybe_gc_forced:636); this multi-threaded
+            // initiator path was missing it, so a relocating G1 evacuation left
+            // ec_watch holders stale and the watchpoint read moved-away memory.
+            crate::runtime::ec_watch::remap(&result.pointer_map);
             shared.gc_barrier.complete_gc(result.pointer_map);
             // T19.3.G1 — count forced cycles (multi-threaded initiator).
             shared
@@ -790,6 +797,10 @@ pub fn force_gc_from_native(shared: &SharedVm, thread: &mut JvmThread) {
             );
             process_references_after_gc(shared, &result.pointer_map);
             update_all_roots(shared, thread, &result.pointer_map);
+            // Step 5 GAP D: keep the ec_watch corruption-watch table consistent
+            // across this multi-threaded finalizer collection (single-threaded
+            // paths already remap it; this initiator path was missing the call).
+            crate::runtime::ec_watch::remap(&result.pointer_map);
             for new_addr in &dead_finalizers {
                 shared.finalizer_thread.enqueue(*new_addr);
             }
@@ -1921,6 +1932,20 @@ pub(crate) fn apply_pointer_map_to_thread(
             }
         }
     }
+    // Step 5 GAP B (precise-JIT remap, non-initiator half). The GC initiator's
+    // `update_all_roots` (memory/gc.rs:73) remaps this collection's precise JIT
+    // oop-map slots via `remap_active_jit_frames`, but a thread that was PARKED at
+    // the STW barrier reaches HERE instead and was missing that call. Under a
+    // moving collector this stranded a non-initiator's JIT-frame oops at their old
+    // addresses after a relocation — a use-after-free with CRATONVM_PRECISE_JIT_MAPS
+    // on. It is specifically a G1 hazard: G1 young/mixed move unconditionally,
+    // whereas the generational collector falls back to a non-moving sweep whenever
+    // any thread is in JIT (`gc_quiescence`), so its non-initiator JIT frames never
+    // see relocation. Mirror the initiator: remap THIS resuming thread's precise
+    // JIT oop slots before the shadow stack. Thread-local (walks this thread's JIT
+    // entry chain — sound because we run on the resuming thread itself) and inert
+    // unless a precise-map frame is live, so it is a no-op on the default path.
+    crate::jit::conservative_roots::remap_active_jit_frames(pointer_map);
     // §4 (multi-thread shadow scan, remap half). Remap THIS thread's shadow-stack
     // precise roots in place, so a worker resuming from the STW barrier sees the
     // relocated addresses in the JIT registers/slots it reloads from its shadow
@@ -3976,7 +4001,7 @@ pub fn execute(
     // regression suites (bc-asn1/crypto/crypto-prng went rc=0 -> rc=124).
     // The uncached invoke path is not a safe consumer of the thread-local
     // frame pools as-is; reverted to the proven `new_from_arcs` path.
-    let frame = Frame::new_from_arcs(
+    let mut frame = Frame::new_from_arcs(
         class_id,
         std::sync::Arc::from(class_name_str.as_str()),
         std::sync::Arc::from(method_name),
@@ -3988,6 +4013,22 @@ pub fn execute(
         code_attr.max_locals,
         args,
     );
+
+    // GC-safety: if the JIT early-compile path produced an exception, root its
+    // oop on the operand stack BEFORE `push_frame_and_fire_entry` fires the
+    // JVMTI MethodEntry callback. That callback may allocate Java heap and
+    // trigger a moving young-gen GC; an oop reachable only through the
+    // `jit_early_exception` Rust local across the fire would be unrooted and
+    // could be relocated, leaving a stale pointer for the handler walk /
+    // propagation below. The frame's operand stack is GC-scanned, so we read
+    // the (possibly relocated) reference back from it after the fire. The
+    // pre-fire push is best-effort (`let _ =`): if it does not take — e.g. a
+    // `max_stack == 0` method, which by definition has no operand-using
+    // handler — we fall back to the original local, no worse than before.
+    // Mirrors `route_jit_exception_through_method` / `resume_from_ir_deopt`.
+    if let Some(exc) = jit_early_exception {
+        let _ = frame.stack.push(Value::Object(Some(exc)));
+    }
 
     // Push frame onto thread
     if crate::runtime::env_cache::frame_trace() {
@@ -4003,9 +4044,17 @@ pub fn execute(
 
     // If the JIT early-compile path encountered a Java exception from a callee,
     // route it through this method's exception table before interpreter execution.
-    if let Some(exc) = jit_early_exception {
+    if jit_early_exception.is_some() {
         // The frame has been pushed. Search its exception table for a handler.
         let frame_idx = thread.frames.len() - 1;
+        // Re-read the exception oop from the (GC-scanned) operand stack: a GC
+        // during the MethodEntry callback may have relocated it, and only the
+        // scanned frame slot was updated — not the original Rust local. Fall
+        // back to the local if the pre-fire push did not take.
+        let exc = match thread.frames[frame_idx].stack.pop() {
+            Ok(Value::Object(Some(r))) => r,
+            _ => jit_early_exception.expect("jit_early_exception is_some"),
+        };
         // The JIT executed the entire method body as native code, so there is
         // no live throw-site PC. Previously this passed the freshly-pushed
         // frame's `last_instr_pc` (always 0) to the PC-ranged search, which
@@ -6716,6 +6765,44 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
             }
         }
 
+        // DIAG (gated `CRATONVM_DBG_POPINT=1`): pinpoint a `pop_int` type
+        // mismatch ("expected int on stack, got ref(...)") — log the offending
+        // method/bci/opcode + the Java frame chain the first time one surfaces.
+        if let Err(MethodCallFailed::InternalError(VmError::Runtime(
+            RuntimeError::NotImplemented { feature },
+        ))) = &exec_result
+        {
+            if feature.starts_with("expected int on stack, got")
+                && std::env::var("CRATONVM_DBG_POPINT").is_ok()
+            {
+                use std::sync::atomic::{AtomicBool, Ordering};
+                static FIRED_POPINT: AtomicBool = AtomicBool::new(false);
+                if !FIRED_POPINT.swap(true, Ordering::Relaxed) {
+                    let f = &thread.frames[frame_idx];
+                    eprintln!(
+                        "[DBG_POPINT] {} at {}.{}{} bci={} opcode={:?} stack_len={}",
+                        feature,
+                        f.class_name(),
+                        f.method_name(),
+                        f.method_descriptor(),
+                        saved_pc,
+                        instruction,
+                        f.stack.len(),
+                    );
+                    for (i, fr) in thread.frames.iter().enumerate().rev() {
+                        eprintln!(
+                            "    [{}] {}.{}{} pc={}",
+                            i,
+                            fr.class_name(),
+                            fr.method_name(),
+                            fr.method_descriptor(),
+                            fr.pc
+                        );
+                    }
+                }
+            }
+        }
+
         // Convert RuntimeErrors from native methods into catchable Java exceptions.
         let exec_result = match exec_result {
             Err(MethodCallFailed::InternalError(VmError::Runtime(runtime_err)))
@@ -7455,7 +7542,7 @@ fn route_jit_exception_through_method(
         (cached.max_stack as usize).max(16) + 8,
     );
 
-    let frame = crate::runtime::frame::Frame::new_pooled(
+    let mut frame = crate::runtime::frame::Frame::new_pooled(
         cached.declaring_class_id,
         cached.class_name.clone(),
         cached.method_name.clone(),
@@ -7469,6 +7556,20 @@ fn route_jit_exception_through_method(
         &mut thread.locals_pool,
         &mut thread.stacks_pool,
     );
+    // GC-safety: push the live exception oop onto the handler frame's operand
+    // stack BEFORE `push_frame_and_fire_entry`. That helper fires a JVMTI
+    // MethodEntry callback (when a listener is active); the callback can
+    // allocate Java heap and trigger a young-gen GC that relocates live oops
+    // (gen_heap.rs selective promotion). If `exc` were pushed only AFTER the
+    // fire, it would be reachable solely through this Rust local across the
+    // callback — unrooted — and a relocation/collection would leave a stale
+    // pointer on the operand stack. Populating the GC-scanned frame slot first
+    // keeps it rooted across the callback. Mirrors the same ordering fix in
+    // `resume_from_ir_deopt`.
+    frame
+        .stack
+        .push(Value::Object(Some(exc)))
+        .map_err(|e| MethodCallFailed::InternalError(VmError::Runtime(e)))?;
     if crate::runtime::env_cache::frame_trace() {
         eprintln!(
             "[FRAME_PUSH/jit_exc_route] depth={} {}.{}{}",
@@ -7480,11 +7581,8 @@ fn route_jit_exception_through_method(
     }
     push_frame_and_fire_entry(thread, frame);
     let new_idx = thread.frames.len() - 1;
-    // Push exception onto operand stack; set PC to handler.
-    thread.frames[new_idx]
-        .stack
-        .push(Value::Object(Some(exc)))
-        .map_err(|e| MethodCallFailed::InternalError(VmError::Runtime(e)))?;
+    // Exception is already on the operand stack (rooted before the fire above);
+    // just position the PC at the handler.
     thread.frames[new_idx].pc = handler_pc;
     // Silence unused parameter warning — caller_frame_idx is kept for
     // future extensions (e.g. return-value coercion into the caller).
@@ -17763,6 +17861,10 @@ fn try_jit_upgrade_with_gate(
                 std::env::var_os("CRATONVM_JIT_IR_CALL_SPECIAL").is_some(),
                 // inc 25: long methods → IR path, gated default-OFF.
                 std::env::var_os("CRATONVM_JIT_IR_LONG").is_some(),
+                // inc 26: invokevirtual/invokeinterface → Op::Call (dynamic
+                // dispatch via the helper), gated default-OFF (its own soak).
+                // `CRATONVM_JIT_IR_CALL_VIRTUAL=1` opts in.
+                std::env::var_os("CRATONVM_JIT_IR_CALL_VIRTUAL").is_some(),
             )?;
             let entry = compiled.entry_ptr() as usize; // Cast: JIT entry point to address
             let needs_ctx = compiled.needs_context();
@@ -17873,6 +17975,9 @@ fn try_jit_upgrade_with_gate(
         std::env::var_os("CRATONVM_JIT_IR_CALL_SPECIAL").is_some(),
         // inc 25: long methods → IR path, gated default-OFF.
         std::env::var_os("CRATONVM_JIT_IR_LONG").is_some(),
+        // inc 26: invokevirtual/invokeinterface → Op::Call (dynamic dispatch via
+        // the helper), gated default-OFF (its own soak). `=1` opts in.
+        std::env::var_os("CRATONVM_JIT_IR_CALL_VIRTUAL").is_some(),
     )?;
     let ret = crate::jit::return_type(&cached.method_descriptor);
     let heap = compiled.needs_heap();
@@ -18446,6 +18551,9 @@ fn try_jit_compile_callee_slow(
         std::env::var_os("CRATONVM_JIT_IR_CALL_SPECIAL").is_some(),
         // inc 25: long methods → IR path, gated default-OFF.
         std::env::var_os("CRATONVM_JIT_IR_LONG").is_some(),
+        // inc 26: invokevirtual/invokeinterface → Op::Call (dynamic dispatch via
+        // the helper), gated default-OFF (its own soak). `=1` opts in.
+        std::env::var_os("CRATONVM_JIT_IR_CALL_VIRTUAL").is_some(),
     )?;
     if std::env::var_os("CRATONVM_DBG_JITC").is_some() {
         eprintln!(

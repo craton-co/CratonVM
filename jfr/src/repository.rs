@@ -1999,7 +1999,7 @@ mod tests {
         // of the producer-initialised `EventInstance`. We read it without moving
         // it out (so we don't double-drop the skipped slot's payload).
         let ev_ref: &EventInstance = unsafe { (*(*slot_ptr).get()).assume_init_ref() };
-        assert_eq!(ev_ref.start_time, active_tail);
+        assert_eq!(ev_ref.start_time, active_tail as u64);
         match &ev_ref.fields[0] {
             EventValue::String(s) => {
                 assert_eq!(&**s, format!("uaf-{}", active_tail));

@@ -9,61 +9,39 @@
 | **Failing test(s)** | every method that instantiates the affected bean (e.g. `LookupMethodTests` 0/7) |
 | **CratonVM** | FAIL — `IllegalArgumentException: Target object must not be null` |
 | **HotSpot JDK 25** | OK (LookupMethodTests 7/7; instance is `…AbstractBean$$SpringCGLIB$$0`) |
-| **CratonVM HEAD** | found `c4536b94`; primary **FIXED on dev `3b16e985`+**; bug-B2 **mostly FIXED on dev 2026-06-21** |
-| **Status** | 🟢 **MOSTLY FIXED** — primary bean-filter FIXED; bug-B2 method-injection implemented; **generic-type disambiguation FIXED on dev `a67ec290`** (`LookupMethodTests` **7/7**, `LookupAnnotationTests` **9/10**). One narrow residual: `@Lookup` null-bean (`withNullBean`, 1 test). |
-| **Suggested owner** | residual: `withNullBean` — overload-aware override mapping + `NullBean`→`null` unwrap |
+| **CratonVM HEAD** | found `c4536b94`; primary **FIXED on dev `3b16e985`+**; bug-B2 **FULLY FIXED on dev 2026-06-21** |
+| **Status** | ✅ **FIXED** — primary bean-filter FIXED; **bug-B2 (CGLIB method-injection) fully implemented**: `LookupMethodTests` **7/7** (JIT and `--nojit`), `LookupAnnotationTests` **10/10**. |
+| **Suggested owner** | done |
 
-> **GENERIC-TYPE FIX LANDED 2026-06-21** (dev `a67ec290`, JDK 25). `build_lookup_subclass`'s
-> by-type, no-arg path now emits Spring's generic-aware resolution —
-> `getBeanProvider(ResolvableType.forMethodReturnType(getClass().getSuperclass().getDeclaredMethod(name))).getObject()`
-> — instead of `getBean(Ret.class)`, so `NumberStore<Double>` vs `NumberStore<Float>` disambiguate.
-> **`LookupMethodTests` 6/7 → 7/7; `LookupAnnotationTests` 6/10 → 9/10.** Verified vs HotSpot via a
-> JUnit-platform runner over `spring-beans/build/cratonvm-testcp.txt`: stable across 4 JIT runs **and**
-> under `--nojit` (7/7, no hang). **The two blockers from the earlier reverted attempt no longer
-> reproduce** — the flaky JIT `InterceptingExecutableInvoker.invokeVoid` "expected int got ref" and the
-> `--nojit` hang were cleared by intervening JNI/JIT merge fixes. Remaining residual = `withNullBean`
-> (by-name `@Lookup("testBean")` to a null-producing prototype): needs (a) overload-aware override
-> mapping so `get()` is recognised by-name despite the overloaded by-type `get(String)` (the override
-> map is keyed by method name only), and (b) a `bean.equals(null) ? null : bean` NullBean unwrap on the
-> by-name path.
-
-> **bug-B2 FIX 2026-06-21** (`cratonvm-spring0620-b2`, dev `7c66d89f`+, JDK 25). Method-injection
-> (`<lookup-method>` / `@Lookup`) is now implemented. The bean class is abstract, so the
-> `SimpleInstantiationStrategy.instantiate` shim
-> (`s_instantiation_strategy_instantiate` → `try_build_method_injection`) synthesises a concrete
-> CGLIB-style subclass via `cglib_enhancer::build_lookup_subclass`: a `$$beanFactory` field + an
-> override per abstract method that returns `(Ret) bf.getBean(name|Ret.class[, boxedArgs])`
-> (non-lookup abstract methods get a throwing stub so the subclass stays concrete). The owning
-> factory is stored into `$$beanFactory` right after `new_object`. Results:
-> **`LookupMethodTests` 0/7 → 6/7**, **`LookupAnnotationTests` 0/10 → 6/10** (no more "Target
-> object must not be null").
+> **bug-B2 FIX 2026-06-21** (commit `ffa71253`, → dev; `cratonvm-spring0620-b2`, JDK 25).
+> Method-injection (`<lookup-method>` / `@Lookup`) is fully implemented. The bean class is abstract,
+> so the `SimpleInstantiationStrategy.instantiate` shim (`s_instantiation_strategy_instantiate` →
+> `try_build_method_injection`) synthesises a concrete CGLIB-style subclass via
+> `cglib_enhancer::build_lookup_subclass`: a `$$beanFactory` field + an override per abstract method
+> (non-lookup abstract methods get a throwing stub so the subclass stays concrete). The owning factory
+> is stored into `$$beanFactory` right after `new_object`. Each override resolves the bean by:
+> - **by name, no args** → `(Ret) bf.getBean(name)`, then unwrap a `NullBean` result to `null`;
+> - **by name, args** → `(Ret) bf.getBean(name, boxedArgs)` (+ NullBean unwrap);
+> - **by type, no args** → `(Ret) bf.getBeanProvider(ResolvableType.forMethodReturnType(
+>   getClass().getSuperclass().getDeclaredMethod(name))).getObject()` — generic-aware, so
+>   `NumberStore<Double>` vs `NumberStore<Float>` disambiguate;
+> - **by type, args** → `(Ret) bf.getBean(Ret.class, boxedArgs)`.
 >
-> **Residual (OPEN, narrow):**
-> 1. **Generic-type disambiguation** — a by-type lookup whose return type is generic
->    (`NumberStore<Double>` vs `NumberStore<Float>`, both erase to `NumberStore`) does
->    `getBean(NumberStore.class)` → `NoUniqueBeanDefinitionException` (2 candidates). Real Spring
->    uses the *generic* return type via `getBeanProvider(ResolvableType.forMethodReturnType(m))`.
->    Affects `withGenericBean` + the `*WithoutMetadataCaching` cases (1 in LookupMethodTests, 3 in
->    LookupAnnotationTests).
-> 2. **`@Lookup` null-bean** — `withNullBean` expects a `null` result; our override throws/CCEs
->    instead of honouring Spring's `NullBean` marker. Also needs overload-aware override mapping:
->    `get()` is `@Lookup("testBean")` (by name) but collides with the overloaded `@Lookup get(String)`
->    (by type) in a name-keyed map (1 test).
+> Override → method matching is **overload-aware** (keyed on `(methodName, paramCount)` from each
+> `@Lookup`'s stored `Method`) and matched in **reverse** so a child bean definition's override wins
+> over an inherited parent override (`extendedBean.getOneArgument` → `jedi`, not the parent's
+> `testBean`).
 >
-> **Attempted 2026-06-21 (NOT merged):** a generic-aware emitter (by-type →
-> `getBeanProvider(ResolvableType.forMethodReturnType(getClass().getSuperclass().getDeclaredMethod(...)))`,
-> overload-aware mapping keyed on the `@Lookup` `Method`'s param count, and a `NullBean`→`null` unwrap)
-> **does fix the generic case** — `withGenericBean` passes in both classes. It was **reverted** because
-> the extra per-bean reflection (a) reliably triggers a **separate flaky JIT bug** — `InternalError:
-> JIT dispatch into org/junit/jupiter/engine/execution/InterceptingExecutableInvoker.invokeVoid … not
-> implemented: expected int on stack, got ref` (a JIT calling-convention type-tracking defect in the
-> JUnit invoker, masking ~3 tests/class and net-regressing `LookupMethodTests` 6→4 in JIT mode), and
-> (b) **hangs the interpreter under `--nojit`** (no RESULT, rc=1). Both are pre-conditions to resolve
-> before the generic emitter can land. The JIT `invokeVoid` "expected int got ref" defect is a
-> standalone find worth its own fix (it is a test-harness path, not production Spring).
+> **Results: `LookupMethodTests` 0/7 → 7/7, `LookupAnnotationTests` 0/10 → 10/10.**
+> (`FactoryBeanTests` 4/6 — unchanged; its 2 fails are an unrelated `${myName}` placeholder issue.)
 >
-> (`FactoryBeanTests` stays 4/6 — its 2 failures are an unrelated `${myName}` placeholder
-> resolution issue, not method injection.)
+> **Note — the "flaky JIT `invokeVoid`" was a self-inflicted emitter typo, not a VM defect.** An
+> earlier iteration emitted `0x99` (`IFEQ`, pops an int) where the NullBean suffix needed `0xC6`
+> (`IFNULL`), so every by-name lookup ran `dup; ifeq` on a ref → `expected int on stack, got ref`,
+> which propagated up and surfaced as `InternalError: JIT dispatch into …
+> InterceptingExecutableInvoker.invokeVoid`. Pinpointed via the new gated `CRATONVM_DBG_POPINT`
+> interpreter tripwire (mirrors `CRATONVM_DBG_UNDERFLOW`). Fixing the opcode resolved all of it; no
+> JIT defect exists here.
 
 > **FIX (landed):** both loaded-set-only bean filters in
 > `native-builtins/src/spring_startup_bootstrap.rs` — the `getBeanClassName()` override
