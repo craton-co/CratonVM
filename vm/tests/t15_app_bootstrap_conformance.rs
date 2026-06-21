@@ -23,6 +23,39 @@ fn read_ws(rel: &str) -> String {
     std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()))
 }
 
+/// Whitespace-stripped source. `registry.register(...)` calls are frequently
+/// wrapped across lines by rustfmt, so per-line text scans miss them (and would
+/// conflict with `cargo fmt`); matching the whitespace-free form makes a
+/// registration detectable regardless of wrapping.
+fn compact_ws(src: &str) -> String {
+    src.chars().filter(|c| !c.is_whitespace()).collect()
+}
+
+/// True if the whitespace-free source registers a MethodHandleNatives method,
+/// whether the call uses the class literal or the local `mhn` class variable.
+fn registers_mhn(compact: &str, method: &str, desc: &str) -> bool {
+    let suffix = format!("\"{method}\",\"{desc}\"");
+    compact.contains(&format!(
+        "\"java/lang/invoke/MethodHandleNatives\",{suffix}"
+    )) || compact.contains(&format!("mhn,{suffix}"))
+}
+
+/// True if the `register("class","method", ...)` call (any wrapping) is wired
+/// to `func`. Scans a bounded window after the `"class","method"` key covering
+/// the descriptor + handler argument. (A `;`-terminated window can't be used:
+/// JVM descriptors contain `;`, which would truncate before the handler.)
+fn wired(compact: &str, class: &str, method: &str, func: &str) -> bool {
+    let key = format!("\"{class}\",\"{method}\"");
+    match compact.find(&key) {
+        Some(i) => {
+            let start = i + key.len();
+            let end = (start + 220).min(compact.len());
+            compact[start..end].contains(func)
+        }
+        None => false,
+    }
+}
+
 // ===========================================================================
 // T15.1.1-2 — MethodHandleNatives natives registered
 // ===========================================================================
@@ -42,19 +75,12 @@ const MHN_NATIVES: &[(&str, &str)] = &[
 
 #[test]
 fn t15_method_handle_natives_registered() {
-    let lib = read_ws("native-builtins/src/lib.rs");
+    let compact = compact_ws(&read_ws("native-builtins/src/lib.rs"));
     let mut missing: Vec<String> = Vec::new();
 
     for &(method, descriptor) in MHN_NATIVES {
-        let method_pat = format!("\"{}\"", method);
-        let desc_pat = format!("\"{}\"", descriptor);
-        // Registration may use literal "...MethodHandleNatives" or a variable `mhn`
-        let found = lib.lines().any(|line| {
-            (line.contains("MethodHandleNatives") || line.contains("mhn,"))
-                && line.contains(&method_pat)
-                && line.contains(&desc_pat)
-        });
-        if !found {
+        // Registration may use the class literal or the local `mhn` variable.
+        if !registers_mhn(&compact, method, descriptor) {
             missing.push(format!("{method}{descriptor}"));
         }
     }
@@ -79,7 +105,7 @@ fn t15_method_handle_natives_registered() {
 
 #[test]
 fn t15_classloader_natives_registered() {
-    let lib = read_ws("native-builtins/src/lib.rs");
+    let compact = compact_ws(&read_ws("native-builtins/src/lib.rs"));
 
     let required = [
         (
@@ -91,12 +117,10 @@ fn t15_classloader_natives_registered() {
     ];
 
     for (method, func) in &required {
-        let found = lib.lines().any(|line| {
-            line.contains("\"java/lang/ClassLoader\"")
-                && line.contains(&format!("\"{}\"", method))
-                && line.contains(func)
-        });
-        assert!(found, "T15: ClassLoader.{method} not wired to {func}",);
+        assert!(
+            wired(&compact, "java/lang/ClassLoader", method, func),
+            "T15: ClassLoader.{method} not wired to {func}",
+        );
     }
     eprintln!(
         "[T15.2] ✓ ClassLoader.defineClass0/1 and findBootstrapClass use real implementations"
@@ -109,12 +133,13 @@ fn t15_classloader_natives_registered() {
 
 #[test]
 fn t15_finalizer_register_registered() {
-    let lib = read_ws("native-builtins/src/lib.rs");
-    let found = lib.lines().any(|line| {
-        line.contains("\"java/lang/ref/Finalizer\"")
-            && line.contains("\"register\"")
-            && line.contains("native_finalizer_register")
-    });
+    let compact = compact_ws(&read_ws("native-builtins/src/lib.rs"));
+    let found = wired(
+        &compact,
+        "java/lang/ref/Finalizer",
+        "register",
+        "native_finalizer_register",
+    );
     assert!(found, "T15: Finalizer.register not registered");
     eprintln!("[T15.3] ✓ Finalizer.register uses real implementation");
 }
@@ -125,12 +150,13 @@ fn t15_finalizer_register_registered() {
 
 #[test]
 fn t15_array_new_array_registered() {
-    let lib = read_ws("native-builtins/src/lib.rs");
-    let found = lib.lines().any(|line| {
-        line.contains("\"java/lang/reflect/Array\"")
-            && line.contains("\"newArray\"")
-            && line.contains("native_array_new_array")
-    });
+    let compact = compact_ws(&read_ws("native-builtins/src/lib.rs"));
+    let found = wired(
+        &compact,
+        "java/lang/reflect/Array",
+        "newArray",
+        "native_array_new_array",
+    );
     assert!(found, "T15: Array.newArray not registered");
     eprintln!("[T15.4] ✓ Array.newArray registered with real implementation");
 }

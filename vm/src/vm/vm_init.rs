@@ -4137,16 +4137,24 @@ mod ranked_locks {
         use crate::runtime::lock_order::LockOrderViolation;
         use std::cell::Cell;
 
-        const COUNT: usize = 6;
+        // One slot per `LockLevel` discriminant (Scratch=0 .. ClassManager=10).
+        // MUST equal the discriminant count of `runtime::lock_order::LockLevel`;
+        // the array is indexed directly by `level as u8`, so an undersized COUNT
+        // panics with an out-of-bounds index instead of a lock-order message.
+        const COUNT: usize = 11;
 
         thread_local! {
             static HELD: Cell<[bool; COUNT]> = const { Cell::new([false; COUNT]) };
         }
 
-        fn highest_held() -> Option<LockLevel> {
+        /// The LOWEST-ranked level currently held. The canonical
+        /// `lock_order::OrderedMutex` enforces DESCENDING acquisition (each new
+        /// level must be strictly less than the minimum already held), so the
+        /// rank check compares the candidate against the lowest held level.
+        fn lowest_held() -> Option<LockLevel> {
             HELD.with(|cell| {
                 let arr = cell.get();
-                for i in (0..COUNT).rev() {
+                for i in 0..COUNT {
                     if arr[i] {
                         return Some(level_from_u8(i as u8));
                     }
@@ -4156,22 +4164,29 @@ mod ranked_locks {
         }
 
         fn level_from_u8(v: u8) -> LockLevel {
+            // Array indices ARE `LockLevel` discriminants (see runtime::lock_order).
             match v {
-                0 => LockLevel::ClassManager,   // L10 — highest
-                1 => LockLevel::NativeMethods,  // L9
-                2 => LockLevel::RefProcessor,   // L7
-                3 => LockLevel::Monitors,       // L6
-                4 => LockLevel::ThreadRegistry, // L5
-                5 => LockLevel::FlightRecorder, // L4
-                6 => LockLevel::NativeMemory,   // L2
+                0 => LockLevel::Scratch,
+                1 => LockLevel::JvmThread,
+                2 => LockLevel::NativeMemory,
+                3 => LockLevel::CleanerActions,
+                4 => LockLevel::FlightRecorder,
+                5 => LockLevel::ThreadRegistry,
+                6 => LockLevel::Monitors,
+                7 => LockLevel::RefProcessor,
+                8 => LockLevel::Heap,
+                9 => LockLevel::NativeMethods,
+                10 => LockLevel::ClassManager,
                 _ => unreachable!("level discriminant out of range: {v}"),
             }
         }
 
         pub(super) fn check_and_acquire(level: LockLevel) {
-            if let Some(held) = highest_held() {
+            // Descending order: the new level must be strictly less than the
+            // minimum level already held (mirrors lock_order::check_and_acquire).
+            if let Some(held) = lowest_held() {
                 assert!(
-                    level > held,
+                    level < held,
                     "{}",
                     LockOrderViolation {
                         attempted: level,

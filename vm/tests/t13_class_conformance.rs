@@ -20,6 +20,19 @@ fn workspace_root() -> PathBuf {
         .to_path_buf()
 }
 
+/// Whitespace-stripped source. `registry.register(...)` calls are frequently
+/// wrapped across lines by rustfmt, so per-line text scans miss them (and would
+/// conflict with `cargo fmt`); matching the whitespace-free form makes the
+/// `("class", "method", "descriptor")` tuple detectable regardless of wrapping.
+fn compact_ws(src: &str) -> String {
+    src.chars().filter(|c| !c.is_whitespace()).collect()
+}
+
+/// True if the whitespace-free source registers `("class","method","desc")`.
+fn registers(compact: &str, class: &str, method: &str, desc: &str) -> bool {
+    compact.contains(&format!("\"{class}\",\"{method}\",\"{desc}\""))
+}
+
 // ===========================================================================
 // T13.1 — All 28 java/lang/Class natives are registered
 // ===========================================================================
@@ -88,20 +101,11 @@ fn t13_all_class_natives_registered() {
     let contents = std::fs::read_to_string(&lib_path)
         .unwrap_or_else(|e| panic!("cannot read {}: {e}", lib_path.display()));
 
+    let compact = compact_ws(&contents);
     let mut missing: Vec<String> = Vec::new();
 
     for &(method, descriptor) in JDK25_CLASS_NATIVES {
-        // Search for a register call with the method name and descriptor
-        let pattern = format!("\"{}\"", method);
-        let desc_pattern = format!("\"{}\"", descriptor);
-
-        let found = contents.lines().any(|line| {
-            line.contains("\"java/lang/Class\"")
-                && line.contains(&pattern)
-                && line.contains(&desc_pattern)
-        });
-
-        if !found {
+        if !registers(&compact, "java/lang/Class", method, descriptor) {
             missing.push(format!("{method}{descriptor}"));
         }
     }
@@ -473,10 +477,12 @@ fn t13_method_count() {
     let contents = std::fs::read_to_string(&lib_path)
         .unwrap_or_else(|e| panic!("cannot read {}: {e}", lib_path.display()));
 
-    let class_reg_count = contents
-        .lines()
-        .filter(|line| line.contains("\"java/lang/Class\"") && line.contains("register"))
-        .count();
+    // Count actual `register("java/lang/Class", ...)` calls in the
+    // whitespace-free source so multi-line (rustfmt-wrapped) registrations are
+    // counted correctly — a per-line scan misses calls whose class literal and
+    // `register` token land on different lines.
+    let compact = compact_ws(&contents);
+    let class_reg_count = compact.matches("register(\"java/lang/Class\"").count();
 
     // We expect at least 28 registrations across all registration functions
     assert!(

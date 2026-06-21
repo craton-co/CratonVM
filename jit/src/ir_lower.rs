@@ -42,6 +42,11 @@ const RDX: u8 = 2;
 #[allow(dead_code)]
 const R10: u8 = 10;
 
+// XMM scratch registers for the FP value tier (inc 30). Analogous to RAX/RCX:
+// XMM0 holds the first operand / result, XMM1 the second operand / a mask.
+const XMM0: u8 = 0;
+const XMM1: u8 = 1;
+
 // Platform C-ABI integer argument registers for the `invoke_dispatch` helper
 // call (Gap B `Op::Call`). The helper's 4 args (vm_ptr, info_ptr, args_ptr,
 // num_args) are all integer, so all four fit in registers on both ABIs — no
@@ -499,6 +504,163 @@ impl<'a> Lowerer<'a> {
         self.buf.emit_byte(0xE8 | (reg & 7));
     }
 
+    // ── FP value tier (inc 30) — XMM scratch helpers ─────────────────────
+    //
+    // The naive spill-everything model extends cleanly to FP: every value
+    // (int/long/ref AND float/double) lives in a frame slot as raw bits. FP
+    // arithmetic and conversions load operand bits from slots into XMM0/XMM1
+    // (scratch — caller-saved on both ABIs, and no value lives across nodes),
+    // compute, and store the result back. Constants and FP negation never touch
+    // XMM: a float/double constant is just its bit pattern written via a GPR
+    // immediate, and negation is a sign-bit XOR on the integer bit pattern.
+    // XMM0/XMM1 are the FP analogues of RAX/RCX. Both are < 8, so no REX is
+    // needed; `[rbp - offset]` always uses the disp32 ModRM form (mod=10, the
+    // `0x85 | reg<<3` byte) for simplicity.
+
+    /// MOVSS/MOVSD xmm, [rbp - offset] — load a 32/64-bit FP value from a slot.
+    fn fp_load(&mut self, xmm: u8, offset: i32, is_double: bool) {
+        let neg = -offset;
+        self.buf.emit_byte(if is_double { 0xF2 } else { 0xF3 });
+        self.buf.emit(&[0x0F, 0x10]);
+        self.buf.emit_byte(0x85 | ((xmm & 7) << 3));
+        self.buf.emit(&neg.to_le_bytes());
+    }
+
+    /// MOVSS/MOVSD [rbp - offset], xmm — store an FP value to a slot. A `MOVSS`
+    /// writes only the low 4 bytes; the slot's high 4 are left stale, which is
+    /// harmless because every float consumer reads it back with `MOVSS` (4 bytes).
+    fn fp_store(&mut self, offset: i32, xmm: u8, is_double: bool) {
+        let neg = -offset;
+        self.buf.emit_byte(if is_double { 0xF2 } else { 0xF3 });
+        self.buf.emit(&[0x0F, 0x11]);
+        self.buf.emit_byte(0x85 | ((xmm & 7) << 3));
+        self.buf.emit(&neg.to_le_bytes());
+    }
+
+    /// Scalar FP binary op (`<prefix> 0F <op>`), reg-reg form `dst op= src`.
+    /// `op` is the second opcode byte: ADD=0x58, SUB=0x5C, MUL=0x59, DIV=0x5E.
+    fn fp_binop(&mut self, op: u8, dst: u8, src: u8, is_double: bool) {
+        self.buf.emit_byte(if is_double { 0xF2 } else { 0xF3 });
+        self.buf.emit(&[0x0F, op]);
+        self.buf.emit_byte(0xC0 | ((dst & 7) << 3) | (src & 7));
+    }
+
+    /// IEEE-754 NaN/overflow fixup after a `CVTTSS2SI`/`CVTTSD2SI` whose source
+    /// is still in XMM0 and whose (sentinel-or-real) result is in EAX/RAX.
+    ///
+    /// x86 `CVTT*` yields the "integer indefinite" (0x8000_0000 / 0x8000…0) for
+    /// NaN AND any out-of-range/∞ input, but the JVM requires NaN→0,
+    /// +overflow→MAX, −overflow→MIN. This ports the single-pass backend's
+    /// `emit_fp_to_int_nan_fixup` verbatim so the two backends agree bit-for-bit.
+    /// Uses XMM1 as scratch (PXOR to materialize +0.0 for the sign test).
+    fn emit_fp_to_int_fixup(&mut self, is_double: bool, is_long: bool) {
+        if !is_long {
+            // CMP EAX, 0x80000000
+            self.buf.emit_byte(0x3D);
+            self.buf.emit(&0x80000000u32.to_le_bytes());
+            // JNE .done
+            self.buf.emit_byte(0x75);
+            let jne_patch = self.buf.pos();
+            self.buf.emit_byte(0x00);
+            // UCOMISD/UCOMISS XMM0, XMM0 — PF=1 if NaN
+            if is_double {
+                self.buf.emit(&[0x66, 0x0F, 0x2E, 0xC0]);
+            } else {
+                self.buf.emit(&[0x0F, 0x2E, 0xC0]);
+            }
+            // JP .nan
+            self.buf.emit_byte(0x7A);
+            let jp_patch = self.buf.pos();
+            self.buf.emit_byte(0x00);
+            // Not NaN — overflow. PXOR XMM1,XMM1 then compare sign.
+            self.buf.emit(&[0x66, 0x0F, 0xEF, 0xC9]);
+            if is_double {
+                self.buf.emit(&[0x66, 0x0F, 0x2E, 0xC1]);
+            } else {
+                self.buf.emit(&[0x0F, 0x2E, 0xC1]);
+            }
+            // JBE .done (negative overflow — 0x80000000 already correct)
+            self.buf.emit_byte(0x76);
+            let jbe_patch = self.buf.pos();
+            self.buf.emit_byte(0x00);
+            // Positive overflow: MOV EAX, 0x7FFFFFFF ; JMP .done
+            self.buf.emit_byte(0xB8);
+            self.buf.emit(&0x7FFFFFFFu32.to_le_bytes());
+            self.buf.emit_byte(0xEB);
+            let jmp_patch = self.buf.pos();
+            self.buf.emit_byte(0x00);
+            // .nan: XOR EAX,EAX
+            let nan_off = self.buf.pos();
+            self.buf
+                .try_patch_byte(jp_patch, (nan_off - jp_patch - 1) as u8)
+                .ok();
+            self.buf.emit(&[0x31, 0xC0]);
+            // .done:
+            let done_off = self.buf.pos();
+            self.buf
+                .try_patch_byte(jne_patch, (done_off - jne_patch - 1) as u8)
+                .ok();
+            self.buf
+                .try_patch_byte(jbe_patch, (done_off - jbe_patch - 1) as u8)
+                .ok();
+            self.buf
+                .try_patch_byte(jmp_patch, (done_off - jmp_patch - 1) as u8)
+                .ok();
+        } else {
+            // MOV RCX, 0x8000000000000000 ; CMP RAX, RCX
+            self.buf.emit(&[0x48, 0xB9]);
+            self.buf.emit(&0x8000000000000000u64.to_le_bytes());
+            self.buf.emit(&[0x48, 0x39, 0xC8]);
+            // JNE .done
+            self.buf.emit_byte(0x75);
+            let jne_patch = self.buf.pos();
+            self.buf.emit_byte(0x00);
+            // UCOMI XMM0,XMM0 ; JP .nan
+            if is_double {
+                self.buf.emit(&[0x66, 0x0F, 0x2E, 0xC0]);
+            } else {
+                self.buf.emit(&[0x0F, 0x2E, 0xC0]);
+            }
+            self.buf.emit_byte(0x7A);
+            let jp_patch = self.buf.pos();
+            self.buf.emit_byte(0x00);
+            // PXOR XMM1,XMM1 ; UCOMI XMM0,XMM1
+            self.buf.emit(&[0x66, 0x0F, 0xEF, 0xC9]);
+            if is_double {
+                self.buf.emit(&[0x66, 0x0F, 0x2E, 0xC1]);
+            } else {
+                self.buf.emit(&[0x0F, 0x2E, 0xC1]);
+            }
+            // JBE .done (negative overflow)
+            self.buf.emit_byte(0x76);
+            let jbe_patch = self.buf.pos();
+            self.buf.emit_byte(0x00);
+            // Positive overflow: MOV RAX, 0x7FFFFFFFFFFFFFFF ; JMP .done
+            self.buf.emit(&[0x48, 0xB8]);
+            self.buf.emit(&0x7FFFFFFFFFFFFFFFu64.to_le_bytes());
+            self.buf.emit_byte(0xEB);
+            let jmp_patch = self.buf.pos();
+            self.buf.emit_byte(0x00);
+            // .nan: XOR RAX,RAX
+            let nan_off = self.buf.pos();
+            self.buf
+                .try_patch_byte(jp_patch, (nan_off - jp_patch - 1) as u8)
+                .ok();
+            self.buf.emit(&[0x48, 0x31, 0xC0]);
+            // .done:
+            let done_off = self.buf.pos();
+            self.buf
+                .try_patch_byte(jne_patch, (done_off - jne_patch - 1) as u8)
+                .ok();
+            self.buf
+                .try_patch_byte(jbe_patch, (done_off - jbe_patch - 1) as u8)
+                .ok();
+            self.buf
+                .try_patch_byte(jmp_patch, (done_off - jmp_patch - 1) as u8)
+                .ok();
+        }
+    }
+
     // ── Node lowering ────────────────────────────────────────────────
 
     fn lower_block(&mut self, block_idx: usize) {
@@ -565,45 +727,83 @@ impl<'a> Lowerer<'a> {
             }
             Op::Add => {
                 let slot = self.alloc_slot(id);
-                self.load_to_rax(self.slot_of(node.inputs[0]));
-                self.load_to_rcx(self.slot_of(node.inputs[1]));
-                if node.ty == IrType::Int {
-                    // ADD EAX, ECX
-                    self.buf.emit(&[0x01, 0xC8]);
+                if matches!(node.ty, IrType::Float | IrType::Double) {
+                    // ADDSS/ADDSD XMM0, XMM1
+                    let is_d = node.ty == IrType::Double;
+                    self.fp_load(XMM0, self.slot_of(node.inputs[0]), is_d);
+                    self.fp_load(XMM1, self.slot_of(node.inputs[1]), is_d);
+                    self.fp_binop(0x58, XMM0, XMM1, is_d);
+                    self.fp_store(slot, XMM0, is_d);
                 } else {
-                    // ADD RAX, RCX
-                    self.buf.emit(&[0x48, 0x01, 0xC8]);
+                    self.load_to_rax(self.slot_of(node.inputs[0]));
+                    self.load_to_rcx(self.slot_of(node.inputs[1]));
+                    if node.ty == IrType::Int {
+                        // ADD EAX, ECX
+                        self.buf.emit(&[0x01, 0xC8]);
+                    } else {
+                        // ADD RAX, RCX
+                        self.buf.emit(&[0x48, 0x01, 0xC8]);
+                    }
+                    self.store_rax(slot);
                 }
-                self.store_rax(slot);
             }
             Op::Sub => {
                 let slot = self.alloc_slot(id);
-                self.load_to_rax(self.slot_of(node.inputs[0]));
-                self.load_to_rcx(self.slot_of(node.inputs[1]));
-                if node.ty == IrType::Int {
-                    // SUB EAX, ECX
-                    self.buf.emit(&[0x29, 0xC8]);
+                if matches!(node.ty, IrType::Float | IrType::Double) {
+                    // SUBSS/SUBSD XMM0, XMM1
+                    let is_d = node.ty == IrType::Double;
+                    self.fp_load(XMM0, self.slot_of(node.inputs[0]), is_d);
+                    self.fp_load(XMM1, self.slot_of(node.inputs[1]), is_d);
+                    self.fp_binop(0x5C, XMM0, XMM1, is_d);
+                    self.fp_store(slot, XMM0, is_d);
                 } else {
-                    // SUB RAX, RCX
-                    self.buf.emit(&[0x48, 0x29, 0xC8]);
+                    self.load_to_rax(self.slot_of(node.inputs[0]));
+                    self.load_to_rcx(self.slot_of(node.inputs[1]));
+                    if node.ty == IrType::Int {
+                        // SUB EAX, ECX
+                        self.buf.emit(&[0x29, 0xC8]);
+                    } else {
+                        // SUB RAX, RCX
+                        self.buf.emit(&[0x48, 0x29, 0xC8]);
+                    }
+                    self.store_rax(slot);
                 }
-                self.store_rax(slot);
             }
             Op::Mul => {
                 let slot = self.alloc_slot(id);
-                self.load_to_rax(self.slot_of(node.inputs[0]));
-                self.load_to_rcx(self.slot_of(node.inputs[1]));
-                if node.ty == IrType::Int {
-                    // IMUL EAX, ECX
-                    self.buf.emit(&[0x0F, 0xAF, 0xC1]);
+                if matches!(node.ty, IrType::Float | IrType::Double) {
+                    // MULSS/MULSD XMM0, XMM1
+                    let is_d = node.ty == IrType::Double;
+                    self.fp_load(XMM0, self.slot_of(node.inputs[0]), is_d);
+                    self.fp_load(XMM1, self.slot_of(node.inputs[1]), is_d);
+                    self.fp_binop(0x59, XMM0, XMM1, is_d);
+                    self.fp_store(slot, XMM0, is_d);
                 } else {
-                    // IMUL RAX, RCX
-                    self.buf.emit(&[0x48, 0x0F, 0xAF, 0xC1]);
+                    self.load_to_rax(self.slot_of(node.inputs[0]));
+                    self.load_to_rcx(self.slot_of(node.inputs[1]));
+                    if node.ty == IrType::Int {
+                        // IMUL EAX, ECX
+                        self.buf.emit(&[0x0F, 0xAF, 0xC1]);
+                    } else {
+                        // IMUL RAX, RCX
+                        self.buf.emit(&[0x48, 0x0F, 0xAF, 0xC1]);
+                    }
+                    self.store_rax(slot);
                 }
-                self.store_rax(slot);
             }
             Op::Div => {
                 let slot = self.alloc_slot(id);
+                // FP division has NO zero/overflow guard: IEEE x/0 is ±inf/NaN,
+                // never an exception, so an `fdiv`/`ddiv` is a plain DIVSS/DIVSD
+                // and is never a deopt point.
+                if matches!(node.ty, IrType::Float | IrType::Double) {
+                    let is_d = node.ty == IrType::Double;
+                    self.fp_load(XMM0, self.slot_of(node.inputs[0]), is_d);
+                    self.fp_load(XMM1, self.slot_of(node.inputs[1]), is_d);
+                    self.fp_binop(0x5E, XMM0, XMM1, is_d);
+                    self.fp_store(slot, XMM0, is_d);
+                    return;
+                }
                 let ty = node.ty;
                 let bpc = node.bytecode_pc;
                 self.load_to_rax(self.slot_of(node.inputs[0]));
@@ -652,12 +852,30 @@ impl<'a> Lowerer<'a> {
             Op::Neg => {
                 let slot = self.alloc_slot(id);
                 self.load_to_rax(self.slot_of(node.inputs[0]));
-                if node.ty == IrType::Int {
-                    // NEG EAX
-                    self.buf.emit(&[0xF7, 0xD8]);
-                } else {
-                    // NEG RAX
-                    self.buf.emit(&[0x48, 0xF7, 0xD8]);
+                match node.ty {
+                    // FP negation = flip the IEEE sign bit of the bit pattern
+                    // (correct for ±0.0 and NaN, unlike `0.0 - x`). Done on the
+                    // integer pattern in RAX — no XMM needed. The float result's
+                    // high 4 slot bytes are left zero; every consumer reads it
+                    // back with MOVSS (4 bytes).
+                    IrType::Float => {
+                        // XOR EAX, 0x80000000
+                        self.buf.emit_byte(0x35);
+                        self.buf.emit(&0x80000000u32.to_le_bytes());
+                    }
+                    IrType::Double => {
+                        // MOV RCX, 0x8000000000000000 ; XOR RAX, RCX
+                        self.emit_mov_reg_imm64(RCX, 0x8000000000000000u64);
+                        self.buf.emit(&[0x48, 0x31, 0xC8]);
+                    }
+                    IrType::Int => {
+                        // NEG EAX
+                        self.buf.emit(&[0xF7, 0xD8]);
+                    }
+                    _ => {
+                        // NEG RAX (Long)
+                        self.buf.emit(&[0x48, 0xF7, 0xD8]);
+                    }
                 }
                 self.store_rax(slot);
             }
@@ -951,6 +1169,101 @@ impl<'a> Lowerer<'a> {
                 // 5. Spill the return value (harmless for a void call: the slot
                 //    is allocated but never read).
                 self.store_rax(slot);
+            }
+            // ── FP value tier (inc 30) ───────────────────────────────────
+            // A float/double constant is just its IEEE bit pattern written to
+            // the result slot via a GPR immediate — no XMM. A float's payload
+            // sits in the low 32 bits (high 32 left zero by the imm32 form);
+            // every consumer reads it back with MOVSS (4 bytes).
+            Op::ConstF(bits) => {
+                let slot = self.alloc_slot(id);
+                self.emit_mov_rax_imm64(*bits as i64);
+                self.store_rax(slot);
+            }
+            // int → float / double. Load the int operand to EAX and convert.
+            Op::I2F => {
+                let slot = self.alloc_slot(id);
+                self.load_to_rax(self.slot_of(node.inputs[0]));
+                // CVTSI2SS XMM0, EAX
+                self.buf.emit(&[0xF3, 0x0F, 0x2A, 0xC0]);
+                self.fp_store(slot, XMM0, false);
+            }
+            Op::I2D => {
+                let slot = self.alloc_slot(id);
+                self.load_to_rax(self.slot_of(node.inputs[0]));
+                // CVTSI2SD XMM0, EAX
+                self.buf.emit(&[0xF2, 0x0F, 0x2A, 0xC0]);
+                self.fp_store(slot, XMM0, true);
+            }
+            // long → float / double (64-bit source operand in RAX).
+            Op::L2F => {
+                let slot = self.alloc_slot(id);
+                self.load_to_rax(self.slot_of(node.inputs[0]));
+                // CVTSI2SS XMM0, RAX (REX.W)
+                self.buf.emit(&[0xF3, 0x48, 0x0F, 0x2A, 0xC0]);
+                self.fp_store(slot, XMM0, false);
+            }
+            Op::L2D => {
+                let slot = self.alloc_slot(id);
+                self.load_to_rax(self.slot_of(node.inputs[0]));
+                // CVTSI2SD XMM0, RAX (REX.W)
+                self.buf.emit(&[0xF2, 0x48, 0x0F, 0x2A, 0xC0]);
+                self.fp_store(slot, XMM0, true);
+            }
+            // float → int / long (truncate toward zero, with the JVM
+            // NaN→0 / overflow→MAX|MIN fixup). Source stays in XMM0 for the
+            // fixup's sign/NaN test.
+            Op::F2I => {
+                let slot = self.alloc_slot(id);
+                self.fp_load(XMM0, self.slot_of(node.inputs[0]), false);
+                // CVTTSS2SI EAX, XMM0
+                self.buf.emit(&[0xF3, 0x0F, 0x2C, 0xC0]);
+                self.emit_fp_to_int_fixup(/* is_double */ false, /* is_long */ false);
+                // Sign-extend EAX→RAX so the int slot matches the single-pass ABI.
+                self.buf.emit(&[0x48, 0x63, 0xC0]); // MOVSXD RAX, EAX
+                self.store_rax(slot);
+            }
+            Op::F2L => {
+                let slot = self.alloc_slot(id);
+                self.fp_load(XMM0, self.slot_of(node.inputs[0]), false);
+                // CVTTSS2SI RAX, XMM0 (REX.W)
+                self.buf.emit(&[0xF3, 0x48, 0x0F, 0x2C, 0xC0]);
+                self.emit_fp_to_int_fixup(/* is_double */ false, /* is_long */ true);
+                self.store_rax(slot);
+            }
+            // float → double.
+            Op::F2D => {
+                let slot = self.alloc_slot(id);
+                self.fp_load(XMM0, self.slot_of(node.inputs[0]), false);
+                // CVTSS2SD XMM0, XMM0
+                self.buf.emit(&[0xF3, 0x0F, 0x5A, 0xC0]);
+                self.fp_store(slot, XMM0, true);
+            }
+            // double → int / long (truncate toward zero, with the JVM fixup).
+            Op::D2I => {
+                let slot = self.alloc_slot(id);
+                self.fp_load(XMM0, self.slot_of(node.inputs[0]), true);
+                // CVTTSD2SI EAX, XMM0
+                self.buf.emit(&[0xF2, 0x0F, 0x2C, 0xC0]);
+                self.emit_fp_to_int_fixup(/* is_double */ true, /* is_long */ false);
+                self.buf.emit(&[0x48, 0x63, 0xC0]); // MOVSXD RAX, EAX
+                self.store_rax(slot);
+            }
+            Op::D2L => {
+                let slot = self.alloc_slot(id);
+                self.fp_load(XMM0, self.slot_of(node.inputs[0]), true);
+                // CVTTSD2SI RAX, XMM0 (REX.W)
+                self.buf.emit(&[0xF2, 0x48, 0x0F, 0x2C, 0xC0]);
+                self.emit_fp_to_int_fixup(/* is_double */ true, /* is_long */ true);
+                self.store_rax(slot);
+            }
+            // double → float.
+            Op::D2F => {
+                let slot = self.alloc_slot(id);
+                self.fp_load(XMM0, self.slot_of(node.inputs[0]), true);
+                // CVTSD2SS XMM0, XMM0
+                self.buf.emit(&[0xF2, 0x0F, 0x5A, 0xC0]);
+                self.fp_store(slot, XMM0, false);
             }
             // Control and meta nodes — skip
             Op::Start | Op::Return | Op::If | Op::Merge | Op::Region | Op::Proj(_) | Op::Dead => {}

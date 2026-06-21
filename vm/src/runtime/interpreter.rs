@@ -18319,6 +18319,9 @@ fn try_jit_upgrade_with_gate(
                 // dispatch via the helper), gated default-OFF (its own soak).
                 // `CRATONVM_JIT_IR_CALL_VIRTUAL=1` opts in.
                 std::env::var_os("CRATONVM_JIT_IR_CALL_VIRTUAL").is_some(),
+                // inc 30: double/float XMM value tier, gated default-OFF (its
+                // own soak). `CRATONVM_JIT_IR_FP=1` opts in.
+                std::env::var_os("CRATONVM_JIT_IR_FP").is_some(),
             )?;
             let entry = compiled.entry_ptr() as usize; // Cast: JIT entry point to address
             let needs_ctx = compiled.needs_context();
@@ -18432,6 +18435,9 @@ fn try_jit_upgrade_with_gate(
         // inc 26: invokevirtual/invokeinterface → Op::Call (dynamic dispatch via
         // the helper), gated default-OFF (its own soak). `=1` opts in.
         std::env::var_os("CRATONVM_JIT_IR_CALL_VIRTUAL").is_some(),
+        // inc 30: double/float XMM value tier, gated default-OFF (its own soak).
+        // `CRATONVM_JIT_IR_FP=1` opts in.
+        std::env::var_os("CRATONVM_JIT_IR_FP").is_some(),
     )?;
     let ret = crate::jit::return_type(&cached.method_descriptor);
     let heap = compiled.needs_heap();
@@ -19008,6 +19014,9 @@ fn try_jit_compile_callee_slow(
         // inc 26: invokevirtual/invokeinterface → Op::Call (dynamic dispatch via
         // the helper), gated default-OFF (its own soak). `=1` opts in.
         std::env::var_os("CRATONVM_JIT_IR_CALL_VIRTUAL").is_some(),
+        // inc 30: double/float XMM value tier, gated default-OFF (its own soak).
+        // `CRATONVM_JIT_IR_FP=1` opts in.
+        std::env::var_os("CRATONVM_JIT_IR_FP").is_some(),
     )?;
     if std::env::var_os("CRATONVM_DBG_JITC").is_some() {
         eprintln!(
