@@ -1648,6 +1648,47 @@ on, and bt10/14/16/18 == HotSpot.
 the `i64::MIN`-return/sentinel collision, both spun off as separate tasks); then
 `double`/`float` (XMM); then long/double *call* args + returns.
 
+## Increment 28 (long *call args* — the original category-2-call-args goal) landed
+
+Status: **landed** on `dev`, under **`CRATONVM_JIT_IR_LONG`** (default-OFF).
+Delivers part of the roadmap's original "category-2 call args" item: an `Op::Call`
+may now take a **`long` argument**. This is the payoff of the inc-25..27 long
+value work — a long is now a first-class IR value, so passing one to a call is a
+marshalling question, and the answer is "one i64 slot."
+
+**What landed** (`jit/src/lib.rs`): `static_call_shape` accepts a `J` (long)
+parameter, counting it as **one** arg — the compact JIT ABI passes each parameter
+in one i64 register (`count_param_slots` already counts `J` as 1), the IR builder
+treats a long as one operand-stack node, and the `Op::Call` marshaller stores
+each arg as one i64. So **no lowerer change** was needed — a long arg is
+marshalled exactly like an int/ref. `double`/`float` args (XMM) stay rejected,
+and a `long`/`double`/`float` **return** stays rejected (a `Long.MIN_VALUE` result
+would collide with the `i64::MIN` deopt/exception sentinel — the spun-off
+out-of-band-signal task; long *returns* wait on it).
+
+**Why it's inert for the default path**: producing a long to pass requires a
+category-2 opcode (`lload`/`lconst`/`ldc2_w`/…), which trips
+`method_uses_category2`, so a long-arg-call method is only ever admitted under
+`ir_emit_long`. The `J`-arg acceptance is unreachable on the default int/ref path.
+
+**Tests** — `jit/tests/ir_vs_singlepass.rs::ir_vs_singlepass_invokestatic_long_arg`:
+`int f(long a, int n){ return g(a, n); }` executes through a stub `invoke_dispatch`
+that reads **both halves** of the long arg0 (a truncated marshalling would
+diverge) plus the int arg1. IR == host across sign/width edge cases (incl.
+`i64::MIN`, a constant with high bits set). jit lib **820/820**, differential
+**39/39**, `cratonvm-vm` builds clean.
+
+**Live soak** (`CRATONVM_JIT_IR_LONG` toggled): `scratch/irlong/IrLong4.java`
+(`f(long base)` passes `base + i` — a long — to `g(long,int)int` in a hot loop;
+both take the IR path) == HotSpot (`2336681890816`) gate-ON and gate-OFF, and
+`CRATONVM_DBG_IR_CALL` confirms the long-arg call lowers to `Op::Call`
+(non-vacuous). No regression: the inc-25/26/27 `IrLong`/`IrLong2`/`IrLong3`
+probes still == HotSpot with the gate on, and bt10/14/16/18 == HotSpot.
+
+**Remaining**: long/double call *returns* (gated on the `i64::MIN`-sentinel fix);
+`ldiv`/`lrem` (gated on long deopt-resume); then the `double`/`float` half (XMM
+registers + FP-slot deopt resume), which also unlocks `double` call args/returns.
+
 ## Implementation steps (ordered)
 
 1. **φ/branch lowering repro + fix** (Front 1.1) — unblocks everything.

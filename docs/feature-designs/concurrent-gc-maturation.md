@@ -108,8 +108,65 @@ Author note: this doc is grounded in a read of `gc/src/{g1,g1_concurrent,zgc,zgc
     read/write end-to-end). Note: the 8-byte reference-*array* read/`jit_aastore`
     path is single-word (cannot tear) and left as-is; the three STW evacuation
     Value reads are non-concurrent and unchanged.
-- Steps 5–10 — not started. Next highest-value: Step 8 (opt-in G1 gauntlet
-  validation) and Step 5 (moving-GC root-parity audit under G1).
+- **Step 5 (moving-GC root-parity audit under G1) — AUDIT DONE; 1 of 4 gaps
+  fixed, 3 documented** (branch `feat/g1-root-parity`). A 25-agent fan-out audited
+  every root/side-table category for G1-evacuation parity (each adversarially
+  verified). Core finding: the interpreter GC spine is collector-agnostic
+  (`collect_roots` → `collect_garbage` → `update_all_roots` with G1's
+  `GcResult.pointer_map`), so the large majority of sources (interpreter frames,
+  statics/mirrors/interns, monitors, native_pin_roots, native-root registry incl.
+  OscCache, weak/soft/phantom references, XNIO futures, JNI globals) have automatic
+  parity. Four genuine gaps surfaced (each verified against the code by hand):
+  - **GAP B — non-initiator JIT precise-map remap (HIGH, G1-specific) — FIXED.**
+    `apply_pointer_map_to_thread` (the path a thread parked at the STW barrier runs
+    on *itself* when it resumes) remapped frames/monitors/shadow-stack/native-pins
+    but NOT `remap_active_jit_frames` (the precise JIT oop-map RBP-chain remap the
+    initiator does at `gc.rs:73`). With `CRATONVM_PRECISE_JIT_MAPS` on, a
+    non-initiator's JIT-frame oops stayed stale after a move → UAF. G1-specific:
+    G1 moves unconditionally, while the generational collector falls back to a
+    non-moving sweep whenever any thread is in JIT (`gc_quiescence`). Fix: add the
+    thread-local `remap_active_jit_frames(pointer_map)` to
+    `apply_pointer_map_to_thread` (inert when no precise-map frame is live).
+  - **GAP A — smuggled-jobject remap skipped after CSet free (HIGH, G1-specific)
+    — DOCUMENTED, fix is non-trivial.** `value_stack::update_object_refs`'s
+    *ambiguous Long/Double smuggle arm* gates the rewrite on a POST-GC
+    `heap.is_heap_addr(old_ptr)` (value_stack.rs:1365). Under G1 the CSet region is
+    reset to `Free` during evacuation, and `is_heap_addr` skips Free regions
+    (g1.rs:2828), so a genuinely-moved jobject's old address now reads "not in
+    heap" → the rewrite is SKIPPED → stale (UAF; the JNI long-as-jobject path,
+    e.g. WildFly jboss-modules). The generational collector is safe because its
+    `young_from` is swapped, never freed, so `is_heap_addr(old_ptr)` still returns
+    `Some`. NOTE the *object-tagged* arm (value_stack.rs:1304-1325) was already
+    fixed for this (it gates on `pointer_map` membership, not `is_heap_addr` — the
+    H2 stale-stack crash). The Long/Double arm can't simply drop the guard: it
+    disambiguates a real smuggled jobject from a coincidental primitive long whose
+    bits collide with a `pointer_map` key (tested by
+    `frame.rs::update_local_refs_preserves_collision_long_matching_pointer_map_key`).
+    A correct fix keeps that disambiguation while surviving CSet-free — cleanest:
+    have G1 keep just-collected CSet address ranges queryable during the remap
+    window (a `was_in_collection_set(old_ptr)` accepted alongside `is_heap_addr`),
+    mirroring gen's "from-space still resolvable during remap". Needs its own
+    focused change + the frame.rs collision tests re-run.
+  - **GAP C — Panama/FFM upcall targets never rooted (MEDIUM, affects BOTH
+    collectors) — DOCUMENTED.** `native-builtins/src/panama.rs` UPCALL_REGISTRY
+    holds an upcall stub's target `ObjectRef` (also leaked into the libffi closure)
+    with ZERO `register_native_root_source` calls, so it is neither scanned nor
+    remapped — a moving-GC UAF on the next upcall. Not G1-specific (any moving
+    collector); manifests under G1 young because objects actually move. Fix:
+    register a native-root source (scan+remap) for the upcall registry, like
+    `oscache.rs:175`.
+  - **GAP D — ec_watch table not remapped on multi-thread GC paths (LOW,
+    diagnostic-only) — DOCUMENTED.** `ec_watch::remap` is missing from the two
+    multi-threaded initiator paths (`maybe_gc_forced`, `force_gc_with_finalizers`);
+    degrades only the debug corruption-watch, no production UAF.
+  - The synthesizer also DOWNGRADED a `monitor_on_exit` over-claim: it is reachable
+    via local-0 / class-mirror in the normal case, so it is in `pointer_map`; the
+    residual (a method overwriting local 0) is pre-existing and not G1-specific.
+  - Remaining for Step 5: implement the GAP A G1-lifecycle fix + GAP C registration,
+    and a moving-GC stress test (smuggled jobject + multi-thread precise-JIT frame
+    relocated under `-XX:+UseG1GC`) asserting no staleness.
+- Steps 6–10 — not started. Next highest-value: Step 8 (opt-in G1 gauntlet
+  validation).
 
 ---
 

@@ -1921,6 +1921,20 @@ pub(crate) fn apply_pointer_map_to_thread(
             }
         }
     }
+    // Step 5 GAP B (precise-JIT remap, non-initiator half). The GC initiator's
+    // `update_all_roots` (memory/gc.rs:73) remaps this collection's precise JIT
+    // oop-map slots via `remap_active_jit_frames`, but a thread that was PARKED at
+    // the STW barrier reaches HERE instead and was missing that call. Under a
+    // moving collector this stranded a non-initiator's JIT-frame oops at their old
+    // addresses after a relocation — a use-after-free with CRATONVM_PRECISE_JIT_MAPS
+    // on. It is specifically a G1 hazard: G1 young/mixed move unconditionally,
+    // whereas the generational collector falls back to a non-moving sweep whenever
+    // any thread is in JIT (`gc_quiescence`), so its non-initiator JIT frames never
+    // see relocation. Mirror the initiator: remap THIS resuming thread's precise
+    // JIT oop slots before the shadow stack. Thread-local (walks this thread's JIT
+    // entry chain — sound because we run on the resuming thread itself) and inert
+    // unless a precise-map frame is live, so it is a no-op on the default path.
+    crate::jit::conservative_roots::remap_active_jit_frames(pointer_map);
     // §4 (multi-thread shadow scan, remap half). Remap THIS thread's shadow-stack
     // precise roots in place, so a worker resuming from the STW barrier sees the
     // relocated addresses in the JIT registers/slots it reloads from its shadow
