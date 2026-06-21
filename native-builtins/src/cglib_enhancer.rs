@@ -623,6 +623,14 @@ struct LookupCp {
     valueof_short: u16,
     ame_class_idx: u16,
     ame_init_ref: u16,
+    // Generic by-type lookup: getBeanProvider(ResolvableType.forMethodReturnType(m)).getObject().
+    object_getclass_ref: u16,
+    class_class_idx: u16,
+    class_getsuperclass_ref: u16,
+    class_getdeclaredmethod_ref: u16,
+    rt_formethodreturntype_ref: u16,
+    getbeanprovider_rt_ref: u16,
+    objectprovider_getobject_ref: u16,
 }
 
 /// Push a small int constant (`iconst`/`bipush`/`sipush`).
@@ -793,6 +801,37 @@ pub fn build_lookup_subclass(
     let ame_class_idx = cw.add_class("java/lang/AbstractMethodError");
     let ame_init_ref = cw.add_methodref(ame_class_idx, "<init>", "()V");
 
+    // For a by-type lookup with a *generic* return type (e.g. NumberStore<Double>
+    // vs NumberStore<Float>, both erasing to NumberStore), `getBean(Class)` cannot
+    // disambiguate → NoUniqueBeanDefinitionException. Real Spring
+    // (CglibSubclassingInstantiationStrategy.LookupOverrideMethodInterceptor) uses
+    // the *generic* return type: getBeanProvider(ResolvableType.forMethodReturnType
+    // (method)).getObject(). We reflect the abstract super method to recover its
+    // generic signature (our own override carries no Signature attribute).
+    let object_getclass_ref = cw.add_methodref(object_class_idx, "getClass", "()Ljava/lang/Class;");
+    let class_class_idx = cw.add_class("java/lang/Class");
+    let class_getsuperclass_ref =
+        cw.add_methodref(class_class_idx, "getSuperclass", "()Ljava/lang/Class;");
+    let class_getdeclaredmethod_ref = cw.add_methodref(
+        class_class_idx,
+        "getDeclaredMethod",
+        "(Ljava/lang/String;[Ljava/lang/Class;)Ljava/lang/reflect/Method;",
+    );
+    let rt_class_idx = cw.add_class("org/springframework/core/ResolvableType");
+    let rt_formethodreturntype_ref = cw.add_methodref(
+        rt_class_idx,
+        "forMethodReturnType",
+        "(Ljava/lang/reflect/Method;)Lorg/springframework/core/ResolvableType;",
+    );
+    let getbeanprovider_rt_ref = cw.add_interface_methodref(
+        beanfactory_cast_idx,
+        "getBeanProvider",
+        "(Lorg/springframework/core/ResolvableType;)Lorg/springframework/beans/factory/ObjectProvider;",
+    );
+    let objectprovider_class_idx = cw.add_class("org/springframework/beans/factory/ObjectProvider");
+    let objectprovider_getobject_ref =
+        cw.add_interface_methodref(objectprovider_class_idx, "getObject", "()Ljava/lang/Object;");
+
     let cp = LookupCp {
         code_attr_name_idx,
         bf_field_ref,
@@ -812,6 +851,13 @@ pub fn build_lookup_subclass(
         valueof_short,
         ame_class_idx,
         ame_init_ref,
+        object_getclass_ref,
+        class_class_idx,
+        class_getsuperclass_ref,
+        class_getdeclaredmethod_ref,
+        rt_formethodreturntype_ref,
+        getbeanprovider_rt_ref,
+        objectprovider_getobject_ref,
     };
 
     let ctor = emit_default_ctor(
@@ -853,44 +899,72 @@ pub fn build_lookup_subclass(
         code.extend_from_slice(&b(cp.bf_field_ref));
         code.push(0xC0); // checkcast BeanFactory
         code.extend_from_slice(&b(cp.beanfactory_cast_idx));
-        // selector: name string (by name) or return Class (by type)
-        code.push(0x13); // ldc_w
-        match name_string_idx {
-            Some(s) => code.extend_from_slice(&b(s)),
-            None => code.extend_from_slice(&b(rettype_class_idx)),
-        }
         let has_args = !params.is_empty();
-        if has_args {
-            push_int(&mut code, params.len() as i32);
-            code.push(0xBD); // anewarray
-            code.extend_from_slice(&b(cp.object_class_idx));
-            let mut slot = 1u16;
-            for (i, p) in params.iter().enumerate() {
-                code.push(0x59); // dup
-                push_int(&mut code, i as i32);
-                emit_load_box(&mut code, &cp, p, slot);
-                slot += if p == "J" || p == "D" { 2 } else { 1 };
-                code.push(0x53); // aastore
-            }
-            let r = if name_string_idx.is_some() {
-                cp.getbean_name_args_ref
-            } else {
-                cp.getbean_type_args_ref
-            };
-            code.push(0xB9); // invokeinterface
-            code.extend_from_slice(&b(r));
-            code.push(0x03); // count = this + (name|class) + array
+        if name_string_idx.is_none() && !has_args {
+            // BY-TYPE, no-arg: resolve by the *generic* return type so that
+            // NumberStore<Double> vs NumberStore<Float> (both erasing to
+            // NumberStore) disambiguate, matching Spring's
+            // getBeanProvider(ResolvableType.forMethodReturnType(m)).getObject().
+            // `bf` is already on the stack. Reflect the abstract super method to
+            // recover its generic signature, then build the ResolvableType.
+            let mname_str = cw.add_string(&m.name);
+            code.push(0x2A); // aload_0
+            code.push(0xB6); // invokevirtual Object.getClass()
+            code.extend_from_slice(&b(cp.object_getclass_ref));
+            code.push(0xB6); // invokevirtual Class.getSuperclass()
+            code.extend_from_slice(&b(cp.class_getsuperclass_ref));
+            code.push(0x13); // ldc_w "<methodName>"
+            code.extend_from_slice(&b(mname_str));
+            code.push(0x03); // iconst_0
+            code.push(0xBD); // anewarray java/lang/Class  (no-arg → empty Class[])
+            code.extend_from_slice(&b(cp.class_class_idx));
+            code.push(0xB6); // invokevirtual Class.getDeclaredMethod(String, Class[])
+            code.extend_from_slice(&b(cp.class_getdeclaredmethod_ref));
+            code.push(0xB8); // invokestatic ResolvableType.forMethodReturnType(Method)
+            code.extend_from_slice(&b(cp.rt_formethodreturntype_ref));
+            code.push(0xB9); // invokeinterface BeanFactory.getBeanProvider(ResolvableType)
+            code.extend_from_slice(&b(cp.getbeanprovider_rt_ref));
+            code.push(0x02); // count = bf + resolvableType
+            code.push(0x00);
+            code.push(0xB9); // invokeinterface ObjectProvider.getObject()
+            code.extend_from_slice(&b(cp.objectprovider_getobject_ref));
+            code.push(0x01); // count = provider
             code.push(0x00);
         } else {
-            let r = if name_string_idx.is_some() {
-                cp.getbean_name_ref
+            // selector: name string (by name) or return Class (by type + args)
+            code.push(0x13); // ldc_w
+            match name_string_idx {
+                Some(s) => code.extend_from_slice(&b(s)),
+                None => code.extend_from_slice(&b(rettype_class_idx)),
+            }
+            if has_args {
+                push_int(&mut code, params.len() as i32);
+                code.push(0xBD); // anewarray
+                code.extend_from_slice(&b(cp.object_class_idx));
+                let mut slot = 1u16;
+                for (i, p) in params.iter().enumerate() {
+                    code.push(0x59); // dup
+                    push_int(&mut code, i as i32);
+                    emit_load_box(&mut code, &cp, p, slot);
+                    slot += if p == "J" || p == "D" { 2 } else { 1 };
+                    code.push(0x53); // aastore
+                }
+                let r = if name_string_idx.is_some() {
+                    cp.getbean_name_args_ref
+                } else {
+                    cp.getbean_type_args_ref
+                };
+                code.push(0xB9); // invokeinterface
+                code.extend_from_slice(&b(r));
+                code.push(0x03); // count = this + (name|class) + array
+                code.push(0x00);
             } else {
-                cp.getbean_type_ref
-            };
-            code.push(0xB9);
-            code.extend_from_slice(&b(r));
-            code.push(0x02);
-            code.push(0x00);
+                // no-arg here implies by-name (by-type no-arg took the branch above)
+                code.push(0xB9);
+                code.extend_from_slice(&b(cp.getbean_name_ref));
+                code.push(0x02);
+                code.push(0x00);
+            }
         }
         code.push(0xC0); // checkcast Ret
         code.extend_from_slice(&b(rettype_class_idx));
