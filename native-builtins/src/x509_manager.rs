@@ -2548,6 +2548,7 @@ mod tests {
             key_usage_bits: Some(KU_DIGITAL_SIGNATURE),
             ext_key_usages: &[],
             basic_constraints_ca: Some(false), // explicitly NOT a CA
+            subject_alt_dns: &[],
         });
         let anchor = mk_cert(&CertSpec {
             not_before_utc: "200101000000Z",
@@ -2939,7 +2940,6 @@ mod tests {
             key_usage_bits: Some(KU_DIGITAL_SIGNATURE),
             ext_key_usages: &[OID_KP_SERVER_AUTH],
             basic_constraints_ca: Some(false),
-            subject_alt_dns: &[],
         });
         let fake_sig = Rsa::sign_sha256(root_sk, &tbs);
         let leaf = assemble_cert(&tbs, OID_SIG_RSA_PSS, &fake_sig);

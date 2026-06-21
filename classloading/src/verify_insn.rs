@@ -19,6 +19,7 @@ use super::vtype::{return_type_from_descriptor, ClassHierarchy, VType};
 use cratonvm_types::error::LinkageError;
 
 /// The result of verifying a single instruction's type effects.
+#[derive(Debug)]
 pub struct InsnVerifyResult {
     /// Whether control falls through to the next instruction.
     pub falls_through: bool,
