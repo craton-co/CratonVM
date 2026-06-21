@@ -1182,9 +1182,7 @@ pub enum HostnameError {
     /// nothing rather than silently accept.
     EmptyHost,
     /// The leaf asserted at least one identity, but none matched the host.
-    NoMatch {
-        expected: String,
-    },
+    NoMatch { expected: String },
     /// The leaf carried no usable identity at all (no SAN dNSName/iPAddress
     /// and no commonName). RFC 6125 §6.4.4: with no presentable identity the
     /// match must fail closed.
@@ -1293,7 +1291,10 @@ fn dns_name_matches(pattern: &str, expected: &str) -> bool {
 ///      commonName with the same matching rules (legacy compatibility).
 ///   4. No usable identity / no match → fail closed.
 pub fn verify_hostname(leaf: &ParsedCert, expected_host: &str) -> Result<(), HostnameError> {
-    let host = expected_host.trim().trim_start_matches('[').trim_end_matches(']');
+    let host = expected_host
+        .trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']');
     if host.is_empty() {
         return Err(HostnameError::EmptyHost);
     }
@@ -1340,7 +1341,10 @@ pub fn verify_hostname(leaf: &ParsedCert, expected_host: &str) -> Result<(), Hos
 /// leaf asserts that identity. This does NOT re-run chain trust — call
 /// `validate_chain` first (or alongside); endpoint identity is an *additional*
 /// gate on top of a trusted chain, never a replacement for it.
-pub fn check_endpoint_identity(chain: &[Vec<u8>], expected_host: &str) -> Result<(), HostnameError> {
+pub fn check_endpoint_identity(
+    chain: &[Vec<u8>],
+    expected_host: &str,
+) -> Result<(), HostnameError> {
     let leaf_der = chain.first().ok_or(HostnameError::NoIdentity)?;
     let leaf = parse_certificate(leaf_der).map_err(|_| HostnameError::NoIdentity)?;
     verify_hostname(&leaf, expected_host)
@@ -2972,7 +2976,10 @@ mod tests {
     #[test]
     fn san_dns_names_are_parsed_lowercased() {
         let leaf = leaf_with_san("ignored", &["WWW.Example.COM", "api.example.com"]);
-        assert_eq!(leaf.san_dns_names, vec!["www.example.com", "api.example.com"]);
+        assert_eq!(
+            leaf.san_dns_names,
+            vec!["www.example.com", "api.example.com"]
+        );
     }
 
     #[test]

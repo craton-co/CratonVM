@@ -1007,8 +1007,8 @@ fn register_pe_memory_segment(r: &mut NativeMethodRegistry) {
                         // checked address arithmetic, so the `+ bytes` cannot
                         // wrap a u64.
                         let bytes_u64 = bytes as u64;
-                        let overlap = s < d.saturating_add(bytes_u64)
-                            && d < s.saturating_add(bytes_u64);
+                        let overlap =
+                            s < d.saturating_add(bytes_u64) && d < s.saturating_add(bytes_u64);
                         // SAFETY: addresses are non-null, bounds-checked against
                         // segment sizes, and bytes is bounded by MAX_COPY_SIZE.
                         // Overlapping ranges use `copy` (memmove), which is

@@ -420,7 +420,8 @@ impl ReferenceProcessor {
         // is "live" if the collector already marked it OR it is reachable from
         // a to-be-finalized object. Phases 3-4 keep using the raw `is_marked`
         // snapshot so finalizers/phantoms are still discovered correctly.
-        let soft_is_live = |addr: usize| -> bool { is_marked(addr) || finalizer_live.contains(&addr) };
+        let soft_is_live =
+            |addr: usize| -> bool { is_marked(addr) || finalizer_live.contains(&addr) };
 
         // Phase 1 (soft) honours the finalizer-reachable closure.
         self.process_soft_refs(&soft_is_live, free_heap_mb, current_time_ms);
@@ -2032,7 +2033,7 @@ mod tests {
         let mut proc = ReferenceProcessor::new_with_policy(1000);
         proc.discover_reference(ReferenceType::Soft, 0x100, 0x200, Some(0x180));
         proc.touch_soft_reference(0x100, 5000); // soft ref survives
-        // Weak ref to a totally unrelated dead object, not reachable from 0x200.
+                                                // Weak ref to a totally unrelated dead object, not reachable from 0x200.
         proc.discover_reference(ReferenceType::Weak, 0x300, 0x999, Some(0x400));
 
         let trace = |roots: &[usize]| -> Vec<usize> { roots.to_vec() }; // 0x200 -> {0x200}

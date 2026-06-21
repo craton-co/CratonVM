@@ -3694,7 +3694,8 @@ fn enforce_lookup_access(
     }
 
     let kind = if is_field { "field" } else { "method" };
-    let owner = crate::lang_class::mirror_class_name(ctx, target).unwrap_or_else(|| "?".to_string());
+    let owner =
+        crate::lang_class::mirror_class_name(ctx, target).unwrap_or_else(|| "?".to_string());
     Err(
         cratonvm_types::error::RuntimeError::IllegalAccessException {
             message: format!(

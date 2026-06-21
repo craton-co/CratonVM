@@ -61,9 +61,7 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::Mutex;
 
 use cratonvm_vm::config::VmConfig;
-use cratonvm_vm::native::jni::{
-    clear_jni_context, get_java_vm, get_jni_env, set_jni_context_arc,
-};
+use cratonvm_vm::native::jni::{clear_jni_context, get_java_vm, get_jni_env, set_jni_context_arc};
 use cratonvm_vm::vm::Vm;
 
 // ---------------------------------------------------------------------------
@@ -986,8 +984,7 @@ pub extern "C" fn cratonvm_invoke_static(
                     // SAFETY: checked `args` non-null and `n_args > 0` above.
                     std::slice::from_raw_parts(args, n_args as usize)
                 };
-                let values: Vec<Value> =
-                    in_args.iter().map(|v| v.to_value(&h.vm.shared)).collect();
+                let values: Vec<Value> = in_args.iter().map(|v| v.to_value(&h.vm.shared)).collect();
 
                 match h.vm.invoke(class, method, sig, &values) {
                     Ok(Some(v)) => CratonValue::from_value(&h.vm.shared, v),

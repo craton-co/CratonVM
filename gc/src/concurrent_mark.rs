@@ -405,11 +405,13 @@ impl ConcurrentMarker {
 
         let mut count = 0;
         for &root_ptr in roots {
-            if !root_ptr.is_null() && old_gen.contains(root_ptr)
-                && self.bitmap.try_mark(root_ptr as usize) {
-                    self.queue.push(root_ptr);
-                    count += 1;
-                }
+            if !root_ptr.is_null()
+                && old_gen.contains(root_ptr)
+                && self.bitmap.try_mark(root_ptr as usize)
+            {
+                self.queue.push(root_ptr);
+                count += 1;
+            }
         }
 
         // Activate SATB barrier for the concurrent phase.
@@ -472,20 +474,21 @@ impl ConcurrentMarker {
         // gate is allowed to go INACTIVE. See the closing block.
         let satb_entries = self.satb_queue.drain();
         for addr in satb_entries {
-            if addr != 0 && old_gen.contains(addr as *const u8)
-                && self.bitmap.try_mark(addr) {
-                    self.queue.push(addr as *mut u8);
-                    discovered += 1;
-                }
+            if addr != 0 && old_gen.contains(addr as *const u8) && self.bitmap.try_mark(addr) {
+                self.queue.push(addr as *mut u8);
+                discovered += 1;
+            }
         }
 
         // Re-scan roots (some may have changed during concurrent mark).
         for &root_ptr in roots {
-            if !root_ptr.is_null() && old_gen.contains(root_ptr)
-                && self.bitmap.try_mark(root_ptr as usize) {
-                    self.queue.push(root_ptr);
-                    discovered += 1;
-                }
+            if !root_ptr.is_null()
+                && old_gen.contains(root_ptr)
+                && self.bitmap.try_mark(root_ptr as usize)
+            {
+                self.queue.push(root_ptr);
+                discovered += 1;
+            }
         }
 
         // Drain the queue fully (mark transitive closure from new roots),
@@ -517,11 +520,10 @@ impl ConcurrentMarker {
         // reaps the stragglers. Either way the bitmap is final on exit.
         let late_entries = self.satb_queue.deactivate_and_drain();
         for addr in late_entries {
-            if addr != 0 && old_gen.contains(addr as *const u8)
-                && self.bitmap.try_mark(addr) {
-                    self.queue.push(addr as *mut u8);
-                    discovered += 1;
-                }
+            if addr != 0 && old_gen.contains(addr as *const u8) && self.bitmap.try_mark(addr) {
+                self.queue.push(addr as *mut u8);
+                discovered += 1;
+            }
         }
         // Mark the transitive closure of any late entries (again with the
         // overflow fallback). The gate is INACTIVE now, but mutators are
@@ -1364,10 +1366,7 @@ mod tests {
             h.gc_flags = 0x01;
         }
 
-        let marker = Arc::new(ConcurrentMarker::new(
-            og.base_ptr() as usize,
-            og.capacity(),
-        ));
+        let marker = Arc::new(ConcurrentMarker::new(og.base_ptr() as usize, og.capacity()));
         // The marker must be in the concurrent-mark phase so its bitmap is live.
         marker.initial_mark(&[ptr_a], &og);
 
