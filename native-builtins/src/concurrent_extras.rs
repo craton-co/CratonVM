@@ -379,27 +379,28 @@ fn value_to_bits(v: Value) -> (i64, u8) {
 }
 
 /// Decode a PRIMITIVE / null slot payload back into a `Value`. Tag 1
-/// (Object) only ever round-trips here for the `bits == 0` null case in
-/// the unit tests — live Object items are stored in/read from field 0 of
-/// the owning queue object, never reconstructed from a raw `bits` pointer
-/// (bug nb-concurrent-extras). The alignment guard keeps a stray pointer
-/// degrading to null instead of UB if `bits` is ever non-zero.
+/// (Object) only ever round-trips here for the `bits == 0` null case —
+/// live Object items are stored in/read from field 0 of the owning queue
+/// object, never reconstructed from a raw `bits` pointer
+/// (bug nb-concurrent-extras).
+///
+/// SECURITY (review 2026-06-20): we deliberately do NOT fabricate an
+/// `ObjectRef` from the raw integer `bits` for tag 1. An integer guarded
+/// only by alignment is not a proof of heap membership — a stale, hostile,
+/// or garbage value would become a dereferenceable reference (use-after-free
+/// / arbitrary-address read). The production deposit path NEVER stashes a
+/// non-zero Object pointer in the slot (see [`deposit_item`]), so the only
+/// legitimate tag-1 payload is the null sentinel. Any non-zero tag-1 `bits`
+/// is therefore by definition illegitimate and is degraded to null rather
+/// than reconstructed. This keeps the decode total and pointer-fabrication
+/// free; legitimate Object items are forwarded via the GC-tracked mirror
+/// field 0 in [`consume_item`].
 fn bits_to_value(bits: i64, tag: u8) -> Value {
     match tag {
-        1 => {
-            if bits == 0 {
-                Value::Object(None)
-            } else {
-                let ptr = bits as usize as *mut u8;
-                if ptr.is_null() || (ptr as usize) % 8 != 0 {
-                    Value::Object(None)
-                } else {
-                    // SAFETY: defensive only; the production deposit path
-                    // never stores a non-zero Object pointer here.
-                    unsafe { Value::Object(Some(ObjectRef::from_raw(ptr))) }
-                }
-            }
-        }
+        // Object slot: the only legitimate in-slot payload is the null
+        // sentinel (`bits == 0`). A non-zero value is never a live heap
+        // reference here — refuse to fabricate an `ObjectRef` from it.
+        1 => Value::Object(None),
         2 => Value::Int(bits as i32),
         3 => Value::Long(bits),
         _ => Value::Object(None),
@@ -797,6 +798,21 @@ mod tests {
         assert_eq!(tag, 1);
         assert_eq!(bits, 0);
         assert_eq!(bits_to_value(bits, tag), Value::Object(None));
+    }
+
+    /// SECURITY (review 2026-06-20): a non-zero tag-1 (Object) payload must
+    /// NEVER be turned into a dereferenceable `ObjectRef`. An arbitrary /
+    /// hostile integer that merely happens to be 8-byte aligned must still
+    /// decode to null, not a fabricated reference.
+    #[test]
+    fn bits_to_value_object_never_fabricates_pointer() {
+        // Aligned but arbitrary integer — would previously pass the
+        // alignment-only guard and become a bogus ObjectRef.
+        assert_eq!(bits_to_value(0x4000_1000, 1), Value::Object(None));
+        // Misaligned / null all degrade to null too.
+        assert_eq!(bits_to_value(0x4000_1001, 1), Value::Object(None));
+        assert_eq!(bits_to_value(-1, 1), Value::Object(None));
+        assert_eq!(bits_to_value(0, 1), Value::Object(None));
     }
 
     #[test]
