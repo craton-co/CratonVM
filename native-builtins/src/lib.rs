@@ -41974,8 +41974,10 @@ fn value_to_format_string(ctx: &mut dyn NativeContext, val: Value) -> String {
     match val {
         Value::Int(v) => v.to_string(),
         Value::Long(v) => v.to_string(),
-        Value::Float(v) => format!("{}", v),
-        Value::Double(v) => format!("{}", v),
+        // Java-spec float/double rendering (matches Double.toString), not raw
+        // Rust `{}` which omits ".0", prints "inf"/"-0", and never uses E-notation.
+        Value::Float(v) => format_float(v),
+        Value::Double(v) => format_double(v),
         Value::Object(None) => "null".to_string(),
         Value::Object(Some(o)) => ctx.read_string(o).unwrap_or_else(|| "object".to_string()),
         _ => "?".to_string(),
