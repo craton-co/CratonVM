@@ -52,7 +52,7 @@ These need the app's test classpath (KRun / JUnitCore + the suite jars); see eac
 | `spring-bug-11-…` (Groovy hang residual) | `org.springframework.scripting.groovy.GroovyScriptEvaluatorTests` |
 | `bug06-fam6-…` (2 GB OOM) | `org.springframework.core.annotation.AnnotationUtilsTests` (small `-Xmx` to fail fast) |
 | `kafka-bug-B-mockstatic-capturing-lambda-jit` | `ksuite/repro/MockClientUtils.java` (Kafka clients + Mockito cp) |
-| `keycloak-credentialmodel-jit-…` | keycloak `…CredentialModel.getAdditionalParameters()` path (kcfull report 18) |
+| `keycloak-credentialmodel-jit-…` | keycloak `…CredentialModel.getAdditionalParameters()` path (kcfull report 18). **Standalone repros `keycloak-credentialmodel-jit/{LazyNull,EaRepro}.java` are negative controls** — they show the bare lazy-init shape is compiled correctly by both backends (escape-analysis hypothesis refuted 2026-06-21; needs the real Jackson-deser caller context). |
 | `hibernate-jaxb-classloading-bytebuddy-bootstrap-slow` | `org.hibernate.orm.test.hql.HQLTest` (Hibernate suite, `@common.args`) |
 | `hibernate-deserialization-sessionfactory-reconnect-null` | `…jpa.serialization.EntityManagerDeserializationTest` |
 | `reactor-worker-thread-leak-at-shutdown` | `org.elasticsearch.client.RestClient*IntegTests` (intermittent) |

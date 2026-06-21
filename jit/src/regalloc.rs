@@ -121,7 +121,20 @@ pub(crate) fn bc_len(code: &[u8], pc: usize) -> usize {
         | 0xc7 => 3,
         0xbb => 3,
         0xc5 => 4,
-        0xb9 => 5,
+        // 5-byte instructions: invokeinterface (0xb9: opcode, cp_hi, cp_lo,
+        // count, 0), invokedynamic (0xba: opcode, cp_hi, cp_lo, 0, 0), and the
+        // wide-offset branches goto_w (0xc8) / jsr_w (0xc9: opcode + 4-byte
+        // signed offset). Only `invokeinterface` is currently reachable here;
+        // `invokedynamic`, `goto_w`, and `jsr_w` are rejected by `jit_scan`
+        // (its catch-all returns `None`), so no compiled method contains them
+        // today — but, exactly as for `wide` (0xc4) below, the length table
+        // must stay correct as defense-in-depth so every PC-stepping consumer
+        // (liveness/`bc_len`, branch-target precompute, DCE, OSR/unroll, oop
+        // maps) stays in lockstep if any of them is ever accepted. A missing
+        // entry under-counts the instruction by 4 bytes and desyncs the walk —
+        // the same class of liveness-desync miscompile that the missing-`ldc`
+        // bug caused. Keep the x64.rs `bytecode_len_at` twin in sync.
+        0xb9 | 0xba | 0xc8 | 0xc9 => 5,
         // wide (0xc4) — prefix modifies the following opcode to use a 2-byte
         // local index. JVMS §6.5 wide: `wide <opcode> <indexbyte1> <indexbyte2>`
         // is 4 bytes for the load/store/ret family, and `wide iinc <index>
@@ -1223,6 +1236,22 @@ mod tests {
         assert_eq!(bc_len(&[0x11, 0x12, 0x34], 0), 3, "sipush");
         assert_eq!(bc_len(&[0xa8, 0x00, 0x10], 0), 3, "jsr");
         assert_eq!(bc_len(&[0xa9, 0x04], 0), 2, "ret");
+    }
+
+    // Defense-in-depth (same class as the missing-`ldc` CM-FASTMATH bug): the
+    // 5-byte instructions invokeinterface (0xb9), invokedynamic (0xba), goto_w
+    // (0xc8) and jsr_w (0xc9). Only invokeinterface is reachable today (the
+    // other three are rejected by `jit_scan`), but a missing length entry
+    // under-counts the instruction by 4 bytes and desyncs every PC-stepping
+    // walk — so all four must read 5, and must match the x64.rs
+    // `bytecode_len_at` twin. Operand bytes are dummies; `bc_len` only reads
+    // `code[pc]` for these arms.
+    #[test]
+    fn bc_len_five_byte_ops() {
+        assert_eq!(bc_len(&[0xb9, 0x00, 0x10, 0x02, 0x00], 0), 5, "invokeinterface");
+        assert_eq!(bc_len(&[0xba, 0x00, 0x10, 0x00, 0x00], 0), 5, "invokedynamic");
+        assert_eq!(bc_len(&[0xc8, 0x00, 0x00, 0x00, 0x10], 0), 5, "goto_w");
+        assert_eq!(bc_len(&[0xc9, 0x00, 0x00, 0x00, 0x10], 0), 5, "jsr_w");
     }
 
     // CM-FASTMATH end-to-end regression: the exact bytecode shape of

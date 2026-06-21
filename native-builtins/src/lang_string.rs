@@ -1141,22 +1141,12 @@ pub(crate) fn native_string_value_of_int(
 
 /// Format a double like Java does (no trailing zeros for integers, etc.)
 pub(crate) fn format_double(v: f64) -> String {
-    if v == f64::INFINITY {
-        "Infinity".to_string()
-    } else if v == f64::NEG_INFINITY {
-        "-Infinity".to_string()
-    } else if v.is_nan() {
-        "NaN".to_string()
-    } else {
-        // Java uses minimal representation
-        let s = format!("{v}");
-        // Ensure there's always a decimal point (Java does "1.0" not "1")
-        if !s.contains('.') {
-            format!("{s}.0")
-        } else {
-            s
-        }
-    }
+    // Java's `Double.toString` layout (incl. the 10^-3..10^7 scientific-notation
+    // threshold) lives in the shared `cratonvm_types` formatter so every copy
+    // stays correct. The old local `format!("{v}")` never used E-notation, so
+    // large/small magnitudes (1e7, 1e-4, 1e300, Double.MAX_VALUE) printed in
+    // full decimal instead of "1.0E7"/"1.0E-4"/... .
+    cratonvm_types::java_double_to_string(v)
 }
 
 // ---------------------------------------------------------------------------
@@ -2415,20 +2405,8 @@ pub(crate) fn native_sb_ensure_cap(
 
 /// Format a float like Java does.
 pub(crate) fn format_float(v: f32) -> String {
-    if v == f32::INFINITY {
-        "Infinity".to_string()
-    } else if v == f32::NEG_INFINITY {
-        "-Infinity".to_string()
-    } else if v.is_nan() {
-        "NaN".to_string()
-    } else {
-        let s = format!("{v}");
-        if !s.contains('.') {
-            format!("{s}.0")
-        } else {
-            s
-        }
-    }
+    // See `format_double` — shared with the scientific-notation threshold fix.
+    cratonvm_types::java_float_to_string(v)
 }
 
 // ---------------------------------------------------------------------------

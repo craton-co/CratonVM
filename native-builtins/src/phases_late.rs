@@ -4523,29 +4523,23 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             let other = obj_arg(args, 1)?;
             let base = p57_read_path(ctx, this);
             let target = p57_read_path(ctx, other);
-            // Simplified: use std::path for relativization
-            let base_path = std::path::Path::new(&base);
-            let target_path = std::path::Path::new(&target);
-            let relative = target_path
-                .strip_prefix(base_path)
-                .map(|p| p.to_string_lossy().to_string())
-                .unwrap_or_else(|_| target.clone());
-            // Separator-normalize the result. `strip_prefix` returns a
-            // SLICE of `target`, so the relative path keeps whatever
-            // separators the caller's strings used (often '/') while the
-            // real WindowsPath.toString() renders '\' and zipfs renders
-            // '/'. JUnit5's ClasspathScanner does
-            // `relativize(...).toString().replace(fs.getSeparator(), ".")`
-            // — a separator mismatch silently no-ops the replace, package
-            // names keep slashes, and every scanned class fails the
-            // package filter (classpath-root discovery found 0 tests).
-            let relative = if jarfs_decode(&base).is_some() || jarfs_decode(&target).is_some() {
-                relative.replace('\\', "/")
-            } else if cfg!(windows) {
-                relative.replace('/', "\\")
-            } else {
-                relative
-            };
+            // jar-FS: entries form a forward-prefix namespace, so `strip_prefix`
+            // suffices. JUnit5's ClasspathScanner does
+            // `relativize(...).toString().replace(fs.getSeparator(), ".")`, which
+            // needs the zipfs '/' separator, so keep '/' for jar paths.
+            if jarfs_decode(&base).is_some() || jarfs_decode(&target).is_some() {
+                let relative = std::path::Path::new(&target)
+                    .strip_prefix(std::path::Path::new(&base))
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_else(|_| target.clone())
+                    .replace('\\', "/");
+                let result = p57_alloc_path(ctx, &relative);
+                return Ok(Some(Value::Object(Some(result))));
+            }
+            // Host paths: compute the real relative path (with `..` backtracking)
+            // off the shared root, not just a forward strip_prefix. Falls back to
+            // `target` when the roots differ (can't be relativized).
+            let relative = p57_relativize(&base, &target).unwrap_or_else(|| target.clone());
             let result = p57_alloc_path(ctx, &relative);
             Ok(Some(Value::Object(Some(result))))
         },
@@ -6798,25 +6792,13 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         },
     );
 
+    // Route through the shared root-aware `p57_normalize_path` (keeps the root
+    // and leading `..` on relative paths) instead of an inline `..`-pop that
+    // dropped the drive root. This is the last-registered (winning) `normalize`.
     r.register(path, "normalize", "()Ljava/nio/file/Path;", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let p = p57_read_path(ctx, this);
-        // Simple normalize: resolve . and ..
-        let mut parts: Vec<&str> = Vec::new();
-        for part in p.split('/') {
-            match part {
-                "." | "" => {}
-                ".." => {
-                    parts.pop();
-                }
-                other => parts.push(other),
-            }
-        }
-        let normalized = if p.starts_with('/') {
-            format!("/{}", parts.join("/"))
-        } else {
-            parts.join("/")
-        };
+        let normalized = p57_normalize_path(&p);
         let result = p57_alloc_path(ctx, &normalized);
         Ok(Some(Value::Object(Some(result))))
     });
@@ -7571,6 +7553,49 @@ mod p57_win_path_tests {
     }
 }
 
+#[cfg(test)]
+mod p57_normalize_relativize_tests {
+    //! `Path.normalize()` / `Path.relativize()` vs HotSpot (JDK 25, via the
+    //! `PathDeep` repro). Helpers emit `/`-canonical internal form.
+    use super::{p57_normalize_path, p57_relativize};
+
+    #[test]
+    fn normalize_preserves_root_and_leading_dotdot() {
+        // `..` must not pop above the root.
+        assert_eq!(p57_normalize_path("C:/a/../../b"), "C:/b");
+        assert_eq!(p57_normalize_path("C:/.."), "C:/");
+        assert_eq!(p57_normalize_path("//s/sh/a/.."), "//s/sh/");
+        // Leading `..` on a relative path is kept.
+        assert_eq!(p57_normalize_path("../../a"), "../../a");
+        assert_eq!(p57_normalize_path("a/../../b"), "../b");
+        // Ordinary collapses.
+        assert_eq!(p57_normalize_path("C:/a/./b/.."), "C:/a");
+        assert_eq!(p57_normalize_path("a/./b/.."), "a");
+        assert_eq!(p57_normalize_path("a/../b"), "b");
+        assert_eq!(p57_normalize_path("C:/a/b"), "C:/a/b");
+        // Drive-relative root retained with no separator before the first name.
+        assert_eq!(p57_normalize_path("C:a/../b"), "C:b");
+    }
+
+    #[test]
+    fn relativize_backtracks_with_dotdot() {
+        assert_eq!(p57_relativize("C:/a/b", "C:/a/x").as_deref(), Some("../x"));
+        assert_eq!(p57_relativize("a/b/c", "a/b").as_deref(), Some(".."));
+        assert_eq!(
+            p57_relativize("C:/a/b", "C:/a/b/c/d").as_deref(),
+            Some("c/d")
+        );
+        assert_eq!(p57_relativize("C:/a", "C:/a").as_deref(), Some(""));
+        assert_eq!(p57_relativize("a/b", "a/b/c").as_deref(), Some("c"));
+        // Case-insensitive common-prefix match on Windows.
+        #[cfg(windows)]
+        assert_eq!(p57_relativize("C:/A/b", "C:/a/x").as_deref(), Some("../x"));
+        // Different roots → None (caller falls back to target).
+        assert_eq!(p57_relativize("C:/a", "D:/b"), None);
+        assert_eq!(p57_relativize("C:/a", "rel/b"), None);
+    }
+}
+
 fn p57_alloc_path(ctx: &mut dyn NativeContext, path: &str) -> ObjectRef {
     // 2 fields: [0] = path String, [1] = owning FileSystem (P57_PATH_FS_FIELD,
     // null unless set by `FileSystem.getPath`).
@@ -7959,27 +7984,91 @@ fn p57_read_to_string(p: &str) -> std::io::Result<String> {
     Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
+/// `Path.normalize()` — collapse `.`/`..` per the JDK contract. Two rules the
+/// previous naive `split('/')`+unconditional-`pop` version got wrong:
+///   * a `..` must **not** pop above the root: `C:\a\..\..\b` → `C:\b` (not `b`),
+///     `C:\..` → `C:\` (not empty). The drive/UNC/`\` root is preserved.
+///   * a leading `..` on a **relative** path is **kept** (it can't be resolved
+///     without a base): `..\..\a` → `..\..\a` (not `a`).
+/// Output is `/`-canonical (the internal form; `p57_alloc_path` folds, `toString`
+/// renders the host separator), so this is platform-neutral.
 fn p57_normalize_path(path: &str) -> String {
     if let Some((jar, entry)) = jarfs_decode(path) {
         return jarfs_encode(&jar, &p57_normalize_path(&entry));
     }
-    let sep = '/';
-    let mut parts: Vec<&str> = Vec::new();
-    for part in path.split(sep) {
-        match part {
-            "" | "." => {}
-            ".." => {
-                parts.pop();
-            }
-            _ => parts.push(part),
+    let (root, names) = p57_parse_win_root(path);
+    let has_root = root.is_some();
+    let mut stack: Vec<&str> = Vec::new();
+    for name in &names {
+        match name.as_str() {
+            "." => {}
+            ".." => match stack.last() {
+                // A real name precedes the `..` → cancel the pair.
+                Some(&top) if top != ".." => {
+                    stack.pop();
+                }
+                // Nothing to cancel: keep `..` only for a relative path; for a
+                // rooted path a `..` at the root is discarded (can't go above it).
+                _ => {
+                    if !has_root {
+                        stack.push("..");
+                    }
+                }
+            },
+            other => stack.push(other),
         }
     }
-    let result = parts.join("/");
-    if path.starts_with(sep) {
-        format!("/{}", result)
-    } else {
-        result
+    // Reconstruct in '/'-form. The root already carries its trailing separator
+    // for absolute/UNC roots; a drive-relative root (`C:`) carries none, so the
+    // first name attaches directly.
+    let mut out = match root {
+        Some(r) => r.replace('\\', "/"),
+        None => String::new(),
+    };
+    for (i, name) in stack.iter().enumerate() {
+        if i > 0 {
+            out.push('/');
+        }
+        out.push_str(name);
     }
+    out
+}
+
+/// `Path.relativize(other)` — construct a relative path that, resolved against
+/// `base`, yields `target`. The previous `strip_prefix` version only handled the
+/// case where `target` is *under* `base`; when backtracking is needed it wrongly
+/// returned `target` unchanged. Compute `..` × (base-tail) + target-tail off the
+/// shared root prefix. Returns `None` (caller falls back to `target`) when the
+/// two paths have different roots / absoluteness, which can't be relativized.
+/// Output is `/`-canonical and relative (no root).
+fn p57_relativize(base: &str, target: &str) -> Option<String> {
+    let (rb, bn) = p57_parse_win_root(base);
+    let (rt, tn) = p57_parse_win_root(target);
+    // Roots must match (case-insensitively, matching WindowsPath); one absolute
+    // and one relative cannot be relativized.
+    let norm_root = |r: &Option<String>| r.as_ref().map(|s| s.to_ascii_lowercase());
+    if norm_root(&rb) != norm_root(&rt) {
+        return None;
+    }
+    let name_eq = |a: &str, b: &str| {
+        if cfg!(windows) {
+            a.eq_ignore_ascii_case(b)
+        } else {
+            a == b
+        }
+    };
+    let mut common = 0;
+    while common < bn.len() && common < tn.len() && name_eq(&bn[common], &tn[common]) {
+        common += 1;
+    }
+    let mut parts: Vec<&str> = Vec::new();
+    for _ in common..bn.len() {
+        parts.push("..");
+    }
+    for name in &tn[common..] {
+        parts.push(name);
+    }
+    Some(parts.join("/"))
 }
 
 /// Resolve `other` against `base` as per `Path.resolve()` semantics:

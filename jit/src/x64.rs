@@ -1701,7 +1701,19 @@ fn bytecode_len_at(code: &[u8], pc: usize) -> usize {
         | 0xc7 => 3,
         0xbb => 3, // new
         0xc5 => 4,
-        0xb9 => 5, // invokeinterface: opcode, cp_hi, cp_lo, count, 0
+        // 5-byte instructions. invokeinterface (0xb9: opcode, cp_hi, cp_lo,
+        // count, 0) is the only one reachable today; invokedynamic (0xba:
+        // opcode, cp_hi, cp_lo, 0, 0) and the wide-offset branches goto_w
+        // (0xc8) / jsr_w (0xc9: opcode + 4-byte signed offset) are rejected by
+        // `jit_scan` (catch-all → `None`), so no compiled method contains them
+        // — but, like `wide` (0xc4) below, the length table must stay correct
+        // as defense-in-depth so every PC-stepping consumer (branch-target
+        // precompute, DCE, OSR/unroll, instruction-start map, oop-map dataflow)
+        // stays in lockstep if any is ever accepted. A missing entry
+        // under-counts by 4 bytes and misaligns the walk — the same class of
+        // bug as the previously-absent `ldc`. Keep the regalloc.rs `bc_len`
+        // twin in sync.
+        0xb9 | 0xba | 0xc8 | 0xc9 => 5,
         // wide (0xc4) — prefix modifies the following opcode to use a 2-byte
         // local index. JVMS §6.5 wide: `wide <opcode> <indexbyte1> <indexbyte2>`
         // is 4 bytes for the load/store/ret family, and `wide iinc <index>
@@ -27642,6 +27654,14 @@ mod tests {
         assert_eq!(bytecode_len_at(&[0xb6, 0x00, 0x01], 0), 3); // invokevirtual
         assert_eq!(bytecode_len_at(&[0xb7, 0x00, 0x01], 0), 3); // invokespecial
         assert_eq!(bytecode_len_at(&[0xb9, 0x00, 0x01, 0x02, 0x00], 0), 5); // invokeinterface
+        // Defense-in-depth (same class as the missing-`ldc` desync): the other
+        // 5-byte ops. invokedynamic / goto_w / jsr_w are rejected by `jit_scan`
+        // today, but the length table must stay correct so a future acceptance
+        // can't silently desync every PC-stepping walk. Must match the
+        // regalloc.rs `bc_len` twin's `bc_len_five_byte_ops`.
+        assert_eq!(bytecode_len_at(&[0xba, 0x00, 0x01, 0x00, 0x00], 0), 5); // invokedynamic
+        assert_eq!(bytecode_len_at(&[0xc8, 0x00, 0x00, 0x00, 0x10], 0), 5); // goto_w
+        assert_eq!(bytecode_len_at(&[0xc9, 0x00, 0x00, 0x00, 0x10], 0), 5); // jsr_w
     }
 
     #[test]
