@@ -642,6 +642,27 @@ fn register_datasource_runtime_config(registry: &mut NativeMethodRegistry) {
 /// that relies on these hooks as "booted far enough to dispatch", not "fully
 /// started".
 fn register_application_lifecycle(registry: &mut NativeMethodRegistry) {
+    // CRATONVM_REAL_QUARKUS_START (Keycloak Gap 9): run the REAL Quarkus lifecycle.
+    // `Application.start([String])` is a concrete `final` method on the abstract
+    // `io.quarkus.runtime.Application` that locks + calls the generated
+    // `ApplicationImpl.doStart([String])` — the RUNTIME_INIT phase that runs the
+    // STARTUP_TASKS: the Vert.x HTTP server LISTEN, the datasource connect, etc.
+    // The default no-op shim below SKIPS this entirely (the STATIC_INIT deploy steps
+    // in `ApplicationImpl.<clinit>` still run — ArC/RESTEasy-metadata/Hibernate — which
+    // is why the boot reaches RESTEasy deploy, but the HTTP server never starts and
+    // `start()` "succeeds" so main parks in `waitForExit`). With the gate set we
+    // suppress the no-op so the real `start()`→`doStart()` bytecode runs (the generated
+    // deploy bytecode already runs for `<clinit>` — see Gaps 4–7 — so `doStart` is the
+    // same kind of bytecode). Opt-in while the RUNTIME_INIT path is validated; pairs with
+    // CRATONVM_REAL_AGROAL / CRATONVM_REAL_VERTX / CRATONVM_REAL_NET_SOCKETS.
+    if std::env::var_os("CRATONVM_REAL_QUARKUS_START").is_some() {
+        if std::env::var_os("CRATONVM_DBG").is_some() {
+            eprintln!(
+                "[cratonvm] CRATONVM_REAL_QUARKUS_START: NOT registering Application.start/stop/awaitShutdown no-ops — real Quarkus lifecycle (doStart RUNTIME_INIT) will run"
+            );
+        }
+        return;
+    }
     let __prev_cat = registry.current_category();
     registry.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
     // COMPATIBILITY SHIM (see fn doc): override the lifecycle entry points

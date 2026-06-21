@@ -2017,7 +2017,11 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // T19.10: Infinispan local-mode cache (DefaultCacheManager + Cache).
     infinispan_local::register_infinispan_natives(registry);
     // T19.6: Vert.x / Netty NioEventLoop affinity scheduler natives.
-    vertx_eventloop::register_vertx_eventloop_natives(registry);
+    // Under CRATONVM_REAL_VERTX the synthetic loop is suppressed so the real Netty
+    // NioEventLoop.run() drives Selector.select() over our selector (see real_vertx).
+    if !real_vertx() {
+        vertx_eventloop::register_vertx_eventloop_natives(registry);
+    }
     // T19.2.e: WildFly Datasources subsystem + Narayana JTA glue.
     wildfly_datasources_tx::register_wildfly_datasources_tx_natives(registry);
     // T19.H2: StackWalker boot-time getInstance variants + getCallerClass.
@@ -40412,6 +40416,20 @@ pub fn real_proxy_super() -> bool {
 pub fn real_agroal() -> bool {
     std::env::var_os("CRATONVM_REAL_AGROAL").is_some()
         && std::env::var_os("CRATONVM_SYNTHETIC_AGROAL").is_none()
+}
+
+/// Vert.x / Netty event loop (Keycloak Gap 9). Under `CRATONVM_REAL_VERTX` the
+/// synthetic `vertx_eventloop` natives (`VertxImpl.init`, `NioEventLoop.run` /
+/// `execute` / `schedule` / ...) are suppressed so the REAL Netty
+/// `NioEventLoopGroup` / `SingleThreadEventExecutor` / `NioEventLoop.run()`
+/// bytecode runs, driving `Selector.select()` over CratonVM's own selector (see
+/// the `WEPollSelectorProvider` routing in `native-io`). The synthetic loop runs
+/// only tasks/timers and does NOT poll the selector, so a real Vert.x HTTP server
+/// binds but never accepts. Opt-in while the real path is validated; flips to
+/// opt-out (`CRATONVM_SYNTHETIC_VERTX`) once green by default, mirroring `real_agroal`.
+pub fn real_vertx() -> bool {
+    std::env::var_os("CRATONVM_REAL_VERTX").is_some()
+        && std::env::var_os("CRATONVM_SYNTHETIC_VERTX").is_none()
 }
 
 /// The internal name of the super class generated `$ProxyN` proxies extend,
