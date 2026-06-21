@@ -1744,6 +1744,14 @@ impl IrBuilder {
                         let ty = match ret_type {
                             b'V' => IrType::Void,
                             b'L' | b'[' => IrType::Ref,
+                            // A `J` (long) return is a 64-bit value node so
+                            // downstream category-2 ops (lstore/lreturn/ladd/…)
+                            // type-check; `static_call_shape` only admits `J`
+                            // returns once the i64::MIN-sentinel collision is
+                            // disambiguated at the call site (see `Op::Call`
+                            // lowering). `D`/`F` returns stay rejected by the
+                            // shape gate until the XMM value tier exists.
+                            b'J' => IrType::Long,
                             _ => IrType::Int,
                         };
                         let call = self.graph.add(Op::Call { info_ptr }, ty, inputs, Some(pc));
@@ -1813,6 +1821,11 @@ impl IrBuilder {
                     let ty = match ret_type {
                         b'V' => IrType::Void,
                         b'L' | b'[' => IrType::Ref,
+                        // A `J` (long) return is a 64-bit value node so
+                        // downstream category-2 ops type-check; `static_call_shape`
+                        // only admits `J` returns once the i64::MIN-sentinel
+                        // collision is disambiguated at the call site.
+                        b'J' => IrType::Long,
                         _ => IrType::Int,
                     };
                     let call = self.graph.add(Op::Call { info_ptr }, ty, inputs, Some(pc));
@@ -1846,6 +1859,11 @@ impl IrBuilder {
                     let ty = match ret_type {
                         b'V' => IrType::Void,
                         b'L' | b'[' => IrType::Ref,
+                        // A `J` (long) return is a 64-bit value node so
+                        // downstream category-2 ops type-check; `static_call_shape`
+                        // only admits `J` returns once the i64::MIN-sentinel
+                        // collision is disambiguated at the call site.
+                        b'J' => IrType::Long,
                         _ => IrType::Int,
                     };
                     let call = self.graph.add(Op::Call { info_ptr }, ty, inputs, Some(pc));

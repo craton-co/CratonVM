@@ -94,6 +94,7 @@ fn helpers() -> JitRuntimeHelpers {
         shadow_stack_offset_in_thread: 0,
         throw_exception: s,
         jit_npe_with_action: s,
+        dispatch_threw: s,
     }
 }
 

@@ -5979,9 +5979,11 @@ pub fn static_call_shape(descriptor: &str) -> Option<(usize, u8)> {
             // an int/ref. Only reachable under `ir_emit_long` (producing a long
             // requires a category-2 opcode → `method_uses_category2`), so this is
             // inert for the default int/ref path. `double`/`float` args (XMM) are
-            // still rejected; a `long`/`double`/`float` RETURN is still rejected
-            // below (a `Long.MIN_VALUE` result would collide with the `i64::MIN`
-            // deopt sentinel — deferred to the out-of-band-signal fix).
+            // still rejected; a `double`/`float` RETURN is still rejected below
+            // (needs the XMM value tier). A `long` (`J`) RETURN is now accepted
+            // (post-inc-29): the `Long.MIN_VALUE`/`i64::MIN` deopt-sentinel
+            // collision is disambiguated at the call site via the out-of-band
+            // `dispatch_threw` peek (see `ir_lower.rs::Op::Call`).
             b'J' => {
                 num_args += 1;
                 i += 1;
@@ -6017,7 +6019,15 @@ pub fn static_call_shape(descriptor: &str) -> Option<(usize, u8)> {
     let ret = return_type(descriptor);
     match ret {
         b'I' | b'Z' | b'B' | b'C' | b'S' | b'V' | b'L' | b'[' => Some((num_args, ret)),
-        // J / D / F return — not handled.
+        // `J` (long) return: accepted post-inc-29. The result is one i64 slot in
+        // RAX (the compact JIT ABI); the IR builder types the `Op::Call` node as
+        // `IrType::Long`, and the call-site post-invoke check disambiguates a
+        // legitimate `Long.MIN_VALUE` return from the `i64::MIN` deopt sentinel
+        // via the out-of-band `dispatch_threw` peek. Only reachable under
+        // `ir_emit_long` (consuming a long result needs a category-2 opcode), so
+        // inert for the default int/ref path.
+        b'J' => Some((num_args, ret)),
+        // `D` / `F` return — still rejected (needs the XMM value tier).
         _ => None,
     }
 }

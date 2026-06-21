@@ -73,6 +73,10 @@ fn dummy_helpers() -> JitRuntimeHelpers {
         shadow_stack_offset_in_thread: 0,
         throw_exception: s,
         jit_npe_with_action: s,
+        // Panic stub by default: only consulted on a J/D call's `RAX == i64::MIN`
+        // branch, which no existing test reaches. The long-return tests below
+        // override this per-test with a real returns-0/1 stub.
+        dispatch_threw: s,
     }
 }
 
@@ -1711,6 +1715,140 @@ fn ir_vs_singlepass_invokestatic_long_arg() {
             "long-arg marshalling (full 64-bit) for a={a}, n={n}"
         );
     }
+}
+
+// ── J (long) call RETURNS — the i64::MIN-sentinel disambiguation (post-inc-29) ──
+//
+// `static_call_shape` now accepts a `J` return, so an `Op::Call` may produce a
+// long result in RAX. The dispatch helper signals a callee exception/deopt by
+// returning the `i64::MIN` sentinel — which is bit-identical to a legitimate
+// `Long.MIN_VALUE` return. These tests pin the call-site disambiguation: on the
+// `RAX == i64::MIN` branch the JIT consults the out-of-band `dispatch_threw`
+// peek, bailing ONLY when a genuine exception/deopt is pending and otherwise
+// keeping the real value. The methods do a trailing `+ 1` after the call so the
+// "kept the value (then +1)" and "bailed (returned the sentinel unchanged)"
+// outcomes are observably different.
+
+#[test]
+fn ir_vs_singlepass_invokestatic_long_return() {
+    // static long f(long a, long b) { return g(a, b) + 1; }   // g:(JJ)J
+    //   lload_0; lload_2; invokestatic #2; lconst_1; ladd; lreturn
+    // Common path (RAX != i64::MIN): a variety of long results — including
+    // negative and full-64-bit values — must round-trip through the `JNE .keep`
+    // fast path untouched. `dispatch_threw` must NEVER be consulted here.
+    unsafe extern "C" fn sum_dispatch(_vm: i64, _info: i64, args_ptr: i64, num_args: i64) -> i64 {
+        assert_eq!(num_args, 2, "sum_dispatch expects (long, long)");
+        let p = args_ptr as *const i64;
+        (*p).wrapping_add(*p.add(1)) // full 64-bit long sum
+    }
+    unsafe extern "C" fn poison_threw() -> i64 {
+        panic!("dispatch_threw must not run when the call result is not i64::MIN");
+    }
+    let mut helpers = dummy_helpers();
+    helpers.invoke_dispatch = sum_dispatch as *const () as usize;
+    helpers.dispatch_threw = poison_threw as *const () as usize;
+    let code = vec![0x1e, 0x20, 0xb8, 0x00, 0x02, 0x0a, 0x61, 0xad];
+    let cm = cached("f", "(JJ)J", code, 4, 2);
+    let resolver = |cp: u16| -> Option<(String, String, String)> {
+        if cp == 2 {
+            Some(("pkg/Helper".into(), "g".into(), "(JJ)J".into()))
+        } else {
+            None
+        }
+    };
+    let ir = compile_with_dispatch(&cm, &helpers, &resolver)
+        .expect("IR compile of long-returning invokestatic method");
+    assert!(ir.needs_context());
+    let dummy_vm = [0u8; 64];
+    for (a, b) in [
+        (3i64, 4i64),
+        (-5, 2),
+        (0x0123_4567_89ab_cdefu64 as i64, 0x10),
+        (i64::MAX, 0), // sum = MAX (not the sentinel)
+        (-1, -1),      // sum = -2 (high bit set, not the sentinel)
+    ] {
+        // SAFETY: finalized Op::Call body taking (vm, long a, long b); the dummy
+        // VM buffer is never dereferenced by the stub.
+        let r = unsafe { ir.try_call_with_context(dummy_vm.as_ptr() as i64, &[a, b]) }
+            .unwrap_or_else(|e| panic!("call a={a},b={b}: {e:?}"));
+        assert_eq!(
+            r,
+            a.wrapping_add(b).wrapping_add(1),
+            "long-return common path for a={a}, b={b}"
+        );
+    }
+}
+
+#[test]
+fn ir_vs_singlepass_invokestatic_long_return_min_value_legit() {
+    // The collision case: a callee that LEGITIMATELY returns Long.MIN_VALUE
+    // (== i64::MIN) must NOT be misread as the deopt/exception sentinel.
+    // `dispatch_threw` reports "no signal pending" (0), so the caller keeps the
+    // value and runs the trailing `+ 1` → MIN_VALUE + 1. Pre-fix this returned
+    // i64::MIN (the caller silently bailed at the call, skipping the `+ 1`).
+    //   static long f(long a, long b) { return g(a, b) + 1; }
+    unsafe extern "C" fn min_value_dispatch(_vm: i64, _i: i64, _a: i64, _n: i64) -> i64 {
+        i64::MIN // a real Long.MIN_VALUE result — no exception
+    }
+    unsafe extern "C" fn never_threw() -> i64 {
+        0 // no exception/deopt pending
+    }
+    let mut helpers = dummy_helpers();
+    helpers.invoke_dispatch = min_value_dispatch as *const () as usize;
+    helpers.dispatch_threw = never_threw as *const () as usize;
+    let code = vec![0x1e, 0x20, 0xb8, 0x00, 0x02, 0x0a, 0x61, 0xad];
+    let cm = cached("f", "(JJ)J", code, 4, 2);
+    let resolver = |cp: u16| -> Option<(String, String, String)> {
+        if cp == 2 {
+            Some(("pkg/Helper".into(), "g".into(), "(JJ)J".into()))
+        } else {
+            None
+        }
+    };
+    let ir = compile_with_dispatch(&cm, &helpers, &resolver).expect("compile");
+    let dummy_vm = [0u8; 64];
+    let r = unsafe { ir.try_call_with_context(dummy_vm.as_ptr() as i64, &[1, 2]) }.expect("call");
+    assert_eq!(
+        r,
+        i64::MIN.wrapping_add(1),
+        "a legitimate Long.MIN_VALUE return must be kept (then +1), not bailed as a deopt"
+    );
+}
+
+#[test]
+fn ir_vs_singlepass_invokestatic_long_return_min_value_exception() {
+    // The genuine-sentinel case: the callee threw, so the dispatch helper
+    // returns i64::MIN AND `dispatch_threw` reports a pending signal (1). The
+    // caller must BAIL — propagate the sentinel unchanged, skipping the trailing
+    // `+ 1` — so the VM's post-JIT path routes the pending exception.
+    //   static long f(long a, long b) { return g(a, b) + 1; }
+    unsafe extern "C" fn throwing_dispatch(_vm: i64, _i: i64, _a: i64, _n: i64) -> i64 {
+        i64::MIN // the deopt/exception sentinel
+    }
+    unsafe extern "C" fn did_throw() -> i64 {
+        1 // a real exception/deopt is pending
+    }
+    let mut helpers = dummy_helpers();
+    helpers.invoke_dispatch = throwing_dispatch as *const () as usize;
+    helpers.dispatch_threw = did_throw as *const () as usize;
+    let code = vec![0x1e, 0x20, 0xb8, 0x00, 0x02, 0x0a, 0x61, 0xad];
+    let cm = cached("f", "(JJ)J", code, 4, 2);
+    let resolver = |cp: u16| -> Option<(String, String, String)> {
+        if cp == 2 {
+            Some(("pkg/Helper".into(), "g".into(), "(JJ)J".into()))
+        } else {
+            None
+        }
+    };
+    let ir = compile_with_dispatch(&cm, &helpers, &resolver).expect("compile");
+    let dummy_vm = [0u8; 64];
+    let r = unsafe { ir.try_call_with_context(dummy_vm.as_ptr() as i64, &[1, 2]) }.expect("call");
+    assert_eq!(
+        r,
+        i64::MIN,
+        "a throwing callee (i64::MIN + pending signal) must bail and propagate the sentinel \
+         (the trailing +1 must NOT run)"
+    );
 }
 
 #[test]

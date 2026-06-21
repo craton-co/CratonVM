@@ -1965,18 +1965,36 @@ has its own flag/soak.
 The single consolidated to-do for whoever picks this up next. Increments 1–29
 are landed and (where flagged) default-ON. What remains, in dependency order:
 
-1. **`i64::MIN`-return / deopt-sentinel fix** *(unblocks long/double call returns;
-   own task)*. The JIT returns `i64::MIN` in RAX as the universal deopt/exception
-   sentinel (`x64.rs` epilogue + the `Op::Call` bail check; interpreter.rs post-JIT
-   dispatch does `CMP RAX, i64::MIN; JE`). A method that legitimately returns
-   `Long.MIN_VALUE` is misread as deoptimized → silently re-executed (side effects
-   can double). **Pre-existing in BOTH backends** (single-pass already compiles
-   long-returning methods), found by the inc-26 adversarial review. Fix: signal
-   deopt/exception **out-of-band** (a TLS flag the helper sets, checked *before*
-   inspecting RAX, like the pending-NPE/AIOOBE flags) for `J`/`D` returns. Spun
-   off as a background task (see commit history / `spawn_task`). Once fixed,
-   relax `static_call_shape` to accept `J`/`D` *returns* and the
-   `lreturn`/`dreturn` paths are fully safe.
+1. ✅ **`i64::MIN`-return / deopt-sentinel fix** *(unblocks `long` call returns)* —
+   **DONE** (branch `feat/ir-long-return-sentinel`). The JIT returns `i64::MIN`
+   in RAX as the universal deopt/exception sentinel, so a method legitimately
+   returning `Long.MIN_VALUE` was indistinguishable from a deopt. The
+   interpreter↔JIT boundary was already disambiguated by the inc-26 MEDIUM fix
+   (the out-of-band `JIT_DEOPT_PENDING` flag + `deopt_signaled` gate); this
+   increment closes the remaining **JIT→JIT `Op::Call` bail check** the same way:
+   - New `dispatch_threw` runtime helper (`jit-api` golden table slot 42 →
+     `vm/jit/helpers.rs::jit_dispatch_threw`): a **non-clearing peek** of every
+     out-of-band signal (pending exception / NPE / AIOOBE / `JIT_DEOPT_PENDING` /
+     a stashed IR-deopt frame via `deopt::has_last_deopt`).
+   - At a `J`/`D` call site BOTH backends now emit, only on the rare
+     `RAX == i64::MIN` branch, a `CALL dispatch_threw`: bail (propagate the
+     sentinel) iff it returns `1`, else keep the genuine `Long.MIN_VALUE`. The
+     int/ref/void path is the unchanged `CMP; JE` (byte-identical).
+     (`jit/src/ir_lower.rs` `Op::Call`; `jit/src/x64.rs`
+     `emit_post_invoke_exception_check(ret_type)`.)
+   - The IR builder types a `J` call result as `IrType::Long` (was `Int`), and
+     `static_call_shape` now accepts a `J` return.
+   - Validated: 3 differential tests (`ir_vs_singlepass_invokestatic_long_return*`)
+     + a `jit_dispatch_threw` peek unit test; E2E `Long.MIN_VALUE`-returning
+     callers `== HotSpot` on BOTH backends (IR-on and `CRATONVM_JIT_IR_CALL=0`).
+   - **Remaining gaps:** (a) `D`/`F` *returns* stay rejected by `static_call_shape`
+     until the XMM value tier (item 3) — the sentinel machinery already handles
+     them (`IrType::Double` is in the call-site check). (b) single-pass's
+     *self-recursive* call site passes `b'I'` (the method descriptor is not
+     threaded into the single-pass `Compiler`), so a self-recursive `long`/`double`
+     method that legitimately returns `Long.MIN_VALUE` retains the pre-existing
+     collision at that one site only — a rare corner (cross-method J/D calls, the
+     real unblock, go through the disambiguated dispatch/direct sites).
 
 2. **`ldiv`/`lrem`** — ✅ **DONE**. The IR pipeline lowers `ldiv` (0x6d) /
    `lrem` (0x71) and a `long` can be live at the div-by-zero deopt guard. Of the

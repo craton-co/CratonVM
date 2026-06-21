@@ -92,6 +92,12 @@ struct Lowerer<'a> {
     /// Address of the `jit_invoke_dispatch` runtime helper (baked into each
     /// `Op::Call` site as `MOV RAX,imm64 ; CALL RAX`). 0 if no calls.
     invoke_dispatch: usize,
+    /// Address of the `jit_dispatch_threw` peek helper. Baked into a `J`/`D`
+    /// (long/double) call site's post-invoke check on the rare `RAX == i64::MIN`
+    /// branch to disambiguate a genuine callee exception/deopt from a legitimate
+    /// `Long.MIN_VALUE` return (see `lower_call`'s sentinel sequence). 0 if no
+    /// calls / not wired (int/ref/void sites never consult it).
+    dispatch_threw: usize,
     /// True iff the graph contains an `Op::Call` — then the method takes the VM
     /// context pointer as a hidden first argument (`try_call_with_context`), and
     /// the prologue stores it to `context_slot_off` + shifts the Java params.
@@ -179,6 +185,7 @@ impl<'a> Lowerer<'a> {
             deopt_stub_patches: Vec::new(),
             deopt_boxes: Vec::new(),
             invoke_dispatch: helpers.invoke_dispatch,
+            dispatch_threw: helpers.dispatch_threw,
             needs_context,
             context_slot_off,
             args_stage_top_off,
@@ -1159,13 +1166,52 @@ impl<'a> Lowerer<'a> {
                                                                             // 3. MOV RAX, invoke_dispatch ; CALL RAX.
                 self.emit_mov_reg_imm64(RAX, self.invoke_dispatch as u64);
                 self.buf.emit(&[0xFF, 0xD0]);
-                // 4. Exception sentinel: CMP RAX, i64::MIN ; JE bail_stub.
+                // 4. Exception sentinel. The dispatch helper returns `i64::MIN`
+                //    when the callee threw/deopted. For an int/ref/void return
+                //    that is unambiguous (no legitimate result is `i64::MIN`), so
+                //    a plain `CMP RAX, i64::MIN; JE bail` suffices. For a `J`/`D`
+                //    (long/double) return a legitimate `Long.MIN_VALUE` result is
+                //    bit-identical to the sentinel, so on the (rare)
+                //    `RAX == i64::MIN` branch we peek the out-of-band signal via
+                //    `jit_dispatch_threw`: bail only when a genuine exception/
+                //    deopt is pending, else keep the real value. (Only `J` is
+                //    currently reachable — `static_call_shape` still rejects
+                //    `D`/`F` returns until the XMM value tier.)
                 self.emit_mov_reg_imm64(R10, i64::MIN as u64);
                 self.buf.emit(&[0x4C, 0x39, 0xD0]); // CMP RAX, R10
-                self.buf.emit(&[0x0F, 0x84]); // JE rel32 (patched to the stub)
-                let patch = self.buf.pos();
-                self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
-                self.call_exc_patches.push(patch);
+                if matches!(node.ty, IrType::Long | IrType::Double) {
+                    // JNE .keep — common path: not the sentinel, keep real RAX.
+                    self.buf.emit(&[0x0F, 0x85]);
+                    let keep_patch = self.buf.pos();
+                    self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
+                    // Cold: RAX == i64::MIN. Peek whether a real exception/deopt
+                    // is pending — MOV RAX, dispatch_threw ; CALL RAX (RAX = 0/1).
+                    self.emit_mov_reg_imm64(RAX, self.dispatch_threw as u64);
+                    self.buf.emit(&[0xFF, 0xD0]);
+                    // TEST RAX, RAX — ZF=1 iff no signal pending (legit value).
+                    self.buf.emit(&[0x48, 0x85, 0xC0]);
+                    // Restore the sentinel/value into RAX before branching: the
+                    // shared bail stub returns RAX unchanged (so it must be
+                    // `i64::MIN`), and the keep path needs the genuine
+                    // `Long.MIN_VALUE`. `MOV` does not disturb ZF.
+                    self.emit_mov_reg_imm64(RAX, i64::MIN as u64);
+                    // JNE bail_stub — ZF==0 ⇒ exception/deopt ⇒ propagate sentinel.
+                    self.buf.emit(&[0x0F, 0x85]);
+                    let patch = self.buf.pos();
+                    self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
+                    self.call_exc_patches.push(patch);
+                    // .keep: patch the JNE above to land here.
+                    let keep_off = self.buf.pos();
+                    let rel = keep_off as i32 - (keep_patch as i32 + 4);
+                    self.buf
+                        .try_patch_i32(keep_patch, rel)
+                        .expect("ir_lower call-sentinel keep patch in-bounds");
+                } else {
+                    self.buf.emit(&[0x0F, 0x84]); // JE rel32 (patched to the stub)
+                    let patch = self.buf.pos();
+                    self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
+                    self.call_exc_patches.push(patch);
+                }
                 // 5. Spill the return value (harmless for a void call: the slot
                 //    is allocated but never read).
                 self.store_rax(slot);

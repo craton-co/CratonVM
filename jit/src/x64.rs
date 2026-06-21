@@ -13341,17 +13341,56 @@ impl Compiler {
     ///
     /// RAX is caller-saved and already clobbered by the dispatch call, so
     /// using R10 as the `i64::MIN` scratch is safe here.
-    fn emit_post_invoke_exception_check(&mut self) {
+    ///
+    /// `ret_type` is the callee's JVM return-descriptor byte. For an int/ref/
+    /// void return (`i64::MIN` is never a legitimate result) the check is the
+    /// plain `CMP RAX, i64::MIN; JE bail` and stays byte-identical to before.
+    /// For a `J`/`D` (long/double) return a legitimate `Long.MIN_VALUE` result
+    /// is bit-identical to the sentinel, so on the (rare) `RAX == i64::MIN`
+    /// branch we peek the out-of-band signal via `jit_dispatch_threw`
+    /// (`self.helpers.dispatch_threw`): bail only when a genuine exception/deopt
+    /// is pending, else restore the real value and continue. This is what makes
+    /// dispatching a `J`/`D`-returning callee sound (a `Pack.bigEndianToLong`
+    /// SHA-512 word == `0x8000_0000_0000_0000` would otherwise be misread as a
+    /// deopt and the caller would silently bail mid-method).
+    fn emit_post_invoke_exception_check(&mut self, ret_type: u8) {
         // MOV R10, i64::MIN  (49 BA <imm64>)
         self.buf.emit(&[0x49, 0xBA]);
         self.buf.emit(&(i64::MIN as u64).to_le_bytes()); // Cast: x86-64 immediate encoding
                                                          // CMP RAX, R10  (4C 39 D0)
         self.buf.emit(&[0x4C, 0x39, 0xD0]);
-        // JE rel32 → shared exception-check stub (patched later)
-        self.buf.emit(&[0x0F, 0x84]);
-        let patch_offset = self.buf.pos();
-        self.buf.emit(&[0x00, 0x00, 0x00, 0x00]); // placeholder rel32
-        self.exception_check_stubs.push(patch_offset);
+        if matches!(ret_type, b'J' | b'D') {
+            // JNE .keep (0F 85 rel32) — common path: not the sentinel, keep RAX.
+            self.buf.emit(&[0x0F, 0x85]);
+            let keep_patch = self.buf.pos();
+            self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
+            // Cold: RAX == i64::MIN. Peek whether a genuine exception/deopt is
+            // pending — MOV RAX, dispatch_threw ; CALL RAX (RAX = 0/1). The
+            // imm64-baked address is loop-unroll copy-safe (no rel32 to track).
+            self.emit_mov_imm64(RAX, self.helpers.dispatch_threw as i64); // Cast: helper address
+            self.buf.emit(&[0xFF, 0xD0]); // CALL RAX
+                                          // TEST RAX, RAX (48 85 C0) — ZF=1 iff no signal (legit value).
+            self.buf.emit(&[0x48, 0x85, 0xC0]);
+            // Restore the legit `Long.MIN_VALUE` into RAX for the keep path; the
+            // shared bail stub reloads `i64::MIN` itself, so this is harmless on
+            // the bail path. MOV does not disturb ZF.
+            self.emit_mov_imm64(RAX, i64::MIN);
+            // JNE bail_stub (0F 85 rel32) — pending ⇒ propagate the sentinel.
+            self.buf.emit(&[0x0F, 0x85]);
+            let patch_offset = self.buf.pos();
+            self.buf.emit(&[0x00, 0x00, 0x00, 0x00]); // placeholder rel32
+            self.exception_check_stubs.push(patch_offset);
+            // .keep: patch the JNE above to land here (self-relative ⇒ copy-safe).
+            let keep_off = self.buf.pos();
+            let rel = (keep_off as i32) - (keep_patch as i32 + 4); // Cast: rel32 displacement
+            self.buf.try_patch_i32(keep_patch, rel).ok(); // on Err sets buf.overflowed; compile bails
+        } else {
+            // JE rel32 → shared exception-check stub (patched later)
+            self.buf.emit(&[0x0F, 0x84]);
+            let patch_offset = self.buf.pos();
+            self.buf.emit(&[0x00, 0x00, 0x00, 0x00]); // placeholder rel32
+            self.exception_check_stubs.push(patch_offset);
+        }
     }
 
     /// Emit the post-allocation OOM guard, immediately after an allocation
@@ -18659,7 +18698,7 @@ impl Compiler {
                             // segfaults. Deopt out so the interpreter routes
                             // the stashed exception through the exception
                             // table instead.
-                            self.emit_post_invoke_exception_check();
+                            self.emit_post_invoke_exception_check(ret_type);
 
                             if ret_type != b'V' {
                                 if matches!(ret_type, b'D' | b'F') {
@@ -18747,7 +18786,7 @@ impl Compiler {
                         // pointer segfaults (the Tomcat boot regression).
                         // Deopt out so the interpreter routes the stashed
                         // exception through the method's exception table.
-                        self.emit_post_invoke_exception_check();
+                        self.emit_post_invoke_exception_check(info_ref.return_type);
 
                         // Reclaim spill slots used for invoke args AND the
                         // popped arg values — see `post_pop_spill` above.
@@ -18851,7 +18890,20 @@ impl Compiler {
                         // hazard as the direct/dispatch invokestatic paths
                         // above. Guard it so the sentinel is never pushed
                         // (and never tagged as an oop) as a return value.
-                        self.emit_post_invoke_exception_check();
+                        //
+                        // The callee here IS this method, so its return type is
+                        // the method's own — but single-pass does not thread the
+                        // method descriptor into the Compiler, so we pass `b'I'`
+                        // (the plain `CMP; JE` check, byte-identical to before).
+                        // Consequence: a self-recursive `long`/`double` method
+                        // that *legitimately* returns `Long.MIN_VALUE` retains
+                        // the pre-existing `i64::MIN` collision at THIS site
+                        // only. That is a rare corner (cross-method J/D calls —
+                        // the real unblock — go through the dispatch/direct sites
+                        // above, which ARE disambiguated). Left as a documented
+                        // follow-up rather than threading a new descriptor param
+                        // through every `x64::compile` caller.
+                        self.emit_post_invoke_exception_check(b'I');
                         self.push_from_rax();
                     }
                     pc += 3;
@@ -20055,7 +20107,7 @@ impl Compiler {
                             // A directly-called compiled callee that throws (or
                             // deopts) returns the `i64::MIN` sentinel. Propagate
                             // the deopt instead of running on with a bogus value.
-                            self.emit_post_invoke_exception_check();
+                            self.emit_post_invoke_exception_check(ret_type);
 
                             if ret_type != b'V' {
                                 if matches!(ret_type, b'D' | b'F') {
@@ -20812,7 +20864,7 @@ impl Compiler {
                             // downstream secondary failure. The guard deopts
                             // out so the interpreter routes the exception
                             // through this method's exception table.
-                            self.emit_post_invoke_exception_check();
+                            self.emit_post_invoke_exception_check(info_ref.return_type);
 
                             // Reclaim spill slots used for invoke args AND the
                             // popped arg values — restoring to `pre_pop_spill`
@@ -22548,6 +22600,7 @@ mod tests {
             shadow_stack_offset_in_thread: 0,
             throw_exception: sentinel,
             jit_npe_with_action: sentinel,
+            dispatch_threw: sentinel,
         }
     }
 
