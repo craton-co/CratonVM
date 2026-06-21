@@ -4085,6 +4085,13 @@ pub fn try_compile(
     // single-pass. Gated default-OFF behind `CRATONVM_JIT_IR_CALL` at the VM
     // call sites until it soaks.
     ir_emit_calls: bool,
+    // inc 24 (Gap B): `true` additionally lets the IR builder lower a resolved
+    // non-`<init>` `invokespecial` (private / `super.` / non-virtual instance
+    // call) to `Op::Call`, with the receiver marshalled as arg0 and
+    // `invoke_kind == 1`. `false` (the default) keeps every `invokespecial`
+    // on single-pass (the builder bails). Gated default-OFF behind
+    // `CRATONVM_JIT_IR_CALL_SPECIAL` at the VM call sites until it soaks.
+    ir_emit_special_calls: bool,
 ) -> Option<CompiledMethod> {
     // round-7 fix (bug 1): short-circuit re-attempts on methods the
     // backend already permanently bailed on.  Avoids ~50µs of wasted
@@ -4136,6 +4143,7 @@ pub fn try_compile(
         cp_elidable_init_resolver,
         optimize,
         ir_emit_calls,
+        ir_emit_special_calls,
         &mut backend_attempted,
     );
 
@@ -4267,6 +4275,9 @@ fn try_compile_inner(
     // Gap B: enable lowering of int-only `invokestatic` in oop-free methods to
     // `Op::Call`. See `try_compile`. Default-OFF at the VM call sites.
     ir_emit_calls: bool,
+    // inc 24 (Gap B): additionally lower resolved non-`<init>` `invokespecial`
+    // to `Op::Call`. See `try_compile`. Default-OFF at the VM call sites.
+    ir_emit_special_calls: bool,
     // round-7 fix (bug 1): set to `true` immediately before invoking
     // the heavy `x64::compile` path so the outer wrapper can tell a
     // permanent backend bail (worth bail-listing) from an early
@@ -4475,17 +4486,24 @@ fn try_compile_inner(
         // `CompiledMethod` below so the baked `info_ptr`s outlive the code.
         let mut ir_call_infos: Vec<Box<JitInvokeInfo>> = Vec::new();
         let mut ir_call_strings: Vec<Box<str>> = Vec::new();
-        if ir_emit_calls && !scan.invoke_ops.is_empty() {
+        if (ir_emit_calls || ir_emit_special_calls) && !scan.invoke_ops.is_empty() {
             if let Some(resolver) = cp_invoke_resolver {
                 let call_eligible = scan.new_ops.is_empty() && scan.anewarray_ops.is_empty();
                 if call_eligible {
                     let mut info_map = std::collections::HashMap::new();
                     let mut all_emittable = true;
                     for &(pc, cp_idx, opcode) in &scan.invoke_ops {
-                        // Only invokestatic (0xb8); any other invoke kind keeps
-                        // the whole method on single-pass (the builder bails on
-                        // an invoke with no `invoke_info` entry).
-                        if opcode != 0xb8 {
+                        // Admit `invokestatic` (under `ir_emit_calls`) and
+                        // resolved non-`<init>` `invokespecial` (inc 24, under
+                        // `ir_emit_special_calls`). Any other invoke kind
+                        // (virtual / interface) or a disabled gate keeps the
+                        // whole method on single-pass — the builder bails on an
+                        // invoke with no `invoke_info` entry.
+                        let is_static = opcode == 0xb8;
+                        let is_special = opcode == 0xb7;
+                        if !((is_static && ir_emit_calls)
+                            || (is_special && ir_emit_special_calls))
+                        {
                             all_emittable = false;
                             break;
                         }
@@ -4496,13 +4514,30 @@ fn try_compile_inner(
                                 break;
                             }
                         };
-                        let (num_args, ret) = match static_call_shape(&desc) {
+                        // A `<init>` `invokespecial` is never a real `Op::Call`
+                        // here: a constructor is only ever handled by the
+                        // scalar-new elision path (`trivial_init_pcs`), and
+                        // eliding vs. calling a ctor are different transforms.
+                        // (Belt-and-braces — a `<init>`-bearing method also has
+                        // a `new`, so `call_eligible` is already false.)
+                        if is_special && mn == "<init>" {
+                            all_emittable = false;
+                            break;
+                        }
+                        let (desc_args, ret) = match static_call_shape(&desc) {
                             Some(t) => t,
                             None => {
                                 all_emittable = false;
                                 break;
                             }
                         };
+                        // `invokespecial` marshals the receiver as arg0 (a
+                        // reference → one GPR slot), so it carries one more JIT
+                        // arg than its descriptor lists; `invokestatic` has no
+                        // receiver. `invoke_kind`: 1 = invokespecial (non-
+                        // virtual dispatch to the resolved target), 3 = static.
+                        let num_args = desc_args + if is_special { 1 } else { 0 };
+                        let invoke_kind: u8 = if is_special { 1 } else { 3 };
                         let class_box: Box<str> = cn.into_boxed_str();
                         let method_box: Box<str> = mn.into_boxed_str();
                         let desc_box: Box<str> = desc.into_boxed_str();
@@ -4518,7 +4553,7 @@ fn try_compile_inner(
                             descriptor: unsafe { &*desc_ref },
                             num_jit_args: num_args,
                             return_type: ret,
-                            invoke_kind: 3, // invokestatic
+                            invoke_kind,
                         });
                         let info_ptr = &*info as *const JitInvokeInfo as usize;
                         ir_call_infos.push(info);
@@ -4527,7 +4562,7 @@ fn try_compile_inner(
                     if all_emittable && !info_map.is_empty() {
                         if std::env::var_os("CRATONVM_DBG_IR_CALL").is_some() {
                             eprintln!(
-                                "[cratonvm-ircall] {}.{}{}: emitting {} invokestatic Op::Call(s)",
+                                "[cratonvm-ircall] {}.{}{}: emitting {} invoke(static/special) Op::Call(s)",
                                 cached.class_name,
                                 cached.method_name,
                                 cached.method_descriptor,
@@ -5720,7 +5755,7 @@ mod tests {
         IR_LOWER_COMPILES.with(|c| c.set(0));
         let c2 = try_compile(
             &cached, None, None, None, None, None, None, None, None, None, &helpers, None, None,
-            None, None, true, false,
+            None, None, true, false, false,
         );
         let c2_used_ir = IR_LOWER_COMPILES.with(|c| c.get());
         assert!(c2.is_some(), "optimize=true (C2) must compile `add`");
@@ -5733,7 +5768,7 @@ mod tests {
         IR_LOWER_COMPILES.with(|c| c.set(0));
         let c1 = try_compile(
             &cached, None, None, None, None, None, None, None, None, None, &helpers, None, None,
-            None, None, false, false,
+            None, None, false, false, false,
         );
         let c1_used_ir = IR_LOWER_COMPILES.with(|c| c.get());
         assert!(
@@ -5814,6 +5849,7 @@ mod tests {
             None,
             true,
             false,
+            false,
         );
         assert!(c2.is_some(), "optimize=true (C2) must compile `get`");
         assert_eq!(
@@ -5829,7 +5865,7 @@ mod tests {
         IR_LOWER_COMPILES.with(|c| c.set(0));
         let _ = try_compile(
             &cached, None, None, None, None, None, None, None, None, None, &helpers, None, None,
-            None, None, true, false,
+            None, None, true, false, false,
         );
         assert_eq!(
             IR_LOWER_COMPILES.with(|c| c.get()),
@@ -6248,6 +6284,7 @@ mod tests {
             Some(&elidable),
             true,
             false,
+            false,
         );
         assert!(r.is_some(), "an elidable `new` method must compile via IR");
         assert_eq!(
@@ -6275,6 +6312,7 @@ mod tests {
             None,
             None,
             true,
+            false,
             false,
         );
         assert_eq!(
@@ -6344,6 +6382,7 @@ mod tests {
             None,
             true, // optimize
             true, // ir_emit_calls
+            false, // ir_emit_special_calls (testing invokestatic, not special)
         );
         assert!(
             with.is_some(),
@@ -6379,11 +6418,94 @@ mod tests {
             None,
             true,  // optimize
             false, // ir_emit_calls OFF
+            false, // ir_emit_special_calls OFF
         );
         assert_eq!(
             IR_LOWER_COMPILES.with(|c| c.get()),
             0,
             "without ir_emit_calls, invokestatic must NOT take the IR pipeline"
+        );
+    }
+
+    /// inc 24 (Gap B): a resolved non-`<init>` `invokespecial` routes through the
+    /// IR pipeline ONLY when `ir_emit_special_calls` is on — independent of
+    /// `ir_emit_calls` (which gates invokestatic). The two toggles are crossed
+    /// here to prove the SPECIAL flag alone admits invokespecial. Guards against
+    /// a vacuous validation: single-pass ALSO dispatches invokespecial, so
+    /// result-equality alone (the integration harness) would not prove the IR
+    /// path ran.
+    #[test]
+    fn ir_special_call_wiring_routes_through_ir_only_with_flag() {
+        use std::sync::Arc;
+
+        // `static int f(Obj o, int n) { return o.g(n); }`  (g private → invokespecial)
+        //   aload_0; iload_1; invokespecial #2; ireturn
+        let cached = CachedBytecodeMethod {
+            declaring_class_id: cratonvm_types::ClassId::new(1),
+            class_name: Arc::from("pkg/Caller"),
+            method_name: Arc::from("f"),
+            method_descriptor: Arc::from("(Lpkg/Obj;I)I"),
+            source_file: None,
+            code: Arc::from([0x2a, 0x1b, 0xb7, 0x00, 0x02, 0xac, 0x00, 0x00].as_slice()),
+            exception_table: Arc::from(Vec::new().as_slice()),
+            max_stack: 2,
+            max_locals: 2,
+            num_params: 2,
+            is_synchronized: false,
+            is_static: true,
+        };
+        // SAFETY: all-zero `JitRuntimeHelpers` is valid; this test only COMPILES
+        // (never executes the body), so the baked `invoke_dispatch` is not called.
+        let helpers: JitRuntimeHelpers = unsafe { std::mem::zeroed() };
+        // Target: the private instance method `g(I)I` — receiver implicit, so the
+        // IR builder marshals it as arg0 (num_jit_args = 1 desc + 1 receiver).
+        let invoke_resolver = |cp: u16| -> Option<(String, String, String)> {
+            if cp == 2 {
+                Some(("pkg/Obj".into(), "g".into(), "(I)I".into()))
+            } else {
+                None
+            }
+        };
+
+        // ir_emit_special_calls = true (ir_emit_calls OFF) → invokespecial lowers
+        // to Op::Call → IR pipeline. Crossing the flags proves SPECIAL is the gate.
+        IR_LOWER_COMPILES.with(|c| c.set(0));
+        let with = try_compile(
+            &cached, None, None, None, Some(&invoke_resolver), None, None, None, None, None,
+            &helpers, None, None, None, None,
+            true,  // optimize
+            false, // ir_emit_calls (invokestatic) OFF
+            true,  // ir_emit_special_calls ON
+        );
+        assert!(
+            with.is_some(),
+            "invokespecial must compile with ir_emit_special_calls"
+        );
+        assert_eq!(
+            IR_LOWER_COMPILES.with(|c| c.get()),
+            1,
+            "invokespecial must route through the IR pipeline when ir_emit_special_calls is on"
+        );
+        assert!(
+            with.as_ref().unwrap().needs_context(),
+            "an Op::Call method must be needs_context"
+        );
+
+        // ir_emit_special_calls = false (ir_emit_calls ON) → the builder bails on
+        // the invokespecial → single-pass. Proves invokestatic's gate does NOT
+        // admit invokespecial.
+        IR_LOWER_COMPILES.with(|c| c.set(0));
+        let _without = try_compile(
+            &cached, None, None, None, Some(&invoke_resolver), None, None, None, None, None,
+            &helpers, None, None, None, None,
+            true,  // optimize
+            true,  // ir_emit_calls (invokestatic) ON
+            false, // ir_emit_special_calls OFF
+        );
+        assert_eq!(
+            IR_LOWER_COMPILES.with(|c| c.get()),
+            0,
+            "without ir_emit_special_calls, invokespecial must NOT take the IR pipeline"
         );
     }
 
