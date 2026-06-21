@@ -14,8 +14,10 @@ the ~30 docs map to **one root-cause family + ~15 distinct standalone bugs**, of
 **~11 distinct OPEN defects + 1 latent**, grouped as:
 
 1. **Family A — GC root coverage under JIT** (one root cause, several manifestations). Open members:
-   **A2** (register-only/native-return reclaim + non-moving-sweep walk) and **A4** (Fork6 FJP
-   multi-thread, gated). **A1/A3 are FIXED.** `spring-bug-10` is a Family-A manifestation seen from
+   **A2** (register-only/native-return reclaim + non-moving-sweep walk), **A4** (Fork6 FJP
+   multi-thread, gated), and **A5** (object-binarytrees JIT-frame **stale** root under extreme
+   `GC_STRESS` ≤ 64 KB — *below* the band the A3 precise-maps fix was verified at; precise maps don't
+   help). **A1/A3 are FIXED.** `spring-bug-10` is a Family-A manifestation seen from
    the Spring suite (same root cause, different entry point); `springsuite-bug-04` was the same race
    but **no longer reproduces** (doc removed). The suite-scale field evidence in
    `jit-junit-discovery-reflection-corruption.md` is the same race.
@@ -138,6 +140,7 @@ current (incomplete/buggy) implementation of that.
 | **A2** | **`implausible object size` young-sweep-walker crash** (reflection/String-array allocation churn) — a *distinct* bug, NOT the register root | `wildfly-suite/repro/ReflRepro` | 🔴 **OPEN** — precise maps do **not** fix it (still crashes; verified 2026-06-17) | [reflrepro-register-resident-jit-root-handoff.md](reflrepro-register-resident-jit-root-handoff.md) |
 | **A3** | **Register-invisibility** — a live oop sits only in a CPU register at a young-GC safepoint, invisible to the stack-only scan (single thread) | `apps/spring-boot/buildSrc/runner/MinRegexProbe` | ✅ **FIXED on dev** (`32649b56`, precise maps default-on) | _(doc removed; resolved)_ |
 | **A4** | Multi-thread: live `ForkJoinTask`s reclaimed under **FJP worker threads** + a **lost-tag** interpreter local | `scratch/xworker/Fork6` (needs `CRATONVM_REAL_FORKJOINPOOL=1`) | 🟡 **OPEN / inconclusive** — a separate real-FJP CAS failure now masks the reclaim test (same with/without precise) | [fork6-fjp-multithread-jit-root-reclamation.md](fork6-fjp-multithread-jit-root-reclamation.md) |
+| **A5** | **Object-binarytrees JIT-frame STALE root** — `main`'s compiled frame holds a raw young pointer that goes stale across an evacuating young GC; triggered by `main` loading `args` (oop in a callee-saved register shared with int locals). Heap stays consistent; receiver is **not** sweep-zeroed (≠ A3). Only at `GC_STRESS` ≤ 64 KB, *below* the A3-verified band | [`repros/gc-stress-bintrees-main-args/`](repros/gc-stress-bintrees-main-args/) (`VAAload`) | 🔴 **OPEN** — precise maps (on/off), full-stack scan, reg-spill-all, shadow-stack, C2-first-call all fail to fix it (2026-06-21) | [gc-stress-bintrees-object-main-args-jit-frame-stale-root.md](gc-stress-bintrees-object-main-args-jit-frame-stale-root.md) |
 
 > ## ✅ FIX (2026-06-17, dev `32649b56`): **precise JIT oop maps, default-on** — closes the register-invisibility root-scan gap (A3)
 > `CRATONVM_PRECISE_JIT_MAPS` is now **default-on** (opt out: `CRATONVM_NO_PRECISE_JIT_MAPS`).
