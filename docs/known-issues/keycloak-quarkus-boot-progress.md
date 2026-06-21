@@ -703,6 +703,51 @@ VM's real file layer).
 > `scripts/build-kcboot-sym.bat` (full-symbol build). Boot needs
 > `CRATONVM_REAL_AGROAL=1` (+ `CRATONVM_REAL_NET_SOCKETS=1` for a real listen).
 
+> **MILESTONE (2026-06-21) — the real Vert.x/Netty HTTP server SERVES under CratonVM.**
+> Validated in isolation with a minimal `Vertx.vertx().createHttpServer().listen(8080)`
+> repro (`scratch/vertx/`, real Vert.x 4.5.27 + Netty jars from the Keycloak dist):
+> `curl localhost:8080` → **HTTP 200** + the request handler fires (`HANDLED request path=/`).
+> This is Keycloak/Quarkus's HTTP foundation (Vert.x → Netty NIO). Required gates:
+> `CRATONVM_REAL_VERTX=1` + `CRATONVM_REAL_NET_SOCKETS=1`. Five commits, each a real VM bug,
+> found by fix→build→validate iteration with the new `run() Ok/Err` diagnostic +
+> `CRATONVM_DBG_SELECTOR` + cdb:
+> 1. **`e7fec84f`** — route `sun/nio/ch/WEPollSelectorProvider.{openSelector,openServerSocketChannel,
+>    openSocketChannel}` to CratonVM's selector/`ssc_open`/`sc_open`. JDK 21+ Windows defaults to
+>    the wepoll selector provider; Netty's `NioEventLoop`/`NioServerSocketChannel` call
+>    `provider.openX()` DIRECTLY (bypassing the static `Selector.open()`/`ServerSocketChannel.open()`
+>    CratonVM intercepts), so the real `WEPoll`/`ServerSocketChannelImpl` path ran →
+>    `UnsatisfiedLinkError: sun/nio/ch/WEPoll.eventSize()I` + `ClosedChannelException`.
+> 2. **`185fb300`** — `ServerSocketChannel.isBound()`/`localAddress()` natives (impl-methods on
+>    `ServerSocketChannelImpl` that `ServerSocketAdaptor`/Netty call on our abstract-class channel
+>    object). → port 8080 binds, `LISTENING` fires.
+> 3. **`5f8f96b1`** — `CRATONVM_REAL_VERTX` gate (mirrors `real_agroal`): suppresses the synthetic
+>    `vertx_eventloop` natives so the REAL Netty `NioEventLoop.run()` drives `Selector.select()`
+>    (the synthetic loop ran only tasks/timers and never polled the selector). cdb confirmed the
+>    real Netty event-loop threads then sit in `nio_selector::selector_select`→`WSAPoll`.
+> 4. **`0670dc5f`** — populate the selector's LIVE `selectedKeys` field on select. `WSAPoll` DID
+>    detect the accept (`CRATONVM_DBG_SELECTOR`: `EXIT n=1`/connection) but Netty served nothing
+>    because it reflectively REPLACES `SelectorImpl.selectedKeys` with its own `SelectedSelectionKeySet`
+>    and reads the FIELD; CratonVM only mirrored readyOps into `sk_table` + overrode `selectedKeys()`
+>    on-demand (Tomcat/ES path) and never wrote the field. `populate_selected_keys_field()` adds each
+>    ready key to the field (JDK-faithful; null-safe; on-demand path unchanged so Tomcat/ES unaffected).
+>
+> **The real Agroal H2/JDBC path also runs** (these gates are additive to `CRATONVM_REAL_AGROAL=1`).
+> NB: the earlier `VertxImpl.init` "shim mismatch" hypothesis (b18c6e32 on `dev`) was a RED HERRING —
+> the real blockers were the WEPoll selector routing + the Netty `selectedKeys`-field. The synthetic
+> `vertx_eventloop` natives are now bypassed by the gate, not the bug.
+>
+> **OPEN — full Keycloak boot still blocked EARLIER (the original silent-exit, Gap 9 core).** With
+> ALL gates, the full boot runs ~7 min then **self-terminates SILENTLY** at the post-Hibernate-Validator
+> phase (the slow ValidatorFactory build + RESTEasy deploy over Keycloak's hundreds of constraints/
+> endpoints) — BEFORE reaching the (now-working) Vert.x HTTP startup. No diagnostic fires: NOT
+> main-vm `run()` returning (the new `run() Ok/Err` log is silent), NOT `System.exit`
+> (`native_system_exit` eprintln absent), NOT a Rust panic (the panic hook eprintln's), NOT a GC
+> OOM/abort signal, NOT the crash handler. So a background thread terminates the process via a path
+> that bypasses every hook. Pinning it via `cdb` launched with a breakpoint on
+> `ntdll!NtTerminateProcess` (catches exit/abort/terminate from any thread → calling stack).
+> This silent exit + the silent post-Hibernate logging are the remaining full-boot walls (Gap 9's
+> throughput + invisible-failure core). The HTTP layer is no longer a blocker.
+
 ### Quarkus ArC (`CRATONVM_REAL_ARC`) — REACHED and running
 Real ArC bytecode RUNS during the boot — `Arc.initialize` → container →
 `InstanceImpl` bean resolution/creation all execute as real bytecode, and ArC
