@@ -217,60 +217,81 @@ pub fn run_corpus(config: &RunnerConfig) -> Result<RunSummary, RunError> {
             (dir, cls)
         };
 
-        // HotSpot is the deterministic reference — run it once and reuse it
-        // across every CratonVM mode.
-        let hotspot = hotspot_obs(&classpath, &main_class, jdk, config.timeout)?;
-
-        // Determinism pre-flight (design §3.3): a program admitted to the
-        // corpus MUST be deterministic, or the gate flaps. Run HotSpot a second
-        // time and reject the program if the two disagree under the normalizer.
-        if config.determinism_check {
-            let hotspot2 = hotspot_obs(&classpath, &main_class, jdk, config.timeout)?;
-            if !oracle::compare(&hotspot, &hotspot2, &normalizer).agrees() {
-                summary.nondeterministic.push((
-                    main_class,
-                    "two HotSpot runs disagree under the normalizer".to_string(),
-                ));
-                continue;
-            }
+        match run_one(&bin, &classpath, &main_class, &modes, config, source)? {
+            RunOne::Result(r) => summary.results.push(r),
+            RunOne::Nondeterministic(reason) => summary.nondeterministic.push((main_class, reason)),
         }
-
-        let mut outcomes = Vec::with_capacity(modes.len());
-        for &mode in &modes {
-            let mut cratonvm =
-                cratonvm_obs(&bin, &classpath, &main_class, mode, jdk, config.timeout)?;
-            let mut verdict = oracle::compare(&cratonvm, &hotspot, &normalizer);
-
-            // Re-confirm a divergence: a transient (e.g. a concurrent rebuild
-            // overwriting the binary mid-run) won't reproduce. If the re-run
-            // agrees, the divergence was spurious — adopt the agreeing run.
-            if config.reconfirm && !verdict.agrees() {
-                let cratonvm2 =
-                    cratonvm_obs(&bin, &classpath, &main_class, mode, jdk, config.timeout)?;
-                let verdict2 = oracle::compare(&cratonvm2, &hotspot, &normalizer);
-                if verdict2.agrees() {
-                    cratonvm = cratonvm2;
-                    verdict = verdict2;
-                }
-            }
-
-            outcomes.push(ModeOutcome {
-                mode,
-                cratonvm,
-                verdict,
-            });
-        }
-
-        summary.results.push(ProgramResult {
-            program: main_class,
-            source,
-            hotspot,
-            modes: outcomes,
-        });
     }
 
     let _ = std::fs::remove_dir_all(&workdir);
     Ok(summary)
+}
+
+/// The outcome of running a single already-compiled program.
+pub enum RunOne {
+    /// The program ran on both VMs across the mode matrix.
+    Result(ProgramResult),
+    /// The determinism pre-flight rejected it (two HotSpot runs disagreed).
+    Nondeterministic(String),
+}
+
+/// Run one already-compiled `main_class` (found on `classpath`) across every
+/// `mode` against a single HotSpot reference, honoring the determinism
+/// pre-flight and divergence re-confirmation from `config`. Shared by
+/// [`run_corpus`] and the bytecode-mutation tier (`difftest mutate`).
+pub fn run_one(
+    bin: &Path,
+    classpath: &Path,
+    main_class: &str,
+    modes: &[Mode],
+    config: &RunnerConfig,
+    source: std::path::PathBuf,
+) -> Result<RunOne, RunError> {
+    let jdk = config.jdk_home.as_deref();
+    let normalizer = Normalizer::strict();
+
+    // HotSpot is the deterministic reference — run it once, reuse across modes.
+    let hotspot = hotspot_obs(classpath, main_class, jdk, config.timeout)?;
+
+    // Determinism pre-flight (design §3.3): reject a program whose two HotSpot
+    // runs disagree, or the gate flaps.
+    if config.determinism_check {
+        let hotspot2 = hotspot_obs(classpath, main_class, jdk, config.timeout)?;
+        if !oracle::compare(&hotspot, &hotspot2, &normalizer).agrees() {
+            return Ok(RunOne::Nondeterministic(
+                "two HotSpot runs disagree under the normalizer".to_string(),
+            ));
+        }
+    }
+
+    let mut outcomes = Vec::with_capacity(modes.len());
+    for &mode in modes {
+        let mut cratonvm = cratonvm_obs(bin, classpath, main_class, mode, jdk, config.timeout)?;
+        let mut verdict = oracle::compare(&cratonvm, &hotspot, &normalizer);
+
+        // Re-confirm a divergence: a transient won't reproduce.
+        if config.reconfirm && !verdict.agrees() {
+            let cratonvm2 = cratonvm_obs(bin, classpath, main_class, mode, jdk, config.timeout)?;
+            let verdict2 = oracle::compare(&cratonvm2, &hotspot, &normalizer);
+            if verdict2.agrees() {
+                cratonvm = cratonvm2;
+                verdict = verdict2;
+            }
+        }
+
+        outcomes.push(ModeOutcome {
+            mode,
+            cratonvm,
+            verdict,
+        });
+    }
+
+    Ok(RunOne::Result(ProgramResult {
+        program: main_class.to_string(),
+        source,
+        hotspot,
+        modes: outcomes,
+    }))
 }
 
 /// Run one program on HotSpot and attach the parsed uncaught exception.

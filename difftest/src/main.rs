@@ -17,9 +17,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use clap::{Args, Parser, Subcommand};
 
-use cratonvm_difftest::generate::{self, TargetFamily};
-use cratonvm_difftest::harness;
+use cratonvm_difftest::generate::{self, Rng, TargetFamily};
+use cratonvm_difftest::harness::{self, RunOne};
 use cratonvm_difftest::ledger::{self, Ledger};
+use cratonvm_difftest::mutate;
 use cratonvm_difftest::runner::{self, Mode, RunError, RunnerConfig, DEFAULT_TIMEOUT};
 
 /// Gate / run exit-code contract (design §3.5). These describe the *divergence
@@ -56,6 +57,8 @@ enum Cmd {
     Run(RunArgs),
     /// Generate corpus programs biased toward the bug history (Step 4).
     Gen(GenArgs),
+    /// Mutate a compiled seed's constants and run each mutant differentially (Step 5).
+    Mutate(MutateArgs),
     /// Minimize a confirmed divergence to a small repro (Step 6).
     Min(MinArgs),
     /// CI gate: exit non-zero on a new or regressed divergence (Step 3).
@@ -129,6 +132,37 @@ struct GenArgs {
 }
 
 #[derive(Args)]
+struct MutateArgs {
+    /// Seed program to mutate: a `.java` (compiled here) or a `.class`.
+    program: PathBuf,
+
+    /// Number of mutants to generate and run.
+    #[arg(long, default_value_t = 50)]
+    count: usize,
+
+    /// PRNG seed — the same seed reproduces the exact mutant sequence.
+    #[arg(long, default_value_t = 1)]
+    seed: u64,
+
+    /// Comma-separated CratonVM modes to fan out across.
+    #[arg(
+        long,
+        value_delimiter = ',',
+        default_value = "jit-on,nojit",
+        value_parser = parse_one_mode
+    )]
+    modes: Vec<Mode>,
+
+    /// Hard per-run timeout in seconds.
+    #[arg(long, default_value_t = DEFAULT_TIMEOUT.as_secs())]
+    timeout_secs: u64,
+
+    /// Explicit JDK home (else `DIFFTEST_JAVA_HOME`, else PATH).
+    #[arg(long)]
+    jdk: Option<PathBuf>,
+}
+
+#[derive(Args)]
 struct MinArgs {
     /// The confirmed-divergent program to shrink.
     program: PathBuf,
@@ -188,6 +222,7 @@ fn main() -> ExitCode {
     match cli.command {
         Cmd::Run(args) => cmd_run(&args),
         Cmd::Gen(args) => cmd_gen(&args),
+        Cmd::Mutate(args) => cmd_mutate(&args),
         Cmd::Min(args) => cmd_min(&args),
         Cmd::Gate(args) => cmd_gate(&args),
     }
@@ -296,6 +331,136 @@ fn cmd_gen(args: &GenArgs) -> ExitCode {
         out.display()
     );
     println!("  next: difftest run --corpus {}", out.display());
+    ExitCode::from(exit::OK)
+}
+
+// ---------------------------------------------------------------------------
+// mutate — Step 5 (bytecode mutation tier)
+// ---------------------------------------------------------------------------
+
+fn cmd_mutate(args: &MutateArgs) -> ExitCode {
+    let bin = match runner::cratonvm_binary() {
+        Some(b) => b,
+        None => {
+            eprintln!(
+                "difftest mutate: cratonvm binary not found (build it / set CRATONVM_BIN) — \
+                 exit {}.",
+                exit::BOOTSTRAP
+            );
+            return ExitCode::from(exit::BOOTSTRAP);
+        }
+    };
+    if !runner::java_available(args.jdk.as_deref()) {
+        eprintln!(
+            "difftest mutate: java not found — exit {}.",
+            exit::BOOTSTRAP
+        );
+        return ExitCode::from(exit::BOOTSTRAP);
+    }
+
+    let workdir = std::env::temp_dir().join(format!("difftest_mut_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&workdir);
+    let timeout = std::time::Duration::from_secs(args.timeout_secs);
+
+    // Resolve the seed to a compiled `.class` and its main class name.
+    let is_java = args.program.extension().and_then(|s| s.to_str()) == Some("java");
+    let (class_name, class_path) = if is_java {
+        match runner::compile_java(&args.program, &workdir, args.jdk.as_deref(), timeout) {
+            Ok(name) => (name.clone(), workdir.join(format!("{name}.class"))),
+            Err(e) => {
+                eprintln!("difftest mutate: {e}");
+                let _ = std::fs::remove_dir_all(&workdir);
+                return ExitCode::from(exit::BOOTSTRAP);
+            }
+        }
+    } else {
+        let name = args
+            .program
+            .file_stem()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+        (name, args.program.clone())
+    };
+
+    let bytes = match std::fs::read(&class_path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("difftest mutate: cannot read {}: {e}", class_path.display());
+            let _ = std::fs::remove_dir_all(&workdir);
+            return ExitCode::from(exit::BOOTSTRAP);
+        }
+    };
+    let n_consts = mutate::numeric_constants(&bytes).len();
+    if n_consts == 0 {
+        println!(
+            "difftest mutate: {} has no numeric constants to perturb — nothing to do.",
+            class_name
+        );
+        let _ = std::fs::remove_dir_all(&workdir);
+        return ExitCode::from(exit::OK);
+    }
+
+    println!(
+        "difftest mutate — {} ({n_consts} numeric constant(s)) | {} mutants | modes {} | seed {}",
+        class_name,
+        args.count,
+        args.modes
+            .iter()
+            .map(|m| m.label())
+            .collect::<Vec<_>>()
+            .join(","),
+        args.seed
+    );
+
+    // Mutants reuse the determinism-off / reconfirm-on path (each is freshly
+    // valid by construction; reconfirm filters transients).
+    let config = RunnerConfig {
+        timeout,
+        jdk_home: args.jdk.clone(),
+        modes: args.modes.clone(),
+        reconfirm: true,
+        ..RunnerConfig::for_corpus(workdir.clone())
+    };
+    let mut_dir = workdir.join("m");
+    let _ = std::fs::create_dir_all(&mut_dir);
+    let mut_path = mut_dir.join(format!("{class_name}.class"));
+
+    let mut rng = Rng::new(args.seed);
+    let (mut ran, mut diverged) = (0usize, 0usize);
+    for i in 0..args.count {
+        let Some(mutant) = mutate::mutate_constant(&bytes, &mut rng) else {
+            break;
+        };
+        if std::fs::write(&mut_path, &mutant).is_err() {
+            continue;
+        }
+        match harness::run_one(
+            &bin,
+            &mut_dir,
+            &class_name,
+            &config.modes,
+            &config,
+            args.program.clone(),
+        ) {
+            Ok(RunOne::Result(r)) => {
+                ran += 1;
+                if r.diverged() {
+                    diverged += 1;
+                    let label = r
+                        .classification()
+                        .map(|c| format!("{c:?}"))
+                        .unwrap_or_else(|| "divergent".into());
+                    println!("  DIFF  mutant#{i} [{label}]");
+                }
+            }
+            Ok(RunOne::Nondeterministic(_)) => {}
+            Err(e) => eprintln!("  (mutant#{i} run error: {e})"),
+        }
+    }
+
+    println!("difftest mutate — {ran} mutant(s) ran, {diverged} diverged");
+    let _ = std::fs::remove_dir_all(&workdir);
     ExitCode::from(exit::OK)
 }
 
