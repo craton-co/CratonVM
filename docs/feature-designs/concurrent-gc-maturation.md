@@ -55,7 +55,60 @@ Author note: this doc is grounded in a read of `gc/src/{g1,g1_concurrent,zgc,zgc
   - Generational `ConcurrentMarker::remark` already drains the registry (its
     remark calls `deactivate_and_drain` → `flush_all`), so it is unaffected.
     Applying the same discipline uniformly is a small follow-up.
-- Steps 4–10 — not started. Next highest-value: Step 8 (opt-in G1 gauntlet
+- **Step 4 (atomic concurrent-mark slot reads) — DONE via atomic-per-word
+  read/write** (branch `feat/g1-atomic-mark-reads`). The design's literal "8-byte
+  reference-word load" was infeasible; the implemented fix reads/writes the whole
+  16-byte slot as two `AtomicU64` words instead. Findings that shaped it:
+  - The *standalone* `ConcurrentMarker::scan_object` (`concurrent_mark.rs`) is
+    already mitigated: 8-byte ref-array elements use a single-word `u64` read;
+    16-byte object slots read under `collector::volatile_stripe_lock` + SeqCst
+    fences. G1's own concurrent scan `scan_object_refs` (`g1.rs`) is **not** —
+    it does a plain non-atomic `ptr::read::<Value>` (the §2.8 g1.rs sites).
+  - The design's primary fix — *"8-byte atomic load of the reference word"* — is
+    **not portable**: `Value` is `repr(Rust)` (line ~22; `repr(C)` would grow it
+    to 24 bytes and break JIT slot layout), so the discriminant/payload offsets
+    are compiler-private — there is no stable "reference word" to load. And the
+    mutator write (`set_field`) is a non-atomic `ptr::write::<Value>`, so even an
+    atomic read would be **mixed-atomicity UB** unless every writer (interpreter,
+    JIT raw stores, natives) also becomes atomic — a cross-cutting, perf-critical
+    change far beyond a marker tweak.
+  - The design's alternative — *"prove + assert STW-only"* — fits the **other
+    three** g1.rs Value reads (`scan_and_evacuate_refs`,
+    `scan_source_region_for_cset_refs`, `verify_no_dangling_into_cset`: all in
+    the STW evacuation path) but **not** `scan_object_refs`, which is genuinely
+    concurrent.
+  - The `concurrent_mark.rs` **stripe-lock** approach is **ruled out for G1**:
+    `scan_object_refs` runs holding `self.regions.lock()`, while the volatile
+    write path is `set_field_volatile` → stripe → `set_field` → `regions.lock()`.
+    Adding a stripe lock under the regions lock inverts the order (regions→stripe
+    vs stripe→regions) → **deadlock**.
+  - **Key narrowing:** the *interpreter* write path (`set_field`) takes
+    `regions.lock()` — the same lock the marker holds for the whole
+    `concurrent_mark_step` — so interpreter writes are already serialized against
+    the marker read (no race). The **only** genuinely concurrent writer is the
+    JIT: `jit_putfield_*` write the 16-byte slot **directly** (bypassing
+    `set_field`/the regions lock). So the race is JIT-write ↔ marker-read, and it
+    is benign in practice (typed-field tag invariance → no spliced garbage
+    pointer) — formal UB, not a reachable memory-safety hole.
+  - **Implemented fix (atomic-per-word):** `types::{read_value_atomic,
+    write_value_atomic}` read/write a slot as two relaxed `AtomicU64` words —
+    copying all 16 bytes, so **no `repr(Rust)` layout assumption**, and
+    perf-neutral on x86 (a 16-byte `ptr::write` was already two stores). Applied
+    to the marker reads (`g1::scan_object_refs`, `concurrent_mark::scan_object` —
+    the latter keeps its stripe lock for volatile-write serialization) and to all
+    five `jit_putfield_*` writes plus `jit_putfield_object`'s SATB old-value read.
+    The regions lock is left intact (no deadlock; §3.3 says don't pre-optimize it
+    — defer to gauntlet measurement). `Relaxed` suffices: marking *correctness* is
+    carried by the SATB pre-barrier, not this access's ordering.
+  - **Validation:** build + `cratonvm-gc` (709, parallel) + `cratonvm-types` (283)
+    green; a JIT field-stress program (`scratch/step4/FieldStress.java`,
+    exercising all five putfields + GC churn) yields a **byte-identical checksum
+    `4495525842000` across HotSpot, cratonvm-generational, and cratonvm
+    `-XX:+UseG1GC`** (the G1 run drives Step 1 flag → G1 marking → atomic
+    read/write end-to-end). Note: the 8-byte reference-*array* read/`jit_aastore`
+    path is single-word (cannot tear) and left as-is; the three STW evacuation
+    Value reads are non-concurrent and unchanged.
+- Steps 5–10 — not started. Next highest-value: Step 8 (opt-in G1 gauntlet
   validation) and Step 5 (moving-GC root-parity audit under G1).
 
 ---

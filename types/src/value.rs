@@ -539,6 +539,57 @@ const _: () = assert!(
     "Option<ObjectRef> must be pointer-sized (NonNull niche optimization)"
 );
 
+// ---------------------------------------------------------------------------
+// Atomic 16-byte object-slot access (concurrent-GC correctness)
+// ---------------------------------------------------------------------------
+//
+// The GC marker scans an object's field slots *concurrently* with mutator
+// stores. A `Value` is exactly 16 bytes (asserted above) — wider than any
+// single machine word — so a plain `ptr::read::<Value>` racing a plain
+// `ptr::write::<Value>` is a data race: formal UB under the Rust/C++ memory
+// model, and in principle able to splice the words of two different stores into
+// a garbage pointer the marker would then dereference.
+//
+// These helpers read/write a slot as two `AtomicU64` words. Using them on BOTH
+// the collector read side (`g1`/`concurrent_mark` object scan) and the writer
+// side (the JIT `jit_putfield_*` field-store helpers, which write the slot
+// directly rather than going through the heap's lock-serialized `set_field`)
+// makes every concurrent slot access well-defined and free of within-word
+// tearing. For a statically-typed Java field the discriminant word is invariant
+// across stores, so even a cross-word "torn" pair reconstructs to a valid
+// `Object(ptr-or-null)`/primitive — never a spliced garbage pointer.
+//
+// `Relaxed` is sufficient: marking *correctness* (no lost live reference) is
+// carried by the SATB pre-barrier, not by the ordering of this access; the
+// atomics are here only for per-word atomicity (UB-freedom + no torn pointer).
+
+/// Atomically read a 16-byte `Value` object slot as two relaxed `AtomicU64`
+/// words. See the module note above for why.
+///
+/// # Safety
+/// `slot` must be a valid, 8-byte-aligned pointer to a live 16-byte `Value`
+/// slot. The reconstructed `Value` has the same validity contract as
+/// `ptr::read::<Value>` (the bytes must form a valid `Value`, which holds for a
+/// typed Java field whose discriminant is invariant across stores).
+#[inline]
+pub unsafe fn read_value_atomic(slot: *const Value) -> Value {
+    let w0 = (*(slot as *const AtomicU64)).load(Ordering::Relaxed);
+    let w1 = (*((slot as *const u8).add(8) as *const AtomicU64)).load(Ordering::Relaxed);
+    std::mem::transmute::<[u64; 2], Value>([w0, w1])
+}
+
+/// Atomically write a 16-byte `Value` object slot as two relaxed `AtomicU64`
+/// words — the writer-side counterpart of [`read_value_atomic`].
+///
+/// # Safety
+/// `slot` must be a valid, 8-byte-aligned pointer to a 16-byte `Value` slot.
+#[inline]
+pub unsafe fn write_value_atomic(slot: *mut Value, value: Value) {
+    let [w0, w1] = std::mem::transmute::<Value, [u64; 2]>(value);
+    (*(slot as *const AtomicU64)).store(w0, Ordering::Relaxed);
+    (*((slot as *const u8).add(8) as *const AtomicU64)).store(w1, Ordering::Relaxed);
+}
+
 impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {

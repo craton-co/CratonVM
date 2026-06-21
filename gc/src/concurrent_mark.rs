@@ -701,8 +701,13 @@ impl ConcurrentMarker {
                 std::sync::atomic::fence(Ordering::SeqCst);
                 // SAFETY: slot_idx < num_slots, offset is within the allocated object.
                 let slot_ptr = unsafe { obj_ptr.add(HEADER_SIZE + slot_idx * SLOT_SIZE) };
-                // SAFETY: slot_ptr points to a valid Value-sized region within the object.
-                let value = unsafe { std::ptr::read(slot_ptr as *const Value) };
+                // Read the 16-byte slot as two atomic words. The stripe lock
+                // serializes this against `set_field_volatile` writers, but
+                // JIT-compiled field stores write the slot directly and take no
+                // stripe lock, so the atomic read is what makes *that* pairing
+                // well-defined (see `read_value_atomic` / `write_value_atomic`).
+                // SAFETY: slot_ptr points to a valid, aligned Value slot.
+                let value = unsafe { cratonvm_types::read_value_atomic(slot_ptr as *const Value) };
                 std::sync::atomic::fence(Ordering::SeqCst);
                 if let Value::Object(Some(ref_obj)) = value {
                     let ref_ptr = ref_obj.as_ptr();
