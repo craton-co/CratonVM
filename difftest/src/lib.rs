@@ -11,7 +11,7 @@
 //!
 //! Design: `docs/feature-designs/differential-fuzzer.md`.
 //!
-//! ## Status: Step 6 — reproducer minimizer
+//! ## Status: complete (Steps 0–7)
 //!
 //! The runner spawns the `cratonvm` binary and a real `java` as subprocesses,
 //! compiles a `.java` program once with `javac`, and runs the same `.class` on
@@ -21,9 +21,11 @@
 //! divergence, runs the determinism pre-flight + re-confirmation, and
 //! [`gate`](harness::gate)s a run against the committed [`ledger::Ledger`].
 //! [`generate`] emits a seeded type-directed corpus; [`mutate`] is the
-//! format-aware bytecode mutator; [`minimize`] ddmin-shrinks a confirmed
-//! divergence to a minimal repro under `difftest/regression/`. Only the macro
-//! tier + OSS-Fuzz onboarding (Step 7) remain.
+//! format-aware bytecode mutator (also a libFuzzer target +
+//! OSS-Fuzz-onboarded); [`minimize`] ddmin-shrinks a confirmed divergence to a
+//! minimal repro under `difftest/regression/`. The macro tier reuses
+//! `difftest run` over any directory of real programs (`--check-determinism`
+//! to reject flaky ones); see `README.md`.
 //!
 //! The cooperating pieces, each its own module:
 //!
