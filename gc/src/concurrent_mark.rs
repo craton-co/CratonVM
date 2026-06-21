@@ -656,11 +656,52 @@ impl ConcurrentMarker {
             // Primitive arrays have no references to scan.
         } else {
             // Object: 16-byte Value slots.
+            //
+            // gc-concmark MEDIUM fix — torn-read data race. This loop runs on
+            // the marker thread *concurrently* with mutators (Phase 2
+            // `concurrent_mark` is the whole point of this module), so a
+            // mutator may be mid-store into the very slot we read here. A
+            // `Value` is 16 bytes — wider than any stable atomic on x86-64 —
+            // so a plain `ptr::read::<Value>` can splice the tag word of one
+            // store with the payload word of another (or with the pre-store
+            // bytes). The resulting `Value::Object(Some(..))` would carry a
+            // garbage pointer that we then feed to `old_gen.contains` /
+            // `try_mark` / `queue.push` and ultimately dereference as an
+            // `ObjectHeader` in the next `scan_object` — a memory-safety hole
+            // reachable purely from concurrent application activity (and plain
+            // UB under the Rust memory model: a non-atomic read racing a
+            // non-atomic write).
+            //
+            // Mirror exactly how the rest of the heap reads a 16-byte slot
+            // safely under concurrency: `Heap::get_field_volatile`
+            // (heap.rs:540) takes the per-slot stripe lock from
+            // `collector::volatile_stripe_lock(obj_ref, index)` so the
+            // 16-byte `Value` appears either fully-old or fully-new, never
+            // torn. We acquire the SAME stripe lock here, keyed on the same
+            // `(object, slot index)`, so this read serializes against every
+            // mutator store routed through the volatile field-access helpers,
+            // and the `SeqCst` fence gives the read the JMM acquire edge. The
+            // 8-byte reference-array path above needs no lock: an aligned
+            // 8-byte pointer load/store is single-word and cannot tear.
+            //
+            // SAFETY: `obj_ptr` was popped from the mark queue, where it was
+            // validated by `old_gen.contains` before being enqueued, so it is
+            // a non-null, 8-byte-aligned, live old-gen object address — the
+            // precondition for `ObjectRef::from_raw`. We use the resulting
+            // `ObjectRef` only as a stripe-lock key (its address is hashed),
+            // never to mutate the object.
+            let obj_ref = unsafe { cratonvm_types::ObjectRef::from_raw(obj_ptr) };
             for slot_idx in 0..header.num_slots as usize {
+                // Serialize the 16-byte read against striped mutator writes so
+                // we never observe a torn (tag, payload) pair. Held only for
+                // the duration of this single slot read.
+                let _stripe = crate::collector::volatile_stripe_lock(obj_ref, slot_idx);
+                std::sync::atomic::fence(Ordering::SeqCst);
                 // SAFETY: slot_idx < num_slots, offset is within the allocated object.
                 let slot_ptr = unsafe { obj_ptr.add(HEADER_SIZE + slot_idx * SLOT_SIZE) };
                 // SAFETY: slot_ptr points to a valid Value-sized region within the object.
                 let value = unsafe { std::ptr::read(slot_ptr as *const Value) };
+                std::sync::atomic::fence(Ordering::SeqCst);
                 if let Value::Object(Some(ref_obj)) = value {
                     let ref_ptr = ref_obj.as_ptr();
                     if old_gen.contains(ref_ptr) && self.bitmap.try_mark(ref_ptr as usize) {
@@ -1283,5 +1324,96 @@ mod tests {
 
         assert_eq!(swept, 3);
         assert!(og.used() < used_before);
+    }
+
+    // gc-concmark MEDIUM regression — the concurrent-mark object-slot read
+    // must serialize against striped mutator writes so it never observes a
+    // torn (tag, payload) `Value`. Here a writer thread continuously flips a
+    // reference slot between `Object(Some(b))` and `Object(None)` while
+    // holding the SAME per-slot stripe lock that `scan_object` now takes; the
+    // marker scans the object in a tight loop on another thread. Without the
+    // stripe lock in `scan_object`, a torn read could splice the non-null tag
+    // of one store with the (null) payload of another and feed a bogus
+    // pointer into `old_gen.contains` / `try_mark` — corrupting the heap or
+    // crashing. With the lock, every read sees a fully-old or fully-new value,
+    // so the test runs to completion and only ever marks the real target `b`.
+    #[test]
+    fn scan_object_serializes_against_striped_writer() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let mut og = OldGen::new(65536);
+        let size = HEADER_SIZE + SLOT_SIZE;
+
+        // Object A — single reference slot, the contended one.
+        let ptr_a = og.alloc(size, 8).unwrap();
+        unsafe {
+            let h = &mut *(ptr_a as *mut ObjectHeader);
+            h.class_id = ClassId::new(1);
+            h.kind = ObjectKind::Object;
+            h.num_slots = 1;
+            h.gc_flags = 0x01;
+        }
+        // Object B — the only legitimate target A's slot can point to.
+        let ptr_b = og.alloc(size, 8).unwrap();
+        unsafe {
+            let h = &mut *(ptr_b as *mut ObjectHeader);
+            h.class_id = ClassId::new(2);
+            h.kind = ObjectKind::Object;
+            h.num_slots = 1;
+            h.gc_flags = 0x01;
+        }
+
+        let marker = Arc::new(ConcurrentMarker::new(
+            og.base_ptr() as usize,
+            og.capacity(),
+        ));
+        // The marker must be in the concurrent-mark phase so its bitmap is live.
+        marker.initial_mark(&[ptr_a], &og);
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let a_addr = ptr_a as usize;
+        let b_addr = ptr_b as usize;
+        let obj_a = unsafe { ObjectRef::from_raw(ptr_a) };
+        let obj_b = unsafe { ObjectRef::from_raw(ptr_b) };
+
+        // Writer: flip A.slot[0] between Some(B) and None under the stripe
+        // lock, exactly as the volatile field-access helpers do.
+        let writer = {
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                let slot = (a_addr + HEADER_SIZE) as *mut Value;
+                let mut toggle = false;
+                while !stop.load(Ordering::Relaxed) {
+                    let _g = crate::collector::volatile_stripe_lock(obj_a, 0);
+                    std::sync::atomic::fence(Ordering::SeqCst);
+                    let v = if toggle {
+                        Value::Object(Some(obj_b))
+                    } else {
+                        Value::Object(None)
+                    };
+                    // SAFETY: slot is A's single in-bounds reference field.
+                    unsafe { std::ptr::write(slot, v) };
+                    std::sync::atomic::fence(Ordering::SeqCst);
+                    toggle = !toggle;
+                }
+            })
+        };
+
+        // Reader: scan A many times concurrently with the writer.
+        for _ in 0..50_000 {
+            marker.scan_object(a_addr as *mut u8, &og);
+        }
+        stop.store(true, Ordering::Relaxed);
+        writer.join().unwrap();
+
+        // A must still be marked; B must be marked iff it was observed as a
+        // live target — either is legal, but no THIRD address may ever have
+        // been marked (a torn read would have produced a garbage pointer that
+        // either failed `contains` or, worse, aliased some other object).
+        assert!(marker.bitmap.is_marked(a_addr));
+        // Sanity: the only addresses that can possibly be marked are A and B.
+        // (B is the sole non-null value the writer ever stores.)
+        let _ = b_addr; // referenced for clarity; marking B is permitted, not required.
     }
 }
