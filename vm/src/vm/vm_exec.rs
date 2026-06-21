@@ -352,6 +352,21 @@ pub fn value_as_validated_object_ref(shared: &SharedVm, v: Value) -> Option<Obje
     }
 }
 
+/// Validate that a raw native byte range `[base, base + len)` does not wrap
+/// past the end of the (64-bit) address space.
+///
+/// Used by `copy_to_native_memory` / `copy_from_native_memory` to reject a
+/// forged length on a high `base` before the unchecked `copy_nonoverlapping`.
+/// A wrapping range would let the copy run off the end of the addressable
+/// space (out-of-bounds read/write = UB); we refuse it instead. `len == 0` is
+/// in bounds (a no-op copy). The Java-side array bounds are enforced separately
+/// by the caller, which passes an already-sliced `&[u8]` / `&mut [u8]`.
+#[inline]
+fn native_range_is_in_bounds(base: u64, len: usize) -> bool {
+    // `checked_add` is `None` exactly when `base + len` overflows `u64`.
+    base.checked_add(len as u64).is_some()
+}
+
 /// Pin a value that may encode a jobject as `Value::Long` for the duration
 /// of a native call (see `safe_native_call`).
 #[inline]
@@ -2140,11 +2155,24 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         if cratonvm_native_builtins::unsafe_arena_contains(addr) {
             return cratonvm_native_builtins::unsafe_arena_copy_out(addr, out);
         }
+        // Reject null / negative handles. Returning `false` (not performing the
+        // copy) is how this layer signals failure; the native caller turns that
+        // into the appropriate Java exception. The bounds of `out` itself are
+        // the Java-side array bounds — the caller has already sliced the array,
+        // so `out.len()` is the validated request size.
         if addr <= 0 {
             return false;
         }
+        // Guard against an `addr + len` range that wraps past the end of the
+        // address space (a forged length on a high `addr`). Such a copy would
+        // read out-of-bounds / UB; refuse it instead. `addr > 0` here, so the
+        // `as u64` cast is exact.
+        if !native_range_is_in_bounds(addr as u64, out.len()) {
+            return false;
+        }
         // SAFETY: `addr` is a real, readable native pointer (not an arena
-        // handle); `out.len()` bytes are copied from it.
+        // handle); the `[addr, addr + out.len())` range is non-wrapping
+        // (checked above) and `out.len()` bytes are copied from it.
         unsafe {
             std::ptr::copy_nonoverlapping(addr as *const u8, out.as_mut_ptr(), out.len());
         }
@@ -2155,7 +2183,16 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         if cratonvm_native_builtins::unsafe_arena_contains(addr) {
             return cratonvm_native_builtins::unsafe_arena_copy_in(addr, data);
         }
+        // Reject null / negative handles (failure is signalled by `false`; the
+        // native caller raises the appropriate Java exception). `data` is the
+        // Java-side source slice, already bounds-checked by the caller.
         if addr <= 0 {
+            return false;
+        }
+        // Refuse a destination range `[addr, addr + len)` that would wrap past
+        // the end of the address space (forged length on a high `addr`) — such
+        // a write is out-of-bounds / UB. `addr > 0`, so `as u64` is exact.
+        if !native_range_is_in_bounds(addr as u64, data.len()) {
             return false;
         }
         // DBG (bc math-ec): a raw copy whose destination aliases the MANAGED
@@ -11697,6 +11734,37 @@ mod tests {
         })
         .join()
         .expect("post-unwind thread should not panic");
+    }
+
+    // -----------------------------------------------------------------------
+    // native_range_is_in_bounds — overflow guard for raw native copies
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn native_range_zero_len_is_in_bounds() {
+        // A zero-length copy is a no-op and always in bounds, even at the very
+        // top of the address space.
+        assert!(native_range_is_in_bounds(0, 0));
+        assert!(native_range_is_in_bounds(u64::MAX, 0));
+    }
+
+    #[test]
+    fn native_range_ordinary_is_in_bounds() {
+        assert!(native_range_is_in_bounds(0x1000, 64));
+    }
+
+    #[test]
+    fn native_range_exact_end_is_in_bounds() {
+        // base + len == u64::MAX + 1 is the first wrapping value; one below the
+        // end must still be accepted.
+        assert!(native_range_is_in_bounds(u64::MAX - 8, 8));
+    }
+
+    #[test]
+    fn native_range_wrapping_is_rejected() {
+        // A forged length that pushes the end past u64::MAX wraps — reject it.
+        assert!(!native_range_is_in_bounds(u64::MAX, 1));
+        assert!(!native_range_is_in_bounds(u64::MAX - 4, 16));
     }
 
     #[test]
