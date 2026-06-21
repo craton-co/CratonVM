@@ -9095,6 +9095,17 @@ fn stream_inherit_close_handlers(ctx: &mut dyn NativeContext, src: ObjectRef, ds
     if src == dst {
         return;
     }
+    // W1 fix: several ad-hoc synthetic-stream allocations use a 1-field
+    // (elements-only) layout with no close-handler slot. Guard slot-1 access the
+    // same way the LAZY_SPLITERATOR (slot 2) / OP_CHAIN (slot 3) readers already
+    // do — otherwise this intermediate-op propagation OOB-reads slot 1 on every
+    // chained op against such a source, flooding the GC out-of-bounds-field
+    // guard. A short-layout stream simply has no handlers to inherit.
+    if ctx.object_num_fields(src) <= STREAM_FIELD_CLOSE_HANDLERS
+        || ctx.object_num_fields(dst) <= STREAM_FIELD_CLOSE_HANDLERS
+    {
+        return;
+    }
     if let Value::Object(Some(arr)) = ctx.get_field(src, STREAM_FIELD_CLOSE_HANDLERS) {
         ctx.set_field(dst, STREAM_FIELD_CLOSE_HANDLERS, Value::Object(Some(arr)));
     }
@@ -9394,6 +9405,11 @@ fn stream_run_close_handlers(
     ctx: &mut dyn NativeContext,
     this: ObjectRef,
 ) -> Result<(), cratonvm_types::error::MethodCallFailed> {
+    // W1 fix: 1-field synthetic streams have no close-handler slot — nothing to
+    // run. Guard mirrors the slot-2/slot-3 presence checks elsewhere.
+    if ctx.object_num_fields(this) <= STREAM_FIELD_CLOSE_HANDLERS {
+        return Ok(());
+    }
     if let Value::Object(Some(arr)) = ctx.get_field(this, STREAM_FIELD_CLOSE_HANDLERS) {
         ctx.set_field(this, STREAM_FIELD_CLOSE_HANDLERS, Value::Object(None));
         let len = ctx.array_length(arr);
@@ -9417,6 +9433,14 @@ fn native_stream_on_close(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         .class_name_of_id(ctx.class_id_of_object(this))
         .unwrap_or_default();
     if !is_synthetic_stream(&cn) {
+        return Ok(Some(Value::Object(Some(this))));
+    }
+    // W1 fix: a 1-field synthetic stream (e.g. Files.lines's eager array-backed
+    // stream) has no close-handler slot to attach to. Reading/writing slot 1
+    // would index past the receiver; behave as a no-op (return `this`) instead.
+    // CratonVM materialises such streams eagerly, so there is no live resource a
+    // close handler would need to release.
+    if ctx.object_num_fields(this) <= STREAM_FIELD_CLOSE_HANDLERS {
         return Ok(Some(Value::Object(Some(this))));
     }
     let handler = match args.get(1) {
@@ -10239,6 +10263,10 @@ fn native_stream_concat(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
                 .class_name_of_id(ctx.class_id_of_object(src))
                 .unwrap_or_default();
             if !is_synthetic_stream(&cn) {
+                continue;
+            }
+            // W1 fix: skip 1-field sources with no close-handler slot.
+            if ctx.object_num_fields(src) <= STREAM_FIELD_CLOSE_HANDLERS {
                 continue;
             }
             if let Value::Object(Some(arr)) = ctx.get_field(src, STREAM_FIELD_CLOSE_HANDLERS) {
