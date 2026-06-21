@@ -131,7 +131,11 @@ OSR-exit = a real-frame deopt taken at a **loop bci** (not a guard bci): a runni
 
 ### Scaffolding status for B
 
-Already in the tree: `DeoptReason::OsrExit` (`deopt.rs:52`), `CompiledMethod.can_osr_exit` (`lib.rs:1064`), `compilation_epoch` (`lib.rs:1070`), `recommend_action` (`deopt.rs:287-330`), and the whole reusable PC-selection (`osr_entry_native`) + trampoline + sink. **Not yet in the tree:** `emit_osr_exit_map_at`, `Compiler.osr_exit_points` / `CompiledMethod.osr_exit_points`, the Step-8 mid-loop sink branch + sentinel-disable, and the Step-9 epoch-invalidation consumer.
+Already in the tree: `DeoptReason::OsrExit` (`deopt.rs:52`), `CompiledMethod.can_osr_exit` (`lib.rs:1064`), `compilation_epoch` (`lib.rs:1070`), `recommend_action` (`deopt.rs:287-330`), and the whole reusable PC-selection (`osr_entry_native`) + trampoline + sink.
+
+**Step 7 — DONE (2026-06-21).** `emit_osr_exit_map_at` (`jit/src/x64.rs`, sharing `build_and_record_deopt_point` with the BCE-guard snapshot, tagged `DeoptReason::OsrExit`) is called at every OSR-vetted loop-boundary PC (`osr_entry_native[pc] >= 0`, right after the LICM-hoist check), **gated on `deopt_real_enabled()`** so production builds zero OSR-exit metadata and stay byte-identical. `Compiler.osr_exit_points` + `osr_exit_box_ptr_by_bci` (Step-8 keying) added; at finalize `cm.osr_exit_points = compiler.osr_exit_points` and `cm.can_osr_exit = !osr_exit_points.is_empty()` (`CompiledMethod.osr_exit_points` field added). Emit-and-discard — nothing consumes the maps yet. **Live-validated:** under `CRATONVM_DEOPT_REAL=1 CRATONVM_DBG_DEOPT=1`, a counted-loop method emits exit maps at each loop-body bci with `locals == max_locals` and stack depth tracking the operand stack; with the gate off, **zero** maps and identical result (`acc=14985000000`). 824 jit lib tests green.
+
+**Not yet in the tree:** the Step-8 mid-loop sink branch + trigger codegen (a guard at a loop bci routing to the OSR-exit stub) + sentinel-disable, and the Step-9 epoch-invalidation consumer. **Step-8 note:** the trigger is *new x64 codegen* (emit a guard at a loop bci that jumps to a frame-deopt stub baking the `osr_exit_box_ptr_by_bci` pointer), and it carries the OSR-frame-under-moving-GC caveat (`CRATONVM_SHADOW_OSR_TRACK`, default OFF) — best coordinated with the moving-GC work, or kept strictly on the non-moving sweep + gated.
 
 ---
 

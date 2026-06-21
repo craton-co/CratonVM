@@ -6193,6 +6193,17 @@ struct Compiler {
     /// for that guard, baked as arg0 (imm64) by the frame-deopt stub. Populated
     /// by `emit_deopt_snapshot_at_guard`.
     deopt_box_ptr_by_bci: rustc_hash::FxHashMap<usize, *const crate::deopt::DeoptimizationPoint>,
+    /// deopt-osr Step 7: bcis (loop-boundary PCs vetted by OSR-entry) that carry
+    /// an OSR-exit map in `deopt_points`/`deopt_boxes` (tagged
+    /// `DeoptReason::OsrExit`). Transferred to `CompiledMethod::osr_exit_points`
+    /// at finalize; a non-empty set drives `can_osr_exit`. Emit-and-discard until
+    /// Step 8 wires the mid-loop sink. Only populated when `deopt_real_enabled()`.
+    osr_exit_points: Vec<usize>,
+    /// deopt-osr Step 7: bci → stable boxed-point pointer for the OSR-exit map at
+    /// that loop bci (mirrors `deopt_box_ptr_by_bci`; kept separate so an OSR-exit
+    /// map and a guard snapshot at the same bci cannot collide on the key).
+    osr_exit_box_ptr_by_bci:
+        rustc_hash::FxHashMap<usize, *const crate::deopt::DeoptimizationPoint>,
 }
 
 /// deopt-osr Step 1: map a frame slot's machine location + oop-ness to a
@@ -6573,6 +6584,8 @@ impl Compiler {
             deopt_boxes: Vec::new(),
             deopt_regs_base,
             deopt_box_ptr_by_bci: FxHashMap::default(),
+            osr_exit_points: Vec::new(),
+            osr_exit_box_ptr_by_bci: FxHashMap::default(),
         }
     }
 
@@ -6693,7 +6706,51 @@ impl Compiler {
     /// (transferred to `CompiledMethod` at finalize) but no live path consumes it
     /// yet, so this does not change the `i64::MIN` re-run behaviour.
     fn emit_deopt_snapshot_at_guard(&mut self, bci: usize) {
-        use crate::deopt::{DeoptAction, DeoptReason, DeoptimizationPoint, FrameState, FrameValue};
+        let box_ptr =
+            self.build_and_record_deopt_point(bci, crate::deopt::DeoptReason::BoundsCheck);
+        self.deopt_box_ptr_by_bci.insert(bci, box_ptr);
+    }
+
+    /// deopt-osr Step 7: emit an OSR-exit map — a precise deopt snapshot tagged
+    /// `DeoptReason::OsrExit` — at a loop-boundary `bci` (one of the PCs already
+    /// vetted OSR-eligible, i.e. `osr_entry_native[pc] >= 0`, so it inherits the
+    /// LICM-hoist rejection). EMIT-AND-DISCARD: it records the map in
+    /// `deopt_points`/`deopt_boxes` + the OSR-exit PC set, but no exit path
+    /// consumes it until Step 8 routes the mid-loop bail through the same deopt
+    /// trampoline. Only called when `deopt_real_enabled()` (see the call site), so
+    /// production builds zero OSR-exit metadata and stay byte-identical.
+    fn emit_osr_exit_map_at(&mut self, bci: usize) {
+        let box_ptr = self.build_and_record_deopt_point(bci, crate::deopt::DeoptReason::OsrExit);
+        self.osr_exit_box_ptr_by_bci.insert(bci, box_ptr);
+        self.osr_exit_points.push(bci);
+        if std::env::var_os("CRATONVM_DBG_DEOPT").is_some() {
+            // Step-7 emit-and-discard trace: confirm an exit map was recorded at
+            // this OSR-vetted loop boundary (locals/stack come from the same
+            // unit-tested `frame_value_for_slot` provenance as the guard path).
+            let p = self.deopt_points.last().unwrap();
+            eprintln!(
+                "[cratonvm-deopt] OSR-exit map emitted at bci={bci} \
+                 (locals={}, stack={})",
+                p.frame_state.locals.len(),
+                p.frame_state.stack.len(),
+            );
+        }
+    }
+
+    /// Build a `DeoptimizationPoint` capturing the interpreter frame at `bci`
+    /// from the current regalloc provenance (`reg_for_local`/`xmm_for_local`/
+    /// `local_offset` + the simulated operand stack) and the positive oop sources
+    /// (`local_oop_masks`/`local_oop_reached`/`stack_oop_marks`), record it in
+    /// `deopt_points` + a stable `deopt_boxes` copy, and return the boxed-point
+    /// pointer (for the caller to key by bci). Shared by the BCE-guard snapshot
+    /// and the OSR-exit map, which differ only in `reason` and which bci→ptr map
+    /// they populate. Emits NO machine code — pure metadata.
+    fn build_and_record_deopt_point(
+        &mut self,
+        bci: usize,
+        reason: crate::deopt::DeoptReason,
+    ) -> *const crate::deopt::DeoptimizationPoint {
+        use crate::deopt::{DeoptAction, DeoptimizationPoint, FrameState, FrameValue};
 
         let native_offset = self.buf.pos() as u32;
 
@@ -6740,7 +6797,7 @@ impl Compiler {
         let point = DeoptimizationPoint {
             native_offset,
             bci: bci as u32,
-            reason: DeoptReason::BoundsCheck,
+            reason,
             action: DeoptAction::Reinterpret,
             speculation_id: 0,
             frame_state: FrameState {
@@ -6753,16 +6810,15 @@ impl Compiler {
             },
         };
         // Record a stable boxed copy (the frame-deopt stub bakes it as arg0) and
-        // the by-value point (find_deopt_point / iteration).
+        // the by-value point (find_deopt_point / iteration). The Box payload does
+        // not move when `deopt_boxes` reallocs or when it is moved into
+        // `CompiledMethod::_deopt_point_boxes` at finalize (and is leaked on
+        // Drop), so a baked imm64 of this pointer outlives the emitted code.
         self.deopt_boxes.push(Box::new(point.clone()));
-        // deopt-osr Step 2 — stash the Box's stable payload address keyed by bci.
-        // The Box payload does not move when `deopt_boxes` reallocs or when it is
-        // moved into `CompiledMethod._deopt_point_boxes` at finalize (and is leaked
-        // on Drop), so a baked imm64 of this pointer outlives the emitted code.
         let box_ptr: *const crate::deopt::DeoptimizationPoint =
             &**self.deopt_boxes.last().unwrap();
-        self.deopt_box_ptr_by_bci.insert(bci, box_ptr);
         self.deopt_points.push(point);
+        box_ptr
     }
 
     /// Push a value onto the simulated operand stack.
@@ -13978,6 +14034,17 @@ impl Compiler {
                                                                        // `CompiledMethod::shadow_thread_slot_off` / try_osr), which
                                                                        // makes OSR-entered frames skip shadow tracking via the
                                                                        // null-guards (safe; precise OSR-frame tracking is a follow-up).
+
+                    // deopt-osr Step 7: this PC is an OSR-vetted loop boundary
+                    // (outside every LICM-hoisted body — the `else` branch), so
+                    // emit an OSR-exit map capturing the loop-body interpreter
+                    // state here. Emit-and-discard: Step 8 will resume the loop
+                    // body at this bci on a mid-loop bail. Gated on
+                    // `deopt_real_enabled()` so production (deopt off) builds no
+                    // OSR-exit metadata and stays byte-identical.
+                    if crate::deopt_real_enabled() {
+                        self.emit_osr_exit_map_at(pc);
+                    }
                 }
             }
             // === LICM: Emit hoisted aaload code at loop headers ===
@@ -22172,6 +22239,13 @@ pub fn compile_with_param_slots(
     // (find_deopt_point has no live caller; the i64::MIN re-run is unchanged).
     cm.deopt_points = compiler.deopt_points;
     cm._deopt_point_boxes = compiler.deopt_boxes;
+    // deopt-osr Step 7 — transfer the OSR-exit loop-boundary bci set and set the
+    // per-method gate. Both are empty/false unless `deopt_real_enabled()` was on
+    // (the emit site is gated), so production artifacts are unchanged. Step 8
+    // consults `can_osr_exit` + `osr_exit_points` (under `CRATONVM_DEOPT_REAL`)
+    // to route a mid-loop bail through the deopt trampoline.
+    cm.osr_exit_points = compiler.osr_exit_points;
+    cm.can_osr_exit = !cm.osr_exit_points.is_empty();
     // Stage 3 — the frame offset where this method stores the active
     // safepoint's bytecode PC (0 when the precise gate was off at compile).
     cm.sp_id_slot_off = compiler.sp_id_slot_off;

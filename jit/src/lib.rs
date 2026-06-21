@@ -1056,12 +1056,22 @@ pub struct CompiledMethod {
     /// behaviour change until the resume path is wired
     /// (see `docs/feature-designs/deopt-osr.md`).
     pub can_deopt_resume: bool,
-    /// deopt-osr scaffolding — `true` only once the OSR-exit map emitter has
-    /// proven this (OSR-compiled) method can leave a running JIT/OSR frame
-    /// mid-loop at a loop bci with the loop's live state, rather than the
-    /// `i64::MIN` re-run (which is *wrong* for an OSR'd frame entered partway
-    /// through). `false` by default; no emitter populates it yet.
+    /// deopt-osr Step 7 — `true` once the OSR-exit map emitter has recorded at
+    /// least one loop-boundary exit map for this (OSR-compiled) method, i.e. it
+    /// can leave a running JIT/OSR frame mid-loop at a loop bci with the loop's
+    /// live state, rather than the `i64::MIN` re-run (which is *wrong* for an
+    /// OSR'd frame entered partway through). Set at finalize to
+    /// `!osr_exit_points.is_empty()`; only non-empty when `deopt_real_enabled()`
+    /// was on at compile, so `false` in production. Step 8 consults it (with the
+    /// `CRATONVM_DEOPT_REAL` gate) before routing a mid-loop bail.
     pub can_osr_exit: bool,
+    /// deopt-osr Step 7 — the loop-boundary bcis (OSR-vetted, outside every
+    /// LICM-hoisted body) for which an OSR-exit map was emitted into
+    /// `deopt_points` (tagged `DeoptReason::OsrExit`). Empty unless
+    /// `deopt_real_enabled()` was set at compile. Step 8 looks a trapping loop
+    /// bci up here to decide whether to OSR-exit (resume the loop body) vs
+    /// re-run.
+    pub osr_exit_points: Vec<usize>,
     /// deopt-osr scaffolding — monotonic compilation epoch for this artifact.
     /// When `MakeNotEntrant` invalidation lands, boxed `DeoptimizationPoint`
     /// pointers (baked into guard code) are versioned by this epoch so a
@@ -1170,6 +1180,7 @@ impl CompiledMethod {
             // emitter sets these yet (see docs/feature-designs/deopt-osr.md).
             can_deopt_resume: false,
             can_osr_exit: false,
+            osr_exit_points: Vec::new(),
             compilation_epoch: 0,
         }
     }
@@ -1220,6 +1231,7 @@ impl CompiledMethod {
             // emitter sets these yet (see docs/feature-designs/deopt-osr.md).
             can_deopt_resume: false,
             can_osr_exit: false,
+            osr_exit_points: Vec::new(),
             compilation_epoch: 0,
         }
     }
