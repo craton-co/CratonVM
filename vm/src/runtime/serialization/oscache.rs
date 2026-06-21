@@ -364,8 +364,8 @@ mod tests {
     fn register_for_test(cache: &OscCache) {
         let ptr = &cache.inner as *const OscMap;
         let mut guard = cache_registry().lock();
-        if !guard.contains(&ptr) {
-            guard.push(ptr);
+        if !guard.iter().any(|s| s.0 == ptr) {
+            guard.push(SendPtr(ptr));
         }
     }
 
