@@ -299,6 +299,24 @@ Also fixed on dev this run (no standalone doc — see commit): `Locale.toLanguag
 
 - **Hibernate wrong-result assertion failures** — cluster of CV-only wrong-result assertion FAILs (UniqueConstraintBatching 1-vs-0, DetachedBag true-vs-false, EntityGraphBatchSize, immutable+converter deser, …); each likely a separate root cause. 🔴 open (handoff; standalone doc not preserved).
 
+## Test-suite repair findings (2026-06-21)
+
+While repairing the in-repo test suites (most failures were stale tests / missing
+fixtures / a wrong feature set — all fixed on `dev`), three defects were left open
+because each needs a risky core change or a large quality pass:
+
+- **JIT `idiv`/`irem` divide-by-zero re-runs the whole method** (side effects double-execute):
+  [nested-try-catch-jit-divzero-rerun.md](nested-try-catch-jit-divzero-rerun.md). Root-caused;
+  the direct-throw fix already exists on branch `feat/coupled-deopt-moving-spine` and needs a
+  bt18-soak re-verify before landing on `dev`.
+- **Brooks read-barrier vs CompactHeader forwarding** (`load_and_forward` reads the legacy
+  forwarding slot while the test installs the compact one):
+  [tier1-brooks-compactheader-forwarding.md](tier1-brooks-compactheader-forwarding.md). Needs a
+  maintainer call on which forwarding format the live collector uses before any change.
+- **T11 safety-annotation coverage below thresholds**:
+  [t11-safety-annotation-coverage.md](t11-safety-annotation-coverage.md). Documentation-only but
+  large (~264 cast annotations in interpreter.rs); must be authored accurately, not marker-spammed.
+
 ## Consolidation log
 
 - **2026-06-17:** Merged `precise-jit-stack-maps-multithread-fjp-worker-testcase.md`
