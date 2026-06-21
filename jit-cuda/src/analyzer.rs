@@ -367,6 +367,44 @@ fn scan_bytecode(
     // / sum reduction accumulates into a scalar local and never writes an
     // array, so an array store disqualifies the reduction shape.
     let mut body_has_array_store = false;
+    // Reduction dataflow proof (review jit-cuda-review.md §1 MED): a
+    // shape match (counted loop + array load + `*add`) is NOT enough to
+    // prove a reduction. A method like `for (i…) { acc += a[i]; } return
+    // a[0];` matches the shape but returns an array element, not the
+    // accumulator — flagging it `is_reduction` makes the emitter
+    // atomically-add the per-thread element into `ret_ptr`, racing the
+    // wrong values. To rule that out we require a real loop-carried
+    // accumulator: a local that is read, fed into a `*add`, stored back
+    // to the SAME slot inside the loop body (`*load S; …; *add; *store
+    // S` — the loop re-runs each iteration, giving the loop-carried
+    // dependency), AND whose value is what the method returns (`*load S;
+    // *return`). We track the most-recent `*load` slot so a following
+    // `*add`→`*store` chain can confirm the store target matches a slot
+    // that was loaded since the last store; and we remember the slot
+    // returned by the trailing `*load S; *return`.
+    //
+    // This is a deliberate over-approximation in the SAFE direction:
+    // false-negatives (missing a genuine reduction → non-atomic serial
+    // fallback) are acceptable, false-positives (a wrong `atom.add`) are
+    // not. Anything we cannot prove falls back to a plain map / CPU.
+    //
+    // `acc_slots` collects every slot that has a proven `*load S; …;
+    // *add; *store S` accumulation; `returned_slot` is the slot of a
+    // trailing `*load S; *return`. The two must intersect for the body
+    // to be a recognised reduction.
+    let mut acc_slots: Vec<u16> = Vec::new();
+    let mut returned_slot: Option<u16> = None;
+    // Slots loaded since the last store, used to confirm that a
+    // `*store S` writing the result of a `*add` is writing back a slot
+    // that the same expression read (the `acc = acc + x` self-feed).
+    let mut loaded_since_store: Vec<u16> = Vec::new();
+    // True while the value on top of the operand stack was produced by an
+    // arithmetic `*add` and not yet consumed by a store — lets the next
+    // `*store S` recognise the `acc = acc + x` shape.
+    let mut add_result_live = false;
+    // The slot of the most-recent `*load` (for the `*load S; *return`
+    // trailing pattern).
+    let mut last_load_slot: Option<u16> = None;
     // Literal loop-bound recovery for the work estimate. The canonical
     // counted loop compares the induction variable against its bound with
     // a forward `if_icmp*` (`iload iv; <bound>; if_icmpge exit`). When the
@@ -389,6 +427,49 @@ fn scan_bytecode(
         }
         if (0x4F..=0x56).contains(&op) && op != 0x53 {
             body_has_array_store = true;
+        }
+
+        // ── Reduction dataflow tracking ────────────────────────────────
+        // Decode the local slot read/written by integer/long/float/double
+        // load/store opcodes so we can prove the `acc = acc + x` self-feed
+        // and the `*load acc; *return` link.
+        if let Some(slot) = load_slot(bytes, pc) {
+            // A `*load` after the latest `*store` that may feed an `*add`.
+            loaded_since_store.push(slot);
+            last_load_slot = Some(slot);
+            // Loading anything other than the live add-result clears the
+            // "add result is on top of stack" flag conservatively.
+            add_result_live = false;
+        } else if (0x60..=0x63).contains(&op) {
+            // `*add` consumes two stack values and leaves the sum on top.
+            add_result_live = true;
+        } else if let Some(slot) = store_slot(bytes, pc) {
+            // `*store S` where the stored value came from an `*add` AND S
+            // was itself loaded earlier in this straight-line run is the
+            // `acc = acc + x` accumulation. Record S as an accumulator.
+            if add_result_live && loaded_since_store.contains(&slot) {
+                if !acc_slots.contains(&slot) {
+                    acc_slots.push(slot);
+                }
+            }
+            // A store starts a fresh load window and consumes the value.
+            loaded_since_store.clear();
+            add_result_live = false;
+            last_load_slot = None;
+        } else if (0xAC..=0xAF).contains(&op) {
+            // `*return` of a scalar: the value on top of the stack is what
+            // the method returns. If it came directly from a `*load S`
+            // (the immediately-preceding op), S is the returned slot.
+            if prev_op.map(is_load_op).unwrap_or(false) {
+                returned_slot = last_load_slot;
+            }
+        } else {
+            // Any other opcode that touches the operand stack invalidates
+            // our cheap "add result on top" assumption. Be conservative:
+            // only opcodes we explicitly model (loads/stores/adds/returns)
+            // keep `add_result_live`; everything else clears it so a later
+            // `*store` cannot be mistaken for an accumulation.
+            add_result_live = false;
         }
 
         // Track literal integer pushes so a forward exit-comparison can
@@ -491,8 +572,26 @@ fn scan_bytecode(
     // store, and the dispatcher declines to launch it (it silently falls
     // back to the CPU). The `!body_has_array_store` guard keeps maps out of
     // the reduction shape; `analyze` additionally gates on a scalar return.
-    let is_dot_product_reduction =
-        has_backward && body_has_array_load && body_has_add && !body_has_array_store;
+    //
+    // Beyond the shape, require a proven accumulator dataflow link (review
+    // jit-cuda-review.md §1 MED — "reduction recognition is shape-only"):
+    // some slot must be BOTH a proven loop-carried accumulator
+    // (`*load S; …; *add; *store S`) AND the slot the method returns
+    // (`*load S; *return`). Without this link a body like
+    // `for (i…) { acc += a[i]; } return a[0];` matches the syntactic shape
+    // yet returns an unrelated array element — flagging it `is_reduction`
+    // would emit an `atom.add` of the wrong value. The check is a
+    // conservative over-approximation: if we cannot prove the link the
+    // method falls back to the non-atomic serial path (false-negatives are
+    // safe, false-positives are not).
+    let accumulator_feeds_return = returned_slot
+        .map(|s| acc_slots.contains(&s))
+        .unwrap_or(false);
+    let is_dot_product_reduction = has_backward
+        && body_has_array_load
+        && body_has_add
+        && !body_has_array_store
+        && accumulator_feeds_return;
     Ok((
         this_field_cps,
         estimated_work,
@@ -582,6 +681,54 @@ fn is_iload_family(op: Option<u8>) -> bool {
         // `iload` (0x15) + `iload_0..iload_3` (0x1A..=0x1D).
         Some(0x15) | Some(0x1A) | Some(0x1B) | Some(0x1C) | Some(0x1D) => true,
         _ => false,
+    }
+}
+
+/// True if `op` is a non-reference scalar `*load` opcode (`iload`/`lload`/
+/// `fload`/`dload` and their `_0..=_3` short forms). Used by the reduction
+/// dataflow check; `aload` (reference) is deliberately excluded because
+/// reference locals can never be a numeric accumulator.
+fn is_load_op(op: u8) -> bool {
+    matches!(op, 0x15..=0x18) || matches!(op, 0x1A..=0x29)
+}
+
+/// Decode the local-variable slot read by the scalar `*load` at `pc`, or
+/// `None` if the opcode at `pc` is not a scalar load. Handles both the
+/// two-byte `iload <index>` family and the one-byte `iload_<n>` forms.
+/// Returns `None` on a truncated two-byte operand (defensive — the main
+/// walker re-checks bounds via `instruction_size`).
+fn load_slot(bytes: &[u8], pc: usize) -> Option<u16> {
+    match bytes[pc] {
+        // iload/lload/fload/dload <index> — operand is the next byte.
+        0x15..=0x18 => bytes.get(pc + 1).map(|&b| b as u16),
+        // iload_0..=iload_3 (0x1A..=0x1D).
+        0x1A..=0x1D => Some((bytes[pc] - 0x1A) as u16),
+        // lload_0..=lload_3 (0x1E..=0x21).
+        0x1E..=0x21 => Some((bytes[pc] - 0x1E) as u16),
+        // fload_0..=fload_3 (0x22..=0x25).
+        0x22..=0x25 => Some((bytes[pc] - 0x22) as u16),
+        // dload_0..=dload_3 (0x26..=0x29).
+        0x26..=0x29 => Some((bytes[pc] - 0x26) as u16),
+        _ => None,
+    }
+}
+
+/// Decode the local-variable slot written by the scalar `*store` at `pc`,
+/// or `None` if the opcode at `pc` is not a scalar store. Mirror of
+/// [`load_slot`] for the `istore`/`lstore`/`fstore`/`dstore` families.
+fn store_slot(bytes: &[u8], pc: usize) -> Option<u16> {
+    match bytes[pc] {
+        // istore/lstore/fstore/dstore <index> — operand is the next byte.
+        0x36..=0x39 => bytes.get(pc + 1).map(|&b| b as u16),
+        // istore_0..=istore_3 (0x3B..=0x3E).
+        0x3B..=0x3E => Some((bytes[pc] - 0x3B) as u16),
+        // lstore_0..=lstore_3 (0x3F..=0x42).
+        0x3F..=0x42 => Some((bytes[pc] - 0x3F) as u16),
+        // fstore_0..=fstore_3 (0x43..=0x46).
+        0x43..=0x46 => Some((bytes[pc] - 0x43) as u16),
+        // dstore_0..=dstore_3 (0x47..=0x4A).
+        0x47..=0x4A => Some((bytes[pc] - 0x47) as u16),
+        _ => None,
     }
 }
 
@@ -933,5 +1080,66 @@ mod tests {
             matches!(baseline, OffloadVerdict::Eligible(_)),
             "control: vectorAdd must be Eligible without annotations"
         );
+    }
+
+    // ─── reduction dataflow helpers (review jit-cuda-review.md §1 MED) ──
+    //
+    // These exercise the slot-decoding helpers that back the
+    // accumulator-feeds-return proof directly, without needing a Java
+    // fixture (the `test_classes/gpu/` sources live outside this crate's
+    // owned-file scope). The end-to-end behaviour — a genuine
+    // `return acc` reduction stays `is_reduction`, a `return a[0]`
+    // shape-match does not — is covered by `eligible_dot_product_returns_long`
+    // plus a future `ReductionFalsePositive` fixture noted in the review.
+
+    #[test]
+    fn load_slot_decodes_short_and_wide_forms() {
+        // iload_0..=iload_3 (0x1A..=0x1D).
+        assert_eq!(load_slot(&[0x1A], 0), Some(0));
+        assert_eq!(load_slot(&[0x1D], 0), Some(3));
+        // lload_2 (0x20), fload_1 (0x23), dload_3 (0x29).
+        assert_eq!(load_slot(&[0x20], 0), Some(2));
+        assert_eq!(load_slot(&[0x23], 0), Some(1));
+        assert_eq!(load_slot(&[0x29], 0), Some(3));
+        // Two-byte `iload <index>` (0x15) / `dload <index>` (0x18).
+        assert_eq!(load_slot(&[0x15, 7], 0), Some(7));
+        assert_eq!(load_slot(&[0x18, 42], 0), Some(42));
+        // Non-load opcodes and reference loads decode to None — an
+        // `aload` (0x2A / 0x19) must NOT be mistaken for a scalar
+        // accumulator load.
+        assert_eq!(load_slot(&[0x2A], 0), None); // aload_0
+        assert_eq!(load_slot(&[0x19, 0], 0), None); // aload <index>
+        assert_eq!(load_slot(&[0x60], 0), None); // iadd
+        // Truncated two-byte operand decodes to None rather than panicking.
+        assert_eq!(load_slot(&[0x15], 0), None);
+    }
+
+    #[test]
+    fn store_slot_decodes_short_and_wide_forms() {
+        // istore_0..=istore_3 (0x3B..=0x3E).
+        assert_eq!(store_slot(&[0x3B], 0), Some(0));
+        assert_eq!(store_slot(&[0x3E], 0), Some(3));
+        // lstore_1 (0x40), fstore_2 (0x45), dstore_0 (0x47).
+        assert_eq!(store_slot(&[0x40], 0), Some(1));
+        assert_eq!(store_slot(&[0x45], 0), Some(2));
+        assert_eq!(store_slot(&[0x47], 0), Some(0));
+        // Two-byte `istore <index>` (0x36).
+        assert_eq!(store_slot(&[0x36, 9], 0), Some(9));
+        // astore (reference store) must not decode as a scalar store.
+        assert_eq!(store_slot(&[0x4B], 0), None); // astore_0
+        assert_eq!(store_slot(&[0x3A, 0], 0), None); // astore <index>
+        assert_eq!(store_slot(&[0x36], 0), None); // truncated -> None
+    }
+
+    #[test]
+    fn is_load_op_excludes_reference_loads() {
+        assert!(is_load_op(0x15)); // iload
+        assert!(is_load_op(0x1A)); // iload_0
+        assert!(is_load_op(0x29)); // dload_3
+        // aload family is intentionally excluded.
+        assert!(!is_load_op(0x19)); // aload
+        assert!(!is_load_op(0x2A)); // aload_0
+        assert!(!is_load_op(0x2D)); // aload_3
+        assert!(!is_load_op(0xAC)); // ireturn
     }
 }
