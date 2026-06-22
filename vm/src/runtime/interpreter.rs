@@ -4194,16 +4194,19 @@ pub fn execute(
 
     // If the JIT early-compile path encountered a Java exception from a callee,
     // route it through this method's exception table before interpreter execution.
-    if jit_early_exception.is_some() {
+    if let Some(early_exc) = jit_early_exception {
         // The frame has been pushed. Search its exception table for a handler.
         let frame_idx = thread.frames.len() - 1;
         // Re-read the exception oop from the (GC-scanned) operand stack: a GC
         // during the MethodEntry callback may have relocated it, and only the
         // scanned frame slot was updated — not the original Rust local. Fall
-        // back to the local if the pre-fire push did not take.
+        // back to the bound `early_exc` (the known-Some local) if the pre-fire
+        // push did not take (e.g. a `max_stack == 0` method). Binding it in the
+        // `if let` keeps this fallback panic-free (no `.expect()`), satisfying
+        // the strict-zero production-panic gate.
         let exc = match thread.frames[frame_idx].stack.pop() {
             Ok(Value::Object(Some(r))) => r,
-            _ => jit_early_exception.expect("jit_early_exception is_some"),
+            _ => early_exc,
         };
         // The JIT executed the entire method body as native code, so there is
         // no live throw-site PC. Previously this passed the freshly-pushed

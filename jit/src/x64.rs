@@ -7327,13 +7327,16 @@ impl Compiler {
             // Step-7 emit-and-discard trace: confirm an exit map was recorded at
             // this OSR-vetted loop boundary (locals/stack come from the same
             // unit-tested `frame_value_for_slot` provenance as the guard path).
-            let p = self.deopt_points.last().unwrap();
-            eprintln!(
-                "[cratonvm-deopt] OSR-exit map emitted at bci={bci} \
-                 (locals={}, stack={})",
-                p.frame_state.locals.len(),
-                p.frame_state.stack.len(),
-            );
+            // `if let` (not `.unwrap()`) keeps this debug trace panic-free —
+            // `build_and_record_deopt_point` just pushed, so `last()` is Some.
+            if let Some(p) = self.deopt_points.last() {
+                eprintln!(
+                    "[cratonvm-deopt] OSR-exit map emitted at bci={bci} \
+                     (locals={}, stack={})",
+                    p.frame_state.locals.len(),
+                    p.frame_state.stack.len(),
+                );
+            }
         }
     }
 
@@ -7506,8 +7509,13 @@ impl Compiler {
         // not move when `deopt_boxes` reallocs or when it is moved into
         // `CompiledMethod::_deopt_point_boxes` at finalize (and is leaked on
         // Drop), so a baked imm64 of this pointer outlives the emitted code.
-        self.deopt_boxes.push(Box::new(point.clone()));
-        let box_ptr: *const crate::deopt::DeoptimizationPoint = &**self.deopt_boxes.last().unwrap();
+        // Capture the heap payload's address with `addr_of!` BEFORE moving the
+        // Box into the Vec — pushing the Box (a pointer) does not relocate its
+        // payload, so this is the same address `&**deopt_boxes.last()` would
+        // yield, without a `.unwrap()` (keeps this hot codegen path panic-free).
+        let boxed = Box::new(point.clone());
+        let box_ptr: *const crate::deopt::DeoptimizationPoint = std::ptr::addr_of!(*boxed);
+        self.deopt_boxes.push(boxed);
         self.deopt_points.push(point);
         box_ptr
     }
