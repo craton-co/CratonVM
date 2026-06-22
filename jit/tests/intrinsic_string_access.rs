@@ -78,6 +78,7 @@ fn helpers() -> JitRuntimeHelpers {
         checkcast: s,
         instanceof_check: s,
         throw_aioobe: s,
+        throw_arithmetic: s,
         invoke_dispatch: s,
         invoke_virtual_mic: s,
         write_barrier: s,
