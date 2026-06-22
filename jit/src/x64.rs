@@ -7432,10 +7432,20 @@ impl Compiler {
             let xmm = self.xmm_for_local(i);
             let off = self.local_offset(i);
             let fv = if is_oop {
-                // The precise oop mask is the authority for ref-typed slots
-                // (provenance only; register-resident-oop typing is deferred —
-                // unchanged from Phase A).
-                frame_value_for_slot(reg, xmm, off, true)
+                // The precise oop mask is the authority for ref-typed slots. A
+                // SPILLED ref → `StackSlotRef` (the slot word IS the heap
+                // pointer). A REGISTER-resident ref, however, has no sound
+                // encoding yet: `Register(r)` resolves to `Int`, which both
+                // mistypes the slot AND drops the oop from GC tracking on resume
+                // (a moving-GC UAF). Until register-resident-oop typing lands,
+                // emit `Unsupported` so such a frame re-runs. (For the BCE pilot
+                // the array ref is spilled at the guard, so this is a no-op there;
+                // it keeps the P2 gate-relax sound for any newly-admitted method.)
+                if reg.is_some() {
+                    crate::deopt::FrameValue::Unsupported
+                } else {
+                    frame_value_for_slot(reg, xmm, off, true)
+                }
             } else if let Some(&kind) = self.local_kinds.get(i) {
                 // Non-oop slot, width-typed from the classifier (deopt-osr P2).
                 typed_local_frame_value(reg, xmm, off, kind)
@@ -23258,19 +23268,22 @@ pub fn compile_with_param_slots(
     // artifacts are unchanged. Consumed at the interpreter deopt sink, which
     // attempts `resume_real_ir_deopt` only when `compiled.can_deopt_resume`.
     //
-    // P2.0 (cat-2 soundness): also exclude any method with a wide (long/double)
-    // local. The snapshot has no per-slot WIDTH source yet, so a `long` local is
-    // recorded as `Register`/`StackSlot` and resolves to `Int` — TRUNCATING the
-    // high 32 bits on resume (silent corruption). A `double` already resolves to
-    // `Unsupported` → safe re-run, but a `long` would corrupt. Until P2.1 threads
-    // a width source + a `Long` FrameValue through `frame_value_for_slot` and the
-    // resume mapper, gate such methods to the safe whole-method re-run. (Cat-2
-    // operand-stack values are not a concern at the BCE loop-header guard — the
-    // operand stack is canonically empty there.)
-    let has_wide_local = !wide_local_high_halves(code, code_len).is_empty();
+    // P2.1 (cat-2 long resume): the snapshot now has a per-slot WIDTH source
+    // (`classify_local_kinds`) and emits a typed `RegisterLong`/`StackSlotLong`
+    // for a `long` local, which the resume mapper reconstructs as a full-64-bit
+    // `Value::Long` (P2.0's blanket wide-local exclusion truncated these — it is
+    // now lifted for long-only methods). `float`/`double` are still excluded here
+    // (FP-in-XMM resolution = P2.2): a method with any classified FP local takes
+    // the safe whole-method re-run. (Any slot the classifier can't type emits
+    // `Unsupported` and the mapper re-runs regardless — this gate is the coarse
+    // pre-filter; the per-slot `Unsupported` is the fine-grained safety net.)
+    let has_fp_local = compiler
+        .local_kinds
+        .iter()
+        .any(|k| matches!(k, LocalKind::Float | LocalKind::Double));
     cm.can_deopt_resume = !cm.deopt_points.is_empty()
         && compiler.scalar_replaced.is_empty()
-        && !has_wide_local;
+        && !has_fp_local;
     // deopt-osr Step 7 — transfer the OSR-exit loop-boundary bci set and set the
     // per-method gate. Both are empty/false unless `deopt_real_enabled()` was on
     // (the emit site is gated), so production artifacts are unchanged. Step 8
