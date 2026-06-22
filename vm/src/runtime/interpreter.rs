@@ -7914,45 +7914,10 @@ fn ir_deopt_frame_values(vals: &[cratonvm_jit::deopt::FrameValue]) -> Option<Vec
     vals.iter().map(fv_to_value).collect()
 }
 
-/// Map reconstructed `FrameValue`s 1:1 (NO cat-2 collapse), accepting only
-/// `Int`/`Object`/`Undefined` and bailing (`None`) on every cat-2/FP/unresolved
-/// slot. Used by `transfer_osr_exit_into_live_frame` (the true OSR-exit transfer),
-/// whose JVM-slot-indexed in-place write (`set_local_unchecked(i, …)`) requires a
-/// non-collapsing mapper that REJECTS cat-2 (a `long`/`double` would otherwise
-/// mis-align the 1:1 write). This is deliberately distinct from
-/// `ir_deopt_locals`/`ir_deopt_frame_values`, which the deopt-EXIT path
-/// (`build_deopt_frame_inner`) uses *with* the cat-2 collapse + FP support.
-///
-/// NOTE (2026-06-22): P2 Inc 4 removed this as "no caller" while the P4 OSR-exit
-/// transfer that calls it lived on a separately-forked branch, so the two merges
-/// left dev with a dangling call (it did not compile). Restored here. Making the
-/// OSR-exit transfer cat-2/FP-aware (write a `long`/`double` across two slots) is
-/// a documented follow-up; today such a frame bails to the safe re-run/reject.
-fn ir_deopt_frame_values_with_objects(
-    vals: &[cratonvm_jit::deopt::FrameValue],
-) -> Option<Vec<Value>> {
-    use cratonvm_jit::deopt::FrameValue;
-    vals.iter()
-        .map(|v| match v {
-            // Cast: operand reinterpreted as i32 (JVM 32-bit stack word)
-            FrameValue::Int(i) => Some(Value::Int(*i as i32)),
-            FrameValue::Undefined => Some(Value::Int(0)),
-            FrameValue::Object(addr) => {
-                let obj = if *addr == 0 {
-                    None
-                } else {
-                    // SAFETY: `addr` is a live heap object address captured in
-                    // the deopt frame by `x64_deopt_entry`; `from_raw` only
-                    // debug-asserts non-null / alignment.
-                    Some(unsafe { ObjectRef::from_raw(*addr as usize as *mut u8) })
-                };
-                Some(Value::Object(obj))
-            }
-            // Cat-2 / unresolved / virtual / FP — bail to the safe re-run path.
-            _ => None,
-        })
-        .collect()
-}
+// (`ir_deopt_frame_values_with_objects` — the 1:1 cat-2-REJECTING mapper — was
+// retired here: its sole caller, the OSR-exit in-place transfer, now uses the
+// cat-2/FP-aware 1:1 `ir_deopt_frame_values` (full-workspace caller audit done,
+// applying the deletion lesson from its earlier dangling-call breakage).)
 
 /// Map the reconstructed **locals** `FrameValue`s to a *compact* interpreter
 /// arg list for `Frame::new_pooled`. Unlike the operand stack, JVM local slots
@@ -8543,22 +8508,34 @@ fn transfer_osr_exit_into_live_frame(
         }
     }
 
-    // Map reconstructed FrameValues → interpreter Values (Int / Object / Undefined;
-    // cat-2 / FP / unresolved → None ⇒ reject). Pure Rust; no Java allocation. Done
-    // BEFORE any frame mutation so a reject can never half-write the frame.
-    let locals = match ir_deopt_frame_values_with_objects(&rframe.locals) {
+    // Map reconstructed FrameValues → interpreter Values (Int / Long / Float /
+    // Double / Object / Undefined via `fv_to_value`; virtual / unresolved /
+    // `Unsupported` → None ⇒ reject). Pure Rust; no Java allocation. Done BEFORE
+    // any frame mutation so a reject can never half-write the frame.
+    //
+    // `ir_deopt_frame_values` is the 1:1 (NON-collapsing) mapper, which is exactly
+    // what the in-place transfer needs: the locals snapshot is JVM-slot-indexed
+    // (one entry per slot), and we write it slot-for-slot below. A cat-2
+    // `long`/`double` therefore arrives as two entries — `Long`/`Double` at slot N
+    // plus the reserved upper-half `Undefined` (→ `Int(0)`) at N+1 — which is the
+    // correct two-slot JVM layout (`lload N` reads the full value from slot N; the
+    // dead N+1 is never read). The deopt-EXIT path, which builds a fresh frame via
+    // `Frame::new_pooled`, uses the COLLAPSING `ir_deopt_locals` instead because
+    // `copy_args_to_locals` re-expands a compact list; here there is no
+    // re-expansion, so collapsing would mis-align the direct slot writes.
+    let locals = match ir_deopt_frame_values(&rframe.locals) {
         Some(l) => l,
         None => return bail("unmappable local"),
     };
-    let stack_vals = match ir_deopt_frame_values_with_objects(&rframe.stack) {
+    let stack_vals = match ir_deopt_frame_values(&rframe.stack) {
         Some(s) => s,
         None => return bail("unmappable stack slot"),
     };
 
     // Overwrite the live frame IN PLACE. No Java allocation here, so the
     // reconstructed oops remain valid and are rooted by the frame's slots the moment
-    // they are written. The locals snapshot is JVM-slot-indexed (one entry per slot;
-    // cat-2 would have bailed at the mapper), so slot `i` ← `locals[i]` is 1:1.
+    // they are written. The locals snapshot is JVM-slot-indexed (one entry per slot,
+    // cat-2 as its two-slot pair), so slot `i` ← `locals[i]` is 1:1.
     let frame = &mut thread.frames[frame_idx];
     for (i, v) in locals.iter().enumerate() {
         frame.set_local_unchecked(i, *v);
@@ -9284,6 +9261,52 @@ mod deopt_step3_tests {
         assert_eq!(frame.get_local(1), Value::Int(5460));
         assert_eq!(frame.pc, 7);
         assert_eq!(frame.stack.len(), 0, "stale operand stack must be replaced");
+    }
+
+    /// FU1 — the OSR-exit transfer reconstructs cat-2 (`long`/`double`) and FP
+    /// (`float`) state into the live frame (was: rejected → re-run). The 1:1
+    /// JVM-slot write places a `long`'s value at slot N and a dead `Int(0)` at the
+    /// reserved upper half N+1, so the following `int` is NOT shifted; a `double`
+    /// rides one compact operand-stack slot.
+    #[test]
+    fn osr_exit_transfer_handles_cat2_and_fp() {
+        let shared = Arc::new(SharedVm::new(VmConfig::default()));
+        let mut thread = JvmThread::new(ThreadId(0), "test");
+        let cached = minimal_cached(); // max_locals = 4, max_stack = 8
+        seed_live_frame(
+            &shared,
+            &mut thread,
+            &cached,
+            vec![FrameValue::Int(1), FrameValue::Int(2)],
+            vec![],
+            0,
+        );
+
+        // JVM-slot locals for (long a, float f, int n): a@0 (upper half @1), f@2, n@3.
+        let advanced = rframe(
+            vec![
+                FrameValue::Long(0x7_0000_0001),
+                FrameValue::Undefined,
+                FrameValue::Float(2.5f32.to_bits() as u64),
+                FrameValue::Int(9),
+            ],
+            vec![FrameValue::Double(std::f64::consts::PI.to_bits())],
+            3,
+        );
+        assert!(
+            transfer_osr_exit_into_live_frame(&shared, &mut thread, 0, &advanced).is_some(),
+            "cat-2/FP frame must transfer (no longer rejected)"
+        );
+        let frame = &thread.frames[0];
+        assert_eq!(frame.pc, 3);
+        // long: all 64 bits at slot 0 (raw word — local_kinds disambiguates
+        // long-vs-double, which the NaN-boxed get_local cannot).
+        assert_eq!(frame.get_local_raw(0), 0x7_0000_0001, "long keeps all 64 bits");
+        // The cat-2 write did not shift the float (slot 2) or int (slot 3).
+        assert_eq!(frame.get_local(2), Value::Float(2.5), "float at its own slot");
+        assert_eq!(frame.get_local(3), Value::Int(9), "int not shifted by the cat-2 write");
+        assert_eq!(frame.stack.len(), 1);
+        assert_eq!(frame.stack.peek_at(0), Value::Double(std::f64::consts::PI));
     }
 
     /// A non-empty reconstructed operand stack is transferred verbatim (the stack
