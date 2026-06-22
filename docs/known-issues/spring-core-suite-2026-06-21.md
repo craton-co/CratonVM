@@ -1,0 +1,50 @@
+# CratonVM × Spring Framework suite — bug index
+
+Worktree: `CratonVM-spring0621` (binary built from dev `0c904c04`). Each Spring test
+**passes on HotSpot/JDK25**, so every failure under CratonVM is a divergence (VM bug)
+unless tagged **[harness/env]**. Reports are root-cause clusters, not per-test.
+
+Legend: **FIX** = contained, I can do it · **HANDOFF** = deep/risky/cross-cutting.
+
+## Fixed
+Branch `fix/spring-core-suite-bugs` (off latest dev `6eeb1fe6`); each verified vs the real test class.
+| ID | Sev | Status | Result |
+|----|-----|--------|--------|
+| [W1](W1-stream-close-handler-slot-oob.md) | low-med | ✅ FIXED `7f99971b` (own branch; merged to dev) | Stream slot-1 close-handler OOB |
+| misc-core chm/lhm | med | ✅ FIXED `482b3d96` | `CHM.remove(null)` NPE + `LHM.putIfAbsent` null-replace → SimpleAliasRegistry 12/12 |
+| [generic-type-signature-cce](SC-generic-type-signature-cce.md) | high | ✅ FIXED `f0d2d68f` | reify bounds → Type[] → ResolvableType 155→161/162 (6 CCEs gone) |
+| map-multivaluemap | med | ✅ FIXED `63c120af` | keySet().contains honors overridden containsKey → LinkedCaseInsensitiveMap 18/18 |
+| [stax-xml-family](SC-stax-xml-family.md) | med | ◑ PARTIAL `cd8c9b9f` | 4 cursor natives + getName prefix → StaxStream 1/6→4/6 (2 namespace-SAX-sequence tests remain) |
+| annotation-introspection **Bug B** | high | ✅ FIXED `00c71bb6` | lambda SAM dispatch now checks param types → AnnotationFilter 11/11, AnnotationTypeMappings 43/43, MergedAnnotationsRepeatable 24/24 (general correctness fix) |
+
+**Session total: 7 bugs fixed, ~17 spring-core tests recovered. Branch rebased onto current dev (merge `75ffb42c`).**
+Remaining annotation-introspection sub-bugs (same report): A (TypeNotPresent/classloader, AnnotationIntrospectionFailureTests 0/4), C (enclosing-class scan), D (bridge-method) — separate deeper fixes.
+
+## spring-core — open clusters (run 1, 262 classes)
+| ID | Sev | Conf | Rec | Tests | Root cause |
+|----|-----|------|-----|-------|-----------|
+| [generic-type-signature-cce](SC-generic-type-signature-cce.md) | high | high | FIX | 9 | real `TypeVariableImpl.getBounds()` reifier not overridden → CCE `FieldTypeSignature→Type[]` |
+| [annotation-introspection-family](SC-annotation-introspection-family.md) | high | high | FIX | 12 | 4 distinct: Class-attr TypeNotPresent, lambda SAM/default overload, classloader ctx, bridge merge |
+| [jspecify-nullness-reflection](SC-jspecify-nullness-reflection.md) | med | high | FIX | 26 | type-use + package annotations dropped (`getTypeAnnotationBytes0`=null; synthetic Package no pkg-info) |
+| [env-classreading](SC-env-classreading.md) | high | high | FIX+HO | 6 | getenv/getProperties identity; `Object.equals` shadows override (precedenceOf=-1); `int.class`→Integer; custom-ClassLoader `getResourceAsStream`=null |
+| [stax-xml-family](SC-stax-xml-family.md) | med | high | FIX | 7 | StAX→SAX bridge: 3 unregistered cursor natives + `getName()` drops element prefix |
+| [map-multivaluemap-family](SC-map-multivaluemap-family.md) | med | high | FIX | 6 | keySet.contains skips `containsKey` override; LHM putIfAbsent drops null-replace; Map.equals fails on foreign-Map arg (+2 ByteBuddy handoff) |
+| [stream-collector-supplier-no-code](SC-stream-collector-supplier-no-code.md) | med | high | FIX | 1 | synthetic `Collector` lacks supplier/accumulator/finisher/combiner bodies → AbstractMethodError |
+| [aot-runtimehints-resource-count](SC-aot-runtimehints-resource-count.md) | med | high | FIX | 3 | `Stream.distinct()` ignores Java equals/hashCode → dup resource globs (8 vs 5) |
+| [task-retry-util-misc](SC-task-retry-util-misc.md) | med | med-high | MIXED | 14 | 6 causes: non-Serializable unmod-map; Properties.store missing #date; Throwable deser; retry 20ms timing; **ByteBuddy ClassInjector [handoff]**; AQS throttle |
+| [resource-io-family](SC-resource-io-family.md) | med | high | FIX | ~25 | NIO write-channel stub no `write`; `Path.toUri()` emits `file://` authority; **many FileNotFoundException are harness CWD [env]** |
+| [misc-core-spring](SC-misc-core-spring.md) | med | med | MIXED | 3 | `CHM.remove(null)` no-NPE (fix); SortedProperties OutputStream store (handoff) |
+
+## spring-core — HANGS (timeouts)
+| ID | Sev | Rec | Class | Hypothesis |
+|----|-----|-----|-------|-----------|
+| [hangs-mergedannotations-charsequence](SC-hangs-mergedannotations-charsequence.md) | high | investigate | MergedAnnotationsTests | real-`ReferencePipeline` `stream().toArray()` re-enters native toArray→stream_elements→real toArray (fam6 bounce) |
+| ″ | high | handoff | codec.CharSequenceEncoderTests | Reactor `StepVerifier.verify()` blocks on latch; `ExecutorService.execute()` runs inline + scheduled-task pump not driven → producer never runs |
+
+## Cross-cutting (affect many modules — prioritize)
+- **ByteBuddy `ClassInjector$UsingReflection` "Could not create type"** → breaks AssertJ `assertSoftly` (SoftAssertions) and Mockito. Will recur widely (spring-test/webmvc). **[handoff]**
+- **JUnit "called invocation multiple times: TimeoutExtension"** masks an underlying VM error (see memory `junit-multiple-times-masks-vm-linkage-error`).
+- **CWD-relative resource tests** → `FileNotFoundException` from harness working dir, not a VM bug. Re-check tally; consider running per-module from the module dir.
+
+## Notes
+- [NOTES-prefiltered-warns.md](NOTES-prefiltered-warns.md) — W1 stream-layout WARN (now fixed) + filter rationale.
