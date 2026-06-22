@@ -188,6 +188,79 @@ thread_local! {
     static TOP_RBP: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+/// Step 1 (`docs/feature-designs/precise-jit-maps-default.md`, inline
+/// frame-record) — read/write the innermost-RBP mirror.
+///
+/// When inline frame-record is active (`cratonvm_jit::x64::inline_rbp_tls_disp()
+/// != 0`), the JIT prologue stores RBP directly into a Windows TLS slot with a
+/// single `mov gs:[disp], rbp`; these accessors read/write the SAME slot via
+/// `gs:[disp]` so the cold push/pop/prune/remap paths observe the inlined
+/// writes. When inactive (the default), they fall back to the Rust
+/// `thread_local! TOP_RBP` exactly as before, so the default path is
+/// byte-identical. The displacement is the single source of truth shared with
+/// the JIT codegen, so the two can never disagree on slot vs thread-local.
+#[inline]
+fn top_rbp_get() -> usize {
+    #[cfg(windows)]
+    {
+        let disp = cratonvm_jit::x64::inline_rbp_tls_disp();
+        if disp != 0 {
+            // SAFETY: `disp` was validated by the startup sentinel probe in
+            // `inline_rbp_tls_disp()` to be a live, 8-byte-aligned TEB TLS slot
+            // present on every thread.
+            return unsafe { read_gs_qword(disp) };
+        }
+    }
+    TOP_RBP.with(|c| c.get())
+}
+
+/// Step 1 self-check (`CRATONVM_DBG_VERIFY_INLINE_FRAME_RECORD`) — public read
+/// of the innermost-RBP mirror, used by `jit_verify_inline_frame_record` to
+/// confirm the inlined store landed in the slot the GC reads.
+pub fn top_rbp_mirror_read() -> usize {
+    top_rbp_get()
+}
+
+#[inline]
+fn top_rbp_set(v: usize) {
+    #[cfg(windows)]
+    {
+        let disp = cratonvm_jit::x64::inline_rbp_tls_disp();
+        if disp != 0 {
+            // SAFETY: see `top_rbp_get`.
+            unsafe { write_gs_qword(disp, v) };
+            return;
+        }
+    }
+    TOP_RBP.with(|c| c.set(v));
+}
+
+/// Read the 8-byte value at `gs:[disp]` (Windows TEB-relative TLS slot).
+#[cfg(windows)]
+#[inline]
+unsafe fn read_gs_qword(disp: usize) -> usize {
+    let val: usize;
+    core::arch::asm!(
+        "mov {out}, qword ptr gs:[{addr}]",
+        out = out(reg) val,
+        addr = in(reg) disp,
+        options(nostack, preserves_flags, readonly),
+    );
+    val
+}
+
+/// Write an 8-byte value to `gs:[disp]` (Windows TEB-relative TLS slot).
+#[cfg(windows)]
+#[inline]
+unsafe fn write_gs_qword(disp: usize, val: usize) {
+    core::arch::asm!(
+        "mov qword ptr gs:[{addr}], {val}",
+        addr = in(reg) disp,
+        val = in(reg) val,
+        options(nostack, preserves_flags),
+    );
+}
+
 /// Process-wide counter of active JIT entries across all threads. Lets the GC
 /// quickly answer "is anyone in JIT?" without crossing thread boundaries.
 static GLOBAL_JIT_DEPTH: AtomicUsize = AtomicUsize::new(0);
@@ -295,12 +368,12 @@ pub(crate) fn push_entry_full(entry: JitFrameChainEntry) -> usize {
         // walk). The incoming entry starts unrecorded → reset the cache to 0.
         if let Some(old_top) = v.last_mut() {
             if let Some(info) = old_top.precise.as_mut() {
-                info.exact_rbp = TOP_RBP.with(|cc| cc.get());
+                info.exact_rbp = top_rbp_get();
             }
         }
         v.push(entry);
         let n = v.len();
-        TOP_RBP.with(|cc| cc.set(0));
+        top_rbp_set(0);
         n
     });
     GLOBAL_JIT_DEPTH.fetch_add(1, Ordering::Release);
@@ -974,7 +1047,7 @@ pub fn set_top_frame_base(rbp: usize) {
     // and flushed by `remap_active_jit_frames` before the (only) reader runs.
     // `frame_base` is deliberately NOT touched — the marking path uses it as the
     // upper bound of its conservative sweep.
-    TOP_RBP.with(|c| c.set(rbp));
+    top_rbp_set(rbp);
 }
 
 /// Sync `TOP_RBP` to the current top entry's saved `exact_rbp` (or 0 when the
@@ -985,7 +1058,7 @@ fn reload_top_rbp_cache(v: &[JitFrameChainEntry]) {
         .last()
         .and_then(|e| e.precise.as_ref())
         .map_or(0, |info| info.exact_rbp);
-    TOP_RBP.with(|c| c.set(val));
+    top_rbp_set(val);
 }
 
 /// Stage 3 — precisely relocate the oop slots of every active JIT frame on
@@ -1030,7 +1103,7 @@ pub fn remap_active_jit_frames(pointer_map: &std::collections::HashMap<usize, us
             let mut v = c.borrow_mut();
             if let Some(top) = v.last_mut() {
                 if let Some(info) = top.precise.as_mut() {
-                    info.exact_rbp = TOP_RBP.with(|cc| cc.get());
+                    info.exact_rbp = top_rbp_get();
                 }
             }
         }

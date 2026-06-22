@@ -5419,7 +5419,17 @@ pub fn build_helpers() -> JitRuntimeHelpers {
         // nothing extra. The JIT also gates emission on its own cached flag,
         // but keying the pointer on the same env keeps the default build inert.
         frame_record: if cratonvm_jit::x64::precise_jit_maps_enabled() {
-            jit_frame_record as *const () as usize
+            // Step 1 self-check: when inline frame-record is active AND the
+            // verify knob is on, wire the verify helper here instead — the
+            // prologue calls it right after the inline store to assert the
+            // mirror slot it wrote is the one the GC reads.
+            if cratonvm_jit::x64::verify_inline_frame_record_enabled()
+                && cratonvm_jit::x64::inline_rbp_tls_disp() != 0
+            {
+                jit_verify_inline_frame_record as *const () as usize
+            } else {
+                jit_frame_record as *const () as usize
+            }
         } else {
             0
         },
@@ -5449,6 +5459,27 @@ pub fn build_helpers() -> JitRuntimeHelpers {
 /// integer-argument register, matching the JIT's `ARG_REGS[0]` load.
 extern "C" fn jit_frame_record(rbp: usize) {
     crate::jit::conservative_roots::set_top_frame_base(rbp);
+}
+
+/// Step 1 (`docs/feature-designs/precise-jit-maps-default.md`) debug self-check
+/// helper (`CRATONVM_DBG_VERIFY_INLINE_FRAME_RECORD`).
+///
+/// When inline frame-record AND the verify knob are both on, the JIT prologue
+/// calls this immediately AFTER its inline `mov gs:[disp], rbp` (it is wired
+/// into the `frame_record` helper slot for that combination, see
+/// `build_helpers`). It reads the innermost-RBP mirror back through the SAME
+/// accessor the GC root walk uses and asserts it equals the RBP the inline
+/// store should have written — i.e. that the baked `gs:[disp]` slot is exactly
+/// the slot the Rust side reads. Logs on mismatch (never panics); pure
+/// validation aid with no effect on the mirror value.
+extern "C" fn jit_verify_inline_frame_record(rbp: usize) {
+    let got = crate::jit::conservative_roots::top_rbp_mirror_read();
+    if got != rbp {
+        eprintln!(
+            "[VERIFY-INLINE-FR] mismatch: inline store rbp={:#x} but mirror reads {:#x}",
+            rbp, got
+        );
+    }
 }
 
 /// T1.1.28 — Math.fma(double, double, double) runtime helper.
