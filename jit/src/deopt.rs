@@ -580,7 +580,12 @@ impl InvalidationManager {
 
 /// A fully reconstructed interpreter frame ready for the interpreter to
 /// resume execution.
-#[derive(Debug)]
+///
+/// `Clone` is needed by the vm-crate resume sink: virtual-object
+/// re-materialization (`deopt_materialize::materialize_virtual_objects`) rewrites
+/// slots in place, so the sink clones the immutable reconstructed frame into a
+/// mutable copy before materializing.
+#[derive(Debug, Clone)]
 pub struct ReconstructedFrame {
     pub method_key: String,
     pub bci: u32,

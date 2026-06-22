@@ -399,6 +399,25 @@ Author note: this doc is grounded in a read of `gc/src/{g1,g1_concurrent,zgc,zgc
       `binarytrees16@4g`=14985902). Under actual GC (`SteadyChurn`@256m) the
       parallel evacuator engages (4 workers) and behaves **byte-for-byte
       identically to serial** (same `freed=`, same outcome).
+    - **Diverse-workload differential under sustained `--nojit` GC** (now that the
+      evacuate-into-CSet fix lets G1 collect correctly): object trees
+      (`binarytrees16`@64m, 30 GCs), held-graph (`DeepTree`), primitive arrays
+      (`IntArrChurn`), real `HashMap` (`HashChurn`), `String`/StringBuilder
+      (`StrChurn`), and pointer churn (`SteadyChurn`) all give one checksum across
+      HotSpot / gen / serial-G1 / parallel-G1 at GC-forcing heaps. No new
+      correctness divergence found. Two NON-correctness items characterized:
+      (1) **parallel evac spawns a `thread::scope` worker pool per GC**, so it is
+      contention-sensitive and carries per-collection thread-spawn overhead
+      (a persistent worker pool is the throughput follow-up — the design's noted
+      "first cut"; this also made some `--verbose:gc`+`RUST_LOG` parallel runs hit
+      the 120s watchdog under concurrent-session CPU load — a measurement artifact,
+      not a hang: the same runs complete correctly in isolation);
+      (2) **evacuation-failure under to-space exhaustion** — at a heap too small to
+      fit the live set (where gen correctly OOMs), G1 silently DROPS objects
+      instead of pinning them in place or raising a clean OOM (`GcChurn`@96m gives
+      a wrong checksum; ≥256m all agree). Real-G1 self-forwards on evac failure;
+      CratonVM's G1 has no such path. A robustness prerequisite for Step 10,
+      tracked separately. Distinct from both the CSet fix and JIT A5.
   - **Pre-existing bug surfaced (NOT parallel-specific; blocks Step 10):** with the
     JIT enabled, a long-lived local reference held across a hot loop is **missed by
     GC root scanning**, so G1's *precise unconditional moving* young collection

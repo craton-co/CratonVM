@@ -22814,6 +22814,21 @@ pub fn compile_with_param_slots(
     // (find_deopt_point has no live caller; the i64::MIN re-run is unchanged).
     cm.deopt_points = compiler.deopt_points;
     cm._deopt_point_boxes = compiler.deopt_boxes;
+    // deopt-osr x64-backport Step 5 — finalize the per-method deopt-resume
+    // coverage gate (mirrors `fully_oop_covered` / `can_osr_exit`). A method may
+    // resume a real-frame deopt only when:
+    //   1. it emitted at least one deopt-exit snapshot (`deopt_points`), and
+    //   2. it scalar-replaced NO objects (`scalar_replaced` empty).
+    // (2) is load-bearing: this backend records a scalar-replaced slot by its
+    // machine provenance (Register/StackSlot), NOT as a `VirtualObject`, so its
+    // snapshot cannot be re-materialized — and lock elision over such an object
+    // makes mid-method resume unsound (the elided-monitor hazard). Until the x64
+    // emitter writes `VirtualObject` deopt slots + an elided-monitor flag, a
+    // scalar-replacing method stays on the safe re-run path. Empty/false unless
+    // `deopt_real_enabled()` (the snapshot emit site is gated), so production
+    // artifacts are unchanged. Consumed at the interpreter deopt sink, which
+    // attempts `resume_real_ir_deopt` only when `compiled.can_deopt_resume`.
+    cm.can_deopt_resume = !cm.deopt_points.is_empty() && compiler.scalar_replaced.is_empty();
     // deopt-osr Step 7 — transfer the OSR-exit loop-boundary bci set and set the
     // per-method gate. Both are empty/false unless `deopt_real_enabled()` was on
     // (the emit site is gated), so production artifacts are unchanged. Step 8
