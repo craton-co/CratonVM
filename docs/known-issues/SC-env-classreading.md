@@ -6,8 +6,12 @@
 >   `int.class.isPrimitive()`, `getName()=="int"`, and `int.class != Integer.class` all hold.
 >   The primitive↔wrapper conflation no longer reproduces. (No further action; left documented
 >   for history.)
-> - **RC-A (`System.getenv()`/`getProperties()` singleton identity)**: 🔴 **OPEN** (reproduces —
->   `==` is false). Contained FIX in `native-builtins` (cache the no-arg singletons).
+> - **RC-A (`System.getenv()`/`getProperties()` singleton identity)**: ✅ **FIXED on `dev`**
+>   (`fea93ba8`, merge `d236eb42`). Both no-arg accessors now return a process-wide cached
+>   singleton ObjectRef (GC-rooted + remapped like the singleton class loaders); `getProperties`
+>   resyncs its side-table to the live `list_system_properties()` snapshot each call (wholesale
+>   replace) so enumeration/`getProperty` stay live and reflect `clearProperty`. Verified vs
+>   HotSpot (JDK 25, `test_classes/EnvSingletonRepro` 10/10; holds under GC stress + moving young-gen).
 > - **RC-B (`Object.equals` native shadows a bytecode override → `COWAL.indexOf`/`contains`/
 >   `remove`)**: 🔴 **OPEN** (reproduces). HIGH severity but **HANDOFF** — a core
 >   interpreter/JIT virtual-dispatch + native-shadowing fix (resolve the most-derived `equals`
