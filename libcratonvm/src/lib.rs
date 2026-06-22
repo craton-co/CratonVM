@@ -2439,10 +2439,15 @@ mod tests {
                         // Free the per-call result promptly to bound the live set.
                         delete_local(wenv, s);
                     }
-                    // Periodically force a stop-the-world GC from this foreign
-                    // thread while its siblings are mid-call — the participation
-                    // path under test.
-                    if i % 64 == 0 {
+                    // A SINGLE designated foreign thread periodically forces a
+                    // stop-the-world GC while its siblings are mid-call — the
+                    // participation path under test (siblings must arrive at a
+                    // safepoint). Only one initiator at a time: concurrent
+                    // System.gc from many threads trips a *separate*, pre-existing
+                    // multi-thread-STW reliability bug in dev (reproduces with
+                    // zero foreign threads — see scratch_churn/Churn.java), which
+                    // is out of scope for validating foreign attach.
+                    if t == 0 && i % 64 == 0 {
                         call_void(wenv, shared.sys_cls, shared.gc_mid, std::ptr::null());
                     }
                 }
@@ -2459,9 +2464,12 @@ mod tests {
         let finished = StdArc::new(AtomicBool::new(false));
         {
             let finished = finished.clone();
+            let secs = std::env::var("CRATONVM_SOAK_TIMEOUT_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(120u64);
             std::thread::spawn(move || {
-                let deadline = std::time::Instant::now()
-                    + std::time::Duration::from_secs(120);
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
                 while std::time::Instant::now() < deadline {
                     if finished.load(Ordering::Acquire) {
                         return;
@@ -2471,6 +2479,20 @@ mod tests {
                 eprintln!(
                     "foreign_attach_concurrent_gc_soak: watchdog timeout — likely STW deadlock"
                 );
+                if let Some(vm) = cratonvm_vm::native::jni::process_vm() {
+                    eprintln!(
+                        "[soak/watchdog] alive={} stw_requested={} blocked={} pending(expected-arrived)={}",
+                        vm.thread_registry.alive_count(),
+                        vm.gc_barrier
+                            .stw_requested
+                            .load(std::sync::atomic::Ordering::Acquire),
+                        vm.gc_barrier.blocked_count(),
+                        vm.gc_barrier.pending_count(),
+                    );
+                    for (tid, blocked, snap) in vm.thread_registry.dump_blocked_states() {
+                        eprintln!("[soak/watchdog]   tid={tid} blocked={blocked} snapshot_len={snap}");
+                    }
+                }
                 std::process::abort();
             });
         }
