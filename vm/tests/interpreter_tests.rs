@@ -1073,6 +1073,46 @@ fn test_loader_isolation() {
     }
 }
 
+// Regression (SC-custom-classloader-ignored): a custom loader that overrides
+// loadClass(String,boolean) must have that override invoked by loadClass(String),
+// and a fresh custom loader's findLoadedClass must be loader-scoped (return null
+// for a class only the app loader has loaded). Previously loadClass reimplemented
+// parent-first delegation in Rust and resolved through the global/app class store,
+// ignoring the user loader entirely.
+#[test]
+fn test_custom_loader_override_invoked() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke(
+        "cratonvm/ClassLoaderTest",
+        "testCustomLoaderOverrideInvoked",
+        "()I",
+        &[],
+    );
+    match result {
+        Ok(Some(Value::Int(1))) => {}
+        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+    }
+}
+
+// Regression (SC-custom-classloader-ignored): Class.forName(name, false, loader)
+// must route through the user loader's loadClass override, not the global store.
+#[test]
+fn test_for_name_honors_custom_loader_override() {
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke(
+        "cratonvm/ClassLoaderTest",
+        "testForNameHonorsCustomLoaderOverride",
+        "()I",
+        &[],
+    );
+    match result {
+        Ok(Some(Value::Int(1))) => {}
+        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Session 4: MethodHandle and VarHandle Completeness
 // ---------------------------------------------------------------------------

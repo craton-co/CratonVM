@@ -625,6 +625,7 @@ pub(crate) fn native_method_get_default_value(
         ctx,
         &default,
         ret_desc.as_deref(),
+        None,
     )))
 }
 

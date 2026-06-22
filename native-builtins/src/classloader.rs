@@ -636,12 +636,220 @@ pub(crate) fn receiver_overrides_find_class(ctx: &mut dyn NativeContext, this: O
     false
 }
 
+/// True iff the receiver's actual class overrides the protected
+/// `ClassLoader.loadClass(String,boolean)` with its own bytecode (a genuine
+/// non-builtin subclass override).
+///
+/// `ClassLoader.loadClass(String)` is spec'd as `return loadClass(name, false)`
+/// — a virtual self-call. Some loaders (notably Spring's `OverridingClassLoader`
+/// and any classloader-isolation pattern) override the protected
+/// `loadClass(String,boolean)` to perform OVERRIDE-FIRST loading: they redefine
+/// "eligible" classes under themselves (or reject filtered names) *before*
+/// delegating to the parent. Because CratonVM keeps no JDK bytecode for
+/// `ClassLoader.loadClass`, the `cl_load_class` native stands in for the
+/// single-arg form. If it reimplemented base parent-first delegation for such a
+/// receiver, the override's custom ordering — and crucially the defining-loader
+/// identity it would establish via `defineClass` — would be silently lost, and
+/// the class would be resolved through the global/app class store instead.
+///
+/// When this returns true, `cl_load_class` must instead dispatch the virtual
+/// `loadClass(name, false)` so the subclass bytecode actually runs. Returns
+/// false for base / built-in loaders (where the Rust delegation is authoritative
+/// and a virtual dispatch would recurse back into this native).
+pub(crate) fn receiver_overrides_load_class_resolve(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+) -> bool {
+    let mut cid = Some(ctx.class_id_of_object(this));
+    let mut found_override = false;
+    while let Some(id) = cid {
+        let name = match ctx.class_name_of_id(id) {
+            Some(n) => n,
+            None => break,
+        };
+        // URLClassLoader-family loaders (notably Spring Boot's
+        // `LaunchedURLClassLoader`) have their class resolution substituted by
+        // CratonVM's classpath scanner — their `loadClass` bytecode depends on
+        // `URLClassPath` / nested-JAR plumbing CratonVM does not run, and they
+        // are handled by the existing `Class.forName` / base-delegation rescues.
+        // Leave them on the base path: do NOT route them through their override.
+        if name == "java/net/URLClassLoader" {
+            return false;
+        }
+        if is_builtin_loader_class(&name) {
+            // Reached the builtin base.
+            break;
+        }
+        if !found_override
+            && ctx.declared_methods(id).iter().any(|m| {
+                m.name == "loadClass" && m.descriptor == "(Ljava/lang/String;Z)Ljava/lang/Class;"
+            })
+        {
+            found_override = true;
+        }
+        cid = ctx.superclass_of(id);
+    }
+    found_override
+}
+
+/// True if `this` is a USER-DEFINED `ClassLoader` (a non-builtin subclass), as
+/// opposed to a built-in bootstrap/extension/application/URL loader. Used to
+/// decide whether `findLoadedClass`/`findLoadedClass0` must be loader-scoped
+/// (a user loader only "knows" classes in its own namespace) versus the global
+/// lookup that is correct for the built-in loaders.
+pub(crate) fn is_user_defined_loader(ctx: &mut dyn NativeContext, this: ObjectRef) -> bool {
+    let cid = ctx.class_id_of_object(this);
+    match ctx.class_name_of_id(cid) {
+        Some(name) => !is_builtin_loader_class(&name),
+        None => false,
+    }
+}
+
+/// Identity-hash → CratonVM loader-namespace-id side table for real-JDK mode.
+///
+/// In synthetic-JDK mode a user loader's namespace id lives in the synthetic
+/// `CL_LOADER_ID` field slot (populated by `ClassLoader.<init>`/`defineClass`).
+/// In real-JDK mode that slot is a genuine `java.lang.ClassLoader` field and
+/// cannot be repurposed, so the id is keyed instead on the loader's STABLE
+/// identity hash. Holds only `i32 → u32` (no `ObjectRef`s) — no GC rooting.
+fn loader_namespace_id_store() -> &'static Mutex<std::collections::HashMap<i32, u32>> {
+    static INSTANCE: OnceLock<Mutex<std::collections::HashMap<i32, u32>>> = OnceLock::new();
+    INSTANCE.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Stable CratonVM loader-namespace id for a `ClassLoader` instance, allocating
+/// one on first request. Built-in loaders map to `0` (the Application / global
+/// namespace — they ARE the global store). User-defined loaders use their
+/// synthetic `CL_LOADER_ID` slot when present (synthetic-JDK mode) and otherwise
+/// an identity-hash-keyed id (real-JDK mode). Used by `defineClass` to give a
+/// user loader its own namespace so an override-first redefinition of an
+/// already-loaded class does not collide with the original definer.
+pub(crate) fn loader_namespace_id(ctx: &mut dyn NativeContext, loader: ObjectRef) -> u32 {
+    if !is_user_defined_loader(ctx, loader) {
+        return 0;
+    }
+    if let Value::Int(v) = ctx.get_field(loader, CL_LOADER_ID) {
+        if v > 0 {
+            return v as u32;
+        }
+    }
+    let ihc = ctx.identity_hash_code(loader);
+    let mut map = loader_namespace_id_store()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if let Some(id) = map.get(&ihc) {
+        return *id;
+    }
+    let id = ctx.allocate_loader_id();
+    map.insert(ihc, id);
+    id
+}
+
+/// Read-only probe of a user loader's namespace id (no allocation). `None` when
+/// the loader is built-in, or has not yet been assigned one (it has defined no
+/// class under a distinct namespace).
+pub(crate) fn peek_loader_namespace_id(ctx: &mut dyn NativeContext, loader: ObjectRef) -> Option<u32> {
+    if !is_user_defined_loader(ctx, loader) {
+        return None;
+    }
+    if let Value::Int(v) = ctx.get_field(loader, CL_LOADER_ID) {
+        if v > 0 {
+            return Some(v as u32);
+        }
+    }
+    let ihc = ctx.identity_hash_code(loader);
+    loader_namespace_id_store()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&ihc)
+        .copied()
+}
+
+/// Shared `findLoadedClass` logic (JVMS §5.3): returns the Class mirror for
+/// `internal_name` only if `this` loader is recorded as having loaded it —
+/// NEVER a class some OTHER loader happens to have loaded. Does NOT trigger
+/// loading.
+///
+/// For a built-in loader the global loaded-class set is the right answer. For a
+/// user-defined loader, a class counts as "loaded by this loader" if either:
+///   1. it lives in this loader's own namespace (a distinct copy this loader
+///      defined — the override-first redefinition case), or
+///   2. the globally-known class of that name records THIS loader as its
+///      defining loader (the common case: e.g. ByteBuddy's `ByteArrayClassLoader`
+///      defines under the Application namespace but registers itself as definer).
+/// Otherwise it is not visible to this loader as "already loaded" → `None`,
+/// which lets the loader's `loadClass` override proceed to `findClass`/define.
+pub(crate) fn find_loaded_class_for_loader(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    internal_name: &str,
+) -> Option<ObjectRef> {
+    if !is_user_defined_loader(ctx, this) {
+        return ctx
+            .class_id_by_name(internal_name)
+            .map(|cid| ctx.get_class_mirror(cid));
+    }
+    // 1. Own-namespace copy.
+    if let Some(id) = peek_loader_namespace_id(ctx, this) {
+        if let Some(cid) = ctx.class_id_by_name_and_loader(internal_name, id) {
+            return Some(ctx.get_class_mirror(cid));
+        }
+    }
+    // 2. A globally-known class THIS loader is the defining loader of.
+    if let Some(cid) = ctx.class_id_by_name(internal_name) {
+        if let Some(def) = defining_loader_for(cid.as_u32()) {
+            if def.as_ptr() == this.as_ptr() {
+                return Some(ctx.get_class_mirror(cid));
+            }
+        }
+    }
+    None
+}
+
 fn cl_load_class(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let name_obj = match args.get(1) {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
+
+    // `ClassLoader.loadClass(String)` is spec'd as `return loadClass(name, false)`.
+    // If the receiver's actual class overrides the protected
+    // `loadClass(String,boolean)` with its own bytecode (e.g. Spring's
+    // OverridingClassLoader, which redefines eligible classes under itself
+    // BEFORE parent delegation, or rejects filtered names), dispatch the virtual
+    // `loadClass(name, false)` so that override actually runs. Reimplementing
+    // base parent-first delegation here would resolve the class through the
+    // global/app class store and ignore the user loader entirely (its custom
+    // ordering and defining-loader identity would be lost).
+    //
+    // `super.loadClass(name, resolve)` from such an override is an invokespecial
+    // that lands on the base native `cl_load_class_resolve`
+    // (→ `cl_load_class_base_delegation`), so there is no recursion back here.
+    if receiver_overrides_load_class_resolve(ctx, this) {
+        return ctx.invoke_virtual(
+            this,
+            "loadClass",
+            "(Ljava/lang/String;Z)Ljava/lang/Class;",
+            &[Value::Object(Some(name_obj)), Value::Int(0)],
+        );
+    }
+
+    cl_load_class_base_delegation(ctx, this, name_obj)
+}
+
+/// Base-class `ClassLoader.loadClass` parent-first delegation, reimplemented in
+/// Rust (CratonVM keeps no JDK bytecode for `ClassLoader.loadClass`).
+///
+/// Reached when the receiver does NOT override `loadClass(String,boolean)` — it
+/// inherits the base behavior — and also via `super.loadClass(name, resolve)`
+/// (invokespecial → the base native `cl_load_class_resolve`) from a subclass
+/// override that wants the standard parent-first path as its fallback.
+fn cl_load_class_base_delegation(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    name_obj: ObjectRef,
+) -> MethodCallResult {
     let dotted = ctx.read_string(name_obj).unwrap_or_default();
     let internal = dotted.replace('.', "/");
 
@@ -755,12 +963,33 @@ fn cl_load_class(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
 }
 
 fn cl_load_class_resolve(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    // boolean resolve arg is ignored — we always resolve
-    cl_load_class(ctx, args)
+    // Base `ClassLoader.loadClass(String,boolean)` — boolean resolve arg is
+    // ignored (we always resolve). This is the native for the base class only;
+    // a subclass override of this method runs its own bytecode (it shadows the
+    // inherited native), so reaching here means the receiver uses base
+    // parent-first delegation. Must call the base delegation DIRECTLY (not
+    // `cl_load_class`) so that `super.loadClass(name, resolve)` from a subclass
+    // override does not bounce back into the override-dispatch and recurse.
+    let this = obj_arg(args, 0)?;
+    let name_obj = match args.get(1) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    cl_load_class_base_delegation(ctx, this, name_obj)
 }
 
 fn cl_find_class(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    cl_load_class(ctx, args)
+    // Base `ClassLoader.findClass(String)`. CratonVM reuses the parent-first
+    // delegation as a permissive base findClass (covers the IMPL-JARS fallback).
+    // Routed to the base delegation directly so it never triggers the
+    // `loadClass(String,boolean)` override-dispatch (which would be wrong for
+    // findClass and could recurse via a subclass `super.findClass`).
+    let this = obj_arg(args, 0)?;
+    let name_obj = match args.get(1) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    cl_load_class_base_delegation(ctx, this, name_obj)
 }
 
 fn cl_find_class_module(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -1073,6 +1302,15 @@ fn cl_define_class_basic(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     };
     match define_result {
         Ok(cid) => {
+            // Record the exact defining ClassLoader instance so
+            // `Class.getClassLoader()` returns THIS loader rather than the
+            // app-loader fallback. The public `defineClass(...)` overloads
+            // (this native + its PD / ByteBuffer delegators) must do this just
+            // like the JDK-internal `defineClass1` does — otherwise a class a
+            // custom loader defines (e.g. Spring's OverridingClassLoader
+            // redefining an eligible class under itself) would report the wrong
+            // loader and classloader-isolation patterns silently break.
+            crate::classloader::register_defining_loader(cid.as_u32(), this);
             let count = match ctx.get_field(this, CL_CLASSES_LOADED) {
                 Value::Int(n) => n,
                 _ => 0,
@@ -2007,31 +2245,15 @@ fn cl_find_loaded_class(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         _ => return Ok(Some(Value::Object(None))),
     };
 
-    let loader_type = match ctx.get_field(this, CL_LOADER_TYPE) {
-        Value::Int(v) => v,
-        _ => LOADER_APP,
-    };
-
-    // For custom loaders: check own namespace first
-    if loader_type == LOADER_CUSTOM {
-        let loader_id = match ctx.get_field(this, CL_LOADER_ID) {
-            Value::Int(v) if v > 0 => v as u32,
-            _ => 0,
-        };
-        if loader_id > 0 {
-            if let Some(cid) = ctx.class_id_by_name_and_loader(&name_str, loader_id) {
-                let mirror = ctx.get_class_mirror(cid);
-                return Ok(Some(Value::Object(Some(mirror))));
-            }
-        }
-    }
-
-    // For all loaders: check the global loaded-class cache (covers bootstrap/ext/app)
-    match ctx.class_id_by_name(&name_str) {
-        Some(cid) => {
-            let mirror = ctx.get_class_mirror(cid);
-            Ok(Some(Value::Object(Some(mirror))))
-        }
+    // Loader-scoped lookup (shared with real-JDK mode): a user-defined loader
+    // reports a class only if it is in that loader's own namespace or it is the
+    // recorded defining loader — NOT a class some other loader (typically the
+    // application loader) happens to have loaded. A fresh custom loader thus
+    // gets null for an app-loaded class, so its override-first redefinition
+    // (Spring's OverridingClassLoader) fires and it becomes the defining loader.
+    // Built-in loaders keep the global (no-load) lookup, correct for them.
+    match find_loaded_class_for_loader(ctx, this, &name_str) {
+        Some(mirror) => Ok(Some(Value::Object(Some(mirror)))),
         None => Ok(Some(Value::Object(None))),
     }
 }
@@ -2855,7 +3077,18 @@ fn ucl_init_urls_parent_factory(ctx: &mut dyn NativeContext, args: &[Value]) -> 
 }
 
 fn ucl_find_class(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    cl_load_class(ctx, args)
+    // `URLClassLoader.findClass(String)` — reuse the base parent-first
+    // delegation as a permissive findClass. Route to the base delegation
+    // DIRECTLY (not `cl_load_class`) so it never re-triggers the
+    // `loadClass(String,boolean)` override-dispatch: a subclass that overrides
+    // loadClass and calls `super.findClass`/`findClass` from inside that
+    // override would otherwise recurse back into its own loadClass.
+    let this = obj_arg(args, 0)?;
+    let name_obj = match args.get(1) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    cl_load_class_base_delegation(ctx, this, name_obj)
 }
 
 pub(crate) fn ucl_find_resource(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {

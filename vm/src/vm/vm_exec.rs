@@ -8625,6 +8625,18 @@ pub(crate) fn annotation_proxy_dispatch_impl(
             if let Some(name) = super::read_java_string(&shared.heap, name_ref) {
                 if name == method_name {
                     if let Ok(val) = shared.heap.get_array_element(values_arr, i) {
+                        // Deferred `TypeNotPresentException`: a Class-valued member
+                        // that could not be resolved through the declaring class's
+                        // loader (classloader-isolation / filtering) was stored as a
+                        // `TypeNotPresentException` sentinel at proxy-creation time
+                        // (mirrors HotSpot's `TypeNotPresentExceptionProxy`). Throw it
+                        // now — on member ACCESS — so `getAnnotations()` did not throw
+                        // but `annotation.value()` does.
+                        if let Value::Object(Some(obj)) = val {
+                            if class_name_is(shared, obj, "java/lang/TypeNotPresentException") {
+                                return Err(MethodCallFailed::ExceptionThrown(obj));
+                            }
+                        }
                         return Ok(Some(val));
                     }
                 }
