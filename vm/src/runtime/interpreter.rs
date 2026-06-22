@@ -18447,9 +18447,12 @@ fn try_jit_upgrade_with_gate(
                 // dispatch via the helper), gated default-OFF (its own soak).
                 // `CRATONVM_JIT_IR_CALL_VIRTUAL=1` opts in.
                 std::env::var_os("CRATONVM_JIT_IR_CALL_VIRTUAL").is_some(),
-                // inc 30: double/float XMM value tier, gated default-OFF (its
-                // own soak). `CRATONVM_JIT_IR_FP=1` opts in.
-                std::env::var_os("CRATONVM_JIT_IR_FP").is_some(),
+                // inc 30 + Slices A/B/C: double/float XMM value tier. Now
+                // default-ON — the tier is opcode-complete (frem/drem, FP arrays,
+                // FP-slot deopt resume all landed) and validated == HotSpot
+                // (bt10/14/16/18 checksums + FP E2E probes). `CRATONVM_JIT_IR_FP=0`
+                // is the opt-out (restores the int/long/ref-only IR path).
+                std::env::var("CRATONVM_JIT_IR_FP").map_or(true, |v| v != "0"),
             )?;
             let entry = compiled.entry_ptr() as usize; // Cast: JIT entry point to address
             let needs_ctx = compiled.needs_context();
@@ -18563,9 +18566,9 @@ fn try_jit_upgrade_with_gate(
         // inc 26: invokevirtual/invokeinterface → Op::Call (dynamic dispatch via
         // the helper), gated default-OFF (its own soak). `=1` opts in.
         std::env::var_os("CRATONVM_JIT_IR_CALL_VIRTUAL").is_some(),
-        // inc 30: double/float XMM value tier, gated default-OFF (its own soak).
-        // `CRATONVM_JIT_IR_FP=1` opts in.
-        std::env::var_os("CRATONVM_JIT_IR_FP").is_some(),
+        // inc 30 + Slices A/B/C: double/float XMM value tier. Now default-ON
+        // (opcode-complete + validated == HotSpot). `CRATONVM_JIT_IR_FP=0` opts out.
+        std::env::var("CRATONVM_JIT_IR_FP").map_or(true, |v| v != "0"),
     )?;
     let ret = crate::jit::return_type(&cached.method_descriptor);
     let heap = compiled.needs_heap();
@@ -19143,9 +19146,9 @@ fn try_jit_compile_callee_slow(
         // inc 26: invokevirtual/invokeinterface → Op::Call (dynamic dispatch via
         // the helper), gated default-OFF (its own soak). `=1` opts in.
         std::env::var_os("CRATONVM_JIT_IR_CALL_VIRTUAL").is_some(),
-        // inc 30: double/float XMM value tier, gated default-OFF (its own soak).
-        // `CRATONVM_JIT_IR_FP=1` opts in.
-        std::env::var_os("CRATONVM_JIT_IR_FP").is_some(),
+        // inc 30 + Slices A/B/C: double/float XMM value tier. Now default-ON
+        // (opcode-complete + validated == HotSpot). `CRATONVM_JIT_IR_FP=0` opts out.
+        std::env::var("CRATONVM_JIT_IR_FP").map_or(true, |v| v != "0"),
     )?;
     if std::env::var_os("CRATONVM_DBG_JITC").is_some() {
         eprintln!(
