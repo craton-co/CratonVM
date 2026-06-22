@@ -6655,6 +6655,23 @@ struct Compiler {
     /// deopt-osr Step 1: stable boxed copies of `deopt_points`, for the
     /// imm64-baked deopt stub to load by pointer (mirrors `_deopt_point_boxes`).
     deopt_boxes: Vec<Box<crate::deopt::DeoptimizationPoint>>,
+    /// deopt-osr Step 9 follow-up (a): raw pointer to a single, process-lifetime
+    /// **leaked** `DeoptEpochGuard` for this artifact, baked as the 4th arg into
+    /// every frame-deopt stub so `x64_deopt_entry` can short-circuit a superseded
+    /// compilation BEFORE dereferencing the box. Null until the first frame-deopt
+    /// stub is emitted (`emit_deopt_stubs`, only under `deopt_real_enabled()`);
+    /// copied to `CompiledMethod::deopt_epoch_guard` at finalize so the VM can
+    /// stamp it at install. All deopt points in one artifact share it (one
+    /// creation epoch, one live cell). `*mut` so the leaked allocation's address
+    /// is stable; never written through here (the VM owns the atomic stamp).
+    deopt_epoch_guard: *const crate::deopt::DeoptEpochGuard,
+    /// deopt-osr Step 9 follow-up (c): this method's `"<class>.<method>:<desc>"`
+    /// key, set by `compile_with_param_slots` from its `method_key` arg. Used to
+    /// consult the per-bci de-spec registry (`crate::deopt::despec_contains`) so a
+    /// loop-header speculation that has repeatedly deopted is NOT re-emitted on
+    /// recompile. Empty (`""`) on the legacy/test `compile()` wrapper and in
+    /// production (the registry is empty), so the consult is a no-op there.
+    method_key: String,
     /// deopt-osr Step 2 / P2: frame offset (positive depth-from-RBP) of the
     /// DEEPEST qword of the always-reserved 256-byte
     /// `SavedRegisters{gpr:[u64;16],xmm:[u64;16]}` region the frame-deopt stub
@@ -7327,6 +7344,8 @@ impl Compiler {
             param_slot_span: 0,
             deopt_points: Vec::new(),
             deopt_boxes: Vec::new(),
+            deopt_epoch_guard: std::ptr::null(),
+            method_key: String::new(),
             deopt_regs_base,
             deopt_box_ptr_by_bci: FxHashMap::default(),
             osr_exit_points: Vec::new(),
@@ -14523,6 +14542,21 @@ impl Compiler {
             };
             if let Some(box_ptr) = frame_box_ptr {
                 let base = self.deopt_regs_base;
+                // deopt-osr Step 9 follow-up (a): allocate (once) the artifact's
+                // retained epoch guard and bake it as the 4th arg. Leaked so its
+                // address is stable for the process lifetime — even under
+                // CRATONVM_JIT_FREE_CODE=1, where the artifact (and its deopt
+                // boxes) may be freed, this guard survives so `x64_deopt_entry`
+                // can read the live/creation epochs WITHOUT touching the box. The
+                // VM stamps it (creation epoch + live-epoch cell) at install.
+                if self.deopt_epoch_guard.is_null() {
+                    let g = Box::new(crate::deopt::DeoptEpochGuard::new());
+                    // LEAK(intentional): retained for the process lifetime; baked
+                    // by raw pointer into the stub and into CompiledMethod.
+                    self.deopt_epoch_guard =
+                        Box::into_raw(g) as *const crate::deopt::DeoptEpochGuard;
+                }
+                let guard_ptr = self.deopt_epoch_guard;
                 // 1) Spill all 16 GPRs (RAX=0..R15=15) into the SavedRegisters
                 //    region FIRST, before any arg-setup clobbers a register: the
                 //    guard `JB` reaches here with every GPR still holding its
@@ -14547,13 +14581,15 @@ impl Compiler {
                 }
                 // 2) Args (extern "C"): arg0 = &DeoptimizationPoint (baked imm64),
                 //    arg1 = rbp (live, never clobbered until the epilogue),
-                //    arg2 = &SavedRegisters = LEA [rbp - base] = &gpr[0].
+                //    arg2 = &SavedRegisters = LEA [rbp - base] = &gpr[0],
+                //    arg3 = &DeoptEpochGuard (baked imm64; deopt-osr Step 9 fu-a).
                 #[cfg(target_os = "windows")]
                 {
                     // Cast: non-negative index/count to usize
                     self.emit_mov_imm64_full(RCX, box_ptr as usize as i64);
                     self.emit_mov_reg_reg(RDX, RBP);
                     self.emit_lea_frame_slot(R8, base);
+                    self.emit_mov_imm64_full(R9, guard_ptr as usize as i64);
                 }
                 #[cfg(not(target_os = "windows"))]
                 {
@@ -14561,6 +14597,7 @@ impl Compiler {
                     self.emit_mov_imm64_full(RDI, box_ptr as usize as i64);
                     self.emit_mov_reg_reg(RSI, RBP);
                     self.emit_lea_frame_slot(RDX, base);
+                    self.emit_mov_imm64_full(RCX, guard_ptr as usize as i64);
                 }
                 // 3) CALL the jit-crate 3-arg entry BEFORE the epilogue (rbp + the
                 //    spill region are still live; reconstruction reads gpr[r]
@@ -22845,7 +22882,8 @@ pub fn compile(
         string_layout,
         &[],
         0,
-        0, // param_oop_mask: legacy/test path seeds no oop params (conservative)
+        0,  // param_oop_mask: legacy/test path seeds no oop params (conservative)
+        "", // method_key: legacy/test wrapper disables the per-bci de-spec consult
     )
 }
 
@@ -22908,6 +22946,13 @@ pub fn compile_with_param_slots(
     // "must be oop" local dataflow so oop params live at an early safepoint are
     // precisely covered. `0` on the default path → byte-identical codegen.
     param_oop_mask: u64,
+    // deopt-osr Step 9 follow-up (c) — this method's
+    // `"<class>.<method>:<descriptor>"` key, used to consult the per-bci de-spec
+    // registry (`crate::deopt::despec_contains`) and suppress a loop-header
+    // speculative-BCE guard that has repeatedly deopted. `""` (the legacy/test
+    // `compile()` wrapper) disables the consult; the registry is empty in
+    // production, so a non-empty key is still byte-identical there.
+    method_key: &str,
 ) -> Option<CompiledMethod> {
     // Estimate buffer size: extra for invoke dispatch calls (~40 bytes each).
     // This is a heuristic only — see the `buf.overflowed()` bailout below for
@@ -23213,7 +23258,30 @@ pub fn compile_with_param_slots(
     );
     compiler.param_jvm_slots = param_jvm_slots.to_vec();
     compiler.param_slot_span = param_slot_span;
+    compiler.method_key = method_key.to_string();
     compiler.bounds_safe_pcs = bounds_safe_pcs;
+    // deopt-osr Step 9 follow-up (c): per-bci de-spec. Drop any speculative-BCE
+    // guard whose loop header was recorded in the de-spec registry (a guard that
+    // repeatedly deopted past the per-bci give-up threshold). Those headers fall
+    // back to per-access bounds checks instead of the speculative elide, so the
+    // method stays compiled (no whole-method blacklist) but no longer re-makes
+    // the failed speculation. Inert in production / on the `compile()` wrapper:
+    // `despec_contains` returns `false` for an empty key or empty registry, so
+    // `speculative_bce_guards` is unchanged ⇒ byte-identical codegen.
+    let speculative_bce_guards: Vec<SpeculativeBCEGuard> = speculative_bce_guards
+        .into_iter()
+        .filter(|g| {
+            let despec = crate::deopt::despec_contains(method_key, g.loop_header as u32);
+            if despec && std::env::var_os("CRATONVM_DBG_DEOPT").is_some() {
+                eprintln!(
+                    "[cratonvm-deopt] de-spec: suppressing speculative-BCE guard at \
+                     loop_header bci={} for {} (recompile without it)",
+                    g.loop_header, method_key
+                );
+            }
+            !despec
+        })
+        .collect();
     // Index the speculative guards by loop-header PC once, so the per-header
     // emit loop does an O(1) map lookup instead of an O(guards) filtered scan
     // at every loop header.
@@ -23523,6 +23591,11 @@ pub fn compile_with_param_slots(
     // (find_deopt_point has no live caller; the i64::MIN re-run is unchanged).
     cm.deopt_points = compiler.deopt_points;
     cm._deopt_point_boxes = compiler.deopt_boxes;
+    // deopt-osr Step 9 follow-up (a): hand the retained epoch guard (baked as the
+    // 4th arg into every frame-deopt stub) to the artifact so the VM can stamp it
+    // (creation epoch + live-epoch cell) at install. Null on production artifacts
+    // (no frame-deopt stub emitted unless `deopt_real_enabled()`).
+    cm.deopt_epoch_guard = compiler.deopt_epoch_guard;
     // deopt-osr x64-backport Step 5 — finalize the per-method deopt-resume
     // coverage gate (mirrors `fully_oop_covered` / `can_osr_exit`). A method may
     // resume a real-frame deopt only when:
