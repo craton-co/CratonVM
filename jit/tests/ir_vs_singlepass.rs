@@ -2365,6 +2365,44 @@ fn ir_fp_drem_fractional() {
     );
 }
 
+// ── FP method with int-div (Slice C: FP-slot deopt resume) ──────────────────
+//
+// Dropping the FP gate's `!method_has_int_div` exclusion admits an FP method
+// containing an `idiv`/`irem` to the IR path. The int division carries a
+// div-by-zero deopt guard; with FP-slot resume wired, an FP value live ACROSS
+// that guard is reconstructed precisely on a deopt (the div-by-zero path is
+// validated E2E vs HotSpot — caught ArithmeticException + correct FP value).
+// Here, with a non-zero divisor (no deopt), the method must compile via IR and
+// agree with single-pass (which also compiles idiv + FP) and the host anchor.
+
+#[test]
+fn ir_fp_method_with_int_div() {
+    // int f(int a, int b) { float x = (float)a * 2; int q = a / b;
+    //                       return (int)(x + (float)q); }
+    // The FP value `x` is live on the operand stack ACROSS the idiv (the deopt
+    // point), exercising an FP stack slot at the guard.
+    //   iload_0; i2f; fconst_2; fmul;   // x = a*2.0f  [FP live]
+    //   iload_0; iload_1; idiv;          // q = a/b     [idiv deopt guard]
+    //   i2f; fadd; f2i; ireturn          // (int)(x + (float)q)
+    check_fp(
+        "fp_intdiv",
+        "(II)I",
+        vec![
+            0x1a, 0x86, 0x0d, 0x6a, // (float)a * 2.0
+            0x1a, 0x1b, 0x6c, // a / b
+            0x86, 0x62, 0x8b, 0xac, // (float)q ; +x ; (int) ; return
+        ],
+        2,
+        2,
+        &[
+            (vec![10, 2], 25),   // x=20.0, q=5  → 25
+            (vec![7, 3], 16),    // x=14.0, q=2  → 16
+            (vec![-8, 4], -18),  // x=-16.0, q=-2 → -18
+            (vec![100, 7], 214), // x=200.0, q=14 → 214
+        ],
+    );
+}
+
 // ── FP 3-way compares (fcmpl/fcmpg/dcmpl/dcmpg) — item 3 next slice ──────────
 //
 // The compare yields int {-1,0,1} feeding the existing `if<cond>`. The

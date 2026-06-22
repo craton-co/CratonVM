@@ -7678,12 +7678,13 @@ fn ir_deopt_resume_enabled() -> bool {
 
 /// Map ONE reconstructed `FrameValue` (already resolved in-stub against the
 /// machine state) to an interpreter `Value`. Handles the type-source kinds the
-/// producer can emit today: a cat-1 `Int`, a cat-2 `Long`, and an
-/// object-reference (`StackSlotRef`, resolved in-stub to a raw heap-pointer
-/// word). Returns `None` for any not-yet-reconstructable variant
-/// (`Float`/`Double`/`Unsupported`/`VirtualObject`/`VirtualObjectRef`, or an
-/// unresolved `Register`/`StackSlot*` which should never reach here), so the
-/// caller falls back to the safe re-run path rather than materialise a mistyped
+/// producer can emit today: a cat-1 `Int`, a cat-2 `Long`, a cat-1 `Float`, a
+/// cat-2 `Double` (Slice C — FP-slot resume), and an object-reference
+/// (`StackSlotRef`, resolved in-stub to a raw heap-pointer word). Returns `None`
+/// for any not-yet-reconstructable variant (`Unsupported`/`VirtualObject`/
+/// `VirtualObjectRef`, or an unresolved `Register`/`StackSlot*` which should
+/// never reach here), so the caller falls back to the safe re-run path rather
+/// than materialise a mistyped
 /// slot.
 ///
 /// `Object(w)` is the `real-frame-deopt` type source for ref-typed slots (e.g.
@@ -7699,6 +7700,12 @@ fn fv_to_value(v: &cratonvm_jit::deopt::FrameValue) -> Option<Value> {
     match v {
         FrameValue::Int(i) => Some(Value::Int(*i as i32)),
         FrameValue::Long(l) => Some(Value::Long(*l)),
+        // FP-slot resume (Slice C): a `float`/`double` live at a deopt guard is
+        // carried as raw bits (`Float` = low-32, `Double` = full-64) and rebuilt
+        // into the typed `Value`. A `Double` is cat-2 (one compact operand-stack
+        // slot, two JVM local slots — see `ir_deopt_locals`).
+        FrameValue::Float(bits) => Some(Value::Float(f32::from_bits(*bits as u32))),
+        FrameValue::Double(bits) => Some(Value::Double(f64::from_bits(*bits))),
         FrameValue::Object(w) => Some(match *w {
             0 => Value::Object(None),
             // SAFETY: `w` is a live, 8-byte-aligned heap pointer read
@@ -7733,7 +7740,14 @@ fn ir_deopt_locals(vals: &[cratonvm_jit::deopt::FrameValue]) -> Option<Vec<Value
     let mut i = 0;
     while i < vals.len() {
         out.push(fv_to_value(&vals[i])?);
-        i += if matches!(vals[i], FrameValue::Long(_)) { 2 } else { 1 };
+        // Both `long` and `double` are category-2 (two JVM local slots): the
+        // snapshot reserves the upper-half slot (recorded as `Undefined`), which
+        // `copy_args_to_locals` re-creates from the compact list, so skip it here.
+        i += if matches!(vals[i], FrameValue::Long(_) | FrameValue::Double(_)) {
+            2
+        } else {
+            1
+        };
     }
     Some(out)
 }
@@ -22729,9 +22743,17 @@ mod tests {
             ir_deopt_frame_values(&[FrameValue::Unsupported]).is_none(),
             "an Unsupported slot must re-run, not resume"
         );
-        assert!(
-            ir_deopt_frame_values(&[FrameValue::Float(0)]).is_none(),
-            "an FP-in-slot must re-run until XMM resolution lands"
+        // Slice C: FP-in-slot now resolves to the typed Value (not a re-run).
+        // Float carries the 32-bit bits in the low word; Double the full 64.
+        assert_eq!(
+            ir_deopt_frame_values(&[FrameValue::Float(1.5f32.to_bits() as u64)]),
+            Some(vec![Value::Float(1.5)]),
+            "a float slot resolves to Value::Float"
+        );
+        assert_eq!(
+            ir_deopt_frame_values(&[FrameValue::Double(3.25f64.to_bits())]),
+            Some(vec![Value::Double(3.25)]),
+            "a double slot resolves to Value::Double"
         );
     }
 
@@ -22764,6 +22786,21 @@ mod tests {
         );
         // An unmappable slot still forces re-run.
         assert!(ir_deopt_locals(&[FrameValue::Unsupported]).is_none());
+
+        // Slice C: a `double` is cat-2 too — its reserved upper-half slot must be
+        // skipped just like a `long`'s. JVM-slot layout for `(double d, int x)`:
+        // d@0, <upper-half>@1, x@2 → compact `[Double, Int]`.
+        let dlocals = ir_deopt_locals(&[
+            FrameValue::Double(2.5f64.to_bits()),
+            FrameValue::Undefined, // reserved upper half of the double — skipped
+            FrameValue::Int(9),
+        ])
+        .expect("Double/Undefined/Int are all mappable");
+        assert_eq!(
+            dlocals,
+            vec![Value::Double(2.5), Value::Int(9)],
+            "the double's reserved upper-half placeholder must be dropped"
+        );
     }
 
     // -----------------------------------------------------------------------

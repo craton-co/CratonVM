@@ -1503,10 +1503,16 @@ impl<'a> Lowerer<'a> {
                     FrameValue::Int(v)
                 }
             }
-            // Float / double constant bits. FP-slot resume is a follow-up, so
-            // the resume currently re-runs on a `Float` slot (safe) — the value
-            // is carried for a future FP-aware resume.
-            Op::ConstF(bits) => FrameValue::Float(bits),
+            // Float / double constant bits. A cat-2 `double` resolves to
+            // `Double` (the resume builds a `Value::Double` with cat-2 two-slot
+            // local placement); a cat-1 `float` resolves to `Float`.
+            Op::ConstF(bits) => {
+                if node.ty == IrType::Double {
+                    FrameValue::Double(bits)
+                } else {
+                    FrameValue::Float(bits)
+                }
+            }
             Op::Param(idx) => {
                 // The prologue stored param `idx` at `[rbp - (idx+1)*8]`. If
                 // the Param node was also scheduled it has its own spill slot
@@ -1538,17 +1544,20 @@ impl<'a> Lowerer<'a> {
     /// (`real-frame-deopt` type source). A `Ref` slot becomes `StackSlotRef`
     /// (resolves to a `Value::Object`); a cat-1 `Int` slot stays `StackSlot`
     /// (resolves to `Value::Int`); a cat-2 `Long` slot becomes `StackSlotLong`
-    /// (resolves to a `Value::Long` with cat-2 two-slot placement). `Double` and
-    /// FP (`Float`) slots are `Unsupported` for now — the IR path does not
-    /// compile float/double methods, and FP-slot/XMM resolution is a follow-up,
-    /// so the resume falls back to the safe re-run path rather than truncate/
-    /// mistype them. `Void`/`Control`/`Memory` are never live data slots, so they
-    /// too map to `Unsupported`.
+    /// (resolves to a `Value::Long` with cat-2 two-slot placement). A cat-1
+    /// `Float` slot becomes `StackSlotFloat` (resolves to a `Value::Float` from
+    /// the spilled 32-bit bits); a cat-2 `Double` slot becomes `StackSlotDouble`
+    /// (resolves to a `Value::Double` with cat-2 two-slot placement). With
+    /// FP-slot resume wired (Slice C), an FP value may now be live at a deopt
+    /// guard. `Void`/`Control`/`Memory` are never live data slots, so they map to
+    /// `Unsupported`.
     fn typed_stack_slot(off: i32, ty: IrType) -> FrameValue {
         match ty {
             IrType::Ref => FrameValue::StackSlotRef(off),
             IrType::Int => FrameValue::StackSlot(off),
             IrType::Long => FrameValue::StackSlotLong(off),
+            IrType::Float => FrameValue::StackSlotFloat(off),
+            IrType::Double => FrameValue::StackSlotDouble(off),
             _ => FrameValue::Unsupported,
         }
     }
