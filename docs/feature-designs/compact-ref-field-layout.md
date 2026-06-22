@@ -148,6 +148,25 @@ Build `cvmcref.exe` (unique name). Oracle harness (checksums == HotSpot):
 - `CtorTest`, `CollSmall`/`CollTest`.
 - Measure node size (56 vs 72) and bt throughput delta.
 
+## Gotcha: synthetic objects that store the wrong type into a reference slot
+
+The legacy 16-byte tagged cell can hold *any* `Value` regardless of the field's
+declared type, so some VM bootstrap code repurposes a slot with a value whose
+type differs from the class's declared field. Under compact, a slot's width +
+ref-ness is fixed by the layout: writing a non-`Object` into a reference slot
+**auto-boxes** it (1-field wrapper), turning a "should-be-null" reference into a
+non-null wrapper Object.
+
+The first instance found: `ensure_system_streams` stored the synthetic fd id
+(`Int(1/2)`) into slot 0 of the System.out/err PrintStream, but slot 0 of the
+real `java/io/PrintStream` is the reference `out`. Under compact the Int
+auto-boxed → `out` non-null → `route_write_through_out` routed every write into
+the dead wrapper → silent empty stdout (computation + file I/O were unaffected).
+Fixed by skipping the fd-tag store when slot 0 is a compact reference field
+(`stream_fd` uses pointer identity in real-JDK mode). **When soaking the app
+gauntlet, watch for the same pattern** (a primitive stored into a declared
+reference field of a synthetic/bootstrap object).
+
 ## Stage 5 — observability (deferred, non-critical)
 
 HPROF instance dump (`serviceability.rs`) and the field-watch corruption

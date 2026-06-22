@@ -1461,11 +1461,25 @@ impl GenerationalHeap {
             // object's body (prefix-sum offset table), so `base` and the 8/16-byte
             // read of that slot are in-bounds.
             let base = unsafe { obj_ref.as_ptr().add(HEADER_SIZE + off) };
-            return if is_ref {
-                unsafe { read_prim_element(base, 0, ArrayElementType::Reference) }
-            } else {
-                unsafe { read_slot(base) }
-            };
+            if !is_ref {
+                return unsafe { read_slot(base) };
+            }
+            let v = unsafe { read_prim_element(base, 0, ArrayElementType::Reference) };
+            // Unbox an AUTOBOX wrapper: a non-Object value stored into this
+            // reference slot (CratonVM's synthetic collections type-pun a
+            // primitive into a reference-declared slot) was boxed into a
+            // 1-field wrapper by set_field. Mirror get_array_element_unboxing so
+            // the value round-trips and the wrapper never escapes to Java.
+            if let Value::Object(Some(r)) = v {
+                if self.is_object_address(r.as_ptr() as usize).is_some() {
+                    // SAFETY: address validated as a live heap object.
+                    let h = unsafe { &*(r.as_ptr() as *const ObjectHeader) };
+                    if h.class_id == AUTOBOX_CLASS_ID {
+                        return self.get_field(r, 0);
+                    }
+                }
+            }
+            return v;
         }
         // SAFETY: `obj_ref` points to a valid heap object and `index` is within
         // `num_slots` (checked above). `slot_ptr` computes

@@ -31,6 +31,15 @@ echo "=== GC_STRESS bt16 (compact ON) ==="
 gs=$(CRATONVM_COMPACT_REF_FIELDS=1 CRATONVM_GC_STRESS=1 "$VM" --java-home "$JDK" -cp "$WORK" binarytrees 16 2>/dev/null | tr -d '[:space:]')
 [ "$gs" = "14985902" ] && echo "bt16 GC_STRESS on=$gs OK" || { echo "bt16 GC_STRESS on=$gs MISMATCH(exp 14985902)"; fail=1; }
 
+echo "=== collections / mixed-field correctness (Mix) ==="
+if [ -f "$WORK/Mix.class" ]; then
+  hs=$("$JDK/bin/java.exe" -cp "$WORK" Mix 2>/dev/null | tr -d '[:space:]')
+  coff=$(env -u CRATONVM_COMPACT_REF_FIELDS "$VM" --java-home "$JDK" -cp "$WORK" Mix 2>/dev/null | tr -d '[:space:]')
+  con=$(CRATONVM_COMPACT_REF_FIELDS=1 "$VM" --java-home "$JDK" -cp "$WORK" Mix 2>/dev/null | tr -d '[:space:]')
+  printf "Mix hotspot=%s off=%s on=%s  " "$hs" "$coff" "$con"
+  { [ "$coff" = "$hs" ] && [ "$con" = "$hs" ]; } && echo OK || { echo MISMATCH; fail=1; }
+fi
+
 echo "=== node size probe (compact ON, alloc trace if available) ==="
 echo "(node = HEADER(40) + 2*8 = 56 bytes compact vs 40 + 2*16 = 72 legacy)"
 
