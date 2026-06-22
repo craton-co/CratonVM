@@ -426,6 +426,33 @@ Author note: this doc is grounded in a read of `gc/src/{g1,g1_concurrent,zgc,zgc
       (matching gen) instead of a wrong checksum; clean-heap parity unchanged
       (binarytrees16/DeepTree/GcChurn@256m); 727/727 gc tests + a zero-free-region
       regression. Distinct from both the CSet fix and JIT A5.
+  - **Old→young remembered-set-completeness hole — FIXED** (merge `da4cbe7a`, fix
+    `8069818f`; found during the mixed-GC validation pass). A `young→young` ref
+    carries no rset entry (young is collected whole); when the holder ages /
+    promotes to **Old** while the referent stays younger, the edge silently becomes
+    Old→young — but it was created and maintained ONLY by GC-internal pointer
+    rewrites (evacuation slot-fixups + the promotion copy), never a mutator write
+    barrier, so the rset never learned of it and the next young GC dropped the
+    still-live young referent (the V7b verifier reported 75k–104k dangling refs
+    from Old holder regions). It is the general **aging/promotion** case of the
+    JIT-pinned-straddle fix `5d761809`, but reproduces with `--nojit`/interpreter
+    (no JIT roots) and is a pre-existing serial bug (the parallel evacuator only
+    avoided it by faster timing). Fix: `update_references_in_regions` (the Phase-4
+    pass that already walks every non-CSet⇒Old/Humongous region each collection)
+    now also rebuilds the Old→young rset at no extra walk — every cross-region
+    reference into an Eden/Survivor region is recorded via
+    `RememberedSet::add_reference` so the next collection scans it as a source
+    (shared serial+parallel; over-approximation only). Repro
+    `scratch/g1par/MixedChurn.java` (humongous `live[]` of cross-referenced nodes),
+    `-XX:+UseG1GC --nojit`: @160m serial was **3/3 WRONG** with V7b≈75k–104k; now
+    **V7b=0 and serial is correct@{192,224,256}m or a clean OOM@160m — never
+    wrong**; parallel@160m + clean-heap unchanged; 727 gc tests + regression
+    `old_to_young_ref_via_gc_rewrite_not_dropped`. **Known follow-ups:** the
+    analogous **Old→Old** GC-rewrite edge for MIXED GC is not yet recorded (mixed
+    is rarer/unproven; the write barrier covers mutator Old→Old stores), and the
+    IHOP/region/pause `-XX:` knobs remain unwired (§7 item 4) so a *mixed* GC can
+    only be triggered near 70% occupancy — mixed never fired in these repros, so
+    this was a young-GC bug, and clean mixed-GC validation still awaits the knob.
   - **Pre-existing bug surfaced (NOT parallel-specific; blocks Step 10):** with the
     JIT enabled, a long-lived local reference held across a hot loop is **missed by
     GC root scanning**, so G1's *precise unconditional moving* young collection
