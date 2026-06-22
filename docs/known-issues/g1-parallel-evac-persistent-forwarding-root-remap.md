@@ -1,8 +1,14 @@
 # G1 parallel evacuator drops a root-referenced object (persistent `forwarding_ptr` vs per-cycle `pointer_map`)
 
-**Status:** 🔴 OPEN — fully root-caused, no working fix yet. Blocks
-parallel-evac-default-on and the G1 default flip (Step 9/10 of
-`docs/feature-designs/concurrent-gc-maturation.md`). The `task_58d60f7a` family.
+**Status:** 🟡 PARTIALLY FIXED. The DOMINANT bug (this doc's persistent-
+`forwarding_ptr` root-remap flaw, deterministic ~12.5% on the repro) is **FIXED**
+(see "Fix" below; `SteadyChurn @16m` ~12.5%→0 via the verifier's LOST check, no
+regression on `binarytrees16`/`PromoteMixed` serial+parallel vs HotSpot). A
+SEPARATE, rarer **concurrency race** remains 🔴 OPEN (~5%, timing-sensitive,
+invisible to the post-collection verifier) — see "Residual". Still blocks
+parallel-evac-default-on / the G1 default flip (Step 9/10 of
+`docs/feature-designs/concurrent-gc-maturation.md`). The `task_58d60f7a` family
+turned out to be TWO stacked bugs.
 
 **Scope:** opt-in only (`CRATONVM_G1_PARALLEL_EVAC=1`). The DEFAULT (serial) G1
 and Generational are unaffected. Mixed GC is kept on the serial evacuator
@@ -87,28 +93,45 @@ the root is one-cycle-behind, surviving via the redirect.
 
 ## Fixes that DO NOT work (measured — do not retry)
 
-| Attempt | Result | Why it fails |
+Individually, each of these fails:
+
+| Attempt (alone) | Result | Why it fails alone |
 |---|---|---|
 | Clear `forwarding_ptr` for all `pointer_map` keys at cycle END | 28/30 bad | removes the redirect that masks the stuck roots; the LOST object is not even a key |
 | Clear every CSet object's `forwarding_ptr` at cycle START | 28/30 bad | same, + re-copies the stale from-space object the root is stuck on |
 | Record fast-path hits `(old, existing)` into `pointer_map` | 8/30 (~baseline) | `existing` can be a STALE cross-cycle redirect (collected since) → roots remapped to freed memory |
 
-## The proper fix (sketch — a focused redesign)
+## Fix (landed — dominant bug) — `gc/src/g1.rs`
 
-The parallel evacuator needs a **per-cycle** forwarding notion so a fast-path hit
-is unambiguously a this-cycle forward AND every forward (including fast-path
-hits) is recorded so roots are remappable. Options:
+**Combine the last two** (`evacuate` fast path + the end-of-cycle clear in
+`parallel_evacuate`):
 
-- generation-tag the `forwarding_ptr` (store `(cycle_id, new)`; treat a
-  stale-cycle tag as not-forwarded), then record every this-cycle hit; or
-- never persist `forwarding_ptr` across cycles — clear it for *every* evacuated
-  object at cycle end (not just self-forwards) AND record fast-path hits, so the
-  roots are unstuck the same cycle the redirect is removed (the two failed
-  clear-only / record-only attempts must be combined, and validated that they
-  keep roots on the FINAL live copy, not an intermediate); or
-- drop the header-field dedup entirely and use a concurrent `pointer_map`
-  (`DashMap` / sharded) like the serial path, accepting the contention.
+1. **Record fast-path hits.** On `forwarding_ptr != 0`, push `(old_ptr, existing)`
+   into the worker forward shard before returning — so the forward reaches
+   `pointer_map` and the VM can remap a root/ref pointing at `old_ptr`.
+2. **Clear ALL keys at cycle end**, not just `key == value` (self-forwards) — so
+   no forward persists into the next cycle. With (1)+(2) every forward is recorded
+   AND nothing is stale, so a fast-path hit is always a fully-scanned this-cycle
+   live copy: the two failure modes of the standalone attempts cancel.
 
-Any candidate must be validated with the repro above (0 corruption over ≥30 runs)
-**and** `PromoteMixed` serial≡parallel≡HotSpot + the diverse soak, since the
-forwarding scheme is shared by young and mixed.
+Validated: `SteadyChurn @16m` parallel **38/40** (was ~baseline; the verifier's
+LOST check now reports 0 — the root-remap bug is gone); `binarytrees16@64m` and
+`PromoteMixed 200000 20000000` serial+parallel **byte-identical to HotSpot**;
+734/734 gc tests + new regression `parallel_fast_path_hit_is_recorded_and_root_remapped`.
+
+## Residual — a separate concurrency race (🔴 OPEN)
+
+With the dominant bug fixed, ~2/40 runs still crash, and the verifier reports
+**nothing** (no LOST / UN-REWRITTEN / OVERLAP) — the heap, roots, and forwards
+are all consistent at collection end. The crash rate *rises* under the verifier's
+own timing perturbation (≈4/20), so this is a **genuine, transient worker-vs-worker
+race** in the parallel closure (`run_worker` / `process_object` / `evacuate` copy
++ scan + queue), NOT a steady-state inconsistency the post-collection verifier can
+catch. This is the original `task_58d60f7a` "data race" suspicion, now isolated as
+a distinct second bug. Fixing it needs concurrency-level tooling (TSan-style /
+loom-style, or targeted ordering audits of the copy↔CAS↔gray-queue handoff), not
+the forwarding-protocol reasoning above.
+
+Parallel evac therefore stays **opt-in/experimental** and mixed stays serial until
+this residual race is also fixed. Default G1 (serial) and Generational are
+unaffected.

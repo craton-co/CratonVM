@@ -259,9 +259,24 @@ impl<'a> SharedEvac<'a> {
             (*(old_ptr as *mut ObjectHeader)).forwarding_ptr
         ) as *const AtomicUsize);
 
-        // Fast path: already forwarded by some worker.
+        // Fast path: already forwarded this cycle.
         let existing = fwd_atomic.load(Ordering::Acquire);
         if existing != 0 {
+            // DEFECT-2 FIX (part 1 of 2): record the forward in THIS cycle's
+            // forward set even though we didn't perform the copy, so it reaches
+            // `pointer_map`. The serial path dedups via the per-cycle
+            // `pointer_map` (so every forward is recorded); the parallel path
+            // dedups via the persistent `forwarding_ptr` header field, and a
+            // fast-path hit previously returned `existing` WITHOUT recording it.
+            // That left the address `old_ptr -> existing` absent from
+            // `pointer_map`, so the VM's `update_all_roots` could not remap a root
+            // still pointing at `old_ptr` — it stayed stuck on the from-space
+            // object and dangled when the region was reused (the rare
+            // `java/lang/Object`). Recording it lets the root be remapped to
+            // `existing`. Safe because part 2 (clearing `forwarding_ptr` for every
+            // evacuated object at cycle end) guarantees `existing` is a THIS-cycle
+            // forward (a fully-scanned live copy), never a stale prior-cycle one.
+            forwards.push((old_ptr as usize, existing));
             return Some((existing as *mut u8, false));
         }
 
@@ -2074,43 +2089,38 @@ impl G1Collector {
             }
         }
 
-        // PARALLEL-EVAC UAF FIX (Step 9). The parallel evacuator CAS-installs
-        // each forward into the from-space object's *persistent*
-        // `ObjectHeader::forwarding_ptr` field (the lock-free install slot),
-        // unlike the serial path which records forwards only in the per-cycle
-        // `pointer_map`. For a normally-evacuated object that is harmless: its
-        // from-space region is reset in Phase 5 (`free_or_keep_cset`), which
-        // zeroes the field. But a *self-forwarded* object (evacuation failure —
-        // to-space pool exhausted — installs `old -> old`, a `key == value`
-        // entry) lives in a region that Phase 5 KEEPS and never resets, so its
-        // `forwarding_ptr` would retain its own address across collections.
+        // DEFECT-2 FIX (part 2 of 2): restore the evacuator's
+        // "`forwarding_ptr == 0` at collection start" invariant for EVERY
+        // from-space object forwarded this cycle, not just the self-forwarded
+        // ones.
         //
-        // The NEXT collection's `evacuate` fast path
-        // (`let e = forwarding_ptr; if e != 0 { return (e, false) }`) would then
-        // read that stale self-pointer, SKIP re-evacuating the still-live object
-        // (now back in the CSet) and record NO forward for it this cycle —
-        // whereupon `free_or_keep_cset`, seeing no `key == value` entry, frees
-        // the region out from under every referrer. Result: dangling references
-        // into reclaimed memory (intermittent SIGSEGV; the V7b verifier reports
-        // "freed CSet region ... no forwarding entry"). Manifests at scale on a
-        // large humongous reference array whose elements repeatedly fail to find
-        // to-space.
+        // The parallel evacuator CAS-installs each forward into the from-space
+        // object's *persistent* `ObjectHeader::forwarding_ptr` (the lock-free
+        // install slot), unlike the serial path which records forwards only in
+        // the per-cycle `pointer_map`. Phase 5 (`free_or_keep_cset`) zeroes the
+        // field for a FREED region, but a KEPT region (one holding a
+        // self-forwarded / evacuation-failed object) is never reset, so the
+        // `forwarding_ptr` of EVERY forwarded object it contains — the
+        // self-forwarded one AND the normally-evacuated bodies left behind —
+        // would persist into the next collection. On the next cycle `evacuate`'s
+        // fast path reads that STALE forward, returns it without re-evacuating or
+        // recording it, and (with part 1) records a stale forward / strands a
+        // root on a from-space object → the rare `java/lang/Object`.
         //
-        // Restore the evacuator's "`forwarding_ptr == 0` at collection start"
-        // invariant for the only objects that violate it — the self-forwarded
-        // (kept-in-place) ones — now that the transitive closure is complete and
-        // no further `evacuate` call this cycle depends on the in-place forward.
-        // The merge above is the first point at which every shard's self-forward
-        // is visible. The serial path never writes this header field, which is
-        // why it is V7b-clean on the identical workload.
-        for (&k, &v) in pointer_map.iter() {
-            if k == v {
-                // SAFETY: `k` is a live from-space object address that the
-                // evacuator just CAS-forwarded to itself; its header is intact
-                // and its region is held under the collection's `regions` lock.
-                unsafe {
-                    (*(k as *mut ObjectHeader)).forwarding_ptr = std::ptr::null_mut();
-                }
+        // Clearing only `k == v` (self-forwards) was insufficient: it left the
+        // normally-evacuated bodies in kept regions stale (and clearing them
+        // alone, without part 1's fast-path recording, removed the redirect that
+        // was masking the stuck roots — hence the two halves are landed
+        // together). Clear ALL keys: for a freed region this is redundant (Phase
+        // 5 zeroes it anyway); for a kept region it is the correction. Together
+        // with part 1 this makes the parallel path behave like the serial one —
+        // every forward recorded in `pointer_map`, none persisting across cycles.
+        for &k in pointer_map.keys() {
+            // SAFETY: `k` is a from-space object address forwarded this cycle;
+            // its header is intact and its region is held under the collection's
+            // `regions` lock (Phase 5 has not run yet).
+            unsafe {
+                (*(k as *mut ObjectHeader)).forwarding_ptr = std::ptr::null_mut();
             }
         }
 
@@ -7705,6 +7715,50 @@ mod tests {
             Some(12345),
             "live object lost across a second collection (stale self-forward UAF)"
         );
+    }
+
+    /// Regression (defect 2: persistent forwarding_ptr root-remap). When the
+    /// parallel evacuator reaches a CSet object whose `forwarding_ptr` is already
+    /// set (a fast-path hit), it must RECORD `old -> existing` in `pointer_map`
+    /// (so the VM's `update_all_roots` can remap a root that still points at
+    /// `old`) and CLEAR the header at cycle end (so the forward does not persist
+    /// into the next cycle). Before the fix the fast path returned `existing`
+    /// without recording it, so the root stayed stuck on the from-space object
+    /// and dangled when its region was reused.
+    #[test]
+    fn parallel_fast_path_hit_is_recorded_and_root_remapped() {
+        let mut cfg = parallel_config(4, 8);
+        cfg.promotion_age = 1;
+        let gc = G1Collector::new(cfg);
+
+        // Promote a target T to Old so it is a stable (non-CSet) forward target.
+        let t = gc.alloc_object(ClassId::new(2), 1);
+        gc.set_field(t, 0, Value::Int(99));
+        let mut troots = vec![t];
+        gc.young_collection_parallel(&mut troots, &NoopMonitors); // Survivor, age 1
+        gc.young_collection_parallel(&mut troots, &NoopMonitors); // promote -> Old
+        let t_old = troots[0].as_ptr() as usize;
+
+        // O lives in young Eden; pre-install O.forwarding_ptr = T as if a worker
+        // had already forwarded O to T this cycle (or a stale prior-cycle
+        // redirect). Root O.
+        let o = gc.alloc_object(ClassId::new(1), 0);
+        let o_addr = o.as_ptr() as usize;
+        unsafe {
+            (*(o.as_ptr() as *mut ObjectHeader)).forwarding_ptr = t_old as *mut u8;
+        }
+        let mut roots = vec![o];
+        let r = gc.young_collection_parallel(&mut roots, &NoopMonitors);
+
+        // (a) the fast-path forward O -> T is recorded in pointer_map.
+        assert_eq!(
+            r.pointer_map.get(&o_addr),
+            Some(&t_old),
+            "fast-path forward O->T was not recorded in pointer_map (root cannot be remapped)"
+        );
+        // (b) the root is remapped to T, and T is intact (not re-copied/corrupted).
+        assert_eq!(roots[0].as_ptr() as usize, t_old, "root not remapped to the forward target");
+        assert_eq!(gc.get_field(roots[0], 0).as_int(), Some(99));
     }
 
     #[test]
