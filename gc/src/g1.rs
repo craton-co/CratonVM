@@ -1941,6 +1941,14 @@ impl G1Collector {
     /// available hardware parallelism (always ≥ 1). With 1 worker the parallel
     /// code path drains serially — useful for determinism testing.
     fn parallel_worker_count(&self) -> usize {
+        // Diagnostic override: `CRATONVM_G1_WORKERS=N` forces the worker count
+        // (e.g. =1 to drain the parallel path serially and isolate concurrency
+        // races from logic divergences). Falls back to the config otherwise.
+        if let Some(v) = std::env::var_os("CRATONVM_G1_WORKERS") {
+            if let Some(n) = v.to_str().and_then(|s| s.trim().parse::<usize>().ok()) {
+                return n.max(1);
+            }
+        }
         let cfg = self.config.gc_worker_threads.max(1);
         let avail = std::thread::available_parallelism()
             .map(|n| n.get())
@@ -2181,6 +2189,7 @@ impl G1Collector {
         let bytes_freed = self.free_or_keep_cset(&mut regions, &cset, &pointer_map);
         self.verify_no_dangling_into_cset(&regions, &cset_set, &pointer_map);
         self.dbg_verify_no_unrewritten_forward(&regions, &cset_set, &pointer_map, roots);
+        self.dbg_scan_for_zeroed_refs(&regions, &cset_set, roots);
 
         let cur_eden = self.current_eden.load(Ordering::Relaxed);
         if cset_set.contains(&cur_eden) {
@@ -3147,6 +3156,93 @@ impl G1Collector {
                 "[g1][DBG-HEADERS] {hits} un-rewritten + {lost} LOST(un-evacuated CSet) \
                  from NON-CSET holders/roots = the real defect"
             );
+        }
+    }
+
+    /// DIAGNOSTIC (defect-2 residual race, env `CRATONVM_G1_DBG_ZERO=1`): after a
+    /// parallel collection, scan EVERY non-Free region (INCLUDING kept CSet
+    /// regions, which the un-rewritten verifier excludes) plus the roots, and
+    /// report any reference whose TARGET has an all-zero header (the freed/reused
+    /// region signature behind `java/lang/Object`). Catches the residual
+    /// concurrency-race corruption at the collection that introduces it,
+    /// regardless of which region the holder lives in. No-op unless the env set.
+    fn dbg_scan_for_zeroed_refs(
+        &self,
+        regions: &[G1Region],
+        cset_set: &std::collections::HashSet<usize>,
+        roots: &[ObjectRef],
+    ) {
+        if std::env::var_os("CRATONVM_G1_DBG_ZERO").is_none() {
+            return;
+        }
+        let mut hits = 0usize;
+        let is_zeroed = |addr: usize| -> bool {
+            if addr == 0 || self.lookup_region_for_addr(addr).is_none() {
+                return false;
+            }
+            let h = unsafe { &*(addr as *const ObjectHeader) };
+            h.class_id.as_u32() == 0
+                && h.num_slots == 0
+                && (h.kind as u8) == 0
+                && h.array_length == 0
+        };
+        let mut report = |holder: usize, hreg: Option<usize>, where_: &str, target: usize| {
+            if is_zeroed(target) {
+                hits += 1;
+                if hits <= 16 {
+                    let treg = self.lookup_region_for_addr(target);
+                    let h_in_cset = hreg.map(|i| cset_set.contains(&i)).unwrap_or(false);
+                    let t_in_cset = treg.map(|i| cset_set.contains(&i)).unwrap_or(false);
+                    eprintln!(
+                        "[g1][DBG-ZERO] ZEROED target: {where_} holder={:#x} (region={:?} \
+                         in_cset={h_in_cset}) slot->{:#x} (region={:?} in_cset={t_in_cset})",
+                        holder, hreg, target, treg
+                    );
+                }
+            }
+        };
+        for r in roots {
+            report(0, None, "root", r.as_ptr() as usize);
+        }
+        for (ridx, region) in regions.iter().enumerate() {
+            if region.region_type == RegionType::Free {
+                continue;
+            }
+            let base = region.data.as_ptr();
+            let cursor = region.cursor;
+            let mut off = 0usize;
+            while off < cursor {
+                let obj_ptr = unsafe { base.add(off) };
+                let header = unsafe { &*(obj_ptr as *const ObjectHeader) };
+                if is_humongous_filler(header) {
+                    break;
+                }
+                let sz = object_total_size(header);
+                if sz < HEADER_SIZE || off + sz > cursor {
+                    break;
+                }
+                let data = unsafe { obj_ptr.add(HEADER_SIZE) };
+                if header.kind == ObjectKind::Array {
+                    if header.element_type == ArrayElementType::Reference {
+                        for k in 0..header.array_length as usize {
+                            let raw =
+                                unsafe { std::ptr::read(data.add(k * 8) as *const u64) } as usize;
+                            report(obj_ptr as usize, Some(ridx), "array-elem", raw);
+                        }
+                    }
+                } else {
+                    for s in 0..header.num_slots as usize {
+                        let v = unsafe { std::ptr::read(data.add(s * SLOT_SIZE) as *const Value) };
+                        if let Value::Object(Some(o)) = v {
+                            report(obj_ptr as usize, Some(ridx), "field", o.as_ptr() as usize);
+                        }
+                    }
+                }
+                off += sz;
+            }
+        }
+        if hits > 0 {
+            eprintln!("[g1][DBG-ZERO] {hits} reference(s) to a ZEROED (freed) object this collection");
         }
     }
 
