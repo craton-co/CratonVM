@@ -67,14 +67,15 @@ pub fn optimize(graph: &mut Graph) {
     }
 }
 
-/// `true` when `CRATONVM_JIT_LICM` is set (cached). Enables the SCEV-driven
-/// loop-invariant code-motion pass. Default-OFF: the pass is the experimental
-/// Increment-2 slice and must soak against the differential gauntlet before
-/// the default flips.
+/// `true` (default) when the SCEV-driven loop-invariant code-motion pass runs.
+/// Flipped default-ON after the increment-2 LICM pass soaked clean (bt10/14/16/18
+/// + loop-heavy bench differential gate-ON ≡ gate-OFF == HotSpot, like the
+/// `IR_CALL`/`IR_LONG`/`IR_FP` flips). `CRATONVM_JIT_LICM=0` is the opt-out that
+/// restores the pre-flip (no-LICM) behaviour as the safety net.
 pub fn licm_enabled() -> bool {
     use std::sync::OnceLock;
     static FLAG: OnceLock<bool> = OnceLock::new();
-    *FLAG.get_or_init(|| std::env::var_os("CRATONVM_JIT_LICM").is_some())
+    *FLAG.get_or_init(|| std::env::var("CRATONVM_JIT_LICM").map_or(true, |v| v != "0"))
 }
 
 /// `true` when `CRATONVM_JIT_REASSOC` is set (cached). Enables the affine
@@ -663,6 +664,40 @@ fn try_simplify(nodes: &[Node], id: NodeId, zero: NodeId) -> Option<NodeId> {
             }
             None
         }
+        // Trivial-phi elimination (standard SSA simplification, Braun et al.):
+        // a phi whose value inputs (slots 1..; slot 0 is the control anchor) are
+        // all either the phi itself (a back-edge that re-feeds the same value —
+        // i.e. a loop-carried local that is never reassigned) or a single other
+        // value `v` collapses to `v`: its value cannot differ by predecessor.
+        // This removes the redundant loop-header phis the IR builder inserts for
+        // *invariant* locals (e.g. the receiver `b` in `for (..) acc += b.f`),
+        // exposing the real `Param`/alloc base to LICM, GVN, and the alias
+        // oracle — without it LICM's load hoisting is inert on production IR
+        // (the base is always a region-anchored phi → judged loop-variant).
+        // A phi with two distinct non-self value inputs (an induction phi
+        // `φ(0, i+1)`, an accumulator, a real merge, a memory phi advanced by an
+        // in-loop op) has `single` set twice → returns None, left untouched.
+        Op::Phi => {
+            let mut single = NO_NODE;
+            for &v in inputs.iter().skip(1) {
+                if v == id || v == NO_NODE {
+                    continue; // self-reference (unchanged back-edge) / placeholder
+                }
+                if matches!(nodes[v as usize].op, Op::Dead) {
+                    continue; // a stale dead input observes nothing
+                }
+                if single == NO_NODE {
+                    single = v;
+                } else if single != v {
+                    return None; // genuine merge of distinct values
+                }
+            }
+            if single != NO_NODE && single != id {
+                Some(single)
+            } else {
+                None
+            }
+        }
         _ => None,
     }
 }
@@ -1213,6 +1248,15 @@ fn licm(graph: &mut Graph) -> bool {
         return changed;
     }
 
+    // Non-vacuity diagnostic (mirrors `CRATONVM_DBG_UNROLL`): count the loads
+    // this pass actually hoists, so a live soak can confirm LICM fired rather
+    // than silently bailing every loop.
+    let dbg = std::env::var_os("CRATONVM_DBG_LICM").is_some();
+    let mut hoisted = 0usize;
+    if dbg {
+        eprintln!("[DBG_LICM] {} candidate loop header(s)", headers.len());
+    }
+
     for (region, entry_pred, back_ctrls) in headers {
         // Re-validate: the header may have been killed by an earlier hoist's
         // cleanup in this same loop set (defensive).
@@ -1220,6 +1264,18 @@ fn licm(graph: &mut Graph) -> bool {
             continue;
         }
         let body = loop_body(graph, region, entry_pred, &back_ctrls);
+        if dbg {
+            let nloads = body
+                .iter()
+                .filter(|&&id| matches!(graph.nodes[id as usize].op, Op::Load(_)))
+                .count();
+            eprintln!(
+                "[DBG_LICM] header {region}: body {} node(s), {} load(s), hard_barrier={}",
+                body.len(),
+                nloads,
+                loop_has_hard_barrier(graph, &body)
+            );
+        }
         // The pre-header is the classified loop-entry predecessor — NOT
         // necessarily input slot 0, since a `Merge` header may carry the
         // back-edge at either slot.
@@ -1280,9 +1336,18 @@ fn licm(graph: &mut Graph) -> bool {
                 _ => (NO_NODE, NO_NODE),
             };
             if !is_loop_invariant(graph, base, region, &body) {
+                if dbg {
+                    eprintln!(
+                        "[DBG_LICM] load {load} (inputs {inputs:?}): skip — base {base} variant ({:?})",
+                        graph.nodes[base as usize].op
+                    );
+                }
                 continue;
             }
             if addr != NO_NODE && !is_loop_invariant(graph, addr, region, &body) {
+                if dbg {
+                    eprintln!("[DBG_LICM] load {load}: skip — addr {addr} variant");
+                }
                 continue;
             }
             // If the body has in-loop stores, the load may only hoist past them
@@ -1296,8 +1361,16 @@ fn licm(graph: &mut Graph) -> bool {
                     None => false,
                 };
                 if !safe {
+                    if dbg {
+                        eprintln!("[DBG_LICM] load {load}: skip — may alias in-loop store");
+                    }
                     continue;
                 }
+            }
+            if dbg {
+                eprintln!(
+                    "[DBG_LICM] load {load} (inputs {inputs:?}): HOIST base {base} addr {addr}"
+                );
             }
             // The load is invariant and not clobbered by any in-loop store → safe
             // to compute once at the pre-header. Remove it from the body by
@@ -1310,13 +1383,18 @@ fn licm(graph: &mut Graph) -> bool {
                 if graph.nodes[load as usize].inputs[0] != preheader {
                     graph.nodes[load as usize].inputs[0] = preheader;
                     changed = true;
+                    hoisted += 1;
                 }
             } else {
                 // Compact form: nothing to repoint, but mark changed so the
                 // trailing GVN dedups identical hoisted loads to one.
                 changed = true;
+                hoisted += 1;
             }
         }
+    }
+    if dbg && hoisted > 0 {
+        eprintln!("[DBG_LICM] hoisted {hoisted} invariant load(s) to loop pre-header(s)");
     }
     changed
 }
@@ -1819,13 +1897,16 @@ fn eliminate_dead_nodes(graph: &mut Graph) {
 
 // ── Loop unrolling (activate-ir-optimizer increment 3) ───────────────────
 
-/// `true` when `CRATONVM_JIT_UNROLL` is set (cached). Enables full unrolling of
-/// small constant-trip-count counted loops. Default-OFF: experimental — it
-/// soaks behind the gate and is validated live against HotSpot before any flip.
+/// `true` (default) when full unrolling of small constant-trip-count counted
+/// loops runs. Flipped default-ON after the increment-3 unroll pass soaked clean
+/// (validated live against HotSpot: bt10/14/16/18 + UnrollProbe/UnrollProbe2 +
+/// loop-heavy bench differential gate-ON ≡ gate-OFF == HotSpot).
+/// `CRATONVM_JIT_UNROLL=0` is the opt-out that restores the pre-flip (no-unroll)
+/// behaviour as the safety net.
 pub fn unroll_enabled() -> bool {
     use std::sync::OnceLock;
     static FLAG: OnceLock<bool> = OnceLock::new();
-    *FLAG.get_or_init(|| std::env::var_os("CRATONVM_JIT_UNROLL").is_some())
+    *FLAG.get_or_init(|| std::env::var("CRATONVM_JIT_UNROLL").map_or(true, |v| v != "0"))
 }
 
 /// Only fully unroll loops whose constant trip count is at most this (bounds
@@ -3425,6 +3506,91 @@ mod tests {
         assert_eq!(
             g.nodes[load as usize].inputs[0], preheader,
             "the hoisted load's control input must be re-anchored to the pre-header"
+        );
+    }
+
+    #[test]
+    fn test_trivial_phi_collapses_to_single_value() {
+        // φ(ctrl; v, self) collapses to v (trivial loop phi for an unmodified
+        // local); φ(ctrl; a, b) with two distinct values is a genuine merge and
+        // is left untouched.
+        let mut g = Graph {
+            nodes: Vec::new(),
+            entry: 0,
+            exit: 0,
+            safepoints: Vec::new(),
+        };
+        let start = g.add(Op::Start, IrType::Control, vec![], None);
+        g.entry = start;
+        let ctrl = g.add(Op::Region, IrType::Control, vec![start], None);
+        let v = g.add(Op::Param(0), IrType::Ref, vec![start], None);
+        // Trivial loop phi: value inputs = [v, self].
+        let triv = g.add(Op::Phi, IrType::Ref, vec![ctrl, v], None);
+        g.nodes[triv as usize].inputs.push(triv); // self back-edge
+        let user = g.add(Op::ArrayLength, IrType::Int, vec![triv], None);
+        // Genuine merge phi: two distinct value inputs.
+        let a = g.add(Op::Const(1), IrType::Int, vec![], None);
+        let b = g.add(Op::Const(2), IrType::Int, vec![], None);
+        let merge = g.add(Op::Phi, IrType::Int, vec![ctrl, a, b], None);
+        let user2 = g.add(Op::Neg, IrType::Int, vec![merge], None);
+
+        algebraic_simplify(&mut g);
+
+        assert_eq!(
+            g.nodes[user as usize].inputs[0], v,
+            "the trivial phi must collapse to its single value v"
+        );
+        assert_eq!(
+            g.nodes[triv as usize].op,
+            Op::Dead,
+            "the collapsed trivial phi must be killed"
+        );
+        assert_eq!(
+            g.nodes[user2 as usize].inputs[0], merge,
+            "a genuine merge phi (distinct inputs) must NOT be collapsed"
+        );
+        assert_ne!(g.nodes[merge as usize].op, Op::Dead);
+    }
+
+    #[test]
+    fn test_licm_hoists_load_over_trivial_phi_base() {
+        // The production case: a getfield whose base is a loop-invariant local
+        // arrives with the base wrapped in a trivial loop-header phi `φ(p, self)`
+        // (the IR builder inserts a phi for every live local). Trivial-phi
+        // elimination collapses it to the Param, after which LICM hoists the
+        // load — the integration that makes LICM non-inert on real bytecode.
+        let (mut g, region, preheader, _iv) = loop_probe_header(Op::Merge);
+        let mem = 2;
+        let param = g.add(Op::Param(0), IrType::Ref, vec![g.entry], None);
+        // Trivial loop phi over the invariant base, anchored at the loop header.
+        let base_phi = g.add(Op::Phi, IrType::Ref, vec![region, param], None);
+        g.nodes[base_phi as usize].inputs.push(base_phi); // unchanged back-edge
+        let off = g.add(Op::Const(4), IrType::Int, vec![], None);
+        let load = g.add(
+            Op::Load(MemKind::Int),
+            IrType::Int,
+            vec![region, mem, base_phi, off],
+            None,
+        );
+        let ret = g.add(Op::Return, IrType::Void, vec![region, load], None);
+        g.exit = ret;
+
+        // Precondition: the load's base is the region-anchored loop phi, which
+        // LICM judges loop-variant — so without the collapse LICM is inert here.
+        assert_eq!(g.nodes[load as usize].inputs[2], base_phi);
+        assert_eq!(g.nodes[base_phi as usize].inputs[0], region);
+
+        // Collapse the trivial phi, then hoist.
+        algebraic_simplify(&mut g);
+        assert_eq!(
+            g.nodes[load as usize].inputs[2], param,
+            "trivial-phi elimination must expose the Param base to the load"
+        );
+        let changed = licm(&mut g);
+        assert!(changed, "LICM must hoist once the base is the invariant Param");
+        assert_eq!(
+            g.nodes[load as usize].inputs[0], preheader,
+            "the hoisted load's control must be re-anchored to the pre-header"
         );
     }
 
