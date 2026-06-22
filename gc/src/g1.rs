@@ -1619,12 +1619,19 @@ impl G1Collector {
         roots: &mut [ObjectRef],
         monitors: &dyn MonitorCleanup,
     ) -> GcResult {
-        // Step 9: opt-in multi-threaded evacuator (`CRATONVM_G1_PARALLEL_EVAC`).
-        // Fall back to serial while any thread is in JIT — only the serial path
-        // pins conservative JIT-root regions (see `young_collection`).
-        if parallel_evac_enabled() && !crate::gc_quiescence::is_active() {
-            return self.mixed_collection_parallel(roots, monitors);
-        }
+        // Mixed GC always uses the SERIAL evacuator, even under
+        // `CRATONVM_G1_PARALLEL_EVAC`. Rationale: mixed GC was non-functional
+        // until the concurrent-marking + Old/humongous->old rset-completeness
+        // fixes landed, so `mixed_collection_parallel` was never exercised — and
+        // the parallel evacuator has a known data race that leaves a handful of
+        // dangling references on humongous-reference-array workloads (it
+        // reproduces in parallel *young* collections too, pre-existing on dev;
+        // tracked separately). The serial mixed path is differentially verified
+        // (byte-identical to HotSpot, V7b-clean) so it is the correct choice
+        // until the parallel evacuator race is fixed; mixed GCs are infrequent,
+        // so serializing them costs little. The parallel young path is unchanged
+        // (`young_collection` still dispatches to it). `mixed_collection_parallel`
+        // is retained (and unit-tested directly) for when the race is resolved.
         let start = std::time::Instant::now();
         let mut regions = self.regions.lock();
         // SECURITY FIX (V7a): mixed GC resets/retypes CSet regions
@@ -2631,21 +2638,29 @@ impl G1Collector {
         }
 
         // RSet rebuild (CORRECTNESS — remembered-set completeness for GC-internal
-        // pointer rewrites). A young->young reference carries NO remembered-set
-        // entry (young is always collected whole). When the holder later ages /
-        // is promoted to Old, that edge silently becomes Old->young, but no
-        // mutator write barrier ever fires for it (the rewrite below, and the
-        // promotion copy, are GC-internal). So the NEXT young GC does not scan
-        // this Old region as an rset source and DROPS the still-live young
-        // referent (proven: `MixedChurn` loses cross-referenced nodes; the V7b
-        // verifier reports the Old holder region with a dangling ref into a freed
-        // CSet region). This is the general (aging/promotion) case of the
-        // JIT-pinned-straddle fix landed earlier. Since this pass already walks
-        // every non-CSet (=> Old/Humongous) region each collection, we rebuild
-        // the Old->young rset here at no extra walk: every cross-region reference
-        // from this region into a young (Eden/Survivor) region is recorded so the
-        // next collection scans this region as a source. (Edges are collected and
-        // applied after the walk to keep borrows simple; `add_reference` dedups.)
+        // pointer rewrites). An edge whose holder and referent are collected
+        // together carries NO remembered-set entry while they share a generation:
+        // a young->young edge needs none (young is always collected whole), and an
+        // edge a mutator stored while BOTH ends were young recorded only the
+        // (now-recycled) young source region. When the holder/referent later age
+        // or are promoted to Old, that edge silently becomes Old->young OR
+        // Old->old (or humongous->old, the array-of-nodes case) — but no mutator
+        // write barrier ever fires for it (the rewrite below, and the promotion
+        // copy, are GC-internal). So the referent's region never learns of the
+        // source: the next YOUNG GC drops a still-live young referent, AND a MIXED
+        // GC that selects the referent's Old region never scans the source so it
+        // drops the still-live OLD referent (proven: `MixedChurn` loses
+        // cross-referenced young nodes; `PromoteMixed`'s mixed GC drops every node
+        // held only through a humongous `keep[]` array — the V7b verifier reports
+        // the holder region dangling into a freed CSet region). This is the
+        // general (aging/promotion) case of the JIT-pinned-straddle fix landed
+        // earlier. Since this pass already walks every non-CSet (=> Old/Humongous)
+        // region each collection, we rebuild the rset here at no extra walk: every
+        // cross-region reference from this region into a *collectable* region
+        // (Eden/Survivor/Old — the region types that can enter a young or mixed
+        // CSet) is recorded so the next collection scans this region as a source.
+        // (Edges are collected and applied after the walk to keep borrows simple;
+        // `add_reference` dedups.)
         let mut new_rset_edges: Vec<(usize, usize)> = Vec::new();
 
         for i in 0..regions.len() {
@@ -2672,22 +2687,37 @@ impl G1Collector {
                 }
 
                 update_object_refs(obj_ptr, header, pointer_map);
-                self.collect_outgoing_young_edges(regions, i, obj_ptr, header, &mut new_rset_edges);
+                self.collect_outgoing_cross_region_edges(
+                    regions,
+                    i,
+                    obj_ptr,
+                    header,
+                    &mut new_rset_edges,
+                );
                 offset += obj_size;
             }
         }
 
-        for (young_region, source_region) in new_rset_edges {
-            regions[young_region].rset.add_reference(source_region);
+        for (target_region, source_region) in new_rset_edges {
+            regions[target_region].rset.add_reference(source_region);
         }
     }
 
     /// Record (into `out`) every cross-region reference from `obj` (which lives
     /// in non-CSet `holder` region — always Old/Humongous, since all young
-    /// regions are in the CSet) into a YOUNG (Eden/Survivor) region, as a
-    /// `(young_region, holder)` rset edge. See `update_references_in_regions` for
-    /// why this is required for remembered-set completeness.
-    fn collect_outgoing_young_edges(
+    /// regions are in the CSet) into a *collectable* region as a
+    /// `(target_region, holder)` rset edge. See `update_references_in_regions`
+    /// for why this is required for remembered-set completeness.
+    ///
+    /// A "collectable" target is one whose region type can enter a collection
+    /// set: `Eden`/`Survivor` (young CSet) OR `Old` (mixed CSet). Recording the
+    /// Old targets is what lets a mixed GC find the live old graph reachable only
+    /// through a GC-internal Old->old or humongous->old edge (the `PromoteMixed`
+    /// drop). Humongous targets are never collected by young/mixed evacuation, so
+    /// edges into them carry no rset entry (consistent with the mutator barrier,
+    /// which records cross-region edges regardless of target type but whose
+    /// entries on humongous regions are simply never consulted).
+    fn collect_outgoing_cross_region_edges(
         &self,
         regions: &[G1Region],
         holder: usize,
@@ -2704,12 +2734,7 @@ impl G1Collector {
                         continue;
                     }
                     if let Some(j) = self.lookup_region_for_addr(raw as usize) {
-                        if j != holder
-                            && matches!(
-                                regions[j].region_type,
-                                RegionType::Eden | RegionType::Survivor
-                            )
-                        {
+                        if j != holder && is_collectable_region_type(regions[j].region_type) {
                             out.push((j, holder));
                         }
                     }
@@ -2720,12 +2745,7 @@ impl G1Collector {
                 let v = unsafe { std::ptr::read(data_start.add(s * SLOT_SIZE) as *const Value) };
                 if let Value::Object(Some(r)) = v {
                     if let Some(j) = self.lookup_region_for_addr(r.as_ptr() as usize) {
-                        if j != holder
-                            && matches!(
-                                regions[j].region_type,
-                                RegionType::Eden | RegionType::Survivor
-                            )
-                        {
+                        if j != holder && is_collectable_region_type(regions[j].region_type) {
                             out.push((j, holder));
                         }
                     }
@@ -4845,6 +4865,20 @@ fn object_total_size(header: &ObjectHeader) -> usize {
 #[inline]
 fn is_humongous_filler(header: &ObjectHeader) -> bool {
     matches!(header.kind, ObjectKind::HumongousFiller)
+}
+
+/// True iff a region of this type can be a member of a collection set —
+/// `Eden`/`Survivor` (every young or mixed CSet) or `Old` (a mixed CSet). The
+/// Phase-4 rset rebuild records cross-region edges into these region types so a
+/// later young/mixed GC scans the holder as a remembered-set source; edges into
+/// non-collectable regions (`Free`, `HumongousStart`/`HumongousContinuation`)
+/// are never consulted and so carry no rebuilt rset entry.
+#[inline]
+fn is_collectable_region_type(region_type: RegionType) -> bool {
+    matches!(
+        region_type,
+        RegionType::Eden | RegionType::Survivor | RegionType::Old
+    )
 }
 
 /// Update reference fields in an object using the forwarding map.
@@ -7377,6 +7411,74 @@ mod tests {
                 ),
                 other => panic!("round {round}: A.a dropped -> {other:?}"),
             }
+        }
+    }
+
+    /// Regression for bug C — the Old->old / humongous->old remembered-set
+    /// completeness hole that left G1 *mixed* GC non-functional. This is the
+    /// `PromoteMixed` repro at unit scale: a referent `B` is reachable ONLY
+    /// through a humongous holder array (`keep[0] = B`, the array > region_size/2
+    /// so it lives in HumongousStart/Continuation regions and is NEVER a CSet
+    /// member). The `keep[0] -> B` edge is created while `B` is young (so the
+    /// mutator barrier recorded it against `B`'s then-young region, since
+    /// recycled) and is thereafter maintained only by GC-internal pointer
+    /// rewrites as `B` promotes to Old — no barrier ever fires for the
+    /// humongous->old edge. A mixed GC that selects `B`'s Old region therefore
+    /// finds `B` only if `B`'s region records the humongous holder as an rset
+    /// source. Before the fix `collect_outgoing_*_edges` recorded edges into
+    /// young targets only, so the holder was never registered, the mixed GC
+    /// never scanned `keep[]`, and `B` was dropped (the V7b verifier reported
+    /// the humongous holder dangling into a freed CSet region). The Phase-4
+    /// rebuild now records edges into every *collectable* (Eden/Survivor/Old)
+    /// target, so `B` survives the mixed GC.
+    #[test]
+    fn humongous_to_old_ref_via_gc_rewrite_survives_mixed_gc() {
+        let cfg = G1CollectorConfig {
+            heap_size: 16 * 1024 * 1024,
+            region_size: 1024 * 1024,
+            promotion_age: 1, // age >= 1 promotes (2 young GCs)
+            old_cset_region_threshold_percent: 100, // B's single Old region is eligible
+            ..small_config()
+        };
+        let gc = G1Collector::new(cfg);
+
+        // A humongous reference array (> 512 KiB of refs) — the `keep[]` holder.
+        let len = (640 * 1024) / 8; // 640 KiB of 8-byte refs -> humongous
+        let keep = gc.alloc_array(ClassId::new(1), ArrayElementType::Reference, len);
+        assert!(
+            gc.count_regions(RegionType::HumongousStart) >= 1,
+            "keep[] must be humongous for this regression"
+        );
+
+        // B is reachable ONLY via keep[0]. Wire it while B is young.
+        let b = gc.alloc_object(ClassId::new(2), 1);
+        gc.set_field(b, 0, Value::Int(424242));
+        gc.set_array_element(keep, 0, Value::Object(Some(b))).unwrap();
+        let mut roots = vec![keep]; // root reaches B only through the humongous keep
+
+        // Tenure B to Old (promotion_age = 1). The humongous keep stays in place
+        // (humongous objects are never evacuated by young/mixed GC).
+        gc.young_collection(&mut roots, &NoopMonitors);
+        gc.young_collection(&mut roots, &NoopMonitors);
+        assert!(
+            gc.old_gen_bytes() > 0,
+            "B should have promoted to Old before the mixed GC"
+        );
+
+        // Force a mixed GC that can select B's Old region.
+        gc.marking_complete.store(true, Ordering::Relaxed);
+        gc.mixed_gc_remaining.store(1, Ordering::Relaxed);
+        gc.mixed_collection(&mut roots, &NoopMonitors);
+
+        // B must survive: reachable only through the humongous->old edge, which
+        // is recorded only by the Phase-4 rset rebuild.
+        match gc.get_array_element(roots[0], 0).unwrap() {
+            Value::Object(Some(b2)) => assert_eq!(
+                gc.get_field(b2, 0).as_int(),
+                Some(424242),
+                "B dropped / corrupted: humongous->old rset miss in mixed GC"
+            ),
+            other => panic!("keep[0] dropped in mixed GC -> {other:?}"),
         }
     }
 }
