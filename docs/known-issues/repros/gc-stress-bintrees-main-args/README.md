@@ -1,16 +1,16 @@
 # Repro set — object-binarytrees GC-frame stale-root under extreme `GC_STRESS`
 
-See [`../../gc-stress-bintrees-object-main-args-jit-frame-stale-root.md`](../../gc-stress-bintrees-object-main-args-jit-frame-stale-root.md).
+Writeup (FIXED): [`docs/internal/app-jvm-bugs/gc-stress-bintrees-main-args-unregistered-jit-frame-FIXED.md`](../../../internal/app-jvm-bugs/gc-stress-bintrees-main-args-unregistered-jit-frame-FIXED.md).
 
-> **UPDATE (2026-06-22):** on current dev (`457c95a8`) all five repros now print
-> the **correct** checksum `3222190` at `GC_STRESS=4096` (VAAload verified 8/8),
-> but the GC-array-guard still fires once per run — the stale-root corruption is
-> **masked, not closed** (the bad write is caught + dropped, benign at this
-> depth/stress). The CRASH/WRONG results in the table below are from an *older*
-> dev. The `test-infra/regression-pool/gc-root-lane.sh` GC-root acceptance lane
-> records this state (status PASS, `warned>0`); see
-> [`../../../feature-designs/precise-jit-maps-default.md`](../../../feature-designs/precise-jit-maps-default.md)
-> "Step 4 baseline".
+> **✅ FIXED (2026-06-22, dev `77c98761`).** Root cause: the compiled entry-point
+> `main`'s JIT frame is invisible to `gc_quiescence` (invoked via `Vm::invoke`
+> without a `JitEntryGuard`), so the **moving** young collector relocated its
+> roots and couldn't rewrite the raw stack slots → stale all-zero receiver. Fix:
+> detect an unregistered JIT frame on the native stack → non-moving sweep +
+> full-stack mark. **`VAAload 14 @GC_STRESS=4096` now prints `3222190` cleanly
+> (5/5), no guard warnings.** The CRASH/WRONG/“masked” notes in the table below
+> are from *older* dev and are superseded. These repros remain the regression
+> fixtures for `test-infra/regression-pool/gc-root-lane.sh`.
 
 All build with JDK 25 `javac`. Run under the release `cratonvm.exe`.
 

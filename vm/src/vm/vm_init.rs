@@ -526,7 +526,15 @@ pub struct SharedVm {
     /// the safe whole-method re-run. Empty + unread unless `deopt_real_enabled()`
     /// (the resume sink that consumes it is itself gated), so production VMs are
     /// unaffected.
-    pub method_epochs: parking_lot::RwLock<FxHashMap<String, u64>>,
+    ///
+    /// Step 9 follow-up (a): the value is a **boxed** `AtomicU64` rather than a
+    /// bare `u64` so each method's epoch lives at a STABLE heap address (a
+    /// `Box`'s payload does not move when the map rehashes, and entries are never
+    /// removed). [`Self::live_epoch_cell_ptr`] hands that address to the
+    /// `DeoptEpochGuard` baked into the method's frame-deopt stubs, so
+    /// `x64_deopt_entry` can read the live epoch lock-free, BEFORE dereferencing
+    /// the deopt box, to detect a superseded compilation.
+    pub method_epochs: parking_lot::RwLock<FxHashMap<String, Box<std::sync::atomic::AtomicU64>>>,
 
     /// Invalidation manager — tracks class-hierarchy assumptions and invalidates
     /// dependent compiled methods when class loading breaks those assumptions.
@@ -1030,6 +1038,9 @@ impl SharedVm {
 
         // Reset singleton classloader instances from any previous VM
         cratonvm_native_builtins::classloader::reset_loader_singletons();
+        // Reset cached System.getenv()/getProperties() singletons too, so a new
+        // VM never returns a stale ObjectRef from a previous instance.
+        cratonvm_native_builtins::lang_system::reset_system_singletons();
 
         let mut native_methods = NativeMethodRegistry::new();
         #[cfg(feature = "synthetic-jdk")]
@@ -3525,7 +3536,7 @@ impl SharedVm {
         self.method_epochs
             .read()
             .get(method_key)
-            .copied()
+            .map(|c| c.load(std::sync::atomic::Ordering::Relaxed))
             .unwrap_or(0)
     }
 
@@ -3535,9 +3546,26 @@ impl SharedVm {
     /// `DeoptimizationController::deoptimize`). See [`Self::method_epochs`].
     pub fn bump_compilation_epoch(&self, method_key: &str) -> u64 {
         let mut map = self.method_epochs.write();
-        let e = map.entry(method_key.to_string()).or_insert(0);
-        *e += 1;
-        *e
+        let cell = map
+            .entry(method_key.to_string())
+            .or_insert_with(|| Box::new(std::sync::atomic::AtomicU64::new(0)));
+        // fetch_add returns the PREVIOUS value; the new live epoch is +1.
+        cell.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
+    }
+
+    /// deopt-osr Step 9 follow-up (a) — a STABLE process-lifetime pointer to
+    /// `method_key`'s live compilation-epoch cell, creating the entry at epoch 0
+    /// if absent. The cell is a boxed `AtomicU64`, so its address survives map
+    /// rehashes and entries are never removed — the pointer is valid forever.
+    /// Baked into the method's `DeoptEpochGuard` so `x64_deopt_entry` can read
+    /// the live epoch lock-free before touching the deopt box. Only called under
+    /// `deopt_real_enabled()` (at install, by `stamp_compilation_epoch`).
+    pub fn live_epoch_cell_ptr(&self, method_key: &str) -> *const std::sync::atomic::AtomicU64 {
+        let mut map = self.method_epochs.write();
+        let cell = map
+            .entry(method_key.to_string())
+            .or_insert_with(|| Box::new(std::sync::atomic::AtomicU64::new(0)));
+        cell.as_ref() as *const std::sync::atomic::AtomicU64
     }
 
     /// T5.4.4 — Class-hierarchy change listener.

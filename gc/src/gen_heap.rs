@@ -2448,11 +2448,22 @@ impl GenerationalHeap {
                 && (self.old_gen_used() as u128) * 10 >= (old_cap as u128) * 9
                 && (self.young_from_used() as u128) * 10 >= (young_cap as u128) * 9
         };
-        if (crate::gc_quiescence::is_active() || promotion_oom_risk) && !force_moving {
+        // A5 fix: `unregistered_jit_frame_on_stack()` — the VM root scan found a
+        // guard-less JIT frame on the mutator's native stack (e.g. the compiled
+        // entry-point `main` while a clinit/interpreted callee runs). Its live
+        // objects were conservatively MARKED by the full-stack scan but cannot be
+        // relocated (raw register/spill slots can't be rewritten), so run the
+        // NON-MOVING sweep exactly as for a registered JIT frame (`is_active()`).
+        if (crate::gc_quiescence::is_active()
+            || crate::gc_quiescence::unregistered_jit_frame_on_stack()
+            || promotion_oom_risk)
+            && !force_moving
+        {
             tracing::debug!(
                 "running non-moving young-gen mark-sweep (jit_active={}, \
-                 promotion_oom_risk={}) — compaction deferred.",
+                 unregistered_jit_frame={}, promotion_oom_risk={}) — compaction deferred.",
                 crate::gc_quiescence::is_active(),
+                crate::gc_quiescence::unregistered_jit_frame_on_stack(),
                 promotion_oom_risk,
             );
             let result = self.sweep_young_non_moving(roots, finalizer_addrs);
@@ -6783,6 +6794,54 @@ mod tests {
                 assert_eq!(heap.get_field(b, 0).as_int(), Some(4242));
             }
             other => panic!("live chain corrupted after hole reuse: {other:?}"),
+        }
+    }
+
+    /// A5 fix regression: the `unregistered_jit_frame_on_stack` flag must force
+    /// the same NON-MOVING sweep as `is_active()`. The VM root scan sets it when
+    /// it finds a guard-less JIT frame on the native stack (the compiled
+    /// entry-point `main`); without the non-moving path the moving collector
+    /// would relocate that frame's conservatively-marked roots and leave its raw
+    /// stack slots stale (the bintrees `main`-compiled corruption). Here the flag
+    /// is set directly (no JIT-quiescence `enter()`), and the collector must keep
+    /// survivors in place exactly as in `non_moving_sweep_when_jit_active`.
+    #[test]
+    fn non_moving_sweep_when_unregistered_jit_frame_on_stack() {
+        let heap = small_gen_heap();
+        let monitors = NoOpMonitors;
+
+        let obj_a = heap.alloc_object(ClassId::new(1), 1);
+        let obj_b = heap.alloc_object(ClassId::new(2), 1);
+        heap.set_field(obj_a, 0, Value::Object(Some(obj_b)));
+        heap.set_field(obj_b, 0, Value::Int(4242));
+        let a_ptr = obj_a.as_ptr();
+        let b_ptr = obj_b.as_ptr();
+
+        // No JIT quiescence — only the unregistered-frame flag is set, exactly
+        // as `conservative_roots::scan_active_jit_frames` does on detection.
+        assert!(!crate::gc_quiescence::is_active());
+        crate::gc_quiescence::set_unregistered_jit_frame_on_stack();
+        assert!(crate::gc_quiescence::unregistered_jit_frame_on_stack());
+
+        let mut roots = vec![obj_a];
+        let result = heap.collect_garbage(&stw(), &mut roots, &monitors);
+
+        crate::gc_quiescence::clear_unregistered_jit_frame_on_stack();
+
+        // Non-moving: nothing copied, empty pointer map, addresses UNCHANGED.
+        assert_eq!(
+            result.stats.objects_copied, 0,
+            "unregistered-JIT-frame flag must select the non-moving sweep"
+        );
+        assert!(result.pointer_map.is_empty());
+        assert_eq!(roots[0].as_ptr(), a_ptr, "survivor must not move");
+        assert_eq!(obj_a.as_ptr(), a_ptr);
+        match heap.get_field(obj_a, 0) {
+            Value::Object(Some(b)) => {
+                assert_eq!(b.as_ptr(), b_ptr, "B must not move");
+                assert_eq!(heap.get_field(b, 0).as_int(), Some(4242));
+            }
+            other => panic!("A's field should still reference B, got {other:?}"),
         }
     }
 

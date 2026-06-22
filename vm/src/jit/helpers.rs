@@ -4558,6 +4558,41 @@ impl DeoptimizationController {
             skip.insert((class_name.into(), method_name.into(), descriptor.into()));
         }
 
+        // deopt-osr Step 9 follow-up (b): eager recompile re-queue. On a
+        // RecompileAndReinterpret action the artifact was just evicted
+        // (make-not-entrant); historically the method then had to re-cross the
+        // interpreter hotness threshold (up to JIT_RETRY_STRIDE calls) before the
+        // optimized body was rebuilt. When a background compiler is active,
+        // eagerly enqueue the recompile so it happens off-thread without that
+        // delay (`on_deoptimization` above already reset `queued_for_compilation`
+        // / `current_tier`, so this enqueue is accepted). Gated on the deopt-
+        // resume feature so the production uncommon-trap path is byte-identical;
+        // a no-op when no background worker drains the queue — the existing
+        // hotness-retry path still recompiles, so behaviour never regresses.
+        if cratonvm_jit::deopt_real_enabled()
+            && action == cratonvm_jit::deopt::DeoptAction::RecompileAndReinterpret
+            && vm.tiered_manager.compiler_active()
+        {
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            vm.tiered_manager
+                .enqueue_compilation(cratonvm_jit::tiered::CompilationTask {
+                    method_key: tiered_key.clone(),
+                    target_tier: cratonvm_jit::tiered::CompilationTier::C1,
+                    priority: cratonvm_jit::tiered::CompilationPriority::High,
+                    enqueue_time_ms: now_ms,
+                    osr_bci: None,
+                });
+            if std::env::var_os("CRATONVM_DBG_DEOPT").is_some() {
+                eprintln!(
+                    "[cratonvm-deopt] eager re-queue (RecompileAndReinterpret) {}",
+                    method_key
+                );
+            }
+        }
+
         tracing::debug!(
             "deopt: {} reason={:?} bci={} action={:?}",
             method_key,

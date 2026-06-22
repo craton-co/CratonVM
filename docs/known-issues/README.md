@@ -11,13 +11,16 @@ the ~30 docs map to **one root-cause family + ~15 distinct standalone bugs**, of
 **8 are already FIXED on `dev`** (the 6 prior + `kafka-bug-C` and the dispatch half of
 `kafka-bug-B`). Headline:
 
-**~11 distinct OPEN defects + 1 latent**, grouped as:
+**~10 distinct OPEN defects + 1 latent**, grouped as:
 
 1. **Family A — GC root coverage under JIT** (one root cause, several manifestations). Open members:
-   **A2** (register-only/native-return reclaim + non-moving-sweep walk), **A4** (Fork6 FJP
-   multi-thread, gated), and **A5** (object-binarytrees JIT-frame **stale** root under extreme
-   `GC_STRESS` ≤ 64 KB — *below* the band the A3 precise-maps fix was verified at; precise maps don't
-   help). **A1/A3 are FIXED.** `spring-bug-10` is a Family-A manifestation seen from
+   **A2** (register-only/native-return reclaim + non-moving-sweep walk) and **A4** (Fork6 FJP
+   multi-thread, gated). **A1/A3/A5 are FIXED** — A5 was root-caused to the **compiled entry-point
+   `main`'s JIT frame being unregistered** (invoked via `Vm::invoke` without a `JitEntryGuard`, so
+   the moving young collector relocated its roots); fixed by detecting an unregistered JIT frame on
+   the native stack → non-moving sweep + full-stack mark (dev `77c98761`; writeup moved to
+   [`docs/internal/app-jvm-bugs/gc-stress-bintrees-main-args-unregistered-jit-frame-FIXED.md`](../internal/app-jvm-bugs/gc-stress-bintrees-main-args-unregistered-jit-frame-FIXED.md)).
+   `spring-bug-10` is a Family-A manifestation seen from
    the Spring suite (same root cause, different entry point); `springsuite-bug-04` was the same race
    but **no longer reproduces** (doc removed). The suite-scale field evidence in
    `jit-junit-discovery-reflection-corruption.md` is the same race.
@@ -89,6 +92,15 @@ the ~30 docs map to **one root-cause family + ~15 distinct standalone bugs**, of
     GC-STW-vs-reactor-shutdown race exposed by snapshot timing), **NOT** a socket/OP_WRITE bug and **NOT** an
     rs_cache correctness bug. Reliably avoided by `CRATONVM_ROOTSNAP_CACHE=0` (suite-level — do NOT flip the
     global default). Supersedes the former `reactor-worker-thread-leak-at-shutdown.md` (removed — see git history).
+17. **[GC: gen-GC loses a CompletableFuture completion under promotion + churn](gc-gen-promotion-completablefuture-completion-loss.md)** —
+    🔴 **OPEN** (workarounds: `-XX:+UseG1GC` / `CRATONVM_NO_GC_PROMOTION=1`). Blocks the Keycloak/Quarkus boot
+    at the Hibernate SessionFactory build: a thread parked in `CompletableFuture.get()` (`JPAConfig.startAll`
+    → `Signaller.block` → `LockSupport.park`) is never unparked because the **gen (copying) GC loses the young
+    `Signaller`** when the future is **promoted to old gen** while the Signaller stays young. `NO_GC_PROMOTION`
+    reliably fixes; G1 immune; 3 s repro `CFProbe2` (embedded in the doc). The loss is **same-GC** (mark/evacuate
+    race vs the completing worker), NOT a missed next-GC card (conservative card-marking was insufficient).
+    **Heisenbug**: `SP_VERIFY`/`DBG_SWEEP_EDGES` mask it; needs non-perturbing observation. Path =
+    `gen_heap.rs::sweep_young_non_moving`. Same moving-GC family as #15.
 
 FIXED bugs whose standalone docs were **removed** from this folder (resolved; full writeups in
 `git` history or [`docs/internal/fixed-suite-bugs/`](../internal/fixed-suite-bugs/)): A1 (reflection
@@ -129,6 +141,24 @@ stale reference later reads an all-zero / garbage header → `inconsistent heade
 (interpreter frames are precisely scanned and the moving collector remaps every
 root); `-Xmx8g` passes (no young GC).
 
+> **Current-dev refresh (2026-06-22, dev `14afc6a6`+, precise-jit-maps-default
+> Steps 1–8).** **A3 is CLOSED** by precise JIT oop maps (default-on) — validated
+> green across the GC-root repro+bench lane, OSR frames, and the BouncyCastle app
+> suites (`test-infra/regression-pool/gc-root-lane.sh` + `gc-root-apps-lane.sh`).
+> **A2 remains OPEN, unchanged:** `ReflRepro 8000 @ GC_STRESS=65536` still
+> `rc=139` (register-/native-return-resident missed root → UAF; no stack scan can
+> see a live register — dedicated GC/JIT core work). **A4 is OPEN but non-fatal
+> on the repro here:** gated `CRATONVM_REAL_FORKJOINPOOL=1` Fork6 is 6/6 ALL-OK on
+> current dev (the older ~15% reclamation does not reproduce), though the
+> cross-thread STW JIT-root gap is still *exercised* (`scan_active_jit_frames`
+> WARN) — that scan is the tracked follow-up. The *family is not formally
+> retired* (A2/A4 open); **nothing was removed** — all repros, GC guards,
+> `CRATONVM_DBG_*` knobs, and the shadow stack are retained as experimental/debug
+> tools.
+>
+> See `docs/feature-designs/precise-jit-maps-default.md` "Step 8 — GC-root family
+> retirement status".
+
 The eventual correct fix for the whole family is **precise JIT stack roots**
 (know exactly which registers/slots hold oops at each safepoint), tracked under
 `project_precise_jit_stack_maps`. The `CRATONVM_SHADOW_STACK` mechanism is the
@@ -140,7 +170,7 @@ current (incomplete/buggy) implementation of that.
 | **A2** | **`implausible object size` young-sweep-walker crash** (reflection/String-array allocation churn) — a *distinct* bug, NOT the register root | `wildfly-suite/repro/ReflRepro` | 🔴 **OPEN** — precise maps do **not** fix it (still crashes; verified 2026-06-17) | [reflrepro-register-resident-jit-root-handoff.md](reflrepro-register-resident-jit-root-handoff.md) |
 | **A3** | **Register-invisibility** — a live oop sits only in a CPU register at a young-GC safepoint, invisible to the stack-only scan (single thread) | `apps/spring-boot/buildSrc/runner/MinRegexProbe` | ✅ **FIXED on dev** (`32649b56`, precise maps default-on) | _(doc removed; resolved)_ |
 | **A4** | Multi-thread: live `ForkJoinTask`s reclaimed under **FJP worker threads** + a **lost-tag** interpreter local | `scratch/xworker/Fork6` (needs `CRATONVM_REAL_FORKJOINPOOL=1`) | 🟡 **OPEN / inconclusive** — a separate real-FJP CAS failure now masks the reclaim test (same with/without precise) | [fork6-fjp-multithread-jit-root-reclamation.md](fork6-fjp-multithread-jit-root-reclamation.md) |
-| **A5** | **Object-binarytrees JIT-frame STALE root** — `main`'s compiled frame holds a raw young pointer that goes stale across an evacuating young GC; triggered by `main` loading `args` (oop in a callee-saved register shared with int locals). Heap stays consistent; receiver is **not** sweep-zeroed (≠ A3). Only at `GC_STRESS` ≤ 64 KB, *below* the A3-verified band | [`repros/gc-stress-bintrees-main-args/`](repros/gc-stress-bintrees-main-args/) (`VAAload`) | 🔴 **OPEN** — precise maps (on/off), full-stack scan, reg-spill-all, shadow-stack, C2-first-call all fail to fix it (2026-06-21) | [gc-stress-bintrees-object-main-args-jit-frame-stale-root.md](gc-stress-bintrees-object-main-args-jit-frame-stale-root.md) |
+| **A5** | **Object-binarytrees moving-GC corruption** — the compiled entry-point `main`'s JIT frame is invisible to `gc_quiescence` (invoked via `Vm::invoke` without a `JitEntryGuard`), so the **moving** young collector relocates its roots and can't rewrite the raw stack slots → stale all-zero receiver. (The earlier "register-only stale root in `bottomUpTree`" framing was wrong — `bottomUpTree` isn't even compiled at the crash.) | [`repros/gc-stress-bintrees-main-args/`](repros/gc-stress-bintrees-main-args/) (`VAAload`) | ✅ **FIXED** (dev `77c98761`) — detect an unregistered JIT frame on the native stack → non-moving sweep + full-stack mark. Residual: Windows-only (portable stack-bound is a follow-up) | [docs/internal/.../gc-stress-bintrees-main-args-unregistered-jit-frame-FIXED.md](../internal/app-jvm-bugs/gc-stress-bintrees-main-args-unregistered-jit-frame-FIXED.md) |
 
 > ## ✅ FIX (2026-06-17, dev `32649b56`): **precise JIT oop maps, default-on** — closes the register-invisibility root-scan gap (A3)
 > `CRATONVM_PRECISE_JIT_MAPS` is now **default-on** (opt out: `CRATONVM_NO_PRECISE_JIT_MAPS`).
@@ -344,11 +374,53 @@ supplier/accumulator/finisher/combiner). The **open** ones documented here:
 - [SC-annotation-introspection-family.md](SC-annotation-introspection-family.md) — Bug A (Class-attr TypeNotPresent, blocked on classloader), Bug C (enclosing-class scan traversal), Bug D (relies on HotSpot `getDeclaredMethods` ordering — not cleanly fixable). Bug B FIXED on dev.
 - [SC-env-classreading.md](SC-env-classreading.md) — getenv/getProperties identity; `Object.equals` shadows overrides (`precedenceOf`=-1); `int.class` via classreading; custom-CL `getResourceAsStream`.
 - [SC-resource-io-family.md](SC-resource-io-family.md) — NIO write-channel stub, `Path.toUri()` authority; several FileNotFoundExceptions are harness-CWD artifacts.
-- [SC-aot-runtimehints-resource-count.md](SC-aot-runtimehints-resource-count.md) — RuntimeHints resource glob count (8 vs 5).
 - [SC-stax-xml-family.md](SC-stax-xml-family.md) — namespace SAX-event-sequence mismatch (cursor natives + element prefix already fixed on dev).
-- [SC-map-multivaluemap-family.md](SC-map-multivaluemap-family.md) — residual ByteBuddy `ClassInjector` handoffs (keySet/putIfAbsent fixed on dev).
 - [SC-task-retry-util-misc.md](SC-task-retry-util-misc.md) — Properties.store #date line, Throwable deser, retry timing, ByteBuddy ClassInjector, AQS throttle.
 - [SC-misc-core-spring.md](SC-misc-core-spring.md) — SortedProperties OutputStream store (CHM.remove(null) fixed on dev).
 - [SC-hangs-mergedannotations-charsequence.md](SC-hangs-mergedannotations-charsequence.md) — two hangs: `MergedAnnotations.stream().toArray()` re-entry; Reactor `StepVerifier` producer never scheduled.
 
 Cross-cutting: ByteBuddy `ClassInjector$UsingReflection` failure breaks AssertJ `assertSoftly` + Mockito; JUnit "TimeoutExtension multiple times" masks underlying VM errors.
+
+## Open bug docs relocated from `docs/internal/` (2026-06-22)
+
+Still-**OPEN** bug docs are consolidated here so every unfixed bug lives under
+`docs/known-issues/`. (A2/A4 are the `reflrepro-…` / `fork6-…` docs above;
+FIXED/resolved bugs stay in `docs/internal/` — they are moved out only when fixed.)
+
+**app-jvm-bugs/**
+- [bug-bc-crypto-prng-abnormal-exit-127.md](app-jvm-bugs/bug-bc-crypto-prng-abnormal-exit-127.md)
+- [bug-commons-math-full-reactor.md](app-jvm-bugs/bug-commons-math-full-reactor.md)
+- [bug-commons-math-junit-probe-jit-execute.md](app-jvm-bugs/bug-commons-math-junit-probe-jit-execute.md)
+- [bug-elasticsearch-log4j2-serviceloader.md](app-jvm-bugs/bug-elasticsearch-log4j2-serviceloader.md)
+- [bug-gpu-build-native-builtins-crash.md](app-jvm-bugs/bug-gpu-build-native-builtins-crash.md)
+- [bug-hibernate-duplicate-persistence-unit-scan.md](app-jvm-bugs/bug-hibernate-duplicate-persistence-unit-scan.md)
+- [bug-hibernate-jpa-persistence-xml-properties.md](app-jvm-bugs/bug-hibernate-jpa-persistence-xml-properties.md)
+- [bug-hibernate-log-format-placeholder.md](app-jvm-bugs/bug-hibernate-log-format-placeholder.md)
+- [bug-wildfly-jaxp-premature-end-of-file.md](app-jvm-bugs/bug-wildfly-jaxp-premature-end-of-file.md)
+- [bug-wildfly-msc-service-start-callback.md](app-jvm-bugs/bug-wildfly-msc-service-start-callback.md)
+- [bug-wildfly-throwable-stack-trace-capture.md](app-jvm-bugs/bug-wildfly-throwable-stack-trace-capture.md)
+
+**gaps/**
+- [gap-bc-math-ec-crypto-regression-timeout.md](gaps/gap-bc-math-ec-crypto-regression-timeout.md)
+- [gap-jit-fastmath-transform-miscompile.md](gaps/gap-jit-fastmath-transform-miscompile.md)
+
+**h2-suite-bugs/**
+- [bug-h2-charset-cp500-unsupported.md](h2-suite-bugs/bug-h2-charset-cp500-unsupported.md)
+- [bug-h2-inprocess-javac-resource-bundle.md](h2-suite-bugs/bug-h2-inprocess-javac-resource-bundle.md)
+- [bug-h2-mvstore-insert-loop-perf-hang.md](h2-suite-bugs/bug-h2-mvstore-insert-loop-perf-hang.md)
+- [bug-h2-netutils-missing-pbe-algparams.md](h2-suite-bugs/bug-h2-netutils-missing-pbe-algparams.md)
+- [bug-h2-timezone-dst-offset.md](h2-suite-bugs/bug-h2-timezone-dst-offset.md)
+
+**keycloak-crash-reports/**
+- [06-keypair-verifier-decode.md](keycloak-crash-reports/06-keypair-verifier-decode.md)
+- [08-stripsecrets-json-comparison.md](keycloak-crash-reports/08-stripsecrets-json-comparison.md)
+- [09-streamsutil-onclose-propagation.md](keycloak-crash-reports/09-streamsutil-onclose-propagation.md)
+- [10-jwksutils-one-failure.md](keycloak-crash-reports/10-jwksutils-one-failure.md)
+
+**tomcat-suite-bugs/**
+- [04-embedded-server-throughput-wall-OPEN.md](tomcat-suite-bugs/04-embedded-server-throughput-wall-OPEN.md)
+- [05-suite-rerun-fail-triage.md](tomcat-suite-bugs/05-suite-rerun-fail-triage.md)
+
+**wildfly-suite-bugs/**
+- [bug-06b-jit-scan-cache-unsound.md](wildfly-suite-bugs/bug-06b-jit-scan-cache-unsound.md)
+

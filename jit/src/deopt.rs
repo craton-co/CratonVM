@@ -16,7 +16,7 @@
 
 use std::mem;
 
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 // ---------------------------------------------------------------------------
 // Enums
@@ -209,6 +209,147 @@ pub struct FrameState {
 }
 
 // ---------------------------------------------------------------------------
+// Per-bci de-speculation registry (deopt-osr Step 9 follow-up c)
+// ---------------------------------------------------------------------------
+
+/// Process-global set of `(method_key, bci)` speculation sites that have
+/// deopted past the per-bci give-up threshold and must NOT be re-speculated on
+/// the next compilation — "only de-spec the speculation that failed instead of
+/// whole-method eviction." The VM's real-frame-deopt de-spec path
+/// (`vm/.../interpreter.rs`) inserts into it (only under `deopt_real_enabled()`);
+/// the optimizing compiler reads it when deciding whether to emit a speculative
+/// guard at a loop header (see `compile_with_param_slots`).
+///
+/// Empty on every production VM (nothing inserts unless the deopt-resume feature
+/// is on), so `despec_contains` always returns `false` there and codegen is
+/// byte-identical. Keyed by the same `"<class>.<method>:<descriptor>"` string
+/// the deopt log / `method_epochs` use.
+static DESPEC_SET: std::sync::OnceLock<std::sync::RwLock<FxHashSet<(String, u32)>>> =
+    std::sync::OnceLock::new();
+
+fn despec_set() -> &'static std::sync::RwLock<FxHashSet<(String, u32)>> {
+    DESPEC_SET.get_or_init(|| std::sync::RwLock::new(FxHashSet::default()))
+}
+
+/// Record `(method_key, bci)` as a failed speculation site that must not be
+/// re-speculated. Idempotent. See [`DESPEC_SET`].
+pub fn despec_insert(method_key: &str, bci: u32) {
+    if let Ok(mut s) = despec_set().write() {
+        s.insert((method_key.to_string(), bci));
+    }
+}
+
+/// `true` if `(method_key, bci)` was recorded as a failed speculation site.
+/// Consulted by the optimizing compiler at speculative-guard emission. An empty
+/// `method_key` never matches (the `compile()` legacy/test wrapper passes `""`).
+///
+/// Production fast path: when the registry is empty (nothing ever de-spec'd —
+/// the case unless the deopt-resume feature is on) this returns `false` after a
+/// cheap `is_empty` check, WITHOUT the `method_key.to_string()` lookup
+/// allocation, so consulting it per speculative guard during normal compilation
+/// is allocation-free.
+pub fn despec_contains(method_key: &str, bci: u32) -> bool {
+    if method_key.is_empty() {
+        return false;
+    }
+    let set = match despec_set().read() {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    if set.is_empty() {
+        return false;
+    }
+    set.contains(&(method_key.to_string(), bci))
+}
+
+/// Number of recorded de-spec sites for `method_key` (diagnostics / tests).
+pub fn despec_count_for(method_key: &str) -> usize {
+    despec_set()
+        .read()
+        .map(|s| s.iter().filter(|(m, _)| m == method_key).count())
+        .unwrap_or(0)
+}
+
+/// Clear the entire de-spec registry. Test-only (process-global state leaks
+/// across in-process tests otherwise).
+pub fn despec_clear_for_test() {
+    if let Ok(mut s) = despec_set().write() {
+        s.clear();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Epoch staleness guard (deopt-osr Step 9 follow-up a)
+// ---------------------------------------------------------------------------
+
+/// A small, **process-lifetime-retained** cell baked (by raw pointer) into the
+/// x64 frame-deopt stub *alongside* the `DeoptimizationPoint` box, so the deopt
+/// trampoline can decide — **before dereferencing the box** — whether the
+/// speculation it bakes has been superseded by a later invalidation.
+///
+/// Why a separate cell rather than a field on the box: the box describes the
+/// speculation and must be dereferenced to reconstruct the interpreter frame.
+/// Under the `CRATONVM_JIT_FREE_CODE=1` A/B mode an evicted artifact's
+/// `DeoptimizationPoint` boxes can be freed; reading the epoch *from* the box
+/// would itself be the use-after-free we are trying to avoid. This guard is
+/// retained independently of the artifact (see [`crate::CompiledMethod`]'s
+/// `Drop`), so `x64_deopt_entry` reads the live epoch and the artifact's
+/// creation epoch from here without touching the box at all when the artifact is
+/// stale. ("bake a stable live-epoch cell pointer alongside the box.")
+///
+/// Stamped once by the VM at install time (`SharedVm`/`stamp_compilation_epoch`)
+/// under `deopt_real_enabled()`; on every production artifact it stays
+/// `{ live_epoch_cell: null, creation_epoch: 0 }` and the in-entry check is a
+/// no-op (gate-off byte-identical). Both fields are atomic so the VM's
+/// single install-time write is visible to the lock-free in-stub read.
+#[derive(Debug)]
+pub struct DeoptEpochGuard {
+    /// The artifact's compilation epoch, stamped at install. Compared against
+    /// `*live_epoch_cell`: when the live epoch has advanced past it, every
+    /// speculation this artifact baked is superseded.
+    pub creation_epoch: std::sync::atomic::AtomicU64,
+    /// Stable pointer to the owning method's live compilation-epoch cell
+    /// (`SharedVm::method_epochs`, itself an `AtomicU64` kept boxed so its
+    /// address is stable for the process lifetime). Null until the VM stamps it,
+    /// and on every production artifact.
+    pub live_epoch_cell: std::sync::atomic::AtomicPtr<std::sync::atomic::AtomicU64>,
+}
+
+impl DeoptEpochGuard {
+    /// A fresh, unstamped guard (null cell, epoch 0) — the in-entry check is a
+    /// no-op until the VM stamps it.
+    pub fn new() -> Self {
+        Self {
+            creation_epoch: std::sync::atomic::AtomicU64::new(0),
+            live_epoch_cell: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
+        }
+    }
+
+    /// `true` when the artifact has been superseded: a non-null live cell whose
+    /// epoch has advanced past this artifact's creation epoch. Lock-free; safe
+    /// on a guard whose `live_epoch_cell` is null (returns `false`).
+    #[inline]
+    pub fn is_superseded(&self) -> bool {
+        use std::sync::atomic::Ordering;
+        let cell = self.live_epoch_cell.load(Ordering::Acquire);
+        if cell.is_null() {
+            return false;
+        }
+        // SAFETY: a non-null `live_epoch_cell` is a stable, retained
+        // `AtomicU64` address handed out by `SharedVm::method_epochs` (never
+        // freed for the process lifetime).
+        let live = unsafe { (*cell).load(Ordering::Relaxed) };
+        live > self.creation_epoch.load(Ordering::Relaxed)
+    }
+}
+
+impl Default for DeoptEpochGuard {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Deopt point (embedded in compiled code metadata)
 // ---------------------------------------------------------------------------
 
@@ -293,6 +434,17 @@ impl DeoptimizationLog {
     /// Number of deopts recorded for `method`.
     pub fn deopt_count(&self, method: &str) -> usize {
         self.history.get(method).map_or(0, |v| v.len())
+    }
+
+    /// Number of deopts recorded for `method` at the specific bytecode index
+    /// `bci`. Drives per-bci de-speculation (Step 9 follow-up c): a single
+    /// speculation site that fails repeatedly is de-spec'd on its own (its guard
+    /// suppressed on the next compile) rather than escalating to a whole-method
+    /// blacklist once the *aggregate* per-method count crosses the threshold.
+    pub fn deopt_count_at_bci(&self, method: &str, bci: u32) -> usize {
+        self.history
+            .get(method)
+            .map_or(0, |v| v.iter().filter(|e| e.bci == bci).count())
     }
 
     /// Returns `true` when the method has exceeded the deopt threshold.
@@ -1079,15 +1231,60 @@ pub extern "C" fn ir_deopt_entry(point: *const DeoptimizationPoint, rbp: u64) ->
 /// `deopt_signaled` path, and clears the stash so it cannot leak to the next JIT
 /// call. STASH ONLY — no resume yet (that is Step 4).
 ///
+/// deopt-osr Step 9 follow-up (a): a 4th arg, `epoch_guard`, carries the
+/// stable, retained [`DeoptEpochGuard`] baked alongside the box. Before
+/// dereferencing `point`, the entry consults the guard: if the artifact has been
+/// superseded (its creation epoch is older than the method's live epoch), the
+/// baked speculation is stale, so it stashes a sentinel "re-run" frame
+/// (out-of-range bci ⇒ the VM resume path rejects it and re-runs the method)
+/// **without touching `point` at all** — the before-deref check the
+/// `CRATONVM_JIT_FREE_CODE=1` mode needs (where the box may have been freed).
+/// `epoch_guard` is null on every production artifact (the VM stamps it only
+/// under `deopt_real_enabled()`), so the check is inert there.
+///
 /// # Safety
 /// `point` and `regs` must be non-null and valid for the trapping frame, and
 /// `rbp` its still-live base — guaranteed by the emitting stub, which calls this
-/// after spilling and before the epilogue.
+/// after spilling and before the epilogue. `epoch_guard` is null or a valid,
+/// retained [`DeoptEpochGuard`].
 pub extern "C" fn x64_deopt_entry(
     point: *const DeoptimizationPoint,
     rbp: u64,
     regs: *const SavedRegisters,
+    epoch_guard: *const DeoptEpochGuard,
 ) -> i64 {
+    // Before-deref staleness short-circuit, FIRST — it consults only the
+    // retained guard, never `point`/`regs`, so a superseded artifact is handled
+    // without touching the (possibly-freed) box even when those are null/garbage.
+    if !epoch_guard.is_null() {
+        // SAFETY: a non-null `epoch_guard` is a retained `DeoptEpochGuard`
+        // (process-lifetime, see `CompiledMethod`'s Drop) — valid to read.
+        let guard = unsafe { &*epoch_guard };
+        if guard.is_superseded() {
+            if std::env::var_os("CRATONVM_DBG_DEOPT").is_some() {
+                eprintln!(
+                    "[cratonvm-deopt] x64 frame-deopt SUPERSEDED (creation_epoch={} < live) — \
+                     skipping reconstruction, routing to safe re-run",
+                    guard.creation_epoch.load(std::sync::atomic::Ordering::Relaxed),
+                );
+            }
+            // Stash a sentinel so the VM treats this as deopt-and-re-run
+            // (take_last_deopt is Some), never as a real i64::MIN return. The
+            // out-of-range bci makes the resume path fail → safe whole-method
+            // re-run. No `point` deref.
+            LAST_DEOPT.with(|c| {
+                *c.borrow_mut() = Some(ReconstructedFrame {
+                    method_key: String::new(),
+                    bci: u32::MAX,
+                    locals: Vec::new(),
+                    stack: Vec::new(),
+                    monitors: Vec::new(),
+                    caller_frames: Vec::new(),
+                })
+            });
+            return i64::MIN;
+        }
+    }
     if point.is_null() || regs.is_null() {
         return i64::MIN;
     }
@@ -1136,7 +1333,8 @@ mod x64_deopt_entry_tests {
             },
         };
         let _ = take_last_deopt(); // clear any prior stash
-        let r = x64_deopt_entry(&point, 0, &regs as *const SavedRegisters);
+        // Null guard ⇒ no staleness check (the production / unstamped path).
+        let r = x64_deopt_entry(&point, 0, &regs as *const SavedRegisters, std::ptr::null());
         assert_eq!(r, i64::MIN, "entry returns the deopt sentinel");
 
         let frame = take_last_deopt().expect("entry stashes a reconstructed frame");
@@ -1151,9 +1349,72 @@ mod x64_deopt_entry_tests {
     #[test]
     fn null_args_return_sentinel_without_stash() {
         let _ = take_last_deopt();
-        let r = x64_deopt_entry(std::ptr::null(), 0, std::ptr::null());
+        let r = x64_deopt_entry(std::ptr::null(), 0, std::ptr::null(), std::ptr::null());
         assert_eq!(r, i64::MIN);
         assert!(take_last_deopt().is_none());
+    }
+
+    /// deopt-osr Step 9 follow-up (a): a SUPERSEDED guard (live epoch advanced
+    /// past the artifact's creation epoch) short-circuits BEFORE the box is
+    /// dereferenced — it stashes a sentinel re-run frame (out-of-range bci) and
+    /// never reads `point`. A null `point` here proves the box is untouched: a
+    /// non-superseded run with a null point would crash, but the superseded
+    /// path returns the sentinel cleanly.
+    #[test]
+    fn superseded_guard_skips_box_deref_and_stashes_rerun_sentinel() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let live = Box::new(AtomicU64::new(3)); // live epoch = 3
+        let guard = DeoptEpochGuard::new();
+        guard.creation_epoch.store(1, Ordering::Relaxed); // artifact made at epoch 1 < 3
+        guard
+            .live_epoch_cell
+            .store(live.as_ref() as *const AtomicU64 as *mut AtomicU64, Ordering::Release);
+
+        let _ = take_last_deopt();
+        // point is NULL on purpose: the superseded check must fire before any
+        // deref, so passing null must NOT crash and must yield the sentinel.
+        let r = x64_deopt_entry(std::ptr::null(), 0, std::ptr::null(), &guard);
+        assert_eq!(r, i64::MIN);
+        let frame = take_last_deopt().expect("superseded path stashes a re-run sentinel");
+        assert_eq!(frame.bci, u32::MAX, "sentinel bci is out-of-range ⇒ re-run");
+        assert!(frame.locals.is_empty() && frame.stack.is_empty());
+    }
+
+    /// A FRESH guard (creation epoch == live epoch) does NOT short-circuit: the
+    /// entry proceeds to reconstruct from the box as normal.
+    #[test]
+    fn fresh_guard_proceeds_to_reconstruct() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let live = Box::new(AtomicU64::new(2));
+        let guard = DeoptEpochGuard::new();
+        guard.creation_epoch.store(2, Ordering::Relaxed); // == live ⇒ fresh
+        guard
+            .live_epoch_cell
+            .store(live.as_ref() as *const AtomicU64 as *mut AtomicU64, Ordering::Release);
+        assert!(!guard.is_superseded());
+
+        let regs = SavedRegisters::default();
+        let point = DeoptimizationPoint {
+            native_offset: 0,
+            bci: 11,
+            reason: DeoptReason::BoundsCheck,
+            action: DeoptAction::Reinterpret,
+            speculation_id: 0,
+            frame_state: FrameState {
+                method_key: String::new(),
+                bci: 11,
+                locals: vec![FrameValue::Int(99)],
+                stack: Vec::new(),
+                monitors: Vec::new(),
+                caller: None,
+            },
+        };
+        let _ = take_last_deopt();
+        let r = x64_deopt_entry(&point, 0, &regs as *const SavedRegisters, &guard);
+        assert_eq!(r, i64::MIN);
+        let frame = take_last_deopt().expect("fresh path reconstructs from the box");
+        assert_eq!(frame.bci, 11);
+        assert_eq!(frame.locals[0], FrameValue::Int(99));
     }
 }
 
@@ -1177,6 +1438,27 @@ pub fn count_virtual_objects(frame: &FrameState) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -- per-bci de-spec registry (Step 9 follow-up c) ---------------------
+
+    /// `despec_insert`/`despec_contains`/`despec_count_for` are per-(method, bci):
+    /// a recorded site matches only its own key+bci, an empty key never matches,
+    /// and inserts are idempotent. Uses a test-unique method key so it does not
+    /// race the shared process-global set with other parallel tests.
+    #[test]
+    fn despec_registry_is_per_method_bci() {
+        let m = "DespecTest$Unique.loop:(I)I";
+        assert!(!despec_contains(m, 7));
+        despec_insert(m, 7);
+        despec_insert(m, 7); // idempotent
+        despec_insert(m, 12);
+        assert!(despec_contains(m, 7));
+        assert!(despec_contains(m, 12));
+        assert!(!despec_contains(m, 8), "a different bci must not match");
+        assert!(!despec_contains("OtherClass.m:()V", 7), "a different method must not match");
+        assert!(!despec_contains("", 7), "an empty key never matches");
+        assert_eq!(despec_count_for(m), 2);
+    }
 
     // -- helpers -----------------------------------------------------------
 

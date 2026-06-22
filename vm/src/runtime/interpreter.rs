@@ -8583,6 +8583,13 @@ fn transfer_osr_exit_into_live_frame(
 /// read) unless `CRATONVM_DEOPT_REAL` is on, so production artifacts are
 /// byte-identical. Uses the same `"<class>.<method>:<descriptor>"` key as
 /// `DeoptimizationController::deoptimize`, which advances the epoch.
+///
+/// Step 9 follow-up (a): ALSO stamp the artifact's `DeoptEpochGuard` (baked into
+/// its frame-deopt stubs) with the same creation epoch and a stable pointer to
+/// the live-epoch cell, so `x64_deopt_entry` can short-circuit a superseded
+/// artifact BEFORE dereferencing the deopt box (the `CRATONVM_JIT_FREE_CODE=1`
+/// before-deref guard). No-op when no guard was emitted (`deopt_epoch_guard`
+/// null) — i.e. on every production artifact.
 #[inline]
 fn stamp_compilation_epoch(
     shared: &SharedVm,
@@ -8593,7 +8600,15 @@ fn stamp_compilation_epoch(
 ) {
     if cratonvm_jit::deopt_real_enabled() {
         let key = format!("{class_name}.{method_name}:{descriptor}");
-        cm.compilation_epoch = shared.compilation_epoch_for(&key);
+        // Take a stable pointer to the live-epoch cell first (creating it at
+        // epoch 0 if absent), then read its value as the creation epoch, so the
+        // field and the baked guard agree. A concurrent `bump` racing here only
+        // makes the guard consider itself superseded → safe whole-method re-run.
+        let cell = shared.live_epoch_cell_ptr(&key);
+        // SAFETY: `cell` is a stable, retained `AtomicU64` from `method_epochs`.
+        let epoch = unsafe { (*cell).load(std::sync::atomic::Ordering::Relaxed) };
+        cm.compilation_epoch = epoch;
+        cm.stamp_deopt_epoch_guard(epoch, cell);
     }
 }
 
@@ -8666,6 +8681,38 @@ fn real_frame_deopt_resume_and_despeculate(
         reason,
         rframe.bci,
     );
+
+    // deopt-osr Step 9 follow-up (c): per-bci de-spec. `deoptimize` above evicts
+    // the whole artifact and (on enough *aggregate* deopts) escalates to a
+    // whole-method blacklist. Before that escalation can fire, give the SINGLE
+    // speculation site that keeps failing a chance to be dropped on its own: once
+    // THIS bci has deopted `PER_BCI_DESPEC_LIMIT` times, record `(method, bci)` in
+    // the de-spec registry the optimizing backend consults
+    // (`despec_contains`), so the next compilation suppresses just that
+    // speculative guard (falling back to per-access bounds checks) and the method
+    // stays compiled. A method whose deopts are spread across many bcis still
+    // hits the per-method backstop; a method with one pathological site gets
+    // de-spec'd there and never reaches whole-method give-up. The limit mirrors
+    // HotSpot's `PerBytecodeTrapLimit`. Skipped for the superseded-artifact
+    // sentinel (`bci == u32::MAX`), whose failing site was already counted on the
+    // pre-supersession deopts. Inert in production (this sink is deopt-real-only).
+    const PER_BCI_DESPEC_LIMIT: usize = 4;
+    if rframe.bci != u32::MAX {
+        let bci_deopts = shared
+            .deopt_log
+            .lock()
+            .deopt_count_at_bci(&method_key, rframe.bci);
+        if bci_deopts >= PER_BCI_DESPEC_LIMIT {
+            cratonvm_jit::deopt::despec_insert(&method_key, rframe.bci);
+            if std::env::var_os("CRATONVM_DBG_DEOPT").is_some() {
+                eprintln!(
+                    "[cratonvm-deopt] per-bci de-spec: {} bci={} ({} deopts ≥ {}) — \
+                     speculation suppressed on next compile (method stays compilable)",
+                    method_key, rframe.bci, bci_deopts, PER_BCI_DESPEC_LIMIT
+                );
+            }
+        }
+    }
     resumed
 }
 
@@ -9113,6 +9160,54 @@ mod deopt_step3_tests {
         assert_eq!(thread.frames.len(), 0);
         // Still recorded for the deopt rate.
         assert_eq!(shared.deopt_log.lock().deopt_count("T.m:()V"), 1);
+    }
+
+    /// deopt-osr Step 9 follow-up (c): per-bci de-spec. After
+    /// `PER_BCI_DESPEC_LIMIT` deopts at the SAME bci, the sink records
+    /// `(method, bci)` in the de-spec registry the optimizing backend consults
+    /// (`despec_contains`) — so that ONE speculation is suppressed on the next
+    /// compile instead of the whole method being blacklisted. Fewer deopts, or a
+    /// different bci, do not de-spec.
+    #[test]
+    fn step9_fuc_per_bci_despec_after_limit() {
+        // A test-unique method key so the process-global de-spec registry cannot
+        // collide with other parallel tests.
+        let cached = Arc::new(CachedBytecodeMethod {
+            declaring_class_id: cratonvm_types::ClassId::new(0),
+            class_name: Arc::from("DespecFuC"),
+            method_name: Arc::from("loop"),
+            method_descriptor: Arc::from("()V"),
+            source_file: None,
+            code: Arc::from(&[0xb1u8][..]), // return
+            exception_table: Arc::from(Vec::new().into_boxed_slice()),
+            max_stack: 8,
+            max_locals: 4,
+            num_params: 0,
+            is_synchronized: false,
+            is_static: true,
+        });
+        let key = "DespecFuC.loop:()V";
+        cratonvm_jit::deopt::despec_clear_for_test();
+        let shared = Arc::new(SharedVm::new(VmConfig::default()));
+        let mut thread = JvmThread::new(ThreadId(0), "test");
+
+        // Drive 4 deopts at the SAME bci (5). Each call re-evicts and bumps the
+        // live epoch, so only the first resumes; all four are recorded, and the
+        // per-bci de-spec fires exactly when the count reaches the limit (4).
+        for n in 1..=4u32 {
+            let cm = cm_with_deopt_point(0, 5);
+            let rf = rframe(vec![FrameValue::Int(1)], vec![], 5);
+            let _ = real_frame_deopt_resume_and_despeculate(&shared, &mut thread, &cm, &cached, &rf);
+            let despec_now = cratonvm_jit::deopt::despec_contains(key, 5);
+            if n < 4 {
+                assert!(!despec_now, "must NOT de-spec before the per-bci limit (n={n})");
+            } else {
+                assert!(despec_now, "must de-spec once the per-bci limit is reached");
+            }
+        }
+        // A different bci on the same method is unaffected — de-spec is per-site.
+        assert!(!cratonvm_jit::deopt::despec_contains(key, 9));
+        cratonvm_jit::deopt::despec_clear_for_test();
     }
 
     // ---------------------------------------------------------------------

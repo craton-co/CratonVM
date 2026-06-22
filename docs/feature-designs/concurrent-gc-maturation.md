@@ -311,13 +311,54 @@ Author note: this doc is grounded in a read of `gc/src/{g1,g1_concurrent,zgc,zgc
     FieldStress (Step 4) stays 4495525842000 under G1.
   - **Throughput**: `matrix800` G1/gen = **1.05** (CV-G1 5410ms vs CV-default
     5163ms; CV-G1 ≈ 2.6× HotSpot-G1 2069ms — the interpreter+baseline-JIT gap).
-  - **Pause-time**: NOT obtained. CratonVM's per-collection `[GC ...] pause=Nms`
-    line (`g1.rs::log_gc_event`, `tracing::info!`) is only surfaced via
-    `RUST_LOG=cratonvm_gc=info`+`--verbose:gc` and is **millisecond-granular**
-    (`as_millis()` rounds sub-ms young pauses to 0); the GC-stress benches also
-    OOM under G1 before producing a long pause series. A small enhancement
-    (microsecond + a structured/visible sink — the §7 scaffolding item 6, only
-    half-built) is the prerequisite for §5 p50/p99.
+  - **Pause-time logging enhancement (§7 item 6) — DONE** (branch
+    `feat/g1-pause-logging`). The old `[GC ...] pause=Nms` line was
+    `as_millis()`-granular (sub-ms young pauses rounded to 0) and only surfaced
+    via `RUST_LOG=cratonvm_gc=info`. Replaced with a **microsecond** record sink:
+    every young/mixed evacuation path (serial + parallel) now funnels through a
+    `record_collection(type, pause_us, stats)` helper that appends a
+    `G1PauseRecord` to a bounded ring (`PAUSE_HISTORY_CAP = 64K`, oldest evicted +
+    counted), and `pause_summary()` reduces it to per-type p50/p99/max via
+    nearest-rank. Visible **without RUST_LOG**: `--verbose:gc` emits a parseable
+    per-collection `[GC-STAT] type=… pause_us=… bytes_*=…` line straight to
+    stderr, and at VM shutdown (`--verbose:gc` or `CRATONVM_GC_STATS=1`) a
+    `[GC-SUMMARY] young|mixed count=… p50_us=… p99_us=… max_us=…` table is dumped
+    (`g1.rs::{record_collection,log_gc_event,pause_summary,print_gc_summary}`,
+    `vm_heap.rs::print_gc_summary`, `vm-cli/src/main.rs` shutdown hook). Unit
+    tests `pause_history_records_each_collection`, `pause_percentiles_nearest_rank`,
+    `pause_history_ring_is_bounded`; 734/734 gc tests green.
+  - **Pause-time + throughput — OBTAINED** (verified G1, `cvg1pause.exe`;
+    harness `scratch/g1par/g1pause-measure.sh`). All checksums byte-identical
+    HotSpot==Gen==G1 throughout.
+    - **Small-live-set churn (`SteadyChurn 20000000 --nojit`):** CV-G1 young
+      pauses are in HotSpot's regime — @32m p50/p99 = **2.7 / 3.7 ms** (61 GCs),
+      @24m **1.9 / 4.7 ms** (84 GCs), @16m **1.4 / 2.9 ms** (135 GCs). Pauses
+      scale sensibly with eden size. (HotSpot scalar-replaces this bench's
+      non-escaping garbage → 0 GCs, so no per-pause comparison there.)
+    - **Large-live-set evacuation (`binarytrees 16 @64m --nojit`):** real
+      allocation on both. HotSpot-G1 = 9 GCs, **p50/p99 = 1.8 / 4.7 ms**;
+      CV-G1 serial = 27 GCs, **p50/p99 = 39 / 58 ms** (~10–20×). This is the
+      single-threaded serial evacuator copying a large live set under the
+      interpreter — exactly the case parallel evacuation targets.
+    - **Parallel evacuation cuts the large-live-set pause** (`PromoteMixed
+      200000 20000000`, `CRATONVM_G1_PARALLEL_EVAC=1`, 4 workers): @48m young
+      p50 **269 → 141 ms** (1.9×), @64m **148 → 72 ms** (2.0×); mixed p50 also
+      drops (@96m **42 → 27 ms**), all checksums = HotSpot `200039989800000`.
+      **But the parallel evacuator is not yet trustworthy** — it has an OPEN rare
+      young-collection race (Step-9 "Parallel evacuator" bullet, defect 2) that
+      corrupts `SteadyChurn @16m`, so these are a *potential* pause win, not a
+      shippable one until that race is fixed.
+    - **Throughput (`SteadyChurn 20000000 @32m --nojit`):** CV-G1 35.4 s vs
+      CV-Gen 33.0 s = **1.07×** (within margin). Both ≈230× HotSpot's 0.15 s
+      (escape-analysis + full JIT) — the interpreter/baseline-JIT gap §5 already
+      acknowledges ("same regime, not beating HotSpot").
+    - **Honest read:** the pause-target *direction* is honoured (pauses bounded
+      and heap-scaled), CV-G1's pause is within HotSpot's single-digit-ms regime
+      for small live sets, and ~10–20× for large live sets where the *serial*
+      evacuator dominates. Parallel evacuation *would* close much of that
+      (1.5–2× measured) but is blocked by an OPEN correctness race (Step-9 bullet,
+      defect 2); a persistent worker pool (vs the per-GC `thread::scope` spawn) is
+      a further throughput lever once the race is fixed.
   - Harness (untracked scratch in the worktree): `g1-step8-revalidate.sh` (now
     GUARDS collector selection up front), `g1-step8-benchparity.sh`,
     `g1-step8-appsuites.sh`.
@@ -326,12 +367,14 @@ Author note: this doc is grounded in a read of `gc/src/{g1,g1_concurrent,zgc,zgc
     even at GC-triggering heaps after the evacuate-into-CSet fix `ffb60014`);
     (3) ✅ ROOT-CAUSED + FIXED — the "heap-efficiency gap" was mostly the
     evacuate-into-CSet silent-corruption bug (above); residual genuine footprint
-    overhead is ~20%; (4) the pause-logging enhancement + p50/p99 + throughput
-    (still owed); (5) the daemon boot/e2e comparison — itself gated on 3 tracked
-    **non-G1** upstream bugs that stop WildFly/ES/Kafka/Spring Boot reaching
-    *ready* even on Generational (non-TTY stdout SEGV/hang, ARRAY-LEN-GUARD,
-    GC-clinit; see `apps/TARGET_APPS.md`) **and on JIT known-issue A5** (G1+JIT
-    still corrupts at GC-triggering heaps — being fixed separately).
+    overhead is ~20%; (4) ✅ DONE — pause-logging enhancement + p50/p99 +
+    throughput obtained (above); **and JIT known-issue A5 is now FIXED on dev**
+    (`77c98761` — unregistered compiled-`main` JIT frame → non-moving sweep +
+    full-stack mark; G1+JIT no longer corrupts at GC-triggering heaps), so the
+    G1+JIT multi-GC differential is unblocked; (5) the daemon boot/e2e comparison
+    — still gated on 3 tracked **non-G1** upstream bugs that stop
+    WildFly/ES/Kafka/Spring Boot reaching *ready* even on Generational (non-TTY
+    stdout SEGV/hang, ARRAY-LEN-GUARD, GC-clinit; see `apps/TARGET_APPS.md`).
 - **Step 9 (parallel evacuation) — FOUNDATION + FULL MULTI-THREADED EVACUATOR DONE**
   (foundation: branch `feat/g1-parallel-evac-foundation`; evacuator: branch
   `feat/g1-parallel-evac`). The gpu-bench-cpu G1 SIGSEGV that gated the §3.4
@@ -447,58 +490,134 @@ Author note: this doc is grounded in a read of `gc/src/{g1,g1_concurrent,zgc,zgc
     `-XX:+UseG1GC --nojit`: @160m serial was **3/3 WRONG** with V7b≈75k–104k; now
     **V7b=0 and serial is correct@{192,224,256}m or a clean OOM@160m — never
     wrong**; parallel@160m + clean-heap unchanged; 727 gc tests + regression
-    `old_to_young_ref_via_gc_rewrite_not_dropped`. **Known follow-ups:** the
-    analogous **Old→Old** GC-rewrite edge for MIXED GC is not yet recorded (mixed
-    is rarer/unproven; the write barrier covers mutator Old→Old stores), and the
-    IHOP/region/pause `-XX:` knobs remain unwired (§7 item 4) so a *mixed* GC can
-    only be triggered near 70% occupancy — mixed never fired in these repros, so
-    this was a young-GC bug, and clean mixed-GC validation still awaits the knob.
-  - **Pre-existing bug surfaced (NOT parallel-specific; blocks Step 10):** with the
-    JIT enabled, a long-lived local reference held across a hot loop is **missed by
-    GC root scanning**, so G1's *precise unconditional moving* young collection
-    frees the still-reachable graph (`copied=0`, whole heap freed) → corruption →
-    OOM. Confirmed a JIT root-scan miss, not a heap/footprint issue: the **same
-    workload completes correctly under `--nojit`** (`copied=4132`, prints the
-    HotSpot value) — so the live root IS findable and region recycling works — and
-    it reproduces identically with `CRATONVM_G1_PARALLEL_EVAC` OFF (serial G1) and
-    is **not** fixed by `CRATONVM_PRECISE_JIT_MAPS=1`. The missing root is
-    register-/OSR-frame-resident (same class as the register-only missed-JIT-root
-    history); the generational default hides it via its conservative non-moving
-    in-JIT sweep, which G1's precise move exposes. Fix is safepoint oop-spilling /
-    completing the JIT oop-maps — upstream of, and independent from, the parallel
-    evacuator. This is why this Step's real-binary differentials can't sustain many
-    GCs per run; the multi-GC copy-path coverage rests on the unit tests. **This is
-    tracked as known-issue A5** (`docs/known-issues/.../bintrees-object-main-args-
-    jit-frame-stale-root.md`), which localizes it further to the register allocator
-    coloring `main`'s `args` ref local onto a callee-saved register shared with int
-    locals — confirming it is a JIT root/regalloc bug, not a GC one.
-  - **Remaining:** the JIT-root fix above (a hard Step-10 prerequisite for G1 with
-    JIT on); then a longer soak driving many parallel GCs end-to-end; optional
-    work-stealing-deque upgrade if shared-queue contention is measured to matter.
-    Flipping the flag default-on (with a demonstrated large-heap throughput win) is
-    part of Step 10.
-- **CENTRAL GAP — G1 concurrent marking + mixed GC are NON-FUNCTIONAL** (root of
-  the footprint gap; blocks any old-gen reclaim short of full GC). Driving the
-  now-wired `-XX:` knobs to force a mixed cycle revealed three distinct bugs:
-  (A) `collect_garbage` prematurely flips the phase to ConcurrentMark (activating
-  SATB, no marker) → the VM's real `maybe_concurrent_gc` gate
-  (`should_start && !is_marking_active`) is blocked → **marking never starts**;
-  (B) the marker worker parks (stays `is_running`) at a fixed point and only
-  exits on `request_stop`, but `g1_concurrent_mark_finished` polls `!is_running`
-  and `request_stop` is only issued after completion → **marking never completes
-  (deadlock)**; (C) with A+B fixed, mixed GC fires but **drops live objects**
-  (`copied=3`, V7b≈72k dangling) — a selected old region's remembered set lacks
-  its old→old and humongous→old sources, and `scan_source_region` can't walk a
-  humongous source (object > region). A+B are fixed and preserved on
-  `feat/g1-marking-wip` (NOT merged — shipping them without C enables a
-  corrupting mixed GC); C is non-trivial and the never-exercised mixed path
-  likely hides further bugs. Repro: `scratch/g1par/PromoteMixed.java` with
-  `-XX:InitiatingHeapOccupancyPercent=5 -XX:MaxGCPauseMillis=1 --nojit`. Making
-  marking + mixed GC actually work is a **feature-sized effort** and the real
-  prerequisite for Step 8 pause/throughput and Step 10 — not a quick follow-up.
-- Step 10 (default flip) — not started; gated on a clean gauntlet (Step 8) +
-  pause/throughput within band + a sustained soak (§5), and now also on the
-  marking/mixed-GC repair above (without mixed GC, G1 cannot reclaim old gen).
+    `old_to_young_ref_via_gc_rewrite_not_dropped`. **Follow-ups (both now done):**
+    the analogous **Old→Old / humongous→Old** GC-rewrite edge for MIXED GC is now
+    also recorded by the same Phase-4 rebuild (extended to all collectable targets;
+    bug C above, dev `3d067512`), and the IHOP/region/pause `-XX:` knobs are wired
+    (`cfae0f03`) so a mixed cycle can be forced with a low IHOP — which is exactly
+    how the marking/mixed-GC repair was driven and validated.
+  - **Known-issue A5 (G1+JIT moving-GC corruption) — ✅ FIXED on dev `77c98761`.**
+    With the JIT enabled, a long-lived local ref held across a hot loop was missed
+    by GC root scanning, so G1's precise unconditional moving young collection
+    freed the still-reachable graph (`copied=0`, whole heap freed) → corruption →
+    OOM. Root cause was **not** register-residency (the earlier framing) but the
+    compiled entry-point `main`'s **JIT frame being unregistered** — `Vm::invoke`
+    pushes no `JitEntryGuard`, so `gc_quiescence` was blind to it and the moving
+    young collector relocated its roots without being able to rewrite the raw
+    stack slots. Fix: `scan_active_jit_frames` detects a JIT code address on the
+    native stack when the entry chain is empty → full-stack mark + per-thread flag
+    → non-moving sweep (pin) for that collection. So the G1+JIT multi-GC
+    differential that this Step could not previously sustain is now unblocked.
+    Residuals: Windows-only; the chain-non-empty case. (Doc:
+    `docs/internal/app-jvm-bugs/gc-stress-bintrees-main-args-unregistered-jit-frame-FIXED.md`.)
+  - **Remaining:** ✅ the JIT-root blocker (A5) is fixed; a diverse soak drove many
+    serial + parallel GCs end-to-end and is clean for SERIAL, but **surfaced an
+    OPEN parallel-evacuator data race** (defect 2 in the parallel-evac bullet
+    below) — the hard prerequisite for parallel-evac-default-on and thus Step 10.
+    Then: a persistent worker pool (vs the per-GC `thread::scope` spawn) and the
+    optional work-stealing-deque upgrade for throughput. Flipping the flag
+    default-on (with a demonstrated large-heap throughput win) is part of Step 10.
+- **CENTRAL GAP — G1 concurrent marking + mixed GC — ✅ FIXED (A+B+C), merged to
+  dev `3d067512`** (was the root of the footprint gap; old-gen is now reclaimed
+  by mixed GC). Driving the now-wired `-XX:` knobs to force a mixed cycle had
+  revealed three distinct bugs, all now fixed:
+  - **A — marking never STARTS:** `collect_garbage` prematurely flipped the phase
+    to ConcurrentMark (activating SATB, no marker) → the VM's real
+    `maybe_concurrent_gc` gate (`should_start && !is_marking_active`) was blocked.
+    Fix: delete the premature flip; the VM layer drives the full cycle. (g1.rs)
+  - **B — marking never COMPLETES (deadlock):** the marker worker parks (stays
+    `is_running`) at a fixed point and only exits on `request_stop`, but
+    `g1_concurrent_mark_finished` polled `!is_running` and `request_stop` is only
+    issued after completion. Fix: the worker publishes a `quiesced` AtomicBool at
+    its fixed point; `g1_concurrent_mark_finished` polls quiescence; `g1_mark_roots`
+    clears it after seeding (premature-quiesce race). (g1_concurrent.rs, vm_heap.rs)
+  - **C — mixed evacuation DROPPED live objects** (`copied=3`, V7b≈72k dangling):
+    a referent reachable only through a GC-internal **Old→old / humongous→old**
+    edge was freed. An `A.a=B` edge created while both ends are young records only
+    the (later-recycled) young source region; once A/B age or promote to Old the
+    edge is maintained ONLY by GC-internal pointer rewrites, never a mutator
+    barrier, so the referent's Old region never learns of the source and a mixed
+    GC that selects it never scans the source. **Fix** (the Old→old/humongous→old
+    generalization of the Old→young fix `8069818f`): the Phase-4 rset rebuild
+    (`update_references_in_regions`) now records cross-region edges into every
+    *collectable* (Eden/Survivor/Old) target via the renamed
+    `collect_outgoing_cross_region_edges` + `is_collectable_region_type` — no
+    extra walk, dedup'd; the humongous source is walked via the existing
+    contiguous-arena `cursor=size` path (the earlier "`scan_source_region` can't
+    walk a humongous source" read was wrong post-arena-fix; the real miss was the
+    rset edge). Repro `scratch/g1par/PromoteMixed.java` with
+    `-XX:InitiatingHeapOccupancyPercent=5 -XX:MaxGCPauseMillis=1 --nojit`:
+    serial mixed GC is now **byte-identical to HotSpot (200039989800000) with
+    V7b=0 dangling** across 8–55 mixed cycles at {48,64,96}m, humongous AND
+    non-humongous holder; binarytrees14–17 byte-identical; `cratonvm-gc` 730/730
+    (new regression `humongous_to_old_ref_via_gc_rewrite_survives_mixed_gc`,
+    verified to fail without the Old target).
+  - **Parallel evacuator — TWO defects; one fixed, one OPEN (the Step-9/10
+    blocker).**
+    - **Defect 1 — self-forward (evacuation-failure) UAF — ✅ FIXED on dev
+      `7e97111e`.** The parallel evacuator CAS-installs each forward into the
+      from-space object's persistent `forwarding_ptr`; a *self-forwarded* object
+      (to-space exhausted → `old→old`) lives in a region `free_or_keep_cset`
+      KEEPS, so its `forwarding_ptr` survived into the next cycle, short-circuited
+      re-evacuation, and the region was then freed → UAF. Fix: `parallel_evacuate`
+      clears every self-forward's `forwarding_ptr` after merging the shards (the
+      `key == value` loop). This was the "dangling refs on humongous-ref-array"
+      symptom that originally gated mixed→serial.
+    - **Defect 2 — rare non-deterministic young-evac corruption — 🔴 OPEN.** A
+      separate race in `young_collection_parallel`'s shared closure
+      (`run_worker`/`evacuate`/`process_object` — work-queue / atomic-forwarding /
+      termination concurrency) intermittently corrupts a still-live object under
+      frequent young GCs at small heaps. Repro `SteadyChurn @16m --nojit -Xmx16m
+      SteadyChurn 2000000` under `CRATONVM_G1_PARALLEL_EVAC=1`: ~1 in 8 runs throws
+      `Exception in thread "main" java/lang/Object` (a zeroed/stale header on a
+      node of the held linked list); correct at 24/32/48m and **always correct
+      serially**. This is NOT defect 1 (no to-space exhaustion) and reproduces with
+      `--nojit` (no JIT roots), so it is a genuine parallel-evacuator data race —
+      the long-suspected pre-existing race (`task_58d60f7a` family), now pinned to a
+      concrete cheap repro.
+    - **Consequence:** because defect 2 lives in the shared `parallel_evacuate`
+      closure that both young and mixed parallel paths drive, **mixed GC stays on
+      the SERIAL evacuator** (the earlier plan to un-gate it was reverted — its
+      premise that the evacuator was fully correct after `7e97111e` is false). The
+      parallel young path stays opt-in/experimental under the flag (it was already
+      racy; this characterizes the race, it does not introduce it). Where parallel
+      runs DID complete they were checksum-correct (`PromoteMixed` 48/64/96m,
+      `binarytrees`, `DeepTree`, `IntArrChurn`), and parallel pauses are ~1.5–2×
+      faster than serial — but the evacuator cannot be trusted (let alone made
+      default) until defect 2 is fixed.
+  - **Soak — diverse-workload battery, serial + parallel, vs HotSpot** (harness
+    `scratch/g1par/g1pause-soak.sh`, `g1pause-confirm.sh`): object trees, held
+    graph, primitive arrays, `HashMap`, `String`, pointer churn, and cross-linked
+    promotion (`PromoteMixed`). **Serial G1 == HotSpot on every workload that
+    completes.** Parallel G1 == HotSpot on every workload *except* the
+    `SteadyChurn @16m` corruption above (defect 2). Separately, in the pure
+    `--nojit` interpreter some many-frequent-GC runs exceed the 120s watchdog (the
+    per-GC `thread::scope` spawn makes parallel slower than serial for tiny CSets)
+    — a throughput artifact orthogonal to defect 2 (and to a persistent-worker-pool
+    follow-up). The soak's value here was finding defect 2.
+- **Step 10 (default flip) — NOT started; still gated.** Most historical gates
+  cleared: the marking/mixed-GC repair (`3d067512`) lets G1 reclaim old gen; the
+  JIT missed-root **A5 is fixed** (`77c98761`); the self-forward UAF (parallel-evac
+  defect 1) is fixed (`7e97111e`); **pause/throughput is now measurable** (p50/p99
+  obtainable; CV-G1/CV-Gen throughput 1.07×); and **serial G1 is soak-clean** vs
+  HotSpot across a diverse battery. But three things still gate the flip:
+  - **OPEN: the parallel-evacuator race (defect 2).** A clean parallel evacuator
+    is the prerequisite for parallel-evac-default-on, which is in turn the
+    prerequisite for an acceptable large-live-set pause story (serial pauses are
+    ~10–20× HotSpot). This is now the #1 G1 work item.
+  - **The pause story (§3.3 / §6).** Without a trustworthy parallel evacuator,
+    CV-G1's large-live-set pause is ~10–20× HotSpot; a default flip would need
+    either parallel-evac-default-on or an explicit "selectable, pause-target
+    best-effort" framing.
+  - **The blast radius (§6).** Flipping the default changes behaviour for every
+    app and every test that assumes Generational; per §4 step 10 it must be **its
+    own change with a full suite re-run**, not bundled with this branch. (The
+    gauntlet daemon e2e is also still gated on 3 tracked *non-G1* upstream bugs,
+    Step 8 item 5.)
+  Recommendation: **keep Generational the default.** Land this branch (the µs pause
+  sink) as the Step-8 finish; the next G1 work is fixing parallel-evac defect 2,
+  after which parallel-evac-default-on + a full-suite re-run can carry the Step-10
+  flip as its own change.
 
 ---
 

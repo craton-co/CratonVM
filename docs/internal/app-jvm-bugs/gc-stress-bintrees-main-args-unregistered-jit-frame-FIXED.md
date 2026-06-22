@@ -1,10 +1,128 @@
 # GC: object-binarytrees JIT-frame stale root under extreme `GC_STRESS` (`main` reads `args`)
 
-**Status:** 🔴 **OPEN** — a residual member of **Family A** (GC root coverage under JIT). Found
-2026-06-21. JIT-only; reproduces **only at extreme young-GC frequency** (`CRATONVM_DBG_GC_STRESS`
-≤ 65536, i.e. a young GC every ≤ 64 KB of allocation) — i.e. **below** the 524288 / 4 MB thresholds at
-which the A3 precise-oop-maps fix (`32649b56`, default-on) was verified. Precise maps **on or off make no
-difference**; this is *not* closed by the A3 fix.
+**Status:** ✅ **FIXED on the default path (Windows)** — dev merge `77c98761` / fix `6e92f0e5`.
+Root-caused (instrumented) to the generational MOVING young collector relocating the **compiled
+entry-point `main`**'s live objects: `main`'s JIT frame is invisible to `gc_quiescence` (it is
+invoked via `Vm::invoke` WITHOUT a `JitEntryGuard`), so `is_active()` is false and the collector
+moves instead of running the non-moving sweep. The fix detects an unregistered JIT frame on the
+native stack (a JIT code return address via `cratonvm_jit::lookup_jit_code_range`), conservatively
+marks its oops with a full-stack scan, and runs the non-moving sweep (pin, don't relocate).
+**Validated:** `VAAload 14 @CRATONVM_DBG_GC_STRESS=4096` → `3222190` 5/5 (was crash 8/8); all repro
+variants ==HotSpot; `bt16` throughput byte-identical; `cratonvm-gc` 732/732 (incl. regression
+`non_moving_sweep_when_unregistered_jit_frame_on_stack`). **Follow-up done:** the
+`JIT_ENTRY_CHAIN`-non-empty case (an unregistered `main` ABOVE a registered chain) is now also
+covered — the detection scans `[cover_hi, stack_high)` regardless of chain length and marks the
+above-chain frame (no collector-choice change when the chain is non-empty, so no throughput cost;
+dev merge `9c64d691`). **Remaining residual:** Windows-only — the detection reuses
+`current_thread_stack_high` (Win32 `GetCurrentThreadStackLimits`); a portable (pthread) port is a
+tracked follow-up that needs a non-Windows environment to validate. See the CRACKED + fix notes below.
+
+Originally a residual member of **Family A** (GC root coverage under JIT). Found 2026-06-21.
+JIT-only; reproduced **only at extreme young-GC frequency** (`CRATONVM_DBG_GC_STRESS` ≤ 65536, i.e.
+a young GC every ≤ 64 KB) — **below** the 524288 / 4 MB thresholds at which the A3 precise-oop-maps
+fix (`32649b56`) was verified. Precise maps **on or off** made no difference; not closed by A3.
+
+---
+
+## ⚠️ UPDATE 2026-06-22 (re-investigation) — several earlier conclusions are now CORRECTED
+
+Re-run on current dev (binary built from dev tip after the G1 mixed-GC merge `3d067512`; the JIT
+root path is unchanged by that merge). **The state has FLIPPED and two leading hypotheses are
+refuted.** Read this section before the older body below.
+
+1. **Generational CRASHES; G1 is CLEAN** (the doc/memory had it backwards). `VAAload 14`
+   `CRATONVM_DBG_GC_STRESS=4096`:
+   - **Generational (default): deterministic CRASH** — empty output, `inconsistent header`,
+     `set_field out-of-bounds dropped` (receiver = a zeroed `java/lang/Object`), then
+     `ArrayIndexOutOfBoundsException`. `RHard` (the `args`-free control) is **clean `3222190`** —
+     the `main`-reads-`args` discriminator still holds. Crashes at every stress ≤ 262144; **clean at
+     ≥ 524288** (boundary 262144↔524288, unchanged).
+   - **G1 (`-XX:+UseG1GC`): CLEAN `3222190`, zero guard warnings, every stress.** G1's
+     conservative-JIT-root **region pin** (`5d761809`, dev `f564b156`) excludes JIT-referenced
+     regions from the CSet, so G1 never relocates them → it *works around* this bug. **So A5 today
+     is a generational moving-young problem (the DEFAULT collector), not a G1-specific one.** Fixing
+     it would also let G1 drop the pin workaround (a throughput win).
+
+2. **It is NOT a relocation / moving-GC stale-pointer bug** (refutes this doc's old "leading
+   hypothesis" and the A2 "moved-but-not-remapped" story). Every collector path gives the **byte-
+   identical** failure: `CRATONVM_NO_SELECTIVE_PROMOTE=1`, `CRATONVM_DBG_FORCE_MOVING=1`,
+   `CRATONVM_SHADOW_STACK=1`, `CRATONVM_NO_PRECISE_JIT_MAPS=1` — all crash identically. If
+   relocation were the mechanism, disabling it (`NO_SELECTIVE_PROMOTE`, non-moving sweep) would
+   change the outcome. It does not. **The receiver is a *zeroed* header → a live young object that
+   was MARK-missed and FREED (swept), then its slot reused** — a missed *mark* root, not a missed
+   *remap*.
+
+3. **`CRATONVM_DBG_SWEEP_EDGES` stays silent** — no root / heap-field / dirty-card edge reaches the
+   freed object (confirming the gen_heap.rs:139-144 note). So at the freeing GC the object is
+   reachable from *nothing the marker scans*.
+
+4. **NEW — disassembly proves `node` IS spilled to the stack at every safepoint, yet is still
+   missed.** `CRATONVM_DBG_JIT_DISASM=VAAload.bottomUpTree`: `bottomUpTree`'s locals are
+   `L0=depth=r13`, **`L1=node=r12` (a callee-saved register)**. The canonical spill slot is
+   `[rbp-10h]` (`r12→[rbp-10h]` is re-emitted before *every* GC-capable call: the two recursive
+   calls at `0x18e`/`0x1fd` (`0x17f`,`0x1ee`) and after each, plus `[rbp-30h]`). At both `putfield`
+   safepoints (`0x1cb`,`...`) the receiver is reloaded from `[rbp-30h]` and `[rbp-10h]` still holds
+   `node`. **So `node` is present on the stack in `bottomUpTree`'s frame at every safepoint** — and
+   yet `FULLSTACK_SCAN=1` (scan the *entire* native stack) **does not recover it** (the
+   `inconsistent header` goes away but the `set_field`-into-zeroed-`Object` and the AIOOBE remain).
+   `CRATONVM_JIT_SAFEPOINT_REG_SPILL=all` and the dev-default callee-saved-operand-stack-oop spill
+   (`7c7d8148`, which only covers operand-stack temporaries, **not locals**) also do not fix it.
+
+### ✅ CRACKED (2026-06-22, instrumented) — it is a LOST-TAG object on the MOVING path, NOT a bottomUpTree JIT-frame stale root
+
+An instrumented build (probe in `collect_roots` + `collect_garbage_inner` + the sweep, gated
+`CRATONVM_DBG_A5`, since reverted) settled it. **Every prior "bottomUpTree node in r12 / register-
+only / scan coverage-or-accept" framing is WRONG for this repro** — `bottomUpTree` is **not even
+JIT-compiled** at the crash. The decisive observations on `VAAload 14 GC_STRESS=4096`:
+
+1. **The corruptor is `main`'s COMPILATION, decisively.** `CRATONVM_JIT_BISECT_SKIP=VAAload.main`
+   → **clean `3222190`** (30+ GCs, no corruption); default (main compiled) → crash. `main` compiles
+   at startup (the `DBG_JIT_DISASM` "first VAAload.main" event fires **before GC#0**).
+2. **`bottomUpTree` is NEVER compiled before the crash** (no `first VAAload.bottomUpTree` event; no
+   OSR event). So the corruptee `node` lives in an **interpreter** frame, not a JIT frame — the
+   whole `[rbp-10h]`/`r12` disasm analysis below was chasing the wrong frame.
+3. **Every corrupting GC is a MOVING (Cheney) collection at `quiescence_depth=0`, `jit_thread=false`**
+   — i.e. the *interpreter* is running (no JIT frame registered) and the **relocating** collector
+   runs. The crash is very early (GC#2–3, old gen empty → young-only).
+4. **`--nojit` does NOT corrupt** — it only hits the 120 s watchdog (interpreted `bottomUpTree` is
+   slow). So the bug needs JIT *enabled* (so `main` compiles) but does not need JIT *running* at the
+   GC.
+
+**Mechanism (matches an already-documented hazard).** `main` runs compiled, calls a method across a
+JIT↔interpreter boundary, and **a JIT callee's object return value reaches an interpreter local /
+operand slot under a NON-OBJECT tag** (lost-tag). The tag-filtered `Frame::scan_local_objects`
+omits it, so it is not a GC root. Because `quiescence=0` the **moving** collector runs and
+**relocates/frees** that unrooted-but-live young object → its slot is reused → the stale reference
+reads an all-zero `java/lang/Object` header → `set_field` OOB → `ArrayIndexOutOfBoundsException`.
+This is the SAME class as the Fork6 FJP lost-tag bug — see the comment on
+`vm/src/memory/roots.rs::conservative_locals_enabled` / the `scan_locals_conservative` call there,
+which literally describes *"a JIT callee's object return value can reach an interpreter local under
+a non-object tag (e.g. `main`'s `f = POOL.submit(t)`); the tag-filtered `scan_local_objects` then
+omits it … → stale all-zero receiver."* That recovery scan exists **but is gated to
+`CRATONVM_REAL_FORKJOINPOOL` AND the non-moving sweep** (`base && gc_quiescence::is_active()`). For
+`VAAload` neither holds (no FJP gate; `is_active()=false` → moving collector), so the lost object is
+never recovered. The recovery is deliberately OFF on the moving path because conservatively rooting
+a pointer-shaped `long` there would get it **relocated and corrupted** — so the fix cannot simply
+flip the gate.
+
+**Fix direction.** Preserve the object tag across the JIT→interpreter return boundary (the real fix
+— make the returned reference land in the interpreter slot tagged as an object so the precise scan
+roots it), OR provide a precise (rewritable, not conservative-pin) recovery of JIT-boundary return
+oops that is safe on the moving path. The `main`-reads-`args` discriminator is a red herring for the
+*frame* but real for *triggering main's compilation + the specific call/return shape*; `RHard`
+(args-free) is clean because its `main` compiles to a shape that does not lose the tag (or does not
+compile the same way).
+
+**Confirming experiment for the next session:** add a force-non-moving knob (or reuse the FJP gate
+path) and verify that with the conservative-locals recovery engaged the crash disappears — that
+pins "lost-tag on the moving path" beyond doubt — then implement the precise tag-preserving fix and
+verify `VAAload`/`binarytrees` are clean at `GC_STRESS=4096` with JIT on.
+
+### (historical — the "register-only / coverage-or-accept" hypotheses below are SUPERSEDED by the CRACKED section above)
+
+---
+
+### (older body — superseded where it conflicts with the 2026-06-22 update above)
 
 ## TL;DR
 
@@ -39,7 +157,7 @@ Two observable end-states (both are the same bug; timing decides which):
 
 Canonical: object-based binarytrees that accumulates one checksum, `maxDepth` from `args[0]`.
 Minimal repros and clean controls are in
-[`repros/gc-stress-bintrees-main-args/`](repros/gc-stress-bintrees-main-args/).
+[`repros/gc-stress-bintrees-main-args/`](../../known-issues/repros/gc-stress-bintrees-main-args/).
 
 ```bash
 cd docs/known-issues/repros/gc-stress-bintrees-main-args
@@ -134,7 +252,7 @@ experiments were run.
 
 ## Relationship to existing Family-A members
 
-- Closest to **A2** ([reflrepro-register-resident-jit-root-handoff.md](reflrepro-register-resident-jit-root-handoff.md)):
+- Closest to **A2** ([reflrepro-register-resident-jit-root-handoff.md](../../known-issues/reflrepro-register-resident-jit-root-handoff.md)):
   both show `inconsistent header` on the young-sweep walk and are **not** fixed by precise maps. A2's
   repro is reflection / String-array churn; this one is object-graph recursion with a sharp,
   one-opcode trigger (`main` reads `args`) and a clean GC-frequency boundary. They may share a root

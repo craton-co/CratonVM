@@ -16,6 +16,7 @@ docs
 # Test and benchmarking suites
 test-infra/
 scratch/
+scratch_churn/
 bench/
 .bench-cache/
 

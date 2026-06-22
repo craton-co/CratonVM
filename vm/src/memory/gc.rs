@@ -334,6 +334,12 @@ pub fn update_all_roots(
     //     stale-ClassLoader → `String.loadClass` cryptoProvider failure).
     cratonvm_native_builtins::classloader::gc_update_loader_singleton_refs(pointer_map);
 
+    // 18a. Process-global `System.getenv()` / `System.getProperties()`
+    //      singletons (companion to roots.rs step 18a). Repoint the cached
+    //      Map/Properties ObjectRefs to their relocated addresses so the next
+    //      `getenv()`/`getProperties()` returns the live object after a move.
+    cratonvm_native_builtins::lang_system::gc_update_system_singleton_refs(pointer_map);
+
     // 18b. Process-global Locale caches (companion to roots.rs step 18b).
     //      Repoint the cached default Locale + synthetic Locale side-table keys
     //      to their relocated addresses so `Locale.getDefault()` keeps returning
@@ -638,7 +644,11 @@ fn verify_no_stale_refs(
     let stale_destinations: std::collections::HashSet<usize> = if heavy {
         pointer_map
             .values()
-            .filter(|v| pointer_map.contains_key(v))
+            // A genuine intermediate point is an address that something moved TO
+            // and that was THEN relocated elsewhere. A self-forward (`k -> k`)
+            // makes `k` both a value and a key but represents NO movement, so
+            // exclude it (`pointer_map[v] != v`) to avoid a false STALE-DEST flag.
+            .filter(|v| pointer_map.get(v).is_some_and(|nv| nv != *v))
             .copied()
             .collect()
     } else {
@@ -653,12 +663,18 @@ fn verify_no_stale_refs(
             let val = frame.get_local(li as u16);
             if let Value::Object(Some(obj_ref)) = val {
                 let addr = obj_ref.as_ptr() as usize;
-                if pointer_map.contains_key(&addr) {
-                    eprintln!(
-                        "POST-GC STALE LOCAL: frame[{}] {}.{} local[{}] still points to \
-                         relocated addr 0x{:x} (should be 0x{:x})",
-                        fi, cname, mname, li, addr, pointer_map[&addr],
-                    );
+                // A `key == value` entry is a SELF-FORWARD (evacuation failure:
+                // the object stayed in place because to-space was exhausted), so
+                // a slot pointing at it is correct, not stale. Only flag entries
+                // that actually relocated the object.
+                if let Some(&new_addr) = pointer_map.get(&addr) {
+                    if new_addr != addr {
+                        eprintln!(
+                            "POST-GC STALE LOCAL: frame[{}] {}.{} local[{}] still points to \
+                             relocated addr 0x{:x} (should be 0x{:x})",
+                            fi, cname, mname, li, addr, new_addr,
+                        );
+                    }
                 }
                 if heavy && addr != 0 {
                     if stale_destinations.contains(&addr) {
@@ -692,12 +708,16 @@ fn verify_no_stale_refs(
             let val = frame.stack.get_value(si);
             if let Value::Object(Some(obj_ref)) = val {
                 let addr = obj_ref.as_ptr() as usize;
-                if pointer_map.contains_key(&addr) {
-                    eprintln!(
-                        "POST-GC STALE STACK: frame[{}] {}.{} stack[{}] still points to \
-                         relocated addr 0x{:x} (should be 0x{:x})",
-                        fi, cname, mname, si, addr, pointer_map[&addr],
-                    );
+                // Skip self-forwards (`key == value`): the object did not move,
+                // so this slot is correct (see the locals check above).
+                if let Some(&new_addr) = pointer_map.get(&addr) {
+                    if new_addr != addr {
+                        eprintln!(
+                            "POST-GC STALE STACK: frame[{}] {}.{} stack[{}] still points to \
+                             relocated addr 0x{:x} (should be 0x{:x})",
+                            fi, cname, mname, si, addr, new_addr,
+                        );
+                    }
                 }
                 if heavy && addr != 0 {
                     if stale_destinations.contains(&addr) {

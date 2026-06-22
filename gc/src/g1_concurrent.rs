@@ -93,6 +93,15 @@ const WORKER_POLL_MS: u64 = 5;
 pub struct ConcurrentMarkState {
     /// Set by `request_stop`; the worker exits its loop on next poll.
     pub should_stop: AtomicBool,
+    /// Set by the worker when it reaches a marking fixed point (the worklist
+    /// drained AND no overflow rescan pending) and parks; cleared when work is
+    /// pushed (`notify_work_available`) or the worker resumes stepping. This is
+    /// the completion signal the coordinator polls — the worker PARKS rather
+    /// than EXITS at a fixed point (the cycle ends only via `request_stop`), so
+    /// "worker exited" (`!is_running()`) would deadlock: the worker never exits
+    /// on its own, and `request_stop` is only issued after completion is
+    /// detected. Quiescence ("drained to fixed point") is the correct signal.
+    pub quiesced: AtomicBool,
     /// Telemetry: number of `concurrent_mark_step` calls performed.
     pub steps_performed: AtomicU64,
     /// Telemetry: total gray pointers processed (sum of step budgets).
@@ -111,6 +120,7 @@ impl ConcurrentMarkState {
     fn new() -> Self {
         Self {
             should_stop: AtomicBool::new(false),
+            quiesced: AtomicBool::new(false),
             steps_performed: AtomicU64::new(0),
             work_units_done: AtomicU64::new(0),
             parked: Mutex::new(false),
@@ -126,6 +136,11 @@ impl ConcurrentMarkState {
     /// atomic load + nothing else. Only acquires the mutex when a wake
     /// is actually needed.
     pub fn notify_work_available(&self) {
+        // New work means the marker is no longer at a fixed point: clear the
+        // quiescence signal so the coordinator's completion poll doesn't fire
+        // while there are unprocessed gray pointers (e.g. freshly-seeded roots
+        // or SATB entries).
+        self.quiesced.store(false, Ordering::Release);
         // Acquire the mutex so the wake races correctly with a worker
         // that was about to park: parking_lot's pattern is "lock, set
         // flag, wait" so we must lock to observe a consistent flag.
@@ -242,14 +257,20 @@ impl ConcurrentMarkController {
             }
 
             if drained {
-                // Worklist truly empty. Park until SATB drains push
-                // more work or stop is requested. We do NOT exit the
-                // loop here: the cycle ends only via `request_stop`,
-                // which is the STW coordinator's prerogative (it owns
-                // the transition to the Remark phase).
+                // Worklist truly empty (fixed point). Publish quiescence so the
+                // coordinator's completion poll (`is_quiesced`) can observe that
+                // marking has converged, THEN park. We do NOT exit the loop
+                // here: the cycle ends only via `request_stop`, which is the STW
+                // coordinator's prerogative (it owns the transition to Remark).
+                state.quiesced.store(true, Ordering::Release);
                 state.park_for_work();
+                // Woken (new work via notify, or the poll timeout): we are about
+                // to step again, so we are no longer at a fixed point.
+                state.quiesced.store(false, Ordering::Release);
+            } else {
+                // Still work to do — definitely not quiesced.
+                state.quiesced.store(false, Ordering::Release);
             }
-            // else: still work to do, keep stepping.
         }
     }
 
@@ -279,6 +300,15 @@ impl ConcurrentMarkController {
             .as_ref()
             .map(|h| !h.is_finished())
             .unwrap_or(false)
+    }
+
+    /// True once the worker has marked to a fixed point (worklist drained, no
+    /// overflow rescan pending) and is idle — the correct "concurrent marking
+    /// has converged" signal for the coordinator's completion poll. The worker
+    /// PARKS rather than exits at a fixed point, so `is_running()` would stay
+    /// true forever (deadlocking completion); this reflects convergence instead.
+    pub fn is_quiesced(&self) -> bool {
+        self.state.quiesced.load(Ordering::Acquire)
     }
 
     /// Test/inspection helper: how many concurrent-mark steps has the

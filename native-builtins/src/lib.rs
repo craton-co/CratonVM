@@ -2459,15 +2459,32 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             // default — producing values like `quarkus.locales=en-`.
             // Pre-populate the side-table with the current system
             // property snapshot so enumeration sees the live values.
-            let props = crate::alloc_concurrent_synthetic(ctx, "java/util/Properties", 16);
-            // Mark this as the system-properties view so writes through it (e.g.
+            // Identity: reuse the cached singleton so `System.getProperties()
+            // == System.getProperties()` holds — HotSpot returns the same
+            // `System.props` object every call (SC-env-classreading RC-A,
+            // StandardEnvironmentTests.getSystemProperties `isSameAs`). On the
+            // first call build the synthetic Properties and mark it as the
+            // system-properties view so writes through it (e.g.
             // `System.getProperties().setProperty(...)`) propagate to the global
             // store — regular `new Properties()` objects must NOT (they'd pollute
             // system properties and cross-contaminate other Properties).
-            crate::properties_sidetable::mark_system_props(ctx, props);
-            for (k, v) in ctx.list_system_properties() {
-                crate::properties_sidetable::store_property_in_sidetable(ctx, props, &k, &v);
-            }
+            let props = match crate::lang_system::system_props_singleton() {
+                Some(cached) => cached,
+                None => {
+                    let p = crate::alloc_concurrent_synthetic(ctx, "java/util/Properties", 16);
+                    crate::properties_sidetable::mark_system_props(ctx, p);
+                    crate::lang_system::set_system_props_singleton(p)
+                }
+            };
+            // Resync the side-table to the current system-property snapshot on
+            // every call — whether the object is fresh or cached — so enumeration
+            // (forEach/stringPropertyNames/entrySet/size) and `getProperty` see
+            // the live values. A wholesale REPLACE (not additive store) is
+            // required for the cached singleton: it drops keys removed by
+            // `System.clearProperty(...)` between calls, matching HotSpot
+            // (additive merge would leave a cleared property visible).
+            let snapshot = ctx.list_system_properties();
+            crate::properties_sidetable::replace_sidetable(ctx, props, &snapshot);
             Ok(Some(Value::Object(Some(props))))
         },
     );

@@ -65,7 +65,7 @@ and [docs/SECURITY_HARDENING.md](docs/SECURITY_HARDENING.md).
 
 *Measured 2026-03-31 on Windows 11, JDK 25.0.1 LTS. Round 26 JIT: OSR, loop unrolling, speculative BCE, graph-coloring regalloc.*
 
-See [docs/PRESENTATION.md](docs/PRESENTATION.md) for the full 26-round JIT optimization journey.
+See [docs/JIT_OPTIMIZATION.md](docs/JIT_OPTIMIZATION.md) for the full 26-round JIT optimization journey.
 
 ## Quick Start
 

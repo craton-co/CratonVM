@@ -1093,6 +1093,14 @@ impl VmHeap {
     pub fn g1_mark_roots(&self, roots: &[cratonvm_types::ObjectRef]) {
         if let VmHeap::G1(g1) = self {
             g1.remark(roots); // remark marks roots + drains SATB
+            // The worker (spawned by `g1_start_concurrent_mark` just before this)
+            // may have already drained the initially-empty worklist and parked
+            // with `quiesced=true`. These roots seed real work, so wake it and
+            // clear the premature quiescence — otherwise the completion poll
+            // could fire before the seeded graph is marked.
+            if let Some(ctrl) = g1.concurrent_mark.lock().as_ref() {
+                ctrl.notify_work_available();
+            }
         }
     }
 
@@ -1113,7 +1121,13 @@ impl VmHeap {
     pub fn g1_concurrent_mark_finished(&self) -> bool {
         if let VmHeap::G1(state) = self {
             let slot = state.concurrent_mark.lock();
-            return slot.as_ref().map_or(true, |c| !c.is_running());
+            // Completion = the worker has marked to a FIXED POINT (`is_quiesced`),
+            // NOT that the worker thread exited (`!is_running`). The worker parks
+            // (stays alive) at a fixed point and only exits on `request_stop`,
+            // which the coordinator issues *after* observing completion — so
+            // polling `!is_running` here deadlocked, leaving marking permanently
+            // "active" and mixed GC never firing (old-gen never reclaimed).
+            return slot.as_ref().map_or(true, |c| c.is_quiesced());
         }
         true
     }
@@ -1164,6 +1178,16 @@ impl VmHeap {
                 // but log that GC logging was requested.
                 tracing::info!("[GC] Verbose GC logging enabled (generational collector)");
             }
+        }
+    }
+
+    /// Print the aggregate per-collection pause summary (p50/p99/max young +
+    /// mixed) to stderr. No-op for the generational collector (which keeps no
+    /// pause history) and when no G1 collection has run. Called at VM shutdown
+    /// when GC stats are requested (`--verbose:gc` or `CRATONVM_GC_STATS`).
+    pub fn print_gc_summary(&self) {
+        if let VmHeap::G1(g1) = self {
+            g1.print_gc_summary();
         }
     }
 

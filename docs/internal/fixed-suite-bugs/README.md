@@ -19,6 +19,8 @@ that `docs/known-issues/` holds only **open** items. Kept for traceability (repr
 | `bug-A-arraylist-sublist-copy-not-view.md` | `9a535e85` (off dev `b8908…`) |
 | `springsuite-0620-toarray-referencepipeline-recursion.md` | `8795b88d` — `ReferencePipeline.toArray(IntFunction)` native re-entered no-arg `toArray()` → `StackOverflowError`; was the `MergedAnnotations` hang + bug-06 fam6 "~2 GB OOM" and blocked the whole JUnit suite. `MergedAnnotationsTests` 174/178, `AnnotationUtilsTests` 72/72. |
 | `springsuite-0619-unsafe-offheap-directbuffer.md` | `3b16e985` (bug-A) + re-verified 2026-06-20 (bug-A2 also resolved) — `PooledDataBufferTests` 10/10, `LeakAwareDataBufferFactoryTests` 2/2. |
+| `SC-map-multivaluemap-family.md` | RC-1 keySet `contains`→`containsKey` + RC-2 LHM `putIfAbsent` null-replace (earlier on dev) + RC-3 `Map.equals` foreign-Map operand via virtual dispatch (`e115b0bd`). All 3 native-collections Map bugs verified vs HotSpot (JDK 25, `test_classes/MapEqRepro` 15/15). RC-4/RC-5 are non-Map ByteBuddy/Mockito handoffs (bug-E). |
+| `SC-aot-runtimehints-resource-count.md` | `Stream.distinct()` (`native_stream_distinct`) deduped via shallow `values_equal` → value classes/records never collapsed → over-counted resource globs (8 vs 5). Now dedups via `list_element_matches` (real Java `equals`), `029f2c87` (merge `cf269fc5`). Verified vs HotSpot (JDK 25, `test_classes/DistinctEquals` 5/5). 4 non-`distinct()` writer tests = unconfirmed separate residual (re-triage if they fail). |
 
 **Not moved — partial fixes with open residuals** (left in their suite folders / `docs/known-issues/`):
 - `spring-suite/crash-reports-2026-06-16/bug-05-generics-fieldtypesignature-cce.md`

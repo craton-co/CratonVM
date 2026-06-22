@@ -1136,6 +1136,16 @@ pub struct CompiledMethod {
     /// resume never follows a box belonging to a superseded compilation.
     /// `0` for every artifact today (no invalidation consumer yet).
     pub compilation_epoch: u64,
+    /// deopt-osr Step 9 follow-up (a) — raw pointer to this artifact's retained
+    /// [`crate::deopt::DeoptEpochGuard`], baked as the 4th arg into every
+    /// frame-deopt stub. Null on production artifacts (a guard is allocated only
+    /// when a frame-deopt stub is emitted, which requires `deopt_real_enabled()`).
+    /// The VM stamps it (creation epoch + stable live-epoch cell) at install via
+    /// [`Self::stamp_deopt_epoch_guard`]; `x64_deopt_entry` then reads it BEFORE
+    /// dereferencing the box, so a superseded compilation never follows a stale
+    /// (possibly-freed, under `CRATONVM_JIT_FREE_CODE=1`) box. The pointed-to
+    /// guard is leaked (process-lifetime), so this raw pointer is always valid.
+    pub deopt_epoch_guard: *const crate::deopt::DeoptEpochGuard,
 }
 
 unsafe impl Send for CompiledMethod {}
@@ -1168,6 +1178,20 @@ impl Drop for CompiledMethod {
             std::mem::forget(std::mem::take(&mut self._deopt_point_boxes));
             return;
         }
+        // deopt-osr Step 9 follow-up (a): retain the deopt-point boxes EVEN in
+        // free-mode, decoupling box lifetime from code lifetime. The boxes are
+        // baked by raw imm64 pointer into frame-deopt stubs; under
+        // `CRATONVM_JIT_FREE_CODE=1` the code is unmapped here, but a frame still
+        // executing this evicted artifact (or a concurrent invalidation) can
+        // reach `x64_deopt_entry`, which dereferences the box. Freeing the box
+        // would dangle that pointer. The boxes are tiny (one per deopt point), so
+        // leaking them is a negligible cost that removes the box use-after-free
+        // even in the A/B free-mode; the in-stub `DeoptEpochGuard` (also leaked,
+        // a raw pointer never owned here) lets the entry skip the deref entirely
+        // for a superseded artifact. The residual free-mode hazards (dangling
+        // direct CALLs into, and execution of, the now-unmapped code) are
+        // pre-existing and out of scope — see the module note above.
+        std::mem::forget(std::mem::take(&mut self._deopt_point_boxes));
         // FREE mode: purge any cached OSR trampolines that point into this
         // method's code range. After Drop, `self._buffer` releases its
         // executable mapping, so any stale `target_addr` in the global cache
@@ -1186,6 +1210,39 @@ impl Drop for CompiledMethod {
 }
 
 impl CompiledMethod {
+    /// deopt-osr Step 9 follow-up (a) — stamp this artifact's retained
+    /// [`crate::deopt::DeoptEpochGuard`] (baked into every frame-deopt stub) with
+    /// its creation epoch and a stable pointer to the method's live
+    /// compilation-epoch cell. Called once by the VM at install, under
+    /// `deopt_real_enabled()`. No-op when no guard was emitted (production
+    /// artifacts: `deopt_epoch_guard` is null) so it is gate-off byte-identical.
+    ///
+    /// After this, `x64_deopt_entry` can decide BEFORE dereferencing the deopt
+    /// box whether this artifact's speculation has been superseded (the live
+    /// epoch advanced past `creation_epoch`), routing a stale frame to the safe
+    /// re-run without touching the (possibly-freed) box.
+    ///
+    /// # Safety
+    /// `live_epoch_cell` must be null or a stable, process-lifetime `AtomicU64`
+    /// address (e.g. one handed out by `SharedVm::method_epochs`).
+    pub fn stamp_deopt_epoch_guard(
+        &self,
+        creation_epoch: u64,
+        live_epoch_cell: *const std::sync::atomic::AtomicU64,
+    ) {
+        if self.deopt_epoch_guard.is_null() {
+            return;
+        }
+        use std::sync::atomic::Ordering;
+        // SAFETY: a non-null `deopt_epoch_guard` is the leaked, retained guard
+        // baked by `emit_deopt_stubs` (valid for the process lifetime).
+        let guard = unsafe { &*self.deopt_epoch_guard };
+        guard.creation_epoch.store(creation_epoch, Ordering::Relaxed);
+        guard
+            .live_epoch_cell
+            .store(live_epoch_cell as *mut std::sync::atomic::AtomicU64, Ordering::Release);
+    }
+
     /// Create from a completed executable buffer (pure method, no context needed).
     ///
     /// Raw machine-code bytes of this compiled method (for diagnostics /
@@ -1241,6 +1298,7 @@ impl CompiledMethod {
             can_osr_exit: false,
             osr_exit_points: Vec::new(),
             compilation_epoch: 0,
+            deopt_epoch_guard: std::ptr::null(),
         }
     }
 
@@ -1293,6 +1351,7 @@ impl CompiledMethod {
             can_osr_exit: false,
             osr_exit_points: Vec::new(),
             compilation_epoch: 0,
+            deopt_epoch_guard: std::ptr::null(),
         }
     }
 
@@ -5559,6 +5618,15 @@ fn try_compile_inner(
         0
     };
 
+    // deopt-osr Step 9 follow-up (c): the per-bci de-spec key for this method
+    // (same `"<class>.<method>:<descriptor>"` form the deopt log / method_epochs
+    // use). Lets the optimizing backend skip a loop-header speculative-BCE guard
+    // recorded in the de-spec registry. Empty registry in production ⇒ no effect.
+    let despec_method_key = format!(
+        "{}.{}:{}",
+        cached.class_name, cached.method_name, cached.method_descriptor
+    );
+
     let mut compiled = x64::compile_with_param_slots(
         code,
         code_len,
@@ -5587,6 +5655,7 @@ fn try_compile_inner(
         param_slot_span,
         param_oop_mask,
         compact_field_info,
+        &despec_method_key,
     )?;
 
     compiled._jit_strings = owned_strings;
@@ -6381,6 +6450,38 @@ pub fn return_type(descriptor: &str) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// deopt-osr Step 9 follow-up (a): `stamp_deopt_epoch_guard` writes the
+    /// creation epoch + live-cell pointer into the artifact's retained guard, and
+    /// the resulting guard reports superseded once the live epoch advances past
+    /// the creation epoch. A null guard (production artifact) is a safe no-op.
+    #[test]
+    fn fua_stamp_deopt_epoch_guard_and_supersede() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let mut buf = ExecutableBuffer::new(64).unwrap();
+        buf.emit(&[0xC3]); // ret
+        let mut cm = CompiledMethod::new(buf);
+
+        // No guard emitted (production): stamping is a no-op and must not panic.
+        assert!(cm.deopt_epoch_guard.is_null());
+        cm.stamp_deopt_epoch_guard(5, std::ptr::null());
+
+        // Attach a retained guard (as `emit_deopt_stubs` would) and a stable live
+        // cell (as `method_epochs` would).
+        let guard: &'static crate::deopt::DeoptEpochGuard =
+            Box::leak(Box::new(crate::deopt::DeoptEpochGuard::new()));
+        cm.deopt_epoch_guard = guard as *const _;
+        let live: &'static AtomicU64 = Box::leak(Box::new(AtomicU64::new(3)));
+
+        // Install at the current live epoch (3) ⇒ fresh, not superseded.
+        cm.stamp_deopt_epoch_guard(3, live as *const _);
+        assert_eq!(guard.creation_epoch.load(Ordering::Relaxed), 3);
+        assert!(!guard.is_superseded());
+
+        // A later invalidation advances the live epoch past 3 ⇒ superseded.
+        live.store(4, Ordering::Relaxed);
+        assert!(guard.is_superseded());
+    }
 
     // ── wire-tiered-manager Step 3: per-call C1/C2 backend toggle ──────────
     //
