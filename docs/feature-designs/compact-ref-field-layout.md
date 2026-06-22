@@ -1,8 +1,11 @@
 # Compact reference-field layout (architectural lever #1)
 
-**Status:** in progress (branch `feat/compact-ref-fields`, worktree
-`CratonVM-movingyoung`). Gated **default-OFF** behind
-`CRATONVM_COMPACT_REF_FIELDS`; flag-off is byte-identical to dev.
+**Status:** implemented + validated (branch `feat/compact-ref-fields`, worktree
+`CratonVM-movingyoung`; NOT pushed). Gated **default-OFF** behind
+`CRATONVM_COMPACT_REF_FIELDS`; flag-off is byte-identical to dev. Correctness ==
+HotSpot (bt10–18, GC_STRESS, HashMap/ArrayList/inheritance mix). Footprint
+reduced (node 56 vs 72 B). Throughput **bt16 ~10 % faster, bt18 parity** with
+the compact-aware inline codegen. Default-on flip still needs the app gauntlet.
 
 **Goal:** shrink allocation-heavy object footprint by storing **reference
 instance fields as bare 8-byte pointers** instead of the 16-byte tagged `Value`
@@ -161,20 +164,42 @@ Build `cvmcref.exe` (unique name). Oracle harness (checksums == HotSpot):
 (object 56 B vs 72 B). bt18 runs **one fewer young GC** with compact on
 (`CRATONVM_SP_STATS`: 3 collections vs 4).
 
-**Throughput — currently slower, as expected:** bt18 min-of-3 = **48.1 s OFF
-vs 56.6 s ON (~18 % slower)**. Cause: the compact JIT path currently routes
-field access + allocation through the **helpers** (inline emission disabled
-under the flag), and each helper does a per-access layout lookup
-(`compact_field_slot` → `RwLock` read + `Arc` clone). bt is barely GC-bound at
-8 GB (evac≈0), so that per-op overhead dwarfs the one-GC footprint saving.
+**Throughput — net win (with the inline codegen below):**
 
-**→ Next lever (required to monetize the footprint win): compact-aware inline
-codegen.** Bake the per-field compact byte offset + ref-ness into `field_info`
-at resolve time (the offset is hierarchy-invariant under the prefix-sum layout,
-so the declaring class's layout suffices), then emit the inline 8-byte ref
-load/store + the compact-size inline TLAB directly — no helper call, no runtime
-lookup. That removes both overheads, after which the smaller objects should net
-faster (and increasingly so as heap pressure / GC fraction rises).
+| | bt16 | bt18 |
+|---|---|---|
+| OFF (min-of-5, interleaved) | 12014 ms | 48986 ms |
+| ON | 10880 ms | 49423 ms |
+| ON/OFF | **90 % (~10 % faster)** | **100 % (parity)** |
+
+Getting there required **compact-aware inline codegen** — without it the compact
+JIT path routed field access + allocation through the helpers (each doing a
+per-access `compact_field_slot` → `RwLock` + `Arc`-clone lookup), which made
+compact ~18 % *slower*. The implemented levers, all baking the per-field compact
+offset + ref-ness at JIT-compile time (the offset is hierarchy-invariant under
+the prefix-sum layout, so the declaring class's layout suffices):
+
+1. **Inline getfield** — 8-byte raw-pointer load for a reference field, 16-byte
+   cell payload at the packed offset for a primitive.
+2. **Inline reference putfield** — 8-byte pointer store on the same barrier-free
+   fast path as lever #2 (non-null young receiver, null old, in bounds), else
+   bail to the compact-aware `jit_putfield_object` helper.
+3. **Inline TLAB `new`** — bump-allocate the packed body size and write
+   `array_length`=body + `GC_FLAG_COMPACT` inline; `jit_post_tlab_init`
+   (non-skip path) sets the same.
+
+**Plumbing gotcha that masked the win:** the interpreter's *execute first-call*
+and *OSR-recompile* paths compile through the `x64::compile` wrapper, not
+`try_compile_inner` — so they initially passed an empty `compact_field_info` and
+bt's field ops silently fell back to helpers (inline `new` still engaged because
+`emit_inline_tlab_new` self-looks-up the layout). Fixed by staging
+`compact_field_info` through a thread-local the wrapper consumes. Confirm with
+`CRATONVM_DBG_COMPACT_INLINE=1` (one-shot compile trace per field op / `new`).
+
+**Next lever (optional, to push bt18 from parity to a win):** the GC mark/scan
+calls `compact_oop_scan` → `class_layout` (RwLock + Arc clone) once per scanned
+object; caching that per class within a collection (the live set is mostly one
+class) would shave bt18's larger-live-set scan.
 
 ## Gotcha: synthetic objects that store the wrong type into a reference slot
 

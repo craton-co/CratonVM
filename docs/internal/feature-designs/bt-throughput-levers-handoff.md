@@ -11,12 +11,12 @@ architectural. NOT pushed.
 > GC scan/remap, heap accessors, and JIT helpers all compact-aware). **Correct:**
 > bt10/14/16/18 + GC_STRESS + a HashMap/ArrayList/inheritance mix all ==
 > HotSpot. **Footprint:** TreeNode 56 B vs 72 B, one fewer young GC at bt18.
-> **Throughput:** currently ~18 % *slower* at bt18 because the compact JIT path
-> routes field access + alloc through the helpers (inline codegen disabled under
-> the flag) with a per-access layout lookup — bt is barely GC-bound so that
-> dwarfs the footprint saving. **Next lever to monetize it: compact-aware inline
-> codegen** (bake the per-field compact offset into `field_info` at resolve
-> time, emit inline 8-byte ref load/store + compact-size inline TLAB). See
+> **Throughput:** **net win** — bt16 ~10 % faster, bt18 parity (compact-aware
+> inline codegen: baked per-field offset → inline 8-byte ref load/store +
+> compact-size inline TLAB; the offset is hierarchy-invariant so the declaring
+> class's layout suffices). The win was initially masked because the
+> execute/OSR compile paths use the `x64::compile` wrapper and bypassed the
+> compact_field_info — fixed via a thread-local the wrapper consumes. See
 > [`compact-ref-field-layout.md`](../../feature-designs/compact-ref-field-layout.md).
 
 Context: the object-`binarytrees` (bt) throughput gap vs HotSpot. The
