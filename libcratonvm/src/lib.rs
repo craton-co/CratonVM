@@ -61,7 +61,9 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::Mutex;
 
 use cratonvm_vm::config::VmConfig;
-use cratonvm_vm::native::jni::{clear_jni_context, get_java_vm, get_jni_env, set_jni_context_arc};
+use cratonvm_vm::native::jni::{
+    clear_jni_context, get_java_vm, get_jni_env, set_jni_context_arc, set_process_vm,
+};
 use cratonvm_vm::vm::Vm;
 
 // ---------------------------------------------------------------------------
@@ -422,6 +424,12 @@ pub extern "C" fn JNI_CreateJavaVM(
         // Capture the Arc before moving `vm` into the parked wrapper.
         let shared = vm.shared.get_arc();
 
+        // Publish the process-global VM cell so a foreign host thread that later
+        // calls `AttachCurrentThread` (which only receives the opaque `JavaVM*`)
+        // can resolve the live `SharedVm` and register itself for GC-safepoint
+        // participation. See `foreign-thread-attach.md` / `jni::set_process_vm`.
+        set_process_vm(&shared);
+
         // Publish this thread's JNI context so the returned `JNIEnv*`'s
         // function-table calls (FindClass / GetStaticMethodID / CallStatic…)
         // resolve the live VM via TLS — reusing the exact mechanism native
@@ -759,9 +767,13 @@ pub extern "C" fn cratonvm_create(args: *const JavaVMInitArgs) -> *mut CratonVm 
         let config = unsafe { config_from_args(args) };
         let mut vm = Vm::new(config);
         bootstrap(&mut vm);
+        // Publish the process-global VM cell (parity with JNI_CreateJavaVM) so a
+        // foreign thread driving this VM via the JNIEnv table can attach.
+        let shared = vm.shared.get_arc();
+        set_process_vm(&shared);
         // Publish this thread's JNI context so JNIEnv-table calls on the
         // creating thread resolve this VM (parity with JNI_CreateJavaVM).
-        set_jni_context_arc(vm.shared.get_arc());
+        set_jni_context_arc(shared);
         Box::into_raw(Box::new(CratonVm { vm }))
     }));
     match result {

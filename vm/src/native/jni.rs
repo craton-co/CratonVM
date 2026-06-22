@@ -17,7 +17,7 @@ use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::ffi::CStr;
 use std::os::raw::c_char;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use crate::classloading::{find_field_recursive, find_method_recursive, ClassId};
 use crate::memory::heap::ArrayElementType;
@@ -300,6 +300,42 @@ pub fn set_jni_thread(thread: *mut JvmThread) {
 /// Clear the JNI thread pointer on native code return.
 pub fn clear_jni_thread() {
     JNI_THREAD.with(|c| c.set(std::ptr::null_mut()));
+}
+
+// ---------------------------------------------------------------------------
+// Process-global VM resolution (foreign-thread attach)
+// ---------------------------------------------------------------------------
+//
+// The JNI Invocation API hands `AttachCurrentThread` a `JavaVM*`, but our
+// `JavaVM` is an opaque `*const *const usize` — the invocation function table,
+// with no back-pointer to the live `SharedVm`. Until that is reachable, an
+// attaching foreign thread cannot register itself with the VM (no
+// `ThreadRegistry`, no GC-safepoint participation), which is the gap documented
+// in `docs/feature-designs/foreign-thread-attach.md`.
+//
+// There is exactly one VM per process (the `CREATED_VM` singleton in
+// `libcratonvm`, mirrored by the leaked `JNI_INVOKE_TABLE_PTR`), and the
+// `JavaVM*` we hand back is itself a process-global singleton — so "the
+// JavaVM*" and "the one VM" denote the same fact. We therefore publish the
+// `Arc<SharedVm>` as a process-global `Weak` cell at VM-create time and let the
+// attach path upgrade it. `Weak` (not `Arc`) is deliberate: the cell must not
+// keep the VM alive past the owner (`Vm` / `CREATED_VM`).
+static PROCESS_VM: parking_lot::Mutex<Option<Weak<SharedVm>>> = parking_lot::Mutex::new(None);
+
+/// Publish the process-global VM so foreign threads can resolve it from a
+/// `JavaVM*` in `AttachCurrentThread`. Called once by `JNI_CreateJavaVM`
+/// (and `cratonvm_create`) right after the JNI TLS context is set. Idempotent
+/// — a later create (e.g. a test that builds a second `Vm` in-process) replaces
+/// the cell; the previous `Weak` simply stops upgrading once its `Arc` is gone.
+pub fn set_process_vm(shared: &Arc<SharedVm>) {
+    *PROCESS_VM.lock() = Some(Arc::downgrade(shared));
+}
+
+/// Resolve the live process-global VM, if one was published and is still alive.
+/// Returns an owning `Arc` (keeps the VM alive for the duration of the caller's
+/// use) or `None` if no VM was created or it has been dropped.
+pub fn process_vm() -> Option<Arc<SharedVm>> {
+    PROCESS_VM.lock().as_ref().and_then(Weak::upgrade)
 }
 
 /// Take (read + clear) the pending JNI exception, if any.
@@ -5700,6 +5736,11 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
+    /// Serializes tests that mutate the process-global `PROCESS_VM` cell or the
+    /// foreign-attach TLS so they don't race each other under the parallel test
+    /// runner (the cell and the JNI invocation table are process-wide).
+    static PROCESS_VM_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
     #[test]
     fn global_refs_add_remove() {
         use crate::config::VmConfig;
@@ -5740,6 +5781,30 @@ mod tests {
     #[test]
     fn jobject_null_roundtrip() {
         assert!(jobject_to_obj(0).is_none());
+    }
+
+    #[test]
+    fn process_vm_publish_and_resolve() {
+        use crate::config::VmConfig;
+        use crate::vm::SharedVm;
+        let _guard = PROCESS_VM_TEST_LOCK.lock();
+        // Build a VM Arc and publish it as the process-global cell.
+        let shared = Arc::new(SharedVm::new(VmConfig::default()));
+        set_process_vm(&shared);
+        // The attach path can now resolve the live VM from "the JavaVM*".
+        let resolved = process_vm().expect("process_vm should resolve after publish");
+        assert!(
+            Arc::ptr_eq(&shared, &resolved),
+            "process_vm must return the same SharedVm that was published"
+        );
+        // Dropping every owning Arc lets the Weak cell go dangling: process_vm
+        // then reports no live VM rather than a use-after-free.
+        drop(resolved);
+        drop(shared);
+        assert!(
+            process_vm().is_none(),
+            "process_vm must return None once the VM has been dropped"
+        );
     }
 
     #[test]
