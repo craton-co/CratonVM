@@ -121,7 +121,13 @@ impl GcBarrier {
         let blocked_u32 = u32::try_from(blocked).unwrap_or(u32::MAX);
         inner.expected = alive_count.saturating_sub(1).saturating_sub(blocked_u32);
         inner.arrived = 0;
-        inner.pointer_map.clear();
+        // NOTE: do NOT clear `pointer_map` here. With generation-keyed waiting
+        // (see `arrive_and_wait_inner`), a thread that arrived for the previous
+        // generation may not read its remap map until after THIS `request_stw`
+        // runs; clearing it would hand that thread an empty map and strand its
+        // frame pointers at pre-GC (relocated) addresses. The map is overwritten
+        // wholesale by the matching `complete_gc`, so a stale map never leaks
+        // into the wrong generation.
         self.stw_requested.store(true, Ordering::Release);
         true
     }
@@ -191,10 +197,41 @@ impl GcBarrier {
     /// `check_post_block_gc`.
     pub fn mark_blocked_region_leave(&self) {
         let mut inner = self.inner.lock();
-        while self.stw_requested.load(Ordering::Acquire) {
-            self.gc_complete.wait(&mut inner);
-        }
+        Self::wait_out_pause_locked(
+            &self.stw_requested,
+            &self.gc_generation,
+            &self.gc_complete,
+            &mut inner,
+        );
         self.threads_blocked.fetch_sub(1, Ordering::AcqRel);
+    }
+
+    /// Wait out the CURRENTLY-active stop-the-world pause (if any), keyed on the
+    /// GC generation rather than the shared `stw_requested` flag.
+    ///
+    /// CRIT (multi-thread STW deadlock): a plain `while stw_requested` loop here
+    /// would stall a thread across DISTINCT pauses — when the pause it entered on
+    /// completes and a new one begins before it wakes, it observes `stw_requested`
+    /// set again and waits forever, even though its own pause is long over. (At
+    /// Churn shutdown this stranded the main thread in `BlockedGuard::drop` while
+    /// the last worker's `System.gc` initiator waited on a thread that never
+    /// arrived.) We instead capture the active pause's generation and return the
+    /// instant it advances. If no pause is active we return immediately (the
+    /// generation would otherwise never change → its own deadlock).
+    #[inline]
+    fn wait_out_pause_locked(
+        stw_requested: &AtomicBool,
+        gc_generation: &AtomicU64,
+        gc_complete: &Condvar,
+        inner: &mut parking_lot::MutexGuard<'_, GcBarrierInner>,
+    ) {
+        if !stw_requested.load(Ordering::Acquire) {
+            return;
+        }
+        let gen = gc_generation.load(Ordering::Acquire);
+        while gc_generation.load(Ordering::Acquire) == gen {
+            gc_complete.wait(inner);
+        }
     }
 
     /// Number of threads currently parked in a blocking native. Used by
@@ -270,6 +307,22 @@ impl GcBarrier {
         if !self.stw_requested.load(Ordering::Acquire) || inner.initiator == Some(tid) {
             return HashMap::new();
         }
+        // Capture the generation of the STW we are arriving for (under the lock,
+        // so `complete_gc` — which bumps the generation under the same lock —
+        // cannot race between this and the `stw_requested` check above). We wait
+        // until THIS generation completes, NOT until `stw_requested` clears.
+        //
+        // CRIT (multi-thread STW deadlock): `stw_requested` is a single shared
+        // flag reused across STW cycles. If a thread arrives for generation G,
+        // parks in the wait loop, and generation G completes AND a new
+        // generation G+1 starts before this thread wakes, a `while stw_requested`
+        // loop observes the flag set again (for G+1) and keeps waiting — yet this
+        // thread never `arrive`d for G+1, so G+1's initiator's `wait_for_all`
+        // blocks on it forever. Keying on the generation makes the thread return
+        // the instant ITS pause ends; it then re-arrives for G+1 at its next
+        // safepoint. (Reproduces with 6 threads each looping `System.gc()` —
+        // scratch_churn/Churn.java.)
+        let arrival_gen = self.gc_generation.load(Ordering::Acquire);
         // Signal arrival — but only for threads the initiator is actually
         // waiting for. An excluded (blocked) thread that wakes mid-STW must
         // not inflate `arrived`: it was never in `expected`, so counting it
@@ -281,8 +334,9 @@ impl GcBarrier {
                 self.all_arrived.notify_all();
             }
         }
-        // Wait for GC to complete
-        while self.stw_requested.load(Ordering::Acquire) {
+        // Wait until THIS pause completes (its generation is published by
+        // `complete_gc`), not merely until `stw_requested` clears — see above.
+        while self.gc_generation.load(Ordering::Acquire) == arrival_gen {
             self.gc_complete.wait(&mut inner);
         }
         inner.pointer_map.clone()
@@ -340,13 +394,18 @@ pub struct BlockedGuard<'a> {
 impl Drop for BlockedGuard<'_> {
     fn drop(&mut self) {
         // Checked leave — identical contract to `mark_blocked_region_leave`:
-        // wait out any active stop-the-world pause (we were excluded from
-        // its `expected`; arriving or running would both be wrong) before
-        // re-entering the mutator population.
+        // wait out the active stop-the-world pause we were excluded from
+        // (arriving or running would both be wrong) before re-entering the
+        // mutator population. Keyed on the GC generation, NOT `stw_requested`,
+        // so a back-to-back new pause cannot strand this thread forever — see
+        // `GcBarrier::wait_out_pause_locked`.
         let mut inner = self.barrier.inner.lock();
-        while self.barrier.stw_requested.load(Ordering::Acquire) {
-            self.barrier.gc_complete.wait(&mut inner);
-        }
+        GcBarrier::wait_out_pause_locked(
+            &self.barrier.stw_requested,
+            &self.barrier.gc_generation,
+            &self.barrier.gc_complete,
+            &mut inner,
+        );
         self.barrier.threads_blocked.fetch_sub(1, Ordering::AcqRel);
     }
 }

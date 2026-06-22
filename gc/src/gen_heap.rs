@@ -3441,7 +3441,20 @@ impl GenerationalHeap {
             self.force_promote_all.store(true, Ordering::Relaxed);
         }
 
-        if freed_percent < GC_EXPANSION_THRESHOLD_PERCENT {
+        // Only expand when the young arena was actually under pressure at GC
+        // start. Without this gate, a FORCED or early collection — e.g.
+        // `System.gc()` fired when young holds only a few KB — computes
+        // `freed_percent` against a tiny live set, reads it as "low reclamation",
+        // and doubles the arena. Repeated across frequent forced GCs the young
+        // balloons to `max_young_semi_size` (multi-GB) even though gigabytes are
+        // free; growing + zeroing that arena under a stop-the-world is the
+        // multi-thread GC "hang"/OOM (6 threads each looping `System.gc()` —
+        // scratch_churn/Churn.java). Mirrors the `high_survival` occupancy guard
+        // above (same `from_cap_before / 2` threshold): a young collected at its
+        // `YOUNG_GC_THRESHOLD_PERCENT` (50%) natural-GC trigger still expands
+        // (`bytes_before >= cap/2` holds), while a tiny forced/early GC
+        // (`System.gc` at well under 50% full) does not.
+        if freed_percent < GC_EXPANSION_THRESHOLD_PERCENT && bytes_before >= from_cap_before / 2 {
             let current_cap = young_to.capacity();
             let new_cap = (current_cap * 2).min(self.max_young_semi_size);
             if new_cap > current_cap {
