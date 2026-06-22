@@ -12,18 +12,39 @@ Twelve tests across the Spring annotation-introspection family fail under Craton
 
 ## Root cause вЂ” this cluster has FOUR distinct root causes
 
-### (A) Class-valued annotation attribute: no TypeNotPresentException, no classloader context  [HIGH]
-Class attributes are converted **eagerly** at proxy build time, not lazily on accessor invocation. `create_annotation_proxy` calls `annotation_element_to_java_typed` for every element up front (`native-builtins/src/lang_class.rs:7893-7898`). For a `Class<?>` value the `AnnotationElementValue::Class(desc)` arm (`lang_class.rs:8050-8094`):
-- resolves the class with `ctx.load_class(class_name)` (`:8064`), but `NativeContext::load_class(&mut self, name: &str)` (`native-api/src/registry.rs:213`) takes **no ClassLoader** вЂ” so it resolves the type name through the global/app loader, ignoring the annotation type's defining loader (the test's child `FilteringClassLoader`/`OverridingClassLoader`); and
-- on failure it `return Value::Object(None)` (`:8078`) вЂ” i.e. returns `null` instead of throwing `TypeNotPresentException` (cause `ClassNotFoundException`).
+### (A) Class-valued annotation attribute: no TypeNotPresentException, no classloader context  [✅ FIXED — branch `fix/custom-classloader-forname`]
+**Was:** `Class`-valued members were resolved through the global/app store
+(`ctx.load_class`, no ClassLoader), ignoring the declaring class's loader, and an
+unresolvable type returned `null` instead of throwing `TypeNotPresentException`.
+This depended on the custom-loader foundation
+(`docs/internal/fixed-suite-bugs/SC-custom-classloader-ignored.md`).
 
-`TypeNotPresentException` exists only as a registered constructor (`native-builtins/src/lib.rs:38322`) and is never thrown anywhere in the VM. Consequences:
-- `filteredTypeThrowsTypeNotPresentException` expects `value()` to throw `TypeNotPresentException`/cause `ClassNotFoundException`; CratonVM returns null (or the globally-resolved real class) в†’ fail.
-- `filteredTypeInAnnotationAttributeDoesNotThrowWhenCallingAsAnnotationAttributes` expects `getClass("value")` to throw `TypeNotPresentException` and `asAnnotationAttributes` to *store the exception as the attribute value* в†’ fail.
-- The two meta-annotation tests expect graceful null/false because the underlying `Class` type cannot be loaded *by the child loader*; CratonVM either silently resolves it globally (so it is "present") or returns null at the wrong layer в†’ fail.
-- `MergedAnnotationClassLoaderTests.synthesizedUsesCorrectClassLoader` asserts `getClassAttribute(metaAnnotation).getClassLoader() == child`; because the `Class` attribute (`@TestMetaAnnotation(classValue = TestReference.class)`) is resolved without the defining-loader context, the returned mirror's loader is not the child в†’ fail. (Note: plain `Class.getClassLoader()` for child-defined classes *is* correct via `defining_loader_for`, `lang_class.rs:10906`; the gap is specifically the annotation `Class`-attribute resolution path.)
+**Fix:** the Class-attribute resolution now threads the **declaring class's
+defining ClassLoader** (HotSpot's `AnnotationParser` "container") into
+`create_annotation_proxy` / `annotation_element_to_java_typed` (via
+`defining_loader_for(queried_class_id)` at the class/field/method annotation
+natives). The `Class` arm resolves through `loader.loadClass(name)`; a
+`ClassNotFoundException` is captured into a `TypeNotPresentException(type, cause)`
+stored as the member value (NOT thrown at build time), and
+`annotation_proxy_dispatch_impl` throws it when the member is **accessed** —
+mirroring HotSpot's deferred `TypeNotPresentExceptionProxy` (so `getAnnotations()`
+does not throw, `value()` does). Built-in/app loaders keep the global resolution.
 
-Correct fix shape: thread the annotation type's defining ClassLoader into the `Class`-attribute resolution, resolve **lazily** in `annotation_proxy_invoke`, and on `ClassNotFoundException` raise `TypeNotPresentException` (cause CNFE) rather than returning null.
+Validated against reference JDK (`vm/tests/annotation_loader_isolation.rs` +
+`tests/resources/annprobe/`): `value()` on a filtered Class member throws
+`TypeNotPresentException`/cause `ClassNotFoundException`; `getAnnotations()` does
+not throw; a resolvable member still returns its class; and a child-eligible Class
+member resolves through the child loader so `value().getClassLoader() == child`.
+Holds under `CRATONVM_GC_STRESS`.
+
+**Tests this resolves:** `filteredTypeThrowsTypeNotPresentException` and the
+loader-identity case of `MergedAnnotationClassLoaderTests.synthesizedUsesCorrectClassLoader`
+(both validated). The remaining (A) tests
+(`filteredTypeInAnnotationAttributeDoesNotThrowWhenCallingAsAnnotationAttributes`
+and the two meta-annotation `…HandlesException` cases) layer Spring's
+`MergedAnnotation.asAnnotationAttributes` / meta-annotation handling ON TOP of the
+now-correct `TypeNotPresentException`; expected to follow but not yet run against
+the full Spring suite here.
 
 ### (B) Lambda SAM dispatch swallows same-name/same-arity interface default methods  [HIGH]
 `AnnotationFilter` is a `@FunctionalInterface` whose abstract SAM is `boolean matches(String)`, with default methods `boolean matches(Class<?>)` and `boolean matches(Annotation)` that first convert to a type name. All three are named `matches` and the two defaults have **arity 1**, same as the SAM.
@@ -68,7 +89,7 @@ Fix. Bug B is a small, high-value, contained change at two cite points (add a de
 
 **Bug B — FIXED & on dev** (lambda SAM param-type dispatch, commit 00c71bb6 → merged): AnnotationFilterTests 11/11, AnnotationTypeMappingsTests 43/43, MergedAnnotationsRepeatableAnnotationTests 24/24.
 
-**Bug A — foundation UNBLOCKED:** the prior blocker (CratonVM ignored user `ClassLoader`s for `forName`/`loadClass`) is ✅ RESOLVED — see `docs/internal/fixed-suite-bugs/SC-custom-classloader-ignored.md`. User loaders now run their `loadClass(String,boolean)` override, `findLoadedClass` is loader-scoped, and a redefined class records the user loader as its defining loader. The defining-loader annotation `Class`-attr fix (`defining_loader_for(annType) → loader.loadClass` → CNFE → `TypeNotPresentException`) can now land on top: the annotation type's defining loader is the FilteringClassLoader, so the filter is seen.
+**Bug A — ✅ FIXED (see root cause (A) above):** the custom-loader foundation (`docs/internal/fixed-suite-bugs/SC-custom-classloader-ignored.md`) is RESOLVED, and the defining-loader-aware annotation `Class`-attribute fix landed on top — `Class` members resolve through the declaring class's loader and an unresolvable type yields a deferred `TypeNotPresentException` (cause `ClassNotFoundException`) thrown at member access. Validated end-to-end against reference JDK (`vm/tests/annotation_loader_isolation.rs`). `filteredTypeThrowsTypeNotPresentException` + the loader-identity of `synthesizedUsesCorrectClassLoader` resolved; the Spring `asAnnotationAttributes`/meta-annotation layers expected to follow.
 
 **Bug C — root cause was wrong:** `getModifiers`/`isMemberClass`/`getEnclosingClass` are all CORRECT on CratonVM (probe matches HotSpot). The 2 AnnotationsScannerTests failures are in Spring's scan *traversal*, not reflection.
 
