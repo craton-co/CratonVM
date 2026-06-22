@@ -54,6 +54,10 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     // collector then excludes them from the pin set. No-op unless precise
     // relocation is engaged (the set stays empty on the default path).
     cratonvm_gc::gc_quiescence::clear_movable_jit_roots();
+    // G1 pin-in-place: reset the conservative-JIT-root pin set too, so it
+    // reflects only THIS collection's stack (republished by the JIT-frame scan
+    // below, under G1). See that scan site and `G1Collector::young_collection`.
+    cratonvm_gc::gc_quiescence::clear_pinned_jit_roots();
 
     // 1. Thread frames — scan locals and operand stacks (SoA layout).
     //
@@ -282,7 +286,25 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     //     `invalidate_scan_cache_for_gc`). Discard the cached snapshot first so
     //     this scan is a full, current walk.
     crate::jit::conservative_roots::invalidate_scan_cache_for_gc();
+    let jit_scan_start = roots.len();
     crate::jit::conservative_roots::scan_active_jit_frames(&shared.heap, &mut roots);
+    // G1 pin-in-place for conservative JIT roots: the generational collector
+    // protects a conservatively-scanned JIT root (a register/spill slot the
+    // collector cannot rewrite) by running its NON-MOVING young sweep while any
+    // thread is in JIT, so nothing moves. G1 always evacuates, so it must
+    // instead PIN the regions holding these roots (exclude them from the
+    // collection set) — otherwise it relocates the object and the un-rewritable
+    // JIT-frame slot is left dangling (the SteadyChurn `-XX:+UseG1GC` + JIT
+    // wrong-result: the `live` list head, held only in a callee-saved register
+    // and its canonical frame slot, went stale after the young GC moved it).
+    // Publish each conservative JIT-frame root so the G1 collector can pin its
+    // region. Gated on G1 (the generational path doesn't read this set) and on
+    // there actually being JIT roots this cycle.
+    if shared.heap.is_g1() && roots.len() > jit_scan_start {
+        for r in &roots[jit_scan_start..] {
+            cratonvm_gc::gc_quiescence::add_pinned_jit_root(r.as_ptr() as usize);
+        }
+    }
 
     // 14b. Shadow-stack precise roots (CRATONVM_SHADOW_STACK). JIT code pushes
     //      every live oop (locals AND operand-stack entries) onto this thread's
