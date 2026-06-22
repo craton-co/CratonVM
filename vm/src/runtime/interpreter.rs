@@ -8042,6 +8042,44 @@ fn verify_reconstructed_frame(
     Ok(())
 }
 
+/// CRATONVM_DEOPT_VERIFY oop-plausibility layer (verifier increment 2). Every
+/// `Object(addr)` slot in the reconstructed frame — locals, operand stack, and
+/// recursively the already-real `Object` fields of scalar-replaced descriptors —
+/// must be null or a real heap address (`heap.is_heap_addr`: alignment + region
+/// containment, NO header deref, so it is safe on an arbitrary garbage word).
+/// This catches the most dangerous map drift the structural layer cannot: a
+/// non-oop value (a small int, a stale/wild pointer) landing in a slot the frame
+/// resumes as an object reference — a use-after-free on first dereference. A
+/// violation forces the safe re-run. Not pure (needs the heap); the env gate is
+/// consulted by the caller.
+fn verify_reconstructed_oops(
+    rframe: &cratonvm_jit::deopt::ReconstructedFrame,
+    shared: &SharedVm,
+) -> Result<(), String> {
+    use cratonvm_jit::deopt::FrameValue;
+    fn check(vals: &[FrameValue], shared: &SharedVm, region: &str) -> Result<(), String> {
+        for (i, v) in vals.iter().enumerate() {
+            match v {
+                FrameValue::Object(addr) if *addr != 0 => {
+                    if shared.heap.is_heap_addr(*addr as usize).is_none() {
+                        return Err(format!(
+                            "{region}[{i}] = Object(0x{addr:x}) is not a valid heap address"
+                        ));
+                    }
+                }
+                // Recurse into a scalar-replaced descriptor's already-real fields
+                // (nested VirtualObject / VirtualObjectRef carry no address yet).
+                FrameValue::VirtualObject(state) => check(&state.field_values, shared, "vfield")?,
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+    check(&rframe.locals, shared, "local")?;
+    check(&rframe.stack, shared, "stack")?;
+    Ok(())
+}
+
 /// real-frame-deopt Step 3 — build the interpreter `Frame` for an Object-bearing
 /// deopt, GC-rooting the reconstructed oops across the pool refill. Returns the
 /// built `Frame` (NOT pushed onto `thread.frames`) with the oops still pinned in
@@ -8079,9 +8117,9 @@ fn build_deopt_frame_inner(
     // re-run. Runs on the ORIGINAL frame (virtuals intact) so the descriptor
     // checks see them. Gate is read-once; default-off ⇒ skipped entirely.
     if cratonvm_jit::deopt_verify_enabled() {
-        if let Err(why) =
-            verify_reconstructed_frame(rframe, cached.max_locals, cached.max_stack)
-        {
+        let verdict = verify_reconstructed_frame(rframe, cached.max_locals, cached.max_stack)
+            .and_then(|()| verify_reconstructed_oops(rframe, shared));
+        if let Err(why) = verdict {
             eprintln!(
                 "[DEOPT-VERIFY] {} bci={}: reconstructed-frame invariant violated: {why} \
                  — forcing safe re-run",
@@ -8641,6 +8679,36 @@ mod deopt_step3_tests {
     fn verify_rejects_dangling_virtual_ref() {
         let rf = rframe(vec![FrameValue::VirtualObjectRef(9)], vec![], 0);
         assert!(verify_reconstructed_frame(&rf, 4, 8).is_err());
+    }
+
+    /// Oop layer: a real heap address (and null) passes; a non-heap word in an
+    /// Object slot — the UAF-causing drift — is rejected.
+    #[test]
+    fn verify_oops_accepts_real_rejects_bogus() {
+        let shared = Arc::new(SharedVm::new(VmConfig::default()));
+        let obj = shared.heap.alloc_object(cratonvm_types::ClassId::new(7), 0);
+        let addr = obj.as_ptr() as usize as u64;
+
+        // Real object + null pass.
+        let good = rframe(
+            vec![FrameValue::Object(addr), FrameValue::Object(0)],
+            vec![],
+            0,
+        );
+        assert!(verify_reconstructed_oops(&good, &shared).is_ok());
+
+        // A small/wild address that is not in the heap is rejected.
+        let bad = rframe(vec![FrameValue::Object(0x1234)], vec![], 0);
+        assert!(verify_reconstructed_oops(&bad, &shared).is_err());
+
+        // A bogus already-real field inside a scalar-replaced descriptor is also
+        // caught (recursion into vfields).
+        let bad_field = rframe(
+            vec![vobj(0, 5, vec![FrameValue::Object(0x1234)])],
+            vec![],
+            0,
+        );
+        assert!(verify_reconstructed_oops(&bad_field, &shared).is_err());
     }
 
     /// A3 GC-stress: a virtual frame built with a forced GC at the refill point —
