@@ -6,6 +6,84 @@
 which the A3 precise-oop-maps fix (`32649b56`, default-on) was verified. Precise maps **on or off make no
 difference**; this is *not* closed by the A3 fix.
 
+---
+
+## ⚠️ UPDATE 2026-06-22 (re-investigation) — several earlier conclusions are now CORRECTED
+
+Re-run on current dev (binary built from dev tip after the G1 mixed-GC merge `3d067512`; the JIT
+root path is unchanged by that merge). **The state has FLIPPED and two leading hypotheses are
+refuted.** Read this section before the older body below.
+
+1. **Generational CRASHES; G1 is CLEAN** (the doc/memory had it backwards). `VAAload 14`
+   `CRATONVM_DBG_GC_STRESS=4096`:
+   - **Generational (default): deterministic CRASH** — empty output, `inconsistent header`,
+     `set_field out-of-bounds dropped` (receiver = a zeroed `java/lang/Object`), then
+     `ArrayIndexOutOfBoundsException`. `RHard` (the `args`-free control) is **clean `3222190`** —
+     the `main`-reads-`args` discriminator still holds. Crashes at every stress ≤ 262144; **clean at
+     ≥ 524288** (boundary 262144↔524288, unchanged).
+   - **G1 (`-XX:+UseG1GC`): CLEAN `3222190`, zero guard warnings, every stress.** G1's
+     conservative-JIT-root **region pin** (`5d761809`, dev `f564b156`) excludes JIT-referenced
+     regions from the CSet, so G1 never relocates them → it *works around* this bug. **So A5 today
+     is a generational moving-young problem (the DEFAULT collector), not a G1-specific one.** Fixing
+     it would also let G1 drop the pin workaround (a throughput win).
+
+2. **It is NOT a relocation / moving-GC stale-pointer bug** (refutes this doc's old "leading
+   hypothesis" and the A2 "moved-but-not-remapped" story). Every collector path gives the **byte-
+   identical** failure: `CRATONVM_NO_SELECTIVE_PROMOTE=1`, `CRATONVM_DBG_FORCE_MOVING=1`,
+   `CRATONVM_SHADOW_STACK=1`, `CRATONVM_NO_PRECISE_JIT_MAPS=1` — all crash identically. If
+   relocation were the mechanism, disabling it (`NO_SELECTIVE_PROMOTE`, non-moving sweep) would
+   change the outcome. It does not. **The receiver is a *zeroed* header → a live young object that
+   was MARK-missed and FREED (swept), then its slot reused** — a missed *mark* root, not a missed
+   *remap*.
+
+3. **`CRATONVM_DBG_SWEEP_EDGES` stays silent** — no root / heap-field / dirty-card edge reaches the
+   freed object (confirming the gen_heap.rs:139-144 note). So at the freeing GC the object is
+   reachable from *nothing the marker scans*.
+
+4. **NEW — disassembly proves `node` IS spilled to the stack at every safepoint, yet is still
+   missed.** `CRATONVM_DBG_JIT_DISASM=VAAload.bottomUpTree`: `bottomUpTree`'s locals are
+   `L0=depth=r13`, **`L1=node=r12` (a callee-saved register)**. The canonical spill slot is
+   `[rbp-10h]` (`r12→[rbp-10h]` is re-emitted before *every* GC-capable call: the two recursive
+   calls at `0x18e`/`0x1fd` (`0x17f`,`0x1ee`) and after each, plus `[rbp-30h]`). At both `putfield`
+   safepoints (`0x1cb`,`...`) the receiver is reloaded from `[rbp-30h]` and `[rbp-10h]` still holds
+   `node`. **So `node` is present on the stack in `bottomUpTree`'s frame at every safepoint** — and
+   yet `FULLSTACK_SCAN=1` (scan the *entire* native stack) **does not recover it** (the
+   `inconsistent header` goes away but the `set_field`-into-zeroed-`Object` and the AIOOBE remain).
+   `CRATONVM_JIT_SAFEPOINT_REG_SPILL=all` and the dev-default callee-saved-operand-stack-oop spill
+   (`7c7d8148`, which only covers operand-stack temporaries, **not locals**) also do not fix it.
+
+### Corrected mechanism (the real paradox to crack)
+
+`node` is a live young object whose pointer **is on the stack** (`[rbp-10h]`/`[rbp-30h]` of every
+`bottomUpTree` frame) at every safepoint, yet the conservative marker **does not produce it as a
+root** (sweep-edges silent), so the sweep frees it. This is therefore **not** a spill-coverage
+problem (the value is spilled) and **not** a relocation problem (nothing moves). It is a
+**conservative-scan COVERAGE-or-ACCEPT gap**: at the corrupting GC, `scan_one_frame` either does
+not cover the stack band containing `bottomUpTree`'s `[rbp-10h]` slots, or `is_object_address`
+rejects the value. The `main`-reads-`args` trigger (which changes `main`'s register allocation /
+frame so the `JIT_ENTRY_CHAIN` entry + `[scanner_sp, entry_sp)` band differ) most plausibly shifts
+the scanned band off the ancestor `bottomUpTree` recursion frames. Note `JIT_ENTRY_CHAIN` is pushed
+**only at the interpreter→JIT boundary**, not on JIT→JIT recursion (`conservative_roots.rs`
+~1128), so the *single* chain entry's `[scanner_sp, entry_sp)` must cover the entire recursion — if
+that band is computed wrong when `main` is the compiled entry, the deep `node` spills fall outside.
+
+### Decisive next experiment (not yet run — needs one instrumented build)
+
+Instrument `sweep_young_non_moving`: when about to **zero an unmarked young object whose header is a
+valid `TreeNode`** (kind=Object, `num_slots=2`, matching class), scan the conservatively-scanned
+band(s) `[scanner_sp, entry_sp)` (and the full native stack) for any word equal to that object's
+address, and print: (a) whether the address appears on the stack at all, (b) within which scanned
+band, (c) whether `is_object_address` accepts it. This directly answers "is `node`'s spilled
+pointer inside the scanned range at the freeing GC?" — splitting *coverage gap* (address on stack
+but outside `[scanner_sp, entry_sp)`) from *accept gap* (`is_object_address` rejects it) from
+*genuinely-register-only* (address nowhere on stack). Pair with logging each GC's chain length +
+band bounds. Until then the older "register-only" framing below is **not** confirmed — the disasm
+shows the value IS spilled.
+
+---
+
+### (older body — superseded where it conflicts with the 2026-06-22 update above)
+
 ## TL;DR
 
 The **object** version of binarytrees (recursive `TreeNode{left,right}` allocation), run under
