@@ -218,7 +218,30 @@ Already in the tree: `DeoptReason::OsrExit` (`deopt.rs:52`), `CompiledMethod.can
 
 - **Every-boundary vs loop-headers-only exit maps** (`deopt-osr.md` ~476-479). Emitting an exit map at every canonical boundary maximizes deopt coverage but bloats metadata. Recommendation: loop-headers-first, widen with measurement.
 - **OSR-track vs moving GC** (`deopt-osr.md` ~480-485). An OSR'd frame's oops must be precisely relocatable for a moving collector. `CRATONVM_SHADOW_OSR_TRACK` currently regresses bt18 (conservative-pin × precise-move). Resolving that interaction may become a prerequisite for Step 8 under moving GC; a non-moving sweep sidesteps it.
-- **Cat-2 / FP needing `xmm[16]`** (`deopt-osr.md` ~468-472). `SavedRegisters` is `gpr[16]` only; long/double and FP-in-register slots resolve to `Unsupported` → re-run. A loop with a live `double` accumulator cannot OSR-exit until the snapshot is extended to `xmm[16]` plus a width source. Blocks neither Workstream A's integer/object case nor Step 7's emit-and-discard.
+- **Cat-2 / FP — P2 workstream (`xmm[16]` + width source).** `SavedRegisters` is
+  `gpr[16]` only and `frame_value_for_slot` has **no per-slot width source**. The
+  failure modes differ by type:
+  - A **`double`/`float`** local is XMM-resident → `frame_value_for_slot` →
+    `Unsupported` → the mapper bails → safe re-run. (Correct, just no resume.)
+  - A **`long`** local is GPR/spilled → recorded as `Register`/`StackSlot` →
+    `resolve_value` produces `Int(i64)` → the mapper TRUNCATES to `i32` — **silent
+    corruption** on resume, not a safe re-run.
+  - **P2.0 — DONE (2026-06-21, branch `feat/deopt-osr-cat2fp`).** Close the long
+    hole: `can_deopt_resume` now also requires `wide_local_high_halves(code).is_empty()`
+    (no long/double local), so a wide-local method takes the safe whole-method
+    re-run. `jit/src/x64.rs` finalize; gate-off byte-identical; 825 jit-lib tests
+    green. The BCE pilot (int loops) is unaffected.
+  - **P2.1 — long resume (OWED).** Thread the width source (`wide_local_high_halves`
+    + `xmm_for_local` to split long-vs-double) into `frame_value_for_slot`; emit a
+    new `FrameValue::RegisterLong(r)` (resolves to `Long(gpr[r])`) / existing
+    `StackSlotLong` for long slots; extend the Object-bearing resume mapper
+    (`ir_deopt_frame_values_with_objects`) to map `Long` WITH the cat-2 locals
+    upper-half collapse (as `ir_deopt_locals` already does); then drop the
+    `wide_local` exclusion for long-only methods. No XMM needed.
+  - **P2.2 — FP resume (OWED).** Extend `SavedRegisters` to `xmm[16]`, spill XMM in
+    the deopt stub (`emit_deopt_stubs`), add `RegisterFloat`/`RegisterDouble`
+    resolving from `xmm[r]`, map `Float`/`Double`; then a live `double` accumulator
+    can resume / OSR-exit. The heaviest slice (hot-stub codegen).
 - **Elided monitors on a scalar-replaced object** — see Workstream A caveat: gated off (`can_deopt_resume = false`) when `scalar_replaced` is non-empty or the method is `ACC_SYNCHRONIZED`; monitor re-entry at resume is a later refinement.
 - **Epoch / MakeNotEntrant invalidation of baked deopt-point pointers** — boxed `DeoptimizationPoint` pointers are baked into the stub as arg0 (`deopt_boxes`, `x64.rs:6184`). After recompilation/invalidation these must be versioned by `compilation_epoch` and checked before dereference (Step 9), or a stale box could be followed into freed memory.
 
