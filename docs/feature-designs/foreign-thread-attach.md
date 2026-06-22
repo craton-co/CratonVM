@@ -1,9 +1,15 @@
 # Foreign-thread attach with safepoint participation
 
-Status: design + scaffold plan. Nothing in this doc is implemented yet beyond
-the parts called out as **already done**. Goal: make a foreign (non-VM-created)
-OS thread a first-class, GC-safe Java thread so `libcratonvm` is a credible
-`libjvm` drop-in for hosts that drive the VM from their own threads.
+Status: **IMPLEMENTED (Steps 1–7, branch `feat/foreign-thread-attach`).** A
+foreign (non-VM-created) OS thread is now a first-class, GC-safe Java thread:
+`AttachCurrentThread` / `AttachCurrentThreadAsDaemon` register it, it participates
+in stop-the-world via the existing barrier (counted mutator while running a call,
+idle-blocked between calls), and `DetachCurrentThread` reclaims it. Real
+registration is the default; `CRATONVM_FOREIGN_ATTACH=0` is the opt-out. Goal:
+make `libcratonvm` a credible `libjvm` drop-in for hosts that drive the VM from
+their own threads. See the **Implementation status** note below §4 for what
+landed (and two discoveries: a latent `JNIEnv*` indirection bug in the old attach
+stub, and the idle-creating-thread caveat).
 
 Related docs: [`embedding-api.md`](embedding-api.md) (the `JNI_CreateJavaVM` /
 flat-C surface this builds on), and the precise/conservative-roots material
@@ -353,6 +359,50 @@ is validated; the gate flips on at the end (Step 7).
    Document in `embedding-api.md`.
 8. **(Deferred) Java `Thread` object** (§3.5) — `Thread.currentThread()`,
    naming, daemon flag, group, unpark reverse index.
+
+### Implementation status (landed, Steps 1–7)
+
+All seven steps landed on `feat/foreign-thread-attach`, structured as planned:
+
+- **Step 1** — `jni::PROCESS_VM` (`Weak<SharedVm>`) + `set_process_vm` /
+  `process_vm`, published by `JNI_CreateJavaVM` and `cratonvm_create`.
+- **Step 2** — `attach_foreign_thread(&SharedVm, daemon, name)` /
+  `detach_foreign_thread`, `FOREIGN_THREAD_BOX` + `FOREIGN_CALL_DEPTH` TLS.
+- **Steps 3–5** — `attach_current_thread_impl` (running-call path + idle blocked
+  region), `jni_detach_current_thread` teardown, and `ForeignCallGuard` (the
+  outermost-call idle↔running transition) wrapping the 3 call helpers +
+  `NewObjectA`. Gated `CRATONVM_FOREIGN_ATTACH`.
+- **Step 6** — opt-in concurrent-GC soak (`--cfg foreign_attach_soak`); green
+  JIT-on and `--nojit`.
+- **Step 7** — `AttachCurrentThreadAsDaemon` wired to `t[7]`; gate flipped
+  **default-on** (opt-out `=0`); docs.
+
+Two findings during implementation, beyond the plan:
+
+1. **Latent `JNIEnv*` indirection bug (fixed).** The historical
+   `AttachCurrentThread` stub wrote `JNI_TABLE_PTR.load()` (the table-array
+   pointer) into `*penv` — one level too shallow for a `JNIEnv`
+   (`*const *const usize`). `(*env)[slot]` then read a function's code bytes as a
+   slot pointer and jumped to garbage. Harmless only because nothing ever drove
+   the function table through the attach env (the creating thread uses
+   `get_jni_env`/the flat API). Fixed: attach now hands back `get_jni_env()`,
+   matching `GetEnv`. This was the first crash the soak surfaced.
+
+2. **Idle creating-thread caveat (§5 refinement).** A thread that parks *outside*
+   the VM (the creating/coordinator thread in a host `join()` or event loop)
+   while foreign threads drive GC is still counted in `request_stw`'s `expected`
+   but never reaches a Java safepoint → STW hang. Foreign *attached* threads
+   handle this via the idle-blocked model; the **creating** thread has no
+   automatic in-native hook yet, so the soak brackets its host-side wait in a
+   blocked region (`mark_blocked_region_enter`/`leave`). A clean host-facing
+   "this thread is now in native" primitive (or auto-blocking the creating thread
+   on return from `JNI_CreateJavaVM`, leaving it on the next VM call) is the
+   natural follow-up.
+
+Still deferred (unchanged): the Java `Thread` object (§3.5) so
+`Thread.currentThread()` works from attached code; a real `JavaVM*→SharedVm`
+back-pointer (§3.1 option b); and `DestroyJavaVM` waiting on attached non-daemon
+threads (§5).
 
 ---
 

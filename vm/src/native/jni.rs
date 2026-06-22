@@ -468,17 +468,17 @@ fn with_foreign_thread<R>(f: impl FnOnce(&mut JvmThread) -> R) -> Option<R> {
 
 /// Whether the foreign-thread attach path is enabled.
 ///
-/// Default **OFF** (the gate is flipped on in Step 7 of
-/// `foreign-thread-attach.md`): while off, `AttachCurrentThread` keeps its
-/// historical env-only behaviour (no thread registration), so every
-/// intermediate merge is a no-op for existing callers. Read once and cached —
-/// it is not a hot path (attach is rare), but `AttachCurrentThread` may be
-/// called many times.
+/// Default **ON** (Step 7 of `foreign-thread-attach.md`): a genuinely foreign
+/// thread that calls `AttachCurrentThread` is registered as a first-class
+/// GC-safe Java thread — the real `libjvm`-substitute behaviour. The opt-out
+/// `CRATONVM_FOREIGN_ATTACH=0` (or `false`) restores the historical env-only
+/// stub (no thread registration), matching the project rule that the real path
+/// is the default and the legacy/synthetic path is the safety net. Read on each
+/// attach (cold path; attach is rare).
 fn foreign_attach_enabled() -> bool {
-    // Default-OFF form (Step 1-6): only explicit opt-IN enables it.
-    matches!(
+    !matches!(
         std::env::var("CRATONVM_FOREIGN_ATTACH").as_deref(),
-        Ok("1") | Ok("true") | Ok("TRUE")
+        Ok("0") | Ok("false") | Ok("FALSE")
     )
 }
 
@@ -6077,7 +6077,7 @@ fn build_invoke_table() -> Box<[usize; JNI_INVOKE_FUNCTION_COUNT]> {
     t[4] = jni_attach_current_thread as *const () as usize;
     t[5] = jni_detach_current_thread as *const () as usize;
     t[6] = jni_get_env as *const () as usize;
-    t[7] = jni_attach_current_thread as *const () as usize; // AttachCurrentThreadAsDaemon
+    t[7] = jni_attach_current_thread_as_daemon as *const () as usize; // AttachCurrentThreadAsDaemon
     Box::new(t)
 }
 

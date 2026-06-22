@@ -2269,8 +2269,9 @@ mod tests {
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
         use std::sync::Arc as StdArc;
 
-        // The foreign-attach gate is default-OFF until step 7; turn it on for
-        // this test. (Read at attach time, so setting it before create is fine.)
+        // Foreign attach is default-ON (step 7); set it explicitly so the soak
+        // is deterministic regardless of any ambient `CRATONVM_FOREIGN_ATTACH=0`
+        // opt-out in the environment.
         std::env::set_var("CRATONVM_FOREIGN_ATTACH", "1");
         // Print a symbolized native backtrace on any access violation.
         cratonvm_vm::runtime::crash_handler::install_hardware_fault_handler();
