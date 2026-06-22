@@ -5319,6 +5319,25 @@ fn try_compile_inner(
                 continue;
             }
 
+            // Trivial-constructor elision (callee/IR tier, via try_compile): an
+            // elidable `invokespecial C.<init>()V` is emitted AS
+            // `java/lang/Object.<init>` so the single-pass `0xb7` codegen elision
+            // drops the per-object `jit_invoke_dispatch` — the same effect the
+            // VM-side execute/OSR resolution gets, here for callees compiled
+            // through this path. `cp_elidable_init_resolver` is the body-checking
+            // predicate (`resolve_jit_elidable_init` → `is_elidable_construction`);
+            // it resolves bootstrap/JDK targets via `find_class_by_name`, so
+            // app-loaded targets are not yet covered on this path (follow-up).
+            let class_name = if invoke_kind == 1
+                && method_name == "<init>"
+                && descriptor == "()V"
+                && cp_elidable_init_resolver.map_or(false, |r| r(cp_idx))
+            {
+                "java/lang/Object".to_string()
+            } else {
+                class_name
+            };
+
             let class_box: Box<str> = class_name.into_boxed_str();
             let method_box: Box<str> = method_name.into_boxed_str();
             let desc_box: Box<str> = descriptor.into_boxed_str();

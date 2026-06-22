@@ -18342,6 +18342,13 @@ fn try_osr(
             // Pending invokestatic callee compilations: (pc, class, method, desc, param_count)
             let mut pending_callee_compiles: Vec<(usize, String, String, String, usize)> =
                 Vec::new();
+            // Trivial-ctor elision (OSR tier) — same deferred mechanism as the
+            // `execute` first-call path: record `invokespecial …<init>()V` sites
+            // here, resolve their target via `load_class_concurrent` after the
+            // lock drops, and emit elidable ones as `Object.<init>` so codegen
+            // drops the per-object dispatch. See `execute` for the rationale.
+            let ctor_direct_call_off = crate::runtime::env_cache::ctor_direct_call_disabled();
+            let mut pending_ctor_sites: Vec<(usize, String, usize)> = Vec::new();
             if !scan.invoke_ops.is_empty() {
                 let cm_lock = shared.class_manager.read();
                 let class = cm_lock.get_class(class_id)?;
@@ -18398,6 +18405,12 @@ fn try_osr(
                             desc.to_string(),
                             param_count,
                         ));
+                        continue;
+                    }
+
+                    // Trivial constructor: defer for after-lock elidability resolution.
+                    if invoke_kind == 1 && mn == "<init>" && desc == "()V" && !ctor_direct_call_off {
+                        pending_ctor_sites.push((pc, target_class.to_string(), param_count));
                         continue;
                     }
 
@@ -18476,6 +18489,44 @@ fn try_osr(
                     owned_jit_invoke_infos2.push(info);
                     invoke_info.push((ipc, info_ptr));
                 }
+            }
+
+            // Resolve the deferred trivial-ctor sites (cm_lock released). Emit an
+            // elidable `C.<init>()V` AS `java/lang/Object.<init>` so the codegen
+            // elision drops the per-object dispatch; else the real dispatch info.
+            // (See the `execute` path for the soundness argument.)
+            for (pc, tclass, pcount) in pending_ctor_sites {
+                let elidable = shared
+                    .load_class_concurrent(&tclass)
+                    .ok()
+                    .map(|tid| {
+                        let cm2 = shared.class_manager.read();
+                        is_elidable_construction(&cm2, tid)
+                    })
+                    .unwrap_or(false);
+                let info_class: &str = if elidable { "java/lang/Object" } else { &tclass };
+                let class_box: Box<str> = info_class.to_string().into_boxed_str();
+                let method_box: Box<str> = "<init>".to_string().into_boxed_str();
+                let desc_box: Box<str> = "()V".to_string().into_boxed_str();
+                let class_ref = &*class_box as *const str; // Cast: string slice to raw pointer for JIT lifetime
+                let method_ref = &*method_box as *const str; // Cast: string slice to raw pointer for JIT lifetime
+                let desc_ref = &*desc_box as *const str; // Cast: string slice to raw pointer for JIT lifetime
+                owned_jit_strings2.push(class_box);
+                owned_jit_strings2.push(method_box);
+                owned_jit_strings2.push(desc_box);
+                // SAFETY: refs point into the boxed strs just pushed to owned_jit_strings2,
+                // which outlives the JitInvokeInfo (same contract as the loop above).
+                let info = Box::new(crate::jit::JitInvokeInfo {
+                    class_name: unsafe { &*class_ref },
+                    method_name: unsafe { &*method_ref },
+                    descriptor: unsafe { &*desc_ref },
+                    num_jit_args: pcount + 1, // receiver + params
+                    return_type: b'V',
+                    invoke_kind: 1,
+                });
+                let info_ptr: *const _ = &*info;
+                owned_jit_invoke_infos2.push(info);
+                invoke_info.push((pc, info_ptr));
             }
 
             // Resolve ldc/ldc_w constants
