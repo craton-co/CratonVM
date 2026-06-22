@@ -131,6 +131,7 @@ fn stub_helpers() -> JitRuntimeHelpers {
         checkcast: s,
         instanceof_check: s,
         throw_aioobe: s,
+        throw_arithmetic: s,
         invoke_dispatch: s,
         invoke_virtual_mic: s,
         write_barrier: s,
@@ -147,6 +148,7 @@ fn stub_helpers() -> JitRuntimeHelpers {
         shadow_stack_offset_in_thread: 0,
         throw_exception: s,
         jit_npe_with_action: s,
+        dispatch_threw: s,
     }
 }
 

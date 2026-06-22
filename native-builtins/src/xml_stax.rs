@@ -1558,6 +1558,30 @@ pub fn register(registry: &mut NativeMethodRegistry) {
     );
     registry.register(
         "javax/xml/stream/XMLStreamReader",
+        "getAttributePrefix",
+        "(I)Ljava/lang/String;",
+        native_get_attribute_prefix,
+    );
+    registry.register(
+        "javax/xml/stream/XMLStreamReader",
+        "getTextCharacters",
+        "()[C",
+        native_get_text_characters,
+    );
+    registry.register(
+        "javax/xml/stream/XMLStreamReader",
+        "getTextStart",
+        "()I",
+        native_get_text_start,
+    );
+    registry.register(
+        "javax/xml/stream/XMLStreamReader",
+        "getTextLength",
+        "()I",
+        native_get_text_length,
+    );
+    registry.register(
+        "javax/xml/stream/XMLStreamReader",
         "getAttributeCount",
         "()I",
         native_get_attribute_count,
@@ -1892,15 +1916,23 @@ fn native_get_element_text(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
 fn native_get_qname(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = this_obj(args)?;
     require_state(ctx, this)?;
-    let (local, ns) = with_state(ctx, this, |s| match s.current() {
-        Some(e) => (e.local_name.clone(), e.namespace_uri.clone()),
-        None => (String::new(), String::new()),
+    let (local, ns, prefix) = with_state(ctx, this, |s| match s.current() {
+        Some(e) => (
+            e.local_name.clone(),
+            e.namespace_uri.clone(),
+            e.prefix.clone(),
+        ),
+        None => (String::new(), String::new(), String::new()),
     })
     .unwrap_or_default();
     let qname = crate::alloc_concurrent_synthetic(ctx, "javax/xml/namespace/QName", 3);
     let local_s = ctx.create_string(&local);
     let ns_s = ctx.create_string(&ns);
-    let prefix_s = ctx.create_string("");
+    // Carry the real element prefix (mirrors native_get_attr_qname): SAX qName
+    // construction (AbstractStaxXMLReader.toQualifiedName) needs prefix:localPart,
+    // so hardcoding "" dropped the prefix from StaxEventXMLReader/StaxStreamXMLReader
+    // output (StaxEventXMLReaderTests / StaxStreamXMLReaderTests namespace tests).
+    let prefix_s = ctx.create_string(&prefix);
     ctx.set_field_by_name(qname, "localPart", Value::Object(Some(local_s)));
     ctx.set_field_by_name(qname, "namespaceURI", Value::Object(Some(ns_s)));
     ctx.set_field_by_name(qname, "prefix", Value::Object(Some(prefix_s)));
@@ -1957,6 +1989,70 @@ fn native_get_attr_namespace(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     })
     .unwrap_or_default();
     Ok(Some(Value::Object(Some(ctx.create_string(&ns)))))
+}
+
+/// `XMLStreamReader.getAttributePrefix(int)` — prefix of the i-th attribute on the
+/// current START_ELEMENT ("" when unprefixed). Mirrors `native_get_attr_namespace`.
+/// Spring's `StaxStreamXMLReader.handleStartElement` calls it for prefixed
+/// attributes; without it the abstract interface method had no body
+/// (AbstractMethodError) — StaxStreamXMLReaderTests namespace tests.
+fn native_get_attribute_prefix(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = this_obj(args)?;
+    require_state(ctx, this)?;
+    let idx = args
+        .get(1)
+        .and_then(|v| match v {
+            Value::Int(n) => Some(*n as usize),
+            _ => None,
+        })
+        .unwrap_or(0);
+    let prefix = with_state(ctx, this, |s| match s.current() {
+        Some(e) if idx < e.attributes.len() => e.attributes[idx].prefix.clone(),
+        _ => String::new(),
+    })
+    .unwrap_or_default();
+    Ok(Some(Value::Object(Some(ctx.create_string(&prefix)))))
+}
+
+/// `XMLStreamReader.getTextCharacters()` — current CHARACTERS/CDATA/COMMENT payload
+/// as a fresh exact-length char[]. Spring's `StaxStreamXMLReader.handleCharacters`/
+/// `handleComment` use this (+ getTextStart/getTextLength) instead of getText();
+/// the interface method had no body (AbstractMethodError) before this.
+fn native_get_text_characters(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = this_obj(args)?;
+    require_state(ctx, this)?;
+    let text = with_state(ctx, this, |s| match s.current() {
+        Some(e) => e.text.clone(),
+        None => String::new(),
+    })
+    .unwrap_or_default();
+    let units: Vec<u16> = text.encode_utf16().collect();
+    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Char, units.len());
+    for (i, &ch) in units.iter().enumerate() {
+        ctx.set_array_element(arr, i, Value::Int(ch as i32));
+    }
+    Ok(Some(Value::Object(Some(arr))))
+}
+
+/// `XMLStreamReader.getTextStart()` — offset into the char[] from getTextCharacters().
+/// We return a fresh exact-length array, so the start is always 0.
+fn native_get_text_start(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = this_obj(args)?;
+    require_state(ctx, this)?;
+    Ok(Some(Value::Int(0)))
+}
+
+/// `XMLStreamReader.getTextLength()` — length (UTF-16 code units) of the current
+/// event's text payload (pairs with getTextCharacters/getTextStart).
+fn native_get_text_length(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = this_obj(args)?;
+    require_state(ctx, this)?;
+    let len = with_state(ctx, this, |s| match s.current() {
+        Some(e) => e.text.encode_utf16().count(),
+        None => 0,
+    })
+    .unwrap_or(0);
+    Ok(Some(Value::Int(len as i32)))
 }
 
 /// `XMLStreamReader.getNamespaceCount()` — number of `xmlns`/`xmlns:p`

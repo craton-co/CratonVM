@@ -3952,14 +3952,20 @@ pub(crate) fn format_arg(ctx: &mut dyn NativeContext, val: &Value, spec: char) -
             // String + wrappers and returned "null" for everything else, so e.g.
             // `String.format("%s", Color.GREEN)` printed "null".
             if spec == 's' {
-                if let Some(s) = ctx.read_string(*obj) {
-                    return s;
+                // String.valueOf(arg) == arg.toString(). Fast-path a *real* String
+                // (read its chars directly); every other object — boxed wrappers
+                // (incl. Boolean), enums, records, beans — goes through toString().
+                // The old code called read_string FIRST on any object, which
+                // mis-read a Boolean's value slot and yielded "1"/"0" instead of
+                // "true"/"false" (and likewise for other non-String objects whose
+                // slot-0 happens to read as text).
+                let is_string = ctx.class_id_by_name("java/lang/String")
+                    == Some(ctx.class_id_of_object(*obj));
+                if is_string {
+                    if let Some(s) = ctx.read_string(*obj) {
+                        return s;
+                    }
                 }
-                let inner = unbox_obj(ctx, *obj);
-                if !matches!(inner, Value::Object(_)) {
-                    return format_arg(ctx, &inner, spec);
-                }
-                // Non-wrapper object: dispatch to toString().
                 match ctx.invoke_virtual(*obj, "toString", "()Ljava/lang/String;", &[]) {
                     Ok(Some(Value::Object(Some(s)))) => {
                         return ctx.read_string(s).unwrap_or_else(|| "null".to_string());

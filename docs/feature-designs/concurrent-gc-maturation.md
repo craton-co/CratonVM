@@ -274,12 +274,27 @@ Author note: this doc is grounded in a read of `gc/src/{g1,g1_concurrent,zgc,zgc
     **`bintrees18`@8g=68332206** are byte-identical. So G1 itself does **not**
     lose / duplicate / corrupt objects under sustained young+mixed evacuation —
     the gpu-bench crash is a distinct memory-safety fault, not a tracing bug.
-  - **G1 heap inefficiency (not a correctness bug, but a real gap).** `bintrees16`
-    @1g and `bintrees18`@4g/@6g raise a *catchable* `OutOfMemoryError` under **G1**
-    at heaps where **Generational completes** (G1 region overhead/fragmentation
-    needs a larger `-Xmx` — `bintrees18` fits gen in 4g but needs ~8g on G1). NB
-    this is why the bogus first cut "passed" `bintrees18`@4g — that was gen; real
-    G1 cannot fit it in 4g.
+  - **G1 "heap inefficiency" was mostly a SILENT-CORRECTNESS bug — now ROOT-CAUSED
+    and FIXED** (merge `8bb638d9`, fix `ffb60014`). The original read ("not a
+    correctness bug, just region overhead — `bintrees18` needs ~8g on G1 vs 4g
+    gen") was WRONG. Root cause: serial `alloc_in_type_locked` chose evacuation
+    *destination* regions by type and reused a partially-filled Survivor (young GC)
+    / selected Old (mixed GC) region that was **itself in the collection set**, so
+    survivors were copied INTO a region Phase 5 then resets (frees) — **silent
+    live-object loss on every young GC after the first** (the first has no Survivor
+    regions yet, which masked it). So G1 only produced correct results at heaps big
+    enough to NEVER collect; the moment it GC'd it corrupted (hence the giant
+    `-Xmx`). Distinct from the JIT missed-root issue (A5, below): this reproduces
+    with `--nojit` and in the interpreter. Repro `scratch/g1par/DeepTree.java`: a
+    held 65535-node tree, `-XX:+UseG1GC --nojit -Xmx64m DeepTree 15 3000` returned
+    `got=1` (lost 65534 nodes), now `got=65535`; `binarytrees16 --nojit` was
+    silently wrong at every GC-triggering heap (14721206..14079350 vs 14985902),
+    now 14985902 down to 48m. **Fix** = thread the CSet into `evacuate_object` →
+    `alloc_in_type_locked` and skip CSet regions (the semi-space "never allocate
+    into from-space" invariant gen and the Step-9 parallel TLAB path already
+    honour). **Residual genuine footprint gap is now ~20%** (G1 completes
+    `binarytrees16` at 48m vs gen 40m), not the ~2x the corruption implied. (NB the
+    bogus first cut also "passed" `bintrees18`@4g because it was actually gen.)
   - **App-suite no-regression on real G1**: **h2-testall-fast** PASS==PASS.
     **hibernate-smoke** was RED on **both** collectors (non-GC: ByteBuddy
     `JavaDispatcher$DynamicClassLoader.proxy` `jsr/ret` verifier rejection) —
@@ -306,15 +321,110 @@ Author note: this doc is grounded in a read of `gc/src/{g1,g1_concurrent,zgc,zgc
   - Harness (untracked scratch in the worktree): `g1-step8-revalidate.sh` (now
     GUARDS collector selection up front), `g1-step8-benchparity.sh`,
     `g1-step8-appsuites.sh`.
-  - **Remaining for Step 8**: (1) root-cause + fix the `gpu-bench-cpu` G1 SIGSEGV
-    (blocker); (2) confirm GC-stress checksum parity on G1 at an adequate heap;
-    (3) address/quantify the G1 heap-efficiency gap; (4) the pause-logging
-    enhancement + p50/p99 + throughput; (5) the daemon boot/e2e comparison —
-    itself gated on 3 tracked **non-G1** upstream bugs that stop WildFly/ES/Kafka/
-    Spring Boot reaching *ready* even on Generational (non-TTY stdout SEGV/hang,
-    ARRAY-LEN-GUARD, GC-clinit; see `apps/TARGET_APPS.md`).
-- Steps 9 (parallel evacuation), 10 (default flip) — not started; gated on Step 8
-  (a clean gauntlet, starting with the gpu-bench-cpu SIGSEGV fix).
+  - **Remaining for Step 8**: (1) ✅ DONE — `gpu-bench-cpu` G1 SIGSEGV fixed;
+    (2) ✅ DONE — GC-stress checksum parity on G1 confirmed (now byte-identical
+    even at GC-triggering heaps after the evacuate-into-CSet fix `ffb60014`);
+    (3) ✅ ROOT-CAUSED + FIXED — the "heap-efficiency gap" was mostly the
+    evacuate-into-CSet silent-corruption bug (above); residual genuine footprint
+    overhead is ~20%; (4) the pause-logging enhancement + p50/p99 + throughput
+    (still owed); (5) the daemon boot/e2e comparison — itself gated on 3 tracked
+    **non-G1** upstream bugs that stop WildFly/ES/Kafka/Spring Boot reaching
+    *ready* even on Generational (non-TTY stdout SEGV/hang, ARRAY-LEN-GUARD,
+    GC-clinit; see `apps/TARGET_APPS.md`) **and on JIT known-issue A5** (G1+JIT
+    still corrupts at GC-triggering heaps — being fixed separately).
+- **Step 9 (parallel evacuation) — FOUNDATION + FULL MULTI-THREADED EVACUATOR DONE**
+  (foundation: branch `feat/g1-parallel-evac-foundation`; evacuator: branch
+  `feat/g1-parallel-evac`). The gpu-bench-cpu G1 SIGSEGV that gated the §3.4
+  "fast-after-correct" caveat is FIXED (dev `f8f357e1` + `85d16997`), so the
+  multi-threaded evacuator now lands — still **default-off**, opt-in via
+  `CRATONVM_G1_PARALLEL_EVAC=1`. The serial path is unchanged and remains the
+  default; the public `young_collection`/`mixed_collection` dispatch to new
+  `young_collection_parallel`/`mixed_collection_parallel` only when the flag is set.
+  - **Foundation (behaviour-identical, checksum-neutral, already on dev):**
+    `evacuate_object` returns `Option<(*mut u8, bool)>` where the bool is `fresh`
+    (true iff this call performed the copy). The `scan_and_evacuate_refs` ref-scan
+    sites gate their work_list push on `fresh` instead of a separate
+    `pointer_map.contains_key(...)` pre-check, removing the explicit evacuation
+    TOCTOU. `CRATONVM_G1_PARALLEL_EVAC` flag declared (read-once `OnceLock`,
+    default off).
+  - **The four-piece evacuator (now implemented, `gc/src/g1.rs`):**
+    1. **Atomic forwarding** — the dedup/race winner is decided by a CAS on each
+       from-space object's own `ObjectHeader::forwarding_ptr` (treated as an
+       `AtomicUsize` via `addr_of_mut!`). G1's serial young/mixed never uses the
+       from-space `forwarding_ptr` (it uses `pointer_map`) and every live object
+       starts a collection with a null `forwarding_ptr`, so the field is free to
+       repurpose as the per-object install slot. CAS winner copies (`fresh=true`);
+       a loser abandons its speculatively-copied destination (unreferenced
+       to-space garbage reclaimed next cycle) and adopts the winner's address.
+       Only worker-vs-worker races exist (mutators parked at the STW safepoint).
+    2. **Per-worker forward shards** — each worker records its winning `(old,new)`
+       pairs into a thread-local `Vec`, merged into `GcResult.pointer_map` after
+       the closure (consumed by the VM root remap, Phase-4 region remap, monitors
+       and the mark worklist exactly as the serial map). No concurrent map needed.
+    3. **Per-worker GC-TLAB allocation** — replaces the single big `regions.lock()`
+       for allocation. Workers claim whole Free regions from a shared pool via a
+       lock-free `fetch_add` index, then bump-allocate with a thread-local cursor
+       (single owner per region ⇒ no intra-region atomics); the cursor is written
+       back on retire.
+    4. **Shared work queue** — `Mutex<Vec<usize>>` of gray to-space addresses with
+       per-worker batches and an `outstanding` termination counter (children added
+       before the parent is subtracted, so it never transiently hits 0 while work
+       remains). The design's explicit "first cut" in place of work-stealing
+       deques (`crossbeam-deque` is available transitively if profiling later
+       shows the shared-lock contention matters).
+  - **Safety model.** The `regions.lock()` guard is held for the whole collection
+    (the concurrent marker, which takes the same lock per step, stays excluded).
+    The driver derives the regions' raw base once (`as_mut_ptr`) and does NOT
+    deref the guard again until after the `std::thread::scope` join; in between,
+    CSet (from-space) regions are only read + atomically CAS'd, and each to-space
+    region is `&mut`-accessed only by its unique claiming worker (`split_at_mut`
+    -style disjointness). Roots + RSet sources are seeded serially by the driver
+    (the bulk — the transitive closure — is the parallel part); the driver also
+    participates as one worker.
+  - **Validation.**
+    - **Unit (the copy-path correctness proof):** 9 new g1 tests call the parallel
+      methods directly (flag-independent) — basic, reference chain,
+      unreachable-freed, pointer-map root remap, **wide fan-out (2000 distinct
+      objects, no loss/dup, 8 workers)**, **diamond shared-children CAS dedup
+      (200 parents × 50 shared children evacuated exactly once under 8 workers)**,
+      promotion, mixed, and **serial-vs-1-worker-vs-8-worker byte-identical
+      equivalence** (objects_copied + reachable-value multiset). 725/725 gc tests
+      green (isolated/single-threaded; the `gen_heap` parallel-pollution failure
+      is pre-existing and reproduces with these tests skipped). Stress-run 8× with
+      zero flakiness.
+    - **Real binary (`cvg1par.exe`, verified G1 — no "(generational collector)"):**
+      a one-shot `g1: parallel evacuation ACTIVE (N workers)` log confirms the
+      gated path is genuinely taken. Completing workloads are byte-identical
+      across HotSpot / CV-serial / CV-parallel (`binarytrees18@8g`=68332206,
+      `binarytrees16@4g`=14985902). Under actual GC (`SteadyChurn`@256m) the
+      parallel evacuator engages (4 workers) and behaves **byte-for-byte
+      identically to serial** (same `freed=`, same outcome).
+  - **Pre-existing bug surfaced (NOT parallel-specific; blocks Step 10):** with the
+    JIT enabled, a long-lived local reference held across a hot loop is **missed by
+    GC root scanning**, so G1's *precise unconditional moving* young collection
+    frees the still-reachable graph (`copied=0`, whole heap freed) → corruption →
+    OOM. Confirmed a JIT root-scan miss, not a heap/footprint issue: the **same
+    workload completes correctly under `--nojit`** (`copied=4132`, prints the
+    HotSpot value) — so the live root IS findable and region recycling works — and
+    it reproduces identically with `CRATONVM_G1_PARALLEL_EVAC` OFF (serial G1) and
+    is **not** fixed by `CRATONVM_PRECISE_JIT_MAPS=1`. The missing root is
+    register-/OSR-frame-resident (same class as the register-only missed-JIT-root
+    history); the generational default hides it via its conservative non-moving
+    in-JIT sweep, which G1's precise move exposes. Fix is safepoint oop-spilling /
+    completing the JIT oop-maps — upstream of, and independent from, the parallel
+    evacuator. This is why this Step's real-binary differentials can't sustain many
+    GCs per run; the multi-GC copy-path coverage rests on the unit tests. **This is
+    tracked as known-issue A5** (`docs/known-issues/.../bintrees-object-main-args-
+    jit-frame-stale-root.md`), which localizes it further to the register allocator
+    coloring `main`'s `args` ref local onto a callee-saved register shared with int
+    locals — confirming it is a JIT root/regalloc bug, not a GC one.
+  - **Remaining:** the JIT-root fix above (a hard Step-10 prerequisite for G1 with
+    JIT on); then a longer soak driving many parallel GCs end-to-end; optional
+    work-stealing-deque upgrade if shared-queue contention is measured to matter.
+    Flipping the flag default-on (with a demonstrated large-heap throughput win) is
+    part of Step 10.
+- Step 10 (default flip) — not started; gated on a clean gauntlet (Step 8) +
+  pause/throughput within band + a sustained soak (§5).
 
 ---
 
@@ -553,11 +663,53 @@ This is where a concurrent collector earns trust. Concrete work:
 
 ### 3.4 Parallel evacuation (throughput, later phase)
 
-`gc_worker_threads` exists but evacuation is single-threaded. Parallelizing is **out of scope for
-initial selectability** but is the main throughput lever for large heaps. Prerequisite (documented
-in `g1.rs:1204-1224`): convert `pointer_map` to a concurrent map with `entry().or_insert_with`
-dedup, and shard the work_list per worker. Sequenced as a distinct phase (§4 step 7) so the
-collector is *correct and selectable* before it is *fast*.
+`gc_worker_threads` (default 4) exists but evacuation is single-threaded. Parallelizing is **out of
+scope for initial selectability** but is the main throughput lever for large heaps. Sequenced as a
+distinct phase so the collector is *correct and selectable* before it is *fast*, gated behind
+`CRATONVM_G1_PARALLEL_EVAC` (default off) and differential-validated before any default flip.
+
+**Sequencing caveat (hard):** parallel evacuation must NOT land — even gated — on a base with an
+open moving-GC memory-safety bug. The single-threaded evacuator must first be proven memory-safe
+across the gauntlet; the **gpu-bench-cpu G1 SIGSEGV** (Step 8 finding, `task_b53503fd`) is the
+current blocker.
+
+**Foundation already landed (Step 9, behaviour-identical):** `evacuate_object` now returns
+`(new_ptr, fresh)`, where `fresh` is the dedup signal — `true` iff this call performed the copy.
+The ref-scan sites (`scan_and_evacuate_refs`) take their work_list-push decision from `fresh`
+instead of a separate `pointer_map.contains_key(...)` pre-check, removing the explicit TOCTOU the
+old code documented. In the parallel evacuator `fresh` becomes the outcome of the atomic forwarding
+install (below) — the call sites don't change again. The `CRATONVM_G1_PARALLEL_EVAC` opt-out flag
+is declared (read-once `OnceLock`, default off) per §7.
+
+**The remaining parallel protocol (the follow-up), four pieces in dependency order:**
+
+1. **Atomic forwarding (the core).** Replace the `pointer_map.get`/`insert` dedup with a CAS on the
+   object header's `forwarding_ptr` (already a field): a worker reads `forwarding_ptr`; if non-null
+   the object is already evacuated (not fresh) — use it; else it allocates a destination, copies,
+   and `CAS(forwarding_ptr, null → new)`. CAS win = this worker owns the copy (`fresh = true`); CAS
+   loss = abandon the dest allocation and use the winner's pointer (`fresh = false`). The mark-word
+   transfer must re-read after the CAS. CSet objects live in from-space and are not mutated by
+   mutators during STW, so only worker-vs-worker races exist.
+2. **Concurrent `pointer_map`.** Still needed to remap roots / refs in non-CSet regions. Convert
+   `HashMap<usize,usize>` → a `DashMap` (add the dep) or per-worker shards merged at end-of-pause;
+   inserts become idempotent `entry().or_insert(new)` keyed by the winning forward.
+3. **Per-worker allocation.** Today `young/mixed_collection` hold `self.regions.lock()` for the
+   *entire* pause and bump-allocate via `alloc_in_type_locked`. N workers can't share that. Give
+   each worker a GC-TLAB: a short critical section to claim/retire a Survivor/Old region, then
+   lock-free bump within it (`cursor` → `AtomicUsize` at the claim/retire boundary). The single big
+   lock is replaced by claim/retire + per-worker bump.
+4. **Sharded / work-stealing work_list.** Replace the single `Vec<*mut u8>` with per-worker deques
+   + work-stealing (Chase-Lev, or a shared `Mutex<Vec>` with per-worker local batches as a first
+   cut). Termination = all deques empty + an atomic active-worker count at zero. The RSet-source
+   scan (`scan_source_region_for_cset_refs`) and `verify_no_dangling_into_cset` must also gate their
+   pushes on `fresh` (today they push unconditionally — fine single-threaded, redundant in
+   parallel).
+
+**Validation (§4 step 9 / §5):** differential — the deterministic benches (e.g. `bintrees18@8g`)
+under `CRATONVM_G1_PARALLEL_EVAC=1` must produce **byte-identical checksums** vs serial G1 vs
+HotSpot, across worker counts; plus a parallel-evac soak with no leak/corruption. Parallel evac
+stays **opt-in** until soak-clean; flipping it on (with a demonstrated large-heap throughput win) is
+part of Step 10.
 
 ---
 

@@ -871,6 +871,18 @@ pub fn deopt_verify_enabled() -> bool {
     *CACHE.get_or_init(|| std::env::var_os("CRATONVM_DEOPT_VERIFY").is_some())
 }
 
+/// deopt-osr Step 8 (test trigger): `CRATONVM_OSR_EXIT_TEST` (default-OFF,
+/// read-once). When ON *and* `deopt_real_enabled()`, the single-pass backend
+/// emits one synthetic unconditional OSR-exit branch at a loop header so a JIT'd
+/// loop bails to the interpreter at a loop bci and resumes the loop body — the
+/// deliberate "instrument a rare branch" trigger that exercises the OSR-exit
+/// resume end-to-end pending a real speculation trigger. OFF ⇒ no trigger
+/// emitted ⇒ byte-identical code (the production path).
+pub fn osr_exit_test_enabled() -> bool {
+    static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| std::env::var_os("CRATONVM_OSR_EXIT_TEST").is_some())
+}
+
 /// Record `[entry, entry+len)` → `name` for crash-time symbolization. No-op
 /// unless `CRATONVM_DBG_JIT_NAMES` is set.
 pub fn register_jit_method_name(entry: usize, len: usize, name: String) {
@@ -1056,12 +1068,22 @@ pub struct CompiledMethod {
     /// behaviour change until the resume path is wired
     /// (see `docs/feature-designs/deopt-osr.md`).
     pub can_deopt_resume: bool,
-    /// deopt-osr scaffolding — `true` only once the OSR-exit map emitter has
-    /// proven this (OSR-compiled) method can leave a running JIT/OSR frame
-    /// mid-loop at a loop bci with the loop's live state, rather than the
-    /// `i64::MIN` re-run (which is *wrong* for an OSR'd frame entered partway
-    /// through). `false` by default; no emitter populates it yet.
+    /// deopt-osr Step 7 — `true` once the OSR-exit map emitter has recorded at
+    /// least one loop-boundary exit map for this (OSR-compiled) method, i.e. it
+    /// can leave a running JIT/OSR frame mid-loop at a loop bci with the loop's
+    /// live state, rather than the `i64::MIN` re-run (which is *wrong* for an
+    /// OSR'd frame entered partway through). Set at finalize to
+    /// `!osr_exit_points.is_empty()`; only non-empty when `deopt_real_enabled()`
+    /// was on at compile, so `false` in production. Step 8 consults it (with the
+    /// `CRATONVM_DEOPT_REAL` gate) before routing a mid-loop bail.
     pub can_osr_exit: bool,
+    /// deopt-osr Step 7 — the loop-boundary bcis (OSR-vetted, outside every
+    /// LICM-hoisted body) for which an OSR-exit map was emitted into
+    /// `deopt_points` (tagged `DeoptReason::OsrExit`). Empty unless
+    /// `deopt_real_enabled()` was set at compile. Step 8 looks a trapping loop
+    /// bci up here to decide whether to OSR-exit (resume the loop body) vs
+    /// re-run.
+    pub osr_exit_points: Vec<usize>,
     /// deopt-osr scaffolding — monotonic compilation epoch for this artifact.
     /// When `MakeNotEntrant` invalidation lands, boxed `DeoptimizationPoint`
     /// pointers (baked into guard code) are versioned by this epoch so a
@@ -1170,6 +1192,7 @@ impl CompiledMethod {
             // emitter sets these yet (see docs/feature-designs/deopt-osr.md).
             can_deopt_resume: false,
             can_osr_exit: false,
+            osr_exit_points: Vec::new(),
             compilation_epoch: 0,
         }
     }
@@ -1220,6 +1243,7 @@ impl CompiledMethod {
             // emitter sets these yet (see docs/feature-designs/deopt-osr.md).
             can_deopt_resume: false,
             can_osr_exit: false,
+            osr_exit_points: Vec::new(),
             compilation_epoch: 0,
         }
     }
@@ -4102,7 +4126,7 @@ pub fn try_compile(
     // so the post-init helper call stays in place.
     cp_new_resolver: Option<&dyn Fn(u16) -> Option<(u32, usize, bool, bool)>>,
     cp_ldc_resolver: Option<&dyn Fn(u16) -> Option<i64>>,
-    cp_ldc2w_resolver: Option<&dyn Fn(u16) -> Option<i64>>,
+    cp_ldc2w_resolver: Option<&dyn Fn(u16) -> Option<(i64, bool)>>, // inc 35: (bits, is_double)
     profile: Option<&profile::MethodProfile>,
     helpers: &JitRuntimeHelpers,
     inline_resolver: Option<&dyn Fn(&str, &str, &str) -> Option<InlineSite>>,
@@ -4344,7 +4368,7 @@ fn try_compile_inner(
     // (class_id, num_fields, has_primitive_init, has_finalizer) — see `try_compile`.
     cp_new_resolver: Option<&dyn Fn(u16) -> Option<(u32, usize, bool, bool)>>,
     cp_ldc_resolver: Option<&dyn Fn(u16) -> Option<i64>>,
-    cp_ldc2w_resolver: Option<&dyn Fn(u16) -> Option<i64>>,
+    cp_ldc2w_resolver: Option<&dyn Fn(u16) -> Option<(i64, bool)>>, // inc 35: (bits, is_double)
     profile: Option<&profile::MethodProfile>,
     helpers: &JitRuntimeHelpers,
     inline_resolver: Option<&dyn Fn(&str, &str, &str) -> Option<InlineSite>>,
@@ -4529,29 +4553,41 @@ fn try_compile_inner(
                 // routes through the FP clause below (or bails to single-pass
                 // when the FP gate is off, exactly as it does today).
                 && !method_uses_fp(code, code_len, &cached.method_descriptor))
-            // inc 25: admit a long-using method when the long gate is on, as
-            // long as it is double/float-free AND int-div/rem-free. The latter
-            // keeps a `long` value off a deopt point (div emits a guard whose
-            // resume cannot yet reconstruct a `long` slot — a follow-up), so a
-            // long is only ever live in a leaf with no safepoint.
+            // inc 25/30(ldiv): admit a long-using method when the long gate is
+            // on, as long as it is double/float-free. (inc 25 also required
+            // int-div/rem-free, because a `long` live at a div guard's deopt
+            // could not be reconstructed; long deopt-resume now makes `long` a
+            // real `FrameValue` width — `StackSlotLong`/`Long` → `Value::Long`,
+            // the locals mapper collapsing the cat-2 two-slot snapshot — so a
+            // `long` may now be live at an `idiv`/`irem`/`ldiv`/`lrem` deopt.
+            // The precise resume reconstructs it; an unmappable frame falls back
+            // to the safe whole-method re-run.)
             || (ir_emit_long
-                && !method_uses_fp(code, code_len, &cached.method_descriptor)
-                && !method_has_int_div(code, code_len))
+                && !method_uses_fp(code, code_len, &cached.method_descriptor))
             // inc 30: admit a float/double-using method when the FP gate is on.
-            // Scope (mirrors the long track's first increment): FP is used only
-            // INTERNALLY — the signature must be FP-free (`!fp_in_descriptor`),
-            // because FP params/returns ride XMM registers the prologue/epilogue
-            // do not yet marshal (a follow-on, the "also unlocks double call
-            // args + returns" item). Excludes int-div (would strand an FP value
-            // at the div deopt — whose resume can't yet reconstruct an FP slot,
-            // same discipline as the long gate) and `ldc2_w` (the builder does
-            // not yet disambiguate long-vs-double constant bits; such a method
-            // bails — a follow-up).
+            // The VM uses the COMPACT all-GPR i64 ABI (`execute_jit_call` /
+            // `jit_invoke_dispatch` marshal each FP value as `to_bits() as i64`
+            // into an INTEGER arg register, NOT XMM), so NOTHING about FP
+            // params/returns/call-args needs XMM register marshalling:
+            //   - PARAMS (inc 34): an FP param arrives as bits in a GPR; the
+            //     prologue stores it to the param slot like any other param, and
+            //     `ir_param_types`/`set_param_types` already type it Float/Double
+            //     (the cat-2 two-slot layout for `D`, as for `J`), so a later
+            //     `dload`/`fload` reads the slot via `fp_load`. The whole gate is
+            //     now FP-signature-agnostic — `fp_in_body` identifies FP methods.
+            //   - RETURNS (inc 32/33): the FP result's bits ride RAX (interpreter
+            //     reads `result as u64`/`as u32` → `from_bits`).
+            //   - CALL-ARGS (inc 34): `static_call_shape` admits `D`/`F` args
+            //     (one GPR slot each); the marshaller stores the slot bits to the
+            //     staging region and `decode_dispatch_values` reads them back.
+            // Still excludes int-div (would strand an FP value at the div deopt —
+            // whose resume can't yet reconstruct an FP slot). inc 35 lifted the
+            // `ldc2_w` exclusion: the resolver now reports `is_double`, so the
+            // builder lowers a `double` constant to `dconst` (a `long` ldc2_w
+            // stays `lconst`) — double literals (`1.5`, `3.14`, …) no longer bail.
             || (ir_emit_fp
                 && fp_in_body(code, code_len)
-                && !fp_in_descriptor(&cached.method_descriptor)
-                && !method_has_int_div(code, code_len)
-                && scan.ldc2w_ops.is_empty()))
+                && !method_has_int_div(code, code_len)))
     {
         // Includes the implicit `this` slot for instance methods — see
         // `prologue_param_slots` above.
@@ -4576,12 +4612,14 @@ fn try_compile_inner(
         // unconditionally rather than only under the long gate.
         let ptypes = ir_param_types(&cached.method_descriptor, cached.is_static);
         builder.set_param_types(&ptypes);
-        if ir_emit_long {
-            // inc 26: resolve `ldc2_w` long constants (pc → i64) so the builder
-            // can lower them to `Op::Const(Long)`. A double constant is excluded
-            // upstream (its consuming double opcode trips `method_uses_double`),
-            // so every resolved value here is a long bit pattern. An unresolved
-            // `ldc2_w` is omitted → that opcode bails to single-pass.
+        if ir_emit_long || ir_emit_fp {
+            // inc 26 (long) / inc 35 (double): resolve `ldc2_w` constants to
+            // `(pc → (bits, is_double))` so the builder lowers a `long` to
+            // `Op::Const(Long)` (`lconst`) and a `double` to `Op::ConstF`
+            // (`dconst`). inc 35 lifts the inc-30 FP-gate `ldc2_w` exclusion now
+            // that the builder disambiguates by `is_double` (a `double` constant
+            // is admitted under `ir_emit_fp`). An unresolved `ldc2_w` is omitted →
+            // that opcode bails to single-pass.
             if !scan.ldc2w_ops.is_empty() {
                 if let Some(resolver) = cp_ldc2w_resolver {
                     let mut lm = std::collections::HashMap::with_capacity(scan.ldc2w_ops.len());
@@ -5006,12 +5044,14 @@ fn try_compile_inner(
         }
     }
 
-    // Resolve ldc2_w constants (long/double from CP)
+    // Resolve ldc2_w constants (long/double from CP). Single-pass types the
+    // value by the consuming opcode (lstore/dstore/…), so it ignores the inc-35
+    // `is_double` flag and keeps just the bits.
     let mut ldc2w_info: Vec<(usize, i64)> = Vec::new();
     if !scan.ldc2w_ops.is_empty() {
         let resolver = cp_ldc2w_resolver?;
         for &(pc, cp_idx) in &scan.ldc2w_ops {
-            let val = resolver(cp_idx)?;
+            let (val, _is_double) = resolver(cp_idx)?;
             ldc2w_info.push((pc, val));
         }
     }
@@ -5970,16 +6010,15 @@ pub fn static_call_shape(descriptor: &str) -> Option<(usize, u8)> {
                 num_args += 1;
                 i += 1;
             }
-            // inc 28: a `long` arg is one i64 slot in the compact JIT ABI (the
-            // IR builder treats a long as one operand-stack node and the
-            // marshaller stores it as one i64), so it counts as one arg — same as
-            // an int/ref. Only reachable under `ir_emit_long` (producing a long
-            // requires a category-2 opcode → `method_uses_category2`), so this is
-            // inert for the default int/ref path. `double`/`float` args (XMM) are
-            // still rejected; a `long`/`double`/`float` RETURN is still rejected
-            // below (a `Long.MIN_VALUE` result would collide with the `i64::MIN`
-            // deopt sentinel — deferred to the out-of-band-signal fix).
-            b'J' => {
+            // A `long`/`double`/`float` arg is ONE i64 slot in the compact JIT
+            // ABI — the VM marshals every value (incl. FP, as `to_bits() as i64`)
+            // into one INTEGER arg register, not XMM, so each counts as one arg
+            // exactly like an int/ref. `J` args: inc 28; `D`/`F` args: inc 34
+            // (the marshaller stores the slot bits to the staging region and
+            // `decode_dispatch_values` reads them back as `Double`/`Float`). Only
+            // reachable under `ir_emit_long`/`ir_emit_fp` (producing a cat-2/FP
+            // value needs such an opcode), so inert for the default int/ref path.
+            b'J' | b'D' | b'F' => {
                 num_args += 1;
                 i += 1;
             }
@@ -6007,14 +6046,35 @@ pub fn static_call_shape(descriptor: &str) -> Option<(usize, u8)> {
                     i += 1; // primitive array element type
                 }
             }
-            // long / float / double — category-2 / XMM, not handled.
+            // Any other byte is a malformed descriptor — bail.
             _ => return None,
         }
     }
     let ret = return_type(descriptor);
     match ret {
         b'I' | b'Z' | b'B' | b'C' | b'S' | b'V' | b'L' | b'[' => Some((num_args, ret)),
-        // J / D / F return — not handled.
+        // `J` (long) return: accepted post-inc-29. The result is one i64 slot in
+        // RAX (the compact JIT ABI); the IR builder types the `Op::Call` node as
+        // `IrType::Long`, and the call-site post-invoke check disambiguates a
+        // legitimate `Long.MIN_VALUE` return from the `i64::MIN` deopt sentinel
+        // via the out-of-band `dispatch_threw` peek. Only reachable under
+        // `ir_emit_long` (consuming a long result needs a category-2 opcode), so
+        // inert for the default int/ref path.
+        b'J' => Some((num_args, ret)),
+        // `D` (double) return: accepted (inc 32). The result rides RAX as a clean
+        // 64-bit bit pattern (the i64 return ABI); the IR builder types the
+        // `Op::Call` node `IrType::Double`, and the call-site post-invoke check
+        // disambiguates a real `-0.0`/other double whose bits == `i64::MIN` from
+        // the deopt sentinel via the out-of-band `dispatch_threw` peek (the check
+        // already matches `IrType::Double`). `D`/`F` *args* are still rejected
+        // (the arg loop above) — they ride XMM the marshaller does not yet emit.
+        b'D' => Some((num_args, ret)),
+        // `F` (float) return: accepted (inc 33). The 32-bit result rides the low
+        // 32 of RAX (the i64 return ABI); the IR builder types the `Op::Call`
+        // `IrType::Float` and the call-site `dispatch_threw` peek disambiguates a
+        // `+0.0f`-with-stale-upper-bits ↔ `i64::MIN` collision. `D`/`F` *args* are
+        // still rejected (the arg loop) — they ride XMM the marshaller lacks.
+        b'F' => Some((num_args, ret)),
         _ => None,
     }
 }

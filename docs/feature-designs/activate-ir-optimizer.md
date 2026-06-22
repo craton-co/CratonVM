@@ -5,15 +5,16 @@ live on the broad path; the φ/branch dam is fixed; `Op::Load`/`Store`/`New`/`Ca
 emission, escape→scalar-replacement, and a full **long (64-bit) value tier** are
 built and **default-ON** in production: `CRATONVM_JIT_IR_CALL` (invokestatic,
 inc 23), `CRATONVM_JIT_SCALAR_NEW` (inc 20), `CRATONVM_JIT_IR_LONG` (long
-arithmetic/constants/load-store/shifts/bitwise/compare/branches/call-args,
-inc 25–28) and `CRATONVM_JIT_IR_CALL_SPECIAL` (invokespecial, inc 24) all flipped
-on in **inc 29** (each with a `=0` opt-out). **Inc 30** opens the `double`/`float`
-XMM value tier (value arithmetic + constants + FP-local load/store + int/long⇄FP
-conversions) behind a new **`CRATONVM_JIT_IR_FP`** flag (default-OFF). See the
-per-increment sections below and
-**["Remaining roadmap (post-inc-29)"](#remaining-roadmap-post-inc-29)** for what is
-left (long/double call returns, `ldiv`/`lrem`, and the rest of the `double`/`float`
-XMM tier — FP compares/branches, arrays, params/returns/call-args). Original plan
+arithmetic/constants/load-store/shifts/bitwise/compare/branches/call-args/div-rem,
+inc 25–28 + `ldiv`/`lrem` with long deopt-resume) and `CRATONVM_JIT_IR_CALL_SPECIAL`
+(invokespecial, inc 24) all flipped on in **inc 29** (each with a `=0` opt-out).
+**Inc 30** opens the `double`/`float` XMM value tier (value arithmetic + constants
++ FP-local load/store + int/long⇄FP conversions) behind a new
+**`CRATONVM_JIT_IR_FP`** flag (default-OFF). See the per-increment sections below
+and **["Remaining roadmap (post-inc-29)"](#remaining-roadmap-post-inc-29)** for what
+is left (long/double call returns, and the rest of the `double`/`float` XMM tier —
+FP compares/branches, arrays, params/returns/call-args; `ldiv`/`lrem` is now done).
+Original plan
 text follows.
 
 The Sea-of-Nodes IR and its
@@ -1954,41 +1955,68 @@ calls), and `IR_LONG` carries 39 differential tests + a 5-agent adversarial
 review behind it; `=0` remains the opt-out if a suite ever regresses.
 
 **Still gated-OFF / deferred** (unchanged): long/double call *returns*
-(`i64::MIN`-sentinel task), `ldiv`/`lrem` (long deopt-resume), and the entire
-`double`/`float` half (XMM). `CRATONVM_JIT_IR_CALL` virtual/interface dispatch
-(the concurrent inc-26 track) has its own flag/soak.
+(`i64::MIN`-sentinel task) and the entire `double`/`float` half (XMM).
+(`ldiv`/`lrem` is now done — long deopt-resume landed; see roadmap item #2.)
+`CRATONVM_JIT_IR_CALL` virtual/interface dispatch (the concurrent inc-26 track)
+has its own flag/soak.
 
 ## Remaining roadmap (post-inc-29)
 
 The single consolidated to-do for whoever picks this up next. Increments 1–29
 are landed and (where flagged) default-ON. What remains, in dependency order:
 
-1. **`i64::MIN`-return / deopt-sentinel fix** *(unblocks long/double call returns;
-   own task)*. The JIT returns `i64::MIN` in RAX as the universal deopt/exception
-   sentinel (`x64.rs` epilogue + the `Op::Call` bail check; interpreter.rs post-JIT
-   dispatch does `CMP RAX, i64::MIN; JE`). A method that legitimately returns
-   `Long.MIN_VALUE` is misread as deoptimized → silently re-executed (side effects
-   can double). **Pre-existing in BOTH backends** (single-pass already compiles
-   long-returning methods), found by the inc-26 adversarial review. Fix: signal
-   deopt/exception **out-of-band** (a TLS flag the helper sets, checked *before*
-   inspecting RAX, like the pending-NPE/AIOOBE flags) for `J`/`D` returns. Spun
-   off as a background task (see commit history / `spawn_task`). Once fixed,
-   relax `static_call_shape` to accept `J`/`D` *returns* and the
-   `lreturn`/`dreturn` paths are fully safe.
+1. ✅ **`i64::MIN`-return / deopt-sentinel fix** *(unblocks `long` call returns)* —
+   **DONE** (branch `feat/ir-long-return-sentinel`). The JIT returns `i64::MIN`
+   in RAX as the universal deopt/exception sentinel, so a method legitimately
+   returning `Long.MIN_VALUE` was indistinguishable from a deopt. The
+   interpreter↔JIT boundary was already disambiguated by the inc-26 MEDIUM fix
+   (the out-of-band `JIT_DEOPT_PENDING` flag + `deopt_signaled` gate); this
+   increment closes the remaining **JIT→JIT `Op::Call` bail check** the same way:
+   - New `dispatch_threw` runtime helper (`jit-api` golden table slot 42 →
+     `vm/jit/helpers.rs::jit_dispatch_threw`): a **non-clearing peek** of every
+     out-of-band signal (pending exception / NPE / AIOOBE / `JIT_DEOPT_PENDING` /
+     a stashed IR-deopt frame via `deopt::has_last_deopt`).
+   - At a `J`/`D` call site BOTH backends now emit, only on the rare
+     `RAX == i64::MIN` branch, a `CALL dispatch_threw`: bail (propagate the
+     sentinel) iff it returns `1`, else keep the genuine `Long.MIN_VALUE`. The
+     int/ref/void path is the unchanged `CMP; JE` (byte-identical).
+     (`jit/src/ir_lower.rs` `Op::Call`; `jit/src/x64.rs`
+     `emit_post_invoke_exception_check(ret_type)`.)
+   - The IR builder types a `J` call result as `IrType::Long` (was `Int`), and
+     `static_call_shape` now accepts a `J` return.
+   - Validated: 3 differential tests (`ir_vs_singlepass_invokestatic_long_return*`)
+     + a `jit_dispatch_threw` peek unit test; E2E `Long.MIN_VALUE`-returning
+     callers `== HotSpot` on BOTH backends (IR-on and `CRATONVM_JIT_IR_CALL=0`).
+   - **Remaining gaps:** (a) `D`/`F` *returns* stay rejected by `static_call_shape`
+     until the XMM value tier (item 3) — the sentinel machinery already handles
+     them (`IrType::Double` is in the call-site check). (b) single-pass's
+     *self-recursive* call site passes `b'I'` (the method descriptor is not
+     threaded into the single-pass `Compiler`), so a self-recursive `long`/`double`
+     method that legitimately returns `Long.MIN_VALUE` retains the pre-existing
+     collision at that one site only — a rare corner (cross-method J/D calls, the
+     real unblock, go through the disambiguated dispatch/direct sites).
 
-2. **`ldiv`/`lrem`** *(blocked on long deopt-resume)*. The IR `Op::Div`/`Op::Rem`
-   div-by-zero guard **deopts** (`emit_div_zero_guard` → `emit_deopt_if_zero`),
-   unlike single-pass's direct-throw. A `long` live at that deopt needs frame
-   reconstruction, but (a) `frame_value_for` maps `Long` to
-   `FrameValue::Unsupported` (`ir_lower.rs`), and (b) the IR deopt entry isn't
-   wired into VM dispatch (no `ir_deopt_entry`/`take_last_deopt` caller — emit-and
-   -discard). So the inc-25 gate bails any long method with int `idiv`/`irem`
-   (`method_has_int_div`) and the builder never lowers `ldiv`/`lrem`. To unlock:
-   wire the IR deopt entry into VM dispatch **and** make long (and double) a
-   real `FrameValue` width on resume; then add the `ldiv`/`lrem` builder arms
-   (the lowerer's `Op::Div`/`Rem` are already 64-bit-aware) and drop the
-   `method_has_int_div` bail. (The inc-27 phi-typing fix already types long/double
-   phis correctly for that resume.)
+2. **`ldiv`/`lrem`** — ✅ **DONE**. The IR pipeline lowers `ldiv` (0x6d) /
+   `lrem` (0x71) and a `long` can be live at the div-by-zero deopt guard. Of the
+   two original sub-blockers, (b) "wire the IR deopt entry into VM dispatch" was
+   **already resolved** by the landed real-frame-deopt Steps 1–4
+   (`take_last_deopt()` is consumed on the `i64::MIN` return at both JIT-dispatch
+   sites); only (a) — make `long` a real `FrameValue` width on resume — remained.
+   The long-deopt-resume infrastructure (`FrameValue::Long` + `StackSlotLong`,
+   `frame_value_for`/`typed_stack_slot` mapping, the locals mapper collapsing the
+   cat-2 two-slot snapshot, `Long → Value::Long`) and the `ldiv`/`lrem` builder
+   arms landed alongside the inc-30 cat-2 work; the long-clause
+   `method_has_int_div` bail is now dropped (so a long method with *int* `idiv`/
+   `irem` is also admitted — the precise resume reconstructs the live `long`, or
+   an unmappable frame falls back to the safe re-run). Tests: `ir_vs_singlepass`
+   `…_long_ldiv`/`…_long_lrem` (full i64 + JVMS `MIN/-1` overflow), an
+   `ir_lower` deopt-resume test (`long` frame reconstructs as `FrameValue::Long`),
+   and a vm `long_locals_collapse_and_compact_stack` mapper test. Validated
+   gate-ON == HotSpot (incl. caught div-by-zero, `MIN/-1`) + bt10/14/16/18
+   unchanged. *Follow-up surfaced (separate bug):* the **single-pass** long-div
+   path SIGSEGVs on this workload (`--nojit` and the IR path both run clean) — a
+   pre-existing single-pass JIT bug, now masked on the default path because the IR
+   pipeline serves these methods; filed for separate fix.
 
 3. **`double`/`float` value tier (XMM)** *(the next major sub-project; **first
    increment landed — inc 30**)*. The whole second half of category-2. The XMM
@@ -1999,17 +2027,75 @@ are landed and (where flagged) default-ON. What remains, in dependency order:
    conversions** (`i2f`/`i2d`/`l2f`/`l2d`/`f2d`/`d2f` and the fixup-bearing
    `f2i`/`f2l`/`d2i`/`d2l`). `method_uses_fp` is the new admission gate (a
    bail→gate flip). What remains of the tier, in dependency order:
-   - **FP compares + branches** (`fcmpl`/`fcmpg`/`dcmpl`/`dcmpg` via `ucomiss`/
-     `ucomisd` → the 3-way `{-1,0,1}` result feeding `if<cond>`, with the NaN
-     "unordered" rule distinguishing `cmpl` vs `cmpg`).
+   - ✅ **FP compares + branches** — **DONE (inc 31)**. `fcmpl`/`fcmpg`/`dcmpl`/
+     `dcmpg` lower to a new `Op::FCmp { double, nan_greater }` (builder, ir.rs)
+     producing an int `{-1,0,1}` that feeds the existing `if<cond>`-against-0
+     (the `Op::LCmp` path). Codegen (`ir_lower.rs`) is branchless `ucomiss`/
+     `ucomisd` + `SETA`/`SETB` − `SUB`: since `ucomis` raises CF on BOTH "below"
+     AND "unordered", `cmpl` (`UCOMIS a,b`; `SETA−SETB`) yields NaN→−1 for free,
+     and `cmpg` swaps the operands (`UCOMIS b,a`) so NaN→+1 — the JVMS rule with
+     no extra branch. Validated: `ir_vs_singlepass` `…_fcmp_ordered`/
+     `…_dcmp_ordered`/`…_fcmp_nan`/`…_dcmp_nan` (ordered + NaN in either operand,
+     both variants; IR == single-pass == host) + E2E (all 5 relational operators
+     on float/double incl. NaN) `== HotSpot` under `CRATONVM_JIT_IR_FP=1`.
    - **FP array load/store** (`faload`/`daload`/`fastore`/`dastore`).
-   - **FP params/returns + call-args** — XMM prologue/epilogue marshalling + an
-     FP-aware VM→JIT call convention (FP args in XMM0-3/0-7, FP return in XMM0).
-     This **also unlocks `double`/`float` call args + returns** (extend
-     `static_call_shape` to accept `D`/`F` once XMM marshalling exists).
-   - **`frem`/`drem`** (`fmod`-style remainder helper — no single instruction).
+   - ✅ **FP params/returns + call-args — DONE (inc 32/33/34).** Key realization:
+     the VM uses the **compact all-GPR i64 ABI** — `execute_jit_call` /
+     `jit_invoke_dispatch` marshal every FP value as `to_bits() as i64` into an
+     INTEGER register, NOT XMM — so the doc's "FP args in XMM0-3/0-7" was wrong for
+     this VM and **no XMM register marshalling is needed anywhere** for the call
+     boundary. Returns landed in inc 32/33 (below); inc 34 finished params +
+     call-args:
+     - ✅ **FP params (inc 34).** Dropped the gate's `!fp_in_params` — the gate is
+       now FP-signature-agnostic (`fp_in_body` identifies FP methods). An FP param
+       arrives as bits in a GPR; the prologue stores it to the param slot like any
+       other param (`Op::Param` is a plain 64-bit copy from `(idx+1)*8`), and
+       `ir_param_types`/`set_param_types` already type it `Float`/`Double` (cat-2
+       two-slot layout for `D`, as for `J`), so a `dload`/`fload` reads the slot
+       via `fp_load`. Methods with FP SIGNATURES now take the IR path.
+     - ✅ **`D`/`F` call-args (inc 34).** `static_call_shape` admits `D`/`F` args
+       (one GPR slot each); the `Op::Call` marshaller stores the slot bits to the
+       staging region and `decode_dispatch_values` reads them back as
+       `Double`/`Float`.
+     - Validated: `ir_vs_singlepass` `…_double_param`/`…_float_param`/
+       `…_invokestatic_fp_args`; E2E (FpSig: FP-signature `hyp2`/`scalef`/`combine`
+       with FP params + FP call-args + FP call-returns) `== HotSpot`.
+     - ✅ **`double` returns — DONE (inc 32).** A `double` result rides RAX as a
+       clean 64-bit bit pattern (the i64 return ABI; the interpreter reads
+       `result as u64` → `f64::from_bits`), so NO XMM return marshalling is
+       needed: a new `dreturn` (0xaf) builder arm → `Op::Return`, whose existing
+       `load_to_rax` from the value's slot already returns the bits. The FP gate
+       splits `!fp_in_descriptor` into `!fp_in_params && !returns_float` (admits a
+       `D` return, keeps FP *params* and `float` returns off). `static_call_shape`
+       accepts a `D` *return* (the builder types the `Op::Call` `IrType::Double`);
+       the `-0.0`/`i64::MIN`-bits ↔ deopt-sentinel collision on a `D` call result
+       is handled by the item-1 `dispatch_threw` peek. Validated: `ir_vs_singlepass`
+       `…_double_return` + `…_invokestatic_double_return`; E2E (incl. a `-0.0`
+       call-return → `1.0/-0.0 = -Infinity`) `== HotSpot`.
+     - ✅ **`float` returns — DONE (inc 33).** A `float` result rides the LOW 32
+       of RAX; every consumer reads only the low 32 (interpreter `result as u32`
+       → `f32::from_bits`; downstream `MOVSS`), so the `load_to_rax`-from-slot
+       stale upper bits are harmless. The one hazard — a `+0.0f` whose stale upper
+       bits make RAX == `i64::MIN` on a `F` CALL result — is caught by the
+       call-site `dispatch_threw` peek (extended to `IrType::Float`/`b'F'` in both
+       backends; only `+0.0f` can collide since `i64::MIN` has low-63 = 0). The
+       gate dropped `!returns_float` (now just `!fp_in_params`); `freturn` (0xae)
+       joins `dreturn`; `static_call_shape` accepts a `F` return. Validated:
+       `ir_vs_singlepass` `…_float_return`/`…_invokestatic_float_return`/
+       `…_float_return_min_bits_collision`; E2E `== HotSpot`.
+   - ✅ **`double` `ldc2_w` constants — DONE (inc 35).** Lifted the FP-gate
+     `ldc2_w` exclusion: `cp_ldc2w_resolver` now returns `(bits, is_double)` (it
+     already read `ConstantPoolEntry::Long`/`Double` but had collapsed both to
+     `i64`), so the builder lowers a `double` constant to `dconst`
+     (`Op::ConstF`/`Double`) and a `long` to `lconst` — double literals (`1.5`,
+     `3.14`, …) no longer bail. Single-pass ignores the flag (types by the
+     consuming opcode). Validated: `ir_vs_singlepass` `…_double_ldc2w_constant`
+     (and `…_long_ldc2w_constant` for no long-path regression); E2E (DLit:
+     `a*1.5+0.25`, polynomial) `== HotSpot`.
+   - **`frem`/`drem`** (`fmod`-style remainder helper — no single instruction;
+     needs a new `JitRuntimeHelpers` table entry).
    - **FP-slot deopt resume** (let an FP value be live at a deopt — lifts the
-     inc-30 int-div and `ldc2_w` exclusions). `typed_stack_slot` already carries
+     remaining inc-30 int-div exclusion). `typed_stack_slot` already carries
      `FrameValue::Float` for a future FP-aware resume.
    Continue mirroring the long track's increment discipline, each slice gated
    behind `CRATONVM_JIT_IR_FP` + differential/probe soak.

@@ -17,6 +17,7 @@
 //! - **Humongous allocation:** Objects > region_size/2 span contiguous regions.
 
 use std::collections::HashMap;
+use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering};
 
 use parking_lot::Mutex;
@@ -37,6 +38,504 @@ use cratonvm_types::{ClassId, ObjectRef, Value};
 // ---------------------------------------------------------------------------
 // Configuration
 // ---------------------------------------------------------------------------
+
+/// Step 9 (parallel evacuation) opt-out flag, declared early per the design's
+/// §7 scaffolding convention: a recognized env knob, read **once** behind a
+/// `OnceLock`, defaulting to the SAFE single-threaded behaviour so a later step
+/// can flip the default without re-plumbing. `CRATONVM_G1_PARALLEL_EVAC=1` (or
+/// `true`) will opt INTO the multi-threaded evacuator once it is built; unset or
+/// any other value keeps evacuation single-threaded.
+///
+/// Nothing gates on it yet — the parallel work_list / CAS-forwarding machinery
+/// is a deliberate follow-up: the single-threaded evacuator must be memory-safe
+/// across the gauntlet first (cf. the open gpu-bench-cpu G1 SIGSEGV). The
+/// behaviour-identical groundwork that *does* land now is the `evacuate_object`
+/// freshness signal that removes the `pointer_map.contains_key` evacuation
+/// TOCTOU at the ref-scan sites.
+fn parallel_evac_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("CRATONVM_G1_PARALLEL_EVAC")
+            .ok()
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    })
+}
+
+// ===========================================================================
+// Step 9 — parallel STW evacuation (gated behind `CRATONVM_G1_PARALLEL_EVAC`)
+// ===========================================================================
+//
+// The serial evacuator threads `&mut Vec<G1Region>`, a `HashMap` forwarding
+// map, and a `Vec<*mut u8>` work list through one call chain under one big
+// `regions.lock()`. The parallel evacuator implements the four-piece protocol
+// from the design's §3.4:
+//
+//   1. Atomic forwarding — the dedup/race winner is decided by a CAS on the
+//      from-space object's own `ObjectHeader::forwarding_ptr` field (treated as
+//      an `AtomicUsize`), not a shared map lookup. G1's serial young/mixed path
+//      never uses the from-space header's `forwarding_ptr` (it uses the
+//      `pointer_map`), and every live object starts a collection with
+//      `forwarding_ptr == null`, so the field is free to repurpose as the
+//      per-object install slot. Only worker-vs-worker races exist (mutators are
+//      parked at the STW safepoint; CSet objects are not mutated).
+//   2. Per-worker forward shards — each worker records its winning
+//      `(old, new)` pairs into a thread-local `Vec`; they are merged into the
+//      `GcResult.pointer_map` after the closure (consumed by the VM's
+//      `update_all_roots`, by Phase-4 region remap, monitors and the mark
+//      worklist — exactly as the serial map).
+//   3. Per-worker GC-TLAB allocation — replaces the single big lock. Each
+//      worker claims whole Free regions from a shared pool via a lock-free
+//      `fetch_add` index, then bump-allocates within its claimed region with a
+//      thread-local cursor (single owner ⇒ no atomics needed inside a region);
+//      the final cursor is written back when the region is retired.
+//   4. Shared work queue — a `Mutex<Vec<usize>>` of gray (already-evacuated,
+//      not-yet-scanned) to-space addresses with per-worker local batches, and
+//      an `outstanding` counter for termination (children are added to the
+//      counter before the parent is subtracted, so it never transiently hits 0
+//      while work remains). This is the design's explicit "first cut" in place
+//      of work-stealing deques.
+//
+// SAFETY MODEL. The `regions.lock()` guard is held by the driver for the whole
+// collection (so the concurrent marker — which takes the same lock per step —
+// stays excluded). The driver derives the regions' raw base (`as_mut_ptr()`)
+// once and does NOT deref the guard again until after the parallel scope joins;
+// all region access in between goes through that raw base under a strict
+// disjointness discipline (the `split_at_mut`-style pattern):
+//   * CSet (from-space) regions are only ever READ (copy source) plus an atomic
+//     CAS on each object's `forwarding_ptr` — never `&mut`-aliased.
+//   * To-space regions are each claimed by exactly one worker (unique pool
+//     index) and `&mut`-accessed only by that owner.
+//   * `region_for_ptr` resolves via the immutable, never-mutated
+//     `region_lookup` table, not the regions Vec.
+// `std::thread::scope` join is the synchronisation point after which the driver
+// resumes normal guard access for Phases 4/5.
+
+/// Raw base pointer of the regions `Vec`, shared across evacuation workers.
+///
+/// `Send`/`Sync` is sound under the disjointness discipline documented above:
+/// workers only `&mut`-access regions they exclusively claimed and only read /
+/// atomically-CAS shared (CSet) regions.
+#[derive(Clone, Copy)]
+struct RegionsBase(*mut G1Region);
+// SAFETY: see the module-level SAFETY MODEL note — disjoint per-worker access.
+unsafe impl Send for RegionsBase {}
+unsafe impl Sync for RegionsBase {}
+
+/// A per-worker, per-destination-type thread-local allocation buffer.
+struct Tlab {
+    dest_type: RegionType,
+    /// Index of the currently-owned to-space region, if any.
+    region_idx: Option<usize>,
+    /// Base address of the owned region.
+    base: usize,
+    /// Length (bytes) of the owned region.
+    len: usize,
+    /// Local bump cursor (offset from `base`).
+    offset: usize,
+}
+
+impl Tlab {
+    fn new(dest_type: RegionType) -> Self {
+        Self {
+            dest_type,
+            region_idx: None,
+            base: 0,
+            len: 0,
+            offset: 0,
+        }
+    }
+}
+
+/// Each worker holds one Survivor TLAB (young survivors) and one Old TLAB
+/// (tenured promotions).
+struct TlabSet {
+    survivor: Tlab,
+    old: Tlab,
+}
+
+impl Default for TlabSet {
+    fn default() -> Self {
+        Self {
+            survivor: Tlab::new(RegionType::Survivor),
+            old: Tlab::new(RegionType::Old),
+        }
+    }
+}
+
+/// Immutable shared state handed to every evacuation worker (the driver and the
+/// spawned threads). Auto-`Sync` because every field is `Sync` (`RegionsBase`
+/// via the `unsafe impl` above).
+struct SharedEvac<'a> {
+    collector: &'a G1Collector,
+    regions_base: RegionsBase,
+    /// CSet membership (region indices being evacuated FROM).
+    cset: &'a std::collections::HashSet<usize>,
+    /// Free-region indices available for to-space TLAB claiming.
+    pool: &'a [usize],
+    /// Lock-free claim cursor into `pool`.
+    pool_next: &'a AtomicUsize,
+    /// Gray-object work queue (to-space addresses awaiting a ref scan).
+    queue: &'a Mutex<Vec<usize>>,
+    /// Termination counter: queued + in-progress items (see protocol note 4).
+    outstanding: &'a AtomicUsize,
+    /// Tenuring threshold copied from the collector config.
+    promotion_age: u8,
+}
+
+impl<'a> SharedEvac<'a> {
+    /// Claim/bump-allocate `size` bytes into `tlab`. Returns the destination
+    /// address, or `None` on free-region-pool exhaustion (the same loss
+    /// semantics the serial allocator has when it cannot find space).
+    ///
+    /// SAFETY: `regions_base` must be the live regions Vec base; the claimed
+    /// region index is unique to this worker (lock-free `fetch_add`), so the
+    /// `&mut G1Region` formed here never aliases another thread.
+    unsafe fn tlab_alloc(&self, tlab: &mut Tlab, size: usize) -> Option<usize> {
+        loop {
+            if tlab.region_idx.is_some() {
+                let aligned = (tlab.base + tlab.offset + 7) & !7;
+                let new_off = (aligned - tlab.base) + size;
+                if new_off <= tlab.len {
+                    tlab.offset = new_off;
+                    return Some(aligned);
+                }
+                // Current region is full — retire it (write back the cursor) and
+                // fall through to claim a fresh one.
+                self.retire_tlab(tlab);
+            }
+            let i = self.pool_next.fetch_add(1, Ordering::Relaxed);
+            if i >= self.pool.len() {
+                return None;
+            }
+            let idx = self.pool[i];
+            let region = &mut *self.regions_base.0.add(idx);
+            region.region_type = tlab.dest_type;
+            if tlab.dest_type == RegionType::Survivor {
+                region.age = 1;
+            }
+            // Freshly-Free regions are zero-filled (reset) with cursor 0.
+            tlab.region_idx = Some(idx);
+            tlab.base = region.data.addr();
+            tlab.len = region.data.len();
+            tlab.offset = 0;
+        }
+    }
+
+    /// Write a TLAB's final bump cursor back to its region and clear the TLAB.
+    unsafe fn retire_tlab(&self, tlab: &mut Tlab) {
+        if let Some(idx) = tlab.region_idx.take() {
+            let region = &mut *self.regions_base.0.add(idx);
+            region.cursor = tlab.offset;
+        }
+        tlab.base = 0;
+        tlab.len = 0;
+        tlab.offset = 0;
+    }
+
+    /// Retire both TLABs of a worker (called once the worker is done).
+    unsafe fn retire_all(&self, tlab: &mut TlabSet) {
+        self.retire_tlab(&mut tlab.survivor);
+        self.retire_tlab(&mut tlab.old);
+    }
+
+    /// Evacuate one CSet object: atomic header CAS-forwarding + TLAB copy.
+    /// Returns `Some((new_ptr, fresh))` where `fresh` is true iff THIS call
+    /// performed the copy (CAS winner), `None` on alloc failure / corrupt
+    /// header. The from-space object's `forwarding_ptr` is the single install
+    /// slot; on a CAS loss the speculatively-copied destination is abandoned
+    /// (becomes unreferenced to-space garbage reclaimed next cycle) and the
+    /// winner's pointer is returned so all references converge.
+    unsafe fn evacuate(
+        &self,
+        tlab: &mut TlabSet,
+        old_ptr: *mut u8,
+        forwards: &mut Vec<(usize, usize)>,
+        objs: &mut usize,
+        bytes: &mut usize,
+    ) -> Option<(*mut u8, bool)> {
+        let fwd_atomic = &*(std::ptr::addr_of_mut!(
+            (*(old_ptr as *mut ObjectHeader)).forwarding_ptr
+        ) as *const AtomicUsize);
+
+        // Fast path: already forwarded by some worker.
+        let existing = fwd_atomic.load(Ordering::Acquire);
+        if existing != 0 {
+            return Some((existing as *mut u8, false));
+        }
+
+        let obj_size = {
+            let header = &*(old_ptr as *const ObjectHeader);
+            object_total_size(header)
+        };
+        if obj_size < HEADER_SIZE {
+            tracing::warn!(
+                "g1::evacuate(parallel): refusing to evacuate object at {:p} — \
+                 implausible size {} (corrupt header)",
+                old_ptr,
+                obj_size
+            );
+            return None;
+        }
+
+        let promote = {
+            let header = &*(old_ptr as *const ObjectHeader);
+            header.gc_age >= self.promotion_age
+        };
+        let dest_tlab = if promote {
+            &mut tlab.old
+        } else {
+            &mut tlab.survivor
+        };
+        let new_addr = self.tlab_alloc(dest_tlab, obj_size)?;
+        let new_ptr = new_addr as *mut u8;
+
+        std::ptr::copy_nonoverlapping(old_ptr, new_ptr, obj_size);
+
+        // Atomic mark-word transfer (matches the serial T2-4 fix: the bulk
+        // memcpy is UB for the AtomicU64 mark word).
+        {
+            let old_h = old_ptr as *const ObjectHeader;
+            let new_h = new_ptr as *mut ObjectHeader;
+            let mark = (*old_h).mark_word.load(Ordering::Relaxed);
+            (*new_h).mark_word.store(mark, Ordering::Relaxed);
+        }
+
+        let new_header = &mut *(new_ptr as *mut ObjectHeader);
+        if !promote {
+            new_header.gc_age = new_header.gc_age.saturating_add(1);
+        }
+        // Clear the NEW copy's forwarding slot (the memcpy may have copied a
+        // racing non-null value from the old header).
+        new_header.forwarding_ptr = std::ptr::null_mut();
+
+        // Install the forward on the OLD (from-space) header. Winner copies; a
+        // loser abandons its `new_ptr` and adopts the winner's address.
+        match fwd_atomic.compare_exchange(
+            0,
+            new_addr,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => {
+                forwards.push((old_ptr as usize, new_addr));
+                *objs += 1;
+                *bytes += obj_size;
+                Some((new_ptr, true))
+            }
+            Err(winner) => Some((winner as *mut u8, false)),
+        }
+    }
+
+    /// Scan one already-evacuated (to-space) object's reference fields; evacuate
+    /// each CSet target, rewrite the slot, and collect freshly-evacuated targets
+    /// into `children`. Mirrors the serial `scan_and_evacuate_refs` slot
+    /// dispatch.
+    unsafe fn process_object(
+        &self,
+        tlab: &mut TlabSet,
+        obj_ptr: *mut u8,
+        forwards: &mut Vec<(usize, usize)>,
+        objs: &mut usize,
+        bytes: &mut usize,
+        children: &mut Vec<usize>,
+    ) {
+        let (kind, etype, alen, nslots) = {
+            let h = &*(obj_ptr as *const ObjectHeader);
+            (h.kind, h.element_type, h.array_length, h.num_slots)
+        };
+        if kind == ObjectKind::Array {
+            if etype == ArrayElementType::Reference {
+                for i in 0..alen as usize {
+                    let slot_ptr = obj_ptr.add(HEADER_SIZE + i * 8);
+                    let raw: u64 = std::ptr::read(slot_ptr as *const u64);
+                    if raw == 0 {
+                        continue;
+                    }
+                    let ref_ptr = raw as usize as *mut u8;
+                    if let Some(ridx) = self.collector.lookup_region_for_addr(ref_ptr as usize) {
+                        if self.cset.contains(&ridx) {
+                            if let Some((new_ptr, fresh)) =
+                                self.evacuate(tlab, ref_ptr, forwards, objs, bytes)
+                            {
+                                std::ptr::write(slot_ptr as *mut u64, new_ptr as u64);
+                                if fresh {
+                                    children.push(new_ptr as usize);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        } else {
+            for slot_idx in 0..nslots as usize {
+                let slot_ptr = obj_ptr.add(HEADER_SIZE + slot_idx * SLOT_SIZE);
+                let value = std::ptr::read(slot_ptr as *const Value);
+                if let Value::Object(Some(ref_obj)) = value {
+                    let ref_ptr = ref_obj.as_ptr();
+                    if let Some(ridx) = self.collector.lookup_region_for_addr(ref_ptr as usize) {
+                        if self.cset.contains(&ridx) {
+                            if let Some((new_ptr, fresh)) =
+                                self.evacuate(tlab, ref_ptr, forwards, objs, bytes)
+                            {
+                                let nv = Value::Object(Some(ObjectRef::from_raw(new_ptr)));
+                                std::ptr::write(slot_ptr as *mut Value, nv);
+                                if fresh {
+                                    children.push(new_ptr as usize);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Seed phase (driver/main thread, single-threaded): walk a non-CSet
+    /// remembered-set source region, evacuate every CSet-bound reference and
+    /// rewrite the slot in place, pushing freshly-evacuated targets onto the
+    /// shared work queue. Mirrors the serial `scan_source_region_for_cset_refs`.
+    unsafe fn seed_source_region(
+        &self,
+        source_idx: usize,
+        tlab: &mut TlabSet,
+        forwards: &mut Vec<(usize, usize)>,
+        objs: &mut usize,
+        bytes: &mut usize,
+    ) {
+        if self.cset.contains(&source_idx) {
+            return;
+        }
+        let (cursor, base) = {
+            let r = &*self.regions_base.0.add(source_idx);
+            if r.region_type == RegionType::Free {
+                return;
+            }
+            (r.cursor, r.data.addr() as *mut u8)
+        };
+
+        let mut newly: Vec<usize> = Vec::new();
+        let mut offset = 0usize;
+        while offset < cursor {
+            let obj_ptr = base.add(offset);
+            let (kind, etype, alen, nslots, is_filler, obj_size) = {
+                let header = &*(obj_ptr as *const ObjectHeader);
+                let is_filler = is_humongous_filler(header);
+                let sz = if is_filler { 0 } else { object_total_size(header) };
+                (
+                    header.kind,
+                    header.element_type,
+                    header.array_length,
+                    header.num_slots,
+                    is_filler,
+                    sz,
+                )
+            };
+            if is_filler {
+                break;
+            }
+            if obj_size < HEADER_SIZE || offset + obj_size > cursor {
+                break;
+            }
+
+            if kind == ObjectKind::Array {
+                if etype == ArrayElementType::Reference {
+                    for i in 0..alen as usize {
+                        let slot_ptr = obj_ptr.add(HEADER_SIZE + i * 8);
+                        let raw: u64 = std::ptr::read(slot_ptr as *const u64);
+                        if raw == 0 {
+                            continue;
+                        }
+                        let ref_ptr = raw as usize as *mut u8;
+                        if let Some(ridx) = self.collector.lookup_region_for_addr(ref_ptr as usize) {
+                            if self.cset.contains(&ridx) {
+                                if let Some((new_ptr, fresh)) =
+                                    self.evacuate(tlab, ref_ptr, forwards, objs, bytes)
+                                {
+                                    std::ptr::write(slot_ptr as *mut u64, new_ptr as u64);
+                                    if fresh {
+                                        newly.push(new_ptr as usize);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            } else {
+                for slot_idx in 0..nslots as usize {
+                    let slot_ptr = obj_ptr.add(HEADER_SIZE + slot_idx * SLOT_SIZE);
+                    let value = std::ptr::read(slot_ptr as *const Value);
+                    if let Value::Object(Some(ref_obj)) = value {
+                        let ref_ptr = ref_obj.as_ptr();
+                        if let Some(ridx) = self.collector.lookup_region_for_addr(ref_ptr as usize) {
+                            if self.cset.contains(&ridx) {
+                                if let Some((new_ptr, fresh)) =
+                                    self.evacuate(tlab, ref_ptr, forwards, objs, bytes)
+                                {
+                                    let nv = Value::Object(Some(ObjectRef::from_raw(new_ptr)));
+                                    std::ptr::write(slot_ptr as *mut Value, nv);
+                                    if fresh {
+                                        newly.push(new_ptr as usize);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            offset += obj_size;
+        }
+
+        if !newly.is_empty() {
+            self.outstanding.fetch_add(newly.len(), Ordering::AcqRel);
+            let mut q = self.queue.lock();
+            q.extend(newly);
+        }
+    }
+
+    /// Worker drain loop: pop gray objects, scan + evacuate their refs, push
+    /// fresh children, until `outstanding` reaches 0. Retires its TLABs on exit.
+    unsafe fn run_worker(
+        &self,
+        tlab: &mut TlabSet,
+        objs: &mut usize,
+        bytes: &mut usize,
+        forwards: &mut Vec<(usize, usize)>,
+    ) {
+        let mut children: Vec<usize> = Vec::new();
+        loop {
+            if self.outstanding.load(Ordering::Acquire) == 0 {
+                break;
+            }
+            let item = {
+                let mut q = self.queue.lock();
+                q.pop()
+            };
+            match item {
+                Some(addr) => {
+                    children.clear();
+                    self.process_object(tlab, addr as *mut u8, forwards, objs, bytes, &mut children);
+                    if !children.is_empty() {
+                        // Add children to the outstanding count BEFORE retiring
+                        // the parent so the counter never transiently hits 0
+                        // while work remains.
+                        self.outstanding.fetch_add(children.len(), Ordering::AcqRel);
+                        let mut q = self.queue.lock();
+                        q.extend(children.iter().copied());
+                    }
+                    self.outstanding.fetch_sub(1, Ordering::AcqRel);
+                }
+                None => {
+                    // Queue momentarily empty but work still outstanding
+                    // (another worker is mid-scan and about to push).
+                    std::thread::yield_now();
+                }
+            }
+        }
+        self.retire_all(tlab);
+    }
+}
 
 /// Configuration for the G1 garbage collector.
 #[derive(Debug, Clone)]
@@ -90,12 +589,68 @@ impl Default for G1CollectorConfig {
 // G1 Region
 // ---------------------------------------------------------------------------
 
+/// Non-owning view of one region's backing slice inside
+/// [`G1Collector::arena`].
+///
+/// `base` is the slice's start address in the arena and `len` is
+/// `region_size`. `base` is stored as a `usize` (not a raw pointer) so that
+/// `G1Region` stays `Send + Sync` exactly as it did with the old
+/// `data: Vec<u8>` field. `Deref`/`DerefMut` expose the slice, so every
+/// existing `region.data.as_ptr()` / `.len()` / `.fill(0)` / indexing call
+/// site keeps working unchanged.
+///
+/// IMPORTANT: cross-region access (a humongous object whose payload extends
+/// past this region's `len` into the physically-adjacent next region) must go
+/// through [`RegionBuf::addr`] integer arithmetic, NOT through the `Deref`
+/// slice — `.as_ptr().add(off)` past `len` would be out of the slice's
+/// provenance. The arena guarantees those bytes are contiguous and live.
+pub struct RegionBuf {
+    base: usize,
+    len: usize,
+}
+
+impl RegionBuf {
+    #[inline]
+    fn new(base: usize, len: usize) -> Self {
+        Self { base, len }
+    }
+    /// Start address of this region's slice, as a `usize`. Use this (plus an
+    /// offset cast to `*mut u8`) for any access that may cross into the
+    /// adjacent region (humongous payloads); the arena keeps the bytes
+    /// contiguous and live.
+    #[inline]
+    fn addr(&self) -> usize {
+        self.base
+    }
+}
+
+impl Deref for RegionBuf {
+    type Target = [u8];
+    #[inline]
+    fn deref(&self) -> &[u8] {
+        // SAFETY: `[base, base+len)` is a live, per-region-exclusive slice of
+        // the collector's `arena` (allocated once, never freed/reallocated for
+        // the collector's lifetime); standalone test regions point at a leaked
+        // boxed slice, equally stable. Region ranges never overlap.
+        unsafe { std::slice::from_raw_parts(self.base as *const u8, self.len) }
+    }
+}
+
+impl DerefMut for RegionBuf {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut [u8] {
+        // SAFETY: see `deref`; `&mut self` gives unique access to this region's
+        // disjoint arena range.
+        unsafe { std::slice::from_raw_parts_mut(self.base as *mut u8, self.len) }
+    }
+}
+
 /// Enhanced region descriptor for the G1 collector.
 pub struct G1Region {
     /// Current region classification.
     pub region_type: RegionType,
-    /// Backing storage for this region.
-    pub data: Vec<u8>,
+    /// Backing storage for this region (a slice of [`G1Collector::arena`]).
+    pub data: RegionBuf,
     /// Bump pointer: next free byte offset.
     pub cursor: usize,
     /// Bytes of live data (computed during marking).
@@ -132,16 +687,16 @@ pub struct G1Region {
 }
 
 impl G1Region {
-    /// Create a new free region of the given size.
-    fn new(region_size: usize) -> Self {
-        let data = vec![0u8; region_size];
+    /// Create a free region backed by `region_size` bytes starting at arena
+    /// address `base`. The caller ([`G1Collector::new`]) guarantees the range
+    /// is a live, region-exclusive slice of the collector's `arena`.
+    fn from_arena(base: usize, region_size: usize) -> Self {
         // Round-2 fix (HIGH — GC #5): bitmap covers exactly this region's
-        // heap-allocated buffer. Base = data.as_ptr(), span = region_size.
-        let base = data.as_ptr() as usize;
+        // backing slice. Base = arena address, span = region_size.
         let mark_bitmap = MarkBitmap::new(base, region_size);
         Self {
             region_type: RegionType::Free,
-            data,
+            data: RegionBuf::new(base, region_size),
             cursor: 0,
             live_bytes: 0,
             gc_efficiency: 0.0,
@@ -151,6 +706,18 @@ impl G1Region {
             age: 0,
             mark_bitmap,
         }
+    }
+
+    /// Standalone test constructor: allocates a dedicated, leaked backing
+    /// buffer so a region can own stable memory without a shared arena.
+    /// Production regions come from [`G1Region::from_arena`] over
+    /// [`G1Collector::arena`]; this exists only for the unit tests that
+    /// exercise a single region in isolation.
+    #[cfg(test)]
+    fn new(region_size: usize) -> Self {
+        let buf = vec![0u8; region_size].into_boxed_slice();
+        let base = Box::leak(buf).as_mut_ptr() as usize;
+        Self::from_arena(base, region_size)
     }
 
     /// Remaining free bytes in this region.
@@ -264,6 +831,23 @@ pub enum G1CollectionType {
 pub struct G1Collector {
     /// Collector configuration.
     config: G1CollectorConfig,
+    /// Single contiguous backing store for every region.
+    ///
+    /// All `num_regions` regions are carved as adjacent `region_size` slices
+    /// of this one allocation (region `i` lives at `arena_base + i*region_size`).
+    /// This makes a humongous object spanning a contiguous run of region
+    /// indices one physically-contiguous block, so the JIT's flat
+    /// `base + HEADER_SIZE + i*stride` array addressing (and JNI-critical /
+    /// Unsafe / arraycopy raw pointers) address every element correctly. The
+    /// previous design gave each region its own `Vec<u8>`, so a humongous
+    /// element past the first region's payload read/wrote unrelated heap
+    /// memory (silent zero tail → SIGSEGV). Allocated once in
+    /// [`G1Collector::new`]; never moved or reallocated, so every region base
+    /// and the `region_lookup` table stay address-stable for the collector's
+    /// lifetime. `Box<[u8]>` (not `Vec`) to make the no-realloc contract
+    /// explicit. Dropped with the collector — no leak.
+    #[allow(dead_code)]
+    arena: Box<[u8]>,
     /// All heap regions.
     regions: Mutex<Vec<G1Region>>,
 
@@ -388,13 +972,26 @@ impl G1Collector {
             config.region_size
         );
 
+        // One contiguous arena carved into `num_regions` adjacent slices, so
+        // region `i+1` physically follows region `i`. This is what makes a
+        // humongous object spanning a contiguous run of region indices one
+        // contiguous block (see the `arena` field doc and `alloc_humongous_locked`).
+        // Allocated once and never moved/reallocated → every region base and
+        // the `region_lookup` table are address-stable for the collector's life.
+        let arena: Box<[u8]> = vec![0u8; num_regions * config.region_size].into_boxed_slice();
+        let arena_base = arena.as_ptr() as usize;
+
         let regions: Vec<G1Region> = (0..num_regions)
-            .map(|_| G1Region::new(config.region_size))
+            .map(|i| {
+                G1Region::from_arena(arena_base + i * config.region_size, config.region_size)
+            })
             .collect();
 
         // Build the address-to-region lookup table (sorted by base addr).
-        // Each region's `data` Vec was just allocated; its `as_ptr()` is
-        // stable for the lifetime of the collector (see field doc).
+        // Bases are `arena_base + i*region_size` — already ascending; the sort
+        // is retained for robustness and parity with the previous construction.
+        // The arena is never reallocated so these addresses are stable for the
+        // lifetime of the collector (see field doc).
         let mut region_lookup: Vec<(usize, usize)> = regions
             .iter()
             .enumerate()
@@ -412,6 +1009,7 @@ impl G1Collector {
 
         Self {
             config: config.clone(),
+            arena,
             regions: Mutex::new(regions),
             current_eden: AtomicUsize::new(usize::MAX), // no eden yet
             next_hash_code: AtomicI32::new(1),
@@ -493,121 +1091,76 @@ impl G1Collector {
         None
     }
 
-    /// Allocate a humongous object spanning contiguous free regions.
+    /// Allocate a humongous object spanning a contiguous run of free regions.
+    ///
+    /// The object occupies ONE physically-contiguous block: the regions are
+    /// adjacent slices of [`G1Collector::arena`], so a span of `regions_needed`
+    /// consecutive region indices is `regions_needed * region_size` contiguous
+    /// bytes. The real `ObjectHeader` lives at offset 0 of the start region and
+    /// the payload flows straight through the following regions — exactly like
+    /// any other array, just larger. This is what lets the JIT (and
+    /// JNI-critical / Unsafe / arraycopy) address every element with flat
+    /// `base + HEADER_SIZE + i*stride` arithmetic.
+    ///
+    /// Layout / bookkeeping:
+    /// * `start` is `HumongousStart` with `cursor = size` (the full object
+    ///   size). Heap walkers iterating `[0, cursor)` therefore read the single
+    ///   humongous object once — reads cross region boundaries safely because
+    ///   the arena is contiguous — then stop.
+    /// * Continuation regions are `HumongousContinuation` with `cursor = 0`, so
+    ///   walkers skip them (their bytes are the start object's payload, NOT
+    ///   independent objects). No per-region header prefix and no
+    ///   `HumongousFiller` sentinel: those would corrupt the contiguous
+    ///   payload. (`is_humongous_filler` is now never true for live data and
+    ///   stays only as a defensive no-op in the walkers.)
+    ///
+    /// Replaces the previous region-fragmented layout (each region a separate
+    /// `Vec<u8>` with its own HEADER_SIZE prefix), which was safe for the
+    /// GC-internal region-aware accessors but invisible to the JIT's flat
+    /// addressing — a humongous element past the first region read/wrote
+    /// unrelated memory (silent zero tail at ~1–2 MB, SIGSEGV at ~4 MB+).
     fn alloc_humongous_locked(
         &self,
         regions: &mut Vec<G1Region>,
         size: usize,
     ) -> Option<(*mut u8, usize)> {
         let region_size = self.config.region_size;
-
-        // CRIT (round-12 gc C2, humongous OOB R/W): a humongous object is laid
-        // out so that **every** region in the span carries a HEADER_SIZE prefix
-        // (the real ObjectHeader on the start region, a HumongousFiller sentinel
-        // on each continuation), and the object's payload lives in the
-        // `region_size - HEADER_SIZE` bytes AFTER that prefix. The previous
-        // layout returned `regions[start].base_ptr_mut()` and then accessed
-        // fields/elements via a single FLAT offset from that base — but each
-        // `G1Region.data` is a SEPARATE `vec![0u8; region_size]` allocation, so
-        // any logical offset past `region_size - HEADER_SIZE` landed outside
-        // region[start]'s Vec in unrelated heap memory (arbitrary OOB R/W).
-        //
-        // With the prefixed layout, every access is translated to the owning
-        // continuation region's own buffer (see `humongous_segment_for` /
-        // `humongous_payload_ptr` and the field/array accessors), so no access
-        // can ever escape the object's backing memory. The per-region prefix
-        // also lets us keep the HumongousFiller walker sentinel unchanged —
-        // walkers stay correct and continuation regions remain dark.
-        //
-        // `usable` is the payload capacity of one region; `payload_bytes` is the
-        // object size minus its single ObjectHeader.
-        let usable = region_size.checked_sub(HEADER_SIZE)?;
-        if usable == 0 {
+        if region_size == 0 || size < HEADER_SIZE {
             return None;
         }
-        let payload_bytes = size.saturating_sub(HEADER_SIZE);
-        let regions_needed = payload_bytes.div_ceil(usable).max(1);
+
+        // Number of contiguous regions whose combined bytes hold the whole
+        // object (header + payload). Contiguity in the arena makes this a
+        // single block, so we size by the FULL object, not a per-region chunk.
+        let regions_needed = size.div_ceil(region_size).max(1);
 
         let start = find_contiguous_free(regions, regions_needed)?;
 
-        // Mark regions
+        // Classify the span. `cursor = size` on the start makes walkers read
+        // the one object; `cursor = 0` on continuations makes walkers skip them.
         regions[start].region_type = RegionType::HumongousStart;
+        regions[start].cursor = size;
         for i in 1..regions_needed {
             regions[start + i].region_type = RegionType::HumongousContinuation;
+            regions[start + i].cursor = 0;
         }
 
-        // Per-region byte usage (`cursor`): each region stores its HEADER_SIZE
-        // prefix plus the payload chunk it owns. Chunk `i` covers payload bytes
-        // `[i*usable, (i+1)*usable)`.
-        for i in 0..regions_needed {
-            let chunk = payload_bytes.saturating_sub(i * usable).min(usable);
-            regions[start + i].cursor = HEADER_SIZE + chunk;
+        // Zero the entire contiguous span before handing it out. Continuation
+        // regions come from `Free` slots that may still hold stale collected
+        // data; `G1Region::reset` zeroes a region only on its STW retire path.
+        // The arena is one allocation, so a single `write_bytes` across the
+        // full span is in-bounds and contiguous.
+        let start_addr = regions[start].data.addr();
+        unsafe {
+            // SAFETY: `[start_addr, start_addr + regions_needed*region_size)` is
+            // `regions_needed` adjacent arena slices reserved by this
+            // allocation (`find_contiguous_free` returned a Free run); `size <=
+            // regions_needed*region_size`, so zeroing `size` bytes stays inside
+            // the reserved span.
+            std::ptr::write_bytes(start_addr as *mut u8, 0, size);
         }
 
-        // CRIT (round-5 GC #1, heap walker UAF): zero the *entire* humongous
-        // span, not just the first region's payload. Continuation regions
-        // (start+1..start+regions_needed) come from `Free` slots that may
-        // have last held arbitrary collected data; G1Region::reset() zeroes
-        // a region only on its STW retire path. If we leave the residual
-        // bytes intact, the heap walker that scans `cursor` bytes per
-        // continuation region will treat those stale bytes as live object
-        // headers / reference slots, follow the garbage pointers, and
-        // either crash, corrupt the bitmap, or revive freed objects.
-        //
-        // Zero each region's `cursor` bytes individually rather than a
-        // single `write_bytes` across `total_bytes`: G1Region buffers are
-        // separate `Vec<u8>` allocations and are NOT guaranteed to live
-        // at contiguous addresses, even though they are logically adjacent
-        // in region index space.
-        for i in 0..regions_needed {
-            let n = regions[start + i].cursor;
-            if n > 0 {
-                let p = regions[start + i].base_ptr_mut();
-                unsafe {
-                    std::ptr::write_bytes(p, 0, n);
-                }
-            }
-        }
-
-        // CRIT (round-9 gc CRIT-1): install a `HumongousFiller` sentinel
-        // header at the START of every continuation region. The previous
-        // round-5 fix only zeroed the continuation bytes, but a zero
-        // header still decodes as a well-formed `Object` (class_id=0,
-        // kind=Object=0, num_slots=0). A heap walker iterating with the
-        // generic per-object size formula treats the zeroed bytes as a
-        // 40-byte object and the next 40 bytes as another, and so on,
-        // following any garbage that survives at later offsets.
-        //
-        // The filler is a single sentinel header (HEADER_SIZE bytes) that
-        // walkers detect via `is_humongous_filler()` and use to break out
-        // of the per-region iteration. No oops are scanned and the
-        // continuation region is effectively dark to the walker.
-        //
-        // The first region (start) is the HumongousStart and contains the
-        // actual application object header at offset 0 — leave it alone.
-        for i in 1..regions_needed {
-            let n = regions[start + i].cursor;
-            if n >= HEADER_SIZE {
-                let p = regions[start + i].base_ptr_mut();
-                // SAFETY: continuation region's first HEADER_SIZE bytes are
-                // owned by this allocation and were just zeroed; writing a
-                // sentinel ObjectHeader here is well-defined.
-                let filler = ObjectHeader::new(
-                    ClassId::new(0),
-                    ObjectKind::HumongousFiller,
-                    ArrayElementType::Reference,
-                    0,
-                    0,
-                    0,
-                );
-                unsafe {
-                    std::ptr::write(p as *mut ObjectHeader, filler);
-                }
-            }
-        }
-
-        let ptr = regions[start].base_ptr_mut();
-        Some((ptr, start))
+        Some((start_addr as *mut u8, start))
     }
 
     /// Allocate in a region of the specified type (Survivor or Old).
@@ -615,17 +1168,28 @@ impl G1Collector {
         regions: &mut Vec<G1Region>,
         target_type: RegionType,
         size: usize,
+        cset: &std::collections::HashSet<usize>,
     ) -> Option<*mut u8> {
-        // Try existing regions of this type
+        // CORRECTNESS (evacuation destination must NOT be in the collection set):
+        // a young GC evacuates *all* Survivor regions, so a partially-filled
+        // Survivor region is itself in the CSet; a mixed GC likewise has selected
+        // Old regions in the CSet. Reusing such a region as an evacuation
+        // *destination* copies survivors into a region that Phase 5 then resets
+        // (frees) — the copies are lost and every reference to them is left
+        // dangling (silent live-object loss; the held-tree `got=1` repro). Skip
+        // any CSet region here: young survivors land only in fresh Free regions,
+        // mixed promotions only in non-CSet Old or fresh Free regions — matching
+        // the semi-space "never allocate into from-space" invariant the
+        // generational collector and the Step-9 parallel TLAB path already honour.
         for i in 0..regions.len() {
-            if regions[i].region_type == target_type {
+            if regions[i].region_type == target_type && !cset.contains(&i) {
                 if let Some((ptr, _)) = regions[i].bump_alloc(size, 8) {
                     return Some(ptr);
                 }
             }
         }
 
-        // Allocate a new free region
+        // Allocate a new free region (Free regions are never in the CSet).
         if let Some(idx) = find_free_region(regions) {
             regions[idx].region_type = target_type;
             if target_type == RegionType::Survivor {
@@ -649,6 +1213,12 @@ impl G1Collector {
         roots: &mut [ObjectRef],
         monitors: &dyn MonitorCleanup,
     ) -> GcResult {
+        // Step 9: opt-in multi-threaded evacuator (`CRATONVM_G1_PARALLEL_EVAC`).
+        // Behaviour-equivalent to the serial path below (byte-identical program
+        // output); see the parallel-evacuation module note above.
+        if parallel_evac_enabled() {
+            return self.young_collection_parallel(roots, monitors);
+        }
         let start = std::time::Instant::now();
         let mut regions = self.regions.lock();
         // SECURITY FIX (V7a): this collection will reset/retype CSet
@@ -692,17 +1262,51 @@ impl G1Collector {
             let old_ptr = root.as_ptr();
             if let Some(region_idx) = self.region_for_ptr(&regions, old_ptr) {
                 if cset_set.contains(&region_idx) {
-                    if let Some(new_ptr) = self.evacuate_object(
+                    // Step 9: `fresh` is ignored here — the root loop keeps its
+                    // existing unconditional push (a duplicate root re-scans
+                    // idempotently). Gating it on `fresh` is deferred to the
+                    // parallel evacuator (where duplicate worklist entries
+                    // matter for worker load).
+                    if let Some((new_ptr, _fresh)) = self.evacuate_object(
                         &mut regions,
                         old_ptr,
                         &mut pointer_map,
                         &mut objects_copied,
                         &mut bytes_copied,
+                        &cset_set,
                     ) {
                         *root = unsafe { ObjectRef::from_raw(new_ptr) };
                         work_list.push(new_ptr);
                     }
                 }
+            }
+        }
+
+        if std::env::var_os("CRATONVM_DBG_JITROOT").is_some() {
+            let mut in_region = 0usize;
+            let mut in_cset = 0usize;
+            for root in roots.iter() {
+                if let Some(idx) = self.region_for_ptr(&regions, root.as_ptr()) {
+                    in_region += 1;
+                    if cset_set.contains(&idx) {
+                        in_cset += 1;
+                    }
+                }
+            }
+            eprintln!(
+                "[JITROOT-G1] roots={} in_region={} in_cset={} cset_len={} copied={}",
+                roots.len(),
+                in_region,
+                in_cset,
+                cset.len(),
+                objects_copied
+            );
+            for &ci in cset.iter().take(8) {
+                let base = regions[ci].data.as_ptr() as usize;
+                eprintln!(
+                    "[JITROOT-G1]   cset region {} type={:?} [{:#x}, {:#x}) cursor={}",
+                    ci, regions[ci].region_type, base, base + regions[ci].cursor, regions[ci].cursor
+                );
             }
         }
 
@@ -956,6 +1560,10 @@ impl G1Collector {
         roots: &mut [ObjectRef],
         monitors: &dyn MonitorCleanup,
     ) -> GcResult {
+        // Step 9: opt-in multi-threaded evacuator (`CRATONVM_G1_PARALLEL_EVAC`).
+        if parallel_evac_enabled() {
+            return self.mixed_collection_parallel(roots, monitors);
+        }
         let start = std::time::Instant::now();
         let mut regions = self.regions.lock();
         // SECURITY FIX (V7a): mixed GC resets/retypes CSet regions
@@ -1030,12 +1638,18 @@ impl G1Collector {
             let old_ptr = root.as_ptr();
             if let Some(region_idx) = self.region_for_ptr(&regions, old_ptr) {
                 if cset_set.contains(&region_idx) {
-                    if let Some(new_ptr) = self.evacuate_object(
+                    // Step 9: `fresh` is ignored here — the root loop keeps its
+                    // existing unconditional push (a duplicate root re-scans
+                    // idempotently). Gating it on `fresh` is deferred to the
+                    // parallel evacuator (where duplicate worklist entries
+                    // matter for worker load).
+                    if let Some((new_ptr, _fresh)) = self.evacuate_object(
                         &mut regions,
                         old_ptr,
                         &mut pointer_map,
                         &mut objects_copied,
                         &mut bytes_copied,
+                        &cset_set,
                     ) {
                         *root = unsafe { ObjectRef::from_raw(new_ptr) };
                         work_list.push(new_ptr);
@@ -1159,6 +1773,393 @@ impl G1Collector {
     }
 
     // -----------------------------------------------------------------------
+    // Step 9 — parallel evacuation drivers (gated; see the module note above)
+    // -----------------------------------------------------------------------
+
+    /// Number of evacuation workers: `gc_worker_threads` clamped to the
+    /// available hardware parallelism (always ≥ 1). With 1 worker the parallel
+    /// code path drains serially — useful for determinism testing.
+    fn parallel_worker_count(&self) -> usize {
+        let cfg = self.config.gc_worker_threads.max(1);
+        let avail = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .max(1);
+        cfg.min(avail)
+    }
+
+    /// Shared seed + parallel transitive-closure core used by both
+    /// `young_collection_parallel` and `mixed_collection_parallel`.
+    ///
+    /// Seeds the work queue from `roots` and the CSet remembered-set sources on
+    /// the calling (driver) thread, then runs the work-stealing closure across
+    /// `parallel_worker_count()` workers (the driver participating as one). Roots
+    /// are rewritten in place. Returns the merged forwarding map plus the
+    /// objects/bytes copied.
+    ///
+    /// SAFETY: `regions_base` must be the live regions Vec base and the caller
+    /// must hold `regions.lock()` for the whole call WITHOUT dereferencing the
+    /// guard (see the module SAFETY MODEL note). `pool` lists currently-Free
+    /// region indices reserved for to-space allocation.
+    unsafe fn parallel_evacuate(
+        &self,
+        regions_base: RegionsBase,
+        cset: &[usize],
+        cset_set: &std::collections::HashSet<usize>,
+        pool: Vec<usize>,
+        roots: &mut [ObjectRef],
+    ) -> (HashMap<usize, usize>, usize, usize) {
+        // One-shot confirmation that the parallel evacuator is genuinely active
+        // (the gauntlet lesson: never assume a gated path was taken — verify).
+        {
+            static LOGGED: AtomicBool = AtomicBool::new(false);
+            if !LOGGED.swap(true, Ordering::Relaxed) {
+                tracing::info!(
+                    "g1: parallel evacuation ACTIVE ({} workers, CRATONVM_G1_PARALLEL_EVAC)",
+                    self.parallel_worker_count()
+                );
+            }
+        }
+        let pool_next = AtomicUsize::new(0);
+        let queue: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+        let outstanding = AtomicUsize::new(0);
+        let shared = SharedEvac {
+            collector: self,
+            regions_base,
+            cset: cset_set,
+            pool: &pool,
+            pool_next: &pool_next,
+            queue: &queue,
+            outstanding: &outstanding,
+            promotion_age: self.config.promotion_age,
+        };
+
+        let mut objs = 0usize;
+        let mut bytes = 0usize;
+        let mut main_tlab = TlabSet::default();
+        let mut main_forwards: Vec<(usize, usize)> = Vec::new();
+
+        // Phase 1 (driver): seed roots.
+        for root in roots.iter_mut() {
+            let old_ptr = root.as_ptr();
+            if let Some(ridx) = self.lookup_region_for_addr(old_ptr as usize) {
+                if cset_set.contains(&ridx) {
+                    if let Some((new_ptr, fresh)) =
+                        shared.evacuate(&mut main_tlab, old_ptr, &mut main_forwards, &mut objs, &mut bytes)
+                    {
+                        *root = ObjectRef::from_raw(new_ptr);
+                        if fresh {
+                            outstanding.fetch_add(1, Ordering::AcqRel);
+                            queue.lock().push(new_ptr as usize);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Phase 2 (driver): seed remembered-set sources for every CSet region.
+        let rset_sources: std::collections::HashSet<usize> = {
+            let mut set = std::collections::HashSet::new();
+            for &cset_idx in cset {
+                let r = &*regions_base.0.add(cset_idx);
+                for s in r.rset.sources() {
+                    set.insert(s);
+                }
+            }
+            set
+        };
+        for src_idx in rset_sources {
+            shared.seed_source_region(
+                src_idx,
+                &mut main_tlab,
+                &mut main_forwards,
+                &mut objs,
+                &mut bytes,
+            );
+        }
+
+        // Phase 3: parallel transitive closure.
+        let nworkers = self.parallel_worker_count();
+        let (extra_objs, extra_bytes, worker_forwards): (usize, usize, Vec<Vec<(usize, usize)>>) =
+            std::thread::scope(|s| {
+                let mut handles = Vec::new();
+                for _ in 1..nworkers {
+                    let shared_ref = &shared;
+                    handles.push(s.spawn(move || {
+                        let mut tlab = TlabSet::default();
+                        let mut o = 0usize;
+                        let mut b = 0usize;
+                        let mut f: Vec<(usize, usize)> = Vec::new();
+                        unsafe {
+                            shared_ref.run_worker(&mut tlab, &mut o, &mut b, &mut f);
+                        }
+                        (o, b, f)
+                    }));
+                }
+                // The driver participates as a worker, reusing its seeded TLAB
+                // and accumulators.
+                unsafe {
+                    shared.run_worker(&mut main_tlab, &mut objs, &mut bytes, &mut main_forwards);
+                }
+                let mut to = 0usize;
+                let mut tb = 0usize;
+                let mut allf: Vec<Vec<(usize, usize)>> = Vec::new();
+                for h in handles {
+                    let (o, b, f) = h.join().expect("g1 parallel-evac worker panicked");
+                    to += o;
+                    tb += b;
+                    allf.push(f);
+                }
+                (to, tb, allf)
+            });
+        objs += extra_objs;
+        bytes += extra_bytes;
+
+        // Merge the per-worker forward shards into the pointer map consumed by
+        // the VM root remap and Phases 4/5.
+        let mut pointer_map: HashMap<usize, usize> =
+            HashMap::with_capacity(main_forwards.len() + extra_objs);
+        for (o, n) in main_forwards {
+            pointer_map.insert(o, n);
+        }
+        for f in worker_forwards {
+            for (o, n) in f {
+                pointer_map.insert(o, n);
+            }
+        }
+
+        (pointer_map, objs, bytes)
+    }
+
+    /// Parallel young-only collection (Step 9). Behaviour-equivalent to
+    /// [`Self::young_collection`]'s serial body — Phases 1–3 run through the
+    /// multi-threaded evacuator, Phases 4/5 + stats mirror the serial path.
+    pub(crate) fn young_collection_parallel(
+        &self,
+        roots: &mut [ObjectRef],
+        monitors: &dyn MonitorCleanup,
+    ) -> GcResult {
+        let start = std::time::Instant::now();
+        let mut regions = self.regions.lock();
+        // SECURITY FIX (V7a): invalidate every mutator's RSet fast-path cache
+        // before any reclassification (see `rset_cache_epoch`).
+        self.rset_cache_epoch.fetch_add(1, Ordering::Release);
+
+        let cset: Vec<usize> = regions
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| {
+                !r.pinned
+                    && (r.region_type == RegionType::Eden || r.region_type == RegionType::Survivor)
+            })
+            .map(|(i, _)| i)
+            .collect();
+        if cset.is_empty() {
+            return GcResult {
+                stats: GcStats {
+                    objects_copied: 0,
+                    bytes_copied: 0,
+                    bytes_freed: 0,
+                },
+                pointer_map: HashMap::new(),
+            };
+        }
+        let cset_set: std::collections::HashSet<usize> = cset.iter().copied().collect();
+        let pool: Vec<usize> = regions
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r.region_type == RegionType::Free)
+            .map(|(i, _)| i)
+            .collect();
+
+        // Take the raw regions base; do NOT deref `regions` again until after
+        // `parallel_evacuate` returns (see the module SAFETY MODEL note).
+        let regions_base = RegionsBase(regions.as_mut_ptr());
+        let (pointer_map, objects_copied, bytes_copied) =
+            unsafe { self.parallel_evacuate(regions_base, &cset, &cset_set, pool, roots) };
+
+        // Phase 4: update interior refs in non-CSet regions.
+        self.update_references_in_regions(&mut regions, &cset_set, &pointer_map);
+
+        // Phase 5: free evacuated regions.
+        let mut bytes_freed = 0usize;
+        for &cset_idx in &cset {
+            bytes_freed += regions[cset_idx].cursor;
+            regions[cset_idx].reset();
+        }
+        self.verify_no_dangling_into_cset(&regions, &cset_set, &pointer_map);
+
+        let cur_eden = self.current_eden.load(Ordering::Relaxed);
+        if cset_set.contains(&cur_eden) {
+            self.current_eden.store(usize::MAX, Ordering::Relaxed);
+        }
+
+        let old_bytes: usize = regions
+            .iter()
+            .filter(|r| r.region_type == RegionType::Old)
+            .map(|r| r.cursor)
+            .sum();
+        self.old_gen_bytes.store(old_bytes, Ordering::Relaxed);
+
+        monitors.remap_after_gc(&pointer_map);
+
+        // Remap (or drop) stale concurrent-mark worklist entries — identical to
+        // the serial young path. Done under STW (guard held) so no marker step
+        // races us.
+        {
+            let mut worklist = self.mark_worklist.lock();
+            if !worklist.is_empty() {
+                worklist.retain_mut(|addr| {
+                    if let Some(&new_addr) = pointer_map.get(&*addr) {
+                        *addr = new_addr;
+                        return true;
+                    }
+                    match self.region_for_ptr(&regions, *addr as *mut u8) {
+                        Some(idx) if cset_set.contains(&idx) => false,
+                        _ => true,
+                    }
+                });
+            }
+        }
+
+        let pause_ms = start.elapsed().as_millis() as u64;
+        self.collection_count.fetch_add(1, Ordering::Relaxed);
+        self.total_pause_ms.fetch_add(pause_ms, Ordering::Relaxed);
+
+        let stats = GcStats {
+            objects_copied,
+            bytes_copied,
+            bytes_freed,
+        };
+        self.log_gc_event(&G1CollectionType::YoungOnly, pause_ms, &stats);
+        GcResult { stats, pointer_map }
+    }
+
+    /// Parallel mixed collection (Step 9). Behaviour-equivalent to
+    /// [`Self::mixed_collection`]'s serial body (including the Step-7
+    /// pause-target old-region CSet sizing and the mixed-cycle bookkeeping).
+    pub(crate) fn mixed_collection_parallel(
+        &self,
+        roots: &mut [ObjectRef],
+        monitors: &dyn MonitorCleanup,
+    ) -> GcResult {
+        let start = std::time::Instant::now();
+        let mut regions = self.regions.lock();
+        self.rset_cache_epoch.fetch_add(1, Ordering::Release);
+
+        // Build CSet: all young regions + worst (most-garbage) old regions,
+        // bounded by both the percentage cap and the Step-7 pause budget —
+        // identical selection to the serial `mixed_collection`.
+        let mut cset: Vec<usize> = regions
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| {
+                !r.pinned
+                    && (r.region_type == RegionType::Eden || r.region_type == RegionType::Survivor)
+            })
+            .map(|(i, _)| i)
+            .collect();
+
+        let max_old =
+            (regions.len() * self.config.old_cset_region_threshold_percent as usize) / 100;
+        let max_old = max_old.max(1);
+
+        let mut old_candidates: Vec<(usize, f64)> = regions
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r.region_type == RegionType::Old && !r.pinned)
+            .map(|(i, r)| (i, r.gc_efficiency))
+            .collect();
+        old_candidates.sort_by(|a, b| {
+            a.1.partial_cmp(&b.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
+
+        let budget_ns = self.config.max_gc_pause_ms.saturating_mul(1_000_000);
+        let ns_per_byte = self.evac_ns_per_byte.load(Ordering::Relaxed).max(1);
+        let mut old_cost_ns: u64 = 0;
+        let mut old_selected: usize = 0;
+        for (idx, _) in old_candidates.into_iter().take(max_old) {
+            let cost = regions[idx].estimated_evac_cost_ns(ns_per_byte);
+            if old_selected > 0 && old_cost_ns.saturating_add(cost) > budget_ns {
+                break;
+            }
+            cset.push(idx);
+            old_cost_ns = old_cost_ns.saturating_add(cost);
+            old_selected += 1;
+        }
+
+        if cset.is_empty() {
+            return GcResult {
+                stats: GcStats {
+                    objects_copied: 0,
+                    bytes_copied: 0,
+                    bytes_freed: 0,
+                },
+                pointer_map: HashMap::new(),
+            };
+        }
+        let cset_set: std::collections::HashSet<usize> = cset.iter().copied().collect();
+        let pool: Vec<usize> = regions
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r.region_type == RegionType::Free)
+            .map(|(i, _)| i)
+            .collect();
+
+        let regions_base = RegionsBase(regions.as_mut_ptr());
+        let (pointer_map, objects_copied, bytes_copied) =
+            unsafe { self.parallel_evacuate(regions_base, &cset, &cset_set, pool, roots) };
+
+        self.update_references_in_regions(&mut regions, &cset_set, &pointer_map);
+
+        let mut bytes_freed = 0usize;
+        for &cset_idx in &cset {
+            bytes_freed += regions[cset_idx].cursor;
+            regions[cset_idx].reset();
+        }
+        self.verify_no_dangling_into_cset(&regions, &cset_set, &pointer_map);
+
+        let cur_eden = self.current_eden.load(Ordering::Relaxed);
+        if cset_set.contains(&cur_eden) {
+            self.current_eden.store(usize::MAX, Ordering::Relaxed);
+        }
+
+        let old_bytes: usize = regions
+            .iter()
+            .filter(|r| r.region_type == RegionType::Old)
+            .map(|r| r.cursor)
+            .sum();
+        self.old_gen_bytes.store(old_bytes, Ordering::Relaxed);
+
+        monitors.remap_after_gc(&pointer_map);
+
+        let remaining = self.mixed_gc_remaining.load(Ordering::Relaxed);
+        if remaining > 0 {
+            self.mixed_gc_remaining
+                .store(remaining - 1, Ordering::Relaxed);
+            if remaining - 1 == 0 {
+                self.marking_complete.store(false, Ordering::Relaxed);
+            }
+        }
+
+        let elapsed = start.elapsed();
+        let pause_ms = elapsed.as_millis() as u64;
+        self.update_evac_cost(elapsed.as_nanos() as u64, bytes_copied);
+        self.collection_count.fetch_add(1, Ordering::Relaxed);
+        self.total_pause_ms.fetch_add(pause_ms, Ordering::Relaxed);
+
+        let stats = GcStats {
+            objects_copied,
+            bytes_copied,
+            bytes_freed,
+        };
+        self.log_gc_event(&G1CollectionType::Mixed, pause_ms, &stats);
+        GcResult { stats, pointer_map }
+    }
+
+    // -----------------------------------------------------------------------
     // Evacuation helpers
     // -----------------------------------------------------------------------
 
@@ -1180,7 +2181,19 @@ impl G1Collector {
     }
 
     /// Evacuate a single object from its current region to Survivor or Old.
-    /// Returns the new pointer, or None on evacuation failure.
+    /// Returns `Some((new_ptr, fresh))` where `fresh` is `true` iff THIS call
+    /// performed the copy (vs found an existing forwarding entry), or `None`
+    /// on evacuation failure.
+    ///
+    /// Step 9 (parallel-evac foundation): `fresh` is the dedup signal callers
+    /// use to gate the work_list push, replacing a separate
+    /// `pointer_map.contains_key` pre-check — that pre-check is a TOCTOU the
+    /// moment evacuation is sharded across worker threads (two workers both
+    /// sample "absent", both copy, the loser's allocation leaks and is
+    /// double-scanned). Reading the freshness from the evacuation outcome
+    /// instead means the parallel evacuator can later derive it from the
+    /// atomic CAS-forwarding install in the object header (`forwarding_ptr`)
+    /// without changing the call sites.
     fn evacuate_object(
         &self,
         regions: &mut Vec<G1Region>,
@@ -1188,12 +2201,13 @@ impl G1Collector {
         pointer_map: &mut HashMap<usize, usize>,
         objects_copied: &mut usize,
         bytes_copied: &mut usize,
-    ) -> Option<*mut u8> {
+        cset: &std::collections::HashSet<usize>,
+    ) -> Option<(*mut u8, bool)> {
         let old_addr = old_ptr as usize;
 
-        // Already forwarded?
+        // Already forwarded (not fresh) — return the existing forward.
         if let Some(&new_addr) = pointer_map.get(&old_addr) {
-            return Some(new_addr as *mut u8);
+            return Some((new_addr as *mut u8, false));
         }
 
         let header = unsafe { &*(old_ptr as *const ObjectHeader) };
@@ -1226,7 +2240,7 @@ impl G1Collector {
             RegionType::Survivor
         };
 
-        let new_ptr = Self::alloc_in_type_locked(regions, dest_type, obj_size)?;
+        let new_ptr = Self::alloc_in_type_locked(regions, dest_type, obj_size, cset)?;
 
         // Copy object data
         unsafe {
@@ -1266,7 +2280,7 @@ impl G1Collector {
         *objects_copied += 1;
         *bytes_copied += obj_size;
 
-        Some(new_ptr)
+        Some((new_ptr, true))
     }
 
     /// Scan an evacuated object's reference fields. For each reference pointing
@@ -1322,25 +2336,24 @@ impl G1Collector {
                                 // pathological graphs. The dedup signal we
                                 // need is "was this evacuation fresh?".
                                 // `evacuate_object` inserts into
-                                // `pointer_map` only when it actually
-                                // copies; if the entry was already present
-                                // it returns the existing forward without
-                                // touching the map. Sample BEFORE the call
-                                // and push to the worklist only on a fresh
-                                // evacuation.
-                                let already_forwarded =
-                                    pointer_map.contains_key(&(ref_ptr as usize));
-                                if let Some(new_ptr) = self.evacuate_object(
+                                // `pointer_map` only when it actually copies.
+                                // Step 9: take the freshness from the
+                                // evacuation outcome (`fresh`) rather than a
+                                // separate `contains_key` pre-check (a TOCTOU
+                                // under parallel evacuation) and push to the
+                                // worklist only on a fresh evacuation.
+                                if let Some((new_ptr, fresh)) = self.evacuate_object(
                                     regions,
                                     ref_ptr,
                                     pointer_map,
                                     objects_copied,
                                     bytes_copied,
+                                    cset,
                                 ) {
                                     unsafe {
                                         std::ptr::write(slot_ptr as *mut u64, new_ptr as u64);
                                     }
-                                    if !already_forwarded {
+                                    if fresh {
                                         work_list.push(new_ptr);
                                     }
                                 }
@@ -1364,22 +2377,24 @@ impl G1Collector {
                         if cset.contains(&region_idx) {
                             // Round-5 fix (CRIT, O(N²)): only push the
                             // forwarded target onto the worklist when this
-                            // call site actually evacuated it. See the
-                            // matching comment in the Array branch above.
-                            let already_forwarded = pointer_map.contains_key(&(ref_ptr as usize));
-                            if let Some(new_ptr) = self.evacuate_object(
+                            // call site actually evacuated it. Step 9: the
+                            // freshness comes from the evacuation outcome
+                            // (`fresh`), not a separate `contains_key`
+                            // pre-check (a TOCTOU under parallel evacuation).
+                            if let Some((new_ptr, fresh)) = self.evacuate_object(
                                 regions,
                                 ref_ptr,
                                 pointer_map,
                                 objects_copied,
                                 bytes_copied,
+                                cset,
                             ) {
                                 let new_value =
                                     Value::Object(Some(unsafe { ObjectRef::from_raw(new_ptr) }));
                                 unsafe {
                                     std::ptr::write(slot_ptr as *mut Value, new_value);
                                 }
-                                if !already_forwarded {
+                                if fresh {
                                     work_list.push(new_ptr);
                                 }
                             }
@@ -1459,12 +2474,17 @@ impl G1Collector {
                         let ref_ptr = raw as usize as *mut u8;
                         if let Some(ridx) = self.region_for_ptr(regions, ref_ptr) {
                             if cset.contains(&ridx) {
-                                if let Some(new_ptr) = self.evacuate_object(
+                                // Step 9: `fresh` ignored — this RSet-source
+                                // scan keeps its existing unconditional push
+                                // (behaviour-identical; the parallel evacuator
+                                // will gate it on `fresh`).
+                                if let Some((new_ptr, _fresh)) = self.evacuate_object(
                                     regions,
                                     ref_ptr,
                                     pointer_map,
                                     objects_copied,
                                     bytes_copied,
+                                    cset,
                                 ) {
                                     unsafe {
                                         std::ptr::write(slot_ptr as *mut u64, new_ptr as u64);
@@ -1483,12 +2503,14 @@ impl G1Collector {
                         let ref_ptr = ref_obj.as_ptr();
                         if let Some(ridx) = self.region_for_ptr(regions, ref_ptr) {
                             if cset.contains(&ridx) {
-                                if let Some(new_ptr) = self.evacuate_object(
+                                // Step 9: `fresh` ignored (see the Array branch).
+                                if let Some((new_ptr, _fresh)) = self.evacuate_object(
                                     regions,
                                     ref_ptr,
                                     pointer_map,
                                     objects_copied,
                                     bytes_copied,
+                                    cset,
                                 ) {
                                     let new_value = Value::Object(Some(unsafe {
                                         ObjectRef::from_raw(new_ptr)
@@ -2713,7 +3735,7 @@ impl G1Collector {
     /// Returns `Some(idx)` iff `addr` falls within `[base, base + region_size)`
     /// for some region. The check uses `self.config.region_size` instead of
     /// the per-region `data.len()` because every region's backing buffer is
-    /// allocated at exactly `region_size` bytes (see [`G1Region::new`]).
+    /// allocated at exactly `region_size` bytes (see [`G1Region::from_arena`]).
     #[inline]
     fn lookup_region_for_addr(&self, addr: usize) -> Option<usize> {
         // Find the largest base address that is <= addr.
@@ -2734,19 +3756,16 @@ impl G1Collector {
     }
 
     // -----------------------------------------------------------------------
-    // Humongous object addressing (round-12 gc C2)
+    // Humongous object addressing
     // -----------------------------------------------------------------------
     //
-    // A humongous object spans several non-contiguous `G1Region.data`
-    // buffers. Each region carries a HEADER_SIZE prefix (real ObjectHeader on
-    // the start region, HumongousFiller sentinel on continuations) followed by
-    // `region_size - HEADER_SIZE` payload bytes. Logical payload byte `P`
-    // (0-based, i.e. measured from the end of the object's ObjectHeader)
-    // therefore lives in region `start + P / usable` at physical offset
-    // `HEADER_SIZE + (P % usable)`.
-    //
-    // The accessors below translate every field/array access through this map
-    // so a read/write can never fall outside the object's own backing memory.
+    // A humongous object spans a contiguous run of region indices, which —
+    // because all regions are adjacent slices of one `arena` — is one
+    // physically-contiguous block. The real `ObjectHeader` sits at offset 0 of
+    // the start region and the payload flows straight through, so logical
+    // payload byte `P` lives at `start_addr + HEADER_SIZE + P`. The accessors
+    // below could read/write that flat range directly; `humongous_copy` is
+    // retained so the existing field/array accessor call sites are unchanged.
 
     /// If `obj`'s start address names a `HumongousStart` region, return the
     /// start region index and the total payload byte count (object size minus
@@ -2770,13 +3789,11 @@ impl G1Collector {
 
     /// `true` iff `obj`'s start address names a `HumongousStart` region.
     ///
-    /// A humongous object's payload is laid out across several
-    /// NON-contiguous region buffers (each with its own HEADER_SIZE prefix),
-    /// so it has no single valid contiguous data pointer. Callers that would
-    /// otherwise hand out `obj.as_ptr() + HEADER_SIZE` and walk a flat
-    /// `[base, base + len*stride)` range must instead route through the
-    /// region-aware per-element accessors (`get_array_element` /
-    /// `set_array_element`) when this returns `true`.
+    /// The object's payload is one contiguous block (the regions are adjacent
+    /// arena slices), so a flat `obj.as_ptr() + HEADER_SIZE + i*stride` access
+    /// is valid for callers — this predicate is retained for the GC-internal
+    /// accessor routing and for callers that must distinguish humongous (e.g.
+    /// to skip evacuation of an in-place, non-relocated object).
     ///
     /// This is the size-independent sibling of `humongous_span` (which also
     /// needs the object's total size to compute the payload byte count).
@@ -2792,28 +3809,21 @@ impl G1Collector {
     }
 
     /// Copy `len` bytes of a humongous object's payload, starting at logical
-    /// payload offset `payload_off`, between the (region-fragmented) heap
-    /// backing store and the caller-provided `buf`.
+    /// payload offset `payload_off`, between the heap backing store and the
+    /// caller-provided `buf`.
     ///
-    /// `write == true` copies `buf -> heap`; otherwise `heap -> buf`. Every
-    /// byte is bounds-checked against the owning region's payload capacity and
-    /// against `total_payload`, so a straddling element (the per-region
-    /// payload capacity is not necessarily a multiple of the element/slot
-    /// size, since HEADER_SIZE is not a power-of-two divisor of region_size)
-    /// is handled correctly by splitting across the two regions. Returns
-    /// `false` if the access would exceed the object's payload (checked up
-    /// front, before any copy) — the caller turns that into a dropped access,
-    /// exactly as the `index >= len` bounds checks do. The per-region checks
-    /// inside the loop are defense-in-depth and are unreachable for a
-    /// well-formed humongous span (the allocator reserves
-    /// `payload_bytes.div_ceil(usable)` regions, so the region run always
-    /// covers `total_payload`).
+    /// `write == true` copies `buf -> heap`; otherwise `heap -> buf`. The
+    /// humongous object is one contiguous block (its regions are adjacent
+    /// arena slices), so this is a single bounds-checked `memcpy` at
+    /// `start_addr + HEADER_SIZE + payload_off`. Returns `false` if the access
+    /// would exceed the object's payload (checked up front, before any copy) —
+    /// the caller turns that into a dropped access, exactly as the `index >=
+    /// len` bounds checks do.
     ///
     /// SAFETY: callers hold the `regions` lock for the duration, so the region
-    /// buffers are not concurrently reset/reallocated (the `Vec<G1Region>` is
-    /// never resized and each `data` Vec is never reallocated — only
-    /// zero-filled by `reset`). `start` must be a `HumongousStart` index with
-    /// `regions_needed` valid continuation regions following it.
+    /// classification (and thus the reserved arena span) is stable. `start`
+    /// must be a `HumongousStart` index and `total_payload` the object's
+    /// payload byte count (object size minus the single `ObjectHeader`).
     fn humongous_copy(
         &self,
         regions: &[G1Region],
@@ -2824,11 +3834,6 @@ impl G1Collector {
         len: usize,
         write: bool,
     ) -> bool {
-        let region_size = self.config.region_size;
-        let usable = match region_size.checked_sub(HEADER_SIZE) {
-            Some(u) if u > 0 => u,
-            _ => return false,
-        };
         // Reject any access whose end exceeds the object's payload.
         let end = match payload_off.checked_add(len) {
             Some(e) => e,
@@ -2837,43 +3842,26 @@ impl G1Collector {
         if end > total_payload {
             return false;
         }
+        if start >= regions.len() {
+            return false;
+        }
 
-        let mut remaining = len;
-        let mut p = payload_off;
-        let mut buf_off = 0usize;
-        while remaining > 0 {
-            let region_slot = p / usable;
-            let within = p % usable;
-            let region_idx = start + region_slot;
-            if region_idx >= regions.len() {
-                return false;
+        // The payload is contiguous from `start_addr + HEADER_SIZE`. Use the
+        // region's integer base address (not the `Deref` slice, whose `len` is
+        // only `region_size`) so the pointer carries arena provenance across
+        // region boundaries.
+        let phys = (regions[start].data.addr() + HEADER_SIZE + payload_off) as *mut u8;
+        // SAFETY: `payload_off + len <= total_payload`, and the humongous span
+        // reserved `ceil(size/region_size)` contiguous arena regions covering
+        // `HEADER_SIZE + total_payload` bytes from `start_addr`, so
+        // `[phys, phys+len)` is inside the object's reserved, contiguous,
+        // arena-backed memory. `buf` is a caller-owned buffer of >= `len` bytes.
+        unsafe {
+            if write {
+                std::ptr::copy_nonoverlapping(buf, phys, len);
+            } else {
+                std::ptr::copy_nonoverlapping(phys, buf, len);
             }
-            let region = &regions[region_idx];
-            // Physical span actually backed by this region's payload.
-            let region_payload = region.cursor.saturating_sub(HEADER_SIZE);
-            if within >= region_payload {
-                return false;
-            }
-            let chunk = remaining.min(region_payload - within).min(usable - within);
-            if chunk == 0 {
-                return false;
-            }
-            // SAFETY: `within < region_payload <= usable` and
-            // `HEADER_SIZE + within + chunk <= cursor <= data.len()`, so the
-            // physical slice is fully inside this region's buffer. `buf` is a
-            // caller-owned buffer of at least `len` bytes.
-            unsafe {
-                let phys = region.data.as_ptr().add(HEADER_SIZE + within) as *mut u8;
-                let dst_src = buf.add(buf_off);
-                if write {
-                    std::ptr::copy_nonoverlapping(dst_src, phys, chunk);
-                } else {
-                    std::ptr::copy_nonoverlapping(phys, dst_src, chunk);
-                }
-            }
-            remaining -= chunk;
-            p += chunk;
-            buf_off += chunk;
         }
         true
     }
@@ -4010,6 +4998,69 @@ mod tests {
         // OOB index is rejected, not a wild write.
         assert!(gc.set_array_element(arr, n, Value::Int(1)).is_err());
         assert!(gc.get_array_element(arr, n).is_err());
+    }
+
+    // G1 SIGSEGV regression (CpuOnlyBench / gpu-bench-cpu): a humongous array
+    // must be ONE physically-contiguous block so the JIT's flat
+    // `base + HEADER_SIZE + i*stride` array addressing — which bypasses the
+    // GC's region-aware accessors entirely — reads/writes every element
+    // correctly. The old region-fragmented layout backed each region with a
+    // SEPARATE `Vec<u8>`, so flat access past the first region's payload hit
+    // unrelated heap memory: silent zero tail at ~1–2 MB arrays, hard SIGSEGV
+    // at ~4 MB+. This test writes/reads through a RAW FLAT POINTER (exactly as
+    // JIT-compiled code does), including a full sweep over every element.
+    #[test]
+    fn humongous_int_array_is_contiguous_for_flat_jit_access() {
+        let gc = make_collector();
+        let n = 400_000; // ~1.6 MB → spans multiple 1 MB regions
+        let arr = gc.alloc_array(ClassId::new(0), ArrayElementType::Int, n);
+        assert!(gc.is_humongous(arr), "test array must be humongous");
+        assert!(gc.count_regions(RegionType::HumongousContinuation) >= 1);
+
+        // Raw flat base pointer to element 0 — what the JIT computes from the
+        // array oop (`obj + HEADER_SIZE`), with no region-aware translation.
+        let base = unsafe { arr.as_ptr().add(HEADER_SIZE) as *mut i32 };
+
+        // 1) GC accessor writes, flat pointer reads back — including the tail
+        //    element, which lives in a continuation region.
+        let probes = [0usize, 1, 262_143, 262_144, 300_000, n - 1];
+        for &i in &probes {
+            gc.set_array_element(arr, i, Value::Int((i as i32).wrapping_mul(31) ^ 0x1234))
+                .unwrap();
+        }
+        for &i in &probes {
+            let v = unsafe { std::ptr::read(base.add(i)) };
+            assert_eq!(
+                v,
+                (i as i32).wrapping_mul(31) ^ 0x1234,
+                "flat JIT-style read mismatch at index {i}"
+            );
+        }
+
+        // 2) Flat pointer writes EVERY element, GC accessor reads back. This is
+        //    the crashing direction: a tight JIT store loop over the whole
+        //    array. Pre-fix this would corrupt unrelated heap / SIGSEGV.
+        for i in 0..n {
+            unsafe { std::ptr::write(base.add(i), i as i32) };
+        }
+        for &i in &[0usize, 100_000, 262_144, 350_000, n - 1] {
+            assert_eq!(
+                gc.get_array_element(arr, i).unwrap().as_int(),
+                Some(i as i32),
+                "accessor read-back mismatch at index {i}"
+            );
+        }
+
+        // 3) Contiguity invariant: the byte just past the last element stays
+        //    inside the reserved span [start, start + regions_needed*region_size).
+        let rs = gc.config.region_size;
+        let total = HEADER_SIZE + n * 4;
+        let regions_needed = total.div_ceil(rs);
+        let start_base = arr.as_ptr() as usize;
+        assert!(
+            start_base + total <= start_base + regions_needed * rs,
+            "humongous tail escapes its reserved contiguous span"
+        );
     }
 
     // Residual humongous-OOB fix: `is_humongous` must distinguish a
@@ -5713,6 +6764,338 @@ mod tests {
         // Reclaim the leaked backing alloc.
         unsafe {
             drop(Box::from_raw(leaked));
+        }
+    }
+
+    // =====================================================================
+    // Step 9 — parallel evacuation tests.
+    //
+    // These call `young_collection_parallel` / `mixed_collection_parallel`
+    // directly so they exercise the multi-threaded evacuator regardless of
+    // the `CRATONVM_G1_PARALLEL_EVAC` env flag (which gates only the public
+    // dispatch). They assert no object is lost, duplicated, or corrupted and
+    // that the result matches the serial path.
+    // =====================================================================
+
+    fn parallel_config(workers: usize, region_count: usize) -> G1CollectorConfig {
+        let region_size = 1024 * 1024;
+        G1CollectorConfig {
+            heap_size: region_size * region_count,
+            region_size,
+            max_gc_pause_ms: 200,
+            ihop_percent: 45,
+            promotion_age: 3,
+            gc_worker_threads: workers,
+            string_dedup_enabled: false,
+            mixed_gc_count_target: 8,
+            old_cset_region_threshold_percent: 10,
+        }
+    }
+
+    #[test]
+    fn parallel_young_basic() {
+        let gc = G1Collector::new(parallel_config(4, 8));
+        let obj = gc.alloc_object(ClassId::new(1), 1);
+        gc.set_field(obj, 0, Value::Int(42));
+        let mut roots = vec![obj];
+        let result = gc.young_collection_parallel(&mut roots, &NoopMonitors);
+        assert!(result.stats.objects_copied >= 1);
+        assert_eq!(gc.get_field(roots[0], 0).as_int(), Some(42));
+    }
+
+    #[test]
+    fn parallel_young_reference_chain() {
+        let gc = G1Collector::new(parallel_config(4, 8));
+        let a = gc.alloc_object(ClassId::new(1), 1);
+        let b = gc.alloc_object(ClassId::new(2), 1);
+        let c = gc.alloc_object(ClassId::new(3), 1);
+        gc.set_field(a, 0, Value::Object(Some(b)));
+        gc.set_field(b, 0, Value::Object(Some(c)));
+        gc.set_field(c, 0, Value::Int(99));
+        let mut roots = vec![a];
+        let result = gc.young_collection_parallel(&mut roots, &NoopMonitors);
+        assert_eq!(result.stats.objects_copied, 3);
+        let na = roots[0];
+        let nb = match gc.get_field(na, 0) {
+            Value::Object(Some(o)) => o,
+            _ => panic!("a->b lost"),
+        };
+        let nc = match gc.get_field(nb, 0) {
+            Value::Object(Some(o)) => o,
+            _ => panic!("b->c lost"),
+        };
+        assert_eq!(gc.get_field(nc, 0).as_int(), Some(99));
+    }
+
+    #[test]
+    fn parallel_young_unreachable_freed() {
+        let gc = G1Collector::new(parallel_config(4, 8));
+        let live = gc.alloc_object(ClassId::new(1), 0);
+        let _dead = gc.alloc_object(ClassId::new(2), 0);
+        let mut roots = vec![live];
+        let result = gc.young_collection_parallel(&mut roots, &NoopMonitors);
+        assert_eq!(result.stats.objects_copied, 1);
+    }
+
+    #[test]
+    fn parallel_pointer_map_remaps_root() {
+        let gc = G1Collector::new(parallel_config(4, 8));
+        let obj = gc.alloc_object(ClassId::new(1), 0);
+        let old = obj.as_ptr() as usize;
+        let mut roots = vec![obj];
+        let r = gc.young_collection_parallel(&mut roots, &NoopMonitors);
+        assert_eq!(r.pointer_map.get(&old), Some(&(roots[0].as_ptr() as usize)));
+        assert_ne!(old, roots[0].as_ptr() as usize);
+    }
+
+    /// Wide fan-out: a root reference array of N distinct objects, each with a
+    /// unique int. Multi-worker evacuation must preserve EVERY element exactly
+    /// once (no loss, no duplication).
+    #[test]
+    fn parallel_young_wide_ref_array() {
+        let gc = G1Collector::new(parallel_config(8, 32));
+        let n = 2000usize;
+        let arr = gc.alloc_array(ClassId::new(0), ArrayElementType::Reference, n);
+        for i in 0..n {
+            let o = gc.alloc_object(ClassId::new(7), 1);
+            gc.set_field(o, 0, Value::Int(i as i32));
+            gc.set_array_element(arr, i, Value::Object(Some(o))).unwrap();
+        }
+        let mut roots = vec![arr];
+        let result = gc.young_collection_parallel(&mut roots, &NoopMonitors);
+        // array + n elements, each evacuated exactly once.
+        assert_eq!(result.stats.objects_copied, n + 1);
+        assert_eq!(result.pointer_map.len(), n + 1);
+        let narr = roots[0];
+        for i in 0..n {
+            let child = match gc.get_array_element(narr, i).unwrap() {
+                Value::Object(Some(o)) => o,
+                _ => panic!("element {i} lost"),
+            };
+            assert_eq!(
+                gc.get_field(child, 0).as_int(),
+                Some(i as i32),
+                "value {i}"
+            );
+        }
+    }
+
+    /// Diamond sharing: P parents each referencing the SAME S shared children.
+    /// The atomic CAS-forwarding must evacuate each shared child exactly once
+    /// under concurrency, so `objects_copied == 1 + P + S`, and every parent
+    /// must end up pointing at the one canonical copy of each child.
+    #[test]
+    fn parallel_young_diamond_shared_children_dedup() {
+        let gc = G1Collector::new(parallel_config(8, 32));
+        let p = 200usize;
+        let s = 50usize;
+        let shared: Vec<ObjectRef> = (0..s)
+            .map(|j| {
+                let c = gc.alloc_object(ClassId::new(9), 1);
+                gc.set_field(c, 0, Value::Int(1000 + j as i32));
+                c
+            })
+            .collect();
+        let arr = gc.alloc_array(ClassId::new(0), ArrayElementType::Reference, p);
+        for i in 0..p {
+            let parent = gc.alloc_object(ClassId::new(8), s);
+            for j in 0..s {
+                gc.set_field(parent, j, Value::Object(Some(shared[j])));
+            }
+            gc.set_array_element(arr, i, Value::Object(Some(parent))).unwrap();
+        }
+        let mut roots = vec![arr];
+        let result = gc.young_collection_parallel(&mut roots, &NoopMonitors);
+        assert_eq!(
+            result.stats.objects_copied,
+            1 + p + s,
+            "shared children must be evacuated exactly once"
+        );
+        assert_eq!(result.pointer_map.len(), 1 + p + s);
+        let narr = roots[0];
+        let parent0 = match gc.get_array_element(narr, 0).unwrap() {
+            Value::Object(Some(o)) => o,
+            _ => panic!(),
+        };
+        let parent_last = match gc.get_array_element(narr, p - 1).unwrap() {
+            Value::Object(Some(o)) => o,
+            _ => panic!(),
+        };
+        for j in 0..s {
+            let c0 = match gc.get_field(parent0, j) {
+                Value::Object(Some(o)) => o,
+                _ => panic!(),
+            };
+            let cl = match gc.get_field(parent_last, j) {
+                Value::Object(Some(o)) => o,
+                _ => panic!(),
+            };
+            assert_eq!(
+                c0.as_ptr(),
+                cl.as_ptr(),
+                "shared child {j} must be one canonical object after evac"
+            );
+            assert_eq!(gc.get_field(c0, 0).as_int(), Some(1000 + j as i32));
+        }
+    }
+
+    #[test]
+    fn parallel_young_promotion() {
+        let mut cfg = parallel_config(4, 8);
+        cfg.promotion_age = 1;
+        let gc = G1Collector::new(cfg);
+        let obj = gc.alloc_object(ClassId::new(1), 1);
+        gc.set_field(obj, 0, Value::Int(7));
+        let mut roots = vec![obj];
+        // First parallel young GC: Survivor, age -> 1.
+        gc.young_collection_parallel(&mut roots, &NoopMonitors);
+        assert!(gc.get_header(roots[0]).gc_age >= 1);
+        assert_eq!(gc.get_field(roots[0], 0).as_int(), Some(7));
+        // Second: age >= promotion_age -> promote to Old.
+        gc.young_collection_parallel(&mut roots, &NoopMonitors);
+        assert!(gc.count_regions(RegionType::Old) >= 1);
+        assert_eq!(gc.get_field(roots[0], 0).as_int(), Some(7));
+    }
+
+    #[test]
+    fn parallel_mixed_basic() {
+        let mut cfg = parallel_config(4, 16);
+        cfg.promotion_age = 1;
+        let gc = G1Collector::new(cfg);
+        let a = gc.alloc_object(ClassId::new(1), 1);
+        gc.set_field(a, 0, Value::Int(11));
+        let b = gc.alloc_object(ClassId::new(2), 1);
+        gc.set_field(b, 0, Value::Int(22));
+        let mut roots = vec![a, b];
+        gc.young_collection_parallel(&mut roots, &NoopMonitors); // -> Survivor
+        gc.young_collection_parallel(&mut roots, &NoopMonitors); // -> Old
+        assert!(gc.count_regions(RegionType::Old) >= 1);
+        // Parallel mixed collection (young empty, old region(s) in CSet).
+        let _r = gc.mixed_collection_parallel(&mut roots, &NoopMonitors);
+        assert_eq!(gc.get_field(roots[0], 0).as_int(), Some(11));
+        assert_eq!(gc.get_field(roots[1], 0).as_int(), Some(22));
+    }
+
+    // --- Serial-vs-parallel equivalence (no loss / dup / corruption) ---
+
+    fn build_equiv_graph(gc: &G1Collector, n: usize, s: usize) -> ObjectRef {
+        let shared: Vec<ObjectRef> = (0..s)
+            .map(|j| {
+                let c = gc.alloc_object(ClassId::new(9), 1);
+                gc.set_field(c, 0, Value::Int(1000 + j as i32));
+                c
+            })
+            .collect();
+        let arr = gc.alloc_array(ClassId::new(0), ArrayElementType::Reference, n);
+        for i in 0..n {
+            let parent = gc.alloc_object(ClassId::new(8), 2);
+            gc.set_field(parent, 0, Value::Int(i as i32));
+            gc.set_field(parent, 1, Value::Object(Some(shared[i % s])));
+            gc.set_array_element(arr, i, Value::Object(Some(parent))).unwrap();
+        }
+        arr
+    }
+
+    fn reachable_ints(gc: &G1Collector, root_arr: ObjectRef, n: usize) -> Vec<i32> {
+        let mut vals = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for i in 0..n {
+            let parent = match gc.get_array_element(root_arr, i).unwrap() {
+                Value::Object(Some(o)) => o,
+                _ => panic!("parent {i} lost"),
+            };
+            vals.push(gc.get_field(parent, 0).as_int().unwrap());
+            let child = match gc.get_field(parent, 1) {
+                Value::Object(Some(o)) => o,
+                _ => panic!("child of {i} lost"),
+            };
+            if seen.insert(child.as_ptr()) {
+                vals.push(gc.get_field(child, 0).as_int().unwrap());
+            }
+        }
+        vals.sort();
+        vals
+    }
+
+    /// The serial path, the 1-worker parallel path, and the 8-worker parallel
+    /// path must all copy the same number of objects and preserve the same
+    /// multiset of reachable values. Addresses differ; program-observable
+    /// state does not.
+    #[test]
+    fn parallel_matches_serial_no_loss_or_dup() {
+        let n = 500usize;
+        let s = 40usize;
+
+        // Serial baseline (env flag is unset in the test process, so the public
+        // `young_collection` dispatches to the serial body).
+        let gc_serial = G1Collector::new(parallel_config(1, 32));
+        let arr_s = build_equiv_graph(&gc_serial, n, s);
+        let mut roots_s = vec![arr_s];
+        let res_s = gc_serial.young_collection(&mut roots_s, &NoopMonitors);
+        let vals_s = reachable_ints(&gc_serial, roots_s[0], n);
+
+        // 1-worker parallel (deterministic drain through the parallel code).
+        let gc_p1 = G1Collector::new(parallel_config(1, 32));
+        let arr_p1 = build_equiv_graph(&gc_p1, n, s);
+        let mut roots_p1 = vec![arr_p1];
+        let res_p1 = gc_p1.young_collection_parallel(&mut roots_p1, &NoopMonitors);
+        let vals_p1 = reachable_ints(&gc_p1, roots_p1[0], n);
+
+        // 8-worker parallel (real concurrency + CAS races).
+        let gc_p8 = G1Collector::new(parallel_config(8, 32));
+        let arr_p8 = build_equiv_graph(&gc_p8, n, s);
+        let mut roots_p8 = vec![arr_p8];
+        let res_p8 = gc_p8.young_collection_parallel(&mut roots_p8, &NoopMonitors);
+        let vals_p8 = reachable_ints(&gc_p8, roots_p8[0], n);
+
+        // 1 array + n parents + s shared children.
+        let expected_copied = 1 + n + s;
+        assert_eq!(res_s.stats.objects_copied, expected_copied, "serial count");
+        assert_eq!(res_p1.stats.objects_copied, expected_copied, "p1 count");
+        assert_eq!(res_p8.stats.objects_copied, expected_copied, "p8 count");
+
+        assert_eq!(vals_s, vals_p1, "serial vs 1-worker values diverge");
+        assert_eq!(vals_s, vals_p8, "serial vs 8-worker values diverge");
+    }
+
+    /// Regression for the serial-G1 evacuate-into-CSet-region bug: a young GC
+    /// evacuates ALL survivor regions, so a partially-filled survivor region is
+    /// itself in the CSet. `alloc_in_type_locked` used to reuse it as an
+    /// evacuation *destination*, so survivors were copied into a region Phase 5
+    /// then reset (freed) — silently dropping live objects and leaving every
+    /// reference dangling (the held-tree `got=1` repro). A held object graph must
+    /// survive REPEATED young GCs fully intact. This drives the SERIAL path
+    /// (`young_collection`; the env flag is unset in tests).
+    #[test]
+    fn held_chain_survives_repeated_young_gc() {
+        let gc = make_collector();
+        let n = 50usize;
+        let head = gc.alloc_object(ClassId::new(1), 1);
+        let mut cur = head;
+        for _ in 1..n {
+            let node = gc.alloc_object(ClassId::new(1), 1);
+            gc.set_field(cur, 0, Value::Object(Some(node)));
+            cur = node;
+        }
+        gc.set_field(cur, 0, Value::Int(999)); // tail marker
+        let mut roots = vec![head];
+        for round in 0..6 {
+            let _ = gc.alloc_object(ClassId::new(9), 8); // a little garbage
+            gc.young_collection(&mut roots, &NoopMonitors);
+            // Walk the whole chain: it must still be exactly `n` nodes ending in
+            // the tail marker — no node lost to an evacuate-into-CSet free.
+            let mut count = 0usize;
+            let mut c = roots[0];
+            loop {
+                count += 1;
+                assert!(count <= n, "round {round}: chain longer than {n}");
+                match gc.get_field(c, 0) {
+                    Value::Object(Some(next)) => c = next,
+                    Value::Int(999) => break,
+                    other => panic!("round {round}: chain broke at node {count} -> {other:?}"),
+                }
+            }
+            assert_eq!(count, n, "round {round}: chain length changed (lost nodes)");
         }
     }
 }

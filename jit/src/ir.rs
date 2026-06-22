@@ -175,6 +175,13 @@ pub enum Op {
     /// Result: `Int` ∈ {-1, 0, 1} = sign(left − right), signed. Typically feeds
     /// an `if<cond>` against zero (`lcmp; iflt` ⇒ `left < right`).
     LCmp,
+    /// FP 3-way compare (`fcmpl`/`fcmpg`/`dcmpl`/`dcmpg`). Inputs:
+    /// `[left, right]` (both `Float` or both `Double`). Result: `Int` ∈
+    /// {-1, 0, 1} feeding an `if<cond>` against zero, exactly like [`Op::LCmp`].
+    /// `double` selects `ucomisd` vs `ucomiss`. `nan_greater` is the JVMS
+    /// unordered rule: a NaN operand yields `+1` for the `g` variants
+    /// (`fcmpg`/`dcmpg`) and `-1` for the `l` variants (`fcmpl`/`dcmpl`).
+    FCmp { double: bool, nan_greater: bool },
 
     // ── Type conversion ──────────────────────────────────────────────
     I2L,
@@ -499,12 +506,11 @@ pub struct IrBuilder {
     /// live across the call — found by the conservative GC scan of the spilled
     /// frame, sound because GC is non-moving while a JIT frame is active).
     invoke_info: HashMap<usize, (usize, usize, u8)>,
-    /// inc 26: resolved `ldc2_w` (0x14) long-constant values (`pc → i64`). Set by
-    /// [`Self::set_ldc2w_info`]; an `ldc2_w` pc not present bails to single-pass.
-    /// Only long constants are admitted — a double `ldc2_w` is excluded upstream
-    /// (its consuming double opcode trips `method_uses_double`), so a present
-    /// value is always the `long` bit pattern.
-    ldc2w_info: HashMap<usize, i64>,
+    /// inc 26/35: resolved `ldc2_w` (0x14) constant values (`pc → (bits, is_double)`).
+    /// Set by [`Self::set_ldc2w_info`]; an `ldc2_w` pc not present bails to
+    /// single-pass. `is_double` selects the lowering: a `long` constant becomes
+    /// `Op::Const(Long)` (`lconst`), a `double` constant `Op::ConstF` (`dconst`).
+    ldc2w_info: HashMap<usize, (i64, bool)>,
 }
 
 impl IrBuilder {
@@ -552,7 +558,7 @@ impl IrBuilder {
 
     /// inc 26: supply resolved `ldc2_w` long-constant values (`pc → i64`). Must
     /// be called before [`Self::build`]; an `ldc2_w` pc not present bails.
-    pub fn set_ldc2w_info(&mut self, info: HashMap<usize, i64>) {
+    pub fn set_ldc2w_info(&mut self, info: HashMap<usize, (i64, bool)>) {
         self.ldc2w_info = info;
     }
 
@@ -1312,6 +1318,30 @@ impl IrBuilder {
                     self.push(r);
                     pc += 1;
                 }
+                // fcmpl / fcmpg / dcmpl / dcmpg — FP 3-way compare → int
+                // {-1,0,1}, like `lcmp` but with the JVMS NaN-unordered rule:
+                // a NaN operand yields -1 for the `l` variants (fcmpl/dcmpl) and
+                // +1 for the `g` variants (fcmpg/dcmpg). The result feeds the
+                // same `if<cond>`-against-0 arm as `lcmp`. Only reachable under
+                // the FP gate (`method_uses_fp` ⇒ `ir_emit_fp`); the lowerer
+                // emits `ucomiss`/`ucomisd` (see `Op::FCmp`).
+                0x95 | 0x96 | 0x97 | 0x98 => {
+                    let b = self.pop();
+                    let a = self.pop();
+                    let double = op == 0x97 || op == 0x98; // dcmpl / dcmpg
+                    let nan_greater = op == 0x96 || op == 0x98; // fcmpg / dcmpg
+                    let r = self.add_data(
+                        Op::FCmp {
+                            double,
+                            nan_greater,
+                        },
+                        IrType::Int,
+                        vec![a, b],
+                        pc,
+                    );
+                    self.push(r);
+                    pc += 1;
+                }
                 // iinc
                 0x84 => {
                     let idx = code[pc + 1] as usize;
@@ -1744,6 +1774,20 @@ impl IrBuilder {
                         let ty = match ret_type {
                             b'V' => IrType::Void,
                             b'L' | b'[' => IrType::Ref,
+                            // A `J` (long) return is a 64-bit value node so
+                            // downstream category-2 ops (lstore/lreturn/ladd/…)
+                            // type-check; `static_call_shape` only admits `J`
+                            // returns once the i64::MIN-sentinel collision is
+                            // disambiguated at the call site (see `Op::Call`
+                            // lowering). `D`/`F` returns stay rejected by the
+                            // shape gate until the XMM value tier exists.
+                            b'J' => IrType::Long,
+                            // A `D` (double) return is a 64-bit value node (inc
+                            // 32); admitted by `static_call_shape`, the call-site
+                            // sentinel check already disambiguates it.
+                            b'D' => IrType::Double,
+                            // A `F` (float) return is a 32-bit value node (inc 33).
+                            b'F' => IrType::Float,
                             _ => IrType::Int,
                         };
                         let call = self.graph.add(Op::Call { info_ptr }, ty, inputs, Some(pc));
@@ -1813,6 +1857,15 @@ impl IrBuilder {
                     let ty = match ret_type {
                         b'V' => IrType::Void,
                         b'L' | b'[' => IrType::Ref,
+                        // A `J` (long) return is a 64-bit value node so
+                        // downstream category-2 ops type-check; `static_call_shape`
+                        // only admits `J` returns once the i64::MIN-sentinel
+                        // collision is disambiguated at the call site.
+                        b'J' => IrType::Long,
+                        // A `D` (double) return is a 64-bit value node (inc 32).
+                        b'D' => IrType::Double,
+                        // A `F` (float) return is a 32-bit value node (inc 33).
+                        b'F' => IrType::Float,
                         _ => IrType::Int,
                     };
                     let call = self.graph.add(Op::Call { info_ptr }, ty, inputs, Some(pc));
@@ -1846,6 +1899,15 @@ impl IrBuilder {
                     let ty = match ret_type {
                         b'V' => IrType::Void,
                         b'L' | b'[' => IrType::Ref,
+                        // A `J` (long) return is a 64-bit value node so
+                        // downstream category-2 ops type-check; `static_call_shape`
+                        // only admits `J` returns once the i64::MIN-sentinel
+                        // collision is disambiguated at the call site.
+                        b'J' => IrType::Long,
+                        // A `D` (double) return is a 64-bit value node (inc 32).
+                        b'D' => IrType::Double,
+                        // A `F` (float) return is a 32-bit value node (inc 33).
+                        b'F' => IrType::Float,
                         _ => IrType::Int,
                     };
                     let call = self.graph.add(Op::Call { info_ptr }, ty, inputs, Some(pc));
@@ -1992,6 +2054,35 @@ impl IrBuilder {
                     pc += 1;
                 }
 
+                // freturn (inc 33) / dreturn (inc 32) — an FP return rides RAX as
+                // bits (the JIT i64 return ABI): the interpreter's post-JIT path
+                // reads `result as u64`→`f64::from_bits` (`D`) or `result as u32`
+                // →`f32::from_bits` (`F`), and `lower_terminator`'s `Op::Return`
+                // does `load_to_rax` from the value's slot, so no XMM return
+                // marshalling is needed. Identical to `lreturn`/`ireturn`.
+                //
+                // `float` (inc 33): the slot holds 32 bits; `load_to_rax` reads 64,
+                // so RAX's UPPER 32 are stale — harmless because every consumer
+                // reads only the low 32 (`result as u32`; downstream `MOVSS`). The
+                // one hazard is a `+0.0f` whose stale upper bits make RAX ==
+                // `i64::MIN`: on a `F` CALL result the call-site `dispatch_threw`
+                // peek (extended to `IrType::Float`) disambiguates it, and the
+                // restore (RAX=`i64::MIN`, low-32=0) preserves `+0.0f` — `i64::MIN`
+                // has low-63 = 0, so only `+0.0f` can ever collide.
+                //
+                // Reachable only under the FP gate; the `-0.0`/`Long.MIN_VALUE` ↔
+                // `i64::MIN` collision on a `D`/`F` call result is handled by the
+                // item-1 `dispatch_threw` peek.
+                0xae | 0xaf => {
+                    let val = self.pop();
+                    let ret =
+                        self.graph
+                            .add(Op::Return, IrType::Void, vec![self.ctrl, val], Some(pc));
+                    self.graph.exit = ret;
+                    self.ctrl = NO_NODE;
+                    pc += 1;
+                }
+
                 // return (void)
                 0xb1 => {
                     let ret = self
@@ -2013,18 +2104,22 @@ impl IrBuilder {
                     self.push(c);
                     pc += 1;
                 }
-                // ldc2_w (long constant from the constant pool) — inc 26. The
-                // resolved long value comes from `set_ldc2w_info` (`pc → i64`);
-                // an absent pc bails to single-pass. A double `ldc2_w` is
-                // excluded upstream (its consuming double opcode trips
-                // `method_uses_double`), so a present value is the long bits.
-                // (`ldc2_w` is 3 bytes: opcode + 2-byte CP index.)
+                // ldc2_w (long OR double constant from the constant pool) — inc 26
+                // (long) / inc 35 (double). The resolved `(bits, is_double)` comes
+                // from `set_ldc2w_info`; an absent pc bails to single-pass. A
+                // `double` constant lowers to `dconst` (`Op::ConstF`/`Double`), a
+                // `long` to `lconst` (`Op::Const`/`Long`). (`ldc2_w` is 3 bytes:
+                // opcode + 2-byte CP index.)
                 0x14 => {
-                    let val = match self.ldc2w_info.get(&pc) {
+                    let (val, is_double) = match self.ldc2w_info.get(&pc) {
                         Some(&v) => v,
                         None => return None,
                     };
-                    let c = self.lconst(val);
+                    let c = if is_double {
+                        self.dconst(f64::from_bits(val as u64))
+                    } else {
+                        self.lconst(val)
+                    };
                     self.push(c);
                     pc += 3;
                 }

@@ -174,14 +174,17 @@ fn arrstore_check(
     // (arenas stay mapped) even if the contents are garbage.
     let (class_id_raw, kind_byte, elem_byte, array_len) = unsafe {
         (
+            // Cast: reinterpret raw header byte pointer as *const u32 to read packed fields
             (p as *const u32).read_unaligned(),
             *p.add(4),
             *p.add(5),
+            // Cast: reinterpret raw header byte pointer as *const u32 to read packed fields
             (p.add(12) as *const u32).read_unaligned(),
         )
     };
     // ObjectKind::Array == 1; ArrayElementType has < 16 variants; a real
     // array_length is <= i32::MAX. Anything else = garbage header = stale ref.
+    // Widening: i32::MAX -> u32 (positive constant fits in u32)
     let plausible = kind_byte == 1 && elem_byte < 16 && array_len <= i32::MAX as u32;
     if plausible {
         return;
@@ -194,6 +197,7 @@ fn arrstore_check(
     }
     eprintln!(
         "[arrstore] #{k} {op} through GARBAGE-HEADER receiver @0x{:x}: class_id_raw={} kind_byte={} elem_byte={} array_len={} index={}",
+        // Cast: raw pointer to integer address for diagnostic formatting
         p as usize, class_id_raw, kind_byte, elem_byte, array_len, index,
     );
     eprintln!("[arrstore] Java stack (top first):");
@@ -254,7 +258,9 @@ fn mtroots_set_gc_ctx(shared: &SharedVm, thread: &JvmThread, reason: u8) {
     if mtroots_on() {
         cratonvm_gc::gen_heap::set_gc_context(
             reason,
+            // Widening: smaller value -> u32 (value fits)
             thread.thread_id.0 as u32,
+            // Widening: smaller value -> u32 (value fits)
             shared.gc_barrier.blocked_count() as u32,
         );
     }
@@ -332,6 +338,7 @@ fn mtroots_selfcheck(thread: &JvmThread, heap: &crate::memory::VmHeap, location:
         let mut objs: Vec<ObjectRef> = Vec::new();
         frame.scan_local_objects(&mut objs, heap);
         for o in objs {
+            // SAFETY: `o` is a live ObjectRef scanned from this frame; its pointer is a valid heap address with at least a 16-byte readable header.
             let hdr: [u8; 16] = unsafe { std::ptr::read(o.as_ptr() as *const [u8; 16]) };
             if hdr == [0u8; 16] {
                 eprintln!(
@@ -701,6 +708,7 @@ fn note_gc_productivity(shared: &SharedVm, before_live: usize) {
     let after_live = shared.heap.allocated_bytes();
     let freed = before_live.saturating_sub(after_live);
     // unproductive: freed < 2% of capacity
+    // Cast: numeric/representation conversion
     let unproductive = (freed as u128) * 100 < (cap as u128) * 2;
     let streak = if unproductive {
         shared
@@ -1309,6 +1317,7 @@ fn tlab_alloc_object(
         // fits in u64 so `as u64` is exact.
         shared
             .bytes_allocated_total
+            // Widening: smaller integer -> 64-bit (zero/sign-extended, value preserved)
             .fetch_add(total_size as u64, Ordering::Relaxed);
         // SAFETY: ptr was produced by TLAB allocation and points at a valid object header within the heap arena.
         return Some(unsafe { ObjectRef::from_raw(ptr) });
@@ -1369,6 +1378,7 @@ fn tlab_alloc_object(
             shared.tlab_hit_count.fetch_add(1, Ordering::Relaxed);
             shared
                 .bytes_allocated_total
+                // Widening: smaller integer -> 64-bit (zero/sign-extended, value preserved)
                 .fetch_add(total_size as u64, Ordering::Relaxed);
             // SAFETY: ptr was produced by TLAB allocation and points at a valid object header within the heap arena.
             return Some(unsafe { ObjectRef::from_raw(ptr) });
@@ -1452,6 +1462,7 @@ pub(crate) fn alloc_object_shared(
         .map(|obj| {
             shared
                 .bytes_allocated_total
+                // Widening: smaller integer -> 64-bit (zero/sign-extended, value preserved)
                 .fetch_add(total_size as u64, std::sync::atomic::Ordering::Relaxed);
             obj
         })
@@ -1580,6 +1591,7 @@ fn scan_frame_roots(frame: &Frame, out: &mut Vec<ObjectRef>, heap: &crate::memor
         let mut write = before;
         for read in before..len {
             let o = out[read];
+            // Cast: object/code pointer to integer address
             if heap.is_object_address(o.as_ptr() as usize).is_some() {
                 out[write] = o;
                 write += 1;
@@ -1691,6 +1703,7 @@ pub(crate) fn update_root_snapshot(shared: &SharedVm, thread: &mut JvmThread) {
                 let mut write = before;
                 for read in before..len {
                     let o = snapshot[read];
+                    // Cast: object/code pointer to integer address
                     if shared.heap.is_object_address(o.as_ptr() as usize).is_some() {
                         snapshot[write] = o;
                         write += 1;
@@ -1748,7 +1761,9 @@ pub(crate) fn update_root_snapshot(shared: &SharedVm, thread: &mut JvmThread) {
         use std::sync::atomic::Ordering::Relaxed;
         drop(snapshot); // release the lock before the (rare) print
         let calls = ROOTSNAP_CALLS.fetch_add(1, Relaxed) + 1;
+        // Widening: smaller integer -> 64-bit (zero/sign-extended, value preserved)
         ROOTSNAP_NANOS.fetch_add(t0.elapsed().as_nanos() as u64, Relaxed);
+        // Widening: smaller integer -> 64-bit (zero/sign-extended, value preserved)
         ROOTSNAP_FRAMES.fetch_add(nframes as u64, Relaxed);
         if calls % 200_000 == 0 {
             let nanos = ROOTSNAP_NANOS.load(Relaxed);
@@ -1757,7 +1772,9 @@ pub(crate) fn update_root_snapshot(shared: &SharedVm, thread: &mut JvmThread) {
                 "[ROOTSNAP] calls={} total_ms={} avg_us={:.2} avg_frames={:.1}",
                 calls,
                 nanos / 1_000_000,
+                // Cast: numeric/representation conversion
                 (nanos as f64 / calls as f64) / 1000.0,
+                // Cast: numeric/representation conversion
                 frames as f64 / calls as f64,
             );
         }
@@ -1800,6 +1817,7 @@ fn safepoint_check(shared: &SharedVm, thread: &mut JvmThread) {
             let n = top.locals_len().min(10);
             for i in 0..n {
                 let raw = top.get_local_raw(i);
+                // Widening: small integer index -> usize (non-negative, fits in pointer width)
                 let p = (raw & 0x0000_7fff_ffff_ffff) as usize;
                 let mut extra = String::new();
                 if p != 0 && p % 8 == 0 && shared.heap.is_heap_addr(p).is_some() {
@@ -1810,12 +1828,14 @@ fn safepoint_check(shared: &SharedVm, thread: &mut JvmThread) {
                         (
                             *q.add(4),
                             *q.add(5),
+                            // Cast: reinterpret pointer/address to typed pointer
                             (q.add(12) as *const u32).read_unaligned(),
                         )
                     };
                     extra = format!(
                         " [heap obj kind={kind_b} elem={elem_b} len={alen} data=0x{:x}..0x{:x}]",
                         p + 40,
+                        // Widening: small unsigned (u8/u16/i32 index) -> usize (non-negative, fits)
                         p + 40 + (alen as usize) * 8,
                     );
                 }
@@ -1926,8 +1946,10 @@ pub(crate) fn apply_pointer_map_to_thread(
         // non-initiator safepoint-resume path was the missing third site. Keep
         // it consistent with the relocated object, identically to those two.
         if let Some(ref mut obj_ref) = frame.monitor_on_exit {
+            // Cast: object/code pointer to integer address
             let old_addr = obj_ref.as_ptr() as usize;
             if let Some(&new_addr) = pointer_map.get(&old_addr) {
+                // SAFETY: new_addr was produced by pointer_map and points at the relocated, valid object header within the heap arena.
                 *obj_ref = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
             }
         }
@@ -1978,29 +2000,37 @@ pub(crate) fn apply_pointer_map_to_thread(
     // address (surfaced as the `java/lang/Object.handle` NoSuchMethodError
     // storm). Forward the same set those two siblings do.
     for obj_ref in &mut thread.native_pin_roots {
+        // Cast: object/code pointer to integer address
         let old_addr = obj_ref.as_ptr() as usize;
         if let Some(&new_addr) = pointer_map.get(&old_addr) {
+            // SAFETY: new_addr was produced by pointer_map and points at the relocated, valid object header within the heap arena.
             *obj_ref = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
         }
     }
     if let Some(ref mut obj_ref) = thread.native_pending_return {
+        // Cast: object/code pointer to integer address
         let old_addr = obj_ref.as_ptr() as usize;
         if let Some(&new_addr) = pointer_map.get(&old_addr) {
+            // SAFETY: new_addr was produced by pointer_map and points at the relocated, valid object header within the heap arena.
             *obj_ref = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
         }
     }
     for (_key_id, key_ref, val) in &mut thread.scoped_values {
         if let Some(obj_ref) = key_ref {
+            // Cast: object/code pointer to integer address
             let old_addr = obj_ref.as_ptr() as usize;
             if let Some(&new_addr) = pointer_map.get(&old_addr) {
+                // SAFETY: new_addr was produced by pointer_map and points at the relocated, valid object header within the heap arena.
                 *obj_ref = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
             }
         }
         update_value_ref(val, pointer_map);
     }
     if let Some(ref mut obj_ref) = thread.pending_async_exception {
+        // Cast: object/code pointer to integer address
         let old_addr = obj_ref.as_ptr() as usize;
         if let Some(&new_addr) = pointer_map.get(&old_addr) {
+            // SAFETY: new_addr was produced by pointer_map and points at the relocated, valid object header within the heap arena.
             *obj_ref = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
         }
     }
@@ -2031,9 +2061,12 @@ pub(crate) fn apply_pointer_map_to_thread(
             let cn = frame.class_name();
             let mn = frame.method_name();
             for li in 0..frame.locals_len() {
+                // Cast: numeric/representation conversion
                 if let crate::types::Value::Object(Some(o)) = frame.get_local(li as u16) {
+                    // Cast: object/code pointer to integer address
                     let a = o.as_ptr() as usize;
                     if a != 0 {
+                        // SAFETY: `a` is a non-null heap address from a live Object local; reading its ObjectHeader is valid for the lifetime of the borrow.
                         let h = unsafe { &*(a as *const ObjectHeader) };
                         if h.class_id.as_u32() == 0 && h.num_slots == 0 && h.array_length == 0 {
                             eprintln!(
@@ -2047,8 +2080,10 @@ pub(crate) fn apply_pointer_map_to_thread(
             let mut stk = Vec::new();
             frame.stack.scan_object_refs(&mut stk, heap);
             for o in stk {
+                // Cast: object/code pointer to integer address
                 let a = o.as_ptr() as usize;
                 if a != 0 {
+                    // SAFETY: `a` is a non-null heap address from a live Object stack slot; reading its ObjectHeader is valid for the lifetime of the borrow.
                     let h = unsafe { &*(a as *const ObjectHeader) };
                     if h.class_id.as_u32() == 0 && h.num_slots == 0 && h.array_length == 0 {
                         eprintln!(
@@ -2092,6 +2127,7 @@ pub(crate) fn remap_rs_cache_after_gc(
     if !pointer_map.is_empty() {
         for (_seq, roots) in thread.rs_cache.iter_mut() {
             for r in roots.iter_mut() {
+                // Cast: object/code pointer to integer address
                 if let Some(&new_addr) = pointer_map.get(&(r.as_ptr() as usize)) {
                     // SAFETY: new_addr came from the GC's pointer_map and points
                     // at the relocated object's header within the heap arena —
@@ -2359,6 +2395,7 @@ fn derive_exec_depth_ceiling(native_stack_bytes: usize) -> u32 {
     let usable = native_stack_bytes / NATIVE_STACK_SAFETY_DIVISOR;
     let levels = usable / NATIVE_STACK_BYTES_PER_EXEC_LEVEL;
     // Clamp into u32 and apply the floor.
+    // Widening: small unsigned (u8/u16/i32 index) -> usize (non-negative, fits)
     let levels = levels.min(u32::MAX as usize) as u32;
     levels.max(MIN_EXEC_DEPTH_CEILING)
 }
@@ -2393,6 +2430,7 @@ const MIN_JIT_DISPATCH_DEPTH_CEILING: u32 = 64;
 fn derive_jit_dispatch_depth_ceiling(native_stack_bytes: usize) -> u32 {
     let usable = native_stack_bytes / NATIVE_STACK_SAFETY_DIVISOR;
     let levels = usable / NATIVE_STACK_BYTES_PER_JIT_DISPATCH_LEVEL;
+    // Widening: small unsigned (u8/u16/i32 index) -> usize (non-negative, fits)
     let levels = levels.min(u32::MAX as usize) as u32;
     levels.max(MIN_JIT_DISPATCH_DEPTH_CEILING)
 }
@@ -2561,6 +2599,7 @@ pub fn execute(
             .map(|c| c.name.to_string())
             .unwrap_or_else(|| format!("cid#{class_id:?}"));
         crate::dispatch_trace::record_bytecode(
+            // Widening: small integer index -> usize (non-negative, fits in pointer width)
             thread.thread_id.0 as usize,
             &class_name_owned,
             method_name,
@@ -3199,11 +3238,14 @@ pub fn execute(
                         let invoc_key = {
                             let mut h = 0u32;
                             for &b in method_name.as_bytes() {
+                                // Widening: smaller value -> u32 (value fits)
                                 h = h.wrapping_mul(31).wrapping_add(b as u32);
                             }
                             for &b in method_descriptor.as_bytes() {
+                                // Widening: smaller value -> u32 (value fits)
                                 h = h.wrapping_mul(31).wrapping_add(b as u32);
                             }
+                            // Widening: smaller integer -> 64-bit (zero/sign-extended, value preserved)
                             ((class_id.as_u32() as u64) << 32) | (h as u64)
                         };
                         let n = shared.profile_store.increment_invocation(invoc_key);
@@ -3538,6 +3580,7 @@ pub fn execute(
                             for &(pc_ldc, cp_idx) in &scan.ldc_ops {
                                 match class.constant_pool.get(cp_idx) {
                                     Some(ConstantPoolEntry::Integer(v)) => {
+                                        // Widening: i32 -> i64 (sign-extended, JVM i2l)
                                         ldc_info_early.push((pc_ldc, *v as i64));
                                         // Cast: JIT ABI — i64 register convention
                                     }
@@ -4002,13 +4045,37 @@ pub fn execute(
                                 } else {
                                     false
                                 };
+                                // Divide-by-zero direct-throw drain (sibling of the
+                                // NPE/AIOOBE blocks above). The JIT div-by-zero stub sets
+                                // `JIT_PENDING_ARITHMETIC` and returns i64::MIN; route the
+                                // `ArithmeticException` into `jit_early_exception` so the
+                                // post-frame-push handler walker can catch it in the JIT'd
+                                // method, instead of re-running from entry (which double-
+                                // executes side effects preceding the trap).
+                                let arith_routed = if crate::jit::helpers::take_jit_pending_arithmetic() {
+                                    match crate::runtime::exceptions::throw_runtime_error(
+                                        shared,
+                                        thread,
+                                        RuntimeError::ArithmeticException {
+                                            message: "/ by zero".to_string(),
+                                        },
+                                    ) {
+                                        MethodCallFailed::ExceptionThrown(exc) => {
+                                            jit_early_exception = Some(exc);
+                                            true
+                                        }
+                                        other => return Err(other),
+                                    }
+                                } else {
+                                    false
+                                };
                                 // Deopt sentinel: i64::MIN means the JIT method was deoptimized
                                 // via jit_uncommon_trap.  Fall through to the interpreter to
                                 // re-execute the method from scratch.
                                 // If an NPE or AIOOBE was routed above, also fall through so
                                 // the post-frame-push exception handler walker (~line 2340)
                                 // gets a chance to catch it in the JIT'd method.
-                                if !npe_routed && !aioobe_routed && result != i64::MIN {
+                                if !npe_routed && !aioobe_routed && !arith_routed && result != i64::MIN {
                                     return match ret_type {
                                         // Cast: JIT ABI -- i64 register convention
                                         b'I' | b'Z' | b'B' | b'C' | b'S' => {
@@ -4016,6 +4083,7 @@ pub fn execute(
                                         }
                                         b'J' => Ok(Some(Value::Long(result))),
                                         b'F' => {
+                                            // Cast: integer word reinterpreted as float/double bit pattern
                                             Ok(Some(Value::Float(f32::from_bits(result as u32))))
                                         } // Cast: JIT ABI -- i64 register convention
                                         b'D' => {
@@ -4735,6 +4803,7 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                         if next2 == 0x60
                             && next3 >= 0x3b
                             && next3 <= 0x3e
+                            // Widening: small integer index -> usize (non-negative, fits in pointer width)
                             && (next3 - 0x3b) as usize == local_idx
                         // Cast: bytecode operand decoding
                         {
@@ -5874,6 +5943,7 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                     let va = frame.stack.pop_int_unchecked();
                     frame
                         .stack
+                        // Widening: smaller value -> u32 (value fits)
                         .push_int_unchecked(va.wrapping_shl(vb as u32 & 0x1f));
                     frame.pc = saved_pc + 1;
                     continue;
@@ -5884,6 +5954,7 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                     let va = frame.stack.pop_int_unchecked();
                     frame
                         .stack
+                        // Widening: smaller value -> u32 (value fits)
                         .push_int_unchecked(va.wrapping_shr(vb as u32 & 0x1f));
                     frame.pc = saved_pc + 1;
                     continue;
@@ -5894,6 +5965,7 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                     let va = frame.stack.pop_int_unchecked();
                     frame
                         .stack
+                        // Widening: smaller value -> u32 (value fits)
                         .push_int_unchecked(((va as u32).wrapping_shr(vb as u32 & 0x1f)) as i32);
                     frame.pc = saved_pc + 1;
                     continue;
@@ -6260,6 +6332,7 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                 // skip the unchecked arm and fall through to the
                 // bounds-checked slow path (which re-decodes from `saved_pc`,
                 // unchanged here).
+                // Widening: small unsigned (u8/u16/i32 index) -> usize (non-negative, fits)
                 0x15 | 0x17 | 0x19 if (b1 as usize) < frame.max_locals as usize => {
                     let mut v = frame.get_local_unchecked(b1 as usize); // Cast: bytecode operand decoding
                     if opcode == 0x19 {
@@ -6276,6 +6349,7 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                 // lossy `to_value()`/`from_value()` round-trip that dropped
                 // collision-pattern longs (see lload_0..3 above).
                 // H7: bounds-guard `b1` (see iload/fload/aload above).
+                // Widening: small unsigned (u8/u16/i32 index) -> usize (non-negative, fits)
                 0x16 | 0x18 if (b1 as usize) < frame.max_locals as usize => {
                     let cv = frame.get_local_compact_unchecked(b1 as usize); // Cast: bytecode operand decoding
                                                                              // Mark the slot's category so a NaN-tag-colliding long is
@@ -6290,6 +6364,7 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                 }
                 // istore (0x36), fstore (0x38)
                 // H7: bounds-guard `b1` (see iload/fload/aload above).
+                // Widening: small unsigned (u8/u16/i32 index) -> usize (non-negative, fits)
                 0x36 | 0x38 if (b1 as usize) < frame.max_locals as usize => {
                     let v = frame.stack.pop_unchecked();
                     frame.set_local_unchecked(b1 as usize, v); // Cast: bytecode operand decoding
@@ -6299,6 +6374,7 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                 // astore (0x3a) — reference local; coerce jlong jobject handles.
                 // Validated to reject aligned non-heap long bits (Letsgo AV).
                 // H7: bounds-guard `b1` (see iload/fload/aload above).
+                // Widening: small unsigned (u8/u16/i32 index) -> usize (non-negative, fits)
                 0x3a if (b1 as usize) < frame.max_locals as usize => {
                     let v = frame.stack.pop_unchecked();
                     frame.set_local_unchecked(
@@ -6310,6 +6386,7 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                 }
                 // lstore (0x37), dstore (0x39) — WP4.3 typed-pop routing.
                 // H7: bounds-guard `b1` (see iload/fload/aload above).
+                // Widening: small unsigned (u8/u16/i32 index) -> usize (non-negative, fits)
                 0x37 | 0x39 if (b1 as usize) < frame.max_locals as usize => {
                     let cv = frame.stack.pop_compact();
                     let v = if opcode == 0x37 {
@@ -7095,6 +7172,7 @@ fn fire_jvmti_exception_catch(frame: &Frame, handler_pc: usize) {
     // we pass 0 here (the interpreter does not track a JVMTI thread id on
     // the per-frame path). Agents that need the id consult `GetCurrentThread`
     // from within the callback.
+    // Widening: smaller integer -> 64-bit (zero/sign-extended, value preserved)
     crate::runtime::jvmti::fire_exception_catch(0, method_id, handler_pc as i64);
 }
 
@@ -7111,9 +7189,11 @@ pub(crate) fn synth_method_id(frame: &Frame) -> u64 {
     let class_id = frame.class_id.as_u32();
     let mut h: u32 = 2166136261;
     for b in frame.method_name().bytes() {
+        // Widening: smaller value -> u32 (value fits)
         h ^= b as u32;
         h = h.wrapping_mul(16777619);
     }
+    // Widening: smaller integer -> 64-bit (zero/sign-extended, value preserved)
     ((class_id as u64) << 32) | (h as u64)
 }
 
@@ -7182,6 +7262,7 @@ fn fire_jvmti_frame_pop_if_requested(thread: &mut JvmThread, was_popped_by_excep
     if thread.frame_pop_requests.is_empty() {
         return;
     }
+    // Widening: smaller value -> u32 (value fits)
     let current_depth = thread.frames.len().saturating_sub(1) as u32;
     if let Some(pos) = thread
         .frame_pop_requests
@@ -7213,6 +7294,7 @@ fn fire_jvmti_single_step(thread: &JvmThread, frame: &Frame, saved_pc: usize) {
         return;
     }
     let method_id = synth_method_id(frame);
+    // Widening: smaller integer -> 64-bit (zero/sign-extended, value preserved)
     crate::runtime::jvmti::fire_single_step(thread.thread_id.0, method_id, saved_pc as i64);
 }
 
@@ -7269,6 +7351,7 @@ fn to_local_value(v: Option<&Value>) -> crate::runtime::jvmti::LocalValue {
         Some(Value::Float(f)) => LV::Float(*f),
         Some(Value::Double(d)) => LV::Double(*d),
         Some(Value::Object(None)) => LV::Object(None),
+        // Cast: object/code pointer to integer address
         Some(Value::Object(Some(r))) => LV::Object(Some(r.as_ptr() as usize as u64)),
         _ => LV::Object(None),
     }
@@ -7362,7 +7445,9 @@ fn find_exception_handler_pc_unknown(
         // when it spans the entire method (always covers the throw site);
         // otherwise skip it (it could catch an out-of-region exception).
         if entry.catch_type == 0 {
+            // Widening: small unsigned (u8/u16/i32 index) -> usize (non-negative, fits)
             if entry.start_pc == 0 && entry.end_pc as usize >= code_len {
+                // Widening: small unsigned (u8/u16/i32 index) -> usize (non-negative, fits)
                 return Some((entry.handler_pc as usize, exc));
             }
             continue;
@@ -7386,6 +7471,7 @@ fn find_exception_handler_pc_unknown(
             }
         };
         if cm_guard.is_subclass_of(exc_class_id, catch_class_id) {
+            // Widening: small unsigned (u8/u16/i32 index) -> usize (non-negative, fits)
             return Some((entry.handler_pc as usize, exc));
         }
     }
@@ -7428,6 +7514,7 @@ fn find_exception_handler_impl(
         }
         // catch_type == 0 means catch-all (finally block) — always matches
         if entry.catch_type == 0 {
+            // Widening: small unsigned (u8/u16/i32 index) -> usize (non-negative, fits)
             return Some((entry.handler_pc as usize, exc));
         }
 
@@ -7460,6 +7547,7 @@ fn find_exception_handler_impl(
         };
 
         if cm_guard.is_subclass_of(exc_class_id, catch_class_id) {
+            // Widening: small unsigned (u8/u16/i32 index) -> usize (non-negative, fits)
             return Some((entry.handler_pc as usize, exc));
         }
     }
@@ -7534,15 +7622,18 @@ fn route_jit_exception_through_method(
         // catch an out-of-region exception); typed handlers still match on
         // exception class — wrong-type exceptions cannot be silently swallowed.
         if pc_unknown {
+            // Widening: small unsigned (u8/u16/i32 index) -> usize (non-negative, fits)
             if entry.catch_type == 0 && !(entry.start_pc == 0 && entry.end_pc as usize >= code_len)
             {
                 continue;
             }
+        // Widening: small unsigned (u8/u16/i32 index) -> usize (non-negative, fits)
         } else if throw_pc < entry.start_pc as usize || throw_pc >= entry.end_pc as usize {
             continue;
         }
 
         if entry.catch_type == 0 {
+            // Widening: small unsigned (u8/u16/i32 index) -> usize (non-negative, fits)
             handler_pc = Some(entry.handler_pc as usize);
             break;
         }
@@ -7567,6 +7658,7 @@ fn route_jit_exception_through_method(
             }
         };
         if cm_guard.is_subclass_of(exc_class_id, catch_class_id) {
+            // Widening: small unsigned (u8/u16/i32 index) -> usize (non-negative, fits)
             handler_pc = Some(entry.handler_pc as usize);
             break;
         }
@@ -7613,7 +7705,9 @@ fn route_jit_exception_through_method(
     thread.refill_pools_from_shared(
         &shared.operand_stack_pool,
         &shared.tag_pool,
+        // Widening: small unsigned (u8/u16/i32 index) -> usize (non-negative, fits)
         cached.max_locals as usize,
+        // Widening: small unsigned (u8/u16/i32 index) -> usize (non-negative, fits)
         (cached.max_stack as usize).max(16) + 8,
     );
 
@@ -7733,7 +7827,11 @@ fn ir_deopt_locals(vals: &[cratonvm_jit::deopt::FrameValue]) -> Option<Vec<Value
     let mut i = 0;
     while i < vals.len() {
         out.push(fv_to_value(&vals[i])?);
-        i += if matches!(vals[i], FrameValue::Long(_)) { 2 } else { 1 };
+        i += if matches!(vals[i], FrameValue::Long(_)) {
+            2
+        } else {
+            1
+        };
     }
     Some(out)
 }
@@ -7786,7 +7884,9 @@ fn resume_from_ir_deopt(
     thread.refill_pools_from_shared(
         &shared.operand_stack_pool,
         &shared.tag_pool,
+        // Widening: small unsigned (u8/u16/i32 index) -> usize (non-negative, fits)
         cached.max_locals as usize,
+        // Widening: small unsigned (u8/u16/i32 index) -> usize (non-negative, fits)
         (cached.max_stack as usize).max(16) + 8,
     );
     let mut frame = crate::runtime::frame::Frame::new_pooled(
@@ -7812,15 +7912,12 @@ fn resume_from_ir_deopt(
     for v in stack_vals {
         frame.stack.push(v).ok()?;
     }
+    // Widening: small unsigned (u8/u16/i32 index) -> usize (non-negative, fits)
     frame.pc = rframe.bci as usize;
     if trace {
         eprintln!(
             "[cratonvm-deopt] PRECISE resume {}.{}{} at bci={} locals={:?}",
-            cached.class_name,
-            cached.method_name,
-            cached.method_descriptor,
-            rframe.bci,
-            locals,
+            cached.class_name, cached.method_name, cached.method_descriptor, rframe.bci, locals,
         );
     }
     push_frame_and_fire_entry(thread, frame);
@@ -7843,6 +7940,7 @@ fn ir_deopt_frame_values_with_objects(
     use cratonvm_jit::deopt::FrameValue;
     vals.iter()
         .map(|v| match v {
+            // Cast: operand reinterpreted as i32 (JVM 32-bit stack word)
             FrameValue::Int(i) => Some(Value::Int(*i as i32)),
             FrameValue::Undefined => Some(Value::Int(0)),
             FrameValue::Object(addr) => {
@@ -7914,7 +8012,9 @@ fn build_deopt_frame_inner(
     thread.refill_pools_from_shared(
         &shared.operand_stack_pool,
         &shared.tag_pool,
+        // Widening: small unsigned (u8/u16/i32 index) -> usize (non-negative, fits)
         cached.max_locals as usize,
+        // Widening: small unsigned (u8/u16/i32 index) -> usize (non-negative, fits)
         (cached.max_stack as usize).max(16) + 8,
     );
 
@@ -7970,6 +8070,7 @@ fn build_deopt_frame_inner(
             return None;
         }
     }
+    // Widening: small unsigned (u8/u16/i32 index) -> usize (non-negative, fits)
     frame.pc = rframe.bci as usize;
     Some(frame)
 }
@@ -8070,12 +8171,40 @@ mod deopt_step3_tests {
             Some(vec![
                 Value::Int(42),
                 Value::Int(0),
+                // SAFETY: test-only sentinel address (0x1000); never dereferenced, only compared for equality.
                 Value::Object(Some(unsafe { ObjectRef::from_raw(0x1000usize as *mut u8) })),
                 Value::Object(None),
             ])
         );
         assert!(ir_deopt_frame_values_with_objects(&[FrameValue::Unsupported]).is_none());
         assert!(ir_deopt_frame_values_with_objects(&[FrameValue::VirtualObjectRef(0)]).is_none());
+    }
+
+    /// ldiv/lrem long deopt-resume: a `long` reconstructs as a full-64-bit
+    /// `Value::Long`, and the LOCALS mapper COLLAPSES the JVM-two-slot snapshot
+    /// (a `long` reserves its upper half as `Undefined`) into the compact arg
+    /// list `copy_args_to_locals` re-expands — so a local after a `long` is not
+    /// mis-aligned. The operand-stack mapper keeps one entry per `long` (already
+    /// compact). A regression in either mapper silently corrupts a resumed
+    /// long-bearing frame at an `ldiv`/`lrem` (or int-div) deopt.
+    #[test]
+    fn long_locals_collapse_and_compact_stack() {
+        // locals: long a@0-1, int n@2  →  JVM-slot-indexed [Long, Undefined, Int].
+        // Collapses to one entry per long (upper-half placeholder dropped) so the
+        // int stays adjacent for the cat-2 re-expansion inside new_pooled.
+        assert_eq!(
+            ir_deopt_locals(&[
+                FrameValue::Long(0x7_0000_0000),
+                FrameValue::Undefined,
+                FrameValue::Int(9),
+            ]),
+            Some(vec![Value::Long(0x7_0000_0000), Value::Int(9)]),
+        );
+        // Operand stack is already compact (one entry per long) — no collapse.
+        assert_eq!(
+            ir_deopt_frame_values(&[FrameValue::Long(123), FrameValue::Long(0)]),
+            Some(vec![Value::Long(123), Value::Long(0)]),
+        );
     }
 
     /// Build a frame with an Int local, a real Object local, and an Int on the
@@ -8087,6 +8216,7 @@ mod deopt_step3_tests {
         let cached = minimal_cached();
 
         let obj = shared.heap.alloc_object(cratonvm_types::ClassId::new(7), 0);
+        // Cast: object/code pointer to integer address
         let addr = obj.as_ptr() as usize as u64;
         let rf = rframe(
             vec![FrameValue::Int(42), FrameValue::Object(addr)],
@@ -8130,6 +8260,7 @@ mod deopt_step3_tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
         let cached = minimal_cached();
         let obj = shared.heap.alloc_object(cratonvm_types::ClassId::new(7), 0);
+        // Cast: object/code pointer to integer address
         let addr = obj.as_ptr() as usize as u64;
         let rf = rframe(vec![FrameValue::Object(addr)], vec![], 3);
 
@@ -8164,12 +8295,14 @@ mod deopt_step3_tests {
         let cached = minimal_cached();
 
         let obj = shared.heap.alloc_object(cratonvm_types::ClassId::new(7), 0);
+        // Cast: object/code pointer to integer address
         let addr = obj.as_ptr() as usize as u64;
         let rf = rframe(vec![FrameValue::Object(addr)], vec![], 0);
 
         let pin_base = thread.native_pin_roots.len();
-        let frame = build_deopt_frame_inner(&shared, &mut thread, &cached, &rf, /* stress */ true)
-            .expect("must build under a forced GC");
+        let frame =
+            build_deopt_frame_inner(&shared, &mut thread, &cached, &rf, /* stress */ true)
+                .expect("must build under a forced GC");
         match frame.get_local(0) {
             Value::Object(Some(o)) => {
                 assert_eq!(shared.heap.class_id_of(o), cratonvm_types::ClassId::new(7));
@@ -8531,6 +8664,7 @@ fn execute_instruction(
             }
             shared
                 .heap
+                // Widening: small unsigned (u8/u16/i32 index) -> usize (non-negative, fits)
                 .set_array_element(array_ref, index as usize, Value::Long(v))
                 .map_err(|i| RuntimeError::ArrayIndexOutOfBoundsException { index: i })?;
         }
@@ -8565,6 +8699,7 @@ fn execute_instruction(
                 })?;
             shared
                 .heap
+                // Widening: small unsigned (u8/u16/i32 index) -> usize (non-negative, fits)
                 .set_array_element(array_ref, index as usize, Value::Double(d))
                 .map_err(|i| RuntimeError::ArrayIndexOutOfBoundsException { index: i })?;
         }
@@ -8740,6 +8875,7 @@ fn execute_instruction(
                 .unwrap_or(0);
             thread.frames[frame_idx].set_local_compact(
                 *index,
+                // Cast: operand reinterpreted as i32 (JVM 32-bit stack word)
                 CompactValue::int(val.wrapping_add(*constant as i32)),
             ); // Cast: bytecode operand decoding
         }
@@ -9134,6 +9270,7 @@ fn execute_instruction(
             } else {
                 *default
             };
+            // Widening: small unsigned (u8/u16/i32 index) -> usize (non-negative, fits)
             thread.frames[frame_idx].pc = (saved_pc as i64 + offset as i64) as usize;
             // Widening: index conversion
         }
@@ -9144,6 +9281,7 @@ fn execute_instruction(
                 .find(|(k, _)| *k == key)
                 .map(|(_, off)| *off)
                 .unwrap_or(*default);
+            // Widening: small unsigned (u8/u16/i32 index) -> usize (non-negative, fits)
             thread.frames[frame_idx].pc = (saved_pc as i64 + offset as i64) as usize;
             // Widening: index conversion
         }
@@ -9209,6 +9347,7 @@ fn execute_instruction(
                 crate::runtime::jvmti::fire_field_access_if_watched(
                     thread.thread_id.0,
                     method_id,
+                    // Widening: smaller integer -> 64-bit (zero/sign-extended, value preserved)
                     field.declaring_class_id.as_u32() as u64,
                     field.field_index,
                 );
@@ -9324,6 +9463,7 @@ fn execute_instruction(
                 crate::runtime::jvmti::fire_field_modification_if_watched(
                     thread.thread_id.0,
                     method_id,
+                    // Widening: smaller integer -> 64-bit (zero/sign-extended, value preserved)
                     field.declaring_class_id.as_u32() as u64,
                     field.field_index,
                 );
@@ -9424,6 +9564,7 @@ fn execute_instruction(
                             eprintln!(
                             "[FIELDADDR] GET {} obj=0x{:x} slot={} num_slots={} readObj={} in {}",
                             fname,
+                            // Cast: object/code pointer to integer address
                             obj_ref.as_ptr() as usize,
                             field.field_index,
                             shared.heap.get_header(obj_ref).num_slots,
@@ -9440,6 +9581,7 @@ fn execute_instruction(
                 // native that drove this method via invoke_virtual), then raise NPE
                 // instead of dereferencing the wild pointer.
                 if crate::runtime::env_cache::badrecv_dbg() {
+                    // Cast: object/code pointer to integer address
                     let p = obj_ref.as_ptr() as usize;
                     if p != 0 && shared.heap.is_heap_addr(p).is_none() {
                         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -9522,6 +9664,7 @@ fn execute_instruction(
                 crate::runtime::jvmti::fire_field_access_if_watched(
                     thread.thread_id.0,
                     method_id,
+                    // Widening: smaller integer -> 64-bit (zero/sign-extended, value preserved)
                     field.declaring_class_id.as_u32() as u64,
                     field.field_index,
                 );
@@ -9558,11 +9701,16 @@ fn execute_instruction(
             if matches!(desc_byte, Some(b'J')) {
                 let bits: i64 = match value {
                     Value::Long(x) => x,
+                    // Cast: float/double raw bit pattern stored in integer word (no value conversion)
                     Value::Double(x) => x.to_bits() as i64,
+                    // Widening: i32 -> i64 (sign-extended, JVM i2l)
                     Value::Int(x) => x as i64,
                     Value::Object(None) | Value::Uninitialized => 0,
+                    // Cast: object/code pointer to integer address
                     Value::Object(Some(raw)) => raw.as_ptr() as usize as i64,
+                    // Cast: float/double raw bit pattern stored in integer word (no value conversion)
                     Value::Float(x) => x.to_bits() as i64,
+                    // Widening: i32 -> i64 (sign-extended, JVM i2l)
                     Value::ReturnAddress(pc) => pc as i64,
                 };
                 thread.frames[frame_idx]
@@ -9571,11 +9719,16 @@ fn execute_instruction(
             } else if matches!(desc_byte, Some(b'D')) {
                 let d: f64 = match value {
                     Value::Double(x) => x,
+                    // Cast: integer word reinterpreted as float/double bit pattern
                     Value::Long(x) => f64::from_bits(x as u64),
+                    // Cast: integer-to-float numeric conversion (JVM i2f/i2d/l2f/l2d semantics)
                     Value::Int(x) => x as f64,
                     Value::Object(None) | Value::Uninitialized => 0.0,
+                    // Cast: object/code pointer to integer address
                     Value::Object(Some(raw)) => f64::from_bits(raw.as_ptr() as usize as u64),
+                    // Cast: integer-to-float numeric conversion (JVM i2f/i2d/l2f/l2d semantics)
                     Value::Float(x) => x as f64,
+                    // Cast: integer-to-float numeric conversion (JVM i2f/i2d/l2f/l2d semantics)
                     Value::ReturnAddress(pc) => pc as f64,
                 };
                 thread.frames[frame_idx]
@@ -9597,7 +9750,9 @@ fn execute_instruction(
                     match value {
                         Value::Object(None) => value = Value::Int(0),
                         Value::Object(Some(raw)) => {
+                            // Cast: object/code pointer to integer address
                             let bits = raw.as_ptr() as usize as u64;
+                            // Cast: operand reinterpreted as i32 (JVM 32-bit stack word)
                             value = Value::Int(bits as i32);
                         }
                         _ => {}
@@ -9662,8 +9817,10 @@ fn execute_instruction(
                     let cv = thread.frames[frame_idx].stack.pop_compact_checked()?;
                     let dv = match cv.tag() {
                         CompactTag::Double => f64::from_bits(cv.raw_bits()),
+                        // Cast: integer word reinterpreted as float/double bit pattern
                         CompactTag::Long => f64::from_bits(cv.as_long_unchecked() as u64),
                         CompactTag::Int => match cv.to_value() {
+                            // Cast: integer-to-float numeric conversion (JVM i2f/i2d/l2f/l2d semantics)
                             Value::Int(x) => x as f64,
                             _ => 0.0,
                         },
@@ -9802,6 +9959,7 @@ fn execute_instruction(
                             eprintln!(
                             "[FIELDADDR] PUT {} obj=0x{:x} slot={} num_slots={} valObj={} in {}",
                             fname,
+                            // Cast: object/code pointer to integer address
                             obj_ref.as_ptr() as usize,
                             field.field_index,
                             shared.heap.get_header(obj_ref).num_slots,
@@ -9821,6 +9979,7 @@ fn execute_instruction(
                 // (operand-stack slot not remapped after a young GC). Rate-limited.
                 if straystack_enabled() {
                     let h = shared.heap.get_header(obj_ref);
+                    // Widening: small unsigned (u8/u16/i32 index) -> usize (non-negative, fits)
                     let ns = h.num_slots as usize;
                     if field.field_index >= ns || h.num_slots > (1 << 24) {
                         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -9830,7 +9989,9 @@ fn execute_instruction(
                             let field_name = resolve_field_name(shared, current_class_id, *index);
                             eprintln!(
                             "[straystack] #{k} STRAY putfield recv@0x{:x} cid={} num_slots={} array_len={} kind={} -> field '{}' idx={} is_ref={} value={:?}",
+                            // Cast: object/code pointer to integer address
                             obj_ref.as_ptr() as usize,
+                            // Truncation: integer -> u8 (intentional low 8 bits)
                             h.class_id.as_u32(), h.num_slots, h.array_length, h.kind as u8,
                             field_name.as_deref().unwrap_or("?"),
                             field.field_index, field.is_reference, value,
@@ -9913,6 +10074,7 @@ fn execute_instruction(
                 crate::runtime::jvmti::fire_field_modification_if_watched(
                     thread.thread_id.0,
                     method_id,
+                    // Widening: smaller integer -> 64-bit (zero/sign-extended, value preserved)
                     field.declaring_class_id.as_u32() as u64,
                     field.field_index,
                 );
@@ -9949,6 +10111,7 @@ fn execute_instruction(
                         crate::runtime::ec_watch::record(
                             obj_ref,
                             field.field_index,
+                            // Cast: object/code pointer to integer address
                             p.as_ptr() as usize,
                             recv_cid.as_u32(),
                         );
@@ -10076,6 +10239,7 @@ fn execute_instruction(
                 thread,
                 ClassId::new(0),
                 element_type,
+                // Widening: small unsigned (u8/u16/i32 index) -> usize (non-negative, fits)
                 length as usize,
             )?;
             thread.frames[frame_idx]
@@ -10124,6 +10288,7 @@ fn execute_instruction(
                 thread,
                 component_class_id,
                 ArrayElementType::Reference,
+                // Widening: small unsigned (u8/u16/i32 index) -> usize (non-negative, fits)
                 length as usize,
             )?;
             thread.frames[frame_idx]
@@ -10456,6 +10621,7 @@ fn execute_instruction(
                             let now_ns = std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
                                 .unwrap_or_default()
+                                // Widening: smaller integer -> 64-bit (zero/sign-extended, value preserved)
                                 .as_nanos() as u64;
                             let mut jfr = shared.flight_recorder.lock();
                             cratonvm_jfr::builtin::emit_java_error_throw_event(
@@ -10463,6 +10629,7 @@ fn execute_instruction(
                                 class_name,
                                 message,
                                 now_ns,
+                                // Widening: smaller integer -> 64-bit (zero/sign-extended, value preserved)
                                 thread.thread_id.0 as u64,
                             );
                         }
@@ -10736,7 +10903,9 @@ fn execute_instruction(
                 // body — both are inside `frame_ref.inner` which is not
                 // mutated by `pop_object_ref_ctx_with` (which only touches
                 // the stack vec). We re-borrow `stack` from a fresh index.
+                // Cast: reinterpret pointer/address to typed pointer
                 let cls_ptr = cls as *const str;
+                // Cast: reinterpret pointer/address to typed pointer
                 let mth_ptr = mth as *const str;
                 let stack = &mut thread.frames[frame_idx].stack;
                 pop_object_ref_ctx_with(stack, &shared.heap, || {
@@ -10824,7 +10993,9 @@ fn execute_instruction(
             let npe_bci = thread.frames[frame_idx].last_instr_pc;
             let obj_ref = {
                 let frame_ref = &thread.frames[frame_idx];
+                // Cast: reinterpret pointer/address to typed pointer
                 let cls_ptr = frame_ref.class_name() as *const str;
+                // Cast: reinterpret pointer/address to typed pointer
                 let mth_ptr = frame_ref.method_name() as *const str;
                 let stack = &mut thread.frames[frame_idx].stack;
                 pop_object_ref_ctx_with(stack, &shared.heap, || {
@@ -10871,6 +11042,7 @@ fn execute_instruction(
             thread.frames[frame_idx]
                 .stack
                 .push(Value::ReturnAddress(return_addr))?;
+            // Widening: small unsigned (u8/u16/i32 index) -> usize (non-negative, fits)
             thread.frames[frame_idx].pc = (saved_pc as i64 + *offset as i64) as usize;
             // Widening: index conversion
         }
@@ -12287,8 +12459,11 @@ fn narrow_int_to_field_type(value: Value, desc_byte: u8) -> Value {
     match value {
         Value::Int(x) => {
             let narrowed = match desc_byte {
-                b'B' => x as i8 as i32,  // byte: sign-extend low 8 bits
+                // JVM spec: narrow to sub-int width then sign/zero-extend back to i32 (i2b/i2s/i2c)
+                b'B' => x as i8 as i32, // byte: sign-extend low 8 bits
+                // JVM spec: narrow to sub-int width then sign/zero-extend back to i32 (i2b/i2s/i2c)
                 b'S' => x as i16 as i32, // short: sign-extend low 16 bits
+                // JVM spec: narrow to sub-int width then sign/zero-extend back to i32 (i2b/i2s/i2c)
                 b'C' => x as u16 as i32, // char: zero-extend low 16 bits
                 b'Z' => x & 1,           // boolean: JVMS stores only bit 0
                 _ => return value,       // I and non-sub-int: unchanged
@@ -12319,6 +12494,7 @@ fn push_static_field_value(
             // Long: accept any primitive (zero-init defaults to Int(0)).
             let lv = match value {
                 Value::Long(x) => x,
+                // Widening: i32 -> i64 (sign-extended, JVM i2l)
                 Value::Int(x) => x as i64,
                 // A freshly zero-initialized static slot decodes as
                 // Object(None) through the Value boundary.  Treat it as
@@ -12341,7 +12517,9 @@ fn push_static_field_value(
         Some(b'D') => {
             let dv = match value {
                 Value::Double(x) => x,
+                // Cast: integer word reinterpreted as float/double bit pattern
                 Value::Long(x) => f64::from_bits(x as u64),
+                // Cast: integer-to-float numeric conversion (JVM i2f/i2d/l2f/l2d semantics)
                 Value::Int(x) => x as f64,
                 Value::Object(None) => 0.0,
                 other => {
@@ -12369,7 +12547,9 @@ fn push_static_field_value(
                 match v {
                     Value::Object(None) => v = Value::Int(0),
                     Value::Object(Some(raw)) => {
+                        // Cast: object/code pointer to integer address
                         let bits = raw.as_ptr() as usize as u64;
+                        // Cast: operand reinterpreted as i32 (JVM 32-bit stack word)
                         v = Value::Int(bits as i32);
                     }
                     _ => {}
@@ -12408,8 +12588,10 @@ fn pop_static_field_value(
             let cv = stack.pop_compact();
             let dv = match cv.tag() {
                 CompactTag::Double => f64::from_bits(cv.raw_bits()),
+                // Cast: integer word reinterpreted as float/double bit pattern
                 CompactTag::Long => f64::from_bits(cv.as_long_unchecked() as u64),
                 CompactTag::Int => match cv.to_value() {
+                    // Cast: integer-to-float numeric conversion (JVM i2f/i2d/l2f/l2d semantics)
                     Value::Int(x) => x as f64,
                     _ => 0.0,
                 },
@@ -12503,8 +12685,10 @@ fn coerce_invoke_arg_for_descriptor(param_desc: &str, v: Value) -> Value {
             // Untagged-long-as-Double: reinterpret the bit pattern. This
             // is the common case for "normal" longs (any value whose
             // upper 16 bits aren't all 1s).
+            // Cast: float/double raw bit pattern stored in integer word (no value conversion)
             Value::Double(d) => Value::Long(d.to_bits() as i64),
             // i2l widening for upstream bytecode that forgot the cast.
+            // Widening: i32 -> i64 (sign-extended, JVM i2l)
             Value::Int(i) => Value::Long(i as i64),
             // Null / Uninitialized → JVMS §2.3 default 0L.
             Value::Object(None) | Value::Uninitialized => Value::Long(0),
@@ -12514,7 +12698,9 @@ fn coerce_invoke_arg_for_descriptor(param_desc: &str, v: Value) -> Value {
             Value::Double(_) => v,
             // A long that hit `Self::Long(x)` via descriptor-aware decode
             // path elsewhere would have raw bits — reinterpret.
+            // Cast: integer word reinterpreted as float/double bit pattern
             Value::Long(x) => Value::Double(f64::from_bits(x as u64)),
+            // Cast: integer-to-float numeric conversion (JVM i2f/i2d/l2f/l2d semantics)
             Value::Int(i) => Value::Double(i as f64),
             Value::Object(None) | Value::Uninitialized => Value::Double(0.0),
             _ => v,
@@ -12538,6 +12724,7 @@ fn decode_arg_kind_aware(cv: CompactValue, is_long: bool, pd_byte: u8) -> Value 
     if is_long {
         match pd_byte {
             b'J' => return Value::Long(cv.as_long_unchecked()),
+            // Cast: integer word reinterpreted as float/double bit pattern
             b'D' => return Value::Double(f64::from_bits(cv.as_long_unchecked() as u64)),
             _ => {}
         }
@@ -12729,6 +12916,7 @@ impl crate::runtime::exceptions::helpful_npe::CpResolver for CpPoolResolver<'_> 
         let class = cm.get_class(self.class_id)?;
         let method = class.find_method(self.method_name, self.method_descriptor)?;
         let code = method.code()?;
+        // Widening: small unsigned (u8/u16/i32 index) -> usize (non-negative, fits)
         let bci_u16 = bci.min(u16::MAX as usize) as u16;
         for attr in &code.attributes {
             if let Attribute::LocalVariableTable(entries) = attr {
@@ -13101,6 +13289,7 @@ fn execute_invoke_kind(
                         // stale-pointer regression — and falls back to
                         // the CP method-ref class so dispatch has a
                         // chance to succeed instead of NPE'ing.
+                        // SAFETY: obj_ref is a live ObjectRef; its pointer is a valid heap address with at least a 16-byte readable header.
                         let header_bytes: [u8; 16] =
                             unsafe { std::ptr::read(obj_ref.as_ptr() as *const [u8; 16]) };
                         if header_bytes == [0u8; 16] {
@@ -13113,7 +13302,10 @@ fn execute_invoke_kind(
                             // ref was a register/native-stack root the sweep
                             // couldn't see — `CRATONVM_DBG_SWEEP_EDGES` silent).
                             if let Some((cid, kind, cycle, reason, initiator, blocked)) =
-                                cratonvm_gc::gen_heap::sweep_zero_lookup(obj_ref.as_ptr() as usize)
+                                // Cast: object/code pointer to integer address
+                                cratonvm_gc::gen_heap::sweep_zero_lookup(
+                                        obj_ref.as_ptr() as usize
+                                    )
                             {
                                 // try_read (not read): this is a debug-only leaf
                                 // path; never risk a re-entrant class_manager
@@ -13207,6 +13399,7 @@ fn execute_invoke_kind(
                             // reference this stale address so we can see HOW
                             // the bad pointer arrived in the receiver slot.
                             if std::env::var_os("CRATONVM_DBG_STALE_RECV").is_some() {
+                                // Cast: object/code pointer to integer address
                                 let stale_addr = obj_ref.as_ptr() as usize;
                                 eprintln!(
                                     "[stale-recv] ptr=0x{:x} method={}.{}{} — Java frames:",
@@ -13225,8 +13418,10 @@ fn execute_invoke_kind(
                                         f.pc,
                                     );
                                     for li in 0..f.locals_len() {
+                                        // Cast: numeric/representation conversion
                                         let v = f.get_local(li as u16);
                                         if let Value::Object(Some(o)) = v {
+                                            // Cast: object/code pointer to integer address
                                             let addr = o.as_ptr() as usize;
                                             let marker =
                                                 if addr == stale_addr { "STALE" } else { "" };
@@ -13234,6 +13429,7 @@ fn execute_invoke_kind(
                                             // local: a non-zero hash means it
                                             // looks live, all-zero means it
                                             // shares the stale fate.
+                                            // SAFETY: `addr` is the heap address of a live Object local; reading its 16-byte header is valid.
                                             let bytes: [u8; 16] =
                                                 unsafe { std::ptr::read(addr as *const [u8; 16]) };
                                             let all_zero = bytes == [0u8; 16];
@@ -13246,9 +13442,11 @@ fn execute_invoke_kind(
                                     for si in 0..f.stack.len() {
                                         let v = f.stack.get_value(si);
                                         if let Value::Object(Some(o)) = v {
+                                            // Cast: object/code pointer to integer address
                                             let addr = o.as_ptr() as usize;
                                             let marker =
                                                 if addr == stale_addr { "STALE" } else { "" };
+                                            // SAFETY: `addr` is the heap address of a live Object stack slot; reading its 16-byte header is valid.
                                             let bytes: [u8; 16] =
                                                 unsafe { std::ptr::read(addr as *const [u8; 16]) };
                                             let all_zero = bytes == [0u8; 16];
@@ -14025,21 +14223,27 @@ fn widen_primitive(from_tok: &str, to_tok: &str, v: Value) -> Value {
     match (from_tok, to_tok, &v) {
         ("I" | "B" | "S" | "C" | "Z", "J", _) => {
             if let Some(i) = as_i32(&v) {
+                // Widening: i32 -> i64 (sign-extended, JVM i2l)
                 return Value::Long(i as i64);
             }
         }
         ("I" | "B" | "S" | "C" | "Z", "F", _) => {
             if let Some(i) = as_i32(&v) {
+                // Cast: integer-to-float numeric conversion (JVM i2f/i2d/l2f/l2d semantics)
                 return Value::Float(i as f32);
             }
         }
         ("I" | "B" | "S" | "C" | "Z", "D", _) => {
             if let Some(i) = as_i32(&v) {
+                // Cast: integer-to-float numeric conversion (JVM i2f/i2d/l2f/l2d semantics)
                 return Value::Double(i as f64);
             }
         }
+        // Cast: integer-to-float numeric conversion (JVM i2f/i2d/l2f/l2d semantics)
         ("J", "F", Value::Long(l)) => return Value::Float(*l as f32),
+        // Cast: integer-to-float numeric conversion (JVM i2f/i2d/l2f/l2d semantics)
         ("J", "D", Value::Long(l)) => return Value::Double(*l as f64),
+        // Cast: numeric/representation conversion
         ("F", "D", Value::Float(f)) => return Value::Double(*f as f64),
         _ => {}
     }
@@ -14155,6 +14359,58 @@ pub fn coerce_lambda_args(
     Ok(())
 }
 
+/// Bug B: distinguish the SAM from a same-name, same-arity *overloaded default*
+/// method on the functional interface. A functional interface may declare
+/// default methods named like the SAM with the same arity but different
+/// parameter types — e.g. `AnnotationFilter`'s SAM `matches(String)` plus
+/// defaults `matches(Class)` / `matches(Annotation)`. The arity guard in
+/// `try_lambda_dispatch` can't tell them apart, so `FILTER.matches(someClass)`
+/// was wrongly routed into the `matches(String)` lambda body (passing a Class
+/// where a String was expected → the lambda always returned false).
+///
+/// Returns `false` when the call is such an overloaded default (so the caller
+/// falls through and runs the real default method, which converts the argument
+/// and re-invokes the SAM). Only CONCRETE (non-`Object`) reference SAM params
+/// are checked; generic/erased (`Object`) and primitive params are skipped, so
+/// the hot stream/lambda path stays byte-identical. A param is treated as
+/// compatible unless the runtime arg is a non-null object provably NOT an
+/// instance of the SAM param type (mirrors the `instanceof` opcode's checks).
+pub(crate) fn lambda_args_sam_compatible(
+    shared: &SharedVm,
+    sam_descriptor: &str,
+    args: &[Value],
+) -> bool {
+    let (params, _ret) = split_method_descriptor(sam_descriptor);
+    for (i, pd) in params.iter().enumerate() {
+        if !pd.starts_with('L') || pd.as_str() == "Ljava/lang/Object;" {
+            continue; // generic/erased or non-reference param — never second-guess
+        }
+        let arg = match args.get(i) {
+            Some(Value::Object(Some(a))) => *a,
+            _ => continue, // null / primitive / missing — don't second-guess
+        };
+        let target = &pd[1..pd.len() - 1];
+        let arg_cid = shared.heap.class_id_of(arg);
+        let (target_cid, base) = {
+            let cm = shared.class_manager.read();
+            match cm.get_loaded_class_id(target) {
+                Some(tcid) => (tcid, arg_cid == tcid || cm.is_subclass_of(arg_cid, tcid)),
+                None => continue, // SAM param type not loaded — can't judge → compatible
+            }
+        };
+        if base
+            || lambda_proxy_satisfies(shared, arg_cid, target_cid)
+            || synthetic_implements(shared, arg_cid, target)
+            || proxy_instance_satisfies_target(shared, arg, target)
+            || annotation_proxy_satisfies_target(shared, arg, target)
+        {
+            continue;
+        }
+        return false; // arg provably not an instance of a concrete SAM param → overloaded default
+    }
+    true
+}
+
 /// Try to dispatch a method call on a lambda proxy object.
 ///
 /// Returns:
@@ -14245,6 +14501,14 @@ pub(crate) fn try_lambda_dispatch(
     // re-invokes the SAM with the right arity.
     if method_name == &*call_site.sam_method_name
         && split_method_descriptor(&call_site.sam_descriptor).0.len() != call_args.len()
+    {
+        return Ok(None);
+    }
+    // Bug B: same name + same arity but mismatched parameter types is an
+    // overloaded interface default (e.g. AnnotationFilter.matches(Class) vs the
+    // SAM matches(String)), not the SAM. Fall through so the real default runs.
+    if method_name == &*call_site.sam_method_name
+        && !lambda_args_sam_compatible(shared, &call_site.sam_descriptor, call_args)
     {
         return Ok(None);
     }
@@ -14481,6 +14745,7 @@ pub(crate) fn try_lambda_dispatch(
         for desc in &descriptors {
             if let Some(callback) = shared.native_methods.find(iface, method_name, desc) {
                 let mut ctx = crate::vm::NativeContextImpl { shared, thread };
+                // Widening: small integer index -> usize (non-negative, fits in pointer width)
                 let _ring_idx = cratonvm_native_api::native_ring::record_enter(callback as usize);
                 let result = callback(&mut ctx, &full_args);
                 cratonvm_native_api::native_ring::record_exit(_ring_idx);
@@ -14854,6 +15119,7 @@ fn invoke_cached_native_callback(
     args: &[Value],
     method_descriptor: &str,
 ) -> Result<(), MethodCallFailed> {
+    // Widening: small integer index -> usize (non-negative, fits in pointer width)
     let _ring_idx = cratonvm_native_api::native_ring::record_enter(callback as usize);
     let result = crate::vm::safe_native_call(shared, thread, callback, args);
     cratonvm_native_api::native_ring::record_exit(_ring_idx);
@@ -15667,6 +15933,7 @@ fn try_stackless_invoke(
         caller
             .exception_table()
             .iter()
+            // Widening: small unsigned (u8/u16/i32 index) -> usize (non-negative, fits)
             .any(|e| invoke_pc >= e.start_pc as usize && invoke_pc < e.end_pc as usize)
     };
     if is_tail_call
@@ -15723,7 +15990,9 @@ fn try_stackless_invoke(
     thread.refill_pools_from_shared(
         &shared.operand_stack_pool,
         &shared.tag_pool,
+        // Widening: small unsigned (u8/u16/i32 index) -> usize (non-negative, fits)
         code_attr.max_locals as usize,
+        // Widening: small unsigned (u8/u16/i32 index) -> usize (non-negative, fits)
         (code_attr.max_stack as usize).max(16) + 8,
     );
     let mut frame = Frame::new_pooled(
@@ -16007,6 +16276,7 @@ fn pop_coerced_invoke_args_intrinsic<'b>(
     with_receiver: bool,
     buf: &'b mut [Value; MAX_INTRINSIC_ARGS],
 ) -> Result<&'b [Value], MethodCallFailed> {
+    // Widening: small unsigned (u8/u16/i32 index) -> usize (non-negative, fits)
     let total = num_params + with_receiver as usize;
     debug_assert!(total <= MAX_INTRINSIC_ARGS);
     // BC SM2 fix (2026-05-28): pop raw CompactValue slots and decode each
@@ -16119,6 +16389,7 @@ fn populate_invoke_cache(
                 let target = CachedInvokeTarget::Intrinsic {
                     kind,
                     callback: cratonvm_native_builtins::intrinsics::callback_for(kind),
+                    // Truncation: usize -> u16 (param count fits in 16 bits per JVM method limit)
                     num_params: num_params as u16,
                     param_descs,
                     return_type,
@@ -16196,6 +16467,7 @@ fn populate_invoke_cache(
             drop(cm);
             let target = CachedInvokeTarget::Native {
                 callback,
+                // Truncation: usize -> u16 (param count fits in 16 bits per JVM method limit)
                 num_params: num_params as u16,
                 gate,
             };
@@ -16364,6 +16636,7 @@ fn execute_invokestatic_cached(
             let args = pop_coerced_invoke_args_intrinsic(
                 thread,
                 frame_idx,
+                // Widening: small unsigned (u8/u16/i32 index) -> usize (non-negative, fits)
                 num_params as usize,
                 &param_descs,
                 false,
@@ -16671,7 +16944,9 @@ fn execute_invokestatic_cached(
             thread.refill_pools_from_shared(
                 &shared.operand_stack_pool,
                 &shared.tag_pool,
+                // Widening: small unsigned (u8/u16/i32 index) -> usize (non-negative, fits)
                 cached.max_locals as usize,
+                // Widening: small unsigned (u8/u16/i32 index) -> usize (non-negative, fits)
                 (cached.max_stack as usize).max(16) + 8,
             );
             let mut frame = Frame::new_pooled_cached(
@@ -17346,6 +17621,7 @@ fn try_osr(
     // allocated this thread's shadow stack — it's the same thread. The value is a
     // raw address (Copy `i64`, holds no borrow), so the closure below captures it
     // by value and `thread` stays free for later use.
+    // Cast: reinterpret pointer/address to typed pointer
     let thread_ptr = thread as *mut JvmThread as i64;
     // NEW-1.5 + T1.1.a: record native stack pointer for GC root scan.
     // Uses the precise-oop-map path when the compiled method has
@@ -17496,11 +17772,70 @@ fn try_osr(
         }
         return None;
     }
+    // Divide-by-zero direct-throw drain on the OSR bail path (sibling of the
+    // NPE/AIOOBE OSR blocks above). Route the `ArithmeticException` through the
+    // OSR'd method's own exception table (the OSR target IS the method whose code
+    // raised it); if a handler covering `entry_pc` is found, jump there and
+    // resume interpreting. Otherwise re-stash the flag so the exception survives
+    // the OSR→interpreter handoff and is surfaced by the next JIT-return drain.
+    if crate::jit::helpers::take_jit_pending_arithmetic() {
+        match crate::runtime::exceptions::throw_runtime_error(
+            shared,
+            thread,
+            RuntimeError::ArithmeticException {
+                message: "/ by zero".to_string(),
+            },
+        ) {
+            MethodCallFailed::ExceptionThrown(exc) => {
+                if let Some((handler_pc, exc_ref)) =
+                    find_exception_handler_any_pc(shared, &thread.frames[frame_idx], entry_pc, exc)
+                {
+                    let frame = &mut thread.frames[frame_idx];
+                    frame.stack.clear();
+                    let _ = frame.stack.push(Value::Object(Some(exc_ref)));
+                    frame.pc = handler_pc;
+                    fire_jvmti_exception_catch(frame, handler_pc);
+                    return None;
+                }
+                // No in-frame handler — re-stash so it is not lost.
+                crate::jit::helpers::stash_jit_pending_arithmetic();
+            }
+            _ => {
+                // Couldn't construct the Java object — re-stash the raw flag.
+                crate::jit::helpers::stash_jit_pending_arithmetic();
+            }
+        }
+        return None;
+    }
     let result_i64 = match result_i64 {
         Ok(Some(v)) => v,
         Ok(None) => return None,
         Err(_) => return None,
     };
+
+    // deopt-osr Step 8: OSR-exit safety. A frame-deopt taken inside the OSR'd
+    // code (e.g. the deopt-osr loop-boundary trigger, or any future guard) stashes
+    // a reconstructed frame in LAST_DEOPT and returns the i64::MIN sentinel. OSR is
+    // *same-frame* replacement, so unlike the `execute_jit_call` sink we must NOT
+    // push a new frame or treat the sentinel as the return value (i64::MIN as i32
+    // == 0 → the corrupt result this guards against). Reject the OSR (clear the
+    // stash, return None): the interpreter simply continues executing THIS frame
+    // from where it was — correct because the trigger bails at the loop header
+    // before committing any JIT loop iteration to the frame. (A true OSR-exit that
+    // transfers JIT-advanced loop state back into the live interpreter frame is a
+    // follow-up — it must overwrite the frame's locals/stack under GC-rooting,
+    // which is coupled to the OSR-frame shadow-stack tracking; see
+    // deopt-osr-steps789-handoff.md.) The non-OSR loop-bci resume path is fully
+    // wired + proven at the `execute_jit_call` sink.
+    if result_i64 == i64::MIN && cratonvm_jit::deopt::take_last_deopt().is_some() {
+        if std::env::var_os("CRATONVM_DBG_DEOPT").is_some() {
+            eprintln!(
+                "[cratonvm-deopt] OSR-exit bail rejected (continue interpreting) {}.{}{} entry_pc={}",
+                &*class_name_arc, &*method_name_arc, &*descriptor_arc, entry_pc
+            );
+        }
+        return None;
+    }
 
     // Convert i64 result back to Value based on return type
     let ret_type = crate::jit::return_type(&method_descriptor);
@@ -17602,6 +17937,7 @@ fn is_elidable_construction(cm: &crate::classloading::ClassManager, class_id: Cl
     if bc.len() != 5 || bc[0] != 0x2a || bc[1] != 0xb7 || bc[4] != 0xb1 {
         return false;
     }
+    // Cast: numeric/representation conversion
     let mref_idx = ((bc[2] as u16) << 8) | bc[3] as u16;
     let cp = &class.constant_pool;
     let nat_idx = match cp.get(mref_idx) {
@@ -17957,12 +18293,14 @@ fn try_jit_upgrade_with_gate(
         Some(cm.find_class_by_name(target_class)?.as_u32())
     };
 
-    let ldc2w_resolver = |cp_idx: u16| -> Option<i64> {
+    let ldc2w_resolver = |cp_idx: u16| -> Option<(i64, bool)> {
         let cm = shared.class_manager.read();
         let class = cm.get_class(class_id)?;
+        // inc 35: report `(bits, is_double)` so the IR builder lowers a `double`
+        // constant to `dconst` and a `long` to `lconst`.
         let val = match class.constant_pool.get(cp_idx)? {
-            ConstantPoolEntry::Long(v) => Some(*v),
-            ConstantPoolEntry::Double(v) => Some(v.to_bits() as i64), // Cast: JIT ABI -- float bits to i64
+            ConstantPoolEntry::Long(v) => Some((*v, false)),
+            ConstantPoolEntry::Double(v) => Some((v.to_bits() as i64, true)), // Cast: JIT ABI -- float bits to i64
             _ => None,
         };
         if std::env::var_os("CRATONVM_DBG_JIT_LDC").is_some() {
@@ -17970,7 +18308,9 @@ fn try_jit_upgrade_with_gate(
                 "[cratonvm-ldc2w] upgrade idx={} -> {:?} (f64 {})",
                 cp_idx,
                 val,
-                val.map(|v| f64::from_bits(v as u64)).unwrap_or(f64::NAN)
+                // Cast: integer word reinterpreted as float/double bit pattern
+                val.map(|(v, _)| f64::from_bits(v as u64))
+                    .unwrap_or(f64::NAN)
             );
         }
         val
@@ -18060,6 +18400,7 @@ fn try_jit_upgrade_with_gate(
                 if let Some(compiled) =
                     jit_cache.get(&callee_class_arc, &callee_method_arc, &callee_desc_arc)
                 {
+                    // Cast: object/code pointer to integer address
                     return Some((compiled.entry_ptr() as usize, compiled.needs_context()));
                     // Cast: JIT entry point to address
                 }
@@ -18240,12 +18581,13 @@ fn try_jit_upgrade_with_gate(
                 Some(cm.find_class_by_name(target_class)?.as_u32())
             };
 
-            let c_ldc2w_resolver = |cp_idx: u16| -> Option<i64> {
+            let c_ldc2w_resolver = |cp_idx: u16| -> Option<(i64, bool)> {
                 let cm = shared.class_manager.read();
                 let class = cm.get_class(callee_cid)?;
+                // inc 35: `(bits, is_double)`.
                 match class.constant_pool.get(cp_idx)? {
-                    ConstantPoolEntry::Long(v) => Some(*v),
-                    ConstantPoolEntry::Double(v) => Some(v.to_bits() as i64), // Cast: JIT ABI -- float bits to i64
+                    ConstantPoolEntry::Long(v) => Some((*v, false)),
+                    ConstantPoolEntry::Double(v) => Some((v.to_bits() as i64, true)), // Cast: JIT ABI -- float bits to i64
                     _ => None,
                 }
             };
@@ -18568,6 +18910,7 @@ fn callee_neg_fingerprint(class_name: &str, method_name: &str, descriptor: &str)
     let mut h = FNV_OFFSET;
     for part in [class_name, method_name, descriptor] {
         for &b in part.as_bytes() {
+            // Widening: smaller integer -> 64-bit (zero/sign-extended, value preserved)
             h = (h ^ b as u64).wrapping_mul(FNV_PRIME);
         }
         // Separator so ("AB","C") and ("A","BC") fingerprint differently.
@@ -18621,11 +18964,13 @@ pub fn try_jit_compile_callee(
     {
         let jit_cache = shared.jit_cache.read();
         if let Some(compiled) = jit_cache.get(class_name, method_name, descriptor) {
+            // Cast: object/code pointer to integer address
             return Some((compiled.entry_ptr() as usize, compiled.needs_context()));
             // Cast: JIT entry point to address
         }
     }
     let fp = callee_neg_fingerprint(class_name, method_name, descriptor);
+    // Widening: small integer index -> usize (non-negative, fits in pointer width)
     let slot = &CALLEE_NEG_CACHE[(fp as usize) & (CALLEE_NEG_CACHE_SLOTS - 1)];
     if slot.load(Ordering::Relaxed) == fp {
         let n = CALLEE_NEG_HITS.fetch_add(1, Ordering::Relaxed);
@@ -18926,12 +19271,13 @@ fn try_jit_compile_callee_slow(
         let target_class = class.constant_pool.get_class_name(class_idx)?;
         Some(cm.find_class_by_name(target_class)?.as_u32())
     };
-    let ldc2w_resolver = |cp_idx: u16| -> Option<i64> {
+    let ldc2w_resolver = |cp_idx: u16| -> Option<(i64, bool)> {
         let cm = shared.class_manager.read();
         let class = cm.get_class(cid)?;
+        // inc 35: `(bits, is_double)`.
         let val = match class.constant_pool.get(cp_idx)? {
-            ConstantPoolEntry::Long(v) => Some(*v),
-            ConstantPoolEntry::Double(v) => Some(v.to_bits() as i64), // Cast: JIT ABI -- float bits to i64
+            ConstantPoolEntry::Long(v) => Some((*v, false)),
+            ConstantPoolEntry::Double(v) => Some((v.to_bits() as i64, true)), // Cast: JIT ABI -- float bits to i64
             _ => None,
         };
         if std::env::var_os("CRATONVM_DBG_JIT_LDC").is_some() {
@@ -18939,7 +19285,9 @@ fn try_jit_compile_callee_slow(
                 "[cratonvm-ldc2w] full idx={} -> {:?} (f64 {})",
                 cp_idx,
                 val,
-                val.map(|v| f64::from_bits(v as u64)).unwrap_or(f64::NAN)
+                // Cast: integer word reinterpreted as float/double bit pattern
+                val.map(|(v, _)| f64::from_bits(v as u64))
+                    .unwrap_or(f64::NAN)
             );
         }
         val
@@ -19218,6 +19566,7 @@ fn background_compile_task(
         // backend routing that replaces the former advisory-only hint.
         optimized,
     );
+    // Widening: smaller integer -> 64-bit (zero/sign-extended, value preserved)
     start.elapsed().as_millis() as u64
 }
 
@@ -19738,10 +20087,14 @@ fn execute_jit_call(
         };
         let v = decode_arg_kind_aware(cv, is_long, desc_byte);
         jit_args[i] = match v {
+            // Widening: i32 -> i64 (sign-extended, JVM i2l)
             Value::Int(x) => x as i64,
             Value::Long(x) => x,
+            // Cast: float/double raw bit pattern stored in integer word (no value conversion)
             Value::Float(x) => x.to_bits() as i64,
+            // Cast: float/double raw bit pattern stored in integer word (no value conversion)
             Value::Double(x) => x.to_bits() as i64,
+            // Cast: object/code pointer to integer address
             Value::Object(Some(obj)) => obj.as_ptr() as i64,
             Value::Object(None) => 0,
             _ => 0,
@@ -19943,6 +20296,39 @@ fn execute_jit_call(
                 );
             }
             Err(other) => return Err(other),
+        }
+    }
+
+    // Divide-by-zero direct-throw drain (sibling of the AIOOBE block above).
+    // The JIT `idiv`/`irem`/`ldiv`/`lrem` zero-divisor stub calls
+    // `jit_throw_arithmetic`, which sets this flag + the deopt signal and returns
+    // `i64::MIN`. Throw a real `ArithmeticException` ("/ by zero") through the
+    // method's own exception table here, BEFORE the `i64::MIN` re-run arm below —
+    // re-running the method from entry would double-execute any side effect that
+    // preceded the trap (the prior `uncommon_trap` behaviour, a HotSpot
+    // divergence). `usize::MAX` throw_pc mirrors the NPE/AIOOBE blocks (match
+    // typed handlers by class, skip catch-all `finally`).
+    if crate::jit::helpers::take_jit_pending_arithmetic() {
+        match crate::runtime::exceptions::throw_runtime_error(
+            shared,
+            thread,
+            RuntimeError::ArithmeticException {
+                message: "/ by zero".to_string(),
+            },
+        ) {
+            MethodCallFailed::ExceptionThrown(exc) => {
+                let exc_locals = jit_saved_args_to_values(cached, &saved_args, np);
+                return route_jit_exception_through_method(
+                    shared,
+                    thread,
+                    frame_idx,
+                    cached,
+                    usize::MAX,
+                    exc,
+                    &exc_locals,
+                );
+            }
+            other => return Err(other),
         }
     }
 
@@ -20290,6 +20676,32 @@ fn execute_jit_call_decoded(
             Err(other) => return Err(other),
         }
     }
+    // Divide-by-zero direct-throw drain (sibling of the AIOOBE block above; see
+    // the matching block in `execute_jit_call`). Throw `ArithmeticException`
+    // through the method's exception table instead of re-running from entry.
+    if crate::jit::helpers::take_jit_pending_arithmetic() {
+        match crate::runtime::exceptions::throw_runtime_error(
+            shared,
+            thread,
+            RuntimeError::ArithmeticException {
+                message: "/ by zero".to_string(),
+            },
+        ) {
+            MethodCallFailed::ExceptionThrown(exc) => {
+                return route_jit_exception_through_method(
+                    shared,
+                    thread,
+                    frame_idx,
+                    cached,
+                    usize::MAX,
+                    exc,
+                    args_slice,
+                )
+                .map(Some);
+            }
+            other => return Err(other),
+        }
+    }
 
     // real-frame-deopt: IR-path deopt detection (mirrors the block in
     // `execute_jit_call`). `ir_deopt_entry` stashes `LAST_DEOPT` and returns
@@ -20432,6 +20844,7 @@ fn execute_invokevirtual_vtable_fast(
             Some(rm) => (
                 Arc::clone(&rm.method_name),
                 Arc::clone(&rm.method_descriptor),
+                // Widening: small unsigned (u8/u16/i32 index) -> usize (non-negative, fits)
                 rm.num_params as usize,
             ),
             None => return Ok(CachedCallResult::CacheMiss),
@@ -20681,6 +21094,7 @@ fn execute_invokevirtual_vtable_fast(
     // invalidated by CHA) falls through to invoke_cache / slow path.
     let (entry_cached, entry_is_native) = {
         let guard = shared.vtable_manager.read();
+        // Widening: smaller integer -> 64-bit (zero/sign-extended, value preserved)
         let vtable = match guard.get_vtable(receiver_class_id.as_u32() as u64) {
             Some(v) => v,
             None => return Ok(CachedCallResult::CacheMiss),
@@ -20783,7 +21197,9 @@ fn execute_invokevirtual_vtable_fast(
     thread.refill_pools_from_shared(
         &shared.operand_stack_pool,
         &shared.tag_pool,
+        // Widening: small unsigned (u8/u16/i32 index) -> usize (non-negative, fits)
         entry_cached.max_locals as usize,
+        // Widening: small unsigned (u8/u16/i32 index) -> usize (non-negative, fits)
         (entry_cached.max_stack as usize).max(16) + 8,
     );
     let mut frame = Frame::new_pooled_cached(
@@ -21107,11 +21523,14 @@ fn execute_invokevirtual_cached(
                             let invoc_key = {
                                 let mut h = 0u32;
                                 for &b in cached.method_name.as_bytes() {
+                                    // Widening: smaller value -> u32 (value fits)
                                     h = h.wrapping_mul(31).wrapping_add(b as u32);
                                 }
                                 for &b in cached.method_descriptor.as_bytes() {
+                                    // Widening: smaller value -> u32 (value fits)
                                     h = h.wrapping_mul(31).wrapping_add(b as u32);
                                 }
+                                // Widening: smaller integer -> 64-bit (zero/sign-extended, value preserved)
                                 ((cached.declaring_class_id.as_u32() as u64) << 32) | (h as u64)
                             };
                             const JIT_RETRY_STRIDE: u32 = 64;
@@ -21176,7 +21595,9 @@ fn execute_invokevirtual_cached(
                     thread.refill_pools_from_shared(
                         &shared.operand_stack_pool,
                         &shared.tag_pool,
+                        // Widening: small unsigned (u8/u16/i32 index) -> usize (non-negative, fits)
                         cached.max_locals as usize,
+                        // Widening: small unsigned (u8/u16/i32 index) -> usize (non-negative, fits)
                         (cached.max_stack as usize).max(16) + 8,
                     );
                     let mut frame = Frame::new_pooled_cached(
@@ -21290,6 +21711,7 @@ fn execute_invokevirtual_cached(
             gate: _,
         } => {
             if let Some(guard_class_id) = receiver_class_id {
+                // Widening: small unsigned (u8/u16/i32 index) -> usize (non-negative, fits)
                 let num_params_usize = num_params as usize;
                 let receiver_val = thread.frames[frame_idx].stack.peek_at(num_params_usize);
                 match receiver_val {
@@ -21401,7 +21823,9 @@ fn execute_invokevirtual_cached(
             thread.refill_pools_from_shared(
                 &shared.operand_stack_pool,
                 &shared.tag_pool,
+                // Widening: small unsigned (u8/u16/i32 index) -> usize (non-negative, fits)
                 cached.max_locals as usize,
+                // Widening: small unsigned (u8/u16/i32 index) -> usize (non-negative, fits)
                 (cached.max_stack as usize).max(16) + 8,
             );
             let frame = Frame::new_pooled_cached(
@@ -21605,6 +22029,7 @@ fn populate_virtual_invoke_cache(
                 let target = CachedInvokeTarget::Intrinsic {
                     kind,
                     callback: cratonvm_native_builtins::intrinsics::callback_for(kind),
+                    // Truncation: usize -> u16 (param count fits in 16 bits per JVM method limit)
                     num_params: num_params as u16,
                     param_descs,
                     return_type,
@@ -21656,6 +22081,7 @@ fn populate_virtual_invoke_cache(
             let target = CachedInvokeTarget::VirtualNative {
                 receiver_class_id,
                 callback,
+                // Truncation: usize -> u16 (param count fits in 16 bits per JVM method limit)
                 num_params: num_params as u16,
                 gate,
             };
@@ -21730,6 +22156,7 @@ fn populate_virtual_invoke_cache(
                             let target = CachedInvokeTarget::VirtualNative {
                                 receiver_class_id,
                                 callback,
+                                // Truncation: usize -> u16 (param count fits in 16 bits per JVM method limit)
                                 num_params: num_params as u16,
                                 gate,
                             };
@@ -21755,6 +22182,7 @@ fn populate_virtual_invoke_cache(
                         let target = CachedInvokeTarget::VirtualNative {
                             receiver_class_id,
                             callback,
+                            // Truncation: usize -> u16 (param count fits in 16 bits per JVM method limit)
                             num_params: num_params as u16,
                             gate,
                         };
@@ -21864,6 +22292,7 @@ fn populate_virtual_invoke_cache(
                 let target = CachedInvokeTarget::VirtualNative {
                     receiver_class_id,
                     callback,
+                    // Truncation: usize -> u16 (param count fits in 16 bits per JVM method limit)
                     num_params: num_params as u16,
                     gate,
                 };
@@ -21894,6 +22323,7 @@ fn populate_virtual_invoke_cache(
         let target = CachedInvokeTarget::VirtualNative {
             receiver_class_id,
             callback,
+            // Truncation: usize -> u16 (param count fits in 16 bits per JVM method limit)
             num_params: num_params as u16,
             gate,
         };
@@ -22109,6 +22539,7 @@ where
                 // `value_stack::scan_object_refs` uses for the JNI long-as-
                 // jobject smuggle pattern) to confirm the bits actually point
                 // into the managed heap before fabricating an `ObjectRef`.
+                // Widening: small integer index -> usize (non-negative, fits in pointer width)
                 if let Some(obj_ref) = heap.is_heap_addr(bits as usize) {
                     // SAFETY: `is_heap_addr` returned `Some(ObjectRef)`,
                     // meaning the address is within one of the GC's managed
@@ -22134,12 +22565,14 @@ where
             }
         }
         Value::Long(l) => {
+            // Widening: smaller integer -> 64-bit (zero/sign-extended, value preserved)
             let bits = l as u64;
             if (bits & 0x7) == 0 && bits < (1u64 << 48) {
                 // C7 fix: see Double-arm comment above. The JNI long-as-
                 // jobject smuggle (WildFly jboss-modules bootloader) is
                 // preserved, but we now require the bits to land inside a
                 // managed-heap arena before we trust them as an `ObjectRef`.
+                // Widening: small integer index -> usize (non-negative, fits in pointer width)
                 if let Some(obj_ref) = heap.is_heap_addr(bits as usize) {
                     // SAFETY: `is_heap_addr` returned `Some(ObjectRef)`,
                     // meaning the address is within one of the GC's managed
@@ -22264,8 +22697,10 @@ fn pop_object_ref_ctx(
         // current opcode demands a reference. Recover if the bits look like
         // a valid heap pointer.
         Value::Long(l) => {
+            // Widening: smaller integer -> 64-bit (zero/sign-extended, value preserved)
             let bits = l as u64;
             if (bits & 0x7) == 0 && bits < (1u64 << 48) {
+                // SAFETY: bits is guarded to be 8-byte-aligned and within the 48-bit heap address range before reinterpreting as an object pointer.
                 Ok(unsafe { ObjectRef::from_raw(bits as usize as *mut u8) })
             } else {
                 Err(VmError::Internal {
@@ -22304,6 +22739,7 @@ fn value_as_object_ptr(v: &Value) -> Option<*mut u8> {
     match v {
         Value::Object(Some(o)) => Some(o.as_ptr()),
         Value::Long(bits) => {
+            // Cast: reinterpret pointer/address to typed pointer
             crate::types::jlong_bits_as_aligned_object_ptr(*bits as u64).map(|p| p as *mut u8)
         }
         _ => None,
@@ -22596,7 +23032,9 @@ mod tests {
         assert_eq!(mapped[0], Value::Object(None), "null word → null ref");
         match mapped[1] {
             Value::Object(Some(r)) => assert_eq!(
-                r.as_ptr() as u64, raw,
+                // Cast: object/code pointer to integer address
+                r.as_ptr() as u64,
+                raw,
                 "non-null ref slot must carry the heap pointer verbatim"
             ),
             other => panic!("expected a non-null object reference, got {other:?}"),
@@ -22733,6 +23171,7 @@ mod tests {
         let invoke_pc = 24usize;
         let covered = table
             .iter()
+            // Widening: small unsigned (u8/u16/i32 index) -> usize (non-negative, fits)
             .any(|e| invoke_pc >= e.start_pc as usize && invoke_pc < e.end_pc as usize);
         assert!(
             covered,
@@ -22743,6 +23182,7 @@ mod tests {
         // remains safe there.
         let invoke_pc_outside = 30usize;
         let covered_outside = table.iter().any(|e| {
+            // Widening: small unsigned (u8/u16/i32 index) -> usize (non-negative, fits)
             invoke_pc_outside >= e.start_pc as usize && invoke_pc_outside < e.end_pc as usize
         });
         assert!(
@@ -22754,6 +23194,7 @@ mod tests {
         let empty: &[ExceptionTableEntry] = &[];
         let covered_empty = empty
             .iter()
+            // Widening: small unsigned (u8/u16/i32 index) -> usize (non-negative, fits)
             .any(|e| invoke_pc >= e.start_pc as usize && invoke_pc < e.end_pc as usize);
         assert!(!covered_empty, "empty exception table must never flag");
     }
@@ -22819,7 +23260,9 @@ mod tests {
                 // Inside (or entering) a test-gated item: count braces to
                 // find where it ends, and never scan these lines.
                 if !is_comment {
+                    // Cast: operand reinterpreted as i32 (JVM 32-bit stack word)
                     let opens = line.matches('{').count() as i32;
+                    // Cast: operand reinterpreted as i32 (JVM 32-bit stack word)
                     let closes = line.matches('}').count() as i32;
                     skip_depth += opens - closes;
                     if pending {
@@ -23351,6 +23794,7 @@ mod tests {
     fn narrow_field_byte_sign_extends() {
         // 0x1234_5680 -> low byte 0x80 -> -128 (sign-extended)
         assert_eq!(
+            // Cast: operand reinterpreted as i32 (JVM 32-bit stack word)
             narrow_int_to_field_type(Value::Int(0x1234_5680u32 as i32), b'B'),
             Value::Int(-128)
         );
@@ -23368,6 +23812,7 @@ mod tests {
     fn narrow_field_short_sign_extends() {
         // low 16 bits 0x8000 -> -32768
         assert_eq!(
+            // Cast: operand reinterpreted as i32 (JVM 32-bit stack word)
             narrow_int_to_field_type(Value::Int(0x0001_8000u32 as i32), b'S'),
             Value::Int(-32768)
         );
@@ -23408,7 +23853,9 @@ mod tests {
             Value::Int(-1)
         );
         assert_eq!(
+            // Cast: operand reinterpreted as i32 (JVM 32-bit stack word)
             narrow_int_to_field_type(Value::Int(0x1234_5680u32 as i32), b'L'),
+            // Cast: operand reinterpreted as i32 (JVM 32-bit stack word)
             Value::Int(0x1234_5680u32 as i32)
         );
         // Non-Int carriers pass through regardless of descriptor.
@@ -23829,7 +24276,9 @@ mod tests {
         };
         let invoke_pc = 24usize; // Class.forName at invoke_pc 24 (3-byte insn)
                                  // JVMS range is inclusive-start, exclusive-end.
+                                 // Widening: small unsigned (u8/u16/i32 index) -> usize (non-negative, fits)
         assert!(invoke_pc >= entry.start_pc as usize);
+        // Widening: small unsigned (u8/u16/i32 index) -> usize (non-negative, fits)
         assert!(invoke_pc < entry.end_pc as usize);
 
         // Simulate PC-after-invoke (post-invoke caller PC). The unwind
@@ -23837,7 +24286,9 @@ mod tests {
         // range.
         let post_invoke_pc = invoke_pc + 3;
         let unwound_pc = post_invoke_pc.saturating_sub(1);
+        // Widening: small unsigned (u8/u16/i32 index) -> usize (non-negative, fits)
         assert!(unwound_pc >= entry.start_pc as usize);
+        // Widening: small unsigned (u8/u16/i32 index) -> usize (non-negative, fits)
         assert!(unwound_pc < entry.end_pc as usize);
     }
 
@@ -23861,6 +24312,7 @@ mod tests {
 
         // The predicate factored out of the unwind loop.
         let honored = |e: &ExceptionTableEntry| {
+            // Widening: small unsigned (u8/u16/i32 index) -> usize (non-negative, fits)
             e.catch_type == 0 && e.start_pc == 0 && e.end_pc as usize >= code_len
         };
 
@@ -24306,6 +24758,7 @@ mod tests {
         // A long value whose raw bits set NANBOX_BITS — the exact case
         // that used to confuse the `Value` boundary and surface as
         // "expected long on stack, got <uninitialized>".
+        // Widening: smaller integer -> 64-bit (zero/sign-extended, value preserved)
         let lv: i64 = 0x7FF8_1234_5678_9ABC_u64 as i64;
         push_invoke_return_value(&mut stack, Value::Long(lv))
             .expect("push_invoke_return_value must not overflow on a fresh stack");
@@ -24321,6 +24774,7 @@ mod tests {
         let mut stack = ValueStack::new(8);
         // A long at an arbitrary bit pattern exercises the non-NaN
         // branch of the `long`/`double` codec.
+        // Widening: smaller integer -> 64-bit (zero/sign-extended, value preserved)
         let lv: i64 = 0x0DEA_DBEE_FCAF_EBAB_u64 as i64;
         push_invoke_return_value(&mut stack, Value::Long(lv)).expect("push must succeed");
         assert_eq!(stack.pop_long().expect("J must decode as long"), lv);
@@ -24561,6 +25015,7 @@ mod tests {
             1,
             -1,
             42,
+            // Widening: smaller integer -> 64-bit (zero/sign-extended, value preserved)
             0x0BAD_BEEF_DEAD_CAFE_u64 as i64,
             i64::MAX,
             i64::MIN,
@@ -24570,7 +25025,9 @@ mod tests {
             let value = vm.shared.heap.get_field(obj, 0);
             let bits: i64 = match value {
                 Value::Long(x) => x,
+                // Cast: float/double raw bit pattern stored in integer word (no value conversion)
                 Value::Double(x) => x.to_bits() as i64,
+                // Widening: i32 -> i64 (sign-extended, JVM i2l)
                 Value::Int(x) => x as i64,
                 Value::Object(None) | Value::Uninitialized => 0,
                 other => panic!("unexpected tag for long field: {other:?}"),
@@ -24605,8 +25062,10 @@ mod tests {
             let cv = stack.pop_compact();
             let lv = match cv.tag() {
                 CompactTag::Long => cv.as_long_unchecked(),
+                // Widening: smaller integer -> 64-bit (zero/sign-extended, value preserved)
                 CompactTag::Double => cv.raw_bits() as i64,
                 CompactTag::Int => match cv.to_value() {
+                    // Widening: i32 -> i64 (sign-extended, JVM i2l)
                     Value::Int(x) => x as i64,
                     _ => 0,
                 },
@@ -24619,7 +25078,9 @@ mod tests {
             let value = vm.shared.heap.get_field(obj, 0);
             let bits: i64 = match value {
                 Value::Long(x) => x,
+                // Cast: float/double raw bit pattern stored in integer word (no value conversion)
                 Value::Double(x) => x.to_bits() as i64,
+                // Widening: i32 -> i64 (sign-extended, JVM i2l)
                 Value::Int(x) => x as i64,
                 Value::Object(None) | Value::Uninitialized => 0,
                 other => panic!("unexpected tag for long field: {other:?}"),
@@ -24657,6 +25118,7 @@ mod tests {
             let value = vm.shared.heap.get_field(obj, 0);
             let d: f64 = match value {
                 Value::Double(x) => x,
+                // Cast: integer word reinterpreted as float/double bit pattern
                 Value::Long(x) => f64::from_bits(x as u64),
                 Value::Object(None) | Value::Uninitialized => 0.0,
                 other => panic!("unexpected tag for double field: {other:?}"),
@@ -24691,8 +25153,10 @@ mod tests {
             let cv = stack.pop_compact();
             let dv = match cv.tag() {
                 CompactTag::Double => f64::from_bits(cv.raw_bits()),
+                // Cast: integer word reinterpreted as float/double bit pattern
                 CompactTag::Long => f64::from_bits(cv.as_long_unchecked() as u64),
                 CompactTag::Int => match cv.to_value() {
+                    // Cast: integer-to-float numeric conversion (JVM i2f/i2d/l2f/l2d semantics)
                     Value::Int(x) => x as f64,
                     _ => 0.0,
                 },
@@ -24705,6 +25169,7 @@ mod tests {
             let value = vm.shared.heap.get_field(obj, 0);
             let d: f64 = match value {
                 Value::Double(x) => x,
+                // Cast: integer word reinterpreted as float/double bit pattern
                 Value::Long(x) => f64::from_bits(x as u64),
                 Value::Object(None) | Value::Uninitialized => 0.0,
                 other => panic!("unexpected tag for double field: {other:?}"),
@@ -24779,6 +25244,7 @@ mod tests {
         // Allocate a 32-byte buffer, properly aligned, to host an
         // ObjectHeader. We use a Vec<u64> so it's 8-aligned.
         let mut storage = vec![0u64; 4]; // 32 bytes = HEADER_SIZE
+                                         // Cast: reinterpret pointer/address to typed pointer
         let ptr = storage.as_mut_ptr() as *mut u8;
 
         // Path 1: init with a non-zero hash (what the new TLAB path does)
@@ -24794,6 +25260,7 @@ mod tests {
         // First 16 bytes: must NOT be all-zero, since identity_hash_code
         // is at byte offset 8..12 and is non-zero. This is the invariant
         // the stale-pointer detector relies on.
+        // SAFETY: we just wrote a valid ObjectHeader into `ptr`, so its first 16 bytes are initialized and readable.
         let first_16: [u8; 16] = unsafe { std::ptr::read(ptr as *const [u8; 16]) };
         assert_ne!(
             first_16, [0u8; 16],
@@ -24869,6 +25336,7 @@ mod tests {
         let arr = heap.alloc_array(ClassId::new(0), ArrayElementType::Reference, 1);
         let old_obj = heap.alloc_object(ClassId::new(1), 1);
         let new_obj = heap.alloc_object(ClassId::new(1), 1);
+        // Cast: object/code pointer to integer address
         let old_addr = old_obj.as_ptr() as usize;
 
         // Plant the old reference BEFORE activating SATB so the

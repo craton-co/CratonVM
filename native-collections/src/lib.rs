@@ -6292,6 +6292,23 @@ fn native_hs_contains(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
                 };
             return Ok(Some(Value::Int(if eq { 1 } else { 0 })));
         }
+        // keySet() view: `contains(k)` must follow the SOURCE map's (possibly
+        // overridden) `containsKey`, exactly like the entrySet branch above —
+        // not a direct lookup in the native backing. Spring's
+        // LinkedCaseInsensitiveMap backs its keySet on an inner LinkedHashMap
+        // whose `containsKey` is overridden to be case-insensitive; a direct
+        // native lookup bypassed that override so `keySet().contains("KEY")`
+        // returned false (LinkedCaseInsensitiveMapTests putAndGet /
+        // putWithOverlappingKeys).
+        if view_backing_kind(ctx, backing) == VIEW_KIND_KEYSET {
+            let has =
+                ctx.invoke_virtual(source, "containsKey", "(Ljava/lang/Object;)Z", &[elem])?;
+            return Ok(Some(Value::Int(if matches!(has, Some(Value::Int(1))) {
+                1
+            } else {
+                0
+            })));
+        }
     }
     let ck_args = [Value::Object(Some(backing)), elem];
     native_map_contains_key(ctx, &ck_args)
@@ -11224,7 +11241,158 @@ fn register_collectors_natives(r: &mut NativeMethodRegistry) {
         "()Ljava/util/Set;",
         native_collector_characteristics,
     );
+    // Our synthetic tagged Collectors are driven internally by native_stream_collect
+    // (tag dispatch), but REAL bytecode consumers (e.g. Mutiny's Multi.collect()
+    // .asList()) follow the JLS Collector contract: supplier().get(),
+    // accumulator().accept(c, e), finisher().apply(c), combiner().apply(a, b).
+    // Those four methods were abstract-with-no-body on the synthetic Collector, so
+    // such consumers hit AbstractMethodError (ReactiveAdapterRegistryTests.toMulti).
+    // Hand back synthetic functional objects (class == the function interface, so
+    // they pass `(Supplier) ...` / `(BiConsumer) ...` casts and route their SAM
+    // here) that build/append the accumulation container for the container
+    // collectors. Real lambdas have lambda-proxy classes, not these interface
+    // names, so the SAM registrations below never intercept them.
+    r.register(
+        "java/util/stream/Collector",
+        "supplier",
+        "()Ljava/util/function/Supplier;",
+        native_collector_supplier,
+    );
+    r.register(
+        "java/util/stream/Collector",
+        "accumulator",
+        "()Ljava/util/function/BiConsumer;",
+        native_collector_accumulator,
+    );
+    r.register(
+        "java/util/stream/Collector",
+        "finisher",
+        "()Ljava/util/function/Function;",
+        native_collector_finisher,
+    );
+    r.register(
+        "java/util/stream/Collector",
+        "combiner",
+        "()Ljava/util/function/BinaryOperator;",
+        native_collector_combiner,
+    );
+    r.register(
+        "java/util/function/Supplier",
+        "get",
+        "()Ljava/lang/Object;",
+        native_collfn_supplier_get,
+    );
+    r.register(
+        "java/util/function/BiConsumer",
+        "accept",
+        "(Ljava/lang/Object;Ljava/lang/Object;)V",
+        native_collfn_accumulator_accept,
+    );
+    r.register(
+        "java/util/function/Function",
+        "apply",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+        native_collfn_finisher_apply,
+    );
+    r.register(
+        "java/util/function/BinaryOperator",
+        "apply",
+        "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+        native_collfn_combiner_apply,
+    );
     r.set_category(__prev_cat);
+}
+
+/// True iff `v` is one of our synthetic tagged `java/util/stream/Collector`
+/// objects; if so, returns its tag.
+fn collector_tag_of(ctx: &mut dyn NativeContext, v: Value) -> Option<i32> {
+    if let Value::Object(Some(c)) = v {
+        if ctx.class_name_of_id(ctx.class_id_of_object(c)).as_deref()
+            == Some("java/util/stream/Collector")
+        {
+            if let Value::Int(t) = ctx.get_field(c, COLLECTOR_FIELD_TAG) {
+                return Some(t);
+            }
+        }
+    }
+    None
+}
+
+/// `Collector.supplier()/accumulator()/finisher()/combiner()` — return a synthetic
+/// functional object (class == the SAM interface) carrying the source Collector in
+/// field 0 so its SAM (registered above) can read the tag.
+fn make_collector_fn(ctx: &mut dyn NativeContext, args: &[Value], iface: &str) -> MethodCallResult {
+    let coll = args.first().copied().unwrap_or(Value::Object(None));
+    let f = alloc_synthetic(ctx, iface, 1);
+    ctx.set_field(f, 0, coll);
+    Ok(Some(Value::Object(Some(f))))
+}
+
+fn native_collector_supplier(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    make_collector_fn(ctx, args, "java/util/function/Supplier")
+}
+fn native_collector_accumulator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    make_collector_fn(ctx, args, "java/util/function/BiConsumer")
+}
+fn native_collector_finisher(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    make_collector_fn(ctx, args, "java/util/function/Function")
+}
+fn native_collector_combiner(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    make_collector_fn(ctx, args, "java/util/function/BinaryOperator")
+}
+
+/// `supplier.get()` — fresh accumulation container for the source collector.
+fn native_collfn_supplier_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return make_list_of(ctx, &[]),
+    };
+    let coll = ctx.get_field(this, 0);
+    match collector_tag_of(ctx, coll) {
+        Some(COLLECTOR_TAG_TO_SET) => make_set_of(ctx, &[]),
+        Some(COLLECTOR_TAG_TO_COLLECTION) => {
+            // toCollection(supplier): invoke the user-provided supplier (ARG1).
+            if let Value::Object(Some(c)) = coll {
+                if let Value::Object(Some(user)) = ctx.get_field(c, COLLECTOR_FIELD_ARG1) {
+                    if let Ok(r @ Some(_)) =
+                        ctx.invoke_virtual(user, "get", "()Ljava/lang/Object;", &[])
+                    {
+                        return Ok(r);
+                    }
+                }
+            }
+            make_list_of(ctx, &[])
+        }
+        _ => make_list_of(ctx, &[]),
+    }
+}
+
+/// `accumulator.accept(container, element)` — container.add(element).
+fn native_collfn_accumulator_accept(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let container = args.get(1).copied().unwrap_or(Value::Object(None));
+    let item = args.get(2).copied().unwrap_or(Value::Object(None));
+    if let Value::Object(Some(c)) = container {
+        ctx.invoke_virtual(c, "add", "(Ljava/lang/Object;)Z", &[item])?;
+    }
+    Ok(None)
+}
+
+/// `finisher.apply(container)` — identity (container collectors are IDENTITY_FINISH).
+fn native_collfn_finisher_apply(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    Ok(Some(args.get(1).copied().unwrap_or(Value::Object(None))))
+}
+
+/// `combiner.apply(a, b)` — a.addAll(b); a.
+fn native_collfn_combiner_apply(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let a = args.get(1).copied().unwrap_or(Value::Object(None));
+    let b = args.get(2).copied().unwrap_or(Value::Object(None));
+    if let (Value::Object(Some(ca)), Value::Object(Some(_))) = (a, b) {
+        ctx.invoke_virtual(ca, "addAll", "(Ljava/util/Collection;)Z", &[b])?;
+    }
+    Ok(Some(a))
 }
 
 fn native_collector_characteristics(
@@ -18563,6 +18731,13 @@ fn native_lhm_put_if_absent(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     if let Some(node) = lhm_find_node(ctx, this, &key)? {
         let existing = ctx.get_field(node, LHM_NODE_VALUE);
+        // Map.putIfAbsent contract: a key "present with null value" counts as
+        // absent — associate the new value and return the old (null). Returning
+        // the null existing without storing left the mapping null
+        // (LinkedCaseInsensitiveMapTests.computeIfAbsentWithExistingValue).
+        if matches!(existing, Value::Object(None)) {
+            return native_lhm_put(ctx, args);
+        }
         Ok(Some(existing))
     } else {
         native_lhm_put(ctx, args)
@@ -25559,6 +25734,16 @@ fn native_chm_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         _ => return Ok(Some(Value::Object(None))),
     };
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
+    // ConcurrentHashMap.remove(null) throws NPE per JDK spec (null keys are not
+    // permitted), mirroring the guard in native_chm_put. Without this, Spring's
+    // SimpleAliasRegistry.removeAlias(null) returned silently instead of NPE
+    // (SimpleAliasRegistryTests.removeNullAlias).
+    if matches!(key, Value::Object(None)) {
+        return Err(RuntimeError::NullPointerException {
+            message: Some("ConcurrentHashMap does not permit null keys".to_string()),
+        }
+        .into());
+    }
     let hash = chm_key_hash(ctx, &key)?;
     match chm_segment_for(ctx, this, hash) {
         Some(seg) => {

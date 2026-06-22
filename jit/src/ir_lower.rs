@@ -92,6 +92,12 @@ struct Lowerer<'a> {
     /// Address of the `jit_invoke_dispatch` runtime helper (baked into each
     /// `Op::Call` site as `MOV RAX,imm64 ; CALL RAX`). 0 if no calls.
     invoke_dispatch: usize,
+    /// Address of the `jit_dispatch_threw` peek helper. Baked into a `J`/`D`
+    /// (long/double) call site's post-invoke check on the rare `RAX == i64::MIN`
+    /// branch to disambiguate a genuine callee exception/deopt from a legitimate
+    /// `Long.MIN_VALUE` return (see `lower_call`'s sentinel sequence). 0 if no
+    /// calls / not wired (int/ref/void sites never consult it).
+    dispatch_threw: usize,
     /// True iff the graph contains an `Op::Call` — then the method takes the VM
     /// context pointer as a hidden first argument (`try_call_with_context`), and
     /// the prologue stores it to `context_slot_off` + shifts the Java params.
@@ -179,6 +185,7 @@ impl<'a> Lowerer<'a> {
             deopt_stub_patches: Vec::new(),
             deopt_boxes: Vec::new(),
             invoke_dispatch: helpers.invoke_dispatch,
+            dispatch_threw: helpers.dispatch_threw,
             needs_context,
             context_slot_off,
             args_stage_top_off,
@@ -987,6 +994,46 @@ impl<'a> Lowerer<'a> {
                 self.buf.emit(&[0x48, 0x63, 0xC0]); // MOVSXD RAX, EAX (sign-extend)
                 self.store_rax(slot);
             }
+            Op::FCmp { double, nan_greater } => {
+                // FP 3-way compare → int {-1,0,1}, mirroring `Op::LCmp` but via
+                // `ucomis` with the JVMS NaN-unordered rule. Branchless:
+                // `result = AL - DL` where the operand order + SETcc choice put
+                // a NaN operand on +1 (`cmpg`) or -1 (`cmpl`). `ucomis` raises
+                // CF on BOTH "below" and "unordered", which is what makes the
+                // NaN case fall out for free:
+                //   cmpl: UCOMIS a,b ; AL=SETA(a>b) ; DL=SETB(a<b OR NaN)
+                //         ⇒ AL-DL = {a>b:+1, a<b:-1, eq:0, NaN:-1}.
+                //   cmpg: UCOMIS b,a ; AL=SETB((a>b) OR NaN) ; DL=SETA(a<b)
+                //         ⇒ AL-DL = {a>b:+1, a<b:-1, eq:0, NaN:+1}.
+                let is_d = *double;
+                let slot = self.alloc_slot(id);
+                self.fp_load(XMM0, self.slot_of(node.inputs[0]), is_d); // a
+                self.fp_load(XMM1, self.slot_of(node.inputs[1]), is_d); // b
+                if *nan_greater {
+                    // UCOMIS XMM1, XMM0 (compare b vs a) — ModRM C8.
+                    if is_d {
+                        self.buf.emit(&[0x66, 0x0F, 0x2E, 0xC8]);
+                    } else {
+                        self.buf.emit(&[0x0F, 0x2E, 0xC8]);
+                    }
+                    self.buf.emit(&[0x0F, 0x92, 0xC0]); // SETB AL  ((a>b) OR NaN)
+                    self.buf.emit(&[0x0F, 0x97, 0xC2]); // SETA DL  (a<b)
+                } else {
+                    // UCOMIS XMM0, XMM1 (compare a vs b) — ModRM C1.
+                    if is_d {
+                        self.buf.emit(&[0x66, 0x0F, 0x2E, 0xC1]);
+                    } else {
+                        self.buf.emit(&[0x0F, 0x2E, 0xC1]);
+                    }
+                    self.buf.emit(&[0x0F, 0x97, 0xC0]); // SETA AL  (a>b)
+                    self.buf.emit(&[0x0F, 0x92, 0xC2]); // SETB DL  (a<b OR NaN)
+                }
+                self.buf.emit(&[0x0F, 0xB6, 0xC0]); // MOVZX EAX, AL
+                self.buf.emit(&[0x0F, 0xB6, 0xD2]); // MOVZX EDX, DL
+                self.buf.emit(&[0x29, 0xD0]); // SUB EAX, EDX  → {-1,0,1}
+                self.buf.emit(&[0x48, 0x63, 0xC0]); // MOVSXD RAX, EAX (sign-extend)
+                self.store_rax(slot);
+            }
             Op::I2L => {
                 let slot = self.alloc_slot(id);
                 self.load_to_rax(self.slot_of(node.inputs[0]));
@@ -1159,13 +1206,52 @@ impl<'a> Lowerer<'a> {
                                                                             // 3. MOV RAX, invoke_dispatch ; CALL RAX.
                 self.emit_mov_reg_imm64(RAX, self.invoke_dispatch as u64);
                 self.buf.emit(&[0xFF, 0xD0]);
-                // 4. Exception sentinel: CMP RAX, i64::MIN ; JE bail_stub.
+                // 4. Exception sentinel. The dispatch helper returns `i64::MIN`
+                //    when the callee threw/deopted. For an int/ref/void return
+                //    that is unambiguous (no legitimate result is `i64::MIN`), so
+                //    a plain `CMP RAX, i64::MIN; JE bail` suffices. For a `J`/`D`
+                //    (long/double) return a legitimate `Long.MIN_VALUE` result is
+                //    bit-identical to the sentinel, so on the (rare)
+                //    `RAX == i64::MIN` branch we peek the out-of-band signal via
+                //    `jit_dispatch_threw`: bail only when a genuine exception/
+                //    deopt is pending, else keep the real value. (Only `J` is
+                //    currently reachable — `static_call_shape` still rejects
+                //    `D`/`F` returns until the XMM value tier.)
                 self.emit_mov_reg_imm64(R10, i64::MIN as u64);
                 self.buf.emit(&[0x4C, 0x39, 0xD0]); // CMP RAX, R10
-                self.buf.emit(&[0x0F, 0x84]); // JE rel32 (patched to the stub)
-                let patch = self.buf.pos();
-                self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
-                self.call_exc_patches.push(patch);
+                if matches!(node.ty, IrType::Long | IrType::Double | IrType::Float) {
+                    // JNE .keep — common path: not the sentinel, keep real RAX.
+                    self.buf.emit(&[0x0F, 0x85]);
+                    let keep_patch = self.buf.pos();
+                    self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
+                    // Cold: RAX == i64::MIN. Peek whether a real exception/deopt
+                    // is pending — MOV RAX, dispatch_threw ; CALL RAX (RAX = 0/1).
+                    self.emit_mov_reg_imm64(RAX, self.dispatch_threw as u64);
+                    self.buf.emit(&[0xFF, 0xD0]);
+                    // TEST RAX, RAX — ZF=1 iff no signal pending (legit value).
+                    self.buf.emit(&[0x48, 0x85, 0xC0]);
+                    // Restore the sentinel/value into RAX before branching: the
+                    // shared bail stub returns RAX unchanged (so it must be
+                    // `i64::MIN`), and the keep path needs the genuine
+                    // `Long.MIN_VALUE`. `MOV` does not disturb ZF.
+                    self.emit_mov_reg_imm64(RAX, i64::MIN as u64);
+                    // JNE bail_stub — ZF==0 ⇒ exception/deopt ⇒ propagate sentinel.
+                    self.buf.emit(&[0x0F, 0x85]);
+                    let patch = self.buf.pos();
+                    self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
+                    self.call_exc_patches.push(patch);
+                    // .keep: patch the JNE above to land here.
+                    let keep_off = self.buf.pos();
+                    let rel = keep_off as i32 - (keep_patch as i32 + 4);
+                    self.buf
+                        .try_patch_i32(keep_patch, rel)
+                        .expect("ir_lower call-sentinel keep patch in-bounds");
+                } else {
+                    self.buf.emit(&[0x0F, 0x84]); // JE rel32 (patched to the stub)
+                    let patch = self.buf.pos();
+                    self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
+                    self.call_exc_patches.push(patch);
+                }
                 // 5. Spill the return value (harmless for a void call: the slot
                 //    is allocated but never read).
                 self.store_rax(slot);
@@ -2293,5 +2379,46 @@ mod tests {
             vec![FrameValue::Int(20), FrameValue::Int(0)],
             "operands restored for re-execution",
         );
+    }
+
+    #[test]
+    fn test_lower_ldiv_by_zero_reconstructs_long_frame() {
+        use crate::deopt::{take_last_deopt, FrameValue};
+        use crate::ir::{IrBuilder, IrType};
+        // long f(long a, long b){ return a / b; }
+        //   lload_0; lload_2; ldiv; lreturn   (+ 2 trailing padding bytes)
+        // Proves a `long` live at the div guard reconstructs as a full-64-bit
+        // FrameValue::Long (cat-2 width on resume), not a truncated Int.
+        let code = [0x1e, 0x20, 0x6d, 0xad, 0, 0];
+        let mut builder = IrBuilder::new(2, 4); // 2 long params (a@0-1, b@2-3)
+        builder.set_param_types(&[IrType::Long, IrType::Long]);
+        let mut graph = builder.build(&code, 4).expect("ldiv IR build");
+        ir_optimize::optimize(&mut graph);
+        let schedule = ir_schedule::schedule(&graph);
+        let cm = lower(&graph, &schedule, 2, 4, &no_helpers()).expect("lower ldiv");
+
+        let _ = take_last_deopt(); // clear any stale state
+                                   // divisor != 0 → normal full-64-bit result, no deopt. A 32-bit IDIV
+                                   // would mishandle this dividend (> i32::MAX).
+        let ok = unsafe { cm.try_call(&[0x1_0000_0000, 2]).expect("call (b != 0)") };
+        assert_eq!(ok, 0x8000_0000, "0x1_0000_0000 / 2 (genuinely 64-bit)");
+        assert!(take_last_deopt().is_none(), "no deopt when divisor != 0");
+
+        // divisor == 0 → deopt; the reconstructed frame must carry the two LONG
+        // operands as FrameValue::Long (full 64 bits) so the interpreter resumes
+        // at the ldiv bci and re-executes it (throwing ArithmeticException).
+        let sentinel = unsafe { cm.try_call(&[0x7_0000_0000, 0]).expect("call (b == 0)") };
+        assert_eq!(sentinel, i64::MIN, "ldiv by zero → deopt sentinel");
+        let frame = take_last_deopt().expect("deopt reconstructed a frame");
+        assert_eq!(frame.bci, 2, "resume at the ldiv bci");
+        assert_eq!(
+            frame.stack,
+            vec![FrameValue::Long(0x7_0000_0000), FrameValue::Long(0)],
+            "long operands restored as full-64-bit FrameValue::Long",
+        );
+        // Locals: a@0 and b@2 are longs (StackSlotLong → Long); the high-half
+        // slots 1/3 are dummies (never read by the interpreter).
+        assert_eq!(frame.locals[0], FrameValue::Long(0x7_0000_0000));
+        assert_eq!(frame.locals[2], FrameValue::Long(0));
     }
 }

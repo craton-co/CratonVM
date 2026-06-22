@@ -441,17 +441,24 @@ impl VmHeap {
         unsafe { ObjectRef::from_raw(addr) }
     }
 
-    /// Read the compact header for an object. Thin wrapper over the
-    /// backend-specific path. Used by [`Self::load_and_forward`].
+    /// Decode the first 8 bytes of an object's header as a compact
+    /// 64-bit [`CompactHeader`]. The return is a *copy* of that word so
+    /// the caller can inspect it without holding a borrow into the heap.
     ///
-    /// The return is a *copy* of the 64-bit header word wrapped in a
-    /// `CompactHeader` so the caller can inspect it without holding
-    /// a borrow into the heap.
+    /// NOTE: this is **only** meaningful for a backend that actually
+    /// adopts the compact header format. Every current `VmHeap` backend
+    /// (`Heap`, `GenerationalHeap`, `G1Collector`) lays objects out with
+    /// the full 32-byte [`ObjectHeader`], whose first 8 bytes are
+    /// `class_id`/`identity_hash_code` — not a compact header — so this
+    /// method has no in-tree callers today. In particular it is **not**
+    /// used by [`Self::load_and_forward`], which reads the legacy
+    /// `ObjectHeader.forwarding_ptr` field directly (see that method's
+    /// backend-compatibility note).
     #[inline]
     pub fn get_compact_header(&self, obj: ObjectRef) -> crate::compact_header::CompactHeader {
-        // Every heap backend lays out the object header as a 64-bit
-        // word at offset 0 from the ObjectRef pointer. Read the
-        // word directly and reinterpret as a CompactHeader.
+        // Read the 64-bit word at offset 0 from the ObjectRef pointer and
+        // reinterpret it as a CompactHeader. Only correct once a backend
+        // stores compact headers there (see the doc-comment above).
         //
         // SAFETY: ObjectRef is a validated heap address pointing at
         // a live object header. The load is aligned (headers are
@@ -684,41 +691,32 @@ impl VmHeap {
         }
     }
 
-    /// Raw pointer to array data region (after header), or `None` when no
-    /// single contiguous pointer can describe the payload.
+    /// Raw pointer to the array data region (just past the header).
     ///
-    /// For the generational heap and for ordinary (single-region) G1 arrays
-    /// the whole payload is contiguous after `obj.as_ptr() + HEADER_SIZE`, so
-    /// this returns `Some(ptr)` exactly as before.
+    /// Every array now has a contiguous payload starting at
+    /// `obj.as_ptr() + HEADER_SIZE`, so this returns `Some(ptr)` valid for the
+    /// full `len * stride` span: generational and ordinary single-region G1
+    /// arrays trivially, and G1 **humongous** arrays because all regions are
+    /// adjacent slices of one backing arena, making a humongous span one
+    /// physically-contiguous block (see `G1Collector`'s `arena` /
+    /// `alloc_humongous_locked`). Before that arena change a humongous array
+    /// was fragmented across non-contiguous region buffers and this returned
+    /// `None` to force callers onto the region-aware per-element fallback; that
+    /// fallback (`get_array_element` / `set_array_element` /
+    /// `read_char_array_bulk`) is still correct but no longer required for
+    /// humongous, and bulk consumers (arraycopy, GPU marshalling, Unsafe) now
+    /// get the fast contiguous path. The `Option` is retained for API
+    /// stability and so a future non-contiguous layout could opt back out.
     ///
-    /// For a G1 **humongous** array it returns `None`. Such an array is laid
-    /// out across several NON-contiguous region buffers (each with its own
-    /// HEADER_SIZE prefix), so a single flat base pointer is only valid for
-    /// the first region's worth of payload — any caller that walks
-    /// `[base, base + len * stride)` would read/write out of bounds once the
-    /// offset crosses the first region boundary. Callers MUST handle `None`
-    /// by falling back to the region-aware per-element accessors
-    /// (`get_array_element` / `set_array_element`, or `read_char_array_bulk`
-    /// for char[]), all of which route humongous objects through
-    /// `humongous_copy` and so can never escape the object's own backing
-    /// memory.
-    ///
-    /// SAFETY (the `Some` case): `obj` is a live `ObjectRef` in the heap
-    /// arena; `HEADER_SIZE` offset is the layout-documented start of the array
-    /// payload region. The returned pointer is valid for the lifetime of the
-    /// object (which the caller must not drop while holding the pointer) and,
-    /// because `None` is returned for humongous arrays, for the full
-    /// `len * stride` payload span.
+    /// SAFETY (the `Some` case): `obj` is a live array `ObjectRef` in the heap
+    /// arena and `HEADER_SIZE` is the layout-documented start of the payload.
+    /// The pointer is valid for `len * stride` contiguous bytes for the
+    /// lifetime of the object (which the caller must not let be collected or
+    /// moved while holding the pointer).
     pub fn array_data_ptr(&self, obj: ObjectRef) -> Option<*mut u8> {
-        // A G1 humongous array has no valid contiguous data pointer: refuse
-        // so callers take the region-safe per-element fallback. All other
-        // cases (generational heap, single-region G1 arrays) keep the flat
-        // base pointer.
-        if let VmHeap::G1(h) = self {
-            if h.is_humongous(obj) {
-                return None;
-            }
-        }
+        // Contiguous from `obj + HEADER_SIZE` for every array: generational and
+        // single-region G1 trivially, and G1 humongous because all regions are
+        // adjacent slices of one arena (so a humongous span is one block).
         Some(unsafe { obj.as_ptr().add(HEADER_SIZE) })
     }
 
@@ -1463,33 +1461,48 @@ mod concurrent_mark_controller_tests {
         }
     }
 
-    /// Residual humongous-OOB fix: `array_data_ptr` must REFUSE (return `None`)
-    /// for a G1 humongous array — its payload is split across non-contiguous
-    /// region buffers, so no single flat pointer is valid. For an ordinary
-    /// single-region G1 array it must still return `Some(obj + HEADER_SIZE)`.
+    /// After the single-arena change a G1 humongous array is one contiguous
+    /// block, so `array_data_ptr` hands out a flat pointer valid for the whole
+    /// payload (not just the first region). Verify ordinary AND humongous
+    /// arrays both return `obj + HEADER_SIZE`, and that the humongous flat
+    /// pointer round-trips a tail element living far past region 0 — exactly
+    /// the bulk-consumer (arraycopy/Unsafe/GPU) access pattern.
     #[test]
-    fn array_data_ptr_refuses_g1_humongous_but_allows_ordinary() {
+    fn array_data_ptr_is_flat_and_contiguous_for_g1_humongous() {
         let heap = make_g1_heap();
 
-        // Ordinary single-region int[]: contiguous pointer is returned and
-        // points just past the object header.
+        // Ordinary single-region int[]: contiguous pointer just past the header.
         let small = heap.alloc_array(cratonvm_types::ClassId::new(0), ArrayElementType::Int, 8);
-        let ptr = heap
+        let sptr = heap
             .array_data_ptr(small)
             .expect("ordinary array must have a flat pointer");
-        let expected = unsafe { small.as_ptr().add(HEADER_SIZE) };
-        assert_eq!(ptr, expected, "flat pointer must be obj + HEADER_SIZE");
-
-        // Humongous int[] (~1.6 MB > 1 MiB region) spans multiple regions:
-        // no contiguous pointer, so `array_data_ptr` returns `None`.
-        let large = heap.alloc_array(
-            cratonvm_types::ClassId::new(0),
-            ArrayElementType::Int,
-            400_000,
+        assert_eq!(
+            sptr,
+            unsafe { small.as_ptr().add(HEADER_SIZE) },
+            "flat pointer must be obj + HEADER_SIZE",
         );
-        assert!(
-            heap.array_data_ptr(large).is_none(),
-            "humongous array must not expose a flat data pointer",
+
+        // Humongous int[] (~1.6 MB > 1 MiB region) is now also contiguous.
+        let n = 400_000usize;
+        let large = heap.alloc_array(cratonvm_types::ClassId::new(0), ArrayElementType::Int, n);
+        let lptr = heap
+            .array_data_ptr(large)
+            .expect("humongous array now exposes a contiguous flat pointer")
+            as *mut i32;
+        assert_eq!(
+            lptr as *mut u8,
+            unsafe { large.as_ptr().add(HEADER_SIZE) },
+            "humongous flat pointer must be obj + HEADER_SIZE",
+        );
+
+        // The flat pointer must reach the tail element (far past region 0)
+        // without escaping the object: write via the raw pointer (as a bulk
+        // consumer would), read back via the GC accessor.
+        unsafe { std::ptr::write(lptr.add(n - 1), 0x1234_5678) };
+        assert_eq!(
+            heap.get_array_element(large, n - 1).unwrap().as_int(),
+            Some(0x1234_5678),
+            "flat write to the humongous tail must round-trip",
         );
     }
 }
