@@ -96,8 +96,13 @@ pub enum FrameValue {
     Double(u64),
     /// Object reference (heap address, 0 for null).
     Object(u64),
-    /// Value currently in a general-purpose machine register.
+    /// Cat-1 `int`/`ref` currently in a general-purpose machine register.
     Register(u8),
+    /// Cat-2 `long` currently live in general-purpose register `n`. Resolves to
+    /// [`FrameValue::Long`] from the full 64 bits of `gpr[n]`. Distinct from
+    /// [`FrameValue::Register`] (which resolves to a cat-1 `Int`, truncated to 32
+    /// bits on resume) so a register-resident `long` keeps all 64 bits.
+    RegisterLong(u8),
     /// Cat-1 `float` currently live in XMM register `n`. Resolves to
     /// [`FrameValue::Float`] from the low 32 bits of the spilled `xmm[n]`
     /// ([`SavedRegisters::xmm`]). The JIT FP value tier keeps a `float` in an XMM
@@ -883,6 +888,7 @@ impl Default for SavedRegisters {
 fn resolve_value(v: &FrameValue, regs: &SavedRegisters, rbp: u64) -> FrameValue {
     match v {
         FrameValue::Register(r) => FrameValue::Int(regs.gpr[*r as usize] as i64),
+        FrameValue::RegisterLong(r) => FrameValue::Long(regs.gpr[*r as usize] as i64),
         FrameValue::XmmFloat(n) => {
             // Low 32 bits of the spilled XMM ARE the IEEE-754 float pattern.
             FrameValue::Float(regs.xmm[*n as usize] & 0xFFFF_FFFF)
@@ -1263,6 +1269,9 @@ mod tests {
         let mut regs = SavedRegisters::default();
         regs.xmm[5] = 0xCAFE_F00D_0000_0000 | float_bits as u64; // high garbage masked off
         regs.xmm[9] = double_bits;
+        // A cat-2 `long` in GPR 7 — full 64 bits (high bits set, would truncate
+        // if mistyped as a cat-1 `Register`).
+        regs.gpr[7] = 0xFEDC_BA98_7654_3210;
 
         let fs = FrameState {
             method_key: "T.m:()V".to_string(),
@@ -1272,6 +1281,7 @@ mod tests {
                 FrameValue::StackSlotDouble(-8),
                 FrameValue::XmmFloat(5),
                 FrameValue::XmmDouble(9),
+                FrameValue::RegisterLong(7),
             ],
             stack: Vec::new(),
             monitors: Vec::new(),
@@ -1290,6 +1300,8 @@ mod tests {
         assert_eq!(rf.locals[1], FrameValue::Double(double_bits));
         assert_eq!(rf.locals[2], FrameValue::Float(float_bits as u64));
         assert_eq!(rf.locals[3], FrameValue::Double(double_bits));
+        // RegisterLong keeps all 64 bits (NOT truncated like Register -> Int).
+        assert_eq!(rf.locals[4], FrameValue::Long(0xFEDC_BA98_7654_3210u64 as i64));
     }
 
     // -- DeoptReason -------------------------------------------------------
