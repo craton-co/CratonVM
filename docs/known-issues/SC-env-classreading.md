@@ -1,5 +1,25 @@
 # SC-env-classreading — Environment + class-reading metadata cluster
 
+> **TRIAGE 2026-06-22 (against current `dev`, repro `test_classes/EnvClassreadingRepro`).**
+> The doc was originally static-analysis-only (disk full). Verified status:
+> - **RC-C (`int.class` → wrapper)**: ✅ **already fixed on `dev`** — `int.class == Integer.TYPE`,
+>   `int.class.isPrimitive()`, `getName()=="int"`, and `int.class != Integer.class` all hold.
+>   The primitive↔wrapper conflation no longer reproduces. (No further action; left documented
+>   for history.)
+> - **RC-A (`System.getenv()`/`getProperties()` singleton identity)**: ✅ **FIXED on `dev`**
+>   (`fea93ba8`, merge `d236eb42`). Both no-arg accessors now return a process-wide cached
+>   singleton ObjectRef (GC-rooted + remapped like the singleton class loaders); `getProperties`
+>   resyncs its side-table to the live `list_system_properties()` snapshot each call (wholesale
+>   replace) so enumeration/`getProperty` stay live and reflect `clearProperty`. Verified vs
+>   HotSpot (JDK 25, `test_classes/EnvSingletonRepro` 10/10; holds under GC stress + moving young-gen).
+> - **RC-B (`Object.equals` native shadows a bytecode override → `COWAL.indexOf`/`contains`/
+>   `remove`)**: 🔴 **OPEN** (reproduces). HIGH severity but **HANDOFF** — a core
+>   interpreter/JIT virtual-dispatch + native-shadowing fix (resolve the most-derived `equals`
+>   before serving the `java/lang/Object.equals` native); overlaps the tracked
+>   "Object.toString/equals/hashCode intrinsic shadowing" work. Not a localized patch.
+> - **RC-D (`getResourceAsStream` via user-defined `ClassLoader` subclass)**: 🔴 **OPEN**
+>   (reproduces — returns null). HANDOFF (classloader/resource delegation model).
+
 Two distinct root causes (three, if you split classreading), spanning
 `org.springframework.core.env` (System property/env access) and
 `org.springframework.core.type.classreading` (Spring's ASM-based metadata reader).

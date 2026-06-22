@@ -10595,7 +10595,24 @@ fn native_stream_distinct(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     let elements = stream_elements(ctx, this)?;
     let mut unique: Vec<Value> = Vec::new();
     for elem in &elements {
-        let dup = unique.iter().any(|u| values_equal(ctx, u, elem));
+        // `Stream.distinct()` dedups via the element's `equals`/`hashCode`
+        // (it builds a `HashSet`). `values_equal` only recognises identity,
+        // String, enum, and unboxed primitives — for any other two distinct
+        // object instances it returns false, so value classes/records with a
+        // real `equals` override (`ResourcePatternHint`, `UUID`, user records)
+        // were never deduped and `distinct()` over-counted (Spring AOT
+        // `ResourceHintsAttributes` emitted 8 globs where HotSpot collapses to
+        // 5). Use `list_element_matches`, which takes the cheap structural
+        // check first and then falls back to the seen element's real Java
+        // `equals` — exactly as already done for `List.contains`/`indexOf` and
+        // `Collectors.groupingBy` keys.
+        let mut dup = false;
+        for u in &unique {
+            if list_element_matches(ctx, elem, u) {
+                dup = true;
+                break;
+            }
+        }
         if !dup {
             unique.push(*elem);
         }

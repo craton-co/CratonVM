@@ -1038,6 +1038,9 @@ impl SharedVm {
 
         // Reset singleton classloader instances from any previous VM
         cratonvm_native_builtins::classloader::reset_loader_singletons();
+        // Reset cached System.getenv()/getProperties() singletons too, so a new
+        // VM never returns a stale ObjectRef from a previous instance.
+        cratonvm_native_builtins::lang_system::reset_system_singletons();
 
         let mut native_methods = NativeMethodRegistry::new();
         #[cfg(feature = "synthetic-jdk")]

@@ -1,4 +1,21 @@
-﻿# AOT RuntimeHints resource-pattern count mismatch вЂ” Stream.distinct() ignores element equals()
+﻿# AOT RuntimeHints resource-pattern count mismatch — Stream.distinct() ignores element equals()
+
+> **STATUS: RESOLVED (archived).** The single high-confidence root cause — `Stream.distinct()`
+> (`native_stream_distinct`) deduping via shallow `values_equal` instead of the element's real
+> Java `equals()` — is fixed on `dev` (`029f2c87`, merge `cf269fc5`). `native_stream_distinct`
+> now dedups via `list_element_matches` (cheap structural check → seen element's `equals`),
+> matching `List.contains`/`indexOf` and `Collectors.groupingBy`. This resolves the 3 count-mismatch
+> tests (`RuntimeHintsWriterTests$ResourceHintsTests.registerExactMatch` /
+> `registerPatternWithIncludesAndExcludes`, `FileNativeConfigurationWriterTests.resourceConfig`).
+> Verified vs HotSpot (JDK 25) with `test_classes/DistinctEquals` (pre-fix dev over-counts:
+> record 4 vs 3, value-class 5 vs 3; post-fix 5/5, String/Integer dedup unchanged).
+>
+> **Residual (unconfirmed, see "More than one root cause?" / open question 1):** the 4
+> empty-message `FileNativeConfigurationWriterTests` cases (`reflectionConfig`, `jniConfig`,
+> `serializationConfig`, `proxyConfig`) do NOT flow through `distinct()` and were never confirmed
+> to fail on CratonVM (static-analysis-only at the time). If they do fail, the cause is separate
+> (case-insensitive field sort, or the `comment` field under `NON_EXTENSIBLE`) — re-triage as a
+> new item; it is NOT the distinct() bug fixed here.
 
 ## Symptom
 Three Spring AOT nativex tests fail with resource glob count mismatches:

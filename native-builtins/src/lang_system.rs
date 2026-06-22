@@ -1466,11 +1466,134 @@ pub(crate) fn native_system_getenv(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Process-global singletons for `System.getenv()` (no-arg) and
+// `System.getProperties()`.
+//
+// HotSpot returns the SAME object on every call:
+//   - `System.getenv()` → the cached unmodifiable
+//     `ProcessEnvironment.theUnmodifiableEnvironment` Map, and
+//   - `System.getProperties()` → the `System.props` singleton `Properties`.
+// so `System.getenv() == System.getenv()` and
+// `System.getProperties() == System.getProperties()` hold (Spring's
+// `StandardEnvironmentTests.getSystemEnvironment` / `.getSystemProperties`
+// assert this via `isSameAs`). CratonVM allocated a fresh object on every call,
+// so identity failed (SC-env-classreading RC-A).
+//
+// Cache the built object the first time and return it thereafter. The cached
+// `ObjectRef`s live ONLY in these process-global mutexes (a Rust side-table,
+// invisible to the field/stack/static root scans), so they must be reported as
+// GC roots and remapped after a moving collection — exactly like the singleton
+// class loaders (`classloader::gc_scan_loader_singleton_roots`). The matching
+// hooks are `gc_scan_system_singleton_roots` (wired into `roots.rs`) and
+// `gc_update_system_singleton_refs` (wired into `gc.rs`); `reset_system_singletons`
+// clears them when a new VM is created (mirrors `reset_loader_singletons`).
+// ---------------------------------------------------------------------------
+use std::sync::{Mutex, OnceLock};
+
+fn system_env_store() -> &'static Mutex<Option<ObjectRef>> {
+    static INSTANCE: OnceLock<Mutex<Option<ObjectRef>>> = OnceLock::new();
+    INSTANCE.get_or_init(|| Mutex::new(None))
+}
+
+fn system_props_store() -> &'static Mutex<Option<ObjectRef>> {
+    static INSTANCE: OnceLock<Mutex<Option<ObjectRef>>> = OnceLock::new();
+    INSTANCE.get_or_init(|| Mutex::new(None))
+}
+
+/// The cached no-arg `System.getenv()` Map singleton, if already built.
+fn system_env_singleton() -> Option<ObjectRef> {
+    *system_env_store().lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Publish `obj` as the `System.getenv()` singleton (double-checked, like
+/// [`set_system_props_singleton`]); returns the canonical singleton.
+fn set_system_env_singleton(obj: ObjectRef) -> ObjectRef {
+    let mut g = system_env_store().lock().unwrap_or_else(|e| e.into_inner());
+    match *g {
+        Some(existing) => existing,
+        None => {
+            *g = Some(obj);
+            obj
+        }
+    }
+}
+
+/// The cached `System.getProperties()` `Properties` singleton, if already built.
+pub fn system_props_singleton() -> Option<ObjectRef> {
+    *system_props_store().lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Publish `obj` as the `System.getProperties()` singleton, unless another
+/// thread already won the race — in which case the existing one is returned and
+/// `obj` is discarded (it becomes unreachable and is collected). Returns the
+/// canonical singleton so all callers converge on one identity.
+pub fn set_system_props_singleton(obj: ObjectRef) -> ObjectRef {
+    let mut g = system_props_store().lock().unwrap_or_else(|e| e.into_inner());
+    match *g {
+        Some(existing) => existing,
+        None => {
+            *g = Some(obj);
+            obj
+        }
+    }
+}
+
+/// GC root scan for the `System.getenv()` / `System.getProperties()` singletons
+/// (companion to [`gc_update_system_singleton_refs`]). Mirrors
+/// `classloader::gc_scan_loader_singleton_roots`.
+pub fn gc_scan_system_singleton_roots(out: &mut Vec<ObjectRef>) {
+    if let Some(o) = *system_env_store().lock().unwrap_or_else(|e| e.into_inner()) {
+        out.push(o);
+    }
+    if let Some(o) = *system_props_store().lock().unwrap_or_else(|e| e.into_inner()) {
+        out.push(o);
+    }
+}
+
+/// Post-GC remap for the system singletons (companion to
+/// [`gc_scan_system_singleton_roots`]). Repoints the cached `ObjectRef`s to
+/// their relocated addresses after a moving collection.
+pub fn gc_update_system_singleton_refs(pointer_map: &std::collections::HashMap<usize, usize>) {
+    if pointer_map.is_empty() {
+        return;
+    }
+    let remap = |slot: &mut Option<ObjectRef>| {
+        if let Some(obj_ref) = slot.as_mut() {
+            let old_addr = obj_ref.as_ptr() as usize;
+            if let Some(&new_addr) = pointer_map.get(&old_addr) {
+                debug_assert!(new_addr != 0, "GC pointer map contains null address");
+                *obj_ref = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+            }
+        }
+    };
+    remap(&mut system_env_store().lock().unwrap_or_else(|e| e.into_inner()));
+    remap(&mut system_props_store().lock().unwrap_or_else(|e| e.into_inner()));
+}
+
+/// Reset the cached system singletons. Called when creating a new VM so a stale
+/// `ObjectRef` from a previous VM instance is never returned (mirrors
+/// `classloader::reset_loader_singletons`).
+pub fn reset_system_singletons() {
+    *system_env_store().lock().unwrap_or_else(|e| e.into_inner()) = None;
+    *system_props_store().lock().unwrap_or_else(|e| e.into_inner()) = None;
+}
+
 pub(crate) fn native_system_getenv_all(
     ctx: &mut dyn NativeContext,
     _args: &[Value],
 ) -> MethodCallResult {
     use cratonvm_types::ClassId;
+
+    // Identity: return the cached singleton so `System.getenv() ==
+    // System.getenv()` holds (SC-env-classreading RC-A). The process
+    // environment is immutable for a running JVM, so the cached snapshot stays
+    // correct. Only the real-layout path below caches (the legacy 3-field
+    // fallback is left uncached so a later call retries once the real
+    // `java/util/HashMap` layout is resolvable).
+    if let Some(cached) = system_env_singleton() {
+        return Ok(Some(Value::Object(Some(cached))));
+    }
 
     // Build a HashMap with all environment variables.
     //
@@ -1596,6 +1719,8 @@ pub(crate) fn native_system_getenv_all(
             ctx.set_field(map, f_size, Value::Int(old_size + 1));
         }
 
+        // Cache as the process-wide singleton (double-checked publish).
+        let map = set_system_env_singleton(map);
         return Ok(Some(Value::Object(Some(map))));
     }
 

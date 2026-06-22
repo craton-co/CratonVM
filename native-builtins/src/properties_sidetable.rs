@@ -673,6 +673,28 @@ pub fn store_property_in_sidetable(
     put_kv(ctx, obj, key, value);
 }
 
+/// Wholesale-replace the side-table snapshot for `obj` with exactly `entries`.
+///
+/// Unlike repeated [`store_property_in_sidetable`] (which only adds / overwrites
+/// individual keys), this DROPS any key no longer present in `entries`. It lets
+/// `System.getProperties()` resync its stable singleton's enumeration view to
+/// the current system-property store on every call, so a `System.clearProperty`
+/// between calls is reflected (the entry disappears) — not just additions.
+pub fn replace_sidetable(ctx: &dyn NativeContext, obj: ObjectRef, entries: &[(String, String)]) {
+    let k = key_for(ctx, obj);
+    let mut m: FxHashMap<String, String> = FxHashMap::default();
+    for (key, value) in entries {
+        if key.len() > MAX_KV_LEN || value.len() > MAX_KV_LEN {
+            continue;
+        }
+        if m.len() >= MAX_PROPS_PER_OBJECT {
+            break;
+        }
+        m.insert(key.clone(), value.clone());
+    }
+    table().lock().insert(k, m);
+}
+
 /// Public snapshot of side-table entries for a given object, used by
 /// surefire `setAsSystemProperties` etc. to iterate entries without
 /// going through the inner Map field.
