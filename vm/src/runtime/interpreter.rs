@@ -7990,6 +7990,64 @@ fn build_deopt_frame_inner(
     if !rframe.caller_frames.is_empty() || !rframe.monitors.is_empty() {
         return None;
     }
+
+    // Workstream A: re-materialize scalar-replaced (virtual) objects into real
+    // heap shells before mapping. The reconstructed frame may carry
+    // `VirtualObject`/`VirtualObjectRef` slots (escape analysis elided the
+    // allocation on the fast path); the mapper below has no representation for
+    // them and would bail to re-run. Materialize them into a heap object graph
+    // and rewrite the slots to real `Object` refs first.
+    //
+    // GC-rooting: `keep_pins = true` leaves each shell pinned in
+    // `native_pin_roots`; those pins ride the SAME `pin_base..truncate` window
+    // `resume_real_ir_deopt` holds across `push_frame_and_fire_entry`, so the
+    // shells are rooted continuously from allocation until the resumed frame
+    // roots them. On any materialization failure (unsupported field / unknown
+    // id) the pins are released and we fall back to re-run (`?` → `None`).
+    use cratonvm_jit::deopt::FrameValue;
+    let has_virtual = rframe
+        .locals
+        .iter()
+        .chain(rframe.stack.iter())
+        .any(|v| matches!(v, FrameValue::VirtualObject(_) | FrameValue::VirtualObjectRef(_)));
+    let materialized_frame;
+    let rframe: &cratonvm_jit::deopt::ReconstructedFrame = if has_virtual {
+        // Elided-monitor gate. Escape analysis performs lock elision over
+        // non-escaping objects (`jit::escape_analysis::find_lock_elisions`): a
+        // scalar-replaced object may have had its `monitorenter`/`monitorexit`
+        // elided, so a resumed frame that later runs `monitorexit` would hit an
+        // un-entered monitor. Two layers protect against this:
+        //   1. A frame *holding* a monitor already bailed above (`rframe.monitors`).
+        //   2. `ACC_SYNCHRONIZED` methods bail here (the method monitor is elided
+        //      under scalar replacement of `this`/the receiver).
+        // The residual case — a `synchronized(obj)` *block* over a scalar-replaced
+        // object in a non-synchronized method — is NOT detectable from the
+        // reconstructed frame alone (an elided monitor leaves no trace). It is
+        // unreachable today: no production emitter writes `VirtualObject` deopt
+        // slots (the x64 snapshot records only Register/StackSlot/StackSlotRef
+        // provenance), so `has_virtual` is structurally false in production. When
+        // the x64 virtual-slot emitter lands it MUST carry an "elided monitor
+        // present" flag on the deopt point for this sink to bail on; that flag is
+        // the proper fix and is scoped with that emitter. This whole path is also
+        // `CRATONVM_DEOPT_REAL`-gated (default-off).
+        if cached.is_synchronized {
+            return None;
+        }
+        let mut copy = rframe.clone();
+        crate::runtime::deopt_materialize::materialize_virtual_objects(
+            shared,
+            thread,
+            &mut copy,
+            /* stress_gc */ false,
+            /* keep_pins */ true,
+        )
+        .ok()?;
+        materialized_frame = copy;
+        &materialized_frame
+    } else {
+        rframe
+    };
+
     let locals = ir_deopt_frame_values_with_objects(&rframe.locals)?;
     let stack_vals = ir_deopt_frame_values_with_objects(&rframe.stack)?;
 
@@ -8126,7 +8184,7 @@ mod deopt_step3_tests {
     use super::*;
     use crate::config::VmConfig;
     use crate::threading::jvm_thread::ThreadId;
-    use cratonvm_jit::deopt::{FrameValue, ReconstructedFrame};
+    use cratonvm_jit::deopt::{FrameValue, ReconstructedFrame, VirtualObjectState};
     use std::sync::Arc;
 
     fn minimal_cached() -> Arc<CachedBytecodeMethod> {
@@ -8143,6 +8201,36 @@ mod deopt_step3_tests {
             num_params: 0,
             is_synchronized: false,
             is_static: true,
+        })
+    }
+
+    /// As `minimal_cached` but `ACC_SYNCHRONIZED` — exercises the
+    /// elided-monitor gate for virtual-object resume.
+    fn synchronized_cached() -> Arc<CachedBytecodeMethod> {
+        Arc::new(CachedBytecodeMethod {
+            declaring_class_id: cratonvm_types::ClassId::new(0),
+            class_name: Arc::from("T"),
+            method_name: Arc::from("m"),
+            method_descriptor: Arc::from("()V"),
+            source_file: None,
+            code: Arc::from(&[0xb1u8][..]), // return
+            exception_table: Arc::from(Vec::new().into_boxed_slice()),
+            max_stack: 8,
+            max_locals: 4,
+            num_params: 0,
+            is_synchronized: true,
+            is_static: true,
+        })
+    }
+
+    /// A scalar-replaced object placeholder: id `id`, class `class_id`, with the
+    /// given field values (`num_fields` derived from the vec length).
+    fn vobj(id: usize, class_id: u32, fields: Vec<FrameValue>) -> FrameValue {
+        FrameValue::VirtualObject(VirtualObjectState {
+            id,
+            class_id,
+            num_fields: fields.len(),
+            field_values: fields,
         })
     }
 
@@ -8308,6 +8396,119 @@ mod deopt_step3_tests {
                 assert_eq!(shared.heap.class_id_of(o), cratonvm_types::ClassId::new(7));
             }
             other => panic!("local 0 must be a live object, got {other:?}"),
+        }
+        drop(frame);
+        thread.native_pin_roots.truncate(pin_base);
+    }
+
+    // ---------------------------------------------------------------------
+    // Workstream A — virtual-object (scalar-replaced) re-materialization wired
+    // into the resume path.
+    // ---------------------------------------------------------------------
+
+    /// A1/A2: a reconstructed frame carrying a `VirtualObject` local resumes —
+    /// the materializer turns it into a real heap object, the frame is pushed,
+    /// the temporary shell pins are released, and the materialized object (with
+    /// its fields) survives a forced GC via the pushed frame.
+    #[test]
+    fn resumes_frame_with_virtual_object() {
+        let shared = Arc::new(SharedVm::new(VmConfig::default()));
+        let mut thread = JvmThread::new(ThreadId(0), "test");
+        let cached = minimal_cached();
+
+        // local 0 = scalar-replaced object id 0, class 5, fields [Int(42), Undefined].
+        let rf = rframe(
+            vec![vobj(0, 5, vec![FrameValue::Int(42), FrameValue::Undefined])],
+            vec![],
+            4,
+        );
+
+        let pin_base = thread.native_pin_roots.len();
+        let r = resume_real_ir_deopt(&shared, &mut thread, &cached, &rf)
+            .expect("virtual-bearing frame must resume after materialization");
+        assert!(matches!(r, CachedCallResult::FramePushed));
+        // All temporary shell pins released after the push (the frame roots them).
+        assert_eq!(thread.native_pin_roots.len(), pin_base);
+        assert_eq!(thread.frames.len(), 1);
+
+        // Force a GC: the materialized shell must survive via the pushed frame.
+        maybe_gc_forced_pub(&shared, &mut thread);
+        let frame = thread.frames.last().expect("resumed frame is on the stack");
+        assert_eq!(frame.pc, 4);
+        match frame.get_local(0) {
+            Value::Object(Some(o)) => {
+                assert_eq!(shared.heap.class_id_of(o), cratonvm_types::ClassId::new(5));
+                assert_eq!(shared.heap.get_field(o, 0), Value::Int(42));
+                assert_eq!(shared.heap.get_field(o, 1), Value::Int(0)); // Undefined -> 0
+            }
+            other => panic!("local 0 must be the materialized object, got {other:?}"),
+        }
+    }
+
+    /// A3: a frame with two mutually-referencing scalar-replaced objects resumes
+    /// with both materialized as heap objects whose fields point at each other
+    /// (the two-phase shells-first materializer resolves the back-edge).
+    #[test]
+    fn resumes_frame_with_object_cycle() {
+        let shared = Arc::new(SharedVm::new(VmConfig::default()));
+        let mut thread = JvmThread::new(ThreadId(0), "test");
+        let cached = minimal_cached();
+
+        // local 0 = A(id 0).f0 -> B ; local 1 = B(id 1).f0 -> A
+        let a = vobj(0, 1, vec![FrameValue::VirtualObjectRef(1)]);
+        let b = vobj(1, 1, vec![FrameValue::VirtualObjectRef(0)]);
+        let rf = rframe(vec![a, b], vec![], 2);
+
+        let r = resume_real_ir_deopt(&shared, &mut thread, &cached, &rf)
+            .expect("cyclic virtual frame must resume");
+        assert!(matches!(r, CachedCallResult::FramePushed));
+
+        // No GC forced here (addresses stable): verify the heap cycle is wired.
+        let frame = thread.frames.last().expect("resumed frame is on the stack");
+        let (oa, ob) = match (frame.get_local(0), frame.get_local(1)) {
+            (Value::Object(Some(oa)), Value::Object(Some(ob))) => (oa, ob),
+            other => panic!("both locals must be materialized objects, got {other:?}"),
+        };
+        assert_eq!(shared.heap.get_field(oa, 0), Value::Object(Some(ob)));
+        assert_eq!(shared.heap.get_field(ob, 0), Value::Object(Some(oa)));
+    }
+
+    /// A2 elided-monitor gate: a `synchronized` method carrying a virtual frame
+    /// must NOT resume (lock elision over the scalar-replaced object is
+    /// undetectable here) — it falls back to re-run with no pins leaked and no
+    /// frame pushed.
+    #[test]
+    fn virtual_resume_blocked_for_synchronized_method() {
+        let shared = Arc::new(SharedVm::new(VmConfig::default()));
+        let mut thread = JvmThread::new(ThreadId(0), "test");
+        let cached = synchronized_cached();
+        let rf = rframe(vec![vobj(0, 5, vec![FrameValue::Int(1)])], vec![], 0);
+
+        assert!(resume_real_ir_deopt(&shared, &mut thread, &cached, &rf).is_none());
+        assert_eq!(thread.native_pin_roots.len(), 0);
+        assert_eq!(thread.frames.len(), 0);
+    }
+
+    /// A3 GC-stress: a virtual frame built with a forced GC at the refill point —
+    /// the materialized shell is pinned (materialize keep-pins + the build re-pin)
+    /// and forwarded in place, so the built frame holds the live object.
+    #[test]
+    fn virtual_shells_survive_forced_gc_during_build() {
+        let shared = Arc::new(SharedVm::new(VmConfig::default()));
+        let mut thread = JvmThread::new(ThreadId(0), "test");
+        let cached = minimal_cached();
+        let rf = rframe(vec![vobj(0, 5, vec![FrameValue::Int(7)])], vec![], 0);
+
+        let pin_base = thread.native_pin_roots.len();
+        let frame =
+            build_deopt_frame_inner(&shared, &mut thread, &cached, &rf, /* stress */ true)
+                .expect("virtual frame must build under a forced GC");
+        match frame.get_local(0) {
+            Value::Object(Some(o)) => {
+                assert_eq!(shared.heap.class_id_of(o), cratonvm_types::ClassId::new(5));
+                assert_eq!(shared.heap.get_field(o, 0), Value::Int(7));
+            }
+            other => panic!("materialized shell must survive GC during build, got {other:?}"),
         }
         drop(frame);
         thread.native_pin_roots.truncate(pin_base);
