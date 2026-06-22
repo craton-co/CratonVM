@@ -329,6 +329,10 @@ cached_is_set!(jit_newarray_trace, "CRATON_JIT_NEWARRAY_TRACE");
 /// path (the pre-fix behaviour). Read only at JIT compile time, so caching is
 /// for tidiness rather than hot-path cost.
 cached_is_set!(ctor_direct_call_disabled, "CRATONVM_NO_CTOR_DIRECT_CALL");
+/// `CRATONVM_DBG_CTOR_FIX` — diagnostic tracing for the trivial-constructor
+/// elision (which ctor sites are deferred / resolved elidable). Read only at
+/// JIT compile time.
+cached_is_set!(ctor_fix_dbg, "CRATONVM_DBG_CTOR_FIX");
 
 // ── Frame-trace and interpreter hot-path flags ──────────────────────────
 
