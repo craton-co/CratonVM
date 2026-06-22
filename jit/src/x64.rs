@@ -6696,6 +6696,17 @@ struct Compiler {
     /// `None`, the trigger is the unconditional-at-header bail (Step 8). Set from
     /// `osr_exit_after()` at finalize (only under `CRATONVM_DEOPT_REAL`).
     osr_exit_after_count: Option<usize>,
+    /// deopt-osr: the through-JIT deopt-EXIT differential trigger
+    /// (`CRATONVM_DEOPT_EAGER` + `deopt_real_enabled()`) — the loop-header bci at
+    /// which to force a reason-2 deopt-EXIT. When `Some(pc)`, the backend records a
+    /// reason-2 snapshot and emits an unconditional branch to the deopt stub at
+    /// `pc_to_native[pc]` (the normal loop path), so a JIT'd loop deopts at the
+    /// loop bci on entry — reconstructing the loop-header frame (incl.
+    /// `long`/`double`/`float` locals) and resuming in the interpreter via
+    /// `resume_real_ir_deopt`. The end-to-end exercise of the deopt-EXIT resume,
+    /// independent of the (pattern-specific) speculative-BCE guard. `None`
+    /// (production / no loop) ⇒ no branch ⇒ byte-identical.
+    deopt_eager_bci: Option<usize>,
 }
 
 /// deopt-osr Step 1: map a frame slot's machine location + oop-ness to a
@@ -7322,6 +7333,7 @@ impl Compiler {
             osr_exit_box_ptr_by_bci: FxHashMap::default(),
             osr_exit_test_trigger_bci: None,
             osr_exit_after_count: None,
+            deopt_eager_bci: None,
         }
     }
 
@@ -15421,6 +15433,25 @@ impl Compiler {
                 }
             }
 
+            // deopt-osr: the through-JIT deopt-EXIT differential trigger. At the
+            // chosen loop header, record a reason-2 snapshot (if the speculative-BCE
+            // path above didn't already) and emit an UNCONDITIONAL branch to the
+            // deopt stub on the NORMAL loop path, so the JIT'd loop deopts at this
+            // loop bci on the first reach — reconstructing the loop-header frame
+            // (incl. long/double/float locals) and resuming in the interpreter via
+            // `resume_real_ir_deopt` (the deopt-EXIT sink). Independent of the
+            // speculative-BCE guard. Only under CRATONVM_DEOPT_EAGER + DEOPT_REAL ⇒
+            // no JMP in production ⇒ byte-identical.
+            if self.deopt_eager_bci == Some(pc) {
+                if !self.deopt_box_ptr_by_bci.contains_key(&pc) {
+                    self.emit_deopt_snapshot_at_guard(pc);
+                }
+                self.buf.emit_byte(0xE9); // JMP rel32
+                let patch_off = self.buf.pos();
+                self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
+                self.deopt_stubs.push((patch_off, pc, 2)); // 2 = deopt-EXIT resume
+            }
+
             // === LICM: Replace hoisted sequences with spill slot loads ===
             {
                 let hoist_replace = self
@@ -23216,6 +23247,14 @@ pub fn compile_with_param_slots(
     compiler.osr_exit_test_trigger_bci = if crate::deopt_real_enabled()
         && (crate::osr_exit_test_enabled() || compiler.osr_exit_after_count.is_some())
     {
+        loops.iter().map(|&(h, _)| h).min()
+    } else {
+        None
+    };
+    // deopt-osr: the through-JIT deopt-EXIT differential trigger. Under
+    // CRATONVM_DEOPT_EAGER + DEOPT_REAL, force a reason-2 deopt-EXIT at the first
+    // (lowest-pc) loop header. `None` (either gate off / no loop) ⇒ byte-identical.
+    compiler.deopt_eager_bci = if crate::deopt_real_enabled() && crate::deopt_eager_enabled() {
         loops.iter().map(|&(h, _)| h).min()
     } else {
         None
