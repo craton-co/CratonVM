@@ -24,12 +24,6 @@ exclude = [
 name = "cratonvm"
 path = "src/main.rs"
 
-# Unique name for the feat/x64-deopt-backport worktree binary — avoids
-# collision with cratonvm builds from other worktrees on the same machine.
-[[bin]]
-name = "cratonvm-x64deopt"
-path = "src/main.rs"
-
 # Optional second bin built as `java[.exe]`, gated behind the
 # `java-bin-alias` cargo feature. Off by default so `cargo install
 # cratonvm-cli` does NOT drop a `java` binary into `~/.cargo/bin/`
