@@ -1,10 +1,22 @@
 # GC: object-binarytrees JIT-frame stale root under extreme `GC_STRESS` (`main` reads `args`)
 
-**Status:** 🔴 **OPEN** — a residual member of **Family A** (GC root coverage under JIT). Found
-2026-06-21. JIT-only; reproduces **only at extreme young-GC frequency** (`CRATONVM_DBG_GC_STRESS`
-≤ 65536, i.e. a young GC every ≤ 64 KB of allocation) — i.e. **below** the 524288 / 4 MB thresholds at
-which the A3 precise-oop-maps fix (`32649b56`, default-on) was verified. Precise maps **on or off make no
-difference**; this is *not* closed by the A3 fix.
+**Status:** ✅ **FIXED on the default path (Windows)** — dev merge `77c98761` / fix `6e92f0e5`.
+Root-caused (instrumented) to the generational MOVING young collector relocating the **compiled
+entry-point `main`**'s live objects: `main`'s JIT frame is invisible to `gc_quiescence` (it is
+invoked via `Vm::invoke` WITHOUT a `JitEntryGuard`), so `is_active()` is false and the collector
+moves instead of running the non-moving sweep. The fix detects an unregistered JIT frame on the
+native stack (a JIT code return address via `cratonvm_jit::lookup_jit_code_range`), conservatively
+marks its oops with a full-stack scan, and runs the non-moving sweep (pin, don't relocate).
+**Validated:** `VAAload 14 @CRATONVM_DBG_GC_STRESS=4096` → `3222190` 5/5 (was crash 8/8); all repro
+variants ==HotSpot; `bt16` throughput byte-identical; `cratonvm-gc` 730/730. **Residuals (tracked
+follow-ups, not yet fixed):** (1) Windows-only — the detection reuses `current_thread_stack_high`;
+(2) the `JIT_ENTRY_CHAIN`-non-empty case where an unregistered `main` sits ABOVE a registered chain
+is not yet covered (the repro hits chain-empty). See the CRACKED + fix notes below.
+
+Originally a residual member of **Family A** (GC root coverage under JIT). Found 2026-06-21.
+JIT-only; reproduced **only at extreme young-GC frequency** (`CRATONVM_DBG_GC_STRESS` ≤ 65536, i.e.
+a young GC every ≤ 64 KB) — **below** the 524288 / 4 MB thresholds at which the A3 precise-oop-maps
+fix (`32649b56`) was verified. Precise maps **on or off** made no difference; not closed by A3.
 
 ---
 
