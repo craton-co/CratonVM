@@ -152,3 +152,45 @@ heap, taskkill stray cratonvm first, `build-cpu.bat`).
 XL, and gated on either finishing the shadow stack (Route A, large) or on
 `real-frame-deopt.md` safepoint maps (Route B, very large). Route A is the
 pragmatic first landable; the correctness harness already exists.
+
+## Prerequisite recheck — MEASURED 2026-06-21 (dev `a6f1ec55`)
+
+Ran the design's mandated "MEASURE FIRST" gate directly on a fresh release build
+(`cvmove.exe`, worktree `CratonVM-movingyoung`, branch
+`feat/default-moving-young-gen`). Benchmark = the canonical object-based
+`binarytrees` (checksum 68332206 = HotSpot). `-Xmx8g`. Box load comparable to
+the 2026-06-10 gap doc (HotSpot bt18 651 ms vs its 497 ms).
+
+| Variant (bt18) | checksum | time | sweeps |
+|---|---|---|---|
+| HotSpot JDK 25 | 68332206 | **651 ms** | — |
+| CratonVM default (non-moving sweep under JIT) | 68332206 ✓ | 48 059 ms | 2 |
+| CratonVM `CRATONVM_NO_GC` (GC disabled entirely) | 68332206 ✓ | **50 087 ms** | 0 |
+| CratonVM `CRATONVM_DBG_FORCE_MOVING` | **67674804** ✗ | 47 975 ms | 0 |
+| CratonVM force-moving **+ `CRATONVM_SHADOW_STACK`** | **67674804** ✗ | 46 502 ms | 0 |
+
+Two conclusions, both against the design premise:
+
+1. **GC is ~0 % of the gap.** Turning GC *completely off* does **not** speed bt18
+   up (50.1 s vs 48.1 s — it is marginally *slower*, the heap balloons). Only
+   **2** sweeps run in the entire bt18 run. Across all five GC configurations the
+   time is 46–50 s — the GC choice does not move the needle at all. A moving
+   young gen would replace 2 cheap non-moving sweeps with 2 semispace copies,
+   saving at most a few percent of a 48 s run. The 48 s gap vs HotSpot's 0.65 s
+   is **per-node mutator cost**, not GC (confirms
+   `docs/internal/gaps/gap-bintrees18-gc-throughput.md`).
+
+2. **The Route-A prerequisite is not met — moving silently corrupts the
+   checksum.** `FORCE_MOVING + SHADOW_STACK` still yields **67674804** (the
+   under-count trap), not 68332206 — shadow coverage is incomplete (it does not
+   even reach the historical partial 68199090). Flipping to moving today would be
+   a silent correctness regression.
+
+**Verdict: do NOT implement the default moving young gen.** It cannot close the
+bt18 gap (its own acceptance benchmark shows no GC headroom) and is unsafe until
+shadow coverage is finished. The real levers are the per-node mutator costs in
+the gap doc (§"next levers": inline `putfield` reference store, per-alloc TLS
+fetch, 72-byte tagged `Value` field cells). Separately flagged: bt16/bt18 are
+~3–6× slower than the 2026-06-10 perf-branch numbers (bt16 1.6 s → 9.9 s;
+HotSpot only ~2× of that is box speed) — a probable throughput **regression**
+worth its own investigation, far higher value than this feature.

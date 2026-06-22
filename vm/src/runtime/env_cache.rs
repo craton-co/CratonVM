@@ -323,6 +323,12 @@ cached_is_set!(letsgo_dbg, "CRATONVM_DBG_LETSGO");
 cached_is_set!(jit_pfo_trace, "CRATON_JIT_PFO_TRACE");
 cached_is_set!(jit_pfi_trace, "CRATON_JIT_PFI_TRACE");
 cached_is_set!(jit_newarray_trace, "CRATON_JIT_NEWARRAY_TRACE");
+/// `CRATONVM_NO_CTOR_DIRECT_CALL` — opt out of eager-compiling a trivial
+/// constructor at an `invokespecial …<init>` site into a direct CALL. When
+/// set, such sites fall back to the per-allocation `jit_invoke_dispatch` slow
+/// path (the pre-fix behaviour). Read only at JIT compile time, so caching is
+/// for tidiness rather than hot-path cost.
+cached_is_set!(ctor_direct_call_disabled, "CRATONVM_NO_CTOR_DIRECT_CALL");
 
 // ── Frame-trace and interpreter hot-path flags ──────────────────────────
 
