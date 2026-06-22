@@ -838,6 +838,21 @@ VM's real file layer).
 > `<clinit>` (ArC/RESTEasy-metadata/Hibernate-metadata) → RUNTIME_INIT (logging ✅ → Netty event loops ✅
 > → Hibernate SessionFactory build ❌ Caffeine). Required gates: `CRATONVM_REAL_AGROAL` +
 > `CRATONVM_REAL_VERTX` + `CRATONVM_REAL_NET_SOCKETS` + `CRATONVM_REAL_QUARKUS_START` (all opt-in).
+>
+> **UPDATE (2026-06-22) — Caffeine cleared; CURRENT BLOCKER is a gen-GC bug.** The Caffeine
+> `LocalCacheFactory` failure was the **VarHandle static-field init** bug, FIXED + merged to `dev`
+> (`b223fd21`; `vh_static_slot` now triggers the holder `<clinit>` — see
+> [`reference_varhandle_static_init_on_access`] in memory). That unblocked the **entire** Hibernate
+> SessionFactory build: the boot now reaches Agroal+H2, Infinispan region factory, Narayana JTA recovery,
+> Vert.x router init, and the 64-entity metamodel, ending at `No schema management actions found`.
+> It then **HANGS** there: main parks in `JPAConfig.startAll → CompletableFuture.get → Signaller.block →
+> LockSupport.park` and is never unparked — a **gen-GC promotion bug that loses the CompletableFuture
+> completion** (the future is promoted to old gen while the pushed young `Signaller` is lost by the
+> copying young GC). Full root-cause, 3 s repro, and workarounds (`-XX:+UseG1GC` /
+> `CRATONVM_NO_GC_PROMOTION=1`) in
+> **[gc-gen-promotion-completablefuture-completion-loss.md](gc-gen-promotion-completablefuture-completion-loss.md)**.
+> NOTE: with G1 (immune to that GC bug) the boot reaches the same point but hits a SEPARATE hang — two
+> persistence-unit worker threads stuck executing bytecode (a worker livelock, distinct from the GC bug).
 
 ### Quarkus ArC (`CRATONVM_REAL_ARC`) — REACHED and running
 Real ArC bytecode RUNS during the boot — `Arc.initialize` → container →

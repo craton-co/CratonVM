@@ -89,6 +89,15 @@ the ~30 docs map to **one root-cause family + ~15 distinct standalone bugs**, of
     GC-STW-vs-reactor-shutdown race exposed by snapshot timing), **NOT** a socket/OP_WRITE bug and **NOT** an
     rs_cache correctness bug. Reliably avoided by `CRATONVM_ROOTSNAP_CACHE=0` (suite-level — do NOT flip the
     global default). Supersedes the former `reactor-worker-thread-leak-at-shutdown.md` (removed — see git history).
+17. **[GC: gen-GC loses a CompletableFuture completion under promotion + churn](gc-gen-promotion-completablefuture-completion-loss.md)** —
+    🔴 **OPEN** (workarounds: `-XX:+UseG1GC` / `CRATONVM_NO_GC_PROMOTION=1`). Blocks the Keycloak/Quarkus boot
+    at the Hibernate SessionFactory build: a thread parked in `CompletableFuture.get()` (`JPAConfig.startAll`
+    → `Signaller.block` → `LockSupport.park`) is never unparked because the **gen (copying) GC loses the young
+    `Signaller`** when the future is **promoted to old gen** while the Signaller stays young. `NO_GC_PROMOTION`
+    reliably fixes; G1 immune; 3 s repro `CFProbe2` (embedded in the doc). The loss is **same-GC** (mark/evacuate
+    race vs the completing worker), NOT a missed next-GC card (conservative card-marking was insufficient).
+    **Heisenbug**: `SP_VERIFY`/`DBG_SWEEP_EDGES` mask it; needs non-perturbing observation. Path =
+    `gen_heap.rs::sweep_young_non_moving`. Same moving-GC family as #15.
 
 FIXED bugs whose standalone docs were **removed** from this folder (resolved; full writeups in
 `git` history or [`docs/internal/fixed-suite-bugs/`](../internal/fixed-suite-bugs/)): A1 (reflection
