@@ -2383,11 +2383,22 @@ impl GenerationalHeap {
                 && (self.old_gen_used() as u128) * 10 >= (old_cap as u128) * 9
                 && (self.young_from_used() as u128) * 10 >= (young_cap as u128) * 9
         };
-        if (crate::gc_quiescence::is_active() || promotion_oom_risk) && !force_moving {
+        // A5 fix: `unregistered_jit_frame_on_stack()` — the VM root scan found a
+        // guard-less JIT frame on the mutator's native stack (e.g. the compiled
+        // entry-point `main` while a clinit/interpreted callee runs). Its live
+        // objects were conservatively MARKED by the full-stack scan but cannot be
+        // relocated (raw register/spill slots can't be rewritten), so run the
+        // NON-MOVING sweep exactly as for a registered JIT frame (`is_active()`).
+        if (crate::gc_quiescence::is_active()
+            || crate::gc_quiescence::unregistered_jit_frame_on_stack()
+            || promotion_oom_risk)
+            && !force_moving
+        {
             tracing::debug!(
                 "running non-moving young-gen mark-sweep (jit_active={}, \
-                 promotion_oom_risk={}) — compaction deferred.",
+                 unregistered_jit_frame={}, promotion_oom_risk={}) — compaction deferred.",
                 crate::gc_quiescence::is_active(),
+                crate::gc_quiescence::unregistered_jit_frame_on_stack(),
                 promotion_oom_risk,
             );
             let result = self.sweep_young_non_moving(roots, finalizer_addrs);

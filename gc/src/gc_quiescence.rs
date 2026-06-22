@@ -95,6 +95,49 @@ pub fn depth() -> usize {
 }
 
 // ---------------------------------------------------------------------------
+// Unregistered JIT frame detection (A5 fix)
+// ---------------------------------------------------------------------------
+//
+// `JIT_ACTIVE_DEPTH` / `is_active()` only counts JIT entries that pushed a
+// `JitEntryGuard` (the interpreter→JIT invoke paths). The process entry point
+// (`Vm::invoke` → app `main`) and any other JIT method whose native frame is on
+// the stack WITHOUT a guard is invisible to it. With `is_active()` false the
+// generational collector picks the MOVING young collector, which relocates the
+// unregistered frame's live objects and cannot rewrite their raw stack slots →
+// stale all-zero-header receiver (the bintrees `main`-compiled corruption).
+//
+// The VM root scan (`conservative_roots::scan_active_jit_frames`) detects such a
+// frame by finding a JIT code address among the native stack words and sets
+// this per-thread flag; the collector ORs it into the non-moving-sweep decision
+// (and the scan additionally does a conservative full-stack pass so the frame's
+// oops are MARKED). Per-thread because the STW collection runs on the detecting
+// (mutator) thread; cleared at the start of every root-gathering pass.
+
+thread_local! {
+    static UNREGISTERED_JIT_FRAME: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Record that this thread has an unregistered JIT frame on its native stack
+/// (a JIT method live without a `JitEntryGuard`). Set by the VM root scan.
+pub fn set_unregistered_jit_frame_on_stack() {
+    UNREGISTERED_JIT_FRAME.with(|c| c.set(true));
+}
+
+/// Clear the unregistered-JIT-frame flag (start of each root-gathering pass).
+pub fn clear_unregistered_jit_frame_on_stack() {
+    UNREGISTERED_JIT_FRAME.with(|c| c.set(false));
+}
+
+/// True iff the VM root scan found an unregistered JIT frame on this thread's
+/// stack this cycle. The generational collector treats this like
+/// `is_active()` — run the non-moving sweep so the frame's conservatively-marked
+/// oops are not relocated out from under its raw stack slots.
+#[inline]
+pub fn unregistered_jit_frame_on_stack() -> bool {
+    UNREGISTERED_JIT_FRAME.with(|c| c.get())
+}
+
+// ---------------------------------------------------------------------------
 // Stage B (precise oop maps, B-K fix) — movable precise-JIT roots
 // ---------------------------------------------------------------------------
 //
