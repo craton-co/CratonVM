@@ -10,7 +10,7 @@ use std::collections::HashMap;
 
 use super::ir::{Graph, IrType, MemKind, NodeId, Op, SafepointSnapshot, NO_NODE};
 use super::ir_schedule::Schedule;
-use super::{CompiledMethod, ExecutableBuffer, JitRuntimeHelpers};
+use super::{CompiledMethod, ExecutableBuffer, JitInvokeInfo, JitRuntimeHelpers};
 use crate::deopt::{
     ir_deopt_entry, DeoptAction, DeoptReason, DeoptimizationPoint, FrameState, FrameValue,
 };
@@ -120,6 +120,10 @@ struct Lowerer<'a> {
     /// Native offsets of `JE rel32` instructions emitted after each dispatch
     /// call (the exception sentinel check) that jump to the shared bail stub.
     call_exc_patches: Vec<usize>,
+    /// fib44-fix follow-up: native offsets of the rel32 operand of each direct
+    /// self-recursive `CALL` (invoke_kind 4), patched at finalize to target the
+    /// method's own entry (code offset 0). See `lower_self_call` / Op::Call.
+    self_call_patches: Vec<usize>,
 }
 
 impl<'a> Lowerer<'a> {
@@ -199,6 +203,7 @@ impl<'a> Lowerer<'a> {
             args_stage_top_off,
             spill_cap_off,
             call_exc_patches: Vec::new(),
+            self_call_patches: Vec::new(),
         }
     }
 
@@ -705,6 +710,80 @@ impl<'a> Lowerer<'a> {
                 self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
                 self.branch_patches.push((patch_pos, succ_block));
             }
+        }
+    }
+
+    /// fib44-fix follow-up: emit a self-recursive call as a DIRECT `CALL` to this
+    /// method's own entry (code offset 0), instead of the generic
+    /// `jit_invoke_dispatch` helper. Only reached for an `Op::Call` whose
+    /// `JitInvokeInfo.invoke_kind == 4` (the eligibility loop sets that only when
+    /// `CRATONVM_JIT_IR_SELFREC_DIRECT` is on for a self-recursive wide-return
+    /// call). `inputs` is the call node's `inputs` (`[ctrl, mem, args…]`), `slot`
+    /// its result slot, `num_args` its Java arg count.
+    ///
+    /// SAFETY of a direct call vs. the C-ABI dispatch helper: the IR method is
+    /// itself `extern "C"` (called from Rust via `try_call_with_context`), so it
+    /// preserves the platform callee-saved registers — a self-call is just a call
+    /// to that same ABI-compliant function.
+    fn emit_self_recursive_call(&mut self, inputs: &[NodeId], slot: i32, num_args: usize) {
+        // Marshal args into this method's OWN entry ABI — IDENTICAL to the
+        // register list `emit_prologue` reads incoming args from: abi[0] = the
+        // hidden VM context pointer, abi[1 + i] = Java arg i. Each source is a
+        // frame slot (memory), so loading straight into the abi registers cannot
+        // inter-clobber. `1 + num_args <= abi.len()` is guaranteed by the
+        // needs_context bail in `lower()`, so no arg spills off the register file.
+        #[cfg(target_os = "windows")]
+        let abi: &[u8] = &[1, 2, 8, 9]; // RCX, RDX, R8, R9
+        #[cfg(not(target_os = "windows"))]
+        let abi: &[u8] = &[7, 6, 2, 1, 8, 9]; // RDI, RSI, RDX, RCX, R8, R9
+        self.load_reg_from_frame(abi[0], self.context_slot_off); // vm_ptr
+        for i in 0..num_args {
+            let arg = inputs[2 + i];
+            self.load_reg_from_frame(abi[1 + i], self.slot_of(arg)); // Java arg i
+        }
+        // Direct CALL rel32 to entry (code offset 0), patched at finalize.
+        self.buf.emit(&[0xE8]);
+        let patch = self.buf.pos();
+        self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
+        self.self_call_patches.push(patch);
+        // Exception/deopt sentinel — identical to the dispatch path's wide-return
+        // branch. A self-recursive direct callee is always J/D/F here, so a legit
+        // result whose bits == `i64::MIN` (e.g. Long.MIN_VALUE) must be KEPT, not
+        // misread as the deopt sentinel: on `RAX == i64::MIN` peek the out-of-band
+        // signal via `dispatch_threw` and bail only when one is pending.
+        self.emit_mov_reg_imm64(R10, i64::MIN as u64);
+        self.buf.emit(&[0x4C, 0x39, 0xD0]); // CMP RAX, R10
+        self.buf.emit(&[0x0F, 0x85]); // JNE .keep
+        let keep_patch = self.buf.pos();
+        self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
+        self.emit_mov_reg_imm64(RAX, self.dispatch_threw as u64);
+        self.buf.emit(&[0xFF, 0xD0]); // CALL RAX
+        self.buf.emit(&[0x48, 0x85, 0xC0]); // TEST RAX, RAX
+        self.emit_mov_reg_imm64(RAX, i64::MIN as u64); // restore (MOV preserves ZF)
+        self.buf.emit(&[0x0F, 0x85]); // JNE bail_stub
+        let exc_patch = self.buf.pos();
+        self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
+        self.call_exc_patches.push(exc_patch);
+        // .keep:
+        let keep_off = self.buf.pos();
+        let rel = keep_off as i32 - (keep_patch as i32 + 4);
+        self.buf
+            .try_patch_i32(keep_patch, rel)
+            .expect("ir_lower self-call sentinel keep patch in-bounds");
+        // Spill the return value.
+        self.store_rax(slot);
+    }
+
+    /// fib44-fix follow-up: patch every direct self-recursive `CALL` (invoke_kind
+    /// 4) so its rel32 targets this method's own entry — code offset 0.
+    fn patch_self_calls(&mut self) {
+        let patches = std::mem::take(&mut self.self_call_patches);
+        for p in patches {
+            // rel32 = target - (rel32_field_offset + 4); target = entry = 0.
+            let rel = 0i32 - (p as i32 + 4);
+            self.buf
+                .try_patch_i32(p, rel)
+                .expect("ir_lower self-call rel32 patch in-bounds");
         }
     }
 
@@ -1268,6 +1347,17 @@ impl<'a> Lowerer<'a> {
             Op::Call { info_ptr } => {
                 let slot = self.alloc_slot(id);
                 let num_args = node.inputs.len().saturating_sub(2);
+                // fib44-fix follow-up: invoke_kind 4 marks a self-recursive call
+                // the eligibility loop chose to emit as a DIRECT call to this
+                // method's own entry (CRATONVM_JIT_IR_SELFREC_DIRECT), bypassing
+                // the generic `jit_invoke_dispatch` helper. SAFETY: `info_ptr`
+                // points to a live `JitInvokeInfo` owned by `ir_call_infos` for
+                // the whole compile. `lower_data_node` has no post-`match` code,
+                // so an early `return` here fully handles the node.
+                if unsafe { (*(*info_ptr as *const JitInvokeInfo)).invoke_kind } == 4 {
+                    self.emit_self_recursive_call(&node.inputs, slot, num_args);
+                    return;
+                }
                 // 1. Marshal each Java arg into the staging region.
                 for i in 0..num_args {
                     let arg = node.inputs[2 + i];
@@ -1993,6 +2083,8 @@ pub fn lower(
     lowerer.emit_call_exc_stub();
 
     lowerer.patch_branches();
+    // fib44-fix follow-up: patch direct self-recursive calls to the method entry.
+    lowerer.patch_self_calls();
 
     // real-frame-deopt (step 2): resolve recorded safepoint snapshots into
     // native-offset-keyed DeoptimizationPoints before the buffer is consumed.

@@ -3359,6 +3359,28 @@ pub fn execute(
                         Vec::new();
                     let mut direct_calls_early: Vec<(usize, crate::jit::JitDirectCall)> =
                         Vec::new();
+                    // Per-allocation ctor-dispatch elision: a `new C(); dup;
+                    // invokespecial C.<init>()V` whose `C.<init>` is the empty
+                    // default constructor (`is_elidable_construction`) has NO
+                    // observable effect — the inline-TLAB `new` already zeroed
+                    // the fields and the only call is the no-op `Object.<init>`.
+                    // For such a site we emit the call site AS `Object.<init>`
+                    // so the existing codegen elision (the fix-2 `0xb7` arm)
+                    // drops the per-object `jit_invoke_dispatch` entirely. This
+                    // is the dominant mutator cost on allocation-heavy code
+                    // (object `binarytrees`: `TreeNode.<init>` was dispatched
+                    // ~135K times at depth 10). Sound in BOTH paths: even if the
+                    // elision did not fire, dispatching `Object.<init>` on the
+                    // freshly-allocated object is the same no-op as `C.<init>`.
+                    // Opt out with `CRATONVM_NO_CTOR_DIRECT_CALL`.
+                    let ctor_direct_call_off =
+                        crate::runtime::env_cache::ctor_direct_call_disabled();
+                    // Trivial `invokespecial …<init>()V` sites, deferred so their
+                    // target class can be resolved via `load_class_concurrent`
+                    // AFTER `cm_lock` is dropped — `find_class_by_name` does not
+                    // see app-loaded classes in this context (the `new`-site path
+                    // resolves classes the same way for the same reason).
+                    let mut pending_ctor_sites: Vec<(usize, String, usize)> = Vec::new();
                     if !scan.invoke_ops.is_empty() {
                         let cm_lock = shared.class_manager.read();
                         let class = cm_lock.get_class(class_id)?;
@@ -3423,6 +3445,17 @@ pub fn execute(
                                 ));
                                 continue;
                             }
+                            // Defer trivial `<init>()V` sites for after-lock
+                            // elidability resolution (see the block + pending
+                            // list comments above).
+                            if invoke_kind == 1
+                                && method_name_ref == "<init>"
+                                && descriptor_ref == "()V"
+                                && !ctor_direct_call_off
+                            {
+                                pending_ctor_sites.push((pc, target_class.to_string(), param_count));
+                                continue;
+                            }
                             let num_jit_args = if invoke_kind == 3 {
                                 param_count
                             } else {
@@ -3452,6 +3485,58 @@ pub fn execute(
                             owned_jit_invoke_infos.push(info);
                             invoke_info.push((pc, info_ptr));
                         }
+                    }
+                    // Resolve the deferred trivial-ctor sites now that `cm_lock`
+                    // is released. For each `invokespecial C.<init>()V`, resolve
+                    // `C` (already loaded — `load_class_concurrent` returns the
+                    // cached id without side effects) and check
+                    // `is_elidable_construction`. If elidable, emit the site AS
+                    // `java/lang/Object.<init>` so the codegen's fix-2 elision
+                    // drops the per-object dispatch; otherwise emit the real
+                    // dispatch `JitInvokeInfo`. (Soundness: an elidable `C.<init>`
+                    // writes no field and only calls the no-op `Object.<init>`,
+                    // so eliding it — or dispatching `Object.<init>` on the
+                    // freshly zeroed object if the elision somehow did not fire —
+                    // is identical to running `C.<init>`.)
+                    let dbg_ctor = std::env::var_os("CRATONVM_DBG_CTOR_FIX").is_some();
+                    for (pc, tclass, pcount) in pending_ctor_sites {
+                        let elidable = shared
+                            .load_class_concurrent(&tclass)
+                            .ok()
+                            .map(|tid| {
+                                let cm2 = shared.class_manager.read();
+                                is_elidable_construction(&cm2, tid)
+                            })
+                            .unwrap_or(false);
+                        if dbg_ctor {
+                            eprintln!(
+                                "[ctor-fix] {}.{}{} ctor site pc={} target={} elidable={}",
+                                &*class_name_str, method_name, method_descriptor, pc, tclass, elidable,
+                            );
+                        }
+                        let info_class: &str = if elidable { "java/lang/Object" } else { &tclass };
+                        let class_box: Box<str> = info_class.to_string().into_boxed_str();
+                        let method_box: Box<str> = "<init>".to_string().into_boxed_str();
+                        let desc_box: Box<str> = "()V".to_string().into_boxed_str();
+                        let class_ref = &*class_box as *const str; // Cast: string slice to raw pointer for JIT lifetime
+                        let method_ref = &*method_box as *const str; // Cast: string slice to raw pointer for JIT lifetime
+                        let desc_ref = &*desc_box as *const str; // Cast: string slice to raw pointer for JIT lifetime
+                        owned_jit_strings.push(class_box);
+                        owned_jit_strings.push(method_box);
+                        owned_jit_strings.push(desc_box);
+                        // SAFETY: refs point into the boxed strs just pushed to owned_jit_strings,
+                        // which outlives the JitInvokeInfo (same lifetime contract as the loop above).
+                        let info = Box::new(crate::jit::JitInvokeInfo {
+                            class_name: unsafe { &*class_ref },
+                            method_name: unsafe { &*method_ref },
+                            descriptor: unsafe { &*desc_ref },
+                            num_jit_args: pcount + 1, // receiver + params
+                            return_type: b'V',
+                            invoke_kind: 1,
+                        });
+                        let info_ptr: *const _ = &*info;
+                        owned_jit_invoke_infos.push(info);
+                        invoke_info.push((pc, info_ptr));
                     }
                     // Resolve new/anewarray info (Phase 39: correct ClassId + field count for JIT new)
                     // Only resolve for non-synthetic classes (real JDK bytecode) to avoid
@@ -18257,6 +18342,13 @@ fn try_osr(
             // Pending invokestatic callee compilations: (pc, class, method, desc, param_count)
             let mut pending_callee_compiles: Vec<(usize, String, String, String, usize)> =
                 Vec::new();
+            // Trivial-ctor elision (OSR tier) — same deferred mechanism as the
+            // `execute` first-call path: record `invokespecial …<init>()V` sites
+            // here, resolve their target via `load_class_concurrent` after the
+            // lock drops, and emit elidable ones as `Object.<init>` so codegen
+            // drops the per-object dispatch. See `execute` for the rationale.
+            let ctor_direct_call_off = crate::runtime::env_cache::ctor_direct_call_disabled();
+            let mut pending_ctor_sites: Vec<(usize, String, usize)> = Vec::new();
             if !scan.invoke_ops.is_empty() {
                 let cm_lock = shared.class_manager.read();
                 let class = cm_lock.get_class(class_id)?;
@@ -18313,6 +18405,12 @@ fn try_osr(
                             desc.to_string(),
                             param_count,
                         ));
+                        continue;
+                    }
+
+                    // Trivial constructor: defer for after-lock elidability resolution.
+                    if invoke_kind == 1 && mn == "<init>" && desc == "()V" && !ctor_direct_call_off {
+                        pending_ctor_sites.push((pc, target_class.to_string(), param_count));
                         continue;
                     }
 
@@ -18391,6 +18489,44 @@ fn try_osr(
                     owned_jit_invoke_infos2.push(info);
                     invoke_info.push((ipc, info_ptr));
                 }
+            }
+
+            // Resolve the deferred trivial-ctor sites (cm_lock released). Emit an
+            // elidable `C.<init>()V` AS `java/lang/Object.<init>` so the codegen
+            // elision drops the per-object dispatch; else the real dispatch info.
+            // (See the `execute` path for the soundness argument.)
+            for (pc, tclass, pcount) in pending_ctor_sites {
+                let elidable = shared
+                    .load_class_concurrent(&tclass)
+                    .ok()
+                    .map(|tid| {
+                        let cm2 = shared.class_manager.read();
+                        is_elidable_construction(&cm2, tid)
+                    })
+                    .unwrap_or(false);
+                let info_class: &str = if elidable { "java/lang/Object" } else { &tclass };
+                let class_box: Box<str> = info_class.to_string().into_boxed_str();
+                let method_box: Box<str> = "<init>".to_string().into_boxed_str();
+                let desc_box: Box<str> = "()V".to_string().into_boxed_str();
+                let class_ref = &*class_box as *const str; // Cast: string slice to raw pointer for JIT lifetime
+                let method_ref = &*method_box as *const str; // Cast: string slice to raw pointer for JIT lifetime
+                let desc_ref = &*desc_box as *const str; // Cast: string slice to raw pointer for JIT lifetime
+                owned_jit_strings2.push(class_box);
+                owned_jit_strings2.push(method_box);
+                owned_jit_strings2.push(desc_box);
+                // SAFETY: refs point into the boxed strs just pushed to owned_jit_strings2,
+                // which outlives the JitInvokeInfo (same contract as the loop above).
+                let info = Box::new(crate::jit::JitInvokeInfo {
+                    class_name: unsafe { &*class_ref },
+                    method_name: unsafe { &*method_ref },
+                    descriptor: unsafe { &*desc_ref },
+                    num_jit_args: pcount + 1, // receiver + params
+                    return_type: b'V',
+                    invoke_kind: 1,
+                });
+                let info_ptr: *const _ = &*info;
+                owned_jit_invoke_infos2.push(info);
+                invoke_info.push((pc, info_ptr));
             }
 
             // Resolve ldc/ldc_w constants

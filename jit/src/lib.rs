@@ -997,6 +997,12 @@ pub struct CompiledMethod {
     /// Whether the compiled code uses invoke dispatch (needs set_jit_thread + catch_unwind).
     /// Methods with only direct calls can skip this overhead.
     pub has_dispatch: bool,
+    /// Which backend produced this code: `true` for the optimizing IR pipeline,
+    /// `false` for the single-pass `x64::compile` backend (incl. any method that
+    /// began on the IR path but BAILED to single-pass). Introspection only — used
+    /// by tests to assert backend routing (e.g. that a self-recursive long/FP
+    /// method stays on single-pass, the fib44-regression guard). Not read by codegen.
+    pub used_ir_backend: bool,
     /// Methods that were inlined into this compiled method.
     /// Each entry is (class_name, method_name, descriptor).
     /// Used by invalidation: if the inlined method's class changes, this code must be evicted.
@@ -1197,6 +1203,7 @@ impl CompiledMethod {
             shadow_savetop_slot_off: 0,
             shadow_off_in_thread: 0,
             has_dispatch: false,
+            used_ir_backend: false,
             inlined_methods: Vec::new(),
             deopt_points: Vec::new(),
             _deopt_point_boxes: Vec::new(),
@@ -1248,6 +1255,7 @@ impl CompiledMethod {
             shadow_savetop_slot_off: 0,
             shadow_off_in_thread: 0,
             has_dispatch: false,
+            used_ir_backend: false,
             inlined_methods: Vec::new(),
             deopt_points: Vec::new(),
             _deopt_point_boxes: Vec::new(),
@@ -2196,6 +2204,12 @@ pub struct JitInvokeInfo {
     pub descriptor: &'static str,
     pub num_jit_args: usize,
     pub return_type: u8,
+    /// Dispatch encoding read by `jit_invoke_dispatch`: 0 = virtual, 1 = special,
+    /// 2 = interface, 3 = static. Value `4` = self-recursive static DIRECT call:
+    /// an IR-only marker (set by the eligibility loop when
+    /// `CRATONVM_JIT_IR_SELFREC_DIRECT` is on) that makes `ir_lower` emit a direct
+    /// `CALL` to the method's own entry; such a call NEVER reaches the dispatch
+    /// helper, so the helper need not handle 4.
     pub invoke_kind: u8,
 }
 
@@ -4727,6 +4741,13 @@ fn try_compile_inner(
                 if call_eligible {
                     let mut info_map = std::collections::HashMap::new();
                     let mut all_emittable = true;
+                    // Follow-up to the fib44 fix: when
+                    // `CRATONVM_JIT_IR_SELFREC_DIRECT` is on, a self-recursive
+                    // wide-return call stays on the IR path but is emitted as a
+                    // DIRECT self-call (invoke_kind 4) instead of bailing to
+                    // single-pass — see the gate below and `ir_lower`'s Op::Call.
+                    // Default-off (experimental): default behaviour is the bail.
+                    let selfrec_direct = selfrec_direct_enabled();
                     for &(pc, cp_idx, opcode) in &scan.invoke_ops {
                         // Admit `invokestatic` (under `ir_emit_calls`), resolved
                         // non-`<init>` `invokespecial` (inc 24, under
@@ -4770,6 +4791,31 @@ fn try_compile_inner(
                                 break;
                             }
                         };
+                        // fib44 perf-regression fix. `static_call_shape` admitting a
+                        // wide (`J`/`D`/`F`) RETURN (inc-29/32/33) let a SELF-RECURSIVE
+                        // long/FP method lower its recursive call to an IR `Op::Call`,
+                        // which is routed through the generic `jit_invoke_dispatch`
+                        // runtime helper on EVERY invocation. Single-pass instead emits
+                        // a DIRECT call to this method's own compiled entry — far cheaper
+                        // for a hot recursive method (`static long fib(int)`: ~8.6x; the
+                        // dispatch helper does note_jit_boundary + SATB flush + a
+                        // native-stack recursion guard per call). Keep such methods on
+                        // single-pass: when the resolved callee IS this method and the
+                        // return is wide, mark the body non-emittable so it bails. The
+                        // intended unblock — CROSS-method wide-return calls (e.g.
+                        // `Pack.bigEndianToLong`) — is non-self-recursive and unaffected.
+                        let is_self_recursive_wide = matches!(ret, b'J' | b'D' | b'F')
+                            && cn.as_str() == &*cached.class_name
+                            && mn.as_str() == &*cached.method_name
+                            && desc.as_str() == &*cached.method_descriptor;
+                        if is_self_recursive_wide && !selfrec_direct {
+                            // Default: bail the whole method to single-pass (fast
+                            // direct self-call). The `selfrec_direct` opt-in keeps
+                            // it on the IR path with a direct self-call instead
+                            // (invoke_kind 4 below).
+                            all_emittable = false;
+                            break;
+                        }
                         // Every kind except `invokestatic` marshals the receiver
                         // as arg0 (a reference → one GPR slot), so it carries one
                         // more JIT arg than its descriptor lists. `invoke_kind`
@@ -4781,7 +4827,15 @@ fn try_compile_inner(
                         // static call-site signature it resolves against).
                         let has_receiver = !is_static;
                         let num_args = desc_args + if has_receiver { 1 } else { 0 };
-                        let invoke_kind: u8 = if is_special {
+                        let invoke_kind: u8 = if is_self_recursive_wide {
+                            // 4 = self-recursive static DIRECT call (only reachable
+                            // when `selfrec_direct` is on — else the gate above
+                            // already broke out). `ir_lower` emits a direct `CALL`
+                            // to this method's own entry instead of routing through
+                            // `jit_invoke_dispatch`. Never seen by the dispatch
+                            // helper (the direct path never calls it).
+                            4
+                        } else if is_special {
                             1
                         } else if is_virtual {
                             0
@@ -4943,6 +4997,11 @@ fn try_compile_inner(
                             compiled._jit_strings = ir_call_strings;
                             compiled.has_dispatch = true;
                         }
+                        // Backend-routing introspection (tests only): this body was
+                        // produced by the optimizing IR pipeline. A method that
+                        // bailed out of IR to single-pass never reaches here, so it
+                        // keeps the constructor default `false`.
+                        compiled.used_ir_backend = true;
                         // wire-tiered-manager Step 3 telemetry (test-only):
                         // records that the optimizing IR path — not the
                         // single-pass C1 backend — produced this body, so the
@@ -5318,6 +5377,25 @@ fn try_compile_inner(
             if is_self_call {
                 continue;
             }
+
+            // Trivial-constructor elision (callee/IR tier, via try_compile): an
+            // elidable `invokespecial C.<init>()V` is emitted AS
+            // `java/lang/Object.<init>` so the single-pass `0xb7` codegen elision
+            // drops the per-object `jit_invoke_dispatch` — the same effect the
+            // VM-side execute/OSR resolution gets, here for callees compiled
+            // through this path. `cp_elidable_init_resolver` is the body-checking
+            // predicate (`resolve_jit_elidable_init` → `is_elidable_construction`);
+            // it resolves bootstrap/JDK targets via `find_class_by_name`, so
+            // app-loaded targets are not yet covered on this path (follow-up).
+            let class_name = if invoke_kind == 1
+                && method_name == "<init>"
+                && descriptor == "()V"
+                && cp_elidable_init_resolver.map_or(false, |r| r(cp_idx))
+            {
+                "java/lang/Object".to_string()
+            } else {
+                class_name
+            };
 
             let class_box: Box<str> = class_name.into_boxed_str();
             let method_box: Box<str> = method_name.into_boxed_str();
@@ -5998,6 +6076,36 @@ fn fp_in_descriptor(descriptor: &str) -> bool {
 /// the int/long IR-path clauses to stay FP-free.
 fn method_uses_fp(code: &[u8], code_len: usize, descriptor: &str) -> bool {
     fp_in_descriptor(descriptor) || fp_in_body(code, code_len)
+}
+
+thread_local! {
+    /// Per-thread override for [`selfrec_direct_enabled`], for tests that must
+    /// exercise the self-recursive direct-call path without mutating a
+    /// process-global env var (which would race parallel test threads). `None`
+    /// ⇒ fall back to the env var. Production never sets this.
+    static SELFREC_DIRECT_TEST_OVERRIDE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Test hook: force the self-recursive direct-call path on (`Some(true)`) / off
+/// (`Some(false)`) for the CURRENT thread, or restore env behaviour (`None`).
+/// Thread-local so parallel tests don't race. Not part of the stable API.
+#[doc(hidden)]
+pub fn __set_selfrec_direct_override(v: Option<bool>) {
+    SELFREC_DIRECT_TEST_OVERRIDE.with(|c| c.set(v));
+}
+
+/// fib44-fix follow-up: is the self-recursive wide-return DIRECT-call path on?
+/// When on, a self-recursive `J`/`D`/`F` call stays on the IR path emitted as a
+/// direct `CALL` to the method's own entry (invoke_kind 4 in the eligibility
+/// loop, lowered in `ir_lower`) instead of bailing to single-pass. Default-OFF
+/// (experimental): the env var `CRATONVM_JIT_IR_SELFREC_DIRECT` opts in; a
+/// thread-local override takes precedence for tests.
+fn selfrec_direct_enabled() -> bool {
+    if let Some(v) = SELFREC_DIRECT_TEST_OVERRIDE.with(|c| c.get()) {
+        return v;
+    }
+    std::env::var_os("CRATONVM_JIT_IR_SELFREC_DIRECT").is_some()
 }
 
 /// Gap B (inc 22): classify a static-call descriptor for the `Op::Call` slice.

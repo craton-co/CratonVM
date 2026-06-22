@@ -2,6 +2,16 @@
 
 See [`../../gc-stress-bintrees-object-main-args-jit-frame-stale-root.md`](../../gc-stress-bintrees-object-main-args-jit-frame-stale-root.md).
 
+> **UPDATE (2026-06-22):** on current dev (`457c95a8`) all five repros now print
+> the **correct** checksum `3222190` at `GC_STRESS=4096` (VAAload verified 8/8),
+> but the GC-array-guard still fires once per run — the stale-root corruption is
+> **masked, not closed** (the bad write is caught + dropped, benign at this
+> depth/stress). The CRASH/WRONG results in the table below are from an *older*
+> dev. The `test-infra/regression-pool/gc-root-lane.sh` GC-root acceptance lane
+> records this state (status PASS, `warned>0`); see
+> [`../../../feature-designs/precise-jit-maps-default.md`](../../../feature-designs/precise-jit-maps-default.md)
+> "Step 4 baseline".
+
 All build with JDK 25 `javac`. Run under the release `cratonvm.exe`.
 
 | file | what | `CRATONVM_DBG_GC_STRESS=4096` result |
