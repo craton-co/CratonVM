@@ -86,6 +86,8 @@ fn arrays_helpers() -> JitRuntimeHelpers {
         throw_exception: s,
         jit_npe_with_action: noop_npe_with_action as *const () as usize,
         dispatch_threw: s,
+        jit_frem: s,
+        jit_drem: s,
     }
 }
 

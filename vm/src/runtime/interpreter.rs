@@ -7772,12 +7772,13 @@ fn ir_deopt_resume_enabled() -> bool {
 
 /// Map ONE reconstructed `FrameValue` (already resolved in-stub against the
 /// machine state) to an interpreter `Value`. Handles the type-source kinds the
-/// producer can emit today: a cat-1 `Int`, a cat-2 `Long`, and an
-/// object-reference (`StackSlotRef`, resolved in-stub to a raw heap-pointer
-/// word). Returns `None` for any not-yet-reconstructable variant
-/// (`Float`/`Double`/`Unsupported`/`VirtualObject`/`VirtualObjectRef`, or an
-/// unresolved `Register`/`StackSlot*` which should never reach here), so the
-/// caller falls back to the safe re-run path rather than materialise a mistyped
+/// producer can emit today: a cat-1 `Int`, a cat-2 `Long`, a cat-1 `Float`, a
+/// cat-2 `Double` (Slice C — FP-slot resume), and an object-reference
+/// (`StackSlotRef`, resolved in-stub to a raw heap-pointer word). Returns `None`
+/// for any not-yet-reconstructable variant (`Unsupported`/`VirtualObject`/
+/// `VirtualObjectRef`, or an unresolved `Register`/`StackSlot*` which should
+/// never reach here), so the caller falls back to the safe re-run path rather
+/// than materialise a mistyped
 /// slot.
 ///
 /// `Object(w)` is the `real-frame-deopt` type source for ref-typed slots (e.g.
@@ -7793,6 +7794,12 @@ fn fv_to_value(v: &cratonvm_jit::deopt::FrameValue) -> Option<Value> {
     match v {
         FrameValue::Int(i) => Some(Value::Int(*i as i32)),
         FrameValue::Long(l) => Some(Value::Long(*l)),
+        // FP-slot resume (Slice C): a `float`/`double` live at a deopt guard is
+        // carried as raw bits (`Float` = low-32, `Double` = full-64) and rebuilt
+        // into the typed `Value`. A `Double` is cat-2 (one compact operand-stack
+        // slot, two JVM local slots — see `ir_deopt_locals`).
+        FrameValue::Float(bits) => Some(Value::Float(f32::from_bits(*bits as u32))),
+        FrameValue::Double(bits) => Some(Value::Double(f64::from_bits(*bits))),
         FrameValue::Object(w) => Some(match *w {
             0 => Value::Object(None),
             // SAFETY: `w` is a live, 8-byte-aligned heap pointer read
@@ -7827,7 +7834,10 @@ fn ir_deopt_locals(vals: &[cratonvm_jit::deopt::FrameValue]) -> Option<Vec<Value
     let mut i = 0;
     while i < vals.len() {
         out.push(fv_to_value(&vals[i])?);
-        i += if matches!(vals[i], FrameValue::Long(_)) {
+        // Both `long` and `double` are category-2 (two JVM local slots): the
+        // snapshot reserves the upper-half slot (recorded as `Undefined`), which
+        // `copy_args_to_locals` re-creates from the compact list, so skip it here.
+        i += if matches!(vals[i], FrameValue::Long(_) | FrameValue::Double(_)) {
             2
         } else {
             1
@@ -8042,6 +8052,44 @@ fn verify_reconstructed_frame(
     Ok(())
 }
 
+/// CRATONVM_DEOPT_VERIFY oop-plausibility layer (verifier increment 2). Every
+/// `Object(addr)` slot in the reconstructed frame — locals, operand stack, and
+/// recursively the already-real `Object` fields of scalar-replaced descriptors —
+/// must be null or a real heap address (`heap.is_heap_addr`: alignment + region
+/// containment, NO header deref, so it is safe on an arbitrary garbage word).
+/// This catches the most dangerous map drift the structural layer cannot: a
+/// non-oop value (a small int, a stale/wild pointer) landing in a slot the frame
+/// resumes as an object reference — a use-after-free on first dereference. A
+/// violation forces the safe re-run. Not pure (needs the heap); the env gate is
+/// consulted by the caller.
+fn verify_reconstructed_oops(
+    rframe: &cratonvm_jit::deopt::ReconstructedFrame,
+    shared: &SharedVm,
+) -> Result<(), String> {
+    use cratonvm_jit::deopt::FrameValue;
+    fn check(vals: &[FrameValue], shared: &SharedVm, region: &str) -> Result<(), String> {
+        for (i, v) in vals.iter().enumerate() {
+            match v {
+                FrameValue::Object(addr) if *addr != 0 => {
+                    if shared.heap.is_heap_addr(*addr as usize).is_none() {
+                        return Err(format!(
+                            "{region}[{i}] = Object(0x{addr:x}) is not a valid heap address"
+                        ));
+                    }
+                }
+                // Recurse into a scalar-replaced descriptor's already-real fields
+                // (nested VirtualObject / VirtualObjectRef carry no address yet).
+                FrameValue::VirtualObject(state) => check(&state.field_values, shared, "vfield")?,
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+    check(&rframe.locals, shared, "local")?;
+    check(&rframe.stack, shared, "stack")?;
+    Ok(())
+}
+
 /// real-frame-deopt Step 3 — build the interpreter `Frame` for an Object-bearing
 /// deopt, GC-rooting the reconstructed oops across the pool refill. Returns the
 /// built `Frame` (NOT pushed onto `thread.frames`) with the oops still pinned in
@@ -8079,9 +8127,9 @@ fn build_deopt_frame_inner(
     // re-run. Runs on the ORIGINAL frame (virtuals intact) so the descriptor
     // checks see them. Gate is read-once; default-off ⇒ skipped entirely.
     if cratonvm_jit::deopt_verify_enabled() {
-        if let Err(why) =
-            verify_reconstructed_frame(rframe, cached.max_locals, cached.max_stack)
-        {
+        let verdict = verify_reconstructed_frame(rframe, cached.max_locals, cached.max_stack)
+            .and_then(|()| verify_reconstructed_oops(rframe, shared));
+        if let Err(why) = verdict {
             eprintln!(
                 "[DEOPT-VERIFY] {} bci={}: reconstructed-frame invariant violated: {why} \
                  — forcing safe re-run",
@@ -8781,6 +8829,36 @@ mod deopt_step3_tests {
     fn verify_rejects_dangling_virtual_ref() {
         let rf = rframe(vec![FrameValue::VirtualObjectRef(9)], vec![], 0);
         assert!(verify_reconstructed_frame(&rf, 4, 8).is_err());
+    }
+
+    /// Oop layer: a real heap address (and null) passes; a non-heap word in an
+    /// Object slot — the UAF-causing drift — is rejected.
+    #[test]
+    fn verify_oops_accepts_real_rejects_bogus() {
+        let shared = Arc::new(SharedVm::new(VmConfig::default()));
+        let obj = shared.heap.alloc_object(cratonvm_types::ClassId::new(7), 0);
+        let addr = obj.as_ptr() as usize as u64;
+
+        // Real object + null pass.
+        let good = rframe(
+            vec![FrameValue::Object(addr), FrameValue::Object(0)],
+            vec![],
+            0,
+        );
+        assert!(verify_reconstructed_oops(&good, &shared).is_ok());
+
+        // A small/wild address that is not in the heap is rejected.
+        let bad = rframe(vec![FrameValue::Object(0x1234)], vec![], 0);
+        assert!(verify_reconstructed_oops(&bad, &shared).is_err());
+
+        // A bogus already-real field inside a scalar-replaced descriptor is also
+        // caught (recursion into vfields).
+        let bad_field = rframe(
+            vec![vobj(0, 5, vec![FrameValue::Object(0x1234)])],
+            vec![],
+            0,
+        );
+        assert!(verify_reconstructed_oops(&bad_field, &shared).is_err());
     }
 
     /// A3 GC-stress: a virtual frame built with a forced GC at the refill point —
@@ -19348,9 +19426,12 @@ fn try_jit_upgrade_with_gate(
                 // dispatch via the helper), gated default-OFF (its own soak).
                 // `CRATONVM_JIT_IR_CALL_VIRTUAL=1` opts in.
                 std::env::var_os("CRATONVM_JIT_IR_CALL_VIRTUAL").is_some(),
-                // inc 30: double/float XMM value tier, gated default-OFF (its
-                // own soak). `CRATONVM_JIT_IR_FP=1` opts in.
-                std::env::var_os("CRATONVM_JIT_IR_FP").is_some(),
+                // inc 30 + Slices A/B/C: double/float XMM value tier. Now
+                // default-ON — the tier is opcode-complete (frem/drem, FP arrays,
+                // FP-slot deopt resume all landed) and validated == HotSpot
+                // (bt10/14/16/18 checksums + FP E2E probes). `CRATONVM_JIT_IR_FP=0`
+                // is the opt-out (restores the int/long/ref-only IR path).
+                std::env::var("CRATONVM_JIT_IR_FP").map_or(true, |v| v != "0"),
             )?;
             let entry = compiled.entry_ptr() as usize; // Cast: JIT entry point to address
             let needs_ctx = compiled.needs_context();
@@ -19464,9 +19545,9 @@ fn try_jit_upgrade_with_gate(
         // inc 26: invokevirtual/invokeinterface → Op::Call (dynamic dispatch via
         // the helper), gated default-OFF (its own soak). `=1` opts in.
         std::env::var_os("CRATONVM_JIT_IR_CALL_VIRTUAL").is_some(),
-        // inc 30: double/float XMM value tier, gated default-OFF (its own soak).
-        // `CRATONVM_JIT_IR_FP=1` opts in.
-        std::env::var_os("CRATONVM_JIT_IR_FP").is_some(),
+        // inc 30 + Slices A/B/C: double/float XMM value tier. Now default-ON
+        // (opcode-complete + validated == HotSpot). `CRATONVM_JIT_IR_FP=0` opts out.
+        std::env::var("CRATONVM_JIT_IR_FP").map_or(true, |v| v != "0"),
     )?;
     let ret = crate::jit::return_type(&cached.method_descriptor);
     let heap = compiled.needs_heap();
@@ -20049,9 +20130,9 @@ fn try_jit_compile_callee_slow(
         // inc 26: invokevirtual/invokeinterface → Op::Call (dynamic dispatch via
         // the helper), gated default-OFF (its own soak). `=1` opts in.
         std::env::var_os("CRATONVM_JIT_IR_CALL_VIRTUAL").is_some(),
-        // inc 30: double/float XMM value tier, gated default-OFF (its own soak).
-        // `CRATONVM_JIT_IR_FP=1` opts in.
-        std::env::var_os("CRATONVM_JIT_IR_FP").is_some(),
+        // inc 30 + Slices A/B/C: double/float XMM value tier. Now default-ON
+        // (opcode-complete + validated == HotSpot). `CRATONVM_JIT_IR_FP=0` opts out.
+        std::env::var("CRATONVM_JIT_IR_FP").map_or(true, |v| v != "0"),
     )?;
     if std::env::var_os("CRATONVM_DBG_JITC").is_some() {
         eprintln!(
@@ -23746,9 +23827,17 @@ mod tests {
             ir_deopt_frame_values(&[FrameValue::Unsupported]).is_none(),
             "an Unsupported slot must re-run, not resume"
         );
-        assert!(
-            ir_deopt_frame_values(&[FrameValue::Float(0)]).is_none(),
-            "an FP-in-slot must re-run until XMM resolution lands"
+        // Slice C: FP-in-slot now resolves to the typed Value (not a re-run).
+        // Float carries the 32-bit bits in the low word; Double the full 64.
+        assert_eq!(
+            ir_deopt_frame_values(&[FrameValue::Float(1.5f32.to_bits() as u64)]),
+            Some(vec![Value::Float(1.5)]),
+            "a float slot resolves to Value::Float"
+        );
+        assert_eq!(
+            ir_deopt_frame_values(&[FrameValue::Double(3.25f64.to_bits())]),
+            Some(vec![Value::Double(3.25)]),
+            "a double slot resolves to Value::Double"
         );
     }
 
@@ -23781,6 +23870,21 @@ mod tests {
         );
         // An unmappable slot still forces re-run.
         assert!(ir_deopt_locals(&[FrameValue::Unsupported]).is_none());
+
+        // Slice C: a `double` is cat-2 too — its reserved upper-half slot must be
+        // skipped just like a `long`'s. JVM-slot layout for `(double d, int x)`:
+        // d@0, <upper-half>@1, x@2 → compact `[Double, Int]`.
+        let dlocals = ir_deopt_locals(&[
+            FrameValue::Double(2.5f64.to_bits()),
+            FrameValue::Undefined, // reserved upper half of the double — skipped
+            FrameValue::Int(9),
+        ])
+        .expect("Double/Undefined/Int are all mappable");
+        assert_eq!(
+            dlocals,
+            vec![Value::Double(2.5), Value::Int(9)],
+            "the double's reserved upper-half placeholder must be dropped"
+        );
     }
 
     // -----------------------------------------------------------------------

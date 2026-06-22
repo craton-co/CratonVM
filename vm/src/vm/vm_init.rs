@@ -4431,6 +4431,16 @@ impl Vm {
         // for spawning new threads.
         *shared.self_arc.write() = Some(Arc::downgrade(&shared));
 
+        // Publish the process-global VM cell so a foreign (host-created) thread
+        // that calls `AttachCurrentThread` can resolve the live VM and register
+        // itself for GC-safepoint participation — for EVERY creation path, not
+        // just the libcratonvm Invocation API. Without this, a CLI-launched app
+        // whose native library spawns + attaches its own OS thread would fail
+        // attach (no VM to resolve) once the default-on foreign-attach path runs.
+        // `Weak`, so it never keeps the VM alive; last writer wins (harmless for
+        // the in-process multi-`Vm` test fixtures — one VM per real process).
+        crate::native::jni::set_process_vm(&shared);
+
         // Round 4 audit fix (CRIT) — publish the same weak handle to the
         // module-private slot used by `resolution_invalidate_adapter` so
         // JVMTI `RedefineClasses` can reach back into

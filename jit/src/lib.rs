@@ -3914,6 +3914,14 @@ fn ir_op_to_ea_op(op: &ir::Op) -> escape_analysis::Op {
         },
         ir::Op::Call { .. } => EaOp::Call,
         ir::Op::ArrayLength => EaOp::ArrayLength,
+        // Array element access escapes its array reference (conservative): map to
+        // `EaOp::Call`, whose handling marks every reference input `ArgEscape`.
+        // Today the array is always a Param/external ref (the builder bails on
+        // `newarray`, so a `new[]` never reaches here) and so is never a
+        // scalar-replacement candidate, but routing through `Call` (rather than
+        // the no-op `Other`) keeps a hypothetical future `new[]` from being
+        // wrongly scalar-replaced — the IR lowerer has no scalar-array path.
+        ir::Op::ArrayLoad(_) | ir::Op::ArrayStore(_) => EaOp::Call,
         ir::Op::Dead => EaOp::Dead,
         // All other IR ops (Region, Proj, ConstF, conversions, bitwise,
         // Cmp, Div, Rem, Neg, etc.) have no EA-specific behaviour.
@@ -4604,14 +4612,15 @@ fn try_compile_inner(
             //   - CALL-ARGS (inc 34): `static_call_shape` admits `D`/`F` args
             //     (one GPR slot each); the marshaller stores the slot bits to the
             //     staging region and `decode_dispatch_values` reads them back.
-            // Still excludes int-div (would strand an FP value at the div deopt —
-            // whose resume can't yet reconstruct an FP slot). inc 35 lifted the
-            // `ldc2_w` exclusion: the resolver now reports `is_double`, so the
-            // builder lowers a `double` constant to `dconst` (a `long` ldc2_w
-            // stays `lconst`) — double literals (`1.5`, `3.14`, …) no longer bail.
-            || (ir_emit_fp
-                && fp_in_body(code, code_len)
-                && !method_has_int_div(code, code_len)))
+            // Slice C lifted the int-div exclusion: the IR deopt resume now
+            // reconstructs FP slots (`StackSlotFloat`/`StackSlotDouble` →
+            // `Value::Float`/`Value::Double`, `Double` cat-2 like `Long`), so an
+            // FP value live at an `idiv`/`irem` div-by-zero deopt is restored
+            // precisely rather than stranded. inc 35 lifted the `ldc2_w`
+            // exclusion: the resolver reports `is_double`, so the builder lowers a
+            // `double` constant to `dconst` (a `long` ldc2_w stays `lconst`) —
+            // double literals (`1.5`, `3.14`, …) no longer bail.
+            || (ir_emit_fp && fp_in_body(code, code_len)))
     {
         // Includes the implicit `this` slot for instance methods — see
         // `prologue_param_slots` above.
@@ -5989,22 +5998,6 @@ fn fp_in_descriptor(descriptor: &str) -> bool {
 /// the int/long IR-path clauses to stay FP-free.
 fn method_uses_fp(code: &[u8], code_len: usize, descriptor: &str) -> bool {
     fp_in_descriptor(descriptor) || fp_in_body(code, code_len)
-}
-
-/// inc 25: an int `idiv`/`irem` in the body. Such a method gets a div guard
-/// whose deopt resume cannot yet reconstruct a `long` slot, so admitting a long
-/// method with an int division could strand a live `long` at the deopt — bail
-/// to single-pass until long deopt-resume lands. (Long `ldiv`/`lrem` already
-/// bail: the builder does not lower them.)
-fn method_has_int_div(code: &[u8], code_len: usize) -> bool {
-    let mut pc = 0;
-    while pc < code_len {
-        if matches!(code[pc], 0x6c | 0x70) {
-            return true;
-        }
-        pc += crate::scev::bytecode_len(code, pc, code_len);
-    }
-    false
 }
 
 /// Gap B (inc 22): classify a static-call descriptor for the `Op::Call` slice.

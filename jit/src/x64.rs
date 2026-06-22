@@ -1170,8 +1170,14 @@ pub fn jit_scan(code: &[u8], code_len: usize, descriptor: &str) -> Option<JitSca
             0x60..=0x6f => {
                 pc += 1;
             }
-            // irem, lrem
-            0x70 | 0x71 => {
+            // irem, lrem, frem, drem. (frem/drem 0x72/0x73: only the optimizing
+            // IR backend lowers them — via a CALL to the jit_frem/jit_drem fmod
+            // helper. The single-pass backend has no codegen arm, so it bails
+            // them through the `match op` catch-all (`return false`). Admitting
+            // them at scan time lets the IR pipeline see the method instead of
+            // rejecting it outright here; with the FP gate off the method still
+            // bails to single-pass → interpreter, exactly as before.)
+            0x70..=0x73 => {
                 pc += 1;
             }
             // ineg, lneg, fneg, dneg
@@ -22713,7 +22719,20 @@ pub fn compile_with_param_slots(
     // `deopt_real_enabled()` (the snapshot emit site is gated), so production
     // artifacts are unchanged. Consumed at the interpreter deopt sink, which
     // attempts `resume_real_ir_deopt` only when `compiled.can_deopt_resume`.
-    cm.can_deopt_resume = !cm.deopt_points.is_empty() && compiler.scalar_replaced.is_empty();
+    //
+    // P2.0 (cat-2 soundness): also exclude any method with a wide (long/double)
+    // local. The snapshot has no per-slot WIDTH source yet, so a `long` local is
+    // recorded as `Register`/`StackSlot` and resolves to `Int` — TRUNCATING the
+    // high 32 bits on resume (silent corruption). A `double` already resolves to
+    // `Unsupported` → safe re-run, but a `long` would corrupt. Until P2.1 threads
+    // a width source + a `Long` FrameValue through `frame_value_for_slot` and the
+    // resume mapper, gate such methods to the safe whole-method re-run. (Cat-2
+    // operand-stack values are not a concern at the BCE loop-header guard — the
+    // operand stack is canonically empty there.)
+    let has_wide_local = !wide_local_high_halves(code, code_len).is_empty();
+    cm.can_deopt_resume = !cm.deopt_points.is_empty()
+        && compiler.scalar_replaced.is_empty()
+        && !has_wide_local;
     // deopt-osr Step 7 — transfer the OSR-exit loop-boundary bci set and set the
     // per-method gate. Both are empty/false unless `deopt_real_enabled()` was on
     // (the emit site is gated), so production artifacts are unchanged. Step 8
@@ -23101,6 +23120,8 @@ mod tests {
             throw_exception: sentinel,
             jit_npe_with_action: sentinel,
             dispatch_threw: sentinel,
+            jit_frem: sentinel,
+            jit_drem: sentinel,
         }
     }
 
@@ -33333,3 +33354,4 @@ mod tests {
         );
     }
 }
+

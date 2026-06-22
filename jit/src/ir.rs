@@ -210,6 +210,19 @@ pub enum Op {
     /// Array length.  Inputs: `[ctrl, mem, array_ref]`.
     ArrayLength,
 
+    /// Array ELEMENT load. Inputs: `[ctrl, mem, array, index]`. Unlike
+    /// [`Op::Load`] (a field read at a compile-time offset), the index is a
+    /// runtime value and the lowerer emits the JVMS null + bounds checks
+    /// (deopt-on-fault) before the `[array + HEADER_SIZE + index*elem_size]`
+    /// access. `MemKind` carries the element type (Slice B wires the FP kinds —
+    /// `faload`/`daload`). Impure (may throw NPE/AIOOBE) — DCE-rooted, not GVN'd.
+    ArrayLoad(MemKind),
+
+    /// Array ELEMENT store. Inputs: `[ctrl, mem, array, index, value]`. The
+    /// store analogue of [`Op::ArrayLoad`] (`fastore`/`dastore`); produces a new
+    /// memory token. Impure (NPE/AIOOBE + the write) — DCE-rooted.
+    ArrayStore(MemKind),
+
     // ── Allocation ───────────────────────────────────────────────────
     /// Object allocation.  Inputs: `[ctrl, mem]`.
     New {
@@ -1505,9 +1518,10 @@ impl IrBuilder {
                 // scalar form (`addss`/`addsd`/…). FP `Div` has NO div-zero /
                 // overflow guard (IEEE division by zero is `±inf`/`NaN`, never an
                 // exception), so unlike int `Div` it never deopts. `frem`/`drem`
-                // (0x72/0x73) are intentionally absent — JVM FP remainder is
-                // `fmod`-style, not a single instruction; such a method bails to
-                // single-pass.
+                // (0x72/0x73) — JVM FP remainder is `fmod`-style with no single
+                // SSE instruction, so the lowerer emits a `CALL` to the
+                // `jit_frem`/`jit_drem` runtime helper (Slice A); the builder
+                // just produces `Op::Rem` typed `Float`/`Double`.
                 // fadd / dadd
                 0x62 => {
                     let b = self.pop();
@@ -1565,6 +1579,22 @@ impl IrBuilder {
                     let b = self.pop();
                     let a = self.pop();
                     let r = self.add_data(Op::Div, IrType::Double, vec![a, b], pc);
+                    self.push(r);
+                    pc += 1;
+                }
+                // frem / drem — `fmod`-style remainder lowered via the
+                // jit_frem/jit_drem helper call (no single SSE instruction).
+                0x72 => {
+                    let b = self.pop();
+                    let a = self.pop();
+                    let r = self.add_data(Op::Rem, IrType::Float, vec![a, b], pc);
+                    self.push(r);
+                    pc += 1;
+                }
+                0x73 => {
+                    let b = self.pop();
+                    let a = self.pop();
+                    let r = self.add_data(Op::Rem, IrType::Double, vec![a, b], pc);
                     self.push(r);
                     pc += 1;
                 }
@@ -1649,6 +1679,66 @@ impl IrBuilder {
                     pc += 1;
                 }
 
+                // faload / daload — FP array element load (Slice B). The index
+                // is a runtime value, so the lowerer emits the JVMS null +
+                // bounds checks (deopt-on-fault) before the element access. The
+                // load advances the memory token (a later store to a possibly-
+                // aliasing element must be ordered after this read).
+                0x30 => {
+                    let index = self.pop();
+                    let array = self.pop();
+                    let load = self.graph.add(
+                        Op::ArrayLoad(MemKind::Float),
+                        IrType::Float,
+                        vec![self.ctrl, self.mem, array, index],
+                        Some(pc),
+                    );
+                    self.mem = load;
+                    self.push(load);
+                    pc += 1;
+                }
+                0x31 => {
+                    let index = self.pop();
+                    let array = self.pop();
+                    let load = self.graph.add(
+                        Op::ArrayLoad(MemKind::Double),
+                        IrType::Double,
+                        vec![self.ctrl, self.mem, array, index],
+                        Some(pc),
+                    );
+                    self.mem = load;
+                    self.push(load);
+                    pc += 1;
+                }
+                // fastore / dastore — FP array element store (Slice B). Consumes
+                // the memory token and produces a new one, so the scheduler
+                // serialises it against neighbouring memory ops.
+                0x51 => {
+                    let value = self.pop();
+                    let index = self.pop();
+                    let array = self.pop();
+                    let store = self.graph.add(
+                        Op::ArrayStore(MemKind::Float),
+                        IrType::Memory,
+                        vec![self.ctrl, self.mem, array, index, value],
+                        Some(pc),
+                    );
+                    self.mem = store;
+                    pc += 1;
+                }
+                0x52 => {
+                    let value = self.pop();
+                    let index = self.pop();
+                    let array = self.pop();
+                    let store = self.graph.add(
+                        Op::ArrayStore(MemKind::Double),
+                        IrType::Memory,
+                        vec![self.ctrl, self.mem, array, index, value],
+                        Some(pc),
+                    );
+                    self.mem = store;
+                    pc += 1;
+                }
                 // getfield — read an instance field as an `Op::Load`.
                 //
                 // Slice 1 (read-only) of the field/call IR frontier: only
@@ -2870,3 +2960,5 @@ mod tests {
         assert!(!ir_compatible_sized(&scan, 201));
     }
 }
+
+

@@ -19,7 +19,9 @@
 //! corpus is exactly where the two backends genuinely differ.
 
 use cratonvm_jit::{try_compile, CachedBytecodeMethod, CompiledMethod, JitRuntimeHelpers};
-use cratonvm_types::{ClassId, FIELD_CELL_PAYLOAD32_OFFSET, HEADER_SIZE, SLOT_SIZE};
+use cratonvm_types::{
+    ClassId, ARRAY_LENGTH_OFFSET, FIELD_CELL_PAYLOAD32_OFFSET, HEADER_SIZE, SLOT_SIZE,
+};
 use std::sync::Arc;
 
 /// Dummy runtime helpers — the corpus is pure arithmetic / branches / counted
@@ -78,6 +80,8 @@ fn dummy_helpers() -> JitRuntimeHelpers {
         // branch, which no existing test reaches. The long-return tests below
         // override this per-test with a real returns-0/1 stub.
         dispatch_threw: s,
+        jit_frem: s,
+        jit_drem: s,
     }
 }
 
@@ -2184,6 +2188,350 @@ fn ir_vs_singlepass_fp_negation() {
         1,
         &[(vec![5], -5), (vec![-5], 5), (vec![0], 0)],
     );
+}
+
+// ── FP remainder (frem/drem) — Slice A ──────────────────────────────────────
+//
+// JVMS FP remainder is `fmod`-style (truncated, sign of the dividend) with no
+// single SSE instruction, so the IR `Op::Rem` Float/Double arm lowers to a
+// `CALL` of the `jit_frem`/`jit_drem` runtime helper (operands in XMM0/XMM1,
+// result XMM0). The SINGLE-PASS backend has no `frem`/`drem` arm — it bails such
+// a method to the interpreter — so unlike the other FP ops there is no
+// IR-vs-single-pass comparison; the contract is IR == host IEEE anchor. Rust's
+// `%` on floats is itself `fmod`, the same reference the production helper
+// delegates to, so it catches a miscompile in the call sequence / NaN handling.
+
+/// Real `frem`/`drem` helper stubs for the FP-remainder tests — `extern "C"`
+/// with the float ABI (args in XMM0/XMM1, return XMM0), exactly what the IR
+/// `Op::Rem` site `CALL`s. Mirrors the production `jit_frem`/`jit_drem`.
+unsafe extern "C" fn test_frem(a: f32, b: f32) -> f32 {
+    a % b
+}
+unsafe extern "C" fn test_drem(a: f64, b: f64) -> f64 {
+    a % b
+}
+
+/// [`dummy_helpers`] with the two FP-remainder helpers wired to real stubs (the
+/// rest stay panic stubs — a `frem`/`drem` method calls no other helper).
+fn frem_helpers() -> JitRuntimeHelpers {
+    JitRuntimeHelpers {
+        jit_frem: test_frem as *const () as usize,
+        jit_drem: test_drem as *const () as usize,
+        ..dummy_helpers()
+    }
+}
+
+/// Compile an FP-remainder method through the IR pipeline ONLY and assert
+/// IR == host (Rust float `%`). Single-pass bails `frem`/`drem`, so there is no
+/// IR-vs-single-pass leg; the assert that single-pass returns `None` pins that
+/// assumption (a future single-pass `frem` should switch this to `check_fp`).
+fn check_frem(
+    name: &str,
+    descriptor: &str,
+    code: Vec<u8>,
+    max_locals: u16,
+    num_params: u16,
+    cases: &[(Vec<i64>, i32)],
+) {
+    let helpers = frem_helpers();
+    // Compile the IR body FIRST: a single-pass attempt bails (no frem arm) and
+    // adds the method to the shared permanent bail-list (`mark_jit_bail_listed`),
+    // which would then short-circuit this IR compile to `None`. So the
+    // single-pass-bails check below runs on a DISTINCTLY-named twin method.
+    let cm = cached(name, descriptor, code.clone(), max_locals, num_params);
+    let ir = compile_fp_opt(&cm, &helpers, true)
+        .unwrap_or_else(|| panic!("{name}: IR (FP) failed to compile frem/drem — gate/builder?"));
+    // Pin the "single-pass bails frem/drem" assumption (a future single-pass
+    // frem arm should switch this test to `check_fp`). Separate name so the
+    // bail-list entry it creates can't shadow `cm` above.
+    let twin = cached(
+        &format!("{name}_spbail"),
+        descriptor,
+        code,
+        max_locals,
+        num_params,
+    );
+    assert!(
+        compile_fp_opt(&twin, &helpers, false).is_none(),
+        "{name}: single-pass unexpectedly compiled frem/drem — switch this test to check_fp",
+    );
+    for (args, expected) in cases {
+        // SAFETY: IR-produced body from valid FP bytecode with an int signature;
+        // the i64-arg/i64-ret ABI matches try_call and only frem/drem (wired
+        // above) is reachable.
+        let r_ir = unsafe { ir.try_call(args) }
+            .unwrap_or_else(|e| panic!("{name}: IR call {args:?}: {e:?}"));
+        assert_eq!(
+            r_ir as i32, *expected,
+            "{name}: IR vs host DIVERGE for {args:?}: IR={}, host={expected}",
+            r_ir as i32,
+        );
+    }
+}
+
+#[test]
+fn ir_fp_frem_integer_operands() {
+    // int f(int a, int b) { return (int)((float)a % (float)b); }
+    //   iload_0; i2f; iload_1; i2f; frem; f2i; ireturn
+    check_frem(
+        "frem",
+        "(II)I",
+        vec![0x1a, 0x86, 0x1b, 0x86, 0x72, 0x8b, 0xac],
+        2,
+        2,
+        &[
+            (vec![7, 3], 1),    // 7 % 3 = 1
+            (vec![-7, 3], -1),  // sign of dividend
+            (vec![7, -3], 1),   // sign of dividend (not divisor)
+            (vec![-7, -3], -1),
+            (vec![8, 4], 0),
+            (vec![10, 3], 1),
+            (vec![5, 0], 0),    // x % 0 = NaN; f2i(NaN) = 0
+        ],
+    );
+}
+
+#[test]
+fn ir_fp_drem_integer_operands() {
+    // int f(int a, int b) { return (int)((double)a % (double)b); }
+    //   iload_0; i2d; iload_1; i2d; drem; d2i; ireturn
+    check_frem(
+        "drem",
+        "(II)I",
+        vec![0x1a, 0x87, 0x1b, 0x87, 0x73, 0x8e, 0xac],
+        2,
+        2,
+        &[
+            (vec![7, 3], 1),
+            (vec![-7, 3], -1),
+            (vec![7, -3], 1),
+            (vec![-7, -3], -1),
+            (vec![8, 4], 0),
+            (vec![10, 3], 1),
+            (vec![5, 0], 0), // NaN → 0
+        ],
+    );
+}
+
+#[test]
+fn ir_fp_frem_fractional() {
+    // int f(int a, int b) { return (int)(((a/4f) % (b/4f)) * 4f); } — genuinely
+    // fractional intermediate remainders (0.25, …) prove the helper computes a
+    // real fmod, not just integer-operand agreement. The *4 rescale lands on an
+    // integer so f2i is lossless, and every value (n/4) is exact in binary FP.
+    //   iload_0;i2f; iconst_4;i2f;fdiv; iload_1;i2f; iconst_4;i2f;fdiv; frem;
+    //   iconst_4;i2f;fmul; f2i; ireturn
+    check_frem(
+        "frem_frac",
+        "(II)I",
+        vec![
+            0x1a, 0x86, 0x07, 0x86, 0x6e, // (float)a / 4
+            0x1b, 0x86, 0x07, 0x86, 0x6e, // (float)b / 4
+            0x72, // frem
+            0x07, 0x86, 0x6a, // * 4
+            0x8b, 0xac, // f2i; ireturn
+        ],
+        2,
+        2,
+        &[
+            (vec![7, 2], 1),   // 1.75 % 0.5 = 0.25 → *4 = 1
+            (vec![9, 4], 1),   // 2.25 % 1.0 = 0.25 → 1
+            (vec![-7, 2], -1), // -1.75 % 0.5 = -0.25 → -1
+            (vec![10, 3], 1),  // 2.5 % 0.75 = 0.25 → 1
+        ],
+    );
+}
+
+#[test]
+fn ir_fp_drem_fractional() {
+    // Double analogue of `ir_fp_frem_fractional`.
+    //   iload_0;i2d; iconst_4;i2d;ddiv; iload_1;i2d; iconst_4;i2d;ddiv; drem;
+    //   iconst_4;i2d;dmul; d2i; ireturn
+    check_frem(
+        "drem_frac",
+        "(II)I",
+        vec![
+            0x1a, 0x87, 0x07, 0x87, 0x6f, // (double)a / 4
+            0x1b, 0x87, 0x07, 0x87, 0x6f, // (double)b / 4
+            0x73, // drem
+            0x07, 0x87, 0x6b, // * 4
+            0x8e, 0xac, // d2i; ireturn
+        ],
+        2,
+        2,
+        &[
+            (vec![7, 2], 1),
+            (vec![9, 4], 1),
+            (vec![-7, 2], -1),
+            (vec![10, 3], 1),
+        ],
+    );
+}
+
+// ── FP method with int-div (Slice C: FP-slot deopt resume) ──────────────────
+//
+// Dropping the FP gate's `!method_has_int_div` exclusion admits an FP method
+// containing an `idiv`/`irem` to the IR path. The int division carries a
+// div-by-zero deopt guard; with FP-slot resume wired, an FP value live ACROSS
+// that guard is reconstructed precisely on a deopt (the div-by-zero path is
+// validated E2E vs HotSpot — caught ArithmeticException + correct FP value).
+// Here, with a non-zero divisor (no deopt), the method must compile via IR and
+// agree with single-pass (which also compiles idiv + FP) and the host anchor.
+
+#[test]
+fn ir_fp_method_with_int_div() {
+    // int f(int a, int b) { float x = (float)a * 2; int q = a / b;
+    //                       return (int)(x + (float)q); }
+    // The FP value `x` is live on the operand stack ACROSS the idiv (the deopt
+    // point), exercising an FP stack slot at the guard.
+    //   iload_0; i2f; fconst_2; fmul;   // x = a*2.0f  [FP live]
+    //   iload_0; iload_1; idiv;          // q = a/b     [idiv deopt guard]
+    //   i2f; fadd; f2i; ireturn          // (int)(x + (float)q)
+    check_fp(
+        "fp_intdiv",
+        "(II)I",
+        vec![
+            0x1a, 0x86, 0x0d, 0x6a, // (float)a * 2.0
+            0x1a, 0x1b, 0x6c, // a / b
+            0x86, 0x62, 0x8b, 0xac, // (float)q ; +x ; (int) ; return
+        ],
+        2,
+        2,
+        &[
+            (vec![10, 2], 25),   // x=20.0, q=5  → 25
+            (vec![7, 3], 16),    // x=14.0, q=2  → 16
+            (vec![-8, 4], -18),  // x=-16.0, q=-2 → -18
+            (vec![100, 7], 214), // x=200.0, q=14 → 214
+        ],
+    );
+}
+
+// ── FP array element access (faload/daload/fastore/dastore) — Slice B ───────
+//
+// The IR lowers an FP array access inline: array→RAX, index→RCX, the JVMS null
+// + bounds deopt guards, then a `MOVSS`/`MOVSD` at `[RAX + RCX*elem_size +
+// HEADER_SIZE]`. Single-pass compiles the same opcodes inline, so the
+// non-faulting path is a true IR==single-pass==host differential (a synthetic
+// array buffer is passed as the receiver, mirroring the getfield harness). The
+// fault paths (null array / OOB index) deopt → the interpreter re-throws the
+// exact NPE/AIOOBE; that parity is validated E2E vs HotSpot.
+
+/// Build a synthetic `float[]` buffer: `length` at `ARRAY_LENGTH_OFFSET`, the
+/// elements (4 bytes each) packed from `HEADER_SIZE`.
+fn make_f32_array(elems: &[f32]) -> Vec<u8> {
+    let mut buf = vec![0u8; HEADER_SIZE + elems.len() * 4];
+    buf[ARRAY_LENGTH_OFFSET..ARRAY_LENGTH_OFFSET + 4]
+        .copy_from_slice(&(elems.len() as u32).to_le_bytes());
+    for (i, &v) in elems.iter().enumerate() {
+        let off = HEADER_SIZE + i * 4;
+        buf[off..off + 4].copy_from_slice(&v.to_bits().to_le_bytes());
+    }
+    buf
+}
+
+/// Build a synthetic `double[]` buffer (8 bytes per element).
+fn make_f64_array(elems: &[f64]) -> Vec<u8> {
+    let mut buf = vec![0u8; HEADER_SIZE + elems.len() * 8];
+    buf[ARRAY_LENGTH_OFFSET..ARRAY_LENGTH_OFFSET + 4]
+        .copy_from_slice(&(elems.len() as u32).to_le_bytes());
+    for (i, &v) in elems.iter().enumerate() {
+        let off = HEADER_SIZE + i * 8;
+        buf[off..off + 8].copy_from_slice(&v.to_bits().to_le_bytes());
+    }
+    buf
+}
+
+#[test]
+fn ir_fp_faload() {
+    // static float fget(float[] a, int i) { return a[i]; }
+    //   aload_0; iload_1; faload; freturn
+    let helpers = dummy_helpers();
+    let cm = cached("fget", "([FI)F", vec![0x2a, 0x1b, 0x30, 0xae], 2, 2);
+    let ir = compile_fp_opt(&cm, &helpers, true).expect("fget IR (FP)");
+    let sp = compile_fp_opt(&cm, &helpers, false).expect("fget single-pass");
+    let elems = [1.5f32, -2.25, 0.0, 1234.5, f32::INFINITY];
+    let arr = make_f32_array(&elems);
+    for (i, &want) in elems.iter().enumerate() {
+        let args = [arr.as_ptr() as i64, i as i64];
+        // SAFETY: both bodies are JIT-compiled faload; `arr` is a live, correctly
+        // laid-out float[] whose address is arg0, the index in-bounds.
+        let r_sp = f32::from_bits(unsafe { sp.try_call(&args) }.unwrap() as u32);
+        let r_ir = f32::from_bits(unsafe { ir.try_call(&args) }.unwrap() as u32);
+        assert_eq!(r_ir.to_bits(), r_sp.to_bits(), "faload IR vs sp at {i}");
+        assert_eq!(r_ir.to_bits(), want.to_bits(), "faload vs host at {i}");
+    }
+}
+
+#[test]
+fn ir_fp_daload() {
+    // static double dget(double[] a, int i) { return a[i]; }
+    //   aload_0; iload_1; daload; dreturn
+    let helpers = dummy_helpers();
+    let cm = cached("dget", "([DI)D", vec![0x2a, 0x1b, 0x31, 0xaf], 2, 2);
+    let ir = compile_fp_opt(&cm, &helpers, true).expect("dget IR (FP)");
+    let sp = compile_fp_opt(&cm, &helpers, false).expect("dget single-pass");
+    let elems = [1.5f64, -2.25, 0.0, 1e300, f64::NEG_INFINITY];
+    let arr = make_f64_array(&elems);
+    for (i, &want) in elems.iter().enumerate() {
+        let args = [arr.as_ptr() as i64, i as i64];
+        let r_sp = f64::from_bits(unsafe { sp.try_call(&args) }.unwrap() as u64);
+        let r_ir = f64::from_bits(unsafe { ir.try_call(&args) }.unwrap() as u64);
+        assert_eq!(r_ir.to_bits(), r_sp.to_bits(), "daload IR vs sp at {i}");
+        assert_eq!(r_ir.to_bits(), want.to_bits(), "daload vs host at {i}");
+    }
+}
+
+#[test]
+fn ir_fp_fastore() {
+    // static void fset(float[] a, int i, float v) { a[i] = v; }
+    //   aload_0; iload_1; fload_2; fastore; return
+    let helpers = dummy_helpers();
+    let cm = cached("fset", "([FIF)V", vec![0x2a, 0x1b, 0x24, 0x51, 0xb1], 3, 3);
+    let ir = compile_fp_opt(&cm, &helpers, true).expect("fset IR (FP)");
+    let sp = compile_fp_opt(&cm, &helpers, false).expect("fset single-pass");
+    for (i, v) in [(0usize, 9.5f32), (2, -1.25), (4, 1e30)] {
+        // Each backend writes its OWN fresh array; the element must agree.
+        let read_back = |m: &CompiledMethod| -> u32 {
+            let mut arr = make_f32_array(&[0.0; 5]);
+            let args = [arr.as_mut_ptr() as i64, i as i64, v.to_bits() as i64];
+            // SAFETY: JIT-compiled fastore; live float[] arg0, in-bounds index,
+            // float value passed as bits (compact GPR FP ABI). No helper reached.
+            unsafe { m.try_call(&args) }.unwrap();
+            let off = HEADER_SIZE + i * 4;
+            u32::from_le_bytes([arr[off], arr[off + 1], arr[off + 2], arr[off + 3]])
+        };
+        let got_sp = read_back(&sp);
+        let got_ir = read_back(&ir);
+        assert_eq!(got_ir, got_sp, "fastore IR vs sp at {i}");
+        assert_eq!(got_ir, v.to_bits(), "fastore vs host at {i}");
+    }
+}
+
+#[test]
+fn ir_fp_dastore() {
+    // static void dset(double[] a, int i, double v) { a[i] = v; }
+    //   aload_0; iload_1; dload_2; dastore; return  (double v is cat-2 → slots 2-3;
+    //   dload_2 == 0x28, NOT dload_0/0x26)
+    let helpers = dummy_helpers();
+    let cm = cached("dset", "([DID)V", vec![0x2a, 0x1b, 0x28, 0x52, 0xb1], 4, 3);
+    let ir = compile_fp_opt(&cm, &helpers, true).expect("dset IR (FP)");
+    let sp = compile_fp_opt(&cm, &helpers, false).expect("dset single-pass");
+    for (i, v) in [(0usize, 9.5f64), (2, -1.25), (4, 1e300)] {
+        let read_back = |m: &CompiledMethod| -> u64 {
+            let mut arr = make_f64_array(&[0.0; 5]);
+            let args = [arr.as_mut_ptr() as i64, i as i64, v.to_bits() as i64];
+            unsafe { m.try_call(&args) }.unwrap();
+            let off = HEADER_SIZE + i * 8;
+            u64::from_le_bytes([
+                arr[off], arr[off + 1], arr[off + 2], arr[off + 3], arr[off + 4], arr[off + 5],
+                arr[off + 6], arr[off + 7],
+            ])
+        };
+        let got_sp = read_back(&sp);
+        let got_ir = read_back(&ir);
+        assert_eq!(got_ir, got_sp, "dastore IR vs sp at {i}");
+        assert_eq!(got_ir, v.to_bits(), "dastore vs host at {i}");
+    }
 }
 
 // ── FP 3-way compares (fcmpl/fcmpg/dcmpl/dcmpg) — item 3 next slice ──────────

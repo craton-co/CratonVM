@@ -84,8 +84,14 @@ pub enum FrameValue {
     /// resume builds a `Value::Long` (occupying one compact operand-stack slot
     /// and two JVM local slots) rather than a truncated `Value::Int`.
     Long(i64),
-    /// Float constant (stored as raw bits).
+    /// Float constant (cat-1: stored as raw 32-bit bits in the low word).
+    /// Resolves to `Value::Float(f32::from_bits(..))` on resume.
     Float(u64),
+    /// Category-2 `double` constant (stored as raw 64-bit bits). Distinct from
+    /// [`FrameValue::Float`] so the resume builds a `Value::Double` with cat-2
+    /// two-slot local placement (`real-frame-deopt` cat-2), exactly as `Long`
+    /// is distinct from `Int`.
+    Double(u64),
     /// Object reference (heap address, 0 for null).
     Object(u64),
     /// Value currently in a machine register.
@@ -106,6 +112,16 @@ pub enum FrameValue {
     /// `StackSlot` (which is a cat-1 `int`) so the resume builds a `Value::Long`
     /// with correct cat-2 two-slot local placement (`real-frame-deopt` cat-2).
     StackSlotLong(i32),
+    /// Value at a native stack slot offset, holding a cat-1 `float` (the lowerer
+    /// spills the 32-bit IEEE bit pattern in the low word via `MOVSS`). Resolves
+    /// to [`FrameValue::Float`] — the low 32 bits ARE the float bits. Distinct
+    /// from `StackSlot` (a cat-1 `int`) so the resume builds a `Value::Float`.
+    StackSlotFloat(i32),
+    /// Value at a native stack slot offset, holding a category-2 `double` (the
+    /// lowerer spills the full 64-bit IEEE bit pattern via `MOVSD`). Resolves to
+    /// [`FrameValue::Double`] — the raw 64-bit word IS the double bits. Distinct
+    /// from `StackSlotLong` so the resume builds a `Value::Double` (cat-2).
+    StackSlotDouble(i32),
     /// Scalar-replaced object that must be re-materialized.
     VirtualObject(VirtualObjectState),
     /// A reference to another scalar-replaced object in the same deopt frame, by
@@ -118,11 +134,12 @@ pub enum FrameValue {
     VirtualObjectRef(usize),
     /// Undefined / uninitialized.
     Undefined,
-    /// A live slot whose precise value can't yet be reconstructed for resume
-    /// (category-2 `long`/`double`, or a float-in-slot — the two-slot
-    /// expansion and FP-slot resolution are follow-ups). The resume treats this
-    /// as "fall back to the safe re-run path" rather than fabricate a value, so
-    /// a method with such a slot live at a guard is never resumed with garbage.
+    /// A live slot whose precise value can't yet be reconstructed for resume.
+    /// The resume treats this as "fall back to the safe re-run path" rather than
+    /// fabricate a value, so a method with such a slot live at a guard is never
+    /// resumed with garbage. (Long/double/float-in-slot resolution is now wired —
+    /// see `StackSlotLong`/`StackSlotDouble`/`StackSlotFloat` and `Double` — so
+    /// this is reserved for genuinely unmodelled slot kinds.)
     Unsupported,
 }
 
@@ -860,6 +877,20 @@ fn resolve_value(v: &FrameValue, regs: &SavedRegisters, rbp: u64) -> FrameValue 
             // The lowerer spills the full 64-bit `long`, so the raw word IS the
             // value; the resume builds a `Value::Long` (cat-2) from it.
             FrameValue::Long(unsafe { addr.read_unaligned() })
+        }
+        FrameValue::StackSlotFloat(off) => {
+            let addr = (rbp as i64 + *off as i64) as u64 as *const u32;
+            // SAFETY: see function-level contract — frame is live, slot in-frame.
+            // A `MOVSS` spill wrote only the low 4 bytes (the float bits); read
+            // them and carry as `Float` (the resume builds a `Value::Float`).
+            FrameValue::Float(unsafe { addr.read_unaligned() } as u64)
+        }
+        FrameValue::StackSlotDouble(off) => {
+            let addr = (rbp as i64 + *off as i64) as u64 as *const u64;
+            // SAFETY: see function-level contract — frame is live, slot in-frame.
+            // A `MOVSD` spill wrote the full 64-bit double bits; the raw word IS
+            // the value (the resume builds a `Value::Double`, cat-2).
+            FrameValue::Double(unsafe { addr.read_unaligned() })
         }
         other => other.clone(),
     }
