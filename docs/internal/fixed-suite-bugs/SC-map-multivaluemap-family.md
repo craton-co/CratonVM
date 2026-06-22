@@ -1,5 +1,29 @@
 # SC-map-multivaluemap-family — Map / MultiValueMap utility divergences
 
+> **STATUS: RESOLVED (archived).** All three in-cluster native-collections Map
+> bugs are fixed on `dev`:
+> - **RC-1** (`keySet().contains` not delegating to the source map's overridable
+>   `containsKey`) — fixed; `native_hs_contains` keySet-kind branch now dispatches
+>   `source.containsKey(elem)` (`native-collections/src/lib.rs`, keySet branch of
+>   `native_hs_contains`).
+> - **RC-2** (`LinkedHashMap.putIfAbsent` not replacing a `null`-mapped value) —
+>   fixed; `native_lhm_put_if_absent` now stores + returns null when the existing
+>   value is `null`.
+> - **RC-3** (`Map.equals` mishandling a non-native-layout `Map` operand) — fixed
+>   `fix/sc-map-equals-foreign-rc3-v2` (`e115b0bd`): `native_map_equals` now routes
+>   every `other` access through virtual dispatch (`other.size()`/`get()`/
+>   `containsKey()`) behind an `instanceof Map` guard, restoring
+>   `AbstractMap.equals` semantics for cross-implementation comparisons; also
+>   tightened the null-value contract. Verified vs HotSpot (JDK 25) with
+>   `test_classes/MapEqRepro` (pre-fix 12/15, post-fix 15/15).
+>
+> **RC-4 / RC-5 remain open as handoffs but are NOT Map-family defects** — they
+> are the cross-cutting ByteBuddy `ClassInjector$UsingReflection` /
+> Mockito-proxy + JUnit "TimeoutExtension multiple times" masking gaps tracked in
+> the bug-E workstream (`SC-task-retry-util-misc.md`, and the "JUnit multiple
+> times masks a VM linkage error" note). They do not block archiving this
+> Map-family report.
+
 ## Title
 CratonVM divergences in Spring's `LinkedCaseInsensitiveMap`, `LinkedMultiValueMap`,
 and `(Unmodifiable)MultiValueMap` — three native-collections Map bugs plus two

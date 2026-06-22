@@ -373,7 +373,6 @@ supplier/accumulator/finisher/combiner). The **open** ones documented here:
 - [SC-resource-io-family.md](SC-resource-io-family.md) — NIO write-channel stub, `Path.toUri()` authority; several FileNotFoundExceptions are harness-CWD artifacts.
 - [SC-aot-runtimehints-resource-count.md](SC-aot-runtimehints-resource-count.md) — RuntimeHints resource glob count (8 vs 5).
 - [SC-stax-xml-family.md](SC-stax-xml-family.md) — namespace SAX-event-sequence mismatch (cursor natives + element prefix already fixed on dev).
-- [SC-map-multivaluemap-family.md](SC-map-multivaluemap-family.md) — residual ByteBuddy `ClassInjector` handoffs (keySet/putIfAbsent fixed on dev).
 - [SC-task-retry-util-misc.md](SC-task-retry-util-misc.md) — Properties.store #date line, Throwable deser, retry timing, ByteBuddy ClassInjector, AQS throttle.
 - [SC-misc-core-spring.md](SC-misc-core-spring.md) — SortedProperties OutputStream store (CHM.remove(null) fixed on dev).
 - [SC-hangs-mergedannotations-charsequence.md](SC-hangs-mergedannotations-charsequence.md) — two hangs: `MergedAnnotations.stream().toArray()` re-entry; Reactor `StepVerifier` producer never scheduled.
