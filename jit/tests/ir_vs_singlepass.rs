@@ -3033,3 +3033,154 @@ fn ir_vs_singlepass_fp_to_long_fixup() {
         &[(vec![], -1)],
     );
 }
+
+// ── Backend-routing guards for the fib44 self-recursion fix ──
+//
+// A SELF-RECURSIVE wide-return (J/D/F) call must bail the method to single-pass
+// (fast direct self-call), NOT lower to an IR `Op::Call` routed through the
+// generic `jit_invoke_dispatch` helper per call (the ~8.6x fib44 regression).
+// The gate is keyed on `CompiledMethod::used_ir_backend` (true = optimizing IR
+// pipeline produced the body; false = single-pass, incl. a bail). These pin the
+// gate's behaviour AND its specificity (it fires ONLY for self-recursive J/D/F).
+
+#[test]
+fn selfrec_long_return_bails_to_singlepass() {
+    // static long fib(int n) { return n < 2 ? n : fib(n-1) + fib(n-2); }  // (I)J
+    let helpers = dummy_helpers();
+    let code = vec![
+        0x1a, 0x04, 0xa3, 0x00, 0x06, // iload_0; iconst_1; if_icmpgt 8
+        0x1a, 0x85, 0xad, // iload_0; i2l; lreturn
+        0x1a, 0x04, 0x64, 0xb8, 0x00, 0x02, // iload_0; iconst_1; isub; invokestatic #2 (self)
+        0x1a, 0x05, 0x64, 0xb8, 0x00, 0x02, // iload_0; iconst_2; isub; invokestatic #2 (self)
+        0x61, 0xad, // ladd; lreturn
+    ];
+    let cm = cached("fib", "(I)J", code, 1, 1);
+    let resolver = |cp: u16| -> Option<(String, String, String)> {
+        // CP #2 resolves to THIS method (self-recursion). `cached` uses class
+        // "Corpus", method = the given name, descriptor = the given descriptor.
+        if cp == 2 {
+            Some(("Corpus".into(), "fib".into(), "(I)J".into()))
+        } else {
+            None
+        }
+    };
+    let compiled =
+        compile_with_dispatch(&cm, &helpers, &resolver).expect("compiles (via single-pass)");
+    assert!(
+        !compiled.used_ir_backend,
+        "fib44 regression guard: a self-recursive long-returning method must bail to \
+         single-pass (direct self-call), not the IR Op::Call/jit_invoke_dispatch path"
+    );
+}
+
+#[test]
+fn selfrec_int_return_uses_ir() {
+    // static int f(int n) { return n < 2 ? n : f(n-1) + f(n-2); }  // (I)I
+    // The gate is wide-return-specific: an INT self-recursive call is unaffected
+    // and still lowers to the IR Op::Call path (pre-existing behaviour).
+    let helpers = dummy_helpers();
+    let code = vec![
+        0x1a, 0x04, 0xa3, 0x00, 0x05, // iload_0; iconst_1; if_icmpgt 7
+        0x1a, 0xac, // iload_0; ireturn
+        0x1a, 0x04, 0x64, 0xb8, 0x00, 0x02, // iload_0; iconst_1; isub; invokestatic #2 (self)
+        0x1a, 0x05, 0x64, 0xb8, 0x00, 0x02, // iload_0; iconst_2; isub; invokestatic #2 (self)
+        0x60, 0xac, // iadd; ireturn
+    ];
+    let cm = cached("f", "(I)I", code, 1, 1);
+    let resolver = |cp: u16| -> Option<(String, String, String)> {
+        if cp == 2 {
+            Some(("Corpus".into(), "f".into(), "(I)I".into()))
+        } else {
+            None
+        }
+    };
+    let compiled = compile_with_dispatch(&cm, &helpers, &resolver).expect("compiles");
+    assert!(
+        compiled.used_ir_backend,
+        "an int (non-wide) self-recursive call is not gated and should use the IR backend"
+    );
+}
+
+#[test]
+fn crossmethod_long_return_uses_ir() {
+    // static long f(int n) { return g(n); }   // g:(I)J, NOT self-recursive
+    // Confirms the gate is SELF-recursion specific: a cross-method long-returning
+    // call is the intended inc-29 unblock and still lowers to IR Op::Call.
+    let helpers = dummy_helpers();
+    let code = vec![0x1a, 0xb8, 0x00, 0x02, 0xad]; // iload_0; invokestatic #2 (g); lreturn
+    let cm = cached("f", "(I)J", code, 1, 1);
+    let resolver = |cp: u16| -> Option<(String, String, String)> {
+        // CP #2 resolves to a DIFFERENT method `g` (not the compiling method `f`).
+        if cp == 2 {
+            Some(("Corpus".into(), "g".into(), "(I)J".into()))
+        } else {
+            None
+        }
+    };
+    let compiled = compile_with_dispatch(&cm, &helpers, &resolver).expect("compiles");
+    assert!(
+        compiled.used_ir_backend,
+        "a cross-method long-returning call must NOT be gated (intended IR unblock)"
+    );
+}
+
+#[test]
+fn selfrec_long_direct_call_executes_correctly() {
+    // fib44-fix follow-up: with CRATONVM_JIT_IR_SELFREC_DIRECT on, a self-recursive
+    // long method stays on the IR pipeline but its recursive call is a DIRECT call
+    // to its own entry (not jit_invoke_dispatch). Verify it (a) takes the IR
+    // backend and (b) recurses correctly end-to-end (the real codegen arbiter).
+    //
+    // Reset guard: the override is thread-local and the test harness reuses
+    // threads, so a leak (even on panic) would flip the flag for a later test on
+    // this thread (e.g. `selfrec_long_return_bails_to_singlepass`). Drop restores.
+    struct ResetOverride;
+    impl Drop for ResetOverride {
+        fn drop(&mut self) {
+            cratonvm_jit::__set_selfrec_direct_override(None);
+        }
+    }
+    let _guard = ResetOverride;
+    cratonvm_jit::__set_selfrec_direct_override(Some(true));
+
+    let helpers = dummy_helpers();
+    // static long fib(int n) { return n < 2 ? n : fib(n-1) + fib(n-2); }
+    let code = vec![
+        0x1a, 0x04, 0xa3, 0x00, 0x06, // iload_0; iconst_1; if_icmpgt 8
+        0x1a, 0x85, 0xad, // iload_0; i2l; lreturn
+        0x1a, 0x04, 0x64, 0xb8, 0x00, 0x02, // iload_0; iconst_1; isub; invokestatic #2 (self)
+        0x1a, 0x05, 0x64, 0xb8, 0x00, 0x02, // iload_0; iconst_2; isub; invokestatic #2 (self)
+        0x61, 0xad, // ladd; lreturn
+    ];
+    let cm = cached("fib", "(I)J", code, 1, 1);
+    let resolver = |cp: u16| -> Option<(String, String, String)> {
+        if cp == 2 {
+            Some(("Corpus".into(), "fib".into(), "(I)J".into()))
+        } else {
+            None
+        }
+    };
+    let compiled = compile_with_dispatch(&cm, &helpers, &resolver)
+        .expect("self-recursive long compiles on the IR direct-call path");
+    assert!(
+        compiled.used_ir_backend,
+        "with the flag on, a self-recursive long method stays on the IR backend (direct self-call)"
+    );
+
+    // `vm_ptr` is only forwarded to recursive calls, never dereferenced by fib —
+    // a dummy buffer pointer suffices.
+    let dummy_vm = [0u8; 64];
+    for (n, expect) in [
+        (0i64, 0i64),
+        (1, 1),
+        (2, 1),
+        (5, 5),
+        (10, 55),
+        (20, 6765),
+        (30, 832040),
+    ] {
+        let r = unsafe { compiled.try_call_with_context(dummy_vm.as_ptr() as i64, &[n]) }
+            .unwrap_or_else(|e| panic!("call fib({n}): {e:?}"));
+        assert_eq!(r, expect, "fib({n}) via IR direct self-call");
+    }
+}
