@@ -7755,12 +7755,25 @@ fn fsp_new_output_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         ctx.set_field_by_name(exc, "file", Value::Object(Some(file_str)));
         return Err(MethodCallFailed::ExceptionThrown(exc));
     }
-    let fd = ctx
-        .fd_table()
-        .open_write(&p, append)
-        .map_err(|e| RuntimeError::IOException {
-            message: format!("newOutputStream({}): {}", p, e),
-        })?;
+    let fd = match ctx.fd_table().open_write(&p, append) {
+        Ok(fd) => fd,
+        Err(e) => {
+            // Surface the TYPED `java.nio.file` exception HotSpot throws, not a
+            // bare IOException. Opening a directory for output denies access on
+            // Windows (os error 5) → `AccessDeniedException` (SC-resource-io
+            // Cause C: Spring's `PathResourceTests.getOutputStreamForDirectory`);
+            // a missing parent → `NoSuchFileException`. Both are `IOException`
+            // subclasses so existing `catch (IOException)` callers are unaffected.
+            return Err(match e.kind() {
+                std::io::ErrorKind::PermissionDenied => p57_access_denied(ctx, &p),
+                std::io::ErrorKind::NotFound => p57_no_such_file(ctx, &p),
+                _ => RuntimeError::IOException {
+                    message: format!("newOutputStream({}): {}", p, e),
+                }
+                .into(),
+            });
+        }
+    };
     // Allocate a real FileOutputStream and wire the fd onto its
     // FileDescriptor — the existing FOS native overrides (write/flush/close,
     // registered in native-io::lib.rs) recover the fd via the same
@@ -7790,6 +7803,19 @@ fn p57_no_such_file(ctx: &mut dyn NativeContext, path: &str) -> MethodCallFailed
     let exc = alloc_concurrent_synthetic(ctx, "java/nio/file/NoSuchFileException", 4);
     let file_str = ctx.create_string(path);
     // FileSystemException stores the offending path in its `file` field.
+    ctx.set_field_by_name(exc, "file", Value::Object(Some(file_str)));
+    MethodCallFailed::ExceptionThrown(exc)
+}
+
+/// Build a *typed* `java.nio.file.AccessDeniedException` for `path` (mirrors
+/// [`p57_no_such_file`]). `AccessDeniedException extends FileSystemException
+/// extends IOException`, so the thrown object carries the genuine `ClassId` and
+/// matches `catch (AccessDeniedException)` / `FileSystemException` / `IOException`.
+/// Used when an OS open returns access-denied (e.g. opening a directory for
+/// output on Windows) so the thrown type matches HotSpot.
+fn p57_access_denied(ctx: &mut dyn NativeContext, path: &str) -> MethodCallFailed {
+    let exc = alloc_concurrent_synthetic(ctx, "java/nio/file/AccessDeniedException", 4);
+    let file_str = ctx.create_string(path);
     ctx.set_field_by_name(exc, "file", Value::Object(Some(file_str)));
     MethodCallFailed::ExceptionThrown(exc)
 }
