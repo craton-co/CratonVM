@@ -1,5 +1,25 @@
 # SC-resource-io-family — Spring `spring-core` Resource / IO cluster
 
+> **TRIAGE 2026-06-22 (against current `dev`, repro `test_classes/ResourceIoRepro`).**
+> The doc was static-analysis-only; verified status:
+> - **Cause A (write/read byte-channel `AbstractMethodError`)**: ✅ **FIXED on `dev`**
+>   (`fd14c4ea` + `bbfaa35e`, merge into dev). `FileSystemProvider.newByteChannel` now
+>   delegates real-file opens to the sibling `newFileChannel` shim → returns a working
+>   fd_table-backed `FileChannel` (implements `SeekableByteChannel`); jar entries keep the
+>   in-memory path; the missing-file `NoSuchFileException` contract is preserved. Verified vs
+>   HotSpot (JDK 25, `ResourceIoRepro` 11/11: write/read/size/seek/truncate + missing→NSFE + CREATE).
+> - **Cause B (`Path.toUri()` authority `file://`)**: ⚪ **NOT A BUG** — HotSpot also emits
+>   `file:///C:/…` for `Path.toUri()` on Windows (and `file:/C:/…` for `File.toURI()`); CratonVM
+>   matches BOTH. The doc's "HotSpot single-slash for `Path.toUri`" premise is wrong for Windows;
+>   "fixing" it would *introduce* a divergence. (The original Spring assertion likely normalizes
+>   differently — re-check against the actual `ResourceTests` if it still fails.)
+> - **Cause C (`newOutputStream` on a directory)**: 🔴 **OPEN (minor)** — HotSpot throws
+>   `java.nio.file.AccessDeniedException` (NOT `FileNotFoundException` as the doc claimed);
+>   CratonVM throws a generic `java.io.IOException` (os error 5). A small exception-TYPE residual
+>   (`fsp_new_output_stream` should map the typed nio exception).
+> - **Causes D (harness CWD) / E,H (URL parse) / F (HTTP openStream) / G (ModuleResource)**:
+>   unchanged — env (D) / separate-subsystem handoffs.
+
 ## Title
 CratonVM divergences in the `java.nio.file` Resource / IO family: a write-channel stub
 with no `write` method, `Path.toUri()` emitting an authority component (`file://…`),

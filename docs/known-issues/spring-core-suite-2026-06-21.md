@@ -32,7 +32,7 @@ Remaining annotation-introspection sub-bugs (same report): A (TypeNotPresent/cla
 | [stream-collector-supplier-no-code](SC-stream-collector-supplier-no-code.md) | med | high | FIX | 1 | synthetic `Collector` lacks supplier/accumulator/finisher/combiner bodies → AbstractMethodError |
 | [aot-runtimehints-resource-count](../internal/fixed-suite-bugs/SC-aot-runtimehints-resource-count.md) | med | high | ✅FIXED | 3 | `Stream.distinct()` ignored Java equals/hashCode → dup resource globs (8 vs 5) — **fixed on dev** (`029f2c87`); archived. (4 reflection/jni/etc writer tests = unconfirmed separate residual.) |
 | [task-retry-util-misc](SC-task-retry-util-misc.md) | med | med-high | MIXED | 14 | 6 causes: non-Serializable unmod-map; Properties.store missing #date; Throwable deser; retry 20ms timing; **ByteBuddy ClassInjector [handoff]**; AQS throttle |
-| [resource-io-family](SC-resource-io-family.md) | med | high | FIX | ~25 | NIO write-channel stub no `write`; `Path.toUri()` emits `file://` authority; **many FileNotFoundException are harness CWD [env]** |
+| [resource-io-family](SC-resource-io-family.md) | med | high | FIX | ~25 | ~~NIO write-channel stub no `write`~~ **✅A fixed on dev** (`fd14c4ea`); `Path.toUri()` `file://` = **⚪not-a-bug** (HotSpot matches on Win); `newOutputStream`-on-dir wrong exception type [open,minor]; **many FileNotFoundException are harness CWD [env]** — triaged 2026-06-22, see doc |
 | [misc-core-spring](SC-misc-core-spring.md) | med | med | MIXED | 3 | `CHM.remove(null)` no-NPE (fix); SortedProperties OutputStream store (handoff) |
 
 ## spring-core — HANGS (timeouts)
