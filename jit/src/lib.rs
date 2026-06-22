@@ -6612,9 +6612,11 @@ mod tests {
         // and this test does not execute the generated code).
         let helpers: JitRuntimeHelpers = unsafe { std::mem::zeroed() };
         // Resolve cp index 2 → field index 0, int (`I`).
-        let field_resolver = |cp: u16| -> Option<(usize, u8)> {
+        // (field_index, type_tag, compact_offset, compact_ref) — see the note at
+        // the other field_resolver test closure; compact-ref widened this to 4.
+        let field_resolver = |cp: u16| -> Option<(usize, u8, u32, bool)> {
             if cp == 2 {
-                Some((0, b'I'))
+                Some((0, b'I', 0, false))
             } else {
                 None
             }
@@ -7049,9 +7051,14 @@ mod tests {
                 None
             }
         };
-        let field_resolver = |cp: u16| -> Option<(usize, u8)> {
+        // (field_index, type_tag, compact_offset, compact_ref) — the compact-ref
+        // field-layout merge widened `cp_field_resolver` to 4 fields; a plain
+        // non-compact int field resolves with `(_, _, 0, false)`. (Incidental
+        // fix: this test was left on the old 2-tuple by that merge, which broke
+        // the whole `cratonvm-jit` test binary.)
+        let field_resolver = |cp: u16| -> Option<(usize, u8, u32, bool)> {
             if cp == 3 {
-                Some((0, b'I'))
+                Some((0, b'I', 0, false))
             } else {
                 None
             }
