@@ -12070,7 +12070,12 @@ impl Compiler {
         // 21) so the heap/GC treat it as compact. Write a dword at offset 20
         // (gc_age=0, gc_flags=COMPACT, _gc_reserved=0); legacy objects leave it
         // TLAB-zeroed. GC_FLAG_COMPACT (0x04) << 8 == 0x400 places it at byte 21.
-        if compact_body.is_some() {
+        if let Some(body) = compact_body {
+            if std::env::var_os("CRATONVM_DBG_COMPACT_INLINE").is_some() {
+                eprintln!(
+                    "[compact-inline] new class_id={class_id_raw} body={body} total={total_size}"
+                );
+            }
             self.emit_mov_dword_mem_disp32_imm32(
                 R11,
                 20,
@@ -18162,6 +18167,9 @@ impl Compiler {
                         .get(&pc)
                         .filter(|_| std::env::var_os("DISABLE_INLINE_GETFIELD").is_none())
                     {
+                        if std::env::var_os("CRATONVM_DBG_COMPACT_INLINE").is_some() {
+                            eprintln!("[compact-inline] getfield pc={pc} off={c_off} ref={c_is_ref}");
+                        }
                         // Compact reference-field layout inline getfield. The
                         // packed byte offset + ref-ness were resolved at compile
                         // time, so emit a raw MOV (no helper call, no runtime
@@ -18366,6 +18374,9 @@ impl Compiler {
                                 .get(&pc)
                                 .filter(|_| cratonvm_types::compact_ref_fields_enabled())
                             {
+                                if std::env::var_os("CRATONVM_DBG_COMPACT_INLINE").is_some() {
+                                    eprintln!("[compact-inline] putfield-ref pc={pc} off={c_off}");
+                                }
                                 // COMPACT inline reference putfield: store the
                                 // bare 8-byte pointer on the barrier-free fast
                                 // path (non-null YOUNG receiver, NULL old value,
@@ -22951,6 +22962,23 @@ impl Compiler {
 /// calls [`compile_with_param_slots`] with the real parameter layout so
 /// long/double parameters land in the slots their body reads.
 #[allow(clippy::too_many_arguments)]
+thread_local! {
+    /// Compact reference-field layout: per-pc `(byte_offset, is_ref)` for the
+    /// next `compile()` call, set by the interpreter's execute / OSR compile
+    /// paths (which use the `compile` wrapper, not `compile_with_param_slots`
+    /// directly) so their getfield/putfield get inline compact codegen. Taken
+    /// (cleared) by the wrapper. Empty for every other caller (tests, AOT) →
+    /// legacy/helper field path. Same-thread, synchronous compile, no nesting.
+    static PENDING_COMPACT_FIELD_INFO: std::cell::RefCell<Vec<(usize, u32, bool)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Stage the compact-field-info for the next [`compile`] call on this thread.
+/// Call immediately before `compile`; the wrapper takes (clears) it.
+pub fn set_pending_compact_field_info(info: Vec<(usize, u32, bool)>) {
+    PENDING_COMPACT_FIELD_INFO.with(|c| *c.borrow_mut() = info);
+}
+
 pub fn compile(
     code: &[u8],
     code_len: usize,
@@ -23003,7 +23031,9 @@ pub fn compile(
         &[],
         0,
         0, // param_oop_mask: legacy/test path seeds no oop params (conservative)
-        Vec::new(), // compact_field_info: legacy/test path uses helpers
+        // Compact field info staged by the caller (interpreter execute/OSR);
+        // empty for tests/AOT → legacy/helper field path.
+        PENDING_COMPACT_FIELD_INFO.with(|c| std::mem::take(&mut *c.borrow_mut())),
     )
 }
 

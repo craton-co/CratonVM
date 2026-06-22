@@ -3630,6 +3630,10 @@ pub fn execute(
 
                     // Resolve instance field info for getfield/putfield (M5 fix)
                     let mut field_info: Vec<(usize, usize, u8)> = Vec::new();
+                    // Compact reference-field layout: per-pc packed offset + ref-ness
+                    // so the single-pass codegen emits inline compact field access.
+                    let mut compact_field_info: Vec<(usize, u32, bool)> = Vec::new();
+                    let compact_fields = cratonvm_types::compact_ref_fields_enabled();
                     if !scan.field_ops.is_empty() {
                         for &(pc_f, cp_idx) in &scan.field_ops {
                             if let Ok(field) = resolve_field_ref(shared, class_id, cp_idx) {
@@ -3648,6 +3652,17 @@ pub fn execute(
                                         let type_tag =
                                             *descriptor.as_bytes().first().unwrap_or(&b'I');
                                         field_info.push((pc_f, field.field_index, type_tag));
+                                        if compact_fields {
+                                            if let Some((c_off, c_ref)) =
+                                                cratonvm_types::compact_field_slot(
+                                                    field.declaring_class_id.as_u32(),
+                                                    field.field_index,
+                                                )
+                                            {
+                                                compact_field_info
+                                                    .push((pc_f, c_off as u32, c_ref));
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -3735,6 +3750,9 @@ pub fn execute(
                     // Try to compile
                     let param_slots = args.len();
                     let helpers = crate::jit::helpers::build_helpers();
+                    // Stage compact field offsets for the inline codegen (the
+                    // wrapper takes them); empty/no-op when the flag is off.
+                    crate::jit::x64::set_pending_compact_field_info(compact_field_info);
                     let mut cm = crate::jit::x64::compile(
                         &padded,
                         code_len,
@@ -18340,6 +18358,10 @@ fn try_osr(
             // Mirrors the field_info collection in the first-call JIT compile
             // path (this file, ~line 1915) and `resolve_inline_site` (~line 13367).
             let mut field_info: Vec<(usize, usize, u8)> = Vec::new();
+            // Compact reference-field layout: per-pc packed offset + ref-ness for
+            // inline compact getfield/putfield in the OSR-recompiled method.
+            let mut compact_field_info: Vec<(usize, u32, bool)> = Vec::new();
+            let compact_fields = cratonvm_types::compact_ref_fields_enabled();
             if !scan.field_ops.is_empty() {
                 for &(pc, cp_idx) in &scan.field_ops {
                     let field = resolve_field_ref(shared, class_id, cp_idx).ok()?;
@@ -18355,6 +18377,14 @@ fn try_osr(
                     let (_, descriptor) = class.constant_pool.get_name_and_type(nat_idx)?;
                     let type_tag = *descriptor.as_bytes().first()?;
                     field_info.push((pc, field.field_index, type_tag));
+                    if compact_fields {
+                        if let Some((c_off, c_ref)) = cratonvm_types::compact_field_slot(
+                            field.declaring_class_id.as_u32(),
+                            field.field_index,
+                        ) {
+                            compact_field_info.push((pc, c_off as u32, c_ref));
+                        }
+                    }
                 }
             }
 
@@ -18682,6 +18712,8 @@ fn try_osr(
             let param_slots = crate::jit::count_param_slots(&method_descriptor)
                 + if osr_method_is_static { 0 } else { 1 };
             let helpers = crate::jit::helpers::build_helpers();
+            // Stage compact field offsets for inline codegen (wrapper takes them).
+            crate::jit::x64::set_pending_compact_field_info(compact_field_info);
             let mut cm = crate::jit::x64::compile(
                 &code,
                 code_len,
