@@ -6210,6 +6210,10 @@ struct Compiler {
     /// Resolved field access metadata: (bytecode_pc, field_index, type_tag).
     /// type_tag is b'I', b'J', b'F', b'D', b'L', or b'['.
     field_info: Vec<(usize, usize, u8)>,
+    /// Compact reference-field layout: `pc -> (byte_offset, is_ref)` for inline
+    /// getfield/putfield codegen (no helper call / runtime lookup). Empty when
+    /// the flag is off → the inline emitters use the legacy path.
+    compact_field_off: std::collections::HashMap<usize, (u32, bool)>,
     /// Resolved typecheck metadata: (bytecode_pc, class_name_ptr, class_name_len).
     /// The class name string is leaked for 'static lifetime so the JIT code can reference it.
     typecheck_info: Vec<(usize, *const u8, usize)>,
@@ -7233,6 +7237,7 @@ impl Compiler {
             xmm_saved_base,
             multianewarray_info,
             field_info,
+            compact_field_off: std::collections::HashMap::new(),
             typecheck_info,
             static_field_info,
             hoist_info,
@@ -18123,6 +18128,64 @@ impl Compiler {
                         self.emit_load_local(RAX, field_off);
                         self.push_from_rax();
                         pc += 3;
+                    } else if let Some(&(c_off, c_is_ref)) = self
+                        .compact_field_off
+                        .get(&pc)
+                        .filter(|_| std::env::var_os("DISABLE_INLINE_GETFIELD").is_none())
+                    {
+                        // Compact reference-field layout inline getfield. The
+                        // packed byte offset + ref-ness were resolved at compile
+                        // time, so emit a raw MOV (no helper call, no runtime
+                        // layout lookup). A reference field is the bare 8-byte
+                        // pointer AT the cell (0 = null, matching the helper's
+                        // `Object(None) => 0`); a primitive field keeps its
+                        // 16-byte cell, payload at the same +4/+8 within-cell
+                        // offsets as the legacy path.
+                        let type_tag = self
+                            .field_info_idx
+                            .get(&pc)
+                            .map(|&i| self.field_info[i].2)
+                            .unwrap_or(b'I');
+                        let cell_off = (HEADER_SIZE + c_off as usize) as i32; // Cast: x86-64 disp32
+                        let obj_slot = self.pop_stack();
+                        self.load_slot_to_reg(RAX, obj_slot);
+                        // Null check: TEST RAX,RAX; JZ <null> (result 0).
+                        self.emit_test_r64_r64(RAX);
+                        let null_patch = self.emit_jcc_rel32_patch(0x84); // JE
+                        if c_is_ref {
+                            // 8-byte raw pointer at the cell base.
+                            self.emit_mov_r64_mem_disp32(RAX, RAX, cell_off);
+                        } else {
+                            match type_tag {
+                                b'J' | b'D' => {
+                                    self.emit_mov_r64_mem_disp32(
+                                        RAX,
+                                        RAX,
+                                        cell_off + FIELD_CELL_PAYLOAD64_OFFSET as i32,
+                                    );
+                                }
+                                b'F' => {
+                                    self.emit_mov_r32_mem_disp32(
+                                        RAX,
+                                        RAX,
+                                        cell_off + FIELD_CELL_PAYLOAD32_OFFSET as i32,
+                                    );
+                                }
+                                _ => {
+                                    self.emit_movsxd_r64_mem_disp32(
+                                        RAX,
+                                        RAX,
+                                        cell_off + FIELD_CELL_PAYLOAD32_OFFSET as i32,
+                                    );
+                                }
+                            }
+                        }
+                        let done_patch = self.emit_jmp_rel32_patch();
+                        self.patch_rel32_to_here(null_patch);
+                        self.emit_xor_reg_self(RAX);
+                        self.patch_rel32_to_here(done_patch);
+                        self.push_from_rax();
+                        pc += 3;
                     } else if let Some(&info_idx) = self
                         .field_info_idx
                         .get(&pc)
@@ -18269,7 +18332,56 @@ impl Compiler {
                             // pointers, so this inline 16-byte `Value` store is
                             // wrong — bail to the compact-aware
                             // `jit_putfield_object` helper.
-                            if inline_putfield_enabled()
+                            if let Some(&(c_off, _)) = self
+                                .compact_field_off
+                                .get(&pc)
+                                .filter(|_| cratonvm_types::compact_ref_fields_enabled())
+                            {
+                                // COMPACT inline reference putfield: store the
+                                // bare 8-byte pointer on the barrier-free fast
+                                // path (non-null YOUNG receiver, NULL old value,
+                                // index in bounds), else bail to the compact-aware
+                                // jit_putfield_object helper (full SATB + card).
+                                // Same barrier-free reasoning as the legacy
+                                // 16-byte fast path below — only the store width
+                                // (8 bytes, no tag dword) and the old-value offset
+                                // (cell base, not +8) differ.
+                                let cell_off = (HEADER_SIZE + c_off as usize) as i32; // Cast: disp32
+                                let mut bail: Vec<usize> = Vec::new();
+                                self.load_slot_to_reg(RAX, obj_slot);
+                                // null receiver → helper.
+                                self.emit_test_r64_r64(RAX);
+                                bail.push(self.emit_jcc_rel32_patch(0x84)); // JZ
+                                // old-gen receiver → helper (card). gc_flags @21 bit0.
+                                self.emit_mov_r32_mem_disp32(RCX, RAX, 21);
+                                self.emit_and_r64_imm8(RCX, 1);
+                                bail.push(self.emit_jcc_rel32_patch(0x85)); // JNZ old-gen
+                                // non-null OLD value → helper (SATB). The old ref
+                                // is the 8-byte pointer AT the cell base.
+                                self.emit_mov_r64_mem_disp32(RCX, RAX, cell_off);
+                                self.emit_test_r64_r64(RCX);
+                                bail.push(self.emit_jcc_rel32_patch(0x85)); // JNZ non-null old
+                                // bounds: field_index < num_slots (header u32 @16).
+                                self.emit_mov_r32_mem_disp32(RCX, RAX, 16);
+                                self.emit_mov_imm64(RDX, field_index as i64);
+                                self.emit_cmp_r32_r32(RDX, RCX);
+                                let oob = self.emit_jcc_rel32_patch(0x83); // JAE → drop
+                                // FAST STORE: bare 8-byte pointer at the cell base.
+                                self.load_slot_to_reg(RDX, val_slot);
+                                self.emit_mov_mem_disp32_r64(RAX, RDX, cell_off);
+                                let done = self.emit_jmp_rel32_patch();
+                                // --- helper fallback (full barriers) ---
+                                for b in bail {
+                                    self.patch_rel32_to_here(b);
+                                }
+                                self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
+                                self.load_slot_to_reg(ARG_REGS[1], obj_slot);
+                                self.emit_mov_imm32_sx(ARG_REGS[2], field_index as i32); // Cast
+                                self.load_slot_to_reg(ARG_REGS[3], val_slot);
+                                self.emit_call_absolute(self.helpers.putfield_object);
+                                self.patch_rel32_to_here(oob);
+                                self.patch_rel32_to_here(done);
+                            } else if inline_putfield_enabled()
                                 && !cratonvm_types::compact_ref_fields_enabled()
                             {
                                 let cell_off = (HEADER_SIZE + field_index * SLOT_SIZE) as i32; // Cast: x86-64 disp32
@@ -22862,6 +22974,7 @@ pub fn compile(
         &[],
         0,
         0, // param_oop_mask: legacy/test path seeds no oop params (conservative)
+        Vec::new(), // compact_field_info: legacy/test path uses helpers
     )
 }
 
@@ -22924,6 +23037,11 @@ pub fn compile_with_param_slots(
     // "must be oop" local dataflow so oop params live at an early safepoint are
     // precisely covered. `0` on the default path → byte-identical codegen.
     param_oop_mask: u64,
+    // Compact reference-field layout: per-getfield/putfield `(pc, byte_offset,
+    // is_ref)` so the codegen can emit an inline compact field access (no helper
+    // call, no runtime layout lookup). Empty when the flag is off → the inline
+    // emitters fall back to the legacy 16-byte cell / helper path.
+    compact_field_info: Vec<(usize, u32, bool)>,
 ) -> Option<CompiledMethod> {
     // Estimate buffer size: extra for invoke dispatch calls (~40 bytes each).
     // This is a heuristic only — see the `buf.overflowed()` bailout below for
@@ -23241,6 +23359,10 @@ pub fn compile_with_param_slots(
         compiler.speculative_bce_guards_by_header = by_header;
     }
     compiler.speculative_bce_guards = speculative_bce_guards;
+    compiler.compact_field_off = compact_field_info
+        .into_iter()
+        .map(|(pc, off, is_ref)| (pc, (off, is_ref)))
+        .collect();
     compiler.new_info = new_info;
     compiler.anewarray_info = anewarray_info;
     compiler.invoke_info = invoke_info;
