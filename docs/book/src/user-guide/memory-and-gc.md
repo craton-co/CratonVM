@@ -1,0 +1,118 @@
+# Memory & Garbage Collection
+
+CratonVM manages the Java heap with a **generational garbage collector** and
+sizes the heap ergonomically when you don't specify a size. This chapter is
+about *operating* the heap — sizing it, choosing a collector, and diagnosing
+pauses. For how the collector works internally, see [The Garbage
+Collector](../internals/garbage-collector.md).
+
+## Heap sizing
+
+### The ergonomic default
+
+When you do **not** pass `-Xmx`, the launcher chooses a default maximum heap
+based on the machine, rather than a fixed small number:
+
+- **Fraction:** about **¼ of physical RAM** (approximating the stock JDK's
+  `-XX:MaxRAMPercentage=25`).
+- **Floor:** 256 MiB — the ergonomic default only ever *raises* the heap above
+  the historical baseline, never lowers it.
+- **Cap:** 4 GiB by default. The cap exists because the generational heap
+  *eagerly commits* its arenas, so an uncapped ¼-of-RAM heap on a large host
+  would charge that much memory per process. Override the cap with
+  `CRATONVM_DEFAULT_HEAP_MAX_MB=<N>` (MiB).
+- **Fallback:** if physical RAM cannot be probed, the fixed 256 MiB default
+  stands.
+
+This matters for real frameworks: at a fixed 256 MB, allocation-heavy apps
+(build tools, dependency-injection containers, test runners) thrash the
+collector and can look like a hang, where a JDK that auto-sizes finishes fine.
+
+Precedence the launcher applies:
+
+```text
+-Xmx  →  ergonomic default (¼ RAM, capped)  →  256m
+```
+
+### Setting the heap explicitly
+
+```bash
+cratonvm --Xmx 2g  --classpath . MyApp
+cratonvm --Xmx 512m --classpath . MyApp
+```
+
+`-Xmx` accepts `k`, `m`, and `g` suffixes and always wins over the ergonomic
+default.
+
+`-Xms` (initial heap) is accepted for HotSpot compatibility but currently
+ignored.
+
+### Overriding ergonomics
+
+| Goal | How |
+|------|-----|
+| Pin the heap | `--Xmx <size>` |
+| Cap the ergonomic default | `CRATONVM_DEFAULT_HEAP_MAX_MB=<N>` (MiB) |
+| Disable ergonomics (back to 256 MB) | `CRATONVM_DEFAULT_HEAP_ERGONOMICS=0` |
+
+With `--verbose:gc`, the chosen default is printed at startup, e.g.:
+
+```text
+[cratonvm] ergonomic default max heap: 4096 MB (1/4 physical RAM; set -Xmx or CRATONVM_DEFAULT_HEAP_ERGONOMICS=0 to override)
+```
+
+## Choosing a collector
+
+| Collector | How to select | Status |
+|-----------|---------------|--------|
+| **Generational** (default) | (default) or `-XX:+UseGenerationalGC` | Stable. Young/old generations, write barriers, card table. Moving (Cheney) young copy plus non-moving sweep with selective promotion. |
+| **G1** (region-based) | `-XX:+UseG1GC` | **Experimental.** Region-based collector; the generational collector remains the safety net during its maturation. |
+
+A `zgc` collector exists only as a feature-gated stub and is not selectable as a
+production collector.
+
+```bash
+# Default (generational)
+cratonvm --classpath . MyApp
+
+# Opt into the experimental G1 collector
+cratonvm -XX:+UseG1GC --classpath . MyApp
+```
+
+Unknown collector names produce a warning and fall back to Generational.
+
+## Watching the collector
+
+```bash
+cratonvm --verbose:gc --classpath . MyApp
+```
+
+For HotSpot-style structured GC logging, use unified logging:
+
+```bash
+cratonvm --Xlog "gc*=info:stdout:time,level,tags" --classpath . MyApp
+```
+
+## Out-of-memory diagnostics
+
+If a program exhausts the heap you'll get an `OutOfMemoryError`. To capture an
+HPROF heap dump for analysis:
+
+```bash
+cratonvm -XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=./oom.hprof \
+         --classpath . MyApp
+```
+
+If you simply need more memory, raise `-Xmx`.
+
+## When to tune
+
+- **Frequent GC pauses / poor throughput on allocation-heavy code:** raise
+  `-Xmx`. The default collector triggers young collection as the young region
+  fills; a larger heap reduces collection frequency.
+- **Running in a container:** the ergonomic default is based on *physical RAM*,
+  not the cgroup limit, so inside a memory-constrained container you should set
+  `-Xmx` explicitly (roughly 50–75% of the container limit) or cap it with
+  `CRATONVM_DEFAULT_HEAP_MAX_MB`. See [Containers & cgroups](containers.md).
+- **Deep recursion hitting `StackOverflowError` unexpectedly:** that's the call
+  stack, not the heap — raise `RJ_MAX_STACK_DEPTH` and/or `RUST_MIN_STACK`.
