@@ -116,8 +116,11 @@ known-issues README):
   on, the moving Cheney path **under-counts** bt18 to 67674804 (the historical
   "golden" that was later proven WRONG; HotSpot = 68332206).
 - Its OSR-frame sub-gate `CRATONVM_SHADOW_OSR_TRACK`
-  (`jit/src/lib.rs:1463`, default-OFF) is only a **partial** correctness fix
-  (moves bt18 67674804 → 68199090, still short of 68332206).
+  (`osr_shadow_track_enabled`, `jit/src/lib.rs`, default-OFF) is only a
+  **partial** correctness fix (moves bt18 67674804 → 68199090, still short of
+  68332206). **DEPRECATED per Step 5** (2026-06-22): the precise-maps default
+  accepts the conservative backstop for OSR frames, so this partial shadow path
+  is dead; its removal is folded into Step 6 (shadow-stack retirement).
 - **It must not be combined with precise maps** — the two interfere and
   reclaim (`SB-SUITE-CRASH-04` update #5). Precise maps alone are the path.
 - The shadow infrastructure (multi-thread scan in `roots.rs`/`gc.rs`, unwind
@@ -133,7 +136,7 @@ known-issues README):
 | A2 (`ReflRepro`) register-resident UAF | 🔴 **OPEN** — precise maps do NOT fix it | `reflrepro-register-resident-jit-root-handoff.md`: distinct sweep-walker use-after-free; precise maps *retain more* and surface *more* corruption, verified still-crashing 2026-06-17/18. |
 | A4 (`Fork6`, FJP multi-thread) | 🟡 **OPEN / inconclusive** — gated, separate CAS bug masks it | `fork6-fjp-multithread-jit-root-reclamation.md`: only reachable under experimental `CRATONVM_REAL_FORKJOINPOOL=1`; a real-FJP `ForkJoinPool` CAS conflict now fails the repro on both precise-on and precise-off. |
 | Moving-GC precise relocation (`remap_active_jit_frames` under a real move) | ⚠️ **implemented, not exercised on the default path** | The non-moving sweep + selective promote does not relocate JIT-held slots, so `remap_active_jit_frames` is inert by default; it is only load-bearing if a moving young gen is ever made default. |
-| OSR-point precise tracking | ⚠️ **partial / opt-in only** (`CRATONVM_SHADOW_OSR_TRACK`) | Shadow-path only (68199090, not 68332206); the precise-maps path relies on the conservative backstop for OSR frames, not on OSR oop maps. |
+| OSR-point precise tracking | ✅ **decided (Step 5): conservative backstop accepted; no precise OSR maps** | OSR frames get a `JitEntryGuard` chain entry + are conservatively backstopped in `scan_one_frame_precise` (safe on the non-moving sweep) and are excluded from `fully_oop_covered` (`!compiled_via_osr`) so a future moving path PINS them. Empirically: bt16 OSR-enters `binaryTrees(I)J` and is correct under forced young GC. `CRATONVM_SHADOW_OSR_TRACK` (shadow-only, partial 68199090) is deprecated. See "Step 5 — OSR decision". |
 | Full app-gauntlet GC-root regression with precise on | 🟡 **repro+bench lane LANDED & green; full 50-app lane still future** | `test-infra/regression-pool/gc-root-lane.sh` baseline 2026-06-22: 12 PASS / 1 expected-KNOWN-FAIL (A2) / 1 expected-FLAKY (MTRegex), 0 deviations. See "Step 4 baseline". The named full apps still need container harnesses. |
 | Perf acceptable as default | ✅ **inline frame-record landed (Steps 1+2, 2026-06-21)** | The per-invocation `jit_frame_record` CALL is now an inlined `mov gs:[disp], rbp` (default-on, Windows). fib44 inline-on ~11.8 s vs CALL-path ~19.8 s = **1.68× faster** (the no-frame-record floor is ~9 s, so inline cuts ~74 % of the frame-record overhead). bt16 also ~16 % faster. See "Inline frame-record (Steps 1+2)" below. Opt out: `CRATONVM_NO_PRECISE_INLINE_FRAME_RECORD`. |
 
@@ -224,9 +227,12 @@ not behaviour flips.
   See "Step 4 baseline" below. The named full apps (cassandra/tomcat/wildfly/…)
   need their own container/classpath harnesses (many are env-blocked here) and
   remain the outstanding bar — this lane is the runnable GC-root-family subset.
-- **Step 5 — OSR decision (separate, optional).** Either extend precise oop
-  maps to OSR entry or formally retire `CRATONVM_SHADOW_OSR_TRACK`. Independent
-  of the default flip.
+- **Step 5 — OSR decision (separate, optional). ✅ DONE — option (b)**
+  (2026-06-22). **Formally accept the conservative backstop for OSR frames** on
+  the default path; **do not** build precise OSR-entry oop maps (option a), and
+  **deprecate** the shadow-only `CRATONVM_SHADOW_OSR_TRACK` (removal deferred to
+  Step 6 with the shadow stack). Rationale + evidence in "Step 5 — OSR decision"
+  below. No code change — a documented decision.
 - **Step 6 — Shadow-stack retirement decision (separate).** Once the moving
   default project (`default-moving-young-gen.md`) is decided, either keep
   `CRATONVM_SHADOW_STACK` as the moving-relocation scaffolding or remove it.
@@ -353,6 +359,54 @@ expected FLAKY, 0 deviations** (lane exit 0).
 This is the runnable GC-root-family acceptance set. The full named-app gauntlet
 (cassandra/tomcat/wildfly/keycloak/spring-boot/jenkins/felix) needs container
 harnesses and is the remaining bar before the *family* is declared retired.
+
+## Step 5 — OSR decision (resolved 2026-06-22): accept the conservative backstop
+
+**Decision: option (b).** OSR-entered frames are covered by the conservative
+backstop on the default (precise, non-moving) path; CratonVM does **not** build
+precise oop maps at OSR entry points, and the shadow-only
+`CRATONVM_SHADOW_OSR_TRACK` is **deprecated** (removal folded into Step 6 with the
+shadow stack). This is a clarity/robustness decision — not a correctness change.
+
+**Why OSR frames are already safe without precise OSR maps:**
+
+- **They are scanned.** OSR entry wraps the compiled call in
+  `JitEntryGuard::enter_with_compiled` (`vm/src/runtime/interpreter.rs`, right
+  before `osr_enter`), so the OSR frame gets a precise `JIT_ENTRY_CHAIN` entry
+  and is walked by `scan_one_frame_precise` at GC time.
+- **The backstop pins their oops.** An OSR frame is entered via the trampoline,
+  *not* the normal prologue, so it does **not** call `jit_frame_record` (no exact
+  RBP) — its precise oop-map reads (relative to the approximate guard
+  `frame_base`) are unreliable. But `scan_one_frame_precise` *also* runs the
+  conservative band sweep (`scan_one_frame(scanner_sp, frame_base)`), which finds
+  and pins every oop-looking word in the OSR frame. So no root is missed on the
+  non-moving sweep.
+- **A future moving GC pins them too.** `fully_oop_covered` is computed with
+  `&& !cm.compiled_via_osr` (`jit/src/x64.rs`), so OSR-compiled methods are never
+  "fully covered" — a moving collector keyed on that flag would **pin** (never
+  relocate) OSR frames. Safe on both the current and any future path.
+
+**Evidence (current dev `49954653`, JDK-25 oracle):** `bintrees16` OSR-enters
+`BenchSuite.binaryTrees(I)J` (verified via `CRATONVM_DBG_OSR`; its locals hold
+live `TreeNode` refs) and produces the correct checksum `14985902` with **zero
+corruption markers** under forced young GC (`CRATONVM_DBG_GC_STRESS=65536`);
+`bintrees18` = `68332206`. The Step-4 lane corroborates across the bench + repro
+set. (A minimal standalone OSR-GC probe was tried and discarded — this VM's OSR
+trigger fires for hot loops in *called* methods like `binaryTrees`, not for a
+trivial counted loop, so `binaryTrees` is the correct vehicle.)
+
+**Why option (a) is deferred (not done):** building precise OSR-entry oop maps
+would require recovering each OSR frame's exact RBP and emitting per-OSR-entry
+maps — work the default path does not need (the backstop is correct, and the
+moving path pins OSR frames anyway). Note the deopt-osr work already emits
+*OSR-exit* maps, but for a different consumer (deopt resume at a loop bci), not
+GC roots; it does not change this decision.
+
+**`CRATONVM_SHADOW_OSR_TRACK` status:** a sub-gate of the superseded shadow stack
+that makes an OSR frame replicate the shadow push/reload so a moving Cheney
+collector could relocate its oops. It is **partial** (bt18 67674804 → 68199090,
+still short of the golden 68332206) and **regresses bt18**, and the shadow path
+itself is not the correctness path. Deprecated; its removal is part of Step 6.
 
 ## Risks & open questions
 
