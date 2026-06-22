@@ -3742,6 +3742,28 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                 .thread_registry
                 .java_thread_obj(tid)
                 .unwrap_or(thread_obj_for_spawn);
+
+            // CRIT (multi-thread STW deadlock) — leave the mutator population
+            // through the blocked-region protocol BEFORE marking dead, so a
+            // concurrent stop-the-world is not left waiting on a thread that has
+            // terminated and can never reach an interpreter safepoint to arrive.
+            //
+            // This thread was alive — and so potentially counted in a concurrent
+            // `request_stw`'s `expected` — right up to here. `enter_blocked`
+            // serializes against `request_stw` under the barrier lock and bumps
+            // `threads_blocked`: that increment makes our (stale) inclusion in
+            // `alive_count` cancel out in `expected = alive - 1 - blocked`, AND
+            // `pre_stw` tells us whether a STW that already counted us is active —
+            // in which case we arrive exactly once. Without this, a worker that
+            // finishes near a GC (e.g. 6 threads each looping `System.gc()`;
+            // scratch_churn/Churn.java) was counted but never arrived, hanging
+            // the initiator's `wait_for_all` forever. Previously the
+            // arrive-on-terminate lived only in the monitor-CONTENDED arm below,
+            // so the common uncontended path skipped it.
+            let term_blk = shared_arc.gc_barrier.enter_blocked();
+            if term_blk.pre_stw {
+                let _ = shared_arc.gc_barrier.arrive_and_wait(tid);
+            }
             shared_arc.thread_registry.mark_dead(tid);
 
             // WP4.1 вЂ” wake any thread waiting in `Thread.join()` for us.
@@ -3754,34 +3776,17 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             // and release it.  Without this, `join()` spins forever
             // because nobody ever wakes the waiter.
             //
-            // We use the shared monitors path directly so we don't need a
-            // live `JvmThread` (this closure is on the dying thread's
-            // tail; constructing a frame here is overkill).  Errors are
-            // swallowed вЂ” the worst case is a missed wakeup, which an
-            // existing unparker / interrupt would still resolve.
-            //
-            // GC-safety: a CONTENDED acquire here (a joiner holds the
-            // monitor) must be marked GC-blocked or it wedges a concurrent
-            // STW (this thread is already marked dead and has no Java
-            // frames, so no root deposit is needed — there is nothing to
-            // scan or fix up).
-            if let Some(m) = shared_arc
-                .monitors
-                .enter_or_contend(wake_obj, tid)
-            {
-                let blk = shared_arc.gc_barrier.enter_blocked();
-                if blk.pre_stw {
-                    let _ = shared_arc.gc_barrier.arrive_and_wait(tid);
-                }
+            // We are already inside the `term_blk` blocked region, so a CONTENDED
+            // monitor acquire here cannot wedge a concurrent STW (we are excluded
+            // from `expected` and hold no Java frames to scan).
+            if let Some(m) = shared_arc.monitors.enter_or_contend(wake_obj, tid) {
                 m.block_enter(tid);
-                drop(blk);
             }
-            let _ = shared_arc
-                .monitors
-                .notify_all(wake_obj, tid);
-            let _ = shared_arc
-                .monitors
-                .exit(wake_obj, tid);
+            let _ = shared_arc.monitors.notify_all(wake_obj, tid);
+            let _ = shared_arc.monitors.exit(wake_obj, tid);
+            // Leave the termination blocked region (gen-keyed checked drop waits
+            // out any active pause before decrementing the blocked count).
+            drop(term_blk);
         })
         .expect("failed to spawn child Java thread (OS refused; check ulimit / thread count)");
 
