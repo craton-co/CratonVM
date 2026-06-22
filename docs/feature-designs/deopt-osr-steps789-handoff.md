@@ -333,15 +333,30 @@ tests assert the raw 64-bit word (`get_local_raw`), not the NaN-boxed `Value` ki
 `build_deopt_frame_inner` with long+float+double + cat-2 collapse alignment);
 gate-off byte-identical **by construction** (deopt-real off ⇒ no snapshot emit ⇒
 `deopt_points` empty ⇒ `can_deopt_resume` false, `local_kinds` empty, frame size
-unchanged). The through-JIT runtime deopt-resume of a cat-2/FP method remains
-**infra-blocked** (same as the int pilot: no deterministic in-process BCE-deopt
-trigger), so the live proof is the gate-off bt18 golden + gate-on no-crash soak,
-plus the `CRATONVM_DBG_DEOPT` reconstruction trace.
+unchanged).
 
-**Remaining P2 follow-ups:** typed operand-stack cat-2/FP (no width source for the
-stack; canonically empty at BCE/OSR boundaries, so deferred); register-resident
-*oop* typing (currently re-runs); the eager-deopt differential verifier
-(`CRATONVM_DEOPT_VERIFY`) as the CI bar for flipping families on.
+**✅ Through-JIT deopt validation — DONE (`CRATONVM_DEOPT_EAGER`).** The
+"infra-blocked, no deterministic BCE-deopt trigger" gap is closed: under
+`CRATONVM_DEOPT_EAGER` + `deopt_real`, the backend records a reason-2 snapshot at
+the first loop header and emits an unconditional branch to the deopt stub at
+`pc_to_native[pc]` (not coupled to the speculative-BCE guard, so it fires on any
+loop). SEPARATE-PROCESS differential (the read-once-gate blocker): `NoArrayDeopt`
+(long/double/float accumulator loops) under EAGER reconstructs `Long(499500)` /
+`Double` / `Float` at the loop header (DBG_DEOPT trace) and under
+EAGER+`OSR_EXIT_TRANSFER` USES it (60000 transfers) → result == HotSpot == gate-off
+(a wrong cat-2/FP reconstruction would corrupt it). bt18=68332206 gate-off. The
+cat-2/FP snapshot+XMM-spill+resolve+reconstruct+use chain is now proven end-to-end
+through the live JIT.
+
+**Remaining P2 follow-ups (genuinely deferred):** (a) typed operand-stack cat-2/FP
+**RESUME** — FU2 made it SOUND (wide/FP methods re-run their non-oop stacks, never
+mistype); resuming needs a per-bci operand-stack type-flow analysis (model each
+opcode's stack effect) — low ROI for the gated OSR-exit path + simulator-bug risk,
+so left as the sound conservative behavior. (b) register-resident *oop* typing —
+DONE (Inc 6 `RegisterRef`), though the oop *mask* not marking a ref at a bci still
+falls to re-run. (c) **production default-on flip** — blocked on moving GC: needs
+precise OSR-frame tracking (`CRATONVM_SHADOW_OSR_TRACK`), which regresses bt18
+(conservative-pin × precise-move); co-scheduled with the precise-JIT-maps work.
 
 **Step 9 — DONE (de-speculation wiring + compilation-epoch staleness guard; 2026-06-21).** Branch `feat/deopt-osr-epoch-invalidation` off dev `3c9b628a`. The real-frame-deopt / OSR-exit resume sink (`execute_jit_call`, `vm/src/runtime/interpreter.rs`) now routes through a new `real_frame_deopt_resume_and_despeculate` helper:
 
