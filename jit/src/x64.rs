@@ -11920,8 +11920,20 @@ impl Compiler {
         // still issue the helper call.
         skip_post_init_helper: bool,
     ) {
-        // Object total size (header + fields*8). Computed at compile time.
-        let total_size = HEADER_SIZE + num_fields * SLOT_SIZE;
+        // Compact reference-field layout: when a per-class layout is registered
+        // for exactly this field count, allocate the packed body size and mark
+        // the object compact (array_length = body bytes, GC_FLAG_COMPACT) inline
+        // — no helper call, no per-alloc layout lookup. `class_layout` here runs
+        // once at JIT-compile time, not per allocation.
+        let compact_body: Option<usize> = if cratonvm_types::compact_ref_fields_enabled() {
+            cratonvm_types::class_layout(class_id_raw)
+                .filter(|l| l.field_count() == num_fields)
+                .map(|l| l.body_size as usize)
+        } else {
+            None
+        };
+        // Object total size (header + body). Computed at compile time.
+        let total_size = HEADER_SIZE + compact_body.unwrap_or(num_fields * SLOT_SIZE);
         // Cast: value to i32 (encoding immediate/displacement)
         let cursor_off = self.helpers.tlab_cursor_offset_in_thread as i32;
         // Cast: value to i32 (encoding immediate/displacement)
@@ -12039,7 +12051,13 @@ impl Compiler {
         // (and the four array_length bytes) explicitly. Two extra dwords
         // per `new` is negligible vs. the safety guarantee.
         self.emit_mov_dword_mem_disp32_imm32(R11, 4, 0);
-        self.emit_mov_dword_mem_disp32_imm32(R11, 12, 0);
+        // offset 12: array_length. For a compact object this carries the body
+        // size in bytes (object_body_size reads it); a legacy object writes 0.
+        self.emit_mov_dword_mem_disp32_imm32(
+            R11,
+            12,
+            compact_body.map(|b| b as i32).unwrap_or(0),
+        );
         // Layout reminder (from `types/src/heap_types.rs`):
         //   off 16: num_slots (u32) — Object kind only; arrays use
         //   array_length at offset 12, but `new` only allocates Objects.
@@ -12048,6 +12066,17 @@ impl Compiler {
             16,
             num_fields as i32, // Cast: x86-64 immediate encoding
         );
+        // Compact object: set GC_FLAG_COMPACT (bit 2) in gc_flags (header byte
+        // 21) so the heap/GC treat it as compact. Write a dword at offset 20
+        // (gc_age=0, gc_flags=COMPACT, _gc_reserved=0); legacy objects leave it
+        // TLAB-zeroed. GC_FLAG_COMPACT (0x04) << 8 == 0x400 places it at byte 21.
+        if compact_body.is_some() {
+            self.emit_mov_dword_mem_disp32_imm32(
+                R11,
+                20,
+                (cratonvm_types::GC_FLAG_COMPACT as i32) << 8,
+            );
+        }
 
         // Commit the bump LAST: [R10 + cursor_off] = RAX. This publishes the
         // object's end as the new cursor (and, transitively, the object's
@@ -22352,17 +22381,17 @@ impl Compiler {
                         // synthesising it would require per-field descriptor
                         // plumbing that isn't currently in `new_info`.
                         let total_size = HEADER_SIZE + num_fields * SLOT_SIZE;
+                        // `total_size` here is the legacy upper bound used only
+                        // for the <=256 inline-eligibility gate; the compact body
+                        // is smaller, so a legacy fit implies a compact fit.
+                        // `emit_inline_tlab_new` computes the real compact size +
+                        // writes array_length/GC_FLAG_COMPACT inline.
                         let can_inline = self.helpers.get_current_thread != 0
                             && self.helpers.tlab_post_init != 0
                             && self.helpers.new_object != 0
                             && total_size <= 256
                             && self.needs_heap // need vm_ptr in heap_local slot
-                            && std::env::var_os("CRATONVM_JIT_DISABLE_INLINE_NEW").is_none()
-                            // Compact layout: the object's true size is the
-                            // packed body, not `num_fields * SLOT_SIZE`. Route to
-                            // the `jit_new_object` helper (compact-aware sizing
-                            // via `try_alloc_object_full`).
-                            && !cratonvm_types::compact_ref_fields_enabled();
+                            && std::env::var_os("CRATONVM_JIT_DISABLE_INLINE_NEW").is_none();
 
                         // Round-8 wave-3: defensive callee-saved spill
                         // before the `new` safepoint (both inline TLAB

@@ -1513,7 +1513,24 @@ pub unsafe extern "C" fn jit_post_tlab_init(
     // into the next object's payload — surfacing as ECJ's
     // HashtableOfInt.put `/by zero` on a zero-length keyTable.
     *(raw_ptr.add(4) as *mut u32) = 0;
-    *(raw_ptr.add(12) as *mut u32) = 0;
+    // Compact reference-field layout: array_length (off 12) carries the body
+    // size in bytes and gc_flags (off 21) gets GC_FLAG_COMPACT — matching the
+    // inline header the JIT already wrote (idempotent), and required on the
+    // non-skip path so the helper does not clobber them back to legacy.
+    let compact_body = if cratonvm_types::compact_ref_fields_enabled() {
+        cratonvm_types::class_layout(class_id_raw as u32)
+            .filter(|l| l.field_count() == num_fields as usize)
+            .map(|l| l.body_size)
+    } else {
+        None
+    };
+    if let Some(body) = compact_body {
+        *(raw_ptr.add(12) as *mut u32) = body;
+        // gc_flags byte at offset 21 (leave gc_age@20 / _gc_reserved@22-23 zero).
+        *(raw_ptr.add(21) as *mut u8) = cratonvm_types::GC_FLAG_COMPACT;
+    } else {
+        *(raw_ptr.add(12) as *mut u32) = 0;
+    }
     let hash = vm.heap.next_identity_hash();
     *(raw_ptr.add(8) as *mut i32) = hash;
     *(raw_ptr.add(16) as *mut u32) = num_fields as u32;
