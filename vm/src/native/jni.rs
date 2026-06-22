@@ -5911,15 +5911,22 @@ extern "C" fn jni_get_env(_vm: JavaVM, env: *mut *mut std::ffi::c_void, _version
     JNI_OK
 }
 
-/// Write the process-global `JNIEnv*` (function table) into `*penv`, if non-null.
+/// Write the process-global `JNIEnv*` into `*penv`, if non-null.
+///
+/// `JNIEnv` is a pointer-to-pointer-to-function-table (`*const *const usize`):
+/// native code dereferences it twice — `(*env)[slot]`. We therefore hand back
+/// [`get_jni_env`] (`&JNI_TABLE_PTR`), NOT the table-array pointer
+/// `JNI_TABLE_PTR.load()` itself, which is one indirection too shallow and would
+/// make `(*env)[slot]` read a function's code bytes as a slot pointer (the
+/// historical `AttachCurrentThread` stub had this bug, harmless only because no
+/// caller ever drove the table through the attach env).
 fn write_jni_env(penv: *mut *mut std::ffi::c_void) {
     if penv.is_null() {
         return;
     }
-    init_jni_table();
-    let table = JNI_TABLE_PTR.load(std::sync::atomic::Ordering::Acquire);
+    let env = get_jni_env();
     unsafe {
-        *penv = table as *mut std::ffi::c_void;
+        *penv = env as *mut std::ffi::c_void;
     }
 }
 
