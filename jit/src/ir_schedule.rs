@@ -36,6 +36,37 @@ pub struct Schedule {
     pub blocks: Vec<Block>,
     /// Maps NodeId → block index.
     pub node_to_block: Vec<usize>,
+    /// Dominator relation over the block CFG: `dom[b][d]` is true iff block `d`
+    /// dominates block `b`. Retained from the scheduler's own
+    /// `compute_dominators` (it was previously dropped) so callers — notably the
+    /// guard-surviving scalar-replacement producer — can prove that a value's
+    /// defining block always executes before a deopt point.
+    pub dom: Vec<Vec<bool>>,
+}
+
+impl Schedule {
+    /// True iff `node` is computed in a block that **strictly** dominates
+    /// `block` (a different block on every path to `block`). Used by the deopt
+    /// producer to prove a scalar-replaced object's `Op::New` / field stores
+    /// have definitely executed before a deopt point. Conservative: a node in
+    /// the *same* block as `block` returns `false` even when it is textually
+    /// earlier — v1 does not reason about intra-block order (a block's data
+    /// nodes are topologically, not program, ordered, and a div guard need not
+    /// be memory-ordered against a field store), so same-block bails to the
+    /// safe whole-method re-run. Unplaced (`usize::MAX`) nodes return `false`.
+    pub fn node_strictly_dominates_block(&self, node: NodeId, block: usize) -> bool {
+        let nb = match self.node_to_block.get(node as usize) {
+            Some(&b) if b != usize::MAX => b,
+            _ => return false,
+        };
+        nb != block
+            && self
+                .dom
+                .get(block)
+                .and_then(|row| row.get(nb))
+                .copied()
+                .unwrap_or(false)
+    }
 }
 
 // ── Scheduler ────────────────────────────────────────────────────────
@@ -193,6 +224,7 @@ pub fn schedule(graph: &Graph) -> Schedule {
     Schedule {
         blocks,
         node_to_block,
+        dom,
     }
 }
 

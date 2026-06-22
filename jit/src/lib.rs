@@ -861,6 +861,19 @@ pub fn deopt_real_enabled() -> bool {
     *CACHE.get_or_init(|| std::env::var_os("CRATONVM_DEOPT_REAL").is_some())
 }
 
+/// activate-ir-optimizer Front 3.2: guard-surviving scalar replacement
+/// (`CRATONVM_SCALAR_DEOPT`, default-OFF, read-once). When ON *and*
+/// `deopt_real_enabled()`, the IR lowerer emits a `FrameValue::VirtualObject`
+/// for a scalar-replaced object that is live at a deopt point (instead of
+/// `Undefined` → whole-method re-run), so a precise resume re-materializes it via
+/// `materialize_virtual_objects`. Gated by BOTH flags because it only has effect
+/// on the precise-resume path (itself `deopt_real`-gated); OFF ⇒ the lowerer is
+/// passed `sr_map = None` ⇒ byte-identical to the prior producer.
+pub fn scalar_deopt_enabled() -> bool {
+    static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| std::env::var_os("CRATONVM_SCALAR_DEOPT").is_some())
+}
+
 /// deopt-osr: CI/test gate for the eager-deopt differential verifier
 /// (`CRATONVM_DEOPT_VERIFY`, default-OFF). Read-once cached. When ON, every
 /// eligible guard/loop boundary deopts, reconstructs the interpreter frame, and
@@ -4149,6 +4162,91 @@ fn apply_ea_to_ir(
     }
 }
 
+/// Build the [`ir_lower::ScalarReplacementMap`] that drives guard-surviving
+/// scalar replacement (Front 3.2): for each scalar-replaced object, capture the
+/// metadata the deopt producer needs to emit a `FrameValue::VirtualObject`
+/// (`class_id`/`num_fields`/per-field value nodes/eliminated stores), keyed by
+/// the IR `NodeId` of the eliminated `Op::New`. Sourced entirely from
+/// `ea_result` + `id_map`, so it is order-independent w.r.t. `apply_ea_to_ir`
+/// (which only mutates the graph). An object whose `Op::New` or any *stored*
+/// field value cannot be mapped to an IR node is **omitted** — the producer then
+/// leaves its slot `Undefined` (safe whole-method re-run) rather than emit a
+/// partial/garbage object. Only called when `scalar_deopt_enabled() &&
+/// deopt_real_enabled()`.
+fn build_scalar_replacement_map(
+    ir_graph: &ir::Graph,
+    id_map: &[escape_analysis::NodeId],
+    ea_result: &escape_analysis::EscapeAnalysisResult,
+) -> ir_lower::ScalarReplacementMap {
+    let mut reverse_map: HashMap<escape_analysis::NodeId, ir::NodeId> = HashMap::new();
+    for (ir_id, &ea_id) in id_map.iter().enumerate() {
+        if ea_id != usize::MAX {
+            reverse_map.insert(ea_id, ir_id as ir::NodeId);
+        }
+    }
+    // Control input (slot 0) of a node, used to recover a node's block for the
+    // dominance gate AFTER the node itself is marked `Op::Dead` (its inputs are
+    // cleared then, but the captured control node stays live). MUST be called
+    // before `apply_ea_to_ir`.
+    let ctrl_of = |n: ir::NodeId| -> Option<ir::NodeId> {
+        ir_graph
+            .nodes
+            .get(n as usize)
+            .and_then(|node| node.inputs.first().copied())
+            .filter(|&c| c != ir::NO_NODE)
+    };
+    let mut objects: HashMap<ir::NodeId, ir_lower::VirtualObjectInfo> = HashMap::new();
+    'obj: for info in &ea_result.scalar_replaceable {
+        let ir_new = match reverse_map.get(&info.alloc_node) {
+            Some(&id) => id,
+            None => continue,
+        };
+        // Control of the allocation — bail (omit) if it has none (hand-built /
+        // malformed), so the producer can't emit without a dominance anchor.
+        let new_ctrl = match ctrl_of(ir_new) {
+            Some(c) => c,
+            None => continue,
+        };
+        // Per-field IR value node. A `None` EA entry is a never-stored field
+        // (zero default). A `Some(ea)` that fails to map back to an IR node means
+        // we cannot reconstruct that field — omit the whole object (safe).
+        let mut field_values: Vec<Option<ir::NodeId>> = Vec::with_capacity(info.field_values.len());
+        for fv in &info.field_values {
+            match fv {
+                None => field_values.push(None),
+                Some(ea) => match reverse_map.get(ea) {
+                    Some(&ir_id) => field_values.push(Some(ir_id)),
+                    None => continue 'obj,
+                },
+            }
+        }
+        // Capture each eliminated store's control node (its block). A store with
+        // no resolvable control omits the object (can't prove dominance).
+        let mut store_ctrls: Vec<ir::NodeId> = Vec::with_capacity(info.eliminated_stores.len());
+        for ea in &info.eliminated_stores {
+            let ir_store = match reverse_map.get(ea) {
+                Some(&id) => id,
+                None => continue, // a store with no IR node can't have executed observably
+            };
+            match ctrl_of(ir_store) {
+                Some(c) => store_ctrls.push(c),
+                None => continue 'obj,
+            }
+        }
+        objects.insert(
+            ir_new,
+            ir_lower::VirtualObjectInfo {
+                class_id: info.class_id,
+                num_fields: info.num_fields,
+                field_values,
+                new_ctrl,
+                store_ctrls,
+            },
+        );
+    }
+    ir_lower::ScalarReplacementMap { objects }
+}
+
 // ---------------------------------------------------------------------------
 // Compilation entry point
 // ---------------------------------------------------------------------------
@@ -5012,6 +5110,13 @@ fn try_compile_inner(
             } else {
                 ir_optimize::optimize(&mut graph);
 
+                // Guard-surviving scalar replacement (Front 3.2): metadata for
+                // scalar-replaced objects so the IR lowerer can emit a
+                // `FrameValue::VirtualObject` at a deopt point. Populated from EA
+                // below, only when `CRATONVM_SCALAR_DEOPT` + `CRATONVM_DEOPT_REAL`
+                // are both on; otherwise stays `None` ⇒ byte-identical lowering.
+                let mut sr_map: Option<ir_lower::ScalarReplacementMap> = None;
+
                 // --- Escape analysis (Phase 41 + G46 wiring) ---
                 // Convert IR graph to escape analysis graph, run analysis,
                 // and apply scalar replacement / lock elision to the IR graph.
@@ -5046,6 +5151,15 @@ fn try_compile_inner(
                     }
                     if !ea_result.scalar_replaceable.is_empty() || !ea_result.elide_locks.is_empty()
                     {
+                        // Capture guard-surviving-SR metadata (gated) BEFORE
+                        // `apply_ea_to_ir` marks the News/stores dead and clears
+                        // their (control) inputs — the dominance gate needs them.
+                        if scalar_deopt_enabled()
+                            && deopt_real_enabled()
+                            && !ea_result.scalar_replaceable.is_empty()
+                        {
+                            sr_map = Some(build_scalar_replacement_map(&graph, &id_map, &ea_result));
+                        }
                         apply_ea_to_ir(&mut graph, &id_map, &ea_result);
                     }
                 }
@@ -5061,12 +5175,13 @@ fn try_compile_inner(
                     .any(|n| matches!(n.op, ir::Op::New { .. } | ir::Op::NewArray { .. }));
                 if !has_live_new {
                     let schedule = ir_schedule::schedule(&graph);
-                    if let Some(mut compiled) = ir_lower::lower(
+                    if let Some(mut compiled) = ir_lower::lower_with_scalar_deopt(
                         &graph,
                         &schedule,
                         num_params,
                         cached.max_locals as usize,
                         helpers,
+                        sr_map.as_ref(),
                     ) {
                         // Gap B: attach the leaked `JitInvokeInfo` boxes/strings
                         // so the `info_ptr`s baked into each `Op::Call` stay valid

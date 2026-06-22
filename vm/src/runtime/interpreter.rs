@@ -8222,6 +8222,12 @@ fn build_deopt_frame_inner(
         .iter()
         .chain(rframe.stack.iter())
         .any(|v| matches!(v, FrameValue::VirtualObject(_) | FrameValue::VirtualObjectRef(_)));
+    if has_virtual && std::env::var_os("CRATONVM_DBG_SCALAR_DEOPT").is_some() {
+        eprintln!(
+            "[DBG_SCALAR_DEOPT] build_deopt_frame_inner: materializing virtual object(s) at bci={}",
+            rframe.bci
+        );
+    }
     let materialized_frame;
     let rframe: &cratonvm_jit::deopt::ReconstructedFrame = if has_virtual {
         // Elided-monitor gate. Escape analysis performs lock elision over
@@ -8234,14 +8240,18 @@ fn build_deopt_frame_inner(
         //      under scalar replacement of `this`/the receiver).
         // The residual case — a `synchronized(obj)` *block* over a scalar-replaced
         // object in a non-synchronized method — is NOT detectable from the
-        // reconstructed frame alone (an elided monitor leaves no trace). It is
-        // unreachable today: no production emitter writes `VirtualObject` deopt
-        // slots (the x64 snapshot records only Register/StackSlot/StackSlotRef
-        // provenance), so `has_virtual` is structurally false in production. When
-        // the x64 virtual-slot emitter lands it MUST carry an "elided monitor
-        // present" flag on the deopt point for this sink to bail on; that flag is
-        // the proper fix and is scoped with that emitter. This whole path is also
-        // `CRATONVM_DEOPT_REAL`-gated (default-off).
+        // reconstructed frame alone (an elided monitor leaves no trace). The IR
+        // guard-surviving-SR producer (`ir_lower::frame_value_for_object`, gated by
+        // `CRATONVM_SCALAR_DEOPT` + `CRATONVM_DEOPT_REAL`) now DOES write
+        // `VirtualObject` deopt slots, so `has_virtual` can be true under that gate.
+        // The two layers above (a monitor-holding frame and an `ACC_SYNCHRONIZED`
+        // method both bail) cover the elision cases the IR path can produce today:
+        // the IR escape analysis does not emit `synchronized`-block lock elision on
+        // this path, so the residual block-elision case does not arise. A future
+        // emitter that elides a `synchronized(obj)` block over a scalar-replaced
+        // object MUST carry an "elided monitor present" flag on the deopt point for
+        // this sink to bail on. This whole path is `CRATONVM_DEOPT_REAL`-gated
+        // (default-off).
         if cached.is_synchronized {
             return None;
         }
