@@ -563,18 +563,25 @@ Author note: this doc is grounded in a read of `gc/src/{g1,g1_concurrent,zgc,zgc
       clears every self-forward's `forwarding_ptr` after merging the shards (the
       `key == value` loop). This was the "dangling refs on humongous-ref-array"
       symptom that originally gated mixed→serial.
-    - **Defect 2 — rare non-deterministic young-evac corruption — 🔴 OPEN.** A
-      separate race in `young_collection_parallel`'s shared closure
-      (`run_worker`/`evacuate`/`process_object` — work-queue / atomic-forwarding /
-      termination concurrency) intermittently corrupts a still-live object under
-      frequent young GCs at small heaps. Repro `SteadyChurn @16m --nojit -Xmx16m
-      SteadyChurn 2000000` under `CRATONVM_G1_PARALLEL_EVAC=1`: ~1 in 8 runs throws
-      `Exception in thread "main" java/lang/Object` (a zeroed/stale header on a
-      node of the held linked list); correct at 24/32/48m and **always correct
-      serially**. This is NOT defect 1 (no to-space exhaustion) and reproduces with
-      `--nojit` (no JIT roots), so it is a genuine parallel-evacuator data race —
-      the long-suspected pre-existing race (`task_58d60f7a` family), now pinned to a
-      concrete cheap repro.
+    - **Defect 2 — parallel evacuator drops a root-referenced object — 🔴 OPEN,
+      now ROOT-CAUSED (not a race; a forwarding-design flaw).** Repro
+      `CRATONVM_G1_PARALLEL_EVAC=1 … --nojit -Xmx16m SteadyChurn 2000000`: ~1 in 8
+      runs throws `Exception in thread "main" java/lang/Object` (a zeroed/reused
+      header); correct at 24/32/48m and **always correct serially**. **Root
+      cause:** the parallel evacuator dedups via the PERSISTENT
+      `ObjectHeader.forwarding_ptr` (serial uses the per-cycle `pointer_map`); a
+      fast-path hit returns a forward — possibly left over from a PRIOR cycle —
+      WITHOUT recording it in `pointer_map`, so the VM's `update_all_roots`
+      (which remaps the real frame locals via `pointer_map`) cannot remap a root
+      that resolved through the header. The frame local stays stuck on the
+      from-space object, surviving only via the `forwarding_ptr` redirect until
+      its region is reused → corruption. Invisible to V7b (heap-only; the heap is
+      consistent at collection end — only the roots are stuck). Localized with a
+      gated `CRATONVM_G1_DBG_HEADERS` verifier; THREE naive fixes all fail (clear
+      `forwarding_ptr` start/end = 28/30 bad; record fast-path hits = 8/30).
+      Full writeup + the proper-fix sketch (a per-cycle forwarding redesign):
+      `docs/known-issues/g1-parallel-evac-persistent-forwarding-root-remap.md`
+      (`task_58d60f7a` family; branch `feat/g1-parallel-evac-race`).
     - **Consequence:** because defect 2 lives in the shared `parallel_evacuate`
       closure that both young and mixed parallel paths drive, **mixed GC stays on
       the SERIAL evacuator** (the earlier plan to un-gate it was reverted — its
