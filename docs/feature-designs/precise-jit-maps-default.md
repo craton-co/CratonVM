@@ -200,10 +200,19 @@ not behaviour flips.
   (The full app-gauntlet sweep — Step 4 — remains the final bar before the
   *family* is declared retired; this flip satisfies the doc's Step-2 gate.)
 - **Step 3 — Coverage-gated pin (robustness, no behaviour change under
-  non-moving sweep).** Wire `fully_oop_covered` into the GC so un-covered
-  frames pin conservatively; assert via `CRATONVM_DBG_VERIFY_OOP_MAPS`-style
-  check that the precise map covers every conservatively-found oop. Build-green;
-  byte-identical on the current default (the backstop already pins).
+  non-moving sweep). ✅ DONE** (2026-06-21). Two default-OFF, read-only knobs in
+  `scan_one_frame_precise` (`conservative_roots.rs`), byte-identical on the
+  default path: (a) `CRATONVM_PRECISE_COVERAGE_PIN` surfaces
+  `CompiledMethod::fully_oop_covered` at GC scan, counting precise frames that
+  are NOT fully covered (the backstop already pins them, so this is visibility +
+  the explicit scaffold for the future moving-path "pin-don't-relocate"
+  policy); (b) `CRATONVM_DBG_VERIFY_OOP_MAPS` diffs the union of a method's oop
+  maps against the conservative band and logs any in-band oop no map records —
+  the completeness oracle. CAVEAT documented in-code: the chain-entry band spans
+  nested JIT→JIT callees (whose oops are legitimately absent from the boundary
+  method's maps), so the oracle is sharpest for leaf-ish compiled frames — the
+  register/spill-resident root class, e.g. the new
+  `gc-stress-bintrees ... jit-frame-stale-root` known-issue and `codePointAt`.
 - **Step 4 — App-gauntlet GC-root acceptance sweep.** Add a
   `test-infra/regression-pool` lane (or extend the existing one) that runs the
   A1–A4 repros + the named register-invisibility apps with precise on vs

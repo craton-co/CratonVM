@@ -1256,6 +1256,105 @@ fn remap_one_jit_frame(
 /// keeps the walker functional even when the compiler has only
 /// populated oop maps at a subset of safepoints — a realistic state
 /// during the staged rollout described in `docs/roadmap.md` NEW-12.
+// ---------------------------------------------------------------------------
+// Step 3 (docs/feature-designs/precise-jit-maps-default.md) — coverage
+// visibility + a completeness oracle. Both gates are default-OFF and read-only,
+// so the default GC scan is unchanged (two cached-bool branches per frame).
+// ---------------------------------------------------------------------------
+
+/// `CRATONVM_DBG_VERIFY_OOP_MAPS` — when set, each precise-frame GC scan also
+/// runs [`verify_precise_covers_conservative`], logging any in-band word that
+/// looks like a live oop but is not recorded by ANY of the method's oop maps.
+/// Default-off; the normal union scan still runs, so behaviour is unchanged.
+/// This is the completeness oracle the design doc wants before the conservative
+/// backstop could ever be lifted for a moving collector.
+#[inline]
+fn verify_oop_maps_enabled() -> bool {
+    use std::sync::OnceLock;
+    static E: OnceLock<bool> = OnceLock::new();
+    *E.get_or_init(|| std::env::var_os("CRATONVM_DBG_VERIFY_OOP_MAPS").is_some())
+}
+
+/// `CRATONVM_PRECISE_COVERAGE_PIN` — when set, surface
+/// [`cratonvm_jit::CompiledMethod::fully_oop_covered`] at GC scan time: count
+/// (and rate-limit log) precise frames that are NOT fully covered. On the
+/// non-moving sweep the conservative backstop already pins every found oop, so
+/// this is byte-identical today; it is the explicit visibility + scaffold for
+/// the future moving path, where an un-covered frame must be PINNED, not
+/// relocated. Default-off.
+#[inline]
+fn coverage_pin_enabled() -> bool {
+    use std::sync::OnceLock;
+    static E: OnceLock<bool> = OnceLock::new();
+    *E.get_or_init(|| std::env::var_os("CRATONVM_PRECISE_COVERAGE_PIN").is_some())
+}
+
+/// Count of precise frames observed NOT `fully_oop_covered` during GC scans
+/// while `CRATONVM_PRECISE_COVERAGE_PIN` is on. Diagnostic only.
+static UNCOVERED_PRECISE_FRAMES: AtomicUsize = AtomicUsize::new(0);
+/// Shared rate-limit for the Step-3 diagnostic logs (so neither knob spams).
+static STEP3_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
+const STEP3_LOG_CAP: usize = 64;
+
+/// Diagnostic read of the uncovered-precise-frame counter (see
+/// [`coverage_pin_enabled`]). 0 when the knob was never on.
+pub fn uncovered_precise_frame_count() -> usize {
+    UNCOVERED_PRECISE_FRAMES.load(Ordering::Relaxed)
+}
+
+/// Step 3 completeness oracle — for one precise frame, diff the union of the
+/// method's oop-map slots against a conservative sweep of the same stack band,
+/// logging (rate-limited) any band word that looks like a live oop but is not
+/// recorded by ANY map. Read-only.
+///
+/// CAVEAT: a `JIT_ENTRY_CHAIN` entry is pushed only at the interpreter→JIT
+/// boundary, so the `[scanner_sp, frame_base)` band also spans this method's
+/// *nested JIT→JIT callees*. Their oops are correctly absent from THIS method's
+/// maps and therefore show here as "unmapped" — expected, not a gap. The signal
+/// is sharpest for leaf-ish compiled frames (the register/spill-resident root
+/// class, e.g. the bintrees-`main`-reads-`args` and `codePointAt` families).
+fn verify_precise_covers_conservative(
+    info: PreciseFrameInfo,
+    cm: &cratonvm_jit::CompiledMethod,
+    heap: &VmHeap,
+) {
+    let mut mapped: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    for map in &cm.oop_maps {
+        for &off in &map.frame_slot_offsets {
+            mapped.insert((info.frame_base as isize + off as isize) as usize);
+        }
+    }
+    let scanner_sp = current_stack_pointer();
+    let lo = scanner_sp.min(info.frame_base);
+    let hi = scanner_sp.max(info.frame_base);
+    let mut addr = (lo + 7) & !7usize; // align up to 8
+    while addr + 8 <= hi {
+        // SAFETY: `[scanner_sp, frame_base)` is the calling thread's own live
+        // stack band — the same region `scan_one_frame` reads — and `addr` is
+        // 8-byte aligned and bounded by `hi`.
+        let qword = unsafe { (addr as *const usize).read() };
+        if heap.is_object_address(qword).is_some() && !mapped.contains(&addr) {
+            if STEP3_LOG_COUNT.fetch_add(1, Ordering::Relaxed) < STEP3_LOG_CAP {
+                let delta = (addr as isize) - (info.frame_base as isize);
+                eprintln!(
+                    "[VERIFY-OOP-MAPS] unmapped in-band oop: code@{:p} frame_base={:#x} \
+                     slot=[rbp{}{:#x}] addr={:#x} val={:#x} maps={} covered={} \
+                     (NB band may include nested-JIT-callee slots)",
+                    info.entry_ptr,
+                    info.frame_base,
+                    if delta >= 0 { "+" } else { "-" },
+                    delta.unsigned_abs(),
+                    addr,
+                    qword,
+                    cm.oop_maps.len(),
+                    cm.fully_oop_covered,
+                );
+            }
+        }
+        addr += 8;
+    }
+}
+
 fn scan_one_frame_precise(info: PreciseFrameInfo, heap: &VmHeap, out: &mut Vec<ObjectRef>) {
     // SAFETY: `info.compiled_method` was populated from a live
     // `&CompiledMethod` at push time, and the chain is popped before
@@ -1263,6 +1362,24 @@ fn scan_one_frame_precise(info: PreciseFrameInfo, heap: &VmHeap, out: &mut Vec<O
     // alive via Arc for the duration of the call. Reading through
     // the pointer is valid for the lifetime of this function.
     let cm: &cratonvm_jit::CompiledMethod = unsafe { &*info.compiled_method };
+
+    // Step 3 (precise-jit-maps-default.md) — coverage visibility + completeness
+    // oracle. Both gates default-OFF; off → two cached-bool branches and the
+    // scan below is unchanged.
+    if coverage_pin_enabled() && !cm.fully_oop_covered {
+        let n = UNCOVERED_PRECISE_FRAMES.fetch_add(1, Ordering::Relaxed);
+        if n < STEP3_LOG_CAP {
+            eprintln!(
+                "[COVERAGE-PIN] precise frame NOT fully_oop_covered (pinned via backstop): \
+                 code@{:p} maps={}",
+                info.entry_ptr,
+                cm.oop_maps.len(),
+            );
+        }
+    }
+    if verify_oop_maps_enabled() {
+        verify_precise_covers_conservative(info, cm, heap);
+    }
 
     // Without call-frame introspection we can't directly recover the
     // "current" native PC inside the active JIT frame. Two approaches
