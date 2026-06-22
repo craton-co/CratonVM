@@ -153,7 +153,7 @@ Two observable end-states (both are the same bug; timing decides which):
 
 Canonical: object-based binarytrees that accumulates one checksum, `maxDepth` from `args[0]`.
 Minimal repros and clean controls are in
-[`repros/gc-stress-bintrees-main-args/`](repros/gc-stress-bintrees-main-args/).
+[`repros/gc-stress-bintrees-main-args/`](../../known-issues/repros/gc-stress-bintrees-main-args/).
 
 ```bash
 cd docs/known-issues/repros/gc-stress-bintrees-main-args
@@ -248,7 +248,7 @@ experiments were run.
 
 ## Relationship to existing Family-A members
 
-- Closest to **A2** ([reflrepro-register-resident-jit-root-handoff.md](reflrepro-register-resident-jit-root-handoff.md)):
+- Closest to **A2** ([reflrepro-register-resident-jit-root-handoff.md](../../known-issues/reflrepro-register-resident-jit-root-handoff.md)):
   both show `inconsistent header` on the young-sweep walk and are **not** fixed by precise maps. A2's
   repro is reflection / String-array churn; this one is object-graph recursion with a sharp,
   one-opcode trigger (`main` reads `args`) and a clean GC-frequency boundary. They may share a root
