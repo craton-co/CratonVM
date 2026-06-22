@@ -871,6 +871,22 @@ pub fn deopt_verify_enabled() -> bool {
     *CACHE.get_or_init(|| std::env::var_os("CRATONVM_DEOPT_VERIFY").is_some())
 }
 
+/// deopt-osr: the through-JIT BCE-deopt differential trigger (`CRATONVM_DEOPT_EAGER`,
+/// default-OFF, read-once). When ON *and* `deopt_real_enabled()`, the single-pass
+/// backend emits one synthetic UNCONDITIONAL branch to the BCE-guard deopt stub
+/// (reason 2) right after the loop-header snapshot, so a JIT'd speculative-BCE loop
+/// deopts at the loop bci *even when the bounds check passes* — reconstructing the
+/// loop-header frame (its locals, incl. `long`/`double`/`float` accumulators) and
+/// resuming in the interpreter. This is the long-missing end-to-end exercise of the
+/// deopt-EXIT resume: run a program with the gate vs without and compare outputs (a
+/// SEPARATE-PROCESS differential — the read-once gates can't diff in-process); equal
+/// outputs prove the reconstruction + resume are correct. OFF ⇒ no branch ⇒
+/// byte-identical production code.
+pub fn deopt_eager_enabled() -> bool {
+    static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| std::env::var_os("CRATONVM_DEOPT_EAGER").is_some())
+}
+
 /// deopt-osr Step 8 (test trigger): `CRATONVM_OSR_EXIT_TEST` (default-OFF,
 /// read-once). When ON *and* `deopt_real_enabled()`, the single-pass backend
 /// emits one synthetic unconditional OSR-exit branch at a loop header so a JIT'd
