@@ -1168,17 +1168,28 @@ impl G1Collector {
         regions: &mut Vec<G1Region>,
         target_type: RegionType,
         size: usize,
+        cset: &std::collections::HashSet<usize>,
     ) -> Option<*mut u8> {
-        // Try existing regions of this type
+        // CORRECTNESS (evacuation destination must NOT be in the collection set):
+        // a young GC evacuates *all* Survivor regions, so a partially-filled
+        // Survivor region is itself in the CSet; a mixed GC likewise has selected
+        // Old regions in the CSet. Reusing such a region as an evacuation
+        // *destination* copies survivors into a region that Phase 5 then resets
+        // (frees) — the copies are lost and every reference to them is left
+        // dangling (silent live-object loss; the held-tree `got=1` repro). Skip
+        // any CSet region here: young survivors land only in fresh Free regions,
+        // mixed promotions only in non-CSet Old or fresh Free regions — matching
+        // the semi-space "never allocate into from-space" invariant the
+        // generational collector and the Step-9 parallel TLAB path already honour.
         for i in 0..regions.len() {
-            if regions[i].region_type == target_type {
+            if regions[i].region_type == target_type && !cset.contains(&i) {
                 if let Some((ptr, _)) = regions[i].bump_alloc(size, 8) {
                     return Some(ptr);
                 }
             }
         }
 
-        // Allocate a new free region
+        // Allocate a new free region (Free regions are never in the CSet).
         if let Some(idx) = find_free_region(regions) {
             regions[idx].region_type = target_type;
             if target_type == RegionType::Survivor {
@@ -1262,11 +1273,40 @@ impl G1Collector {
                         &mut pointer_map,
                         &mut objects_copied,
                         &mut bytes_copied,
+                        &cset_set,
                     ) {
                         *root = unsafe { ObjectRef::from_raw(new_ptr) };
                         work_list.push(new_ptr);
                     }
                 }
+            }
+        }
+
+        if std::env::var_os("CRATONVM_DBG_JITROOT").is_some() {
+            let mut in_region = 0usize;
+            let mut in_cset = 0usize;
+            for root in roots.iter() {
+                if let Some(idx) = self.region_for_ptr(&regions, root.as_ptr()) {
+                    in_region += 1;
+                    if cset_set.contains(&idx) {
+                        in_cset += 1;
+                    }
+                }
+            }
+            eprintln!(
+                "[JITROOT-G1] roots={} in_region={} in_cset={} cset_len={} copied={}",
+                roots.len(),
+                in_region,
+                in_cset,
+                cset.len(),
+                objects_copied
+            );
+            for &ci in cset.iter().take(8) {
+                let base = regions[ci].data.as_ptr() as usize;
+                eprintln!(
+                    "[JITROOT-G1]   cset region {} type={:?} [{:#x}, {:#x}) cursor={}",
+                    ci, regions[ci].region_type, base, base + regions[ci].cursor, regions[ci].cursor
+                );
             }
         }
 
@@ -1609,6 +1649,7 @@ impl G1Collector {
                         &mut pointer_map,
                         &mut objects_copied,
                         &mut bytes_copied,
+                        &cset_set,
                     ) {
                         *root = unsafe { ObjectRef::from_raw(new_ptr) };
                         work_list.push(new_ptr);
@@ -2160,6 +2201,7 @@ impl G1Collector {
         pointer_map: &mut HashMap<usize, usize>,
         objects_copied: &mut usize,
         bytes_copied: &mut usize,
+        cset: &std::collections::HashSet<usize>,
     ) -> Option<(*mut u8, bool)> {
         let old_addr = old_ptr as usize;
 
@@ -2198,7 +2240,7 @@ impl G1Collector {
             RegionType::Survivor
         };
 
-        let new_ptr = Self::alloc_in_type_locked(regions, dest_type, obj_size)?;
+        let new_ptr = Self::alloc_in_type_locked(regions, dest_type, obj_size, cset)?;
 
         // Copy object data
         unsafe {
@@ -2306,6 +2348,7 @@ impl G1Collector {
                                     pointer_map,
                                     objects_copied,
                                     bytes_copied,
+                                    cset,
                                 ) {
                                     unsafe {
                                         std::ptr::write(slot_ptr as *mut u64, new_ptr as u64);
@@ -2344,6 +2387,7 @@ impl G1Collector {
                                 pointer_map,
                                 objects_copied,
                                 bytes_copied,
+                                cset,
                             ) {
                                 let new_value =
                                     Value::Object(Some(unsafe { ObjectRef::from_raw(new_ptr) }));
@@ -2440,6 +2484,7 @@ impl G1Collector {
                                     pointer_map,
                                     objects_copied,
                                     bytes_copied,
+                                    cset,
                                 ) {
                                     unsafe {
                                         std::ptr::write(slot_ptr as *mut u64, new_ptr as u64);
@@ -2465,6 +2510,7 @@ impl G1Collector {
                                     pointer_map,
                                     objects_copied,
                                     bytes_copied,
+                                    cset,
                                 ) {
                                     let new_value = Value::Object(Some(unsafe {
                                         ObjectRef::from_raw(new_ptr)
@@ -7010,5 +7056,46 @@ mod tests {
 
         assert_eq!(vals_s, vals_p1, "serial vs 1-worker values diverge");
         assert_eq!(vals_s, vals_p8, "serial vs 8-worker values diverge");
+    }
+
+    /// Regression for the serial-G1 evacuate-into-CSet-region bug: a young GC
+    /// evacuates ALL survivor regions, so a partially-filled survivor region is
+    /// itself in the CSet. `alloc_in_type_locked` used to reuse it as an
+    /// evacuation *destination*, so survivors were copied into a region Phase 5
+    /// then reset (freed) — silently dropping live objects and leaving every
+    /// reference dangling (the held-tree `got=1` repro). A held object graph must
+    /// survive REPEATED young GCs fully intact. This drives the SERIAL path
+    /// (`young_collection`; the env flag is unset in tests).
+    #[test]
+    fn held_chain_survives_repeated_young_gc() {
+        let gc = make_collector();
+        let n = 50usize;
+        let head = gc.alloc_object(ClassId::new(1), 1);
+        let mut cur = head;
+        for _ in 1..n {
+            let node = gc.alloc_object(ClassId::new(1), 1);
+            gc.set_field(cur, 0, Value::Object(Some(node)));
+            cur = node;
+        }
+        gc.set_field(cur, 0, Value::Int(999)); // tail marker
+        let mut roots = vec![head];
+        for round in 0..6 {
+            let _ = gc.alloc_object(ClassId::new(9), 8); // a little garbage
+            gc.young_collection(&mut roots, &NoopMonitors);
+            // Walk the whole chain: it must still be exactly `n` nodes ending in
+            // the tail marker — no node lost to an evacuate-into-CSet free.
+            let mut count = 0usize;
+            let mut c = roots[0];
+            loop {
+                count += 1;
+                assert!(count <= n, "round {round}: chain longer than {n}");
+                match gc.get_field(c, 0) {
+                    Value::Object(Some(next)) => c = next,
+                    Value::Int(999) => break,
+                    other => panic!("round {round}: chain broke at node {count} -> {other:?}"),
+                }
+            }
+            assert_eq!(count, n, "round {round}: chain length changed (lost nodes)");
+        }
     }
 }
