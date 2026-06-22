@@ -124,13 +124,22 @@ graph and resumed at the trapping bci instead of bailing to re-run.
   `virtual_resume_blocked_for_synchronized_method`,
   `virtual_shells_survive_forced_gc_during_build`. 31/31 deopt lib tests green;
   gate-off byte-identical.
-- **A4 — differential.** STILL OWED — folded into the `CRATONVM_DEOPT_VERIFY`
-  verifier workstream (the gate `deopt_verify_enabled()` is defined but has no
-  consumer yet). The genuinely bug-catching form is the *eager-deopt differential*
-  (force a deopt at a non-failing guard, reconstruct, compare the
-  reconstructed-interpreter end-result vs the JIT result) — a harness, not a cheap
-  structural check (a structural check would mostly flag *expected* cat-2/FP
-  Unsupported slots as false positives, since those legitimately re-run).
+- **A4 / verifier increment 1 — DONE (2026-06-21, branch `feat/deopt-osr-verifier`).**
+  `deopt_verify_enabled()` now has a consumer: `verify_reconstructed_frame`
+  (pure, unit-tested) runs in `build_deopt_frame_inner` under `CRATONVM_DEOPT_VERIFY`
+  and checks the always-sound structural invariants a map drift most often
+  breaks — slot counts past `max_locals`/`max_stack` (a shifted snapshot), a
+  malformed `VirtualObject` descriptor (declared `num_fields` ≠ `field_values`),
+  and a dangling `VirtualObjectRef`. A violation is reported to stderr and forces
+  the safe re-run (fail-safe). It deliberately does NOT type-check per-slot
+  (cat-2/FP `Unsupported` slots legitimately re-run — flagging them would be a
+  false positive). 4 tests; 35/35 deopt lib tests green; gate-off byte-identical.
+- **A4 / verifier increment 2 — STILL OWED (the eager-deopt differential).** Force
+  a deopt at a *non-failing* guard, reconstruct, and compare the
+  reconstructed-interpreter end-result against the JIT result — the form that
+  catches a *value* drift (right slot count, wrong contents) the structural layer
+  cannot. It needs a forced-deopt injection hook + a side-effect-free (or
+  re-run-safe) method set to compare against; it is a harness, not a cheap check.
 
 **x64-backport Step 5 — `can_deopt_resume` coverage gate DONE (2026-06-21).** At
 x64 finalize `cm.can_deopt_resume = !deopt_points.is_empty() &&
