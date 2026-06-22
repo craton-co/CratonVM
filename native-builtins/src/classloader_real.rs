@@ -432,14 +432,24 @@ pub fn register_classloader_real_natives(r: &mut NativeMethodRegistry) {
         "findLoadedClass",
         "(Ljava/lang/String;)Ljava/lang/Class;",
         |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(Some(Value::Object(None))),
+            };
             let class_name_obj = match args.get(1) {
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(Some(Value::Object(None))),
             };
             let class_name = ctx.read_string(class_name_obj).unwrap_or_default();
             let internal = class_name.replace('.', "/");
-            match ctx.class_id_by_name(&internal) {
-                Some(cid) => Ok(Some(Value::Object(Some(ctx.get_class_mirror(cid))))),
+            // JVMS §5.3 / no-load: report a class only if THIS loader loaded it.
+            // For a user-defined loader this is its own namespace or the classes
+            // it is the recorded defining loader of — so a fresh custom loader
+            // gets null for an app-loaded class and its override-first
+            // redefinition fires. Built-in loaders keep the global (no-load)
+            // lookup. (Shared with the synthetic-mode `cl_find_loaded_class`.)
+            match crate::classloader::find_loaded_class_for_loader(ctx, this, &internal) {
+                Some(mirror) => Ok(Some(Value::Object(Some(mirror)))),
                 None => Ok(Some(Value::Object(None))),
             }
         },
@@ -695,10 +705,23 @@ pub fn register_classloader_real_natives(r: &mut NativeMethodRegistry) {
         "loadClass",
         "(Ljava/lang/String;Z)Ljava/lang/Class;",
         |ctx, args| {
-            // The boolean `resolve` arg (slot 2) is ignored — we always resolve.
-            // Drop it so `cl_real_load_class` sees the `(receiver, name)` shape.
-            let trimmed: Vec<Value> = args.iter().take(2).copied().collect();
-            cl_real_load_class(ctx, &trimmed)
+            // Base `ClassLoader.loadClass(String,boolean)` — resolve arg ignored.
+            // This native stands in for the BASE method only; a subclass override
+            // of loadClass(String,boolean) runs its own bytecode. Reaching here
+            // means base parent-first delegation (the receiver inherits it, or a
+            // subclass override called `super.loadClass(name, resolve)`). Go
+            // STRAIGHT to base delegation — NOT `cl_real_load_class` — so the
+            // override-dispatch is not re-triggered (which would recurse via the
+            // override's `super` call).
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            let name_obj = match args.get(1) {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            cl_real_load_class_base(ctx, this, name_obj)
         },
     );
     r.set_category(__prev_cat);
@@ -706,19 +729,62 @@ pub fn register_classloader_real_natives(r: &mut NativeMethodRegistry) {
 
 /// `ClassLoader.loadClass(String)` for real-JDK mode.
 ///
+/// `ClassLoader.loadClass(String)` is spec'd as `return loadClass(name, false)`.
+/// If the receiver's actual class overrides the protected
+/// `loadClass(String,boolean)` (Spring's `OverridingClassLoader`, OSGi-like and
+/// test-isolation loaders that redefine eligible classes under themselves or
+/// reject filtered names BEFORE parent delegation), dispatch that override
+/// virtually so its custom ordering and defining-loader identity are honored.
+/// Reimplementing base delegation here would resolve the class through the
+/// global/app class store and ignore the user loader entirely.
+///
+/// Otherwise fall back to base parent-first delegation (`cl_real_load_class_base`).
+fn cl_real_load_class(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> cratonvm_types::error::MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let class_name_obj = match args.get(1) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+
+    // Honor a `loadClass(String,boolean)` override (override-first loaders).
+    // `super.loadClass(name, resolve)` from such an override lands on the base
+    // `loadClass(String,boolean)` native (→ `cl_real_load_class_base`), so there
+    // is no recursion back here.
+    if crate::classloader::receiver_overrides_load_class_resolve(ctx, this) {
+        return ctx.invoke_virtual(
+            this,
+            "loadClass",
+            "(Ljava/lang/String;Z)Ljava/lang/Class;",
+            &[Value::Object(Some(class_name_obj)), Value::Int(0)],
+        );
+    }
+
+    cl_real_load_class_base(ctx, this, class_name_obj)
+}
+
+/// Base `ClassLoader.loadClass` parent-first delegation for real-JDK mode
+/// (CratonVM keeps no JDK bytecode for `ClassLoader.loadClass`).
+///
 /// Delegation order (JVMS §5.3 / `ClassLoader.loadClass` contract):
 ///   1. standard VM class loading (bootstrap → platform → app),
 ///   2. if that fails and the receiver is a non-builtin `ClassLoader`
 ///      subclass overriding `findClass`, dispatch the override virtually,
 ///   3. otherwise throw `ClassNotFoundException`.
-fn cl_real_load_class(
+///
+/// Reached when the receiver does NOT override `loadClass(String,boolean)`, and
+/// via `super.loadClass(name, resolve)` (the base native) from a subclass that
+/// wants standard parent-first delegation as its fallback.
+fn cl_real_load_class_base(
     ctx: &mut dyn NativeContext,
-    args: &[Value],
+    this: ObjectRef,
+    class_name_obj: ObjectRef,
 ) -> cratonvm_types::error::MethodCallResult {
-    let class_name_obj = match args.get(1) {
-        Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(Some(Value::Object(None))),
-    };
     let class_name = ctx.read_string(class_name_obj).unwrap_or_default();
     let internal = class_name.replace('.', "/");
 
@@ -731,15 +797,13 @@ fn cl_real_load_class(
     //    `findClass`, the JVM `loadClass` contract requires us to call it.
     //    `invoke_virtual` resolves on the receiver's actual class, so this
     //    dispatches to the subclass's overriding `findClass` bytecode.
-    if let Some(Value::Object(Some(this))) = args.first() {
-        if crate::classloader::receiver_overrides_find_class(ctx, *this) {
-            return ctx.invoke_virtual(
-                *this,
-                "findClass",
-                "(Ljava/lang/String;)Ljava/lang/Class;",
-                &[Value::Object(Some(class_name_obj))],
-            );
-        }
+    if crate::classloader::receiver_overrides_find_class(ctx, this) {
+        return ctx.invoke_virtual(
+            this,
+            "findClass",
+            "(Ljava/lang/String;)Ljava/lang/Class;",
+            &[Value::Object(Some(class_name_obj))],
+        );
     }
 
     // 3. Genuinely not found and no user override — throw CNFE per spec.

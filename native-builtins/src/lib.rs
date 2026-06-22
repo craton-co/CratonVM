@@ -19018,12 +19018,19 @@ fn native_classloader_find_loaded_class(
         _ => return Ok(Some(Value::Object(None))),
     };
     let internal_name = name.replace('.', "/");
-    // Use class_id_by_name to check if already loaded (doesn't trigger loading)
-    match ctx.class_id_by_name(&internal_name) {
-        Some(class_id) => {
-            let mirror = ctx.get_class_mirror(class_id);
-            Ok(Some(Value::Object(Some(mirror))))
-        }
+
+    // JVMS §5.3: `findLoadedClass0(name)` reports a class only if THIS loader
+    // loaded it — NOT one some OTHER loader (typically the application loader)
+    // happens to have loaded. Loader-scoped for user-defined loaders, global for
+    // built-in loaders. (Shared with the public `findLoadedClass` natives so all
+    // entry points agree; in real-JDK mode the public `findLoadedClass` native
+    // usually shadows this one, but a direct `findLoadedClass0` call must match.)
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    match crate::classloader::find_loaded_class_for_loader(ctx, this, &internal_name) {
+        Some(mirror) => Ok(Some(Value::Object(Some(mirror)))),
         None => Ok(Some(Value::Object(None))),
     }
 }

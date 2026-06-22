@@ -7678,7 +7678,13 @@ fn cached_annotation_proxy(
     {
         return cached;
     }
-    let proxy = create_annotation_proxy(ctx, ann);
+    // Resolve Class-valued members through the declaring class's defining loader
+    // (HotSpot's `AnnotationParser` "container"), so classloader-isolation loaders
+    // (e.g. Spring's OverridingClassLoader / FilteringClassLoader) yield a
+    // deferred `TypeNotPresentException` for filtered types. `None` for built-in
+    // loaders keeps the global resolution.
+    let container_loader = crate::classloader::defining_loader_for(queried_class_id.as_u32());
+    let proxy = create_annotation_proxy(ctx, ann, container_loader);
     *annotation_proxy_cache()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -7778,11 +7784,80 @@ fn wrap_annotation_in_real_proxy(
     Some(real)
 }
 
+/// Build a `java.lang.TypeNotPresentException(typeName, cause)` to store as a
+/// Class-valued annotation member that could NOT be resolved through the
+/// declaring class's loader (classloader-isolation / filtering). It is stored as
+/// the member value, NOT thrown here — `annotation_proxy_dispatch_impl` detects
+/// it and throws it when the member is accessed, mirroring HotSpot's deferred
+/// `TypeNotPresentExceptionProxy` (so `getAnnotations()` does not throw, only the
+/// member accessor does). `type_name` is the binary (dotted) name; `cause` is the
+/// `ClassNotFoundException` the loader raised.
+fn make_type_not_present_exception(
+    ctx: &mut dyn NativeContext,
+    type_name: &str,
+    cause: Option<ObjectRef>,
+) -> Option<ObjectRef> {
+    let cid = ctx
+        .class_id_by_name("java/lang/TypeNotPresentException")
+        .or_else(|| {
+            let _ = ctx.load_class("java/lang/TypeNotPresentException");
+            ctx.class_id_by_name("java/lang/TypeNotPresentException")
+        })?;
+    let nfields = ctx.class_num_total_fields(cid).max(4);
+    let exc = ctx.alloc_object(cid, nfields);
+    // Mirror `new TypeNotPresentException(type, cause)`: message + cause set via
+    // the layout-aware Throwable helpers (Throwable.<init> is shadowed, so the
+    // real field initializers do not run otherwise).
+    let msg = format!("Type {type_name} not present");
+    let msg_obj = ctx.create_string(&msg);
+    crate::lang_misc::write_throwable_detail_message(ctx, exc, Value::Object(Some(msg_obj)));
+    if let Some(c) = cause {
+        crate::lang_misc::write_throwable_cause(ctx, exc, Value::Object(Some(c)));
+    }
+    crate::lang_misc::capture_throwable_trace(ctx, exc);
+    Some(exc)
+}
+
+/// Resolve a Class-valued annotation member's class name through the declaring
+/// class's (`container`) loader, mirroring HotSpot's
+/// `AnnotationParser.parseClassValue(sig, container)`. Returns `Ok(mirror)` on
+/// success and `Err(Some(cnfe))` when the loader raised a
+/// `ClassNotFoundException` (→ a deferred `TypeNotPresentException`).
+/// `Err(None)` for any other failure (caller falls back to the global resolve).
+fn resolve_annotation_class_via_loader(
+    ctx: &mut dyn NativeContext,
+    loader: ObjectRef,
+    class_name: &str,
+) -> Result<ObjectRef, Option<ObjectRef>> {
+    let dotted = class_name.replace('/', ".");
+    let name_obj = ctx.create_string(&dotted);
+    match ctx.invoke_virtual(
+        loader,
+        "loadClass",
+        "(Ljava/lang/String;)Ljava/lang/Class;",
+        &[Value::Object(Some(name_obj))],
+    ) {
+        Ok(Some(Value::Object(Some(mirror)))) => Ok(mirror),
+        Ok(_) => Err(None),
+        // The loader threw — typically ClassNotFoundException (the filter case).
+        Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(exc)) => Err(Some(exc)),
+        // Internal VM error — don't synthesize; let the caller fall back.
+        Err(_) => Err(None),
+    }
+}
+
 /// Create an annotation proxy object from annotation data.
 /// Fills in default values for elements not explicitly provided.
+///
+/// `container_loader` is the defining ClassLoader of the class on which the
+/// annotation is declared (the "container" in HotSpot's `AnnotationParser`).
+/// When present (a user-defined loader), Class-valued members are resolved
+/// through it so classloader-isolation patterns are honored; `None` keeps the
+/// global resolution used for app/bootstrap-loaded classes.
 fn create_annotation_proxy(
     ctx: &mut dyn NativeContext,
     ann: &cratonvm_native_api::AnnotationData,
+    container_loader: Option<ObjectRef>,
 ) -> ObjectRef {
     let proxy = alloc_concurrent_synthetic(
         ctx,
@@ -7893,7 +7968,8 @@ fn create_annotation_proxy(
     for (i, (name, val, ret_desc)) in all_elements.iter().enumerate() {
         let name_str = ctx.create_string(name);
         ctx.set_array_element(names_arr, i, Value::Object(Some(name_str)));
-        let java_val = annotation_element_to_java_typed(ctx, val, ret_desc.as_deref());
+        let java_val =
+            annotation_element_to_java_typed(ctx, val, ret_desc.as_deref(), container_loader);
         ctx.set_array_element(values_arr, i, java_val);
     }
     ctx.set_field(proxy, ANN_PROXY_ELEM_NAMES, Value::Object(Some(names_arr)));
@@ -7927,7 +8003,7 @@ pub(crate) fn annotation_element_to_java(
     ctx: &mut dyn NativeContext,
     val: &cratonvm_native_api::AnnotationElementValue,
 ) -> Value {
-    annotation_element_to_java_typed(ctx, val, None)
+    annotation_element_to_java_typed(ctx, val, None, None)
 }
 
 /// S111r19 — typed variant: when called for a known annotation-element method,
@@ -7942,6 +8018,7 @@ pub(crate) fn annotation_element_to_java_typed(
     ctx: &mut dyn NativeContext,
     val: &cratonvm_native_api::AnnotationElementValue,
     return_type_desc: Option<&str>,
+    container_loader: Option<ObjectRef>,
 ) -> Value {
     use cratonvm_native_api::AnnotationElementValue;
     match val {
@@ -8054,6 +8131,40 @@ pub(crate) fn annotation_element_to_java_typed(
             // return here causes downstream NullPointerExceptions (C29).
             let iae_trace_cls = std::env::var("CRATONVM_IAE_TRACE").is_ok();
             if let Some(class_name) = annotation_desc_to_class_name(desc) {
+                // Classloader-isolation: when the declaring class was loaded by a
+                // user-defined loader, resolve the Class member THROUGH that loader
+                // (HotSpot's `AnnotationParser.parseClassValue(sig, container)`). A
+                // `ClassNotFoundException` becomes a deferred `TypeNotPresentException`
+                // (stored as the member value, thrown at access). This honors a
+                // FilteringClassLoader that rejects the referenced type; without it
+                // the global resolve below would silently return the app-loaded
+                // class and the filter would be bypassed.
+                if let Some(loader) = container_loader {
+                    let owned = class_name.to_string();
+                    match resolve_annotation_class_via_loader(ctx, loader, &owned) {
+                        Ok(mirror) => {
+                            if iae_trace_cls {
+                                eprintln!("ANN-CLASS desc={desc} class={owned} via-container-loader ok");
+                            }
+                            return Value::Object(Some(mirror));
+                        }
+                        Err(Some(cnfe)) => {
+                            if iae_trace_cls {
+                                eprintln!("ANN-CLASS desc={desc} class={owned} container-loader CNFE -> TypeNotPresentException");
+                            }
+                            if let Some(tnpe) =
+                                make_type_not_present_exception(ctx, &owned.replace('/', "."), Some(cnfe))
+                            {
+                                return Value::Object(Some(tnpe));
+                            }
+                            // Could not build the sentinel — fall through to global.
+                        }
+                        Err(None) => {
+                            // Loader returned null / internal error — fall through
+                            // to the global resolution below (best-effort).
+                        }
+                    }
+                }
                 if let Some(cid) = ctx.class_id_by_name(class_name) {
                     let mirror = ctx.get_class_mirror(cid);
                     if iae_trace_cls {
@@ -8094,7 +8205,7 @@ pub(crate) fn annotation_element_to_java_typed(
             Value::Object(Some(descriptor_to_class_mirror(ctx, desc)))
         }
         AnnotationElementValue::Annotation(nested) => {
-            let proxy = create_annotation_proxy(ctx, nested);
+            let proxy = create_annotation_proxy(ctx, nested, container_loader);
             Value::Object(Some(proxy))
         }
         AnnotationElementValue::Array(elems) => {
@@ -8282,7 +8393,12 @@ pub(crate) fn annotation_element_to_java_typed(
                 .and_then(|rd| rd.strip_prefix('['))
                 .map(|s| s.to_string());
             for (i, elem) in elems.iter().enumerate() {
-                let v = annotation_element_to_java_typed(ctx, elem, elem_desc.as_deref());
+                let v = annotation_element_to_java_typed(
+                    ctx,
+                    elem,
+                    elem_desc.as_deref(),
+                    container_loader,
+                );
                 ctx.set_array_element(arr, i, v);
             }
             Value::Object(Some(arr))
@@ -8373,8 +8489,9 @@ fn build_annotation_array(
         .filter(|a| annotation_type_loadable(ctx, a))
         .collect();
     // GC-safe: `create_annotation_proxy` allocates (see `build_mirror_array`).
+    // No container class here (non-cached array path) → global Class resolution.
     build_mirror_array_comp(ctx, comp, resolvable.len(), |ctx, i| {
-        create_annotation_proxy(ctx, resolvable[i])
+        create_annotation_proxy(ctx, resolvable[i], None)
     })
 }
 
@@ -8804,8 +8921,9 @@ fn class_annotations_by_type_impl(
     }
 
     // GC-safe: `create_annotation_proxy` allocates (see `build_mirror_array`).
+    let container_loader = crate::classloader::defining_loader_for(class_id.as_u32());
     let arr = build_mirror_array(ctx, matching.len(), |ctx, i| {
-        create_annotation_proxy(ctx, &matching[i])
+        create_annotation_proxy(ctx, &matching[i], container_loader)
     });
     Ok(Some(Value::Object(Some(arr))))
 }
@@ -8879,8 +8997,9 @@ pub(crate) fn native_method_get_annotations_by_type(
         directly_and_indirectly_present(&annotations, &target_desc, container_desc.as_deref());
 
     // GC-safe: `create_annotation_proxy` allocates (see `build_mirror_array`).
+    let container_loader = crate::classloader::defining_loader_for(class_id.as_u32());
     let arr = build_mirror_array(ctx, matching.len(), |ctx, i| {
-        create_annotation_proxy(ctx, &matching[i])
+        create_annotation_proxy(ctx, &matching[i], container_loader)
     });
     Ok(Some(Value::Object(Some(arr))))
 }
@@ -9035,9 +9154,10 @@ pub(crate) fn native_field_get_annotation(
     };
     let target_desc = format!("L{};", ann_class_name);
     let annotations = ctx.field_annotations(class_id, &field_name);
+    let container_loader = crate::classloader::defining_loader_for(class_id.as_u32());
     for ann in &annotations {
         if ann.type_descriptor == target_desc {
-            let proxy = create_annotation_proxy(ctx, ann);
+            let proxy = create_annotation_proxy(ctx, ann, container_loader);
             return Ok(Some(Value::Object(Some(proxy))));
         }
     }
@@ -9163,9 +9283,10 @@ pub(crate) fn native_method_get_annotation(
             }
         }
     }
+    let container_loader = crate::classloader::defining_loader_for(class_id.as_u32());
     for ann in &annotations {
         if ann.type_descriptor == target_desc {
-            let proxy = create_annotation_proxy(ctx, ann);
+            let proxy = create_annotation_proxy(ctx, ann, container_loader);
             return Ok(Some(Value::Object(Some(proxy))));
         }
     }

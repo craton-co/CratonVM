@@ -2455,10 +2455,29 @@ pub(crate) fn native_classloader_define_class1(
 
     // Loader id from arg 0 (synthetic ClassLoader); 0 = app loader.
     let loader_id = match args.first() {
-        Some(Value::Object(Some(loader_obj))) => match ctx.get_field(*loader_obj, 6) {
-            Value::Int(v) if v > 0 => v as u32,
-            _ => 0,
-        },
+        Some(Value::Object(Some(loader_obj))) => {
+            let mut lid = match ctx.get_field(*loader_obj, 6) {
+                Value::Int(v) if v > 0 => v as u32,
+                _ => 0,
+            };
+            // Override-first redefinition: when a USER-DEFINED loader (e.g.
+            // Spring's OverridingClassLoader) defines a class whose name is
+            // ALREADY loaded by another loader, defining it under the
+            // Application namespace (id 0) would collide ("already defined by
+            // application loader"). Give this loader its own namespace so the
+            // redefinition succeeds and `Class.getClassLoader()` reports it.
+            // (Real-JDK mode reaches here with lid == 0 because the synthetic
+            // CL_LOADER_ID slot is a real ClassLoader field there.) Only kicks
+            // in on an actual name collision, so ByteBuddy/cglib's fresh-name
+            // defines keep their existing Application-namespace behavior.
+            if lid == 0
+                && crate::classloader::is_user_defined_loader(ctx, *loader_obj)
+                && ctx.class_id_by_name(&name).is_some()
+            {
+                lid = crate::classloader::loader_namespace_id(ctx, *loader_obj);
+            }
+            lid
+        }
         _ => 0,
     };
 
@@ -2553,10 +2572,22 @@ pub(crate) fn native_classloader_define_class0(
     }
 
     let loader_id = match args.first() {
-        Some(Value::Object(Some(loader_obj))) => match ctx.get_field(*loader_obj, 6) {
-            Value::Int(v) if v > 0 => v as u32,
-            _ => 0,
-        },
+        Some(Value::Object(Some(loader_obj))) => {
+            let mut lid = match ctx.get_field(*loader_obj, 6) {
+                Value::Int(v) if v > 0 => v as u32,
+                _ => 0,
+            };
+            // Same override-first / name-collision handling as defineClass1:
+            // give a user-defined loader its own namespace when redefining an
+            // already-loaded class name so the define does not collide.
+            if lid == 0
+                && crate::classloader::is_user_defined_loader(ctx, *loader_obj)
+                && ctx.class_id_by_name(&name).is_some()
+            {
+                lid = crate::classloader::loader_namespace_id(ctx, *loader_obj);
+            }
+            lid
+        }
         _ => 0,
     };
 
