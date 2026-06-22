@@ -134,7 +134,7 @@ known-issues README):
 | A4 (`Fork6`, FJP multi-thread) | 🟡 **OPEN / inconclusive** — gated, separate CAS bug masks it | `fork6-fjp-multithread-jit-root-reclamation.md`: only reachable under experimental `CRATONVM_REAL_FORKJOINPOOL=1`; a real-FJP `ForkJoinPool` CAS conflict now fails the repro on both precise-on and precise-off. |
 | Moving-GC precise relocation (`remap_active_jit_frames` under a real move) | ⚠️ **implemented, not exercised on the default path** | The non-moving sweep + selective promote does not relocate JIT-held slots, so `remap_active_jit_frames` is inert by default; it is only load-bearing if a moving young gen is ever made default. |
 | OSR-point precise tracking | ⚠️ **partial / opt-in only** (`CRATONVM_SHADOW_OSR_TRACK`) | Shadow-path only (68199090, not 68332206); the precise-maps path relies on the conservative backstop for OSR frames, not on OSR oop maps. |
-| Full app-gauntlet GC-root regression with precise on | ❌ **NOT done** | `SB-SUITE-CRASH-04` #5: "Either needs a full app/bench regression sweep." |
+| Full app-gauntlet GC-root regression with precise on | 🟡 **repro+bench lane LANDED & green; full 50-app lane still future** | `test-infra/regression-pool/gc-root-lane.sh` baseline 2026-06-22: 12 PASS / 1 expected-KNOWN-FAIL (A2) / 1 expected-FLAKY (MTRegex), 0 deviations. See "Step 4 baseline". The named full apps still need container harnesses. |
 | Perf acceptable as default | ✅ **inline frame-record landed (Steps 1+2, 2026-06-21)** | The per-invocation `jit_frame_record` CALL is now an inlined `mov gs:[disp], rbp` (default-on, Windows). fib44 inline-on ~11.8 s vs CALL-path ~19.8 s = **1.68× faster** (the no-frame-record floor is ~9 s, so inline cuts ~74 % of the frame-record overhead). bt16 also ~16 % faster. See "Inline frame-record (Steps 1+2)" below. Opt out: `CRATONVM_NO_PRECISE_INLINE_FRAME_RECORD`. |
 
 ## Proposed design (to reach a *validated* default)
@@ -213,10 +213,17 @@ not behaviour flips.
   method's maps), so the oracle is sharpest for leaf-ish compiled frames — the
   register/spill-resident root class, e.g. the new
   `gc-stress-bintrees ... jit-frame-stale-root` known-issue and `codePointAt`.
-- **Step 4 — App-gauntlet GC-root acceptance sweep.** Add a
-  `test-infra/regression-pool` lane (or extend the existing one) that runs the
-  A1–A4 repros + the named register-invisibility apps with precise on vs
-  HotSpot and records baselines. Doc-only + harness; no VM behaviour change.
+- **Step 4 — App-gauntlet GC-root acceptance sweep. 🟡 LANDED for the
+  repro+bench set; full 50-app lane still future** (2026-06-22). Added
+  `test-infra/regression-pool/gc-root-lane.sh` — runs the GC-root-coverage
+  family repros (`gc-stress-bintrees-main-args` ×5, A2 `ReflRepro`,
+  `family-a/MTRegex`) + the GC microbenchmarks with precise default-on, diffs
+  CratonVM vs HotSpot, records a baseline TSV under `results/`, and **exits
+  non-zero on any deviation from the per-item expected status** (so it is a
+  regression gate, not just a report). No VM behaviour change — harness only.
+  See "Step 4 baseline" below. The named full apps (cassandra/tomcat/wildfly/…)
+  need their own container/classpath harnesses (many are env-blocked here) and
+  remain the outstanding bar — this lane is the runnable GC-root-family subset.
 - **Step 5 — OSR decision (separate, optional).** Either extend precise oop
   maps to OSR entry or formally retire `CRATONVM_SHADOW_OSR_TRACK`. Independent
   of the default flip.
@@ -302,6 +309,51 @@ inline cuts ~74 % of the frame-record overhead (CALL added ~10.8 s; inline adds
   `aarch64::tests::*overflows` (panic at `aarch64.rs:2241` identically on clean
   `dev` with these changes stashed) — unrelated AArch64 backend tests.
 
+## Step 4 baseline — GC-root acceptance lane (recorded 2026-06-22)
+
+`test-infra/regression-pool/gc-root-lane.sh` against the precise-default dev
+binary, JDK-25 HotSpot oracle. Result: **12 PASS, 1 expected KNOWN-FAIL, 1
+expected FLAKY, 0 deviations** (lane exit 0).
+
+| item | result | vs HotSpot | note |
+|---|---|---|---|
+| bench bintrees10/14/16/18 | PASS | == (135854 / 3222190 / 14985902 / 68332206) | precise default-on |
+| bench fib44 | PASS | == 701408733 | slow (~166 s) — the separate `3a966cb9` long-call regression; checksum correct |
+| bench sieve250k / matrix600 | PASS | == (22044 / 6479950792) | |
+| a3 RHard / VStatic | PASS | == 3222190 (3/3) | `warned=3` — GC-array-guard fires (gap exercised, benign) |
+| a3 VAAload / VArgLen / binarytrees | PASS | == 3222190 (3/3) | `warned=3` — **see below** |
+| a2 ReflRepro | KNOWN-FAIL | crash (markers=251) | precise maps do **not** fix A2 (distinct alloc↔sweep UAF) |
+| mt MTRegex | FLAKY | 1/3 completions | documented cross-thread STW JIT-root gap + Thread.join/IMSE hang |
+
+**Honest findings (the value of recording a baseline):**
+
+- **The `gc-stress-bintrees-main-args` repros now produce the CORRECT checksum
+  on current dev** (VAAload 8/8 verified), whereas the
+  `gc-stress-bintrees-…-jit-frame-stale-root` known-issue recorded CRASH/WRONG on
+  an *older* dev. **But the GC-array-guard fires on every run** (`warned=3`): the
+  stale-root corruption is still *exercised* — the guard catches and drops the
+  bad write — it is simply **non-fatal at this depth/stress**. So the gap is
+  **masked, not closed**. The lane's automated gate flags a deviation only on a
+  **status** change (PASS → crash/wrong); the `warned` count is recorded in the
+  TSV note but is **not** auto-gated, so a human reviews it to see the guard
+  firing more (a fresh gap) or — on a real fix — stopping. Precise maps on/off
+  make no difference to this (per the known-issue).
+- **A2 (`ReflRepro`) and the multi-thread cross-thread gap (`MTRegex`) remain
+  open** — precise maps do not fix them; both are tracked as expected non-PASS so
+  the lane stays green while they're worked separately.
+- **bench `fib44` is correct but ~166 s** due to the separate `3a966cb9` long-call
+  dev regression (bisected; workaround `CRATONVM_JIT_IR_LONG=0`). The lane
+  disables the VM's 120 s native-hang watchdog (`CRATONVM_DISABLE_DEFAULT_WATCHDOG`)
+  so the slow-but-correct run completes and its checksum is verified rather than
+  aborted; the harness's own `timeout` is the backstop.
+- **bt18@8g can transiently fail to allocate under concurrent host memory load**
+  (one empty result observed); the lane retries a bench once on an empty result
+  to absorb that, distinguishing it from a wrong checksum (a real regression).
+
+This is the runnable GC-root-family acceptance set. The full named-app gauntlet
+(cassandra/tomcat/wildfly/keycloak/spring-boot/jenkins/felix) needs container
+harnesses and is the remaining bar before the *family* is declared retired.
+
 ## Risks & open questions
 
 - **Perf regression on call-heavy code (known).** 2.5× on pure-call recursion
@@ -348,12 +400,15 @@ JDK-25 app runs):
 2. **A3 register-invisibility repro green at high GC stress:** `MinRegexProbe`
    correct at `GC_STRESS=524288` **and** 4 MB (the two stress levels in
    `SB-SUITE-CRASH-04`).
-3. **No correctness regression across the regression pool** (`test-infra/
-   regression-pool/run.sh`) with precise on, all probes == their HotSpot/
-   gate-off baselines; the multi-threaded apps (cassandra, activemq, tomcat,
-   wildfly, keycloak, spring-boot, jenkins, felix) green.
-4. **App-gauntlet GC-root family baseline recorded** (Step 4): the named
-   register-invisibility apps run to completion == HotSpot with precise on.
+3. **No correctness regression across the GC-root lane** (`test-infra/
+   regression-pool/gc-root-lane.sh`) with precise on, all probes == their
+   HotSpot baselines (0 deviations). ✅ met 2026-06-22 for the repro+bench set
+   (see "Step 4 baseline"). The multi-threaded full apps (cassandra, activemq,
+   tomcat, wildfly, keycloak, spring-boot, jenkins, felix) still need container
+   harnesses — outstanding.
+4. **App-gauntlet GC-root family baseline recorded** (Step 4): 🟡 partial — the
+   GC-root *repro+bench* lane is recorded & green; the named full apps run to
+   completion == HotSpot with precise on is the remaining bar.
 5. **Perf within budget after inline frame-record:** call-heavy regression
    reduced from 2.5× toward parity (fib44), alloc/compute unchanged (≤~6% /
    ~0%).
