@@ -1,5 +1,81 @@
 # Wire the Tiered Compilation Manager
 
+> **Increment 4 (Step 4 — profile handoff C1 → C2) landed.**
+> Builds on increment 3. The PGO machinery was fully present but **dormant in
+> production**: `jit::profile::enable_profiling` was only ever called from the
+> profile-crate's own tests, so `is_profiling_enabled()` was always `false`, the
+> interpreter's ~13 `record_branch`/`record_receiver`/`record_backedge` sites all
+> short-circuited, `shared.profile_store` stayed empty, and every compile-time
+> `get_profile` returned `None`. Increment 4 turns the handoff on (gated) and
+> makes the optimizing C2 backend a profile consumer:
+> - **Populate (C1 / warmup phase).** New `CRATONVM_TIER_PGO` gate
+>   (`runtime/env_cache.rs`, `tier_pgo()`). When set, `SharedVm::new`
+>   (`vm/src/vm/vm_init.rs`, post-construction) calls
+>   `jit::profile::enable_profiling(true)` **once at VM init** — it must happen
+>   before any frame runs because the dispatch loop captures
+>   `is_profiling_enabled()` once per frame entry (`interpreter.rs` ~4617), so a
+>   method already warming up would never start recording. With the gate on, the
+>   interpreted (C1/warmup) phase populates `profile_store` (branch bias, receiver
+>   types, loop trips).
+> - **C2 reads it.** The single-pass backend already biased branch layout +
+>   pre-populated virtual-call MICs + loop-unroll from the profile (it serves both
+>   the fast C1 tier and the C2 IR-bail fallback). The gap was the **optimizing IR
+>   pipeline itself, which ignored `profile` entirely.** `ir_lower::lower` gained a
+>   sibling `lower_with_branch_hints(…, &HashMap<usize,bool>)`; the `Lowerer` now
+>   carries the per-bytecode-PC branch bias and, in the `Op::If` terminator, picks
+>   the conditional polarity from it. `cmp != 0` ⟺ the JVM branch is TAKEN
+>   (`successors[0]` = taken edge), so the historical layout (`JE around_true`,
+>   true edge as fall-through) already favours the taken edge; a branch the profile
+>   marks **usually-not-taken** inverts to `JNE` so the not-taken edge becomes the
+>   fall-through. `lib.rs` builds `ir_branch_hints` from `profile` exactly as the
+>   single-pass path builds its `branch_hints`, keyed by the branch instruction's
+>   bytecode PC (matching `Op::If::bytecode_pc` and the interpreter's
+>   `record_branch` PC). The two layouts are semantically identical — only the
+>   predicted/fall-through edge and block order differ; phi copies stay attached to
+>   their own edge in both.
+> - **Default-OFF safety.** With the gate unset (default), `enable_profiling` is
+>   never called, every `record_*` short-circuits, `get_profile` returns `None`,
+>   `ir_branch_hints` is empty, and the `Op::If` arm reproduces its historical
+>   bytes byte-for-byte. So the default path — interpreter hot loop and all codegen
+>   (single-pass and IR) — is unchanged until the gate is opted in.
+> - **Tests** (`jit/src/ir_lower.rs`): `step4_ir_lower_consumes_branch_bias_hint`
+>   (a usually-not-taken hint flips the emitted conditional `JE 0F84` → `JNE 0F85`
+>   and changes the buffer; a usually-taken hint reproduces the default
+>   byte-for-byte) and `step4_ir_lower_branch_bias_keyed_by_pc` (a hint for an
+>   unrelated PC does not perturb codegen). 839 jit-crate tests pass.
+> - **Runtime smoke (`scratch/tierpgo/TierPgoProbe.java`).** Two pure-int,
+>   `ir_compatible` methods invoked 3M times each with `x >= 0`: `gate(int)`
+>   (`if (x >= 0) … else …`, which `javac` emits as `iflt else` — a branch taken
+>   only when `x < 0`, i.e. **usually NOT taken**, with a phi merge) and
+>   `classify(int)` (`if (x < 0) …`, emitted as `ifge` — **usually taken**). Result
+>   (`196560529536`) is **identical** on HotSpot, CratonVM default (PGO off), and
+>   `CRATONVM_TIER_PGO=1`, with and without `CRATONVM_JIT_C2_FIRST_CALL=1`. With
+>   `CRATONVM_JIT_C2_FIRST_CALL=1 CRATONVM_DBG_JIT_DISASM=gate` the C2 (IR) body of
+>   `gate` shows `test eax,eax; je …` with profiling off and the inverted
+>   `test eax,eax; jne …` (with the two edge `JMP`s swapped) under
+>   `CRATONVM_TIER_PGO=1` — proving the profile is collected by the interpreter and
+>   consumed by the IR lowerer end-to-end (not a vacuous == HotSpot probe).
+>   `classify` correctly stays `je` (usually-taken ⇒ no inversion), confirming the
+>   bias is directional, not a blanket flip.
+> - **Boundaries / not in this step.** (1) The IR path consumes **branch bias**;
+>   receiver-MIC pre-population stays single-pass-only (the IR virtual-call path
+>   dispatches via the generic helper with no inline cache — IR-level MICs are
+>   future work). (2) `on_backedge` / OSR remains Step 5 (still no VM call site).
+>   (3) Loop-unroll-from-profile stays single-pass; the IR path has its own
+>   LICM/unroll. (4) PGO is inherently a *post-warmup* optimization: a method must
+>   be interpreted long enough to accumulate samples, then compiled via
+>   `try_compile`. The **eager first-call single-pass compile** in `fn execute`
+>   (`interpreter.rs` ~3738, `x64::compile` direct, empty hints) compiles most
+>   methods on call #1 — before any profile exists — and that cached body preempts
+>   the optimizing IR pipeline on every later path (the pre-existing increment-3
+>   boundary 1 + the `c2_first_call` note). So the live C2 branch-bias is reached
+>   through the invocation-counted `try_compile` upgrade / callee / OSR paths;
+>   `CRATONVM_JIT_C2_FIRST_CALL=1` routes the first-call compile through that same
+>   `try_compile(optimize=true)` path and is what the disasm smoke above uses.
+>   Making the default tiering reliably reach a profiled C2 compile is Steps 6–7
+>   (threshold tuning + retiring the eager fixed-threshold path) and C1→C2
+>   supersede (boundary 1).
+>
 > **Increment 3 (Step 3 — real per-call C1/C2 backend routing) landed.**
 > Builds on increment 2. The C1/C2 split is no longer advisory: the target tier
 > now selects the actual backend per compile.
@@ -248,8 +324,13 @@ tier instead of by the current ad-hoc gates.
    recommended tier is already honored (increment 1). Remaining nuance — the
    single-pass backend keeps its own internal escape analysis, and there is no
    C1→C2 supersede yet — is recorded in the increment-3 header above.
-4. **Profile handoff C1 → C2.** Have C1 populate the profile structures; have C2
-   read them.
+4. **Profile handoff C1 → C2.** ✅ **Done (increment 4).** Gated `CRATONVM_TIER_PGO`
+   enables interpreter profile recording at VM init so the C1/warmup phase
+   populates `profile_store`; the optimizing IR (C2) lowerer now consumes the
+   branch bias (`lower_with_branch_hints`), on top of the single-pass backend's
+   pre-existing branch/MIC/unroll consumption. Default-OFF = byte-identical. See
+   the increment-4 header above for the boundaries (receiver-MIC + loop-unroll in
+   the IR path remain single-pass-only / future work).
 5. **Wire `on_backedge` + OSR.** Add back-edge counting and the OSR entry
    (approximate first, precise once deopt/OSR state maps exist).
 6. **Tune thresholds** on the gauntlet; expose `CRATONVM_TIER_*` overrides.

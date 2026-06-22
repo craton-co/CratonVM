@@ -289,6 +289,17 @@ cached_is_set!(jit_main_inline, "CRATONVM_JIT_MAIN_INLINE");
 // regress steady-state behaviour until proven on the gauntlet. See
 // `docs/feature-designs/wire-tiered-manager.md` (Increment 2).
 cached_is_set!(bg_compile, "CRATONVM_BG_COMPILE");
+// wire-tiered-manager Step 4 (PGO handoff C1 → C2): opt-in profile collection.
+// When set, `SharedVm::new` calls `jit::profile::enable_profiling(true)` once at
+// VM init, so the interpreter's existing branch / receiver / back-edge recording
+// sites populate `shared.profile_store` during the interpreted ("C1"/warmup)
+// phase. The optimizing C2 compile then consumes that profile — the single-pass
+// backend already biases branch layout + pre-populates virtual-call MICs from it,
+// and (Step 4) the optimizing IR pipeline now reads branch bias too. Default-OFF:
+// every `ProfileStore::record_*` short-circuits on `is_profiling_enabled()`, so
+// the interpreter hot loop and all codegen are byte-for-byte unchanged unless
+// opted in. See `docs/feature-designs/wire-tiered-manager.md` (Step 4).
+cached_is_set!(tier_pgo, "CRATONVM_TIER_PGO");
 // Invocation-count tier-up for INSTANCE methods (invokevirtual/invokeinterface).
 // DEFAULT-ON as of 2026-06-15 (bug-03 layer B). Previously default-OFF: only
 // static methods had an invocation counter (`execute_invokestatic_cached`), so

@@ -124,6 +124,15 @@ struct Lowerer<'a> {
     /// self-recursive `CALL` (invoke_kind 4), patched at finalize to target the
     /// method's own entry (code offset 0). See `lower_self_call` / Op::Call.
     self_call_patches: Vec<usize>,
+    /// wire-tiered-manager Step 4 (PGO handoff C1 → C2): per-bytecode-PC branch
+    /// bias, keyed by the conditional-branch instruction's bytecode PC (the same
+    /// key the IR builder stamps on each `Op::If` via `Node::bytecode_pc`). Value
+    /// `true` = the branch is usually TAKEN, `false` = usually NOT taken; an
+    /// absent PC is inconclusive. Only `Some(false)` (usually-not-taken) changes
+    /// codegen — see `lower_terminator`'s `Op::If` arm. Empty (the default, and
+    /// whenever profiling is off) ⇒ every `Op::If` keeps its historical layout
+    /// byte-for-byte.
+    branch_hints: &'a HashMap<usize, bool>,
 }
 
 impl<'a> Lowerer<'a> {
@@ -135,6 +144,7 @@ impl<'a> Lowerer<'a> {
         num_locals: usize,
         max_nodes: usize,
         helpers: &JitRuntimeHelpers,
+        branch_hints: &'a HashMap<usize, bool>,
     ) -> Self {
         // Gap B: scan for `Op::Call` to size the call-related frame regions.
         // `needs_context` ⇒ the method takes the VM ptr as a hidden first arg
@@ -204,6 +214,7 @@ impl<'a> Lowerer<'a> {
             spill_cap_off,
             call_exc_patches: Vec::new(),
             self_call_patches: Vec::new(),
+            branch_hints,
         }
     }
 
@@ -1553,34 +1564,63 @@ impl<'a> Lowerer<'a> {
                     (Some(true_block), Some(false_block)) => {
                         // BUG FIX [jit-irlower #2]: phi copies must execute on
                         // the edge actually taken, so the conditional branch
-                        // splits the critical edges. Layout:
+                        // splits the critical edges. Default layout:
                         //   TEST; JE around_true;
                         //   <true-edge phi copies>; JMP true_block;
                         //   around_true: <false-edge phi copies>; JMP false_block;
                         //
-                        // JE around_true (jump when condition == 0)
-                        self.buf.emit(&[0x0F, 0x84]);
-                        let je_patch = self.buf.pos();
+                        // wire-tiered-manager Step 4 (PGO handoff C1 → C2): pick
+                        // the conditional-branch polarity from the profiled branch
+                        // bias. `cmp` is nonzero exactly when the JVM branch is
+                        // TAKEN (`successors[0]` = the taken edge), so the default
+                        // layout makes the *taken* edge the fall-through — its
+                        // forward `JE` is statically predicted not-taken. When the
+                        // profile says this branch is usually NOT taken we invert
+                        // to a `JNE` so the *not-taken* (false) edge becomes the
+                        // fall-through instead. The two layouts are semantically
+                        // identical — only the predicted/fall-through edge and the
+                        // block order differ, and the phi copies stay attached to
+                        // their own edge in both. With no hint for this PC (the
+                        // default, and whenever profiling is off) `favor_false` is
+                        // false and the emitted bytes are unchanged.
+                        let favor_false = node
+                            .bytecode_pc
+                            .and_then(|pc| self.branch_hints.get(&pc).copied())
+                            == Some(false);
+
+                        // `(jcc, first_block, second_block)`: `jcc` skips the
+                        // fall-through (`first_block`) to `second_block`.
+                        //   default  (favor taken): JE  skips true→false; true first
+                        //   inverted (favor !taken): JNE skips false→true; false first
+                        let (jcc_second_byte, first_block, second_block) = if favor_false {
+                            (0x85u8, false_block, true_block) // JNE
+                        } else {
+                            (0x84u8, true_block, false_block) // JE
+                        };
+
+                        // Jcc around_first (skip the fall-through edge).
+                        self.buf.emit(&[0x0F, jcc_second_byte]);
+                        let jcc_patch = self.buf.pos();
                         self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
 
-                        // Taken (true) edge.
-                        self.emit_phi_copies(block_idx, true_block);
-                        self.buf.emit_byte(0xE9); // JMP true_block
-                        let jmp_true = self.buf.pos();
+                        // Fall-through (favored) edge.
+                        self.emit_phi_copies(block_idx, first_block);
+                        self.buf.emit_byte(0xE9); // JMP first_block
+                        let jmp_first = self.buf.pos();
                         self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
-                        self.branch_patches.push((jmp_true, true_block));
+                        self.branch_patches.push((jmp_first, first_block));
 
-                        // around_true: false edge. Patch the JE here.
-                        let around_true = self.buf.pos();
-                        let rel = around_true as i32 - (je_patch as i32 + 4);
+                        // around_first: the jumped-to edge. Patch the Jcc here.
+                        let around_first = self.buf.pos();
+                        let rel = around_first as i32 - (jcc_patch as i32 + 4);
                         self.buf
-                            .try_patch_i32(je_patch, rel)
+                            .try_patch_i32(jcc_patch, rel)
                             .expect("codegen patch in-bounds");
-                        self.emit_phi_copies(block_idx, false_block);
-                        self.buf.emit_byte(0xE9); // JMP false_block
-                        let jmp_false = self.buf.pos();
+                        self.emit_phi_copies(block_idx, second_block);
+                        self.buf.emit_byte(0xE9); // JMP second_block
+                        let jmp_second = self.buf.pos();
                         self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
-                        self.branch_patches.push((jmp_false, false_block));
+                        self.branch_patches.push((jmp_second, second_block));
                     }
                     (Some(only_block), None) => {
                         // Degenerate single-successor If: copies are
@@ -2035,6 +2075,25 @@ pub fn lower(
     num_locals: usize,
     helpers: &JitRuntimeHelpers,
 ) -> Option<CompiledMethod> {
+    // No profile → empty branch hints → historical layout byte-for-byte.
+    // An empty `HashMap` performs no allocation until first insert.
+    let empty: HashMap<usize, bool> = HashMap::new();
+    lower_with_branch_hints(graph, schedule, num_params, num_locals, helpers, &empty)
+}
+
+/// `lower` with profile-guided conditional-branch layout (wire-tiered-manager
+/// Step 4 — PGO handoff C1 → C2). `branch_hints` maps a conditional-branch
+/// instruction's bytecode PC to its bias (`true` = usually taken, `false` =
+/// usually not taken); see `Lowerer::branch_hints`. An empty map reproduces
+/// [`lower`] exactly.
+pub fn lower_with_branch_hints(
+    graph: &Graph,
+    schedule: &Schedule,
+    num_params: usize,
+    num_locals: usize,
+    helpers: &JitRuntimeHelpers,
+    branch_hints: &HashMap<usize, bool>,
+) -> Option<CompiledMethod> {
     let estimated_size = graph.nodes.len() * 32 + 256;
     let buf = ExecutableBuffer::new(estimated_size.max(4096))?;
 
@@ -2046,6 +2105,7 @@ pub fn lower(
         num_locals,
         graph.nodes.len(),
         helpers,
+        branch_hints,
     );
 
     // Gap B: a `needs_context` method (one containing an `Op::Call`) receives the
@@ -2149,6 +2209,107 @@ mod tests {
         let graph = builder.build(code, code_len).expect("IR build");
         let schedule = ir_schedule::schedule(&graph);
         lower(&graph, &schedule, num_params, num_locals, &no_helpers()).expect("lower")
+    }
+
+    /// True iff `needle` appears as a contiguous subsequence of `hay`.
+    fn contains_seq(hay: &[u8], needle: &[u8]) -> bool {
+        needle.len() <= hay.len() && hay.windows(needle.len()).any(|w| w == needle)
+    }
+
+    // ── wire-tiered-manager Step 4: PGO branch-bias in the IR (C2) path ──
+
+    /// The optimizing IR lowerer must consume the profiled branch bias: a
+    /// conditional the profile marks "usually NOT taken" flips from `JE`
+    /// (`0F 84`) to `JNE` (`0F 85`) so the not-taken edge becomes the
+    /// fall-through. No hint (the default) ⇒ the historical `JE` layout, and
+    /// a "usually taken" hint reproduces it byte-for-byte — only the
+    /// not-taken case inverts.
+    #[test]
+    fn step4_ir_lower_consumes_branch_bias_hint() {
+        // iload_0; ifeq +5 (→pc6); iconst_1; ireturn; iconst_0; ireturn.
+        // One conditional branch (the `ifeq` at pc 1) with two successor
+        // edges, no phis, no calls, no guards → the ONLY Jcc in the emitted
+        // body is the `Op::If` terminator.
+        let code = [0x1a, 0x99, 0x00, 0x05, 0x04, 0xac, 0x03, 0xac];
+        let code_len = 8;
+
+        let build = || {
+            let builder = IrBuilder::new(1, 1);
+            let mut graph = builder.build(&code, code_len).expect("IR build");
+            ir_optimize::optimize(&mut graph);
+            let schedule = ir_schedule::schedule(&graph);
+            (graph, schedule)
+        };
+
+        // Default (no hint): a `JE` (0F 84), no inverted form.
+        let (g0, s0) = build();
+        let base_code = lower(&g0, &s0, 1, 1, &no_helpers())
+            .expect("lower baseline")
+            .code_bytes()
+            .to_vec();
+        assert!(
+            contains_seq(&base_code, &[0x0F, 0x84]),
+            "baseline IR branch should emit JE (0F 84)"
+        );
+
+        // "usually not taken" at the ifeq PC (1): inverted to `JNE` (0F 85),
+        // and a different code buffer.
+        let mut hints = HashMap::new();
+        hints.insert(1usize, false);
+        let (g1, s1) = build();
+        let hint_code = lower_with_branch_hints(&g1, &s1, 1, 1, &no_helpers(), &hints)
+            .expect("lower hinted")
+            .code_bytes()
+            .to_vec();
+        assert!(
+            contains_seq(&hint_code, &[0x0F, 0x85]),
+            "usually-not-taken hint should invert the IR branch to JNE (0F 85)"
+        );
+        assert_ne!(
+            base_code, hint_code,
+            "branch-bias hint must change the emitted code"
+        );
+
+        // "usually taken" keeps the default JE layout (byte-identical).
+        let mut taken_hints = HashMap::new();
+        taken_hints.insert(1usize, true);
+        let (g2, s2) = build();
+        let taken_code = lower_with_branch_hints(&g2, &s2, 1, 1, &no_helpers(), &taken_hints)
+            .expect("lower taken-hinted")
+            .code_bytes()
+            .to_vec();
+        assert_eq!(
+            base_code, taken_code,
+            "usually-taken hint must reproduce the default JE layout byte-for-byte"
+        );
+    }
+
+    /// A hint for an UNRELATED bytecode PC must not perturb codegen — only the
+    /// branch whose own PC is marked not-taken inverts.
+    #[test]
+    fn step4_ir_lower_branch_bias_keyed_by_pc() {
+        let code = [0x1a, 0x99, 0x00, 0x05, 0x04, 0xac, 0x03, 0xac];
+        let build = || {
+            let builder = IrBuilder::new(1, 1);
+            let mut graph = builder.build(&code, 8).expect("IR build");
+            ir_optimize::optimize(&mut graph);
+            let schedule = ir_schedule::schedule(&graph);
+            (graph, schedule)
+        };
+        let (g0, s0) = build();
+        let base = lower(&g0, &s0, 1, 1, &no_helpers())
+            .expect("lower")
+            .code_bytes()
+            .to_vec();
+        // Hint a PC that does not correspond to this method's branch (7).
+        let mut hints = HashMap::new();
+        hints.insert(7usize, false);
+        let (g1, s1) = build();
+        let other = lower_with_branch_hints(&g1, &s1, 1, 1, &no_helpers(), &hints)
+            .expect("lower")
+            .code_bytes()
+            .to_vec();
+        assert_eq!(base, other, "a hint for an unrelated PC must not change codegen");
     }
 
     // ── real-frame-deopt step 2: deopt points + lookup ───────────────────
