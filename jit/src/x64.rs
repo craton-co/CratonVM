@@ -5228,6 +5228,124 @@ fn wide_local_high_halves(code: &[u8], code_len: usize) -> Vec<usize> {
     hi
 }
 
+/// deopt-osr P2: the JVM value kind of a local slot, derived for the deopt
+/// snapshot's width/type source. See [`classify_local_kinds`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum LocalKind {
+    /// Never loaded/stored in this method (a dead slot or untyped gap).
+    Unknown,
+    /// Cat-1 `int`/`boolean`/`byte`/`char`/`short`.
+    Int,
+    /// Cat-2 `long`.
+    Long,
+    /// Cat-1 `float`.
+    Float,
+    /// Cat-2 `double`.
+    Double,
+    /// Object reference (`a*` opcodes). The precise oop dataflow mask is the
+    /// authority at a given bci; this is only a corroborating hint.
+    Ref,
+    /// The dead upper half of a cat-2 (`long`/`double`) local at the slot below.
+    HighHalf,
+    /// Accessed as more than one kind across the method (legal JVM slot reuse
+    /// across disjoint live ranges). The kind at a given bci is unknowable from a
+    /// whole-method scan, so the snapshot treats it as "re-run" rather than guess.
+    Ambiguous,
+}
+
+/// deopt-osr P2: classify every local slot's JVM value kind from the method's
+/// load/store opcodes — the only per-slot width/type signal the single-pass
+/// backend has (it threads no method descriptor and runs no verification type
+/// inference). The deopt snapshot uses this to emit a precisely-typed
+/// `FrameValue` (`Long`/`Double`/`Float` vs `Int`/ref) instead of a width-blind
+/// `Register`/`StackSlot` that would truncate a `long` (high 32 bits lost) or
+/// mistype an FP value on resume.
+///
+/// A slot accessed as exactly one kind takes that kind; a slot accessed as more
+/// than one is [`LocalKind::Ambiguous`]; a slot never accessed is
+/// [`LocalKind::Unknown`]. Each `long`/`double` base additionally marks its
+/// high-half slot [`LocalKind::HighHalf`] (so the snapshot records `Undefined`
+/// there and the cat-2 locals collapse stays aligned). `Ambiguous` and
+/// interior-`Unknown` slots make the snapshot fall back to the safe whole-method
+/// re-run — never a guess.
+fn classify_local_kinds(code: &[u8], code_len: usize, num_locals: usize) -> Vec<LocalKind> {
+    let mut kinds = vec![LocalKind::Unknown; num_locals];
+    fn vote(kinds: &mut [LocalKind], slot: usize, k: LocalKind) {
+        if slot >= kinds.len() {
+            return;
+        }
+        kinds[slot] = match kinds[slot] {
+            LocalKind::Unknown => k,
+            existing if existing == k => existing,
+            _ => LocalKind::Ambiguous,
+        };
+    }
+
+    let mut pc = 0usize;
+    while pc < code_len {
+        let op = code[pc];
+        // (kind, slot) for a local access at this pc, if the opcode is one.
+        let access: Option<(LocalKind, usize)> = match op {
+            // Widening: u8 operand/opcode-relative index -> usize (value fits).
+            0x15 if pc + 1 < code_len => Some((LocalKind::Int, code[pc + 1] as usize)),
+            0x16 if pc + 1 < code_len => Some((LocalKind::Long, code[pc + 1] as usize)),
+            0x17 if pc + 1 < code_len => Some((LocalKind::Float, code[pc + 1] as usize)),
+            0x18 if pc + 1 < code_len => Some((LocalKind::Double, code[pc + 1] as usize)),
+            0x19 if pc + 1 < code_len => Some((LocalKind::Ref, code[pc + 1] as usize)),
+            0x1a..=0x1d => Some((LocalKind::Int, (op - 0x1a) as usize)),
+            0x1e..=0x21 => Some((LocalKind::Long, (op - 0x1e) as usize)),
+            0x22..=0x25 => Some((LocalKind::Float, (op - 0x22) as usize)),
+            0x26..=0x29 => Some((LocalKind::Double, (op - 0x26) as usize)),
+            0x2a..=0x2d => Some((LocalKind::Ref, (op - 0x2a) as usize)),
+            0x36 if pc + 1 < code_len => Some((LocalKind::Int, code[pc + 1] as usize)),
+            0x37 if pc + 1 < code_len => Some((LocalKind::Long, code[pc + 1] as usize)),
+            0x38 if pc + 1 < code_len => Some((LocalKind::Float, code[pc + 1] as usize)),
+            0x39 if pc + 1 < code_len => Some((LocalKind::Double, code[pc + 1] as usize)),
+            0x3a if pc + 1 < code_len => Some((LocalKind::Ref, code[pc + 1] as usize)),
+            0x3b..=0x3e => Some((LocalKind::Int, (op - 0x3b) as usize)),
+            0x3f..=0x42 => Some((LocalKind::Long, (op - 0x3f) as usize)),
+            0x43..=0x46 => Some((LocalKind::Float, (op - 0x43) as usize)),
+            0x47..=0x4a => Some((LocalKind::Double, (op - 0x47) as usize)),
+            0x4b..=0x4e => Some((LocalKind::Ref, (op - 0x4b) as usize)),
+            // iinc reads+writes an int local.
+            0x84 if pc + 1 < code_len => Some((LocalKind::Int, code[pc + 1] as usize)),
+            // wide (0xc4): code[pc+1] is the real opcode, code[pc+2..4] the index.
+            0xc4 if pc + 3 < code_len => {
+                let real = code[pc + 1];
+                let idx = ((code[pc + 2] as usize) << 8) | code[pc + 3] as usize;
+                match real {
+                    0x15 | 0x36 | 0x84 => Some((LocalKind::Int, idx)),
+                    0x16 | 0x37 => Some((LocalKind::Long, idx)),
+                    0x17 | 0x38 => Some((LocalKind::Float, idx)),
+                    0x18 | 0x39 => Some((LocalKind::Double, idx)),
+                    0x19 | 0x3a => Some((LocalKind::Ref, idx)),
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        if let Some((k, slot)) = access {
+            vote(&mut kinds, slot, k);
+        }
+        pc += bytecode_len_at(code, pc);
+    }
+
+    // Mark each cat-2 base's high-half slot. A high-half that is independently
+    // accessed (slot reuse) becomes Ambiguous; an untouched one becomes HighHalf.
+    for slot in 0..num_locals {
+        if matches!(kinds[slot], LocalKind::Long | LocalKind::Double) {
+            let hh = slot + 1;
+            if hh < num_locals {
+                kinds[hh] = match kinds[hh] {
+                    LocalKind::Unknown | LocalKind::HighHalf => LocalKind::HighHalf,
+                    _ => LocalKind::Ambiguous,
+                };
+            }
+        }
+    }
+    kinds
+}
+
 fn find_induction_variable(code: &[u8], header: usize, back_edge_end: usize) -> Option<usize> {
     let mut iinc_locals: Vec<(usize, i8)> = Vec::new(); // (local, increment)
     let mut stored_locals: u64 = 0; // bitmask of locals written by xstore
@@ -6232,6 +6350,12 @@ struct Compiler {
     /// Stage 2 — companion to `local_oop_masks`: whether the forward local-oop
     /// dataflow reached each PC. Only `reached` PCs get precise local entries.
     local_oop_reached: Vec<bool>,
+    /// deopt-osr P2 — per-local JVM value kind (`classify_local_kinds`), the
+    /// width/type source for the deopt snapshot so a `long`/`double`/`float`
+    /// local emits a precisely-typed `FrameValue` rather than a truncating
+    /// `Register`/`StackSlot`. Empty unless `deopt_real_enabled()` (the only
+    /// consumer is the gated snapshot), so production compiles skip the scan.
+    local_kinds: Vec<LocalKind>,
     /// Stage 2 — the bytecode PC of the instruction currently being emitted,
     /// updated at the top of the `compile_bytecode` loop so
     /// `emit_oop_map_for_safepoint` can look up the local-oop mask without
@@ -6429,12 +6553,15 @@ struct Compiler {
     /// deopt-osr Step 1: stable boxed copies of `deopt_points`, for the
     /// imm64-baked deopt stub to load by pointer (mirrors `_deopt_point_boxes`).
     deopt_boxes: Vec<Box<crate::deopt::DeoptimizationPoint>>,
-    /// deopt-osr Step 2: frame offset (positive depth-from-RBP) of the DEEPEST
-    /// qword of the always-reserved 128-byte `SavedRegisters{gpr:[u64;16]}`
-    /// region the frame-deopt stub spills into. `gpr[r]` is stored at
-    /// `[rbp - (deopt_regs_base - r*8)]`, so `gpr[0]=RAX` is the deepest/lowest
-    /// address and `LEA [rbp - deopt_regs_base] == &gpr[0]`. 0 unless
-    /// `deopt_real_enabled()` reserved the region at construction.
+    /// deopt-osr Step 2 / P2: frame offset (positive depth-from-RBP) of the
+    /// DEEPEST qword of the always-reserved 256-byte
+    /// `SavedRegisters{gpr:[u64;16],xmm:[u64;16]}` region the frame-deopt stub
+    /// spills into. `gpr[r]` is stored at `[rbp - (deopt_regs_base - r*8)]`, so
+    /// `gpr[0]=RAX` is the deepest/lowest address and
+    /// `LEA [rbp - deopt_regs_base] == &gpr[0] == &SavedRegisters`; the XMM half
+    /// follows (`#[repr(C)]`), so `xmm[n]` at
+    /// `[rbp - (deopt_regs_base - 128 - n*8)]`. 0 unless `deopt_real_enabled()`
+    /// reserved the region at construction.
     deopt_regs_base: i32,
     /// deopt-osr Step 2: bci → stable pointer to the boxed `DeoptimizationPoint`
     /// for that guard, baked as arg0 (imm64) by the frame-deopt stub. Populated
@@ -6497,6 +6624,76 @@ fn frame_value_for_slot(
     }
 }
 
+/// deopt-osr P2: map a NON-oop local slot's machine location + classified JVM
+/// `kind` to a precisely-typed `FrameValue`. Pure (no `&self`) so it is
+/// unit-testable. `spill_off` is the positive `[rbp - spill_off]` frame offset
+/// (the resolver reads `*(rbp + off)`, so a spilled slot encodes the negation).
+///
+/// The classifier ([`classify_local_kinds`]) is the width source the snapshot
+/// otherwise lacks; this turns it into the right variant per provenance:
+/// `long` → `RegisterLong`/`StackSlotLong`, `float` → `XmmFloat`/`StackSlotFloat`,
+/// `double` → `XmmDouble`/`StackSlotDouble`, `int` → `Register`/`StackSlot`. A
+/// provenance/kind contradiction (an `int` in an XMM, an FP value in a GPR) and
+/// an `Ambiguous`/`Ref` kind yield `Unsupported` (safe re-run) — never a guess.
+/// `HighHalf` (the dead cat-2 upper half) and a never-accessed `Unknown` slot
+/// both yield `Undefined`: the only ways to read a local are the load/`iinc`
+/// opcodes the scan covers, so an `Unknown` slot is provably dead — `Undefined`
+/// (→ `Value::Int(0)`) is never read, and even a dead cat-2 param stays
+/// alignment-correct as two `Undefined` cat-1 slots (its high-half can never be
+/// the upper half of a *classified* cat-2 — those are marked `HighHalf`).
+fn typed_local_frame_value(
+    reg: Option<u8>,
+    xmm: Option<u8>,
+    spill_off: i32,
+    kind: LocalKind,
+) -> crate::deopt::FrameValue {
+    use crate::deopt::FrameValue;
+    match kind {
+        LocalKind::Int => {
+            if let Some(r) = reg {
+                FrameValue::Register(r)
+            } else if xmm.is_some() {
+                FrameValue::Unsupported // an int in an XMM is a contradiction
+            } else {
+                FrameValue::StackSlot(-spill_off)
+            }
+        }
+        LocalKind::Long => {
+            if let Some(r) = reg {
+                FrameValue::RegisterLong(r)
+            } else if xmm.is_some() {
+                FrameValue::Unsupported
+            } else {
+                FrameValue::StackSlotLong(-spill_off)
+            }
+        }
+        LocalKind::Float => {
+            if let Some(n) = xmm {
+                FrameValue::XmmFloat(n)
+            } else if reg.is_some() {
+                FrameValue::Unsupported // a float in a GPR is a contradiction
+            } else {
+                FrameValue::StackSlotFloat(-spill_off)
+            }
+        }
+        LocalKind::Double => {
+            if let Some(n) = xmm {
+                FrameValue::XmmDouble(n)
+            } else if reg.is_some() {
+                FrameValue::Unsupported
+            } else {
+                FrameValue::StackSlotDouble(-spill_off)
+            }
+        }
+        // Dead cat-2 upper half (collapse skips it) or a never-accessed dead
+        // slot: a harmless zero the resume never reads.
+        LocalKind::HighHalf | LocalKind::Unknown => FrameValue::Undefined,
+        // Scan says ref but the precise oop mask said non-oop here (handled by the
+        // caller before reaching this helper), or a reused slot — re-run.
+        LocalKind::Ref | LocalKind::Ambiguous => FrameValue::Unsupported,
+    }
+}
+
 #[cfg(test)]
 mod deopt_snapshot_tests {
     use super::frame_value_for_slot;
@@ -6526,6 +6723,110 @@ mod deopt_snapshot_tests {
         assert_eq!(
             frame_value_for_slot(None, None, 24, true),
             FrameValue::StackSlotRef(-24)
+        );
+    }
+
+    use super::{classify_local_kinds, typed_local_frame_value, LocalKind};
+
+    #[test]
+    fn classify_local_kinds_per_opcode() {
+        // Indexed load/store forms exercising each kind + cat-2 high-halves.
+        // local7 is never touched -> Unknown.
+        let code = [
+            0x15, 0x00, // iload 0   -> Int@0
+            0x37, 0x01, // lstore 1  -> Long@1, HighHalf@2
+            0x38, 0x03, // fstore 3  -> Float@3
+            0x39, 0x04, // dstore 4  -> Double@4, HighHalf@5
+            0x3a, 0x06, // astore 6  -> Ref@6
+            0xb1, // return
+        ];
+        let kinds = classify_local_kinds(&code, code.len(), 8);
+        assert_eq!(kinds[0], LocalKind::Int);
+        assert_eq!(kinds[1], LocalKind::Long);
+        assert_eq!(kinds[2], LocalKind::HighHalf);
+        assert_eq!(kinds[3], LocalKind::Float);
+        assert_eq!(kinds[4], LocalKind::Double);
+        assert_eq!(kinds[5], LocalKind::HighHalf);
+        assert_eq!(kinds[6], LocalKind::Ref);
+        assert_eq!(kinds[7], LocalKind::Unknown);
+    }
+
+    #[test]
+    fn classify_local_kinds_reuse_is_ambiguous() {
+        // local0 stored as int then as float -> Ambiguous (slot reuse).
+        let code = [
+            0x36, 0x00, // istore 0 -> Int
+            0x38, 0x00, // fstore 0 -> conflict -> Ambiguous
+            0xb1,
+        ];
+        let kinds = classify_local_kinds(&code, code.len(), 1);
+        assert_eq!(kinds[0], LocalKind::Ambiguous);
+    }
+
+    #[test]
+    fn classify_local_kinds_highhalf_reuse_is_ambiguous() {
+        // local0 long (hi half @1), but local1 also used as int -> Ambiguous@1.
+        let code = [
+            0x37, 0x00, // lstore 0 -> Long@0, would-be HighHalf@1
+            0x15, 0x01, // iload 1  -> Int@1 (independently used)
+            0xb1,
+        ];
+        let kinds = classify_local_kinds(&code, code.len(), 2);
+        assert_eq!(kinds[0], LocalKind::Long);
+        assert_eq!(kinds[1], LocalKind::Ambiguous);
+    }
+
+    #[test]
+    fn typed_local_frame_value_picks_typed_variant() {
+        // long in GPR / spilled.
+        assert_eq!(
+            typed_local_frame_value(Some(7), None, 8, LocalKind::Long),
+            FrameValue::RegisterLong(7)
+        );
+        assert_eq!(
+            typed_local_frame_value(None, None, 16, LocalKind::Long),
+            FrameValue::StackSlotLong(-16)
+        );
+        // float/double in XMM / spilled.
+        assert_eq!(
+            typed_local_frame_value(None, Some(2), 8, LocalKind::Float),
+            FrameValue::XmmFloat(2)
+        );
+        assert_eq!(
+            typed_local_frame_value(None, None, 8, LocalKind::Float),
+            FrameValue::StackSlotFloat(-8)
+        );
+        assert_eq!(
+            typed_local_frame_value(None, Some(3), 8, LocalKind::Double),
+            FrameValue::XmmDouble(3)
+        );
+        assert_eq!(
+            typed_local_frame_value(None, None, 24, LocalKind::Double),
+            FrameValue::StackSlotDouble(-24)
+        );
+        // int unchanged.
+        assert_eq!(
+            typed_local_frame_value(Some(1), None, 8, LocalKind::Int),
+            FrameValue::Register(1)
+        );
+        // HighHalf and never-accessed Unknown -> harmless Undefined.
+        assert_eq!(
+            typed_local_frame_value(None, None, 8, LocalKind::HighHalf),
+            FrameValue::Undefined
+        );
+        assert_eq!(
+            typed_local_frame_value(None, None, 8, LocalKind::Unknown),
+            FrameValue::Undefined
+        );
+        // Ambiguous (slot reuse) -> re-run.
+        assert_eq!(
+            typed_local_frame_value(None, None, 8, LocalKind::Ambiguous),
+            FrameValue::Unsupported
+        );
+        // Provenance/kind contradiction (float in a GPR) -> re-run.
+        assert_eq!(
+            typed_local_frame_value(Some(4), None, 8, LocalKind::Float),
+            FrameValue::Unsupported
         );
     }
 }
@@ -6693,19 +6994,21 @@ impl Compiler {
         };
         let reg_spill_base = xmm_saved_base + xmm_saved_size;
 
-        // deopt-osr Step 2 — 128-byte SavedRegisters{gpr:[u64;16]} region for the
-        // frame-deopt stub's in-stub 16-GPR spill. Reserved only under
-        // CRATONVM_DEOPT_REAL so the default frame is byte-identical. Placed just
-        // BELOW (deeper than) the per-safepoint reg-spill region and above the
-        // shadow/stack-arg region. `deopt_regs_base` is the offset of the DEEPEST
-        // qword (gpr[0]=RAX, lowest address): gpr[r] at [rbp - (deopt_regs_base -
-        // r*8)] so the 16 slots ascend with r from &gpr[0] = [rbp - deopt_regs_base].
+        // deopt-osr Step 2 / P2 — 256-byte SavedRegisters{gpr:[u64;16],xmm:[u64;16]}
+        // region for the frame-deopt stub's in-stub 16-GPR + 16-XMM spill. Reserved
+        // only under CRATONVM_DEOPT_REAL so the default frame is byte-identical.
+        // Placed just BELOW (deeper than) the per-safepoint reg-spill region and
+        // above the shadow/stack-arg region. `deopt_regs_base` is the offset of the
+        // DEEPEST qword (gpr[0]=RAX, lowest address): gpr[r] at
+        // [rbp - (deopt_regs_base - r*8)] (ascending with r from
+        // &gpr[0] = [rbp - deopt_regs_base]); the XMM half follows the GPR half in
+        // `#[repr(C)]` order, so xmm[n] at [rbp - (deopt_regs_base - 128 - n*8)].
         let deopt_regs_size = if crate::deopt_real_enabled() {
-            16 * 8
+            32 * 8
         } else {
             0
         };
-        debug_assert!(deopt_regs_size == 0 || deopt_regs_size == 128);
+        debug_assert!(deopt_regs_size == 0 || deopt_regs_size == 256);
         let deopt_regs_base = if deopt_regs_size != 0 {
             reg_spill_base + reg_spill_size + deopt_regs_size
         } else {
@@ -6832,6 +7135,7 @@ impl Compiler {
             stack_oop_marks: Vec::with_capacity(16),
             oop_maps: Vec::new(),
             local_oop_masks: Vec::new(),
+            local_kinds: Vec::new(),
             local_oop_reached: Vec::new(),
             cur_bc_pc: 0,
             precise_maps,
@@ -7124,12 +7428,32 @@ impl Compiler {
         let mut locals = Vec::with_capacity(self.num_locals);
         for i in 0..self.num_locals {
             let is_oop = i < 64 && (oop_mask & (1u64 << i)) != 0;
-            locals.push(frame_value_for_slot(
-                self.reg_for_local(i),
-                self.xmm_for_local(i),
-                self.local_offset(i),
-                is_oop,
-            ));
+            let reg = self.reg_for_local(i);
+            let xmm = self.xmm_for_local(i);
+            let off = self.local_offset(i);
+            let fv = if is_oop {
+                // The precise oop mask is the authority for ref-typed slots. A
+                // SPILLED ref → `StackSlotRef` (the slot word IS the heap
+                // pointer). A REGISTER-resident ref, however, has no sound
+                // encoding yet: `Register(r)` resolves to `Int`, which both
+                // mistypes the slot AND drops the oop from GC tracking on resume
+                // (a moving-GC UAF). Until register-resident-oop typing lands,
+                // emit `Unsupported` so such a frame re-runs. (For the BCE pilot
+                // the array ref is spilled at the guard, so this is a no-op there;
+                // it keeps the P2 gate-relax sound for any newly-admitted method.)
+                if reg.is_some() {
+                    crate::deopt::FrameValue::Unsupported
+                } else {
+                    frame_value_for_slot(reg, xmm, off, true)
+                }
+            } else if let Some(&kind) = self.local_kinds.get(i) {
+                // Non-oop slot, width-typed from the classifier (deopt-osr P2).
+                typed_local_frame_value(reg, xmm, off, kind)
+            } else {
+                // No kind table (gate off / unmapped) — Phase-A int/provenance.
+                frame_value_for_slot(reg, xmm, off, false)
+            };
+            locals.push(fv);
         }
 
         // Operand stack (canonically empty at a BCE loop header, but handle the
@@ -14028,6 +14352,19 @@ impl Compiler {
                 for r in 0u8..16 {
                     // Cast: value to i32 (encoding immediate/displacement)
                     self.emit_store_local(base - (r as i32) * 8, r);
+                }
+                // 1b) Spill all 16 XMM registers (low 64 bits via MOVQ) into the
+                //     XMM half of the region — `xmm[n] -> [rbp - (base - 128 -
+                //     n*8)]`, matching the `#[repr(C)]` field order
+                //     (gpr[16] then xmm[16]). This captures any `float`/`double`
+                //     the FP value tier kept in an XMM live across the guard, so
+                //     `XmmFloat(n)`/`XmmDouble(n)` resolve in `x64_deopt_entry`.
+                //     The GPR spill above does not touch XMMs, so each still holds
+                //     its trapping-instant value. Always-spill-16 (like the GPRs):
+                //     reading an unused XMM is harmless and keeps the stub simple.
+                for n in 0u8..16 {
+                    // Cast: value to i32 (encoding immediate/displacement)
+                    self.emit_movq_mem_rbp_from_xmm(base - 128 - (n as i32) * 8, n);
                 }
                 // 2) Args (extern "C"): arg0 = &DeoptimizationPoint (baked imm64),
                 //    arg1 = rbp (live, never clobbered until the epilogue),
@@ -22723,6 +23060,12 @@ pub fn compile_with_param_slots(
     compiler.local_oop_masks = lo_masks;
     compiler.local_oop_reached = lo_reached;
 
+    // deopt-osr P2 — per-local width/type source for the deopt snapshot. Only the
+    // (gated) snapshot consumes it, so skip the scan entirely in production.
+    if crate::deopt_real_enabled() {
+        compiler.local_kinds = classify_local_kinds(code, code_len, max_locals);
+    }
+
     // Emit prologue
     compiler.emit_prologue();
     let entry_offset = 0; // prologue starts at offset 0
@@ -22925,19 +23268,19 @@ pub fn compile_with_param_slots(
     // artifacts are unchanged. Consumed at the interpreter deopt sink, which
     // attempts `resume_real_ir_deopt` only when `compiled.can_deopt_resume`.
     //
-    // P2.0 (cat-2 soundness): also exclude any method with a wide (long/double)
-    // local. The snapshot has no per-slot WIDTH source yet, so a `long` local is
-    // recorded as `Register`/`StackSlot` and resolves to `Int` — TRUNCATING the
-    // high 32 bits on resume (silent corruption). A `double` already resolves to
-    // `Unsupported` → safe re-run, but a `long` would corrupt. Until P2.1 threads
-    // a width source + a `Long` FrameValue through `frame_value_for_slot` and the
-    // resume mapper, gate such methods to the safe whole-method re-run. (Cat-2
-    // operand-stack values are not a concern at the BCE loop-header guard — the
-    // operand stack is canonically empty there.)
-    let has_wide_local = !wide_local_high_halves(code, code_len).is_empty();
-    cm.can_deopt_resume = !cm.deopt_points.is_empty()
-        && compiler.scalar_replaced.is_empty()
-        && !has_wide_local;
+    // P2.1/P2.2 (cat-2 + FP resume): the snapshot now has a per-slot WIDTH source
+    // (`classify_local_kinds`) and emits typed `RegisterLong`/`StackSlotLong`
+    // (long), `XmmFloat`/`XmmDouble`/`StackSlotFloat`/`StackSlotDouble` (FP) values
+    // that the resume mapper reconstructs as full-width `Value::Long`/`Float`/
+    // `Double`; the deopt stub spills XMM0..15 (under the gate) so the XMM-resident
+    // FP forms resolve. P2.0's blanket wide-local exclusion is fully lifted. The
+    // only gate now is: a deopt point exists and the method does NOT
+    // scalar-replace (lock-elision / re-materialization hazard — unchanged). Any
+    // slot the classifier can't type (Ambiguous / a register-resident ref /
+    // contradiction) emits `Unsupported`, and the mapper re-runs the whole method
+    // for it — the per-slot fine-grained safety net behind this coarse gate.
+    cm.can_deopt_resume =
+        !cm.deopt_points.is_empty() && compiler.scalar_replaced.is_empty();
     // deopt-osr Step 7 — transfer the OSR-exit loop-boundary bci set and set the
     // per-method gate. Both are empty/false unless `deopt_real_enabled()` was on
     // (the emit site is gated), so production artifacts are unchanged. Step 8

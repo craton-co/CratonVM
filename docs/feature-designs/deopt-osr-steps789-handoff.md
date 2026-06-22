@@ -279,84 +279,68 @@ long/double local takes the safe whole-method re-run. Closes the `long`
 corruption; the BCE pilot (int loops) is unaffected. **P2.1 narrows this exclusion
 to FP-only; P2.2 drops it.**
 
-### P2.1 — long resume (no XMM; ~moderate). OWED.
+### P2.1 — long resume + P2.2 — float/double resume — ✅ DONE (2026-06-21, branch `feat/deopt-cat2-fp-resume`, off dev `0f21a83b`)
 
-Longs live in GPRs / 64-bit spill slots, so no XMM file is needed. The vm side is
-nearly free; the work is jit-side typing.
+Both landed together (the substrate covers long AND FP) as 6 gated, gate-off
+byte-identical increments. The implementation generalises the per-slot-`is_long`
+sketch above into a single width/type oracle and is sound by a per-slot fallback,
+not a coarse gate alone. **All gate-off byte-identical; 830 jit-lib + 37 vm-lib
+deopt tests green.**
 
-1. **Model** (`jit/src/deopt.rs`): add `FrameValue::RegisterLong(u8)` after
-   `Register(u8)` (`deopt.rs:92`). In `resolve_value` (`deopt.rs:840`) add
-   `RegisterLong(r) => FrameValue::Long(regs.gpr[*r as usize] as i64)`.
-   `StackSlotLong(off)` already resolves to `Long` (`deopt.rs:857`).
-2. **Emit width** (`jit/src/x64.rs`):
-   - `frame_value_for_slot` (`6311`): add an `is_long: bool` param. Register slot →
-     `is_long ? RegisterLong(r) : Register(r)`; XMM → `Unsupported` (still — that's
-     FP, P2.2); spilled oop → `StackSlotRef`; spilled `is_long` →
-     `StackSlotLong(-off)`; else → `StackSlot(-off)`. Update the unit test
-     `frame_value_for_slot_maps_provenance` (`x64.rs:6335`).
-   - `build_and_record_deopt_point` (`6866`): compute the high-half set
-     `let hi = wide_local_high_halves(self.code, code_len)` once. In the locals
-     loop (`6887`): if `hi.contains(&i)` push `FrameValue::Undefined` (the cat-2
-     upper-half placeholder the locals mapper skips); else
-     `is_long = hi.contains(&(i+1)) && self.xmm_for_local(i).is_none()` (an `i+1`
-     high-half whose low half is NOT xmm-resident ⇒ `long`, not `double`) and pass
-     it to `frame_value_for_slot`. The operand-stack loop (`6899`) is canonically
-     empty at the BCE loop-header guard, so cat-2 stack entries can be left as a
-     follow-up (or mirror with `StackSlotLong` for `StackSlot::Frame` longs — but
-     there is no width source for the stack; defer).
-   - **Gate** (`22636`): replace `has_wide_local` with FP-only:
-     `let has_fp_local = compiler.xmm_assignments.iter().any(|a| a.is_some());`
-     and `&& !has_fp_local`. Long-only methods become resumable; FP stays excluded
-     until P2.2.
-3. **Resume mapper** (`vm/src/runtime/interpreter.rs`): **the vm side is a 2-line
-   swap** — `fv_to_value` (`7791`) ALREADY maps `Long`→`Value::Long` (full 64-bit,
-   `7795`) and `Object`→`Value::Object` (`7796`). In `build_deopt_frame_inner`
-   (`8101`) change the two mapper calls (`8189-8190`) from
-   `ir_deopt_frame_values_with_objects` (which bails on `Long`, no cat-2 collapse)
-   to: locals → `ir_deopt_locals` (`7824`, cat-2 collapse: advances 2 past a
-   `Long`), stack → `ir_deopt_frame_values` (`7812`, compact). Both already route
-   through `fv_to_value`, so `Long`+`Object`+`Int`+`Undefined` all map. The
-   GC-rooting loop (`build_deopt_frame_inner`, pins `Value::Object(Some(_))`) is
-   unaffected. `ir_deopt_frame_values_with_objects` (`7937`) then has no caller —
-   delete it and its tests, or keep as dead code. The P1 verifier
-   (`verify_reconstructed_frame`/`_oops`) operates on `FrameValue`s and is
-   unaffected (a `[Long, Undefined, …]` frame passes its count checks).
-4. **Tests**:
-   - jit unit: `frame_value_for_slot(reg=Some(3), xmm=None, off, is_oop=false, is_long=true)` → `RegisterLong(3)`; `resolve_value(RegisterLong(3), gpr[3]=0xDEAD_0000_0001)` → `Long(0xDEAD_0000_0001)` (NOT truncated).
-   - vm unit (extend `deopt_step3_tests`): a `ReconstructedFrame` with locals
-     `[Long(0x7_0000_0001), Undefined, Object(addr), Int(9)]` → `build_deopt_frame_inner`
-     yields `get_local(0)=Long(0x7_0000_0001)` (full 64-bit), `get_local(1)=Object`,
-     `get_local(2)=Int(9)` (collapse correct); `resume_real_ir_deopt` → `FramePushed`.
-   - differential (manual, separate process per the P1 note): `long sum(int[] a)`
-     accumulating into a `long` under `CRATONVM_DEOPT_REAL=1` resumes with the full
-     64-bit sum that the gate-off run produces (pre-P2.1 it truncated).
+- **Inc 1 — model + resolver** (`jit/src/deopt.rs`). `SavedRegisters` gains
+  `xmm:[u64;16]` (`#[repr(C)]`). New `FrameValue`: `Double(u64)`,
+  `RegisterLong(u8)` (→ `Long(gpr[r])`), `XmmFloat(u8)`/`XmmDouble(u8)` (→
+  `Float`/`Double` from `xmm[n]` — named for the XMM file, vs the sketch's
+  `RegisterFloat`/`RegisterDouble`), `StackSlotFloat(i32)`/`StackSlotDouble(i32)`.
+  `resolve_value` resolves all.
+- **Inc 2 — stub XMM spill** (`jit/src/x64.rs`). The frame-deopt
+  `SavedRegisters` region grows 128→256 B (gated) and the stub spills XMM0..15
+  (`MOVQ`) after the GPRs; `&gpr[0]` is still the struct base.
+- **Inc 3 — width source + typed emit** (`jit/src/x64.rs`). `classify_local_kinds`
+  scans load/store/`iinc` opcodes → per-local `Int/Long/Float/Double/Ref/HighHalf`,
+  `Ambiguous` on slot reuse, `Unknown` if never accessed (stored on
+  `Compiler.local_kinds`, computed only under the gate). `typed_local_frame_value`
+  maps a non-oop slot per kind+provenance; `HighHalf`/dead-`Unknown` → `Undefined`;
+  `Ambiguous` / a provenance-kind contradiction → `Unsupported` (re-run, never a
+  guess). The sketch's `is_long = hi.contains(&(i+1)) && xmm.is_none()` derivation
+  is subsumed by the direct opcode classification (which also distinguishes
+  float-vs-double, needed for P2.2).
+- **Inc 4 — resume mappers** (`vm/.../interpreter.rs`, `deopt_materialize.rs`).
+  As sketched: `fv_to_value` adds `Float`/`Double`; `ir_deopt_locals` collapses
+  `Double` as well as `Long`; `build_deopt_frame_inner` swaps to
+  `ir_deopt_locals` (locals, cat-2 collapse) + `ir_deopt_frame_values` (stack);
+  the redundant `ir_deopt_frame_values_with_objects` is deleted (its test migrated).
+  `field_value_to_value` maps Long/Float/Double virtual fields (completeness).
+- **Inc 5 — gate relax** (`jit/src/x64.rs`). `can_deopt_resume` drops the wide /
+  FP exclusion entirely (5a lifted long via a precise `has_fp_local` from
+  `local_kinds`; 5b dropped FP) → now just `!deopt_points.is_empty() &&
+  scalar_replaced.is_empty()`. **Soundness rests on the per-slot `Unsupported`
+  net**, not the gate. Also hardened the oop path: a REGISTER-resident ref now
+  emits `Unsupported` (it would otherwise resolve to `Int`, mistyping the slot and
+  dropping the oop from GC tracking — a moving-GC UAF the wider gate could expose);
+  spilled refs (`StackSlotRef`) are unaffected, and the BCE pilot spills its array
+  ref so it is a no-op there.
 
-### P2.2 — float/double resume (XMM spill; heaviest). OWED.
+**Trap recorded (`get_local` vs cat-2):** the frame's `CompactValue` is NaN-boxed
+and cannot distinguish `long` from `double` by bits alone (it relies on the
+parallel `local_kinds`); the generic `get_local`/`to_value` ignores that array, so
+a `long` whose bits form a valid `double` reads back as `Double`. The frame stores
+it correctly (raw bits + `LKIND_LONG`) and the resumed `lload` reads it as a long —
+tests assert the raw 64-bit word (`get_local_raw`), not the NaN-boxed `Value` kind.
 
-Needs an XMM register file end-to-end. Hot-stub codegen — keep gated.
+**Validation:** unit-complete (classifier / resolver / `typed_local_frame_value` /
+`build_deopt_frame_inner` with long+float+double + cat-2 collapse alignment);
+gate-off byte-identical **by construction** (deopt-real off ⇒ no snapshot emit ⇒
+`deopt_points` empty ⇒ `can_deopt_resume` false, `local_kinds` empty, frame size
+unchanged). The through-JIT runtime deopt-resume of a cat-2/FP method remains
+**infra-blocked** (same as the int pilot: no deterministic in-process BCE-deopt
+trigger), so the live proof is the gate-off bt18 golden + gate-on no-crash soak,
+plus the `CRATONVM_DBG_DEOPT` reconstruction trace.
 
-1. **Model** (`jit/src/deopt.rs`): extend `SavedRegisters` (`deopt.rs:816`,
-   `gpr:[u64;16]`, `repr(C)`) with `xmm:[u64;16]` (low 64 bits hold the `double`
-   bits / `float` in low 32). Add `FrameValue::RegisterFloat(u8)` /
-   `RegisterDouble(u8)` (+ optional `StackSlotFloat`/`StackSlotDouble` for spilled
-   FP). `resolve_value`: `RegisterDouble(r) => Double(f64::from_bits(regs.xmm[r]))`,
-   `RegisterFloat(r) => Float(f32::from_bits(regs.xmm[r] as u32))`.
-2. **Emit** (`jit/src/x64.rs`): `frame_value_for_slot` XMM arm → `is_double ?
-   RegisterDouble(r) : RegisterFloat(r)` (thread an `is_double` from
-   `hi.contains(&(i+1))`). `build_and_record_deopt_point` stops forcing
-   `Unsupported` for XMM. Stack XMM (`StackSlot::Xmm`, `x64.rs:6912`) likewise.
-3. **Stub spill** (`jit/src/x64.rs` `emit_deopt_stubs` ~`13679`; reserve via
-   `deopt_regs_size` ~`6528`): after spilling RAX..R15, spill XMM0..15
-   (`MOVSD [rbp - xmm_base - 8*n], xmmN`) into the enlarged `SavedRegisters`
-   region; pass its address to `x64_deopt_entry` (jit `deopt.rs`), which fills
-   `SavedRegisters.xmm`. **This is the load-bearing, gate-critical change** — must
-   be byte-identical when `deopt_real_enabled()` is off.
-4. **Mapper** (`vm/.../interpreter.rs`): `fv_to_value` add `Float`→`Value::Float`,
-   `Double`→`Value::Double`; `ir_deopt_locals` already advances 2 past a `Long`,
-   add the same for `Double` (cat-2). 
-5. **Gate**: drop the `has_fp_local` exclusion (P2.1) once this lands.
-6. **Tests**: a `double`-accumulator loop resumes with the exact `double`; an
-   OSR-exit of a `double`-accumulator loop (Workstream B) then works too.
+**Remaining P2 follow-ups:** typed operand-stack cat-2/FP (no width source for the
+stack; canonically empty at BCE/OSR boundaries, so deferred); register-resident
+*oop* typing (currently re-runs); the eager-deopt differential verifier
+(`CRATONVM_DEOPT_VERIFY`) as the CI bar for flipping families on.
 
 ---
 
@@ -364,30 +348,14 @@ Needs an XMM register file end-to-end. Hot-stub codegen — keep gated.
 
 - **Every-boundary vs loop-headers-only exit maps** (`deopt-osr.md` ~476-479). Emitting an exit map at every canonical boundary maximizes deopt coverage but bloats metadata. Recommendation: loop-headers-first, widen with measurement.
 - **OSR-track vs moving GC** (`deopt-osr.md` ~480-485). An OSR'd frame's oops must be precisely relocatable for a moving collector. `CRATONVM_SHADOW_OSR_TRACK` currently regresses bt18 (conservative-pin × precise-move). Resolving that interaction may become a prerequisite for Step 8 under moving GC; a non-moving sweep sidesteps it.
-- **Cat-2 / FP — P2 workstream (`xmm[16]` + width source).** `SavedRegisters` is
-  `gpr[16]` only and `frame_value_for_slot` has **no per-slot width source**. The
-  failure modes differ by type:
-  - A **`double`/`float`** local is XMM-resident → `frame_value_for_slot` →
-    `Unsupported` → the mapper bails → safe re-run. (Correct, just no resume.)
-  - A **`long`** local is GPR/spilled → recorded as `Register`/`StackSlot` →
-    `resolve_value` produces `Int(i64)` → the mapper TRUNCATES to `i32` — **silent
-    corruption** on resume, not a safe re-run.
-  - **P2.0 — DONE (2026-06-21, branch `feat/deopt-osr-cat2fp`).** Close the long
-    hole: `can_deopt_resume` now also requires `wide_local_high_halves(code).is_empty()`
-    (no long/double local), so a wide-local method takes the safe whole-method
-    re-run. `jit/src/x64.rs` finalize; gate-off byte-identical; 825 jit-lib tests
-    green. The BCE pilot (int loops) is unaffected.
-  - **P2.1 — long resume (OWED).** Thread the width source (`wide_local_high_halves`
-    + `xmm_for_local` to split long-vs-double) into `frame_value_for_slot`; emit a
-    new `FrameValue::RegisterLong(r)` (resolves to `Long(gpr[r])`) / existing
-    `StackSlotLong` for long slots; extend the Object-bearing resume mapper
-    (`ir_deopt_frame_values_with_objects`) to map `Long` WITH the cat-2 locals
-    upper-half collapse (as `ir_deopt_locals` already does); then drop the
-    `wide_local` exclusion for long-only methods. No XMM needed.
-  - **P2.2 — FP resume (OWED).** Extend `SavedRegisters` to `xmm[16]`, spill XMM in
-    the deopt stub (`emit_deopt_stubs`), add `RegisterFloat`/`RegisterDouble`
-    resolving from `xmm[r]`, map `Float`/`Double`; then a live `double` accumulator
-    can resume / OSR-exit. The heaviest slice (hot-stub codegen).
+- **Cat-2 / FP — P2 workstream — ✅ DONE (P2.0 + P2.1 + P2.2).** Real-frame resume
+  now reconstructs `long`/`double`/`float` slots at full width; see the dedicated
+  **Workstream P2** section above for the landed design. P2.0 (the conservative
+  wide-local gate) is fully superseded — `can_deopt_resume` no longer excludes
+  wide/FP locals; the per-slot `Unsupported`→re-run net carries soundness. Branch
+  `feat/deopt-cat2-fp-resume`; gate-off byte-identical; 830 jit-lib + 37 vm-lib
+  deopt tests green. Remaining: typed operand-stack cat-2/FP and register-resident
+  *oop* typing (both currently re-run safely).
 - **Elided monitors on a scalar-replaced object** — see Workstream A caveat: gated off (`can_deopt_resume = false`) when `scalar_replaced` is non-empty or the method is `ACC_SYNCHRONIZED`; monitor re-entry at resume is a later refinement.
 - **Epoch / MakeNotEntrant invalidation of baked deopt-point pointers** — boxed `DeoptimizationPoint` pointers are baked into the stub as arg0 (`deopt_boxes`, `x64.rs:6184`). After recompilation/invalidation these must be versioned by `compilation_epoch` and checked before dereference (Step 9), or a stale box could be followed into freed memory.
 
