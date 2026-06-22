@@ -13,13 +13,17 @@
 //! the vm crate, where the live heap/allocator and the thread's GC-root set are
 //! reachable. The jit-crate `materialize_virtual_objects` panic stub points here.
 //!
-//! STATUS: Phases 1+2 (Steps 5+6) implemented; not yet wired to a live deopt.
-//! The module-level `#![allow(dead_code)]` reflects that no *production* path
-//! reaches [`materialize_virtual_objects`] yet — every virtual-bearing frame
-//! keeps `CompiledMethod::can_deopt_resume` false and falls back to the
-//! `i64::MIN` whole-method re-run; only the acceptance tests drive it (Steps 1–4,
-//! the x64 deopt-exit machinery that would *produce* a virtual-bearing frame,
-//! are the companion-doc prerequisite for an end-to-end real deopt). Implemented:
+//! STATUS: Phases 1+2 (Steps 5+6) implemented AND wired into the resume sink
+//! (Workstream A). [`materialize_virtual_objects`] is now called from
+//! `interpreter::build_deopt_frame_inner`: a reconstructed deopt frame carrying
+//! `VirtualObject`/`VirtualObjectRef` slots is materialized into a real heap
+//! object graph and resumed at the trapping bci, under `CRATONVM_DEOPT_REAL`
+//! (default-off). The live path passes `keep_pins = true`, so the shells stay
+//! rooted across the frame build + push (the sink owns their release). No
+//! *production* emitter writes virtual deopt slots yet (the x64 snapshot records
+//! only Register/StackSlot provenance), so the path is reachable today only via
+//! the acceptance tests and `CRATONVM_DEOPT_VERIFY`; the `#![allow(dead_code)]`
+//! covers test-only helpers (`count_virtual_objects`). Implemented:
 //!   * [`TempRootScope`] — RAII temporary GC-root set over `native_pin_roots`.
 //!   * [`materialize_virtual_objects`] — two-phase, cycle-safe. **Phase 1**
 //!     allocates + header-inits + immediately-roots a shell for every distinct
@@ -132,15 +136,27 @@ impl Drop for TempRootScope<'_> {
 /// passes the `CRATONVM_GC_STRESS` gate (`false` on the normal path, since
 /// forcing a GC at every deopt would be ruinous).
 ///
-/// Gated unreachable in production (`can_deopt_resume == false`). Returns an
-/// error only on allocation failure or a malformed frame (an unresolved /
-/// unsupported field value, or a `VirtualObjectRef` to an unknown id) — the
-/// caller then falls back to the safe re-run path.
+/// `keep_pins` controls the temporary GC-root lifetime. When `false` (unit
+/// tests), the shell pins are released before returning (the frame's rewritten
+/// `Object` slots are the only references — fine for a test that inspects the
+/// heap immediately). When `true` (the live resume sink), the pins are LEFT
+/// installed in `native_pin_roots` and the CALLER owns their release: the sink
+/// holds them across the GC-capable frame build + `push_frame_and_fire_entry`
+/// and truncates only AFTER the resumed frame is on `thread.frames` (itself a GC
+/// root) — so the materialized shells are rooted continuously from allocation
+/// until the frame roots them, with no unrooted window. On the error path the
+/// pins are always released (the scope drops normally before the early return),
+/// regardless of `keep_pins`.
+///
+/// Returns an error only on allocation failure or a malformed frame (an
+/// unresolved / unsupported field value, or a `VirtualObjectRef` to an unknown
+/// id) — the caller then falls back to the safe re-run path.
 pub(crate) fn materialize_virtual_objects(
     shared: &SharedVm,
     thread: &mut JvmThread,
     frame: &mut ReconstructedFrame,
     stress_gc: bool,
+    keep_pins: bool,
 ) -> Result<Vec<(usize, u64)>, MethodCallFailed> {
     // Collect the virtual-object graph: id -> canonical state. Cloning releases
     // the borrow on `frame` so its slots can be rewritten at the end.
@@ -206,6 +222,17 @@ pub(crate) fn materialize_virtual_objects(
             result.push((slot, addr));
         }
         slot += 1;
+    }
+
+    if keep_pins {
+        // Live resume: leave the shell pins installed. The caller holds them
+        // across the frame build + push and truncates `native_pin_roots` only
+        // after the resumed frame is on `thread.frames` — so the shells are
+        // rooted continuously, with no unrooted window across a GC-capable build.
+        std::mem::forget(scope);
+    } else {
+        // Tests: release the shell pins now (the rewritten Object slots remain).
+        drop(scope);
     }
     Ok(result)
 }
@@ -387,9 +414,14 @@ mod tests {
         assert_eq!(count_virtual_objects(&frame), 3);
 
         let pin_base = thread.native_pin_roots.len();
-        let mapped =
-            materialize_virtual_objects(&shared, &mut thread, &mut frame, /* stress_gc */ true)
-                .expect("materialization should succeed");
+        let mapped = materialize_virtual_objects(
+            &shared,
+            &mut thread,
+            &mut frame,
+            /* stress_gc */ true,
+            /* keep_pins */ false,
+        )
+        .expect("materialization should succeed");
 
         assert_eq!(mapped.len(), 3);
         assert_eq!(
@@ -437,9 +469,14 @@ mod tests {
         });
         let mut frame = frame_of(vec![vo], vec![]);
 
-        let mapped =
-            materialize_virtual_objects(&shared, &mut thread, &mut frame, /* stress_gc */ false)
-                .expect("materialization should succeed");
+        let mapped = materialize_virtual_objects(
+            &shared,
+            &mut thread,
+            &mut frame,
+            /* stress_gc */ false,
+            /* keep_pins */ false,
+        )
+        .expect("materialization should succeed");
         assert_eq!(mapped.len(), 1);
         let (slot, addr) = mapped[0];
         assert_eq!(slot, 0);
@@ -476,9 +513,14 @@ mod tests {
         });
         let mut frame = frame_of(vec![a, b], vec![]);
 
-        let mapped =
-            materialize_virtual_objects(&shared, &mut thread, &mut frame, /* stress_gc */ true)
-                .expect("materialization should succeed");
+        let mapped = materialize_virtual_objects(
+            &shared,
+            &mut thread,
+            &mut frame,
+            /* stress_gc */ true,
+            /* keep_pins */ false,
+        )
+        .expect("materialization should succeed");
         assert_eq!(mapped.len(), 2);
 
         let addr_a = mapped.iter().find(|&&(s, _)| s == 0).unwrap().1;

@@ -98,10 +98,51 @@ Materialization is orthogonal to cat-2 support. A `long`/`double` field of a vir
 
 ### Increments (independently landable) + test plan
 
-- **A1 — return the scope.** Change `materialize_virtual_objects` to return `(Vec<(usize,u64)>, TempRootScope)`; update the three existing acceptance tests. No live wiring yet. *Test:* existing tests still green; assert pins persist until the returned scope drops.
-- **A2 — detect + materialize behind `can_deopt_resume`.** Add the `has_virtual` branch in `build_deopt_frame_inner`; call the materializer on a clone; hold the scope across build+push; drop after push. Keep `can_deopt_resume = false` for `scalar_replaced`-nonempty / `ACC_SYNCHRONIZED` methods. *Test:* synthetic `ReconstructedFrame` with one `VirtualObject` → `resume_real_ir_deopt` returns `FramePushed`, frame locals hold the materialized `Object`.
-- **A3 — cyclic + GC-stress.** *Test:* two mutually-referencing `VirtualObjectRef` objects resume correctly (extends `materializes_two_object_cycle`); a `stress_gc = true` resume survives a forced GC during build (shell addresses re-read from pins, frame still consistent — extends `shells_materialize_and_survive_forced_gc`).
-- **A4 — differential.** Under `CRATONVM_DEOPT_VERIFY`, an eager-deopt of a method that scalar-replaces an object produces interpreter state byte-identical to the never-JIT'd run.
+**A1–A3 — DONE (2026-06-21, branch `feat/deopt-osr-completion`).** The materializer
+is wired into `build_deopt_frame_inner`: a reconstructed frame carrying
+`VirtualObject`/`VirtualObjectRef` slots is materialized into a real heap object
+graph and resumed at the trapping bci instead of bailing to re-run.
+
+- **A1 — DONE (keep_pins, not a returned scope).** The literal "return a
+  `TempRootScope`" plan does not compose — `TempRootScope` holds `&mut JvmThread`,
+  so returning it would freeze the thread for the rest of the GC-capable build.
+  Instead `materialize_virtual_objects` gained a `keep_pins: bool`: on the live
+  path (`true`) it `mem::forget`s the scope so the shell pins persist in
+  `native_pin_roots`; the sink owns release via its existing `pin_base..truncate`
+  window held across `push_frame_and_fire_entry` — continuous rooting, no unrooted
+  window. Error path always releases (scope drops before the early return).
+  `ReconstructedFrame` derives `Clone` so the sink materializes on a copy.
+- **A2 — DONE.** `has_virtual` branch in `build_deopt_frame_inner` clones →
+  materializes (keep_pins) → maps. Elided-monitor gate bails (re-run) for
+  `ACC_SYNCHRONIZED`; the residual synchronized-*block* lock-elision case is
+  undetectable from the frame and unreachable today (no production emitter writes
+  `VirtualObject` deopt slots), documented as a flag the future x64 virtual-slot
+  emitter must carry. The coverage gate `can_deopt_resume` is also now finalized
+  (x64-backport Step 5, below) and consulted at the sink.
+- **A3 — DONE.** 4 vm-lib tests: `resumes_frame_with_virtual_object` (+forced-GC
+  survival via the pushed frame), `resumes_frame_with_object_cycle`,
+  `virtual_resume_blocked_for_synchronized_method`,
+  `virtual_shells_survive_forced_gc_during_build`. 31/31 deopt lib tests green;
+  gate-off byte-identical.
+- **A4 — differential.** STILL OWED — folded into the `CRATONVM_DEOPT_VERIFY`
+  verifier workstream (the gate `deopt_verify_enabled()` is defined but has no
+  consumer yet). The genuinely bug-catching form is the *eager-deopt differential*
+  (force a deopt at a non-failing guard, reconstruct, compare the
+  reconstructed-interpreter end-result vs the JIT result) — a harness, not a cheap
+  structural check (a structural check would mostly flag *expected* cat-2/FP
+  Unsupported slots as false positives, since those legitimately re-run).
+
+**x64-backport Step 5 — `can_deopt_resume` coverage gate DONE (2026-06-21).** At
+x64 finalize `cm.can_deopt_resume = !deopt_points.is_empty() &&
+scalar_replaced.is_empty()` (mirrors `can_osr_exit`). The `scalar_replaced`
+clause is load-bearing: this backend records a scalar-replaced slot by machine
+provenance (Register/StackSlot), not as a `VirtualObject`, so its snapshot can't
+be re-materialized and lock elision over it makes mid-method resume unsound — such
+methods stay on re-run until the x64 emitter writes `VirtualObject` slots + an
+elided-monitor flag. The sink (`execute_jit_call` already holds the
+`CompiledMethod`) attempts `resume_real_ir_deopt` only when
+`compiled.can_deopt_resume`. Empty/false unless `deopt_real_enabled()`, so
+production artifacts unchanged; 825 jit-lib tests green.
 
 ---
 
