@@ -5356,6 +5356,70 @@ fn classify_local_kinds(code: &[u8], code_len: usize, num_locals: usize) -> Vec<
     kinds
 }
 
+/// True iff `op` is a `long`/`float`/`double` bytecode — any op that can put a
+/// cat-2 (`long`/`double`) or cat-1 `float` value onto the operand stack, or
+/// proves one is in flight (load/store/const/arith/convert/compare/array/return).
+fn opcode_touches_long_float_double(op: u8) -> bool {
+    matches!(
+        op,
+        // lconst_0/1, fconst_0/1/2, dconst_0/1 | ldc2_w
+        0x09..=0x0f | 0x14
+        // lload, fload, dload (wide-index)
+        | 0x16..=0x18
+        // lload_0-3, fload_0-3, dload_0-3
+        | 0x1e..=0x29
+        // laload, faload, daload
+        | 0x2f..=0x31
+        // lstore, fstore, dstore (wide-index)
+        | 0x37..=0x39
+        // lstore_0-3, fstore_0-3, dstore_0-3
+        | 0x3f..=0x4a
+        // lastore, fastore, dastore
+        | 0x50..=0x52
+        // lneg, fneg, dneg
+        | 0x75..=0x77
+        // lshl, lshr, lushr
+        | 0x79 | 0x7b | 0x7d
+        // land, lor, lxor
+        | 0x7f | 0x81 | 0x83
+        // i2l..d2f (every conversion involving a long/float/double)
+        | 0x85..=0x90
+        // lcmp, fcmpl, fcmpg, dcmpl, dcmpg
+        | 0x94..=0x98
+        // lreturn, freturn, dreturn
+        | 0xad..=0xaf
+    // add/sub/mul/div/rem: within each group of 4 (i,l,f,d at +0,+1,+2,+3) the
+    // non-`i` members are long/float/double.
+    ) || ((0x60..=0x73).contains(&op) && (op - 0x60) % 4 != 0)
+}
+
+/// deopt-osr FU2: true iff the method touches any `long`/`float`/`double` — the
+/// (sound, complete) method-level gate for the operand-stack snapshot. The
+/// abstract operand stack carries NO per-entry width source: a `long` (or a
+/// spilled FP value) in a `Frame`/GPR stack slot is indistinguishable from an
+/// `int` there, so it would be recorded as `StackSlot`/`Register` and TRUNCATE on
+/// resume. Any wide/FP value on the operand stack implies one of these opcodes
+/// somewhere in the method (it must be loaded / produced / consumed), so when
+/// this is `false` every non-oop stack slot is provably a cat-1 `int`/`ref` and
+/// keeps its precise encoding; when `true` the snapshot conservatively records
+/// such slots as `Unsupported` (re-run) rather than risk a mistyped cat-2/FP
+/// stack value. Pure-int/ref methods (the BCE pilot) are unaffected.
+fn code_uses_long_float_double(code: &[u8], code_len: usize) -> bool {
+    let mut pc = 0usize;
+    while pc < code_len {
+        let op = code[pc];
+        if opcode_touches_long_float_double(op) {
+            return true;
+        }
+        // wide (0xc4) prefix: the real opcode follows.
+        if op == 0xc4 && pc + 1 < code_len && opcode_touches_long_float_double(code[pc + 1]) {
+            return true;
+        }
+        pc += bytecode_len_at(code, pc);
+    }
+    false
+}
+
 fn find_induction_variable(code: &[u8], header: usize, back_edge_end: usize) -> Option<usize> {
     let mut iinc_locals: Vec<(usize, i8)> = Vec::new(); // (local, increment)
     let mut stored_locals: u64 = 0; // bitmask of locals written by xstore
@@ -6366,6 +6430,14 @@ struct Compiler {
     /// `Register`/`StackSlot`. Empty unless `deopt_real_enabled()` (the only
     /// consumer is the gated snapshot), so production compiles skip the scan.
     local_kinds: Vec<LocalKind>,
+    /// deopt-osr FU2 — whether the method touches any `long`/`float`/`double`
+    /// (`code_uses_long_float_double`). The method-level gate for the operand-stack
+    /// snapshot: the abstract stack has no per-entry width source, so when this is
+    /// `true` a non-oop `Frame`/GPR stack slot (possibly a `long`/spilled-FP) is
+    /// recorded `Unsupported` (re-run) rather than mistyped `Int`; when `false`
+    /// every non-oop stack slot is provably a cat-1 `int`/`ref`. Only the gated
+    /// snapshot reads it, so production compiles leave it `false`.
+    uses_long_float_double: bool,
     /// Stage 2 — the bytecode PC of the instruction currently being emitted,
     /// updated at the top of the `compile_bytecode` loop so
     /// `emit_oop_map_for_safepoint` can look up the local-oop mask without
@@ -6736,7 +6808,40 @@ mod deopt_snapshot_tests {
         );
     }
 
-    use super::{classify_local_kinds, typed_local_frame_value, LocalKind};
+    use super::{
+        classify_local_kinds, code_uses_long_float_double, opcode_touches_long_float_double,
+        typed_local_frame_value, LocalKind,
+    };
+
+    #[test]
+    fn fu2_wide_fp_gate_detects_long_float_double() {
+        // Pure int/ref method: iload_0; iconst_1; iadd; ireturn → no wide/FP.
+        let int_only = [0x1a, 0x04, 0x60, 0xac];
+        assert!(!code_uses_long_float_double(&int_only, int_only.len()));
+        // A long: lload_0; lconst_1; ladd; lstore_0; return.
+        let with_long = [0x1e, 0x0a, 0x61, 0x3f, 0xb1];
+        assert!(code_uses_long_float_double(&with_long, with_long.len()));
+        // A float: fload_0; freturn.
+        let with_float = [0x22, 0xae];
+        assert!(code_uses_long_float_double(&with_float, with_float.len()));
+        // A double constant: ldc2_w #idx; dreturn.
+        let with_double = [0x14, 0x00, 0x05, 0xaf];
+        assert!(code_uses_long_float_double(&with_double, with_double.len()));
+        // wide-prefixed dload: wide; dload idx16; dreturn.
+        let wide_dload = [0xc4, 0x18, 0x00, 0x03, 0xaf];
+        assert!(code_uses_long_float_double(&wide_dload, wide_dload.len()));
+        // Per-opcode spot checks: i-arith excluded, l/f/d-arith included.
+        assert!(!opcode_touches_long_float_double(0x60)); // iadd
+        assert!(opcode_touches_long_float_double(0x61)); // ladd
+        assert!(opcode_touches_long_float_double(0x62)); // fadd
+        assert!(opcode_touches_long_float_double(0x63)); // dadd
+        assert!(!opcode_touches_long_float_double(0x6c)); // idiv
+        assert!(opcode_touches_long_float_double(0x6d)); // ldiv
+        assert!(!opcode_touches_long_float_double(0x74)); // ineg
+        assert!(opcode_touches_long_float_double(0x75)); // lneg
+        assert!(!opcode_touches_long_float_double(0x36)); // istore
+        assert!(opcode_touches_long_float_double(0x37)); // lstore
+    }
 
     #[test]
     fn classify_local_kinds_per_opcode() {
@@ -7146,6 +7251,7 @@ impl Compiler {
             oop_maps: Vec::new(),
             local_oop_masks: Vec::new(),
             local_kinds: Vec::new(),
+            uses_long_float_double: false,
             local_oop_reached: Vec::new(),
             cur_bc_pc: 0,
             precise_maps,
@@ -7467,8 +7573,20 @@ impl Compiler {
             locals.push(fv);
         }
 
-        // Operand stack (canonically empty at a BCE loop header, but handle the
-        // general case): map each live entry's StackSlot location to a FrameValue.
+        // Operand stack (empty at a BCE loop header; non-empty at OSR-exit loop
+        // boundaries): map each live entry's StackSlot location to a FrameValue.
+        //
+        // FU2 — the abstract operand stack has NO per-entry width source (unlike
+        // locals, which `local_kinds` types). A non-oop `Frame`/GPR stack slot
+        // could be a cat-1 `int` OR a cat-2 `long` / spilled FP, and the snapshot
+        // can't tell. `uses_long_float_double` is the sound method-level gate: when
+        // the method touches no `long`/`float`/`double`, every non-oop stack slot
+        // is provably a cat-1 `int`/`ref` and keeps its precise encoding; otherwise
+        // such slots are recorded `Unsupported` (re-run) rather than risk a
+        // truncated `long` / mistyped FP on resume. (An XMM-resident stack slot is
+        // FP but float-vs-double is unknown here, so it is always `Unsupported`.)
+        // Pure-int/ref methods (the BCE pilot) are unaffected.
+        let wide_fp = self.uses_long_float_double;
         let n = self.stack.len().min(self.stack_oop_marks.len());
         let mut stack = Vec::with_capacity(n);
         for i in 0..n {
@@ -7477,18 +7595,20 @@ impl Compiler {
                 StackSlot::Frame(off) => {
                     if is_oop {
                         FrameValue::StackSlotRef(-*off)
+                    } else if wide_fp {
+                        FrameValue::Unsupported
                     } else {
                         FrameValue::StackSlot(-*off)
                     }
                 }
                 // A register-resident operand: a ref → `RegisterRef` (GC-tracked
-                // Object on resume), else a cat-1 `Register` (Int). A non-oop long
-                // in a stack register has no width source here and would truncate,
-                // but the operand stack is canonically empty at the BCE/OSR
-                // boundaries the snapshot fires at, so this is the conservative arm.
+                // Object on resume); a non-oop slot is a cat-1 `Register` (Int)
+                // only when the method has no wide/FP value that could occupy it.
                 StackSlot::CalleeSaved(r) | StackSlot::Scratch(r) => {
                     if is_oop {
                         FrameValue::RegisterRef(*r)
+                    } else if wide_fp {
+                        FrameValue::Unsupported
                     } else {
                         FrameValue::Register(*r)
                     }
@@ -23091,6 +23211,8 @@ pub fn compile_with_param_slots(
     // (gated) snapshot consumes it, so skip the scan entirely in production.
     if crate::deopt_real_enabled() {
         compiler.local_kinds = classify_local_kinds(code, code_len, max_locals);
+        // FU2 — method-level cat-2/FP gate for the operand-stack snapshot.
+        compiler.uses_long_float_double = code_uses_long_float_double(code, code_len);
     }
 
     // Emit prologue
