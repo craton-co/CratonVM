@@ -66,6 +66,20 @@ pub enum GcBackend {
     G1,
 }
 
+/// Explicit G1 tuning overrides wired from the `-XX:` knobs, applied by
+/// [`VmHeap::new_with_overrides`]. `None` keeps the collector default.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct G1ConfigOverrides {
+    /// `-XX:G1HeapRegionSize=<bytes>`.
+    pub region_size: Option<usize>,
+    /// `-XX:InitiatingHeapOccupancyPercent=<n>` (clamped to 1..=100).
+    pub ihop_percent: Option<u8>,
+    /// `-XX:MaxGCPauseMillis=<n>`.
+    pub max_gc_pause_ms: Option<u64>,
+    /// `-XX:±UseStringDeduplication`.
+    pub string_dedup: Option<bool>,
+}
+
 // ─── GPU-offload coordination (Phase 6 item 1) ───────────────────────────
 //
 // Process-wide counter tracking the number of live SafepointTokens
@@ -197,6 +211,19 @@ macro_rules! dispatch {
 impl VmHeap {
     /// Create a new VmHeap with the specified backend and total capacity.
     pub fn new(backend: GcBackend, total_bytes: usize) -> Self {
+        Self::new_with_overrides(backend, total_bytes, G1ConfigOverrides::default())
+    }
+
+    /// Like [`Self::new`] but applies explicit G1 tuning overrides (wired from
+    /// the `-XX:` knobs: `InitiatingHeapOccupancyPercent`, `G1HeapRegionSize`,
+    /// `MaxGCPauseMillis`, `±UseStringDeduplication`). Each `None` keeps the
+    /// collector default; an explicit value wins over the heap-size-based
+    /// region-size ergonomic. No effect on the generational backend.
+    pub fn new_with_overrides(
+        backend: GcBackend,
+        total_bytes: usize,
+        overrides: G1ConfigOverrides,
+    ) -> Self {
         match backend {
             GcBackend::Generational => {
                 VmHeap::Generational(GenerationalHeap::with_capacity(total_bytes))
@@ -207,6 +234,21 @@ impl VmHeap {
                 // Scale region size: 1 MB for heaps < 4 GB, 2 MB for larger
                 if total_bytes > 4 * 1024 * 1024 * 1024 {
                     config.region_size = 2 * 1024 * 1024;
+                }
+                // Explicit -XX: overrides take precedence over the ergonomic.
+                if let Some(rs) = overrides.region_size {
+                    if rs > 0 {
+                        config.region_size = rs;
+                    }
+                }
+                if let Some(ihop) = overrides.ihop_percent {
+                    config.ihop_percent = ihop.clamp(1, 100);
+                }
+                if let Some(pause) = overrides.max_gc_pause_ms {
+                    config.max_gc_pause_ms = pause.max(1);
+                }
+                if let Some(dedup) = overrides.string_dedup {
+                    config.string_dedup_enabled = dedup;
                 }
                 VmHeap::G1(G1State::new(config))
             }
@@ -1257,6 +1299,29 @@ mod concurrent_mark_controller_tests {
             VmHeap::G1(s) => Some(s),
             _ => None,
         }
+    }
+
+    /// The `-XX:` G1 knobs flow config → `G1ConfigOverrides` →
+    /// `new_with_overrides` → `G1CollectorConfig`. region_size is observable via
+    /// the region count; the other overrides take the identical match-arm path.
+    #[test]
+    fn g1_config_overrides_apply() {
+        // Default (1 MiB regions): 8 MiB / 1 MiB = 8 regions.
+        let h = VmHeap::new(GcBackend::G1, 8 * 1024 * 1024);
+        assert_eq!(g1_state(&h).unwrap().num_regions(), 8);
+        // -XX:G1HeapRegionSize=2m override: 8 MiB / 2 MiB = 4 regions.
+        let ov = G1ConfigOverrides {
+            region_size: Some(2 * 1024 * 1024),
+            ..Default::default()
+        };
+        let h2 = VmHeap::new_with_overrides(GcBackend::G1, 8 * 1024 * 1024, ov);
+        assert_eq!(
+            g1_state(&h2).unwrap().num_regions(),
+            4,
+            "G1HeapRegionSize override must change the region count"
+        );
+        // Generational backend ignores G1 overrides (no panic / no effect).
+        let _ = VmHeap::new_with_overrides(GcBackend::Generational, 8 * 1024 * 1024, ov);
     }
 
     #[test]
