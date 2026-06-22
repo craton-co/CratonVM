@@ -13,16 +13,12 @@ cp "$REPO/binarytrees.java" "$WORK/binarytrees.java"
 
 declare -A GOLD=( [10]=135854 [14]=3222190 [16]=14985902 [18]=68332206 )
 
-run() {  # $1=depth  $2=flagval(0/1)  $3=extra-env
-  local depth="$1" flag="$2" extra="$3"
-  CRATONVM_COMPACT_REF_FIELDS="$flag" env $extra \
-    "$VM" --java-home "$JDK" -cp "$WORK" binarytrees "$depth" 2>/dev/null | tr -d '[:space:]'
-}
-
+# NOTE: compact_ref_fields_enabled() uses var_os().is_some(), so an EMPTY
+# string still enables it — "off" must leave the var UNSET (env -u), not "".
 echo "=== binarytrees checksum A/B (compact OFF vs ON) ==="
 fail=0
 for d in 10 14 16 18; do
-  off=$(run "$d" "" "")
+  off=$(env -u CRATONVM_COMPACT_REF_FIELDS "$VM" --java-home "$JDK" -cp "$WORK" binarytrees "$d" 2>/dev/null | tr -d '[:space:]')
   on=$(CRATONVM_COMPACT_REF_FIELDS=1 "$VM" --java-home "$JDK" -cp "$WORK" binarytrees "$d" 2>/dev/null | tr -d '[:space:]')
   g="${GOLD[$d]}"
   status="OK"
