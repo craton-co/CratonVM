@@ -469,10 +469,21 @@ STW while siblings are mid-call) + `DetachCurrentThread`. Green JIT-on and
 `--nojit` (~370 STW collections per run); no UAF/crash, no STW hang,
 `alive_count` returns to baseline.
 
-**Caveat (creating thread).** A thread that parks *outside* the VM (e.g. an idle
-coordinator/creating thread in a host `join()`/event loop) while foreign threads
-drive GC must declare itself in-native, or a worker's STW waits for it forever —
-it never reaches a Java safepoint. Foreign attached threads handle this
-automatically (idle-blocked model); the creating thread does not yet have an
-automatic hook, so the soak brackets its host-side wait in a blocked region. A
-clean host-facing "this thread is now in native" primitive is a follow-up.
+**Idle host thread / creating thread.** A thread that parks *outside* the VM
+(e.g. an idle coordinator/creating thread in a host `join()`/event loop) while
+foreign threads drive GC must declare itself in-native, or a worker's STW waits
+for it forever — it never reaches a Java safepoint. Foreign attached threads
+handle this automatically (idle-blocked model). The creating/coordinator thread
+has no automatic hook, so the embedding API exposes an explicit primitive:
+
+```c
+cratonvm_thread_enter_native();   // exclude this thread from GC STW while idle
+... host-side join() / event-loop poll ...
+cratonvm_thread_leave_native();   // rejoin the mutator population
+```
+
+This mirrors HotSpot's `_thread_in_native` transition. It is a no-op for a
+foreign attached thread (already auto-managed). The concurrent-GC soak uses it to
+bracket the creating thread's host-side wait. (A future refinement could
+auto-block the creating thread on return from `JNI_CreateJavaVM` and auto-leave
+on the next VM call, removing the explicit calls.)

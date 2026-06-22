@@ -466,6 +466,61 @@ fn with_foreign_thread<R>(f: impl FnOnce(&mut JvmThread) -> R) -> Option<R> {
     FOREIGN_THREAD_BOX.with(|c| c.borrow_mut().as_mut().map(|b| f(&mut **b)))
 }
 
+/// Declare the **current OS thread** as parked in host-native code so a garbage
+/// collection driven by another (e.g. attached) thread does not wait for it to
+/// reach a Java safepoint it will never hit while parked outside the VM.
+///
+/// This is the host-facing analog of HotSpot's `_thread_in_native`: it excludes
+/// the thread from the stop-the-world `expected` set for the duration. Without
+/// it, an idle creating/coordinator thread that sits in a host `join()` / event
+/// loop while foreign threads drive GC is still counted as a live mutator and
+/// **hangs the collection** (the deadlock the foreign-attach soak surfaced).
+///
+/// Must be balanced by exactly one [`host_thread_leave_native`]. Returns `false`
+/// (a no-op) if no VM exists.
+///
+/// Intended for a thread that holds **no live Java roots** while parked — an idle
+/// coordinator/creating thread. A **foreign attached** thread is already modelled
+/// as in-native (GC-blocked) between its JNI calls, so this is a no-op for it
+/// (double-counting would corrupt the barrier accounting).
+pub fn host_thread_enter_native() -> bool {
+    if is_foreign_attached() {
+        // Already auto-managed as idle-blocked between calls; nothing to do.
+        return true;
+    }
+    let shared = match process_vm() {
+        Some(s) => s,
+        None => return false,
+    };
+    let pre_stw = shared.gc_barrier.mark_blocked_region_enter();
+    if pre_stw {
+        // A stop-the-world was already active when we incremented the blocked
+        // count, so `request_stw` had counted this thread in `expected` (it was
+        // a live, non-blocked mutator at that instant). Arrive exactly once so
+        // the initiator's `wait_for_all` can complete. The id only selects "am I
+        // the initiator" — a thread declaring itself in-native is never the
+        // initiator — and a non-foreign caller here is the creating thread (id 0).
+        let _ = shared.gc_barrier.arrive_and_wait(ThreadId(0));
+    }
+    true
+}
+
+/// Re-enter the VM after [`host_thread_enter_native`]: the current thread rejoins
+/// the mutator population (it will wait out any in-flight stop-the-world first).
+/// Must balance exactly one prior `host_thread_enter_native`. No-op for a foreign
+/// attached thread (auto-managed) or when no VM exists.
+pub fn host_thread_leave_native() -> bool {
+    if is_foreign_attached() {
+        return true;
+    }
+    let shared = match process_vm() {
+        Some(s) => s,
+        None => return false,
+    };
+    shared.gc_barrier.mark_blocked_region_leave();
+    true
+}
+
 /// Whether the foreign-thread attach path is enabled.
 ///
 /// Default **ON** (Step 7 of `foreign-thread-attach.md`): a genuinely foreign
@@ -6377,6 +6432,42 @@ mod tests {
             assert_eq!(shared.gc_barrier.blocked_count(), 0);
             assert_eq!(FOREIGN_CALL_DEPTH.with(|c| c.get()), 0);
         }
+    }
+
+    /// `host_thread_enter_native` excludes an idle (non-foreign) coordinator
+    /// thread from stop-the-world, so a GC initiated by another thread does not
+    /// wait for it — the creating-thread STW-hang the primitive resolves.
+    #[test]
+    fn host_native_excludes_idle_thread_from_stw() {
+        use crate::config::VmConfig;
+        use crate::vm::SharedVm;
+        use std::collections::HashMap;
+        let _guard = PROCESS_VM_TEST_LOCK.lock();
+        let shared = Arc::new(SharedVm::new(VmConfig::default()));
+        set_process_vm(&shared);
+
+        let init = shared.thread_registry.next_thread_id();
+        shared.thread_registry.register(init, "init", None);
+        let coord = shared.thread_registry.next_thread_id();
+        shared.thread_registry.register(coord, "coordinator", None);
+        assert_eq!(shared.thread_registry.alive_count(), 2);
+
+        // This thread declares itself in-native (no foreign attachment present).
+        assert!(host_thread_enter_native());
+        assert_eq!(shared.gc_barrier.blocked_count(), 1);
+
+        // A STW from the initiator excludes the in-native thread → waits for nobody.
+        assert!(shared.gc_barrier.request_stw(init, 2));
+        assert_eq!(
+            shared.gc_barrier.pending_count(),
+            0,
+            "in-native thread must be excluded from the STW expected-set"
+        );
+        shared.gc_barrier.wait_for_all();
+        shared.gc_barrier.complete_gc(HashMap::new());
+
+        assert!(host_thread_leave_native());
+        assert_eq!(shared.gc_barrier.blocked_count(), 0);
     }
 
     #[test]
