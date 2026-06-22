@@ -1,5 +1,12 @@
 # Internal development notes (NON-NORMATIVE)
 
+> **2026-06-22:** still-**OPEN** bug docs that lived here (app-jvm-bugs/, gaps/,
+> h2-suite-bugs/, keycloak-crash-reports/, tomcat-suite-bugs/, wildfly-suite-bugs/)
+> were **relocated to `docs/known-issues/`** so every unfixed bug lives under
+> known-issues. FIXED/resolved bugs (e.g. `fixed-suite-bugs/`, the ✅-RESOLVED
+> docs) stay here — a doc moves out of known-issues only when its bug is fixed.
+> See `docs/known-issues/README.md` "Open bug docs relocated…".
+
 This folder holds **non-normative internal development notes**: working
 artifacts, point-in-time audit findings, and large-app bring-up logs. They are
 written for contributors mid-flight and may be **outdated, incomplete, or
