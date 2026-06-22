@@ -5837,35 +5837,82 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let path_obj = obj_arg(args, 1)?;
             let p = p57_read_path(ctx, path_obj);
-            // Read the file into a byte array and wrap in a SeekableByteChannel stub
-            let read = match jarfs_decode(&p) {
-                Some((jar, entry)) => jarfs_read_entry(&jar, &entry),
-                None => std::fs::read(&p),
-            };
-            match read {
-                Ok(data) => {
-                    let channel = alloc_concurrent_synthetic(ctx, "java/nio/channels/SeekableByteChannel", 3);
-                    use cratonvm_types::ArrayElementType;
-                    let arr = ctx.new_array(ArrayElementType::Byte, data.len());
-                    for (i, &b) in data.iter().enumerate() {
-                        ctx.set_array_element(arr, i, Value::Int(b as i8 as i32));
+            // Jar-filesystem entries are not real OS files (`fd_table` cannot
+            // open them), so keep the in-memory snapshot path for them. (These
+            // remain read-only via the methodless stub — unchanged behaviour.)
+            if let Some((jar, entry)) = jarfs_decode(&p) {
+                return match jarfs_read_entry(&jar, &entry) {
+                    Ok(data) => {
+                        let channel = alloc_concurrent_synthetic(
+                            ctx,
+                            "java/nio/channels/SeekableByteChannel",
+                            3,
+                        );
+                        use cratonvm_types::ArrayElementType;
+                        let arr = ctx.new_array(ArrayElementType::Byte, data.len());
+                        for (i, &b) in data.iter().enumerate() {
+                            ctx.set_array_element(arr, i, Value::Int(b as i8 as i32));
+                        }
+                        ctx.set_field(channel, 0, Value::Object(Some(arr))); // data
+                        ctx.set_field(channel, 1, Value::Int(0)); // position
+                        ctx.set_field(channel, 2, Value::Int(data.len() as i32)); // size
+                        Ok(Some(Value::Object(Some(channel))))
                     }
-                    ctx.set_field(channel, 0, Value::Object(Some(arr))); // data
-                    ctx.set_field(channel, 1, Value::Int(0));            // position
-                    ctx.set_field(channel, 2, Value::Int(data.len() as i32)); // size
-                    Ok(Some(Value::Object(Some(channel))))
-                }
-                // NIO contract: a missing file must surface as
-                // `java.nio.file.NoSuchFileException`, NOT a bare `IOException`.
-                // Frameworks treat config sources as OPTIONAL by catching
-                // NoSuchFileException (e.g. SmallRye Config loading Keycloak's
-                // profile-specific `keycloak-<profile>.conf`); a generic
-                // IOException escapes that catch and aborts boot (SRCFG00035).
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    Err(p57_no_such_file(ctx, &p))
-                }
-                Err(e) => Err(p57_io_error(&e)),
+                    // NIO contract: a missing file must surface as
+                    // `java.nio.file.NoSuchFileException`, NOT a bare `IOException`.
+                    // Frameworks treat config sources as OPTIONAL by catching
+                    // NoSuchFileException (e.g. SmallRye Config loading Keycloak's
+                    // profile-specific `keycloak-<profile>.conf`); a generic
+                    // IOException escapes that catch and aborts boot (SRCFG00035).
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        Err(p57_no_such_file(ctx, &p))
+                    }
+                    Err(e) => Err(p57_io_error(&e)),
+                };
             }
+            // Preserve the NIO missing-file contract: opening a non-existent
+            // path for READ — or for WRITE without CREATE/CREATE_NEW — must throw
+            // `java.nio.file.NoSuchFileException`, which frameworks catch to treat
+            // a config source as OPTIONAL (SmallRye loading Keycloak's
+            // `keycloak-<profile>.conf`; SRCFG00035). `newFileChannel`'s fd open
+            // would surface a generic `IOException` here, so pre-check.
+            if !std::path::Path::new(&p).exists() {
+                let creates = match args.get(2) {
+                    Some(Value::Object(Some(set))) => ctx
+                        .invoke_virtual(*set, "toString", "()Ljava/lang/String;", &[])
+                        .ok()
+                        .flatten()
+                        .and_then(|v| match v {
+                            Value::Object(Some(s)) => ctx.read_string(s),
+                            _ => None,
+                        })
+                        .map(|s| s.contains("CREATE"))
+                        .unwrap_or(false),
+                    _ => false,
+                };
+                if !creates {
+                    return Err(p57_no_such_file(ctx, &p));
+                }
+            }
+            // Real file: return a working `FileChannel` (which implements
+            // `SeekableByteChannel`) so `read`/`write`/`position`/`size`/`close`
+            // resolve to the fd_table-backed `FileChannel` natives. Previously
+            // this returned a synthetic object allocated AS the bare
+            // `SeekableByteChannel` interface with no method bodies, so
+            // `channel.write(buf)` / `channel.read(buf)` dispatched to the
+            // abstract interface method → `AbstractMethodError:
+            // WritableByteChannel.write … has no Code attribute`
+            // (SC-resource-io-family Cause A). Delegate to the sibling
+            // `newFileChannel` shim, which parses the `OpenOption` Set
+            // (READ/WRITE/APPEND/CREATE/TRUNCATE_EXISTING) and opens the fd.
+            // NB: inline the class-name literal (not the `fsp` binding) so this
+            // closure stays non-capturing — `r.register` takes a bare `fn`.
+            ctx.invoke(
+                "java/nio/file/spi/FileSystemProvider",
+                "newFileChannel",
+                "(Ljava/nio/file/Path;Ljava/util/Set;[Ljava/nio/file/attribute/FileAttribute;)Ljava/nio/channels/FileChannel;",
+                args,
+            )
         },
     );
 
@@ -7708,12 +7755,25 @@ fn fsp_new_output_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         ctx.set_field_by_name(exc, "file", Value::Object(Some(file_str)));
         return Err(MethodCallFailed::ExceptionThrown(exc));
     }
-    let fd = ctx
-        .fd_table()
-        .open_write(&p, append)
-        .map_err(|e| RuntimeError::IOException {
-            message: format!("newOutputStream({}): {}", p, e),
-        })?;
+    let fd = match ctx.fd_table().open_write(&p, append) {
+        Ok(fd) => fd,
+        Err(e) => {
+            // Surface the TYPED `java.nio.file` exception HotSpot throws, not a
+            // bare IOException. Opening a directory for output denies access on
+            // Windows (os error 5) → `AccessDeniedException` (SC-resource-io
+            // Cause C: Spring's `PathResourceTests.getOutputStreamForDirectory`);
+            // a missing parent → `NoSuchFileException`. Both are `IOException`
+            // subclasses so existing `catch (IOException)` callers are unaffected.
+            return Err(match e.kind() {
+                std::io::ErrorKind::PermissionDenied => p57_access_denied(ctx, &p),
+                std::io::ErrorKind::NotFound => p57_no_such_file(ctx, &p),
+                _ => RuntimeError::IOException {
+                    message: format!("newOutputStream({}): {}", p, e),
+                }
+                .into(),
+            });
+        }
+    };
     // Allocate a real FileOutputStream and wire the fd onto its
     // FileDescriptor — the existing FOS native overrides (write/flush/close,
     // registered in native-io::lib.rs) recover the fd via the same
@@ -7743,6 +7803,19 @@ fn p57_no_such_file(ctx: &mut dyn NativeContext, path: &str) -> MethodCallFailed
     let exc = alloc_concurrent_synthetic(ctx, "java/nio/file/NoSuchFileException", 4);
     let file_str = ctx.create_string(path);
     // FileSystemException stores the offending path in its `file` field.
+    ctx.set_field_by_name(exc, "file", Value::Object(Some(file_str)));
+    MethodCallFailed::ExceptionThrown(exc)
+}
+
+/// Build a *typed* `java.nio.file.AccessDeniedException` for `path` (mirrors
+/// [`p57_no_such_file`]). `AccessDeniedException extends FileSystemException
+/// extends IOException`, so the thrown object carries the genuine `ClassId` and
+/// matches `catch (AccessDeniedException)` / `FileSystemException` / `IOException`.
+/// Used when an OS open returns access-denied (e.g. opening a directory for
+/// output on Windows) so the thrown type matches HotSpot.
+fn p57_access_denied(ctx: &mut dyn NativeContext, path: &str) -> MethodCallFailed {
+    let exc = alloc_concurrent_synthetic(ctx, "java/nio/file/AccessDeniedException", 4);
+    let file_str = ctx.create_string(path);
     ctx.set_field_by_name(exc, "file", Value::Object(Some(file_str)));
     MethodCallFailed::ExceptionThrown(exc)
 }
