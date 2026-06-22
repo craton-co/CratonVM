@@ -5837,35 +5837,58 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let path_obj = obj_arg(args, 1)?;
             let p = p57_read_path(ctx, path_obj);
-            // Read the file into a byte array and wrap in a SeekableByteChannel stub
-            let read = match jarfs_decode(&p) {
-                Some((jar, entry)) => jarfs_read_entry(&jar, &entry),
-                None => std::fs::read(&p),
-            };
-            match read {
-                Ok(data) => {
-                    let channel = alloc_concurrent_synthetic(ctx, "java/nio/channels/SeekableByteChannel", 3);
-                    use cratonvm_types::ArrayElementType;
-                    let arr = ctx.new_array(ArrayElementType::Byte, data.len());
-                    for (i, &b) in data.iter().enumerate() {
-                        ctx.set_array_element(arr, i, Value::Int(b as i8 as i32));
+            // Jar-filesystem entries are not real OS files (`fd_table` cannot
+            // open them), so keep the in-memory snapshot path for them. (These
+            // remain read-only via the methodless stub — unchanged behaviour.)
+            if let Some((jar, entry)) = jarfs_decode(&p) {
+                return match jarfs_read_entry(&jar, &entry) {
+                    Ok(data) => {
+                        let channel = alloc_concurrent_synthetic(
+                            ctx,
+                            "java/nio/channels/SeekableByteChannel",
+                            3,
+                        );
+                        use cratonvm_types::ArrayElementType;
+                        let arr = ctx.new_array(ArrayElementType::Byte, data.len());
+                        for (i, &b) in data.iter().enumerate() {
+                            ctx.set_array_element(arr, i, Value::Int(b as i8 as i32));
+                        }
+                        ctx.set_field(channel, 0, Value::Object(Some(arr))); // data
+                        ctx.set_field(channel, 1, Value::Int(0)); // position
+                        ctx.set_field(channel, 2, Value::Int(data.len() as i32)); // size
+                        Ok(Some(Value::Object(Some(channel))))
                     }
-                    ctx.set_field(channel, 0, Value::Object(Some(arr))); // data
-                    ctx.set_field(channel, 1, Value::Int(0));            // position
-                    ctx.set_field(channel, 2, Value::Int(data.len() as i32)); // size
-                    Ok(Some(Value::Object(Some(channel))))
-                }
-                // NIO contract: a missing file must surface as
-                // `java.nio.file.NoSuchFileException`, NOT a bare `IOException`.
-                // Frameworks treat config sources as OPTIONAL by catching
-                // NoSuchFileException (e.g. SmallRye Config loading Keycloak's
-                // profile-specific `keycloak-<profile>.conf`); a generic
-                // IOException escapes that catch and aborts boot (SRCFG00035).
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    Err(p57_no_such_file(ctx, &p))
-                }
-                Err(e) => Err(p57_io_error(&e)),
+                    // NIO contract: a missing file must surface as
+                    // `java.nio.file.NoSuchFileException`, NOT a bare `IOException`.
+                    // Frameworks treat config sources as OPTIONAL by catching
+                    // NoSuchFileException (e.g. SmallRye Config loading Keycloak's
+                    // profile-specific `keycloak-<profile>.conf`); a generic
+                    // IOException escapes that catch and aborts boot (SRCFG00035).
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        Err(p57_no_such_file(ctx, &p))
+                    }
+                    Err(e) => Err(p57_io_error(&e)),
+                };
             }
+            // Real file: return a working `FileChannel` (which implements
+            // `SeekableByteChannel`) so `read`/`write`/`position`/`size`/`close`
+            // resolve to the fd_table-backed `FileChannel` natives. Previously
+            // this returned a synthetic object allocated AS the bare
+            // `SeekableByteChannel` interface with no method bodies, so
+            // `channel.write(buf)` / `channel.read(buf)` dispatched to the
+            // abstract interface method → `AbstractMethodError:
+            // WritableByteChannel.write … has no Code attribute`
+            // (SC-resource-io-family Cause A). Delegate to the sibling
+            // `newFileChannel` shim, which parses the `OpenOption` Set
+            // (READ/WRITE/APPEND/CREATE/TRUNCATE_EXISTING) and opens the fd.
+            // NB: inline the class-name literal (not the `fsp` binding) so this
+            // closure stays non-capturing — `r.register` takes a bare `fn`.
+            ctx.invoke(
+                "java/nio/file/spi/FileSystemProvider",
+                "newFileChannel",
+                "(Ljava/nio/file/Path;Ljava/util/Set;[Ljava/nio/file/attribute/FileAttribute;)Ljava/nio/channels/FileChannel;",
+                args,
+            )
         },
     );
 
