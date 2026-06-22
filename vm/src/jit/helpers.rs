@@ -4433,6 +4433,17 @@ impl DeoptimizationController {
             jit_cache.remove(class_name, method_name, descriptor);
         }
 
+        // deopt-osr Step 9 — advance the method's live compilation epoch so that
+        // (a) the next compilation is stamped fresh and (b) any frame still
+        // executing this now-evicted artifact, when it reaches the
+        // real-frame-deopt resume sink, sees `compilation_epoch < live` and
+        // re-runs instead of resuming a superseded speculation. Gated on the
+        // resume feature: the epoch is only ever *read* under `deopt_real_enabled()`,
+        // so production VMs neither bump nor consult it (byte-identical).
+        if cratonvm_jit::deopt_real_enabled() {
+            vm.bump_compilation_epoch(&method_key);
+        }
+
         // For class-check or receiver-type failures, also check the
         // invalidation manager for dependent methods.
         if matches!(
