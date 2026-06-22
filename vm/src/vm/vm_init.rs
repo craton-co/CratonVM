@@ -2447,6 +2447,19 @@ impl SharedVm {
             init_level_waiters: Arc::new((std::sync::Mutex::new(()), std::sync::Condvar::new())),
         };
 
+        // wire-tiered-manager Step 4 (PGO handoff C1 → C2): turn on interpreter
+        // profile recording when the opt-in gate is set. This MUST happen here, at
+        // VM init (before any method frame executes), not lazily at the JIT
+        // threshold — the dispatch loop captures `is_profiling_enabled()` once per
+        // frame entry, so a method already warming up would never record. With the
+        // gate set, the interpreted ("C1"/warmup) phase populates
+        // `profile_store` (branch bias, receiver types, loop trips); the optimizing
+        // C2 compile then consumes it. Default-OFF: `enable_profiling` is never
+        // called, every `record_*` short-circuits, and behaviour is unchanged.
+        if crate::runtime::env_cache::tier_pgo() {
+            crate::jit::profile::enable_profiling(true);
+        }
+
         // Post-construction: pre-initialize critical static fields for core
         // classes when running with real JDK bytecode.  This must happen after
         // the struct is fully built because the helpers need &SharedVm.

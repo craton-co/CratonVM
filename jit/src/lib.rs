@@ -5061,12 +5061,37 @@ fn try_compile_inner(
                     .any(|n| matches!(n.op, ir::Op::New { .. } | ir::Op::NewArray { .. }));
                 if !has_live_new {
                     let schedule = ir_schedule::schedule(&graph);
-                    if let Some(mut compiled) = ir_lower::lower(
+                    // wire-tiered-manager Step 4 (PGO handoff C1 → C2): hand the
+                    // optimizing IR (C2) lowerer the profiled branch bias so it can
+                    // pick each `Op::If`'s fall-through edge from the C1/interpreter
+                    // profile — the IR analogue of the single-pass backend's
+                    // `branch_hints` (built identically below). Keyed by the branch
+                    // instruction's bytecode PC (matching `Op::If::bytecode_pc` and
+                    // the interpreter's `record_branch` PC). Empty when there is no
+                    // profile (profiling off, the default) → byte-identical codegen.
+                    let ir_branch_hints: std::collections::HashMap<usize, bool> = profile
+                        .map(|prof| {
+                            prof.branches
+                                .iter()
+                                .filter_map(|(&pc, counts)| {
+                                    if counts.is_usually_taken() {
+                                        Some((pc, true))
+                                    } else if counts.is_usually_not_taken() {
+                                        Some((pc, false))
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    if let Some(mut compiled) = ir_lower::lower_with_branch_hints(
                         &graph,
                         &schedule,
                         num_params,
                         cached.max_locals as usize,
                         helpers,
+                        &ir_branch_hints,
                     ) {
                         // Gap B: attach the leaked `JitInvokeInfo` boxes/strings
                         // so the `info_ptr`s baked into each `Op::Call` stay valid
