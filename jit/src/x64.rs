@@ -18127,6 +18127,11 @@ impl Compiler {
                         .field_info_idx
                         .get(&pc)
                         .filter(|_| std::env::var_os("DISABLE_INLINE_GETFIELD").is_none())
+                        // Compact layout: a reference field is an 8-byte pointer
+                        // and a primitive field sits at a packed offset, so the
+                        // baked `HEADER + index*SLOT_SIZE` 16-byte-cell load is
+                        // wrong. Route to the compact-aware `jit_getfield` helper.
+                        .filter(|_| !cratonvm_types::compact_ref_fields_enabled())
                     {
                         // Inline field load — the field index and type tag are
                         // statically resolved (`field_info` was built from
@@ -18260,7 +18265,13 @@ impl Compiler {
                             // performs the full SATB pre-barrier + card write-barrier.
                             // This is the fresh-init pattern (`n.left = newChild`) that
                             // dominates allocation-heavy code. Off ⇒ helper as before.
-                            if inline_putfield_enabled() {
+                            // Compact layout: reference fields are 8-byte
+                            // pointers, so this inline 16-byte `Value` store is
+                            // wrong — bail to the compact-aware
+                            // `jit_putfield_object` helper.
+                            if inline_putfield_enabled()
+                                && !cratonvm_types::compact_ref_fields_enabled()
+                            {
                                 let cell_off = (HEADER_SIZE + field_index * SLOT_SIZE) as i32; // Cast: x86-64 disp32
                                 let mut bail: Vec<usize> = Vec::new();
                                 // obj → RAX
@@ -22234,7 +22245,12 @@ impl Compiler {
                             && self.helpers.new_object != 0
                             && total_size <= 256
                             && self.needs_heap // need vm_ptr in heap_local slot
-                            && std::env::var_os("CRATONVM_JIT_DISABLE_INLINE_NEW").is_none();
+                            && std::env::var_os("CRATONVM_JIT_DISABLE_INLINE_NEW").is_none()
+                            // Compact layout: the object's true size is the
+                            // packed body, not `num_fields * SLOT_SIZE`. Route to
+                            // the `jit_new_object` helper (compact-aware sizing
+                            // via `try_alloc_object_full`).
+                            && !cratonvm_types::compact_ref_fields_enabled();
 
                         // Round-8 wave-3: defensive callee-saved spill
                         // before the `new` safepoint (both inline TLAB

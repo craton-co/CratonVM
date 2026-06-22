@@ -19,8 +19,8 @@ mod value;
 
 pub use class_id::{ClassId, ClassLoaderId};
 pub use field_layout::{
-    class_layout, compact_ref_fields_enabled, is_compact_object, object_body_size,
-    register_class_layout, set_compact_ref_fields_enabled, CompactLayout,
+    class_layout, compact_field_slot, compact_ref_fields_enabled, is_compact_object,
+    object_body_size, register_class_layout, set_compact_ref_fields_enabled, CompactLayout,
 };
 pub use float_format::{java_double_to_string, java_float_to_string};
 pub use compact_value::{CompactTag, CompactValue, CompactValueError};

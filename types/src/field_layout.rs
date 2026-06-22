@@ -111,6 +111,16 @@ pub fn class_layout(class_id: u32) -> Option<Arc<CompactLayout>> {
     v.get(class_id as usize).and_then(|o| o.clone())
 }
 
+/// `(byte_offset, is_ref)` for field `index` of `class_id`, if a compact layout
+/// is registered (and the index is in range); else `None`. Used by the JIT
+/// field helpers, which only have the raw object pointer (`class_id` from the
+/// header) and the resolved field index — not a heap handle.
+#[inline]
+pub fn compact_field_slot(class_id: u32, index: usize) -> Option<(usize, bool)> {
+    let layout = class_layout(class_id)?;
+    Some((layout.field_offset(index)? as usize, layout.field_is_ref(index)?))
+}
+
 /// Clear the registry (test-only).
 #[cfg(test)]
 pub fn clear_class_layouts() {
