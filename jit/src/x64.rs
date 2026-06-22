@@ -7478,6 +7478,23 @@ impl Compiler {
         self.deopt_box_ptr_by_bci.insert(bci, box_ptr);
     }
 
+    /// Step 6: Record a `DeoptimizationPoint` for a call-site guard bail using
+    /// the CURRENT stack state. Must be called right after `flush_scratch_registers()`
+    /// (so every Scratch/Xmm operand is in a `Frame` slot) and BEFORE any
+    /// `pop_stack()` calls for the intrinsic, so the snapshot reflects the JVM's
+    /// abstract operand stack at this `bci`. The same `deopt_box_ptr_by_bci` map
+    /// is used as for loop-header BCE guards; `emit_deopt_stubs` routes reason-2
+    /// and reason-6 bails to the frame-deopt trampoline when a snapshot is found.
+    /// Idempotent: a second call for the same `bci` is a no-op.
+    /// Only called when `deopt_real_enabled()`; production builds are unaffected.
+    fn snapshot_pre_intrinsic_call(&mut self, bci: usize, reason: crate::deopt::DeoptReason) {
+        if self.deopt_box_ptr_by_bci.contains_key(&bci) {
+            return;
+        }
+        let box_ptr = self.build_and_record_deopt_point(bci, reason);
+        self.deopt_box_ptr_by_bci.insert(bci, box_ptr);
+    }
+
     /// deopt-osr Step 7: emit an OSR-exit map — a precise deopt snapshot tagged
     /// `DeoptReason::OsrExit` — at a loop-boundary `bci` (one of the PCs already
     /// vetted OSR-eligible, i.e. `osr_entry_native[pc] >= 0`, so it inherits the
@@ -14534,6 +14551,11 @@ impl Compiler {
             let frame_box_ptr = if crate::deopt_real_enabled() {
                 match reason {
                     2 => self.deopt_box_ptr_by_bci.get(&bci).copied(),
+                    // Step 6: String-intrinsic and call-site type-check guards
+                    // (ReceiverTypeChanged). The same `deopt_box_ptr_by_bci` map
+                    // is used; a snapshot was recorded by `snapshot_pre_intrinsic_call`
+                    // immediately after the pre-call flush (before any arg pops).
+                    6 => self.deopt_box_ptr_by_bci.get(&bci).copied(),
                     7 => self.osr_exit_box_ptr_by_bci.get(&bci).copied(),
                     _ => None,
                 }
@@ -19104,6 +19126,16 @@ impl Compiler {
                             // Operand stack (deepest first): src, srcPos,
                             // dst, dstPos, len.
                             self.flush_scratch_registers();
+                            // Step 6: snapshot the pre-pop JVM operand stack
+                            // (src, srcPos, dst, dstPos, len) so a bail from
+                            // any null/bounds guard resumes precisely at this
+                            // invokestatic bci rather than re-running from entry.
+                            if crate::deopt_real_enabled() {
+                                self.snapshot_pre_intrinsic_call(
+                                    pc,
+                                    crate::deopt::DeoptReason::BoundsCheck,
+                                );
+                            }
                             let len_slot = self.pop_stack();
                             let dst_pos_slot = self.pop_stack();
                             let dst_slot = self.pop_stack();
@@ -20280,6 +20312,15 @@ impl Compiler {
                             };
                             if let Some(kind) = acc {
                                 self.flush_scratch_registers();
+                                // Step 6: snapshot before arg pops so a null-
+                                // receiver / class-id guard bail resumes at the
+                                // invokevirtual bci (receiver [+ index] on stack).
+                                if crate::deopt_real_enabled() {
+                                    self.snapshot_pre_intrinsic_call(
+                                        pc,
+                                        crate::deopt::DeoptReason::ReceiverTypeChanged,
+                                    );
+                                }
                                 let mut bail: Vec<usize> = Vec::new();
 
                                 // Pop operands. charAt has an index arg
@@ -20541,6 +20582,13 @@ impl Compiler {
                         {
                             let layout = self.string_layout.unwrap();
                             self.flush_scratch_registers();
+                            // Step 6: snapshot (this, other) before pops.
+                            if crate::deopt_real_enabled() {
+                                self.snapshot_pre_intrinsic_call(
+                                    pc,
+                                    crate::deopt::DeoptReason::ReceiverTypeChanged,
+                                );
+                            }
                             let mut bail: Vec<usize> = Vec::new();
 
                             // Operand stack (deepest first): this, other.
@@ -20679,6 +20727,13 @@ impl Compiler {
                         {
                             let layout = self.string_layout.unwrap();
                             self.flush_scratch_registers();
+                            // Step 6: snapshot (this, other) before pops.
+                            if crate::deopt_real_enabled() {
+                                self.snapshot_pre_intrinsic_call(
+                                    pc,
+                                    crate::deopt::DeoptReason::ReceiverTypeChanged,
+                                );
+                            }
                             let mut bail: Vec<usize> = Vec::new();
 
                             // Operand stack (deepest first): this, other.
@@ -20825,6 +20880,13 @@ impl Compiler {
                         {
                             let layout = self.string_layout.unwrap();
                             self.flush_scratch_registers();
+                            // Step 6: snapshot (this, ch) before pops.
+                            if crate::deopt_real_enabled() {
+                                self.snapshot_pre_intrinsic_call(
+                                    pc,
+                                    crate::deopt::DeoptReason::ReceiverTypeChanged,
+                                );
+                            }
                             let mut bail: Vec<usize> = Vec::new();
 
                             // Operand stack (deepest first): this, ch.
@@ -20911,6 +20973,13 @@ impl Compiler {
                         {
                             let layout = self.string_layout.unwrap();
                             self.flush_scratch_registers();
+                            // Step 6: snapshot (this, needle) before pops.
+                            if crate::deopt_real_enabled() {
+                                self.snapshot_pre_intrinsic_call(
+                                    pc,
+                                    crate::deopt::DeoptReason::ReceiverTypeChanged,
+                                );
+                            }
                             let mut bail: Vec<usize> = Vec::new();
 
                             // Operand stack (deepest first): this, needle.
@@ -21136,6 +21205,15 @@ impl Compiler {
                                 let pay_off = cell_off + FIELD_CELL_PAYLOAD32_OFFSET as i32;
 
                                 self.flush_scratch_registers();
+                                // Step 6: snapshot (receiver [, arr, off, len])
+                                // before pops so null/bounds guard bails resume
+                                // at the invokevirtual CRC32.update bci.
+                                if crate::deopt_real_enabled() {
+                                    self.snapshot_pre_intrinsic_call(
+                                        pc,
+                                        crate::deopt::DeoptReason::BoundsCheck,
+                                    );
+                                }
 
                                 // --- pop operands (deepest = receiver) ---
                                 // update(I)V    : [receiver, b]
