@@ -18,11 +18,26 @@ Landed increments:
 | 33 | **float returns** + `F` call returns — `freturn` arm; result rides low-32 of RAX. |
 | 34 | **FP params + `D`/`F` call-args** — dropped the gate's `!fp_in_params`; `static_call_shape` admits `D`/`F` args. |
 | 35 | **double `ldc2_w` constants** — `cp_ldc2w_resolver` returns `(bits, is_double)`; builder lowers `dconst`/`lconst`. |
+| **A** | **`frem`/`drem`** — `jit_frem`/`jit_drem` fmod golden-table helpers (`extern "C"`, XMM ABI); `Op::Rem` Float/Double arm `CALL`s them. jit_scan admits `0x70..=0x73`; single-pass bails via the `match op` catch-all. (commit `62f6e6f4`) |
+| **C** | **FP-slot deopt resume** — `FrameValue::{Double,StackSlotFloat,StackSlotDouble}`; `resolve_value` + `fv_to_value` + `ir_deopt_locals` (cat-2 Double collapse) reconstruct FP slots; **dropped the gate's `!method_has_int_div`**. (commit `5312b11c`) |
+| **B** | **FP arrays** (`faload`/`daload`/`fastore`/`dastore`) — `Op::ArrayLoad`/`ArrayStore(MemKind)`; inline `MOVSS`/`MOVSD` at `[arr + idx*sz + HEADER_SIZE]` after `emit_array_null_bounds_guards` (deopt-on-fault → interpreter re-throws NPE/AIOOBE; FP-safe via Slice C). DCE-rooted, unroller-bail, `EaOp::Call` conservative escape. (commit `f9cfc485`) |
 
 Net: a method with a full FP **signature** (params + return), FP arithmetic,
-compares/branches, FP calls, and double/long constants takes the IR path. What it
-still can NOT do: **FP arrays**, **frem/drem**, and **be live at a deopt** (so
-int-div is still excluded).
+compares/branches, FP calls, double/long constants, **`frem`/`drem`, FP arrays,
+AND an FP value live at an int-div deopt** all take the IR path. **The FP IR tier
+is now opcode-complete** — the gate admits any FP method
+(`ir_emit_fp && fp_in_body(code)`). Remaining: the **default flip** (below).
+
+Validation of A/B/C (each `== HotSpot`, gate-OFF byte-identical): 78
+`ir_vs_singlepass` + 825 jit lib + 29 jit-api tests; E2E probes (frem fmod,
+div-zero deopt with live FP local PRECISE-resumed, FP array sums + null/OOB fault
+parity); bt10/14/16/18 == `135854 / 3222190 / 14985902 / 68332206` with the gate
+on. Probes live in `scratch/fprem/` (gitignored).
+
+A pre-existing **single-pass** bug surfaced while validating Slice C: a
+float/double method with an `idiv` routed to single-pass (gate OFF) hangs on the
+div-by-zero path (the IR path handles it correctly). Filed separately — not an
+FP-IR-tier regression.
 
 ## Shared invariants (DO NOT BREAK)
 
@@ -68,7 +83,14 @@ after each ff-merge — rebase onto dev before each merge; dev moves fast).
 
 ---
 
-## Slice A — `frem` / `drem` (smallest concept, high churn)
+## Slice A — `frem` / `drem` (smallest concept, high churn) — ✅ DONE (commit `62f6e6f4`)
+
+> Implemented exactly as designed below (golden-table helpers + `Op::Rem` FP arm).
+> One deviation from the doc: jit_scan **rejected** frem outright (`0x70|0x71`),
+> so admitting it required extending jit_scan to `0x70..=0x73` — single-pass then
+> bails via the `match op` catch-all (`return false`), keeping gate-OFF behaviour
+> intact. The original design text follows.
+
 
 JVM FP remainder == C `fmod` == Rust `%` for floats (truncated, sign-of-dividend;
 NaN/inf rules match: `fmod(x, inf)=x`, `fmod(inf, x)=NaN`, `fmod(x, 0)=NaN`).
@@ -104,7 +126,15 @@ guard + idiv) / Long; add a `Float`/`Double` branch that emits the helper call.
   (a Rust `a % b` anchor) and a real-VM E2E `== HotSpot`. Confirm single-pass's
   behavior first.
 
-## Slice B — FP array load/store (highest value, heaviest)
+## Slice B — FP array load/store (highest value, heaviest) — ✅ DONE (commit `f9cfc485`)
+
+> Implemented via **design 1 (inline + deopt-on-fault)**, done AFTER Slice C so
+> the deopt resume is FP-safe. New `Op::ArrayLoad`/`ArrayStore(MemKind)` (not a
+> reuse of the field-access `Op::Load`/`Store`, whose passes parse a field
+> layout). Optimizer integration: DCE-rooted (both can throw), unroller bails on
+> them, hard LICM barrier, `EaOp::Call` conservative escape. The original design
+> text follows.
+
 
 `faload`(0x30)/`daload`(0x31)/`fastore`(0x51)/`dastore`(0x52). **The IR has NO
 array element access at all** (only `Op::ArrayLength`); every array load/store
@@ -149,7 +179,16 @@ builder lacks arms) — once you add the arms, also confirm the gate admits them
 - **AIOOBE/NPE parity**: the interpreter must re-throw the *exact* exception at the
   *exact* bci on deopt — validate caught-exception programs `== HotSpot`.
 
-## Slice C — FP-slot deopt resume (lifts the int-div exclusion)
+## Slice C — FP-slot deopt resume (lifts the int-div exclusion) — ✅ DONE (commit `5312b11c`)
+
+> Implemented on the cat-2-capable `resume_from_ir_deopt` path (via `fv_to_value`
+> / `ir_deopt_locals`), which is the path that reconstructs `long` (and now FP)
+> slots. The object-aware `resume_real_ir_deopt`/`_with_objects` path uniformly
+> re-runs cat-2 slots (Long AND FP) — left as-is. Both precise-resume paths are
+> gated default-OFF (`CRATONVM_IR_DEOPT_RESUME` / `CRATONVM_DEOPT_REAL`); the
+> default deopt is a whole-method re-run (FP-safe on its own), so dropping the
+> int-div exclusion is safe in every config. The original design text follows.
+
 
 Today the FP gate excludes `method_has_int_div` because an FP value live at the
 int-div deopt guard can't be reconstructed by the interpreter resume. Item 2 made
@@ -173,7 +212,17 @@ stack/locals (FP slots hold bits; rebuild the typed Value). Add a
   interpreter has the correct FP value + throws `== HotSpot`.
 - After this, also revisit whether any remaining `ldc2_w`/FP exclusions can drop.
 
-## Default flip (the finish line)
+## Default flip (the finish line) — ⏳ REMAINING (the only open item)
+
+A/B/C are landed + validated; the FP IR tier is opcode-complete. The flip itself
+is a small code change (the 3 `try_compile` gate reads in `interpreter.rs`), but
+it is **gated on a soak that has NOT been run** and should not be flipped without
+it: the bt10/14/16/18 checksums hold with the gate on (done), but the **app
+gauntlet + kafka/keycloak/tomcat suites** (a multi-hour, per-app-setup effort)
+must be run with `CRATONVM_JIT_IR_FP=1` first — an FP-tier miscompile in some app
+would regress a default-ON build. Until that soak runs clean, the tier stays
+opt-in (the implementation is complete and safe behind the gate; opt-in users get
+the full FP tier today).
 
 Once A/B/C land and soak clean, flip `CRATONVM_JIT_IR_FP` default-ON (mirror the
 inc-23/29 `IR_CALL`/`IR_LONG` flips: change the 3+ `try_compile` gate reads in
