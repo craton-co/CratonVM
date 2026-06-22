@@ -196,10 +196,18 @@ bt's field ops silently fell back to helpers (inline `new` still engaged because
 `compact_field_info` through a thread-local the wrapper consumes. Confirm with
 `CRATONVM_DBG_COMPACT_INLINE=1` (one-shot compile trace per field op / `new`).
 
-**Next lever (optional, to push bt18 from parity to a win):** the GC mark/scan
-calls `compact_oop_scan` → `class_layout` (RwLock + Arc clone) once per scanned
-object; caching that per class within a collection (the live set is mostly one
-class) would shave bt18's larger-live-set scan.
+**bt18 (parity) — investigated, GC was NOT the bottleneck (refuted).** Measured:
+compact does **fewer** young GCs than legacy at bt18 (3 vs 4, `CRATONVM_SP_STATS`),
+and a `CRATONVM_NO_GC` mutator-only A/B still shows compact ~7 % slower — so
+bt18's gap is **mutator-side**, not GC-scan-side, and is within run-to-run noise
+on this load-volatile box (bt18 ON/OFF bounced 100–115 % across runs while bt16
+held steady at ~90 %). A per-thread cache for the GC `compact_oop_scan` lookup
+(generation-validated; commit `eae5028c`) was added anyway as a general
+GC-hot-path cleanup — it removes a per-object registry `RwLock` acquire and helps
+contended / GC-heavy workloads — but it does **not** move bt18 (consistent with
+GC not being the bottleneck there). The real bt18 mutator residual (if any beyond
+noise) and the broader tagged-`Value`-traffic gap remain for a future pass; the
+headline win is **bt16 ~10 % faster, bt18 ~parity**.
 
 ## Gotcha: synthetic objects that store the wrong type into a reference slot
 
