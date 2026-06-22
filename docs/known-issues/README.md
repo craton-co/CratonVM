@@ -378,3 +378,47 @@ supplier/accumulator/finisher/combiner). The **open** ones documented here:
 - [SC-hangs-mergedannotations-charsequence.md](SC-hangs-mergedannotations-charsequence.md) — two hangs: `MergedAnnotations.stream().toArray()` re-entry; Reactor `StepVerifier` producer never scheduled.
 
 Cross-cutting: ByteBuddy `ClassInjector$UsingReflection` failure breaks AssertJ `assertSoftly` + Mockito; JUnit "TimeoutExtension multiple times" masks underlying VM errors.
+
+## Open bug docs relocated from `docs/internal/` (2026-06-22)
+
+Still-**OPEN** bug docs are consolidated here so every unfixed bug lives under
+`docs/known-issues/`. (A2/A4 are the `reflrepro-…` / `fork6-…` docs above;
+FIXED/resolved bugs stay in `docs/internal/` — they are moved out only when fixed.)
+
+**app-jvm-bugs/**
+- [bug-bc-crypto-prng-abnormal-exit-127.md](app-jvm-bugs/bug-bc-crypto-prng-abnormal-exit-127.md)
+- [bug-commons-math-full-reactor.md](app-jvm-bugs/bug-commons-math-full-reactor.md)
+- [bug-commons-math-junit-probe-jit-execute.md](app-jvm-bugs/bug-commons-math-junit-probe-jit-execute.md)
+- [bug-elasticsearch-log4j2-serviceloader.md](app-jvm-bugs/bug-elasticsearch-log4j2-serviceloader.md)
+- [bug-gpu-build-native-builtins-crash.md](app-jvm-bugs/bug-gpu-build-native-builtins-crash.md)
+- [bug-hibernate-duplicate-persistence-unit-scan.md](app-jvm-bugs/bug-hibernate-duplicate-persistence-unit-scan.md)
+- [bug-hibernate-jpa-persistence-xml-properties.md](app-jvm-bugs/bug-hibernate-jpa-persistence-xml-properties.md)
+- [bug-hibernate-log-format-placeholder.md](app-jvm-bugs/bug-hibernate-log-format-placeholder.md)
+- [bug-wildfly-jaxp-premature-end-of-file.md](app-jvm-bugs/bug-wildfly-jaxp-premature-end-of-file.md)
+- [bug-wildfly-msc-service-start-callback.md](app-jvm-bugs/bug-wildfly-msc-service-start-callback.md)
+- [bug-wildfly-throwable-stack-trace-capture.md](app-jvm-bugs/bug-wildfly-throwable-stack-trace-capture.md)
+
+**gaps/**
+- [gap-bc-math-ec-crypto-regression-timeout.md](gaps/gap-bc-math-ec-crypto-regression-timeout.md)
+- [gap-jit-fastmath-transform-miscompile.md](gaps/gap-jit-fastmath-transform-miscompile.md)
+
+**h2-suite-bugs/**
+- [bug-h2-charset-cp500-unsupported.md](h2-suite-bugs/bug-h2-charset-cp500-unsupported.md)
+- [bug-h2-inprocess-javac-resource-bundle.md](h2-suite-bugs/bug-h2-inprocess-javac-resource-bundle.md)
+- [bug-h2-mvstore-insert-loop-perf-hang.md](h2-suite-bugs/bug-h2-mvstore-insert-loop-perf-hang.md)
+- [bug-h2-netutils-missing-pbe-algparams.md](h2-suite-bugs/bug-h2-netutils-missing-pbe-algparams.md)
+- [bug-h2-timezone-dst-offset.md](h2-suite-bugs/bug-h2-timezone-dst-offset.md)
+
+**keycloak-crash-reports/**
+- [06-keypair-verifier-decode.md](keycloak-crash-reports/06-keypair-verifier-decode.md)
+- [08-stripsecrets-json-comparison.md](keycloak-crash-reports/08-stripsecrets-json-comparison.md)
+- [09-streamsutil-onclose-propagation.md](keycloak-crash-reports/09-streamsutil-onclose-propagation.md)
+- [10-jwksutils-one-failure.md](keycloak-crash-reports/10-jwksutils-one-failure.md)
+
+**tomcat-suite-bugs/**
+- [04-embedded-server-throughput-wall-OPEN.md](tomcat-suite-bugs/04-embedded-server-throughput-wall-OPEN.md)
+- [05-suite-rerun-fail-triage.md](tomcat-suite-bugs/05-suite-rerun-fail-triage.md)
+
+**wildfly-suite-bugs/**
+- [bug-06b-jit-scan-cache-unsound.md](wildfly-suite-bugs/bug-06b-jit-scan-cache-unsound.md)
+
