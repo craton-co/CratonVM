@@ -306,12 +306,13 @@ Also fixed on dev this run (no standalone doc — see commit): `Locale.toLanguag
 
 While repairing the in-repo test suites (most failures were stale tests / missing
 fixtures / a wrong feature set — all fixed on `dev`), three defects were left open
-because each needs a risky core change or a large quality pass:
+because each needs a risky core change or a large quality pass. One of the three (the
+JIT divide-by-zero re-run) has since been fixed; the other two remain open:
 
-- **JIT `idiv`/`irem` divide-by-zero re-runs the whole method** (side effects double-execute):
-  [nested-try-catch-jit-divzero-rerun.md](nested-try-catch-jit-divzero-rerun.md). Root-caused;
-  the direct-throw fix already exists on branch `feat/coupled-deopt-moving-spine` and needs a
-  bt18-soak re-verify before landing on `dev`.
+- ✅ **JIT `idiv`/`irem` divide-by-zero re-runs the whole method** (side effects double-execute):
+  FIXED on `dev` (direct-throw of `ArithmeticException`, verified vs HotSpot + bt18 soak). The
+  historical record moved to [../internal/nested-try-catch-jit-divzero-rerun.md](../internal/nested-try-catch-jit-divzero-rerun.md);
+  regression coverage is `test_jit_*_zero_no_double_side_effect` in `vm/tests/exception_tests.rs`.
 - **Brooks read-barrier vs CompactHeader forwarding** (`load_and_forward` reads the legacy
   forwarding slot while the test installs the compact one):
   [tier1-brooks-compactheader-forwarding.md](tier1-brooks-compactheader-forwarding.md). Needs a

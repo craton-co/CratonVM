@@ -4045,13 +4045,37 @@ pub fn execute(
                                 } else {
                                     false
                                 };
+                                // Divide-by-zero direct-throw drain (sibling of the
+                                // NPE/AIOOBE blocks above). The JIT div-by-zero stub sets
+                                // `JIT_PENDING_ARITHMETIC` and returns i64::MIN; route the
+                                // `ArithmeticException` into `jit_early_exception` so the
+                                // post-frame-push handler walker can catch it in the JIT'd
+                                // method, instead of re-running from entry (which double-
+                                // executes side effects preceding the trap).
+                                let arith_routed = if crate::jit::helpers::take_jit_pending_arithmetic() {
+                                    match crate::runtime::exceptions::throw_runtime_error(
+                                        shared,
+                                        thread,
+                                        RuntimeError::ArithmeticException {
+                                            message: "/ by zero".to_string(),
+                                        },
+                                    ) {
+                                        MethodCallFailed::ExceptionThrown(exc) => {
+                                            jit_early_exception = Some(exc);
+                                            true
+                                        }
+                                        other => return Err(other),
+                                    }
+                                } else {
+                                    false
+                                };
                                 // Deopt sentinel: i64::MIN means the JIT method was deoptimized
                                 // via jit_uncommon_trap.  Fall through to the interpreter to
                                 // re-execute the method from scratch.
                                 // If an NPE or AIOOBE was routed above, also fall through so
                                 // the post-frame-push exception handler walker (~line 2340)
                                 // gets a chance to catch it in the JIT'd method.
-                                if !npe_routed && !aioobe_routed && result != i64::MIN {
+                                if !npe_routed && !aioobe_routed && !arith_routed && result != i64::MIN {
                                     return match ret_type {
                                         // Cast: JIT ABI -- i64 register convention
                                         b'I' | b'Z' | b'B' | b'C' | b'S' => {
@@ -17748,6 +17772,41 @@ fn try_osr(
         }
         return None;
     }
+    // Divide-by-zero direct-throw drain on the OSR bail path (sibling of the
+    // NPE/AIOOBE OSR blocks above). Route the `ArithmeticException` through the
+    // OSR'd method's own exception table (the OSR target IS the method whose code
+    // raised it); if a handler covering `entry_pc` is found, jump there and
+    // resume interpreting. Otherwise re-stash the flag so the exception survives
+    // the OSR→interpreter handoff and is surfaced by the next JIT-return drain.
+    if crate::jit::helpers::take_jit_pending_arithmetic() {
+        match crate::runtime::exceptions::throw_runtime_error(
+            shared,
+            thread,
+            RuntimeError::ArithmeticException {
+                message: "/ by zero".to_string(),
+            },
+        ) {
+            MethodCallFailed::ExceptionThrown(exc) => {
+                if let Some((handler_pc, exc_ref)) =
+                    find_exception_handler_any_pc(shared, &thread.frames[frame_idx], entry_pc, exc)
+                {
+                    let frame = &mut thread.frames[frame_idx];
+                    frame.stack.clear();
+                    let _ = frame.stack.push(Value::Object(Some(exc_ref)));
+                    frame.pc = handler_pc;
+                    fire_jvmti_exception_catch(frame, handler_pc);
+                    return None;
+                }
+                // No in-frame handler — re-stash so it is not lost.
+                crate::jit::helpers::stash_jit_pending_arithmetic();
+            }
+            _ => {
+                // Couldn't construct the Java object — re-stash the raw flag.
+                crate::jit::helpers::stash_jit_pending_arithmetic();
+            }
+        }
+        return None;
+    }
     let result_i64 = match result_i64 {
         Ok(Some(v)) => v,
         Ok(None) => return None,
@@ -20240,6 +20299,39 @@ fn execute_jit_call(
         }
     }
 
+    // Divide-by-zero direct-throw drain (sibling of the AIOOBE block above).
+    // The JIT `idiv`/`irem`/`ldiv`/`lrem` zero-divisor stub calls
+    // `jit_throw_arithmetic`, which sets this flag + the deopt signal and returns
+    // `i64::MIN`. Throw a real `ArithmeticException` ("/ by zero") through the
+    // method's own exception table here, BEFORE the `i64::MIN` re-run arm below —
+    // re-running the method from entry would double-execute any side effect that
+    // preceded the trap (the prior `uncommon_trap` behaviour, a HotSpot
+    // divergence). `usize::MAX` throw_pc mirrors the NPE/AIOOBE blocks (match
+    // typed handlers by class, skip catch-all `finally`).
+    if crate::jit::helpers::take_jit_pending_arithmetic() {
+        match crate::runtime::exceptions::throw_runtime_error(
+            shared,
+            thread,
+            RuntimeError::ArithmeticException {
+                message: "/ by zero".to_string(),
+            },
+        ) {
+            MethodCallFailed::ExceptionThrown(exc) => {
+                let exc_locals = jit_saved_args_to_values(cached, &saved_args, np);
+                return route_jit_exception_through_method(
+                    shared,
+                    thread,
+                    frame_idx,
+                    cached,
+                    usize::MAX,
+                    exc,
+                    &exc_locals,
+                );
+            }
+            other => return Err(other),
+        }
+    }
+
     // real-frame-deopt: IR-path deopt detection. The IR lowerer's trampoline
     // (`ir_deopt_entry`) stashes a reconstructed frame in `LAST_DEOPT` and
     // returns `i64::MIN` WITHOUT setting `JIT_DEOPT_PENDING` (it lives in the
@@ -20582,6 +20674,32 @@ fn execute_jit_call_decoded(
                 .map(Some);
             }
             Err(other) => return Err(other),
+        }
+    }
+    // Divide-by-zero direct-throw drain (sibling of the AIOOBE block above; see
+    // the matching block in `execute_jit_call`). Throw `ArithmeticException`
+    // through the method's exception table instead of re-running from entry.
+    if crate::jit::helpers::take_jit_pending_arithmetic() {
+        match crate::runtime::exceptions::throw_runtime_error(
+            shared,
+            thread,
+            RuntimeError::ArithmeticException {
+                message: "/ by zero".to_string(),
+            },
+        ) {
+            MethodCallFailed::ExceptionThrown(exc) => {
+                return route_jit_exception_through_method(
+                    shared,
+                    thread,
+                    frame_idx,
+                    cached,
+                    usize::MAX,
+                    exc,
+                    args_slice,
+                )
+                .map(Some);
+            }
+            other => return Err(other),
         }
     }
 
