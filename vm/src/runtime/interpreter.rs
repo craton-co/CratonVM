@@ -3219,6 +3219,43 @@ pub fn execute(
                 // this false and still seals, matching the gate-OFF semantics.
                 let mut c2_not_hot = false;
                 let compiled = compiled.or_else(|| {
+                    // wire-tiered-manager Step 7 (full eager-reroute): when the
+                    // background pipeline is the default (`bg_compile`, default-ON),
+                    // the WORKER is the compiler — do NOT eager- or inline-compile on
+                    // the mutator here. Count invocations and, once warm, ensure the
+                    // worker + enqueue via the tiered manager, then return None to
+                    // INTERPRET; the worker compiles off-thread and publishes into
+                    // `jit_cache`, and a later invocation (here, for
+                    // reflective/uncached-hot methods, or via the cached-dispatch
+                    // fast-path) flips this call site to the Jit body. `c2_not_hot =
+                    // true` keeps the counter running so the method is never sealed as
+                    // permanently-uncompiled. Opt-out (`CRATONVM_BG_COMPILE=0`) falls
+                    // through to the historical eager/inline paths below.
+                    if crate::runtime::env_cache::bg_compile() {
+                        let invoc_key = {
+                            let mut h = 0u32;
+                            for &b in method_name.as_bytes() {
+                                h = h.wrapping_mul(31).wrapping_add(b as u32); // Widening: u8 → u32
+                            }
+                            for &b in method_descriptor.as_bytes() {
+                                h = h.wrapping_mul(31).wrapping_add(b as u32); // Widening: u8 → u32
+                            }
+                            // Widening: u32 → u64 (value preserved)
+                            ((class_id.as_u32() as u64) << 32) | (h as u64)
+                        };
+                        let n = shared.profile_store.increment_invocation(invoc_key);
+                        if n >= crate::runtime::env_cache::jit_invocation_threshold() {
+                            ensure_bg_compiler_started(shared);
+                            let tiered_key = crate::jit::tiered::MethodKey::new(
+                                class_name_str.as_str(),
+                                method_name,
+                                method_descriptor,
+                            );
+                            let _ = shared.tiered_manager.on_method_invocation(&tiered_key);
+                        }
+                        c2_not_hot = true; // keep the counter running; do not seal
+                        return None; // interpret — the worker compiles off-thread
+                    }
                     // activate-ir-optimizer (runtime wiring, CRATONVM_JIT_C2_FIRST_CALL,
                     // default-OFF): replace the eager single-pass first-call compile
                     // below with an invocation-counted upgrade through the optimizing
@@ -18058,22 +18095,26 @@ fn execute_invokestatic_cached(
                     cached.method_name.as_ref(),
                     cached.method_descriptor.as_ref(),
                 );
-                // wire-tiered-manager increment 2: OFF-THREAD codegen, gated
-                // default-OFF behind `CRATONVM_BG_COMPILE`.
+                // wire-tiered-manager: OFF-THREAD codegen for the invocation
+                // tier-up trigger. **DEFAULT-ON as of Step 7** ("retire the
+                // single fixed-threshold inline path"); `CRATONVM_BG_COMPILE=0`
+                // is the opt-out safety net.
                 //
-                //  * Flag ON  — start the background compile thread once (idempotent)
-                //    with the REAL compile closure below, then ENQUEUE-ONLY: the
-                //    tiered manager's `on_method_invocation` pushes a CompilationTask
-                //    at the recommended tier and the worker compiles it off the
-                //    mutator (publishing into `shared.jit_cache`). The mutator does
-                //    NOT compile inline; it keeps interpreting until the worker
+                //  * On (default) — start the background compile thread once
+                //    (idempotent), then ENQUEUE-ONLY: the tiered manager's
+                //    `on_method_invocation` pushes a CompilationTask at the
+                //    recommended tier and the worker compiles it off the mutator
+                //    (publishing into `shared.jit_cache`). The mutator does NOT
+                //    compile inline; it keeps interpreting until the worker
                 //    publishes, at which point the `jit_cache` fast-path at the top
-                //    of the `Bytecode` arm flips this call site to `Jit`.
-                //  * Flag OFF (default) — never start the worker; keep the existing
-                //    inline `try_jit_upgrade_with_gate` path EXACTLY as before so the
-                //    off-thread pipeline cannot regress steady-state behaviour until
-                //    proven. (`on_method_invocation` still enqueues, but with no
-                //    worker draining the queue this is the historical no-op.)
+                //    of the `Bytecode` arm flips this call site to `Jit`. (The
+                //    eager *first-call* single-pass compile in `fn execute` is a
+                //    separate quick first tier and still runs; this governs the
+                //    invocation-counted re-tiering + OSR.)
+                //  * Off (`=0`) — never start the worker; keep the historical
+                //    inline `try_jit_upgrade_with_gate` path EXACTLY as before
+                //    (the safety net while the off-thread pipeline soaks on the
+                //    gauntlet).
                 let bg_compile_on = crate::runtime::env_cache::bg_compile();
                 if bg_compile_on {
                     // Start the off-thread compile worker once (idempotent). See
@@ -23090,7 +23131,23 @@ fn execute_invokevirtual_cached(
                             let should_attempt = cnt >= threshold
                                 && (cnt == threshold || (cnt - threshold) % JIT_RETRY_STRIDE == 0);
                             if should_attempt {
-                                if let Some(CachedInvokeTarget::Jit { compiled, .. }) =
+                                // wire-tiered-manager Step 7: off-thread tier-up is now
+                                // the default. Under `bg_compile` (default-ON) we ENQUEUE
+                                // and keep interpreting — the `jit_cache.get` fast-path
+                                // above flips this site to `Jit` once the worker
+                                // publishes — instead of compiling inline on the mutator.
+                                // Mirrors `execute_invokestatic_cached`. Opt-out
+                                // (`CRATONVM_BG_COMPILE=0`) restores the inline path.
+                                if crate::runtime::env_cache::bg_compile() {
+                                    ensure_bg_compiler_started(shared);
+                                    let tiered_key = crate::jit::tiered::MethodKey::new(
+                                        cached.class_name.as_ref(),
+                                        cached.method_name.as_ref(),
+                                        cached.method_descriptor.as_ref(),
+                                    );
+                                    let _ =
+                                        shared.tiered_manager.on_method_invocation(&tiered_key);
+                                } else if let Some(CachedInvokeTarget::Jit { compiled, .. }) =
                                     try_jit_upgrade_with_gate(shared, &cached, entry_gate.clone())
                                 {
                                     return Some(compiled);
