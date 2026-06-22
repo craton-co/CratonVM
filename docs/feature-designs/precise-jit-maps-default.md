@@ -1,16 +1,18 @@
 # Precise JIT Stack Maps as the Validated Default
 
-Status: **largely landed; perf gap closed (Steps 1+2), full app-gauntlet sweep
-still pending.** The mechanism (`CRATONVM_PRECISE_JIT_MAPS`) is **default-on** on
-`dev` (opt out `CRATONVM_NO_PRECISE_JIT_MAPS`). **Steps 1+2 (inline
-frame-record, 2026-06-21) closed the call-heavy perf regression** — the
-per-invocation frame-record CALL is now an inlined `mov gs:[disp], rbp`,
-default-on (opt out `CRATONVM_NO_PRECISE_INLINE_FRAME_RECORD`), fib44 1.68×
-faster, all bintrees checksums == HotSpot; see "Inline frame-record (Steps
-1+2)". What remains for a fully *validated* default — the Step 4 app-gauntlet
-GC-root sweep, and closing the two still-open family members (A2/A4) it does
-**not** fix. This doc separates what is done from what "validated default" still
-requires.
+Status: **Steps 1–6 of the delivery plan landed (2026-06-21/22); the one
+remaining bar for a fully *validated* default is the full named-app gauntlet.**
+The mechanism (`CRATONVM_PRECISE_JIT_MAPS`) is **default-on** on `dev` (opt out
+`CRATONVM_NO_PRECISE_JIT_MAPS`). **Steps 1+2** closed the call-heavy perf
+regression (frame-record CALL → inlined `mov gs:[disp], rbp`, default-on, fib44
+1.68× faster, bintrees == HotSpot). **Step 3** added the default-off coverage/
+verify GC oracles. **Step 4** recorded the GC-root acceptance lane baseline
+(12 PASS / 1 KNOWN-FAIL[A2] / 1 FLAKY[MTRegex]). **Step 5** accepted the
+conservative backstop for OSR frames. **Step 6** retained the shadow stack as
+experimental, default-off scaffolding (kept, not removed). What remains for a
+fully *validated* default: the full named-app gauntlet, plus the two still-open
+family members (A2/A4) it does **not** fix. This doc separates what is done from
+what "validated default" still requires.
 
 > Note on sources: the orchestration brief referenced
 > `docs/internal/reviews/full-review-2026-06-20.md`. That file does **not** exist
@@ -118,9 +120,10 @@ known-issues README):
 - Its OSR-frame sub-gate `CRATONVM_SHADOW_OSR_TRACK`
   (`osr_shadow_track_enabled`, `jit/src/lib.rs`, default-OFF) is only a
   **partial** correctness fix (moves bt18 67674804 → 68199090, still short of
-  68332206). **DEPRECATED per Step 5** (2026-06-22): the precise-maps default
-  accepts the conservative backstop for OSR frames, so this partial shadow path
-  is dead; its removal is folded into Step 6 (shadow-stack retirement).
+  68332206). The precise-maps default accepts the conservative backstop for OSR
+  frames (Step 5), so this sub-gate is *not* the correctness path. **Step 6
+  decision (2026-06-22): RETAINED as experimental, default-off scaffolding —
+  kept, not removed** (paired with `CRATONVM_SHADOW_STACK`).
 - **It must not be combined with precise maps** — the two interfere and
   reclaim (`SB-SUITE-CRASH-04` update #5). Precise maps alone are the path.
 - The shadow infrastructure (multi-thread scan in `roots.rs`/`gc.rs`, unwind
@@ -136,7 +139,7 @@ known-issues README):
 | A2 (`ReflRepro`) register-resident UAF | 🔴 **OPEN** — precise maps do NOT fix it | `reflrepro-register-resident-jit-root-handoff.md`: distinct sweep-walker use-after-free; precise maps *retain more* and surface *more* corruption, verified still-crashing 2026-06-17/18. |
 | A4 (`Fork6`, FJP multi-thread) | 🟡 **OPEN / inconclusive** — gated, separate CAS bug masks it | `fork6-fjp-multithread-jit-root-reclamation.md`: only reachable under experimental `CRATONVM_REAL_FORKJOINPOOL=1`; a real-FJP `ForkJoinPool` CAS conflict now fails the repro on both precise-on and precise-off. |
 | Moving-GC precise relocation (`remap_active_jit_frames` under a real move) | ⚠️ **implemented, not exercised on the default path** | The non-moving sweep + selective promote does not relocate JIT-held slots, so `remap_active_jit_frames` is inert by default; it is only load-bearing if a moving young gen is ever made default. |
-| OSR-point precise tracking | ✅ **decided (Step 5): conservative backstop accepted; no precise OSR maps** | OSR frames get a `JitEntryGuard` chain entry + are conservatively backstopped in `scan_one_frame_precise` (safe on the non-moving sweep) and are excluded from `fully_oop_covered` (`!compiled_via_osr`) so a future moving path PINS them. Empirically: bt16 OSR-enters `binaryTrees(I)J` and is correct under forced young GC. `CRATONVM_SHADOW_OSR_TRACK` (shadow-only, partial 68199090) is deprecated. See "Step 5 — OSR decision". |
+| OSR-point precise tracking | ✅ **decided (Step 5): conservative backstop accepted; no precise OSR maps** | OSR frames get a `JitEntryGuard` chain entry + are conservatively backstopped in `scan_one_frame_precise` (safe on the non-moving sweep) and are excluded from `fully_oop_covered` (`!compiled_via_osr`) so a future moving path PINS them. Empirically: bt16 OSR-enters `binaryTrees(I)J` and is correct under forced young GC. `CRATONVM_SHADOW_OSR_TRACK` (shadow-only, partial 68199090) is retained experimental/default-off (Step 6). See "Step 5 — OSR decision". |
 | Full app-gauntlet GC-root regression with precise on | 🟡 **repro+bench lane LANDED & green; full 50-app lane still future** | `test-infra/regression-pool/gc-root-lane.sh` baseline 2026-06-22: 12 PASS / 1 expected-KNOWN-FAIL (A2) / 1 expected-FLAKY (MTRegex), 0 deviations. See "Step 4 baseline". The named full apps still need container harnesses. |
 | Perf acceptable as default | ✅ **inline frame-record landed (Steps 1+2, 2026-06-21)** | The per-invocation `jit_frame_record` CALL is now an inlined `mov gs:[disp], rbp` (default-on, Windows). fib44 inline-on ~11.8 s vs CALL-path ~19.8 s = **1.68× faster** (the no-frame-record floor is ~9 s, so inline cuts ~74 % of the frame-record overhead). bt16 also ~16 % faster. See "Inline frame-record (Steps 1+2)" below. Opt out: `CRATONVM_NO_PRECISE_INLINE_FRAME_RECORD`. |
 
@@ -233,10 +236,16 @@ not behaviour flips.
   **deprecate** the shadow-only `CRATONVM_SHADOW_OSR_TRACK` (removal deferred to
   Step 6 with the shadow stack). Rationale + evidence in "Step 5 — OSR decision"
   below. No code change — a documented decision.
-- **Step 6 — Shadow-stack retirement decision (separate).** Once the moving
-  default project (`default-moving-young-gen.md`) is decided, either keep
-  `CRATONVM_SHADOW_STACK` as the moving-relocation scaffolding or remove it.
-  Out of scope for *this* doc beyond noting the dependency.
+- **Step 6 — Shadow-stack retention decision (separate). ✅ DONE — KEEP as
+  experimental, default-off** (2026-06-22). Decision: **retain**
+  `CRATONVM_SHADOW_STACK` and its sub-gate `CRATONVM_SHADOW_OSR_TRACK` as
+  experimental, default-off moving-relocation scaffolding — **remove nothing**.
+  `default-moving-young-gen.md` is still *design / not started* (and the bt18 gap
+  was found to be ctor-dispatch, not GC), so no moving young gen is imminent; the
+  shadow path is the only partially-exercised relocation-remap code, it is
+  byte-identical/zero-cost when off, and it is the starting point if a moving gen
+  is ever pursued. Rationale + caveats in "Step 6 — Shadow-stack retention"
+  below; gate rustdocs annotated EXPERIMENTAL/retained.
 
 ## Inline frame-record (Steps 1+2) — landed 2026-06-21
 
@@ -365,8 +374,9 @@ harnesses and is the remaining bar before the *family* is declared retired.
 **Decision: option (b).** OSR-entered frames are covered by the conservative
 backstop on the default (precise, non-moving) path; CratonVM does **not** build
 precise oop maps at OSR entry points, and the shadow-only
-`CRATONVM_SHADOW_OSR_TRACK` is **deprecated** (removal folded into Step 6 with the
-shadow stack). This is a clarity/robustness decision — not a correctness change.
+`CRATONVM_SHADOW_OSR_TRACK` is **retained as experimental, default-off**
+scaffolding (Step 6 — kept, not removed). This is a clarity/robustness decision —
+not a correctness change.
 
 **Why OSR frames are already safe without precise OSR maps:**
 
@@ -406,7 +416,45 @@ GC roots; it does not change this decision.
 that makes an OSR frame replicate the shadow push/reload so a moving Cheney
 collector could relocate its oops. It is **partial** (bt18 67674804 → 68199090,
 still short of the golden 68332206) and **regresses bt18**, and the shadow path
-itself is not the correctness path. Deprecated; its removal is part of Step 6.
+itself is not the correctness path. **Retained as experimental, default-off
+(Step 6 — kept, not removed).**
+
+## Step 6 — Shadow-stack retention decision (resolved 2026-06-22): KEEP experimental
+
+**Decision: RETAIN, do not remove.** `CRATONVM_SHADOW_STACK` and its OSR sub-gate
+`CRATONVM_SHADOW_OSR_TRACK` are kept as **experimental, default-off**
+moving-relocation scaffolding. Nothing is deleted; only the gate rustdocs are
+annotated EXPERIMENTAL/retained (`x64.rs::shadow_stack_maps_enabled`,
+`lib.rs::osr_shadow_track_enabled`, `conservative_roots::shadow_stack_enabled`)
+and this doc records the decision.
+
+**Dependency status.** Step 6 was scoped as contingent on the moving-default
+project. `default-moving-young-gen.md` is still **design / not started**, and the
+Binary-Trees-18 throughput gap was separately root-caused to **per-node ctor
+dispatch, not GC** (moving young gen measured as ~0% of the gap — a dead end for
+that goal). So **no moving young gen is imminent**, and the shadow stack's
+relocation-remap path is **not** load-bearing for any current default.
+
+**Why keep it (rather than remove):**
+
+- It is the **only partially-exercised relocation-remap path** in the tree —
+  per-safepoint shadow push/reload codegen, the multi-thread marking scan
+  (`roots.rs`/`gc.rs`), the post-move remap, and the unwind reset
+  (`helpers.rs::set_jit_thread`/`restore_jit_thread`). Removing it discards real,
+  working (on the GC microbenchmarks) infrastructure.
+- It is **safely default-off**: when the gate is unset the codegen and GC paths
+  are byte-identical to the legacy path, so retaining it costs nothing on the
+  validated default (precise maps + non-moving sweep).
+- It is the **starting point** if a moving/compacting young gen is ever pursued
+  (the only path that has produced a correct *moving* bt18 at adequate heap).
+
+**Experimental status / caveats (unchanged):** opt-in, default-off, **not for
+production**; **partial** (the moving Cheney path under-counts bt18 → 67674804;
+the OSR sub-gate → 68199090, both short of the golden 68332206); and it **must
+not be combined with `CRATONVM_PRECISE_JIT_MAPS`** — the two interfere and
+reclaim. Before it could ever be promoted it needs the bt18 under-count closed
+and the precise-maps interference resolved — tracked under
+`default-moving-young-gen.md`, not here.
 
 ## Risks & open questions
 

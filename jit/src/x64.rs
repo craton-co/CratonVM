@@ -2018,6 +2018,16 @@ unsafe fn read_gs_qword(disp: usize) -> usize {
 /// stack and reloads them after the call, so a *moving* collector can rewrite
 /// every JIT-held reference precisely (see `gc/src/shadow_stack.rs`). Off by
 /// default → no extra codegen, byte-identical to the legacy path.
+///
+/// **EXPERIMENTAL — retained default-off scaffolding (precise-jit-maps-default.md
+/// Step 6 decision, 2026-06-22).** This is the moving-relocation scaffolding for
+/// a potential future moving/compacting young gen (`default-moving-young-gen.md`,
+/// currently *design / not started*); it is **not** the correctness path (the
+/// precise-maps default uses the non-moving sweep + conservative backstop) and is
+/// **partial** (the moving Cheney path under-counts bt18 → 67674804). It is
+/// **kept, not removed**, but must stay default-off and **must not be combined
+/// with `CRATONVM_PRECISE_JIT_MAPS`** — the two interfere and reclaim. Do not
+/// enable in production.
 pub fn shadow_stack_maps_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
