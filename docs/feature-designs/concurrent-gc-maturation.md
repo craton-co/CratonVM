@@ -412,12 +412,20 @@ Author note: this doc is grounded in a read of `gc/src/{g1,g1_concurrent,zgc,zgc
       "first cut"; this also made some `--verbose:gc`+`RUST_LOG` parallel runs hit
       the 120s watchdog under concurrent-session CPU load — a measurement artifact,
       not a hang: the same runs complete correctly in isolation);
-      (2) **evacuation-failure under to-space exhaustion** — at a heap too small to
-      fit the live set (where gen correctly OOMs), G1 silently DROPS objects
-      instead of pinning them in place or raising a clean OOM (`GcChurn`@96m gives
-      a wrong checksum; ≥256m all agree). Real-G1 self-forwards on evac failure;
-      CratonVM's G1 has no such path. A robustness prerequisite for Step 10,
-      tracked separately. Distinct from both the CSet fix and JIT A5.
+      (2) ✅ **evacuation-failure under to-space exhaustion — FIXED** (merge
+      `cdb62510`, fix `40ba24d9`). At a heap too small to fit the live set (where
+      gen correctly OOMs), G1 used to silently DROP the objects it couldn't
+      relocate (`evacuate_object` returned `None` → caller skipped → Phase 5 freed
+      the still-referenced region → wrong result). Now both evacuators
+      **self-forward** on alloc failure (identity forward `old→old`; the parallel
+      path CASes the from-space `forwarding_ptr` to its own address) and the new
+      `free_or_keep_cset` helper KEEPS any CSet region holding a self-forwarded
+      object (Eden→Survivor) instead of freeing it — so nothing is lost, the heap
+      stays full, and the triggering allocation fails into a clean catchable OOM.
+      `GcChurn`@96m now raises `OutOfMemoryError` on serial-G1 AND parallel-G1
+      (matching gen) instead of a wrong checksum; clean-heap parity unchanged
+      (binarytrees16/DeepTree/GcChurn@256m); 727/727 gc tests + a zero-free-region
+      regression. Distinct from both the CSet fix and JIT A5.
   - **Pre-existing bug surfaced (NOT parallel-specific; blocks Step 10):** with the
     JIT enabled, a long-lived local reference held across a hot loop is **missed by
     GC root scanning**, so G1's *precise unconditional moving* young collection
