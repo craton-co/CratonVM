@@ -1,8 +1,14 @@
 # Real-frame deoptimization + precise OSR (entry *and* exit)
 
-Status: design / partially-landed prerequisites. Effort: **XL**, decomposed
-below. This doc is the joining piece between two efforts that already exist in
-the tree but stop short of each other:
+Status: **LANDED on dev (2026-06-22), gated default-off** (`CRATONVM_DEOPT_REAL`,
+gate-off byte-identical). Steps 1–9, Workstreams A & B, the cat-2/FP resume (P2),
+and the `CRATONVM_DEOPT_VERIFY` structural/oop verifier are all on dev. Remaining
+(non-blocking follow-ups): the eager-deopt **value** differential + end-to-end BCE
+runtime test (infra-blocked — read-once gates + forced-deopt codegen; see the
+handoff doc), cat-2/FP **OSR-exit** transfer, register-resident oop typing, and the
+`CRATONVM_JIT_FREE_CODE=1` in-stub epoch check. Effort was **XL**, decomposed
+below. This doc is the joining piece between two efforts that already existed in
+the tree but stopped short of each other:
 
 1. **Real-frame deopt** — reconstruct a precise interpreter frame at the
    trapping bci instead of re-running the method from bci 0. The *mechanism*
@@ -431,12 +437,21 @@ feature branch. All additive and gated **unreachable in production**
   vm-crate invoke. The resume *correctness* (the UAF-risk) is unit-tested +
   3-way adversarially verified; only the through-the-JIT execution path is unproven.
 
-Not yet done: the **end-to-end BCE runtime test** (above); x64 deopt-exit **Steps 5-6**
-of the backport (coverage-gate `can_deopt_resume` finalize + eager-deopt
-`CRATONVM_DEOPT_VERIFY` differential verifier, widen guards beyond the BCE pilot);
-deopt-osr **Step 7+** (OSR-exit map emission + flip) + the x64
-`emit_osr_exit_map_at` / `osr_exit_points` scaffolding; and wiring
-`materialize_virtual_objects` into the resume path (resume virtual-bearing frames).
+Since landed (branch `feat/deopt-osr-completion`, see the handoff doc for detail):
+deopt-osr **Steps 7–8** (OSR-exit map emission + loop-bci resume flip + OSR-driver
+safety); **Workstream A** (`materialize_virtual_objects` wired into
+`build_deopt_frame_inner` so virtual-bearing frames materialize + resume); and
+x64-backport **Step 5** (`can_deopt_resume` coverage-gate finalize + sink consult).
+
+Not yet done: the **end-to-end BCE runtime test** (above, infra-blocked); the
+x64-backport **`CRATONVM_DEOPT_VERIFY` eager-deopt differential verifier** (the
+gate exists but has no consumer; also closes Workstream A4) and **widening guards
+beyond the BCE pilot**; **Step 9** epoch-invalidation (`compilation_epoch`
+consumer for stale baked deopt-point boxes after `MakeNotEntrant`); the **Step 8
+follow-up** true OSR-exit state transfer into the live interpreter frame (coupled
+to `CRATONVM_SHADOW_OSR_TRACK` / moving-GC OSR tracking); and **cat-2 / FP
+`xmm[16]`** snapshot extension (long/double/FP-in-register slots still resolve to
+`Unsupported` → re-run).
 
 ## Risks & open questions
 

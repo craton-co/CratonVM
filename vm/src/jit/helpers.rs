@@ -4433,6 +4433,17 @@ impl DeoptimizationController {
             jit_cache.remove(class_name, method_name, descriptor);
         }
 
+        // deopt-osr Step 9 — advance the method's live compilation epoch so that
+        // (a) the next compilation is stamped fresh and (b) any frame still
+        // executing this now-evicted artifact, when it reaches the
+        // real-frame-deopt resume sink, sees `compilation_epoch < live` and
+        // re-runs instead of resuming a superseded speculation. Gated on the
+        // resume feature: the epoch is only ever *read* under `deopt_real_enabled()`,
+        // so production VMs neither bump nor consult it (byte-identical).
+        if cratonvm_jit::deopt_real_enabled() {
+            vm.bump_compilation_epoch(&method_key);
+        }
+
         // For class-check or receiver-type failures, also check the
         // invalidation manager for dependent methods.
         if matches!(
@@ -5647,7 +5658,17 @@ pub fn build_helpers() -> JitRuntimeHelpers {
         // nothing extra. The JIT also gates emission on its own cached flag,
         // but keying the pointer on the same env keeps the default build inert.
         frame_record: if cratonvm_jit::x64::precise_jit_maps_enabled() {
-            jit_frame_record as *const () as usize
+            // Step 1 self-check: when inline frame-record is active AND the
+            // verify knob is on, wire the verify helper here instead — the
+            // prologue calls it right after the inline store to assert the
+            // mirror slot it wrote is the one the GC reads.
+            if cratonvm_jit::x64::verify_inline_frame_record_enabled()
+                && cratonvm_jit::x64::inline_rbp_tls_disp() != 0
+            {
+                jit_verify_inline_frame_record as *const () as usize
+            } else {
+                jit_frame_record as *const () as usize
+            }
         } else {
             0
         },
@@ -5668,6 +5689,10 @@ pub fn build_helpers() -> JitRuntimeHelpers {
         // tell a genuine callee exception/deopt apart from a legitimate
         // `Long.MIN_VALUE` return.
         dispatch_threw: jit_dispatch_threw as *const () as usize,
+        // IR FP tier (Slice A) — fmod-style FP remainder helpers, CALLed by the
+        // IR `Op::Rem` Float/Double arms (operands in XMM0/XMM1, result XMM0).
+        jit_frem: jit_frem as *const () as usize,
+        jit_drem: jit_drem as *const () as usize,
     }
 }
 
@@ -5682,6 +5707,27 @@ pub fn build_helpers() -> JitRuntimeHelpers {
 /// integer-argument register, matching the JIT's `ARG_REGS[0]` load.
 extern "C" fn jit_frame_record(rbp: usize) {
     crate::jit::conservative_roots::set_top_frame_base(rbp);
+}
+
+/// Step 1 (`docs/feature-designs/precise-jit-maps-default.md`) debug self-check
+/// helper (`CRATONVM_DBG_VERIFY_INLINE_FRAME_RECORD`).
+///
+/// When inline frame-record AND the verify knob are both on, the JIT prologue
+/// calls this immediately AFTER its inline `mov gs:[disp], rbp` (it is wired
+/// into the `frame_record` helper slot for that combination, see
+/// `build_helpers`). It reads the innermost-RBP mirror back through the SAME
+/// accessor the GC root walk uses and asserts it equals the RBP the inline
+/// store should have written — i.e. that the baked `gs:[disp]` slot is exactly
+/// the slot the Rust side reads. Logs on mismatch (never panics); pure
+/// validation aid with no effect on the mirror value.
+extern "C" fn jit_verify_inline_frame_record(rbp: usize) {
+    let got = crate::jit::conservative_roots::top_rbp_mirror_read();
+    if got != rbp {
+        eprintln!(
+            "[VERIFY-INLINE-FR] mismatch: inline store rbp={:#x} but mirror reads {:#x}",
+            rbp, got
+        );
+    }
 }
 
 /// T1.1.28 — Math.fma(double, double, double) runtime helper.
@@ -5708,4 +5754,34 @@ pub extern "C" fn jit_math_fma_float(a: f32, b: f32, c: f32) -> f32 {
     // (see conservative_roots::note_jit_boundary).
     crate::jit::conservative_roots::note_jit_boundary();
     a.mul_add(b, c)
+}
+
+/// IR FP tier (Slice A) — `frem` runtime helper.
+///
+/// Called from JIT code via an absolute `CALL` emitted by the IR `Op::Rem`
+/// Float arm (`jit/src/ir_lower.rs`), which loads the two operands into
+/// XMM0/XMM1 (the float ABI's first two argument registers on both Win64 and
+/// SysV) and reads the result back from XMM0.
+///
+/// JVMS `frem` is the truncated remainder `a - (a / b rounded toward zero) * b`
+/// taking the sign of the dividend — exactly C `fmod` and Rust's `f32 %`. The
+/// special cases also match the JVMS table: `frem(x, ±∞) = x`, `frem(±∞, y) =
+/// NaN`, `frem(x, ±0) = NaN`, `frem(±0, y) = ±0`, and any NaN operand yields
+/// NaN. There is no single SSE instruction for it, hence the helper.
+#[no_mangle]
+pub extern "C" fn jit_frem(a: f32, b: f32) -> f32 {
+    // WS1: Rust<->JIT boundary — invalidate the per-thread JIT-scan cache
+    // (see conservative_roots::note_jit_boundary), mirroring the FMA helpers.
+    crate::jit::conservative_roots::note_jit_boundary();
+    a % b
+}
+
+/// IR FP tier (Slice A) — `drem` runtime helper. The double analogue of
+/// [`jit_frem`]; the IR `Op::Rem` Double arm `CALL`s it with the operands in
+/// XMM0/XMM1 and reads the remainder from XMM0. Rust's `f64 %` is `fmod`,
+/// matching the JVMS `drem` semantics exactly.
+#[no_mangle]
+pub extern "C" fn jit_drem(a: f64, b: f64) -> f64 {
+    crate::jit::conservative_roots::note_jit_boundary();
+    a % b
 }

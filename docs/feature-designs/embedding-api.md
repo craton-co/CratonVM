@@ -418,7 +418,72 @@ and `embed_smoke.c`'s malformed Linux `cc` line was fixed.
   debug build, `-Suffix <tag>` to rename the harness exes.
 
 Still genuinely next (unchanged): descriptor-based disambiguation of shadowed
-same-name fields; a C-varargs convenience shim; foreign call-in thread
-registration with the GC safepoint machinery (out of scope here — the harnesses
-drive the VM only from the creating thread); and CI publication of the `.so`/
-`.dll`/`.a` + header.
+same-name fields; a C-varargs convenience shim; and CI publication of the `.so`/
+`.dll`/`.a` + header. (Foreign call-in thread registration with the GC safepoint
+machinery — previously listed here as out of scope — is now **landed**; see
+below.)
+
+## Foreign call-in thread registration landed (GC-safe AttachCurrentThread)
+
+`AttachCurrentThread` / `AttachCurrentThreadAsDaemon` now register a genuinely
+foreign (host-created) OS thread as a first-class, GC-safe Java thread, closing
+the gap that previously made "drive the VM only from the creating thread" the
+sole safe usage. Design + rationale: `foreign-thread-attach.md`. Summary of what
+shipped:
+
+- **`JavaVM*` → live VM.** `JNI_CreateJavaVM` / `cratonvm_create` publish a
+  process-global `Weak<SharedVm>` cell (`jni::set_process_vm` / `process_vm`)
+  that the attach path upgrades — there is one VM per process, so "the JavaVM*"
+  and "the one VM" denote the same fact.
+- **Attach.** Builds a heap-boxed `JvmThread` with a fresh `ThreadId`, registers
+  it in the `ThreadRegistry`, and mirrors its shared `Arc` fields (root_snapshot
+  / gc_block_state / interrupted / park_state / frame_trace) so a GC initiator on
+  another thread can scan and maintain its roots — the exact wiring a
+  `Thread.start` worker gets. The box is parked in TLS (address-stable for the
+  JIT's baked `tlab`/`shadow_stack` offsets). Registration happens *before* the
+  JNI TLS context is published, so there is no window where the thread can run
+  Java while invisible to `request_stw`. `JavaVMAttachArgs.name` is honoured.
+- **Safepoint participation.** While running a Java call the thread is a counted
+  mutator whose interpreter polls `stw_requested` and arrives at the barrier,
+  exactly like any VM thread. Between calls it is modelled as GC-blocked (idle in
+  the host event loop, no Java frames) so a stop-the-world on another thread is
+  not stalled waiting for it; the first call leaves the blocked region and the
+  return re-enters it (`ForeignCallGuard`, scoped to the outermost call).
+- **Detach.** Refuses a detach with a Java call in flight (`JNI_ERR`, matching
+  HotSpot); otherwise marks the thread dead while still blocked-excluded, waits
+  out any in-flight STW, then reclaims the `JvmThread` (retiring the TLAB).
+- **Default + opt-out.** Real registration is the **default**; the historical
+  env-only stub is the opt-out safety net (`CRATONVM_FOREIGN_ATTACH=0`).
+- **Fix.** The historical `AttachCurrentThread` stub wrote `JNI_TABLE_PTR.load()`
+  (the table-array pointer) as the `JNIEnv*` — one indirection too shallow, so
+  `(*env)[slot]` jumped to garbage. It now hands back `get_jni_env()`
+  (`&JNI_TABLE_PTR`), matching `GetEnv`.
+
+**Validation.** Per-increment Rust unit tests (process-VM resolve; factory
+register/share/detach; idle thread excluded from STW; `ForeignCallGuard`
+idle↔running transitions) plus an opt-in concurrent-GC soak
+(`libcratonvm` `foreign_attach_concurrent_gc_soak`, `--cfg foreign_attach_soak`):
+`JNI_CreateJavaVM` once, 6 host threads each `AttachCurrentThread` + loop an
+allocating static call while periodically forcing `System.gc()` (multi-thread
+STW while siblings are mid-call) + `DetachCurrentThread`. Green JIT-on and
+`--nojit` (~370 STW collections per run); no UAF/crash, no STW hang,
+`alive_count` returns to baseline.
+
+**Idle host thread / creating thread.** A thread that parks *outside* the VM
+(e.g. an idle coordinator/creating thread in a host `join()`/event loop) while
+foreign threads drive GC must declare itself in-native, or a worker's STW waits
+for it forever — it never reaches a Java safepoint. Foreign attached threads
+handle this automatically (idle-blocked model). The creating/coordinator thread
+has no automatic hook, so the embedding API exposes an explicit primitive:
+
+```c
+cratonvm_thread_enter_native();   // exclude this thread from GC STW while idle
+... host-side join() / event-loop poll ...
+cratonvm_thread_leave_native();   // rejoin the mutator population
+```
+
+This mirrors HotSpot's `_thread_in_native` transition. It is a no-op for a
+foreign attached thread (already auto-managed). The concurrent-GC soak uses it to
+bracket the creating thread's host-side wait. (A future refinement could
+auto-block the creating thread on return from `JNI_CreateJavaVM` and auto-leave
+on the next VM call, removing the explicit calls.)

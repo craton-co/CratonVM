@@ -1757,11 +1757,25 @@ fn eliminate_dead_nodes(graph: &mut Graph) {
     // chain it depends on, including its argument values) keeps the effect from
     // being deleted. Strictly additive: a store removed by DSE is `Op::Dead` and
     // not matched, and a live store/call always has an observable effect.
+    // `Op::ArrayLoad`/`Op::ArrayStore` are also side-effecting roots: BOTH can
+    // throw (NullPointerException / ArrayIndexOutOfBoundsException via the
+    // lowerer's deopt guards), an observable effect, so neither may be deleted
+    // even when its result/memory token has no consumer (a `float v = a[i];`
+    // whose `v` is unused still performs the bounds check).
     let mut worklist: Vec<NodeId> = graph
         .nodes
         .iter()
         .enumerate()
-        .filter(|(_, n)| matches!(n.op, Op::Return | Op::Store(_) | Op::Call { .. }))
+        .filter(|(_, n)| {
+            matches!(
+                n.op,
+                Op::Return
+                    | Op::Store(_)
+                    | Op::Call { .. }
+                    | Op::ArrayLoad(_)
+                    | Op::ArrayStore(_)
+            )
+        })
         .map(|(id, _)| id as NodeId)
         .collect();
     if worklist.is_empty() {
@@ -2193,9 +2207,12 @@ fn unroll(graph: &mut Graph) -> bool {
             }
         }
 
-        // No side effects in the loop: a Store/Call/alloc/ArrayLength/Guard that
-        // is loop-variant or control-pinned to the loop is a side effect we do
-        // not model → bail.
+        // No side effects in the loop: a Store/Call/alloc/ArrayLength/Guard/array
+        // element access that is loop-variant or control-pinned to the loop is a
+        // side effect we do not model → bail. (`ArrayLoad`/`ArrayStore` can throw
+        // NPE/AIOOBE and `ArrayStore` mutates the heap, so unrolling a loop that
+        // contains one would duplicate/reorder those effects — conservatively
+        // decline.)
         for id in 0..graph.nodes.len() {
             let op = &graph.nodes[id].op;
             if matches!(
@@ -2205,6 +2222,8 @@ fn unroll(graph: &mut Graph) -> bool {
                     | Op::New { .. }
                     | Op::NewArray { .. }
                     | Op::ArrayLength
+                    | Op::ArrayLoad(_)
+                    | Op::ArrayStore(_)
                     | Op::Guard { .. }
             ) {
                 let ctrl = graph.nodes[id].inputs.first().copied().unwrap_or(NO_NODE);

@@ -515,6 +515,19 @@ pub struct SharedVm {
     /// Deoptimization log — records deopt events and drives adaptive recompilation.
     pub deopt_log: parking_lot::Mutex<crate::jit::deopt::DeoptimizationLog>,
 
+    /// deopt-osr Step 9 — per-method *live* compilation epoch (a monotonic
+    /// invalidation generation), keyed by the same `"<class>.<method>:<descriptor>"`
+    /// string the deopt log uses. `DeoptimizationController::deoptimize` advances
+    /// it on every invalidation; a freshly installed `CompiledMethod` is stamped
+    /// (`CompiledMethod::compilation_epoch`) with the value live at install time.
+    /// The real-frame-deopt resume sink refuses to resume a frame whose artifact
+    /// epoch has fallen behind the live epoch — a compilation superseded since it
+    /// started — so an invalidated speculation is never resumed; it falls back to
+    /// the safe whole-method re-run. Empty + unread unless `deopt_real_enabled()`
+    /// (the resume sink that consumes it is itself gated), so production VMs are
+    /// unaffected.
+    pub method_epochs: parking_lot::RwLock<FxHashMap<String, u64>>,
+
     /// Invalidation manager — tracks class-hierarchy assumptions and invalidates
     /// dependent compiled methods when class loading breaks those assumptions.
     pub invalidation_manager: parking_lot::Mutex<cratonvm_jit::deopt::InvalidationManager>,
@@ -2373,6 +2386,7 @@ impl SharedVm {
             jit_skip_set: parking_lot::RwLock::new(FxHashSet::default()),
             tiered_manager: crate::jit::tiered::TieredCompilationManager::with_default_policy(),
             deopt_log: parking_lot::Mutex::new(crate::jit::deopt::DeoptimizationLog::new()),
+            method_epochs: parking_lot::RwLock::new(FxHashMap::default()),
             invalidation_manager: parking_lot::Mutex::new(
                 cratonvm_jit::deopt::InvalidationManager::new(),
             ),
@@ -3498,6 +3512,28 @@ impl SharedVm {
         action
     }
 
+    /// deopt-osr Step 9 — current live compilation epoch for `method_key`
+    /// (`"<class>.<method>:<descriptor>"`), `0` if the method has never been
+    /// invalidated. See [`Self::method_epochs`].
+    pub fn compilation_epoch_for(&self, method_key: &str) -> u64 {
+        self.method_epochs
+            .read()
+            .get(method_key)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// deopt-osr Step 9 — advance and return the live compilation epoch for
+    /// `method_key`, marking every artifact compiled at an earlier epoch as
+    /// superseded. Called on each invalidation (see
+    /// `DeoptimizationController::deoptimize`). See [`Self::method_epochs`].
+    pub fn bump_compilation_epoch(&self, method_key: &str) -> u64 {
+        let mut map = self.method_epochs.write();
+        let e = map.entry(method_key.to_string()).or_insert(0);
+        *e += 1;
+        *e
+    }
+
     /// T5.4.4 — Class-hierarchy change listener.
     ///
     /// When `class_name` is linked/registered, walk the
@@ -4430,6 +4466,16 @@ impl Vm {
         // Store a weak self-reference so native methods can clone the Arc
         // for spawning new threads.
         *shared.self_arc.write() = Some(Arc::downgrade(&shared));
+
+        // Publish the process-global VM cell so a foreign (host-created) thread
+        // that calls `AttachCurrentThread` can resolve the live VM and register
+        // itself for GC-safepoint participation — for EVERY creation path, not
+        // just the libcratonvm Invocation API. Without this, a CLI-launched app
+        // whose native library spawns + attaches its own OS thread would fail
+        // attach (no VM to resolve) once the default-on foreign-attach path runs.
+        // `Weak`, so it never keeps the VM alive; last writer wins (harmless for
+        // the in-process multi-`Vm` test fixtures — one VM per real process).
+        crate::native::jni::set_process_vm(&shared);
 
         // Round 4 audit fix (CRIT) — publish the same weak handle to the
         // module-private slot used by `resolution_invalidate_adapter` so

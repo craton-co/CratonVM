@@ -883,6 +883,30 @@ pub fn osr_exit_test_enabled() -> bool {
     *CACHE.get_or_init(|| std::env::var_os("CRATONVM_OSR_EXIT_TEST").is_some())
 }
 
+/// deopt-osr Step 8 follow-up (P4): `CRATONVM_OSR_EXIT_AFTER=N` (default-OFF,
+/// read-once) — the COUNTER-GATED OSR-exit trigger. When set to a positive `N`
+/// *and* `deopt_real_enabled()`, the single-pass backend emits, at a loop header,
+/// a per-site counter that bails to the OSR-exit stub only on the `N`-th reach —
+/// so the JIT runs ~`N` loop iterations (advancing the loop-carried locals /
+/// accumulator and committing their side effects) BEFORE the exit. This makes the
+/// reconstructed frame carry genuinely JIT-advanced state, which the interpreter's
+/// `transfer_osr_exit_into_live_frame` (gated `CRATONVM_OSR_EXIT_TRANSFER`) writes
+/// back into the live frame — the realistic trigger the handoff calls for, vs the
+/// unconditional-at-header `CRATONVM_OSR_EXIT_TEST` trigger that bails at iteration
+/// 0. `None` / 0 ⇒ no counter emitted ⇒ byte-identical production code. Test-only:
+/// run it WITH `CRATONVM_OSR_EXIT_TRANSFER=1`; with the transfer gate off the
+/// interpreter safe-rejects and re-runs the committed iterations (double-executing
+/// their side effects) — which is exactly the gap the transfer closes.
+pub fn osr_exit_after() -> Option<usize> {
+    static CACHE: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| {
+        std::env::var("CRATONVM_OSR_EXIT_AFTER")
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .filter(|&n| n > 0)
+    })
+}
+
 /// Record `[entry, entry+len)` → `name` for crash-time symbolization. No-op
 /// unless `CRATONVM_DBG_JIT_NAMES` is set.
 pub fn register_jit_method_name(entry: usize, len: usize, name: String) {
@@ -3890,6 +3914,14 @@ fn ir_op_to_ea_op(op: &ir::Op) -> escape_analysis::Op {
         },
         ir::Op::Call { .. } => EaOp::Call,
         ir::Op::ArrayLength => EaOp::ArrayLength,
+        // Array element access escapes its array reference (conservative): map to
+        // `EaOp::Call`, whose handling marks every reference input `ArgEscape`.
+        // Today the array is always a Param/external ref (the builder bails on
+        // `newarray`, so a `new[]` never reaches here) and so is never a
+        // scalar-replacement candidate, but routing through `Call` (rather than
+        // the no-op `Other`) keeps a hypothetical future `new[]` from being
+        // wrongly scalar-replaced — the IR lowerer has no scalar-array path.
+        ir::Op::ArrayLoad(_) | ir::Op::ArrayStore(_) => EaOp::Call,
         ir::Op::Dead => EaOp::Dead,
         // All other IR ops (Region, Proj, ConstF, conversions, bitwise,
         // Cmp, Div, Rem, Neg, etc.) have no EA-specific behaviour.
@@ -4580,14 +4612,15 @@ fn try_compile_inner(
             //   - CALL-ARGS (inc 34): `static_call_shape` admits `D`/`F` args
             //     (one GPR slot each); the marshaller stores the slot bits to the
             //     staging region and `decode_dispatch_values` reads them back.
-            // Still excludes int-div (would strand an FP value at the div deopt —
-            // whose resume can't yet reconstruct an FP slot). inc 35 lifted the
-            // `ldc2_w` exclusion: the resolver now reports `is_double`, so the
-            // builder lowers a `double` constant to `dconst` (a `long` ldc2_w
-            // stays `lconst`) — double literals (`1.5`, `3.14`, …) no longer bail.
-            || (ir_emit_fp
-                && fp_in_body(code, code_len)
-                && !method_has_int_div(code, code_len)))
+            // Slice C lifted the int-div exclusion: the IR deopt resume now
+            // reconstructs FP slots (`StackSlotFloat`/`StackSlotDouble` →
+            // `Value::Float`/`Value::Double`, `Double` cat-2 like `Long`), so an
+            // FP value live at an `idiv`/`irem` div-by-zero deopt is restored
+            // precisely rather than stranded. inc 35 lifted the `ldc2_w`
+            // exclusion: the resolver reports `is_double`, so the builder lowers a
+            // `double` constant to `dconst` (a `long` ldc2_w stays `lconst`) —
+            // double literals (`1.5`, `3.14`, …) no longer bail.
+            || (ir_emit_fp && fp_in_body(code, code_len)))
     {
         // Includes the implicit `this` slot for instance methods — see
         // `prologue_param_slots` above.
@@ -5965,22 +5998,6 @@ fn fp_in_descriptor(descriptor: &str) -> bool {
 /// the int/long IR-path clauses to stay FP-free.
 fn method_uses_fp(code: &[u8], code_len: usize, descriptor: &str) -> bool {
     fp_in_descriptor(descriptor) || fp_in_body(code, code_len)
-}
-
-/// inc 25: an int `idiv`/`irem` in the body. Such a method gets a div guard
-/// whose deopt resume cannot yet reconstruct a `long` slot, so admitting a long
-/// method with an int division could strand a live `long` at the deopt — bail
-/// to single-pass until long deopt-resume lands. (Long `ldiv`/`lrem` already
-/// bail: the builder does not lower them.)
-fn method_has_int_div(code: &[u8], code_len: usize) -> bool {
-    let mut pc = 0;
-    while pc < code_len {
-        if matches!(code[pc], 0x6c | 0x70) {
-            return true;
-        }
-        pc += crate::scev::bytecode_len(code, pc, code_len);
-    }
-    false
 }
 
 /// Gap B (inc 22): classify a static-call descriptor for the `Op::Call` slice.

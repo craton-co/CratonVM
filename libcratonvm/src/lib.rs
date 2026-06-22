@@ -61,7 +61,10 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::Mutex;
 
 use cratonvm_vm::config::VmConfig;
-use cratonvm_vm::native::jni::{clear_jni_context, get_java_vm, get_jni_env, set_jni_context_arc};
+use cratonvm_vm::native::jni::{
+    clear_jni_context, get_java_vm, get_jni_env, host_thread_enter_native, host_thread_leave_native,
+    set_jni_context_arc,
+};
 use cratonvm_vm::vm::Vm;
 
 // ---------------------------------------------------------------------------
@@ -420,6 +423,8 @@ pub extern "C" fn JNI_CreateJavaVM(
         bootstrap(&mut vm);
 
         // Capture the Arc before moving `vm` into the parked wrapper.
+        // (`Vm::new` already published the process-global VM cell that
+        // `AttachCurrentThread` resolves — see `jni::set_process_vm`.)
         let shared = vm.shared.get_arc();
 
         // Publish this thread's JNI context so the returned `JNIEnv*`'s
@@ -441,6 +446,51 @@ pub extern "C" fn JNI_CreateJavaVM(
         JNI_OK
     }))
     .unwrap_or(JNI_ERR)
+}
+
+// ---------------------------------------------------------------------------
+// Host thread in-native transition
+// ---------------------------------------------------------------------------
+
+/// `jint cratonvm_thread_enter_native(void)`
+///
+/// Declare the **calling** OS thread as parked in host-native code (HotSpot's
+/// `_thread_in_native`): it is excluded from GC stop-the-world for the duration,
+/// so a collection driven by another thread does not wait for it to reach a Java
+/// safepoint it will never hit while parked outside the VM.
+///
+/// Call this around any host-side blocking wait (a `join()`, an event-loop poll,
+/// `sleep`) on a thread that drives the VM but is currently idle in native code —
+/// most importantly the **creating thread** after `JNI_CreateJavaVM`, while other
+/// (attached) threads run Java + GC. Without it, that idle thread is counted as a
+/// live mutator and hangs the collection. Balance every call with exactly one
+/// [`cratonvm_thread_leave_native`].
+///
+/// A **foreign attached** thread (`AttachCurrentThread`) does not need this — it
+/// is already modelled as in-native between its JNI calls — so the call is a
+/// no-op for it. Returns [`JNI_OK`], or [`JNI_ERR`] if no VM exists.
+#[no_mangle]
+pub extern "C" fn cratonvm_thread_enter_native() -> JInt {
+    if host_thread_enter_native() {
+        JNI_OK
+    } else {
+        JNI_ERR
+    }
+}
+
+/// `jint cratonvm_thread_leave_native(void)`
+///
+/// Re-enter the VM after [`cratonvm_thread_enter_native`]: the calling thread
+/// rejoins the mutator population, waiting out any in-flight stop-the-world
+/// first. Balance exactly one prior `cratonvm_thread_enter_native`. No-op for a
+/// foreign attached thread. Returns [`JNI_OK`], or [`JNI_ERR`] if no VM exists.
+#[no_mangle]
+pub extern "C" fn cratonvm_thread_leave_native() -> JInt {
+    if host_thread_leave_native() {
+        JNI_OK
+    } else {
+        JNI_ERR
+    }
 }
 
 // ===========================================================================
@@ -759,6 +809,7 @@ pub extern "C" fn cratonvm_create(args: *const JavaVMInitArgs) -> *mut CratonVm 
         let config = unsafe { config_from_args(args) };
         let mut vm = Vm::new(config);
         bootstrap(&mut vm);
+        // (`Vm::new` already published the process-global VM cell.)
         // Publish this thread's JNI context so JNIEnv-table calls on the
         // creating thread resolve this VM (parity with JNI_CreateJavaVM).
         set_jni_context_arc(vm.shared.get_arc());
@@ -2211,5 +2262,341 @@ mod tests {
         assert!(last_error_string().is_some());
 
         cratonvm_destroy(vm);
+    }
+
+    // -- Foreign-thread attach concurrent-GC soak (opt-in) -----------------
+    //
+    // End-to-end validation of the foreign-thread-attach work
+    // (`foreign-thread-attach.md` §6): `JNI_CreateJavaVM` once, then K host
+    // (non-VM-created) OS threads each `AttachCurrentThread`, loop a static
+    // method that allocates churny garbage while a moving young-gen GC fires
+    // under a small heap, then `DetachCurrentThread`.
+    //
+    // Pass criteria: no UAF / SIGSEGV, no `wait_for_all` hang (a watchdog
+    // aborts on deadlock), the process stays alive, every worker's calls
+    // executed (proving real registration, not the env-only gate-off path),
+    // and `alive_count` returns to the post-create baseline.
+    //
+    // Opt-in (JDK-dependent + slow + creates the process-global VM, so it must
+    // not share a binary with the other live-VM test). Build with the cfg and
+    // run with the gate on:
+    //   $env:CRATONVM_FOREIGN_ATTACH=1
+    //   $env:RUSTFLAGS="--cfg foreign_attach_soak"
+    //   cargo test -p libcratonvm --release foreign_attach_concurrent_gc_soak -- --nocapture
+    /// Debug helper: symbolize comma-separated `exe+0x<RVA>` addresses from a
+    /// prior crash, against THIS (same) binary. Run immediately after a crash
+    /// run (no rebuild) so the RVAs still map.
+    #[cfg(foreign_attach_soak)]
+    #[test]
+    fn dbg_symbolize_rvas() {
+        let spec = std::env::var("CRATONVM_DBG_RVAS").unwrap_or_default();
+        let rvas: Vec<usize> = spec
+            .split(',')
+            .map(|s| s.trim().trim_start_matches("0x"))
+            .filter(|s| !s.is_empty())
+            .filter_map(|s| usize::from_str_radix(s, 16).ok())
+            .collect();
+        for (rva, name) in cratonvm_vm::runtime::crash_handler::symbolize_rvas(&rvas) {
+            eprintln!("0x{rva:x} => {}", name.unwrap_or_else(|| "<unresolved>".to_string()));
+        }
+    }
+
+    #[cfg(foreign_attach_soak)]
+    #[test]
+    fn foreign_attach_concurrent_gc_soak() {
+        use std::os::raw::c_char;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::Arc as StdArc;
+
+        // Foreign attach is default-ON (step 7); set it explicitly so the soak
+        // is deterministic regardless of any ambient `CRATONVM_FOREIGN_ATTACH=0`
+        // opt-out in the environment.
+        std::env::set_var("CRATONVM_FOREIGN_ATTACH", "1");
+        // Print a symbolized native backtrace on any access violation.
+        cratonvm_vm::runtime::crash_handler::install_hardware_fault_handler();
+
+        // Small heap → frequent young-gen GC under K-thread allocation churn.
+        // Overridable via env for bisection.
+        let xmx_s = std::env::var("CRATONVM_SOAK_XMX").unwrap_or_else(|_| "-Xmx48m".to_string());
+        let xmx = CString::new(xmx_s).unwrap();
+        let mut opts = [JavaVMOption {
+            option_string: xmx.as_ptr() as *mut c_char,
+            extra_info: std::ptr::null_mut(),
+        }];
+        let mut args = JavaVMInitArgs {
+            version: JNI_VERSION,
+            n_options: opts.len() as JInt,
+            options: opts.as_mut_ptr(),
+            ignore_unrecognized: 1,
+        };
+
+        let mut vm: JavaVM = std::ptr::null();
+        let mut env: *mut c_void = std::ptr::null_mut();
+        let rc = JNI_CreateJavaVM(
+            &mut vm as *mut JavaVM,
+            &mut env as *mut *mut c_void,
+            &mut args as *mut JavaVMInitArgs as *mut c_void,
+        );
+        assert_eq!(rc, JNI_OK, "JNI_CreateJavaVM failed: {:?}", last_error_string());
+        assert!(!vm.is_null() && !env.is_null());
+
+        // Read a JNIEnv/JavaVM function-table slot (the tables are
+        // `*const *const usize`).
+        let tbl_slot = |tbl: *const *const usize, n: usize| -> usize {
+            // SAFETY: tbl points at a live, fully-populated function table.
+            unsafe { *(*tbl).add(n) }
+        };
+
+        // Resolve `Integer.toString(int)` ONCE on the creating thread. Both
+        // handles are GC-stable integers (a ClassId-as-handle and an encoded
+        // method id), so they are shareable across threads.
+        type FindClassFn = extern "C" fn(*mut c_void, *const c_char) -> u64;
+        type GetStaticMidFn =
+            extern "C" fn(*mut c_void, u64, *const c_char, *const c_char) -> u64;
+        let find_class: FindClassFn =
+            unsafe { std::mem::transmute(tbl_slot(env as *const *const usize, 6)) };
+        let get_static_mid: GetStaticMidFn =
+            unsafe { std::mem::transmute(tbl_slot(env as *const *const usize, 113)) };
+
+        let cls_name = CString::new("java/lang/Integer").unwrap();
+        let (m, sig) = match std::env::var("CRATONVM_SOAK_METHOD").as_deref() {
+            // valueOf(small int) returns a cached box — exercises execution with
+            // NO allocation, to separate alloc bugs from execution bugs.
+            Ok("valueOf") => ("valueOf", "(I)Ljava/lang/Integer;"),
+            _ => ("toString", "(I)Ljava/lang/String;"),
+        };
+        let m_name = CString::new(m).unwrap();
+        let m_sig = CString::new(sig).unwrap();
+        let cls = find_class(env, cls_name.as_ptr());
+        assert_ne!(cls, 0, "FindClass(java/lang/Integer) failed");
+        let mid = get_static_mid(env, cls, m_name.as_ptr(), m_sig.as_ptr());
+        assert_ne!(mid, 0, "GetStaticMethodID(Integer.toString) failed");
+
+        // System.gc()V — workers call it periodically to force STW collections
+        // *while other foreign threads are mid-call*, which is precisely the
+        // path foreign-thread GC participation must survive (a small heap alone
+        // rarely fills fast enough under this modest churn).
+        let sys_name = CString::new("java/lang/System").unwrap();
+        let gc_name = CString::new("gc").unwrap();
+        let gc_sig = CString::new("()V").unwrap();
+        let sys_cls = find_class(env, sys_name.as_ptr());
+        assert_ne!(sys_cls, 0, "FindClass(java/lang/System) failed");
+        let gc_mid = get_static_mid(env, sys_cls, gc_name.as_ptr(), gc_sig.as_ptr());
+        assert_ne!(gc_mid, 0, "GetStaticMethodID(System.gc) failed");
+
+        // Sanity: the same call from the (properly attached) creating thread,
+        // to separate harness/marshalling bugs from the foreign-attach path.
+        {
+            type CallObjAFn = extern "C" fn(*mut c_void, u64, u64, *const c_void) -> u64;
+            let call: CallObjAFn =
+                unsafe { std::mem::transmute(tbl_slot(env as *const *const usize, 116)) };
+            let jv: i64 = 7;
+            let s = call(env, cls, mid, &jv as *const i64 as *const c_void);
+            // The creating thread has JNI_SHARED_VM but no JNI_THREAD, so the
+            // env-table Call* path returns null for it (it drives the VM via the
+            // flat API / vm.invoke instead). This is just diagnostic.
+            eprintln!("[soak] main-thread Integer.toString(7) -> handle {s:#x}");
+        }
+
+        // Baseline alive thread count (just the creating thread, id 0) and GC
+        // cycle counter (to prove a collection actually fired under the churn).
+        let baseline = cratonvm_vm::native::jni::process_vm()
+            .expect("process_vm published")
+            .thread_registry
+            .alive_count();
+        let gc_before = cratonvm_vm::native::jni::process_vm()
+            .expect("process_vm published")
+            .heap
+            .collection_count();
+
+        // Share the process-stable handles into worker threads (raw pointers as
+        // usize for Send; they address process-global singletons).
+        #[derive(Clone, Copy)]
+        struct Shared {
+            vm: usize,
+            cls: u64,
+            mid: u64,
+            sys_cls: u64,
+            gc_mid: u64,
+        }
+        let shared = Shared {
+            vm: vm as usize,
+            cls,
+            mid,
+            sys_cls,
+            gc_mid,
+        };
+
+        let parse_env = |k: &str, d: usize| -> usize {
+            std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
+        };
+        let k_threads = parse_env("CRATONVM_SOAK_K", 6);
+        let iters = parse_env("CRATONVM_SOAK_ITERS", 4000);
+        let total_calls = StdArc::new(AtomicUsize::new(0));
+        let mut handles = Vec::new();
+        for t in 0..k_threads {
+            let shared = shared;
+            let total_calls = total_calls.clone();
+            let iters = iters;
+            // Host threads must give the VM interpreter enough native stack; the
+            // debug interpreter recurses deeply (the VM's own worker carriers use
+            // 8 MiB). Rust's ~2 MiB default thread stack is too small.
+            handles.push(std::thread::Builder::new()
+                .name(format!("foreign-{t}"))
+                .stack_size(16 * 1024 * 1024)
+                .spawn(move || {
+                let vm = shared.vm as *const *const usize;
+                type AttachFn =
+                    extern "C" fn(*const *const usize, *mut *mut c_void, *mut c_void) -> JInt;
+                type DetachFn = extern "C" fn(*const *const usize) -> JInt;
+                type CallObjAFn =
+                    extern "C" fn(*mut c_void, u64, u64, *const c_void) -> u64;
+                type DeleteLocalFn = extern "C" fn(*mut c_void, u64);
+                // SAFETY: vm is the process-global invocation table.
+                let attach: AttachFn = unsafe { std::mem::transmute(*(*vm).add(4)) };
+                let detach: DetachFn = unsafe { std::mem::transmute(*(*vm).add(5)) };
+
+                let mut wenv: *mut c_void = std::ptr::null_mut();
+                let arc = attach(vm, &mut wenv as *mut *mut c_void, std::ptr::null_mut());
+                assert_eq!(arc, JNI_OK, "AttachCurrentThread failed on worker {t}");
+                assert!(!wenv.is_null());
+
+                type CallVoidAFn = extern "C" fn(*mut c_void, u64, u64, *const c_void);
+                let call: CallObjAFn = unsafe {
+                    std::mem::transmute(*(*(wenv as *const *const usize)).add(116))
+                };
+                let call_void: CallVoidAFn = unsafe {
+                    std::mem::transmute(*(*(wenv as *const *const usize)).add(143))
+                };
+                let delete_local: DeleteLocalFn = unsafe {
+                    std::mem::transmute(*(*(wenv as *const *const usize)).add(24))
+                };
+
+                let mut local = 0usize;
+                for i in 0..iters {
+                    // jvalue: an `I` arg occupies the low 4 bytes of the union.
+                    let jv: i64 = ((t * iters + i) as i32) as i64;
+                    let s = call(
+                        wenv,
+                        shared.cls,
+                        shared.mid,
+                        &jv as *const i64 as *const c_void,
+                    );
+                    if s != 0 {
+                        local += 1;
+                        // Free the per-call result promptly to bound the live set.
+                        delete_local(wenv, s);
+                    }
+                    // A SINGLE designated foreign thread periodically forces a
+                    // stop-the-world GC while its siblings are mid-call — the
+                    // participation path under test (siblings must arrive at a
+                    // safepoint). Only one initiator at a time: concurrent
+                    // System.gc from many threads trips a *separate*, pre-existing
+                    // multi-thread-STW reliability bug in dev (reproduces with
+                    // zero foreign threads — see scratch_churn/Churn.java), which
+                    // is out of scope for validating foreign attach.
+                    if t == 0 && i % 64 == 0 {
+                        call_void(wenv, shared.sys_cls, shared.gc_mid, std::ptr::null());
+                    }
+                }
+                total_calls.fetch_add(local, Ordering::Relaxed);
+                let dr = detach(vm);
+                assert_eq!(dr, JNI_OK, "DetachCurrentThread failed on worker {t}");
+            })
+            .expect("failed to spawn foreign host thread"));
+        }
+
+        // Deadlock watchdog: if the workers do not all finish within the
+        // deadline, a `wait_for_all` hang (the failure this work prevents) is
+        // the likely cause — abort loudly rather than hang the test runner.
+        let finished = StdArc::new(AtomicBool::new(false));
+        {
+            let finished = finished.clone();
+            let secs = std::env::var("CRATONVM_SOAK_TIMEOUT_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(120u64);
+            std::thread::spawn(move || {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+                while std::time::Instant::now() < deadline {
+                    if finished.load(Ordering::Acquire) {
+                        return;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+                eprintln!(
+                    "foreign_attach_concurrent_gc_soak: watchdog timeout — likely STW deadlock"
+                );
+                if let Some(vm) = cratonvm_vm::native::jni::process_vm() {
+                    eprintln!(
+                        "[soak/watchdog] alive={} stw_requested={} blocked={} pending(expected-arrived)={}",
+                        vm.thread_registry.alive_count(),
+                        vm.gc_barrier
+                            .stw_requested
+                            .load(std::sync::atomic::Ordering::Acquire),
+                        vm.gc_barrier.blocked_count(),
+                        vm.gc_barrier.pending_count(),
+                    );
+                    for (tid, blocked, snap) in vm.thread_registry.dump_blocked_states() {
+                        eprintln!("[soak/watchdog]   tid={tid} blocked={blocked} snapshot_len={snap}");
+                    }
+                }
+                std::process::abort();
+            });
+        }
+
+        // The creating thread is now idle in host code while the foreign workers
+        // drive Java + GC. It must declare itself in-native, or a worker's
+        // stop-the-world would wait for it forever (it never reaches a Java
+        // safepoint while parked in `join()`). This is exactly the host-facing
+        // primitive the embedding API exposes for an idle coordinator thread.
+        assert_eq!(cratonvm_thread_enter_native(), JNI_OK);
+
+        for h in handles {
+            h.join().expect("a worker thread panicked (UAF/crash or failed assert)");
+        }
+        finished.store(true, Ordering::Release);
+
+        // Rejoin the mutator population before inspecting VM state.
+        assert_eq!(cratonvm_thread_leave_native(), JNI_OK);
+
+        // Every worker's calls executed (proves real registration: the gate-off
+        // env-only path would have returned 0 for every call).
+        assert_eq!(
+            total_calls.load(Ordering::Relaxed),
+            k_threads * iters,
+            "expected every static call to execute and allocate a String"
+        );
+
+        // alive_count returns to the post-create baseline: every attach was
+        // matched by a detach that deregistered its thread.
+        let after = cratonvm_vm::native::jni::process_vm()
+            .expect("process_vm still live")
+            .thread_registry
+            .alive_count();
+        assert_eq!(
+            after, baseline,
+            "alive_count must return to baseline after all detaches"
+        );
+
+        // A moving collection must actually have fired under the churn,
+        // otherwise the soak proves nothing about GC-safety. (Skipped only when
+        // the caller forced a large heap / few iterations for bisection.)
+        let gc_after = cratonvm_vm::native::jni::process_vm()
+            .expect("process_vm still live")
+            .heap
+            .collection_count();
+        if iters >= 64 {
+            assert!(
+                gc_after > gc_before,
+                "expected at least one GC cycle (periodic System.gc + churn) \
+                 (before={gc_before}, after={gc_after})"
+            );
+        }
+        eprintln!(
+            "[soak] OK: {} calls across {k_threads} foreign threads, {} GC cycles",
+            total_calls.load(Ordering::Relaxed),
+            gc_after - gc_before
+        );
     }
 }

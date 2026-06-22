@@ -84,12 +84,44 @@ pub enum FrameValue {
     /// resume builds a `Value::Long` (occupying one compact operand-stack slot
     /// and two JVM local slots) rather than a truncated `Value::Int`.
     Long(i64),
-    /// Float constant (stored as raw bits).
+    /// Cat-1 `float` constant, stored as its raw 32-bit IEEE-754 pattern in the
+    /// low bits (upper bits zero). The resume builds a `Value::Float`
+    /// (`f32::from_bits(bits as u32)`) occupying one local/stack slot.
     Float(u64),
+    /// Category-2 `double` constant, stored as its raw 64-bit IEEE-754 pattern.
+    /// Distinct from [`FrameValue::Float`] (cat-1, 32-bit) so the resume builds a
+    /// `Value::Double` (`f64::from_bits(bits)`) with correct cat-2 two-slot local
+    /// placement, and from [`FrameValue::Long`] so the bits are reinterpreted as
+    /// a double rather than a long.
+    Double(u64),
     /// Object reference (heap address, 0 for null).
     Object(u64),
-    /// Value currently in a machine register.
+    /// Cat-1 `int` currently in a general-purpose machine register. Resolves to a
+    /// (truncated-to-32-bit) [`FrameValue::Int`] from `gpr[n]`, so it is for
+    /// `int`s only — a register-resident `long` uses [`FrameValue::RegisterLong`]
+    /// and a register-resident object reference [`FrameValue::RegisterRef`].
     Register(u8),
+    /// Cat-2 `long` currently live in general-purpose register `n`. Resolves to
+    /// [`FrameValue::Long`] from the full 64 bits of `gpr[n]`. Distinct from
+    /// [`FrameValue::Register`] (which resolves to a cat-1 `Int`, truncated to 32
+    /// bits on resume) so a register-resident `long` keeps all 64 bits.
+    RegisterLong(u8),
+    /// Object reference currently live in general-purpose register `n`. Resolves
+    /// to [`FrameValue::Object`] from the full 64 bits of `gpr[n]` — the register
+    /// holds the raw heap pointer (0 == null), exactly as
+    /// [`FrameValue::StackSlotRef`] does for a spilled ref. Distinct from
+    /// [`FrameValue::Register`] so the resume builds a `Value::Object` (GC-tracked)
+    /// instead of a truncated `Value::Int` that would also drop the oop from the
+    /// GC root scan.
+    RegisterRef(u8),
+    /// Cat-1 `float` currently live in XMM register `n`. Resolves to
+    /// [`FrameValue::Float`] from the low 32 bits of the spilled `xmm[n]`
+    /// ([`SavedRegisters::xmm`]). The JIT FP value tier keeps a `float` in an XMM
+    /// across a guard; the deopt stub spills all 16 XMM regs so this resolves.
+    XmmFloat(u8),
+    /// Cat-2 `double` currently live in XMM register `n`. Resolves to
+    /// [`FrameValue::Double`] from the full 64 bits of the spilled `xmm[n]`.
+    XmmDouble(u8),
     /// Value at a native stack slot offset, holding a cat-1 **int** (JVM
     /// `int`/`boolean`/`byte`/`char`/`short`). Resolves to [`FrameValue::Int`].
     StackSlot(i32),
@@ -106,6 +138,16 @@ pub enum FrameValue {
     /// `StackSlot` (which is a cat-1 `int`) so the resume builds a `Value::Long`
     /// with correct cat-2 two-slot local placement (`real-frame-deopt` cat-2).
     StackSlotLong(i32),
+    /// Value at a native stack slot offset, holding a cat-1 `float` (the lowerer
+    /// spills the 32-bit IEEE bit pattern in the low word). Resolves to
+    /// [`FrameValue::Float`] — the low 32 bits ARE the float bits. Distinct from
+    /// `StackSlot` (a cat-1 `int`) so the resume builds a `Value::Float`.
+    StackSlotFloat(i32),
+    /// Value at a native stack slot offset, holding a category-2 `double` (the
+    /// lowerer spills the full 64-bit IEEE bit pattern). Resolves to
+    /// [`FrameValue::Double`] — the raw 64-bit word IS the double bits. Distinct
+    /// from `StackSlotLong` so the resume builds a `Value::Double` (cat-2).
+    StackSlotDouble(i32),
     /// Scalar-replaced object that must be re-materialized.
     VirtualObject(VirtualObjectState),
     /// A reference to another scalar-replaced object in the same deopt frame, by
@@ -118,11 +160,14 @@ pub enum FrameValue {
     VirtualObjectRef(usize),
     /// Undefined / uninitialized.
     Undefined,
-    /// A live slot whose precise value can't yet be reconstructed for resume
-    /// (category-2 `long`/`double`, or a float-in-slot — the two-slot
-    /// expansion and FP-slot resolution are follow-ups). The resume treats this
-    /// as "fall back to the safe re-run path" rather than fabricate a value, so
-    /// a method with such a slot live at a guard is never resumed with garbage.
+    /// A live slot whose precise value can't be reconstructed for resume. With
+    /// cat-2 (`Long`/`Double`/`StackSlotLong`/`StackSlotDouble`) and FP
+    /// (`Float`/`XmmFloat`/`XmmDouble`/`StackSlotFloat`) now representable, this
+    /// is reserved for slots whose JVM width/type the snapshot emitter cannot
+    /// determine with certainty at the guard bci (the single-pass backend has no
+    /// global per-slot type oracle). The resume treats it as "fall back to the
+    /// safe re-run path" rather than fabricate a value, so a method with such a
+    /// slot live at a guard is never resumed with garbage.
     Unsupported,
 }
 
@@ -580,7 +625,12 @@ impl InvalidationManager {
 
 /// A fully reconstructed interpreter frame ready for the interpreter to
 /// resume execution.
-#[derive(Debug)]
+///
+/// `Clone` is needed by the vm-crate resume sink: virtual-object
+/// re-materialization (`deopt_materialize::materialize_virtual_objects`) rewrites
+/// slots in place, so the sink clones the immutable reconstructed frame into a
+/// mutable copy before materializing.
+#[derive(Debug, Clone)]
 pub struct ReconstructedFrame {
     pub method_key: String,
     pub bci: u32,
@@ -799,34 +849,48 @@ pub fn materialize_virtual_objects(frame: &FrameState) -> Vec<(usize, u64)> {
 // Machine-state frame reconstruction (real-frame-deopt step 3)
 // ---------------------------------------------------------------------------
 
-/// The integer register file spilled by the deopt trampoline, indexed by
-/// x86-64 GPR number (0 = RAX, 1 = RCX, … 15 = R15).
+/// The register file spilled by the deopt trampoline. `gpr` is indexed by
+/// x86-64 GPR number (0 = RAX, 1 = RCX, … 15 = R15); `xmm` by XMM number
+/// (0 = XMM0 … 15 = XMM15), each holding the low 64 bits of the vector register
+/// (`movq`), which is all a scalar `float`/`double` occupies.
 ///
-/// `FrameValue::Register(r)` resolves against `gpr[r]`. The naive IR lowerer
-/// spills every value to a frame slot, so on that path this is unused (all
-/// `FrameValue`s are `StackSlot`/constant); it exists so the resolver is
-/// complete for backends that keep live values in registers at a safepoint.
+/// `FrameValue::Register(r)` resolves against `gpr[r]`; `XmmFloat(n)` /
+/// `XmmDouble(n)` against `xmm[n]`. The naive IR lowerer spills every value to a
+/// frame slot, so on that path this is unused (all `FrameValue`s are
+/// `StackSlot`/constant); it exists so the resolver is complete for backends
+/// that keep live values in registers at a safepoint.
+///
+/// `#[repr(C)]` fixes the field order: the x64 deopt stub spills the 16 GPRs
+/// into the first 128 bytes and the 16 XMMs into the next 128 (256-byte region),
+/// and `&gpr[0]` is the struct base — so the spill layout and this struct must
+/// stay in lockstep (see `emit_deopt_stubs` in `x64.rs`).
 #[derive(Clone, Copy)]
 #[repr(C)]
 pub struct SavedRegisters {
     pub gpr: [u64; 16],
+    pub xmm: [u64; 16],
 }
 
 impl Default for SavedRegisters {
     fn default() -> Self {
-        Self { gpr: [0; 16] }
+        Self {
+            gpr: [0; 16],
+            xmm: [0; 16],
+        }
     }
 }
 
 /// Resolve one `FrameValue` against live machine state.
 ///
-/// Constants (`Int`/`Float`/`Object`/`Undefined`) and not-yet-materialized
-/// `VirtualObject`s pass through unchanged. A `Register(r)` reads
-/// `regs.gpr[r]`; a `StackSlot(off)` reads `*(rbp + off)` from the live
-/// native frame. Both resolved cases become a concrete `Int` — the IR path
-/// carries no per-slot ref/int tag yet, so callers that need to distinguish
-/// object references from primitives must consult the method's verification
-/// type state (a later refinement; see `real-frame-deopt.md`).
+/// Constants (`Int`/`Long`/`Float`/`Double`/`Object`/`Undefined`) and
+/// not-yet-materialized `VirtualObject`s pass through unchanged. The machine
+/// forms resolve against the spilled state: `Register(r)` → `gpr[r]` (as `Int`);
+/// `XmmFloat(n)`/`XmmDouble(n)` → the low 32 / full 64 bits of `xmm[n]` (as
+/// `Float`/`Double`); `StackSlot*(off)` reads `*(rbp + off)` from the live native
+/// frame and tags it `Int`/`Object`/`Long`/`Float`/`Double` per the slot's typed
+/// variant. The plain `StackSlot`/`Register` int case carries no per-slot ref/int
+/// tag, so the snapshot emitter chooses the typed variant up front (oop mask, XMM
+/// provenance, cat-2 width); see `real-frame-deopt.md`.
 ///
 /// # Safety
 /// `rbp` must be the still-live frame base for which `off` was computed, and
@@ -835,6 +899,18 @@ impl Default for SavedRegisters {
 fn resolve_value(v: &FrameValue, regs: &SavedRegisters, rbp: u64) -> FrameValue {
     match v {
         FrameValue::Register(r) => FrameValue::Int(regs.gpr[*r as usize] as i64),
+        FrameValue::RegisterLong(r) => FrameValue::Long(regs.gpr[*r as usize] as i64),
+        // The register holds the raw heap pointer (0 == null) captured in-stub at
+        // the guard — same as `StackSlotRef` but read from the spilled GPR file.
+        FrameValue::RegisterRef(r) => FrameValue::Object(regs.gpr[*r as usize]),
+        FrameValue::XmmFloat(n) => {
+            // Low 32 bits of the spilled XMM ARE the IEEE-754 float pattern.
+            FrameValue::Float(regs.xmm[*n as usize] & 0xFFFF_FFFF)
+        }
+        FrameValue::XmmDouble(n) => {
+            // Full 64 bits of the spilled XMM ARE the IEEE-754 double pattern.
+            FrameValue::Double(regs.xmm[*n as usize])
+        }
         FrameValue::StackSlot(off) => {
             let addr = (rbp as i64 + *off as i64) as u64 as *const i64;
             // SAFETY: see function-level contract — frame is live, slot in-frame.
@@ -855,6 +931,20 @@ fn resolve_value(v: &FrameValue, regs: &SavedRegisters, rbp: u64) -> FrameValue 
             // The lowerer spills the full 64-bit `long`, so the raw word IS the
             // value; the resume builds a `Value::Long` (cat-2) from it.
             FrameValue::Long(unsafe { addr.read_unaligned() })
+        }
+        FrameValue::StackSlotFloat(off) => {
+            let addr = (rbp as i64 + *off as i64) as u64 as *const u32;
+            // SAFETY: see function-level contract — frame is live, slot in-frame.
+            // The low 32 bits ARE the IEEE-754 float pattern; resume builds a
+            // `Value::Float`.
+            FrameValue::Float(unsafe { addr.read_unaligned() } as u64)
+        }
+        FrameValue::StackSlotDouble(off) => {
+            let addr = (rbp as i64 + *off as i64) as u64 as *const u64;
+            // SAFETY: see function-level contract — frame is live, slot in-frame.
+            // The raw 64-bit word IS the IEEE-754 double pattern; resume builds a
+            // `Value::Double` (cat-2).
+            FrameValue::Double(unsafe { addr.read_unaligned() })
         }
         other => other.clone(),
     }
@@ -1171,6 +1261,67 @@ mod tests {
         // StackSlotLong reads the full 64-bit word (NOT truncated to i32).
         assert_eq!(rf.locals[2], FrameValue::Long(0xFEDC_BA98_7654_3210u64 as i64));
         assert_eq!(rf.locals[3], FrameValue::Unsupported);
+    }
+
+    /// `resolve_value` reads FP slots and XMM-resident FP values precisely: a
+    /// `StackSlotFloat`/`XmmFloat` as the low 32 bits (a cat-1 `Float`), a
+    /// `StackSlotDouble`/`XmmDouble` as the full 64 bits (a cat-2 `Double`). The
+    /// high garbage in the float sources proves the low-32 mask/read — so the
+    /// resume builds a real `Value::Float`/`Value::Double`, never a truncated int.
+    #[test]
+    fn reconstruct_resolves_fp_slots_and_xmm_registers() {
+        let float_bits: u32 = 1.5f32.to_bits(); // 0x3FC0_0000
+        let double_bits: u64 = std::f64::consts::PI.to_bits();
+        // buf[0] @ rbp-16 (float bits in low 32, high garbage), buf[1] @ rbp-8 (double).
+        let buf: [u64; 3] = [
+            0xDEAD_BEEF_0000_0000 | float_bits as u64,
+            double_bits,
+            0,
+        ];
+        let rbp = (&buf[2] as *const u64) as u64;
+
+        let mut regs = SavedRegisters::default();
+        regs.xmm[5] = 0xCAFE_F00D_0000_0000 | float_bits as u64; // high garbage masked off
+        regs.xmm[9] = double_bits;
+        // A cat-2 `long` in GPR 7 — full 64 bits (high bits set, would truncate
+        // if mistyped as a cat-1 `Register`).
+        regs.gpr[7] = 0xFEDC_BA98_7654_3210;
+        // An object reference in GPR 3 — the full pointer word.
+        regs.gpr[3] = 0x0000_7F12_3456_7890;
+
+        let fs = FrameState {
+            method_key: "T.m:()V".to_string(),
+            bci: 0,
+            locals: vec![
+                FrameValue::StackSlotFloat(-16),
+                FrameValue::StackSlotDouble(-8),
+                FrameValue::XmmFloat(5),
+                FrameValue::XmmDouble(9),
+                FrameValue::RegisterLong(7),
+                FrameValue::RegisterRef(3),
+            ],
+            stack: Vec::new(),
+            monitors: Vec::new(),
+            caller: None,
+        };
+        let dp = DeoptimizationPoint {
+            native_offset: 0,
+            bci: 0,
+            reason: DeoptReason::BoundsCheck,
+            action: DeoptAction::Reinterpret,
+            speculation_id: 0,
+            frame_state: fs,
+        };
+        let rf = reconstruct_frame_from_machine_state(&dp, &regs, rbp);
+        assert_eq!(rf.locals[0], FrameValue::Float(float_bits as u64));
+        assert_eq!(rf.locals[1], FrameValue::Double(double_bits));
+        assert_eq!(rf.locals[2], FrameValue::Float(float_bits as u64));
+        assert_eq!(rf.locals[3], FrameValue::Double(double_bits));
+        // RegisterLong keeps all 64 bits (NOT truncated like Register -> Int).
+        assert_eq!(rf.locals[4], FrameValue::Long(0xFEDC_BA98_7654_3210u64 as i64));
+        // RegisterRef carries the full heap pointer as an Object (NOT a truncated
+        // Int that would also drop it from the GC scan).
+        assert_eq!(rf.locals[5], FrameValue::Object(0x0000_7F12_3456_7890));
     }
 
     // -- DeoptReason -------------------------------------------------------

@@ -287,7 +287,31 @@ impl<'a> SharedEvac<'a> {
         } else {
             &mut tlab.survivor
         };
-        let new_addr = self.tlab_alloc(dest_tlab, obj_size)?;
+        let new_addr = match self.tlab_alloc(dest_tlab, obj_size) {
+            Some(a) => a,
+            None => {
+                // EVACUATION FAILURE (to-space pool exhausted): self-forward in
+                // place rather than dropping the object (mirrors the serial path).
+                // CAS the from-space header's forwarding slot to the object's OWN
+                // address; the winner records an identity forward (old→old) so
+                // Phase 5 keeps its region, a loser adopts whatever address won
+                // (a real new location, or another self-forward). `fresh` from the
+                // CAS keeps the object scanned exactly once.
+                let old = old_ptr as usize;
+                return match fwd_atomic.compare_exchange(
+                    0,
+                    old,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => {
+                        forwards.push((old, old));
+                        Some((old_ptr, true))
+                    }
+                    Err(winner) => Some((winner as *mut u8, false)),
+                };
+            }
+        };
         let new_ptr = new_addr as *mut u8;
 
         std::ptr::copy_nonoverlapping(old_ptr, new_ptr, obj_size);
@@ -1168,17 +1192,28 @@ impl G1Collector {
         regions: &mut Vec<G1Region>,
         target_type: RegionType,
         size: usize,
+        cset: &std::collections::HashSet<usize>,
     ) -> Option<*mut u8> {
-        // Try existing regions of this type
+        // CORRECTNESS (evacuation destination must NOT be in the collection set):
+        // a young GC evacuates *all* Survivor regions, so a partially-filled
+        // Survivor region is itself in the CSet; a mixed GC likewise has selected
+        // Old regions in the CSet. Reusing such a region as an evacuation
+        // *destination* copies survivors into a region that Phase 5 then resets
+        // (frees) — the copies are lost and every reference to them is left
+        // dangling (silent live-object loss; the held-tree `got=1` repro). Skip
+        // any CSet region here: young survivors land only in fresh Free regions,
+        // mixed promotions only in non-CSet Old or fresh Free regions — matching
+        // the semi-space "never allocate into from-space" invariant the
+        // generational collector and the Step-9 parallel TLAB path already honour.
         for i in 0..regions.len() {
-            if regions[i].region_type == target_type {
+            if regions[i].region_type == target_type && !cset.contains(&i) {
                 if let Some((ptr, _)) = regions[i].bump_alloc(size, 8) {
                     return Some(ptr);
                 }
             }
         }
 
-        // Allocate a new free region
+        // Allocate a new free region (Free regions are never in the CSet).
         if let Some(idx) = find_free_region(regions) {
             regions[idx].region_type = target_type;
             if target_type == RegionType::Survivor {
@@ -1190,6 +1225,49 @@ impl G1Collector {
         }
 
         None
+    }
+
+    /// Phase 5: free evacuated CSet regions — EXCEPT those that hold a
+    /// self-forwarded (evacuation-failed) object, which must be KEPT so the
+    /// still-live object that could not be relocated is not freed.
+    ///
+    /// A self-forwarded object is recorded as an identity entry (`key == value`)
+    /// in the forwarding map by [`Self::evacuate_object`] (and the parallel
+    /// evacuator) when to-space is exhausted. Its region is kept intact: a young
+    /// `Eden` region is retyped to `Survivor` (it now holds survivors and is
+    /// re-collected next cycle, when the moved-out garbage copies it also
+    /// contains become unreachable and freed); `Survivor`/`Old` regions keep
+    /// their type. Returns the bytes freed (only from regions actually reset).
+    ///
+    /// At adequate heaps no evacuation fails, so `failed` is empty and this is
+    /// exactly the old "reset every CSet region" behaviour.
+    fn free_or_keep_cset(
+        &self,
+        regions: &mut Vec<G1Region>,
+        cset: &[usize],
+        pointer_map: &HashMap<usize, usize>,
+    ) -> usize {
+        // Regions that hold at least one self-forwarded (in-place) object.
+        // `lookup_region_for_addr` consults the immutable region table, so it
+        // does not borrow `regions` (no conflict with the mutable loop below).
+        let failed: std::collections::HashSet<usize> = pointer_map
+            .iter()
+            .filter(|(k, v)| k == v)
+            .filter_map(|(k, _)| self.lookup_region_for_addr(*k))
+            .collect();
+
+        let mut bytes_freed = 0usize;
+        for &cset_idx in cset {
+            if failed.contains(&cset_idx) {
+                if regions[cset_idx].region_type == RegionType::Eden {
+                    regions[cset_idx].region_type = RegionType::Survivor;
+                }
+            } else {
+                bytes_freed += regions[cset_idx].cursor;
+                regions[cset_idx].reset();
+            }
+        }
+        bytes_freed
     }
 
     // -----------------------------------------------------------------------
@@ -1205,7 +1283,13 @@ impl G1Collector {
         // Step 9: opt-in multi-threaded evacuator (`CRATONVM_G1_PARALLEL_EVAC`).
         // Behaviour-equivalent to the serial path below (byte-identical program
         // output); see the parallel-evacuation module note above.
-        if parallel_evac_enabled() {
+        //
+        // Fall back to the serial path whenever a thread is in JIT: only the
+        // serial path implements conservative-JIT-root region pinning (the
+        // parallel evacuator would relocate a JIT-rooted object whose holder
+        // slot cannot be rewritten). When parallel DOES run (no thread in JIT)
+        // there are no conservative JIT roots to pin, so it stays correct.
+        if parallel_evac_enabled() && !crate::gc_quiescence::is_active() {
             return self.young_collection_parallel(roots, monitors);
         }
         let start = std::time::Instant::now();
@@ -1220,12 +1304,23 @@ impl G1Collector {
         let mut objects_copied = 0usize;
         let mut bytes_copied = 0usize;
 
-        // Build collection set: all Eden + Survivor regions (skip pinned)
+        // Regions holding a conservatively-discovered JIT root must NOT be
+        // evacuated: the collector cannot rewrite the (register/spill) slot that
+        // holds the only reference, so the object must stay put (the
+        // generational collector achieves this by not moving anything while in
+        // JIT). Map each published root address to its region and exclude those
+        // from the CSet, exactly like JNI-pinned regions. Empty unless a thread
+        // is in JIT (the common case for a JIT-triggered young GC).
+        let jit_pinned_regions = self.jit_pinned_region_set();
+
+        // Build collection set: all Eden + Survivor regions (skip pinned + any
+        // region holding a conservative JIT root)
         let cset: Vec<usize> = regions
             .iter()
             .enumerate()
-            .filter(|(_, r)| {
+            .filter(|(i, r)| {
                 !r.pinned
+                    && !jit_pinned_regions.contains(i)
                     && (r.region_type == RegionType::Eden || r.region_type == RegionType::Survivor)
             })
             .map(|(i, _)| i)
@@ -1262,6 +1357,7 @@ impl G1Collector {
                         &mut pointer_map,
                         &mut objects_copied,
                         &mut bytes_copied,
+                        &cset_set,
                     ) {
                         *root = unsafe { ObjectRef::from_raw(new_ptr) };
                         work_list.push(new_ptr);
@@ -1282,10 +1378,17 @@ impl G1Collector {
 
         // CRIT fix (UAF): actually process the collected rset sources.
         // Dedup source indices so we walk each source region at most once.
-        let unique_sources: std::collections::HashSet<usize> = rset_sources
+        // JIT-pinned regions are scanned as sources too: their objects stay in
+        // place (excluded from the CSet) but may reference objects that ARE in
+        // the CSet, and young→young references carry no remembered set, so the
+        // pinned region must be walked explicitly to evacuate and fix up those
+        // referents. Without this, a list/tree straddling pinned and CSet
+        // regions loses the CSet-side nodes (SIGSEGV / wrong checksum).
+        let mut unique_sources: std::collections::HashSet<usize> = rset_sources
             .iter()
             .flat_map(|(_, srcs)| srcs.iter().copied())
             .collect();
+        unique_sources.extend(jit_pinned_regions.iter().copied());
         for src_idx in unique_sources {
             self.scan_source_region_for_cset_refs(
                 &mut regions,
@@ -1321,11 +1424,7 @@ impl G1Collector {
         self.update_references_in_regions(&mut regions, &cset_set, &pointer_map);
 
         // Phase 5: Free evacuated regions
-        let mut bytes_freed = 0usize;
-        for &cset_idx in &cset {
-            bytes_freed += regions[cset_idx].cursor;
-            regions[cset_idx].reset();
-        }
+        let bytes_freed = self.free_or_keep_cset(&mut regions, &cset, &pointer_map);
 
         // SECURITY FIX (V7b): after the CSet is freed, scan survivors for
         // any slot still pointing into a freed CSet region with no
@@ -1521,7 +1620,9 @@ impl G1Collector {
         monitors: &dyn MonitorCleanup,
     ) -> GcResult {
         // Step 9: opt-in multi-threaded evacuator (`CRATONVM_G1_PARALLEL_EVAC`).
-        if parallel_evac_enabled() {
+        // Fall back to serial while any thread is in JIT — only the serial path
+        // pins conservative JIT-root regions (see `young_collection`).
+        if parallel_evac_enabled() && !crate::gc_quiescence::is_active() {
             return self.mixed_collection_parallel(roots, monitors);
         }
         let start = std::time::Instant::now();
@@ -1534,12 +1635,20 @@ impl G1Collector {
         let mut objects_copied = 0usize;
         let mut bytes_copied = 0usize;
 
-        // Build CSet: all young regions + worst old regions
+        // Exclude regions holding a conservative JIT root from the CSet (pin in
+        // place) — see `young_collection` / `jit_pinned_region_set`. A mixed GC
+        // can also select the (now promoted) region of a long-lived JIT-rooted
+        // object, so this guard matters for both young and old CSet members.
+        let jit_pinned_regions = self.jit_pinned_region_set();
+
+        // Build CSet: all young regions + worst old regions (skip pinned + any
+        // region holding a conservative JIT root)
         let mut cset: Vec<usize> = regions
             .iter()
             .enumerate()
-            .filter(|(_, r)| {
+            .filter(|(i, r)| {
                 !r.pinned
+                    && !jit_pinned_regions.contains(i)
                     && (r.region_type == RegionType::Eden || r.region_type == RegionType::Survivor)
             })
             .map(|(i, _)| i)
@@ -1556,7 +1665,9 @@ impl G1Collector {
         let mut old_candidates: Vec<(usize, f64)> = regions
             .iter()
             .enumerate()
-            .filter(|(_, r)| r.region_type == RegionType::Old && !r.pinned)
+            .filter(|(i, r)| {
+                r.region_type == RegionType::Old && !r.pinned && !jit_pinned_regions.contains(i)
+            })
             .map(|(i, r)| (i, r.gc_efficiency))
             .collect();
         // Stable sort so that among regions with identical efficiency
@@ -1609,6 +1720,7 @@ impl G1Collector {
                         &mut pointer_map,
                         &mut objects_copied,
                         &mut bytes_copied,
+                        &cset_set,
                     ) {
                         *root = unsafe { ObjectRef::from_raw(new_ptr) };
                         work_list.push(new_ptr);
@@ -1635,6 +1747,10 @@ impl G1Collector {
                 // iteration above is over the snapshot and does not hold
                 // the RSet lock across the body.
             }
+            // JIT-pinned regions are scanned as sources too (see
+            // young_collection): their objects stay in place but their CSet
+            // referents must still be evacuated and fixed up.
+            set.extend(jit_pinned_regions.iter().copied());
             set
         };
         for src_idx in mixed_rset_sources {
@@ -1671,11 +1787,7 @@ impl G1Collector {
         // Update references and free evacuated regions
         self.update_references_in_regions(&mut regions, &cset_set, &pointer_map);
 
-        let mut bytes_freed = 0usize;
-        for &cset_idx in &cset {
-            bytes_freed += regions[cset_idx].cursor;
-            regions[cset_idx].reset();
-        }
+        let bytes_freed = self.free_or_keep_cset(&mut regions, &cset, &pointer_map);
 
         // SECURITY FIX (V7b): mixed GC frees old regions as well as young
         // ones, where a stale/incomplete rset is most likely. Verify no
@@ -1941,11 +2053,7 @@ impl G1Collector {
         self.update_references_in_regions(&mut regions, &cset_set, &pointer_map);
 
         // Phase 5: free evacuated regions.
-        let mut bytes_freed = 0usize;
-        for &cset_idx in &cset {
-            bytes_freed += regions[cset_idx].cursor;
-            regions[cset_idx].reset();
-        }
+        let bytes_freed = self.free_or_keep_cset(&mut regions, &cset, &pointer_map);
         self.verify_no_dangling_into_cset(&regions, &cset_set, &pointer_map);
 
         let cur_eden = self.current_eden.load(Ordering::Relaxed);
@@ -2073,11 +2181,7 @@ impl G1Collector {
 
         self.update_references_in_regions(&mut regions, &cset_set, &pointer_map);
 
-        let mut bytes_freed = 0usize;
-        for &cset_idx in &cset {
-            bytes_freed += regions[cset_idx].cursor;
-            regions[cset_idx].reset();
-        }
+        let bytes_freed = self.free_or_keep_cset(&mut regions, &cset, &pointer_map);
         self.verify_no_dangling_into_cset(&regions, &cset_set, &pointer_map);
 
         let cur_eden = self.current_eden.load(Ordering::Relaxed);
@@ -2160,6 +2264,7 @@ impl G1Collector {
         pointer_map: &mut HashMap<usize, usize>,
         objects_copied: &mut usize,
         bytes_copied: &mut usize,
+        cset: &std::collections::HashSet<usize>,
     ) -> Option<(*mut u8, bool)> {
         let old_addr = old_ptr as usize;
 
@@ -2198,7 +2303,33 @@ impl G1Collector {
             RegionType::Survivor
         };
 
-        let new_ptr = Self::alloc_in_type_locked(regions, dest_type, obj_size)?;
+        let new_ptr = match Self::alloc_in_type_locked(regions, dest_type, obj_size, cset) {
+            Some(p) => p,
+            None => {
+                // EVACUATION FAILURE (to-space exhausted: no non-CSet region of the
+                // destination type has room and no Free region is left). Real G1
+                // "self-forwards" such an object — keeps it IN PLACE rather than
+                // dropping it. The previous `?` returned None here, so the caller
+                // skipped the object: its referrers' slots kept pointing into a
+                // CSet region that Phase 5 then reset/freed → silent live-object
+                // loss (a wrong result under memory pressure where the
+                // generational collector correctly OOMs).
+                //
+                // Self-forward: install old→old in the pointer map (an identity
+                // forward) and return the object at its current address with
+                // `fresh = true` so the caller still scans its fields (refs to
+                // objects that DID evacuate are rewritten; refs to other
+                // self-forwarded objects stay put) and the referrer's slot is
+                // rewritten to `old_ptr` (a no-op — the object did not move).
+                // Phase 5 detects self-forwarded objects (key == value in the
+                // pointer map) and KEEPS their regions instead of freeing them,
+                // so nothing is lost. The heap is then simply not reclaimed → the
+                // triggering mutator allocation fails → a clean, catchable
+                // OutOfMemoryError, exactly as the generational collector does.
+                pointer_map.insert(old_addr, old_addr);
+                return Some((old_ptr, true));
+            }
+        };
 
         // Copy object data
         unsafe {
@@ -2306,6 +2437,7 @@ impl G1Collector {
                                     pointer_map,
                                     objects_copied,
                                     bytes_copied,
+                                    cset,
                                 ) {
                                     unsafe {
                                         std::ptr::write(slot_ptr as *mut u64, new_ptr as u64);
@@ -2344,6 +2476,7 @@ impl G1Collector {
                                 pointer_map,
                                 objects_copied,
                                 bytes_copied,
+                                cset,
                             ) {
                                 let new_value =
                                     Value::Object(Some(unsafe { ObjectRef::from_raw(new_ptr) }));
@@ -2440,6 +2573,7 @@ impl G1Collector {
                                     pointer_map,
                                     objects_copied,
                                     bytes_copied,
+                                    cset,
                                 ) {
                                     unsafe {
                                         std::ptr::write(slot_ptr as *mut u64, new_ptr as u64);
@@ -2465,6 +2599,7 @@ impl G1Collector {
                                     pointer_map,
                                     objects_copied,
                                     bytes_copied,
+                                    cset,
                                 ) {
                                     let new_value = Value::Object(Some(unsafe {
                                         ObjectRef::from_raw(new_ptr)
@@ -3668,6 +3803,25 @@ impl G1Collector {
             cell.set(Some((collector_id, dst_idx, region_ptr, epoch_under_lock)));
         });
         regions[dst_idx].rset.add_reference(src_idx);
+    }
+
+    /// Region indices that hold a conservatively-discovered JIT root this cycle
+    /// and must therefore be EXCLUDED from the collection set (pinned in place).
+    ///
+    /// The VM's root gatherer publishes these addresses (only under G1) via
+    /// [`crate::gc_quiescence::add_pinned_jit_root`]; a conservative JIT root
+    /// lives in a register/spill slot the collector cannot rewrite, so its
+    /// object must not move. Excluding its region from the CSet is G1's analog of
+    /// the generational collector's non-moving-while-in-JIT sweep. Returns empty
+    /// unless a thread is in JIT, so the no-JIT path pays nothing.
+    fn jit_pinned_region_set(&self) -> std::collections::HashSet<usize> {
+        if !crate::gc_quiescence::is_active() {
+            return std::collections::HashSet::new();
+        }
+        crate::gc_quiescence::pinned_jit_roots_snapshot()
+            .into_iter()
+            .filter_map(|addr| self.lookup_region_for_addr(addr))
+            .collect()
     }
 
     /// Find which region contains the given address (by raw address).
@@ -7010,5 +7164,89 @@ mod tests {
 
         assert_eq!(vals_s, vals_p1, "serial vs 1-worker values diverge");
         assert_eq!(vals_s, vals_p8, "serial vs 8-worker values diverge");
+    }
+
+    /// Regression for the serial-G1 evacuate-into-CSet-region bug: a young GC
+    /// evacuates ALL survivor regions, so a partially-filled survivor region is
+    /// itself in the CSet. `alloc_in_type_locked` used to reuse it as an
+    /// evacuation *destination*, so survivors were copied into a region Phase 5
+    /// then reset (freed) — silently dropping live objects and leaving every
+    /// reference dangling (the held-tree `got=1` repro). A held object graph must
+    /// survive REPEATED young GCs fully intact. This drives the SERIAL path
+    /// (`young_collection`; the env flag is unset in tests).
+    #[test]
+    fn held_chain_survives_repeated_young_gc() {
+        let gc = make_collector();
+        let n = 50usize;
+        let head = gc.alloc_object(ClassId::new(1), 1);
+        let mut cur = head;
+        for _ in 1..n {
+            let node = gc.alloc_object(ClassId::new(1), 1);
+            gc.set_field(cur, 0, Value::Object(Some(node)));
+            cur = node;
+        }
+        gc.set_field(cur, 0, Value::Int(999)); // tail marker
+        let mut roots = vec![head];
+        for round in 0..6 {
+            let _ = gc.alloc_object(ClassId::new(9), 8); // a little garbage
+            gc.young_collection(&mut roots, &NoopMonitors);
+            // Walk the whole chain: it must still be exactly `n` nodes ending in
+            // the tail marker — no node lost to an evacuate-into-CSet free.
+            let mut count = 0usize;
+            let mut c = roots[0];
+            loop {
+                count += 1;
+                assert!(count <= n, "round {round}: chain longer than {n}");
+                match gc.get_field(c, 0) {
+                    Value::Object(Some(next)) => c = next,
+                    Value::Int(999) => break,
+                    other => panic!("round {round}: chain broke at node {count} -> {other:?}"),
+                }
+            }
+            assert_eq!(count, n, "round {round}: chain length changed (lost nodes)");
+        }
+    }
+
+    /// Regression for G1 evacuation failure (to-space exhaustion). A heap of
+    /// exactly two regions is filled by a held chain so that when a young GC
+    /// runs there are ZERO free regions for to-space. Previously `evacuate_object`
+    /// returned `None` and the caller DROPPED the object → silent live-object
+    /// loss. Now it self-forwards in place and `free_or_keep_cset` keeps the
+    /// region, so the entire held chain survives intact (nothing reclaimed — the
+    /// real heap is full, which the allocation path turns into a clean OOM).
+    #[test]
+    fn evacuation_failure_self_forwards_does_not_drop() {
+        let mut cfg = small_config();
+        cfg.region_size = 1024 * 1024;
+        cfg.heap_size = 2 * 1024 * 1024; // exactly 2 regions
+        let gc = G1Collector::new(cfg);
+        // Fill ~1.1 MB across the 2 regions with a held chain → both regions
+        // become Eden (CSet), leaving 0 Free regions for evacuation to-space.
+        let n = 20000usize;
+        let head = gc.alloc_object(ClassId::new(1), 1);
+        let mut cur = head;
+        for _ in 1..n {
+            let node = gc.alloc_object(ClassId::new(1), 1);
+            gc.set_field(cur, 0, Value::Object(Some(node)));
+            cur = node;
+        }
+        gc.set_field(cur, 0, Value::Int(7));
+        let mut roots = vec![head];
+        // No free region → every survivor hits evacuation failure → self-forward.
+        let r = gc.young_collection(&mut roots, &NoopMonitors);
+        assert_eq!(r.stats.bytes_freed, 0, "a failed collection must free nothing");
+        // The whole chain must still be reachable and intact — nothing dropped.
+        let mut count = 0usize;
+        let mut c = roots[0];
+        loop {
+            count += 1;
+            assert!(count <= n, "chain longer than {n}");
+            match gc.get_field(c, 0) {
+                Value::Object(Some(next)) => c = next,
+                Value::Int(7) => break,
+                other => panic!("chain dropped at node {count} -> {other:?}"),
+            }
+        }
+        assert_eq!(count, n, "evacuation failure dropped live nodes");
     }
 }

@@ -151,6 +151,62 @@ pub fn movable_jit_root_count() -> usize {
     MOVABLE_JIT_ROOTS.with(|s| s.borrow().len())
 }
 
+// ---------------------------------------------------------------------------
+// Conservative (non-movable) JIT roots — G1 region pinning
+// ---------------------------------------------------------------------------
+//
+// The generational collector honours "a conservatively-discovered JIT root must
+// not be relocated" by running its NON-MOVING young sweep whenever any thread is
+// in JIT (`is_active()` above) — nothing moves, so a register/spill slot that
+// the collector cannot rewrite keeps pointing at a valid object.
+//
+// G1 has no non-moving young mode: it always evacuates the collection set. So it
+// needs the same guarantee expressed in its region model — the REGIONS that hold
+// conservatively-discovered JIT roots must be EXCLUDED from the collection set
+// (pinned in place) for the duration of the collection, exactly like a
+// JNI-critical pinned region. The VM's root gatherer publishes each conservative
+// JIT-frame root address here (only under G1); `G1Collector::{young,mixed}
+// _collection` map those addresses to region indices, drop them from the CSet,
+// and still scan each pinned region as a source so its referents in the CSet are
+// evacuated and its own slots fixed up in place (young→young references carry no
+// remembered set, so the pinned region must be scanned explicitly).
+//
+// Thread-local for the same reason as MOVABLE_JIT_ROOTS: the JIT entry chain and
+// the (self-triggered) collection run on the same thread. Cleared at the start
+// of each root-gathering pass. A missed publication only risks a stale slot (the
+// pre-fix behaviour); a stale EXTRA entry is prevented by the per-pass clear and
+// would at worst over-pin one region for one cycle.
+
+thread_local! {
+    static PINNED_JIT_ROOTS: std::cell::RefCell<std::collections::HashSet<usize>> =
+        std::cell::RefCell::new(std::collections::HashSet::new());
+}
+
+/// Clear the conservative-pinned-JIT-root set. Called by the VM's root gatherer
+/// at the start of every collection, before the JIT-frame scan republishes.
+pub fn clear_pinned_jit_roots() {
+    PINNED_JIT_ROOTS.with(|s| s.borrow_mut().clear());
+}
+
+/// Record `addr` (an object address discovered conservatively in a JIT frame,
+/// whose holder slot the collector cannot rewrite) as pin-required for G1.
+pub fn add_pinned_jit_root(addr: usize) {
+    PINNED_JIT_ROOTS.with(|s| {
+        s.borrow_mut().insert(addr);
+    });
+}
+
+/// Snapshot the conservative-pinned-JIT-root addresses published this cycle.
+/// `G1Collector` maps these to regions it must exclude from the collection set.
+pub fn pinned_jit_roots_snapshot() -> Vec<usize> {
+    PINNED_JIT_ROOTS.with(|s| s.borrow().iter().copied().collect())
+}
+
+/// Count of conservative-pinned JIT roots published this cycle (diagnostics).
+pub fn pinned_jit_root_count() -> usize {
+    PINNED_JIT_ROOTS.with(|s| s.borrow().len())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

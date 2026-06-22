@@ -1,0 +1,88 @@
+# The JIT Compiler
+
+CratonVM's JIT compiler turns hot bytecode into native machine code. It lives in
+the `cratonvm-jit` crate, with shared API/IR types in `cratonvm-jit-api`. This
+chapter describes its structure; [How the JIT Got
+Fast](../performance/jit-internals.md) tells the optimization story, and [The
+JIT Compiler (user guide)](../user-guide/jit-compiler.md) covers operating it.
+
+## Backends
+
+- **x86-64** is the primary, complete backend (the machine-code emitter).
+- **AArch64** exists but has partial coverage. On any non-x86-64 host the JIT is
+  disabled and the interpreter runs everything.
+
+## Two compilation paths
+
+The JIT has two ways to lower a method:
+
+1. **Single-pass emitter (default).** Bytecode is lowered directly to x86-64 in
+   one pass. This path is simple and compiles quickly, at the cost of limiting
+   cross-instruction optimization.
+2. **Sea-of-nodes IR pipeline (optional).** Methods that qualify go through:
+
+   ```text
+   bytecode → IrBuilder → Graph → optimize → schedule → lower → x86-64
+   ```
+
+   This decouples optimization from instruction selection, enabling broader
+   transformations. Methods that don't qualify fall back to the direct path.
+
+Key modules:
+
+| Module | Responsibility |
+|--------|----------------|
+| `lib.rs` | JIT infrastructure: compiled-code cache, OSR entry points, helpers. |
+| `x64.rs` | The x86-64 emitter, register allocation, and the LICM/BCE/SIMD analyses. |
+| `aarch64.rs` | The (partial) AArch64 backend. |
+| `ir.rs`, `ir_optimize.rs`, `ir_schedule.rs`, `ir_lower.rs` | The optional IR pipeline. |
+
+## Calling conventions
+
+Compiled methods use one of two conventions:
+
+- **Pure methods** — called directly.
+- **Context methods** — receive a `SharedVm` pointer as a hidden first argument,
+  so they can reach the heap, class manager, and thread state for slow paths
+  (field/array helpers, dispatch bridges, allocation, exceptions).
+
+Compiled code calls back into the VM for anything it doesn't inline: virtual /
+interface dispatch (via a helper bridge), `checkcast`/`instanceof`, allocation,
+and native methods.
+
+## Optimizations
+
+The compiler applies register-allocated locals (graph-coloring across the
+callee-saved set), magic-number division, loop-invariant code motion,
+bounds-check elimination (including a speculative loop-header guard), AVX2 SIMD
+vectorization of reduction loops, loop unrolling, and inlined field/array
+access. The full list and the order it landed in is in [How the JIT Got
+Fast](../performance/jit-internals.md).
+
+## Precise stack maps and GC safety
+
+The collector must find object references inside compiled frames. CratonVM
+records **precise JIT stack maps** — which registers and spill slots hold live
+references at each safepoint — so roots in JIT frames are identified accurately.
+This is on by default; the conservative-scan fallback
+(`CRATONVM_NO_PRECISE_JIT_MAPS`) exists only for diagnostics.
+
+> There is one tracked correctness item here: under the *moving* collector, a
+> JIT worker's published root snapshot can lag its live spill slots at a
+> stop-the-world safepoint. In practice the JIT-active path forces the
+> non-moving young sweep, so it has not been observed to corrupt the heap, and a
+> complete cross-thread stop-the-world JIT root scan is in progress. See
+> [Security Overview](../security/overview.md).
+
+## On-Stack Replacement (OSR)
+
+A long-running loop need not wait for its method to be re-entered: when a loop's
+back-edge counter gets hot, the method is compiled and execution transfers from
+the interpreter into the compiled code mid-method, with interpreter locals
+copied into the JIT frame.
+
+## Code cache
+
+Compiled methods are retained in a code cache. The cache can be bounded with
+`CRATONVM_JIT_CODE_CACHE_MAX_MB`; when the cap is hit, further methods stay
+interpreted.

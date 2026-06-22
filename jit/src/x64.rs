@@ -1170,8 +1170,14 @@ pub fn jit_scan(code: &[u8], code_len: usize, descriptor: &str) -> Option<JitSca
             0x60..=0x6f => {
                 pc += 1;
             }
-            // irem, lrem
-            0x70 | 0x71 => {
+            // irem, lrem, frem, drem. (frem/drem 0x72/0x73: only the optimizing
+            // IR backend lowers them — via a CALL to the jit_frem/jit_drem fmod
+            // helper. The single-pass backend has no codegen arm, so it bails
+            // them through the `match op` catch-all (`return false`). Admitting
+            // them at scan time lets the IR pipeline see the method instead of
+            // rejecting it outright here; with the FP gate off the method still
+            // bails to single-pass → interpreter, exactly as before.)
+            0x70..=0x73 => {
                 pc += 1;
             }
             // ineg, lneg, fneg, dneg
@@ -1856,6 +1862,154 @@ pub fn precise_jit_maps_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
     *G.get_or_init(|| std::env::var_os("CRATONVM_NO_PRECISE_JIT_MAPS").is_none())
+}
+
+/// Step 1 of `docs/feature-designs/precise-jit-maps-default.md` — opt-IN
+/// **inline** frame-record. When on (and precise maps are on, and the OS TLS
+/// probe in [`inline_rbp_tls_disp`] succeeds), the JIT prologue stores RBP
+/// straight into the precise-maps innermost-RBP mirror with a single
+/// `mov gs:[disp], rbp` instead of `call jit_frame_record`. This removes the
+/// per-invocation CALL that is the residual ~1.68× call-heavy regression after
+/// the thread-local cache (`82cf85e9`) already cut the helper body cost.
+///
+/// **DEFAULT ON** (Step 2 flip, 2026-06-21; opt out with
+/// `CRATONVM_NO_PRECISE_INLINE_FRAME_RECORD`). Validated on the inlined path:
+/// bintrees10/14/16/18 == HotSpot, fib44 ~1.68× faster than the CALL path, and
+/// the `CRATONVM_DBG_VERIFY_INLINE_FRAME_RECORD` self-check is clean (0
+/// mismatches over billions of fib44 invocations). Off → the existing
+/// `call jit_frame_record` is emitted (the pre-Step-1 default). Only meaningful
+/// with precise maps on (otherwise there is no frame-record at all), so it is
+/// anded with [`precise_jit_maps_enabled`]. On non-Windows / on a failed TLS
+/// probe, [`inline_rbp_tls_disp`] returns 0 and the CALL path is used even when
+/// this is on, so the flip is a safe no-op there.
+pub fn precise_inline_frame_record_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        precise_jit_maps_enabled()
+            && std::env::var_os("CRATONVM_NO_PRECISE_INLINE_FRAME_RECORD").is_none()
+    })
+}
+
+/// Debug self-check (`CRATONVM_DBG_VERIFY_INLINE_FRAME_RECORD`): when on AND
+/// inline frame-record is active, the prologue emits the inline store **and** a
+/// call to the verify helper (wired into the `frame_record` slot by
+/// `build_helpers`) which reads the mirror back and asserts it equals RBP —
+/// proving the inlined store lands exactly where the Rust GC side reads it.
+/// Default off; pure validation aid, no behaviour change to the mirror value.
+pub fn verify_inline_frame_record_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| std::env::var_os("CRATONVM_DBG_VERIFY_INLINE_FRAME_RECORD").is_some())
+}
+
+/// Step 1 — the GS-relative byte displacement of the Windows TLS slot that
+/// backs the precise-maps innermost-RBP mirror, or `0` when inline
+/// frame-record is disabled or unavailable. This is the **single source of
+/// truth** shared by the JIT codegen (which bakes `mov gs:[disp], rbp`) and the
+/// VM-side mirror accessor in `vm/src/jit/conservative_roots.rs` (which
+/// reads/writes the same slot). Computed once, cached for the process.
+///
+/// Windows x86-64 stores the 64 static TLS slots in the TEB at offset `0x1480`
+/// (`TlsSlots`), reachable as `gs:[0x1480 + slot*8]`. We `TlsAlloc` a slot,
+/// write a unique 64-bit sentinel through the documented `TlsSetValue` API,
+/// then read it back through the candidate `gs:[disp]` to **prove** the
+/// displacement before trusting it (with a fallback scan of the static band in
+/// case the base constant differs). If the probe fails (slot ≥ 64, unexpected
+/// TEB layout, or non-Windows), it returns `0` → the CALL path is used. A wrong
+/// assumption therefore degrades to the existing safe behaviour, never to a
+/// silently mis-tracked mirror (the risk the design doc flags).
+#[cfg(windows)]
+pub fn inline_rbp_tls_disp() -> usize {
+    use std::sync::OnceLock;
+    static DISP: OnceLock<usize> = OnceLock::new();
+    *DISP.get_or_init(|| {
+        if !precise_inline_frame_record_enabled() {
+            return 0;
+        }
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn TlsAlloc() -> u32;
+            fn TlsSetValue(idx: u32, val: *mut core::ffi::c_void) -> i32;
+        }
+        const TLS_OUT_OF_INDEXES: u32 = 0xFFFF_FFFF;
+        // TEB.TlsSlots[64] on x86-64. The probe below validates this, so an
+        // incorrect constant disables inline rather than corrupting.
+        const TEB_TLS_SLOTS_OFF: usize = 0x1480;
+        // SAFETY: TlsAlloc/TlsSetValue are the documented Win32 TLS APIs;
+        // read_gs_qword reads an 8-byte aligned TEB slot we just wrote.
+        let disp = unsafe {
+            'probe: {
+                let slot = TlsAlloc();
+                if slot == TLS_OUT_OF_INDEXES {
+                    break 'probe 0;
+                }
+                // Non-canonical, slot-tagged sentinel (high bits set so it
+                // cannot be mistaken for a real RBP or a small int in a
+                // neighbour slot).
+                let sentinel: usize = 0x5247_4250_4D52_0000 | (slot as usize & 0xFFFF);
+                if TlsSetValue(slot, sentinel as *mut core::ffi::c_void) == 0 {
+                    break 'probe 0;
+                }
+                let candidate = TEB_TLS_SLOTS_OFF + (slot as usize) * 8;
+                if read_gs_qword(candidate) == sentinel {
+                    // Reset the slot to 0 (matches the mirror's initial value);
+                    // all other threads already see 0 at a fresh index.
+                    TlsSetValue(slot, core::ptr::null_mut());
+                    break 'probe candidate;
+                }
+                // Fallback: scan the static 64-slot band for the sentinel in
+                // case the base constant differs on this Windows build.
+                let mut d = TEB_TLS_SLOTS_OFF;
+                let end = TEB_TLS_SLOTS_OFF + 64 * 8;
+                while d < end {
+                    if read_gs_qword(d) == sentinel {
+                        TlsSetValue(slot, core::ptr::null_mut());
+                        break 'probe d;
+                    }
+                    d += 8;
+                }
+                // Probe failed → leave inline disabled (CALL path).
+                TlsSetValue(slot, core::ptr::null_mut());
+                0
+            }
+        };
+        // One-time visibility line, gated behind CRATONVM_DBG_INLINE_FR so the
+        // (now default-on) path stays silent unless explicitly diagnosing.
+        if std::env::var_os("CRATONVM_DBG_INLINE_FR").is_some() {
+            if disp != 0 {
+                eprintln!(
+                    "[INLINE-FR] inline frame-record ENABLED: storing RBP via mov gs:[{:#x}]",
+                    disp
+                );
+            } else {
+                eprintln!("[INLINE-FR] inline frame-record probe FAILED — using CALL path");
+            }
+        }
+        disp
+    })
+}
+
+/// Non-Windows: inline frame-record is unsupported (the single-instruction
+/// store relies on the Windows TEB TLS layout); always return 0 → CALL path.
+#[cfg(not(windows))]
+pub fn inline_rbp_tls_disp() -> usize {
+    0
+}
+
+/// Read the 8-byte value at `gs:[disp]` (Windows TEB-relative). Used only by
+/// the [`inline_rbp_tls_disp`] startup probe.
+#[cfg(windows)]
+#[inline]
+unsafe fn read_gs_qword(disp: usize) -> usize {
+    let val: usize;
+    core::arch::asm!(
+        "mov {out}, qword ptr gs:[{addr}]",
+        out = out(reg) val,
+        addr = in(reg) disp,
+        options(nostack, preserves_flags, readonly),
+    );
+    val
 }
 
 /// Whether the JIT **shadow-stack** precise-roots codegen is enabled
@@ -5074,6 +5228,124 @@ fn wide_local_high_halves(code: &[u8], code_len: usize) -> Vec<usize> {
     hi
 }
 
+/// deopt-osr P2: the JVM value kind of a local slot, derived for the deopt
+/// snapshot's width/type source. See [`classify_local_kinds`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum LocalKind {
+    /// Never loaded/stored in this method (a dead slot or untyped gap).
+    Unknown,
+    /// Cat-1 `int`/`boolean`/`byte`/`char`/`short`.
+    Int,
+    /// Cat-2 `long`.
+    Long,
+    /// Cat-1 `float`.
+    Float,
+    /// Cat-2 `double`.
+    Double,
+    /// Object reference (`a*` opcodes). The precise oop dataflow mask is the
+    /// authority at a given bci; this is only a corroborating hint.
+    Ref,
+    /// The dead upper half of a cat-2 (`long`/`double`) local at the slot below.
+    HighHalf,
+    /// Accessed as more than one kind across the method (legal JVM slot reuse
+    /// across disjoint live ranges). The kind at a given bci is unknowable from a
+    /// whole-method scan, so the snapshot treats it as "re-run" rather than guess.
+    Ambiguous,
+}
+
+/// deopt-osr P2: classify every local slot's JVM value kind from the method's
+/// load/store opcodes — the only per-slot width/type signal the single-pass
+/// backend has (it threads no method descriptor and runs no verification type
+/// inference). The deopt snapshot uses this to emit a precisely-typed
+/// `FrameValue` (`Long`/`Double`/`Float` vs `Int`/ref) instead of a width-blind
+/// `Register`/`StackSlot` that would truncate a `long` (high 32 bits lost) or
+/// mistype an FP value on resume.
+///
+/// A slot accessed as exactly one kind takes that kind; a slot accessed as more
+/// than one is [`LocalKind::Ambiguous`]; a slot never accessed is
+/// [`LocalKind::Unknown`]. Each `long`/`double` base additionally marks its
+/// high-half slot [`LocalKind::HighHalf`] (so the snapshot records `Undefined`
+/// there and the cat-2 locals collapse stays aligned). `Ambiguous` and
+/// interior-`Unknown` slots make the snapshot fall back to the safe whole-method
+/// re-run — never a guess.
+fn classify_local_kinds(code: &[u8], code_len: usize, num_locals: usize) -> Vec<LocalKind> {
+    let mut kinds = vec![LocalKind::Unknown; num_locals];
+    fn vote(kinds: &mut [LocalKind], slot: usize, k: LocalKind) {
+        if slot >= kinds.len() {
+            return;
+        }
+        kinds[slot] = match kinds[slot] {
+            LocalKind::Unknown => k,
+            existing if existing == k => existing,
+            _ => LocalKind::Ambiguous,
+        };
+    }
+
+    let mut pc = 0usize;
+    while pc < code_len {
+        let op = code[pc];
+        // (kind, slot) for a local access at this pc, if the opcode is one.
+        let access: Option<(LocalKind, usize)> = match op {
+            // Widening: u8 operand/opcode-relative index -> usize (value fits).
+            0x15 if pc + 1 < code_len => Some((LocalKind::Int, code[pc + 1] as usize)),
+            0x16 if pc + 1 < code_len => Some((LocalKind::Long, code[pc + 1] as usize)),
+            0x17 if pc + 1 < code_len => Some((LocalKind::Float, code[pc + 1] as usize)),
+            0x18 if pc + 1 < code_len => Some((LocalKind::Double, code[pc + 1] as usize)),
+            0x19 if pc + 1 < code_len => Some((LocalKind::Ref, code[pc + 1] as usize)),
+            0x1a..=0x1d => Some((LocalKind::Int, (op - 0x1a) as usize)),
+            0x1e..=0x21 => Some((LocalKind::Long, (op - 0x1e) as usize)),
+            0x22..=0x25 => Some((LocalKind::Float, (op - 0x22) as usize)),
+            0x26..=0x29 => Some((LocalKind::Double, (op - 0x26) as usize)),
+            0x2a..=0x2d => Some((LocalKind::Ref, (op - 0x2a) as usize)),
+            0x36 if pc + 1 < code_len => Some((LocalKind::Int, code[pc + 1] as usize)),
+            0x37 if pc + 1 < code_len => Some((LocalKind::Long, code[pc + 1] as usize)),
+            0x38 if pc + 1 < code_len => Some((LocalKind::Float, code[pc + 1] as usize)),
+            0x39 if pc + 1 < code_len => Some((LocalKind::Double, code[pc + 1] as usize)),
+            0x3a if pc + 1 < code_len => Some((LocalKind::Ref, code[pc + 1] as usize)),
+            0x3b..=0x3e => Some((LocalKind::Int, (op - 0x3b) as usize)),
+            0x3f..=0x42 => Some((LocalKind::Long, (op - 0x3f) as usize)),
+            0x43..=0x46 => Some((LocalKind::Float, (op - 0x43) as usize)),
+            0x47..=0x4a => Some((LocalKind::Double, (op - 0x47) as usize)),
+            0x4b..=0x4e => Some((LocalKind::Ref, (op - 0x4b) as usize)),
+            // iinc reads+writes an int local.
+            0x84 if pc + 1 < code_len => Some((LocalKind::Int, code[pc + 1] as usize)),
+            // wide (0xc4): code[pc+1] is the real opcode, code[pc+2..4] the index.
+            0xc4 if pc + 3 < code_len => {
+                let real = code[pc + 1];
+                let idx = ((code[pc + 2] as usize) << 8) | code[pc + 3] as usize;
+                match real {
+                    0x15 | 0x36 | 0x84 => Some((LocalKind::Int, idx)),
+                    0x16 | 0x37 => Some((LocalKind::Long, idx)),
+                    0x17 | 0x38 => Some((LocalKind::Float, idx)),
+                    0x18 | 0x39 => Some((LocalKind::Double, idx)),
+                    0x19 | 0x3a => Some((LocalKind::Ref, idx)),
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        if let Some((k, slot)) = access {
+            vote(&mut kinds, slot, k);
+        }
+        pc += bytecode_len_at(code, pc);
+    }
+
+    // Mark each cat-2 base's high-half slot. A high-half that is independently
+    // accessed (slot reuse) becomes Ambiguous; an untouched one becomes HighHalf.
+    for slot in 0..num_locals {
+        if matches!(kinds[slot], LocalKind::Long | LocalKind::Double) {
+            let hh = slot + 1;
+            if hh < num_locals {
+                kinds[hh] = match kinds[hh] {
+                    LocalKind::Unknown | LocalKind::HighHalf => LocalKind::HighHalf,
+                    _ => LocalKind::Ambiguous,
+                };
+            }
+        }
+    }
+    kinds
+}
+
 fn find_induction_variable(code: &[u8], header: usize, back_edge_end: usize) -> Option<usize> {
     let mut iinc_locals: Vec<(usize, i8)> = Vec::new(); // (local, increment)
     let mut stored_locals: u64 = 0; // bitmask of locals written by xstore
@@ -6078,6 +6350,12 @@ struct Compiler {
     /// Stage 2 — companion to `local_oop_masks`: whether the forward local-oop
     /// dataflow reached each PC. Only `reached` PCs get precise local entries.
     local_oop_reached: Vec<bool>,
+    /// deopt-osr P2 — per-local JVM value kind (`classify_local_kinds`), the
+    /// width/type source for the deopt snapshot so a `long`/`double`/`float`
+    /// local emits a precisely-typed `FrameValue` rather than a truncating
+    /// `Register`/`StackSlot`. Empty unless `deopt_real_enabled()` (the only
+    /// consumer is the gated snapshot), so production compiles skip the scan.
+    local_kinds: Vec<LocalKind>,
     /// Stage 2 — the bytecode PC of the instruction currently being emitted,
     /// updated at the top of the `compile_bytecode` loop so
     /// `emit_oop_map_for_safepoint` can look up the local-oop mask without
@@ -6087,6 +6365,15 @@ struct Compiler {
     /// (gate `CRATONVM_PRECISE_JIT_MAPS`). Gates the prologue frame-record
     /// call and the per-safepoint id store. Off → byte-identical default path.
     precise_maps: bool,
+    /// Step 1 (`precise-jit-maps-default.md`) — GS-relative TLS displacement of
+    /// the innermost-RBP mirror slot, or 0 when inline frame-record is off /
+    /// unavailable. Non-zero → the prologue emits `mov gs:[disp], rbp` instead
+    /// of `call jit_frame_record`. Cached from `inline_rbp_tls_disp()` at
+    /// construction so codegen reads it once.
+    inline_rbp_tls_disp: usize,
+    /// Step 1 debug self-check (`CRATONVM_DBG_VERIFY_INLINE_FRAME_RECORD`) —
+    /// when set AND inline frame-record is active, also emit the verify call.
+    verify_inline_frame_record: bool,
     /// Stage 3 — frame offset (positive; slot at `[rbp - sp_id_slot_off]`) of
     /// the reserved safepoint-id slot. 0 when `precise_maps` is off.
     sp_id_slot_off: i32,
@@ -6266,12 +6553,15 @@ struct Compiler {
     /// deopt-osr Step 1: stable boxed copies of `deopt_points`, for the
     /// imm64-baked deopt stub to load by pointer (mirrors `_deopt_point_boxes`).
     deopt_boxes: Vec<Box<crate::deopt::DeoptimizationPoint>>,
-    /// deopt-osr Step 2: frame offset (positive depth-from-RBP) of the DEEPEST
-    /// qword of the always-reserved 128-byte `SavedRegisters{gpr:[u64;16]}`
-    /// region the frame-deopt stub spills into. `gpr[r]` is stored at
-    /// `[rbp - (deopt_regs_base - r*8)]`, so `gpr[0]=RAX` is the deepest/lowest
-    /// address and `LEA [rbp - deopt_regs_base] == &gpr[0]`. 0 unless
-    /// `deopt_real_enabled()` reserved the region at construction.
+    /// deopt-osr Step 2 / P2: frame offset (positive depth-from-RBP) of the
+    /// DEEPEST qword of the always-reserved 256-byte
+    /// `SavedRegisters{gpr:[u64;16],xmm:[u64;16]}` region the frame-deopt stub
+    /// spills into. `gpr[r]` is stored at `[rbp - (deopt_regs_base - r*8)]`, so
+    /// `gpr[0]=RAX` is the deepest/lowest address and
+    /// `LEA [rbp - deopt_regs_base] == &gpr[0] == &SavedRegisters`; the XMM half
+    /// follows (`#[repr(C)]`), so `xmm[n]` at
+    /// `[rbp - (deopt_regs_base - 128 - n*8)]`. 0 unless `deopt_real_enabled()`
+    /// reserved the region at construction.
     deopt_regs_base: i32,
     /// deopt-osr Step 2: bci → stable pointer to the boxed `DeoptimizationPoint`
     /// for that guard, baked as arg0 (imm64) by the frame-deopt stub. Populated
@@ -6296,6 +6586,14 @@ struct Compiler {
     /// "instrument a rare branch" trigger from the handoff — proves the mechanism
     /// pending a real speculation/counter trigger.
     osr_exit_test_trigger_bci: Option<usize>,
+    /// deopt-osr Step 8 follow-up (P4): when `Some(N)`, the trigger at
+    /// `osr_exit_test_trigger_bci` is COUNTER-GATED — it bails only on the `N`-th
+    /// reach of the loop header, so the JIT advances ~`N` loop iterations (and
+    /// commits their side effects) before the exit, making the reconstructed frame
+    /// carry JIT-advanced state for the interpreter's true OSR-exit transfer. When
+    /// `None`, the trigger is the unconditional-at-header bail (Step 8). Set from
+    /// `osr_exit_after()` at finalize (only under `CRATONVM_DEOPT_REAL`).
+    osr_exit_after_count: Option<usize>,
 }
 
 /// deopt-osr Step 1: map a frame slot's machine location + oop-ness to a
@@ -6323,6 +6621,76 @@ fn frame_value_for_slot(
         FrameValue::StackSlotRef(-spill_off)
     } else {
         FrameValue::StackSlot(-spill_off)
+    }
+}
+
+/// deopt-osr P2: map a NON-oop local slot's machine location + classified JVM
+/// `kind` to a precisely-typed `FrameValue`. Pure (no `&self`) so it is
+/// unit-testable. `spill_off` is the positive `[rbp - spill_off]` frame offset
+/// (the resolver reads `*(rbp + off)`, so a spilled slot encodes the negation).
+///
+/// The classifier ([`classify_local_kinds`]) is the width source the snapshot
+/// otherwise lacks; this turns it into the right variant per provenance:
+/// `long` → `RegisterLong`/`StackSlotLong`, `float` → `XmmFloat`/`StackSlotFloat`,
+/// `double` → `XmmDouble`/`StackSlotDouble`, `int` → `Register`/`StackSlot`. A
+/// provenance/kind contradiction (an `int` in an XMM, an FP value in a GPR) and
+/// an `Ambiguous`/`Ref` kind yield `Unsupported` (safe re-run) — never a guess.
+/// `HighHalf` (the dead cat-2 upper half) and a never-accessed `Unknown` slot
+/// both yield `Undefined`: the only ways to read a local are the load/`iinc`
+/// opcodes the scan covers, so an `Unknown` slot is provably dead — `Undefined`
+/// (→ `Value::Int(0)`) is never read, and even a dead cat-2 param stays
+/// alignment-correct as two `Undefined` cat-1 slots (its high-half can never be
+/// the upper half of a *classified* cat-2 — those are marked `HighHalf`).
+fn typed_local_frame_value(
+    reg: Option<u8>,
+    xmm: Option<u8>,
+    spill_off: i32,
+    kind: LocalKind,
+) -> crate::deopt::FrameValue {
+    use crate::deopt::FrameValue;
+    match kind {
+        LocalKind::Int => {
+            if let Some(r) = reg {
+                FrameValue::Register(r)
+            } else if xmm.is_some() {
+                FrameValue::Unsupported // an int in an XMM is a contradiction
+            } else {
+                FrameValue::StackSlot(-spill_off)
+            }
+        }
+        LocalKind::Long => {
+            if let Some(r) = reg {
+                FrameValue::RegisterLong(r)
+            } else if xmm.is_some() {
+                FrameValue::Unsupported
+            } else {
+                FrameValue::StackSlotLong(-spill_off)
+            }
+        }
+        LocalKind::Float => {
+            if let Some(n) = xmm {
+                FrameValue::XmmFloat(n)
+            } else if reg.is_some() {
+                FrameValue::Unsupported // a float in a GPR is a contradiction
+            } else {
+                FrameValue::StackSlotFloat(-spill_off)
+            }
+        }
+        LocalKind::Double => {
+            if let Some(n) = xmm {
+                FrameValue::XmmDouble(n)
+            } else if reg.is_some() {
+                FrameValue::Unsupported
+            } else {
+                FrameValue::StackSlotDouble(-spill_off)
+            }
+        }
+        // Dead cat-2 upper half (collapse skips it) or a never-accessed dead
+        // slot: a harmless zero the resume never reads.
+        LocalKind::HighHalf | LocalKind::Unknown => FrameValue::Undefined,
+        // Scan says ref but the precise oop mask said non-oop here (handled by the
+        // caller before reaching this helper), or a reused slot — re-run.
+        LocalKind::Ref | LocalKind::Ambiguous => FrameValue::Unsupported,
     }
 }
 
@@ -6355,6 +6723,110 @@ mod deopt_snapshot_tests {
         assert_eq!(
             frame_value_for_slot(None, None, 24, true),
             FrameValue::StackSlotRef(-24)
+        );
+    }
+
+    use super::{classify_local_kinds, typed_local_frame_value, LocalKind};
+
+    #[test]
+    fn classify_local_kinds_per_opcode() {
+        // Indexed load/store forms exercising each kind + cat-2 high-halves.
+        // local7 is never touched -> Unknown.
+        let code = [
+            0x15, 0x00, // iload 0   -> Int@0
+            0x37, 0x01, // lstore 1  -> Long@1, HighHalf@2
+            0x38, 0x03, // fstore 3  -> Float@3
+            0x39, 0x04, // dstore 4  -> Double@4, HighHalf@5
+            0x3a, 0x06, // astore 6  -> Ref@6
+            0xb1, // return
+        ];
+        let kinds = classify_local_kinds(&code, code.len(), 8);
+        assert_eq!(kinds[0], LocalKind::Int);
+        assert_eq!(kinds[1], LocalKind::Long);
+        assert_eq!(kinds[2], LocalKind::HighHalf);
+        assert_eq!(kinds[3], LocalKind::Float);
+        assert_eq!(kinds[4], LocalKind::Double);
+        assert_eq!(kinds[5], LocalKind::HighHalf);
+        assert_eq!(kinds[6], LocalKind::Ref);
+        assert_eq!(kinds[7], LocalKind::Unknown);
+    }
+
+    #[test]
+    fn classify_local_kinds_reuse_is_ambiguous() {
+        // local0 stored as int then as float -> Ambiguous (slot reuse).
+        let code = [
+            0x36, 0x00, // istore 0 -> Int
+            0x38, 0x00, // fstore 0 -> conflict -> Ambiguous
+            0xb1,
+        ];
+        let kinds = classify_local_kinds(&code, code.len(), 1);
+        assert_eq!(kinds[0], LocalKind::Ambiguous);
+    }
+
+    #[test]
+    fn classify_local_kinds_highhalf_reuse_is_ambiguous() {
+        // local0 long (hi half @1), but local1 also used as int -> Ambiguous@1.
+        let code = [
+            0x37, 0x00, // lstore 0 -> Long@0, would-be HighHalf@1
+            0x15, 0x01, // iload 1  -> Int@1 (independently used)
+            0xb1,
+        ];
+        let kinds = classify_local_kinds(&code, code.len(), 2);
+        assert_eq!(kinds[0], LocalKind::Long);
+        assert_eq!(kinds[1], LocalKind::Ambiguous);
+    }
+
+    #[test]
+    fn typed_local_frame_value_picks_typed_variant() {
+        // long in GPR / spilled.
+        assert_eq!(
+            typed_local_frame_value(Some(7), None, 8, LocalKind::Long),
+            FrameValue::RegisterLong(7)
+        );
+        assert_eq!(
+            typed_local_frame_value(None, None, 16, LocalKind::Long),
+            FrameValue::StackSlotLong(-16)
+        );
+        // float/double in XMM / spilled.
+        assert_eq!(
+            typed_local_frame_value(None, Some(2), 8, LocalKind::Float),
+            FrameValue::XmmFloat(2)
+        );
+        assert_eq!(
+            typed_local_frame_value(None, None, 8, LocalKind::Float),
+            FrameValue::StackSlotFloat(-8)
+        );
+        assert_eq!(
+            typed_local_frame_value(None, Some(3), 8, LocalKind::Double),
+            FrameValue::XmmDouble(3)
+        );
+        assert_eq!(
+            typed_local_frame_value(None, None, 24, LocalKind::Double),
+            FrameValue::StackSlotDouble(-24)
+        );
+        // int unchanged.
+        assert_eq!(
+            typed_local_frame_value(Some(1), None, 8, LocalKind::Int),
+            FrameValue::Register(1)
+        );
+        // HighHalf and never-accessed Unknown -> harmless Undefined.
+        assert_eq!(
+            typed_local_frame_value(None, None, 8, LocalKind::HighHalf),
+            FrameValue::Undefined
+        );
+        assert_eq!(
+            typed_local_frame_value(None, None, 8, LocalKind::Unknown),
+            FrameValue::Undefined
+        );
+        // Ambiguous (slot reuse) -> re-run.
+        assert_eq!(
+            typed_local_frame_value(None, None, 8, LocalKind::Ambiguous),
+            FrameValue::Unsupported
+        );
+        // Provenance/kind contradiction (float in a GPR) -> re-run.
+        assert_eq!(
+            typed_local_frame_value(Some(4), None, 8, LocalKind::Float),
+            FrameValue::Unsupported
         );
     }
 }
@@ -6399,6 +6871,10 @@ impl Compiler {
         // call so the GC root walker can recover the exact oop map. Off by
         // default → no slot reserved → frame layout byte-identical.
         let precise_maps = precise_jit_maps_enabled();
+        // Step 1 (inline frame-record) — cache the validated TLS displacement
+        // (0 when the opt-in flag is off or the OS probe failed → CALL path).
+        let inline_rbp_tls_disp = if precise_maps { inline_rbp_tls_disp() } else { 0 };
+        let verify_inline_frame_record = verify_inline_frame_record_enabled();
         let shadow_enabled = shadow_stack_maps_enabled();
         // SB-CRASH-04 (register-invisibility): blind-spill used callee-saved
         // GPRs into reserved frame slots at every GC-capable safepoint so the
@@ -6518,19 +6994,21 @@ impl Compiler {
         };
         let reg_spill_base = xmm_saved_base + xmm_saved_size;
 
-        // deopt-osr Step 2 — 128-byte SavedRegisters{gpr:[u64;16]} region for the
-        // frame-deopt stub's in-stub 16-GPR spill. Reserved only under
-        // CRATONVM_DEOPT_REAL so the default frame is byte-identical. Placed just
-        // BELOW (deeper than) the per-safepoint reg-spill region and above the
-        // shadow/stack-arg region. `deopt_regs_base` is the offset of the DEEPEST
-        // qword (gpr[0]=RAX, lowest address): gpr[r] at [rbp - (deopt_regs_base -
-        // r*8)] so the 16 slots ascend with r from &gpr[0] = [rbp - deopt_regs_base].
+        // deopt-osr Step 2 / P2 — 256-byte SavedRegisters{gpr:[u64;16],xmm:[u64;16]}
+        // region for the frame-deopt stub's in-stub 16-GPR + 16-XMM spill. Reserved
+        // only under CRATONVM_DEOPT_REAL so the default frame is byte-identical.
+        // Placed just BELOW (deeper than) the per-safepoint reg-spill region and
+        // above the shadow/stack-arg region. `deopt_regs_base` is the offset of the
+        // DEEPEST qword (gpr[0]=RAX, lowest address): gpr[r] at
+        // [rbp - (deopt_regs_base - r*8)] (ascending with r from
+        // &gpr[0] = [rbp - deopt_regs_base]); the XMM half follows the GPR half in
+        // `#[repr(C)]` order, so xmm[n] at [rbp - (deopt_regs_base - 128 - n*8)].
         let deopt_regs_size = if crate::deopt_real_enabled() {
-            16 * 8
+            32 * 8
         } else {
             0
         };
-        debug_assert!(deopt_regs_size == 0 || deopt_regs_size == 128);
+        debug_assert!(deopt_regs_size == 0 || deopt_regs_size == 256);
         let deopt_regs_base = if deopt_regs_size != 0 {
             reg_spill_base + reg_spill_size + deopt_regs_size
         } else {
@@ -6657,9 +7135,12 @@ impl Compiler {
             stack_oop_marks: Vec::with_capacity(16),
             oop_maps: Vec::new(),
             local_oop_masks: Vec::new(),
+            local_kinds: Vec::new(),
             local_oop_reached: Vec::new(),
             cur_bc_pc: 0,
             precise_maps,
+            inline_rbp_tls_disp,
+            verify_inline_frame_record,
             sp_id_slot_off,
             safepoint_reg_spill,
             safepoint_reg_spill_all,
@@ -6704,6 +7185,7 @@ impl Compiler {
             osr_exit_points: Vec::new(),
             osr_exit_box_ptr_by_bci: FxHashMap::default(),
             osr_exit_test_trigger_bci: None,
+            osr_exit_after_count: None,
         }
     }
 
@@ -6845,14 +7327,77 @@ impl Compiler {
             // Step-7 emit-and-discard trace: confirm an exit map was recorded at
             // this OSR-vetted loop boundary (locals/stack come from the same
             // unit-tested `frame_value_for_slot` provenance as the guard path).
-            let p = self.deopt_points.last().unwrap();
-            eprintln!(
-                "[cratonvm-deopt] OSR-exit map emitted at bci={bci} \
-                 (locals={}, stack={})",
-                p.frame_state.locals.len(),
-                p.frame_state.stack.len(),
-            );
+            // `if let` (not `.unwrap()`) keeps this debug trace panic-free —
+            // `build_and_record_deopt_point` just pushed, so `last()` is Some.
+            if let Some(p) = self.deopt_points.last() {
+                eprintln!(
+                    "[cratonvm-deopt] OSR-exit map emitted at bci={bci} \
+                     (locals={}, stack={})",
+                    p.frame_state.locals.len(),
+                    p.frame_state.stack.len(),
+                );
+            }
         }
+    }
+
+    /// deopt-osr Step 8 follow-up (P4): emit a COUNTER-GATED OSR-exit trigger at a
+    /// loop header — bail to the OSR-exit deopt stub (reason 7) only on the `n`-th
+    /// reach, so the JIT runs ~`n` loop iterations (advancing the loop-carried
+    /// locals/accumulator AND committing their per-iteration side effects) before
+    /// the exit. The reconstructed frame then carries genuinely JIT-advanced state,
+    /// which the interpreter's `transfer_osr_exit_into_live_frame` writes back into
+    /// the live frame — the difference between a *true* OSR-exit and the
+    /// unconditional-at-header trigger (which bails at iteration 0, where reject and
+    /// transfer coincide).
+    ///
+    /// The counter is a leaked per-site `Box<i64>` (one per compiled
+    /// method-with-a-loop, ONLY under `CRATONVM_OSR_EXIT_AFTER`; never in
+    /// production). The sequence is transparent to the JIT's machine state at this
+    /// loop-header basic-block boundary:
+    ///   * RAX/RCX are saved/restored with PUSH/POP — and POP does NOT modify
+    ///     EFLAGS, so the `CMP` result survives to the `JL`;
+    ///   * RSP is balanced (both pops run) before EITHER exit (`JL over` /
+    ///     fall-through `JMP stub`), so the stub sees the normal frame;
+    ///   * EFLAGS are dead at a branch target (the JIT recomputes loop conditions),
+    ///     so clobbering them here is sound.
+    ///
+    /// ```text
+    ///   push rax                       ; 50
+    ///   push rcx                       ; 51
+    ///   mov  rax, &counter             ; 48 B8 imm64
+    ///   mov  rcx, [rax]                ; 48 8B 08
+    ///   inc  rcx                       ; 48 FF C1
+    ///   mov  [rax], rcx                ; 48 89 08
+    ///   cmp  rcx, n                    ; 48 81 F9 imm32
+    ///   pop  rcx                       ; 59   (flags preserved)
+    ///   pop  rax                       ; 58   (flags preserved)
+    ///   jl   over                      ; 7C 05  (counter < n ⇒ skip the bail)
+    ///   jmp  osr_exit_stub             ; E9 rel32 (patched via deopt_stubs)
+    /// over:
+    /// ```
+    fn emit_osr_exit_after_trigger(&mut self, pc: usize, n: usize) {
+        // Per-site counter, leaked so its address outlives the emitted code (the
+        // baked imm64). Test-only path; the leak is intentional and bounded.
+        let counter: *mut i64 = Box::leak(Box::new(0i64));
+
+        self.buf.emit_byte(0x50); // push rax
+        self.buf.emit_byte(0x51); // push rcx
+                                  // mov rax, &counter (imm64)
+        self.emit_mov_imm64_full(RAX, counter as i64); // Cast: address → imm64
+        self.buf.emit(&[0x48, 0x8B, 0x08]); // mov rcx, [rax]
+        self.buf.emit(&[0x48, 0xFF, 0xC1]); // inc rcx
+        self.buf.emit(&[0x48, 0x89, 0x08]); // mov [rax], rcx
+                                            // cmp rcx, n (imm32)
+        self.buf.emit(&[0x48, 0x81, 0xF9]);
+        self.buf.emit(&(n as i32).to_le_bytes()); // Cast: iteration count → imm32
+        self.buf.emit_byte(0x59); // pop rcx (EFLAGS preserved)
+        self.buf.emit_byte(0x58); // pop rax (EFLAGS preserved)
+        self.buf.emit(&[0x7C, 0x05]); // jl over (skip the 5-byte JMP when counter < n)
+        self.buf.emit_byte(0xE9); // jmp rel32 → OSR-exit stub
+        let patch_off = self.buf.pos();
+        self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
+        self.deopt_stubs.push((patch_off, pc, 7)); // 7 = OSR-exit
+                                                   // `over:` is the next emitted instruction.
     }
 
     /// Build a `DeoptimizationPoint` capturing the interpreter frame at `bci`
@@ -6886,12 +7431,30 @@ impl Compiler {
         let mut locals = Vec::with_capacity(self.num_locals);
         for i in 0..self.num_locals {
             let is_oop = i < 64 && (oop_mask & (1u64 << i)) != 0;
-            locals.push(frame_value_for_slot(
-                self.reg_for_local(i),
-                self.xmm_for_local(i),
-                self.local_offset(i),
-                is_oop,
-            ));
+            let reg = self.reg_for_local(i);
+            let xmm = self.xmm_for_local(i);
+            let off = self.local_offset(i);
+            let fv = if is_oop {
+                // The precise oop mask is the authority for ref-typed slots. A
+                // SPILLED ref → `StackSlotRef`; a REGISTER-resident ref →
+                // `RegisterRef(r)` (deopt-osr P2 trap-2). Both resolve to the raw
+                // heap pointer captured in-stub at the guard (the GPR is spilled
+                // into `SavedRegisters.gpr`), and the resume builds a GC-tracked
+                // `Value::Object` — NOT the truncating `Register(r)`/`Int`, which
+                // would also drop the oop from the GC root scan (a moving-GC UAF).
+                if let Some(r) = reg {
+                    crate::deopt::FrameValue::RegisterRef(r)
+                } else {
+                    frame_value_for_slot(reg, xmm, off, true)
+                }
+            } else if let Some(&kind) = self.local_kinds.get(i) {
+                // Non-oop slot, width-typed from the classifier (deopt-osr P2).
+                typed_local_frame_value(reg, xmm, off, kind)
+            } else {
+                // No kind table (gate off / unmapped) — Phase-A int/provenance.
+                frame_value_for_slot(reg, xmm, off, false)
+            };
+            locals.push(fv);
         }
 
         // Operand stack (canonically empty at a BCE loop header, but handle the
@@ -6908,7 +7471,18 @@ impl Compiler {
                         FrameValue::StackSlot(-*off)
                     }
                 }
-                StackSlot::CalleeSaved(r) | StackSlot::Scratch(r) => FrameValue::Register(*r),
+                // A register-resident operand: a ref → `RegisterRef` (GC-tracked
+                // Object on resume), else a cat-1 `Register` (Int). A non-oop long
+                // in a stack register has no width source here and would truncate,
+                // but the operand stack is canonically empty at the BCE/OSR
+                // boundaries the snapshot fires at, so this is the conservative arm.
+                StackSlot::CalleeSaved(r) | StackSlot::Scratch(r) => {
+                    if is_oop {
+                        FrameValue::RegisterRef(*r)
+                    } else {
+                        FrameValue::Register(*r)
+                    }
+                }
                 StackSlot::Xmm(_) => FrameValue::Unsupported,
             });
         }
@@ -6935,8 +7509,13 @@ impl Compiler {
         // not move when `deopt_boxes` reallocs or when it is moved into
         // `CompiledMethod::_deopt_point_boxes` at finalize (and is leaked on
         // Drop), so a baked imm64 of this pointer outlives the emitted code.
-        self.deopt_boxes.push(Box::new(point.clone()));
-        let box_ptr: *const crate::deopt::DeoptimizationPoint = &**self.deopt_boxes.last().unwrap();
+        // Capture the heap payload's address with `addr_of!` BEFORE moving the
+        // Box into the Vec — pushing the Box (a pointer) does not relocate its
+        // payload, so this is the same address `&**deopt_boxes.last()` would
+        // yield, without a `.unwrap()` (keeps this hot codegen path panic-free).
+        let boxed = Box::new(point.clone());
+        let box_ptr: *const crate::deopt::DeoptimizationPoint = std::ptr::addr_of!(*boxed);
+        self.deopt_boxes.push(boxed);
         self.deopt_points.push(point);
         box_ptr
     }
@@ -10494,9 +11073,30 @@ impl Compiler {
         // them. RBP → ABI arg0; the helper records it into the top JIT chain
         // entry. Gated off by default (zero default-path cost), and skipped if
         // the helper pointer isn't wired.
+        // Frame-record recording is "configured" iff the helper pointer is
+        // wired (`build_helpers` sets it whenever precise maps are on). Gate
+        // BOTH the inline and CALL forms on that single signal so a context
+        // without a wired helper (e.g. the JIT unit tests, `frame_record == 0`)
+        // emits neither — keeping those byte-golden even with inline default-on.
         if self.precise_maps && self.helpers.frame_record != 0 {
-            self.emit_mov_reg_reg(ARG_REGS[0], RBP);
-            self.emit_call_absolute(self.helpers.frame_record);
+            if self.inline_rbp_tls_disp != 0 {
+                // Step 1 (inline frame-record) — store RBP straight into the
+                // mirror TLS slot with one `mov gs:[disp], rbp`, no CALL. The
+                // VM-side mirror accessor reads the SAME slot (single source of
+                // truth via `inline_rbp_tls_disp()`), so the GC root walk sees
+                // the innermost RBP exactly as with the helper path.
+                self.emit_mov_gs_disp32_rbp(self.inline_rbp_tls_disp as u32);
+                // Debug self-check: also call the verify helper (wired into
+                // `frame_record` by `build_helpers` when the knob is on), which
+                // reads the slot back and asserts it equals RBP.
+                if self.verify_inline_frame_record {
+                    self.emit_mov_reg_reg(ARG_REGS[0], RBP);
+                    self.emit_call_absolute(self.helpers.frame_record);
+                }
+            } else {
+                self.emit_mov_reg_reg(ARG_REGS[0], RBP);
+                self.emit_call_absolute(self.helpers.frame_record);
+            }
         }
 
         // Shadow-stack precise roots — cache this invocation's `*mut JvmThread`
@@ -10724,6 +11324,27 @@ impl Compiler {
             // (no patch tracking required).
             self.emit_call_imm64_via_rax(addr);
         }
+    }
+
+    /// Step 1 (inline frame-record) — emit `MOV gs:[disp32], RBP`, the single
+    /// instruction that stores RBP straight into the precise-maps innermost-RBP
+    /// mirror TLS slot, replacing `call jit_frame_record`. `disp32` is the
+    /// GS-relative byte displacement from [`inline_rbp_tls_disp`].
+    ///
+    /// Encoding (9 bytes): `65 48 89 2C 25 <disp32-le>`
+    ///   * `65`       — GS segment override prefix.
+    ///   * `48`       — REX.W (64-bit operand).
+    ///   * `89`       — MOV r/m64, r64.
+    ///   * `2C`       — ModRM mod=00 reg=RBP(5) r/m=100(SIB).
+    ///   * `25`       — SIB scale=0 index=none(4) base=none(5) → [disp32].
+    ///   * `disp32`   — absolute displacement; effective address = GS_base+disp.
+    fn emit_mov_gs_disp32_rbp(&mut self, disp32: u32) {
+        self.buf.emit_byte(0x65); // GS prefix
+        self.buf.emit_byte(0x48); // REX.W
+        self.buf.emit_byte(0x89); // MOV r/m64, r64
+        self.buf.emit_byte(0x2C); // ModRM: reg=RBP, r/m=SIB
+        self.buf.emit_byte(0x25); // SIB: [disp32] absolute
+        self.buf.emit(&disp32.to_le_bytes());
     }
 
     /// Task #60 — emit `MOV r64, imm64` in the fixed-length 10-byte form
@@ -13749,6 +14370,19 @@ impl Compiler {
                     // Cast: value to i32 (encoding immediate/displacement)
                     self.emit_store_local(base - (r as i32) * 8, r);
                 }
+                // 1b) Spill all 16 XMM registers (low 64 bits via MOVQ) into the
+                //     XMM half of the region — `xmm[n] -> [rbp - (base - 128 -
+                //     n*8)]`, matching the `#[repr(C)]` field order
+                //     (gpr[16] then xmm[16]). This captures any `float`/`double`
+                //     the FP value tier kept in an XMM live across the guard, so
+                //     `XmmFloat(n)`/`XmmDouble(n)` resolve in `x64_deopt_entry`.
+                //     The GPR spill above does not touch XMMs, so each still holds
+                //     its trapping-instant value. Always-spill-16 (like the GPRs):
+                //     reading an unused XMM is harmless and keeps the stub simple.
+                for n in 0u8..16 {
+                    // Cast: value to i32 (encoding immediate/displacement)
+                    self.emit_movq_mem_rbp_from_xmm(base - 128 - (n as i32) * 8, n);
+                }
                 // 2) Args (extern "C"): arg0 = &DeoptimizationPoint (baked imm64),
                 //    arg1 = rbp (live, never clobbered until the epilogue),
                 //    arg2 = &SavedRegisters = LEA [rbp - base] = &gpr[0].
@@ -14622,10 +15256,19 @@ impl Compiler {
             // no JMP ⇒ byte-identical. The OSR-exit map at this bci (emitted above)
             // is the box the stub bakes via `osr_exit_box_ptr_by_bci`.
             if self.osr_exit_test_trigger_bci == Some(pc) {
-                self.buf.emit_byte(0xE9); // JMP rel32
-                let patch_off = self.buf.pos();
-                self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
-                self.deopt_stubs.push((patch_off, pc, 7)); // 7 = OSR-exit
+                if let Some(n) = self.osr_exit_after_count {
+                    // P4: counter-gated bail — bail only on the N-th reach, so the
+                    // JIT advances ~N iterations (and commits their side effects)
+                    // before the exit. Carries genuinely JIT-advanced state to the
+                    // interpreter's true OSR-exit transfer.
+                    self.emit_osr_exit_after_trigger(pc, n);
+                } else {
+                    // Step 8: unconditional bail on the first reach (iteration 0).
+                    self.buf.emit_byte(0xE9); // JMP rel32
+                    let patch_off = self.buf.pos();
+                    self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
+                    self.deopt_stubs.push((patch_off, pc, 7)); // 7 = OSR-exit
+                }
             }
 
             // === LICM: Replace hoisted sequences with spill slot loads ===
@@ -22347,12 +22990,24 @@ pub fn compile_with_param_slots(
     // pick the first (lowest-pc) detected loop header as the synthetic OSR-exit
     // branch site. `None` in production (either gate off) ⇒ no trigger emitted ⇒
     // byte-identical code. `detect_loops` returns (header, end) pairs.
-    compiler.osr_exit_test_trigger_bci =
-        if crate::osr_exit_test_enabled() && crate::deopt_real_enabled() {
-            loops.iter().map(|&(h, _)| h).min()
-        } else {
-            None
-        };
+    //
+    // P4 (Step 8 follow-up): `CRATONVM_OSR_EXIT_AFTER=N` also arms the trigger at the
+    // same loop header, but counter-gated (`osr_exit_after_count = Some(N)`) so the
+    // JIT advances ~N iterations before the exit — exercising the true OSR-exit
+    // transfer with genuinely advanced state. Either gate (both require DEOPT_REAL)
+    // selects the bci; AFTER takes precedence over TEST for the emitted form.
+    compiler.osr_exit_after_count = if crate::deopt_real_enabled() {
+        crate::osr_exit_after()
+    } else {
+        None
+    };
+    compiler.osr_exit_test_trigger_bci = if crate::deopt_real_enabled()
+        && (crate::osr_exit_test_enabled() || compiler.osr_exit_after_count.is_some())
+    {
+        loops.iter().map(|&(h, _)| h).min()
+    } else {
+        None
+    };
     if std::env::var_os("CRATONVM_DBG_JIT_GEN").is_some() {
         eprintln!(
             "[JIT_GEN_INSTALL] mic_slots count={} pcs={:?}",
@@ -22421,6 +23076,12 @@ pub fn compile_with_param_slots(
         compute_local_oop_masks(code, code_len, max_locals, param_oop_mask);
     compiler.local_oop_masks = lo_masks;
     compiler.local_oop_reached = lo_reached;
+
+    // deopt-osr P2 — per-local width/type source for the deopt snapshot. Only the
+    // (gated) snapshot consumes it, so skip the scan entirely in production.
+    if crate::deopt_real_enabled() {
+        compiler.local_kinds = classify_local_kinds(code, code_len, max_locals);
+    }
 
     // Emit prologue
     compiler.emit_prologue();
@@ -22609,6 +23270,34 @@ pub fn compile_with_param_slots(
     // (find_deopt_point has no live caller; the i64::MIN re-run is unchanged).
     cm.deopt_points = compiler.deopt_points;
     cm._deopt_point_boxes = compiler.deopt_boxes;
+    // deopt-osr x64-backport Step 5 — finalize the per-method deopt-resume
+    // coverage gate (mirrors `fully_oop_covered` / `can_osr_exit`). A method may
+    // resume a real-frame deopt only when:
+    //   1. it emitted at least one deopt-exit snapshot (`deopt_points`), and
+    //   2. it scalar-replaced NO objects (`scalar_replaced` empty).
+    // (2) is load-bearing: this backend records a scalar-replaced slot by its
+    // machine provenance (Register/StackSlot), NOT as a `VirtualObject`, so its
+    // snapshot cannot be re-materialized — and lock elision over such an object
+    // makes mid-method resume unsound (the elided-monitor hazard). Until the x64
+    // emitter writes `VirtualObject` deopt slots + an elided-monitor flag, a
+    // scalar-replacing method stays on the safe re-run path. Empty/false unless
+    // `deopt_real_enabled()` (the snapshot emit site is gated), so production
+    // artifacts are unchanged. Consumed at the interpreter deopt sink, which
+    // attempts `resume_real_ir_deopt` only when `compiled.can_deopt_resume`.
+    //
+    // P2.1/P2.2 (cat-2 + FP resume): the snapshot now has a per-slot WIDTH source
+    // (`classify_local_kinds`) and emits typed `RegisterLong`/`StackSlotLong`
+    // (long), `XmmFloat`/`XmmDouble`/`StackSlotFloat`/`StackSlotDouble` (FP) values
+    // that the resume mapper reconstructs as full-width `Value::Long`/`Float`/
+    // `Double`; the deopt stub spills XMM0..15 (under the gate) so the XMM-resident
+    // FP forms resolve. P2.0's blanket wide-local exclusion is fully lifted. The
+    // only gate now is: a deopt point exists and the method does NOT
+    // scalar-replace (lock-elision / re-materialization hazard — unchanged). Any
+    // slot the classifier can't type (Ambiguous / a register-resident ref /
+    // contradiction) emits `Unsupported`, and the mapper re-runs the whole method
+    // for it — the per-slot fine-grained safety net behind this coarse gate.
+    cm.can_deopt_resume =
+        !cm.deopt_points.is_empty() && compiler.scalar_replaced.is_empty();
     // deopt-osr Step 7 — transfer the OSR-exit loop-boundary bci set and set the
     // per-method gate. Both are empty/false unless `deopt_real_enabled()` was on
     // (the emit site is gated), so production artifacts are unchanged. Step 8
@@ -22996,6 +23685,8 @@ mod tests {
             throw_exception: sentinel,
             jit_npe_with_action: sentinel,
             dispatch_threw: sentinel,
+            jit_frem: sentinel,
+            jit_drem: sentinel,
         }
     }
 
@@ -33228,3 +33919,4 @@ mod tests {
         );
     }
 }
+
