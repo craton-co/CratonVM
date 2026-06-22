@@ -98,10 +98,79 @@ Materialization is orthogonal to cat-2 support. A `long`/`double` field of a vir
 
 ### Increments (independently landable) + test plan
 
-- **A1 — return the scope.** Change `materialize_virtual_objects` to return `(Vec<(usize,u64)>, TempRootScope)`; update the three existing acceptance tests. No live wiring yet. *Test:* existing tests still green; assert pins persist until the returned scope drops.
-- **A2 — detect + materialize behind `can_deopt_resume`.** Add the `has_virtual` branch in `build_deopt_frame_inner`; call the materializer on a clone; hold the scope across build+push; drop after push. Keep `can_deopt_resume = false` for `scalar_replaced`-nonempty / `ACC_SYNCHRONIZED` methods. *Test:* synthetic `ReconstructedFrame` with one `VirtualObject` → `resume_real_ir_deopt` returns `FramePushed`, frame locals hold the materialized `Object`.
-- **A3 — cyclic + GC-stress.** *Test:* two mutually-referencing `VirtualObjectRef` objects resume correctly (extends `materializes_two_object_cycle`); a `stress_gc = true` resume survives a forced GC during build (shell addresses re-read from pins, frame still consistent — extends `shells_materialize_and_survive_forced_gc`).
-- **A4 — differential.** Under `CRATONVM_DEOPT_VERIFY`, an eager-deopt of a method that scalar-replaces an object produces interpreter state byte-identical to the never-JIT'd run.
+**A1–A3 — DONE (2026-06-21, branch `feat/deopt-osr-completion`).** The materializer
+is wired into `build_deopt_frame_inner`: a reconstructed frame carrying
+`VirtualObject`/`VirtualObjectRef` slots is materialized into a real heap object
+graph and resumed at the trapping bci instead of bailing to re-run.
+
+- **A1 — DONE (keep_pins, not a returned scope).** The literal "return a
+  `TempRootScope`" plan does not compose — `TempRootScope` holds `&mut JvmThread`,
+  so returning it would freeze the thread for the rest of the GC-capable build.
+  Instead `materialize_virtual_objects` gained a `keep_pins: bool`: on the live
+  path (`true`) it `mem::forget`s the scope so the shell pins persist in
+  `native_pin_roots`; the sink owns release via its existing `pin_base..truncate`
+  window held across `push_frame_and_fire_entry` — continuous rooting, no unrooted
+  window. Error path always releases (scope drops before the early return).
+  `ReconstructedFrame` derives `Clone` so the sink materializes on a copy.
+- **A2 — DONE.** `has_virtual` branch in `build_deopt_frame_inner` clones →
+  materializes (keep_pins) → maps. Elided-monitor gate bails (re-run) for
+  `ACC_SYNCHRONIZED`; the residual synchronized-*block* lock-elision case is
+  undetectable from the frame and unreachable today (no production emitter writes
+  `VirtualObject` deopt slots), documented as a flag the future x64 virtual-slot
+  emitter must carry. The coverage gate `can_deopt_resume` is also now finalized
+  (x64-backport Step 5, below) and consulted at the sink.
+- **A3 — DONE.** 4 vm-lib tests: `resumes_frame_with_virtual_object` (+forced-GC
+  survival via the pushed frame), `resumes_frame_with_object_cycle`,
+  `virtual_resume_blocked_for_synchronized_method`,
+  `virtual_shells_survive_forced_gc_during_build`. 31/31 deopt lib tests green;
+  gate-off byte-identical.
+- **A4 / verifier increment 1 — DONE (2026-06-21, branch `feat/deopt-osr-verifier`).**
+  `deopt_verify_enabled()` now has a consumer: `verify_reconstructed_frame`
+  (pure, unit-tested) runs in `build_deopt_frame_inner` under `CRATONVM_DEOPT_VERIFY`
+  and checks the always-sound structural invariants a map drift most often
+  breaks — slot counts past `max_locals`/`max_stack` (a shifted snapshot), a
+  malformed `VirtualObject` descriptor (declared `num_fields` ≠ `field_values`),
+  and a dangling `VirtualObjectRef`. A violation is reported to stderr and forces
+  the safe re-run (fail-safe). It deliberately does NOT type-check per-slot
+  (cat-2/FP `Unsupported` slots legitimately re-run — flagging them would be a
+  false positive). 4 tests; 35/35 deopt lib tests green; gate-off byte-identical.
+- **A4 / verifier increment 2 — DONE (2026-06-21, branch `feat/deopt-osr-verifier`).**
+  Oop-plausibility layer `verify_reconstructed_oops`: every `Object(addr)` slot
+  (locals, stack, and recursively the already-real `Object` fields of
+  scalar-replaced descriptors) must be null or a real heap address
+  (`heap.is_heap_addr` — alignment + region containment, no header deref, safe on
+  a garbage word). Catches the most dangerous drift the structural layer cannot —
+  a non-oop value (small int / wild pointer) in a slot resumed as an object ref, a
+  UAF on first deref. Fail-safe (forces re-run). 1 test; 36/36 deopt lib green;
+  gate-off byte-identical. **The verifier's runtime fail-safe role is now complete
+  (structural + oop layers).**
+- **A4 / verifier increment 3 — the eager-deopt VALUE differential — INFRA-BLOCKED
+  (= task #7).** Force a deopt at a *non-failing* guard, reconstruct, and compare
+  the reconstructed-interpreter end-result against the JIT result — the form that
+  catches a *value* drift (right slot count + valid oops, wrong contents) the two
+  runtime layers cannot. Two concrete blockers, the same ones that block the
+  end-to-end BCE test: (1) the `deopt_real_enabled()` / `deopt_verify_enabled()`
+  gates are **read-once cached**, so one in-process test cannot run the method both
+  gate-on and gate-off to diff — it needs a *separate-process* harness (spawn the
+  VM twice with different env, diff output / golden checksum) **or** a `pub`
+  non-`cfg(test)` gate override; (2) forcing a deopt at a guard the speculation
+  did NOT fail needs a codegen trigger (an unconditional deopt at the BCE guard,
+  analogous to the existing `osr_exit_test_trigger_bci` / `CRATONVM_OSR_EXIT_TEST`).
+  Recommended path: add the forced-BCE-deopt gate in `emit_deopt_stubs`, then a
+  scripted separate-process differential over a golden-checksum benchmark (bt18 =
+  68332206) under `CRATONVM_DEOPT_REAL=1` + the force gate.
+
+**x64-backport Step 5 — `can_deopt_resume` coverage gate DONE (2026-06-21).** At
+x64 finalize `cm.can_deopt_resume = !deopt_points.is_empty() &&
+scalar_replaced.is_empty()` (mirrors `can_osr_exit`). The `scalar_replaced`
+clause is load-bearing: this backend records a scalar-replaced slot by machine
+provenance (Register/StackSlot), not as a `VirtualObject`, so its snapshot can't
+be re-materialized and lock elision over it makes mid-method resume unsound — such
+methods stay on re-run until the x64 emitter writes `VirtualObject` slots + an
+elided-monitor flag. The sink (`execute_jit_call` already holds the
+`CompiledMethod`) attempts `resume_real_ir_deopt` only when
+`compiled.can_deopt_resume`. Empty/false unless `deopt_real_enabled()`, so
+production artifacts unchanged; 825 jit-lib tests green.
 
 ---
 
@@ -149,7 +218,30 @@ Already in the tree: `DeoptReason::OsrExit` (`deopt.rs:52`), `CompiledMethod.can
 
 - **Every-boundary vs loop-headers-only exit maps** (`deopt-osr.md` ~476-479). Emitting an exit map at every canonical boundary maximizes deopt coverage but bloats metadata. Recommendation: loop-headers-first, widen with measurement.
 - **OSR-track vs moving GC** (`deopt-osr.md` ~480-485). An OSR'd frame's oops must be precisely relocatable for a moving collector. `CRATONVM_SHADOW_OSR_TRACK` currently regresses bt18 (conservative-pin × precise-move). Resolving that interaction may become a prerequisite for Step 8 under moving GC; a non-moving sweep sidesteps it.
-- **Cat-2 / FP needing `xmm[16]`** (`deopt-osr.md` ~468-472). `SavedRegisters` is `gpr[16]` only; long/double and FP-in-register slots resolve to `Unsupported` → re-run. A loop with a live `double` accumulator cannot OSR-exit until the snapshot is extended to `xmm[16]` plus a width source. Blocks neither Workstream A's integer/object case nor Step 7's emit-and-discard.
+- **Cat-2 / FP — P2 workstream (`xmm[16]` + width source).** `SavedRegisters` is
+  `gpr[16]` only and `frame_value_for_slot` has **no per-slot width source**. The
+  failure modes differ by type:
+  - A **`double`/`float`** local is XMM-resident → `frame_value_for_slot` →
+    `Unsupported` → the mapper bails → safe re-run. (Correct, just no resume.)
+  - A **`long`** local is GPR/spilled → recorded as `Register`/`StackSlot` →
+    `resolve_value` produces `Int(i64)` → the mapper TRUNCATES to `i32` — **silent
+    corruption** on resume, not a safe re-run.
+  - **P2.0 — DONE (2026-06-21, branch `feat/deopt-osr-cat2fp`).** Close the long
+    hole: `can_deopt_resume` now also requires `wide_local_high_halves(code).is_empty()`
+    (no long/double local), so a wide-local method takes the safe whole-method
+    re-run. `jit/src/x64.rs` finalize; gate-off byte-identical; 825 jit-lib tests
+    green. The BCE pilot (int loops) is unaffected.
+  - **P2.1 — long resume (OWED).** Thread the width source (`wide_local_high_halves`
+    + `xmm_for_local` to split long-vs-double) into `frame_value_for_slot`; emit a
+    new `FrameValue::RegisterLong(r)` (resolves to `Long(gpr[r])`) / existing
+    `StackSlotLong` for long slots; extend the Object-bearing resume mapper
+    (`ir_deopt_frame_values_with_objects`) to map `Long` WITH the cat-2 locals
+    upper-half collapse (as `ir_deopt_locals` already does); then drop the
+    `wide_local` exclusion for long-only methods. No XMM needed.
+  - **P2.2 — FP resume (OWED).** Extend `SavedRegisters` to `xmm[16]`, spill XMM in
+    the deopt stub (`emit_deopt_stubs`), add `RegisterFloat`/`RegisterDouble`
+    resolving from `xmm[r]`, map `Float`/`Double`; then a live `double` accumulator
+    can resume / OSR-exit. The heaviest slice (hot-stub codegen).
 - **Elided monitors on a scalar-replaced object** — see Workstream A caveat: gated off (`can_deopt_resume = false`) when `scalar_replaced` is non-empty or the method is `ACC_SYNCHRONIZED`; monitor re-entry at resume is a later refinement.
 - **Epoch / MakeNotEntrant invalidation of baked deopt-point pointers** — boxed `DeoptimizationPoint` pointers are baked into the stub as arg0 (`deopt_boxes`, `x64.rs:6184`). After recompilation/invalidation these must be versioned by `compilation_epoch` and checked before dereference (Step 9), or a stale box could be followed into freed memory.
 
