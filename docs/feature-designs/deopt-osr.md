@@ -6,8 +6,9 @@ Steps 1–9, Workstreams A & B, the cat-2/FP resume (P2), and the `CRATONVM_DEOP
 **Remaining (non-blocking follow-ups):**
 - The eager-deopt **value** differential (infra-blocked — read-once gates + forced-deopt codegen; see Validation).
 - Production default-on flip: blocked on moving GC, which needs precise OSR-frame tracking (`CRATONVM_SHADOW_OSR_TRACK`, currently regresses bt18).
-- The in-stub before-deref epoch check for `CRATONVM_JIT_FREE_CODE=1` (bake a stable live-epoch cell pointer alongside the box).
 - Typed operand-stack cat-2/FP resume (currently falls back to sound conservative re-run).
+
+(The three Step-9 follow-ups — FREE_CODE before-deref epoch check, eager recompile re-queue, and per-bci de-spec — are **done**; see §D.)
 
 This doc is the consolidated joining piece between two efforts that already existed in the tree but stopped short of each other:
 1. **Real-frame deopt** — reconstruct a precise interpreter frame at the trapping bci instead of re-running the method from bci 0.
@@ -76,6 +77,11 @@ OSR-exit is a real-frame deopt specialized for loop BCIs:
 ### D. De-speculation & Epoch Invalidation
 - **De-speculation**: Every deopt/OSR-exit routes through `real_frame_deopt_resume_and_despeculate`. It logs the event, evicts the artifact from `jit_cache` (making it not entrant so subsequent calls trigger recompilation), and escalates to `MakeNotCompilable` if the deopt rate exceeds a threshold.
 - **Epoch Invalidation**: To prevent stale boxed `DeoptimizationPoint` pointers from being followed after recompilation, `SharedVm.method_epochs` tracks live epochs. Fresher artifacts are stamped with the live epoch at install. Before resuming, the sink asserts `compiled.compilation_epoch >= live_epoch(M)`.
+
+#### Step-9 follow-ups (done, gated `CRATONVM_DEOPT_REAL`, gate-off byte-identical; bt18 = `68332206` gate-off **and** gate-on)
+- **In-entry before-deref epoch check** (`CRATONVM_JIT_FREE_CODE=1`): the epoch comparison `method_epochs` enables is now also done *inside the deopt trampoline, before the box is dereferenced*. A process-lifetime-retained `DeoptEpochGuard { creation_epoch, live_epoch_cell }` (`jit/src/deopt.rs`) is baked as a 4th arg into every frame-deopt stub and stamped by the VM at install (`CompiledMethod::stamp_deopt_epoch_guard`); `method_epochs` is now `FxHashMap<String, Box<AtomicU64>>` so the live cell has a stable address (`SharedVm::live_epoch_cell_ptr`). `x64_deopt_entry` consults the guard FIRST and, on a superseded artifact, stashes a `bci = u32::MAX` re-run sentinel **without** touching the (possibly-freed) box. Deopt-point boxes are now retained even under `CRATONVM_JIT_FREE_CODE=1`, so the baked box pointer can never dangle.
+- **Eager recompile re-queue**: on a `RecompileAndReinterpret` action, `DeoptimizationController::deoptimize` (`vm/src/jit/helpers.rs`) eagerly enqueues a high-priority `CompilationTask` when a background compiler is active, instead of waiting for the method to re-cross the interpreter hotness threshold. No-op (no queue leak) when no worker drains it — the hotness-retry path still recompiles, so behaviour never regresses.
+- **Per-bci de-spec**: a process-global `(method_key, bci)` registry (`deopt::despec_insert`/`despec_contains`, allocation-free when empty) plus `DeoptimizationLog::deopt_count_at_bci`. Once a single speculation site has deopted ≥ `PER_BCI_DESPEC_LIMIT` (4, HotSpot `PerBytecodeTrapLimit`-like), the sink records it and the optimizing backend drops *that* speculative-BCE loop-header guard on recompile (`method_key` plumbed through `compile_with_param_slots`) — so one pathological site is de-spec'd and the method stays compilable instead of a whole-method blacklist (diffuse deopts still hit the per-method backstop). Skipped for the superseded-sentinel bci so a stale artifact never de-specs a non-current speculation.
 
 ### E. Cat-2 & FP Real-frame Resume
 Allows methods with `long`, `double`, and `float` variables to resume:
