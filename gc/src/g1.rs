@@ -2630,6 +2630,24 @@ impl G1Collector {
             return;
         }
 
+        // RSet rebuild (CORRECTNESS — remembered-set completeness for GC-internal
+        // pointer rewrites). A young->young reference carries NO remembered-set
+        // entry (young is always collected whole). When the holder later ages /
+        // is promoted to Old, that edge silently becomes Old->young, but no
+        // mutator write barrier ever fires for it (the rewrite below, and the
+        // promotion copy, are GC-internal). So the NEXT young GC does not scan
+        // this Old region as an rset source and DROPS the still-live young
+        // referent (proven: `MixedChurn` loses cross-referenced nodes; the V7b
+        // verifier reports the Old holder region with a dangling ref into a freed
+        // CSet region). This is the general (aging/promotion) case of the
+        // JIT-pinned-straddle fix landed earlier. Since this pass already walks
+        // every non-CSet (=> Old/Humongous) region each collection, we rebuild
+        // the Old->young rset here at no extra walk: every cross-region reference
+        // from this region into a young (Eden/Survivor) region is recorded so the
+        // next collection scans this region as a source. (Edges are collected and
+        // applied after the walk to keep borrows simple; `add_reference` dedups.)
+        let mut new_rset_edges: Vec<(usize, usize)> = Vec::new();
+
         for i in 0..regions.len() {
             if cset.contains(&i) || regions[i].region_type == RegionType::Free {
                 continue;
@@ -2654,7 +2672,64 @@ impl G1Collector {
                 }
 
                 update_object_refs(obj_ptr, header, pointer_map);
+                self.collect_outgoing_young_edges(regions, i, obj_ptr, header, &mut new_rset_edges);
                 offset += obj_size;
+            }
+        }
+
+        for (young_region, source_region) in new_rset_edges {
+            regions[young_region].rset.add_reference(source_region);
+        }
+    }
+
+    /// Record (into `out`) every cross-region reference from `obj` (which lives
+    /// in non-CSet `holder` region — always Old/Humongous, since all young
+    /// regions are in the CSet) into a YOUNG (Eden/Survivor) region, as a
+    /// `(young_region, holder)` rset edge. See `update_references_in_regions` for
+    /// why this is required for remembered-set completeness.
+    fn collect_outgoing_young_edges(
+        &self,
+        regions: &[G1Region],
+        holder: usize,
+        obj_ptr: *mut u8,
+        header: &ObjectHeader,
+        out: &mut Vec<(usize, usize)>,
+    ) {
+        let data_start = unsafe { obj_ptr.add(HEADER_SIZE) };
+        if header.kind == ObjectKind::Array {
+            if header.element_type == ArrayElementType::Reference {
+                for k in 0..header.array_length as usize {
+                    let raw: u64 = unsafe { std::ptr::read(data_start.add(k * 8) as *const u64) };
+                    if raw == 0 {
+                        continue;
+                    }
+                    if let Some(j) = self.lookup_region_for_addr(raw as usize) {
+                        if j != holder
+                            && matches!(
+                                regions[j].region_type,
+                                RegionType::Eden | RegionType::Survivor
+                            )
+                        {
+                            out.push((j, holder));
+                        }
+                    }
+                }
+            }
+        } else {
+            for s in 0..header.num_slots as usize {
+                let v = unsafe { std::ptr::read(data_start.add(s * SLOT_SIZE) as *const Value) };
+                if let Value::Object(Some(r)) = v {
+                    if let Some(j) = self.lookup_region_for_addr(r.as_ptr() as usize) {
+                        if j != holder
+                            && matches!(
+                                regions[j].region_type,
+                                RegionType::Eden | RegionType::Survivor
+                            )
+                        {
+                            out.push((j, holder));
+                        }
+                    }
+                }
             }
         }
     }
@@ -7248,5 +7323,47 @@ mod tests {
             }
         }
         assert_eq!(count, n, "evacuation failure dropped live nodes");
+    }
+
+    /// Regression for the Old->young remembered-set-completeness hole: an
+    /// `A.a = B` edge created while both are young carries no rset entry. Once
+    /// `A` promotes to Old (while `B`, allocated later, stays younger), the edge
+    /// becomes Old->young — but it was created/maintained only by GC-internal
+    /// pointer rewrites, never a mutator write barrier, so it was missing from
+    /// the rset and the next young GC dropped `B` (reachable only via `A.a`).
+    /// `update_references_in_regions` now rebuilds the Old->young rset each
+    /// collection, so `B` must survive repeated young GCs after `A` is tenured.
+    #[test]
+    fn old_to_young_ref_via_gc_rewrite_not_dropped() {
+        let mut cfg = small_config();
+        cfg.promotion_age = 3;
+        let gc = G1Collector::new(cfg);
+
+        let a = gc.alloc_object(ClassId::new(1), 1);
+        let mut roots = vec![a]; // B will be reachable ONLY via A.a
+        // Age A two young GCs (still a Survivor; A is older than B).
+        gc.young_collection(&mut roots, &NoopMonitors);
+        gc.young_collection(&mut roots, &NoopMonitors);
+
+        // Allocate B fresh (younger) and wire A.a -> B while both are young.
+        let b = gc.alloc_object(ClassId::new(2), 1);
+        gc.set_field(b, 0, Value::Int(777));
+        gc.set_field(roots[0], 0, Value::Object(Some(b)));
+
+        // Drive several more young GCs: A tenures to Old while B stays younger,
+        // so A.a becomes an Old->young edge maintained only by GC rewrites. B
+        // must never be dropped.
+        for round in 0..6 {
+            let _g = gc.alloc_object(ClassId::new(9), 1); // a little churn
+            gc.young_collection(&mut roots, &NoopMonitors);
+            match gc.get_field(roots[0], 0) {
+                Value::Object(Some(bb)) => assert_eq!(
+                    gc.get_field(bb, 0).as_int(),
+                    Some(777),
+                    "round {round}: B lost / corrupted (Old->young rset miss)"
+                ),
+                other => panic!("round {round}: A.a dropped -> {other:?}"),
+            }
+        }
     }
 }
