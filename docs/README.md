@@ -1,5 +1,13 @@
 # CratonVM Documentation
 
+> **📖 The complete manual lives in [`book/`](book/src/SUMMARY.md).**
+> It is a unified, navigable documentation site (mdBook-buildable, and readable
+> as Markdown on GitHub) covering installation, the user guide, Java support,
+> security, performance, GPU offload, embedding, internals, contributing, and a
+> full reference. Build it locally with `mdbook serve docs/book` (or just read
+> the Markdown). The standalone files below remain the source for several deep
+> reference tables and are linked from the book.
+
 Index of the CratonVM documentation set. Links are relative to this `docs/`
 folder. See also the root [`README.md`](../README.md) for a project overview
 and [`ARCHITECTURE.md`](../ARCHITECTURE.md) for the system design.
