@@ -23268,22 +23268,19 @@ pub fn compile_with_param_slots(
     // artifacts are unchanged. Consumed at the interpreter deopt sink, which
     // attempts `resume_real_ir_deopt` only when `compiled.can_deopt_resume`.
     //
-    // P2.1 (cat-2 long resume): the snapshot now has a per-slot WIDTH source
-    // (`classify_local_kinds`) and emits a typed `RegisterLong`/`StackSlotLong`
-    // for a `long` local, which the resume mapper reconstructs as a full-64-bit
-    // `Value::Long` (P2.0's blanket wide-local exclusion truncated these — it is
-    // now lifted for long-only methods). `float`/`double` are still excluded here
-    // (FP-in-XMM resolution = P2.2): a method with any classified FP local takes
-    // the safe whole-method re-run. (Any slot the classifier can't type emits
-    // `Unsupported` and the mapper re-runs regardless — this gate is the coarse
-    // pre-filter; the per-slot `Unsupported` is the fine-grained safety net.)
-    let has_fp_local = compiler
-        .local_kinds
-        .iter()
-        .any(|k| matches!(k, LocalKind::Float | LocalKind::Double));
-    cm.can_deopt_resume = !cm.deopt_points.is_empty()
-        && compiler.scalar_replaced.is_empty()
-        && !has_fp_local;
+    // P2.1/P2.2 (cat-2 + FP resume): the snapshot now has a per-slot WIDTH source
+    // (`classify_local_kinds`) and emits typed `RegisterLong`/`StackSlotLong`
+    // (long), `XmmFloat`/`XmmDouble`/`StackSlotFloat`/`StackSlotDouble` (FP) values
+    // that the resume mapper reconstructs as full-width `Value::Long`/`Float`/
+    // `Double`; the deopt stub spills XMM0..15 (under the gate) so the XMM-resident
+    // FP forms resolve. P2.0's blanket wide-local exclusion is fully lifted. The
+    // only gate now is: a deopt point exists and the method does NOT
+    // scalar-replace (lock-elision / re-materialization hazard — unchanged). Any
+    // slot the classifier can't type (Ambiguous / a register-resident ref /
+    // contradiction) emits `Unsupported`, and the mapper re-runs the whole method
+    // for it — the per-slot fine-grained safety net behind this coarse gate.
+    cm.can_deopt_resume =
+        !cm.deopt_points.is_empty() && compiler.scalar_replaced.is_empty();
     // deopt-osr Step 7 — transfer the OSR-exit loop-boundary bci set and set the
     // per-method gate. Both are empty/false unless `deopt_real_enabled()` was on
     // (the emit site is gated), so production artifacts are unchanged. Step 8
