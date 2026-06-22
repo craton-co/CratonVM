@@ -1,6 +1,6 @@
 # Activate the IR Optimizer (GVN / const-fold / DSE / LICM + scalar replacement)
 
-Status: **largely landed (increments 1–29).** The Sea-of-Nodes IR + passes are
+Status: **largely landed (increments 1–36).** The Sea-of-Nodes IR + passes are
 live on the broad path; the φ/branch dam is fixed; `Op::Load`/`Store`/`New`/`Call`
 emission, escape→scalar-replacement, and a full **long (64-bit) value tier** are
 built and **default-ON** in production: `CRATONVM_JIT_IR_CALL` (invokestatic,
@@ -8,14 +8,16 @@ inc 23), `CRATONVM_JIT_SCALAR_NEW` (inc 20), `CRATONVM_JIT_IR_LONG` (long
 arithmetic/constants/load-store/shifts/bitwise/compare/branches/call-args/div-rem,
 inc 25–28 + `ldiv`/`lrem` with long deopt-resume) and `CRATONVM_JIT_IR_CALL_SPECIAL`
 (invokespecial, inc 24) all flipped on in **inc 29** (each with a `=0` opt-out).
-**Inc 30** opens the `double`/`float` XMM value tier (value arithmetic + constants
-+ FP-local load/store + int/long⇄FP conversions) behind a new
-**`CRATONVM_JIT_IR_FP`** flag (default-OFF). See the per-increment sections below
-and **["Remaining roadmap (post-inc-29)"](#remaining-roadmap-post-inc-29)** for what
-is left (long/double call returns, and the rest of the `double`/`float` XMM tier —
-FP compares/branches, arrays, params/returns/call-args; `ldiv`/`lrem` is now done).
-Original plan
-text follows.
+The **`double`/`float` XMM value tier** (`CRATONVM_JIT_IR_FP`, inc 30–35 + slices
+A/B/C) is **opcode-complete and flipped default-ON** (commit `14635585`).
+**Inc 36** flips the two remaining loop-optimization passes default-ON —
+`CRATONVM_JIT_LICM` (loop-invariant code motion) and `CRATONVM_JIT_UNROLL` (full
+unrolling of small constant-trip counted loops) — gated on a **trivial-phi
+elimination** fix that finally makes LICM non-inert on production IR (each with a
+`=0` opt-out). See the per-increment sections below and
+**["Remaining roadmap"](#remaining-roadmap-post-inc-29)** for what is left
+(guard-surviving scalar replacement — blocked on `real-frame-deopt.md`; and
+SCEV-driven LICM — an unwired enhancement). Original plan text follows.
 
 The Sea-of-Nodes IR and its
 optimization passes exist and are unit-tested, but the live JIT path only
@@ -1960,9 +1962,75 @@ review behind it; `=0` remains the opt-out if a suite ever regresses.
 `CRATONVM_JIT_IR_CALL` virtual/interface dispatch (the concurrent inc-26 track)
 has its own flag/soak.
 
-## Remaining roadmap (post-inc-29)
+## Increment 36 (flip `CRATONVM_JIT_LICM` + `CRATONVM_JIT_UNROLL` default-ON, via trivial-phi elimination) landed
 
-The single consolidated to-do for whoever picks this up next. Increments 1–29
+Status: **landed** on `dev`. The production-validation step for Front 2's two
+loop passes — LICM (inc 2/5–9) and full unrolling (inc 3) — both flip from
+default-OFF to **default-ON**, each with a `=0` opt-out at `licm_enabled()` /
+`unroll_enabled()` in `jit/src/ir_optimize.rs`. Mirrors the inc-23/29 `IR_CALL`/
+`IR_LONG` flips.
+
+**The blocker this increment had to fix first — LICM was *inert* on production IR.**
+The soak found that `CRATONVM_JIT_UNROLL` fired correctly on real counted loops
+(`[DBG_UNROLL]` confirmed, `== HotSpot`), but `CRATONVM_JIT_LICM` **never hoisted a
+single load** even on the canonical `for (i<n) acc += obj.f` shape. Root cause: the
+inc-14 int `getfield` `Op::Load` arrived (since inc 14, *after* the inc-5–9 LICM
+work) with its base wrapped in a **trivial loop-header phi** — the bytecode→IR
+builder inserts a `Phi` at the loop header for *every* live local, including ones
+that are loop-invariant (`obj` is never reassigned), producing `φ(obj, self)`.
+`is_loop_invariant` correctly rejects a region-anchored phi (it could be loop-
+carried), so the load's base was always judged variant → no hoist. LICM had been
+silently inert on real bytecode the entire time (the unit tests hand-build a
+`Param` base, never the builder's trivial phi).
+
+**The fix — trivial-phi elimination** (`jit/src/ir_optimize.rs`, a new `Op::Phi`
+arm in `try_simplify`, run in the `optimize()` fixed-point loop before unroll/LICM):
+the standard SSA simplification — a phi whose value inputs (slots 1..) are all
+either the phi itself (an unchanged back-edge) or a single other value `v`
+collapses to `v` (its value cannot differ by predecessor). This removes the
+redundant invariant-local loop phis, exposing the real `Param`/alloc base to LICM,
+GVN, and the alias oracle. A genuine merge / induction phi `φ(0, i+1)` /
+accumulator / in-loop-advanced memory phi has two distinct non-self inputs and is
+left untouched. It is unconditionally sound (SSA dominance guarantees the single
+value dominates the phi) and generally useful beyond LICM. After it, the canonical
+getfield loop hoists (`[DBG_LICM] hoisted 1 invariant load`, base resolves to the
+`Param`) and runs `== HotSpot`.
+
+**Diagnostics added** (keepers, opt-in, mirroring `CRATONVM_DBG_UNROLL`):
+`CRATONVM_DBG_LICM` reports candidate loop headers, each loop's body/load/barrier
+summary, every per-load hoist/skip decision, and the total hoisted count — the
+non-vacuity proof the soak needed.
+
+**Soak** (the gate is a runtime env var, so one flipped build validates both states:
+default = both ON, `CRATONVM_JIT_LICM=0 CRATONVM_JIT_UNROLL=0` = both OFF). The
+decisive invariant is **ON ≡ OFF == HotSpot** (the flip only changes a default):
+- **bt10/14/16/18** == HotSpot (`135854 / 3222190 / 14985902 / 68332206`), ON and OFF.
+- **Targeted probes** `UnrollProbe` (`2940000000`) and `LicmProbe` (`2520000000`)
+  == HotSpot ON and OFF, with `[DBG_UNROLL]`/`[DBG_LICM]` confirming both passes
+  fire non-vacuously (unroll in the default runtime config; LICM under the broad
+  `CRATONVM_JIT_C2_FIRST_CALL` reachability).
+- **Bench differential** (NBody3D / IntegrationTest / FieldCheck / GenPair /
+  Benchmark / QuickBench / MatrixJIT / fannkuch, + TestLambda/Stream/Generics/
+  Switch/Enum) — all **ON==OFF==HotSpot**, in both the default and
+  `CRATONVM_JIT_C2_FIRST_CALL=1` configs (the latter exercises the passes
+  maximally).
+- **`ir_vs_singlepass` 82/82** (the differential harness now runs with LICM +
+  UNROLL + trivial-phi-elim default-ON) and **jit lib 837/837** (incl. two new
+  `test_trivial_phi_*` tests).
+
+**Scope of the soak (honest)**: the full kafka/spring/tomcat/hibernate gauntlet was
+**not** re-run (same constraint as the inc-23/29 flips — impractical here); the soak
+is bt + 2 targeted probes + 13 diverse bench/Test programs (× default and C2-first)
++ 82 differential + 837 lib tests, all ON≡OFF==HotSpot. `=0` remains the opt-out at
+each pass if a suite ever regresses. Unroll's reach is intrinsically narrow (side-
+effect-free, single-block, constant-trip ≤ 8); LICM's load hoisting requires a
+barrier-free loop with an invariant load — both bail conservatively on anything
+else (a `Store`/`Call`/alloc/array/guard in the loop, a non-constant trip), so the
+production blast radius is small.
+
+## Remaining roadmap (post-inc-36)
+
+The single consolidated to-do for whoever picks this up next. Increments 1–36
 are landed and (where flagged) default-ON. What remains, in dependency order:
 
 1. ✅ **`i64::MIN`-return / deopt-sentinel fix** *(unblocks `long` call returns)* —
@@ -2018,8 +2086,13 @@ are landed and (where flagged) default-ON. What remains, in dependency order:
    pre-existing single-pass JIT bug, now masked on the default path because the IR
    pipeline serves these methods; filed for separate fix.
 
-3. **`double`/`float` value tier (XMM)** *(the next major sub-project; **first
-   increment landed — inc 30**)*. The whole second half of category-2. The XMM
+3. **`double`/`float` value tier (XMM)** — ✅ **DONE (opcode-complete + flipped
+   default-ON, commit `14635585`).** Inc 30–35 plus slices **A** (`frem`/`drem`,
+   `62f6e6f4`), **B** (FP arrays, `f9cfc485`), **C** (FP-slot deopt resume,
+   `5312b11c`) landed; the FP IR tier admits any FP method and is now the default
+   (`CRATONVM_JIT_IR_FP=0` opts out). See `docs/feature-designs/ir-fp-tier-remaining.md`
+   for the per-slice status. The original (now-historical) per-bullet plan follows.
+   The whole second half of category-2. The XMM
    register class in `ir_lower.rs` now exists, and **inc 30** (behind
    `CRATONVM_JIT_IR_FP`, default-OFF) lowers the FP **value ops** (`fadd`/`dadd`/
    …, `fneg`/`dneg`), **constants** (`fconst`/`dconst`), **FP-local load/store**
@@ -2038,7 +2111,9 @@ are landed and (where flagged) default-ON. What remains, in dependency order:
      `…_dcmp_ordered`/`…_fcmp_nan`/`…_dcmp_nan` (ordered + NaN in either operand,
      both variants; IR == single-pass == host) + E2E (all 5 relational operators
      on float/double incl. NaN) `== HotSpot` under `CRATONVM_JIT_IR_FP=1`.
-   - **FP array load/store** (`faload`/`daload`/`fastore`/`dastore`).
+   - ✅ **FP array load/store** (`faload`/`daload`/`fastore`/`dastore`) — **DONE
+     (slice B, `f9cfc485`)**: inline `MOVSS`/`MOVSD` after deopt-on-fault null/
+     bounds guards.
    - ✅ **FP params/returns + call-args — DONE (inc 32/33/34).** Key realization:
      the VM uses the **compact all-GPR i64 ABI** — `execute_jit_call` /
      `jit_invoke_dispatch` marshal every FP value as `to_bits() as i64` into an
@@ -2092,13 +2167,36 @@ are landed and (where flagged) default-ON. What remains, in dependency order:
      consuming opcode). Validated: `ir_vs_singlepass` `…_double_ldc2w_constant`
      (and `…_long_ldc2w_constant` for no long-path regression); E2E (DLit:
      `a*1.5+0.25`, polynomial) `== HotSpot`.
-   - **`frem`/`drem`** (`fmod`-style remainder helper — no single instruction;
-     needs a new `JitRuntimeHelpers` table entry).
-   - **FP-slot deopt resume** (let an FP value be live at a deopt — lifts the
-     remaining inc-30 int-div exclusion). `typed_stack_slot` already carries
-     `FrameValue::Float` for a future FP-aware resume.
-   Continue mirroring the long track's increment discipline, each slice gated
-   behind `CRATONVM_JIT_IR_FP` + differential/probe soak.
+   - ✅ **`frem`/`drem`** — **DONE (slice A, `62f6e6f4`)**: `jit_frem`/`jit_drem`
+     fmod golden-table helpers; `Op::Rem` Float/Double arm `CALL`s them.
+   - ✅ **FP-slot deopt resume** — **DONE (slice C, `5312b11c`)**: `FrameValue::
+     {Double,StackSlotFloat,StackSlotDouble}` reconstruct FP slots; dropped the
+     gate's `!method_has_int_div`.
+   (Historical: these were the open bullets at inc-30; all closed by slices A/B/C.)
+
+4. **Loop passes flipped default-ON** — ✅ **DONE (inc 36).** `CRATONVM_JIT_LICM`
+   and `CRATONVM_JIT_UNROLL` are now default-ON (each `=0` opt-out), gated on the
+   **trivial-phi elimination** fix that made LICM non-inert on production IR (it
+   had never hoisted a real `getfield` load because the builder's invariant-local
+   loop phi masked the base). See **["Increment 36"](#increment-36-flip-cratonvm_jit_licm--cratonvm_jit_unroll-default-on-via-trivial-phi-elimination-landed)**.
+
+5. **Guard-surviving scalar replacement** (Front 3.2) — **BLOCKED** on
+   `real-frame-deopt.md`'s `FrameValue::VirtualObject` / `materialize_virtual_objects`
+   (the active deopt-OSR epic, worktree `CratonVM-deopt`). Until an object that is
+   non-escaping on the *fast* path can be re-materialised when a rare guard
+   deopts, scalar replacement stays restricted to objects non-escaping on **all**
+   paths (the current, sound behaviour). Not actionable from this doc alone — it
+   lands when the deopt-OSR `VirtualObject` support does.
+
+6. **SCEV-driven LICM** (Front 2.2 refinement) — **deferred enhancement, not
+   blocking.** The structural graph-level LICM is live and correct (inc 36). The
+   `licm_scev_corroborates(code, code_len)` bytecode bridge
+   (`detect_loops` + `analyze_induction_variables` + `find_invariant_loads`) exists
+   and is unit-exercised, but `optimize(&mut Graph)` has no bytecode in scope, so
+   it is not wired as a gate/extender. Threading the bytecode (or its loop/IV
+   summary) into `optimize()` is the remaining work; its value is marginal over the
+   structural pass (which already discovers loops and hoists invariant loads), so
+   it is a low-priority refinement.
 
 **Adjacent (separate tracks, not this doc's to finish):** virtual/interface
 dispatch via inline caches (`CRATONVM_JIT_IR_CALL` for `invokevirtual`/
@@ -2125,13 +2223,20 @@ ultimately lean on.
    **Remaining**: `putfield`→`Op::Store` (needs scheduler memory ordering), then
    `new` / `invoke*` / array ops — builder emission of those + the rest of the
    real-helper harness. ← next.
-4. **Add DSE** to `ir_optimize::optimize` (Front 2.1).
-5. **SCEV-gated LICM + unroll** (Front 2.2).
+4. **Add DSE** to `ir_optimize::optimize` (Front 2.1). ✅ Done (inc 1/2/4).
+5. **LICM + unroll** (Front 2.2). ✅ Done (inc 2/3/5–9) and **flipped default-ON
+   (inc 36)** — LICM required the trivial-phi-elimination fix to be non-inert on
+   real IR. *SCEV-gating* the decisions from bytecode is the remaining (deferred,
+   low-priority) refinement — see roadmap item 6.
 6. **Broaden escape analysis** once the gate is open; enforce the
-   "call-arg/store/return/throw ⇒ escapes" invariant (Front 3.1).
+   "call-arg/store/return/throw ⇒ escapes" invariant (Front 3.1). ✅ Done (inc 16–20).
 7. **Guard-surviving scalar replacement** after `real-frame-deopt.md` (Front 3.2).
-8. **Flip defaults** pass-by-pass as each soaks clean on the app gauntlet +
-   bt10/14/16/18 checksums.
+   ⛔ BLOCKED on the deopt-OSR `VirtualObject` support — see roadmap item 5.
+8. **Flip defaults** pass-by-pass as each soaks clean on bt10/14/16/18 checksums
+   + bench differential. ✅ Done for `IR_CALL`/`SCALAR_NEW` (inc 20/23),
+   `IR_LONG`/`IR_CALL_SPECIAL` (inc 29), `IR_FP` (`14635585`), and
+   `LICM`/`UNROLL` (inc 36). The full kafka/spring/tomcat/hibernate gauntlet
+   remains the heavier soak each flip's note flags as not-locally-run.
 
 ## Risks
 

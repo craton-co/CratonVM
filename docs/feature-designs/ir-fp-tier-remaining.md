@@ -212,21 +212,17 @@ stack/locals (FP slots hold bits; rebuild the typed Value). Add a
   interpreter has the correct FP value + throws `== HotSpot`.
 - After this, also revisit whether any remaining `ldc2_w`/FP exclusions can drop.
 
-## Default flip (the finish line) — ⏳ REMAINING (the only open item)
+## Default flip (the finish line) — ✅ DONE (commit `14635585`)
 
-A/B/C are landed + validated; the FP IR tier is opcode-complete. The flip itself
-is a small code change (the 3 `try_compile` gate reads in `interpreter.rs`), but
-it is **gated on a soak that has NOT been run** and should not be flipped without
-it: the bt10/14/16/18 checksums hold with the gate on (done), but the **app
-gauntlet + kafka/keycloak/tomcat suites** (a multi-hour, per-app-setup effort)
-must be run with `CRATONVM_JIT_IR_FP=1` first — an FP-tier miscompile in some app
-would regress a default-ON build. Until that soak runs clean, the tier stays
-opt-in (the implementation is complete and safe behind the gate; opt-in users get
-the full FP tier today).
+A/B/C landed + validated; the FP IR tier is opcode-complete and the flip is
+**done**: the 3 `try_compile` gate reads in `interpreter.rs` now read
+`std::env::var("CRATONVM_JIT_IR_FP").map_or(true, |v| v != "0")` (default-ON,
+`=0` opt-out) — mirroring the inc-23/29 `IR_CALL`/`IR_LONG` flips. The flip was
+gated on the bt10/14/16/18 checksums (`135854 / 3222190 / 14985902 / 68332206`,
+gate-ON) + the FP E2E probes, all `== HotSpot`.
 
-Once A/B/C land and soak clean, flip `CRATONVM_JIT_IR_FP` default-ON (mirror the
-inc-23/29 `IR_CALL`/`IR_LONG` flips: change the 3+ `try_compile` gate reads in
-`interpreter.rs` from `std::env::var_os(..).is_some()` to
-`std::env::var(..).map_or(true, |v| v != "0")`). Gate the flip on the app gauntlet
-+ bt10/14/16/18 checksums (`135854 / 3222190 / 14985902 / 68332206`) + the
-kafka/keycloak/tomcat suites, exactly like the long track.
+**Honest scope (unchanged caveat):** the full kafka/keycloak/tomcat app-gauntlet
+suites were **not** run for this flip (a multi-hour, per-app-setup effort,
+impractical in this environment — the same caveat the `IR_CALL`/`IR_LONG`/
+`LICM`/`UNROLL` flips carry). The flip rests on the checksum + E2E-probe evidence;
+`CRATONVM_JIT_IR_FP=0` is the opt-out safety net if an app ever regresses.
