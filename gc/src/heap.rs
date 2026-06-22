@@ -53,7 +53,30 @@ pub(crate) fn compact_oop_scan(header: &ObjectHeader) -> Option<(Arc<CompactLayo
     if !is_compact_object(header) {
         return None;
     }
-    let layout = class_layout(header.class_id.as_u32())?;
+    let cid = header.class_id.as_u32();
+    // Per-thread single-entry cache. The GC scans long runs of same-class
+    // objects (e.g. a tree of one node type), so this avoids re-taking the
+    // registry `RwLock` on every scanned object — a hit is just a generation
+    // load + an `Arc` refcount bump. Validated against `layout_generation()`
+    // so a redefine (which bumps the generation) cannot serve a stale layout.
+    thread_local! {
+        static OOP_CACHE: std::cell::RefCell<Option<(u32, u64, Arc<CompactLayout>)>> =
+            const { std::cell::RefCell::new(None) };
+    }
+    let gen = cratonvm_types::layout_generation();
+    let layout = OOP_CACHE.with(|c| {
+        {
+            let cache = c.borrow();
+            if let Some((cached_cid, cached_gen, arc)) = &*cache {
+                if *cached_cid == cid && *cached_gen == gen {
+                    return Some(arc.clone());
+                }
+            }
+        }
+        let arc = class_layout(cid)?;
+        *c.borrow_mut() = Some((cid, gen, arc.clone()));
+        Some(arc)
+    })?;
     Some((layout, header.array_length as usize))
 }
 

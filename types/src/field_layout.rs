@@ -94,6 +94,18 @@ pub fn set_compact_ref_fields_enabled(enabled: bool) {
 /// so a `Vec` indexed by id is compact. Only populated when the flag is on.
 static CLASS_LAYOUTS: RwLock<Vec<Option<Arc<CompactLayout>>>> = RwLock::new(Vec::new());
 
+/// Monotonic generation, bumped on every (re)registration. Lets hot-path
+/// consumers (the GC scan) cache a `(class_id -> Arc)` lookup and cheaply
+/// validate it with a single atomic load instead of re-taking the registry
+/// `RwLock` per scanned object. A redefine bumps this, invalidating caches.
+static LAYOUT_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Current layout-registry generation (see [`LAYOUT_GENERATION`]).
+#[inline]
+pub fn layout_generation() -> u64 {
+    LAYOUT_GENERATION.load(std::sync::atomic::Ordering::Acquire)
+}
+
 /// Register (or replace, on redefine) the compact layout for a class.
 pub fn register_class_layout(class_id: u32, layout: Arc<CompactLayout>) {
     let mut v = CLASS_LAYOUTS.write().unwrap();
@@ -102,6 +114,10 @@ pub fn register_class_layout(class_id: u32, layout: Arc<CompactLayout>) {
         v.resize(idx + 1, None);
     }
     v[idx] = Some(layout);
+    // Bump after the store so a reader that observes the new generation also
+    // observes the new entry (Release pairs with the Acquire in
+    // `layout_generation`). Done under the write lock, so no torn updates.
+    LAYOUT_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Release);
 }
 
 /// Look up the compact layout for a class, if registered.
