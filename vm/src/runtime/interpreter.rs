@@ -8377,7 +8377,6 @@ fn transfer_osr_exit_into_live_frame(
     rframe: &cratonvm_jit::deopt::ReconstructedFrame,
 ) -> Option<()> {
     use cratonvm_jit::deopt::FrameValue;
-    let _ = shared;
     let trace = std::env::var_os("CRATONVM_DBG_DEOPT").is_some();
     let bail = |why: &str| -> Option<()> {
         if trace {
@@ -8405,11 +8404,20 @@ fn transfer_osr_exit_into_live_frame(
         return bail("virtual-object slot");
     }
 
-    // CRATONVM_DEOPT_VERIFY: structural-invariant check before mutating the frame
-    // (slot counts within the method maxima). Default-off ⇒ skipped.
+    // CRATONVM_DEOPT_VERIFY: structural + oop-plausibility checks before mutating
+    // the frame — mirrors `build_deopt_frame_inner`. Structural catches a shifted /
+    // malformed snapshot (slot counts past the method maxima, bad virtual
+    // descriptors); oop-plausibility (`verify_reconstructed_oops`) catches a
+    // garbage address in an `Object` slot before it is written into the live frame
+    // (which would otherwise hand the GC a dangling root). Default-off ⇒ skipped.
     if cratonvm_jit::deopt_verify_enabled() {
-        let frame = &thread.frames[frame_idx];
-        if let Err(why) = verify_reconstructed_frame(rframe, frame.max_locals, frame.max_stack) {
+        let (max_locals, max_stack) = {
+            let frame = &thread.frames[frame_idx];
+            (frame.max_locals, frame.max_stack)
+        };
+        let verdict = verify_reconstructed_frame(rframe, max_locals, max_stack)
+            .and_then(|()| verify_reconstructed_oops(rframe, shared));
+        if let Err(why) = verdict {
             eprintln!(
                 "[DEOPT-VERIFY] OSR-exit bci={}: reconstructed-frame invariant violated: {why} \
                  — forcing safe reject",
