@@ -1,5 +1,75 @@
 # Wire the Tiered Compilation Manager
 
+> **Increment 5 (Step 5 — precise background OSR) landed.**
+> Builds on increment 4. CratonVM already had fully-working **inline** OSR: every
+> back-edge site does `frame.backward_count += 1; try_osr_with_backoff(…)`, and
+> `try_osr` compiled an OSR-enterable artifact (`x64::compile`, `compiled_via_osr`)
+> and transferred the live interpreter frame into it. The gap this step closes is
+> that the OSR **compile ran on the mutator** (a first-caller stall), the tiered
+> manager's `on_backedge` was never called, and `background_compile_task` ignored
+> `osr_bci`. Increment 5 moves the precise OSR compile **off the mutator**:
+> - **Frame-free compile core.** `try_osr`'s ~620-line compile/publish closure is
+>   extracted verbatim into `compile_osr_artifact(shared, class_id, class_name,
+>   method_name, descriptor, code, max_locals, entry_pc) -> Option<Arc<CompiledMethod>>`
+>   (`interpreter.rs`). Its only former frame dependency (`max_locals`) is now a
+>   param; everything else is method metadata, so it runs with no live frame. The
+>   `entry_pc` only feeds the *reuse* probe (`can_osr_enter`) — the compile is
+>   entry-pc-independent (the artifact supports OSR entry at every loop header it
+>   emits). `try_osr` now extracts metadata from the frame, calls
+>   `compile_osr_artifact`, and does the live-frame entry on the result (unchanged
+>   transfer logic). Validated behavior-preserving (see below).
+> - **Worker honors `osr_bci`.** `background_compile_task`: an OSR task resolves
+>   `(class_id, padded bytecode, max_locals)` from the (loaded) class via
+>   `fetch_osr_compile_inputs` and calls `compile_osr_artifact` off-thread,
+>   publishing a `compiled_via_osr` body into `jit_cache`. Same GC-STW lock
+>   discipline as `try_jit_compile_callee_slow`; `PENDING_COMPACT_FIELD_INFO` is
+>   thread-local so the worker stages its own.
+> - **Back-edge → enqueue, reuse-only entry.** Under `CRATONVM_BG_COMPILE`,
+>   `try_osr_with_backoff` (gated by the cheap per-frame `should_try_osr` schedule)
+>   enqueues an OSR task via the new `TieredCompilationManager::request_osr` (a
+>   sibling of `on_backedge` that enqueues *immediately* and idempotently — the
+>   per-frame schedule is the throttle, avoiding a per-back-edge lock and the
+>   10 000-count threshold), then **keeps interpreting**; it only ENTERS a
+>   worker-published artifact (the existing `osr_reused` reuse path) and never
+>   inline-compiles. `ensure_bg_compiler_started` is factored so the back-edge path
+>   starts the worker even for an all-hot-loop program that never crosses the
+>   invocation threshold.
+> - **Default-OFF safety.** With `CRATONVM_BG_COMPILE` unset, `try_osr_with_backoff`
+>   takes the historical inline-OSR path byte-for-byte (the extraction is the only
+>   change, and it is behavior-preserving). The manager's `on_backedge`/`request_osr`
+>   are never called.
+> - **Tests** (`jit/src/tiered.rs`): `step5_request_osr_enqueues_osr_task_immediately`
+>   (first call enqueues a High-priority `osr_bci` task; idempotent while queued;
+>   counted once) and `step5_request_osr_skips_when_already_c2_or_bailed`. 841
+>   jit-crate tests pass. (Incidentally repaired two `cratonvm-jit` test closures
+>   the compact-ref-field-layout merge left on the old 2-tuple `cp_field_resolver`,
+>   which had broken the whole jit test binary.)
+> - **Runtime validation (`scratch/bgosr/`).** `OsrProbe.compute` (a long int/long
+>   loop invoked once — so it only ever runs via OSR), `binarytrees 16`
+>   (recursion + allocation), and `OsrShapes` (arrays, branchy, nested loops + a
+>   callee) all produce **identical** results on HotSpot and CratonVM across
+>   `CRATONVM_BG_COMPILE` off/on × `CRATONVM_JIT_C2_FIRST_CALL` off/on
+>   (`compute`@10M = `1550058760673472`; bt16 = `14985902`; `OsrShapes` =
+>   `-784340278423176288`). The **off-thread** path is proven non-vacuously: under
+>   `CRATONVM_BG_COMPILE=1 CRATONVM_JIT_C2_FIRST_CALL=1 CRATONVM_DBG_JITC=1` the
+>   worker logs `bg-compile …compute… osr_bci=4` + `OSR-compile …entry=0x…` while
+>   the mutator logs `OSR-reuse …entry=0x…` at the **same** entry address — the
+>   compile ran on the worker and the interpreter entered its artifact (the mutator
+>   never logs `OSR-compile` under the gate). `OsrShapes` shows off-thread OSR for
+>   `arraySum`/`branchy`/`nestedCalls` independently.
+> - **Why `C2_FIRST_CALL`.** As in increment 4, the eager first-call single-pass
+>   compile (`fn execute`) compiles a method on call #1, so a once-invoked method
+>   would run fully compiled and never reach an interpreter back-edge. With
+>   `CRATONVM_JIT_C2_FIRST_CALL=1` the method stays interpreted until hot, so its
+>   loop OSRs — which is how the off-thread path is exercised. Correctness holds in
+>   every combination regardless.
+> - **Boundaries / not in this step.** (1) The compile is off-thread; the live-frame
+>   **entry** stays on the mutator (it must — the frame is the mutator's). (2)
+>   Threshold tuning of "hot enough" + `CRATONVM_TIER_*` overrides is Step 6. (3)
+>   The per-frame `should_try_osr` exponential backoff still gates entry attempts;
+>   a worker artifact is entered on the next firing after it publishes. (4) IR-path
+>   OSR (vs the single-pass `x64::compile` OSR reused here) remains future work.
+>
 > **Increment 4 (Step 4 — profile handoff C1 → C2) landed.**
 > Builds on increment 3. The PGO machinery was fully present but **dormant in
 > production**: `jit::profile::enable_profiling` was only ever called from the
@@ -331,8 +401,15 @@ tier instead of by the current ad-hoc gates.
    pre-existing branch/MIC/unroll consumption. Default-OFF = byte-identical. See
    the increment-4 header above for the boundaries (receiver-MIC + loop-unroll in
    the IR path remain single-pass-only / future work).
-5. **Wire `on_backedge` + OSR.** Add back-edge counting and the OSR entry
-   (approximate first, precise once deopt/OSR state maps exist).
+5. **Wire `on_backedge` + OSR.** ✅ **Done (increment 5).** Precise OSR (the
+   existing single-pass `x64::compile` OSR entry — already exact, not the design's
+   "approximate" fallback) now compiles **off the mutator**: `compile_osr_artifact`
+   is the extracted frame-free compile core, the background worker honors
+   `osr_bci`, and under `CRATONVM_BG_COMPILE` the back-edge path enqueues via
+   `TieredCompilationManager::request_osr` and enters only the worker-published
+   artifact (reuse-only). Default-OFF keeps the inline OSR byte-for-byte. The
+   `real-frame-deopt` dependency the design assumed turned out not to gate this —
+   the single-pass OSR works without it. See the increment-5 header above.
 6. **Tune thresholds** on the gauntlet; expose `CRATONVM_TIER_*` overrides.
 7. **Retire** the single fixed-threshold inline path.
 

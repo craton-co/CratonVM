@@ -4597,6 +4597,43 @@ pub(crate) fn try_osr_with_backoff(
     if !thread.frames[*frame_idx].should_try_osr(entry_pc, OSR_THRESHOLD) {
         return OsrBackoffOutcome::Skip;
     }
+    // wire-tiered-manager Step 5 (precise background OSR): when the bg/tiered
+    // pipeline is enabled, OSR compilation runs OFF the mutator. On a hot
+    // back-edge (the per-frame `should_try_osr` schedule above is the throttle)
+    // we enqueue an OSR task for the worker and KEEP INTERPRETING; we only enter
+    // a worker-PUBLISHED `compiled_via_osr` artifact (the existing reuse path) —
+    // never inline-compile here. Gated default-OFF: the historical inline OSR
+    // below is byte-for-byte unchanged when `CRATONVM_BG_COMPILE` is unset.
+    if crate::runtime::env_cache::bg_compile() {
+        let (cn, mn, md) = {
+            let f = &thread.frames[*frame_idx];
+            (
+                f.class_name().to_string(),
+                f.method_name().to_string(),
+                f.method_descriptor().to_string(),
+            )
+        };
+        let reusable = {
+            let jc = shared.jit_cache.read();
+            matches!(
+                jc.get(&cn, &mn, &md),
+                Some(c) if c.compiled_via_osr && c.can_osr_enter(entry_pc)
+            )
+        };
+        if !reusable {
+            // Not compiled yet: ensure the worker is running, request an OSR
+            // compile (idempotent), and back off so we re-probe later rather
+            // than spin. A subsequent hot back-edge finds the published
+            // artifact and falls through to the reuse-enter below.
+            ensure_bg_compiler_started(shared);
+            let key = crate::jit::tiered::MethodKey::new(cn, mn, md);
+            let _ = shared.tiered_manager.request_osr(&key, entry_pc as u32);
+            thread.frames[*frame_idx].record_osr_rejection(entry_pc);
+            return OsrBackoffOutcome::Skip;
+        }
+        // `reusable`: fall through to `try_osr`, which reuses the published
+        // artifact via its `osr_reused` fast path (no inline compile).
+    }
     let osr_class_id = thread.frames[*frame_idx].class_id;
     match try_osr(shared, thread, *frame_idx, osr_class_id, entry_pc) {
         Some(osr_val) => {
@@ -18023,19 +18060,9 @@ fn execute_invokestatic_cached(
                 //    worker draining the queue this is the historical no-op.)
                 let bg_compile_on = crate::runtime::env_cache::bg_compile();
                 if bg_compile_on {
-                    // Real off-thread compile closure. Captures a `Weak<SharedVm>`
-                    // (the worker outlives no Arc of its own) and, per drained task,
-                    // upgrades it and runs the same codegen entry point the inline
-                    // path uses — `try_jit_compile_callee` does the by-name lookup +
-                    // `jit::try_compile` + `shared.jit_cache` publish. Returns the
-                    // wall-clock compile time in ms for the tiered stats.
-                    let weak_vm: std::sync::Weak<SharedVm> =
-                        shared.self_arc.read().as_ref().cloned().unwrap_or_default();
-                    crate::jit::tiered::ensure_background_compiler(&shared.tiered_manager, || {
-                        Box::new(move |task: &crate::jit::tiered::CompilationTask| -> u64 {
-                            background_compile_task(&weak_vm, task)
-                        })
-                    });
+                    // Start the off-thread compile worker once (idempotent). See
+                    // `ensure_bg_compiler_started` for the closure / GC rationale.
+                    ensure_bg_compiler_started(shared);
                 }
                 let recommended_tier = shared.tiered_manager.on_method_invocation(&tiered_key);
                 if let Some(tier) = recommended_tier {
@@ -18231,13 +18258,31 @@ const OSR_THRESHOLD: u32 = 1_000;
 ///
 /// Returns `Some(Option<Value>)` if OSR succeeds (the method completed via JIT),
 /// or `None` if OSR is not possible (method not JIT-compatible, compilation failed, etc.).
-fn try_osr(
+/// wire-tiered-manager Step 5 (precise background OSR): compile (or reuse) an
+/// OSR-enterable artifact for `(class, method, descriptor)` and publish it into
+/// `shared.jit_cache`. Extracted verbatim from `try_osr`'s former inline compile
+/// closure so it can run **off the mutator** on the background compile worker
+/// (which holds no live frame): every input is method metadata, not runtime frame
+/// state. The mutator's `try_osr` then does the live-frame entry on the returned
+/// artifact. `entry_pc` only selects which back-edge the *reuse* probe checks
+/// (`can_osr_enter`); the compile itself is entry-pc-independent (the artifact
+/// supports OSR entry at every loop header it emits).
+///
+/// GC-STW-safety on the worker: same discipline as `try_jit_compile_callee_slow`
+/// (see its doc) — every `class_manager` lock is read out and dropped before any
+/// blocking / allocating call (`load_class_concurrent`, eager callee compile), and
+/// `PENDING_COMPACT_FIELD_INFO` is thread-local so the worker stages its own.
+#[allow(clippy::too_many_arguments)]
+fn compile_osr_artifact(
     shared: &SharedVm,
-    thread: &mut JvmThread,
-    frame_idx: usize,
     class_id: ClassId,
+    class_name: String,
+    method_name: String,
+    method_descriptor: String,
+    code: &[u8],
+    max_locals: usize,
     entry_pc: usize,
-) -> Option<Option<Value>> {
+) -> Option<Arc<crate::jit::CompiledMethod>> {
     // Kill-switch: CRATONVM_DISABLE_JIT=1 forces interpreter-only execution.
     // OSR is a JIT entry point distinct from `try_jit_compile_callee` /
     // `try_jit_upgrade_with_gate`, so it needs its own gate so the user-facing
@@ -18245,7 +18290,6 @@ fn try_osr(
     if crate::runtime::env_cache::disable_jit() {
         return None;
     }
-    let frame = &thread.frames[frame_idx];
     // Respect the JIT skip list for OSR — classes that are skipped from
     // normal JIT compilation must also be skipped from OSR to avoid
     // re-executing loop bodies with buggy compiled code. Use the canonical
@@ -18255,8 +18299,8 @@ fn try_osr(
     } else {
         crate::jit::skip_list::SkipPolicy::Conservative
     };
-    let class_name_check = frame.class_name();
-    let method_name_check = frame.method_name();
+    let class_name_check = class_name.as_str();
+    let method_name_check = method_name.as_str();
     // T1.1.f — OSR of `<init>`/`<clinit>` methods follows the same
     // InitComplexity classification as the first-call compile path.
     // Trivial constructors (which never appear as OSR targets in
@@ -18298,7 +18342,6 @@ fn try_osr(
         return None;
     }
     // Get method info from frame metadata
-    let method_descriptor = frame.method_descriptor().to_string();
     // S111r15 — same native-shadow guard as the other JIT entry points
     // (`try_jit_compile_callee`, `try_jit_upgrade_with_gate`, first-call
     // compile path). OSR must respect the native registration too.
@@ -18309,9 +18352,6 @@ fn try_osr(
     {
         return None;
     }
-    let class_name = frame.class_name().to_string();
-    let method_name = frame.method_name().to_string();
-    let code = frame.code.clone();
 
     // Check if already compiled
     let class_name_arc: Arc<str> = Arc::from(class_name.as_str());
@@ -18813,7 +18853,7 @@ fn try_osr(
                 &code,
                 code_len,
                 param_slots,
-                thread.frames[frame_idx].max_locals as usize, // Widening: u16 to usize
+                max_locals, // Widening: u16 to usize (OSR target's max_locals, frame-free)
                 scan.needs_heap,
                 mna_info,
                 field_info,
@@ -18893,6 +18933,38 @@ fn try_osr(
             compiled.code_bytes(),
         );
     }
+    Some(compiled)
+}
+
+fn try_osr(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    frame_idx: usize,
+    class_id: ClassId,
+    entry_pc: usize,
+) -> Option<Option<Value>> {
+    let frame = &thread.frames[frame_idx];
+    let class_name = frame.class_name().to_string();
+    let method_name = frame.method_name().to_string();
+    let method_descriptor = frame.method_descriptor().to_string();
+    let code = frame.code.clone();
+    let max_locals = frame.max_locals as usize;
+    let class_name_arc: Arc<str> = Arc::from(class_name.as_str());
+    let method_name_arc: Arc<str> = Arc::from(method_name.as_str());
+    let descriptor_arc: Arc<str> = Arc::from(method_descriptor.as_str());
+    // wire-tiered-manager Step 5: the OSR compile (or cache reuse) now lives in
+    // `compile_osr_artifact`, which the background worker can also call off-thread.
+    // The live-frame entry/transfer below stays on the mutator.
+    let compiled = compile_osr_artifact(
+        shared,
+        class_id,
+        class_name.clone(),
+        method_name.clone(),
+        method_descriptor.clone(),
+        &code,
+        max_locals,
+        entry_pc,
+    )?;
 
     // Convert interpreter locals to i64 for JIT frame (raw u64 → i64 reinterpret)
     let frame = &thread.frames[frame_idx];
@@ -20899,6 +20971,56 @@ fn try_jit_compile_callee_slow(
 /// function's lock-order contract): nothing is held across the worker's queue
 /// wait (its own `CompilerCore::wake` condvar, no VM lock), across class loading,
 /// or across the JFR / jit_cache publish.
+/// wire-tiered-manager Step 5: start the background compile worker once
+/// (idempotent), wiring the real off-thread compile closure. Captures a
+/// `Weak<SharedVm>` (the worker owns no Arc of the VM) and, per drained task,
+/// runs [`background_compile_task`] off the mutator. Called from BOTH the
+/// invocation tier-up trigger AND the back-edge OSR path, so an all-hot-loop
+/// program (a `main()` loop that never crosses the invocation threshold) still
+/// starts the worker.
+fn ensure_bg_compiler_started(shared: &SharedVm) {
+    let weak_vm: std::sync::Weak<SharedVm> =
+        shared.self_arc.read().as_ref().cloned().unwrap_or_default();
+    crate::jit::tiered::ensure_background_compiler(&shared.tiered_manager, || {
+        Box::new(move |task: &crate::jit::tiered::CompilationTask| -> u64 {
+            background_compile_task(&weak_vm, task)
+        })
+    });
+}
+
+/// wire-tiered-manager Step 5: resolve the inputs the off-thread OSR compile
+/// needs for `(class, method, descriptor)` — `(class_id, padded bytecode,
+/// max_locals)` — from already-loaded class metadata. The method is currently
+/// executing in the interpreter (that is what tripped the back-edge), so its
+/// class is loaded; we never load it here. Returns `None` if the
+/// class/method/Code attribute is absent. The padded bytecode matches
+/// `Frame::code`'s layout (`padded_bytecode`, +2 zero tail) so the compiled
+/// artifact's PC mapping lines up with the interpreter frame at OSR entry.
+fn fetch_osr_compile_inputs(
+    shared: &SharedVm,
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+) -> Option<(ClassId, std::sync::Arc<[u8]>, u16)> {
+    let cm = shared.class_manager.read();
+    let class_id = cm.get_loaded_class_id(class_name)?;
+    let class = cm.get_class(class_id)?;
+    let method = class
+        .methods
+        .iter()
+        .find(|m| &*m.name == method_name && &*m.descriptor == descriptor)?;
+    let code_attr = method.attributes.iter().find_map(|a| match a.as_decoded() {
+        Some(cratonvm_reader::attribute::Attribute::Code(ca)) => Some(ca),
+        _ => None,
+    })?;
+    // `padded_bytecode` only copies bytes (Rust-heap alloc, no VM lock / no
+    // blocking / no managed allocation), so building it under the `cm` read
+    // lock is GC-STW-safe; the lock drops at function return.
+    let padded = crate::runtime::frame::padded_bytecode(&code_attr.code);
+    let max_locals = code_attr.max_locals;
+    Some((class_id, padded, max_locals))
+}
+
 fn background_compile_task(
     weak_vm: &std::sync::Weak<SharedVm>,
     task: &crate::jit::tiered::CompilationTask,
@@ -20920,6 +21042,36 @@ fn background_compile_task(
                 .map(|b| format!(" osr_bci={b}"))
                 .unwrap_or_default(),
         );
+    }
+    // wire-tiered-manager Step 5 (precise background OSR): an OSR-motivated task
+    // compiles an OSR-enterable artifact OFF the mutator (the worker has no live
+    // frame). `compile_osr_artifact` resolves all metadata from the (loaded)
+    // class and publishes a `compiled_via_osr` body into `jit_cache`; the
+    // mutator's back-edge path then ENTERS that published artifact (the existing
+    // `osr_reused` reuse path) with no inline compile stall. `osr_bci` is the
+    // back-edge the mutator will enter at — the artifact supports entry at every
+    // loop header it emits, so the compile itself is entry-pc-independent.
+    if let Some(osr_bci) = task.osr_bci {
+        let start = std::time::Instant::now();
+        if let Some((class_id, padded, max_locals)) = fetch_osr_compile_inputs(
+            &shared,
+            &task.method_key.class_name,
+            &task.method_key.method_name,
+            &task.method_key.descriptor,
+        ) {
+            let _ = compile_osr_artifact(
+                &shared,
+                class_id,
+                task.method_key.class_name.to_string(),
+                task.method_key.method_name.to_string(),
+                task.method_key.descriptor.to_string(),
+                &padded,
+                max_locals as usize,
+                osr_bci as usize,
+            );
+        }
+        // Widening: smaller integer -> 64-bit (zero/sign-extended).
+        return start.elapsed().as_millis() as u64;
     }
     let start = std::time::Instant::now();
     // Real codegen + publish into the shared JIT cache. `try_jit_compile_callee`
