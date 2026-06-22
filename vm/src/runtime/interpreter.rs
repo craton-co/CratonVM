@@ -8279,6 +8279,146 @@ fn resume_real_ir_deopt(
     }
 }
 
+/// deopt-osr Step 8 follow-up (P4): `CRATONVM_OSR_EXIT_TRANSFER` (default-OFF,
+/// read-once). When ON, a frame-deopt taken inside OSR-entered code transfers the
+/// JIT-advanced loop state into the LIVE interpreter frame and resumes the loop
+/// body there (a *true* OSR-exit), instead of the safe reject that discards the
+/// JIT-advanced state and re-runs those iterations in the interpreter. OFF ⇒ the
+/// validated Step-8 reject ⇒ byte-identical to today. Consulted together with the
+/// per-method `can_osr_exit` flag and `cratonvm_jit::deopt_real_enabled()` at the
+/// OSR sink, so OSR-exit can never run half-on.
+fn osr_exit_transfer_enabled() -> bool {
+    use std::sync::OnceLock;
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var_os("CRATONVM_OSR_EXIT_TRANSFER").is_some())
+}
+
+/// deopt-osr Step 8 follow-up (P4) — TRUE OSR-exit: transfer the JIT-advanced loop
+/// state from a reconstructed frame into the LIVE interpreter frame at `frame_idx`
+/// (overwrite locals + operand stack in place, set pc), so the interpreter resumes
+/// the loop body exactly where the OSR-compiled code bailed.
+///
+/// OSR is *same-frame* replacement — the OSR'd code ran within `frame_idx`'s
+/// logical frame — so unlike `resume_real_ir_deopt` (which pushes a NEW frame for a
+/// normal-call deopt) this MUTATES the existing frame, preserving its identity and
+/// bookkeeping (`backward_count`, `osr_attempt_counts`, `monitor_on_exit`, `seq`,
+/// the cold metadata) that a wholesale rebuild-and-swap would drop. That matters:
+/// the safe-reject alternative discards the JIT's advanced loop state and lets the
+/// interpreter re-run the iterations the OSR'd code already executed, which
+/// double-executes any side effect it committed (the gap this closes).
+///
+/// Returns `Some(())` on a clean transfer (the caller then returns `None` from
+/// `try_osr`, so the interpreter resumes THIS mutated frame), or `None` for an
+/// out-of-scope / unmappable frame so the caller falls back to the safe reject.
+///
+/// GC-safety. The reconstructed oops were read in-stub (`x64_deopt_entry`) as raw
+/// heap words. The OSR-exit snapshot's provenance is Register / StackSlot /
+/// StackSlotRef only — never `VirtualObject` — so there is NO materialization, and
+/// an in-place overwrite reuses the frame's existing pooled buffers, so there is NO
+/// pool refill. Hence NO Java-heap allocation runs between the in-stub capture and
+/// the writes below: the addresses stay current and become rooted by the frame's
+/// own GC-scanned slots the instant they are written. A `VirtualObject`-bearing
+/// frame (unreachable from the OSR-exit emitter today) bails to reject rather than
+/// allocate without the pin dance. The per-slot oop typing comes from the same
+/// `local_oop_masks` dataflow that the already-validated deopt-EXIT resume relies
+/// on; under `CRATONVM_DEOPT_VERIFY` the structural invariants are checked first.
+fn transfer_osr_exit_into_live_frame(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    frame_idx: usize,
+    rframe: &cratonvm_jit::deopt::ReconstructedFrame,
+) -> Option<()> {
+    use cratonvm_jit::deopt::FrameValue;
+    let _ = shared;
+    let trace = std::env::var_os("CRATONVM_DBG_DEOPT").is_some();
+    let bail = |why: &str| -> Option<()> {
+        if trace {
+            eprintln!("[cratonvm-deopt] OSR-exit transfer reject ({why}) at bci={}", rframe.bci);
+        }
+        None
+    };
+
+    // Phase-A scope (mirror `build_deopt_frame_inner`): a single non-inlined frame,
+    // no held monitors, no virtual (scalar-replaced) slots. The OSR-exit snapshot
+    // never emits virtuals; if a future emitter does, reject until the elided-
+    // monitor handling that gates `build_deopt_frame_inner` is wired here too.
+    if !rframe.caller_frames.is_empty() {
+        return bail("inlined caller chain");
+    }
+    if !rframe.monitors.is_empty() {
+        return bail("held monitors");
+    }
+    if rframe
+        .locals
+        .iter()
+        .chain(rframe.stack.iter())
+        .any(|v| matches!(v, FrameValue::VirtualObject(_) | FrameValue::VirtualObjectRef(_)))
+    {
+        return bail("virtual-object slot");
+    }
+
+    // CRATONVM_DEOPT_VERIFY: structural-invariant check before mutating the frame
+    // (slot counts within the method maxima). Default-off ⇒ skipped.
+    if cratonvm_jit::deopt_verify_enabled() {
+        let frame = &thread.frames[frame_idx];
+        if let Err(why) = verify_reconstructed_frame(rframe, frame.max_locals, frame.max_stack) {
+            eprintln!(
+                "[DEOPT-VERIFY] OSR-exit bci={}: reconstructed-frame invariant violated: {why} \
+                 — forcing safe reject",
+                rframe.bci
+            );
+            return None;
+        }
+    }
+
+    // The reconstructed slots must fit the live frame's storage. (`set_local_unchecked`
+    // / `push_unchecked` panic out-of-bounds, so this guard is load-bearing.)
+    {
+        let frame = &thread.frames[frame_idx];
+        if rframe.locals.len() > frame.locals_len() || rframe.stack.len() > frame.max_stack as usize
+        {
+            return bail("slot overflow");
+        }
+    }
+
+    // Map reconstructed FrameValues → interpreter Values (Int / Object / Undefined;
+    // cat-2 / FP / unresolved → None ⇒ reject). Pure Rust; no Java allocation. Done
+    // BEFORE any frame mutation so a reject can never half-write the frame.
+    let locals = match ir_deopt_frame_values_with_objects(&rframe.locals) {
+        Some(l) => l,
+        None => return bail("unmappable local"),
+    };
+    let stack_vals = match ir_deopt_frame_values_with_objects(&rframe.stack) {
+        Some(s) => s,
+        None => return bail("unmappable stack slot"),
+    };
+
+    // Overwrite the live frame IN PLACE. No Java allocation here, so the
+    // reconstructed oops remain valid and are rooted by the frame's slots the moment
+    // they are written. The locals snapshot is JVM-slot-indexed (one entry per slot;
+    // cat-2 would have bailed at the mapper), so slot `i` ← `locals[i]` is 1:1.
+    let frame = &mut thread.frames[frame_idx];
+    for (i, v) in locals.iter().enumerate() {
+        frame.set_local_unchecked(i, *v);
+    }
+    frame.stack.clear();
+    for v in &stack_vals {
+        frame.stack.push_unchecked(*v);
+    }
+    // Cast: bytecode index (non-negative, fits) → usize pc.
+    frame.pc = rframe.bci as usize;
+
+    if trace {
+        eprintln!(
+            "[cratonvm-deopt] OSR-exit TRANSFER into live frame: resume bci={} ({} locals, {} stack)",
+            rframe.bci,
+            locals.len(),
+            stack_vals.len(),
+        );
+    }
+    Some(())
+}
+
 #[cfg(test)]
 mod deopt_step3_tests {
     use super::*;
@@ -8666,6 +8806,177 @@ mod deopt_step3_tests {
         }
         drop(frame);
         thread.native_pin_roots.truncate(pin_base);
+    }
+
+    // ---------------------------------------------------------------------
+    // P4 — TRUE OSR-exit transfer into the live interpreter frame.
+    // ---------------------------------------------------------------------
+
+    /// Seed a single live frame for `cached` (the OSR'd method) holding the given
+    /// reconstructed state, returning the now-live `thread.frames[0]`.
+    fn seed_live_frame(
+        shared: &SharedVm,
+        thread: &mut JvmThread,
+        cached: &Arc<CachedBytecodeMethod>,
+        locals: Vec<FrameValue>,
+        stack: Vec<FrameValue>,
+        bci: u32,
+    ) {
+        let rf = rframe(locals, stack, bci);
+        resume_real_ir_deopt(shared, thread, cached, &rf).expect("seed frame must push");
+        assert_eq!(thread.frames.len(), 1);
+    }
+
+    /// The core P4 invariant: the JIT-advanced loop state OVERWRITES the live
+    /// frame's locals + operand stack IN PLACE and re-points pc, WITHOUT pushing a
+    /// new frame — so the interpreter resumes the loop body from where the OSR'd
+    /// code bailed (vs the reject, which would re-run those iterations).
+    #[test]
+    fn osr_exit_transfers_advanced_state_into_live_frame() {
+        let shared = Arc::new(SharedVm::new(VmConfig::default()));
+        let mut thread = JvmThread::new(ThreadId(0), "test");
+        let cached = minimal_cached();
+
+        // Pre-advance live state: i=100, acc=4950, a stale operand-stack entry, at
+        // loop-header bci 7.
+        seed_live_frame(
+            &shared,
+            &mut thread,
+            &cached,
+            vec![FrameValue::Int(100), FrameValue::Int(4950)],
+            vec![FrameValue::Int(777)],
+            7,
+        );
+
+        // The OSR'd code advanced 5 iterations (i=105, acc=5460) and left the
+        // operand stack empty at the loop header.
+        let advanced = rframe(vec![FrameValue::Int(105), FrameValue::Int(5460)], vec![], 7);
+        assert!(
+            transfer_osr_exit_into_live_frame(&shared, &mut thread, 0, &advanced).is_some(),
+            "clean int frame must transfer"
+        );
+
+        // SAME frame (no push), with advanced locals, cleared stack, pc at the bci.
+        assert_eq!(thread.frames.len(), 1, "transfer must not push a frame");
+        let frame = &thread.frames[0];
+        assert_eq!(frame.get_local(0), Value::Int(105));
+        assert_eq!(frame.get_local(1), Value::Int(5460));
+        assert_eq!(frame.pc, 7);
+        assert_eq!(frame.stack.len(), 0, "stale operand stack must be replaced");
+    }
+
+    /// A non-empty reconstructed operand stack is transferred verbatim (the stack
+    /// is cleared then refilled from the snapshot).
+    #[test]
+    fn osr_exit_transfer_replaces_operand_stack() {
+        let shared = Arc::new(SharedVm::new(VmConfig::default()));
+        let mut thread = JvmThread::new(ThreadId(0), "test");
+        let cached = minimal_cached();
+        seed_live_frame(&shared, &mut thread, &cached, vec![FrameValue::Int(0)], vec![], 0);
+
+        let advanced = rframe(
+            vec![FrameValue::Int(1)],
+            vec![FrameValue::Int(3), FrameValue::Int(4)],
+            2,
+        );
+        assert!(transfer_osr_exit_into_live_frame(&shared, &mut thread, 0, &advanced).is_some());
+        let frame = &thread.frames[0];
+        assert_eq!(frame.pc, 2);
+        assert_eq!(frame.stack.len(), 2);
+        // Snapshot order is bottom→top ([3, 4]); `peek_at(0)` is the TOP.
+        assert_eq!(frame.stack.peek_at(0), Value::Int(4));
+        assert_eq!(frame.stack.peek_at(1), Value::Int(3));
+    }
+
+    /// GC-safety: an object reference carried in the advanced state must survive a
+    /// forced GC AFTER the transfer — rooted via the mutated LIVE frame's slot (the
+    /// transfer installs no temporary pin; the frame slot is the root, forwarded in
+    /// place by a moving collector).
+    #[test]
+    fn osr_exit_transfer_roots_oop_via_live_frame() {
+        let shared = Arc::new(SharedVm::new(VmConfig::default()));
+        let mut thread = JvmThread::new(ThreadId(0), "test");
+        let cached = minimal_cached();
+        seed_live_frame(&shared, &mut thread, &cached, vec![FrameValue::Int(0)], vec![], 0);
+
+        let obj = shared.heap.alloc_object(cratonvm_types::ClassId::new(7), 0);
+        // Cast: object pointer to integer address.
+        let addr = obj.as_ptr() as usize as u64;
+        let advanced = rframe(vec![FrameValue::Object(addr), FrameValue::Int(9)], vec![], 3);
+        assert!(transfer_osr_exit_into_live_frame(&shared, &mut thread, 0, &advanced).is_some());
+
+        // No Java allocation between in-stub capture and the in-place write, so the
+        // raw address was valid; the frame slot now roots it. Force a GC — it must
+        // survive (and be forwarded in place under a moving collector).
+        maybe_gc_forced_pub(&shared, &mut thread);
+        let frame = &thread.frames[0];
+        assert_eq!(frame.pc, 3);
+        match frame.get_local(0) {
+            Value::Object(Some(o)) => {
+                assert_eq!(shared.heap.class_id_of(o), cratonvm_types::ClassId::new(7));
+            }
+            other => panic!("local 0 must survive GC via the live frame, got {other:?}"),
+        }
+        assert_eq!(frame.get_local(1), Value::Int(9));
+    }
+
+    /// An unmappable slot (cat-2 `Unsupported`) rejects (returns `None`) and leaves
+    /// the live frame COMPLETELY untouched — the mapping happens before any
+    /// mutation, so a reject can never half-write the frame (the caller then safely
+    /// continues interpreting the pre-OSR state).
+    #[test]
+    fn osr_exit_transfer_rejects_unmappable_without_mutating() {
+        let shared = Arc::new(SharedVm::new(VmConfig::default()));
+        let mut thread = JvmThread::new(ThreadId(0), "test");
+        let cached = minimal_cached();
+        seed_live_frame(
+            &shared,
+            &mut thread,
+            &cached,
+            vec![FrameValue::Int(11), FrameValue::Int(22)],
+            vec![FrameValue::Int(33)],
+            5,
+        );
+
+        let bad = rframe(vec![FrameValue::Int(99), FrameValue::Unsupported], vec![], 8);
+        assert!(transfer_osr_exit_into_live_frame(&shared, &mut thread, 0, &bad).is_none());
+
+        // Frame fully intact.
+        let frame = &thread.frames[0];
+        assert_eq!(frame.get_local(0), Value::Int(11));
+        assert_eq!(frame.get_local(1), Value::Int(22));
+        assert_eq!(frame.pc, 5);
+        assert_eq!(frame.stack.len(), 1);
+        assert_eq!(frame.stack.peek_at(0), Value::Int(33));
+    }
+
+    /// A virtual-object slot (never emitted by the OSR-exit snapshot today) rejects
+    /// rather than allocate without the materialize pin-dance — the frame is left
+    /// untouched.
+    #[test]
+    fn osr_exit_transfer_rejects_virtual_slot() {
+        let shared = Arc::new(SharedVm::new(VmConfig::default()));
+        let mut thread = JvmThread::new(ThreadId(0), "test");
+        let cached = minimal_cached();
+        seed_live_frame(&shared, &mut thread, &cached, vec![FrameValue::Int(1)], vec![], 0);
+
+        let bad = rframe(vec![vobj(0, 5, vec![FrameValue::Int(1)])], vec![], 0);
+        assert!(transfer_osr_exit_into_live_frame(&shared, &mut thread, 0, &bad).is_none());
+        assert_eq!(thread.frames[0].get_local(0), Value::Int(1));
+    }
+
+    /// An inlined-caller chain or a held monitor is out of Phase-A scope → reject.
+    #[test]
+    fn osr_exit_transfer_rejects_out_of_scope() {
+        let shared = Arc::new(SharedVm::new(VmConfig::default()));
+        let mut thread = JvmThread::new(ThreadId(0), "test");
+        let cached = minimal_cached();
+        seed_live_frame(&shared, &mut thread, &cached, vec![FrameValue::Int(1)], vec![], 0);
+
+        let mut inlined = rframe(vec![FrameValue::Int(2)], vec![], 0);
+        inlined.caller_frames.push(rframe(vec![], vec![], 0));
+        assert!(transfer_osr_exit_into_live_frame(&shared, &mut thread, 0, &inlined).is_none());
+        assert_eq!(thread.frames[0].get_local(0), Value::Int(1));
     }
 }
 
@@ -18168,28 +18479,49 @@ fn try_osr(
         Err(_) => return None,
     };
 
-    // deopt-osr Step 8: OSR-exit safety. A frame-deopt taken inside the OSR'd
-    // code (e.g. the deopt-osr loop-boundary trigger, or any future guard) stashes
-    // a reconstructed frame in LAST_DEOPT and returns the i64::MIN sentinel. OSR is
-    // *same-frame* replacement, so unlike the `execute_jit_call` sink we must NOT
-    // push a new frame or treat the sentinel as the return value (i64::MIN as i32
-    // == 0 → the corrupt result this guards against). Reject the OSR (clear the
-    // stash, return None): the interpreter simply continues executing THIS frame
-    // from where it was — correct because the trigger bails at the loop header
-    // before committing any JIT loop iteration to the frame. (A true OSR-exit that
-    // transfers JIT-advanced loop state back into the live interpreter frame is a
-    // follow-up — it must overwrite the frame's locals/stack under GC-rooting,
-    // which is coupled to the OSR-frame shadow-stack tracking; see
-    // deopt-osr-steps789-handoff.md.) The non-OSR loop-bci resume path is fully
-    // wired + proven at the `execute_jit_call` sink.
-    if result_i64 == i64::MIN && cratonvm_jit::deopt::take_last_deopt().is_some() {
-        if std::env::var_os("CRATONVM_DBG_DEOPT").is_some() {
-            eprintln!(
-                "[cratonvm-deopt] OSR-exit bail rejected (continue interpreting) {}.{}{} entry_pc={}",
-                &*class_name_arc, &*method_name_arc, &*descriptor_arc, entry_pc
-            );
+    // deopt-osr Step 8: OSR-exit. A frame-deopt taken inside the OSR'd code (the
+    // deopt-osr loop-boundary trigger, or any future guard) stashes a reconstructed
+    // frame in LAST_DEOPT and returns the i64::MIN sentinel. OSR is *same-frame*
+    // replacement, so unlike the `execute_jit_call` sink we must NOT push a new
+    // frame or treat the sentinel as the return value (i64::MIN as i32 == 0 → the
+    // corrupt result this guards against). Two handlings, gated:
+    //
+    //   * TRUE OSR-exit (P4, `CRATONVM_OSR_EXIT_TRANSFER`): transfer the
+    //     JIT-advanced loop state into THIS live frame and resume the loop body
+    //     there (`return None` ⇒ the interpreter continues the mutated frame). This
+    //     is required for correctness once the OSR'd code commits per-iteration side
+    //     effects — re-running them in the interpreter (the reject below) would
+    //     double-execute them.
+    //   * Safe reject (gate off / out-of-scope / unmappable): clear the stash and
+    //     `return None` so the interpreter continues executing THIS frame from where
+    //     it was — correct only when the bail precedes any committed loop iteration
+    //     (the unconditional-at-header trigger). The validated Step-8 default.
+    if result_i64 == i64::MIN {
+        if let Some(rframe) = cratonvm_jit::deopt::take_last_deopt() {
+            if osr_exit_transfer_enabled()
+                && compiled.can_osr_exit
+                && transfer_osr_exit_into_live_frame(shared, thread, frame_idx, &rframe).is_some()
+            {
+                if std::env::var_os("CRATONVM_DBG_DEOPT").is_some() {
+                    eprintln!(
+                        "[cratonvm-deopt] OSR-exit TRANSFER {}.{}{} entry_pc={} resume_bci={}",
+                        &*class_name_arc, &*method_name_arc, &*descriptor_arc, entry_pc, rframe.bci
+                    );
+                }
+                return None;
+            }
+            // Safe reject: gate off, method not OSR-exit-capable, or an
+            // out-of-scope/unmappable reconstructed frame.
+            if std::env::var_os("CRATONVM_DBG_DEOPT").is_some() {
+                eprintln!(
+                    "[cratonvm-deopt] OSR-exit bail rejected (continue interpreting) {}.{}{} entry_pc={}",
+                    &*class_name_arc, &*method_name_arc, &*descriptor_arc, entry_pc
+                );
+            }
+            return None;
         }
-        return None;
+        // No stashed deopt frame: a genuine `Long.MIN_VALUE` method result — fall
+        // through to the normal return-value conversion below.
     }
 
     // Convert i64 result back to Value based on return type

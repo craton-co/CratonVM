@@ -883,6 +883,30 @@ pub fn osr_exit_test_enabled() -> bool {
     *CACHE.get_or_init(|| std::env::var_os("CRATONVM_OSR_EXIT_TEST").is_some())
 }
 
+/// deopt-osr Step 8 follow-up (P4): `CRATONVM_OSR_EXIT_AFTER=N` (default-OFF,
+/// read-once) — the COUNTER-GATED OSR-exit trigger. When set to a positive `N`
+/// *and* `deopt_real_enabled()`, the single-pass backend emits, at a loop header,
+/// a per-site counter that bails to the OSR-exit stub only on the `N`-th reach —
+/// so the JIT runs ~`N` loop iterations (advancing the loop-carried locals /
+/// accumulator and committing their side effects) BEFORE the exit. This makes the
+/// reconstructed frame carry genuinely JIT-advanced state, which the interpreter's
+/// `transfer_osr_exit_into_live_frame` (gated `CRATONVM_OSR_EXIT_TRANSFER`) writes
+/// back into the live frame — the realistic trigger the handoff calls for, vs the
+/// unconditional-at-header `CRATONVM_OSR_EXIT_TEST` trigger that bails at iteration
+/// 0. `None` / 0 ⇒ no counter emitted ⇒ byte-identical production code. Test-only:
+/// run it WITH `CRATONVM_OSR_EXIT_TRANSFER=1`; with the transfer gate off the
+/// interpreter safe-rejects and re-runs the committed iterations (double-executing
+/// their side effects) — which is exactly the gap the transfer closes.
+pub fn osr_exit_after() -> Option<usize> {
+    static CACHE: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| {
+        std::env::var("CRATONVM_OSR_EXIT_AFTER")
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .filter(|&n| n > 0)
+    })
+}
+
 /// Record `[entry, entry+len)` → `name` for crash-time symbolization. No-op
 /// unless `CRATONVM_DBG_JIT_NAMES` is set.
 pub fn register_jit_method_name(entry: usize, len: usize, name: String) {

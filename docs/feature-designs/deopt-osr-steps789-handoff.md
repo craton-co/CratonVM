@@ -191,7 +191,48 @@ Already in the tree: `DeoptReason::OsrExit` (`deopt.rs:52`), `CompiledMethod.can
 
 **Live-validated** (`CRATONVM_DEOPT_REAL=1 CRATONVM_OSR_EXIT_TEST=1 CRATONVM_NO_IR_BRANCHY=1`): a counted-loop `sum(n)` — (A) n=10 (no OSR-entry): 150 OSR-exit deopts at the loop header, each reconstructs `[n,0,0]` and resumes → `acc` correct (9000); (B) n=1000 (OSR-enters): driver rejects the bail → no corruption → `acc` correct (99900000); gate-off controls identical. 825 jit lib tests green.
 
-**Remaining (Step 8 follow-up + Step 9).** A *true* OSR-exit that transfers JIT-advanced loop state back into the **live interpreter frame** (overwrite locals/stack in place, set pc) — rather than the safe reject — is the refinement; it must root the reconstructed oops while mutating the frame and is coupled to the OSR-frame shadow-stack tracking (`CRATONVM_SHADOW_OSR_TRACK`, default OFF, regresses bt18), so it is best co-scheduled with the moving-GC work. A *realistic* trigger (a counter/speculation that bails after N JIT iterations, vs the unconditional-at-header test trigger) is also follow-up. **Step 9** (epoch-invalidation consumer for `compilation_epoch` vs stale baked boxes) is unstarted.
+**Step 8 follow-up — TRUE OSR-exit transfer DONE (P4, 2026-06-21).** The *true*
+OSR-exit now transfers JIT-advanced loop state back into the **live interpreter
+frame** (overwrite locals + operand stack in place, set pc) instead of the safe
+reject — closing the side-effect double-execution gap (reject discards the
+JIT-advanced loop counter and re-runs committed iterations in the interpreter).
+Both pieces gated, default-OFF ⇒ byte-identical production (bt18 = 68332206):
+
+- **Transfer** (`vm/src/runtime/interpreter.rs` `transfer_osr_exit_into_live_frame`,
+  gate `CRATONVM_OSR_EXIT_TRANSFER`): wired into `try_osr`'s OSR-exit branch as
+  transfer-then-reject. It is an *in-place* mutation of `thread.frames[frame_idx]`
+  (NOT a rebuild-and-swap), so the frame's identity/bookkeeping survives
+  (`backward_count`, `osr_attempt_counts`, `monitor_on_exit`, `seq`, cold
+  metadata). Reuses the `ir_deopt_frame_values_with_objects` mapper; maps BEFORE
+  any write so a reject (cat-2/FP/virtual/out-of-scope) can never half-write the
+  frame. GC-safe with NO pin dance: the OSR-exit snapshot carries only
+  Register/StackSlot/StackSlotRef (never `VirtualObject`), so there is no
+  materialization and no pool refill ⇒ no Java allocation between the in-stub oop
+  capture and the in-place write; the frame slot roots the oop the instant it is
+  written. Consulted with `compiled.can_osr_exit` + `deopt_real_enabled()`.
+- **Realistic counter trigger** (`jit/src/x64.rs` `emit_osr_exit_after_trigger`,
+  gate `CRATONVM_OSR_EXIT_AFTER=N`): bails on the N-th reach of the loop header so
+  the JIT advances ~N iterations (and commits their side effects) before the exit —
+  vs the unconditional-at-header `CRATONVM_OSR_EXIT_TEST` trigger that bails at
+  iteration 0 (where reject and transfer coincide). Per-site leaked `Box<i64>`
+  counter; RAX/RCX saved/restored via PUSH/POP (POP preserves EFLAGS, so the CMP
+  result survives to the JL), RSP balanced before either exit ⇒ transparent to the
+  JIT's machine state at the loop-header BB boundary.
+
+**Live-validated** (`OsrXfer.loop(int)`: int counted loop with a per-iteration
+static side effect `sink += 1`, n=200000) — `CRATONVM_DEOPT_REAL=1
+CRATONVM_OSR_EXIT_AFTER=1000`: (A) `CRATONVM_OSR_EXIT_TRANSFER=1` → `sink=200000`
+== HotSpot (10 transfers, reconstructed `locals=[200000, 1997001, 1999]` proving
+genuinely advanced state); (B) transfer OFF (reject) → `sink=200999` (the ~999
+committed-then-re-run iterations the transfer eliminates); n=50000 also ==HotSpot.
+Gate-off bt18 = 68332206 byte-identical. 825 jit + 6 new vm-lib transfer tests
+green. NOT default-on: still coupled to OSR-frame shadow-stack tracking
+(`CRATONVM_SHADOW_OSR_TRACK`, default OFF, regresses bt18) for a production flip —
+best co-scheduled with the moving-GC work; the mechanism + realistic trigger are
+proven under the gate.
+
+**Remaining: Step 9** (epoch-invalidation consumer for `compilation_epoch` vs
+stale baked boxes) is unstarted.
 
 ---
 

@@ -6296,6 +6296,14 @@ struct Compiler {
     /// "instrument a rare branch" trigger from the handoff — proves the mechanism
     /// pending a real speculation/counter trigger.
     osr_exit_test_trigger_bci: Option<usize>,
+    /// deopt-osr Step 8 follow-up (P4): when `Some(N)`, the trigger at
+    /// `osr_exit_test_trigger_bci` is COUNTER-GATED — it bails only on the `N`-th
+    /// reach of the loop header, so the JIT advances ~`N` loop iterations (and
+    /// commits their side effects) before the exit, making the reconstructed frame
+    /// carry JIT-advanced state for the interpreter's true OSR-exit transfer. When
+    /// `None`, the trigger is the unconditional-at-header bail (Step 8). Set from
+    /// `osr_exit_after()` at finalize (only under `CRATONVM_DEOPT_REAL`).
+    osr_exit_after_count: Option<usize>,
 }
 
 /// deopt-osr Step 1: map a frame slot's machine location + oop-ness to a
@@ -6704,6 +6712,7 @@ impl Compiler {
             osr_exit_points: Vec::new(),
             osr_exit_box_ptr_by_bci: FxHashMap::default(),
             osr_exit_test_trigger_bci: None,
+            osr_exit_after_count: None,
         }
     }
 
@@ -6853,6 +6862,66 @@ impl Compiler {
                 p.frame_state.stack.len(),
             );
         }
+    }
+
+    /// deopt-osr Step 8 follow-up (P4): emit a COUNTER-GATED OSR-exit trigger at a
+    /// loop header — bail to the OSR-exit deopt stub (reason 7) only on the `n`-th
+    /// reach, so the JIT runs ~`n` loop iterations (advancing the loop-carried
+    /// locals/accumulator AND committing their per-iteration side effects) before
+    /// the exit. The reconstructed frame then carries genuinely JIT-advanced state,
+    /// which the interpreter's `transfer_osr_exit_into_live_frame` writes back into
+    /// the live frame — the difference between a *true* OSR-exit and the
+    /// unconditional-at-header trigger (which bails at iteration 0, where reject and
+    /// transfer coincide).
+    ///
+    /// The counter is a leaked per-site `Box<i64>` (one per compiled
+    /// method-with-a-loop, ONLY under `CRATONVM_OSR_EXIT_AFTER`; never in
+    /// production). The sequence is transparent to the JIT's machine state at this
+    /// loop-header basic-block boundary:
+    ///   * RAX/RCX are saved/restored with PUSH/POP — and POP does NOT modify
+    ///     EFLAGS, so the `CMP` result survives to the `JL`;
+    ///   * RSP is balanced (both pops run) before EITHER exit (`JL over` /
+    ///     fall-through `JMP stub`), so the stub sees the normal frame;
+    ///   * EFLAGS are dead at a branch target (the JIT recomputes loop conditions),
+    ///     so clobbering them here is sound.
+    ///
+    /// ```text
+    ///   push rax                       ; 50
+    ///   push rcx                       ; 51
+    ///   mov  rax, &counter             ; 48 B8 imm64
+    ///   mov  rcx, [rax]                ; 48 8B 08
+    ///   inc  rcx                       ; 48 FF C1
+    ///   mov  [rax], rcx                ; 48 89 08
+    ///   cmp  rcx, n                    ; 48 81 F9 imm32
+    ///   pop  rcx                       ; 59   (flags preserved)
+    ///   pop  rax                       ; 58   (flags preserved)
+    ///   jl   over                      ; 7C 05  (counter < n ⇒ skip the bail)
+    ///   jmp  osr_exit_stub             ; E9 rel32 (patched via deopt_stubs)
+    /// over:
+    /// ```
+    fn emit_osr_exit_after_trigger(&mut self, pc: usize, n: usize) {
+        // Per-site counter, leaked so its address outlives the emitted code (the
+        // baked imm64). Test-only path; the leak is intentional and bounded.
+        let counter: *mut i64 = Box::leak(Box::new(0i64));
+
+        self.buf.emit_byte(0x50); // push rax
+        self.buf.emit_byte(0x51); // push rcx
+                                  // mov rax, &counter (imm64)
+        self.emit_mov_imm64_full(RAX, counter as i64); // Cast: address → imm64
+        self.buf.emit(&[0x48, 0x8B, 0x08]); // mov rcx, [rax]
+        self.buf.emit(&[0x48, 0xFF, 0xC1]); // inc rcx
+        self.buf.emit(&[0x48, 0x89, 0x08]); // mov [rax], rcx
+                                            // cmp rcx, n (imm32)
+        self.buf.emit(&[0x48, 0x81, 0xF9]);
+        self.buf.emit(&(n as i32).to_le_bytes()); // Cast: iteration count → imm32
+        self.buf.emit_byte(0x59); // pop rcx (EFLAGS preserved)
+        self.buf.emit_byte(0x58); // pop rax (EFLAGS preserved)
+        self.buf.emit(&[0x7C, 0x05]); // jl over (skip the 5-byte JMP when counter < n)
+        self.buf.emit_byte(0xE9); // jmp rel32 → OSR-exit stub
+        let patch_off = self.buf.pos();
+        self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
+        self.deopt_stubs.push((patch_off, pc, 7)); // 7 = OSR-exit
+                                                   // `over:` is the next emitted instruction.
     }
 
     /// Build a `DeoptimizationPoint` capturing the interpreter frame at `bci`
@@ -14622,10 +14691,19 @@ impl Compiler {
             // no JMP ⇒ byte-identical. The OSR-exit map at this bci (emitted above)
             // is the box the stub bakes via `osr_exit_box_ptr_by_bci`.
             if self.osr_exit_test_trigger_bci == Some(pc) {
-                self.buf.emit_byte(0xE9); // JMP rel32
-                let patch_off = self.buf.pos();
-                self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
-                self.deopt_stubs.push((patch_off, pc, 7)); // 7 = OSR-exit
+                if let Some(n) = self.osr_exit_after_count {
+                    // P4: counter-gated bail — bail only on the N-th reach, so the
+                    // JIT advances ~N iterations (and commits their side effects)
+                    // before the exit. Carries genuinely JIT-advanced state to the
+                    // interpreter's true OSR-exit transfer.
+                    self.emit_osr_exit_after_trigger(pc, n);
+                } else {
+                    // Step 8: unconditional bail on the first reach (iteration 0).
+                    self.buf.emit_byte(0xE9); // JMP rel32
+                    let patch_off = self.buf.pos();
+                    self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
+                    self.deopt_stubs.push((patch_off, pc, 7)); // 7 = OSR-exit
+                }
             }
 
             // === LICM: Replace hoisted sequences with spill slot loads ===
@@ -22347,12 +22425,24 @@ pub fn compile_with_param_slots(
     // pick the first (lowest-pc) detected loop header as the synthetic OSR-exit
     // branch site. `None` in production (either gate off) ⇒ no trigger emitted ⇒
     // byte-identical code. `detect_loops` returns (header, end) pairs.
-    compiler.osr_exit_test_trigger_bci =
-        if crate::osr_exit_test_enabled() && crate::deopt_real_enabled() {
-            loops.iter().map(|&(h, _)| h).min()
-        } else {
-            None
-        };
+    //
+    // P4 (Step 8 follow-up): `CRATONVM_OSR_EXIT_AFTER=N` also arms the trigger at the
+    // same loop header, but counter-gated (`osr_exit_after_count = Some(N)`) so the
+    // JIT advances ~N iterations before the exit — exercising the true OSR-exit
+    // transfer with genuinely advanced state. Either gate (both require DEOPT_REAL)
+    // selects the bci; AFTER takes precedence over TEST for the emitted form.
+    compiler.osr_exit_after_count = if crate::deopt_real_enabled() {
+        crate::osr_exit_after()
+    } else {
+        None
+    };
+    compiler.osr_exit_test_trigger_bci = if crate::deopt_real_enabled()
+        && (crate::osr_exit_test_enabled() || compiler.osr_exit_after_count.is_some())
+    {
+        loops.iter().map(|&(h, _)| h).min()
+    } else {
+        None
+    };
     if std::env::var_os("CRATONVM_DBG_JIT_GEN").is_some() {
         eprintln!(
             "[JIT_GEN_INSTALL] mic_slots count={} pcs={:?}",
