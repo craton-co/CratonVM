@@ -19,7 +19,9 @@
 //! corpus is exactly where the two backends genuinely differ.
 
 use cratonvm_jit::{try_compile, CachedBytecodeMethod, CompiledMethod, JitRuntimeHelpers};
-use cratonvm_types::{ClassId, FIELD_CELL_PAYLOAD32_OFFSET, HEADER_SIZE, SLOT_SIZE};
+use cratonvm_types::{
+    ClassId, ARRAY_LENGTH_OFFSET, FIELD_CELL_PAYLOAD32_OFFSET, HEADER_SIZE, SLOT_SIZE,
+};
 use std::sync::Arc;
 
 /// Dummy runtime helpers — the corpus is pure arithmetic / branches / counted
@@ -2401,6 +2403,134 @@ fn ir_fp_method_with_int_div() {
             (vec![100, 7], 214), // x=200.0, q=14 → 214
         ],
     );
+}
+
+// ── FP array element access (faload/daload/fastore/dastore) — Slice B ───────
+//
+// The IR lowers an FP array access inline: array→RAX, index→RCX, the JVMS null
+// + bounds deopt guards, then a `MOVSS`/`MOVSD` at `[RAX + RCX*elem_size +
+// HEADER_SIZE]`. Single-pass compiles the same opcodes inline, so the
+// non-faulting path is a true IR==single-pass==host differential (a synthetic
+// array buffer is passed as the receiver, mirroring the getfield harness). The
+// fault paths (null array / OOB index) deopt → the interpreter re-throws the
+// exact NPE/AIOOBE; that parity is validated E2E vs HotSpot.
+
+/// Build a synthetic `float[]` buffer: `length` at `ARRAY_LENGTH_OFFSET`, the
+/// elements (4 bytes each) packed from `HEADER_SIZE`.
+fn make_f32_array(elems: &[f32]) -> Vec<u8> {
+    let mut buf = vec![0u8; HEADER_SIZE + elems.len() * 4];
+    buf[ARRAY_LENGTH_OFFSET..ARRAY_LENGTH_OFFSET + 4]
+        .copy_from_slice(&(elems.len() as u32).to_le_bytes());
+    for (i, &v) in elems.iter().enumerate() {
+        let off = HEADER_SIZE + i * 4;
+        buf[off..off + 4].copy_from_slice(&v.to_bits().to_le_bytes());
+    }
+    buf
+}
+
+/// Build a synthetic `double[]` buffer (8 bytes per element).
+fn make_f64_array(elems: &[f64]) -> Vec<u8> {
+    let mut buf = vec![0u8; HEADER_SIZE + elems.len() * 8];
+    buf[ARRAY_LENGTH_OFFSET..ARRAY_LENGTH_OFFSET + 4]
+        .copy_from_slice(&(elems.len() as u32).to_le_bytes());
+    for (i, &v) in elems.iter().enumerate() {
+        let off = HEADER_SIZE + i * 8;
+        buf[off..off + 8].copy_from_slice(&v.to_bits().to_le_bytes());
+    }
+    buf
+}
+
+#[test]
+fn ir_fp_faload() {
+    // static float fget(float[] a, int i) { return a[i]; }
+    //   aload_0; iload_1; faload; freturn
+    let helpers = dummy_helpers();
+    let cm = cached("fget", "([FI)F", vec![0x2a, 0x1b, 0x30, 0xae], 2, 2);
+    let ir = compile_fp_opt(&cm, &helpers, true).expect("fget IR (FP)");
+    let sp = compile_fp_opt(&cm, &helpers, false).expect("fget single-pass");
+    let elems = [1.5f32, -2.25, 0.0, 1234.5, f32::INFINITY];
+    let arr = make_f32_array(&elems);
+    for (i, &want) in elems.iter().enumerate() {
+        let args = [arr.as_ptr() as i64, i as i64];
+        // SAFETY: both bodies are JIT-compiled faload; `arr` is a live, correctly
+        // laid-out float[] whose address is arg0, the index in-bounds.
+        let r_sp = f32::from_bits(unsafe { sp.try_call(&args) }.unwrap() as u32);
+        let r_ir = f32::from_bits(unsafe { ir.try_call(&args) }.unwrap() as u32);
+        assert_eq!(r_ir.to_bits(), r_sp.to_bits(), "faload IR vs sp at {i}");
+        assert_eq!(r_ir.to_bits(), want.to_bits(), "faload vs host at {i}");
+    }
+}
+
+#[test]
+fn ir_fp_daload() {
+    // static double dget(double[] a, int i) { return a[i]; }
+    //   aload_0; iload_1; daload; dreturn
+    let helpers = dummy_helpers();
+    let cm = cached("dget", "([DI)D", vec![0x2a, 0x1b, 0x31, 0xaf], 2, 2);
+    let ir = compile_fp_opt(&cm, &helpers, true).expect("dget IR (FP)");
+    let sp = compile_fp_opt(&cm, &helpers, false).expect("dget single-pass");
+    let elems = [1.5f64, -2.25, 0.0, 1e300, f64::NEG_INFINITY];
+    let arr = make_f64_array(&elems);
+    for (i, &want) in elems.iter().enumerate() {
+        let args = [arr.as_ptr() as i64, i as i64];
+        let r_sp = f64::from_bits(unsafe { sp.try_call(&args) }.unwrap() as u64);
+        let r_ir = f64::from_bits(unsafe { ir.try_call(&args) }.unwrap() as u64);
+        assert_eq!(r_ir.to_bits(), r_sp.to_bits(), "daload IR vs sp at {i}");
+        assert_eq!(r_ir.to_bits(), want.to_bits(), "daload vs host at {i}");
+    }
+}
+
+#[test]
+fn ir_fp_fastore() {
+    // static void fset(float[] a, int i, float v) { a[i] = v; }
+    //   aload_0; iload_1; fload_2; fastore; return
+    let helpers = dummy_helpers();
+    let cm = cached("fset", "([FIF)V", vec![0x2a, 0x1b, 0x24, 0x51, 0xb1], 3, 3);
+    let ir = compile_fp_opt(&cm, &helpers, true).expect("fset IR (FP)");
+    let sp = compile_fp_opt(&cm, &helpers, false).expect("fset single-pass");
+    for (i, v) in [(0usize, 9.5f32), (2, -1.25), (4, 1e30)] {
+        // Each backend writes its OWN fresh array; the element must agree.
+        let read_back = |m: &CompiledMethod| -> u32 {
+            let mut arr = make_f32_array(&[0.0; 5]);
+            let args = [arr.as_mut_ptr() as i64, i as i64, v.to_bits() as i64];
+            // SAFETY: JIT-compiled fastore; live float[] arg0, in-bounds index,
+            // float value passed as bits (compact GPR FP ABI). No helper reached.
+            unsafe { m.try_call(&args) }.unwrap();
+            let off = HEADER_SIZE + i * 4;
+            u32::from_le_bytes([arr[off], arr[off + 1], arr[off + 2], arr[off + 3]])
+        };
+        let got_sp = read_back(&sp);
+        let got_ir = read_back(&ir);
+        assert_eq!(got_ir, got_sp, "fastore IR vs sp at {i}");
+        assert_eq!(got_ir, v.to_bits(), "fastore vs host at {i}");
+    }
+}
+
+#[test]
+fn ir_fp_dastore() {
+    // static void dset(double[] a, int i, double v) { a[i] = v; }
+    //   aload_0; iload_1; dload_2; dastore; return  (double v is cat-2 → slots 2-3;
+    //   dload_2 == 0x28, NOT dload_0/0x26)
+    let helpers = dummy_helpers();
+    let cm = cached("dset", "([DID)V", vec![0x2a, 0x1b, 0x28, 0x52, 0xb1], 4, 3);
+    let ir = compile_fp_opt(&cm, &helpers, true).expect("dset IR (FP)");
+    let sp = compile_fp_opt(&cm, &helpers, false).expect("dset single-pass");
+    for (i, v) in [(0usize, 9.5f64), (2, -1.25), (4, 1e300)] {
+        let read_back = |m: &CompiledMethod| -> u64 {
+            let mut arr = make_f64_array(&[0.0; 5]);
+            let args = [arr.as_mut_ptr() as i64, i as i64, v.to_bits() as i64];
+            unsafe { m.try_call(&args) }.unwrap();
+            let off = HEADER_SIZE + i * 8;
+            u64::from_le_bytes([
+                arr[off], arr[off + 1], arr[off + 2], arr[off + 3], arr[off + 4], arr[off + 5],
+                arr[off + 6], arr[off + 7],
+            ])
+        };
+        let got_sp = read_back(&sp);
+        let got_ir = read_back(&ir);
+        assert_eq!(got_ir, got_sp, "dastore IR vs sp at {i}");
+        assert_eq!(got_ir, v.to_bits(), "dastore vs host at {i}");
+    }
 }
 
 // ── FP 3-way compares (fcmpl/fcmpg/dcmpl/dcmpg) — item 3 next slice ──────────

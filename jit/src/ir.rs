@@ -210,6 +210,19 @@ pub enum Op {
     /// Array length.  Inputs: `[ctrl, mem, array_ref]`.
     ArrayLength,
 
+    /// Array ELEMENT load. Inputs: `[ctrl, mem, array, index]`. Unlike
+    /// [`Op::Load`] (a field read at a compile-time offset), the index is a
+    /// runtime value and the lowerer emits the JVMS null + bounds checks
+    /// (deopt-on-fault) before the `[array + HEADER_SIZE + index*elem_size]`
+    /// access. `MemKind` carries the element type (Slice B wires the FP kinds —
+    /// `faload`/`daload`). Impure (may throw NPE/AIOOBE) — DCE-rooted, not GVN'd.
+    ArrayLoad(MemKind),
+
+    /// Array ELEMENT store. Inputs: `[ctrl, mem, array, index, value]`. The
+    /// store analogue of [`Op::ArrayLoad`] (`fastore`/`dastore`); produces a new
+    /// memory token. Impure (NPE/AIOOBE + the write) — DCE-rooted.
+    ArrayStore(MemKind),
+
     // ── Allocation ───────────────────────────────────────────────────
     /// Object allocation.  Inputs: `[ctrl, mem]`.
     New {
@@ -1666,6 +1679,66 @@ impl IrBuilder {
                     pc += 1;
                 }
 
+                // faload / daload — FP array element load (Slice B). The index
+                // is a runtime value, so the lowerer emits the JVMS null +
+                // bounds checks (deopt-on-fault) before the element access. The
+                // load advances the memory token (a later store to a possibly-
+                // aliasing element must be ordered after this read).
+                0x30 => {
+                    let index = self.pop();
+                    let array = self.pop();
+                    let load = self.graph.add(
+                        Op::ArrayLoad(MemKind::Float),
+                        IrType::Float,
+                        vec![self.ctrl, self.mem, array, index],
+                        Some(pc),
+                    );
+                    self.mem = load;
+                    self.push(load);
+                    pc += 1;
+                }
+                0x31 => {
+                    let index = self.pop();
+                    let array = self.pop();
+                    let load = self.graph.add(
+                        Op::ArrayLoad(MemKind::Double),
+                        IrType::Double,
+                        vec![self.ctrl, self.mem, array, index],
+                        Some(pc),
+                    );
+                    self.mem = load;
+                    self.push(load);
+                    pc += 1;
+                }
+                // fastore / dastore — FP array element store (Slice B). Consumes
+                // the memory token and produces a new one, so the scheduler
+                // serialises it against neighbouring memory ops.
+                0x51 => {
+                    let value = self.pop();
+                    let index = self.pop();
+                    let array = self.pop();
+                    let store = self.graph.add(
+                        Op::ArrayStore(MemKind::Float),
+                        IrType::Memory,
+                        vec![self.ctrl, self.mem, array, index, value],
+                        Some(pc),
+                    );
+                    self.mem = store;
+                    pc += 1;
+                }
+                0x52 => {
+                    let value = self.pop();
+                    let index = self.pop();
+                    let array = self.pop();
+                    let store = self.graph.add(
+                        Op::ArrayStore(MemKind::Double),
+                        IrType::Memory,
+                        vec![self.ctrl, self.mem, array, index, value],
+                        Some(pc),
+                    );
+                    self.mem = store;
+                    pc += 1;
+                }
                 // getfield — read an instance field as an `Op::Load`.
                 //
                 // Slice 1 (read-only) of the field/call IR frontier: only

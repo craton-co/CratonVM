@@ -3890,6 +3890,14 @@ fn ir_op_to_ea_op(op: &ir::Op) -> escape_analysis::Op {
         },
         ir::Op::Call { .. } => EaOp::Call,
         ir::Op::ArrayLength => EaOp::ArrayLength,
+        // Array element access escapes its array reference (conservative): map to
+        // `EaOp::Call`, whose handling marks every reference input `ArgEscape`.
+        // Today the array is always a Param/external ref (the builder bails on
+        // `newarray`, so a `new[]` never reaches here) and so is never a
+        // scalar-replacement candidate, but routing through `Call` (rather than
+        // the no-op `Other`) keeps a hypothetical future `new[]` from being
+        // wrongly scalar-replaced — the IR lowerer has no scalar-array path.
+        ir::Op::ArrayLoad(_) | ir::Op::ArrayStore(_) => EaOp::Call,
         ir::Op::Dead => EaOp::Dead,
         // All other IR ops (Region, Proj, ConstF, conversions, bitwise,
         // Cmp, Div, Rem, Neg, etc.) have no EA-specific behaviour.

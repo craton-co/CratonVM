@@ -8,13 +8,13 @@
 
 use std::collections::HashMap;
 
-use super::ir::{Graph, IrType, NodeId, Op, SafepointSnapshot, NO_NODE};
+use super::ir::{Graph, IrType, MemKind, NodeId, Op, SafepointSnapshot, NO_NODE};
 use super::ir_schedule::Schedule;
 use super::{CompiledMethod, ExecutableBuffer, JitRuntimeHelpers};
 use crate::deopt::{
     ir_deopt_entry, DeoptAction, DeoptReason, DeoptimizationPoint, FrameState, FrameValue,
 };
-use cratonvm_types::{FIELD_CELL_PAYLOAD32_OFFSET, HEADER_SIZE, SLOT_SIZE};
+use cratonvm_types::{ARRAY_LENGTH_OFFSET, FIELD_CELL_PAYLOAD32_OFFSET, HEADER_SIZE, SLOT_SIZE};
 
 // Argument registers for the deopt trampoline's call to `ir_deopt_entry`
 // (`fn(point, rbp)`), per platform ABI.
@@ -1209,6 +1209,52 @@ impl<'a> Lowerer<'a> {
                 self.buf.emit(&0u32.to_le_bytes());
                 // skip:  (10 + 6 + 11 = 27 bytes guarded — matches the JE rel8)
             }
+            // FP array element load (Slice B) — `faload`/`daload`. inputs =
+            // [ctrl, mem, array, index]. Load the array pointer to RAX and the
+            // index to RCX (the layout the SIB access expects), emit the JVMS
+            // null + bounds deopt guards, then `MOVSS`/`MOVSD` the element from
+            // `[RAX + RCX*elem_size + HEADER_SIZE]` into XMM0 and spill it. The
+            // index slot holds a sign-extended int; the 32-bit unsigned bounds
+            // CMP (in the guard) rejects a negative index before the SIB uses
+            // the 64-bit RCX (whose high half is then zero for an in-bounds
+            // index). FP element accesses never alias the int field cells, but
+            // the memory-token edge still serialises them with neighbours.
+            Op::ArrayLoad(kind) => {
+                let slot = self.alloc_slot(id);
+                let is_d = matches!(kind, MemKind::Double);
+                let bci = node.bytecode_pc.unwrap_or(0);
+                self.load_to_rax(self.slot_of(node.inputs[2])); // array → RAX
+                self.load_to_rcx(self.slot_of(node.inputs[3])); // index → RCX
+                self.emit_array_null_bounds_guards(bci);
+                // MOVSS/MOVSD XMM0, [RAX + RCX*{4,8} + HEADER_SIZE]. ModRM 0x44
+                // (mod=01, reg=XMM0, r/m=SIB); SIB 0x88 (*4) / 0xC8 (*8), idx=RCX,
+                // base=RAX; disp8 = HEADER_SIZE.
+                let prefix = if is_d { 0xF2 } else { 0xF3 };
+                let sib = if is_d { 0xC8 } else { 0x88 };
+                self.buf
+                    .emit(&[prefix, 0x0F, 0x10, 0x44, sib, HEADER_SIZE as u8]);
+                self.fp_store(slot, XMM0, is_d);
+            }
+            // FP array element store (Slice B) — `fastore`/`dastore`. inputs =
+            // [ctrl, mem, array, index, value]. Load the value into XMM0 first
+            // (it must survive the guards; the bounds check clobbers only a GPR
+            // scratch), then array→RAX, index→RCX, the null + bounds guards, and
+            // `MOVSS`/`MOVSD` XMM0 into the element. Produces a memory token (no
+            // result slot is read), but a slot is allocated for layout uniformity.
+            Op::ArrayStore(kind) => {
+                let _slot = self.alloc_slot(id);
+                let is_d = matches!(kind, MemKind::Double);
+                let bci = node.bytecode_pc.unwrap_or(0);
+                self.fp_load(XMM0, self.slot_of(node.inputs[4]), is_d); // value → XMM0
+                self.load_to_rax(self.slot_of(node.inputs[2])); // array → RAX
+                self.load_to_rcx(self.slot_of(node.inputs[3])); // index → RCX
+                self.emit_array_null_bounds_guards(bci);
+                // MOVSS/MOVSD [RAX + RCX*{4,8} + HEADER_SIZE], XMM0 (opcode 0x11).
+                let prefix = if is_d { 0xF2 } else { 0xF3 };
+                let sib = if is_d { 0xC8 } else { 0x88 };
+                self.buf
+                    .emit(&[prefix, 0x0F, 0x11, 0x44, sib, HEADER_SIZE as u8]);
+            }
             // invokestatic — dispatch via the `jit_invoke_dispatch` helper
             // (Gap B). inputs = [ctrl, mem, arg0, arg1, …]. The IR builder emits
             // this only for an oop-free method, so no object reference is ever
@@ -1692,6 +1738,18 @@ impl<'a> Lowerer<'a> {
     /// divisor — but the `mov` only executes on the deopt branch (after the
     /// `JNZ`), so the fall-through path keeps RCX intact for the `IDIV`.
     fn emit_deopt_if_zero(&mut self, bci: usize, reason: DeoptReason) {
+        // Continue (skip deopt) when the tested value is NON-zero — `JNZ` (the
+        // near-Jcc second byte 0x85). Deopt when zero (ZF=1, JNZ not taken).
+        self.emit_deopt_unless(0x85, bci, reason);
+    }
+
+    /// Emit a guard that deopts at `bci` UNLESS the just-set flags satisfy
+    /// `jcc_continue` (the near-`Jcc` second byte, e.g. `0x85`=JNZ, `0x82`=JB).
+    /// The "continue" condition falls through to the following code; otherwise
+    /// control jumps to the shared deopt stub with this point's pointer in
+    /// `DEOPT_ARG0`. Generalises `emit_deopt_if_zero` so a bounds check can
+    /// continue on `JB` (unsigned index < length) and deopt otherwise.
+    fn emit_deopt_unless(&mut self, jcc_continue: u8, bci: usize, reason: DeoptReason) {
         let frame_state = self.resolve_frame_state_for_bci(bci);
         let point = Box::new(DeoptimizationPoint {
             native_offset: self.buf.pos() as u32,
@@ -1703,9 +1761,9 @@ impl<'a> Lowerer<'a> {
         });
         let point_ptr = point.as_ref() as *const DeoptimizationPoint as u64;
         self.deopt_boxes.push(point);
-        // JNZ continue (value != 0 → skip deopt).
-        self.buf.emit(&[0x0F, 0x85]);
-        let jnz_patch = self.buf.pos();
+        // J<continue> continue (condition holds → skip deopt).
+        self.buf.emit(&[0x0F, jcc_continue]);
+        let jcc_patch = self.buf.pos();
         self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
         // Deopt path: load the point pointer into arg0, JMP to the shared stub.
         self.emit_mov_reg_imm64(DEOPT_ARG0, point_ptr);
@@ -1715,10 +1773,33 @@ impl<'a> Lowerer<'a> {
         self.deopt_stub_patches.push(jmp_patch);
         // continue:
         let cont = self.buf.pos();
-        let rel = cont as i32 - (jnz_patch as i32 + 4);
+        let rel = cont as i32 - (jcc_patch as i32 + 4);
         self.buf
-            .try_patch_i32(jnz_patch, rel)
-            .expect("deopt-if-zero JNZ patch in-bounds");
+            .try_patch_i32(jcc_patch, rel)
+            .expect("deopt-unless Jcc patch in-bounds");
+    }
+
+    /// IR FP tier (Slice B) — emit the JVMS null + bounds deopt guards for an
+    /// array element access, with the array pointer in RAX and the index in RCX
+    /// (the layout the `MOVSS`/`MOVSD` SIB access below expects). On a null
+    /// array or an out-of-bounds index, deopt at `bci`: the interpreter
+    /// re-executes the array opcode and throws the exact NPE / AIOOBE with full
+    /// semantics (including any in-method handler). Mirrors the single-pass
+    /// inline checks, but routes the fault through the deopt path (which, with
+    /// FP-slot resume — Slice C — reconstructs any live FP value precisely).
+    /// Uses R10 as scratch for the length (the IR lowering never homes a value
+    /// there). A non-faulting access continues with RAX/RCX unchanged.
+    fn emit_array_null_bounds_guards(&mut self, bci: usize) {
+        // Null check: TEST RAX,RAX → ZF=1 iff array == null. Continue on JNZ.
+        self.buf.emit(&[0x48, 0x85, 0xC0]); // TEST RAX, RAX
+        self.emit_deopt_if_zero(bci, DeoptReason::NullCheck);
+        // Bounds check: MOV R10D, [RAX + ARRAY_LENGTH_OFFSET] (zero-extends to
+        // R10), then CMP ECX, R10D. An UNSIGNED `index < length` (JB, CF=1)
+        // continues; otherwise (index >= length, OR a negative index whose
+        // unsigned value is huge) deopt → AIOOBE.
+        self.buf.emit(&[0x44, 0x8B, 0x50, ARRAY_LENGTH_OFFSET as u8]); // MOV R10D,[RAX+12]
+        self.buf.emit(&[0x44, 0x39, 0xD1]); // CMP ECX, R10D
+        self.emit_deopt_unless(0x82, bci, DeoptReason::BoundsCheck); // JB continue
     }
 
     /// Emit the single shared deopt stub (if any guard jumps to it) and patch
@@ -2461,3 +2542,6 @@ mod tests {
         assert_eq!(frame.locals[2], FrameValue::Long(0));
     }
 }
+
+
+
