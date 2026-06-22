@@ -58,6 +58,10 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     // reflects only THIS collection's stack (republished by the JIT-frame scan
     // below, under G1). See that scan site and `G1Collector::young_collection`.
     cratonvm_gc::gc_quiescence::clear_pinned_jit_roots();
+    // A5 fix: reset the unregistered-JIT-frame flag; `scan_active_jit_frames`
+    // below re-sets it iff it finds a guard-less JIT frame on the native stack,
+    // and the generational collector consults it to pick the non-moving sweep.
+    cratonvm_gc::gc_quiescence::clear_unregistered_jit_frame_on_stack();
 
     // 1. Thread frames — scan locals and operand stacks (SoA layout).
     //

@@ -10,7 +10,8 @@
 use std::fmt;
 use std::sync::Arc;
 
-use cratonvm_reader::class_access_flags::ClassAccessFlags;
+use cratonvm_reader::class_access_flags::{ClassAccessFlags, FieldAccessFlags};
+use cratonvm_types::CompactLayout;
 use cratonvm_reader::class_file_version::ClassFileVersion;
 use cratonvm_reader::constant_pool::ConstantPool;
 use cratonvm_reader::field::ClassFileField;
@@ -788,7 +789,90 @@ impl ClassStore {
         );
         let id = class.id;
         self.classes.push(class);
+        // Compact reference-field layout: register this class's oop-map / offset
+        // table so the heap + GC can place and scan its reference fields as
+        // 8-byte pointers. No-op unless `CRATONVM_COMPACT_REF_FIELDS` is set.
+        self.register_compact_layout_if_enabled(id);
         id
+    }
+
+    /// Build and register the compact field layout for class `id`, if the
+    /// compact reference-field layout is enabled. Idempotent (overwrites on
+    /// redefine / subclass-layout recompute). Safe no-op when the flag is off.
+    pub fn register_compact_layout_if_enabled(&self, id: ClassId) {
+        if !cratonvm_types::compact_ref_fields_enabled() {
+            return;
+        }
+        if let Some(layout) = self.build_compact_layout(id) {
+            cratonvm_types::register_class_layout(id.as_u32(), Arc::new(layout));
+        }
+    }
+
+    /// Build the per-class compact instance-field layout: a prefix-sum offset
+    /// table (reference field = 8 bytes, primitive field = 16-byte tagged cell),
+    /// in declaration order with superclasses first, plus the reference-field
+    /// oop-map for the GC.
+    ///
+    /// Handles synthetic-stub **padding**: a class's `num_total_fields` may
+    /// exceed its declared instance fields (native `<init>` writes to synthetic
+    /// indices). Each ancestor contributes its declared fields followed by any
+    /// padding up to *its own* `num_total_fields`, so absolute indices line up
+    /// even when an ancestor is padded. Padded / unknown-descriptor slots are
+    /// treated as references (8-byte), matching the heap default-init rule
+    /// (`Value::Object(None)` for uncovered slots).
+    fn build_compact_layout(&self, id: ClassId) -> Option<CompactLayout> {
+        // Superclass chain, root (java/lang/Object) first.
+        let mut chain: Vec<ClassId> = Vec::new();
+        let mut cur = Some(id);
+        while let Some(cid) = cur {
+            chain.push(cid);
+            cur = self.get(cid)?.superclass;
+        }
+        chain.reverse();
+
+        let total = self.get(id)?.num_total_fields;
+        let mut field_offsets: Vec<u32> = Vec::with_capacity(total);
+        let mut is_ref: Vec<bool> = Vec::with_capacity(total);
+        let mut ref_offsets: Vec<u32> = Vec::new();
+        let mut off: u32 = 0;
+        let mut count: usize = 0;
+
+        let mut push = |r: bool, off: &mut u32| {
+            field_offsets.push(*off);
+            is_ref.push(r);
+            if r {
+                ref_offsets.push(*off);
+                *off += cratonvm_types::REF_FIELD_SIZE as u32;
+            } else {
+                *off += cratonvm_types::SLOT_SIZE as u32;
+            }
+        };
+
+        for cid in chain {
+            let class = self.get(cid)?;
+            for f in &class.fields {
+                if f.access_flags.contains(FieldAccessFlags::STATIC) {
+                    continue;
+                }
+                let b = f.descriptor.as_bytes().first().copied().unwrap_or(0);
+                let r = b == b'L' || b == b'[';
+                push(r, &mut off);
+                count += 1;
+            }
+            // Pad up to this ancestor's own total so absolute indices stay aligned.
+            let target = class.num_total_fields;
+            while count < target {
+                push(true, &mut off); // padded slot -> reference (8-byte null)
+                count += 1;
+            }
+        }
+
+        Some(CompactLayout {
+            field_offsets,
+            is_ref,
+            ref_offsets,
+            body_size: off,
+        })
     }
 
     /// Look up a class by id.

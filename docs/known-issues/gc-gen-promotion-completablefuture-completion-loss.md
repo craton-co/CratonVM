@@ -122,4 +122,4 @@ cratonvm.exe -XX:+UseG1GC --Xmx 2g -cp <dir> CFProbe2   # → ALL 30 OK
 - The VarHandle static-field init fix (dev `b223fd21`) that first unblocked the whole
   Hibernate SessionFactory build, exposing this next blocker.
 - Other moving-GC root/edge issues: [gc-moving-interpreter-lost-tag-missed-root.md](gc-moving-interpreter-lost-tag-missed-root.md),
-  [gc-stress-bintrees-object-main-args-jit-frame-stale-root.md](gc-stress-bintrees-object-main-args-jit-frame-stale-root.md).
+  [gc-stress-bintrees-main-args-unregistered-jit-frame-FIXED.md](../internal/app-jvm-bugs/gc-stress-bintrees-main-args-unregistered-jit-frame-FIXED.md) (FIXED).

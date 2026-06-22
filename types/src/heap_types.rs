@@ -81,6 +81,15 @@ pub const SLOT_SIZE: usize = 16;
 /// 16-byte Value enums. This halves memory usage for reference arrays.
 pub const REF_ELEMENT_SIZE: usize = 8;
 
+/// Size of a compact reference *instance field* in bytes (raw pointer, 0 = null).
+///
+/// Under the compact reference-field layout (`CRATONVM_COMPACT_REF_FIELDS`), a
+/// reference instance field is stored as a bare 8-byte pointer instead of the
+/// 16-byte tagged [`crate::Value`] cell — the same encoding reference array
+/// elements already use. Primitive fields keep their 16-byte [`SLOT_SIZE`] cell.
+/// See `docs/feature-designs/compact-ref-field-layout.md`.
+pub const REF_FIELD_SIZE: usize = 8;
+
 // --- Instance-field cell (`Value` enum) inline-access layout ---------------
 //
 // Java instance fields are stored on the heap as the full 16-byte `crate::Value`
@@ -311,6 +320,17 @@ pub const GC_FLAG_OLD_GEN: u8 = 0x01;
 
 /// GC flag: object is marked as live during major GC mark phase.
 pub const GC_FLAG_MARKED: u8 = 0x02;
+
+/// GC flag: object uses the **compact reference-field layout** — reference
+/// instance fields are stored as bare 8-byte pointers (per the registered
+/// [`crate::field_layout::CompactLayout`] for its class) and the object's body
+/// size in bytes is recorded in the `array_length` header field. Set at
+/// allocation time and never cleared (a permanent property of the object).
+///
+/// Decided per-object so AUTOBOX wrappers, ad-hoc `ClassId(0)` containers, and
+/// objects allocated before a synthetic-stub class grew all stay on the legacy
+/// uniform 16-byte-cell layout (no flag) within the same process.
+pub const GC_FLAG_COMPACT: u8 = 0x04;
 
 impl ObjectHeader {
     /// Construct a fresh, unlocked object header. The mark word is initialized

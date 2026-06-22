@@ -2569,6 +2569,15 @@ fn run() -> Result<()> {
         }
     }
 
+    // §5 acceptance metric — aggregate G1 pause summary (p50/p99/max young +
+    // mixed) to stderr at shutdown when GC stats are requested. Driven by
+    // `--verbose:gc` or the `CRATONVM_GC_STATS` env knob so a gauntlet runner
+    // can collect the table without `RUST_LOG`. No-op for the generational
+    // collector and when no G1 collection ran.
+    if args.verbose_gc || std::env::var_os("CRATONVM_GC_STATS").is_some() {
+        vm.shared.heap.print_gc_summary();
+    }
+
     // T19.K1 — wait for non-daemon threads before exiting.
     //
     // Per the JVM specification, the VM keeps running until every

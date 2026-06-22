@@ -1,5 +1,151 @@
 # Wire the Tiered Compilation Manager
 
+> **Increment 5 (Step 5 — precise background OSR) landed.**
+> Builds on increment 4. CratonVM already had fully-working **inline** OSR: every
+> back-edge site does `frame.backward_count += 1; try_osr_with_backoff(…)`, and
+> `try_osr` compiled an OSR-enterable artifact (`x64::compile`, `compiled_via_osr`)
+> and transferred the live interpreter frame into it. The gap this step closes is
+> that the OSR **compile ran on the mutator** (a first-caller stall), the tiered
+> manager's `on_backedge` was never called, and `background_compile_task` ignored
+> `osr_bci`. Increment 5 moves the precise OSR compile **off the mutator**:
+> - **Frame-free compile core.** `try_osr`'s ~620-line compile/publish closure is
+>   extracted verbatim into `compile_osr_artifact(shared, class_id, class_name,
+>   method_name, descriptor, code, max_locals, entry_pc) -> Option<Arc<CompiledMethod>>`
+>   (`interpreter.rs`). Its only former frame dependency (`max_locals`) is now a
+>   param; everything else is method metadata, so it runs with no live frame. The
+>   `entry_pc` only feeds the *reuse* probe (`can_osr_enter`) — the compile is
+>   entry-pc-independent (the artifact supports OSR entry at every loop header it
+>   emits). `try_osr` now extracts metadata from the frame, calls
+>   `compile_osr_artifact`, and does the live-frame entry on the result (unchanged
+>   transfer logic). Validated behavior-preserving (see below).
+> - **Worker honors `osr_bci`.** `background_compile_task`: an OSR task resolves
+>   `(class_id, padded bytecode, max_locals)` from the (loaded) class via
+>   `fetch_osr_compile_inputs` and calls `compile_osr_artifact` off-thread,
+>   publishing a `compiled_via_osr` body into `jit_cache`. Same GC-STW lock
+>   discipline as `try_jit_compile_callee_slow`; `PENDING_COMPACT_FIELD_INFO` is
+>   thread-local so the worker stages its own.
+> - **Back-edge → enqueue, reuse-only entry.** Under `CRATONVM_BG_COMPILE`,
+>   `try_osr_with_backoff` (gated by the cheap per-frame `should_try_osr` schedule)
+>   enqueues an OSR task via the new `TieredCompilationManager::request_osr` (a
+>   sibling of `on_backedge` that enqueues *immediately* and idempotently — the
+>   per-frame schedule is the throttle, avoiding a per-back-edge lock and the
+>   10 000-count threshold), then **keeps interpreting**; it only ENTERS a
+>   worker-published artifact (the existing `osr_reused` reuse path) and never
+>   inline-compiles. `ensure_bg_compiler_started` is factored so the back-edge path
+>   starts the worker even for an all-hot-loop program that never crosses the
+>   invocation threshold.
+> - **Default-OFF safety.** With `CRATONVM_BG_COMPILE` unset, `try_osr_with_backoff`
+>   takes the historical inline-OSR path byte-for-byte (the extraction is the only
+>   change, and it is behavior-preserving). The manager's `on_backedge`/`request_osr`
+>   are never called.
+> - **Tests** (`jit/src/tiered.rs`): `step5_request_osr_enqueues_osr_task_immediately`
+>   (first call enqueues a High-priority `osr_bci` task; idempotent while queued;
+>   counted once) and `step5_request_osr_skips_when_already_c2_or_bailed`. 841
+>   jit-crate tests pass. (Incidentally repaired two `cratonvm-jit` test closures
+>   the compact-ref-field-layout merge left on the old 2-tuple `cp_field_resolver`,
+>   which had broken the whole jit test binary.)
+> - **Runtime validation (`scratch/bgosr/`).** `OsrProbe.compute` (a long int/long
+>   loop invoked once — so it only ever runs via OSR), `binarytrees 16`
+>   (recursion + allocation), and `OsrShapes` (arrays, branchy, nested loops + a
+>   callee) all produce **identical** results on HotSpot and CratonVM across
+>   `CRATONVM_BG_COMPILE` off/on × `CRATONVM_JIT_C2_FIRST_CALL` off/on
+>   (`compute`@10M = `1550058760673472`; bt16 = `14985902`; `OsrShapes` =
+>   `-784340278423176288`). The **off-thread** path is proven non-vacuously: under
+>   `CRATONVM_BG_COMPILE=1 CRATONVM_JIT_C2_FIRST_CALL=1 CRATONVM_DBG_JITC=1` the
+>   worker logs `bg-compile …compute… osr_bci=4` + `OSR-compile …entry=0x…` while
+>   the mutator logs `OSR-reuse …entry=0x…` at the **same** entry address — the
+>   compile ran on the worker and the interpreter entered its artifact (the mutator
+>   never logs `OSR-compile` under the gate). `OsrShapes` shows off-thread OSR for
+>   `arraySum`/`branchy`/`nestedCalls` independently.
+> - **Why `C2_FIRST_CALL`.** As in increment 4, the eager first-call single-pass
+>   compile (`fn execute`) compiles a method on call #1, so a once-invoked method
+>   would run fully compiled and never reach an interpreter back-edge. With
+>   `CRATONVM_JIT_C2_FIRST_CALL=1` the method stays interpreted until hot, so its
+>   loop OSRs — which is how the off-thread path is exercised. Correctness holds in
+>   every combination regardless.
+> - **Boundaries / not in this step.** (1) The compile is off-thread; the live-frame
+>   **entry** stays on the mutator (it must — the frame is the mutator's). (2)
+>   Threshold tuning of "hot enough" + `CRATONVM_TIER_*` overrides is Step 6. (3)
+>   The per-frame `should_try_osr` exponential backoff still gates entry attempts;
+>   a worker artifact is entered on the next firing after it publishes. (4) IR-path
+>   OSR (vs the single-pass `x64::compile` OSR reused here) remains future work.
+>
+> **Increment 4 (Step 4 — profile handoff C1 → C2) landed.**
+> Builds on increment 3. The PGO machinery was fully present but **dormant in
+> production**: `jit::profile::enable_profiling` was only ever called from the
+> profile-crate's own tests, so `is_profiling_enabled()` was always `false`, the
+> interpreter's ~13 `record_branch`/`record_receiver`/`record_backedge` sites all
+> short-circuited, `shared.profile_store` stayed empty, and every compile-time
+> `get_profile` returned `None`. Increment 4 turns the handoff on (gated) and
+> makes the optimizing C2 backend a profile consumer:
+> - **Populate (C1 / warmup phase).** New `CRATONVM_TIER_PGO` gate
+>   (`runtime/env_cache.rs`, `tier_pgo()`). When set, `SharedVm::new`
+>   (`vm/src/vm/vm_init.rs`, post-construction) calls
+>   `jit::profile::enable_profiling(true)` **once at VM init** — it must happen
+>   before any frame runs because the dispatch loop captures
+>   `is_profiling_enabled()` once per frame entry (`interpreter.rs` ~4617), so a
+>   method already warming up would never start recording. With the gate on, the
+>   interpreted (C1/warmup) phase populates `profile_store` (branch bias, receiver
+>   types, loop trips).
+> - **C2 reads it.** The single-pass backend already biased branch layout +
+>   pre-populated virtual-call MICs + loop-unroll from the profile (it serves both
+>   the fast C1 tier and the C2 IR-bail fallback). The gap was the **optimizing IR
+>   pipeline itself, which ignored `profile` entirely.** `ir_lower::lower` gained a
+>   sibling `lower_with_branch_hints(…, &HashMap<usize,bool>)`; the `Lowerer` now
+>   carries the per-bytecode-PC branch bias and, in the `Op::If` terminator, picks
+>   the conditional polarity from it. `cmp != 0` ⟺ the JVM branch is TAKEN
+>   (`successors[0]` = taken edge), so the historical layout (`JE around_true`,
+>   true edge as fall-through) already favours the taken edge; a branch the profile
+>   marks **usually-not-taken** inverts to `JNE` so the not-taken edge becomes the
+>   fall-through. `lib.rs` builds `ir_branch_hints` from `profile` exactly as the
+>   single-pass path builds its `branch_hints`, keyed by the branch instruction's
+>   bytecode PC (matching `Op::If::bytecode_pc` and the interpreter's
+>   `record_branch` PC). The two layouts are semantically identical — only the
+>   predicted/fall-through edge and block order differ; phi copies stay attached to
+>   their own edge in both.
+> - **Default-OFF safety.** With the gate unset (default), `enable_profiling` is
+>   never called, every `record_*` short-circuits, `get_profile` returns `None`,
+>   `ir_branch_hints` is empty, and the `Op::If` arm reproduces its historical
+>   bytes byte-for-byte. So the default path — interpreter hot loop and all codegen
+>   (single-pass and IR) — is unchanged until the gate is opted in.
+> - **Tests** (`jit/src/ir_lower.rs`): `step4_ir_lower_consumes_branch_bias_hint`
+>   (a usually-not-taken hint flips the emitted conditional `JE 0F84` → `JNE 0F85`
+>   and changes the buffer; a usually-taken hint reproduces the default
+>   byte-for-byte) and `step4_ir_lower_branch_bias_keyed_by_pc` (a hint for an
+>   unrelated PC does not perturb codegen). 839 jit-crate tests pass.
+> - **Runtime smoke (`scratch/tierpgo/TierPgoProbe.java`).** Two pure-int,
+>   `ir_compatible` methods invoked 3M times each with `x >= 0`: `gate(int)`
+>   (`if (x >= 0) … else …`, which `javac` emits as `iflt else` — a branch taken
+>   only when `x < 0`, i.e. **usually NOT taken**, with a phi merge) and
+>   `classify(int)` (`if (x < 0) …`, emitted as `ifge` — **usually taken**). Result
+>   (`196560529536`) is **identical** on HotSpot, CratonVM default (PGO off), and
+>   `CRATONVM_TIER_PGO=1`, with and without `CRATONVM_JIT_C2_FIRST_CALL=1`. With
+>   `CRATONVM_JIT_C2_FIRST_CALL=1 CRATONVM_DBG_JIT_DISASM=gate` the C2 (IR) body of
+>   `gate` shows `test eax,eax; je …` with profiling off and the inverted
+>   `test eax,eax; jne …` (with the two edge `JMP`s swapped) under
+>   `CRATONVM_TIER_PGO=1` — proving the profile is collected by the interpreter and
+>   consumed by the IR lowerer end-to-end (not a vacuous == HotSpot probe).
+>   `classify` correctly stays `je` (usually-taken ⇒ no inversion), confirming the
+>   bias is directional, not a blanket flip.
+> - **Boundaries / not in this step.** (1) The IR path consumes **branch bias**;
+>   receiver-MIC pre-population stays single-pass-only (the IR virtual-call path
+>   dispatches via the generic helper with no inline cache — IR-level MICs are
+>   future work). (2) `on_backedge` / OSR remains Step 5 (still no VM call site).
+>   (3) Loop-unroll-from-profile stays single-pass; the IR path has its own
+>   LICM/unroll. (4) PGO is inherently a *post-warmup* optimization: a method must
+>   be interpreted long enough to accumulate samples, then compiled via
+>   `try_compile`. The **eager first-call single-pass compile** in `fn execute`
+>   (`interpreter.rs` ~3738, `x64::compile` direct, empty hints) compiles most
+>   methods on call #1 — before any profile exists — and that cached body preempts
+>   the optimizing IR pipeline on every later path (the pre-existing increment-3
+>   boundary 1 + the `c2_first_call` note). So the live C2 branch-bias is reached
+>   through the invocation-counted `try_compile` upgrade / callee / OSR paths;
+>   `CRATONVM_JIT_C2_FIRST_CALL=1` routes the first-call compile through that same
+>   `try_compile(optimize=true)` path and is what the disasm smoke above uses.
+>   Making the default tiering reliably reach a profiled C2 compile is Steps 6–7
+>   (threshold tuning + retiring the eager fixed-threshold path) and C1→C2
+>   supersede (boundary 1).
+>
 > **Increment 3 (Step 3 — real per-call C1/C2 backend routing) landed.**
 > Builds on increment 2. The C1/C2 split is no longer advisory: the target tier
 > now selects the actual backend per compile.
@@ -248,10 +394,22 @@ tier instead of by the current ad-hoc gates.
    recommended tier is already honored (increment 1). Remaining nuance — the
    single-pass backend keeps its own internal escape analysis, and there is no
    C1→C2 supersede yet — is recorded in the increment-3 header above.
-4. **Profile handoff C1 → C2.** Have C1 populate the profile structures; have C2
-   read them.
-5. **Wire `on_backedge` + OSR.** Add back-edge counting and the OSR entry
-   (approximate first, precise once deopt/OSR state maps exist).
+4. **Profile handoff C1 → C2.** ✅ **Done (increment 4).** Gated `CRATONVM_TIER_PGO`
+   enables interpreter profile recording at VM init so the C1/warmup phase
+   populates `profile_store`; the optimizing IR (C2) lowerer now consumes the
+   branch bias (`lower_with_branch_hints`), on top of the single-pass backend's
+   pre-existing branch/MIC/unroll consumption. Default-OFF = byte-identical. See
+   the increment-4 header above for the boundaries (receiver-MIC + loop-unroll in
+   the IR path remain single-pass-only / future work).
+5. **Wire `on_backedge` + OSR.** ✅ **Done (increment 5).** Precise OSR (the
+   existing single-pass `x64::compile` OSR entry — already exact, not the design's
+   "approximate" fallback) now compiles **off the mutator**: `compile_osr_artifact`
+   is the extracted frame-free compile core, the background worker honors
+   `osr_bci`, and under `CRATONVM_BG_COMPILE` the back-edge path enqueues via
+   `TieredCompilationManager::request_osr` and enters only the worker-published
+   artifact (reuse-only). Default-OFF keeps the inline OSR byte-for-byte. The
+   `real-frame-deopt` dependency the design assumed turned out not to gate this —
+   the single-pass OSR works without it. See the increment-5 header above.
 6. **Tune thresholds** on the gauntlet; expose `CRATONVM_TIER_*` overrides.
 7. **Retire** the single fixed-threshold inline path.
 

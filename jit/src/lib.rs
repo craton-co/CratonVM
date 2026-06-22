@@ -4245,7 +4245,7 @@ pub fn jit_bail_shortcircuits() -> u64 {
 pub fn try_compile(
     cached: &CachedBytecodeMethod,
     cp_class_name_resolver: Option<&dyn Fn(u16) -> Option<String>>,
-    cp_field_resolver: Option<&dyn Fn(u16) -> Option<(usize, u8)>>,
+    cp_field_resolver: Option<&dyn Fn(u16) -> Option<(usize, u8, u32, bool)>>,
     cp_static_field_resolver: Option<&dyn Fn(u16) -> Option<(u32, usize, u8, bool)>>,
     cp_invoke_resolver: Option<&dyn Fn(u16) -> Option<(String, String, String)>>,
     callee_compiler: Option<&dyn Fn(&str, &str, &str) -> Option<(usize, bool)>>,
@@ -4490,7 +4490,7 @@ thread_local! {
 fn try_compile_inner(
     cached: &CachedBytecodeMethod,
     cp_class_name_resolver: Option<&dyn Fn(u16) -> Option<String>>,
-    cp_field_resolver: Option<&dyn Fn(u16) -> Option<(usize, u8)>>,
+    cp_field_resolver: Option<&dyn Fn(u16) -> Option<(usize, u8, u32, bool)>>,
     cp_static_field_resolver: Option<&dyn Fn(u16) -> Option<(u32, usize, u8, bool)>>,
     cp_invoke_resolver: Option<&dyn Fn(u16) -> Option<(String, String, String)>>,
     callee_compiler: Option<&dyn Fn(&str, &str, &str) -> Option<(usize, bool)>>,
@@ -4770,8 +4770,10 @@ fn try_compile_inner(
             if let Some(resolver) = cp_field_resolver {
                 let mut fm = std::collections::HashMap::with_capacity(scan.field_ops.len());
                 for &(pc, cp_idx) in &scan.field_ops {
-                    if let Some(fi) = resolver(cp_idx) {
-                        fm.insert(pc, fi);
+                    if let Some((field_index, type_tag, _c_off, _c_ref)) = resolver(cp_idx) {
+                        // The IR builder only needs (field_index, type_tag); it
+                        // bails getfield/putfield to single-pass under compact.
+                        fm.insert(pc, (field_index, type_tag));
                     }
                 }
                 builder.set_field_info(fm);
@@ -5061,12 +5063,37 @@ fn try_compile_inner(
                     .any(|n| matches!(n.op, ir::Op::New { .. } | ir::Op::NewArray { .. }));
                 if !has_live_new {
                     let schedule = ir_schedule::schedule(&graph);
-                    if let Some(mut compiled) = ir_lower::lower(
+                    // wire-tiered-manager Step 4 (PGO handoff C1 → C2): hand the
+                    // optimizing IR (C2) lowerer the profiled branch bias so it can
+                    // pick each `Op::If`'s fall-through edge from the C1/interpreter
+                    // profile — the IR analogue of the single-pass backend's
+                    // `branch_hints` (built identically below). Keyed by the branch
+                    // instruction's bytecode PC (matching `Op::If::bytecode_pc` and
+                    // the interpreter's `record_branch` PC). Empty when there is no
+                    // profile (profiling off, the default) → byte-identical codegen.
+                    let ir_branch_hints: std::collections::HashMap<usize, bool> = profile
+                        .map(|prof| {
+                            prof.branches
+                                .iter()
+                                .filter_map(|(&pc, counts)| {
+                                    if counts.is_usually_taken() {
+                                        Some((pc, true))
+                                    } else if counts.is_usually_not_taken() {
+                                        Some((pc, false))
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    if let Some(mut compiled) = ir_lower::lower_with_branch_hints(
                         &graph,
                         &schedule,
                         num_params,
                         cached.max_locals as usize,
                         helpers,
+                        &ir_branch_hints,
                     ) {
                         // Gap B: attach the leaked `JitInvokeInfo` boxes/strings
                         // so the `info_ptr`s baked into each `Op::Call` stay valid
@@ -5140,11 +5167,19 @@ fn try_compile_inner(
 
     let mut needs_heap = scan.needs_heap;
     let mut field_info = Vec::new();
+    // Compact reference-field layout: per field op, the packed byte offset +
+    // ref-ness (from the resolver, which has the declaring class). Stays empty
+    // when the flag is off → inline emitters use the legacy path.
+    let mut compact_field_info: Vec<(usize, u32, bool)> = Vec::new();
+    let compact_fields = cratonvm_types::compact_ref_fields_enabled();
     if !scan.field_ops.is_empty() {
         let resolver = cp_field_resolver?;
         for &(pc, cp_idx) in &scan.field_ops {
-            let (field_index, type_tag) = resolver(cp_idx)?;
+            let (field_index, type_tag, c_off, c_ref) = resolver(cp_idx)?;
             field_info.push((pc, field_index, type_tag));
+            if compact_fields {
+                compact_field_info.push((pc, c_off, c_ref));
+            }
             if code[pc] == 0xb5 && (type_tag == b'L' || type_tag == b'[') {
                 needs_heap = true;
             }
@@ -5644,6 +5679,7 @@ fn try_compile_inner(
         &param_jvm_slots,
         param_slot_span,
         param_oop_mask,
+        compact_field_info,
         &despec_method_key,
     )?;
 
@@ -6576,9 +6612,11 @@ mod tests {
         // and this test does not execute the generated code).
         let helpers: JitRuntimeHelpers = unsafe { std::mem::zeroed() };
         // Resolve cp index 2 → field index 0, int (`I`).
-        let field_resolver = |cp: u16| -> Option<(usize, u8)> {
+        // (field_index, type_tag, compact_offset, compact_ref) — see the note at
+        // the other field_resolver test closure; compact-ref widened this to 4.
+        let field_resolver = |cp: u16| -> Option<(usize, u8, u32, bool)> {
             if cp == 2 {
-                Some((0, b'I'))
+                Some((0, b'I', 0, false))
             } else {
                 None
             }
@@ -7013,9 +7051,14 @@ mod tests {
                 None
             }
         };
-        let field_resolver = |cp: u16| -> Option<(usize, u8)> {
+        // (field_index, type_tag, compact_offset, compact_ref) — the compact-ref
+        // field-layout merge widened `cp_field_resolver` to 4 fields; a plain
+        // non-compact int field resolves with `(_, _, 0, false)`. (Incidental
+        // fix: this test was left on the old 2-tuple by that merge, which broke
+        // the whole `cratonvm-jit` test binary.)
+        let field_resolver = |cp: u16| -> Option<(usize, u8, u32, bool)> {
             if cp == 3 {
-                Some((0, b'I'))
+                Some((0, b'I', 0, false))
             } else {
                 None
             }

@@ -2447,6 +2447,19 @@ impl SharedVm {
             init_level_waiters: Arc::new((std::sync::Mutex::new(()), std::sync::Condvar::new())),
         };
 
+        // wire-tiered-manager Step 4 (PGO handoff C1 → C2): turn on interpreter
+        // profile recording when the opt-in gate is set. This MUST happen here, at
+        // VM init (before any method frame executes), not lazily at the JIT
+        // threshold — the dispatch loop captures `is_profiling_enabled()` once per
+        // frame entry, so a method already warming up would never record. With the
+        // gate set, the interpreted ("C1"/warmup) phase populates
+        // `profile_store` (branch bias, receiver types, loop trips); the optimizing
+        // C2 compile then consumes it. Default-OFF: `enable_profiling` is never
+        // called, every `record_*` short-circuits, and behaviour is unchanged.
+        if crate::runtime::env_cache::tier_pgo() {
+            crate::jit::profile::enable_profiling(true);
+        }
+
         // Post-construction: pre-initialize critical static fields for core
         // classes when running with real JDK bytecode.  This must happen after
         // the struct is fully built because the helpers need &SharedVm.
@@ -4014,8 +4027,25 @@ impl SharedVm {
         // working. The real-JDK native-override path uses pointer
         // identity via `stream_fd()` in `native-builtins/src/lib.rs`, so
         // it doesn't care what else lives in the object's field slots.
-        self.heap.set_field(out_obj, 0, Value::Int(1));
-        self.heap.set_field(err_obj, 0, Value::Int(2));
+        //
+        // Compact reference-field layout: the real java/io/PrintStream's
+        // field 0 is the reference `out` (inherited FilterOutputStream). Under
+        // the compact layout an `Int` written into a reference slot auto-boxes,
+        // so `out` becomes a non-null wrapper Object — which makes
+        // `route_write_through_out()` think System.out wraps a real stream and
+        // route every write into the dead wrapper (silent empty stdout). The
+        // real-JDK path resolves the fd by pointer identity, not slot 0, so
+        // skip the fd tag whenever slot 0 is a (compact) reference field. In
+        // synthetic-jdk mode (1-field stub, slot 0 is the primitive fd tag) the
+        // store still happens. `class_layout` is only populated when compact is
+        // enabled, so this is a no-op (legacy behaviour) when the flag is off.
+        let slot0_is_ref = cratonvm_gc::class_layout(ps_class_id.as_u32())
+            .and_then(|l| l.field_is_ref(0))
+            .unwrap_or(false);
+        if !slot0_is_ref {
+            self.heap.set_field(out_obj, 0, Value::Int(1));
+            self.heap.set_field(err_obj, 0, Value::Int(2));
+        }
         *out = Some(out_obj);
         *err = Some(err_obj);
         (out_obj, err_obj)

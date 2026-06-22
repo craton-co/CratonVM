@@ -44,6 +44,10 @@ use crate::heap::{
     SLOT_SIZE,
 };
 use crate::old_gen::OldGen;
+// Compact reference-field layout (CRATONVM_COMPACT_REF_FIELDS). Reference
+// instance fields are stored as 8-byte pointers per the per-class oop-map.
+use crate::{class_layout, compact_ref_fields_enabled, is_compact_object, object_body_size};
+use cratonvm_types::GC_FLAG_COMPACT;
 use crate::satb::SatbQueue;
 use cratonvm_types::{ClassId, ObjectRef, Value};
 
@@ -662,9 +666,10 @@ impl GenerationalHeap {
     pub fn alloc_object(&self, class_id: ClassId, num_fields: usize) -> ObjectRef {
         // Checked arithmetic — an overflowed `total_size` would size the
         // allocation incorrectly. Mirrors `try_alloc_object`'s checked path.
-        let total_size = num_fields
-            .checked_mul(SLOT_SIZE)
-            .and_then(|fields_size| HEADER_SIZE.checked_add(fields_size))
+        // `plan_object_alloc` also picks the compact reference-field layout when
+        // enabled (smaller `total_size`, `array_length` = body bytes,
+        // `GC_FLAG_COMPACT`).
+        let (total_size, array_len, compact_flag) = plan_object_alloc(class_id, num_fields)
             .unwrap_or_else(|| {
                 eprintln!(
                     "FATAL: object size overflow in gen_heap alloc_object \
@@ -700,20 +705,21 @@ impl GenerationalHeap {
             }
         };
 
-        let header = ObjectHeader::new(
+        let mut header = ObjectHeader::new(
             class_id,
             ObjectKind::Object,
             ArrayElementType::Reference,
             self.next_hash(),
-            0,
+            array_len,
             num_slots_u32,
         );
+        header.gc_flags |= compact_flag;
 
         // SAFETY: `ptr` was just bump-allocated from the young arena with sufficient
-        // size (`HEADER_SIZE + num_fields * SLOT_SIZE`) and 8-byte alignment, so
-        // writing an `ObjectHeader` at its start is valid. The pointer is non-null
-        // and exclusively owned by this allocation; wrapping it in `ObjectRef` is
-        // sound because the header has been fully initialized.
+        // size (`total_size`) and 8-byte alignment, so writing an `ObjectHeader` at
+        // its start is valid. The pointer is non-null and exclusively owned by this
+        // allocation; wrapping it in `ObjectRef` is sound because the header has been
+        // fully initialized.
         unsafe {
             std::ptr::write(ptr as *mut ObjectHeader, header);
             ObjectRef::from_raw(ptr)
@@ -729,7 +735,7 @@ impl GenerationalHeap {
     /// so it is safe to call from a context holding unrooted local `ObjectRef`s
     /// (the JIT object-alloc helper GC-and-retries before calling this).
     pub fn try_alloc_object_full(&self, class_id: ClassId, num_fields: usize) -> Option<ObjectRef> {
-        let total_size = HEADER_SIZE.checked_add(num_fields.checked_mul(SLOT_SIZE)?)?;
+        let (total_size, array_len, compact_flag) = plan_object_alloc(class_id, num_fields)?;
         let num_slots_u32 = u32::try_from(num_fields).ok()?;
 
         // Young fast path; on exhaustion spill into old gen (non-moving) BEFORE
@@ -745,14 +751,15 @@ impl GenerationalHeap {
             }
         };
 
-        let header = ObjectHeader::new(
+        let mut header = ObjectHeader::new(
             class_id,
             ObjectKind::Object,
             ArrayElementType::Reference,
             self.next_hash(),
-            0,
+            array_len,
             num_slots_u32,
         );
+        header.gc_flags |= compact_flag;
         // SAFETY: identical invariants to `alloc_object` — `ptr` is a freshly
         // bump-allocated, exclusively-owned, zeroed region of `total_size` bytes
         // with 8-byte alignment, so writing the header and wrapping it in an
@@ -975,16 +982,18 @@ impl GenerationalHeap {
     pub fn try_alloc_object(&self, class_id: ClassId, num_fields: usize) -> Option<ObjectRef> {
         // M6 (round-12 gc): make the `+ HEADER_SIZE` add checked too, so a
         // near-`usize::MAX` field count can't wrap past the checked multiply.
-        let total_size = HEADER_SIZE.checked_add(num_fields.checked_mul(SLOT_SIZE)?)?;
+        // `plan_object_alloc` also selects the compact reference-field layout.
+        let (total_size, array_len, compact_flag) = plan_object_alloc(class_id, num_fields)?;
         let ptr = self.try_alloc_young(total_size)?;
-        let header = ObjectHeader::new(
+        let mut header = ObjectHeader::new(
             class_id,
             ObjectKind::Object,
             ArrayElementType::Reference,
             self.next_hash(),
-            0,
+            array_len,
             u32::try_from(num_fields).ok()?,
         );
+        header.gc_flags |= compact_flag;
         // SAFETY: `ptr` was bump-allocated from the young arena with sufficient size
         // and 8-byte alignment via `try_alloc_young`. The pointer is exclusively owned,
         // so writing the header and creating an `ObjectRef` are sound.
@@ -1132,7 +1141,7 @@ impl GenerationalHeap {
     /// succeed without GC instead of `std::process::abort()`-ing the whole VM.
     /// The `GC_FLAG_OLD_GEN` mark keeps minor GC from trying to forward it.
     fn try_alloc_object_old(&self, class_id: ClassId, num_fields: usize) -> Option<ObjectRef> {
-        let total_size = HEADER_SIZE.checked_add(num_fields.checked_mul(SLOT_SIZE)?)?;
+        let (total_size, array_len, compact_flag) = plan_object_alloc(class_id, num_fields)?;
         let ptr = {
             let mut og = self.old_gen.lock();
             og.alloc(total_size, 8)?
@@ -1142,10 +1151,10 @@ impl GenerationalHeap {
             ObjectKind::Object,
             ArrayElementType::Reference,
             self.next_hash(),
-            0,
+            array_len,
             u32::try_from(num_fields).ok()?,
         );
-        header.gc_flags |= GC_FLAG_OLD_GEN;
+        header.gc_flags |= GC_FLAG_OLD_GEN | compact_flag;
         // SAFETY: `OldGen::alloc` returned `total_size` bytes of zeroed,
         // 8-byte-aligned memory exclusive to this allocation; writing the
         // header is in-bounds and the resulting `ObjectRef` is fully valid.
@@ -1445,6 +1454,33 @@ impl GenerationalHeap {
             } // end rate-limited OOB-read diagnostics
             return Value::Object(None);
         }
+        // Compact reference-field layout: reference fields are 8-byte pointers
+        // at their per-class byte offset; primitive fields stay 16-byte cells.
+        if let Some((off, is_ref)) = compact_field_slot(header, index) {
+            // SAFETY: `index < num_slots` (checked above) ⇒ `off` is within the
+            // object's body (prefix-sum offset table), so `base` and the 8/16-byte
+            // read of that slot are in-bounds.
+            let base = unsafe { obj_ref.as_ptr().add(HEADER_SIZE + off) };
+            if !is_ref {
+                return unsafe { read_slot(base) };
+            }
+            let v = unsafe { read_prim_element(base, 0, ArrayElementType::Reference) };
+            // Unbox an AUTOBOX wrapper: a non-Object value stored into this
+            // reference slot (CratonVM's synthetic collections type-pun a
+            // primitive into a reference-declared slot) was boxed into a
+            // 1-field wrapper by set_field. Mirror get_array_element_unboxing so
+            // the value round-trips and the wrapper never escapes to Java.
+            if let Value::Object(Some(r)) = v {
+                if self.is_object_address(r.as_ptr() as usize).is_some() {
+                    // SAFETY: address validated as a live heap object.
+                    let h = unsafe { &*(r.as_ptr() as *const ObjectHeader) };
+                    if h.class_id == AUTOBOX_CLASS_ID {
+                        return self.get_field(r, 0);
+                    }
+                }
+            }
+            return v;
+        }
         // SAFETY: `obj_ref` points to a valid heap object and `index` is within
         // `num_slots` (checked above). `slot_ptr` computes
         // `obj_ref + HEADER_SIZE + index * SLOT_SIZE`, which is within the
@@ -1596,6 +1632,35 @@ impl GenerationalHeap {
             return;
         }
         debug_assert!(index < self.get_header(obj_ref).num_slots as usize);
+        // Compact reference-field layout: store reference fields as 8-byte
+        // pointers; primitive fields stay 16-byte cells. The write barrier fires
+        // in every arm (card-mark old→young + SATB), same as the legacy path.
+        if let Some((off, is_ref)) = compact_field_slot(header, index) {
+            // SAFETY: `index < num_slots` (checked above) ⇒ `off` within body.
+            let base = unsafe { obj_ref.as_ptr().add(HEADER_SIZE + off) };
+            if is_ref {
+                match value {
+                    Value::Object(_) => {
+                        unsafe { write_prim_element(base, 0, ArrayElementType::Reference, value) };
+                        self.write_barrier(obj_ref, value);
+                    }
+                    // A non-reference value written into a reference slot
+                    // (typeless `Unsafe.put*`): box it into a 1-field wrapper,
+                    // exactly as compact reference *arrays* do (AUTOBOX_CLASS_ID).
+                    _ => {
+                        let wrapper = self.alloc_object(AUTOBOX_CLASS_ID, 1);
+                        self.set_field(wrapper, 0, value);
+                        let wv = Value::Object(Some(wrapper));
+                        unsafe { write_prim_element(base, 0, ArrayElementType::Reference, wv) };
+                        self.write_barrier(obj_ref, wv);
+                    }
+                }
+            } else {
+                unsafe { write_slot(base, value) };
+                self.write_barrier(obj_ref, value);
+            }
+            return;
+        }
         // SAFETY: Same as `get_field` — `index` is within `num_slots` so the
         // computed slot pointer is within the object's allocated region.
         // `write_slot` writes a `Value` at the computed address.
@@ -2383,11 +2448,22 @@ impl GenerationalHeap {
                 && (self.old_gen_used() as u128) * 10 >= (old_cap as u128) * 9
                 && (self.young_from_used() as u128) * 10 >= (young_cap as u128) * 9
         };
-        if (crate::gc_quiescence::is_active() || promotion_oom_risk) && !force_moving {
+        // A5 fix: `unregistered_jit_frame_on_stack()` — the VM root scan found a
+        // guard-less JIT frame on the mutator's native stack (e.g. the compiled
+        // entry-point `main` while a clinit/interpreted callee runs). Its live
+        // objects were conservatively MARKED by the full-stack scan but cannot be
+        // relocated (raw register/spill slots can't be rewritten), so run the
+        // NON-MOVING sweep exactly as for a registered JIT frame (`is_active()`).
+        if (crate::gc_quiescence::is_active()
+            || crate::gc_quiescence::unregistered_jit_frame_on_stack()
+            || promotion_oom_risk)
+            && !force_moving
+        {
             tracing::debug!(
                 "running non-moving young-gen mark-sweep (jit_active={}, \
-                 promotion_oom_risk={}) — compaction deferred.",
+                 unregistered_jit_frame={}, promotion_oom_risk={}) — compaction deferred.",
                 crate::gc_quiescence::is_active(),
+                crate::gc_quiescence::unregistered_jit_frame_on_stack(),
                 promotion_oom_risk,
             );
             let result = self.sweep_young_non_moving(roots, finalizer_addrs);
@@ -2767,6 +2843,34 @@ impl GenerationalHeap {
                         }
                     }
                 }
+            } else if is_compact_object(header) {
+                // Compact object: `slot_idx` is the BYTE OFFSET of an 8-byte
+                // reference slot (recorded that way by the card scan). Mirror
+                // the ref-array branch.
+                // SAFETY: `slot_idx` (byte offset) was recorded by dirty-card
+                // scanning within this object's body; the 8-byte read is in-bounds.
+                let slot_ptr = unsafe { old_obj.as_ptr().add(HEADER_SIZE + slot_idx) };
+                let raw: u64 = unsafe { std::ptr::read(slot_ptr as *const u64) };
+                if raw != 0 {
+                    let ref_ptr = raw as usize as *mut u8;
+                    if young_from.contains(ref_ptr) {
+                        let new_ptr = Self::forward_object(
+                            &young_from,
+                            &mut young_to,
+                            &mut old_gen,
+                            ref_ptr,
+                            &mut objects_copied,
+                            &mut pointer_map,
+                            &mut promoted_worklist,
+                            force_promote_all,
+                        );
+                        // SAFETY: writing the forwarded pointer back to the slot.
+                        unsafe { std::ptr::write(slot_ptr as *mut u64, new_ptr as u64) };
+                        if !old_gen.contains(new_ptr) {
+                            deferred_dirty_cards.push(old_obj.as_ptr() as usize);
+                        }
+                    }
+                }
             } else {
                 // SAFETY: `old_obj` is a valid old-gen object, `slot_idx` is within
                 // `num_slots` (from dirty card scanning). Arithmetic stays in bounds.
@@ -2832,66 +2936,26 @@ impl GenerationalHeap {
                 let header = unsafe { &*(obj_ptr as *const ObjectHeader) };
                 let total_size = gen_object_total_size(header);
 
-                // Scan ref slots: ref arrays use compact 8-byte pointers,
-                // object fields use 16-byte Value.
-                if header.kind == ObjectKind::Array {
-                    if header.element_type == ArrayElementType::Reference {
-                        for i in 0..header.array_length as usize {
-                            // SAFETY: `i` is within `array_length`, so the offset is
-                            // within the array's data region.
-                            let s_ptr = unsafe { obj_ptr.add(HEADER_SIZE + i * REF_ELEMENT_SIZE) };
-                            // SAFETY: `s_ptr` points to a valid 8-byte ref element.
-                            let raw: u64 = unsafe { std::ptr::read(s_ptr as *const u64) };
-                            if raw != 0 {
-                                let ref_ptr = raw as usize as *mut u8;
-                                if young_from.contains(ref_ptr) {
-                                    let new_ref_ptr = Self::forward_object(
-                                        &young_from,
-                                        &mut young_to,
-                                        &mut old_gen,
-                                        ref_ptr,
-                                        &mut objects_copied,
-                                        &mut pointer_map,
-                                        &mut promoted_worklist,
-                                        force_promote_all,
-                                    );
-                                    // SAFETY: Writing forwarded pointer back to the same valid slot.
-                                    unsafe {
-                                        std::ptr::write(s_ptr as *mut u64, new_ref_ptr as u64);
-                                    }
-                                }
-                            }
+                // Scan/forward ref slots. Ref arrays + compact objects store
+                // 8-byte pointers; legacy objects store 16-byte Value cells.
+                // SAFETY: `obj_ptr`/`header` are a valid copied object in young_to.
+                unsafe {
+                    forward_ref_slots(obj_ptr, header, |ref_ptr| {
+                        if young_from.contains(ref_ptr) {
+                            Some(Self::forward_object(
+                                &young_from,
+                                &mut young_to,
+                                &mut old_gen,
+                                ref_ptr,
+                                &mut objects_copied,
+                                &mut pointer_map,
+                                &mut promoted_worklist,
+                                force_promote_all,
+                            ))
+                        } else {
+                            None
                         }
-                    }
-                } else {
-                    for slot_idx in 0..header.num_slots as usize {
-                        // SAFETY: `slot_idx` is within `num_slots`, so the offset is
-                        // within the object's field region.
-                        let s_ptr = unsafe { obj_ptr.add(HEADER_SIZE + slot_idx * SLOT_SIZE) };
-                        // SAFETY: `s_ptr` points to a valid `Value`-sized slot.
-                        let value = unsafe { std::ptr::read(s_ptr as *const Value) };
-                        if let Value::Object(Some(ref_obj)) = value {
-                            let ref_ptr = ref_obj.as_ptr();
-                            if young_from.contains(ref_ptr) {
-                                let new_ref_ptr = Self::forward_object(
-                                    &young_from,
-                                    &mut young_to,
-                                    &mut old_gen,
-                                    ref_ptr,
-                                    &mut objects_copied,
-                                    &mut pointer_map,
-                                    &mut promoted_worklist,
-                                    force_promote_all,
-                                );
-                                // SAFETY: `new_ref_ptr` is a valid forwarded allocation.
-                                let new_value = Value::Object(Some(unsafe {
-                                    ObjectRef::from_raw(new_ref_ptr)
-                                }));
-                                // SAFETY: Writing updated Value back to the same valid slot.
-                                unsafe { std::ptr::write(s_ptr as *mut Value, new_value) };
-                            }
-                        }
-                    }
+                    });
                 }
 
                 scan_cursor += total_size;
@@ -2921,86 +2985,37 @@ impl GenerationalHeap {
                 // landed in `old_gen`), with a valid copied header.
                 let header = unsafe { &*(obj_ptr as *const ObjectHeader) };
 
-                // Scan ref slots: ref arrays use compact 8-byte pointers,
-                // object fields use 16-byte Value.
-                if header.kind == ObjectKind::Array {
-                    if header.element_type == ArrayElementType::Reference {
-                        for i in 0..header.array_length as usize {
-                            // SAFETY: `i` < `array_length`; offset within array data region.
-                            let s_ptr = unsafe { obj_ptr.add(HEADER_SIZE + i * REF_ELEMENT_SIZE) };
-                            // SAFETY: `s_ptr` points to a valid 8-byte ref element.
-                            let raw: u64 = unsafe { std::ptr::read(s_ptr as *const u64) };
-                            if raw != 0 {
-                                let ref_ptr = raw as usize as *mut u8;
-                                if young_from.contains(ref_ptr) {
-                                    let new_ref_ptr = Self::forward_object(
-                                        &young_from,
-                                        &mut young_to,
-                                        &mut old_gen,
-                                        ref_ptr,
-                                        &mut objects_copied,
-                                        &mut pointer_map,
-                                        &mut promoted_worklist,
-                                        force_promote_all,
-                                    );
-                                    // SAFETY: Writing forwarded pointer back to the same valid slot.
-                                    unsafe {
-                                        std::ptr::write(s_ptr as *mut u64, new_ref_ptr as u64);
-                                    }
-                                    // Mark card dirty if the forwarded ref landed in young
-                                    // to-space — this old→young cross-gen reference must be
-                                    // visible to the NEXT minor GC's dirty card scan.
-                                    if !old_gen.contains(new_ref_ptr) {
-                                        deferred_dirty_cards.push(obj_ptr as usize);
-                                    }
-                                }
+                // Scan/forward ref slots (ref arrays + compact objects use
+                // 8-byte pointers; legacy objects use 16-byte Value cells). A
+                // forwarded ref that stays in young to-space is an old→young
+                // edge: defer-mark its card so the NEXT minor GC's dirty-card
+                // scan sees it (deferred_dirty_cards is re-marked after Phase
+                // 3's clear_all; a direct mark would be wiped). The object-field
+                // case once missed this (BouncyCastle X9ECParametersHolder.params
+                // -> young X9ECParameters lost its remembered-set entry); the
+                // unified helper applies it to every layout.
+                // SAFETY: `obj_ptr`/`header` are a valid promoted old-gen object.
+                unsafe {
+                    forward_ref_slots(obj_ptr, header, |ref_ptr| {
+                        if young_from.contains(ref_ptr) {
+                            let new_ref_ptr = Self::forward_object(
+                                &young_from,
+                                &mut young_to,
+                                &mut old_gen,
+                                ref_ptr,
+                                &mut objects_copied,
+                                &mut pointer_map,
+                                &mut promoted_worklist,
+                                force_promote_all,
+                            );
+                            if !old_gen.contains(new_ref_ptr) {
+                                deferred_dirty_cards.push(obj_ptr as usize);
                             }
+                            Some(new_ref_ptr)
+                        } else {
+                            None
                         }
-                    }
-                } else {
-                    for slot_idx in 0..header.num_slots as usize {
-                        // SAFETY: `slot_idx` is within `num_slots`; offset within the object's field region.
-                        let s_ptr = unsafe { obj_ptr.add(HEADER_SIZE + slot_idx * SLOT_SIZE) };
-                        let value = unsafe { std::ptr::read(s_ptr as *const Value) };
-                        if let Value::Object(Some(ref_obj)) = value {
-                            let ref_ptr = ref_obj.as_ptr();
-                            if young_from.contains(ref_ptr) {
-                                let new_ref_ptr = Self::forward_object(
-                                    &young_from,
-                                    &mut young_to,
-                                    &mut old_gen,
-                                    ref_ptr,
-                                    &mut objects_copied,
-                                    &mut pointer_map,
-                                    &mut promoted_worklist,
-                                    force_promote_all,
-                                );
-                                // SAFETY: `new_ref_ptr` is a valid forwarded allocation.
-                                let new_value = Value::Object(Some(unsafe {
-                                    ObjectRef::from_raw(new_ref_ptr)
-                                }));
-                                // SAFETY: Writing updated Value back to the same valid slot.
-                                unsafe { std::ptr::write(s_ptr as *mut Value, new_value) };
-                                // Mark card dirty if the forwarded ref landed in young
-                                // to-space — this old→young cross-gen reference must be
-                                // visible to the NEXT minor GC's dirty card scan.
-                                //
-                                // BUGFIX: use `deferred_dirty_cards` (re-marked AFTER
-                                // Phase 3's `clear_all()` via `mark_dirty_bulk`), NOT a
-                                // direct `card_table.mark_dirty` — the latter is wiped by
-                                // `clear_all()` and the edge is forgotten next cycle. The
-                                // array branch already does this; the object-field branch
-                                // didn't, so a promoted old object holding a young object
-                                // in a *field* (e.g. BouncyCastle X9ECParametersHolder
-                                // .params -> young X9ECParameters) lost its remembered-set
-                                // entry → the next minor GC relocated the referent without
-                                // updating the field → stale all-zero-header receiver.
-                                if !old_gen.contains(new_ref_ptr) {
-                                    deferred_dirty_cards.push(obj_ptr as usize);
-                                }
-                            }
-                        }
-                    }
+                    });
                 }
             }
 
@@ -3043,63 +3058,26 @@ impl GenerationalHeap {
                     let obj_ptr = unsafe { young_to.base_ptr_mut().add(scan_cursor) };
                     let header = unsafe { &*(obj_ptr as *const ObjectHeader) };
                     let total_size = gen_object_total_size(header);
-                    if header.kind == ObjectKind::Array {
-                        if header.element_type == ArrayElementType::Reference {
-                            for i in 0..header.array_length as usize {
-                                // SAFETY: `i` < `array_length`; offset within array data region.
-                                let s_ptr =
-                                    unsafe { obj_ptr.add(HEADER_SIZE + i * REF_ELEMENT_SIZE) };
-                                let raw: u64 = unsafe { std::ptr::read(s_ptr as *const u64) };
-                                if raw != 0 {
-                                    let ref_ptr = raw as usize as *mut u8;
-                                    if young_from.contains(ref_ptr) {
-                                        let new_ref_ptr = Self::forward_object(
-                                            &young_from,
-                                            &mut young_to,
-                                            &mut old_gen,
-                                            ref_ptr,
-                                            &mut objects_copied,
-                                            &mut pointer_map,
-                                            &mut promoted_worklist,
-                                            force_promote_all,
-                                        );
-                                        // SAFETY: Writing forwarded pointer back to the same valid ref-array slot.
-                                        unsafe {
-                                            std::ptr::write(s_ptr as *mut u64, new_ref_ptr as u64);
-                                        }
-                                    }
-                                }
+                    // Scan/forward ref slots (arrays + compact objects: 8-byte
+                    // pointers; legacy objects: 16-byte Value cells).
+                    // SAFETY: `obj_ptr`/`header` are a valid copied object in young_to.
+                    unsafe {
+                        forward_ref_slots(obj_ptr, header, |ref_ptr| {
+                            if young_from.contains(ref_ptr) {
+                                Some(Self::forward_object(
+                                    &young_from,
+                                    &mut young_to,
+                                    &mut old_gen,
+                                    ref_ptr,
+                                    &mut objects_copied,
+                                    &mut pointer_map,
+                                    &mut promoted_worklist,
+                                    force_promote_all,
+                                ))
+                            } else {
+                                None
                             }
-                        }
-                    } else {
-                        for slot_idx in 0..header.num_slots as usize {
-                            // SAFETY: `slot_idx` is within `num_slots`; offset within the object's field region.
-                            let s_ptr = unsafe { obj_ptr.add(HEADER_SIZE + slot_idx * SLOT_SIZE) };
-                            let value = unsafe { std::ptr::read(s_ptr as *const Value) };
-                            if let Value::Object(Some(ref_obj)) = value {
-                                let ref_ptr = ref_obj.as_ptr();
-                                if young_from.contains(ref_ptr) {
-                                    let new_ref_ptr = Self::forward_object(
-                                        &young_from,
-                                        &mut young_to,
-                                        &mut old_gen,
-                                        ref_ptr,
-                                        &mut objects_copied,
-                                        &mut pointer_map,
-                                        &mut promoted_worklist,
-                                        force_promote_all,
-                                    );
-                                    // SAFETY: `new_ref_ptr` is a valid forwarded allocation.
-                                    let new_value = Value::Object(Some(unsafe {
-                                        ObjectRef::from_raw(new_ref_ptr)
-                                    }));
-                                    // SAFETY: Writing updated Value back to the same valid slot.
-                                    unsafe {
-                                        std::ptr::write(s_ptr as *mut Value, new_value);
-                                    }
-                                }
-                            }
-                        }
+                        });
                     }
                     scan_cursor += total_size;
                 }
@@ -3112,79 +3090,33 @@ impl GenerationalHeap {
                     made_progress = true;
                     // SAFETY: `obj_ptr` is a promoted old-gen object with a valid copied header.
                     let header = unsafe { &*(obj_ptr as *const ObjectHeader) };
-                    if header.kind == ObjectKind::Array {
-                        if header.element_type == ArrayElementType::Reference {
-                            for i in 0..header.array_length as usize {
-                                // SAFETY: `i` < `array_length`; offset within array data region.
-                                let s_ptr =
-                                    unsafe { obj_ptr.add(HEADER_SIZE + i * REF_ELEMENT_SIZE) };
-                                let raw: u64 = unsafe { std::ptr::read(s_ptr as *const u64) };
-                                if raw != 0 {
-                                    let ref_ptr = raw as usize as *mut u8;
-                                    if young_from.contains(ref_ptr) {
-                                        let new_ref_ptr = Self::forward_object(
-                                            &young_from,
-                                            &mut young_to,
-                                            &mut old_gen,
-                                            ref_ptr,
-                                            &mut objects_copied,
-                                            &mut pointer_map,
-                                            &mut promoted_worklist,
-                                            force_promote_all,
-                                        );
-                                        // SAFETY: Writing forwarded pointer back to the same valid ref-array slot.
-                                        unsafe {
-                                            std::ptr::write(s_ptr as *mut u64, new_ref_ptr as u64);
-                                        }
-                                        // BUGFIX (same class as the object-field fix): use
-                                        // `deferred_dirty_cards` (re-applied AFTER clear_all
-                                        // via mark_dirty_bulk), NOT a direct
-                                        // `card_table.mark_dirty` which clear_all() wipes.
-                                        // An old reference ARRAY holding a young object (e.g.
-                                        // ArrayList.elementData with the ServiceLoader provider
-                                        // instances) promoted via this resurrection drain
-                                        // otherwise loses its remembered-set entry → the next
-                                        // minor GC relocates/collects the young element →
-                                        // "Not able to load any cryptoProvider".
-                                        if !old_gen.contains(new_ref_ptr) {
-                                            deferred_dirty_cards.push(obj_ptr as usize);
-                                        }
-                                    }
+                    // Scan/forward ref slots (arrays + compact objects: 8-byte
+                    // pointers; legacy objects: 16-byte cells). A forwarded ref
+                    // that stays young is an old→young edge — defer-mark its card
+                    // (re-applied after clear_all; a direct mark would be wiped),
+                    // for every layout (the ServiceLoader cryptoProvider bug).
+                    // SAFETY: `obj_ptr`/`header` are a valid promoted old-gen object.
+                    unsafe {
+                        forward_ref_slots(obj_ptr, header, |ref_ptr| {
+                            if young_from.contains(ref_ptr) {
+                                let new_ref_ptr = Self::forward_object(
+                                    &young_from,
+                                    &mut young_to,
+                                    &mut old_gen,
+                                    ref_ptr,
+                                    &mut objects_copied,
+                                    &mut pointer_map,
+                                    &mut promoted_worklist,
+                                    force_promote_all,
+                                );
+                                if !old_gen.contains(new_ref_ptr) {
+                                    deferred_dirty_cards.push(obj_ptr as usize);
                                 }
+                                Some(new_ref_ptr)
+                            } else {
+                                None
                             }
-                        }
-                    } else {
-                        for slot_idx in 0..header.num_slots as usize {
-                            // SAFETY: `slot_idx` is within `num_slots`; offset within the object's field region.
-                            let s_ptr = unsafe { obj_ptr.add(HEADER_SIZE + slot_idx * SLOT_SIZE) };
-                            let value = unsafe { std::ptr::read(s_ptr as *const Value) };
-                            if let Value::Object(Some(ref_obj)) = value {
-                                let ref_ptr = ref_obj.as_ptr();
-                                if young_from.contains(ref_ptr) {
-                                    let new_ref_ptr = Self::forward_object(
-                                        &young_from,
-                                        &mut young_to,
-                                        &mut old_gen,
-                                        ref_ptr,
-                                        &mut objects_copied,
-                                        &mut pointer_map,
-                                        &mut promoted_worklist,
-                                        force_promote_all,
-                                    );
-                                    // SAFETY: `new_ref_ptr` is a valid forwarded allocation.
-                                    let new_value = Value::Object(Some(unsafe {
-                                        ObjectRef::from_raw(new_ref_ptr)
-                                    }));
-                                    // SAFETY: Writing updated Value back to the same valid slot.
-                                    unsafe {
-                                        std::ptr::write(s_ptr as *mut Value, new_value);
-                                    }
-                                    if !old_gen.contains(new_ref_ptr) {
-                                        deferred_dirty_cards.push(obj_ptr as usize);
-                                    }
-                                }
-                            }
-                        }
+                        });
                     }
                 }
                 if !made_progress {
@@ -3652,6 +3584,15 @@ impl GenerationalHeap {
                 if raw != 0 {
                     mark_young(raw as usize as *mut u8, &mut worklist);
                 }
+            } else if is_compact_object(header) {
+                // Compact object: `slot_idx` is the BYTE OFFSET of an 8-byte
+                // reference slot (as recorded by scan_dirty_cards).
+                // SAFETY: byte offset within this object's body (from card scan).
+                let slot_ptr = unsafe { old_obj.as_ptr().add(HEADER_SIZE + slot_idx) };
+                let raw: u64 = unsafe { std::ptr::read(slot_ptr as *const u64) };
+                if raw != 0 {
+                    mark_young(raw as usize as *mut u8, &mut worklist);
+                }
             } else {
                 // SAFETY: `slot_idx` is within `num_slots` (from card scan).
                 let slot_ptr = unsafe { old_obj.as_ptr().add(HEADER_SIZE + slot_idx * SLOT_SIZE) };
@@ -3677,30 +3618,9 @@ impl GenerationalHeap {
             for (op, _sz) in old_gen.walk_objects() {
                 // SAFETY: `op` is a live old-gen object header from walk_objects.
                 let oh = unsafe { &*(op as *const ObjectHeader) };
-                if oh.kind == ObjectKind::Array {
-                    if oh.element_type == ArrayElementType::Reference {
-                        for i in 0..oh.array_length as usize {
-                            // SAFETY: `i < oh.array_length`, so the element offset lies in
-                            // this live old-gen array's payload; the pointer and u64 read
-                            // of that ref slot are in-bounds.
-                            let s = unsafe { op.add(HEADER_SIZE + i * REF_ELEMENT_SIZE) };
-                            let raw: u64 = unsafe { std::ptr::read(s as *const u64) };
-                            if raw != 0 {
-                                mark_young(raw as usize as *mut u8, &mut worklist);
-                            }
-                        }
-                    }
-                } else {
-                    for slot in 0..oh.num_slots as usize {
-                        // SAFETY: `slot < oh.num_slots`, so the offset lies in this live
-                        // old-gen object's field area; the pointer and `Value` read of
-                        // that initialized slot are in-bounds.
-                        let s = unsafe { op.add(HEADER_SIZE + slot * SLOT_SIZE) };
-                        let v = unsafe { std::ptr::read(s as *const Value) };
-                        if let Value::Object(Some(r)) = v {
-                            mark_young(r.as_ptr(), &mut worklist);
-                        }
-                    }
+                // SAFETY: `op`/`oh` are a valid live old-gen object.
+                unsafe {
+                    for_each_ref_slot(op, oh, |r, _| mark_young(r, &mut worklist));
                 }
             }
         }
@@ -3710,28 +3630,13 @@ impl GenerationalHeap {
             // SAFETY: `obj_ptr` was validated by `mark_young` before being
             // pushed — it is a sane young-gen object header.
             let header = unsafe { &*(obj_ptr as *const ObjectHeader) };
-            if header.kind == ObjectKind::Array {
-                if header.element_type == ArrayElementType::Reference {
-                    for i in 0..header.array_length as usize {
-                        // SAFETY: `i` < `array_length`; offset within array data.
-                        let s_ptr = unsafe { obj_ptr.add(HEADER_SIZE + i * REF_ELEMENT_SIZE) };
-                        // SAFETY: `s_ptr` is a valid 8-byte ref element.
-                        let raw: u64 = unsafe { std::ptr::read(s_ptr as *const u64) };
-                        if raw != 0 {
-                            mark_young(raw as usize as *mut u8, &mut worklist);
-                        }
-                    }
-                }
-            } else {
-                for slot_idx in 0..header.num_slots as usize {
-                    // SAFETY: `slot_idx` < `num_slots`; offset within field region.
-                    let s_ptr = unsafe { obj_ptr.add(HEADER_SIZE + slot_idx * SLOT_SIZE) };
-                    // SAFETY: `s_ptr` is a valid Value-sized slot.
-                    let value = unsafe { std::ptr::read(s_ptr as *const Value) };
-                    if let Value::Object(Some(ref_obj)) = value {
-                        mark_young(ref_obj.as_ptr(), &mut worklist);
-                    }
-                }
+            // Mark every referent (arrays + compact objects: 8-byte pointers;
+            // legacy objects: 16-byte Value cells).
+            // SAFETY: `obj_ptr`/`header` are a validated young object.
+            unsafe {
+                for_each_ref_slot(obj_ptr, header, |ref_ptr, _| {
+                    mark_young(ref_ptr, &mut worklist);
+                });
             }
         }
 
@@ -4196,33 +4101,17 @@ impl GenerationalHeap {
             let scan_refs = |obj_ptr: *mut u8, report: &mut dyn FnMut(usize, usize)| {
                 // SAFETY: caller guarantees obj_ptr is a valid object header.
                 let h = unsafe { &*(obj_ptr as *const ObjectHeader) };
-                if h.kind == ObjectKind::Array {
-                    if h.element_type == ArrayElementType::Reference {
-                        for i in 0..h.array_length as usize {
-                            // SAFETY: `i < h.array_length`, so the element offset is in the
-                            // array payload of the valid object `obj_ptr`; pointer and u64
-                            // read of that ref slot are in-bounds.
-                            let sp = unsafe { obj_ptr.add(HEADER_SIZE + i * REF_ELEMENT_SIZE) };
-                            let raw: u64 = unsafe { std::ptr::read(sp as *const u64) };
-                            if raw != 0 && is_unmarked_young(raw as usize) {
-                                report(i, raw as usize);
-                            }
+                // Arrays + compact objects: 8-byte pointer slots; legacy objects:
+                // 16-byte Value cells. `slot_id` is the element index / byte
+                // offset / field index (diagnostic-only here).
+                // SAFETY: `obj_ptr`/`h` are a valid live object.
+                unsafe {
+                    for_each_ref_slot(obj_ptr, h, |raw, slot_id| {
+                        let ta = raw as usize;
+                        if is_unmarked_young(ta) {
+                            report(slot_id, ta);
                         }
-                    }
-                } else {
-                    for si in 0..h.num_slots as usize {
-                        // SAFETY: `si < h.num_slots`, so the offset is in the field area of
-                        // the valid object `obj_ptr`; pointer and `Value` read of that
-                        // initialized slot are in-bounds.
-                        let sp = unsafe { obj_ptr.add(HEADER_SIZE + si * SLOT_SIZE) };
-                        let v = unsafe { std::ptr::read(sp as *const Value) };
-                        if let Value::Object(Some(rf)) = v {
-                            let ta = rf.as_ptr() as usize;
-                            if is_unmarked_young(ta) {
-                                report(si, ta);
-                            }
-                        }
-                    }
+                    });
                 }
             };
 
@@ -4796,42 +4685,21 @@ impl GenerationalHeap {
                 break;
             }
 
-            if header.kind == ObjectKind::Array {
-                if header.element_type == ArrayElementType::Reference {
-                    for i in 0..header.array_length as usize {
-                        // SAFETY: `i` < `array_length`; offset within array data region.
-                        let s_ptr = unsafe { obj_ptr.add(HEADER_SIZE + i * REF_ELEMENT_SIZE) };
-                        let raw: u64 = unsafe { std::ptr::read(s_ptr as *const u64) };
-                        if raw != 0 {
-                            let ref_ptr = raw as usize as *mut u8;
-                            if old_gen.contains(ref_ptr) {
-                                // SAFETY: `ref_ptr` is in old gen (verified by `contains`); its header is valid and mutable for marking.
-                                let ref_header = unsafe { &mut *(ref_ptr as *mut ObjectHeader) };
-                                if ref_header.gc_flags & GC_FLAG_MARKED == 0 {
-                                    ref_header.gc_flags |= GC_FLAG_MARKED;
-                                    worklist.push(ref_ptr);
-                                }
-                            }
+            // Mark every old-gen referent (arrays + compact objects: 8-byte
+            // pointers; legacy objects: 16-byte Value cells).
+            // SAFETY: `obj_ptr`/`header` are a valid live young-from object.
+            unsafe {
+                for_each_ref_slot(obj_ptr, header, |ref_ptr, _| {
+                    if old_gen.contains(ref_ptr) {
+                        // SAFETY: `ref_ptr` is in old gen (verified by `contains`);
+                        // its header is valid and mutable for marking.
+                        let ref_header = &mut *(ref_ptr as *mut ObjectHeader);
+                        if ref_header.gc_flags & GC_FLAG_MARKED == 0 {
+                            ref_header.gc_flags |= GC_FLAG_MARKED;
+                            worklist.push(ref_ptr);
                         }
                     }
-                }
-            } else {
-                for slot_idx in 0..header.num_slots as usize {
-                    // SAFETY: `slot_idx` is within `num_slots`; offset within the object's field region.
-                    let s_ptr = unsafe { obj_ptr.add(HEADER_SIZE + slot_idx * SLOT_SIZE) };
-                    let value = unsafe { std::ptr::read(s_ptr as *const Value) };
-                    if let Value::Object(Some(ref_obj)) = value {
-                        let ref_ptr = ref_obj.as_ptr();
-                        if old_gen.contains(ref_ptr) {
-                            // SAFETY: `ref_ptr` is in old gen (verified by `contains`); its header is valid and mutable for marking.
-                            let ref_header = unsafe { &mut *(ref_ptr as *mut ObjectHeader) };
-                            if ref_header.gc_flags & GC_FLAG_MARKED == 0 {
-                                ref_header.gc_flags |= GC_FLAG_MARKED;
-                                worklist.push(ref_ptr);
-                            }
-                        }
-                    }
-                }
+                });
             }
 
             cursor += total_size;
@@ -4842,43 +4710,21 @@ impl GenerationalHeap {
     fn scan_object_for_old_refs(obj_ptr: *mut u8, old_gen: &OldGen, worklist: &mut Vec<*mut u8>) {
         // SAFETY: `obj_ptr` is a live old-gen object from the mark worklist; its header is valid.
         let header = unsafe { &*(obj_ptr as *const ObjectHeader) };
-
-        if header.kind == ObjectKind::Array {
-            if header.element_type == ArrayElementType::Reference {
-                for i in 0..header.array_length as usize {
-                    // SAFETY: `i` < `array_length`; offset within array data region.
-                    let s_ptr = unsafe { obj_ptr.add(HEADER_SIZE + i * REF_ELEMENT_SIZE) };
-                    let raw: u64 = unsafe { std::ptr::read(s_ptr as *const u64) };
-                    if raw != 0 {
-                        let ref_ptr = raw as usize as *mut u8;
-                        if old_gen.contains(ref_ptr) {
-                            // SAFETY: `ref_ptr` is in old gen (verified by `contains`); its header is valid and mutable for marking.
-                            let ref_header = unsafe { &mut *(ref_ptr as *mut ObjectHeader) };
-                            if ref_header.gc_flags & GC_FLAG_MARKED == 0 {
-                                ref_header.gc_flags |= GC_FLAG_MARKED;
-                                worklist.push(ref_ptr);
-                            }
-                        }
+        // Mark every old-gen referent (arrays + compact objects: 8-byte pointers;
+        // legacy objects: 16-byte Value cells).
+        // SAFETY: `obj_ptr`/`header` are a valid live object.
+        unsafe {
+            for_each_ref_slot(obj_ptr, header, |ref_ptr, _| {
+                if old_gen.contains(ref_ptr) {
+                    // SAFETY: `ref_ptr` is in old gen (verified by `contains`); its
+                    // header is valid and mutable for marking.
+                    let ref_header = &mut *(ref_ptr as *mut ObjectHeader);
+                    if ref_header.gc_flags & GC_FLAG_MARKED == 0 {
+                        ref_header.gc_flags |= GC_FLAG_MARKED;
+                        worklist.push(ref_ptr);
                     }
                 }
-            }
-        } else {
-            for slot_idx in 0..header.num_slots as usize {
-                // SAFETY: `slot_idx` is within `num_slots`; offset within the object's field region.
-                let s_ptr = unsafe { obj_ptr.add(HEADER_SIZE + slot_idx * SLOT_SIZE) };
-                let value = unsafe { std::ptr::read(s_ptr as *const Value) };
-                if let Value::Object(Some(ref_obj)) = value {
-                    let ref_ptr = ref_obj.as_ptr();
-                    if old_gen.contains(ref_ptr) {
-                        // SAFETY: `ref_ptr` is in old gen (verified by `contains`); its header is valid and mutable for marking.
-                        let ref_header = unsafe { &mut *(ref_ptr as *mut ObjectHeader) };
-                        if ref_header.gc_flags & GC_FLAG_MARKED == 0 {
-                            ref_header.gc_flags |= GC_FLAG_MARKED;
-                            worklist.push(ref_ptr);
-                        }
-                    }
-                }
-            }
+            });
         }
     }
 
@@ -4923,36 +4769,15 @@ impl GenerationalHeap {
                 break;
             }
 
-            if header.kind == ObjectKind::Array {
-                if header.element_type == ArrayElementType::Reference {
-                    for i in 0..header.array_length as usize {
-                        // SAFETY: `i` < `array_length`; offset within array data region.
-                        let slot = unsafe { obj_ptr.add(HEADER_SIZE + i * REF_ELEMENT_SIZE) };
-                        let raw: u64 = unsafe { std::ptr::read(slot as *const u64) };
-                        if raw != 0 {
-                            if let Some(&new_addr) = compact_map.get(&(raw as usize)) {
-                                // SAFETY: Writing the compacted address back to the same valid ref-array slot.
-                                unsafe { std::ptr::write(slot as *mut u64, new_addr as u64) };
-                            }
-                        }
-                    }
-                }
-            } else {
-                for slot_idx in 0..header.num_slots as usize {
-                    // SAFETY: `slot_idx` is within `num_slots`; offset within the object's field region.
-                    let slot = unsafe { obj_ptr.add(HEADER_SIZE + slot_idx * SLOT_SIZE) };
-                    let value = unsafe { std::ptr::read(slot as *const Value) };
-                    if let Value::Object(Some(ref_obj)) = value {
-                        if let Some(&new_addr) = compact_map.get(&(ref_obj.as_ptr() as usize)) {
-                            // SAFETY: `new_addr` comes from the compaction map, pointing to a valid relocated object.
-                            let new_value = Value::Object(Some(unsafe {
-                                ObjectRef::from_raw(new_addr as *mut u8)
-                            }));
-                            // SAFETY: Writing updated Value back to the same valid slot.
-                            unsafe { std::ptr::write(slot as *mut Value, new_value) };
-                        }
-                    }
-                }
+            // Remap any reference into a relocated old-gen object (arrays +
+            // compact objects: 8-byte pointers; legacy objects: 16-byte cells).
+            // SAFETY: `obj_ptr`/`header` are a valid live young-from object.
+            unsafe {
+                forward_ref_slots(obj_ptr, header, |ref_ptr| {
+                    compact_map
+                        .get(&(ref_ptr as usize))
+                        .map(|&new_addr| new_addr as *mut u8)
+                });
             }
 
             cursor += total_size;
@@ -5649,6 +5474,28 @@ impl GenerationalHeap {
                         }
                     }
                 }
+            } else if let Some((layout, compact_body)) = crate::heap::compact_oop_scan(header) {
+                // Compact object: 8-byte reference slots at the oop-map offsets.
+                // Record the BYTE OFFSET as slot_idx — the seed/fixup consumers
+                // read it back as a byte offset for compact receivers.
+                let body = compact_body.min(body_bytes);
+                for &off in &layout.ref_offsets {
+                    let off = off as usize;
+                    if off + crate::heap::REF_FIELD_SIZE > body {
+                        break;
+                    }
+                    // SAFETY: `off` is within the object's body (capped above).
+                    let s_ptr = unsafe { obj_ptr.add(HEADER_SIZE + off) };
+                    let raw: u64 = unsafe { std::ptr::read(s_ptr as *const u64) };
+                    if raw != 0 {
+                        let ref_ptr = raw as usize as *mut u8;
+                        if young_from.contains(ref_ptr) {
+                            // SAFETY: valid old-gen object pointer.
+                            let obj_ref = unsafe { ObjectRef::from_raw(obj_ptr) };
+                            extra_roots.push((obj_ref, off, 0));
+                        }
+                    }
+                }
             } else {
                 // Cap slot count at what the object's field region holds.
                 let max_slots = body_bytes / SLOT_SIZE;
@@ -5844,51 +5691,25 @@ fn fixup_object_fields(
     in_young: &dyn Fn(usize) -> bool,
     mut points_young: Option<&mut bool>,
 ) {
-    if header.kind == ObjectKind::Array {
-        if header.element_type == ArrayElementType::Reference {
-            for i in 0..header.array_length as usize {
-                // SAFETY: `i < header.array_length`, so the element offset lies within the
-                // valid object's array payload; pointer, u64 read, and (forwarded) u64
-                // write of that ref slot are in-bounds and unaliased under STW.
-                let slot = unsafe { obj.add(HEADER_SIZE + i * REF_ELEMENT_SIZE) };
-                let raw: u64 = unsafe { std::ptr::read(slot as *const u64) };
-                if raw != 0 {
-                    if let Some(nw) = fwd_of(raw as usize) {
-                        // SAFETY: `slot` is the in-bounds ref element computed above; STW
-                        // guarantees exclusive access for this forwarding-pointer write.
-                        unsafe { std::ptr::write(slot as *mut u64, nw as u64) };
-                    } else if let Some(p) = points_young.as_deref_mut() {
-                        if in_young(raw as usize) {
-                            *p = true;
-                        }
-                    }
-                }
-            }
-        }
-    } else {
-        for si in 0..header.num_slots as usize {
-            // SAFETY: `si < header.num_slots`, so the slot offset lies in the valid
-            // object's field area; pointer and `Value` read of that initialized slot are
-            // in-bounds and unaliased under STW.
-            let slot = unsafe { obj.add(HEADER_SIZE + si * SLOT_SIZE) };
-            let value = unsafe { std::ptr::read(slot as *const Value) };
-            if let Value::Object(Some(ref_obj)) = value {
-                let target = ref_obj.as_ptr() as usize;
-                if let Some(nw) = fwd_of(target) {
-                    // SAFETY: `nw` is the forwarded destination address of a live object,
-                    // so wrapping it as an `ObjectRef` is sound.
-                    let new_value =
-                        Value::Object(Some(unsafe { ObjectRef::from_raw(nw as *mut u8) }));
-                    // SAFETY: `slot` is the in-bounds field slot computed above; STW
-                    // guarantees exclusive access for this rewrite.
-                    unsafe { std::ptr::write(slot as *mut Value, new_value) };
-                } else if let Some(p) = points_young.as_deref_mut() {
+    // Arrays + compact objects use 8-byte pointer slots; legacy objects use
+    // 16-byte Value cells. `forward_ref_slots` rewrites a slot only when the
+    // closure returns Some (an evacuated target's new address); a non-evacuated
+    // young referent flips `points_young` and leaves the slot unchanged.
+    // SAFETY: `obj`/`header` are a valid object under STW (no mutator).
+    unsafe {
+        forward_ref_slots(obj, header, |ref_ptr| {
+            let target = ref_ptr as usize;
+            if let Some(nw) = fwd_of(target) {
+                Some(nw as *mut u8)
+            } else {
+                if let Some(p) = points_young.as_deref_mut() {
                     if in_young(target) {
                         *p = true;
                     }
                 }
+                None
             }
-        }
+        });
     }
 }
 
@@ -5898,41 +5719,19 @@ fn fixup_object_fields(
 /// reclaimed young slot, the bintrees18 wrong-checksum smoking gun.
 fn forwarded_ref_count(obj: *mut u8, header: &ObjectHeader, is_y: &dyn Fn(usize) -> bool) -> usize {
     let mut n = 0usize;
-    if header.kind == ObjectKind::Array {
-        if header.element_type == ArrayElementType::Reference {
-            for i in 0..header.array_length as usize {
-                // SAFETY: `i < header.array_length`, so the element offset lies within the
-                // valid object's array payload; pointer and u64 read are in-bounds.
-                let slot = unsafe { obj.add(HEADER_SIZE + i * REF_ELEMENT_SIZE) };
-                let raw: u64 = unsafe { std::ptr::read(slot as *const u64) };
-                if raw != 0 && is_y(raw as usize) {
-                    // SAFETY: `is_y` confirmed `raw` is a young-from-space heap address,
-                    // so it points at a valid `ObjectHeader`.
-                    let h = unsafe { &*(raw as usize as *const ObjectHeader) };
-                    if h.is_forwarded() {
-                        n += 1;
-                    }
+    // SAFETY: `obj`/`header` are a valid object header under STW.
+    unsafe {
+        for_each_ref_slot(obj, header, |raw, _| {
+            let t = raw as usize;
+            if is_y(t) {
+                // SAFETY: `is_y` confirmed `t` is a young-from-space heap address,
+                // so it points at a valid `ObjectHeader`.
+                let h = &*(t as *const ObjectHeader);
+                if h.is_forwarded() {
+                    n += 1;
                 }
             }
-        }
-    } else {
-        for si in 0..header.num_slots as usize {
-            // SAFETY: `si < header.num_slots`, so the slot offset lies in the valid
-            // object's field area; pointer and `Value` read of that slot are in-bounds.
-            let slot = unsafe { obj.add(HEADER_SIZE + si * SLOT_SIZE) };
-            let v = unsafe { std::ptr::read(slot as *const Value) };
-            if let Value::Object(Some(rf)) = v {
-                let t = rf.as_ptr() as usize;
-                if is_y(t) {
-                    // SAFETY: `is_y` confirmed `t` is a young-from-space heap address,
-                    // so it points at a valid `ObjectHeader`.
-                    let h = unsafe { &*(t as *const ObjectHeader) };
-                    if h.is_forwarded() {
-                        n += 1;
-                    }
-                }
-            }
-        }
+        });
     }
     n
 }
@@ -5941,28 +5740,9 @@ fn forwarded_ref_count(obj: *mut u8, header: &ObjectHeader, is_y: &dyn Fn(usize)
 /// reference fields (object Value slots or reference-array elements). Used by
 /// the CRATONVM_SP_VERIFY aliasing detector.
 fn for_each_ref(obj: *mut u8, header: &ObjectHeader, mut f: impl FnMut(usize)) {
-    if header.kind == ObjectKind::Array {
-        if header.element_type == ArrayElementType::Reference {
-            for i in 0..header.array_length as usize {
-                // SAFETY: `i < header.array_length`, so the element offset lies within the
-                // valid object's array payload; pointer and u64 read are in-bounds.
-                let slot = unsafe { obj.add(HEADER_SIZE + i * REF_ELEMENT_SIZE) };
-                let raw: u64 = unsafe { std::ptr::read(slot as *const u64) };
-                if raw != 0 {
-                    f(raw as usize);
-                }
-            }
-        }
-    } else {
-        for si in 0..header.num_slots as usize {
-            // SAFETY: `si < header.num_slots`, so the slot offset lies in the valid
-            // object's field area; pointer and `Value` read of that slot are in-bounds.
-            let slot = unsafe { obj.add(HEADER_SIZE + si * SLOT_SIZE) };
-            let v = unsafe { std::ptr::read(slot as *const Value) };
-            if let Value::Object(Some(rf)) = v {
-                f(rf.as_ptr() as usize);
-            }
-        }
+    // SAFETY: `obj`/`header` are a valid object header under STW.
+    unsafe {
+        for_each_ref_slot(obj, header, |raw, _| f(raw as usize));
     }
 }
 
@@ -6123,11 +5903,17 @@ fn gen_object_total_size(header: &ObjectHeader) -> usize {
                 0
             }
         }
+    } else if is_compact_object(header) {
+        // Compact object: the body size in bytes is stored in `array_length`
+        // (objects don't otherwise use it; `kind` disambiguates from arrays).
+        // The sum is bounded by the u32 body size + HEADER_SIZE, no overflow.
+        HEADER_SIZE + header.array_length as usize
     } else {
-        // Header-coherence sanity check: a correctly-allocated `kind = Object`
-        // header always has `array_length = 0` (see `try_alloc_object` / the
-        // ObjectHeader::new contract — only `alloc_array` writes a non-zero
-        // array_length, and it sets `kind = Array` together with it).
+        // Header-coherence sanity check: a correctly-allocated legacy
+        // `kind = Object` header always has `array_length = 0` (see
+        // `try_alloc_object` / the ObjectHeader::new contract — only
+        // `alloc_array` writes a non-zero array_length, and it sets
+        // `kind = Array` together with it).
         //
         // The binary-trees workload exposed a JIT inline-allocation path that
         // writes `array_length` into the header but leaves `kind` at its
@@ -6176,6 +5962,151 @@ fn gen_object_total_size(header: &ObjectHeader) -> usize {
 fn slot_ptr(obj_ref: ObjectRef, index: usize) -> *mut u8 {
     // SAFETY: Caller guarantees `index` is within the object's slot count; pointer arithmetic stays within the allocation.
     unsafe { obj_ref.as_ptr().add(HEADER_SIZE + index * SLOT_SIZE) }
+}
+
+/// Plan an object allocation under the compact reference-field layout.
+///
+/// Returns `(total_size, array_length, gc_flags)`:
+/// - When the flag is on, a layout is registered for `class_id`, and its field
+///   count matches `num_fields`, the object uses the **compact** layout:
+///   `total_size = HEADER_SIZE + body_size`, `array_length = body_size` (the
+///   object's body bytes, since arrays-vs-objects is disambiguated by `kind`),
+///   and `gc_flags = GC_FLAG_COMPACT`.
+/// - Otherwise the legacy uniform layout: `total_size = HEADER_SIZE +
+///   num_fields*SLOT_SIZE`, `array_length = 0`, `gc_flags = 0`.
+///
+/// `None` only on size overflow.
+#[inline]
+fn plan_object_alloc(class_id: ClassId, num_fields: usize) -> Option<(usize, u32, u8)> {
+    if compact_ref_fields_enabled() {
+        if let Some(layout) = class_layout(class_id.as_u32()) {
+            if layout.field_count() == num_fields {
+                let total = HEADER_SIZE.checked_add(layout.body_size as usize)?;
+                return Some((total, layout.body_size, GC_FLAG_COMPACT));
+            }
+        }
+    }
+    let body = num_fields.checked_mul(SLOT_SIZE)?;
+    Some((HEADER_SIZE.checked_add(body)?, 0, 0))
+}
+
+/// Resolve a field access on a (possibly compact) object to `(byte_offset,
+/// is_ref)` within the object body. Returns `None` for a legacy object (caller
+/// uses the uniform `index * SLOT_SIZE` 16-byte cell). Keys on the per-object
+/// `GC_FLAG_COMPACT` bit, so legacy and compact objects coexist correctly.
+#[inline]
+fn compact_field_slot(header: &ObjectHeader, index: usize) -> Option<(usize, bool)> {
+    if !is_compact_object(header) {
+        return None;
+    }
+    let layout = class_layout(header.class_id.as_u32())?;
+    let off = layout.field_offset(index)? as usize;
+    let is_ref = layout.field_is_ref(index)?;
+    Some((off, is_ref))
+}
+
+/// Visit every reference slot of an object/array (read-only), invoking
+/// `f(referent_ptr, slot_id)` for each non-null reference.
+///
+/// `slot_id` is the slot's GC identifier, reused by the dirty-card scan/fixup
+/// pair: an **element index** for reference arrays, the **byte offset** for a
+/// compact object's 8-byte reference slot, or the **field index** for a legacy
+/// object's 16-byte cell. This three-way split mirrors the layout the heap
+/// writes, so flag-off runs only the array + legacy arms (identical to dev).
+///
+/// # Safety
+/// `obj_ptr` must point to a valid, fully-initialized object/array header whose
+/// body is in-bounds for the slot ranges implied by `header`.
+#[inline]
+pub(crate) unsafe fn for_each_ref_slot(
+    obj_ptr: *mut u8,
+    header: &ObjectHeader,
+    mut f: impl FnMut(*mut u8, usize),
+) {
+    if header.kind == ObjectKind::Array {
+        if header.element_type == ArrayElementType::Reference {
+            for i in 0..header.array_length as usize {
+                let s = obj_ptr.add(HEADER_SIZE + i * REF_ELEMENT_SIZE);
+                let raw: u64 = std::ptr::read(s as *const u64);
+                if raw != 0 {
+                    f(raw as usize as *mut u8, i);
+                }
+            }
+        }
+    } else if let Some((layout, body)) = crate::heap::compact_oop_scan(header) {
+        for &off in &layout.ref_offsets {
+            let off = off as usize;
+            if off + crate::heap::REF_FIELD_SIZE > body {
+                break;
+            }
+            let s = obj_ptr.add(HEADER_SIZE + off);
+            let raw: u64 = std::ptr::read(s as *const u64);
+            if raw != 0 {
+                f(raw as usize as *mut u8, off);
+            }
+        }
+    } else {
+        for slot_idx in 0..header.num_slots as usize {
+            let s = obj_ptr.add(HEADER_SIZE + slot_idx * SLOT_SIZE);
+            if let Value::Object(Some(r)) = std::ptr::read(s as *const Value) {
+                f(r.as_ptr(), slot_idx);
+            }
+        }
+    }
+}
+
+/// Forward/remap every reference slot of an object/array: for each non-null
+/// referent, calls `forward(referent_ptr)`; on `Some(new_ptr)` the slot is
+/// rewritten (8-byte raw for arrays/compact objects, 16-byte `Value::Object`
+/// for legacy objects), on `None` the slot is left untouched. Handles all three
+/// layouts; flag-off runs only the array + legacy arms (identical to dev, with
+/// non-forwarded slots never written).
+///
+/// # Safety
+/// Same contract as [`for_each_ref_slot`]. A returned `Some(ptr)` must be a
+/// valid heap pointer.
+#[inline]
+pub(crate) unsafe fn forward_ref_slots(
+    obj_ptr: *mut u8,
+    header: &ObjectHeader,
+    mut forward: impl FnMut(*mut u8) -> Option<*mut u8>,
+) {
+    if header.kind == ObjectKind::Array {
+        if header.element_type == ArrayElementType::Reference {
+            for i in 0..header.array_length as usize {
+                let s = obj_ptr.add(HEADER_SIZE + i * REF_ELEMENT_SIZE);
+                let raw: u64 = std::ptr::read(s as *const u64);
+                if raw != 0 {
+                    if let Some(n) = forward(raw as usize as *mut u8) {
+                        std::ptr::write(s as *mut u64, n as u64);
+                    }
+                }
+            }
+        }
+    } else if let Some((layout, body)) = crate::heap::compact_oop_scan(header) {
+        for &off in &layout.ref_offsets {
+            let off = off as usize;
+            if off + crate::heap::REF_FIELD_SIZE > body {
+                break;
+            }
+            let s = obj_ptr.add(HEADER_SIZE + off);
+            let raw: u64 = std::ptr::read(s as *const u64);
+            if raw != 0 {
+                if let Some(n) = forward(raw as usize as *mut u8) {
+                    std::ptr::write(s as *mut u64, n as u64);
+                }
+            }
+        }
+    } else {
+        for slot_idx in 0..header.num_slots as usize {
+            let s = obj_ptr.add(HEADER_SIZE + slot_idx * SLOT_SIZE);
+            if let Value::Object(Some(r)) = std::ptr::read(s as *const Value) {
+                if let Some(n) = forward(r.as_ptr()) {
+                    std::ptr::write(s as *mut Value, Value::Object(Some(ObjectRef::from_raw(n))));
+                }
+            }
+        }
+    }
 }
 
 /// Walk every object header in `arena` and clear `GC_FLAG_MARKED`.
@@ -6863,6 +6794,54 @@ mod tests {
                 assert_eq!(heap.get_field(b, 0).as_int(), Some(4242));
             }
             other => panic!("live chain corrupted after hole reuse: {other:?}"),
+        }
+    }
+
+    /// A5 fix regression: the `unregistered_jit_frame_on_stack` flag must force
+    /// the same NON-MOVING sweep as `is_active()`. The VM root scan sets it when
+    /// it finds a guard-less JIT frame on the native stack (the compiled
+    /// entry-point `main`); without the non-moving path the moving collector
+    /// would relocate that frame's conservatively-marked roots and leave its raw
+    /// stack slots stale (the bintrees `main`-compiled corruption). Here the flag
+    /// is set directly (no JIT-quiescence `enter()`), and the collector must keep
+    /// survivors in place exactly as in `non_moving_sweep_when_jit_active`.
+    #[test]
+    fn non_moving_sweep_when_unregistered_jit_frame_on_stack() {
+        let heap = small_gen_heap();
+        let monitors = NoOpMonitors;
+
+        let obj_a = heap.alloc_object(ClassId::new(1), 1);
+        let obj_b = heap.alloc_object(ClassId::new(2), 1);
+        heap.set_field(obj_a, 0, Value::Object(Some(obj_b)));
+        heap.set_field(obj_b, 0, Value::Int(4242));
+        let a_ptr = obj_a.as_ptr();
+        let b_ptr = obj_b.as_ptr();
+
+        // No JIT quiescence — only the unregistered-frame flag is set, exactly
+        // as `conservative_roots::scan_active_jit_frames` does on detection.
+        assert!(!crate::gc_quiescence::is_active());
+        crate::gc_quiescence::set_unregistered_jit_frame_on_stack();
+        assert!(crate::gc_quiescence::unregistered_jit_frame_on_stack());
+
+        let mut roots = vec![obj_a];
+        let result = heap.collect_garbage(&stw(), &mut roots, &monitors);
+
+        crate::gc_quiescence::clear_unregistered_jit_frame_on_stack();
+
+        // Non-moving: nothing copied, empty pointer map, addresses UNCHANGED.
+        assert_eq!(
+            result.stats.objects_copied, 0,
+            "unregistered-JIT-frame flag must select the non-moving sweep"
+        );
+        assert!(result.pointer_map.is_empty());
+        assert_eq!(roots[0].as_ptr(), a_ptr, "survivor must not move");
+        assert_eq!(obj_a.as_ptr(), a_ptr);
+        match heap.get_field(obj_a, 0) {
+            Value::Object(Some(b)) => {
+                assert_eq!(b.as_ptr(), b_ptr, "B must not move");
+                assert_eq!(heap.get_field(b, 0).as_int(), Some(4242));
+            }
+            other => panic!("A's field should still reference B, got {other:?}"),
         }
     }
 

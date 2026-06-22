@@ -1,10 +1,26 @@
 # GC: object-binarytrees JIT-frame stale root under extreme `GC_STRESS` (`main` reads `args`)
 
-**Status:** 🔴 **OPEN** — a residual member of **Family A** (GC root coverage under JIT). Found
-2026-06-21. JIT-only; reproduces **only at extreme young-GC frequency** (`CRATONVM_DBG_GC_STRESS`
-≤ 65536, i.e. a young GC every ≤ 64 KB of allocation) — i.e. **below** the 524288 / 4 MB thresholds at
-which the A3 precise-oop-maps fix (`32649b56`, default-on) was verified. Precise maps **on or off make no
-difference**; this is *not* closed by the A3 fix.
+**Status:** ✅ **FIXED on the default path (Windows)** — dev merge `77c98761` / fix `6e92f0e5`.
+Root-caused (instrumented) to the generational MOVING young collector relocating the **compiled
+entry-point `main`**'s live objects: `main`'s JIT frame is invisible to `gc_quiescence` (it is
+invoked via `Vm::invoke` WITHOUT a `JitEntryGuard`), so `is_active()` is false and the collector
+moves instead of running the non-moving sweep. The fix detects an unregistered JIT frame on the
+native stack (a JIT code return address via `cratonvm_jit::lookup_jit_code_range`), conservatively
+marks its oops with a full-stack scan, and runs the non-moving sweep (pin, don't relocate).
+**Validated:** `VAAload 14 @CRATONVM_DBG_GC_STRESS=4096` → `3222190` 5/5 (was crash 8/8); all repro
+variants ==HotSpot; `bt16` throughput byte-identical; `cratonvm-gc` 732/732 (incl. regression
+`non_moving_sweep_when_unregistered_jit_frame_on_stack`). **Follow-up done:** the
+`JIT_ENTRY_CHAIN`-non-empty case (an unregistered `main` ABOVE a registered chain) is now also
+covered — the detection scans `[cover_hi, stack_high)` regardless of chain length and marks the
+above-chain frame (no collector-choice change when the chain is non-empty, so no throughput cost;
+dev merge `9c64d691`). **Remaining residual:** Windows-only — the detection reuses
+`current_thread_stack_high` (Win32 `GetCurrentThreadStackLimits`); a portable (pthread) port is a
+tracked follow-up that needs a non-Windows environment to validate. See the CRACKED + fix notes below.
+
+Originally a residual member of **Family A** (GC root coverage under JIT). Found 2026-06-21.
+JIT-only; reproduced **only at extreme young-GC frequency** (`CRATONVM_DBG_GC_STRESS` ≤ 65536, i.e.
+a young GC every ≤ 64 KB) — **below** the 524288 / 4 MB thresholds at which the A3 precise-oop-maps
+fix (`32649b56`) was verified. Precise maps **on or off** made no difference; not closed by A3.
 
 ---
 
@@ -141,7 +157,7 @@ Two observable end-states (both are the same bug; timing decides which):
 
 Canonical: object-based binarytrees that accumulates one checksum, `maxDepth` from `args[0]`.
 Minimal repros and clean controls are in
-[`repros/gc-stress-bintrees-main-args/`](repros/gc-stress-bintrees-main-args/).
+[`repros/gc-stress-bintrees-main-args/`](../../known-issues/repros/gc-stress-bintrees-main-args/).
 
 ```bash
 cd docs/known-issues/repros/gc-stress-bintrees-main-args
@@ -236,7 +252,7 @@ experiments were run.
 
 ## Relationship to existing Family-A members
 
-- Closest to **A2** ([reflrepro-register-resident-jit-root-handoff.md](reflrepro-register-resident-jit-root-handoff.md)):
+- Closest to **A2** ([reflrepro-register-resident-jit-root-handoff.md](../../known-issues/reflrepro-register-resident-jit-root-handoff.md)):
   both show `inconsistent header` on the young-sweep walk and are **not** fixed by precise maps. A2's
   repro is reflection / String-array churn; this one is object-graph recursion with a sharp,
   one-opcode trigger (`main` reads `args`) and a clean GC-frequency boundary. They may share a root

@@ -1753,6 +1753,13 @@ impl IrBuilder {
                 // every `putfield` (no IR `Op::Store` lowering yet — writes
                 // need scheduler memory ordering, a separate slice).
                 0xb4 => {
+                    // Compact reference-field layout packs field offsets (refs to
+                    // 8 bytes), so the `HEADER_SIZE + field_index*SLOT_SIZE`
+                    // displacement this lowerer derives is wrong. Bail to the
+                    // compact-aware single-pass helper path.
+                    if cratonvm_types::compact_ref_fields_enabled() {
+                        return None;
+                    }
                     let (field_index, type_tag) = match self.field_info.get(&pc) {
                         Some(&fi) => fi,
                         None => return None,
@@ -1787,6 +1794,11 @@ impl IrBuilder {
                 // input-edge topological sort). Non-int fields and any pc without
                 // resolved layout bail (`None` → single-pass).
                 0xb5 => {
+                    // See the getfield (0xb4) note: compact layout packs offsets,
+                    // so bail to single-pass.
+                    if cratonvm_types::compact_ref_fields_enabled() {
+                        return None;
+                    }
                     let (field_index, type_tag) = match self.field_info.get(&pc) {
                         Some(&fi) => fi,
                         None => return None,
@@ -1813,6 +1825,12 @@ impl IrBuilder {
                 // analysis (escaping) makes the whole compile bail to
                 // single-pass — enforced by the caller after `optimize`.
                 0xbb => {
+                    // Compact layout sizes objects from the packed body, not
+                    // `num_fields * SLOT_SIZE`; bail to the compact-aware
+                    // single-pass `jit_new_object` helper path.
+                    if cratonvm_types::compact_ref_fields_enabled() {
+                        return None;
+                    }
                     let (class_id, num_fields) = match self.new_info.get(&pc) {
                         Some(&ci) => ci,
                         None => return None,

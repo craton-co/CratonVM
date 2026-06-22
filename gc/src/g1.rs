@@ -17,6 +17,7 @@
 //! - **Humongous allocation:** Objects > region_size/2 span contiguous regions.
 
 use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering};
 
@@ -832,6 +833,11 @@ impl G1Region {
 /// hotfix; the cap below is the defensive interim.
 const MARK_WORKLIST_CAP: usize = 1 << 20;
 
+/// Bound on the per-collection pause-record ring (§7 item 6). 64K records is
+/// ~1.5 MB and covers a very long soak's most-recent window for p50/p99; older
+/// records are evicted (and counted) so memory stays bounded.
+const PAUSE_HISTORY_CAP: usize = 1 << 16;
+
 // ---------------------------------------------------------------------------
 // Collection type
 // ---------------------------------------------------------------------------
@@ -845,6 +851,56 @@ pub enum G1CollectionType {
     Mixed,
     /// Full heap compaction (fallback when evacuation fails).
     Full,
+}
+
+/// One STW collection's pause record (§7 item 6 — the structured pause sink).
+///
+/// Pause is recorded in **microseconds** (not milliseconds): a young G1 pause
+/// is routinely sub-millisecond, so the old `Duration::as_millis()` rounded the
+/// whole young series to `0` and made p50/p99 reporting (§5) impossible. The
+/// collector keeps a bounded ring of the most recent records (see
+/// `G1Collector::pause_history`) which `pause_summary()` reduces to percentiles.
+#[derive(Debug, Clone, Copy)]
+pub struct G1PauseRecord {
+    /// Young / mixed / full.
+    pub collection_type: G1CollectionType,
+    /// STW pause duration in microseconds.
+    pub pause_us: u64,
+    /// Live objects copied.
+    pub objects_copied: usize,
+    /// Bytes copied (headers + slot data).
+    pub bytes_copied: usize,
+    /// Bytes reclaimed.
+    pub bytes_freed: usize,
+}
+
+/// Percentile reduction of the recorded pauses, split by collection type
+/// (the §5 acceptance metric). All durations are microseconds.
+#[derive(Debug, Clone, Default)]
+pub struct G1PausePercentiles {
+    /// Number of collections of this type in the (bounded) history.
+    pub count: u64,
+    /// Total pause across the recorded collections.
+    pub total_us: u64,
+    /// Median (50th percentile) pause.
+    pub p50_us: u64,
+    /// 99th percentile pause.
+    pub p99_us: u64,
+    /// Worst observed pause.
+    pub max_us: u64,
+}
+
+/// Aggregate pause summary for a run: young + mixed percentiles plus the
+/// number of records dropped from the bounded ring (so a long soak's summary
+/// never silently under-reports — see `PAUSE_HISTORY_CAP`).
+#[derive(Debug, Clone, Default)]
+pub struct G1PauseSummary {
+    /// Young-only collection percentiles.
+    pub young: G1PausePercentiles,
+    /// Mixed collection percentiles.
+    pub mixed: G1PausePercentiles,
+    /// Records evicted from the bounded ring before this summary was taken.
+    pub dropped: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -892,8 +948,19 @@ pub struct G1Collector {
 
     /// Number of collections performed.
     collection_count: AtomicU64,
-    /// Total pause time in milliseconds across all collections.
-    total_pause_ms: AtomicU64,
+    /// Total pause time in **microseconds** across all collections. (The public
+    /// `total_pause_ms()` accessor derives milliseconds from this; storing
+    /// microseconds keeps sub-millisecond young pauses from rounding to zero.)
+    total_pause_us: AtomicU64,
+    /// Bounded ring of the most recent per-collection pause records
+    /// (§7 item 6 — the structured pause sink that `pause_summary()` reduces to
+    /// p50/p99). Capped at `PAUSE_HISTORY_CAP`; the oldest record is evicted
+    /// when full and `pause_history_dropped` counts the evictions so a summary
+    /// stays honest about coverage. Lock order: this is a leaf lock, never held
+    /// across `regions.lock()`.
+    pause_history: Mutex<VecDeque<G1PauseRecord>>,
+    /// Records evicted from `pause_history` because the ring was full.
+    pause_history_dropped: AtomicU64,
 
     /// Step 7 (pause-target CSet sizing) — rolling per-region copy-cost
     /// calibration: an EMA of observed evacuation cost in **nanoseconds per
@@ -1040,7 +1107,9 @@ impl G1Collector {
             gc_state: Arc::new(ConcurrentGcState::new()),
             satb_queue: Arc::new(SatbQueue::new()),
             collection_count: AtomicU64::new(0),
-            total_pause_ms: AtomicU64::new(0),
+            total_pause_us: AtomicU64::new(0),
+            pause_history: Mutex::new(VecDeque::new()),
+            pause_history_dropped: AtomicU64::new(0),
             evac_ns_per_byte: AtomicU64::new(4),
             old_gen_bytes: AtomicUsize::new(0),
             marking_threshold_bytes: AtomicUsize::new(ihop_threshold),
@@ -1520,20 +1589,13 @@ impl G1Collector {
             }
         }
 
-        let pause_ms = start.elapsed().as_millis() as u64;
-        // Relaxed ordering: collection_count and total_pause_ms are statistics
-        // counters used for monitoring/logging only. They do not guard any data
-        // and a slightly stale read is harmless.
-        self.collection_count.fetch_add(1, Ordering::Relaxed);
-        self.total_pause_ms.fetch_add(pause_ms, Ordering::Relaxed);
-
+        let pause_us = start.elapsed().as_micros() as u64;
         let stats = GcStats {
             objects_copied,
             bytes_copied,
             bytes_freed,
         };
-
-        self.log_gc_event(&G1CollectionType::YoungOnly, pause_ms, &stats);
+        self.record_collection(G1CollectionType::YoungOnly, pause_us, &stats);
 
         GcResult { stats, pointer_map }
     }
@@ -1620,18 +1682,29 @@ impl G1Collector {
         monitors: &dyn MonitorCleanup,
     ) -> GcResult {
         // Mixed GC always uses the SERIAL evacuator, even under
-        // `CRATONVM_G1_PARALLEL_EVAC`. Rationale: mixed GC was non-functional
-        // until the concurrent-marking + Old/humongous->old rset-completeness
-        // fixes landed, so `mixed_collection_parallel` was never exercised — and
-        // the parallel evacuator has a known data race that leaves a handful of
-        // dangling references on humongous-reference-array workloads (it
-        // reproduces in parallel *young* collections too, pre-existing on dev;
-        // tracked separately). The serial mixed path is differentially verified
-        // (byte-identical to HotSpot, V7b-clean) so it is the correct choice
-        // until the parallel evacuator race is fixed; mixed GCs are infrequent,
-        // so serializing them costs little. The parallel young path is unchanged
-        // (`young_collection` still dispatches to it). `mixed_collection_parallel`
-        // is retained (and unit-tested directly) for when the race is resolved.
+        // `CRATONVM_G1_PARALLEL_EVAC`. The parallel evacuator still has an OPEN
+        // correctness bug, so mixed (which reclaims old gen) stays on the
+        // differentially-verified serial path.
+        //
+        // Two distinct parallel-evac defects exist:
+        //  1. self-forward (evacuation-failure) UAF — FIXED on dev `7e97111e`
+        //     (`parallel_evacuate` clears each self-forward's `forwarding_ptr`
+        //     after merging the shards; the `key == value` loop).
+        //  2. a RARE, NON-DETERMINISTIC race in the *young* parallel evacuator
+        //     (`run_worker`/`evacuate`/`process_object`) that intermittently
+        //     corrupts a live object under frequent young GCs at small heaps —
+        //     reproduced on `SteadyChurn @16m --nojit` (~1 in 8 runs, smallest
+        //     heap only; serial is always correct). This is NOT defect 1 (no
+        //     to-space exhaustion) and is the tracked parallel-evac follow-up.
+        //     Because it lives in the shared `parallel_evacuate` closure that
+        //     `mixed_collection_parallel` also drives, mixed must not be routed
+        //     to it until the race is fixed — even though `PromoteMixed` happened
+        //     to pass at the larger heaps it was tested on.
+        //
+        // mixed GCs are infrequent, so serializing them costs little. The
+        // parallel young path is unchanged (`young_collection` still dispatches
+        // to it under the flag). `mixed_collection_parallel` is retained (and
+        // unit-tested directly) for when defect 2 is resolved.
         let start = std::time::Instant::now();
         let mut regions = self.regions.lock();
         // SECURITY FIX (V7a): mixed GC resets/retypes CSet regions
@@ -1830,22 +1903,17 @@ impl G1Collector {
         }
 
         let elapsed = start.elapsed();
-        let pause_ms = elapsed.as_millis() as u64;
+        let pause_us = elapsed.as_micros() as u64;
         // Step 7 — recalibrate the rolling copy-cost from this mixed cycle's
         // actual pause / bytes copied, so the next mixed CSet is sized against
         // real wall-clock throughput.
         self.update_evac_cost(elapsed.as_nanos() as u64, bytes_copied);
-        // Relaxed ordering: statistics counters for monitoring/logging only.
-        self.collection_count.fetch_add(1, Ordering::Relaxed);
-        self.total_pause_ms.fetch_add(pause_ms, Ordering::Relaxed);
-
         let stats = GcStats {
             objects_copied,
             bytes_copied,
             bytes_freed,
         };
-
-        self.log_gc_event(&G1CollectionType::Mixed, pause_ms, &stats);
+        self.record_collection(G1CollectionType::Mixed, pause_us, &stats);
 
         GcResult { stats, pointer_map }
     }
@@ -2006,6 +2074,46 @@ impl G1Collector {
             }
         }
 
+        // PARALLEL-EVAC UAF FIX (Step 9). The parallel evacuator CAS-installs
+        // each forward into the from-space object's *persistent*
+        // `ObjectHeader::forwarding_ptr` field (the lock-free install slot),
+        // unlike the serial path which records forwards only in the per-cycle
+        // `pointer_map`. For a normally-evacuated object that is harmless: its
+        // from-space region is reset in Phase 5 (`free_or_keep_cset`), which
+        // zeroes the field. But a *self-forwarded* object (evacuation failure —
+        // to-space pool exhausted — installs `old -> old`, a `key == value`
+        // entry) lives in a region that Phase 5 KEEPS and never resets, so its
+        // `forwarding_ptr` would retain its own address across collections.
+        //
+        // The NEXT collection's `evacuate` fast path
+        // (`let e = forwarding_ptr; if e != 0 { return (e, false) }`) would then
+        // read that stale self-pointer, SKIP re-evacuating the still-live object
+        // (now back in the CSet) and record NO forward for it this cycle —
+        // whereupon `free_or_keep_cset`, seeing no `key == value` entry, frees
+        // the region out from under every referrer. Result: dangling references
+        // into reclaimed memory (intermittent SIGSEGV; the V7b verifier reports
+        // "freed CSet region ... no forwarding entry"). Manifests at scale on a
+        // large humongous reference array whose elements repeatedly fail to find
+        // to-space.
+        //
+        // Restore the evacuator's "`forwarding_ptr == 0` at collection start"
+        // invariant for the only objects that violate it — the self-forwarded
+        // (kept-in-place) ones — now that the transitive closure is complete and
+        // no further `evacuate` call this cycle depends on the in-place forward.
+        // The merge above is the first point at which every shard's self-forward
+        // is visible. The serial path never writes this header field, which is
+        // why it is V7b-clean on the identical workload.
+        for (&k, &v) in pointer_map.iter() {
+            if k == v {
+                // SAFETY: `k` is a live from-space object address that the
+                // evacuator just CAS-forwarded to itself; its header is intact
+                // and its region is held under the collection's `regions` lock.
+                unsafe {
+                    (*(k as *mut ObjectHeader)).forwarding_ptr = std::ptr::null_mut();
+                }
+            }
+        }
+
         (pointer_map, objs, bytes)
     }
 
@@ -2096,16 +2204,13 @@ impl G1Collector {
             }
         }
 
-        let pause_ms = start.elapsed().as_millis() as u64;
-        self.collection_count.fetch_add(1, Ordering::Relaxed);
-        self.total_pause_ms.fetch_add(pause_ms, Ordering::Relaxed);
-
+        let pause_us = start.elapsed().as_micros() as u64;
         let stats = GcStats {
             objects_copied,
             bytes_copied,
             bytes_freed,
         };
-        self.log_gc_event(&G1CollectionType::YoungOnly, pause_ms, &stats);
+        self.record_collection(G1CollectionType::YoungOnly, pause_us, &stats);
         GcResult { stats, pointer_map }
     }
 
@@ -2215,17 +2320,14 @@ impl G1Collector {
         }
 
         let elapsed = start.elapsed();
-        let pause_ms = elapsed.as_millis() as u64;
+        let pause_us = elapsed.as_micros() as u64;
         self.update_evac_cost(elapsed.as_nanos() as u64, bytes_copied);
-        self.collection_count.fetch_add(1, Ordering::Relaxed);
-        self.total_pause_ms.fetch_add(pause_ms, Ordering::Relaxed);
-
         let stats = GcStats {
             objects_copied,
             bytes_copied,
             bytes_freed,
         };
-        self.log_gc_event(&G1CollectionType::Mixed, pause_ms, &stats);
+        self.record_collection(G1CollectionType::Mixed, pause_us, &stats);
         GcResult { stats, pointer_map }
     }
 
@@ -3512,17 +3614,140 @@ impl G1Collector {
         self.evac_ns_per_byte.store(next.max(1), Ordering::Relaxed);
     }
 
-    fn log_gc_event(&self, collection_type: &G1CollectionType, pause_ms: u64, stats: &GcStats) {
+    /// Account for one completed STW collection: bump the counters, append the
+    /// microsecond-granular record to the bounded pause ring, and emit the log
+    /// line(s). Called by every young/mixed evacuation path (serial + parallel)
+    /// so the pause sink and the `[GC ...]` log stay in lock-step. `pause_us`
+    /// is `Instant::elapsed().as_micros()` — see `G1PauseRecord`.
+    fn record_collection(
+        &self,
+        collection_type: G1CollectionType,
+        pause_us: u64,
+        stats: &GcStats,
+    ) {
+        // Relaxed ordering: these are statistics counters for monitoring /
+        // logging only. They guard no data and a slightly stale read is
+        // harmless.
+        self.collection_count.fetch_add(1, Ordering::Relaxed);
+        self.total_pause_us.fetch_add(pause_us, Ordering::Relaxed);
+
+        {
+            let mut hist = self.pause_history.lock();
+            if hist.len() >= PAUSE_HISTORY_CAP {
+                hist.pop_front();
+                self.pause_history_dropped.fetch_add(1, Ordering::Relaxed);
+            }
+            hist.push_back(G1PauseRecord {
+                collection_type,
+                pause_us,
+                objects_copied: stats.objects_copied,
+                bytes_copied: stats.bytes_copied,
+                bytes_freed: stats.bytes_freed,
+            });
+        }
+
+        self.log_gc_event(collection_type, pause_us, stats);
+    }
+
+    fn log_gc_event(&self, collection_type: G1CollectionType, pause_us: u64, stats: &GcStats) {
         if !self.gc_log_enabled.load(Ordering::Relaxed) {
             return;
         }
+        // Two sinks:
+        //  - `tracing::info!` keeps the legacy `[GC <Type>] ...` line for
+        //    `RUST_LOG=cratonvm_gc=info` consumers and the G1-selection guard
+        //    (which greps for `[GC YoungOnly]`); pause is now microseconds.
+        //  - a structured `[GC-STAT]` line straight to stderr so the pause +
+        //    bytes are visible with JUST `--verbose:gc` (no RUST_LOG needed)
+        //    and trivially parseable by the gauntlet runner (§7 item 6).
         tracing::info!(
-            "[GC {:?}] pause={pause_ms}ms copied={} bytes_copied={} freed={}",
+            "[GC {:?}] pause={pause_us}us copied={} bytes_copied={} freed={}",
             collection_type,
             stats.objects_copied,
             stats.bytes_copied,
             stats.bytes_freed,
         );
+        eprintln!(
+            "[GC-STAT] type={:?} pause_us={pause_us} objects_copied={} bytes_copied={} bytes_freed={}",
+            collection_type, stats.objects_copied, stats.bytes_copied, stats.bytes_freed,
+        );
+    }
+
+    /// Snapshot the bounded pause ring (most-recent window) for offline
+    /// percentile/throughput analysis.
+    pub fn pause_history_snapshot(&self) -> Vec<G1PauseRecord> {
+        self.pause_history.lock().iter().copied().collect()
+    }
+
+    /// Reduce the recorded pauses to per-type p50/p99/max (§5 acceptance
+    /// metric). Returns `None` when nothing has been collected yet.
+    pub fn pause_summary(&self) -> Option<G1PauseSummary> {
+        let hist = self.pause_history.lock();
+        if hist.is_empty() {
+            return None;
+        }
+        let reduce = |kind: G1CollectionType| -> G1PausePercentiles {
+            let mut samples: Vec<u64> = hist
+                .iter()
+                .filter(|r| r.collection_type == kind)
+                .map(|r| r.pause_us)
+                .collect();
+            if samples.is_empty() {
+                return G1PausePercentiles::default();
+            }
+            samples.sort_unstable();
+            let count = samples.len();
+            let total_us: u64 = samples.iter().sum();
+            // Nearest-rank percentile: index ceil(p/100 * N) - 1, clamped.
+            let pct = |p: usize| -> u64 {
+                let rank = ((p * count) + 99) / 100; // ceil(p*N/100)
+                let idx = rank.saturating_sub(1).min(count - 1);
+                samples[idx]
+            };
+            G1PausePercentiles {
+                count: count as u64,
+                total_us,
+                p50_us: pct(50),
+                p99_us: pct(99),
+                max_us: *samples.last().unwrap(),
+            }
+        };
+        Some(G1PauseSummary {
+            young: reduce(G1CollectionType::YoungOnly),
+            mixed: reduce(G1CollectionType::Mixed),
+            dropped: self.pause_history_dropped.load(Ordering::Relaxed),
+        })
+    }
+
+    /// Print the aggregate pause summary to stderr (the §5 p50/p99 table). A
+    /// no-op when no collection has run. Emitted at VM shutdown when GC stats
+    /// are requested — see `VmHeap::print_gc_summary`.
+    pub fn print_gc_summary(&self) {
+        let Some(s) = self.pause_summary() else {
+            return;
+        };
+        let line = |label: &str, p: &G1PausePercentiles| {
+            if p.count == 0 {
+                return;
+            }
+            eprintln!(
+                "[GC-SUMMARY] {label} count={} total_us={} p50_us={} p99_us={} max_us={} avg_us={}",
+                p.count,
+                p.total_us,
+                p.p50_us,
+                p.p99_us,
+                p.max_us,
+                p.total_us / p.count.max(1),
+            );
+        };
+        line("young", &s.young);
+        line("mixed", &s.mixed);
+        if s.dropped > 0 {
+            eprintln!(
+                "[GC-SUMMARY] note: {} oldest record(s) evicted from the {}-entry ring (percentiles cover the most-recent window)",
+                s.dropped, PAUSE_HISTORY_CAP,
+            );
+        }
     }
 
     /// Enable GC event logging.
@@ -3542,7 +3767,13 @@ impl G1Collector {
 
     /// Get the total pause time across all collections.
     pub fn total_pause_ms(&self) -> u64 {
-        self.total_pause_ms.load(Ordering::Relaxed)
+        self.total_pause_us.load(Ordering::Relaxed) / 1000
+    }
+
+    /// Total pause time across all collections in microseconds (the precise
+    /// accumulator; `total_pause_ms()` rounds this to milliseconds).
+    pub fn total_pause_us(&self) -> u64 {
+        self.total_pause_us.load(Ordering::Relaxed)
     }
 
     /// Get the current GC phase.
@@ -5841,6 +6072,77 @@ mod tests {
         assert_eq!(gc.collection_count(), 2);
     }
 
+    // -- Pause sink (§7 item 6) --
+
+    #[test]
+    fn pause_history_records_each_collection() {
+        let gc = make_collector();
+        let obj = gc.alloc_object(ClassId::new(1), 0);
+        let mut roots = vec![obj];
+
+        assert!(gc.pause_summary().is_none(), "no history before any GC");
+
+        gc.young_collection(&mut roots, &NoopMonitors);
+        gc.young_collection(&mut roots, &NoopMonitors);
+
+        let hist = gc.pause_history_snapshot();
+        assert_eq!(hist.len(), 2, "one record per collection");
+        assert!(hist
+            .iter()
+            .all(|r| r.collection_type == G1CollectionType::YoungOnly));
+
+        let summary = gc.pause_summary().expect("history present");
+        assert_eq!(summary.young.count, 2);
+        assert_eq!(summary.mixed.count, 0);
+        // Microsecond accumulator agrees with the per-record total.
+        let recorded: u64 = hist.iter().map(|r| r.pause_us).sum();
+        assert_eq!(gc.total_pause_us(), recorded);
+    }
+
+    #[test]
+    fn pause_percentiles_nearest_rank() {
+        // Drive the reduction directly with a known distribution so the
+        // percentile math is exercised independently of wall-clock timing.
+        let gc = make_collector();
+        let stats = GcStats {
+            objects_copied: 0,
+            bytes_copied: 0,
+            bytes_freed: 0,
+        };
+        // pauses 10,20,...,100 us (10 young collections).
+        for i in 1..=10u64 {
+            gc.record_collection(G1CollectionType::YoungOnly, i * 10, &stats);
+        }
+        let s = gc.pause_summary().unwrap();
+        assert_eq!(s.young.count, 10);
+        assert_eq!(s.young.max_us, 100);
+        // nearest-rank: p50 -> ceil(0.5*10)=5th -> 50; p99 -> ceil(0.99*10)=10th -> 100.
+        assert_eq!(s.young.p50_us, 50);
+        assert_eq!(s.young.p99_us, 100);
+        assert_eq!(s.young.total_us, 550);
+    }
+
+    #[test]
+    fn pause_history_ring_is_bounded() {
+        let gc = make_collector();
+        let stats = GcStats {
+            objects_copied: 0,
+            bytes_copied: 0,
+            bytes_freed: 0,
+        };
+        for _ in 0..(PAUSE_HISTORY_CAP + 100) {
+            gc.record_collection(G1CollectionType::YoungOnly, 1, &stats);
+        }
+        assert_eq!(gc.pause_history_snapshot().len(), PAUSE_HISTORY_CAP);
+        assert_eq!(
+            gc.pause_history_dropped.load(Ordering::Relaxed),
+            100,
+            "evictions are counted so the summary stays honest"
+        );
+        // collection_count keeps the true total, not the ring size.
+        assert_eq!(gc.collection_count(), (PAUSE_HISTORY_CAP + 100) as u64);
+    }
+
     // -- Concurrent marking --
 
     #[test]
@@ -7185,6 +7487,62 @@ mod tests {
         gc.young_collection_parallel(&mut roots, &NoopMonitors);
         assert!(gc.count_regions(RegionType::Old) >= 1);
         assert_eq!(gc.get_field(roots[0], 0).as_int(), Some(7));
+    }
+
+    /// Regression (parallel-evac self-forward UAF). The parallel evacuator
+    /// installs each forward into the from-space object's *persistent*
+    /// `ObjectHeader::forwarding_ptr` field. A normally-evacuated object's
+    /// region is reset in Phase 5 (zeroing the field), but a SELF-FORWARDED
+    /// (evacuation-failure) object's region is KEPT — so its `forwarding_ptr`
+    /// must be explicitly cleared at cycle end. Without the clear, the NEXT
+    /// collection's `evacuate` fast path reads the stale self-pointer, SKIPS
+    /// re-evacuating the still-live object, records no forward, and
+    /// `free_or_keep_cset` (seeing no `key == value` entry) frees the region
+    /// out from under it — a use-after-free that surfaced as V7b dangling
+    /// references / SIGSEGV on the `PromoteMixed` humongous-array workload.
+    #[test]
+    fn parallel_self_forward_clears_forwarding_ptr_across_cycles() {
+        let gc = G1Collector::new(parallel_config(4, 6));
+        let obj = gc.alloc_object(ClassId::new(1), 1);
+        gc.set_field(obj, 0, Value::Int(12345));
+        let mut roots = vec![obj];
+
+        // Force an evacuation failure: drain the to-space pool by retyping every
+        // Free region to Old (non-CSet), leaving the GC nowhere to copy the
+        // Eden survivor — so it must self-forward (stay in place).
+        {
+            let mut regions = gc.regions.lock();
+            for r in regions.iter_mut() {
+                if r.region_type == RegionType::Free {
+                    r.region_type = RegionType::Old;
+                }
+            }
+        }
+
+        // Cycle 1: obj cannot be copied -> self-forwards (identity entry).
+        let r1 = gc.young_collection_parallel(&mut roots, &NoopMonitors);
+        let addr = roots[0].as_ptr() as usize;
+        assert_eq!(
+            r1.pointer_map.get(&addr),
+            Some(&addr),
+            "expected a self-forward (evacuation failure)"
+        );
+        assert_eq!(gc.get_field(roots[0], 0).as_int(), Some(12345));
+        // THE FIX: the kept object's persistent forwarding_ptr is cleared, so it
+        // does not look "already forwarded" to the next cycle.
+        assert!(
+            gc.get_header(roots[0]).forwarding_ptr.is_null(),
+            "self-forwarded object's forwarding_ptr must be cleared after the cycle"
+        );
+
+        // Cycle 2: with a stale self-pointer the object would be skipped and its
+        // region freed; the field read would then hit reclaimed memory.
+        gc.young_collection_parallel(&mut roots, &NoopMonitors);
+        assert_eq!(
+            gc.get_field(roots[0], 0).as_int(),
+            Some(12345),
+            "live object lost across a second collection (stale self-forward UAF)"
+        );
     }
 
     #[test]

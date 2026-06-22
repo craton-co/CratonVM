@@ -593,6 +593,55 @@ impl TieredCompilationManager {
         None
     }
 
+    /// wire-tiered-manager Step 5 (precise background OSR): request an OSR
+    /// compilation for a method whose loop the *caller* has already judged hot.
+    ///
+    /// Unlike [`on_backedge`], which counts every back-edge and only enqueues
+    /// once its `osr_threshold` is crossed, this enqueues **immediately** — the
+    /// interpreter's per-frame back-edge schedule (`Frame::should_try_osr`) is
+    /// the throttle, so calling `on_backedge` per iteration just to reach the
+    /// count threshold would both pay a lock per back-edge and double-count.
+    /// It is idempotent: a no-op (returns `None`) if the method is already
+    /// queued, already at/above C2, or has bailed out of C2. The enqueued task
+    /// carries `osr_bci` so the background worker compiles an OSR-enterable
+    /// artifact; the mutator enters it once published. (Threshold tuning of
+    /// when a loop counts as "hot enough" is Step 6.)
+    pub fn request_osr(&self, key: &MethodKey, bci: u32) -> Option<CompilationTask> {
+        let mut methods = self.core.methods.lock();
+        let state = methods
+            .entry(key.clone())
+            .or_insert_with(|| MethodState::new(key.clone()));
+        state.backedge_count = state.backedge_count.saturating_add(1);
+
+        let policy = self.policy.lock();
+        if !policy.tiered_enabled {
+            return None;
+        }
+        if state.queued_for_compilation
+            || state.current_tier >= CompilationTier::C2
+            || state.c2_bailout
+        {
+            return None;
+        }
+
+        let target_tier = CompilationTier::C2;
+        state.queued_for_compilation = true;
+        state.queued_tier = Some(target_tier);
+        let task = CompilationTask {
+            method_key: key.clone(),
+            target_tier,
+            priority: CompilationPriority::High,
+            enqueue_time_ms: 0,
+            osr_bci: Some(bci),
+        };
+        self.core.enqueue(task.clone());
+        self.core
+            .stats
+            .osr_compilations
+            .fetch_add(1, Ordering::Relaxed);
+        Some(task)
+    }
+
     // ── Profile recording ────────────────────────────────────────────────
 
     /// Record a branch outcome for profiling.
@@ -1016,6 +1065,52 @@ mod tests {
             "get",
             "(Ljava/lang/Object;)Ljava/lang/Object;",
         )
+    }
+
+    // ── wire-tiered-manager Step 5: request_osr ──────────────────────────
+
+    #[test]
+    fn step5_request_osr_enqueues_osr_task_immediately() {
+        let mgr = TieredCompilationManager::with_default_policy();
+        let key = test_key();
+        // Unlike on_backedge, the first call enqueues immediately (no 10k count).
+        let task = mgr.request_osr(&key, 42).expect("first request should enqueue");
+        assert_eq!(task.osr_bci, Some(42));
+        assert_eq!(task.priority, CompilationPriority::High);
+        assert_eq!(task.target_tier, CompilationTier::C2);
+        // Idempotent while queued: a second request is a no-op (no double compile).
+        assert!(mgr.request_osr(&key, 42).is_none());
+        // The task really is on the queue, and the OSR stat counted exactly once.
+        let dq = mgr.dequeue_compilation().expect("an OSR task should be queued");
+        assert_eq!(dq.osr_bci, Some(42));
+        assert_eq!(
+            mgr.stats()
+                .osr_compilations
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+    }
+
+    #[test]
+    fn step5_request_osr_skips_when_already_c2_or_bailed() {
+        // Already at C2 → nothing to OSR-compile. `compilation_complete` /
+        // `on_c2_bailout` use `get_mut` (no-op on an unseen method), so the
+        // method must first be registered via `on_method_invocation`.
+        let mgr = TieredCompilationManager::with_default_policy();
+        let key = test_key();
+        mgr.on_method_invocation(&key);
+        mgr.compilation_complete(&key, CompilationTier::C2, 1);
+        assert!(mgr.request_osr(&key, 7).is_none(), "C2 method: no OSR enqueue");
+
+        // C2-bailed method → no OSR enqueue.
+        let mgr2 = TieredCompilationManager::with_default_policy();
+        let key2 = test_key2();
+        mgr2.on_method_invocation(&key2);
+        mgr2.on_c2_bailout(&key2);
+        assert!(
+            mgr2.request_osr(&key2, 7).is_none(),
+            "bailed method: no OSR enqueue"
+        );
     }
 
     // ── Policy defaults ──────────────────────────────────────────────────

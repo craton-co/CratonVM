@@ -1,14 +1,60 @@
 # Real-Frame-Deopt — x64 Backend Backport (Phase A→production)
 
-Status: scoped / not started. Effort: **L** (the gating slice of the XL keystone;
-Phases B/C deferred). Companion to [`real-frame-deopt.md`](real-frame-deopt.md),
-which landed the mechanism on the dormant IR path. This doc scopes bringing it
-to the **production single-pass x64 backend** so it actually deopts real
-workloads.
+Status: **Phase A IMPLEMENTED — all 6 steps landed, behind the default-off
+`CRATONVM_DEOPT_REAL` gate (gate-off byte-identical to production).** Effort: **L**
+(the gating slice of the XL keystone; Phases B/C deferred). Companion to
+[`real-frame-deopt.md`](real-frame-deopt.md), which landed the mechanism on the
+dormant IR path. This doc scoped bringing it to the **production single-pass x64
+backend** so it actually deopts real workloads.
 
 > Scoped via a multi-agent understand→design→adversarial-review pass over the
 > seven x64 subsystems involved. `file:line` citations below are from that pass
 > and reflect the tree at the time of writing — verify before editing, code moves.
+
+## Current status (2026-06-22)
+
+**Phase A is functionally complete.** Steps 1–6 are all implemented and behind the
+default-off `CRATONVM_DEOPT_REAL` gate; with the gate off the codegen is
+byte-identical to production (bt18=68332206).
+
+- **Steps 1–5** landed on `dev` as part of the deopt-osr scaffolding workstream
+  (snapshot at the BCE pilot guard → 3-arg `x64_deopt_entry` + in-stub 16-GPR
+  spill → build+validate the interpreter `Frame` → flip the resume at both sinks →
+  `can_deopt_resume` coverage gate + `CRATONVM_DEOPT_VERIFY` verifier). The cat-2/FP
+  resume extensions (`SavedRegisters.xmm[16]`, `RegisterLong`/`RegisterRef`/
+  `XmmFloat`/`XmmDouble`), the epoch-invalidation de-speculation, and the true
+  OSR-exit state transfer all landed too — see [`real-frame-deopt.md`](real-frame-deopt.md)
+  and the deopt-osr feature doc for the full step-by-step record.
+- **Step 6** (widen to call-site canonical-boundary guards) landed on branch
+  `feat/x64-deopt-backport` (worktree `CratonVM-x64deopt`), commit `a7bff464`,
+  **not yet merged to dev**:
+  - new `snapshot_pre_intrinsic_call(bci, reason)` — idempotent call-site snapshot
+    taken at the canonical flush boundary (post-`flush_scratch_registers`, pre-pop),
+    inserted into `deopt_box_ptr_by_bci`;
+  - `emit_deopt_stubs` routing extended so reason 6 (`ReceiverTypeChanged`,
+    String-intrinsic guards) goes through the frame-deopt trampoline when a
+    snapshot is present, same as reason 2 (`BoundsCheck`);
+  - 7 snapshot sites: arraycopy, `String.charAt/length/isEmpty/hashCode`,
+    `String.equals`, `String.compareTo`, `String.indexOf(char)`,
+    `String.indexOf(String)`, `CRC32.update`;
+  - unique `cratonvm-x64deopt` binary in `vm-cli/Cargo.toml` for worktree isolation.
+  - Validation: 835 JIT + 81 deopt-JIT + 48 deopt-VM tests pass; gate-off
+    byte-identical.
+
+**What is NOT done (deliberately out of Phase-A scope):**
+- **Production default-on flip.** The feature is proven under the gate but stays
+  default-off. Flipping it on is coupled to precise OSR-frame tracking
+  (`CRATONVM_SHADOW_OSR_TRACK`), which currently regresses bt18 under moving GC
+  (conservative-pin × precise-move) — co-scheduled with the precise-JIT-maps /
+  moving-GC workstream, not this doc.
+- **Phases B/C**: `VirtualObject` materialization for scalar-replaced objects on
+  the x64 path, inlined-frame chains, and monitor-bearing methods remain excluded
+  by the positive `can_deopt_resume` gate.
+
+The decisions captured in "Open question" below were resolved as the steps landed
+(BCE loop-header pilot, primitive-width source via typed local kinds,
+`SavedRegisters.xmm[16]` added for the cat-2/FP follow-up, compilation-epoch
+versioning wired). They are retained for historical context.
 
 ## Goal
 
