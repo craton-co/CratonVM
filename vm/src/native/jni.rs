@@ -338,6 +338,120 @@ pub fn process_vm() -> Option<Arc<SharedVm>> {
     PROCESS_VM.lock().as_ref().and_then(Weak::upgrade)
 }
 
+// ---------------------------------------------------------------------------
+// Foreign-thread attach state (host-created OS threads)
+// ---------------------------------------------------------------------------
+
+thread_local! {
+    /// Owns the heap-boxed `JvmThread` for a foreign (host-created) OS thread
+    /// that attached via `AttachCurrentThread`. The same `JvmThread`'s raw
+    /// address is published into `JNI_THREAD` (so `with_jni_context` can reach
+    /// it); this box keeps the allocation alive and **address-stable** — the JIT
+    /// bakes `tlab_offset`/`shadow_stack_offset`-relative addresses off the live
+    /// `JvmThread*` while the thread runs, so it must never be moved or freed
+    /// until `DetachCurrentThread`. `None` for VM-created threads (the main
+    /// thread parks its `JvmThread` in `Vm`; `Thread.start` workers own theirs
+    /// on the spawned stack).
+    static FOREIGN_THREAD_BOX: std::cell::RefCell<Option<Box<JvmThread>>> =
+        const { std::cell::RefCell::new(None) };
+    /// Depth of nested Java calls in flight on a foreign-attached thread. Used
+    /// to scope the idle-attached blocked-region transition (§3.3) to the
+    /// OUTERMOST Java call: `0` means the thread is idle (between calls, parked
+    /// in the host event loop) and is modelled as GC-blocked.
+    static FOREIGN_CALL_DEPTH: Cell<u32> = const { Cell::new(0) };
+}
+
+/// True if the calling OS thread is currently foreign-attached (owns a
+/// `JvmThread` parked in [`FOREIGN_THREAD_BOX`]).
+pub fn is_foreign_attached() -> bool {
+    FOREIGN_THREAD_BOX.with(|c| c.borrow().is_some())
+}
+
+/// Build, register, and install a foreign (host-created) OS thread as a
+/// first-class, GC-safe Java thread, returning the stable `*mut JvmThread` the
+/// caller installs into `JNI_THREAD`.
+///
+/// This mirrors the per-thread wiring the main thread gets in `Vm::new`
+/// (`vm_init.rs`) and that `Thread.start` workers get (`vm_exec.rs`): a
+/// heap-boxed `JvmThread` with a fresh `ThreadId`, registered in the
+/// `ThreadRegistry`, with its shared `Arc` fields (interrupted / park_state /
+/// root_snapshot / frame_trace / gc_block_state) mirrored into the registry so a
+/// GC initiator on another thread can scan and maintain this thread's roots.
+///
+/// Ordering is deliberate (see §3.2 / §5 of the design): the thread is
+/// registered and its `root_snapshot` / `gc_block_state` are shared with the
+/// registry BEFORE the caller publishes `JNI_SHARED_VM` / `JNI_THREAD`. So the
+/// first instant this thread can run Java (and trip a safepoint) it is already
+/// stop-the-world-visible with a (currently empty) deposited snapshot — there is
+/// no window where it holds live oops but is invisible to `request_stw`.
+pub fn attach_foreign_thread(shared: &SharedVm, daemon: bool) -> *mut JvmThread {
+    let tid = shared.thread_registry.next_thread_id();
+    // Synthetic name until §3.5 builds a real java.lang.Thread object. `Thread-N`
+    // matches the JDK's default platform-thread naming.
+    let name = format!("Thread-{}", tid.0);
+    let mut jt = Box::new(JvmThread::new(tid, &name));
+    jt.kind = crate::threading::ThreadKind::Platform;
+    jt.daemon = daemon;
+
+    // Register, then replace the registry entry's default Arcs with this
+    // JvmThread's own so the two share state (identical to vm_exec.rs's worker
+    // wiring). register_with_daemon constructs fresh Arcs; the set_* calls
+    // overwrite them with the thread-owned ones.
+    shared
+        .thread_registry
+        .register_with_daemon(tid, &name, None, daemon);
+    shared
+        .thread_registry
+        .set_interrupted_flag(tid, jt.interrupted.clone());
+    shared
+        .thread_registry
+        .set_park_state(tid, jt.park_state.clone());
+    shared
+        .thread_registry
+        .set_root_snapshot(tid, jt.root_snapshot.clone());
+    shared
+        .thread_registry
+        .set_frame_trace(tid, jt.frame_trace.clone());
+    shared
+        .thread_registry
+        .set_gc_block_state(tid, jt.gc_block_state.clone());
+
+    // Park the box in TLS so it outlives this call and stays address-stable; the
+    // raw pointer is the heap allocation address, unchanged by moving the Box.
+    let raw: *mut JvmThread = &mut *jt as *mut JvmThread;
+    FOREIGN_THREAD_BOX.with(|c| *c.borrow_mut() = Some(jt));
+    FOREIGN_CALL_DEPTH.with(|c| c.set(0));
+    raw
+}
+
+/// Tear down the foreign thread previously installed by
+/// [`attach_foreign_thread`] on this OS thread: deregister it from the VM and
+/// reclaim its `JvmThread`, retiring the TLAB. Returns `true` if a foreign
+/// thread was reclaimed, `false` if this OS thread held no foreign attachment.
+///
+/// The caller is responsible for leaving any idle/blocked region first (so the
+/// reclamation does not race a live stop-the-world — see §3.4) and for clearing
+/// the `JNI_THREAD` / `JNI_SHARED_VM` TLS afterwards.
+pub fn detach_foreign_thread(shared: &SharedVm) -> bool {
+    let jt = FOREIGN_THREAD_BOX.with(|c| c.borrow_mut().take());
+    let mut jt = match jt {
+        Some(j) => j,
+        None => return false,
+    };
+    let tid = jt.thread_id;
+    // Drop out of `alive_count` / STW `expected` before reclaiming the TLAB so a
+    // subsequent `request_stw` no longer waits for this thread.
+    shared.thread_registry.mark_dead(tid);
+    // Retire the TLAB: install its tail filler and reset, so the unfilled tail
+    // is walkable to the sweep and the freed buffer is never handed back out
+    // (the terminating-worker discipline — see jvm_thread/tlab). Dropping the
+    // box then frees frames/pools.
+    jt.tlab.retire();
+    drop(jt);
+    FOREIGN_CALL_DEPTH.with(|c| c.set(0));
+    true
+}
+
 /// Take (read + clear) the pending JNI exception, if any.
 ///
 /// Returns `Some(raw_value)` if an exception was set via `Throw` or `ThrowNew`,
@@ -5805,6 +5919,67 @@ mod tests {
             process_vm().is_none(),
             "process_vm must return None once the VM has been dropped"
         );
+    }
+
+    #[test]
+    fn foreign_attach_factory_registers_shares_and_detaches() {
+        use crate::classloading::ClassId;
+        use crate::config::VmConfig;
+        use crate::vm::SharedVm;
+        let _guard = PROCESS_VM_TEST_LOCK.lock();
+        let shared = Arc::new(SharedVm::new(VmConfig::default()));
+        // A bare SharedVm has no registered threads (Vm::new registers main).
+        let baseline = shared.thread_registry.alive_count();
+
+        let raw = attach_foreign_thread(&shared, false);
+        assert!(!raw.is_null());
+        assert!(is_foreign_attached());
+        assert_eq!(
+            shared.thread_registry.alive_count(),
+            baseline + 1,
+            "attach must add exactly one alive thread"
+        );
+
+        // Safety: `raw` points at the live, boxed foreign JvmThread parked in
+        // this thread's FOREIGN_THREAD_BOX; the accessed fields are Arc/atomic
+        // (interior mutability), so a shared reference is sufficient.
+        let jt: &JvmThread = unsafe { &*raw };
+
+        // The registry must SHARE this thread's root_snapshot Arc: an object
+        // pushed into the JvmThread's snapshot is visible to the cross-thread
+        // collector (`collect_all_root_snapshots`), which is how a GC initiator
+        // on another thread scans this foreign thread's roots.
+        let obj = shared.heap.alloc_object(ClassId::new(0), 1);
+        jt.root_snapshot.lock().push(obj);
+        let collected = shared.thread_registry.collect_all_root_snapshots();
+        assert!(
+            collected.contains(&obj),
+            "registry must observe the foreign thread's root via the shared snapshot Arc"
+        );
+
+        // The registry must SHARE this thread's gc_block_state Arc too: setting
+        // in_blocked_region on the JvmThread is visible to the initiator's
+        // blocked-region maintenance (`dump_blocked_states`).
+        let tid = jt.thread_id;
+        jt.gc_block_state
+            .in_blocked_region
+            .store(true, std::sync::atomic::Ordering::Release);
+        let blocked = shared.thread_registry.dump_blocked_states();
+        assert!(
+            blocked.iter().any(|(t, blk, _)| *t == tid.0 && *blk),
+            "registry must observe the foreign thread's blocked state via the shared Arc"
+        );
+
+        // Detach reclaims the thread and restores the baseline.
+        assert!(detach_foreign_thread(&shared));
+        assert!(!is_foreign_attached());
+        assert_eq!(
+            shared.thread_registry.alive_count(),
+            baseline,
+            "detach must restore alive_count to baseline"
+        );
+        // Double-detach on a thread with no attachment is a clean no-op.
+        assert!(!detach_foreign_thread(&shared));
     }
 
     #[test]
