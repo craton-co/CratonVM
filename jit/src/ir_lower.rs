@@ -98,6 +98,12 @@ struct Lowerer<'a> {
     /// `Long.MIN_VALUE` return (see `lower_call`'s sentinel sequence). 0 if no
     /// calls / not wired (int/ref/void sites never consult it).
     dispatch_threw: usize,
+    /// IR FP tier (Slice A) — address of the `jit_frem` / `jit_drem` runtime
+    /// helpers (`extern "C" fn(f32,f32)->f32` / `fn(f64,f64)->f64`). Baked into
+    /// an `Op::Rem` Float/Double site as `MOV RAX,imm64 ; CALL RAX` with the two
+    /// operands already in XMM0/XMM1 and the result read back from XMM0.
+    frem: usize,
+    drem: usize,
     /// True iff the graph contains an `Op::Call` — then the method takes the VM
     /// context pointer as a hidden first argument (`try_call_with_context`), and
     /// the prologue stores it to `context_slot_off` + shifts the Java params.
@@ -186,6 +192,8 @@ impl<'a> Lowerer<'a> {
             deopt_boxes: Vec::new(),
             invoke_dispatch: helpers.invoke_dispatch,
             dispatch_threw: helpers.dispatch_threw,
+            frem: helpers.jit_frem,
+            drem: helpers.jit_drem,
             needs_context,
             context_slot_off,
             args_stage_top_off,
@@ -835,6 +843,28 @@ impl<'a> Lowerer<'a> {
             }
             Op::Rem => {
                 let slot = self.alloc_slot(id);
+                // FP remainder (`frem`/`drem`) is `fmod`-style with no single SSE
+                // instruction, so it is lowered as a CALL to the jit_frem/jit_drem
+                // runtime helper. The float ABI passes the two args in XMM0/XMM1
+                // and returns in XMM0 on both Win64 and SysV — which is exactly
+                // the IR's own XMM scratch convention — so no register shuffling
+                // is needed: load the operands, MOV RAX,helper ; CALL RAX, store
+                // the XMM0 result. The 32-byte Win64 shadow space and 16-byte
+                // call alignment are reserved unconditionally by the frame layout
+                // (see `Lowerer::new`), so this CALL is safe even in an otherwise
+                // call-free method. The helper never throws/deopts (IEEE `fmod`
+                // has no exceptional result — `x % 0.0` is NaN, not a trap), so
+                // there is NO exception-sentinel check, unlike `Op::Call`.
+                if matches!(node.ty, IrType::Float | IrType::Double) {
+                    let is_d = node.ty == IrType::Double;
+                    self.fp_load(XMM0, self.slot_of(node.inputs[0]), is_d); // a
+                    self.fp_load(XMM1, self.slot_of(node.inputs[1]), is_d); // b
+                    let helper = if is_d { self.drem } else { self.frem };
+                    self.emit_mov_reg_imm64(RAX, helper as u64);
+                    self.buf.emit(&[0xFF, 0xD0]); // CALL RAX
+                    self.fp_store(slot, XMM0, is_d);
+                    return;
+                }
                 let ty = node.ty;
                 let bpc = node.bytecode_pc;
                 self.load_to_rax(self.slot_of(node.inputs[0]));

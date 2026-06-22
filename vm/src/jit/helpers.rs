@@ -5532,6 +5532,10 @@ pub fn build_helpers() -> JitRuntimeHelpers {
         // tell a genuine callee exception/deopt apart from a legitimate
         // `Long.MIN_VALUE` return.
         dispatch_threw: jit_dispatch_threw as *const () as usize,
+        // IR FP tier (Slice A) — fmod-style FP remainder helpers, CALLed by the
+        // IR `Op::Rem` Float/Double arms (operands in XMM0/XMM1, result XMM0).
+        jit_frem: jit_frem as *const () as usize,
+        jit_drem: jit_drem as *const () as usize,
     }
 }
 
@@ -5572,4 +5576,34 @@ pub extern "C" fn jit_math_fma_float(a: f32, b: f32, c: f32) -> f32 {
     // (see conservative_roots::note_jit_boundary).
     crate::jit::conservative_roots::note_jit_boundary();
     a.mul_add(b, c)
+}
+
+/// IR FP tier (Slice A) — `frem` runtime helper.
+///
+/// Called from JIT code via an absolute `CALL` emitted by the IR `Op::Rem`
+/// Float arm (`jit/src/ir_lower.rs`), which loads the two operands into
+/// XMM0/XMM1 (the float ABI's first two argument registers on both Win64 and
+/// SysV) and reads the result back from XMM0.
+///
+/// JVMS `frem` is the truncated remainder `a - (a / b rounded toward zero) * b`
+/// taking the sign of the dividend — exactly C `fmod` and Rust's `f32 %`. The
+/// special cases also match the JVMS table: `frem(x, ±∞) = x`, `frem(±∞, y) =
+/// NaN`, `frem(x, ±0) = NaN`, `frem(±0, y) = ±0`, and any NaN operand yields
+/// NaN. There is no single SSE instruction for it, hence the helper.
+#[no_mangle]
+pub extern "C" fn jit_frem(a: f32, b: f32) -> f32 {
+    // WS1: Rust<->JIT boundary — invalidate the per-thread JIT-scan cache
+    // (see conservative_roots::note_jit_boundary), mirroring the FMA helpers.
+    crate::jit::conservative_roots::note_jit_boundary();
+    a % b
+}
+
+/// IR FP tier (Slice A) — `drem` runtime helper. The double analogue of
+/// [`jit_frem`]; the IR `Op::Rem` Double arm `CALL`s it with the operands in
+/// XMM0/XMM1 and reads the remainder from XMM0. Rust's `f64 %` is `fmod`,
+/// matching the JVMS `drem` semantics exactly.
+#[no_mangle]
+pub extern "C" fn jit_drem(a: f64, b: f64) -> f64 {
+    crate::jit::conservative_roots::note_jit_boundary();
+    a % b
 }

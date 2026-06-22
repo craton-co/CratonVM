@@ -1505,9 +1505,10 @@ impl IrBuilder {
                 // scalar form (`addss`/`addsd`/…). FP `Div` has NO div-zero /
                 // overflow guard (IEEE division by zero is `±inf`/`NaN`, never an
                 // exception), so unlike int `Div` it never deopts. `frem`/`drem`
-                // (0x72/0x73) are intentionally absent — JVM FP remainder is
-                // `fmod`-style, not a single instruction; such a method bails to
-                // single-pass.
+                // (0x72/0x73) — JVM FP remainder is `fmod`-style with no single
+                // SSE instruction, so the lowerer emits a `CALL` to the
+                // `jit_frem`/`jit_drem` runtime helper (Slice A); the builder
+                // just produces `Op::Rem` typed `Float`/`Double`.
                 // fadd / dadd
                 0x62 => {
                     let b = self.pop();
@@ -1565,6 +1566,22 @@ impl IrBuilder {
                     let b = self.pop();
                     let a = self.pop();
                     let r = self.add_data(Op::Div, IrType::Double, vec![a, b], pc);
+                    self.push(r);
+                    pc += 1;
+                }
+                // frem / drem — `fmod`-style remainder lowered via the
+                // jit_frem/jit_drem helper call (no single SSE instruction).
+                0x72 => {
+                    let b = self.pop();
+                    let a = self.pop();
+                    let r = self.add_data(Op::Rem, IrType::Float, vec![a, b], pc);
+                    self.push(r);
+                    pc += 1;
+                }
+                0x73 => {
+                    let b = self.pop();
+                    let a = self.pop();
+                    let r = self.add_data(Op::Rem, IrType::Double, vec![a, b], pc);
                     self.push(r);
                     pc += 1;
                 }
@@ -2870,3 +2887,5 @@ mod tests {
         assert!(!ir_compatible_sized(&scan, 201));
     }
 }
+
+

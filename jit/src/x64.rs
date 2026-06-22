@@ -1153,8 +1153,14 @@ pub fn jit_scan(code: &[u8], code_len: usize, descriptor: &str) -> Option<JitSca
             0x60..=0x6f => {
                 pc += 1;
             }
-            // irem, lrem
-            0x70 | 0x71 => {
+            // irem, lrem, frem, drem. (frem/drem 0x72/0x73: only the optimizing
+            // IR backend lowers them — via a CALL to the jit_frem/jit_drem fmod
+            // helper. The single-pass backend has no codegen arm, so it bails
+            // them through the `match op` catch-all (`return false`). Admitting
+            // them at scan time lets the IR pipeline see the method instead of
+            // rejecting it outright here; with the FP gate off the method still
+            // bails to single-pass → interpreter, exactly as before.)
+            0x70..=0x73 => {
                 pc += 1;
             }
             // ineg, lneg, fneg, dneg
@@ -22722,6 +22728,8 @@ mod tests {
             throw_exception: sentinel,
             jit_npe_with_action: sentinel,
             dispatch_threw: sentinel,
+            jit_frem: sentinel,
+            jit_drem: sentinel,
         }
     }
 
@@ -32831,3 +32839,4 @@ mod tests {
         );
     }
 }
+

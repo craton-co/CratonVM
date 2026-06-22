@@ -103,6 +103,8 @@ fn helpers() -> JitRuntimeHelpers {
         throw_exception: s,
         jit_npe_with_action: s,
         dispatch_threw: s,
+        jit_frem: s,
+        jit_drem: s,
     }
 }
 

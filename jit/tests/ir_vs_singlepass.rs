@@ -77,6 +77,8 @@ fn dummy_helpers() -> JitRuntimeHelpers {
         // branch, which no existing test reaches. The long-return tests below
         // override this per-test with a real returns-0/1 stub.
         dispatch_threw: s,
+        jit_frem: s,
+        jit_drem: s,
     }
 }
 
@@ -2182,6 +2184,184 @@ fn ir_vs_singlepass_fp_negation() {
         1,
         1,
         &[(vec![5], -5), (vec![-5], 5), (vec![0], 0)],
+    );
+}
+
+// ── FP remainder (frem/drem) — Slice A ──────────────────────────────────────
+//
+// JVMS FP remainder is `fmod`-style (truncated, sign of the dividend) with no
+// single SSE instruction, so the IR `Op::Rem` Float/Double arm lowers to a
+// `CALL` of the `jit_frem`/`jit_drem` runtime helper (operands in XMM0/XMM1,
+// result XMM0). The SINGLE-PASS backend has no `frem`/`drem` arm — it bails such
+// a method to the interpreter — so unlike the other FP ops there is no
+// IR-vs-single-pass comparison; the contract is IR == host IEEE anchor. Rust's
+// `%` on floats is itself `fmod`, the same reference the production helper
+// delegates to, so it catches a miscompile in the call sequence / NaN handling.
+
+/// Real `frem`/`drem` helper stubs for the FP-remainder tests — `extern "C"`
+/// with the float ABI (args in XMM0/XMM1, return XMM0), exactly what the IR
+/// `Op::Rem` site `CALL`s. Mirrors the production `jit_frem`/`jit_drem`.
+unsafe extern "C" fn test_frem(a: f32, b: f32) -> f32 {
+    a % b
+}
+unsafe extern "C" fn test_drem(a: f64, b: f64) -> f64 {
+    a % b
+}
+
+/// [`dummy_helpers`] with the two FP-remainder helpers wired to real stubs (the
+/// rest stay panic stubs — a `frem`/`drem` method calls no other helper).
+fn frem_helpers() -> JitRuntimeHelpers {
+    JitRuntimeHelpers {
+        jit_frem: test_frem as *const () as usize,
+        jit_drem: test_drem as *const () as usize,
+        ..dummy_helpers()
+    }
+}
+
+/// Compile an FP-remainder method through the IR pipeline ONLY and assert
+/// IR == host (Rust float `%`). Single-pass bails `frem`/`drem`, so there is no
+/// IR-vs-single-pass leg; the assert that single-pass returns `None` pins that
+/// assumption (a future single-pass `frem` should switch this to `check_fp`).
+fn check_frem(
+    name: &str,
+    descriptor: &str,
+    code: Vec<u8>,
+    max_locals: u16,
+    num_params: u16,
+    cases: &[(Vec<i64>, i32)],
+) {
+    let helpers = frem_helpers();
+    // Compile the IR body FIRST: a single-pass attempt bails (no frem arm) and
+    // adds the method to the shared permanent bail-list (`mark_jit_bail_listed`),
+    // which would then short-circuit this IR compile to `None`. So the
+    // single-pass-bails check below runs on a DISTINCTLY-named twin method.
+    let cm = cached(name, descriptor, code.clone(), max_locals, num_params);
+    let ir = compile_fp_opt(&cm, &helpers, true)
+        .unwrap_or_else(|| panic!("{name}: IR (FP) failed to compile frem/drem — gate/builder?"));
+    // Pin the "single-pass bails frem/drem" assumption (a future single-pass
+    // frem arm should switch this test to `check_fp`). Separate name so the
+    // bail-list entry it creates can't shadow `cm` above.
+    let twin = cached(
+        &format!("{name}_spbail"),
+        descriptor,
+        code,
+        max_locals,
+        num_params,
+    );
+    assert!(
+        compile_fp_opt(&twin, &helpers, false).is_none(),
+        "{name}: single-pass unexpectedly compiled frem/drem — switch this test to check_fp",
+    );
+    for (args, expected) in cases {
+        // SAFETY: IR-produced body from valid FP bytecode with an int signature;
+        // the i64-arg/i64-ret ABI matches try_call and only frem/drem (wired
+        // above) is reachable.
+        let r_ir = unsafe { ir.try_call(args) }
+            .unwrap_or_else(|e| panic!("{name}: IR call {args:?}: {e:?}"));
+        assert_eq!(
+            r_ir as i32, *expected,
+            "{name}: IR vs host DIVERGE for {args:?}: IR={}, host={expected}",
+            r_ir as i32,
+        );
+    }
+}
+
+#[test]
+fn ir_fp_frem_integer_operands() {
+    // int f(int a, int b) { return (int)((float)a % (float)b); }
+    //   iload_0; i2f; iload_1; i2f; frem; f2i; ireturn
+    check_frem(
+        "frem",
+        "(II)I",
+        vec![0x1a, 0x86, 0x1b, 0x86, 0x72, 0x8b, 0xac],
+        2,
+        2,
+        &[
+            (vec![7, 3], 1),    // 7 % 3 = 1
+            (vec![-7, 3], -1),  // sign of dividend
+            (vec![7, -3], 1),   // sign of dividend (not divisor)
+            (vec![-7, -3], -1),
+            (vec![8, 4], 0),
+            (vec![10, 3], 1),
+            (vec![5, 0], 0),    // x % 0 = NaN; f2i(NaN) = 0
+        ],
+    );
+}
+
+#[test]
+fn ir_fp_drem_integer_operands() {
+    // int f(int a, int b) { return (int)((double)a % (double)b); }
+    //   iload_0; i2d; iload_1; i2d; drem; d2i; ireturn
+    check_frem(
+        "drem",
+        "(II)I",
+        vec![0x1a, 0x87, 0x1b, 0x87, 0x73, 0x8e, 0xac],
+        2,
+        2,
+        &[
+            (vec![7, 3], 1),
+            (vec![-7, 3], -1),
+            (vec![7, -3], 1),
+            (vec![-7, -3], -1),
+            (vec![8, 4], 0),
+            (vec![10, 3], 1),
+            (vec![5, 0], 0), // NaN → 0
+        ],
+    );
+}
+
+#[test]
+fn ir_fp_frem_fractional() {
+    // int f(int a, int b) { return (int)(((a/4f) % (b/4f)) * 4f); } — genuinely
+    // fractional intermediate remainders (0.25, …) prove the helper computes a
+    // real fmod, not just integer-operand agreement. The *4 rescale lands on an
+    // integer so f2i is lossless, and every value (n/4) is exact in binary FP.
+    //   iload_0;i2f; iconst_4;i2f;fdiv; iload_1;i2f; iconst_4;i2f;fdiv; frem;
+    //   iconst_4;i2f;fmul; f2i; ireturn
+    check_frem(
+        "frem_frac",
+        "(II)I",
+        vec![
+            0x1a, 0x86, 0x07, 0x86, 0x6e, // (float)a / 4
+            0x1b, 0x86, 0x07, 0x86, 0x6e, // (float)b / 4
+            0x72, // frem
+            0x07, 0x86, 0x6a, // * 4
+            0x8b, 0xac, // f2i; ireturn
+        ],
+        2,
+        2,
+        &[
+            (vec![7, 2], 1),   // 1.75 % 0.5 = 0.25 → *4 = 1
+            (vec![9, 4], 1),   // 2.25 % 1.0 = 0.25 → 1
+            (vec![-7, 2], -1), // -1.75 % 0.5 = -0.25 → -1
+            (vec![10, 3], 1),  // 2.5 % 0.75 = 0.25 → 1
+        ],
+    );
+}
+
+#[test]
+fn ir_fp_drem_fractional() {
+    // Double analogue of `ir_fp_frem_fractional`.
+    //   iload_0;i2d; iconst_4;i2d;ddiv; iload_1;i2d; iconst_4;i2d;ddiv; drem;
+    //   iconst_4;i2d;dmul; d2i; ireturn
+    check_frem(
+        "drem_frac",
+        "(II)I",
+        vec![
+            0x1a, 0x87, 0x07, 0x87, 0x6f, // (double)a / 4
+            0x1b, 0x87, 0x07, 0x87, 0x6f, // (double)b / 4
+            0x73, // drem
+            0x07, 0x87, 0x6b, // * 4
+            0x8e, 0xac, // d2i; ireturn
+        ],
+        2,
+        2,
+        &[
+            (vec![7, 2], 1),
+            (vec![9, 4], 1),
+            (vec![-7, 2], -1),
+            (vec![10, 3], 1),
+        ],
     );
 }
 

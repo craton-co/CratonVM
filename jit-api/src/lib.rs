@@ -289,6 +289,22 @@ pub struct JitRuntimeHelpers {
     /// Appended at the END of the struct so all prior golden offsets stay
     /// stable.
     pub dispatch_threw: usize,
+    /// IR FP tier (Slice A) — `frem` runtime helper, `extern "C" fn(f32, f32)
+    /// -> f32`. JVM `frem` is the `fmod`-style truncated remainder (sign of the
+    /// dividend, with the matching NaN/∞ rules) which has no single SSE
+    /// instruction; the IR `Op::Rem` Float arm loads the two operands into
+    /// XMM0/XMM1 and `CALL`s this helper (result in XMM0). The float ABI passes
+    /// the two args in XMM0/XMM1 and returns in XMM0 on both Win64 and SysV,
+    /// matching the IR's own XMM scratch convention exactly, so no register
+    /// shuffling is needed. Appended at the END of the struct so all prior
+    /// golden offsets stay stable.
+    pub jit_frem: usize,
+    /// IR FP tier (Slice A) — `drem` runtime helper, `extern "C" fn(f64, f64)
+    /// -> f64`. The double analogue of [`Self::jit_frem`]; the IR `Op::Rem`
+    /// Double arm `CALL`s it with the operands in XMM0/XMM1 and reads the
+    /// remainder from XMM0. Appended at the END of the struct so all prior
+    /// golden offsets stay stable.
+    pub jit_drem: usize,
 }
 
 /// Classifies each field of [`JitRuntimeHelpers`] for the validator.
@@ -421,6 +437,8 @@ helper_fields! {
     (throw_exception,                FieldKind::RequiredPtr),
     (jit_npe_with_action,            FieldKind::RequiredPtr),
     (dispatch_threw,                 FieldKind::RequiredPtr),
+    (jit_frem,                       FieldKind::RequiredPtr),
+    (jit_drem,                       FieldKind::RequiredPtr),
 }
 
 // Compile-time integrity check: the macro-generated NUM_FIELDS must
@@ -446,7 +464,7 @@ const _: () = assert!(
 // struct field AND its macro entry simultaneously would still satisfy
 // the ratio assert above and silently change the JIT ABI.
 const _: () = assert!(
-    JitRuntimeHelpers::NUM_FIELDS == 43,
+    JitRuntimeHelpers::NUM_FIELDS == 45,
     "JitRuntimeHelpers field count changed — bump the literal here and update \
      the golden-offset test in mod tests if the change is intentional",
 );
@@ -495,8 +513,8 @@ impl JitRuntimeHelpers {
     /// fix: the previous bool-returning, dead-loop implementation
     /// silently returned `true` on a null `tlab_post_init` because the
     /// hand-maintained bulk array did not include it. The validator now
-    /// iterates the macro-generated `all_fields()` list — all 43 fields,
-    /// 36 of which are required pointers — so no field can be silently
+    /// iterates the macro-generated `all_fields()` list — all 45 fields,
+    /// 38 of which are required pointers — so no field can be silently
     /// uncovered.)
     pub fn validate(&self) -> Result<(), Vec<&'static str>> {
         let nulls = self.null_pointers();
@@ -597,6 +615,8 @@ mod tests {
             throw_exception: 0x1118,
             jit_npe_with_action: 0x1120,
             dispatch_threw: 0x1128,
+            jit_frem: 0x1130,
+            jit_drem: 0x1138,
         }
     }
 
@@ -811,6 +831,8 @@ mod tests {
             throw_exception: 0,
             jit_npe_with_action: 0,
             dispatch_threw: 0,
+            jit_frem: 0,
+            jit_drem: 0,
         };
         assert_eq!(h.newarray, 0);
         assert_eq!(h.write_barrier, 0);
@@ -986,8 +1008,8 @@ mod tests {
             std::mem::size_of::<JitRuntimeHelpers>(),
             JitRuntimeHelpers::NUM_FIELDS * FIELD_WIDTH,
         );
-        // And the macro-driven count is the canonical 43.
-        assert_eq!(JitRuntimeHelpers::NUM_FIELDS, 43);
+        // And the macro-driven count is the canonical 45.
+        assert_eq!(JitRuntimeHelpers::NUM_FIELDS, 45);
     }
 
     #[test]
@@ -1200,6 +1222,16 @@ mod tests {
                 "dispatch_threw",
                 std::mem::offset_of!(JitRuntimeHelpers, dispatch_threw),
             ),
+            (
+                43,
+                "jit_frem",
+                std::mem::offset_of!(JitRuntimeHelpers, jit_frem),
+            ),
+            (
+                44,
+                "jit_drem",
+                std::mem::offset_of!(JitRuntimeHelpers, jit_drem),
+            ),
         ];
 
         // (a) Each field is at its documented sequential byte offset.
@@ -1236,8 +1268,8 @@ mod tests {
 
     #[test]
     fn jit_runtime_helpers_all_fields_classified() {
-        // The macro must classify every field. 36 RequiredPtr + 4
-        // Offset + 3 OptionalPtr = 43. A new field whose classification
+        // The macro must classify every field. 38 RequiredPtr + 4
+        // Offset + 3 OptionalPtr = 45. A new field whose classification
         // is omitted will fail to compile (the macro requires both
         // arms); this test pins the *counts* so a reclassification
         // (e.g. demoting a RequiredPtr to OptionalPtr) is also a
@@ -1253,7 +1285,7 @@ mod tests {
             .filter(|e| e.kind == FieldKind::OptionalPtr)
             .count();
         let off = f.iter().filter(|e| e.kind == FieldKind::Offset).count();
-        assert_eq!(req, 36, "required-pointer count drifted");
+        assert_eq!(req, 38, "required-pointer count drifted");
         assert_eq!(opt, 3, "optional-pointer count drifted");
         assert_eq!(off, 4, "offset-field count drifted");
         assert_eq!(req + opt + off, JitRuntimeHelpers::NUM_FIELDS);
@@ -1265,7 +1297,7 @@ mod tests {
         // must NOT reject on that. (Regression for the round-9 fix —
         // the previous `validate()` looped over a hand-maintained array
         // that omitted all offset/optional fields, so this was true
-        // by accident. The new validator iterates ALL 43 fields and
+        // by accident. The new validator iterates ALL 45 fields and
         // must still pass when offsets are zero.)
         let mut h = make_helpers();
         h.tlab_cursor_offset_in_thread = 0;
@@ -1297,7 +1329,7 @@ mod tests {
             .filter(|e| e.kind == FieldKind::RequiredPtr)
             .map(|e| e.name)
             .collect();
-        assert_eq!(names.len(), 36);
+        assert_eq!(names.len(), 38);
         for name in names {
             let mut h = make_helpers();
             // Zero the field by name via a match — the macro doesn't
@@ -1330,7 +1362,7 @@ mod tests {
     #[test]
     fn jit_runtime_helpers_all_required_null_reports_every_name() {
         // Zero EVERY required pointer at once: `null_pointers()` must
-        // return the complete set of 36 required-field names (and
+        // return the complete set of 38 required-field names (and
         // `validate()` must reject). This complements the per-field
         // sweep above — it proves the validator does not stop at the
         // first miss and that the offset/optional fields (left non-zero
@@ -1343,7 +1375,7 @@ mod tests {
             .filter(|e| e.kind == FieldKind::RequiredPtr)
             .map(|e| e.name)
             .collect();
-        assert_eq!(required.len(), 36, "expected 36 required pointers");
+        assert_eq!(required.len(), 38, "expected 38 required pointers");
         // throw_exception is the round-10 addition — pin it explicitly so
         // a regression that drops it from the required set is caught here
         // and not just by the count.
@@ -1362,6 +1394,16 @@ mod tests {
         assert!(
             required.contains(&"dispatch_threw"),
             "dispatch_threw must be a required (null-rejected) pointer",
+        );
+        // jit_frem / jit_drem are the IR FP-tier (Slice A) fmod helpers — pin
+        // them explicitly for the same reason.
+        assert!(
+            required.contains(&"jit_frem"),
+            "jit_frem must be a required (null-rejected) pointer",
+        );
+        assert!(
+            required.contains(&"jit_drem"),
+            "jit_drem must be a required (null-rejected) pointer",
         );
 
         for name in &required {
@@ -1436,6 +1478,8 @@ mod tests {
             "throw_exception" => h.throw_exception = 0,
             "jit_npe_with_action" => h.jit_npe_with_action = 0,
             "dispatch_threw" => h.dispatch_threw = 0,
+            "jit_frem" => h.jit_frem = 0,
+            "jit_drem" => h.jit_drem = 0,
             other => panic!("unknown required-pointer field name in test: {}", other),
         }
     }
