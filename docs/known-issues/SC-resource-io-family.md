@@ -13,10 +13,13 @@
 >   matches BOTH. The doc's "HotSpot single-slash for `Path.toUri`" premise is wrong for Windows;
 >   "fixing" it would *introduce* a divergence. (The original Spring assertion likely normalizes
 >   differently — re-check against the actual `ResourceTests` if it still fails.)
-> - **Cause C (`newOutputStream` on a directory)**: 🔴 **OPEN (minor)** — HotSpot throws
->   `java.nio.file.AccessDeniedException` (NOT `FileNotFoundException` as the doc claimed);
->   CratonVM throws a generic `java.io.IOException` (os error 5). A small exception-TYPE residual
->   (`fsp_new_output_stream` should map the typed nio exception).
+> - **Cause C (`newOutputStream` on a directory)**: ✅ **FIXED on `dev`** (`9e14cc2d`).
+>   `fsp_new_output_stream` now maps `open_write` errors by `ErrorKind` to the TYPED nio
+>   exception HotSpot throws: PermissionDenied → `AccessDeniedException` (directory open on
+>   Windows, os error 5; new `p57_access_denied`), NotFound → `NoSuchFileException`, else the
+>   generic `IOException`. (NB the doc's "expects `FileNotFoundException`" premise was wrong —
+>   HotSpot throws `AccessDeniedException` here.) Verified vs HotSpot (JDK 25,
+>   `test_classes/NewOutputStreamRepro` 3/3).
 > - **Causes D (harness CWD) / E,H (URL parse) / F (HTTP openStream) / G (ModuleResource)**:
 >   unchanged — env (D) / separate-subsystem handoffs.
 
