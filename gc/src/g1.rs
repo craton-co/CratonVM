@@ -2006,6 +2006,46 @@ impl G1Collector {
             }
         }
 
+        // PARALLEL-EVAC UAF FIX (Step 9). The parallel evacuator CAS-installs
+        // each forward into the from-space object's *persistent*
+        // `ObjectHeader::forwarding_ptr` field (the lock-free install slot),
+        // unlike the serial path which records forwards only in the per-cycle
+        // `pointer_map`. For a normally-evacuated object that is harmless: its
+        // from-space region is reset in Phase 5 (`free_or_keep_cset`), which
+        // zeroes the field. But a *self-forwarded* object (evacuation failure —
+        // to-space pool exhausted — installs `old -> old`, a `key == value`
+        // entry) lives in a region that Phase 5 KEEPS and never resets, so its
+        // `forwarding_ptr` would retain its own address across collections.
+        //
+        // The NEXT collection's `evacuate` fast path
+        // (`let e = forwarding_ptr; if e != 0 { return (e, false) }`) would then
+        // read that stale self-pointer, SKIP re-evacuating the still-live object
+        // (now back in the CSet) and record NO forward for it this cycle —
+        // whereupon `free_or_keep_cset`, seeing no `key == value` entry, frees
+        // the region out from under every referrer. Result: dangling references
+        // into reclaimed memory (intermittent SIGSEGV; the V7b verifier reports
+        // "freed CSet region ... no forwarding entry"). Manifests at scale on a
+        // large humongous reference array whose elements repeatedly fail to find
+        // to-space.
+        //
+        // Restore the evacuator's "`forwarding_ptr == 0` at collection start"
+        // invariant for the only objects that violate it — the self-forwarded
+        // (kept-in-place) ones — now that the transitive closure is complete and
+        // no further `evacuate` call this cycle depends on the in-place forward.
+        // The merge above is the first point at which every shard's self-forward
+        // is visible. The serial path never writes this header field, which is
+        // why it is V7b-clean on the identical workload.
+        for (&k, &v) in pointer_map.iter() {
+            if k == v {
+                // SAFETY: `k` is a live from-space object address that the
+                // evacuator just CAS-forwarded to itself; its header is intact
+                // and its region is held under the collection's `regions` lock.
+                unsafe {
+                    (*(k as *mut ObjectHeader)).forwarding_ptr = std::ptr::null_mut();
+                }
+            }
+        }
+
         (pointer_map, objs, bytes)
     }
 
@@ -7185,6 +7225,62 @@ mod tests {
         gc.young_collection_parallel(&mut roots, &NoopMonitors);
         assert!(gc.count_regions(RegionType::Old) >= 1);
         assert_eq!(gc.get_field(roots[0], 0).as_int(), Some(7));
+    }
+
+    /// Regression (parallel-evac self-forward UAF). The parallel evacuator
+    /// installs each forward into the from-space object's *persistent*
+    /// `ObjectHeader::forwarding_ptr` field. A normally-evacuated object's
+    /// region is reset in Phase 5 (zeroing the field), but a SELF-FORWARDED
+    /// (evacuation-failure) object's region is KEPT — so its `forwarding_ptr`
+    /// must be explicitly cleared at cycle end. Without the clear, the NEXT
+    /// collection's `evacuate` fast path reads the stale self-pointer, SKIPS
+    /// re-evacuating the still-live object, records no forward, and
+    /// `free_or_keep_cset` (seeing no `key == value` entry) frees the region
+    /// out from under it — a use-after-free that surfaced as V7b dangling
+    /// references / SIGSEGV on the `PromoteMixed` humongous-array workload.
+    #[test]
+    fn parallel_self_forward_clears_forwarding_ptr_across_cycles() {
+        let gc = G1Collector::new(parallel_config(4, 6));
+        let obj = gc.alloc_object(ClassId::new(1), 1);
+        gc.set_field(obj, 0, Value::Int(12345));
+        let mut roots = vec![obj];
+
+        // Force an evacuation failure: drain the to-space pool by retyping every
+        // Free region to Old (non-CSet), leaving the GC nowhere to copy the
+        // Eden survivor — so it must self-forward (stay in place).
+        {
+            let mut regions = gc.regions.lock();
+            for r in regions.iter_mut() {
+                if r.region_type == RegionType::Free {
+                    r.region_type = RegionType::Old;
+                }
+            }
+        }
+
+        // Cycle 1: obj cannot be copied -> self-forwards (identity entry).
+        let r1 = gc.young_collection_parallel(&mut roots, &NoopMonitors);
+        let addr = roots[0].as_ptr() as usize;
+        assert_eq!(
+            r1.pointer_map.get(&addr),
+            Some(&addr),
+            "expected a self-forward (evacuation failure)"
+        );
+        assert_eq!(gc.get_field(roots[0], 0).as_int(), Some(12345));
+        // THE FIX: the kept object's persistent forwarding_ptr is cleared, so it
+        // does not look "already forwarded" to the next cycle.
+        assert!(
+            gc.get_header(roots[0]).forwarding_ptr.is_null(),
+            "self-forwarded object's forwarding_ptr must be cleared after the cycle"
+        );
+
+        // Cycle 2: with a stale self-pointer the object would be skipped and its
+        // region freed; the field read would then hit reclaimed memory.
+        gc.young_collection_parallel(&mut roots, &NoopMonitors);
+        assert_eq!(
+            gc.get_field(roots[0], 0).as_int(),
+            Some(12345),
+            "live object lost across a second collection (stale self-forward UAF)"
+        );
     }
 
     #[test]
