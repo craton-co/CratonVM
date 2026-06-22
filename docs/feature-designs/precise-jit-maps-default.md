@@ -1,7 +1,11 @@
 # Precise JIT Stack Maps as the Validated Default
 
-Status: **Steps 1–6 of the delivery plan landed (2026-06-21/22); the one
-remaining bar for a fully *validated* default is the full named-app gauntlet.**
+Status: **Steps 1–8 of the delivery plan landed (2026-06-21/22). The
+precise-maps default closes the A3 register-invisibility class and is green
+across every GC-root vehicle runnable on this box (repros, benches, OSR, and the
+BouncyCastle app suites). Formally retiring the *family* still needs the A2 fix,
+the A4 cross-thread-STW scan, and the container-app gauntlet on CI — see "Step 8
+— GC-root family retirement status".**
 The mechanism (`CRATONVM_PRECISE_JIT_MAPS`) is **default-on** on `dev` (opt out
 `CRATONVM_NO_PRECISE_JIT_MAPS`). **Steps 1+2** closed the call-heavy perf
 regression (frame-record CALL → inlined `mov gs:[disp], rbp`, default-on, fib44
@@ -494,6 +498,38 @@ but those classpaths are not built here. So the GC-root *family* is not yet
 formally "retired" (that also needs A2's sweep-walker fix and A4's FJP CAS fix),
 but every GC-root vehicle runnable on this box — repros, benches, and the BC app
 suites — is green under the precise-maps default.
+
+## Step 8 — GC-root family retirement status (2026-06-22): A3 closed, A2/A4 open, nothing removed
+
+The "validated default" work closes the **A3 register-invisibility class**. The
+*family* is **not yet formally retired** — A2 and A4 are distinct, deep bugs that
+this work never claimed to fix. Per the retain directive, **nothing is removed**:
+the conservative backstop, the GC guards, every `CRATONVM_DBG_*` diagnostic knob,
+the shadow stack (Step 6), and all A1–A4 repros stay in the tree as
+experimental / debugging tools.
+
+**Current-dev status refresh (binary off dev `14afc6a6`, JDK-25 oracle):**
+
+| member | status | current-dev evidence |
+|---|---|---|
+| A1 (reflection mirror-array pin) | ✅ FIXED | `pin_native_root` (long-landed) |
+| A3 (register-invisibility) | ✅ CLOSED by precise maps | repro+bench lane (Step 4) + OSR (Step 5) + BouncyCastle apps (Step 7) all green |
+| **A2** (`ReflRepro` alloc↔sweep-walker UAF) | 🔴 **OPEN, unchanged** | `ReflRepro 8000 @ GC_STRESS=65536` → **rc=139** (SIGSEGV, ~216k corruption-cascade lines). Register-/native-return-resident missed root that no *stack* scan (precise/shadow/fullstack) can see; fix is dedicated GC/JIT core work (handoff: spill object-returning call results to a scanned slot before the next safepoint, or precise per-PC register maps; the reclaimed-region-filler attempt was tried + reverted). Repro + guards retained. |
+| **A4** (`Fork6` FJP multi-thread) | 🟡 **OPEN but non-fatal on the repro here** | gated `CRATONVM_REAL_FORKJOINPOOL=1` → **6/6 ALL-OK**, 0 corruption (the doc's older ~15% reclamation does **not** reproduce on current dev); the documented cross-thread STW JIT-root gap is still *exercised* (`scan_active_jit_frames` WARN, ~2048 hits) but **non-fatal** (the parked thread's `root_snapshot` covered it). Default path throws `RejectedExecutionException` (a synthetic-FJP feature gap, not GC). The cross-thread STW JIT-root scan remains the tracked follow-up. |
+
+**Container-app gauntlet — CI-complete, not removed.** `gc-root-apps-lane.sh`
+now enumerates the named apps (tomcat / keycloak / spring-boot / cassandra /
+activemq / jenkins / felix) via an env-driven `named_app` hook (set `<APP>_CP` +
+`<APP>_MAIN` to run on a box where the app is built; SKIP-with-note otherwise) in
+addition to the runnable BouncyCastle suites. So the harness is the complete
+named-app gauntlet; the heavy apps are CI-deferred (unbuilt on a dev checkout),
+not dropped.
+
+**Formal retirement of the family is gated on** (separate, dedicated work): the
+A2 fix, the A4 cross-thread-STW JIT-root scan (+ the real-FJP CAS bug), and a CI
+run of the container apps. Until then this doc claims only what is proven: the
+precise-maps default closes A3 and is green across every GC-root vehicle runnable
+on this box.
 
 ## Risks & open questions
 

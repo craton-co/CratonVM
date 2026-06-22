@@ -158,6 +158,32 @@ skip_suite elasticsearch "ES lib/ not present (needs the 8.15.5 distro)"
 skip_suite hibernate-smoke "hibernate-ri10 smoke-cache not built"
 skip_suite commons-math "no runnable JUnitProbe main built here"
 
+# --- The named register-invisibility apps from the family README. None ship a
+# built classpath on a dev checkout, and their main/cp are deployment-specific,
+# so they are CI targets driven by env (set <APP>_CP, <APP>_MAIN, optional
+# <APP>_ARGS / <APP>_OUT) — otherwise SKIP-with-note. This makes the lane the
+# complete named-app gauntlet without hardcoding speculative classpaths.
+hr; log "named register-invisibility apps (set <APP>_CP + <APP>_MAIN to run on CI)"
+named_app() { # ENVPREFIX name default-heap default-outre
+  local pfx="$1" name="$2" heap="$3" outre="$4"
+  local cp main args
+  eval "cp=\${${pfx}_CP:-}"; eval "main=\${${pfx}_MAIN:-}"; eval "args=\${${pfx}_ARGS:-}"
+  eval "outre=\${${pfx}_OUT:-$outre}"; eval "heap=\${${pfx}_HEAP:-$heap}"
+  if [ -n "$cp" ] && [ -n "$main" ]; then
+    command -v cygpath >/dev/null 2>&1 && cp="$(cygpath -m "$cp")"
+    app_suite "$name" "$heap" "$cp" "$main" "$args" "$outre"
+  else
+    skip_suite "$name" "set ${pfx}_CP + ${pfx}_MAIN (+ ${pfx}_ARGS/${pfx}_OUT) to run on a box where it is built"
+  fi
+}
+named_app TOMCAT     tomcat      2g 'OK|Tests run:|BUILD SUCCESS'
+named_app KEYCLOAK   keycloak    2g 'OK|Tests run:|BUILD SUCCESS'
+named_app SPRINGBOOT spring-boot 2g 'OK|Tests run:|Started .* in'
+named_app CASSANDRA  cassandra   2g 'OK|Tests run:|PASSED'
+named_app ACTIVEMQ   activemq    2g 'OK|Tests run:|PASSED'
+named_app JENKINS    jenkins     2g 'OK|Tests run:|BUILD SUCCESS'
+named_app FELIX      felix       2g 'OK|Tests run:|PASSED'
+
 hr
 log "results: $TSV"
 log "PASS=$NPASS  SKIP=$NSKIP  FAIL=$NFAIL  (deviations=$NDEV)"
