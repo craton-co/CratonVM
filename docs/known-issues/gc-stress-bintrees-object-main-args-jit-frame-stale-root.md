@@ -52,33 +52,57 @@ refuted.** Read this section before the older body below.
    `CRATONVM_JIT_SAFEPOINT_REG_SPILL=all` and the dev-default callee-saved-operand-stack-oop spill
    (`7c7d8148`, which only covers operand-stack temporaries, **not locals**) also do not fix it.
 
-### Corrected mechanism (the real paradox to crack)
+### ✅ CRACKED (2026-06-22, instrumented) — it is a LOST-TAG object on the MOVING path, NOT a bottomUpTree JIT-frame stale root
 
-`node` is a live young object whose pointer **is on the stack** (`[rbp-10h]`/`[rbp-30h]` of every
-`bottomUpTree` frame) at every safepoint, yet the conservative marker **does not produce it as a
-root** (sweep-edges silent), so the sweep frees it. This is therefore **not** a spill-coverage
-problem (the value is spilled) and **not** a relocation problem (nothing moves). It is a
-**conservative-scan COVERAGE-or-ACCEPT gap**: at the corrupting GC, `scan_one_frame` either does
-not cover the stack band containing `bottomUpTree`'s `[rbp-10h]` slots, or `is_object_address`
-rejects the value. The `main`-reads-`args` trigger (which changes `main`'s register allocation /
-frame so the `JIT_ENTRY_CHAIN` entry + `[scanner_sp, entry_sp)` band differ) most plausibly shifts
-the scanned band off the ancestor `bottomUpTree` recursion frames. Note `JIT_ENTRY_CHAIN` is pushed
-**only at the interpreter→JIT boundary**, not on JIT→JIT recursion (`conservative_roots.rs`
-~1128), so the *single* chain entry's `[scanner_sp, entry_sp)` must cover the entire recursion — if
-that band is computed wrong when `main` is the compiled entry, the deep `node` spills fall outside.
+An instrumented build (probe in `collect_roots` + `collect_garbage_inner` + the sweep, gated
+`CRATONVM_DBG_A5`, since reverted) settled it. **Every prior "bottomUpTree node in r12 / register-
+only / scan coverage-or-accept" framing is WRONG for this repro** — `bottomUpTree` is **not even
+JIT-compiled** at the crash. The decisive observations on `VAAload 14 GC_STRESS=4096`:
 
-### Decisive next experiment (not yet run — needs one instrumented build)
+1. **The corruptor is `main`'s COMPILATION, decisively.** `CRATONVM_JIT_BISECT_SKIP=VAAload.main`
+   → **clean `3222190`** (30+ GCs, no corruption); default (main compiled) → crash. `main` compiles
+   at startup (the `DBG_JIT_DISASM` "first VAAload.main" event fires **before GC#0**).
+2. **`bottomUpTree` is NEVER compiled before the crash** (no `first VAAload.bottomUpTree` event; no
+   OSR event). So the corruptee `node` lives in an **interpreter** frame, not a JIT frame — the
+   whole `[rbp-10h]`/`r12` disasm analysis below was chasing the wrong frame.
+3. **Every corrupting GC is a MOVING (Cheney) collection at `quiescence_depth=0`, `jit_thread=false`**
+   — i.e. the *interpreter* is running (no JIT frame registered) and the **relocating** collector
+   runs. The crash is very early (GC#2–3, old gen empty → young-only).
+4. **`--nojit` does NOT corrupt** — it only hits the 120 s watchdog (interpreted `bottomUpTree` is
+   slow). So the bug needs JIT *enabled* (so `main` compiles) but does not need JIT *running* at the
+   GC.
 
-Instrument `sweep_young_non_moving`: when about to **zero an unmarked young object whose header is a
-valid `TreeNode`** (kind=Object, `num_slots=2`, matching class), scan the conservatively-scanned
-band(s) `[scanner_sp, entry_sp)` (and the full native stack) for any word equal to that object's
-address, and print: (a) whether the address appears on the stack at all, (b) within which scanned
-band, (c) whether `is_object_address` accepts it. This directly answers "is `node`'s spilled
-pointer inside the scanned range at the freeing GC?" — splitting *coverage gap* (address on stack
-but outside `[scanner_sp, entry_sp)`) from *accept gap* (`is_object_address` rejects it) from
-*genuinely-register-only* (address nowhere on stack). Pair with logging each GC's chain length +
-band bounds. Until then the older "register-only" framing below is **not** confirmed — the disasm
-shows the value IS spilled.
+**Mechanism (matches an already-documented hazard).** `main` runs compiled, calls a method across a
+JIT↔interpreter boundary, and **a JIT callee's object return value reaches an interpreter local /
+operand slot under a NON-OBJECT tag** (lost-tag). The tag-filtered `Frame::scan_local_objects`
+omits it, so it is not a GC root. Because `quiescence=0` the **moving** collector runs and
+**relocates/frees** that unrooted-but-live young object → its slot is reused → the stale reference
+reads an all-zero `java/lang/Object` header → `set_field` OOB → `ArrayIndexOutOfBoundsException`.
+This is the SAME class as the Fork6 FJP lost-tag bug — see the comment on
+`vm/src/memory/roots.rs::conservative_locals_enabled` / the `scan_locals_conservative` call there,
+which literally describes *"a JIT callee's object return value can reach an interpreter local under
+a non-object tag (e.g. `main`'s `f = POOL.submit(t)`); the tag-filtered `scan_local_objects` then
+omits it … → stale all-zero receiver."* That recovery scan exists **but is gated to
+`CRATONVM_REAL_FORKJOINPOOL` AND the non-moving sweep** (`base && gc_quiescence::is_active()`). For
+`VAAload` neither holds (no FJP gate; `is_active()=false` → moving collector), so the lost object is
+never recovered. The recovery is deliberately OFF on the moving path because conservatively rooting
+a pointer-shaped `long` there would get it **relocated and corrupted** — so the fix cannot simply
+flip the gate.
+
+**Fix direction.** Preserve the object tag across the JIT→interpreter return boundary (the real fix
+— make the returned reference land in the interpreter slot tagged as an object so the precise scan
+roots it), OR provide a precise (rewritable, not conservative-pin) recovery of JIT-boundary return
+oops that is safe on the moving path. The `main`-reads-`args` discriminator is a red herring for the
+*frame* but real for *triggering main's compilation + the specific call/return shape*; `RHard`
+(args-free) is clean because its `main` compiles to a shape that does not lose the tag (or does not
+compile the same way).
+
+**Confirming experiment for the next session:** add a force-non-moving knob (or reuse the FJP gate
+path) and verify that with the conservative-locals recovery engaged the crash disappears — that
+pins "lost-tag on the moving path" beyond doubt — then implement the precise tag-preserving fix and
+verify `VAAload`/`binarytrees` are clean at `GC_STRESS=4096` with JIT on.
+
+### (historical — the "register-only / coverage-or-accept" hypotheses below are SUPERSEDED by the CRACKED section above)
 
 ---
 
