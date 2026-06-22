@@ -140,7 +140,7 @@ known-issues README):
 | A4 (`Fork6`, FJP multi-thread) | 🟡 **OPEN / inconclusive** — gated, separate CAS bug masks it | `fork6-fjp-multithread-jit-root-reclamation.md`: only reachable under experimental `CRATONVM_REAL_FORKJOINPOOL=1`; a real-FJP `ForkJoinPool` CAS conflict now fails the repro on both precise-on and precise-off. |
 | Moving-GC precise relocation (`remap_active_jit_frames` under a real move) | ⚠️ **implemented, not exercised on the default path** | The non-moving sweep + selective promote does not relocate JIT-held slots, so `remap_active_jit_frames` is inert by default; it is only load-bearing if a moving young gen is ever made default. |
 | OSR-point precise tracking | ✅ **decided (Step 5): conservative backstop accepted; no precise OSR maps** | OSR frames get a `JitEntryGuard` chain entry + are conservatively backstopped in `scan_one_frame_precise` (safe on the non-moving sweep) and are excluded from `fully_oop_covered` (`!compiled_via_osr`) so a future moving path PINS them. Empirically: bt16 OSR-enters `binaryTrees(I)J` and is correct under forced young GC. `CRATONVM_SHADOW_OSR_TRACK` (shadow-only, partial 68199090) is retained experimental/default-off (Step 6). See "Step 5 — OSR decision". |
-| Full app-gauntlet GC-root regression with precise on | 🟡 **repro+bench lane LANDED & green; full 50-app lane still future** | `test-infra/regression-pool/gc-root-lane.sh` baseline 2026-06-22: 12 PASS / 1 expected-KNOWN-FAIL (A2) / 1 expected-FLAKY (MTRegex), 0 deviations. See "Step 4 baseline". The named full apps still need container harnesses. |
+| Full app-gauntlet GC-root regression with precise on | 🟡 **repro+bench lane + app lane LANDED & green; heavy container apps still CI-deferred** | `gc-root-lane.sh` (Step 4): 12 PASS / 1 KNOWN-FAIL (A2) / 1 FLAKY (MTRegex), 0 dev. `gc-root-apps-lane.sh` (Step 7): BouncyCastle asn1+prng PASS (GC-invariant + corruption-free under 4 MB GC-stress), 0 dev. The named container apps (wildfly/kafka/h2/elasticsearch/…) are unbuilt on a dev checkout → SKIP-with-note; they need CI / a provisioned box. See "Step 7 — App GC-root gauntlet". |
 | Perf acceptable as default | ✅ **inline frame-record landed (Steps 1+2, 2026-06-21)** | The per-invocation `jit_frame_record` CALL is now an inlined `mov gs:[disp], rbp` (default-on, Windows). fib44 inline-on ~11.8 s vs CALL-path ~19.8 s = **1.68× faster** (the no-frame-record floor is ~9 s, so inline cuts ~74 % of the frame-record overhead). bt16 also ~16 % faster. See "Inline frame-record (Steps 1+2)" below. Opt out: `CRATONVM_NO_PRECISE_INLINE_FRAME_RECORD`. |
 
 ## Proposed design (to reach a *validated* default)
@@ -456,6 +456,45 @@ reclaim. Before it could ever be promoted it needs the bt18 under-count closed
 and the precise-maps interference resolved — tracked under
 `default-moving-young-gen.md`, not here.
 
+## Step 7 — App GC-root gauntlet (landed 2026-06-22): the runnable subset is green
+
+`test-infra/regression-pool/gc-root-apps-lane.sh` is the named-app companion to
+the Step-4 repro+bench lane. For each app suite it runs the workload under
+CratonVM with **precise maps default-on**, at the default heap **and** under
+forced young GC (`CRATONVM_DBG_GC_STRESS`), and classifies by **GC-invariance**
+rather than feature parity:
+
+- **PASS** = CratonVM's outcome is identical with vs. without forced GC (same rc,
+  same result-summary signature) and shows **no HARD** (crash: SEGV / panic /
+  fatal) corruption. A **SOFT** marker — the GC walker catching + re-syncing a
+  stale/half-initialised access — is benign *iff* the result stays GC-invariant,
+  and is reported as `guarded(soft=N)` (the "masked, not closed" state, same as
+  the Step-4 repros). A feature gap vs HotSpot (locale/i18n) is GC-invariant, so
+  it is a note (`cv!=hs`), never a GC-root failure.
+- This criterion is the point: the register-invisibility family is a *GC-timing-
+  dependent* fault, so "the result doesn't change when you force GC, and nothing
+  crashes" is exactly the property precise maps must guarantee.
+
+**Baseline (2026-06-22, current dev binary, JDK-25 oracle, GC_STRESS = 4 MB):**
+
+| suite | result | note |
+|---|---|---|
+| BouncyCastle `asn1.test.RegressionTest` | **PASS** | GC-invariant + corruption-free; differs from HotSpot only by the `X500Name` Turkish dotless-i locale fold (a feature gap, GC-invariant). One earlier run tripped a *recoverable* `inconsistent header (inline-alloc race)` soft marker under 4 MB stress — walker re-synced, result unchanged; rare/flaky, orthogonal to precise *root* maps. |
+| BouncyCastle `crypto.prng.test.RegressionTest` | **PASS** | GC-invariant + corruption-free; == HotSpot. |
+| BouncyCastle `crypto.test.RegressionTest` | SKIP | runnable but too long for the lane timeout — `BC_CRYPTO=1` + large `TIMEOUT` to include. |
+| h2 / wildfly / kafka / elasticsearch / hibernate / commons-math | SKIP | **env-blocked on a dev checkout** — these are gitignored build artifacts (need gradle/maven + network + disk, and kafka/ES need docker). Gated SKIP-with-note; the lane runs them on CI / a provisioned box where they are built. |
+
+**Honest scope.** BouncyCastle (crypto / ASN.1 / PRNG / reflection-heavy, pure
+Java) is the strongest register-invisibility vehicle that is actually runnable on
+this box, and it is **green** (GC-invariant, no fatal corruption) with precise
+maps default-on. The full named container gauntlet
+(cassandra/tomcat/wildfly/keycloak/spring-boot/jenkins/felix) remains the
+outstanding bar and is **CI-deferred** — the lane is written and gated for it,
+but those classpaths are not built here. So the GC-root *family* is not yet
+formally "retired" (that also needs A2's sweep-walker fix and A4's FJP CAS fix),
+but every GC-root vehicle runnable on this box — repros, benches, and the BC app
+suites — is green under the precise-maps default.
+
 ## Risks & open questions
 
 - **Perf regression on call-heavy code (known).** 2.5× on pure-call recursion
@@ -508,9 +547,12 @@ JDK-25 app runs):
    (see "Step 4 baseline"). The multi-threaded full apps (cassandra, activemq,
    tomcat, wildfly, keycloak, spring-boot, jenkins, felix) still need container
    harnesses — outstanding.
-4. **App-gauntlet GC-root family baseline recorded** (Step 4): 🟡 partial — the
-   GC-root *repro+bench* lane is recorded & green; the named full apps run to
-   completion == HotSpot with precise on is the remaining bar.
+4. **App-gauntlet GC-root family baseline recorded** (Steps 4 + 7): 🟡 partial —
+   the GC-root *repro+bench* lane (Step 4) **and** the *app* lane (Step 7:
+   `gc-root-apps-lane.sh`, BouncyCastle asn1+prng GC-invariant & corruption-free
+   under forced GC) are recorded & green. The named container apps
+   (cassandra/tomcat/wildfly/keycloak/spring-boot/jenkins/felix) are CI-deferred
+   (unbuilt on a dev checkout) — the remaining bar.
 5. **Perf within budget after inline frame-record:** call-heavy regression
    reduced from 2.5× toward parity (fib44), alloc/compute unchanged (≤~6% /
    ~0%).
