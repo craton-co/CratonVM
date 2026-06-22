@@ -957,12 +957,36 @@ impl VmHeap {
         }
     }
 
-    /// Probe whether a young-gen allocation would succeed (generational only).
-    /// G1 always returns Some(()) since it allocates from regions.
+    /// Probe whether a young-gen allocation would succeed, OR whether a young
+    /// GC should be forced first to keep an evacuation reserve.
+    ///
+    /// Returning `None` routes the caller (the JIT alloc helpers'
+    /// `if try_alloc_young_probe(..).is_none() { maybe_gc_forced }` path) into a
+    /// young GC before the allocation is attempted.
     pub fn try_alloc_young_probe(&self, size: usize) -> Option<()> {
         match self {
             VmHeap::Generational(h) => h.try_alloc_young_probe(size),
-            VmHeap::G1(_) => Some(()),
+            // G1: JIT-compiled code never reaches the interpreter's `maybe_gc`
+            // safepoint poll (which consults `needs_gc()`), so without a probe
+            // here a JIT-heavy mutator allocates Eden right up to a 100%-full
+            // heap before *any* young GC fires. At that point every region is
+            // Eden (in the collection set) and ZERO Free regions remain for
+            // to-space, so `evacuate_object` finds no destination — without the
+            // self-forward net the whole CSet (incl. the live set) is reclaimed
+            // (the SteadyChurn `-XX:+UseG1GC` + JIT OOM; the generational
+            // collector hides it via its non-moving JIT-active sweep, which needs
+            // no to-space). Mirror the interpreter's threshold: signal "collect
+            // now" (`None`) while the evacuation reserve (Free regions) is still
+            // intact, so the forced young GC has somewhere to evacuate. `size`
+            // is unused for G1 — the reserve is region-granular (`needs_gc()` =
+            // Free regions < 25%), not a byte-level bump check.
+            VmHeap::G1(_) => {
+                if self.needs_gc() {
+                    None
+                } else {
+                    Some(())
+                }
+            }
         }
     }
 
