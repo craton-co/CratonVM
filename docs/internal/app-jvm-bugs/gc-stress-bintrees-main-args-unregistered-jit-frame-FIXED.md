@@ -8,10 +8,14 @@ moves instead of running the non-moving sweep. The fix detects an unregistered J
 native stack (a JIT code return address via `cratonvm_jit::lookup_jit_code_range`), conservatively
 marks its oops with a full-stack scan, and runs the non-moving sweep (pin, don't relocate).
 **Validated:** `VAAload 14 @CRATONVM_DBG_GC_STRESS=4096` → `3222190` 5/5 (was crash 8/8); all repro
-variants ==HotSpot; `bt16` throughput byte-identical; `cratonvm-gc` 730/730. **Residuals (tracked
-follow-ups, not yet fixed):** (1) Windows-only — the detection reuses `current_thread_stack_high`;
-(2) the `JIT_ENTRY_CHAIN`-non-empty case where an unregistered `main` sits ABOVE a registered chain
-is not yet covered (the repro hits chain-empty). See the CRACKED + fix notes below.
+variants ==HotSpot; `bt16` throughput byte-identical; `cratonvm-gc` 732/732 (incl. regression
+`non_moving_sweep_when_unregistered_jit_frame_on_stack`). **Follow-up done:** the
+`JIT_ENTRY_CHAIN`-non-empty case (an unregistered `main` ABOVE a registered chain) is now also
+covered — the detection scans `[cover_hi, stack_high)` regardless of chain length and marks the
+above-chain frame (no collector-choice change when the chain is non-empty, so no throughput cost;
+dev merge `9c64d691`). **Remaining residual:** Windows-only — the detection reuses
+`current_thread_stack_high` (Win32 `GetCurrentThreadStackLimits`); a portable (pthread) port is a
+tracked follow-up that needs a non-Windows environment to validate. See the CRACKED + fix notes below.
 
 Originally a residual member of **Family A** (GC root coverage under JIT). Found 2026-06-21.
 JIT-only; reproduced **only at extreme young-GC frequency** (`CRATONVM_DBG_GC_STRESS` ≤ 65536, i.e.
