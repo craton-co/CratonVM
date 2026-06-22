@@ -835,16 +835,45 @@ pub(crate) fn resolve_field_index_in_hierarchy(
     field_name: &str,
     store: &ClassStore,
 ) -> Option<usize> {
+    resolve_field_index_in_hierarchy_desc(class_id, field_name, None, store)
+}
+
+/// Descriptor-aware variant of [`resolve_field_index_in_hierarchy`].
+///
+/// Resolves an instance field by name, optionally disambiguated by its JVM
+/// type `descriptor` (`"I"`, `"Ljava/lang/String;"`, `"[J"`, …). When
+/// `descriptor` is `Some`, only a field whose declared descriptor matches is
+/// considered — this is what lets a caller address a **shadowed** super-class
+/// field that a subclass re-declares with the same name: a name-only resolve
+/// always returns the most-derived declaration, but passing the super-class
+/// field's descriptor walks past the subclass shadow to the intended slot.
+///
+/// `descriptor == None` is exactly the name-only behaviour (most-derived
+/// declaration wins). The hierarchy is walked subclass → super, so among
+/// several descriptor-matching fields the most-derived still wins (two fields
+/// with the *same* name and *same* descriptor in the chain are inherently
+/// indistinguishable by descriptor — full disambiguation there would need the
+/// declaring class, which is out of scope).
+pub(crate) fn resolve_field_index_in_hierarchy_desc(
+    class_id: ClassId,
+    field_name: &str,
+    descriptor: Option<&str>,
+    store: &ClassStore,
+) -> Option<usize> {
     let mut current_id = Some(class_id);
     while let Some(cid) = current_id {
         let class = store.get(cid)?;
-        // Search non-static fields declared in this class
+        // Search non-static fields declared in this class. `instance_offset`
+        // counts every non-static field (matching or not) so the layout slot
+        // stays correct regardless of the descriptor filter.
         let mut instance_offset = 0;
         for field in &class.fields {
             if field.is_static() {
                 continue;
             }
-            if &*field.name == field_name {
+            if &*field.name == field_name
+                && descriptor.is_none_or(|d| &*field.descriptor == d)
+            {
                 return Some(class.first_field_index + instance_offset);
             }
             instance_offset += 1;

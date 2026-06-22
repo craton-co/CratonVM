@@ -1632,6 +1632,86 @@ pub extern "C" fn cratonvm_field_index(
     })
 }
 
+/// `int32_t cratonvm_field_index_desc(CratonVm *vm, CratonClass cls,
+///     const char *name, const char *descriptor, int32_t *out_index)`
+///
+/// Descriptor-disambiguated companion to [`cratonvm_field_index`]: resolve an
+/// instance field by `name`, additionally requiring its JVM type `descriptor`
+/// to match (`"I"`, `"Ljava/lang/String;"`, `"[J"`, …). This is what lets a
+/// host address a **shadowed** super-class field that a subclass re-declares
+/// with the same name — a plain name resolve always returns the most-derived
+/// declaration, but passing the super-class field's descriptor walks past the
+/// subclass shadow to the intended slot.
+///
+/// `descriptor` may be **null**, in which case this behaves exactly like
+/// [`cratonvm_field_index`] (name-only; most-derived wins). Writes the slot to
+/// `*out_index` and returns [`JNI_OK`], or [`JNI_ERR`] (last error set,
+/// `*out_index` untouched) when the class is unloaded or has no instance field
+/// matching both name and (when supplied) descriptor. The resolved index is
+/// usable with [`cratonvm_get_field`] / [`cratonvm_set_field`].
+///
+/// # Safety
+/// `vm` is a handle from [`cratonvm_create`]; `cls` is a [`CratonClass`] the VM
+/// handed out; `name` is a valid NUL-terminated C string; `descriptor` is null
+/// or a valid NUL-terminated C string; `out_index`, when non-null, is writable.
+#[no_mangle]
+pub extern "C" fn cratonvm_field_index_desc(
+    vm: *mut CratonVm,
+    cls: CratonClass,
+    name: *const c_char,
+    descriptor: *const c_char,
+    out_index: *mut JInt,
+) -> JInt {
+    catch_unwind(AssertUnwindSafe(|| {
+        clear_last_error();
+        // SAFETY: `vm` per caller contract.
+        unsafe {
+            with_vm(vm, JNI_ERR, |h| {
+                // SAFETY: caller contract — `name` is a valid C string or null.
+                let field_name = match cstr_or_err(name, "field name") {
+                    Some(s) => s,
+                    None => return JNI_ERR,
+                };
+                // `descriptor` is optional: null → name-only resolution.
+                let desc: Option<&str> = if descriptor.is_null() {
+                    None
+                } else {
+                    // SAFETY: caller contract — non-null `descriptor` is a valid C string.
+                    match cstr_or_err(descriptor, "field descriptor") {
+                        Some(s) => Some(s),
+                        None => return JNI_ERR,
+                    }
+                };
+                let class_id = ClassId::new(cls as u32);
+                match h.vm.instance_field_index_desc(class_id, field_name, desc) {
+                    Some(idx) => {
+                        if !out_index.is_null() {
+                            // SAFETY: `out_index` checked non-null; writable per contract.
+                            *out_index = idx as JInt;
+                        }
+                        JNI_OK
+                    }
+                    None => {
+                        match desc {
+                            Some(d) => set_last_error(format!(
+                                "cratonvm_field_index_desc: no instance field \"{field_name}\" with descriptor \"{d}\" on class"
+                            )),
+                            None => set_last_error(format!(
+                                "cratonvm_field_index_desc: no instance field \"{field_name}\" on class"
+                            )),
+                        }
+                        JNI_ERR
+                    }
+                }
+            })
+        }
+    }))
+    .unwrap_or_else(|_| {
+        set_last_error("cratonvm_field_index_desc: panic");
+        JNI_ERR
+    })
+}
+
 /// `CratonValue cratonvm_get_field_by_name(CratonVm *vm, CratonRef obj, const char *name)`
 ///
 /// Read the named instance field of `obj` (resolved against `obj`'s **runtime**
@@ -2075,6 +2155,35 @@ mod tests {
     }
 
     #[test]
+    fn field_index_desc_null_handle_returns_err() {
+        clear_last_error();
+        let name = CString::new("h").unwrap();
+        let desc = CString::new("I").unwrap();
+        let mut out: JInt = -999;
+        // Both with and without a descriptor, a null VM handle must short-circuit
+        // to JNI_ERR before any VM access, leaving out_index untouched.
+        let rc = cratonvm_field_index_desc(
+            std::ptr::null_mut(),
+            0,
+            name.as_ptr(),
+            desc.as_ptr(),
+            &mut out,
+        );
+        assert_eq!(rc, JNI_ERR);
+        assert_eq!(out, -999, "out_index must be untouched on error");
+        assert!(last_error_string().is_some());
+        // Null descriptor (name-only) path, same null-VM rejection.
+        let rc2 = cratonvm_field_index_desc(
+            std::ptr::null_mut(),
+            0,
+            name.as_ptr(),
+            std::ptr::null(),
+            &mut out,
+        );
+        assert_eq!(rc2, JNI_ERR);
+    }
+
+    #[test]
     fn get_field_by_name_null_handle_returns_error_value() {
         clear_last_error();
         let name = CString::new("h").unwrap();
@@ -2258,6 +2367,33 @@ mod tests {
             last_error_string()
         );
         assert!(hash_idx >= 0);
+        // descriptor-aware resolution: the correct descriptor ("I") resolves to
+        // the SAME slot as the name-only resolve; a wrong descriptor ("J") finds
+        // no matching field; a null descriptor is name-only (same slot again).
+        {
+            let desc_i = CString::new("I").unwrap();
+            let desc_j = CString::new("J").unwrap();
+            let mut idx_i: JInt = -1;
+            assert_eq!(
+                cratonvm_field_index_desc(vm, scls, hash_name.as_ptr(), desc_i.as_ptr(), &mut idx_i),
+                JNI_OK,
+                "field_index_desc(String.hash, I) failed: {:?}",
+                last_error_string()
+            );
+            assert_eq!(idx_i, hash_idx, "descriptor-matched slot must equal name-only slot");
+            let mut idx_j: JInt = -1;
+            assert_eq!(
+                cratonvm_field_index_desc(vm, scls, hash_name.as_ptr(), desc_j.as_ptr(), &mut idx_j),
+                JNI_ERR,
+                "field_index_desc(String.hash, J) should not match an int field"
+            );
+            let mut idx_n: JInt = -1;
+            assert_eq!(
+                cratonvm_field_index_desc(vm, scls, hash_name.as_ptr(), std::ptr::null(), &mut idx_n),
+                JNI_OK
+            );
+            assert_eq!(idx_n, hash_idx, "null descriptor must be name-only resolution");
+        }
         // name-based read agrees with index-based read at the resolved slot.
         let by_name = cratonvm_get_field_by_name(vm, s, hash_name.as_ptr());
         let by_index = cratonvm_get_field(vm, s, hash_idx);

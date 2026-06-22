@@ -159,6 +159,16 @@ CratonValue cratonvm_get_field(CratonVm *vm, CratonRef obj, cratonvm_jint index)
 cratonvm_jint cratonvm_field_index(CratonVm *vm, CratonClass cls, const char *name,
                                    cratonvm_jint *out_index);
 
+/* Descriptor-disambiguated field resolution: like cratonvm_field_index, but a
+ * non-null `descriptor` (a JVM type descriptor: "I", "Ljava/lang/String;",
+ * "[J", ...) must also match. This addresses a SHADOWED super-class field that a
+ * subclass re-declares with the same name (name-only resolution returns the
+ * most-derived one; passing the super-class field's descriptor walks past the
+ * shadow). A null `descriptor` is identical to cratonvm_field_index (name-only).
+ * Returns 0 (JNI_OK) or -1 (JNI_ERR) when no field matches name + descriptor. */
+cratonvm_jint cratonvm_field_index_desc(CratonVm *vm, CratonClass cls, const char *name,
+                                        const char *descriptor, cratonvm_jint *out_index);
+
 /* Read the named instance field of `obj` (resolved against obj's RUNTIME class)
  * as a typed CratonValue. tag CRATON_TAG_ERROR on a bad handle / unknown name. */
 CratonValue cratonvm_get_field_by_name(CratonVm *vm, CratonRef obj, const char *name);
