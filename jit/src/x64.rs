@@ -6429,12 +6429,15 @@ struct Compiler {
     /// deopt-osr Step 1: stable boxed copies of `deopt_points`, for the
     /// imm64-baked deopt stub to load by pointer (mirrors `_deopt_point_boxes`).
     deopt_boxes: Vec<Box<crate::deopt::DeoptimizationPoint>>,
-    /// deopt-osr Step 2: frame offset (positive depth-from-RBP) of the DEEPEST
-    /// qword of the always-reserved 128-byte `SavedRegisters{gpr:[u64;16]}`
-    /// region the frame-deopt stub spills into. `gpr[r]` is stored at
-    /// `[rbp - (deopt_regs_base - r*8)]`, so `gpr[0]=RAX` is the deepest/lowest
-    /// address and `LEA [rbp - deopt_regs_base] == &gpr[0]`. 0 unless
-    /// `deopt_real_enabled()` reserved the region at construction.
+    /// deopt-osr Step 2 / P2: frame offset (positive depth-from-RBP) of the
+    /// DEEPEST qword of the always-reserved 256-byte
+    /// `SavedRegisters{gpr:[u64;16],xmm:[u64;16]}` region the frame-deopt stub
+    /// spills into. `gpr[r]` is stored at `[rbp - (deopt_regs_base - r*8)]`, so
+    /// `gpr[0]=RAX` is the deepest/lowest address and
+    /// `LEA [rbp - deopt_regs_base] == &gpr[0] == &SavedRegisters`; the XMM half
+    /// follows (`#[repr(C)]`), so `xmm[n]` at
+    /// `[rbp - (deopt_regs_base - 128 - n*8)]`. 0 unless `deopt_real_enabled()`
+    /// reserved the region at construction.
     deopt_regs_base: i32,
     /// deopt-osr Step 2: bci → stable pointer to the boxed `DeoptimizationPoint`
     /// for that guard, baked as arg0 (imm64) by the frame-deopt stub. Populated
@@ -6693,19 +6696,21 @@ impl Compiler {
         };
         let reg_spill_base = xmm_saved_base + xmm_saved_size;
 
-        // deopt-osr Step 2 — 128-byte SavedRegisters{gpr:[u64;16]} region for the
-        // frame-deopt stub's in-stub 16-GPR spill. Reserved only under
-        // CRATONVM_DEOPT_REAL so the default frame is byte-identical. Placed just
-        // BELOW (deeper than) the per-safepoint reg-spill region and above the
-        // shadow/stack-arg region. `deopt_regs_base` is the offset of the DEEPEST
-        // qword (gpr[0]=RAX, lowest address): gpr[r] at [rbp - (deopt_regs_base -
-        // r*8)] so the 16 slots ascend with r from &gpr[0] = [rbp - deopt_regs_base].
+        // deopt-osr Step 2 / P2 — 256-byte SavedRegisters{gpr:[u64;16],xmm:[u64;16]}
+        // region for the frame-deopt stub's in-stub 16-GPR + 16-XMM spill. Reserved
+        // only under CRATONVM_DEOPT_REAL so the default frame is byte-identical.
+        // Placed just BELOW (deeper than) the per-safepoint reg-spill region and
+        // above the shadow/stack-arg region. `deopt_regs_base` is the offset of the
+        // DEEPEST qword (gpr[0]=RAX, lowest address): gpr[r] at
+        // [rbp - (deopt_regs_base - r*8)] (ascending with r from
+        // &gpr[0] = [rbp - deopt_regs_base]); the XMM half follows the GPR half in
+        // `#[repr(C)]` order, so xmm[n] at [rbp - (deopt_regs_base - 128 - n*8)].
         let deopt_regs_size = if crate::deopt_real_enabled() {
-            16 * 8
+            32 * 8
         } else {
             0
         };
-        debug_assert!(deopt_regs_size == 0 || deopt_regs_size == 128);
+        debug_assert!(deopt_regs_size == 0 || deopt_regs_size == 256);
         let deopt_regs_base = if deopt_regs_size != 0 {
             reg_spill_base + reg_spill_size + deopt_regs_size
         } else {
@@ -14028,6 +14033,19 @@ impl Compiler {
                 for r in 0u8..16 {
                     // Cast: value to i32 (encoding immediate/displacement)
                     self.emit_store_local(base - (r as i32) * 8, r);
+                }
+                // 1b) Spill all 16 XMM registers (low 64 bits via MOVQ) into the
+                //     XMM half of the region — `xmm[n] -> [rbp - (base - 128 -
+                //     n*8)]`, matching the `#[repr(C)]` field order
+                //     (gpr[16] then xmm[16]). This captures any `float`/`double`
+                //     the FP value tier kept in an XMM live across the guard, so
+                //     `XmmFloat(n)`/`XmmDouble(n)` resolve in `x64_deopt_entry`.
+                //     The GPR spill above does not touch XMMs, so each still holds
+                //     its trapping-instant value. Always-spill-16 (like the GPRs):
+                //     reading an unused XMM is harmless and keeps the stub simple.
+                for n in 0u8..16 {
+                    // Cast: value to i32 (encoding immediate/displacement)
+                    self.emit_movq_mem_rbp_from_xmm(base - 128 - (n as i32) * 8, n);
                 }
                 // 2) Args (extern "C"): arg0 = &DeoptimizationPoint (baked imm64),
                 //    arg1 = rbp (live, never clobbered until the epilogue),
