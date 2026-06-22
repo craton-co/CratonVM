@@ -82,6 +82,65 @@ jobs:
             echo "::warning::default build registered ${STUBS} synthetic-stub native(s)"
           fi
 
+  # Build + publish the libcratonvm C-ABI embedding library (cdylib + staticlib)
+  # and its public C headers as downloadable CI artifacts, per
+  # docs/feature-designs/embedding-api.md ("CI publication of the .so/.dll/.a +
+  # header"). cargo names the artifacts after the crate:
+  #   Linux:   liblibcratonvm.so (cdylib) + liblibcratonvm.a (staticlib)
+  #   Windows: libcratonvm.dll (cdylib) + libcratonvm.dll.lib (import lib) +
+  #            libcratonvm.lib (staticlib)
+  # (the doubled `lib` on Linux is cargo's prefix on a crate already named
+  # `lib...`; see the design doc). The build-and-test job already compiles the
+  # whole workspace including libcratonvm, so this never introduces a new build
+  # failure surface — it only adds a release build + artifact upload.
+  publish-libcratonvm:
+    name: Publish libcratonvm (cdylib/staticlib + headers)
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build libcratonvm (release cdylib + staticlib)
+        run: cargo build --release -p libcratonvm
+
+      - name: Stage artifacts (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp target/release/liblibcratonvm.so dist/
+          cp target/release/liblibcratonvm.a  dist/
+          cp libcratonvm/include/cratonvm.h         dist/
+          cp libcratonvm/include/cratonvm_helpers.h dist/
+          ls -l dist
+
+      - name: Stage artifacts (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp target/release/libcratonvm.dll      dist/
+          cp target/release/libcratonvm.dll.lib  dist/
+          cp target/release/libcratonvm.lib      dist/
+          cp libcratonvm/include/cratonvm.h         dist/
+          cp libcratonvm/include/cratonvm_helpers.h dist/
+          ls -l dist
+
+      - name: Upload libcratonvm artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: libcratonvm-${{ runner.os }}
+          path: dist/
+          if-no-files-found: error
+
   # Smoke-test every per-subsystem CRATONVM_REAL_* real-path gate.
   # Requires a JDK (for javac to compile the Java test classes in build.rs)
   # and the cratonvm binary. The tests skip gracefully when prerequisites are

@@ -13,10 +13,11 @@ pre-implementation gaps, now closed.) A stable public surface for hosting a
 CratonVM JVM inside a host process — both a curated Rust API and a C-ABI
 `libcratonvm` with JNI Invocation-API parity.
 
-Remaining / genuinely next: descriptor-based disambiguation of shadowed
-same-name fields; a C-varargs convenience shim (the typed `CratonValue` array
-is the stable core — a definition-side C-varargs entry is unsound on stable
-Rust); and CI publication of the `.so`/`.dll`/`.a` + header.
+The three previously-"genuinely next" items are now **DONE** (Increment 7
+below): descriptor-based disambiguation of shadowed same-name fields
+(`cratonvm_field_index_desc`); the C-varargs convenience shim (header-only
+`cratonvm_helpers.h`); and CI publication of the `.so`/`.dll`/`.a` + header
+(the `publish-libcratonvm` CI job). No open follow-ups remain on this feature.
 
 ## Goal
 
@@ -546,3 +547,74 @@ the VM down for real.
   (no parked VM → idempotent `JNI_OK`). The `embed_smoke.c` Invocation-API
   acceptance harness now calls `DestroyJavaVM` (slot 3) after the `System.gc`
   call and asserts `JNI_GetCreatedJavaVMs` then reports **0** VMs.
+
+## Increment 7 (the three remaining follow-ups) landed
+
+Closes the last three "genuinely next" items, after which this feature has no
+open follow-ups.
+
+### Descriptor-based disambiguation of shadowed same-name fields
+
+A subclass may re-declare a field with the same **name** as a super-class field
+(field shadowing). Name-only resolution (`instance_field_index` /
+`cratonvm_field_index`) always returns the most-derived declaration, so the
+shadowed super-class slot was unreachable. Now resolvable by JVM type
+descriptor:
+
+- **vm crate.** `resolve_field_index_in_hierarchy_desc(class_id, name,
+  descriptor: Option<&str>, store)` (the old `…_in_hierarchy` delegates with
+  `None`) matches name **and**, when `descriptor` is `Some`, the field's declared
+  descriptor (`ClassFileField.descriptor`). `instance_offset` still counts every
+  non-static field, so the layout slot is unaffected by the filter. Exposed as
+  `Vm::instance_field_index_desc`. (`None` is byte-identical to the name-only
+  path; the most-derived match still wins, so two fields with the *same* name
+  *and* descriptor remain indistinguishable by descriptor alone — full
+  disambiguation there needs the declaring class, out of scope.)
+- **Flat C API.** `cratonvm_field_index_desc(vm, cls, name, descriptor,
+  out_index)` — `descriptor` may be **null** (≡ `cratonvm_field_index`). The
+  resolved index feeds the existing `cratonvm_get_field` / `cratonvm_set_field`.
+- **Facade.** `cratonvm_embed::field_index_desc`.
+- **Tests.** `field_index_desc_null_handle_returns_err` (both with and without a
+  descriptor); the `--cfg flat_api_live_vm` round trip asserts `String.hash`
+  resolves identically by `"I"` and by null descriptor, and that `"J"` finds no
+  match.
+
+### C-varargs convenience shim — `cratonvm_helpers.h`
+
+A definition-side C-varargs entry (`extern "C" fn(...)`) is unsound/unavailable
+on stable Rust and not ABI-portable for non-`int`/`double` args, so the stable
+core ABI keeps the typed `CratonValue` array + count. The varargs-like
+*ergonomics* are restored **purely on the C side**, header-only, with no new ABI
+surface and no Rust change:
+
+- `cratonvm_val_int/long/float/double/object/void` build a `CratonValue` from a
+  native C value (float/double bit-cast via `memcpy`); `cratonvm_as_*` /
+  `cratonvm_is_error` read one back.
+- `cratonvm_invoke_static_v` / `cratonvm_invoke_virtual_v` are variadic macros
+  that assemble the typed array + count via a C99 compound literal + `sizeof`
+  (so `cratonvm_invoke_virtual_v(vm, s, "substring", "(I)Ljava/lang/String;",
+  cratonvm_val_int(2))` just works). They require ≥1 arg (a C99 compound literal
+  cannot be empty); for a zero-arg call use the core function with `NULL, 0`.
+- Kept in a **separate** header (not `cratonvm.h`) so the core header stays a
+  faithful, cbindgen-regenerable mirror of the Rust ABI. `cratonvm.h` itself is
+  unchanged except for the new `cratonvm_field_index_desc` declaration.
+- Exercised by the new `libcratonvm/examples/embed_helpers.c`, which (unlike the
+  re-declaring `embed_smoke.c`/`embed_flat.c`) actually `#include`s **both**
+  public headers — so it doubles as proof they compile from C — and runs
+  `Integer.toString(1234)` (static-`_v`), `"embed".substring(2)` / `.charAt(0)`
+  (virtual-`_v`), and the `field_index_desc` descriptor cases.
+
+### CI publication of the `.so`/`.dll`/`.a` + header
+
+New `publish-libcratonvm` job in `.github/workflows/ci.yml` (matrix
+ubuntu-latest + windows-latest): `cargo build --release -p libcratonvm`, stage
+the per-platform artifacts (Linux `liblibcratonvm.so` + `liblibcratonvm.a`;
+Windows `libcratonvm.dll` + `libcratonvm.dll.lib` + `libcratonvm.lib`) plus
+`cratonvm.h` + `cratonvm_helpers.h`, and upload via `actions/upload-artifact@v4`
+(`if-no-files-found: error`). The existing `build-and-test` job already compiles
+the whole workspace incl. libcratonvm, so this adds no new build-failure surface
+— only a release build + upload.
+
+The reproducible local build+run wrapper `scripts/build-libcratonvm.ps1` now also
+compiles & runs `embed_helpers.c` (a third harness, `-I libcratonvm/include` so
+it can include the public headers).

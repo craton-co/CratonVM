@@ -4831,10 +4831,34 @@ impl Vm {
     /// not loaded or declares no such instance field. The returned index is the
     /// absolute slot suitable for [`Vm::get_instance_field`] /
     /// [`Vm::set_instance_field`] and `heap.get_field`. Resolution is by **name**
-    /// only (descriptor disambiguation of shadowed same-name fields is a refinement).
+    /// only; use [`Vm::instance_field_index_desc`] to disambiguate a shadowed
+    /// same-name field by its descriptor.
     pub fn instance_field_index(&self, class_id: ClassId, field_name: &str) -> Option<usize> {
         let cm = self.shared.class_manager.read();
         super::vm_exec::resolve_field_index_in_hierarchy(class_id, field_name, &cm.class_store)
+    }
+
+    /// Descriptor-aware field resolution: resolve `field_name` to its layout
+    /// slot, optionally disambiguated by JVM type `descriptor` (`"I"`,
+    /// `"Ljava/lang/String;"`, …). Passing `Some(descriptor)` lets a caller
+    /// address a **shadowed** super-class field that a subclass re-declares
+    /// with the same name (the super-class field's descriptor walks past the
+    /// subclass shadow). `None` is identical to [`Vm::instance_field_index`]
+    /// (most-derived declaration wins). See
+    /// [`super::vm_exec::resolve_field_index_in_hierarchy_desc`].
+    pub fn instance_field_index_desc(
+        &self,
+        class_id: ClassId,
+        field_name: &str,
+        descriptor: Option<&str>,
+    ) -> Option<usize> {
+        let cm = self.shared.class_manager.read();
+        super::vm_exec::resolve_field_index_in_hierarchy_desc(
+            class_id,
+            field_name,
+            descriptor,
+            &cm.class_store,
+        )
     }
 
     /// Number of instance-field slots in `class_id`'s layout — the valid index

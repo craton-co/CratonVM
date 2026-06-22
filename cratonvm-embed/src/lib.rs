@@ -114,6 +114,21 @@ pub fn field_index(vm: &Vm, class_id: ClassId, name: &str) -> Option<usize> {
     vm.instance_field_index(class_id, name)
 }
 
+/// Descriptor-disambiguated field resolution: resolve `name` to its layout slot,
+/// optionally requiring its JVM type `descriptor` (`"I"`, `"Ljava/lang/String;"`,
+/// …) to match. `Some(descriptor)` lets a caller address a **shadowed**
+/// super-class field that a subclass re-declares with the same name; `None` is
+/// identical to [`field_index`] (most-derived wins). Thin pass-through to
+/// [`Vm::instance_field_index_desc`].
+pub fn field_index_desc(
+    vm: &Vm,
+    class_id: ClassId,
+    name: &str,
+    descriptor: Option<&str>,
+) -> Option<usize> {
+    vm.instance_field_index_desc(class_id, name, descriptor)
+}
+
 /// Read a named instance field of `obj`, resolved against its **runtime** class.
 /// `None` if the field name is unknown.
 pub fn get_field_by_name(vm: &Vm, obj: ObjectRef, name: &str) -> Option<Value> {
