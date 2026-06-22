@@ -7433,16 +7433,14 @@ impl Compiler {
             let off = self.local_offset(i);
             let fv = if is_oop {
                 // The precise oop mask is the authority for ref-typed slots. A
-                // SPILLED ref → `StackSlotRef` (the slot word IS the heap
-                // pointer). A REGISTER-resident ref, however, has no sound
-                // encoding yet: `Register(r)` resolves to `Int`, which both
-                // mistypes the slot AND drops the oop from GC tracking on resume
-                // (a moving-GC UAF). Until register-resident-oop typing lands,
-                // emit `Unsupported` so such a frame re-runs. (For the BCE pilot
-                // the array ref is spilled at the guard, so this is a no-op there;
-                // it keeps the P2 gate-relax sound for any newly-admitted method.)
-                if reg.is_some() {
-                    crate::deopt::FrameValue::Unsupported
+                // SPILLED ref → `StackSlotRef`; a REGISTER-resident ref →
+                // `RegisterRef(r)` (deopt-osr P2 trap-2). Both resolve to the raw
+                // heap pointer captured in-stub at the guard (the GPR is spilled
+                // into `SavedRegisters.gpr`), and the resume builds a GC-tracked
+                // `Value::Object` — NOT the truncating `Register(r)`/`Int`, which
+                // would also drop the oop from the GC root scan (a moving-GC UAF).
+                if let Some(r) = reg {
+                    crate::deopt::FrameValue::RegisterRef(r)
                 } else {
                     frame_value_for_slot(reg, xmm, off, true)
                 }
@@ -7470,7 +7468,18 @@ impl Compiler {
                         FrameValue::StackSlot(-*off)
                     }
                 }
-                StackSlot::CalleeSaved(r) | StackSlot::Scratch(r) => FrameValue::Register(*r),
+                // A register-resident operand: a ref → `RegisterRef` (GC-tracked
+                // Object on resume), else a cat-1 `Register` (Int). A non-oop long
+                // in a stack register has no width source here and would truncate,
+                // but the operand stack is canonically empty at the BCE/OSR
+                // boundaries the snapshot fires at, so this is the conservative arm.
+                StackSlot::CalleeSaved(r) | StackSlot::Scratch(r) => {
+                    if is_oop {
+                        FrameValue::RegisterRef(*r)
+                    } else {
+                        FrameValue::Register(*r)
+                    }
+                }
                 StackSlot::Xmm(_) => FrameValue::Unsupported,
             });
         }

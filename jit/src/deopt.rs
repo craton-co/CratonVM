@@ -96,13 +96,24 @@ pub enum FrameValue {
     Double(u64),
     /// Object reference (heap address, 0 for null).
     Object(u64),
-    /// Cat-1 `int`/`ref` currently in a general-purpose machine register.
+    /// Cat-1 `int` currently in a general-purpose machine register. Resolves to a
+    /// (truncated-to-32-bit) [`FrameValue::Int`] from `gpr[n]`, so it is for
+    /// `int`s only — a register-resident `long` uses [`FrameValue::RegisterLong`]
+    /// and a register-resident object reference [`FrameValue::RegisterRef`].
     Register(u8),
     /// Cat-2 `long` currently live in general-purpose register `n`. Resolves to
     /// [`FrameValue::Long`] from the full 64 bits of `gpr[n]`. Distinct from
     /// [`FrameValue::Register`] (which resolves to a cat-1 `Int`, truncated to 32
     /// bits on resume) so a register-resident `long` keeps all 64 bits.
     RegisterLong(u8),
+    /// Object reference currently live in general-purpose register `n`. Resolves
+    /// to [`FrameValue::Object`] from the full 64 bits of `gpr[n]` — the register
+    /// holds the raw heap pointer (0 == null), exactly as
+    /// [`FrameValue::StackSlotRef`] does for a spilled ref. Distinct from
+    /// [`FrameValue::Register`] so the resume builds a `Value::Object` (GC-tracked)
+    /// instead of a truncated `Value::Int` that would also drop the oop from the
+    /// GC root scan.
+    RegisterRef(u8),
     /// Cat-1 `float` currently live in XMM register `n`. Resolves to
     /// [`FrameValue::Float`] from the low 32 bits of the spilled `xmm[n]`
     /// ([`SavedRegisters::xmm`]). The JIT FP value tier keeps a `float` in an XMM
@@ -889,6 +900,9 @@ fn resolve_value(v: &FrameValue, regs: &SavedRegisters, rbp: u64) -> FrameValue 
     match v {
         FrameValue::Register(r) => FrameValue::Int(regs.gpr[*r as usize] as i64),
         FrameValue::RegisterLong(r) => FrameValue::Long(regs.gpr[*r as usize] as i64),
+        // The register holds the raw heap pointer (0 == null) captured in-stub at
+        // the guard — same as `StackSlotRef` but read from the spilled GPR file.
+        FrameValue::RegisterRef(r) => FrameValue::Object(regs.gpr[*r as usize]),
         FrameValue::XmmFloat(n) => {
             // Low 32 bits of the spilled XMM ARE the IEEE-754 float pattern.
             FrameValue::Float(regs.xmm[*n as usize] & 0xFFFF_FFFF)
@@ -1272,6 +1286,8 @@ mod tests {
         // A cat-2 `long` in GPR 7 — full 64 bits (high bits set, would truncate
         // if mistyped as a cat-1 `Register`).
         regs.gpr[7] = 0xFEDC_BA98_7654_3210;
+        // An object reference in GPR 3 — the full pointer word.
+        regs.gpr[3] = 0x0000_7F12_3456_7890;
 
         let fs = FrameState {
             method_key: "T.m:()V".to_string(),
@@ -1282,6 +1298,7 @@ mod tests {
                 FrameValue::XmmFloat(5),
                 FrameValue::XmmDouble(9),
                 FrameValue::RegisterLong(7),
+                FrameValue::RegisterRef(3),
             ],
             stack: Vec::new(),
             monitors: Vec::new(),
@@ -1302,6 +1319,9 @@ mod tests {
         assert_eq!(rf.locals[3], FrameValue::Double(double_bits));
         // RegisterLong keeps all 64 bits (NOT truncated like Register -> Int).
         assert_eq!(rf.locals[4], FrameValue::Long(0xFEDC_BA98_7654_3210u64 as i64));
+        // RegisterRef carries the full heap pointer as an Object (NOT a truncated
+        // Int that would also drop it from the GC scan).
+        assert_eq!(rf.locals[5], FrameValue::Object(0x0000_7F12_3456_7890));
     }
 
     // -- DeoptReason -------------------------------------------------------
