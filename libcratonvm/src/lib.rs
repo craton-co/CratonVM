@@ -61,7 +61,10 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::Mutex;
 
 use cratonvm_vm::config::VmConfig;
-use cratonvm_vm::native::jni::{clear_jni_context, get_java_vm, get_jni_env, set_jni_context_arc};
+use cratonvm_vm::native::jni::{
+    clear_jni_context, get_java_vm, get_jni_env, host_thread_enter_native, host_thread_leave_native,
+    set_jni_context_arc,
+};
 use cratonvm_vm::vm::Vm;
 
 // ---------------------------------------------------------------------------
@@ -443,6 +446,51 @@ pub extern "C" fn JNI_CreateJavaVM(
         JNI_OK
     }))
     .unwrap_or(JNI_ERR)
+}
+
+// ---------------------------------------------------------------------------
+// Host thread in-native transition
+// ---------------------------------------------------------------------------
+
+/// `jint cratonvm_thread_enter_native(void)`
+///
+/// Declare the **calling** OS thread as parked in host-native code (HotSpot's
+/// `_thread_in_native`): it is excluded from GC stop-the-world for the duration,
+/// so a collection driven by another thread does not wait for it to reach a Java
+/// safepoint it will never hit while parked outside the VM.
+///
+/// Call this around any host-side blocking wait (a `join()`, an event-loop poll,
+/// `sleep`) on a thread that drives the VM but is currently idle in native code —
+/// most importantly the **creating thread** after `JNI_CreateJavaVM`, while other
+/// (attached) threads run Java + GC. Without it, that idle thread is counted as a
+/// live mutator and hangs the collection. Balance every call with exactly one
+/// [`cratonvm_thread_leave_native`].
+///
+/// A **foreign attached** thread (`AttachCurrentThread`) does not need this — it
+/// is already modelled as in-native between its JNI calls — so the call is a
+/// no-op for it. Returns [`JNI_OK`], or [`JNI_ERR`] if no VM exists.
+#[no_mangle]
+pub extern "C" fn cratonvm_thread_enter_native() -> JInt {
+    if host_thread_enter_native() {
+        JNI_OK
+    } else {
+        JNI_ERR
+    }
+}
+
+/// `jint cratonvm_thread_leave_native(void)`
+///
+/// Re-enter the VM after [`cratonvm_thread_enter_native`]: the calling thread
+/// rejoins the mutator population, waiting out any in-flight stop-the-world
+/// first. Balance exactly one prior `cratonvm_thread_enter_native`. No-op for a
+/// foreign attached thread. Returns [`JNI_OK`], or [`JNI_ERR`] if no VM exists.
+#[no_mangle]
+pub extern "C" fn cratonvm_thread_leave_native() -> JInt {
+    if host_thread_leave_native() {
+        JNI_OK
+    } else {
+        JNI_ERR
+    }
 }
 
 // ===========================================================================
@@ -2497,21 +2545,12 @@ mod tests {
             });
         }
 
-        // The creating thread (registry id 0) is now idle in host code while the
-        // foreign workers drive Java + GC. Like a foreign thread parked between
-        // calls, it must be modelled as in-native / GC-blocked, or a worker's
+        // The creating thread is now idle in host code while the foreign workers
+        // drive Java + GC. It must declare itself in-native, or a worker's
         // stop-the-world would wait for it forever (it never reaches a Java
-        // safepoint while parked in `join()`). This is the creating-thread analog
-        // of the foreign idle-blocked model (see foreign-thread-attach.md §3.3 /
-        // Risks: an idle creating thread that parks in host code must declare
-        // itself in-native). A real libjvm host hits the same requirement.
-        let host_vm = cratonvm_vm::native::jni::process_vm().expect("process_vm live");
-        let pre_stw = host_vm.gc_barrier.mark_blocked_region_enter();
-        if pre_stw {
-            let _ = host_vm
-                .gc_barrier
-                .arrive_and_wait(cratonvm_vm::threading::ThreadId(0));
-        }
+        // safepoint while parked in `join()`). This is exactly the host-facing
+        // primitive the embedding API exposes for an idle coordinator thread.
+        assert_eq!(cratonvm_thread_enter_native(), JNI_OK);
 
         for h in handles {
             h.join().expect("a worker thread panicked (UAF/crash or failed assert)");
@@ -2519,7 +2558,7 @@ mod tests {
         finished.store(true, Ordering::Release);
 
         // Rejoin the mutator population before inspecting VM state.
-        host_vm.gc_barrier.mark_blocked_region_leave();
+        assert_eq!(cratonvm_thread_leave_native(), JNI_OK);
 
         // Every worker's calls executed (proves real registration: the gate-off
         // env-only path would have returned 0 for every call).
