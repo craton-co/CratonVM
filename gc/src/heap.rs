@@ -28,9 +28,34 @@ use cratonvm_types::{ClassId, ObjectRef, Value};
 // Re-export heap types from the shared types crate.
 pub use cratonvm_types::{
     array_data_size, array_data_size_checked, element_byte_size, ArrayElementType, ObjectHeader,
-    ObjectKind, ARRAY_LENGTH_OFFSET, AUTOBOX_CLASS_ID, GC_FLAG_MARKED, GC_FLAG_OLD_GEN,
-    HEADER_SIZE, REF_ELEMENT_SIZE, SLOT_SIZE,
+    ObjectKind, ARRAY_LENGTH_OFFSET, AUTOBOX_CLASS_ID, GC_FLAG_COMPACT, GC_FLAG_MARKED,
+    GC_FLAG_OLD_GEN, HEADER_SIZE, REF_ELEMENT_SIZE, REF_FIELD_SIZE, SLOT_SIZE,
 };
+use cratonvm_types::{class_layout, is_compact_object, CompactLayout};
+use std::sync::Arc;
+
+/// For a compact object (one allocated under the compact reference-field
+/// layout, [`GC_FLAG_COMPACT`]), return its class oop-map together with the
+/// object's own allocated body size in bytes. The GC scans/remaps **only** the
+/// reference slots listed in [`CompactLayout::ref_offsets`], each an 8-byte
+/// pointer at `HEADER_SIZE + offset`.
+///
+/// Returns `None` for a legacy object — the caller must fall back to
+/// tag-scanning its uniform 16-byte cells.
+///
+/// The `body_size` is the object's *own* body (from its header), which may be
+/// smaller than the class's current `body_size` if the (synthetic-stub) class
+/// grew after this object was allocated. Callers iterate `ref_offsets` in
+/// ascending order and stop at the first offset that would read past
+/// `body_size`, so a grown class never makes the GC read out of bounds.
+#[inline]
+pub(crate) fn compact_oop_scan(header: &ObjectHeader) -> Option<(Arc<CompactLayout>, usize)> {
+    if !is_compact_object(header) {
+        return None;
+    }
+    let layout = class_layout(header.class_id.as_u32())?;
+    Some((layout, header.array_length as usize))
+}
 
 // ---------------------------------------------------------------------------
 // Heap — semi-space copying GC heap

@@ -11,12 +11,17 @@ pub mod access_flags;
 mod class_id;
 pub mod compact_value;
 pub mod error;
+pub mod field_layout;
 pub mod float_format;
 mod heap_types;
 pub mod intern;
 mod value;
 
 pub use class_id::{ClassId, ClassLoaderId};
+pub use field_layout::{
+    class_layout, compact_ref_fields_enabled, is_compact_object, object_body_size,
+    register_class_layout, set_compact_ref_fields_enabled, CompactLayout,
+};
 pub use float_format::{java_double_to_string, java_float_to_string};
 pub use compact_value::{CompactTag, CompactValue, CompactValueError};
 pub use heap_types::{
@@ -24,7 +29,8 @@ pub use heap_types::{
     ObjectKind, ARRAY_LENGTH_OFFSET, AUTOBOX_CLASS_ID, FIELD_CELL_PAYLOAD32_OFFSET,
     FIELD_CELL_PAYLOAD64_OFFSET, FIELD_CELL_TAG_OFFSET, GC_FLAG_MARKED, GC_FLAG_OLD_GEN,
     HEADER_SIZE, INFLATED_PTR_MASK, MARK_INFLATED, MARK_NEUTRAL, MARK_STATE_MASK, MARK_THIN_LOCKED,
-    MARK_WORD_OFFSET, REF_ELEMENT_SIZE, SLOT_SIZE, THIN_LOCK_OWNER_MASK, THIN_LOCK_OWNER_SHIFT,
+    GC_FLAG_COMPACT, MARK_WORD_OFFSET, REF_ELEMENT_SIZE, REF_FIELD_SIZE, SLOT_SIZE,
+    THIN_LOCK_OWNER_MASK, THIN_LOCK_OWNER_SHIFT,
     THIN_LOCK_RECURSION_MASK, THIN_LOCK_RECURSION_SHIFT,
 };
 pub use intern::{intern, intern_arc, StringPool};

@@ -44,6 +44,10 @@ use crate::heap::{
     SLOT_SIZE,
 };
 use crate::old_gen::OldGen;
+// Compact reference-field layout (CRATONVM_COMPACT_REF_FIELDS). Reference
+// instance fields are stored as 8-byte pointers per the per-class oop-map.
+use crate::{class_layout, compact_ref_fields_enabled, is_compact_object, object_body_size};
+use cratonvm_types::GC_FLAG_COMPACT;
 use crate::satb::SatbQueue;
 use cratonvm_types::{ClassId, ObjectRef, Value};
 
@@ -662,9 +666,10 @@ impl GenerationalHeap {
     pub fn alloc_object(&self, class_id: ClassId, num_fields: usize) -> ObjectRef {
         // Checked arithmetic — an overflowed `total_size` would size the
         // allocation incorrectly. Mirrors `try_alloc_object`'s checked path.
-        let total_size = num_fields
-            .checked_mul(SLOT_SIZE)
-            .and_then(|fields_size| HEADER_SIZE.checked_add(fields_size))
+        // `plan_object_alloc` also picks the compact reference-field layout when
+        // enabled (smaller `total_size`, `array_length` = body bytes,
+        // `GC_FLAG_COMPACT`).
+        let (total_size, array_len, compact_flag) = plan_object_alloc(class_id, num_fields)
             .unwrap_or_else(|| {
                 eprintln!(
                     "FATAL: object size overflow in gen_heap alloc_object \
@@ -700,20 +705,21 @@ impl GenerationalHeap {
             }
         };
 
-        let header = ObjectHeader::new(
+        let mut header = ObjectHeader::new(
             class_id,
             ObjectKind::Object,
             ArrayElementType::Reference,
             self.next_hash(),
-            0,
+            array_len,
             num_slots_u32,
         );
+        header.gc_flags |= compact_flag;
 
         // SAFETY: `ptr` was just bump-allocated from the young arena with sufficient
-        // size (`HEADER_SIZE + num_fields * SLOT_SIZE`) and 8-byte alignment, so
-        // writing an `ObjectHeader` at its start is valid. The pointer is non-null
-        // and exclusively owned by this allocation; wrapping it in `ObjectRef` is
-        // sound because the header has been fully initialized.
+        // size (`total_size`) and 8-byte alignment, so writing an `ObjectHeader` at
+        // its start is valid. The pointer is non-null and exclusively owned by this
+        // allocation; wrapping it in `ObjectRef` is sound because the header has been
+        // fully initialized.
         unsafe {
             std::ptr::write(ptr as *mut ObjectHeader, header);
             ObjectRef::from_raw(ptr)
@@ -729,7 +735,7 @@ impl GenerationalHeap {
     /// so it is safe to call from a context holding unrooted local `ObjectRef`s
     /// (the JIT object-alloc helper GC-and-retries before calling this).
     pub fn try_alloc_object_full(&self, class_id: ClassId, num_fields: usize) -> Option<ObjectRef> {
-        let total_size = HEADER_SIZE.checked_add(num_fields.checked_mul(SLOT_SIZE)?)?;
+        let (total_size, array_len, compact_flag) = plan_object_alloc(class_id, num_fields)?;
         let num_slots_u32 = u32::try_from(num_fields).ok()?;
 
         // Young fast path; on exhaustion spill into old gen (non-moving) BEFORE
@@ -745,14 +751,15 @@ impl GenerationalHeap {
             }
         };
 
-        let header = ObjectHeader::new(
+        let mut header = ObjectHeader::new(
             class_id,
             ObjectKind::Object,
             ArrayElementType::Reference,
             self.next_hash(),
-            0,
+            array_len,
             num_slots_u32,
         );
+        header.gc_flags |= compact_flag;
         // SAFETY: identical invariants to `alloc_object` — `ptr` is a freshly
         // bump-allocated, exclusively-owned, zeroed region of `total_size` bytes
         // with 8-byte alignment, so writing the header and wrapping it in an
@@ -975,16 +982,18 @@ impl GenerationalHeap {
     pub fn try_alloc_object(&self, class_id: ClassId, num_fields: usize) -> Option<ObjectRef> {
         // M6 (round-12 gc): make the `+ HEADER_SIZE` add checked too, so a
         // near-`usize::MAX` field count can't wrap past the checked multiply.
-        let total_size = HEADER_SIZE.checked_add(num_fields.checked_mul(SLOT_SIZE)?)?;
+        // `plan_object_alloc` also selects the compact reference-field layout.
+        let (total_size, array_len, compact_flag) = plan_object_alloc(class_id, num_fields)?;
         let ptr = self.try_alloc_young(total_size)?;
-        let header = ObjectHeader::new(
+        let mut header = ObjectHeader::new(
             class_id,
             ObjectKind::Object,
             ArrayElementType::Reference,
             self.next_hash(),
-            0,
+            array_len,
             u32::try_from(num_fields).ok()?,
         );
+        header.gc_flags |= compact_flag;
         // SAFETY: `ptr` was bump-allocated from the young arena with sufficient size
         // and 8-byte alignment via `try_alloc_young`. The pointer is exclusively owned,
         // so writing the header and creating an `ObjectRef` are sound.
@@ -1132,7 +1141,7 @@ impl GenerationalHeap {
     /// succeed without GC instead of `std::process::abort()`-ing the whole VM.
     /// The `GC_FLAG_OLD_GEN` mark keeps minor GC from trying to forward it.
     fn try_alloc_object_old(&self, class_id: ClassId, num_fields: usize) -> Option<ObjectRef> {
-        let total_size = HEADER_SIZE.checked_add(num_fields.checked_mul(SLOT_SIZE)?)?;
+        let (total_size, array_len, compact_flag) = plan_object_alloc(class_id, num_fields)?;
         let ptr = {
             let mut og = self.old_gen.lock();
             og.alloc(total_size, 8)?
@@ -1142,10 +1151,10 @@ impl GenerationalHeap {
             ObjectKind::Object,
             ArrayElementType::Reference,
             self.next_hash(),
-            0,
+            array_len,
             u32::try_from(num_fields).ok()?,
         );
-        header.gc_flags |= GC_FLAG_OLD_GEN;
+        header.gc_flags |= GC_FLAG_OLD_GEN | compact_flag;
         // SAFETY: `OldGen::alloc` returned `total_size` bytes of zeroed,
         // 8-byte-aligned memory exclusive to this allocation; writing the
         // header is in-bounds and the resulting `ObjectRef` is fully valid.
@@ -1445,6 +1454,19 @@ impl GenerationalHeap {
             } // end rate-limited OOB-read diagnostics
             return Value::Object(None);
         }
+        // Compact reference-field layout: reference fields are 8-byte pointers
+        // at their per-class byte offset; primitive fields stay 16-byte cells.
+        if let Some((off, is_ref)) = compact_field_slot(header, index) {
+            // SAFETY: `index < num_slots` (checked above) ⇒ `off` is within the
+            // object's body (prefix-sum offset table), so `base` and the 8/16-byte
+            // read of that slot are in-bounds.
+            let base = unsafe { obj_ref.as_ptr().add(HEADER_SIZE + off) };
+            return if is_ref {
+                unsafe { read_prim_element(base, 0, ArrayElementType::Reference) }
+            } else {
+                unsafe { read_slot(base) }
+            };
+        }
         // SAFETY: `obj_ref` points to a valid heap object and `index` is within
         // `num_slots` (checked above). `slot_ptr` computes
         // `obj_ref + HEADER_SIZE + index * SLOT_SIZE`, which is within the
@@ -1596,6 +1618,35 @@ impl GenerationalHeap {
             return;
         }
         debug_assert!(index < self.get_header(obj_ref).num_slots as usize);
+        // Compact reference-field layout: store reference fields as 8-byte
+        // pointers; primitive fields stay 16-byte cells. The write barrier fires
+        // in every arm (card-mark old→young + SATB), same as the legacy path.
+        if let Some((off, is_ref)) = compact_field_slot(header, index) {
+            // SAFETY: `index < num_slots` (checked above) ⇒ `off` within body.
+            let base = unsafe { obj_ref.as_ptr().add(HEADER_SIZE + off) };
+            if is_ref {
+                match value {
+                    Value::Object(_) => {
+                        unsafe { write_prim_element(base, 0, ArrayElementType::Reference, value) };
+                        self.write_barrier(obj_ref, value);
+                    }
+                    // A non-reference value written into a reference slot
+                    // (typeless `Unsafe.put*`): box it into a 1-field wrapper,
+                    // exactly as compact reference *arrays* do (AUTOBOX_CLASS_ID).
+                    _ => {
+                        let wrapper = self.alloc_object(AUTOBOX_CLASS_ID, 1);
+                        self.set_field(wrapper, 0, value);
+                        let wv = Value::Object(Some(wrapper));
+                        unsafe { write_prim_element(base, 0, ArrayElementType::Reference, wv) };
+                        self.write_barrier(obj_ref, wv);
+                    }
+                }
+            } else {
+                unsafe { write_slot(base, value) };
+                self.write_barrier(obj_ref, value);
+            }
+            return;
+        }
         // SAFETY: Same as `get_field` — `index` is within `num_slots` so the
         // computed slot pointer is within the object's allocated region.
         // `write_slot` writes a `Value` at the computed address.
@@ -6123,11 +6174,17 @@ fn gen_object_total_size(header: &ObjectHeader) -> usize {
                 0
             }
         }
+    } else if is_compact_object(header) {
+        // Compact object: the body size in bytes is stored in `array_length`
+        // (objects don't otherwise use it; `kind` disambiguates from arrays).
+        // The sum is bounded by the u32 body size + HEADER_SIZE, no overflow.
+        HEADER_SIZE + header.array_length as usize
     } else {
-        // Header-coherence sanity check: a correctly-allocated `kind = Object`
-        // header always has `array_length = 0` (see `try_alloc_object` / the
-        // ObjectHeader::new contract — only `alloc_array` writes a non-zero
-        // array_length, and it sets `kind = Array` together with it).
+        // Header-coherence sanity check: a correctly-allocated legacy
+        // `kind = Object` header always has `array_length = 0` (see
+        // `try_alloc_object` / the ObjectHeader::new contract — only
+        // `alloc_array` writes a non-zero array_length, and it sets
+        // `kind = Array` together with it).
         //
         // The binary-trees workload exposed a JIT inline-allocation path that
         // writes `array_length` into the header but leaves `kind` at its
@@ -6176,6 +6233,47 @@ fn gen_object_total_size(header: &ObjectHeader) -> usize {
 fn slot_ptr(obj_ref: ObjectRef, index: usize) -> *mut u8 {
     // SAFETY: Caller guarantees `index` is within the object's slot count; pointer arithmetic stays within the allocation.
     unsafe { obj_ref.as_ptr().add(HEADER_SIZE + index * SLOT_SIZE) }
+}
+
+/// Plan an object allocation under the compact reference-field layout.
+///
+/// Returns `(total_size, array_length, gc_flags)`:
+/// - When the flag is on, a layout is registered for `class_id`, and its field
+///   count matches `num_fields`, the object uses the **compact** layout:
+///   `total_size = HEADER_SIZE + body_size`, `array_length = body_size` (the
+///   object's body bytes, since arrays-vs-objects is disambiguated by `kind`),
+///   and `gc_flags = GC_FLAG_COMPACT`.
+/// - Otherwise the legacy uniform layout: `total_size = HEADER_SIZE +
+///   num_fields*SLOT_SIZE`, `array_length = 0`, `gc_flags = 0`.
+///
+/// `None` only on size overflow.
+#[inline]
+fn plan_object_alloc(class_id: ClassId, num_fields: usize) -> Option<(usize, u32, u8)> {
+    if compact_ref_fields_enabled() {
+        if let Some(layout) = class_layout(class_id.as_u32()) {
+            if layout.field_count() == num_fields {
+                let total = HEADER_SIZE.checked_add(layout.body_size as usize)?;
+                return Some((total, layout.body_size, GC_FLAG_COMPACT));
+            }
+        }
+    }
+    let body = num_fields.checked_mul(SLOT_SIZE)?;
+    Some((HEADER_SIZE.checked_add(body)?, 0, 0))
+}
+
+/// Resolve a field access on a (possibly compact) object to `(byte_offset,
+/// is_ref)` within the object body. Returns `None` for a legacy object (caller
+/// uses the uniform `index * SLOT_SIZE` 16-byte cell). Keys on the per-object
+/// `GC_FLAG_COMPACT` bit, so legacy and compact objects coexist correctly.
+#[inline]
+fn compact_field_slot(header: &ObjectHeader, index: usize) -> Option<(usize, bool)> {
+    if !is_compact_object(header) {
+        return None;
+    }
+    let layout = class_layout(header.class_id.as_u32())?;
+    let off = layout.field_offset(index)? as usize;
+    let is_ref = layout.field_is_ref(index)?;
+    Some((off, is_ref))
 }
 
 /// Walk every object header in `arena` and clear `GC_FLAG_MARKED`.

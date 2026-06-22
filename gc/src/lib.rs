@@ -83,6 +83,12 @@ pub mod zgc;
 #[cfg(feature = "zgc")]
 pub mod zgc_concurrent;
 
+// Compact reference-field layout registry lives in `cratonvm-types` (shared by
+// classloading + gc). Re-export the GC/heap-facing API for convenience.
+pub use cratonvm_types::{
+    class_layout, compact_ref_fields_enabled, is_compact_object, object_body_size,
+    register_class_layout, set_compact_ref_fields_enabled, CompactLayout,
+};
 pub use collector::{GarbageCollector, MonitorCleanup, StopTheWorldToken};
 pub use compact_header::{
     CompactAllocator, CompactHeader, CompactHeaderSavingsReport, HashCodeTable, HeaderView,
