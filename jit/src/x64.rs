@@ -22828,7 +22828,20 @@ pub fn compile_with_param_slots(
     // `deopt_real_enabled()` (the snapshot emit site is gated), so production
     // artifacts are unchanged. Consumed at the interpreter deopt sink, which
     // attempts `resume_real_ir_deopt` only when `compiled.can_deopt_resume`.
-    cm.can_deopt_resume = !cm.deopt_points.is_empty() && compiler.scalar_replaced.is_empty();
+    //
+    // P2.0 (cat-2 soundness): also exclude any method with a wide (long/double)
+    // local. The snapshot has no per-slot WIDTH source yet, so a `long` local is
+    // recorded as `Register`/`StackSlot` and resolves to `Int` — TRUNCATING the
+    // high 32 bits on resume (silent corruption). A `double` already resolves to
+    // `Unsupported` → safe re-run, but a `long` would corrupt. Until P2.1 threads
+    // a width source + a `Long` FrameValue through `frame_value_for_slot` and the
+    // resume mapper, gate such methods to the safe whole-method re-run. (Cat-2
+    // operand-stack values are not a concern at the BCE loop-header guard — the
+    // operand stack is canonically empty there.)
+    let has_wide_local = !wide_local_high_halves(code, code_len).is_empty();
+    cm.can_deopt_resume = !cm.deopt_points.is_empty()
+        && compiler.scalar_replaced.is_empty()
+        && !has_wide_local;
     // deopt-osr Step 7 — transfer the OSR-exit loop-boundary bci set and set the
     // per-method gate. Both are empty/false unless `deopt_real_enabled()` was on
     // (the emit site is gated), so production artifacts are unchanged. Step 8

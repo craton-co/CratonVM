@@ -287,7 +287,31 @@ impl<'a> SharedEvac<'a> {
         } else {
             &mut tlab.survivor
         };
-        let new_addr = self.tlab_alloc(dest_tlab, obj_size)?;
+        let new_addr = match self.tlab_alloc(dest_tlab, obj_size) {
+            Some(a) => a,
+            None => {
+                // EVACUATION FAILURE (to-space pool exhausted): self-forward in
+                // place rather than dropping the object (mirrors the serial path).
+                // CAS the from-space header's forwarding slot to the object's OWN
+                // address; the winner records an identity forward (old→old) so
+                // Phase 5 keeps its region, a loser adopts whatever address won
+                // (a real new location, or another self-forward). `fresh` from the
+                // CAS keeps the object scanned exactly once.
+                let old = old_ptr as usize;
+                return match fwd_atomic.compare_exchange(
+                    0,
+                    old,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => {
+                        forwards.push((old, old));
+                        Some((old_ptr, true))
+                    }
+                    Err(winner) => Some((winner as *mut u8, false)),
+                };
+            }
+        };
         let new_ptr = new_addr as *mut u8;
 
         std::ptr::copy_nonoverlapping(old_ptr, new_ptr, obj_size);
@@ -1203,6 +1227,49 @@ impl G1Collector {
         None
     }
 
+    /// Phase 5: free evacuated CSet regions — EXCEPT those that hold a
+    /// self-forwarded (evacuation-failed) object, which must be KEPT so the
+    /// still-live object that could not be relocated is not freed.
+    ///
+    /// A self-forwarded object is recorded as an identity entry (`key == value`)
+    /// in the forwarding map by [`Self::evacuate_object`] (and the parallel
+    /// evacuator) when to-space is exhausted. Its region is kept intact: a young
+    /// `Eden` region is retyped to `Survivor` (it now holds survivors and is
+    /// re-collected next cycle, when the moved-out garbage copies it also
+    /// contains become unreachable and freed); `Survivor`/`Old` regions keep
+    /// their type. Returns the bytes freed (only from regions actually reset).
+    ///
+    /// At adequate heaps no evacuation fails, so `failed` is empty and this is
+    /// exactly the old "reset every CSet region" behaviour.
+    fn free_or_keep_cset(
+        &self,
+        regions: &mut Vec<G1Region>,
+        cset: &[usize],
+        pointer_map: &HashMap<usize, usize>,
+    ) -> usize {
+        // Regions that hold at least one self-forwarded (in-place) object.
+        // `lookup_region_for_addr` consults the immutable region table, so it
+        // does not borrow `regions` (no conflict with the mutable loop below).
+        let failed: std::collections::HashSet<usize> = pointer_map
+            .iter()
+            .filter(|(k, v)| k == v)
+            .filter_map(|(k, _)| self.lookup_region_for_addr(*k))
+            .collect();
+
+        let mut bytes_freed = 0usize;
+        for &cset_idx in cset {
+            if failed.contains(&cset_idx) {
+                if regions[cset_idx].region_type == RegionType::Eden {
+                    regions[cset_idx].region_type = RegionType::Survivor;
+                }
+            } else {
+                bytes_freed += regions[cset_idx].cursor;
+                regions[cset_idx].reset();
+            }
+        }
+        bytes_freed
+    }
+
     // -----------------------------------------------------------------------
     // Young Collection (STW)
     // -----------------------------------------------------------------------
@@ -1361,11 +1428,7 @@ impl G1Collector {
         self.update_references_in_regions(&mut regions, &cset_set, &pointer_map);
 
         // Phase 5: Free evacuated regions
-        let mut bytes_freed = 0usize;
-        for &cset_idx in &cset {
-            bytes_freed += regions[cset_idx].cursor;
-            regions[cset_idx].reset();
-        }
+        let bytes_freed = self.free_or_keep_cset(&mut regions, &cset, &pointer_map);
 
         // SECURITY FIX (V7b): after the CSet is freed, scan survivors for
         // any slot still pointing into a freed CSet region with no
@@ -1712,11 +1775,7 @@ impl G1Collector {
         // Update references and free evacuated regions
         self.update_references_in_regions(&mut regions, &cset_set, &pointer_map);
 
-        let mut bytes_freed = 0usize;
-        for &cset_idx in &cset {
-            bytes_freed += regions[cset_idx].cursor;
-            regions[cset_idx].reset();
-        }
+        let bytes_freed = self.free_or_keep_cset(&mut regions, &cset, &pointer_map);
 
         // SECURITY FIX (V7b): mixed GC frees old regions as well as young
         // ones, where a stale/incomplete rset is most likely. Verify no
@@ -1982,11 +2041,7 @@ impl G1Collector {
         self.update_references_in_regions(&mut regions, &cset_set, &pointer_map);
 
         // Phase 5: free evacuated regions.
-        let mut bytes_freed = 0usize;
-        for &cset_idx in &cset {
-            bytes_freed += regions[cset_idx].cursor;
-            regions[cset_idx].reset();
-        }
+        let bytes_freed = self.free_or_keep_cset(&mut regions, &cset, &pointer_map);
         self.verify_no_dangling_into_cset(&regions, &cset_set, &pointer_map);
 
         let cur_eden = self.current_eden.load(Ordering::Relaxed);
@@ -2114,11 +2169,7 @@ impl G1Collector {
 
         self.update_references_in_regions(&mut regions, &cset_set, &pointer_map);
 
-        let mut bytes_freed = 0usize;
-        for &cset_idx in &cset {
-            bytes_freed += regions[cset_idx].cursor;
-            regions[cset_idx].reset();
-        }
+        let bytes_freed = self.free_or_keep_cset(&mut regions, &cset, &pointer_map);
         self.verify_no_dangling_into_cset(&regions, &cset_set, &pointer_map);
 
         let cur_eden = self.current_eden.load(Ordering::Relaxed);
@@ -2240,7 +2291,33 @@ impl G1Collector {
             RegionType::Survivor
         };
 
-        let new_ptr = Self::alloc_in_type_locked(regions, dest_type, obj_size, cset)?;
+        let new_ptr = match Self::alloc_in_type_locked(regions, dest_type, obj_size, cset) {
+            Some(p) => p,
+            None => {
+                // EVACUATION FAILURE (to-space exhausted: no non-CSet region of the
+                // destination type has room and no Free region is left). Real G1
+                // "self-forwards" such an object — keeps it IN PLACE rather than
+                // dropping it. The previous `?` returned None here, so the caller
+                // skipped the object: its referrers' slots kept pointing into a
+                // CSet region that Phase 5 then reset/freed → silent live-object
+                // loss (a wrong result under memory pressure where the
+                // generational collector correctly OOMs).
+                //
+                // Self-forward: install old→old in the pointer map (an identity
+                // forward) and return the object at its current address with
+                // `fresh = true` so the caller still scans its fields (refs to
+                // objects that DID evacuate are rewritten; refs to other
+                // self-forwarded objects stay put) and the referrer's slot is
+                // rewritten to `old_ptr` (a no-op — the object did not move).
+                // Phase 5 detects self-forwarded objects (key == value in the
+                // pointer map) and KEEPS their regions instead of freeing them,
+                // so nothing is lost. The heap is then simply not reclaimed → the
+                // triggering mutator allocation fails → a clean, catchable
+                // OutOfMemoryError, exactly as the generational collector does.
+                pointer_map.insert(old_addr, old_addr);
+                return Some((old_ptr, true));
+            }
+        };
 
         // Copy object data
         unsafe {
@@ -7097,5 +7174,48 @@ mod tests {
             }
             assert_eq!(count, n, "round {round}: chain length changed (lost nodes)");
         }
+    }
+
+    /// Regression for G1 evacuation failure (to-space exhaustion). A heap of
+    /// exactly two regions is filled by a held chain so that when a young GC
+    /// runs there are ZERO free regions for to-space. Previously `evacuate_object`
+    /// returned `None` and the caller DROPPED the object → silent live-object
+    /// loss. Now it self-forwards in place and `free_or_keep_cset` keeps the
+    /// region, so the entire held chain survives intact (nothing reclaimed — the
+    /// real heap is full, which the allocation path turns into a clean OOM).
+    #[test]
+    fn evacuation_failure_self_forwards_does_not_drop() {
+        let mut cfg = small_config();
+        cfg.region_size = 1024 * 1024;
+        cfg.heap_size = 2 * 1024 * 1024; // exactly 2 regions
+        let gc = G1Collector::new(cfg);
+        // Fill ~1.1 MB across the 2 regions with a held chain → both regions
+        // become Eden (CSet), leaving 0 Free regions for evacuation to-space.
+        let n = 20000usize;
+        let head = gc.alloc_object(ClassId::new(1), 1);
+        let mut cur = head;
+        for _ in 1..n {
+            let node = gc.alloc_object(ClassId::new(1), 1);
+            gc.set_field(cur, 0, Value::Object(Some(node)));
+            cur = node;
+        }
+        gc.set_field(cur, 0, Value::Int(7));
+        let mut roots = vec![head];
+        // No free region → every survivor hits evacuation failure → self-forward.
+        let r = gc.young_collection(&mut roots, &NoopMonitors);
+        assert_eq!(r.stats.bytes_freed, 0, "a failed collection must free nothing");
+        // The whole chain must still be reachable and intact — nothing dropped.
+        let mut count = 0usize;
+        let mut c = roots[0];
+        loop {
+            count += 1;
+            assert!(count <= n, "chain longer than {n}");
+            match gc.get_field(c, 0) {
+                Value::Object(Some(next)) => c = next,
+                Value::Int(7) => break,
+                other => panic!("chain dropped at node {count} -> {other:?}"),
+            }
+        }
+        assert_eq!(count, n, "evacuation failure dropped live nodes");
     }
 }
