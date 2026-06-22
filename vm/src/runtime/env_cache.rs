@@ -93,6 +93,27 @@ pub fn jit_invocation_threshold() -> u32 {
     })
 }
 
+/// `CRATONVM_TIER_OSR_BACKEDGE` — wire-tiered-manager Step 6 — per-frame
+/// back-edge count at which OSR is first attempted (`Frame::should_try_osr`'s
+/// `osr_threshold` argument), default 1000 (the historical `OSR_THRESHOLD`
+/// const in `interpreter.rs`). This is the *live* OSR trigger on BOTH the
+/// default inline-OSR path and the Step-5 background-OSR path (which is why it
+/// is a VM-side env knob, separate from the tiered manager's policy
+/// `osr_threshold`). Lowering it makes hot loops OSR sooner (useful for
+/// gauntlet tuning / quick repros); raising it defers OSR. Invalid/unset →
+/// useful profile/warmup). `None` when unset/invalid, so the caller keeps its
+/// own default (`OSR_THRESHOLD`); `0` clamps to `1`. Read once and cached.
+#[inline]
+pub fn tier_osr_backedge() -> Option<u32> {
+    static CACHE: OnceLock<Option<u32>> = OnceLock::new();
+    *CACHE.get_or_init(|| {
+        std::env::var("CRATONVM_TIER_OSR_BACKEDGE")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .map(|v| v.max(1))
+    })
+}
+
 /// `CRATONVM_DISABLE_INTRINSICS` — kill-switch that prevents the interpreter
 /// from ever populating a `CachedInvokeTarget::Intrinsic` inline-cache entry,
 /// forcing every call through the ordinary native/bytecode dispatch path.

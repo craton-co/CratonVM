@@ -4594,7 +4594,13 @@ pub(crate) fn try_osr_with_backoff(
     initial_frame_idx: usize,
     entry_pc: usize,
 ) -> OsrBackoffOutcome {
-    if !thread.frames[*frame_idx].should_try_osr(entry_pc, OSR_THRESHOLD) {
+    // wire-tiered-manager Step 6: the per-frame back-edge OSR trigger is now an
+    // env knob (`CRATONVM_TIER_OSR_BACKEDGE`); `OSR_THRESHOLD` remains the
+    // canonical default. Live on both the inline and background-OSR paths. Unset
+    // → identical to before.
+    let osr_backedge_threshold =
+        crate::runtime::env_cache::tier_osr_backedge().unwrap_or(OSR_THRESHOLD);
+    if !thread.frames[*frame_idx].should_try_osr(entry_pc, osr_backedge_threshold) {
         return OsrBackoffOutcome::Skip;
     }
     // wire-tiered-manager Step 5 (precise background OSR): when the bg/tiered
