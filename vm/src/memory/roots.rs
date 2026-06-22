@@ -396,6 +396,15 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     //     (`gc_update_loader_singleton_refs`).
     cratonvm_native_builtins::classloader::gc_scan_loader_singleton_roots(&mut roots);
 
+    // 18a. Process-global `System.getenv()` / `System.getProperties()`
+    //      singletons cached in `native-builtins/src/lang_system.rs`. Like the
+    //      class loaders above, these synthetic objects live ONLY in process-
+    //      global mutexes, invisible to every scan above; without rooting them a
+    //      moving young GC reclaims/relocates the cached Map/Properties and the
+    //      next `getenv()`/`getProperties()` returns a stale `ObjectRef`. Remap
+    //      companion in `gc.rs` (`gc_update_system_singleton_refs`).
+    cratonvm_native_builtins::lang_system::gc_scan_system_singleton_roots(&mut roots);
+
     // 18b. Process-global Locale caches (cached default Locale + synthetic
     //      Locale side-tables) in native-builtins. Same stale-pointer hazard as
     //      the class loaders: a moving young GC reclaims/relocates the cached

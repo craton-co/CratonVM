@@ -334,6 +334,12 @@ pub fn update_all_roots(
     //     stale-ClassLoader → `String.loadClass` cryptoProvider failure).
     cratonvm_native_builtins::classloader::gc_update_loader_singleton_refs(pointer_map);
 
+    // 18a. Process-global `System.getenv()` / `System.getProperties()`
+    //      singletons (companion to roots.rs step 18a). Repoint the cached
+    //      Map/Properties ObjectRefs to their relocated addresses so the next
+    //      `getenv()`/`getProperties()` returns the live object after a move.
+    cratonvm_native_builtins::lang_system::gc_update_system_singleton_refs(pointer_map);
+
     // 18b. Process-global Locale caches (companion to roots.rs step 18b).
     //      Repoint the cached default Locale + synthetic Locale side-table keys
     //      to their relocated addresses so `Locale.getDefault()` keeps returning
