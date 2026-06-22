@@ -656,6 +656,26 @@ impl ConcurrentMarker {
                 }
             }
             // Primitive arrays have no references to scan.
+        } else if let Some((layout, body)) = crate::heap::compact_oop_scan(header) {
+            // Compact object: 8-byte reference slots at the per-class oop-map
+            // offsets. An aligned single-word 8-byte pointer load cannot tear,
+            // so (like the reference-array branch above) no stripe lock is
+            // needed even though this runs concurrently with mutators.
+            for &off in &layout.ref_offsets {
+                let off = off as usize;
+                if off + crate::heap::REF_FIELD_SIZE > body {
+                    break;
+                }
+                // SAFETY: `off` is within the object's body (capped above).
+                let slot_ptr = unsafe { obj_ptr.add(HEADER_SIZE + off) };
+                let raw: u64 = unsafe { std::ptr::read(slot_ptr as *const u64) };
+                if raw != 0 {
+                    let ref_ptr = raw as usize as *mut u8;
+                    if old_gen.contains(ref_ptr) && self.bitmap.try_mark(ref_ptr as usize) {
+                        self.queue.push(ref_ptr);
+                    }
+                }
+            }
         } else {
             // Object: 16-byte Value slots.
             //

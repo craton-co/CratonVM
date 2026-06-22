@@ -5354,6 +5354,10 @@ impl ClassManager {
         if old_first_field_index != first_field_index || old_num_total != final_num_total {
             self.recompute_subclass_layouts(id);
         }
+        // Compact ref-field layout: the upgrade replaced this class's field
+        // descriptors (stub -> real bytecode), so its offset table / oop-map
+        // must be rebuilt even when the field *count* is unchanged.
+        self.class_store.register_compact_layout_if_enabled(id);
 
         // The upgrade replaced the constant pool and may have shifted
         // field indices for this class and its subclasses; drop any
@@ -5464,6 +5468,10 @@ impl ClassManager {
         // recompilation of any method that baked the stale offset).
         for cid in changed_descendants {
             fire_resolution_invalidate_hook(cid);
+            // Compact ref-field layout: the descendant's field offsets / oop-map
+            // shifted with its parent's growth — rebuild + re-register it.
+            self.class_store
+                .register_compact_layout_if_enabled(ClassId::new(cid));
         }
     }
 }

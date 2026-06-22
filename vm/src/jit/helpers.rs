@@ -1513,7 +1513,24 @@ pub unsafe extern "C" fn jit_post_tlab_init(
     // into the next object's payload — surfacing as ECJ's
     // HashtableOfInt.put `/by zero` on a zero-length keyTable.
     *(raw_ptr.add(4) as *mut u32) = 0;
-    *(raw_ptr.add(12) as *mut u32) = 0;
+    // Compact reference-field layout: array_length (off 12) carries the body
+    // size in bytes and gc_flags (off 21) gets GC_FLAG_COMPACT — matching the
+    // inline header the JIT already wrote (idempotent), and required on the
+    // non-skip path so the helper does not clobber them back to legacy.
+    let compact_body = if cratonvm_types::compact_ref_fields_enabled() {
+        cratonvm_types::class_layout(class_id_raw as u32)
+            .filter(|l| l.field_count() == num_fields as usize)
+            .map(|l| l.body_size)
+    } else {
+        None
+    };
+    if let Some(body) = compact_body {
+        *(raw_ptr.add(12) as *mut u32) = body;
+        // gc_flags byte at offset 21 (leave gc_age@20 / _gc_reserved@22-23 zero).
+        *(raw_ptr.add(21) as *mut u8) = cratonvm_types::GC_FLAG_COMPACT;
+    } else {
+        *(raw_ptr.add(12) as *mut u32) = 0;
+    }
     let hash = vm.heap.next_identity_hash();
     *(raw_ptr.add(8) as *mut i32) = hash;
     *(raw_ptr.add(16) as *mut u32) = num_fields as u32;
@@ -2117,6 +2134,44 @@ pub unsafe extern "C" fn jit_arraylength(array_ptr: i64) -> i64 {
 // Field access helpers
 // ---------------------------------------------------------------------------
 
+/// `(byte_offset, is_ref)` for a field of a **compact** object (one allocated
+/// under `CRATONVM_COMPACT_REF_FIELDS`, marked `GC_FLAG_COMPACT` @ header byte
+/// 21), else `None` for a legacy object. The JIT field helpers only get the raw
+/// object pointer + resolved field index, so they read `class_id` (header
+/// offset 0) and consult the per-class layout registry directly.
+///
+/// # Safety
+/// `obj_ptr` must be non-null and point at a valid object header.
+#[inline]
+unsafe fn jit_compact_field_slot(obj_ptr: i64, field_index: i64) -> Option<(usize, bool)> {
+    if field_index < 0 {
+        return None;
+    }
+    // GC_FLAG_COMPACT is the gc_flags byte at header offset 21.
+    let gc_flags = std::ptr::read((obj_ptr as *const u8).add(21));
+    if gc_flags & cratonvm_types::GC_FLAG_COMPACT == 0 {
+        return None;
+    }
+    let class_id = std::ptr::read(obj_ptr as *const u32); // class_id @ offset 0
+    cratonvm_types::compact_field_slot(class_id, field_index as usize)
+}
+
+/// Byte pointer to a **primitive** field's 16-byte cell, honouring the compact
+/// layout (primitive cells stay 16 bytes, only at a packed offset). Legacy
+/// objects use the uniform `index * SLOT_SIZE`.
+///
+/// # Safety
+/// `obj_ptr` must be non-null, point at a valid object header, and `field_index`
+/// must be within the object's slot count (callers bounds-check first).
+#[inline]
+unsafe fn jit_field_cell_ptr(obj_ptr: i64, field_index: i64) -> *mut u8 {
+    let off = match jit_compact_field_slot(obj_ptr, field_index) {
+        Some((o, _)) => o,
+        None => field_index as usize * SLOT_SIZE,
+    };
+    (obj_ptr as *mut u8).add(HEADER_SIZE + off)
+}
+
 // SAFETY: Called from JIT-compiled code. obj_ptr must be 0 (null) or a valid heap pointer
 // to a live object. field_index is the resolved field slot index within the object layout.
 // ptr::read is used because Value may contain non-Copy variants (ObjectRef).
@@ -2147,6 +2202,26 @@ pub unsafe extern "C" fn jit_getfield(obj_ptr: i64, field_index: i64) -> i64 {
     // object; match that by returning 0 without dereferencing.
     if !jit_putfield_slot_in_bounds(obj_ptr, field_index) {
         return 0;
+    }
+    // Compact layout: a reference field is a bare 8-byte pointer (0 = null,
+    // matching the legacy `Object(Some(r)) => r.as_ptr()` / `Object(None) => 0`
+    // result); a primitive field stays a 16-byte cell at its packed offset.
+    if let Some((off, is_ref)) = jit_compact_field_slot(obj_ptr, field_index) {
+        // SAFETY: off is within the object body (field_index < num_slots).
+        let ptr = (obj_ptr as *const u8).add(HEADER_SIZE + off);
+        if is_ref {
+            return std::ptr::read(ptr as *const u64) as i64;
+        }
+        let val: Value = std::ptr::read(ptr as *const Value);
+        return match val {
+            Value::Int(i) => i as i64,
+            Value::Long(l) => l,
+            Value::Float(f) => f.to_bits() as i64,
+            Value::Double(d) => d.to_bits() as i64,
+            Value::Object(Some(r)) => r.as_ptr() as i64,
+            Value::Object(None) => 0,
+            _ => 0,
+        };
     }
     // SAFETY: obj_ptr is non-null and points to a live object, and field_index is now
     // verified < num_slots, so HEADER_SIZE + field_index * SLOT_SIZE is within the
@@ -2224,8 +2299,9 @@ pub unsafe extern "C" fn jit_putfield_int(obj_ptr: i64, field_index: i64, val: i
     if !jit_putfield_slot_in_bounds(obj_ptr, field_index) {
         return;
     }
-    // SAFETY: obj_ptr is non-null, field slot is within the object's allocated region.
-    let ptr = (obj_ptr as *mut u8).add(HEADER_SIZE + field_index as usize * SLOT_SIZE);
+    // SAFETY: obj_ptr is non-null, field slot is within the object's allocated
+    // region; `jit_field_cell_ptr` packs the offset for a compact object.
+    let ptr = jit_field_cell_ptr(obj_ptr, field_index);
     if crate::runtime::env_cache::jit_pfi_trace() {
         // Read existing value to see if we're overwriting a ref with an int
         let existing = std::ptr::read(ptr as *const Value);
@@ -2252,8 +2328,9 @@ pub unsafe extern "C" fn jit_putfield_long(obj_ptr: i64, field_index: i64, val: 
     if !jit_putfield_slot_in_bounds(obj_ptr, field_index) {
         return;
     }
-    // SAFETY: obj_ptr is non-null, field slot is within the object's allocated region.
-    let ptr = (obj_ptr as *mut u8).add(HEADER_SIZE + field_index as usize * SLOT_SIZE);
+    // SAFETY: obj_ptr is non-null, field slot is within the object's allocated
+    // region; `jit_field_cell_ptr` packs the offset for a compact object.
+    let ptr = jit_field_cell_ptr(obj_ptr, field_index);
     // Atomic per-word store (concurrent-GC torn-read safety; see
     // `write_value_atomic`).
     cratonvm_types::write_value_atomic(ptr as *mut Value, Value::Long(val));
@@ -2271,8 +2348,9 @@ pub unsafe extern "C" fn jit_putfield_float(obj_ptr: i64, field_index: i64, val:
     if !jit_putfield_slot_in_bounds(obj_ptr, field_index) {
         return;
     }
-    // SAFETY: obj_ptr is non-null, field slot is within the object's allocated region.
-    let ptr = (obj_ptr as *mut u8).add(HEADER_SIZE + field_index as usize * SLOT_SIZE);
+    // SAFETY: obj_ptr is non-null, field slot is within the object's allocated
+    // region; `jit_field_cell_ptr` packs the offset for a compact object.
+    let ptr = jit_field_cell_ptr(obj_ptr, field_index);
     // Atomic per-word store (concurrent-GC torn-read safety; see
     // `write_value_atomic`).
     cratonvm_types::write_value_atomic(ptr as *mut Value, Value::Float(f32::from_bits(val as u32)));
@@ -2290,8 +2368,9 @@ pub unsafe extern "C" fn jit_putfield_double(obj_ptr: i64, field_index: i64, val
     if !jit_putfield_slot_in_bounds(obj_ptr, field_index) {
         return;
     }
-    // SAFETY: obj_ptr is non-null, field slot is within the object's allocated region.
-    let ptr = (obj_ptr as *mut u8).add(HEADER_SIZE + field_index as usize * SLOT_SIZE);
+    // SAFETY: obj_ptr is non-null, field slot is within the object's allocated
+    // region; `jit_field_cell_ptr` packs the offset for a compact object.
+    let ptr = jit_field_cell_ptr(obj_ptr, field_index);
     // Atomic per-word store (concurrent-GC torn-read safety; see
     // `write_value_atomic`).
     cratonvm_types::write_value_atomic(
@@ -2367,6 +2446,22 @@ pub unsafe extern "C" fn jit_putfield_object(
             eprintln!("[JIT-PFO] obj=0x{:x} obj_cid={} field_index={} val=0x{:x} val_cid={} val_kind={} val_arrlen=0x{:x}",
                 obj_ptr as usize, obj_cid, field_index, val as u64, val_class_id, val_kind, val_arrlen);
         }
+    }
+    // Compact layout: reference fields are bare 8-byte pointers. Preserve the
+    // SATB pre-barrier on the old 8-byte ref, then route through the heap's
+    // compact-aware `set_field` (8-byte store + generational card barrier).
+    if let Some((off, _is_ref)) = jit_compact_field_slot(obj_ptr, field_index) {
+        let heap = heap_from_vm(vm_ptr);
+        // SAFETY: `off` is within the object body (slot bounds-checked above).
+        let old_raw: u64 =
+            std::ptr::read((obj_ptr as *const u8).add(HEADER_SIZE + off) as *const u64);
+        if old_raw != 0 {
+            heap.satb_barrier(Value::Object(Some(ObjectRef::from_raw(
+                old_raw as usize as *mut u8,
+            ))));
+        }
+        heap.set_field(obj_ref, field_index as usize, value);
+        return;
     }
     let ptr = obj_ref
         .as_ptr()

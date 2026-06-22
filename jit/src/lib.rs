@@ -4245,7 +4245,7 @@ pub fn jit_bail_shortcircuits() -> u64 {
 pub fn try_compile(
     cached: &CachedBytecodeMethod,
     cp_class_name_resolver: Option<&dyn Fn(u16) -> Option<String>>,
-    cp_field_resolver: Option<&dyn Fn(u16) -> Option<(usize, u8)>>,
+    cp_field_resolver: Option<&dyn Fn(u16) -> Option<(usize, u8, u32, bool)>>,
     cp_static_field_resolver: Option<&dyn Fn(u16) -> Option<(u32, usize, u8, bool)>>,
     cp_invoke_resolver: Option<&dyn Fn(u16) -> Option<(String, String, String)>>,
     callee_compiler: Option<&dyn Fn(&str, &str, &str) -> Option<(usize, bool)>>,
@@ -4490,7 +4490,7 @@ thread_local! {
 fn try_compile_inner(
     cached: &CachedBytecodeMethod,
     cp_class_name_resolver: Option<&dyn Fn(u16) -> Option<String>>,
-    cp_field_resolver: Option<&dyn Fn(u16) -> Option<(usize, u8)>>,
+    cp_field_resolver: Option<&dyn Fn(u16) -> Option<(usize, u8, u32, bool)>>,
     cp_static_field_resolver: Option<&dyn Fn(u16) -> Option<(u32, usize, u8, bool)>>,
     cp_invoke_resolver: Option<&dyn Fn(u16) -> Option<(String, String, String)>>,
     callee_compiler: Option<&dyn Fn(&str, &str, &str) -> Option<(usize, bool)>>,
@@ -4770,8 +4770,10 @@ fn try_compile_inner(
             if let Some(resolver) = cp_field_resolver {
                 let mut fm = std::collections::HashMap::with_capacity(scan.field_ops.len());
                 for &(pc, cp_idx) in &scan.field_ops {
-                    if let Some(fi) = resolver(cp_idx) {
-                        fm.insert(pc, fi);
+                    if let Some((field_index, type_tag, _c_off, _c_ref)) = resolver(cp_idx) {
+                        // The IR builder only needs (field_index, type_tag); it
+                        // bails getfield/putfield to single-pass under compact.
+                        fm.insert(pc, (field_index, type_tag));
                     }
                 }
                 builder.set_field_info(fm);
@@ -5140,11 +5142,19 @@ fn try_compile_inner(
 
     let mut needs_heap = scan.needs_heap;
     let mut field_info = Vec::new();
+    // Compact reference-field layout: per field op, the packed byte offset +
+    // ref-ness (from the resolver, which has the declaring class). Stays empty
+    // when the flag is off → inline emitters use the legacy path.
+    let mut compact_field_info: Vec<(usize, u32, bool)> = Vec::new();
+    let compact_fields = cratonvm_types::compact_ref_fields_enabled();
     if !scan.field_ops.is_empty() {
         let resolver = cp_field_resolver?;
         for &(pc, cp_idx) in &scan.field_ops {
-            let (field_index, type_tag) = resolver(cp_idx)?;
+            let (field_index, type_tag, c_off, c_ref) = resolver(cp_idx)?;
             field_info.push((pc, field_index, type_tag));
+            if compact_fields {
+                compact_field_info.push((pc, c_off, c_ref));
+            }
             if code[pc] == 0xb5 && (type_tag == b'L' || type_tag == b'[') {
                 needs_heap = true;
             }
@@ -5644,6 +5654,7 @@ fn try_compile_inner(
         &param_jvm_slots,
         param_slot_span,
         param_oop_mask,
+        compact_field_info,
         &despec_method_key,
     )?;
 

@@ -736,11 +736,18 @@ impl OldGen {
         let data_start = data.as_ptr() as usize;
         let data_end = data_start + data.len();
 
-        // Snapshot the layout-driving fields, then drop the reference before
-        // any callback runs (see the aliasing note above).
-        let (kind, element_type, array_length, num_slots) = unsafe {
+        // Snapshot the layout-driving fields (incl. the compact oop-map Arc),
+        // then drop the reference before any callback runs (see the aliasing
+        // note above — `f` may mutate the object's header/fields).
+        let (kind, element_type, array_length, num_slots, compact) = unsafe {
             let h = &*(obj_ptr as *const ObjectHeader);
-            (h.kind, h.element_type, h.array_length, h.num_slots)
+            (
+                h.kind,
+                h.element_type,
+                h.array_length,
+                h.num_slots,
+                crate::heap::compact_oop_scan(h),
+            )
         };
 
         if kind == ObjectKind::Array {
@@ -753,6 +760,22 @@ impl OldGen {
                         if ref_ptr >= data_start && ref_ptr < data_end {
                             f(ref_ptr);
                         }
+                    }
+                }
+            }
+        } else if let Some((layout, body)) = compact {
+            // Compact object: 8-byte reference slots at the oop-map offsets.
+            for &off in &layout.ref_offsets {
+                let off = off as usize;
+                if off + crate::heap::REF_FIELD_SIZE > body {
+                    break;
+                }
+                let slot = unsafe { obj_ptr.add(HEADER_SIZE + off) };
+                let raw: u64 = unsafe { std::ptr::read(slot as *const u64) };
+                if raw != 0 {
+                    let ref_ptr = raw as usize;
+                    if ref_ptr >= data_start && ref_ptr < data_end {
+                        f(ref_ptr);
                     }
                 }
             }
@@ -844,97 +867,47 @@ impl OldGen {
         let data_start = data.as_ptr() as usize;
         let data_end = data_start + data.len();
 
-        if header.kind == ObjectKind::Array {
-            if header.element_type == ArrayElementType::Reference {
-                for i in 0..header.array_length as usize {
-                    let slot = unsafe { obj_ptr.add(HEADER_SIZE + i * REF_ELEMENT_SIZE) };
-                    let raw: u64 = unsafe { std::ptr::read(slot as *const u64) };
-                    if raw != 0 {
-                        let ref_ptr = raw as usize;
-                        // Only update references within old gen bounds
-                        if ref_ptr >= data_start && ref_ptr < data_end {
-                            let ref_header = unsafe { &*(ref_ptr as *const ObjectHeader) };
-                            if !ref_header.forwarding_ptr.is_null() {
-                                if seedhunt_enabled()
-                                    && (ref_header.forwarding_ptr as usize) < 0x1000
-                                {
-                                    eprintln!(
-                                        "[gcfwd] ARR write small fwd: holder@0x{:x} cid={} arr[{}] \
-                                         referent@0x{:x} cid={} marked={} fwd=0x{:x}",
-                                        obj_ptr as usize, header.class_id.as_u32(), i,
-                                        ref_ptr, ref_header.class_id.as_u32(),
-                                        ref_header.gc_flags & GC_FLAG_MARKED != 0,
-                                        ref_header.forwarding_ptr as usize,
-                                    );
-                                }
-                                unsafe {
-                                    std::ptr::write(
-                                        slot as *mut u64,
-                                        ref_header.forwarding_ptr as u64,
-                                    )
-                                };
-                            } else {
-                                // Dangling-ref guard: an in-old-gen target with
-                                // a null forwarding pointer is an UNMARKED
-                                // object that Phase 0 should have promoted. If
-                                // this fires, the live closure missed an edge
-                                // and leaving the slot as-is would dangle.
-                                debug_assert!(
-                                    false,
-                                    "old_gen.compact: live array holder@0x{:x} arr[{}] -> \
-                                     unmarked old-gen referent@0x{:x} (no forwarding addr); \
-                                     close_live_set_over_old_gen missed an edge",
-                                    obj_ptr as usize, i, ref_ptr,
-                                );
-                            }
-                        }
-                    }
+        // Remap every reference into a relocated (forwarded) in-old-gen object.
+        // Arrays + compact objects use 8-byte pointer slots; legacy objects use
+        // 16-byte Value cells. `forward_ref_slots` rewrites a slot only when the
+        // closure returns Some(new_addr).
+        // SAFETY: `obj_ptr`/`header` are a valid live old-gen object under STW.
+        unsafe {
+            crate::gen_heap::forward_ref_slots(obj_ptr, header, |ref_ptr| {
+                let r = ref_ptr as usize;
+                if r < data_start || r >= data_end {
+                    return None; // reference outside the compacted old-gen region
                 }
-            }
-        } else {
-            for slot_idx in 0..header.num_slots as usize {
-                let slot = unsafe { obj_ptr.add(HEADER_SIZE + slot_idx * SLOT_SIZE) };
-                let value = unsafe { std::ptr::read(slot as *const Value) };
-                if let Value::Object(Some(ref_obj)) = value {
-                    let ref_ptr = ref_obj.as_ptr() as usize;
-                    if ref_ptr >= data_start && ref_ptr < data_end {
-                        let ref_header = unsafe { &*(ref_ptr as *const ObjectHeader) };
-                        if !ref_header.forwarding_ptr.is_null() {
-                            if seedhunt_enabled() && (ref_header.forwarding_ptr as usize) < 0x1000 {
-                                eprintln!(
-                                    "[gcfwd] OBJ write small fwd: holder@0x{:x} cid={} fld[{}] \
-                                     referent@0x{:x} cid={} marked={} fwd=0x{:x}",
-                                    obj_ptr as usize,
-                                    header.class_id.as_u32(),
-                                    slot_idx,
-                                    ref_ptr,
-                                    ref_header.class_id.as_u32(),
-                                    ref_header.gc_flags & GC_FLAG_MARKED != 0,
-                                    ref_header.forwarding_ptr as usize,
-                                );
-                            }
-                            let new_value = Value::Object(Some(unsafe {
-                                ObjectRef::from_raw(ref_header.forwarding_ptr)
-                            }));
-                            unsafe { std::ptr::write(slot as *mut Value, new_value) };
-                        } else {
-                            // Dangling-ref guard (see the array branch above):
-                            // an in-old-gen field target with a null forwarding
-                            // pointer is unmarked floating garbage that Phase 0
-                            // should have promoted. Leaving the field as-is
-                            // would dangle once Phase 3/4 reuse the target's
-                            // bytes.
-                            debug_assert!(
-                                false,
-                                "old_gen.compact: live holder@0x{:x} fld[{}] -> \
-                                 unmarked old-gen referent@0x{:x} (no forwarding addr); \
-                                 close_live_set_over_old_gen missed an edge",
-                                obj_ptr as usize, slot_idx, ref_ptr,
-                            );
-                        }
+                let ref_header = &*(ref_ptr as *const ObjectHeader);
+                if !ref_header.forwarding_ptr.is_null() {
+                    if seedhunt_enabled() && (ref_header.forwarding_ptr as usize) < 0x1000 {
+                        eprintln!(
+                            "[gcfwd] write small fwd: holder@0x{:x} cid={} \
+                             referent@0x{:x} cid={} marked={} fwd=0x{:x}",
+                            obj_ptr as usize,
+                            header.class_id.as_u32(),
+                            r,
+                            ref_header.class_id.as_u32(),
+                            ref_header.gc_flags & GC_FLAG_MARKED != 0,
+                            ref_header.forwarding_ptr as usize,
+                        );
                     }
+                    Some(ref_header.forwarding_ptr)
+                } else {
+                    // Dangling-ref guard: an in-old-gen target with a null
+                    // forwarding pointer is an UNMARKED object that Phase 0
+                    // should have promoted. If this fires, the live closure
+                    // missed an edge and leaving the slot as-is would dangle.
+                    debug_assert!(
+                        false,
+                        "old_gen.compact: live holder@0x{:x} -> unmarked old-gen \
+                         referent@0x{:x} (no forwarding addr); \
+                         close_live_set_over_old_gen missed an edge",
+                        obj_ptr as usize, r,
+                    );
+                    None
                 }
-            }
+            });
         }
     }
 
