@@ -1,11 +1,16 @@
 # Precise JIT Stack Maps as the Validated Default
 
-Status: **largely landed, NOT yet fully validated as a trusted default.** The
-mechanism (`CRATONVM_PRECISE_JIT_MAPS`) is already **default-on** on `dev` (opt
-out with `CRATONVM_NO_PRECISE_JIT_MAPS`). What remains is the work to make it a
-*validated* default — perf, a full app-gauntlet GC-root sweep, and closing the
-two still-open family members it does **not** fix. This doc separates what is
-done from what "validated default" still requires.
+Status: **largely landed; perf gap closed (Steps 1+2), full app-gauntlet sweep
+still pending.** The mechanism (`CRATONVM_PRECISE_JIT_MAPS`) is **default-on** on
+`dev` (opt out `CRATONVM_NO_PRECISE_JIT_MAPS`). **Steps 1+2 (inline
+frame-record, 2026-06-21) closed the call-heavy perf regression** — the
+per-invocation frame-record CALL is now an inlined `mov gs:[disp], rbp`,
+default-on (opt out `CRATONVM_NO_PRECISE_INLINE_FRAME_RECORD`), fib44 1.68×
+faster, all bintrees checksums == HotSpot; see "Inline frame-record (Steps
+1+2)". What remains for a fully *validated* default — the Step 4 app-gauntlet
+GC-root sweep, and closing the two still-open family members (A2/A4) it does
+**not** fix. This doc separates what is done from what "validated default" still
+requires.
 
 > Note on sources: the orchestration brief referenced
 > `docs/internal/reviews/full-review-2026-06-20.md`. That file does **not** exist
@@ -130,7 +135,7 @@ known-issues README):
 | Moving-GC precise relocation (`remap_active_jit_frames` under a real move) | ⚠️ **implemented, not exercised on the default path** | The non-moving sweep + selective promote does not relocate JIT-held slots, so `remap_active_jit_frames` is inert by default; it is only load-bearing if a moving young gen is ever made default. |
 | OSR-point precise tracking | ⚠️ **partial / opt-in only** (`CRATONVM_SHADOW_OSR_TRACK`) | Shadow-path only (68199090, not 68332206); the precise-maps path relies on the conservative backstop for OSR frames, not on OSR oop maps. |
 | Full app-gauntlet GC-root regression with precise on | ❌ **NOT done** | `SB-SUITE-CRASH-04` #5: "Either needs a full app/bench regression sweep." |
-| Perf acceptable as default | ⚠️ **known regression on call-heavy code** | ~6% alloc-heavy (bt18), ~0% compute, **2.5× on pure call-heavy recursion** (fib44 8.5 s → 21.5 s) from the per-invocation `jit_frame_record` CALL. |
+| Perf acceptable as default | ✅ **inline frame-record landed (Steps 1+2, 2026-06-21)** | The per-invocation `jit_frame_record` CALL is now an inlined `mov gs:[disp], rbp` (default-on, Windows). fib44 inline-on ~11.8 s vs CALL-path ~19.8 s = **1.68× faster** (the no-frame-record floor is ~9 s, so inline cuts ~74 % of the frame-record overhead). bt16 also ~16 % faster. See "Inline frame-record (Steps 1+2)" below. Opt out: `CRATONVM_NO_PRECISE_INLINE_FRAME_RECORD`. |
 
 ## Proposed design (to reach a *validated* default)
 
@@ -179,14 +184,21 @@ not behaviour flips.
 - **Step 0 — Documentation of record (this doc).** Land the design; correct the
   README cross-refs so the shadow-stack vs precise-maps distinction and the
   A2/A4 scope are unambiguous. No code. Build-green by construction.
-- **Step 1 — Inline frame-record scaffolding (no behaviour change).** Add the
-  prologue chain-top cache slot and a feature flag
-  `CRATONVM_PRECISE_INLINE_FRAME_RECORD` (default-**off**) that, when on, emits
-  the inlined `mov` instead of the `call`. Keep the `call` path as the default
-  until validated. Build-green; A/B-able.
-- **Step 2 — Validate + flip the inline frame-record.** Prove A3 + bt16/bt18 +
-  fib44 (perf) on the inlined path; flip `CRATONVM_PRECISE_INLINE_FRAME_RECORD`
-  default-on (opt-out). Removes the 2.5× call-heavy regression.
+- **Step 1 — Inline frame-record scaffolding (no behaviour change). ✅ DONE**
+  (2026-06-21). Feature flag `CRATONVM_PRECISE_INLINE_FRAME_RECORD`; when on,
+  the prologue emits a single `mov gs:[disp], rbp` instead of
+  `call jit_frame_record`. Landed default-**off** first (byte-identical CALL
+  path); see "Inline frame-record (Steps 1+2)" below for the design that
+  *supersedes* the "chain-top cache slot" sketch — no frame slot is needed, the
+  store is one instruction into a startup-probed Windows TLS slot. Build-green;
+  A/B-able.
+- **Step 2 — Validate + flip the inline frame-record. ✅ DONE** (2026-06-21).
+  Validated on the inlined path: bintrees10/14/16/18 == HotSpot, fib44 **1.68×
+  faster** than the CALL path, `CRATONVM_DBG_VERIFY_INLINE_FRAME_RECORD`
+  self-check clean (0 mismatches). Flipped to **default-on**, opt-out
+  `CRATONVM_NO_PRECISE_INLINE_FRAME_RECORD`. Removes the call-heavy regression.
+  (The full app-gauntlet sweep — Step 4 — remains the final bar before the
+  *family* is declared retired; this flip satisfies the doc's Step-2 gate.)
 - **Step 3 — Coverage-gated pin (robustness, no behaviour change under
   non-moving sweep).** Wire `fully_oop_covered` into the GC so un-covered
   frames pin conservatively; assert via `CRATONVM_DBG_VERIFY_OOP_MAPS`-style
@@ -203,6 +215,83 @@ not behaviour flips.
   default project (`default-moving-young-gen.md`) is decided, either keep
   `CRATONVM_SHADOW_STACK` as the moving-relocation scaffolding or remove it.
   Out of scope for *this* doc beyond noting the dependency.
+
+## Inline frame-record (Steps 1+2) — landed 2026-06-21
+
+**What shipped.** The per-invocation `call jit_frame_record` in the JIT prologue
+(`x64.rs`) is replaced, when enabled, by a single instruction:
+
+```text
+mov gs:[disp], rbp      ; 65 48 89 2C 25 <disp32>  (9 bytes, no CALL)
+```
+
+storing RBP straight into the precise-maps innermost-RBP mirror. Gate:
+`precise_inline_frame_record_enabled()` (`x64.rs`), **default-on**, opt out with
+`CRATONVM_NO_PRECISE_INLINE_FRAME_RECORD`.
+
+**Design note — supersedes the "chain-top cache slot" sketch.** The scaffolding
+section below proposed caching the chain-top *address* in a frame slot (by
+analogy with the shadow path's thread-pointer cache). That only helps if
+obtaining the address is cheap, but the frame-record runs **once per
+invocation**, so "fetch address (CALL) + store" is no cheaper than the original
+CALL. The shipped design instead bakes the address as an immediate: the mirror
+lives in a **Windows OS TLS slot** (`TlsAlloc`), whose `gs:[0x1480 + slot*8]`
+displacement is recovered and **sentinel-probed at startup**
+(`inline_rbp_tls_disp()`). No frame slot, no per-call address fetch — just one
+`mov`. The probe is the safety net the Risks section demands: a unique 64-bit
+sentinel is written via the documented `TlsSetValue` and read back through the
+candidate `gs:[disp]` (with a fallback scan of the 64-slot static band); on any
+mismatch (slot ≥ 64, unexpected TEB layout) **or** non-Windows, it returns 0 and
+the CALL path is used. A wrong layout assumption therefore degrades to the
+existing safe behaviour, never to a silently mis-tracked mirror.
+
+**Single source of truth.** `inline_rbp_tls_disp()` (jit crate) is consulted by
+both the codegen (which bakes `gs:[disp]`) and the VM-side mirror accessor
+`top_rbp_get/set` (`conservative_roots.rs`, which reads/writes the same slot when
+active, else the legacy `thread_local! TOP_RBP`). Codegen and GC can never
+disagree on slot-vs-thread-local. The change is **behaviour-equivalent to the
+CALL path for the mirror value** — same RBP, same program point, same per-thread
+mirror, consumed identically; only the mechanism and cost differ. (On the
+default *non-moving* sweep the mirror is inert anyway — `remap_active_jit_frames`
+early-returns — so the default-path blast radius is nil; the mirror is
+load-bearing only for the moving/relocation path.)
+
+**Self-check.** `CRATONVM_DBG_VERIFY_INLINE_FRAME_RECORD` (default-off) wires a
+verify helper into the `frame_record` slot; the prologue emits the inline store
+*and* calls it to assert the mirror reads back the RBP just stored — proving the
+hand-rolled `gs:[disp]` encoding lands exactly where the GC reads.
+
+**Validation (this build, quiet host, JDK-25 HotSpot oracle):**
+
+| Check | inline-OFF (CALL) | inline-ON (`mov gs:[disp]`) | HotSpot |
+|---|---|---|---|
+| bintrees10 checksum | 135854 | 135854 | 135854 |
+| bintrees14 checksum | 3222190 | 3222190 | 3222190 |
+| bintrees16 checksum | 14985902 | 14985902 | 14985902 |
+| bintrees18 checksum | 68332206 | 68332206 | 68332206 |
+| fib44 wall (bench `ms=`) | ~19.8 s | **~11.8 s (1.68×)** | — |
+| bintrees16 wall | ~19.1 s | ~16.0 s | — |
+| self-check mismatches (fib44, bt16) | n/a | **0** | — |
+
+The no-frame-record floor (`CRATONVM_NO_PRECISE_JIT_MAPS`) is ~9 s on fib44, so
+inline cuts ~74 % of the frame-record overhead (CALL added ~10.8 s; inline adds
+~2.8 s). The TLS probe selected slot 15 → `gs:[0x14f8]` on the primary candidate
+(0x1480 TEB constant confirmed; the scan fallback was not needed).
+
+**Scope / residuals (not regressions of this work):**
+
+- **Windows-only.** The single-instruction store relies on the Windows TEB TLS
+  layout. On non-Windows `inline_rbp_tls_disp()` returns 0 → CALL path, so the
+  default flip is a safe no-op there. A Linux `fs:`-based path is future work.
+- **Multi-thread.** The mirror is per-thread (TLS), identical to the CALL path's
+  per-thread `TOP_RBP`. The `MTRegex` GC-root stress repro is **flaky on both
+  inline-on and inline-off** — it exercises the *documented, pre-existing*
+  cross-thread STW JIT-root gap (`scan_active_jit_frames` warns; see Risks
+  "Multi-thread precise scan") and a separate `Thread.join`/IMSE hang, neither
+  touched by this change. It is therefore not a usable inline-vs-CALL oracle.
+- **jit unit tests:** 820 pass; the only 4 failures are pre-existing
+  `aarch64::tests::*overflows` (panic at `aarch64.rs:2241` identically on clean
+  `dev` with these changes stashed) — unrelated AArch64 backend tests.
 
 ## Risks & open questions
 

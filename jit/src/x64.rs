@@ -1849,16 +1849,22 @@ pub fn precise_jit_maps_enabled() -> bool {
 /// per-invocation CALL that is the residual ~1.68× call-heavy regression after
 /// the thread-local cache (`82cf85e9`) already cut the helper body cost.
 ///
-/// **DEFAULT OFF** (opt in with `CRATONVM_PRECISE_INLINE_FRAME_RECORD`). Off →
-/// the existing `call jit_frame_record` is emitted byte-identically. Only
-/// meaningful with precise maps on (otherwise there is no frame-record at all),
-/// so it is anded with [`precise_jit_maps_enabled`].
+/// **DEFAULT ON** (Step 2 flip, 2026-06-21; opt out with
+/// `CRATONVM_NO_PRECISE_INLINE_FRAME_RECORD`). Validated on the inlined path:
+/// bintrees10/14/16/18 == HotSpot, fib44 ~1.68× faster than the CALL path, and
+/// the `CRATONVM_DBG_VERIFY_INLINE_FRAME_RECORD` self-check is clean (0
+/// mismatches over billions of fib44 invocations). Off → the existing
+/// `call jit_frame_record` is emitted (the pre-Step-1 default). Only meaningful
+/// with precise maps on (otherwise there is no frame-record at all), so it is
+/// anded with [`precise_jit_maps_enabled`]. On non-Windows / on a failed TLS
+/// probe, [`inline_rbp_tls_disp`] returns 0 and the CALL path is used even when
+/// this is on, so the flip is a safe no-op there.
 pub fn precise_inline_frame_record_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
     *G.get_or_init(|| {
         precise_jit_maps_enabled()
-            && std::env::var_os("CRATONVM_PRECISE_INLINE_FRAME_RECORD").is_some()
+            && std::env::var_os("CRATONVM_NO_PRECISE_INLINE_FRAME_RECORD").is_none()
     })
 }
 
@@ -1945,15 +1951,17 @@ pub fn inline_rbp_tls_disp() -> usize {
                 0
             }
         };
-        // One-time visibility line (only reached when the opt-in flag is on, so
-        // the default build stays silent).
-        if disp != 0 {
-            eprintln!(
-                "[INLINE-FR] inline frame-record ENABLED: storing RBP via mov gs:[{:#x}]",
-                disp
-            );
-        } else {
-            eprintln!("[INLINE-FR] inline frame-record probe FAILED — using CALL path");
+        // One-time visibility line, gated behind CRATONVM_DBG_INLINE_FR so the
+        // (now default-on) path stays silent unless explicitly diagnosing.
+        if std::env::var_os("CRATONVM_DBG_INLINE_FR").is_some() {
+            if disp != 0 {
+                eprintln!(
+                    "[INLINE-FR] inline frame-record ENABLED: storing RBP via mov gs:[{:#x}]",
+                    disp
+                );
+            } else {
+                eprintln!("[INLINE-FR] inline frame-record probe FAILED — using CALL path");
+            }
         }
         disp
     })
@@ -10446,7 +10454,12 @@ impl Compiler {
         // them. RBP → ABI arg0; the helper records it into the top JIT chain
         // entry. Gated off by default (zero default-path cost), and skipped if
         // the helper pointer isn't wired.
-        if self.precise_maps {
+        // Frame-record recording is "configured" iff the helper pointer is
+        // wired (`build_helpers` sets it whenever precise maps are on). Gate
+        // BOTH the inline and CALL forms on that single signal so a context
+        // without a wired helper (e.g. the JIT unit tests, `frame_record == 0`)
+        // emits neither — keeping those byte-golden even with inline default-on.
+        if self.precise_maps && self.helpers.frame_record != 0 {
             if self.inline_rbp_tls_disp != 0 {
                 // Step 1 (inline frame-record) — store RBP straight into the
                 // mirror TLS slot with one `mov gs:[disp], rbp`, no CALL. The
@@ -10457,11 +10470,11 @@ impl Compiler {
                 // Debug self-check: also call the verify helper (wired into
                 // `frame_record` by `build_helpers` when the knob is on), which
                 // reads the slot back and asserts it equals RBP.
-                if self.verify_inline_frame_record && self.helpers.frame_record != 0 {
+                if self.verify_inline_frame_record {
                     self.emit_mov_reg_reg(ARG_REGS[0], RBP);
                     self.emit_call_absolute(self.helpers.frame_record);
                 }
-            } else if self.helpers.frame_record != 0 {
+            } else {
                 self.emit_mov_reg_reg(ARG_REGS[0], RBP);
                 self.emit_call_absolute(self.helpers.frame_record);
             }
