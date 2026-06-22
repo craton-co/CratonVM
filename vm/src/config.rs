@@ -105,6 +105,18 @@ pub struct VmConfig {
     /// Which garbage collector algorithm to use (`-XX:+UseG1GC`, etc.).
     pub gc_algorithm: GcAlgorithm,
 
+    /// G1 tuning overrides (only honoured when `gc_algorithm == G1`). `None`
+    /// keeps the collector default. Wired from the corresponding `-XX:` knobs.
+    /// `-XX:InitiatingHeapOccupancyPercent=<n>` — start concurrent marking when
+    /// old-gen occupancy crosses this percent.
+    pub g1_ihop_percent: Option<u8>,
+    /// `-XX:G1HeapRegionSize=<bytes>` — G1 region size.
+    pub g1_region_size: Option<usize>,
+    /// `-XX:MaxGCPauseMillis=<n>` — target max pause (mixed-CSet sizing).
+    pub g1_max_gc_pause_ms: Option<u64>,
+    /// `-XX:±UseStringDeduplication` — G1 String backing-array dedup.
+    pub g1_string_dedup: Option<bool>,
+
     /// Enable compressed object pointers (`-XX:+UseCompressedOops`).
     /// Reduces memory usage by using 32-bit references for heaps < 32 GB.
     pub use_compressed_oops: bool,
@@ -365,6 +377,10 @@ impl Default for VmConfig {
             skip_verification: false,
             xverify_mode: XverifyMode::Remote,
             gc_algorithm: GcAlgorithm::Generational,
+            g1_ihop_percent: None,
+            g1_region_size: None,
+            g1_max_gc_pause_ms: None,
+            g1_string_dedup: None,
             use_compressed_oops: false,
             use_compact_headers: false,
             shared_archive_file: None,

@@ -249,6 +249,22 @@ struct Args {
     #[arg(long = "XX:UseGc", value_name = "NAME", overrides_with = "gc_selector")]
     gc_selector: Option<String>,
 
+    /// `-XX:InitiatingHeapOccupancyPercent=<n>` → G1 IHOP (honoured under G1).
+    #[arg(long = "XX:IHOP", value_name = "PCT", overrides_with = "g1_ihop")]
+    g1_ihop: Option<String>,
+
+    /// `-XX:G1HeapRegionSize=<bytes>` → G1 region size (honoured under G1).
+    #[arg(long = "XX:G1RegionSize", value_name = "SIZE", overrides_with = "g1_region_size")]
+    g1_region_size: Option<String>,
+
+    /// `-XX:MaxGCPauseMillis=<n>` → G1 pause target (honoured under G1).
+    #[arg(long = "XX:MaxGCPause", value_name = "MS", overrides_with = "g1_max_pause")]
+    g1_max_pause: Option<String>,
+
+    /// `-XX:±UseStringDeduplication` → G1 String dedup (honoured under G1).
+    #[arg(long = "XX:StringDedup", value_name = "BOOL", overrides_with = "g1_string_dedup")]
+    g1_string_dedup: Option<String>,
+
     /// Unified logging spec (-Xlog:tag[+tag]*[=level][:output[:decorators]]).
     /// Example: --Xlog gc*=info:stdout:time,level,tags
     #[arg(long = "Xlog", value_name = "SPEC")]
@@ -1004,6 +1020,30 @@ fn normalize_java_launcher_argv(args: Vec<String>) -> Vec<String> {
         } else if a == "-XX:-UseG1GC" {
             out.push("--XX:UseGc".into());
             out.push("Generational".into());
+            i += 1;
+        }
+        // G1 tuning knobs (§7 item 4). `-XX:Name=Value` → `--XX:<short> Value`;
+        // honoured only under G1 (the config-apply step is G1-gated). Each maps
+        // to a `G1CollectorConfig` field via `G1ConfigOverrides`.
+        else if let Some(v) = a.strip_prefix("-XX:InitiatingHeapOccupancyPercent=") {
+            out.push("--XX:IHOP".into());
+            out.push(v.to_string());
+            i += 1;
+        } else if let Some(v) = a.strip_prefix("-XX:G1HeapRegionSize=") {
+            out.push("--XX:G1RegionSize".into());
+            out.push(v.to_string());
+            i += 1;
+        } else if let Some(v) = a.strip_prefix("-XX:MaxGCPauseMillis=") {
+            out.push("--XX:MaxGCPause".into());
+            out.push(v.to_string());
+            i += 1;
+        } else if a == "-XX:+UseStringDeduplication" {
+            out.push("--XX:StringDedup".into());
+            out.push("true".into());
+            i += 1;
+        } else if a == "-XX:-UseStringDeduplication" {
+            out.push("--XX:StringDedup".into());
+            out.push("false".into());
             i += 1;
         }
         // Any other `-XX:...` flag is a HotSpot tuning knob CratonVM does not
@@ -1780,6 +1820,35 @@ fn run() -> Result<()> {
                 config.gc_algorithm = cratonvm_vm::config::GcAlgorithm::Generational;
             }
         }
+    }
+
+    // G1 tuning knobs (§7 item 4). Parsed from the normalized `--XX:*` value
+    // args and stored on the config; applied to `G1CollectorConfig` only when
+    // the G1 backend is selected (vm_init via `G1ConfigOverrides`). A malformed
+    // value warns and is ignored (keeps the collector default), matching the
+    // lenient-with-warning policy used for the GC selector.
+    if let Some(s) = &args.g1_ihop {
+        match s.parse::<u8>() {
+            Ok(p) if (1..=100).contains(&p) => config.g1_ihop_percent = Some(p),
+            _ => eprintln!(
+                "Warning: ignoring -XX:InitiatingHeapOccupancyPercent={s} (expected 1..=100)"
+            ),
+        }
+    }
+    if let Some(s) = &args.g1_region_size {
+        match parse_size(s) {
+            Some(sz) if sz > 0 => config.g1_region_size = Some(sz),
+            _ => eprintln!("Warning: ignoring -XX:G1HeapRegionSize={s} (expected a byte size)"),
+        }
+    }
+    if let Some(s) = &args.g1_max_pause {
+        match s.parse::<u64>() {
+            Ok(ms) if ms > 0 => config.g1_max_gc_pause_ms = Some(ms),
+            _ => eprintln!("Warning: ignoring -XX:MaxGCPauseMillis={s} (expected a positive integer)"),
+        }
+    }
+    if let Some(s) = &args.g1_string_dedup {
+        config.g1_string_dedup = Some(s == "true");
     }
 
     // Missing native audit. NEW-10: `--dump-missing-natives FILE` and

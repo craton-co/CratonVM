@@ -21,7 +21,7 @@ use crate::error::{MethodCallFailed, MethodCallResult, VmError};
 use crate::jit::profile::ProfileStore;
 use crate::jit::JitCache;
 use crate::memory::heap::ArrayElementType;
-use crate::memory::vm_heap::{GcBackend, VmHeap};
+use crate::memory::vm_heap::{G1ConfigOverrides, GcBackend, VmHeap};
 use crate::native::io::FileDescriptorTable;
 use crate::native::register_essential_natives;
 use crate::native::register_io_natives;
@@ -1007,7 +1007,13 @@ impl SharedVm {
             crate::config::GcAlgorithm::Generational => GcBackend::Generational,
             crate::config::GcAlgorithm::G1 => GcBackend::G1,
         };
-        let heap = VmHeap::new(gc_backend, config.max_heap_size);
+        let g1_overrides = G1ConfigOverrides {
+            region_size: config.g1_region_size,
+            ihop_percent: config.g1_ihop_percent,
+            max_gc_pause_ms: config.g1_max_gc_pause_ms,
+            string_dedup: config.g1_string_dedup,
+        };
+        let heap = VmHeap::new_with_overrides(gc_backend, config.max_heap_size, g1_overrides);
 
         // Reset singleton classloader instances from any previous VM
         cratonvm_native_builtins::classloader::reset_loader_singletons();
