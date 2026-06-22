@@ -3305,7 +3305,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         self.shared.monitors.holds(obj, self.thread.thread_id)
     }
 
-    fn monitor_wait(&mut self, obj: ObjectRef, timeout_ms: Option<u64>) -> MethodCallResult {
+    fn monitor_wait(&mut self, mut obj: ObjectRef, timeout_ms: Option<u64>) -> MethodCallResult {
         // JLS В§17.2.1: Check interrupt before waiting вЂ” clear flag and throw.
         // This is the entry-time check: if the thread was already interrupted
         // before wait() was called, consume the flag and throw immediately.
@@ -3347,10 +3347,28 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             if blk.pre_stw {
                 // A STW was already in progress when we became blocked —
                 // arrive at the barrier so its `wait_for_all` completes.
-                let _ = self
+                //
+                // CRIT (Thread.join monitor-desync, scratch_churn/Churn.java):
+                // the collection we just let finish may have RELOCATED `obj`
+                // (the very monitor we are about to wait on) and zeroed its old
+                // slot. `obj` is a raw `ObjectRef` captured before we blocked and
+                // is NOT remapped by the blocked-thread fixup (that runs on wake,
+                // against our frames). If we hand the stale address to
+                // `monitors.wait`, `ensure_inflated` reads a zeroed (NEUTRAL)
+                // mark word and synthesises a FRESH owner=None monitor → the
+                // owner check fails → `IllegalMonitorStateException` → the JDK
+                // `synchronized` exit handler loops on it forever → the joiner
+                // livelocks off the GC safepoint and wedges the next STW. Remap
+                // `obj` through the pointer map the barrier hands back.
+                let pm = self
                     .shared
                     .gc_barrier
                     .arrive_and_wait(self.thread.thread_id);
+                if let Some(&new) = pm.get(&(obj.as_ptr() as usize)) {
+                    // SAFETY: `new` is the relocated header address from the GC
+                    // pointer map for the object we hold a live reference to.
+                    obj = unsafe { ObjectRef::from_raw(new as *mut u8) };
+                }
             }
             let r = self.shared.monitors.wait(
                 obj,
@@ -3738,7 +3756,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             // GC (`update_thread_objs_after_gc`), so read the current address
             // from there while the thread is still registered (before
             // `mark_dead`), falling back to the captured ref only if absent.
-            let wake_obj = shared_arc
+            let mut wake_obj = shared_arc
                 .thread_registry
                 .java_thread_obj(tid)
                 .unwrap_or(thread_obj_for_spawn);
@@ -3762,7 +3780,18 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             // so the common uncontended path skipped it.
             let term_blk = shared_arc.gc_barrier.enter_blocked();
             if term_blk.pre_stw {
-                let _ = shared_arc.gc_barrier.arrive_and_wait(tid);
+                // Arrive at the in-flight STW. CRIT (same desync as
+                // `monitor_wait`): that collection can RELOCATE our Thread
+                // object, leaving `wake_obj` (a raw ref captured above) dangling
+                // at a freed/zeroed slot — the `enter_or_contend`/`notify_all`/
+                // `exit` below would then operate on the wrong (stale) monitor
+                // and never wake the real joiner. Remap `wake_obj` through the
+                // returned pointer map.
+                let pm = shared_arc.gc_barrier.arrive_and_wait(tid);
+                if let Some(&new) = pm.get(&(wake_obj.as_ptr() as usize)) {
+                    // SAFETY: relocated header address from the GC pointer map.
+                    wake_obj = unsafe { ObjectRef::from_raw(new as *mut u8) };
+                }
             }
             shared_arc.thread_registry.mark_dead(tid);
 
