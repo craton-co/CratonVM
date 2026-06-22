@@ -4654,10 +4654,23 @@ impl GarbageCollector for G1Collector {
         };
         let pause_ms = pause_start.elapsed().as_millis() as u64;
 
-        // 2. Check IHOP -> start concurrent mark if threshold reached
-        if self.check_ihop() && self.gc_state.phase() == ConcurrentGcPhase::Idle {
-            self.start_concurrent_mark();
-        }
+        // 2. IHOP / concurrent-mark triggering is driven by the VM layer
+        //    (`interpreter::maybe_concurrent_gc` -> `g1_concurrent_mark_cycle`),
+        //    which has the thread + STW-barrier context to run the FULL cycle:
+        //    brief-STW initial mark, root marking, the background marker, and
+        //    the completion watcher that flips into mixed GC.
+        //
+        //    This site used to ALSO call `start_concurrent_mark()` here, but
+        //    that only flips the phase Idle -> ConcurrentMark (activates SATB,
+        //    clears bitmaps) WITHOUT spawning the marker or marking roots. Run
+        //    first (inside collect_garbage), it left `is_marking_active()` true,
+        //    so the VM's `should_start && !is_marking_active` gate then BLOCKED
+        //    the real cycle forever — the phase was stuck in ConcurrentMark,
+        //    concurrent marking never actually ran, and so mixed GC never fired
+        //    and old-gen was never reclaimed (a major cause of G1's footprint
+        //    gap). The gc crate has no thread/barrier context to run the real
+        //    cycle, so triggering belongs to the VM layer alone; this premature
+        //    phase-flip is removed.
 
         // 3. Adaptive IHOP: feed the *pause time* of this collection (not
         //    the bytes freed) — see `update_ihop` doc for the contract.
