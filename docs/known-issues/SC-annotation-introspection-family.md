@@ -68,7 +68,7 @@ Fix. Bug B is a small, high-value, contained change at two cite points (add a de
 
 **Bug B — FIXED & on dev** (lambda SAM param-type dispatch, commit 00c71bb6 → merged): AnnotationFilterTests 11/11, AnnotationTypeMappingsTests 43/43, MergedAnnotationsRepeatableAnnotationTests 24/24.
 
-**Bug A — BLOCKED (root cause was wrong):** real blocker is that CratonVM ignores user `ClassLoader`s for `forName` — see `SC-custom-classloader-ignored.md`. The defining-loader annotation fix is correct-in-shape but inert (annotation type loads under AppClassLoader, not the FilteringClassLoader). Needs the foundational class-loading fix first.
+**Bug A — foundation UNBLOCKED:** the prior blocker (CratonVM ignored user `ClassLoader`s for `forName`/`loadClass`) is ✅ RESOLVED — see `docs/internal/fixed-suite-bugs/SC-custom-classloader-ignored.md`. User loaders now run their `loadClass(String,boolean)` override, `findLoadedClass` is loader-scoped, and a redefined class records the user loader as its defining loader. The defining-loader annotation `Class`-attr fix (`defining_loader_for(annType) → loader.loadClass` → CNFE → `TypeNotPresentException`) can now land on top: the annotation type's defining loader is the FilteringClassLoader, so the filter is seen.
 
 **Bug C — root cause was wrong:** `getModifiers`/`isMemberClass`/`getEnclosingClass` are all CORRECT on CratonVM (probe matches HotSpot). The 2 AnnotationsScannerTests failures are in Spring's scan *traversal*, not reflection.
 

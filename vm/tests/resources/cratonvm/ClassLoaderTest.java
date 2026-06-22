@@ -148,4 +148,62 @@ public class ClassLoaderTest {
         if (testLoader == null) return 0; // User class must NOT be bootstrap
         return 1;
     }
+
+    // ------------------------------------------------------------------
+    // Regression: custom ClassLoader must NOT be ignored by loadClass /
+    // Class.forName (SC-custom-classloader-ignored).
+    //
+    // A loader that overrides the protected loadClass(String,boolean) — like
+    // Spring's OverridingClassLoader and any classloader-isolation pattern —
+    // must have that override actually invoked, instead of the VM silently
+    // resolving the class through the global/app class store. A fresh custom
+    // loader's findLoadedClass must also return null for a class only the app
+    // loader has loaded (JVMS §5.3: it is not yet an initiating loader for it).
+    // ------------------------------------------------------------------
+    static final class ProbingLoader extends ClassLoader {
+        volatile boolean overrideRan = false;
+        volatile boolean findLoadedWasNull = false;
+
+        ProbingLoader(ClassLoader parent) {
+            super(parent);
+        }
+
+        @Override
+        protected Class<?> loadClass(String name, boolean resolve) throws ClassNotFoundException {
+            overrideRan = true;
+            if ("cratonvm.ClassLoaderTest".equals(name)) {
+                // This loader has never defined/initiated the class; per JVMS
+                // findLoadedClass must return null here — NOT the app copy.
+                findLoadedWasNull = (findLoadedClass(name) == null);
+            }
+            return super.loadClass(name, resolve);
+        }
+    }
+
+    // FIX #1 + #2: loadClass(String) entry must dispatch the subclass
+    // loadClass(String,boolean) override, and findLoadedClass must be
+    // loader-scoped.
+    public static int testCustomLoaderOverrideInvoked() {
+        ProbingLoader pl = new ProbingLoader(ClassLoaderTest.class.getClassLoader());
+        try {
+            Class<?> c = pl.loadClass("cratonvm.ClassLoaderTest");
+            if (c == null) return 0;              // delegation still resolves it
+            if (!pl.overrideRan) return 0;        // FIX #1: override must run
+            if (!pl.findLoadedWasNull) return 0;  // FIX #2: no global leak
+            return 1;
+        } catch (ClassNotFoundException e) {
+            return 0;
+        }
+    }
+
+    // FIX #1 via the Class.forName(name, false, loader) entry point.
+    public static int testForNameHonorsCustomLoaderOverride() {
+        ProbingLoader pl = new ProbingLoader(ClassLoaderTest.class.getClassLoader());
+        try {
+            Class<?> c = Class.forName("cratonvm.ClassLoaderTest", false, pl);
+            return (c != null && pl.overrideRan) ? 1 : 0;
+        } catch (ClassNotFoundException e) {
+            return 0;
+        }
+    }
 }

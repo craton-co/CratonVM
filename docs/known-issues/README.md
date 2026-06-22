@@ -366,7 +366,7 @@ LinkedHashMap.putIfAbsent, generic-bounds reify CCE, keySet.contains delegate, S
 lambda-SAM param-type dispatch, `String.format("%s",boolean)`, and synthetic `Collector`
 supplier/accumulator/finisher/combiner). The **open** ones documented here:
 
-- [SC-custom-classloader-ignored.md](SC-custom-classloader-ignored.md) — `Class.forName(name, loader)` ignores user `ClassLoader`s (foundational; blocks the annotation `TypeNotPresentException` cases).
+- ~~SC-custom-classloader-ignored.md~~ — ✅ RESOLVED (`Class.forName`/`loadClass` now honor user `ClassLoader`s — override-first redefinition + loader-scoped `findLoadedClass` + non-colliding `defineClass`). Moved to [docs/internal/fixed-suite-bugs/SC-custom-classloader-ignored.md](../internal/fixed-suite-bugs/SC-custom-classloader-ignored.md). Unblocks the annotation `TypeNotPresentException` foundation (Bug A).
 - [SC-jspecify-nullness-reflection.md](SC-jspecify-nullness-reflection.md) — type-use + package annotations dropped by reflection (`getTypeAnnotationBytes0` null) — 26 tests.
 - [SC-annotation-introspection-family.md](SC-annotation-introspection-family.md) — Bug A (Class-attr TypeNotPresent, blocked on classloader), Bug C (enclosing-class scan traversal), Bug D (relies on HotSpot `getDeclaredMethods` ordering — not cleanly fixable). Bug B FIXED on dev.
 - [SC-env-classreading.md](SC-env-classreading.md) — getenv/getProperties identity; `Object.equals` shadows overrides (`precedenceOf`=-1); `int.class` via classreading; custom-CL `getResourceAsStream`.
