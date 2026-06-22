@@ -384,11 +384,15 @@ pub fn is_foreign_attached() -> bool {
 /// first instant this thread can run Java (and trip a safepoint) it is already
 /// stop-the-world-visible with a (currently empty) deposited snapshot — there is
 /// no window where it holds live oops but is invisible to `request_stw`.
-pub fn attach_foreign_thread(shared: &SharedVm, daemon: bool) -> *mut JvmThread {
+pub fn attach_foreign_thread(shared: &SharedVm, daemon: bool, name: Option<&str>) -> *mut JvmThread {
     let tid = shared.thread_registry.next_thread_id();
-    // Synthetic name until §3.5 builds a real java.lang.Thread object. `Thread-N`
-    // matches the JDK's default platform-thread naming.
-    let name = format!("Thread-{}", tid.0);
+    // Caller-supplied name (from `JavaVMAttachArgs.name`) when present, else the
+    // JDK's default platform-thread naming `Thread-N`. A real java.lang.Thread
+    // object + group is deferred to §3.5.
+    let name = match name {
+        Some(n) if !n.is_empty() => n.to_string(),
+        _ => format!("Thread-{}", tid.0),
+    };
     let mut jt = Box::new(JvmThread::new(tid, &name));
     jt.kind = crate::threading::ThreadKind::Platform;
     jt.daemon = daemon;
@@ -450,6 +454,166 @@ pub fn detach_foreign_thread(shared: &SharedVm) -> bool {
     drop(jt);
     FOREIGN_CALL_DEPTH.with(|c| c.set(0));
     true
+}
+
+/// Run `f` against this OS thread's foreign-attached `JvmThread`, if any.
+///
+/// Safe to call only at points where the interpreter does NOT also hold the
+/// `&mut JvmThread` (which it borrows from the raw `JNI_THREAD` pointer): namely
+/// the attach/detach paths and the foreign-call transitions, which run strictly
+/// before a call begins or after it returns — never concurrently with the call.
+fn with_foreign_thread<R>(f: impl FnOnce(&mut JvmThread) -> R) -> Option<R> {
+    FOREIGN_THREAD_BOX.with(|c| c.borrow_mut().as_mut().map(|b| f(&mut **b)))
+}
+
+/// Whether the foreign-thread attach path is enabled.
+///
+/// Default **OFF** (the gate is flipped on in Step 7 of
+/// `foreign-thread-attach.md`): while off, `AttachCurrentThread` keeps its
+/// historical env-only behaviour (no thread registration), so every
+/// intermediate merge is a no-op for existing callers. Read once and cached —
+/// it is not a hot path (attach is rare), but `AttachCurrentThread` may be
+/// called many times.
+fn foreign_attach_enabled() -> bool {
+    // Default-OFF form (Step 1-6): only explicit opt-IN enables it.
+    matches!(
+        std::env::var("CRATONVM_FOREIGN_ATTACH").as_deref(),
+        Ok("1") | Ok("true") | Ok("TRUE")
+    )
+}
+
+/// `#[repr(C)]` mirror of jni.h `JavaVMAttachArgs` — the optional third argument
+/// to `AttachCurrentThread` / `AttachCurrentThreadAsDaemon`:
+/// ```c
+/// typedef struct JavaVMAttachArgs { jint version; char *name; jobject group; }
+/// ```
+/// `group` is a landing spot for §3.5 (Java Thread object + thread group);
+/// today only `name` is consumed, to give an attached thread a meaningful
+/// registry name in dumps.
+#[repr(C)]
+pub struct JavaVMAttachArgs {
+    pub version: JInt,
+    pub name: *const c_char,
+    pub group: JObject,
+}
+
+/// Best-effort read of the attach `name` from an optional `JavaVMAttachArgs*`.
+///
+/// # Safety
+/// `args`, when non-null, must point at a valid `JavaVMAttachArgs` whose `name`
+/// (when non-null) is a NUL-terminated C string — the JNI Invocation-API
+/// contract for the argument.
+unsafe fn read_attach_name(args: *mut std::ffi::c_void) -> Option<String> {
+    if args.is_null() {
+        return None;
+    }
+    let a = &*(args as *const JavaVMAttachArgs);
+    if a.name.is_null() {
+        return None;
+    }
+    CStr::from_ptr(a.name).to_str().ok().map(|s| s.to_string())
+}
+
+/// RAII guard bracketing a JNI call (`Call*Method` / `NewObject`) on a
+/// foreign-attached thread, implementing the idle↔running transition of §3.3.
+///
+/// A foreign thread is modelled as **GC-blocked while idle** (between calls,
+/// parked in the host event loop): it holds no Java frames and will not reach an
+/// interpreter safepoint, so a stop-the-world on another thread must not wait
+/// for it. On the **outermost** Java call this guard leaves the blocked region —
+/// becoming a counted mutator whose interpreter polls safepoints normally — and
+/// on return re-enters it. Nested calls (a JNI up-call made by a native that the
+/// interpreter dispatched mid-call) only adjust the depth counter; the thread is
+/// already a counted mutator. For non-foreign threads (the bootstrap/creating
+/// thread, VM `Thread.start` workers making up-calls) the guard is entirely
+/// inert.
+struct ForeignCallGuard {
+    /// `Some(vm)` iff this guard performed the outermost idle→running transition
+    /// and must perform the running→idle transition on drop.
+    transition: Option<Arc<SharedVm>>,
+    /// `true` iff this guard incremented [`FOREIGN_CALL_DEPTH`] (i.e. the thread
+    /// is foreign-attached) and must decrement it on drop.
+    counted: bool,
+}
+
+impl ForeignCallGuard {
+    fn enter() -> Self {
+        if !is_foreign_attached() {
+            return ForeignCallGuard {
+                transition: None,
+                counted: false,
+            };
+        }
+        let prev = FOREIGN_CALL_DEPTH.with(|c| {
+            let p = c.get();
+            c.set(p + 1);
+            p
+        });
+        if prev != 0 {
+            // Nested call (e.g. a JNI up-call) — already a counted mutator.
+            return ForeignCallGuard {
+                transition: None,
+                counted: true,
+            };
+        }
+        // Outermost call: leave the idle blocked region and become a counted
+        // mutator. `mark_blocked_region_leave` waits out any in-flight STW first,
+        // so we never start running Java under an active collection.
+        let shared = match process_vm() {
+            Some(s) => s,
+            None => {
+                return ForeignCallGuard {
+                    transition: None,
+                    counted: true,
+                }
+            }
+        };
+        shared.gc_barrier.mark_blocked_region_leave();
+        with_foreign_thread(|jt| {
+            jt.gc_block_state
+                .in_blocked_region
+                .store(false, std::sync::atomic::Ordering::Release);
+            jt.root_snapshot.lock().clear();
+        });
+        // A fresh local-ref frame scopes this call's JNI local refs (freed on
+        // return, per JNI semantics) so the thread holds none across the idle
+        // window — keeping the idle root snapshot genuinely empty.
+        push_local_frame(16);
+        ForeignCallGuard {
+            transition: Some(shared),
+            counted: true,
+        }
+    }
+}
+
+impl Drop for ForeignCallGuard {
+    fn drop(&mut self) {
+        if let Some(shared) = self.transition.take() {
+            // Outermost return → go idle. Pop this call's local-ref frame.
+            let _ = pop_local_frame(0);
+            // Retire the TLAB while still a counted mutator: a STW requested now
+            // is still waiting for us to arrive (its collector has not started),
+            // so writing the TLAB tail filler cannot race the moving collector.
+            // Then deposit an empty snapshot and re-enter the idle blocked region.
+            with_foreign_thread(|jt| {
+                jt.tlab.retire();
+                jt.root_snapshot.lock().clear();
+                jt.gc_block_state
+                    .in_blocked_region
+                    .store(true, std::sync::atomic::Ordering::Release);
+            });
+            let pre_stw = shared.gc_barrier.mark_blocked_region_enter();
+            if pre_stw {
+                // We were counted in the active STW's `expected` (it started
+                // while we were a running mutator); arrive exactly once.
+                let tid = with_foreign_thread(|jt| jt.thread_id).unwrap_or(ThreadId(0));
+                let _ = shared.gc_barrier.arrive_and_wait(tid);
+            }
+        }
+        if self.counted {
+            FOREIGN_CALL_DEPTH.with(|c| c.set(c.get().saturating_sub(1)));
+        }
+    }
 }
 
 /// Take (read + clear) the pending JNI exception, if any.
@@ -651,6 +815,7 @@ fn jni_call_instance(obj: JObject, mid: JMethodID, args: *const JValue) -> Optio
     if obj == 0 || mid == 0 {
         return None;
     }
+    let _fg = ForeignCallGuard::enter();
     with_jni_context(|shared, thread| {
         let oref = jobject_to_obj(obj)?;
         let obj_class_id = shared.heap.class_id_of(oref);
@@ -690,6 +855,7 @@ fn jni_call_nonvirtual(
     if obj == 0 || mid == 0 {
         return None;
     }
+    let _fg = ForeignCallGuard::enter();
     with_jni_context(|shared, thread| {
         let oref = jobject_to_obj(obj)?;
         let dispatch_class_id = if clazz != 0 {
@@ -728,6 +894,7 @@ fn jni_call_static(clazz: JClass, mid: JMethodID, args: *const JValue) -> Option
     if mid == 0 {
         return None;
     }
+    let _fg = ForeignCallGuard::enter();
     with_jni_context(|shared, thread| {
         let (decl_class_id, method_index) = decode_method_id(mid);
         let class_id = if clazz != 0 {
@@ -4672,6 +4839,10 @@ extern "C" fn jni_new_object_a(
     if clazz == 0 || mid == 0 {
         return 0;
     }
+    // Become a counted mutator for the whole alloc+<init> on a foreign thread
+    // (the alloc itself touches the heap, so it must run as a mutator, not while
+    // idle/blocked). Inert for non-foreign threads.
+    let _fg = ForeignCallGuard::enter();
     // First allocate the object.
     let obj_handle = jni_alloc_object(_env, clazz);
     if obj_handle == 0 {
@@ -5740,42 +5911,147 @@ extern "C" fn jni_get_env(_vm: JavaVM, env: *mut *mut std::ffi::c_void, _version
     JNI_OK
 }
 
+/// Write the process-global `JNIEnv*` (function table) into `*penv`, if non-null.
+fn write_jni_env(penv: *mut *mut std::ffi::c_void) {
+    if penv.is_null() {
+        return;
+    }
+    init_jni_table();
+    let table = JNI_TABLE_PTR.load(std::sync::atomic::Ordering::Acquire);
+    unsafe {
+        *penv = table as *mut std::ffi::c_void;
+    }
+}
+
 extern "C" fn jni_attach_current_thread(
     _vm: JavaVM,
     penv: *mut *mut std::ffi::c_void,
-    _args: *mut std::ffi::c_void,
+    args: *mut std::ffi::c_void,
 ) -> JInt {
-    // Set up JNI environment pointer for the current thread.
-    // If context is already set, this is a no-op (thread already attached).
+    attach_current_thread_impl(penv, args, false)
+}
+
+/// `AttachCurrentThreadAsDaemon` (invocation slot 7) — identical to
+/// `AttachCurrentThread` except the registered thread is a **daemon** (the VM's
+/// non-daemon-wait at shutdown ignores it). Wired in Step 7.
+extern "C" fn jni_attach_current_thread_as_daemon(
+    _vm: JavaVM,
+    penv: *mut *mut std::ffi::c_void,
+    args: *mut std::ffi::c_void,
+) -> JInt {
+    attach_current_thread_impl(penv, args, true)
+}
+
+/// Shared body for `AttachCurrentThread` / `AttachCurrentThreadAsDaemon`.
+///
+/// When the foreign-attach gate is off (default until Step 7) this preserves the
+/// historical env-only behaviour. When on, a genuinely foreign thread is
+/// registered as a first-class GC-safe Java thread (see
+/// `foreign-thread-attach.md`).
+fn attach_current_thread_impl(
+    penv: *mut *mut std::ffi::c_void,
+    args: *mut std::ffi::c_void,
+    daemon: bool,
+) -> JInt {
+    // Already-attached fast path. A thread whose JNI context is set — the
+    // bootstrap/creating thread (main, id 0), or a foreign thread re-attaching —
+    // is a no-op that just hands back the env pointer (matches HotSpot: a
+    // redundant AttachCurrentThread returns JNI_OK).
     let has_context = JNI_SHARED_VM.with(|c| c.borrow().is_some());
     if has_context {
-        // Already attached — just return the existing env pointer
-        if !penv.is_null() {
-            init_jni_table();
-            let table = JNI_TABLE_PTR.load(std::sync::atomic::Ordering::Acquire);
-            unsafe {
-                *penv = table as *mut std::ffi::c_void;
-            }
-        }
+        write_jni_env(penv);
         tracing::trace!("JNI AttachCurrentThread: thread already attached");
         return JNI_OK;
     }
-    // Thread not yet attached — set up env pointer
-    // Note: full thread registration with the VM's ThreadRegistry requires
-    // access to SharedVm which is obtained from the JavaVM* pointer.
-    if !penv.is_null() {
-        init_jni_table();
-        let table = JNI_TABLE_PTR.load(std::sync::atomic::Ordering::Acquire);
-        unsafe {
-            *penv = table as *mut std::ffi::c_void;
+
+    if foreign_attach_enabled() {
+        // Repair case: this OS thread still OWNS a foreign JvmThread but its JNI
+        // context was cleared (a nested true-JNI-native call's guard clears the
+        // TLS context on return). Re-publish rather than attaching a second time
+        // (which would leak a JvmThread and inflate alive_count).
+        if is_foreign_attached() {
+            if let Some(shared) = process_vm() {
+                set_jni_context_arc(shared);
+            }
+            with_foreign_thread(|jt| set_jni_thread(jt as *mut JvmThread));
+            write_jni_env(penv);
+            return JNI_OK;
         }
+        // Genuine first attach: resolve the live VM from "the JavaVM*".
+        let shared = match process_vm() {
+            Some(s) => s,
+            None => return JNI_ERR,
+        };
+        // SAFETY: `args`, when non-null, is a valid `JavaVMAttachArgs` per ABI.
+        let name = unsafe { read_attach_name(args) };
+        // Build + register the foreign thread. It is STW-visible (with an empty
+        // deposited snapshot) BEFORE we publish the TLS context below — there is
+        // no window where it can run Java while invisible to `request_stw`.
+        let raw = attach_foreign_thread(&shared, daemon, name.as_deref());
+        // §3.3 — an attached-but-idle thread (parked in the host event loop with
+        // no Java frames) is modelled as GC-blocked, so a stop-the-world on
+        // another thread does not wait forever for it. The matching leave is the
+        // first Java call's `ForeignCallGuard` (or detach's, if it never calls).
+        with_foreign_thread(|jt| {
+            jt.gc_block_state
+                .in_blocked_region
+                .store(true, std::sync::atomic::Ordering::Release);
+        });
+        // Not counted in any active STW's `expected` (we registered after its
+        // `request_stw`), so we must NOT arrive even if one is in progress —
+        // hence the pre_stw return is intentionally ignored here.
+        let _ = shared.gc_barrier.mark_blocked_region_enter();
+        // Publish the TLS context LAST.
+        set_jni_context_arc(shared);
+        set_jni_thread(raw);
+        write_jni_env(penv);
+        tracing::debug!("JNI AttachCurrentThread: foreign thread attached + registered");
+        return JNI_OK;
     }
-    tracing::debug!("JNI AttachCurrentThread: thread attached");
+
+    // Gate off — historical behaviour: env pointer only, no registration.
+    write_jni_env(penv);
+    tracing::debug!("JNI AttachCurrentThread: thread attached (env-only, gate off)");
     JNI_OK
 }
 
 extern "C" fn jni_detach_current_thread(_vm: JavaVM) -> JInt {
-    // Clear the JNI thread-local context for this thread.
+    // Foreign-attached thread: full teardown (deregister + reclaim JvmThread).
+    if is_foreign_attached() {
+        // JNI forbids detaching a thread that still has Java frames on its stack;
+        // for us that means a call is in flight on this OS thread (depth > 0).
+        // Return JNI_ERR rather than corrupt state (matches HotSpot).
+        if FOREIGN_CALL_DEPTH.with(|c| c.get()) != 0 {
+            tracing::warn!("JNI DetachCurrentThread: refusing detach with a Java call in flight");
+            return JNI_ERR;
+        }
+        if let Some(shared) = process_vm() {
+            let tid = with_foreign_thread(|jt| jt.thread_id);
+            // Mark dead while still in the idle blocked region (excluded from
+            // every STW's `expected`), so no current/future request_stw waits
+            // for us.
+            if let Some(tid) = tid {
+                shared.thread_registry.mark_dead(tid);
+            }
+            // Leave the idle blocked region: this waits out any in-flight STW
+            // (during which our empty snapshot is scanned harmlessly) before we
+            // reclaim, so teardown never races a live collection (§3.4).
+            shared.gc_barrier.mark_blocked_region_leave();
+            // Reclaim: mark_dead (idempotent) + retire the (empty) TLAB + drop.
+            detach_foreign_thread(&shared);
+        } else {
+            // No live VM (process shutdown) — just drop our owned box.
+            FOREIGN_THREAD_BOX.with(|c| *c.borrow_mut() = None);
+            FOREIGN_CALL_DEPTH.with(|c| c.set(0));
+        }
+        clear_jni_thread();
+        clear_jni_context();
+        tracing::debug!("JNI DetachCurrentThread: foreign thread detached");
+        return JNI_OK;
+    }
+
+    // Non-foreign thread (bootstrap/creating thread, or never-attached): clear
+    // the JNI TLS context if present — historical behaviour, unchanged.
     let had_context = JNI_SHARED_VM.with(|c| c.borrow().is_some());
     if had_context {
         clear_jni_context();
@@ -5931,7 +6207,7 @@ mod tests {
         // A bare SharedVm has no registered threads (Vm::new registers main).
         let baseline = shared.thread_registry.alive_count();
 
-        let raw = attach_foreign_thread(&shared, false);
+        let raw = attach_foreign_thread(&shared, false, None);
         assert!(!raw.is_null());
         assert!(is_foreign_attached());
         assert_eq!(
@@ -5980,6 +6256,120 @@ mod tests {
         );
         // Double-detach on a thread with no attachment is a clean no-op.
         assert!(!detach_foreign_thread(&shared));
+    }
+
+    /// The core GC-safety property (§3.3): an attached-but-idle foreign thread is
+    /// modelled as GC-blocked, so a stop-the-world initiated by another thread
+    /// does NOT wait for it — no deadlock, even though it is alive and counted in
+    /// `alive_count`.
+    #[test]
+    fn foreign_idle_thread_excluded_from_stw() {
+        use crate::config::VmConfig;
+        use crate::vm::SharedVm;
+        use std::collections::HashMap;
+        let _guard = PROCESS_VM_TEST_LOCK.lock();
+        let shared = Arc::new(SharedVm::new(VmConfig::default()));
+
+        // A "main" initiator thread, registered alive.
+        let main_tid = shared.thread_registry.next_thread_id();
+        shared.thread_registry.register(main_tid, "main", None);
+
+        // Attach a foreign thread and put it in the idle blocked region exactly
+        // as `attach_current_thread_impl` does.
+        let _raw = attach_foreign_thread(&shared, false, None);
+        with_foreign_thread(|jt| {
+            jt.gc_block_state
+                .in_blocked_region
+                .store(true, std::sync::atomic::Ordering::Release)
+        });
+        let _ = shared.gc_barrier.mark_blocked_region_enter();
+
+        // Two alive threads (main + foreign), but the idle foreign thread is
+        // excluded from `expected`, so the initiator waits for nobody.
+        let alive = shared.thread_registry.alive_count() as u32;
+        assert_eq!(alive, 2);
+        assert!(shared.gc_barrier.request_stw(main_tid, alive));
+        assert_eq!(
+            shared.gc_barrier.pending_count(),
+            0,
+            "idle foreign thread must be excluded from the STW expected-set"
+        );
+        shared.gc_barrier.wait_for_all(); // returns immediately — no deadlock
+        shared.gc_barrier.complete_gc(HashMap::new());
+
+        // Teardown mirrors detach: mark dead, leave the region, reclaim.
+        let tid = with_foreign_thread(|jt| jt.thread_id).unwrap();
+        shared.thread_registry.mark_dead(tid);
+        shared.gc_barrier.mark_blocked_region_leave();
+        assert!(detach_foreign_thread(&shared));
+    }
+
+    /// `ForeignCallGuard` drives the idle↔running transition: the outermost call
+    /// leaves the blocked region (becomes a counted mutator), nested calls only
+    /// bump the depth counter, and the outermost return re-enters the region.
+    #[test]
+    fn foreign_call_guard_transitions() {
+        use crate::config::VmConfig;
+        use crate::vm::SharedVm;
+        use std::sync::atomic::Ordering;
+        let _guard = PROCESS_VM_TEST_LOCK.lock();
+        let shared = Arc::new(SharedVm::new(VmConfig::default()));
+        set_process_vm(&shared);
+
+        let _raw = attach_foreign_thread(&shared, false, None);
+        with_foreign_thread(|jt| {
+            jt.gc_block_state
+                .in_blocked_region
+                .store(true, Ordering::Release)
+        });
+        let _ = shared.gc_barrier.mark_blocked_region_enter();
+        assert_eq!(shared.gc_barrier.blocked_count(), 1);
+
+        {
+            // Outermost call → leave blocked region, counted mutator.
+            let _fg = ForeignCallGuard::enter();
+            assert_eq!(
+                shared.gc_barrier.blocked_count(),
+                0,
+                "outermost call must leave the blocked region"
+            );
+            assert!(!with_foreign_thread(|jt| jt
+                .gc_block_state
+                .in_blocked_region
+                .load(Ordering::Acquire))
+            .unwrap());
+            assert_eq!(FOREIGN_CALL_DEPTH.with(|c| c.get()), 1);
+            {
+                // Nested call (e.g. a JNI up-call) → depth only, no transition.
+                let _fg2 = ForeignCallGuard::enter();
+                assert_eq!(shared.gc_barrier.blocked_count(), 0);
+                assert_eq!(FOREIGN_CALL_DEPTH.with(|c| c.get()), 2);
+            }
+            assert_eq!(FOREIGN_CALL_DEPTH.with(|c| c.get()), 1);
+        }
+        // Outermost return → idle/blocked again.
+        assert_eq!(
+            shared.gc_barrier.blocked_count(),
+            1,
+            "outermost return must re-enter the blocked region"
+        );
+        assert!(with_foreign_thread(|jt| jt
+            .gc_block_state
+            .in_blocked_region
+            .load(Ordering::Acquire))
+        .unwrap());
+        assert_eq!(FOREIGN_CALL_DEPTH.with(|c| c.get()), 0);
+
+        // A non-foreign thread sees an entirely inert guard.
+        let tid = with_foreign_thread(|jt| jt.thread_id).unwrap();
+        shared.thread_registry.mark_dead(tid);
+        shared.gc_barrier.mark_blocked_region_leave();
+        assert!(detach_foreign_thread(&shared));
+        {
+            let _fg = ForeignCallGuard::enter();
+            assert_eq!(shared.gc_barrier.blocked_count(), 0);
+            assert_eq!(FOREIGN_CALL_DEPTH.with(|c| c.get()), 0);
+        }
     }
 
     #[test]
