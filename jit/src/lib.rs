@@ -1675,6 +1675,14 @@ fn osr_trampoline_cache() -> &'static parking_lot::Mutex<FxHashMap<usize, Arc<Ex
 /// the OSR'd `binaryTrees` frame currently regresses bt18 (a conservative-pin ×
 /// precise-move interaction). Read once and cached so the cached trampoline
 /// bodies (keyed by `target_addr`) stay consistent for the whole run.
+///
+/// **EXPERIMENTAL — retained default-off scaffolding (precise-jit-maps-default.md
+/// Steps 5 + 6, 2026-06-22).** Step 5 accepted the conservative backstop for OSR
+/// frames as the default policy, so this sub-gate is *not* the correctness path;
+/// it is a **partial** moving-relocation aid (moves bt18 67674804 → 68199090,
+/// still short of the golden 68332206) for a possible future moving young gen.
+/// Step 6 decided to **keep, not remove** it — experimental, default-off, paired
+/// with `cratonvm_jit::x64::shadow_stack_maps_enabled`; do not enable in production.
 fn osr_shadow_track_enabled() -> bool {
     static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *G.get_or_init(|| std::env::var_os("CRATONVM_SHADOW_OSR_TRACK").is_some())

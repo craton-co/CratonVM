@@ -282,6 +282,13 @@ pub use cratonvm_gc::gc_quiescence::is_active as gc_must_defer;
 /// *moving* (Cheney) cycle even while JIT frames are live (see
 /// `gen_heap.rs` quiescence gate). Off by default: zero codegen change, the
 /// collector keeps deferring to the non-moving sweep under JIT.
+///
+/// **EXPERIMENTAL — retained default-off scaffolding (precise-jit-maps-default.md
+/// Step 6, 2026-06-22).** Not the correctness path (that is precise maps +
+/// non-moving sweep); this is the moving-relocation scaffolding for a possible
+/// future moving young gen (`default-moving-young-gen.md`, design / not started),
+/// partial (under-counts bt18) and not to be combined with precise maps. Kept,
+/// not removed; do not enable in production.
 #[inline]
 pub fn shadow_stack_enabled() -> bool {
     use std::sync::OnceLock;
