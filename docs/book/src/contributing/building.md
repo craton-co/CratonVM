@@ -1,0 +1,85 @@
+# Building from Source
+
+This chapter consolidates the build, lint, and benchmark workflow. For installing
+a pre-built binary instead, see [Installation](../getting-started/installation.md).
+
+## Prerequisites
+
+- **Rust 1.80+** — install via [rustup.rs](https://rustup.rs). CratonVM uses
+  edition 2021.
+- **A JDK (17+) is optional** — needed only to compile the Java test classes and
+  to boot against a real `java.base`. CratonVM runs standalone without one.
+- **Visual Studio Build Tools** (Windows only) — for the MSVC toolchain/linker.
+
+## Building the launcher
+
+```bash
+git clone https://github.com/craton-co/cratonvm.git
+cd cratonvm
+cargo build --release -p cratonvm-cli
+```
+
+The package is `cratonvm-cli`, but the binary it produces is `cratonvm`, so the
+executable lands at `target/release/cratonvm` (or `cratonvm.exe` on Windows).
+
+Build the whole workspace (all crates and targets):
+
+```bash
+cargo build --workspace --all-targets
+```
+
+## Optional build features
+
+| Feature | Crate | Effect |
+|---------|-------|--------|
+| `java-bin-alias` | `cratonvm-cli` | Also build a `java[.exe]` binary (for tools that require the launcher basename to be `java`). Off by default to avoid shadowing the system JDK. |
+| `synthetic-jdk` | `cratonvm-cli` / `vm` | Force synthetic standard-library mode at compile time. |
+| `gpu` / `gpu-driver` | `cratonvm-cli` | Enable GPU offload plumbing (stub) / real CUDA driver. See [GPU Offload](../gpu/overview.md). |
+| `mimalloc` | `cratonvm-cli` | Use mimalloc as the global allocator (on by default; faster on Windows). |
+| `awt` | `vm` | AWT/Swing/Java2D natives (on by default). |
+| `zgc` | `gc` | Compile the (non-selectable) ZGC stub. Off by default. |
+
+```bash
+# A java[.exe] alias alongside cratonvm
+cargo build --release -p cratonvm-cli --features java-bin-alias
+
+# GPU offload with the real CUDA driver
+cargo build --release -p cratonvm-cli --features gpu-driver
+```
+
+The default `cargo build` produces a CPU-only JVM with **no** GPU code linked.
+
+## Linting & formatting
+
+These are the checks CI gates on, run on Linux and Windows:
+
+```bash
+cargo fmt --all --check
+cargo clippy --workspace --all-targets -- -D warnings
+```
+
+> The workspace `[lints]` table allows `dead_code`/`unused_*` and a few rustdoc
+> lints, so "zero clippy warnings" is relative to that configuration, not the
+> full default lint set. Code style follows `rustfmt` defaults with
+> `max_width = 100`.
+
+## Benchmarking
+
+A typical run compiles a benchmark's Java sources with `javac`, then runs the
+class under both `java` and the release `cratonvm` binary, comparing wall-clock
+time:
+
+```bash
+cargo build --release -p cratonvm-cli
+cargo run --release -p cratonvm-cli -- --classpath bench QuickBench
+java -cp bench QuickBench
+```
+
+Give larger benchmarks more heap (e.g. `--Xmx 8g` for Binary Trees) and use
+`--nojit` to isolate interpreter-only timings. See
+[Benchmarks](../performance/benchmarks.md) and [Profiling](../performance/profiling.md).
+
+## Next
+
+- [Testing](testing.md) — running the test and regression suites.
+- [Contributing Guide](contributing.md) — workflow and how to add opcodes/natives.
