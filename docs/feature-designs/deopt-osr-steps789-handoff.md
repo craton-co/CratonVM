@@ -250,8 +250,9 @@ green. NOT default-on: still coupled to OSR-frame shadow-stack tracking
 best co-scheduled with the moving-GC work; the mechanism + realistic trigger are
 proven under the gate.
 
-**Remaining: Step 9** (epoch-invalidation consumer for `compilation_epoch` vs
-stale baked boxes) is unstarted.
+**Step 9 — DONE (P3, 2026-06-21)** (epoch-invalidation consumer for `compilation_epoch`
++ de-speculation wiring) — branch `feat/deopt-osr-epoch-invalidation`; see the
+**Step 9 — DONE** record after the Workstream P2 section below.
 
 ---
 
@@ -357,6 +358,13 @@ Needs an XMM register file end-to-end. Hot-stub codegen — keep gated.
 5. **Gate**: drop the `has_fp_local` exclusion (P2.1) once this lands.
 6. **Tests**: a `double`-accumulator loop resumes with the exact `double`; an
    OSR-exit of a `double`-accumulator loop (Workstream B) then works too.
+**Step 9 — DONE (de-speculation wiring + compilation-epoch staleness guard; 2026-06-21).** Branch `feat/deopt-osr-epoch-invalidation` off dev `3c9b628a`. The real-frame-deopt / OSR-exit resume sink (`execute_jit_call`, `vm/src/runtime/interpreter.rs`) now routes through a new `real_frame_deopt_resume_and_despeculate` helper:
+
+- **De-speculation wiring** (the *"route every real deopt/OSR-exit through `record_deopt` + `recommend_action`"* item). Previously the real-frame-deopt sink recorded **nothing** — only the separate `jit_uncommon_trap` stub path fed the log. The sink now drives the EXISTING `DeoptimizationController::deoptimize` (`vm/src/jit/helpers.rs`) on every real-frame deopt: it records the event in `shared.deopt_log` (so the deopt rate is observable), evicts the artifact from `jit_cache` (= make-not-entrant: the next call recompiles), and on repeated deopts `recommend_action` escalates to `MakeNotCompilable` → `jit_skip_set` (stops recompiling). The reason is recovered from the `deopt_points` entry matching the trapping bci, so `OsrExit` events stay countable separately from guard deopts. De-spec runs AFTER the resume decision, so it only affects FUTURE invocations — the just-resumed frame is unaffected.
+- **Epoch staleness guard** (the `compilation_epoch` consumer). New per-method live-epoch registry `SharedVm.method_epochs` (keyed `"<class>.<method>:<descriptor>"`, the deopt-log key). `deoptimize` advances it on each invalidation (`bump_compilation_epoch`); the **5** `jit_cache.put` install sites stamp the fresh artifact's `CompiledMethod.compilation_epoch` from the live epoch (`stamp_compilation_epoch`). Before resuming, the sink asserts `compiled.compilation_epoch >= live_epoch(M)`: a compilation **superseded** since it was installed (live advanced past its epoch) does NOT resume its now-invalidated speculation — it falls back to the safe whole-method re-run. **KEY:** a `DeoptimizationPoint` box is built during *compilation*, before install, so it cannot carry an install-time epoch; the box is reachable only through the artifact that baked it, so checking the artifact's `compilation_epoch` *is* "assert the owning method's current epoch matches the box's creation epoch before following it." NB: in default leak-mode the deopt boxes are never freed (`CompiledMethod::drop` `mem::forget`s `_deopt_point_boxes`), so this is a **correctness / de-spec** guard (never resume a superseded speculation), not a UAF guard; the literal in-stub before-deref check only matters under the `CRATONVM_JIT_FREE_CODE=1` A/B mode and is a documented follow-up.
+- **Gate-off byte-identical.** Every stamp / bump / guard is gated on `deopt_real_enabled()` (OFF by default): the field stays `0`, the registry stays empty + unread, the sink helper is never reached (it lives inside `deopt_real_enabled() && can_deopt_resume`). bt18 golden checksum `68332206` unchanged with the gate off (== HotSpot). 18/18 `deopt_step3` vm-lib tests green, incl. **3 new** Step-9 tests (`step9_epoch_registry_bump_and_read`, `step9_fresh_artifact_resumes_and_records_deopt`, `step9_stale_artifact_skips_resume`).
+
+**Step 9 follow-ups (not blocking).** (a) The in-stub before-deref epoch check for `CRATONVM_JIT_FREE_CODE=1` (bake a stable live-epoch cell pointer alongside the box). (b) `RecompileAndReinterpret` could eagerly re-queue compilation rather than relying on the next call's hotness path. (c) Per-bci de-spec (only evict the speculation that failed) instead of whole-method eviction.
 
 ---
 

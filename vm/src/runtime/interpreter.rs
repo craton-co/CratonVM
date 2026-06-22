@@ -3688,6 +3688,13 @@ pub fn execute(
                     // Attach owned metadata to compiled method
                     cm._jit_strings = owned_jit_strings;
                     cm._jit_invoke_infos = owned_jit_invoke_infos;
+                    stamp_compilation_epoch(
+                        shared,
+                        &class_name_arc,
+                        &method_name_arc,
+                        &descriptor_arc,
+                        &mut cm,
+                    );
                     let code_size = 0usize; // TODO: expose compiled code size
                                             // Round-7 HIGH-2 fix: do NOT hold `jit_cache.write()` across
                                             // `flight_recorder.lock()`.  The global JIT cache writer
@@ -8475,6 +8482,99 @@ fn transfer_osr_exit_into_live_frame(
     Some(())
 }
 
+/// deopt-osr Step 9 — stamp a freshly compiled artifact with the method's
+/// current live compilation epoch (`SharedVm::method_epochs`) so the
+/// real-frame-deopt resume sink can distinguish a current compilation from one
+/// superseded by a later invalidation. No-op (the field stays `0` and is never
+/// read) unless `CRATONVM_DEOPT_REAL` is on, so production artifacts are
+/// byte-identical. Uses the same `"<class>.<method>:<descriptor>"` key as
+/// `DeoptimizationController::deoptimize`, which advances the epoch.
+#[inline]
+fn stamp_compilation_epoch(
+    shared: &SharedVm,
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+    cm: &mut crate::jit::CompiledMethod,
+) {
+    if cratonvm_jit::deopt_real_enabled() {
+        let key = format!("{class_name}.{method_name}:{descriptor}");
+        cm.compilation_epoch = shared.compilation_epoch_for(&key);
+    }
+}
+
+/// deopt-osr Step 9 — resume a real-frame deopt under the epoch staleness
+/// guard, then drive de-speculation. Only reached under `CRATONVM_DEOPT_REAL`
+/// with `compiled.can_deopt_resume`, so it is inert in production.
+///
+/// 1. **Staleness guard.** The running artifact (`compiled`) carries the
+///    compilation epoch live when it was installed; the method's *live* epoch
+///    advances on every invalidation (`SharedVm::bump_compilation_epoch`). If
+///    the live epoch has moved past the artifact's, this compilation has been
+///    superseded — its baked `DeoptimizationPoint`s describe a speculation that
+///    has since been invalidated — so we do NOT resume its frame; we fall back
+///    to the safe whole-method re-run (returning `None`). This is the
+///    "assert the owning method's current epoch matches the box's creation
+///    epoch before following it" guard: a `DeoptimizationPoint` box is built
+///    during compilation (it cannot know the install-time epoch) and is
+///    reachable only through the artifact that baked it, so checking the
+///    artifact's `compilation_epoch` versions the box.
+/// 2. **Resume.** When the artifact is current, build + push the interpreter
+///    frame and resume at the trapping bci (`resume_real_ir_deopt`).
+/// 3. **De-speculation.** Record the deopt and drive the escalation policy
+///    (`DeoptimizationController::deoptimize`: log the event so the deopt rate
+///    is observable, evict so the next call recompiles, blacklist on repeated
+///    deopts), which also advances the live epoch. Run AFTER the resume
+///    decision so it only affects FUTURE invocations — the current frame,
+///    already resumed, is unaffected. The reason is recovered from the matching
+///    deopt point so OSR-exit events stay countable separately from guards.
+///
+/// Returns `Some` when the frame was resumed (caller returns it), `None` to
+/// fall through to the whole-method re-run.
+fn real_frame_deopt_resume_and_despeculate(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    compiled: &crate::jit::CompiledMethod,
+    cached: &Arc<CachedBytecodeMethod>,
+    rframe: &cratonvm_jit::deopt::ReconstructedFrame,
+) -> Option<CachedCallResult> {
+    let method_key = format!(
+        "{}.{}:{}",
+        cached.class_name, cached.method_name, cached.method_descriptor
+    );
+    let live = shared.compilation_epoch_for(&method_key);
+    let fresh = compiled.compilation_epoch >= live;
+    let resumed = if fresh {
+        resume_real_ir_deopt(shared, thread, cached, rframe)
+    } else {
+        if std::env::var_os("CRATONVM_DBG_DEOPT").is_some() {
+            eprintln!(
+                "[cratonvm-deopt] skip resume — artifact epoch {} < live {} for {} (superseded)",
+                compiled.compilation_epoch, live, method_key
+            );
+        }
+        None
+    };
+    // De-speculate (record + evict + escalate + bump live epoch). The reason is
+    // recovered from the deopt point matching the trapping bci so OSR-exit
+    // events are tallied separately from guard deopts.
+    let reason = compiled
+        .deopt_points
+        .iter()
+        .find(|dp| dp.bci == rframe.bci)
+        .map(|dp| dp.reason)
+        .unwrap_or(cratonvm_jit::deopt::DeoptReason::UncommonTrap);
+    crate::jit::helpers::DeoptimizationController::deoptimize(
+        shared,
+        &cached.class_name,
+        &cached.method_name,
+        &cached.method_descriptor,
+        reason,
+        rframe.bci,
+    );
+    resumed
+}
+
 #[cfg(test)]
 mod deopt_step3_tests {
     use super::*;
@@ -8783,6 +8883,90 @@ mod deopt_step3_tests {
         assert!(resume_real_ir_deopt(&shared, &mut thread, &cached, &rf).is_none());
         assert_eq!(thread.native_pin_roots.len(), 0);
         assert_eq!(thread.frames.len(), 0);
+    }
+
+    // ---------------------------------------------------------------------
+    // Step 9 — de-speculation wiring + compilation-epoch staleness guard.
+    // ---------------------------------------------------------------------
+
+    /// A `CompiledMethod` with a single bounds-check deopt point at `bci`, stamped
+    /// with `epoch`. The 1-byte `ret` body is never executed by these tests — only
+    /// the metadata (`compilation_epoch`, `deopt_points`) is consulted.
+    fn cm_with_deopt_point(epoch: u64, bci: u32) -> cratonvm_jit::CompiledMethod {
+        let mut buf = cratonvm_jit::ExecutableBuffer::new(64).unwrap();
+        buf.emit(&[0xC3]); // ret
+        let mut cm = cratonvm_jit::CompiledMethod::new(buf);
+        cm.compilation_epoch = epoch;
+        cm.deopt_points.push(cratonvm_jit::deopt::DeoptimizationPoint {
+            native_offset: 0,
+            bci,
+            reason: cratonvm_jit::deopt::DeoptReason::BoundsCheck,
+            action: cratonvm_jit::deopt::DeoptAction::Reinterpret,
+            speculation_id: 0,
+            frame_state: cratonvm_jit::deopt::FrameState {
+                method_key: String::new(),
+                bci,
+                locals: Vec::new(),
+                stack: Vec::new(),
+                monitors: Vec::new(),
+                caller: None,
+            },
+        });
+        cm
+    }
+
+    /// The per-method live compilation-epoch registry: absent → 0, `bump`
+    /// increments and returns, `compilation_epoch_for` reads back.
+    #[test]
+    fn step9_epoch_registry_bump_and_read() {
+        let shared = Arc::new(SharedVm::new(VmConfig::default()));
+        assert_eq!(shared.compilation_epoch_for("X.y:()V"), 0);
+        assert_eq!(shared.bump_compilation_epoch("X.y:()V"), 1);
+        assert_eq!(shared.compilation_epoch_for("X.y:()V"), 1);
+        assert_eq!(shared.bump_compilation_epoch("X.y:()V"), 2);
+        assert_eq!(shared.compilation_epoch_for("X.y:()V"), 2);
+        // Independent methods have independent epochs.
+        assert_eq!(shared.compilation_epoch_for("X.z:()V"), 0);
+    }
+
+    /// A *current* artifact (epoch == live) resumes the trapping frame AND the
+    /// deopt is recorded in the log (so the deopt rate is observable).
+    #[test]
+    fn step9_fresh_artifact_resumes_and_records_deopt() {
+        let shared = Arc::new(SharedVm::new(VmConfig::default()));
+        let mut thread = JvmThread::new(ThreadId(0), "test");
+        let cached = minimal_cached(); // T.m:()V
+        let cm = cm_with_deopt_point(0, 5);
+        let rf = rframe(vec![FrameValue::Int(1)], vec![], 5);
+
+        // live epoch for T.m:()V is 0 (never invalidated) == artifact epoch 0.
+        let r = real_frame_deopt_resume_and_despeculate(&shared, &mut thread, &cm, &cached, &rf)
+            .expect("current artifact must resume");
+        assert!(matches!(r, CachedCallResult::FramePushed));
+        assert_eq!(thread.frames.len(), 1);
+        // De-speculation recorded the event (reason recovered from the deopt point).
+        assert_eq!(shared.deopt_log.lock().deopt_count("T.m:()V"), 1);
+    }
+
+    /// A *superseded* artifact (epoch < live, simulating an invalidation since it
+    /// was installed) does NOT resume — it falls back to the safe re-run — but the
+    /// deopt is still recorded.
+    #[test]
+    fn step9_stale_artifact_skips_resume() {
+        let shared = Arc::new(SharedVm::new(VmConfig::default()));
+        let mut thread = JvmThread::new(ThreadId(0), "test");
+        let cached = minimal_cached(); // T.m:()V
+        let cm = cm_with_deopt_point(0, 5); // artifact epoch 0
+        let rf = rframe(vec![FrameValue::Int(1)], vec![], 5);
+
+        // Simulate a prior invalidation: live epoch advances past the artifact.
+        assert_eq!(shared.bump_compilation_epoch("T.m:()V"), 1);
+
+        let r = real_frame_deopt_resume_and_despeculate(&shared, &mut thread, &cm, &cached, &rf);
+        assert!(r.is_none(), "superseded artifact must not resume");
+        assert_eq!(thread.frames.len(), 0);
+        // Still recorded for the deopt rate.
+        assert_eq!(shared.deopt_log.lock().deopt_count("T.m:()V"), 1);
     }
 
     // ---------------------------------------------------------------------
@@ -18312,6 +18496,13 @@ fn try_osr(
             cm.compiled_via_osr = true;
             cm._jit_strings = owned_jit_strings2;
             cm._jit_invoke_infos = owned_jit_invoke_infos2;
+            stamp_compilation_epoch(
+                shared,
+                &class_name_arc,
+                &method_name_arc,
+                &descriptor_arc,
+                &mut cm,
+            );
             let mut jit_cache = shared.jit_cache.write();
             jit_cache.put(
                 class_name_arc.clone(),
@@ -19391,7 +19582,7 @@ fn try_jit_upgrade_with_gate(
             };
             let c_helpers = crate::jit::helpers::build_helpers();
             let c_string_layout_resolver = || resolve_string_field_layout(shared);
-            let compiled = crate::jit::try_compile(
+            let mut compiled = crate::jit::try_compile(
                 &callee_cached,
                 Some(&c_resolver),
                 Some(&c_field_resolver),
@@ -19465,6 +19656,13 @@ fn try_jit_upgrade_with_gate(
             );
 
             // Store in JIT cache
+            stamp_compilation_epoch(
+                shared,
+                &callee_cached.class_name,
+                &callee_cached.method_name,
+                &callee_cached.method_descriptor,
+                &mut compiled,
+            );
             {
                 let mut jit_cache = shared.jit_cache.write();
                 jit_cache.put(
@@ -19513,7 +19711,7 @@ fn try_jit_upgrade_with_gate(
     // wired only into `try_jit_compile_callee_slow`. See the JIT-inlining notes.
     let main_inline_on = crate::runtime::env_cache::jit_main_inline();
     let string_layout_resolver = || resolve_string_field_layout(shared);
-    let compiled = crate::jit::try_compile(
+    let mut compiled = crate::jit::try_compile(
         cached,
         Some(&resolver),
         Some(&field_resolver),
@@ -19561,6 +19759,13 @@ fn try_jit_upgrade_with_gate(
     let heap = compiled.needs_heap();
 
     // Store in shared JIT cache
+    stamp_compilation_epoch(
+        shared,
+        &cached.class_name,
+        &cached.method_name,
+        &cached.method_descriptor,
+        &mut compiled,
+    );
     let compiled_arc = {
         let mut jit_cache = shared.jit_cache.write();
         jit_cache.put(
@@ -20104,7 +20309,7 @@ fn try_jit_compile_callee_slow(
     let string_layout_resolver = || resolve_string_field_layout(shared);
 
     let compile_start = std::time::Instant::now();
-    let compiled = crate::jit::try_compile(
+    let mut compiled = crate::jit::try_compile(
         &cached,
         Some(&resolver),
         Some(&field_resolver),
@@ -20236,6 +20441,13 @@ fn try_jit_compile_callee_slow(
     let receiver_key: std::sync::Arc<str> = std::sync::Arc::from(class_name);
     let method_name_key = cached.method_name.clone();
     let method_desc_key = cached.method_descriptor.clone();
+    stamp_compilation_epoch(
+        shared,
+        &receiver_key,
+        &method_name_key,
+        &method_desc_key,
+        &mut compiled,
+    );
     {
         let mut jit_cache = shared.jit_cache.write();
         jit_cache.put(receiver_key, method_name_key, method_desc_key, compiled);
@@ -21146,7 +21358,13 @@ fn execute_jit_call(
             // machine provenance the mapper can't re-materialize — falls straight
             // through to the safe re-run instead of relying on the mapper bail.
             if cratonvm_jit::deopt_real_enabled() && compiled.can_deopt_resume {
-                if let Some(r) = resume_real_ir_deopt(shared, thread, cached, &rframe) {
+                // deopt-osr Step 9: epoch staleness guard + de-speculation
+                // wiring (record the deopt, evict, escalate to not-entrant /
+                // not-compilable, advance the live epoch). Resumes the trapping
+                // frame only when the artifact has not been superseded.
+                if let Some(r) =
+                    real_frame_deopt_resume_and_despeculate(shared, thread, compiled, cached, &rframe)
+                {
                     return Ok(r);
                 }
             }
