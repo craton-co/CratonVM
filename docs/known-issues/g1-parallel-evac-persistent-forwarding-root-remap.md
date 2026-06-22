@@ -119,18 +119,37 @@ LOST check now reports 0 — the root-remap bug is gone); `binarytrees16@64m` an
 `PromoteMixed 200000 20000000` serial+parallel **byte-identical to HotSpot**;
 734/734 gc tests + new regression `parallel_fast_path_hit_is_recorded_and_root_remapped`.
 
-## Residual — a separate concurrency race (🔴 OPEN)
+## Residual — a separate concurrency race (🔴 OPEN), now CHARACTERIZED + LOCALIZED
 
-With the dominant bug fixed, ~2/40 runs still crash, and the verifier reports
-**nothing** (no LOST / UN-REWRITTEN / OVERLAP) — the heap, roots, and forwards
-are all consistent at collection end. The crash rate *rises* under the verifier's
-own timing perturbation (≈4/20), so this is a **genuine, transient worker-vs-worker
-race** in the parallel closure (`run_worker` / `process_object` / `evacuate` copy
-+ scan + queue), NOT a steady-state inconsistency the post-collection verifier can
-catch. This is the original `task_58d60f7a` "data race" suspicion, now isolated as
-a distinct second bug. Fixing it needs concurrency-level tooling (TSan-style /
-loom-style, or targeted ordering audits of the copy↔CAS↔gray-queue handoff), not
-the forwarding-protocol reasoning above.
+With the dominant bug fixed, ~2/40 runs still crash. Further investigation
+(diagnostic knobs `CRATONVM_G1_WORKERS=N` and `CRATONVM_G1_DBG_ZERO=1`, both gated,
+on branch `feat/g1-parallel-evac-race2`) pinned it down:
+
+- **It is a genuine worker-vs-worker concurrency race.** `CRATONVM_G1_WORKERS=1`
+  (drain the parallel path serially) is **30/30 clean** — the parallel *logic* is
+  correct; only the multi-worker concurrency corrupts.
+- **The verifier's LOST check is `0` on every crash** — it is NOT the dominant
+  root-remap bug recurring. The new `CRATONVM_G1_DBG_ZERO` scan (walks ALL
+  non-Free regions incl. kept ones + roots, flags any reference to an all-zero /
+  freed-region header) **fires on every crash**: a KEPT-region self-forwarded
+  holder, and sometimes a root, points at an object in a **freed CSet region**.
+  So the parallel closure **drops a still-live object** (its CSet region is freed
+  by `free_or_keep_cset` because it was neither evacuated nor self-forwarded),
+  leaving its referrers dangling.
+- **It scales with timing perturbation.** Under both verifiers enabled the crash
+  rate jumps to ~19/25 and `DBG-ZERO` reports **80–200** dangling refs — i.e. when
+  the bad window is hit, a whole **subgraph** is dropped, not a single object.
+  This is consistent with a transient ordering bug, not a steady-state logic gap
+  (the gray-queue termination invariant `outstanding ≥ queue.len` holds, and Phase
+  1/2 seeding completes before the worker scope).
+
+This is the original `task_58d60f7a` "data race" suspicion, now isolated as a
+distinct second bug and localized to the copy ↔ CAS ↔ gray-queue ↔ in-place-scan
+handoff for self-forwarded objects under contention. The exact ordering bug needs
+a race detector (TSan / loom) or a targeted restructure (e.g. deferring
+self-forwarded objects' in-place slot rewrites to the serial Phase-4 pass so they
+never race a concurrent copy-read) — not the forwarding-protocol reasoning that
+fixed the dominant bug.
 
 Parallel evac therefore stays **opt-in/experimental** and mixed stays serial until
 this residual race is also fixed. Default G1 (serial) and Generational are
