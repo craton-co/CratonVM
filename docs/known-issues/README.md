@@ -138,6 +138,24 @@ stale reference later reads an all-zero / garbage header → `inconsistent heade
 (interpreter frames are precisely scanned and the moving collector remaps every
 root); `-Xmx8g` passes (no young GC).
 
+> **Current-dev refresh (2026-06-22, dev `14afc6a6`+, precise-jit-maps-default
+> Steps 1–8).** **A3 is CLOSED** by precise JIT oop maps (default-on) — validated
+> green across the GC-root repro+bench lane, OSR frames, and the BouncyCastle app
+> suites (`test-infra/regression-pool/gc-root-lane.sh` + `gc-root-apps-lane.sh`).
+> **A2 remains OPEN, unchanged:** `ReflRepro 8000 @ GC_STRESS=65536` still
+> `rc=139` (register-/native-return-resident missed root → UAF; no stack scan can
+> see a live register — dedicated GC/JIT core work). **A4 is OPEN but non-fatal
+> on the repro here:** gated `CRATONVM_REAL_FORKJOINPOOL=1` Fork6 is 6/6 ALL-OK on
+> current dev (the older ~15% reclamation does not reproduce), though the
+> cross-thread STW JIT-root gap is still *exercised* (`scan_active_jit_frames`
+> WARN) — that scan is the tracked follow-up. The *family is not formally
+> retired* (A2/A4 open); **nothing was removed** — all repros, GC guards,
+> `CRATONVM_DBG_*` knobs, and the shadow stack are retained as experimental/debug
+> tools.
+>
+> See `docs/feature-designs/precise-jit-maps-default.md` "Step 8 — GC-root family
+> retirement status".
+
 The eventual correct fix for the whole family is **precise JIT stack roots**
 (know exactly which registers/slots hold oops at each safepoint), tracked under
 `project_precise_jit_stack_maps`. The `CRATONVM_SHADOW_STACK` mechanism is the
