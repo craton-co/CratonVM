@@ -5870,6 +5870,30 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                     Err(e) => Err(p57_io_error(&e)),
                 };
             }
+            // Preserve the NIO missing-file contract: opening a non-existent
+            // path for READ — or for WRITE without CREATE/CREATE_NEW — must throw
+            // `java.nio.file.NoSuchFileException`, which frameworks catch to treat
+            // a config source as OPTIONAL (SmallRye loading Keycloak's
+            // `keycloak-<profile>.conf`; SRCFG00035). `newFileChannel`'s fd open
+            // would surface a generic `IOException` here, so pre-check.
+            if !std::path::Path::new(&p).exists() {
+                let creates = match args.get(2) {
+                    Some(Value::Object(Some(set))) => ctx
+                        .invoke_virtual(*set, "toString", "()Ljava/lang/String;", &[])
+                        .ok()
+                        .flatten()
+                        .and_then(|v| match v {
+                            Value::Object(Some(s)) => ctx.read_string(s),
+                            _ => None,
+                        })
+                        .map(|s| s.contains("CREATE"))
+                        .unwrap_or(false),
+                    _ => false,
+                };
+                if !creates {
+                    return Err(p57_no_such_file(ctx, &p));
+                }
+            }
             // Real file: return a working `FileChannel` (which implements
             // `SeekableByteChannel`) so `read`/`write`/`position`/`size`/`close`
             // resolve to the fd_table-backed `FileChannel` natives. Previously

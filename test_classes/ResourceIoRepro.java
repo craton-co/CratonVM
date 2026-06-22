@@ -57,7 +57,26 @@ public class ResourceIoRepro {
         check("content after truncate == 'hi'", "hi".equals(new String(Files.readAllBytes(p))),
                 new String(Files.readAllBytes(p)));
 
+        // Missing-file contract: READ on a non-existent path → NoSuchFileException.
         Files.deleteIfExists(p);
+        Path missing = p.resolveSibling("cvchan-does-not-exist-" + System.nanoTime() + ".bin");
+        try {
+            Files.newByteChannel(missing, Set.of(StandardOpenOption.READ));
+            check("missing-file READ throws NoSuchFileException", false, "no exception");
+        } catch (NoSuchFileException e) {
+            check("missing-file READ throws NoSuchFileException", true, "NSFE");
+        } catch (IOException e) {
+            check("missing-file READ throws NoSuchFileException", false, e.getClass().getName());
+        }
+        // CREATE on a non-existent path SUCCEEDS and creates the file.
+        try (SeekableByteChannel ch = Files.newByteChannel(missing,
+                Set.of(StandardOpenOption.WRITE, StandardOpenOption.CREATE))) {
+            ch.write(ByteBuffer.wrap("new".getBytes()));
+        }
+        check("CREATE on missing path writes file", Files.exists(missing) && Files.size(missing) == 3,
+                "exists=" + Files.exists(missing));
+        Files.deleteIfExists(missing);
+
         System.out.println("RESULT pass=" + pass + " fail=" + fail);
         if (fail != 0) System.exit(1);
     }
