@@ -2487,15 +2487,22 @@ mod tests {
                         // Free the per-call result promptly to bound the live set.
                         delete_local(wenv, s);
                     }
-                    // A SINGLE designated foreign thread periodically forces a
-                    // stop-the-world GC while its siblings are mid-call — the
-                    // participation path under test (siblings must arrive at a
-                    // safepoint). Only one initiator at a time: concurrent
-                    // System.gc from many threads trips a *separate*, pre-existing
-                    // multi-thread-STW reliability bug in dev (reproduces with
-                    // zero foreign threads — see scratch_churn/Churn.java), which
-                    // is out of scope for validating foreign attach.
-                    if t == 0 && i % 64 == 0 {
+                    // EVERY foreign thread periodically forces a stop-the-world
+                    // GC while its siblings are mid-call — the strongest form of
+                    // the participation path under test: N concurrent initiators
+                    // racing `request_stw` (one wins, the losers fall through to
+                    // `safepoint_check` and arrive). This previously deadlocked on
+                    // the multi-thread-STW barrier bugs (generation-reuse in
+                    // `arrive_and_wait`, the blocked-region wait-out, terminate-
+                    // without-arrive, and a forced-GC young-arena over-expansion);
+                    // those are fixed (see vm/src/threading/gc_barrier.rs and the
+                    // `collect_garbage_inner` expansion gate), so the concurrent
+                    // form is restored. NOTE: a *separate*, deeper residual —
+                    // monitor-ownership desync in Java `Thread.join` under
+                    // concurrent GC (scratch_churn/Churn.java) — does NOT affect
+                    // this soak: foreign workers detach via the host join, never
+                    // Java `Thread.join`.
+                    if i % 64 == 0 {
                         call_void(wenv, shared.sys_cls, shared.gc_mid, std::ptr::null());
                     }
                 }

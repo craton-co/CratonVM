@@ -210,6 +210,7 @@ The history below predates the fix.
 | # | Bug | Status | Doc |
 |---|---|---|---|
 | **C** | Deep JIT→JIT recursion overruns the **native** stack (ANTLR `closure()`); the overflow path faults instead of throwing a catchable `StackOverflowError`. Only arises with an *unmerged* cold-path-throughput experiment; needs stack-banging + a fault-recovery handler. | ⚪ **LATENT** (not a current blocker) | [springrepos-extension-hang-jit-throughput-and-deep-recursion.md](springrepos-extension-hang-jit-throughput-and-deep-recursion.md) §6–7 |
+| **MT-STW** | `Thread.join` monitor-ownership **desync under concurrent GC** (JIT-off): the joined Thread object's monitor is re-associated to a fresh `owner=None` monitor, so `wait(0)`/`monitorexit` throw `IllegalMonitorStateException` in an infinite javac synchronized-exit loop → the joiner livelocks off the GC safepoint → next STW wedges. ~1–3% on `scratch_churn/Churn.java`. **Distinct from / deeper than** the four barrier+expansion bugs fixed in `68c6993e` (0%→~97%). Does **not** affect the foreign-attach soak (host join, not Java join). | 🔴 **OPEN** — fix the dying-worker death-notify vs. moving-collector race + `check_post_block_gc` on the `monitor_wait` error path | [mt-stw-join-monitor-desync.md](mt-stw-join-monitor-desync.md) |
 
 > Bug **B** (JUnit `@Timeout` "interceptor invoked twice") is **FIXED** and archived — it was
 > never threading/`MethodHandle`: a synthetic natural-order compare raised `NoSuchMethodError`
