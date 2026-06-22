@@ -19123,34 +19123,69 @@ fn is_elidable_construction(cm: &crate::classloading::ClassManager, class_id: Cl
 
 /// Shared body for the JIT `cp_elidable_init_resolver` closures: given the
 /// holder class `holder_cid` and an `invokespecial` constant-pool index, return
-/// `true` iff it targets a no-arg `<init>()V` whose construction is elidable for
-/// scalar replacement (see [`is_elidable_construction`]).
-fn resolve_jit_elidable_init(
-    cm: &crate::classloading::ClassManager,
+/// `true` iff it targets a no-arg `<init>()V` whose construction is elidable
+/// (see [`is_elidable_construction`]) — for both scalar replacement (IR `new`
+/// elision) and the per-allocation ctor-dispatch elision.
+///
+/// Resolves the target via `load_class_concurrent` so APPLICATION-loaded
+/// classes are covered, not only bootstrap/JDK ones: `find_class_by_name` does
+/// NOT see app classes in the JIT-compile context (the same gap the
+/// `execute`/`try_osr` ctor-elision paths hit). It reads the target
+/// class name under a brief `class_manager` lock, DROPS it, resolves via
+/// `load_class_concurrent` (already-loaded classes return cached — the common
+/// case, since a ctor site's class is loaded — so no `<clinit>`/GC), then
+/// re-reads `cm` to check elidability. Lock discipline matches the
+/// `field_resolver` precedent (resolve-with-load BEFORE taking the inner `cm`
+/// read), so no VM read lock is alive across the load. MUST NOT be called with
+/// a `class_manager` lock already held.
+fn resolve_jit_elidable_init_loading(
+    shared: &SharedVm,
     holder_cid: ClassId,
     cp_idx: u16,
 ) -> bool {
-    let Some(holder) = cm.get_class(holder_cid) else {
+    // 1. Extract the target class name + confirm a no-arg `<init>()V` ref
+    //    (brief `cm` read, dropped before the load).
+    let target_name = {
+        let cm = shared.class_manager.read();
+        let Some(holder) = cm.get_class(holder_cid) else {
+            return false;
+        };
+        let cp = &holder.constant_pool;
+        let (class_index, nat_index) = match cp.get(cp_idx) {
+            Some(ConstantPoolEntry::MethodReference {
+                class_index,
+                name_and_type_index,
+            }) => (*class_index, *name_and_type_index),
+            _ => return false,
+        };
+        if !matches!(cp.get_name_and_type(nat_index), Some(("<init>", "()V"))) {
+            return false;
+        }
+        match cp.get_class_name(class_index) {
+            Some(n) => n.to_string(),
+            None => return false,
+        }
+    };
+    // 2. Resolve the target (loading if necessary) with NO `cm` lock held.
+    let Ok(target_id) = shared.load_class_concurrent(&target_name) else {
         return false;
     };
-    let cp = &holder.constant_pool;
-    let (class_index, nat_index) = match cp.get(cp_idx) {
-        Some(ConstantPoolEntry::MethodReference {
-            class_index,
-            name_and_type_index,
-        }) => (*class_index, *name_and_type_index),
-        _ => return false,
-    };
-    if !matches!(cp.get_name_and_type(nat_index), Some(("<init>", "()V"))) {
-        return false;
+    // 3. Check elidability (brief `cm` read).
+    let cm = shared.class_manager.read();
+    let elidable = is_elidable_construction(&cm, target_id);
+    // DBG (CRATONVM_DBG_CTOR_FIX): when this resolves an elidable ctor whose
+    // target `find_class_by_name` could NOT see, it is the app-class gap being
+    // closed (the old resolver would have returned false here).
+    if elidable && crate::runtime::env_cache::ctor_fix_dbg() {
+        let via_find = cm.find_class_by_name(&target_name).is_some();
+        eprintln!(
+            "[ctor-fix] elidable-resolver: {} elidable=true find_class_by_name={}{}",
+            target_name,
+            via_find,
+            if via_find { "" } else { "  <- APP-CLASS GAP CLOSED" },
+        );
     }
-    let Some(target_name) = cp.get_class_name(class_index) else {
-        return false;
-    };
-    let Some(target_id) = cm.find_class_by_name(target_name) else {
-        return false;
-    };
-    is_elidable_construction(cm, target_id)
+    elidable
 }
 
 /// Try to JIT-compile a method and return the upgraded cache target.
@@ -19440,10 +19475,8 @@ fn try_jit_upgrade_with_gate(
     // is the opt-out safety net — when off, `None` is passed and the IR builder
     // bails on `new`, restoring the single-pass backend for allocation methods.
     let scalar_new_on = std::env::var("CRATONVM_JIT_SCALAR_NEW").map_or(true, |v| v != "0");
-    let elidable_init_resolver = |cp_idx: u16| -> bool {
-        let cm = shared.class_manager.read();
-        resolve_jit_elidable_init(&cm, class_id, cp_idx)
-    };
+    let elidable_init_resolver =
+        |cp_idx: u16| -> bool { resolve_jit_elidable_init_loading(shared, class_id, cp_idx) };
     // invoke class-id resolver: maps an invoke* CP index to the class id of
     // its declared (Methodref) class. Used by the CRC32/CRC32C `update`
     // call-site intrinsics for the receiver class-id guard.
@@ -19727,8 +19760,7 @@ fn try_jit_upgrade_with_gate(
             let c_scalar_new_on =
                 std::env::var("CRATONVM_JIT_SCALAR_NEW").map_or(true, |v| v != "0");
             let c_elidable_init_resolver = |cp_idx: u16| -> bool {
-                let cm = shared.class_manager.read();
-                resolve_jit_elidable_init(&cm, callee_cid, cp_idx)
+                resolve_jit_elidable_init_loading(shared, callee_cid, cp_idx)
             };
             // invoke class-id resolver for the callee's constant pool — maps
             // an invoke* CP index to its declared class id, for the CRC32/
@@ -20437,10 +20469,8 @@ fn try_jit_compile_callee_slow(
     // Elidable-`<init>` resolver for `new` scalar replacement, default-ON
     // (opt-out: CRATONVM_JIT_SCALAR_NEW=0).
     let scalar_new_on = std::env::var("CRATONVM_JIT_SCALAR_NEW").map_or(true, |v| v != "0");
-    let elidable_init_resolver = |cp_idx: u16| -> bool {
-        let cm = shared.class_manager.read();
-        resolve_jit_elidable_init(&cm, cid, cp_idx)
-    };
+    let elidable_init_resolver =
+        |cp_idx: u16| -> bool { resolve_jit_elidable_init_loading(shared, cid, cp_idx) };
     // invoke class-id resolver — maps an invoke* CP index to its declared
     // class id, consumed by the CRC32/CRC32C `update` receiver class-id guard.
     let invoke_class_id_resolver = |cp_idx: u16| -> Option<u32> {
