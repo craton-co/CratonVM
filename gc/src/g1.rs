@@ -2170,6 +2170,7 @@ impl G1Collector {
         // Phase 5: free evacuated regions.
         let bytes_freed = self.free_or_keep_cset(&mut regions, &cset, &pointer_map);
         self.verify_no_dangling_into_cset(&regions, &cset_set, &pointer_map);
+        self.dbg_verify_no_unrewritten_forward(&regions, &cset_set, &pointer_map, roots);
 
         let cur_eden = self.current_eden.load(Ordering::Relaxed);
         if cset_set.contains(&cur_eden) {
@@ -2976,6 +2977,167 @@ impl G1Collector {
              holder_obj={:#x} holder_region={} target={:#x}",
             holder_obj, holder_region, target
         );
+    }
+
+    /// DIAGNOSTIC TOOL (parallel-evac defect 2, env `CRATONVM_G1_DBG_HEADERS=1`).
+    /// Post-collection consistency verifier that ROOT-CAUSED the rare
+    /// `young_collection_parallel` corruption (`SteadyChurn @16m --nojit`, ~1/8,
+    /// `java/lang/Object`). Checks, after a parallel collection:
+    ///   (0) OVERLAP — two from-space objects forwarded to the same dest (a TLAB
+    ///       race) — NEVER fires (ruled out);
+    ///   (a) UN-REWRITTEN — a non-CSet/root ref to a `pointer_map` KEY — NEVER
+    ///       fires from heap holders (the heap is clean);
+    ///   (b) LOST — a root → a CSet object NOT in `pointer_map` — fires EVERY
+    ///       collection: the smoking gun.
+    ///
+    /// ROOT CAUSE (full writeup + ruled-out fixes:
+    /// `docs/known-issues/g1-parallel-evac-persistent-forwarding-root-remap.md`):
+    /// the parallel evacuator dedups via the PERSISTENT `forwarding_ptr` header
+    /// field (serial uses the per-cycle `pointer_map`). A fast-path hit returns a
+    /// forward — possibly left over from a PRIOR cycle — WITHOUT recording it in
+    /// `pointer_map`, so the VM's `update_all_roots` cannot remap a root that
+    /// resolved through it. The frame local stays stuck on the from-space object,
+    /// surviving only via the `forwarding_ptr` redirect until its region is
+    /// reused → corruption. Invisible to V7b (heap-only). Three naive fixes all
+    /// fail (see the doc); the proper fix is a per-cycle forwarding redesign.
+    ///
+    /// Mixed GC is kept on the serial evacuator and parallel evac stays
+    /// opt-in/experimental (`CRATONVM_G1_PARALLEL_EVAC`) until this is fixed.
+    /// No-op unless the env knob is set.
+    fn dbg_verify_no_unrewritten_forward(
+        &self,
+        regions: &[G1Region],
+        cset_set: &std::collections::HashSet<usize>,
+        pointer_map: &HashMap<usize, usize>,
+        roots: &[ObjectRef],
+    ) {
+        if std::env::var_os("CRATONVM_G1_DBG_HEADERS").is_none() {
+            return;
+        }
+        // (0) OVERLAP DETECTOR: two distinct from-space objects forwarded to the
+        // SAME destination address = a TLAB allocation race (one copy clobbers
+        // the other's header → `java/lang/Object`). Reverse-map the forwards.
+        {
+            let mut by_dest: HashMap<usize, usize> = HashMap::with_capacity(pointer_map.len());
+            let mut overlaps = 0usize;
+            for (&k, &v) in pointer_map.iter() {
+                if k == v {
+                    continue; // self-forward (in place) — not a copy destination
+                }
+                if let Some(&prev) = by_dest.get(&v) {
+                    overlaps += 1;
+                    if overlaps <= 8 {
+                        eprintln!(
+                            "[g1][DBG-HEADERS] OVERLAP: dest {:#x} is the forward target of TWO \
+                             from-space objects {:#x} and {:#x}",
+                            v, prev, k
+                        );
+                    }
+                } else {
+                    by_dest.insert(v, k);
+                }
+            }
+            if overlaps > 0 {
+                eprintln!("[g1][DBG-HEADERS] {overlaps} forward-destination OVERLAP(s) this collection");
+            }
+        }
+
+        let mut hits = 0usize;
+        // A holder is REACHABLE-RELEVANT only if it is NOT in a CSet (from-space)
+        // region: kept CSet regions hold dead-never-reached from-space objects
+        // whose slots are legitimately un-rewritten (noise). True survivors/old
+        // (non-CSet) and roots MUST have every CSet ref rewritten (by the in-place
+        // scan for new survivors, or Phase 4 for pre-existing survivors/old).
+        let mut lost = 0usize;
+        let mut check = |holder: usize, where_: &str, target: usize| {
+            if let Some(&new) = pointer_map.get(&target) {
+                if new != target {
+                    hits += 1;
+                    if hits <= 24 {
+                        let treg = self.lookup_region_for_addr(target);
+                        eprintln!(
+                            "[g1][DBG-HEADERS] UN-REWRITTEN forward (live holder): {where_} \
+                             holder={:#x} slot->{:#x} should be {:#x}; target region={:?}",
+                            holder, target, new, treg
+                        );
+                    }
+                }
+                return;
+            }
+            // LOST: target sits in a CSet (collected) region but has NO forwarding
+            // entry — it was never evacuated. V7b catches this for HEAP holders;
+            // here it also covers ROOTS (which V7b never scans). A live object
+            // reachable only via a root, dropped because the parallel closure
+            // terminated before scanning it, lands here — and the VM's
+            // `update_all_roots` cannot remap it (not in `pointer_map`), so the
+            // frame local dangles into the freed region → `java/lang/Object`.
+            if let Some(tidx) = self.lookup_region_for_addr(target) {
+                if cset_set.contains(&tidx) {
+                    lost += 1;
+                    if lost <= 24 {
+                        eprintln!(
+                            "[g1][DBG-HEADERS] LOST (un-evacuated CSet target): {where_} \
+                             holder={:#x} slot->{:#x} region={tidx} — NOT in pointer_map",
+                            holder, target
+                        );
+                    }
+                }
+            }
+        };
+        // Roots (always reachable).
+        for r in roots {
+            let p = r.as_ptr() as usize;
+            if p != 0 {
+                check(0, "root", p);
+            }
+        }
+        // Only NON-CSet regions (true survivors / old / new survivors). Kept CSet
+        // regions are excluded — their dead objects are the stranded-copy noise.
+        for (ridx, region) in regions.iter().enumerate() {
+            if region.region_type == RegionType::Free || cset_set.contains(&ridx) {
+                continue;
+            }
+            let base = region.data.as_ptr();
+            let cursor = region.cursor;
+            let mut offset = 0usize;
+            while offset < cursor {
+                let obj_ptr = unsafe { base.add(offset) };
+                let header = unsafe { &*(obj_ptr as *const ObjectHeader) };
+                if is_humongous_filler(header) {
+                    break;
+                }
+                let obj_size = object_total_size(header);
+                if obj_size < HEADER_SIZE || offset + obj_size > cursor {
+                    break;
+                }
+                let data = unsafe { obj_ptr.add(HEADER_SIZE) };
+                if header.kind == ObjectKind::Array {
+                    if header.element_type == ArrayElementType::Reference {
+                        for k in 0..header.array_length as usize {
+                            let raw =
+                                unsafe { std::ptr::read(data.add(k * 8) as *const u64) } as usize;
+                            if raw != 0 {
+                                check(obj_ptr as usize, "array-elem", raw);
+                            }
+                        }
+                    }
+                } else {
+                    for s in 0..header.num_slots as usize {
+                        let v = unsafe { std::ptr::read(data.add(s * SLOT_SIZE) as *const Value) };
+                        if let Value::Object(Some(o)) = v {
+                            check(obj_ptr as usize, "field", o.as_ptr() as usize);
+                        }
+                    }
+                }
+                offset += obj_size;
+            }
+        }
+        if hits > 0 || lost > 0 {
+            eprintln!(
+                "[g1][DBG-HEADERS] {hits} un-rewritten + {lost} LOST(un-evacuated CSet) \
+                 from NON-CSET holders/roots = the real defect"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------
