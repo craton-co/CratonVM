@@ -20563,7 +20563,14 @@ fn execute_jit_call(
             // returns None and falls through to the re-run below. Gate-OFF
             // (default): skipped → byte-identical; the int-only
             // CRATONVM_IR_DEOPT_RESUME path above is untouched.
-            if cratonvm_jit::deopt_real_enabled() {
+            //
+            // x64-backport Step 5: gate on the per-method coverage flag
+            // `compiled.can_deopt_resume` (finalized in x64 codegen: deopt
+            // snapshots present AND no scalar replacement). A method off the gate
+            // — e.g. one that scalar-replaced an object, whose snapshot records
+            // machine provenance the mapper can't re-materialize — falls straight
+            // through to the safe re-run instead of relying on the mapper bail.
+            if cratonvm_jit::deopt_real_enabled() && compiled.can_deopt_resume {
                 if let Some(r) = resume_real_ir_deopt(shared, thread, cached, &rframe) {
                     return Ok(r);
                 }
