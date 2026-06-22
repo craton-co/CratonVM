@@ -4933,6 +4933,16 @@ fn native_map_hash_code(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     Ok(Some(Value::Int(hash)))
 }
 
+/// True when `obj`'s runtime class implements `java/util/Map` (directly or via
+/// any superclass / super-interface). `is_subclass` walks the interface graph,
+/// so this answers "is `obj` a Map" even for arbitrary user implementations.
+fn object_is_map(ctx: &dyn NativeContext, obj: ObjectRef) -> bool {
+    match ctx.class_id_by_name("java/util/Map") {
+        Some(map_cid) => ctx.is_subclass(ctx.class_id_of_object(obj), map_cid),
+        None => false,
+    }
+}
+
 fn native_map_equals(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
@@ -4945,46 +4955,93 @@ fn native_map_equals(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     if std::ptr::eq(this.as_ptr(), other.as_ptr()) {
         return Ok(Some(Value::Int(1)));
     }
+    // `Map.equals(o)` is `false` for a non-Map argument (`AbstractMap.equals`:
+    // `if (!(o instanceof Map)) return false`). The virtual-dispatch reads
+    // below would otherwise invoke `other.size()` / `other.get(...)` on an
+    // object that has no such methods and throw.
+    if !object_is_map(ctx, other) {
+        return Ok(Some(Value::Int(0)));
+    }
+
+    // RC-3 fix (SC-map-multivaluemap-family): `this` is always a
+    // natively-modelled map — this native is registered on
+    // HashMap/Hashtable/Properties and LinkedHashMap inherits it — so its size
+    // and entries are read directly via the native helpers. `other`, however,
+    // may be ANY `Map`: a TreeMap / ConcurrentHashMap (segmented or tree
+    // layouts that `map_state` cannot read as buckets), or an arbitrary Java
+    // `Map` such as Spring's `LinkedMultiValueMap` whose slot 0 is its
+    // `targetMap` field, not a bucket array. Reading `other` through
+    // `map_state` / `native_map_get` reported size 0 / no matching entries, so
+    // `nativeMap.equals(foreignMap)` wrongly returned `false`
+    // (LinkedMultiValueMapTests.equals). Route every `other` access through
+    // virtual dispatch — `other.size()` / `other.get(k)` / `other.containsKey(k)`
+    // resolve to whatever natives or bytecode `other`'s real class provides,
+    // restoring `AbstractMap.equals` semantics for cross-implementation
+    // comparisons.
     let (_, size_a, _) = map_state(ctx, this);
-    let (_, size_b, _) = map_state(ctx, other);
+    let size_b = match ctx.invoke_virtual(other, "size", "()I", &[])? {
+        Some(Value::Int(s)) => s,
+        // Defensive: a Map whose `size()` did not yield an int — fall back to
+        // the native-layout read rather than mis-comparing.
+        _ => {
+            let (_, s, _) = map_state(ctx, other);
+            s
+        }
+    };
     if size_a != size_b {
         return Ok(Some(Value::Int(0)));
     }
-    // Check all entries in this map exist in other.
+    // Check that every entry in `this` is present-and-equal in `other`.
     //
-    // MED fix: previously the `if let Value::Object(Some(k))` guard
-    // silently skipped null-keyed entries entirely, so two maps that
-    // differed only on the value mapped to `null` would compare equal —
-    // a Map.equals contract violation. We now include null-keyed entries
-    // by dispatching the lookup with a `null` key (HashMap permits this
-    // and `native_map_get` handles it), and also include non-`Object`
-    // primitive-keyed entries for completeness.
+    // Null-value handling (MED fix, preserved): a `null`-valued entry must be
+    // matched by `other` mapping the same key to `null` AND actually containing
+    // it (distinguish present-null from absent, per the contract). Null-keyed
+    // entries are included by dispatching the lookup with a `null` key.
     let entries = map_collect_entries(ctx, this);
     for (key, value) in &entries {
-        let get_args = [Value::Object(Some(other)), *key];
-        let other_val = native_map_get(ctx, &get_args)?;
-        match other_val {
-            Some(ref ov) => {
+        let other_val = ctx
+            .invoke_virtual(
+                other,
+                "get",
+                "(Ljava/lang/Object;)Ljava/lang/Object;",
+                &[*key],
+            )?
+            .unwrap_or(Value::Object(None));
+        match value {
+            Value::Object(None) => {
+                if !matches!(other_val, Value::Object(None)) {
+                    return Ok(Some(Value::Int(0)));
+                }
+                let has = ctx.invoke_virtual(
+                    other,
+                    "containsKey",
+                    "(Ljava/lang/Object;)Z",
+                    &[*key],
+                )?;
+                if !matches!(has, Some(Value::Int(1))) {
+                    return Ok(Some(Value::Int(0)));
+                }
+            }
+            _ => {
                 // Compare values per the `Map.equals` contract: `v.equals(ov)`.
                 // For two object values this must dispatch the value's Java
-                // `equals(Object)` — `values_equal` only knows identity,
-                // String contents and enum identity, so it wrongly reported
-                // unequal for List/bean/etc. values (e.g. two HashMaps whose
-                // values are equal `List`s compared `false`). `map_keys_equal`
-                // already honours the contract (it falls back to the Java
-                // `equals`), so reuse it for object/object pairs and keep
-                // `values_equal` for the primitive / null / mixed cases.
-                let eq = match (value, ov) {
+                // `equals(Object)` — `values_equal` only knows identity, String
+                // contents and enum identity, so it wrongly reported unequal for
+                // List/bean/etc. values (e.g. two maps whose values are equal
+                // `List`s compared `false`). `map_keys_equal` already honours
+                // the contract (it falls back to the Java `equals`), so reuse it
+                // for object/object pairs and keep `values_equal` for the
+                // primitive / null / mixed cases.
+                let eq = match (value, &other_val) {
                     (Value::Object(Some(va)), Value::Object(Some(vb))) => {
                         map_keys_equal(ctx, *va, *vb)?
                     }
-                    _ => values_equal(ctx, value, ov),
+                    _ => values_equal(ctx, value, &other_val),
                 };
                 if !eq {
                     return Ok(Some(Value::Int(0)));
                 }
             }
-            None => return Ok(Some(Value::Int(0))),
         }
     }
     Ok(Some(Value::Int(1)))
