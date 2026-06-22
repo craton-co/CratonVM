@@ -328,3 +328,26 @@ JIT divide-by-zero re-run) has since been fixed; the other two remain open:
   into a single [fork6-fjp-multithread-jit-root-reclamation.md](fork6-fjp-multithread-jit-root-reclamation.md)
   — they described the *same* Fork6 bug (A4). Added this index framing the
   A1–A4 family + standalone B/C, and recorded the current-`dev` A3 verification.
+
+## Spring Framework full-suite run (2026-06-21) — new entries
+
+A fresh full `spring-core` run (binary built from dev) surfaced these CratonVM
+divergences. Consolidated index: [spring-core-suite-2026-06-21.md](spring-core-suite-2026-06-21.md).
+**7 fixes from this run already landed on `dev`** (stream close-handler OOB, CHM.remove(null)+
+LinkedHashMap.putIfAbsent, generic-bounds reify CCE, keySet.contains delegate, StAX cursor natives,
+lambda-SAM param-type dispatch, `String.format("%s",boolean)`, and synthetic `Collector`
+supplier/accumulator/finisher/combiner). The **open** ones documented here:
+
+- [SC-custom-classloader-ignored.md](SC-custom-classloader-ignored.md) — `Class.forName(name, loader)` ignores user `ClassLoader`s (foundational; blocks the annotation `TypeNotPresentException` cases).
+- [SC-jspecify-nullness-reflection.md](SC-jspecify-nullness-reflection.md) — type-use + package annotations dropped by reflection (`getTypeAnnotationBytes0` null) — 26 tests.
+- [SC-annotation-introspection-family.md](SC-annotation-introspection-family.md) — Bug A (Class-attr TypeNotPresent, blocked on classloader), Bug C (enclosing-class scan traversal), Bug D (relies on HotSpot `getDeclaredMethods` ordering — not cleanly fixable). Bug B FIXED on dev.
+- [SC-env-classreading.md](SC-env-classreading.md) — getenv/getProperties identity; `Object.equals` shadows overrides (`precedenceOf`=-1); `int.class` via classreading; custom-CL `getResourceAsStream`.
+- [SC-resource-io-family.md](SC-resource-io-family.md) — NIO write-channel stub, `Path.toUri()` authority; several FileNotFoundExceptions are harness-CWD artifacts.
+- [SC-aot-runtimehints-resource-count.md](SC-aot-runtimehints-resource-count.md) — RuntimeHints resource glob count (8 vs 5).
+- [SC-stax-xml-family.md](SC-stax-xml-family.md) — namespace SAX-event-sequence mismatch (cursor natives + element prefix already fixed on dev).
+- [SC-map-multivaluemap-family.md](SC-map-multivaluemap-family.md) — residual ByteBuddy `ClassInjector` handoffs (keySet/putIfAbsent fixed on dev).
+- [SC-task-retry-util-misc.md](SC-task-retry-util-misc.md) — Properties.store #date line, Throwable deser, retry timing, ByteBuddy ClassInjector, AQS throttle.
+- [SC-misc-core-spring.md](SC-misc-core-spring.md) — SortedProperties OutputStream store (CHM.remove(null) fixed on dev).
+- [SC-hangs-mergedannotations-charsequence.md](SC-hangs-mergedannotations-charsequence.md) — two hangs: `MergedAnnotations.stream().toArray()` re-entry; Reactor `StepVerifier` producer never scheduled.
+
+Cross-cutting: ByteBuddy `ClassInjector$UsingReflection` failure breaks AssertJ `assertSoftly` + Mockito; JUnit "TimeoutExtension multiple times" masks underlying VM errors.
