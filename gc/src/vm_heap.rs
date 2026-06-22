@@ -1181,6 +1181,16 @@ impl VmHeap {
         }
     }
 
+    /// Print the aggregate per-collection pause summary (p50/p99/max young +
+    /// mixed) to stderr. No-op for the generational collector (which keeps no
+    /// pause history) and when no G1 collection has run. Called at VM shutdown
+    /// when GC stats are requested (`--verbose:gc` or `CRATONVM_GC_STATS`).
+    pub fn print_gc_summary(&self) {
+        if let VmHeap::G1(g1) = self {
+            g1.print_gc_summary();
+        }
+    }
+
     /// Get the number of fields (slots) in an object.
     pub fn num_fields(&self, obj: ObjectRef) -> usize {
         dispatch!(self, get_header(obj)).num_slots as usize
