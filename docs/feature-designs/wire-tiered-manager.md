@@ -1,5 +1,53 @@
 # Wire the Tiered Compilation Manager
 
+> **Increment 6 (Step 6 — `CRATONVM_TIER_*` threshold overrides) landed.**
+> Builds on increment 5. The tiered policy's thresholds were hardcoded
+> (`CompilationPolicy::default()`), so the pipeline could not be tuned without a
+> recompile. Increment 6 exposes them as environment knobs and threads them into
+> VM init; it does **not** change the (HotSpot-referenced) defaults — authoritative
+> retuning against the app gauntlet is an empirical activity deferred to a quiet
+> machine (this repo runs many concurrent worktrees, so wall-time here is
+> unreliable; cf. `MEMORY` "never measure VM wall-time with a build running").
+> - **Policy knobs.** `CompilationPolicy::from_env()` (`jit/src/tiered.rs`) applies
+>   `CRATONVM_TIER_C1_THRESHOLD` / `_C2_THRESHOLD` / `_OSR_THRESHOLD` /
+>   `_C2_MIN_INVOCATIONS` (each parsed `u32`, clamped `>= 1` so a `0` can't defeat
+>   warmup) and `CRATONVM_TIER_ENABLED=0` over `Default`. The parsing core is a
+>   pure, env-free `with_overrides(get)` (production passes `std::env::var`), so it
+>   is unit-tested deterministically with a fake getter — no racy/`unsafe`
+>   `set_var`. `TieredCompilationManager::with_env_policy()` wraps it; `SharedVm::new`
+>   (`vm_init.rs`) now constructs the manager from it (was `with_default_policy`).
+>   These four govern `on_method_invocation`'s tier recommendation, i.e. the
+>   background tiered pipeline (gated by `CRATONVM_BG_COMPILE`).
+> - **Live OSR back-edge knob.** `CRATONVM_TIER_OSR_BACKEDGE`
+>   (`env_cache::tier_osr_backedge`, default `OSR_THRESHOLD` = 1000) overrides the
+>   per-frame back-edge count at which `try_osr_with_backoff` first attempts OSR.
+>   Unlike the four policy knobs this is live on **both** the default inline-OSR
+>   path and the Step-5 background-OSR path (both gate on `Frame::should_try_osr`),
+>   which is why it is a VM-side `env_cache` flag rather than a policy field. The
+>   function returns `Option<u32>` so `OSR_THRESHOLD` stays the single canonical
+>   default at the call site (`.unwrap_or(OSR_THRESHOLD)`).
+> - **Default-OFF safety.** With no `CRATONVM_TIER_*` set, `from_env() ==
+>   default()` and `tier_osr_backedge() == None` (→ `OSR_THRESHOLD`), so every
+>   threshold is byte-for-byte the historical value; no behavior change.
+> - **Tests** (`jit/src/tiered.rs`): `step6_policy_overrides_apply_and_clamp`
+>   (parse, `0`→`1` clamp, unparseable→default, `ENABLED=0`) and
+>   `step6_policy_overrides_empty_env_is_default`. 843 jit-crate tests pass.
+> - **Validation / demonstration (`scratch/tier6/`).** `OsrProbe 10M`
+>   (`1550058760673472`) and `binarytrees 16` (`14985902`) stay == HotSpot with
+>   defaults AND with overridden thresholds. The knobs demonstrably change behavior
+>   (via `CRATONVM_DBG_JITC`): lowering `CRATONVM_TIER_OSR_BACKEDGE` makes OSR fire
+>   after fewer back-edges, and `CRATONVM_TIER_C2_THRESHOLD` shifts the
+>   background-tiered tier recommendation — correctness is invariant under tuning.
+> - **Tuning guidance.** HotSpot's defaults (c1 200 / c2 5000 / osr 10000) are the
+>   starting reference. CratonVM's C2 compile is comparatively expensive and its
+>   interpreter comparatively slow, so the two levers that matter most in practice
+>   are `CRATONVM_TIER_OSR_BACKEDGE` (lower → hot loops in cold methods reach
+>   compiled code sooner; too low → OSR churn / premature compiles before the
+>   profile is useful) and `CRATONVM_JIT_THRESHOLD` (the existing default-path
+>   invocation knob). Retune on a quiet machine by sweeping these against the
+>   gauntlet's startup-vs-throughput trade-off; the defaults are intentionally
+>   conservative (interpreter-first) until that data exists.
+>
 > **Increment 5 (Step 5 — precise background OSR) landed.**
 > Builds on increment 4. CratonVM already had fully-working **inline** OSR: every
 > back-edge site does `frame.backward_count += 1; try_osr_with_backoff(…)`, and
@@ -411,6 +459,13 @@ tier instead of by the current ad-hoc gates.
    `real-frame-deopt` dependency the design assumed turned out not to gate this —
    the single-pass OSR works without it. See the increment-5 header above.
 6. **Tune thresholds** on the gauntlet; expose `CRATONVM_TIER_*` overrides.
+   ✅ **Overrides exposed (increment 6):** `CRATONVM_TIER_C1_THRESHOLD` /
+   `_C2_THRESHOLD` / `_OSR_THRESHOLD` / `_C2_MIN_INVOCATIONS` / `_ENABLED`
+   (policy, via `CompilationPolicy::from_env`) and `CRATONVM_TIER_OSR_BACKEDGE`
+   (the live per-frame OSR trigger). Defaults unchanged (HotSpot-referenced).
+   *Authoritative gauntlet retuning of the defaults is deferred* — it needs a
+   quiet machine for reliable wall-time; the knobs make that a config sweep, not
+   a recompile. See the increment-6 header for tuning guidance.
 7. **Retire** the single fixed-threshold inline path.
 
 ## Risks

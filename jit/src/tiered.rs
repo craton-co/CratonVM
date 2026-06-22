@@ -85,6 +85,57 @@ impl Default for CompilationPolicy {
     }
 }
 
+impl CompilationPolicy {
+    /// wire-tiered-manager Step 6: a [`Default`] policy with `CRATONVM_TIER_*`
+    /// environment overrides applied. HotSpot's defaults are the reference, but
+    /// CratonVM's compile cost differs, so these knobs let the tiered pipeline
+    /// be re-tuned on the app gauntlet without a recompile. Read once at VM init
+    /// (cold path), so it consults the process environment directly.
+    ///
+    /// | env var                            | field                | default |
+    /// |------------------------------------|----------------------|---------|
+    /// | `CRATONVM_TIER_C1_THRESHOLD`       | `c1_threshold`       | 200     |
+    /// | `CRATONVM_TIER_C2_THRESHOLD`       | `c2_threshold`       | 5000    |
+    /// | `CRATONVM_TIER_OSR_THRESHOLD`      | `osr_threshold`      | 10000   |
+    /// | `CRATONVM_TIER_C2_MIN_INVOCATIONS` | `c2_min_invocations` | 1000    |
+    /// | `CRATONVM_TIER_ENABLED=0`          | `tiered_enabled`     | true    |
+    ///
+    /// (The per-frame back-edge OSR trigger — `Frame::should_try_osr` — is a
+    /// separate live knob, `CRATONVM_TIER_OSR_BACKEDGE`, read VM-side because it
+    /// is consulted on the default path too, not only under the tiered manager.)
+    pub fn from_env() -> Self {
+        Self::with_overrides(|name| std::env::var(name).ok())
+    }
+
+    /// Testable core of [`from_env`]: apply the `CRATONVM_TIER_*` overrides
+    /// resolved through `get` (production passes `std::env::var`). Each numeric
+    /// knob is parsed as `u32` and clamped to `>= 1` — a `0` threshold would
+    /// compile/OSR on the first observation, defeating warmup. An absent or
+    /// unparseable value leaves the [`Default`].
+    pub fn with_overrides(get: impl Fn(&str) -> Option<String>) -> Self {
+        let num = |name: &str| -> Option<u32> {
+            get(name)?.trim().parse::<u32>().ok().map(|v| v.max(1))
+        };
+        let mut p = Self::default();
+        if let Some(v) = num("CRATONVM_TIER_C1_THRESHOLD") {
+            p.c1_threshold = v;
+        }
+        if let Some(v) = num("CRATONVM_TIER_C2_THRESHOLD") {
+            p.c2_threshold = v;
+        }
+        if let Some(v) = num("CRATONVM_TIER_OSR_THRESHOLD") {
+            p.osr_threshold = v;
+        }
+        if let Some(v) = num("CRATONVM_TIER_C2_MIN_INVOCATIONS") {
+            p.c2_min_invocations = v;
+        }
+        if let Some(s) = get("CRATONVM_TIER_ENABLED") {
+            p.tiered_enabled = s != "0" && !s.eq_ignore_ascii_case("false");
+        }
+        p
+    }
+}
+
 // ───────────────────────────────────────────────────────────────────────────────
 // MethodKey
 // ───────────────────────────────────────────────────────────────────────────────
@@ -520,6 +571,14 @@ impl TieredCompilationManager {
     /// Create a new manager with the default policy.
     pub fn with_default_policy() -> Self {
         Self::new(CompilationPolicy::default())
+    }
+
+    /// wire-tiered-manager Step 6: create a manager whose policy honors the
+    /// `CRATONVM_TIER_*` environment overrides (see [`CompilationPolicy::from_env`]).
+    /// Used by `SharedVm::new`; an unset environment is identical to
+    /// [`with_default_policy`].
+    pub fn with_env_policy() -> Self {
+        Self::new(CompilationPolicy::from_env())
     }
 
     // ── Invocation / back-edge hooks ─────────────────────────────────────
@@ -1065,6 +1124,42 @@ mod tests {
             "get",
             "(Ljava/lang/Object;)Ljava/lang/Object;",
         )
+    }
+
+    // ── wire-tiered-manager Step 6: CRATONVM_TIER_* policy overrides ─────
+
+    #[test]
+    fn step6_policy_overrides_apply_and_clamp() {
+        use std::collections::HashMap;
+        let env: HashMap<&str, &str> = [
+            ("CRATONVM_TIER_C1_THRESHOLD", "50"),
+            ("CRATONVM_TIER_C2_THRESHOLD", "9000"),
+            ("CRATONVM_TIER_OSR_THRESHOLD", "0"), // clamps to 1
+            ("CRATONVM_TIER_C2_MIN_INVOCATIONS", "garbage"), // ignored → default
+            ("CRATONVM_TIER_ENABLED", "0"),
+        ]
+        .into_iter()
+        .collect();
+        let p = CompilationPolicy::with_overrides(|k| env.get(k).map(|s| s.to_string()));
+        assert_eq!(p.c1_threshold, 50);
+        assert_eq!(p.c2_threshold, 9000);
+        assert_eq!(p.osr_threshold, 1, "0 must clamp to 1, not disable warmup");
+        assert_eq!(
+            p.c2_min_invocations, 1_000,
+            "unparseable value keeps the default"
+        );
+        assert!(!p.tiered_enabled, "CRATONVM_TIER_ENABLED=0 disables tiering");
+    }
+
+    #[test]
+    fn step6_policy_overrides_empty_env_is_default() {
+        let p = CompilationPolicy::with_overrides(|_| None);
+        let d = CompilationPolicy::default();
+        assert_eq!(p.c1_threshold, d.c1_threshold);
+        assert_eq!(p.c2_threshold, d.c2_threshold);
+        assert_eq!(p.osr_threshold, d.osr_threshold);
+        assert_eq!(p.c2_min_invocations, d.c2_min_invocations);
+        assert_eq!(p.tiered_enabled, d.tiered_enabled);
     }
 
     // ── wire-tiered-manager Step 5: request_osr ──────────────────────────

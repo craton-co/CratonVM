@@ -2401,7 +2401,10 @@ impl SharedVm {
             missing_natives_log: parking_lot::Mutex::new(Vec::new()),
             profile_store: ProfileStore::new(),
             jit_skip_set: parking_lot::RwLock::new(FxHashSet::default()),
-            tiered_manager: crate::jit::tiered::TieredCompilationManager::with_default_policy(),
+            // wire-tiered-manager Step 6: honor the CRATONVM_TIER_* threshold
+            // overrides (c1/c2/osr/c2_min/enabled). Identical to the default
+            // policy when the environment is unset.
+            tiered_manager: crate::jit::tiered::TieredCompilationManager::with_env_policy(),
             deopt_log: parking_lot::Mutex::new(crate::jit::deopt::DeoptimizationLog::new()),
             method_epochs: parking_lot::RwLock::new(FxHashMap::default()),
             invalidation_manager: parking_lot::Mutex::new(
