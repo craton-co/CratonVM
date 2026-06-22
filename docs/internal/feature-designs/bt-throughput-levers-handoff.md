@@ -3,6 +3,22 @@
 Status: **two codegen levers landed on dev** (2026-06-22); the remaining gap is
 architectural. NOT pushed.
 
+> **UPDATE 2026-06-22 — architectural lever #1 (compact reference-field layout)
+> implemented + validated** on branch `feat/compact-ref-fields` (worktree
+> `CratonVM-movingyoung`), gated **`CRATONVM_COMPACT_REF_FIELDS`** default-OFF;
+> flag-off byte-identical to dev. Reference instance fields are now stored as
+> bare 8-byte pointers (oop-map + per-class layout registry in `cratonvm-types`;
+> GC scan/remap, heap accessors, and JIT helpers all compact-aware). **Correct:**
+> bt10/14/16/18 + GC_STRESS + a HashMap/ArrayList/inheritance mix all ==
+> HotSpot. **Footprint:** TreeNode 56 B vs 72 B, one fewer young GC at bt18.
+> **Throughput:** currently ~18 % *slower* at bt18 because the compact JIT path
+> routes field access + alloc through the helpers (inline codegen disabled under
+> the flag) with a per-access layout lookup — bt is barely GC-bound so that
+> dwarfs the footprint saving. **Next lever to monetize it: compact-aware inline
+> codegen** (bake the per-field compact offset into `field_info` at resolve
+> time, emit inline 8-byte ref load/store + compact-size inline TLAB). See
+> [`compact-ref-field-layout.md`](../../feature-designs/compact-ref-field-layout.md).
+
 Context: the object-`binarytrees` (bt) throughput gap vs HotSpot. The
 long-standing "make a moving young gen the default" plan
 ([`default-moving-young-gen.md`](../../feature-designs/default-moving-young-gen.md))

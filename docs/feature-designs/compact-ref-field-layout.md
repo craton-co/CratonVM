@@ -148,6 +148,34 @@ Build `cvmcref.exe` (unique name). Oracle harness (checksums == HotSpot):
 - `CtorTest`, `CollSmall`/`CollTest`.
 - Measure node size (56 vs 72) and bt throughput delta.
 
+## Validation results (2026-06-22, `cvmcref.exe`)
+
+**Correctness — all == HotSpot golden, compact ON and OFF, JIT on:**
+- binarytrees bt10=135854, bt14=3222190, bt16=14985902, bt18=68332206.
+- bt16 under `CRATONVM_GC_STRESS` = 14985902.
+- Mix (HashMap + ArrayList + inheritance + long/double/object fields) ==
+  HotSpot (199990002100158883), incl. GC_STRESS.
+- stdout/collections work (after the two compat fixes below).
+
+**Footprint — confirmed reduced:** `TreeNode` body 2×8 = 16 B vs 2×16 = 32 B
+(object 56 B vs 72 B). bt18 runs **one fewer young GC** with compact on
+(`CRATONVM_SP_STATS`: 3 collections vs 4).
+
+**Throughput — currently slower, as expected:** bt18 min-of-3 = **48.1 s OFF
+vs 56.6 s ON (~18 % slower)**. Cause: the compact JIT path currently routes
+field access + allocation through the **helpers** (inline emission disabled
+under the flag), and each helper does a per-access layout lookup
+(`compact_field_slot` → `RwLock` read + `Arc` clone). bt is barely GC-bound at
+8 GB (evac≈0), so that per-op overhead dwarfs the one-GC footprint saving.
+
+**→ Next lever (required to monetize the footprint win): compact-aware inline
+codegen.** Bake the per-field compact byte offset + ref-ness into `field_info`
+at resolve time (the offset is hierarchy-invariant under the prefix-sum layout,
+so the declaring class's layout suffices), then emit the inline 8-byte ref
+load/store + the compact-size inline TLAB directly — no helper call, no runtime
+lookup. That removes both overheads, after which the smaller objects should net
+faster (and increasingly so as heap pressure / GC fraction rises).
+
 ## Gotcha: synthetic objects that store the wrong type into a reference slot
 
 The legacy 16-byte tagged cell can hold *any* `Value` regardless of the field's
