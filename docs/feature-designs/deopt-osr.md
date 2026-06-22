@@ -1,8 +1,14 @@
 # Real-frame deoptimization + precise OSR (entry *and* exit)
 
-Status: design / partially-landed prerequisites. Effort: **XL**, decomposed
-below. This doc is the joining piece between two efforts that already exist in
-the tree but stop short of each other:
+Status: **LANDED on dev (2026-06-22), gated default-off** (`CRATONVM_DEOPT_REAL`,
+gate-off byte-identical). Steps 1–9, Workstreams A & B, the cat-2/FP resume (P2),
+and the `CRATONVM_DEOPT_VERIFY` structural/oop verifier are all on dev. Remaining
+(non-blocking follow-ups): the eager-deopt **value** differential + end-to-end BCE
+runtime test (infra-blocked — read-once gates + forced-deopt codegen; see the
+handoff doc), cat-2/FP **OSR-exit** transfer, register-resident oop typing, and the
+`CRATONVM_JIT_FREE_CODE=1` in-stub epoch check. Effort was **XL**, decomposed
+below. This doc is the joining piece between two efforts that already existed in
+the tree but stopped short of each other:
 
 1. **Real-frame deopt** — reconstruct a precise interpreter frame at the
    trapping bci instead of re-running the method from bci 0. The *mechanism*
