@@ -734,6 +734,29 @@ fn dbg_fullstack_scan() -> bool {
     *ON.get_or_init(|| std::env::var_os("CRATONVM_DBG_FULLSTACK_SCAN").is_some())
 }
 
+/// A5 fix — scan this thread's native stack band `[lo, hi)` for any word that is
+/// an address inside a live JIT code range (`cratonvm_jit::lookup_jit_code_range`),
+/// i.e. a return address into compiled code. A hit proves a JIT method's frame
+/// is on the stack even if it pushed no `JitEntryGuard`. Early-exits on the
+/// first hit. Bounded like [`scan_one_frame`] so a stale `hi` cannot run into
+/// unmapped pages.
+#[cfg(target_os = "windows")]
+fn native_stack_has_jit_frame(lo: usize, hi: usize) -> bool {
+    let mut addr = (lo + 7) & !7usize;
+    const MAX_SCAN_BYTES: usize = 8 * 1024 * 1024;
+    let hi = hi.min(addr.saturating_add(MAX_SCAN_BYTES));
+    while addr + 8 <= hi {
+        // SAFETY: aligned read inside the calling thread's own live stack band
+        // between two known stack pointers (same contract as `scan_one_frame`).
+        let w = unsafe { (addr as *const usize).read() };
+        if cratonvm_jit::lookup_jit_code_range(w).is_some() {
+            return true;
+        }
+        addr += 8;
+    }
+    false
+}
+
 /// Returns true if any thread anywhere in the process is currently inside a
 /// JIT call. Used by the GC to decide whether compaction is safe.
 #[inline]
@@ -950,6 +973,35 @@ pub fn scan_active_jit_frames(heap: &VmHeap, out: &mut Vec<ObjectRef>) {
     }
     let chain_len = JIT_ENTRY_CHAIN.with(|c| c.borrow().len());
     if chain_len == 0 {
+        // A5 fix — UNREGISTERED JIT frame. The `JIT_ENTRY_CHAIN` is empty, but a
+        // JIT method can still be live on this thread's native stack WITHOUT
+        // having pushed a `JitEntryGuard`: the process entry point (`Vm::invoke`
+        // → app `main`, compiled) is the canonical case, and it can be on the
+        // stack while a clinit / interpreted callee runs and triggers a GC. With
+        // `is_active()` false the generational collector picks the MOVING young
+        // collector, which relocates that frame's live objects and cannot
+        // rewrite its raw (register/spill) stack slots → stale all-zero-header
+        // receiver (the `main`-compiled bintrees corruption — repro
+        // `docs/known-issues/.../gc-stress-bintrees-object-main-args-...`).
+        //
+        // Detect it by finding a JIT code address among the native stack words
+        // (a return address into compiled code). When present: conservatively
+        // scan the whole native stack (MARK the frame's oops via
+        // `is_object_address`) AND flag the collector to run the NON-MOVING sweep
+        // (so those oops are pinned, not relocated, keeping the unscannable raw
+        // slots valid). Cheap-gated: only when ≥1 method is compiled, and only on
+        // the (already slow) GC root-scan path. Windows-only for now: it reuses
+        // `current_thread_stack_high` (the same gate the full-stack diagnostic
+        // uses); the generational moving collector is the default on every
+        // platform, so the non-Windows port is a tracked follow-up.
+        #[cfg(target_os = "windows")]
+        if cratonvm_jit::jit_code_range_count() > 0 {
+            let high = current_thread_stack_high();
+            if high > scanner_sp && native_stack_has_jit_frame(scanner_sp, high) {
+                scan_one_frame(scanner_sp, high, heap, out);
+                cratonvm_gc::gc_quiescence::set_unregistered_jit_frame_on_stack();
+            }
+        }
         // Cross-thread JIT-root gap detector: this thread has no live JIT
         // frames, so this thread-local scan contributes nothing — but if some
         // OTHER thread is in JIT, and this scan is part of a peer-triggered STW
