@@ -371,7 +371,6 @@ supplier/accumulator/finisher/combiner). The **open** ones documented here:
 - [SC-annotation-introspection-family.md](SC-annotation-introspection-family.md) — Bug A (Class-attr TypeNotPresent, blocked on classloader), Bug C (enclosing-class scan traversal), Bug D (relies on HotSpot `getDeclaredMethods` ordering — not cleanly fixable). Bug B FIXED on dev.
 - [SC-env-classreading.md](SC-env-classreading.md) — getenv/getProperties identity; `Object.equals` shadows overrides (`precedenceOf`=-1); `int.class` via classreading; custom-CL `getResourceAsStream`.
 - [SC-resource-io-family.md](SC-resource-io-family.md) — NIO write-channel stub, `Path.toUri()` authority; several FileNotFoundExceptions are harness-CWD artifacts.
-- [SC-aot-runtimehints-resource-count.md](SC-aot-runtimehints-resource-count.md) — RuntimeHints resource glob count (8 vs 5).
 - [SC-stax-xml-family.md](SC-stax-xml-family.md) — namespace SAX-event-sequence mismatch (cursor natives + element prefix already fixed on dev).
 - [SC-task-retry-util-misc.md](SC-task-retry-util-misc.md) — Properties.store #date line, Throwable deser, retry timing, ByteBuddy ClassInjector, AQS throttle.
 - [SC-misc-core-spring.md](SC-misc-core-spring.md) — SortedProperties OutputStream store (CHM.remove(null) fixed on dev).
