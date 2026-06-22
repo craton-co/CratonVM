@@ -477,8 +477,28 @@ Author note: this doc is grounded in a read of `gc/src/{g1,g1_concurrent,zgc,zgc
     work-stealing-deque upgrade if shared-queue contention is measured to matter.
     Flipping the flag default-on (with a demonstrated large-heap throughput win) is
     part of Step 10.
+- **CENTRAL GAP — G1 concurrent marking + mixed GC are NON-FUNCTIONAL** (root of
+  the footprint gap; blocks any old-gen reclaim short of full GC). Driving the
+  now-wired `-XX:` knobs to force a mixed cycle revealed three distinct bugs:
+  (A) `collect_garbage` prematurely flips the phase to ConcurrentMark (activating
+  SATB, no marker) → the VM's real `maybe_concurrent_gc` gate
+  (`should_start && !is_marking_active`) is blocked → **marking never starts**;
+  (B) the marker worker parks (stays `is_running`) at a fixed point and only
+  exits on `request_stop`, but `g1_concurrent_mark_finished` polls `!is_running`
+  and `request_stop` is only issued after completion → **marking never completes
+  (deadlock)**; (C) with A+B fixed, mixed GC fires but **drops live objects**
+  (`copied=3`, V7b≈72k dangling) — a selected old region's remembered set lacks
+  its old→old and humongous→old sources, and `scan_source_region` can't walk a
+  humongous source (object > region). A+B are fixed and preserved on
+  `feat/g1-marking-wip` (NOT merged — shipping them without C enables a
+  corrupting mixed GC); C is non-trivial and the never-exercised mixed path
+  likely hides further bugs. Repro: `scratch/g1par/PromoteMixed.java` with
+  `-XX:InitiatingHeapOccupancyPercent=5 -XX:MaxGCPauseMillis=1 --nojit`. Making
+  marking + mixed GC actually work is a **feature-sized effort** and the real
+  prerequisite for Step 8 pause/throughput and Step 10 — not a quick follow-up.
 - Step 10 (default flip) — not started; gated on a clean gauntlet (Step 8) +
-  pause/throughput within band + a sustained soak (§5).
+  pause/throughput within band + a sustained soak (§5), and now also on the
+  marking/mixed-GC repair above (without mixed GC, G1 cannot reclaim old gen).
 
 ---
 
