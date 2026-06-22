@@ -148,8 +148,33 @@ Build `cvmcref.exe` (unique name). Oracle harness (checksums == HotSpot):
 - `CtorTest`, `CollSmall`/`CollTest`.
 - Measure node size (56 vs 72) and bt throughput delta.
 
+## Stage 5 — observability (deferred, non-critical)
+
+HPROF instance dump (`serviceability.rs`) and the field-watch corruption
+detector (`ec_watch.rs`) still assume the uniform 16-byte cell layout under the
+compact flag. Both are **safe** (no crash / no heap corruption) — HPROF's
+`slot_offset + N <= total_size` bounds check fails closed (reads 0 for an
+out-of-range compact offset), and ec_watch reads within the always-mapped
+arena — they are merely **inaccurate** for compact objects (heap dumps show
+wrong field values; the debug `CRATONVM_DBG_BADREF` watcher checks the wrong
+offset). Both are debug/observability features (HPROF dumps, JVMTI/debug
+watch), off by default, with no effect on execution, GC, or bt checksums.
+Making them compact-aware is a follow-up (use `class_layout` for the packed
+offset + 8-byte ref read). NB: the HPROF field-value reads were already
+approximate before this work (they read the cell start, not the `Value`
+payload offsets).
+
 ## Residuals / future
 
+- The **opt-in IR JIT backend** (`CRATONVM_JIT_IR_*`) bails to single-pass for
+  getfield/putfield/new under the compact flag (it bakes
+  `HEADER+index*SLOT_SIZE` displacements). Native compact codegen for the IR
+  tier is future work.
+- The JIT field/alloc path under compact uses the **helper** path (no inline
+  field store / inline-TLAB), so it is correct but not yet as fast as a
+  compact-aware inline emitter — the next perf lever once correctness is soaked.
+- Debug-flag-gated GC diagnostics (`rset-audit`, `small4`, `seedhunt`) still
+  tag-scan compact objects (wrong logging only).
 - Slice (2): compact **primitive** fields to natural width (needs descriptor at
   every read — bigger).
 - Slice (3): full HotSpot-style packed header + typed fields.
