@@ -1864,6 +1864,26 @@ pub fn precise_jit_maps_enabled() -> bool {
     *G.get_or_init(|| std::env::var_os("CRATONVM_NO_PRECISE_JIT_MAPS").is_none())
 }
 
+/// Opt-IN inline reference-`putfield` fast path (`CRATONVM_JIT_INLINE_PUTFIELD`).
+///
+/// When on, a `putfield` of a reference field emits an inline 16-byte `Value`
+/// store INSTEAD of the `jit_putfield_object` helper CALL — but ONLY on the
+/// barrier-free fast path: the target object is in the YOUNG generation
+/// (`gc_flags & GC_FLAG_OLD_GEN == 0` → no generational card needed) AND the
+/// field's OLD value is null (`payload == 0` → no SATB snapshot to preserve,
+/// regardless of concurrent-marking state). Any other case (null receiver,
+/// old-gen receiver, non-null old value, out-of-bounds index) bails to the
+/// existing, validated `jit_putfield_object` helper, which performs the full
+/// SATB pre-barrier + card-marking write-barrier. This is the canonical
+/// fresh-object-initialisation pattern (`n.left = newChild`) that dominates
+/// allocation-heavy code (object binarytrees). DEFAULT-OFF pending GC-stress
+/// validation; opt in with `CRATONVM_JIT_INLINE_PUTFIELD`.
+pub fn inline_putfield_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| std::env::var_os("CRATONVM_JIT_INLINE_PUTFIELD").is_some())
+}
+
 /// Step 1 of `docs/feature-designs/precise-jit-maps-default.md` — opt-IN
 /// **inline** frame-record. When on (and precise maps are on, and the OS TLS
 /// probe in [`inline_rbp_tls_disp`] succeeds), the JIT prologue stores RBP
@@ -18193,24 +18213,86 @@ impl Compiler {
                         let val_slot = self.pop_stack();
                         let obj_slot = self.pop_stack();
                         if type_tag == b'L' || type_tag == b'[' {
-                            // TODO (R20 follow-up): inline this store. Blocked on the
-                            // field-storage layout — Java object fields are stored as
-                            // the 16-byte Rust enum `Value` (tag + payload, repr is
-                            // implementation-defined), not a compact 8-byte pointer like
-                            // the Object[] array layout used by aastore. A safe inline
-                            // store would need either:
-                            //   (a) a `#[repr(C, u8)]` or stable-layout commitment on
-                            //       `Value`, plus emitting both halves (tag byte + ptr
-                            //       qword) at the field offset; or
-                            //   (b) migrating reference fields to a compact pointer
-                            //       layout (parallel to the array compact layout).
-                            // Neither is in scope here, so keep the helper call. This is
-                            // the higher-value half of HIGH-5 and remains a known gap.
-                            self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
-                            self.load_slot_to_reg(ARG_REGS[1], obj_slot);
-                            self.emit_mov_imm32_sx(ARG_REGS[2], field_index as i32); // Cast: x86-64 immediate encoding
-                            self.load_slot_to_reg(ARG_REGS[3], val_slot);
-                            self.emit_call_absolute(self.helpers.putfield_object);
+                            // HIGH-5 / R20: inline the reference-field store on the
+                            // barrier-free fast path (CRATONVM_JIT_INLINE_PUTFIELD).
+                            // The field cell is the 16-byte `Value` enum: tag dword
+                            // (`Value::Object` == 4) at FIELD_CELL_TAG_OFFSET, raw
+                            // pointer payload at FIELD_CELL_PAYLOAD64_OFFSET. We emit
+                            // the store directly ONLY when no GC barrier is required:
+                            //   * receiver non-null;
+                            //   * receiver YOUNG (`gc_flags & GC_FLAG_OLD_GEN == 0`,
+                            //     header byte @21) → no generational card needed;
+                            //   * field's OLD value null (payload @cell+8 == 0) → no
+                            //     SATB snapshot to preserve, regardless of marking;
+                            //   * index in bounds (`num_slots`, header u32 @16).
+                            // Every other case bails to `jit_putfield_object`, which
+                            // performs the full SATB pre-barrier + card write-barrier.
+                            // This is the fresh-init pattern (`n.left = newChild`) that
+                            // dominates allocation-heavy code. Off ⇒ helper as before.
+                            if inline_putfield_enabled() {
+                                let cell_off = (HEADER_SIZE + field_index * SLOT_SIZE) as i32; // Cast: x86-64 disp32
+                                let mut bail: Vec<usize> = Vec::new();
+                                // obj → RAX
+                                self.load_slot_to_reg(RAX, obj_slot);
+                                // null receiver → helper (matches the helper's no-op).
+                                self.emit_test_r64_r64(RAX);
+                                bail.push(self.emit_jcc_rel32_patch(0x84)); // JZ
+                                // old-gen receiver → helper (card barrier). gc_flags is
+                                // the byte at header offset 21; GC_FLAG_OLD_GEN == bit 0.
+                                self.emit_mov_r32_mem_disp32(RCX, RAX, 21);
+                                self.emit_and_r64_imm8(RCX, 1);
+                                bail.push(self.emit_jcc_rel32_patch(0x85)); // JNZ old-gen
+                                // non-null OLD value → helper (SATB). Read the cell's
+                                // 8-byte payload; a null old value never needs SATB.
+                                self.emit_mov_r64_mem_disp32(
+                                    RCX,
+                                    RAX,
+                                    cell_off + FIELD_CELL_PAYLOAD64_OFFSET as i32, // Cast: layout offset → disp32
+                                );
+                                self.emit_test_r64_r64(RCX);
+                                bail.push(self.emit_jcc_rel32_patch(0x85)); // JNZ non-null old
+                                // bounds: field_index < num_slots (header u32 @16).
+                                // 32-bit compare — an 8-byte read would fold in the
+                                // adjacent gc_age/gc_flags bytes.
+                                self.emit_mov_r32_mem_disp32(RCX, RAX, 16); // RCX = num_slots
+                                self.emit_mov_imm64(RDX, field_index as i64); // RDX = field_index
+                                self.emit_cmp_r32_r32(RDX, RCX); // cmp field_index, num_slots
+                                let oob = self.emit_jcc_rel32_patch(0x83); // JAE → out of bounds, drop
+                                // FAST STORE. tag dword = 4 (+ zeroed pad dword) via a
+                                // sign-extended imm32 qword store; payload = value.
+                                self.emit_mov_imm64(RCX, 4);
+                                self.emit_mov_mem_disp32_r64(
+                                    RAX,
+                                    RCX,
+                                    cell_off + FIELD_CELL_TAG_OFFSET as i32, // Cast: layout offset → disp32
+                                );
+                                self.load_slot_to_reg(RDX, val_slot);
+                                self.emit_mov_mem_disp32_r64(
+                                    RAX,
+                                    RDX,
+                                    cell_off + FIELD_CELL_PAYLOAD64_OFFSET as i32, // Cast: layout offset → disp32
+                                );
+                                let done = self.emit_jmp_rel32_patch();
+                                // --- helper fallback (full barriers) ---
+                                for b in bail {
+                                    self.patch_rel32_to_here(b);
+                                }
+                                self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
+                                self.load_slot_to_reg(ARG_REGS[1], obj_slot);
+                                self.emit_mov_imm32_sx(ARG_REGS[2], field_index as i32); // Cast: x86-64 immediate encoding
+                                self.load_slot_to_reg(ARG_REGS[3], val_slot);
+                                self.emit_call_absolute(self.helpers.putfield_object);
+                                // join: the out-of-bounds skip and the post-store jump
+                                // both land here (after the helper).
+                                self.patch_rel32_to_here(oob);
+                                self.patch_rel32_to_here(done);
+                            } else {
+                                self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
+                                self.load_slot_to_reg(ARG_REGS[1], obj_slot);
+                                self.emit_mov_imm32_sx(ARG_REGS[2], field_index as i32); // Cast: x86-64 immediate encoding
+                                self.load_slot_to_reg(ARG_REGS[3], val_slot);
+                                self.emit_call_absolute(self.helpers.putfield_object);
+                            }
                         } else {
                             self.load_slot_to_reg(ARG_REGS[0], obj_slot);
                             self.emit_mov_imm32_sx(ARG_REGS[1], field_index as i32); // Cast: x86-64 immediate encoding
