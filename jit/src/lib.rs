@@ -4770,6 +4770,27 @@ fn try_compile_inner(
                                 break;
                             }
                         };
+                        // fib44 perf-regression fix. `static_call_shape` admitting a
+                        // wide (`J`/`D`/`F`) RETURN (inc-29/32/33) let a SELF-RECURSIVE
+                        // long/FP method lower its recursive call to an IR `Op::Call`,
+                        // which is routed through the generic `jit_invoke_dispatch`
+                        // runtime helper on EVERY invocation. Single-pass instead emits
+                        // a DIRECT call to this method's own compiled entry — far cheaper
+                        // for a hot recursive method (`static long fib(int)`: ~8.6x; the
+                        // dispatch helper does note_jit_boundary + SATB flush + a
+                        // native-stack recursion guard per call). Keep such methods on
+                        // single-pass: when the resolved callee IS this method and the
+                        // return is wide, mark the body non-emittable so it bails. The
+                        // intended unblock — CROSS-method wide-return calls (e.g.
+                        // `Pack.bigEndianToLong`) — is non-self-recursive and unaffected.
+                        if matches!(ret, b'J' | b'D' | b'F')
+                            && cn.as_str() == &*cached.class_name
+                            && mn.as_str() == &*cached.method_name
+                            && desc.as_str() == &*cached.method_descriptor
+                        {
+                            all_emittable = false;
+                            break;
+                        }
                         // Every kind except `invokestatic` marshals the receiver
                         // as arg0 (a reference → one GPR slot), so it carries one
                         // more JIT arg than its descriptor lists. `invoke_kind`
