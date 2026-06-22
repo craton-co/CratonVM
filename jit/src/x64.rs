@@ -1858,6 +1858,154 @@ pub fn precise_jit_maps_enabled() -> bool {
     *G.get_or_init(|| std::env::var_os("CRATONVM_NO_PRECISE_JIT_MAPS").is_none())
 }
 
+/// Step 1 of `docs/feature-designs/precise-jit-maps-default.md` — opt-IN
+/// **inline** frame-record. When on (and precise maps are on, and the OS TLS
+/// probe in [`inline_rbp_tls_disp`] succeeds), the JIT prologue stores RBP
+/// straight into the precise-maps innermost-RBP mirror with a single
+/// `mov gs:[disp], rbp` instead of `call jit_frame_record`. This removes the
+/// per-invocation CALL that is the residual ~1.68× call-heavy regression after
+/// the thread-local cache (`82cf85e9`) already cut the helper body cost.
+///
+/// **DEFAULT ON** (Step 2 flip, 2026-06-21; opt out with
+/// `CRATONVM_NO_PRECISE_INLINE_FRAME_RECORD`). Validated on the inlined path:
+/// bintrees10/14/16/18 == HotSpot, fib44 ~1.68× faster than the CALL path, and
+/// the `CRATONVM_DBG_VERIFY_INLINE_FRAME_RECORD` self-check is clean (0
+/// mismatches over billions of fib44 invocations). Off → the existing
+/// `call jit_frame_record` is emitted (the pre-Step-1 default). Only meaningful
+/// with precise maps on (otherwise there is no frame-record at all), so it is
+/// anded with [`precise_jit_maps_enabled`]. On non-Windows / on a failed TLS
+/// probe, [`inline_rbp_tls_disp`] returns 0 and the CALL path is used even when
+/// this is on, so the flip is a safe no-op there.
+pub fn precise_inline_frame_record_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        precise_jit_maps_enabled()
+            && std::env::var_os("CRATONVM_NO_PRECISE_INLINE_FRAME_RECORD").is_none()
+    })
+}
+
+/// Debug self-check (`CRATONVM_DBG_VERIFY_INLINE_FRAME_RECORD`): when on AND
+/// inline frame-record is active, the prologue emits the inline store **and** a
+/// call to the verify helper (wired into the `frame_record` slot by
+/// `build_helpers`) which reads the mirror back and asserts it equals RBP —
+/// proving the inlined store lands exactly where the Rust GC side reads it.
+/// Default off; pure validation aid, no behaviour change to the mirror value.
+pub fn verify_inline_frame_record_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| std::env::var_os("CRATONVM_DBG_VERIFY_INLINE_FRAME_RECORD").is_some())
+}
+
+/// Step 1 — the GS-relative byte displacement of the Windows TLS slot that
+/// backs the precise-maps innermost-RBP mirror, or `0` when inline
+/// frame-record is disabled or unavailable. This is the **single source of
+/// truth** shared by the JIT codegen (which bakes `mov gs:[disp], rbp`) and the
+/// VM-side mirror accessor in `vm/src/jit/conservative_roots.rs` (which
+/// reads/writes the same slot). Computed once, cached for the process.
+///
+/// Windows x86-64 stores the 64 static TLS slots in the TEB at offset `0x1480`
+/// (`TlsSlots`), reachable as `gs:[0x1480 + slot*8]`. We `TlsAlloc` a slot,
+/// write a unique 64-bit sentinel through the documented `TlsSetValue` API,
+/// then read it back through the candidate `gs:[disp]` to **prove** the
+/// displacement before trusting it (with a fallback scan of the static band in
+/// case the base constant differs). If the probe fails (slot ≥ 64, unexpected
+/// TEB layout, or non-Windows), it returns `0` → the CALL path is used. A wrong
+/// assumption therefore degrades to the existing safe behaviour, never to a
+/// silently mis-tracked mirror (the risk the design doc flags).
+#[cfg(windows)]
+pub fn inline_rbp_tls_disp() -> usize {
+    use std::sync::OnceLock;
+    static DISP: OnceLock<usize> = OnceLock::new();
+    *DISP.get_or_init(|| {
+        if !precise_inline_frame_record_enabled() {
+            return 0;
+        }
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn TlsAlloc() -> u32;
+            fn TlsSetValue(idx: u32, val: *mut core::ffi::c_void) -> i32;
+        }
+        const TLS_OUT_OF_INDEXES: u32 = 0xFFFF_FFFF;
+        // TEB.TlsSlots[64] on x86-64. The probe below validates this, so an
+        // incorrect constant disables inline rather than corrupting.
+        const TEB_TLS_SLOTS_OFF: usize = 0x1480;
+        // SAFETY: TlsAlloc/TlsSetValue are the documented Win32 TLS APIs;
+        // read_gs_qword reads an 8-byte aligned TEB slot we just wrote.
+        let disp = unsafe {
+            'probe: {
+                let slot = TlsAlloc();
+                if slot == TLS_OUT_OF_INDEXES {
+                    break 'probe 0;
+                }
+                // Non-canonical, slot-tagged sentinel (high bits set so it
+                // cannot be mistaken for a real RBP or a small int in a
+                // neighbour slot).
+                let sentinel: usize = 0x5247_4250_4D52_0000 | (slot as usize & 0xFFFF);
+                if TlsSetValue(slot, sentinel as *mut core::ffi::c_void) == 0 {
+                    break 'probe 0;
+                }
+                let candidate = TEB_TLS_SLOTS_OFF + (slot as usize) * 8;
+                if read_gs_qword(candidate) == sentinel {
+                    // Reset the slot to 0 (matches the mirror's initial value);
+                    // all other threads already see 0 at a fresh index.
+                    TlsSetValue(slot, core::ptr::null_mut());
+                    break 'probe candidate;
+                }
+                // Fallback: scan the static 64-slot band for the sentinel in
+                // case the base constant differs on this Windows build.
+                let mut d = TEB_TLS_SLOTS_OFF;
+                let end = TEB_TLS_SLOTS_OFF + 64 * 8;
+                while d < end {
+                    if read_gs_qword(d) == sentinel {
+                        TlsSetValue(slot, core::ptr::null_mut());
+                        break 'probe d;
+                    }
+                    d += 8;
+                }
+                // Probe failed → leave inline disabled (CALL path).
+                TlsSetValue(slot, core::ptr::null_mut());
+                0
+            }
+        };
+        // One-time visibility line, gated behind CRATONVM_DBG_INLINE_FR so the
+        // (now default-on) path stays silent unless explicitly diagnosing.
+        if std::env::var_os("CRATONVM_DBG_INLINE_FR").is_some() {
+            if disp != 0 {
+                eprintln!(
+                    "[INLINE-FR] inline frame-record ENABLED: storing RBP via mov gs:[{:#x}]",
+                    disp
+                );
+            } else {
+                eprintln!("[INLINE-FR] inline frame-record probe FAILED — using CALL path");
+            }
+        }
+        disp
+    })
+}
+
+/// Non-Windows: inline frame-record is unsupported (the single-instruction
+/// store relies on the Windows TEB TLS layout); always return 0 → CALL path.
+#[cfg(not(windows))]
+pub fn inline_rbp_tls_disp() -> usize {
+    0
+}
+
+/// Read the 8-byte value at `gs:[disp]` (Windows TEB-relative). Used only by
+/// the [`inline_rbp_tls_disp`] startup probe.
+#[cfg(windows)]
+#[inline]
+unsafe fn read_gs_qword(disp: usize) -> usize {
+    let val: usize;
+    core::arch::asm!(
+        "mov {out}, qword ptr gs:[{addr}]",
+        out = out(reg) val,
+        addr = in(reg) disp,
+        options(nostack, preserves_flags, readonly),
+    );
+    val
+}
+
 /// Whether the JIT **shadow-stack** precise-roots codegen is enabled
 /// (`CRATONVM_SHADOW_STACK`). When on, each GC-capable safepoint pushes every
 /// live oop (operand-stack entries AND oop locals) onto the thread's shadow
@@ -6087,6 +6235,15 @@ struct Compiler {
     /// (gate `CRATONVM_PRECISE_JIT_MAPS`). Gates the prologue frame-record
     /// call and the per-safepoint id store. Off → byte-identical default path.
     precise_maps: bool,
+    /// Step 1 (`precise-jit-maps-default.md`) — GS-relative TLS displacement of
+    /// the innermost-RBP mirror slot, or 0 when inline frame-record is off /
+    /// unavailable. Non-zero → the prologue emits `mov gs:[disp], rbp` instead
+    /// of `call jit_frame_record`. Cached from `inline_rbp_tls_disp()` at
+    /// construction so codegen reads it once.
+    inline_rbp_tls_disp: usize,
+    /// Step 1 debug self-check (`CRATONVM_DBG_VERIFY_INLINE_FRAME_RECORD`) —
+    /// when set AND inline frame-record is active, also emit the verify call.
+    verify_inline_frame_record: bool,
     /// Stage 3 — frame offset (positive; slot at `[rbp - sp_id_slot_off]`) of
     /// the reserved safepoint-id slot. 0 when `precise_maps` is off.
     sp_id_slot_off: i32,
@@ -6399,6 +6556,10 @@ impl Compiler {
         // call so the GC root walker can recover the exact oop map. Off by
         // default → no slot reserved → frame layout byte-identical.
         let precise_maps = precise_jit_maps_enabled();
+        // Step 1 (inline frame-record) — cache the validated TLS displacement
+        // (0 when the opt-in flag is off or the OS probe failed → CALL path).
+        let inline_rbp_tls_disp = if precise_maps { inline_rbp_tls_disp() } else { 0 };
+        let verify_inline_frame_record = verify_inline_frame_record_enabled();
         let shadow_enabled = shadow_stack_maps_enabled();
         // SB-CRASH-04 (register-invisibility): blind-spill used callee-saved
         // GPRs into reserved frame slots at every GC-capable safepoint so the
@@ -6660,6 +6821,8 @@ impl Compiler {
             local_oop_reached: Vec::new(),
             cur_bc_pc: 0,
             precise_maps,
+            inline_rbp_tls_disp,
+            verify_inline_frame_record,
             sp_id_slot_off,
             safepoint_reg_spill,
             safepoint_reg_spill_all,
@@ -10494,9 +10657,30 @@ impl Compiler {
         // them. RBP → ABI arg0; the helper records it into the top JIT chain
         // entry. Gated off by default (zero default-path cost), and skipped if
         // the helper pointer isn't wired.
+        // Frame-record recording is "configured" iff the helper pointer is
+        // wired (`build_helpers` sets it whenever precise maps are on). Gate
+        // BOTH the inline and CALL forms on that single signal so a context
+        // without a wired helper (e.g. the JIT unit tests, `frame_record == 0`)
+        // emits neither — keeping those byte-golden even with inline default-on.
         if self.precise_maps && self.helpers.frame_record != 0 {
-            self.emit_mov_reg_reg(ARG_REGS[0], RBP);
-            self.emit_call_absolute(self.helpers.frame_record);
+            if self.inline_rbp_tls_disp != 0 {
+                // Step 1 (inline frame-record) — store RBP straight into the
+                // mirror TLS slot with one `mov gs:[disp], rbp`, no CALL. The
+                // VM-side mirror accessor reads the SAME slot (single source of
+                // truth via `inline_rbp_tls_disp()`), so the GC root walk sees
+                // the innermost RBP exactly as with the helper path.
+                self.emit_mov_gs_disp32_rbp(self.inline_rbp_tls_disp as u32);
+                // Debug self-check: also call the verify helper (wired into
+                // `frame_record` by `build_helpers` when the knob is on), which
+                // reads the slot back and asserts it equals RBP.
+                if self.verify_inline_frame_record {
+                    self.emit_mov_reg_reg(ARG_REGS[0], RBP);
+                    self.emit_call_absolute(self.helpers.frame_record);
+                }
+            } else {
+                self.emit_mov_reg_reg(ARG_REGS[0], RBP);
+                self.emit_call_absolute(self.helpers.frame_record);
+            }
         }
 
         // Shadow-stack precise roots — cache this invocation's `*mut JvmThread`
@@ -10724,6 +10908,27 @@ impl Compiler {
             // (no patch tracking required).
             self.emit_call_imm64_via_rax(addr);
         }
+    }
+
+    /// Step 1 (inline frame-record) — emit `MOV gs:[disp32], RBP`, the single
+    /// instruction that stores RBP straight into the precise-maps innermost-RBP
+    /// mirror TLS slot, replacing `call jit_frame_record`. `disp32` is the
+    /// GS-relative byte displacement from [`inline_rbp_tls_disp`].
+    ///
+    /// Encoding (9 bytes): `65 48 89 2C 25 <disp32-le>`
+    ///   * `65`       — GS segment override prefix.
+    ///   * `48`       — REX.W (64-bit operand).
+    ///   * `89`       — MOV r/m64, r64.
+    ///   * `2C`       — ModRM mod=00 reg=RBP(5) r/m=100(SIB).
+    ///   * `25`       — SIB scale=0 index=none(4) base=none(5) → [disp32].
+    ///   * `disp32`   — absolute displacement; effective address = GS_base+disp.
+    fn emit_mov_gs_disp32_rbp(&mut self, disp32: u32) {
+        self.buf.emit_byte(0x65); // GS prefix
+        self.buf.emit_byte(0x48); // REX.W
+        self.buf.emit_byte(0x89); // MOV r/m64, r64
+        self.buf.emit_byte(0x2C); // ModRM: reg=RBP, r/m=SIB
+        self.buf.emit_byte(0x25); // SIB: [disp32] absolute
+        self.buf.emit(&disp32.to_le_bytes());
     }
 
     /// Task #60 — emit `MOV r64, imm64` in the fixed-length 10-byte form
@@ -22609,6 +22814,21 @@ pub fn compile_with_param_slots(
     // (find_deopt_point has no live caller; the i64::MIN re-run is unchanged).
     cm.deopt_points = compiler.deopt_points;
     cm._deopt_point_boxes = compiler.deopt_boxes;
+    // deopt-osr x64-backport Step 5 — finalize the per-method deopt-resume
+    // coverage gate (mirrors `fully_oop_covered` / `can_osr_exit`). A method may
+    // resume a real-frame deopt only when:
+    //   1. it emitted at least one deopt-exit snapshot (`deopt_points`), and
+    //   2. it scalar-replaced NO objects (`scalar_replaced` empty).
+    // (2) is load-bearing: this backend records a scalar-replaced slot by its
+    // machine provenance (Register/StackSlot), NOT as a `VirtualObject`, so its
+    // snapshot cannot be re-materialized — and lock elision over such an object
+    // makes mid-method resume unsound (the elided-monitor hazard). Until the x64
+    // emitter writes `VirtualObject` deopt slots + an elided-monitor flag, a
+    // scalar-replacing method stays on the safe re-run path. Empty/false unless
+    // `deopt_real_enabled()` (the snapshot emit site is gated), so production
+    // artifacts are unchanged. Consumed at the interpreter deopt sink, which
+    // attempts `resume_real_ir_deopt` only when `compiled.can_deopt_resume`.
+    cm.can_deopt_resume = !cm.deopt_points.is_empty() && compiler.scalar_replaced.is_empty();
     // deopt-osr Step 7 — transfer the OSR-exit loop-boundary bci set and set the
     // per-method gate. Both are empty/false unless `deopt_real_enabled()` was on
     // (the emit site is gated), so production artifacts are unchanged. Step 8
