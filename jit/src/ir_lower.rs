@@ -13,8 +13,55 @@ use super::ir_schedule::Schedule;
 use super::{CompiledMethod, ExecutableBuffer, JitInvokeInfo, JitRuntimeHelpers};
 use crate::deopt::{
     ir_deopt_entry, DeoptAction, DeoptReason, DeoptimizationPoint, FrameState, FrameValue,
+    VirtualObjectState,
 };
 use cratonvm_types::{ARRAY_LENGTH_OFFSET, FIELD_CELL_PAYLOAD32_OFFSET, HEADER_SIZE, SLOT_SIZE};
+
+// ── Guard-surviving scalar replacement (producer side) ───────────────
+//
+// When escape analysis scalar-replaces an `Op::New` (the allocation is elided,
+// its field loads redirected to the stored values), the object no longer exists
+// in the JIT frame — but it may still be live at a deopt point. The default
+// behaviour resolves its (now-`Op::Dead`) snapshot slot to `FrameValue::Undefined`,
+// forcing a whole-method re-run. With this map threaded into the lowerer, such a
+// slot instead lowers to a `FrameValue::VirtualObject`, which the VM's
+// `materialize_virtual_objects` consumer rebuilds on a precise resume.
+//
+// Built by `lib.rs::build_scalar_replacement_map` from the escape-analysis result
+// (so `class_id`/`num_fields`/`field_values` are captured before the `Op::New` is
+// marked dead) and passed to `lower_with_scalar_deopt`. `None` (the default)
+// preserves the exact prior behaviour — byte-identical default builds.
+
+/// Per-scalar-replaced-object metadata the deopt producer needs to emit a
+/// `FrameValue::VirtualObject`. Keyed (in [`ScalarReplacementMap`]) by the IR
+/// `NodeId` of the eliminated `Op::New`, which is also used as the object's
+/// stable [`crate::deopt::VirtualObjectState::id`] within a deopt frame.
+pub struct VirtualObjectInfo {
+    pub class_id: u32,
+    pub num_fields: usize,
+    /// Per field index: the IR value node the field holds, or `None` for a field
+    /// never stored (resolves to the object's zero default). Admitted allocations
+    /// have no non-zero primitive `<init>`, so `None` ⇒ `0` is sound.
+    pub field_values: Vec<Option<NodeId>>,
+    /// Control input of the eliminated `Op::New` (its block's control node),
+    /// captured before EA cleared the dead node's inputs. The producer requires
+    /// it to strictly dominate a deopt point (the object must have been
+    /// allocated by then). Read via the live control node, not the now-dead New.
+    pub new_ctrl: NodeId,
+    /// Control inputs of the eliminated field stores (each store's block control
+    /// node), captured before EA cleared them. The producer's temporal gate
+    /// requires every one to strictly dominate a deopt point before emitting a
+    /// `VirtualObject` there — else a deopt *before* a store would materialize
+    /// the post-store value instead of the field's actual (earlier) value.
+    pub store_ctrls: Vec<NodeId>,
+}
+
+/// Maps each scalar-replaced `Op::New` (by IR `NodeId`) to its
+/// [`VirtualObjectInfo`]. Empty / `None` ⇒ no guard-surviving SR emission.
+#[derive(Default)]
+pub struct ScalarReplacementMap {
+    pub objects: HashMap<NodeId, VirtualObjectInfo>,
+}
 
 // Argument registers for the deopt trampoline's call to `ir_deopt_entry`
 // (`fn(point, rbp)`), per platform ABI.
@@ -133,6 +180,10 @@ struct Lowerer<'a> {
     /// whenever profiling is off) ⇒ every `Op::If` keeps its historical layout
     /// byte-for-byte.
     branch_hints: &'a HashMap<usize, bool>,
+    /// Guard-surviving scalar replacement: metadata for each scalar-replaced
+    /// `Op::New` so a deopt snapshot slot holding it lowers to a
+    /// `FrameValue::VirtualObject`. `None` ⇒ disabled (byte-identical default).
+    sr_map: Option<&'a ScalarReplacementMap>,
 }
 
 impl<'a> Lowerer<'a> {
@@ -145,6 +196,7 @@ impl<'a> Lowerer<'a> {
         max_nodes: usize,
         helpers: &JitRuntimeHelpers,
         branch_hints: &'a HashMap<usize, bool>,
+        sr_map: Option<&'a ScalarReplacementMap>,
     ) -> Self {
         // Gap B: scan for `Op::Call` to size the call-related frame regions.
         // `needs_context` ⇒ the method takes the VM ptr as a hidden first arg
@@ -215,6 +267,7 @@ impl<'a> Lowerer<'a> {
             call_exc_patches: Vec::new(),
             self_call_patches: Vec::new(),
             branch_hints,
+            sr_map,
         }
     }
 
@@ -1993,6 +2046,58 @@ impl<'a> Lowerer<'a> {
     /// know it); deopt resume keys on the running `CompiledMethod`, not this
     /// string. It is recorded empty here.
     fn resolve_frame_state(&self, sp: &SafepointSnapshot) -> FrameState {
+        // Guard-surviving scalar replacement (producer): when `sr_map` is set, a
+        // snapshot slot holding a scalar-replaced (now-`Op::Dead`) `Op::New`
+        // lowers to a `FrameValue::VirtualObject` (first occurrence) /
+        // `VirtualObjectRef` (later occurrences), so a precise resume can
+        // re-materialize the elided object instead of falling back to a
+        // whole-method re-run. `emitted` tracks which objects already have their
+        // defining `VirtualObject` in this frame. With `sr_map == None` this is
+        // exactly the historical `frame_value_for` mapping (byte-identical).
+        if let Some(sr) = self.sr_map {
+            let deopt_block = self.deopt_block_for_bci(sp.bci);
+            if std::env::var_os("CRATONVM_DBG_SCALAR_DEOPT").is_some() {
+                let matches: Vec<NodeId> = sp
+                    .locals
+                    .iter()
+                    .chain(sp.stack.iter())
+                    .copied()
+                    .filter(|n| *n != NO_NODE && sr.objects.contains_key(n))
+                    .collect();
+                eprintln!(
+                    "[DBG_SCALAR_DEOPT] resolve bci {} deopt_block={:?} sr_objects={} matching_slots={:?}",
+                    sp.bci,
+                    deopt_block,
+                    sr.objects.len(),
+                    matches
+                );
+            }
+            let mut emitted: std::collections::HashSet<NodeId> = std::collections::HashSet::new();
+            let mut locals = Vec::with_capacity(sp.locals.len());
+            for &n in &sp.locals {
+                locals.push(if n != NO_NODE && sr.objects.contains_key(&n) {
+                    self.frame_value_for_object(n, deopt_block, sr, &mut emitted)
+                } else {
+                    self.frame_value_for(n)
+                });
+            }
+            let mut stack = Vec::with_capacity(sp.stack.len());
+            for &n in &sp.stack {
+                stack.push(if n != NO_NODE && sr.objects.contains_key(&n) {
+                    self.frame_value_for_object(n, deopt_block, sr, &mut emitted)
+                } else {
+                    self.frame_value_for(n)
+                });
+            }
+            return FrameState {
+                method_key: String::new(),
+                bci: sp.bci as u32,
+                locals,
+                stack,
+                monitors: Vec::new(),
+                caller: None,
+            };
+        }
         FrameState {
             method_key: String::new(),
             bci: sp.bci as u32,
@@ -2001,6 +2106,145 @@ impl<'a> Lowerer<'a> {
             monitors: Vec::new(),
             caller: None,
         }
+    }
+
+    /// Block where the deopt at `bci` fires — the program point all of a
+    /// scalar-replaced object's field stores must dominate for its
+    /// `VirtualObject` emission to be temporally correct. v1 deopt points are
+    /// div/rem guards, so the block is that of the `Op::Div`/`Op::Rem` node
+    /// carrying this bci. Returns `None` (⇒ the producer bails to `Undefined`)
+    /// when the block can't be uniquely identified.
+    fn deopt_block_for_bci(&self, bci: usize) -> Option<usize> {
+        let mut found: Option<usize> = None;
+        for (id, n) in self.graph.nodes.iter().enumerate() {
+            // The deopt at `bci` fires from a div/rem zero/overflow guard (whose
+            // node carries `bytecode_pc == bci`) or an explicit `Op::Guard { bci }`.
+            let is_deopt_here = match &n.op {
+                Op::Div | Op::Rem => n.bytecode_pc == Some(bci),
+                Op::Guard { bci: gb } => *gb == bci,
+                _ => false,
+            };
+            if is_deopt_here {
+                let b = *self.schedule.node_to_block.get(id)?;
+                if b == usize::MAX {
+                    return None;
+                }
+                match found {
+                    Some(prev) if prev != b => return None, // ambiguous
+                    _ => found = Some(b),
+                }
+            }
+        }
+        found
+    }
+
+    /// Lower a scalar-replaced object (`new_id`, an eliminated `Op::New`) that is
+    /// live in a deopt snapshot slot into a `FrameValue::VirtualObject` (its
+    /// first occurrence in this frame) or `VirtualObjectRef` (a later, shared
+    /// occurrence). Bails to `FrameValue::Undefined` (⇒ safe whole-method re-run)
+    /// unless every soundness condition holds:
+    ///   * a deopt block is known, and the `Op::New` + every eliminated field
+    ///     store **strictly dominate** it — so each field genuinely holds its
+    ///     recorded value at the deopt bci (a deopt *before* a store would
+    ///     otherwise materialize a post-store value);
+    ///   * no field value is itself another scalar-replaced (virtual) object —
+    ///     nested virtual graphs are a deferred follow-up (v1);
+    ///   * every field value resolves to a real machine/const `FrameValue`
+    ///     (never `Undefined`/`Unsupported`), which `resolve_value` makes
+    ///     concrete from machine state at deopt time.
+    fn frame_value_for_object(
+        &self,
+        new_id: NodeId,
+        deopt_block: Option<usize>,
+        sr: &ScalarReplacementMap,
+        emitted: &mut std::collections::HashSet<NodeId>,
+    ) -> FrameValue {
+        let dbg = std::env::var_os("CRATONVM_DBG_SCALAR_DEOPT").is_some();
+        let info = match sr.objects.get(&new_id) {
+            Some(i) => i,
+            None => return FrameValue::Undefined,
+        };
+        let db = match deopt_block {
+            Some(b) => b,
+            None => {
+                if dbg {
+                    eprintln!("[DBG_SCALAR_DEOPT] bail new {new_id}: no deopt block for bci");
+                }
+                return FrameValue::Undefined;
+            }
+        };
+        // The allocation and every field store must have executed before the
+        // deopt (strict block dominance — same-block ordering is conservatively
+        // rejected; see `Schedule::node_strictly_dominates_block`). We test the
+        // *control* node of each — the New/store nodes themselves are now
+        // `Op::Dead` (unscheduled), but their captured control inputs are live
+        // and carry the same block.
+        if !self.schedule.node_strictly_dominates_block(info.new_ctrl, db) {
+            if dbg {
+                eprintln!(
+                    "[DBG_SCALAR_DEOPT] bail new {new_id}: new_ctrl {} (block {:?}) !strict-dom deopt block {db}",
+                    info.new_ctrl,
+                    self.schedule.node_to_block.get(info.new_ctrl as usize)
+                );
+            }
+            return FrameValue::Undefined;
+        }
+        for &store_ctrl in &info.store_ctrls {
+            if !self.schedule.node_strictly_dominates_block(store_ctrl, db) {
+                if dbg {
+                    eprintln!(
+                        "[DBG_SCALAR_DEOPT] bail new {new_id}: store_ctrl {} (block {:?}) !strict-dom deopt block {db}",
+                        store_ctrl,
+                        self.schedule.node_to_block.get(store_ctrl as usize)
+                    );
+                }
+                return FrameValue::Undefined;
+            }
+        }
+        // A later occurrence of an already-defined object is a back/shared edge.
+        if emitted.contains(&new_id) {
+            return FrameValue::VirtualObjectRef(new_id as usize);
+        }
+        // Build per-field values. `None` ⇒ zero default (admitted allocations set
+        // no non-zero primitive field in <init>). A field whose value is itself a
+        // scalar-replaced New (nested virtual) or an unresolvable slot bails the
+        // whole object.
+        let mut field_values: Vec<FrameValue> = Vec::with_capacity(info.num_fields);
+        for i in 0..info.num_fields {
+            let fv = match info.field_values.get(i).copied().flatten() {
+                None => FrameValue::Int(0),
+                Some(vnode) => {
+                    if sr.objects.contains_key(&vnode) {
+                        if dbg {
+                            eprintln!("[DBG_SCALAR_DEOPT] bail new {new_id}: field {i} is nested virtual (node {vnode})");
+                        }
+                        return FrameValue::Undefined; // nested virtual — deferred
+                    }
+                    let fv = self.frame_value_for(vnode);
+                    if matches!(fv, FrameValue::Undefined | FrameValue::Unsupported) {
+                        if dbg {
+                            eprintln!("[DBG_SCALAR_DEOPT] bail new {new_id}: field {i} node {vnode} -> {fv:?}");
+                        }
+                        return FrameValue::Undefined;
+                    }
+                    fv
+                }
+            };
+            field_values.push(fv);
+        }
+        emitted.insert(new_id);
+        if std::env::var_os("CRATONVM_DBG_SCALAR_DEOPT").is_some() {
+            eprintln!(
+                "[DBG_SCALAR_DEOPT] emit VirtualObject (new {new_id}, class_id {}, {} field(s)) at deopt block {db}",
+                info.class_id, info.num_fields
+            );
+        }
+        FrameValue::VirtualObject(VirtualObjectState {
+            id: new_id as usize,
+            class_id: info.class_id,
+            num_fields: info.num_fields,
+            field_values,
+        })
     }
 
     /// Resolve every recorded safepoint snapshot into a `DeoptimizationPoint`,
@@ -2075,10 +2319,11 @@ pub fn lower(
     num_locals: usize,
     helpers: &JitRuntimeHelpers,
 ) -> Option<CompiledMethod> {
-    // No profile → empty branch hints → historical layout byte-for-byte.
-    // An empty `HashMap` performs no allocation until first insert.
+    // No profile → empty branch hints; no scalar-deopt → None. Both default to
+    // the historical byte-for-byte layout. An empty `HashMap` performs no
+    // allocation until first insert.
     let empty: HashMap<usize, bool> = HashMap::new();
-    lower_with_branch_hints(graph, schedule, num_params, num_locals, helpers, &empty)
+    lower_inner(graph, schedule, num_params, num_locals, helpers, &empty, None)
 }
 
 /// `lower` with profile-guided conditional-branch layout (wire-tiered-manager
@@ -2094,6 +2339,39 @@ pub fn lower_with_branch_hints(
     helpers: &JitRuntimeHelpers,
     branch_hints: &HashMap<usize, bool>,
 ) -> Option<CompiledMethod> {
+    lower_inner(graph, schedule, num_params, num_locals, helpers, branch_hints, None)
+}
+
+/// As [`lower`], but with an optional [`ScalarReplacementMap`] enabling the
+/// guard-surviving scalar-replacement deopt producer (a deopt slot holding a
+/// scalar-replaced `Op::New` lowers to a `FrameValue::VirtualObject`). The
+/// production caller passes `Some(map)` only when `CRATONVM_SCALAR_DEOPT` and
+/// `CRATONVM_DEOPT_REAL` are both set; `None` is byte-identical to the prior
+/// `lower`.
+pub fn lower_with_scalar_deopt(
+    graph: &Graph,
+    schedule: &Schedule,
+    num_params: usize,
+    num_locals: usize,
+    helpers: &JitRuntimeHelpers,
+    sr_map: Option<&ScalarReplacementMap>,
+) -> Option<CompiledMethod> {
+    let empty: HashMap<usize, bool> = HashMap::new();
+    lower_inner(graph, schedule, num_params, num_locals, helpers, &empty, sr_map)
+}
+
+/// Shared lowering body: both profile-guided branch hints and the optional
+/// guard-surviving scalar-replacement map flow in here. `pub(crate)` so the
+/// production compile path (`lib.rs`) can supply BOTH at once.
+pub(crate) fn lower_inner(
+    graph: &Graph,
+    schedule: &Schedule,
+    num_params: usize,
+    num_locals: usize,
+    helpers: &JitRuntimeHelpers,
+    branch_hints: &HashMap<usize, bool>,
+    sr_map: Option<&ScalarReplacementMap>,
+) -> Option<CompiledMethod> {
     let estimated_size = graph.nodes.len() * 32 + 256;
     let buf = ExecutableBuffer::new(estimated_size.max(4096))?;
 
@@ -2106,6 +2384,7 @@ pub fn lower_with_branch_hints(
         graph.nodes.len(),
         helpers,
         branch_hints,
+        sr_map,
     );
 
     // Gap B: a `needs_context` method (one containing an `Op::Call`) receives the
@@ -2163,6 +2442,24 @@ pub fn lower_with_branch_hints(
     cm._deopt_point_boxes = deopt_boxes;
     if needs_context {
         cm.needs_context = true;
+    }
+    // Guard-surviving scalar replacement: if any deopt frame carries a
+    // scalar-replaced object as a `FrameValue::VirtualObject`, route this method
+    // through the interpreter's precise-resume + materialize path
+    // (`resume_real_ir_deopt` → `materialize_virtual_objects`) instead of the
+    // no-materialize int-only path / whole-method re-run. Without this the
+    // `can_deopt_resume` gate stays off for the IR backend and the emitted
+    // VirtualObject is never consumed. Sound to enable: the per-slot mapper and
+    // the materializer each bail to a safe whole-method re-run on any slot they
+    // cannot reconstruct. Only reachable with `sr_map` set (i.e.
+    // `CRATONVM_SCALAR_DEOPT` + `CRATONVM_DEOPT_REAL`), so production is unaffected.
+    if sr_map.is_some()
+        && cm
+            ._deopt_point_boxes
+            .iter()
+            .any(|p| crate::deopt::count_virtual_objects(&p.frame_state) > 0)
+    {
+        cm.can_deopt_resume = true;
     }
     Some(cm)
 }
@@ -2407,6 +2704,192 @@ mod tests {
         );
         assert!(frame.stack.is_empty());
         assert!(frame.caller_frames.is_empty());
+    }
+
+    // ── Guard-surviving scalar replacement (producer) ────────────────────
+
+    /// Build a 3-block graph modelling a scalar-replaced object live at a guard:
+    ///
+    /// ```text
+    /// block0 (entry):  o = new Foo(); o.x = 7; if (cond) ...   (New + store here)
+    /// block1 (taken):  guard(cond != 0) [bci 10]; return o.x   (deopt point here)
+    /// block2 (else):   return 0
+    /// ```
+    ///
+    /// `same_block_guard` puts the guard in block0 instead (no `If`), so the New/
+    /// store do NOT strictly dominate it — the temporal-hazard bail case.
+    /// `dup_local` puts the object in TWO local slots (sharing → `VirtualObjectRef`).
+    /// Returns `(graph, sr_map, new_id)`; the New + store are marked `Op::Dead`
+    /// (simulating `apply_ea_to_ir`) and `sr_map` captures their control inputs.
+    fn build_sr_deopt_graph(
+        same_block_guard: bool,
+        dup_local: bool,
+    ) -> (Graph, ScalarReplacementMap, NodeId) {
+        use crate::ir::CmpOp;
+        let mut g = Graph {
+            nodes: Vec::new(),
+            entry: 0,
+            exit: NO_NODE,
+            safepoints: Vec::new(),
+        };
+        let start = g.add(Op::Start, IrType::Control, vec![], None);
+        let c0 = g.add(Op::Proj(0), IrType::Control, vec![start], None);
+        let mem = g.add(Op::Proj(1), IrType::Memory, vec![start], None);
+        let cond = g.add(Op::Param(0), IrType::Int, vec![start], None);
+        // o = new Foo(); o.x = 7  (both controlled by c0 → block0)
+        let newo = g.add(
+            Op::New { class_id: 7, num_fields: 1 },
+            IrType::Ref,
+            vec![c0, mem],
+            None,
+        );
+        let f0 = g.add(Op::Const(0), IrType::Int, vec![], None); // field index 0
+        let v7 = g.add(Op::Const(7), IrType::Int, vec![], None); // field value
+        let store = g.add(Op::Store(MemKind::Int), IrType::Memory, vec![c0, mem, newo, f0, v7], None);
+        let new_ctrl = c0;
+        let store_ctrl = c0;
+
+        // Locals at the guard's safepoint: [cond, o] (or [cond, o, o] for sharing).
+        let locals = if dup_local {
+            vec![cond, newo, newo]
+        } else {
+            vec![cond, newo]
+        };
+
+        let guard_ctrl = if same_block_guard {
+            // Guard in block0 (after the store), no branch → same block as New/store.
+            let guard = g.add(Op::Guard { bci: 10 }, IrType::Void, vec![c0, cond], None);
+            let _ = guard;
+            let ret = g.add(Op::Return, IrType::Void, vec![c0, v7], None);
+            g.exit = ret;
+            c0
+        } else {
+            // if (cond) → block1 (taken) / block2 (else); guard in block1.
+            let zero = g.add(Op::Const(0), IrType::Int, vec![], None);
+            let cmp = g.add(Op::Cmp(CmpOp::Ne), IrType::Int, vec![cond, zero], None);
+            let iff = g.add(Op::If, IrType::Control, vec![c0, cmp], None);
+            let t = g.add(Op::Proj(0), IrType::Control, vec![iff], None);
+            let e = g.add(Op::Proj(1), IrType::Control, vec![iff], None);
+            let guard = g.add(Op::Guard { bci: 10 }, IrType::Void, vec![t, cond], None);
+            let _ = guard;
+            let ret1 = g.add(Op::Return, IrType::Void, vec![t, v7], None);
+            let ret2 = g.add(Op::Return, IrType::Void, vec![e, v7], None);
+            g.exit = ret1;
+            let _ = ret2;
+            t
+        };
+        let _ = guard_ctrl;
+
+        g.safepoints.push(SafepointSnapshot {
+            bci: 10,
+            locals,
+            stack: vec![],
+        });
+
+        // Simulate `apply_ea_to_ir`: mark the New + store dead (their inputs are
+        // cleared), exactly as the production path does before scheduling.
+        g.nodes[newo as usize].op = Op::Dead;
+        g.nodes[newo as usize].inputs.clear();
+        g.nodes[store as usize].op = Op::Dead;
+        g.nodes[store as usize].inputs.clear();
+
+        let mut objects = HashMap::new();
+        objects.insert(
+            newo,
+            VirtualObjectInfo {
+                class_id: 7,
+                num_fields: 1,
+                field_values: vec![Some(v7)],
+                new_ctrl,
+                store_ctrls: vec![store_ctrl],
+            },
+        );
+        (g, ScalarReplacementMap { objects }, newo)
+    }
+
+    /// Find the deopt point at `bci` among a lowered method's baked guard boxes
+    /// (`_deopt_point_boxes` — the runtime-used frame states; an `Op::Guard`
+    /// emits its box there via `emit_deopt_unless`, NOT into the `bci_native`-keyed
+    /// `deopt_points` list).
+    fn deopt_locals_at(cm: &CompiledMethod, bci: u32) -> Vec<FrameValue> {
+        cm._deopt_point_boxes
+            .iter()
+            .find(|p| p.bci == bci)
+            .unwrap_or_else(|| panic!("no deopt box at bci {bci}"))
+            .frame_state
+            .locals
+            .clone()
+    }
+
+    #[test]
+    fn test_scalar_deopt_emits_virtual_object() {
+        // A scalar-replaced object whose New + (constant) field store strictly
+        // dominate the guard's block lowers to a `VirtualObject` with the stored
+        // value as its field — the guard-surviving case.
+        let (g, sr_map, newo) = build_sr_deopt_graph(false, false);
+        let schedule = ir_schedule::schedule(&g);
+        let cm =
+            lower_with_scalar_deopt(&g, &schedule, 1, 3, &no_helpers(), Some(&sr_map)).expect("lower");
+        let locals = deopt_locals_at(&cm, 10);
+        // local[1] is the object → VirtualObject{ class_id:7, field_values:[Int(7)] }.
+        match &locals[1] {
+            FrameValue::VirtualObject(state) => {
+                assert_eq!(state.id, newo as usize);
+                assert_eq!(state.class_id, 7);
+                assert_eq!(state.num_fields, 1);
+                assert_eq!(state.field_values, vec![FrameValue::Int(7)]);
+            }
+            other => panic!("expected VirtualObject, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_scalar_deopt_bails_when_store_not_dominating() {
+        // Guard in the SAME block as the New/store → strict dominance fails (v1
+        // conservatively rejects same-block ordering) → bail to Undefined → the
+        // resume falls back to a safe whole-method re-run.
+        let (g, sr_map, _newo) = build_sr_deopt_graph(true, false);
+        let schedule = ir_schedule::schedule(&g);
+        let cm =
+            lower_with_scalar_deopt(&g, &schedule, 1, 3, &no_helpers(), Some(&sr_map)).expect("lower");
+        let locals = deopt_locals_at(&cm, 10);
+        assert_eq!(
+            locals[1],
+            FrameValue::Undefined,
+            "same-block store must bail to Undefined (safe re-run)"
+        );
+    }
+
+    #[test]
+    fn test_scalar_deopt_shares_via_ref() {
+        // The same object in two local slots: first occurrence defines the
+        // VirtualObject, the second is a VirtualObjectRef to its id.
+        let (g, sr_map, newo) = build_sr_deopt_graph(false, true);
+        let schedule = ir_schedule::schedule(&g);
+        let cm =
+            lower_with_scalar_deopt(&g, &schedule, 1, 3, &no_helpers(), Some(&sr_map)).expect("lower");
+        let locals = deopt_locals_at(&cm, 10);
+        assert!(
+            matches!(&locals[1], FrameValue::VirtualObject(s) if s.id == newo as usize),
+            "first occurrence defines the object, got {:?}",
+            locals[1]
+        );
+        assert_eq!(
+            locals[2],
+            FrameValue::VirtualObjectRef(newo as usize),
+            "second occurrence is a ref to the same id"
+        );
+    }
+
+    #[test]
+    fn test_scalar_deopt_disabled_without_map() {
+        // With `sr_map = None` (the default), the dead-New slot resolves to
+        // Undefined exactly as before — byte-identical to the prior producer.
+        let (g, _sr_map, _newo) = build_sr_deopt_graph(false, false);
+        let schedule = ir_schedule::schedule(&g);
+        let cm = lower(&g, &schedule, 1, 3, &no_helpers()).expect("lower");
+        let locals = deopt_locals_at(&cm, 10);
+        assert_eq!(locals[1], FrameValue::Undefined);
     }
 
     #[test]

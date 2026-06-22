@@ -56,8 +56,14 @@
 >   (correct for the side-effect-free div trigger today). **Remaining follow-ups:**
 >   **FP/XMM-slot resolution** (needs `SavedRegisters.xmm[16]` + a width source).
 >   `materialize_virtual_objects` (Phase B, GC-backed; consumer built in
->   `vm/src/runtime/deopt_materialize.rs`, but the IR producer never emits
->   `FrameValue::VirtualObject` yet — escape-analysis→snapshot wiring needed).
+>   `vm/src/runtime/deopt_materialize.rs`) — **the IR producer is now WIRED**: the
+>   guard-surviving scalar-replacement producer (`ir_lower::frame_value_for_object`,
+>   gated `CRATONVM_SCALAR_DEOPT` + `CRATONVM_DEOPT_REAL`) emits
+>   `FrameValue::VirtualObject` for a scalar-replaced object live at a deopt point,
+>   `resolve_value` resolves its machine-form fields, and the IR method sets
+>   `can_deopt_resume` so `resume_real_ir_deopt` re-materializes it. Validated live
+>   (producer emit + `materialize_virtual_objects` fire on a real method; div-deopt
+>   `== HotSpot`). See `activate-ir-optimizer.md` "Increment 37".
 >   Inlined-frame chains + monitor re-entry (no inliner exists yet). The x64
 >   single-pass backport ([`real-frame-deopt-x64-backport.md`](real-frame-deopt-x64-backport.md)),
 >   whose remaining blocker is the **primitive/width source** (StackMapTable

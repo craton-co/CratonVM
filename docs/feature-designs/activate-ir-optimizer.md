@@ -2033,9 +2033,79 @@ barrier-free loop with an invariant load — both bail conservatively on anythin
 else (a `Store`/`Call`/alloc/array/guard in the loop, a non-constant trip), so the
 production blast radius is small.
 
-## Remaining roadmap (post-inc-36)
+## Increment 37 (Front 3.2 — guard-surviving scalar replacement: the producer) landed
 
-The single consolidated to-do for whoever picks this up next. Increments 1–36
+Status: **landed**, **gated `CRATONVM_SCALAR_DEOPT` + `CRATONVM_DEOPT_REAL`
+(both default-OFF)**. Completes Front 3.2: an object non-escaping on the fast path
+but **live at a deopt point** can now be scalar-replaced and **re-materialized**
+if the guard fails, instead of forcing a whole-method re-run.
+
+**The split it closes.** The deopt-OSR epic had already built the *consumer*:
+`FrameValue::VirtualObject(VirtualObjectState{id,class_id,num_fields,field_values})`
+/ `VirtualObjectRef` (`jit/src/deopt.rs`) and the two-phase, cycle-safe, GC-safe
+`vm/src/runtime/deopt_materialize.rs::materialize_virtual_objects` (wired into
+`build_deopt_frame_inner` ← `resume_real_ir_deopt`). What was missing was the
+*producer*: the IR lowerer never emitted a `VirtualObject`, so a scalar-replaced
+object live at a deopt resolved to `FrameValue::Undefined` → safe re-run. (EA
+already treats `Op::Guard`/deopt points as non-escaping, so such objects were
+*already* scalar-replaced — just not re-materializable.)
+
+**What landed**
+- **Producer (`jit/src/ir_lower.rs`).** `build_scalar_replacement_map` (`lib.rs`,
+  built from the EA result *before* `apply_ea_to_ir` marks the `Op::New`/stores
+  dead and clears their inputs) records per scalar-replaced object: `class_id`,
+  `num_fields`, per-field IR value nodes, and the **control inputs** of the `New`
+  and each eliminated store (for the dominance gate). `resolve_frame_state` then
+  routes a snapshot slot holding a scalar-replaced (now-`Op::Dead`) `New` to
+  `frame_value_for_object`, which emits a `VirtualObject` (first occurrence) /
+  `VirtualObjectRef` (shared occurrences) with each field mapped via the existing
+  `frame_value_for` (a `Const` → `Int`/`Long`; a spilled value → `StackSlot*`).
+- **Temporal-correctness gate.** A `VirtualObject` is emitted only when the
+  `New` *and every eliminated store* **strictly dominate** the deopt block
+  (`Schedule::node_strictly_dominates_block`, using the dominator matrix now
+  retained on `Schedule`). This is essential: a deopt *before* a field's store
+  must see the field's default, not the post-store value. Anything not provably
+  dominating (incl. a same-block store — v1 conservatively rejects intra-block
+  order), a field that is itself another virtual object (nested — deferred), or an
+  unresolvable field → bail to `Undefined` (safe re-run).
+- **Consumer field resolution (`jit/src/deopt.rs`).** `resolve_value` now recurses
+  into `VirtualObject.field_values`, resolving each machine form
+  (`StackSlot*`/`Register*`) to a concrete `Object`/`Int`/`Long`/`Float`/`Double`
+  from the live machine state *before* the frame is torn down — so the materializer
+  (which rejects machine forms) receives concrete values. This is what makes
+  **non-constant** fields work.
+- **Resume enablement.** An IR method that emits any `VirtualObject` sets
+  `can_deopt_resume = true` (previously off for the IR backend, and the single-pass
+  gate explicitly excluded scalar-replacing methods), so the interpreter takes
+  `resume_real_ir_deopt` → `materialize_virtual_objects` instead of the
+  no-materialize int-only path / re-run. The per-slot mapper + the materializer
+  each bail to a safe whole-method re-run on anything unreconstructable, so
+  enabling resume is sound.
+- **Gate.** `scalar_deopt_enabled()` (`CRATONVM_SCALAR_DEOPT`) ANDed with
+  `deopt_real_enabled()`. OFF ⇒ `sr_map = None` ⇒ byte-identical lowering.
+  `CRATONVM_DBG_SCALAR_DEOPT` traces producer emits / bail reasons / the runtime
+  materialization.
+
+**Validation**
+- **Unit (jit lib 842, +5):** producer emits a `VirtualObject{field_values:[Int(7)]}`
+  for a dominating-store object; bails to `Undefined` for a same-block (non-
+  dominating) store; shares via `VirtualObjectRef`; is inert with `sr_map=None`;
+  and `resolve_value` resolves machine-form fields from a synthetic frame.
+  `ir_vs_singlepass` 82/82 (gate-off byte-identical).
+- **Live E2E** (`scratch/srdeopt/`, gitignored): a method that scalar-replaces a
+  POJO live across a loop-body div guard — warmed to JIT-compile, then a div-by-zero
+  trigger — fires the producer (`[DBG_SCALAR_DEOPT] emit VirtualObject … at deopt
+  block 1`) AND the consumer (`build_deopt_frame_inner: materializing virtual
+  object(s)`), then throws `ArithmeticException` `== HotSpot` with no crash / no
+  `DEOPT_VERIFY` rejection. bt10/14/16/18 `== HotSpot` gate-OFF (default).
+- **Honest scope.** The full app gauntlet was not run (the feature is gated
+  default-OFF and inert in production). v1 handles primitive + already-real-ref
+  fields with dominating stores; nested virtual objects and intra-block store
+  ordering are documented follow-ups.
+
+## Remaining roadmap (post-inc-37)
+
+The single consolidated to-do for whoever picks this up next. Increments 1–37
 are landed and (where flagged) default-ON. What remains, in dependency order:
 
 1. ✅ **`i64::MIN`-return / deopt-sentinel fix** *(unblocks `long` call returns)* —
@@ -2208,13 +2278,10 @@ are landed and (where flagged) default-ON. What remains, in dependency order:
    had never hoisted a real `getfield` load because the builder's invariant-local
    loop phi masked the base). See **["Increment 36"](#increment-36-flip-cratonvm_jit_licm--cratonvm_jit_unroll-default-on-via-trivial-phi-elimination-landed)**.
 
-5. **Guard-surviving scalar replacement** (Front 3.2) — **BLOCKED** on
-   `real-frame-deopt.md`'s `FrameValue::VirtualObject` / `materialize_virtual_objects`
-   (the active deopt-OSR epic, worktree `CratonVM-deopt`). Until an object that is
-   non-escaping on the *fast* path can be re-materialised when a rare guard
-   deopts, scalar replacement stays restricted to objects non-escaping on **all**
-   paths (the current, sound behaviour). Not actionable from this doc alone — it
-   lands when the deopt-OSR `VirtualObject` support does.
+5. **Guard-surviving scalar replacement** (Front 3.2) — ✅ **DONE (inc 37,
+   gated `CRATONVM_SCALAR_DEOPT` + `CRATONVM_DEOPT_REAL`).** The deopt-OSR epic
+   landed `FrameValue::VirtualObject` + the GC-backed `materialize_virtual_objects`
+   consumer; this increment wired the **producer**. See "Increment 37" below.
 
 6. **SCEV-driven LICM** (Front 2.2 refinement) — **deferred enhancement, not
    blocking.** The structural graph-level LICM is live and correct (inc 36). The
@@ -2259,7 +2326,8 @@ ultimately lean on.
 6. **Broaden escape analysis** once the gate is open; enforce the
    "call-arg/store/return/throw ⇒ escapes" invariant (Front 3.1). ✅ Done (inc 16–20).
 7. **Guard-surviving scalar replacement** after `real-frame-deopt.md` (Front 3.2).
-   ⛔ BLOCKED on the deopt-OSR `VirtualObject` support — see roadmap item 5.
+   ✅ Done (inc 37, gated `CRATONVM_SCALAR_DEOPT` + `CRATONVM_DEOPT_REAL`) — the
+   deopt-OSR `VirtualObject` consumer landed; inc 37 wired the IR producer.
 8. **Flip defaults** pass-by-pass as each soaks clean on bt10/14/16/18 checksums
    + bench differential. ✅ Done for `IR_CALL`/`SCALAR_NEW` (inc 20/23),
    `IR_LONG`/`IR_CALL_SPECIAL` (inc 29), `IR_FP` (`14635585`), and

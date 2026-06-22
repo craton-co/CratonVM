@@ -1098,6 +1098,22 @@ fn resolve_value(v: &FrameValue, regs: &SavedRegisters, rbp: u64) -> FrameValue 
             // `Value::Double` (cat-2).
             FrameValue::Double(unsafe { addr.read_unaligned() })
         }
+        // A scalar-replaced object whose fields are still in *machine* form
+        // (the guard-surviving SR producer emits `field_values` as the live
+        // `StackSlot*`/`Const` of each stored field). Resolve each field NOW —
+        // synchronously, before the frame is torn down and before any Java-heap
+        // allocation — so the VM materializer (`field_value_to_value`) receives
+        // concrete `Object`/`Int`/`Long`/`Float`/`Double` values it accepts.
+        // A `VirtualObjectRef` field is an intra-frame id edge with no machine
+        // location, so it passes through unchanged. Recursion handles nested
+        // virtual objects (none are emitted in v1, but the resolver is general).
+        FrameValue::VirtualObject(state) => {
+            let mut resolved = state.clone();
+            for fv in resolved.field_values.iter_mut() {
+                *fv = resolve_value(fv, regs, rbp);
+            }
+            FrameValue::VirtualObject(resolved)
+        }
         other => other.clone(),
     }
 }
@@ -1756,6 +1772,51 @@ mod tests {
         assert_eq!(vo.class_id, 42);
         assert_eq!(vo.num_fields, 2);
         assert_eq!(vo.field_values.len(), 2);
+    }
+
+    #[test]
+    fn resolve_value_recurses_virtual_object_fields() {
+        // Guard-surviving SR: the producer emits a `VirtualObject` whose fields
+        // are still machine forms (`StackSlot*`/`Register*`). `resolve_value`
+        // must resolve each field from the live machine state so the VM
+        // materializer receives concrete values; a `VirtualObjectRef` field (an
+        // intra-frame id edge) passes through unchanged.
+        let mut regs = SavedRegisters::default();
+        regs.gpr[3] = 0x1234; // a RegisterRef field reads this GPR as an object ptr
+        // Stand-in native frame: a StackSlot(off) reads *(rbp + off) as i64.
+        let buf: [i64; 4] = [0, 111, 0xBEEFi64, 0];
+        let rbp = buf.as_ptr() as u64;
+        let vo = FrameValue::VirtualObject(VirtualObjectState {
+            id: 9,
+            class_id: 7,
+            num_fields: 4,
+            field_values: vec![
+                FrameValue::StackSlot(8),      // buf[1] = 111 → Int(111)
+                FrameValue::StackSlotRef(16),  // buf[2] = 0xBEEF → Object(0xBEEF)
+                FrameValue::RegisterRef(3),    // gpr[3] = 0x1234 → Object(0x1234)
+                FrameValue::VirtualObjectRef(5), // intra-frame edge → unchanged
+            ],
+        });
+        match resolve_value(&vo, &regs, rbp) {
+            FrameValue::VirtualObject(s) => {
+                assert_eq!(s.id, 9);
+                assert_eq!(
+                    s.field_values,
+                    vec![
+                        FrameValue::Int(111),
+                        FrameValue::Object(0xBEEF),
+                        FrameValue::Object(0x1234),
+                        FrameValue::VirtualObjectRef(5),
+                    ]
+                );
+            }
+            other => panic!("expected VirtualObject, got {other:?}"),
+        }
+        // A bare ref edge resolves to itself (no machine location).
+        assert_eq!(
+            resolve_value(&FrameValue::VirtualObjectRef(5), &regs, rbp),
+            FrameValue::VirtualObjectRef(5)
+        );
     }
 
     // -- MonitorInfo -------------------------------------------------------
