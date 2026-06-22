@@ -1283,7 +1283,13 @@ impl G1Collector {
         // Step 9: opt-in multi-threaded evacuator (`CRATONVM_G1_PARALLEL_EVAC`).
         // Behaviour-equivalent to the serial path below (byte-identical program
         // output); see the parallel-evacuation module note above.
-        if parallel_evac_enabled() {
+        //
+        // Fall back to the serial path whenever a thread is in JIT: only the
+        // serial path implements conservative-JIT-root region pinning (the
+        // parallel evacuator would relocate a JIT-rooted object whose holder
+        // slot cannot be rewritten). When parallel DOES run (no thread in JIT)
+        // there are no conservative JIT roots to pin, so it stays correct.
+        if parallel_evac_enabled() && !crate::gc_quiescence::is_active() {
             return self.young_collection_parallel(roots, monitors);
         }
         let start = std::time::Instant::now();
@@ -1298,12 +1304,23 @@ impl G1Collector {
         let mut objects_copied = 0usize;
         let mut bytes_copied = 0usize;
 
-        // Build collection set: all Eden + Survivor regions (skip pinned)
+        // Regions holding a conservatively-discovered JIT root must NOT be
+        // evacuated: the collector cannot rewrite the (register/spill) slot that
+        // holds the only reference, so the object must stay put (the
+        // generational collector achieves this by not moving anything while in
+        // JIT). Map each published root address to its region and exclude those
+        // from the CSet, exactly like JNI-pinned regions. Empty unless a thread
+        // is in JIT (the common case for a JIT-triggered young GC).
+        let jit_pinned_regions = self.jit_pinned_region_set();
+
+        // Build collection set: all Eden + Survivor regions (skip pinned + any
+        // region holding a conservative JIT root)
         let cset: Vec<usize> = regions
             .iter()
             .enumerate()
-            .filter(|(_, r)| {
+            .filter(|(i, r)| {
                 !r.pinned
+                    && !jit_pinned_regions.contains(i)
                     && (r.region_type == RegionType::Eden || r.region_type == RegionType::Survivor)
             })
             .map(|(i, _)| i)
@@ -1349,34 +1366,6 @@ impl G1Collector {
             }
         }
 
-        if std::env::var_os("CRATONVM_DBG_JITROOT").is_some() {
-            let mut in_region = 0usize;
-            let mut in_cset = 0usize;
-            for root in roots.iter() {
-                if let Some(idx) = self.region_for_ptr(&regions, root.as_ptr()) {
-                    in_region += 1;
-                    if cset_set.contains(&idx) {
-                        in_cset += 1;
-                    }
-                }
-            }
-            eprintln!(
-                "[JITROOT-G1] roots={} in_region={} in_cset={} cset_len={} copied={}",
-                roots.len(),
-                in_region,
-                in_cset,
-                cset.len(),
-                objects_copied
-            );
-            for &ci in cset.iter().take(8) {
-                let base = regions[ci].data.as_ptr() as usize;
-                eprintln!(
-                    "[JITROOT-G1]   cset region {} type={:?} [{:#x}, {:#x}) cursor={}",
-                    ci, regions[ci].region_type, base, base + regions[ci].cursor, regions[ci].cursor
-                );
-            }
-        }
-
         // Phase 2: Scan remembered sets for references into CSet
         // (Collect rset sources before mutating regions)
         let mut rset_sources: Vec<(usize, Vec<usize>)> = Vec::new();
@@ -1389,10 +1378,17 @@ impl G1Collector {
 
         // CRIT fix (UAF): actually process the collected rset sources.
         // Dedup source indices so we walk each source region at most once.
-        let unique_sources: std::collections::HashSet<usize> = rset_sources
+        // JIT-pinned regions are scanned as sources too: their objects stay in
+        // place (excluded from the CSet) but may reference objects that ARE in
+        // the CSet, and young→young references carry no remembered set, so the
+        // pinned region must be walked explicitly to evacuate and fix up those
+        // referents. Without this, a list/tree straddling pinned and CSet
+        // regions loses the CSet-side nodes (SIGSEGV / wrong checksum).
+        let mut unique_sources: std::collections::HashSet<usize> = rset_sources
             .iter()
             .flat_map(|(_, srcs)| srcs.iter().copied())
             .collect();
+        unique_sources.extend(jit_pinned_regions.iter().copied());
         for src_idx in unique_sources {
             self.scan_source_region_for_cset_refs(
                 &mut regions,
@@ -1624,7 +1620,9 @@ impl G1Collector {
         monitors: &dyn MonitorCleanup,
     ) -> GcResult {
         // Step 9: opt-in multi-threaded evacuator (`CRATONVM_G1_PARALLEL_EVAC`).
-        if parallel_evac_enabled() {
+        // Fall back to serial while any thread is in JIT — only the serial path
+        // pins conservative JIT-root regions (see `young_collection`).
+        if parallel_evac_enabled() && !crate::gc_quiescence::is_active() {
             return self.mixed_collection_parallel(roots, monitors);
         }
         let start = std::time::Instant::now();
@@ -1637,12 +1635,20 @@ impl G1Collector {
         let mut objects_copied = 0usize;
         let mut bytes_copied = 0usize;
 
-        // Build CSet: all young regions + worst old regions
+        // Exclude regions holding a conservative JIT root from the CSet (pin in
+        // place) — see `young_collection` / `jit_pinned_region_set`. A mixed GC
+        // can also select the (now promoted) region of a long-lived JIT-rooted
+        // object, so this guard matters for both young and old CSet members.
+        let jit_pinned_regions = self.jit_pinned_region_set();
+
+        // Build CSet: all young regions + worst old regions (skip pinned + any
+        // region holding a conservative JIT root)
         let mut cset: Vec<usize> = regions
             .iter()
             .enumerate()
-            .filter(|(_, r)| {
+            .filter(|(i, r)| {
                 !r.pinned
+                    && !jit_pinned_regions.contains(i)
                     && (r.region_type == RegionType::Eden || r.region_type == RegionType::Survivor)
             })
             .map(|(i, _)| i)
@@ -1659,7 +1665,9 @@ impl G1Collector {
         let mut old_candidates: Vec<(usize, f64)> = regions
             .iter()
             .enumerate()
-            .filter(|(_, r)| r.region_type == RegionType::Old && !r.pinned)
+            .filter(|(i, r)| {
+                r.region_type == RegionType::Old && !r.pinned && !jit_pinned_regions.contains(i)
+            })
             .map(|(i, r)| (i, r.gc_efficiency))
             .collect();
         // Stable sort so that among regions with identical efficiency
@@ -1739,6 +1747,10 @@ impl G1Collector {
                 // iteration above is over the snapshot and does not hold
                 // the RSet lock across the body.
             }
+            // JIT-pinned regions are scanned as sources too (see
+            // young_collection): their objects stay in place but their CSet
+            // referents must still be evacuated and fixed up.
+            set.extend(jit_pinned_regions.iter().copied());
             set
         };
         for src_idx in mixed_rset_sources {
@@ -3791,6 +3803,25 @@ impl G1Collector {
             cell.set(Some((collector_id, dst_idx, region_ptr, epoch_under_lock)));
         });
         regions[dst_idx].rset.add_reference(src_idx);
+    }
+
+    /// Region indices that hold a conservatively-discovered JIT root this cycle
+    /// and must therefore be EXCLUDED from the collection set (pinned in place).
+    ///
+    /// The VM's root gatherer publishes these addresses (only under G1) via
+    /// [`crate::gc_quiescence::add_pinned_jit_root`]; a conservative JIT root
+    /// lives in a register/spill slot the collector cannot rewrite, so its
+    /// object must not move. Excluding its region from the CSet is G1's analog of
+    /// the generational collector's non-moving-while-in-JIT sweep. Returns empty
+    /// unless a thread is in JIT, so the no-JIT path pays nothing.
+    fn jit_pinned_region_set(&self) -> std::collections::HashSet<usize> {
+        if !crate::gc_quiescence::is_active() {
+            return std::collections::HashSet::new();
+        }
+        crate::gc_quiescence::pinned_jit_roots_snapshot()
+            .into_iter()
+            .filter_map(|addr| self.lookup_region_for_addr(addr))
+            .collect()
     }
 
     /// Find which region contains the given address (by raw address).
