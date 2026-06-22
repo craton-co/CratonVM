@@ -339,6 +339,41 @@ pub fn process_vm() -> Option<Arc<SharedVm>> {
 }
 
 // ---------------------------------------------------------------------------
+// DestroyJavaVM teardown hook
+// ---------------------------------------------------------------------------
+//
+// The `DestroyJavaVM` invocation-table slot (`jni_destroy_java_vm`) is reached
+// when a C host calls `(*vm)->DestroyJavaVM(vm)`. The actual VM instance, though,
+// is *owned* by the embedding layer (`libcratonvm`'s process-global `CREATED_VM`
+// registry), which this crate cannot reach directly. So the embedder registers a
+// teardown closure here at create time; `DestroyJavaVM` invokes it. When no hook
+// is registered (e.g. a VM built directly via `Vm::new` from Rust, with no
+// Invocation-API bootstrap), `DestroyJavaVM` has nothing process-global to drop
+// and reports success.
+
+/// Embedder-registered `DestroyJavaVM` teardown. Returns a JNI status code.
+static DESTROY_VM_HOOK: parking_lot::Mutex<Option<fn() -> JInt>> = parking_lot::Mutex::new(None);
+
+/// Register the teardown invoked by `DestroyJavaVM`. Called by the embedding
+/// layer (`JNI_CreateJavaVM` / `cratonvm_create`) so the slot can drop the VM it
+/// owns. Replacing an existing hook is allowed (one VM per process; a later
+/// create overwrites). Passing the same fn pointer is idempotent.
+pub fn set_destroy_vm_hook(hook: fn() -> JInt) {
+    *DESTROY_VM_HOOK.lock() = Some(hook);
+}
+
+/// Run the registered teardown hook (if any) and clear it. `None` → `JNI_OK`
+/// (nothing process-global to tear down). The hook is taken so a second
+/// `DestroyJavaVM` is a no-op success, mirroring HotSpot (the VM is gone).
+fn run_destroy_vm_hook() -> JInt {
+    let hook = DESTROY_VM_HOOK.lock().take();
+    match hook {
+        Some(h) => h(),
+        None => JNI_OK,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Foreign-thread attach state (host-created OS threads)
 // ---------------------------------------------------------------------------
 
@@ -5951,8 +5986,24 @@ fn build_function_table() -> Box<[usize; JNI_FUNCTION_COUNT]> {
 // JavaVM Invocation Interface
 // ---------------------------------------------------------------------------
 
+/// `jint DestroyJavaVM(JavaVM *vm)` — invocation-table slot 3.
+///
+/// HotSpot semantics: the calling thread waits until it is the only remaining
+/// non-daemon thread, then unloads the VM; after a successful return the VM may
+/// not be used and (per the spec) cannot be recreated in the same process. We
+/// honour the load-bearing part of that contract for an embedded VM: tear the VM
+/// down by invoking the embedder-registered teardown hook (which drops the parked
+/// `Vm`, releasing its `Arc<SharedVm>` / heap / threads, clears the calling
+/// thread's JNI TLS context, and resets the one-VM-per-process registry so
+/// `JNI_GetCreatedJavaVMs` then reports 0).
+///
+/// We do NOT block waiting for other non-daemon threads: the embedding contract
+/// (see `docs/feature-designs/embedding-api.md`) is that the host calls
+/// `DestroyJavaVM` from the creating thread once it has quiesced its own Java
+/// activity — mirroring how an embedder drives a single VM. Returns the hook's
+/// status (`JNI_OK` when no hook is registered, i.e. nothing to tear down).
 extern "C" fn jni_destroy_java_vm(_vm: JavaVM) -> JInt {
-    JNI_OK
+    run_destroy_vm_hook()
 }
 
 extern "C" fn jni_get_env(_vm: JavaVM, env: *mut *mut std::ffi::c_void, _version: JInt) -> JInt {
@@ -6256,6 +6307,37 @@ mod tests {
         assert!(
             process_vm().is_none(),
             "process_vm must return None once the VM has been dropped"
+        );
+    }
+
+    /// `DestroyJavaVM`'s teardown hook fires once and is one-shot: a registered
+    /// hook runs on the first `DestroyJavaVM`, and a second call (the VM now
+    /// gone) is a no-op `JNI_OK` without re-running it — mirroring HotSpot, where
+    /// the VM cannot be destroyed twice.
+    #[test]
+    fn destroy_vm_hook_runs_once_then_clears() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let _guard = PROCESS_VM_TEST_LOCK.lock();
+        static CALLS: AtomicUsize = AtomicUsize::new(0);
+        fn hook() -> JInt {
+            CALLS.fetch_add(1, Ordering::SeqCst);
+            JNI_OK
+        }
+        CALLS.store(0, Ordering::SeqCst);
+        // With no hook registered, teardown is a no-op success.
+        // (Take any stale hook a prior test/run left behind first.)
+        let _ = run_destroy_vm_hook();
+        assert_eq!(CALLS.load(Ordering::SeqCst), 0);
+
+        set_destroy_vm_hook(hook);
+        assert_eq!(run_destroy_vm_hook(), JNI_OK);
+        assert_eq!(CALLS.load(Ordering::SeqCst), 1, "hook must run exactly once");
+        // Second DestroyJavaVM: hook was taken, so no re-run, still JNI_OK.
+        assert_eq!(run_destroy_vm_hook(), JNI_OK);
+        assert_eq!(
+            CALLS.load(Ordering::SeqCst),
+            1,
+            "hook must not run again after being taken"
         );
     }
 

@@ -1,9 +1,22 @@
 # `libcratonvm` Embedding API
 
-Status: design / not started (Rust-native embedding exists; C-ABI + JNI
-Invocation API do not). L. A stable public surface for hosting a CratonVM JVM
-inside a host process — both a curated Rust API and a C-ABI `libcratonvm` with
-JNI Invocation-API parity.
+Status: **LANDED** — all three layers shipped, built, and run against a live
+JDK-25 VM. The `libcratonvm` `cdylib`/`staticlib` exposes the JNI Invocation API
+(`JNI_CreateJavaVM` / `GetDefaultJavaVMInitArgs` / `GetCreatedJavaVMs` /
+`DestroyJavaVM`), the flat `cratonvm_*` opaque-handle C API (create/destroy,
+load-class, static + virtual invoke, string/object/field read-back + write-back,
+last-error), and GC-safe foreign-thread attach; the curated `cratonvm-embed`
+crate is the Layer-1 Rust facade. See the increment log at the end of this doc
+for what each piece covers. (The historical sections below describe the *design*
+that was implemented — kept for rationale; "Current state (cited)" reflects the
+pre-implementation gaps, now closed.) A stable public surface for hosting a
+CratonVM JVM inside a host process — both a curated Rust API and a C-ABI
+`libcratonvm` with JNI Invocation-API parity.
+
+Remaining / genuinely next: descriptor-based disambiguation of shadowed
+same-name fields; a C-varargs convenience shim (the typed `CratonValue` array
+is the stable core — a definition-side C-varargs entry is unsound on stable
+Rust); and CI publication of the `.so`/`.dll`/`.a` + header.
 
 ## Goal
 
@@ -487,3 +500,49 @@ foreign attached thread (already auto-managed). The concurrent-GC soak uses it t
 bracket the creating thread's host-side wait. (A future refinement could
 auto-block the creating thread on return from `JNI_CreateJavaVM` and auto-leave
 on the next VM call, removing the explicit calls.)
+
+## Increment 6 (`DestroyJavaVM` real teardown) landed
+
+`DestroyJavaVM` — invocation-table slot 3, the lifecycle counterpart to
+`JNI_CreateJavaVM` — was a literal no-op stub (`jni_destroy_java_vm` returned
+`JNI_OK` without doing anything). Increment 1's claim that "the invocation table
+(slots 3–7) … were already complete" was correct only for the *wiring*: the slot
+existed and dispatched, but the slot 3 *implementation* did nothing. It now tears
+the VM down for real.
+
+- **Teardown hook (vm crate, `native::jni`).** The `DestroyJavaVM` slot lives in
+  the vm crate, but the VM *instance* is owned by the embedding layer
+  (`libcratonvm`'s process-global `CREATED_VM` registry), which the vm crate
+  cannot reach. So a small process-global hook (`set_destroy_vm_hook` /
+  `run_destroy_vm_hook`) is registered by the embedder at create time; the slot
+  delegates to it. The hook is **one-shot** (taken on first call), so a second
+  `DestroyJavaVM` is a no-op `JNI_OK` — mirroring HotSpot, where the VM cannot be
+  destroyed twice. With **no** hook registered (a VM built directly from Rust via
+  `Vm::new`, no Invocation-API bootstrap) the slot has nothing process-global to
+  drop and reports `JNI_OK`.
+- **The hook (`libcratonvm::destroy_created_vm`).** Takes the parked VM out of
+  `CREATED_VM` and drops it — releasing its `Arc<SharedVm>`, heap, and threads —
+  then releases this VM's flat-API handle table (and the global refs pinning its
+  objects as GC roots, in case the host mixed surfaces) and clears the calling
+  thread's JNI TLS context (so a later JNIEnv-table call on that thread does not
+  resolve a freed VM). Registered in `JNI_CreateJavaVM` right after the JNI
+  context is published. Wrapped in `catch_unwind` (a drop panic must not unwind
+  across the C `DestroyJavaVM` boundary). After it runs, `JNI_GetCreatedJavaVMs`
+  honestly reports 0.
+- **Threading contract.** We honour the load-bearing part of HotSpot's
+  `DestroyJavaVM` (tear the VM down, release the one-VM-per-process slot) but do
+  **not** block waiting for other non-daemon threads to exit: the embedding
+  contract is that the host calls `DestroyJavaVM` from the creating thread once it
+  has quiesced its own Java activity, exactly as an embedder drives a single VM.
+- **Restart caveat (unchanged).** HotSpot does not support recreating a VM after
+  `DestroyJavaVM`, and neither do we — CratonVM installs process-global signal
+  handlers / sandbox roots and leaks the JNI function tables as process-lifetime
+  singletons (see Risks). Clearing the registry makes the count honest and frees
+  the VM instance; a *subsequent* `JNI_CreateJavaVM` in the same process is
+  untested and unsupported. The flat API's caller-controlled `cratonvm_destroy`
+  (which already tore its handle down) is unchanged.
+- **Tests.** vm crate: `destroy_vm_hook_runs_once_then_clears` (hook fires once,
+  is one-shot, no-hook → `JNI_OK`). `libcratonvm`: `destroy_created_vm_without_vm_is_noop_ok`
+  (no parked VM → idempotent `JNI_OK`). The `embed_smoke.c` Invocation-API
+  acceptance harness now calls `DestroyJavaVM` (slot 3) after the `System.gc`
+  call and asserts `JNI_GetCreatedJavaVMs` then reports **0** VMs.

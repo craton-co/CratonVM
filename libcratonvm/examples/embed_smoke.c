@@ -63,7 +63,7 @@ typedef uint8_t jboolean;
 typedef void     *JniSlot;    /* one function-table slot (a function address) */
 typedef JniSlot  *JniTable;   /* the function table (array of slots) */
 typedef JniTable *JNIEnv;     /* env -> table -> slot  (double indirection) */
-typedef JniTable *JavaVM;     /* same shape; never indexed in this harness */
+typedef JniTable *JavaVM;     /* same shape; indexed for DestroyJavaVM (slot 3) */
 
 typedef struct JavaVMOption {
     char *optionString;
@@ -95,6 +95,10 @@ extern jint JNI_GetCreatedJavaVMs(JavaVM *vmBuf, jsize bufLen, jsize *nVMs);
 #define JNIENV_GetStaticMethodID     113 /* jmethodID (*)(JNIEnv*, jclass, const char*, const char*) */
 #define JNIENV_CallStaticVoidMethodA 143 /* void      (*)(JNIEnv*, jclass, jmethodID, const jvalue*) */
 
+/* JavaVM invocation-table slot indices (cratonvm-vm native::jni
+ * `build_invoke_table`; standard JNI Invocation-API ordering). */
+#define JAVAVM_DestroyJavaVM         3   /* jint (*)(JavaVM) */
+
 typedef uint64_t jclass;
 typedef uint64_t jmethodID;
 typedef union jvalue { int32_t i; int64_t j; double d; uint64_t l; } jvalue;
@@ -102,11 +106,18 @@ typedef union jvalue { int32_t i; int64_t j; double d; uint64_t l; } jvalue;
 typedef jclass    (*FindClass_t)(JNIEnv, const char *);
 typedef jmethodID (*GetStaticMethodID_t)(JNIEnv, jclass, const char *, const char *);
 typedef void      (*CallStaticVoidMethodA_t)(JNIEnv, jclass, jmethodID, const jvalue *);
+typedef jint      (*DestroyJavaVM_t)(JavaVM);
 
 static void *slot(JNIEnv env, int index) {
     /* env points at the table pointer; (*env) is the table; (*env)[index] is
      * the function pointer for that slot. */
     return (void *)((*env)[index]);
+}
+
+static void *vm_slot(JavaVM jvm, int index) {
+    /* Same double-indirection shape as the JNIEnv table, applied to the
+     * JavaVM invocation table. */
+    return (void *)((*jvm)[index]);
 }
 
 int main(void) {
@@ -173,6 +184,21 @@ int main(void) {
     }
     CallStaticVoidMethodA(env, cls, mid, NULL);  /* zero-arg: args pointer is NULL */
     printf("invoked static System.gc() via JNIEnv table\n");
+
+    /* 6. Tear the VM down via DestroyJavaVM (invocation-table slot 3). After a
+     * successful destroy the VM is gone: JNI_GetCreatedJavaVMs must report 0. */
+    DestroyJavaVM_t DestroyJavaVM = (DestroyJavaVM_t) vm_slot(jvm, JAVAVM_DestroyJavaVM);
+    jint drc = DestroyJavaVM(jvm);
+    if (drc != JNI_OK) {
+        fprintf(stderr, "DestroyJavaVM failed: %d\n", drc);
+        return 1;
+    }
+    n = -1;
+    if (JNI_GetCreatedJavaVMs(buf, 1, &n) != JNI_OK || n != 0) {
+        fprintf(stderr, "after DestroyJavaVM: expected 0 VMs, got %d\n", n);
+        return 1;
+    }
+    printf("DestroyJavaVM ok: JNI_GetCreatedJavaVMs now reports %d VM(s)\n", n);
 
     printf("embed_smoke: OK\n");
     return 0;

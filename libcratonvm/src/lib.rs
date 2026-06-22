@@ -63,7 +63,7 @@ use std::sync::Mutex;
 use cratonvm_vm::config::VmConfig;
 use cratonvm_vm::native::jni::{
     clear_jni_context, get_java_vm, get_jni_env, host_thread_enter_native, host_thread_leave_native,
-    set_jni_context_arc,
+    set_destroy_vm_hook, set_jni_context_arc,
 };
 use cratonvm_vm::vm::Vm;
 
@@ -433,6 +433,11 @@ pub extern "C" fn JNI_CreateJavaVM(
         // methods use.
         set_jni_context_arc(shared);
 
+        // Register the teardown the `DestroyJavaVM` invocation-table slot
+        // invokes: this crate owns the parked VM, so the vm crate's slot
+        // delegates back here to drop it. See `destroy_created_vm`.
+        set_destroy_vm_hook(destroy_created_vm);
+
         // Hand back the process-global tables from jni.rs.
         // SAFETY: out-pointers checked non-null above.
         unsafe {
@@ -443,6 +448,44 @@ pub extern "C" fn JNI_CreateJavaVM(
         // Park the VM for the life of the process.
         *guard = Some(ParkedVm(vm));
 
+        JNI_OK
+    }))
+    .unwrap_or(JNI_ERR)
+}
+
+/// Tear down the Invocation-API VM: the teardown registered with
+/// [`set_destroy_vm_hook`] and invoked by the vm crate's `DestroyJavaVM` slot.
+///
+/// Takes the parked VM out of [`CREATED_VM`] and drops it — releasing its
+/// `Arc<SharedVm>`, heap, and threads — then clears the calling thread's JNI TLS
+/// context (so a later JNIEnv-table call on this thread does not resolve a freed
+/// VM) and drops this VM's flat-API handle table (releasing the global refs that
+/// pinned its objects as GC roots, in case the host mixed the two surfaces).
+/// After this, [`JNI_GetCreatedJavaVMs`] reports 0.
+///
+/// One-VM-per-process / restart caveat: HotSpot does not support recreating a VM
+/// after `DestroyJavaVM`, and neither do we — CratonVM installs process-global
+/// signal handlers / sandbox roots and leaks the JNI function tables as
+/// process-lifetime singletons (see the design doc Risks). Clearing the registry
+/// makes the count honest and frees the VM instance; a *subsequent*
+/// `JNI_CreateJavaVM` in the same process is untested and unsupported.
+fn destroy_created_vm() -> JInt {
+    // SAFETY: pure Rust; wrapped in catch_unwind so a drop panic cannot unwind
+    // across the C `DestroyJavaVM` boundary.
+    catch_unwind(AssertUnwindSafe(|| {
+        let parked = match CREATED_VM.lock() {
+            Ok(mut g) => g.take(),
+            Err(_) => return JNI_ERR,
+        };
+        if let Some(parked) = parked {
+            // Release this VM's flat-handle table + global refs before dropping
+            // the VM (the SharedVm address keys the table; resolve it first).
+            drop_handle_table(&parked.0.shared);
+            // Clear the JNI TLS context for the calling thread: it was published
+            // to point at this VM; once dropped that Arc would dangle in TLS.
+            clear_jni_context();
+            drop(parked);
+        }
         JNI_OK
     }))
     .unwrap_or(JNI_ERR)
@@ -1794,6 +1837,15 @@ mod tests {
         // count is 0 unless a sibling test in this binary created a VM first;
         // either way it must be a valid non-negative count that was written.
         assert!(n == 0 || n == 1);
+    }
+
+    #[test]
+    fn destroy_created_vm_without_vm_is_noop_ok() {
+        // The `DestroyJavaVM` teardown is a no-op success when no Invocation-API
+        // VM is parked (the default test run never bootstraps one — the flat API
+        // does not touch `CREATED_VM`). This also pins idempotent double-destroy.
+        assert_eq!(destroy_created_vm(), JNI_OK);
+        assert_eq!(destroy_created_vm(), JNI_OK);
     }
 
     #[test]
