@@ -1,7 +1,113 @@
-# Handoff — ReflRepro GC corruption = register-resident missed JIT root (OPEN)
+# Handoff — ReflRepro GC corruption (OPEN) — title's "register-resident missed JIT root" is REFUTED, see 2026-06-22
 
 ---
-## RE-DIAGNOSIS 2026-06-18 (worktree `CratonVM-shadowdbg`, branch `dbg/shadow-reload-probe` @ `c9b56f7d`; precise-maps default-on + shadow reload fix)
+## RE-DIAGNOSIS 2026-06-22 (worktree `CratonVM-regroots`, branch `fix/jit-register-roots`, binary `cvmregroots.exe`, off dev `6e1c13a8`; precise-maps default-on)
+
+A fresh, systematic investigation (~20 controlled experiments + a 6-agent forensic
+workflow with adversarial verification) on the **current dev** binary **REFUTES the
+central premise of this whole document** ("register-resident missed JIT root") and
+substantially re-localizes the bug. **Read this before touching the code or re-running
+any of the levers below — most of the older lever table is now misleading.**
+
+### ⛔ REFUTED: it is NOT a missed root in *scan's JIT registers*
+`CRATONVM_JIT_SAFEPOINT_REG_SPILL=all` blind-spills the **FULL 14-GPR file (incl. RAX
+and every caller-saved/argument register)** to scanned frame slots at every GC-capable
+call safepoint (the `=all` mode in `jit/src/x64.rs::safepoint_reg_spill_all`, frame
+reservation at ~7153, store loop at ~8013). **This document's old table only ever tested
+`=1` (callee-saved only).** Result on `ReflRepro 8000 @ CRATONVM_DBG_GC_STRESS=65536`:
+`=all` is **BYTE-IDENTICAL to default** — same corruption, same RE-SYNC offsets (2624 /
+3304 / 66744), same exit. A live oop sitting in *any* of scan's JIT registers at a *call*
+safepoint would have been made visible by `=all`. It was not. **So the missed root, if
+one exists, is NOT in scan's JIT-compiled register/operand state at a call safepoint.**
+(`=all` does NOT spill a *native's* Rust registers, so it does not rule out a native-side
+root — see below.)
+
+### ✅ ESTABLISHED: the bug is a miscompile/codegen-context bug of the single method `ReflRepro.scan`
+- `CRATONVM_JIT_BISECT_SKIP=ReflRepro.scan` → **fully clean** (`ok=8000 bad=0 rc=0`).
+  Skipping `describeField` alone does **nothing**: `describeField` *bails* on `op=0xba`
+  (`invokedynamic`, from the `+` string-concat `makeConcatWithConstants`) and is **never
+  JIT-compiled** — it always runs interpreted. So the corruption is driven entirely by the
+  JIT codegen of **`scan`** (single-pass, invocation-tier-up, `len=5880`).
+- A *generic* missed-root would not care which method is compiled. This one does ⇒ it is in
+  scan's compiled code path, i.e. the **regalloc/codegen family**
+  (`jit-regalloc-callee-saved-clobber-family.md`), NOT the GC-root-coverage family.
+- `--nojit` clean. `-Xmx 4g` (suppress young GC) does not crash. Needs GC.
+
+### What ruled-OUT (current binary, each rebuilt-free env A/B)
+| lever | result | reading |
+|---|---|---|
+| `CRATONVM_JIT_SAFEPOINT_REG_SPILL=all` | byte-identical | NOT scan's JIT registers (see above) |
+| `CRATONVM_NO_PRECISE_JIT_MAPS=1` | **WORSE** (rc=132 SIGILL, ~3116 warns vs ~217) | precise-maps' oop-local spill+reload **MASKS most** of it; underlying bug is in base regalloc |
+| `CRATONVM_JIT_DISABLE_INLINE_NEW=1` | still corrupts | scan's only alloc (the StringBuilder) inline-new is header-before-commit & correct |
+| `CRATONVM_JIT_NO_CALLEE_OOP_FLUSH=1` | still corrupts | not the operand-stack callee-saved oop flush |
+| `CRATONVM_NO_CTOR_DIRECT_CALL=1` | still corrupts | not ctor-direct-call |
+| OSR disable (scan's loops < OSR threshold anyway) | still corrupts | invocation-tier-up, not OSR |
+| `CRATONVM_DBG_FORCE_MOVING=1` | **no crash, `ok=1917 bad=83`, `MISMATCH: java.lang.Object`** | see below |
+
+### Decisive `FORCE_MOVING` finding — reconciles the collector story
+Under `FORCE_MOVING` (moving collector even with scan's JIT frame live) there is **no
+crash but wrong results** (a returned object decayed to bare `java.lang.Object`). So:
+- The corruption happens under **both** collectors **whenever scan's JIT frame is live**;
+  it is tied to the **JIT frame**, not the sweep's linear walk. The crash/hang (rc=127/139)
+  is just the **non-moving sweep's** downstream reaction (linear-walk desync on the
+  resulting garbage header); the moving collector instead silently returns wrong results.
+- `sb` (the StringBuilder) **IS** found as a conservative root at `[rbp-0x10]` (FORCE_MOVING
+  *relocates* it → stale slot → `java.lang.Object`), so under the default **non-moving**
+  sweep `sb` is **pinned, not reclaimed**. Therefore the non-moving corruption is **not a
+  simple reclaim of `sb`** — the primary corrupted object (`CRATONVM_DBG_SWEEP_EDGES`:
+  `root=1 ... mark filter rejected a live root`, header **already garbage at mark time**)
+  is a **different** live object whose only reference, when scan is JIT-compiled, is not a
+  GC root — and a **write/use-after-free corrupts a header**, which the GC then merely
+  *detects*. It is **not** the clean "object reclaimed by the sweep" story the old text tells.
+
+### Reproducer isolation (confirms context-sensitivity — matches the family doc)
+Two minimal Java reproducers of scan's *shape* — `scratch-min/Min.java` (StringBuilder held
+across a `String[]` for-each calling a `+`-concat-bailing helper) and `scratch-min/Min2.java`
+(two loops over **freshly-allocated-inside-scan** arrays) — **do NOT reproduce** (`bad=0`).
+**Only the real reflection natives** (`getDeclaredFields`/`getDeclaredMethods`/`isSynthetic`/
+`getName`/`getParameterCount`) inside scan trigger it. This matches
+`jit-regalloc-callee-saved-clobber-family.md`'s key finding: *"NOT reproducible by bytecode
+shape … context-sensitive register allocation … per-method skip bisection, not a small
+synthetic repro, is what localizes each instance."*
+
+### Forensic workflow verdicts (6 agents, all 3 root-cause hypotheses REFUTED)
+1. "JIT spills r13/r14 before every call but never reloads them" — **REFUTED**: r13/r14 are
+   Win64 callee-saved (ABI-preserved); `[rbp-0x20]/[rbp-0x28]` are **GC-root spill slots
+   written-but-never-read by design** (`emit_pre_safepoint_spill` ~7999: "no post-call reload
+   needed under the non-moving sweep"). scan's loop counters are maintained in-register
+   correctly (`cmp r13d,r14d` etc.).
+2. "Commit-before-header marking window in the slow heap-alloc path" — **REFUTED**: the
+   collector is STW (`collect_garbage` takes a `StopTheWorldToken`), GC runs only *after*
+   `try_alloc_young`/`tlab_alloc_object` returns (header written), and the sweep and the
+   allocator are mutually exclusive on `young_from.lock()`.
+3. "RAX native-return-value root gap before push_from_rax" — **REFUTED**: `emit_pre_safepoint_spill`
+   precedes every GC-capable call, the post-return sequence has no intervening safepoint, and
+   the young GC fires *inside* the interpreted callee where the in-flight oops live in that
+   callee's own (rooted, band-covered) interpreter frame.
+
+### Net status + the actual next step
+**A2 is a context-sensitive miscompile of `ReflRepro.scan`'s single-pass JIT codegen
+(regalloc family), NOT a register-resident GC-root gap.** The old "register-resident /
+native-call-return missed root" framing is the wrong lens for the *single-thread* A2 repro
+(it may still apply to the multi-thread A4 sibling). The remaining unknown is the exact
+write/clobber: a value that scan's interpreter frame roots/keeps-correct but scan's JIT
+codegen does not, **at a point `=all` GPR-spill does not cover** (i.e. NOT a call-safepoint
+register) — candidates that survived all elimination: (a) a value live across a **non-call
+back-edge** in a register the back-edge flush does not cover, or (b) a **native-side**
+(reflection-native Rust) in-flight/return oop invisible to both the conservative scan and
+`=all`. The principled fixes remain the deferred **precise-JIT-maps / regalloc project**
+(precise oop maps that the *moving* remap consumes **and** correct callee-saved liveness
+across calls). The validated **interim disposition** is the regalloc-family practice: a
+targeted `skip_list::is_known_miscompile` ban on the real-world carrier methods
+(JUnit `ReflectionUtils.streamFields` / `AnnotationUtils.findAnnotation`-style reflection
+iterators), with `bad=0` on `ReflRepro 8000 @ GC_STRESS=65536` + no bintrees/Spring/WildFly
+regression as the bar.
+
+Repro (unchanged): `CRATONVM_DBG_GC_STRESS=65536 cvmregroots.exe --java-home <jdk25> -cp
+docs/known-issues/repros/A2-reflrepro ReflRepro 8000`. `javac` the class first.
+
+---
+## RE-DIAGNOSIS 2026-06-18 (worktree `CratonVM-shadowdbg`, branch `dbg/shadow-reload-probe` @ `c9b56f7d`; precise-maps default-on + shadow reload fix) — SUPERSEDED in part by 2026-06-22 above (the `=all` test was never run in this section)
 
 A full re-investigation on the **current** binary corrects two load-bearing claims in
 the 2026-06-17 section below and re-confirms the rest. **Net: A2 is a register-resident
