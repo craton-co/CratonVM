@@ -134,12 +134,31 @@ graph and resumed at the trapping bci instead of bailing to re-run.
   the safe re-run (fail-safe). It deliberately does NOT type-check per-slot
   (cat-2/FP `Unsupported` slots legitimately re-run — flagging them would be a
   false positive). 4 tests; 35/35 deopt lib tests green; gate-off byte-identical.
-- **A4 / verifier increment 2 — STILL OWED (the eager-deopt differential).** Force
-  a deopt at a *non-failing* guard, reconstruct, and compare the
-  reconstructed-interpreter end-result against the JIT result — the form that
-  catches a *value* drift (right slot count, wrong contents) the structural layer
-  cannot. It needs a forced-deopt injection hook + a side-effect-free (or
-  re-run-safe) method set to compare against; it is a harness, not a cheap check.
+- **A4 / verifier increment 2 — DONE (2026-06-21, branch `feat/deopt-osr-verifier`).**
+  Oop-plausibility layer `verify_reconstructed_oops`: every `Object(addr)` slot
+  (locals, stack, and recursively the already-real `Object` fields of
+  scalar-replaced descriptors) must be null or a real heap address
+  (`heap.is_heap_addr` — alignment + region containment, no header deref, safe on
+  a garbage word). Catches the most dangerous drift the structural layer cannot —
+  a non-oop value (small int / wild pointer) in a slot resumed as an object ref, a
+  UAF on first deref. Fail-safe (forces re-run). 1 test; 36/36 deopt lib green;
+  gate-off byte-identical. **The verifier's runtime fail-safe role is now complete
+  (structural + oop layers).**
+- **A4 / verifier increment 3 — the eager-deopt VALUE differential — INFRA-BLOCKED
+  (= task #7).** Force a deopt at a *non-failing* guard, reconstruct, and compare
+  the reconstructed-interpreter end-result against the JIT result — the form that
+  catches a *value* drift (right slot count + valid oops, wrong contents) the two
+  runtime layers cannot. Two concrete blockers, the same ones that block the
+  end-to-end BCE test: (1) the `deopt_real_enabled()` / `deopt_verify_enabled()`
+  gates are **read-once cached**, so one in-process test cannot run the method both
+  gate-on and gate-off to diff — it needs a *separate-process* harness (spawn the
+  VM twice with different env, diff output / golden checksum) **or** a `pub`
+  non-`cfg(test)` gate override; (2) forcing a deopt at a guard the speculation
+  did NOT fail needs a codegen trigger (an unconditional deopt at the BCE guard,
+  analogous to the existing `osr_exit_test_trigger_bci` / `CRATONVM_OSR_EXIT_TEST`).
+  Recommended path: add the forced-BCE-deopt gate in `emit_deopt_stubs`, then a
+  scripted separate-process differential over a golden-checksum benchmark (bt18 =
+  68332206) under `CRATONVM_DEOPT_REAL=1` + the force gate.
 
 **x64-backport Step 5 — `can_deopt_resume` coverage gate DONE (2026-06-21).** At
 x64 finalize `cm.can_deopt_resume = !deopt_points.is_empty() &&
