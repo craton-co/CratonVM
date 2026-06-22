@@ -272,14 +272,18 @@ fn field_value_to_value(
 ) -> Result<Value, MethodCallFailed> {
     let value = match fv {
         FrameValue::Int(i) => Value::Int(*i as i32),
+        FrameValue::Long(l) => Value::Long(*l),
+        // Cast: raw IEEE-754 bits -> f32/f64 (deopt-osr P2).
+        FrameValue::Float(bits) => Value::Float(f32::from_bits(*bits as u32)),
+        FrameValue::Double(bits) => Value::Double(f64::from_bits(*bits)),
         FrameValue::Object(addr) => Value::Object(object_ref_from_addr(*addr)),
         FrameValue::VirtualObject(state) => Value::Object(Some(shell_for(shells, state.id)?)),
         FrameValue::VirtualObjectRef(id) => Value::Object(Some(shell_for(shells, *id)?)),
         FrameValue::Undefined => Value::Int(0),
-        // Float / Long / Double-in-field (cat-2 + FP slots), and unresolved
-        // Register / StackSlot / StackSlotRef / Unsupported, are follow-ups
-        // (the deopt model carries no per-field type tag yet). Refuse so the
-        // caller falls back to the safe re-run path rather than store garbage.
+        // Unresolved machine forms (Register / RegisterLong / Xmm* / StackSlot* —
+        // resolved in-stub before the sink) and `Unsupported` must never reach a
+        // materialized field. Refuse so the caller falls back to the safe re-run
+        // path rather than store garbage.
         other => {
             return Err(MethodCallFailed::InternalError(VmError::Internal {
                 message: format!("deopt materialize: unsupported field value {other:?}"),

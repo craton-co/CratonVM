@@ -7772,14 +7772,13 @@ fn ir_deopt_resume_enabled() -> bool {
 
 /// Map ONE reconstructed `FrameValue` (already resolved in-stub against the
 /// machine state) to an interpreter `Value`. Handles the type-source kinds the
-/// producer can emit today: a cat-1 `Int`, a cat-2 `Long`, a cat-1 `Float`, a
-/// cat-2 `Double` (Slice C — FP-slot resume), and an object-reference
-/// (`StackSlotRef`, resolved in-stub to a raw heap-pointer word). Returns `None`
-/// for any not-yet-reconstructable variant (`Unsupported`/`VirtualObject`/
-/// `VirtualObjectRef`, or an unresolved `Register`/`StackSlot*` which should
-/// never reach here), so the caller falls back to the safe re-run path rather
-/// than materialise a mistyped
-/// slot.
+/// producer can emit: a cat-1 `Int`, a cat-2 `Long`, cat-1 `Float` / cat-2
+/// `Double` (deopt-osr P2 — raw IEEE-754 bits → `f32`/`f64`), and an
+/// object-reference (`StackSlotRef`, resolved in-stub to a raw heap-pointer
+/// word). Returns `None` for any not-yet-reconstructable variant
+/// (`Unsupported`/`VirtualObject`/`VirtualObjectRef`, or an unresolved
+/// `Register`/`StackSlot*` which should never reach here), so the caller falls
+/// back to the safe re-run path rather than materialise a mistyped slot.
 ///
 /// `Object(w)` is the `real-frame-deopt` type source for ref-typed slots (e.g.
 /// an instance method's `this`): `w` is the raw heap pointer captured **in-stub**
@@ -7794,10 +7793,10 @@ fn fv_to_value(v: &cratonvm_jit::deopt::FrameValue) -> Option<Value> {
     match v {
         FrameValue::Int(i) => Some(Value::Int(*i as i32)),
         FrameValue::Long(l) => Some(Value::Long(*l)),
-        // FP-slot resume (Slice C): a `float`/`double` live at a deopt guard is
-        // carried as raw bits (`Float` = low-32, `Double` = full-64) and rebuilt
-        // into the typed `Value`. A `Double` is cat-2 (one compact operand-stack
-        // slot, two JVM local slots — see `ir_deopt_locals`).
+        // FP-slot resume: a `float`/`double` live at a deopt guard is carried as
+        // raw bits (`Float` = low-32, `Double` = full-64) and rebuilt into the
+        // typed `Value`. A `Double` is cat-2 (one compact operand-stack slot, two
+        // JVM local slots — see `ir_deopt_locals`).
         FrameValue::Float(bits) => Some(Value::Float(f32::from_bits(*bits as u32))),
         FrameValue::Double(bits) => Some(Value::Double(f64::from_bits(*bits))),
         FrameValue::Object(w) => Some(match *w {
@@ -7822,12 +7821,13 @@ fn ir_deopt_frame_values(vals: &[cratonvm_jit::deopt::FrameValue]) -> Option<Vec
 
 /// Map the reconstructed **locals** `FrameValue`s to a *compact* interpreter
 /// arg list for `Frame::new_pooled`. Unlike the operand stack, JVM local slots
-/// are category-2 *two-slot*: a `long` at slot `i` reserves the upper half at
-/// `i+1`, which the snapshot records as `Undefined` (NO_NODE). `copy_args_to_locals`
-/// (inside `new_pooled`) re-expands each cat-2 arg back into its two slots, so we
-/// must hand it a COMPACT list (one entry per long) — passing the JVM-slot-indexed
-/// snapshot verbatim, with its placeholder, would mis-align every subsequent
-/// local. We therefore skip the reserved upper-half slot after each `Long`.
+/// are category-2 *two-slot*: a `long`/`double` at slot `i` reserves the upper
+/// half at `i+1`, which the snapshot records as `Undefined`/`HighHalf`.
+/// `copy_args_to_locals` (inside `new_pooled`) re-expands each cat-2 arg back into
+/// its two slots, so we must hand it a COMPACT list (one entry per cat-2 value) —
+/// passing the JVM-slot-indexed snapshot verbatim, with its placeholder, would
+/// mis-align every subsequent local. We therefore skip the reserved upper-half
+/// slot after each `Long`/`Double`.
 fn ir_deopt_locals(vals: &[cratonvm_jit::deopt::FrameValue]) -> Option<Vec<Value>> {
     use cratonvm_jit::deopt::FrameValue;
     let mut out = Vec::with_capacity(vals.len());
@@ -7932,42 +7932,6 @@ fn resume_from_ir_deopt(
     }
     push_frame_and_fire_entry(thread, frame);
     Some(CachedCallResult::FramePushed)
-}
-
-/// real-frame-deopt Step 3 — Object-aware sibling of `ir_deopt_frame_values`.
-/// Maps reconstructed `FrameValue`s to interpreter `Value`s INCLUDING object
-/// references; refuses (returns `None`) on any variant the clean Step-3 pilot
-/// must not fabricate: `Float`, the unresolved machine forms
-/// (`Register`/`StackSlot`/`StackSlotRef` — these are resolved by the jit-crate
-/// `x64_deopt_entry` before stashing and must never reach the sink),
-/// `VirtualObject`/`VirtualObjectRef` (scalar-replaced; Steps 5-6), and
-/// `Unsupported` (the cat-2 `long`/`double` sentinel — never fabricate a cat-2
-/// slot). `Object(addr)` → `Value::Object(Some(ObjectRef::from_raw))` (or null
-/// for `addr == 0`); `Int`/`Undefined` map exactly as the int-only path.
-fn ir_deopt_frame_values_with_objects(
-    vals: &[cratonvm_jit::deopt::FrameValue],
-) -> Option<Vec<Value>> {
-    use cratonvm_jit::deopt::FrameValue;
-    vals.iter()
-        .map(|v| match v {
-            // Cast: operand reinterpreted as i32 (JVM 32-bit stack word)
-            FrameValue::Int(i) => Some(Value::Int(*i as i32)),
-            FrameValue::Undefined => Some(Value::Int(0)),
-            FrameValue::Object(addr) => {
-                let obj = if *addr == 0 {
-                    None
-                } else {
-                    // SAFETY: `addr` is a live heap object address captured in
-                    // the deopt frame by `x64_deopt_entry`; `from_raw` only
-                    // debug-asserts non-null / alignment.
-                    Some(unsafe { ObjectRef::from_raw(*addr as usize as *mut u8) })
-                };
-                Some(Value::Object(obj))
-            }
-            // Cat-2 / unresolved / virtual / FP — bail to the safe re-run path.
-            _ => None,
-        })
-        .collect()
 }
 
 /// CRATONVM_DEOPT_VERIFY (x64-backport Step 5 / Workstream A4) — structural
@@ -8196,8 +8160,15 @@ fn build_deopt_frame_inner(
         rframe
     };
 
-    let locals = ir_deopt_frame_values_with_objects(&rframe.locals)?;
-    let stack_vals = ir_deopt_frame_values_with_objects(&rframe.stack)?;
+    // deopt-osr P2 — map via the cat-2-aware mappers (both route through
+    // `fv_to_value`, so Int/Long/Float/Double/Object/Undefined all map): LOCALS
+    // collapse the JVM-two-slot snapshot (a `long`/`double` reserves its upper
+    // half, skipped) into the compact arg list `Frame::new_pooled` re-expands; the
+    // operand STACK is already compact (one entry per value). Any unresolvable
+    // slot (`Unsupported`/virtual/unresolved machine form) returns `None` → safe
+    // re-run.
+    let locals = ir_deopt_locals(&rframe.locals)?;
+    let stack_vals = ir_deopt_frame_values(&rframe.stack)?;
 
     // ROOT the reconstructed oops BEFORE the GC-capable refill (locals then
     // stack — the order the re-read below relies on).
@@ -8541,10 +8512,11 @@ mod deopt_step3_tests {
         }
     }
 
-    /// Pure mapper: Int/Undefined/Object map; cat-2 `Unsupported` + virtual bail.
+    /// Pure stack mapper (`ir_deopt_frame_values` → `fv_to_value`):
+    /// Int/Undefined/Object map; `Unsupported` + virtual bail.
     #[test]
     fn maps_int_and_object_refuses_cat2_and_virtual() {
-        let got = ir_deopt_frame_values_with_objects(&[
+        let got = ir_deopt_frame_values(&[
             FrameValue::Int(42),
             FrameValue::Undefined,
             FrameValue::Object(0x1000),
@@ -8560,8 +8532,8 @@ mod deopt_step3_tests {
                 Value::Object(None),
             ])
         );
-        assert!(ir_deopt_frame_values_with_objects(&[FrameValue::Unsupported]).is_none());
-        assert!(ir_deopt_frame_values_with_objects(&[FrameValue::VirtualObjectRef(0)]).is_none());
+        assert!(ir_deopt_frame_values(&[FrameValue::Unsupported]).is_none());
+        assert!(ir_deopt_frame_values(&[FrameValue::VirtualObjectRef(0)]).is_none());
     }
 
     /// ldiv/lrem long deopt-resume: a `long` reconstructs as a full-64-bit
@@ -8616,6 +8588,57 @@ mod deopt_step3_tests {
         assert!(matches!(frame.get_local(1), Value::Object(Some(_))));
         assert_eq!(frame.stack.len(), 1);
         assert_eq!(frame.stack.peek_at(0), Value::Int(7));
+        drop(frame);
+        thread.native_pin_roots.truncate(pin_base);
+    }
+
+    /// deopt-osr P2 — a frame with cat-2 `long`, cat-1 `float` locals and a
+    /// cat-2 `double` on the operand stack reconstructs with the right widths.
+    /// The locals cat-2 collapse must keep slots aligned: the `long`'s reserved
+    /// upper half (an `Undefined` placeholder in the snapshot) is dropped and
+    /// re-expanded by `copy_args_to_locals`, so the `float` at JVM slot 2 lands
+    /// at slot 2 (NOT shifted into the long's high half), and the `int` at 3.
+    #[test]
+    fn builds_cat2_and_fp_frame() {
+        let shared = Arc::new(SharedVm::new(VmConfig::default()));
+        let mut thread = JvmThread::new(ThreadId(0), "test");
+        let cached = minimal_cached(); // max_locals = 4, max_stack = 8
+
+        // JVM-slot locals for (long a, float f, int n): a@0 (upper half @1),
+        // f@2, n@3.
+        let rf = rframe(
+            vec![
+                FrameValue::Long(0x7_0000_0001),
+                FrameValue::Undefined, // long's reserved upper half
+                FrameValue::Float(2.5f32.to_bits() as u64),
+                FrameValue::Int(9),
+            ],
+            vec![FrameValue::Double(std::f64::consts::PI.to_bits())],
+            3,
+        );
+
+        let pin_base = thread.native_pin_roots.len();
+        let frame = build_deopt_frame_inner(&shared, &mut thread, &cached, &rf, false)
+            .expect("cat-2/FP frame must build");
+        assert_eq!(frame.pc, 3);
+        // The long is stored at slot 0 with all 64 bits intact (the resumed
+        // `lload` reads the raw word as a long — `local_kinds` disambiguates
+        // long-vs-double, which the generic NaN-boxed `get_local` cannot).
+        assert_eq!(
+            frame.get_local_raw(0),
+            0x7_0000_0001,
+            "long keeps all 64 bits (no truncation)"
+        );
+        // The cat-2 collapse kept the float at slot 2 and the int at slot 3 — had
+        // the long's upper half NOT been dropped, these would shift by one.
+        assert_eq!(frame.get_local(2), Value::Float(2.5), "float at its own slot");
+        assert_eq!(frame.get_local(3), Value::Int(9), "int not shifted by collapse");
+        assert_eq!(frame.stack.len(), 1);
+        assert_eq!(
+            frame.stack.peek_at(0),
+            Value::Double(std::f64::consts::PI),
+            "double on the operand stack (compact, one slot)"
+        );
         drop(frame);
         thread.native_pin_roots.truncate(pin_base);
     }
@@ -23830,22 +23853,23 @@ mod tests {
         );
         assert_eq!(mapped[4], Value::Int(0), "Undefined → zero slot");
 
-        // Not-yet-reconstructable variants force the safe re-run (None).
-        assert!(
-            ir_deopt_frame_values(&[FrameValue::Unsupported]).is_none(),
-            "an Unsupported slot must re-run, not resume"
-        );
-        // Slice C: FP-in-slot now resolves to the typed Value (not a re-run).
-        // Float carries the 32-bit bits in the low word; Double the full 64.
+        // deopt-osr P2 — cat-1 `float` and cat-2 `double` now reconstruct from
+        // their raw IEEE-754 bits (resolved in-stub from the slot/XMM).
         assert_eq!(
             ir_deopt_frame_values(&[FrameValue::Float(1.5f32.to_bits() as u64)]),
             Some(vec![Value::Float(1.5)]),
-            "a float slot resolves to Value::Float"
+            "a float slot maps to Value::Float"
         );
         assert_eq!(
-            ir_deopt_frame_values(&[FrameValue::Double(3.25f64.to_bits())]),
-            Some(vec![Value::Double(3.25)]),
-            "a double slot resolves to Value::Double"
+            ir_deopt_frame_values(&[FrameValue::Double(std::f64::consts::PI.to_bits())]),
+            Some(vec![Value::Double(std::f64::consts::PI)]),
+            "a double slot maps to Value::Double"
+        );
+
+        // The unresolved machine forms / sentinel still force the safe re-run.
+        assert!(
+            ir_deopt_frame_values(&[FrameValue::Unsupported]).is_none(),
+            "an Unsupported slot must re-run, not resume"
         );
     }
 
@@ -23869,6 +23893,17 @@ mod tests {
             locals,
             vec![Value::Long(7), Value::Int(9)],
             "the long's reserved upper-half placeholder must be dropped"
+        );
+
+        // deopt-osr P2 — a cat-2 `double` collapses identically to a `long`.
+        assert_eq!(
+            ir_deopt_locals(&[
+                FrameValue::Double(std::f64::consts::PI.to_bits()),
+                FrameValue::Undefined, // reserved upper half of the double — skipped
+                FrameValue::Float(1.5f32.to_bits() as u64),
+            ]),
+            Some(vec![Value::Double(std::f64::consts::PI), Value::Float(1.5)]),
+            "the double's reserved upper-half placeholder must be dropped",
         );
 
         // A genuine (non-long) Undefined local is kept as a zero slot.
