@@ -1,14 +1,23 @@
 # IR FP XMM tier — remaining-work handoff
 
+> **ARCHIVED / COMPLETE (2026-06-22).** This was the live handoff for the
+> remaining FP-tier slices; **all of them landed and the tier is flipped
+> default-ON** (commit `14635585`). It now lives under `docs/internal/` as
+> **non-normative historical scratch** — kept only for its per-slice mechanism
+> detail. The canonical, current status is
+> [`docs/feature-designs/activate-ir-optimizer.md`](../../feature-designs/activate-ir-optimizer.md)
+> "Remaining roadmap" item 3 (which also carries the shared invariants). Do not
+> cite this file as current truth; where it says a slice "remains", read "done".
+
 Handoff for whoever continues `activate-ir-optimizer.md` **roadmap item 3** (the
-double/float XMM value tier). Three slices remain. This doc gives the concrete
-mechanism, approach, and gotchas for each, plus the shared invariants you must
-preserve.
+double/float XMM value tier). *(Originally: three slices remain — all now done.)*
+This doc gives the concrete mechanism, approach, and gotchas for each, plus the
+shared invariants you must preserve.
 
 ## What is already DONE (on `dev`)
 
-The FP tier is gated default-OFF behind **`CRATONVM_JIT_IR_FP`** (`=1` opt-in).
-Landed increments:
+*(As of archival: the FP tier is **default-ON**; `CRATONVM_JIT_IR_FP=0` opts out.
+The "gated default-OFF" framing below is the pre-flip state.)* Landed increments:
 
 | inc | what |
 |-----|------|

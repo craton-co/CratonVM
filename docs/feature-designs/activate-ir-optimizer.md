@@ -15,7 +15,7 @@ A/B/C) is **opcode-complete and flipped default-ON** (commit `14635585`).
 unrolling of small constant-trip counted loops) — gated on a **trivial-phi
 elimination** fix that finally makes LICM non-inert on production IR (each with a
 `=0` opt-out). See the per-increment sections below and
-**["Remaining roadmap"](#remaining-roadmap-post-inc-29)** for what is left
+**["Remaining roadmap"](#remaining-roadmap-post-inc-36)** for what is left
 (guard-surviving scalar replacement — blocked on `real-frame-deopt.md`; and
 SCEV-driven LICM — an unwired enhancement). Original plan text follows.
 
@@ -1776,13 +1776,18 @@ float-to-int `as`, which matches the JVM `f2i`/`d2i` semantics exactly).
 is non-vacuous: `IR_LOWER_COMPILES`==1 with `ir_emit_fp` on, ==0 without. **824/824
 jit lib, 50/50 differential, `cratonvm-vm` builds clean.**
 
-**Remaining (FP tier follow-ups, dependency order):** FP compares + branches
-(`fcmp`/`dcmp` via `ucomiss`/`ucomisd` → the 3-way `{-1,0,1}` result feeding
-`if<cond>`); FP array load/store (`faload`/`fastore`/…); FP params/returns +
-call-args (XMM prologue/epilogue marshalling + an FP-aware `try_call`/VM call
-convention — the `double` call-args/returns unlock); `frem`/`drem` (`fmod` helper);
-FP-slot deopt resume (so an FP value may be live at a deopt — lets the int-div and
-`ldc2_w` exclusions lift).
+**FP tier follow-ups — ✅ ALL DONE (this section is now historical).** Every
+inc-30 follow-up below has since landed and the tier is flipped **default-ON**
+(commit `14635585`): FP compares + branches (inc 31), `double`/`float` returns +
+`D`/`F` call-returns (inc 32/33), FP params + `D`/`F` call-args (inc 34, no XMM
+marshalling needed — see the i64-ABI realization), `double` `ldc2_w` constants
+(inc 35), `frem`/`drem` (slice A), FP arrays (slice B), and FP-slot deopt resume
+which lifted the int-div / `ldc2_w` exclusions (slice C). The consolidated,
+current status — including the *key realization* that this VM marshals FP through
+**integer** registers (the doc's "FP args in XMM" was wrong) — is in
+**["Remaining roadmap" item 3](#remaining-roadmap-post-inc-36)**; the per-slice
+mechanism detail is archived in
+`docs/internal/feature-designs/ir-fp-tier-remaining.md`.
 
 ## Runtime wiring — the reachability fix (`CRATONVM_JIT_C2_FIRST_CALL`, gated) landed
 
@@ -2090,9 +2095,32 @@ are landed and (where flagged) default-ON. What remains, in dependency order:
    default-ON, commit `14635585`).** Inc 30–35 plus slices **A** (`frem`/`drem`,
    `62f6e6f4`), **B** (FP arrays, `f9cfc485`), **C** (FP-slot deopt resume,
    `5312b11c`) landed; the FP IR tier admits any FP method and is now the default
-   (`CRATONVM_JIT_IR_FP=0` opts out). See `docs/feature-designs/ir-fp-tier-remaining.md`
-   for the per-slice status. The original (now-historical) per-bullet plan follows.
-   The whole second half of category-2. The XMM
+   (`CRATONVM_JIT_IR_FP=0` opts out). The per-slice mechanism detail is archived in
+   `docs/internal/feature-designs/ir-fp-tier-remaining.md` (a completed handoff,
+   non-normative).
+
+   **Shared invariants the FP tier preserves (DO NOT BREAK when extending it):**
+   (1) **Compact all-GPR i64 ABI** — `execute_jit_call`/`jit_invoke_dispatch`
+   marshal *every* value, FP included, as `to_bits() as i64` in an INTEGER
+   register, and read returns from RAX (`as u64`/`as u32` → `from_bits`). There is
+   **no XMM at the VM↔JIT or JIT↔JIT call boundary** (this is why inc 34 needed
+   zero codegen). (2) **`i64::MIN` deopt sentinel** — a callee signals
+   exception/deopt with `i64::MIN`; a legit `Long.MIN_VALUE`/`-0.0`/`+0.0f`(stale
+   upper) collides, so the call-site `dispatch_threw` peek disambiguates on the
+   rare `RAX == i64::MIN` branch (`Op::Call` in `ir_lower.rs`;
+   `emit_post_invoke_exception_check(ret_type)` in `x64.rs`; already covers
+   `Long`/`Double`/`Float`). A new `i64::MIN`-capable return type must be added
+   there. (3) **The FP gate** (`jit/src/lib.rs`, `try_compile_inner`) admits a
+   method iff `ir_emit_fp && fp_in_body` (`fp_in_body` = any opcode in
+   `is_float_opcode`/`is_double_opcode`) — a new FP opcode must join those sets.
+   (4) **Gate-OFF byte-identical** — with `CRATONVM_JIT_IR_FP=0` no FP opcode may
+   reach the IR builder (admission alone is the gate). (5) **Differential
+   discipline** — add `ir_vs_singlepass` cases via `check_fp` (IR == single-pass ==
+   host IEEE anchor) plus a real-VM E2E `== HotSpot`; bt10/14/16/18 (`135854 /
+   3222190 / 14985902 / 68332206`) must hold.
+
+   *The original (now-historical) per-bullet plan follows* — the whole second half
+   of category-2. The XMM
    register class in `ir_lower.rs` now exists, and **inc 30** (behind
    `CRATONVM_JIT_IR_FP`, default-OFF) lowers the FP **value ops** (`fadd`/`dadd`/
    …, `fneg`/`dneg`), **constants** (`fconst`/`dconst`), **FP-local load/store**
