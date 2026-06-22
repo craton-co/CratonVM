@@ -89,6 +89,15 @@ the ~30 docs map to **one root-cause family + ~15 distinct standalone bugs**, of
     GC-STW-vs-reactor-shutdown race exposed by snapshot timing), **NOT** a socket/OP_WRITE bug and **NOT** an
     rs_cache correctness bug. Reliably avoided by `CRATONVM_ROOTSNAP_CACHE=0` (suite-level — do NOT flip the
     global default). Supersedes the former `reactor-worker-thread-leak-at-shutdown.md` (removed — see git history).
+17. **[GC: gen-GC loses a CompletableFuture completion under promotion + churn](gc-gen-promotion-completablefuture-completion-loss.md)** —
+    🔴 **OPEN** (workarounds: `-XX:+UseG1GC` / `CRATONVM_NO_GC_PROMOTION=1`). Blocks the Keycloak/Quarkus boot
+    at the Hibernate SessionFactory build: a thread parked in `CompletableFuture.get()` (`JPAConfig.startAll`
+    → `Signaller.block` → `LockSupport.park`) is never unparked because the **gen (copying) GC loses the young
+    `Signaller`** when the future is **promoted to old gen** while the Signaller stays young. `NO_GC_PROMOTION`
+    reliably fixes; G1 immune; 3 s repro `CFProbe2` (embedded in the doc). The loss is **same-GC** (mark/evacuate
+    race vs the completing worker), NOT a missed next-GC card (conservative card-marking was insufficient).
+    **Heisenbug**: `SP_VERIFY`/`DBG_SWEEP_EDGES` mask it; needs non-perturbing observation. Path =
+    `gen_heap.rs::sweep_young_non_moving`. Same moving-GC family as #15.
 
 FIXED bugs whose standalone docs were **removed** from this folder (resolved; full writeups in
 `git` history or [`docs/internal/fixed-suite-bugs/`](../internal/fixed-suite-bugs/)): A1 (reflection
@@ -128,6 +137,24 @@ stale reference later reads an all-zero / garbage header → `inconsistent heade
 `Stale pointer … all-zero header`, CCE, NPE, or SIGSEGV. `--nojit` always passes
 (interpreter frames are precisely scanned and the moving collector remaps every
 root); `-Xmx8g` passes (no young GC).
+
+> **Current-dev refresh (2026-06-22, dev `14afc6a6`+, precise-jit-maps-default
+> Steps 1–8).** **A3 is CLOSED** by precise JIT oop maps (default-on) — validated
+> green across the GC-root repro+bench lane, OSR frames, and the BouncyCastle app
+> suites (`test-infra/regression-pool/gc-root-lane.sh` + `gc-root-apps-lane.sh`).
+> **A2 remains OPEN, unchanged:** `ReflRepro 8000 @ GC_STRESS=65536` still
+> `rc=139` (register-/native-return-resident missed root → UAF; no stack scan can
+> see a live register — dedicated GC/JIT core work). **A4 is OPEN but non-fatal
+> on the repro here:** gated `CRATONVM_REAL_FORKJOINPOOL=1` Fork6 is 6/6 ALL-OK on
+> current dev (the older ~15% reclamation does not reproduce), though the
+> cross-thread STW JIT-root gap is still *exercised* (`scan_active_jit_frames`
+> WARN) — that scan is the tracked follow-up. The *family is not formally
+> retired* (A2/A4 open); **nothing was removed** — all repros, GC guards,
+> `CRATONVM_DBG_*` knobs, and the shadow stack are retained as experimental/debug
+> tools.
+>
+> See `docs/feature-designs/precise-jit-maps-default.md` "Step 8 — GC-root family
+> retirement status".
 
 The eventual correct fix for the whole family is **precise JIT stack roots**
 (know exactly which registers/slots hold oops at each safepoint), tracked under
