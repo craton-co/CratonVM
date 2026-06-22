@@ -6384,6 +6384,40 @@ mod tests {
         assert_eq!(JNI_VERSION_1_8, 0x00010008);
     }
 
+    /// Regression for the `AttachCurrentThread`/`GetEnv` JNIEnv* indirection bug:
+    /// `write_jni_env` must hand back `get_jni_env()` (a pointer-to-pointer-to
+    /// function-table) so `(*env)[slot]` resolves a function — NOT the
+    /// table-array pointer `JNI_TABLE_PTR.load()`, which is one indirection too
+    /// shallow and made `(*env)[slot]` read a function's code bytes as a slot
+    /// pointer (jump-to-garbage, the first crash the foreign-attach soak hit).
+    #[test]
+    fn attach_env_indirection_is_correct() {
+        use std::sync::atomic::Ordering;
+        // The env `write_jni_env` produces must equal the canonical `get_jni_env`.
+        let canonical = get_jni_env();
+        let mut penv: *mut std::ffi::c_void = std::ptr::null_mut();
+        write_jni_env(&mut penv as *mut *mut std::ffi::c_void);
+        assert_eq!(
+            penv as usize, canonical as usize,
+            "attach env must equal get_jni_env()"
+        );
+
+        // It must be ONE level above the table-array pointer (the old-bug value).
+        let table_value = JNI_TABLE_PTR.load(Ordering::Acquire) as usize;
+        assert_ne!(
+            penv as usize, table_value,
+            "JNIEnv* must be &JNI_TABLE_PTR, not the loaded table-array pointer"
+        );
+
+        // Double-deref + call GetVersion (function-table slot 4) to prove the
+        // indirection level resolves a real function (the bug jumped to garbage).
+        let env = penv as JNIEnv;
+        let slot = unsafe { *(*env).add(4) };
+        assert_ne!(slot, 0);
+        let get_version: extern "C" fn(JNIEnv) -> JInt = unsafe { std::mem::transmute(slot) };
+        assert_eq!(get_version(env), JNI_VERSION_1_8);
+    }
+
     #[test]
     fn jni_function_table_get_version() {
         let env = get_jni_env();
