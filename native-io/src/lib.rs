@@ -3061,20 +3061,31 @@ fn native_baos_write_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
 }
 
 fn native_baos_write_byte_array(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    // write([B)V — delegates to write([BII)V with off=0, len=array.length
+    // write([B)V — mirror `java.io.OutputStream.write(byte[])`, whose bytecode is
+    // `write(b, 0, b.length)` via an **invokevirtual** of `write([BII)V`. Tomcat's
+    // `WebdavServlet$BoundedByteArrayOutputStream` (and any BAOS subclass)
+    // overrides `write([BII)V` to enforce a size bound but does NOT override the
+    // one-arg `write([B)V`. Calling `native_baos_write_bytes` directly (a Rust
+    // call) bypassed that override, so the bound check silently never ran
+    // (BUG-TC0622 Gap B). Dispatch `write([BII)V` VIRTUALLY so the subclass
+    // override runs; for a plain `ByteArrayOutputStream` it resolves straight
+    // back to `native_baos_write_bytes`.
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(None),
+    };
     let buf = match args.get(1) {
         Some(Value::Object(Some(arr))) => *arr,
         _ => return Ok(None),
     };
-    let len = ctx.array_length(buf);
-    let mut full_args = args.to_vec();
-    // Ensure we have at least 4 args: this, array, offset, length
-    while full_args.len() < 4 {
-        full_args.push(Value::Int(0));
-    }
-    full_args[2] = Value::Int(0);
-    full_args[3] = Value::Int(len as i32);
-    native_baos_write_bytes(ctx, &full_args)
+    let len = ctx.array_length(buf) as i32;
+    // `invoke_virtual`'s `args` excludes the receiver — it is prepended.
+    ctx.invoke_virtual(
+        this,
+        "write",
+        "([BII)V",
+        &[Value::Object(Some(buf)), Value::Int(0), Value::Int(len)],
+    )
 }
 
 fn native_baos_to_byte_array(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
