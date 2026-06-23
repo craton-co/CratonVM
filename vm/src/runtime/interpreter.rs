@@ -1420,6 +1420,17 @@ fn init_object_header(ptr: *mut u8, class_id: ClassId, num_fields: usize, identi
     };
     // SAFETY: ptr points to freshly allocated, properly aligned memory for an ObjectHeader.
     unsafe { std::ptr::write(ptr as *mut ObjectHeader, header) };
+    // A2 breadcrumb (CRATONVM_DBG_A2): the interpreter TLAB fast path bypasses
+    // gen_heap, so record the legacy-layout object header it writes here.
+    cratonvm_gc::a2dbg::record(
+        ptr as usize,
+        class_id.as_u32(),
+        ObjectKind::Object as u8,
+        ArrayElementType::Reference as u8,
+        0,
+        u32::try_from(num_fields).unwrap_or(u32::MAX),
+        cratonvm_gc::heap::HEADER_SIZE + num_fields * cratonvm_gc::heap::SLOT_SIZE,
+    );
 }
 
 /// Shared-heap allocation path (with lock). Used for TLAB misses and large objects.
