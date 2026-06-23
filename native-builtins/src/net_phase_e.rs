@@ -4999,6 +4999,156 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
 // RE.5 — java.net.http.HttpClient
 // ===========================================================================
 
+// Synthetic `java/net/http/HttpResponse` field layout used by the bare
+// real-JDK `HttpClient` model. `HttpClient`/`HttpResponse` are abstract JDK
+// types, so `newHttpClient()`/`send()` hand back synthetic instances whose
+// runtime class IS the abstract class — every instance method therefore has to
+// be registered directly on it (a real concrete `HttpClientImpl`/
+// `HttpResponseImpl` is never materialised on this path).
+const RE5_RESP_STATUS: usize = 0; // Int
+const RE5_RESP_BODY_BYTES: usize = 1; // byte[]
+const RE5_RESP_HEADERS: usize = 2; // String[] of "key: value"
+const RE5_RESP_HANDLER_TAG: usize = 3; // String: how body() materialises
+const RE5_RESP_NUM_FIELDS: usize = 4;
+
+/// Read a `byte[]` heap object into a `Vec<u8>` (high byte ignored).
+fn re5_read_byte_array(ctx: &dyn NativeContext, arr: ObjectRef) -> Vec<u8> {
+    let len = ctx.array_length(arr);
+    let mut out = Vec::with_capacity(len);
+    for i in 0..len {
+        if let Value::Int(b) = ctx.get_array_element(arr, i) {
+            out.push((b & 0xff) as u8);
+        }
+    }
+    out
+}
+
+/// Determine how `HttpResponse.body()` should materialise from the BodyHandler
+/// passed to `send`/`sendAsync`. Our synthetic `BodyHandlers` factories stash a
+/// tag string in slot 0 ("string" / "inputstream" / "bytearray" /
+/// "discarding"); any other handler (e.g. Spring's `DecompressingBodyHandler`,
+/// which wraps `ofInputStream`) defaults to an InputStream body — the shape the
+/// JDK-`HttpClient` `ClientHttpRequest` path consumes.
+fn re5_handler_tag(ctx: &dyn NativeContext, handler: Option<Value>) -> String {
+    if let Some(Value::Object(Some(h))) = handler {
+        let cid = ctx.class_id_of_object(h);
+        if ctx.class_name_of_id(cid).as_deref() == Some("java/net/http/HttpResponse$BodyHandler") {
+            if let Value::Object(Some(s)) = ctx.get_field(h, 0) {
+                if let Some(tag) = ctx.read_string(s) {
+                    return tag;
+                }
+            }
+        }
+    }
+    "inputstream".to_string()
+}
+
+/// Build the synthetic `java/net/http/HttpResponse` carrying the wire result.
+fn re5_build_response(
+    ctx: &mut dyn NativeContext,
+    status: i32,
+    headers: &[(String, String)],
+    body: &[u8],
+    handler_tag: &str,
+) -> ObjectRef {
+    let out = alloc_concurrent_synthetic(ctx, "java/net/http/HttpResponse", RE5_RESP_NUM_FIELDS);
+    ctx.set_field(out, RE5_RESP_STATUS, Value::Int(status));
+    let body_arr = ctx.new_array(ArrayElementType::Byte, body.len());
+    for (i, b) in body.iter().enumerate() {
+        ctx.set_array_element(body_arr, i, Value::Int(*b as i32));
+    }
+    ctx.set_field(out, RE5_RESP_BODY_BYTES, Value::Object(Some(body_arr)));
+    let hdr_arr = ctx.new_ref_array(ClassId::new(0), headers.len());
+    for (i, (k, v)) in headers.iter().enumerate() {
+        let s = ctx.create_string(&format!("{k}: {v}"));
+        ctx.set_array_element(hdr_arr, i, Value::Object(Some(s)));
+    }
+    ctx.set_field(out, RE5_RESP_HEADERS, Value::Object(Some(hdr_arr)));
+    let tag = ctx.create_string(handler_tag);
+    ctx.set_field(out, RE5_RESP_HANDLER_TAG, Value::Object(Some(tag)));
+    out
+}
+
+/// Shared request driver for `HttpClient.send` / `sendAsync`. `args[0]` is the
+/// `HttpClient`, `args[1]` the `HttpRequest`, `args[2]` the `BodyHandler`.
+///
+/// LIMITATION: a request body is only carried when it was supplied as a literal
+/// (`BodyPublishers.ofString`); a reactive `BodyPublishers.fromPublisher(...)`
+/// body (Spring's streaming `JdkClientHttpRequest` POST/PUT path) is not driven
+/// here, so the request goes out with an empty body. See
+/// docs/known-issues for the streaming-body follow-up.
+fn re5_do_request(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let req = obj_arg(args, 1)?;
+    let handler_tag = re5_handler_tag(ctx, args.get(2).copied());
+    let method = read_field_string_or(ctx, req, 0, "GET");
+    let uri = read_field_string_or(ctx, req, 1, "");
+    let body_str = read_field_string_or(ctx, req, 2, "");
+    let hdrs_val = ctx.get_field(req, 3);
+    let headers = huc_extract_req_headers(ctx, hdrs_val);
+    if uri.is_empty() {
+        return Err(ioex("HttpRequest.uri is empty"));
+    }
+    let resp = http_perform_request(&method, &uri, &headers, body_str.as_bytes(), 10)
+        .map_err(|e| ioex(format!("HttpClient request failed: {e}")))?;
+    let out = re5_build_response(ctx, resp.status, &resp.headers, &resp.body, &handler_tag);
+    Ok(Some(Value::Object(Some(out))))
+}
+
+/// Extract the full external-form string from a `java.net.URI` and return it as
+/// a heap String. `java.net.URI`'s slot 0 is the `scheme` ("http"), not the
+/// whole URL, so reading the field directly is wrong; `uri_raw_string` is the
+/// module's slot-order-safe reconstruction (reads the `string` cache field by
+/// name, the same path every URI getter uses) and works for both a real JDK
+/// `URI` and a `make_uri`-built one. Falls back to `toString()` only if that
+/// yields nothing.
+fn re5_uri_string(ctx: &mut dyn NativeContext, uri: ObjectRef) -> ObjectRef {
+    // 1. Cached external form (the `string` field, slot-order-safe).
+    let raw = uri_raw_string(ctx, uri);
+    if !raw.is_empty() {
+        return ctx.create_string(&raw);
+    }
+    // 2. Reconstruct from the URI's own getters (proven natives that read named
+    //    components), so we don't depend on the `string` cache being populated.
+    let getter = |ctx: &mut dyn NativeContext, m: &str, d: &str| -> Option<String> {
+        match ctx.invoke_virtual(uri, m, d, &[]) {
+            Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s).filter(|v| !v.is_empty()),
+            _ => None,
+        }
+    };
+    if let Some(scheme) = getter(ctx, "getScheme", "()Ljava/lang/String;") {
+        let mut url = format!("{scheme}://");
+        if let Some(host) = getter(ctx, "getHost", "()Ljava/lang/String;") {
+            url.push_str(&host);
+            if let Ok(Some(Value::Int(port))) = ctx.invoke_virtual(uri, "getPort", "()I", &[]) {
+                if port > 0 {
+                    url.push_str(&format!(":{port}"));
+                }
+            }
+        }
+        if let Some(path) = getter(ctx, "getRawPath", "()Ljava/lang/String;") {
+            url.push_str(&path);
+        }
+        if let Some(query) = getter(ctx, "getRawQuery", "()Ljava/lang/String;") {
+            url.push('?');
+            url.push_str(&query);
+        }
+        if url.contains("://") && url.len() > scheme.len() + 3 {
+            return ctx.create_string(&url);
+        }
+    }
+    // 3. Last resort: toString().
+    if let Ok(Some(Value::Object(Some(s)))) =
+        ctx.invoke_virtual(uri, "toString", "()Ljava/lang/String;", &[])
+    {
+        if let Some(text) = ctx.read_string(s) {
+            if text.contains("://") || text.starts_with('/') {
+                return s;
+            }
+        }
+    }
+    ctx.create_string("")
+}
+
 fn register_re5_http_client(r: &mut NativeMethodRegistry) {
     let hc = "java/net/http/HttpClient";
     r.register(
@@ -5047,31 +5197,111 @@ fn register_re5_http_client(r: &mut NativeMethodRegistry) {
         hc,
         "send",
         "(Ljava/net/http/HttpRequest;Ljava/net/http/HttpResponse$BodyHandler;)Ljava/net/http/HttpResponse;",
-        |ctx, args| {
-            let req = obj_arg(args, 1)?;
-            let method = read_field_string_or(ctx, req, 0, "GET");
-            let uri = read_field_string_or(ctx, req, 1, "");
-            let body_str = read_field_string_or(ctx, req, 2, "");
-            let hdrs_val = ctx.get_field(req, 3);
-            let headers = huc_extract_req_headers(ctx, hdrs_val);
-            if uri.is_empty() {
-                return Err(ioex("HttpRequest.uri is empty"));
-            }
-            let resp = http_perform_request(&method, &uri, &headers, body_str.as_bytes(), 10)
-                .map_err(|e| ioex(format!("HttpClient.send failed: {e}")))?;
-            let out = alloc_concurrent_synthetic(ctx, "java/net/http/HttpResponse", 3);
-            ctx.set_field(out, 0, Value::Int(resp.status));
-            let body_text = String::from_utf8_lossy(&resp.body).to_string();
-            let bs = ctx.create_string(&body_text);
-            ctx.set_field(out, 1, Value::Object(Some(bs)));
-            let hdr_arr = ctx.new_ref_array(ClassId::new(0), resp.headers.len());
-            for (i, (k, v)) in resp.headers.iter().enumerate() {
-                let s = ctx.create_string(&format!("{k}: {v}"));
-                ctx.set_array_element(hdr_arr, i, Value::Object(Some(s)));
-            }
-            ctx.set_field(out, 2, Value::Object(Some(hdr_arr)));
-            Ok(Some(Value::Object(Some(out))))
+        |ctx, args| re5_do_request(ctx, args),
+    );
+
+    // sendAsync(HttpRequest, BodyHandler) -> CompletableFuture<HttpResponse>.
+    // Spring's `JdkClientHttpRequest` (RestClient / JdkClientHttpRequestFactory)
+    // drives requests exclusively through sendAsync(...).get(). We perform the
+    // request synchronously and hand back an already-completed real
+    // CompletableFuture so the caller's `.get()` returns immediately.
+    let send_async: fn(&mut dyn NativeContext, &[Value]) -> MethodCallResult = |ctx, args| {
+        let resp = re5_do_request(ctx, args)?.unwrap_or(Value::Object(None));
+        ctx.invoke(
+            "java/util/concurrent/CompletableFuture",
+            "completedFuture",
+            "(Ljava/lang/Object;)Ljava/util/concurrent/CompletableFuture;",
+            &[resp],
+        )
+    };
+    r.register(
+        hc,
+        "sendAsync",
+        "(Ljava/net/http/HttpRequest;Ljava/net/http/HttpResponse$BodyHandler;)Ljava/util/concurrent/CompletableFuture;",
+        send_async,
+    );
+    r.register(
+        hc,
+        "sendAsync",
+        "(Ljava/net/http/HttpRequest;Ljava/net/http/HttpResponse$BodyHandler;Ljava/net/http/HttpResponse$PushPromiseHandler;)Ljava/util/concurrent/CompletableFuture;",
+        send_async,
+    );
+
+    // --- HttpClient instance accessors (RE.5 audit) ---------------------------
+    // `java.net.http.HttpClient` declares these as abstract; on the synthetic
+    // bare-client object they have neither real bytecode nor a native, so any
+    // call throws `AbstractMethodError: ... has no Code attribute`. Spring's
+    // `JdkClientHttpRequestFactory` ctor calls `executor()`; the rest are filled
+    // for parity so they degrade to JDK-default values instead of crashing.
+    let opt_empty: fn(&mut dyn NativeContext, &[Value]) -> MethodCallResult =
+        |ctx, _args| ctx.invoke("java/util/Optional", "empty", "()Ljava/util/Optional;", &[]);
+    r.register(hc, "executor", "()Ljava/util/Optional;", opt_empty);
+    r.register(hc, "connectTimeout", "()Ljava/util/Optional;", opt_empty);
+    r.register(hc, "proxy", "()Ljava/util/Optional;", opt_empty);
+    r.register(hc, "authenticator", "()Ljava/util/Optional;", opt_empty);
+    r.register(hc, "cookieHandler", "()Ljava/util/Optional;", opt_empty);
+    // version() -> HttpClient.Version (default HTTP_2); fetch the real enum
+    // constant so the returned object is a genuine Version, not an int proxy.
+    r.register(
+        hc,
+        "version",
+        "()Ljava/net/http/HttpClient$Version;",
+        |ctx, _args| {
+            let name = ctx.create_string("HTTP_2");
+            ctx.invoke(
+                "java/net/http/HttpClient$Version",
+                "valueOf",
+                "(Ljava/lang/String;)Ljava/net/http/HttpClient$Version;",
+                &[Value::Object(Some(name))],
+            )
         },
+    );
+    // followRedirects() -> HttpClient.Redirect (newHttpClient() default: NEVER).
+    r.register(
+        hc,
+        "followRedirects",
+        "()Ljava/net/http/HttpClient$Redirect;",
+        |ctx, _args| {
+            let name = ctx.create_string("NEVER");
+            ctx.invoke(
+                "java/net/http/HttpClient$Redirect",
+                "valueOf",
+                "(Ljava/lang/String;)Ljava/net/http/HttpClient$Redirect;",
+                &[Value::Object(Some(name))],
+            )
+        },
+    );
+    // sslContext() -> the JVM default SSLContext.
+    r.register(
+        hc,
+        "sslContext",
+        "()Ljavax/net/ssl/SSLContext;",
+        |ctx, _args| {
+            ctx.invoke(
+                "javax/net/ssl/SSLContext",
+                "getDefault",
+                "()Ljavax/net/ssl/SSLContext;",
+                &[],
+            )
+        },
+    );
+    // close()/shutdown()/shutdownNow() (JDK 21+ AutoCloseable surface) — no-ops;
+    // our synthetic client owns no background selector/threads to tear down.
+    for (m, d) in [
+        ("close", "()V"),
+        ("shutdown", "()V"),
+        ("shutdownNow", "()V"),
+    ] {
+        r.register(hc, m, d, |_ctx, _args| Ok(None));
+    }
+    r.register(hc, "isTerminated", "()Z", |_ctx, _args| {
+        Ok(Some(Value::Int(1)))
+    });
+    r.register(
+        hc,
+        "awaitTermination",
+        "(Ljava/time/Duration;)Z",
+        |_ctx, _args| Ok(Some(Value::Int(1))),
     );
 
     let req = "java/net/http/HttpRequest";
@@ -5098,10 +5328,7 @@ fn register_re5_http_client(r: &mut NativeMethodRegistry) {
             let m = ctx.create_string("GET");
             ctx.set_field(b, 0, Value::Object(Some(m)));
             let uri = obj_arg(args, 0)?;
-            let uri_s = match ctx.get_field(uri, 0) {
-                Value::Object(Some(s)) => s,
-                _ => ctx.create_string(""),
-            };
+            let uri_s = re5_uri_string(ctx, uri);
             ctx.set_field(b, 1, Value::Object(Some(uri_s)));
             ctx.set_field(b, 2, Value::Object(None));
             ctx.set_field(b, 3, Value::Object(None));
@@ -5117,10 +5344,7 @@ fn register_re5_http_client(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let this = obj_arg(args, 0)?;
             let uri = obj_arg(args, 1)?;
-            let uri_s = match ctx.get_field(uri, 0) {
-                Value::Object(Some(s)) => s,
-                _ => ctx.create_string(""),
-            };
+            let uri_s = re5_uri_string(ctx, uri);
             ctx.set_field(this, 1, Value::Object(Some(uri_s)));
             Ok(Some(Value::Object(Some(this))))
         },
@@ -5204,6 +5428,48 @@ fn register_re5_http_client(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(this))))
         },
     );
+    // method(String, BodyPublisher) — the generic verb setter Spring uses for
+    // POST/PUT/PATCH (and any custom verb). Slot 0 = method name, slot 2 = body
+    // (carried only for literal `ofString` publishers; see `re5_do_request`).
+    r.register(
+        bl,
+        "method",
+        "(Ljava/lang/String;Ljava/net/http/HttpRequest$BodyPublisher;)Ljava/net/http/HttpRequest$Builder;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            if let Some(m @ Value::Object(Some(_))) = args.get(1).copied() {
+                ctx.set_field(this, 0, m);
+            }
+            if let Some(Value::Object(Some(bp))) = args.get(2) {
+                let body = ctx.get_field(*bp, 0);
+                ctx.set_field(this, 2, body);
+            }
+            Ok(Some(Value::Object(Some(this))))
+        },
+    );
+    // timeout(Duration) / expectContinue(boolean) / version(Version) — accepted
+    // and chained, but not separately modelled (request timeout is enforced by
+    // the caller; the bare client speaks HTTP/1.1). Returning `this` keeps the
+    // fluent builder chain intact instead of throwing AbstractMethodError.
+    r.register(
+        bl,
+        "timeout",
+        "(Ljava/time/Duration;)Ljava/net/http/HttpRequest$Builder;",
+        |_ctx, args| Ok(Some(args[0])),
+    );
+    r.register(
+        bl,
+        "expectContinue",
+        "(Z)Ljava/net/http/HttpRequest$Builder;",
+        |_ctx, args| Ok(Some(args[0])),
+    );
+    r.register(
+        bl,
+        "version",
+        "(Ljava/net/http/HttpClient$Version;)Ljava/net/http/HttpRequest$Builder;",
+        |_ctx, args| Ok(Some(args[0])),
+    );
+
     r.register(bl, "build", "()Ljava/net/http/HttpRequest;", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let req = alloc_concurrent_synthetic(ctx, "java/net/http/HttpRequest", 4);
@@ -5242,6 +5508,40 @@ fn register_re5_http_client(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(body))))
         },
     );
+    r.register(
+        bps,
+        "ofByteArray",
+        "([B)Ljava/net/http/HttpRequest$BodyPublisher;",
+        |ctx, args| {
+            let body =
+                alloc_concurrent_synthetic(ctx, "java/net/http/HttpRequest$BodyPublisher", 1);
+            let bytes = match args.get(1).copied() {
+                Some(Value::Object(Some(arr))) => {
+                    String::from_utf8_lossy(&re5_read_byte_array(ctx, arr)).into_owned()
+                }
+                _ => String::new(),
+            };
+            let s = ctx.create_string(&bytes);
+            ctx.set_field(body, 0, Value::Object(Some(s)));
+            Ok(Some(Value::Object(Some(body))))
+        },
+    );
+    // fromPublisher(Flow.Publisher[, contentLength]) — Spring's streaming
+    // POST/PUT path. The body is produced reactively by a `Flow.Publisher` we
+    // cannot drive from here, so the publisher carries no literal bytes (slot 0
+    // = null) and the request is sent body-less. Registered so the call returns
+    // a BodyPublisher rather than throwing AbstractMethodError. See known-issues.
+    for desc in [
+        "(Ljava/util/concurrent/Flow$Publisher;)Ljava/net/http/HttpRequest$BodyPublisher;",
+        "(Ljava/util/concurrent/Flow$Publisher;J)Ljava/net/http/HttpRequest$BodyPublisher;",
+    ] {
+        r.register(bps, "fromPublisher", desc, |ctx, _args| {
+            let body =
+                alloc_concurrent_synthetic(ctx, "java/net/http/HttpRequest$BodyPublisher", 1);
+            ctx.set_field(body, 0, Value::Object(None));
+            Ok(Some(Value::Object(Some(body))))
+        });
+    }
 
     let bhs = "java/net/http/HttpResponse$BodyHandlers";
     r.register(
@@ -5266,15 +5566,149 @@ fn register_re5_http_client(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(bh))))
         },
     );
+    // ofInputStream() / ofByteArray() — the body shapes Spring's
+    // `JdkClientHttpRequest` consumes (it always reads `response.body()` as an
+    // InputStream). The tag drives `HttpResponse.body()` materialisation.
+    r.register(
+        bhs,
+        "ofInputStream",
+        "()Ljava/net/http/HttpResponse$BodyHandler;",
+        |ctx, _args| {
+            let bh = alloc_concurrent_synthetic(ctx, "java/net/http/HttpResponse$BodyHandler", 1);
+            let t = ctx.create_string("inputstream");
+            ctx.set_field(bh, 0, Value::Object(Some(t)));
+            Ok(Some(Value::Object(Some(bh))))
+        },
+    );
+    r.register(
+        bhs,
+        "ofByteArray",
+        "()Ljava/net/http/HttpResponse$BodyHandler;",
+        |ctx, _args| {
+            let bh = alloc_concurrent_synthetic(ctx, "java/net/http/HttpResponse$BodyHandler", 1);
+            let t = ctx.create_string("bytearray");
+            ctx.set_field(bh, 0, Value::Object(Some(t)));
+            Ok(Some(Value::Object(Some(bh))))
+        },
+    );
 
     let resp = "java/net/http/HttpResponse";
     r.register(resp, "statusCode", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 0)))
+        Ok(Some(ctx.get_field(this, RE5_RESP_STATUS)))
     });
+    // body() materialises the stored byte[] per the BodyHandler tag captured at
+    // send time: an InputStream (default / ofInputStream), a String (ofString),
+    // the raw byte[] (ofByteArray), or null (discarding).
     r.register(resp, "body", "()Ljava/lang/Object;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 1)))
+        let tag = read_field_string_or(ctx, this, RE5_RESP_HANDLER_TAG, "inputstream");
+        let body_val = ctx.get_field(this, RE5_RESP_BODY_BYTES);
+        match tag.as_str() {
+            "discarding" => Ok(Some(Value::Object(None))),
+            "bytearray" => Ok(Some(body_val)),
+            "string" => {
+                let bytes = match body_val {
+                    Value::Object(Some(a)) => re5_read_byte_array(ctx, a),
+                    _ => Vec::new(),
+                };
+                let s = ctx.create_string(&String::from_utf8_lossy(&bytes));
+                Ok(Some(Value::Object(Some(s))))
+            }
+            _ => {
+                // InputStream: wrap the byte[] in a real ByteArrayInputStream.
+                let arr = match body_val {
+                    Value::Object(Some(_)) => body_val,
+                    _ => Value::Object(Some(ctx.new_array(ArrayElementType::Byte, 0))),
+                };
+                ctx.new_object_initialized("java/io/ByteArrayInputStream", "([B)V", &[arr])
+            }
+        }
+    });
+    // headers() -> HttpHeaders backed by the stored "key: value" String[].
+    r.register(
+        resp,
+        "headers",
+        "()Ljava/net/http/HttpHeaders;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let arr = ctx.get_field(this, RE5_RESP_HEADERS);
+            let headers = alloc_concurrent_synthetic(ctx, "java/net/http/HttpHeaders", 1);
+            ctx.set_field(headers, 0, arr);
+            Ok(Some(Value::Object(Some(headers))))
+        },
+    );
+
+    // HttpHeaders.map() -> Map<String, List<String>>. Spring's
+    // `JdkClientHttpResponse.adaptHeaders` calls `response.headers().map()` and
+    // iterates it, so this must be a real Map of real Lists. Header names are
+    // grouped case-insensitively, preserving first-seen order.
+    let hh = "java/net/http/HttpHeaders";
+    r.register(hh, "map", "()Ljava/util/Map;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        // Parse the stored "key: value" lines into insertion-ordered groups.
+        let mut groups: Vec<(String, Vec<String>)> = Vec::new();
+        if let Value::Object(Some(arr)) = ctx.get_field(this, 0) {
+            let n = ctx.array_length(arr);
+            for i in 0..n {
+                if let Value::Object(Some(s)) = ctx.get_array_element(arr, i) {
+                    if let Some(line) = ctx.read_string(s) {
+                        if let Some(c) = line.find(':') {
+                            let k = line[..c].trim().to_string();
+                            let v = line[c + 1..].trim().to_string();
+                            if k.is_empty() {
+                                continue;
+                            }
+                            if let Some(g) =
+                                groups.iter_mut().find(|(gk, _)| gk.eq_ignore_ascii_case(&k))
+                            {
+                                g.1.push(v);
+                            } else {
+                                groups.push((k, vec![v]));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let map_val = ctx.new_object_initialized("java/util/LinkedHashMap", "()V", &[])?;
+        let map = match map_val {
+            Some(Value::Object(Some(m))) => m,
+            _ => return Ok(map_val),
+        };
+        // Pin the map across the (allocating) per-entry construction so a moving
+        // collector can't invalidate the reference we keep `put`-ing into.
+        let map_pin = ctx.pin_native_root(map);
+        for (k, vals) in groups {
+            let list_val = ctx.new_object_initialized("java/util/ArrayList", "()V", &[])?;
+            let list = match list_val {
+                Some(Value::Object(Some(l))) => l,
+                _ => continue,
+            };
+            let list_pin = ctx.pin_native_root(list);
+            for v in vals {
+                let vs = ctx.create_string(&v);
+                let list_now = ctx.read_native_pin(list_pin, list);
+                ctx.invoke_virtual(
+                    list_now,
+                    "add",
+                    "(Ljava/lang/Object;)Z",
+                    &[Value::Object(Some(vs))],
+                )?;
+            }
+            let ks = ctx.create_string(&k);
+            let list_now = ctx.read_native_pin(list_pin, list);
+            let map_now = ctx.read_native_pin(map_pin, map);
+            ctx.invoke_virtual(
+                map_now,
+                "put",
+                "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+                &[Value::Object(Some(ks)), Value::Object(Some(list_now))],
+            )?;
+        }
+        let map_now = ctx.read_native_pin(map_pin, map);
+        ctx.unpin_native_roots(map_pin);
+        Ok(Some(Value::Object(Some(map_now))))
     });
 }
 
