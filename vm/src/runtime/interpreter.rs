@@ -3798,10 +3798,36 @@ pub fn execute(
                     // Try to compile
                     let param_slots = args.len();
                     let helpers = crate::jit::helpers::build_helpers();
-                    // Stage compact field offsets for the inline codegen (the
-                    // wrapper takes them); empty/no-op when the flag is off.
-                    crate::jit::x64::set_pending_compact_field_info(compact_field_info);
-                    let mut cm = crate::jit::x64::compile(
+                    // HIB-CV-20 — like the OSR path (and unlike the legacy
+                    // `x64::compile` wrapper, which hardcodes `param_oop_mask = 0`),
+                    // seed the local-oop dataflow with this method's reference
+                    // PARAMETERS so an oop param living in a callee-saved register
+                    // across an early safepoint is reloaded after a moving GC
+                    // (`emit_post_safepoint_reload`). Without it the register stays
+                    // stale → heap corruption. The category-2 slot-layout guard
+                    // above guarantees "arg index == slot", so the descriptor-derived
+                    // mask lines up with the `&[]`/`0` legacy layout. Gate on the
+                    // precise-maps flag so the gate-off path stays byte-identical.
+                    let early_is_static = shared
+                        .class_manager
+                        .read()
+                        .get_class(class_id)
+                        .and_then(|class| {
+                            class
+                                .methods
+                                .iter()
+                                .find(|m| {
+                                    &*m.name == method_name && &*m.descriptor == method_descriptor
+                                })
+                                .map(|m| m.is_static())
+                        })
+                        .unwrap_or(false);
+                    let param_oop_mask = if crate::jit::x64::precise_jit_maps_enabled() {
+                        crate::jit::compute_param_oop_mask(method_descriptor, early_is_static)
+                    } else {
+                        0
+                    };
+                    let mut cm = crate::jit::x64::compile_with_param_slots(
                         &padded,
                         code_len,
                         param_slots,
@@ -3835,6 +3861,11 @@ pub fn execute(
                         scan.non_escaping_new.clone(), // escape analysis results
                         std::collections::HashMap::new(), // inline_sites
                         None, // string_layout — String intrinsics land in a later wave
+                        &[],  // param_jvm_slots — legacy "arg index == slot" layout
+                        0,    // param_slot_span — legacy layout
+                        param_oop_mask,
+                        compact_field_info,
+                        "", // method_key — eager path disables the per-bci de-spec consult
                     )?;
                     // Attach owned metadata to compiled method
                     cm._jit_strings = owned_jit_strings;
@@ -4642,6 +4673,15 @@ pub(crate) fn try_osr_with_backoff(
     initial_frame_idx: usize,
     entry_pc: usize,
 ) -> OsrBackoffOutcome {
+    // HIB-CV-20 / HIB-CV-21: back-edge OSR is unsound on large real-world
+    // methods (the OSR entry path can resume with corrupted register/stack
+    // state → a silent wrong value → infinite loops in e.g. Xerces XSD parsing).
+    // Gated OFF by default; whole-method JIT is unaffected. `CRATONVM_JIT_OSR=1`
+    // opts back in. This is the canonical entry for BOTH the inline and
+    // background-OSR paths, so the gate disables OSR everywhere.
+    if !crate::runtime::env_cache::osr_backedge_enabled() {
+        return OsrBackoffOutcome::Skip;
+    }
     // wire-tiered-manager Step 6: the per-frame back-edge OSR trigger is now an
     // env knob (`CRATONVM_TIER_OSR_BACKEDGE`); `OSR_THRESHOLD` remains the
     // canonical default. Live on both the inline and background-OSR paths. Unset
@@ -19059,9 +19099,25 @@ fn compile_osr_artifact(
             let param_slots = crate::jit::count_param_slots(&method_descriptor)
                 + if osr_method_is_static { 0 } else { 1 };
             let helpers = crate::jit::helpers::build_helpers();
-            // Stage compact field offsets for inline codegen (wrapper takes them).
-            crate::jit::x64::set_pending_compact_field_info(compact_field_info);
-            let mut cm = crate::jit::x64::compile(
+            // HIB-CV-20 — seed the local-oop dataflow with this method's reference
+            // PARAMETERS, exactly as the hot-path `jit::try_compile` does. The
+            // legacy `x64::compile` wrapper hardcodes `param_oop_mask = 0`, so an
+            // oop parameter (e.g. the `byte[]` of `Arrays.fill([BIIB)V`, JVM local
+            // 0) that lives in a callee-saved register across an early safepoint
+            // (its pre-loop `rangeCheck(III)V` call) was never marked an oop:
+            // `emit_post_safepoint_reload` skipped it, so a moving young GC during
+            // that call rewrote the canonical frame slot but left the register
+            // stale → the OSR loop then wrote through the pre-GC address → heap
+            // corruption / hang (Hibernate XSD-parse, MappingXsdSupport bootstrap).
+            // Seed it via `compile_with_param_slots` (legacy `&[]`/`0` slot layout,
+            // unchanged) so the reload covers oop params too. Gate on the precise-
+            // maps flag so the gate-off path stays byte-identical (mask = 0).
+            let param_oop_mask = if crate::jit::x64::precise_jit_maps_enabled() {
+                crate::jit::compute_param_oop_mask(&method_descriptor, osr_method_is_static)
+            } else {
+                0
+            };
+            let mut cm = crate::jit::x64::compile_with_param_slots(
                 &code,
                 code_len,
                 param_slots,
@@ -19089,6 +19145,12 @@ fn compile_osr_artifact(
                 scan.non_escaping_new.clone(), // escape analysis results
                 std::collections::HashMap::new(), // inline_sites
                 None, // string_layout — String intrinsics land in a later wave
+                &[],  // param_jvm_slots — legacy "arg index == slot" layout (OSR
+                // bails category-2 params elsewhere; unchanged behavior)
+                0,    // param_slot_span — legacy layout
+                param_oop_mask,
+                compact_field_info,
+                "", // method_key — OSR path disables the per-bci de-spec consult
             );
             let Some(mut cm) = cm else {
                 // RBC.2 — a backend bail here is just as permanent as one in

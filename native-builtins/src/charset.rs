@@ -374,6 +374,20 @@ fn enc_name(ctx: &dyn NativeContext, this: ObjectRef) -> String {
     }
 }
 
+/// True when the decoder's `malformedInputAction` is `CodingErrorAction.REPLACE`
+/// (substitute U+FFFD and continue). Default is REPORT, so an unreadable/absent
+/// field conservatively returns false (preserving the strict error behavior).
+fn decoder_malformed_is_replace(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
+    if let Value::Object(Some(action)) = ctx.get_field_by_name(this, "malformedInputAction") {
+        // CodingErrorAction's only instance field is `String name`
+        // ("REPLACE" / "REPORT" / "IGNORE").
+        if let Value::Object(Some(s)) = ctx.get_field_by_name(action, "name") {
+            return ctx.read_string(s).as_deref() == Some("REPLACE");
+        }
+    }
+    false
+}
+
 /// `CharsetEncoder.encode(CharBuffer, ByteBuffer, boolean end_of_input)
 ///  -> CoderResult`
 ///
@@ -507,14 +521,26 @@ fn native_decoder_decode(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     // `input_len` = how many input bytes the `decoded` units represent
     // (== bytes.len() except when we stop early at a truncated trailing
     // sequence, leaving its bytes buffered for the next call).
+    //
+    // On a genuinely MALFORMED sequence we must honor the decoder's configured
+    // `malformedInputAction`: REPORT (the default) surfaces it as a MALFORMED
+    // CoderResult; REPLACE substitutes the replacement char (U+FFFD) for each
+    // ill-formed subsequence and continues — exactly what the real
+    // `java.nio.charset.CharsetDecoder.decode()` orchestrator does (which this
+    // native shadows). Without this, REPLACE-mode callers (e.g. Tomcat's
+    // `TestUtf8`/`Utf8Decoder` conformance suite, and any `onMalformedInput(
+    // REPLACE)` decoder) hit a spurious MalformedInputException.
+    let replace = decoder_malformed_is_replace(ctx, this);
     let (decoded, input_len) = match engine::decode_bytes(&name, &bytes) {
         Ok(chars) => (chars, bytes.len()),
         Err(e) if e.kind == engine::CodingErrorKind::Incomplete && !end_of_input => {
             // Decode only the valid prefix; the partial trailing bytes stay in
             // the buffer (position advances only past the prefix) and the
-            // decoder reports UNDERFLOW.
+            // decoder reports UNDERFLOW. A truncated trailing sequence is NOT
+            // yet malformed, so REPLACE does not apply here.
             match engine::decode_bytes(&name, &bytes[..e.offset]) {
                 Ok(chars) => (chars, e.offset),
+                Err(_) if replace => (engine::decode_bytes_lossy(&name, &bytes), bytes.len()),
                 Err(_) => {
                     set_pos(ctx, bb, bpos + e.offset as i32);
                     let r = alloc_coder_result(ctx, CR_MALFORMED);
@@ -522,6 +548,7 @@ fn native_decoder_decode(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
                 }
             }
         }
+        Err(_) if replace => (engine::decode_bytes_lossy(&name, &bytes), bytes.len()),
         Err(e) => {
             set_pos(ctx, bb, bpos + e.offset as i32);
             let r = alloc_coder_result(ctx, CR_MALFORMED);
