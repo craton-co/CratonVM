@@ -833,6 +833,25 @@ pub fn lookup_jit_code_range(addr: usize) -> Option<usize> {
         .map(|&(_, _, cm)| cm)
 }
 
+/// Copy the registered code ranges into `buf` as `(start, end)` pairs sorted by
+/// `start`, taking the table lock exactly ONCE.
+///
+/// PERF (TC0622 startup): the GC's per-native-call native-stack scan
+/// (`native_stack_has_jit_frame`) tests up to ~1M stack words against the code
+/// ranges. Calling `lookup_jit_code_range` per word locked this `Mutex` a
+/// million times per scan — ~66% of all CPU during a Tomcat `start()`. Callers
+/// snapshot once into a reusable buffer and binary-search it lock-free instead;
+/// the result is identical because the ranges are disjoint. The lock is NOT held
+/// across the (long) word scan, so it never blocks the background compiler's
+/// `register_jit_code_range`.
+pub fn snapshot_code_ranges_into(buf: &mut Vec<(usize, usize)>) {
+    buf.clear();
+    if let Ok(v) = jit_code_ranges().lock() {
+        buf.extend(v.iter().map(|&(e, end, _)| (e, end)));
+    }
+    buf.sort_unstable();
+}
+
 /// DBG (spring-bug-11): code-range → method-name table for naming a JIT frame in
 /// a crash report. Populated by `JitCache::put` ONLY when `CRATONVM_DBG_JIT_NAMES`
 /// is set (so the default path keeps zero overhead and no unbounded growth).
