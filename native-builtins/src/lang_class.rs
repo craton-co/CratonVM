@@ -11158,13 +11158,50 @@ pub(crate) fn native_class_get_declaring_class(
         None => return Ok(Some(Value::Object(None))),
     };
 
-    match ctx.declaring_class(class_id) {
-        Some(outer_id) => {
-            let mirror = ctx.get_class_mirror(outer_id);
-            Ok(Some(Value::Object(Some(mirror))))
-        }
-        None => Ok(Some(Value::Object(None))),
+    // Fast path: the enclosing class is already loaded, so the VM's
+    // `find_class_by_name`-backed `declaring_class` resolves it directly.
+    if let Some(outer_id) = ctx.declaring_class(class_id) {
+        let mirror = ctx.get_class_mirror(outer_id);
+        return Ok(Some(Value::Object(Some(mirror))));
     }
+
+    // Slow path (SBR-07): the enclosing class is NOT yet loaded. This is the
+    // common shape for `Class.forName("Pkg.Outer$Inner")` where the inner class
+    // is resolved by name without ever referencing `Outer` — e.g. Kotlin's
+    // protobuf-generated `ProtoBuf$StringTable`. `Vm::declaring_class` resolves
+    // the outer-class name through `find_class_by_name`, which only sees
+    // already-loaded classes, so it returns `None` and the real-JDK
+    // `getSimpleName()`/`getCanonicalName()` bytecode then mistakes the class
+    // for a top-level type (yielding `Outer$Inner` instead of `Inner`). HotSpot
+    // *loads* the enclosing class here; mirror that by walking this class's own
+    // `InnerClasses` attribute for the entry naming itself and loading the
+    // recorded outer class (same resolve-then-load pattern as
+    // `getDeclaredClasses0`). A non-member class (anonymous/local — empty
+    // `outer_class`/`inner_name`) has no such entry and correctly stays `null`.
+    let class_name = match ctx.class_name_of_id(class_id) {
+        Some(n) => n,
+        None => return Ok(Some(Value::Object(None))),
+    };
+    let inner_classes = ctx.inner_classes(class_id);
+    for (inner_class, outer_class, inner_name, _flags) in &inner_classes {
+        if inner_class == &class_name && !outer_class.is_empty() && !inner_name.is_empty() {
+            let outer_id = match ctx.class_id_by_name(outer_class) {
+                Some(id) => Some(id),
+                None => match ctx.load_class(outer_class) {
+                    Ok(_) => ctx.class_id_by_name(outer_class),
+                    Err(_) => None,
+                },
+            };
+            if let Some(outer_id) = outer_id {
+                let mirror = ctx.get_class_mirror(outer_id);
+                return Ok(Some(Value::Object(Some(mirror))));
+            }
+            // Found the member entry but couldn't load the outer class — match
+            // HotSpot's class-load-failure suppression at this site and stop.
+            break;
+        }
+    }
+    Ok(Some(Value::Object(None)))
 }
 
 /// `java/lang/Class.getSimpleBinaryName0()Ljava/lang/String;`
