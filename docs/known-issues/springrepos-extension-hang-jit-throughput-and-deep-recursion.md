@@ -34,6 +34,26 @@ fix below).
 > Family A4 / [[fork6-fjp-multithread-jit-root-reclamation]]). See
 > [[spring-boot-buildsrc-coldpath-hangs-2026-06-22]] for the full suite context.
 
+> ## 🔬 FULL RE-INVESTIGATION 2026-06-23 (dev `99510377`) — it is NOT a hang; it is a 3-bug cascade
+> Ran the test to completion on a freshly-built current-dev binary, P-core-pinned,
+> watchdog off. **The "hang" framing is wrong** — it terminates. The test is blocked
+> by **three independent CratonVM bugs**, peeled one at a time:
+>
+> | # | Bug | Path | Status |
+> |---|-----|------|--------|
+> | 1 | **JIT miscompile in the ANTLR `PredictionContext` equality/hash cluster** → a null `PredictionContext` flows into interpreted `ATNConfigSet.optimizeConfigs` → `ATN.getCachedContext` **NPE** → Groovy `MultipleCompilationErrorsException: General error during parsing: NullPointerException` → 0/11 run. `--nojit` parses cleanly. **Bisected** (`CRATONVM_JIT_BISECT_SKIP` on a standalone `GroovyScriptProbe`) from ~105 compiled ANTLR methods down to **7**: `PredictionContext.{calculateHashCode,hashCode}`, `PredictionContext$IdentityEqualityComparator.hashCode`, `SingletonPredictionContext.{equals,isEmpty,size}`, `ObjectEqualityComparator.equals` (a wrong hash/equals corrupts ATN config-context dedup → null context). | **JIT only** | ✅ **FIXED** on branch `fix/springrepos-coldpath` (`978c783a`): ban `groovyjarjarantlr4/` from JIT (`vm/src/jit/skip_list.rs`), matching the BouncyCastle/ByteBuddy precedent. Verified: `GroovyScriptProbe` parses the script OK under default JIT (was NPE). Open follow-up: the exact single method / codegen archetype (for a surgical 7-method ban or a real codegen fix). NB a *partial* ANTLR ban exposes a separate conservative-root-scan-over-deep-interpreter-recursion throughput cliff (cf. [[hql-antlr-parser-cold-prediction-throughput]]). |
+> | 2 | **Type-variable USE resolved only against the immediate decl** → a method bound `<S extends T>` (Gradle `RepositoryHandler.withType`/`named`) fell back to a synthetic `TypeVariable` stub (right name, but not identity-equal to the class's real `T`, bound defaulted to `Object`) → ByteBuddy `TypeVariableSource.findExpectedVariable` throws `Cannot resolve T` → **all 11 Mockito mocks fail**. | both (JIT + `--nojit`) | ✅ **FIXED** on branch `fix/springrepos-coldpath` (`f7942b09`, `native-builtins/src/generics.rs`): walk the enclosing generic scope (method → declaring class → outer). Verified: probe reports bound `[T]` matching HotSpot; "Cannot resolve T" gone. General fix — repairs Mockito-on-generics VM-wide. |
+> | 3 | **Groovy invokedynamic / MethodHandle receiver mismatch** — after #2, dispatch reaches `vmplugin.v8.Selector.correctCoerce` and threw `GroovyBugError: argument array length and parameter array length should be the same`. **Root cause (found via a `java.lang.invoke` probe vs HotSpot):** CratonVM's `Lookup.unreflect`/`findVirtual` omitted the leading **receiver** from a virtual/special `MethodHandle.type()` (`int m(Object)` → `(Object)int` pcount 1 vs HotSpot `(Recv,Object)int` pcount 2), and `bindTo` didn't drop it. | both | ◐ **PARTIAL** (`fix/springrepos-coldpath` `bcbe2f23`): receiver now included in `type()` + dropped on `bindTo` (`native-builtins/src/lang_invoke.rs`), verified == HotSpot (probe + lambda/method-ref/concat smoke + 23/23 invoke tests). GroovyBugError is **gone**. **Remaining:** the test now advances to a *deeper* indy layer — `ArrayIndexOutOfBoundsException` in Groovy's `IndyGuardsFiltersAndSignatures.sameClasses` (the guard's `classes[]` from the now-correct N+1 type is longer than the N runtime args collected at the call site) — a separate `java.lang.invoke` guard-arg-collection / indy-linkage gap. |
+>
+> **Net:** the old "dev passes 11/11 via root-snapshot" claim is false on `99510377`
+> (it predates this test-level run). **Bugs #1 and #2 are FIXED, and #3 is partially
+> fixed** (the MethodHandle-receiver layer; one deeper indy guard-arg layer remains) —
+> all on branch `fix/springrepos-coldpath`. The class is not yet green but has advanced
+> through three distinct CratonVM defects, two-and-a-half now fixed. Repro binary
+> `C:\craton\CratonVM-sbrepos\target\release\cvsbrepos.exe`; reflection probe
+> `apps/spring-boot/buildSrc/runner/RhProbe.java`; parse repro
+> `apps/spring-boot/buildSrc/runner/GroovyScriptProbe.java`.
+
 > **CHECKED 2026-06-21 against dev `0c904c04`.** All four load-bearing commits this
 > doc relies on are confirmed present on the current dev tip (git ancestry):
 > `1d523351` (root-snapshot/hang fix), `43f5fe03` (pdcache), `05b9622a`

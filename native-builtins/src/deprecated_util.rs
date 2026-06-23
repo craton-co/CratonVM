@@ -886,6 +886,189 @@ fn collect_hashtable(ctx: &dyn NativeContext, this: ObjectRef, want_keys: bool) 
     out
 }
 
+/// Walk the native-backed Hashtable buckets and emit `(key, value)` pairs in
+/// bucket/chain order. Same discrimination as [`collect_hashtable`] (real
+/// `Hashtable$Entry` layout vs native HashMap-node layout) but returns both
+/// halves of each entry together, so a single pass yields self-consistent
+/// pairs (two separate `collect_hashtable` calls would each re-walk and could
+/// diverge if the table mutated in between).
+///
+/// Reads fields only — performs no allocation, so the returned `ObjectRef`s are
+/// valid at return but go stale on the first allocating call afterwards; the
+/// caller must pin them before allocating.
+fn collect_hashtable_pairs(ctx: &dyn NativeContext, this: ObjectRef) -> Vec<(Value, Value)> {
+    let buckets = match ctx.get_field(this, 0) {
+        Value::Object(Some(arr)) => arr,
+        _ => return Vec::new(),
+    };
+    let cap = ctx.array_length(buckets);
+    let mut out = Vec::new();
+    for i in 0..cap {
+        let mut node_val = ctx.get_array_element(buckets, i);
+        while let Value::Object(Some(node)) = node_val {
+            // `next` is slot 3 in both layouts; discriminate on slot 0 (a real
+            // Entry's `hash` is a primitive int, a native node's key is always
+            // an object reference) — see `collect_hashtable`.
+            let real_layout = matches!(ctx.get_field(node, 0), Value::Int(_));
+            let (k, v) = if real_layout {
+                (ctx.get_field(node, 1), ctx.get_field(node, 2))
+            } else {
+                (ctx.get_field(node, 0), ctx.get_field(node, 1))
+            };
+            out.push((k, v));
+            node_val = ctx.get_field(node, 3);
+        }
+    }
+    out
+}
+
+/// `java/util/Properties.defaults` field index in the native layout. Mirrors
+/// the private `PROPS_FIELD_DEFAULTS` in `native-collections::lib.rs` (slot 3);
+/// kept in sync so `clone()` can carry the defaults chain across.
+const PROPS_FIELD_DEFAULTS: usize = 3;
+
+/// `java/util/Hashtable.clone()Ljava/lang/Object;`
+///
+/// CratonVM models `Hashtable`/`Properties` natively: `put` stores synthetic
+/// bucket-node objects (`cratonvm/synthetic/AnonymousObject$N`) in the slot-0
+/// `table[]`, not genuine `java/util/Hashtable$Entry` instances. The real-JDK
+/// `Hashtable.clone()` body does `t.table[i] = (Hashtable$Entry) table[i].clone()`
+/// — that `checkcast` throws `ClassCastException` against our synthetic node.
+/// (`InitialContext.<init>` clones its environment Hashtable, so the very first
+/// `new InitialDirContext(env)` blew up before any LDAP socket; bug TC0622.)
+///
+/// Shadow the broken real-JDK body: build a fresh natively-backed map of the
+/// receiver's concrete class (so `Properties.clone()` returns a `Properties`)
+/// and re-`put` each `(key, value)` pair through the native `put`. This matches
+/// `java.util.Hashtable.clone()` semantics — a fresh entry chain (deep) over the
+/// *same* key/value references (shallow) — without ever materialising a
+/// `Hashtable$Entry`. Purely additive: the real-JDK path is 100% broken for any
+/// natively-populated Hashtable, so there is nothing to regress.
+fn native_hashtable_clone(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+
+    // Concrete class so `Properties.clone()` -> `Properties`, etc. Fall back to
+    // plain Hashtable if the lookup can't resolve a name.
+    let cls = ctx
+        .class_name_of_id(ctx.class_id_of_object(this))
+        .unwrap_or_else(|| "java/util/Hashtable".to_string());
+
+    // Snapshot the entries first (field reads only, no allocation). The refs
+    // they hold go stale on the first allocating call below, so pin every
+    // object-typed key/value before allocating anything. `base` is the first
+    // pin handle; `unpin_native_roots(base)` later releases the whole batch
+    // (pin handles are contiguous and increasing).
+    let pairs = collect_hashtable_pairs(ctx, this);
+    let mut pinned: Vec<(Value, Option<usize>, Value, Option<usize>)> =
+        Vec::with_capacity(pairs.len());
+    let mut base: Option<usize> = None;
+
+    // `Properties` extends `Hashtable` and inherits its `clone()`, which is a
+    // shallow field copy: the cloned Properties shares the same `defaults`
+    // chain (field 3). Our native `<init>` clears defaults to null, so capture
+    // it here (pre-allocation) and restore it onto the clone afterwards.
+    let is_props = cls == "java/util/Properties";
+    let defaults = if is_props {
+        ctx.get_field(this, PROPS_FIELD_DEFAULTS)
+    } else {
+        Value::Object(None)
+    };
+    let defaults_pin = if let Value::Object(Some(o)) = defaults {
+        let h = ctx.pin_native_root(o);
+        base.get_or_insert(h);
+        Some(h)
+    } else {
+        None
+    };
+
+    for (k, v) in pairs {
+        let kh = if let Value::Object(Some(o)) = k {
+            let h = ctx.pin_native_root(o);
+            base.get_or_insert(h);
+            Some(h)
+        } else {
+            None
+        };
+        let vh = if let Value::Object(Some(o)) = v {
+            let h = ctx.pin_native_root(o);
+            base.get_or_insert(h);
+            Some(h)
+        } else {
+            None
+        };
+        pinned.push((k, kh, v, vh));
+    }
+
+    // Allocate the fresh map and run its native `<init>` (installs the empty
+    // bucket store; `Properties` also clears its defaults slot). Pin it too so
+    // the per-entry `put` calls (which allocate nodes) don't leave it stale.
+    let clone = match ctx.new_object_initialized(&cls, "()V", &[]) {
+        Ok(Some(Value::Object(Some(o)))) => o,
+        other => {
+            if let Some(b) = base {
+                ctx.unpin_native_roots(b);
+            }
+            return match other {
+                Ok(v) => Ok(v),
+                Err(e) => Err(e),
+            };
+        }
+    };
+    let clone_pin = ctx.pin_native_root(clone);
+    base.get_or_insert(clone_pin);
+
+    // Re-put each pair through the native `put` (registered on Hashtable; works
+    // regardless of the concrete subclass since it operates on the bucket store
+    // generically). Read each ref back through its pin in case the heap moved.
+    for (k, kh, v, vh) in &pinned {
+        let key = match kh {
+            Some(h) => match k {
+                Value::Object(Some(o)) => Value::Object(Some(ctx.read_native_pin(*h, *o))),
+                _ => *k,
+            },
+            None => *k,
+        };
+        let val = match vh {
+            Some(h) => match v {
+                Value::Object(Some(o)) => Value::Object(Some(ctx.read_native_pin(*h, *o))),
+                _ => *v,
+            },
+            None => *v,
+        };
+        let cl = ctx.read_native_pin(clone_pin, clone);
+        if let Err(e) = ctx.invoke(
+            "java/util/Hashtable",
+            "put",
+            "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+            &[Value::Object(Some(cl)), key, val],
+        ) {
+            if let Some(b) = base {
+                ctx.unpin_native_roots(b);
+            }
+            return Err(e);
+        }
+    }
+
+    let clone = ctx.read_native_pin(clone_pin, clone);
+
+    // Restore the shared `Properties.defaults` chain (shallow), if any.
+    if is_props {
+        let dv = match defaults_pin {
+            Some(h) => match defaults {
+                Value::Object(Some(o)) => Value::Object(Some(ctx.read_native_pin(h, o))),
+                _ => defaults,
+            },
+            None => defaults,
+        };
+        ctx.set_field(clone, PROPS_FIELD_DEFAULTS, dv);
+    }
+
+    if let Some(b) = base {
+        ctx.unpin_native_roots(b);
+    }
+    Ok(Some(Value::Object(Some(clone))))
+}
+
 // FIX: added `type_marker` param. The synthetic Enumeration carries a
 // discriminator in field 2 (1 = keys snapshot, 0 = values/elements snapshot)
 // so callers can tell a keys()-enumeration from an elements()-enumeration.
@@ -1593,6 +1776,12 @@ pub(crate) fn register_deprecated_util_natives(r: &mut NativeMethodRegistry) {
         "()Ljava/util/Enumeration;",
         native_hashtable_keys,
     );
+    // TC0622 — `Hashtable.clone()` (inherited by `Properties`). The real-JDK
+    // body casts our synthetic bucket nodes to `Hashtable$Entry` and throws
+    // CCE; shadow it with a native that rebuilds a fresh natively-backed map.
+    // Paired with the force-native overrides in `interpreter.rs` /
+    // `vm_exec.rs` so it wins over the real-JDK bytecode.
+    r.register(ht, "clone", "()Ljava/lang/Object;", native_hashtable_clone);
 
     // T8.2.10 — StringBufferInputStream
     let sbis = "java/io/StringBufferInputStream";
@@ -2459,6 +2648,35 @@ mod tests {
         };
         // type marker should be 1 (keys)
         assert_eq!(ctx.get_field(enum_obj, 2), Value::Int(1));
+    }
+
+    #[test]
+    fn test_hashtable_clone_empty_returns_fresh_object() {
+        // TC0622 — `Hashtable.clone()` is registered as a native (it shadows the
+        // real-JDK body that casts our synthetic bucket nodes to
+        // `Hashtable$Entry`). An empty table has no pairs to copy, so the native
+        // just allocates a fresh map and returns it. (The full copy semantics are
+        // covered E2E against HotSpot; the mock's array store is a stub, so a unit
+        // test can only exercise the empty/registration path.)
+        let reg = make_registry();
+        let mut ctx = MockNativeContext::new();
+        let ht = alloc_concurrent_synthetic(&mut ctx, "java/util/Hashtable", 1);
+
+        let res = call_native(
+            &reg,
+            &mut ctx,
+            "java/util/Hashtable",
+            "clone",
+            "()Ljava/lang/Object;",
+            &[Value::Object(Some(ht))],
+        );
+        assert!(res.is_ok(), "Hashtable.clone() should succeed");
+        match res.unwrap() {
+            Some(Value::Object(Some(clone))) => {
+                assert_ne!(clone.as_ptr(), ht.as_ptr(), "clone must be a fresh object");
+            }
+            other => panic!("Expected a fresh Object(Some(_)), got {:?}", other),
+        }
     }
 
     // -------------------------------------------------------------------------

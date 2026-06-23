@@ -353,6 +353,13 @@ pub(crate) fn register_string_builder_natives(registry: &mut NativeMethodRegistr
     );
     registry.register(class, "length", "()I", native_sb_length);
     registry.register(class, "charAt", "(I)C", native_sb_char_at);
+    // BUG-TC0622: real-JDK bytecode (String.nonSyncContentEquals, reached via
+    // String.contentEquals(CharSequence)) reads the builder's value/coder
+    // directly. Our synthetic char[]+count layout has no compact byte[]/coder,
+    // so without these natives getCoder() returns `count` and getValue() hands
+    // back the char[] mis-typed as a byte[], crashing in StringUTF16.contentEquals.
+    registry.register(class, "getValue", "()[B", native_sb_get_value);
+    registry.register(class, "getCoder", "()B", native_sb_get_coder);
     registry.register(class, "getChars", "(II[CI)V", native_sb_get_chars);
     registry.register(
         class,
@@ -1913,6 +1920,74 @@ pub(crate) fn native_sb_length(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     };
     let (_, count) = sb_state(ctx, this);
     Ok(Some(Value::Int(count)))
+}
+
+/// `AbstractStringBuilder.getCoder()B` — synthetic-layout accessor.
+///
+/// The real JDK `getCoder()` returns the `coder` byte field of the compact-string
+/// `AbstractStringBuilder` (`byte[] value`, `byte coder`, `int count`). CratonVM
+/// instead backs StringBuilder/StringBuffer with a synthetic layout (slot 0 =
+/// `char[] buffer`, slot 1 = `int count`) that has no `coder` field. Real-JDK
+/// bytecode such as `String.nonSyncContentEquals` (reached from
+/// `String.contentEquals(CharSequence)`) calls `sb.getCoder()` / `sb.getValue()`
+/// directly; with no native override it would read our `int count` as the coder
+/// byte and the `char[]` buffer as a compact `byte[]`, forcing a bogus UTF16
+/// branch and a `StringIndexOutOfBoundsException` in `StringUTF16.contentEquals`
+/// (BUG-TC0622, same family as BUG-M `lastIndexOf`).
+///
+/// We derive the coder exactly the way `vm_object::create_java_string` does:
+/// LATIN1 (0) iff every code unit fits in a byte, otherwise UTF16 (1). Matching
+/// that choice keeps the comparison correct: the receiver String's coder and our
+/// builder's coder agree whenever the contents do.
+pub(crate) fn native_sb_get_coder(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let chars = sb_read_chars(ctx, this);
+    let coder = if chars.iter().all(|&u| u <= 0xFF) { 0 } else { 1 };
+    Ok(Some(Value::Int(coder)))
+}
+
+/// `AbstractStringBuilder.getValue()[B` — synthetic-layout accessor.
+///
+/// Companion to [`native_sb_get_coder`]: returns a freshly allocated compact
+/// `byte[]` view of the synthetic `char[]` buffer, in the SAME layout CratonVM's
+/// own Strings use (`vm_object::create_java_string`): LATIN1 packs one byte per
+/// char, UTF16 packs two little-endian bytes per char (low byte first). The
+/// `coder` implied by this array must match [`native_sb_get_coder`] for the real
+/// `nonSyncContentEquals` path to compute correctly.
+pub(crate) fn native_sb_get_value(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    use cratonvm_types::ArrayElementType;
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    // Snapshot the chars into a Rust-local Vec BEFORE allocating, so the moving
+    // GC that `new_array` may trigger cannot leave us with a stale `this`/buffer.
+    let chars = sb_read_chars(ctx, this);
+    let latin1 = chars.iter().all(|&u| u <= 0xFF);
+    let byte_len = if latin1 { chars.len() } else { chars.len() * 2 };
+    let arr = ctx.new_array(ArrayElementType::Byte, byte_len);
+    if latin1 {
+        for (i, &u) in chars.iter().enumerate() {
+            ctx.set_array_element(arr, i, Value::Int((u & 0xFF) as i32));
+        }
+    } else {
+        // Little-endian UTF16: low byte at even index, high byte at odd index —
+        // consistent with create_java_string and StringUTF16.isBigEndian()==false.
+        for (i, &u) in chars.iter().enumerate() {
+            ctx.set_array_element(arr, i * 2, Value::Int((u & 0xFF) as i32));
+            ctx.set_array_element(arr, i * 2 + 1, Value::Int(((u >> 8) & 0xFF) as i32));
+        }
+    }
+    Ok(Some(Value::Object(Some(arr))))
 }
 
 pub(crate) fn native_sb_char_at(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -5811,5 +5886,82 @@ mod tests {
             ],
         );
         assert!(r.unwrap().is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // BUG-TC0622: AbstractStringBuilder.getValue()[B / getCoder()B — synthetic
+    // char[] buffer must present a compact byte[]+coder view matching CratonVM's
+    // own String layout, so real-JDK String.nonSyncContentEquals computes right.
+    // -----------------------------------------------------------------------
+
+    fn read_bytes(ctx: &dyn NativeContext, arr: cratonvm_types::ObjectRef) -> Vec<u8> {
+        (0..ctx.array_length(arr))
+            .map(|i| match ctx.get_array_element(arr, i) {
+                Value::Int(v) => v as u8,
+                _ => 0,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn sb_get_coder_latin1_for_ascii() {
+        let mut ctx = mock_ctx();
+        let sb = make_sb_with(&mut ctx, "http://localhost:8080");
+        let r = native_sb_get_coder(&mut ctx, &[Value::Object(Some(sb))]).unwrap();
+        assert_eq!(r, Some(Value::Int(0)), "all-ASCII builder must be LATIN1");
+    }
+
+    #[test]
+    fn sb_get_coder_utf16_when_non_latin1_present() {
+        let mut ctx = mock_ctx();
+        let sb = make_sb_with(&mut ctx, "caf\u{00e9}\u{4e2d}"); // contains U+4E2D > 0xFF
+        let r = native_sb_get_coder(&mut ctx, &[Value::Object(Some(sb))]).unwrap();
+        assert_eq!(r, Some(Value::Int(1)), "char > 0xFF must force UTF16");
+    }
+
+    #[test]
+    fn sb_get_value_latin1_one_byte_per_char() {
+        let mut ctx = mock_ctx();
+        let sb = make_sb_with(&mut ctx, "AbZ");
+        let r = native_sb_get_value(&mut ctx, &[Value::Object(Some(sb))]).unwrap();
+        let Some(Value::Object(Some(arr))) = r else {
+            panic!("expected byte[]")
+        };
+        assert_eq!(read_bytes(&ctx, arr), vec![b'A', b'b', b'Z']);
+    }
+
+    #[test]
+    fn sb_get_value_utf16_little_endian_pairs() {
+        let mut ctx = mock_ctx();
+        let sb = make_sb_with(&mut ctx, "A\u{4e2d}"); // 'A'=0x0041, U+4E2D
+        let r = native_sb_get_value(&mut ctx, &[Value::Object(Some(sb))]).unwrap();
+        let Some(Value::Object(Some(arr))) = r else {
+            panic!("expected byte[]")
+        };
+        // Little-endian: low byte first. 0x0041 -> [0x41,0x00]; 0x4E2D -> [0x2D,0x4E].
+        assert_eq!(read_bytes(&ctx, arr), vec![0x41, 0x00, 0x2D, 0x4E]);
+    }
+
+    #[test]
+    fn sb_get_value_empty_builder_is_empty_array() {
+        let mut ctx = mock_ctx();
+        let sb = make_sb(&mut ctx);
+        let r = native_sb_get_value(&mut ctx, &[Value::Object(Some(sb))]).unwrap();
+        let Some(Value::Object(Some(arr))) = r else {
+            panic!("expected byte[]")
+        };
+        assert_eq!(ctx.array_length(arr), 0);
+    }
+
+    #[test]
+    fn sb_get_value_getcoder_registered_for_abstract_sb() {
+        let mut registry = NativeMethodRegistry::new();
+        register_string_builder_natives(&mut registry, "java/lang/AbstractStringBuilder");
+        assert!(registry
+            .find("java/lang/AbstractStringBuilder", "getValue", "()[B")
+            .is_some());
+        assert!(registry
+            .find("java/lang/AbstractStringBuilder", "getCoder", "()B")
+            .is_some());
     }
 }

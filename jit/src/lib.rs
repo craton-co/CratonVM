@@ -1036,6 +1036,26 @@ pub struct CompiledMethod {
     pub osr_frame_size: i32,
     /// OSR metadata: callee-saved register save area offset.
     pub osr_callee_saved_base: i32,
+    /// OSR metadata: the EXACT callee-saved GPR set the method's epilogue
+    /// restores (`alloc_used_regs`), in slot order. The OSR trampoline MUST
+    /// spill the caller's value for every register in this set, at the same
+    /// `callee_saved_base + i*8` slot the epilogue reads register `i` from —
+    /// otherwise (HIB-CV-20) a callee-saved register the allocator used for a
+    /// NON-local temporary (e.g. an operand-stack value held across a call) is
+    /// restored from the wrong slot, silently corrupting the OSR caller's live
+    /// registers. `None` falls back to the (unsound for that case) local-derived
+    /// spill set.
+    pub osr_callee_saved_regs: Option<Vec<u8>>,
+    /// OSR metadata: the callee-saved XMM set the epilogue restores
+    /// (`alloc_used_xmms`), in slot order, paired with `osr_xmm_saved_base`. The
+    /// trampoline spills the caller's XMM values to these slots so the epilogue
+    /// restores them unchanged (the old trampoline omitted XMM spills entirely,
+    /// corrupting the caller's callee-saved XMM regs on Windows). `None`/empty →
+    /// no callee-saved XMM in use.
+    pub osr_callee_saved_xmms: Option<Vec<u8>>,
+    /// OSR metadata: XMM callee-saved save-area offset (mirrors the prologue's
+    /// `xmm_saved_base`). Paired with `osr_callee_saved_xmms`.
+    pub osr_xmm_saved_base: i32,
     /// OSR metadata: offset of VM context pointer in frame.
     pub osr_heap_local_offset: i32,
     /// Shadow-stack: frame offset (`[rbp - off]`) of the cached thread-pointer
@@ -1316,6 +1336,9 @@ impl CompiledMethod {
             osr_xmm_assignments: None,
             osr_frame_size: 0,
             osr_callee_saved_base: 0,
+            osr_callee_saved_regs: None,
+            osr_callee_saved_xmms: None,
+            osr_xmm_saved_base: 0,
             osr_heap_local_offset: 0,
             shadow_thread_slot_off: 0,
             shadow_savetop_slot_off: 0,
@@ -1369,6 +1392,9 @@ impl CompiledMethod {
             osr_xmm_assignments: None,
             osr_frame_size: 0,
             osr_callee_saved_base: 0,
+            osr_callee_saved_regs: None,
+            osr_callee_saved_xmms: None,
+            osr_xmm_saved_base: 0,
             osr_heap_local_offset: 0,
             shadow_thread_slot_off: 0,
             shadow_savetop_slot_off: 0,
@@ -1752,6 +1778,9 @@ impl CompiledMethod {
             self.osr_xmm_assignments.as_deref(),
             self.osr_frame_size,
             self.osr_callee_saved_base,
+            self.osr_callee_saved_regs.as_deref(),
+            self.osr_callee_saved_xmms.as_deref(),
+            self.osr_xmm_saved_base,
             self.osr_heap_local_offset,
             self.needs_context,
             dead_mask,
@@ -1830,6 +1859,9 @@ unsafe fn emit_osr_trampoline(
     xmm_assignments: Option<&[Option<u8>]>,
     frame_size: i32,
     callee_saved_base: i32,
+    callee_saved_regs: Option<&[u8]>,
+    callee_saved_xmms: Option<&[u8]>,
+    xmm_saved_base: i32,
     heap_local_offset: i32,
     needs_context: bool,
     dead_mask: u64,
@@ -1896,7 +1928,19 @@ unsafe fn emit_osr_trampoline(
     // with corrupted registers and segfaults on the next dereference.
     //
     // Therefore: always emit the spill set in `LOCAL_REGS` order.
-    let used_regs: Vec<u8> = if let Some(assignments) = local_assignments {
+    // HIB-CV-20: spill EXACTLY the callee-saved GPR set the method's epilogue
+    // restores, at the SAME slot index. `callee_saved_regs` is the compiler's
+    // `alloc_used_regs` (every callee-saved register the allocator used — for
+    // locals AND for operand-stack temporaries / spilled values), in the order
+    // the epilogue reads `[rbp-(callee_saved_base+i*8)]`. Spilling only the
+    // local_assignments-derived subset (the historical fallback below) drops any
+    // non-local callee-saved register, so the epilogue restores it (and every
+    // later one) from the wrong slot — silently corrupting the OSR caller's live
+    // registers on return. Prefer the exact set; keep the subset derivation only
+    // for artifacts compiled before this metadata existed.
+    let used_regs: Vec<u8> = if let Some(regs) = callee_saved_regs {
+        regs.to_vec()
+    } else if let Some(assignments) = local_assignments {
         let mut used = [false; 16];
         for &a in assignments {
             if let Some(reg) = a {
@@ -1919,6 +1963,26 @@ unsafe fn emit_osr_trampoline(
         tramp.emit_byte(0x89);
         tramp.emit_byte(0x85 | ((reg & 7) << 3));
         tramp.emit(&neg_off.to_le_bytes());
+    }
+
+    // HIB-CV-20: spill the caller's callee-saved XMM registers to the same slots
+    // the epilogue restores them from (`alloc_used_xmms` at xmm_saved_base + i*8,
+    // matching `emit_movq_mem_rbp_from_xmm`). The old trampoline skipped XMM
+    // spills entirely, so on Windows (where XMM6–XMM15 are callee-saved) a method
+    // that used a callee-saved XMM had the caller's value restored from an
+    // uninitialised slot. Encoding: 66 [REX.R] 0F D6 /r with a disp32 [rbp-off].
+    if let Some(xmms) = callee_saved_xmms {
+        for (i, &xmm) in xmms.iter().enumerate() {
+            let neg_off = -(xmm_saved_base + i as i32 * 8);
+            tramp.emit_byte(0x66);
+            if xmm >= 8 {
+                tramp.emit_byte(0x44); // REX.R (base RBP needs no REX.B)
+            }
+            tramp.emit_byte(0x0F);
+            tramp.emit_byte(0xD6);
+            tramp.emit_byte(0x85 | ((xmm & 7) << 3)); // mod=10, reg=xmm&7, rm=rbp(5)
+            tramp.emit(&neg_off.to_le_bytes());
+        }
     }
 
     if needs_context {
@@ -2081,6 +2145,9 @@ unsafe fn osr_trampoline(
     xmm_assignments: Option<&[Option<u8>]>,
     frame_size: i32,
     callee_saved_base: i32,
+    callee_saved_regs: Option<&[u8]>,
+    callee_saved_xmms: Option<&[u8]>,
+    xmm_saved_base: i32,
     heap_local_offset: i32,
     needs_context: bool,
     dead_mask: u64,
@@ -2119,6 +2186,9 @@ unsafe fn osr_trampoline(
                 xmm_assignments,
                 frame_size,
                 callee_saved_base,
+                callee_saved_regs,
+                callee_saved_xmms,
+                xmm_saved_base,
                 heap_local_offset,
                 needs_context,
                 dead_mask,
@@ -6009,7 +6079,13 @@ fn compute_param_jvm_slots(descriptor: &str, is_static: bool) -> (Vec<usize>, us
 ///
 /// Used only on the precise gate to seed [`x64::compile_with_param_slots`]'s
 /// `param_oop_mask`; the caller passes `0` when the gate is off.
-fn compute_param_oop_mask(descriptor: &str, is_static: bool) -> u64 {
+///
+/// `pub` so the OSR / eager-first-call compile paths in the VM crate (which call
+/// `x64::compile_with_param_slots` directly) can seed the same reference-parameter
+/// mask the hot-path `try_compile` does — without it, an oop parameter living in a
+/// callee-saved register across an early safepoint is invisible to the
+/// post-safepoint reload and a moving GC leaves the register stale (HIB-CV-20).
+pub fn compute_param_oop_mask(descriptor: &str, is_static: bool) -> u64 {
     let mut mask = 0u64;
     let mut slot = 0usize;
     if !is_static {

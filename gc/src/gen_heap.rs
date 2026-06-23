@@ -125,6 +125,16 @@ const GC_PROMOTE_PRESSURE_PERCENT: usize = 25;
 /// when run with a tiny young gen (frequent GC).
 pub static SWEEP_CORRUPTION_HITS: AtomicU64 = AtomicU64::new(0);
 
+/// A2 forensic probe (CRATONVM_DBG_A2) — limits the per-run detail dump to the
+/// first few corruption hits so the log is not flooded.
+pub static A2_PROBE_HITS: AtomicU64 = AtomicU64::new(0);
+
+/// Count of OVERLAPPING free blocks merged by the post-sweep coalescer (off <
+/// previous block end). A non-zero count proves the free list was handing out —
+/// or about to hand out — the same young region twice (the A2 object-overlap /
+/// walk-desync root). Exposed for the gated diagnostic + tests.
+pub static A2_FL_OVERLAP_HITS: AtomicU64 = AtomicU64::new(0);
+
 /// DBG: optional young-GC stress threshold (bytes) from CRATONVM_DBG_GC_STRESS.
 fn gc_stress_threshold() -> Option<usize> {
     use std::sync::OnceLock;
@@ -722,6 +732,15 @@ impl GenerationalHeap {
         // fully initialized.
         unsafe {
             std::ptr::write(ptr as *mut ObjectHeader, header);
+            crate::a2dbg::record(
+                ptr as usize,
+                class_id.as_u32(),
+                ObjectKind::Object as u8,
+                ArrayElementType::Reference as u8,
+                array_len,
+                num_slots_u32,
+                total_size,
+            );
             ObjectRef::from_raw(ptr)
         }
     }
@@ -766,6 +785,15 @@ impl GenerationalHeap {
         // `ObjectRef` are sound.
         unsafe {
             std::ptr::write(ptr as *mut ObjectHeader, header);
+            crate::a2dbg::record(
+                ptr as usize,
+                class_id.as_u32(),
+                ObjectKind::Object as u8,
+                ArrayElementType::Reference as u8,
+                array_len,
+                num_slots_u32,
+                total_size,
+            );
             Some(ObjectRef::from_raw(ptr))
         }
     }
@@ -914,6 +942,15 @@ impl GenerationalHeap {
         // because the header is fully initialized.
         unsafe {
             std::ptr::write(ptr as *mut ObjectHeader, header);
+            crate::a2dbg::record(
+                ptr as usize,
+                class_id.as_u32(),
+                ObjectKind::Array as u8,
+                element_type as u8,
+                length_u32,
+                length_u32,
+                total_size,
+            );
             // Data region already zeroed by try_alloc_young() — no redundant memset needed.
             ObjectRef::from_raw(ptr)
         }
@@ -974,6 +1011,15 @@ impl GenerationalHeap {
         // an `ObjectRef` are sound.
         unsafe {
             std::ptr::write(ptr as *mut ObjectHeader, header);
+            crate::a2dbg::record(
+                ptr as usize,
+                class_id.as_u32(),
+                ObjectKind::Array as u8,
+                element_type as u8,
+                length_u32,
+                length_u32,
+                total_size,
+            );
             Some(ObjectRef::from_raw(ptr))
         }
     }
@@ -999,6 +1045,15 @@ impl GenerationalHeap {
         // so writing the header and creating an `ObjectRef` are sound.
         unsafe {
             std::ptr::write(ptr as *mut ObjectHeader, header);
+            crate::a2dbg::record(
+                ptr as usize,
+                class_id.as_u32(),
+                ObjectKind::Object as u8,
+                ArrayElementType::Reference as u8,
+                array_len,
+                u32::try_from(num_fields).unwrap_or(u32::MAX),
+                total_size,
+            );
             Some(ObjectRef::from_raw(ptr))
         }
     }
@@ -1050,6 +1105,15 @@ impl GenerationalHeap {
         // owned, so writing the header and creating an `ObjectRef` are sound.
         unsafe {
             std::ptr::write(ptr as *mut ObjectHeader, header);
+            crate::a2dbg::record(
+                ptr as usize,
+                class_id.as_u32(),
+                ObjectKind::Array as u8,
+                element_type as u8,
+                length_u32,
+                length_u32,
+                total_size,
+            );
             Some(ObjectRef::from_raw(ptr))
         }
     }
@@ -3235,6 +3299,11 @@ impl GenerationalHeap {
         // Phase 4: Swap young spaces (monitor remap deferred until after a
         // possible major GC so we can pass the composed pointer_map).
         std::mem::swap(&mut *young_from, &mut *young_to);
+        // A2 breadcrumb (CRATONVM_DBG_A2): the swap relocates every live young
+        // object to a fresh from-space, so all recorded absolute addresses are now
+        // stale. Clear so cross-epoch lookups don't lie (keeps the breadcrumb
+        // reliable within the next non-moving epoch, where A2's desync occurs).
+        crate::a2dbg::clear();
 
         // Phase 5: Check if old gen is getting full — trigger major GC (mark-compact)
         let major_ran = if old_gen.used() >= old_gen.capacity() * 75 / 100 {
@@ -4233,6 +4302,28 @@ impl GenerationalHeap {
         // Every marked object is a survivor: clear the mark and leave it
         // exactly where it is.
         let existing_free = young_from.free_blocks_sorted();
+        // A2 diag (CRATONVM_DBG_A2): does the free list ALREADY self-overlap at
+        // sweep start? `existing_free` is built only from prior sweeps' coalesced
+        // output + the alloc/split bookkeeping between sweeps. A self-overlap here
+        // means the BETWEEN-SWEEP maintenance (Arena::alloc split, or a stale block
+        // never removed) is the source — vs. this sweep's frees overlapping it.
+        if std::env::var_os("CRATONVM_DBG_A2").is_some() {
+            for w in existing_free.windows(2) {
+                let (a_off, a_sz) = w[0];
+                let (b_off, _b_sz) = w[1];
+                if b_off < a_off + a_sz {
+                    let n = A2_FL_OVERLAP_HITS.load(Ordering::Relaxed);
+                    if n < 12 {
+                        eprintln!(
+                            "[A2-FL] EXISTING-FREE self-overlap at sweep start: [{}, {}) then off={} (prev end {})",
+                            a_off, a_off + a_sz, b_off, a_off + a_sz,
+                        );
+                    }
+                    A2_FL_OVERLAP_HITS.fetch_add(1, Ordering::Relaxed);
+                    break;
+                }
+            }
+        }
         let mut dead_regions: Vec<(usize, usize)> = Vec::new();
         let mut bytes_swept: usize = 0;
         let mut objects_swept: usize = 0;
@@ -4248,12 +4339,44 @@ impl GenerationalHeap {
         // walker into a payload region. Cheap (a Vec push per object) and only
         // logged once per sweep on the abort path.
         let mut walked: Vec<(usize, usize, u32, ObjectKind, u32, u32)> = Vec::new();
+        // A2 probe (CRATONVM_DBG_A2): parallel to `walked`, the element_type byte
+        // and the raw first 8 header bytes AS THE WALKER READ THEM (so a desync
+        // dump shows the actual walk-time header, not an unreliable post-zeroing
+        // re-read). Indexed in lockstep with `walked`.
+        let mut walked_ext: Vec<(u8, u64)> = Vec::new();
         while cursor < used {
-            // If `cursor` is the start of a known free block, skip it.
-            if let Some(&&(off, sz)) = free_iter.peek() {
-                if cursor == off {
-                    cursor += sz;
-                    free_iter.next();
+            // Skip known free blocks ROBUSTLY. The free list (`existing_free`) is
+            // sorted ascending and the walk advances `cursor` monotonically, so we
+            // can stride `free_iter` forward in lockstep. Crucially this handles the
+            // case where a previous object's size brought the cursor PAST a free
+            // block's start (`cursor > off`): the old code only matched `cursor ==
+            // off`, so a single overshoot wedged `free_iter` at that block FOREVER —
+            // and every later free block was then read as a run of zeroed 40-byte
+            // phantom `Object`s (class_id=0, kind=Object, num_slots=0 → size 40),
+            // desyncing the walk off the object grid (the A2 / ReflRepro corruption:
+            // `CRATONVM_DBG_A2` shows freed+zeroed regions being walked, not skipped).
+            // Now: drop free blocks the cursor has wholly passed, and if the cursor
+            // lands AT or INSIDE a free block, resync to that block's end.
+            {
+                let mut resynced = false;
+                while let Some(&&(off, sz)) = free_iter.peek() {
+                    if cursor >= off + sz {
+                        // Walk is already past this entire free block — drop it and
+                        // re-examine the next one.
+                        free_iter.next();
+                        continue;
+                    }
+                    if cursor >= off {
+                        // Cursor is within `[off, off + sz)` — skip the remainder of
+                        // this free block and resync the walk to a real boundary.
+                        cursor = off + sz;
+                        free_iter.next();
+                        resynced = true;
+                    }
+                    // `cursor < off`: the next free block is still ahead; stop.
+                    break;
+                }
+                if resynced {
                     continue;
                 }
             }
@@ -4363,6 +4486,125 @@ impl GenerationalHeap {
                 }
                 tracing::warn!("  bytes around bad header (start_off={}):\n{}", start, hex);
 
+                // A2 forensic probe (CRATONVM_DBG_A2): identify the corrupt object.
+                // The hypothesis is the corrupt slot at `cursor` is an OBJECT whose
+                // 40-byte header was overwritten by 16-byte Value-cell field data
+                // (allocate-then-putfield clobber), OR the PRIOR object (an array)
+                // is a mis-typed reference array the walker under-sized. Dump the
+                // prior object's exact element_type/elem-bytes and resolve the
+                // Value cells at `cursor` (disc + payload, and whether the payload
+                // points into the young arena).
+                if std::env::var_os("CRATONVM_DBG_A2").is_some()
+                    && A2_PROBE_HITS.fetch_add(1, Ordering::Relaxed) < 4
+                {
+                    if let Some(&(loff, lsz, lcid, lkind, lns, lal)) = walked.last() {
+                        // SAFETY: loff < used, header mapped.
+                        let lhdr = unsafe { &*((from_base + loff) as *const ObjectHeader) };
+                        eprintln!(
+                            "[A2] PRIOR obj @{} size={} class_id={} kind={:?} num_slots={} array_len={} ELEM_TYPE={:?} elem_bytes={} (cursor={} = {}+{})",
+                            loff, lsz, lcid, lkind, lns, lal,
+                            lhdr.element_type,
+                            crate::heap::element_byte_size(lhdr.element_type),
+                            cursor, loff, lsz,
+                        );
+                    }
+                    eprintln!("[A2] corruption @off={} from_base={:#x} used={}", cursor, from_base, used);
+                    for k in 0..8usize {
+                        let off = cursor + k * 16;
+                        if off + 16 > used {
+                            break;
+                        }
+                        // SAFETY: off+16 <= used, region mapped.
+                        let disc = unsafe { *((from_base + off) as *const u64) };
+                        let payload = unsafe { *((from_base + off + 8) as *const u64) };
+                        let in_young = payload >= from_base as u64
+                            && payload < (from_base + used) as u64;
+                        // If the payload points into the young arena at an aligned
+                        // object boundary, read its class_id to identify the referent.
+                        let referent = if in_young && (payload as usize - from_base) % 8 == 0 {
+                            let rh = unsafe {
+                                &*(payload as *const ObjectHeader)
+                            };
+                            format!(
+                                "young referent class_id={} kind={} num_slots={}",
+                                rh.class_id.as_u32(),
+                                rh.kind as u8,
+                                rh.num_slots
+                            )
+                        } else if payload >> 40 == (from_base as u64) >> 40 {
+                            "heap-ptr (old-gen?)".to_string()
+                        } else {
+                            "(not-heap)".to_string()
+                        };
+                        eprintln!(
+                            "[A2]   cell[{}] @{} disc={} payload={:#x} {}",
+                            k, off, disc, payload, referent
+                        );
+                    }
+                    // BREADCRUMB: what was actually allocated at/covering the
+                    // corrupt cursor, and the prior object's REAL allocated size
+                    // vs the size the walker computed (the decisive comparison).
+                    match crate::a2dbg::lookup_covering(from_base + cursor) {
+                        Some(r) => eprintln!(
+                            "[A2] BREADCRUMB cursor@{} ({:#x}) covered by alloc start={:#x} class_id={} kind={} et={} alen={} ns={} REAL_size={} seq={} (mid-object offset={})",
+                            cursor, from_base + cursor, r.addr, r.class_id, r.kind, r.element_type, r.array_length, r.num_slots, r.size, r.seq, (from_base + cursor) - r.addr,
+                        ),
+                        None => eprintln!(
+                            "[A2] BREADCRUMB cursor@{} ({:#x}) — NO young alloc record covers it (header never written here, or freed+reused)",
+                            cursor, from_base + cursor,
+                        ),
+                    }
+                    if let Some(&(loff, lsz, _, _, _, _)) = walked.last() {
+                        // Walk-time header AS THE WALKER READ IT (element_type byte
+                        // + raw first 8 bytes). This is the decisive value: if it
+                        // shows a 4-byte element_type for a byte[], the header is
+                        // corrupt at walk time (vs an allocator/walker formula bug).
+                        if let Some(&(wet, w0)) = walked_ext.last() {
+                            eprintln!(
+                                "[A2] WALK-TIME prior@{} element_type_byte={} raw_word0={:#018x} (b0=class_id_lo b4=kind b5=element_type)",
+                                loff, wet, w0,
+                            );
+                        }
+                        match crate::a2dbg::lookup_at(from_base + loff) {
+                            Some(r) if r.kind == 0xFF => eprintln!(
+                                "[A2] BREADCRUMB prior@{} — slot was FREED by the sweep (stale record); walker_size={}",
+                                loff, lsz,
+                            ),
+                            Some(r) => eprintln!(
+                                "[A2] BREADCRUMB prior@{} alloc class_id={} kind={} et={} alen={} ns={} REAL_size={} vs WALKER_size={} {}",
+                                loff, r.class_id, r.kind, r.element_type, r.array_length, r.num_slots, r.size, lsz,
+                                if r.size == lsz { "(match)" } else { "*** SIZE MISMATCH ***" },
+                            ),
+                            None => eprintln!(
+                                "[A2] BREADCRUMB prior@{} — no exact alloc record (walker_size={})",
+                                loff, lsz,
+                            ),
+                        }
+                    }
+                    // The desync DETECTION above is downstream: the walk may have
+                    // silently overshot earlier (reading garbage that still passed
+                    // the plausibility check). Find the FIRST walked object whose
+                    // walker-computed size disagrees with its real allocated size —
+                    // that is the ROOT overshoot. Compare walk-time header (et/raw0)
+                    // to the alloc record to classify header-corruption vs reuse.
+                    for (i, &(woff, wsz, _, _, _, _)) in walked.iter().enumerate() {
+                        if let Some(r) = crate::a2dbg::lookup_at(from_base + woff) {
+                            if r.kind != 0xFF && r.size != wsz {
+                                let (wet, w0) = walked_ext
+                                    .get(i)
+                                    .copied()
+                                    .unwrap_or((255, 0));
+                                eprintln!(
+                                    "[A2] FIRST-MISMATCH walked[{}]@{} walker_size={} walk_et={} raw0={:#018x} vs REAL(class_id={} kind={} et={} alen={} ns={} size={} seq={})",
+                                    i, woff, wsz, wet, w0,
+                                    r.class_id, r.kind, r.element_type, r.array_length, r.num_slots, r.size, r.seq,
+                                );
+                                break;
+                            }
+                        }
+                    }
+                }
+
                 // Defensive recovery: instead of `break` (which abandons
                 // the rest of the arena and leaves dead objects unreclaimed
                 // → young exhaust → OOM/SIGSEGV downstream), scan forward
@@ -4416,6 +4658,35 @@ impl GenerationalHeap {
                 continue;
             }
 
+            // A2 fix: an object can never span a pre-existing free HOLE (holes are
+            // gaps between objects, not object interiors). If the computed size
+            // oversteps the next known free block, the header is over-sized — the
+            // ReflRepro `et=Int` byte-array corruption reads a `byte[N]` as an
+            // `int[N]` (4× the element size). Without this guard the sweep would
+            // FREE the over-large span `[cursor, cursor+total_size)`, which overlaps
+            // the free hole (the `DEAD-vs-EXISTING` overlap) and feeds the
+            // overlapping-free-block / double-serve cycle the coalescer then has to
+            // mop up. Instead, do NOT free or trust this span (it may subsume a live
+            // neighbour) — RETAIN it (over-retention is always safe under the
+            // non-moving sweep) and re-sync the cursor at the hole boundary, where
+            // the robust free-block skip takes over. Caps the desync to a single
+            // object instead of an overstep cascade.
+            if let Some(&&(foff, _fsz)) = free_iter.peek() {
+                if foff > cursor && foff < cursor + total_size {
+                    if std::env::var_os("CRATONVM_DBG_A2").is_some()
+                        && A2_FL_OVERLAP_HITS.load(Ordering::Relaxed) < 30
+                    {
+                        eprintln!(
+                            "[A2-FL] CLAMP over-sized object @{} computed_size={} (kind={:?} class_id={}) oversteps free hole at {} — retaining + resyncing",
+                            cursor, total_size, header.kind, header.class_id.as_u32(), foff,
+                        );
+                    }
+                    A2_FL_OVERLAP_HITS.fetch_add(1, Ordering::Relaxed);
+                    cursor = foff;
+                    continue;
+                }
+            }
+
             walked.push((
                 cursor,
                 total_size,
@@ -4424,6 +4695,10 @@ impl GenerationalHeap {
                 header.num_slots,
                 header.array_length,
             ));
+            // SAFETY: obj_ptr is the mapped header start; reading 8 bytes is in bounds.
+            walked_ext.push((header.element_type as u8, unsafe {
+                *(obj_ptr as *const u64)
+            }));
 
             if header.is_forwarded() {
                 // Evacuated to old gen by selective promotion: the live copy is
@@ -4440,6 +4715,7 @@ impl GenerationalHeap {
                 );
                 // SAFETY: span within from-space (checked above).
                 unsafe { std::ptr::write_bytes(obj_ptr, 0, total_size) };
+                crate::a2dbg::record_free(obj_ptr as usize);
                 dead_regions.push((cursor, total_size));
                 bytes_swept += total_size;
                 objects_swept += 1;
@@ -4464,6 +4740,7 @@ impl GenerationalHeap {
                 // SAFETY: `[obj_ptr, obj_ptr+total_size)` lies within the
                 // live from-space region (checked above).
                 unsafe { std::ptr::write_bytes(obj_ptr, 0, total_size) };
+                crate::a2dbg::record_free(obj_ptr as usize);
                 dead_regions.push((cursor, total_size));
                 bytes_swept += total_size;
                 objects_swept += 1;
@@ -4490,6 +4767,30 @@ impl GenerationalHeap {
         // positive: the Nodes are valid; the *walk* desynced). The main sweep
         // loop never desynced because it knew each object's size before zeroing
         // it; publishing the holes first makes the re-walk hole-aware too.
+        // A2 diag (CRATONVM_DBG_A2): does a NEW dead region this sweep overlap a
+        // free block that was ALREADY free at sweep start? That is a double-free
+        // (the walk reclaimed a region that was already on the free list — e.g. a
+        // freed slot it walked as a phantom because the region wasn't skipped) or
+        // an OVER-free (a too-large dead object whose span covers a free hole).
+        // Either way it is the direct source of the overlapping free blocks the
+        // coalescer then has to merge.
+        if std::env::var_os("CRATONVM_DBG_A2").is_some() {
+            for &(doff, dsz) in &dead_regions {
+                for &(foff, fsz) in &existing_free {
+                    if doff < foff + fsz && foff < doff + dsz {
+                        let n = A2_FL_OVERLAP_HITS.load(Ordering::Relaxed);
+                        if n < 18 {
+                            eprintln!(
+                                "[A2-FL] DEAD-vs-EXISTING overlap: new dead [{}, {}) overlaps pre-existing free [{}, {})",
+                                doff, doff + dsz, foff, foff + fsz,
+                            );
+                        }
+                        A2_FL_OVERLAP_HITS.fetch_add(1, Ordering::Relaxed);
+                        break;
+                    }
+                }
+            }
+        }
         for (off, sz) in dead_regions {
             young_from.add_free_block(off, sz);
         }
@@ -4513,8 +4814,34 @@ impl GenerationalHeap {
                 let mut merged: Vec<(usize, usize)> = Vec::with_capacity(sorted.len());
                 for (off, sz) in sorted {
                     if let Some(last) = merged.last_mut() {
-                        if last.0 + last.1 == off {
-                            last.1 += sz;
+                        let last_end = last.0 + last.1;
+                        // Merge ADJACENT (off == last_end) AND OVERLAPPING
+                        // (off < last_end) blocks. The old code only handled the
+                        // adjacent case, so two overlapping free blocks both
+                        // survived — and `Arena::alloc` (no overlap check, see
+                        // `arena.rs::add_free_block`) could then SERVE the same
+                        // young region twice → two live objects overlapping → the
+                        // non-moving sweep's linear walk reads a header inside a
+                        // neighbour and desyncs (the A2 / ReflRepro corruption:
+                        // CRATONVM_DBG_A2 shows the walk overstep a live object).
+                        // Overlapping spans appear when a region is freed more than
+                        // once (a stale block not removed on reuse, or two dead
+                        // spans that overlap after an earlier desync). Extend to the
+                        // farther end so the union is one block, never double-served.
+                        if off <= last_end {
+                            if off < last_end {
+                                A2_FL_OVERLAP_HITS.fetch_add(1, Ordering::Relaxed);
+                                if std::env::var_os("CRATONVM_DBG_A2").is_some()
+                                    && A2_FL_OVERLAP_HITS.load(Ordering::Relaxed) <= 6
+                                {
+                                    eprintln!(
+                                        "[A2-FL] coalesce OVERLAP: block off={} size={} overlaps prev [{}, {}) — merging",
+                                        off, sz, last.0, last_end,
+                                    );
+                                }
+                            }
+                            let new_end = last_end.max(off + sz);
+                            last.1 = new_end - last.0;
                             continue;
                         }
                     }
