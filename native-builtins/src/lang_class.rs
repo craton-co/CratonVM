@@ -6153,6 +6153,22 @@ pub(crate) fn create_constructor_object(
     ctx.set_field_by_name(obj, "modifiers", Value::Int(meta.access_flags as i32));
     ctx.set_field_by_name(obj, "slot", Value::Int(0));
 
+    // SBR-06: populate the JDK `signature` field from the JVMS §4.7.9 Signature
+    // attribute, mirroring `create_method_object`. `Parameter.getParameterizedType()`
+    // runs JDK bytecode (`executable.getAllGenericParameterTypes()`), which checks
+    // `hasGenericInformation()` (i.e. `getGenericSignature() != null`) FIRST and
+    // short-circuits to the erased `parameterTypes` when the `signature` field is
+    // null. The Method path already sets this; Constructors did not, so a generic
+    // constructor parameter (e.g. a record's canonical `List<Foo>` component) came
+    // back as raw `List` from `Parameter.getParameterizedType()` while
+    // `Constructor.getGenericParameterTypes()` (a registered native) was correct.
+    if let Some(sig) =
+        ctx.method_signature(meta.declaring_class_id, &meta.name, &meta.descriptor)
+    {
+        let sig_obj = ctx.create_string(&sig);
+        ctx.set_field_by_name(obj, "signature", Value::Object(Some(sig_obj)));
+    }
+
     // --- CratonVM extra metadata ---
     ctx.set_field(
         obj,
