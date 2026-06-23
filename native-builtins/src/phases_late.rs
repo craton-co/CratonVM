@@ -15867,6 +15867,18 @@ fn spring_class_utils_for_name_impl(
     };
     let dotted = ctx.read_string(name_obj).unwrap_or_default();
 
+    // BUG-06 — this native shadows Spring's ClassUtils.forName, the engine
+    // behind ClassUtils.isPresent. It must observe the same reflective-probe
+    // semantics as the Class.forName native: an enterprise-framework class
+    // (org/jboss/, io/smallrye/, …) that is not on the classpath must report
+    // ABSENT (CNFE) rather than resolve to a fabricated synthetic stub.
+    // Otherwise Spring's ReactiveAdapterRegistry sees a false-positive
+    // `io.smallrye.mutiny.Multi`, registers MutinyRegistrar, and its <clinit>
+    // dies on the incomplete stub. Real factory classes are on the classpath,
+    // so the gate (which only fires after classpath lookup fails) leaves them
+    // untouched. The guard clears on every return path below.
+    let _probe_guard = cratonvm_types::reflective_probe::ProbeGuard::new();
+
     // Handle primitive language names (Spring converts these to wrapper classes)
     let prim_class_id: Option<&str> = match dotted.as_str() {
         "boolean" => Some("java/lang/Boolean"),

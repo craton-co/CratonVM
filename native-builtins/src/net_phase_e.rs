@@ -4701,6 +4701,14 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
                 return Ok(Some(Value::Int(0)));
             }
             let internal = name.replace('.', "/");
+            // BUG-06 — isPresent is a reflective existence probe: it must NOT be
+            // satisfied by a fabricated enterprise-framework synthetic stub
+            // (org/jboss/, io/smallrye/, …) for a class absent from the
+            // classpath. The probe guard makes the class loader return CNFE in
+            // that case (matching HotSpot) instead of fabricating a stub, so
+            // e.g. Spring's ReactiveAdapterRegistry correctly sees
+            // io.smallrye.mutiny.Multi as absent and skips MutinyRegistrar.
+            let _probe_guard = cratonvm_types::reflective_probe::ProbeGuard::new();
             let present = ctx.ensure_class_initialized(&internal).is_ok();
             Ok(Some(Value::Int(if present { 1 } else { 0 })))
         },
