@@ -135,12 +135,17 @@ pub static A2_PROBE_HITS: AtomicU64 = AtomicU64::new(0);
 /// walk-desync root). Exposed for the gated diagnostic + tests.
 pub static A2_FL_OVERLAP_HITS: AtomicU64 = AtomicU64::new(0);
 
-/// DBG: optional young-GC stress threshold (bytes) from CRATONVM_DBG_GC_STRESS.
+/// DBG: optional young-GC stress threshold (bytes). Read from
+/// `CRATONVM_DBG_GC_STRESS`, or `CRATONVM_GC_STRESS` as an accepted alias
+/// (the latter is what several handoff/repro docs use; without the alias the
+/// documented `CRATONVM_GC_STRESS=<bytes> …` command silently does nothing).
+/// `CRATONVM_DBG_GC_STRESS` wins if both are set.
 fn gc_stress_threshold() -> Option<usize> {
     use std::sync::OnceLock;
     static S: OnceLock<Option<usize>> = OnceLock::new();
     *S.get_or_init(|| {
         std::env::var("CRATONVM_DBG_GC_STRESS")
+            .or_else(|_| std::env::var("CRATONVM_GC_STRESS"))
             .ok()
             .and_then(|v| v.trim().parse::<usize>().ok())
             .filter(|&v| v > 0)
