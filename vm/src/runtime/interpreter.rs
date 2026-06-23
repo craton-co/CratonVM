@@ -12134,9 +12134,11 @@ fn execute_instruction(
                             })?
                             .to_string()
                     };
-                    // Arrays: use descriptor-based assignability.
+                    // Arrays: use descriptor-based assignability. instanceof is
+                    // strict (SBR-03): a genuine `Object[]` is not an instance of
+                    // an unrelated `T[]`.
                     let result = if let Some(src_desc) = array_descriptor_of(shared, obj_ref) {
-                        if array_is_assignable_to(shared, &src_desc, &target_class_name) {
+                        if array_is_instance_of(shared, &src_desc, &target_class_name) {
                             1
                         } else {
                             0
@@ -12689,6 +12691,28 @@ pub(crate) fn array_descriptor_of(
 ///   - A class/interface name like "java/lang/Object", "java/io/Serializable",
 ///     or "java/lang/Cloneable".
 pub(crate) fn array_is_assignable_to(shared: &SharedVm, src_desc: &str, target_name: &str) -> bool {
+    // Lenient entry point: used by `checkcast` and `aastore`, where the native
+    // array-allocation leniency (an `Object[]` standing in for a `T[]` whose real
+    // element type a native path didn't preserve) must not provoke a spurious
+    // `ClassCastException` / `ArrayStoreException`.
+    array_is_assignable_to_impl(shared, src_desc, target_name, true)
+}
+
+/// Strict variant for the `instanceof` opcode (SBR-03). Unlike `checkcast`,
+/// `instanceof` must answer precisely: `Object[] instanceof I[]` is `false`
+/// because `Object` is not assignable to the interface `I`. The lenient
+/// `Object[]`→`T[]` fallback used for casts is suppressed here so a genuine
+/// `Object[]` is not reported as an instance of an unrelated `T[]`.
+pub(crate) fn array_is_instance_of(shared: &SharedVm, src_desc: &str, target_name: &str) -> bool {
+    array_is_assignable_to_impl(shared, src_desc, target_name, false)
+}
+
+fn array_is_assignable_to_impl(
+    shared: &SharedVm,
+    src_desc: &str,
+    target_name: &str,
+    lenient: bool,
+) -> bool {
     // Every array is an Object and implements Serializable + Cloneable.
     if &*target_name == "java/lang/Object"
         || target_name == "java/io/Serializable"
@@ -12736,7 +12760,7 @@ pub(crate) fn array_is_assignable_to(shared: &SharedVm, src_desc: &str, target_n
         None => return false,
     };
     if src_is_arr && tgt_is_arr {
-        return array_is_assignable_to(shared, &src_comp, &tgt_comp);
+        return array_is_assignable_to_impl(shared, &src_comp, &tgt_comp, lenient);
     }
     if src_is_arr != tgt_is_arr {
         // One is nested array, the other is an object-component; only compatible
@@ -12749,13 +12773,15 @@ pub(crate) fn array_is_assignable_to(shared: &SharedVm, src_desc: &str, target_n
             || tgt_comp == "java/lang/Cloneable";
     }
     // Both are reference (non-array) component class names.
-    // Lenient fallback: our native array-allocation paths often create
-    // reference arrays with component `java/lang/Object` when the runtime
-    // component type is actually a subclass (e.g. `getEnumConstantsShared`
-    // returns `[Ljava/lang/Object;` but callers cast to `[LEnum;`). Accept
-    // these casts so reflection/enum paths don't spuriously fail.
+    // Lenient fallback (checkcast/aastore only): our native array-allocation
+    // paths often create reference arrays with component `java/lang/Object` when
+    // the runtime component type is actually a subclass (e.g.
+    // `getEnumConstantsShared` returns `[Ljava/lang/Object;` but callers cast to
+    // `[LEnum;`). Accept these casts so reflection/enum paths don't spuriously
+    // fail. For `instanceof` (lenient == false) this is suppressed: a genuine
+    // `Object[]` is NOT an instance of `I[]` (SBR-03).
     if src_comp == "java/lang/Object" {
-        return true;
+        return lenient || tgt_comp == "java/lang/Object";
     }
     let src_id = match shared.class_manager.write().load_class(&src_comp) {
         Ok(id) => id,
