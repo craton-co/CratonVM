@@ -138,16 +138,30 @@ escapes the `<init>` receiver and seeds `non_escaping_new` empty; `x64::compile`
 precise re-analysis (which has the resolved shapes) is gated to only *refine a
 non-empty* set (`if non_escaping_new.is_empty() { stays empty }`), so it never
 runs — and the hot IR/`try_compile` path passes an empty set too (`lib.rs:5812`).
-Net: single-pass (x64) SR is effectively dormant in the runtime hot paths for
-ordinary allocations; the IR/C2 backend has its own independent SR-deopt
-(`ir_lower::frame_value_for_object`, `CRATONVM_SCALAR_DEOPT`). So Phase B is a
-correct-and-tested producer extension whose *runtime* exercise is gated by an
-orthogonal single-pass-SR-seeding limitation. Completing B4 requires either fixing
-that seeding (let `x64::compile`'s precise re-analysis DISCOVER non-escaping
-objects from a `new`-seeded set rather than only refine, then re-run with
-`invoke_info` shapes) or a test hook that seeds `non_escaping_new` directly — both
-out of Phase B's producer scope. The trigger + diagnostics are retained as the
-completion harness.
+Net: single-pass (x64) SR was effectively dormant in the runtime hot paths for
+ordinary allocations.
+
+**SR-reachability FIXED (commit `0db926ed`).** `x64::compile`'s precise
+re-analysis is now gated on whether the method allocates (`new_info` non-empty)
+rather than on jit_scan's seed, so it DISCOVERS non-escaping objects (it
+recomputes from scratch with the resolved `<init>` shapes) instead of only
+refining a non-empty set. Verified: a straight-line `new X(); <init>()V` method
+now reports `non_escaping=[0]` and the Phase B path emits the `VirtualObject`
+(correct `class_id`/`num_fields`) at runtime. This is an UNGATED production
+codegen change — validated by 849 jit tests + binarytrees depth-16 checksum
+`14985902` == HotSpot (escaping `TreeNode`s correctly NOT scalar-replaced).
+Fuller app-suite validation (gauntlet/kafka) recommended before merging the
+ungated change.
+
+**Live deopt-RESUME still not directly observed — C2 subsumption.** The eager
+trigger fires in the single-pass (C1) compile, but C2/IR subsumes hot methods
+(and has its own IR SR-deopt via `ir_lower::frame_value_for_object`,
+`CRATONVM_SCALAR_DEOPT`), so the *running* version of a hot method is usually the
+C2 recompile — single-pass deopt-resume is inherently narrow at runtime (C1
+window / C1-resident methods only). Every link is proven independently (SR fires
+→ producer emits the correct `VirtualObject`; the consumer materializes it, 48 vm
+tests), but the C1-version-stays-resident-and-deopts case is hard to stage. The
+trigger + diagnostics are retained as the harness.
 
 ## Phase C — monitors (deferred); inlining (out of scope)
 
