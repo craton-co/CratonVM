@@ -209,8 +209,35 @@ pub fn type_sig_to_java(ctx: &mut dyn NativeContext, sig: &TypeSig) -> Value {
             // Validator then fails to discover a constraint's validated type
             // (`HV000030 No validator found` / `HV000150 multiple validators`).
             if let Value::Object(Some(decl)) = current_generic_decl() {
-                if let Some(real) = resolve_declared_type_variable(ctx, decl, name) {
-                    return real;
+                // A type-variable USE resolves by walking the ENCLOSING generic
+                // declarations, exactly like Java's lexical scope: the immediate
+                // decl (method/constructor/class), then its declaring class, then
+                // any outer classes. A method type-parameter bound such as
+                // `<S extends T> withType(Class<S>)` references the CLASS's `T`,
+                // which the immediate (method) decl does not declare — without the
+                // walk-up we fell back to a synthetic stub whose `getName()` is
+                // right but which is NOT identity-equal to the class's real `T`
+                // and whose bound defaults to `Object`. ByteBuddy's mock builder
+                // (`TypeVariableSource.findExpectedVariable`) then fails with
+                // "Cannot resolve T", breaking Mockito mocks of any generic type
+                // (e.g. Gradle `RepositoryHandler`). Resolving up the scope hands
+                // back the real `TypeVariableImpl`, matching HotSpot.
+                let mut scope = decl;
+                for _ in 0..16 {
+                    if let Some(real) = resolve_declared_type_variable(ctx, scope, name) {
+                        return real;
+                    }
+                    match ctx.invoke_virtual(
+                        scope,
+                        "getDeclaringClass",
+                        "()Ljava/lang/Class;",
+                        &[],
+                    ) {
+                        Ok(Some(Value::Object(Some(enclosing)))) if enclosing != scope => {
+                            scope = enclosing;
+                        }
+                        _ => break,
+                    }
                 }
             }
             // Fallback (no resolvable declaration in scope): synthetic
