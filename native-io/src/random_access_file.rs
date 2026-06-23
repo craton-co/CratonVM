@@ -18,10 +18,24 @@
 //! - close0()
 //! - initIDs() (no-op)
 //!
-//! Handles are stored in `RandomAccessFile.fd.fd` as an i32 handle id
-//! (mirroring the pattern used by FileInputStream.open0 in lib.rs where
-//! the fd slot of `this` holds an integer id).  The actual
-//! `std::fs::File` is kept in a process-global map keyed by that id.
+//! ## Single FD registry (TC0622 fix)
+//!
+//! A `RandomAccessFile` and any `FileChannel` obtained from it
+//! (`raf.getChannel()`) share **one** `java.io.FileDescriptor` — and on
+//! HotSpot they share one OS fd. CratonVM's nio natives
+//! (`FileDispatcherImpl.size0/read0/…`, `FileChannelImpl.map0`) resolve a
+//! `FileDescriptor` against the global `fd_table` (`native-api`). So the RAF
+//! natives MUST register the open file in that **same** `fd_table` and store
+//! the returned `FdId` on the descriptor — otherwise `raf.getChannel().size()`
+//! / `.map(...)` fail with `IOException: size0: bad fd for size`.
+//!
+//! `open0` therefore opens through `fd_table().open_random_access(path,
+//! write)` (a `FileReadWrite` entry, which `file_size`/`rw_read`/`rw_seek`/
+//! `clone_file` all handle), and `read0`/`write0`/`seek0`/`length0`/… drive
+//! that same fd. The id is written into both `fd.fd` (int) and `fd.handle`
+//! (long) so either layout (Unix `fd` / Windows `handle`) resolves it. This
+//! replaces the previous module-local handle table, whose ids (≥ 1000) were
+//! invisible to the nio path and overlapped the `fd_table` id range.
 //!
 //! Synthetic-mode uses the fd_table-based `<init>`/`read`/`write`
 //! overrides in `lib.rs::register_io_extras_natives`; those remain
@@ -29,19 +43,18 @@
 //! different method names.
 
 use std::collections::HashMap;
-use std::fs::{File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
-use std::sync::atomic::{AtomicI64, Ordering};
-use std::sync::Arc;
+use std::fs::OpenOptions;
+use std::io::SeekFrom;
 
 use parking_lot::Mutex;
 
+use cratonvm_native_api::fd_table::FdId;
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError, VmError};
 use cratonvm_types::{ObjectRef, Value};
 
 // ---------------------------------------------------------------------------
-// Handle table
+// Per-handle sync mode (O_SYNC / O_DSYNC)
 // ---------------------------------------------------------------------------
 
 /// Java spec for `RandomAccessFile` modes:
@@ -57,97 +70,26 @@ enum SyncMode {
     Full,
 }
 
-/// Per-handle state: the open `File` plus the sync mode requested at
-/// open time. `None` sync_mode means no per-write sync (plain "r" or
-/// "rw" modes).
-///
-/// AUDIT 2026-05-17: mirrors the `fd_table::FileEntry` pattern. The
-/// underlying `File` lives behind its own `Arc<Mutex<_>>` so callers
-/// can clone the handle out of the global map, drop the map-level
-/// lock, and only then perform the blocking I/O. Holding the map
-/// lock across the syscall serializes every RAF op in the VM against
-/// the longest-running I/O on any open RAF.
-struct RafHandle {
-    file: Arc<Mutex<File>>,
-    sync_mode: Option<SyncMode>,
-}
-
-impl Clone for RafHandle {
-    fn clone(&self) -> Self {
-        Self {
-            file: Arc::clone(&self.file),
-            sync_mode: self.sync_mode,
-        }
-    }
-}
-
-/// Module-local handle table: integer id -> RafHandle.
-///
-/// Starts at 1000 to stay clear of the 0..3 stdio reservations and the
-/// small fd_table space (which starts at 3 and rarely exceeds a few
-/// hundred in practice).  A collision would only cause a wrong-file
-/// error; it wouldn't be a memory-safety issue because the two systems
-/// never read each other's ids.
-static NEXT_HANDLE: AtomicI64 = AtomicI64::new(1000);
-
-fn handle_map() -> &'static Mutex<HashMap<i64, RafHandle>> {
-    static MAP: std::sync::OnceLock<Mutex<HashMap<i64, RafHandle>>> = std::sync::OnceLock::new();
+/// The open file itself now lives in the global `fd_table` (so the RAF and
+/// its `FileChannel` share one fd — see the module doc). The only per-handle
+/// state the RAF natives still own is the requested sync mode, which `fd_table`
+/// does not model. This side map is keyed by the **same** `FdId`, so it shares
+/// the fd_table id namespace and carries no wrong-file hazard. Only "rws"/"rwd"
+/// opens insert an entry; plain "r"/"rw" opens never touch it.
+fn sync_modes() -> &'static Mutex<HashMap<FdId, SyncMode>> {
+    static MAP: std::sync::OnceLock<Mutex<HashMap<FdId, SyncMode>>> = std::sync::OnceLock::new();
     MAP.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn alloc_handle(file: File, sync_mode: Option<SyncMode>) -> i64 {
-    let h = NEXT_HANDLE.fetch_add(1, Ordering::Relaxed);
-    handle_map().lock().insert(
-        h,
-        RafHandle {
-            file: Arc::new(Mutex::new(file)),
-            sync_mode,
-        },
-    );
-    h
-}
-
-/// AUDIT 2026-05-17 (mirror of `fd_table::get_entry`): take the
-/// map-level lock briefly to clone the per-handle `Arc<Mutex<File>>`,
-/// drop the map lock, then lock and operate on the inner file. This
-/// keeps the global handle-table lock off the blocking I/O path.
-fn with_file<F, R>(handle: i64, f: F) -> Option<R>
-where
-    F: FnOnce(&mut File) -> R,
-{
-    let entry = handle_map().lock().get(&handle).cloned()?;
-    let mut file = entry.file.lock();
-    Some(f(&mut file))
-}
-
-/// Look up the configured sync mode for an open handle.
-fn handle_sync_mode(handle: i64) -> Option<SyncMode> {
-    handle_map().lock().get(&handle).and_then(|h| h.sync_mode)
-}
-
-/// Run an fsync corresponding to the handle's sync mode. No-op if
-/// the handle was opened in a non-sync mode ("r" / "rw").
-///
-/// AUDIT 2026-05-17: same Arc-clone-then-drop pattern as `with_file`
-/// so the fsync syscall does not serialize against handle-map mutations.
-fn sync_for_handle(handle: i64) -> Result<(), std::io::Error> {
-    let entry = match handle_map().lock().get(&handle).cloned() {
-        Some(e) => e,
-        None => return Ok(()),
-    };
-    let mode = match entry.sync_mode {
-        Some(m) => m,
-        None => return Ok(()),
-    };
-    let mut file = entry.file.lock();
-    match mode {
-        SyncMode::Data => file.sync_data(),
-        SyncMode::Full => file.sync_all(),
+/// Run the fsync corresponding to `fd`'s sync mode, if any. No-op when the
+/// handle was opened in a non-sync mode ("r" / "rw").
+fn sync_if_needed(ctx: &dyn NativeContext, fd: FdId) -> Result<(), MethodCallFailed> {
+    let mode = sync_modes().lock().get(&fd).copied();
+    if let Some(mode) = mode {
+        let data_only = matches!(mode, SyncMode::Data);
+        ctx.fd_table().rw_sync(fd, data_only).map_err(io_err)?;
     }
-}
-
-fn remove_handle(handle: i64) -> Option<Arc<Mutex<File>>> {
-    handle_map().lock().remove(&handle).map(|h| h.file)
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -205,47 +147,50 @@ fn raf_fd_object(ctx: &dyn NativeContext, this: ObjectRef) -> Option<ObjectRef> 
     }
 }
 
-/// Read the integer handle id from a FileDescriptor object.  JDK 25
-/// FileDescriptor has both `fd` (int) and `handle` (long on Windows).
-/// We store our id in `fd` so all platforms use the same slot.
-fn read_handle(ctx: &dyn NativeContext, this: ObjectRef) -> Option<i64> {
+/// Read the `fd_table` `FdId` from this RAF's `FileDescriptor`.  JDK 25
+/// FileDescriptor has both `fd` (int) and `handle` (long on Windows); we
+/// store the id in both. Valid `fd_table` ids are ≥ 3 (0/1/2 are reserved
+/// stdio), so anything ≤ 2 (including the closed-file sentinel `-1` and the
+/// unset `0`) reads back as "no open handle" — matching `fd_from_descriptor`
+/// in `nio_native.rs`, so the RAF and its channel agree on what is open.
+fn read_fd(ctx: &dyn NativeContext, this: ObjectRef) -> Option<FdId> {
     let fd_obj = raf_fd_object(ctx, this)?;
     match ctx.get_field_by_name(fd_obj, "fd") {
-        Value::Int(v) if v != 0 => Some(v as i64),
-        _ => {
-            // Fallback to `handle` (long) — used by Windows JDK builds.
-            match ctx.get_field_by_name(fd_obj, "handle") {
-                Value::Long(v) if v != 0 => Some(v),
-                _ => None,
-            }
-        }
+        Value::Int(v) if v > 2 => return Some(v as FdId),
+        _ => {}
+    }
+    // Fallback to `handle` (long) — used by Windows JDK builds.
+    match ctx.get_field_by_name(fd_obj, "handle") {
+        Value::Long(v) if v > 2 && v < u32::MAX as i64 => Some(v as FdId),
+        _ => None,
     }
 }
 
-fn write_handle(ctx: &mut dyn NativeContext, this: ObjectRef, handle: i64) {
+fn write_handle(ctx: &mut dyn NativeContext, this: ObjectRef, fd: FdId) {
     // Real `RandomAccessFile.<init>` sets `this.fd = new FileDescriptor()` before
     // calling open0, but on CratonVM that constructor field-initializer does not
     // always land — `this.fd` reads back null (same class of issue as
     // java.net.Socket's null `socketLock`). With no FileDescriptor there is
-    // nowhere to record the open handle, so `read_handle` returns None and every
+    // nowhere to record the open handle, so `read_fd` returns None and every
     // length/read/seek behaves as a closed/empty file: `length()`=0, `read()`=-1,
     // and commons-compress's seek-from-EOF computes a negative offset
     // ("seek before beginning of file"). Create the FileDescriptor on demand.
     let fd_obj = match raf_fd_object(ctx, this) {
         Some(o) => o,
         None => match ctx.new_object("java/io/FileDescriptor") {
-            Ok(Some(Value::Object(Some(fd)))) => {
-                ctx.set_field_by_name(this, "fd", Value::Object(Some(fd)));
-                fd
+            Ok(Some(Value::Object(Some(fd_obj)))) => {
+                ctx.set_field_by_name(this, "fd", Value::Object(Some(fd_obj)));
+                fd_obj
             }
             _ => return,
         },
     };
     // Store the same id in both slots so code looking at either
-    // gets a consistent value.  JDK's RandomAccessFile close path
-    // checks `fd.fd != -1`.
-    ctx.set_field_by_name(fd_obj, "fd", Value::Int(handle as i32));
-    ctx.set_field_by_name(fd_obj, "handle", Value::Long(handle));
+    // gets a consistent value (and so `nio_native::fd_from_descriptor`,
+    // which prefers `handle`, resolves the same fd_table entry).  JDK's
+    // RandomAccessFile close path checks `fd.fd != -1`.
+    ctx.set_field_by_name(fd_obj, "fd", Value::Int(fd as i32));
+    ctx.set_field_by_name(fd_obj, "handle", Value::Long(fd as i64));
 }
 
 fn clear_handle(ctx: &mut dyn NativeContext, this: ObjectRef) {
@@ -306,14 +251,11 @@ fn native_open0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult
         Err(_) => return Err(fnf(&path_str)),
     };
 
-    let mut opts = OpenOptions::new();
     // O_RDONLY == 1 means read-only; O_RDWR == 2 means read+write.
     // Java spec: "rw" => O_RDWR; "r" => O_RDONLY.  The private open()
     // Java wrapper already translates the string mode into these bits.
-    opts.read(true);
-    if mode_bits & O_RDWR != 0 {
-        opts.write(true).create(true);
-    }
+    let write = mode_bits & O_RDWR != 0;
+
     // Translate O_SYNC / O_DSYNC into a per-handle sync mode that the
     // write paths honour. std::fs doesn't expose O_SYNC portably at
     // open time, so we emulate by calling sync_all / sync_data after
@@ -327,9 +269,17 @@ fn native_open0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult
         None
     };
 
-    let file = opts.open(&path_str).map_err(|_| fnf(&path_str))?;
-    let handle = alloc_handle(file, sync_mode);
-    write_handle(ctx, this, handle);
+    // Open through the global fd_table (a FileReadWrite entry) so the RAF and
+    // any FileChannel from raf.getChannel() resolve the SAME fd. Any open
+    // error surfaces as FileNotFoundException, matching open0's declared throws.
+    let fd = ctx
+        .fd_table()
+        .open_random_access(&path_str, write)
+        .map_err(|_| fnf(&path_str))?;
+    if let Some(mode) = sync_mode {
+        sync_modes().lock().insert(fd, mode);
+    }
+    write_handle(ctx, this, fd);
     Ok(None)
 }
 
@@ -338,22 +288,15 @@ fn native_read0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(-1))),
     };
-    let handle = match read_handle(ctx, this) {
-        Some(h) => h,
+    let fd = match read_fd(ctx, this) {
+        Some(fd) => fd,
         None => return Ok(Some(Value::Int(-1))),
     };
-    let res = with_file(handle, |f| {
-        let mut buf = [0u8; 1];
-        match f.read(&mut buf) {
-            Ok(0) => Ok(-1i32),
-            Ok(_) => Ok(buf[0] as i32),
-            Err(e) => Err(e),
-        }
-    });
-    match res {
-        Some(Ok(v)) => Ok(Some(Value::Int(v))),
-        Some(Err(e)) => Err(io_err(e)),
-        None => Ok(Some(Value::Int(-1))),
+    // fd_table().read_byte returns 0..255, or -1 at EOF — the exact
+    // contract of RandomAccessFile.read0.
+    match ctx.fd_table().read_byte(fd) {
+        Ok(v) => Ok(Some(Value::Int(v))),
+        Err(e) => Err(io_err(e)),
     }
 }
 
@@ -383,15 +326,16 @@ fn native_readBytes0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     if len == 0 {
         return Ok(Some(Value::Int(0)));
     }
-    let handle = match read_handle(ctx, this) {
-        Some(h) => h,
+    let fd = match read_fd(ctx, this) {
+        Some(fd) => fd,
         None => return Ok(Some(Value::Int(-1))),
     };
     let mut buf = vec![0u8; len];
-    let n = match with_file(handle, |f| f.read(&mut buf)) {
-        Some(Ok(n)) => n,
-        Some(Err(e)) => return Err(io_err(e)),
-        None => return Ok(Some(Value::Int(-1))),
+    // Sequential read at the file's current cursor (advances it), matching
+    // RandomAccessFile semantics.
+    let n = match ctx.fd_table().rw_read(fd, &mut buf) {
+        Ok(n) => n,
+        Err(e) => return Err(io_err(e)),
     };
     if n == 0 {
         return Ok(Some(Value::Int(-1)));
@@ -410,21 +354,16 @@ fn native_write0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
         Some(Value::Int(v)) => *v as u8,
         _ => return Ok(None),
     };
-    let handle = match read_handle(ctx, this) {
-        Some(h) => h,
+    let fd = match read_fd(ctx, this) {
+        Some(fd) => fd,
         None => return Ok(None),
     };
-    match with_file(handle, |f| f.write_all(&[byte])) {
-        Some(Ok(())) => {
-            // Honour O_SYNC / O_DSYNC: per Java RandomAccessFile spec,
-            // "rws" and "rwd" modes require that every write reach
-            // stable storage before the call returns.
-            sync_for_handle(handle).map_err(io_err)?;
-            Ok(None)
-        }
-        Some(Err(e)) => Err(io_err(e)),
-        None => Ok(None),
-    }
+    ctx.fd_table().write_byte(fd, byte).map_err(io_err)?;
+    // Honour O_SYNC / O_DSYNC: per Java RandomAccessFile spec, "rws" and
+    // "rwd" modes require that every write reach stable storage before the
+    // call returns.
+    sync_if_needed(ctx, fd)?;
+    Ok(None)
 }
 
 #[allow(non_snake_case)]
@@ -456,19 +395,15 @@ fn native_writeBytes0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     let mut buf = vec![0u8; len];
     // AUDIT 2026-05-17: bulk read via NativeContext intrinsic.
     ctx.read_byte_array_into(arr, off, &mut buf);
-    let handle = match read_handle(ctx, this) {
-        Some(h) => h,
+    let fd = match read_fd(ctx, this) {
+        Some(fd) => fd,
         None => return Ok(None),
     };
-    match with_file(handle, |f| f.write_all(&buf)) {
-        Some(Ok(())) => {
-            // Honour O_SYNC / O_DSYNC — see native_write0 above.
-            sync_for_handle(handle).map_err(io_err)?;
-            Ok(None)
-        }
-        Some(Err(e)) => Err(io_err(e)),
-        None => Ok(None),
-    }
+    // write_bytes on a FileReadWrite entry does write_all at the cursor.
+    ctx.fd_table().write_bytes(fd, &buf).map_err(io_err)?;
+    // Honour O_SYNC / O_DSYNC — see native_write0 above.
+    sync_if_needed(ctx, fd)?;
+    Ok(None)
 }
 
 #[allow(non_snake_case)]
@@ -477,14 +412,13 @@ fn native_getFilePointer(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Long(0))),
     };
-    let handle = match read_handle(ctx, this) {
-        Some(h) => h,
+    let fd = match read_fd(ctx, this) {
+        Some(fd) => fd,
         None => return Ok(Some(Value::Long(0))),
     };
-    match with_file(handle, |f| f.stream_position()) {
-        Some(Ok(p)) => Ok(Some(Value::Long(p as i64))),
-        Some(Err(e)) => Err(io_err(e)),
-        None => Ok(Some(Value::Long(0))),
+    match ctx.fd_table().rw_position(fd) {
+        Ok(p) => Ok(Some(Value::Long(p as i64))),
+        Err(e) => Err(io_err(e)),
     }
 }
 
@@ -507,14 +441,13 @@ fn native_seek0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult
             },
         )));
     }
-    let handle = match read_handle(ctx, this) {
-        Some(h) => h,
+    let fd = match read_fd(ctx, this) {
+        Some(fd) => fd,
         None => return Ok(None),
     };
-    match with_file(handle, |f| f.seek(SeekFrom::Start(pos as u64))) {
-        Some(Ok(_)) => Ok(None),
-        Some(Err(e)) => Err(io_err(e)),
-        None => Ok(None),
+    match ctx.fd_table().rw_seek(fd, SeekFrom::Start(pos as u64)) {
+        Ok(_) => Ok(None),
+        Err(e) => Err(io_err(e)),
     }
 }
 
@@ -523,14 +456,13 @@ fn native_length0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Long(0))),
     };
-    let handle = match read_handle(ctx, this) {
-        Some(h) => h,
+    let fd = match read_fd(ctx, this) {
+        Some(fd) => fd,
         None => return Ok(Some(Value::Long(0))),
     };
-    match with_file(handle, |f| f.metadata().map(|m| m.len())) {
-        Some(Ok(n)) => Ok(Some(Value::Long(n as i64))),
-        Some(Err(e)) => Err(io_err(e)),
-        None => Ok(Some(Value::Long(0))),
+    match ctx.fd_table().file_size(fd) {
+        Ok(n) => Ok(Some(Value::Long(n as i64))),
+        Err(e) => Err(io_err(e)),
     }
 }
 
@@ -552,14 +484,13 @@ fn native_setLength0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
             },
         )));
     }
-    let handle = match read_handle(ctx, this) {
-        Some(h) => h,
+    let fd = match read_fd(ctx, this) {
+        Some(fd) => fd,
         None => return Ok(None),
     };
-    match with_file(handle, |f| f.set_len(new_len as u64)) {
-        Some(Ok(())) => Ok(None),
-        Some(Err(e)) => Err(io_err(e)),
-        None => Ok(None),
+    match ctx.fd_table().rw_set_length(fd, new_len as u64) {
+        Ok(()) => Ok(None),
+        Err(e) => Err(io_err(e)),
     }
 }
 
@@ -568,9 +499,12 @@ fn native_close0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
     };
-    if let Some(handle) = read_handle(ctx, this) {
-        // Drop the File to close it
-        let _ = remove_handle(handle);
+    if let Some(fd) = read_fd(ctx, this) {
+        // Drop any sync-mode bookkeeping, then close the fd_table entry
+        // (which drops the File and closes the OS handle). Closing the RAF
+        // closes its channel too — they share this one fd, matching HotSpot.
+        sync_modes().lock().remove(&fd);
+        let _ = ctx.fd_table().close(fd);
     }
     clear_handle(ctx, this);
     Ok(None)
@@ -605,50 +539,87 @@ pub fn register_random_access_file_natives(registry: &mut NativeMethodRegistry) 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cratonvm_native_api::fd_table::FileDescriptorTable;
+    use std::io::{Read, Write};
 
+    /// The crux of the TC0622 fix: a file opened via `open_random_access`
+    /// (the path RAF.open0 now takes) is resolvable by BOTH the sequential
+    /// RAF read path (`rw_read`) AND the nio channel size path (`file_size`)
+    /// through the SAME fd. Previously RAF used a private ≥1000 handle map
+    /// that `file_size` could not see → `IOException: size0: bad fd for size`.
     #[test]
-    fn handle_table_roundtrips_open_read_close() {
-        use std::io::Write as _;
+    fn open_random_access_shares_fd_for_read_and_size() {
         let mut tmp = tempfile::NamedTempFile::new().unwrap();
         tmp.write_all(b"hello world").unwrap();
-        let path = tmp.path().to_path_buf();
+        let path = tmp.path().to_str().unwrap().to_string();
 
-        let file = File::open(&path).unwrap();
-        let h = alloc_handle(file, None);
-        assert!(handle_map().lock().contains_key(&h));
+        let table = FileDescriptorTable::new();
+        let fd = table.open_random_access(&path, false).unwrap();
 
+        // nio FileChannel.size() → FileDispatcherImpl.size0 → file_size
+        assert_eq!(table.file_size(fd).unwrap(), 11);
+
+        // RAF.readBytes0 → rw_read at the cursor
         let mut buf = [0u8; 5];
-        let n = with_file(h, |f| f.read(&mut buf)).unwrap().unwrap();
+        let n = table.rw_read(fd, &mut buf).unwrap();
         assert_eq!(n, 5);
         assert_eq!(&buf, b"hello");
 
-        let removed = remove_handle(h);
-        assert!(removed.is_some());
-        assert!(!handle_map().lock().contains_key(&h));
+        // ...and size0 still works after the cursor moved (it saves/restores).
+        assert_eq!(table.file_size(fd).unwrap(), 11);
+
+        table.close(fd).unwrap();
     }
 
     #[test]
-    fn seek_and_length_via_handle() {
-        use std::io::Write as _;
+    fn open_random_access_seek_and_length() {
         let mut tmp = tempfile::NamedTempFile::new().unwrap();
         tmp.write_all(b"0123456789").unwrap();
-        let file = File::open(tmp.path()).unwrap();
-        let h = alloc_handle(file, None);
+        let path = tmp.path().to_str().unwrap().to_string();
 
-        let len = with_file(h, |f| f.metadata().unwrap().len()).unwrap();
-        assert_eq!(len, 10);
+        let table = FileDescriptorTable::new();
+        let fd = table.open_random_access(&path, false).unwrap();
 
-        with_file(h, |f| f.seek(SeekFrom::Start(3)).unwrap()).unwrap();
+        assert_eq!(table.file_size(fd).unwrap(), 10);
+
+        table.rw_seek(fd, SeekFrom::Start(3)).unwrap();
+        assert_eq!(table.rw_position(fd).unwrap(), 3);
         let mut buf = [0u8; 3];
-        with_file(h, |f| f.read_exact(&mut buf).unwrap()).unwrap();
+        let n = table.rw_read(fd, &mut buf).unwrap();
+        assert_eq!(n, 3);
         assert_eq!(&buf, b"345");
 
-        remove_handle(h);
+        table.close(fd).unwrap();
     }
 
+    /// "rw" mode opens read+write+create; write-then-read-back roundtrips,
+    /// and the durable-sync path (`rw_sync`, used by "rws"/"rwd") succeeds.
+    #[test]
+    fn open_random_access_write_and_sync() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("raf_rw.bin");
+        let path_s = path.to_str().unwrap().to_string();
+
+        let table = FileDescriptorTable::new();
+        let fd = table.open_random_access(&path_s, true).unwrap();
+        table.write_bytes(fd, b"durable").unwrap();
+        // "rwd"/"rws" per-write durability hook.
+        table.rw_sync(fd, true).unwrap();
+        table.rw_sync(fd, false).unwrap();
+        table.close(fd).unwrap();
+
+        let mut s = String::new();
+        std::fs::File::open(&path)
+            .unwrap()
+            .read_to_string(&mut s)
+            .unwrap();
+        assert_eq!(s, "durable");
+    }
+
+    /// "r" mode must open the underlying file read-only: a write fails at
+    /// the OS level (justifying why RAF "r" rejects writes).
     #[test]
     fn open_options_read_only_rejects_write() {
-        use std::io::Write as _;
         let mut tmp = tempfile::NamedTempFile::new().unwrap();
         tmp.write_all(b"x").unwrap();
         let mut opts = OpenOptions::new();

@@ -854,31 +854,45 @@ fn new_java_byte_array(ctx: &mut dyn NativeContext, data: &[u8]) -> ObjectRef {
     arr
 }
 
-/// Fold an IPv4-mapped IPv6 address string (`::ffff:a.b.c.d`) down to its IPv4
-/// dotted-quad form; every other input (genuine IPv6 incl. `::1`, plain IPv4,
-/// or an unparseable host) is returned unchanged.
+/// Canonicalise an IP address string into the exact textual form HotSpot's
+/// `InetAddress` stores, so `getHostAddress()` / `toString()` are byte-identical:
 ///
-/// HotSpot does this universally: `InetAddress.getByName` / `getByAddress` and
-/// the JDK's socket peer-address decoder all hand back an `Inet4Address`
-/// (4-byte `getAddress()`) for a v4-mapped address. Without the fold our mirror
-/// stays a 16-byte `Inet6Address`, so any IPv4 CIDR test — e.g. Tomcat's
-/// `RemoteIpFilter` matching a dual-stack loopback peer against `127.0.0.0/8` —
-/// silently fails on `NetMask.matches`'s 4-vs-16 length guard.
-fn normalize_v4_mapped_ip(ip: &str) -> String {
+///   * IPv4-mapped IPv6 (`::ffff:a.b.c.d`) is folded to its IPv4 dotted-quad,
+///     matching HotSpot: `getByName` / `getByAddress` / the socket peer decoder
+///     all hand back an `Inet4Address` (4-byte `getAddress()`) for a v4-mapped
+///     address. Without the fold our mirror stays a 16-byte `Inet6Address`, so
+///     any IPv4 CIDR test — e.g. Tomcat's `RemoteIpFilter` matching a dual-stack
+///     loopback peer against `127.0.0.0/8` — silently fails on
+///     `NetMask.matches`'s 4-vs-16 length guard.
+///   * Genuine IPv6 is rendered in HotSpot's FULL eight-group form
+///     (`Inet6Address.numericToTextFormat`: each 16-bit group as minimal
+///     lowercase hex, joined by `:`, with NO `::` zero-compression), e.g.
+///     `::1` → `0:0:0:0:0:0:0:1`, `fe80::1` → `fe80:0:0:0:0:0:0:1`. Rust's
+///     `Ipv6Addr::to_string()` would otherwise emit the RFC-5952 compressed
+///     form (`::1`), diverging from HotSpot's `getHostAddress()`.
+///   * Plain IPv4 and unparseable hosts pass through unchanged.
+fn hotspot_ip_string(ip: &str) -> String {
     match ip.parse::<std::net::IpAddr>() {
         Ok(std::net::IpAddr::V6(v6)) => match v6.to_ipv4_mapped() {
             Some(v4) => v4.to_string(),
-            None => ip.to_string(),
+            None => v6
+                .segments()
+                .iter()
+                .map(|seg| format!("{seg:x}"))
+                .collect::<Vec<_>>()
+                .join(":"),
         },
-        _ => ip.to_string(),
+        Ok(std::net::IpAddr::V4(v4)) => v4.to_string(),
+        Err(_) => ip.to_string(),
     }
 }
 
 fn alloc_inet_address(ctx: &mut dyn NativeContext, host: &str, ip: &str) -> ObjectRef {
-    // Normalize an IPv4-mapped IPv6 literal (`::ffff:a.b.c.d`) down to its IPv4
-    // form (see [`normalize_v4_mapped_ip`]) so the mirror is an `Inet4Address`
-    // with a 4-byte `getAddress()`, matching HotSpot.
-    let ip_norm = normalize_v4_mapped_ip(ip);
+    // Canonicalise the address string to HotSpot's exact textual form (v4-mapped
+    // fold + uncompressed IPv6) — see [`hotspot_ip_string`] — so the mirror is an
+    // `Inet4Address` with a 4-byte `getAddress()` where appropriate and
+    // `getHostAddress()` is byte-identical to HotSpot.
+    let ip_norm = hotspot_ip_string(ip);
     let ip = ip_norm.as_str();
     // Allocate the *concrete* address class so `instanceof Inet4Address`
     // checks (e.g. Hazelcast's `DefaultAddressPicker`) and virtual dispatch
@@ -7391,18 +7405,22 @@ mod tests {
     // Regression (BUG-TC0622 Gap A): an IPv4-mapped IPv6 literal must fold to
     // its IPv4 dotted-quad so the `InetAddress` mirror is an `Inet4Address`
     // (4-byte getAddress) — otherwise Tomcat's RemoteIpFilter can't match a
-    // dual-stack loopback peer against `127.0.0.0/8`. Genuine IPv6 and plain
-    // IPv4 must pass through byte-identical.
+    // dual-stack loopback peer against `127.0.0.0/8`. Genuine IPv6 must render in
+    // HotSpot's full uncompressed eight-group form (NOT Rust's RFC-5952 `::`),
+    // and plain IPv4 / non-IP hosts pass through byte-identical.
     #[test]
-    fn normalize_v4_mapped_folds_only_mapped_addresses() {
-        assert_eq!(normalize_v4_mapped_ip("::ffff:127.0.0.1"), "127.0.0.1");
-        assert_eq!(normalize_v4_mapped_ip("::ffff:10.1.2.3"), "10.1.2.3");
-        // Genuine IPv6 loopback / link-local / global: untouched.
-        assert_eq!(normalize_v4_mapped_ip("::1"), "::1");
-        assert_eq!(normalize_v4_mapped_ip("fe80::1"), "fe80::1");
+    fn hotspot_ip_string_matches_jdk_text_form() {
+        // v4-mapped fold → Inet4Address dotted-quad.
+        assert_eq!(hotspot_ip_string("::ffff:127.0.0.1"), "127.0.0.1");
+        assert_eq!(hotspot_ip_string("::ffff:10.1.2.3"), "10.1.2.3");
+        // Genuine IPv6: HotSpot's Inet6Address.numericToTextFormat — eight
+        // minimal-hex groups joined by ':', no zero-compression.
+        assert_eq!(hotspot_ip_string("::1"), "0:0:0:0:0:0:0:1");
+        assert_eq!(hotspot_ip_string("fe80::1"), "fe80:0:0:0:0:0:0:1");
+        assert_eq!(hotspot_ip_string("2001:db8::1"), "2001:db8:0:0:0:0:0:1");
         // Plain IPv4 and non-IP hosts: untouched.
-        assert_eq!(normalize_v4_mapped_ip("127.0.0.1"), "127.0.0.1");
-        assert_eq!(normalize_v4_mapped_ip("example.com"), "example.com");
+        assert_eq!(hotspot_ip_string("127.0.0.1"), "127.0.0.1");
+        assert_eq!(hotspot_ip_string("example.com"), "example.com");
     }
 
     #[test]

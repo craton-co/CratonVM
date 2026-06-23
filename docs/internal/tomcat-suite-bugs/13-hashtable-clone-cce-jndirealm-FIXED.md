@@ -41,8 +41,8 @@ Registered a native `java/util/Hashtable.clone()Ljava/lang/Object;`
 (`native-builtins/src/deprecated_util.rs::native_hashtable_clone`) that shadows
 the broken real-JDK body:
 
-1. Resolve the receiver's concrete class (so `Properties.clone()` returns a
-   `Properties`), defaulting to `java/util/Hashtable`.
+1. Resolve the receiver's concrete class (a user `Hashtable` subclass clones as
+   itself), defaulting to `java/util/Hashtable`.
 2. Snapshot the `(key, value)` pairs from the slot-0 bucket store
    (`collect_hashtable_pairs`, a no-allocation field walk handling both the real
    `Hashtable$Entry` layout and the native HashMap-node layout — same
@@ -70,6 +70,25 @@ Paired force-native overrides so the native wins over the real-JDK bytecode
 Purely additive: the real-JDK `clone()` path was 100% broken for any natively
 populated Hashtable, so there is nothing to regress.
 
+### `Properties.clone()` — the side-table half
+
+`Properties` is **not** routed through `native_hashtable_clone`: it stores its
+entries in an identity-keyed **side-table** (`properties_sidetable`), not the
+slot-0 buckets, so a slot-0 re-put would clone *zero* entries. Instead it is
+handled by the generic shallow `Object.clone` native
+(`native-builtins/src/lib.rs::native_object_clone`), to which a `Properties`
+arm was added — exactly mirroring the existing `LinkedHashMap`-overlay arm:
+
+* The shallow field copy duplicates all heap fields (including the inherited
+  Hashtable `defaults` field).
+* Then `properties_sidetable::snapshot_sidetable(this)` →
+  `replace_sidetable(clone, …)` gives the clone its **own independent**
+  side-table of the receiver's entries (a fresh identity ⇒ empty side-table
+  otherwise).
+
+Without this, the cloned `Properties` had a new identity and therefore an empty
+side-table, so `getProperty` / `stringPropertyNames` saw nothing.
+
 ## Validation
 
 * `TestJNDIRealm` 4/4 PASS (`testErrorRealm` now gets the intended
@@ -78,20 +97,20 @@ populated Hashtable, so there is nothing to regress.
   Hashtable: size, all values, `instanceof Hashtable`, clone/original
   independence, shared (shallow) value identity, empty-table clone, and
   `keys()` enumeration over the clone.
+* `Properties.clone()` vs HotSpot (`CloneFaith` probe) — **byte-identical**:
+  entries copied, `size`, clone↔original mutation **independence** both ways,
+  `instanceof Properties` / `getClass()`, and `stringPropertyNames()`.
 * `native-builtins` unit tests green (incl. new
   `test_hashtable_clone_empty_returns_fresh_object`).
 
-## Residual (out of scope — not TC0622)
+## Residual (separate, pre-existing — not a clone bug)
 
-`Properties.clone()` (inherited from `Hashtable`) now succeeds and copies the
-entries correctly for the Hashtable surface (`get`/`containsKey`/`size`/`keys`
-all match HotSpot), but `Properties.getProperty(key)` on the *clone* can return
-`null` for copied keys. This is a **pre-existing Properties dual-model quirk**,
-not a clone bug: `new_object_initialized("java/util/Properties","()V")` runs the
-real-JDK `<init>`, which creates the separate JDK-25 internal
-`ConcurrentHashMap map` field. Native ops read the slot-0 buckets (populated by
-the re-put) and work; the real `getProperty` bytecode reads the empty internal
-`map`. Plain `Hashtable` has no such separate field, which is why it is
-byte-perfect. TC0622's JNDI environment is a plain `Hashtable`, so this residual
-does not affect the fix. Properties.clone() previously threw CCE outright, so
-this is a net improvement, not a regression.
+`Properties.getProperty(key)` does **not** consult the `defaults` chain: a
+`new Properties(def)` (no clone involved) returns `null` for a key that only
+`def` holds, where HotSpot returns the default. This is a pre-existing gap in
+CratonVM's side-table `Properties` model (`native_properties_get_property_1`
+checks the side-table → system properties → `null`, with no `defaults`
+fallback) and affects the **original** as much as the clone — so the clone is
+*faithful* (it behaves identically to its source for every key). Fixing the
+`defaults` fallback is an independent change to the `getProperty` path, out of
+scope for the clone fix.

@@ -1846,22 +1846,30 @@ fn instruction_start_map(code: &[u8], code_len: usize) -> Vec<bool> {
 /// precise-stack-map machinery (exact RBP frame registration, safepoint-id
 /// slot, precise relocation).
 ///
-/// **DEFAULT ON** (opt out with `CRATONVM_NO_PRECISE_JIT_MAPS`). This is the fix
-/// for the GC-root-coverage-under-JIT family (SB-CRASH-04 / A2 / A4): the GC
-/// walks every active JIT frame via the RBP-chain `frame_record` and scans each
-/// precisely (with a conservative per-frame fallback), so a live oop held only in
-/// a callee-saved register of a *caller* frame is found — the register-invisible
-/// root the conservative deepest-band-only scan missed. Verified: bintrees16/18
-/// == golden (14985902 / 68332206), MinRegexProbe A3 repro green, matrix/sieve/fib
-/// correct. Perf: ~6% alloc-heavy (bt18), ~0% compute, ~2.5× pure call-heavy (the
-/// per-invocation `frame_record` CALL — follow-up: inline that store; the
-/// NOP-skip lever is unsafe as it anchors the frame walk). See
-/// docs/known-issues/SB-SUITE-CRASH-04. When off, no Stage 3 codegen is emitted
-/// (byte-identical legacy path) for A/B + bisection.
+/// **DEFAULT OFF** (opt in with `CRATONVM_PRECISE_JIT_MAPS`; `CRATONVM_NO_PRECISE_JIT_MAPS`
+/// also forces off and wins). Flipped to default-off for BUG-01: the per-invocation
+/// `frame_record` + per-safepoint sp-id/flush codegen is a ~6× throughput tax on
+/// call-heavy JIT'd code (JUnit execution: 105 s → 18 s with this off), and it
+/// dominates the reflection/lambda-heavy Spring suites. See
+/// `docs/known-issues/bug-01-junit-reflection-heavy-jit-frame-scan-throughput.md`.
+///
+/// TRADE-OFF (accepted, residuals tracked): when off, the GC falls back to the
+/// conservative deepest-band-only JIT-frame scan, which can miss a live oop held
+/// only in a callee-saved register of a *caller* frame — the GC-root-coverage-under-JIT
+/// family (SB-CRASH-04 / A2 ReflRepro / A4 Fork6) this machinery was landed to fix
+/// (commit 5b8864a0). Opt back in with `CRATONVM_PRECISE_JIT_MAPS=1` to restore that
+/// coverage. The follow-up fix is to keep the coverage while cutting the per-call cost
+/// (RBP-chain walk at GC time, or selective emission); see the BUG-01 doc.
+///
+/// When off, no Stage 3 codegen is emitted (byte-identical legacy path); when on,
+/// bintrees16/18 == golden (14985902 / 68332206), MinRegexProbe A3 repro green.
 pub fn precise_jit_maps_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
-    *G.get_or_init(|| std::env::var_os("CRATONVM_NO_PRECISE_JIT_MAPS").is_none())
+    *G.get_or_init(|| {
+        std::env::var_os("CRATONVM_PRECISE_JIT_MAPS").is_some()
+            && std::env::var_os("CRATONVM_NO_PRECISE_JIT_MAPS").is_none()
+    })
 }
 
 /// Opt-IN inline reference-`putfield` fast path (`CRATONVM_JIT_INLINE_PUTFIELD`).

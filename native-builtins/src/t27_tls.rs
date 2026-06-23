@@ -2040,6 +2040,17 @@ mod tests {
         assert!(r
             .find(cls, "getSSLParameters", "()Ljavax/net/ssl/SSLParameters;")
             .is_some());
+
+        // TC0622: the SSLSession accessors must also be registered in the
+        // real-mode path (they previously lived only in the synthetic-jdk-gated
+        // register_p68_ssl, so SSLEngine.getSession().getApplicationBufferSize()
+        // threw AbstractMethodError and killed Tomcat's NioEndpoint processor).
+        let sess = "javax/net/ssl/SSLSession";
+        assert!(r.find(sess, "getApplicationBufferSize", "()I").is_some());
+        assert!(r.find(sess, "getPacketBufferSize", "()I").is_some());
+        assert!(r.find(sess, "getProtocol", "()Ljava/lang/String;").is_some());
+        assert!(r.find(sess, "getCipherSuite", "()Ljava/lang/String;").is_some());
+        assert!(r.find(sess, "isValid", "()Z").is_some());
     }
 
     #[test]
@@ -3856,7 +3867,87 @@ pub fn register_sslengine_real(r: &mut NativeMethodRegistry) {
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     register_engine_impl_natives(r);
     register_apply_parameters(r);
+    register_ssl_session_real(r);
     r.set_category(__prev_cat);
+}
+
+/// Register `javax/net/ssl/SSLSession` accessor natives for the REAL-mode
+/// session objects the VM hands out — the 7-field session from
+/// `SSLEngineImpl.getSession()` (see ~line 3263) and the 3-field session from
+/// `SSLServerSocket.accept()` (see ~line 1014). Both objects carry the bare
+/// interface `javax/net/ssl/SSLSession` as their runtime class, so a virtual
+/// call resolves to the abstract interface declaration (no Code) and the
+/// interpreter's no-Code rescue then looks for a native registered on that
+/// class name.
+///
+/// The *full* SSLSession accessor set lives only in the synthetic-jdk-gated
+/// `phases_late::register_p68_ssl` / `tls::register_ssl_session`, which are
+/// compiled OUT of the real-JDK CLI. Without a real-mode registration here,
+/// Tomcat's `SecureNioChannel`/`SecureNio2Channel` buffer sizing
+/// (`SSLEngine.getSession().getApplicationBufferSize()` /
+/// `getPacketBufferSize()`) throws
+/// `AbstractMethodError: javax/net/ssl/SSLSession.getApplicationBufferSize()I
+/// has no Code attribute`, killing the NioEndpoint socket processor so the
+/// HTTPS server never serves (~18 TLS/HTTP2-TLS/WebSocket-SSL test classes).
+fn register_ssl_session_real(r: &mut NativeMethodRegistry) {
+    let cls = "javax/net/ssl/SSLSession";
+
+    // Buffer sizes are layout-independent JSSE constants. The real JDK returns
+    // 16384 (max TLS plaintext record) for `getApplicationBufferSize` and 16709
+    // (16384 + TLS record overhead: 5 header + 256 padding + 68 MAC/IV) for
+    // `getPacketBufferSize`. Tomcat only needs them >= a TLS record so its
+    // network/application `ByteBuffer`s are large enough.
+    r.register(cls, "getApplicationBufferSize", "()I", |_ctx, _args| {
+        Ok(Some(Value::Int(16384)))
+    });
+    r.register(cls, "getPacketBufferSize", "()I", |_ctx, _args| {
+        Ok(Some(Value::Int(16709)))
+    });
+
+    // proto/cipher slot order differs between the two real-mode shapes:
+    //   7-field (SSLEngineImpl.getSession): [0]=cipher [1]=proto [2]=valid ...
+    //   3-field (SSLServerSocket.accept):   [0]=proto  [1]=cipher [2]=stream_id
+    // Disambiguate by field count so both return the correct String.
+    r.register(cls, "getProtocol", "()Ljava/lang/String;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let slot = if ctx.object_num_fields(this) >= 7 { 1 } else { 0 };
+        Ok(Some(ctx.get_field(this, slot)))
+    });
+    r.register(cls, "getCipherSuite", "()Ljava/lang/String;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let slot = if ctx.object_num_fields(this) >= 7 { 0 } else { 1 };
+        Ok(Some(ctx.get_field(this, slot)))
+    });
+
+    // `isValid` flag is slot 2 only on the 7-field engine session; the 3-field
+    // accept session has no flag — treat it as valid (it was just negotiated).
+    r.register(cls, "isValid", "()Z", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        if ctx.object_num_fields(this) >= 7 {
+            Ok(Some(ctx.get_field(this, 2)))
+        } else {
+            Ok(Some(Value::Int(1)))
+        }
+    });
+
+    // creation / last-accessed time: the 7-field engine session stores a
+    // millis timestamp in slot 5; the 3-field shape has none → 0.
+    r.register(cls, "getCreationTime", "()J", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        if ctx.object_num_fields(this) > 5 {
+            Ok(Some(ctx.get_field(this, 5)))
+        } else {
+            Ok(Some(Value::Long(0)))
+        }
+    });
+    r.register(cls, "getLastAccessedTime", "()J", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        if ctx.object_num_fields(this) > 5 {
+            Ok(Some(ctx.get_field(this, 5)))
+        } else {
+            Ok(Some(Value::Long(0)))
+        }
+    });
 }
 
 /// WP5.4 — register ALPN-related natives on SSLParameters. ALPN propagation
