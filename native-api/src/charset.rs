@@ -305,7 +305,26 @@ fn encode_utf8_strict(chars: &[u16]) -> Result<Vec<u8>, CodingError> {
                 Some(l) if (0xDC00..=0xDFFF).contains(&l) => {
                     i += 2; // valid surrogate pair
                 }
+                None => {
+                    // Trailing high surrogate with no following unit. This is
+                    // INCOMPLETE rather than malformed: a streaming encoder that
+                    // has not yet reached end-of-input may receive the matching
+                    // low surrogate in the next chunk, so it should buffer this
+                    // unit and report UNDERFLOW. Only at end-of-input does an
+                    // unpaired trailing surrogate become genuinely malformed.
+                    // Symmetric to the decoder's `Incomplete` truncated-trailing
+                    // sequence handling.
+                    return Err(CodingError {
+                        offset: i,
+                        length: 1,
+                        kind: CodingErrorKind::Incomplete,
+                        charset: "UTF-8",
+                    });
+                }
                 _ => {
+                    // High surrogate followed by a non-low-surrogate unit: this
+                    // can never complete, so it is malformed regardless of how
+                    // much more input arrives.
                     return Err(CodingError {
                         offset: i,
                         length: 1,
@@ -979,6 +998,26 @@ mod tests {
         let err = encode_chars("UTF-8", &chars).unwrap_err();
         assert_eq!(err.kind, CodingErrorKind::Malformed);
         assert_eq!(err.offset, 0);
+    }
+
+    #[test]
+    fn utf8_strict_encode_reports_trailing_high_surrogate_as_incomplete() {
+        // A high surrogate at the very END of the chunk is INCOMPLETE, not
+        // malformed: a streaming encoder may receive its matching low surrogate
+        // in the next chunk. The shims rely on this to buffer the surrogate
+        // across a split write (Tomcat BUG-TC0622). Offset points at the
+        // unpaired high surrogate so callers can encode just the prefix.
+        let chars: Vec<u16> = vec![0x0041, 0xD800]; // 'A', trailing high surrogate
+        let err = encode_chars("UTF-8", &chars).unwrap_err();
+        assert_eq!(err.kind, CodingErrorKind::Incomplete);
+        assert_eq!(err.charset, "UTF-8");
+        assert_eq!(err.offset, 1);
+        // The lossy path is unchanged — it still substitutes U+FFFD regardless
+        // of the (Incomplete vs Malformed) distinction.
+        assert_eq!(
+            encode_chars_lossy("UTF-8", &chars),
+            vec![0x41, 0xEF, 0xBF, 0xBD]
+        );
     }
 
     #[test]

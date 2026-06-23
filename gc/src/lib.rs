@@ -44,6 +44,7 @@
     clippy::doc_lazy_continuation
 )]
 
+pub mod a2dbg;
 pub mod arena;
 pub mod card_table;
 pub mod class_unloading;

@@ -13,7 +13,7 @@
 > effect, and 7/10 weaving tests fail their `assertEquals`.
 
 * **Severity:** High (core class-loader identity / instrumentation correctness; affects any framework that relies on per-loader class isolation or load-time weaving — Tomcat webapps, AOP/instrumentation agents, OSGi-style isolation).
-* **Status:** **Sub-cause A (weaving) → ✅ FIXED + MERGED to dev** (commit `e92fe438`, 2026-06-22; surgical reflection-path fix — reflective construct/dispatch now honor the mirror's exact `ClassId` per JVMS §5.3 instead of re-resolving by name). Validated on dev `0284432c`: `TestWebappClassLoaderWeaving` OK (10 tests, was 7 failures); `scratch_weave/WeaveRepro` + `ReflectSanity` PASS ==HotSpot. **Sub-cause B (session-id) → HANDOFF** (separate, higher-level connector/session behavior; still OPEN, not investigated to root).
+* **Status:** **Sub-cause A (weaving) → ✅ FIXED + MERGED to dev** (commit `e92fe438`, 2026-06-22; surgical reflection-path fix — reflective construct/dispatch now honor the mirror's exact `ClassId` per JVMS §5.3 instead of re-resolving by name). Validated on dev `0284432c`: `TestWebappClassLoaderWeaving` OK (10 tests, was 7 failures); `scratch_weave/WeaveRepro` + `ReflectSanity` PASS ==HotSpot. **Sub-cause B (session-id) → ✅ FIXED on dev (no new change needed)**: root cause was the client-side `HttpURLConnection` dropping the replayed `Cookie` header (and all other `setRequestProperty` headers), already fixed on dev by commit `7b8f37d1` ("make real-JDK HttpURLConnection carrier first-class", merged `8e44e8c5`) — which postdates the `df11ac00` report binary. Verified on dev `34fd57fb`: `TestValidateClientSessionId` **OK (2 tests)** (was 1 failure on `df11ac00`); see Sub-cause B section below.
 * **Run date:** 2026-06-22
 * **Binary:** dev df11ac00 (worktree `C:\craton\CratonVM-tctest`), exe `C:\craton\CratonVM-tctest\target\release\cratonvm-tcfull-0622.exe`
 
@@ -22,7 +22,7 @@
 | Class | Result | Sub-cause |
 |---|---|---|
 | `org.apache.catalina.loader.TestWebappClassLoaderWeaving` | 7 of 10 fail | **A** — per-loader identity ignored on `defineClass` |
-| `org.apache.catalina.connector.TestValidateClientSessionId` | 1 of 2 fail | **B** — cross-context session-id divergence (separate) |
+| `org.apache.catalina.connector.TestValidateClientSessionId` | ✅ 2 of 2 pass on dev (was 1 of 2 fail) | **B** — client `HttpURLConnection` dropped replayed `Cookie` header; fixed on dev by `7b8f37d1` |
 
 The `[cratonvm] System.exit(1) called — process terminating` line at the end of
 both captured logs is **NOT a VM abort, panic, or unsupported-op**. Both runs
@@ -170,7 +170,7 @@ gauntlet, so validate broadly (full classloading test suite) after the change.
 
 ---
 
-## Sub-cause B — Session-id across contexts (SEPARATE, HANDOFF)
+## Sub-cause B — Session-id across contexts (SEPARATE) — ✅ FIXED on dev
 
 ### Symptom
 
@@ -198,22 +198,68 @@ complete — see the connector start/stop INFO lines and the benign
 divergence in the connector + session-cookie path**, not a VM core defect and not
 related to Sub-cause A.
 
-### Root cause
+### Root cause (PINNED) — client-side `HttpURLConnection` dropped the replayed `Cookie` header
 
-Not pinned. Candidates (run uses `CRATONVM_REAL_NET_SOCKETS=1 CRATONVM_REAL_AQS=1`):
-cross-context `JSESSIONID` cookie matching / `sessionCookiePath="/"` handling,
-the request-cookie parse, or session-manager lookup returning a fresh session
-instead of reusing the supplied id. Needs a focused HTTP-level repro
-(`getUrl` with a replayed `Cookie: JSESSIONID=…`) comparing CratonVM vs HotSpot
-to localize whether the cookie reaches the request, is matched to an existing
-session, and whether the session manager is shared/validated across contexts.
+The divergence was **not** in the connector/session-manager path at all. It was in
+the **client** `getUrl(...)` helper: `TomcatBaseTest.methodUrl` sets the replayed
+cookie via `connection.setRequestProperty("Cookie", "JSESSIONID=" + sessionId1)`,
+but on the report binary CratonVM's synthetic `HttpURLConnection` **dropped every
+`setRequestProperty` request header** (`Cookie`, `Authorization`, `Accept`, any
+custom header) — they never reached the wire. So the second request arrived at
+`/app2` with **no** `Cookie` header → `CoyoteAdapter.parseSessionCookiesId` found
+no `JSESSIONID` → `Request.requestedSessionId` stayed null →
+`isRequestedSessionIdFromCookie()` false → `doGetSession` skipped the
+client-id-reuse branch (`Request.java:2697`) and minted a *fresh* id for `/app2`.
+Hence `sessionId2 != sessionId1`.
 
-### Recommendation — HANDOFF
+Isolated, Tomcat-free repro (`HttpURLConnection` → a plain `ServerSocket` echoing
+the raw request line/headers) made it unambiguous:
 
-Separate, lower-severity connector/session investigation. Document and triage on
-its own; it does not block or interact with the Sub-cause A fix. (Both sub-causes
-only share the cosmetic `System.exit(1)` symptom, which is just JUnitCore's
-non-zero exit on any failure.)
+```
+=== HotSpot ===            === CratonVM df11ac00 ===     === CratonVM dev 34fd57fb ===
+Cookie: JSESSIONID=...     (no Cookie header)            Cookie: JSESSIONID=...
+Authorization: Bearer ...  (no Authorization)            Authorization: Bearer ...
+Accept: text/plain         (no Accept)                   Accept: text/plain
+COOKIE_HEADER_PRESENT=true COOKIE_HEADER_PRESENT=false   COOKIE_HEADER_PRESENT=true
+```
+
+The underlying defect: `URL.openConnection()` (`net_phase_e::register_re4_url_http`)
+hands out a synthetic carrier whose field 0 holds the originating `URL` object,
+which `http_url_connection.rs`'s `is_real_carrier` treats as a real-JDK carrier.
+On `df11ac00`, `setRequestProperty` stored those headers into a synthetic slot
+that landed on an unrelated real field (silently dropped). This was already fixed
+on dev by **commit `7b8f37d1`** ("fix(net): make real-JDK HttpURLConnection
+carrier first-class (Tomcat bugs #2/#4/#9)", merged `8e44e8c5`), which routes
+real-carrier `setRequestProperty`/`addRequestProperty` into an
+identity-keyed `real_reqs` side-table that the perform path (`huc_real_perform`)
+reads back verbatim — so the `Cookie` (and all other) headers now reach the wire.
+
+### Resolution — already fixed on dev (no new VM change)
+
+Confirmed by direct before/after on the *same* test (`-Xmx2g` + the suite's
+`CRATONVM_REAL_NET_SOCKETS`/`REAL_AQS`/`DISABLE_DEFAULT_WATCHDOG`/`ROOTSNAP_CACHE`
+env + `--add-opens`):
+
+* **df11ac00** (`cratonvm-tcfull-0622.exe`): `testValidSessionIdAcceptedAcrossContexts`
+  → `org.junit.ComparisonFailure`, `Tests run: 2, Failures: 1`.
+* **dev `34fd57fb`** (fresh release build): **`OK (2 tests)`**, `System.exit(0)`.
+
+No code change was required for Sub-cause B beyond what already landed on dev via
+`7b8f37d1`. (Both sub-causes only ever shared the cosmetic `System.exit(1)`
+symptom, which is just JUnitCore's non-zero exit on any failure.)
+
+### Follow-up (latent, non-blocking)
+
+There are **three** overlapping `java/net/HttpURLConnection` native
+implementations with incompatible synthetic field layouts and request-header
+stores: `phases_early.rs` (headers in field 4), `net_phase_e.rs` (field 4, and the
+`openConnection()` carrier factory), and `http_url_connection.rs` (identity-keyed
+`real_reqs` side-table, registered last so it wins method dispatch). They work
+today only because the last-registered module wins consistently for the methods it
+covers. This is fragile — a future registration-order change or a method covered
+by one module but not another (as `setRequestProperty` once was) can silently
+re-introduce header loss. Worth consolidating onto a single carrier
+layout/implementation, but out of scope here and not currently broken.
 
 ---
 

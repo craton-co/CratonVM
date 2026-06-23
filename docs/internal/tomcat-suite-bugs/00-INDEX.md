@@ -19,14 +19,15 @@ Unified status (verified on the fresh dev worktree build, srun run):
 | [03](03-gc-root-snapshot-contention-FIXED.md) | GC root-snapshot lock contention | (all server deploy) | perf | ✅ **FIXED** |
 | [07](07-beanelresolver-property-not-found-FAIL.md) | Introspector interface default-method property | jakarta.el.TestBeanELResolver | FAIL | ✅ **FIXED** |
 | [08](08-importhandler-standard-packages-npe-FAIL.md) | ModuleFinder.ofSystem/jimage ModuleReader.list | jakarta.el.TestImportHandlerStandardPackages | FAIL | ✅ **FIXED** (peer) |
-| [09](09-objectstreamclass-recordsupport-missing.md) | ObjectStreamClass$RecordSupport (record serialization) | catalina.realm.TestGenericPrincipal | NOSUMMARY | ✅ **FIXED** (peer) — residual: TestJNDIRealm still NOSUMMARY |
+| [09](09-objectstreamclass-recordsupport-missing.md) | ObjectStreamClass$RecordSupport (record serialization) | catalina.realm.TestGenericPrincipal | NOSUMMARY | ✅ **FIXED** (peer) — TestJNDIRealm residual now FIXED in [13](13-hashtable-clone-cce-jndirealm-FIXED.md) |
+| [13](13-hashtable-clone-cce-jndirealm-FIXED.md) | `Hashtable.clone()` casts synthetic native entry → CCE | catalina.realm.TestJNDIRealm | FAIL | ✅ **FIXED** |
 | [04](04-embedded-server-throughput-wall-OPEN.md) | Embedded-server deployment throughput wall | (most catalina/coyote) | perf | 🔴 **OPEN** (dominant — most HANGs) |
 | [06](06-openssl-ffm-clinit-segv-CRASH.md) | `Method.invoke` GC stale-ref under load (mis-blamed on OpenSSL FFM) | catalina.util.TestServerInfo | CRASH | ✅ **FIXED** — NOT an FFM bug (see note) |
 | [10](10-pagecontext-npe-contains-null-FAIL.md) | Embedded-server serving wall (null response body; re-diagnosed → group 04, NOT a JSP/EL bug) | jakarta.servlet.jsp.TestPageContext | FAIL | 🔴 **OPEN** (→ 04) |
 | [05](05-suite-rerun-fail-triage.md) | Remaining craton-only FAIL set — to triage | (~30 classes) | FAIL | 🔴 **OPEN** (mostly undiagnosed) |
 | [13](13-classpath-url-protocol-not-registered-FIXED.md) | `classpath:` URL scheme unresolvable (`VM.isBooted` false → factory bypassed; pre-clinit factory publish; synthetic `URI.toURL` allowlist) | TestClasspathUrlStreamHandler, TestConfigFileLoader | FAIL | ✅ **FIXED** |
 
-7 of the diagnosed bug groups are FIXED (01/02/03/06/07/08/09); the open set is
+8 of the diagnosed bug groups are FIXED (01/02/03/06/07/08/09/13); the open set is
 dominated by the throughput wall (04) and the not-yet-individually-diagnosed
 FAILs (05).
 

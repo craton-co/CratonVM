@@ -854,7 +854,32 @@ fn new_java_byte_array(ctx: &mut dyn NativeContext, data: &[u8]) -> ObjectRef {
     arr
 }
 
+/// Fold an IPv4-mapped IPv6 address string (`::ffff:a.b.c.d`) down to its IPv4
+/// dotted-quad form; every other input (genuine IPv6 incl. `::1`, plain IPv4,
+/// or an unparseable host) is returned unchanged.
+///
+/// HotSpot does this universally: `InetAddress.getByName` / `getByAddress` and
+/// the JDK's socket peer-address decoder all hand back an `Inet4Address`
+/// (4-byte `getAddress()`) for a v4-mapped address. Without the fold our mirror
+/// stays a 16-byte `Inet6Address`, so any IPv4 CIDR test — e.g. Tomcat's
+/// `RemoteIpFilter` matching a dual-stack loopback peer against `127.0.0.0/8` —
+/// silently fails on `NetMask.matches`'s 4-vs-16 length guard.
+fn normalize_v4_mapped_ip(ip: &str) -> String {
+    match ip.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V6(v6)) => match v6.to_ipv4_mapped() {
+            Some(v4) => v4.to_string(),
+            None => ip.to_string(),
+        },
+        _ => ip.to_string(),
+    }
+}
+
 fn alloc_inet_address(ctx: &mut dyn NativeContext, host: &str, ip: &str) -> ObjectRef {
+    // Normalize an IPv4-mapped IPv6 literal (`::ffff:a.b.c.d`) down to its IPv4
+    // form (see [`normalize_v4_mapped_ip`]) so the mirror is an `Inet4Address`
+    // with a 4-byte `getAddress()`, matching HotSpot.
+    let ip_norm = normalize_v4_mapped_ip(ip);
+    let ip = ip_norm.as_str();
     // Allocate the *concrete* address class so `instanceof Inet4Address`
     // checks (e.g. Hazelcast's `DefaultAddressPicker`) and virtual dispatch
     // resolve correctly. A bare `InetAddress` is abstract in real-JDK.
@@ -7300,6 +7325,23 @@ mod tests {
     fn re3_parse_literal_v4() {
         let ip = resolve_host("10.0.0.1").unwrap();
         assert_eq!(ip, IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+    }
+
+    // Regression (BUG-TC0622 Gap A): an IPv4-mapped IPv6 literal must fold to
+    // its IPv4 dotted-quad so the `InetAddress` mirror is an `Inet4Address`
+    // (4-byte getAddress) — otherwise Tomcat's RemoteIpFilter can't match a
+    // dual-stack loopback peer against `127.0.0.0/8`. Genuine IPv6 and plain
+    // IPv4 must pass through byte-identical.
+    #[test]
+    fn normalize_v4_mapped_folds_only_mapped_addresses() {
+        assert_eq!(normalize_v4_mapped_ip("::ffff:127.0.0.1"), "127.0.0.1");
+        assert_eq!(normalize_v4_mapped_ip("::ffff:10.1.2.3"), "10.1.2.3");
+        // Genuine IPv6 loopback / link-local / global: untouched.
+        assert_eq!(normalize_v4_mapped_ip("::1"), "::1");
+        assert_eq!(normalize_v4_mapped_ip("fe80::1"), "fe80::1");
+        // Plain IPv4 and non-IP hosts: untouched.
+        assert_eq!(normalize_v4_mapped_ip("127.0.0.1"), "127.0.0.1");
+        assert_eq!(normalize_v4_mapped_ip("example.com"), "example.com");
     }
 
     #[test]

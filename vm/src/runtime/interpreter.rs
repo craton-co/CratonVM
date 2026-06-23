@@ -1420,6 +1420,17 @@ fn init_object_header(ptr: *mut u8, class_id: ClassId, num_fields: usize, identi
     };
     // SAFETY: ptr points to freshly allocated, properly aligned memory for an ObjectHeader.
     unsafe { std::ptr::write(ptr as *mut ObjectHeader, header) };
+    // A2 breadcrumb (CRATONVM_DBG_A2): the interpreter TLAB fast path bypasses
+    // gen_heap, so record the legacy-layout object header it writes here.
+    cratonvm_gc::a2dbg::record(
+        ptr as usize,
+        class_id.as_u32(),
+        ObjectKind::Object as u8,
+        ArrayElementType::Reference as u8,
+        0,
+        u32::try_from(num_fields).unwrap_or(u32::MAX),
+        cratonvm_gc::heap::HEADER_SIZE + num_fields * cratonvm_gc::heap::SLOT_SIZE,
+    );
 }
 
 /// Shared-heap allocation path (with lock). Used for TLAB misses and large objects.
@@ -16783,6 +16794,21 @@ fn force_native_over_real_jdk_bytecode(
                 "java/util/Hashtable",
                 "elements",
                 "()Ljava/util/Enumeration;",
+            )
+            // TC0622: `Hashtable.clone()` (inherited by `Properties`). Our
+            // native `put` stores synthetic bucket nodes in slot-0 `table[]`,
+            // not genuine `Hashtable$Entry`. The real-JDK clone body does
+            // `t.table[i] = (Hashtable$Entry) table[i].clone()` and the
+            // `checkcast` throws ClassCastException on our synthetic node.
+            // (`InitialContext.<init>` clones its environment Hashtable, so
+            // `new InitialDirContext(env)` blew up before any LDAP connect.)
+            // Force the native (deprecated_util::native_hashtable_clone) which
+            // rebuilds a fresh natively-backed map without materialising an
+            // Entry. Companion match in vm_exec.rs.
+            | (
+                "java/util/Hashtable",
+                "clone",
+                "()Ljava/lang/Object;",
             )
             // spring-bug-08: `ObjectInputStream.resolveProxyClass(String[])`
             // has a real JDK body whose default routes
