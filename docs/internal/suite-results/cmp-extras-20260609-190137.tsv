@@ -1,0 +1,7 @@
+item	variant	rc	state	wall_s	summary
+junit-help	cratonvm-jit	0	FAIL	13.4	Usage: junit [OPTIONS] [COMMAND]
+junit-help	hotspot	0	OK	0.5	Usage: junit [OPTIONS] [COMMAND]
+junit-help	tornadovm	0	OK	0.8	Usage: junit [OPTIONS] [COMMAND]
+dacapo-avrora	cratonvm-jit	0	N/S	5.7	===== DaCapo unknown avrora PASSED in 196 msec =====
+dacapo-avrora	hotspot	127	N/S	0.8	Validation FAILED for avrora default
+dacapo-avrora	tornadovm	1	N/S	0.3	Caused by: java.lang.module.InvalidModuleDescriptorException: Harness.class found in top-level directory (unnamed package not allowed in module)

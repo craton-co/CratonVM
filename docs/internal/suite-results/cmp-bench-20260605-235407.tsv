@@ -1,0 +1,13 @@
+bench	variant	rc	state	ms	checksum	sig
+arith1500M	cratonvm-cpu	0	OK	8549	2812500002999999995	
+arith1500M	hotspot	0	OK	4425	2812500002999999995	
+fib44	cratonvm-cpu	0	OK	7582	701408733	
+fib44	hotspot	0	OK	4640	701408733	
+sieve250k	cratonvm-cpu	0	OK	2479	22044	
+sieve250k	hotspot	0	OK	1810	22044	
+matrix600	cratonvm-cpu	0	OK	1199	6479950792	
+matrix600	hotspot	0	OK	565	6479950792	
+bintrees18	cratonvm-cpu	0	OK	53949	68332206	
+bintrees18	hotspot	0	OK	663	68332206	
+vadd2_28	cratonvm-cpu	0	OK	2620	108086390654238720	
+vadd2_28	hotspot	0	OK	1977	108086390654238720	

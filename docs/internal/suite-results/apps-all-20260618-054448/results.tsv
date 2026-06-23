@@ -1,0 +1,13 @@
+suite	vm	rc	state	wall_s	note
+h2-testall-fast	cratonvm	0	PASS	3.9	[2m2026-06-18T08:44:58.385913Z[0m [33m WARN[0m [2mcratonvm_vm::vm::vm_util
+h2-testall-fast	hotspot	0	PASS	1.8	00:00.078 total
+hibernate-smoke	cratonvm	1	FAIL	13.0	2026-06-18T08:45:16.438404Z  WARN cratonvm_vm::vm::vm_exec: NoSuchMethodError method="cratonvm/internal/ArrayListSubList
+hibernate-smoke	hotspot	-	SKIP	-	CratonVM not PASS
+gpu-bench-cpu	cratonvm	0	PASS	4.0	[cratonvm] System.exit(0) called — process terminating
+gpu-bench-cpu	hotspot	0	PASS	1.0	correctness=OK
+pool:kafka-codec	cratonvm	0	PASS	3.94	 regression-pool: total=1 pass=1 regress=0 slow=0 no_base=0 no_stage=0 results: /c/craton/CratonVM/apps/probe/test-infra
+pool:kafka-codec	hotspot	1	REGRESS	0.64	-
+pool:spring-boot-run	cratonvm	0	PASS	7.58	 regression-pool: total=1 pass=1 regress=0 slow=0 no_base=0 no_stage=0 results: /c/craton/CratonVM/apps/probe/test-infra
+pool:spring-boot-run	hotspot	1	REGRESS	0.43	-
+pool:tomcat-server-info	cratonvm	0	PASS	4.06	 regression-pool: total=1 pass=1 regress=0 slow=0 no_base=0 no_stage=0 results: /c/craton/CratonVM/apps/probe/test-infra
+pool:tomcat-server-info	hotspot	1	REGRESS	0.51	-

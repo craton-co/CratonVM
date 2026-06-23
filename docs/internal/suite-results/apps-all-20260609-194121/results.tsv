@@ -1,0 +1,25 @@
+suite	vm	rc	state	wall_s	note
+h2-testall-fast	cratonvm	0	PASS	2.1	[2m2026-06-09T22:41:23.910470Z[0m [33m WARN[0m [2mcratonvm_vm::vm::vm_util
+h2-testall-fast	hotspot	0	PASS	0.8	00:00.039 total
+wildfly-health	cratonvm	1	FAIL	6.3	FAIL testSchema[0](org.wildfly.extension.health.HealthSubsystemTestCase) :: fatal error: Premature end of file.
+wildfly-health	hotspot	-	SKIP	-	CratonVM not PASS
+elasticsearch-version	cratonvm	70	FAIL	6.2	Exception
+elasticsearch-version	hotspot	-	SKIP	-	-
+gpu-bench-cpu	cratonvm	0	PASS	1.6	[cratonvm] System.exit(0) called — process terminating
+gpu-bench-cpu	hotspot	0	PASS	0.2	correctness=OK
+gpu-offload-probe	cratonvm	0	PASS	1.7	OUT0=0 OUTN=1048600
+gpu-offload-probe	hotspot	0	PASS	0.2	OUT0=0 OUTN=1048600
+bc-asn1-regression	cratonvm	1	PASS	23.7	GeneralName: Okay
+bc-asn1-regression	hotspot	0	PASS	1.4	All tests successful.
+bc-crypto-prng	cratonvm	0	PASS	69.8	All tests successful.
+bc-crypto-prng	hotspot	0	PASS	0.9	All tests successful.
+commons-math-junit-probe	cratonvm	1	FAIL	5.1	Exception in thread "main" java/lang/InternalError: JIT dispatch into org/junit/platform/launcher/core/EngineExecutionOr
+commons-math-junit-probe	hotspot	-	SKIP	-	CratonVM not PASS
+dacapo-avrora	cratonvm	0	PASS	10.5	PASSED
+dacapo-avrora	hotspot	127	N/S	1.5	FAILED
+pool:kafka-codec	cratonvm	127	CRASH	0	bash: C:/craton/CratonVM/test-infra/regression-pool/run.sh: No such file or directory 
+pool:kafka-codec	hotspot	-	SKIP	-	-
+pool:spring-boot-run	cratonvm	127	CRASH	0	bash: C:/craton/CratonVM/test-infra/regression-pool/run.sh: No such file or directory 
+pool:spring-boot-run	hotspot	-	SKIP	-	-
+pool:tomcat-server-info	cratonvm	127	CRASH	0	bash: C:/craton/CratonVM/test-infra/regression-pool/run.sh: No such file or directory 
+pool:tomcat-server-info	hotspot	-	SKIP	-	-

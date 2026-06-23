@@ -1,0 +1,4 @@
+variant	rc	wall_s	state	summary
+cratonvm	1	86.9	RAN	Caused by: java.lang.AbstractMethodError: method java/nio/file/attribute/BasicFileAttributes.isDirectory()Z has no Code attribute 2026-06-09T22:24:33.232187Z  WARN cratonvm_vm::vm::vm_exec: NoSuchMeth
+hotspot	127	0.8	RAN	Caused by: java.lang.NoClassDefFoundError: org/apache/commons/rng/UniformRandomProvider Caused by: java.lang.ClassNotFoundException: org.apache.commons.rng.UniformRandomProvider 
+tornadovm	127	1.2	RAN	Caused by: java.lang.NoClassDefFoundError: org/apache/commons/rng/UniformRandomProvider Caused by: java.lang.ClassNotFoundException: org.apache.commons.rng.UniformRandomProvider 
