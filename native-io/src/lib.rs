@@ -3061,20 +3061,43 @@ fn native_baos_write_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
 }
 
 fn native_baos_write_byte_array(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    // write([B)V — delegates to write([BII)V with off=0, len=array.length
+    // write([B)V — `java.io.OutputStream.write(byte[])` is defined as
+    // `write(b, 0, b.length)`, i.e. a *virtual* dispatch to `write([BII)V`.
+    // We MUST perform that virtual call (not delegate straight to
+    // `native_baos_write_bytes`) so that a subclass which overrides
+    // `write([BII)V` runs — e.g. Tomcat's
+    // `WebdavServlet$BoundedByteArrayOutputStream`, whose `write([BII)V`
+    // enforces a request-body size bound and throws
+    // `ArrayIndexOutOfBoundsException` past the limit. `ByteArrayOutputStream`
+    // itself declares no `write(byte[])`, so this native stands in for the
+    // inherited `OutputStream` bytecode; calling the backing store directly
+    // here silently bypassed the subclass bound check (TC0622 Gap B — the
+    // "native shadows subclass override" / BUG-J family).
+    //
+    // For a plain `java/io/ByteArrayOutputStream` receiver (and non-overriding
+    // subclasses like `DerOutputStream`) the virtual dispatch resolves to the
+    // base `write([BII)V` native, so the byte-for-byte behaviour is unchanged.
+    // No recursion: the callee descriptor `([BII)V` differs from `([B)V`.
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(None),
+    };
     let buf = match args.get(1) {
         Some(Value::Object(Some(arr))) => *arr,
         _ => return Ok(None),
     };
     let len = ctx.array_length(buf);
-    let mut full_args = args.to_vec();
-    // Ensure we have at least 4 args: this, array, offset, length
-    while full_args.len() < 4 {
-        full_args.push(Value::Int(0));
-    }
-    full_args[2] = Value::Int(0);
-    full_args[3] = Value::Int(len as i32);
-    native_baos_write_bytes(ctx, &full_args)
+    ctx.invoke_virtual(
+        this,
+        "write",
+        "([BII)V",
+        &[
+            Value::Object(Some(buf)),
+            Value::Int(0),
+            Value::Int(len as i32),
+        ],
+    )?;
+    Ok(None)
 }
 
 fn native_baos_to_byte_array(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
