@@ -131,6 +131,28 @@ taxes every native call:
 This is the same root cause as [[springrepos-extension-hang-jit-throughput-and-deep-recursion]]
 and the WS1 kafka-throughput note; fixing precise maps fixes all three.
 
+## Verified NOT fixed by precise maps as landed (dev `814158ae`, 2026-06-23)
+
+Precise-map **emission is already default-on** (`x64::precise_jit_maps_enabled()` =
+opt-out `CRATONVM_NO_PRECISE_JIT_MAPS`; Steps 1–8 are in dev history). The
+`CRATONVM_PRECISE_JIT_MAPS` env var is **read nowhere** — an earlier "91s with it
+on" reading was run-to-run noise on this box, not the flag. Merging current dev and
+rebuilding did **not** fix BUG-01:
+
+| class | default (watchdog ON) | watchdog OFF | nojit |
+|---|---|---|---|
+| ClassUtilsTests | 112 s (barely under 120 s — fragile) | 105 s | 15 s |
+| ObjectUtilsTests | **rc=127, aborts at 120 s (still hangs)** | 127 s (`found=140 succ=140`, all pass) | — |
+
+`ObjectUtilsTests` has **no** separate correctness bugs (140/140 pass with the
+watchdog off) — it is *purely* the throughput hang, and it still overshoots the
+watchdog with precise maps on. **Why precise maps don't help here:**
+`emit_oop_map_for_safepoint` only fires at **safepoints (call sites)**, so a pure
+leaf method with no calls (`Integer.compare`, `Character.charCount`, …) emits **no**
+oop maps → `has_precise_oop_maps()==false` → it still falls to the conservative
+band scan. Closing the gap needs oop-map coverage (or a cheap entry-frame bound)
+for the leaf/lambda shapes that compile on these workloads — still the open fix.
+
 ## Repro
 
 ```bash
