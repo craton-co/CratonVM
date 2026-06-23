@@ -163,6 +163,12 @@ pub(crate) fn materialize_virtual_objects(
     let mut states: BTreeMap<usize, VirtualObjectState> = BTreeMap::new();
     collect_virtual_objects(&frame.locals, &mut states);
     collect_virtual_objects(&frame.stack, &mut states);
+    // Phase C (monitors): a held monitor's object may be a scalar-replaced one;
+    // its defining `VirtualObject` lives in the locals (the `synchronized(obj)`
+    // temp), so it is already collected above — but collect from the monitor
+    // objects too in case the only reference is the monitor itself.
+    let monitor_objs: Vec<FrameValue> = frame.monitors.iter().map(|m| m.object.clone()).collect();
+    collect_virtual_objects(&monitor_objs, &mut states);
     if states.is_empty() {
         return Ok(Vec::new());
     }
@@ -222,6 +228,15 @@ pub(crate) fn materialize_virtual_objects(
             result.push((slot, addr));
         }
         slot += 1;
+    }
+    // Phase C: rewrite each held monitor's object to the materialized shell so the
+    // resume can re-acquire the lock on the real heap object. (Not added to
+    // `result` — `result` tracks frame slots; monitors are relocked separately.)
+    for m in frame.monitors.iter_mut() {
+        if let Some(id) = virtual_id_of(&m.object) {
+            let addr = shells[&id].as_ptr() as usize as u64;
+            m.object = FrameValue::Object(addr);
+        }
     }
 
     if keep_pins {
@@ -538,5 +553,44 @@ mod tests {
         // Frame slots rewritten.
         assert_eq!(frame.locals[0], FrameValue::Object(addr_a));
         assert_eq!(frame.locals[1], FrameValue::Object(addr_b));
+    }
+
+    /// Phase C (monitors): a held monitor whose object is a scalar-replaced one
+    /// (referenced by `VirtualObjectRef`) is rewritten to the SAME materialized
+    /// shell as the local that defines it, so the resume can relock the real object.
+    #[test]
+    fn materialize_rewrites_held_monitor_object() {
+        use cratonvm_jit::deopt::MonitorInfo;
+        let shared = Arc::new(SharedVm::new(VmConfig::default()));
+        let mut thread = JvmThread::new(ThreadId(0), "test");
+
+        // local 1 defines virtual object id 0; a held monitor references it.
+        let mut frame = ReconstructedFrame {
+            method_key: "T.m".to_string(),
+            bci: 0,
+            locals: vec![FrameValue::Int(0), vobj(0, 1, 0)],
+            stack: vec![],
+            monitors: vec![MonitorInfo {
+                object: FrameValue::VirtualObjectRef(0),
+                lock_depth: 2,
+            }],
+            caller_frames: Vec::new(),
+        };
+
+        let mapped = materialize_virtual_objects(
+            &shared,
+            &mut thread,
+            &mut frame,
+            /* stress_gc */ true,
+            /* keep_pins */ false,
+        )
+        .expect("materialization should succeed");
+
+        // The defining local was materialized to a real Object.
+        let local_addr = mapped.iter().find(|&&(s, _)| s == 1).expect("local 1 materialized").1;
+        assert_eq!(frame.locals[1], FrameValue::Object(local_addr));
+        // The monitor's object was rewritten to the SAME shell; depth preserved.
+        assert_eq!(frame.monitors[0].object, FrameValue::Object(local_addr));
+        assert_eq!(frame.monitors[0].lock_depth, 2);
     }
 }
