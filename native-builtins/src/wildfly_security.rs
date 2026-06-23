@@ -752,16 +752,88 @@ fn next_oid() -> u64 {
 // Native method implementations.
 // ===========================================================================
 
+/// Subject instance-field slots.  The synthetic-stub layout
+/// (`class_manager::synthetic_stub_fields`) lists `principals`,
+/// `publicCreds`, `privateCreds` in this order; the real JDK `Subject`
+/// lists `principals`, `pubCredentials`, `privCredentials` in the SAME
+/// order under `java.lang.Object` (no inherited instance fields).  Because
+/// the slot order matches, these indices stay valid after an in-place
+/// stub→real-bytecode upgrade (`update_class_in_place` keeps already-
+/// allocated objects' slots), so accessing by index — not by name, which
+/// the upgrade renames `privateCreds`→`privCredentials` — is the only
+/// upgrade-stable choice.
+const SUBJECT_SLOT_PRINCIPALS: usize = 0;
+const SUBJECT_SLOT_PUBLIC_CREDS: usize = 1;
+const SUBJECT_SLOT_PRIVATE_CREDS: usize = 2;
+
+/// Read the real, mutable `java.util.HashSet` backing one of `Subject`'s
+/// three sets, lazily building and storing it when the slot is still null.
+///
+/// The set must be a *real* HashSet (constructed via its `<init>`), not an
+/// `alloc_concurrent_synthetic` field-only stub: JASPIC's
+/// `CallbackHandlerImpl` (and, once the unregistered
+/// `getPrivateCredentials(Class)` overload upgrades the stub to real
+/// bytecode, the JDK's own `Subject$ClassSet` populate loop running under
+/// `synchronized (privCredentials)`) calls real `add`/`remove`/`iterator`
+/// on it and stores arbitrary Java credential objects (e.g. Tomcat's
+/// `GenericPrincipal`) that the Rust-typed `Subject` side-table cannot
+/// represent.  The no-arg getter and the real `getXxx(Class)` bytecode
+/// share this one object via the slot, so mutations round-trip.
+///
+/// GC-safety: `new_object_initialized` runs `HashSet.<init>` and can
+/// trigger a moving collection, so `this` is pinned across it and read
+/// back forwarded before the `set_field`.
+fn get_or_init_subject_set(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    slot: usize,
+) -> MethodCallResult {
+    if let Value::Object(Some(set)) = ctx.get_field(this, slot) {
+        return Ok(Some(Value::Object(Some(set))));
+    }
+    let pin = ctx.pin_native_root(this);
+    let made = ctx.new_object_initialized("java/util/HashSet", "()V", &[]);
+    let this = ctx.read_native_pin(pin, this);
+    ctx.unpin_native_roots(pin);
+    let set = match made {
+        Ok(Some(Value::Object(Some(s)))) => s,
+        // Allocation produced no object (OOME pending) or raised — surface
+        // it rather than storing a null.
+        Ok(other) => return Ok(other),
+        Err(e) => return Err(e),
+    };
+    ctx.set_field(this, slot, Value::Object(Some(set)));
+    Ok(Some(Value::Object(Some(set))))
+}
+
 fn native_subject_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let subject = Subject::new();
     let key = obj_key(ctx, this);
     subject_handles().write().insert(key, subject);
-    // Field 0 = principals, Field 1 = publicCreds, Field 2 =
-    // privateCreds; we leave them null because real bytecode never
-    // reads the raw sets directly (goes via getPrincipals()).  A
-    // handle-attach token written to the identity-hash-code slot is
-    // pointless — Java code stores its Subject by reference.
+    // Initialise principals (0) / publicCreds (1) / privateCreds (2) to REAL
+    // mutable `java.util.HashSet`s, matching the real `Subject` constructor's
+    // invariant that all three sets are non-null.  Real bytecode DOES read the
+    // raw sets directly: the no-arg getters below hand the field set back, and
+    // the JDK's `getPrivateCredentials(Class)` overload (unregistered → real
+    // bytecode after stub upgrade) does `synchronized (privCredentials)`, which
+    // NPE'd on the previously-null field (Tomcat JASPIC
+    // `TestJaspicCallbackHandlerInAuthenticator`).  The Rust side-table above is
+    // retained for WildFly's Rust-typed login/doAs state.
+    //
+    // Pin `this` across the loop: each `get_or_init_subject_set` allocates and
+    // may relocate the Subject, so re-read the forwarded ref before the next.
+    let pin = ctx.pin_native_root(this);
+    let mut this = this;
+    for slot in [
+        SUBJECT_SLOT_PRINCIPALS,
+        SUBJECT_SLOT_PUBLIC_CREDS,
+        SUBJECT_SLOT_PRIVATE_CREDS,
+    ] {
+        this = ctx.read_native_pin(pin, this);
+        get_or_init_subject_set(ctx, this, slot)?;
+    }
+    ctx.unpin_native_roots(pin);
     Ok(None)
 }
 
@@ -800,15 +872,12 @@ fn native_subject_get_private_credentials(
     args: &[Value],
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    let Some(subject) = get_subject_from_this(ctx, this) else {
-        return Err(subject_missing_err());
-    };
-    let creds = subject.get_private_credentials();
-    // Do NOT log the credential bytes; use redact_private.
-    tracing::trace!(count = creds.len(), value = %redact_private(b""), "Subject.getPrivateCredentials");
-    let set = alloc_concurrent_synthetic(ctx, "java/util/HashSet", 3);
-    ctx.set_field(set, 1, Value::Int(creds.len() as i32));
-    Ok(Some(Value::Object(Some(set))))
+    // Hand back the REAL backing Set field (slot 2) so callers can
+    // add/remove/iterate Java credential objects and the post-upgrade real
+    // `getPrivateCredentials(Class)` bytecode — which reads the same slot under
+    // `synchronized (privCredentials)` — sees them.  We never log the live set
+    // (it may hold cleartext secrets); contents stay redacted by construction.
+    get_or_init_subject_set(ctx, this, SUBJECT_SLOT_PRIVATE_CREDS)
 }
 
 fn native_subject_get_public_credentials(
@@ -816,13 +885,10 @@ fn native_subject_get_public_credentials(
     args: &[Value],
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    let Some(subject) = get_subject_from_this(ctx, this) else {
-        return Err(subject_missing_err());
-    };
-    let creds = subject.get_public_credentials();
-    let set = alloc_concurrent_synthetic(ctx, "java/util/HashSet", 3);
-    ctx.set_field(set, 1, Value::Int(creds.len() as i32));
-    Ok(Some(Value::Object(Some(set))))
+    // Hand back the REAL backing Set field (slot 1) — same rationale as
+    // `getPrivateCredentials`: round-tripping mutations and a non-null set for
+    // the real `getPublicCredentials(Class)` bytecode after stub upgrade.
+    get_or_init_subject_set(ctx, this, SUBJECT_SLOT_PUBLIC_CREDS)
 }
 
 fn native_subject_do_as(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
