@@ -388,19 +388,69 @@ fn decoder_malformed_is_replace(ctx: &dyn NativeContext, this: ObjectRef) -> boo
     false
 }
 
+fn is_high_surrogate(u: u16) -> bool {
+    (0xD800..=0xDBFF).contains(&u)
+}
+fn is_low_surrogate(u: u16) -> bool {
+    (0xDC00..=0xDFFF).contains(&u)
+}
+
+/// True when the named `CodingErrorAction` field of `this` (an encoder or
+/// decoder) is `REPLACE`. Default is REPORT, so an unreadable/absent field
+/// conservatively returns false (preserving the strict error behavior).
+fn coding_action_is_replace(ctx: &dyn NativeContext, this: ObjectRef, field: &str) -> bool {
+    if let Value::Object(Some(action)) = ctx.get_field_by_name(this, field) {
+        // CodingErrorAction's only instance field is `String name`
+        // ("REPLACE" / "REPORT" / "IGNORE").
+        if let Value::Object(Some(s)) = ctx.get_field_by_name(action, "name") {
+            return ctx.read_string(s).as_deref() == Some("REPLACE");
+        }
+    }
+    false
+}
+
+/// The encoder's REPLACE-action replacement bytes. The JDK default is a single
+/// `'?'` (0x3F) for every charset we implement; honour a custom `replacement`
+/// byte[] if one is set, else fall back to `'?'`.
+fn encoder_replacement(ctx: &dyn NativeContext, this: ObjectRef) -> Vec<u8> {
+    if let Value::Object(Some(arr)) = ctx.get_field_by_name(this, "replacement") {
+        let len = ctx.array_length(arr);
+        if len > 0 {
+            return read_byte_array(ctx, arr, 0, len);
+        }
+    }
+    vec![b'?']
+}
+
 /// `CharsetEncoder.encode(CharBuffer, ByteBuffer, boolean end_of_input)
 ///  -> CoderResult`
 ///
-/// Consumes UTF-16 code units from the input CharBuffer between its
-/// current position and limit, encodes them via the engine, and writes
-/// them into the output ByteBuffer. Advances both buffers' positions
-/// by the amount consumed / produced. Returns UNDERFLOW on success,
-/// OVERFLOW when the output buffer fills before all input is consumed,
-/// UNMAPPABLE on a character the charset can't represent.
+/// Consumes UTF-16 code units from the input CharBuffer between its current
+/// position and limit, encodes them via the engine, and writes them into the
+/// output ByteBuffer. Advances both buffers' positions by the amount consumed /
+/// produced. Returns UNDERFLOW on success, OVERFLOW when the output buffer fills
+/// before all input is consumed, MALFORMED/UNMAPPABLE (under the REPORT action)
+/// on bad input.
+///
+/// Encoding proceeds atom-by-atom — a BMP code unit or a complete surrogate
+/// pair — so that:
+///   * a trailing lone high surrogate is left buffered (UNDERFLOW) when more
+///     input may follow, reuniting a pair split across two calls (a servlet
+///     `Writer` writing one char at a time → Tomcat BUG-TC0622);
+///   * OVERFLOW stops on a whole-atom boundary, never emitting a truncated
+///     multi-byte sequence and never over/under-consuming the input (the prior
+///     proportional estimate corrupted variable-width output when the byte
+///     buffer filled mid-character);
+///   * the encoder's REPLACE actions are honoured (substitute the replacement
+///     bytes and continue) instead of always REPORTing — matching the real
+///     `java.nio.charset.CharsetEncoder.encode` orchestrator this shadows, and
+///     symmetric to `native_decoder_decode`.
 fn native_encoder_encode(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = arg_obj(args, 0)?;
     let cb = arg_obj(args, 1)?;
     let bb = arg_obj(args, 2)?;
+    // args[3] = boolean endOfInput (passed as Int 0/1).
+    let end_of_input = matches!(args.get(3), Some(Value::Int(v)) if *v != 0);
 
     let (carr, cpos, clim) = match buf_state(ctx, cb) {
         Some(s) => s,
@@ -428,57 +478,115 @@ fn native_encoder_encode(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         return Ok(Some(Value::Object(Some(r))));
     }
 
-    // Encode chunk-by-chunk so we can report OVERFLOW / UNMAPPABLE with
-    // precise buffer positions.  The engine encodes the whole slice
-    // atomically; on success we need to honour the destination's
-    // remaining space.
-    let encoded = match engine::encode_chars(&name, &chars) {
-        Ok(bytes) => bytes,
-        Err(e) => {
-            // Advance the input position to the error offset.
-            set_pos(ctx, cb, cpos + e.offset as i32);
-            let tag = match e.kind {
-                engine::CodingErrorKind::Unmappable => CR_UNMAPPABLE,
-                _ => CR_MALFORMED,
-            };
-            let r = alloc_coder_result(ctx, tag);
+    let avail = (blim - bpos).max(0) as usize;
+
+    // Fast path: the whole slice encodes cleanly (no surrogate/mapping errors)
+    // and fits in the destination. Avoids per-atom work for the common case.
+    if let Ok(encoded) = engine::encode_chars(&name, &chars) {
+        if encoded.len() <= avail {
+            let written = write_byte_array(ctx, barr, bpos as usize, &encoded);
+            set_pos(ctx, bb, bpos + written as i32);
+            set_pos(ctx, cb, cpos + chars.len() as i32);
+            let r = alloc_coder_result(ctx, CR_UNDERFLOW);
             return Ok(Some(Value::Object(Some(r))));
         }
-    };
+    }
 
-    let avail = (blim - bpos).max(0) as usize;
-    let to_write = encoded.len().min(avail);
-    let written = write_byte_array(ctx, barr, bpos as usize, &encoded[..to_write]);
+    // Precise path: encode atom by atom.
+    let malformed_replace = coding_action_is_replace(ctx, this, "malformedInputAction");
+    let unmappable_replace = coding_action_is_replace(ctx, this, "unmappableCharacterAction");
+    let replacement = encoder_replacement(ctx, this);
+
+    let mut out: Vec<u8> = Vec::new();
+    let mut i = 0usize;
+    let mut tag = CR_UNDERFLOW;
+    while i < chars.len() {
+        let c = chars[i];
+        // Resolve the next atom into (units, bytes), or set `tag`+break for a
+        // REPORT-action error or an incomplete trailing surrogate.
+        let (atom_units, atom_bytes): (usize, Vec<u8>) = if is_high_surrogate(c) {
+            match chars.get(i + 1).copied() {
+                Some(lo) if is_low_surrogate(lo) => match engine::encode_chars(&name, &[c, lo]) {
+                    Ok(b) => (2, b),
+                    Err(e) if e.kind == engine::CodingErrorKind::Unmappable => {
+                        if unmappable_replace {
+                            (2, replacement.clone())
+                        } else {
+                            tag = CR_UNMAPPABLE;
+                            break;
+                        }
+                    }
+                    Err(_) => {
+                        if malformed_replace {
+                            (2, replacement.clone())
+                        } else {
+                            tag = CR_MALFORMED;
+                            break;
+                        }
+                    }
+                },
+                None if !end_of_input => {
+                    // Incomplete trailing high surrogate: leave it buffered and
+                    // report UNDERFLOW (tag stays CR_UNDERFLOW).
+                    break;
+                }
+                _ => {
+                    // Lone high surrogate at end-of-input, or followed by a
+                    // non-low-surrogate unit: malformed.
+                    if malformed_replace {
+                        (1, replacement.clone())
+                    } else {
+                        tag = CR_MALFORMED;
+                        break;
+                    }
+                }
+            }
+        } else if is_low_surrogate(c) {
+            if malformed_replace {
+                (1, replacement.clone())
+            } else {
+                tag = CR_MALFORMED;
+                break;
+            }
+        } else {
+            match engine::encode_chars(&name, &[c]) {
+                Ok(b) => (1, b),
+                Err(e) if e.kind == engine::CodingErrorKind::Unmappable => {
+                    if unmappable_replace {
+                        (1, replacement.clone())
+                    } else {
+                        tag = CR_UNMAPPABLE;
+                        break;
+                    }
+                }
+                Err(_) => {
+                    if malformed_replace {
+                        (1, replacement.clone())
+                    } else {
+                        tag = CR_MALFORMED;
+                        break;
+                    }
+                }
+            }
+        };
+
+        if out.len() + atom_bytes.len() > avail {
+            // The next atom won't fit: stop on this whole-atom boundary.
+            tag = CR_OVERFLOW;
+            break;
+        }
+        out.extend_from_slice(&atom_bytes);
+        i += atom_units;
+    }
+
+    let written = write_byte_array(ctx, barr, bpos as usize, &out);
     set_pos(ctx, bb, bpos + written as i32);
-
-    if to_write < encoded.len() {
-        // We could not write the entire encoded payload: advance the
-        // input position proportionally (approximate for variable-width
-        // charsets) so the caller can retry after draining the output.
-        let consumed = proportional_input_consumed(&chars, &encoded, to_write);
-        set_pos(ctx, cb, cpos + consumed as i32);
-        let r = alloc_coder_result(ctx, CR_OVERFLOW);
-        Ok(Some(Value::Object(Some(r))))
-    } else {
-        set_pos(ctx, cb, cpos + chars.len() as i32);
-        let r = alloc_coder_result(ctx, CR_UNDERFLOW);
-        Ok(Some(Value::Object(Some(r))))
-    }
-}
-
-/// For variable-width charsets, approximate how many UTF-16 input
-/// units were fully consumed by `to_write` output bytes.  Only used
-/// on the OVERFLOW path where the caller will retry; an imprecise
-/// value here only affects how many chars are re-encoded, not
-/// correctness.
-fn proportional_input_consumed(chars: &[u16], encoded: &[u8], to_write: usize) -> usize {
-    if encoded.is_empty() {
-        return chars.len();
-    }
-    // Lower-bound on fully-consumed input: (to_write / encoded_len) * chars_len
-    // rounded DOWN so we never over-consume.
-    let num = to_write as u64 * chars.len() as u64;
-    (num / encoded.len() as u64) as usize
+    // `i` is the exact number of input units consumed; on a REPORT error or an
+    // incomplete trailing surrogate it points at the offending unit (left
+    // unconsumed), exactly matching the real encoder's CoderResult contract.
+    set_pos(ctx, cb, cpos + i as i32);
+    let r = alloc_coder_result(ctx, tag);
+    Ok(Some(Value::Object(Some(r))))
 }
 
 /// `CharsetDecoder.decode(ByteBuffer, CharBuffer, boolean end_of_input)
@@ -997,5 +1105,133 @@ mod tests {
             msg.contains("Shift_JIS"),
             "error should name the unsupported charset, got: {msg}"
         );
+    }
+
+    // --- BUG-TC0622: streaming encoder cross-call high-surrogate carry ---
+
+    /// Build a synthetic `CharsetEncoder` whose charset (slot 0) is `name`.
+    fn make_encoder(ctx: &mut dyn NativeContext, name: &str) -> ObjectRef {
+        let cs = make_charset(ctx, name);
+        let enc = alloc_concurrent_synthetic(ctx, "java/nio/charset/CharsetEncoder", 3);
+        ctx.set_field(enc, 0, Value::Object(Some(cs)));
+        enc
+    }
+
+    fn coder_tag(ctx: &dyn NativeContext, r: Option<Value>) -> i32 {
+        match r {
+            Some(Value::Object(Some(cr))) => ctx.get_field(cr, 0).as_int().unwrap_or(-1),
+            other => panic!("expected CoderResult, got {:?}", other),
+        }
+    }
+
+    fn cb_pos(ctx: &dyn NativeContext, cb: ObjectRef) -> i32 {
+        ctx.get_field(cb, BUF_FIELD_POS).as_int().unwrap_or(-1)
+    }
+
+    fn bb_bytes(ctx: &dyn NativeContext, bb: ObjectRef) -> Vec<u8> {
+        let (arr, _pos, _lim) = buf_state(ctx, bb).expect("byte buffer state");
+        let upto = ctx.get_field(bb, BUF_FIELD_POS).as_int().unwrap_or(0) as usize;
+        (0..upto)
+            .map(|i| (ctx.get_array_element(arr, i).as_int().unwrap_or(0) & 0xFF) as u8)
+            .collect()
+    }
+
+    #[test]
+    fn encoder_buffers_trailing_high_surrogate_when_more_input_coming() {
+        // 'A' followed by a lone high surrogate, endOfInput=false. The encoder
+        // must emit 'A', leave the high surrogate buffered (input position stops
+        // before it), and report UNDERFLOW — NOT substitute U+FFFD.
+        let mut ctx = mock_ctx();
+        let enc = make_encoder(&mut ctx, "UTF-8");
+        let cb = alloc_char_buffer(&mut ctx, &[0x0041, 0xD800]);
+        let bb = alloc_byte_buffer(&mut ctx, &[0u8; 8]);
+        // alloc_byte_buffer sets limit/pos to the data length (8) with pos 0;
+        // that's the writable window we need.
+        let r = native_encoder_encode(
+            &mut ctx,
+            &[
+                Value::Object(Some(enc)),
+                Value::Object(Some(cb)),
+                Value::Object(Some(bb)),
+                Value::Int(0), // endOfInput = false
+            ],
+        )
+        .expect("encode must not error");
+        assert_eq!(coder_tag(&ctx, r), CR_UNDERFLOW);
+        assert_eq!(bb_bytes(&ctx, bb), vec![0x41], "only 'A' should be written");
+        assert_eq!(cb_pos(&ctx, cb), 1, "high surrogate must stay unconsumed");
+    }
+
+    #[test]
+    fn encoder_completes_pair_in_single_buffer() {
+        // A full surrogate pair (U+10000) in one buffer must encode to its true
+        // 4-byte UTF-8 form and consume both units — the carry logic must not
+        // mistakenly hold back a well-paired surrogate.
+        let mut ctx = mock_ctx();
+        let enc = make_encoder(&mut ctx, "UTF-8");
+        let cb = alloc_char_buffer(&mut ctx, &[0xD800, 0xDC00]); // U+10000
+        let bb = alloc_byte_buffer(&mut ctx, &[0u8; 8]);
+        let r = native_encoder_encode(
+            &mut ctx,
+            &[
+                Value::Object(Some(enc)),
+                Value::Object(Some(cb)),
+                Value::Object(Some(bb)),
+                Value::Int(0),
+            ],
+        )
+        .expect("encode must not error");
+        assert_eq!(coder_tag(&ctx, r), CR_UNDERFLOW);
+        assert_eq!(bb_bytes(&ctx, bb), vec![0xF0, 0x90, 0x80, 0x80]);
+        assert_eq!(cb_pos(&ctx, cb), 2);
+    }
+
+    #[test]
+    fn encoder_overflow_stops_on_whole_atom_boundary() {
+        // 'A' + U+10000 (a surrogate pair = 4 UTF-8 bytes) into a 3-byte window.
+        // 'A' fits (1 byte); the pair (4 bytes) does not. The encoder must stop
+        // on the atom boundary — write ONLY 'A', report OVERFLOW, and consume
+        // exactly 1 unit — never a truncated multi-byte sequence (the prior
+        // proportional path wrote part of the pair and mis-consumed input,
+        // corrupting Tomcat's supplementary-char response body).
+        let mut ctx = mock_ctx();
+        let enc = make_encoder(&mut ctx, "UTF-8");
+        let cb = alloc_char_buffer(&mut ctx, &[0x0041, 0xD800, 0xDC00]);
+        let bb = alloc_byte_buffer(&mut ctx, &[0u8; 3]);
+        let r = native_encoder_encode(
+            &mut ctx,
+            &[
+                Value::Object(Some(enc)),
+                Value::Object(Some(cb)),
+                Value::Object(Some(bb)),
+                Value::Int(0),
+            ],
+        )
+        .expect("encode must not error");
+        assert_eq!(coder_tag(&ctx, r), CR_OVERFLOW);
+        assert_eq!(bb_bytes(&ctx, bb), vec![0x41], "only the whole 'A' atom fits");
+        assert_eq!(cb_pos(&ctx, cb), 1, "only 'A' consumed; the pair is retried");
+    }
+
+    #[test]
+    fn encoder_trailing_high_surrogate_is_malformed_at_end_of_input() {
+        // The same trailing high surrogate, but endOfInput=true: no more input
+        // can complete it, so it is genuinely MALFORMED (matches the JDK).
+        let mut ctx = mock_ctx();
+        let enc = make_encoder(&mut ctx, "UTF-8");
+        let cb = alloc_char_buffer(&mut ctx, &[0x0041, 0xD800]);
+        let bb = alloc_byte_buffer(&mut ctx, &[0u8; 8]);
+        let r = native_encoder_encode(
+            &mut ctx,
+            &[
+                Value::Object(Some(enc)),
+                Value::Object(Some(cb)),
+                Value::Object(Some(bb)),
+                Value::Int(1), // endOfInput = true
+            ],
+        )
+        .expect("encode must not error");
+        assert_eq!(coder_tag(&ctx, r), CR_MALFORMED);
+        assert_eq!(cb_pos(&ctx, cb), 1, "position advances to the bad surrogate");
     }
 }

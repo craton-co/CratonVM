@@ -8,13 +8,24 @@
 //! bytes and forwarding them via the underlying stream's
 //! `write([BII)V` method.  The JDK bytecode reaches into sun.nio.ch
 //! internals we don't cover; this synthetic implementation keeps its
-//! state in three fields:
+//! state in three indexed scratch fields:
 //!
 //! | slot | meaning                                    |
 //! |------|--------------------------------------------|
 //! | 0    | underlying `java.io.OutputStream`          |
 //! | 1    | `java.lang.String` — canonical charset name|
 //! | 2    | `int` — `1` if closed, `0` otherwise        |
+//!
+//! Cross-call surrogate carry uses the REAL `sun.nio.cs.StreamEncoder` fields
+//! `haveLeftoverChar` (boolean) and `leftoverChar` (char) by name — the exact
+//! mechanism the JDK's own `StreamEncoder` uses to hold an unmatched high
+//! surrogate between writes. They must be the real primitive fields (not an
+//! indexed scratch slot): the encoder is allocated with the real class id, so
+//! low indexed slots alias the real reference-typed fields (`cs`/`encoder`/`bb`)
+//! and would not round-trip a primitive `int`. Without this carry, a surrogate
+//! pair split across two writes (e.g. a servlet `Writer` writing one char at a
+//! time) encodes each half as a lone surrogate and corrupts supplementary-plane
+//! text to U+FFFD (Tomcat BUG-TC0622).
 
 use cratonvm_native_api::charset as engine;
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
@@ -141,6 +152,8 @@ pub(crate) fn alloc_stream_encoder(
     ctx.set_field(obj, SE_OUTPUT, Value::Object(Some(os)));
     ctx.set_field(obj, SE_NAME, Value::Object(Some(name)));
     ctx.set_field(obj, SE_CLOSED, Value::Int(0));
+    // No pending high surrogate yet (real-field carry, cleared explicitly).
+    clear_pending(ctx, obj);
     obj
 }
 
@@ -180,22 +193,86 @@ fn native_se_for_osw_charset(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     Ok(Some(Value::Object(Some(se))))
 }
 
+/// True for a UTF-16 high surrogate (the leading unit of a supplementary pair).
+fn is_high_surrogate(u: u16) -> bool {
+    (0xD800..=0xDBFF).contains(&u)
+}
+
+/// Read the carried pending high surrogate, if any, from the real JDK
+/// `haveLeftoverChar`/`leftoverChar` fields. Returns `None` unless the flag is
+/// set AND the stored unit is a genuine high surrogate (defensive: a stray
+/// non-surrogate is never treated as a carry).
+fn take_pending(ctx: &dyn NativeContext, this: ObjectRef) -> Option<u16> {
+    if ctx.get_field_by_name(this, "haveLeftoverChar").as_int().unwrap_or(0) == 0 {
+        return None;
+    }
+    let u = (ctx.get_field_by_name(this, "leftoverChar").as_int().unwrap_or(0) & 0xFFFF) as u16;
+    if is_high_surrogate(u) {
+        Some(u)
+    } else {
+        None
+    }
+}
+
+/// Stash an unmatched high surrogate for the next call.
+fn set_pending(ctx: &dyn NativeContext, this: ObjectRef, hi: u16) {
+    ctx.set_field_by_name(this, "leftoverChar", Value::Int(hi as i32));
+    ctx.set_field_by_name(this, "haveLeftoverChar", Value::Int(1));
+}
+
+/// Clear any pending high surrogate.
+fn clear_pending(ctx: &dyn NativeContext, this: ObjectRef) {
+    ctx.set_field_by_name(this, "haveLeftoverChar", Value::Int(0));
+}
+
 /// Encode `chars` with the encoder's charset and forward to the
 /// underlying OutputStream via `write([BII)V`.
+///
+/// Carries an unmatched trailing high surrogate across calls (the real
+/// `haveLeftoverChar`/`leftoverChar` fields): any surrogate held from a previous
+/// call is prepended, and if the combined run ends on a lone high surrogate it
+/// is stashed for the next call instead of being encoded as U+FFFD. This makes a
+/// surrogate pair split across two writes encode to its true supplementary code
+/// point.
 fn write_bytes(
     ctx: &mut dyn NativeContext,
     this: ObjectRef,
     chars: &[u16],
 ) -> Result<(), cratonvm_types::error::MethodCallFailed> {
-    if chars.is_empty() {
+    // Combine any carried high surrogate with this chunk.
+    let pending = take_pending(ctx, this);
+    if chars.is_empty() && pending.is_none() {
         return Ok(());
     }
+    let mut combined: Vec<u16> = Vec::with_capacity(chars.len() + 1);
+    if let Some(hi) = pending {
+        combined.push(hi);
+    }
+    combined.extend_from_slice(chars);
+
+    // If the combined run ends on a lone high surrogate, hold it back for the
+    // next call (its low surrogate may arrive then); encode only the prefix.
+    let encode_len = match combined.last() {
+        Some(&last) if is_high_surrogate(last) => {
+            set_pending(ctx, this, last);
+            combined.len() - 1
+        }
+        _ => {
+            clear_pending(ctx, this);
+            combined.len()
+        }
+    };
+    if encode_len == 0 {
+        return Ok(());
+    }
+    let to_encode = &combined[..encode_len];
+
     let os = match ctx.get_field(this, SE_OUTPUT) {
         Value::Object(Some(s)) => s,
         _ => return Ok(()),
     };
     let name = name_of(ctx, this);
-    let bytes = engine::encode_chars_lossy(&name, chars);
+    let bytes = engine::encode_chars_lossy(&name, to_encode);
     if bytes.is_empty() {
         return Ok(());
     }
@@ -291,6 +368,11 @@ fn native_se_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         Some(o) => o,
         None => return Ok(None),
     };
+    // End of input: any still-unpaired high surrogate can no longer be
+    // completed, so flush it now as the replacement char (U+FFFD), matching
+    // the JDK's encoder.encode(.., endOfInput=true) + flush at close. Done
+    // before the stream is flushed/closed so the bytes actually go out.
+    flush_pending_surrogate(ctx, this)?;
     if let Value::Object(Some(os)) = ctx.get_field(this, SE_OUTPUT) {
         let _ = ctx.invoke_virtual(os, "flush", "()V", &[]);
         let _ = ctx.invoke_virtual(os, "close", "()V", &[]);
@@ -298,6 +380,43 @@ fn native_se_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     ctx.set_field(this, SE_OUTPUT, Value::Object(None));
     ctx.set_field(this, SE_CLOSED, Value::Int(1));
     Ok(None)
+}
+
+/// Emit a carried (now unmatched) high surrogate as the replacement char and
+/// clear the carry. Used at end-of-input (close), where a lone surrogate is
+/// genuinely malformed and must be substituted rather than silently dropped.
+fn flush_pending_surrogate(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+) -> Result<(), cratonvm_types::error::MethodCallFailed> {
+    let Some(hi) = take_pending(ctx, this) else {
+        return Ok(());
+    };
+    clear_pending(ctx, this);
+    let os = match ctx.get_field(this, SE_OUTPUT) {
+        Value::Object(Some(s)) => s,
+        _ => return Ok(()),
+    };
+    let name = name_of(ctx, this);
+    // Lossy encode of a lone surrogate yields the charset's replacement bytes
+    // (U+FFFD → EF BF BD for UTF-8), exactly as HotSpot's REPLACE action does.
+    let bytes = engine::encode_chars_lossy(&name, &[hi]);
+    if bytes.is_empty() {
+        return Ok(());
+    }
+    let buf = ctx.new_array(ArrayElementType::Byte, bytes.len());
+    ctx.write_byte_array_from(buf, 0, &bytes);
+    ctx.invoke_virtual(
+        os,
+        "write",
+        "([BII)V",
+        &[
+            Value::Object(Some(buf)),
+            Value::Int(0),
+            Value::Int(bytes.len() as i32),
+        ],
+    )?;
+    Ok(())
 }
 
 pub fn register_stream_encoder_natives(registry: &mut NativeMethodRegistry) {
