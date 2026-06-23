@@ -1,214 +1,121 @@
 ---
 name: bug-01-junit-reflection-heavy-jit-frame-scan-throughput
-description: BUG-01 "JUnit discovery hangs on reflection-heavy test classes" is MISDIAGNOSED. Reflection/reflectionData caching works fine. The real cause is the conservative JIT-frame GC-root scan (scan_active_jit_frames) making JIT-on ~6x SLOWER than the interpreter on call-heavy JUnit execution, overshooting the 120s default watchdog. nojit=20s, default JIT=123s. Same documented mechanism as the WS1/kafka-throughput + springrepos-extension-hang issues; the real fix is precise oop maps (in-flight, default-off, only ~26% effective today).
+description: BUG-01 "JUnit discovery hangs on reflection-heavy test classes" is MISDIAGNOSED. reflectionData caching works fine. The REAL cause is precise-JIT-oop-maps default-on (commit 5b8864a0) — its per-call/per-safepoint codegen makes hot JIT'd JUnit code ~6x SLOWER than the interpreter (nojit 15-25s vs JIT 105-123s), overshooting the 120s watchdog. CRATONVM_NO_PRECISE_JIT_MAPS=1 restores ~18s but reintroduces the A2/A3/A4 GC-root corruption that 5b8864a0 fixed. Ruled out: reflection cache, the conservative scan (chain mostly empty), compile time. The fix lives in the precise-maps codegen (owned by concurrent sessions) — reduce its per-call overhead or make emission selective.
 metadata:
   type: known-issue
   area: jit, gc, throughput
 ---
 
-# BUG-01 — "JUnit discovery hangs on reflection-heavy test classes" — REAL cause: conservative JIT-frame root scan
+# BUG-01 — "JUnit discovery hangs on reflection-heavy test classes" — REAL cause: precise-JIT-maps codegen overhead
 
-**Severity:** High (suite-wide; every reflection/call-heavy JUnit test class overshoots the
-120 s default watchdog and is reported as a hang).
+**Severity:** High (suite-wide; every reflection/call-heavy JUnit test class overshoots
+the 120 s default watchdog and is reported as a hang).
 
-**TL;DR — the original BUG-01 report is misdiagnosed.** It blamed
-`Class.reflectionData()` not being cached. That is **wrong**: the reflection-data
-cache works perfectly (≈50 declared-member native calls for the whole run). The
-class does **not** hang — it **completes in ~123 s** with the JIT on, but the
-built-in **120 s watchdog aborts it first**, which surfaces as a "hang." With the
-JIT **disabled** the same class completes in **~20 s**. So the JIT makes this
-workload **~6× slower than the interpreter**. This is the same mechanism already
-documented in `vm/src/jit/conservative_roots.rs` (the "WS1 kafka JIT throughput"
-comment) and in [[springrepos-extension-hang-jit-throughput-and-deep-recursion]].
+**TL;DR.** The original report blamed `Class.reflectionData()` not being cached — that
+is **wrong** (the reflection cache works perfectly). The class does not hang: it
+**completes**, but slowly enough that the built-in **120 s watchdog aborts it**, which
+surfaces as a "hang." The real cause is that **precise JIT oop maps are default-on**
+(commit `5b8864a0`) and their **per-call / per-safepoint codegen makes hot JIT-compiled
+code ~6× slower than the interpreter** on call-heavy JUnit execution.
+`CRATONVM_NO_PRECISE_JIT_MAPS=1` makes the class run in ~18 s (≈ nojit) — but that
+re-opens the GC-root-coverage corruption (`SB-CRASH-04`/A3, `ReflRepro`/A2, `Fork6`/A4)
+that `5b8864a0` was landed to fix, so it is **not** a safe default flip.
 
-Investigated on a worktree off `dev` `99510377` (binary `cratonvm-bug01*.exe`).
-Repro classes: `org.springframework.util.ClassUtilsTests`,
-`org.springframework.util.ObjectUtilsTests`.
+Investigated on a worktree off `dev` `99510377`…`814158ae`. Repro classes:
+`org.springframework.util.ClassUtilsTests`, `org.springframework.util.ObjectUtilsTests`.
 
-## Hard measurements (ClassUtilsTests; `CRATONVM_DISABLE_DEFAULT_WATCHDOG=1`, heap 2 GB)
+## Hard measurements (`CRATONVM_DISABLE_DEFAULT_WATCHDOG=1`, heap 2 GB)
+
+ClassUtilsTests:
 
 | config | wall | note |
 |---|---|---|
 | HotSpot JDK 25 | **3.2 s** | 106 tests |
-| CratonVM, **JIT off** (`CRATONVM_DISABLE_JIT=1`) | **20 s** | correct results |
-| CratonVM, JIT default | **123 s** | overshoots 120 s watchdog → "hang" |
-| CratonVM, JIT, lower threshold `CRATONVM_JIT_THRESHOLD=50` | 141 s | more compiles → *slower* |
-| CratonVM, JIT, high threshold `=50000` | **18–23 s** | ≈ nojit (nothing crosses threshold) |
-| CratonVM, JIT, `CRATONVM_PRECISE_JIT_MAPS=1` | 91 s | precise maps help only ~26 % |
-| CratonVM, JIT, **skip the 13 hot methods** (see below) | **25 s** | ≈ nojit |
+| CratonVM, **JIT off** (`CRATONVM_DISABLE_JIT=1`) | **15–20 s** | correct results |
+| CratonVM, JIT default (precise maps on) | **105–123 s** | overshoots 120 s watchdog → "hang" |
+| CratonVM, JIT, **`CRATONVM_NO_PRECISE_JIT_MAPS=1`** | **18–25 s** | ≈ nojit — **precise maps are the cost** |
+| CratonVM, JIT, `CRATONVM_JIT_THRESHOLD=50` (more compiles) | 141 s | more precise-compiled methods → *slower* |
+| CratonVM, JIT, `=50000` (≈ nothing compiles) | 18–23 s | ≈ nojit |
+| CratonVM, JIT, skip the ~13 hot compiled methods | 25 s | ≈ nojit (no precise codegen runs) |
 
-(The 63-vs-106 test-count gap and the 10 failures in CratonVM runs are **separate,
-pre-existing bugs** — `forName` array types, primitive-class identity, `isCacheSafe`,
-`UnmodifiableList`-public — NOT part of BUG-01. JIT-on and JIT-off produce the
-*same* `found=63 succ=53 fail=10`, so the throughput fix is behaviour-neutral.)
+ObjectUtilsTests: JIT default **aborts at the 120 s watchdog**; watchdog-off it finishes
+in **127 s** with **`found=140 succ=140 fail=0`** — so it is *purely* the throughput hang,
+no separate bugs. (ClassUtilsTests' `found=63 succ=53 fail=10` vs HotSpot's 106 — the gap
+and the 10 fails are **separate pre-existing bugs**: `forName` array types, primitive-class
+identity, `isCacheSafe`, `UnmodifiableList`-public. JIT-on and JIT-off produce the *same*
+results, so any throughput fix here is behaviour-neutral.)
 
-## What was ruled out (with data)
+## Root cause (confirmed by elimination)
 
-- **Reflection-data / `reflectionData()` caching (the report's hypothesis).** REFUTED.
-  Instrumented `getDeclaredMethods0`/`getDeclaredFields0`/`getDeclaredConstructors0`
-  and all the class/method annotation natives. A microbench loop of
-  `getDeclaredMethods()` ×500 fires the native **exactly once** (the JDK
-  `reflectionData` SoftReference cache sticks). During the real ClassUtilsTests run
-  the declared-member natives fire **~49 times total in 75 s**, and the annotation
-  natives fire **zero** times in 40 s. Reflection is not the bottleneck.
-- **JIT compile *time*.** Only **13 methods** ever compile (no recompiles/deopt
-  churn), and 0 GCs occur — so it is not compilation cost.
-- **Instance-method virtual tier-up** (`CRATONVM_JIT_VIRTUAL_TIERUP=0` → 115 s, ~no
-  change).
-- **OSR** (`CRATONVM_TIER_OSR_BACKEDGE=2e9` → 112 s; OSR is only ~+28 s).
-- **`on_method_invocation` per-call frequency.** Throttling the tiered-manager
-  consult with a `JIT_RETRY_STRIDE` gate in the `execute()` warmup path did **not**
-  help (140 s) — reverted.
+`precise_jit_maps_enabled()` (`jit/src/x64.rs`) is **default-ON** as of commit
+`5b8864a0` ("fix(jit/gc): default-on CRATONVM_PRECISE_JIT_MAPS — fixes the
+GC-root-coverage-under-JIT family (SB-CRASH-04 A3, ReflRepro A2, Fork6 A4)") — opt-out
+`CRATONVM_NO_PRECISE_JIT_MAPS`. With it on, every compiled method carries the precise-maps
+codegen: a per-invocation prologue **frame-record** (innermost-RBP mirror) and a
+per-safepoint **sp-id store** plus the register-local flush + oop-map metadata. On
+call-heavy framework code (JUnit's `findAnnotation`/`executeRecursively`/Stream-lambda
+machinery, executed an enormous number of times) this per-call/per-safepoint tax is the
+~6× overhead. `5b8864a0` lands in the report's own suspected regression window
+(`0c904c04..3cc11e0c`), matching "the regression predates the annotation merge."
 
-## Root cause (confirmed)
+The precise maps are **correctness-load-bearing**: their per-safepoint register/local
+flush is what makes a register-resident GC root visible to the root scan (the A2/A3/A4
+family). So the overhead cannot simply be removed — the fix must make the *codegen*
+cheaper (or selective) while preserving that coverage.
 
-The whole overhead comes from JIT-compiling a handful of tiny, ultra-hot
-leaf/utility methods, then paying CratonVM's **conservative JIT-frame GC-root scan**
-for them. The mechanism is documented verbatim in
-`vm/src/jit/conservative_roots.rs` (search "WS1 (kafka JIT throughput)"):
+## Ruled out with data (do not re-investigate these)
 
-> `scan_active_jit_frames` runs on **every object-returning native call** (via
-> `update_root_snapshot`). For a conservative chain entry it scans the band
-> `[scanner_sp, entry_sp]` word-by-word. When a compiled frame sits low on a deep
-> interpreter stack (e.g. a compiled JUnit lambda that transitively runs the test
-> plan), that band spans the entire interpreter recursion above it, so every native
-> call pays an **O(megabytes)** stack scan. *"This was the dominant mechanism behind
-> 'JIT-on is slower than the interpreter' on call-heavy suites."*
+- **`reflectionData()` caching (the report's hypothesis).** REFUTED. A `getDeclaredMethods()`
+  ×500 microbench fires the backing native **exactly once** (the JDK SoftReference cache
+  sticks). During the real run the declared-member natives fire **~49× total in 75 s** and
+  the class/method annotation natives fire **zero** times in 40 s.
+- **The conservative JIT-frame scan / `scan_active_jit_frames`.** RULED OUT. With
+  `CRATONVM_DBG_SCAN_TIMING` the scan's miss-path counter **never reached 500 k calls** —
+  the JIT entry chain is *mostly empty* (`chain_len == 0` early-return), so the scan barely
+  runs. Coalescing the per-entry backstop band scans, the WS1 scan cache
+  (`CRATONVM_NO_JIT_SCAN_CACHE`), and an sp-id active-map scan all changed wall time only
+  within box noise. The band size is identical precise-on vs precise-off, so the scan cannot
+  explain the 18 s→105 s gap. (This corrects an earlier draft of this doc that blamed the
+  scan and proposed precise-maps "Stage B" backstop suppression — that is NOT the cost.)
+- **JIT compile *time* / churn.** RULED OUT. Fewer than ~200 methods compile, no recompile
+  churn; `CRATONVM_DBG_COMPILE_*` thresholds were never hit. The cost is **runtime execution
+  of the precise-codegen'd methods**, not building them.
+- **Inline vs CALL frame-record.** `CRATONVM_NO_PRECISE_INLINE_FRAME_RECORD` changed wall
+  time only within noise — the inline-vs-CALL choice is not the dominant term.
+- **`CRATONVM_PRECISE_JIT_MAPS` env (note).** This var is **read nowhere** (a no-op); an
+  earlier "91 s with it on" reading was box noise. The live gate is the opt-out
+  `CRATONVM_NO_PRECISE_JIT_MAPS`.
 
-The conservative path is taken because **precise oop maps are not emitted during
-codegen by default** (`JitEntryGuard::enter_with_compiled`,
-`conservative_roots.rs:540` — `if !cm.has_precise_oop_maps() { return Self::enter() }`).
+## The fix (precise-maps codegen — owned by the precise-maps work, not contained)
 
-### The 13 methods that compile (and cause it)
+Make precise maps cheap or selective without losing the A2/A3/A4 register-root coverage:
 
-`org/junit/platform/commons/util/ReflectionUtils.{lambda$findAllFieldsInHierarchy$0,
-defaultMethodSorter}`, `org/junit/platform/commons/util/Preconditions.{notNull,
-condition,lambda$containsNoNullElements$2}`,
-`org/junit/jupiter/engine/extension/MutableExtensionRegistry.lambda$stream$0`,
-`java/util/regex/Pattern.lambda$DOT$0`, `java/util/Objects.requireNonNull`,
-`java/lang/Integer.compare`, `java/lang/Class.cast`,
-`java/lang/Character.{isHighSurrogate,codePointAt,charCount}`,
-`java/lang/Enum.valueOf`.
+1. **Cut the per-call/per-safepoint cost.** The frame-record + sp-id + per-safepoint flush
+   run on every invocation/call-site of hot methods. Options: an RBP-chain *walk at GC time*
+   instead of an eager per-invocation frame-record; emit the per-safepoint flush only for
+   safepoints that actually have a live register-resident oop; coalesce/cheapen the sp-id
+   store.
+2. **Selective emission.** Only emit precise codegen for methods that can actually hold a
+   register-resident GC root across a safepoint (the A2/A3/A4 shape), leaving call-heavy
+   framework glue on the cheaper conservative path. Needs a sound "can this method's roots be
+   register-resident across a call" predicate.
+3. **Until then:** the only lever is the global opt-out `CRATONVM_NO_PRECISE_JIT_MAPS=1`
+   (6× faster) — unsafe as a default because it reintroduces the A2/A3/A4 GC-root corruption.
 
-Forcing all 13 to skip the JIT (`CRATONVM_JIT_BISECT_SKIP=…`) drops the run from
-**140 s → 25 s** — proving these compiled frames are the entire cost.
-
-## Why the obvious mitigations don't generalise
-
-- **A bytecode-size gate cannot separate culprits from genuinely-hot methods.**
-  `Objects.requireNonNull` is 32 bytecodes and `Character.codePointAt` is 49 —
-  *larger* than `fib` (16). A size gate that excludes them also excludes `fib`,
-  which **needs** compilation (`fib` benefits because it is called tens of millions
-  of times and recurses JIT→JIT, so its interpreter→JIT transition is paid once).
-- **Raising the invocation threshold** to ~50000 fixes ClassUtilsTests (the leaves
-  are called 10 k–50 k times here, so they stop crossing it) but is a band-aid: a
-  longer/larger test class pushes the same leaves past any fixed threshold, and a
-  high default starves legitimately-hot medium methods of compilation.
-- **`fib` is the adversarial case**: tiny, no loop, recursive, and *benefits* from
-  JIT — so neither size nor "has-no-loop" nor "is-a-leaf" cleanly distinguishes the
-  regressive methods. The true distinguisher is *caller context* (called
-  predominantly from the interpreter, on a deep call-heavy stack), which is not
-  known at compile time without profiling.
-
-## Why "emit oop maps for the leaf methods" does NOT work (investigated 2026-06-23)
-
-Three measured facts kill the leaf-map idea:
-
-1. **Leaves are not the expensive frames.** Splitting the 13 and skipping only the
-   pure leaves (`Integer.compare`, `Character.*`, …) leaves the run at 138 s (≈
-   default); skipping only the methods-*with-calls*/lambdas drops it to 96 s. A leaf
-   has no callee subtree below it, so its conservative band is tiny — cheap. The
-   expensive frames are the call-wrapping lambdas whose band spans a big interpreted
-   subtree.
-2. **Precise maps are already emitted, and don't avoid the band scan.**
-   `scan_one_frame_precise` (`conservative_roots.rs:1472-1485`) scans the mapped
-   slots **and then STILL runs the full conservative backstop**
-   `scan_one_frame(scanner_sp, info.frame_base)`. That backstop band scan is the
-   actual O(stack-band) cost; precision is purely additive on top of it.
-3. **No frame is `fully_oop_covered`, and the band covers callee oops.** Running the
-   repro under `CRATONVM_PRECISE_COVERAGE_PIN=1 CRATONVM_DBG_VERIFY_OOP_MAPS=1` shows
-   **64/64 precise frames `covered=false`**, and the unmapped in-band oops sit at
-   deep offsets the oracle flags as *nested-JIT-callee slots*. So the backstop is
-   load-bearing: it covers real roots in callees / unpinned native Rust locals that
-   the frame's own maps cannot describe.
-
-The codegen scaffolding for the fix exists (`CompiledMethod.fully_oop_covered`,
-x64.rs:24277-24296) but is **inert by default** (`sp_id_slot_off == 0` →
-`fully_oop_covered` is always false), and per its own comment the backstop may be
-suppressed only once the runtime `CRATONVM_DBG_VERIFY_OOP_MAPS` oracle *proves*
-coverage — i.e. it needs whole-stack precise coverage, not a per-leaf map. A naive
-backstop-skip would drop the callee/native-local roots → heap corruption.
-
-## The real fix (deep / cross-cutting — handoff)
-
-The fix is **precise-maps "Stage B": let `scan_one_frame_precise` skip the
-conservative backstop band scan for a `fully_oop_covered` frame** (the exact lever
-named in x64.rs:24283-24289). That requires, in order:
-
-1. **Full safepoint coverage + the precise inline gate** so methods actually become
-   `fully_oop_covered` at runtime (today 0 % are). Needs `sp_id_slot_off != 0`,
-   every `safepoint_pcs` mapped, no inlined-callee safepoints.
-2. **Whole-stack coverage (the callee/native-local roots).** The backstop band also
-   covers oops in nested callees and unpinned native Rust locals (proven by the
-   VERIFY oracle above). Suppressing it is sound only when those are rooted some
-   other way — every JIT callee precise+covered, and every allocating native pinning
-   via `pin_native_root`.
-3. **The runtime `CRATONVM_DBG_VERIFY_OOP_MAPS` oracle as the gate** before flipping
-   backstop-suppression on, per the staged-rollout design.
-
-This is the keystone of the in-flight precise-maps work
-([[precise-maps-inline-frame-record-steps12]]) and is the same root cause as
-[[springrepos-extension-hang-jit-throughput-and-deep-recursion]]; it is **not** a
-per-leaf map and **not** a contained single-session change.
-
-### (superseded note) earlier framing
-The keystone is precise oop maps emitted during codegen — but emission is *already*
-default-on, and on its own it does **not** help because the backstop band scan still
-runs (see "Why ... does NOT work" above). The actionable missing piece is the
-backstop suppression (Stage B), not the emission. `CRATONVM_PRECISE_JIT_MAPS` is a
-no-op (read nowhere).
-   Today it is default-off and only ~26 % effective here (91 s), suggesting maps are
-   not yet emitted for these method shapes (lambdas / tiny leaves). Closing that gap
-   should bring this workload to ≈ nojit.
-2. **Or** bound the conservative band to the compiled frame's own size rather than
-   `[scanner_sp, entry_sp]` — but that is exactly the GC-soundness tradeoff the WS1
-   cache documents (the band covers interpreted callees that may hold the only live
-   root), so it needs care.
-
-This is the same root cause as [[springrepos-extension-hang-jit-throughput-and-deep-recursion]]
-and the WS1 kafka-throughput note; fixing precise maps fixes all three.
-
-## Verified NOT fixed by precise maps as landed (dev `814158ae`, 2026-06-23)
-
-Precise-map **emission is already default-on** (`x64::precise_jit_maps_enabled()` =
-opt-out `CRATONVM_NO_PRECISE_JIT_MAPS`; Steps 1–8 are in dev history). The
-`CRATONVM_PRECISE_JIT_MAPS` env var is **read nowhere** — an earlier "91s with it
-on" reading was run-to-run noise on this box, not the flag. Merging current dev and
-rebuilding did **not** fix BUG-01:
-
-| class | default (watchdog ON) | watchdog OFF | nojit |
-|---|---|---|---|
-| ClassUtilsTests | 112 s (barely under 120 s — fragile) | 105 s | 15 s |
-| ObjectUtilsTests | **rc=127, aborts at 120 s (still hangs)** | 127 s (`found=140 succ=140`, all pass) | — |
-
-`ObjectUtilsTests` has **no** separate correctness bugs (140/140 pass with the
-watchdog off) — it is *purely* the throughput hang, and it still overshoots the
-watchdog with precise maps on. **Why precise maps don't help here:**
-`emit_oop_map_for_safepoint` only fires at **safepoints (call sites)**, so a pure
-leaf method with no calls (`Integer.compare`, `Character.charCount`, …) emits **no**
-oop maps → `has_precise_oop_maps()==false` → it still falls to the conservative
-band scan. Closing the gap needs oop-map coverage (or a cheap entry-frame bound)
-for the leaf/lambda shapes that compile on these workloads — still the open fix.
+This is the precise-maps keystone ([[precise-maps-inline-frame-record-steps12]]); memory
+flags that codegen as owned by concurrent sessions. Same throughput family as
+[[springrepos-extension-hang-jit-throughput-and-deep-recursion]].
 
 ## Repro
 
 ```bash
-cd /c/craton/CratonVM-refldata/spring-suite   # or reuse CratonVM-springsuite0622/spring-suite
-# default watchdog ON → reproduces the "hang" (aborts at 120 s):
-VM=.../target/release/cratonvm-bug01.exe
-"$VM" --java-home "$JDK25" "@/tmp/af_sc.txt" KRun org.springframework.util.ClassUtilsTests
-# completes in ~20 s and proves it is not a hang:
-CRATONVM_DISABLE_JIT=1 CRATONVM_DISABLE_DEFAULT_WATCHDOG=1 "$VM" ... KRun org.springframework.util.ClassUtilsTests
-# isolates the cost to the 13 compiled methods (~25 s):
-CRATONVM_JIT_BISECT_SKIP="java/lang/Integer.compare,java/util/Objects.requireNonNull,..." "$VM" ...
+cd /c/craton/CratonVM-refldata
+VM=./target/release/cratonvm.exe   # any default (precise-maps-on) build
+CPF=/c/craton/cratonvm/apps/spring-framework/spring-core/build/cratonvm-testcp.txt
+KRUN=/c/craton/CratonVM-springsuite0622/spring-suite
+AF=/tmp/af.txt; { echo -cp; echo "$(cygpath -m $KRUN);$(tr -d '\r' < $CPF)"; } > $AF
+# precise on (default) — overshoots the 120s watchdog:
+"$VM" --java-home "<jdk25>" --stack-dump-on-timeout 50 "@$(cygpath -m $AF)" KRun org.springframework.util.ObjectUtilsTests
+# precise off — ~18s, ≈ nojit (BUT reintroduces A2/A3/A4 GC-root corruption risk):
+CRATONVM_NO_PRECISE_JIT_MAPS=1 CRATONVM_DISABLE_DEFAULT_WATCHDOG=1 "$VM" --java-home "<jdk25>" "@$(cygpath -m $AF)" KRun org.springframework.util.ObjectUtilsTests
 ```
