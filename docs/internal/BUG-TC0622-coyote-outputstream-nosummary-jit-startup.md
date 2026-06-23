@@ -8,8 +8,51 @@
 > so the process is killed mid-run before JUnit prints a summary.
 
 **Status:** Non-blocking tests PASS (no defect). Root cause = general
-JIT-startup-throughput ("the throughput wall"), which is a separate, deep
-JIT-perf effort. **Date:** 2026-06-23.
+JIT-startup-throughput ("the throughput wall"). **Date:** 2026-06-23.
+
+## RESOLUTION (2026-06-23) — profiled and the dominant cost FIXED
+
+A native sampling profile (samply/ETW, full-debuginfo `profsym` build, CPU-time
+weighted) of `tomcat.start()` localized the cost to **one function consuming
+~66% of all CPU**: `cratonvm_jit::lookup_jit_code_range`.
+
+Chain: `update_root_snapshot` (per native call) → `scan_active_jit_frames` →
+once any method compiles (`jit_code_range_count() > 0`; precise maps default-on)
+→ `native_stack_has_jit_frame` scans up to ~1M native-stack words, and **each
+word locked a global `std::sync::Mutex` + linear-scanned the range Vec** via
+`lookup_jit_code_range`. JIT-gated → `--nojit` never registers ranges → ~5×
+faster. This is also why neither the counter-sharding nor the high-threshold
+experiments helped: the cost was the per-word Mutex in the GC root scan, not the
+counters or compiles.
+
+**Fix** (branch `fix/jit-startup-rangescan`, commit e601c4ba): snapshot the
+small disjoint range set ONCE per scan into a reusable thread-local buffer (one
+lock, released before the word loop) and binary-search each word lock-free —
+behavior-identical. Opt-out `CRATONVM_JIT_RANGE_SCAN_LEGACY=1`.
+
+Measured: `start()` ~48s → ~22s (~11s on one profiled run); re-profile shows the
+function fell from 66% → ~25% self-time and total CPU dropped ~62%. bt16
+GC-stress = 14985902 (==HotSpot) on both paths.
+
+**Remaining follow-up:** after the Mutex removal, `native_stack_has_jit_frame`
+is still ~25% self-time — now the *raw* per-native-call scan of the whole stack
+band (up to 8 MB read per call). Reducing that means scanning less often / less
+of the band, which is GC-correctness-sensitive (it's the A5 unregistered-frame
+net), so it's a separate, gated change. Even so, 13 × ~22s still exceeds the
+180s/class harness timeout, so the suite should also bump `-TimeoutSec` for
+heavy-startup classes.
+
+## Tooling note (no admin / cross-thread)
+
+ETW kernel sampling normally needs admin; this account could run `samply record`
+non-elevated. CratonVM's cross-thread `Thread.getStackTrace()` returns empty for
+a running thread, so a Java-level in-process sampler does NOT work — use the
+native profiler. `samply --unstable-presymbolicate` only resolved PUBLIC symbols
+(needs `debug = 2`, not `line-tables-only`); the `[profile.profsym]` profile
+(full debuginfo) plus a tiny `pdb-addr2line` RVA→name tool
+(`apps/tomcat/.tooling/pdbresolve`) gave real Rust names. The libffi-sys
+"Pre-process ASM" fresh-build panic needs the `$env:INCLUDE` libffi-dirs fix
+before vcvars (see reference_libffi_sys_build_fix).
 
 ## Evidence
 
