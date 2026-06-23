@@ -960,17 +960,11 @@ pub fn descriptor_from_module_attribute(
         _ => return None,
     };
 
-    let name = cp.get_utf8(*name_index)?.to_string();
-
-    let version = if *version_index != 0 {
-        cp.get_utf8(*version_index).map(|s| s.to_string())
-    } else {
-        None
-    };
-
-    let is_open = (flags & ACC_MODULE_OPEN) != 0;
-
-    // Helper: resolve a CONSTANT_Module or CONSTANT_Package entry's name
+    // Helper: resolve a CONSTANT_Module or CONSTANT_Package entry's name.
+    // The Module attribute references modules and packages through
+    // CONSTANT_Module_info / CONSTANT_Package_info indirections (JVMS §4.7.25),
+    // NOT direct Utf8 — so every index here must go through this resolver,
+    // including `module_name_index` itself.
     let resolve_name = |idx: u16| -> Option<String> {
         match cp.get(idx) {
             Some(ConstantPoolEntry::Module { name_index }) => {
@@ -984,6 +978,22 @@ pub fn descriptor_from_module_attribute(
             _ => None,
         }
     };
+
+    // `module_name_index` points to a CONSTANT_Module_info, NOT a Utf8 — the
+    // previous `cp.get_utf8(*name_index)` returned None for every real
+    // module-info, so the eager boot-module scan registered ZERO modules (the
+    // whole module graph fell back to a single synthetic java.base entry, and
+    // module-declared service providers like jdk.compiler's
+    // `provides javax.tools.JavaCompiler` were invisible to ServiceLoader).
+    let name = resolve_name(*name_index)?;
+
+    let version = if *version_index != 0 {
+        cp.get_utf8(*version_index).map(|s| s.to_string())
+    } else {
+        None
+    };
+
+    let is_open = (flags & ACC_MODULE_OPEN) != 0;
 
     let requires: Vec<ModuleRequiresEntry> = requires_raw
         .iter()

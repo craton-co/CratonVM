@@ -1,5 +1,16 @@
 # HIB-CV-29 — Java deserialization fails: `StreamCorruptedException: List implementation not in base module`
 
+> **✅ FIXED + ROOT-CAUSED (2026-06-23).** The original premise below is **wrong**:
+> the message is **NOT** CratonVM-internal — it is a **real JDK guard** in
+> `java.lang.Throwable.validateSuppressedExceptionsList`
+> (`!Object.class.getModule().equals(list.getClass().getModule())`). The real bug
+> was that CratonVM's `Class.getModule()` allocated a **fresh `java.lang.Module`
+> per call**, so two `java.base` classes never compared `equals`. Fixed by
+> returning a **canonical `Module` per module name**. Full write-up + verification:
+> [internal doc](../../internal/h2-suite-bugs/run-20260622/HIB-CV-29-getmodule-identity-deserialize-list.md).
+> The "grep for the literal string" guidance below does not apply — the string is
+> in the JDK's `Throwable.class`, not CratonVM source.
+
 **Run:** full Hibernate ORM suite, 2026-06-22/23
 **Binary:** `cvhibtest.exe` (dev `c863b23e`)
 **Severity:** High — breaks `ObjectInputStream` round-trip of common objects; **deterministic, `--nojit`**, HotSpot PASS

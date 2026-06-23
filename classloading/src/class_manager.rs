@@ -1461,13 +1461,30 @@ impl ClassManager {
 
         // Eagerly scan all classpath entries for module-info.class files
         // (N1: module graph resolution + N4: boot module loading).
-        for class_path in [
-            bootstrap.class_path(),
-            extension.class_path(),
-            application.class_path(),
-        ] {
-            for bytes in class_path.scan_module_infos() {
-                Self::try_register_module_info(&mut module_registry, &bytes);
+        // Opt-out safety net: `CRATONVM_BOOT_MODULE_REGISTRY=0` skips the eager
+        // boot/ext/app module-info registration, leaving the registry empty (the
+        // historic behaviour, in which the module-info parser was broken and
+        // registered nothing — see `descriptor_from_module_attribute`). That
+        // restores the fully-permissive classpath-only mode where every
+        // `module_registry.is_empty()`-gated access check short-circuits to
+        // "allow", in case populating real module metadata regresses an app that
+        // relied on CratonVM not enforcing JPMS. Default-on: register modules so
+        // service-provider discovery (`ServiceLoader` via module `provides`,
+        // e.g. ToolProvider.getSystemJavaCompiler) and module labelling match
+        // the real JDK.
+        let register_modules = !matches!(
+            std::env::var("CRATONVM_BOOT_MODULE_REGISTRY").as_deref(),
+            Ok("0") | Ok("false") | Ok("no")
+        );
+        if register_modules {
+            for class_path in [
+                bootstrap.class_path(),
+                extension.class_path(),
+                application.class_path(),
+            ] {
+                for bytes in class_path.scan_module_infos() {
+                    Self::try_register_module_info(&mut module_registry, &bytes);
+                }
             }
         }
 
@@ -1511,6 +1528,7 @@ impl ClassManager {
     /// Parse a `module-info.class` byte array and register the contained
     /// module descriptor in `registry`.  Silently ignores parse failures.
     fn try_register_module_info(registry: &mut ModuleRegistry, bytes: &[u8]) {
+        let diag_mp = std::env::var("CRATONVM_DBG_MODPROV").is_ok();
         let mut class_file = match cratonvm_reader::read_class(bytes) {
             Ok(cf) => cf,
             Err(e) => {

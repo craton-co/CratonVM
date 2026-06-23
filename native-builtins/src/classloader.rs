@@ -888,6 +888,25 @@ fn cl_load_class_base_delegation(
     let dotted = ctx.read_string(name_obj).unwrap_or_default();
     let internal = dotted.replace('.', "/");
 
+    // HIB-CV-24 / SBR-14 — honor a supplied child/isolated `ClassLoader`.
+    //
+    // CratonVM stands in for `ClassLoader.loadClass` with this native (it keeps no
+    // JDK bytecode for it). The steps below resolve a class through CratonVM's
+    // flat global store (`ensure_class_initialized`) BEFORE reaching the
+    // `findClass` override (step 4). For a custom loader whose parent is the
+    // bootstrap loader (e.g. Hibernate's `AggregatedClassLoader`, which is
+    // `super(null)` and overrides `findClass` to iterate scoped child loaders),
+    // that global pre-resolution acts like the application loader and bypasses the
+    // supplied loader entirely (JVMS §5.3: a bootstrap parent cannot load an
+    // application class, so `findClass` MUST run). When the receiver overrides
+    // `findClass` and the requested class is NOT a bootstrap/platform class, defer
+    // every global short-circuit to AFTER `findClass`. Built-in loaders and
+    // bootstrap classes keep the permissive global path (CratonVM has no separate
+    // bootstrap classpath). Opt-out: `CRATONVM_CL_BOOTSTRAP_SCOPED=0`.
+    let defer_to_find_class = cl_bootstrap_scoped()
+        && !is_bootstrap_class_name(&internal)
+        && receiver_overrides_find_class(ctx, this);
+
     // JVM spec §5.3.2 — parent-first delegation:
     // 1. Check if this loader already loaded the class (findLoadedClass)
     let loader_type = match ctx.get_field(this, CL_LOADER_TYPE) {
@@ -928,14 +947,14 @@ fn cl_load_class_base_delegation(
             }
         }
         // For built-in parent loaders (bootstrap/platform/app), use standard delegation
-        if parent_type != LOADER_CUSTOM {
+        if parent_type != LOADER_CUSTOM && !defer_to_find_class {
             // Standard delegation handles bootstrap → extension → app
             if let Ok(cid) = ctx.ensure_class_initialized(&internal) {
                 let mirror = ctx.get_class_mirror(cid);
                 return Ok(Some(Value::Object(Some(mirror))));
             }
         }
-    } else {
+    } else if !defer_to_find_class {
         // No parent (or null parent) → delegate directly to bootstrap loader
         // Bootstrap delegation: use the standard class loading chain
         if let Ok(cid) = ctx.ensure_class_initialized(&internal) {
@@ -945,10 +964,14 @@ fn cl_load_class_base_delegation(
     }
 
     // 3. Parent couldn't find it — fall back to standard loading
-    //    (this covers bootstrap → extension → application delegation)
-    if let Ok(cid) = ctx.ensure_class_initialized(&internal) {
-        let mirror = ctx.get_class_mirror(cid);
-        return Ok(Some(Value::Object(Some(mirror))));
+    //    (this covers bootstrap → extension → application delegation).
+    //    Skipped when deferring to a custom `findClass` override (HIB-CV-24) so
+    //    the supplied loader runs before CratonVM's global store answers.
+    if !defer_to_find_class {
+        if let Ok(cid) = ctx.ensure_class_initialized(&internal) {
+            let mirror = ctx.get_class_mirror(cid);
+            return Ok(Some(Value::Object(Some(mirror))));
+        }
     }
 
     // 4. Custom-classloader extension point. The JVM `ClassLoader.loadClass`
@@ -993,7 +1016,20 @@ fn cl_load_class_base_delegation(
         return Ok(Some(Value::Object(Some(mirror))));
     }
 
-    // 6. Not found and no user override — class genuinely missing.
+    // 6. Deferred-resolution last resort (HIB-CV-24). When `defer_to_find_class`
+    //    skipped the global short-circuits above and the loader's own `findClass`
+    //    did not produce the class, CratonVM's flat store is still the only source
+    //    of application classes — resolve here so a findClass-overriding loader
+    //    whose override legitimately misses (delegating the actual load elsewhere)
+    //    does not spuriously fail a class the runtime can provide.
+    if defer_to_find_class {
+        if let Ok(cid) = ctx.ensure_class_initialized(&internal) {
+            let mirror = ctx.get_class_mirror(cid);
+            return Ok(Some(Value::Object(Some(mirror))));
+        }
+    }
+
+    // 7. Not found and no user override — class genuinely missing.
     Ok(Some(Value::Object(None)))
 }
 

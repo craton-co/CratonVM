@@ -570,6 +570,23 @@ fn discover_providers(
         }
     }
 
+    // JPMS module `provides` declarations. The JDK declares service providers
+    // in module-info — e.g. jdk.compiler has
+    // `provides javax.tools.JavaCompiler with com.sun.tools.javac.api.JavacTool`
+    // — NOT in META-INF/services. Without this source,
+    // `ServiceLoader.load(JavaCompiler.class)` (the body of
+    // `ToolProvider.getSystemJavaCompiler()`) finds nothing and returns null,
+    // so the in-process javac is unavailable. `service_providers_from_modules`
+    // takes the service name in binary/slash form and returns provider impl
+    // names in slash form; normalise both to dot form to match the
+    // META-INF/services FQNs. Providers that fail to load/instantiate are
+    // skipped by the iterator, so a module-declared provider CratonVM cannot
+    // construct is harmless.
+    let service_slash = service_name.replace('.', "/");
+    for mp in ctx.service_providers_from_modules(&service_slash) {
+        providers.push(mp.replace('/', "."));
+    }
+
     providers.sort();
     providers.dedup();
     if matches!(

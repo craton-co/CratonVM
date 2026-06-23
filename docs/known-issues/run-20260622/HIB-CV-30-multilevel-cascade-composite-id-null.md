@@ -3,7 +3,13 @@
 **Run:** full Hibernate ORM suite, 2026-06-22/23
 **Binary:** `cvhibtest.exe` (dev `c863b23e`)
 **Severity:** Medium-High — data-correctness divergence; **deterministic, `--nojit`**, HotSpot PASS
-**Status:** Confirmed; exact failing assertion line not yet pinpointed
+**Status:** **ROOT-CAUSED 2026-06-23** — the original composite-key/cascade/reflection
+hypothesis below is **WRONG**. The real cause is a `java.util.List.of(...).hashCode()` defect
+that destabilises JUnit-6's `Namespace.hashCode()` → breaks `NamespacedHierarchicalStore` →
+breaks `@TestInstance(PER_CLASS)` EntityManagerFactory caching → 2nd test method queries a
+freshly-rebuilt empty schema → `find(...)` returns null. Full analysis + implemented Layer-2
+fix: [`docs/internal/h2-suite-bugs/run-20260622/HIB-CV-30-multilevel-cascade-composite-id-null.md`](../../internal/h2-suite-bugs/run-20260622/HIB-CV-30-multilevel-cascade-composite-id-null.md).
+The hypotheses in this file are retained only as the original (incorrect) triage.
 
 ---
 

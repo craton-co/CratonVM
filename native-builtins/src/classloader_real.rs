@@ -788,22 +788,61 @@ fn cl_real_load_class_base(
     let class_name = ctx.read_string(class_name_obj).unwrap_or_default();
     let internal = class_name.replace('.', "/");
 
-    // 1. Standard VM class loading.
-    if let Ok(Some(mirror)) = ctx.load_class(&internal) {
-        return Ok(Some(mirror));
+    // HIB-CV-24 / SBR-14 — honor a supplied child/isolated `ClassLoader`.
+    //
+    // Step 1 below (`ctx.load_class`) resolves through CratonVM's flat global
+    // store. For a custom loader whose parent is the bootstrap loader and which
+    // overrides `findClass` to load from its own source (Hibernate's
+    // `AggregatedClassLoader` — `super(null)`, iterates scoped child loaders;
+    // plugin / test-isolation loaders), that global pre-resolution acts like the
+    // application loader and answers the request before the loader's own
+    // `findClass` ever runs — so the supplied loader is bypassed and a class it
+    // would have defined (or counted) is served from the wrong loader (JVMS §5.3:
+    // a bootstrap parent cannot load an application class, so `findClass` MUST
+    // run). When the receiver overrides `findClass` and the requested class is
+    // not a bootstrap/platform class, defer global resolution to AFTER `findClass`.
+    // Built-in loaders and bootstrap classes keep the fast global path. Opt-out:
+    // `CRATONVM_CL_BOOTSTRAP_SCOPED=0`.
+    let overrides_find_class = crate::classloader::receiver_overrides_find_class(ctx, this);
+    let defer_to_find_class = overrides_find_class
+        && crate::classloader::cl_bootstrap_scoped()
+        && !crate::classloader::is_bootstrap_class_name(&internal);
+
+    // 1. Standard VM class loading (skipped when deferring to a custom findClass).
+    if !defer_to_find_class {
+        if let Ok(Some(mirror)) = ctx.load_class(&internal) {
+            return Ok(Some(mirror));
+        }
     }
 
     // 2. Custom-classloader extension point: if the receiver overrides
     //    `findClass`, the JVM `loadClass` contract requires us to call it.
     //    `invoke_virtual` resolves on the receiver's actual class, so this
     //    dispatches to the subclass's overriding `findClass` bytecode.
-    if crate::classloader::receiver_overrides_find_class(ctx, this) {
-        return ctx.invoke_virtual(
+    if overrides_find_class {
+        let result = ctx.invoke_virtual(
             this,
             "findClass",
             "(Ljava/lang/String;)Ljava/lang/Class;",
             &[Value::Object(Some(class_name_obj))],
         );
+        match result {
+            // findClass produced the class — that is the answer.
+            Ok(Some(Value::Object(Some(_)))) => return result,
+            // In the deferred case, findClass missing/throwing falls through to
+            // the global store as the last resort (below). Otherwise propagate.
+            _ if !defer_to_find_class => return result,
+            _ => {}
+        }
+    }
+
+    // 2b. Deferred-resolution last resort (HIB-CV-24): CratonVM's flat store is
+    //     the only source of application classes, so a findClass-overriding loader
+    //     whose override legitimately misses still resolves here.
+    if defer_to_find_class {
+        if let Ok(Some(mirror)) = ctx.load_class(&internal) {
+            return Ok(Some(mirror));
+        }
     }
 
     // 3. Genuinely not found and no user override — throw CNFE per spec.

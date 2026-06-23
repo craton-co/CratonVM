@@ -28170,6 +28170,35 @@ fn native_unmod_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
 }
 
 fn native_unmod_hash_code(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // HIB-CV-30: for a List-shaped immutable wrapper (e.g. `List.of(..)` →
+    // `cratonvm/internal/UnmodifiableList` over a synthetic ArrayList backing),
+    // compute the `List.hashCode()` contract directly over the backing's
+    // element array instead of delegating to `invoke_virtual(backing,
+    // "hashCode")`. That delegation re-enters real `AbstractList.hashCode`
+    // bytecode, which — when it hashes a GC-relocated element whose class does
+    // not override `hashCode` — reads an unstable identity hash for that
+    // element (0, then 1, ... per GC cycle) rather than the header value. The
+    // canonical victim is JUnit 6's `Namespace.hashCode()` over
+    // `List.of(extensionClassName, testInstance)`: the drift silently breaks
+    // `NamespacedHierarchicalStore` lookups, which (via `@TestInstance(PER_CLASS)`)
+    // makes Hibernate rebuild the EntityManagerFactory between test methods —
+    // surfacing as "a cascaded association is null". `native_al_hash_code`
+    // reads each element fresh from the backing array and hashes it immediately,
+    // so it does not hold a stale element ref across an allocation/GC.
+    if let Some(Value::Object(Some(this))) = args.first() {
+        if let Some(backing) = unmod_backing(ctx, *this) {
+            // Only redirect for ordered list backings; Set/Map wrappers use the
+            // unordered contract and must keep delegating.
+            let bcid = ctx.class_id_of_object(backing);
+            let is_list = ctx
+                .class_name_of_id(bcid)
+                .map(|n| n == "java/util/ArrayList" || n == "java/util/LinkedList")
+                .unwrap_or(false);
+            if is_list {
+                return native_al_hash_code(ctx, &[Value::Object(Some(backing))]);
+            }
+        }
+    }
     unmod_delegate(ctx, args, "hashCode", "()I")
 }
 

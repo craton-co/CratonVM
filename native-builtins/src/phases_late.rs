@@ -19011,9 +19011,14 @@ pub(crate) fn register_p59_module(r: &mut NativeMethodRegistry) {
             // Canonical Module per module name: the JDK compares Modules by
             // identity, so every class in a module must observe the SAME Module
             // instance. Mirror of the real-JDK getModule in lib.rs (HIB-CV-29).
+            // Read the module of the class the mirror REFLECTS via
+            // `class_id_from_mirror` — `class_id_of_object` would return
+            // `java/lang/Class` and mis-report every class as java.base.
             let module_name: Option<String> = if let Some(Value::Object(Some(mirror))) = args.first()
             {
-                let class_id = ctx.class_id_of_object(*mirror);
+                let class_id = ctx
+                    .class_id_from_mirror(*mirror)
+                    .unwrap_or_else(|| ctx.class_id_of_object(*mirror));
                 ctx.module_name_of_class(class_id)
             } else {
                 None
@@ -19033,7 +19038,12 @@ pub(crate) fn register_p59_module(r: &mut NativeMethodRegistry) {
                 .map(|name| Value::Object(Some(ctx.create_string(name))))
                 .unwrap_or(Value::Object(None));
             let m_obj = ctx.read_native_pin(pin, m_obj);
+            // Dual-write: slot 0 = synthetic-Module contract; named `name` field =
+            // what real `Module.isNamed()`/`getName()` bytecode reads (slot 0 is
+            // `layer` in the real layout). `set_field_by_name` no-ops if absent.
+            // See companion in lib.rs getModule (HIB-CV-29 isNamed follow-up).
             ctx.set_field(m_obj, 0, module_name_val);
+            ctx.set_field_by_name(m_obj, "name", module_name_val);
             ctx.unpin_native_roots(pin);
             ctx.cache_module_mirror(module_name.as_deref(), m_obj);
             Ok(Some(Value::Object(Some(m_obj))))

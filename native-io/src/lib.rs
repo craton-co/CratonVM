@@ -6632,39 +6632,56 @@ fn register_string_rw_natives(registry: &mut NativeMethodRegistry) {
         });
     }
 
-    let sw = "java/io/StringWriter";
-    registry.register(sw, "<init>", "()V", native_sw_init);
-    registry.register(sw, "<init>", "(I)V", native_sw_init_cap);
-    registry.register(sw, "write", "(I)V", native_sw_write_int);
-    registry.register(sw, "write", "(Ljava/lang/String;)V", native_sw_write_string);
-    registry.register(sw, "write", "([CII)V", native_sw_write_chars);
-    registry.register(
-        sw,
-        "write",
-        "(Ljava/lang/String;II)V",
-        native_sw_write_string_off,
-    );
-    registry.register(sw, "toString", "()Ljava/lang/String;", native_sw_to_string);
-    registry.register(
-        sw,
-        "getBuffer",
-        "()Ljava/lang/StringBuffer;",
-        native_sw_get_buffer,
-    );
-    registry.register(sw, "flush", "()V", native_noop_void);
-    registry.register(sw, "close", "()V", native_noop_void);
-    registry.register(
-        sw,
-        "append",
-        "(C)Ljava/io/StringWriter;",
-        native_sw_append_char,
-    );
-    registry.register(
-        sw,
-        "append",
-        "(Ljava/lang/CharSequence;)Ljava/io/StringWriter;",
-        native_sw_append_cs,
-    );
+    // HIB-CV-25b sibling: the synthetic StringWriter natives below model the
+    // writer as a `char[] buf` (slot 0) + `int count` (slot 1). The REAL JDK
+    // layout is `Writer.lock` (slot 0, Object) + `StringWriter.buf`
+    // (slot 1, StringBuffer) — so the synthetic state squats two real,
+    // reference-typed fields: a subclass reading the inherited `this.lock` saw
+    // a `char[]`/`int[]` instead of the JDK's `lock == buf` StringBuffer, and a
+    // moving GC could fail to trace a `char[]` parked in the (primitive-context)
+    // mislabelled slot. Real StringWriter bytecode is self-contained (it just
+    // delegates to a real `StringBuffer`, which works on CratonVM), so — exactly
+    // like the StringReader migration above — keep the synthetic natives under
+    // `synthetic-jdk` only and let the real bytecode run by default. This also
+    // retires the base-class `Writer.write(I)V` → `native_sw_write_int`
+    // registration (below), which applied the StringWriter layout to EVERY
+    // Writer subclass (same base-class hazard the Reader.read migration fixed).
+    #[cfg(feature = "synthetic-jdk")]
+    {
+        let sw = "java/io/StringWriter";
+        registry.register(sw, "<init>", "()V", native_sw_init);
+        registry.register(sw, "<init>", "(I)V", native_sw_init_cap);
+        registry.register(sw, "write", "(I)V", native_sw_write_int);
+        registry.register(sw, "write", "(Ljava/lang/String;)V", native_sw_write_string);
+        registry.register(sw, "write", "([CII)V", native_sw_write_chars);
+        registry.register(
+            sw,
+            "write",
+            "(Ljava/lang/String;II)V",
+            native_sw_write_string_off,
+        );
+        registry.register(sw, "toString", "()Ljava/lang/String;", native_sw_to_string);
+        registry.register(
+            sw,
+            "getBuffer",
+            "()Ljava/lang/StringBuffer;",
+            native_sw_get_buffer,
+        );
+        registry.register(sw, "flush", "()V", native_noop_void);
+        registry.register(sw, "close", "()V", native_noop_void);
+        registry.register(
+            sw,
+            "append",
+            "(C)Ljava/io/StringWriter;",
+            native_sw_append_char,
+        );
+        registry.register(
+            sw,
+            "append",
+            "(Ljava/lang/CharSequence;)Ljava/io/StringWriter;",
+            native_sw_append_cs,
+        );
+    }
 
     // RDR-MIGRATION 2026-06-01: the blanket `java/io/Reader.read()I` native
     // (backed by `native_sr_read`, which assumes the synthetic StringReader
@@ -6688,6 +6705,13 @@ fn register_string_rw_natives(registry: &mut NativeMethodRegistry) {
             native_reader_read_charbuffer,
         );
     }
+    // `Writer.write(I)V` default is concrete JDK bytecode (`writeBuffer[0]=(char)c;
+    // write(writeBuffer,0,1)`) that delegates to the subclass `write([CII)`, so it
+    // runs correctly without a native. The synthetic `native_sw_write_int` here
+    // assumed the StringWriter `char[]`+`count` layout and so corrupted slot 0/1 of
+    // every OTHER Writer subclass — keep it under `synthetic-jdk` only (same
+    // base-class hazard the `Reader.read` migration above fixed).
+    #[cfg(feature = "synthetic-jdk")]
     registry.register("java/io/Writer", "write", "(I)V", native_sw_write_int);
     registry.register("java/io/Writer", "flush", "()V", native_noop_void);
     registry.register("java/io/Writer", "close", "()V", native_noop_void);
@@ -7118,7 +7142,18 @@ fn native_sw_append_cs(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
 
 const DIS_FIELD_IN: usize = 0;
 const DOS_FIELD_OUT: usize = 0;
-const DOS_FIELD_WRITTEN: usize = 1;
+// NOTE: `written` is NOT at a fixed low slot. The real JDK layout is
+// FilterOutputStream{out, closed, closeLock} then DataOutputStream{written, …},
+// so `written` lives at slot 3 — NOT slot 1 (which is `closed`). These natives
+// previously hardcoded slot 1: self-consistent for `size()` (native reader +
+// native writer used the same wrong slot), but a SUBCLASS reading the real
+// `written` via `getfield` (e.g. jboss-classfilewriter's
+// `ByteArrayDataOutputStream.writeSize()`, which records `this.written` as a
+// back-patch position) saw a stale 0 → it overwrote offset 0 of the buffer,
+// corrupting the class-file magic to `FF FF FF FC` and making Weld's
+// `Lookup.defineClass` reject every generated client proxy (`WELD-001524`).
+// Access `written` by NAME so the native and real bytecode agree on the slot.
+const DOS_WRITTEN_FIELD: &str = "written";
 
 fn register_data_stream_natives(registry: &mut NativeMethodRegistry) {
     let __prev_cat = registry.current_category();
@@ -7729,7 +7764,7 @@ fn native_dos_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         _ => return Ok(None),
     };
     ctx.set_field(this, DOS_FIELD_OUT, args[1]);
-    ctx.set_field(this, DOS_FIELD_WRITTEN, Value::Int(0));
+    ctx.set_field_by_name(this, DOS_WRITTEN_FIELD, Value::Int(0));
     Ok(None)
 }
 
@@ -7743,11 +7778,11 @@ fn dos_write_one(
         _ => return Ok(()),
     };
     ctx.invoke_virtual(inner, "write", "(I)V", &[Value::Int(b & 0xFF)])?;
-    let written = match ctx.get_field(this, DOS_FIELD_WRITTEN) {
+    let written = match ctx.get_field_by_name(this, DOS_WRITTEN_FIELD) {
         Value::Int(w) => w,
         _ => 0,
     };
-    ctx.set_field(this, DOS_FIELD_WRITTEN, Value::Int(written + 1));
+    ctx.set_field_by_name(this, DOS_WRITTEN_FIELD, Value::Int(written + 1));
     Ok(())
 }
 
@@ -7944,7 +7979,7 @@ fn native_dos_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let written = match ctx.get_field(this, DOS_FIELD_WRITTEN) {
+    let written = match ctx.get_field_by_name(this, DOS_WRITTEN_FIELD) {
         Value::Int(w) => w,
         _ => 0,
     };

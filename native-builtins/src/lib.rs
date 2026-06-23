@@ -3957,21 +3957,29 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         "getModule",
         "()Ljava/lang/Module;",
         |ctx, args| {
-            if std::env::var_os("CRATONVM_DBG_GETMODULE").is_some() {
-                eprintln!("[dbg-getmodule] lib.rs getModule native FIRED");
-            }
-            // Resolve the receiver class's module name FIRST so we can return the
-            // canonical (cached) Module instance for that module. The JDK compares
-            // Modules by identity (`Module` does not override `equals`), so every
-            // class in a module MUST observe the SAME Module object. Allocating a
-            // fresh Module per call broke `Throwable.validateSuppressedExceptionsList`
+            // Resolve the module name of the class the receiver mirror
+            // *represents* so we can return the canonical (cached) Module for
+            // that module. The JDK compares Modules by identity (`Module` does
+            // not override `equals`), so every class in a module MUST observe
+            // the SAME Module object. Allocating a fresh Module per call broke
+            // `Throwable.validateSuppressedExceptionsList`
             // (`Object.class.getModule() == deserList.getClass().getModule()`),
             // which throws `StreamCorruptedException("List implementation not in
             // base module.")` on any ObjectInputStream round-trip of an object
             // holding a java.util List — HIB-CV-29.
+            //
+            // CRITICAL: the receiver is a `java.lang.Class` *mirror*; its own
+            // object class is always `java/lang/Class` (java.base). We must read
+            // the module of the class it REFLECTS via `class_id_from_mirror`
+            // (the mirror→ClassId reverse map), NOT `class_id_of_object` (which
+            // would return `java/lang/Class` and report every class as java.base
+            // — the original defect). Fall back to the object class only if the
+            // reverse lookup misses (defensive; e.g. primitive mirrors).
             let module_name: Option<String> = if let Some(Value::Object(Some(mirror))) = args.first()
             {
-                let class_id = ctx.class_id_of_object(*mirror);
+                let class_id = ctx
+                    .class_id_from_mirror(*mirror)
+                    .unwrap_or_else(|| ctx.class_id_of_object(*mirror));
                 ctx.module_name_of_class(class_id)
             } else {
                 None
@@ -3998,7 +4006,17 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
                 .map(|name| Value::Object(Some(ctx.create_string(name))))
                 .unwrap_or(Value::Object(None));
             let m_obj = ctx.read_native_pin(pin, m_obj);
+            // Dual-write the name. Field index 0 is the synthetic 2-field Module
+            // contract (the `register_p59_module` getName/isNamed/toString natives
+            // read slot 0). But real `java.lang.Module.isNamed()`/`getName()`
+            // bytecode reads the named `name` field (slot 1 in the real layout —
+            // slot 0 is `layer`); without also writing it by name, real
+            // `isNamed()` reads the unset `name` field and reports a named
+            // platform module (e.g. java.base) as UNNAMED. `set_field_by_name`
+            // no-ops when the field is absent (synthetic shape), so this is safe
+            // in both modes.
             ctx.set_field(m_obj, 0, module_name_val);
+            ctx.set_field_by_name(m_obj, "name", module_name_val);
             ctx.unpin_native_roots(pin);
             // Publish as the canonical mirror for this module name so future
             // getModule() calls (and the JDK's identity comparisons) see the
@@ -9842,17 +9860,6 @@ fn register_annotation_overrides(registry: &mut NativeMethodRegistry) {
                 .find(|v| matches!(v, Value::Object(Some(_))))
                 .copied()
                 .unwrap_or(Value::Object(None));
-            if std::env::var_os("CRATONVM_DBG_NSFM").is_some() {
-                eprintln!("[NSFM] argc={}", args.len());
-                for (i, a) in args.iter().enumerate() {
-                    if let Value::Object(Some(o)) = a {
-                        let cn = ctx.class_name_of_id(ctx.class_id_of_object(*o)).unwrap_or_default();
-                        eprintln!("[NSFM]   arg[{}] = obj class={}", i, cn);
-                    } else {
-                        eprintln!("[NSFM]   arg[{}] = {:?}", i, a);
-                    }
-                }
-            }
             // The plain `HashSet` returned below uses value `hashCode`/`equals`,
             // which matches `HashMap`/`WeakHashMap`/`ConcurrentHashMap` backings
             // (all key-hash/equals based). But an `IdentityHashMap` backing must
@@ -19503,29 +19510,6 @@ fn native_classloader_find_bootstrap_class(
     };
     // Convert "java.lang.String" → "java/lang/String"
     let internal_name = name.replace('.', "/");
-
-    // HIB-CV-24 / SBR-14 — `findBootstrapClass` must answer ONLY for classes the
-    // bootstrap loader genuinely owns. The real `ClassLoader.loadClass` bytecode
-    // calls this for a null-parent loader BEFORE its own `findClass`; if we
-    // resolve an application class here, a custom child/isolated loader's
-    // `findClass` override (Hibernate `AggregatedClassLoader`, plugin loaders) is
-    // never invoked and the supplied loader is bypassed (JVMS §5.3). Scope the
-    // bootstrap lookup so a custom loader that overrides `findClass` gets `null`
-    // for non-bootstrap names and the bytecode proceeds to its override. Built-in
-    // loaders keep the permissive global resolution (CratonVM has no separate
-    // bootstrap classpath, so the app-loader path relies on it). Opt-out gate.
-    if crate::classloader::cl_bootstrap_scoped()
-        && !crate::classloader::is_bootstrap_class_name(&internal_name)
-    {
-        if let Some(Value::Object(Some(this))) = args.first() {
-            if crate::classloader::is_user_defined_loader(ctx, *this)
-                && crate::classloader::receiver_overrides_find_class(ctx, *this)
-            {
-                return Ok(Some(Value::Object(None)));
-            }
-        }
-    }
-
     // Try to load the class — load_class returns MethodCallResult
     // where Ok(Some(Value::Object(Some(obj)))) contains the class mirror
     match ctx.load_class(&internal_name) {
