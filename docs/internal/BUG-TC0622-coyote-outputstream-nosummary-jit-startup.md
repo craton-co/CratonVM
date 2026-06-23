@@ -34,13 +34,24 @@ Measured: `start()` ~48s → ~22s (~11s on one profiled run); re-profile shows t
 function fell from 66% → ~25% self-time and total CPU dropped ~62%. bt16
 GC-stress = 14985902 (==HotSpot) on both paths.
 
-**Remaining follow-up:** after the Mutex removal, `native_stack_has_jit_frame`
-is still ~25% self-time — now the *raw* per-native-call scan of the whole stack
-band (up to 8 MB read per call). Reducing that means scanning less often / less
-of the band, which is GC-correctness-sensitive (it's the A5 unregistered-frame
-net), so it's a separate, gated change. Even so, 13 × ~22s still exceeds the
-180s/class harness timeout, so the suite should also bump `-TimeoutSec` for
-heavy-startup classes.
+**Follow-up #1 (done — small safe win):** after the Mutex removal,
+`native_stack_has_jit_frame` was still ~25% self-time. Added an **address-envelope
+prefilter** (commit 21bfd096): JIT code occupies a narrow address band, so a
+stack word outside `[min_start, max_end)` is rejected with one compare before the
+binary search (strict superset → identical result). `start()` ~22s → ~20s,
+bt16==HotSpot. The gain is small because the residual is **memory-bandwidth-
+bound** — the raw per-native-call read of the stack band, not per-word compute.
+
+**Why it can't be cut further cheaply:** the per-native-call scan is
+load-bearing — the authoritative cross-thread-STW snapshot is rebuilt at the
+safepoint (`safepoint_check`, interpreter.rs:1880), so the per-call scans exist
+to cover threads that **block in native code before reaching a safepoint** (their
+last per-call snapshot is the only view the collector gets). Scanning less often
+/ less of the band risks dropping a live root for such a thread → the exact
+heap-corruption class this A5 net prevents. The clean elimination is **precise
+JIT stack maps** (so the conservative band scan is unnecessary) — a separate
+epic. Also: 13 × ~20s still exceeds the 180s/class harness timeout, so the suite
+should bump `-TimeoutSec` for heavy-startup classes regardless.
 
 ## Tooling note (no admin / cross-thread)
 
