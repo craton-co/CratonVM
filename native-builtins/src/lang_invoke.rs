@@ -3988,7 +3988,29 @@ pub(crate) fn alloc_method_handle(
     // failure paths in lookup_find_static_getter/setter, linkCallSite, etc.)
     // so JDK-internal `erasedType()` / `parameterSlotCount()` walks never
     // observe a null MethodType.
-    let mt_opt = build_method_type_from_descriptor(ctx, desc)
+    // The `type()` of an UNBOUND virtual/special method handle includes the
+    // receiver as its LEADING parameter, exactly as HotSpot does
+    // (`Lookup.unreflect`/`findVirtual` on `int m(Object)` -> type
+    // `(Recv,Object)int`, parameterCount 2). Our raw `desc` is the bytecode
+    // descriptor WITHOUT the receiver, so prepend `Lclass;` for the `type`
+    // field only. (MH_DESC — used by the invoke dispatch and the invokeExact
+    // arity check — stays the raw descriptor; the receiver comes from args[0]
+    // there.) Without this, `mh.type().parameterCount()` was one short, and
+    // Groovy's IndyInterface `Selector.correctCoerce` threw
+    // `GroovyBugError: argument array length and parameter array length should
+    // be the same` when dispatching any instance call (e.g. Gradle/Groovy
+    // SpringRepositoriesExtension). STATIC/CONSTRUCTOR/GETTER keep raw `desc`.
+    let recv_desc;
+    let type_desc: &str = if (kind == MH_KIND_VIRTUAL || kind == MH_KIND_SPECIAL)
+        && !class.is_empty()
+        && desc.starts_with('(')
+    {
+        recv_desc = format!("(L{};{}", class, &desc[1..]);
+        recv_desc.as_str()
+    } else {
+        desc
+    };
+    let mt_opt = build_method_type_from_descriptor(ctx, type_desc)
         .or_else(|| build_method_type_from_descriptor(ctx, "()V"));
     if let Some(mt) = mt_opt {
         ctx.set_field_by_name(mh, "type", Value::Object(Some(mt)));
@@ -5386,6 +5408,19 @@ pub fn register_t4_method_handle_invoke(r: &mut NativeMethodRegistry) {
                 _ => MH_KIND_VIRTUAL,
             };
             let new_mh = alloc_method_handle(ctx, &class, &name, &desc, kind);
+            // `bindTo` captures the LEADING argument, so the bound handle's
+            // `type()` must have that leading parameter REMOVED (HotSpot:
+            // `(Recv,Object)int`.bindTo(r) -> `(Object)int`). For virtual/special
+            // handles the leading param is the receiver that `alloc_method_handle`
+            // just prepended to `type`; reset `type` to the raw (receiver-less)
+            // descriptor so e.g. Groovy's indy `sameClasses` guard builds a
+            // classes[] of the right length (was AIOOBE: classes longer than the
+            // runtime args). STATIC-handle leading-arg drop is a separate path.
+            if kind == MH_KIND_VIRTUAL || kind == MH_KIND_SPECIAL {
+                if let Some(mt) = build_method_type_from_descriptor(ctx, &desc) {
+                    ctx.set_field_by_name(new_mh, "type", Value::Object(Some(mt)));
+                }
+            }
             if kind == MH_KIND_LAMBDA_FACTORY {
                 // A lambda factory may capture more than one value (e.g. log4j's
                 // `factory.bindTo(serviceType).bindTo(classLoader)`). The single-slot
