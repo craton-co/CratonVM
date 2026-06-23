@@ -92,24 +92,49 @@ set happened to behave correctly there. For an `IdentityHashMap` backing it
 silently switched identity semantics to value semantics, and the value hash on a
 `PersistentSet` has the side effect of initializing it.
 
-## Fix
+## Fix (two coordinated parts)
 
-`native-builtins/src/lib.rs`, the `Collections.newSetFromMap` native: when the
-backing map is a `java/util/IdentityHashMap`, build the **real**
+**1. `native-builtins/src/lib.rs` — the `Collections.newSetFromMap` native.**
+When the backing map is a `java/util/IdentityHashMap`, build the **real**
 `java/util/Collections$SetFromMap` wrapping the passed map (via
 `new_object_initialized`), so `add`/`contains` route through `IdentityHashMap`
 (reference identity), exactly like HotSpot. All other backings (Hash/Weak/
 Concurrent — value-hash) keep the existing synthetic `HashSet`, so the Spring/
-Felix workarounds are untouched. CratonVM's `Collections$SetFromMap` view-method
-interception (`native-collections/src/lib.rs`) already routes iterator/toArray/
-contains through the live backing map.
+Felix workarounds are untouched.
+- Trap fixed along the way: the original native read the backing map from
+  `args.get(1)`, but for this *static* method the argument is at `args[0]`
+  (`argc=1`). The original code never used `_map`, so the off-by-one was inert
+  until this fix needed the value. The native now picks the first `Object`
+  operand positionally.
+
+**2. `native-collections/src/lib.rs` — the `Collections$SetFromMap` view natives.**
+`newSetFromMap` previously *always* returned a synthetic `HashSet`, so a real
+`SetFromMap` was never created and these natives were dead. Part 1 resurrects
+them for the `IdentityHashMap` case, and they mis-read a real `IdentityHashMap`
+(its backing is a flat alternating key/value table, not CratonVM's synthetic
+`buckets/size/capacity` HashMap) — `iterator()`/`toArray()` returned garbage
+(`byte[]`, nulls) → `ClassCastException: SessionImpl cannot be cast to
+PersistentCollection` in Hibernate's `endLoading` loop. Fixed by routing
+`iterator`/`toArray`/`contains` through the **real backing map** via
+`invoke_virtual` (`m.keySet().iterator()`, `m.keySet().toArray()`,
+`m.containsKey(k)`) instead of the synthetic-layout `native_map_*` helpers.
+Only the (new) `IdentityHashMap`-backed `SetFromMap` path is affected.
 
 ## Verification
 
 - Minimal `IdHashProbe`: CratonVM `newSetFromMap(IdentityHashMap)` → hashCode/
   equals calls **0** (was 2), `IdentityHashMap.put` unchanged.
-- `EntityGraphBatchSizeTest`: both tests PASS; `batchedTags` now one
-  `IN (?,?,?)` query; counts 1/3/1/3 == HotSpot.
+- `SfmProbe` / `SfmReg`: `SetFromMap` over IdentityHashMap iterates `[AA,BB,CC]`,
+  `contains`/`toArray`/`new ArrayList<>(set)` all correct == HotSpot; Hash/Weak/
+  Concurrent backings keep the synthetic `HashSet` path (size/contains/list all
+  correct, unchanged).
+- `EntityGraphBatchSizeTest`: **OK 2/2** (was 0/2); `batchedTags` now one
+  `IN (?,?,?)` query; counts 1/3/1/3 == HotSpot. Reproduced + verified `--nojit`.
+
+Build note: verified with a binary built with per-package `opt-level=0`
+(`--config`, deps cached) because the shared build host was being thrashed by
+concurrent sessions killing `cargo`/`rustc`; the fix is source-level and
+collector/JIT-independent (interpreter `--nojit`).
 
 ## Notes / traps
 

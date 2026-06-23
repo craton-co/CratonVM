@@ -26462,8 +26462,11 @@ fn native_set_from_map_contains(ctx: &mut dyn NativeContext, args: &[Value]) -> 
         _ => return Ok(Some(Value::Int(0))),
     };
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
+    // Delegate to the real backing map's `containsKey` via virtual dispatch so
+    // an `IdentityHashMap` backing uses reference identity (and the correct
+    // layout) rather than the synthetic-layout `native_map_contains_key`.
     match set_from_map_backing(ctx, this) {
-        Some(m) => native_map_contains_key(ctx, &[Value::Object(Some(m)), key]),
+        Some(m) => ctx.invoke_virtual(m, "containsKey", "(Ljava/lang/Object;)Z", &[key]),
         None => Ok(Some(Value::Int(0))),
     }
 }
@@ -26473,15 +26476,18 @@ fn native_set_from_map_to_array(ctx: &mut dyn NativeContext, args: &[Value]) -> 
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let keys = match set_from_map_backing(ctx, this) {
-        Some(m) => map_collect_keys(ctx, m),
-        None => Vec::new(),
+    // Delegate to the real backing map's `keySet().toArray()` via virtual
+    // dispatch (see `native_set_from_map_iterator` — `map_collect_keys` assumes
+    // a synthetic map layout and mis-reads a real `IdentityHashMap`).
+    let backing = match set_from_map_backing(ctx, this) {
+        Some(m) => m,
+        None => return Ok(Some(Value::Object(None))),
     };
-    let arr = alloc_ref_array(ctx, keys.len());
-    for (i, k) in keys.iter().enumerate() {
-        let _ = ctx.set_array_element(arr, i, *k);
-    }
-    Ok(Some(Value::Object(Some(arr))))
+    let set = match ctx.invoke_virtual(backing, "keySet", "()Ljava/util/Set;", &[])? {
+        Some(Value::Object(Some(s))) => s,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    ctx.invoke_virtual(set, "toArray", "()[Ljava/lang/Object;", &[])
 }
 
 fn native_set_from_map_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -26489,16 +26495,22 @@ fn native_set_from_map_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> 
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
-    // Build a fresh HashSet snapshot of the live map's keys and hand back its
-    // iterator — the snapshot is taken *now*, so it reflects every add() that
-    // happened after `newSetFromMap` constructed the (then-empty) view.
-    let backing = set_from_map_backing(ctx, this);
-    let set = match backing {
-        Some(m) => match native_map_key_set(ctx, &[Value::Object(Some(m))])? {
-            Some(Value::Object(Some(s))) => s,
-            _ => return Ok(Some(Value::Object(None))),
-        },
+    // Route through the live backing map's *real* `keySet().iterator()` via
+    // virtual dispatch so the correct per-map-type view is used. The
+    // `native_map_key_set` helper assumes CratonVM's synthetic HashMap field
+    // layout (buckets/size/capacity) and reads garbage from a real
+    // `IdentityHashMap` (whose backing is a flat alternating key/value table).
+    // Since `newSetFromMap` only returns a real `Collections$SetFromMap` for an
+    // `IdentityHashMap` backing (other backings get the synthetic HashSet), the
+    // virtual call dispatches to the real map's keySet, which iterates the live
+    // keys correctly. The snapshot is taken now, after every add().
+    let backing = match set_from_map_backing(ctx, this) {
+        Some(m) => m,
         None => return Ok(Some(Value::Object(None))),
+    };
+    let set = match ctx.invoke_virtual(backing, "keySet", "()Ljava/util/Set;", &[])? {
+        Some(Value::Object(Some(s))) => s,
+        _ => return Ok(Some(Value::Object(None))),
     };
     ctx.invoke_virtual(set, "iterator", "()Ljava/util/Iterator;", &[])
 }
