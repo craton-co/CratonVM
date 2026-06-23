@@ -130,6 +130,42 @@ for a specific object/array kind. The fix is then GC-side (header coherence / wa
 **NOT** the precise-JIT-maps/regalloc project, and **NOT** a `skip_list` ban (those address the
 wrong layer). Gated probe `CRATONVM_DBG_A2` (first 4 corruptions) is committed in `gen_heap.rs`.
 
+### ✅ Allocation breadcrumb (2026-06-22, CRATONVM_DBG_A2) — drilled the mechanism further + a REAL fix
+A young-allocation breadcrumb (`gc/src/a2dbg.rs`: records `addr → class_id/kind/element_type/
+array_length/num_slots/real_size` at every young header-write — `try_alloc_*`/`alloc_*` in
+gen_heap + `init_object_header` in vm; also `record_free` in the sweep's dead/forwarded branches)
++ a walk-time raw-header capture in the sweep walk produced these load-bearing facts:
+
+1. **The walk over-sizes a `byte[]`.** At the first detected desync the walker computes e.g.
+   `byte[37]` (real `40 + 37*1 = 80`) as **192** = `40 + 37*4` (a 4-byte/Int element). The
+   walk-time header raw word is `0x00000a0100000000` → `class_id=0, kind=Array(1),
+   element_type=Int(0x0a=10)` — the **`element_type` byte at offset 5 reads Int, not Byte(8)**.
+   So the walk reads a corrupt/garbage header for what was a byte array and over-strides into
+   the next (live, correctly-tracked) object's field region → the `class_id=4`/`array_length=N`
+   "implausible size" symptom.
+2. **Reference arrays remain clean** (a live `Reference[6]` walks at `40+6*8=88`, matches alloc).
+3. **A REAL robustness bug FOUND + FIXED (committed):** the sweep's free-block skip
+   (`gen_heap.rs` walk loop) only matched `cursor == off` EXACTLY. On any overshoot
+   (`cursor > off`) `free_iter` wedged forever and every later freed+zeroed region was walked as
+   a run of 40-byte phantom `Object`s → desync cascade. Replaced with a **robust skip** (advance
+   past wholly-passed blocks; resync to the block end when the cursor lands at/inside one).
+   **Validated: byte-identical in the normal in-sync case; `bt16=14985902`, `bt18=68332206`
+   golden, no regression.** This is a genuine fix for a *cascade-amplifier* class — but it does
+   **NOT** make A2 `bad=0`, because the over-sized `byte[]` (#1) is not a free-list block.
+4. **The residual root** is the over-sized byte-array header: a freed byte-array slot whose
+   header word0 is overwritten to `class_id=0/kind=Array/et=Int` by an apparently-UNTRACKED reuse
+   (all `kind=Array` *allocations* are breadcrumb-hooked, so this is either a write the breadcrumb
+   can't see or a header corruption), making the walked object OVERLAP a live tracked object →
+   overstep. Only under the non-moving sweep (moving collector never linear-walks → `--nojit`
+   clean). **Breadcrumb caveat:** between `scan` calls (no JIT frame) the *moving* collector swaps
+   the young arena, so breadcrumb absolute addresses go stale across GC epochs — the cross-epoch
+   "FIRST-MISMATCH @0" is an artifact; the breadcrumb is only reliable within one non-moving epoch.
+   **Next step:** clear the breadcrumb on each arena from/to swap (so addresses stay valid), then
+   the FIRST-MISMATCH within one epoch names the exact mis-sized allocation; and audit
+   `Arena::add_free_block`/the free-block split-on-alloc for a region handed out twice (overlap),
+   which `Arena::add_free_block` does not currently check. The fix is GC-side (arena/header
+   coherence), NOT precise-maps/regalloc, NOT a skip_list ban.
+
 Repro (unchanged): `CRATONVM_DBG_GC_STRESS=65536 cvmregroots.exe --java-home <jdk25> -cp
 docs/known-issues/repros/A2-reflrepro ReflRepro 8000`. `javac` the class first.
 

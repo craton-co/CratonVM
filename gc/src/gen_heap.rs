@@ -726,6 +726,15 @@ impl GenerationalHeap {
         // fully initialized.
         unsafe {
             std::ptr::write(ptr as *mut ObjectHeader, header);
+            crate::a2dbg::record(
+                ptr as usize,
+                class_id.as_u32(),
+                ObjectKind::Object as u8,
+                ArrayElementType::Reference as u8,
+                array_len,
+                num_slots_u32,
+                total_size,
+            );
             ObjectRef::from_raw(ptr)
         }
     }
@@ -770,6 +779,15 @@ impl GenerationalHeap {
         // `ObjectRef` are sound.
         unsafe {
             std::ptr::write(ptr as *mut ObjectHeader, header);
+            crate::a2dbg::record(
+                ptr as usize,
+                class_id.as_u32(),
+                ObjectKind::Object as u8,
+                ArrayElementType::Reference as u8,
+                array_len,
+                num_slots_u32,
+                total_size,
+            );
             Some(ObjectRef::from_raw(ptr))
         }
     }
@@ -918,6 +936,15 @@ impl GenerationalHeap {
         // because the header is fully initialized.
         unsafe {
             std::ptr::write(ptr as *mut ObjectHeader, header);
+            crate::a2dbg::record(
+                ptr as usize,
+                class_id.as_u32(),
+                ObjectKind::Array as u8,
+                element_type as u8,
+                length_u32,
+                length_u32,
+                total_size,
+            );
             // Data region already zeroed by try_alloc_young() — no redundant memset needed.
             ObjectRef::from_raw(ptr)
         }
@@ -978,6 +1005,15 @@ impl GenerationalHeap {
         // an `ObjectRef` are sound.
         unsafe {
             std::ptr::write(ptr as *mut ObjectHeader, header);
+            crate::a2dbg::record(
+                ptr as usize,
+                class_id.as_u32(),
+                ObjectKind::Array as u8,
+                element_type as u8,
+                length_u32,
+                length_u32,
+                total_size,
+            );
             Some(ObjectRef::from_raw(ptr))
         }
     }
@@ -1003,6 +1039,15 @@ impl GenerationalHeap {
         // so writing the header and creating an `ObjectRef` are sound.
         unsafe {
             std::ptr::write(ptr as *mut ObjectHeader, header);
+            crate::a2dbg::record(
+                ptr as usize,
+                class_id.as_u32(),
+                ObjectKind::Object as u8,
+                ArrayElementType::Reference as u8,
+                array_len,
+                u32::try_from(num_fields).unwrap_or(u32::MAX),
+                total_size,
+            );
             Some(ObjectRef::from_raw(ptr))
         }
     }
@@ -1054,6 +1099,15 @@ impl GenerationalHeap {
         // owned, so writing the header and creating an `ObjectRef` are sound.
         unsafe {
             std::ptr::write(ptr as *mut ObjectHeader, header);
+            crate::a2dbg::record(
+                ptr as usize,
+                class_id.as_u32(),
+                ObjectKind::Array as u8,
+                element_type as u8,
+                length_u32,
+                length_u32,
+                total_size,
+            );
             Some(ObjectRef::from_raw(ptr))
         }
     }
@@ -4252,12 +4306,44 @@ impl GenerationalHeap {
         // walker into a payload region. Cheap (a Vec push per object) and only
         // logged once per sweep on the abort path.
         let mut walked: Vec<(usize, usize, u32, ObjectKind, u32, u32)> = Vec::new();
+        // A2 probe (CRATONVM_DBG_A2): parallel to `walked`, the element_type byte
+        // and the raw first 8 header bytes AS THE WALKER READ THEM (so a desync
+        // dump shows the actual walk-time header, not an unreliable post-zeroing
+        // re-read). Indexed in lockstep with `walked`.
+        let mut walked_ext: Vec<(u8, u64)> = Vec::new();
         while cursor < used {
-            // If `cursor` is the start of a known free block, skip it.
-            if let Some(&&(off, sz)) = free_iter.peek() {
-                if cursor == off {
-                    cursor += sz;
-                    free_iter.next();
+            // Skip known free blocks ROBUSTLY. The free list (`existing_free`) is
+            // sorted ascending and the walk advances `cursor` monotonically, so we
+            // can stride `free_iter` forward in lockstep. Crucially this handles the
+            // case where a previous object's size brought the cursor PAST a free
+            // block's start (`cursor > off`): the old code only matched `cursor ==
+            // off`, so a single overshoot wedged `free_iter` at that block FOREVER —
+            // and every later free block was then read as a run of zeroed 40-byte
+            // phantom `Object`s (class_id=0, kind=Object, num_slots=0 → size 40),
+            // desyncing the walk off the object grid (the A2 / ReflRepro corruption:
+            // `CRATONVM_DBG_A2` shows freed+zeroed regions being walked, not skipped).
+            // Now: drop free blocks the cursor has wholly passed, and if the cursor
+            // lands AT or INSIDE a free block, resync to that block's end.
+            {
+                let mut resynced = false;
+                while let Some(&&(off, sz)) = free_iter.peek() {
+                    if cursor >= off + sz {
+                        // Walk is already past this entire free block — drop it and
+                        // re-examine the next one.
+                        free_iter.next();
+                        continue;
+                    }
+                    if cursor >= off {
+                        // Cursor is within `[off, off + sz)` — skip the remainder of
+                        // this free block and resync the walk to a real boundary.
+                        cursor = off + sz;
+                        free_iter.next();
+                        resynced = true;
+                    }
+                    // `cursor < off`: the next free block is still ahead; stop.
+                    break;
+                }
+                if resynced {
                     continue;
                 }
             }
@@ -4422,6 +4508,68 @@ impl GenerationalHeap {
                             k, off, disc, payload, referent
                         );
                     }
+                    // BREADCRUMB: what was actually allocated at/covering the
+                    // corrupt cursor, and the prior object's REAL allocated size
+                    // vs the size the walker computed (the decisive comparison).
+                    match crate::a2dbg::lookup_covering(from_base + cursor) {
+                        Some(r) => eprintln!(
+                            "[A2] BREADCRUMB cursor@{} ({:#x}) covered by alloc start={:#x} class_id={} kind={} et={} alen={} ns={} REAL_size={} seq={} (mid-object offset={})",
+                            cursor, from_base + cursor, r.addr, r.class_id, r.kind, r.element_type, r.array_length, r.num_slots, r.size, r.seq, (from_base + cursor) - r.addr,
+                        ),
+                        None => eprintln!(
+                            "[A2] BREADCRUMB cursor@{} ({:#x}) — NO young alloc record covers it (header never written here, or freed+reused)",
+                            cursor, from_base + cursor,
+                        ),
+                    }
+                    if let Some(&(loff, lsz, _, _, _, _)) = walked.last() {
+                        // Walk-time header AS THE WALKER READ IT (element_type byte
+                        // + raw first 8 bytes). This is the decisive value: if it
+                        // shows a 4-byte element_type for a byte[], the header is
+                        // corrupt at walk time (vs an allocator/walker formula bug).
+                        if let Some(&(wet, w0)) = walked_ext.last() {
+                            eprintln!(
+                                "[A2] WALK-TIME prior@{} element_type_byte={} raw_word0={:#018x} (b0=class_id_lo b4=kind b5=element_type)",
+                                loff, wet, w0,
+                            );
+                        }
+                        match crate::a2dbg::lookup_at(from_base + loff) {
+                            Some(r) if r.kind == 0xFF => eprintln!(
+                                "[A2] BREADCRUMB prior@{} — slot was FREED by the sweep (stale record); walker_size={}",
+                                loff, lsz,
+                            ),
+                            Some(r) => eprintln!(
+                                "[A2] BREADCRUMB prior@{} alloc class_id={} kind={} et={} alen={} ns={} REAL_size={} vs WALKER_size={} {}",
+                                loff, r.class_id, r.kind, r.element_type, r.array_length, r.num_slots, r.size, lsz,
+                                if r.size == lsz { "(match)" } else { "*** SIZE MISMATCH ***" },
+                            ),
+                            None => eprintln!(
+                                "[A2] BREADCRUMB prior@{} — no exact alloc record (walker_size={})",
+                                loff, lsz,
+                            ),
+                        }
+                    }
+                    // The desync DETECTION above is downstream: the walk may have
+                    // silently overshot earlier (reading garbage that still passed
+                    // the plausibility check). Find the FIRST walked object whose
+                    // walker-computed size disagrees with its real allocated size —
+                    // that is the ROOT overshoot. Compare walk-time header (et/raw0)
+                    // to the alloc record to classify header-corruption vs reuse.
+                    for (i, &(woff, wsz, _, _, _, _)) in walked.iter().enumerate() {
+                        if let Some(r) = crate::a2dbg::lookup_at(from_base + woff) {
+                            if r.kind != 0xFF && r.size != wsz {
+                                let (wet, w0) = walked_ext
+                                    .get(i)
+                                    .copied()
+                                    .unwrap_or((255, 0));
+                                eprintln!(
+                                    "[A2] FIRST-MISMATCH walked[{}]@{} walker_size={} walk_et={} raw0={:#018x} vs REAL(class_id={} kind={} et={} alen={} ns={} size={} seq={})",
+                                    i, woff, wsz, wet, w0,
+                                    r.class_id, r.kind, r.element_type, r.array_length, r.num_slots, r.size, r.seq,
+                                );
+                                break;
+                            }
+                        }
+                    }
                 }
 
                 // Defensive recovery: instead of `break` (which abandons
@@ -4485,6 +4633,10 @@ impl GenerationalHeap {
                 header.num_slots,
                 header.array_length,
             ));
+            // SAFETY: obj_ptr is the mapped header start; reading 8 bytes is in bounds.
+            walked_ext.push((header.element_type as u8, unsafe {
+                *(obj_ptr as *const u64)
+            }));
 
             if header.is_forwarded() {
                 // Evacuated to old gen by selective promotion: the live copy is
@@ -4501,6 +4653,7 @@ impl GenerationalHeap {
                 );
                 // SAFETY: span within from-space (checked above).
                 unsafe { std::ptr::write_bytes(obj_ptr, 0, total_size) };
+                crate::a2dbg::record_free(obj_ptr as usize);
                 dead_regions.push((cursor, total_size));
                 bytes_swept += total_size;
                 objects_swept += 1;
@@ -4525,6 +4678,7 @@ impl GenerationalHeap {
                 // SAFETY: `[obj_ptr, obj_ptr+total_size)` lies within the
                 // live from-space region (checked above).
                 unsafe { std::ptr::write_bytes(obj_ptr, 0, total_size) };
+                crate::a2dbg::record_free(obj_ptr as usize);
                 dead_regions.push((cursor, total_size));
                 bytes_swept += total_size;
                 objects_swept += 1;
