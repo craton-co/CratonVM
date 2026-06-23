@@ -2447,13 +2447,12 @@ pub(crate) fn native_class_new_instance(
             .into())
         }
     };
-    let class_name = ctx
-        .class_name_of_id(class_id)
-        .unwrap_or_else(|| "unknown".to_string());
-
     // GC-safe allocate + `<init>()V` — pins the new object across the
     // constructor under the moving collector (see `new_object_initialized`).
-    match ctx.new_object_initialized(&class_name, "()V", &[])? {
+    // Allocate by the mirror's EXACT class id (not its name) so per-loader
+    // class identity is preserved (JVMS §5.3); the name-based path collapses
+    // to the first/global definer of that name.
+    match ctx.new_object_initialized_with_class_id(class_id, "()V", &[])? {
         Some(v @ Value::Object(Some(_))) => Ok(Some(v)),
         _ => Err(cratonvm_types::error::RuntimeError::NotImplemented {
             feature: "Class.newInstance: new_object failed".to_string(),
@@ -6509,6 +6508,13 @@ pub(crate) fn native_constructor_new_instance(
             .into())
         }
     };
+    // Capture the declaring class's EXACT id from the mirror up front (before
+    // any allocation that could relocate the mirror). Allocation below uses
+    // this id directly so a loader-private / load-time-weaved class is
+    // instantiated as itself (JVMS §5.3), not as the same-named class some
+    // other loader defined first (which the name-based allocation collapses
+    // to). See `new_object_initialized_with_class_id`.
+    let declaring_cid = mirror_class_id(ctx, declaring_mirror);
     let class_name = match mirror_class_name(ctx, declaring_mirror) {
         Some(n) if !n.is_empty() => n,
         _ => match ctx.class_id_from_mirror(declaring_mirror) {
@@ -6616,7 +6622,11 @@ pub(crate) fn native_constructor_new_instance(
     // a relocation doesn't leave us returning a stale pointer (which would
     // resolve to a reused `java.lang.Object`). Wrap any Java exception in
     // InvocationTargetException per the `Constructor.newInstance` javadoc.
-    match ctx.new_object_initialized(&class_name, &descriptor, &init_args) {
+    let alloc_result = match declaring_cid {
+        Some(cid) => ctx.new_object_initialized_with_class_id(cid, &descriptor, &init_args),
+        None => ctx.new_object_initialized(&class_name, &descriptor, &init_args),
+    };
+    match alloc_result {
         Ok(Some(v @ Value::Object(Some(_)))) => Ok(Some(v)),
         Ok(_) => Err(cratonvm_types::error::RuntimeError::IllegalStateException {
             message: format!("Constructor.newInstance: failed to allocate {class_name}"),
