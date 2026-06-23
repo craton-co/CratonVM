@@ -990,6 +990,17 @@ fn native_url_set_stream_handler_factory_guard(
     // clears the `handlers` cache on install; we leave it — a freshly-booted
     // VM has nothing cached for an app-defined scheme.
     if let Some(Value::Object(Some(fac))) = args.first() {
+        // Force-native dispatch (force_native_over_real_jdk_bytecode) runs this
+        // guard as the body of `setURLStreamHandlerFactory` WITHOUT first
+        // running `java/net/URL`'s `<clinit>` (the normal invokestatic
+        // class-init step is skipped for the override). If we publish `factory`
+        // before URL is initialized, URL's later initialization re-creates its
+        // statics vector and silently discards our write — leaving `factory`
+        // null so `getURLStreamHandler` never consults the app factory
+        // (`MalformedURLException: unknown protocol: classpath`, Tomcat
+        // TestConfigFileLoader / TestClasspathUrlStreamHandler). Initialize URL
+        // FIRST so the static store exists and is stable, then publish into it.
+        let _ = ctx.ensure_class_initialized("java/net/URL");
         ctx.set_static_field_by_name("java/net/URL", "factory", Value::Object(Some(*fac)));
     }
     URL_SET_STREAM_HANDLER_FACTORY_DEPTH.set(0);

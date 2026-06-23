@@ -1708,12 +1708,27 @@ fn register_uri_natives(r: &mut NativeMethodRegistry) {
             return Err(iae("URI is not absolute"));
         }
         if !KNOWN_PROTOCOLS.contains(&proto_lc.as_str()) {
-            let exc = alloc_concurrent_synthetic(ctx, "java/net/MalformedURLException", 4);
-            let msg = ctx.create_string(&format!("unknown protocol: {proto_lc}"));
-            ctx.set_field_by_name(exc, "detailMessage", Value::Object(Some(msg)));
-            return Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(
-                exc,
-            ));
+            // Not one of the always-handled built-in schemes. Rather than
+            // blindly reject, defer to the REAL `java.net.URL` constructor,
+            // which runs `URL.getURLStreamHandler(proto)` — consulting any
+            // app-registered `URLStreamHandlerFactory` (published into
+            // `URL.factory` by `native_url_set_stream_handler_factory_guard`).
+            // This is what lets Tomcat's `classpath:` scheme resolve via its
+            // `TomcatURLStreamHandlerFactory` (`URI.create("classpath:…").toURL()`
+            // in TestConfigFileLoader / TestClasspathUrlStreamHandler) while
+            // STILL throwing `MalformedURLException` for genuinely-unknown
+            // schemes — including the single-letter Windows drive (`C:`) case
+            // that Tomcat's `Bootstrap.createClassLoader` relies on catching to
+            // fall into its `*.jar` glob-expansion branch (the real `URL("C:/…")`
+            // ctor throws `unknown protocol: c` exactly as the old hard-coded
+            // reject did). `new URL(String)` is un-intercepted real bytecode in
+            // real-JDK mode, so this honours the full real handler-lookup path.
+            let full_s = ctx.create_string(&raw);
+            return ctx.new_object_initialized(
+                "java/net/URL",
+                "(Ljava/lang/String;)V",
+                &[Value::Object(Some(full_s))],
+            );
         }
         // Build a simple 13-field synthetic URL (same layout as p59_alloc_url).
         let url = alloc_concurrent_synthetic(ctx, "java/net/URL", 13);
@@ -3649,7 +3664,15 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
         } else if let Some(name) = url_str.strip_prefix("classpath:") {
             let name = name.trim_start_matches('/');
             ctx.find_resource(name).ok_or_else(|| {
-                ioex(format!(
+                // Tomcat's real `ClasspathURLStreamHandler.openConnection`
+                // throws `FileNotFoundException` (a subclass of IOException)
+                // when neither the TCCL nor the handler's own loader resolves
+                // the resource. Callers assert on that specific type — e.g.
+                // `TestConfigFileLoader.test02` is `@Test(expected =
+                // FileNotFoundException.class)` for `classpath:.../foo`. Mirror
+                // the `file:` arm above (which already uses `fnfex`) so a
+                // missing classpath resource raises FNFE, not a bare IOException.
+                fnfex(format!(
                     "URL.openStream: classpath resource not found: {name}"
                 ))
             })?
