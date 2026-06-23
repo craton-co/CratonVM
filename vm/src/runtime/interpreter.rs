@@ -16854,6 +16854,28 @@ fn force_native_over_real_jdk_bytecode(
                 "getProxyClass",
                 "(Ljava/lang/ClassLoader;[Ljava/lang/Class;)Ljava/lang/Class;",
             )
+            // TC0622 classpath:-protocol: `jdk.internal.misc.VM.isBooted()` on
+            // JDK 25 is real bytecode `return initLevel >= SYSTEM_BOOTED(4)`,
+            // reading the *static field* `jdk.internal.misc.VM.initLevel`.
+            // CratonVM boots natively and never runs the real
+            // `System.initPhase2/3` that would call `VM.initLevel(int)` to set
+            // that field, so it stays 0 and the real `isBooted()` returns false
+            // forever. `java.net.URL.getURLStreamHandler` gates factory lookup
+            // on `isOverrideable(protocol) && VM.isBooted()`, so a false result
+            // makes the un-intercepted real `getURLStreamHandler` skip the
+            // app-installed `URLStreamHandlerFactory` entirely and throw
+            // `MalformedURLException: unknown protocol: classpath` even though
+            // Tomcat's `TomcatURLStreamHandlerFactory` is correctly registered
+            // (and published into `URL.factory` by
+            // `native_url_set_stream_handler_factory_guard`, HIB-CV-15). The
+            // registered native (`register_essential_natives`, lib.rs) returns
+            // 1; force it so the boot-state native — like the `VM.initLevel()`
+            // floor-of-2 native alongside it — actually shadows the real
+            // bytecode. By the time any app/JDK-library code calls `isBooted()`
+            // the VM is genuinely up, matching HotSpot's post-boot `true`. Also
+            // unblocks the JASPIC `ResourcesMgr` path (commit 873355f1 added the
+            // native but missed this force-list entry, leaving it inert).
+            | ("jdk/internal/misc/VM", "isBooted", "()Z")
     ) || (class_name == "java/net/URL"
         && matches!(method_name, "getAuthority" | "getHostAddress"))
         || (matches!(
