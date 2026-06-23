@@ -5833,6 +5833,52 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
             )
         },
     );
+    // getDefaultSSLParameters() — BUG-08: Jetty's `SslContextFactory.load()`
+    // (jetty-util) calls this on the SSLContext it just `getInstance`'d to seed
+    // the connector's enabled protocols/cipher suites. Like
+    // getSupportedSSLParameters above, the synthetic SSLContext carries no real
+    // `contextSpi`, so the un-intercepted `javax.net.ssl.SSLContext`
+    // .getDefaultSSLParameters() bytecode (`return contextSpi.engineGet…()`)
+    // dereferenced null → NPE (5× org.springframework.http.client.
+    // JettyClientHttpRequestFactoryTests). Return a REAL SSLParameters whose
+    // *default-enabled* protocol/cipher lists match what the rustls-backed
+    // engine negotiates — on JDK 25 the modern TLSv1.3/1.2 suites are
+    // enabled-by-default, so the default set mirrors the supported set here.
+    r.register(
+        ctx_cls,
+        "getDefaultSSLParameters",
+        "()Ljavax/net/ssl/SSLParameters;",
+        |ctx, _args| {
+            let protocols = ["TLSv1.3", "TLSv1.2"];
+            let ciphers = [
+                "TLS_AES_128_GCM_SHA256",
+                "TLS_AES_256_GCM_SHA384",
+                "TLS_CHACHA20_POLY1305_SHA256",
+                "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256",
+                "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
+                "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384",
+                "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",
+                "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256",
+                "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256",
+            ];
+            let mk = |ctx: &mut dyn NativeContext, items: &[&str]| {
+                let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, items.len());
+                for (i, &s) in items.iter().enumerate() {
+                    let so = ctx.create_string(s);
+                    ctx.set_array_element(arr, i, Value::Object(Some(so)));
+                }
+                Value::Object(Some(arr))
+            };
+            let carr = mk(ctx, &ciphers);
+            let parr = mk(ctx, &protocols);
+            // SSLParameters(String[] cipherSuites, String[] protocols)
+            ctx.new_object_initialized(
+                "javax/net/ssl/SSLParameters",
+                "([Ljava/lang/String;[Ljava/lang/String;)V",
+                &[carr, parr],
+            )
+        },
+    );
     // createSSLEngine() — return a rustls-backed sun.security.ssl.SSLEngineImpl
     // (its wrap/unwrap/handshake natives live in t27_tls::register_sslengine_real,
     // keyed by ObjectRef via engine_id_or_alloc, so a bare object suffices).
