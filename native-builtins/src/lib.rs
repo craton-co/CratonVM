@@ -5598,6 +5598,19 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         let live = cratonvm_native_api::init_level::get_init_level();
         Ok(Some(Value::Int(live.max(2))))
     });
+    // isBooted() -> boolean. The real `jdk.internal.misc.VM.isBooted()` reads a
+    // `booted` flag set true at the end of `System.initPhase2`; CratonVM drives
+    // boot natively and never flips that flag, so the real bytecode returns
+    // false. Security-sensitive JDK paths gate on it — e.g.
+    // `sun.security.util.ResourcesMgr.getBundle` throws
+    // `InternalError("Expected to use ResourceBundle only after booted")`,
+    // breaking `Subject.getPrivateCredentials` (JASPIC auth) and any other
+    // post-boot ResourceBundle load. By the time app/test code runs the VM is
+    // booted, so return 1 — consistent with `sun/misc/VM.isBooted` and the
+    // `initLevel` floor-of-2 ("up enough") policy above.
+    registry.register("jdk/internal/misc/VM", "isBooted", "()Z", |_ctx, _args| {
+        Ok(Some(Value::Int(1)))
+    });
     // WP1.3: awaitInitLevel(int) blocks on the process-wide condvar
     // until the level reaches `n`.  Matches HotSpot's
     // `JVM_AwaitInitLevel` — used by JDK internals (e.g. the
