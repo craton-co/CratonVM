@@ -8530,6 +8530,64 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // Also register `ZoneInfoFile.getZoneInfo0(String)` as a safety net
     // for any direct caller — returns null so callers fall through to
     // GMT.
+    // HIB-CV-34: standard (non-DST) UTC offset in seconds for common IANA zone
+    // ids. Mirrors `util_time::iana_zone_offset_seconds`, duplicated here because
+    // that module is `#[cfg(feature = "synthetic-jdk")]`-gated and not compiled
+    // in the default real-JDK build, where `alloc_synth_timezone` lives.
+    fn tz_standard_offset_seconds(zone_id: &str) -> Option<i32> {
+        match zone_id {
+            "UTC" | "GMT" | "Etc/UTC" | "Etc/GMT" | "Z" | "Atlantic/Reykjavik"
+            | "Europe/London" | "GB" => Some(0),
+            "US/Eastern" | "America/New_York" | "America/Bogota" => Some(-5 * 3600),
+            "US/Central" | "America/Chicago" | "America/Mexico_City" => Some(-6 * 3600),
+            "US/Mountain" | "America/Denver" => Some(-7 * 3600),
+            "US/Pacific" | "America/Los_Angeles" => Some(-8 * 3600),
+            "America/Anchorage" => Some(-9 * 3600),
+            "Pacific/Honolulu" | "US/Hawaii" => Some(-10 * 3600),
+            "America/Sao_Paulo" | "America/Argentina/Buenos_Aires" => Some(-3 * 3600),
+            "America/Santiago" => Some(-4 * 3600),
+            "Europe/Paris" | "Europe/Berlin" | "Europe/Rome" | "Europe/Madrid" | "CET" => {
+                Some(3600)
+            }
+            "Europe/Athens" | "Europe/Bucharest" | "Europe/Helsinki" | "EET" => Some(2 * 3600),
+            "Europe/Moscow" | "Europe/Istanbul" => Some(3 * 3600),
+            "Asia/Dubai" => Some(4 * 3600),
+            "Asia/Karachi" => Some(5 * 3600),
+            "Asia/Kolkata" | "Asia/Calcutta" => Some(5 * 3600 + 1800),
+            "Asia/Dhaka" => Some(6 * 3600),
+            "Asia/Bangkok" | "Asia/Jakarta" => Some(7 * 3600),
+            "Asia/Shanghai" | "Asia/Hong_Kong" | "Asia/Singapore" | "Asia/Taipei" | "PRC"
+            | "Australia/Perth" => Some(8 * 3600),
+            "Asia/Tokyo" | "Japan" | "Asia/Seoul" | "ROK" => Some(9 * 3600),
+            "Australia/Adelaide" => Some(9 * 3600 + 1800),
+            "Australia/Sydney" | "Australia/Melbourne" => Some(10 * 3600),
+            "Pacific/Auckland" | "NZ" | "Pacific/Fiji" => Some(12 * 3600),
+            "Africa/Cairo" | "Africa/Johannesburg" => Some(2 * 3600),
+            "Africa/Lagos" => Some(3600),
+            "Africa/Nairobi" => Some(3 * 3600),
+            _ => {
+                // GMT+HH:MM / -HH:MM and Etc/GMT±N (inverted sign).
+                if let Some(rest) = zone_id.strip_prefix("Etc/GMT") {
+                    rest.parse::<i32>().ok().map(|h| -h * 3600)
+                } else {
+                    let body = zone_id
+                        .strip_prefix("GMT")
+                        .or_else(|| zone_id.strip_prefix("UTC"))
+                        .unwrap_or(zone_id);
+                    if body.starts_with('+') || body.starts_with('-') {
+                        let sign = if body.starts_with('-') { -1 } else { 1 };
+                        let parts: Vec<&str> = body[1..].split(':').collect();
+                        let h: i32 = parts.first()?.parse().ok()?;
+                        let m: i32 = parts.get(1).and_then(|p| p.parse().ok()).unwrap_or(0);
+                        Some(sign * (h * 3600 + m * 60))
+                    } else {
+                        None
+                    }
+                }
+            }
+        }
+    }
+
     fn alloc_synth_timezone(ctx: &mut dyn NativeContext, id_str: &str) -> cratonvm_types::Value {
         // Prefer sun/util/calendar/ZoneInfo (concrete subclass of TimeZone).
         // Fall back to allocating with class-id 0 if init fails — the
@@ -8549,7 +8607,17 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         // resolve into the correct inherited slot.
         ctx.set_field_by_name(obj, "ID", Value::Object(Some(s)));
         // ZoneInfo subclass fields — best-effort, no-op if missing.
-        ctx.set_field_by_name(obj, "rawOffset", Value::Int(0));
+        // HIB-CV-34: wire the standard UTC offset (ms) from the IANA table so
+        // getRawOffset()/getOffset(long) return the real zone offset instead of
+        // 0. Without transition data this is a standard-offset-year-round
+        // approximation (no DST), but it fixes the silent N-hour shift that
+        // corrupted every custom-zone JDBC timestamp (e.g. America/Los_Angeles
+        // returned 0 instead of -28800000). `transitions` stays null, so
+        // ZoneInfo.getOffset(long) returns this rawOffset for all instants.
+        let raw_offset_ms = tz_standard_offset_seconds(id_str)
+            .unwrap_or(0)
+            .saturating_mul(1000);
+        ctx.set_field_by_name(obj, "rawOffset", Value::Int(raw_offset_ms));
         ctx.set_field_by_name(obj, "rawOffsetDiff", Value::Int(0));
         ctx.set_field_by_name(obj, "dstSavings", Value::Int(0));
         cratonvm_types::Value::Object(Some(obj))
