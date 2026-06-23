@@ -130,12 +130,63 @@ fn registry() -> &'static Mutex<ConnRegistry> {
 
 struct RealResult {
     status: i32,
+    headers: Vec<(String, String)>,
     body: Vec<u8>,
 }
 
 fn real_results() -> &'static Mutex<HashMap<i32, RealResult>> {
     static R: OnceLock<Mutex<HashMap<i32, RealResult>>> = OnceLock::new();
     R.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Per-real-connection REQUEST state, keyed by `identity_hash_code(this)`.
+///
+/// A real-JDK `sun.net.www...HttpURLConnection` (handed out by the genuine
+/// `URL.openConnection()` machinery) carries the JDK's own instance layout, so
+/// the synthetic `HUC_*` slots do NOT apply — writing them corrupts unrelated
+/// real fields and reading them yields garbage (this is the root cause of the
+/// dropped-`Authorization`-header / `cannot write after connect` /
+/// empty-`getHeaderFields` cluster). We therefore keep every piece of request
+/// state a real carrier needs (method, request headers, doOutput) in this
+/// identity-keyed side-table, mirroring the established
+/// `net_phase_e::stream_owner_table` precedent for real-JDK carrier objects.
+#[derive(Default, Clone)]
+struct RealReq {
+    method: String,                 // empty => "GET"
+    headers: Vec<(String, String)>, // ordered; setRequestProperty replaces, addRequestProperty appends
+    do_output: bool,
+}
+
+fn real_reqs() -> &'static Mutex<HashMap<i32, RealReq>> {
+    static R: OnceLock<Mutex<HashMap<i32, RealReq>>> = OnceLock::new();
+    R.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Real-carrier buffered request-body stream (the `ByteArrayOutputStream`
+/// returned by `getOutputStream`), keyed by `identity_hash_code(this)`. We
+/// cannot park it in a synthetic slot on a real object, so we track the object
+/// by identity — same rationale and lifetime as `stream_owner_table`: the
+/// harness keeps the stream live on its Java stack across the
+/// write→`getResponseCode` window, so the bytes are read back at perform time.
+fn real_body_streams() -> &'static Mutex<HashMap<i32, ObjectRef>> {
+    static R: OnceLock<Mutex<HashMap<i32, ObjectRef>>> = OnceLock::new();
+    R.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// True if `this` is a real-JDK URLConnection carrier (field 0 holds the
+/// `java/net/URL` object) rather than our synthetic carrier (field 0 = i32
+/// conn-id). The real JDK constructor uses a different descriptor than our
+/// `<init>(Ljava/net/URL;)V` native, so a genuine carrier never runs `huc_init`
+/// and keeps the JDK layout (field 0 = `URLConnection.url`).
+fn is_real_carrier(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
+    matches!(ctx.get_field(this, HUC_CONN_ID), Value::Object(Some(_)))
+}
+
+/// Mutate this real carrier's `RealReq` entry (creating it on first use).
+fn with_real_req<R>(ctx: &dyn NativeContext, this: ObjectRef, f: impl FnOnce(&mut RealReq) -> R) -> R {
+    let key = ctx.identity_hash_code(this);
+    let mut t = real_reqs().lock().expect("real_reqs poisoned");
+    f(t.entry(key).or_default())
 }
 
 /// If `this` is a real-JDK URLConnection (field 0 is a `java/net/URL` object,
@@ -152,14 +203,39 @@ fn huc_real_object_url(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<S
     }
 }
 
+/// Read the buffered request body for a real-JDK carrier from the
+/// `ByteArrayOutputStream` recorded by `getOutputStream` (synthetic BAOS layout:
+/// field 0 = byte[] buf, field 1 = count). Empty if no body was written.
+fn real_body_bytes(ctx: &dyn NativeContext, this: ObjectRef) -> Vec<u8> {
+    let key = ctx.identity_hash_code(this);
+    let baos = match real_body_streams()
+        .lock()
+        .ok()
+        .and_then(|t| t.get(&key).copied())
+    {
+        Some(b) => b,
+        None => return Vec::new(),
+    };
+    if let Value::Object(Some(arr)) = ctx.get_field(baos, 0) {
+        let mut buf = read_byte_array(ctx, arr);
+        if let Value::Int(count) = ctx.get_field(baos, 1) {
+            if (count as usize) < buf.len() {
+                buf.truncate(count as usize);
+            }
+        }
+        return buf;
+    }
+    Vec::new()
+}
+
 /// Perform (idempotently) the request for a real-JDK http(s) connection and
-/// cache `(status, body)` by object identity. Returns the HTTP status (-1 on
-/// parse/IO failure). Wrapped in a GC-safe blocking region so the blocking I/O
-/// does not stall an in-process CratonVM server's worker threads.
-///
-/// Method is assumed GET (the only verb `TomcatBaseTest.getUrl` uses, and the
-/// dominant one for `getResponseCode`/`getInputStream`); the real `method`
-/// field is not at a known synthetic slot.
+/// cache `(status, headers, body)` by object identity. Returns the HTTP status
+/// (-1 on parse/IO failure). The request honors the method, headers, and body
+/// the caller staged via `setRequestMethod` / `setRequestProperty` / the output
+/// stream — all tracked in the identity-keyed `real_reqs` / `real_body_streams`
+/// side-tables, since a real carrier's synthetic slots are unusable. Wrapped in
+/// a GC-safe blocking region so the blocking I/O does not stall an in-process
+/// CratonVM server's worker threads.
 fn huc_real_perform(ctx: &mut dyn NativeContext, this: ObjectRef, url_str: &str) -> i32 {
     let key = ctx.identity_hash_code(this);
     if let Some(st) = real_results()
@@ -173,20 +249,38 @@ fn huc_real_perform(ctx: &mut dyn NativeContext, this: ObjectRef, url_str: &str)
         Ok(p) => p,
         Err(_) => return -1,
     };
+    let req = real_reqs()
+        .lock()
+        .ok()
+        .and_then(|t| t.get(&key).cloned())
+        .unwrap_or_default();
+    let method = if req.method.is_empty() {
+        "GET".to_string()
+    } else {
+        req.method.clone()
+    };
+    let body = real_body_bytes(ctx, this);
     ctx.begin_blocking_region();
     let resp = perform(
         &parsed,
-        "GET",
-        &[],
-        &[],
+        &method,
+        &req.headers,
+        &body,
         Duration::from_secs(30),
         Duration::from_secs(60),
     );
     ctx.end_blocking_region();
     match resp {
-        Ok((status, _headers, body)) => {
+        Ok((status, headers, body)) => {
             if let Ok(mut t) = real_results().lock() {
-                t.insert(key, RealResult { status, body });
+                t.insert(
+                    key,
+                    RealResult {
+                        status,
+                        headers,
+                        body,
+                    },
+                );
             }
             status
         }
@@ -202,6 +296,30 @@ fn huc_real_body(ctx: &dyn NativeContext, this: ObjectRef) -> Vec<u8> {
         .ok()
         .and_then(|t| t.get(&key).map(|r| r.body.clone()))
         .unwrap_or_default()
+}
+
+/// Cached response headers for a real-JDK connection (empty if not performed).
+fn huc_real_headers(ctx: &dyn NativeContext, this: ObjectRef) -> Vec<(String, String)> {
+    let key = ctx.identity_hash_code(this);
+    real_results()
+        .lock()
+        .ok()
+        .and_then(|t| t.get(&key).map(|r| r.headers.clone()))
+        .unwrap_or_default()
+}
+
+/// Drop all identity-keyed side-table state for a real carrier (on disconnect).
+fn real_forget(ctx: &dyn NativeContext, this: ObjectRef) {
+    let key = ctx.identity_hash_code(this);
+    if let Ok(mut t) = real_results().lock() {
+        t.remove(&key);
+    }
+    if let Ok(mut t) = real_reqs().lock() {
+        t.remove(&key);
+    }
+    if let Ok(mut t) = real_body_streams().lock() {
+        t.remove(&key);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -279,6 +397,72 @@ fn make_byte_array_input_stream(ctx: &mut dyn NativeContext, body: &[u8]) -> Val
     ctx.set_field(stream, 2, Value::Int(0));
     ctx.set_field(stream, 3, Value::Int(body.len() as i32));
     Value::Object(Some(stream))
+}
+
+/// Build a real `java.util.Map<String, java.util.List<String>>` from response
+/// headers, grouping duplicate header names (case-insensitively, first-seen
+/// order) into a per-name `List`. This mirrors what the JDK's
+/// `URLConnection.getHeaderFields()` returns and is what `TomcatBaseTest`'s
+/// `resHead` out-parameter is filled from. Every `create_string`/`invoke` can
+/// allocate and move objects, so the map/list/key refs are pinned and re-read
+/// across each re-entrant call (see the manifest-builder idiom in phases_late).
+fn build_header_map(
+    ctx: &mut dyn NativeContext,
+    headers: &[(String, String)],
+) -> Result<ObjectRef, cratonvm_types::error::MethodCallFailed> {
+    let mut groups: Vec<(String, Vec<String>)> = Vec::new();
+    for (k, v) in headers {
+        if let Some(g) = groups.iter_mut().find(|(gk, _)| gk.eq_ignore_ascii_case(k)) {
+            g.1.push(v.clone());
+        } else {
+            groups.push((k.clone(), vec![v.clone()]));
+        }
+    }
+    let map = match ctx.new_object_initialized("java/util/LinkedHashMap", "()V", &[])? {
+        Some(Value::Object(Some(o))) => o,
+        _ => return Err(ioex("getHeaderFields: could not allocate LinkedHashMap")),
+    };
+    let map_pin = ctx.pin_native_root(map);
+    for (k, vals) in &groups {
+        let list = match ctx.new_object_initialized("java/util/ArrayList", "()V", &[])? {
+            Some(Value::Object(Some(o))) => o,
+            _ => {
+                ctx.unpin_native_roots(map_pin);
+                return Err(ioex("getHeaderFields: could not allocate ArrayList"));
+            }
+        };
+        let list_pin = ctx.pin_native_root(list);
+        for v in vals {
+            let vs = ctx.create_string(v);
+            let vs_pin = ctx.pin_native_root(vs);
+            let list = ctx.read_native_pin(list_pin, list);
+            let vs = ctx.read_native_pin(vs_pin, vs);
+            ctx.invoke(
+                "java/util/ArrayList",
+                "add",
+                "(Ljava/lang/Object;)Z",
+                &[Value::Object(Some(list)), Value::Object(Some(vs))],
+            )?;
+        }
+        let ks = ctx.create_string(k);
+        let ks_pin = ctx.pin_native_root(ks);
+        let map = ctx.read_native_pin(map_pin, map);
+        let list = ctx.read_native_pin(list_pin, list);
+        let ks = ctx.read_native_pin(ks_pin, ks);
+        ctx.invoke(
+            "java/util/LinkedHashMap",
+            "put",
+            "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+            &[
+                Value::Object(Some(map)),
+                Value::Object(Some(ks)),
+                Value::Object(Some(list)),
+            ],
+        )?;
+    }
+    let map = ctx.read_native_pin(map_pin, map);
+    ctx.unpin_native_roots(map_pin);
+    Ok(map)
 }
 
 #[derive(Debug, Clone)]
@@ -700,6 +884,14 @@ fn huc_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
 
 fn huc_connect(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
+    // Real-JDK carrier: `connect()` only opens the socket on HotSpot and the
+    // request is sent lazily by `getResponseCode`/`getInputStream`/the output
+    // stream. We mirror that by deferring the actual `perform` — running it here
+    // would (a) misread the synthetic slots `ensure_connected` consults and
+    // (b) prematurely fix the request before the body/headers are fully staged.
+    if is_real_carrier(ctx, this) {
+        return Ok(None);
+    }
     ensure_connected(ctx, this)
 }
 
@@ -717,8 +909,35 @@ fn huc_get_response_code(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     Ok(Some(Value::Int(code)))
 }
 
+fn status_reason(status: i32) -> String {
+    match status {
+        200 => "OK",
+        201 => "Created",
+        204 => "No Content",
+        301 => "Moved Permanently",
+        302 => "Found",
+        304 => "Not Modified",
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        403 => "Forbidden",
+        404 => "Not Found",
+        500 => "Internal Server Error",
+        503 => "Service Unavailable",
+        _ => return format!("Status {status}"),
+    }
+    .to_string()
+}
+
 fn huc_get_response_message(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
+    // Real-JDK carrier: derive from the cached perform result.
+    if let Some(url_str) = huc_real_object_url(ctx, this) {
+        if url_str.starts_with("http://") || url_str.starts_with("https://") {
+            let status = huc_real_perform(ctx, this, &url_str);
+            let s = ctx.create_string(&status_reason(status));
+            return Ok(Some(Value::Object(Some(s))));
+        }
+    }
     ensure_connected(ctx, this)?;
     let msg = with_state(ctx, this, |s| match s.status {
         200 => "OK".to_string(),
@@ -803,6 +1022,17 @@ fn huc_get_input_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
 
 fn huc_get_error_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
+    // Real-JDK carrier: serve the cached body when the response was an error.
+    if let Some(url_str) = huc_real_object_url(ctx, this) {
+        if url_str.starts_with("http://") || url_str.starts_with("https://") {
+            let status = huc_real_perform(ctx, this, &url_str);
+            if status < 400 {
+                return Ok(Some(Value::Object(None)));
+            }
+            let body = huc_real_body(ctx, this);
+            return Ok(Some(make_byte_array_input_stream(ctx, &body)));
+        }
+    }
     if !matches!(ctx.get_field(this, HUC_CONNECTED), Value::Int(1)) {
         return Ok(Some(Value::Object(None)));
     }
@@ -823,6 +1053,40 @@ fn huc_get_error_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
 
 fn huc_get_output_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
+    // Real-JDK carrier: the synthetic `HUC_DO_OUTPUT`/`HUC_CONNECTED` slots land
+    // on unrelated real fields (one reads 1 → the old code wrongly threw "cannot
+    // write after connect"). Use the identity-keyed `RealReq.do_output` and a
+    // buffered BAOS tracked by identity; a write-after-`connect()` is legal here
+    // exactly as on HotSpot (the body is sent lazily by `getResponseCode`).
+    if is_real_carrier(ctx, this) {
+        let do_output = with_real_req(ctx, this, |r| r.do_output);
+        if !do_output {
+            return Err(ioex("HttpURLConnection.getOutputStream: doOutput=false"));
+        }
+        // JDK semantics: opening the output stream promotes a still-default GET
+        // to POST (see sun.net.www...HttpURLConnection.getOutputStream:
+        // `if (method.equals("GET")) method = "POST"`). The harness's `postUrl`
+        // relies on this — it sets only `setDoOutput(true)`, never the method —
+        // so without this promotion the body is sent as a GET and the servlet
+        // replies 405 Method Not Allowed.
+        with_real_req(ctx, this, |r| {
+            if r.method.is_empty() || r.method == "GET" {
+                r.method = "POST".to_string();
+            }
+        });
+        let key = ctx.identity_hash_code(this);
+        if let Some(existing) = real_body_streams().lock().ok().and_then(|t| t.get(&key).copied()) {
+            return Ok(Some(Value::Object(Some(existing))));
+        }
+        let baos = alloc_concurrent_synthetic(ctx, "java/io/ByteArrayOutputStream", 2);
+        let backing = ctx.new_array(ArrayElementType::Byte, 0);
+        ctx.set_field(baos, 0, Value::Object(Some(backing)));
+        ctx.set_field(baos, 1, Value::Int(0));
+        if let Ok(mut t) = real_body_streams().lock() {
+            t.insert(key, baos);
+        }
+        return Ok(Some(Value::Object(Some(baos))));
+    }
     if !matches!(ctx.get_field(this, HUC_DO_OUTPUT), Value::Int(1)) {
         return Err(ioex("HttpURLConnection.getOutputStream: doOutput=false"));
     }
@@ -849,6 +1113,20 @@ fn huc_get_header_field_named(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
         Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
         _ => return Ok(Some(Value::Object(None))),
     };
+    // Real-JDK carrier: read from the cached perform result, not synthetic slots.
+    if let Some(url_str) = huc_real_object_url(ctx, this) {
+        if url_str.starts_with("http://") || url_str.starts_with("https://") {
+            huc_real_perform(ctx, this, &url_str);
+            let v = huc_real_headers(ctx, this)
+                .into_iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(&name))
+                .map(|(_, v)| v);
+            return Ok(Some(match v {
+                Some(s) => Value::Object(Some(ctx.create_string(&s))),
+                None => Value::Object(None),
+            }));
+        }
+    }
     if !matches!(ctx.get_field(this, HUC_CONNECTED), Value::Int(1)) {
         ensure_connected(ctx, this)?;
     }
@@ -874,6 +1152,16 @@ fn huc_get_header_field_indexed(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     if idx < 0 {
         return Ok(Some(Value::Object(None)));
     }
+    if let Some(url_str) = huc_real_object_url(ctx, this) {
+        if url_str.starts_with("http://") || url_str.starts_with("https://") {
+            huc_real_perform(ctx, this, &url_str);
+            let v = huc_real_headers(ctx, this).get(idx as usize).cloned();
+            return Ok(Some(match v {
+                Some((_k, val)) => Value::Object(Some(ctx.create_string(&val))),
+                None => Value::Object(None),
+            }));
+        }
+    }
     ensure_connected(ctx, this)?;
     let v = with_state(ctx, this, |s| s.response_headers.get(idx as usize).cloned()).flatten();
     match v {
@@ -894,6 +1182,16 @@ fn huc_get_header_field_key_indexed(
     if idx < 0 {
         return Ok(Some(Value::Object(None)));
     }
+    if let Some(url_str) = huc_real_object_url(ctx, this) {
+        if url_str.starts_with("http://") || url_str.starts_with("https://") {
+            huc_real_perform(ctx, this, &url_str);
+            let v = huc_real_headers(ctx, this).get(idx as usize).cloned();
+            return Ok(Some(match v {
+                Some((k, _)) => Value::Object(Some(ctx.create_string(&k))),
+                None => Value::Object(None),
+            }));
+        }
+    }
     ensure_connected(ctx, this)?;
     let v = with_state(ctx, this, |s| s.response_headers.get(idx as usize).cloned()).flatten();
     match v {
@@ -905,8 +1203,36 @@ fn huc_get_header_field_key_indexed(
     }
 }
 
+/// `getHeaderFields()` — the `Map<String,List<String>>` accessor the JDK's
+/// `URLConnection` exposes and `TomcatBaseTest.methodUrl` reads `resHead` from.
+/// Registered nowhere before this fix, so it fell through to real-JDK bytecode
+/// that reads response state our shim never populated → empty map.
+fn huc_get_header_fields(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let headers = if let Some(url_str) = huc_real_object_url(ctx, this) {
+        if url_str.starts_with("http://") || url_str.starts_with("https://") {
+            huc_real_perform(ctx, this, &url_str);
+            huc_real_headers(ctx, this)
+        } else {
+            ensure_connected(ctx, this)?;
+            with_state(ctx, this, |s| s.response_headers.clone()).unwrap_or_default()
+        }
+    } else {
+        ensure_connected(ctx, this)?;
+        with_state(ctx, this, |s| s.response_headers.clone()).unwrap_or_default()
+    };
+    let map = build_header_map(ctx, &headers)?;
+    Ok(Some(Value::Object(Some(map))))
+}
+
 fn huc_get_content_length(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
+    if let Some(url_str) = huc_real_object_url(ctx, this) {
+        if url_str.starts_with("http://") || url_str.starts_with("https://") {
+            huc_real_perform(ctx, this, &url_str);
+            return Ok(Some(Value::Int(huc_real_body(ctx, this).len() as i32)));
+        }
+    }
     if !matches!(ctx.get_field(this, HUC_CONNECTED), Value::Int(1)) {
         ensure_connected(ctx, this)?;
     }
@@ -916,6 +1242,12 @@ fn huc_get_content_length(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
 
 fn huc_get_content_length_long(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
+    if let Some(url_str) = huc_real_object_url(ctx, this) {
+        if url_str.starts_with("http://") || url_str.starts_with("https://") {
+            huc_real_perform(ctx, this, &url_str);
+            return Ok(Some(Value::Long(huc_real_body(ctx, this).len() as i64)));
+        }
+    }
     if !matches!(ctx.get_field(this, HUC_CONNECTED), Value::Int(1)) {
         ensure_connected(ctx, this)?;
     }
@@ -925,6 +1257,12 @@ fn huc_get_content_length_long(ctx: &mut dyn NativeContext, args: &[Value]) -> M
 
 fn huc_disconnect(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
+    // Real carrier: clear identity-keyed side-table state, never write synthetic
+    // slots (they alias real fields on a real-JDK object).
+    if is_real_carrier(ctx, this) {
+        real_forget(ctx, this);
+        return Ok(None);
+    }
     if let Value::Int(id) = ctx.get_field(this, HUC_CONN_ID) {
         if id > 0 {
             if let Ok(mut reg) = registry().lock() {
@@ -951,6 +1289,10 @@ fn huc_set_request_method(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     ) {
         return Err(iae(format!("invalid HTTP method: {m}")));
     }
+    if is_real_carrier(ctx, this) {
+        with_real_req(ctx, this, |r| r.method = normalized);
+        return Ok(None);
+    }
     let s = ctx.create_string(&normalized);
     ctx.set_field(this, HUC_METHOD, Value::Object(Some(s)));
     Ok(None)
@@ -958,6 +1300,17 @@ fn huc_set_request_method(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
 
 fn huc_get_request_method(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
+    if is_real_carrier(ctx, this) {
+        let m = with_real_req(ctx, this, |r| {
+            if r.method.is_empty() {
+                "GET".to_string()
+            } else {
+                r.method.clone()
+            }
+        });
+        let s = ctx.create_string(&m);
+        return Ok(Some(Value::Object(Some(s))));
+    }
     let m = match ctx.get_field(this, HUC_METHOD) {
         Value::Object(Some(s)) => s,
         _ => ctx.create_string("GET"),
@@ -975,6 +1328,17 @@ fn huc_set_request_property(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
         _ => String::new(),
     };
+    // Real-JDK carrier: store into the identity-keyed header list (synthetic
+    // slot 3 lands on an unrelated real field → header silently dropped, which
+    // is the dropped-`Authorization`/`Origin` 401/403 bug). setRequestProperty
+    // replaces any existing values for the key.
+    if is_real_carrier(ctx, this) {
+        with_real_req(ctx, this, |r| {
+            r.headers.retain(|(k, _)| !k.eq_ignore_ascii_case(&key));
+            r.headers.push((key.clone(), value.clone()));
+        });
+        return Ok(None);
+    }
     let line = ctx.create_string(&format!("{key}: {value}"));
     let arr = match ctx.get_field(this, HUC_REQ_HEADERS) {
         Value::Object(Some(a)) => a,
@@ -1016,6 +1380,10 @@ fn huc_add_request_property(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
         _ => String::new(),
     };
+    if is_real_carrier(ctx, this) {
+        with_real_req(ctx, this, |r| r.headers.push((key.clone(), value.clone())));
+        return Ok(None);
+    }
     let line = ctx.create_string(&format!("{key}: {value}"));
     let arr = match ctx.get_field(this, HUC_REQ_HEADERS) {
         Value::Object(Some(a)) => a,
@@ -1035,9 +1403,61 @@ fn huc_add_request_property(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     Ok(None)
 }
 
+/// `getRequestProperty(String)` — read back a request header. The JDK joins
+/// multiple `addRequestProperty` values with ", ". Registered as a native so a
+/// real-JDK carrier reads from our identity-keyed header list rather than the
+/// real `requests` map our setter never populated (which returned null).
+fn huc_get_request_property(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let key = match args.get(1) {
+        Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let joined: Option<String> = if is_real_carrier(ctx, this) {
+        with_real_req(ctx, this, |r| {
+            let vals: Vec<String> = r
+                .headers
+                .iter()
+                .filter(|(k, _)| k.eq_ignore_ascii_case(&key))
+                .map(|(_, v)| v.clone())
+                .collect();
+            if vals.is_empty() {
+                None
+            } else {
+                Some(vals.join(", "))
+            }
+        })
+    } else if let Value::Object(Some(arr)) = ctx.get_field(this, HUC_REQ_HEADERS) {
+        let len = ctx.array_length(arr);
+        let mut found: Option<String> = None;
+        for i in 0..len {
+            if let Value::Object(Some(s)) = ctx.get_array_element(arr, i) {
+                let line = ctx.read_string(s).unwrap_or_default();
+                if let Some(colon) = line.find(':') {
+                    if line[..colon].trim().eq_ignore_ascii_case(&key) {
+                        found = Some(line[colon + 1..].trim().to_string());
+                    }
+                }
+            }
+        }
+        found
+    } else {
+        None
+    };
+    Ok(Some(match joined {
+        Some(s) => Value::Object(Some(ctx.create_string(&s))),
+        None => Value::Object(None),
+    }))
+}
+
 fn huc_set_do_input(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let v = args.get(1).and_then(|v| v.as_int()).unwrap_or(1);
+    // Real carrier: doInput defaults true and is not consulted by our perform;
+    // never write a synthetic slot on a real object (it corrupts a real field).
+    if is_real_carrier(ctx, this) {
+        return Ok(None);
+    }
     ctx.set_field(this, HUC_DO_INPUT, Value::Int(v));
     Ok(None)
 }
@@ -1045,6 +1465,10 @@ fn huc_set_do_input(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
 fn huc_set_do_output(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let v = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
+    if is_real_carrier(ctx, this) {
+        with_real_req(ctx, this, |r| r.do_output = v != 0);
+        return Ok(None);
+    }
     ctx.set_field(this, HUC_DO_OUTPUT, Value::Int(v));
     Ok(None)
 }
@@ -1054,6 +1478,9 @@ fn huc_set_connect_timeout(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     let v = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
     if v < 0 {
         return Err(iae("setConnectTimeout: negative"));
+    }
+    if is_real_carrier(ctx, this) {
+        return Ok(None);
     }
     ctx.set_field(this, HUC_CONNECT_TIMEOUT, Value::Int(v));
     Ok(None)
@@ -1065,6 +1492,9 @@ fn huc_set_read_timeout(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     if v < 0 {
         return Err(iae("setReadTimeout: negative"));
     }
+    if is_real_carrier(ctx, this) {
+        return Ok(None);
+    }
     ctx.set_field(this, HUC_READ_TIMEOUT, Value::Int(v));
     Ok(None)
 }
@@ -1075,6 +1505,9 @@ fn huc_set_instance_follow_redirects(
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let v = args.get(1).and_then(|v| v.as_int()).unwrap_or(1);
+    if is_real_carrier(ctx, this) {
+        return Ok(None);
+    }
     ctx.set_field(this, HUC_INSTANCE_FOLLOW_REDIRECTS, Value::Int(v));
     Ok(None)
 }
@@ -1084,6 +1517,9 @@ fn huc_get_instance_follow_redirects(
     args: &[Value],
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
+    if is_real_carrier(ctx, this) {
+        return Ok(Some(Value::Int(1)));
+    }
     Ok(Some(ctx.get_field(this, HUC_INSTANCE_FOLLOW_REDIRECTS)))
 }
 
@@ -1145,6 +1581,12 @@ fn register_one(r: &mut NativeMethodRegistry, cls: &str) {
         "(I)Ljava/lang/String;",
         huc_get_header_field_key_indexed,
     );
+    r.register(
+        cls,
+        "getHeaderFields",
+        "()Ljava/util/Map;",
+        huc_get_header_fields,
+    );
     r.register(cls, "getContentLength", "()I", huc_get_content_length);
     r.register(
         cls,
@@ -1176,6 +1618,12 @@ fn register_one(r: &mut NativeMethodRegistry, cls: &str) {
         "addRequestProperty",
         "(Ljava/lang/String;Ljava/lang/String;)V",
         huc_add_request_property,
+    );
+    r.register(
+        cls,
+        "getRequestProperty",
+        "(Ljava/lang/String;)Ljava/lang/String;",
+        huc_get_request_property,
     );
     r.register(cls, "setDoInput", "(Z)V", huc_set_do_input);
     r.register(cls, "setDoOutput", "(Z)V", huc_set_do_output);
