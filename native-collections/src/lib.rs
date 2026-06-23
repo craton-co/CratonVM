@@ -8929,7 +8929,8 @@ fn freeze_result(
 ) -> MethodCallResult {
     match result? {
         Some(Value::Object(Some(backing))) => {
-            let w = alloc_unmod_wrapper(ctx, wrapper_class, backing);
+            // Immutable `*.of` product → `java.util.ImmutableCollections$*`.
+            let w = alloc_immutable_wrapper(ctx, wrapper_class, backing);
             Ok(Some(Value::Object(Some(w))))
         }
         other => Ok(other),
@@ -27292,6 +27293,16 @@ const UNMOD_LIST_ITR_CLASS: &str = "cratonvm/internal/UnmodifiableListItr";
 /// Slot 0 of every wrapper holds the backing collection / iterator.
 const UNMOD_FIELD_BACKING: usize = 0;
 
+/// Slot 1 distinguishes the *immutable* `List.of`/`Set.of`/`Map.of`/`copyOf`
+/// factories (`Int(1)`) from the *unmodifiable* `Collections.unmodifiable*`
+/// wrappers (default). Both share the same `cratonvm/internal/Unmodifiable*`
+/// stamp but report different concrete classes from `getClass()`
+/// (`ImmutableCollections$*` vs `Collections$Unmodifiable*`). Set only by
+/// `freeze_result`. CONTRACT: this slot index is mirrored by
+/// `getclass_immutable_marker` in native-builtins (the `getClass()` display
+/// map); keep the two in sync.
+const UNMOD_FIELD_IMMUTABLE: usize = 1;
+
 /// Build an `UnsupportedOperationException` error for a blocked mutator.
 fn unsupported_op() -> MethodCallFailed {
     RuntimeError::UnsupportedOperationException {
@@ -27301,13 +27312,31 @@ fn unsupported_op() -> MethodCallFailed {
 }
 
 /// Allocate an unmodifiable wrapper of `class_name` around `backing`.
+///
+/// Two slots: slot 0 = backing collection (read by every wrapper native), slot
+/// 1 = the [`UNMOD_FIELD_IMMUTABLE`] marker, left at its default here and set to
+/// `Int(1)` only by `freeze_result` for the immutable `*.of`/`copyOf` factories.
 fn alloc_unmod_wrapper(
     ctx: &mut dyn NativeContext,
     class_name: &str,
     backing: ObjectRef,
 ) -> ObjectRef {
-    let wrapper = alloc_synthetic(ctx, class_name, 1);
+    let wrapper = alloc_synthetic(ctx, class_name, 2);
     ctx.set_field(wrapper, UNMOD_FIELD_BACKING, Value::Object(Some(backing)));
+    wrapper
+}
+
+/// Allocate an *immutable*-collection wrapper (the `List.of`/`Set.of`/`Map.of`/
+/// `copyOf` factories) — an unmodifiable wrapper with the [`UNMOD_FIELD_IMMUTABLE`]
+/// marker set, so `getClass()` reports the `java.util.ImmutableCollections$*`
+/// family rather than `Collections$Unmodifiable*`.
+fn alloc_immutable_wrapper(
+    ctx: &mut dyn NativeContext,
+    class_name: &str,
+    backing: ObjectRef,
+) -> ObjectRef {
+    let wrapper = alloc_unmod_wrapper(ctx, class_name, backing);
+    ctx.set_field(wrapper, UNMOD_FIELD_IMMUTABLE, Value::Int(1));
     wrapper
 }
 
@@ -28606,7 +28635,7 @@ fn native_list_copy_of(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     let src = args.first().copied().unwrap_or(Value::Object(None));
     let backing = alloc_synthetic(ctx, "java/util/ArrayList", AL_NUM_FIELDS);
     native_al_init_from_collection(ctx, &[Value::Object(Some(backing)), src])?;
-    Ok(Some(Value::Object(Some(alloc_unmod_wrapper(
+    Ok(Some(Value::Object(Some(alloc_immutable_wrapper(
         ctx,
         UNMOD_LIST_CLASS,
         backing,
@@ -28617,7 +28646,7 @@ fn native_set_copy_of(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     let src = args.first().copied().unwrap_or(Value::Object(None));
     let backing = alloc_synthetic(ctx, "java/util/HashSet", HS_NUM_FIELDS);
     native_hs_init_from_collection(ctx, &[Value::Object(Some(backing)), src])?;
-    Ok(Some(Value::Object(Some(alloc_unmod_wrapper(
+    Ok(Some(Value::Object(Some(alloc_immutable_wrapper(
         ctx,
         UNMOD_SET_CLASS,
         backing,
@@ -28628,7 +28657,7 @@ fn native_map_copy_of(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     let src = args.first().copied().unwrap_or(Value::Object(None));
     let backing = alloc_synthetic(ctx, "java/util/HashMap", MAP_NUM_FIELDS);
     native_map_init_from_map(ctx, &[Value::Object(Some(backing)), src])?;
-    Ok(Some(Value::Object(Some(alloc_unmod_wrapper(
+    Ok(Some(Value::Object(Some(alloc_immutable_wrapper(
         ctx,
         UNMOD_MAP_CLASS,
         backing,

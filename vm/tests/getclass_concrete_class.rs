@@ -29,22 +29,29 @@ const PROBE_SRC: &str = r#"
 import java.net.URI;
 import java.net.URLConnection;
 import java.nio.file.FileSystems;
-import java.util.List;
-import java.util.Map;
-import java.util.Set;
+import java.util.*;
 import java.util.stream.IntStream;
 
 public class GetClassProbe {
+  static String c(Object o){return o.getClass().getName();}
   public static void main(String[] a) throws Exception {
-    System.out.println("intRange=" + IntStream.rangeClosed(1, 4).getClass().getName());
-    System.out.println("listEmpty=" + List.of().getClass().getName());
-    System.out.println("list2=" + List.of(1, 2).getClass().getName());
-    System.out.println("list3=" + List.of(1, 2, 3).getClass().getName());
-    System.out.println("set2=" + Set.of(1, 2).getClass().getName());
-    System.out.println("map1=" + Map.of(1, 2).getClass().getName());
-    System.out.println("fs=" + FileSystems.getDefault().getClass().getName());
+    System.out.println("intRange=" + c(IntStream.rangeClosed(1, 4)));
+    // Immutable factories -> ImmutableCollections (size-discriminated).
+    System.out.println("listEmpty=" + c(List.of()));
+    System.out.println("list2=" + c(List.of(1, 2)));
+    System.out.println("list3=" + c(List.of(1, 2, 3)));
+    System.out.println("set2=" + c(Set.of(1, 2)));
+    System.out.println("map1=" + c(Map.of(1, 2)));
+    System.out.println("copyOf=" + c(List.copyOf(new ArrayList<>(List.of(1, 2)))));
+    // Unmodifiable wrappers -> Collections$Unmodifiable* (lists split on RandomAccess).
+    System.out.println("unmodRA=" + c(Collections.unmodifiableList(new ArrayList<>(List.of(1, 2)))));
+    System.out.println("unmodLL=" + c(Collections.unmodifiableList(new LinkedList<>(List.of(1, 2)))));
+    System.out.println("unmodSet=" + c(Collections.unmodifiableSet(new HashSet<>(Set.of(1)))));
+    System.out.println("unmodMap=" + c(Collections.unmodifiableMap(new HashMap<>(Map.of(1, 2)))));
+    System.out.println("unmodColl=" + c(Collections.unmodifiableCollection(new ArrayList<>(List.of(1)))));
+    System.out.println("fs=" + c(FileSystems.getDefault()));
     URLConnection jc = URI.create("jar:file:/none.jar!/x").toURL().openConnection();
-    System.out.println("jarConn=" + jc.getClass().getName());
+    System.out.println("jarConn=" + c(jc));
     System.out.println("OK");
   }
 }
@@ -195,11 +202,26 @@ fn getclass_reports_concrete_classes() {
         "java.util.stream.IntPipeline$Head",
         "IntStream.rangeClosed must report a concrete IntPipeline class, not the interface"
     );
+    // Immutable factories.
     assert_eq!(line("listEmpty="), "java.util.ImmutableCollections$ListN");
     assert_eq!(line("list2="), "java.util.ImmutableCollections$List12");
     assert_eq!(line("list3="), "java.util.ImmutableCollections$ListN");
     assert_eq!(line("set2="), "java.util.ImmutableCollections$Set12");
     assert_eq!(line("map1="), "java.util.ImmutableCollections$Map1");
+    assert_eq!(line("copyOf="), "java.util.ImmutableCollections$List12");
+    // Unmodifiable wrappers — distinct from the immutable family, and lists
+    // split on RandomAccess (ArrayList vs LinkedList backing).
+    assert_eq!(
+        line("unmodRA="),
+        "java.util.Collections$UnmodifiableRandomAccessList"
+    );
+    assert_eq!(line("unmodLL="), "java.util.Collections$UnmodifiableList");
+    assert_eq!(line("unmodSet="), "java.util.Collections$UnmodifiableSet");
+    assert_eq!(line("unmodMap="), "java.util.Collections$UnmodifiableMap");
+    assert_eq!(
+        line("unmodColl="),
+        "java.util.Collections$UnmodifiableCollection"
+    );
     assert_eq!(
         line("jarConn="),
         "sun.net.www.protocol.jar.JarURLConnection",
