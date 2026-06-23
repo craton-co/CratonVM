@@ -922,11 +922,6 @@ fn collect_hashtable_pairs(ctx: &dyn NativeContext, this: ObjectRef) -> Vec<(Val
     out
 }
 
-/// `java/util/Properties.defaults` field index in the native layout. Mirrors
-/// the private `PROPS_FIELD_DEFAULTS` in `native-collections::lib.rs` (slot 3);
-/// kept in sync so `clone()` can carry the defaults chain across.
-const PROPS_FIELD_DEFAULTS: usize = 3;
-
 /// `java/util/Hashtable.clone()Ljava/lang/Object;`
 ///
 /// CratonVM models `Hashtable`/`Properties` natively: `put` stores synthetic
@@ -938,17 +933,20 @@ const PROPS_FIELD_DEFAULTS: usize = 3;
 /// `new InitialDirContext(env)` blew up before any LDAP socket; bug TC0622.)
 ///
 /// Shadow the broken real-JDK body: build a fresh natively-backed map of the
-/// receiver's concrete class (so `Properties.clone()` returns a `Properties`)
-/// and re-`put` each `(key, value)` pair through the native `put`. This matches
-/// `java.util.Hashtable.clone()` semantics — a fresh entry chain (deep) over the
-/// *same* key/value references (shallow) — without ever materialising a
-/// `Hashtable$Entry`. Purely additive: the real-JDK path is 100% broken for any
-/// natively-populated Hashtable, so there is nothing to regress.
+/// receiver's concrete class and re-`put` each `(key, value)` pair through the
+/// native `put`. This matches `java.util.Hashtable.clone()` semantics — a fresh
+/// entry chain (deep) over the *same* key/value references (shallow) — without
+/// ever materialising a `Hashtable$Entry`. Purely additive: the real-JDK path is
+/// 100% broken for any natively-populated Hashtable, so there is nothing to
+/// regress. (`Properties` is side-table backed and handled separately by the
+/// generic `Object.clone` native.)
 fn native_hashtable_clone(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
 
-    // Concrete class so `Properties.clone()` -> `Properties`, etc. Fall back to
-    // plain Hashtable if the lookup can't resolve a name.
+    // Concrete class (a user `Hashtable` subclass should clone as itself). Fall
+    // back to plain Hashtable if the lookup can't resolve a name. `Properties`
+    // never reaches here — it is side-table backed and handled by the generic
+    // `Object.clone` native (see the registration note).
     let cls = ctx
         .class_name_of_id(ctx.class_id_of_object(this))
         .unwrap_or_else(|| "java/util/Hashtable".to_string());
@@ -962,24 +960,6 @@ fn native_hashtable_clone(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     let mut pinned: Vec<(Value, Option<usize>, Value, Option<usize>)> =
         Vec::with_capacity(pairs.len());
     let mut base: Option<usize> = None;
-
-    // `Properties` extends `Hashtable` and inherits its `clone()`, which is a
-    // shallow field copy: the cloned Properties shares the same `defaults`
-    // chain (field 3). Our native `<init>` clears defaults to null, so capture
-    // it here (pre-allocation) and restore it onto the clone afterwards.
-    let is_props = cls == "java/util/Properties";
-    let defaults = if is_props {
-        ctx.get_field(this, PROPS_FIELD_DEFAULTS)
-    } else {
-        Value::Object(None)
-    };
-    let defaults_pin = if let Value::Object(Some(o)) = defaults {
-        let h = ctx.pin_native_root(o);
-        base.get_or_insert(h);
-        Some(h)
-    } else {
-        None
-    };
 
     for (k, v) in pairs {
         let kh = if let Value::Object(Some(o)) = k {
@@ -1050,18 +1030,6 @@ fn native_hashtable_clone(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     }
 
     let clone = ctx.read_native_pin(clone_pin, clone);
-
-    // Restore the shared `Properties.defaults` chain (shallow), if any.
-    if is_props {
-        let dv = match defaults_pin {
-            Some(h) => match defaults {
-                Value::Object(Some(o)) => Value::Object(Some(ctx.read_native_pin(h, o))),
-                _ => defaults,
-            },
-            None => defaults,
-        };
-        ctx.set_field(clone, PROPS_FIELD_DEFAULTS, dv);
-    }
 
     if let Some(b) = base {
         ctx.unpin_native_roots(b);
@@ -1776,11 +1744,19 @@ pub(crate) fn register_deprecated_util_natives(r: &mut NativeMethodRegistry) {
         "()Ljava/util/Enumeration;",
         native_hashtable_keys,
     );
-    // TC0622 — `Hashtable.clone()` (inherited by `Properties`). The real-JDK
-    // body casts our synthetic bucket nodes to `Hashtable$Entry` and throws
-    // CCE; shadow it with a native that rebuilds a fresh natively-backed map.
-    // Paired with the force-native overrides in `interpreter.rs` /
-    // `vm_exec.rs` so it wins over the real-JDK bytecode.
+    // TC0622 — `Hashtable.clone()`. CratonVM stores Hashtable entries as
+    // synthetic bucket nodes in the slot-0 `table[]`; the real-JDK clone body
+    // casts them to `Hashtable$Entry` and throws CCE. Shadow it with a native
+    // that rebuilds a fresh natively-backed map. Paired with the force-native
+    // overrides in `interpreter.rs` / `vm_exec.rs` so it wins over the real-JDK
+    // bytecode.
+    //
+    // NOTE: `Properties` (which extends Hashtable) is deliberately NOT routed
+    // here — it stores entries in an identity-keyed side-table
+    // (`properties_sidetable`), not the slot-0 buckets, so this slot-0 re-put
+    // would produce an empty clone. `Properties.clone()` is handled by the
+    // generic `Object.clone` native (`native_object_clone`), which shallow-
+    // copies the heap fields (incl. `defaults`) and copies the side-table.
     r.register(ht, "clone", "()Ljava/lang/Object;", native_hashtable_clone);
 
     // T8.2.10 — StringBufferInputStream
