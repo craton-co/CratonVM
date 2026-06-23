@@ -288,13 +288,17 @@ and already-consolidated ones (fam5/6) were left in place.
 ## The springrepos handoff (mostly fixed)
 
 [springrepos-extension-hang-jit-throughput-and-deep-recursion.md](springrepos-extension-hang-jit-throughput-and-deep-recursion.md)
-is a multi-defect handoff. `dev` now **passes** `SpringRepositoriesExtensionTests`.
-Of its decomposed defects: the `SecureClassLoader.pdcache` NPE, the
-`AssertionError`-preload JIT bail, the `hashCode`/`equals`-override JIT compile,
-and the root-snapshot hang are all **fixed on dev**. Its only still-relevant open
-items are **its "defect #2" (= family A3 above)** and **bug C** (the cold-path
-deep-recursion overflow). It is kept for that context and the deep-recursion
-stack-guard design.
+is a multi-defect handoff for `SpringRepositoriesExtensionTests`. The hang,
+parse-NPE (#1), generics (#2), and the indy `MethodHandle.type()` layers
+(3/3b/3c/3d) are all **fixed** — the test went from 0/11 (crashing) to **3/11
+clean (no crashes)**. The **last open layer is 3e**: a Groovy indy call on a
+**Mockito mock** (`this.repositories.maven { … }`) records no interaction, so the
+8 non-empty cases assert "expected size N but was 0" →
+[spring-boot-groovy-indy-mockito-mock-dispatch.md](spring-boot-groovy-indy-mockito-mock-dispatch.md).
+The 3c/3d fix writeup is in
+[`docs/internal/spring-boot-groovy-indy-runtime-argcount-3c-FIXED.md`](../internal/spring-boot-groovy-indy-runtime-argcount-3c-FIXED.md).
+Also still relevant: **defect #2 (= family A3 above)** and **bug C** (the
+cold-path deep-recursion overflow).
 
 ## Resolved standalone bugs (full writeups in `docs/internal/`)
 
