@@ -73,6 +73,40 @@ public class RReflect {
         check(Array.getInt(arr, 1) == 42 && Array.getLength(arr) == 3, "Array reflection");
         check(int[].class.isArray() && int[].class.getComponentType() == int.class, "array class");
 
+        // ---- getSimpleName / getCanonicalName on nested / top-level / array /
+        // anonymous classes (SBR-07). The nested type is resolved via
+        // Class.forName WITHOUT ever referencing its enclosing class in source,
+        // so the outer class is NOT loaded when getSimpleName runs — the exact
+        // shape (Kotlin's protobuf ProtoBuf$StringTable) that used to return the
+        // binary leaf "RReflectOuter$Nested" instead of "Nested" because
+        // getDeclaringClass0() couldn't see the unloaded outer.
+        Class<?> nested = Class.forName("RReflectOuter$Nested");
+        check(nested.getSimpleName().equals("Nested"), "nested getSimpleName (outer unloaded)");
+        check(nested.getCanonicalName().equals("RReflectOuter.Nested"), "nested getCanonicalName");
+        check(nested.getName().equals("RReflectOuter$Nested"), "nested getName");
+        // array of the (still-unloaded-outer) nested type -> "Nested[]"
+        Object nestedArr = Array.newInstance(nested, 0);
+        check(nestedArr.getClass().getSimpleName().equals("Nested[]"), "nested-array getSimpleName");
+        // top-level
+        check(String.class.getSimpleName().equals("String"), "top-level getSimpleName");
+        check(String.class.getCanonicalName().equals("java.lang.String"), "top-level getCanonicalName");
+        // primitive array
+        check(int[].class.getSimpleName().equals("int[]"), "primitive-array getSimpleName");
+        check(int[].class.getCanonicalName().equals("int[]"), "primitive-array getCanonicalName");
+        // anonymous class: simple name is "", canonical name is null
+        Object anon = new Object() {};
+        check(anon.getClass().getSimpleName().isEmpty(), "anonymous getSimpleName empty");
+        check(anon.getClass().getCanonicalName() == null, "anonymous getCanonicalName null");
+
         System.out.println("PASS RReflect (" + checks + " checks)");
     }
+}
+
+/**
+ * Sibling top-level helper for the SBR-07 nested-name checks. Deliberately
+ * referenced ONLY via {@code Class.forName("RReflectOuter$Nested")} so its
+ * enclosing class stays unloaded when {@code getSimpleName()} runs.
+ */
+class RReflectOuter {
+    static class Nested {}
 }

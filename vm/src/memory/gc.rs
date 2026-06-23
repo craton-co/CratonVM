@@ -222,6 +222,19 @@ pub fn update_all_roots(
         }
     }
 
+    // 8a. Canonical java.lang.Module mirrors (companion to root scan in
+    //     roots.rs section 8a).
+    {
+        let mut module_mirrors = shared.module_mirrors.write();
+        for obj_ref in module_mirrors.values_mut() {
+            let old_addr = obj_ref.as_ptr() as usize;
+            if let Some(&new_addr) = pointer_map.get(&old_addr) {
+                debug_assert!(new_addr != 0, "GC pointer map contains null address");
+                *obj_ref = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+            }
+        }
+    }
+
     // 9. JNI global references — update stored ObjectRefs inside each Box<ObjectRef>.
     {
         shared.jni_global_refs.lock().update_after_gc(pointer_map);

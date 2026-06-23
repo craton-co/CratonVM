@@ -3957,6 +3957,32 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         "getModule",
         "()Ljava/lang/Module;",
         |ctx, args| {
+            if std::env::var_os("CRATONVM_DBG_GETMODULE").is_some() {
+                eprintln!("[dbg-getmodule] lib.rs getModule native FIRED");
+            }
+            // Resolve the receiver class's module name FIRST so we can return the
+            // canonical (cached) Module instance for that module. The JDK compares
+            // Modules by identity (`Module` does not override `equals`), so every
+            // class in a module MUST observe the SAME Module object. Allocating a
+            // fresh Module per call broke `Throwable.validateSuppressedExceptionsList`
+            // (`Object.class.getModule() == deserList.getClass().getModule()`),
+            // which throws `StreamCorruptedException("List implementation not in
+            // base module.")` on any ObjectInputStream round-trip of an object
+            // holding a java.util List — HIB-CV-29.
+            let module_name: Option<String> = if let Some(Value::Object(Some(mirror))) = args.first()
+            {
+                let class_id = ctx.class_id_of_object(*mirror);
+                ctx.module_name_of_class(class_id)
+            } else {
+                None
+            };
+
+            // Canonical-cache hit: hand back the existing Module mirror so
+            // identity comparisons across classes in the same module succeed.
+            if let Some(cached) = ctx.get_cached_module_mirror(module_name.as_deref()) {
+                return Ok(Some(Value::Object(Some(cached))));
+            }
+
             let m_obj = alloc_concurrent_synthetic(ctx, "java/lang/Module", 2);
             // GC-safety: `create_string` below allocates (String + char[]) and
             // can trigger a moving GC. `m_obj` lives only in this Rust local —
@@ -3967,17 +3993,17 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             // Pin across the allocation and read the forwarded ref back. Same
             // bug class as reference_classloader_gc_root_gap.
             let pin = ctx.pin_native_root(m_obj);
-            let module_name_val = if let Some(Value::Object(Some(mirror))) = args.first() {
-                let class_id = ctx.class_id_of_object(*mirror);
-                ctx.module_name_of_class(class_id)
-                    .map(|name| Value::Object(Some(ctx.create_string(&name))))
-                    .unwrap_or(Value::Object(None))
-            } else {
-                Value::Object(None)
-            };
+            let module_name_val = module_name
+                .as_deref()
+                .map(|name| Value::Object(Some(ctx.create_string(name))))
+                .unwrap_or(Value::Object(None));
             let m_obj = ctx.read_native_pin(pin, m_obj);
             ctx.set_field(m_obj, 0, module_name_val);
             ctx.unpin_native_roots(pin);
+            // Publish as the canonical mirror for this module name so future
+            // getModule() calls (and the JDK's identity comparisons) see the
+            // same instance. The VM registers it as a permanent GC root.
+            ctx.cache_module_mirror(module_name.as_deref(), m_obj);
             Ok(Some(Value::Object(Some(m_obj))))
         },
     );
@@ -4513,8 +4539,7 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         "getProtectionDomain",
         "()Ljava/security/ProtectionDomain;",
         |ctx, args| {
-            let perms = alloc_concurrent_synthetic(ctx, "java/security/Permissions", 1);
-            let pd = alloc_concurrent_synthetic(ctx, "java/security/ProtectionDomain", 2);
+            let pd = alloc_concurrent_synthetic(ctx, "java/security/ProtectionDomain", 4);
             // Try to produce a real CodeSource with a URL pointing at the
             // classpath entry that holds this Class.
             let mut path_opt = if let Some(Value::Object(Some(mirror))) = args.first() {
@@ -4547,7 +4572,7 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
                         .filter(|s| !s.is_empty())
                 })
             });
-            if let Some(raw_path) = path_opt {
+            let codesource = if let Some(raw_path) = path_opt {
                 // R63 (Keycloak/Quarkus): `find_class_source_path` returns the
                 // classpath entry verbatim — which may be a relative path like
                 // `lib/quarkus-run.jar` when launched via `cd <appdir> && --jar
@@ -4609,11 +4634,22 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
                 let cs = alloc_concurrent_synthetic(ctx, "java/security/CodeSource", 2);
                 ctx.set_field(cs, 0, Value::Object(Some(url)));
                 ctx.set_field(cs, 1, Value::Object(None));
-                ctx.set_field(pd, 0, Value::Object(Some(cs)));
+                Value::Object(Some(cs))
             } else {
-                ctx.set_field(pd, 0, Value::Object(None));
-            }
-            ctx.set_field(pd, 1, Value::Object(Some(perms)));
+                Value::Object(None)
+            };
+            // SBR-13: populate `classloader` (the class's real defining loader,
+            // matching `Class.getClassLoader()`) and a non-null (empty)
+            // `permissions` collection. The previous code allocated only the
+            // codesource + a Permissions on slot 1 — but slot 1 is the
+            // `classloader` field in the real-JDK `ProtectionDomain` layout, so
+            // `getClassLoader()` returned the Permissions object and
+            // `getPermissions()` was null.
+            let classloader = lang_class::native_class_get_class_loader(ctx, args)
+                .ok()
+                .flatten()
+                .unwrap_or(Value::Object(None));
+            lang_class::populate_protection_domain_fields(ctx, pd, codesource, classloader);
             Ok(Some(Value::Object(Some(pd))))
         },
     );
@@ -8530,6 +8566,64 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // Also register `ZoneInfoFile.getZoneInfo0(String)` as a safety net
     // for any direct caller — returns null so callers fall through to
     // GMT.
+    // HIB-CV-34: standard (non-DST) UTC offset in seconds for common IANA zone
+    // ids. Mirrors `util_time::iana_zone_offset_seconds`, duplicated here because
+    // that module is `#[cfg(feature = "synthetic-jdk")]`-gated and not compiled
+    // in the default real-JDK build, where `alloc_synth_timezone` lives.
+    fn tz_standard_offset_seconds(zone_id: &str) -> Option<i32> {
+        match zone_id {
+            "UTC" | "GMT" | "Etc/UTC" | "Etc/GMT" | "Z" | "Atlantic/Reykjavik"
+            | "Europe/London" | "GB" => Some(0),
+            "US/Eastern" | "America/New_York" | "America/Bogota" => Some(-5 * 3600),
+            "US/Central" | "America/Chicago" | "America/Mexico_City" => Some(-6 * 3600),
+            "US/Mountain" | "America/Denver" => Some(-7 * 3600),
+            "US/Pacific" | "America/Los_Angeles" => Some(-8 * 3600),
+            "America/Anchorage" => Some(-9 * 3600),
+            "Pacific/Honolulu" | "US/Hawaii" => Some(-10 * 3600),
+            "America/Sao_Paulo" | "America/Argentina/Buenos_Aires" => Some(-3 * 3600),
+            "America/Santiago" => Some(-4 * 3600),
+            "Europe/Paris" | "Europe/Berlin" | "Europe/Rome" | "Europe/Madrid" | "CET" => {
+                Some(3600)
+            }
+            "Europe/Athens" | "Europe/Bucharest" | "Europe/Helsinki" | "EET" => Some(2 * 3600),
+            "Europe/Moscow" | "Europe/Istanbul" => Some(3 * 3600),
+            "Asia/Dubai" => Some(4 * 3600),
+            "Asia/Karachi" => Some(5 * 3600),
+            "Asia/Kolkata" | "Asia/Calcutta" => Some(5 * 3600 + 1800),
+            "Asia/Dhaka" => Some(6 * 3600),
+            "Asia/Bangkok" | "Asia/Jakarta" => Some(7 * 3600),
+            "Asia/Shanghai" | "Asia/Hong_Kong" | "Asia/Singapore" | "Asia/Taipei" | "PRC"
+            | "Australia/Perth" => Some(8 * 3600),
+            "Asia/Tokyo" | "Japan" | "Asia/Seoul" | "ROK" => Some(9 * 3600),
+            "Australia/Adelaide" => Some(9 * 3600 + 1800),
+            "Australia/Sydney" | "Australia/Melbourne" => Some(10 * 3600),
+            "Pacific/Auckland" | "NZ" | "Pacific/Fiji" => Some(12 * 3600),
+            "Africa/Cairo" | "Africa/Johannesburg" => Some(2 * 3600),
+            "Africa/Lagos" => Some(3600),
+            "Africa/Nairobi" => Some(3 * 3600),
+            _ => {
+                // GMT+HH:MM / -HH:MM and Etc/GMT±N (inverted sign).
+                if let Some(rest) = zone_id.strip_prefix("Etc/GMT") {
+                    rest.parse::<i32>().ok().map(|h| -h * 3600)
+                } else {
+                    let body = zone_id
+                        .strip_prefix("GMT")
+                        .or_else(|| zone_id.strip_prefix("UTC"))
+                        .unwrap_or(zone_id);
+                    if body.starts_with('+') || body.starts_with('-') {
+                        let sign = if body.starts_with('-') { -1 } else { 1 };
+                        let parts: Vec<&str> = body[1..].split(':').collect();
+                        let h: i32 = parts.first()?.parse().ok()?;
+                        let m: i32 = parts.get(1).and_then(|p| p.parse().ok()).unwrap_or(0);
+                        Some(sign * (h * 3600 + m * 60))
+                    } else {
+                        None
+                    }
+                }
+            }
+        }
+    }
+
     fn alloc_synth_timezone(ctx: &mut dyn NativeContext, id_str: &str) -> cratonvm_types::Value {
         // Prefer sun/util/calendar/ZoneInfo (concrete subclass of TimeZone).
         // Fall back to allocating with class-id 0 if init fails — the
@@ -8549,7 +8643,17 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         // resolve into the correct inherited slot.
         ctx.set_field_by_name(obj, "ID", Value::Object(Some(s)));
         // ZoneInfo subclass fields — best-effort, no-op if missing.
-        ctx.set_field_by_name(obj, "rawOffset", Value::Int(0));
+        // HIB-CV-34: wire the standard UTC offset (ms) from the IANA table so
+        // getRawOffset()/getOffset(long) return the real zone offset instead of
+        // 0. Without transition data this is a standard-offset-year-round
+        // approximation (no DST), but it fixes the silent N-hour shift that
+        // corrupted every custom-zone JDBC timestamp (e.g. America/Los_Angeles
+        // returned 0 instead of -28800000). `transitions` stays null, so
+        // ZoneInfo.getOffset(long) returns this rawOffset for all instants.
+        let raw_offset_ms = tz_standard_offset_seconds(id_str)
+            .unwrap_or(0)
+            .saturating_mul(1000);
+        ctx.set_field_by_name(obj, "rawOffset", Value::Int(raw_offset_ms));
         ctx.set_field_by_name(obj, "rawOffsetDiff", Value::Int(0));
         ctx.set_field_by_name(obj, "dstSavings", Value::Int(0));
         cratonvm_types::Value::Object(Some(obj))
@@ -13412,6 +13516,205 @@ fn native_object_hash_code(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     Ok(Some(Value::Int(hash)))
 }
 
+/// Map a synthetic object's stamped class — an interface, an abstract class, or
+/// a craton-internal backing class — to the concrete, JDK-plausible class that a
+/// real HotSpot JVM reports from `Object.getClass()`.
+///
+/// Several CratonVM synthetic factories stamp their result with the *interface*
+/// or *abstract* type it stands in for (e.g. `IntStream.rangeClosed(..)` →
+/// the `java/util/stream/IntStream` interface, `FileSystems.getDefault()` →
+/// the abstract `java/nio/file/FileSystem`) or with a private craton-internal
+/// name (`List.of(..)` → `cratonvm/internal/UnmodifiableList`). On a real JVM an
+/// instance's runtime class is always concrete, so `getClass()` must never
+/// surface an interface/abstract/internal type. Native method *dispatch* keys on
+/// the resolved declaring class, not the receiver's stamp (see
+/// `interpreter.rs`), so re-reporting the class here is decoupled from method
+/// resolution — it changes only the Java-visible `Class` mirror, not storage,
+/// dispatch, or GC layout.
+///
+/// Returns the internal (slash-separated) name of the concrete substitute for a
+/// stamp whose concrete class is fixed (does not depend on the instance), or
+/// `None`. Size-dependent immutable-collection stamps are handled separately by
+/// [`immutable_collection_kind`] because their concrete class varies with the
+/// element count.
+fn jdk_concrete_getclass_alias(stamp: &str) -> Option<&'static str> {
+    Some(match stamp {
+        // java.util.stream — synthetic streams are stamped with the *interface*.
+        // (`IntStream.of(..)` already produces a real `IntPipeline$Head`, so its
+        // objects are not stamped with the interface and never reach here.)
+        "java/util/stream/Stream" => "java/util/stream/ReferencePipeline$Head",
+        "java/util/stream/IntStream" => "java/util/stream/IntPipeline$Head",
+        "java/util/stream/LongStream" => "java/util/stream/LongPipeline$Head",
+        "java/util/stream/DoubleStream" => "java/util/stream/DoublePipeline$Head",
+        // java.net — abstract URLConnection subclasses.
+        "java/net/JarURLConnection" => "sun/net/www/protocol/jar/JarURLConnection",
+        "java/net/HttpURLConnection" => "sun/net/www/protocol/http/HttpURLConnection",
+        // java.nio.file — abstract/interface stamps; the concrete impl is
+        // platform specific. Resolution is best-effort: an unavailable class
+        // simply falls back to the stamped mirror (see caller).
+        "java/nio/file/FileSystem" => {
+            if cfg!(windows) {
+                "sun/nio/fs/WindowsFileSystem"
+            } else {
+                "sun/nio/fs/UnixFileSystem"
+            }
+        }
+        "java/nio/file/spi/FileSystemProvider" => {
+            if cfg!(windows) {
+                "sun/nio/fs/WindowsFileSystemProvider"
+            } else {
+                "sun/nio/fs/UnixFileSystemProvider"
+            }
+        }
+        "java/nio/file/Path" => {
+            if cfg!(windows) {
+                "sun/nio/fs/WindowsPath"
+            } else {
+                "sun/nio/fs/UnixPath"
+            }
+        }
+        _ => return None,
+    })
+}
+
+/// The resolved display strategy for a stamped class, memoised per stamp.
+#[derive(Clone, Copy)]
+enum GetClassDisplay {
+    /// No remap — report the stamped class unchanged (the common case).
+    Stamp,
+    /// A fixed concrete alias, already resolved to its `ClassId`.
+    Fixed(cratonvm_types::ClassId),
+    /// `java.util` immutable-collection family. HotSpot picks the concrete
+    /// class by element count (`List12`/`ListN`, `Set12`/`SetN`, `Map1`/`MapN`),
+    /// so this is resolved per-object rather than memoised to a single class.
+    ImmutableList,
+    ImmutableSet,
+    ImmutableMap,
+}
+
+/// Classify the craton-internal immutable/unmodifiable collection stamps.
+/// `List.of`/`copyOf` and `Collections.unmodifiableList` currently share one
+/// backing class, so a wrapper produced by `unmodifiableList` is also reported
+/// with the `List.of` concrete family here; the distinct
+/// `Collections$UnmodifiableRandomAccessList` would need a stamp split
+/// (deferred — see SBR-12).
+fn immutable_collection_kind(stamp: &str) -> Option<GetClassDisplay> {
+    match stamp {
+        "cratonvm/internal/UnmodifiableList" => Some(GetClassDisplay::ImmutableList),
+        "cratonvm/internal/UnmodifiableSet" => Some(GetClassDisplay::ImmutableSet),
+        "cratonvm/internal/UnmodifiableMap" => Some(GetClassDisplay::ImmutableMap),
+        _ => None,
+    }
+}
+
+thread_local! {
+    // Per-stamp memo for the display strategy. `getClass()`/`toString()` are
+    // hot; resolving the stamped name (a `String` clone) and loading the alias
+    // on every call would allocate each time. `ClassId`s are stable for the VM
+    // lifetime, so this never goes stale.
+    static GETCLASS_ALIAS_CACHE: std::cell::RefCell<
+        std::collections::HashMap<cratonvm_types::ClassId, GetClassDisplay>,
+    > = std::cell::RefCell::new(std::collections::HashMap::new());
+    // Secondary memo: concrete display name -> resolved `ClassId` (loading on
+    // first use). Shared by the fixed and size-dependent paths.
+    static GETCLASS_NAME_TO_ID: std::cell::RefCell<
+        std::collections::HashMap<&'static str, Option<cratonvm_types::ClassId>>,
+    > = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// Resolve (and cache) a concrete display class name to its `ClassId`, loading
+/// it on first use. `None` if the class is unavailable (caller falls back).
+fn getclass_resolve_name(
+    ctx: &mut dyn NativeContext,
+    name: &'static str,
+) -> Option<cratonvm_types::ClassId> {
+    if let Some(cached) = GETCLASS_NAME_TO_ID.with(|c| c.borrow().get(name).copied()) {
+        return cached;
+    }
+    let resolved = ctx.class_id_by_name(name).or_else(|| {
+        let _ = ctx.load_class(name);
+        ctx.class_id_by_name(name)
+    });
+    GETCLASS_NAME_TO_ID.with(|c| c.borrow_mut().insert(name, resolved));
+    resolved
+}
+
+/// The element count of a synthetic immutable collection, via its own `size()`.
+/// Best-effort: any failure yields `-1`, which selects the `…N` (multi) form.
+fn getclass_collection_size(ctx: &mut dyn NativeContext, this: ObjectRef) -> i64 {
+    match ctx.invoke_virtual(this, "size", "()I", &[]) {
+        Ok(Some(Value::Int(n))) => n as i64,
+        _ => -1,
+    }
+}
+
+/// Resolve the concrete display `ClassId` for an object stamped with `class_id`,
+/// or `None` to use the stamp unchanged. The stamp→strategy classification is
+/// memoised; the size-dependent collection forms are resolved per-object.
+fn getclass_display_class_id(
+    ctx: &mut dyn NativeContext,
+    class_id: cratonvm_types::ClassId,
+    this: ObjectRef,
+) -> Option<cratonvm_types::ClassId> {
+    let display = match GETCLASS_ALIAS_CACHE.with(|c| c.borrow().get(&class_id).copied()) {
+        Some(d) => d,
+        None => {
+            // Cache miss: classify once. `Stamp` is cached too (negative cache)
+            // so the common non-synthetic class never re-clones its name.
+            let d = match ctx.class_name_of_id(class_id) {
+                Some(name) => {
+                    if let Some(kind) = immutable_collection_kind(&name) {
+                        kind
+                    } else if let Some(alias) = jdk_concrete_getclass_alias(&name) {
+                        match getclass_resolve_name(ctx, alias) {
+                            Some(cid) => GetClassDisplay::Fixed(cid),
+                            None => GetClassDisplay::Stamp,
+                        }
+                    } else {
+                        GetClassDisplay::Stamp
+                    }
+                }
+                None => GetClassDisplay::Stamp,
+            };
+            GETCLASS_ALIAS_CACHE.with(|c| c.borrow_mut().insert(class_id, d));
+            d
+        }
+    };
+    match display {
+        GetClassDisplay::Stamp => None,
+        GetClassDisplay::Fixed(cid) => Some(cid),
+        // HotSpot: `List.of()`→ListN, size 1–2→List12, ≥3→ListN. Set mirrors
+        // List; Map uses Map1 only for a single entry, else MapN.
+        GetClassDisplay::ImmutableList => {
+            let n = getclass_collection_size(ctx, this);
+            let name = if (1..=2).contains(&n) {
+                "java/util/ImmutableCollections$List12"
+            } else {
+                "java/util/ImmutableCollections$ListN"
+            };
+            getclass_resolve_name(ctx, name)
+        }
+        GetClassDisplay::ImmutableSet => {
+            let n = getclass_collection_size(ctx, this);
+            let name = if (1..=2).contains(&n) {
+                "java/util/ImmutableCollections$Set12"
+            } else {
+                "java/util/ImmutableCollections$SetN"
+            };
+            getclass_resolve_name(ctx, name)
+        }
+        GetClassDisplay::ImmutableMap => {
+            let n = getclass_collection_size(ctx, this);
+            let name = if n == 1 {
+                "java/util/ImmutableCollections$Map1"
+            } else {
+                "java/util/ImmutableCollections$MapN"
+            };
+            getclass_resolve_name(ctx, name)
+        }
+    }
+}
+
 fn native_object_get_class(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
@@ -13513,7 +13816,12 @@ fn native_object_get_class(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     }
 
     let class_id = ctx.class_id_of_object(this);
-    let mirror = ctx.get_class_mirror(class_id);
+    // Synthetic objects are sometimes stamped with the interface/abstract/
+    // internal type they stand in for; a real JVM always reports a concrete
+    // runtime class. Re-map to a JDK-plausible concrete class for the mirror
+    // (memoised; no-op for ordinary classes). Storage/dispatch are unaffected.
+    let display_id = getclass_display_class_id(ctx, class_id, this).unwrap_or(class_id);
+    let mirror = ctx.get_class_mirror(display_id);
     Ok(Some(Value::Object(Some(mirror))))
 }
 
@@ -13572,6 +13880,11 @@ fn native_object_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         }
     };
     let class_id = ctx.class_id_of_object(this);
+    // Keep the default `toString` class name consistent with `getClass()`:
+    // synthetic objects stamped with an interface/abstract/internal class
+    // report their concrete JDK display class here too (memoised; no-op for
+    // ordinary classes).
+    let class_id = getclass_display_class_id(ctx, class_id, this).unwrap_or(class_id);
     let dotted = object_to_string_dotted_name(ctx, class_id);
     let hash = ctx.identity_hash_code(this);
     // Build "dotted@hash" with a single pre-sized buffer (saves the realloc
@@ -19100,6 +19413,29 @@ fn native_classloader_find_bootstrap_class(
     };
     // Convert "java.lang.String" → "java/lang/String"
     let internal_name = name.replace('.', "/");
+
+    // HIB-CV-24 / SBR-14 — `findBootstrapClass` must answer ONLY for classes the
+    // bootstrap loader genuinely owns. The real `ClassLoader.loadClass` bytecode
+    // calls this for a null-parent loader BEFORE its own `findClass`; if we
+    // resolve an application class here, a custom child/isolated loader's
+    // `findClass` override (Hibernate `AggregatedClassLoader`, plugin loaders) is
+    // never invoked and the supplied loader is bypassed (JVMS §5.3). Scope the
+    // bootstrap lookup so a custom loader that overrides `findClass` gets `null`
+    // for non-bootstrap names and the bytecode proceeds to its override. Built-in
+    // loaders keep the permissive global resolution (CratonVM has no separate
+    // bootstrap classpath, so the app-loader path relies on it). Opt-out gate.
+    if crate::classloader::cl_bootstrap_scoped()
+        && !crate::classloader::is_bootstrap_class_name(&internal_name)
+    {
+        if let Some(Value::Object(Some(this))) = args.first() {
+            if crate::classloader::is_user_defined_loader(ctx, *this)
+                && crate::classloader::receiver_overrides_find_class(ctx, *this)
+            {
+                return Ok(Some(Value::Object(None)));
+            }
+        }
+    }
+
     // Try to load the class — load_class returns MethodCallResult
     // where Ok(Some(Value::Object(Some(obj)))) contains the class mirror
     match ctx.load_class(&internal_name) {

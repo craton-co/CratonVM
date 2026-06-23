@@ -1,0 +1,227 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
+//! Regression: `Object.getClass()` must report a concrete, JDK-plausible class
+//! for synthetic objects.
+//!
+//! Several CratonVM synthetic factories stamp their result with the *interface*
+//! or *abstract* type it stands in for (e.g. `IntStream.rangeClosed(..)` → the
+//! `java/util/stream/IntStream` interface, `FileSystems.getDefault()` → the
+//! abstract `java/nio/file/FileSystem`) or with a private craton-internal name
+//! (`List.of(..)` → `cratonvm/internal/UnmodifiableList`). On a real JVM an
+//! instance's runtime class is always concrete, so `getClass()` must never
+//! surface an interface/abstract/internal type.
+//!
+//! The fix lives in `native_object_get_class` (native-builtins/src/lib.rs): a
+//! memoised stamp→concrete-class substitution that leaves storage, dispatch,
+//! and GC layout untouched (it changes only the Java-visible `Class` mirror).
+//!
+//! The probe source is embedded below and compiled to a temp dir on the fly, so
+//! the test is self-contained (no gitignored `apps/` fixture required). It
+//! skips gracefully when `javac`, a JDK home, or the cratonvm binary are
+//! unavailable.
+
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::time::Duration;
+
+const PROBE_SRC: &str = r#"
+import java.net.URI;
+import java.net.URLConnection;
+import java.nio.file.FileSystems;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.stream.IntStream;
+
+public class GetClassProbe {
+  public static void main(String[] a) throws Exception {
+    System.out.println("intRange=" + IntStream.rangeClosed(1, 4).getClass().getName());
+    System.out.println("listEmpty=" + List.of().getClass().getName());
+    System.out.println("list2=" + List.of(1, 2).getClass().getName());
+    System.out.println("list3=" + List.of(1, 2, 3).getClass().getName());
+    System.out.println("set2=" + Set.of(1, 2).getClass().getName());
+    System.out.println("map1=" + Map.of(1, 2).getClass().getName());
+    System.out.println("fs=" + FileSystems.getDefault().getClass().getName());
+    URLConnection jc = URI.create("jar:file:/none.jar!/x").toURL().openConnection();
+    System.out.println("jarConn=" + jc.getClass().getName());
+    System.out.println("OK");
+  }
+}
+"#;
+
+fn cratonvm_binary() -> Option<PathBuf> {
+    if let Ok(bin) = std::env::var("CRATONVM_BIN") {
+        let p = PathBuf::from(&bin);
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    let target = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .join("target");
+    let exe = if cfg!(windows) { "cratonvm.exe" } else { "cratonvm" };
+    for profile in &["release", "debug"] {
+        let candidate = target.join(profile).join(exe);
+        if candidate.exists() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+fn jdk_home() -> Option<PathBuf> {
+    for var in &["CRATONVM_TEST_JDK", "JAVA_HOME"] {
+        if let Ok(j) = std::env::var(var) {
+            let p = PathBuf::from(&j);
+            if p.exists() {
+                return Some(p);
+            }
+        }
+    }
+    for cand in [
+        "C:/Program Files/Java/jdk-25",
+        "C:/Program Files/Eclipse Adoptium/jdk-25.0.2.10-hotspot",
+    ] {
+        let p = PathBuf::from(cand);
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    None
+}
+
+/// Write + compile the embedded probe to a fresh temp dir. Returns the
+/// directory holding `GetClassProbe.class`, or `None` if javac is unavailable.
+fn compile_probe(javac: &Path) -> Option<PathBuf> {
+    let dir = std::env::temp_dir().join("cratonvm-getclass-probe");
+    let _ = std::fs::create_dir_all(&dir);
+    let src = dir.join("GetClassProbe.java");
+    std::fs::write(&src, PROBE_SRC).ok()?;
+    let status = Command::new(javac)
+        .args(["--release", "21", "-d"])
+        .arg(&dir)
+        .arg(&src)
+        .status()
+        .ok()?;
+    if status.success() && dir.join("GetClassProbe.class").exists() {
+        Some(dir)
+    } else {
+        None
+    }
+}
+
+#[test]
+fn getclass_reports_concrete_classes() {
+    let bin = match cratonvm_binary() {
+        Some(b) => b,
+        None => {
+            eprintln!(
+                "[getclass_concrete_class] cratonvm binary not found; \
+                 build with `cargo build --release -p cratonvm-cli`. Skipping."
+            );
+            return;
+        }
+    };
+    let jdk = match jdk_home() {
+        Some(j) => j,
+        None => {
+            eprintln!(
+                "[getclass_concrete_class] no JDK home \
+                 (set CRATONVM_TEST_JDK or JAVA_HOME); skipping"
+            );
+            return;
+        }
+    };
+    let javac = jdk.join("bin").join(if cfg!(windows) { "javac.exe" } else { "javac" });
+    let classes = match compile_probe(&javac) {
+        Some(d) => d,
+        None => {
+            eprintln!("[getclass_concrete_class] javac unavailable; skipping");
+            return;
+        }
+    };
+
+    let mut child = match Command::new(&bin)
+        .arg("--java-home")
+        .arg(&jdk)
+        .arg("-c")
+        .arg(&classes)
+        .arg("GetClassProbe")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("[getclass_concrete_class] failed to spawn cratonvm: {e}");
+            return;
+        }
+    };
+    let timeout = Duration::from_secs(120);
+    let start = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => {
+                if start.elapsed() > timeout {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("[getclass_concrete_class] GetClassProbe timed out after {timeout:?}");
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(e) => panic!("[getclass_concrete_class] try_wait failed: {e}"),
+        }
+    }
+    let output = child.wait_with_output().expect("collect output");
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+    let line = |key: &str| -> String {
+        stdout
+            .lines()
+            .find_map(|l| l.strip_prefix(key))
+            .unwrap_or_else(|| {
+                panic!("[getclass_concrete_class] missing `{key}` line.\nstdout:\n{stdout}\nstderr:\n{stderr}")
+            })
+            .to_string()
+    };
+
+    // Platform-independent exact matches (== HotSpot jdk-25).
+    assert_eq!(
+        line("intRange="),
+        "java.util.stream.IntPipeline$Head",
+        "IntStream.rangeClosed must report a concrete IntPipeline class, not the interface"
+    );
+    assert_eq!(line("listEmpty="), "java.util.ImmutableCollections$ListN");
+    assert_eq!(line("list2="), "java.util.ImmutableCollections$List12");
+    assert_eq!(line("list3="), "java.util.ImmutableCollections$ListN");
+    assert_eq!(line("set2="), "java.util.ImmutableCollections$Set12");
+    assert_eq!(line("map1="), "java.util.ImmutableCollections$Map1");
+    assert_eq!(
+        line("jarConn="),
+        "sun.net.www.protocol.jar.JarURLConnection",
+        "jar: URLConnection must report the concrete impl, not the abstract class"
+    );
+
+    // FileSystem concrete class is platform specific (WindowsFileSystem /
+    // LinuxFileSystem / …); just require a concrete `sun.nio.fs.*`, never the
+    // abstract `java.nio.file.FileSystem`.
+    let fs = line("fs=");
+    assert!(
+        fs.starts_with("sun.nio.fs.") && fs != "java.nio.file.FileSystem",
+        "FileSystems.getDefault() must report a concrete sun.nio.fs.* class, got `{fs}`"
+    );
+
+    assert!(
+        stdout.contains("OK"),
+        "GetClassProbe did not reach OK marker.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        output.status.success(),
+        "GetClassProbe exited non-zero: {:?}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+        output.status
+    );
+}

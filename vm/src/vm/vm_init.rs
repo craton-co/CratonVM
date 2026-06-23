@@ -410,6 +410,20 @@ pub struct SharedVm {
     /// T10.9.B: FxHashMap — keys are fixed primitive type names, not user input.
     pub primitive_mirrors: RwLock<FxHashMap<String, ObjectRef>>,
 
+    /// Canonical `java.lang.Module` mirrors keyed by module name (e.g.
+    /// "java.base"), with `""` reserved for the unnamed module. `Class.getModule()`
+    /// MUST hand back the SAME `Module` instance for every class in a module,
+    /// because the JDK compares modules by identity (`Module` does not override
+    /// `equals`). Real bytecode relies on this — e.g.
+    /// `Throwable.validateSuppressedExceptionsList` deserializes a Throwable's
+    /// suppressed-exceptions list and throws `StreamCorruptedException("List
+    /// implementation not in base module.")` unless
+    /// `Object.class.getModule() == deserializedList.getClass().getModule()`.
+    /// Allocating a fresh Module per `getModule()` call (the old behaviour) made
+    /// that comparison always false and broke ObjectInputStream round-trips of any
+    /// object holding a `java.util` List (HIB-CV-29).
+    pub module_mirrors: RwLock<FxHashMap<String, ObjectRef>>,
+
     /// B-J: permanent GC-root registry for `java.lang.invoke.VarHandle` objects.
     /// VarHandles are long-lived singletons stored in `static final` fields
     /// (e.g. `ConcurrentLinkedDeque.NEXT`) and used for lock-free CAS. They were
@@ -2383,6 +2397,7 @@ impl SharedVm {
             next_lambda_id: AtomicU32::new(0x8000_0000),
             thread_registry: ThreadRegistry::new(),
             primitive_mirrors: RwLock::new(FxHashMap::default()),
+            module_mirrors: RwLock::new(FxHashMap::default()),
             var_handle_roots: RwLock::new(FxHashMap::default()),
             self_arc: RwLock::new(None),
             oom_dump_written: std::sync::atomic::AtomicBool::new(false),

@@ -1473,6 +1473,28 @@ pub(crate) fn native_class_for_name(
                     "[S111-DBG] loadClass({}) succeeded via invoke_virtual",
                     dotted_name
                 );
+                // HIB-CV-26 — honour the `initialize` flag (args[1]).
+                // `ClassLoader.loadClass` only loads + links the class; it does
+                // NOT run static initialisers. The JDK contract for
+                // `Class.forName(name, true, loader)` is that the class IS
+                // initialised before the call returns (this is exactly the
+                // distinction HHH-7272 relies on: `loadClass` skips `<clinit>`,
+                // `Class.forName(.., true, ..)` runs it — so a JDBC driver's
+                // self-registering static block fires). Without this, drivers
+                // loaded via the 3-arg overload never register and
+                // `DriverManager.getDriver` throws "No suitable driver".
+                let initialize = matches!(args.get(1), Some(v) if v.as_int().unwrap_or(0) != 0);
+                if initialize {
+                    if let Value::Object(Some(mirror_ref)) = mirror {
+                        if let Some(cid) = ctx.class_id_from_mirror(mirror_ref) {
+                            if let Some(bin_name) = ctx.class_name_of_id(cid) {
+                                // Propagate ExceptionInInitializerError / linkage
+                                // errors raised by `<clinit>`, matching HotSpot.
+                                ctx.ensure_class_initialized(&bin_name)?;
+                            }
+                        }
+                    }
+                }
                 return Ok(Some(mirror));
             }
             // ClassLoader.loadClass returning null is technically illegal
@@ -11168,13 +11190,50 @@ pub(crate) fn native_class_get_declaring_class(
         None => return Ok(Some(Value::Object(None))),
     };
 
-    match ctx.declaring_class(class_id) {
-        Some(outer_id) => {
-            let mirror = ctx.get_class_mirror(outer_id);
-            Ok(Some(Value::Object(Some(mirror))))
-        }
-        None => Ok(Some(Value::Object(None))),
+    // Fast path: the enclosing class is already loaded, so the VM's
+    // `find_class_by_name`-backed `declaring_class` resolves it directly.
+    if let Some(outer_id) = ctx.declaring_class(class_id) {
+        let mirror = ctx.get_class_mirror(outer_id);
+        return Ok(Some(Value::Object(Some(mirror))));
     }
+
+    // Slow path (SBR-07): the enclosing class is NOT yet loaded. This is the
+    // common shape for `Class.forName("Pkg.Outer$Inner")` where the inner class
+    // is resolved by name without ever referencing `Outer` — e.g. Kotlin's
+    // protobuf-generated `ProtoBuf$StringTable`. `Vm::declaring_class` resolves
+    // the outer-class name through `find_class_by_name`, which only sees
+    // already-loaded classes, so it returns `None` and the real-JDK
+    // `getSimpleName()`/`getCanonicalName()` bytecode then mistakes the class
+    // for a top-level type (yielding `Outer$Inner` instead of `Inner`). HotSpot
+    // *loads* the enclosing class here; mirror that by walking this class's own
+    // `InnerClasses` attribute for the entry naming itself and loading the
+    // recorded outer class (same resolve-then-load pattern as
+    // `getDeclaredClasses0`). A non-member class (anonymous/local — empty
+    // `outer_class`/`inner_name`) has no such entry and correctly stays `null`.
+    let class_name = match ctx.class_name_of_id(class_id) {
+        Some(n) => n,
+        None => return Ok(Some(Value::Object(None))),
+    };
+    let inner_classes = ctx.inner_classes(class_id);
+    for (inner_class, outer_class, inner_name, _flags) in &inner_classes {
+        if inner_class == &class_name && !outer_class.is_empty() && !inner_name.is_empty() {
+            let outer_id = match ctx.class_id_by_name(outer_class) {
+                Some(id) => Some(id),
+                None => match ctx.load_class(outer_class) {
+                    Ok(_) => ctx.class_id_by_name(outer_class),
+                    Err(_) => None,
+                },
+            };
+            if let Some(outer_id) = outer_id {
+                let mirror = ctx.get_class_mirror(outer_id);
+                return Ok(Some(Value::Object(Some(mirror))));
+            }
+            // Found the member entry but couldn't load the outer class — match
+            // HotSpot's class-load-failure suppression at this site and stop.
+            break;
+        }
+    }
+    Ok(Some(Value::Object(None)))
 }
 
 /// `java/lang/Class.getSimpleBinaryName0()Ljava/lang/String;`
@@ -11772,6 +11831,62 @@ fn make_annotated_type(
     obj
 }
 
+/// Build a non-null, empty `java.security.Permissions` collection.
+///
+/// We allocate the real-layout object and run its no-arg constructor so the
+/// internal `permsMap` is initialised — this makes `PermissionCollection`'s
+/// `elements()` / `toString()` work and renders as HotSpot's
+/// `java.security.Permissions@HASH ( )` for an app class with no policy
+/// grants. The constructor run is best-effort: even if it fails the object is
+/// still non-null, which is the contract callers (`getPermissions()`) rely on.
+pub(crate) fn build_empty_permissions(ctx: &mut dyn NativeContext) -> ObjectRef {
+    let perms = crate::alloc_concurrent_synthetic(ctx, "java/security/Permissions", 2);
+    let _ = ctx.invoke(
+        "java/security/Permissions",
+        "<init>",
+        "()V",
+        &[Value::Object(Some(perms))],
+    );
+    perms
+}
+
+/// Populate a freshly-allocated `java.security.ProtectionDomain` with faithful
+/// `codesource` / `classloader` / `permissions` / `principals` fields.
+///
+/// Writes BOTH the synthetic field layout (slot 0 = codesource, 1 =
+/// permissions, 2 = classloader, 3 = principals — see `class_manager.rs`) AND
+/// the real-JDK layout (slot 0 = codesource, 1 = classloader, 2 = principals,
+/// 3 = permissions) by name. The slot writes land first; the by-name writes
+/// run last and are authoritative, so a real-JDK-loaded `ProtectionDomain`
+/// ends up with each value in the correct field regardless of which layout the
+/// object actually has.
+///
+/// `classloader` is the class's defining loader (matching
+/// `Class.getClassLoader()`); previously this slot was left null or — worse —
+/// clobbered with the permissions object (SBR-13).
+pub(crate) fn populate_protection_domain_fields(
+    ctx: &mut dyn NativeContext,
+    pd: ObjectRef,
+    codesource: Value,
+    classloader: Value,
+) {
+    let perms = build_empty_permissions(ctx);
+    let principals = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
+    let perms_v = Value::Object(Some(perms));
+    let principals_v = Value::Object(Some(principals));
+
+    // Synthetic layout (codesource, permissions, classloader, principals).
+    ctx.set_field(pd, 0, codesource);
+    ctx.set_field(pd, 1, perms_v);
+    ctx.set_field(pd, 2, classloader);
+    ctx.set_field(pd, 3, principals_v);
+    // Real-JDK layout by name (authoritative — runs last).
+    ctx.set_field_by_name(pd, "codesource", codesource);
+    ctx.set_field_by_name(pd, "permissions", perms_v);
+    ctx.set_field_by_name(pd, "classloader", classloader);
+    ctx.set_field_by_name(pd, "principals", principals_v);
+}
+
 /// `java/lang/Class.getClassFileVersion0()I`
 ///
 /// Returns the class file version number. The JDK encodes this as
@@ -11942,22 +12057,23 @@ pub(crate) fn native_class_get_protection_domain0(
         ctx.set_field_by_name(cs, "certs", Value::Object(Some(arr)));
     }
 
-    // Build ProtectionDomain(codesource=cs, permissions=null, classloader=null,
-    // principals=empty).  Null permissions = "all permissions" per JDK default.
+    // Build ProtectionDomain(codesource=cs, permissions=<empty>,
+    // classloader=<defining loader>, principals=empty).  SBR-13: populate the
+    // real defining ClassLoader and a non-null (empty) Permissions collection
+    // so `getClassLoader()` / `getPermissions()` match HotSpot's shape instead
+    // of returning null / a placeholder.
     let pd_cid = ctx
         .ensure_class_initialized("java/security/ProtectionDomain")
         .unwrap_or(cratonvm_types::ClassId::new(0));
     let pd_num_fields = ctx.class_num_total_fields(pd_cid).max(4);
     let pd = ctx.alloc_object(pd_cid, pd_num_fields);
-    ctx.set_field(pd, 0, Value::Object(Some(cs)));
-    ctx.set_field(pd, 1, Value::Object(None));
-    ctx.set_field(pd, 2, Value::Object(None));
-    let empty_principals = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
-    ctx.set_field(pd, 3, Value::Object(Some(empty_principals)));
-    ctx.set_field_by_name(pd, "codesource", Value::Object(Some(cs)));
-    ctx.set_field_by_name(pd, "permissions", Value::Object(None));
-    ctx.set_field_by_name(pd, "classloader", Value::Object(None));
-    ctx.set_field_by_name(pd, "principals", Value::Object(Some(empty_principals)));
+    // Resolve the class's defining loader exactly like `Class.getClassLoader()`
+    // (bootstrap → null, app classpath → the singleton AppClassLoader).
+    let classloader = native_class_get_class_loader(ctx, args)
+        .ok()
+        .flatten()
+        .unwrap_or(Value::Object(None));
+    populate_protection_domain_fields(ctx, pd, Value::Object(Some(cs)), classloader);
 
     Ok(Some(Value::Object(Some(pd))))
 }

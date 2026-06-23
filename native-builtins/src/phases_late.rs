@@ -19008,24 +19008,34 @@ pub(crate) fn register_p59_module(r: &mut NativeMethodRegistry) {
         "getModule",
         "()Ljava/lang/Module;",
         |ctx, args| {
+            // Canonical Module per module name: the JDK compares Modules by
+            // identity, so every class in a module must observe the SAME Module
+            // instance. Mirror of the real-JDK getModule in lib.rs (HIB-CV-29).
+            let module_name: Option<String> = if let Some(Value::Object(Some(mirror))) = args.first()
+            {
+                let class_id = ctx.class_id_of_object(*mirror);
+                ctx.module_name_of_class(class_id)
+            } else {
+                None
+            };
+            if let Some(cached) = ctx.get_cached_module_mirror(module_name.as_deref()) {
+                return Ok(Some(Value::Object(Some(cached))));
+            }
             // GC-safety: pin m_obj across the `create_string` allocation below;
             // otherwise a moving GC reclaims/relocates the unpinned local and
             // getModule() returns a stale ref (a reused slot → String →
-            // `String.isNamed()` NoSuchMethodError). Mirror of the real-JDK
-            // getModule in lib.rs. Same bug class as reference_classloader_gc_root_gap.
+            // `String.isNamed()` NoSuchMethodError). Same bug class as
+            // reference_classloader_gc_root_gap.
             let m_obj = alloc_concurrent_synthetic(ctx, "java/lang/Module", 2);
             let pin = ctx.pin_native_root(m_obj);
-            let module_name_val = if let Some(Value::Object(Some(mirror))) = args.first() {
-                let class_id = ctx.class_id_of_object(*mirror);
-                ctx.module_name_of_class(class_id)
-                    .map(|name| Value::Object(Some(ctx.create_string(&name))))
-                    .unwrap_or(Value::Object(None))
-            } else {
-                Value::Object(None)
-            };
+            let module_name_val = module_name
+                .as_deref()
+                .map(|name| Value::Object(Some(ctx.create_string(name))))
+                .unwrap_or(Value::Object(None));
             let m_obj = ctx.read_native_pin(pin, m_obj);
             ctx.set_field(m_obj, 0, module_name_val);
             ctx.unpin_native_roots(pin);
+            ctx.cache_module_mirror(module_name.as_deref(), m_obj);
             Ok(Some(Value::Object(Some(m_obj))))
         },
     );

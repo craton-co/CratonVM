@@ -67,3 +67,6 @@ docs/internal/**/cld*.out
 
 # machine-specific / personal dev scripts (not for the OSS repo)
 scripts/internal/
+/regression-suite/build/RReflect$1.class
+/regression-suite/build/RReflectOuter$Nested.class
+/regression-suite/build/RReflectOuter.class

@@ -596,6 +596,41 @@ pub(crate) fn is_builtin_loader_class(class_name: &str) -> bool {
         || class_name.starts_with("sun/misc/Launcher$")
 }
 
+/// True if `internal_name` (slash-form) names a class the **bootstrap** (and
+/// platform) loader genuinely owns — the JDK/platform module surface. The real
+/// JVM's `findBootstrapClass` searches ONLY this set; an application class is
+/// never resolvable through it. CratonVM has no separate bootstrap classpath
+/// (its class store is flat), so this name predicate stands in for "would the
+/// bootstrap loader find this".
+pub(crate) fn is_bootstrap_class_name(internal: &str) -> bool {
+    internal.starts_with("java/")
+        || internal.starts_with("javax/")
+        || internal.starts_with("jdk/")
+        || internal.starts_with("sun/")
+        || internal.starts_with("com/sun/")
+        || internal.starts_with("org/w3c/dom")
+        || internal.starts_with("org/xml/sax")
+        || internal.starts_with("org/ietf/jgss")
+        || internal.starts_with("org/jcp/xml")
+        || internal.starts_with("[")
+}
+
+/// HIB-CV-24 / SBR-14 gate. When ON (default), `findBootstrapClass` is scoped to
+/// genuine bootstrap classes for a custom loader that overrides `findClass` with
+/// a null parent — so the real `ClassLoader.loadClass` bytecode proceeds to that
+/// override (JVMS §5.3) instead of the bootstrap native resolving the app class
+/// out from under it. Opt-out `CRATONVM_CL_BOOTSTRAP_SCOPED=0` restores the
+/// legacy permissive behavior (bootstrap native resolves any app class) as the
+/// safety net.
+pub(crate) fn cl_bootstrap_scoped() -> bool {
+    static GATE: OnceLock<bool> = OnceLock::new();
+    *GATE.get_or_init(|| {
+        std::env::var("CRATONVM_CL_BOOTSTRAP_SCOPED")
+            .map(|v| v != "0")
+            .unwrap_or(true)
+    })
+}
+
 /// Virtual-dispatch correctness for custom `ClassLoader` subclasses.
 ///
 /// `cl_load_class` is registered as the Rust native for
@@ -5151,6 +5186,30 @@ mod classloader_tests {
     }
 
     // --- ClassLoader registration tests ---
+
+    #[test]
+    fn test_is_bootstrap_class_name_jdk_packages() {
+        // JDK / platform packages the bootstrap loader genuinely owns.
+        assert!(is_bootstrap_class_name("java/lang/String"));
+        assert!(is_bootstrap_class_name("javax/sql/DataSource"));
+        assert!(is_bootstrap_class_name("jdk/internal/loader/ClassLoaders"));
+        assert!(is_bootstrap_class_name("sun/nio/ch/IOUtil"));
+        assert!(is_bootstrap_class_name("com/sun/crypto/provider/AESCipher"));
+        assert!(is_bootstrap_class_name("[Ljava/lang/Object;"));
+    }
+
+    #[test]
+    fn test_is_bootstrap_class_name_app_classes() {
+        // Application classes are NEVER bootstrap-loadable — findBootstrapClass
+        // must defer these to a custom loader's findClass override (HIB-CV-24).
+        assert!(!is_bootstrap_class_name(
+            "org/hibernate/orm/test/bootstrap/registry/classloading/ClassLoaderServiceImplTest"
+        ));
+        assert!(!is_bootstrap_class_name("com/example/MyService"));
+        assert!(!is_bootstrap_class_name("MProbe$Base"));
+        // `jakarta.*` is an application/module class, not bootstrap.
+        assert!(!is_bootstrap_class_name("jakarta/persistence/Entity"));
+    }
 
     #[test]
     fn test_cl_init_default_registered() {
