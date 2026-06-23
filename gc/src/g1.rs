@@ -1060,6 +1060,26 @@ pub struct G1Collector {
     /// audit-flagged hot-path bottleneck (CRIT-P4): with 256 regions, a
     /// 100-slot object incurred ~25k linear probes during evacuation.
     region_lookup: Vec<(usize, usize)>,
+
+    /// Lock-free inclusive-exclusive bounds `[arena_base, arena_end)` of the
+    /// single contiguous backing arena. Immutable for the collector's
+    /// lifetime (the `arena` `Box` is allocated once in [`G1Collector::new`]
+    /// and never moved or resized), so they can be read with no atomics and
+    /// no `regions.lock()`.
+    ///
+    /// Used by [`G1Collector::is_addr_in_live_region`] as an O(1) lock-free
+    /// reject for the overwhelming majority of conservative-root-scan
+    /// candidate words (return addresses, ints, native-stack addresses) that
+    /// fall outside the heap arena entirely. That function is the per-word
+    /// hot path of `scan_active_jit_frames` / `update_root_snapshot`, which
+    /// run on *every* object-returning native call; the previous
+    /// implementation took the regions mutex and linearly scanned all
+    /// `num_regions` regions for each candidate word, contending
+    /// catastrophically on deep-stack JIT-on workloads. This mirrors the
+    /// lock-free `[base, end)` bounds gate `gen_heap` already adopted for the
+    /// identical reason (see `GenerationalHeap::is_object_address`).
+    arena_base: usize,
+    arena_end: usize,
 }
 
 // SAFETY: All fields are either atomic, behind Mutex, or Arc. Raw pointers
@@ -1086,6 +1106,7 @@ impl G1Collector {
         // the `region_lookup` table are address-stable for the collector's life.
         let arena: Box<[u8]> = vec![0u8; num_regions * config.region_size].into_boxed_slice();
         let arena_base = arena.as_ptr() as usize;
+        let arena_end = arena_base + arena.len();
 
         let regions: Vec<G1Region> = (0..num_regions)
             .map(|i| {
@@ -1137,6 +1158,8 @@ impl G1Collector {
             // SECURITY FIX (V7a): start the RSet TLS-cache epoch at 0.
             rset_cache_epoch: AtomicU64::new(0),
             region_lookup,
+            arena_base,
+            arena_end,
         }
     }
 
@@ -4630,17 +4653,61 @@ impl G1Collector {
     /// without being relocated (e.g., objects in Old/Humongous regions that
     /// were not part of the collection set).
     pub fn is_addr_in_live_region(&self, addr: usize) -> bool {
-        let regions = self.regions.lock();
-        for r in regions.iter() {
-            if r.region_type == RegionType::Free {
-                continue;
-            }
-            let base = r.data.as_ptr() as usize;
-            if addr >= base && addr < base + r.cursor {
-                return true;
-            }
+        // Fast lock-free arena-bounds gate. `[arena_base, arena_end)` is
+        // immutable for the collector's lifetime (single contiguous `Box<[u8]>`,
+        // never moved/resized), so the test needs no atomics and no lock. This
+        // is the hot path: `is_addr_in_live_region` is called per candidate word
+        // by the conservative JIT/native root scan
+        // (`scan_active_jit_frames` / `update_root_snapshot`), which runs on
+        // every object-returning native call. The overwhelming majority of those
+        // words (return addresses, ints, native-stack addresses) lie OUTSIDE the
+        // heap arena and are rejected here without touching `regions.lock()` or
+        // scanning any region. The previous implementation took the regions
+        // mutex and linearly scanned all ~`num_regions` regions for EVERY word,
+        // which made JIT-on, deep-stack workloads (e.g. Spring Boot buildSrc
+        // JUnit annotation walks) run for minutes / appear hung under G1 while
+        // serial GC — whose `gen_heap` adopted exactly this lock-free gate —
+        // finished in seconds.
+        if addr < self.arena_base || addr >= self.arena_end {
+            return false;
         }
-        false
+        // In-arena candidate: index the single owning region in O(1). Region `k`
+        // occupies `[arena_base + k*region_size, +region_size)` and lives at
+        // `regions[k]` (the Vec has fixed length and is never reordered; each
+        // slot's `data` buffer is address-stable). Only genuine
+        // heap-pointer-shaped words reach here, so the lock is taken rarely. The
+        // explicit base/cursor bounds re-check below is the authoritative test
+        // (and guards against any indexing skew).
+        let region_size = self.config.region_size;
+        if region_size == 0 {
+            return false;
+        }
+        let idx = (addr - self.arena_base) / region_size;
+        let regions = self.regions.lock();
+        match regions.get(idx) {
+            None => false,
+            Some(r) => match r.region_type {
+                // Free regions hold no live object.
+                RegionType::Free => false,
+                // A humongous object is physically contiguous across its
+                // slices; only the `HumongousStart` region carries the full
+                // `cursor = object_size`, while every continuation slice keeps
+                // `cursor = 0` as a sentinel (see `alloc_humongous_locked`).
+                // The whole continuation slice is therefore live — matching the
+                // previous linear scan, which found such interior addresses via
+                // the start region's full-span cursor. (A conservative root
+                // scan tolerates the harmless over-retention of any tail
+                // padding past the object's true end; `is_object_address`'s
+                // header check still rejects non-object interior words.)
+                RegionType::HumongousContinuation => true,
+                // Eden / Survivor / Old / HumongousStart: live iff the address
+                // is below the region's allocation cursor.
+                _ => {
+                    let base = r.data.as_ptr() as usize;
+                    addr >= base && addr < base + r.cursor
+                }
+            },
+        }
     }
 
     /// Walk all live objects across all non-Free regions.
@@ -7379,6 +7446,48 @@ mod tests {
             "addr {:#x} above all regions should not resolve",
             well_above,
         );
+    }
+
+    /// `is_addr_in_live_region` regression: the lock-free O(1) arena-bounds
+    /// gate + single-region index must (a) reject addresses outside the arena
+    /// without taking the lock, (b) reject addresses inside the arena but in an
+    /// unallocated (Free) region, and (c) accept the address of a freshly
+    /// allocated live object. This is the per-word hot path of the conservative
+    /// JIT/native root scan; the previous lock+linear-scan-per-word
+    /// implementation made G1+JIT deep-stack workloads (Spring Boot buildSrc
+    /// JUnit) fall off a throughput cliff (1264 s → 72 s after the fix).
+    #[test]
+    fn is_addr_in_live_region_bounds_and_liveness() {
+        let gc = make_collector();
+
+        // (a) Outside the arena → false, via the lock-free fast gate.
+        assert!(!gc.is_addr_in_live_region(0));
+        assert!(!gc.is_addr_in_live_region(gc.arena_base - 8));
+        assert!(!gc.is_addr_in_live_region(gc.arena_end));
+        assert!(!gc.is_addr_in_live_region(gc.arena_end + 0x10_0000));
+
+        // (b) Inside the arena but in a still-Free region → false. The very
+        // first slot is Free until the first allocation carves an Eden.
+        let first_free = gc.arena_base + 64; // 8-aligned, inside region 0
+        assert!(
+            !gc.is_addr_in_live_region(first_free),
+            "address in an unallocated Free region must not be live"
+        );
+
+        // (c) A freshly allocated object's address is in a live region.
+        let obj = gc
+            .try_alloc_object(ClassId::new(0), 3)
+            .expect("alloc should succeed on a fresh heap");
+        let addr = obj.as_ptr() as usize;
+        assert!(addr >= gc.arena_base && addr < gc.arena_end);
+        assert!(
+            gc.is_addr_in_live_region(addr),
+            "a live object's address must resolve as in a live region"
+        );
+
+        // O(1) index agrees with the authoritative binary-search lookup for the
+        // live address (sanity on the `(addr - arena_base) / region_size` math).
+        assert!(gc.lookup_region_for_addr(addr).is_some());
     }
 
     /// `region_for_ptr_with_regions` (write-barrier hot path) must agree
