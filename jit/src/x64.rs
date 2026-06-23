@@ -3883,6 +3883,15 @@ struct ScalarReplacementPlan {
     /// locals. Scalar objects never reach the operand stack (a call-arg escapes),
     /// so only per-local provenance is needed.
     local_prov_at: FxHashMap<usize, Vec<(usize, usize)>>,
+    /// Phase C (monitors): per-bytecode-PC snapshot of the scalar monitors held at
+    /// that PC — `(new_pc, lock_depth)` pairs. A deopt snapshot at `bci` consults
+    /// `monitor_at[bci]` to emit `MonitorInfo` so the resume re-acquires the elided
+    /// lock on the re-materialized object.
+    monitor_at: FxHashMap<usize, Vec<(usize, u32)>>,
+    /// Phase C: monitorenter/monitorexit PCs whose receiver is a scalar object
+    /// (relockable on deopt). A monitor op NOT in this set operated on a non-scalar
+    /// object and keeps the method off the resume path.
+    monitor_scalar_ops: std::collections::HashSet<usize>,
 }
 
 /// Analyze bytecode to plan scalar replacement for non-escaping objects.
@@ -3904,6 +3913,8 @@ fn plan_scalar_replacement(
         init_skips: std::collections::HashSet::new(),
         total_slots: 0,
         local_prov_at: FxHashMap::default(),
+        monitor_at: FxHashMap::default(),
+        monitor_scalar_ops: std::collections::HashSet::new(),
     };
     if non_escaping_new.is_empty() {
         return empty;
@@ -3953,6 +3964,15 @@ fn plan_scalar_replacement(
     let mut init_skips = std::collections::HashSet::new();
     // Phase B: per-PC snapshot of locals holding a live scalar object.
     let mut local_prov_at: FxHashMap<usize, Vec<(usize, usize)>> = FxHashMap::default();
+    // Phase C (monitors): running monitor recursion depth per scalar object
+    // (`new_pc → depth`), the per-PC snapshot of held scalar monitors, and the set
+    // of monitorenter/exit PCs whose receiver IS a scalar object. A monitor op over
+    // a scalar object is relockable on deopt (recorded here); one over a non-scalar
+    // (escaping) object is the pre-existing blanket-elision case and keeps the
+    // method off the resume path (`has_elided_monitor` in codegen).
+    let mut mon_depth: FxHashMap<usize, u32> = FxHashMap::default();
+    let mut monitor_at: FxHashMap<usize, Vec<(usize, u32)>> = FxHashMap::default();
+    let mut monitor_scalar_ops: std::collections::HashSet<usize> = std::collections::HashSet::new();
 
     // EC-SCALAR-SOUNDNESS: same branch-target barrier as `analyze_escapes`.
     // Objects in `objects` are already guaranteed (by the stricter
@@ -3968,6 +3988,24 @@ fn plan_scalar_replacement(
             abs_stack.clear();
             for prov in local_prov.iter_mut() {
                 *prov = None;
+            }
+            // Phase C: a monitored scalar object cannot cross a CFG edge (it would
+            // escape and not be scalar-replaced), so any depth still standing at a
+            // merge point is stale tracking — clear it (mirrors the provenance
+            // barrier above). A correctly-balanced `synchronized` block exits before
+            // its back-edge, so this never drops a genuinely-held monitor.
+            mon_depth.clear();
+        }
+        // Phase C: snapshot the scalar monitors held at the ENTRY of this PC
+        // (after the barrier, before the opcode), recorded only when non-empty.
+        {
+            let held: Vec<(usize, u32)> = mon_depth
+                .iter()
+                .filter(|(_, &d)| d > 0)
+                .map(|(&np, &d)| (np, d))
+                .collect();
+            if !held.is_empty() {
+                monitor_at.insert(pc, held);
             }
         }
         // Phase B: snapshot which locals hold a live scalar object at the ENTRY
@@ -4371,6 +4409,28 @@ fn plan_scalar_replacement(
                 abs_stack.push(None);
                 pc += 3;
             }
+            // Phase C: monitorenter / monitorexit — pop the receiver and, when it
+            // is a scalar-replaced object, track the recursion depth so a deopt can
+            // record + relock the elided monitor. Handled explicitly (not via the
+            // catch-all below) so the scalar object's LOCAL provenance survives the
+            // op — the catch-all would clear it, hiding the object from later deopt
+            // snapshots.
+            0xC2 => {
+                if let Some(np) = abs_stack.pop().flatten() {
+                    *mon_depth.entry(np).or_insert(0) += 1;
+                    monitor_scalar_ops.insert(pc);
+                }
+                pc += 1;
+            }
+            0xC3 => {
+                if let Some(np) = abs_stack.pop().flatten() {
+                    if let Some(d) = mon_depth.get_mut(&np) {
+                        *d = d.saturating_sub(1);
+                    }
+                    monitor_scalar_ops.insert(pc);
+                }
+                pc += 1;
+            }
             // For anything else, conservatively clear all provenance
             _ => {
                 abs_stack.clear();
@@ -4447,12 +4507,30 @@ fn plan_scalar_replacement(
         })
         .collect();
 
+    // Phase C: keep only monitor snapshots referencing surviving objects.
+    let final_monitor_at: FxHashMap<usize, Vec<(usize, u32)>> = monitor_at
+        .into_iter()
+        .filter_map(|(pc, held)| {
+            let kept: Vec<(usize, u32)> = held
+                .into_iter()
+                .filter(|(np, _)| final_objects.contains_key(np))
+                .collect();
+            if kept.is_empty() {
+                None
+            } else {
+                Some((pc, kept))
+            }
+        })
+        .collect();
+
     ScalarReplacementPlan {
         objects: final_objects,
         field_ops: final_field_ops,
         init_skips: final_init_skips,
         total_slots: final_total,
         local_prov_at: final_local_prov_at,
+        monitor_at: final_monitor_at,
+        monitor_scalar_ops,
     }
 }
 
@@ -6466,13 +6544,22 @@ struct Compiler {
     /// at `bci` reads `sr_local_prov_at[bci]` to emit `VirtualObject` slots.
     sr_local_prov_at: FxHashMap<usize, Vec<(usize, usize)>>,
     /// Phase B: set when a `monitorenter`/`monitorexit` was ELIDED over a
-    /// scalar-replaced (thread-local) object. An elided lock leaves no trace in
-    /// the reconstructed frame's `monitors`, so the VM resume sink cannot detect
-    /// it — the producer must keep such a method off the deopt-resume path
-    /// (`can_deopt_resume = false`) until Phase C records elided monitors and the
-    /// resume relocks. (`ACC_SYNCHRONIZED` is separately caught by the consumer's
+    /// NON-scalar object (the pre-existing blanket-elision case). An elided lock
+    /// over a non-scalar object leaves no recordable trace, so the producer keeps
+    /// such a method off the deopt-resume path. Phase C: an elision over a SCALAR
+    /// object no longer sets this — it is recorded in `sr_monitor_at` and relocked
+    /// on resume. (`ACC_SYNCHRONIZED` is separately caught by the consumer's
     /// `is_synchronized` bail.)
     has_elided_monitor: bool,
+    /// Phase C (monitors): bytecode PC → scalar monitors held at that PC
+    /// (`(new_pc, lock_depth)`), from `plan_scalar_replacement`. A deopt snapshot at
+    /// `bci` reads `sr_monitor_at[bci]` to emit `MonitorInfo{ VirtualObjectRef(new_pc),
+    /// lock_depth }` so the resume re-acquires the elided lock.
+    sr_monitor_at: FxHashMap<usize, Vec<(usize, u32)>>,
+    /// Phase C: monitorenter/exit PCs whose receiver is a scalar object — the
+    /// codegen monitor handler consults this to decide relockable (scalar) vs
+    /// `has_elided_monitor` (non-scalar).
+    sr_monitor_scalar_ops: std::collections::HashSet<usize>,
     /// Inline sites: bytecode PC → resolved InlineSite for inlining callee bytecode.
     inline_sites: FxHashMap<usize, crate::InlineSite>,
     /// Compile-time resolved `java/lang/String` field layout, for the String
@@ -7411,6 +7498,8 @@ impl Compiler {
             sr_field_types: FxHashMap::default(),
             sr_local_prov_at: FxHashMap::default(),
             has_elided_monitor: false,
+            sr_monitor_at: FxHashMap::default(),
+            sr_monitor_scalar_ops: std::collections::HashSet::new(),
             inline_sites: FxHashMap::default(),
             string_layout: None,
             deopt_stubs: Vec::new(),
@@ -7867,6 +7956,24 @@ impl Compiler {
             });
         }
 
+        // Phase C: scalar monitors held at this bci → `MonitorInfo` referencing
+        // the re-materialized object by `VirtualObjectRef(new_pc)` (the same id the
+        // locals' `VirtualObject` defines), so the resume re-acquires the elided
+        // lock `lock_depth` times. Empty unless a `synchronized(scalarObj)` block is
+        // open here.
+        let monitors: Vec<crate::deopt::MonitorInfo> = self
+            .sr_monitor_at
+            .get(&bci)
+            .map(|held| {
+                held.iter()
+                    .map(|&(new_pc, depth)| crate::deopt::MonitorInfo {
+                        object: FrameValue::VirtualObjectRef(new_pc),
+                        lock_depth: depth,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
         let point = DeoptimizationPoint {
             native_offset,
             // Cast: bytecode/native offset to u32 (non-negative, fits)
@@ -7880,7 +7987,7 @@ impl Compiler {
                 bci: bci as u32,
                 locals,
                 stack,
-                monitors: Vec::new(),
+                monitors,
                 caller: None,
             },
         };
@@ -23133,10 +23240,14 @@ impl Compiler {
                     }
                     // Lock elided — emit nothing. The object is thread-
                     // local so the monitor is never contended.
-                    // Phase B: record the elision so the deopt-resume gate can
-                    // exclude this method (an elided lock leaves no `monitors`
-                    // trace for the VM resume sink to bail on).
-                    self.has_elided_monitor = true;
+                    // Phase C: an elision over a SCALAR object is recorded in
+                    // `sr_monitor_at` and relocked on resume, so it does NOT block
+                    // deopt. Only an elision over a NON-scalar object (not in
+                    // `sr_monitor_scalar_ops`) leaves no recordable trace and keeps
+                    // the method off the resume path.
+                    if !self.sr_monitor_scalar_ops.contains(&pc) {
+                        self.has_elided_monitor = true;
+                    }
                     let _ = recv_slot;
                     pc += 1;
                 }
@@ -23882,6 +23993,8 @@ pub fn compile_with_param_slots(
         compiler.sr_field_types = sr_field_types;
     }
     compiler.sr_local_prov_at = sr_plan.local_prov_at;
+    compiler.sr_monitor_at = sr_plan.monitor_at;
+    compiler.sr_monitor_scalar_ops = sr_plan.monitor_scalar_ops;
     compiler.scalar_replaced = sr_plan.objects;
     compiler.scalar_field_ops = sr_plan.field_ops;
     compiler.scalar_init_skips = sr_plan.init_skips;
@@ -32553,6 +32666,55 @@ mod tests {
         // An int-family tag (b'I'/b'B'/b'C'/b'S'/b'Z') maps to the cat-1 StackSlot.
         let ints = sr_field_values(1, 16, |_| Some(b'I'));
         assert_eq!(ints[0], FrameValue::StackSlot(-16));
+    }
+
+    #[test]
+    fn s32_phase_c_plan_tracks_scalar_monitors() {
+        // `Foo f = new Foo(); synchronized(f) { f.x = 1; }` (straight-line, no
+        // exception handler) — a `synchronized` block over a scalar object.
+        let code: Vec<u8> = vec![
+            0xbb, 0x00, 0x01, // 0: new #1
+            0x59, // 3: dup
+            0xb7, 0x00, 0x02, // 4: invokespecial #2 <init>()V
+            0x4c, // 7: astore_1            -> f in local 1
+            0x2b, // 8: aload_1             -> [f]
+            0x59, // 9: dup                 -> [f, f]
+            0x4d, // 10: astore_2           -> local 2 = f, [f]
+            0xc2, // 11: monitorenter       -> lock f (mon_depth[0]=1)
+            0x2b, // 12: aload_1            -> [f]
+            0x04, // 13: iconst_1           -> [f, 1]
+            0xb5, 0x00, 0x03, // 14: putfield #3
+            0x2c, // 17: aload_2            -> [f]
+            0xc3, // 18: monitorexit        -> unlock (mon_depth[0]=0)
+            0xb1, // 19: return
+            0, 0,
+        ];
+        let code_len = 20;
+        let mut non_escaping = std::collections::HashSet::new();
+        non_escaping.insert(0usize);
+        let new_info = vec![(0usize, 7u32, 1usize, true, true)]; // class_id 7, 1 field
+        let init_info = Box::leak(Box::new(JitInvokeInfo {
+            class_name: Box::leak("Foo".to_string().into_boxed_str()),
+            method_name: Box::leak("<init>".to_string().into_boxed_str()),
+            descriptor: Box::leak("()V".to_string().into_boxed_str()),
+            num_jit_args: 1,
+            return_type: b'V',
+            invoke_kind: 0xb7,
+        }));
+        let invoke_info = vec![(4usize, init_info as *const JitInvokeInfo)];
+        let plan = plan_scalar_replacement(&code, code_len, &non_escaping, &new_info, &invoke_info, 0);
+
+        assert!(plan.objects.contains_key(&0), "Foo should be scalar-replaced");
+        // Both monitor ops are over the scalar object (relockable, not blocking).
+        assert!(plan.monitor_scalar_ops.contains(&11), "monitorenter@11 is scalar");
+        assert!(plan.monitor_scalar_ops.contains(&18), "monitorexit@18 is scalar");
+        // The lock is held (depth 1) across the block body and AT the monitorexit
+        // entry (it executes the unlock), but NOT before the enter / after the exit.
+        assert_eq!(plan.monitor_at.get(&12).map(|v| v.as_slice()), Some([(0usize, 1u32)].as_slice()));
+        assert_eq!(plan.monitor_at.get(&14).map(|v| v.as_slice()), Some([(0usize, 1u32)].as_slice()));
+        assert_eq!(plan.monitor_at.get(&18).map(|v| v.as_slice()), Some([(0usize, 1u32)].as_slice()));
+        assert!(!plan.monitor_at.contains_key(&11), "not held before the enter executes");
+        assert!(!plan.monitor_at.contains_key(&19), "released after the exit");
     }
 
     #[test]

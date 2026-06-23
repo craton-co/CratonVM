@@ -163,15 +163,40 @@ window / C1-resident methods only). Every link is proven independently (SR fires
 tests), but the C1-version-stays-resident-and-deopts case is hard to stage. The
 trigger + diagnostics are retained as the harness.
 
-## Phase C — monitors (deferred); inlining (out of scope)
+## Phase C — monitors (IMPLEMENTED); inlining (out of scope)
 
-Monitor-bearing deopt needs the emitter to record held/elided monitors
-(`FrameState.monitors` + an "elided-monitor present" flag on the deopt point) and
-the resume path to **relock** (`Frame::new_pooled` sets up no monitor ownership
-today; the resume sink bails on any non-empty `monitors` / `is_synchronized`).
-Harder and riskier — deferred to Phase C. **Inlining is default-OFF with a known
-unfixed `try_emit_inline_body` miscompile**, so inlined-frame-chain deopt is moot
-in production and excluded.
+**DONE — branch `feat/x64-deopt-phase-c`, commit `2c814346`.** A method holding a
+`synchronized(obj)` block over a scalar-replaced object now deopt-resumes: the
+elided monitor is recorded at the deopt point and re-acquired on the
+re-materialized object on resume.
+
+- **Producer** (`jit/src/x64.rs`): `plan_scalar_replacement` gained explicit
+  monitorenter/monitorexit handlers tracking per-scalar-object recursion depth +
+  a per-PC held-monitor snapshot (`monitor_at`) and the scalar-receiver monitor PC
+  set (`monitor_scalar_ops`). `build_and_record_deopt_point` emits
+  `MonitorInfo{ VirtualObjectRef(new_pc), lock_depth }`. The codegen monitor
+  handler sets `has_elided_monitor` only for elisions over NON-scalar objects, so
+  `can_deopt_resume` admits scalar-monitor methods. Handling monitors explicitly
+  (vs the catch-all clear-all) also **fixed a latent miscompile**: a field access
+  inside `synchronized(scalarObj)` previously lost provenance and was compiled as
+  a heap access on the elided dummy ref.
+- **Consumer**: `deopt_materialize` rewrites each held monitor's `VirtualObjectRef`
+  to the materialized shell; `build_deopt_frame_inner` pins + re-reads the monitor
+  objects through the same GC-forwarding flow as locals/stack, then re-acquires
+  each via `shared.monitors.enter` `lock_depth` times after the frame is built.
+  `ACC_SYNCHRONIZED` methods still bail (the method monitor over `this` is a
+  separate case).
+- Gated `CRATONVM_DEOPT_REAL`; gate-off byte-identical for monitor-free methods.
+  Tests: 850 jit (+1) + 50 vm deopt (+2, incl. a resume that relocks at depth 2
+  and proves ownership). A `synchronized`-block-over-scalar program == HotSpot
+  (`20000100000`) gate-off AND gate-on; bt16 = `14985902`.
+
+The same C2-subsumption caveat as Phase B applies to the live monitor-relock
+path: every link is unit/integration-proven, but a hot method's running version
+is usually the C2 recompile, so single-pass monitor deopt is narrow at runtime.
+
+**Inlining is default-OFF with a known unfixed `try_emit_inline_body` miscompile**,
+so inlined-frame-chain deopt is moot in production and remains excluded.
 
 ## Goal
 
