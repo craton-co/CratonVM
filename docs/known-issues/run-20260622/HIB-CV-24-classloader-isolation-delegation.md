@@ -1,5 +1,17 @@
 # HIB-CV-24 — Classloader isolation/delegation not honored (non-JIT, deterministic)
 
+> ✅ **FIXED (Manifestation A) 2026-06-23.** Root cause: real-mode
+> `cl_real_load_class_base` (`native-builtins/src/classloader_real.rs`) resolved
+> through CratonVM's global store BEFORE a null-parent loader's `findClass`
+> override, bypassing the supplied loader. Fix defers global resolution to after
+> `findClass` for null-parent `findClass`-overriding loaders (gate
+> `CRATONVM_CL_BOOTSTRAP_SCOPED`, default-ON). `ClassLoaderServiceImplTest` 6/1→7/7
+> ==HotSpot, no parent-first regression. Manifestation B's defining-loader is also
+> correct now; its residual is a class-unloading/leak-detector gap (separate).
+> Full write-up:
+> `docs/internal/h2-suite-bugs/run-20260622/HIB-CV-24-classloader-isolation-delegation-FIXED.md`.
+
+
 **Run:** full Hibernate ORM suite, 2026-06-22/23
 **Binary:** `cvhibtest.exe` (dev `c863b23e`)
 **Severity:** High — real correctness bug, **deterministic, reproduces under `--nojit`**, HotSpot PASS

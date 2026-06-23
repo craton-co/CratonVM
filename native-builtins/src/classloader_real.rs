@@ -791,20 +791,30 @@ fn cl_real_load_class_base(
     // HIB-CV-24 / SBR-14 — honor a supplied child/isolated `ClassLoader`.
     //
     // Step 1 below (`ctx.load_class`) resolves through CratonVM's flat global
-    // store. For a custom loader whose parent is the bootstrap loader and which
-    // overrides `findClass` to load from its own source (Hibernate's
-    // `AggregatedClassLoader` — `super(null)`, iterates scoped child loaders;
-    // plugin / test-isolation loaders), that global pre-resolution acts like the
-    // application loader and answers the request before the loader's own
+    // store. For a custom loader whose parent is the bootstrap loader (a
+    // `super(null)` loader) and which overrides `findClass` to load from its own
+    // source (Hibernate's `AggregatedClassLoader`, which iterates scoped child
+    // loaders; plugin / test-isolation loaders), that global pre-resolution acts
+    // like the application loader and answers the request before the loader's own
     // `findClass` ever runs — so the supplied loader is bypassed and a class it
     // would have defined (or counted) is served from the wrong loader (JVMS §5.3:
     // a bootstrap parent cannot load an application class, so `findClass` MUST
-    // run). When the receiver overrides `findClass` and the requested class is
+    // run). When such a loader overrides `findClass` and the requested class is
     // not a bootstrap/platform class, defer global resolution to AFTER `findClass`.
-    // Built-in loaders and bootstrap classes keep the fast global path. Opt-out:
+    //
+    // CRUCIAL: only for a NULL parent. A loader with a non-null (application/
+    // platform) parent must keep JVMS parent-first — the parent legitimately
+    // loads the class and `findClass` is NOT called (else we would wrongly define
+    // app classes under the child loader, diverging from HotSpot). Built-in
+    // loaders and bootstrap class names also keep the fast global path. Opt-out:
     // `CRATONVM_CL_BOOTSTRAP_SCOPED=0`.
+    let parent_is_null = matches!(
+        ctx.get_field_by_name(this, "parent"),
+        Value::Object(None) | Value::Int(0) | Value::Long(0)
+    );
     let overrides_find_class = crate::classloader::receiver_overrides_find_class(ctx, this);
     let defer_to_find_class = overrides_find_class
+        && parent_is_null
         && crate::classloader::cl_bootstrap_scoped()
         && !crate::classloader::is_bootstrap_class_name(&internal);
 
