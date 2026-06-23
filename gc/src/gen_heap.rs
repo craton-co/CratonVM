@@ -129,6 +129,12 @@ pub static SWEEP_CORRUPTION_HITS: AtomicU64 = AtomicU64::new(0);
 /// first few corruption hits so the log is not flooded.
 pub static A2_PROBE_HITS: AtomicU64 = AtomicU64::new(0);
 
+/// Count of OVERLAPPING free blocks merged by the post-sweep coalescer (off <
+/// previous block end). A non-zero count proves the free list was handing out —
+/// or about to hand out — the same young region twice (the A2 object-overlap /
+/// walk-desync root). Exposed for the gated diagnostic + tests.
+pub static A2_FL_OVERLAP_HITS: AtomicU64 = AtomicU64::new(0);
+
 /// DBG: optional young-GC stress threshold (bytes) from CRATONVM_DBG_GC_STRESS.
 fn gc_stress_threshold() -> Option<usize> {
     use std::sync::OnceLock;
@@ -4733,8 +4739,34 @@ impl GenerationalHeap {
                 let mut merged: Vec<(usize, usize)> = Vec::with_capacity(sorted.len());
                 for (off, sz) in sorted {
                     if let Some(last) = merged.last_mut() {
-                        if last.0 + last.1 == off {
-                            last.1 += sz;
+                        let last_end = last.0 + last.1;
+                        // Merge ADJACENT (off == last_end) AND OVERLAPPING
+                        // (off < last_end) blocks. The old code only handled the
+                        // adjacent case, so two overlapping free blocks both
+                        // survived — and `Arena::alloc` (no overlap check, see
+                        // `arena.rs::add_free_block`) could then SERVE the same
+                        // young region twice → two live objects overlapping → the
+                        // non-moving sweep's linear walk reads a header inside a
+                        // neighbour and desyncs (the A2 / ReflRepro corruption:
+                        // CRATONVM_DBG_A2 shows the walk overstep a live object).
+                        // Overlapping spans appear when a region is freed more than
+                        // once (a stale block not removed on reuse, or two dead
+                        // spans that overlap after an earlier desync). Extend to the
+                        // farther end so the union is one block, never double-served.
+                        if off <= last_end {
+                            if off < last_end {
+                                A2_FL_OVERLAP_HITS.fetch_add(1, Ordering::Relaxed);
+                                if std::env::var_os("CRATONVM_DBG_A2").is_some()
+                                    && A2_FL_OVERLAP_HITS.load(Ordering::Relaxed) <= 6
+                                {
+                                    eprintln!(
+                                        "[A2-FL] coalesce OVERLAP: block off={} size={} overlaps prev [{}, {}) — merging",
+                                        off, sz, last.0, last_end,
+                                    );
+                                }
+                            }
+                            let new_end = last_end.max(off + sz);
+                            last.1 = new_end - last.0;
                             continue;
                         }
                     }
