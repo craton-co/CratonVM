@@ -742,19 +742,66 @@ fn dbg_fullstack_scan() -> bool {
 /// unmapped pages.
 #[cfg(target_os = "windows")]
 fn native_stack_has_jit_frame(lo: usize, hi: usize) -> bool {
-    let mut addr = (lo + 7) & !7usize;
-    const MAX_SCAN_BYTES: usize = 8 * 1024 * 1024;
-    let hi = hi.min(addr.saturating_add(MAX_SCAN_BYTES));
-    while addr + 8 <= hi {
-        // SAFETY: aligned read inside the calling thread's own live stack band
-        // between two known stack pointers (same contract as `scan_one_frame`).
-        let w = unsafe { (addr as *const usize).read() };
-        if cratonvm_jit::lookup_jit_code_range(w).is_some() {
-            return true;
+    // PERF (TC0622 startup): snapshot the JIT code ranges ONCE (single table
+    // lock) into a reusable thread-local buffer, then binary-search each stack
+    // word lock-free. The previous code called `lookup_jit_code_range` per word,
+    // locking a global `Mutex` up to ~1M times per scan — and this runs on the
+    // per-native-call root-snapshot path, so it dominated Tomcat `start()`
+    // (~66% of CPU). The hit/no-hit result is identical: ranges are disjoint,
+    // so `start <= w < end` for the greatest `start <= w` is exact.
+    // Opt-out safety net for the gauntlet soak: `CRATONVM_JIT_RANGE_SCAN_LEGACY=1`
+    // restores the original per-word `lookup_jit_code_range` path (one global
+    // Mutex lock per stack word). The default (fast) path is behavior-identical
+    // — disjoint ranges make the binary-search membership test exact — so this
+    // gate exists purely so a soak can A/B and revert without a rebuild.
+    if jit_range_scan_legacy() {
+        let mut addr = (lo + 7) & !7usize;
+        const MAX_SCAN_BYTES: usize = 8 * 1024 * 1024;
+        let hi = hi.min(addr.saturating_add(MAX_SCAN_BYTES));
+        while addr + 8 <= hi {
+            // SAFETY: see the fast path below.
+            let w = unsafe { (addr as *const usize).read() };
+            if cratonvm_jit::lookup_jit_code_range(w).is_some() {
+                return true;
+            }
+            addr += 8;
         }
-        addr += 8;
+        return false;
     }
-    false
+    thread_local! {
+        static RANGE_SNAPSHOT: std::cell::RefCell<Vec<(usize, usize)>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+    RANGE_SNAPSHOT.with(|cell| {
+        let mut ranges = cell.borrow_mut();
+        cratonvm_jit::snapshot_code_ranges_into(&mut ranges);
+        if ranges.is_empty() {
+            return false;
+        }
+        let mut addr = (lo + 7) & !7usize;
+        const MAX_SCAN_BYTES: usize = 8 * 1024 * 1024;
+        let hi = hi.min(addr.saturating_add(MAX_SCAN_BYTES));
+        while addr + 8 <= hi {
+            // SAFETY: aligned read inside the calling thread's own live stack
+            // band between two known stack pointers (same contract as
+            // `scan_one_frame`).
+            let w = unsafe { (addr as *const usize).read() };
+            // Greatest range whose start <= w; it contains w iff w < its end.
+            let idx = ranges.partition_point(|&(s, _)| s <= w);
+            if idx > 0 && w < ranges[idx - 1].1 {
+                return true;
+            }
+            addr += 8;
+        }
+        false
+    })
+}
+
+/// Cached `CRATONVM_JIT_RANGE_SCAN_LEGACY` gate — see `native_stack_has_jit_frame`.
+#[cfg(target_os = "windows")]
+fn jit_range_scan_legacy() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("CRATONVM_JIT_RANGE_SCAN_LEGACY").is_some())
 }
 
 /// Returns true if any thread anywhere in the process is currently inside a

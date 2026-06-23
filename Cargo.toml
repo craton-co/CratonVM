@@ -193,6 +193,15 @@ inherits = "release"
 debug = "line-tables-only"
 strip = "none"
 
+# Full debuginfo (S_GPROC32 function records in the PDB) so a sampling
+# profiler (samply/ETW) can resolve Rust function names, not just line
+# tables. Profiling captures only — never shipped. Same codegen as release
+# (opt-level 3, fat LTO) so the profile is representative.
+[profile.profsym]
+inherits = "release"
+debug = 2
+strip = "none"
+
 # Benches must use the same codegen as release so criterion numbers are
 # representative of what users will actually run.
 [profile.bench]
