@@ -1,0 +1,27 @@
+suite	vm	rc	state	wall_s	note
+h2-testall-fast	cratonvm	0	PASS	1.6	[2m2026-06-12T07:37:46.797254Z[0m [33m WARN[0m [2mcratonvm_vm::vm::vm_util
+h2-testall-fast	hotspot	0	PASS	0.5	00:00.030 total
+wildfly-health	cratonvm	0	PASS	19.8	ERROR [org.jboss.as.controller] WFLYCTL0362: Capabilities required by resource '/subsystem=health' are not available:
+wildfly-health	hotspot	0	PASS	2.0	RESULT tests=2 failures=0 ignored=0 ms=1399 ok=true
+hibernate-smoke	cratonvm	1	FAIL	50.8	2026-06-12T07:38:20.402638Z  WARN cratonvm_vm::vm::vm_exec: NoSuchMethodError method="java/util/ServiceLoader$Itr.hasNex
+hibernate-smoke	hotspot	-	SKIP	-	CratonVM not PASS
+elasticsearch-version	cratonvm	0	PASS	12.2	Error
+elasticsearch-version	hotspot	0	PASS	1.4	-
+gpu-bench-cpu	cratonvm	0	PASS	1.8	[cratonvm] System.exit(0) called — process terminating
+gpu-bench-cpu	hotspot	0	PASS	0.3	correctness=OK
+gpu-offload-probe	cratonvm	0	PASS	2.8	OUT0=0 OUTN=1048600
+gpu-offload-probe	hotspot	0	PASS	0.3	OUT0=0 OUTN=1048600
+bc-asn1-regression	cratonvm	0	PASS	47.5	All tests successful.
+bc-asn1-regression	hotspot	0	PASS	1.1	All tests successful.
+bc-crypto-prng	cratonvm	0	PASS	57.0	All tests successful.
+bc-crypto-prng	hotspot	0	PASS	0.8	All tests successful.
+commons-math-junit-probe	cratonvm	0	PASS	7.3	EXEC_FOUND=4 SUCCEEDED=4 FAILED=0
+commons-math-junit-probe	hotspot	0	PASS	0.8	EXEC_FOUND=1 SUCCEEDED=0 FAILED=1
+dacapo-avrora	cratonvm	0	PASS	7.9	PASSED
+dacapo-avrora	hotspot	127	N/S	1.2	FAILED
+pool:kafka-codec	cratonvm	0	PASS	2.12	 regression-pool: total=1 pass=1 regress=0 slow=0 no_base=0 no_stage=0 results: /c/craton/CratonVM/apps/probe/test-infra
+pool:kafka-codec	hotspot	1	REGRESS	0.15	-
+pool:spring-boot-run	cratonvm	0	PASS	10.48	 regression-pool: total=1 pass=1 regress=0 slow=0 no_base=0 no_stage=0 results: /c/craton/CratonVM/apps/probe/test-infra
+pool:spring-boot-run	hotspot	1	REGRESS	0.15	-
+pool:tomcat-server-info	cratonvm	0	PASS	1.99	 regression-pool: total=1 pass=1 regress=0 slow=0 no_base=0 no_stage=0 results: /c/craton/CratonVM/apps/probe/test-infra
+pool:tomcat-server-info	hotspot	1	REGRESS	0.16	-

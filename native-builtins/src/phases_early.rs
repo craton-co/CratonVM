@@ -10478,6 +10478,46 @@ pub(crate) fn pbkdf2_prf_code(alg: &str) -> Option<i32> {
     }
 }
 
+/// Opt-in gate for the native PKCS#5 v1.5 PBE `SecretKeyFactory` family
+/// (`PBEWith*`, e.g. `PBEWithMD5AndDES`). Default-OFF: when unset, every
+/// non-PBKDF2 `SecretKeyFactory.getInstance` keeps throwing the same
+/// `SecurityException` the (absent) real SunJCE provider would have raised, so
+/// the change is byte-identical to prior behaviour unless explicitly enabled.
+///
+/// Gated because, although the encoding is HotSpot-faithful for the algorithms
+/// the Tomcat realm test exercises, the blanket native intercept means turning
+/// this on supersedes the real-provider path for the *entire* `PBEWith*` family
+/// rather than just the one tested algorithm — so it ships opt-in until soaked.
+fn pbe_keyfactory_enabled() -> bool {
+    std::env::var("CRATONVM_NATIVE_PBE_KEYFACTORY").as_deref() == Ok("1")
+}
+
+/// Is `alg` a SunJCE PKCS#5 v1.5 PBE `SecretKeyFactory` algorithm?
+///
+/// SunJCE splits `SecretKeyFactory` cleanly: `PBKDF2With*` resolves to
+/// `PBKDF2Core` (whose key derives bytes — handled by [`pbkdf2_get_instance`]),
+/// while every `PBEWith*` resolves to a `PBEKeyFactory` subclass that returns a
+/// `com.sun.crypto.provider.PBEKey`. That `PBEKey.getEncoded()` returns the
+/// password as 7-bit ASCII bytes — it performs NO key derivation (the MD5+DES
+/// PBKDF1 only runs later, inside a `Cipher`). So matching the `PBEWith` prefix
+/// (the `PBKDF2With` names start differently and never collide) is the exact
+/// SunJCE dividing line.
+fn is_pbe_keyfactory_alg(alg: &str) -> bool {
+    alg.starts_with("PBEWith")
+}
+
+/// Side table recording which `SecretKeyFactory` synthetics are PBE (password-
+/// bytes) factories, mapping the GC-stable key from [`pbkdf2_key_for`] to the
+/// requested algorithm name. `generateSecret` consults this first: a hit takes
+/// the PBE path (return password bytes); a miss falls through to PBKDF2. Kept
+/// separate from `pbkdf2_prf_table` so the existing PBKDF2 PRF lookup is
+/// untouched.
+fn pbe_algo_table() -> &'static std::sync::Mutex<std::collections::HashMap<usize, String>> {
+    static T: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<usize, String>>> =
+        std::sync::OnceLock::new();
+    T.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
 /// GC-stable, collision-disambiguated identity key for the PBKDF2 PRF table.
 ///
 /// Keying by the bare 32-bit `identity_hash_code` is unsafe: two distinct
@@ -10563,6 +10603,17 @@ pub(crate) fn pbkdf2_get_instance(ctx: &mut dyn NativeContext, args: &[Value]) -
             pbkdf2_prf_table().lock().unwrap().insert(key, code);
             Ok(Some(Value::Object(Some(obj))))
         }
+        // PKCS#5 v1.5 PBE family (`PBEWithMD5AndDES`, …) — opt-in. SunJCE's
+        // `PBEKeyFactory` returns a `PBEKey` whose `getEncoded()` is the 7-bit
+        // ASCII password (no key derivation); we record the factory as PBE and
+        // let `generateSecret` reproduce that. Default-off and any unrecognised
+        // algorithm both fall through to the original `SecurityException`.
+        None if pbe_keyfactory_enabled() && is_pbe_keyfactory_alg(&alg) => {
+            let obj = alloc_concurrent_synthetic(ctx, "javax/crypto/SecretKeyFactory", 1);
+            let key = pbkdf2_key_for(ctx, obj);
+            pbe_algo_table().lock().unwrap().insert(key, alg);
+            Ok(Some(Value::Object(Some(obj))))
+        }
         None => Err(RuntimeError::SecurityException {
             message: format!("{alg} SecretKeyFactory not available"),
         }
@@ -10582,6 +10633,16 @@ pub(crate) fn pbkdf2_generate_secret(
     // Same GC-stable, collision-disambiguated key used by `getInstance` so the
     // PRF is looked up deterministically for THIS factory instance.
     let key = pbkdf2_key_for(ctx, this);
+    // PBE (`PBEWithMD5AndDES`, …): SunJCE's `PBEKey.getEncoded()` returns the
+    // password as 7-bit ASCII bytes, deriving NO key (salt/iterations/keyLength
+    // are ignored here and consumed only by the eventual Cipher). Reproduce that
+    // exactly, including the ASCII-range validation that yields
+    // `InvalidKeySpecException`.
+    let pbe_alg = pbe_algo_table().lock().unwrap().get(&key).cloned();
+    if let Some(alg) = pbe_alg {
+        let spec = obj_arg(args, 1)?;
+        return pbe_generate_secret(ctx, spec, &alg);
+    }
     let prf = pbkdf2_prf_table()
         .lock()
         .unwrap()
@@ -10642,6 +10703,86 @@ pub(crate) fn pbkdf2_generate_secret(
     );
     ctx.unpin_native_roots(kpin);
     sk
+}
+
+/// `SecretKeyFactory.generateSecret(PBEKeySpec)` for a PKCS#5 v1.5 PBE factory
+/// (`PBEWithMD5AndDES`, …).
+///
+/// Mirrors SunJCE's `com.sun.crypto.provider.PBEKey`: the encoded key is just
+/// the password rendered as 7-bit ASCII bytes (`c & 0x7f`) — there is NO key
+/// derivation at this stage (salt/iterations/keyLength are ignored; the MD5+DES
+/// PBKDF1 runs later inside a `Cipher`). Each password char must be printable
+/// ASCII (`0x20..=0x7E`); anything else raises `InvalidKeySpecException`, exactly
+/// as the real `PBEKey` constructor does. The bytes are wrapped in a real
+/// `SecretKeySpec(bytes, alg)` so `getEncoded()` returns them.
+fn pbe_generate_secret(
+    ctx: &mut dyn NativeContext,
+    spec: ObjectRef,
+    alg: &str,
+) -> MethodCallResult {
+    // PBEKeySpec layout: field 0 = password (char[]).
+    let mut pw: Vec<u8> = Vec::new();
+    if let Value::Object(Some(chars)) = ctx.get_field(spec, 0) {
+        let n = ctx.array_length(chars);
+        pw.reserve(n);
+        for i in 0..n {
+            if let Value::Int(c) = ctx.get_array_element(chars, i) {
+                let ch = (c as u32) & 0xffff;
+                if !(0x20..=0x7e).contains(&ch) {
+                    // Match com.sun.crypto.provider.PBEKey: reject non-ASCII.
+                    return Err(throw_jca_exc(
+                        ctx,
+                        "java/security/spec/InvalidKeySpecException",
+                        "Password is not ASCII",
+                    ));
+                }
+                pw.push((ch & 0x7f) as u8);
+            }
+        }
+    }
+    // SecretKeySpec rejects an empty key; the real PBEKey permits an empty
+    // password (encoded = empty byte[]). The Tomcat realm test never uses an
+    // empty password with a PBE algorithm, so route the empty case to the same
+    // InvalidKeySpecException the handler already catches rather than minting a
+    // spec that would throw a less-faithful IllegalArgumentException.
+    if pw.is_empty() {
+        return Err(throw_jca_exc(
+            ctx,
+            "java/security/spec/InvalidKeySpecException",
+            "Empty password",
+        ));
+    }
+    let key_arr = make_byte_array(ctx, &pw);
+    let kpin = ctx.pin_native_root(key_arr);
+    let algo_s = ctx.create_string(alg);
+    let key_arr_r = ctx.read_native_pin(kpin, key_arr);
+    let sk = ctx.new_object_initialized(
+        "javax/crypto/spec/SecretKeySpec",
+        "([BLjava/lang/String;)V",
+        &[Value::Object(Some(key_arr_r)), Value::Object(Some(algo_s))],
+    );
+    ctx.unpin_native_roots(kpin);
+    sk
+}
+
+/// Construct and throw a real JCA exception of `class_name` (internal form,
+/// e.g. `java/security/spec/InvalidKeySpecException`) carrying `msg`, falling
+/// back to a catchable `IllegalArgumentException` if the class can't be built.
+/// `SecretKeyCredentialHandler.mutate` catches both, so either way the handler
+/// logs and returns null exactly as it does on HotSpot.
+fn throw_jca_exc(ctx: &mut dyn NativeContext, class_name: &str, msg: &str) -> MethodCallFailed {
+    let detail = ctx.create_string(msg);
+    if let Ok(Some(Value::Object(Some(exc)))) = ctx.new_object_initialized(
+        class_name,
+        "(Ljava/lang/String;)V",
+        &[Value::Object(Some(detail))],
+    ) {
+        return MethodCallFailed::ExceptionThrown(exc);
+    }
+    RuntimeError::IllegalArgumentException {
+        message: msg.to_string(),
+    }
+    .into()
 }
 
 /// Execute doFinal: encrypt or decrypt accumulated data using the configured algorithm

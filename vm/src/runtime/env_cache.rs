@@ -301,15 +301,30 @@ cached_is_set!(jit_dispatch_dbg, "CRATONVM_DBG_JIT_DISPATCH");
 // Default-OFF until a `try_emit_inline_body` miscompile (Spring boot enum CCE)
 // is root-caused. See `try_jit_upgrade_with_gate`.
 cached_is_set!(jit_main_inline, "CRATONVM_JIT_MAIN_INLINE");
-// wire-tiered-manager increment 2: opt-in OFF-THREAD codegen. When set, the
-// interpreter's invocation tier-up trigger ENQUEUES a `CompilationTask` for the
-// background compile thread (which runs the real codegen via
-// `try_jit_compile_callee` and publishes into `shared.jit_cache`) and DOES NOT
-// compile inline on the mutator. Default-OFF: the mutator keeps its existing
-// inline `try_jit_upgrade_with_gate` path so the off-thread pipeline cannot
-// regress steady-state behaviour until proven on the gauntlet. See
-// `docs/feature-designs/wire-tiered-manager.md` (Increment 2).
-cached_is_set!(bg_compile, "CRATONVM_BG_COMPILE");
+// wire-tiered-manager: OFF-THREAD codegen for the invocation tier-up trigger.
+// When on, the interpreter's invocation tier-up trigger ENQUEUES a
+// `CompilationTask` for the background compile thread (which runs the real
+// codegen via `try_jit_compile_callee` and publishes into `shared.jit_cache`)
+// and DOES NOT compile inline on the mutator — the mutator keeps interpreting
+// until the worker publishes, at which point the `jit_cache` fast-path flips the
+// call site to `Jit`. Step-5 OSR likewise compiles off-thread when on.
+//
+// **DEFAULT-ON as of wire-tiered-manager Step 7** ("retire the single
+// fixed-threshold inline path"): the fixed-threshold invocation path
+// (`try_jit_upgrade_with_gate`) no longer compiles synchronously on the mutator
+// by default. The eager *first-call* single-pass compile (`fn execute`) remains
+// as the quick first tier; this gate governs the invocation-counted re-tiering
+// and OSR. Opt-out — `CRATONVM_BG_COMPILE=0` (or `false`) restores the historical
+// inline path (the safety net while the off-thread pipeline soaks on the
+// gauntlet). See `docs/feature-designs/wire-tiered-manager.md` (Step 7).
+#[inline]
+pub fn bg_compile() -> bool {
+    static CACHE: OnceLock<bool> = OnceLock::new();
+    *CACHE.get_or_init(|| match std::env::var("CRATONVM_BG_COMPILE") {
+        Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+        Err(_) => true,
+    })
+}
 // wire-tiered-manager Step 4 (PGO handoff C1 → C2): opt-in profile collection.
 // When set, `SharedVm::new` calls `jit::profile::enable_profiling(true)` once at
 // VM init, so the interpreter's existing branch / receiver / back-edge recording
@@ -336,6 +351,32 @@ cached_is_set!(tier_pgo, "CRATONVM_TIER_PGO");
 pub fn jit_virtual_tierup() -> bool {
     static CACHE: OnceLock<bool> = OnceLock::new();
     *CACHE.get_or_init(|| match std::env::var("CRATONVM_JIT_VIRTUAL_TIERUP") {
+        // Explicit opt-out only: `0` / `false` disable; unset or any other
+        // value (incl. `1`, empty) enables.
+        Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+        Err(_) => true,
+    })
+}
+/// `CRATONVM_NATIVE_STRING_REGEX` — route `String.replaceAll` / `replaceFirst`
+/// / `matches` and the literal `String.replace(CharSequence,CharSequence)` to
+/// CratonVM's fast cached Rust natives instead of the real JDK bytecode. The
+/// real-JDK `java.util.regex` engine runs interpreted (every `Matcher` step
+/// crosses the VM→native String-accessor boundary), and the literal `replace`
+/// overload runs an interpreted per-char scan — 10–600× slower than HotSpot
+/// for regex-heavy build steps (ShrinkWrap archive packaging, Spring Boot's
+/// `PluginXmlParser`, AsciiDoc/Javadoc `{@code}` rewriting). The natives use the
+/// `regex` / `fancy-regex` crates (bounded compile cache, Java-faithful
+/// replacement `$N`/`${name}`/`\`-escapes, ASCII-default `\d`/`\w`/`\s`/`\b`)
+/// and `str::replace`, and are validated byte-identical to HotSpot.
+///
+/// **DEFAULT-ON** (opt-out `CRATONVM_NATIVE_STRING_REGEX=0`/`false`). These are
+/// faithful alternate implementations (like intrinsics), not synthetic stubs,
+/// and a parity battery confirms HotSpot-identical output incl. non-ASCII Perl
+/// classes; the opt-out is the safety net if an app hits a regex-feature gap.
+#[inline]
+pub fn native_string_regex() -> bool {
+    static CACHE: OnceLock<bool> = OnceLock::new();
+    *CACHE.get_or_init(|| match std::env::var("CRATONVM_NATIVE_STRING_REGEX") {
         // Explicit opt-out only: `0` / `false` disable; unset or any other
         // value (incl. `1`, empty) enables.
         Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),

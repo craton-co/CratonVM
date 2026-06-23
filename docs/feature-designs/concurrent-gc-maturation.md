@@ -563,18 +563,26 @@ Author note: this doc is grounded in a read of `gc/src/{g1,g1_concurrent,zgc,zgc
       clears every self-forward's `forwarding_ptr` after merging the shards (the
       `key == value` loop). This was the "dangling refs on humongous-ref-array"
       symptom that originally gated mixed→serial.
-    - **Defect 2 — rare non-deterministic young-evac corruption — 🔴 OPEN.** A
-      separate race in `young_collection_parallel`'s shared closure
-      (`run_worker`/`evacuate`/`process_object` — work-queue / atomic-forwarding /
-      termination concurrency) intermittently corrupts a still-live object under
-      frequent young GCs at small heaps. Repro `SteadyChurn @16m --nojit -Xmx16m
-      SteadyChurn 2000000` under `CRATONVM_G1_PARALLEL_EVAC=1`: ~1 in 8 runs throws
-      `Exception in thread "main" java/lang/Object` (a zeroed/stale header on a
-      node of the held linked list); correct at 24/32/48m and **always correct
-      serially**. This is NOT defect 1 (no to-space exhaustion) and reproduces with
-      `--nojit` (no JIT roots), so it is a genuine parallel-evacuator data race —
-      the long-suspected pre-existing race (`task_58d60f7a` family), now pinned to a
-      concrete cheap repro.
+    - **Defect 2 — TWO stacked bugs; DOMINANT 🟡 FIXED (dev `f1afdcf9`), residual
+      race 🔴 OPEN.** Repro `CRATONVM_G1_PARALLEL_EVAC=1 … --nojit -Xmx16m
+      SteadyChurn 2000000` threw `java/lang/Object`; always correct serially.
+      **(1) DOMINANT — persistent-`forwarding_ptr` root-remap flaw, FIXED.** The
+      parallel evacuator dedups via the PERSISTENT `ObjectHeader.forwarding_ptr`
+      (serial uses the per-cycle `pointer_map`); a fast-path hit returned a
+      forward — possibly a stale prior-cycle one — WITHOUT recording it in
+      `pointer_map`, so the VM's `update_all_roots` could not remap a root that
+      resolved through the header → the frame local stayed stuck on the from-space
+      object and dangled on region reuse. Invisible to V7b (heap-only). Fix =
+      `evacuate` fast path records `(old, existing)` + `parallel_evacuate` clears
+      `forwarding_ptr` for ALL keys at cycle end (combining the two fixes that
+      fail alone — clear = 28/30 bad, record = 8/30). `SteadyChurn @16m` ~12.5%→0
+      (`CRATONVM_G1_DBG_HEADERS` LOST=0); `binarytrees16`/`PromoteMixed`
+      serial+parallel == HotSpot; 734/734 + regression. **(2) RESIDUAL — a
+      separate transient worker-vs-worker concurrency race**, ~2/40, verifier
+      reports nothing and the rate rises under its timing perturbation (the
+      original `task_58d60f7a` race). STILL OPEN; needs concurrency tooling.
+      Full writeup:
+      `docs/known-issues/g1-parallel-evac-persistent-forwarding-root-remap.md`.
     - **Consequence:** because defect 2 lives in the shared `parallel_evacuate`
       closure that both young and mixed parallel paths drive, **mixed GC stays on
       the SERIAL evacuator** (the earlier plan to un-gate it was reverted — its

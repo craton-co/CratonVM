@@ -259,9 +259,24 @@ impl<'a> SharedEvac<'a> {
             (*(old_ptr as *mut ObjectHeader)).forwarding_ptr
         ) as *const AtomicUsize);
 
-        // Fast path: already forwarded by some worker.
+        // Fast path: already forwarded this cycle.
         let existing = fwd_atomic.load(Ordering::Acquire);
         if existing != 0 {
+            // DEFECT-2 FIX (part 1 of 2): record the forward in THIS cycle's
+            // forward set even though we didn't perform the copy, so it reaches
+            // `pointer_map`. The serial path dedups via the per-cycle
+            // `pointer_map` (so every forward is recorded); the parallel path
+            // dedups via the persistent `forwarding_ptr` header field, and a
+            // fast-path hit previously returned `existing` WITHOUT recording it.
+            // That left the address `old_ptr -> existing` absent from
+            // `pointer_map`, so the VM's `update_all_roots` could not remap a root
+            // still pointing at `old_ptr` — it stayed stuck on the from-space
+            // object and dangled when the region was reused (the rare
+            // `java/lang/Object`). Recording it lets the root be remapped to
+            // `existing`. Safe because part 2 (clearing `forwarding_ptr` for every
+            // evacuated object at cycle end) guarantees `existing` is a THIS-cycle
+            // forward (a fully-scanned live copy), never a stale prior-cycle one.
+            forwards.push((old_ptr as usize, existing));
             return Some((existing as *mut u8, false));
         }
 
@@ -1045,6 +1060,26 @@ pub struct G1Collector {
     /// audit-flagged hot-path bottleneck (CRIT-P4): with 256 regions, a
     /// 100-slot object incurred ~25k linear probes during evacuation.
     region_lookup: Vec<(usize, usize)>,
+
+    /// Lock-free inclusive-exclusive bounds `[arena_base, arena_end)` of the
+    /// single contiguous backing arena. Immutable for the collector's
+    /// lifetime (the `arena` `Box` is allocated once in [`G1Collector::new`]
+    /// and never moved or resized), so they can be read with no atomics and
+    /// no `regions.lock()`.
+    ///
+    /// Used by [`G1Collector::is_addr_in_live_region`] as an O(1) lock-free
+    /// reject for the overwhelming majority of conservative-root-scan
+    /// candidate words (return addresses, ints, native-stack addresses) that
+    /// fall outside the heap arena entirely. That function is the per-word
+    /// hot path of `scan_active_jit_frames` / `update_root_snapshot`, which
+    /// run on *every* object-returning native call; the previous
+    /// implementation took the regions mutex and linearly scanned all
+    /// `num_regions` regions for each candidate word, contending
+    /// catastrophically on deep-stack JIT-on workloads. This mirrors the
+    /// lock-free `[base, end)` bounds gate `gen_heap` already adopted for the
+    /// identical reason (see `GenerationalHeap::is_object_address`).
+    arena_base: usize,
+    arena_end: usize,
 }
 
 // SAFETY: All fields are either atomic, behind Mutex, or Arc. Raw pointers
@@ -1071,6 +1106,7 @@ impl G1Collector {
         // the `region_lookup` table are address-stable for the collector's life.
         let arena: Box<[u8]> = vec![0u8; num_regions * config.region_size].into_boxed_slice();
         let arena_base = arena.as_ptr() as usize;
+        let arena_end = arena_base + arena.len();
 
         let regions: Vec<G1Region> = (0..num_regions)
             .map(|i| {
@@ -1122,6 +1158,8 @@ impl G1Collector {
             // SECURITY FIX (V7a): start the RSet TLS-cache epoch at 0.
             rset_cache_epoch: AtomicU64::new(0),
             region_lookup,
+            arena_base,
+            arena_end,
         }
     }
 
@@ -1926,6 +1964,14 @@ impl G1Collector {
     /// available hardware parallelism (always ≥ 1). With 1 worker the parallel
     /// code path drains serially — useful for determinism testing.
     fn parallel_worker_count(&self) -> usize {
+        // Diagnostic override: `CRATONVM_G1_WORKERS=N` forces the worker count
+        // (e.g. =1 to drain the parallel path serially and isolate concurrency
+        // races from logic divergences). Falls back to the config otherwise.
+        if let Some(v) = std::env::var_os("CRATONVM_G1_WORKERS") {
+            if let Some(n) = v.to_str().and_then(|s| s.trim().parse::<usize>().ok()) {
+                return n.max(1);
+            }
+        }
         let cfg = self.config.gc_worker_threads.max(1);
         let avail = std::thread::available_parallelism()
             .map(|n| n.get())
@@ -2074,43 +2120,38 @@ impl G1Collector {
             }
         }
 
-        // PARALLEL-EVAC UAF FIX (Step 9). The parallel evacuator CAS-installs
-        // each forward into the from-space object's *persistent*
-        // `ObjectHeader::forwarding_ptr` field (the lock-free install slot),
-        // unlike the serial path which records forwards only in the per-cycle
-        // `pointer_map`. For a normally-evacuated object that is harmless: its
-        // from-space region is reset in Phase 5 (`free_or_keep_cset`), which
-        // zeroes the field. But a *self-forwarded* object (evacuation failure —
-        // to-space pool exhausted — installs `old -> old`, a `key == value`
-        // entry) lives in a region that Phase 5 KEEPS and never resets, so its
-        // `forwarding_ptr` would retain its own address across collections.
+        // DEFECT-2 FIX (part 2 of 2): restore the evacuator's
+        // "`forwarding_ptr == 0` at collection start" invariant for EVERY
+        // from-space object forwarded this cycle, not just the self-forwarded
+        // ones.
         //
-        // The NEXT collection's `evacuate` fast path
-        // (`let e = forwarding_ptr; if e != 0 { return (e, false) }`) would then
-        // read that stale self-pointer, SKIP re-evacuating the still-live object
-        // (now back in the CSet) and record NO forward for it this cycle —
-        // whereupon `free_or_keep_cset`, seeing no `key == value` entry, frees
-        // the region out from under every referrer. Result: dangling references
-        // into reclaimed memory (intermittent SIGSEGV; the V7b verifier reports
-        // "freed CSet region ... no forwarding entry"). Manifests at scale on a
-        // large humongous reference array whose elements repeatedly fail to find
-        // to-space.
+        // The parallel evacuator CAS-installs each forward into the from-space
+        // object's *persistent* `ObjectHeader::forwarding_ptr` (the lock-free
+        // install slot), unlike the serial path which records forwards only in
+        // the per-cycle `pointer_map`. Phase 5 (`free_or_keep_cset`) zeroes the
+        // field for a FREED region, but a KEPT region (one holding a
+        // self-forwarded / evacuation-failed object) is never reset, so the
+        // `forwarding_ptr` of EVERY forwarded object it contains — the
+        // self-forwarded one AND the normally-evacuated bodies left behind —
+        // would persist into the next collection. On the next cycle `evacuate`'s
+        // fast path reads that STALE forward, returns it without re-evacuating or
+        // recording it, and (with part 1) records a stale forward / strands a
+        // root on a from-space object → the rare `java/lang/Object`.
         //
-        // Restore the evacuator's "`forwarding_ptr == 0` at collection start"
-        // invariant for the only objects that violate it — the self-forwarded
-        // (kept-in-place) ones — now that the transitive closure is complete and
-        // no further `evacuate` call this cycle depends on the in-place forward.
-        // The merge above is the first point at which every shard's self-forward
-        // is visible. The serial path never writes this header field, which is
-        // why it is V7b-clean on the identical workload.
-        for (&k, &v) in pointer_map.iter() {
-            if k == v {
-                // SAFETY: `k` is a live from-space object address that the
-                // evacuator just CAS-forwarded to itself; its header is intact
-                // and its region is held under the collection's `regions` lock.
-                unsafe {
-                    (*(k as *mut ObjectHeader)).forwarding_ptr = std::ptr::null_mut();
-                }
+        // Clearing only `k == v` (self-forwards) was insufficient: it left the
+        // normally-evacuated bodies in kept regions stale (and clearing them
+        // alone, without part 1's fast-path recording, removed the redirect that
+        // was masking the stuck roots — hence the two halves are landed
+        // together). Clear ALL keys: for a freed region this is redundant (Phase
+        // 5 zeroes it anyway); for a kept region it is the correction. Together
+        // with part 1 this makes the parallel path behave like the serial one —
+        // every forward recorded in `pointer_map`, none persisting across cycles.
+        for &k in pointer_map.keys() {
+            // SAFETY: `k` is a from-space object address forwarded this cycle;
+            // its header is intact and its region is held under the collection's
+            // `regions` lock (Phase 5 has not run yet).
+            unsafe {
+                (*(k as *mut ObjectHeader)).forwarding_ptr = std::ptr::null_mut();
             }
         }
 
@@ -2170,6 +2211,8 @@ impl G1Collector {
         // Phase 5: free evacuated regions.
         let bytes_freed = self.free_or_keep_cset(&mut regions, &cset, &pointer_map);
         self.verify_no_dangling_into_cset(&regions, &cset_set, &pointer_map);
+        self.dbg_verify_no_unrewritten_forward(&regions, &cset_set, &pointer_map, roots);
+        self.dbg_scan_for_zeroed_refs(&regions, &cset_set, roots);
 
         let cur_eden = self.current_eden.load(Ordering::Relaxed);
         if cset_set.contains(&cur_eden) {
@@ -2976,6 +3019,254 @@ impl G1Collector {
              holder_obj={:#x} holder_region={} target={:#x}",
             holder_obj, holder_region, target
         );
+    }
+
+    /// DIAGNOSTIC TOOL (parallel-evac defect 2, env `CRATONVM_G1_DBG_HEADERS=1`).
+    /// Post-collection consistency verifier that ROOT-CAUSED the rare
+    /// `young_collection_parallel` corruption (`SteadyChurn @16m --nojit`, ~1/8,
+    /// `java/lang/Object`). Checks, after a parallel collection:
+    ///   (0) OVERLAP — two from-space objects forwarded to the same dest (a TLAB
+    ///       race) — NEVER fires (ruled out);
+    ///   (a) UN-REWRITTEN — a non-CSet/root ref to a `pointer_map` KEY — NEVER
+    ///       fires from heap holders (the heap is clean);
+    ///   (b) LOST — a root → a CSet object NOT in `pointer_map` — fires EVERY
+    ///       collection: the smoking gun.
+    ///
+    /// ROOT CAUSE (full writeup + ruled-out fixes:
+    /// `docs/known-issues/g1-parallel-evac-persistent-forwarding-root-remap.md`):
+    /// the parallel evacuator dedups via the PERSISTENT `forwarding_ptr` header
+    /// field (serial uses the per-cycle `pointer_map`). A fast-path hit returns a
+    /// forward — possibly left over from a PRIOR cycle — WITHOUT recording it in
+    /// `pointer_map`, so the VM's `update_all_roots` cannot remap a root that
+    /// resolved through it. The frame local stays stuck on the from-space object,
+    /// surviving only via the `forwarding_ptr` redirect until its region is
+    /// reused → corruption. Invisible to V7b (heap-only). Three naive fixes all
+    /// fail (see the doc); the proper fix is a per-cycle forwarding redesign.
+    ///
+    /// Mixed GC is kept on the serial evacuator and parallel evac stays
+    /// opt-in/experimental (`CRATONVM_G1_PARALLEL_EVAC`) until this is fixed.
+    /// No-op unless the env knob is set.
+    fn dbg_verify_no_unrewritten_forward(
+        &self,
+        regions: &[G1Region],
+        cset_set: &std::collections::HashSet<usize>,
+        pointer_map: &HashMap<usize, usize>,
+        roots: &[ObjectRef],
+    ) {
+        if std::env::var_os("CRATONVM_G1_DBG_HEADERS").is_none() {
+            return;
+        }
+        // (0) OVERLAP DETECTOR: two distinct from-space objects forwarded to the
+        // SAME destination address = a TLAB allocation race (one copy clobbers
+        // the other's header → `java/lang/Object`). Reverse-map the forwards.
+        {
+            let mut by_dest: HashMap<usize, usize> = HashMap::with_capacity(pointer_map.len());
+            let mut overlaps = 0usize;
+            for (&k, &v) in pointer_map.iter() {
+                if k == v {
+                    continue; // self-forward (in place) — not a copy destination
+                }
+                if let Some(&prev) = by_dest.get(&v) {
+                    overlaps += 1;
+                    if overlaps <= 8 {
+                        eprintln!(
+                            "[g1][DBG-HEADERS] OVERLAP: dest {:#x} is the forward target of TWO \
+                             from-space objects {:#x} and {:#x}",
+                            v, prev, k
+                        );
+                    }
+                } else {
+                    by_dest.insert(v, k);
+                }
+            }
+            if overlaps > 0 {
+                eprintln!("[g1][DBG-HEADERS] {overlaps} forward-destination OVERLAP(s) this collection");
+            }
+        }
+
+        let mut hits = 0usize;
+        // A holder is REACHABLE-RELEVANT only if it is NOT in a CSet (from-space)
+        // region: kept CSet regions hold dead-never-reached from-space objects
+        // whose slots are legitimately un-rewritten (noise). True survivors/old
+        // (non-CSet) and roots MUST have every CSet ref rewritten (by the in-place
+        // scan for new survivors, or Phase 4 for pre-existing survivors/old).
+        let mut lost = 0usize;
+        let mut check = |holder: usize, where_: &str, target: usize| {
+            if let Some(&new) = pointer_map.get(&target) {
+                if new != target {
+                    hits += 1;
+                    if hits <= 24 {
+                        let treg = self.lookup_region_for_addr(target);
+                        eprintln!(
+                            "[g1][DBG-HEADERS] UN-REWRITTEN forward (live holder): {where_} \
+                             holder={:#x} slot->{:#x} should be {:#x}; target region={:?}",
+                            holder, target, new, treg
+                        );
+                    }
+                }
+                return;
+            }
+            // LOST: target sits in a CSet (collected) region but has NO forwarding
+            // entry — it was never evacuated. V7b catches this for HEAP holders;
+            // here it also covers ROOTS (which V7b never scans). A live object
+            // reachable only via a root, dropped because the parallel closure
+            // terminated before scanning it, lands here — and the VM's
+            // `update_all_roots` cannot remap it (not in `pointer_map`), so the
+            // frame local dangles into the freed region → `java/lang/Object`.
+            if let Some(tidx) = self.lookup_region_for_addr(target) {
+                if cset_set.contains(&tidx) {
+                    lost += 1;
+                    if lost <= 24 {
+                        eprintln!(
+                            "[g1][DBG-HEADERS] LOST (un-evacuated CSet target): {where_} \
+                             holder={:#x} slot->{:#x} region={tidx} — NOT in pointer_map",
+                            holder, target
+                        );
+                    }
+                }
+            }
+        };
+        // Roots (always reachable).
+        for r in roots {
+            let p = r.as_ptr() as usize;
+            if p != 0 {
+                check(0, "root", p);
+            }
+        }
+        // Only NON-CSet regions (true survivors / old / new survivors). Kept CSet
+        // regions are excluded — their dead objects are the stranded-copy noise.
+        for (ridx, region) in regions.iter().enumerate() {
+            if region.region_type == RegionType::Free || cset_set.contains(&ridx) {
+                continue;
+            }
+            let base = region.data.as_ptr();
+            let cursor = region.cursor;
+            let mut offset = 0usize;
+            while offset < cursor {
+                let obj_ptr = unsafe { base.add(offset) };
+                let header = unsafe { &*(obj_ptr as *const ObjectHeader) };
+                if is_humongous_filler(header) {
+                    break;
+                }
+                let obj_size = object_total_size(header);
+                if obj_size < HEADER_SIZE || offset + obj_size > cursor {
+                    break;
+                }
+                let data = unsafe { obj_ptr.add(HEADER_SIZE) };
+                if header.kind == ObjectKind::Array {
+                    if header.element_type == ArrayElementType::Reference {
+                        for k in 0..header.array_length as usize {
+                            let raw =
+                                unsafe { std::ptr::read(data.add(k * 8) as *const u64) } as usize;
+                            if raw != 0 {
+                                check(obj_ptr as usize, "array-elem", raw);
+                            }
+                        }
+                    }
+                } else {
+                    for s in 0..header.num_slots as usize {
+                        let v = unsafe { std::ptr::read(data.add(s * SLOT_SIZE) as *const Value) };
+                        if let Value::Object(Some(o)) = v {
+                            check(obj_ptr as usize, "field", o.as_ptr() as usize);
+                        }
+                    }
+                }
+                offset += obj_size;
+            }
+        }
+        if hits > 0 || lost > 0 {
+            eprintln!(
+                "[g1][DBG-HEADERS] {hits} un-rewritten + {lost} LOST(un-evacuated CSet) \
+                 from NON-CSET holders/roots = the real defect"
+            );
+        }
+    }
+
+    /// DIAGNOSTIC (defect-2 residual race, env `CRATONVM_G1_DBG_ZERO=1`): after a
+    /// parallel collection, scan EVERY non-Free region (INCLUDING kept CSet
+    /// regions, which the un-rewritten verifier excludes) plus the roots, and
+    /// report any reference whose TARGET has an all-zero header (the freed/reused
+    /// region signature behind `java/lang/Object`). Catches the residual
+    /// concurrency-race corruption at the collection that introduces it,
+    /// regardless of which region the holder lives in. No-op unless the env set.
+    fn dbg_scan_for_zeroed_refs(
+        &self,
+        regions: &[G1Region],
+        cset_set: &std::collections::HashSet<usize>,
+        roots: &[ObjectRef],
+    ) {
+        if std::env::var_os("CRATONVM_G1_DBG_ZERO").is_none() {
+            return;
+        }
+        let mut hits = 0usize;
+        let is_zeroed = |addr: usize| -> bool {
+            if addr == 0 || self.lookup_region_for_addr(addr).is_none() {
+                return false;
+            }
+            let h = unsafe { &*(addr as *const ObjectHeader) };
+            h.class_id.as_u32() == 0
+                && h.num_slots == 0
+                && (h.kind as u8) == 0
+                && h.array_length == 0
+        };
+        let mut report = |holder: usize, hreg: Option<usize>, where_: &str, target: usize| {
+            if is_zeroed(target) {
+                hits += 1;
+                if hits <= 16 {
+                    let treg = self.lookup_region_for_addr(target);
+                    let h_in_cset = hreg.map(|i| cset_set.contains(&i)).unwrap_or(false);
+                    let t_in_cset = treg.map(|i| cset_set.contains(&i)).unwrap_or(false);
+                    eprintln!(
+                        "[g1][DBG-ZERO] ZEROED target: {where_} holder={:#x} (region={:?} \
+                         in_cset={h_in_cset}) slot->{:#x} (region={:?} in_cset={t_in_cset})",
+                        holder, hreg, target, treg
+                    );
+                }
+            }
+        };
+        for r in roots {
+            report(0, None, "root", r.as_ptr() as usize);
+        }
+        for (ridx, region) in regions.iter().enumerate() {
+            if region.region_type == RegionType::Free {
+                continue;
+            }
+            let base = region.data.as_ptr();
+            let cursor = region.cursor;
+            let mut off = 0usize;
+            while off < cursor {
+                let obj_ptr = unsafe { base.add(off) };
+                let header = unsafe { &*(obj_ptr as *const ObjectHeader) };
+                if is_humongous_filler(header) {
+                    break;
+                }
+                let sz = object_total_size(header);
+                if sz < HEADER_SIZE || off + sz > cursor {
+                    break;
+                }
+                let data = unsafe { obj_ptr.add(HEADER_SIZE) };
+                if header.kind == ObjectKind::Array {
+                    if header.element_type == ArrayElementType::Reference {
+                        for k in 0..header.array_length as usize {
+                            let raw =
+                                unsafe { std::ptr::read(data.add(k * 8) as *const u64) } as usize;
+                            report(obj_ptr as usize, Some(ridx), "array-elem", raw);
+                        }
+                    }
+                } else {
+                    for s in 0..header.num_slots as usize {
+                        let v = unsafe { std::ptr::read(data.add(s * SLOT_SIZE) as *const Value) };
+                        if let Value::Object(Some(o)) = v {
+                            report(obj_ptr as usize, Some(ridx), "field", o.as_ptr() as usize);
+                        }
+                    }
+                }
+                off += sz;
+            }
+        }
+        if hits > 0 {
+            eprintln!("[g1][DBG-ZERO] {hits} reference(s) to a ZEROED (freed) object this collection");
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -4362,17 +4653,61 @@ impl G1Collector {
     /// without being relocated (e.g., objects in Old/Humongous regions that
     /// were not part of the collection set).
     pub fn is_addr_in_live_region(&self, addr: usize) -> bool {
-        let regions = self.regions.lock();
-        for r in regions.iter() {
-            if r.region_type == RegionType::Free {
-                continue;
-            }
-            let base = r.data.as_ptr() as usize;
-            if addr >= base && addr < base + r.cursor {
-                return true;
-            }
+        // Fast lock-free arena-bounds gate. `[arena_base, arena_end)` is
+        // immutable for the collector's lifetime (single contiguous `Box<[u8]>`,
+        // never moved/resized), so the test needs no atomics and no lock. This
+        // is the hot path: `is_addr_in_live_region` is called per candidate word
+        // by the conservative JIT/native root scan
+        // (`scan_active_jit_frames` / `update_root_snapshot`), which runs on
+        // every object-returning native call. The overwhelming majority of those
+        // words (return addresses, ints, native-stack addresses) lie OUTSIDE the
+        // heap arena and are rejected here without touching `regions.lock()` or
+        // scanning any region. The previous implementation took the regions
+        // mutex and linearly scanned all ~`num_regions` regions for EVERY word,
+        // which made JIT-on, deep-stack workloads (e.g. Spring Boot buildSrc
+        // JUnit annotation walks) run for minutes / appear hung under G1 while
+        // serial GC — whose `gen_heap` adopted exactly this lock-free gate —
+        // finished in seconds.
+        if addr < self.arena_base || addr >= self.arena_end {
+            return false;
         }
-        false
+        // In-arena candidate: index the single owning region in O(1). Region `k`
+        // occupies `[arena_base + k*region_size, +region_size)` and lives at
+        // `regions[k]` (the Vec has fixed length and is never reordered; each
+        // slot's `data` buffer is address-stable). Only genuine
+        // heap-pointer-shaped words reach here, so the lock is taken rarely. The
+        // explicit base/cursor bounds re-check below is the authoritative test
+        // (and guards against any indexing skew).
+        let region_size = self.config.region_size;
+        if region_size == 0 {
+            return false;
+        }
+        let idx = (addr - self.arena_base) / region_size;
+        let regions = self.regions.lock();
+        match regions.get(idx) {
+            None => false,
+            Some(r) => match r.region_type {
+                // Free regions hold no live object.
+                RegionType::Free => false,
+                // A humongous object is physically contiguous across its
+                // slices; only the `HumongousStart` region carries the full
+                // `cursor = object_size`, while every continuation slice keeps
+                // `cursor = 0` as a sentinel (see `alloc_humongous_locked`).
+                // The whole continuation slice is therefore live — matching the
+                // previous linear scan, which found such interior addresses via
+                // the start region's full-span cursor. (A conservative root
+                // scan tolerates the harmless over-retention of any tail
+                // padding past the object's true end; `is_object_address`'s
+                // header check still rejects non-object interior words.)
+                RegionType::HumongousContinuation => true,
+                // Eden / Survivor / Old / HumongousStart: live iff the address
+                // is below the region's allocation cursor.
+                _ => {
+                    let base = r.data.as_ptr() as usize;
+                    addr >= base && addr < base + r.cursor
+                }
+            },
+        }
     }
 
     /// Walk all live objects across all non-Free regions.
@@ -7113,6 +7448,48 @@ mod tests {
         );
     }
 
+    /// `is_addr_in_live_region` regression: the lock-free O(1) arena-bounds
+    /// gate + single-region index must (a) reject addresses outside the arena
+    /// without taking the lock, (b) reject addresses inside the arena but in an
+    /// unallocated (Free) region, and (c) accept the address of a freshly
+    /// allocated live object. This is the per-word hot path of the conservative
+    /// JIT/native root scan; the previous lock+linear-scan-per-word
+    /// implementation made G1+JIT deep-stack workloads (Spring Boot buildSrc
+    /// JUnit) fall off a throughput cliff (1264 s → 72 s after the fix).
+    #[test]
+    fn is_addr_in_live_region_bounds_and_liveness() {
+        let gc = make_collector();
+
+        // (a) Outside the arena → false, via the lock-free fast gate.
+        assert!(!gc.is_addr_in_live_region(0));
+        assert!(!gc.is_addr_in_live_region(gc.arena_base - 8));
+        assert!(!gc.is_addr_in_live_region(gc.arena_end));
+        assert!(!gc.is_addr_in_live_region(gc.arena_end + 0x10_0000));
+
+        // (b) Inside the arena but in a still-Free region → false. The very
+        // first slot is Free until the first allocation carves an Eden.
+        let first_free = gc.arena_base + 64; // 8-aligned, inside region 0
+        assert!(
+            !gc.is_addr_in_live_region(first_free),
+            "address in an unallocated Free region must not be live"
+        );
+
+        // (c) A freshly allocated object's address is in a live region.
+        let obj = gc
+            .try_alloc_object(ClassId::new(0), 3)
+            .expect("alloc should succeed on a fresh heap");
+        let addr = obj.as_ptr() as usize;
+        assert!(addr >= gc.arena_base && addr < gc.arena_end);
+        assert!(
+            gc.is_addr_in_live_region(addr),
+            "a live object's address must resolve as in a live region"
+        );
+
+        // O(1) index agrees with the authoritative binary-search lookup for the
+        // live address (sanity on the `(addr - arena_base) / region_size` math).
+        assert!(gc.lookup_region_for_addr(addr).is_some());
+    }
+
     /// `region_for_ptr_with_regions` (write-barrier hot path) must agree
     /// with `region_for_ptr` for every probe.
     #[test]
@@ -7543,6 +7920,50 @@ mod tests {
             Some(12345),
             "live object lost across a second collection (stale self-forward UAF)"
         );
+    }
+
+    /// Regression (defect 2: persistent forwarding_ptr root-remap). When the
+    /// parallel evacuator reaches a CSet object whose `forwarding_ptr` is already
+    /// set (a fast-path hit), it must RECORD `old -> existing` in `pointer_map`
+    /// (so the VM's `update_all_roots` can remap a root that still points at
+    /// `old`) and CLEAR the header at cycle end (so the forward does not persist
+    /// into the next cycle). Before the fix the fast path returned `existing`
+    /// without recording it, so the root stayed stuck on the from-space object
+    /// and dangled when its region was reused.
+    #[test]
+    fn parallel_fast_path_hit_is_recorded_and_root_remapped() {
+        let mut cfg = parallel_config(4, 8);
+        cfg.promotion_age = 1;
+        let gc = G1Collector::new(cfg);
+
+        // Promote a target T to Old so it is a stable (non-CSet) forward target.
+        let t = gc.alloc_object(ClassId::new(2), 1);
+        gc.set_field(t, 0, Value::Int(99));
+        let mut troots = vec![t];
+        gc.young_collection_parallel(&mut troots, &NoopMonitors); // Survivor, age 1
+        gc.young_collection_parallel(&mut troots, &NoopMonitors); // promote -> Old
+        let t_old = troots[0].as_ptr() as usize;
+
+        // O lives in young Eden; pre-install O.forwarding_ptr = T as if a worker
+        // had already forwarded O to T this cycle (or a stale prior-cycle
+        // redirect). Root O.
+        let o = gc.alloc_object(ClassId::new(1), 0);
+        let o_addr = o.as_ptr() as usize;
+        unsafe {
+            (*(o.as_ptr() as *mut ObjectHeader)).forwarding_ptr = t_old as *mut u8;
+        }
+        let mut roots = vec![o];
+        let r = gc.young_collection_parallel(&mut roots, &NoopMonitors);
+
+        // (a) the fast-path forward O -> T is recorded in pointer_map.
+        assert_eq!(
+            r.pointer_map.get(&o_addr),
+            Some(&t_old),
+            "fast-path forward O->T was not recorded in pointer_map (root cannot be remapped)"
+        );
+        // (b) the root is remapped to T, and T is intact (not re-copied/corrupted).
+        assert_eq!(roots[0].as_ptr() as usize, t_old, "root not remapped to the forward target");
+        assert_eq!(gc.get_field(roots[0], 0).as_int(), Some(99));
     }
 
     #[test]

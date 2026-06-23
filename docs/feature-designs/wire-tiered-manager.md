@@ -1,5 +1,53 @@
 # Wire the Tiered Compilation Manager
 
+> **Increment 7 (Step 7 — retire the single fixed-threshold inline path) landed.**
+> Builds on increment 6. The **default flip**: the background tiered pipeline
+> (Steps 1–5) is now the default compiler — *all* synchronous on-mutator
+> compilation (the fixed-threshold `try_jit_upgrade_with_gate` AND the eager
+> first-call single-pass compile) is replaced, by default, with off-thread
+> compilation; the mutator interprets until the worker publishes.
+> - **`bg_compile()` flipped default-ON** (`runtime/env_cache.rs`): was
+>   opt-in (`cached_is_set!`), now an explicit predicate that is `true` unless
+>   `CRATONVM_BG_COMPILE=0`/`false`. The opt-out restores the historical inline +
+>   eager paths verbatim — the safety net while the off-thread pipeline soaks on
+>   the gauntlet (per the repo rule: flip default-on, opt-out is the net).
+> - **Both invocation triggers enqueue under the default.** The static path
+>   (`execute_invokestatic_cached`) was already bg-aware (Steps 1–2). The virtual
+>   path (`execute_invokevirtual_cached`) is now bg-aware too: under `bg_compile`
+>   it `ensure_bg_compiler_started` + `on_method_invocation` (enqueue) and keeps
+>   interpreting, instead of inline `try_jit_upgrade_with_gate`. OSR already
+>   compiles off-thread by default (Step 5, same `bg_compile`).
+> - **Eager first-call rerouted (the key change).** The eager single-pass compile
+>   in `fn execute` (the de-facto default compiler — it ran on call #1 and thereby
+>   *preempted* the worker, which is why a naive gate-flip left the worker firing
+>   0×) is now, under `bg_compile`, replaced by an invocation-counted **enqueue**:
+>   `execute` counts invocations, ensures the worker + `on_method_invocation` once
+>   past the warmup threshold, and returns `None` to interpret (with
+>   `c2_not_hot = true` so the method isn't sealed and the counter keeps running —
+>   covering reflective / uncached-hot methods). So the worker is now genuinely the
+>   default compiler; the mutator never runs codegen on a default run.
+> - **Opt-out = byte-for-byte historical.** `CRATONVM_BG_COMPILE=0` → the worker is
+>   never started, `execute` eager-compiles on first call, both triggers compile
+>   inline at the 500 threshold, and OSR is inline — exactly as before Step 7.
+> - **Validation.** 843 jit-crate tests pass. Under the new default (no flags) the
+>   worker is confirmed to be the compiler (`bg-compile` events > 0, was 0 before
+>   the reroute) and results match HotSpot: `OsrProbe 10M`=`1550058760673472`,
+>   `OsrShapes 5M`=`-784340278423176288`, `binarytrees 16`=`14985902`,
+>   `binarytrees 18`=`68332206`, and a 4-thread `MtProbe` (concurrent hot methods +
+>   allocation, exercising the worker × GC × multi-mutator STW path that
+>   historically deadlocked) = `30594089` — every run timeout-guarded (no hangs).
+>   The opt-out (`CRATONVM_BG_COMPILE=0`) reproduces each result.
+> - **Honest caveat / risk.** This flips DEFAULT JIT behavior for every program and
+>   changes warmup semantics: methods now interpret until the worker publishes
+>   (a method in a short run may finish before its compiled body is ready, and
+>   reflection-/uncached-heavy or worker-starved workloads could see a throughput
+>   shift). It is validated == HotSpot above + on the increment-1–6 evidence, but
+>   has **NOT** been soaked on the full 50+ app gauntlet (which needs a quiet
+>   machine — this repo runs many concurrent worktrees, so wall-time/throughput
+>   here is unreliable). `CRATONVM_BG_COMPILE=0` is the immediate revert if a
+>   regression surfaces. **Strongly recommended follow-up:** a gauntlet soak
+>   (startup + throughput + stability) before treating this flip as settled.
+>
 > **Increment 6 (Step 6 — `CRATONVM_TIER_*` threshold overrides) landed.**
 > Builds on increment 5. The tiered policy's thresholds were hardcoded
 > (`CompilationPolicy::default()`), so the pipeline could not be tuned without a
@@ -466,7 +514,14 @@ tier instead of by the current ad-hoc gates.
    *Authoritative gauntlet retuning of the defaults is deferred* — it needs a
    quiet machine for reliable wall-time; the knobs make that a config sweep, not
    a recompile. See the increment-6 header for tuning guidance.
-7. **Retire** the single fixed-threshold inline path.
+7. **Retire** the single fixed-threshold inline path. ✅ **Done (increment 7).**
+   `bg_compile()` flipped default-ON (opt-out `CRATONVM_BG_COMPILE=0`); both the
+   static and virtual invocation tier-up triggers now enqueue to the background
+   worker by default and OSR compiles off-thread by default. The eager
+   first-call single-pass compile is kept as the quick first tier. Validated
+   == HotSpot (incl. a multi-thread probe) with no hangs; **not yet
+   gauntlet-soaked** — see the increment-7 header for the caveat and the
+   `=0` revert. This completes the wire-tiered-manager build (Steps 1–7).
 
 ## Risks
 

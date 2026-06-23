@@ -835,16 +835,45 @@ pub(crate) fn resolve_field_index_in_hierarchy(
     field_name: &str,
     store: &ClassStore,
 ) -> Option<usize> {
+    resolve_field_index_in_hierarchy_desc(class_id, field_name, None, store)
+}
+
+/// Descriptor-aware variant of [`resolve_field_index_in_hierarchy`].
+///
+/// Resolves an instance field by name, optionally disambiguated by its JVM
+/// type `descriptor` (`"I"`, `"Ljava/lang/String;"`, `"[J"`, …). When
+/// `descriptor` is `Some`, only a field whose declared descriptor matches is
+/// considered — this is what lets a caller address a **shadowed** super-class
+/// field that a subclass re-declares with the same name: a name-only resolve
+/// always returns the most-derived declaration, but passing the super-class
+/// field's descriptor walks past the subclass shadow to the intended slot.
+///
+/// `descriptor == None` is exactly the name-only behaviour (most-derived
+/// declaration wins). The hierarchy is walked subclass → super, so among
+/// several descriptor-matching fields the most-derived still wins (two fields
+/// with the *same* name and *same* descriptor in the chain are inherently
+/// indistinguishable by descriptor — full disambiguation there would need the
+/// declaring class, which is out of scope).
+pub(crate) fn resolve_field_index_in_hierarchy_desc(
+    class_id: ClassId,
+    field_name: &str,
+    descriptor: Option<&str>,
+    store: &ClassStore,
+) -> Option<usize> {
     let mut current_id = Some(class_id);
     while let Some(cid) = current_id {
         let class = store.get(cid)?;
-        // Search non-static fields declared in this class
+        // Search non-static fields declared in this class. `instance_offset`
+        // counts every non-static field (matching or not) so the layout slot
+        // stays correct regardless of the descriptor filter.
         let mut instance_offset = 0;
         for field in &class.fields {
             if field.is_static() {
                 continue;
             }
-            if &*field.name == field_name {
+            if &*field.name == field_name
+                && descriptor.is_none_or(|d| &*field.descriptor == d)
+            {
                 return Some(class.first_field_index + instance_offset);
             }
             instance_offset += 1;
@@ -1707,6 +1736,62 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         );
 
         // Read the (possibly forwarded) reference back before unpinning.
+        let forwarded = self
+            .thread
+            .native_pin_roots
+            .get(pin_idx)
+            .copied()
+            .unwrap_or(obj_ref);
+        self.thread.native_pin_roots.truncate(pin_idx);
+
+        init_result?;
+        Ok(Some(Value::Object(Some(forwarded))))
+    }
+
+    fn new_object_initialized_with_class_id(
+        &mut self,
+        class_id: ClassId,
+        init_desc: &str,
+        init_args: &[Value],
+    ) -> MethodCallResult {
+        // Per-loader-identity construction (JVMS §5.3): allocate and `<init>`
+        // the EXACT `class_id` the caller resolved from a Class mirror, never
+        // re-resolving the name (which collapses to the first/global definer).
+        let num_fields = self
+            .shared
+            .class_manager
+            .read()
+            .get_class(class_id)
+            .map(|c| c.num_total_fields)
+            .unwrap_or(0);
+        let obj_ref = self.shared.heap.alloc_object(class_id, num_fields);
+        crate::runtime::interpreter::init_primitive_fields(self.shared, obj_ref, class_id);
+
+        // Pin across `<init>` exactly like the name-based path above.
+        let pin_idx = self.thread.native_pin_roots.len();
+        self.thread.native_pin_roots.push(obj_ref);
+
+        let mut full = Vec::with_capacity(init_args.len() + 1);
+        full.push(Value::Object(Some(obj_ref)));
+        full.extend_from_slice(init_args);
+
+        // Ensure the class is initialized (<clinit>) then dispatch `<init>` on
+        // this precise class id — `invoke_on_class_shared` keys on the id, so
+        // the weaved/loader-private constructor runs, not the global one.
+        let init_result =
+            super::ensure_class_initialized_shared(self.shared, self.thread, class_id).and_then(
+                |_| {
+                    invoke_on_class_shared(
+                        self.shared,
+                        self.thread,
+                        class_id,
+                        "<init>",
+                        init_desc,
+                        &full,
+                    )
+                },
+            );
+
         let forwarded = self
             .thread
             .native_pin_roots
@@ -5071,6 +5156,17 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             // method table is `Object`'s — short-circuit array receivers to
             // `java/lang/Object` here, matching the parallel logic in
             // `invoke_or_native` and `try_stackless_invoke`.
+            // `resolved_from_receiver` tracks whether `class_name` is just the
+            // receiver's own class name (the plain-object case). When it is, the
+            // final dispatch keys on `receiver_class_id` DIRECTLY rather than
+            // re-resolving the name — otherwise a class a custom loader defined
+            // (load-time weaving, webapp isolation) collapses to the same-named
+            // class some other loader registered first, so a reflective
+            // `Method.invoke` on the loader-private instance runs the wrong
+            // body (JVMS §5.3). Arrays (dispatch on Object) and lambda-proxy
+            // non-SAM calls (dispatch on the functional interface) must keep the
+            // name-based path, so the flag is false there.
+            let mut resolved_from_receiver = false;
             let class_name =
                 if self.shared.heap.kind_of(receiver) == cratonvm_types::ObjectKind::Array {
                     "java/lang/Object".to_string()
@@ -5081,14 +5177,24 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                             .get(&receiver_class_id)
                             .map(|lcs| lcs.functional_interface.to_string())
                     };
-                    lambda_iface.unwrap_or_else(|| {
-                        self.shared
-                            .class_manager
-                            .read()
-                            .get_class(receiver_class_id)
-                            .map(|c| c.name.to_string())
-                            .unwrap_or_else(|| format!("<unknown class {}>", receiver_class_id))
-                    })
+                    match lambda_iface {
+                        Some(iface) => iface,
+                        None => {
+                            let by_id = self
+                                .shared
+                                .class_manager
+                                .read()
+                                .get_class(receiver_class_id)
+                                .map(|c| c.name.to_string());
+                            match by_id {
+                                Some(n) => {
+                                    resolved_from_receiver = true;
+                                    n
+                                }
+                                None => format!("<unknown class {}>", receiver_class_id),
+                            }
+                        }
+                    }
                 };
 
             // Check for java.lang.reflect.Proxy dynamic proxy dispatch.
@@ -5144,7 +5250,37 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             full_args.push(Value::Object(Some(receiver)));
             full_args.extend_from_slice(args);
 
-            self.invoke_or_native(&class_name, method_name, descriptor, &full_args)
+            // Per-loader identity (JVMS §5.3): when the receiver's class name
+            // resolves (globally, by name) to a DIFFERENT class id than the
+            // receiver actually has — i.e. another loader defined a same-named
+            // class first — dispatch on the receiver's EXACT class id so a
+            // reflective `Method.invoke` on a loader-private (e.g. load-time
+            // weaved) instance runs ITS body, not the global one.
+            // `invoke_on_class_shared` resolves via
+            // `find_method_recursive(receiver_class_id, ...)` and keeps
+            // native-override precedence, matching `invoke_or_native`'s
+            // semantics minus the name→global-id collapse. The common
+            // single-loader case (name resolves back to `receiver_class_id`)
+            // keeps the original `invoke_or_native` path byte-for-byte.
+            let diverges = resolved_from_receiver
+                && self
+                    .shared
+                    .class_manager
+                    .read()
+                    .get_loaded_class_id(&class_name)
+                    != Some(receiver_class_id);
+            if diverges {
+                invoke_on_class_shared(
+                    self.shared,
+                    self.thread,
+                    receiver_class_id,
+                    method_name,
+                    descriptor,
+                    &full_args,
+                )
+            } else {
+                self.invoke_or_native(&class_name, method_name, descriptor, &full_args)
+            }
         }
     }
 

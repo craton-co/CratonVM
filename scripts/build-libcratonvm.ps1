@@ -91,12 +91,15 @@ $work = Join-Path $repo "scratch\embedacc"
 New-Item -ItemType Directory -Force -Path $work | Out-Null
 Copy-Item $dll (Join-Path $work "libcratonvm.dll") -Force
 $examples = Join-Path $repo "libcratonvm\examples"
+$includeDir = Join-Path $repo "libcratonvm\include"
 
 function Build-And-Run($srcName, $exeName) {
     $src = Join-Path $examples $srcName
     $exe = Join-Path $work $exeName
     Write-Host "`n=== $srcName -> $exeName ==="
-    cmd /c "`"$vc`" >nul 2>&1 && cd /d `"$work`" && cl /nologo /Fe:`"$exe`" `"$src`" `"$implib`" 2>&1"
+    # `/I include` lets a harness #include the public headers (cratonvm.h /
+    # cratonvm_helpers.h); harmless for the standalone harnesses that re-declare.
+    cmd /c "`"$vc`" >nul 2>&1 && cd /d `"$work`" && cl /nologo /I`"$includeDir`" /Fe:`"$exe`" `"$src`" `"$implib`" 2>&1"
     if ($LASTEXITCODE -ne 0) { throw "cl failed for $srcName (exit $LASTEXITCODE)" }
     # Run the harness with EAP relaxed: a native exe writing to stderr (even
     # benign VM diagnostics) must not be promoted to a terminating error — gate
@@ -109,7 +112,8 @@ function Build-And-Run($srcName, $exeName) {
     if ($rc -ne 0) { throw "$exeName exited with $rc" }
 }
 
-Build-And-Run "embed_smoke.c" "embed_smoke_$Suffix.exe"
-Build-And-Run "embed_flat.c"  "embed_flat_$Suffix.exe"
+Build-And-Run "embed_smoke.c"   "embed_smoke_$Suffix.exe"
+Build-And-Run "embed_flat.c"    "embed_flat_$Suffix.exe"
+Build-And-Run "embed_helpers.c" "embed_helpers_$Suffix.exe"
 
 Write-Host "`nlibcratonvm acceptance: OK"

@@ -9,7 +9,6 @@ target/
 *.iml
 apps/
 .smoke-cache/
-docs
 **/*.jar
 **/*.tar.gz
 

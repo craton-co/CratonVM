@@ -380,6 +380,35 @@ pub trait NativeContext {
         Ok(obj_val)
     }
 
+    /// Allocate an object of the EXACT `class_id` and run its `<init>`
+    /// (`init_desc`, with `init_args` as the post-`this` arguments),
+    /// returning the freshly-constructed (GC-forwarded) object.
+    ///
+    /// Unlike [`Self::new_object_initialized`], which resolves the class by
+    /// *name* (and therefore collapses to whichever loader defined that name
+    /// first — the global Application/bootstrap copy), this honours per-loader
+    /// class identity per JVMS §5.3: `(defining loader, name)`. Reflective
+    /// construction (`Constructor.newInstance`, `Class.newInstance`) must use
+    /// this when it already holds the declaring class's mirror, so a class a
+    /// custom loader defined (load-time weaving, webapp/OSGi isolation) is
+    /// instantiated as ITSELF rather than as a same-named class some other
+    /// loader happens to have defined first.
+    ///
+    /// The default implementation resolves the class id back to a name and
+    /// delegates to the name-based path — sufficient for test mocks and any
+    /// context with a single (global) loader namespace.
+    fn new_object_initialized_with_class_id(
+        &mut self,
+        class_id: ClassId,
+        init_desc: &str,
+        init_args: &[Value],
+    ) -> MethodCallResult {
+        match self.class_name_of_id(class_id) {
+            Some(name) => self.new_object_initialized(&name, init_desc, init_args),
+            None => Ok(Some(Value::Object(None))),
+        }
+    }
+
     /// Pin a heap object as a GC root and return an opaque handle index.
     ///
     /// Native code that holds an `ObjectRef` across a re-entrant call

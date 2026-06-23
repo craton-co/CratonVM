@@ -3230,6 +3230,43 @@ pub fn execute(
                 // this false and still seals, matching the gate-OFF semantics.
                 let mut c2_not_hot = false;
                 let compiled = compiled.or_else(|| {
+                    // wire-tiered-manager Step 7 (full eager-reroute): when the
+                    // background pipeline is the default (`bg_compile`, default-ON),
+                    // the WORKER is the compiler — do NOT eager- or inline-compile on
+                    // the mutator here. Count invocations and, once warm, ensure the
+                    // worker + enqueue via the tiered manager, then return None to
+                    // INTERPRET; the worker compiles off-thread and publishes into
+                    // `jit_cache`, and a later invocation (here, for
+                    // reflective/uncached-hot methods, or via the cached-dispatch
+                    // fast-path) flips this call site to the Jit body. `c2_not_hot =
+                    // true` keeps the counter running so the method is never sealed as
+                    // permanently-uncompiled. Opt-out (`CRATONVM_BG_COMPILE=0`) falls
+                    // through to the historical eager/inline paths below.
+                    if crate::runtime::env_cache::bg_compile() {
+                        let invoc_key = {
+                            let mut h = 0u32;
+                            for &b in method_name.as_bytes() {
+                                h = h.wrapping_mul(31).wrapping_add(b as u32); // Widening: u8 → u32
+                            }
+                            for &b in method_descriptor.as_bytes() {
+                                h = h.wrapping_mul(31).wrapping_add(b as u32); // Widening: u8 → u32
+                            }
+                            // Widening: u32 → u64 (value preserved)
+                            ((class_id.as_u32() as u64) << 32) | (h as u64)
+                        };
+                        let n = shared.profile_store.increment_invocation(invoc_key);
+                        if n >= crate::runtime::env_cache::jit_invocation_threshold() {
+                            ensure_bg_compiler_started(shared);
+                            let tiered_key = crate::jit::tiered::MethodKey::new(
+                                class_name_str.as_str(),
+                                method_name,
+                                method_descriptor,
+                            );
+                            let _ = shared.tiered_manager.on_method_invocation(&tiered_key);
+                        }
+                        c2_not_hot = true; // keep the counter running; do not seal
+                        return None; // interpret — the worker compiles off-thread
+                    }
                     // activate-ir-optimizer (runtime wiring, CRATONVM_JIT_C2_FIRST_CALL,
                     // default-OFF): replace the eager single-pass first-call compile
                     // below with an invocation-counted upgrade through the optimizing
@@ -8251,9 +8288,13 @@ fn build_deopt_frame_inner(
     rframe: &cratonvm_jit::deopt::ReconstructedFrame,
     stress: bool,
 ) -> Option<crate::runtime::frame::Frame> {
-    // Phase-A scope: single non-inlined frame, no held monitors (same guard as
-    // `resume_from_ir_deopt`).
-    if !rframe.caller_frames.is_empty() || !rframe.monitors.is_empty() {
+    // Single non-inlined frame (inlined-caller chains stay out of scope). Held
+    // monitors are NO LONGER a blanket bail: Phase C records `synchronized(obj)`
+    // blocks over scalar-replaced objects as `MonitorInfo` and re-acquires them on
+    // resume (below). The x64 producer only emits monitors over scalar objects
+    // (a non-scalar elision sets `has_elided_monitor` → `can_deopt_resume=false`),
+    // so every monitor here is materializable + relockable.
+    if !rframe.caller_frames.is_empty() {
         return None;
     }
 
@@ -8360,6 +8401,25 @@ fn build_deopt_frame_inner(
             thread.native_pin_roots.push(*obj);
         }
     }
+    // Phase C: pin the held-monitor objects too (materialized shells), so the
+    // refill GC forwards them in place and the relock below uses live addresses.
+    // `monitor_objs` keeps (pin-relative position implied by push order, depth);
+    // a non-Object monitor (an unresolved virtual ref — shouldn't occur, the
+    // materializer rewrote them) bails to safe re-run.
+    let mut monitor_depths: Vec<u32> = Vec::with_capacity(rframe.monitors.len());
+    for m in &rframe.monitors {
+        match &m.object {
+            FrameValue::Object(addr) => {
+                let obj = unsafe { ObjectRef::from_raw(*addr as usize as *mut u8) };
+                thread.native_pin_roots.push(obj);
+                monitor_depths.push(m.lock_depth);
+            }
+            // Null monitor or an unresolved form — refuse rather than relock a
+            // bogus object (would corrupt the monitor table). Release nothing
+            // extra; the caller truncates `native_pin_roots` to its watermark.
+            _ => return None,
+        }
+    }
 
     // Stress hook: the ONLY sanctioned GC injection point — before refill, while
     // every reconstructed oop is pinned (a GC after the re-read would stale the
@@ -8402,6 +8462,14 @@ fn build_deopt_frame_inner(
             other => stack_fwd.push(*other),
         }
     }
+    // Phase C: re-read the forwarded monitor objects (pushed after locals+stack),
+    // pairing each with its lock depth for the relock below.
+    let mut monitors_fwd: Vec<(ObjectRef, u32)> = Vec::with_capacity(monitor_depths.len());
+    for &depth in &monitor_depths {
+        let fwd = thread.native_pin_roots[k];
+        k += 1;
+        monitors_fwd.push((fwd, depth));
+    }
 
     // Build the Frame as a LOCAL (never pushed onto thread.frames), so the
     // subsequent re-run sees identical interpreter state after it is discarded.
@@ -8431,6 +8499,17 @@ fn build_deopt_frame_inner(
     }
     // Widening: small unsigned (u8/u16/i32 index) -> usize (non-negative, fits)
     frame.pc = rframe.bci as usize;
+    // Phase C: re-acquire each elided monitor on the re-materialized (thread-local,
+    // uncontended) object, `lock_depth` times, so the resumed frame's eventual
+    // `monitorexit` (and any nested exits) balance via the MonitorTable. Done after
+    // every fallible step so a bail never leaves a stray lock. `monitors.enter` is
+    // the recursive uncontended enter (the object is fresh thread-local — no
+    // contention, no GC).
+    for &(obj, depth) in &monitors_fwd {
+        for _ in 0..depth {
+            shared.monitors.enter(obj, thread.thread_id);
+        }
+    }
     Some(frame)
 }
 
@@ -9124,6 +9203,50 @@ mod deopt_step3_tests {
         };
         assert_eq!(shared.heap.get_field(oa, 0), Value::Object(Some(ob)));
         assert_eq!(shared.heap.get_field(ob, 0), Value::Object(Some(oa)));
+    }
+
+    /// Phase C (monitors): a frame holding a `synchronized(scalarObj)` monitor
+    /// resumes — the scalar object is materialized and its elided lock is
+    /// re-acquired on the resumed thread at the recorded depth, so the resumed
+    /// frame's eventual `monitorexit`(es) balance.
+    #[test]
+    fn resumes_frame_with_held_monitor() {
+        use cratonvm_jit::deopt::MonitorInfo;
+        let shared = Arc::new(SharedVm::new(VmConfig::default()));
+        let mut thread = JvmThread::new(ThreadId(0), "test");
+        let cached = minimal_cached(); // NOT synchronized
+
+        // local 0 = scalar object id 0 (class 5, one Int field); a held monitor on
+        // it at recursion depth 2 (nested `synchronized` blocks).
+        let rf = ReconstructedFrame {
+            method_key: "T.m".to_string(),
+            bci: 4,
+            locals: vec![vobj(0, 5, vec![FrameValue::Int(9)])],
+            stack: vec![],
+            monitors: vec![MonitorInfo {
+                object: FrameValue::VirtualObjectRef(0),
+                lock_depth: 2,
+            }],
+            caller_frames: Vec::new(),
+        };
+
+        let pin_base = thread.native_pin_roots.len();
+        let r = resume_real_ir_deopt(&shared, &mut thread, &cached, &rf)
+            .expect("monitor-bearing frame must resume");
+        assert!(matches!(r, CachedCallResult::FramePushed));
+        assert_eq!(thread.native_pin_roots.len(), pin_base);
+
+        let obj = match thread.frames.last().unwrap().get_local(0) {
+            Value::Object(Some(o)) => o,
+            other => panic!("local 0 must be the materialized object, got {other:?}"),
+        };
+        // The lock is held at depth 2: two exits succeed, a third fails (not owned).
+        assert!(shared.monitors.exit(obj, thread.thread_id).is_ok(), "exit 1 (2->1)");
+        assert!(shared.monitors.exit(obj, thread.thread_id).is_ok(), "exit 2 (1->0)");
+        assert!(
+            shared.monitors.exit(obj, thread.thread_id).is_err(),
+            "exit 3 must fail — monitor no longer held"
+        );
     }
 
     /// A2 elided-monitor gate: a `synchronized` method carrying a virtual frame
@@ -12108,9 +12231,11 @@ fn execute_instruction(
                             })?
                             .to_string()
                     };
-                    // Arrays: use descriptor-based assignability.
+                    // Arrays: use descriptor-based assignability. instanceof is
+                    // strict (SBR-03): a genuine `Object[]` is not an instance of
+                    // an unrelated `T[]`.
                     let result = if let Some(src_desc) = array_descriptor_of(shared, obj_ref) {
-                        if array_is_assignable_to(shared, &src_desc, &target_class_name) {
+                        if array_is_instance_of(shared, &src_desc, &target_class_name) {
                             1
                         } else {
                             0
@@ -12663,6 +12788,28 @@ pub(crate) fn array_descriptor_of(
 ///   - A class/interface name like "java/lang/Object", "java/io/Serializable",
 ///     or "java/lang/Cloneable".
 pub(crate) fn array_is_assignable_to(shared: &SharedVm, src_desc: &str, target_name: &str) -> bool {
+    // Lenient entry point: used by `checkcast` and `aastore`, where the native
+    // array-allocation leniency (an `Object[]` standing in for a `T[]` whose real
+    // element type a native path didn't preserve) must not provoke a spurious
+    // `ClassCastException` / `ArrayStoreException`.
+    array_is_assignable_to_impl(shared, src_desc, target_name, true)
+}
+
+/// Strict variant for the `instanceof` opcode (SBR-03). Unlike `checkcast`,
+/// `instanceof` must answer precisely: `Object[] instanceof I[]` is `false`
+/// because `Object` is not assignable to the interface `I`. The lenient
+/// `Object[]`→`T[]` fallback used for casts is suppressed here so a genuine
+/// `Object[]` is not reported as an instance of an unrelated `T[]`.
+pub(crate) fn array_is_instance_of(shared: &SharedVm, src_desc: &str, target_name: &str) -> bool {
+    array_is_assignable_to_impl(shared, src_desc, target_name, false)
+}
+
+fn array_is_assignable_to_impl(
+    shared: &SharedVm,
+    src_desc: &str,
+    target_name: &str,
+    lenient: bool,
+) -> bool {
     // Every array is an Object and implements Serializable + Cloneable.
     if &*target_name == "java/lang/Object"
         || target_name == "java/io/Serializable"
@@ -12710,7 +12857,7 @@ pub(crate) fn array_is_assignable_to(shared: &SharedVm, src_desc: &str, target_n
         None => return false,
     };
     if src_is_arr && tgt_is_arr {
-        return array_is_assignable_to(shared, &src_comp, &tgt_comp);
+        return array_is_assignable_to_impl(shared, &src_comp, &tgt_comp, lenient);
     }
     if src_is_arr != tgt_is_arr {
         // One is nested array, the other is an object-component; only compatible
@@ -12723,13 +12870,15 @@ pub(crate) fn array_is_assignable_to(shared: &SharedVm, src_desc: &str, target_n
             || tgt_comp == "java/lang/Cloneable";
     }
     // Both are reference (non-array) component class names.
-    // Lenient fallback: our native array-allocation paths often create
-    // reference arrays with component `java/lang/Object` when the runtime
-    // component type is actually a subclass (e.g. `getEnumConstantsShared`
-    // returns `[Ljava/lang/Object;` but callers cast to `[LEnum;`). Accept
-    // these casts so reflection/enum paths don't spuriously fail.
+    // Lenient fallback (checkcast/aastore only): our native array-allocation
+    // paths often create reference arrays with component `java/lang/Object` when
+    // the runtime component type is actually a subclass (e.g.
+    // `getEnumConstantsShared` returns `[Ljava/lang/Object;` but callers cast to
+    // `[LEnum;`). Accept these casts so reflection/enum paths don't spuriously
+    // fail. For `instanceof` (lenient == false) this is suppressed: a genuine
+    // `Object[]` is NOT an instance of `I[]` (SBR-03).
     if src_comp == "java/lang/Object" {
-        return true;
+        return lenient || tgt_comp == "java/lang/Object";
     }
     let src_id = match shared.class_manager.write().load_class(&src_comp) {
         Ok(id) => id,
@@ -16468,6 +16617,38 @@ fn force_native_over_real_jdk_bytecode(
     method_name: &str,
     method_descriptor: &str,
 ) -> bool {
+    // SBR-02 / bug-03: fast native regex. The real-JDK `String.replaceAll` /
+    // `replaceFirst` / `matches` bodies run `Pattern.compile(...).matcher(...)`
+    // in the interpreter (java.util.regex), which is 30–600× slower than
+    // HotSpot because every Matcher step crosses the VM→native String-accessor
+    // boundary. We force CratonVM's cached `regex`/`fancy-regex` native
+    // (lang_string.rs), which is Java-faithful (replacement `$N` / `${name}` /
+    // `\`-escapes) and orders of magnitude faster. **Default-ON** (opt-out
+    // `CRATONVM_NATIVE_STRING_REGEX=0` reverts to real Java bytecode as the
+    // safety net); see `env_cache::native_string_regex`. This is what makes
+    // Spring Boot's `PluginXmlParser.format()` chain (4 `replaceAll` + 8 literal
+    // `replace`) complete instead of hanging (SBR-02 / PluginXmlParserTests).
+    if class_name == "java/lang/String"
+        && crate::runtime::env_cache::native_string_regex()
+        && matches!(
+            (method_name, method_descriptor),
+            ("replaceAll", "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;")
+                | ("replaceFirst", "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;")
+                | ("matches", "(Ljava/lang/String;)Z")
+                // `replace(CharSequence,CharSequence)` is LITERAL (non-regex)
+                // all-occurrences replacement, byte-identical to Rust
+                // `str::replace`; routed through the fast native under the same
+                // gate (SBR-02 secondary finding — the 8-chained-`replace`
+                // PluginXmlParser.format wall). The `(char,char)` overload has
+                // its own unconditional native and is NOT gated here.
+                | (
+                    "replace",
+                    "(Ljava/lang/CharSequence;Ljava/lang/CharSequence;)Ljava/lang/String;"
+                )
+        )
+    {
+        return true;
+    }
     matches!(
         (class_name, method_name, method_descriptor),
         ("java/lang/ClassLoader", "setDefaultAssertionStatus", "(Z)V")
@@ -18069,22 +18250,26 @@ fn execute_invokestatic_cached(
                     cached.method_name.as_ref(),
                     cached.method_descriptor.as_ref(),
                 );
-                // wire-tiered-manager increment 2: OFF-THREAD codegen, gated
-                // default-OFF behind `CRATONVM_BG_COMPILE`.
+                // wire-tiered-manager: OFF-THREAD codegen for the invocation
+                // tier-up trigger. **DEFAULT-ON as of Step 7** ("retire the
+                // single fixed-threshold inline path"); `CRATONVM_BG_COMPILE=0`
+                // is the opt-out safety net.
                 //
-                //  * Flag ON  — start the background compile thread once (idempotent)
-                //    with the REAL compile closure below, then ENQUEUE-ONLY: the
-                //    tiered manager's `on_method_invocation` pushes a CompilationTask
-                //    at the recommended tier and the worker compiles it off the
-                //    mutator (publishing into `shared.jit_cache`). The mutator does
-                //    NOT compile inline; it keeps interpreting until the worker
+                //  * On (default) — start the background compile thread once
+                //    (idempotent), then ENQUEUE-ONLY: the tiered manager's
+                //    `on_method_invocation` pushes a CompilationTask at the
+                //    recommended tier and the worker compiles it off the mutator
+                //    (publishing into `shared.jit_cache`). The mutator does NOT
+                //    compile inline; it keeps interpreting until the worker
                 //    publishes, at which point the `jit_cache` fast-path at the top
-                //    of the `Bytecode` arm flips this call site to `Jit`.
-                //  * Flag OFF (default) — never start the worker; keep the existing
-                //    inline `try_jit_upgrade_with_gate` path EXACTLY as before so the
-                //    off-thread pipeline cannot regress steady-state behaviour until
-                //    proven. (`on_method_invocation` still enqueues, but with no
-                //    worker draining the queue this is the historical no-op.)
+                //    of the `Bytecode` arm flips this call site to `Jit`. (The
+                //    eager *first-call* single-pass compile in `fn execute` is a
+                //    separate quick first tier and still runs; this governs the
+                //    invocation-counted re-tiering + OSR.)
+                //  * Off (`=0`) — never start the worker; keep the historical
+                //    inline `try_jit_upgrade_with_gate` path EXACTLY as before
+                //    (the safety net while the off-thread pipeline soaks on the
+                //    gauntlet).
                 let bg_compile_on = crate::runtime::env_cache::bg_compile();
                 if bg_compile_on {
                     // Start the off-thread compile worker once (idempotent). See
@@ -23101,7 +23286,23 @@ fn execute_invokevirtual_cached(
                             let should_attempt = cnt >= threshold
                                 && (cnt == threshold || (cnt - threshold) % JIT_RETRY_STRIDE == 0);
                             if should_attempt {
-                                if let Some(CachedInvokeTarget::Jit { compiled, .. }) =
+                                // wire-tiered-manager Step 7: off-thread tier-up is now
+                                // the default. Under `bg_compile` (default-ON) we ENQUEUE
+                                // and keep interpreting — the `jit_cache.get` fast-path
+                                // above flips this site to `Jit` once the worker
+                                // publishes — instead of compiling inline on the mutator.
+                                // Mirrors `execute_invokestatic_cached`. Opt-out
+                                // (`CRATONVM_BG_COMPILE=0`) restores the inline path.
+                                if crate::runtime::env_cache::bg_compile() {
+                                    ensure_bg_compiler_started(shared);
+                                    let tiered_key = crate::jit::tiered::MethodKey::new(
+                                        cached.class_name.as_ref(),
+                                        cached.method_name.as_ref(),
+                                        cached.method_descriptor.as_ref(),
+                                    );
+                                    let _ =
+                                        shared.tiered_manager.on_method_invocation(&tiered_key);
+                                } else if let Some(CachedInvokeTarget::Jit { compiled, .. }) =
                                     try_jit_upgrade_with_gate(shared, &cached, entry_gate.clone())
                                 {
                                     return Some(compiled);

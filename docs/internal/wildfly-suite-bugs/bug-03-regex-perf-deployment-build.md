@@ -291,3 +291,132 @@ now correct and fast with `search` compiled, and static + instance hot paths
 benefit from layers A/B. (The codePointAt precise-ON fix #1 is independent — it
 makes the precise-maps path safe for compiled instance methods that hit the
 inline cascade, a prerequisite for any future B+precise default-on.)
+
+## Update (2026-06-22): opt-in fast Rust-regex native for `String.{replaceAll,replaceFirst,matches}` (SBR-02)
+
+Even with all of the above (virtual-tierup default-ON, layers A/B/C fixed), the
+real-JDK `java.util.regex` engine running interpreted/partially-compiled is still
+**~100–125× slower** than HotSpot for `String.replaceAll`-in-a-loop. SBR-02
+(Spring Boot `MinRegexProbe` / `RegexLoopProbe`, mirror of the hanging
+`PluginXmlParserTests`) measured ~0.78 ms/iter for `input.replaceAll("\\{@code
+(.*?)}", "`$1`")` (HotSpot ≈ 0.002 ms/iter). The remaining gap is the
+interpreted Matcher/Pattern inner loop itself — a JIT-codegen-quality problem that
+is open-ended to close.
+
+CratonVM already ships a **fast, cached Rust regex native** for these methods
+(`native-builtins/src/lang_string.rs::native_string_{replace_all,replace_first,
+matches}`, backed by the `regex` / `fancy-regex` crates with a bounded
+`(pattern,flags)` compile cache). It was previously **dormant in real-JDK mode**:
+it is only wired up by `register_synthetic_overrides` (`#[cfg(feature =
+"synthetic-jdk")]`, compiled out of the default CLI), so the real-JDK build ran
+the JDK bytecode and never reached the native.
+
+**Fix (opt-in, default-OFF):** `CRATONVM_NATIVE_STRING_REGEX=1` routes
+`String.replaceAll` / `replaceFirst` / `matches` to the cached Rust native.
+- `env_cache::native_string_regex()` (default-OFF gate; `cached_is_set!`).
+- `register_essential_natives` (the real-JDK registration path) now registers the
+  three String regex natives **when the env is set** — so with the gate off they
+  stay unregistered and the real bytecode runs (default byte-identical).
+- `force_native_over_real_jdk_bytecode` (interpreter.rs) returns `true` for those
+  three (class, method, descriptor) triples when the gate is on, so the registered
+  native **wins** over the JDK bytecode at dispatch.
+- The native's replacement expansion was made **Java-faithful**
+  (`JavaRegex::replace_{all,first}_java` + `parse_java_replacement`): `$N`
+  (digit-bounded by group count, so `$10` with 2 groups = group 1 then literal
+  `0`), `${name}`, and `\`-escapes (`\$`→`$`, `\\`→`\`) — the engine's own
+  `$$`/greedy-`$NN`/no-`\`-escape syntax would otherwise diverge from
+  `Matcher.appendReplacement`.
+
+**Measured (JDK 25 boot; `scratch/regexperf`, clean machine):**
+
+| benchmark | gate-OFF (real Java) | gate-ON (native) | HotSpot | speedup vs OFF |
+|-----------|----------------------|------------------|---------|----------------|
+| `MinRegexProbe code` `replaceAll` ×N | 0.785 ms/iter | **0.0115 ms/iter** | 0.002 ms/iter | **~68×** |
+| `MinRegexProbe` N=200000 wall | never finishes / minutes | **2.3 s** | 0.41 s | — |
+
+A 30-case `RegexParity` battery (literal/group/named/zero-width/greedy-reluctant/
+split/backref/lookahead, replace + replaceFirst + matches) is **byte-identical to
+HotSpot** both gate-OFF and gate-ON for ASCII/Latin input. Java-faithful
+replacement covered by `native-builtins` unit tests (`java_replacement_tests`).
+
+**Why opt-in (not default-ON):** the Rust `regex` engine's Perl classes are
+**Unicode by default**, whereas Java's `\d` / `\w` / `\s` / `\b` are **ASCII-only**
+unless `UNICODE_CHARACTER_CLASS` is set. So `"٣".matches("\\d")` is `false`
+under HotSpot but `true` via the native (Arabic-Indic digit). This only affects
+**non-ASCII** input to `\d`/`\w`/`\s`/`\b`; the SBR-02 / Javadoc-tag patterns
+(`\{@code (.*?)}`, `<a href=...>`, …) don't use those classes, so they are exact.
+Keeping it opt-in preserves the real-Java-first default. Closing the
+`\d`/`\w`/`\s`/`\b` ASCII-parity gap in `translate_java_regex` (only when
+`UNICODE_CHARACTER_CLASS` is absent) is the prerequisite for any future default-ON.
+
+**Secondary finding (out of scope for SBR-02):** `RegexLoopProbe` (the exact
+`PluginXmlParser.format` chain) is, after this fix, bottlenecked on its **8 literal
+`String.replace(CharSequence,CharSequence)` calls** (~1.17 ms/iter for the chain),
+not regex — a general interpreter-throughput issue for that non-regex method (no
+native exists for the `(CharSequence,CharSequence)` overload). The real
+`PluginXmlParser.format` runs per-plugin (hundreds of calls), where ~1 ms/call is
+tolerable; the *hang* was the regex recompile-per-call, which this fix removes.
+Routing literal `String.replace(CharSequence,CharSequence)` to a Rust native
+(byte-identical, zero regex-semantics risk) is a clean follow-up.
+
+**Secondary finding — RESOLVED (SBR-02 follow-up).** Added
+`native_string_replace_charseq` (`native-builtins/src/lang_string.rs`): reads
+this/target/replacement and returns `ctx.create_string(&s.replace(&target, &repl))`.
+Registered for `String.replace(Ljava/lang/CharSequence;Ljava/lang/CharSequence;)Ljava/lang/String;`
+in `register_essential_natives` and routed via `force_native_over_real_jdk_bytecode`,
+both **under the same `CRATONVM_NATIVE_STRING_REGEX` gate** as the regex natives
+(default-OFF → real Java bytecode is still the default). Rust `str::replace` is
+byte-identical to Java's literal overload: non-overlapping, left-to-right, and an
+empty target inserts the replacement at every position (`"abc".replace("","-")` →
+`-a-b-c-` in both). Validation (`scratch/regexperf/`, JDK 25):
+- gate-ON native is **byte-identical to the real-JDK bytecode (gate-OFF)** across
+  empty-target, consecutive/overlapping, replacement-contains-target, not-found,
+  and unicode cases (`ReplaceParity.java`);
+- full HotSpot parity on all ASCII cases (the only HotSpot diff is the pre-existing
+  Windows-console charset rendering of non-ASCII — CV's replace result is correct);
+- `Split replace` N=200000: gate-OFF 182065ms → gate-ON 8702ms (**~21× faster**),
+  identical `last.len=158`. The `PluginXmlParser`/`RegexLoopProbe` chain is now
+  fully fast under the gate.
+
+Note: the `(char,char)` overload already has its own unconditional native
+(`native_string_replace`) and is unaffected. A separate synthetic-mode native for
+the `(CharSequence,CharSequence)` overload also exists
+(`phases_early::register_core_stdlib_extras`, reached only via
+`register_synthetic_overrides`); the new gated registration is the real-JDK-mode
+counterpart.
+
+## Update (2026-06-22 final): ASCII-class parity closed → gate flipped **default-ON**
+
+The two prerequisites the "opt-in" sections above called out (ASCII Perl-class
+parity + a literal-`replace` native) are now both done, so
+`CRATONVM_NATIVE_STRING_REGEX` is **default-ON** (opt-out `=0` / `false`). The
+"default-OFF / opt-in" wording in the two preceding 2026-06-22 sections describes
+the *first* increment (committed separately) and is superseded here.
+
+**ASCII-default Perl classes** (`ascii_perl_classes` in `native-builtins/src/lib.rs`,
+applied by `compile_java_regex` whenever `UNICODE_CHARACTER_CLASS` is absent — i.e.
+always for `String.{replaceAll,matches}`). Java's `\d`/`\w`/`\s`/`\b` are ASCII-only
+by default; the `regex` crate's are Unicode. Rewrite: `\d`→`[0-9]`, `\D`→`[^0-9]`,
+`\w`→`[a-zA-Z0-9_]`, `\W`→`[^a-zA-Z0-9_]`, `\s`→`[ \t\n\x0B\f\r]`, `\S`→`[^…]`,
+`\b`/`\B`→`(?-u:\b)`/`(?-u:\B)`. Negated forms expand to *Unicode-mode* negated
+classes (`[^0-9]` matches any scalar except an ASCII digit = Java's `\D`, and stays
+valid-UTF-8-safe, unlike `(?-u:\D)` which matches a non-ASCII *byte*). Inside a
+`[...]` class the positive forms expand to bare ranges (`[\d.]`→`[0-9.]`); the rare
+inside-class negated forms are left untouched (documented narrow residual). After
+this, `"٣".matches("\\d")` is `false` (== HotSpot) and `\d+`/`\w+`/`\s`/`\b` all
+behave ASCII-style.
+
+**Validation (default-ON):** a 46-case `RegexParity` battery — now including
+non-ASCII `\d`/`\w`/`\s`/`\b` and 7 literal-`replace` cases — is **byte-identical to
+HotSpot** both default-ON and opt-out (`=0`); opt-out is also byte-identical to the
+baseline dev binary (default truly unchanged when disabled). 8
+`java_replacement_tests` pass (incl. `ascii_perl_classes_parity`,
+`ascii_word_boundary`). `MinRegexProbe` ~2.3 s (was never-finishes); the
+`PluginXmlParser.format`/`RegexLoopProbe` chain (regex + 8 literal `replace`) is now
+fully fast.
+
+**Residual risk (why the opt-out exists):** the Rust engine still differs from
+`java.util.regex` on some advanced features — possessive quantifiers, certain
+`\p{…}` property names, Unicode case-folding edge cases — which fall back to
+`fancy-regex` or a `PatternSyntaxException`. `CRATONVM_NATIVE_STRING_REGEX=0`
+restores the exact real-JDK engine for any app that hits such a gap.

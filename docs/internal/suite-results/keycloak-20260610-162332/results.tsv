@@ -1,0 +1,116 @@
+module	class	vm	rc	state	wall_s	tests	fail	note
+core	org.keycloak.AtHashTest	cratonvm	1	FAIL	1.2	0	0	
+core	org.keycloak.AtHashTest	hotspot	0	PASS	0.5	2	0	-
+core	org.keycloak.HashTest	cratonvm	0	PASS	1.7	1	0	
+core	org.keycloak.HashTest	hotspot	0	PASS	0.5	1	0	-
+core	org.keycloak.JsonParserTest	cratonvm	1	FAIL	5.3	0	0	
+core	org.keycloak.JsonParserTest	hotspot	0	PASS	1.2	10	0	-
+core	org.keycloak.KeyPairVerifierTest	-	-	ABSTRACT	-	-	-	-
+core	org.keycloak.RSAVerifierTest	-	-	ABSTRACT	-	-	-	-
+core	org.keycloak.SkeletonKeyTokenTest	cratonvm	1	FAIL	7.2	0	0	
+core	org.keycloak.SkeletonKeyTokenTest	hotspot	0	PASS	3.1	5	0	-
+core	org.keycloak.authentication.x509.CertificateIdentityExtractorTest	-	-	ABSTRACT	-	-	-	-
+core	org.keycloak.jose.HmacTest	-	-	ABSTRACT	-	-	-	-
+core	org.keycloak.jose.JWETest	-	-	ABSTRACT	-	-	-	-
+core	org.keycloak.jose.JsonWebTokenTest	cratonvm	0	PASS	2.5	9	0	
+core	org.keycloak.jose.JsonWebTokenTest	hotspot	0	PASS	0.9	9	0	-
+core	org.keycloak.jose.jwk.AKPJWKTest	-	-	ABSTRACT	-	-	-	-
+core	org.keycloak.jose.jwk.JWKTest	-	-	ABSTRACT	-	-	-	-
+core	org.keycloak.jose.jwk.JWKUtilTest	cratonvm	1	FAIL	1.9	6	1	1) testBigInteger380bit48bytesErrorFor256(org.keycloak.jose.jwk.JWKUtilTest)
+core	org.keycloak.jose.jwk.JWKUtilTest	hotspot	1	FAIL	0.4	6	1	-
+core	org.keycloak.json.StringListMapDeserializerTest	cratonvm	0	PASS	2.6	4	0	
+core	org.keycloak.json.StringListMapDeserializerTest	hotspot	0	PASS	0.7	4	0	-
+core	org.keycloak.representations.IDTokenTest	cratonvm	1	FAIL	1.7	0	0	
+core	org.keycloak.representations.IDTokenTest	hotspot	0	PASS	0.9	1	0	-
+core	org.keycloak.representations.UserInfoTest	cratonvm	0	PASS	2.4	1	0	
+core	org.keycloak.representations.UserInfoTest	hotspot	0	PASS	0.8	1	0	-
+core	org.keycloak.representations.workflows.WorkflowDefinitionTest	cratonvm	0	PASS	3.7	2	0	
+core	org.keycloak.representations.workflows.WorkflowDefinitionTest	hotspot	0	PASS	1.0	2	0	-
+core	org.keycloak.sdjwt.ArrayElementDisclosureTest	cratonvm	0	PASS	3.4	2	0	
+core	org.keycloak.sdjwt.ArrayElementDisclosureTest	hotspot	0	PASS	0.8	2	0	-
+core	org.keycloak.sdjwt.ArrayElementSerializationTest	cratonvm	0	PASS	1.9	1	0	
+core	org.keycloak.sdjwt.ArrayElementSerializationTest	hotspot	0	PASS	0.7	1	0	-
+core	org.keycloak.sdjwt.ClaimVerifierTest	cratonvm	0	PASS	1.9	4	0	
+core	org.keycloak.sdjwt.ClaimVerifierTest	hotspot	0	PASS	0.5	4	0	-
+core	org.keycloak.sdjwt.DisclosureRedListTest	cratonvm	0	PASS	1.9	7	0	
+core	org.keycloak.sdjwt.DisclosureRedListTest	hotspot	0	PASS	0.7	7	0	-
+core	org.keycloak.sdjwt.IssuerSignedJWTTest	cratonvm	1	FAIL	2.2	0	0	
+core	org.keycloak.sdjwt.IssuerSignedJWTTest	hotspot	0	PASS	0.8	4	0	-
+core	org.keycloak.sdjwt.JsonClaimsetTest	cratonvm	0	PASS	1.8	1	0	
+core	org.keycloak.sdjwt.JsonClaimsetTest	hotspot	0	PASS	0.7	1	0	-
+core	org.keycloak.sdjwt.JsonNodeComparisonTest	cratonvm	0	PASS	1.7	1	0	
+core	org.keycloak.sdjwt.JsonNodeComparisonTest	hotspot	0	PASS	0.7	1	0	-
+core	org.keycloak.sdjwt.SdJWTSamplesTest	cratonvm	1	FAIL	1.0	0	0	
+core	org.keycloak.sdjwt.SdJWTSamplesTest	hotspot	0	PASS	1.0	4	0	-
+core	org.keycloak.sdjwt.SdJwsTest	-	-	ABSTRACT	-	-	-	-
+core	org.keycloak.sdjwt.SdJwtCreationAndSigningTest	-	-	ABSTRACT	-	-	-	-
+core	org.keycloak.sdjwt.SdJwtTest	cratonvm	1	FAIL	7.3	0	0	
+core	org.keycloak.sdjwt.SdJwtTest	hotspot	0	PASS	1.0	2	0	-
+core	org.keycloak.sdjwt.SdJwtUtilsTest	cratonvm	0	PASS	1.7	6	0	
+core	org.keycloak.sdjwt.SdJwtUtilsTest	hotspot	0	PASS	0.7	6	0	-
+core	org.keycloak.sdjwt.SdJwtVerificationTest	-	-	ABSTRACT	-	-	-	-
+core	org.keycloak.sdjwt.TimeClaimVerifierTest	cratonvm	0	PASS	2.0	15	0	
+core	org.keycloak.sdjwt.TimeClaimVerifierTest	hotspot	0	PASS	0.7	15	0	-
+core	org.keycloak.sdjwt.UndisclosedClaimTest	cratonvm	1	FAIL	0.2	0	0	
+core	org.keycloak.sdjwt.UndisclosedClaimTest	hotspot	0	PASS	0.8	1	0	-
+core	org.keycloak.sdjwt.consumer.JwtVcMetadataTrustedSdJwtIssuerTest	-	-	ABSTRACT	-	-	-	-
+core	org.keycloak.sdjwt.consumer.SdJwtPresentationConsumerTest	-	-	ABSTRACT	-	-	-	-
+core	org.keycloak.sdjwt.consumer.SimplePresentationDefinitionTest	cratonvm	0	PASS	2.1	3	0	
+core	org.keycloak.sdjwt.consumer.SimplePresentationDefinitionTest	hotspot	0	PASS	0.8	3	0	-
+core	org.keycloak.sdjwt.sdjwtvp.KeyBindingJwtVerificationOptsTest	cratonvm	0	PASS	1.8	3	0	
+core	org.keycloak.sdjwt.sdjwtvp.KeyBindingJwtVerificationOptsTest	hotspot	0	PASS	0.4	3	0	-
+core	org.keycloak.sdjwt.sdjwtvp.SdJwtKeyBindingTest	-	-	ABSTRACT	-	-	-	-
+core	org.keycloak.sdjwt.sdjwtvp.SdJwtVPTest	-	-	ABSTRACT	-	-	-	-
+core	org.keycloak.sdjwt.sdjwtvp.SdJwtVPVerificationTest	-	-	ABSTRACT	-	-	-	-
+core	org.keycloak.util.BasicAuthHelperTest	cratonvm	0	PASS	1.7	4	0	
+core	org.keycloak.util.BasicAuthHelperTest	hotspot	0	PASS	0.4	4	0	-
+core	org.keycloak.util.JWKSUtilsTest	-	-	ABSTRACT	-	-	-	-
+core	org.keycloak.util.PemUtilsTest	-	-	ABSTRACT	-	-	-	-
+core	org.keycloak.util.UriUtilsTest	cratonvm	0	PASS	2.0	2	0	
+core	org.keycloak.util.UriUtilsTest	hotspot	0	PASS	0.4	2	0	-
+crypto	org.keycloak.crypto.def.test.BCECDSACryptoProviderTest	cratonvm	1	FAIL	1.5	0	0	
+crypto	org.keycloak.crypto.def.test.BCECDSACryptoProviderTest	hotspot	0	PASS	1.8	3	0	-
+crypto	org.keycloak.crypto.def.test.BCEcdhEsAlgorithmProviderTest	cratonvm	1	FAIL	3.6	2	2	1) encodeDecode(org.keycloak.crypto.def.test.BCEcdhEsAlgorithmProviderTest)
+crypto	org.keycloak.crypto.def.test.BCEcdhEsAlgorithmProviderTest	hotspot	0	PASS	2.4	2	0	-
+crypto	org.keycloak.crypto.def.test.CryptoPerfTest	cratonvm	0	PASS	1.7	0	0	
+crypto	org.keycloak.crypto.def.test.CryptoPerfTest	hotspot	0	PASS	0.5	0	0	-
+crypto	org.keycloak.crypto.def.test.DefaultCertificateIdentityExtractorTest	cratonvm	1	FAIL	3.6	5	1	1) testX509SubjectCommonName(org.keycloak.crypto.def.test.DefaultCertificateIdentityExtractorTest)
+crypto	org.keycloak.crypto.def.test.DefaultCertificateIdentityExtractorTest	hotspot	0	PASS	1.6	5	0	-
+crypto	org.keycloak.crypto.def.test.DefaultCryptoAKPJWKTest	cratonvm	1	FAIL	0.5	0	0	
+crypto	org.keycloak.crypto.def.test.DefaultCryptoAKPJWKTest	hotspot	0	PASS	2.1	6	0	-
+crypto	org.keycloak.crypto.def.test.DefaultCryptoHmacTest	cratonvm	0	PASS	4.2	2	0	
+crypto	org.keycloak.crypto.def.test.DefaultCryptoHmacTest	hotspot	0	PASS	2.0	2	0	-
+crypto	org.keycloak.crypto.def.test.DefaultCryptoJWETest	cratonvm	1	FAIL	10.1	0	0	
+crypto	org.keycloak.crypto.def.test.DefaultCryptoJWETest	hotspot	0	PASS	4.0	11	0	-
+crypto	org.keycloak.crypto.def.test.DefaultCryptoJWKSUtilsTest	cratonvm	1	FAIL	6.2	3	1	1) publicRs256(org.keycloak.crypto.def.test.DefaultCryptoJWKSUtilsTest)
+crypto	org.keycloak.crypto.def.test.DefaultCryptoJWKSUtilsTest	hotspot	0	PASS	2.0	3	0	-
+crypto	org.keycloak.crypto.def.test.DefaultCryptoJWKTest	cratonvm	1	FAIL	14.8	10	7	1) testCertificateGenerationWithEcAndRsa(org.keycloak.crypto.def.test.DefaultCryptoJWKTest)
+crypto	org.keycloak.crypto.def.test.DefaultCryptoJWKTest	hotspot	0	PASS	3.6	10	0	-
+crypto	org.keycloak.crypto.def.test.DefaultCryptoKeyPairVerifierTest	cratonvm	1	FAIL	3.2	4	4	1) verifyWith1024PrivateKeyInPKCS8Format(org.keycloak.crypto.def.test.DefaultCryptoKeyPairVerifierTest)
+crypto	org.keycloak.crypto.def.test.DefaultCryptoKeyPairVerifierTest	hotspot	0	PASS	2.0	4	0	-
+crypto	org.keycloak.crypto.def.test.DefaultCryptoRSAVerifierTest	cratonvm	1	FAIL	20.2	9	1	1) testVerificationWithAddedX5cAndJwk(org.keycloak.crypto.def.test.DefaultCryptoRSAVerifierTest)
+crypto	org.keycloak.crypto.def.test.DefaultCryptoRSAVerifierTest	hotspot	0	PASS	3.6	9	0	-
+crypto	org.keycloak.crypto.def.test.DefaultCryptoUnitTest	cratonvm	0	PASS	2.9	1	0	
+crypto	org.keycloak.crypto.def.test.DefaultCryptoUnitTest	hotspot	0	PASS	1.4	1	0	-
+crypto	org.keycloak.crypto.def.test.DefaultKeyStoreTypesTest	cratonvm	1	FAIL	2.8	2	1	1) testKeystoreFormats(org.keycloak.crypto.def.test.DefaultKeyStoreTypesTest)
+crypto	org.keycloak.crypto.def.test.DefaultKeyStoreTypesTest	hotspot	0	PASS	1.5	2	0	-
+crypto	org.keycloak.crypto.def.test.DefaultSecureRandomTest	cratonvm	0	PASS	2.8	1	0	
+crypto	org.keycloak.crypto.def.test.DefaultSecureRandomTest	hotspot	0	PASS	1.5	1	0	-
+crypto	org.keycloak.crypto.def.test.PemUtilsBCTest	cratonvm	1	FAIL	7.1	6	3	1) testEncodeAndDecodeGeneratedObjects(org.keycloak.crypto.def.test.PemUtilsBCTest)
+crypto	org.keycloak.crypto.def.test.PemUtilsBCTest	hotspot	0	PASS	2.0	6	0	-
+crypto	org.keycloak.crypto.def.test.sdjwt.DefaultCryptoJwtVcMetadataTrustedSdJwtIssuerTest	cratonvm	0	PASS	22.8	16	0	
+crypto	org.keycloak.crypto.def.test.sdjwt.DefaultCryptoJwtVcMetadataTrustedSdJwtIssuerTest	hotspot	0	PASS	2.2	16	0	-
+crypto	org.keycloak.crypto.def.test.sdjwt.DefaultCryptoSdJwsTest	cratonvm	0	PASS	6.1	14	0	
+crypto	org.keycloak.crypto.def.test.sdjwt.DefaultCryptoSdJwsTest	hotspot	0	PASS	2.1	14	0	-
+crypto	org.keycloak.crypto.def.test.sdjwt.DefaultCryptoSdJwtCreationAndSigningTest	cratonvm	0	PASS	8.9	2	0	
+crypto	org.keycloak.crypto.def.test.sdjwt.DefaultCryptoSdJwtCreationAndSigningTest	hotspot	0	PASS	2.2	2	0	-
+crypto	org.keycloak.crypto.def.test.sdjwt.DefaultCryptoSdJwtKeyBindingTest	cratonvm	1	FAIL	54.4	7	5	1) testRSA4096KeyBinding(org.keycloak.crypto.def.test.sdjwt.DefaultCryptoSdJwtKeyBindingTest)
+crypto	org.keycloak.crypto.def.test.sdjwt.DefaultCryptoSdJwtKeyBindingTest	hotspot	1	FAIL	4.6	7	2	-
+crypto	org.keycloak.crypto.def.test.sdjwt.DefaultCryptoSdJwtPresentationConsumerTest	cratonvm	0	PASS	7.6	2	0	    org.keycloak.common.VerificationException: org.keycloak.common.VerificationException: Invalid jws signatur
+crypto	org.keycloak.crypto.def.test.sdjwt.DefaultCryptoSdJwtPresentationConsumerTest	hotspot	0	PASS	2.1	2	0	-
+crypto	org.keycloak.crypto.def.test.sdjwt.DefaultCryptoSdJwtVPTest	cratonvm	0	PASS	22.4	14	0	
+crypto	org.keycloak.crypto.def.test.sdjwt.DefaultCryptoSdJwtVPTest	hotspot	0	PASS	2.0	14	0	-
+crypto	org.keycloak.crypto.def.test.sdjwt.DefaultCryptoSdJwtVPVerificationTest	cratonvm	139	CRASH	11.6	0	0	
+crypto	org.keycloak.crypto.def.test.sdjwt.DefaultCryptoSdJwtVPVerificationTest	hotspot	0	PASS	2.6	24	0	-
+crypto	org.keycloak.crypto.def.test.sdjwt.DefaultCryptoSdJwtVerificationTest	cratonvm	0	PASS	34.3	16	0	    org.keycloak.common.VerificationException: org.keycloak.common.VerificationException: Invalid jws signatur
+crypto	org.keycloak.crypto.def.test.sdjwt.DefaultCryptoSdJwtVerificationTest	hotspot	0	PASS	2.3	16	0	-

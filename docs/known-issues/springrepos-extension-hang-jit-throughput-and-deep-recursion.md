@@ -19,6 +19,21 @@ fix, commit `1d523351`). Three additional general JIT/classloader fixes landed o
 crash it surfaces is precisely diagnosed (a native stack overflow, design for the
 fix below).
 
+> ## ⚠️ CONTRADICTED by a 2026-06-22 re-run (dev `d95a836e`) — re-opened as a HANG
+> A fresh test-level execution (NOT just the commit-ancestry check the 2026-06-21
+> note relied on) **does not pass**: `SpringRepositoriesExtensionTests` was run
+> **P-core-pinned (`0xFFFF`), default watchdog disabled, 360s timeout** and was
+> **killed at 361s with no `JUNIT_RESULT`** — i.e. it still hangs. HotSpot passes
+> it 11/11 in 5s. Either (a) a regression between `0c904c04` (the "passes" basis)
+> and `d95a836e`, or (b) the real 163-line script's cold ANTLR ATN simulation
+> genuinely needs **>360s** even pinned (consistent with §5's "first-time
+> per-decision simulation" being O(distinct decisions) and the script being
+> decision-diverse). **Next step:** a 900s-timeout re-run to separate regression
+> from pure throughput. The stall coincides with the cross-thread STW JIT-root WARN
+> (`scan_active_jit_frames … cross_thread_jit_gap_hits=1 global_jit_depth=6`,
+> Family A4 / [[fork6-fjp-multithread-jit-root-reclamation]]). See
+> [[spring-boot-buildsrc-coldpath-hangs-2026-06-22]] for the full suite context.
+
 > **CHECKED 2026-06-21 against dev `0c904c04`.** All four load-bearing commits this
 > doc relies on are confirmed present on the current dev tip (git ancestry):
 > `1d523351` (root-snapshot/hang fix), `43f5fe03` (pdcache), `05b9622a`

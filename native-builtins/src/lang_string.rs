@@ -2629,6 +2629,40 @@ pub(crate) fn native_string_replace(
     Ok(Some(Value::Object(Some(result))))
 }
 
+/// `String.replace(CharSequence target, CharSequence replacement)` — **literal**
+/// (non-regex) all-occurrences replacement. The real-JDK bytecode runs a
+/// per-char interpreted scan that is ~13× slower than HotSpot under CratonVM (the
+/// dominant cost in the `PluginXmlParser.format` chain after the regex methods
+/// are routed to natives). Rust's `str::replace(from, to)` performs the exact
+/// same left-to-right, non-overlapping, all-occurrences literal replacement,
+/// including the empty-target case (`"abc".replace("", "X")` → `"XaXbXcX"`),
+/// so the result is byte-identical to Java. Targets/replacements are coerced via
+/// `invoke_to_string` so `StringBuilder`/`StringBuffer`/`CharBuffer` arguments
+/// (not just `String`) are handled. Routed only under
+/// `CRATONVM_NATIVE_STRING_REGEX` (see `register_essential_natives`).
+pub(crate) fn native_string_replace_charseq(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let target = match args.get(1) {
+        Some(Value::Object(Some(o))) => invoke_to_string(ctx, *o).unwrap_or_default(),
+        // null target → real JDK NPEs; defer to the (graceful) null result the
+        // sibling regex natives use rather than crash. Real callers never pass null.
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let replacement = match args.get(2) {
+        Some(Value::Object(Some(o))) => invoke_to_string(ctx, *o).unwrap_or_default(),
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let s = ctx.read_string(this).unwrap_or_default();
+    let result = s.replace(&target, &replacement);
+    Ok(Some(Value::Object(Some(ctx.create_string(&result)))))
+}
+
 pub(crate) fn native_string_to_lower_case(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -3061,7 +3095,7 @@ pub(crate) fn native_string_replace_all(
     };
     let s = ctx.read_string(this).unwrap_or_default();
     let result = if let Ok(re) = compile_java_regex(&pattern, 0) {
-        re.replace_all(&s, replacement.as_str())
+        re.replace_all_java(&s, replacement.as_str())
     } else {
         s.replace(&pattern, &replacement)
     };
@@ -3086,7 +3120,7 @@ pub(crate) fn native_string_replace_first(
     };
     let s = ctx.read_string(this).unwrap_or_default();
     let result = if let Ok(re) = compile_java_regex(&pattern, 0) {
-        re.replace_first(&s, replacement.as_str())
+        re.replace_first_java(&s, replacement.as_str())
     } else {
         s.replacen(&pattern, &replacement, 1)
     };

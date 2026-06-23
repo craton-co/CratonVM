@@ -27,6 +27,7 @@ short index; these files are the full handoff notes for fix agents.
 | CM-2 | [bug-commons-math-junit-probe-jit-execute.md](bug-commons-math-junit-probe-jit-execute.md) | Commons Math | OPEN |
 | BC-PRNG-1 | [bug-bc-crypto-prng-abnormal-exit-127.md](bug-bc-crypto-prng-abnormal-exit-127.md) | Bouncy Castle | OPEN |
 | BUILD-1 | [bug-gpu-build-native-builtins-crash.md](bug-gpu-build-native-builtins-crash.md) | GPU build | OPEN |
+| SB-G1-1 | [spring-boot-g1-conservative-rootscan-region-lookup-FIXED.md](spring-boot-g1-conservative-rootscan-region-lookup-FIXED.md) | Spring Boot | FIXED (`fix/g1-coldpath-hang`) |
 
 **Apps suite runs:** [`apps/APPS_SUITE_RESULTS.md`](../../apps/APPS_SUITE_RESULTS.md) · [`apps/CRATONVM_CRASHES.md`](../../apps/CRATONVM_CRASHES.md)
 

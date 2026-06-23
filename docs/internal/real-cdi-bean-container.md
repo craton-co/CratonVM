@@ -1,0 +1,380 @@
+# Real-Bytecode CDI / Bean Container (retire the per-framework shim cluster)
+
+Status: in progress (increment 1 landed). XL, and policy-sensitive (intersects
+the "no synthetic stubs" project rule). The goal is to delete a cluster of
+per-framework native short-circuits by making the real container bytecode run.
+
+> **Increment 1 (interface static-final init; observability shim retired) — LANDED.**
+> Scope: the lowest-risk first scalp of Step 1's general fix.
+> - Verified that the GENERAL VM path for a non-constant `static final` field on
+>   an *interface* is correct: the `getstatic` opcode resolves the field to its
+>   declaring interface and calls `ensure_class_initialized_shared`, and
+>   `initialize_class_shared` runs the interface `<clinit>` regardless of
+>   interface status (JVMS §5.5 / §5.4.3.2). No interpreter change was needed —
+>   the gap the Spring shim *named* (interface static-final not initialised) is
+>   not the operative failure; the operative one is the NESTED concrete-class
+>   `DefaultApplicationStartup.<clinit>` NPE (swallow + `post_clinit_fixup`
+>   backfill), which remains covered by the Spring shim and is the next scalp.
+> - Added a framework-independent regression test pinning the general behavior:
+>   `vm/tests/iface_static_final_init.rs` (fixture
+>   `vm/tests/resources/cratonvm/IfaceStaticFinalInit.java`). It reads a
+>   non-constant `static final int VALUE = compute()` on an interface via a
+>   single `getstatic` and asserts the value is the computed `42`, not the
+>   prepared default `0`.
+> - Retired the pure-observability piece of the Spring shim: the debug-gated
+>   `warn_shim_first_use()` first-use warning in
+>   `native-builtins/src/spring_startup_bootstrap.rs` (it announced the
+>   now-verified general gap). The functional `getApplicationStartup`/`start`/
+>   `tag`/`end` natives and the `post_clinit_fixup` carrier write are RETAINED —
+>   removing them would re-expose the nested-`<clinit>` NPE and abort Spring Boot.
+
+> **Increment 2 (Step 2, gated `CRATONVM_REAL_SPRING_STARTUP`) — LANDED.**
+> Scope: make the real `DefaultApplicationStartup.<clinit>` chain run behind a
+> default-OFF env gate, so the swallow + `post_clinit_fixup` backfill + no-op
+> startup-metrics natives are no longer needed when the gate is ON. The default
+> (gate unset) path is unchanged byte-for-byte.
+>
+> - **Concrete root cause.** Disassembling Spring Framework 5.3.31
+>   (`spring-core`, the Spring Boot 2.7.x line the shim targets) shows the entire
+>   `<clinit>` chain is *trivial* bytecode — no I/O, no reflection, no resource
+>   loading:
+>     - `ApplicationStartup.<clinit>`: `new DefaultApplicationStartup; dup;
+>       invokespecial <init>; putstatic DEFAULT`.
+>     - `DefaultApplicationStartup.<clinit>`: `new DefaultStartupStep; dup;
+>       invokespecial <init>; putstatic DEFAULT_STARTUP_STEP`.
+>     - `DefaultStartupStep.<init>`: `Object.<init>` then `new DefaultTags; dup;
+>       invokespecial <init>; putfield TAGS`.
+>     - `DefaultTags.<init>`: just `Object.<init>` (all nested classes are
+>       `static`, so there is no enclosing-instance `this$0` to bind).
+>   There is no genuine deep VM bug in *executing* this chain. The operative
+>   failure was that the chain was **never given the chance to run on the real
+>   path**: the no-op `getApplicationStartup()` native (registered in
+>   `spring_startup_bootstrap.rs` and force-routed by the `check_override` chain
+>   in `vm_exec.rs`) shadowed the real `getstatic ApplicationStartup.DEFAULT`
+>   getter, so the interface `<clinit>` → nested `DefaultApplicationStartup
+>   .<clinit>` chain was bypassed; and on the Spring Boot fat-jar path, where the
+>   nested inner classes are loaded from a nested JAR, the `<clinit>` that *did*
+>   run was swallowed by the lenient `<clinit>` path and `post_clinit_fixup`
+>   stamped a synthetic `DEFAULT`. So the "nested-`<clinit>` NPE" was really a
+>   shadow-and-swallow interaction, not an un-runnable bytecode chain. With the
+>   gate ON the real chain completes on its own.
+> - **The gate (`CRATONVM_REAL_SPRING_STARTUP`, default OFF).** Three coordinated
+>   suppressions, all no-ops when the var is unset:
+>     1. `native-builtins/src/spring_startup_bootstrap.rs::register` — the no-op
+>        `getApplicationStartup`/`start`/`tag`/`end`/`getName`/`getId`/
+>        `getParentId`/`getTags` natives are wrapped in `if !real_spring_startup()`
+>        (mirroring the `CRATONVM_REAL_AQS` registration gate). The
+>        environment/bean-factory/property-source natives in the same module cover
+>        *separate* gaps and remain registered.
+>     2. `vm/src/vm/vm_exec.rs` `check_override` chain — the `getApplicationStartup`
+>        arm and the `start|tag|end|getName|getTags` arm are guarded with
+>        `!real_spring_startup()` so the no-op natives are not force-shadowed over
+>        the real bytecode.
+>     3. `vm/src/vm/vm_util.rs` — `clinit_swallow_has_recovery` drops
+>        `ApplicationStartup`/`DefaultApplicationStartup` from the lenient swallow
+>        allowlist when the gate is ON (so a failed `<clinit>` propagates per JVMS
+>        §5.5 instead of being swallowed), and the `post_clinit_fixup`
+>        `ApplicationStartup` arm early-returns (so `DEFAULT` is never synthetically
+>        backfilled). The shared gate accessor is
+>        `crate::runtime::env_cache::real_spring_startup()`.
+> - **Test.** `vm/tests/nested_clinit_startup.rs` with a framework-independent
+>   fixture `vm/tests/resources/cratonvm/NestedClinitStartup.java` (real-JDK
+>   bytecode, JDK 25 / class major 69) whose `Startup`/`DefaultStartup`/
+>   `DefaultStep`/`DefaultTags` classes mirror Spring's `ApplicationStartup`/
+>   `DefaultApplicationStartup`/`DefaultStartupStep`/`DefaultTags` byte-for-byte in
+>   `<clinit>` shape. The flag-ON test (in-process) drives a single `getstatic
+>   Startup.DEFAULT` and asserts the whole nested chain completes (probe `true`)
+>   without the shim; the flag-OFF test (subprocess, env-isolated, skips if the
+>   binary is unbuilt) asserts the existing shim + swallow + fixup fallback still
+>   completes the probe.
+> - **Superseded by Increment 3 (below):** flipping the gate default to the real
+>   path is now DONE; deleting the startup-metrics natives + the
+>   `post_clinit_fixup` ApplicationStartup arm outright (full Step 3) remains
+>   deferred until a Spring Boot **fat-jar** battery exists.
+
+> **Increment 3 (Step 2 → default flip) — LANDED (branch `feat/real-spring-startup-default`).**
+> Scope: make the real startup-metrics path the DEFAULT, retaining the no-op shim
+> only as an opt-out fallback. This removes the synthetic startup-metrics stub
+> from the common Spring path (the no-stubs-policy goal) without taking the
+> unvalidated risk of deleting the fat-jar fallback.
+>
+> - **Validation (the live suite the prior session lacked).** Ran the Spring Boot
+>   functional battery (`apps/spring-boot/cratonvm-suite`, real Spring Boot 4.0.6
+>   + Spring Framework 7.0.7 on jdk-25) three ways with one binary:
+>     - gate ON (`CRATONVM_REAL_SPRING_STARTUP=1`, pre-flip binary): **10/10
+>       scenarios, 95/95 checks == HotSpot**; the `ApplicationStartup` synthetic
+>       backfill never fired (logs show only BigInteger / PosixFilePermission
+>       post-clinit fixups), and S01_Context refresh output is byte-for-byte
+>       identical to HotSpot — so the real `ApplicationStartup.<clinit>` →
+>       `DefaultApplicationStartup` → `DefaultStartupStep` → `DefaultTags` chain
+>       ran on its own.
+>     - default, no env var (post-flip binary): **10/10 == HotSpot**, no backfill
+>       — the real path is now the default. It is also *faster*: S01 ≈3.3 s vs the
+>       shim's ≈6.2 s, since the force-override native overhead is gone.
+>     - opt-out (`CRATONVM_SYNTHETIC_SPRING_STARTUP=1`, post-flip binary): **10/10
+>       == HotSpot** — the legacy shim still works as a fallback.
+> - **The flip.** `crate::runtime::env_cache::real_spring_startup()` and its
+>   `native-builtins` twin now return `true` by DEFAULT; opt out with
+>   `CRATONVM_SYNTHETIC_SPRING_STARTUP=1` (legacy `CRATONVM_REAL_SPRING_STARTUP`
+>   still honored as a now-redundant explicit opt-in; wins if both are set).
+>   Mirrors the `CRATONVM_SYNTHETIC_AQS` opt-out precedent. The four use-sites
+>   (register-guard in `spring_startup_bootstrap.rs`, two `vm_exec.rs`
+>   `check_override` arms, `vm_util.rs` swallow allowlist + `post_clinit_fixup`
+>   arm) are logically unchanged — the semantics flip is centralized in the
+>   accessor. `vm/tests/nested_clinit_startup.rs` flag-OFF was updated to drive
+>   the shim via the new opt-out var.
+> - **Blast radius.** All four use-sites are guarded by Spring `core.metrics`
+>   class names, so only Spring apps are affected. Keycloak (Quarkus) is provably
+>   unaffected: its universal classpath carries **zero** spring-core jars, so it
+>   never loads `org.springframework.core.metrics.*`.
+> - **Still deferred (full Step 3 = outright deletion):** deleting the
+>   startup-metrics no-op natives + the `post_clinit_fixup` ApplicationStartup arm
+>   requires a Spring Boot **fat-jar** battery (nested-JAR classloading), which the
+>   exploded-classpath functional battery does not exercise. The fat-jar nested
+>   `<clinit>` *shape* is already pinned by `vm/tests/nested_clinit_startup.rs`,
+>   but an end-to-end fat-jar boot run is needed before removing the fallback.
+
+> **Increment 3 finalize (regression fix) — LANDED (branch `fix/spring-startup-shim-finalize`).**
+> Scope: close the one loose end the default flip left behind. The flip made
+> `real_spring_startup()` default-`true`, which made
+> `clinit_swallow_has_recovery("…/ApplicationStartup")` return `false` on the
+> default path (correct — the real `<clinit>` must run, not be swallowed +
+> backfilled). But the unit test `clinit_swallow_recovery_admits_documented_cases`
+> in `vm/src/vm/vm_util.rs` still listed `ApplicationStartup` among the classes
+> that "must stay swallowable", so a default `cargo test` asserted the old
+> pre-flip answer and failed. The flip commit (`save 18.06-5`) never updated it.
+>   - Fix: drop `ApplicationStartup` from that unconditional must-be-swallowable
+>     loop and replace it with an env-aware assertion (branching on the live
+>     `real_spring_startup()` gate, mirroring `lenient_clinit_defaults_off`): on
+>     the default real path it must NOT be swallowable; under the
+>     `CRATONVM_SYNTHETIC_SPRING_STARTUP` opt-out it must stay swallowable. The
+>     production `clinit_swallow_has_recovery` / `post_clinit_fixup` arms are
+>     unchanged — only the test's expectation was stale.
+>   - Re-verified (default real path, unique-named binary): Spring Boot functional
+>     battery == HotSpot, `vm/tests/iface_static_final_init.rs`,
+>     `vm/tests/nested_clinit_startup.rs`, and the corrected `vm_util` unit test
+>     all green. (Superseded by Increment 4 below, which then removed the fallback
+>     outright.)
+
+> **Increment 4 (Step 3 — outright deletion of the no-op shim) — LANDED (branch `fix/spring-startup-shim-finalize`).**
+> Scope: delete the Spring startup-metrics no-op shim entirely now that the real
+> path is the validated default. This completes Step 3 for the Spring startup
+> scalp (the no-stubs-policy goal). The default behavior is unchanged — the
+> no-op natives were only ever reachable under the now-removed opt-out.
+>
+> - **Removed.** The no-op `ApplicationStartup` / `StartupStep` singletons and
+>   their natives (`getApplicationStartup` / `start` / `tag` / `end` / `getName` /
+>   `getId` / `getParentId` / `getTags`) and the singleton helpers in
+>   `native-builtins/src/spring_startup_bootstrap.rs`; the two `vm_exec.rs`
+>   `check_override` force arms; the `vm_util.rs` `clinit_swallow_has_recovery`
+>   guard + `has_fixup_arm` entry + the `post_clinit_fixup` `ApplicationStartup`
+>   arm; and the `real_spring_startup()` gate + `CRATONVM_SYNTHETIC_SPRING_STARTUP`
+>   / `CRATONVM_REAL_SPRING_STARTUP` env vars (`vm/src/runtime/env_cache.rs` and
+>   the `native-builtins` twin). `ApplicationStartup` / `DefaultApplicationStartup`
+>   are now in the `clinit_swallow_recovery_rejects_unrecovered_classes` list (must
+>   NOT be swallowed). The obsolete opt-out subprocess test in
+>   `vm/tests/nested_clinit_startup.rs` and the
+>   `application_startup_intercepts_registered` native-builtins test were removed.
+> - **Kept.** The SEPARATE environment / bean-factory / property-source /
+>   config-data natives in the same module (they cover different partial-bootstrap
+>   gaps).
+> - **Why this is safe without a fat-jar battery.** The deleted natives were only
+>   ever registered under the opt-out, so the default (real) path — validated
+>   10/10 == HotSpot — is byte-for-byte unaffected by the deletion. The opt-out's
+>   only intended consumer was the Spring Boot fat-jar path, which is independently
+>   still partial (`vm/tests/wave3_spring_boot_fatjar.rs` shows the launcher stops
+>   earlier, at `JarFileArchive.getClassPathUrls`), so no working path loses a
+>   fallback. The `<clinit>` shape stays pinned by
+>   `vm/tests/nested_clinit_startup.rs` and `vm/tests/iface_static_final_init.rs`.
+> - **Re-verified (default path, unique-named binary `cratonvm-sbstartup.exe`):**
+>   Spring Boot functional battery 10/10 == HotSpot (zero divergence, no synthetic
+>   backfill); `nested_clinit_startup` + `iface_static_final_init` +
+>   `vm_util` clinit-swallow unit tests green; workspace builds clean.
+
+> **Increment 5 (Agroal — Step 2 gate, Keycloak Gap 8) — LANDED (branch `fix/keycloak-gap8-datasource`).**
+> Scope: retire the `agroal_pool.rs` datasource shim for the real Quarkus/Keycloak path by routing
+> to the real `io.agroal.pool.*` container bytecode behind an opt-in gate, and correct the
+> mis-scoping of the blocker.
+>
+> - **Re-scoped the blocker (the prior "real H2 engine under CratonVM" plan was wrong).** Isolated
+>   repros against the real `com.h2database.h2-2.4.240.jar` prove the **real `org.h2.Driver` already
+>   works** byte-identically to HotSpot (connect, DDL, sequences, `MERGE`, `DatabaseMetaData`,
+>   multi-connection file mode). Gap 8 is **not** an H2-engine gap. The real blocker, reproduced
+>   deterministically with the real `io.agroal.agroal-pool-3.0.1.jar`, is a classic shim-vs-real
+>   collision: `agroal_pool.rs`'s `AgroalDataSourceConfigurationSupplier.get()` native returns a
+>   synthetic object typed as the bare **interface** `AgroalDataSourceConfiguration` (no method
+>   bodies); the real `io.agroal.pool.DataSource.<init>` / `DataSourceProvider.getDataSource`
+>   bytecode then does `invokeinterface dataSourceImplementation()` →
+>   `AbstractMethodError: … has no Code attribute`. (Same shape as the old Gap-6 `getConfigMapping`
+>   interface-alloc shim.)
+> - **The gate (`CRATONVM_REAL_AGROAL`, currently opt-in).**
+>   `native_builtins::real_agroal()` (defined next to `real_proxy_super`) returns true when
+>   `CRATONVM_REAL_AGROAL` is set and `CRATONVM_SYNTHETIC_AGROAL` is not. When ON, the
+>   `register_agroal_natives` call in `lib.rs::register_essential_natives` is skipped, so the whole
+>   shim (config supplier / `AgroalDataSource` / `ConnectionPool` / `PoolHandler` / properties
+>   reader natives) is suppressed and the real Agroal bytecode runs over the real `org.h2.Driver`.
+>   The shim module + its (Rust-level) unit tests are RETAINED unchanged as the synthetic fallback.
+> - **Validation.** `KcAgroal` (real Agroal pool + real H2, isolated) reaches `== DONE OK ==` with
+>   the gate ON. The **real Keycloak 26.6.3 boot with `CRATONVM_REAL_AGROAL=1` no longer throws the
+>   `AbstractMethodError`** and advances through ArC, truststore, Hibernate ORM, the
+>   `keycloak-default` persistence unit, and Hibernate Validator to `ApplicationLifecycleManager
+>   .waitForExit` (real AQS `ConditionObject.awaitUninterruptibly` + ForkJoinPool — the concurrency
+>   the Risks section feared is exercised and works). The boot does not yet bind HTTP — a **separate
+>   deeper blocker** (a worker thread stuck in native before Liquibase / HTTP bind) is the next
+>   frontier; see `docs/known-issues/keycloak-quarkus-boot-progress.md` Gap 8/9.
+> - **Default flip (deferred):** flipping `real_agroal()` to default-on (opt-out
+>   `CRATONVM_SYNTHETIC_AGROAL`, mirroring AQS / Spring-startup) is gated on the Keycloak boot going
+>   fully green, per Step 2's "validate the suite before flipping" rule. The shim is broken for the
+>   real Quarkus path (AbstractMethodError) and its only consumer is Quarkus apps that carry the real
+>   agroal-pool jar, so the eventual flip is low-risk (no Agroal bytecode test depends on the shim).
+> - **Tangential general VM bug fixed (not Gap-8-specific):** `java.util.Properties.store` dropped
+>   every entry (wrote only the comment) for real-JDK-layout map nodes — `native_props_store` /
+>   `props_collect_keys` read bucket-node field 0 as the key (correct for legacy key=0 nodes, wrong
+>   for real hash=0/key=1 nodes). Rewrote `store` to use the layout-aware `map_collect_entries` + JDK
+>   `saveConvert` escaping + the real `#`-prefixed comment format. Surfaced via H2's `AUTO_SERVER`
+>   `FileLock` save→load→equals watchdog ("Concurrent update"); affects all `Properties.store` callers.
+
+## Goal
+
+Run the **real** CDI / dependency-injection / service-container bytecode of
+Quarkus ArC, Spring, WildFly Core, JBoss MSC, Infinispan, and Agroal — and
+retire the hand-written native shims that currently short-circuit each
+framework's bootstrap. Each shim is a per-app landmine (slot-keyed synthetic
+objects, ignored configuration, no real lifecycle) that diverges from upstream
+behavior the moment an app exercises a path the shim didn't anticipate.
+
+## Current state (cited)
+
+There is a documented cluster of intentional, per-framework native shims under
+`native-builtins/src/`. Each is a real implementation of a *narrow boot path*,
+not the framework:
+
+- **`quarkus_arc.rs`** — Quarkus 3.x ArC (build-time CDI). Implements just
+  `Arc.initialize()` / `Arc.container()` / `ArcContainer.instance(Class)` /
+  `beanManager()` so Keycloak 26 boot returns. Module doc: "provides enough of
+  ArC for that path to return. It does NOT [implement the container]".
+- **`spring_startup_bootstrap.rs`** — explicitly labelled
+  "⚠ INTENTIONAL APP-COMPATIBILITY SHIM — NOT a faithful implementation ⚠".
+  Installs a no-op `ApplicationStartup`/`StartupStep`; every `start()/tag()/end()`
+  is discarded. The doc states the underlying VM bug it works around: a
+  `static final` field on an *interface* (`ApplicationStartup.DEFAULT`) that the
+  bootstrap can't initialize.
+- **`wildfly_core.rs`** — WildFly Core kernel (Deployment / Threads / Logging)
+  natives; mirrors `DeploymentUnit` attachment maps by identity, wraps thread
+  pools.
+- **`jboss_msc.rs`** — JBoss MSC `ServiceContainer` / `ServiceController` state
+  machine (`New→Down→Starting→Up`), `ServiceName` indexing, dependency DAG —
+  reimplemented in Rust.
+- **`infinispan_local.rs`** — Infinispan local-mode caches backed by a
+  process-wide `RwLock<HashMap>`; `getCache/put/get/remove/addListener`.
+- **`agroal_pool.rs`** — Agroal JDBC pool short-circuited to a Rust
+  `AgroalPoolRegistry`; each `AgroalDataSource` stores an `i32` handle in a
+  synthetic `pool` field.
+- Adjacent shims in the same cluster: `ironjacamar_pool.rs`, `vertx_eventloop.rs`,
+  `logmanager.rs`.
+
+Why this matters (policy): `MEMORY.md` "feedback: no synthetic stubs" and the
+"synthetic stub removal" project entry record the standing rule — fake-main
+shims are forbidden; fix the underlying VM bug so real bytecode runs. This
+cluster is the largest remaining concentration of exactly that pattern. Several
+shim docs (e.g. `spring_startup_bootstrap.rs`) even name the specific VM bug they
+paper over.
+
+## Design
+
+The shims exist because the *underlying VM gaps* make the real bytecode fail.
+Retiring the cluster is therefore not "delete the shims" — it's "fix the gaps
+the shims hide, framework by framework, then delete the shim." Order by gap, not
+by framework.
+
+### Step 0 — enumerate the real VM gaps each shim hides
+
+Each shim's module doc names (or implies) the bug. Build a gap inventory:
+
+- **`static final` field on an interface not initialized**
+  (`spring_startup_bootstrap.rs` doc: `ApplicationStartup.DEFAULT`). This is a
+  *general* `<clinit>`/interface-static bug; fixing it removes the Spring
+  startup shim entirely and likely helps many frameworks.
+- **Build-time-generated bean classes** (Quarkus ArC generates bean/registration
+  classes at build time). Running the real ArC means loading and executing those
+  generated classes — a classloading + generated-bytecode-execution gap, not a
+  container gap.
+- **Service-container concurrency** (MSC's worker-pool + async `complete()`):
+  needs the real `ExecutorService`/thread + AQS machinery (cf. `CRATONVM_REAL_AQS`
+  in `MEMORY.md` Gradle entry) rather than a Rust state machine.
+- **Datasource/pool** (Agroal/IronJacamar): needs real `java.sql` + the JDBC
+  driver bytecode to run, backed by the VM's real socket/file layers
+  (`CRATONVM_REAL_NET_SOCKETS`).
+- **Cache** (Infinispan local): the real local-mode cache is plain
+  `ConcurrentHashMap`-backed Java — running it needs no native cache at all once
+  the surrounding container boots.
+
+### Step 1 — fix the general VM bugs first
+
+The interface-`static-final`-`<clinit>` bug and the generated-class
+loading/execution path are *shared* enablers. Fix these against a minimal repro
+(not the full framework) so the fix is principled and regression-tested in
+isolation, then confirm the dependent shim can be removed.
+
+### Step 2 — retire shims framework-by-framework behind a gate
+
+For each framework, add an opt-in gate (mirroring `CRATONVM_REAL_AQS`,
+`CRATONVM_REAL_ANNOTATIONS`, `CRATONVM_REAL_JCA`) that **routes to real
+bytecode** instead of the shim:
+
+- `CRATONVM_REAL_SPRING_STARTUP` → drop the no-op `ApplicationStartup`, run the
+  real `org.springframework.core.metrics` once the interface-static bug is fixed.
+- `CRATONVM_REAL_ARC` → load Quarkus's generated bean classes, run real
+  `Arc.initialize()`.
+- `CRATONVM_REAL_MSC` → run real `ServiceContainer` bytecode on real executors.
+- `CRATONVM_REAL_AGROAL` → real Agroal + JDBC driver.
+- `CRATONVM_REAL_INFINISPAN` → real local-mode cache (likely free once the
+  container boots).
+
+Validate each gate against the corresponding suite (Keycloak 16/26 boot, Spring
+Boot battery, WildFly boot diagnostic — see `docs/internal/wildfly-boot-
+diagnostic.md`, `docs/internal/kc16-blocker-map.md`,
+`docs/internal/kc26-blocker-map.md`) before flipping its default.
+
+### Step 3 — delete the shim modules
+
+Once a framework's real path is default-on and its suite is green, delete the
+shim module and its registrations. The `--dump-native-registry` census
+(`MEMORY.md` "synthetic stub removal") tracks the shrinkage.
+
+## Implementation steps (ordered)
+
+1. **Gap inventory** (Step 0): per-shim, the exact VM bug it hides, with a
+   pointer to a minimal repro.
+2. **Fix interface `static final` `<clinit>`** — highest leverage; unblocks the
+   Spring startup shim and probably others. Minimal repro + isolated fix.
+3. **Fix generated-class load/execute** for build-time CDI (ArC) — minimal repro.
+4. **Per-framework real-path gate** (Step 2), starting with Spring startup (most
+   clearly a pure-observability shim, lowest risk), then MSC, ArC, Agroal,
+   Infinispan, Vert.x, IronJacamar.
+5. **Validate** each gate against its boot suite; flip default when green.
+6. **Delete the shim module** (Step 3) once default-on + green; update the
+   native-registry census.
+
+## Risks
+
+- **This is the riskiest doc to execute**: each shim hides one or more *real*
+  VM bugs, so "remove the shim" can re-expose a boot failure. The gate +
+  per-framework rollout is mandatory; never delete a shim before its real path is
+  green.
+- **Concurrency/lifecycle correctness**: MSC's async service DAG and Agroal's
+  pool are genuinely concurrent; the real bytecode needs the real AQS/executor
+  paths to be solid (they are partially gated today).
+- **Build-time-generated bytecode** (ArC, Spring AOT) may exercise classloading
+  and reflection corners that no current app does — expect new gaps to surface.
+- **Performance**: real containers do more work than the shims; the shims were
+  partly chosen for fast boot. Measure boot time after each flip.
+- **Scope creep**: this touches six+ frameworks. Treat each as an independent,
+  separately-landable sub-project sharing the Step-1 general fixes.
+
+## Effort
+
+XL, and the largest of the nine. Best framed as a program: the two general
+fixes (Step 1) are M–L each and unblock multiple frameworks; each per-framework
+retirement is M and independently landable behind its gate. The Spring startup
+shim is the recommended first scalp (pure observability, the bug is named).
