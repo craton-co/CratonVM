@@ -13627,25 +13627,28 @@ enum GetClassDisplay {
     Stamp,
     /// A fixed concrete alias, already resolved to its `ClassId`.
     Fixed(cratonvm_types::ClassId),
-    /// `java.util` immutable-collection family. HotSpot picks the concrete
-    /// class by element count (`List12`/`ListN`, `Set12`/`SetN`, `Map1`/`MapN`),
-    /// so this is resolved per-object rather than memoised to a single class.
-    ImmutableList,
-    ImmutableSet,
-    ImmutableMap,
+    /// A `cratonvm/internal/Unmodifiable{List,Set,Map}` stamp shared by the
+    /// immutable `*.of`/`copyOf` factories and the `Collections.unmodifiable*`
+    /// wrappers. Resolved per object: the immutable marker (slot 1) selects the
+    /// size-discriminated `ImmutableCollections$*` family (`List12`/`ListN`,
+    /// `Set12`/`SetN`, `Map1`/`MapN`); otherwise the `Collections$Unmodifiable*`
+    /// family (with a `RandomAccess` check for lists).
+    CollList,
+    CollSet,
+    CollMap,
+    /// `cratonvm/internal/UnmodifiableCollection` — only ever produced by
+    /// `Collections.unmodifiableCollection` (no immutable factory), so it always
+    /// maps to `Collections$UnmodifiableCollection`.
+    CollUnmod,
 }
 
 /// Classify the craton-internal immutable/unmodifiable collection stamps.
-/// `List.of`/`copyOf` and `Collections.unmodifiableList` currently share one
-/// backing class, so a wrapper produced by `unmodifiableList` is also reported
-/// with the `List.of` concrete family here; the distinct
-/// `Collections$UnmodifiableRandomAccessList` would need a stamp split
-/// (deferred — see SBR-12).
-fn immutable_collection_kind(stamp: &str) -> Option<GetClassDisplay> {
+fn collection_display_kind(stamp: &str) -> Option<GetClassDisplay> {
     match stamp {
-        "cratonvm/internal/UnmodifiableList" => Some(GetClassDisplay::ImmutableList),
-        "cratonvm/internal/UnmodifiableSet" => Some(GetClassDisplay::ImmutableSet),
-        "cratonvm/internal/UnmodifiableMap" => Some(GetClassDisplay::ImmutableMap),
+        "cratonvm/internal/UnmodifiableList" => Some(GetClassDisplay::CollList),
+        "cratonvm/internal/UnmodifiableSet" => Some(GetClassDisplay::CollSet),
+        "cratonvm/internal/UnmodifiableMap" => Some(GetClassDisplay::CollMap),
+        "cratonvm/internal/UnmodifiableCollection" => Some(GetClassDisplay::CollUnmod),
         _ => None,
     }
 }
@@ -13691,6 +13694,31 @@ fn getclass_collection_size(ctx: &mut dyn NativeContext, this: ObjectRef) -> i64
     }
 }
 
+/// Whether a craton-internal collection wrapper was produced by an *immutable*
+/// factory (`List.of`/`copyOf` …) rather than `Collections.unmodifiable*`. Reads
+/// the marker slot set by `freeze_result` in native-collections. CONTRACT: this
+/// index must match `UNMOD_FIELD_IMMUTABLE` (= 1) there.
+fn getclass_immutable_marker(ctx: &mut dyn NativeContext, this: ObjectRef) -> bool {
+    matches!(ctx.get_field(this, 1), Value::Int(1))
+}
+
+/// Whether the backing collection of an unmodifiable-list wrapper implements
+/// `java.util.RandomAccess` — HotSpot reports `Collections$UnmodifiableRandom`
+/// `AccessList` for those and `Collections$UnmodifiableList` otherwise. The
+/// backing lives in slot 0 (`UNMOD_FIELD_BACKING`).
+fn getclass_backing_is_random_access(ctx: &mut dyn NativeContext, this: ObjectRef) -> bool {
+    let backing = match ctx.get_field(this, 0) {
+        Value::Object(Some(b)) => b,
+        _ => return false,
+    };
+    let ra = match getclass_resolve_name(ctx, "java/util/RandomAccess") {
+        Some(cid) => cid,
+        None => return false,
+    };
+    let backing_cid = ctx.class_id_of_object(backing);
+    ctx.is_subclass(backing_cid, ra)
+}
+
 /// Resolve the concrete display `ClassId` for an object stamped with `class_id`,
 /// or `None` to use the stamp unchanged. The stamp→strategy classification is
 /// memoised; the size-dependent collection forms are resolved per-object.
@@ -13706,7 +13734,7 @@ fn getclass_display_class_id(
             // so the common non-synthetic class never re-clones its name.
             let d = match ctx.class_name_of_id(class_id) {
                 Some(name) => {
-                    if let Some(kind) = immutable_collection_kind(&name) {
+                    if let Some(kind) = collection_display_kind(&name) {
                         kind
                     } else if let Some(alias) = jdk_concrete_getclass_alias(&name) {
                         match getclass_resolve_name(ctx, alias) {
@@ -13726,34 +13754,53 @@ fn getclass_display_class_id(
     match display {
         GetClassDisplay::Stamp => None,
         GetClassDisplay::Fixed(cid) => Some(cid),
-        // HotSpot: `List.of()`→ListN, size 1–2→List12, ≥3→ListN. Set mirrors
-        // List; Map uses Map1 only for a single entry, else MapN.
-        GetClassDisplay::ImmutableList => {
-            let n = getclass_collection_size(ctx, this);
-            let name = if (1..=2).contains(&n) {
-                "java/util/ImmutableCollections$List12"
+        // Immutable (marker set): HotSpot picks by size — `List.of()`→ListN,
+        // size 1–2→List12, ≥3→ListN; Set mirrors List; Map uses Map1 only for a
+        // single entry. Unmodifiable (no marker): the `Collections$Unmodifiable*`
+        // family — lists split on `RandomAccess`.
+        GetClassDisplay::CollList => {
+            let name = if getclass_immutable_marker(ctx, this) {
+                let n = getclass_collection_size(ctx, this);
+                if (1..=2).contains(&n) {
+                    "java/util/ImmutableCollections$List12"
+                } else {
+                    "java/util/ImmutableCollections$ListN"
+                }
+            } else if getclass_backing_is_random_access(ctx, this) {
+                "java/util/Collections$UnmodifiableRandomAccessList"
             } else {
-                "java/util/ImmutableCollections$ListN"
+                "java/util/Collections$UnmodifiableList"
             };
             getclass_resolve_name(ctx, name)
         }
-        GetClassDisplay::ImmutableSet => {
-            let n = getclass_collection_size(ctx, this);
-            let name = if (1..=2).contains(&n) {
-                "java/util/ImmutableCollections$Set12"
+        GetClassDisplay::CollSet => {
+            let name = if getclass_immutable_marker(ctx, this) {
+                let n = getclass_collection_size(ctx, this);
+                if (1..=2).contains(&n) {
+                    "java/util/ImmutableCollections$Set12"
+                } else {
+                    "java/util/ImmutableCollections$SetN"
+                }
             } else {
-                "java/util/ImmutableCollections$SetN"
+                "java/util/Collections$UnmodifiableSet"
             };
             getclass_resolve_name(ctx, name)
         }
-        GetClassDisplay::ImmutableMap => {
-            let n = getclass_collection_size(ctx, this);
-            let name = if n == 1 {
-                "java/util/ImmutableCollections$Map1"
+        GetClassDisplay::CollMap => {
+            let name = if getclass_immutable_marker(ctx, this) {
+                let n = getclass_collection_size(ctx, this);
+                if n == 1 {
+                    "java/util/ImmutableCollections$Map1"
+                } else {
+                    "java/util/ImmutableCollections$MapN"
+                }
             } else {
-                "java/util/ImmutableCollections$MapN"
+                "java/util/Collections$UnmodifiableMap"
             };
             getclass_resolve_name(ctx, name)
+        }
+        GetClassDisplay::CollUnmod => {
+            getclass_resolve_name(ctx, "java/util/Collections$UnmodifiableCollection")
         }
     }
 }

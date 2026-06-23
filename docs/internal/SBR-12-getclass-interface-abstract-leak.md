@@ -46,17 +46,39 @@ Regression test: `vm/tests/getclass_concrete_class.rs` (self-contained — embed
 and compiles its probe to a temp dir). Manual parity also confirmed via
 `IntSortProbe2`, `FSEq`, `LOfHash2`, `KUrlProbe`.
 
+## Follow-up (2026-06-23) — immutable vs unmodifiable split
+
+The shared-stamp residual is now resolved **without** a backing-class/dispatch
+rework. `List.of`/`Set.of`/`Map.of`/`copyOf` and `Collections.unmodifiable*`
+keep the same `cratonvm/internal/Unmodifiable*` stamp (so all dispatch guards are
+untouched), but the immutable factories now set a marker field (slot 1,
+`UNMOD_FIELD_IMMUTABLE`, via `alloc_immutable_wrapper`). `getClass()` reads it
+per object:
+
+* marker set → `java.util.ImmutableCollections$*` (size-discriminated, as before)
+* marker unset → `java.util.Collections$Unmodifiable*`; for lists the backing's
+  `RandomAccess`-ness (checked via `is_subclass`) selects
+  `UnmodifiableRandomAccessList` vs `UnmodifiableList`, matching HotSpot exactly.
+  `Collections$UnmodifiableCollection` is also now mapped.
+
+Verified byte-identical to HotSpot jdk-25 for `List.of`/`copyOf`/
+`unmodifiableList(ArrayList|LinkedList)`/`unmodifiableSet`/`unmodifiableMap`/
+`unmodifiableCollection` (regression test extended).
+
 ## Residuals (knowingly deferred — still concrete, the floor is met)
 
-* `List.of`/`copyOf` and `Collections.unmodifiableList` share the
-  `cratonvm/internal/UnmodifiableList` backing stamp, so a `unmodifiableList`
-  wrapper now reports the `ImmutableCollections$List{12,N}` family rather than
-  HotSpot's `Collections$UnmodifiableRandomAccessList`. An exact fix needs the
-  backing-stamp split (separate immutable vs unmodifiable classes + their
-  dispatch guards in `native-collections`).
-* An *intermediate* stream op (`.map(..)`) reports `IntPipeline$Head` rather
-  than HotSpot's `IntPipeline$4`; CratonVM's synthetic streams are eager, so
-  there is no faithful op-chain subtype to report.
+* *Views* of immutable collections (`List.of(..).subList(..)`,
+  `Map.of(..).keySet()`, …) report the `Collections$Unmodifiable*` family rather
+  than HotSpot's `ImmutableCollections$SubList` etc. — they reuse the plain
+  unmodifiable wrapper and carry no marker. `Collections.empty*`/`singleton*`
+  likewise report their backing-collection class, not `Collections$Empty*`/
+  `Singleton*`. All concrete; rare in practice.
+* An *intermediate* stream op (`.map(..)`) reports `IntPipeline$Head` rather than
+  HotSpot's `IntPipeline$4`. The exact name is a JDK anonymous-class index
+  (`$1`/`$2`/`$3`/`$4`/`$10`…, plus `SortedOps$OfInt`) — a declaration-order
+  artifact that varies across JDK builds and that no user code inspects. Matching
+  it would require threading per-op tags through every eager-stream native and
+  hard-coding a fragile version-specific table; deliberately not done.
 
-Both residuals report a concrete, JDK-plausible class — the original bug
+All residuals report a concrete, JDK-plausible class — the original bug
 (interface/abstract/internal `getClass()`) is gone in every case.
