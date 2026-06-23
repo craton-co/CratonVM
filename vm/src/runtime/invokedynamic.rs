@@ -65,6 +65,15 @@ const OBJECT_METHODS: &str = "java/lang/runtime/ObjectMethods";
 /// ObjectMethods.bootstrap method name.
 const BOOTSTRAP: &str = "bootstrap";
 
+/// Apache Groovy's invokedynamic bootstrap class.
+const GROOVY_INDY_INTERFACE: &str = "org/codehaus/groovy/vmplugin/v8/IndyInterface";
+
+/// Groovy call-site name for a coercion (`cast:(Object)Z`, `cast:(Object)I`, …).
+const GROOVY_CAST: &str = "cast";
+
+/// Groovy's runtime type-coercion helper (implements "Groovy truth").
+const GROOVY_DTT: &str = "org/codehaus/groovy/runtime/typehandling/DefaultTypeTransformation";
+
 /// Data extracted from the constant pool under a read lock, owned so we can
 /// drop the lock before proceeding with string creation (which needs a write lock).
 struct IndyInfo {
@@ -261,6 +270,28 @@ pub fn execute_invokedynamic(
         bootstrap_enum_switch(shared, thread, frame_idx, cp_index, &info)
     } else if info.bsm_class == OBJECT_METHODS && info.bsm_method == BOOTSTRAP {
         bootstrap_record_object_method(shared, thread, frame_idx, cp_index, &info)
+    } else if info.bsm_class == GROOVY_INDY_INTERFACE
+        && info.target_name == GROOVY_CAST
+        && info.target_descriptor.ends_with(")Z")
+        && matches!(parse_descriptor_args(&info.target_descriptor).as_slice(),
+                    [c] if *c == 'L' || *c == '[')
+    {
+        // Groovy "cast"-to-boolean coercion (`if (x.f())`, `!x`, ternaries …).
+        // Groovy emits a dedicated `cast:(Object)Z` invokedynamic and routes it
+        // through `IndyInterface` → `Selector$CastSelector.handleBoolean`, which
+        // builds a `guardWithTest(IS_NULL, FALSE, asBoolean(…))` MethodHandle.
+        // CratonVM's MH dispatch of that particular adapter chain does not reach
+        // the runtime receiver's `asBoolean` (so a Groovy-falsy-but-non-null value
+        // — `Boolean.FALSE`, `""`, `[]`, `0` — read as TRUE), which silently flips
+        // `if`/`!` branches (e.g. Spring Boot's `SpringRepositoriesExtension`
+        // `if (!"commercial".equalsIgnoreCase(buildType))` and
+        // `if (version.endsWith("-SNAPSHOT"))`). Dispatch Groovy's own
+        // `DefaultTypeTransformation.castToBoolean(Object)` directly instead — it
+        // is real Groovy bytecode implementing "Groovy truth" and dispatches
+        // `asBoolean` correctly on CratonVM (verified == HotSpot). This bypasses
+        // the broken CastSelector adapter for the boolean case only; all other
+        // cast targets keep the generic bootstrap path.
+        groovy_cast_to_boolean(shared, thread, frame_idx, &info)
     } else {
         // Generic invokedynamic: a bootstrap method outside the hardcoded JDK
         // factory set above (e.g. Groovy's
@@ -322,6 +353,50 @@ fn resolve_static_arg_kind(cp: &ConstantPool, index: u16) -> Result<StaticArg, M
             .into());
         }
     })
+}
+
+/// Groovy `cast:(Object)Z` coercion → `DefaultTypeTransformation.castToBoolean`.
+///
+/// Pops the single operand and dispatches Groovy's real "Groovy truth" helper,
+/// pushing the resulting `boolean`. See the call site in `execute_invokedynamic`
+/// for why the generic CastSelector path is bypassed for the boolean case.
+fn groovy_cast_to_boolean(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    frame_idx: usize,
+    info: &IndyInfo,
+) -> Result<(), MethodCallFailed> {
+    // Single reference operand (guaranteed by the dispatch guard).
+    let cv = thread.frames[frame_idx].stack.pop_compact();
+    let arg = cv.decode_by_descriptor(b'L');
+    // Pin the operand across the helper call (castToBoolean runs Java bytecode
+    // that may allocate / GC).
+    let pin_base = thread.native_pin_roots.len();
+    if let Value::Object(Some(o)) = arg {
+        thread.native_pin_roots.push(o);
+    }
+    let result = crate::vm::invoke_shared(
+        shared,
+        thread,
+        GROOVY_DTT,
+        "castToBoolean",
+        "(Ljava/lang/Object;)Z",
+        &[arg],
+    );
+    thread.native_pin_roots.truncate(pin_base);
+    let b = match result? {
+        Some(Value::Int(v)) => v,
+        Some(Value::Object(Some(o))) => {
+            // Defensive: a boxed Boolean — unbox via field 0.
+            match shared.heap.get_field(o, 0) {
+                Value::Int(v) => v,
+                _ => 1,
+            }
+        }
+        _ => 0,
+    };
+    thread.frames[frame_idx].stack.push(Value::Int(b))?;
+    Ok(())
 }
 
 /// Generic invokedynamic linkage: execute an arbitrary bootstrap method to

@@ -3984,6 +3984,17 @@ pub(crate) const MH_KIND_COLLECT: i32 = 16;
 /// `Object[]` back into positional arguments for the resolved method.
 pub(crate) const MH_KIND_SPREAD: i32 = 17;
 
+/// Argument-filter adapter produced by `MethodHandles.filterArguments(target,
+/// pos, filters...)`. `MH_BOUND` holds a 3-field wrapper (field 0 = target MH,
+/// field 1 = filters `MethodHandle[]`, field 2 = pos). On invocation each
+/// non-null filter is applied to the argument at `pos + i` (replacing it with
+/// `filter.invoke(arg)`) before the target is dispatched. Groovy's
+/// `TypeTransformers` uses this to coerce a `Closure` argument into a SAM
+/// interface / number / array via a per-argument transform handle — without it
+/// the raw `Closure` reaches a method expecting e.g. a Gradle `Action`, and the
+/// callee's `action.execute(...)` throws `NoSuchMethodError: …Closure.execute`.
+pub(crate) const MH_KIND_FILTER: i32 = 18;
+
 // ---------------------------------------------------------------------------
 // Round-9 perf: LambdaMetafactory CallSite cache.
 // ---------------------------------------------------------------------------
@@ -4438,6 +4449,48 @@ fn build_reflective_lambda_callsite(
 
 /// Core dispatch: given a populated MethodHandle and argument list, invoke it.
 /// `extra_args` are the args passed to invoke() after `this` (the MH itself).
+/// `MethodHandles.filterArguments` dispatch (`MH_KIND_FILTER`). Extracted from
+/// `mh_dispatch`'s match to keep that already-huge function small enough for
+/// rustc to compile without overflowing its analysis stack. `bound` is the
+/// 3-field wrapper (target MH, filters `MethodHandle[]`, pos).
+fn mh_dispatch_filter(
+    ctx: &mut dyn NativeContext,
+    bound: Value,
+    extra_args: &[Value],
+) -> MethodCallResult {
+    let wrapper = match bound {
+        Value::Object(Some(w)) => w,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let target = match ctx.get_field(wrapper, 0) {
+        Value::Object(Some(t)) => t,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let filters = ctx.get_field(wrapper, 1);
+    let pos = match ctx.get_field(wrapper, 2) {
+        Value::Int(p) => p as usize,
+        _ => 0,
+    };
+    let mut filtered: Vec<Value> = extra_args.to_vec();
+    if let Value::Object(Some(farr)) = filters {
+        let n = ctx.array_length(farr);
+        for i in 0..n {
+            let idx = pos + i;
+            if idx >= filtered.len() {
+                break;
+            }
+            // A null filter element means "leave this argument unchanged".
+            if let Value::Object(Some(filter_mh)) = ctx.get_array_element(farr, i) {
+                let arg = filtered[idx];
+                if let Some(v) = mh_dispatch(ctx, filter_mh, &[arg])? {
+                    filtered[idx] = v;
+                }
+            }
+        }
+    }
+    mh_dispatch(ctx, target, &filtered)
+}
+
 pub(crate) fn mh_dispatch(
     ctx: &mut dyn NativeContext,
     mh: cratonvm_types::ObjectRef,
@@ -4918,6 +4971,7 @@ pub(crate) fn mh_dispatch(
             full.push(Value::Object(Some(arr)));
             mh_dispatch(ctx, target, &full)
         }
+        MH_KIND_FILTER => mh_dispatch_filter(ctx, bound, extra_args),
         MH_KIND_SPREAD => {
             // asSpreader(arrayType, count): the trailing argument is an array;
             // spread its elements into positional args, then dispatch target.
@@ -5981,9 +6035,37 @@ pub fn register_t28_method_handle_completeness(r: &mut NativeMethodRegistry) {
         mhs,
         "filterArguments",
         "(Ljava/lang/invoke/MethodHandle;I[Ljava/lang/invoke/MethodHandle;)Ljava/lang/invoke/MethodHandle;",
-        |_ctx, args| {
-            // Simplified: return the target MH unchanged
-            Ok(Some(args.first().copied().unwrap_or(Value::Object(None))))
+        |ctx, args| {
+            // filterArguments(target, pos, filters[]): apply each non-null filter
+            // to the argument at `pos + i` before dispatching `target`. Used by
+            // Groovy's TypeTransformers to coerce a Closure into a SAM/number/
+            // array argument — a passthrough leaks the raw Closure to a callee
+            // expecting e.g. a Gradle Action.
+            let target = match args.first() {
+                Some(Value::Object(Some(t))) => *t,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            let pos = match args.get(1) {
+                Some(Value::Int(p)) => *p,
+                _ => 0,
+            };
+            let filters = match args.get(2) {
+                Some(Value::Object(Some(f))) => *f,
+                // No filters → behaves like the identity wrapper over target.
+                _ => return Ok(Some(Value::Object(Some(target)))),
+            };
+            let wrapper = alloc_concurrent_synthetic(ctx, "__mh_filter_wrapper__", 3);
+            ctx.set_field(wrapper, 0, Value::Object(Some(target)));
+            ctx.set_field(wrapper, 1, Value::Object(Some(filters)));
+            ctx.set_field(wrapper, 2, Value::Int(pos));
+            // The adapter's type() equals the target's (filters change argument
+            // *types* but not arity); chain off the target's effective descriptor.
+            let desc = mh_type_descriptor(ctx, target)
+                .or_else(|| mh_read_desc(ctx, target))
+                .unwrap_or_default();
+            let adapter = alloc_method_handle(ctx, "__adapter__", "filter", &desc, MH_KIND_FILTER);
+            ctx.set_field(adapter, MH_BOUND, Value::Object(Some(wrapper)));
+            Ok(Some(Value::Object(Some(adapter))))
         },
     );
     r.register(
@@ -6333,21 +6415,52 @@ fn mhs_guard_with_test(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         _ => return Ok(Some(Value::Object(None))),
     };
 
-    // Get the target's EFFECTIVE type descriptor for the adapter MH. The
-    // guardWithTest result's `type()` must equal the target's `type()` (JLS:
-    // guard/target/fallback all share that type). We must therefore chain off
-    // the adapted MethodType (`mh_type_descriptor`) — which reflects the
-    // receiver-prepend of a virtual/special target and any insertArguments/
-    // asCollector arity changes — NOT the raw bytecode `MH_DESC`
-    // (`mh_read_desc`), which omits the receiver for an unbound virtual target.
-    // Using the raw desc dropped the receiver, so the GUARD adapter reported one
-    // FEWER parameter than the target; Groovy's `Selector.setGuards` reads
-    // `handle.type().parameterArray()` for the `SAME_CLASSES` collector count
-    // while building `classes[]` from the (longer) runtime args, so the shrunken
-    // count made `sameClasses(cs, os)` index past `os` → AIOOBE in fromCache.
-    let target_desc = mh_type_descriptor(ctx, target_mh)
-        .or_else(|| mh_read_desc(ctx, target_mh))
-        .unwrap_or_default();
+    // Build the GUARD adapter's descriptor from the target's EFFECTIVE
+    // PARAMETERS but its RAW RETURN TYPE.
+    //
+    // Parameters: chain off the adapted MethodType (`mh_type_descriptor`) so the
+    // adapter has the correct ARITY — it reflects the receiver-prepend of a
+    // virtual/special target and any insertArguments/asCollector arity changes.
+    // The raw `MH_DESC` (`mh_read_desc`) omits the receiver for an unbound
+    // virtual target; using it dropped the receiver, so the GUARD adapter
+    // reported one FEWER parameter than the target. Groovy's
+    // `Selector.setGuards` reads `handle.type().parameterArray()` for the
+    // `SAME_CLASSES` collector count while building `classes[]` from the
+    // (longer) runtime args, so the shrunken count made `sameClasses(cs, os)`
+    // index past `os` → AIOOBE in fromCache.
+    //
+    // Return type: keep the target's RAW return type, NOT the effective one.
+    // CratonVM's `asType` is a passthrough that stamps the `type` field but
+    // leaves `MH_DESC` carrying the LEAF method's real (possibly primitive or
+    // void) return type. `auto_box_return` keys off that descriptor at the
+    // signature-polymorphic invoke boundary to box a primitive return
+    // (`Z`→Boolean, …) or map void→null — boxing the real JDK's `asType(…→
+    // Object)` adapter would otherwise do. Taking the EFFECTIVE return type here
+    // erased it to `Object` (`L`), which (a) dropped the `Z`→Boolean boxing so a
+    // Groovy `version.endsWith("-SNAPSHOT")` came back null/false, and (b) turned
+    // a void leaf's `Ok(None)` into an operand-stack underflow in fromCache.
+    let eff = mh_type_descriptor(ctx, target_mh).unwrap_or_default();
+    let raw = mh_read_desc(ctx, target_mh).unwrap_or_default();
+    let target_desc = match (split_descriptor_params(&eff), split_descriptor_params(&raw)) {
+        (Some((params, _eff_ret)), Some((_, raw_ret))) => {
+            let mut d = String::with_capacity(eff.len());
+            d.push('(');
+            for p in &params {
+                d.push_str(p);
+            }
+            d.push(')');
+            d.push_str(&raw_ret);
+            d
+        }
+        // Fall back to whichever descriptor parsed (effective preferred for arity).
+        _ => {
+            if !eff.is_empty() {
+                eff
+            } else {
+                raw
+            }
+        }
+    };
 
     // Create a wrapper synthetic to hold (test, target, fallback)
     let wrapper = alloc_concurrent_synthetic(ctx, "__mh_guard_wrapper__", 3);
