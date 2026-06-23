@@ -111,9 +111,11 @@ pub fn register_multicast_socket_overrides(r: &mut NativeMethodRegistry) {
         };
         let port = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
         let bind_addr = format!("0.0.0.0:{port}");
+        // MulticastSocket sets SO_REUSEADDR before bind (JDK semantics) so
+        // multiple receivers / repeated bind cycles can share the group port.
         let fd_id =
             ctx.fd_table()
-                .open_udp(Some(&bind_addr))
+                .open_udp_reuse(Some(&bind_addr))
                 .map_err(|e| RuntimeError::IOException {
                     message: format!("MulticastSocket bind failed: {e}"),
                 })?;
@@ -145,7 +147,7 @@ pub fn register_multicast_socket_overrides(r: &mut NativeMethodRegistry) {
         };
         let fd_id =
             ctx.fd_table()
-                .open_udp(Some("0.0.0.0:0"))
+                .open_udp_reuse(Some("0.0.0.0:0"))
                 .map_err(|e| RuntimeError::IOException {
                     message: format!("MulticastSocket bind failed: {e}"),
                 })?;
@@ -192,7 +194,309 @@ pub fn register_multicast_socket_overrides(r: &mut NativeMethodRegistry) {
         }
         Ok(None)
     });
+
+    // --- DatagramSocket-surface methods that route through the real-JDK
+    // `delegate` (JDK 14+ rewrote DatagramSocket/MulticastSocket as thin
+    // wrappers over a lazily-created `DatagramSocketImpl` delegate). Our socket
+    // is fd_table-backed and never populates that delegate, so the inherited
+    // bytecode throws `InternalError("Should not get here")`. These natives are
+    // force-selected over the bytecode (see
+    // `interpreter.rs::force_native_over_real_jdk_bytecode`) and operate on the
+    // 5-field layout (port/closed/timeout/fd/ttl). DatagramPacket fields are
+    // read/written through the real accessors (getData/getLength/…), which work
+    // on the real-JDK packet regardless of its private field layout.
+
+    // setOption(SocketOption, Object) -> DatagramSocket. Apply the options we
+    // model best-effort; accept the rest as a no-op. Returns `this`.
+    r.register(
+        ms,
+        "setOption",
+        "(Ljava/net/SocketOption;Ljava/lang/Object;)Ljava/net/DatagramSocket;",
+        |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(None),
+            };
+            let fd = ctx.get_field(this, 3).as_int().unwrap_or(-1);
+            let opt_name = match args.get(1) {
+                Some(Value::Object(Some(o))) => {
+                    match ctx.invoke_virtual(*o, "name", "()Ljava/lang/String;", &[]) {
+                        Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s).unwrap_or_default(),
+                        _ => String::new(),
+                    }
+                }
+                _ => String::new(),
+            };
+            if fd >= 0 {
+                // Integer/Boolean both box their scalar at field 0 (real-JDK
+                // `value`); read it directly to avoid a second upcall.
+                let ival = match args.get(2) {
+                    Some(Value::Object(Some(b))) => ctx.get_field(*b, 0).as_int(),
+                    Some(Value::Int(n)) => Some(*n),
+                    _ => None,
+                };
+                match opt_name.as_str() {
+                    "SO_REUSEADDR" => {
+                        let _ = ctx
+                            .fd_table()
+                            .udp_set_reuse_address(fd as u32, ival.unwrap_or(0) != 0);
+                    }
+                    "SO_SNDBUF" => {
+                        if let Some(n) = ival {
+                            let _ = ctx
+                                .fd_table()
+                                .udp_set_send_buffer_size(fd as u32, n.max(0) as usize);
+                        }
+                    }
+                    "SO_RCVBUF" => {
+                        if let Some(n) = ival {
+                            let _ = ctx
+                                .fd_table()
+                                .udp_set_recv_buffer_size(fd as u32, n.max(0) as usize);
+                        }
+                    }
+                    "IP_MULTICAST_TTL" => {
+                        if let Some(n) = ival {
+                            let _ = ctx.fd_table().udp_set_ttl(fd as u32, n.max(0) as u32);
+                        }
+                    }
+                    // IP_MULTICAST_LOOP / IP_MULTICAST_IF / IP_TOS / SO_BROADCAST / …: no-op.
+                    _ => {}
+                }
+            }
+            Ok(Some(Value::Object(Some(this))))
+        },
+    );
+    r.register(
+        ms,
+        "getOption",
+        "(Ljava/net/SocketOption;)Ljava/lang/Object;",
+        |_ctx, _args| Ok(Some(Value::Object(None))),
+    );
+
+    // setSoTimeout / setTimeToLive — store on the object and apply to the fd.
+    r.register(ms, "setSoTimeout", "(I)V", |ctx, args| {
+        let this = match args.first() {
+            Some(Value::Object(Some(o))) => *o,
+            _ => return Ok(None),
+        };
+        let t = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
+        ctx.set_field(this, 2, Value::Int(t));
+        let fd = ctx.get_field(this, 3).as_int().unwrap_or(-1);
+        if fd >= 0 {
+            let to = if t > 0 {
+                Some(Duration::from_millis(t as u64))
+            } else {
+                None
+            };
+            let _ = ctx.fd_table().udp_set_read_timeout(fd as u32, to);
+        }
+        Ok(None)
+    });
+    r.register(ms, "getSoTimeout", "()I", |ctx, args| match args.first() {
+        Some(Value::Object(Some(o))) => Ok(Some(ctx.get_field(*o, 2))),
+        _ => Ok(Some(Value::Int(0))),
+    });
+    r.register(ms, "setTimeToLive", "(I)V", |ctx, args| {
+        let this = match args.first() {
+            Some(Value::Object(Some(o))) => *o,
+            _ => return Ok(None),
+        };
+        let ttl = args.get(1).and_then(|v| v.as_int()).unwrap_or(1);
+        let fd = ctx.get_field(this, 3).as_int().unwrap_or(-1);
+        if fd >= 0 {
+            let _ = ctx.fd_table().udp_set_ttl(fd as u32, ttl.max(0) as u32);
+        }
+        if ctx.object_num_fields(this) >= 5 {
+            ctx.set_field(this, 4, Value::Int(ttl));
+        }
+        Ok(None)
+    });
+
+    // joinGroup / leaveGroup (modern SocketAddress overload). Best-effort: a
+    // host without a multicast-capable interface must not fail channel startup
+    // (Tribes re-throws join failures), so swallow errors here.
+    r.register(
+        ms,
+        "joinGroup",
+        "(Ljava/net/SocketAddress;Ljava/net/NetworkInterface;)V",
+        |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(None),
+            };
+            let fd = ctx.get_field(this, 3).as_int().unwrap_or(-1);
+            if fd >= 0 {
+                if let Some(Value::Object(Some(sa))) = args.get(1).copied() {
+                    if let Some(ip) = ms_sockaddr_ipv4(ctx, sa) {
+                        let _ = ctx.fd_table().udp_join_multicast_v4(
+                            fd as u32,
+                            &ip,
+                            &std::net::Ipv4Addr::UNSPECIFIED,
+                        );
+                    }
+                }
+            }
+            Ok(None)
+        },
+    );
+    r.register(
+        ms,
+        "leaveGroup",
+        "(Ljava/net/SocketAddress;Ljava/net/NetworkInterface;)V",
+        |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(None),
+            };
+            let fd = ctx.get_field(this, 3).as_int().unwrap_or(-1);
+            if fd >= 0 {
+                if let Some(Value::Object(Some(sa))) = args.get(1).copied() {
+                    if let Some(ip) = ms_sockaddr_ipv4(ctx, sa) {
+                        let _ = ctx.fd_table().udp_leave_multicast_v4(
+                            fd as u32,
+                            &ip,
+                            &std::net::Ipv4Addr::UNSPECIFIED,
+                        );
+                    }
+                }
+            }
+            Ok(None)
+        },
+    );
+
+    // send(DatagramPacket) — best-effort UDP send. Reads the packet through the
+    // real accessors. Errors are swallowed so a routine multicast-send failure
+    // does not abort channel startup (`McastServiceImpl.start` sends one packet
+    // inline before spawning the sender thread).
+    r.register(ms, "send", "(Ljava/net/DatagramPacket;)V", |ctx, args| {
+        let this = match args.first() {
+            Some(Value::Object(Some(o))) => *o,
+            _ => return Ok(None),
+        };
+        let fd = ctx.get_field(this, 3).as_int().unwrap_or(-1);
+        if fd < 0 || ctx.get_field(this, 1).as_int().unwrap_or(0) != 0 {
+            return Err(RuntimeError::IOException {
+                message: "Socket closed".into(),
+            }
+            .into());
+        }
+        let pkt = match args.get(1) {
+            Some(Value::Object(Some(p))) => *p,
+            _ => return Ok(None),
+        };
+        let arr = ms_iv_obj(ctx, pkt, "getData", "()[B");
+        let addr = ms_iv_obj(ctx, pkt, "getAddress", "()Ljava/net/InetAddress;");
+        let off = ms_iv_i32(ctx, pkt, "getOffset", "()I").unwrap_or(0).max(0) as usize;
+        let len = ms_iv_i32(ctx, pkt, "getLength", "()I").unwrap_or(0).max(0) as usize;
+        let port = ms_iv_i32(ctx, pkt, "getPort", "()I").unwrap_or(0);
+        if let (Some(arr), Some(ia)) = (arr, addr) {
+            if let Some(host) = ms_inet_host(ctx, ia) {
+                let alen = ctx.array_length(arr);
+                let mut buf = vec![0u8; len];
+                for i in 0..len {
+                    if off + i < alen {
+                        buf[i] = ctx.get_array_element(arr, off + i).as_int().unwrap_or(0) as u8;
+                    }
+                }
+                let _ = ctx.fd_table().udp_send(fd as u32, &buf, &format!("{host}:{port}"));
+            }
+        }
+        Ok(None)
+    });
+
+    // receive(DatagramPacket) — fills the packet's backing buffer + length.
+    // A read timeout surfaces as java.net.SocketTimeoutException so callers that
+    // loop on it (Tribes' McastServiceImpl.receive) continue cleanly; all other
+    // recv errors are likewise reported as timeouts to keep the daemon loop
+    // alive rather than tearing it down.
+    r.register(ms, "receive", "(Ljava/net/DatagramPacket;)V", |ctx, args| {
+        let this = match args.first() {
+            Some(Value::Object(Some(o))) => *o,
+            _ => return Ok(None),
+        };
+        let fd = ctx.get_field(this, 3).as_int().unwrap_or(-1);
+        if fd < 0 || ctx.get_field(this, 1).as_int().unwrap_or(0) != 0 {
+            return Err(RuntimeError::IOException {
+                message: "Socket closed".into(),
+            }
+            .into());
+        }
+        let timeout = ctx.get_field(this, 2).as_int().unwrap_or(0);
+        if timeout > 0 {
+            let _ = ctx
+                .fd_table()
+                .udp_set_read_timeout(fd as u32, Some(Duration::from_millis(timeout as u64)));
+        }
+        let pkt = match args.get(1) {
+            Some(Value::Object(Some(p))) => *p,
+            _ => return Ok(None),
+        };
+        let arr = match ms_iv_obj(ctx, pkt, "getData", "()[B") {
+            Some(a) => a,
+            None => {
+                return Err(RuntimeError::IOException {
+                    message: "DatagramPacket has no buffer".into(),
+                }
+                .into())
+            }
+        };
+        let cap = ctx.array_length(arr);
+        let mut buf = vec![0u8; cap.max(1)];
+        match ctx.fd_table().udp_recv(fd as u32, &mut buf) {
+            Ok((n, src)) => {
+                let copy = n.min(cap);
+                for i in 0..copy {
+                    ctx.set_array_element(arr, i, Value::Int(buf[i] as i8 as i32));
+                }
+                let _ = ctx.invoke_virtual(pkt, "setLength", "(I)V", &[Value::Int(copy as i32)]);
+                if let Some(c) = src.rfind(':') {
+                    if let Ok(p) = src[c + 1..].parse::<i32>() {
+                        let _ = ctx.invoke_virtual(pkt, "setPort", "(I)V", &[Value::Int(p)]);
+                    }
+                }
+                Ok(None)
+            }
+            Err(e) => Err(RuntimeError::IOException {
+                message: format!("SocketTimeoutException: Receive timed out: {e}"),
+            }
+            .into()),
+        }
+    });
+
     r.set_category(__prev_cat);
+}
+
+/// Invoke a no-arg `int`-returning method on `recv`, returning `None` on any
+/// dispatch failure. Used to read DatagramPacket scalar accessors.
+fn ms_iv_i32(ctx: &mut dyn NativeContext, recv: ObjectRef, m: &str, d: &str) -> Option<i32> {
+    match ctx.invoke_virtual(recv, m, d, &[]) {
+        Ok(Some(v)) => v.as_int(),
+        _ => None,
+    }
+}
+
+/// Invoke a no-arg reference-returning method on `recv`, returning the object.
+fn ms_iv_obj(ctx: &mut dyn NativeContext, recv: ObjectRef, m: &str, d: &str) -> Option<ObjectRef> {
+    match ctx.invoke_virtual(recv, m, d, &[]) {
+        Ok(Some(Value::Object(Some(o)))) => Some(o),
+        _ => None,
+    }
+}
+
+/// Read an InetAddress's dotted-quad/host via `getHostAddress()`.
+fn ms_inet_host(ctx: &mut dyn NativeContext, ia: ObjectRef) -> Option<String> {
+    match ctx.invoke_virtual(ia, "getHostAddress", "()Ljava/lang/String;", &[]) {
+        Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s),
+        _ => None,
+    }
+}
+
+/// Extract the IPv4 group address from a SocketAddress (InetSocketAddress) via
+/// `getAddress().getHostAddress()`, parsed as an `Ipv4Addr`.
+fn ms_sockaddr_ipv4(ctx: &mut dyn NativeContext, sa: ObjectRef) -> Option<std::net::Ipv4Addr> {
+    let ia = ms_iv_obj(ctx, sa, "getAddress", "()Ljava/net/InetAddress;")?;
+    ms_inet_host(ctx, ia)?.parse().ok()
 }
 
 // ---------------------------------------------------------------------------

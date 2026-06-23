@@ -16678,6 +16678,45 @@ fn force_native_over_real_jdk_bytecode(
     {
         return true;
     }
+    // java.net.DatagramSocket / MulticastSocket — real-JDK delegate architecture.
+    // Since JDK 14 these classes are thin wrappers that forward every operation
+    // to an internal `delegate` (a `DatagramSocketImpl`-backed socket) created
+    // lazily; the real bytecode for setOption/getOption/joinGroup/send/receive/…
+    // calls `delegate()`, which throws `InternalError("Should not get here")`
+    // when the delegate was never wired up. CratonVM models these sockets
+    // natively (fd_table-backed, fields port/closed/timeout/fd[/ttl]) and never
+    // populates the JDK `delegate`, so the concrete inherited bytecode (e.g.
+    // `DatagramSocket.setOption`) always fails. Force our natives to win for the
+    // operation surface Tomcat Tribes' `McastServiceImpl` drives (its `socket`
+    // field is statically typed `MulticastSocket`, so the CP class is
+    // MulticastSocket even for DatagramSocket-declared methods; both classes are
+    // listed to be robust to either resolution). Constructors already dispatch
+    // to natives via invokespecial and need no entry here.
+    if matches!(
+        class_name,
+        "java/net/MulticastSocket" | "java/net/DatagramSocket"
+    ) && matches!(
+        method_name,
+        "setOption"
+            | "getOption"
+            | "joinGroup"
+            | "leaveGroup"
+            | "setSoTimeout"
+            | "getSoTimeout"
+            | "setTimeToLive"
+            | "getTimeToLive"
+            | "setReuseAddress"
+            | "getReuseAddress"
+            | "setBroadcast"
+            | "getBroadcast"
+            | "send"
+            | "receive"
+            | "close"
+            | "isClosed"
+            | "getLocalPort"
+    ) {
+        return true;
+    }
     matches!(
         (class_name, method_name, method_descriptor),
         ("java/lang/ClassLoader", "setDefaultAssertionStatus", "(Z)V")

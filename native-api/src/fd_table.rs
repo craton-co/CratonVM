@@ -927,6 +927,47 @@ impl FileDescriptorTable {
         Ok(fd)
     }
 
+    /// Open a UDP socket with `SO_REUSEADDR` set **before** bind. Returns the fd_id.
+    ///
+    /// `java.net.MulticastSocket` enables `SO_REUSEADDR` prior to binding so that
+    /// multiple receivers (and repeated bind/close cycles within one process)
+    /// can share a multicast group port. Plain `open_udp` binds via
+    /// `std::net::UdpSocket::bind`, which does not set the option — on Windows
+    /// that surfaces as `WSAEADDRINUSE` (os error 10048) when a recently-closed
+    /// or concurrently-held port is re-bound. This variant mirrors the JDK
+    /// semantics using `socket2` (create → set_reuse_address → bind).
+    ///
+    /// # Security
+    ///
+    /// Same `bind_addr` caveat as [`open_udp`]: the address is passed verbatim
+    /// to the OS with no sandbox/SSRF check here.
+    pub fn open_udp_reuse(&self, bind_addr: Option<&str>) -> Result<FdId, io::Error> {
+        use std::net::ToSocketAddrs;
+        let fd = self.next_fd.fetch_add(1, Ordering::Relaxed);
+        if fd >= u32::MAX - 16 {
+            return Err(io::Error::other("file descriptor limit exceeded"));
+        }
+        let addr_str = bind_addr.unwrap_or("0.0.0.0:0");
+        let sock_addr = addr_str
+            .to_socket_addrs()?
+            .next()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no addr resolved"))?;
+        let domain = if sock_addr.is_ipv4() {
+            socket2::Domain::IPV4
+        } else {
+            socket2::Domain::IPV6
+        };
+        let socket =
+            socket2::Socket::new(domain, socket2::Type::DGRAM, Some(socket2::Protocol::UDP))?;
+        socket.set_reuse_address(true)?;
+        socket.bind(&sock_addr.into())?;
+        let udp: std::net::UdpSocket = socket.into();
+        self.entries
+            .write()
+            .insert(fd, Arc::new(FileEntry::UdpSocket(Mutex::new(udp))));
+        Ok(fd)
+    }
+
     /// Send UDP datagram to a target address. Returns bytes sent.
     pub fn udp_send(&self, fd: FdId, data: &[u8], target: &str) -> Result<usize, io::Error> {
         let entry = self
@@ -1553,6 +1594,34 @@ impl FileDescriptorTable {
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "bad fd for udp"))?;
         match &*entry {
             FileEntry::UdpSocket(s) => s.lock().set_read_timeout(timeout),
+            _ => Err(io::Error::new(io::ErrorKind::NotFound, "bad fd for udp")),
+        }
+    }
+
+    /// Set SO_SNDBUF on a UDP socket.
+    pub fn udp_set_send_buffer_size(&self, fd: FdId, size: usize) -> Result<(), io::Error> {
+        let entry = self
+            .get_entry(fd)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "bad fd for udp"))?;
+        match &*entry {
+            FileEntry::UdpSocket(s) => {
+                let sock = s.lock();
+                socket2::SockRef::from(&*sock).set_send_buffer_size(size)
+            }
+            _ => Err(io::Error::new(io::ErrorKind::NotFound, "bad fd for udp")),
+        }
+    }
+
+    /// Set SO_RCVBUF on a UDP socket.
+    pub fn udp_set_recv_buffer_size(&self, fd: FdId, size: usize) -> Result<(), io::Error> {
+        let entry = self
+            .get_entry(fd)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "bad fd for udp"))?;
+        match &*entry {
+            FileEntry::UdpSocket(s) => {
+                let sock = s.lock();
+                socket2::SockRef::from(&*sock).set_recv_buffer_size(size)
+            }
             _ => Err(io::Error::new(io::ErrorKind::NotFound, "bad fd for udp")),
         }
     }
