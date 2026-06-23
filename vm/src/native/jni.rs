@@ -454,6 +454,13 @@ pub fn attach_foreign_thread(shared: &SharedVm, daemon: bool, name: Option<&str>
     shared
         .thread_registry
         .set_gc_block_state(tid, jt.gc_block_state.clone());
+    // BUG-03 — publish this foreign thread's TLAB address (the box is
+    // address-stable) so the cross-thread STW JIT root scan can recover its
+    // un-retired reserved tail if forcibly stopped mid-JIT. Cleared in
+    // `detach_foreign_thread` before the box is dropped.
+    shared
+        .thread_registry
+        .set_tlab_addr(tid, &jt.tlab as *const cratonvm_gc::Tlab as usize);
 
     // Park the box in TLS so it outlives this call and stays address-stable; the
     // raw pointer is the heap allocation address, unchanged by moving the Box.
@@ -478,6 +485,9 @@ pub fn detach_foreign_thread(shared: &SharedVm) -> bool {
         None => return false,
     };
     let tid = jt.thread_id;
+    // BUG-03 — stop publishing this thread's TLAB address before the box is
+    // dropped, so the collector can never read a dangling pointer.
+    shared.thread_registry.clear_tlab_addr(tid);
     // Drop out of `alive_count` / STW `expected` before reclaiming the TLAB so a
     // subsequent `request_stw` no longer waits for this thread.
     shared.thread_registry.mark_dead(tid);

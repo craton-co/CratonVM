@@ -474,6 +474,18 @@ pub struct GenerationalHeap {
     /// `AtomicBool` so the flag can be read/written without going
     /// through the per-arena mutex.
     force_promote_all: std::sync::atomic::AtomicBool,
+    /// BUG-03 — absolute `(cursor, end)` reserved-tail regions of TLABs
+    /// belonging to peer threads that the cross-thread STW JIT root scan
+    /// forcibly stopped while they were executing JIT code. Such a peer never
+    /// reached a safepoint to `retire` (tail-fill) its TLAB, so its un-filled
+    /// tail would desync the non-moving sweep's linear heap walk. The
+    /// collector publishes these regions here (under STW, before
+    /// `collect_garbage`) and clears them afterward; the non-moving young
+    /// sweep treats them like already-free blocks — neither walked as objects
+    /// nor reclaimed into the free list — so the peer's reservation survives
+    /// the collection intact. Empty on every normal collection (byte-identical
+    /// default path).
+    jit_tlab_skip_regions: Mutex<Vec<(usize, usize)>>,
 }
 
 // SAFETY: Same reasoning as Heap — raw pointers are to internally owned
@@ -547,6 +559,7 @@ impl GenerationalHeap {
             numa_num_nodes,
             stats: HeapStats::default(),
             force_promote_all: std::sync::atomic::AtomicBool::new(false),
+            jit_tlab_skip_regions: Mutex::new(Vec::new()),
         };
         // Publish the initial region bounds so the lock-free
         // `is_object_address` containment check is correct from the first
@@ -1277,6 +1290,47 @@ impl GenerationalHeap {
     /// as a *root* (which only inflates retention; it cannot cause incorrect
     /// behavior). False negatives (missing a real object) would be wrong, so
     /// we err on the inclusive side.
+    /// BUG-03 — publish the reserved-tail regions of forcibly-stopped in-JIT
+    /// peers' TLABs so the next non-moving young sweep skips them (see
+    /// [`Self::jit_tlab_skip_regions`]). Replaces any previously-set list.
+    /// Pass an empty slice (or call [`Self::clear_jit_tlab_skip_regions`]) to
+    /// reset. Must be set under STW, immediately before the collection, and
+    /// cleared immediately after.
+    pub fn set_jit_tlab_skip_regions(&self, regions: &[(usize, usize)]) {
+        let mut g = self.jit_tlab_skip_regions.lock();
+        g.clear();
+        g.extend_from_slice(regions);
+    }
+
+    /// BUG-03 — clear the JIT TLAB skip regions (see
+    /// [`Self::set_jit_tlab_skip_regions`]).
+    pub fn clear_jit_tlab_skip_regions(&self) {
+        self.jit_tlab_skip_regions.lock().clear();
+    }
+
+    /// BUG-03 — the published JIT TLAB skip regions as young-from byte
+    /// offsets `(offset, size)`, filtered to those that fall wholly inside the
+    /// given `[from_base, from_end)` window and sorted ascending. Empty on the
+    /// normal collection path.
+    fn jit_tlab_skip_offsets(&self, from_base: usize, from_end: usize) -> Vec<(usize, usize)> {
+        let g = self.jit_tlab_skip_regions.lock();
+        if g.is_empty() {
+            return Vec::new();
+        }
+        let mut v: Vec<(usize, usize)> = g
+            .iter()
+            .filter_map(|&(c, e)| {
+                if c >= from_base && e <= from_end && e > c && (c & 0x7) == 0 {
+                    Some((c - from_base, e - c))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        v.sort_by_key(|&(off, _)| off);
+        v
+    }
+
     pub fn is_object_address(&self, addr: usize) -> Option<ObjectRef> {
         // Reject obvious garbage.
         if addr == 0 {
@@ -3564,6 +3618,24 @@ impl GenerationalHeap {
         let from_base = young_from.base_ptr() as usize;
         let from_end = from_base + young_from.used();
 
+        // BUG-03 — reserved tails of forcibly-stopped in-JIT peers' TLABs,
+        // as young-from offsets. Empty on the normal path. Every linear
+        // from-space walk below merges these into its free-block skip list so
+        // an un-retired tail is neither walked as objects nor reclaimed.
+        let jit_skips = self.jit_tlab_skip_offsets(from_base, from_end);
+        // Merge a sorted free-block list with `jit_skips` (both ascending,
+        // disjoint — a TLAB tail is reserved, never on the free list). Cheap;
+        // the skip list has at most one entry per live thread.
+        let merge_skips = |free: Vec<(usize, usize)>| -> Vec<(usize, usize)> {
+            if jit_skips.is_empty() {
+                return free;
+            }
+            let mut v = free;
+            v.extend_from_slice(&jit_skips);
+            v.sort_by_key(|&(off, _)| off);
+            v
+        };
+
         // Helper: is `addr` the start of a young from-space object?
         let in_young =
             |addr: usize| -> bool { addr >= from_base && addr < from_end && (addr & 0x7) == 0 };
@@ -3765,7 +3837,7 @@ impl GenerationalHeap {
             // block, and evacuation only allocates into `old_gen`. So this
             // single snapshot is valid for every pass below; behavior is
             // identical, we just skip the redundant collect+sort each pass.
-            let sweep_free_blocks = young_from.free_blocks_sorted();
+            let sweep_free_blocks = merge_skips(young_from.free_blocks_sorted());
             let sweep_used = young_from.used();
 
             // (1) Pin set: every root / finalizer value that lands in young.
@@ -4301,7 +4373,7 @@ impl GenerationalHeap {
         // object is dead: zero it and return its span to the free list.
         // Every marked object is a survivor: clear the mark and leave it
         // exactly where it is.
-        let existing_free = young_from.free_blocks_sorted();
+        let existing_free = merge_skips(young_from.free_blocks_sorted());
         // A2 diag (CRATONVM_DBG_A2): does the free list ALREADY self-overlap at
         // sweep start? `existing_free` is built only from prior sweeps' coalesced
         // output + the alloc/split bookkeeping between sweeps. A self-overlap here

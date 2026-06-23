@@ -357,6 +357,65 @@ fn mtroots_selfcheck(thread: &JvmThread, heap: &crate::memory::VmHeap, location:
     }
 }
 
+/// BUG-03 — drive the cross-thread STW JIT root scan for a multi-threaded GC
+/// initiator.
+///
+/// A thread spinning in JIT-compiled code never cooperatively reaches an
+/// interpreter safepoint, so `wait_for_all` would either hang on it or (when
+/// it slips through) let the collector mark off its stale `root_snapshot` and
+/// reclaim a still-live object → SIGSEGV. This forcibly stops every in-JIT
+/// peer at the OS level, conservatively scans its registers + stack into
+/// `xt_roots` (pinned, since the frozen peers keep the sweep non-moving), and
+/// excludes them from the barrier so the remaining cooperative mutators can
+/// be waited for normally. The returned [`TakenOver`] must be `resume`d once
+/// the collection has completed.
+///
+/// When the feature is disabled (`CRATONVM_XT_JIT_ROOT_SCAN` unset) this is
+/// byte-for-byte the legacy `wait_for_all()` — zero behaviour change.
+fn stw_take_over_and_wait(
+    shared: &SharedVm,
+    xt_roots: &mut Vec<ObjectRef>,
+) -> crate::jit::xt_root_scan::TakenOver {
+    use crate::jit::xt_root_scan as xt;
+    // The forcible take-over is only sound on a heap whose young collection is
+    // the generational non-moving sweep that consumes the JIT TLAB skip
+    // regions (so a frozen peer's un-retired TLAB tail is not walked/reclaimed).
+    if !xt::enabled() || !shared.heap.supports_jit_tlab_skip() {
+        shared.gc_barrier.wait_for_all();
+        return xt::TakenOver::default();
+    }
+    let mut taken = xt::TakenOver::default();
+    // Take over every currently-in-JIT peer, re-scanning until a pass finds no
+    // new one (a peer may enter JIT between passes). Each taken peer is excluded
+    // from the barrier's `expected`. Then do ONE blocking wait for the remaining
+    // cooperative mutators. A peer we could not classify as in-JIT (e.g. its
+    // compiled code range is not registered) is simply waited for cooperatively,
+    // exactly as on the default path — no worse than baseline, and no spin.
+    // Bounded round cap as a backstop against pathological churn.
+    const MAX_ROUNDS: u32 = 64;
+    let mut rounds = 0u32;
+    loop {
+        let newly = xt::take_over_pass(&mut taken, &|a| shared.heap.is_object_address(a), xt_roots);
+        if newly > 0 {
+            shared.gc_barrier.reduce_expected(newly as u32);
+        }
+        rounds += 1;
+        if newly == 0 || rounds >= MAX_ROUNDS {
+            break;
+        }
+    }
+    shared.gc_barrier.wait_for_all();
+    // Publish the reserved TLAB tails of the now-frozen in-JIT peers so the
+    // non-moving young sweep skips them (their owners never reached a safepoint
+    // to retire/tail-fill, so the tails would otherwise desync the heap walk).
+    // Cleared by the caller after the collection completes.
+    if taken.count() > 0 {
+        let regions = shared.thread_registry.collect_reserved_tlab_tails();
+        shared.heap.set_jit_tlab_skip_regions(&regions);
+    }
+    taken
+}
+
 fn maybe_gc(shared: &SharedVm, thread: &mut JvmThread) {
     // First, check if another thread requested STW — if so, participate
     safepoint_check(shared, thread);
@@ -551,16 +610,22 @@ fn maybe_gc(shared: &SharedVm, thread: &mut JvmThread) {
         } else {
             // Multi-threaded path: coordinate via GC barrier
             if shared.gc_barrier.request_stw(thread.thread_id, alive_count) {
-                // We are the GC initiator — wait for all other threads
-                shared.gc_barrier.wait_for_all();
+                // We are the GC initiator. BUG-03 — forcibly stop in-JIT
+                // peers and conservatively scan them before waiting for the
+                // cooperative mutators.
+                let mut xt_roots: Vec<ObjectRef> = Vec::new();
+                let taken = stw_take_over_and_wait(shared, &mut xt_roots);
 
                 // Collect roots: current thread + all snapshots + shared state
                 let mut roots = collect_roots(shared, thread);
                 let snapshot_roots = shared.thread_registry.collect_all_root_snapshots();
                 roots.extend(snapshot_roots);
+                // BUG-03 — conservative roots from forcibly-stopped in-JIT peers.
+                roots.extend(xt_roots);
 
                 // STW invariant: `gc_barrier.wait_for_all()` returned, so
-                // every mutator has parked at its safepoint poll.
+                // every mutator has parked at its safepoint poll OR (BUG-03)
+                // been forcibly stopped in JIT and conservatively scanned.
                 let stw = cratonvm_gc::collector::StopTheWorldToken::new();
                 let result = shared
                     .heap
@@ -581,6 +646,11 @@ fn maybe_gc(shared: &SharedVm, thread: &mut JvmThread) {
 
                 // Signal all threads with the pointer map
                 shared.gc_barrier.complete_gc(result.pointer_map);
+                // BUG-03 — resume the forcibly-stopped in-JIT peers now that
+                // the heap is consistent again (non-moving sweep → their
+                // pointers are unchanged) and drop the TLAB skip regions.
+                shared.heap.clear_jit_tlab_skip_regions();
+                crate::jit::xt_root_scan::resume(taken);
 
                 // T19.3.G1 — bump the cycle counter (multi-threaded
                 // path, fires only on the GC initiator).
@@ -648,12 +718,16 @@ fn maybe_gc_forced(shared: &SharedVm, thread: &mut JvmThread) {
         note_gc_productivity(shared, before_live);
     } else {
         if shared.gc_barrier.request_stw(thread.thread_id, alive_count) {
-            shared.gc_barrier.wait_for_all();
+            // BUG-03 — forcibly stop + conservatively scan in-JIT peers.
+            let mut xt_roots: Vec<ObjectRef> = Vec::new();
+            let taken = stw_take_over_and_wait(shared, &mut xt_roots);
             let mut roots = collect_roots(shared, thread);
             let snapshot_roots = shared.thread_registry.collect_all_root_snapshots();
             roots.extend(snapshot_roots);
+            roots.extend(xt_roots); // BUG-03 cross-thread JIT conservative roots
             // STW invariant: `wait_for_all()` returned — every mutator
-            // has parked at its safepoint poll.
+            // has parked at its safepoint poll (or, BUG-03, been forcibly
+            // stopped in JIT and conservatively scanned).
             let stw = cratonvm_gc::collector::StopTheWorldToken::new();
             let result = shared
                 .heap
@@ -668,6 +742,8 @@ fn maybe_gc_forced(shared: &SharedVm, thread: &mut JvmThread) {
             // ec_watch holders stale and the watchpoint read moved-away memory.
             crate::runtime::ec_watch::remap(&result.pointer_map);
             shared.gc_barrier.complete_gc(result.pointer_map);
+            shared.heap.clear_jit_tlab_skip_regions(); // BUG-03
+            crate::jit::xt_root_scan::resume(taken); // BUG-03 resume frozen peers
             // T19.3.G1 — count forced cycles (multi-threaded initiator).
             shared
                 .gc_cycle_count
@@ -790,12 +866,16 @@ pub fn force_gc_from_native(shared: &SharedVm, thread: &mut JvmThread) {
         }
     } else {
         if shared.gc_barrier.request_stw(thread.thread_id, alive_count) {
-            shared.gc_barrier.wait_for_all();
+            // BUG-03 — forcibly stop + conservatively scan in-JIT peers.
+            let mut xt_roots: Vec<ObjectRef> = Vec::new();
+            let taken = stw_take_over_and_wait(shared, &mut xt_roots);
             let mut roots = collect_roots(shared, thread);
             let snapshot_roots = shared.thread_registry.collect_all_root_snapshots();
             roots.extend(snapshot_roots);
+            roots.extend(xt_roots); // BUG-03 cross-thread JIT conservative roots
             // STW invariant: `wait_for_all()` returned — every mutator
-            // has parked at its safepoint poll.
+            // has parked at its safepoint poll (or, BUG-03, been forcibly
+            // stopped in JIT and conservatively scanned).
             let stw = cratonvm_gc::collector::StopTheWorldToken::new();
             let (result, dead_finalizers) = shared.heap.collect_garbage_with_finalizers(
                 &stw,
@@ -813,6 +893,8 @@ pub fn force_gc_from_native(shared: &SharedVm, thread: &mut JvmThread) {
                 shared.finalizer_thread.enqueue(*new_addr);
             }
             shared.gc_barrier.complete_gc(result.pointer_map);
+            shared.heap.clear_jit_tlab_skip_regions(); // BUG-03
+            crate::jit::xt_root_scan::resume(taken); // BUG-03 resume frozen peers
         } else {
             safepoint_check(shared, thread);
         }

@@ -249,6 +249,44 @@ impl GcBarrier {
         }
     }
 
+    /// BUG-03 — wait for all expected threads to arrive, but give up after
+    /// `dur`. Returns `true` if the barrier was satisfied (`arrived >=
+    /// expected`), `false` on timeout.
+    ///
+    /// Used by the cross-thread STW JIT root scan: the initiator forcibly
+    /// stops in-JIT peers (which never arrive cooperatively) and excludes
+    /// them via [`reduce_expected`], then loops on this bounded wait to pick
+    /// up any thread that entered JIT *after* a previous take-over pass.
+    pub fn wait_for_all_timeout(&self, dur: std::time::Duration) -> bool {
+        let mut inner = self.inner.lock();
+        if inner.arrived >= inner.expected {
+            return true;
+        }
+        // parking_lot's `wait_for` may wake spuriously; one bounded wait is
+        // enough because the caller loops. Re-check the predicate after waking.
+        let _ = self.all_arrived.wait_for(&mut inner, dur);
+        inner.arrived >= inner.expected
+    }
+
+    /// BUG-03 — remove `n` threads from the set the initiator is waiting for.
+    ///
+    /// Called when the initiator has taken over `n` in-JIT peers via OS
+    /// suspension (see [`crate::jit::xt_root_scan`]): those threads are now
+    /// frozen and conservatively scanned, so they will never arrive at the
+    /// barrier and must not be counted in `expected` — otherwise
+    /// `wait_for_all` would block on them forever. Saturates at zero and
+    /// re-fires `all_arrived` in case the reduced quota is already met.
+    pub fn reduce_expected(&self, n: u32) {
+        if n == 0 {
+            return;
+        }
+        let mut inner = self.inner.lock();
+        inner.expected = inner.expected.saturating_sub(n);
+        if inner.arrived >= inner.expected {
+            self.all_arrived.notify_all();
+        }
+    }
+
     /// Signal that GC is complete and threads can resume.
     /// Called by the GC initiator after running collection.
     ///

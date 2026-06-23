@@ -823,6 +823,39 @@ pub fn jit_code_range_count() -> usize {
     jit_code_ranges().lock().map(|v| v.len()).unwrap_or(0)
 }
 
+/// BUG-03 — whether the cross-thread STW JIT root scan is enabled (env
+/// `CRATONVM_XT_JIT_ROOT_SCAN`). Mirrors `cratonvm_vm::jit::xt_root_scan::
+/// enabled` (the jit crate cannot depend on the vm crate); kept in sync via
+/// the same env var. Cached on first read.
+pub fn xt_jit_root_scan_enabled() -> bool {
+    static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| {
+        matches!(
+            std::env::var("CRATONVM_XT_JIT_ROOT_SCAN").as_deref(),
+            Ok("1") | Ok("true") | Ok("on")
+        )
+    })
+}
+
+/// Snapshot the registered JIT code ranges as `(entry, end)` pairs.
+///
+/// BUG-03 — the cross-thread STW JIT root scan must classify each *suspended*
+/// peer's `Rip` as in-JIT-or-not WITHOUT taking the `JIT_CODE_RANGES` lock
+/// while a peer is frozen: a peer suspended mid-`register_jit_code_range`
+/// holds that very lock, so a `lookup_jit_code_range` call on it would
+/// deadlock the collector. The collector instead takes this snapshot ONCE
+/// (no thread suspended yet), then classifies every frozen peer against the
+/// returned copy with a lock-free range check. The set of ranges only grows
+/// during compilation / shrinks on eviction; a momentarily-stale snapshot can
+/// only mis-classify a brand-new range as "not JIT" (handled conservatively
+/// by the snapshot-based mitigation), never the reverse.
+pub fn jit_code_ranges_snapshot() -> Vec<(usize, usize)> {
+    jit_code_ranges()
+        .lock()
+        .map(|v| v.iter().map(|&(e, end, _)| (e, end)).collect())
+        .unwrap_or_default()
+}
+
 /// Resolve the `CompiledMethod` pointer whose code range contains `addr`, or
 /// `None`. Linear scan (method counts are modest; only hit at GC time on the
 /// gated precise path). Stage 5.
@@ -3869,10 +3902,13 @@ impl JitCache {
         };
         let arc = Arc::new(compiled);
         // Stage 5 — register this method's code range for the GC RBP-chain
-        // walker. Only when the precise gate is on (the registry is consulted
-        // solely by `remap_active_jit_frames`, which is inert otherwise), so
-        // the default path keeps zero bookkeeping overhead.
-        if crate::x64::precise_jit_maps_enabled() {
+        // walker. Enabled when the precise gate is on (the registry is consulted
+        // by `remap_active_jit_frames`) OR when the BUG-03 cross-thread STW JIT
+        // root scan is on (which classifies a forcibly-stopped peer's `Rip` as
+        // in-JIT-or-not by looking it up in this registry — an empty registry
+        // would make every peer look "not in JIT" and the scan a no-op). The
+        // default path keeps zero bookkeeping overhead.
+        if crate::x64::precise_jit_maps_enabled() || xt_jit_root_scan_enabled() {
             register_jit_code_range(
                 arc.entry_ptr() as usize,
                 arc.code_len(),
