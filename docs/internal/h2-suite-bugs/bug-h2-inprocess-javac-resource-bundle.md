@@ -1,7 +1,15 @@
 # H2 — in-process javac "compiler message file broken" (CREATE ALIAS/TRIGGER)
 
 ## Status
-**OPEN** — jdk.compiler module resource loading.
+**FIXED** (2026-06-23) — see
+[run-20260622/HIB-CV-27-javac-message-bundle-class-based-listresourcebundle.md](run-20260622/HIB-CV-27-javac-message-bundle-class-based-listresourcebundle.md).
+The hypothesis below was WRONG: JDK 25 ships these javac messages as compiled
+`ListResourceBundle` `.class` files (`com/sun/tools/javac/resources/compiler.class`),
+NOT `.properties`. CratonVM's `ResourceBundle.getBundle` native only loaded
+`.properties`, so javac got an empty bundle. Fix = load the real class-based
+`ListResourceBundle` in `locale_resources.rs`. Verified byte-identical to HotSpot
+(`error: illegal start of expression`, not "message file broken"). Residual:
+`ToolProvider.getSystemJavaCompiler()` returns null (separate module-layer gap).
 
 ## Severity
 **MEDIUM** — fails H2 tests that compile Java source for user functions/triggers.
