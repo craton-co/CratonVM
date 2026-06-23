@@ -23654,7 +23654,21 @@ pub fn compile_with_param_slots(
     // JIT frame cannot reproduce. Skipping this re-analysis (or running
     // it without descriptors) caused boxed values to come back as 0
     // (the `Integer.valueOf` / `String.toLowerCase` archetype).
-    let non_escaping_new: std::collections::HashSet<usize> = if non_escaping_new.is_empty() {
+    //
+    // SR-reachability fix (real-frame-deopt x64 backport, Phase B prerequisite):
+    // the precise re-analysis here is the AUTHORITATIVE escape analysis — it
+    // recomputes from scratch with the resolved invokespecial shapes and does not
+    // use `non_escaping_new` as a seed. Gate it on whether the method has any
+    // `new` allocation (`new_info`), NOT on whether `jit_scan`'s conservative
+    // pre-pass found a non-escaping object. `jit_scan` runs `analyze_escapes` with
+    // an EMPTY shape map, whose `None` arm `escape_all!`s every invokespecial
+    // receiver — so it returns an empty `non_escaping_new` for the ubiquitous
+    // `new X(); <init>()V` pattern, and the old `if non_escaping_new.is_empty()`
+    // gate then skipped the precise pass that WOULD recognize it. Net effect of
+    // that bug: single-pass scalar replacement never fired for ordinary
+    // allocations at runtime. Gating on `new_info` instead lets it fire (and is
+    // what makes the Phase B `VirtualObject` deopt path reachable).
+    let non_escaping_new: std::collections::HashSet<usize> = if new_info.is_empty() {
         non_escaping_new
     } else {
         let mut invokespecial_shapes: FxHashMap<usize, InvokeSpecialShape> = FxHashMap::default();
@@ -23675,6 +23689,14 @@ pub fn compile_with_param_slots(
         }
         analyze_escapes(code, code_len, &invokespecial_shapes)
     };
+    if std::env::var_os("CRATONVM_DBG_SCALAR_DEOPT").is_some() && !new_info.is_empty() {
+        eprintln!(
+            "[DBG_SCALAR_DEOPT] x64::compile escape re-analysis: new_info={} non_escaping_new={:?} invoke_info={}",
+            new_info.len(),
+            { let mut v: Vec<usize> = non_escaping_new.iter().copied().collect(); v.sort(); v },
+            invoke_info.len(),
+        );
+    }
 
     // Scalar replacement: plan frame-local storage for non-escaping object fields
     let num_hoists = hoist_info.len();
