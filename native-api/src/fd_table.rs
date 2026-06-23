@@ -688,6 +688,41 @@ impl FileDescriptorTable {
         Ok(fd)
     }
 
+    /// Open a file for `java.io.RandomAccessFile`. Always produces a
+    /// `FileReadWrite` entry so the RAF read/write/seek natives **and** any
+    /// `FileChannel` derived from the RAF (`raf.getChannel()`) resolve to the
+    /// **same** fd — they share one `FileDescriptor`, and HotSpot shares one
+    /// OS fd between them. `write == false` mirrors mode `"r"` (open the file
+    /// read-only: do not create it, and let a stray write fail at the OS
+    /// level, matching a read-only RAF). `write == true` mirrors `"rw"`/
+    /// `"rws"`/`"rwd"` (read+write, create if absent). The caller emulates the
+    /// `"rws"`/`"rwd"` per-write sync via [`Self::rw_sync`].
+    ///
+    /// # Security
+    ///
+    /// `path` is passed **verbatim** to the OS with no path-traversal or
+    /// sandbox check performed here. When the value originates from
+    /// Java-controlled input, the caller (the VM / native-io sandbox layer)
+    /// MUST sanitize it for path traversal before calling.
+    pub fn open_random_access(&self, path: &str, write: bool) -> Result<FdId, io::Error> {
+        // fds only need to be unique, not contiguous — on overflow we
+        // simply fail without rolling the counter back (a `fetch_sub`
+        // rollback would be racy and pointless).
+        let fd = self.next_fd.fetch_add(1, Ordering::Relaxed);
+        if fd >= u32::MAX - 16 {
+            return Err(io::Error::other("file descriptor limit exceeded"));
+        }
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(write)
+            .create(write)
+            .open(path)?;
+        self.entries
+            .write()
+            .insert(fd, Arc::new(FileEntry::FileReadWrite(Mutex::new(file))));
+        Ok(fd)
+    }
+
     /// Read bytes from a file at a specific position (pread).
     /// Does not change the file's current position.
     pub fn pread_at(&self, fd: FdId, buf: &mut [u8], position: u64) -> Result<usize, io::Error> {
@@ -872,6 +907,28 @@ impl FileDescriptorTable {
                 io::ErrorKind::NotFound,
                 "bad fd for rw_set_length",
             )),
+        }
+    }
+
+    /// Flush a FileReadWrite file's contents to stable storage. Used by
+    /// `RandomAccessFile` modes `"rws"` (`data_only == false` → `sync_all`,
+    /// data + metadata) and `"rwd"` (`data_only == true` → `sync_data`, data
+    /// only) which require every write to reach durable storage before the
+    /// call returns.
+    pub fn rw_sync(&self, fd: FdId, data_only: bool) -> Result<(), io::Error> {
+        let entry = self
+            .get_entry(fd)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "bad fd for rw_sync"))?;
+        match &*entry {
+            FileEntry::FileReadWrite(file) => {
+                let f = file.lock();
+                if data_only {
+                    f.sync_data()
+                } else {
+                    f.sync_all()
+                }
+            }
+            _ => Err(io::Error::new(io::ErrorKind::NotFound, "bad fd for rw_sync")),
         }
     }
 
