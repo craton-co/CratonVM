@@ -5046,6 +5046,40 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                         }
                         .into());
                     }
+                    // BUG-07: when the target receiver is ITSELF a lambda proxy,
+                    // the method being invoked is that proxy's own SAM (or a
+                    // method on its functional interface) and is only resolvable
+                    // through lambda-proxy dispatch. This happens with an unbound
+                    // instance method reference used as a higher-order function —
+                    // e.g. `stream.map(Supplier::get)` over a stream of `() -> x`
+                    // lambdas: the mapper's impl handle is `InvokeInterface
+                    // Supplier.get`, and each receiver is a synthetic `Supplier`
+                    // lambda proxy. `invoke_or_native` does not consult the
+                    // lambda-proxy table, so it misses the SAM and falls through
+                    // to a wrong/default result (observed: an empty ArrayList,
+                    // later mis-cast → ClassCastException). Recurse through
+                    // `invoke_virtual`, which dispatches both lambda proxies and
+                    // ordinary objects correctly.
+                    let receiver_is_lambda_proxy = match &full_args[0] {
+                        Value::Object(Some(r)) => {
+                            let rcv_id = self.shared.heap.class_id_of(*r);
+                            self.shared.lambda_proxies.read().contains_key(&rcv_id)
+                        }
+                        _ => false,
+                    };
+                    if receiver_is_lambda_proxy {
+                        if let Value::Object(Some(recv)) = full_args[0] {
+                            self.invoke_virtual(
+                                recv,
+                                &lcs.impl_handle.member_name,
+                                &lcs.impl_handle.descriptor,
+                                &full_args[1..],
+                            )
+                        } else {
+                            // unreachable: receiver_is_lambda_proxy implies an object
+                            Ok(None)
+                        }
+                    } else {
                     let target_class = match &full_args[0] {
                         Value::Object(Some(r)) => {
                             let rcv_id = self.shared.heap.class_id_of(*r);
@@ -5079,6 +5113,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                                 &full_args,
                             ),
                         _ => result,
+                    }
                     }
                 }
                 MethodHandleKind::InvokeSpecial => self.invoke_or_native(

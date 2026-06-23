@@ -7531,6 +7531,78 @@ mod tests {
     }
 
     #[test]
+    fn invoke_virtual_methodref_over_lambda_receiver() {
+        // BUG-07 regression: an unbound instance method reference used as a
+        // higher-order function whose runtime receiver is ITSELF a lambda proxy.
+        // Models `stream.map(Supplier::get)` over a `() -> x` lambda: the mapper's
+        // impl handle is `InvokeInterface Supplier.get`, and the element passed to
+        // it is a synthetic `Supplier` lambda proxy. The mapper must dispatch the
+        // receiver's SAM through lambda-proxy dispatch (not `invoke_or_native`,
+        // which doesn't consult the proxy table and previously returned a wrong
+        // default → later mis-cast to ClassCastException).
+        let shared = Arc::new(SharedVm::new(VmConfig::default()));
+        let mut thread = JvmThread::new(ThreadId(0), "test");
+
+        // Inner Supplier proxy: get() -> Integer.valueOf(7) (InvokeStatic, capture 7).
+        let supplier = make_lambda_proxy(
+            &shared,
+            "java/util/function/Supplier",
+            "get",
+            "()Ljava/lang/Object;",
+            "java/lang/Integer",
+            "valueOf",
+            "(I)Ljava/lang/Integer;",
+            MethodHandleKind::InvokeStatic,
+            vec!['I'],
+            &[Value::Int(7)],
+        );
+
+        // Outer mapper proxy: Function.apply(o) -> ((Supplier)o).get()
+        // (unbound instance method reference Supplier::get, no captures).
+        let mapper = make_lambda_proxy(
+            &shared,
+            "java/util/function/Function",
+            "apply",
+            "(Ljava/lang/Object;)Ljava/lang/Object;",
+            "java/util/function/Supplier",
+            "get",
+            "()Ljava/lang/Object;",
+            MethodHandleKind::InvokeInterface,
+            vec![],
+            &[],
+        );
+
+        let mut ctx = NativeContextImpl {
+            shared: &shared,
+            thread: &mut thread,
+        };
+        let result = ctx
+            .invoke_virtual(
+                mapper,
+                "apply",
+                "(Ljava/lang/Object;)Ljava/lang/Object;",
+                &[Value::Object(Some(supplier))],
+            )
+            .unwrap();
+        // Must be the Integer(7) produced by the inner supplier — not a wrong
+        // default (the pre-fix bug surfaced an empty ArrayList here).
+        match result {
+            Some(Value::Object(Some(r))) => {
+                let cid = ctx.shared.heap.class_id_of(r);
+                let name = ctx
+                    .shared
+                    .class_manager
+                    .read()
+                    .get_class(cid)
+                    .map(|c| c.name.to_string())
+                    .unwrap_or_default();
+                assert_eq!(name, "java/lang/Integer", "expected Integer from Supplier::get");
+            }
+            other => panic!("expected an Integer object, got {:?}", other),
+        }
+    }
+
+    #[test]
     fn invoke_or_native_calls_native_method() {
         // Verify invoke_or_native directly calls native methods by class name.
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
