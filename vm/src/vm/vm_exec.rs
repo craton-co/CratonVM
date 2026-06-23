@@ -9870,6 +9870,17 @@ fn invoke_on_class_shared_inner(
                                 // every `BCStyle.attrNameToOID("cn"/...)`
                                 // fails with "Unknown object id".
                                 | "keys" | "elements"
+                                // TC0622: `Hashtable.clone()` (inherited by
+                                // `Properties`). Real-JDK body casts our
+                                // synthetic bucket nodes to `Hashtable$Entry`
+                                // → ClassCastException; force the native
+                                // (deprecated_util::native_hashtable_clone)
+                                // which rebuilds a fresh natively-backed map.
+                                // Only fires if a native is registered for the
+                                // exact triple, so non-map clone()s are
+                                // unaffected. Companion entry in
+                                // interpreter.rs::force_native_over_real_jdk_bytecode.
+                                | "clone"
                                 // S111r14: copy-constructor `<init>(Ljava/util/Map;)V`
                                 // — DateTimeFormatter.<clinit> hits this via
                                 // `new LinkedHashMap<>(map)`. Override only

@@ -16775,6 +16775,21 @@ fn force_native_over_real_jdk_bytecode(
                 "elements",
                 "()Ljava/util/Enumeration;",
             )
+            // TC0622: `Hashtable.clone()` (inherited by `Properties`). Our
+            // native `put` stores synthetic bucket nodes in slot-0 `table[]`,
+            // not genuine `Hashtable$Entry`. The real-JDK clone body does
+            // `t.table[i] = (Hashtable$Entry) table[i].clone()` and the
+            // `checkcast` throws ClassCastException on our synthetic node.
+            // (`InitialContext.<init>` clones its environment Hashtable, so
+            // `new InitialDirContext(env)` blew up before any LDAP connect.)
+            // Force the native (deprecated_util::native_hashtable_clone) which
+            // rebuilds a fresh natively-backed map without materialising an
+            // Entry. Companion match in vm_exec.rs.
+            | (
+                "java/util/Hashtable",
+                "clone",
+                "()Ljava/lang/Object;",
+            )
             // spring-bug-08: `ObjectInputStream.resolveProxyClass(String[])`
             // has a real JDK body whose default routes
             // `Proxy.getProxyClass` → `ProxyBuilder.getDynamicModule` →
