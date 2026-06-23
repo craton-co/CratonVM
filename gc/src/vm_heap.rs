@@ -398,6 +398,32 @@ impl VmHeap {
         }
     }
 
+    /// BUG-03 — whether this heap backend supports the cross-thread STW JIT
+    /// TLAB skip-region protocol (i.e. its young collection is the
+    /// generational non-moving sweep that consumes
+    /// [`GenerationalHeap::set_jit_tlab_skip_regions`]). The collector only
+    /// engages the forcible in-JIT-peer take-over when this is `true`, so the
+    /// G1 path keeps its existing (cooperative-wait) behaviour.
+    pub fn supports_jit_tlab_skip(&self) -> bool {
+        matches!(self, VmHeap::Generational(_))
+    }
+
+    /// BUG-03 — publish/clear the reserved TLAB tails of forcibly-stopped
+    /// in-JIT peers so the next non-moving young sweep skips them. No-op on
+    /// backends without the protocol (see [`Self::supports_jit_tlab_skip`]).
+    pub fn set_jit_tlab_skip_regions(&self, regions: &[(usize, usize)]) {
+        if let VmHeap::Generational(h) = self {
+            h.set_jit_tlab_skip_regions(regions);
+        }
+    }
+
+    /// BUG-03 — clear any published JIT TLAB skip regions.
+    pub fn clear_jit_tlab_skip_regions(&self) {
+        if let VmHeap::Generational(h) = self {
+            h.clear_jit_tlab_skip_regions();
+        }
+    }
+
     /// Loose validity check: alignment + heap-region containment.
     ///
     /// Unlike [`Self::is_object_address`] this does NOT read the object
