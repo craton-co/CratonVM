@@ -431,10 +431,10 @@ A 103-probe sweep of `apps/spring-boot/buildSrc/runner/` (each a standalone
 HotSpot jdk-25 found **14 CratonVM-only bugs** (0 crash, 11 hang, 19 real DIFF).
 Index + per-bug reports: [spring-boot-probe-sweep/INDEX.md](spring-boot-probe-sweep/INDEX.md).
 
-**2 FIXED + merged to `dev`** (writeups in [`docs/internal/fixed-suite-bugs/`](../internal/fixed-suite-bugs/)):
-- **SBR-03** (`a245002c`) strict array `instanceof` (`Object[] instanceof I[]` → `false`).
+**2 FIXED + merged to `dev`** (writeups in [`docs/internal/`](../internal/)):
+- **SBR-03** (`a245002c`) strict array `instanceof` ([writeup](../internal/SBR-03-array-interface-instanceof.md)) — `Object[] instanceof I[]` → `false`.
 - **SBR-06** (`bce39db7`) Constructor `Parameter.getParameterizedType()` generics
-  (populate the Constructor mirror's `signature` field).
+  ([writeup](../internal/SBR-06-field-getgenerictype-raw.md)) — populate the Constructor mirror's `signature` field.
 
 **Open** (root-caused; none a safe one-liner — see each report):
 - **SBR-01** Groovy `parseClass` hang ×9 — overlaps [spring-boot-buildsrc-coldpath-hangs](spring-boot-buildsrc-coldpath-hangs-2026-06-22.md). **handoff**
