@@ -93,6 +93,33 @@ pub fn jit_invocation_threshold() -> u32 {
     })
 }
 
+/// `CRATONVM_JIT_OSR` — master enable for back-edge **On-Stack Replacement**
+/// (entering JIT code mid-loop at a hot back-edge).
+///
+/// **Default: OFF (disabled).** OSR back-edge compilation is currently unsound on
+/// large real-world methods: the OSR entry path does not perfectly reproduce the
+/// method's prologue state, so the OSR'd frame (or, via the trampoline's
+/// callee-saved handling, its caller) can resume with corrupted register/stack
+/// state — producing a *silent wrong value* rather than a crash. On the Hibernate
+/// ORM suite this is the dominant cause of JIT-on hangs (HIB-CV-20 / HIB-CV-21):
+/// Xerces XSD parsing's content-model DFA construction reads a corrupted value and
+/// loops forever. Regular (whole-method) JIT compilation is unaffected and stays
+/// on — only the mid-loop back-edge OSR trigger is gated here.
+///
+/// The HIB-CV-20 trampoline callee-saved-register fix removes one corruption
+/// source; this gate keeps the remaining (not-yet-hardened) OSR entry paths off by
+/// default so real bytecode runs correctly. Set `CRATONVM_JIT_OSR=1` to re-enable
+/// OSR for benchmarking / development once the entry-state reconstruction is fully
+/// hardened. Empty or `"0"` ⇒ disabled (the safe default). Read once and cached.
+#[inline]
+pub fn osr_backedge_enabled() -> bool {
+    static CACHE: OnceLock<bool> = OnceLock::new();
+    *CACHE.get_or_init(|| match std::env::var("CRATONVM_JIT_OSR") {
+        Ok(v) => !v.is_empty() && v != "0",
+        Err(_) => false,
+    })
+}
+
 /// `CRATONVM_TIER_OSR_BACKEDGE` — wire-tiered-manager Step 6 — per-frame
 /// back-edge count at which OSR is first attempted (`Frame::should_try_osr`'s
 /// `osr_threshold` argument), default 1000 (the historical `OSR_THRESHOLD`
