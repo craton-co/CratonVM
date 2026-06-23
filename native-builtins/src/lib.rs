@@ -13640,6 +13640,27 @@ fn native_object_clone(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
                         cratonvm_native_collections::clone_lhm_overlay(this, clone_ref);
                         break;
                     }
+                    // TC0622: `Properties` keeps its entries in an identity-keyed
+                    // side-table (`properties_sidetable`), NOT the heap fields the
+                    // shallow loop above copies. A fresh clone has a new identity
+                    // and therefore an empty side-table, so `getProperty` /
+                    // `propertyNames` / `stringPropertyNames` would see nothing
+                    // (the inherited Hashtable `defaults` field IS copied above, so
+                    // the defaults fallback still works). Snapshot the receiver's
+                    // side-table onto the clone — same pattern as the LinkedHashMap
+                    // overlay just above. This is what makes
+                    // `(Properties) props.clone()` round-trip its keys, e.g. the
+                    // env Hashtable JNDI clones in `InitialContext.<init>` and any
+                    // app that clones a Properties.
+                    Some(n) if n == "java/util/Properties" => {
+                        let snap = crate::properties_sidetable::snapshot_sidetable(ctx, this);
+                        if !snap.is_empty() {
+                            crate::properties_sidetable::replace_sidetable(
+                                ctx, clone_ref, &snap,
+                            );
+                        }
+                        break;
+                    }
                     Some(n) if n == "java/lang/Object" => break,
                     None => break,
                     _ => match ctx.superclass_of(cur) {
