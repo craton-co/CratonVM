@@ -272,6 +272,251 @@ fn decode_utf8_lossy(bytes: &[u8]) -> Vec<u16> {
     String::from_utf8_lossy(bytes).encode_utf16().collect()
 }
 
+// ---------------------------------------------------------------------------
+// JDK-faithful streaming UTF-8 decoder
+//
+// `String::from_utf8_lossy` follows the WHATWG/W3C "maximal subpart"
+// substitution rule, but its replacement granularity at multi-byte-sequence
+// *buffer boundaries* differs from `sun.nio.cs.UTF_8.Decoder` — which is what
+// `java.nio.charset.CharsetDecoder` drives. Tomcat's `TestUtf8` feeds malformed
+// input one byte at a time and asserts the exact number / placement of U+FFFD
+// substitutions (53 cases). To match byte-for-byte we port the JDK's
+// `decodeArrayLoop` + `malformedN` length accounting and run the
+// `CharsetDecoder.decode` orchestrator (REPORT / REPLACE / IGNORE) over it.
+// ---------------------------------------------------------------------------
+
+/// Error action applied to a malformed / unmappable coding result, mirroring
+/// `java.nio.charset.CodingErrorAction`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodingAction {
+    /// Surface the error to the caller (HotSpot default).
+    Report,
+    /// Substitute the replacement unit(s) and continue.
+    Replace,
+    /// Skip the erroneous input and continue.
+    Ignore,
+}
+
+/// Terminal status of a [`utf8_decode`] call — the subset of
+/// `java.nio.charset.CoderResult` states the orchestrator can hand back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Utf8DecodeStatus {
+    /// All consumable input was processed; any *unconsumed* trailing bytes are
+    /// an incomplete multi-byte sequence awaiting more input.
+    Underflow,
+    /// The output capacity was reached before all input was decoded.
+    Overflow,
+    /// A malformed sequence was hit while the action is REPORT.
+    Malformed,
+}
+
+#[inline]
+fn u8_is_not_continuation(b: u32) -> bool {
+    (b & 0xC0) != 0x80
+}
+#[inline]
+fn u8_is_malformed3(b1: u32, b2: u32, b3: u32) -> bool {
+    (b1 == 0xE0 && (b2 & 0xE0) == 0x80) || u8_is_not_continuation(b2) || u8_is_not_continuation(b3)
+}
+#[inline]
+fn u8_is_malformed3_2(b1: u32, b2: u32) -> bool {
+    (b1 == 0xE0 && (b2 & 0xE0) == 0x80) || u8_is_not_continuation(b2)
+}
+#[inline]
+fn u8_is_malformed4(b2: u32, b3: u32, b4: u32) -> bool {
+    u8_is_not_continuation(b2) || u8_is_not_continuation(b3) || u8_is_not_continuation(b4)
+}
+#[inline]
+fn u8_is_malformed4_2(b1: u32, b2: u32) -> bool {
+    (b1 == 0xF0 && (b2 & 0xF0) == 0x80)
+        || (b1 == 0xF4 && (b2 & 0xF0) != 0x80)
+        || u8_is_not_continuation(b2)
+}
+#[inline]
+fn u8_is_malformed4_3(b3: u32) -> bool {
+    u8_is_not_continuation(b3)
+}
+
+/// Length (in bytes) of the maximal ill-formed subpart of a 3-byte sequence,
+/// matching `UTF_8.malformedN(src, 3)`.
+#[inline]
+fn u8_malformed_n3(b1: u32, b2: u32) -> usize {
+    if (b1 == 0xE0 && (b2 & 0xE0) == 0x80) || u8_is_not_continuation(b2) {
+        1
+    } else {
+        2
+    }
+}
+/// Length (in bytes) of the maximal ill-formed subpart of a 4-byte sequence,
+/// matching `UTF_8.malformedN(src, 4)`.
+#[inline]
+fn u8_malformed_n4(b1: u32, b2: u32, b3: u32) -> usize {
+    if b1 > 0xF4
+        || (b1 == 0xF0 && (b2 < 0x90 || b2 > 0xBF))
+        || (b1 == 0xF4 && (b2 & 0xF0) != 0x80)
+        || u8_is_not_continuation(b2)
+    {
+        1
+    } else if u8_is_not_continuation(b3) {
+        2
+    } else {
+        3
+    }
+}
+
+/// Outcome of one [`utf8_decode_loop`] pass (one `decodeArrayLoop` call).
+enum Utf8LoopEnd {
+    /// Ran out of input (any leftover is an incomplete trailing sequence).
+    Underflow,
+    /// Output capacity reached before the next code point could be emitted.
+    Overflow,
+    /// Malformed sequence of the given byte length at the current position.
+    Malformed(usize),
+}
+
+/// Port of `sun.nio.cs.UTF_8.Decoder.decodeArrayLoop`: decode valid code
+/// points from the front of `src` into `out` (UTF-16 units), stopping at the
+/// first malformed sequence, output overflow (`out.len() == out_cap`), or
+/// end of input. Returns `(bytes_consumed, end)`.
+fn utf8_decode_loop(src: &[u8], out: &mut Vec<u16>, out_cap: usize) -> (usize, Utf8LoopEnd) {
+    let sl = src.len();
+    let mut sp = 0usize;
+    while sp < sl {
+        let b1 = src[sp] as u32;
+        if b1 < 0x80 {
+            // 1 byte: 0xxxxxxx
+            if out.len() >= out_cap {
+                return (sp, Utf8LoopEnd::Overflow);
+            }
+            out.push(b1 as u16);
+            sp += 1;
+        } else if (0xC2..=0xDF).contains(&b1) {
+            // 2 bytes: 110xxxxx 10xxxxxx (C0/C1 are overlong → fall to `else`)
+            if sl - sp < 2 {
+                return (sp, Utf8LoopEnd::Underflow);
+            }
+            if out.len() >= out_cap {
+                return (sp, Utf8LoopEnd::Overflow);
+            }
+            let b2 = src[sp + 1] as u32;
+            if u8_is_not_continuation(b2) {
+                return (sp, Utf8LoopEnd::Malformed(1));
+            }
+            out.push((((b1 & 0x1F) << 6) | (b2 & 0x3F)) as u16);
+            sp += 2;
+        } else if (0xE0..=0xEF).contains(&b1) {
+            // 3 bytes: 1110xxxx 10xxxxxx 10xxxxxx
+            let rem = sl - sp;
+            if rem < 3 {
+                if rem > 1 && u8_is_malformed3_2(b1, src[sp + 1] as u32) {
+                    return (sp, Utf8LoopEnd::Malformed(1));
+                }
+                return (sp, Utf8LoopEnd::Underflow);
+            }
+            if out.len() >= out_cap {
+                return (sp, Utf8LoopEnd::Overflow);
+            }
+            let b2 = src[sp + 1] as u32;
+            let b3 = src[sp + 2] as u32;
+            if u8_is_malformed3(b1, b2, b3) {
+                return (sp, Utf8LoopEnd::Malformed(u8_malformed_n3(b1, b2)));
+            }
+            let cp = ((b1 & 0x0F) << 12) | ((b2 & 0x3F) << 6) | (b3 & 0x3F);
+            if (0xD800..=0xDFFF).contains(&cp) {
+                // Surrogate code point encoded as 3 bytes (CESU-8) → malformed.
+                return (sp, Utf8LoopEnd::Malformed(3));
+            }
+            out.push(cp as u16);
+            sp += 3;
+        } else if (0xF0..=0xF7).contains(&b1) {
+            // 4 bytes: 11110xxx 10xxxxxx 10xxxxxx 10xxxxxx
+            let rem = sl - sp;
+            if rem < 4 || out_cap - out.len() < 2 {
+                if rem < 4 {
+                    if rem > 1 && u8_is_malformed4_2(b1, src[sp + 1] as u32) {
+                        return (sp, Utf8LoopEnd::Malformed(1));
+                    }
+                    if rem > 2 && u8_is_malformed4_3(src[sp + 2] as u32) {
+                        return (sp, Utf8LoopEnd::Malformed(2));
+                    }
+                    return (sp, Utf8LoopEnd::Underflow);
+                }
+                return (sp, Utf8LoopEnd::Overflow);
+            }
+            let b2 = src[sp + 1] as u32;
+            let b3 = src[sp + 2] as u32;
+            let b4 = src[sp + 3] as u32;
+            let cp = ((b1 & 0x07) << 18) | ((b2 & 0x3F) << 12) | ((b3 & 0x3F) << 6) | (b4 & 0x3F);
+            if u8_is_malformed4(b2, b3, b4) || !(0x10000..=0x10FFFF).contains(&cp) {
+                return (sp, Utf8LoopEnd::Malformed(u8_malformed_n4(b1, b2, b3)));
+            }
+            let adj = cp - 0x10000;
+            out.push((0xD800 + (adj >> 10)) as u16);
+            out.push((0xDC00 + (adj & 0x3FF)) as u16);
+            sp += 4;
+        } else {
+            // 0x80..=0xBF lone continuation, 0xC0, 0xC1, 0xF8..=0xFF.
+            return (sp, Utf8LoopEnd::Malformed(1));
+        }
+    }
+    (sp, Utf8LoopEnd::Underflow)
+}
+
+/// JDK-faithful UTF-8 decode of `src`, applying `action` (the decoder's
+/// `malformedInputAction`) to malformed sequences and honoring `end_of_input`
+/// exactly like the `java.nio.charset.CharsetDecoder.decode(in, out, eoi)`
+/// orchestrator. Decoded UTF-16 units are appended to `out`, bounded by
+/// `out_cap` (the destination's remaining capacity). Returns
+/// `(bytes_consumed, status)` — the caller advances the input buffer by
+/// `bytes_consumed` and maps `status` to a `CoderResult`.
+pub fn utf8_decode(
+    src: &[u8],
+    end_of_input: bool,
+    action: CodingAction,
+    out: &mut Vec<u16>,
+    out_cap: usize,
+) -> (usize, Utf8DecodeStatus) {
+    let sl = src.len();
+    let mut sp = 0usize;
+    loop {
+        let (np, end) = utf8_decode_loop(&src[sp..], out, out_cap);
+        sp += np;
+        match end {
+            Utf8LoopEnd::Overflow => return (sp, Utf8DecodeStatus::Overflow),
+            Utf8LoopEnd::Underflow => {
+                if end_of_input && sp < sl {
+                    // A trailing incomplete sequence at end-of-input is treated
+                    // as `malformedForLength(remaining)` by the orchestrator.
+                    match action {
+                        CodingAction::Report => return (sp, Utf8DecodeStatus::Malformed),
+                        CodingAction::Replace => {
+                            if out.len() >= out_cap {
+                                return (sp, Utf8DecodeStatus::Overflow);
+                            }
+                            out.push(REPLACEMENT_CHAR);
+                            sp = sl;
+                        }
+                        CodingAction::Ignore => sp = sl,
+                    }
+                } else {
+                    return (sp, Utf8DecodeStatus::Underflow);
+                }
+            }
+            Utf8LoopEnd::Malformed(len) => match action {
+                CodingAction::Report => return (sp, Utf8DecodeStatus::Malformed),
+                CodingAction::Replace => {
+                    if out.len() >= out_cap {
+                        return (sp, Utf8DecodeStatus::Overflow);
+                    }
+                    out.push(REPLACEMENT_CHAR);
+                    sp += len;
+                }
+                CodingAction::Ignore => sp += len,
+            },
+        }
+    }
+}
+
 /// Lossy UTF-8 encode: lone surrogates become U+FFFD (replacement char),
 /// matching `CodingErrorAction.REPLACE`. Used by the `*_lossy` callers.
 fn encode_utf8(chars: &[u16]) -> Vec<u8> {
@@ -1152,6 +1397,238 @@ mod tests {
         let chars = "A\u{00FF}\u{1F600}".encode_utf16().collect::<Vec<_>>();
         let bytes = encode_chars_lossy("Some-Unknown-Charset", &chars);
         assert_eq!(bytes, vec![0x41, 0xFF, b'?', b'?']);
+    }
+
+    /// Mirror `TestUtf8.doTest` REPLACE phase: feed `input` one byte at a
+    /// time with end_of_input=false (buffering unconsumed bytes like
+    /// `ByteBuffer.compact`), then a final flush with end_of_input=true.
+    fn stream_decode_replace(input: &[u8]) -> String {
+        let mut leftover: Vec<u8> = Vec::new();
+        let mut units: Vec<u16> = Vec::new();
+        let cap = input.len().max(1) * 2;
+        for &b in input {
+            leftover.push(b);
+            let mut chunk: Vec<u16> = Vec::new();
+            let (consumed, _) =
+                utf8_decode(&leftover, false, CodingAction::Replace, &mut chunk, cap);
+            units.extend_from_slice(&chunk);
+            leftover.drain(..consumed);
+        }
+        let mut chunk: Vec<u16> = Vec::new();
+        let (consumed, _) = utf8_decode(&leftover, true, CodingAction::Replace, &mut chunk, cap);
+        units.extend_from_slice(&chunk);
+        leftover.drain(..consumed);
+        String::from_utf16(&units).unwrap()
+    }
+
+    /// Mirror `TestUtf8.doTest` REPORT phase: feed one byte at a time with
+    /// end_of_input=false and return the byte index of the first error, or
+    /// `None` if no error surfaced during streaming (truncated sequences).
+    fn stream_decode_report_index(input: &[u8]) -> Option<usize> {
+        let mut leftover: Vec<u8> = Vec::new();
+        let cap = input.len().max(1) * 2;
+        for (i, &b) in input.iter().enumerate() {
+            leftover.push(b);
+            let mut chunk: Vec<u16> = Vec::new();
+            let (consumed, status) =
+                utf8_decode(&leftover, false, CodingAction::Report, &mut chunk, cap);
+            if status == Utf8DecodeStatus::Malformed {
+                return Some(i);
+            }
+            leftover.drain(..consumed);
+        }
+        None
+    }
+
+    #[test]
+    fn utf8_testutf8_53_cases_replace_byte_for_byte() {
+        // Every case from org.apache.tomcat.util.buf.TestUtf8 (input bytes,
+        // REPORT-phase invalid byte index, REPLACE-phase expected output).
+        // The decoder must reproduce HotSpot's substitution exactly.
+        let cases: &[(&[u8], i32, &str)] = &[
+            (&[], -1, ""),
+            (&[0x41], -1, "A"),
+            (&[0xC2, 0xA9], -1, "\u{00A9}"),
+            (&[0xE0, 0xA4, 0x87], -1, "\u{0907}"),
+            (&[0xF0, 0x90, 0x90, 0x80], -1, "\u{10400}"),
+            (
+                &[0x41, 0xF4, 0x90, 0x80, 0x80, 0x41],
+                2,
+                "A\u{FFFD}\u{FFFD}\u{FFFD}\u{FFFD}A",
+            ),
+            (&[0x41, 0xC0, 0xC1, 0x41], 1, "A\u{FFFD}\u{FFFD}A"),
+            (&[0x41, 0xE0, 0x80, 0xC1, 0x41], 2, "A\u{FFFD}\u{FFFD}\u{FFFD}A"),
+            (
+                &[0x41, 0xF0, 0x80, 0x80, 0xC1, 0x41],
+                2,
+                "A\u{FFFD}\u{FFFD}\u{FFFD}\u{FFFD}A",
+            ),
+            (&[0x41, 0xFF, 0x41], 1, "A\u{FFFD}A"),
+            (&[0x41, 0xF0, 0x41], 2, "A\u{FFFD}A"),
+            (&[0x41, 0xE0, 0x41], 2, "A\u{FFFD}A"),
+            (&[0x41, 0xC0, 0x41], 1, "A\u{FFFD}A"),
+            (&[0x41, 0x80, 0x41], 1, "A\u{FFFD}A"),
+            (
+                &[
+                    0x61, 0xF1, 0x80, 0x80, 0xE1, 0x80, 0xC2, 0x62, 0x80, 0x63, 0x80, 0xBF, 0x64,
+                ],
+                4,
+                "a\u{FFFD}\u{FFFD}\u{FFFD}b\u{FFFD}c\u{FFFD}\u{FFFD}d",
+            ),
+            (&[0x61, 0xF0, 0x90, 0x90], 3, "a\u{FFFD}"),
+            (&[0x61, 0xF0, 0x90], 2, "a\u{FFFD}"),
+            (&[0x61, 0xF0], 1, "a\u{FFFD}"),
+            (&[0x61, 0xF0, 0x90, 0x90, 0x61], 4, "a\u{FFFD}a"),
+            (&[0x61, 0xF0, 0x90, 0x61], 3, "a\u{FFFD}a"),
+            (&[0x61, 0xF0, 0x61], 2, "a\u{FFFD}a"),
+            (&[0x61, 0xC0, 0x80, 0x61], 1, "a\u{FFFD}\u{FFFD}a"),
+            (&[0x61, 0xC1, 0xBF, 0x61], 1, "a\u{FFFD}\u{FFFD}a"),
+            (&[0x61, 0xFF, 0xFF, 0x61], 1, "a\u{FFFD}\u{FFFD}a"),
+            (&[0x61, 0xE0, 0x80, 0x61], 2, "a\u{FFFD}\u{FFFD}a"),
+            (&[0x61, 0xA0, 0x80, 0x61], 1, "a\u{FFFD}\u{FFFD}a"),
+            (&[0x61, 0xC2, 0x00, 0x61], 2, "a\u{FFFD}\u{0000}a"),
+            (&[0x61, 0xC2, 0xC0, 0x61], 2, "a\u{FFFD}\u{FFFD}a"),
+            (&[0x61, 0xE0, 0x80, 0x80, 0x61], 2, "a\u{FFFD}\u{FFFD}\u{FFFD}a"),
+            (&[0x61, 0xE0, 0x81, 0xBF, 0x61], 2, "a\u{FFFD}\u{FFFD}\u{FFFD}a"),
+            (&[0x61, 0xE0, 0x9F, 0xBF, 0x61], 2, "a\u{FFFD}\u{FFFD}\u{FFFD}a"),
+            (
+                &[0x61, 0xFF, 0xFF, 0xFF, 0x61],
+                1,
+                "a\u{FFFD}\u{FFFD}\u{FFFD}a",
+            ),
+            (
+                &[0x61, 0xF8, 0x80, 0x80, 0x61],
+                1,
+                "a\u{FFFD}\u{FFFD}\u{FFFD}a",
+            ),
+            (
+                &[0x61, 0xE0, 0xC0, 0x80, 0x61],
+                2,
+                "a\u{FFFD}\u{FFFD}\u{FFFD}a",
+            ),
+            (&[0x61, 0xE1, 0x80, 0xC0, 0x61], 3, "a\u{FFFD}\u{FFFD}a"),
+            (
+                &[0x61, 0xF0, 0x80, 0x80, 0x80, 0x61],
+                2,
+                "a\u{FFFD}\u{FFFD}\u{FFFD}\u{FFFD}a",
+            ),
+            (
+                &[0x61, 0xF0, 0x80, 0x81, 0xBF, 0x61],
+                2,
+                "a\u{FFFD}\u{FFFD}\u{FFFD}\u{FFFD}a",
+            ),
+            (
+                &[0x61, 0xF0, 0x80, 0x9F, 0xBF, 0x61],
+                2,
+                "a\u{FFFD}\u{FFFD}\u{FFFD}\u{FFFD}a",
+            ),
+            (
+                &[0x61, 0xF0, 0x8F, 0xBF, 0xBF, 0x61],
+                2,
+                "a\u{FFFD}\u{FFFD}\u{FFFD}\u{FFFD}a",
+            ),
+            (
+                &[0x61, 0xFF, 0xFF, 0xFF, 0xFF, 0x61],
+                1,
+                "a\u{FFFD}\u{FFFD}\u{FFFD}\u{FFFD}a",
+            ),
+            (
+                &[0x61, 0xF8, 0x80, 0x80, 0x80, 0x61],
+                1,
+                "a\u{FFFD}\u{FFFD}\u{FFFD}\u{FFFD}a",
+            ),
+            (
+                &[0x61, 0xF1, 0xC0, 0x80, 0x80, 0x61],
+                2,
+                "a\u{FFFD}\u{FFFD}\u{FFFD}\u{FFFD}a",
+            ),
+            (
+                &[0x61, 0xF1, 0x80, 0xC0, 0x80, 0x61],
+                3,
+                "a\u{FFFD}\u{FFFD}\u{FFFD}a",
+            ),
+            (
+                &[0x61, 0xF1, 0x80, 0x80, 0xC0, 0x61],
+                4,
+                "a\u{FFFD}\u{FFFD}a",
+            ),
+            (
+                &[0x61, 0xF8, 0x80, 0x80, 0x80, 0x80, 0x61],
+                1,
+                "a\u{FFFD}\u{FFFD}\u{FFFD}\u{FFFD}\u{FFFD}a",
+            ),
+            (
+                &[0x61, 0xF8, 0x80, 0x80, 0x81, 0xBF, 0x61],
+                1,
+                "a\u{FFFD}\u{FFFD}\u{FFFD}\u{FFFD}\u{FFFD}a",
+            ),
+            (
+                &[0x61, 0xF8, 0x80, 0x80, 0x9F, 0xBF, 0x61],
+                1,
+                "a\u{FFFD}\u{FFFD}\u{FFFD}\u{FFFD}\u{FFFD}a",
+            ),
+            (
+                &[0x61, 0xF8, 0x80, 0x8F, 0xBF, 0xBF, 0x61],
+                1,
+                "a\u{FFFD}\u{FFFD}\u{FFFD}\u{FFFD}\u{FFFD}a",
+            ),
+            (
+                &[0x61, 0xFC, 0x80, 0x80, 0x80, 0x80, 0x80, 0x61],
+                1,
+                "a\u{FFFD}\u{FFFD}\u{FFFD}\u{FFFD}\u{FFFD}\u{FFFD}a",
+            ),
+            (
+                &[0x61, 0xFC, 0x80, 0x80, 0x80, 0x81, 0xBF, 0x61],
+                1,
+                "a\u{FFFD}\u{FFFD}\u{FFFD}\u{FFFD}\u{FFFD}\u{FFFD}a",
+            ),
+            (
+                &[0x61, 0xFC, 0x80, 0x80, 0x80, 0x9F, 0xBF, 0x61],
+                1,
+                "a\u{FFFD}\u{FFFD}\u{FFFD}\u{FFFD}\u{FFFD}\u{FFFD}a",
+            ),
+            (
+                &[0x61, 0xFC, 0x80, 0x80, 0x8F, 0xBF, 0xBF, 0x61],
+                1,
+                "a\u{FFFD}\u{FFFD}\u{FFFD}\u{FFFD}\u{FFFD}\u{FFFD}a",
+            ),
+            (
+                &[
+                    0xCE, 0xBA, 0xE1, 0xDB, 0xB9, 0xCF, 0x83, 0xCE, 0xBC, 0xCE, 0xB5, 0xED, 0x80,
+                    0x65, 0x64, 0x69, 0x74, 0x65, 0x64,
+                ],
+                3,
+                "\u{03BA}\u{FFFD}\u{06F9}\u{03C3}\u{03BC}\u{03B5}\u{FFFD}edited",
+            ),
+        ];
+        assert_eq!(cases.len(), 53, "expected all 53 TestUtf8 cases");
+        for (idx, (input, invalid_index, expected)) in cases.iter().enumerate() {
+            let got = stream_decode_replace(input);
+            assert_eq!(
+                &got, expected,
+                "REPLACE mismatch at case {idx}: input {input:02X?}"
+            );
+            // REPORT phase only asserts the index when an error actually
+            // surfaces mid-stream (truncated trailing sequences never do).
+            if let Some(i) = stream_decode_report_index(input) {
+                assert_eq!(
+                    i as i32, *invalid_index,
+                    "REPORT index mismatch at case {idx}: input {input:02X?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn utf8_decode_overflow_is_precise() {
+        // 'A' + U+00A9 (2-byte). Output capacity 1 → 'A' emitted, 1 byte
+        // consumed, OVERFLOW with the 2-byte sequence left for retry.
+        let src = &[0x41, 0xC2, 0xA9];
+        let mut out = Vec::new();
+        let (consumed, status) = utf8_decode(src, false, CodingAction::Replace, &mut out, 1);
+        assert_eq!(out, vec![0x41]);
+        assert_eq!(consumed, 1);
+        assert_eq!(status, Utf8DecodeStatus::Overflow);
     }
 
     #[test]

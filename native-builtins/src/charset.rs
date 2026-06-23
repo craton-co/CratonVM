@@ -422,6 +422,25 @@ fn encoder_replacement(ctx: &dyn NativeContext, this: ObjectRef) -> Vec<u8> {
     vec![b'?']
 }
 
+/// Read a `CodingErrorAction`-valued field (`malformedInputAction` /
+/// `unmappableCharacterAction`) off a coder object and map it to the engine's
+/// [`engine::CodingAction`]. An unreadable/absent field conservatively yields
+/// REPORT (HotSpot's default), preserving strict error behavior. Three-way
+/// variant of [`coding_action_is_replace`], used by the UTF-8 decode
+/// orchestrator (which distinguishes REPLACE from IGNORE).
+fn coding_action(ctx: &dyn NativeContext, obj: ObjectRef, field: &str) -> engine::CodingAction {
+    if let Value::Object(Some(action)) = ctx.get_field_by_name(obj, field) {
+        if let Value::Object(Some(s)) = ctx.get_field_by_name(action, "name") {
+            return match ctx.read_string(s).as_deref() {
+                Some("REPLACE") => engine::CodingAction::Replace,
+                Some("IGNORE") => engine::CodingAction::Ignore,
+                _ => engine::CodingAction::Report,
+            };
+        }
+    }
+    engine::CodingAction::Report
+}
+
 /// `CharsetEncoder.encode(CharBuffer, ByteBuffer, boolean end_of_input)
 ///  -> CoderResult`
 ///
@@ -623,6 +642,29 @@ fn native_decoder_decode(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     let bytes = read_byte_array(ctx, barr, bpos as usize, (blim - bpos).max(0) as usize);
     if bytes.is_empty() {
         let r = alloc_coder_result(ctx, CR_UNDERFLOW);
+        return Ok(Some(Value::Object(Some(r))));
+    }
+
+    // UTF-8 is decoded through a JDK-faithful streaming state machine so the
+    // number / placement of U+FFFD substitutions in REPLACE mode is
+    // byte-for-byte identical to `sun.nio.cs.UTF_8.Decoder` (the W3C
+    // maximal-subpart rule HotSpot follows). The generic engine path below
+    // (Rust `from_utf8_lossy`) diverges at multi-byte-sequence buffer
+    // boundaries — see `cratonvm_native_api::charset::utf8_decode`.
+    if name == "UTF-8" {
+        let action = coding_action(ctx, this, "malformedInputAction");
+        let avail = (clim - cpos).max(0) as usize;
+        let mut units: Vec<u16> = Vec::new();
+        let (consumed, status) = engine::utf8_decode(&bytes, end_of_input, action, &mut units, avail);
+        let written = write_char_array(ctx, carr, cpos as usize, &units);
+        set_pos(ctx, cb, cpos + written as i32);
+        set_pos(ctx, bb, bpos + consumed as i32);
+        let tag = match status {
+            engine::Utf8DecodeStatus::Underflow => CR_UNDERFLOW,
+            engine::Utf8DecodeStatus::Overflow => CR_OVERFLOW,
+            engine::Utf8DecodeStatus::Malformed => CR_MALFORMED,
+        };
+        let r = alloc_coder_result(ctx, tag);
         return Ok(Some(Value::Object(Some(r))));
     }
 
