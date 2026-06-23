@@ -1,6 +1,6 @@
 ---
 name: spring-boot-buildsrc-coldpath-hangs-2026-06-22
-description: Spring Boot buildSrc JUnit suite re-run on dev d95a836e (2026-06-22), P-core-pinned + watchdog-off + 360s. 5 true-hangs confirmed of 23 non-TestKit classes (17 pass, 0 crash, 0 wrong-result). PluginXmlParser is a genuine HotSpot-clean true-hang NOT previously in docs/known-issues; SpringRepositoriesExtension still hangs >360s (CONTRADICTS the existing springrepos doc's "dev passes" claim); GenerateAntoraPlaybook/ArtifactRelease/DocumentAutoConfig hang where HotSpot env-fails (Gradle ProjectBuilder/ActorFactory). All stall on the cross-thread STW JIT-root WARN (Family A4) + cold-path interpreter throughput.
+description: Spring Boot buildSrc JUnit suite re-run on dev d95a836e (2026-06-22), P-core-pinned + watchdog-off + 360s. 5 true-hangs confirmed of 23 non-TestKit classes (17 pass, 0 crash, 0 wrong-result). UPDATE 2026-06-22: PluginXmlParser true-hang is now FIXED on dev (SBR-02 native String regex default-ON, 0d7dfc28/01375f90 — see docs/internal/SBR-02-string-regex-throughput.md). PluginXmlParser was a genuine HotSpot-clean true-hang NOT previously in docs/known-issues; SpringRepositoriesExtension still hangs >360s (CONTRADICTS the existing springrepos doc's "dev passes" claim); GenerateAntoraPlaybook/ArtifactRelease/DocumentAutoConfig hang where HotSpot env-fails (Gradle ProjectBuilder/ActorFactory). All stall on the cross-thread STW JIT-root WARN (Family A4) + cold-path interpreter throughput.
 metadata:
   type: known-issue
   area: jit, gc, throughput, groovy, gradle
@@ -31,7 +31,7 @@ is the **cold-path interpreter throughput tax**, the same family as
 
 | Class | HotSpot | In known-issues before? | Notes |
 |-------|---------|-------------------------|-------|
-| `mavenplugin.PluginXmlParserTests` | PASS 2/2, 1s | **No (new here)** | Genuine HotSpot-clean true-hang. Its old register-invisibility cause (A3 / `MinRegexProbe`) is marked **FIXED** (precise JIT maps default-on), so this residual throughput/stall hang was undocumented in `docs/known-issues`. |
+| `mavenplugin.PluginXmlParserTests` | PASS 2/2, 1s | **✅ FIXED** | **RESOLVED** — was a `java.util.regex` / `String.replaceAll`+literal-`replace` throughput wall in `PluginXmlParser.format()`. Fixed by flipping `CRATONVM_NATIVE_STRING_REGEX` default-ON (SBR-02, `0d7dfc28`, merge `01375f90`): the regex/replace chain routes to fast Rust-regex natives. Mirror probe `RegexLoopProbe` 100k iters nojit 7s / JIT 7.4s, output byte-identical to HotSpot (was 300s+ hang). Writeup: [`docs/internal/SBR-02-string-regex-throughput.md`](../internal/SBR-02-string-regex-throughput.md). |
 | `groovyscripts.SpringRepositoriesExtensionTests` | PASS 11/11, 5s | Yes (stale) | **CONTRADICTS** [[springrepos-extension-hang-jit-throughput-and-deep-recursion]], which states "dev **passes** this test." On `d95a836e`, P-core-pinned + watchdog-off, it still **hangs >360s**. Either a regression since dev `0c904c04`, or the real 163-line script's cold ANTLR ATN simulation genuinely needs >360s. |
 | `antora.GenerateAntoraPlaybookTests` | 1/2 — **env-fail**, 3s | n/a | **NOT a clean bug — env-limited** (see below) |
 | `artifacts.ArtifactReleaseTests` | 7/8 — **env-fail**, 3s | n/a | **NOT a clean bug — env-limited** |
@@ -52,8 +52,9 @@ where HotSpot throws the `GradleException` fast (CV stalls in Gradle
 surfacing the same exception) — a secondary robustness divergence on a test that cannot
 pass on either VM, **not a primary functional bug**.
 
-**Net genuine CV-only hang count on HotSpot-passable classes: 2** (`PluginXmlParserTests`,
-`SpringRepositoriesExtensionTests`).
+**Net genuine CV-only hang count on HotSpot-passable classes: 1**
+(`SpringRepositoriesExtensionTests`). `PluginXmlParserTests` is now **FIXED** (SBR-02
+native String regex default-ON — see the table above).
 
 ## Shared stall signature
 The 4 non-Antora-bootstrap hangs all stop logging on the VM's own warning, then go
@@ -74,10 +75,10 @@ interpreter throughput are in play. No crash signature (no panic / SIGSEGV / hea
 corruption) appears in any hang log.
 
 ## Triage
-- **FIX candidates** (HotSpot fully green): `PluginXmlParserTests`,
-  `SpringRepositoriesExtensionTests`. The latter should first be re-checked with a
-  longer timeout (900s) to separate a genuine regression/deadlock from pure cold-path
-  throughput — if it never completes, it is a regression vs the `0c904c04` "passes" claim.
+- **✅ FIXED:** `PluginXmlParserTests` — SBR-02 native String regex default-ON (see table).
+- **FIX candidate** (HotSpot fully green): `SpringRepositoriesExtensionTests`. Should first be
+  re-checked with a longer timeout (900s) to separate a genuine regression/deadlock from pure
+  cold-path throughput — if it never completes, it is a regression vs the `0c904c04` "passes" claim.
 - **HANDOFF / lower-priority** (HotSpot also env-fails; CV divergence is hang-vs-terminate):
   the 3 Gradle `ProjectBuilder` classes.
 
@@ -96,7 +97,7 @@ corruption) appears in any hang log.
   A *non-pathological* G1-vs-serial gap remains under the G1-maturation workstream.
 
 ## Net genuine CratonVM-only defects from this run
-1. `PluginXmlParserTests` true-hang ([[spring-boot-pluginxmlparser-hang]]).
+1. ~~`PluginXmlParserTests` true-hang~~ — **✅ FIXED** (SBR-02 native String regex default-ON; writeup [`docs/internal/SBR-02-string-regex-throughput.md`](../internal/SBR-02-string-regex-throughput.md)).
 2. `SpringRepositoriesExtensionTests` true-hang ([[springrepos-extension-hang-jit-throughput-and-deep-recursion]], re-opened).
 Everything else is env-limited (ProjectBuilder ×3), a slow-pass (Antora, G1 ×8), or clean.
 
