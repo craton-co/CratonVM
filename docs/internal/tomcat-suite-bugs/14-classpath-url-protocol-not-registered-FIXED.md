@@ -92,12 +92,26 @@ resource, where the real `ClasspathURLStreamHandler` throws
 `@Test(expected=FileNotFoundException.class)`). Changed that arm from `ioex` to
 `fnfex` to mirror the `file:` arm.
 
-## Validation (`fix/tc0622-classpath-url-protocol` vs HotSpot)
+A fifth item (originally filed as the residual below, now fixed): the synthetic
+`classpath:` `URL.openStream` resolved only via `ctx.find_resource` (static
+bootstrap→ext→**app** classpath), so resources behind the **thread context
+classloader** — a deployed webapp's `WEB-INF/classes` — were invisible, while the
+real `ClasspathURLStreamHandler` resolves them via
+`Thread.currentThread().getContextClassLoader().getResource(path)`. Added a
+fallback: on a `find_resource` miss, the synthetic now calls
+`Thread.currentThread().getContextClassLoader().getResourceAsStream(name)` and
+returns that stream (the webapp's `WebappClassLoaderBase` override resolves
+`WEB-INF/classes` via its `WebResourceRoot`). `find_resource` stays first so every
+already-working system-classpath case is byte-identical; the TCCL path only fires
+on a miss, and a miss there still yields `FileNotFoundException`.
+
+## Validation (`fix/tc0622-classpath-url-protocol` + `fix/tc0622-classpath-tccl-resource` vs HotSpot)
 
 | Class | Before | After |
 |-------|-------:|------:|
 | `TestClasspathUrlStreamHandler` | FAIL (unknown protocol) | **PASS** (1/1) |
 | `TestConfigFileLoader` | FAIL (4/4 classpath) | **3/4** (test01/02/04 pass) |
+| `TestPropertiesRoleMappingListener` | FAIL (classpath + LifecycleException) | **PASS** (9/9) |
 
 `TestConfigFileLoader.test03` still fails — unrelated: it opens a **directory**
 through a `file:` URL; HotSpot's `FileURLConnection` returns a directory-listing
@@ -113,12 +127,12 @@ by this change), vm `getstatic` round-trip tests pass.
 
 ## Residual (separate, out of scope)
 
-`TestPropertiesRoleMappingListener` now resolves the `classpath:` scheme (no more
-"unknown protocol") but its two classpath methods still fail: the role-mapping
-files live in a **deployed webapp's `WEB-INF/classes`**
-(`test/webapp-role-mapping/...`). HotSpot's `ClasspathURLStreamHandler` finds
-them via `Thread.currentThread().getContextClassLoader().getResource(path)` — the
-webapp loader. CratonVM's synthetic `URL.openStream` uses `ctx.find_resource`,
-which searches only bootstrap→ext→**app** classpaths, never the thread context /
-webapp classloader. That is a deeper resource-scoping gap (webapp-classloader
-resource resolution), distinct from the protocol-registration bug fixed here.
+`TestConfigFileLoader.test03` still fails — unrelated to `classpath:`: it opens a
+**directory** through a `file:` URL. HotSpot's `FileURLConnection` returns a
+directory-listing stream; CratonVM's synthetic `file:` `openStream` does
+`fs::read` on the directory → Windows "access denied" (os error 5). Separate
+`file:`-URL directory-listing gap, was failing pre-fix.
+
+(The earlier residual — `TestPropertiesRoleMappingListener`'s webapp
+`WEB-INF/classes` resources being invisible to `find_resource` — is now FIXED via
+the thread-context-classloader fallback described above; the class passes 9/9.)

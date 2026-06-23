@@ -3343,6 +3343,55 @@ fn huc_perform(ctx: &mut dyn NativeContext, this: ObjectRef) -> MethodCallResult
     Ok(None)
 }
 
+/// Resolve a `classpath:` resource through the current thread's context
+/// classloader, mirroring Tomcat's real `ClasspathURLStreamHandler.openConnection`
+/// (`Thread.currentThread().getContextClassLoader().getResourceAsStream(path)`).
+///
+/// `find_resource` only sees the static bootstrap/ext/app classpath; it cannot
+/// reach a deployed webapp's `WEB-INF/classes`. The webapp's
+/// `WebappClassLoaderBase` overrides `getResourceAsStream` and resolves those via
+/// its `WebResourceRoot` (real Tomcat bytecode), so going through the live TCCL
+/// picks them up. Returns the loader's own `InputStream` (already a real object),
+/// or `None` when there is no context loader or it has no such resource — the
+/// caller then falls back to `FileNotFoundException`, matching the real handler.
+///
+/// Ordering note: the loader ref is only held across a single small
+/// `create_string` allocation before its `getResourceAsStream` call, keeping the
+/// moving-GC exposure minimal (same shape as the `toExternalForm` hop above).
+fn classpath_resource_via_context_loader(
+    ctx: &mut dyn NativeContext,
+    name: &str,
+) -> Option<ObjectRef> {
+    let thread = match ctx.invoke(
+        "java/lang/Thread",
+        "currentThread",
+        "()Ljava/lang/Thread;",
+        &[],
+    ) {
+        Ok(Some(Value::Object(Some(t)))) => t,
+        _ => return None,
+    };
+    let loader = match ctx.invoke_virtual(
+        thread,
+        "getContextClassLoader",
+        "()Ljava/lang/ClassLoader;",
+        &[],
+    ) {
+        Ok(Some(Value::Object(Some(l)))) => l,
+        _ => return None,
+    };
+    let name_s = ctx.create_string(name);
+    match ctx.invoke_virtual(
+        loader,
+        "getResourceAsStream",
+        "(Ljava/lang/String;)Ljava/io/InputStream;",
+        &[Value::Object(Some(name_s))],
+    ) {
+        Ok(Some(Value::Object(Some(stream)))) => Some(stream),
+        _ => None,
+    }
+}
+
 fn register_re4_url_http(r: &mut NativeMethodRegistry) {
     let url = "java/net/URL";
 
@@ -3688,7 +3737,19 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
             }
         } else if let Some(name) = url_str.strip_prefix("classpath:") {
             let name = name.trim_start_matches('/');
-            ctx.find_resource(name).ok_or_else(|| {
+            // Static app/boot/ext classpath first — preserves every case that
+            // already worked (e.g. catalina.jar's mbeans-descriptors.xml).
+            if let Some(b) = ctx.find_resource(name) {
+                b
+            } else if let Some(stream) = classpath_resource_via_context_loader(ctx, name) {
+                // Resource lives behind the thread context classloader (a
+                // deployed webapp's WEB-INF/classes), which `find_resource`
+                // can't see. The real `ClasspathURLStreamHandler` resolves it
+                // via `TCCL.getResource`; return the loader's own InputStream
+                // directly. (TestPropertiesRoleMappingListener
+                // testFileFromClasspath*: classpath:com/example/role-mapping.properties.)
+                return Ok(Some(Value::Object(Some(stream))));
+            } else {
                 // Tomcat's real `ClasspathURLStreamHandler.openConnection`
                 // throws `FileNotFoundException` (a subclass of IOException)
                 // when neither the TCCL nor the handler's own loader resolves
@@ -3697,10 +3758,10 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
                 // FileNotFoundException.class)` for `classpath:.../foo`. Mirror
                 // the `file:` arm above (which already uses `fnfex`) so a
                 // missing classpath resource raises FNFE, not a bare IOException.
-                fnfex(format!(
+                return Err(fnfex(format!(
                     "URL.openStream: classpath resource not found: {name}"
-                ))
-            })?
+                )));
+            }
         } else if let Some(name) = url_str.strip_prefix("resource:") {
             // Synthetic `resource:/<name>` URLs are produced by
             // `Class.getResource(String)` in `lang_class.rs` for resources
