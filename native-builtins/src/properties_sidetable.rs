@@ -1069,8 +1069,21 @@ fn native_properties_load_reader(ctx: &mut dyn NativeContext, args: &[Value]) ->
     Ok(None)
 }
 
-/// Native `Properties.getProperty(String)` — checks the side-table
-/// first, then falls back to the VM's system-property store.
+/// Read the `defaults` Properties reference (the head of the fallback chain
+/// set by `new Properties(Properties)`), resolving the field BY NAME so it is
+/// robust to CratonVM's dual native/real `Properties` field layouts. Returns
+/// `None` when the receiver has no defaults (the common case) or the field
+/// can't be resolved.
+fn props_defaults(ctx: &dyn NativeContext, this: ObjectRef) -> Option<ObjectRef> {
+    let idx = ctx.resolve_field_index("java/util/Properties", "defaults")?;
+    match ctx.get_field(this, idx) {
+        Value::Object(Some(d)) => Some(d),
+        _ => None,
+    }
+}
+
+/// Native `Properties.getProperty(String)` — checks the side-table first, then
+/// the `defaults` chain, then falls back to the VM's system-property store.
 /// Returns null when the key is unknown.
 ///
 /// We deliberately do NOT call back into `this.get(key)` via
@@ -1080,6 +1093,14 @@ fn native_properties_load_reader(ctx: &mut dyn NativeContext, args: &[Value]) ->
 /// (Hashtable's internal table-array is null) or NoSuchMethodError
 /// (the synthetic Properties' class hierarchy doesn't expose
 /// `Object.get`).  Both have been observed during KC26 boot.
+///
+/// The `defaults` fallback, by contrast, recurses through the *defaults*
+/// Properties' own `getProperty` (`invoke_virtual`), so it naturally walks a
+/// multi-level `new Properties(parentDefaults)` chain and bottoms out at a
+/// Properties with no defaults. This matches `java.util.Properties.getProperty`
+/// (JDK: `(sval == null && defaults != null) ? defaults.getProperty(key) : sval`)
+/// and is checked BEFORE the system-property fallback so a Properties' own
+/// defaults win over any same-named system property.
 fn native_properties_get_property_1(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -1101,6 +1122,20 @@ fn native_properties_get_property_1(
         );
         return Ok(Some(Value::Object(Some(ctx.create_string(&v)))));
     }
+    // Fall through to the `defaults` chain (recursively, via the defaults
+    // Properties' own getProperty). The receiver is no longer used after this,
+    // and the VM roots `defs`/`key_obj` for the duration of the re-entrant call.
+    if let Some(defs) = props_defaults(ctx, this) {
+        let dv = ctx.invoke_virtual(
+            defs,
+            "getProperty",
+            "(Ljava/lang/String;)Ljava/lang/String;",
+            &[Value::Object(Some(key_obj))],
+        )?;
+        if let Some(Value::Object(Some(s))) = dv {
+            return Ok(Some(Value::Object(Some(s))));
+        }
+    }
     tracing::debug!(
         target: "cratonvm_vm::props_sidetable",
         ?this, key = %key,
@@ -1115,32 +1150,21 @@ fn native_properties_get_property_1(
     }
 }
 
-/// Native `Properties.getProperty(String, String)` — like the
-/// 1-arg form but returns the supplied default when the key is
-/// unknown.
+/// Native `Properties.getProperty(String, String)` — `getProperty(key)` (which
+/// includes the side-table, the `defaults` chain, and the system-property
+/// fallback) and, only if that is null, the supplied default. Mirrors the JDK:
+/// `String val = getProperty(key); return (val == null) ? defaultValue : val;`.
 fn native_properties_get_property_2(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
     let default = args.get(2).copied().unwrap_or(Value::Object(None));
-    let this = match args.first() {
-        Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(Some(default)),
-    };
-    let key_obj = match args.get(1) {
-        Some(Value::Object(Some(k))) => *k,
-        _ => return Ok(Some(default)),
-    };
-    let key = crate::property_key_from_java_string(ctx, key_obj);
-    if let Some(v) = get_kv(ctx, this, &key) {
-        return Ok(Some(Value::Object(Some(ctx.create_string(&v)))));
-    }
-    match ctx
-        .get_system_property(&key)
-        .or_else(|| super::bootstrap_property_fallback(&key))
-    {
-        Some(v) => Ok(Some(Value::Object(Some(ctx.create_string(&v))))),
-        None => Ok(Some(default)),
+    // Reuse the 1-arg path verbatim (it owns the side-table → defaults → system
+    // lookup order), substituting the caller's default on a null result.
+    let nargs = 2.min(args.len());
+    match native_properties_get_property_1(ctx, &args[..nargs])? {
+        Some(Value::Object(Some(s))) => Ok(Some(Value::Object(Some(s)))),
+        _ => Ok(Some(default)),
     }
 }
 

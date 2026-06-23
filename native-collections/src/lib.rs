@@ -26699,6 +26699,19 @@ fn native_props_init_defaults(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     };
     native_map_init(ctx, &[Value::Object(Some(this))])?;
     ctx.set_field(this, PROPS_FIELD_DEFAULTS, args[1]);
+    // Also store the defaults reference in the REAL `defaults` field, resolved
+    // by name. On a real-layout `java.util.Properties` the inherited Hashtable
+    // fields push `defaults` to a different slot than this native model's
+    // `PROPS_FIELD_DEFAULTS` (3) — which there lands on `loadFactor` (a float),
+    // so the reference is misplaced. The side-table `getProperty` reads the
+    // by-name `defaults` slot to walk the fallback chain (TC0622 follow-up);
+    // without this write it always sees null. Writing both keeps the native
+    // model (slot 3) and the real layout consistent.
+    if let Some(idx) = ctx.resolve_field_index("java/util/Properties", "defaults") {
+        if idx != PROPS_FIELD_DEFAULTS {
+            ctx.set_field(this, idx, args[1]);
+        }
+    }
     Ok(None)
 }
 
