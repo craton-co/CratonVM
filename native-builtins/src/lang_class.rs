@@ -11799,6 +11799,62 @@ fn make_annotated_type(
     obj
 }
 
+/// Build a non-null, empty `java.security.Permissions` collection.
+///
+/// We allocate the real-layout object and run its no-arg constructor so the
+/// internal `permsMap` is initialised — this makes `PermissionCollection`'s
+/// `elements()` / `toString()` work and renders as HotSpot's
+/// `java.security.Permissions@HASH ( )` for an app class with no policy
+/// grants. The constructor run is best-effort: even if it fails the object is
+/// still non-null, which is the contract callers (`getPermissions()`) rely on.
+pub(crate) fn build_empty_permissions(ctx: &mut dyn NativeContext) -> ObjectRef {
+    let perms = crate::alloc_concurrent_synthetic(ctx, "java/security/Permissions", 2);
+    let _ = ctx.invoke(
+        "java/security/Permissions",
+        "<init>",
+        "()V",
+        &[Value::Object(Some(perms))],
+    );
+    perms
+}
+
+/// Populate a freshly-allocated `java.security.ProtectionDomain` with faithful
+/// `codesource` / `classloader` / `permissions` / `principals` fields.
+///
+/// Writes BOTH the synthetic field layout (slot 0 = codesource, 1 =
+/// permissions, 2 = classloader, 3 = principals — see `class_manager.rs`) AND
+/// the real-JDK layout (slot 0 = codesource, 1 = classloader, 2 = principals,
+/// 3 = permissions) by name. The slot writes land first; the by-name writes
+/// run last and are authoritative, so a real-JDK-loaded `ProtectionDomain`
+/// ends up with each value in the correct field regardless of which layout the
+/// object actually has.
+///
+/// `classloader` is the class's defining loader (matching
+/// `Class.getClassLoader()`); previously this slot was left null or — worse —
+/// clobbered with the permissions object (SBR-13).
+pub(crate) fn populate_protection_domain_fields(
+    ctx: &mut dyn NativeContext,
+    pd: ObjectRef,
+    codesource: Value,
+    classloader: Value,
+) {
+    let perms = build_empty_permissions(ctx);
+    let principals = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
+    let perms_v = Value::Object(Some(perms));
+    let principals_v = Value::Object(Some(principals));
+
+    // Synthetic layout (codesource, permissions, classloader, principals).
+    ctx.set_field(pd, 0, codesource);
+    ctx.set_field(pd, 1, perms_v);
+    ctx.set_field(pd, 2, classloader);
+    ctx.set_field(pd, 3, principals_v);
+    // Real-JDK layout by name (authoritative — runs last).
+    ctx.set_field_by_name(pd, "codesource", codesource);
+    ctx.set_field_by_name(pd, "permissions", perms_v);
+    ctx.set_field_by_name(pd, "classloader", classloader);
+    ctx.set_field_by_name(pd, "principals", principals_v);
+}
+
 /// `java/lang/Class.getClassFileVersion0()I`
 ///
 /// Returns the class file version number. The JDK encodes this as
@@ -11969,22 +12025,23 @@ pub(crate) fn native_class_get_protection_domain0(
         ctx.set_field_by_name(cs, "certs", Value::Object(Some(arr)));
     }
 
-    // Build ProtectionDomain(codesource=cs, permissions=null, classloader=null,
-    // principals=empty).  Null permissions = "all permissions" per JDK default.
+    // Build ProtectionDomain(codesource=cs, permissions=<empty>,
+    // classloader=<defining loader>, principals=empty).  SBR-13: populate the
+    // real defining ClassLoader and a non-null (empty) Permissions collection
+    // so `getClassLoader()` / `getPermissions()` match HotSpot's shape instead
+    // of returning null / a placeholder.
     let pd_cid = ctx
         .ensure_class_initialized("java/security/ProtectionDomain")
         .unwrap_or(cratonvm_types::ClassId::new(0));
     let pd_num_fields = ctx.class_num_total_fields(pd_cid).max(4);
     let pd = ctx.alloc_object(pd_cid, pd_num_fields);
-    ctx.set_field(pd, 0, Value::Object(Some(cs)));
-    ctx.set_field(pd, 1, Value::Object(None));
-    ctx.set_field(pd, 2, Value::Object(None));
-    let empty_principals = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
-    ctx.set_field(pd, 3, Value::Object(Some(empty_principals)));
-    ctx.set_field_by_name(pd, "codesource", Value::Object(Some(cs)));
-    ctx.set_field_by_name(pd, "permissions", Value::Object(None));
-    ctx.set_field_by_name(pd, "classloader", Value::Object(None));
-    ctx.set_field_by_name(pd, "principals", Value::Object(Some(empty_principals)));
+    // Resolve the class's defining loader exactly like `Class.getClassLoader()`
+    // (bootstrap → null, app classpath → the singleton AppClassLoader).
+    let classloader = native_class_get_class_loader(ctx, args)
+        .ok()
+        .flatten()
+        .unwrap_or(Value::Object(None));
+    populate_protection_domain_fields(ctx, pd, Value::Object(Some(cs)), classloader);
 
     Ok(Some(Value::Object(Some(pd))))
 }

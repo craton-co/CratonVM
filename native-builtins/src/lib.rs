@@ -4513,8 +4513,7 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         "getProtectionDomain",
         "()Ljava/security/ProtectionDomain;",
         |ctx, args| {
-            let perms = alloc_concurrent_synthetic(ctx, "java/security/Permissions", 1);
-            let pd = alloc_concurrent_synthetic(ctx, "java/security/ProtectionDomain", 2);
+            let pd = alloc_concurrent_synthetic(ctx, "java/security/ProtectionDomain", 4);
             // Try to produce a real CodeSource with a URL pointing at the
             // classpath entry that holds this Class.
             let mut path_opt = if let Some(Value::Object(Some(mirror))) = args.first() {
@@ -4547,7 +4546,7 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
                         .filter(|s| !s.is_empty())
                 })
             });
-            if let Some(raw_path) = path_opt {
+            let codesource = if let Some(raw_path) = path_opt {
                 // R63 (Keycloak/Quarkus): `find_class_source_path` returns the
                 // classpath entry verbatim — which may be a relative path like
                 // `lib/quarkus-run.jar` when launched via `cd <appdir> && --jar
@@ -4609,11 +4608,22 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
                 let cs = alloc_concurrent_synthetic(ctx, "java/security/CodeSource", 2);
                 ctx.set_field(cs, 0, Value::Object(Some(url)));
                 ctx.set_field(cs, 1, Value::Object(None));
-                ctx.set_field(pd, 0, Value::Object(Some(cs)));
+                Value::Object(Some(cs))
             } else {
-                ctx.set_field(pd, 0, Value::Object(None));
-            }
-            ctx.set_field(pd, 1, Value::Object(Some(perms)));
+                Value::Object(None)
+            };
+            // SBR-13: populate `classloader` (the class's real defining loader,
+            // matching `Class.getClassLoader()`) and a non-null (empty)
+            // `permissions` collection. The previous code allocated only the
+            // codesource + a Permissions on slot 1 — but slot 1 is the
+            // `classloader` field in the real-JDK `ProtectionDomain` layout, so
+            // `getClassLoader()` returned the Permissions object and
+            // `getPermissions()` was null.
+            let classloader = lang_class::native_class_get_class_loader(ctx, args)
+                .ok()
+                .flatten()
+                .unwrap_or(Value::Object(None));
+            lang_class::populate_protection_domain_fields(ctx, pd, codesource, classloader);
             Ok(Some(Value::Object(Some(pd))))
         },
     );
