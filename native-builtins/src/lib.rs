@@ -36799,7 +36799,11 @@ fn native_md_update_bytes_off(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
 /// re-implement the Keccak permutation.
 pub(crate) fn compute_digest(algo: &str, data: &[u8]) -> Vec<u8> {
     use sha3::Digest as _;
-    let upper = algo.to_uppercase().replace('-', "");
+    // Strip both `-` and `/` so the truncated SHA-512 spellings
+    // ("SHA-512/256", "SHA-512/224") normalise to "SHA512256" / "SHA512224"
+    // — matching the alphanumeric-only normalisation used by
+    // `algorithm_supported` / `digest_length_bytes`.
+    let upper = algo.to_uppercase().replace(['-', '/'], "");
     match upper.as_str() {
         "MD5" => real_md5(data),
         "SHA1" | "SHA" => real_sha1(data),
@@ -36813,6 +36817,22 @@ pub(crate) fn compute_digest(algo: &str, data: &[u8]) -> Vec<u8> {
         "SHA256" => real_sha256(data),
         "SHA384" => real_sha384(data),
         "SHA512" => real_sha512(data),
+        "SHA512224" => {
+            // SHA-512/224 (FIPS 180-4 §5.3.6): SHA-512 with the distinct
+            // alternate IV derived from "SHA-512/224", truncated to 224 bits.
+            // Distinct from SHA-224 and not a plain truncation of SHA-512.
+            let mut h = sha2::Sha512_224::new();
+            h.update(data);
+            h.finalize().to_vec()
+        }
+        "SHA512256" => {
+            // SHA-512/256 (FIPS 180-4 §5.3.6): SHA-512 with the distinct
+            // alternate IV derived from "SHA-512/256", truncated to 256 bits.
+            // Distinct from SHA-256 and not a plain truncation of SHA-512.
+            let mut h = sha2::Sha512_256::new();
+            h.update(data);
+            h.finalize().to_vec()
+        }
         "SHA3224" => {
             let mut h = sha3::Sha3_224::new();
             h.update(data);
