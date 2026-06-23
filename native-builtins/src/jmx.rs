@@ -2634,30 +2634,65 @@ fn register_mbean_server(r: &mut NativeMethodRegistry) {
     // there is no real `java.management` module, so the factory call needs a
     // server. Returning our synthetic `alloc_mbean_server` gives the full
     // register/get/set/invoke/query flow a concrete receiver.
-    let make_server = |ctx: &mut dyn NativeContext, _args: &[Value]| {
-        Ok(Some(Value::Object(Some(alloc_mbean_server(ctx)))))
+    //
+    // `newMBeanServer` only builds a server; `createMBeanServer` additionally
+    // registers it so the (un-overridden, real-bytecode) `findMBeanServer`
+    // reports it — matching the JMX contract where only createMBeanServer
+    // tracks servers in the factory list.
+    let new_server: fn(&mut dyn NativeContext, &[Value]) -> MethodCallResult =
+        |ctx, _args| Ok(Some(Value::Object(Some(alloc_mbean_server(ctx)))));
+    let create_server: fn(&mut dyn NativeContext, &[Value]) -> MethodCallResult = |ctx, _args| {
+        let server = alloc_mbean_server(ctx);
+        Ok(Some(Value::Object(Some(track_created_mbean_server(
+            ctx, server,
+        )))))
     };
-    let make_server_fn: fn(&mut dyn NativeContext, &[Value]) -> MethodCallResult = make_server;
     for (name, desc) in [
         ("createMBeanServer", "()Ljavax/management/MBeanServer;"),
         (
             "createMBeanServer",
             "(Ljava/lang/String;)Ljavax/management/MBeanServer;",
         ),
+    ] {
+        r.register("javax/management/MBeanServerFactory", name, desc, create_server);
+    }
+    for (name, desc) in [
         ("newMBeanServer", "()Ljavax/management/MBeanServer;"),
         (
             "newMBeanServer",
             "(Ljava/lang/String;)Ljavax/management/MBeanServer;",
         ),
     ] {
-        r.register(
-            "javax/management/MBeanServerFactory",
-            name,
-            desc,
-            make_server_fn,
-        );
+        r.register("javax/management/MBeanServerFactory", name, desc, new_server);
     }
     r.set_category(__prev_cat);
+}
+
+/// Append a freshly-created MBeanServer to the real
+/// `javax.management.MBeanServerFactory.mBeanServerList` static field, so the
+/// (un-overridden) real `findMBeanServer(null)` bytecode reports it — the real
+/// `createMBeanServer` does this via the private `addMBeanServer`, which our
+/// override bypasses. Returns the (possibly GC-forwarded) server. Best-effort:
+/// if the field can't be resolved (e.g. unit-test mock) the server is returned
+/// untracked, leaving `findMBeanServer` empty as before.
+fn track_created_mbean_server(ctx: &mut dyn NativeContext, server: ObjectRef) -> ObjectRef {
+    let pin = ctx.pin_native_root(server);
+    if let Ok(cls_id) = ctx.ensure_class_initialized("javax/management/MBeanServerFactory") {
+        if let Some(idx) = ctx.static_field_index_by_name(cls_id, "mBeanServerList") {
+            if let Value::Object(Some(list)) = ctx.get_static_field(cls_id, idx) {
+                let s = ctx.read_native_pin(pin, server);
+                let _ = ctx.invoke_virtual(
+                    list,
+                    "add",
+                    "(Ljava/lang/Object;)Z",
+                    &[Value::Object(Some(s))],
+                );
+            }
+        }
+    }
+    let result = ctx.read_native_pin(pin, server);
+    ctx.unpin_native_roots(pin);
+    result
 }
 
 // ---------------------------------------------------------------------------
