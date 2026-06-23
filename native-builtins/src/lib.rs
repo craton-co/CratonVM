@@ -13412,6 +13412,205 @@ fn native_object_hash_code(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     Ok(Some(Value::Int(hash)))
 }
 
+/// Map a synthetic object's stamped class — an interface, an abstract class, or
+/// a craton-internal backing class — to the concrete, JDK-plausible class that a
+/// real HotSpot JVM reports from `Object.getClass()`.
+///
+/// Several CratonVM synthetic factories stamp their result with the *interface*
+/// or *abstract* type it stands in for (e.g. `IntStream.rangeClosed(..)` →
+/// the `java/util/stream/IntStream` interface, `FileSystems.getDefault()` →
+/// the abstract `java/nio/file/FileSystem`) or with a private craton-internal
+/// name (`List.of(..)` → `cratonvm/internal/UnmodifiableList`). On a real JVM an
+/// instance's runtime class is always concrete, so `getClass()` must never
+/// surface an interface/abstract/internal type. Native method *dispatch* keys on
+/// the resolved declaring class, not the receiver's stamp (see
+/// `interpreter.rs`), so re-reporting the class here is decoupled from method
+/// resolution — it changes only the Java-visible `Class` mirror, not storage,
+/// dispatch, or GC layout.
+///
+/// Returns the internal (slash-separated) name of the concrete substitute for a
+/// stamp whose concrete class is fixed (does not depend on the instance), or
+/// `None`. Size-dependent immutable-collection stamps are handled separately by
+/// [`immutable_collection_kind`] because their concrete class varies with the
+/// element count.
+fn jdk_concrete_getclass_alias(stamp: &str) -> Option<&'static str> {
+    Some(match stamp {
+        // java.util.stream — synthetic streams are stamped with the *interface*.
+        // (`IntStream.of(..)` already produces a real `IntPipeline$Head`, so its
+        // objects are not stamped with the interface and never reach here.)
+        "java/util/stream/Stream" => "java/util/stream/ReferencePipeline$Head",
+        "java/util/stream/IntStream" => "java/util/stream/IntPipeline$Head",
+        "java/util/stream/LongStream" => "java/util/stream/LongPipeline$Head",
+        "java/util/stream/DoubleStream" => "java/util/stream/DoublePipeline$Head",
+        // java.net — abstract URLConnection subclasses.
+        "java/net/JarURLConnection" => "sun/net/www/protocol/jar/JarURLConnection",
+        "java/net/HttpURLConnection" => "sun/net/www/protocol/http/HttpURLConnection",
+        // java.nio.file — abstract/interface stamps; the concrete impl is
+        // platform specific. Resolution is best-effort: an unavailable class
+        // simply falls back to the stamped mirror (see caller).
+        "java/nio/file/FileSystem" => {
+            if cfg!(windows) {
+                "sun/nio/fs/WindowsFileSystem"
+            } else {
+                "sun/nio/fs/UnixFileSystem"
+            }
+        }
+        "java/nio/file/spi/FileSystemProvider" => {
+            if cfg!(windows) {
+                "sun/nio/fs/WindowsFileSystemProvider"
+            } else {
+                "sun/nio/fs/UnixFileSystemProvider"
+            }
+        }
+        "java/nio/file/Path" => {
+            if cfg!(windows) {
+                "sun/nio/fs/WindowsPath"
+            } else {
+                "sun/nio/fs/UnixPath"
+            }
+        }
+        _ => return None,
+    })
+}
+
+/// The resolved display strategy for a stamped class, memoised per stamp.
+#[derive(Clone, Copy)]
+enum GetClassDisplay {
+    /// No remap — report the stamped class unchanged (the common case).
+    Stamp,
+    /// A fixed concrete alias, already resolved to its `ClassId`.
+    Fixed(cratonvm_types::ClassId),
+    /// `java.util` immutable-collection family. HotSpot picks the concrete
+    /// class by element count (`List12`/`ListN`, `Set12`/`SetN`, `Map1`/`MapN`),
+    /// so this is resolved per-object rather than memoised to a single class.
+    ImmutableList,
+    ImmutableSet,
+    ImmutableMap,
+}
+
+/// Classify the craton-internal immutable/unmodifiable collection stamps.
+/// `List.of`/`copyOf` and `Collections.unmodifiableList` currently share one
+/// backing class, so a wrapper produced by `unmodifiableList` is also reported
+/// with the `List.of` concrete family here; the distinct
+/// `Collections$UnmodifiableRandomAccessList` would need a stamp split
+/// (deferred — see SBR-12).
+fn immutable_collection_kind(stamp: &str) -> Option<GetClassDisplay> {
+    match stamp {
+        "cratonvm/internal/UnmodifiableList" => Some(GetClassDisplay::ImmutableList),
+        "cratonvm/internal/UnmodifiableSet" => Some(GetClassDisplay::ImmutableSet),
+        "cratonvm/internal/UnmodifiableMap" => Some(GetClassDisplay::ImmutableMap),
+        _ => None,
+    }
+}
+
+thread_local! {
+    // Per-stamp memo for the display strategy. `getClass()`/`toString()` are
+    // hot; resolving the stamped name (a `String` clone) and loading the alias
+    // on every call would allocate each time. `ClassId`s are stable for the VM
+    // lifetime, so this never goes stale.
+    static GETCLASS_ALIAS_CACHE: std::cell::RefCell<
+        std::collections::HashMap<cratonvm_types::ClassId, GetClassDisplay>,
+    > = std::cell::RefCell::new(std::collections::HashMap::new());
+    // Secondary memo: concrete display name -> resolved `ClassId` (loading on
+    // first use). Shared by the fixed and size-dependent paths.
+    static GETCLASS_NAME_TO_ID: std::cell::RefCell<
+        std::collections::HashMap<&'static str, Option<cratonvm_types::ClassId>>,
+    > = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// Resolve (and cache) a concrete display class name to its `ClassId`, loading
+/// it on first use. `None` if the class is unavailable (caller falls back).
+fn getclass_resolve_name(
+    ctx: &mut dyn NativeContext,
+    name: &'static str,
+) -> Option<cratonvm_types::ClassId> {
+    if let Some(cached) = GETCLASS_NAME_TO_ID.with(|c| c.borrow().get(name).copied()) {
+        return cached;
+    }
+    let resolved = ctx.class_id_by_name(name).or_else(|| {
+        let _ = ctx.load_class(name);
+        ctx.class_id_by_name(name)
+    });
+    GETCLASS_NAME_TO_ID.with(|c| c.borrow_mut().insert(name, resolved));
+    resolved
+}
+
+/// The element count of a synthetic immutable collection, via its own `size()`.
+/// Best-effort: any failure yields `-1`, which selects the `…N` (multi) form.
+fn getclass_collection_size(ctx: &mut dyn NativeContext, this: ObjectRef) -> i64 {
+    match ctx.invoke_virtual(this, "size", "()I", &[]) {
+        Ok(Some(Value::Int(n))) => n as i64,
+        _ => -1,
+    }
+}
+
+/// Resolve the concrete display `ClassId` for an object stamped with `class_id`,
+/// or `None` to use the stamp unchanged. The stamp→strategy classification is
+/// memoised; the size-dependent collection forms are resolved per-object.
+fn getclass_display_class_id(
+    ctx: &mut dyn NativeContext,
+    class_id: cratonvm_types::ClassId,
+    this: ObjectRef,
+) -> Option<cratonvm_types::ClassId> {
+    let display = match GETCLASS_ALIAS_CACHE.with(|c| c.borrow().get(&class_id).copied()) {
+        Some(d) => d,
+        None => {
+            // Cache miss: classify once. `Stamp` is cached too (negative cache)
+            // so the common non-synthetic class never re-clones its name.
+            let d = match ctx.class_name_of_id(class_id) {
+                Some(name) => {
+                    if let Some(kind) = immutable_collection_kind(&name) {
+                        kind
+                    } else if let Some(alias) = jdk_concrete_getclass_alias(&name) {
+                        match getclass_resolve_name(ctx, alias) {
+                            Some(cid) => GetClassDisplay::Fixed(cid),
+                            None => GetClassDisplay::Stamp,
+                        }
+                    } else {
+                        GetClassDisplay::Stamp
+                    }
+                }
+                None => GetClassDisplay::Stamp,
+            };
+            GETCLASS_ALIAS_CACHE.with(|c| c.borrow_mut().insert(class_id, d));
+            d
+        }
+    };
+    match display {
+        GetClassDisplay::Stamp => None,
+        GetClassDisplay::Fixed(cid) => Some(cid),
+        // HotSpot: `List.of()`→ListN, size 1–2→List12, ≥3→ListN. Set mirrors
+        // List; Map uses Map1 only for a single entry, else MapN.
+        GetClassDisplay::ImmutableList => {
+            let n = getclass_collection_size(ctx, this);
+            let name = if (1..=2).contains(&n) {
+                "java/util/ImmutableCollections$List12"
+            } else {
+                "java/util/ImmutableCollections$ListN"
+            };
+            getclass_resolve_name(ctx, name)
+        }
+        GetClassDisplay::ImmutableSet => {
+            let n = getclass_collection_size(ctx, this);
+            let name = if (1..=2).contains(&n) {
+                "java/util/ImmutableCollections$Set12"
+            } else {
+                "java/util/ImmutableCollections$SetN"
+            };
+            getclass_resolve_name(ctx, name)
+        }
+        GetClassDisplay::ImmutableMap => {
+            let n = getclass_collection_size(ctx, this);
+            let name = if n == 1 {
+                "java/util/ImmutableCollections$Map1"
+            } else {
+                "java/util/ImmutableCollections$MapN"
+            };
+            getclass_resolve_name(ctx, name)
+        }
+    }
+}
+
 fn native_object_get_class(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
@@ -13513,7 +13712,12 @@ fn native_object_get_class(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     }
 
     let class_id = ctx.class_id_of_object(this);
-    let mirror = ctx.get_class_mirror(class_id);
+    // Synthetic objects are sometimes stamped with the interface/abstract/
+    // internal type they stand in for; a real JVM always reports a concrete
+    // runtime class. Re-map to a JDK-plausible concrete class for the mirror
+    // (memoised; no-op for ordinary classes). Storage/dispatch are unaffected.
+    let display_id = getclass_display_class_id(ctx, class_id, this).unwrap_or(class_id);
+    let mirror = ctx.get_class_mirror(display_id);
     Ok(Some(Value::Object(Some(mirror))))
 }
 
@@ -13572,6 +13776,11 @@ fn native_object_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         }
     };
     let class_id = ctx.class_id_of_object(this);
+    // Keep the default `toString` class name consistent with `getClass()`:
+    // synthetic objects stamped with an interface/abstract/internal class
+    // report their concrete JDK display class here too (memoised; no-op for
+    // ordinary classes).
+    let class_id = getclass_display_class_id(ctx, class_id, this).unwrap_or(class_id);
     let dotted = object_to_string_dotted_name(ctx, class_id);
     let hash = ctx.identity_hash_code(this);
     // Build "dotted@hash" with a single pre-sized buffer (saves the realloc
