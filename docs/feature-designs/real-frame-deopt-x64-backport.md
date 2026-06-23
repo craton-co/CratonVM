@@ -56,6 +56,123 @@ The decisions captured in "Open question" below were resolved as the steps lande
 `SavedRegisters.xmm[16]` added for the cat-2/FP follow-up, compilation-epoch
 versioning wired). They are retained for historical context.
 
+## Phase B — x64 VirtualObject emission (scalar-replaced objects)
+
+Scoped from a fresh research pass (2026-06-22) over the x64 scalar-replacement
+path, the VM-side materializer, and the IR-path producer. Branch
+`feat/x64-deopt-phase-b` (worktree `CratonVM-x64deopt`).
+
+**Consumer is already done.** `vm/src/runtime/deopt_materialize.rs`
+(`materialize_virtual_objects`) is fully implemented, wired into the live resume
+sink (`build_deopt_frame_inner`), GC-correct (two-phase, `TempRootScope`),
+cycle-safe, and unit-tested. The IR/C2 producer already feeds it via
+`ir_lower::frame_value_for_object` under `CRATONVM_SCALAR_DEOPT`. So **Phase B is
+producer-only work in `jit/src/x64.rs`** — emit the right `VirtualObject`
+descriptors; no consumer changes.
+
+**The gap.** x64 scalar replacement (`plan_scalar_replacement`,
+`ScalarReplacedObject`) keeps only `{num_fields, field_base_offset}` — it drops
+the class id and all per-field typing, and the snapshot builder
+(`build_and_record_deopt_point`) emits a bogus `StackSlotRef`/`RegisterRef` to the
+zeroed dummy ref instead of a `VirtualObject`. `can_deopt_resume` requires
+`scalar_replaced.is_empty()`, excluding every scalar-replacing method.
+
+**Two load-bearing simplifications vs the IR path** (both reduce risk):
+1. **Frame slots are temporally correct by construction.** The IR path lowers SSA
+   *values* and so needs strict-dominance analysis (a deopt before a field store
+   must see the pre-store value). The single-pass path reads the field's *frame
+   slot*, which is zero-filled at `new` and overwritten by `putfield` — so the
+   slot always holds the field's actual value at any PC. No dominance analysis;
+   reading the slot is unconditionally correct.
+2. **Scalar objects appear only in LOCALS at deopt points, never on the operand
+   stack.** `analyze_escapes` escapes any object passed as a call arg, so a
+   non-escaping (scalar-replaced) object is never a call argument → never on the
+   stack at a Step-6 call-site deopt; and a BCE loop-header deopt has an empty
+   stack. So only **per-local** provenance is needed (`local index → new_pc`),
+   which is index-keyed (no operand-stack-depth alignment risk). The straight-line
+   guarantee (`analyze_escapes` escapes anything crossing a CFG edge) makes
+   clearing provenance at branch barriers sound — no scalar object is ever live
+   across one.
+
+**Field types** come from access sites: join `field_info` (`(pc, field_index,
+type_tag)`) with the plan's `field_ops` (`pc → new_pc`) on pc to get
+`(new_pc, field_index) → type_tag`. Fields never accessed default to `Int(0)`
+(zero, sound — admitted SR allocations have no non-zero primitive `<init>`),
+mirroring the IR producer's `None ⇒ Int(0)`.
+
+**Increments:**
+- **B1 — data model.** `ScalarReplacedObject` gains `class_id` (already in
+  `new_info`, currently dropped); Compiler gains `sr_field_types:
+  HashMap<(new_pc, field_index), u8>` (built post-plan from `field_info ∩
+  field_ops`) and `sr_local_prov_at: HashMap<pc, Vec<(local_idx, new_pc)>>`
+  (captured during `plan_scalar_replacement`'s existing locals abs-interp,
+  snapshotting non-empty `local_prov` per pc). Additive, behavior-neutral.
+- **B2 — emit.** In `build_and_record_deopt_point`, for each local `i` whose
+  `sr_local_prov_at[bci]` maps it to a scalar `new_pc`: emit
+  `FrameValue::VirtualObject` (first occurrence) / `VirtualObjectRef(new_pc)`
+  (shared), with `field_values[k] = StackSlot{,Ref,Long}(-(field_base_offset +
+  k*SLOT_SIZE))` typed by `sr_field_types`, or `Int(0)` for unaccessed fields.
+- **B3 — relax the gate.** `can_deopt_resume` admits a scalar-replacing method
+  when it has **no monitor ops / is not `ACC_SYNCHRONIZED`** (the elided-monitor
+  hazard stays in Phase C) and every live SR object fully resolves (no
+  `Unsupported`/`Undefined` field). Still `CRATONVM_DEOPT_REAL`-gated.
+- **B4 — tests + e2e** under `CRATONVM_DEOPT_REAL` / `CRATONVM_DEOPT_EAGER`.
+
+**Status (2026-06-22): B1–B3 implemented, unit + integration tested, committed.**
+849 jit tests (2 new: `plan_scalar_replacement` class_id + `local_prov_at`
+capture; `sr_field_values` type→`StackSlot*` mapping) + 48 vm deopt tests
+(consumer materialization) all green. The field-slot offset
+(`-(field_base_offset + k*SLOT_SIZE)`) was verified by code to match exactly the
+address the SR `getfield` reads (`emit_load_local`/`modrm_rbp_disp`). Gate-off is
+byte-identical (emission only runs inside `build_and_record_deopt_point`, gated;
+`can_deopt_resume` stays false with no `deopt_points`).
+
+**B4 runtime e2e — BLOCKED on single-pass SR reachability (not a Phase B defect).**
+Added a `CRATONVM_DEOPT_EAGER_BCI=<n>` trigger (a call-site analog of
+`CRATONVM_DEOPT_EAGER`, since a scalar object can never be live at a loop header)
+to force a deopt at a straight-line bci where a scalar local is live. Diagnostics
+(`CRATONVM_DBG_SCALAR_DEOPT`) showed single-pass scalar replacement never fires at
+runtime for the standard `new X(); <init>()V` pattern: `jit_scan` runs
+`analyze_escapes` with an EMPTY invokespecial-shape map, so it conservatively
+escapes the `<init>` receiver and seeds `non_escaping_new` empty; `x64::compile`'s
+precise re-analysis (which has the resolved shapes) is gated to only *refine a
+non-empty* set (`if non_escaping_new.is_empty() { stays empty }`), so it never
+runs — and the hot IR/`try_compile` path passes an empty set too (`lib.rs:5812`).
+Net: single-pass (x64) SR was effectively dormant in the runtime hot paths for
+ordinary allocations.
+
+**SR-reachability FIXED (commit `0db926ed`).** `x64::compile`'s precise
+re-analysis is now gated on whether the method allocates (`new_info` non-empty)
+rather than on jit_scan's seed, so it DISCOVERS non-escaping objects (it
+recomputes from scratch with the resolved `<init>` shapes) instead of only
+refining a non-empty set. Verified: a straight-line `new X(); <init>()V` method
+now reports `non_escaping=[0]` and the Phase B path emits the `VirtualObject`
+(correct `class_id`/`num_fields`) at runtime. This is an UNGATED production
+codegen change — validated by 849 jit tests + binarytrees depth-16 checksum
+`14985902` == HotSpot (escaping `TreeNode`s correctly NOT scalar-replaced).
+Fuller app-suite validation (gauntlet/kafka) recommended before merging the
+ungated change.
+
+**Live deopt-RESUME still not directly observed — C2 subsumption.** The eager
+trigger fires in the single-pass (C1) compile, but C2/IR subsumes hot methods
+(and has its own IR SR-deopt via `ir_lower::frame_value_for_object`,
+`CRATONVM_SCALAR_DEOPT`), so the *running* version of a hot method is usually the
+C2 recompile — single-pass deopt-resume is inherently narrow at runtime (C1
+window / C1-resident methods only). Every link is proven independently (SR fires
+→ producer emits the correct `VirtualObject`; the consumer materializes it, 48 vm
+tests), but the C1-version-stays-resident-and-deopts case is hard to stage. The
+trigger + diagnostics are retained as the harness.
+
+## Phase C — monitors (deferred); inlining (out of scope)
+
+Monitor-bearing deopt needs the emitter to record held/elided monitors
+(`FrameState.monitors` + an "elided-monitor present" flag on the deopt point) and
+the resume path to **relock** (`Frame::new_pooled` sets up no monitor ownership
+today; the resume sink bails on any non-empty `monitors` / `is_synchronized`).
+Harder and riskier — deferred to Phase C. **Inlining is default-OFF with a known
+unfixed `try_emit_inline_body` miscompile**, so inlined-frame-chain deopt is moot
+in production and excluded.
+
 ## Goal
 
 When a guard fails in JIT code, rebuild a **precise** interpreter frame at the

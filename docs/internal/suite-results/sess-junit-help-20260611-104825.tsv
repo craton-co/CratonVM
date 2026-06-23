@@ -1,0 +1,5 @@
+item	variant	rc	state	wall_s	summary
+junit-help	cratonvm-jit	0	OK	20.8	Usage: junit [OPTIONS] [COMMAND]
+junit-help	cratonvm-nojit	0	OK	7.0	Usage: junit [OPTIONS] [COMMAND]
+junit-help	hotspot	0	OK	0.8	Usage: junit [OPTIONS] [COMMAND]
+junit-help	tornadovm	0	OK	1.2	Usage: junit [OPTIONS] [COMMAND]
