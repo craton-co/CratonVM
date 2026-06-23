@@ -13461,6 +13461,57 @@ fn register_datagram_channel(r: &mut NativeMethodRegistry) {
         let this = obj_arg92(args, 0)?;
         Ok(Some(Value::Object(Some(this))))
     });
+
+    // DatagramSocket-surface adaptor methods.
+    //
+    // `socket()` (above) returns the channel itself, so callers that do
+    // `datagramChannel.socket().<datagramSocketMethod>()` resolve those
+    // `java/net/DatagramSocket` methods against THIS class. The real abstract
+    // `DatagramChannel` declares none of them, so they reach native lookup
+    // here. Concretely, Tomcat's `NioReceiver.configureDatagramChannel()` calls
+    // `socket().{setSendBufferSize,setReceiveBufferSize,setReuseAddress,
+    // setSoTimeout,setTrafficClass}` and `ReceiverBase.bindUdp()` calls
+    // `socket().bind(addr)` — the void `DatagramSocket.bind(SocketAddress)`.
+    // Buffer/option setters are best-effort against the channel's UDP fd;
+    // `bind(SocketAddress)V` performs the real bind so UDP receive works.
+
+    r.register(dc, "setSendBufferSize", "(I)V", |ctx, args| {
+        let this = obj_arg92(args, 0)?;
+        let size = args.get(1).and_then(|v| v.as_int()).unwrap_or(0).max(0) as usize;
+        if let Value::Int(fd) = ctx.get_field(this, DC_FIELD_FD) {
+            let _ = ctx.fd_table().udp_set_send_buffer_size(fd as u32, size);
+        }
+        Ok(None)
+    });
+    r.register(dc, "setReceiveBufferSize", "(I)V", |ctx, args| {
+        let this = obj_arg92(args, 0)?;
+        let size = args.get(1).and_then(|v| v.as_int()).unwrap_or(0).max(0) as usize;
+        if let Value::Int(fd) = ctx.get_field(this, DC_FIELD_FD) {
+            let _ = ctx.fd_table().udp_set_recv_buffer_size(fd as u32, size);
+        }
+        Ok(None)
+    });
+    r.register(dc, "setReuseAddress", "(Z)V", |ctx, args| {
+        let this = obj_arg92(args, 0)?;
+        let on = args.get(1).and_then(|v| v.as_int()).unwrap_or(0) != 0;
+        if let Value::Int(fd) = ctx.get_field(this, DC_FIELD_FD) {
+            let _ = ctx.fd_table().udp_set_reuse_address(fd as u32, on);
+        }
+        Ok(None)
+    });
+    // Receive timeout has no effect on a non-blocking channel; accept the call.
+    r.register(dc, "setSoTimeout", "(I)V", |_ctx, _args| Ok(None));
+    // IP ToS/DSCP — accepted but not applied (cosmetic socket tuning).
+    r.register(dc, "setTrafficClass", "(I)V", |_ctx, _args| Ok(None));
+
+    // bind(SocketAddress)V — the void `DatagramSocket.bind`. Delegates to the
+    // channel's own real bind (close old fd, open a fresh UDP fd bound to the
+    // requested address) and discards the channel return value.
+    r.register(dc, "bind", "(Ljava/net/SocketAddress;)V", |ctx, args| {
+        native_dc_bind(ctx, args)?;
+        Ok(None)
+    });
+
     r.set_category(__prev_cat);
 }
 
