@@ -2451,6 +2451,25 @@ fn re2_bind_listener(
     Ok(None)
 }
 
+/// Plain `java.net.ServerSocket.bind(SocketAddress[, int])` handler. Handles
+/// both arities (backlog read from `args[2]` when present). Registered for both
+/// descriptors below AND installed as the cross-crate plain-bind hook
+/// ([`cratonvm_native_api::plain_server_socket_bind`]) so native-io's *winning*
+/// `ss_wrapper_bind` (which shadows this registration) delegates the
+/// no-channel-back-ref (plain `new ServerSocket()`) case back here instead of
+/// no-opping — without which `new ServerSocket().bind(addr)` never bound a
+/// listener and `getLocalPort()` stayed 0 (okhttp MockWebServer → port 0; BUG-04).
+fn re2_server_socket_bind(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let sa = obj_arg(args, 1).map_err(|_| ioex("bind: null address"))?;
+    let (host, port) = read_inet_socket_address(ctx, sa)?;
+    let backlog = args
+        .get(2)
+        .and_then(|v| v.as_int())
+        .unwrap_or_else(|| ss_get(this).backlog);
+    re2_bind_listener(ctx, this, &host, port, backlog)
+}
+
 fn register_re2_server_socket(r: &mut NativeMethodRegistry) {
     // NIO-SERVER-SOCKET (route 1): skip the synthetic java.net.ServerSocket
     // surface so real bytecode drives sun/nio/ch/Net. See
@@ -2458,6 +2477,11 @@ fn register_re2_server_socket(r: &mut NativeMethodRegistry) {
     if std::env::var_os("CRATONVM_REAL_NET_SOCKETS").is_some() {
         return;
     }
+    // Install the plain-`ServerSocket` bind hook for native-io's winning
+    // `ss_wrapper_bind` to delegate to (BUG-04). Done unconditionally here (the
+    // early-return above is the REAL_NET_SOCKETS path where native-io also defers
+    // to real bytecode, so the hook is simply never consulted).
+    cratonvm_native_api::plain_server_socket_bind::set(re2_server_socket_bind);
     let ss = "java/net/ServerSocket";
 
     r.register(ss, "<init>", "()V", |_ctx, args| {
@@ -2504,20 +2528,18 @@ fn register_re2_server_socket(r: &mut NativeMethodRegistry) {
         r
     });
 
-    r.register(ss, "bind", "(Ljava/net/SocketAddress;)V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let sa = obj_arg(args, 1).map_err(|_| ioex("bind: null address"))?;
-        let (host, port) = read_inet_socket_address(ctx, sa)?;
-        let backlog = ss_get(this).backlog;
-        re2_bind_listener(ctx, this, &host, port, backlog)
-    });
-    r.register(ss, "bind", "(Ljava/net/SocketAddress;I)V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let sa = obj_arg(args, 1).map_err(|_| ioex("bind: null address"))?;
-        let backlog = args.get(2).and_then(|v| v.as_int()).unwrap_or(50);
-        let (host, port) = read_inet_socket_address(ctx, sa)?;
-        re2_bind_listener(ctx, this, &host, port, backlog)
-    });
+    r.register(
+        ss,
+        "bind",
+        "(Ljava/net/SocketAddress;)V",
+        re2_server_socket_bind,
+    );
+    r.register(
+        ss,
+        "bind",
+        "(Ljava/net/SocketAddress;I)V",
+        re2_server_socket_bind,
+    );
 
     r.register(ss, "accept", "()Ljava/net/Socket;", |ctx, args| {
         let this = obj_arg(args, 0)?;
