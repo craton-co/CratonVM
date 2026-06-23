@@ -560,7 +560,10 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|w| w == needle)
 }
 
-fn read_response<S: Read>(stream: &mut S) -> Result<(i32, Vec<(String, String)>, Vec<u8>), String> {
+fn read_response<S: Read>(
+    stream: &mut S,
+    head: bool,
+) -> Result<(i32, Vec<(String, String)>, Vec<u8>), String> {
     let mut buf = Vec::with_capacity(8192);
     let mut tmp = [0u8; 8192];
     let head_end;
@@ -606,6 +609,15 @@ fn read_response<S: Read>(stream: &mut S) -> Result<(i32, Vec<(String, String)>,
             chunked = true;
         }
         headers.push((name, value));
+    }
+
+    // A HEAD response carries the would-be `Content-Length`/`Transfer-Encoding`
+    // but NO message body (RFC 9110 §9.3.2). Return as soon as the head is
+    // parsed — otherwise the body loop below blocks waiting for `content_length`
+    // bytes that never arrive, hits the read timeout, and `perform` fails ->
+    // `getResponseCode` returns -1, discarding a valid status line.
+    if head {
+        return Ok((status, headers, Vec::new()));
     }
 
     let mut body_buf: Vec<u8> = Vec::new();
@@ -698,6 +710,7 @@ fn perform(
     connect_timeout: Duration,
     read_timeout: Duration,
 ) -> Result<(i32, Vec<(String, String)>, Vec<u8>), String> {
+    let head = method.eq_ignore_ascii_case("HEAD");
     let addr = format!("{}:{}", parsed.host, parsed.port);
     let mut last_err: Option<String> = None;
     let mut tcp: Option<TcpStream> = None;
@@ -751,12 +764,12 @@ fn perform(
         }
         stream.write_all(&req).map_err(|e| format!("write: {e}"))?;
         stream.flush().map_err(|e| format!("flush: {e}"))?;
-        read_response(&mut stream)
+        read_response(&mut stream, head)
     } else {
         let mut s = tcp;
         s.write_all(&req).map_err(|e| format!("write: {e}"))?;
         s.flush().map_err(|e| format!("flush: {e}"))?;
-        read_response(&mut s)
+        read_response(&mut s, head)
     }
 }
 
