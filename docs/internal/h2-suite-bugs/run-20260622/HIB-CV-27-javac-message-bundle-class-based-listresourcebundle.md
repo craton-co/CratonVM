@@ -94,14 +94,51 @@ path intact); absent app bundle still throws `MissingResourceException`.
 
 Probes: `scratch/javacbundle/{JavacToolProbe,JavacBundleProbe,RegressionProbe}.java`.
 
-## Separate, pre-existing follow-up (NOT this bug)
-`javax.tools.ToolProvider.getSystemJavaCompiler()` returns **null** on CratonVM
-(both pre- and post-fix) — its real-JDK body resolves the system tool through
-the boot `ModuleLayer`, which CratonVM does not fully model. Instantiating
-`com.sun.tools.javac.api.JavacTool.create()` directly works (that is the exact
-path the bundle fix exercises). A synthetic stub exists at
-`native-builtins/src/t3_impl.rs` (returns a fake non-compiling `JavaCompiler`)
-but is inert in real-JDK mode (not force-listed) — correctly so. Making
-`ToolProvider.getSystemJavaCompiler()` return the real `JavacTool` is a distinct
-module-layer task; H2's `SourceCompiler` uses `ToolProvider`, so if the H2 test
-still fails after this bundle fix it will be on that axis, not the message bundle.
+## Follow-up: ToolProvider.getSystemJavaCompiler() == null — ALSO FIXED
+H2's `SourceCompiler` obtains the compiler via
+`javax.tools.ToolProvider.getSystemJavaCompiler()`, which on CratonVM returned
+**null** (so the in-process javac was unavailable even with the bundle fixed).
+
+Root cause: `getSystemJavaCompiler()`'s real body is
+`ServiceLoader.load(JavaCompiler.class, systemClassLoader)` then "pick the
+provider whose module is `jdk.compiler`". The `JavacTool` provider is declared
+in `jdk.compiler`'s **module-info `provides`** (NOT `META-INF/services`), and
+CratonVM's ServiceLoader discovered providers only from `META-INF/services`.
+Worse, the module registry was **empty**: the eager boot module-info scan
+registered ZERO of the 70 boot modules because
+`descriptor_from_module_attribute` resolved the Module attribute's
+`module_name_index` with `cp.get_utf8(...)` — but per JVMS §4.7.25 that index
+points to a `CONSTANT_Module_info`, not a Utf8, so every module's name came back
+`None` and the descriptor was dropped. The whole module graph fell back to a
+single synthetic `java.base`.
+
+Fix (three parts, all on dev):
+1. **`classloading/src/module.rs`** — resolve `module_name_index` through its
+   `CONSTANT_Module_info` indirection (the `resolve_name` helper), like every
+   other module/package index. Now all 70 boot modules register with their
+   real `requires`/`exports`/`provides`.
+2. **`native-builtins/src/service_loader.rs`** — `discover_providers` now also
+   consults `ctx.service_providers_from_modules(service)` (JPMS `provides`),
+   in addition to `META-INF/services`.
+3. **`classloading/src/class_manager.rs`** — opt-out gate
+   `CRATONVM_BOOT_MODULE_REGISTRY=0` skips the eager registration (restores the
+   historic empty-registry / fully-permissive classpath-only mode) as a safety
+   net, since populating real module metadata activates the
+   `module_registry.is_empty()`-gated JPMS access checks.
+
+Verified (`--nojit`, debug):
+* default: `ToolProvider.getSystemJavaCompiler()` works; the H2-style in-process
+  compile produces the real localized diagnostic, `PART2: OK`.
+* `CRATONVM_BOOT_MODULE_REGISTRY=0`: `PART2: SKIP` (old behaviour restored).
+* `getClass().getModule().getName()` now == HotSpot
+  (`ArrayList`→`java.base`, `JavacTool`→`jdk.compiler`, app→unnamed).
+* No reflection regression: `setAccessible`+read of private JDK fields
+  (`ArrayList.size`, `String.value`) still works (`DeepReflectProbe`).
+
+Blast radius: populating the module registry activates ~8
+`module_registry.is_empty()`-gated access checks VM-wide. Empirically safe on
+the probes above (classpath/unnamed-module access stays permissive; module
+labelling now matches the JDK), but NOT yet soaked against the full app
+gauntlet — the `CRATONVM_BOOT_MODULE_REGISTRY=0` opt-out is the revert path if a
+regression appears. Probes:
+`scratch/javacbundle/{DeepReflectProbe,ModuleLabelProbe}.java`.
