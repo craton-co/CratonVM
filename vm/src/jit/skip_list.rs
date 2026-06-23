@@ -687,6 +687,47 @@ fn should_skip_jit_internal(
             return Some(SkipReason::RustJvmTestFixture);
         }
 
+        // ANTLR.1 (2026-06-23) — blanket ban for the shaded ANTLR v4 runtime
+        // that Groovy's parser (`org.apache.groovy.parser.antlr4`) and any
+        // ANTLR-based grammar (HQL, SpEL, …) execute. Two independent reasons,
+        // both verified on the SpringRepositoriesExtensionTests / Groovy parse:
+        //
+        // 1. CORRECTNESS — JIT-compiling the ANTLR ATN simulation MISCOMPILES.
+        //    A method in `…/runtime/atn/` produces a null `PredictionContext`
+        //    that flows into interpreted `ATNConfigSet.optimizeConfigs` ->
+        //    `ATN.getCachedContext` -> NPE, surfacing as Groovy
+        //    `MultipleCompilationErrorsException: General error during parsing:
+        //    NullPointerException` (the script fails to compile). `--nojit`
+        //    parses the SAME script cleanly. Bisection via
+        //    `CRATONVM_JIT_BISECT_SKIP` proved it and NARROWED the culprit from
+        //    the ~105 compiled `groovyjarjarantlr4/*` methods down to a 7-method
+        //    `PredictionContext` equality/hash cluster — de-JIT'ing just these 7
+        //    makes the parse succeed:
+        //      PredictionContext.{calculateHashCode, hashCode},
+        //      PredictionContext$IdentityEqualityComparator.hashCode,
+        //      SingletonPredictionContext.{equals, isEmpty, size},
+        //      ObjectEqualityComparator.equals.
+        //    (A wrong hash/equals corrupts ATN config-context dedup, leaving a
+        //    config with a null `PredictionContext` that later NPEs.) The exact
+        //    single method / codegen archetype is the open follow-up; the
+        //    package ban is the sound, evidence-backed stop-gap (a surgical
+        //    per-method ban of those 7 is the future minimal fix once the
+        //    codegen bug is root-caused — see docs/known-issues).
+        // 2. THROUGHPUT — JIT-compiling ANTLR is also a large REGRESSION here:
+        //    the first cold parse runs ~8x SLOWER with JIT than `--nojit`
+        //    (a trivial warmup class alone takes ~95 s under JIT). The ATN
+        //    simulation is a one-shot, branch-heavy interpreter loop, not a
+        //    benchmarked hot path — exactly the BouncyCastle / ByteBuddy /
+        //    Spring archetype banned above. Same root family as the
+        //    `hql-antlr-parser-cold-prediction-throughput` known issue.
+        //
+        // Lifted by `CRATONVM_JIT_ALLOW_PACKAGES=groovyjarjarantlr4/`.
+        if class_name.starts_with("groovyjarjarantlr4/")
+            && !package_allowed("groovyjarjarantlr4/", allow_packages)
+        {
+            return Some(SkipReason::RustJvmTestFixture);
+        }
+
         // SPB.6 (Session 113 r1) — provisional blanket ban for the
         // Netflix Eureka discovery client. `com/netflix/discovery/
         // DiscoveryClient.<init>` allocates Eureka `InstanceInfo` /
