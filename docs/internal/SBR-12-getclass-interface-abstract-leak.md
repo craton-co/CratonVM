@@ -65,14 +65,43 @@ Verified byte-identical to HotSpot jdk-25 for `List.of`/`copyOf`/
 `unmodifiableList(ArrayList|LinkedList)`/`unmodifiableSet`/`unmodifiableMap`/
 `unmodifiableCollection` (regression test extended).
 
+## Follow-up (2026-06-23) — real-JDK singletons + interface-native delegation
+
+`Collections.singletonList`/`singleton`/`singletonMap` previously returned
+synthetic `ArrayList`/`HashSet`/`HashMap` (wrong class **and** wrongly mutable).
+Per the "real JDK by default" principle they now return **real**
+`Collections$Singleton{List,,Map}` objects (`alloc_real_jdk` allocates the real
+class with its natural field count and sets `element` / `k`,`v` by name; a
+synthetic fallback remains if the class is unavailable). Their `get`/`iterator`/
+`contains`/`toString`/mutator-throws run real JDK bytecode via the receiver-walk.
+
+The one obstacle was that `size`/`isEmpty` are registered on the
+`Collection`/`List`/`Set`/`Map` **interfaces** as a fallback and bailed to a
+`0`/empty sentinel for any non-ArrayList/HashSet/HashMap layout — so a real
+singleton reported `size()==0`. Fixed generally: those 5 natives now
+**delegate to the receiver's own bytecode** (`invoke_special`, whose exact
+per-class native lookup finds nothing for these real classes → runs real
+`Code`, no recursion) when the receiver is a real JDK collection
+(`instanceof Collection`/`Map`) that CratonVM has **no** synthetic backing for
+(`!is_synthetic_backed_collection`). CratonVM's own synthetic collections keep
+their fast path; genuinely-foreign receivers (`Charset`/`String` funnelled via a
+misresolved vtable) keep the safe sentinel. This is a real-JDK-completeness win
+beyond singletons — e.g. `((Collection) linkedList).size()` and
+`Collections.empty*` now run correct real bytecode too.
+
+Verified byte-identical to HotSpot jdk-25 for the whole singleton family
+(class + `size`/`get`/`isEmpty`/`contains`/iteration/`toString`/`keySet`/
+`values`/`entrySet`/`equals`/`hashCode`/mutation-throws) and for a normal vs
+foreign collection smoke (ArrayList/HashSet/HashMap/LinkedList/emptyList/
+emptyMap). native-collections 69 unit tests + getclass/sublist/cluster_b/
+intrinsic_diff integration tests all green.
+
 ## Residuals (knowingly deferred — still concrete, the floor is met)
 
 * *Views* of immutable collections (`List.of(..).subList(..)`,
   `Map.of(..).keySet()`, …) report the `Collections$Unmodifiable*` family rather
   than HotSpot's `ImmutableCollections$SubList` etc. — they reuse the plain
-  unmodifiable wrapper and carry no marker. `Collections.empty*`/`singleton*`
-  likewise report their backing-collection class, not `Collections$Empty*`/
-  `Singleton*`. All concrete; rare in practice.
+  unmodifiable wrapper and carry no marker. All concrete; rare in practice.
 * An *intermediate* stream op (`.map(..)`) reports `IntPipeline$Head` rather than
   HotSpot's `IntPipeline$4`. The exact name is a JDK anonymous-class index
   (`$1`/`$2`/`$3`/`$4`/`$10`…, plus `SortedOps$OfInt`) — a declaration-order
