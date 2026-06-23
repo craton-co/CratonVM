@@ -1790,9 +1790,18 @@ const MBS_DOMAIN: usize = 0;
 const MBS_COUNT: usize = 1;
 const MBS_NAMES: usize = 2;
 const MBS_BEANS: usize = 3;
+/// Parallel array of the ORIGINAL `javax.management.ObjectName` objects the
+/// caller registered under. `MBS_NAMES` stores their canonical key *strings*
+/// (used for identity/dedup, which is canonical per JMX), but a query must
+/// return the original ObjectName objects: `ObjectName.toString()` preserves
+/// the as-constructed key order (e.g. `Tomcat:type=Valve,name=...`) whereas the
+/// canonical form sorts keys (`Tomcat:name=...,type=Valve`). Reconstructing
+/// from the canonical string would therefore change `toString()` and break
+/// callers that compare the textual form (e.g. Tomcat's `TestRegistration`).
+const MBS_ONAMES: usize = 4;
 
 /// Number of fields on the synthetic MBeanServer (must cover all slots above).
-const MBS_NUM_FIELDS: usize = 4;
+const MBS_NUM_FIELDS: usize = 5;
 
 /// Allocate the in-process platform MBeanServer with an empty registry.
 fn alloc_mbean_server(ctx: &mut dyn NativeContext) -> ObjectRef {
@@ -1802,8 +1811,10 @@ fn alloc_mbean_server(ctx: &mut dyn NativeContext) -> ObjectRef {
     ctx.set_field(obj, MBS_COUNT, Value::Int(0));
     let names = ctx.new_ref_array(ClassId::new(0), 0);
     let beans = ctx.new_ref_array(ClassId::new(0), 0);
+    let onames = ctx.new_ref_array(ClassId::new(0), 0);
     ctx.set_field(obj, MBS_NAMES, Value::Object(Some(names)));
     ctx.set_field(obj, MBS_BEANS, Value::Object(Some(beans)));
+    ctx.set_field(obj, MBS_ONAMES, Value::Object(Some(onames)));
     obj
 }
 
@@ -1848,6 +1859,14 @@ fn mbs_registry(
         _ => None,
     };
     (names, beans)
+}
+
+/// Read the parallel array of original `ObjectName` objects off a server.
+fn mbs_onames(ctx: &dyn NativeContext, server: ObjectRef) -> Option<ObjectRef> {
+    match ctx.get_field(server, MBS_ONAMES) {
+        Value::Object(opt) => opt,
+        _ => None,
+    }
 }
 
 /// Find the registry index for `key`, or None.
@@ -1903,11 +1922,13 @@ fn jmx_attribute_not_found(attr: &str) -> MethodCallFailed {
     .into()
 }
 
-/// Build a synthetic `java.util.HashSet` whose backing array holds the
-/// supplied references in order, with the `size` slot set. Mirrors the
-/// 2-slot synthetic-set layout the existing `queryMBeans` body used so
-/// callers that iterate / call `size()` see the right element count.
-fn build_hash_set(ctx: &mut dyn NativeContext, elems: &[ObjectRef]) -> ObjectRef {
+/// Fallback: build a synthetic 2-slot `java.util.HashSet` stand-in. Only used
+/// if a real `java.util.HashSet` cannot be constructed in this context (e.g. a
+/// unit-test mock with no JDK classes). A real query path always builds a real
+/// HashSet via [`build_real_hash_set`] — a synthetic stand-in's real `size()` /
+/// `iterator()` read its (empty) backing map, so callers see an empty set
+/// regardless of contents (the TC0622 defect).
+fn build_synthetic_hash_set(ctx: &mut dyn NativeContext, elems: &[ObjectRef]) -> ObjectRef {
     let set = alloc_concurrent_synthetic(ctx, "java/util/HashSet", 2);
     let backing = ctx.new_ref_array(ClassId::new(0), elems.len());
     for (i, e) in elems.iter().enumerate() {
@@ -1917,6 +1938,201 @@ fn build_hash_set(ctx: &mut dyn NativeContext, elems: &[ObjectRef]) -> ObjectRef
     ctx.set_field(set, 1, Value::Int(elems.len() as i32));
     ctx.set_field_by_name(set, "size", Value::Int(elems.len() as i32));
     set
+}
+
+/// Build a REAL `java.util.HashSet` and populate it via real `add(Object)`
+/// bytecode so `size()`, `iterator()`, `contains()`, `removeAll()` all behave.
+/// GC-safe: the elements are parked in a single ref-array and the set is pinned
+/// across the (allocating) `add` calls, so a moving collector can't strand them.
+/// Falls back to the synthetic stand-in only if the real class is unavailable.
+fn build_real_hash_set(ctx: &mut dyn NativeContext, elems: &[ObjectRef]) -> ObjectRef {
+    // Park the elements in one heap array we can re-read across each add().
+    let arr = ctx.new_ref_array(ClassId::new(0), elems.len());
+    for (i, e) in elems.iter().enumerate() {
+        ctx.set_array_element(arr, i, Value::Object(Some(*e)));
+    }
+    let base = ctx.pin_native_root(arr);
+    let set = match ctx.new_object_initialized("java/util/HashSet", "()V", &[]) {
+        Ok(Some(Value::Object(Some(s)))) => s,
+        _ => {
+            ctx.unpin_native_roots(base);
+            return build_synthetic_hash_set(ctx, elems);
+        }
+    };
+    let set_pin = ctx.pin_native_root(set);
+    for i in 0..elems.len() {
+        let arr_now = ctx.read_native_pin(base, arr);
+        let elem = ctx.get_array_element(arr_now, i);
+        let set_now = ctx.read_native_pin(set_pin, set);
+        let _ = ctx.invoke_virtual(set_now, "add", "(Ljava/lang/Object;)Z", &[elem]);
+    }
+    let result = ctx.read_native_pin(set_pin, set);
+    ctx.unpin_native_roots(base);
+    result
+}
+
+/// Build a `javax.management.ObjectInstance(name, className)` for `bean` under
+/// `name`. `className` is the bean's runtime class (dotted), empty if unknown.
+fn build_object_instance(
+    ctx: &mut dyn NativeContext,
+    name: Option<ObjectRef>,
+    bean: Option<ObjectRef>,
+) -> ObjectRef {
+    let oi = alloc_concurrent_synthetic(ctx, "javax/management/ObjectInstance", 2);
+    ctx.set_field_by_name(oi, "name", Value::Object(name));
+    let cls_name = bean
+        .map(|b| {
+            ctx.class_name_of_id(ctx.class_id_of_object(b))
+                .unwrap_or_default()
+        })
+        .unwrap_or_default()
+        .replace('/', ".");
+    let cls_name_str = ctx.create_string(&cls_name);
+    ctx.set_field_by_name(oi, "className", Value::Object(Some(cls_name_str)));
+    oi
+}
+
+/// Resolve the `ObjectName` at registry index `i`. Prefers the ORIGINAL
+/// registered ObjectName object (slot `MBS_ONAMES`, which preserves
+/// `toString()` key order); if that wasn't captured, reconstructs one from the
+/// canonical key string in `MBS_NAMES`. Returns `(ref, is_object_name)` where
+/// `is_object_name` is false only when reconstruction failed and the raw key
+/// string is returned as a last resort (so pattern matching is skipped for it).
+fn mbs_resolve_oname(
+    ctx: &mut dyn NativeContext,
+    server: ObjectRef,
+    i: usize,
+) -> Option<(ObjectRef, bool)> {
+    if let Some(arr) = mbs_onames(ctx, server) {
+        if i < ctx.array_length(arr) {
+            if let Value::Object(Some(o)) = ctx.get_array_element(arr, i) {
+                return Some((o, true));
+            }
+        }
+    }
+    // Original ObjectName not captured — reconstruct from the canonical key.
+    let (names_opt, _) = mbs_registry(ctx, server);
+    let key_s = match names_opt.map(|a| ctx.get_array_element(a, i)) {
+        Some(Value::Object(Some(s))) => s,
+        _ => return None,
+    };
+    let on = ctx
+        .invoke(
+            "javax/management/ObjectName",
+            "getInstance",
+            "(Ljava/lang/String;)Ljavax/management/ObjectName;",
+            &[Value::Object(Some(key_s))],
+        )
+        .ok()
+        .flatten()
+        .and_then(|v| match v {
+            Value::Object(Some(o)) => Some(o),
+            _ => None,
+        });
+    match on {
+        Some(o) => Some((o, true)),
+        None => Some((key_s, false)),
+    }
+}
+
+/// Core of `queryNames` / `queryMBeans`: build a real `Set` of the registered
+/// entries whose ObjectName matches `pattern` (a null pattern matches all). When
+/// `as_instances` is true the set holds `ObjectInstance`s (queryMBeans),
+/// otherwise the original `ObjectName`s (queryNames). Pattern matching is
+/// delegated to the real `ObjectName.apply(ObjectName)` bytecode, so wildcard
+/// domains, key-property subset/pattern matching and `:*` all follow JMX
+/// semantics exactly. GC-safe via per-iteration pinning of the candidate and a
+/// persistent pin of the accumulator set and server.
+fn mbs_query_set(
+    ctx: &mut dyn NativeContext,
+    server: ObjectRef,
+    pattern: Option<ObjectRef>,
+    as_instances: bool,
+) -> ObjectRef {
+    let server_pin = ctx.pin_native_root(server);
+    let pat_pin = pattern.map(|p| ctx.pin_native_root(p));
+    let set = match ctx.new_object_initialized("java/util/HashSet", "()V", &[]) {
+        Ok(Some(Value::Object(Some(s)))) => s,
+        _ => {
+            // Real HashSet unavailable (test mock): best-effort unfiltered
+            // synthetic set of the original names, preserving prior behaviour.
+            let s = ctx.read_native_pin(server_pin, server);
+            let len = mbs_onames(ctx, s)
+                .map(|a| ctx.array_length(a))
+                .unwrap_or(0);
+            let mut elems = Vec::with_capacity(len);
+            if let Some(arr) = mbs_onames(ctx, s) {
+                for i in 0..len {
+                    if let Value::Object(Some(o)) = ctx.get_array_element(arr, i) {
+                        elems.push(o);
+                    }
+                }
+            }
+            ctx.unpin_native_roots(server_pin);
+            return build_synthetic_hash_set(ctx, &elems);
+        }
+    };
+    let set_pin = ctx.pin_native_root(set);
+    let len = {
+        let s = ctx.read_native_pin(server_pin, server);
+        mbs_onames(ctx, s)
+            .or_else(|| mbs_registry(ctx, s).0)
+            .map(|a| ctx.array_length(a))
+            .unwrap_or(0)
+    };
+    for i in 0..len {
+        let s = ctx.read_native_pin(server_pin, server);
+        let (on_ref, is_on) = match mbs_resolve_oname(ctx, s, i) {
+            Some(t) => t,
+            None => continue,
+        };
+        let on_pin = ctx.pin_native_root(on_ref);
+        let matched = match (pattern, is_on) {
+            (Some(_), true) => {
+                let pat = ctx.read_native_pin(pat_pin.unwrap(), pattern.unwrap());
+                let cand = ctx.read_native_pin(on_pin, on_ref);
+                matches!(
+                    ctx.invoke_virtual(
+                        pat,
+                        "apply",
+                        "(Ljavax/management/ObjectName;)Z",
+                        &[Value::Object(Some(cand))],
+                    ),
+                    Ok(Some(Value::Int(x))) if x != 0
+                )
+            }
+            // Null pattern (match all), or a non-ObjectName fallback key.
+            _ => true,
+        };
+        if matched {
+            let elem = if as_instances {
+                let s2 = ctx.read_native_pin(server_pin, server);
+                let bean = mbs_lookup_bean_at(ctx, s2, i);
+                let cand = ctx.read_native_pin(on_pin, on_ref);
+                build_object_instance(ctx, Some(cand), bean)
+            } else {
+                ctx.read_native_pin(on_pin, on_ref)
+            };
+            let elem_pin = ctx.pin_native_root(elem);
+            let set_now = ctx.read_native_pin(set_pin, set);
+            let e = ctx.read_native_pin(elem_pin, elem);
+            let _ = ctx.invoke_virtual(set_now, "add", "(Ljava/lang/Object;)Z", &[Value::Object(Some(e))]);
+            ctx.unpin_native_roots(elem_pin);
+        }
+        ctx.unpin_native_roots(on_pin);
+    }
+    let result = ctx.read_native_pin(set_pin, set);
+    ctx.unpin_native_roots(server_pin);
+    result
+}
+
+/// Read the registered bean at registry index `i`, or None.
+fn mbs_lookup_bean_at(ctx: &dyn NativeContext, server: ObjectRef, i: usize) -> Option<ObjectRef> {
+    let (_, beans) = mbs_registry(ctx, server);
+    match ctx.get_array_element(beans?, i) {
+        Value::Object(Some(o)) => Some(o),
+        _ => None,
+    }
 }
 
 fn register_mbean_server(r: &mut NativeMethodRegistry) {
@@ -1933,8 +2149,10 @@ fn register_mbean_server(r: &mut NativeMethodRegistry) {
         ctx.set_field(this, MBS_COUNT, Value::Int(0));
         let names = ctx.new_ref_array(ClassId::new(0), 0);
         let beans = ctx.new_ref_array(ClassId::new(0), 0);
+        let onames = ctx.new_ref_array(ClassId::new(0), 0);
         ctx.set_field(this, MBS_NAMES, Value::Object(Some(names)));
         ctx.set_field(this, MBS_BEANS, Value::Object(Some(beans)));
+        ctx.set_field(this, MBS_ONAMES, Value::Object(Some(onames)));
         Ok(None)
     });
 
@@ -2005,17 +2223,23 @@ fn register_mbean_server(r: &mut NativeMethodRegistry) {
 
             // Grow the parallel registry arrays by one (or overwrite an
             // existing entry with the same key — last registration wins,
-            // matching a re-register after unregister).
+            // matching a re-register after unregister). `MBS_ONAMES` holds the
+            // original ObjectName objects so queries return them verbatim.
             let (names_opt, beans_opt) = mbs_registry(ctx, this);
+            let onames_opt = mbs_onames(ctx, this);
             let old_len = names_opt.map(|n| ctx.array_length(n)).unwrap_or(0);
             if let Some(idx) = mbs_find(ctx, this, &key) {
                 // Overwrite in place.
                 if let Some(beans) = beans_opt {
                     ctx.set_array_element(beans, idx, Value::Object(Some(bean)));
                 }
+                if let Some(onames) = onames_opt {
+                    ctx.set_array_element(onames, idx, Value::Object(name_ref));
+                }
             } else {
                 let new_names = ctx.new_ref_array(ClassId::new(0), old_len + 1);
                 let new_beans = ctx.new_ref_array(ClassId::new(0), old_len + 1);
+                let new_onames = ctx.new_ref_array(ClassId::new(0), old_len + 1);
                 for i in 0..old_len {
                     if let Some(names) = names_opt {
                         ctx.set_array_element(new_names, i, ctx.get_array_element(names, i));
@@ -2023,25 +2247,26 @@ fn register_mbean_server(r: &mut NativeMethodRegistry) {
                     if let Some(beans) = beans_opt {
                         ctx.set_array_element(new_beans, i, ctx.get_array_element(beans, i));
                     }
+                    if let Some(onames) = onames_opt {
+                        ctx.set_array_element(new_onames, i, ctx.get_array_element(onames, i));
+                    }
                 }
                 let key_str = ctx.create_string(&key);
                 ctx.set_array_element(new_names, old_len, Value::Object(Some(key_str)));
                 ctx.set_array_element(new_beans, old_len, Value::Object(Some(bean)));
+                ctx.set_array_element(new_onames, old_len, Value::Object(name_ref));
                 ctx.set_field(this, MBS_NAMES, Value::Object(Some(new_names)));
                 ctx.set_field(this, MBS_BEANS, Value::Object(Some(new_beans)));
+                ctx.set_field(this, MBS_ONAMES, Value::Object(Some(new_onames)));
                 ctx.set_field(this, MBS_COUNT, Value::Int((old_len + 1) as i32));
             }
 
             // Build an ObjectInstance(name, className) for the return value.
-            let oi = alloc_concurrent_synthetic(ctx, "javax/management/ObjectInstance", 2);
-            ctx.set_field_by_name(oi, "name", Value::Object(name_ref));
-            let cls_name = ctx
-                .class_name_of_id(ctx.class_id_of_object(bean))
-                .unwrap_or_default()
-                .replace('/', ".");
-            let cls_name_str = ctx.create_string(&cls_name);
-            ctx.set_field_by_name(oi, "className", Value::Object(Some(cls_name_str)));
-            Ok(Some(Value::Object(Some(oi))))
+            Ok(Some(Value::Object(Some(build_object_instance(
+                ctx,
+                name_ref,
+                Some(bean),
+            )))))
         },
     );
 
@@ -2059,10 +2284,12 @@ fn register_mbean_server(r: &mut NativeMethodRegistry) {
             let key = object_name_key(ctx, name_ref);
             if let Some(idx) = mbs_find(ctx, this, &key) {
                 let (names_opt, beans_opt) = mbs_registry(ctx, this);
+                let onames_opt = mbs_onames(ctx, this);
                 let old_len = names_opt.map(|n| ctx.array_length(n)).unwrap_or(0);
                 if old_len > 0 {
                     let new_names = ctx.new_ref_array(ClassId::new(0), old_len - 1);
                     let new_beans = ctx.new_ref_array(ClassId::new(0), old_len - 1);
+                    let new_onames = ctx.new_ref_array(ClassId::new(0), old_len - 1);
                     let mut w = 0usize;
                     for rd in 0..old_len {
                         if rd == idx {
@@ -2074,10 +2301,14 @@ fn register_mbean_server(r: &mut NativeMethodRegistry) {
                         if let Some(beans) = beans_opt {
                             ctx.set_array_element(new_beans, w, ctx.get_array_element(beans, rd));
                         }
+                        if let Some(onames) = onames_opt {
+                            ctx.set_array_element(new_onames, w, ctx.get_array_element(onames, rd));
+                        }
                         w += 1;
                     }
                     ctx.set_field(this, MBS_NAMES, Value::Object(Some(new_names)));
                     ctx.set_field(this, MBS_BEANS, Value::Object(Some(new_beans)));
+                    ctx.set_field(this, MBS_ONAMES, Value::Object(Some(new_onames)));
                     ctx.set_field(this, MBS_COUNT, Value::Int((old_len - 1) as i32));
                 }
             }
@@ -2116,103 +2347,51 @@ fn register_mbean_server(r: &mut NativeMethodRegistry) {
                 Some(i) => i,
                 None => return Err(jmx_instance_not_found(&key)),
             };
-            let (_, beans_opt) = mbs_registry(ctx, this);
-            let bean = beans_opt.and_then(|b| match ctx.get_array_element(b, idx) {
-                Value::Object(Some(o)) => Some(o),
-                _ => None,
-            });
-            let oi = alloc_concurrent_synthetic(ctx, "javax/management/ObjectInstance", 2);
-            ctx.set_field_by_name(oi, "name", Value::Object(name_ref));
-            let cls_name = bean
-                .map(|b| {
-                    ctx.class_name_of_id(ctx.class_id_of_object(b))
-                        .unwrap_or_default()
-                })
-                .unwrap_or_default()
-                .replace('/', ".");
-            let cls_name_str = ctx.create_string(&cls_name);
-            ctx.set_field_by_name(oi, "className", Value::Object(Some(cls_name_str)));
-            Ok(Some(Value::Object(Some(oi))))
+            let bean = mbs_lookup_bean_at(ctx, this, idx);
+            Ok(Some(Value::Object(Some(build_object_instance(
+                ctx, name_ref, bean,
+            )))))
         },
     );
 
-    // queryNames(ObjectName, QueryExp) -> Set<ObjectName>. We don't parse
-    // wildcard ObjectName patterns or evaluate QueryExp; a null/empty
-    // pattern means "all", which is the common boot-time usage. We return
-    // the canonical-name strings wrapped back into ObjectName via
-    // ObjectName.getInstance, so callers iterating the Set get usable
-    // names. Where ObjectName construction isn't available we fall back to
-    // returning the raw key strings (still a valid Set<?> for size/iterate).
+    // queryNames(ObjectName, QueryExp) -> Set<ObjectName>. The ObjectName
+    // pattern is honoured via the real `ObjectName.apply` (domain + key-property
+    // pattern / wildcards / `:*`); a null pattern matches all. QueryExp (the
+    // second arg) is not evaluated — JMX clients pass null here for plain
+    // name-pattern enumeration, which is the boot/management usage. The set is a
+    // real `java.util.HashSet` of the ORIGINAL registered ObjectNames.
     r.register(
         cls,
         "queryNames",
         "(Ljavax/management/ObjectName;Ljavax/management/QueryExp;)Ljava/util/Set;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let (names_opt, _) = mbs_registry(ctx, this);
-            let len = names_opt.map(|n| ctx.array_length(n)).unwrap_or(0);
-            let mut elems: Vec<ObjectRef> = Vec::with_capacity(len);
-            if let Some(names) = names_opt {
-                for i in 0..len {
-                    if let Value::Object(Some(s)) = ctx.get_array_element(names, i) {
-                        let key = ctx.read_string(s).unwrap_or_default();
-                        // Reconstruct an ObjectName for the key. If that
-                        // fails, fall back to the raw String key.
-                        let on = ctx
-                            .invoke(
-                                "javax/management/ObjectName",
-                                "getInstance",
-                                "(Ljava/lang/String;)Ljavax/management/ObjectName;",
-                                &[Value::Object(Some(s))],
-                            )
-                            .ok()
-                            .flatten()
-                            .and_then(|v| match v {
-                                Value::Object(Some(o)) => Some(o),
-                                _ => None,
-                            });
-                        elems.push(on.unwrap_or(s));
-                        let _ = key;
-                    }
-                }
-            }
-            Ok(Some(Value::Object(Some(build_hash_set(ctx, &elems)))))
+            let pattern = match args.get(1) {
+                Some(Value::Object(opt)) => *opt,
+                _ => None,
+            };
+            Ok(Some(Value::Object(Some(mbs_query_set(
+                ctx, this, pattern, false,
+            )))))
         },
     );
 
-    // queryMBeans(ObjectName, QueryExp) -> Set<ObjectInstance>.
+    // queryMBeans(ObjectName, QueryExp) -> Set<ObjectInstance>. Same pattern
+    // matching as queryNames; the set holds ObjectInstances built from the
+    // original ObjectName + the registered bean's class.
     r.register(
         cls,
         "queryMBeans",
         "(Ljavax/management/ObjectName;Ljavax/management/QueryExp;)Ljava/util/Set;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let (names_opt, beans_opt) = mbs_registry(ctx, this);
-            let len = names_opt.map(|n| ctx.array_length(n)).unwrap_or(0);
-            let mut elems: Vec<ObjectRef> = Vec::with_capacity(len);
-            for i in 0..len {
-                let name_ref = names_opt.and_then(|n| match ctx.get_array_element(n, i) {
-                    Value::Object(Some(s)) => Some(s),
-                    _ => None,
-                });
-                let bean = beans_opt.and_then(|b| match ctx.get_array_element(b, i) {
-                    Value::Object(Some(o)) => Some(o),
-                    _ => None,
-                });
-                let oi = alloc_concurrent_synthetic(ctx, "javax/management/ObjectInstance", 2);
-                ctx.set_field_by_name(oi, "name", Value::Object(name_ref));
-                let cls_name = bean
-                    .map(|b| {
-                        ctx.class_name_of_id(ctx.class_id_of_object(b))
-                            .unwrap_or_default()
-                    })
-                    .unwrap_or_default()
-                    .replace('/', ".");
-                let cls_name_str = ctx.create_string(&cls_name);
-                ctx.set_field_by_name(oi, "className", Value::Object(Some(cls_name_str)));
-                elems.push(oi);
-            }
-            Ok(Some(Value::Object(Some(build_hash_set(ctx, &elems)))))
+            let pattern = match args.get(1) {
+                Some(Value::Object(opt)) => *opt,
+                _ => None,
+            };
+            Ok(Some(Value::Object(Some(mbs_query_set(
+                ctx, this, pattern, true,
+            )))))
         },
     );
 
@@ -2351,6 +2530,20 @@ fn register_mbean_server(r: &mut NativeMethodRegistry) {
             };
             let key = object_name_key(ctx, name_ref);
             if let Some(bean) = mbs_lookup_bean(ctx, this, &key) {
+                // DynamicMBean (e.g. Tomcat's modeler BaseModelMBean / a
+                // RequiredModelMBean) exposes attributes through its own
+                // `getAttribute(String)` rather than JavaBean accessors —
+                // delegate to it first so descriptor-driven attributes resolve.
+                if let Some(Value::Object(Some(name_s))) = args.get(2).copied() {
+                    if let Ok(Some(v)) = ctx.invoke_virtual(
+                        bean,
+                        "getAttribute",
+                        "(Ljava/lang/String;)Ljava/lang/Object;",
+                        &[Value::Object(Some(name_s))],
+                    ) {
+                        return Ok(Some(v));
+                    }
+                }
                 let cap = capitalize(&attr_name);
                 // Try getXxx()Object, then getXxx()-with-real-return via the
                 // generic Object return, then isXxx()Z for boolean attrs.
