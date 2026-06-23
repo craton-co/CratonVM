@@ -778,6 +778,16 @@ fn native_stack_has_jit_frame(lo: usize, hi: usize) -> bool {
         if ranges.is_empty() {
             return false;
         }
+        // Address envelope of ALL code ranges: `ranges` is sorted by start, so
+        // the smallest start is first; the largest end is the max over the (few)
+        // entries. A stack word outside `[env_lo, env_hi)` cannot be in any
+        // range, so reject it with a single compare before the binary search.
+        // The overwhelming majority of stack words are ints / data pointers far
+        // outside the small JIT code arena, so this prefilter skips the
+        // partition_point for ~all words. Strict superset of the membership test
+        // → result is identical.
+        let env_lo = ranges[0].0;
+        let env_hi = ranges.iter().map(|&(_, e)| e).max().unwrap_or(0);
         let mut addr = (lo + 7) & !7usize;
         const MAX_SCAN_BYTES: usize = 8 * 1024 * 1024;
         let hi = hi.min(addr.saturating_add(MAX_SCAN_BYTES));
@@ -786,10 +796,12 @@ fn native_stack_has_jit_frame(lo: usize, hi: usize) -> bool {
             // band between two known stack pointers (same contract as
             // `scan_one_frame`).
             let w = unsafe { (addr as *const usize).read() };
-            // Greatest range whose start <= w; it contains w iff w < its end.
-            let idx = ranges.partition_point(|&(s, _)| s <= w);
-            if idx > 0 && w < ranges[idx - 1].1 {
-                return true;
+            if w >= env_lo && w < env_hi {
+                // Greatest range whose start <= w; it contains w iff w < its end.
+                let idx = ranges.partition_point(|&(s, _)| s <= w);
+                if idx > 0 && w < ranges[idx - 1].1 {
+                    return true;
+                }
             }
             addr += 8;
         }
