@@ -2370,17 +2370,46 @@ fn cl_get_resource(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
             let class_id = ctx.class_id_of_object(this_ref);
             if let Some(class_name) = ctx.class_name_of_id(class_id) {
                 if !is_builtin_loader_class(&class_name) {
-                    // Pin the receiver across the allocating create_string —
+                    // JDK `ClassLoader.getResource` contract: delegate to the
+                    // PARENT's getResource FIRST, then fall back to this loader's
+                    // own `findResource` override. The previous code skipped
+                    // parent delegation and called `findResource` directly, so a
+                    // custom loader that overrides only `loadClass` (and inherits
+                    // the default `findResource`, which returns null) reported
+                    // null for every resource its parent (the app/system loader)
+                    // can serve. Hibernate's SerializationHelperTest /
+                    // ProxyClassReuseTest custom loaders read class bytes via
+                    // getResource(AsStream) and broke on this (CNFE for a class
+                    // that exists on the classpath).
+                    //
+                    // Pin the receiver across each allocating create_string —
                     // a moving GC during it would stale `this_ref`.
                     let pin = ctx.pin_native_root(this_ref);
-                    let name_arg = Value::Object(Some(ctx.create_string(&name)));
+                    let name_for_parent = Value::Object(Some(ctx.create_string(&name)));
                     let this_ref = ctx.read_native_pin(pin, this_ref);
+                    let parent = ctx.get_field_by_name(this_ref, "parent");
                     ctx.unpin_native_roots(pin);
+                    if let Value::Object(Some(parent_ref)) = parent {
+                        if let Ok(Some(Value::Object(Some(url)))) = ctx.invoke_virtual(
+                            parent_ref,
+                            "getResource",
+                            "(Ljava/lang/String;)Ljava/net/URL;",
+                            &[name_for_parent],
+                        ) {
+                            return Ok(Some(Value::Object(Some(url))));
+                        }
+                    }
+                    // Parent had nothing (or is null/bootstrap): this loader's
+                    // own findResource override gets the final say.
+                    let pin2 = ctx.pin_native_root(this_ref);
+                    let name_for_find = Value::Object(Some(ctx.create_string(&name)));
+                    let this_ref = ctx.read_native_pin(pin2, this_ref);
+                    ctx.unpin_native_roots(pin2);
                     return ctx.invoke_virtual(
                         this_ref,
                         "findResource",
                         "(Ljava/lang/String;)Ljava/net/URL;",
-                        &[name_arg],
+                        &[name_for_find],
                     );
                 }
             }
@@ -2868,6 +2897,39 @@ fn cl_get_resource_as_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     let resource_name = name.trim_start_matches('/');
     if crate::lang_class::t19_h10_validate_resource_name_pub(resource_name).is_none() {
         return Ok(Some(Value::Object(None)));
+    }
+    // User-defined loader: mirror JDK `ClassLoader.getResourceAsStream` =
+    // `URL u = getResource(name); return u != null ? u.openStream() : null;`.
+    // Routing through `getResource` (which now performs parent delegation)
+    // ensures a custom loader that doesn't override `findResource` still finds
+    // resources its parent serves (SerializationHelperTest/ProxyClassReuseTest).
+    // The raw `find_resource` fast-path below is kept for builtin loaders.
+    if let Some(Value::Object(Some(this_ref))) = args.first().copied() {
+        if is_classloader_instance(ctx, this_ref) {
+            let class_id = ctx.class_id_of_object(this_ref);
+            if let Some(class_name) = ctx.class_name_of_id(class_id) {
+                if !is_builtin_loader_class(&class_name) {
+                    let pin = ctx.pin_native_root(this_ref);
+                    let name_arg = Value::Object(Some(ctx.create_string(&name)));
+                    let this_ref = ctx.read_native_pin(pin, this_ref);
+                    ctx.unpin_native_roots(pin);
+                    if let Ok(Some(Value::Object(Some(url)))) = ctx.invoke_virtual(
+                        this_ref,
+                        "getResource",
+                        "(Ljava/lang/String;)Ljava/net/URL;",
+                        &[name_arg],
+                    ) {
+                        return ctx.invoke_virtual(
+                            url,
+                            "openStream",
+                            "()Ljava/io/InputStream;",
+                            &[],
+                        );
+                    }
+                    return Ok(Some(Value::Object(None)));
+                }
+            }
+        }
     }
     match ctx.find_resource(resource_name) {
         None => Ok(Some(Value::Object(None))),

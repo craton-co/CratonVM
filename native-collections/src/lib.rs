@@ -30171,6 +30171,32 @@ fn native_spliterators_empty(ctx: &mut dyn NativeContext, _args: &[Value]) -> Me
 }
 
 fn native_empty_iterator(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    // In the JDK, `Collections.emptyIterator()` is literally
+    // `(Iterator<T>) EmptyIterator.EMPTY_ITERATOR`, so
+    // `emptyIterator() == emptyIterator()` holds by identity. Code relies on
+    // that: Hibernate's StatelessSession persistence-context "is-cleared" check
+    // asserts `managedEntitiesIterator() == Collections.emptyIterator()`.
+    // Allocating a fresh `EmptyIterator` per call broke the identity (cf.
+    // `collections_empty_singleton` for EMPTY_LIST/MAP/SET). Return the real
+    // `Collections$EmptyIterator.EMPTY_ITERATOR` singleton when available.
+    let _ = ctx.ensure_class_initialized("java/util/Collections$EmptyIterator");
+    if let Some(cid) = ctx.class_id_by_name("java/util/Collections$EmptyIterator") {
+        if let Some(idx) = ctx.static_field_index_by_name(cid, "EMPTY_ITERATOR") {
+            if let v @ Value::Object(Some(_)) = ctx.get_static_field(cid, idx) {
+                return Ok(Some(v));
+            }
+            // Field present but not yet populated: lazily allocate the singleton,
+            // store it in the static field (GC-rooted, so it survives
+            // relocation), and return it so all callers share one instance.
+            let arr = alloc_ref_array(ctx, 0);
+            let itr = alloc_synthetic(ctx, "java/util/Collections$EmptyIterator", 2);
+            ctx.set_field(itr, 0, Value::Object(Some(arr)));
+            ctx.set_field(itr, 1, Value::Int(0));
+            ctx.set_static_field(cid, idx, Value::Object(Some(itr)));
+            return Ok(Some(Value::Object(Some(itr))));
+        }
+    }
+    // Fallback (class/field unavailable): fresh synthetic empty iterator.
     let arr = alloc_ref_array(ctx, 0);
     let itr = alloc_synthetic(ctx, "java/util/Collections$EmptyIterator", 2);
     ctx.set_field(itr, 0, Value::Object(Some(arr)));
