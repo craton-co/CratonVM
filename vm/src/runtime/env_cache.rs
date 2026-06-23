@@ -357,6 +357,21 @@ pub fn jit_virtual_tierup() -> bool {
         Err(_) => true,
     })
 }
+/// `CRATONVM_NATIVE_STRING_REGEX` — route `String.replaceAll` / `replaceFirst`
+/// / `matches` to CratonVM's fast cached Rust regex native instead of the real
+/// JDK bytecode (`Pattern.compile(...).matcher(this).{replaceAll,find}`). The
+/// real-JDK `java.util.regex` engine runs in the interpreter (and only partly
+/// tiers up — see bug-03 `wildfly-suite-bugs`), where every `Matcher` step
+/// crosses the VM→native String-accessor boundary, making regex-heavy build
+/// steps (ShrinkWrap archive packaging, Spring Boot's `PluginXmlParser`,
+/// AsciiDoc/Javadoc `{@code}` rewriting) 30–600× slower than HotSpot. The
+/// native uses the `regex` / `fancy-regex` crates with a bounded compile cache
+/// and Java-faithful replacement expansion (`$N` / `${name}` / `\`-escapes).
+/// Default-OFF (opt-in): real Java bytecode stays the default per the
+/// real-Java-first principle; this is a faithful alternate implementation, not
+/// a synthetic stub. Opt in with `CRATONVM_NATIVE_STRING_REGEX=1` for
+/// regex-heavy workloads. See SBR-02 / bug-03.
+cached_is_set!(native_string_regex, "CRATONVM_NATIVE_STRING_REGEX");
 cached_is_set!(jit_mic_dbg, "CRATONVM_DBG_JIT_MIC");
 cached_is_set!(jit_entry_dbg, "CRATONVM_DBG_JIT_ENTRY");
 cached_is_set!(jit_putfield_diag, "CRATONVM_DBG_JIT_PUTFIELD");

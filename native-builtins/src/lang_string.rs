@@ -3061,7 +3061,7 @@ pub(crate) fn native_string_replace_all(
     };
     let s = ctx.read_string(this).unwrap_or_default();
     let result = if let Ok(re) = compile_java_regex(&pattern, 0) {
-        re.replace_all(&s, replacement.as_str())
+        re.replace_all_java(&s, replacement.as_str())
     } else {
         s.replace(&pattern, &replacement)
     };
@@ -3086,7 +3086,7 @@ pub(crate) fn native_string_replace_first(
     };
     let s = ctx.read_string(this).unwrap_or_default();
     let result = if let Ok(re) = compile_java_regex(&pattern, 0) {
-        re.replace_first(&s, replacement.as_str())
+        re.replace_first_java(&s, replacement.as_str())
     } else {
         s.replacen(&pattern, &replacement, 1)
     };

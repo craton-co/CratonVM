@@ -1061,6 +1061,39 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // never touched at runtime.
     register_biginteger_arithmetic_overrides(registry);
     register_bigdecimal_arithmetic_overrides(registry);
+    // SBR-02 / bug-03: opt-in fast regex. The real-JDK `String.replaceAll` /
+    // `replaceFirst` / `matches` bodies run `Pattern.compile(...).matcher(...)`
+    // through the interpreted `java.util.regex` engine, which is 30–600× slower
+    // than HotSpot (every Matcher step crosses the VM→native String-accessor
+    // boundary — see docs/internal/wildfly-suite-bugs/bug-03). These fast Rust
+    // `regex`/`fancy-regex` natives are normally registered only by
+    // `register_synthetic_overrides` (compiled out in real-JDK mode), so they
+    // are absent here by default and the real bytecode runs (the real-Java
+    // default). When `CRATONVM_NATIVE_STRING_REGEX` is set, register them so the
+    // companion `force_native_over_real_jdk_bytecode` gate routes
+    // `String.replaceAll/replaceFirst/matches` to the cached, Java-faithful
+    // native. Read directly (native-builtins cannot depend on vm::env_cache);
+    // registration runs once at VM init so the lookup cost is negligible.
+    if std::env::var_os("CRATONVM_NATIVE_STRING_REGEX").is_some() {
+        registry.register(
+            "java/lang/String",
+            "replaceAll",
+            "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;",
+            native_string_replace_all,
+        );
+        registry.register(
+            "java/lang/String",
+            "replaceFirst",
+            "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;",
+            native_string_replace_first,
+        );
+        registry.register(
+            "java/lang/String",
+            "matches",
+            "(Ljava/lang/String;)Z",
+            native_string_matches,
+        );
+    }
     // bug-26 (kafka SCRAM): `javax.crypto.Mac` (getInstance/init/update/doFinal)
     // was only registered inside `register_synthetic_overrides`, which real-JDK
     // mode never calls — so `Mac.getInstance("HmacSHA256")` fell through to the
@@ -20179,6 +20212,252 @@ impl JavaRegex {
             JavaRegex::Std(r) => r.replace(text, replacement).into_owned(),
             JavaRegex::Fancy(r) => r.replace(text, replacement).into_owned(),
         }
+    }
+
+    /// Number of *capturing* groups (excluding the whole-match group 0).
+    fn group_count(&self) -> usize {
+        self.captures_len().saturating_sub(1)
+    }
+
+    /// Replace all non-overlapping matches, expanding `replacement` with
+    /// **Java** `Matcher.appendReplacement` semantics rather than the `regex`
+    /// crate's: `$N` (digit-bounded by group count), `${name}`, and `\`-escapes
+    /// (`\$` → literal `$`, `\\` → literal `\`). This is what
+    /// `String.replaceAll` must do; the engine's own `$`-syntax differs
+    /// (`$$` for a literal `$`, greedy `$NN`, no `\`-escape), so we drive the
+    /// expansion ourselves via a per-match closure.
+    pub fn replace_all_java(&self, text: &str, replacement: &str) -> String {
+        let tokens = parse_java_replacement(replacement, self.group_count());
+        match self {
+            JavaRegex::Std(r) => r
+                .replace_all(text, |caps: &regex::Captures| {
+                    render_java_replacement(
+                        &tokens,
+                        |i| caps.get(i).map(|m| m.as_str()),
+                        |n| caps.name(n).map(|m| m.as_str()),
+                    )
+                })
+                .into_owned(),
+            JavaRegex::Fancy(r) => r
+                .replace_all(text, |caps: &fancy_regex::Captures| {
+                    render_java_replacement(
+                        &tokens,
+                        |i| caps.get(i).map(|m| m.as_str()),
+                        |n| caps.name(n).map(|m| m.as_str()),
+                    )
+                })
+                .into_owned(),
+        }
+    }
+
+    /// Like [`replace_all_java`](Self::replace_all_java) but only the first
+    /// match (`String.replaceFirst`).
+    pub fn replace_first_java(&self, text: &str, replacement: &str) -> String {
+        let tokens = parse_java_replacement(replacement, self.group_count());
+        match self {
+            JavaRegex::Std(r) => r
+                .replace(text, |caps: &regex::Captures| {
+                    render_java_replacement(
+                        &tokens,
+                        |i| caps.get(i).map(|m| m.as_str()),
+                        |n| caps.name(n).map(|m| m.as_str()),
+                    )
+                })
+                .into_owned(),
+            JavaRegex::Fancy(r) => r
+                .replace(text, |caps: &fancy_regex::Captures| {
+                    render_java_replacement(
+                        &tokens,
+                        |i| caps.get(i).map(|m| m.as_str()),
+                        |n| caps.name(n).map(|m| m.as_str()),
+                    )
+                })
+                .into_owned(),
+        }
+    }
+}
+
+/// One unit of a parsed Java replacement string.
+enum JavaReplToken {
+    Lit(String),
+    Group(usize),
+    Named(String),
+}
+
+/// Parse a Java replacement string into tokens once (reused across every match
+/// in a `replaceAll`). Mirrors `Matcher.appendExpandedReplacement`:
+/// * `\X` emits `X` literally (escape — including `\$` and `\\`).
+/// * `${name}` is a named-group reference.
+/// * `$NN` is a numeric reference; the digit run is consumed **greedily but
+///   bounded by `group_count`** (so `$10` with 2 groups means group 1 then a
+///   literal `0`, exactly like Java).
+/// * A `$` followed by neither a digit nor `{` is emitted as a literal `$`
+///   (Java throws `IllegalArgumentException`; we choose the lenient path —
+///   malformed replacements are programming errors and rare).
+fn parse_java_replacement(rep: &str, group_count: usize) -> Vec<JavaReplToken> {
+    let mut tokens: Vec<JavaReplToken> = Vec::new();
+    let mut lit = String::new();
+    let bytes = rep.as_bytes();
+    let mut i = 0;
+    macro_rules! flush_lit {
+        () => {
+            if !lit.is_empty() {
+                tokens.push(JavaReplToken::Lit(std::mem::take(&mut lit)));
+            }
+        };
+    }
+    while i < bytes.len() {
+        let c = bytes[i];
+        if c == b'\\' {
+            if i + 1 < bytes.len() {
+                let start = i + 1;
+                let clen = utf8_char_len(bytes[start]);
+                let end = (start + clen).min(bytes.len());
+                lit.push_str(&rep[start..end]);
+                i = end;
+            } else {
+                // Trailing backslash: Java throws; drop it leniently.
+                i += 1;
+            }
+            continue;
+        }
+        if c == b'$' {
+            // ${name}
+            if i + 1 < bytes.len() && bytes[i + 1] == b'{' {
+                if let Some(close) = rep[i + 2..].find('}') {
+                    let name = &rep[i + 2..i + 2 + close];
+                    flush_lit!();
+                    tokens.push(JavaReplToken::Named(name.to_string()));
+                    i = i + 2 + close + 1;
+                    continue;
+                }
+                lit.push('$');
+                i += 1;
+                continue;
+            }
+            // $NN (digit-bounded by group_count)
+            if i + 1 < bytes.len() && bytes[i + 1].is_ascii_digit() {
+                let mut j = i + 1;
+                let mut num = (bytes[j] - b'0') as usize;
+                j += 1;
+                while j < bytes.len() && bytes[j].is_ascii_digit() {
+                    let trial = num * 10 + (bytes[j] - b'0') as usize;
+                    if trial <= group_count {
+                        num = trial;
+                        j += 1;
+                    } else {
+                        break;
+                    }
+                }
+                flush_lit!();
+                tokens.push(JavaReplToken::Group(num));
+                i = j;
+                continue;
+            }
+            // Dangling `$`: emit literally.
+            lit.push('$');
+            i += 1;
+            continue;
+        }
+        let clen = utf8_char_len(c);
+        let end = (i + clen).min(bytes.len());
+        lit.push_str(&rep[i..end]);
+        i = end;
+    }
+    flush_lit!();
+    tokens
+}
+
+/// Render parsed replacement tokens against one match's capture groups. A
+/// missing/non-participating group contributes the empty string (Java would
+/// throw for an out-of-range numeric reference, but a group that simply did
+/// not participate yields `""` — and the common case is a valid reference).
+fn render_java_replacement<'a>(
+    tokens: &[JavaReplToken],
+    get_num: impl Fn(usize) -> Option<&'a str>,
+    get_name: impl Fn(&str) -> Option<&'a str>,
+) -> String {
+    let mut out = String::new();
+    for t in tokens {
+        match t {
+            JavaReplToken::Lit(s) => out.push_str(s),
+            JavaReplToken::Group(n) => {
+                if let Some(s) = get_num(*n) {
+                    out.push_str(s);
+                }
+            }
+            JavaReplToken::Named(n) => {
+                if let Some(s) = get_name(n) {
+                    out.push_str(s);
+                }
+            }
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod java_replacement_tests {
+    use super::compile_java_regex;
+
+    fn ra(text: &str, pat: &str, rep: &str) -> String {
+        compile_java_regex(pat, 0).unwrap().replace_all_java(text, rep)
+    }
+    fn rf(text: &str, pat: &str, rep: &str) -> String {
+        compile_java_regex(pat, 0)
+            .unwrap()
+            .replace_first_java(text, rep)
+    }
+
+    // Each expectation below is the exact output of the equivalent
+    // `String.replaceAll` / `replaceFirst` under HotSpot JDK 25
+    // (see scratch/regexperf/RegexParity golden).
+    #[test]
+    fn literal_and_groups() {
+        assert_eq!(ra("a.b.c.d", "[.]", "/"), "a/b/c/d");
+        assert_eq!(ra("a {@code X} b", "\\{@code (.*?)}", "`$1`"), "a `X` b");
+        assert_eq!(ra("a {@code X} b", "\\{@code (.*?)}", "XX"), "a XX b");
+        assert_eq!(ra("abc", "(b)", "$1Z"), "abZc");
+        assert_eq!(ra("a1b22c333", "(\\d+)", "<$1>"), "a<1>b<22>c<333>");
+    }
+
+    #[test]
+    fn escapes() {
+        // Java `\$` -> literal `$`; `\\` -> literal backslash.
+        assert_eq!(ra("abc", "b", "\\$"), "a$c");
+        assert_eq!(ra("abc", "b", "\\\\"), "a\\c");
+    }
+
+    #[test]
+    fn digit_bounded_group_ref() {
+        // One capturing group; `$10` must mean group 1 then a literal '0'.
+        assert_eq!(ra("abc", "(b)", "$10"), "ab0c");
+    }
+
+    #[test]
+    fn multiref_and_named() {
+        assert_eq!(ra("John Smith", "(\\w+) (\\w+)", "$2 $1"), "Smith John");
+        assert_eq!(
+            ra(
+                "2026-01-15",
+                "(?<y>\\d{4})-(?<m>\\d{2})-(?<d>\\d{2})",
+                "${d}/${m}/${y}"
+            ),
+            "15/01/2026"
+        );
+    }
+
+    #[test]
+    fn zero_width_and_greedy() {
+        assert_eq!(ra("abc", "", "-"), "-a-b-c-");
+        assert_eq!(ra("<a><b>", "<(.*)>", "[$1]"), "[a><b]");
+        assert_eq!(ra("<a><b>", "<(.*?)>", "[$1]"), "[a][b]");
+    }
+
+    #[test]
+    fn replace_first_only() {
+        assert_eq!(rf("a1b2c3", "(\\d)", "<$1>"), "a<1>b2c3");
+        assert_eq!(rf("x.y.z", "[.]", "/"), "x/y.z");
     }
 }
 
