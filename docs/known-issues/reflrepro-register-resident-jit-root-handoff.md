@@ -1,4 +1,17 @@
-# Handoff — ReflRepro GC corruption (OPEN) — title's "register-resident missed JIT root" is REFUTED, see 2026-06-22
+# ReflRepro GC corruption — ✅ FIXED 2026-06-23 (it was GC-side free-list accounting, NOT a register-resident JIT root)
+
+> **✅ FIXED (commit `6e3ddb05`, branch `fix/jit-register-roots`, NOT pushed).** The corruption
+> the title blamed on a "register-resident missed JIT root" was **never that**. ROOT CAUSE: the
+> non-moving young sweep's free-block coalescer merged only **adjacent** free blocks; **overlapping**
+> ones survived, and `Arena::alloc` (no overlap check) then **double-served** the same young region
+> → two live objects at overlapping addresses → linear-walk desync → corruption. FIX: coalesce
+> overlapping blocks too (`off <= last_end`, extend to max end). **`ReflRepro 8000 @
+> GC_STRESS=65536` → `ok=8000 bad=0` (the verification bar, met); `bt16=14985902`, `bt18=68332206`
+> golden.** Paired with a robust free-block skip (`f9138bf0`) that keeps any residual desync
+> recoverable. The full investigation (register-root refutation → mechanism → breadcrumb → fix)
+> is below, kept as the evidence trail. **Residual (non-corrupting, follow-up):** a freed
+> byte-array slot whose `element_type` byte reads Int still triggers a recoverable RE-SYNC warn
+> (benign over-retention, `bad=0`); eliminating it (perf/cleanliness) is the only thing left.
 
 ---
 ## RE-DIAGNOSIS 2026-06-22 (worktree `CratonVM-regroots`, branch `fix/jit-register-roots`, binary `cvmregroots.exe`, off dev `6e1c13a8`; precise-maps default-on)
