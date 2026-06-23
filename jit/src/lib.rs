@@ -850,15 +850,30 @@ pub fn jit_names_enabled() -> bool {
 }
 
 /// deopt-osr: master gate for *real* deopt-exit / OSR-exit resume
-/// (`CRATONVM_DEOPT_REAL`, default-OFF). Read-once cached. While OFF (the
-/// default) every guard/loop bail stays on the `i64::MIN` whole-method re-run,
-/// so the surface is inert. The interpreter deopt sinks and the OSR-exit sink
-/// consult this together with the per-method `can_deopt_resume` / `can_osr_exit`
-/// flags, so deopt-exit and OSR-exit can never run half-on
-/// (see `docs/feature-designs/deopt-osr.md`).
+/// (`CRATONVM_DEOPT_REAL`, **default-ON** as of the 2026-06-22 flip). Read-once
+/// cached. When ON, a guard/loop bail reconstructs a precise interpreter frame
+/// at the trapping bci and RESUMES there (avoiding the `i64::MIN` whole-method
+/// re-run and its side-effect double-execution). The interpreter deopt sinks and
+/// the OSR-exit sink consult this together with the per-method
+/// `can_deopt_resume` / `can_osr_exit` flags, so deopt-exit and OSR-exit can
+/// never run half-on (see `docs/feature-designs/deopt-osr.md`).
+///
+/// **Opt out** with `CRATONVM_DEOPT_REAL=0` (also `false`/`off`/`no`) to restore
+/// the whole-method re-run — the safety net. The flip rides on the
+/// correctness-verified non-moving young-gen + conservative-OSR-backstop GC
+/// foundation (precise-jit-maps default-on); it does NOT enable the OSR-exit
+/// in-place transfer (`CRATONVM_OSR_EXIT_TRANSFER`) or the moving-GC OSR-frame
+/// tracking (`CRATONVM_SHADOW_OSR_TRACK`), which stay default-off — so OSR-exit
+/// uses the safe reject path. When a moving young gen later becomes the default,
+/// re-evaluate the OSR-frame relocation (`SHADOW_OSR_TRACK`) before relying on
+/// OSR-exit transfer.
 pub fn deopt_real_enabled() -> bool {
     static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *CACHE.get_or_init(|| std::env::var_os("CRATONVM_DEOPT_REAL").is_some())
+    *CACHE.get_or_init(|| match std::env::var("CRATONVM_DEOPT_REAL") {
+        // Explicit opt-out values disable; any other value (and unset) → ON.
+        Ok(v) => !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "off" | "no"),
+        Err(_) => true,
+    })
 }
 
 /// activate-ir-optimizer Front 3.2: guard-surviving scalar replacement

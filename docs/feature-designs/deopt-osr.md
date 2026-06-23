@@ -1,12 +1,14 @@
 # Real-frame deoptimization + precise OSR (entry *and* exit)
 
-Status: **LANDED on dev (2026-06-22), gated default-off** (`CRATONVM_DEOPT_REAL`, gate-off byte-identical). 
+Status: **LANDED on dev + DEFAULT-ON (2026-06-22)** (`CRATONVM_DEOPT_REAL` flipped default-on; opt out with `CRATONVM_DEOPT_REAL=0`).
 Steps 1–9, Workstreams A & B, the cat-2/FP resume (P2), and the `CRATONVM_DEOPT_VERIFY` structural/oop verifier are all on dev.
+
+**The default-on flip (2026-06-22).** `deopt_real_enabled()` now defaults ON: a guard/loop bail RESUMES at the trapping bci instead of the `i64::MIN` whole-method re-run. It rides on the correctness-verified GC foundation — the *current default young gen is non-moving* (the moving young gen is "design / not started", see `default-moving-young-gen.md`), so OSR/JIT frames are conservatively pinned and precisely covered (`precise-jit-maps-default.md`, default-on). The flip enables ONLY the real feature: the OSR-exit in-place transfer (`CRATONVM_OSR_EXIT_TRANSFER`) and the moving-GC OSR-frame tracking (`CRATONVM_SHADOW_OSR_TRACK`) stay default-off, so OSR-exit uses the safe reject path. Validation: bt10/12/14/16/18 + long/double/float-accumulator, int-array-BCE, and nested-loop programs all == HotSpot with the gate **off, on, and on+`DEOPT_EAGER`** (eager forces the reconstruct+resume path on every loop); 848 jit-lib + 48 vm-lib deopt + 14 vm OSR tests green. **Footprint cost:** every JIT frame reserves +256 B (the `SavedRegisters` deopt region) when on, even methods with no deopt point — a possible follow-up is to make that conditional on `!deopt_points.is_empty()`. **Forward-looking:** when a moving young gen later becomes the default, re-evaluate OSR-frame relocation (`SHADOW_OSR_TRACK`, still partial: bt18 68199090 ≠ golden) before relying on OSR-exit transfer.
 
 **Remaining (non-blocking follow-ups):**
 - The eager-deopt **value** differential (infra-blocked — read-once gates + forced-deopt codegen; see Validation).
-- Production default-on flip: blocked on moving GC, which needs precise OSR-frame tracking (`CRATONVM_SHADOW_OSR_TRACK`, currently regresses bt18).
 - Typed operand-stack cat-2/FP resume (currently falls back to sound conservative re-run).
+- Optional: make the +256 B deopt-region reservation conditional on the method having deopt points.
 
 (The three Step-9 follow-ups — FREE_CODE before-deref epoch check, eager recompile re-queue, and per-bci de-spec — are **done**; see §D.)
 
