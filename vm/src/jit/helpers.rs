@@ -2775,6 +2775,9 @@ unsafe fn jit_typecheck_resolve(
     obj_class_id: ClassId,
     obj_ref: ObjectRef,
     class_name: &str,
+    // SBR-03: `checkcast` is lenient (preserve native `Object[]`→`T[]` casts),
+    // `instanceof` is strict (a genuine `Object[]` is not an instance of `I[]`).
+    lenient: bool,
 ) -> bool {
     // KC26 array.clone() bug — descriptor-based array assignability.
     //
@@ -2793,7 +2796,12 @@ unsafe fn jit_typecheck_resolve(
     // in place, the cast succeeds and the array round-trips correctly.
     if vm.heap.kind_of(obj_ref) == cratonvm_types::ObjectKind::Array {
         if let Some(src_desc) = crate::runtime::interpreter::array_descriptor_of(vm, obj_ref) {
-            if crate::runtime::interpreter::array_is_assignable_to(vm, &src_desc, class_name) {
+            let assignable = if lenient {
+                crate::runtime::interpreter::array_is_assignable_to(vm, &src_desc, class_name)
+            } else {
+                crate::runtime::interpreter::array_is_instance_of(vm, &src_desc, class_name)
+            };
+            if assignable {
                 return true;
             }
         }
@@ -2915,7 +2923,8 @@ pub unsafe extern "C" fn jit_checkcast(
     // SAFETY: obj_ptr is non-null (checked above) and points to a live heap object.
     let obj_ref = ObjectRef::from_raw(obj_ptr as usize as *mut u8);
     let obj_class_id = vm.heap.class_id_of(obj_ref);
-    if jit_typecheck_resolve(vm, obj_class_id, obj_ref, class_name) {
+    // checkcast: lenient (SBR-03).
+    if jit_typecheck_resolve(vm, obj_class_id, obj_ref, class_name, true) {
         obj_ptr
     } else {
         0
@@ -2957,7 +2966,8 @@ pub unsafe extern "C" fn jit_instanceof(
     // SAFETY: obj_ptr is non-null (checked above) and points to a live heap object.
     let obj_ref = ObjectRef::from_raw(obj_ptr as usize as *mut u8);
     let obj_class_id = vm.heap.class_id_of(obj_ref);
-    if jit_typecheck_resolve(vm, obj_class_id, obj_ref, class_name) {
+    // instanceof: strict (SBR-03).
+    if jit_typecheck_resolve(vm, obj_class_id, obj_ref, class_name, false) {
         1
     } else {
         0
