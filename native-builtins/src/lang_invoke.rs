@@ -292,6 +292,81 @@ fn mirror_to_descriptor(ctx: &dyn NativeContext, mirror: ObjectRef) -> Cow<'stat
     }
 }
 
+/// Split a method descriptor `(p0p1…)ret` into its parameter descriptor tokens
+/// and the return token, so MethodHandle combinators can add/drop parameters
+/// while preserving the exact JVM type spellings. Returns None on malformed
+/// input.
+fn split_descriptor_params(desc: &str) -> Option<(Vec<String>, String)> {
+    let b = desc.as_bytes();
+    if b.first() != Some(&b'(') {
+        return None;
+    }
+    let mut i = 1usize;
+    let mut params = Vec::new();
+    while i < b.len() && b[i] != b')' {
+        let start = i;
+        while i < b.len() && b[i] == b'[' {
+            i += 1;
+        }
+        if i >= b.len() {
+            return None;
+        }
+        if b[i] == b'L' {
+            while i < b.len() && b[i] != b';' {
+                i += 1;
+            }
+            if i >= b.len() {
+                return None;
+            }
+            i += 1; // include the ';'
+        } else {
+            i += 1; // primitive
+        }
+        params.push(desc[start..i].to_string());
+    }
+    if i >= b.len() {
+        return None;
+    }
+    Some((params, desc[i + 1..].to_string()))
+}
+
+/// Read a MethodType object's effective JVM descriptor by converting its
+/// `ptypes` (Class[]) and `rtype` (Class) mirrors back to descriptor tokens.
+fn methodtype_to_descriptor(ctx: &mut dyn NativeContext, mt: ObjectRef) -> Option<String> {
+    let ptypes = match ctx.get_field_by_name(mt, "ptypes") {
+        Value::Object(Some(a)) => a,
+        _ => return None,
+    };
+    let mut s = String::from("(");
+    let n = ctx.array_length(ptypes);
+    for i in 0..n {
+        match ctx.get_array_element(ptypes, i) {
+            Value::Object(Some(p)) => s.push_str(&mirror_to_descriptor(ctx, p)),
+            _ => return None,
+        }
+    }
+    s.push(')');
+    match ctx.get_field_by_name(mt, "rtype") {
+        Value::Object(Some(r)) => s.push_str(&mirror_to_descriptor(ctx, r)),
+        _ => s.push('V'),
+    }
+    Some(s)
+}
+
+/// A MethodHandle's effective `type()` descriptor — the ADAPTED MethodType
+/// (which reflects receiver-prepend, bindTo/insertArguments drops, asCollector
+/// spreads, …), not the raw bytecode `MH_DESC`. Falls back to `MH_DESC` when no
+/// `type` MethodType has been installed. Combinators must chain off this so a
+/// stack of adapters tracks arity correctly.
+fn mh_type_descriptor(ctx: &mut dyn NativeContext, mh: ObjectRef) -> Option<String> {
+    if let Value::Object(Some(mt)) = ctx.get_field_by_name(mh, "type") {
+        if let Some(d) = methodtype_to_descriptor(ctx, mt) {
+            return Some(d);
+        }
+    }
+    mh_read_desc(ctx, mh)
+}
+
 /// WP2.9 — Robust class-name extraction that survives the descriptor-coercion
 /// drift where `Class` mirrors store `Object(name_str)` in slot 1 but read
 /// back as `Int(ptr_lo)` / `Long(ptr_bits)` because the field-coercion path
@@ -3261,6 +3336,31 @@ pub(crate) fn register_method_handle_combinator_extras_bridge(r: &mut NativeMeth
             let desc = mh_read_desc(ctx, target).unwrap_or_default();
             let adapter = alloc_method_handle(ctx, "__adapter__", "insert", &desc, MH_KIND_INSERT);
             ctx.set_field(adapter, MH_BOUND, Value::Object(Some(wrapper)));
+            // type(): insertArguments at `pos` REMOVES `values.length` parameters
+            // (the bound ones) from the target's type. Chain off the target's
+            // adapted type so stacked combinators stay arity-correct. Without
+            // this the guard MH that Groovy's IndyInterface builds
+            // (`insertArguments(sameClasses,0,classes).asCollector(...)`) had a
+            // classes[] longer than the collected args -> AIOOBE in sameClasses.
+            let nvalues = match values {
+                Value::Object(Some(arr)) => ctx.array_length(arr),
+                _ => 0,
+            };
+            if nvalues > 0 {
+                if let Some(tdesc) = mh_type_descriptor(ctx, target) {
+                    if let Some((mut params, ret)) = split_descriptor_params(&tdesc) {
+                        let p = (pos.max(0) as usize).min(params.len());
+                        let end = (p + nvalues).min(params.len());
+                        if p < end {
+                            params.drain(p..end);
+                        }
+                        let new_desc = format!("({}){}", params.concat(), ret);
+                        if let Some(mt) = build_method_type_from_descriptor(ctx, &new_desc) {
+                            ctx.set_field_by_name(adapter, "type", Value::Object(Some(mt)));
+                        }
+                    }
+                }
+            }
             Ok(Some(Value::Object(Some(adapter))))
         },
     );
@@ -3283,6 +3383,36 @@ pub(crate) fn register_method_handle_combinator_extras_bridge(r: &mut NativeMeth
             let adapter =
                 alloc_method_handle(ctx, "__adapter__", "collect", &desc, MH_KIND_COLLECT);
             ctx.set_field(adapter, MH_BOUND, Value::Object(Some(wrapper)));
+            // type(): asCollector REPLACES the trailing array parameter with
+            // `count` parameters of the array's component type (HotSpot:
+            // `(Object[])R`.asCollector(Object[],2) -> `(Object,Object)R`).
+            // Chain off the target's adapted type.
+            if let Some(tdesc) = mh_type_descriptor(ctx, target) {
+                if let Some((mut params, ret)) = split_descriptor_params(&tdesc) {
+                    if !params.is_empty() {
+                        params.pop(); // drop the trailing array parameter
+                    }
+                    // Component descriptor of the array type arg (args[1]).
+                    let comp = match args.get(1) {
+                        Some(Value::Object(Some(arr_cls))) => {
+                            let ad = mirror_to_descriptor(ctx, *arr_cls);
+                            if let Some(rest) = ad.strip_prefix('[') {
+                                rest.to_string()
+                            } else {
+                                DESC_OBJECT.to_string()
+                            }
+                        }
+                        _ => DESC_OBJECT.to_string(),
+                    };
+                    for _ in 0..count.max(0) {
+                        params.push(comp.clone());
+                    }
+                    let new_desc = format!("({}){}", params.concat(), ret);
+                    if let Some(mt) = build_method_type_from_descriptor(ctx, &new_desc) {
+                        ctx.set_field_by_name(adapter, "type", Value::Object(Some(mt)));
+                    }
+                }
+            }
             Ok(Some(Value::Object(Some(adapter))))
         },
     );
