@@ -110,16 +110,63 @@ Forcing all 13 to skip the JIT (`CRATONVM_JIT_BISECT_SKIP=…`) drops the run fr
   predominantly from the interpreter, on a deep call-heavy stack), which is not
   known at compile time without profiling.
 
+## Why "emit oop maps for the leaf methods" does NOT work (investigated 2026-06-23)
+
+Three measured facts kill the leaf-map idea:
+
+1. **Leaves are not the expensive frames.** Splitting the 13 and skipping only the
+   pure leaves (`Integer.compare`, `Character.*`, …) leaves the run at 138 s (≈
+   default); skipping only the methods-*with-calls*/lambdas drops it to 96 s. A leaf
+   has no callee subtree below it, so its conservative band is tiny — cheap. The
+   expensive frames are the call-wrapping lambdas whose band spans a big interpreted
+   subtree.
+2. **Precise maps are already emitted, and don't avoid the band scan.**
+   `scan_one_frame_precise` (`conservative_roots.rs:1472-1485`) scans the mapped
+   slots **and then STILL runs the full conservative backstop**
+   `scan_one_frame(scanner_sp, info.frame_base)`. That backstop band scan is the
+   actual O(stack-band) cost; precision is purely additive on top of it.
+3. **No frame is `fully_oop_covered`, and the band covers callee oops.** Running the
+   repro under `CRATONVM_PRECISE_COVERAGE_PIN=1 CRATONVM_DBG_VERIFY_OOP_MAPS=1` shows
+   **64/64 precise frames `covered=false`**, and the unmapped in-band oops sit at
+   deep offsets the oracle flags as *nested-JIT-callee slots*. So the backstop is
+   load-bearing: it covers real roots in callees / unpinned native Rust locals that
+   the frame's own maps cannot describe.
+
+The codegen scaffolding for the fix exists (`CompiledMethod.fully_oop_covered`,
+x64.rs:24277-24296) but is **inert by default** (`sp_id_slot_off == 0` →
+`fully_oop_covered` is always false), and per its own comment the backstop may be
+suppressed only once the runtime `CRATONVM_DBG_VERIFY_OOP_MAPS` oracle *proves*
+coverage — i.e. it needs whole-stack precise coverage, not a per-leaf map. A naive
+backstop-skip would drop the callee/native-local roots → heap corruption.
+
 ## The real fix (deep / cross-cutting — handoff)
 
-Make the JIT-frame root scan cheap so a compiled frame on a deep stack no longer
-taxes every native call:
+The fix is **precise-maps "Stage B": let `scan_one_frame_precise` skip the
+conservative backstop band scan for a `fully_oop_covered` frame** (the exact lever
+named in x64.rs:24283-24289). That requires, in order:
 
-1. **Precise oop maps emitted during codegen, default-on.** `cm.has_precise_oop_maps()`
-   then routes `enter_with_compiled` to the precise path and `scan_active_jit_frames`
-   to `scan_one_frame_precise` (O(map) not O(band)). This is the keystone fix and is
-   **already in flight** — see the precise-maps memory entries
-   ([[precise-maps-inline-frame-record-steps12]]) and `CRATONVM_PRECISE_JIT_MAPS`.
+1. **Full safepoint coverage + the precise inline gate** so methods actually become
+   `fully_oop_covered` at runtime (today 0 % are). Needs `sp_id_slot_off != 0`,
+   every `safepoint_pcs` mapped, no inlined-callee safepoints.
+2. **Whole-stack coverage (the callee/native-local roots).** The backstop band also
+   covers oops in nested callees and unpinned native Rust locals (proven by the
+   VERIFY oracle above). Suppressing it is sound only when those are rooted some
+   other way — every JIT callee precise+covered, and every allocating native pinning
+   via `pin_native_root`.
+3. **The runtime `CRATONVM_DBG_VERIFY_OOP_MAPS` oracle as the gate** before flipping
+   backstop-suppression on, per the staged-rollout design.
+
+This is the keystone of the in-flight precise-maps work
+([[precise-maps-inline-frame-record-steps12]]) and is the same root cause as
+[[springrepos-extension-hang-jit-throughput-and-deep-recursion]]; it is **not** a
+per-leaf map and **not** a contained single-session change.
+
+### (superseded note) earlier framing
+The keystone is precise oop maps emitted during codegen — but emission is *already*
+default-on, and on its own it does **not** help because the backstop band scan still
+runs (see "Why ... does NOT work" above). The actionable missing piece is the
+backstop suppression (Stage B), not the emission. `CRATONVM_PRECISE_JIT_MAPS` is a
+no-op (read nowhere).
    Today it is default-off and only ~26 % effective here (91 s), suggesting maps are
    not yet emitted for these method shapes (lambdas / tiny leaves). Closing that gap
    should bring this workload to ≈ nojit.
