@@ -3856,6 +3856,11 @@ struct ScalarReplacedObject {
     /// Field `i` starts at `[RBP - (field_base_offset + i * SLOT_SIZE)]`, matching
     /// heap object layout (`HEADER_SIZE + i * SLOT_SIZE` from `jit_getfield`).
     field_base_offset: i32,
+    /// Resolved class id of the eliminated `new`. Phase B (real-frame-deopt x64
+    /// backport): required to emit a `FrameValue::VirtualObject` so a guard deopt
+    /// can re-materialize the elided object. Available in `new_info` and captured
+    /// here; otherwise dropped.
+    class_id: u32,
 }
 
 /// Result of scalar replacement planning: which bytecode PCs to rewrite.
@@ -3869,6 +3874,15 @@ struct ScalarReplacementPlan {
     /// Total 8-byte frame slots reserved for scalar-replaced fields
     /// (`num_fields * (SLOT_SIZE / 8)` per object).
     total_slots: usize,
+    /// Phase B (real-frame-deopt x64 backport): per-bytecode-PC snapshot of which
+    /// LOCALS hold a live scalar-replaced object at that PC — `(local_index,
+    /// new_pc)` pairs, recorded only for PCs where at least one local is a scalar
+    /// object. Captured during the locals abs-interp below (same `local_prov`
+    /// tracking, same branch-barrier reset). A deopt snapshot at `bci` consults
+    /// `local_prov_at[bci]` to emit `VirtualObject`/`VirtualObjectRef` for those
+    /// locals. Scalar objects never reach the operand stack (a call-arg escapes),
+    /// so only per-local provenance is needed.
+    local_prov_at: FxHashMap<usize, Vec<(usize, usize)>>,
 }
 
 /// Analyze bytecode to plan scalar replacement for non-escaping objects.
@@ -3889,6 +3903,7 @@ fn plan_scalar_replacement(
         field_ops: FxHashMap::default(),
         init_skips: std::collections::HashSet::new(),
         total_slots: 0,
+        local_prov_at: FxHashMap::default(),
     };
     if non_escaping_new.is_empty() {
         return empty;
@@ -3904,13 +3919,15 @@ fn plan_scalar_replacement(
     // below — that was O(sorted_pcs.len() * new_info.len()). To preserve the
     // exact prior behavior, where `find` returns the FIRST matching entry, we
     // keep the first occurrence on duplicate PCs (`entry(..).or_insert(..)`).
-    let mut new_info_by_pc: FxHashMap<usize, usize> = FxHashMap::default();
+    // Phase B: carry `class_id` alongside `num_fields` so the scalar-replaced
+    // object descriptor can drive `VirtualObject` materialization on deopt.
+    let mut new_info_by_pc: FxHashMap<usize, (u32, usize)> = FxHashMap::default();
     new_info_by_pc.reserve(new_info.len());
-    for &(p, _, num_fields, _, _) in new_info {
-        new_info_by_pc.entry(p).or_insert(num_fields);
+    for &(p, class_id, num_fields, _, _) in new_info {
+        new_info_by_pc.entry(p).or_insert((class_id, num_fields));
     }
     for &new_pc in &sorted_pcs {
-        if let Some(&num_fields) = new_info_by_pc.get(&new_pc) {
+        if let Some(&(class_id, num_fields)) = new_info_by_pc.get(&new_pc) {
             if num_fields > 0 && num_fields <= 16 {
                 let field_base_offset = ((scalar_base + total_slots) as i32 + 1) * 8; // Cast: x86-64 immediate encoding
                 objects.insert(
@@ -3918,6 +3935,7 @@ fn plan_scalar_replacement(
                     ScalarReplacedObject {
                         num_fields,
                         field_base_offset,
+                        class_id,
                     },
                 );
                 total_slots += num_fields * (SLOT_SIZE / 8);
@@ -3933,6 +3951,8 @@ fn plan_scalar_replacement(
     let mut local_prov: [Option<usize>; 256] = [None; 256];
     let mut field_ops: FxHashMap<usize, usize> = FxHashMap::default();
     let mut init_skips = std::collections::HashSet::new();
+    // Phase B: per-PC snapshot of locals holding a live scalar object.
+    let mut local_prov_at: FxHashMap<usize, Vec<(usize, usize)>> = FxHashMap::default();
 
     // EC-SCALAR-SOUNDNESS: same branch-target barrier as `analyze_escapes`.
     // Objects in `objects` are already guaranteed (by the stricter
@@ -3948,6 +3968,23 @@ fn plan_scalar_replacement(
             abs_stack.clear();
             for prov in local_prov.iter_mut() {
                 *prov = None;
+            }
+        }
+        // Phase B: snapshot which locals hold a live scalar object at the ENTRY
+        // of this PC (after the branch barrier, before the opcode executes) — the
+        // state a deopt snapshot taken at `bci == pc` must see. Recorded only when
+        // non-empty so the map stays small. A `local_prov[i]` is only ever
+        // `Some(new_pc)` for a `new_pc` in `objects` (set exclusively from the
+        // `new`/aload/astore/dup provenance below), so each pair names a real
+        // scalar-replaced object.
+        {
+            let live: Vec<(usize, usize)> = local_prov
+                .iter()
+                .enumerate()
+                .filter_map(|(i, p)| p.map(|np| (i, np)))
+                .collect();
+            if !live.is_empty() {
+                local_prov_at.insert(pc, live);
             }
         }
         let op = code[pc];
@@ -4372,6 +4409,7 @@ fn plan_scalar_replacement(
                     ScalarReplacedObject {
                         num_fields: obj.num_fields,
                         field_base_offset,
+                        class_id: obj.class_id,
                     },
                 );
                 final_total += obj.num_fields * (SLOT_SIZE / 8);
@@ -4392,11 +4430,29 @@ fn plan_scalar_replacement(
         })
         .collect();
 
+    // Phase B: drop any provenance entry referencing an object that did not
+    // survive the used-objects pruning, and any PC whose locals all dropped out.
+    let final_local_prov_at: FxHashMap<usize, Vec<(usize, usize)>> = local_prov_at
+        .into_iter()
+        .filter_map(|(pc, live)| {
+            let kept: Vec<(usize, usize)> = live
+                .into_iter()
+                .filter(|(_, np)| final_objects.contains_key(np))
+                .collect();
+            if kept.is_empty() {
+                None
+            } else {
+                Some((pc, kept))
+            }
+        })
+        .collect();
+
     ScalarReplacementPlan {
         objects: final_objects,
         field_ops: final_field_ops,
         init_skips: final_init_skips,
         total_slots: final_total,
+        local_prov_at: final_local_prov_at,
     }
 }
 
@@ -6399,6 +6455,24 @@ struct Compiler {
     scalar_field_ops: FxHashMap<usize, usize>,
     /// Scalar replacement: invokespecial PCs whose `<init>()V` should be skipped.
     scalar_init_skips: std::collections::HashSet<usize>,
+    /// Phase B (real-frame-deopt x64 backport): `(new_pc, field_index)` →
+    /// JVM field type tag (`b'I'`/`b'J'`/`b'D'`/`b'F'`/`b'L'`/…) for fields of
+    /// scalar-replaced objects, built post-plan by joining `field_info` with
+    /// `scalar_field_ops`. Drives the per-field `FrameValue` width/ref-ness when
+    /// emitting a `VirtualObject`. A field never accessed is absent ⇒ zero default.
+    sr_field_types: FxHashMap<(usize, usize), u8>,
+    /// Phase B: bytecode PC → locals holding a live scalar object at that PC
+    /// (`(local_index, new_pc)`), from `plan_scalar_replacement`. A deopt snapshot
+    /// at `bci` reads `sr_local_prov_at[bci]` to emit `VirtualObject` slots.
+    sr_local_prov_at: FxHashMap<usize, Vec<(usize, usize)>>,
+    /// Phase B: set when a `monitorenter`/`monitorexit` was ELIDED over a
+    /// scalar-replaced (thread-local) object. An elided lock leaves no trace in
+    /// the reconstructed frame's `monitors`, so the VM resume sink cannot detect
+    /// it — the producer must keep such a method off the deopt-resume path
+    /// (`can_deopt_resume = false`) until Phase C records elided monitors and the
+    /// resume relocks. (`ACC_SYNCHRONIZED` is separately caught by the consumer's
+    /// `is_synchronized` bail.)
+    has_elided_monitor: bool,
     /// Inline sites: bytecode PC → resolved InlineSite for inlining callee bytecode.
     inline_sites: FxHashMap<usize, crate::InlineSite>,
     /// Compile-time resolved `java/lang/String` field layout, for the String
@@ -6740,6 +6814,43 @@ struct Compiler {
 /// register slot oop-vs-primitive is the deferred width/type source (Phase A
 /// `can_deopt_resume` excludes the ambiguous cases). XMM-resident slots have no
 /// resolver in Phase A (`SavedRegisters` is `gpr[16]` only) -> `Unsupported`.
+/// Phase B (real-frame-deopt x64 backport): build the per-field `FrameValue`s for
+/// a scalar-replaced object's `VirtualObjectState`. `field_type(k)` yields the JVM
+/// type tag of field `k` if the method accessed it (else `None` ⇒ `Int(0)` zero
+/// default — sound: a non-escaping object's continuation reads the same bytecode,
+/// so a never-accessed field is provably never read post-resume). Field `k` lives
+/// in the frame at `[rbp - (field_base_offset + k*SLOT_SIZE)]` (always its live
+/// value: zero-filled at `new`, overwritten by `putfield`); the resolver reads
+/// `*(rbp + off)`, so the encoded `StackSlot*` offset is the negation. Pure (no
+/// `&self`) so it is unit-testable.
+fn sr_field_values(
+    num_fields: usize,
+    field_base_offset: i32,
+    field_type: impl Fn(usize) -> Option<u8>,
+) -> Vec<crate::deopt::FrameValue> {
+    use crate::deopt::FrameValue;
+    let mut field_values = Vec::with_capacity(num_fields);
+    for k in 0..num_fields {
+        let spill_off = field_base_offset + (k as i32) * (SLOT_SIZE as i32);
+        let off = -spill_off;
+        let fv = match field_type(k) {
+            Some(tag) => match tag {
+                // Reference field (object or array) — the raw word IS the heap
+                // pointer (0 = null); resolves to a GC-tracked `Object`.
+                b'L' | b'[' => FrameValue::StackSlotRef(off),
+                b'J' => FrameValue::StackSlotLong(off),
+                b'D' => FrameValue::StackSlotDouble(off),
+                b'F' => FrameValue::StackSlotFloat(off),
+                // I/B/C/S/Z (and any unexpected tag) → cat-1 int.
+                _ => FrameValue::StackSlot(off),
+            },
+            None => FrameValue::Int(0),
+        };
+        field_values.push(fv);
+    }
+    field_values
+}
+
 fn frame_value_for_slot(
     reg: Option<u8>,
     xmm: Option<u8>,
@@ -7297,6 +7408,9 @@ impl Compiler {
             scalar_replaced: FxHashMap::default(),
             scalar_field_ops: FxHashMap::default(),
             scalar_init_skips: std::collections::HashSet::new(),
+            sr_field_types: FxHashMap::default(),
+            sr_local_prov_at: FxHashMap::default(),
+            has_elided_monitor: false,
             inline_sites: FxHashMap::default(),
             string_layout: None,
             deopt_stubs: Vec::new(),
@@ -7597,6 +7711,29 @@ impl Compiler {
     /// pointer (for the caller to key by bci). Shared by the BCE-guard snapshot
     /// and the OSR-exit map, which differ only in `reason` and which bci→ptr map
     /// they populate. Emits NO machine code — pure metadata.
+    /// Phase B (real-frame-deopt x64 backport): build the `VirtualObjectState`
+    /// for a scalar-replaced object `new_pc` whose dummy ref is live in a local at
+    /// a deopt point. Each field `k`'s value is read from its frame slot
+    /// `[rbp - (field_base_offset + k*SLOT_SIZE)]` — always the field's live value
+    /// (zero-filled at `new`, overwritten by `putfield`), so reading it is
+    /// temporally correct at any PC. The slot's `FrameValue` width/ref-ness is
+    /// typed by `sr_field_types`; a field never accessed by the method defaults to
+    /// `Int(0)` (sound: a non-escaping object's continuation reads the same
+    /// bytecode, so a never-accessed field is provably never read post-resume).
+    /// Returns `None` if the object metadata is missing (⇒ caller bails the slot).
+    fn sr_virtual_object_state(&self, new_pc: usize) -> Option<crate::deopt::VirtualObjectState> {
+        let obj = self.scalar_replaced.get(&new_pc)?;
+        let field_values = sr_field_values(obj.num_fields, obj.field_base_offset, |k| {
+            self.sr_field_types.get(&(new_pc, k)).copied()
+        });
+        Some(crate::deopt::VirtualObjectState {
+            id: new_pc,
+            class_id: obj.class_id,
+            num_fields: obj.num_fields,
+            field_values,
+        })
+    }
+
     fn build_and_record_deopt_point(
         &mut self,
         bci: usize,
@@ -7606,6 +7743,18 @@ impl Compiler {
 
         // Cast: buffer position/length to encoding offset (i32/u32)
         let native_offset = self.buf.pos() as u32;
+
+        // Phase B: locals holding a live scalar-replaced object at this bci →
+        // `local_index → new_pc`. Emitted as `VirtualObject` (first occurrence) /
+        // `VirtualObjectRef` (a shared later occurrence) below, so a guard deopt
+        // re-materializes the elided object instead of resuming with the dummy
+        // null. Empty unless the method scalar-replaced an object live here.
+        let sr_here: FxHashMap<usize, usize> = self
+            .sr_local_prov_at
+            .get(&bci)
+            .map(|v| v.iter().copied().collect())
+            .unwrap_or_default();
+        let mut sr_emitted: std::collections::HashSet<usize> = std::collections::HashSet::new();
 
         // Locals: oop-ness from the intersection-dataflow mask (only when the
         // forward dataflow reached this PC; otherwise treat as non-oop). A slot
@@ -7619,6 +7768,34 @@ impl Compiler {
         };
         let mut locals = Vec::with_capacity(self.num_locals);
         for i in 0..self.num_locals {
+            // Phase B: a local holding a scalar-replaced object's dummy ref is
+            // emitted as a `VirtualObject` (first sighting) / `VirtualObjectRef`
+            // (a shared later sighting), NOT as a `StackSlotRef`/`RegisterRef` to
+            // the zeroed dummy — which would resume with a bogus null. Takes
+            // precedence over the oop-mask path below (the slot's machine home
+            // holds 0; the object's real state lives in its field slots).
+            if let Some(&new_pc) = sr_here.get(&i) {
+                if sr_emitted.contains(&new_pc) {
+                    locals.push(FrameValue::VirtualObjectRef(new_pc));
+                    continue;
+                }
+                if let Some(state) = self.sr_virtual_object_state(new_pc) {
+                    if std::env::var_os("CRATONVM_DBG_SCALAR_DEOPT").is_some() {
+                        eprintln!(
+                            "[DBG_SCALAR_DEOPT] x64 emit VirtualObject local={i} new_pc={new_pc} \
+                             class_id={} fields={} at bci={bci}",
+                            state.class_id, state.num_fields
+                        );
+                    }
+                    sr_emitted.insert(new_pc);
+                    locals.push(FrameValue::VirtualObject(state));
+                    continue;
+                }
+                // Metadata missing → fall through to the safe re-run encoding
+                // (the gate excludes such methods, but never emit a bogus ref).
+                locals.push(FrameValue::Unsupported);
+                continue;
+            }
             let is_oop = i < 64 && (oop_mask & (1u64 << i)) != 0;
             let reg = self.reg_for_local(i);
             let xmm = self.xmm_for_local(i);
@@ -15541,6 +15718,9 @@ impl Compiler {
             // speculative-BCE guard. Only under CRATONVM_DEOPT_EAGER + DEOPT_REAL ⇒
             // no JMP in production ⇒ byte-identical.
             if self.deopt_eager_bci == Some(pc) {
+                if std::env::var_os("CRATONVM_DBG_SCALAR_DEOPT").is_some() {
+                    eprintln!("[DBG_SCALAR_DEOPT] x64 eager deopt-EXIT JMP emitted at bci={pc}");
+                }
                 if !self.deopt_box_ptr_by_bci.contains_key(&pc) {
                     self.emit_deopt_snapshot_at_guard(pc);
                 }
@@ -22953,6 +23133,10 @@ impl Compiler {
                     }
                     // Lock elided — emit nothing. The object is thread-
                     // local so the monitor is never contended.
+                    // Phase B: record the elision so the deopt-resume gate can
+                    // exclude this method (an elided lock leaves no `monitors`
+                    // trace for the VM resume sink to bail on).
+                    self.has_elided_monitor = true;
                     let _ = recv_slot;
                     pc += 1;
                 }
@@ -23470,7 +23654,21 @@ pub fn compile_with_param_slots(
     // JIT frame cannot reproduce. Skipping this re-analysis (or running
     // it without descriptors) caused boxed values to come back as 0
     // (the `Integer.valueOf` / `String.toLowerCase` archetype).
-    let non_escaping_new: std::collections::HashSet<usize> = if non_escaping_new.is_empty() {
+    //
+    // SR-reachability fix (real-frame-deopt x64 backport, Phase B prerequisite):
+    // the precise re-analysis here is the AUTHORITATIVE escape analysis — it
+    // recomputes from scratch with the resolved invokespecial shapes and does not
+    // use `non_escaping_new` as a seed. Gate it on whether the method has any
+    // `new` allocation (`new_info`), NOT on whether `jit_scan`'s conservative
+    // pre-pass found a non-escaping object. `jit_scan` runs `analyze_escapes` with
+    // an EMPTY shape map, whose `None` arm `escape_all!`s every invokespecial
+    // receiver — so it returns an empty `non_escaping_new` for the ubiquitous
+    // `new X(); <init>()V` pattern, and the old `if non_escaping_new.is_empty()`
+    // gate then skipped the precise pass that WOULD recognize it. Net effect of
+    // that bug: single-pass scalar replacement never fired for ordinary
+    // allocations at runtime. Gating on `new_info` instead lets it fire (and is
+    // what makes the Phase B `VirtualObject` deopt path reachable).
+    let non_escaping_new: std::collections::HashSet<usize> = if new_info.is_empty() {
         non_escaping_new
     } else {
         let mut invokespecial_shapes: FxHashMap<usize, InvokeSpecialShape> = FxHashMap::default();
@@ -23491,6 +23689,14 @@ pub fn compile_with_param_slots(
         }
         analyze_escapes(code, code_len, &invokespecial_shapes)
     };
+    if std::env::var_os("CRATONVM_DBG_SCALAR_DEOPT").is_some() && !new_info.is_empty() {
+        eprintln!(
+            "[DBG_SCALAR_DEOPT] x64::compile escape re-analysis: new_info={} non_escaping_new={:?} invoke_info={}",
+            new_info.len(),
+            { let mut v: Vec<usize> = non_escaping_new.iter().copied().collect(); v.sort(); v },
+            invoke_info.len(),
+        );
+    }
 
     // Scalar replacement: plan frame-local storage for non-escaping object fields
     let num_hoists = hoist_info.len();
@@ -23599,9 +23805,31 @@ pub fn compile_with_param_slots(
     // (lowest-pc) loop header. `None` (either gate off / no loop) ⇒ byte-identical.
     compiler.deopt_eager_bci = if crate::deopt_real_enabled() && crate::deopt_eager_enabled() {
         loops.iter().map(|&(h, _)| h).min()
+    } else if crate::deopt_real_enabled() {
+        // Phase B e2e: `CRATONVM_DEOPT_EAGER_BCI=<n>` points the eager deopt-EXIT
+        // at a specific straight-line bci (where a scalar object is live in a
+        // local), the only way to drive `VirtualObject` resume through the JIT.
+        // Fire ONLY in a method that actually has a scalar object live at that
+        // bci — so the global env doesn't perturb unrelated methods (e.g. the
+        // driver `main`, which has no scalar replacement).
+        crate::deopt_eager_bci_override()
+            .filter(|n| compiler.sr_local_prov_at.contains_key(n))
     } else {
         None
     };
+    if std::env::var_os("CRATONVM_DBG_SCALAR_DEOPT").is_some()
+        && !compiler.scalar_replaced.is_empty()
+    {
+        let mut keys: Vec<usize> = compiler.sr_local_prov_at.keys().copied().collect();
+        keys.sort();
+        eprintln!(
+            "[DBG_SCALAR_DEOPT] x64 single-pass compile: scalar_replaced={} sr_local_prov_at_pcs={:?} eager_bci={:?} elided_monitor={}",
+            compiler.scalar_replaced.len(),
+            keys,
+            compiler.deopt_eager_bci,
+            compiler.has_elided_monitor,
+        );
+    }
     if std::env::var_os("CRATONVM_DBG_JIT_GEN").is_some() {
         eprintln!(
             "[JIT_GEN_INSTALL] mic_slots count={} pcs={:?}",
@@ -23638,6 +23866,22 @@ pub fn compile_with_param_slots(
     compiler.fp_hoist_info = fp_hoist_info;
     compiler.fp_strength_reduction_pcs = fp_strength_reduction_pcs;
     compiler.simd_fp_loops = simd_fp_loops;
+    // Phase B (real-frame-deopt x64 backport): build the per-field type map for
+    // scalar-replaced objects by joining the per-access-site `field_info`
+    // (`(pc, field_index, type_tag)`) with the plan's `field_ops` (`pc → new_pc`).
+    // Each accessed field of a scalar object thus learns its JVM type tag, which
+    // drives the `VirtualObject` field `FrameValue` width/ref-ness on deopt. Built
+    // before `field_ops` is moved into `scalar_field_ops` below.
+    {
+        let mut sr_field_types: FxHashMap<(usize, usize), u8> = FxHashMap::default();
+        for &(pc, field_index, type_tag) in &compiler.field_info {
+            if let Some(&new_pc) = sr_plan.field_ops.get(&pc) {
+                sr_field_types.insert((new_pc, field_index), type_tag);
+            }
+        }
+        compiler.sr_field_types = sr_field_types;
+    }
+    compiler.sr_local_prov_at = sr_plan.local_prov_at;
     compiler.scalar_replaced = sr_plan.objects;
     compiler.scalar_field_ops = sr_plan.field_ops;
     compiler.scalar_init_skips = sr_plan.init_skips;
@@ -23891,14 +24135,22 @@ pub fn compile_with_param_slots(
     // (long), `XmmFloat`/`XmmDouble`/`StackSlotFloat`/`StackSlotDouble` (FP) values
     // that the resume mapper reconstructs as full-width `Value::Long`/`Float`/
     // `Double`; the deopt stub spills XMM0..15 (under the gate) so the XMM-resident
-    // FP forms resolve. P2.0's blanket wide-local exclusion is fully lifted. The
-    // only gate now is: a deopt point exists and the method does NOT
-    // scalar-replace (lock-elision / re-materialization hazard — unchanged). Any
+    // FP forms resolve. P2.0's blanket wide-local exclusion is fully lifted. Any
     // slot the classifier can't type (Ambiguous / a register-resident ref /
     // contradiction) emits `Unsupported`, and the mapper re-runs the whole method
     // for it — the per-slot fine-grained safety net behind this coarse gate.
-    cm.can_deopt_resume =
-        !cm.deopt_points.is_empty() && compiler.scalar_replaced.is_empty();
+    //
+    // Phase B (real-frame-deopt x64 backport): the scalar-replacement exclusion is
+    // RELAXED. The snapshot builder now emits `FrameValue::VirtualObject` /
+    // `VirtualObjectRef` for a scalar-replaced object live in a local at a deopt
+    // point (its fields read from their frame slots, typed by `sr_field_types`),
+    // which the VM materializer (`deopt_materialize::materialize_virtual_objects`)
+    // rebuilds on resume. So a scalar-replacing method MAY resume — UNLESS it
+    // elided a `monitorenter`/`monitorexit` over a scalar object (`has_elided_monitor`):
+    // an elided lock leaves no `monitors` trace, so the resume would skip the
+    // re-lock (the elided-monitor hazard, deferred to Phase C). `ACC_SYNCHRONIZED`
+    // is independently caught by the VM resume sink's `is_synchronized` bail.
+    cm.can_deopt_resume = !cm.deopt_points.is_empty() && !compiler.has_elided_monitor;
     // deopt-osr Step 7 — transfer the OSR-exit loop-boundary bci set and set the
     // per-method gate. Both are empty/false unless `deopt_real_enabled()` was on
     // (the emit site is gated), so production artifacts are unchanged. Step 8
@@ -32256,6 +32508,51 @@ mod tests {
         );
         // Two heap fields × two 8-byte words per `Value` slot (`SLOT_SIZE` = 16).
         assert_eq!(plan.total_slots, 4);
+
+        // Phase B: the resolved class id is captured on the object descriptor.
+        assert_eq!(plan.objects[&0].class_id, 1);
+
+        // Phase B: per-PC local provenance records local 1 holding the scalar
+        // object (new_pc 0) from `astore_1` (PC 7 stores it; first observable at
+        // the PC-8 entry) through the rest of the straight-line region. It is NOT
+        // recorded before the store (PCs 0..=7 have local 1 empty at entry).
+        assert_eq!(
+            plan.local_prov_at.get(&8).map(|v| v.as_slice()),
+            Some([(1usize, 0usize)].as_slice()),
+            "local 1 holds scalar obj 0 at PC 8 (aload_1)"
+        );
+        for &pc in &[9usize, 10, 13, 14] {
+            assert_eq!(
+                plan.local_prov_at.get(&pc).map(|v| v.as_slice()),
+                Some([(1usize, 0usize)].as_slice()),
+                "local 1 holds scalar obj 0 at PC {pc}"
+            );
+        }
+        for &pc in &[0usize, 3, 4, 7] {
+            assert!(
+                !plan.local_prov_at.contains_key(&pc),
+                "no scalar local recorded at PC {pc} (before astore_1)"
+            );
+        }
+    }
+
+    #[test]
+    fn s32_phase_b_sr_field_values_typed_by_tag() {
+        use crate::deopt::FrameValue;
+        // 5 fields, base offset 80 (positive `[rbp - off]`), SLOT_SIZE = 16.
+        // Field tags: 0=ref(L), 1=long(J), 2=double(D), 3=float(F), 4=unaccessed.
+        let tags = [Some(b'L'), Some(b'J'), Some(b'D'), Some(b'F'), None];
+        let fvs = sr_field_values(5, 80, |k| tags[k]);
+        // Offsets: field k at `[rbp - (80 + k*16)]` → encoded `-(80 + k*16)`.
+        assert_eq!(fvs[0], FrameValue::StackSlotRef(-80));
+        assert_eq!(fvs[1], FrameValue::StackSlotLong(-(80 + 16)));
+        assert_eq!(fvs[2], FrameValue::StackSlotDouble(-(80 + 32)));
+        assert_eq!(fvs[3], FrameValue::StackSlotFloat(-(80 + 48)));
+        // Never-accessed field ⇒ zero default, NOT a slot read.
+        assert_eq!(fvs[4], FrameValue::Int(0));
+        // An int-family tag (b'I'/b'B'/b'C'/b'S'/b'Z') maps to the cat-1 StackSlot.
+        let ints = sr_field_values(1, 16, |_| Some(b'I'));
+        assert_eq!(ints[0], FrameValue::StackSlot(-16));
     }
 
     #[test]
