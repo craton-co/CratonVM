@@ -1392,6 +1392,16 @@ pub(crate) fn native_class_for_name(
     validate_for_name_dotted(&dotted_name)?;
     let internal_name = dotted_name.replace('.', "/");
 
+    // BUG-06 — mark this thread as inside a reflective class-existence probe for
+    // the duration of resolution. The class loader consults this flag and
+    // refuses to fabricate a synthetic enterprise-framework stub (org/jboss/,
+    // io/smallrye/, …) for a class that is not actually on the classpath, so
+    // `Class.forName` / `ClassUtils.isPresent` correctly report it absent (CNFE)
+    // instead of a false positive. The guard clears on every return path,
+    // including the wf7 entry-class synthesis below (which is unaffected: it
+    // runs only after `loadClass` itself yields null/CNFE).
+    let _probe_guard = cratonvm_types::reflective_probe::ProbeGuard::new();
+
     // RKC16r23 — jboss-logging i18n localized-logger lookup short-circuit.
     //
     // jboss-logging's `Messages.getBundle` / `LoggerProviders.doGetMessageLogger`

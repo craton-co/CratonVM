@@ -70,6 +70,21 @@ struct ThreadEntry {
     /// (a fresh `Thread.stop` throwable is generally NOT frame-reachable
     /// on the target, so this slot is the only thing keeping it alive).
     async_exception_slot: Arc<std::sync::atomic::AtomicUsize>,
+    /// BUG-03 — raw address of this thread's [`cratonvm_gc::Tlab`] (a field of
+    /// its `JvmThread`), published once the thread starts running. 0 until set
+    /// / after teardown. Read by the cross-thread STW JIT root scan to recover
+    /// the un-retired reserved tail of a peer it forcibly stopped while it was
+    /// in JIT code (such a peer never reached a safepoint to retire its TLAB).
+    ///
+    /// Safety of the cross-thread read: it happens only after the STW barrier
+    /// has been satisfied, at which point every *alive* peer is either parked
+    /// at a safepoint or blocked (both having already retired their TLAB →
+    /// `cursor`/`end` null) or forcibly OS-suspended by the collector — so the
+    /// `Tlab` is never being mutated, and an alive thread's `JvmThread` cannot
+    /// be concurrently dropped (teardown flips `alive=false` and clears this
+    /// before dropping). `AtomicUsize` so the owning thread sets/clears it
+    /// lock-free.
+    tlab_addr: std::sync::atomic::AtomicUsize,
 }
 
 /// Global registry of all JVM threads.
@@ -142,6 +157,7 @@ impl ThreadRegistry {
             frame_trace: Arc::new(Mutex::new(Vec::new())),
             gc_block_state: Arc::new(GcBlockState::new()),
             async_exception_slot: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            tlab_addr: std::sync::atomic::AtomicUsize::new(0),
         };
         self.threads.lock().insert(thread_id, entry);
         if let Some(obj) = java_thread_obj {
@@ -149,6 +165,65 @@ impl ThreadRegistry {
                 .lock()
                 .insert(obj.as_ptr() as usize, park_state);
         }
+    }
+
+    /// BUG-03 — publish the address of this thread's `JvmThread`'s
+    /// [`cratonvm_gc::Tlab`]. Called once by the thread itself just after it
+    /// starts running (the TLAB lives in the `JvmThread`, whose address is
+    /// stable for the thread's life). No-op for an unknown id.
+    pub fn set_tlab_addr(&self, thread_id: ThreadId, tlab_addr: usize) {
+        let threads = self.threads.lock();
+        if let Some(entry) = threads.get(&thread_id) {
+            entry.tlab_addr.store(tlab_addr, Ordering::Release);
+        }
+    }
+
+    /// BUG-03 — clear this thread's published TLAB address. MUST be called by
+    /// the thread (or its teardown) before its `JvmThread` is dropped so the
+    /// collector never dereferences a dangling TLAB pointer.
+    pub fn clear_tlab_addr(&self, thread_id: ThreadId) {
+        let threads = self.threads.lock();
+        if let Some(entry) = threads.get(&thread_id) {
+            entry.tlab_addr.store(0, Ordering::Release);
+        }
+    }
+
+    /// BUG-03 — collect the reserved (un-retired) TLAB tails of every alive
+    /// thread, as absolute `(cursor, end)` pairs.
+    ///
+    /// Called by the multi-threaded GC initiator AFTER the STW barrier is
+    /// satisfied (so no peer is running Java): at that point a parked or
+    /// blocked peer has already retired its TLAB (`reserved_tail` → `None`),
+    /// and only a peer the cross-thread JIT root scan forcibly OS-suspended
+    /// still has a non-empty reserved tail. Those tails are the regions the
+    /// non-moving young sweep must skip (see
+    /// [`cratonvm_gc::vm_heap::VmHeap::set_jit_tlab_skip_regions`]).
+    ///
+    /// SAFETY: reads each alive thread's `Tlab` through its published address.
+    /// Per the call-time invariant above, no alive thread is mutating its TLAB
+    /// (all are parked / blocked / OS-suspended), and an alive thread's
+    /// `JvmThread` cannot be concurrently dropped (teardown clears the address
+    /// and flips `alive` first). Dead / un-published entries are skipped.
+    pub fn collect_reserved_tlab_tails(&self) -> Vec<(usize, usize)> {
+        let threads = self.threads.lock();
+        let mut out = Vec::new();
+        for entry in threads.values() {
+            if !entry.alive.load(Ordering::Acquire) {
+                continue;
+            }
+            let addr = entry.tlab_addr.load(Ordering::Acquire);
+            if addr == 0 {
+                continue;
+            }
+            // SAFETY: see method contract — the owning thread is parked /
+            // blocked / OS-suspended, so the `Tlab` at `addr` is live and not
+            // being mutated.
+            let tlab = unsafe { &*(addr as *const cratonvm_gc::Tlab) };
+            if let Some(tail) = tlab.reserved_tail() {
+                out.push(tail);
+            }
+        }
+        out
     }
 
     /// T19.K1 — Update the daemon flag for an already-registered thread.

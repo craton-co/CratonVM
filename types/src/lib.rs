@@ -15,6 +15,7 @@ pub mod field_layout;
 pub mod float_format;
 mod heap_types;
 pub mod intern;
+pub mod reflective_probe;
 mod value;
 
 pub use class_id::{ClassId, ClassLoaderId};

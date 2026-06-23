@@ -2365,6 +2365,26 @@ impl ClassManager {
                         class_name: name.to_string(),
                     }));
                 }
+                // BUG-06 — a reflective `Class.forName` / `ClassUtils.isPresent`
+                // existence probe must report an enterprise-framework class that
+                // is not on the classpath as ABSENT, exactly as HotSpot does.
+                // The synthetic stub fabricated below exists only to satisfy
+                // WildFly/Quarkus *bytecode* linkage; letting it satisfy a
+                // reflective probe is a false positive. Spring's
+                // ReactiveAdapterRegistry probes `io.smallrye.mutiny.Multi` to
+                // decide whether to register its MutinyRegistrar, whose
+                // <clinit> then dies on the incomplete stub — an
+                // ExceptionInInitializerError that cascades across ~20
+                // reactive-messaging / RSocket test classes. Only the reflective
+                // path is gated (the probe flag is set by the Class.forName
+                // native); genuine constant-pool resolution still gets its stub.
+                if is_enterprise_stub_prefix(name)
+                    && cratonvm_types::reflective_probe::active()
+                {
+                    return Err(VmError::ClassFile(ClassFileError::ClassNotFound {
+                        class_name: name.to_string(),
+                    }));
+                }
                 // JDK class not found as a .class file — create a synthetic stub.
                 // Our VM handles JDK classes natively, so we just need a minimal
                 // entry in the ClassStore for the type system to work.
@@ -6038,6 +6058,26 @@ fn is_standard_jdk_namespace(name: &str) -> bool {
         || name.starts_with("com/sun/")
 }
 
+/// Non-JDK package prefixes whose classes get a synthetic-stub fallback when
+/// absent from the classpath. These exist so WildFly / Quarkus *bytecode* can
+/// link against types CratonVM handles natively or that are genuinely optional
+/// (e.g. `org.jboss.modules.Module`); a real jar on the classpath still loads
+/// normally because the fallback only fires after classpath lookup has failed.
+///
+/// A reflective `Class.forName` / `isPresent` probe must NOT be satisfied by one
+/// of these stubs — see [`cratonvm_types::reflective_probe`] and the gate in
+/// [`ClassManager::load_class`].
+fn is_enterprise_stub_prefix(name: &str) -> bool {
+    name.starts_with("org/jboss/")
+        || name.starts_with("org/wildfly/")
+        || name.starts_with("org/xnio/")
+        || name.starts_with("org/infinispan/")
+        || name.starts_with("io/quarkus/")
+        || name.starts_with("io/agroal/")
+        || name.starts_with("io/undertow/")
+        || name.starts_with("io/smallrye/")
+}
+
 fn is_jdk_class(name: &str) -> bool {
     name.starts_with("java/")
         || name.starts_with("javax/")
@@ -6052,14 +6092,7 @@ fn is_jdk_class(name: &str) -> bool {
         // synthetic-stub fallback in `load_class` can fire. The fallback
         // only triggers when classpath lookup has already failed, so a real
         // jboss-modules.jar on the classpath still loads normally.
-        || name.starts_with("org/jboss/")
-        || name.starts_with("org/wildfly/")
-        || name.starts_with("org/xnio/")
-        || name.starts_with("org/infinispan/")
-        || name.starts_with("io/quarkus/")
-        || name.starts_with("io/agroal/")
-        || name.starts_with("io/undertow/")
-        || name.starts_with("io/smallrye/")
+        || is_enterprise_stub_prefix(name)
 }
 
 /// Create the field declarations for well-known JDK stub classes.
@@ -8752,6 +8785,48 @@ mod tests {
             descriptor: cratonvm_types::intern_arc("I"),
             attributes: vec![],
         }
+    }
+
+    // --- BUG-06: reflective Class.forName must not be satisfied by an
+    //     enterprise-framework synthetic stub ---
+
+    #[test]
+    fn enterprise_stub_prefixes_are_recognized() {
+        // Prefixes that get the synthetic-stub fallback for bytecode linkage…
+        for n in [
+            "org/jboss/modules/Module",
+            "org/wildfly/common/Foo",
+            "org/xnio/Options",
+            "org/infinispan/Cache",
+            "io/quarkus/runtime/Application",
+            "io/agroal/api/AgroalDataSource",
+            "io/undertow/Undertow",
+            "io/smallrye/mutiny/Multi",
+            "io/smallrye/mutiny/groups/UniConvert",
+        ] {
+            assert!(is_enterprise_stub_prefix(n), "expected enterprise prefix: {n}");
+            // …and they are a subset of is_jdk_class (the stub gate).
+            assert!(is_jdk_class(n), "expected is_jdk_class: {n}");
+        }
+        // Standard JDK + ordinary app classes are NOT enterprise stub prefixes.
+        for n in [
+            "java/lang/Object",
+            "javax/sql/DataSource",
+            "org/springframework/core/ReactiveAdapterRegistry",
+            "reactor/core/publisher/Flux",
+            "io/reactivex/rxjava3/core/Flowable",
+        ] {
+            assert!(!is_enterprise_stub_prefix(n), "unexpected enterprise prefix: {n}");
+        }
+    }
+
+    #[test]
+    fn reflective_probe_flag_defaults_inactive() {
+        // The gate in `load_class` fabricates a stub unless a reflective probe
+        // is active. Outside the Class.forName native, the flag is clear.
+        assert!(!cratonvm_types::reflective_probe::active());
+        let _g = cratonvm_types::reflective_probe::ProbeGuard::new();
+        assert!(cratonvm_types::reflective_probe::active());
     }
 
     // --- bug-06 family 4: synthetic stubs inherit java/lang/Object ---

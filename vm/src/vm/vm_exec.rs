@@ -3727,6 +3727,14 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             shared_arc
                 .thread_registry
                 .set_gc_block_state(tid, jvm_thread.gc_block_state.clone());
+            // BUG-03 — publish this worker's TLAB address so the cross-thread
+            // STW JIT root scan can recover its un-retired reserved tail if it
+            // is forcibly stopped mid-JIT. `jvm_thread` is a stack local that
+            // is never moved after this point, so the address is stable for
+            // the thread's life; cleared just before `mark_dead` below.
+            shared_arc
+                .thread_registry
+                .set_tlab_addr(tid, &jvm_thread.tlab as *const cratonvm_gc::Tlab as usize);
             // WP4.8: For real-JDK virtual threads (e.g.
             // `java.lang.ThreadBuilders$BoundVirtualThread`), `Thread.run()`
             // is overridden вЂ” `BoundVirtualThread.run()` invokes the user's
@@ -3888,6 +3896,10 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                     wake_obj = unsafe { ObjectRef::from_raw(new as *mut u8) };
                 }
             }
+            // BUG-03 — stop publishing this worker's TLAB address before the
+            // `JvmThread` (and its TLAB) is dropped at closure end, so the
+            // collector can never read a dangling pointer.
+            shared_arc.thread_registry.clear_tlab_addr(tid);
             shared_arc.thread_registry.mark_dead(tid);
 
             // WP4.1 вЂ” wake any thread waiting in `Thread.join()` for us.

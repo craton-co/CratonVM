@@ -13,3 +13,4 @@ pub mod conservative_roots;
 pub mod disasm;
 pub mod helpers;
 pub mod skip_list;
+pub mod xt_root_scan;

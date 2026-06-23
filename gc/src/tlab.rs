@@ -123,6 +123,28 @@ impl Tlab {
     /// Read by the JIT-emitted inline TLAB bump in `jit/src/x64.rs`
     /// and verified at runtime by the `test_tlab_offsets` unit test.
     pub const END_OFFSET: usize = 8;
+
+    /// BUG-03 — the still-reserved, un-allocated tail of this TLAB as an
+    /// absolute `(cursor, end)` address pair, or `None` if the TLAB is empty
+    /// (retired / never refilled).
+    ///
+    /// Used by the cross-thread STW JIT root scan: a peer thread that was
+    /// forcibly stopped while executing JIT code never reached a safepoint to
+    /// `retire` its TLAB, so its un-filled tail `[cursor, end)` would desync
+    /// the non-moving sweep's linear heap walk. The collector reads this tail
+    /// (the peer is OS-suspended, so the read is race-free; the JIT commits
+    /// the bump cursor only AFTER writing the full object header, so `cursor`
+    /// is the linearization point and `[cursor, end)` wholesale-covers any
+    /// in-flight object) and skips it during the sweep. Returns `None` for an
+    /// empty TLAB so a retired/parked thread contributes no skip region.
+    pub fn reserved_tail(&self) -> Option<(usize, usize)> {
+        let c = self.cursor as usize;
+        let e = self.end as usize;
+        if c == 0 || e == 0 || c >= e {
+            return None;
+        }
+        Some((c, e))
+    }
 }
 
 // SAFETY: Tlab pointers are into arena memory owned by the GC heap.

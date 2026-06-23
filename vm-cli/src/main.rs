@@ -1964,6 +1964,19 @@ fn run() -> Result<()> {
     // Create VM and execute main method
     let mut vm = Vm::new(config);
 
+    // BUG-03 — publish the main thread's TLAB address now that `vm` is at its
+    // final, address-stable location on the `main-vm` thread. This lets the
+    // cross-thread STW JIT root scan recover the main thread's un-retired
+    // reserved TLAB tail if it is forcibly stopped while executing JIT code
+    // (workers / foreign threads publish theirs at their own start). Casting to
+    // a raw pointer ends the borrow immediately, so the subsequent registry
+    // call does not conflict.
+    {
+        let main_tlab = &vm.main_thread.tlab as *const _ as usize;
+        let main_tid = vm.main_thread.thread_id;
+        vm.shared.thread_registry.set_tlab_addr(main_tid, main_tlab);
+    }
+
     // T19.H1 — optional watchdog that dumps every interpreter thread's
     // frame chain and aborts the process if the main method hasn't
     // completed within the configured deadline. Triggered by the
