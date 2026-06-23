@@ -24207,6 +24207,18 @@ pub fn compile_with_param_slots(
     cm.osr_xmm_assignments = Some(compiler.xmm_assignments);
     cm.osr_frame_size = compiler.frame_size;
     cm.osr_callee_saved_base = compiler.callee_saved_base;
+    // HIB-CV-20 OSR caller-corruption fix: hand the trampoline the EXACT
+    // callee-saved sets the epilogue restores (GPR + XMM), so it spills the
+    // caller's value for every one of them at the matching slot index. The
+    // prologue/epilogue spill/restore `alloc_used_regs` / `alloc_used_xmms` (the
+    // full allocator-used set, which can include callee-saved regs used for
+    // operand-stack temporaries — NOT just locals); the old trampoline only
+    // spilled a local_assignments-derived subset, so any non-local callee-saved
+    // register was restored from the wrong (or an uninitialised) slot, silently
+    // corrupting the OSR caller's live registers after return.
+    cm.osr_callee_saved_regs = Some(compiler.alloc_used_regs.clone());
+    cm.osr_callee_saved_xmms = Some(compiler.alloc_used_xmms.clone());
+    cm.osr_xmm_saved_base = compiler.xmm_saved_base;
     cm.osr_heap_local_offset = compiler.heap_local_offset;
 
     // T1.1.a — transfer precise oop maps collected during codegen.

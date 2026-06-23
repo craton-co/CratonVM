@@ -4631,6 +4631,15 @@ pub(crate) fn try_osr_with_backoff(
     initial_frame_idx: usize,
     entry_pc: usize,
 ) -> OsrBackoffOutcome {
+    // HIB-CV-20 / HIB-CV-21: back-edge OSR is unsound on large real-world
+    // methods (the OSR entry path can resume with corrupted register/stack
+    // state → a silent wrong value → infinite loops in e.g. Xerces XSD parsing).
+    // Gated OFF by default; whole-method JIT is unaffected. `CRATONVM_JIT_OSR=1`
+    // opts back in. This is the canonical entry for BOTH the inline and
+    // background-OSR paths, so the gate disables OSR everywhere.
+    if !crate::runtime::env_cache::osr_backedge_enabled() {
+        return OsrBackoffOutcome::Skip;
+    }
     // wire-tiered-manager Step 6: the per-frame back-edge OSR trigger is now an
     // env knob (`CRATONVM_TIER_OSR_BACKEDGE`); `OSR_THRESHOLD` remains the
     // canonical default. Live on both the inline and background-OSR paths. Unset
