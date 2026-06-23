@@ -4302,6 +4302,28 @@ impl GenerationalHeap {
         // Every marked object is a survivor: clear the mark and leave it
         // exactly where it is.
         let existing_free = young_from.free_blocks_sorted();
+        // A2 diag (CRATONVM_DBG_A2): does the free list ALREADY self-overlap at
+        // sweep start? `existing_free` is built only from prior sweeps' coalesced
+        // output + the alloc/split bookkeeping between sweeps. A self-overlap here
+        // means the BETWEEN-SWEEP maintenance (Arena::alloc split, or a stale block
+        // never removed) is the source — vs. this sweep's frees overlapping it.
+        if std::env::var_os("CRATONVM_DBG_A2").is_some() {
+            for w in existing_free.windows(2) {
+                let (a_off, a_sz) = w[0];
+                let (b_off, _b_sz) = w[1];
+                if b_off < a_off + a_sz {
+                    let n = A2_FL_OVERLAP_HITS.load(Ordering::Relaxed);
+                    if n < 12 {
+                        eprintln!(
+                            "[A2-FL] EXISTING-FREE self-overlap at sweep start: [{}, {}) then off={} (prev end {})",
+                            a_off, a_off + a_sz, b_off, a_off + a_sz,
+                        );
+                    }
+                    A2_FL_OVERLAP_HITS.fetch_add(1, Ordering::Relaxed);
+                    break;
+                }
+            }
+        }
         let mut dead_regions: Vec<(usize, usize)> = Vec::new();
         let mut bytes_swept: usize = 0;
         let mut objects_swept: usize = 0;
@@ -4636,6 +4658,35 @@ impl GenerationalHeap {
                 continue;
             }
 
+            // A2 fix: an object can never span a pre-existing free HOLE (holes are
+            // gaps between objects, not object interiors). If the computed size
+            // oversteps the next known free block, the header is over-sized — the
+            // ReflRepro `et=Int` byte-array corruption reads a `byte[N]` as an
+            // `int[N]` (4× the element size). Without this guard the sweep would
+            // FREE the over-large span `[cursor, cursor+total_size)`, which overlaps
+            // the free hole (the `DEAD-vs-EXISTING` overlap) and feeds the
+            // overlapping-free-block / double-serve cycle the coalescer then has to
+            // mop up. Instead, do NOT free or trust this span (it may subsume a live
+            // neighbour) — RETAIN it (over-retention is always safe under the
+            // non-moving sweep) and re-sync the cursor at the hole boundary, where
+            // the robust free-block skip takes over. Caps the desync to a single
+            // object instead of an overstep cascade.
+            if let Some(&&(foff, _fsz)) = free_iter.peek() {
+                if foff > cursor && foff < cursor + total_size {
+                    if std::env::var_os("CRATONVM_DBG_A2").is_some()
+                        && A2_FL_OVERLAP_HITS.load(Ordering::Relaxed) < 30
+                    {
+                        eprintln!(
+                            "[A2-FL] CLAMP over-sized object @{} computed_size={} (kind={:?} class_id={}) oversteps free hole at {} — retaining + resyncing",
+                            cursor, total_size, header.kind, header.class_id.as_u32(), foff,
+                        );
+                    }
+                    A2_FL_OVERLAP_HITS.fetch_add(1, Ordering::Relaxed);
+                    cursor = foff;
+                    continue;
+                }
+            }
+
             walked.push((
                 cursor,
                 total_size,
@@ -4716,6 +4767,30 @@ impl GenerationalHeap {
         // positive: the Nodes are valid; the *walk* desynced). The main sweep
         // loop never desynced because it knew each object's size before zeroing
         // it; publishing the holes first makes the re-walk hole-aware too.
+        // A2 diag (CRATONVM_DBG_A2): does a NEW dead region this sweep overlap a
+        // free block that was ALREADY free at sweep start? That is a double-free
+        // (the walk reclaimed a region that was already on the free list — e.g. a
+        // freed slot it walked as a phantom because the region wasn't skipped) or
+        // an OVER-free (a too-large dead object whose span covers a free hole).
+        // Either way it is the direct source of the overlapping free blocks the
+        // coalescer then has to merge.
+        if std::env::var_os("CRATONVM_DBG_A2").is_some() {
+            for &(doff, dsz) in &dead_regions {
+                for &(foff, fsz) in &existing_free {
+                    if doff < foff + fsz && foff < doff + dsz {
+                        let n = A2_FL_OVERLAP_HITS.load(Ordering::Relaxed);
+                        if n < 18 {
+                            eprintln!(
+                                "[A2-FL] DEAD-vs-EXISTING overlap: new dead [{}, {}) overlaps pre-existing free [{}, {})",
+                                doff, doff + dsz, foff, foff + fsz,
+                            );
+                        }
+                        A2_FL_OVERLAP_HITS.fetch_add(1, Ordering::Relaxed);
+                        break;
+                    }
+                }
+            }
+        }
         for (off, sz) in dead_regions {
             young_from.add_free_block(off, sz);
         }
