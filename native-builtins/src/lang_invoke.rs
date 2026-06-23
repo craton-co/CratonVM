@@ -5359,7 +5359,23 @@ fn auto_box_return(
             Ok(_) => Ok(Some(Value::Object(None))),
             err => err,
         },
-        _ => result, // already an object reference
+        // Reference / array return ('L…;' or '[…'): an Object-typed polymorphic
+        // invoke MUST push a value (null at worst) — `Ok(None)` pushes NOTHING, so
+        // the caller's `areturn`/consumer underflows the operand stack. This
+        // happens when an adapter chain (guardWithTest / asSpreader / asType) has
+        // an Object effective return type but the dispatched leaf method is `void`
+        // (mh_dispatch yields `Ok(None)`). Groovy's IndyInterface is the canonical
+        // case: every call site returns Object, but the resolved method (e.g.
+        // `addRepositories(Closure)`) is void — `fromCache`'s
+        // `cachedMethodHandle.invokeExact(args)` then underflowed at its `areturn`.
+        // HotSpot's asType(...→Object) bakes a void→null filter into the adapter;
+        // our asType is a passthrough, so normalize here. Thrown exceptions and a
+        // present value pass through unchanged.
+        _ if matches!(ret_desc.as_bytes().first(), Some(b'L') | Some(b'[')) => match result {
+            Ok(None) => Ok(Some(Value::Object(None))),
+            other => other,
+        },
+        _ => result, // void handled above; any other shape unchanged
     }
 }
 
@@ -6317,8 +6333,21 @@ fn mhs_guard_with_test(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         _ => return Ok(Some(Value::Object(None))),
     };
 
-    // Get the target's descriptor for the adapter MH
-    let target_desc = mh_read_desc(ctx, target_mh).unwrap_or_default();
+    // Get the target's EFFECTIVE type descriptor for the adapter MH. The
+    // guardWithTest result's `type()` must equal the target's `type()` (JLS:
+    // guard/target/fallback all share that type). We must therefore chain off
+    // the adapted MethodType (`mh_type_descriptor`) — which reflects the
+    // receiver-prepend of a virtual/special target and any insertArguments/
+    // asCollector arity changes — NOT the raw bytecode `MH_DESC`
+    // (`mh_read_desc`), which omits the receiver for an unbound virtual target.
+    // Using the raw desc dropped the receiver, so the GUARD adapter reported one
+    // FEWER parameter than the target; Groovy's `Selector.setGuards` reads
+    // `handle.type().parameterArray()` for the `SAME_CLASSES` collector count
+    // while building `classes[]` from the (longer) runtime args, so the shrunken
+    // count made `sameClasses(cs, os)` index past `os` → AIOOBE in fromCache.
+    let target_desc = mh_type_descriptor(ctx, target_mh)
+        .or_else(|| mh_read_desc(ctx, target_mh))
+        .unwrap_or_default();
 
     // Create a wrapper synthetic to hold (test, target, fallback)
     let wrapper = alloc_concurrent_synthetic(ctx, "__mh_guard_wrapper__", 3);
@@ -6326,7 +6355,10 @@ fn mhs_guard_with_test(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     ctx.set_field(wrapper, 1, Value::Object(Some(target_mh)));
     ctx.set_field(wrapper, 2, Value::Object(Some(fallback_mh)));
 
-    // Create the adapter MH with kind=GUARD
+    // Create the adapter MH with kind=GUARD. `target_desc` already carries the
+    // full (receiver-inclusive) param list, so alloc_method_handle installs a
+    // `type` MethodType with the correct arity for the GUARD kind (which does
+    // NOT itself prepend a receiver).
     let adapter = alloc_method_handle(ctx, "__adapter__", "guard", &target_desc, MH_KIND_GUARD);
     ctx.set_field(adapter, MH_BOUND, Value::Object(Some(wrapper)));
     Ok(Some(Value::Object(Some(adapter))))
