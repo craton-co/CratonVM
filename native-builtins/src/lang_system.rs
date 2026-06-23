@@ -615,6 +615,38 @@ pub(crate) fn native_thread_start0(
         let child_hash = ctx.identity_hash_code(this);
         crate::phases_early::queue_inherited_tl_for_child(child_hash, snap);
     }
+    // TC0622: inherit the parent (creating) thread's context classloader into
+    // the child, mirroring real JDK's `Thread.<init>`, which assigns
+    // `this.contextClassLoader = parent.getContextClassLoader()`. CratonVM's
+    // construction path does not propagate it: the synthetic `<init>` overrides
+    // (synthetic-JDK mode) only set name/priority/target/group, and the real
+    // `Thread.<init>` bytecode (real-JDK mode) leaves the child's field null.
+    // A null `contextClassLoader` makes `Thread.getContextClassLoader()` fall
+    // back to the app loader, so Tomcat's
+    // `WebappClassLoaderBase.clearReferencesThreads` — which only stops a thread
+    // when `thread.getContextClassLoader() == webappLoader` — skips leaked
+    // app-spawned threads (e.g. `java.util.TimerThread`) and they stay alive.
+    // Do this here, on the parent thread, before the child runs, and only when
+    // the child has no CCL of its own (preserve an explicit
+    // `setContextClassLoader` issued before `start()`). Opt-out:
+    // `CRATONVM_INHERIT_THREAD_CCL=0` restores the prior (no-inherit) behavior.
+    let inherit_ccl = match std::env::var("CRATONVM_INHERIT_THREAD_CCL") {
+        Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+        Err(_) => true,
+    };
+    if inherit_ccl
+        && !matches!(
+            ctx.get_field_by_name(this, "contextClassLoader"),
+            Value::Object(Some(_))
+        )
+    {
+        let parent = ctx.current_thread_object();
+        if let Value::Object(Some(parent_ccl)) =
+            ctx.get_field_by_name(parent, "contextClassLoader")
+        {
+            ctx.set_field_by_name(this, "contextClassLoader", Value::Object(Some(parent_ccl)));
+        }
+    }
     ctx.thread_start(this)
 }
 
