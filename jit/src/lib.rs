@@ -6009,7 +6009,13 @@ fn compute_param_jvm_slots(descriptor: &str, is_static: bool) -> (Vec<usize>, us
 ///
 /// Used only on the precise gate to seed [`x64::compile_with_param_slots`]'s
 /// `param_oop_mask`; the caller passes `0` when the gate is off.
-fn compute_param_oop_mask(descriptor: &str, is_static: bool) -> u64 {
+///
+/// `pub` so the OSR / eager-first-call compile paths in the VM crate (which call
+/// `x64::compile_with_param_slots` directly) can seed the same reference-parameter
+/// mask the hot-path `try_compile` does — without it, an oop parameter living in a
+/// callee-saved register across an early safepoint is invisible to the
+/// post-safepoint reload and a moving GC leaves the register stale (HIB-CV-20).
+pub fn compute_param_oop_mask(descriptor: &str, is_static: bool) -> u64 {
     let mut mask = 0u64;
     let mut slot = 0usize;
     if !is_static {
