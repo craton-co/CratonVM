@@ -34,6 +34,23 @@ fix below).
 > Family A4 / [[fork6-fjp-multithread-jit-root-reclamation]]). See
 > [[spring-boot-buildsrc-coldpath-hangs-2026-06-22]] for the full suite context.
 
+> ## 🔬 FULL RE-INVESTIGATION 2026-06-23 (dev `99510377`) — it is NOT a hang; it is a 3-bug cascade
+> Ran the test to completion on a freshly-built current-dev binary, P-core-pinned,
+> watchdog off. **The "hang" framing is wrong** — it terminates. The test is blocked
+> by **three independent CratonVM bugs**, peeled one at a time:
+>
+> | # | Bug | Path | Status |
+> |---|-----|------|--------|
+> | 1 | **JIT miscompile in the ANTLR ATN cluster** → a null `PredictionContext` flows into interpreted `ATNConfigSet.optimizeConfigs` → `ATN.getCachedContext` **NPE** → Groovy `MultipleCompilationErrorsException: General error during parsing: NullPointerException` → 0/11 run. JIT is **also 8× slower** here (608s vs `--nojit` 75s). Banning the 53 compiled ANTLR methods via `CRATONVM_JIT_BISECT_SKIP` did **not** clear it → culprit is a non-ANTLR or later-compiled method. | **JIT only** (`--nojit` parses cleanly) | 🔴 OPEN — needs bisection or a scoped ANTLR/Groovy JIT ban |
+> | 2 | **Type-variable USE resolved only against the immediate decl** → a method bound `<S extends T>` (Gradle `RepositoryHandler.withType`/`named`) fell back to a synthetic `TypeVariable` stub (right name, but not identity-equal to the class's real `T`, bound defaulted to `Object`) → ByteBuddy `TypeVariableSource.findExpectedVariable` throws `Cannot resolve T` → **all 11 Mockito mocks fail**. | both (JIT + `--nojit`) | ✅ **FIXED** on branch `fix/springrepos-coldpath` (`f7942b09`, `native-builtins/src/generics.rs`): walk the enclosing generic scope (method → declaring class → outer). Verified: probe reports bound `[T]` matching HotSpot; "Cannot resolve T" gone. General fix — repairs Mockito-on-generics VM-wide. |
+> | 3 | **Groovy invokedynamic parameter-count mismatch** — after #2, dispatch reaches `vmplugin.v8.Selector$MethodSelector.correctCoerce` calling `$Proxy28.mavenRepositories` and throws `GroovyBugError: argument array length and parameter array length should be the same` (a `java.lang.invoke`/MethodHandle vs JDK-dynamic-proxy interaction). | both | 🔴 OPEN — surfaced only after #2; deeper `java.lang.invoke`/indy bug |
+>
+> **Net:** the old "dev passes 11/11 via root-snapshot" claim is false on `99510377`
+> (it predates this test-level run). Bug #2 is fixed; the class still needs #1 and #3
+> (and possibly further layers) to go green. Repro binary
+> `C:\craton\CratonVM-sbrepos\target\release\cvsbrepos.exe`; reflection probe
+> `apps/spring-boot/buildSrc/runner/RhProbe.java`.
+
 > **CHECKED 2026-06-21 against dev `0c904c04`.** All four load-bearing commits this
 > doc relies on are confirmed present on the current dev tip (git ancestry):
 > `1d523351` (root-snapshot/hang fix), `43f5fe03` (pdcache), `05b9622a`
