@@ -166,6 +166,24 @@ gen_heap + `init_object_header` in vm; also `record_free` in the sweep's dead/fo
    which `Arena::add_free_block` does not currently check. The fix is GC-side (arena/header
    coherence), NOT precise-maps/regalloc, NOT a skip_list ban.
 
+### ✅ Clear-on-swap done (2026-06-23, `cvma2arena.exe`) — root = a FREED-slot garbage header missing from the free list
+`a2dbg::clear()` now fires at the young from/to swap (`gen_heap.rs` ~3295) so the breadcrumb is
+reliable within one non-moving epoch. Decisive: the sweep's **FIRST-MISMATCH finds NO mismatch
+among LIVE tracked objects** — every live object sizes correctly. The desync is ENTIRELY a
+**freed slot** (`@2384`, freed THIS epoch) whose header reads garbage
+`kind=Array/et=Int(10)/array_length=37 → 192` (the original byte[37]'s `kind`+`array_length` with
+the `element_type` byte at offset 5 flipped Byte(8)→Int(10)), whose freed region is **NOT on the
+sweep's free list** (the robust skip can't skip what isn't listed), overstepping the live
+`class_id=398` object at 2520. ⇒ A2 is a **free-list/alloc accounting bug**: a freed byte-array
+region (a) goes missing from the free list between sweeps (consumed by a TLAB refill /
+`Arena::alloc` free-list path but left with a non-zero header and NOT re-tracked), and (b) its
+`element_type` byte is corrupted Byte→Int by a stray/leftover write (no young array-header write
+path is unhooked — JIT has no inline array alloc; native arrays use the hooked `alloc_array`).
+**Next instrument (precise pin):** log every `Arena` free-list add/remove + every alloc served
+from the free list (offset+size+caller) to capture the moment `@2384`'s region leaves the free
+list with a non-zero header. Committed: clear-on-swap `d8d85f62`; robust free-block skip FIX
+`f9138bf0` (validated bt16=14985902/bt18=68332206 golden).
+
 Repro (unchanged): `CRATONVM_DBG_GC_STRESS=65536 cvmregroots.exe --java-home <jdk25> -cp
 docs/known-issues/repros/A2-reflrepro ReflRepro 8000`. `javac` the class first.
 
