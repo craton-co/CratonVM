@@ -16509,6 +16509,16 @@ fn force_native_over_real_jdk_bytecode(
             ("replaceAll", "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;")
                 | ("replaceFirst", "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;")
                 | ("matches", "(Ljava/lang/String;)Z")
+                // `replace(CharSequence,CharSequence)` is LITERAL (non-regex)
+                // all-occurrences replacement, byte-identical to Rust
+                // `str::replace`; routed through the fast native under the same
+                // gate (SBR-02 secondary finding — the 8-chained-`replace`
+                // PluginXmlParser.format wall). The `(char,char)` overload has
+                // its own unconditional native and is NOT gated here.
+                | (
+                    "replace",
+                    "(Ljava/lang/CharSequence;Ljava/lang/CharSequence;)Ljava/lang/String;"
+                )
         )
     {
         return true;
