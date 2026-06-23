@@ -72,6 +72,21 @@ pub fn record(
     }
 }
 
+/// Drop all breadcrumb records. Called when the young arena is swapped/reset by
+/// the moving collector — every recorded absolute address becomes stale (live
+/// objects are copied to a new from-space), so cross-epoch lookups would lie.
+/// Clearing per swap keeps the breadcrumb reliable WITHIN one non-moving epoch
+/// (where A2's desync lives), so a `lookup_at` at the sweep names the right alloc.
+#[inline]
+pub fn clear() {
+    if !enabled() {
+        return;
+    }
+    if let Ok(mut l) = LOG.lock() {
+        l.clear();
+    }
+}
+
 /// Mark an address as freed/zeroed by the sweep (size-0 sentinel, kind=0xFF).
 /// `lookup_covering` skips it automatically (size 0 never covers); `lookup_at`
 /// surfaces it so the dump can show a slot was freed (disambiguates a stale

@@ -3293,6 +3293,11 @@ impl GenerationalHeap {
         // Phase 4: Swap young spaces (monitor remap deferred until after a
         // possible major GC so we can pass the composed pointer_map).
         std::mem::swap(&mut *young_from, &mut *young_to);
+        // A2 breadcrumb (CRATONVM_DBG_A2): the swap relocates every live young
+        // object to a fresh from-space, so all recorded absolute addresses are now
+        // stale. Clear so cross-epoch lookups don't lie (keeps the breadcrumb
+        // reliable within the next non-moving epoch, where A2's desync occurs).
+        crate::a2dbg::clear();
 
         // Phase 5: Check if old gen is getting full — trigger major GC (mark-compact)
         let major_ran = if old_gen.used() >= old_gen.capacity() * 75 / 100 {
