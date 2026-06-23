@@ -1463,6 +1463,28 @@ pub(crate) fn native_class_for_name(
                     "[S111-DBG] loadClass({}) succeeded via invoke_virtual",
                     dotted_name
                 );
+                // HIB-CV-26 — honour the `initialize` flag (args[1]).
+                // `ClassLoader.loadClass` only loads + links the class; it does
+                // NOT run static initialisers. The JDK contract for
+                // `Class.forName(name, true, loader)` is that the class IS
+                // initialised before the call returns (this is exactly the
+                // distinction HHH-7272 relies on: `loadClass` skips `<clinit>`,
+                // `Class.forName(.., true, ..)` runs it — so a JDBC driver's
+                // self-registering static block fires). Without this, drivers
+                // loaded via the 3-arg overload never register and
+                // `DriverManager.getDriver` throws "No suitable driver".
+                let initialize = matches!(args.get(1), Some(v) if v.as_int().unwrap_or(0) != 0);
+                if initialize {
+                    if let Value::Object(Some(mirror_ref)) = mirror {
+                        if let Some(cid) = ctx.class_id_from_mirror(mirror_ref) {
+                            if let Some(bin_name) = ctx.class_name_of_id(cid) {
+                                // Propagate ExceptionInInitializerError / linkage
+                                // errors raised by `<clinit>`, matching HotSpot.
+                                ctx.ensure_class_initialized(&bin_name)?;
+                            }
+                        }
+                    }
+                }
                 return Ok(Some(mirror));
             }
             // ClassLoader.loadClass returning null is technically illegal

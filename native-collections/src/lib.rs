@@ -2002,7 +2002,18 @@ pub fn native_al_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         let cls = ctx
             .class_name_of_id(ctx.class_id_of_object(this))
             .unwrap_or_default();
-        if cls == "java/util/RegularEnumSet" || cls == "java/util/JumboEnumSet" {
+        // `java/nio/file/Path` reaches this Iterable.iterator() bridge when a
+        // caller iterates a Path via the `Iterable` super-interface (the JDK's
+        // `Iterable.forEach` default does exactly this: `for (T t : this)`).
+        // The synthetic Path is not ArrayList-layout, so snapshot its real name
+        // elements (via `collect_collection_elements`, which special-cases Path)
+        // and iterate the snapshot — mirroring the EnumSet path below. The
+        // Path-class `iterator()` native (phases_late) still serves direct
+        // `path.iterator()` calls.
+        if cls == "java/util/RegularEnumSet"
+            || cls == "java/util/JumboEnumSet"
+            || cls == "java/nio/file/Path"
+        {
             let elems = collect_collection_elements(ctx, this);
             let backing = alloc_ref_array(ctx, elems.len());
             for (i, v) in elems.iter().enumerate() {
@@ -6121,6 +6132,19 @@ fn native_hs_equals(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
 /// LETSGO_S1: HashSet.containsAll(Collection<?>) — true iff every element
 /// of the source collection is present in this set.  Wraps the existing
 /// `native_hs_contains` and `collect_collection_elements` helpers.
+///
+/// Uses `collect_collection_elements_or_real` (NOT the bare
+/// `collect_collection_elements`): when the argument is a foreign collection
+/// whose layout none of the heuristics model — e.g. Weld's
+/// `ImmutableTinySet$Doubleton`, which stores its members in named `element1`/
+/// `element2` fields — the bare extractor returns an empty Vec, and an empty
+/// argument makes `containsAll` vacuously `true`. That false positive poisoned
+/// Weld's CDI bootstrap: `ImmutableSet.equalsSet` is `size==size &&
+/// other.containsAll(this)`, so a producer's qualifier set `{Parameters,Any}`
+/// compared equal to an interned `{Produces,Parameters}`, and
+/// `SharedObjectCache.getSharedSet` handed back the wrong canonical set —
+/// surfacing as `WELD-001301: @Produces is not a qualifier` (HIB-CV-25). The
+/// `_or_real` variant falls back to the collection's real `toArray()`.
 fn native_hs_contains_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
@@ -6130,7 +6154,7 @@ fn native_hs_contains_all(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let elems = collect_collection_elements(ctx, coll);
+    let elems = collect_collection_elements_or_real(ctx, coll);
     for e in &elems {
         let r = native_hs_contains(ctx, &[Value::Object(Some(this)), *e])?;
         if !matches!(r, Some(Value::Int(1))) {
@@ -20525,6 +20549,39 @@ fn collect_collection_elements(ctx: &mut dyn NativeContext, coll: ObjectRef) -> 
             }
             return Vec::new();
         }
+        // `java/nio/file/Path` — CratonVM's synthetic Path (2 fields: path
+        // String + owning FileSystem) implements `Iterable<Path>` over its
+        // name elements, but it is NOT an ArrayList-layout object. The
+        // ArrayList-shaped natives registered on `java/lang/Iterable`
+        // (`iterator`/`forEach` → `native_al_iterator`/`native_al_for_each`)
+        // therefore read the wrong slots and iterate zero elements — so
+        // `path.forEach(...)` and `((Iterable) path).iterator()` silently see
+        // nothing even though `path.iterator()` (the Path-class native) works
+        // and `getNameCount()` is correct. This broke Spring Boot's
+        // `GenerateAntoraPlaybook` (content-source `url` computed by
+        // `root.relativize(playbook).normalize().forEach(p -> url.append("/.."))`
+        // came out as "." instead of "./../../../../.."). Walk the path's own
+        // `getNameCount()`/`getName(i)` natives (neither is shadowed by a
+        // collection bridge, so `invoke_virtual` resolves them on the Path
+        // class) to surface the real name elements as `Path` objects.
+        if cls_name == "java/nio/file/Path" {
+            let count = match ctx.invoke_virtual(coll, "getNameCount", "()I", &[]) {
+                Ok(Some(Value::Int(n))) if n > 0 => n,
+                _ => 0,
+            };
+            let mut out = Vec::with_capacity(count as usize);
+            for i in 0..count {
+                if let Ok(Some(v)) = ctx.invoke_virtual(
+                    coll,
+                    "getName",
+                    "(I)Ljava/nio/file/Path;",
+                    &[Value::Int(i)],
+                ) {
+                    out.push(v);
+                }
+            }
+            return out;
+        }
     }
     // org.apache.kafka.common.utils.ImplicitLinkedHashCollection (and its
     // subclasses — ImplicitLinkedHashMultiCollection, the generated message
@@ -20874,7 +20931,11 @@ fn native_hs_remove_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let coll_elems = collect_collection_elements(ctx, coll);
+    // `_or_real`: a foreign collection arg whose layout the heuristics can't
+    // read must not silently extract to empty (which would make removeAll a
+    // no-op). Falls back to the collection's real `toArray()`. See
+    // `native_hs_contains_all` for the Weld `ImmutableTinySet` case.
+    let coll_elems = collect_collection_elements_or_real(ctx, coll);
     let mut modified = false;
     for e in &coll_elems {
         let result = native_hs_remove(ctx, &[Value::Object(Some(this)), *e])?;
@@ -20894,7 +20955,12 @@ fn native_hs_retain_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let coll_elems = collect_collection_elements(ctx, coll);
+    // `_or_real`: a foreign collection arg whose layout the heuristics can't
+    // read must not silently extract to empty — for retainAll that would empty
+    // the whole set (keep nothing). Falls back to the collection's real
+    // `toArray()`. See `native_hs_contains_all` for the Weld `ImmutableTinySet`
+    // case.
+    let coll_elems = collect_collection_elements_or_real(ctx, coll);
     // Get current HashSet elements (keys of backing HashMap)
     let current = match hs_backing_map(ctx, this) {
         Some(m) => map_collect_keys(ctx, m),

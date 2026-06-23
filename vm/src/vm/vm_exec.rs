@@ -2907,6 +2907,16 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         *self.shared.system_in.write() = Some(stream);
     }
 
+    fn get_cached_module_mirror(&self, module_name: Option<&str>) -> Option<ObjectRef> {
+        let key = module_name.unwrap_or("");
+        self.shared.module_mirrors.read().get(key).copied()
+    }
+
+    fn cache_module_mirror(&mut self, module_name: Option<&str>, module: ObjectRef) {
+        let key = module_name.unwrap_or("").to_string();
+        self.shared.module_mirrors.write().insert(key, module);
+    }
+
     fn get_system_property(&self, key: &str) -> Option<String> {
         let normalized = normalize_system_property_key(key);
         self.shared

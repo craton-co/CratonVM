@@ -543,6 +543,90 @@ fn is_jdk_internal_bundle(name: &str) -> bool {
         || name.starts_with("javax.")
 }
 
+/// `true` for the locale-data base-name families that `build_bundle`
+/// hand-synthesizes (FormatData / LocaleNames / CalendarData / CurrencyNames).
+/// Those live in the `jdk.localedata` module, which our partial-bootstrap
+/// class path does not reliably surface, so we keep the curated English/US
+/// fallback rather than instantiating the real (potentially absent) class
+/// bundle. Every OTHER base name is eligible for the real class-based
+/// `ListResourceBundle` path below.
+fn is_synthesized_locale_base(name: &str) -> bool {
+    name.starts_with("sun.text.resources.") || name.starts_with("sun.util.resources.")
+}
+
+/// Real-JDK "java.class" bundle format: the bundle is a compiled
+/// `ListResourceBundle` subclass rather than a `.properties` file. The JDK
+/// ships javac/launcher diagnostics (and some app resources) this way — e.g.
+/// `com.sun.tools.javac.resources.compiler` is a generated `ListResourceBundle`
+/// whose `getContents()` returns the message table; there is NO
+/// `compiler.properties` at runtime. Our `getBundle` override only knew how to
+/// load `.properties`, so it handed javac an empty bundle and every diagnostic
+/// degraded to "compiler message file broken: key=…".
+///
+/// Walk the candidate chain (ROOT/least-specific first, mirroring the
+/// `.properties` merge order), instantiate every candidate class that exists,
+/// link the less-specific ones as the parent chain, and return the
+/// most-specific bundle. The read-side natives (`rb_get_object`) resolve keys
+/// through the overridden `getContents()` and walk that parent chain on a miss.
+/// Returns `None` when no candidate class is on the class path.
+fn try_class_bundle(
+    ctx: &mut dyn NativeContext,
+    chain: &[(String, String, String)],
+) -> Option<ObjectRef> {
+    // Candidate class internal names (dots → slashes) whose `.class` resource
+    // exists, least-specific first.
+    let existing: Vec<String> = chain
+        .iter()
+        .map(|(cand, _, _)| cand.replace('.', "/"))
+        .filter(|p| ctx.find_resource(&format!("{p}.class")).is_some())
+        .collect();
+    if existing.is_empty() {
+        return None;
+    }
+
+    // Instantiate least-specific → most-specific and link parents. Every live
+    // bundle is pinned across the subsequent `new_object_initialized`
+    // (instantiating the generated `getContents()` array can trigger a moving
+    // GC that relocates earlier bundles); `first_pin` anchors the batch for a
+    // single release at the end.
+    let mut first_pin: Option<usize> = None;
+    let mut parent_pin: Option<usize> = None;
+    let mut most_specific: Option<ObjectRef> = None;
+    for cname in &existing {
+        let cur = match ctx.new_object_initialized(cname, "()V", &[]) {
+            Ok(Some(Value::Object(Some(o)))) => o,
+            _ => continue,
+        };
+        let cur_pin = ctx.pin_native_root(cur);
+        if first_pin.is_none() {
+            first_pin = Some(cur_pin);
+        }
+        if let Some(pp) = parent_pin {
+            // Re-read both refs through their pins before the re-entrant call.
+            let parent = ctx.read_native_pin(pp, cur);
+            let cur_now = ctx.read_native_pin(cur_pin, cur);
+            ctx.invoke_virtual(
+                cur_now,
+                "setParent",
+                "(Ljava/util/ResourceBundle;)V",
+                &[Value::Object(Some(parent))],
+            )
+            .ok();
+        }
+        parent_pin = Some(cur_pin);
+        most_specific = Some(cur);
+    }
+
+    let result = match (parent_pin, most_specific) {
+        (Some(pp), Some(ms)) => Some(ctx.read_native_pin(pp, ms)),
+        _ => None,
+    };
+    if let Some(base) = first_pin {
+        ctx.unpin_native_roots(base);
+    }
+    result
+}
+
 fn rb_get_bundle(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let bundle_name = match args.first() {
         Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
@@ -624,10 +708,21 @@ fn rb_get_bundle(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
         return Ok(Some(Value::Object(Some(obj))));
     }
 
-    // No .properties on the classpath. JDK-internal base names keep the
-    // synthesized / empty-bundle fallback; a genuinely-absent app bundle gets
-    // MissingResourceException (java.util.ResourceBundle.getBundle's contract,
-    // which callers such as Tomcat's StringManager rely on).
+    // No .properties on the classpath. Before the synthetic / empty-bundle
+    // fallback, try a real class-based `ListResourceBundle` (the JDK ships
+    // javac/launcher messages — and some apps ship resources — as compiled
+    // bundle classes, e.g. `com.sun.tools.javac.resources.compiler`). Skip the
+    // hand-synthesized locale-data families, which stay on their curated path.
+    if !is_synthesized_locale_base(&bundle_name) {
+        if let Some(real) = try_class_bundle(ctx, &chain) {
+            return Ok(Some(Value::Object(Some(real))));
+        }
+    }
+
+    // JDK-internal base names keep the synthesized / empty-bundle fallback; a
+    // genuinely-absent app bundle gets MissingResourceException
+    // (java.util.ResourceBundle.getBundle's contract, which callers such as
+    // Tomcat's StringManager rely on).
     if is_jdk_internal_bundle(&bundle_name) {
         let obj = build_bundle(ctx, &bundle_name);
         return Ok(Some(Value::Object(Some(obj))));
@@ -699,6 +794,17 @@ fn rb_get_object(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
                         }
                     }
                 }
+            }
+            // Key absent in this bundle: walk the parent chain
+            // (ResourceBundle.getObject's contract) before failing, so a
+            // locale variant inherits keys present only in a less-specific
+            // parent — e.g. `compiler_de` falling back to the ROOT
+            // `compiler` bundle for untranslated messages.
+            if let Value::Object(Some(parent)) = ctx.get_field_by_name(this, "parent") {
+                return rb_get_object(
+                    ctx,
+                    &[Value::Object(Some(parent)), Value::Object(Some(key))],
+                );
             }
             // Key absent: throw MissingResourceException — ResourceBundle.getObject's
             // contract, and jakarta.el.ResourceBundleELResolver.getValue catches it

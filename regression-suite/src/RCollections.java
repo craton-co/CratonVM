@@ -81,6 +81,56 @@ public class RCollections {
         try { imm.add(4); } catch (UnsupportedOperationException e) { uoe = true; }
         check(uoe, "immutable List.of");
 
+        // ---- HashSet bulk ops with a FOREIGN collection argument (HIB-CV-25) ----
+        // A custom Set whose elements live in named fields (element1/element2),
+        // not an ArrayList-shaped backing array — mirrors Weld's
+        // ImmutableTinySet$Doubleton. CratonVM's HashSet.containsAll/removeAll/
+        // retainAll must extract such an argument's elements via its real
+        // iterator()/toArray(), NOT silently see it as empty. An empty-seen arg
+        // made containsAll() vacuously true, which (via AbstractSet.equals ->
+        // other.containsAll(this)) corrupted Set-keyed map lookups and broke
+        // Weld's CDI qualifier discovery.
+        Set<String> hs = new HashSet<>(Arrays.asList("a", "b"));
+        Set<String> foreignDisjoint = new TinySet("c", "d");
+        Set<String> foreignPartial  = new TinySet("a", "c");   // shares "a" only
+        Set<String> foreignSubset   = new TinySet("a", "b");
+        check(!hs.containsAll(foreignDisjoint), "containsAll(foreign disjoint)");
+        check(!hs.containsAll(foreignPartial),  "containsAll(foreign partial)");
+        check(hs.containsAll(foreignSubset),    "containsAll(foreign subset)");
+        // AbstractSet.equals across the type boundary must be symmetric+correct.
+        check(!hs.equals(foreignPartial) && !foreignPartial.equals(hs), "equals foreign partial");
+        check(hs.equals(foreignSubset) && foreignSubset.equals(hs), "equals foreign subset");
+        // Set-of-set keyed map: a HashSet lookup must not collide with a foreign
+        // set key that merely shares one element (the getSharedSet failure).
+        Map<Set<String>, String> byKey = new HashMap<>();
+        byKey.put(new TinySet("a", "x"), "AX");
+        check(byKey.get(new HashSet<>(Arrays.asList("a", "y"))) == null, "set-key no false hit");
+        check(byKey.get(new HashSet<>(Arrays.asList("a", "x"))).equals("AX"), "set-key true hit");
+        // retainAll against a foreign arg must keep the shared element, not empty.
+        Set<String> retain = new HashSet<>(Arrays.asList("a", "b"));
+        retain.retainAll(new TinySet("a", "z"));
+        check(retain.equals(new HashSet<>(Arrays.asList("a"))), "retainAll(foreign)");
+        // removeAll against a foreign arg must remove the shared element.
+        Set<String> remove = new HashSet<>(Arrays.asList("a", "b"));
+        remove.removeAll(new TinySet("a", "z"));
+        check(remove.equals(new HashSet<>(Arrays.asList("b"))), "removeAll(foreign)");
+
         System.out.println("PASS RCollections (" + checks + " checks)");
+    }
+
+    /**
+     * A minimal immutable two-element Set whose members are stored in named
+     * fields (not an array) — deliberately shaped like Weld's
+     * {@code ImmutableTinySet$Doubleton} so CratonVM's collection-layout
+     * heuristics cannot model it and must fall back to the real iterator.
+     */
+    static final class TinySet extends AbstractSet<String> {
+        private final String element1, element2;
+        TinySet(String e1, String e2) { this.element1 = e1; this.element2 = e2; }
+        public int size() { return 2; }
+        public boolean contains(Object o) { return element1.equals(o) || element2.equals(o); }
+        public Iterator<String> iterator() {
+            return Arrays.asList(element1, element2).iterator();
+        }
     }
 }

@@ -808,6 +808,20 @@ pub trait NativeContext {
     /// agree after `initPhase1` allocates it. Default: no-op.
     fn cache_system_stdin(&mut self, _stream: ObjectRef) {}
 
+    /// Look up the canonical `java.lang.Module` mirror for a module name
+    /// (`None`/`Some("")` ⇒ the unnamed module). `Class.getModule()` MUST return
+    /// the SAME instance for every class in a module — the JDK compares modules
+    /// by identity (see `Throwable.validateSuppressedExceptionsList`, HIB-CV-29).
+    /// Default: `None` (mock contexts have no persistent store).
+    fn get_cached_module_mirror(&self, _module_name: Option<&str>) -> Option<ObjectRef> {
+        None
+    }
+
+    /// Store the canonical `java.lang.Module` mirror for a module name so that
+    /// subsequent `Class.getModule()` calls return the identical instance.
+    /// The mirror is registered as a permanent GC root. Default: no-op.
+    fn cache_module_mirror(&mut self, _module_name: Option<&str>, _module: ObjectRef) {}
+
     /// Get a system property by key.
     fn get_system_property(&self, key: &str) -> Option<String>;
 

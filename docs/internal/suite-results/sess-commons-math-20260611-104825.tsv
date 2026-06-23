@@ -1,4 +1,0 @@
-variant	rc	wall_s	tests	failures	errors	skipped	build
-hotspot	0	128.7	3204	0	0	30	BUILD SUCCESS
-tornadovm	0	174.6	3204	0	0	30	BUILD SUCCESS
-cratonvm	1	229.1	56	12	0	30	RAN(transform-only)

@@ -3957,6 +3957,32 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         "getModule",
         "()Ljava/lang/Module;",
         |ctx, args| {
+            if std::env::var_os("CRATONVM_DBG_GETMODULE").is_some() {
+                eprintln!("[dbg-getmodule] lib.rs getModule native FIRED");
+            }
+            // Resolve the receiver class's module name FIRST so we can return the
+            // canonical (cached) Module instance for that module. The JDK compares
+            // Modules by identity (`Module` does not override `equals`), so every
+            // class in a module MUST observe the SAME Module object. Allocating a
+            // fresh Module per call broke `Throwable.validateSuppressedExceptionsList`
+            // (`Object.class.getModule() == deserList.getClass().getModule()`),
+            // which throws `StreamCorruptedException("List implementation not in
+            // base module.")` on any ObjectInputStream round-trip of an object
+            // holding a java.util List — HIB-CV-29.
+            let module_name: Option<String> = if let Some(Value::Object(Some(mirror))) = args.first()
+            {
+                let class_id = ctx.class_id_of_object(*mirror);
+                ctx.module_name_of_class(class_id)
+            } else {
+                None
+            };
+
+            // Canonical-cache hit: hand back the existing Module mirror so
+            // identity comparisons across classes in the same module succeed.
+            if let Some(cached) = ctx.get_cached_module_mirror(module_name.as_deref()) {
+                return Ok(Some(Value::Object(Some(cached))));
+            }
+
             let m_obj = alloc_concurrent_synthetic(ctx, "java/lang/Module", 2);
             // GC-safety: `create_string` below allocates (String + char[]) and
             // can trigger a moving GC. `m_obj` lives only in this Rust local —
@@ -3967,17 +3993,17 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             // Pin across the allocation and read the forwarded ref back. Same
             // bug class as reference_classloader_gc_root_gap.
             let pin = ctx.pin_native_root(m_obj);
-            let module_name_val = if let Some(Value::Object(Some(mirror))) = args.first() {
-                let class_id = ctx.class_id_of_object(*mirror);
-                ctx.module_name_of_class(class_id)
-                    .map(|name| Value::Object(Some(ctx.create_string(&name))))
-                    .unwrap_or(Value::Object(None))
-            } else {
-                Value::Object(None)
-            };
+            let module_name_val = module_name
+                .as_deref()
+                .map(|name| Value::Object(Some(ctx.create_string(name))))
+                .unwrap_or(Value::Object(None));
             let m_obj = ctx.read_native_pin(pin, m_obj);
             ctx.set_field(m_obj, 0, module_name_val);
             ctx.unpin_native_roots(pin);
+            // Publish as the canonical mirror for this module name so future
+            // getModule() calls (and the JDK's identity comparisons) see the
+            // same instance. The VM registers it as a permanent GC root.
+            ctx.cache_module_mirror(module_name.as_deref(), m_obj);
             Ok(Some(Value::Object(Some(m_obj))))
         },
     );
@@ -19319,6 +19345,29 @@ fn native_classloader_find_bootstrap_class(
     };
     // Convert "java.lang.String" → "java/lang/String"
     let internal_name = name.replace('.', "/");
+
+    // HIB-CV-24 / SBR-14 — `findBootstrapClass` must answer ONLY for classes the
+    // bootstrap loader genuinely owns. The real `ClassLoader.loadClass` bytecode
+    // calls this for a null-parent loader BEFORE its own `findClass`; if we
+    // resolve an application class here, a custom child/isolated loader's
+    // `findClass` override (Hibernate `AggregatedClassLoader`, plugin loaders) is
+    // never invoked and the supplied loader is bypassed (JVMS §5.3). Scope the
+    // bootstrap lookup so a custom loader that overrides `findClass` gets `null`
+    // for non-bootstrap names and the bytecode proceeds to its override. Built-in
+    // loaders keep the permissive global resolution (CratonVM has no separate
+    // bootstrap classpath, so the app-loader path relies on it). Opt-out gate.
+    if crate::classloader::cl_bootstrap_scoped()
+        && !crate::classloader::is_bootstrap_class_name(&internal_name)
+    {
+        if let Some(Value::Object(Some(this))) = args.first() {
+            if crate::classloader::is_user_defined_loader(ctx, *this)
+                && crate::classloader::receiver_overrides_find_class(ctx, *this)
+            {
+                return Ok(Some(Value::Object(None)));
+            }
+        }
+    }
+
     // Try to load the class — load_class returns MethodCallResult
     // where Ok(Some(Value::Object(Some(obj)))) contains the class mirror
     match ctx.load_class(&internal_name) {
