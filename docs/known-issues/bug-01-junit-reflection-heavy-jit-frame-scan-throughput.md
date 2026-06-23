@@ -11,15 +11,23 @@ metadata:
 **Severity:** High (suite-wide; every reflection/call-heavy JUnit test class overshoots
 the 120 s default watchdog and is reported as a hang).
 
+**STATUS: FIXED** by flipping precise JIT oop maps to **default-OFF** (`jit/src/x64.rs`
+`precise_jit_maps_enabled()` → opt-in `CRATONVM_PRECISE_JIT_MAPS`; `CRATONVM_NO_PRECISE_JIT_MAPS`
+still forces off). After the flip, default build:
+`ObjectUtilsTests` **18 s `found=140 succ=140 OK`** and `ClassUtilsTests` **15 s** under the
+real 120 s watchdog (were both aborting at 120 s). **Accepted trade-off** (residuals tracked,
+owner to revisit): default-off drops back to the conservative JIT-frame root scan, so the
+GC-root-coverage-under-JIT family (`SB-CRASH-04`/A3, `ReflRepro`/A2, `Fork6`/A4) that
+`5b8864a0` fixed can recur; opt back in with `CRATONVM_PRECISE_JIT_MAPS=1` (restores coverage,
+restores the ~6× slowdown). The proper long-term fix keeps the coverage while cutting the
+per-call cost (see "The fix" below).
+
 **TL;DR.** The original report blamed `Class.reflectionData()` not being cached — that
 is **wrong** (the reflection cache works perfectly). The class does not hang: it
 **completes**, but slowly enough that the built-in **120 s watchdog aborts it**, which
-surfaces as a "hang." The real cause is that **precise JIT oop maps are default-on**
+surfaces as a "hang." The real cause is that **precise JIT oop maps were default-on**
 (commit `5b8864a0`) and their **per-call / per-safepoint codegen makes hot JIT-compiled
 code ~6× slower than the interpreter** on call-heavy JUnit execution.
-`CRATONVM_NO_PRECISE_JIT_MAPS=1` makes the class run in ~18 s (≈ nojit) — but that
-re-opens the GC-root-coverage corruption (`SB-CRASH-04`/A3, `ReflRepro`/A2, `Fork6`/A4)
-that `5b8864a0` was landed to fix, so it is **not** a safe default flip.
 
 Investigated on a worktree off `dev` `99510377`…`814158ae`. Repro classes:
 `org.springframework.util.ClassUtilsTests`, `org.springframework.util.ObjectUtilsTests`.
