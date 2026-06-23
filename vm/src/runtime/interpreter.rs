@@ -16606,6 +16606,35 @@ fn force_native_over_real_jdk_bytecode(
     method_name: &str,
     method_descriptor: &str,
 ) -> bool {
+    // SBR-02 / bug-03: opt-in fast regex. The real-JDK `String.replaceAll` /
+    // `replaceFirst` / `matches` bodies run `Pattern.compile(...).matcher(...)`
+    // in the interpreter (java.util.regex), which is 30–600× slower than
+    // HotSpot because every Matcher step crosses the VM→native String-accessor
+    // boundary. When opted in, force CratonVM's cached `regex`/`fancy-regex`
+    // native (lang_string.rs), which is Java-faithful (replacement `$N` /
+    // `${name}` / `\`-escapes) and orders of magnitude faster. Default-OFF so
+    // real Java bytecode stays the default; see `env_cache::native_string_regex`.
+    if class_name == "java/lang/String"
+        && crate::runtime::env_cache::native_string_regex()
+        && matches!(
+            (method_name, method_descriptor),
+            ("replaceAll", "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;")
+                | ("replaceFirst", "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;")
+                | ("matches", "(Ljava/lang/String;)Z")
+                // `replace(CharSequence,CharSequence)` is LITERAL (non-regex)
+                // all-occurrences replacement, byte-identical to Rust
+                // `str::replace`; routed through the fast native under the same
+                // gate (SBR-02 secondary finding — the 8-chained-`replace`
+                // PluginXmlParser.format wall). The `(char,char)` overload has
+                // its own unconditional native and is NOT gated here.
+                | (
+                    "replace",
+                    "(Ljava/lang/CharSequence;Ljava/lang/CharSequence;)Ljava/lang/String;"
+                )
+        )
+    {
+        return true;
+    }
     matches!(
         (class_name, method_name, method_descriptor),
         ("java/lang/ClassLoader", "setDefaultAssertionStatus", "(Z)V")

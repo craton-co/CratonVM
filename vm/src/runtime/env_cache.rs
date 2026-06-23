@@ -357,6 +357,32 @@ pub fn jit_virtual_tierup() -> bool {
         Err(_) => true,
     })
 }
+/// `CRATONVM_NATIVE_STRING_REGEX` — route `String.replaceAll` / `replaceFirst`
+/// / `matches` and the literal `String.replace(CharSequence,CharSequence)` to
+/// CratonVM's fast cached Rust natives instead of the real JDK bytecode. The
+/// real-JDK `java.util.regex` engine runs interpreted (every `Matcher` step
+/// crosses the VM→native String-accessor boundary), and the literal `replace`
+/// overload runs an interpreted per-char scan — 10–600× slower than HotSpot
+/// for regex-heavy build steps (ShrinkWrap archive packaging, Spring Boot's
+/// `PluginXmlParser`, AsciiDoc/Javadoc `{@code}` rewriting). The natives use the
+/// `regex` / `fancy-regex` crates (bounded compile cache, Java-faithful
+/// replacement `$N`/`${name}`/`\`-escapes, ASCII-default `\d`/`\w`/`\s`/`\b`)
+/// and `str::replace`, and are validated byte-identical to HotSpot.
+///
+/// **DEFAULT-ON** (opt-out `CRATONVM_NATIVE_STRING_REGEX=0`/`false`). These are
+/// faithful alternate implementations (like intrinsics), not synthetic stubs,
+/// and a parity battery confirms HotSpot-identical output incl. non-ASCII Perl
+/// classes; the opt-out is the safety net if an app hits a regex-feature gap.
+#[inline]
+pub fn native_string_regex() -> bool {
+    static CACHE: OnceLock<bool> = OnceLock::new();
+    *CACHE.get_or_init(|| match std::env::var("CRATONVM_NATIVE_STRING_REGEX") {
+        // Explicit opt-out only: `0` / `false` disable; unset or any other
+        // value (incl. `1`, empty) enables.
+        Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+        Err(_) => true,
+    })
+}
 cached_is_set!(jit_mic_dbg, "CRATONVM_DBG_JIT_MIC");
 cached_is_set!(jit_entry_dbg, "CRATONVM_DBG_JIT_ENTRY");
 cached_is_set!(jit_putfield_diag, "CRATONVM_DBG_JIT_PUTFIELD");

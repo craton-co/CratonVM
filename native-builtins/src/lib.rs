@@ -1061,6 +1061,62 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // never touched at runtime.
     register_biginteger_arithmetic_overrides(registry);
     register_bigdecimal_arithmetic_overrides(registry);
+    // SBR-02 / bug-03: opt-in fast regex. The real-JDK `String.replaceAll` /
+    // `replaceFirst` / `matches` bodies run `Pattern.compile(...).matcher(...)`
+    // through the interpreted `java.util.regex` engine, which is 30–600× slower
+    // than HotSpot (every Matcher step crosses the VM→native String-accessor
+    // boundary — see docs/internal/wildfly-suite-bugs/bug-03). These fast Rust
+    // `regex`/`fancy-regex` natives are normally registered only by
+    // `register_synthetic_overrides` (compiled out in real-JDK mode), so they
+    // are absent here by default and the real bytecode runs (the real-Java
+    // default). When `CRATONVM_NATIVE_STRING_REGEX` is set, register them so the
+    // companion `force_native_over_real_jdk_bytecode` gate routes
+    // `String.replaceAll/replaceFirst/matches` to the cached, Java-faithful
+    // native. Read directly (native-builtins cannot depend on vm::env_cache)
+    // with the SAME default-ON / opt-out (`=0`/`false`) semantics as
+    // `env_cache::native_string_regex`; registration runs once at VM init so the
+    // lookup cost is negligible.
+    let native_string_regex_enabled = match std::env::var("CRATONVM_NATIVE_STRING_REGEX") {
+        Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+        Err(_) => true,
+    };
+    if native_string_regex_enabled {
+        registry.register(
+            "java/lang/String",
+            "replaceAll",
+            "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;",
+            native_string_replace_all,
+        );
+        registry.register(
+            "java/lang/String",
+            "replaceFirst",
+            "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;",
+            native_string_replace_first,
+        );
+        registry.register(
+            "java/lang/String",
+            "matches",
+            "(Ljava/lang/String;)Z",
+            native_string_matches,
+        );
+        // SBR-02 secondary finding: the `replace(CharSequence,CharSequence)`
+        // overload is LITERAL all-occurrences replacement (NOT regex), but its
+        // real-JDK body still runs interpreted per-char scans + StringBuilder
+        // allocations (~13× slower than HotSpot under CratonVM — it dominated
+        // the `PluginXmlParser.format` chain of 8 chained `replace` calls).
+        // `native_string_replace_charseq` is byte-identical to Rust
+        // `str::replace` (literal, non-overlapping, empty-target inserts at
+        // every position — same as Java) so there's no regex-semantics risk;
+        // gated together with the regex natives. NOTE: the `(char,char)`
+        // overload already has an unconditional native (`native_string_replace`)
+        // and is unaffected.
+        registry.register(
+            "java/lang/String",
+            "replace",
+            "(Ljava/lang/CharSequence;Ljava/lang/CharSequence;)Ljava/lang/String;",
+            native_string_replace_charseq,
+        );
+    }
     // bug-26 (kafka SCRAM): `javax.crypto.Mac` (getInstance/init/update/doFinal)
     // was only registered inside `register_synthetic_overrides`, which real-JDK
     // mode never calls — so `Mac.getInstance("HmacSHA256")` fell through to the
@@ -20180,6 +20236,292 @@ impl JavaRegex {
             JavaRegex::Fancy(r) => r.replace(text, replacement).into_owned(),
         }
     }
+
+    /// Number of *capturing* groups (excluding the whole-match group 0).
+    fn group_count(&self) -> usize {
+        self.captures_len().saturating_sub(1)
+    }
+
+    /// Replace all non-overlapping matches, expanding `replacement` with
+    /// **Java** `Matcher.appendReplacement` semantics rather than the `regex`
+    /// crate's: `$N` (digit-bounded by group count), `${name}`, and `\`-escapes
+    /// (`\$` → literal `$`, `\\` → literal `\`). This is what
+    /// `String.replaceAll` must do; the engine's own `$`-syntax differs
+    /// (`$$` for a literal `$`, greedy `$NN`, no `\`-escape), so we drive the
+    /// expansion ourselves via a per-match closure.
+    pub fn replace_all_java(&self, text: &str, replacement: &str) -> String {
+        let tokens = parse_java_replacement(replacement, self.group_count());
+        match self {
+            JavaRegex::Std(r) => r
+                .replace_all(text, |caps: &regex::Captures| {
+                    render_java_replacement(
+                        &tokens,
+                        |i| caps.get(i).map(|m| m.as_str()),
+                        |n| caps.name(n).map(|m| m.as_str()),
+                    )
+                })
+                .into_owned(),
+            JavaRegex::Fancy(r) => r
+                .replace_all(text, |caps: &fancy_regex::Captures| {
+                    render_java_replacement(
+                        &tokens,
+                        |i| caps.get(i).map(|m| m.as_str()),
+                        |n| caps.name(n).map(|m| m.as_str()),
+                    )
+                })
+                .into_owned(),
+        }
+    }
+
+    /// Like [`replace_all_java`](Self::replace_all_java) but only the first
+    /// match (`String.replaceFirst`).
+    pub fn replace_first_java(&self, text: &str, replacement: &str) -> String {
+        let tokens = parse_java_replacement(replacement, self.group_count());
+        match self {
+            JavaRegex::Std(r) => r
+                .replace(text, |caps: &regex::Captures| {
+                    render_java_replacement(
+                        &tokens,
+                        |i| caps.get(i).map(|m| m.as_str()),
+                        |n| caps.name(n).map(|m| m.as_str()),
+                    )
+                })
+                .into_owned(),
+            JavaRegex::Fancy(r) => r
+                .replace(text, |caps: &fancy_regex::Captures| {
+                    render_java_replacement(
+                        &tokens,
+                        |i| caps.get(i).map(|m| m.as_str()),
+                        |n| caps.name(n).map(|m| m.as_str()),
+                    )
+                })
+                .into_owned(),
+        }
+    }
+}
+
+/// One unit of a parsed Java replacement string.
+enum JavaReplToken {
+    Lit(String),
+    Group(usize),
+    Named(String),
+}
+
+/// Parse a Java replacement string into tokens once (reused across every match
+/// in a `replaceAll`). Mirrors `Matcher.appendExpandedReplacement`:
+/// * `\X` emits `X` literally (escape — including `\$` and `\\`).
+/// * `${name}` is a named-group reference.
+/// * `$NN` is a numeric reference; the digit run is consumed **greedily but
+///   bounded by `group_count`** (so `$10` with 2 groups means group 1 then a
+///   literal `0`, exactly like Java).
+/// * A `$` followed by neither a digit nor `{` is emitted as a literal `$`
+///   (Java throws `IllegalArgumentException`; we choose the lenient path —
+///   malformed replacements are programming errors and rare).
+fn parse_java_replacement(rep: &str, group_count: usize) -> Vec<JavaReplToken> {
+    let mut tokens: Vec<JavaReplToken> = Vec::new();
+    let mut lit = String::new();
+    let bytes = rep.as_bytes();
+    let mut i = 0;
+    macro_rules! flush_lit {
+        () => {
+            if !lit.is_empty() {
+                tokens.push(JavaReplToken::Lit(std::mem::take(&mut lit)));
+            }
+        };
+    }
+    while i < bytes.len() {
+        let c = bytes[i];
+        if c == b'\\' {
+            if i + 1 < bytes.len() {
+                let start = i + 1;
+                let clen = utf8_char_len(bytes[start]);
+                let end = (start + clen).min(bytes.len());
+                lit.push_str(&rep[start..end]);
+                i = end;
+            } else {
+                // Trailing backslash: Java throws; drop it leniently.
+                i += 1;
+            }
+            continue;
+        }
+        if c == b'$' {
+            // ${name}
+            if i + 1 < bytes.len() && bytes[i + 1] == b'{' {
+                if let Some(close) = rep[i + 2..].find('}') {
+                    let name = &rep[i + 2..i + 2 + close];
+                    flush_lit!();
+                    tokens.push(JavaReplToken::Named(name.to_string()));
+                    i = i + 2 + close + 1;
+                    continue;
+                }
+                lit.push('$');
+                i += 1;
+                continue;
+            }
+            // $NN (digit-bounded by group_count)
+            if i + 1 < bytes.len() && bytes[i + 1].is_ascii_digit() {
+                let mut j = i + 1;
+                let mut num = (bytes[j] - b'0') as usize;
+                j += 1;
+                while j < bytes.len() && bytes[j].is_ascii_digit() {
+                    let trial = num * 10 + (bytes[j] - b'0') as usize;
+                    if trial <= group_count {
+                        num = trial;
+                        j += 1;
+                    } else {
+                        break;
+                    }
+                }
+                flush_lit!();
+                tokens.push(JavaReplToken::Group(num));
+                i = j;
+                continue;
+            }
+            // Dangling `$`: emit literally.
+            lit.push('$');
+            i += 1;
+            continue;
+        }
+        let clen = utf8_char_len(c);
+        let end = (i + clen).min(bytes.len());
+        lit.push_str(&rep[i..end]);
+        i = end;
+    }
+    flush_lit!();
+    tokens
+}
+
+/// Render parsed replacement tokens against one match's capture groups. A
+/// missing/non-participating group contributes the empty string (Java would
+/// throw for an out-of-range numeric reference, but a group that simply did
+/// not participate yields `""` — and the common case is a valid reference).
+fn render_java_replacement<'a>(
+    tokens: &[JavaReplToken],
+    get_num: impl Fn(usize) -> Option<&'a str>,
+    get_name: impl Fn(&str) -> Option<&'a str>,
+) -> String {
+    let mut out = String::new();
+    for t in tokens {
+        match t {
+            JavaReplToken::Lit(s) => out.push_str(s),
+            JavaReplToken::Group(n) => {
+                if let Some(s) = get_num(*n) {
+                    out.push_str(s);
+                }
+            }
+            JavaReplToken::Named(n) => {
+                if let Some(s) = get_name(n) {
+                    out.push_str(s);
+                }
+            }
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod java_replacement_tests {
+    use super::{compile_anchored_cached, compile_java_regex};
+
+    fn ra(text: &str, pat: &str, rep: &str) -> String {
+        compile_java_regex(pat, 0).unwrap().replace_all_java(text, rep)
+    }
+    fn rf(text: &str, pat: &str, rep: &str) -> String {
+        compile_java_regex(pat, 0)
+            .unwrap()
+            .replace_first_java(text, rep)
+    }
+
+    // Each expectation below is the exact output of the equivalent
+    // `String.replaceAll` / `replaceFirst` under HotSpot JDK 25
+    // (see scratch/regexperf/RegexParity golden).
+    #[test]
+    fn literal_and_groups() {
+        assert_eq!(ra("a.b.c.d", "[.]", "/"), "a/b/c/d");
+        assert_eq!(ra("a {@code X} b", "\\{@code (.*?)}", "`$1`"), "a `X` b");
+        assert_eq!(ra("a {@code X} b", "\\{@code (.*?)}", "XX"), "a XX b");
+        assert_eq!(ra("abc", "(b)", "$1Z"), "abZc");
+        assert_eq!(ra("a1b22c333", "(\\d+)", "<$1>"), "a<1>b<22>c<333>");
+    }
+
+    #[test]
+    fn escapes() {
+        // Java `\$` -> literal `$`; `\\` -> literal backslash.
+        assert_eq!(ra("abc", "b", "\\$"), "a$c");
+        assert_eq!(ra("abc", "b", "\\\\"), "a\\c");
+    }
+
+    #[test]
+    fn digit_bounded_group_ref() {
+        // One capturing group; `$10` must mean group 1 then a literal '0'.
+        assert_eq!(ra("abc", "(b)", "$10"), "ab0c");
+    }
+
+    #[test]
+    fn multiref_and_named() {
+        assert_eq!(ra("John Smith", "(\\w+) (\\w+)", "$2 $1"), "Smith John");
+        assert_eq!(
+            ra(
+                "2026-01-15",
+                "(?<y>\\d{4})-(?<m>\\d{2})-(?<d>\\d{2})",
+                "${d}/${m}/${y}"
+            ),
+            "15/01/2026"
+        );
+    }
+
+    #[test]
+    fn zero_width_and_greedy() {
+        assert_eq!(ra("abc", "", "-"), "-a-b-c-");
+        assert_eq!(ra("<a><b>", "<(.*)>", "[$1]"), "[a><b]");
+        assert_eq!(ra("<a><b>", "<(.*?)>", "[$1]"), "[a][b]");
+    }
+
+    #[test]
+    fn replace_first_only() {
+        assert_eq!(rf("a1b2c3", "(\\d)", "<$1>"), "a<1>b2c3");
+        assert_eq!(rf("x.y.z", "[.]", "/"), "x/y.z");
+    }
+
+    fn m(text: &str, pat: &str) -> bool {
+        let re = compile_java_regex(pat, 0).unwrap();
+        let anchored = format!("^(?:{})$", re.as_str());
+        match compile_anchored_cached(&anchored) {
+            Some(full) => full.is_match(text),
+            None => re.is_match(text),
+        }
+    }
+
+    // ASCII-default Perl classes must match Java (NOT Rust's Unicode default).
+    #[test]
+    fn ascii_perl_classes_parity() {
+        // \d ASCII-only: Arabic-Indic digit U+0663 is NOT \d in Java default.
+        assert!(m("5", "\\d"));
+        assert!(!m("\u{0663}", "\\d"));
+        // \w ASCII-only: 'é' (Latin-1) is NOT \w in Java default.
+        assert!(m("a", "\\w"));
+        assert!(m("_", "\\w"));
+        assert!(!m("\u{00e9}", "\\w"));
+        // \s ASCII-only set.
+        assert!(m(" ", "\\s"));
+        assert!(m("\t", "\\s"));
+        // U+00A0 NBSP is whitespace in Unicode but NOT Java's ASCII \s.
+        assert!(!m("\u{00a0}", "\\s"));
+        // Inside a class: \d expands to the bare range, still ASCII.
+        assert_eq!(ra("a1\u{0663}b2", "[\\d]", "#"), "a#\u{0663}b#");
+        // Negated forms.
+        assert!(m("\u{0663}", "\\D")); // non-ASCII digit IS \D (any non-[0-9])
+        assert!(!m("7", "\\D"));
+        // Replace using \d+ stays ASCII-bounded.
+        assert_eq!(ra("a12\u{0663}34b", "\\d+", "N"), "aN\u{0663}Nb");
+    }
+
+    // \b word boundary uses ASCII \w; (?-u:\b) must compile and match ASCII-style.
+    #[test]
+    fn ascii_word_boundary() {
+        assert_eq!(ra("foo bar", "\\bbar\\b", "X"), "foo X");
+        assert_eq!(ra("foobar", "\\bbar\\b", "X"), "foobar");
+    }
 }
 
 /// Split a string on every match of a fancy-regex Regex. Mirrors the semantics
@@ -20317,12 +20659,23 @@ fn compile_java_regex_uncached(
     if flags & JAVA_REGEX_COMMENTS != 0 {
         prefix.push_str("(?x)");
     }
-    // UNICODE_CASE and UNICODE_CHARACTER_CLASS: Rust regex is Unicode-aware by
-    // default, so these flags are effectively always enabled.
+    // UNICODE_CASE: Rust regex is Unicode-case-aware by default, so this flag is
+    // effectively always honored for `(?i)`.
     let _ = JAVA_REGEX_UNICODE_CASE;
-    let _ = JAVA_REGEX_UNICODE_CHARACTER_CLASS;
 
     let translated = translate_java_regex(pattern);
+    // ASCII-default Perl classes. Java's `\d` / `\w` / `\s` / `\b` (and the
+    // negated forms) are **ASCII-only** unless `UNICODE_CHARACTER_CLASS` is set,
+    // whereas the `regex` crate's are Unicode by default (`\d` == `\p{Nd}` etc.).
+    // Without this rewrite, `"٣".matches("\\d")` would be `true` here but
+    // `false` on HotSpot. Rewrite to explicit ASCII classes that match Java's
+    // default exactly; when the caller passes `UNICODE_CHARACTER_CLASS`, leave the
+    // engine's Unicode classes (which is what that flag requests).
+    let translated = if flags & JAVA_REGEX_UNICODE_CHARACTER_CLASS == 0 {
+        std::borrow::Cow::Owned(ascii_perl_classes(&translated))
+    } else {
+        translated
+    };
     let full = format!("{prefix}{translated}");
     // Fast path: try the `regex` crate first.
     if let Ok(r) = regex::Regex::new(&full) {
@@ -20504,6 +20857,103 @@ fn translate_java_regex(pattern: &str) -> std::borrow::Cow<'_, str> {
         i = end;
     }
     std::borrow::Cow::Owned(out)
+}
+
+/// Rewrite the Perl character-class shorthands `\d \D \w \W \s \S` and the word
+/// boundaries `\b \B` from the `regex` crate's Unicode-by-default meaning to
+/// Java's **ASCII-by-default** meaning (i.e. the behavior when
+/// `Pattern.UNICODE_CHARACTER_CLASS` is *not* set, which is the default).
+///
+/// | shorthand | Java ASCII default            |
+/// |-----------|-------------------------------|
+/// | `\d`      | `[0-9]`                       |
+/// | `\D`      | `[^0-9]`                      |
+/// | `\w`      | `[a-zA-Z0-9_]`                |
+/// | `\W`      | `[^a-zA-Z0-9_]`               |
+/// | `\s`      | `[ \t\n\x0B\f\r]`             |
+/// | `\S`      | `[^ \t\n\x0B\f\r]`            |
+/// | `\b` `\B` | ASCII word boundary `(?-u:…)`  |
+///
+/// The negated forms expand to *Unicode-mode* negated classes (`[^0-9]` etc.):
+/// in the default Unicode `regex` mode `[^0-9]` matches any scalar except an
+/// ASCII digit — exactly Java's `\D` — and (unlike `(?-u:\D)`, which matches a
+/// non-ASCII *byte*) stays valid-UTF-8-safe for `&str` matching.
+///
+/// Context rules mirror Java: outside a `[...]` class the positive forms expand
+/// to a bracketed class; inside a class they expand to the bare range
+/// (`[\d.]` → `[0-9.]`). Inside a class the *negated* forms and the boundaries
+/// are left untouched (a negated shorthand inside a positive set, or `\b` =
+/// backspace inside a class, are rare and not additively expressible) — a
+/// documented, narrow residual that only affects non-ASCII input.
+///
+/// Escapes are tracked so a literal backslash (`\\`) is never misread as the
+/// start of a shorthand.
+fn ascii_perl_classes(pattern: &str) -> String {
+    // Cheap bail: nothing to do if there is no backslash at all.
+    if !pattern.contains('\\') {
+        return pattern.to_string();
+    }
+    let bytes = pattern.as_bytes();
+    let mut out = String::with_capacity(pattern.len() + 8);
+    let mut i = 0;
+    let mut in_class = false;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if c == b'\\' && i + 1 < bytes.len() {
+            let n = bytes[i + 1];
+            let bare = match n {
+                b'd' => Some("0-9"),
+                b'w' => Some("a-zA-Z0-9_"),
+                b's' => Some(" \\t\\n\\x0B\\f\\r"),
+                _ => None,
+            };
+            if !in_class {
+                // Outside a character class: emit a full bracketed class.
+                match n {
+                    b'd' => out.push_str("[0-9]"),
+                    b'D' => out.push_str("[^0-9]"),
+                    b'w' => out.push_str("[a-zA-Z0-9_]"),
+                    b'W' => out.push_str("[^a-zA-Z0-9_]"),
+                    b's' => out.push_str("[ \\t\\n\\x0B\\f\\r]"),
+                    b'S' => out.push_str("[^ \\t\\n\\x0B\\f\\r]"),
+                    b'b' => out.push_str("(?-u:\\b)"),
+                    b'B' => out.push_str("(?-u:\\B)"),
+                    _ => {
+                        // Any other escape — emit unchanged (consume both bytes).
+                        out.push('\\');
+                        out.push(n as char);
+                    }
+                }
+                i += 2;
+                continue;
+            } else if let Some(rng) = bare {
+                // Inside a class: emit the bare range (additive).
+                out.push_str(rng);
+                i += 2;
+                continue;
+            } else {
+                // Inside a class, negated shorthand / boundary / other escape:
+                // pass through unchanged (consume both bytes so `\]` etc. are
+                // not misread as a class terminator).
+                out.push('\\');
+                out.push(n as char);
+                i += 2;
+                continue;
+            }
+        }
+        // Track character-class nesting (naive single-level; `\[`/`\]` are
+        // handled above by the escape branch and never reach here).
+        if c == b'[' {
+            in_class = true;
+        } else if c == b']' {
+            in_class = false;
+        }
+        let ch_len = utf8_char_len(c);
+        let end = (i + ch_len).min(bytes.len());
+        out.push_str(&pattern[i..end]);
+        i = end;
+    }
+    out
 }
 
 /// Map a Java Unicode block name (used after the `In` prefix in `\p{InXxx}`)
