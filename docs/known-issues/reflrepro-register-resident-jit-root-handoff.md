@@ -85,23 +85,50 @@ synthetic repro, is what localizes each instance."*
    the young GC fires *inside* the interpreted callee where the in-flight oops live in that
    callee's own (rooted, band-covered) interpreter frame.
 
-### Net status + the actual next step
-**A2 is a context-sensitive miscompile of `ReflRepro.scan`'s single-pass JIT codegen
-(regalloc family), NOT a register-resident GC-root gap.** The old "register-resident /
-native-call-return missed root" framing is the wrong lens for the *single-thread* A2 repro
-(it may still apply to the multi-thread A4 sibling). The remaining unknown is the exact
-write/clobber: a value that scan's interpreter frame roots/keeps-correct but scan's JIT
-codegen does not, **at a point `=all` GPR-spill does not cover** (i.e. NOT a call-safepoint
-register) — candidates that survived all elimination: (a) a value live across a **non-call
-back-edge** in a register the back-edge flush does not cover, or (b) a **native-side**
-(reflection-native Rust) in-flight/return oop invisible to both the conservative scan and
-`=all`. The principled fixes remain the deferred **precise-JIT-maps / regalloc project**
-(precise oop maps that the *moving* remap consumes **and** correct callee-saved liveness
-across calls). The validated **interim disposition** is the regalloc-family practice: a
-targeted `skip_list::is_known_miscompile` ban on the real-world carrier methods
-(JUnit `ReflectionUtils.streamFields` / `AnnotationUtils.findAnnotation`-style reflection
-iterators), with `bad=0` on `ReflRepro 8000 @ GC_STRESS=65536` + no bintrees/Spring/WildFly
-regression as the bar.
+### ✅✅ MECHANISM CRACKED (2026-06-22, live `CRATONVM_DBG_A2` probe in the non-moving sweep)
+**A2 is a NON-MOVING-YOUNG-SWEEP LINEAR-WALK SIZE DESYNC (a header-size/coherence mismatch),
+NOT a GC-root gap and NOT a register-resident root.** The decisive evidence is a byte-level
+dump of the heap at the first corruption (`gen_heap.rs` sweep walk, gated `CRATONVM_DBG_A2`):
+
+- The walk desyncs at an offset where the bytes are **object field data** — 16-byte `Value`
+  cells `{disc=4=Object, <heap-ptr>}` (`SLOT_SIZE=16`), or **UTF-16 char data** (e.g.
+  `0x3a006500750072` = `"rue:"` from describeField's `"true:"`), sitting **where a 40-byte
+  object/array header should be**. I.e. the linear walk has stepped off the object grid: some
+  preceding object's computed size ≠ its real size, so the walk lands mid-object and reads
+  field/char data as a header (→ the long-seen `"kind=Object but array_length=N (num_slots=4,
+  class_id=4)"` / `"implausible object size"` messages — those are the **symptom of the
+  understep/overstep**, the walker reading a `Value`-cell discriminant `4` as a `class_id`).
+- **Reference arrays are NOT the bug** (ruled out): `element_byte_size(Reference)=REF_ELEMENT_SIZE=8`
+  and a live `Reference[6]` (`class_id=49`) walked cleanly at `size=88 = 40 + 6*8`. The
+  allocator, the element reader (`read_prim_element`, 8-byte stride), and the walker all agree
+  on 8-byte reference elements. The 16-byte cells at the desync are **object fields**, not
+  array elements.
+- **This is why it is JIT-only.** The non-moving sweep is the ONLY collector that **linear-walks**
+  the young gen (it is forced whenever a JIT frame is live, via `gc_quiescence`). The moving
+  (Cheney) collector traces live roots and never linear-walks, so it never consults the
+  mis-computed size. Hence `--nojit` (no JIT frame → moving) is **clean**, and `FORCE_MOVING`
+  (moving even with a JIT frame) gives **wrong-results-without-crash** (a different failure:
+  relocating conservative JIT roots). The bug needs scan JIT-compiled ONLY to force the
+  non-moving linear-walk collector — scan's *codegen* is incidental, **not** miscompiled.
+  (This SUPERSEDES the "regalloc miscompile of scan" framing in the section header above: scan
+  is the trigger for the non-moving sweep, not the source of a wrong store.)
+
+**⇒ The fault is a header-coherence / size-computation mismatch for some object or array kind
+in the reflection-allocation workload** (`describeField`'s `String`/`char[]`/`byte[]` building
++ `Field[]`/`Method[]`/reflection objects), where `gen_object_total_size`'s computed size
+diverges from the allocator's actual cursor advance. bintrees (uniform `Node` objects, no such
+arrays/objects) never trips it. The exact culprit allocation varies per GC (the dead-object
+zeroing — `ArrayElementType::Reference == 0`, so a zeroed header reads as a `Reference` array —
+also obscures post-walk re-reads), so the precise next step is an **allocation breadcrumb**:
+record `(addr → class_id, kind, element_type, array_length, num_slots, real_size)` at every
+young header-write (`init_object_header` in vm + `try_alloc_array`/`try_alloc_object` in gc),
+and at the sweep desync look up the corrupt address **and** the preceding object — that names
+the exact mis-sized object + its allocation site in one run, isolating whether it is (a) an
+allocator that writes a wrong/partial header (the documented "inline-alloc forgot to set
+kind=Array" class, `gen_heap.rs:5918`), or (b) a `gen_object_total_size` size-computation bug
+for a specific object/array kind. The fix is then GC-side (header coherence / walker sizing) —
+**NOT** the precise-JIT-maps/regalloc project, and **NOT** a `skip_list` ban (those address the
+wrong layer). Gated probe `CRATONVM_DBG_A2` (first 4 corruptions) is committed in `gen_heap.rs`.
 
 Repro (unchanged): `CRATONVM_DBG_GC_STRESS=65536 cvmregroots.exe --java-home <jdk25> -cp
 docs/known-issues/repros/A2-reflrepro ReflRepro 8000`. `javac` the class first.

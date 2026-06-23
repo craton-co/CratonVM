@@ -125,6 +125,10 @@ const GC_PROMOTE_PRESSURE_PERCENT: usize = 25;
 /// when run with a tiny young gen (frequent GC).
 pub static SWEEP_CORRUPTION_HITS: AtomicU64 = AtomicU64::new(0);
 
+/// A2 forensic probe (CRATONVM_DBG_A2) — limits the per-run detail dump to the
+/// first few corruption hits so the log is not flooded.
+pub static A2_PROBE_HITS: AtomicU64 = AtomicU64::new(0);
+
 /// DBG: optional young-GC stress threshold (bytes) from CRATONVM_DBG_GC_STRESS.
 fn gc_stress_threshold() -> Option<usize> {
     use std::sync::OnceLock;
@@ -4362,6 +4366,63 @@ impl GenerationalHeap {
                     }
                 }
                 tracing::warn!("  bytes around bad header (start_off={}):\n{}", start, hex);
+
+                // A2 forensic probe (CRATONVM_DBG_A2): identify the corrupt object.
+                // The hypothesis is the corrupt slot at `cursor` is an OBJECT whose
+                // 40-byte header was overwritten by 16-byte Value-cell field data
+                // (allocate-then-putfield clobber), OR the PRIOR object (an array)
+                // is a mis-typed reference array the walker under-sized. Dump the
+                // prior object's exact element_type/elem-bytes and resolve the
+                // Value cells at `cursor` (disc + payload, and whether the payload
+                // points into the young arena).
+                if std::env::var_os("CRATONVM_DBG_A2").is_some()
+                    && A2_PROBE_HITS.fetch_add(1, Ordering::Relaxed) < 4
+                {
+                    if let Some(&(loff, lsz, lcid, lkind, lns, lal)) = walked.last() {
+                        // SAFETY: loff < used, header mapped.
+                        let lhdr = unsafe { &*((from_base + loff) as *const ObjectHeader) };
+                        eprintln!(
+                            "[A2] PRIOR obj @{} size={} class_id={} kind={:?} num_slots={} array_len={} ELEM_TYPE={:?} elem_bytes={} (cursor={} = {}+{})",
+                            loff, lsz, lcid, lkind, lns, lal,
+                            lhdr.element_type,
+                            crate::heap::element_byte_size(lhdr.element_type),
+                            cursor, loff, lsz,
+                        );
+                    }
+                    eprintln!("[A2] corruption @off={} from_base={:#x} used={}", cursor, from_base, used);
+                    for k in 0..8usize {
+                        let off = cursor + k * 16;
+                        if off + 16 > used {
+                            break;
+                        }
+                        // SAFETY: off+16 <= used, region mapped.
+                        let disc = unsafe { *((from_base + off) as *const u64) };
+                        let payload = unsafe { *((from_base + off + 8) as *const u64) };
+                        let in_young = payload >= from_base as u64
+                            && payload < (from_base + used) as u64;
+                        // If the payload points into the young arena at an aligned
+                        // object boundary, read its class_id to identify the referent.
+                        let referent = if in_young && (payload as usize - from_base) % 8 == 0 {
+                            let rh = unsafe {
+                                &*(payload as *const ObjectHeader)
+                            };
+                            format!(
+                                "young referent class_id={} kind={} num_slots={}",
+                                rh.class_id.as_u32(),
+                                rh.kind as u8,
+                                rh.num_slots
+                            )
+                        } else if payload >> 40 == (from_base as u64) >> 40 {
+                            "heap-ptr (old-gen?)".to_string()
+                        } else {
+                            "(not-heap)".to_string()
+                        };
+                        eprintln!(
+                            "[A2]   cell[{}] @{} disc={} payload={:#x} {}",
+                            k, off, disc, payload, referent
+                        );
+                    }
+                }
 
                 // Defensive recovery: instead of `break` (which abandons
                 // the rest of the arena and leaves dead objects unreclaimed
