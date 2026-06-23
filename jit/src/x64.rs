@@ -3824,14 +3824,40 @@ fn analyze_escapes(
                 pc += bytecode_len_at(code, pc);
             }
             // For all other opcodes, use bytecode_len_at for PC advance.
-            // These ops don't move tracked references, so no escaping needed.
+            //
+            // EC-SCALAR-SOUNDNESS (varargs-ctor receiver fix): an opcode this
+            // single pass does not model precisely. We cannot know whether it
+            // consumes, stores, or otherwise lets a tracked object escape — so
+            // the only SOUND action is to ESCAPE every tracked object currently
+            // on the operand stack, then forget provenance (keeping depth
+            // approximately correct).
+            //
+            // Merely forgetting provenance (the previous behaviour) was UNSOUND:
+            // an unmodeled opcode sitting ABOVE a tracked `new`-receiver on the
+            // operand stack wiped that receiver's provenance, so a later
+            // arg-bearing `invokespecial <init>` no longer saw it as tracked and
+            // never escaped it. The classic trigger is a varargs constructor
+            // call `new C(a, b)` which javac compiles to
+            //   new C; dup; iconst_n; anewarray; (dup;…;aastore)*; invokespecial C.<init>([…])V
+            // The `anewarray` (0xbd) — not modeled here — erased the dup'd
+            // receiver's provenance; the `<init>` then escaped nothing; the
+            // receiver was reported non-escaping, scalar-replaced to a dummy
+            // null (see the 0xbb handler), and passed as `this` to the
+            // un-inlined constructor → "Cannot assign field … because \"this\"
+            // is null" (Spring `ResourceDatabasePopulator` varargs ctor, BUG-05).
+            //
+            // Escaping (rather than forgetting) is purely soundness-restoring:
+            // it can only cause MORE objects to be heap-allocated normally,
+            // never fewer — it never changes a correctly-allocated object into a
+            // scalar-replaced one. Straight-line allocation sites built only
+            // from modeled opcodes are unaffected.
             _ => {
-                // For ops that might manipulate the stack in ways we don't track,
-                // clear any tracked objects (conservative).
                 let len = bytecode_len_at(code, pc);
-                // Ops that push values onto the stack also push None (not tracked).
-                // Ops that pop values: we pop and discard (losing provenance is safe).
-                // Rather than implementing each op's exact stack effect, just clear provenance.
+                for slot in abs_stack.iter() {
+                    if let Some(p) = slot {
+                        escaped.insert(*p);
+                    }
+                }
                 for slot in abs_stack.iter_mut() {
                     *slot = None; // forget provenance, but keep stack depth correct
                 }
@@ -31254,6 +31280,61 @@ mod tests {
         assert!(
             !analyze_escapes(&code, 13, &arg_init).contains(&0),
             "an arg-bearing `<init>(I)V` must escape its receiver"
+        );
+    }
+
+    #[test]
+    fn test_escape_analysis_varargs_ctor_receiver_escapes() {
+        // BUG-05 regression. A varargs constructor call `new C(a, b)` is
+        // compiled by javac to:
+        //   new C; dup; iconst_2; anewarray E;
+        //   dup; iconst_0; <push a>; aastore;
+        //   dup; iconst_1; <push b>; aastore;
+        //   invokespecial C.<init>([E;)V
+        // The dup'd receiver sits on the operand stack BELOW the array while
+        // `anewarray` (0xbd) executes. `anewarray` is not modeled by
+        // `analyze_escapes`, so its catch-all arm runs. The previous catch-all
+        // merely FORGOT the slot provenance — which erased the receiver's
+        // tracking, so the later arg-bearing `invokespecial <init>` escaped
+        // nothing and the receiver was reported non-escaping. It was then
+        // scalar-replaced to a dummy null and passed as `this` to the
+        // un-inlined constructor → "Cannot assign field … because \"this\" is
+        // null" (Spring `ResourceDatabasePopulator`). The catch-all must now
+        // ESCAPE tracked stack objects, so the `new` at PC=0 is escaping.
+        //
+        // Use `bipush a (0x10)` / `bipush b` as the array element pushes so the
+        // bytecode is self-contained (no constant-pool dependency for the test).
+        let code: Vec<u8> = vec![
+            0xbb, 0x00, 0x01, // 0:  new #1 (C)
+            0x59, // 3:  dup
+            0x05, // 4:  iconst_2
+            0xbd, 0x00, 0x02, // 5:  anewarray #2 (E)
+            0x59, // 8:  dup
+            0x03, // 9:  iconst_0
+            0x10, 0x07, // 10: bipush 7
+            0x53, // 12: aastore
+            0x59, // 13: dup
+            0x04, // 14: iconst_1
+            0x10, 0x09, // 15: bipush 9
+            0x53, // 17: aastore
+            0xb7, 0x00, 0x03, // 18: invokespecial C.<init>([E;)V
+            0xb1, // 21: return
+            0, 0, // padding
+        ];
+        // Resolved shape for the varargs ctor: receiver + 1 array slot.
+        let mut shapes: FxHashMap<usize, InvokeSpecialShape> = FxHashMap::default();
+        shapes.insert(
+            18,
+            InvokeSpecialShape {
+                arg_slots: 2,
+                is_trivial_void_init: false,
+            },
+        );
+        assert!(
+            !analyze_escapes(&code, 22, &shapes).contains(&0),
+            "the receiver of a varargs constructor must escape (it is passed to \
+             the un-inlined `<init>` across an `anewarray`); scalar-replacing it \
+             yields a null `this` (BUG-05)"
         );
     }
 
