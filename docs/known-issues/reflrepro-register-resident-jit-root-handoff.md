@@ -9,9 +9,18 @@
 > GC_STRESS=65536` → `ok=8000 bad=0` (the verification bar, met); `bt16=14985902`, `bt18=68332206`
 > golden.** Paired with a robust free-block skip (`f9138bf0`) that keeps any residual desync
 > recoverable. The full investigation (register-root refutation → mechanism → breadcrumb → fix)
-> is below, kept as the evidence trail. **Residual (non-corrupting, follow-up):** a freed
-> byte-array slot whose `element_type` byte reads Int still triggers a recoverable RE-SYNC warn
-> (benign over-retention, `bad=0`); eliminating it (perf/cleanliness) is the only thing left.
+> is below, kept as the evidence trail.
+>
+> **TWO fixes land the result:** (1) coalesce **overlapping** free blocks (`6e3ddb05`) — fixes
+> the data corruption (`bad=0`); (2) **clamp over-sized objects** that overstep a pre-existing
+> free hole (`9d…`/next commit) — a corrupt over-sized header (the `et=Int` byte-array read)
+> can't span a free hole, so the sweep retains-not-frees it and re-syncs at the hole instead of
+> over-freeing into a neighbour. This cut the recoverable RE-SYNC warns **685792 → 29930 (23×)**
+> with `bad=0` + bt golden preserved. **Residual (non-corrupting, deeper follow-up):** ~30k warns
+> remain from over-sized headers that overstep into a *live* neighbour (not a free hole), so the
+> clamp can't catch them; the true source is a `byte[]`'s `element_type` byte reading `Int` —
+> a double-serve residue / stray write under the non-moving sweep that the two fixes decay but
+> don't fully eliminate. Benign (`bad=0`); perf/cleanliness only.
 
 ---
 ## RE-DIAGNOSIS 2026-06-22 (worktree `CratonVM-regroots`, branch `fix/jit-register-roots`, binary `cvmregroots.exe`, off dev `6e1c13a8`; precise-maps default-on)
