@@ -100,17 +100,34 @@ side-table, so `getProperty` / `stringPropertyNames` saw nothing.
 * `Properties.clone()` vs HotSpot (`CloneFaith` probe) — **byte-identical**:
   entries copied, `size`, clone↔original mutation **independence** both ways,
   `instanceof Properties` / `getClass()`, and `stringPropertyNames()`.
-* `native-builtins` unit tests green (incl. new
-  `test_hashtable_clone_empty_returns_fresh_object`).
+* `Properties` `defaults` chain vs HotSpot (`DefChk` probe) — **byte-identical**:
+  `getProperty` falls back through `defaults`, the 2-arg `getProperty(k, def)`
+  honours the chain, multi-level `new Properties(parent)` chains resolve, and a
+  clone preserves its source's defaults.
+* System properties / `Properties.load` round-trip unchanged (no regression on
+  the touched `getProperty` path).
+* `native-builtins` (2690) and `native-collections` (69) lib tests green (incl.
+  new `test_hashtable_clone_empty_returns_fresh_object`).
 
-## Residual (separate, pre-existing — not a clone bug)
+## `Properties.getProperty` defaults chain — also fixed
 
-`Properties.getProperty(key)` does **not** consult the `defaults` chain: a
-`new Properties(def)` (no clone involved) returns `null` for a key that only
-`def` holds, where HotSpot returns the default. This is a pre-existing gap in
-CratonVM's side-table `Properties` model (`native_properties_get_property_1`
-checks the side-table → system properties → `null`, with no `defaults`
-fallback) and affects the **original** as much as the clone — so the clone is
-*faithful* (it behaves identically to its source for every key). Fixing the
-`defaults` fallback is an independent change to the `getProperty` path, out of
-scope for the clone fix.
+CratonVM models `Properties` entries in an identity-keyed side-table, and the
+side-table `getProperty` (`native_properties_get_property_1`) previously checked
+the side-table → system properties → `null` with **no `defaults` fallback**, so
+`new Properties(def).getProperty(keyOnlyInDef)` returned `null` (a pre-existing
+gap affecting the original, not just clones). Two coordinated fixes:
+
+1. **Storage** (`native-collections::native_props_init_defaults`): the
+   `Properties(Properties)` constructor stored the defaults ref at the native
+   model's `PROPS_FIELD_DEFAULTS` (slot 3), which on the real 12-field
+   `Properties` layout is `loadFactor` (a float) — so the reference was
+   misplaced and unreadable. It now *also* writes the defaults into the real
+   `defaults` field, resolved **by name** (`resolve_field_index`), so the
+   reference lands where readers expect it regardless of layout.
+2. **Lookup** (`native_properties_get_property_1`): after a side-table miss it
+   reads the `defaults` field (by name) and, if present, recurses through the
+   defaults Properties' own `getProperty` — naturally walking multi-level
+   chains — *before* the system-property fallback (so a Properties' own defaults
+   win over a same-named system property). The 2-arg `getProperty(k, def)` now
+   delegates to the 1-arg path and substitutes the caller's default only on a
+   true null, matching the JDK.
