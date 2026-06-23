@@ -50,8 +50,22 @@ last per-call snapshot is the only view the collector gets). Scanning less often
 / less of the band risks dropping a live root for such a thread → the exact
 heap-corruption class this A5 net prevents. The clean elimination is **precise
 JIT stack maps** (so the conservative band scan is unnecessary) — a separate
-epic. Also: 13 × ~20s still exceeds the 180s/class harness timeout, so the suite
-should bump `-TimeoutSec` for heavy-startup classes regardless.
+epic.
+
+## OUTCOME — class now PASSES
+
+With the RAF fd-registry fix (`testWriteWithByteBuffer` → 200) **and** the JIT
+startup fix, the full class now runs green: `run-suite.ps1` reports
+**`PASS 56s — OK (14 tests)`** (`Tag=tc0622bump`, the fixed binary). The 56s
+total (vs ~20s for one isolated cold method) is warm-JVM amortization — after the
+first test the startup methods are already compiled, so the remaining 13 starts
+are cheap. The JIT fix alone got it under even the default 90s/class timeout.
+
+As a general safety net for other heavy embedded-server classes, `run-suite.ps1`
+now supports a per-class timeout override (CSV `class,seconds`, default
+`.tooling/class-timeouts.csv`); unlisted classes keep the small default so
+genuine hangs still die fast. Seeded with `TestCoyoteOutputStream,720`.
+(`.tooling/` is gitignored local harness — not a repo/CI change.)
 
 ## Tooling note (no admin / cross-thread)
 
