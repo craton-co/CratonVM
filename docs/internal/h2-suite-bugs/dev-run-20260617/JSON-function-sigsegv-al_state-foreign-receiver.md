@@ -1,0 +1,1 @@
+> **Moved to tracked known-issues:** [docs/known-issues/hibernate-json-function-sigsegv-al_state-foreign-receiver.md](../../../../docs/known-issues/hibernate-json-function-sigsegv-al_state-foreign-receiver.md)

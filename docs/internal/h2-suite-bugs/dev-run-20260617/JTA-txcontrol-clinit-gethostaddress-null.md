@@ -1,0 +1,1 @@
+> **Moved to tracked known-issues:** [docs/known-issues/hibernate-jta-txcontrol-getinetaddress-per-class-report.md](../../../../docs/known-issues/hibernate-jta-txcontrol-getinetaddress-per-class-report.md)

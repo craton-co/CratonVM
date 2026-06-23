@@ -1,0 +1,11 @@
+MinSeq.java — parse 13 ORM XSDs via Xerces SchemaFactory.newSchema() in sequence.
+cvhibtest.exe (dev c863b23e). HotSpot: all 13 parse, instant.
+
+config                 result
+default (JIT on)       rc=124 HANG at 5th-6th parse
+--Xmx 6g (JIT on)      rc=124 HANG at 6th parse          -> not heap/GC
+default rep1           rc=124 HANG at 6th                -> reproducible
+default rep2           rc=124 HANG at 6th                -> reproducible
+CRATONVM_BG_COMPILE=0  rc=124 HANG at 6th                -> NOT bg-worker; foreground JIT
+--nojit                rc=0   ALLDONE 13/13              -> JIT is the cause
+--nojit --Xmx 6g       rc=0   ALLDONE 13/13

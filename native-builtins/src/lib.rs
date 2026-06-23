@@ -9834,7 +9834,50 @@ fn register_annotation_overrides(registry: &mut NativeMethodRegistry) {
         "newSetFromMap",
         "(Ljava/util/Map;)Ljava/util/Set;",
         |ctx, args| {
-            let _map = args.get(1).copied().unwrap_or(Value::Object(None));
+            // The backing `Map` argument: for this static method the actual
+            // argument may land at index 0 or 1 depending on dispatch path, so
+            // pick the first `Object` arg.
+            let map = args
+                .iter()
+                .find(|v| matches!(v, Value::Object(Some(_))))
+                .copied()
+                .unwrap_or(Value::Object(None));
+            if std::env::var_os("CRATONVM_DBG_NSFM").is_some() {
+                eprintln!("[NSFM] argc={}", args.len());
+                for (i, a) in args.iter().enumerate() {
+                    if let Value::Object(Some(o)) = a {
+                        let cn = ctx.class_name_of_id(ctx.class_id_of_object(*o)).unwrap_or_default();
+                        eprintln!("[NSFM]   arg[{}] = obj class={}", i, cn);
+                    } else {
+                        eprintln!("[NSFM]   arg[{}] = {:?}", i, a);
+                    }
+                }
+            }
+            // The plain `HashSet` returned below uses value `hashCode`/`equals`,
+            // which matches `HashMap`/`WeakHashMap`/`ConcurrentHashMap` backings
+            // (all key-hash/equals based). But an `IdentityHashMap` backing must
+            // use *reference identity*: returning a value-hash set there silently
+            // calls each element's `hashCode()`/`equals()` on insertion. For a
+            // Hibernate `PersistentSet` element that has side effects —
+            // `PersistentSet.hashCode()` force-initializes the collection — which
+            // breaks entity-graph `@BatchSize` collection batch fetching
+            // (HIB-CV-28: per-row `=?` loads instead of one batched `IN (...)`).
+            // For an `IdentityHashMap` backing, build the real
+            // `Collections$SetFromMap` wrapping the actual map so add/contains
+            // route through `IdentityHashMap` (identity), exactly like HotSpot.
+            if let Value::Object(Some(m)) = map {
+                let cname = ctx
+                    .class_name_of_id(ctx.class_id_of_object(m))
+                    .unwrap_or_default();
+                if cname == "java/util/IdentityHashMap" {
+                    return ctx.new_object_initialized(
+                        "java/util/Collections$SetFromMap",
+                        "(Ljava/util/Map;)V",
+                        &[map],
+                    );
+                }
+            }
+            let _map = map;
             let cap = 16usize;
             // Backing HashMap: slot 0 = buckets, slot 1 = size, slot 2 = capacity.
             let backing = crate::alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3);

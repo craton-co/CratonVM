@@ -1,0 +1,51 @@
+class	signature
+org.hibernate.orm.test.annotations.manytoone.ManyToOneJoinTest	org.junit.platform.commons.JUnitException: Chain of InvocationInterceptors called invocation multiple times instead of just once: org.junit.jupiter.engine.exten
+org.hibernate.orm.test.cdi.events.delayed.DelayedCdiSupportTest	java.lang.RuntimeException: Could not configure StandardServiceRegistryBuilder
+org.hibernate.orm.test.cdi.general.hibernatesearch.standard.HibernateSearchStandardCdiSupportTest	org.jboss.weld.exceptions.IllegalArgumentException: WELD-001301: Annotation QualifierInstance {annotationClass=interface jakarta.enterprise.inject.Produces, val
+org.hibernate.orm.test.cdi.type.CdiSmokeTests	org.jboss.weld.exceptions.IllegalArgumentException: WELD-001301: Annotation QualifierInstance {annotationClass=interface jakarta.enterprise.inject.Produces, val
+org.hibernate.orm.test.sql.storedproc.ResultMappingTest	org.hibernate.exception.SQLGrammarException: Could not prepare statement [Function "FINDONEUSER" not found; SQL statement:
+org.hibernate.orm.test.stats.ExplicitQueryStatsMaxSizeTest	org.opentest4j.AssertionFailedError: expected: <0> but was: <1000>
+org.hibernate.orm.test.bootstrap.registry.classloading.ClassLoaderLeaksUtilityTest	java.lang.IllegalStateException: Not being loaded by the expected classloader
+org.hibernate.orm.test.cdi.general.mixed.DelayedMixedAccessTest	org.jboss.weld.exceptions.IllegalArgumentException: WELD-001301: Annotation QualifierInstance {annotationClass=interface jakarta.enterprise.inject.Produces, val
+org.hibernate.orm.test.cdi.type.SimpleTests	org.jboss.weld.exceptions.IllegalArgumentException: WELD-001301: Annotation QualifierInstance {annotationClass=interface jakarta.enterprise.inject.Produces, val
+org.hibernate.orm.test.entitygraph.EntityGraphBatchSizeTest	java.lang.AssertionError: 
+org.hibernate.orm.test.service.ClassLoaderServiceImplTest	java.lang.AssertionError: 
+org.hibernate.orm.test.sql.storedproc.StoredProcedureResultSetMappingTest	org.hibernate.exception.SQLGrammarException: Could not prepare statement [Function "ALLEMPLOYEENAMES" not found; SQL statement:
+org.hibernate.orm.test.stateless.StatelessSessionPersistentContextTest	org.opentest4j.AssertionFailedError: StatelessSession: PersistenceContext has not been cleared ==> expected: <true> but was: <false>
+org.hibernate.orm.test.timestamp.JdbcTimestampCustomSessionLevelTimeZoneTest	org.opentest4j.AssertionFailedError: expected: <0> but was: <28800000>
+org.hibernate.orm.test.annotations.onetoone.OneToOneJoinTableUniquenessTest	java.lang.RuntimeException: Could not build SessionFactory: Unable to open specified script target file for writing : C:\Users\Victor\AppData\Local\Temp\tmp.KW8
+org.hibernate.orm.test.bootstrap.registry.classloading.ClassLoaderServiceImplTest	java.lang.AssertionError: expected:<1> but was:<0>
+org.hibernate.orm.test.cdi.events.extended.ValidExtendedCdiSupportTest	org.jboss.weld.exceptions.IllegalArgumentException: WELD-001301: Annotation QualifierInstance {annotationClass=interface jakarta.enterprise.inject.Produces, val
+org.hibernate.orm.test.cdi.general.mixed.ExtendedMixedAccessTest	org.jboss.weld.exceptions.IllegalArgumentException: WELD-001301: Annotation QualifierInstance {annotationClass=interface jakarta.enterprise.inject.Produces, val
+org.hibernate.orm.test.filter.FilterParameterTests	org.jboss.weld.exceptions.IllegalArgumentException: WELD-001301: Annotation QualifierInstance {annotationClass=interface jakarta.enterprise.inject.Produces, val
+org.hibernate.orm.test.jpa.cascade.multilevel.MultiLevelCascadeCollectionEmbeddableTest	org.opentest4j.AssertionFailedError: expected: not <null>
+org.hibernate.orm.test.jpa.procedure.StoredProcedureResultSetMappingTest	org.hibernate.exception.GenericJDBCException: Error executing work [General error: "java.lang.IllegalStateException: IOException: Системе не удает
+org.hibernate.orm.test.mapping.type.format.XmlFormatterTest	java.lang.UnsupportedOperationException: 
+org.hibernate.orm.test.sql.storedproc.StoredProcedureTest	org.hibernate.exception.SQLGrammarException: Could not prepare statement [Function "FINDUSERS" not found; SQL statement:
+org.hibernate.orm.test.timestamp.JdbcTimestampCustomTimeZoneTest	org.opentest4j.AssertionFailedError: expected: <0> but was: <28800000>
+org.hibernate.orm.test.util.PropertiesHelperTest	java.lang.UnsupportedOperationException: 
+org.hibernate.orm.test.cdi.converters.delayed.DelayedCdiHostedConverterTest	java.lang.RuntimeException: Could not configure StandardServiceRegistryBuilder
+org.hibernate.orm.test.cdi.general.mixed.ImmediateMixedAccessTests	org.jboss.weld.exceptions.IllegalArgumentException: WELD-001301: Annotation QualifierInstance {annotationClass=interface jakarta.enterprise.inject.Produces, val
+org.hibernate.orm.test.jpa.cascade.multilevel.MultiLevelCascadeCollectionIdClassTest	org.opentest4j.AssertionFailedError: expected: not <null>
+org.hibernate.orm.test.lob.JpaLargeBlobTest	java.lang.AbstractMethodError: method org/hibernate/event/spi/FlushEventListener.onFlush(Lorg/hibernate/event/spi/FlushEvent;)V has no Code attribute
+org.hibernate.orm.test.query.NativeQueryConstructorErrorTest	org.opentest4j.AssertionFailedError: expected: <true> but was: <false>
+org.hibernate.orm.test.sorted.set.SortComparatorTest	org.opentest4j.AssertionFailedError: 
+org.hibernate.orm.test.sql.exec.onetoone.bidirectional.EntityWithOneBidirectionalJoinTableAssociationTest	org.junit.platform.commons.JUnitException: Chain of InvocationInterceptors called invocation multiple times instead of just once: org.junit.jupiter.engine.exten
+org.hibernate.orm.test.sorted.set.SortNaturalTest	org.opentest4j.AssertionFailedError: 
+org.hibernate.orm.test.sql.exec.onetoone.bidirectional.EntityWithTwoBidirectionalAssociationsOneWithJoinTableTest	org.junit.platform.commons.JUnitException: Chain of InvocationInterceptors called invocation multiple times instead of just once: org.junit.jupiter.engine.exten
+org.hibernate.orm.test.timezones.JDBCTimeZoneZonedTest	org.opentest4j.AssertionFailedError: expected: <2026-06-23T12:32:25.454487Z> but was: <2026-06-23T07:32:25.454487Z>
+org.hibernate.orm.test.util.SerializationHelperTest	java.lang.ClassNotFoundException: org.hibernate.orm.test.util.SerializableThing not found
+org.hibernate.orm.test.cdi.events.standard.StandardCdiSupportTest	java.lang.RuntimeException: Could not configure StandardServiceRegistryBuilder
+org.hibernate.orm.test.connection.DriverManagerRegistrationTest	org.opentest4j.AssertionFailedError: Unanticipated failure according to HHH-7272
+org.hibernate.orm.test.mapping.fetch.depth.NoDepthTests	java.lang.RuntimeException: Could not create URL for archive: fetch-depth.par
+org.hibernate.orm.test.multitenancy.DatabaseTimeZoneMultiTenancyTest	org.opentest4j.AssertionFailedError: 
+org.hibernate.orm.test.proxy.ProxyClassReuseTest	java.lang.RuntimeException: java.lang.ClassNotFoundException: org.hibernate.orm.test.proxy.ProxyClassReuseTest$ProxyGetter not found
+org.hibernate.orm.test.cdi.general.hibernatesearch.delayed.HibernateSearchDelayedCdiSupportTest	org.jboss.weld.exceptions.IllegalArgumentException: WELD-001301: Annotation QualifierInstance {annotationClass=interface jakarta.enterprise.inject.Produces, val
+org.hibernate.orm.test.hql.HqlParserMemoryUsageTest	org.junit.platform.commons.JUnitException: Chain of InvocationInterceptors called invocation multiple times instead of just once: org.junit.jupiter.engine.exten
+org.hibernate.orm.test.jpa.EntityManagerTest	java.lang.RuntimeException: java.io.StreamCorruptedException: List implementation not in base module.
+org.hibernate.orm.test.cdi.converters.standard.CdiHostedConverterTest	java.lang.RuntimeException: Could not configure StandardServiceRegistryBuilder
+org.hibernate.orm.test.cdi.general.hibernatesearch.extended.HibernateSearchExtendedCdiSupportTest	org.jboss.weld.exceptions.IllegalArgumentException: WELD-001301: Annotation QualifierInstance {annotationClass=interface jakarta.enterprise.inject.Produces, val
+org.hibernate.orm.test.delegation.SessionDelegatorBaseImplTest	org.hibernate.exception.GenericJDBCException: Error executing work [General error: "java.lang.IllegalStateException: IOException: Системе не удает
+org.hibernate.orm.test.jpa.cdi.BasicCdiTest	org.jboss.weld.exceptions.IllegalArgumentException: WELD-001301: Annotation QualifierInstance {annotationClass=interface jakarta.enterprise.inject.Produces, val
+org.hibernate.orm.test.jpa.transaction.TransactionTimeoutTest	java.lang.AssertionError: 
+org.hibernate.orm.test.timestamp.JdbcTimeCustomTimeZoneTest	org.opentest4j.AssertionFailedError: expected: <16:00:00> but was: <00:00:00>
