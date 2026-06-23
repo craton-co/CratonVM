@@ -105,33 +105,32 @@ returns that stream (the webapp's `WebappClassLoaderBase` override resolves
 already-working system-classpath case is byte-identical; the TCCL path only fires
 on a miss, and a miss there still yields `FileNotFoundException`.
 
-## Validation (`fix/tc0622-classpath-url-protocol` + `fix/tc0622-classpath-tccl-resource` vs HotSpot)
+A sixth item (the last residual, now fixed): a `file:` URL pointing at a
+**directory** failed. HotSpot's `sun.net.www.protocol.file.FileURLConnection`
+returns a directory LISTING (entry names, Collator-sorted, one per `\n`-terminated
+line) as a `ByteArrayInputStream`; CratonVM's synthetic `file:` `openStream` did
+`std::fs::read` on the path, which errors on a directory (Windows: os error 5
+"access denied") → `FileNotFoundException`. Now, when the read fails and the path
+is a directory, the synthetic synthesizes the same listing
+(`std::fs::read_dir`, case-insensitive sort to mirror `Collator`). Byte-identical
+to HotSpot for `test/webresources/dir1`: `d1\nd2\nf1.txt\nf2.txt\nMETA-INF\n`
+(len 29). Regular files and missing files are unchanged (still bytes / still FNFE).
+
+## Validation (`fix/tc0622-classpath-url-protocol` + `fix/tc0622-classpath-tccl-resource` + `fix/tc0622-file-url-directory-listing` vs HotSpot)
 
 | Class | Before | After |
 |-------|-------:|------:|
 | `TestClasspathUrlStreamHandler` | FAIL (unknown protocol) | **PASS** (1/1) |
-| `TestConfigFileLoader` | FAIL (4/4 classpath) | **3/4** (test01/02/04 pass) |
+| `TestConfigFileLoader` | FAIL (4/4 classpath) | **PASS** (4/4) |
 | `TestPropertiesRoleMappingListener` | FAIL (classpath + LifecycleException) | **PASS** (9/9) |
 
-`TestConfigFileLoader.test03` still fails — unrelated: it opens a **directory**
-through a `file:` URL; HotSpot's `FileURLConnection` returns a directory-listing
-stream, CratonVM's synthetic `file:` `openStream` does `fs::read` on the dir →
-Windows "access denied" (os error 5). Separate `file:`-URL gap, was failing
-pre-fix.
+All three originally-affected classes are fully green; no residuals remain.
 
 Regression checks (all green): HIB-CV-15 `vfszip`/`vfsfile` custom-factory probe
 (`new URL` + `URI.toURL`), Bootstrap `C:`-drive glob still throws, `file:`/`war:`
-`URI.toURL` unchanged, `cargo test -p cratonvm-native-builtins` (2688 pass; the 1
-fail is a pre-existing env-specific `Runtime.exec`/SecurityManager test, untouched
-by this change), vm `getstatic` round-trip tests pass.
-
-## Residual (separate, out of scope)
-
-`TestConfigFileLoader.test03` still fails — unrelated to `classpath:`: it opens a
-**directory** through a `file:` URL. HotSpot's `FileURLConnection` returns a
-directory-listing stream; CratonVM's synthetic `file:` `openStream` does
-`fs::read` on the directory → Windows "access denied" (os error 5). Separate
-`file:`-URL directory-listing gap, was failing pre-fix.
+`URI.toURL` unchanged, `file:` regular-file (bytes) and missing-file (FNFE) probes
+match HotSpot, `cargo test -p cratonvm-native-builtins` (2701 pass), vm `getstatic`
+round-trip tests pass.
 
 (The earlier residual — `TestPropertiesRoleMappingListener`'s webapp
 `WEB-INF/classes` resources being invisible to `find_resource` — is now FIXED via

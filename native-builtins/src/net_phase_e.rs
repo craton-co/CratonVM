@@ -3737,16 +3737,56 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
             match result {
                 Some(b) => b,
                 None => {
-                    let e = first_err.unwrap_or_else(|| std::io::Error::other("no path tried"));
-                    // The JDK's `file:` URL stream (sun.net.www.protocol.file
-                    // FileURLConnection → FileInputStream) raises
-                    // FileNotFoundException — not a bare IOException — when the
-                    // target can't be opened (missing file, directory, or
-                    // permission). Callers assert on it specifically, e.g.
-                    // Spring Boot's PluginXmlParser via
-                    // `withCauseInstanceOf(FileNotFoundException.class)`. See
-                    // `apps/spring-boot/cratonvm-bug-reports/SB-12`.
-                    return Err(fnfex(format!("{path} ({e})")));
+                    // A `file:` URL pointing at a DIRECTORY: HotSpot's
+                    // `sun.net.www.protocol.file.FileURLConnection.getInputStream`
+                    // does NOT fail — it returns a directory LISTING (the entry
+                    // names, Collator-sorted, one per `\n`-terminated line) as a
+                    // `ByteArrayInputStream`. `std::fs::read` on a directory
+                    // errors instead (Windows: os error 5 "access denied"), so
+                    // detect the directory and synthesize the same listing.
+                    // (TestConfigFileLoader.test03: file: URL to
+                    // test/webresources/dir1 expects a non-null stream.)
+                    if let Some(d) = try_paths
+                        .iter()
+                        .find(|p| std::path::Path::new(p).is_dir())
+                    {
+                        match std::fs::read_dir(d) {
+                            Ok(entries) => {
+                                let mut names: Vec<String> = entries
+                                    .filter_map(|e| e.ok())
+                                    .filter_map(|e| e.file_name().into_string().ok())
+                                    .collect();
+                                // HotSpot uses `Collator.getInstance()` (default
+                                // locale, case-insensitive primary order). Mirror
+                                // it closely with a case-insensitive sort, ties
+                                // broken by the raw name for determinism.
+                                names.sort_by(|a, b| {
+                                    a.to_lowercase()
+                                        .cmp(&b.to_lowercase())
+                                        .then_with(|| a.cmp(b))
+                                });
+                                let mut listing = String::new();
+                                for n in &names {
+                                    listing.push_str(n);
+                                    listing.push('\n');
+                                }
+                                listing.into_bytes()
+                            }
+                            Err(e) => return Err(fnfex(format!("{path} ({e})"))),
+                        }
+                    } else {
+                        let e =
+                            first_err.unwrap_or_else(|| std::io::Error::other("no path tried"));
+                        // The JDK's `file:` URL stream (sun.net.www.protocol.file
+                        // FileURLConnection → FileInputStream) raises
+                        // FileNotFoundException — not a bare IOException — when the
+                        // target can't be opened (missing file or permission).
+                        // Callers assert on it specifically, e.g. Spring Boot's
+                        // PluginXmlParser via
+                        // `withCauseInstanceOf(FileNotFoundException.class)`. See
+                        // `apps/spring-boot/cratonvm-bug-reports/SB-12`.
+                        return Err(fnfex(format!("{path} ({e})")));
+                    }
                 }
             }
         } else if let Some(name) = url_str.strip_prefix("classpath:") {
