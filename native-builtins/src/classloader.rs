@@ -898,12 +898,19 @@ fn cl_load_class_base_delegation(
     // `super(null)` and overrides `findClass` to iterate scoped child loaders),
     // that global pre-resolution acts like the application loader and bypasses the
     // supplied loader entirely (JVMS §5.3: a bootstrap parent cannot load an
-    // application class, so `findClass` MUST run). When the receiver overrides
+    // application class, so `findClass` MUST run). When such a loader overrides
     // `findClass` and the requested class is NOT a bootstrap/platform class, defer
-    // every global short-circuit to AFTER `findClass`. Built-in loaders and
-    // bootstrap classes keep the permissive global path (CratonVM has no separate
-    // bootstrap classpath). Opt-out: `CRATONVM_CL_BOOTSTRAP_SCOPED=0`.
+    // every global short-circuit to AFTER `findClass`. Only for a NULL parent — a
+    // non-null (app/platform) parent keeps JVMS parent-first (it legitimately
+    // loads the class; `findClass` is not called). Built-in loaders and bootstrap
+    // classes keep the permissive global path (CratonVM has no separate bootstrap
+    // classpath). Opt-out: `CRATONVM_CL_BOOTSTRAP_SCOPED=0`.
+    let parent_is_null = matches!(
+        ctx.get_field(this, CL_PARENT_REF),
+        Value::Object(None) | Value::Int(0) | Value::Long(0)
+    );
     let defer_to_find_class = cl_bootstrap_scoped()
+        && parent_is_null
         && !is_bootstrap_class_name(&internal)
         && receiver_overrides_find_class(ctx, this);
 
