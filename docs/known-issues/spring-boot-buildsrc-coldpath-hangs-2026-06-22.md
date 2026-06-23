@@ -84,9 +84,16 @@ corruption) appears in any hang log.
 ## Config matrix (`--nojit` + `-XX:+UseG1GC`, 17 passing classes, P-core-pinned)
 - **`--nojit` (interpreter-only): 17/17 PASS** — zero interpreter-path divergences.
 - **`-XX:+UseG1GC`: 8 of 17 "hang" @240s, but all SLOW-PASS correctly** given a 600s
-  window (e.g. `DependencyVersionTests` 8s-serial → 366s-G1 PASS 8/8). G1 here is **~45×
-  slower than serial** — a throughput/maturation gap, **not a deadlock or correctness
-  bug**. Full detail: [[spring-boot-g1-gc-coldpath-hang]].
+  window (e.g. `DependencyVersionTests` 8s-serial → 366s-G1 PASS 8/8). Not a deadlock.
+  **UPDATE 2026-06-22 — root-caused + FIXED** (not merely generic G1 maturation tax):
+  the dominant cost was G1's `is_addr_in_live_region` taking `regions.lock()` + an
+  O(num_regions) linear scan **per word** of the conservative JIT/native root scan
+  (run on every object-returning native call), a hot path `gen_heap` had already made
+  lock-free O(1). After the port (`fix/g1-coldpath-hang`, merged to dev),
+  `DependencyVersionUpgradeTests` G1+JIT went **1264s → 72s** and all `bom.bomr`
+  classes pass under G1+JIT. Full detail (moved out of known-issues):
+  `docs/internal/app-jvm-bugs/spring-boot-g1-conservative-rootscan-region-lookup-FIXED.md`.
+  A *non-pathological* G1-vs-serial gap remains under the G1-maturation workstream.
 
 ## Net genuine CratonVM-only defects from this run
 1. `PluginXmlParserTests` true-hang ([[spring-boot-pluginxmlparser-hang]]).
