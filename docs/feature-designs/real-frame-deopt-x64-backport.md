@@ -118,6 +118,37 @@ mirroring the IR producer's `None ⇒ Int(0)`.
   `Unsupported`/`Undefined` field). Still `CRATONVM_DEOPT_REAL`-gated.
 - **B4 — tests + e2e** under `CRATONVM_DEOPT_REAL` / `CRATONVM_DEOPT_EAGER`.
 
+**Status (2026-06-22): B1–B3 implemented, unit + integration tested, committed.**
+849 jit tests (2 new: `plan_scalar_replacement` class_id + `local_prov_at`
+capture; `sr_field_values` type→`StackSlot*` mapping) + 48 vm deopt tests
+(consumer materialization) all green. The field-slot offset
+(`-(field_base_offset + k*SLOT_SIZE)`) was verified by code to match exactly the
+address the SR `getfield` reads (`emit_load_local`/`modrm_rbp_disp`). Gate-off is
+byte-identical (emission only runs inside `build_and_record_deopt_point`, gated;
+`can_deopt_resume` stays false with no `deopt_points`).
+
+**B4 runtime e2e — BLOCKED on single-pass SR reachability (not a Phase B defect).**
+Added a `CRATONVM_DEOPT_EAGER_BCI=<n>` trigger (a call-site analog of
+`CRATONVM_DEOPT_EAGER`, since a scalar object can never be live at a loop header)
+to force a deopt at a straight-line bci where a scalar local is live. Diagnostics
+(`CRATONVM_DBG_SCALAR_DEOPT`) showed single-pass scalar replacement never fires at
+runtime for the standard `new X(); <init>()V` pattern: `jit_scan` runs
+`analyze_escapes` with an EMPTY invokespecial-shape map, so it conservatively
+escapes the `<init>` receiver and seeds `non_escaping_new` empty; `x64::compile`'s
+precise re-analysis (which has the resolved shapes) is gated to only *refine a
+non-empty* set (`if non_escaping_new.is_empty() { stays empty }`), so it never
+runs — and the hot IR/`try_compile` path passes an empty set too (`lib.rs:5812`).
+Net: single-pass (x64) SR is effectively dormant in the runtime hot paths for
+ordinary allocations; the IR/C2 backend has its own independent SR-deopt
+(`ir_lower::frame_value_for_object`, `CRATONVM_SCALAR_DEOPT`). So Phase B is a
+correct-and-tested producer extension whose *runtime* exercise is gated by an
+orthogonal single-pass-SR-seeding limitation. Completing B4 requires either fixing
+that seeding (let `x64::compile`'s precise re-analysis DISCOVER non-escaping
+objects from a `new`-seeded set rather than only refine, then re-run with
+`invoke_info` shapes) or a test hook that seeds `non_escaping_new` directly — both
+out of Phase B's producer scope. The trigger + diagnostics are retained as the
+completion harness.
+
 ## Phase C — monitors (deferred); inlining (out of scope)
 
 Monitor-bearing deopt needs the emitter to record held/elided monitors

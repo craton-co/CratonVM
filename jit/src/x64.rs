@@ -7780,6 +7780,13 @@ impl Compiler {
                     continue;
                 }
                 if let Some(state) = self.sr_virtual_object_state(new_pc) {
+                    if std::env::var_os("CRATONVM_DBG_SCALAR_DEOPT").is_some() {
+                        eprintln!(
+                            "[DBG_SCALAR_DEOPT] x64 emit VirtualObject local={i} new_pc={new_pc} \
+                             class_id={} fields={} at bci={bci}",
+                            state.class_id, state.num_fields
+                        );
+                    }
                     sr_emitted.insert(new_pc);
                     locals.push(FrameValue::VirtualObject(state));
                     continue;
@@ -15711,6 +15718,9 @@ impl Compiler {
             // speculative-BCE guard. Only under CRATONVM_DEOPT_EAGER + DEOPT_REAL ⇒
             // no JMP in production ⇒ byte-identical.
             if self.deopt_eager_bci == Some(pc) {
+                if std::env::var_os("CRATONVM_DBG_SCALAR_DEOPT").is_some() {
+                    eprintln!("[DBG_SCALAR_DEOPT] x64 eager deopt-EXIT JMP emitted at bci={pc}");
+                }
                 if !self.deopt_box_ptr_by_bci.contains_key(&pc) {
                     self.emit_deopt_snapshot_at_guard(pc);
                 }
@@ -23773,9 +23783,31 @@ pub fn compile_with_param_slots(
     // (lowest-pc) loop header. `None` (either gate off / no loop) ⇒ byte-identical.
     compiler.deopt_eager_bci = if crate::deopt_real_enabled() && crate::deopt_eager_enabled() {
         loops.iter().map(|&(h, _)| h).min()
+    } else if crate::deopt_real_enabled() {
+        // Phase B e2e: `CRATONVM_DEOPT_EAGER_BCI=<n>` points the eager deopt-EXIT
+        // at a specific straight-line bci (where a scalar object is live in a
+        // local), the only way to drive `VirtualObject` resume through the JIT.
+        // Fire ONLY in a method that actually has a scalar object live at that
+        // bci — so the global env doesn't perturb unrelated methods (e.g. the
+        // driver `main`, which has no scalar replacement).
+        crate::deopt_eager_bci_override()
+            .filter(|n| compiler.sr_local_prov_at.contains_key(n))
     } else {
         None
     };
+    if std::env::var_os("CRATONVM_DBG_SCALAR_DEOPT").is_some()
+        && !compiler.scalar_replaced.is_empty()
+    {
+        let mut keys: Vec<usize> = compiler.sr_local_prov_at.keys().copied().collect();
+        keys.sort();
+        eprintln!(
+            "[DBG_SCALAR_DEOPT] x64 single-pass compile: scalar_replaced={} sr_local_prov_at_pcs={:?} eager_bci={:?} elided_monitor={}",
+            compiler.scalar_replaced.len(),
+            keys,
+            compiler.deopt_eager_bci,
+            compiler.has_elided_monitor,
+        );
+    }
     if std::env::var_os("CRATONVM_DBG_JIT_GEN").is_some() {
         eprintln!(
             "[JIT_GEN_INSTALL] mic_slots count={} pcs={:?}",

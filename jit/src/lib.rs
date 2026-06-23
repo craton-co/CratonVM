@@ -900,6 +900,23 @@ pub fn deopt_eager_enabled() -> bool {
     *CACHE.get_or_init(|| std::env::var_os("CRATONVM_DEOPT_EAGER").is_some())
 }
 
+/// Phase B (real-frame-deopt x64 backport) e2e trigger: `CRATONVM_DEOPT_EAGER_BCI=<n>`
+/// (default unset, read-once). When set *and* `deopt_real_enabled()`, the eager
+/// deopt-EXIT branch fires at the chosen bytecode bci `n` instead of the first
+/// loop header. Loop headers can never hold a live scalar-replaced object (it
+/// would escape across the back-edge), so this points the trigger at a
+/// straight-line bci where a scalar object IS live in a local — the only way to
+/// exercise the `VirtualObject` materialization path through the live JIT. A
+/// SEPARATE-PROCESS differential, like `CRATONVM_DEOPT_EAGER`. Unset ⇒ unchanged.
+pub fn deopt_eager_bci_override() -> Option<usize> {
+    static CACHE: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| {
+        std::env::var("CRATONVM_DEOPT_EAGER_BCI")
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+    })
+}
+
 /// deopt-osr Step 8 (test trigger): `CRATONVM_OSR_EXIT_TEST` (default-OFF,
 /// read-once). When ON *and* `deopt_real_enabled()`, the single-pass backend
 /// emits one synthetic unconditional OSR-exit branch at a loop header so a JIT'd
