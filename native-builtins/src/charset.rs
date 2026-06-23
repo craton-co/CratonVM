@@ -388,6 +388,23 @@ fn decoder_malformed_is_replace(ctx: &dyn NativeContext, this: ObjectRef) -> boo
     false
 }
 
+/// Read a `CodingErrorAction`-valued field (`malformedInputAction` /
+/// `unmappableCharacterAction`) off a coder object and map it to the engine's
+/// [`engine::CodingAction`]. An unreadable/absent field conservatively yields
+/// REPORT (HotSpot's default), preserving strict error behavior.
+fn coding_action(ctx: &dyn NativeContext, obj: ObjectRef, field: &str) -> engine::CodingAction {
+    if let Value::Object(Some(action)) = ctx.get_field_by_name(obj, field) {
+        if let Value::Object(Some(s)) = ctx.get_field_by_name(action, "name") {
+            return match ctx.read_string(s).as_deref() {
+                Some("REPLACE") => engine::CodingAction::Replace,
+                Some("IGNORE") => engine::CodingAction::Ignore,
+                _ => engine::CodingAction::Report,
+            };
+        }
+    }
+    engine::CodingAction::Report
+}
+
 /// `CharsetEncoder.encode(CharBuffer, ByteBuffer, boolean end_of_input)
 ///  -> CoderResult`
 ///
@@ -401,6 +418,13 @@ fn native_encoder_encode(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     let this = arg_obj(args, 0)?;
     let cb = arg_obj(args, 1)?;
     let bb = arg_obj(args, 2)?;
+    // args[3] = boolean endOfInput (Int 0/1). When false, a high surrogate at
+    // the very end of the input is a *potential* pair start: the encoder must
+    // return UNDERFLOW and leave it unconsumed (waiting for its low surrogate)
+    // rather than reporting a lone-surrogate malformed error — exactly what
+    // java.nio.charset.CharsetEncoder.encode does. C2BConverter relies on this
+    // to carry a surrogate across its `leftovers` buffer (Tomcat TestUEncoder).
+    let end_of_input = matches!(args.get(3), Some(Value::Int(v)) if *v != 0);
 
     let (carr, cpos, clim) = match buf_state(ctx, cb) {
         Some(s) => s,
@@ -428,57 +452,88 @@ fn native_encoder_encode(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         return Ok(Some(Value::Object(Some(r))));
     }
 
-    // Encode chunk-by-chunk so we can report OVERFLOW / UNMAPPABLE with
-    // precise buffer positions.  The engine encodes the whole slice
-    // atomically; on success we need to honour the destination's
-    // remaining space.
-    let encoded = match engine::encode_chars(&name, &chars) {
-        Ok(bytes) => bytes,
-        Err(e) => {
-            // Advance the input position to the error offset.
-            set_pos(ctx, cb, cpos + e.offset as i32);
-            let tag = match e.kind {
-                engine::CodingErrorKind::Unmappable => CR_UNMAPPABLE,
-                _ => CR_MALFORMED,
-            };
-            let r = alloc_coder_result(ctx, tag);
-            return Ok(Some(Value::Object(Some(r))));
-        }
-    };
-
+    // Run the `java.nio.charset.CharsetEncoder.encode` orchestrator: encode
+    // code-point groups (a high+low surrogate pair is one group), applying the
+    // configured malformed / unmappable action. Encoding group-by-group lets us
+    // (a) stop exactly at the output capacity for a precise OVERFLOW position
+    // (no proportional approximation), (b) honor REPLACE/IGNORE by substituting
+    // the replacement byte and continuing, and (c) defer a trailing lone high
+    // surrogate as UNDERFLOW when more input may still arrive.
+    let action_mal = coding_action(ctx, this, "malformedInputAction");
+    let action_unmap = coding_action(ctx, this, "unmappableCharacterAction");
     let avail = (blim - bpos).max(0) as usize;
-    let to_write = encoded.len().min(avail);
-    let written = write_byte_array(ctx, barr, bpos as usize, &encoded[..to_write]);
+    let mut out: Vec<u8> = Vec::new();
+    let mut consumed = 0usize; // UTF-16 units consumed from `chars`
+    let status_tag: i32;
+    loop {
+        if consumed >= chars.len() {
+            status_tag = CR_UNDERFLOW;
+            break;
+        }
+        let u = chars[consumed];
+        // A high surrogate followed by a low surrogate is a single 2-unit code
+        // point; a high surrogate at end-of-buffer with !end_of_input is left
+        // for the next call; anything else is a 1-unit group (possibly a lone
+        // surrogate that `encode_chars` will report as malformed).
+        let mut group_len = 1usize;
+        if (0xD800..=0xDBFF).contains(&u) {
+            if consumed + 1 < chars.len() {
+                if (0xDC00..=0xDFFF).contains(&chars[consumed + 1]) {
+                    group_len = 2;
+                }
+            } else if !end_of_input {
+                status_tag = CR_UNDERFLOW;
+                break;
+            }
+        }
+        let group = &chars[consumed..consumed + group_len];
+        match engine::encode_chars(&name, group) {
+            Ok(bytes) => {
+                if out.len() + bytes.len() > avail {
+                    status_tag = CR_OVERFLOW;
+                    break;
+                }
+                out.extend_from_slice(&bytes);
+                consumed += group_len;
+            }
+            Err(e) => {
+                let action = if e.kind == engine::CodingErrorKind::Unmappable {
+                    action_unmap
+                } else {
+                    action_mal
+                };
+                match action {
+                    engine::CodingAction::Report => {
+                        let written = write_byte_array(ctx, barr, bpos as usize, &out);
+                        set_pos(ctx, bb, bpos + written as i32);
+                        set_pos(ctx, cb, cpos + consumed as i32);
+                        let tag = if e.kind == engine::CodingErrorKind::Unmappable {
+                            CR_UNMAPPABLE
+                        } else {
+                            CR_MALFORMED
+                        };
+                        let r = alloc_coder_result(ctx, tag);
+                        return Ok(Some(Value::Object(Some(r))));
+                    }
+                    engine::CodingAction::Replace => {
+                        if out.len() + 1 > avail {
+                            status_tag = CR_OVERFLOW;
+                            break;
+                        }
+                        out.push(engine::REPLACEMENT_BYTE);
+                        consumed += group_len;
+                    }
+                    engine::CodingAction::Ignore => consumed += group_len,
+                }
+            }
+        }
+    }
+
+    let written = write_byte_array(ctx, barr, bpos as usize, &out);
     set_pos(ctx, bb, bpos + written as i32);
-
-    if to_write < encoded.len() {
-        // We could not write the entire encoded payload: advance the
-        // input position proportionally (approximate for variable-width
-        // charsets) so the caller can retry after draining the output.
-        let consumed = proportional_input_consumed(&chars, &encoded, to_write);
-        set_pos(ctx, cb, cpos + consumed as i32);
-        let r = alloc_coder_result(ctx, CR_OVERFLOW);
-        Ok(Some(Value::Object(Some(r))))
-    } else {
-        set_pos(ctx, cb, cpos + chars.len() as i32);
-        let r = alloc_coder_result(ctx, CR_UNDERFLOW);
-        Ok(Some(Value::Object(Some(r))))
-    }
-}
-
-/// For variable-width charsets, approximate how many UTF-16 input
-/// units were fully consumed by `to_write` output bytes.  Only used
-/// on the OVERFLOW path where the caller will retry; an imprecise
-/// value here only affects how many chars are re-encoded, not
-/// correctness.
-fn proportional_input_consumed(chars: &[u16], encoded: &[u8], to_write: usize) -> usize {
-    if encoded.is_empty() {
-        return chars.len();
-    }
-    // Lower-bound on fully-consumed input: (to_write / encoded_len) * chars_len
-    // rounded DOWN so we never over-consume.
-    let num = to_write as u64 * chars.len() as u64;
-    (num / encoded.len() as u64) as usize
+    set_pos(ctx, cb, cpos + consumed as i32);
+    let r = alloc_coder_result(ctx, status_tag);
+    Ok(Some(Value::Object(Some(r))))
 }
 
 /// `CharsetDecoder.decode(ByteBuffer, CharBuffer, boolean end_of_input)
@@ -515,6 +570,29 @@ fn native_decoder_decode(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     let bytes = read_byte_array(ctx, barr, bpos as usize, (blim - bpos).max(0) as usize);
     if bytes.is_empty() {
         let r = alloc_coder_result(ctx, CR_UNDERFLOW);
+        return Ok(Some(Value::Object(Some(r))));
+    }
+
+    // UTF-8 is decoded through a JDK-faithful streaming state machine so the
+    // number / placement of U+FFFD substitutions in REPLACE mode is
+    // byte-for-byte identical to `sun.nio.cs.UTF_8.Decoder` (the W3C
+    // maximal-subpart rule HotSpot follows). The generic engine path below
+    // (Rust `from_utf8_lossy`) diverges at multi-byte-sequence buffer
+    // boundaries — see `cratonvm_native_api::charset::utf8_decode`.
+    if name == "UTF-8" {
+        let action = coding_action(ctx, this, "malformedInputAction");
+        let avail = (clim - cpos).max(0) as usize;
+        let mut units: Vec<u16> = Vec::new();
+        let (consumed, status) = engine::utf8_decode(&bytes, end_of_input, action, &mut units, avail);
+        let written = write_char_array(ctx, carr, cpos as usize, &units);
+        set_pos(ctx, cb, cpos + written as i32);
+        set_pos(ctx, bb, bpos + consumed as i32);
+        let tag = match status {
+            engine::Utf8DecodeStatus::Underflow => CR_UNDERFLOW,
+            engine::Utf8DecodeStatus::Overflow => CR_OVERFLOW,
+            engine::Utf8DecodeStatus::Malformed => CR_MALFORMED,
+        };
+        let r = alloc_coder_result(ctx, tag);
         return Ok(Some(Value::Object(Some(r))));
     }
 
