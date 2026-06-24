@@ -10994,6 +10994,23 @@ fn invoke_on_class_shared_inner(
                                 | "getSentenceInstance"
                                 | "getCharacterInstance"
                             ))
+                        // BUG-15: `LocaleResources.getDateTimePattern(int,int,
+                        // Calendar)` returns null in our partial locale-data
+                        // bootstrap (jdk.localedata class-based bundles not
+                        // surfaced — same gap as BreakIterator above), so
+                        // `DateFormatProviderImpl.getInstance` builds
+                        // `new SimpleDateFormat(null, locale)` → `compile(null)`
+                        // → NPE "pattern is null". This breaks MessageFormat
+                        // `{n,date}`/`{n,time}` typed elements (Spring
+                        // StaticMessageSource) and the
+                        // `DateFormat.get{Date,Time,DateTime}Instance` style
+                        // factories (Spring DateFormatter). Pin the native
+                        // (registered in `locale_resources::register`) which
+                        // returns the en/de CLDR pattern directly so the
+                        // downstream real-JDK SimpleDateFormat runs with a valid
+                        // pattern.
+                        || (class_name == "sun/util/locale/provider/LocaleResources"
+                            && method_name == "getDateTimePattern")
                         // METHODHANDLES ARRAY ACCESSORS: `MethodHandles.
                         // arrayElementGetter` / `arrayElementSetter` are concrete
                         // static factories whose JDK 25 bytecode routes through

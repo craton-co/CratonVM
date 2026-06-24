@@ -16777,6 +16777,23 @@ fn force_native_over_real_jdk_bytecode(
     if class_name == "java/lang/Module" && matches!(method_name, "isExported" | "isOpen") {
         return true;
     }
+    // BUG-15: `sun.util.locale.provider.LocaleResources.getDateTimePattern(int,
+    // int, Calendar)` reads its pattern arrays through `LocaleData
+    // .getDateFormatData` → `Bundles.of(...)`, the jdk.localedata class-based
+    // resource path CratonVM does not surface, so it returns a NULL pattern.
+    // `DateFormatProviderImpl.getInstance` then builds `new SimpleDateFormat(
+    // null, locale)` → `compile(null)` → NPE ("pattern is null"), breaking
+    // MessageFormat `{n,date}`/`{n,time}` elements and the
+    // `DateFormat.get{Date,Time}Instance` factories. Force our native (returns
+    // the en/de CLDR pattern directly) so the downstream real-JDK
+    // SimpleDateFormat runs with a valid pattern. Companion native registered in
+    // `native-builtins::locale_resources::register`; same locale-data-gap class
+    // as the BreakIterator / getDecimalFormatSymbolsData overrides.
+    if class_name == "sun/util/locale/provider/LocaleResources"
+        && method_name == "getDateTimePattern"
+    {
+        return true;
+    }
     // SBR-02 / bug-03: fast native regex. The real-JDK `String.replaceAll` /
     // `replaceFirst` / `matches` bodies run `Pattern.compile(...).matcher(...)`
     // in the interpreter (java.util.regex), which is 30–600× slower than
