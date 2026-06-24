@@ -17044,6 +17044,22 @@ fn force_native_over_real_jdk_bytecode(
             method_name,
             "getHostName" | "getCanonicalHostName" | "getHostAddress"
         ))
+        // URLClassLoader.findResource / findResources + URLClassPath.addURL —
+        // see the companion `check_override` entry in
+        // `vm_exec.rs::invoke_on_class_shared_inner`. The real bytecode routes
+        // through the shimmed `URLClassPath` (null `unopenedUrls`/`path`), so
+        // `addURL` NPEs and `findResource(s)` find nothing. Force the natives
+        // (`ucp_add_url` / `ucl_find_resource(s)`) on the bytecode-interpreter +
+        // cached/promoted dispatch paths. `addURL` is keyed on `URLClassPath`
+        // (its `ucp.addURL(url)` call site) — the `URLClassLoader.addURL`
+        // wrapper is invoked via a subclass `this`, escaping this static-class
+        // gate. Hibernate `NoDepthTests` JPA + ShrinkWrap.
+        || (class_name == "java/net/URLClassLoader"
+            && matches!(method_name, "findResource" | "findResources"))
+        || (matches!(
+            class_name,
+            "jdk/internal/loader/URLClassPath" | "sun/misc/URLClassPath"
+        ) && method_name == "addURL")
 }
 
 /// True when `class_name` has been redefined in place by a JVMTI agent

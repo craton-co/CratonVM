@@ -7840,6 +7840,22 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;)Ljava/util/Enumeration;",
         classloader::ucl_find_resources,
     );
+    // URLClassPath.addURL — `URLClassLoader.addURL`'s body is `ucp.addURL(url)`,
+    // whose real bytecode does `synchronized (unopenedUrls)` and NPEs because
+    // CratonVM's `ucp` is a bare synthetic `URLClassPath` (null instance
+    // fields). Register a native that records the URL on `ucp.path` (so
+    // `findResource(s)` can resolve custom-handler URLs) and extends the global
+    // dynamic classpath for ordinary file:/jar: URLs. We shim `URLClassPath`
+    // (not `URLClassLoader`) because `addURL` is usually invoked via a SUBCLASS
+    // `this.addURL(url)` (e.g. ShrinkWrap), whose CP methodref names the
+    // subclass and so escapes the force-native gates; `ucp.addURL` always names
+    // `URLClassPath`. Without this, ANY real-mode `URLClassLoader` subclass that
+    // calls the protected `addURL` (ShrinkWrap's `ShrinkWrapClassLoader`,
+    // Hibernate `NoDepthTests` JPA) throws
+    // `NullPointerException: ... "this.unopenedUrls" is null`.
+    for cls in &["jdk/internal/loader/URLClassPath", "sun/misc/URLClassPath"] {
+        registry.register(cls, "addURL", "(Ljava/net/URL;)V", classloader::ucp_add_url);
+    }
     // Natives for the synthetic `java/util/Enumeration$Impl` helper the
     // getResources override returns.  These are idempotent (re-registered
     // by `register_classloader_natives` in synthetic-JDK mode).
