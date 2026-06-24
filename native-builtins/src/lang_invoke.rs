@@ -3995,6 +3995,18 @@ pub(crate) const MH_KIND_SPREAD: i32 = 17;
 /// callee's `action.execute(...)` throws `NoSuchMethodError: …Closure.execute`.
 pub(crate) const MH_KIND_FILTER: i32 = 18;
 
+/// Argument-fold adapter produced by `MethodHandles.foldArguments(target,
+/// [pos,] combiner)`. `MH_BOUND` holds a 3-field wrapper (field 0 = target MH,
+/// field 1 = combiner MH, field 2 = pos). On invocation the combiner is applied
+/// to `combiner.parameterCount()` arguments starting at `pos`; if the combiner
+/// returns a value it is spliced in at `pos` (so the target sees the combiner's
+/// result followed by all the original arguments), then the target is
+/// dispatched. Groovy's `TypeTransformers.TO_REFLECTIVE_PROXY` is
+/// `foldArguments(Proxy.newProxyInstance…, new ConvertedClosure(closure,name))`
+/// — without a real fold the `ConvertedClosure` handler is never built and the
+/// proxy is created with no interfaces (its SAM method then 404s).
+pub(crate) const MH_KIND_FOLD: i32 = 19;
+
 // ---------------------------------------------------------------------------
 // Round-9 perf: LambdaMetafactory CallSite cache.
 // ---------------------------------------------------------------------------
@@ -4491,6 +4503,81 @@ fn mh_dispatch_filter(
     mh_dispatch(ctx, target, &filtered)
 }
 
+/// Build a `MethodHandles.foldArguments` adapter (`MH_KIND_FOLD`). `target` and
+/// `combiner` are the two handles; `pos` is the fold position (0 for the basic
+/// form). The adapter's `type()` mirrors the target minus the folded result
+/// parameter, but for CratonVM's dispatch only the wrapper fields matter.
+fn make_fold_adapter(
+    ctx: &mut dyn NativeContext,
+    target: Option<Value>,
+    pos: i32,
+    combiner: Option<Value>,
+) -> MethodCallResult {
+    let target = match target {
+        Some(Value::Object(Some(t))) => t,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let combiner_ref = match combiner {
+        Some(Value::Object(Some(c))) => c,
+        // No combiner → behave like the bare target.
+        _ => return Ok(Some(Value::Object(Some(target)))),
+    };
+    let wrapper = alloc_concurrent_synthetic(ctx, "__mh_fold_wrapper__", 3);
+    ctx.set_field(wrapper, 0, Value::Object(Some(target)));
+    ctx.set_field(wrapper, 1, Value::Object(Some(combiner_ref)));
+    ctx.set_field(wrapper, 2, Value::Int(pos));
+    let desc = mh_type_descriptor(ctx, target)
+        .or_else(|| mh_read_desc(ctx, target))
+        .unwrap_or_default();
+    let adapter = alloc_method_handle(ctx, "__adapter__", "fold", &desc, MH_KIND_FOLD);
+    ctx.set_field(adapter, MH_BOUND, Value::Object(Some(wrapper)));
+    Ok(Some(Value::Object(Some(adapter))))
+}
+
+/// `MethodHandles.foldArguments` dispatch (`MH_KIND_FOLD`). Extracted from
+/// `mh_dispatch` to keep that match small enough for rustc. The combiner runs
+/// over `combiner.parameterCount()` args starting at `pos`; a non-void result is
+/// spliced in at `pos` before the (full) original args, then the target runs.
+fn mh_dispatch_fold(
+    ctx: &mut dyn NativeContext,
+    bound: Value,
+    extra_args: &[Value],
+) -> MethodCallResult {
+    let wrapper = match bound {
+        Value::Object(Some(w)) => w,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let target = match ctx.get_field(wrapper, 0) {
+        Value::Object(Some(t)) => t,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let combiner = match ctx.get_field(wrapper, 1) {
+        Value::Object(Some(c)) => c,
+        _ => return mh_dispatch(ctx, target, extra_args),
+    };
+    let pos = match ctx.get_field(wrapper, 2) {
+        Value::Int(p) => (p as usize).min(extra_args.len()),
+        _ => 0,
+    };
+    // The combiner consumes `combiner.parameterCount()` args starting at `pos`.
+    let cdesc = mh_type_descriptor(ctx, combiner)
+        .or_else(|| mh_read_desc(ctx, combiner))
+        .unwrap_or_default();
+    let (cparams, cret) = split_descriptor_params(&cdesc).unwrap_or_default();
+    let take = cparams.len().min(extra_args.len().saturating_sub(pos));
+    let combine_args: Vec<Value> = extra_args[pos..pos + take].to_vec();
+    let combined = mh_dispatch(ctx, combiner, &combine_args)?;
+    // Splice a non-void combiner result in at `pos`; void combiners contribute
+    // nothing (the target then sees the original arg list unchanged).
+    let mut full: Vec<Value> = Vec::with_capacity(extra_args.len() + 1);
+    full.extend_from_slice(&extra_args[..pos]);
+    if cret != "V" {
+        full.push(combined.unwrap_or(Value::Object(None)));
+    }
+    full.extend_from_slice(&extra_args[pos..]);
+    mh_dispatch(ctx, target, &full)
+}
+
 pub(crate) fn mh_dispatch(
     ctx: &mut dyn NativeContext,
     mh: cratonvm_types::ObjectRef,
@@ -4972,6 +5059,7 @@ pub(crate) fn mh_dispatch(
             mh_dispatch(ctx, target, &full)
         }
         MH_KIND_FILTER => mh_dispatch_filter(ctx, bound, extra_args),
+        MH_KIND_FOLD => mh_dispatch_fold(ctx, bound, extra_args),
         MH_KIND_SPREAD => {
             // asSpreader(arrayType, count): the trailing argument is an array;
             // spread its elements into positional args, then dispatch target.
@@ -6077,20 +6165,24 @@ pub fn register_t28_method_handle_completeness(r: &mut NativeMethodRegistry) {
             Ok(Some(args.first().copied().unwrap_or(Value::Object(None))))
         },
     );
+    // foldArguments(target, combiner): fold at position 0.
     r.register(
         mhs,
         "foldArguments",
         "(Ljava/lang/invoke/MethodHandle;Ljava/lang/invoke/MethodHandle;)Ljava/lang/invoke/MethodHandle;",
-        |_ctx, args| {
-            Ok(Some(args.first().copied().unwrap_or(Value::Object(None))))
-        },
+        |ctx, args| make_fold_adapter(ctx, args.first().copied(), 0, args.get(1).copied()),
     );
+    // foldArguments(target, pos, combiner): fold at position `pos`.
     r.register(
         mhs,
         "foldArguments",
         "(Ljava/lang/invoke/MethodHandle;ILjava/lang/invoke/MethodHandle;)Ljava/lang/invoke/MethodHandle;",
-        |_ctx, args| {
-            Ok(Some(args.first().copied().unwrap_or(Value::Object(None))))
+        |ctx, args| {
+            let pos = match args.get(1) {
+                Some(Value::Int(p)) => *p,
+                _ => 0,
+            };
+            make_fold_adapter(ctx, args.first().copied(), pos, args.get(2).copied())
         },
     );
     r.register(
