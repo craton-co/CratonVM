@@ -25,13 +25,48 @@ metadata:
 | 3d | Object-returning poly-invoke of a `void` target → operand-stack underflow | ✅ FIXED+MERGED (`5d36c432`) |
 | 3e | Groovy truth: `cast:(Object)Z` not routed through `asBoolean` → falsy non-null read as true | ✅ FIXED (`cd4bfb27`, route to `DefaultTypeTransformation.castToBoolean`) |
 | 3f | `MethodHandles.filterArguments` was a passthrough → closure→SAM coercion never ran | ✅ FIXED (`1b1f8cde`, real `MH_KIND_FILTER`) |
-| **g** | **Generated SAM proxy's `execute()` → `NoSuchMethodError`** | 🔴 OPEN |
+| g1 | `MethodHandles.foldArguments` was a passthrough → `TypeTransformers.TO_REFLECTIVE_PROXY` malformed → SAM proxy built with **no interfaces** (`execute()` → `NoSuchMethodError`) | ✅ FIXED (real `MH_KIND_FOLD`; SAM proxy now has `[Action]`, `execute` dispatches to the closure — verified by `SamRealProbe`) |
+| g2 | Named `Module` (e.g. `java.base`) has a null `descriptor` → real `implIsExportedOrOpen` NPEs in every reflective access check (Groovy `CachedClass.getMethods`, `GroovySystem.<clinit>`, JUnit `@BeforeAll`) | 🔴 OPEN (see below — flaky; a blanket-permissive `isExported` fixes the NPE but **regresses ByteBuddy**) |
+| g3 | ByteBuddy `JavaDispatcher.<clinit>` → `IllegalStateException: Failed to create invoker` (reached once g2's NPE is bypassed) | 🔴 OPEN |
 | **h** | **closure→Action coercion on a Mockito mock drives no interaction** | 🔴 OPEN |
 
-Net: `0/11` (all crashed) → **`4/11`** clean. The 4 passing are the empty/false-
-condition cases; the 7 failing all need `maven.mavenContent { }` / `maven.content
-{ }` / `maven.credentials { }` (closures coerced to a Gradle `Action`) to drive
-their Mockito stubs, which they don't yet.
+Net: `0/11` (all crashed) → **`4/11`** clean *(flaky: the g2 Module NPE in
+`GroovySystem.<clinit>` intermittently drops it to `0/11`)*. The 4 passing are the
+empty/false-condition cases; the 7 failing all need `maven.mavenContent { }` /
+`maven.content { }` / `maven.credentials { }` (closures coerced to a Gradle
+`Action`) to drive their Mockito stubs.
+
+## Layer g1 — `foldArguments` passthrough (FIXED)
+Groovy's `TypeTransformers.TO_REFLECTIVE_PROXY` =
+`foldArguments(Proxy.newProxyInstance…, new ConvertedClosure(closure,name))`.
+CratonVM's `MethodHandles.foldArguments` returned the target unchanged (ignored
+the combiner), so the `ConvertedClosure` handler was never built and the arg
+vector shifted → `Proxy.newProxyInstance` got an **empty interfaces array** →
+the proxy implemented nothing → `execute()` 404'd. Implemented a real
+`MH_KIND_FOLD` adapter (run combiner over its param count starting at `pos`,
+splice a non-void result in at `pos`, dispatch target). `SamRealProbe` now shows
+`interfaces=[Action]`, `execute OK`, closure ran. (`filterReturnValue` /
+`collectArguments` remain passthroughs — likely the next combinator gaps.)
+
+## Layer g2 — named Module has null descriptor (OPEN; permissive fix regresses ByteBuddy)
+Once g1 is fixed, `createSAMTransform` reflects via `CachedClass.getMethods` →
+`ReflectionUtils.checkCanSetAccessible` → `Java9.checkAccessible` →
+`Module.isExported(pn, other)` → real `implIsExportedOrOpen` →
+`descriptor.isOpen()` **NPE** because CratonVM's `Module` mirrors carry a name
+but no `ModuleDescriptor`. This is pre-existing and **flaky** (it also crashes
+`GroovySystem.<clinit>` and JUnit `@BeforeAll`, which is why the test oscillates
+4/11 ↔ 0/11). A blanket-permissive native (`isExported`/`isOpen` → true via the
+empty module registry, force-listed) **removes the NPE** and makes layer g1's
+SAM path fully work — BUT it then **regresses ByteBuddy**: `JavaDispatcher` queries
+`java.base.isExported("jdk.internal.…")`, expects the real-JDK answer (`false`,
+so it uses a fallback strategy), and our always-`true` makes it attempt direct
+access that fails (layer g3). The correct fix needs **accurate per-module export
+modeling** (java.base exports `java.lang`/`java.util`/… but NOT `jdk.internal.*`/
+`sun.*`), not blanket-true. NOTE the existing `isExported`/`isOpen` natives
+(`phases_late::register_p59_module`) are registered ONLY via
+`register_synthetic_overrides` — a no-op in the default real-JDK build — so they
+must ALSO be added to `register_essential_natives` once a correct policy exists.
+The blanket-permissive attempt was reverted; only g1 (`foldArguments`) landed.
 
 ## Layer g — SAM proxy `execute()` → NoSuchMethodError
 With 3f, Groovy's `TypeTransformers.createSAMTransform` now runs and wraps the
