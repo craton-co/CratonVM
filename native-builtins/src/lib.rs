@@ -13767,7 +13767,7 @@ fn getclass_backing_is_random_access(ctx: &mut dyn NativeContext, this: ObjectRe
 /// Resolve the concrete display `ClassId` for an object stamped with `class_id`,
 /// or `None` to use the stamp unchanged. The stamp→strategy classification is
 /// memoised; the size-dependent collection forms are resolved per-object.
-fn getclass_display_class_id(
+pub(crate) fn getclass_display_class_id(
     ctx: &mut dyn NativeContext,
     class_id: cratonvm_types::ClassId,
     this: ObjectRef,
