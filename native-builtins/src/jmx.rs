@@ -903,6 +903,40 @@ pub fn register_operating_system_impl(r: &mut NativeMethodRegistry) {
 
     // initialize0()V — sets up native counters; nothing to do here.
     r.register(cls, "initialize0", "()V", |_ctx, _args| Ok(None));
+
+    // JDK 9+ moved the platform OS-bean implementation to
+    // `com.sun.management.internal.OperatingSystemImpl` (the old
+    // `sun.management.OperatingSystemImpl` triples above are kept for any
+    // legacy caller). JDK 25 also renamed several natives:
+    //   getFreePhysicalMemorySize0  -> getFreeMemorySize0
+    //   getTotalPhysicalMemorySize0 -> getTotalMemorySize0
+    //   getSystemCpuLoad0           -> getCpuLoad0
+    // `<clinit>` calls the static `initialize0()`; without it the class
+    // fails to initialize with UnsatisfiedLinkError, which aborts any
+    // `ManagementFactory.getPlatformMBeanServer()` caller. Apache Derby's
+    // embedded boot does exactly that (JMXManagementService.boot ->
+    // getOperatingSystemMXBean -> OperatingSystemImpl.<clinit>), so the
+    // missing native left the whole database service unbooted and the
+    // embedded driver unregistered. Same "metric unavailable" -1 / -1.0
+    // sentinels as the legacy class.
+    let mcls = "com/sun/management/internal/OperatingSystemImpl";
+    for name in [
+        "getCommittedVirtualMemorySize0",
+        "getTotalSwapSpaceSize0",
+        "getFreeSwapSpaceSize0",
+        "getProcessCpuTime0",
+        "getFreeMemorySize0",
+        "getTotalMemorySize0",
+        "getOpenFileDescriptorCount0",
+        "getMaxFileDescriptorCount0",
+    ] {
+        r.register(mcls, name, "()J", neg_one_long);
+    }
+    for name in ["getCpuLoad0", "getProcessCpuLoad0"] {
+        r.register(mcls, name, "()D", neg_one_double);
+    }
+    r.register(mcls, "initialize0", "()V", |_ctx, _args| Ok(None));
+
     r.set_category(__prev_cat);
 }
 

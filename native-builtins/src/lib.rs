@@ -4037,31 +4037,138 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         },
     );
 
-    // `java.lang.Module` access checks — permissive overrides.
+    // `java.lang.Module` access checks — registry-backed exports/opens modeling.
     //
     // `getModule()` above returns named Module mirrors (so `getName()`/identity
-    // match the real JDK) but does NOT populate the Java-side `descriptor` field.
-    // Real `Module.isExported`/`isOpen` bytecode dereferences `descriptor` and
-    // NPEs (e.g. Hibernate's `JdbcTypeNameMapper.<clinit>` reflecting over
-    // `java.sql.Types`), and even with a synthetic descriptor the JDK's
-    // `descriptor.packages().contains(pkg)` check would deny access because we do
-    // not enumerate a module's packages. CratonVM has no real module-path
-    // encapsulation — every class is effectively on the class path, where the
-    // JDK performs no inter-module access checks — so these reflective access
-    // probes must all succeed. Return `true` for any non-null receiver. This
-    // matches the synthetic-jdk `register_p59_module` overrides for real-JDK mode
-    // and is the access analogue of the always-true `Module.canRead`/`canUse`
-    // natives already registered.
-    let module_access_permissive: cratonvm_native_api::NativeCallback =
-        |_ctx, args| Ok(Some(Value::Int(matches!(args.first(), Some(Value::Object(Some(_)))) as i32)));
-    for (method, descr) in [
-        ("isExported", "(Ljava/lang/String;)Z"),
-        ("isExported", "(Ljava/lang/String;Ljava/lang/Module;)Z"),
-        ("isOpen", "(Ljava/lang/String;)Z"),
-        ("isOpen", "(Ljava/lang/String;Ljava/lang/Module;)Z"),
-    ] {
-        registry.register("java/lang/Module", method, descr, module_access_permissive);
+    // match the real JDK) but does NOT populate the Java-side `descriptor` field,
+    // so the real `Module.isExported`/`isOpen` bytecode dereferences a null
+    // `descriptor` and NPEs in every reflective access check (Groovy
+    // `CachedClass.getMethods` → `ReflectionUtils.checkCanSetAccessible` →
+    // `Java9.checkAccessible` → `Module.implIsExportedOrOpen`, and Hibernate's
+    // `JdbcTypeNameMapper.<clinit>` reflecting over `java.sql.Types`). These
+    // natives are force-listed over the real bytecode (see
+    // `force_native_over_real_jdk_bytecode`) so the NPE never fires.
+    //
+    // Crucially they answer from the boot `ModuleRegistry`, which carries the
+    // accurate per-module exports/opens parsed from each module-info (java.base
+    // exports `java.lang`/`java.util`/… to all but NOT `jdk.internal.*`/`sun.*`;
+    // application-classpath jars register as automatic modules that export every
+    // package). A blanket-`true` answer also removes the NPE but regresses
+    // ByteBuddy's `JavaDispatcher`, which queries
+    // `java.base.isExported("jdk.internal.…")` and needs the real-JDK `false` to
+    // select its fallback strategy. The receiver's module name lives at synthetic
+    // slot 0 (dual-written by `getModule()` above); an unnamed module (null name →
+    // empty string) exports and opens everything, matching the JDK's
+    // `if (!isNamed()) return true;` short-circuit. The Java API uses dot-format
+    // package names; the registry is keyed on slash-format.
+    fn module_name_of_mirror(ctx: &dyn NativeContext, m: ObjectRef) -> String {
+        match ctx.get_field(m, 0) {
+            Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+            _ => String::new(), // unnamed module
+        }
     }
+    fn module_pkg_arg(ctx: &dyn NativeContext, args: &[Value]) -> Option<String> {
+        match args.get(1) {
+            Some(Value::Object(Some(s))) => Some(ctx.read_string(*s).unwrap_or_default().replace('.', "/")),
+            _ => None,
+        }
+    }
+    // Module.isExported(String) — exported unqualified (to EVERYONE).
+    registry.register(
+        "java/lang/Module",
+        "isExported",
+        "(Ljava/lang/String;)Z",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let module_name = module_name_of_mirror(ctx, this);
+            let Some(pkg) = module_pkg_arg(ctx, args) else {
+                return Ok(Some(Value::Int(0)));
+            };
+            let ok = ctx.is_package_exported_unqualified(&module_name, &pkg);
+            Ok(Some(Value::Int(ok as i32)))
+        },
+    );
+    // Module.isExported(String, Module) — exported to the given module.
+    registry.register(
+        "java/lang/Module",
+        "isExported",
+        "(Ljava/lang/String;Ljava/lang/Module;)Z",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let module_name = module_name_of_mirror(ctx, this);
+            let Some(pkg) = module_pkg_arg(ctx, args) else {
+                return Ok(Some(Value::Int(0)));
+            };
+            let to_module = match args.get(2) {
+                Some(Value::Object(Some(o))) => module_name_of_mirror(ctx, *o),
+                _ => String::new(),
+            };
+            let ok = ctx.is_package_exported_to(&module_name, &pkg, &to_module);
+            Ok(Some(Value::Int(ok as i32)))
+        },
+    );
+    // Module.isOpen(String) — opened unqualified (to EVERYONE).
+    registry.register(
+        "java/lang/Module",
+        "isOpen",
+        "(Ljava/lang/String;)Z",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let module_name = module_name_of_mirror(ctx, this);
+            let Some(pkg) = module_pkg_arg(ctx, args) else {
+                return Ok(Some(Value::Int(0)));
+            };
+            let ok = ctx.is_package_open_unqualified(&module_name, &pkg);
+            Ok(Some(Value::Int(ok as i32)))
+        },
+    );
+    // Module.isOpen(String, Module) — opened to the given module.
+    registry.register(
+        "java/lang/Module",
+        "isOpen",
+        "(Ljava/lang/String;Ljava/lang/Module;)Z",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let module_name = module_name_of_mirror(ctx, this);
+            let Some(pkg) = module_pkg_arg(ctx, args) else {
+                return Ok(Some(Value::Int(0)));
+            };
+            let to_module = match args.get(2) {
+                Some(Value::Object(Some(o))) => module_name_of_mirror(ctx, *o),
+                _ => String::new(),
+            };
+            let ok = ctx.is_package_open_to(&module_name, &pkg, &to_module);
+            Ok(Some(Value::Int(ok as i32)))
+        },
+    );
+    // `static native void addReads0(Module from, Module to)` — the VM-sync hook
+    // behind `Module.implAddReads` (reached via `Instrumentation.redefineModule`).
+    // Pure native (no JDK bytecode), so it MUST be registered or the call NSME/
+    // UnsatisfiedLinkErrors. Mockito's inline mock maker drives it from
+    // `InlineBytecodeGenerator.assureCanReadMockito`: it makes `java.base` read
+    // the (unnamed) Mockito module so the redefined bootstrap classes can see the
+    // injected `MockMethodDispatcher`. Java-side `implAddReads` already updates
+    // the heap `reads` set; here we mirror the edge into the boot `ModuleRegistry`
+    // so a later registry-backed `canRead` agrees. `from`/`to` may be the unnamed
+    // module (null name → empty string), which `module_add_reads` accepts. Without
+    // this the whole inline-mock path aborts before `retransformClasses` even runs.
+    registry.register(
+        "java/lang/Module",
+        "addReads0",
+        "(Ljava/lang/Module;Ljava/lang/Module;)V",
+        |ctx, args| {
+            let from = match args.first() {
+                Some(Value::Object(Some(m))) => module_name_of_mirror(ctx, *m),
+                _ => String::new(),
+            };
+            let to = match args.get(1) {
+                Some(Value::Object(Some(m))) => module_name_of_mirror(ctx, *m),
+                _ => String::new(),
+            };
+            ctx.module_add_reads(&from, &to);
+            Ok(None)
+        },
+    );
 
     registry.register(
         "java/lang/Class",
@@ -33649,6 +33756,42 @@ pub(crate) fn uri_store_named(ctx: &mut dyn NativeContext, this: ObjectRef, full
     }
 }
 
+/// Returns the byte index of the first character that `java.net.URI`'s
+/// single-string parser would reject as illegal, or `None` if every character
+/// is permitted. Mirrors the JDK parser's legal-character set for US-ASCII:
+/// unreserved (`alphanum` + `-_.!~*'()`) + reserved (`;/?:@&=+$,[]`) + the
+/// escape/fragment delimiters `%` and `#`. ASCII control characters (`<0x20`,
+/// `0x7F`) are always illegal. Non-ASCII (`>=0x80`) is deliberately left
+/// permitted here so we do not over-reject inputs that currently parse — the
+/// goal is to match HotSpot on the clearly-malformed ASCII cases (spaces,
+/// `{}<>"\^|`), not to police every Unicode edge.
+fn uri_first_illegal_index(s: &str) -> Option<usize> {
+    for (i, c) in s.char_indices() {
+        let u = c as u32;
+        if u < 0x20 || u == 0x7f {
+            return Some(i);
+        }
+        if u >= 0x80 {
+            continue;
+        }
+        let ok = c.is_ascii_alphanumeric()
+            || matches!(
+                c,
+                // unreserved marks
+                '-' | '_' | '.' | '!' | '~' | '*' | '\'' | '(' | ')'
+                // reserved (RFC 2396 + RFC 2732 host brackets)
+                | ';' | '/' | '?' | ':' | '@' | '&' | '=' | '+' | '$' | ','
+                | '[' | ']'
+                // escape + fragment delimiter
+                | '%' | '#'
+            );
+        if !ok {
+            return Some(i);
+        }
+    }
+    None
+}
+
 fn native_uri_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
@@ -33658,13 +33801,32 @@ fn native_uri_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         Some(Value::Object(Some(o))) => ctx.read_string(*o).unwrap_or_default(),
         _ => String::new(),
     };
-    // Reject ASCII control characters (e.g. a raw newline/tab) like java.net.URI
-    // does — `new URI(String)` must throw URISyntaxException for them. Our parser
-    // was lenient and accepted them, so a malformed redirect URI such as
-    // "https://keycloak.org\n" was treated as valid (keycloak
-    // SecureRedirectUrisEnforcerExecutorTest.failUriSyntax). Scoped to control
-    // chars (<0x20 / 0x7F) to avoid rejecting otherwise-accepted inputs.
-    if let Some(pos) = url_str.find(|c: char| (c as u32) < 0x20 || (c as u32) == 0x7f) {
+    // Reject illegal characters like java.net.URI's single-string parser does —
+    // `new URI(String)` must throw URISyntaxException for them. Our parser was
+    // lenient and accepted anything, so malformed input slipped through:
+    //   * control chars: "https://keycloak.org\n" treated as valid (keycloak
+    //     SecureRedirectUrisEnforcerExecutorTest.failUriSyntax);
+    //   * spaces / delimiters: "not a valid uri :{}" treated as valid, so
+    //     HttpHeaderSecurityFilter.setAntiClickJackingUri never threw and
+    //     TestHttpHeaderSecurityFilter.testAntiClickJackingInvalidUri saw no
+    //     ServletException.
+    // `uri_first_illegal_index` mirrors the JDK's legal-character set for ASCII
+    // (unreserved + reserved + `%`/`#`); non-ASCII is left to the lenient path
+    // to avoid over-rejecting inputs the gauntlet relies on. Control chars stay
+    // rejected unconditionally even with the opt-out gate (preserves the
+    // keycloak fix); the broader ASCII check is gated default-ON so it can be
+    // disabled (CRATONVM_URI_STRICT_CHARS=0) if a regression surfaces.
+    let strict_uri_chars =
+        std::env::var("CRATONVM_URI_STRICT_CHARS").map(|v| v != "0").unwrap_or(true);
+    let illegal = if strict_uri_chars {
+        uri_first_illegal_index(&url_str)
+    } else {
+        url_str
+            .char_indices()
+            .find(|(_, c)| (*c as u32) < 0x20 || (*c as u32) == 0x7f)
+            .map(|(i, _)| i)
+    };
+    if let Some(pos) = illegal {
         let input = ctx.create_string(&url_str);
         let reason = ctx.create_string("Illegal character in URI");
         if let Ok(Some(Value::Object(Some(exc)))) = ctx.new_object_initialized(

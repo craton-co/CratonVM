@@ -554,6 +554,41 @@ fn is_synthesized_locale_base(name: &str) -> bool {
     name.starts_with("sun.text.resources.") || name.starts_with("sun.util.resources.")
 }
 
+/// `true` for the `sun.util.resources.*` bundle family whose *caller* in
+/// `sun.util.resources.LocaleData` immediately `checkcast`s the result to a
+/// concrete JDK bundle type — so a bare synthetic `java/util/ResourceBundle`
+/// is rejected with a `ClassCastException`. From `javap -c LocaleData`,
+/// `getTimeZoneNames` does `checkcast sun/util/resources/TimeZoneNamesBundle`.
+///
+/// `TimeZoneNamesBundle` is abstract, but the jimage ships concrete leaf data
+/// classes (`sun.util.resources.cldr.TimeZoneNames`/`_en`, plus the non-CLDR
+/// `sun.util.resources.TimeZoneNames` root) that subclass it. So this base name
+/// MUST take the real class-based bundle path (`try_class_bundle`) — which
+/// instantiates the concrete leaf class — rather than the curated synthetic
+/// `build_bundle` that returns a raw `java/util/ResourceBundle`. The root data
+/// class always exists, so the cast always finds a real instance. Surfaced by
+/// Tomcat `TestExpiresFilter`, whose HTTP `Expires`/`Date` header formatting
+/// resolves time-zone display names via `TimeZoneNameUtility` →
+/// `LocaleData.getTimeZoneNames`.
+///
+/// `getCurrencyNames` / `getLocaleNames` `checkcast` to
+/// `sun/util/resources/OpenListResourceBundle` and share the same latent
+/// pattern, but are deliberately LEFT on the curated `build_bundle` path: the
+/// real CLDR display names for those live in the `sun.util.resources.cldr.ext.*`
+/// package that the simple locale-candidate chain below does not reach, so
+/// routing them to `try_class_bundle` would hand back a partial bundle without
+/// changing their (already code-only) display-name output — and nothing in the
+/// failing test exercises their cast. Restricting to `TimeZoneNames` keeps this
+/// fix's blast radius to the one bundle the reported bug needs.
+///
+/// `FormatData` / `CalendarData` are likewise NOT included: their `LocaleData`
+/// accessors return a plain `ResourceBundle` (no `checkcast`), and
+/// `DateFormatSymbols`/`DecimalFormatSymbols` consume them through the curated
+/// English/US map populated by `build_bundle`.
+fn needs_concrete_bundle_class(name: &str) -> bool {
+    name.ends_with(".TimeZoneNames")
+}
+
 /// Real-JDK "java.class" bundle format: the bundle is a compiled
 /// `ListResourceBundle` subclass rather than a `.properties` file. The JDK
 /// ships javac/launcher diagnostics (and some app resources) this way — e.g.
@@ -713,7 +748,7 @@ fn rb_get_bundle(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     // javac/launcher messages — and some apps ship resources — as compiled
     // bundle classes, e.g. `com.sun.tools.javac.resources.compiler`). Skip the
     // hand-synthesized locale-data families, which stay on their curated path.
-    if !is_synthesized_locale_base(&bundle_name) {
+    if !is_synthesized_locale_base(&bundle_name) || needs_concrete_bundle_class(&bundle_name) {
         if let Some(real) = try_class_bundle(ctx, &chain) {
             return Ok(Some(Value::Object(Some(real))));
         }
@@ -737,6 +772,61 @@ fn rb_get_bundle(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     ))
 }
 
+/// Re-apply `sun.util.resources.TimeZoneNamesBundle.handleGetObject`'s
+/// transform when we resolve a value out of a real bundle's `getContents()`
+/// directly. That override does NOT return the raw `getContents()` value: when
+/// the value is a `String[]`, it returns a NEW `String[]` of length+1 with the
+/// lookup key (the zone id) copied into slot 0 and the original entries shifted
+/// to slots 1..n (see `javap -c TimeZoneNamesBundle`). The JDK's
+/// `TimeZoneNameUtility.getZoneStrings` depends on this layout — each row is
+/// `[id, longStd, shortStd, longDst, shortDst, longGen, shortGen]` (7 columns).
+/// Reading `getContents()` ourselves bypassed the override and produced a
+/// 6-column row (zone id dropped), so `SimpleDateFormat`'s `z` field could not
+/// find/format the GMT zone and fell back to "UTC" — corrupting every Tomcat
+/// `Date`/`Expires`/`Last-Modified` HTTP header (surfaced by `TestExpiresFilter`,
+/// whose `validate` parses the `Expires` header back with `FastHttpDateFormat`).
+/// Only `String[]` values are transformed; single-`String` entries (e.g. the
+/// `timezone.excity.*` keys) pass through unchanged, exactly like the JDK's
+/// `instanceof String[]` guard.
+fn maybe_prepend_tz_zone_id(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    key: ObjectRef,
+    val: Value,
+) -> Value {
+    let arr = match val {
+        Value::Object(Some(a)) => a,
+        _ => return val,
+    };
+    // Only TimeZoneNamesBundle subclasses get the id-prepend.
+    let is_tz = match ctx.class_id_by_name("sun/util/resources/TimeZoneNamesBundle") {
+        Some(tz) => ctx.is_subclass(ctx.class_id_of_object(this), tz),
+        None => false,
+    };
+    if !is_tz {
+        return val;
+    }
+    // ...and only when the value is a reference array (a `String[]`, mirroring
+    // the JDK's `instanceof String[]` guard). NOTE: `class_name_of_id` on an
+    // array object here reports the *element* class (e.g. "java/lang/String"),
+    // not the JVM array descriptor, so detect array-ness via `heap_kind_of`
+    // rather than the class name. The `timezone.excity.*` keys carry a single
+    // `String` value (kind == Object) and correctly fall through unchanged.
+    if ctx.heap_kind_of(arr) != cratonvm_types::ObjectKind::Array
+        || ctx.heap_element_type_of(arr) != cratonvm_types::ArrayElementType::Reference
+    {
+        return val;
+    }
+    let len = ctx.array_length(arr);
+    let new_arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, len + 1);
+    ctx.set_array_element(new_arr, 0, Value::Object(Some(key)));
+    for i in 0..len {
+        let e = ctx.get_array_element(arr, i);
+        ctx.set_array_element(new_arr, i + 1, e);
+    }
+    Value::Object(Some(new_arr))
+}
+
 fn rb_get_object(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
@@ -746,7 +836,6 @@ fn rb_get_object(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
         Some(Value::Object(Some(k))) => *k,
         _ => return Ok(Some(Value::Object(None))),
     };
-
     // CratonVM's synthetic bundles (built by the `getBundle` native) are raw
     // `java/util/ResourceBundle` instances whose field 0 holds the backing map.
     // A *real* ResourceBundle subclass instantiated from bytecode (e.g. a user
@@ -790,7 +879,8 @@ fn rb_get_object(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
                             _ => None,
                         };
                         if rk.is_some() && rk == key_str {
-                            return Ok(Some(ctx.get_array_element(row, 1)));
+                            let val = ctx.get_array_element(row, 1);
+                            return Ok(Some(maybe_prepend_tz_zone_id(ctx, this, key, val)));
                         }
                     }
                 }
@@ -850,7 +940,8 @@ fn rb_contains_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     };
     // Real PropertyResourceBundle: keys live in the `lookup` Map, not field 0.
     let this_cid = ctx.class_id_of_object(this);
-    if ctx.class_name_of_id(this_cid).as_deref() == Some("java/util/PropertyResourceBundle") {
+    let this_cname = ctx.class_name_of_id(this_cid);
+    if this_cname.as_deref() == Some("java/util/PropertyResourceBundle") {
         return match ctx.get_field_by_name(this, "lookup") {
             Value::Object(Some(lookup)) => {
                 cratonvm_native_collections::native_map_contains_key_pub(
@@ -860,6 +951,48 @@ fn rb_contains_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
             }
             _ => Ok(Some(Value::Int(0))),
         };
+    }
+    // Real ListResourceBundle / OpenListResourceBundle subclass (e.g. the CLDR
+    // `TimeZoneNamesBundle` the JDK loads through our `getBundle` override):
+    // its keys come from the overridden `getContents()`, NOT a field-0 map —
+    // field 0 on a real bundle is the inherited `parent` slot, so the map
+    // shortcut below would test the wrong object and answer `false`. The JDK's
+    // `LocaleResources.getTimeZoneNames` gates its zone-name lookup on
+    // `tzb.containsKey(key)`; a wrong `false` there sends it down the metazone
+    // fallback and yields "UTC" instead of "GMT" for the GMT zone (breaking
+    // every Tomcat `Date`/`Expires`/`Last-Modified` HTTP header, which formats
+    // with a `z` field and the GMT TimeZone). Resolve real subclasses through
+    // `getContents()` + the parent chain, mirroring `rb_get_object`.
+    let is_synthetic = this_cname.as_deref() == Some("java/util/ResourceBundle");
+    if !is_synthetic {
+        let key_str = ctx.read_string(key);
+        if let Ok(Some(Value::Object(Some(contents)))) =
+            ctx.invoke_virtual(this, "getContents", "()[[Ljava/lang/Object;", &[])
+        {
+            let rows = ctx.array_length(contents);
+            for i in 0..rows {
+                if let Value::Object(Some(row)) = ctx.get_array_element(contents, i) {
+                    if ctx.array_length(row) >= 1 {
+                        let rk = match ctx.get_array_element(row, 0) {
+                            Value::Object(Some(k)) => ctx.read_string(k),
+                            _ => None,
+                        };
+                        if rk.is_some() && rk == key_str {
+                            return Ok(Some(Value::Int(1)));
+                        }
+                    }
+                }
+            }
+            // Key absent here: walk the parent chain (a locale variant inherits
+            // keys present only in a less-specific parent bundle).
+            if let Value::Object(Some(parent)) = ctx.get_field_by_name(this, "parent") {
+                return rb_contains_key(
+                    ctx,
+                    &[Value::Object(Some(parent)), Value::Object(Some(key))],
+                );
+            }
+            return Ok(Some(Value::Int(0)));
+        }
     }
     let map = match ctx.get_field(this, 0) {
         Value::Object(Some(m)) => m,

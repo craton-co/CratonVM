@@ -337,6 +337,31 @@ Also fixed on dev this run (no standalone doc — see commit): `Locale.toLanguag
 
 - **Hibernate wrong-result assertion failures** — cluster of CV-only wrong-result assertion FAILs (UniqueConstraintBatching 1-vs-0, DetachedBag true-vs-false, EntityGraphBatchSize, immutable+converter deser, …); each likely a separate root cause. 🔴 open (handoff; standalone doc not preserved).
 
+## Hibernate suite residuals (2026-06-24)
+
+Triaged while fixing the collection-delegation native stack overflow (`7b224d8a`:
+`try_delegate_real_collection` self-recursion → `EXCEPTION_STACK_OVERFLOW` building a
+`SessionFactory`). Once that crash was fixed, three pre-existing CratonVM-only
+residuals surfaced (all fail identically at baseline `b0aab8f9`, so none is from the
+regression):
+
+- [hib-proxyclassreuse-loader-blind-class-resolution.md](hib-proxyclassreuse-loader-blind-class-resolution.md) —
+  🔴 **OPEN.** `ProxyClassReuseTest.testNoReuse`: `CONSTANT_Class` resolution is loader-blind
+  (a class constant inside custom-loader bytecode resolves through the flat global/app store, not
+  the holder's defining loader), so an isolated loader's `MyEntity` collapses to the app namespace
+  and its ByteBuddy proxy collides. loadClass-override isolation itself works; this is deeper
+  (core class-store change, broad blast radius). Min repro `.scratch-hhsf/IsoProbe3.java`. Same
+  family as **SBR-14** / `SC-custom-classloader`.
+- [hib-sortnatural-persistentsortedset-cascade-drop.md](hib-sortnatural-persistentsortedset-cascade-drop.md) —
+  🔴 **OPEN.** `SortNaturalTest` (`sorted.set`/`sorted.map`): a cascaded `@OneToMany SortedSet`
+  drops an element on **persist** (only 1 of 2 rows inserted; `size()` 2→1). Core `TreeSet` verified
+  correct on every access path; the loss is in the Hibernate `PersistentSortedSet` cascade
+  interaction. Part of the HIB-CV-35 cvonly long-tail.
+- [hib-nodepth-shrinkwrap-par-archive-url.md](hib-nodepth-shrinkwrap-par-archive-url.md) —
+  🔴 **OPEN** (niche). `NoDepthTests` JPA variants: ShrinkWrap in-memory `.par` archive +
+  `ShrinkWrapClassLoader` need a custom `URLStreamHandler` ("Could not create URL for archive");
+  the 2 non-JPA variants pass.
+
 ## Test-suite repair findings (2026-06-21)
 
 While repairing the in-repo test suites (most failures were stale tests / missing

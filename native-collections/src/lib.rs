@@ -1566,18 +1566,70 @@ fn is_synthetic_backed_collection(ctx: &mut dyn NativeContext, obj: ObjectRef) -
 /// recursion back into this native. Returns `None` (caller keeps its sentinel)
 /// for CratonVM's synthetic collections and for non-collection receivers
 /// (reflection / lambda-metafactory funnels a `Charset`, `String`, … here).
+thread_local! {
+    /// Re-entrancy guard for [`try_delegate_real_collection`]. Holds the
+    /// `(object pointer, method name)` pairs whose real-collection delegation is
+    /// currently in flight on this thread.
+    static DELEGATE_GUARD: std::cell::RefCell<Vec<(usize, &'static str)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Delegate a `Collection`/`Map` method on a *real* (non-synthetic-backed)
+/// receiver to its actual class implementation via `invokespecial`.
+///
+/// Re-entrancy guard (HIB native stack-overflow fix): `invoke_special` below
+/// resolves `cls.method`, and for a class whose `method` is itself registered to
+/// the SAME native shim that called us (e.g. a real `java.util.Map` instance with
+/// no CratonVM native bucket state, whose `isEmpty`/`size` is force-native), the
+/// dispatch lands straight back in that shim → it re-delegates → unbounded native
+/// recursion. No Java frame is pushed on this path, so the interpreter's
+/// stack-depth guard never fires and the process dies with a native
+/// `EXCEPTION_STACK_OVERFLOW` (observed building a Hibernate `SessionFactory`).
+/// We detect the self-re-entry on the same `(object, method)` and decline to
+/// delegate, letting the caller fall back to its native best-effort result
+/// instead of looping. The guard keys on the raw pointer, which is stable here
+/// because the looping path resolves to the native shim *without* running any
+/// bytecode (hence no allocation / GC move between levels).
 fn try_delegate_real_collection(
     ctx: &mut dyn NativeContext,
     this: ObjectRef,
     iface: &str,
-    method: &str,
+    method: &'static str,
     descriptor: &str,
 ) -> Option<MethodCallResult> {
     if !obj_is_instance_of(ctx, this, iface) || is_synthetic_backed_collection(ctx, this) {
         return None;
     }
-    let cls = ctx.class_name_of_id(ctx.class_id_of_object(this))?;
-    Some(ctx.invoke_special(&cls, method, descriptor, &[Value::Object(Some(this))]))
+    let key = (this.as_ptr() as usize, method);
+    let reentered = DELEGATE_GUARD.with(|g| {
+        let mut g = g.borrow_mut();
+        if g.contains(&key) {
+            true
+        } else {
+            g.push(key);
+            false
+        }
+    });
+    if reentered {
+        // Self-delegation loop: the resolved `cls.method` is the same native
+        // shim. Decline so the caller returns its native fallback rather than
+        // recursing into a stack overflow.
+        return None;
+    }
+    let cls = match ctx.class_name_of_id(ctx.class_id_of_object(this)) {
+        Some(c) => c,
+        None => {
+            DELEGATE_GUARD.with(|g| {
+                g.borrow_mut().retain(|k| *k != key);
+            });
+            return None;
+        }
+    };
+    let r = ctx.invoke_special(&cls, method, descriptor, &[Value::Object(Some(this))]);
+    DELEGATE_GUARD.with(|g| {
+        g.borrow_mut().retain(|k| *k != key);
+    });
+    Some(r)
 }
 
 pub fn native_al_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {

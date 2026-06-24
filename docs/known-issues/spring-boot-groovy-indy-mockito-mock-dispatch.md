@@ -8,7 +8,8 @@ metadata:
 
 # SpringRepos tail — Groovy closure→SAM proxy dispatch + Mockito-mock SAM coercion
 
-**Status:** 🟡 PARTIAL — `4/11` and climbing.
+**Status:** 🟡 PARTIAL — Groovy/indy + Module layers (1–3f, g1, **g2**) all FIXED;
+remaining blocker is Mockito **inline-mock** class redefinition (layer h).
 `org.springframework.boot.build.groovyscripts.SpringRepositoriesExtensionTests`
 (Spring Boot buildSrc). The earlier layers are all FIXED; see
 [[spring-boot-groovy-indy-runtime-argcount-3c-FIXED]],
@@ -26,8 +27,8 @@ metadata:
 | 3e | Groovy truth: `cast:(Object)Z` not routed through `asBoolean` → falsy non-null read as true | ✅ FIXED (`cd4bfb27`, route to `DefaultTypeTransformation.castToBoolean`) |
 | 3f | `MethodHandles.filterArguments` was a passthrough → closure→SAM coercion never ran | ✅ FIXED (`1b1f8cde`, real `MH_KIND_FILTER`) |
 | g1 | `MethodHandles.foldArguments` was a passthrough → `TypeTransformers.TO_REFLECTIVE_PROXY` malformed → SAM proxy built with **no interfaces** (`execute()` → `NoSuchMethodError`) | ✅ FIXED (real `MH_KIND_FOLD`; SAM proxy now has `[Action]`, `execute` dispatches to the closure — verified by `SamRealProbe`) |
-| g2 | Named `Module` (e.g. `java.base`) has a null `descriptor` → real `implIsExportedOrOpen` NPEs in every reflective access check (Groovy `CachedClass.getMethods`, `GroovySystem.<clinit>`, JUnit `@BeforeAll`) | 🔴 OPEN (see below — flaky; a blanket-permissive `isExported` fixes the NPE but **regresses ByteBuddy**) |
-| g3 | ByteBuddy `JavaDispatcher.<clinit>` → `IllegalStateException: Failed to create invoker` (reached once g2's NPE is bypassed) | 🔴 OPEN |
+| g2 | Named `Module` (e.g. `java.base`) has a null `descriptor` → real `implIsExportedOrOpen` NPEs in every reflective access check (Groovy `CachedClass.getMethods`, `GroovySystem.<clinit>`, JUnit `@BeforeAll`) | ✅ FIXED — `Module.isExported/isOpen` natives (still force-listed) now answer from the boot `ModuleRegistry`'s **accurate** per-module exports/opens instead of blanket-`true`; the null descriptor is never touched. `java.base.isExported("java.lang")==true` (Groovy works) and `isExported("jdk.internal.misc")==false` (ByteBuddy's `JavaDispatcher` gets the real-JDK answer, so it does NOT regress). Byte-identical to HotSpot (`ModProbe`). Also: `is_package_{exported,open}_unqualified` now honor automatic modules. **Replaces the reverted blanket-permissive attempt.** |
+| g3 | ByteBuddy `JavaDispatcher.<clinit>` → `IllegalStateException: Failed to create invoker` (reached once g2's NPE is bypassed) | 🟡 should be unblocked by the accurate g2 fix (JavaDispatcher now sees `jdk.internal.*` as not-exported and takes its fallback); not separately re-verified — SpringRepos now fails further along at the Mockito **inline-mock** wall (layer h) |
 | **h** | **closure→Action coercion on a Mockito mock drives no interaction** | 🔴 OPEN |
 
 Net: `0/11` (all crashed) → **`4/11`** clean *(flaky: the g2 Module NPE in
@@ -35,6 +36,40 @@ Net: `0/11` (all crashed) → **`4/11`** clean *(flaky: the g2 Module NPE in
 empty/false-condition cases; the 7 failing all need `maven.mavenContent { }` /
 `maven.content { }` / `maven.credentials { }` (closures coerced to a Gradle
 `Action`) to drive their Mockito stubs.
+
+**Update 2026-06-24:** with the g2 descriptor NPE fixed AND the boot module
+registry populated (`2ec37261`), the test now reaches `createExtension`
+(`Mockito.mock(RepositoryHandler)`) on *every* case and fails there at the
+**Mockito inline-mock** wall — not the Groovy NPE. Mockito's
+`InlineBytecodeGenerator.assureCanReadMockito` finds `java.base` does not read
+the unnamed module, tries `InstrumentationImpl.redefineModule` →
+`UnsatisfiedLinkError: java/lang/Module.addReads0`, then `TypeCache.findOrInsert`
+→ `MockitoException: Could not modify all classes […RepositoryHandler…]`. This is
+class **retransformation/redefinition** support (instrumentation), independent of
+the SAM/indy work — the real remaining blocker for this test. (A force-listed
+permissive `Module.canRead` would skip the `addReads0` path but inline mock
+generation still needs class redefine, so it would not by itself make the test
+pass.) The descriptor-NPE regression that this fix targets is resolved:
+`ArtifactReleaseTests` CRASH→**`8/8`**, `DocumentAutoConfigurationClassesTests`
+`0/2`→**`2/2`** (both fully green after the two fixes below).
+
+**Update 2026-06-24 (residual MethodHandle unboxing bug — FIXED):** the
+`ArtifactReleaseTests`/`DocumentAutoConfigurationClassesTests` residual was NOT a
+`ProjectBuilder` NPE but a `MethodHandle` defect. Gradle's
+`DefaultLegacyTypesSupport.injectEmptyInterfacesIntoClassLoader` ASM-generates
+each empty interface (~91 bytes) and defines it through
+`ClassLoaderUtils$LookupClassDefiner`, which does
+`findVirtual(ClassLoader,"defineClass",(String,byte[],int,int)Class).bindTo(cl)
+.invokeWithArguments(new Object[]{name, bytes, 0, bytes.length})`. CratonVM's
+`mh_dispatch` virtual/bound arm (`lang_invoke.rs`) called `invoke_virtual`
+WITHOUT unboxing the boxed `Integer` args (the `MH_KIND_STATIC` arm already did,
+via `adapt_invoke_args`), so both `int` params read **0** → `defineClass1` saw a
+0-length array → "class file too short (0 bytes)" → "Could not inject synthetic
+classes". Fix: apply `adapt_invoke_args` in the virtual/bound arm too (idempotent
+for the direct invoke/invokeExact path). Isolated probe
+(`bindTo(...).invokeWithArguments` with boxed ints) now byte-matches HotSpot
+(`8001`), 23 invoke unit tests pass. This is broad — any bound virtual `MH`
+invoked with primitive args via `invokeWithArguments`/`Object[]` was affected.
 
 ## Layer g1 — `foldArguments` passthrough (FIXED)
 Groovy's `TypeTransformers.TO_REFLECTIVE_PROXY` =
