@@ -5086,15 +5086,27 @@ pub(crate) fn mh_dispatch(
             mh_dispatch(ctx, target, &full)
         }
         _ => {
-            // Virtual: first extra_arg is receiver (unless bound)
+            // Virtual: first extra_arg is receiver (unless bound). Unbox boxed
+            // primitive args against the (receiver-less) descriptor, exactly as
+            // the MH_KIND_STATIC arm does via `adapt_invoke_args`. `invokeWithArguments`
+            // (and any `Object[]`-spreading caller) hands every primitive param a
+            // boxed wrapper; without unboxing here a `(...,int)` target reads each
+            // boxed Integer as 0. Canonical victim: Gradle's `LookupClassDefiner`
+            // does `ClassLoader.defineClass(name, bytes, 0, bytes.length)` via a
+            // bound virtual MH + `invokeWithArguments` — `len` arrived as 0, so the
+            // class was defined from 0 bytes ("Could not inject synthetic classes").
+            // `adapt_invoke_args` is a no-op for already-raw args (the direct
+            // invoke/invokeExact path), so this is safe for every caller.
             match bound {
                 Value::Object(Some(r)) => {
                     // Bound method handle — receiver was pre-captured
-                    ctx.invoke_virtual(r, &name, &desc, extra_args)
+                    let adapted = adapt_invoke_args(ctx, extra_args, &desc);
+                    ctx.invoke_virtual(r, &name, &desc, &adapted)
                 }
                 _ => match extra_args.first() {
                     Some(Value::Object(Some(receiver))) => {
-                        ctx.invoke_virtual(*receiver, &name, &desc, &extra_args[1..])
+                        let adapted = adapt_invoke_args(ctx, &extra_args[1..], &desc);
+                        ctx.invoke_virtual(*receiver, &name, &desc, &adapted)
                     }
                     _ => Ok(Some(Value::Object(None))),
                 },

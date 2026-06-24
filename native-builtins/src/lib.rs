@@ -4141,6 +4141,34 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             Ok(Some(Value::Int(ok as i32)))
         },
     );
+    // `static native void addReads0(Module from, Module to)` — the VM-sync hook
+    // behind `Module.implAddReads` (reached via `Instrumentation.redefineModule`).
+    // Pure native (no JDK bytecode), so it MUST be registered or the call NSME/
+    // UnsatisfiedLinkErrors. Mockito's inline mock maker drives it from
+    // `InlineBytecodeGenerator.assureCanReadMockito`: it makes `java.base` read
+    // the (unnamed) Mockito module so the redefined bootstrap classes can see the
+    // injected `MockMethodDispatcher`. Java-side `implAddReads` already updates
+    // the heap `reads` set; here we mirror the edge into the boot `ModuleRegistry`
+    // so a later registry-backed `canRead` agrees. `from`/`to` may be the unnamed
+    // module (null name → empty string), which `module_add_reads` accepts. Without
+    // this the whole inline-mock path aborts before `retransformClasses` even runs.
+    registry.register(
+        "java/lang/Module",
+        "addReads0",
+        "(Ljava/lang/Module;Ljava/lang/Module;)V",
+        |ctx, args| {
+            let from = match args.first() {
+                Some(Value::Object(Some(m))) => module_name_of_mirror(ctx, *m),
+                _ => String::new(),
+            };
+            let to = match args.get(1) {
+                Some(Value::Object(Some(m))) => module_name_of_mirror(ctx, *m),
+                _ => String::new(),
+            };
+            ctx.module_add_reads(&from, &to);
+            Ok(None)
+        },
+    );
 
     registry.register(
         "java/lang/Class",
