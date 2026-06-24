@@ -911,7 +911,7 @@ fn throwable_frame_lines(ctx: &mut dyn NativeContext, t: ObjectRef) -> Vec<Strin
 /// host process's stderr fd (2) so `printStackTrace` actually shows up
 /// when the JVM runs an embedded program. The record_printed_line call
 /// keeps existing tests that scan `thread.printed_lines` working.
-fn emit_stack_line(ctx: &mut dyn NativeContext, line: String) {
+fn emit_stack_line(ctx: &mut dyn NativeContext, line: String, fd: u32) {
     ctx.record_printed_line(line.clone());
     let sep = ctx
         .get_system_property("line.separator")
@@ -922,8 +922,31 @@ fn emit_stack_line(ctx: &mut dyn NativeContext, line: String) {
                 "\n".to_string()
             }
         });
-    let _ = ctx.fd_table().write_string(2, &line);
-    let _ = ctx.fd_table().write_string(2, &sep);
+    let _ = ctx.fd_table().write_string(fd, &line);
+    let _ = ctx.fd_table().write_string(fd, &sep);
+}
+
+/// Resolve the host fd that a `printStackTrace(PrintStream/PrintWriter)` target
+/// should write to. The no-arg `printStackTrace()` goes to `System.err` (fd 2).
+/// When an explicit stream is passed we honour it: if it is the `System.out`
+/// static we route to stdout (fd 1) — `t.printStackTrace(System.out)` must land
+/// on stdout, not stderr — otherwise we keep the stderr sink (the common
+/// `printStackTrace(System.err)` case and any other stream we can't map).
+fn print_stream_target_fd(ctx: &mut dyn NativeContext, stream: Option<ObjectRef>) -> u32 {
+    let stream = match stream {
+        Some(s) => s,
+        None => return 2,
+    };
+    if let Some(sys) = ctx.class_id_by_name("java/lang/System") {
+        if let Some(idx) = ctx.static_field_index_by_name(sys, "out") {
+            if let Value::Object(Some(out)) = ctx.get_static_field(sys, idx) {
+                if out == stream {
+                    return 1;
+                }
+            }
+        }
+    }
+    2
 }
 
 /// printStackTrace() / printStackTrace(PrintStream) / printStackTrace(PrintWriter).
@@ -942,12 +965,19 @@ pub(crate) fn native_throwable_print_stack_trace(
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
     };
+    // No-arg overload: real JDK writes to `System.err` (fd 2).
+    print_throwable_chain_to_fd(ctx, this, 2);
+    Ok(None)
+}
 
+/// Shared body for all three `printStackTrace` overloads: writes the header +
+/// captured frames for the throwable and its cause chain to `fd`.
+fn print_throwable_chain_to_fd(ctx: &mut dyn NativeContext, this: ObjectRef, fd: u32) {
     // Header for the top-level throwable.
     let header = throwable_header_line(ctx, this);
-    emit_stack_line(ctx, header);
+    emit_stack_line(ctx, header, fd);
     for f in throwable_frame_lines(ctx, this) {
-        emit_stack_line(ctx, f);
+        emit_stack_line(ctx, f, fd);
     }
 
     // Walk the cause chain with a cycle guard. Limit depth defensively
@@ -963,14 +993,12 @@ pub(crate) fn native_throwable_print_stack_trace(
         }
         seen.push(c);
         let inner = throwable_header_line(ctx, c);
-        emit_stack_line(ctx, format!("Caused by: {inner}"));
+        emit_stack_line(ctx, format!("Caused by: {inner}"), fd);
         for f in throwable_frame_lines(ctx, c) {
-            emit_stack_line(ctx, f);
+            emit_stack_line(ctx, f, fd);
         }
         current = throwable_cause(ctx, c);
     }
-
-    Ok(None)
 }
 
 /// addSuppressed(Throwable) — append to suppressed list stored in field 2
@@ -1767,14 +1795,15 @@ pub fn register_throwable_subclass_natives(r: &mut NativeMethodRegistry) {
 
 /// printStackTrace(Ljava/io/PrintStream;)V (and PrintWriter overload).
 ///
-/// Args layout: [this, stream]. We reuse the no-arg printStackTrace
-/// implementation which writes to the recorded-line sink; the
-/// PrintStream/PrintWriter argument is intentionally ignored because
-/// the recorded-line sink is already wired through to System.err in
-/// the lib.rs PrintStream natives.
+/// Args layout: [this, stream]. We honour the requested sink: when `stream`
+/// is the `System.out` static we route to stdout (fd 1) so
+/// `t.printStackTrace(System.out)` lands on stdout exactly like HotSpot;
+/// otherwise (the common `System.err` case, or any stream we can't map) we
+/// keep the stderr sink (fd 2). Output is always also mirrored into the
+/// recorded-line buffer so tests scanning `thread.printed_lines` keep working.
 ///
 /// Null-safe: if `this` is null we no-op; if `stream` is null we still
-/// print, because catch-block code paths frequently call
+/// print to stderr, because catch-block code paths frequently call
 /// `t.printStackTrace(System.err)` and the synthetic-stub System.err
 /// static may itself be null on early boot — we don't want to throw a
 /// secondary NPE inside a catch handler.
@@ -1782,5 +1811,18 @@ pub(crate) fn native_throwable_print_stack_trace_to_stream(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    native_throwable_print_stack_trace(ctx, args)
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(None),
+    };
+    // Honour the requested stream: `printStackTrace(System.out)` must land on
+    // stdout (fd 1), not the stderr sink. Any other / unmappable stream
+    // (notably `System.err`) keeps fd 2.
+    let stream = match args.get(1) {
+        Some(Value::Object(Some(s))) => Some(*s),
+        _ => None,
+    };
+    let fd = print_stream_target_fd(ctx, stream);
+    print_throwable_chain_to_fd(ctx, this, fd);
+    Ok(None)
 }

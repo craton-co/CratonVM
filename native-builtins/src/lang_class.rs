@@ -2902,26 +2902,27 @@ pub(crate) fn coerce_arg_strict(
                     // Cross-category coercion (e.g. int → long, int → double):
                     // honour JLS §5.1.2 widening; narrowing is rejected.
                     let src = primitive_tag_of(value);
-                    widen_primitive_value(value, src, expected_desc).ok_or_else(|| {
-                        illegal_arg_exc(format!(
-                            "{context}: cannot convert {src} to {expected_desc}"
-                        ))
-                    })
+                    // JDK faithful: `jdk.internal.reflect` accessors throw
+                    // `IllegalArgumentException("argument type mismatch")` for ALL
+                    // reflective arg-coercion failures (Method.invoke /
+                    // Constructor.newInstance). Hibernate's HHH-20261 error message
+                    // appends this verbatim ("…due to: argument type mismatch"), so
+                    // a descriptive message would diverge from HotSpot.
+                    let _ = src;
+                    widen_primitive_value(value, src, expected_desc)
+                        .ok_or_else(|| illegal_arg_exc("argument type mismatch".to_string()))
                 }
                 Value::Object(Some(obj)) => {
                     let wrapper_cid = ctx.class_id_of_object(obj);
                     let wrapper_name = ctx.class_name_of_id(wrapper_cid).unwrap_or_default();
                     let src_prim = wrapper_to_prim_desc(&wrapper_name).ok_or_else(|| {
-                        illegal_arg_exc(format!(
-                            "{context}: expected primitive {expected_desc}, got {wrapper_name}"
-                        ))
+                        // JDK-faithful "argument type mismatch" (see note above).
+                        illegal_arg_exc("argument type mismatch".to_string())
                     })?;
                     if !wrapper_matches_primitive(&wrapper_name, expected_desc)
                         && !widening_allowed(src_prim, expected_desc)
                     {
-                        return Err(illegal_arg_exc(format!(
-                            "{context}: cannot convert {wrapper_name} to {expected_desc}"
-                        )));
+                        return Err(illegal_arg_exc("argument type mismatch".to_string()));
                     }
                     // WP2.2 fix: read the wrapper's `value` field by name.
                     // Slot 0 is unreliable when the real JDK Byte/Short/Integer
@@ -2934,15 +2935,12 @@ pub(crate) fn coerce_arg_strict(
                         Value::Object(None) => by_slot0,
                         v => v,
                     };
-                    widen_primitive_value(raw, src_prim, expected_desc).ok_or_else(|| {
-                        illegal_arg_exc(format!(
-                            "{context}: cannot widen {src_prim} to {expected_desc}"
-                        ))
-                    })
+                    widen_primitive_value(raw, src_prim, expected_desc)
+                        .ok_or_else(|| illegal_arg_exc("argument type mismatch".to_string()))
                 }
-                Value::Object(None) => Err(illegal_arg_exc(format!(
-                    "{context}: null argument not assignable to primitive {expected_desc}"
-                ))),
+                Value::Object(None) => {
+                    Err(illegal_arg_exc("argument type mismatch".to_string()))
+                }
                 _ => Err(illegal_arg_exc(format!(
                     "{context}: unexpected VM value for primitive {expected_desc}"
                 ))),
@@ -2954,9 +2952,8 @@ pub(crate) fn coerce_arg_strict(
         // slot kind is an Object.
         _ => match value {
             Value::Object(_) => Ok(value),
-            _ => Err(illegal_arg_exc(format!(
-                "{context}: expected reference ({expected_desc}), got primitive"
-            ))),
+            // JDK-faithful "argument type mismatch" (see note above).
+            _ => Err(illegal_arg_exc("argument type mismatch".to_string())),
         },
     }
 }
