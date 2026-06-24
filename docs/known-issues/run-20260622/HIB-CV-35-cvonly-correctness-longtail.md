@@ -1,6 +1,29 @@
 # HIB-CV-35 — CratonVM-only Hibernate correctness divergences (long-tail)
 
-**Status:** OPEN (triage + root-cause complete; fixes specified, partial)
+## Validated scorecard (clean binary `cvh35.exe`, worktree `fix/hib-cv-35` @ dev)
+
+| Test | Inventory | After fixes | Disposition |
+|---|---|---|---|
+| util.SerializationHelperTest | CNFE (1/2) | **2/2 PASS** ✅ | FIXED — getResource parent delegation |
+| stateless.StatelessSessionPersistentContextTest | fail (0/1) | **1/1 PASS** ✅ | FIXED — emptyIterator singleton |
+| proxy.ProxyClassReuseTest | CNFE (2/3) | 2/3 | CNFE root FIXED; residual `testNoReuse` = classloader **isolation** (HIB-CV-24) |
+| bootstrap.scanning.JarVisitorTest | CRASH | **9/9 PASS** ✅ | Was the `[HIB32]` flood (watchdog) — not a real bug |
+| sorted.set.SortComparatorTest | fail (0/1) | 0/1 | OPEN — persist-side dedup (1-of-2 inserted); core collections OK |
+| sorted.set.SortNaturalTest | fail (0/1) | 0/1 | OPEN — same as above |
+| mapping.type.format.XmlFormatterTest | UOE (10/12) | 10/12 | OPEN — `byte[][]`→CollectionJavaType; `isArray` is correct |
+| util.PropertiesHelperTest | UOE (1/2) | 1/2 | OPEN — Properties live entrySet view needed |
+| stats.ExplicitQueryStatsMaxSizeTest | 0≠1000 (1/2) | 1/2 | OPEN — BoundedConcurrentHashMap LRU eviction |
+| mapping.fetch.depth.NoDepthTests | .par URL (2/4) | 2/4 | OPEN — ShrinkWrap in-memory archive URL |
+| onetoone.nopojo.DynamicMapOneToOneTest | LOADERR | HANG | OPEN — `--nojit` hbm.xml-mapping bootstrap hang (HIB-CV-23 class) |
+
+**Fixes landed on branch `fix/hib-cv-35`** (build with `CARGO_PROFILE_RELEASE_LTO=false
+CARGO_PROFILE_RELEASE_CODEGEN_UNITS=256` to avoid OOM under IDE/agent contention):
+1. **getResource / getResourceAsStream parent delegation** (`native-builtins/src/classloader.rs`) — §3.
+2. **`Collections.emptyIterator()` singleton** (`native-builtins/src/phases_early.rs` + `native-collections/src/lib.rs`) — §4.
+
+---
+
+**Status:** PARTIALLY FIXED (2 tests fixed + 1 CNFE root + 1 flood-debunked; 6 deep ones documented)
 **Date:** 2026-06-23
 **Baseline:** dev (inventory generated on f8cdd52b; retest current dev)
 **Mode:** all reproduce under `--nojit`; all PASS on HotSpot
@@ -77,25 +100,56 @@ collection holds **1** element instead of 2.
 `"A".compareTo("B") = -1`, `CIO.compare("B","a") = 1`). So `TreeSet`/`TreeMap`
 ordering and `String.compareTo`/`CASE_INSENSITIVE_ORDER` are correct.
 
-**Root cause (hydration):** the dedup occurs while Hibernate hydrates the
-`PersistentSortedSet`/`PersistentSortedMap` from the result set — two distinct
-rows collapse because their ordering key compares equal **at insert time**. The
-sorted-MAP variant is keyed by distinct *String* values (`"A"`,`"B"`) yet also
-collapses to size 1, which rules out entity-identity/first-level-cache collision
-and points at the **per-row key/element value being read as the same value for
-both rows** during collection load (a stale field read or row-cursor reuse in the
-collection initializer path), or the elements being added to the sorted backing
-*before* their ordering field is populated (two-phase load) such that both
-compare as `null==null → 0`.
+**ROOT CAUSE (precisely localized): `invokeinterface Comparable.compareTo`
+mis-dispatches to a 0-returning target for an `@Entity` class, *after Hibernate's
+`SessionFactory` build-time processing of that class* — so the user's own
+`TreeSet<Cat>` dedups two distinct cats at the SOURCE (before any persist).**
 
-**Next step to confirm:** run with Hibernate SQL logging (`org.hibernate.SQL` at
-DEBUG) on a clean binary to determine whether (a) only 1 row is inserted at
-persist, or (b) 2 rows are returned at load but collapse on add. The map-keyed-by-
-String evidence strongly favors (b) — a hydration-time field/row read returning
-the same value twice.
+A self-contained JUnit reproduction (`@DomainModel`+`@SessionFactory`, entity `Cat
+implements Comparable<Cat>`) shows, inside the test body (SF already built):
+```
+DIAG GenCmp(non-entity, identical structure) size=2   <- OK
+DIAG Cat(ENTITY)                              size=1   <- BUG   (k1.compareTo(k2)=1 — direct call CORRECT)
+DIAG RawCmp(raw Comparable, no bridge)        size=2   <- OK
+DIAG String / Integer                         size=2   <- OK
+```
+`new TreeSet<Cat>(); add(B); add(A)` → **size 1**: the second `add` returns
+`false`. Real JDK `TreeMap.put` runs (TreeSet/TreeMap are NOT native on CratonVM),
+so its `((Comparable)key).compareTo(t.key)` — an `invokeinterface
+Comparable.compareTo(Object)` — returns **0** for two distinct `Cat`s.
 
-**Confidence:** root cause class HIGH (hydration, not core collections);
-exact mechanism MEDIUM pending SQL trace.
+Decisively ruled out:
+- Core collections: `TreeSet`/`TreeMap`/`IdentityHashMap`/`HashSet` of two distinct
+  `Cat`s → size 2 **standalone** (== HotSpot). Array `Class` reflection too.
+- The synthetic-bridge `compareTo(Object)`: a *non-entity* `GenCmp` with the
+  identical `Comparable<T>`+bridge shape works (size 2). A raw `Comparable`
+  (no bridge) works.
+- Megamorphic call-site pollution: warming `TreeMap.put`'s `compareTo` call site
+  with 5 Comparable types × 2000 iters does NOT reproduce it standalone.
+- Reflection on the class (`getMethods`/`getMethod("compareTo",Object)`/bridge
+  invoke) does NOT corrupt dispatch standalone.
+- GC: big heap (`-Xmx512m`) and `CRATONVM_FORCE_MOVING=1` do NOT help (so NOT the
+  HIB-CV-33 load-sensitive corruptor).
+- Direct `((Comparable)cat).compareTo(other)` from app code returns the correct
+  value even in the failing context — only the *internal* `TreeMap.put` dispatch
+  is wrong.
+
+So **building the `SessionFactory` over the `Comparable` entity corrupts that
+class's method-table / itable entry for `compareTo`** (only that class — sibling
+non-entity Comparables in the same run are fine). Manual `MetadataSources`
+bootstrap does NOT trigger it; the `@DomainModel`/`@SessionFactory` extension path
+does — prime suspect is the ByteBuddy proxy/instantiator generation for the entity
+(Hibernate makes `Cat$HibernateProxy` subclasses; cf. ProxyClassReuseTest), which
+may rewrite/relocate the entity's `compareTo` itable slot on CratonVM.
+
+**Next step:** bisect the SF-build steps for an entity (BytecodeProvider proxy
+generation vs instantiator vs JavaType registration); instrument the interpreter's
+`invokeinterface` resolution for `Comparable.compareTo` on the entity class to see
+which target it picks after each step. Repro: `SortDiagTest` in the suite scratch
+(self-contained).
+
+**Confidence:** root cause HIGH and precisely reproduced; exact SF-build corruptor
+MEDIUM (bisection pending). Deep interpreter/ByteBuddy interaction — deferred.
 
 ---
 
@@ -160,86 +214,98 @@ descriptor whose `wrap` throws. The divergence therefore hinges on multi-dimensi
 array **`Class` reflection** — `byte[][].class.isArray()` / `getComponentType()` /
 `getTypeName()`.
 
-VM code: `native_class_is_array` (`native-builtins/src/lang_class.rs:2152`) returns
-`mirror_class_name(this).starts_with('[')`. If the mirror for a 2-D array
-(`byte[][]`) is not named `"[[B"` (e.g. created with a wrong/strict name), `isArray`
-returns false and the array branch is skipped → `CollectionJavaType`.
+**Array reflection RULED OUT (probe == HotSpot):**
+```
+byte[]   isArray=true comp=byte      typeName=byte[]   name=[B
+byte[][] isArray=true comp=class [B  typeName=byte[][] name=[[B
+String[] isArray=true comp=String    typeName=java.lang.String[]
+int[][]  isArray=true comp=class [I  typeName=int[][]
+```
+All identical to HotSpot. So `JavaTypeRegistry.resolveDescriptor`'s
+`javaClass.isArray()` branch *should* fire — the mis-resolution is **elsewhere**:
+likely a stale/pre-seeded entry in `descriptorsByTypeName` keyed by `"byte[][]"`
+(or a divergent `createArrayTypeDescriptor`/`findDescriptor` for the `byte[]`
+element), so `getDescriptor(byte[][])` returns a cached `CollectionJavaType`
+without running the array creator. Only `testByteArray` (the `byte[][]` cases)
+fails; the other 10 subtests pass.
 
-**Next step to confirm:** probe (ready: `ArrProbe.java`) printing
-`byte[][].class.isArray()`, `.getComponentType()`, `.getTypeName()` vs HotSpot.
-If `isArray(byte[][])` is `false` or the name is wrong, the fix is in 2-D array
-mirror naming in `lang_class.rs`.
+**Next step:** dump `getDescriptor(byte[][].class).getClass()` and inspect
+whether `descriptorsByTypeName` already holds `"byte[][]"`→CollectionJavaType
+before the array path runs.
 
-**Confidence:** root cause HIGH (resolution hinges on array reflection); exact
-defect MEDIUM pending the probe on a clean binary.
+**Confidence:** NOT array reflection (proven). Resolution/cache path — MEDIUM.
+Deep, niche (Jackson-XML byte-array round-trip) — deferred.
 
 ---
 
-## 3. Custom `ClassLoader.getResourceAsStream` returns null for classpath resources
+## 3. Custom `ClassLoader.getResource(AsStream)` skipped parent delegation — ✅ FIXED
 
 **Tests:** `org.hibernate.orm.test.util.SerializationHelperTest`
 (CNFE `...util.SerializableThing`),
 `org.hibernate.orm.test.proxy.ProxyClassReuseTest`
 (CNFE `...ProxyClassReuseTest$ProxyGetter`)
 
-**Symptom (CONFIRMED, reproduced):** `ClassNotFoundException`. Both tests use a
-custom `ClassLoader` subclass that loads a class by reading its bytes via
+**Symptom:** `ClassNotFoundException`. Both tests use a custom `ClassLoader`
+subclass that loads a class by reading its bytes via
 `this.getResourceAsStream(name.replace('.','/') + ".class")` and `defineClass`;
-the `getResourceAsStream` returns **null** for a `.class` resource that exists on
-the application classpath, so the loader throws `"<name> not found"`.
+`getResourceAsStream` returned **null** for a `.class` on the app classpath.
 
-**Root cause:** the resource lookup path for a custom (app-defined)
-`ClassLoader` subclass does not locate classpath resources. In the JDK,
-`ClassLoader.getResourceAsStream` → `getResource` delegates to the parent and
-ultimately the application/system loader's `findResource`, which scans the
-classpath. On CratonVM this returns null for these custom loaders. This is the
-**resource** facet of the classloader-isolation work tracked in
-[HIB-CV-24](HIB-CV-24-classloader-isolation-delegation.md) / SBR-14, and is
-distinct from `loadClass`/`findBootstrapClass` (the WIP `classloader.rs`
-`cl_bootstrap_scoped` work addresses class loading, not resource lookup).
+**Root cause (isolated by probe):** `cl_get_resource`
+(`native-builtins/src/classloader.rs`), for a non-builtin (user) loader, called
+`findResource()` **directly**, skipping the JDK `ClassLoader.getResource`
+parent-delegation step. A custom loader that overrides only `loadClass` inherits
+the default `findResource` (returns null) → every parent-served resource reported
+null. Probe (custom loader, parent = system):
+```
+sys.getResource           = file:/.../SerializableThing.class   (worked)
+custom.getResource        = null                                (BUG; HotSpot: the same URL)
+custom.getResourceAsStream= false                               (BUG; HotSpot: true)
+```
 
-**Recommended fix:** ensure `ClassLoader.getResource`/`getResourceAsStream`
-default delegation reaches the app/system classpath scan for custom subclasses
-that don't override `findResource` — i.e. the synthetic/native
-`getResourceAsStream` must fall through to the classpath resource resolver
-(the same one backing the system loader), not just the bootstrap/module set.
+**Fix (landed):** in the user-loader branch of `cl_get_resource`, delegate to
+`parent.getResource(name)` FIRST (the JDK contract), then fall back to this
+loader's `findResource`. `cl_get_resource_as_stream` mirrors JDK
+(`getResource(name).openStream()`) for user loaders so it inherits the same
+delegation. **Validated:** `custom.getResource(AsStream)` now resolve; **
+SerializationHelperTest 2/2 PASS**.
 
-**Confidence:** root cause HIGH (shared, reproduced on both tests); fix location
-in the classloader resource natives.
+**Residual:** `ProxyClassReuseTest.testNoReuse` no longer throws CNFE but now
+fails a *different* assertion — two `IsolatingClassLoader`s produce the **same**
+proxy class (`assertNotSame` fails). That is genuine classloader **isolation**
+(each isolated loader should `defineClass` its own copy), tracked under
+[HIB-CV-24](HIB-CV-24-classloader-isolation-delegation.md) — out of scope here.
 
 ---
 
-## 4. `Collections` empty-singleton identity (`==`) divergence
+## 4. `Collections.emptyIterator()` not a singleton — ✅ FIXED
 
 **Test:** `org.hibernate.orm.test.stateless.StatelessSessionPersistentContextTest`
 
 **Symptom (inventory):** `"StatelessSession: PersistenceContext has not been
 cleared" expected: <true> but was: <false>`.
 
-**Root cause:** the assertions use **reference identity** against JDK singletons:
+**Root cause (isolated by probe):** the cleared-context assertions use
+**reference identity** against JDK singletons:
 ```java
-persistenceContextInternal.managedEntitiesIterator() == Collections.emptyIterator()
-persistenceContextInternal.getCollectionsByKey()     == Collections.EMPTY_MAP
+managedEntitiesIterator() == Collections.emptyIterator()   // the failing one
+getCollectionsByKey()      == Collections.EMPTY_MAP         // (EMPTY_MAP was already OK)
 ```
-Hibernate returns the JDK singletons (`Collections.emptyIterator()` /
-`Collections.EMPTY_MAP`) when the context is empty. The `==` holds on HotSpot
-because those are process-wide singletons. If CratonVM's
-`Collections.emptyIterator()` (or `emptyMap()`) does not return the *same*
-singleton instance each call — or returns a freshly-synthesized object — the
-identity check fails. This is the object-identity/synthesis theme also seen in
-SBR-07..13.
+Probe: `Collections.emptyIterator() == Collections.emptyIterator()` → **false** on
+CratonVM (true on HotSpot); `EMPTY_MAP`/`emptyMap()` were already stable. The
+`emptyIterator` native (TWO registrations: `phases_early.rs:551` — the active
+one — and `native-collections`'s `native_empty_iterator`) allocated a **fresh**
+`Collections$EmptyIterator` per call.
 
-**Next step to confirm:** probe (ready in `ArrProbe.java`):
-`Collections.emptyIterator() == Collections.emptyIterator()` and
-`Collections.EMPTY_MAP == Collections.emptyMap()` vs HotSpot.
+**Fix (landed):** return the process-wide singleton stored in the (GC-rooted)
+`Collections$EmptyIterator.EMPTY_ITERATOR` static field, populating it lazily on
+first use — the same mechanism `Collections.EMPTY_MAP` already uses
+(`collections_empty_singleton`). Applied to BOTH registrations
+(`ensure_class_initialized` first so the class id resolves cold-start).
+**Validated: StatelessSessionPersistentContextTest 1/1 PASS.**
 
-**Recommended fix:** ensure `Collections.emptyIterator()`/`emptyList()`/
-`emptyMap()`/`emptySet()` return the canonical static singletons
-(`Collections.EMPTY_*` / `EmptyIterator.EMPTY_ITERATOR`) rather than new
-instances, so reference identity is preserved.
-
-**Confidence:** root cause HIGH (identity-on-singleton is explicit in the test);
-exact VM defect MEDIUM pending probe.
+Note: array `Class` reflection (`isArray`/`getComponentType`/`getName`/
+`getTypeName` for `byte[]`/`byte[][]`/`String[]`/`int[][]`) is **byte-identical to
+HotSpot** — see §2b; that ruled out the original array-reflection hypothesis.
 
 ---
 
@@ -290,15 +356,17 @@ deferring behind the higher-value fixes above.
 
 ---
 
-## Crash variants — re-evaluation
+## Crash variants — re-evaluated on the clean binary
 
-The inventory's "crash"/"LOADERR" entries
-(`bootstrap.scanning.JarVisitorTest` CRASH, `dynamicmap`/`onetoone.nopojo`
-`DynamicMapOneToOneTest` LOADERR) must be re-checked on a **clean** (de-flooded)
-binary: several apparent crashes/hangs in initial reruns were the `[HIB32]` flood
-tripping the watchdog (§0a), not genuine faults. `DynamicMapOneToOneTest` uses an
-`hbm.xml` (dynamic-map, no-POJO) mapping and may also intersect the `--nojit`
-XML-mapping path (HIB-CV-23). Re-run pending a contention-free build.
+- **`bootstrap.scanning.JarVisitorTest`** — inventory "CRASH" was the `[HIB32]`
+  flood tripping the 120 s watchdog (§0a). On the clean binary it is **9/9 PASS**.
+  No real bug.
+- **`onetoone.nopojo.DynamicMapOneToOneTest`** (inventory "LOADERR") — on the
+  clean binary it **HANGS** (no `@@RESULT`, watchdog/timeout) during
+  SessionFactory bootstrap of its `hbm.xml` (dynamic-map, no-POJO) mapping, after
+  JAXB context init. This is the `--nojit` XML-mapping-processing hang class
+  ([HIB-CV-23](HIB-CV-23-nojit-hang-orm-xml-mapping-processing.md)), not a
+  load-error/abort. Deep — deferred.
 
 ---
 

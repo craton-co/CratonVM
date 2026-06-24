@@ -372,7 +372,30 @@ pub fn check_module_access(
         return Ok(());
     }
 
+    // Array classes have no package of their own. In the JDK an array type
+    // belongs to the run-time package of its element type, and primitive /
+    // primitive-array types are always accessible. CratonVM synthesises every
+    // array class under module `java.base` with a descriptor name (`[I`, `[C`,
+    // `[Ljava/lang/Object;`), so `package_of` yields "" for primitive arrays
+    // (no '/') and a bogus "[Ljava/lang" for reference arrays — either way the
+    // package-export check is meaningless for an array target. Element-type
+    // accessibility is enforced separately when the element type is itself
+    // referenced. Skipping here matches the JDK (e.g. java.xml's
+    // `XMLSecurityManager` legitimately uses `int[]`, which is `[I` in
+    // `java.base` with an empty package).
+    if target.name.starts_with('[') {
+        return Ok(());
+    }
+
     let target_pkg = module_pkg_of(&target.name);
+
+    // A named module never legitimately contains a default-(empty-)package
+    // class — the JLS forbids it. An empty package on a named-module target is
+    // therefore a CratonVM labelling artifact (synthetic/hidden class), not a
+    // real export boundary; don't deny on it.
+    if target_pkg.is_empty() {
+        return Ok(());
+    }
 
     registry
         .check_module_access(accessor_mod, target_mod, target_pkg)
@@ -1298,5 +1321,105 @@ mod tests {
         let b = store.get(b_id).unwrap();
         // Host unresolvable в†’ claim unconfirmed в†’ not nestmates.
         assert!(!are_nestmates(a, b, &store));
+    }
+
+    // --- JPMS module access: array / empty-package targets ---
+
+    use crate::module::ModuleDescriptor;
+
+    fn make_class_in_module(
+        store: &mut ClassStore,
+        name: &str,
+        module: Option<&str>,
+    ) -> ClassId {
+        let id = make_class(store, name, None, ClassAccessFlags::PUBLIC);
+        store.get_mut(id).unwrap().module_name = module.map(|m| m.to_string());
+        id
+    }
+
+    /// A non-empty registry where `java.xml` reads `java.base` but `java.base`
+    /// exports nothing — so a *real* cross-module access would be denied. This
+    /// lets the array / empty-package exemptions be tested against a registry
+    /// that would otherwise reject.
+    fn strict_registry() -> ModuleRegistry {
+        let desc = |name: &str| ModuleDescriptor {
+            name: name.to_string(),
+            version: None,
+            is_open: false,
+            requires: vec![],
+            exports: vec![],
+            opens: vec![],
+            uses: vec![],
+            provides: vec![],
+        };
+        let mut reg = ModuleRegistry::new();
+        reg.register(desc("java.base"), vec![]);
+        reg.register(desc("java.xml"), vec![]);
+        reg.build_readability_graph();
+        reg.add_reads("java.xml", "java.base");
+        reg
+    }
+
+    #[test]
+    fn module_access_array_target_is_exempt() {
+        // Regression: java.xml's `XMLSecurityManager` references `int[]`, which
+        // CratonVM synthesises as `[I` under module `java.base` with an empty
+        // package. The JPMS check must not deny access to an array class.
+        let mut store = ClassStore::new();
+        let accessor =
+            make_class_in_module(&mut store, "jdk/xml/internal/XMLSecurityManager", Some("java.xml"));
+        let prim_arr = make_class_in_module(&mut store, "[I", Some("java.base"));
+        let ref_arr =
+            make_class_in_module(&mut store, "[Ljava/lang/Object;", Some("java.base"));
+        let reg = strict_registry();
+        assert!(check_module_access(
+            store.get(accessor).unwrap(),
+            store.get(prim_arr).unwrap(),
+            &reg
+        )
+        .is_ok());
+        assert!(check_module_access(
+            store.get(accessor).unwrap(),
+            store.get(ref_arr).unwrap(),
+            &reg
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn module_access_empty_package_named_module_is_exempt() {
+        // A default-(empty-)package class labelled into a named module is a
+        // CratonVM artifact (e.g. a synthetic/hidden class), not a real export
+        // boundary — don't deny on it.
+        let mut store = ClassStore::new();
+        let accessor =
+            make_class_in_module(&mut store, "jdk/xml/internal/Foo", Some("java.xml"));
+        let target = make_class_in_module(&mut store, "DefaultPkgClass", Some("java.base"));
+        let reg = strict_registry();
+        assert!(check_module_access(
+            store.get(accessor).unwrap(),
+            store.get(target).unwrap(),
+            &reg
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn module_access_real_unexported_package_still_denied() {
+        // Control: a genuine cross-module access to an un-exported package of a
+        // named module is still denied — the exemptions above don't neuter the
+        // check for real classes.
+        let mut store = ClassStore::new();
+        let accessor =
+            make_class_in_module(&mut store, "jdk/xml/internal/Foo", Some("java.xml"));
+        let target =
+            make_class_in_module(&mut store, "java/lang/invoke/Hidden", Some("java.base"));
+        let reg = strict_registry();
+        assert!(check_module_access(
+            store.get(accessor).unwrap(),
+            store.get(target).unwrap(),
+            &reg
+        )
+        .is_err());
     }
 }
