@@ -1964,18 +1964,20 @@ fn re1_socket_write_stream(
     if stream_id < 0 {
         return Err(ioex("Socket not connected"));
     }
-    // Clone the handle out and release s2_registry before the (potentially
-    // blocking, on a full send buffer) write — same deadlock-avoidance as the
-    // read path above: a peer blocked in read() must not be wedged behind a
-    // writer holding the global registry lock.
-    let mut stream = {
-        let reg = s2_registry().lock();
-        reg.streams
-            .get(&stream_id)
-            .ok_or_else(|| ioex("Socket stream not found"))?
-            .try_clone()
-            .map_err(|e| ioex(format!("Socket write: try_clone failed: {e}")))?
-    };
+    // Write on the ORIGINAL registered stream under the lock — do NOT write on a
+    // try_clone'd handle and drop it: dropping the duplicate handle right after
+    // write_all defers actual transmission on Windows (the peer only sees the
+    // bytes when the socket is later close()d / shutdown), which wedges any
+    // request/response loopback (okhttp MockWebServer never replies). Holding
+    // the lock here is safe: write_all into a non-full kernel send buffer
+    // returns promptly and never blocks waiting on a peer, so it cannot form the
+    // reader-holds-lock / writer-waits-lock deadlock the blocking READ path can
+    // (that one clones to drop the lock; see re1_socket_read_stream).
+    let mut reg = s2_registry().lock();
+    let stream = reg
+        .streams
+        .get_mut(&stream_id)
+        .ok_or_else(|| ioex("Socket stream not found"))?;
     stream
         .write_all(&data)
         .map_err(|e| ioex(format!("Socket write failed: {e}")))?;
