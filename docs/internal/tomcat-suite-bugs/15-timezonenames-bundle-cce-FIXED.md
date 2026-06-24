@@ -1,9 +1,10 @@
 # TC0623 — `ResourceBundle` cannot be cast to `TimeZoneNamesBundle` (FIXED)
 
 **Status:** FIXED on branch `fix/tz-names-bundle` (merged to `dev`).
-**Test:** `org.apache.catalina.filters.TestExpiresFilter` — **17/19 PASS** (was
-HANG with a `ClassCastException`). The 2 residual failures are a **separate,
-pre-existing** HTTP-connector bug (see "Residual" below), not time-zone related.
+**Test:** `org.apache.catalina.filters.TestExpiresFilter` — **19/19 PASS** (was
+HANG with a `ClassCastException`). Two fixes landed on this branch: (1) the
+TimeZoneNamesBundle CCE below, and (2) a separate, pre-existing HTTP-connector
+hang on bodiless 304 responses (see "Second fix" below).
 
 ## Symptom
 
@@ -109,12 +110,27 @@ timestamp (verified == the GMT literal), so `validate()`'s
 the bundle path works, but that has VM-wide blast radius and is out of scope for
 this CCE fix.
 
-## Residual (separate, pre-existing — NOT this bug)
+## Second fix — bodiless 304/204/1xx hung the native HTTP client
 
-`testExcludedResponseStatusCode` and `testBug63909` fail with `expected:<304>
-but was:<-1>` (HTTP client `IOException`, ~200 s hang). Both are the only tests
-where the **server returns a 304 (empty-body) response**;
+With the CCE gone, `testExcludedResponseStatusCode` and `testBug63909` still
+failed with `expected:<304> but was:<-1>` (`HttpURLConnection.getResponseCode()`
+returns -1 on an unparseable/incomplete response, after a ~200 s hang). Both are
+the only tests where the **server returns a 304 (empty-body) response**;
 `testExcludedResponseStatusCode` calls `response.setStatus(304)` directly and
-contains zero time-zone code. **Reproduced on the baseline dev binary** (which
-has no time-zone change) → a CratonVM HTTP-connector bug handling empty-body 304
-responses, independent of this fix. Tracked separately.
+contains zero time-zone code. **Reproduced on the baseline dev binary** → a
+distinct, pre-existing bug.
+
+Root cause: CratonVM models `java.net.HttpURLConnection` natively
+(`native-builtins/src/http_url_connection.rs`); its `read_response` special-cased
+only **HEAD** as bodiless. A 304/204/1xx response legitimately omits
+`Content-Length` (RFC 9110 §6.4.1: those carry no message body), so the
+no-content-length `else` branch read "until EOF" — which never comes on a
+keep-alive connection the server holds open → `getResponseCode()` hangs forever.
+
+Fix: extend the bodiless guard to `status == 204 || status == 304 || 1xx` (plus
+HEAD). Isolated repro `scratch/tznames/C304v.java` (raw `ServerSocket` returning
+a keep-alive 304): pre-fix hangs >60 s; post-fix `rc=304` in <50 ms across the
+keep-alive / `Content-Length: 0` / `Connection: close` variants, matching
+HotSpot. Rust unit tests `test_read_response_{304,204}_is_bodiless` +
+`test_read_response_200_reads_body` guard the rule. Any conditional-GET / 304
+test across the Tomcat suite benefits.

@@ -611,12 +611,22 @@ fn read_response<S: Read>(
         headers.push((name, value));
     }
 
-    // A HEAD response carries the would-be `Content-Length`/`Transfer-Encoding`
-    // but NO message body (RFC 9110 §9.3.2). Return as soon as the head is
-    // parsed — otherwise the body loop below blocks waiting for `content_length`
-    // bytes that never arrive, hits the read timeout, and `perform` fails ->
-    // `getResponseCode` returns -1, discarding a valid status line.
-    if head {
+    // Responses that carry NO message body regardless of their
+    // `Content-Length`/`Transfer-Encoding` headers (RFC 9110 §6.4.1):
+    //   * any response to a HEAD request,
+    //   * 1xx (informational), 204 (No Content), 304 (Not Modified).
+    // Return as soon as the head is parsed — otherwise the body loop below
+    // blocks. The 304/204/1xx case is the dangerous one: such a response
+    // legitimately omits `Content-Length`, so without this guard the
+    // no-content-length `else` branch reads "until EOF", which never comes on a
+    // keep-alive connection (the server holds it open) -> `getResponseCode`
+    // hangs indefinitely instead of returning the status. Surfaced by Tomcat
+    // `TestExpiresFilter` (`testExcludedResponseStatusCode`, `testBug63909`),
+    // whose conditional-GET / explicit `setStatus(304)` servlets return a
+    // bodiless 304 that previously hung the client (`expected:<304> but
+    // was:<-1>`).
+    let bodiless = head || status == 204 || status == 304 || (100..200).contains(&status);
+    if bodiless {
         return Ok((status, headers, Vec::new()));
     }
 
@@ -1846,6 +1856,41 @@ mod http_url_connection_tests {
         let mut empty: &[u8] = &[];
         let body = read_chunked(&mut data, &mut empty).unwrap();
         assert_eq!(body, b"Wikipedia in \r\nchunks.");
+    }
+
+    #[test]
+    fn test_read_response_304_is_bodiless() {
+        // RFC 9110 §6.4.1: a 304 has no message body even when it carries a
+        // (bogus) Content-Length. read_response must return immediately with an
+        // empty body and NOT consume the trailing bytes — otherwise a keep-alive
+        // 304 (no real body coming) hangs the client. The trailing "HELLO" here
+        // stands in for "bytes that are not ours to read".
+        let mut data: &[u8] =
+            b"HTTP/1.1 304 Not Modified\r\nETag: W/\"x\"\r\nContent-Length: 5\r\n\r\nHELLO";
+        let (status, headers, body) = read_response(&mut data, false).unwrap();
+        assert_eq!(status, 304);
+        assert!(body.is_empty(), "304 must be bodiless");
+        assert!(headers
+            .iter()
+            .any(|(n, v)| n.eq_ignore_ascii_case("etag") && v == "W/\"x\""));
+    }
+
+    #[test]
+    fn test_read_response_204_is_bodiless() {
+        let mut data: &[u8] = b"HTTP/1.1 204 No Content\r\nContent-Length: 3\r\n\r\nabc";
+        let (status, _h, body) = read_response(&mut data, false).unwrap();
+        assert_eq!(status, 204);
+        assert!(body.is_empty(), "204 must be bodiless");
+    }
+
+    #[test]
+    fn test_read_response_200_reads_body() {
+        // Guard against over-broadening the bodiless rule: a normal 200 with a
+        // Content-Length must still return its body.
+        let mut data: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nHELLO";
+        let (status, _h, body) = read_response(&mut data, false).unwrap();
+        assert_eq!(status, 200);
+        assert_eq!(body, b"HELLO");
     }
 
     #[test]
