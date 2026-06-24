@@ -2,65 +2,68 @@
 
 | | |
 |---|---|
-| **Status** | OPEN (root-caused to the persist-side collection cascade; core `TreeSet` verified correct) |
-| **Area** | Hibernate `PersistentSortedSet` / collection cascade interaction with CratonVM (not a `java.util` bug) |
-| **Symptom** | `org.hibernate.orm.test.sorted.{set,map}.SortNaturalTest` fails: `assertThat(owner.cats.size()).isEqualTo(2)` → `expected: 2 but was: 1`. |
-| **Severity** | medium (CratonVM-only; pre-existing — fails identically at baseline `b0aab8f9`). Part of the HIB-CV-35 cvonly correctness long-tail. |
-| **Discovered** | 2026-06-24, triaging the Hibernate suite residuals after the collection-delegation stack-overflow fix (`7b224d8a`). |
+| **Status** | ✅ FIXED (branch `fix/hib-sortnatural-cascade`) — root cause was the native `TreeSet`/`TreeMap` natural-order comparator, **not** the cascade. |
+| **Area** | `native-collections` natural-ordering comparison (`natural_compare`) |
+| **Symptom** | `org.hibernate.orm.test.sorted.{set,map}.{SortNaturalTest,SortComparatorTest}` failed: `assertThat(owner.cats.size()).isEqualTo(2)` → `expected: 2 but was: 1`. |
+| **Severity** | medium (CratonVM-only; pre-existing). Part of the HIB-CV-35 cvonly correctness long-tail. |
+| **Discovered** | 2026-06-24 |
+| **Fixed** | 2026-06-24 |
 
-## Symptom
+## Real root cause — `natural_compare` field-0 heuristic, not the cascade
 
-The test persists an `Owner` whose `@OneToMany @SortNatural SortedSet<Cat> cats`
-(a `new TreeSet<>()`) holds two distinct cats, then reloads and asserts:
+The earlier triage (and the HIB-CV-35 §1 note) mis-attributed this to a
+collection cascade / `invokeinterface Comparable.compareTo` mis-dispatch after
+ByteBuddy proxy generation. That was a **red herring** — the proxy *does* trigger
+a CHA vtable-slot invalidation on the entity's `compareTo`, but that invalidation
+is harmless and not on the failing path.
 
-```java
-owner.cats.add( cat1 );   // name "B"
-owner.cats.add( cat2 );   // name "A"
-session.persist( owner );
-…
-owner = session.get( Owner.class, owner.id );
-assertThat( owner.cats.size() ).isEqualTo( 2 );   // expected 2, was 1
+The actual cause is in `native-collections/src/lib.rs::natural_compare` (used by
+`tree_compare` → the native `TreeSet`/`TreeMap` array implementation and by
+`Comparator.naturalOrder()`/`comparing()`):
+
+For two object elements that are not `String`s, it tried a "primitive wrapper"
+fast path by reading **field 0** of each object and comparing them if both were
+primitives — *for any object with ≥ 1 field*:
+
+```rust
+if ctx.object_num_fields(*ra) >= 1 && ctx.object_num_fields(*rb) >= 1 {
+    let fa = ctx.get_field(*ra, 0);   // entity's first DECLARED field
+    let fb = ctx.get_field(*rb, 0);
+    match (fa, fb) { (Long(a), Long(b)) => return a.cmp(b), ... }
+}
 ```
 
-`Cat implements Comparable<Cat>` ordering by `name`, so the two cats are distinct
-under the natural ordering.
+A JPA entity whose first field is a primitive id —
+`@Id @GeneratedValue private long id;` (exactly `SortNaturalTest.Cat`) — has
+`id == 0` for every freshly-`new`'d, not-yet-persisted instance. So the probe
+compared `0` vs `0`, returned **0 ("equal")**, and the user's own
+`new TreeSet<>()` (natural ordering) collapsed the two distinct cats into one
+*at `add()` time, before any persist*. The cascade then saw a 1-element set and
+inserted a single `Cat` row.
 
-## Root cause — persist side, not hydration
+This is why the `@DomainModel`/`@SessionFactory` repro failed while a sibling
+`MetadataSources` repro "passed": the two repros happened to declare the id as
+`long` vs **boxed** `Long` — a boxed `Long id` is `null` (a reference) on a fresh
+instance, so the field-0 match fell through to the correct `compareTo`. The
+difference was the id *type*, not the bootstrap path.
 
-It is **not** a load/hydration problem: the JDBC trace shows only **one** `Cat`
-row is ever inserted (`binding parameter (1:VARCHAR) <- [B]`); the cat named `"A"`
-is never persisted. So `owner.cats` already presents a single element to
-Hibernate's cascade, even though both cats were `add`-ed to the `TreeSet`.
+## Fix
 
-The core collection is fine. A standalone probe exercising a `TreeSet<Comparable>`
-on CratonVM matches HotSpot across **every** access path Hibernate could use:
+Gate the wrapper fast path on `unbox_wrapper` (which only matches a genuine
+**single-primitive-field** wrapper: `Integer`/`Long`/`Float`/`Double`/…) instead
+of a raw field-0 probe. A multi-field `Comparable` (any entity/POJO) now falls
+through to its real `Comparable.compareTo` — the JDK's natural-order contract.
+Wrapper sorting keeps its fast path; a non-`Comparable` element correctly throws
+`ClassCastException` via the existing `implements_comparable` guard.
 
-```
-size               = 2
-iterator() count   = 2
-forEach (Collection / Set cast) = 2
-toArray().length   = 2
-stream().count()   = 2
-first / last       = A / B
-```
+One-function change in `native_compare` (`native-collections/src/lib.rs`).
 
-So the element is dropped somewhere in Hibernate's **collection cascade** —
-specifically the interaction between CratonVM and `PersistentSortedSet` (Hibernate
-wraps the user `TreeSet` into a `PersistentSortedSet`, whose snapshot / dirty
-tracking / cascade iteration is where the second element is lost). The exact gap
-in that interaction is not yet isolated.
+## Validation
 
-## Impact
-
-- `SortNaturalTest` in both `sorted.set` and `sorted.map` packages.
-- Likely related: other Hibernate "wrong-result" collection-cascade residuals in
-  the HIB-CV-35 cvonly long-tail (sorted-set / map hydration dedup).
-
-## Next steps
-
-Isolate the loss inside `PersistentSortedSet`: instrument (or replicate without
-Hibernate) the wrap → snapshot → cascade-iterate sequence and find which step
-sees one element instead of two. The core `java.util.TreeSet` natives are **not**
-the culprit — do not chase those. Compare a non-sorted `@OneToMany Set` (HashSet)
-mapping to determine whether the drop is sorted-specific or general to
-`PersistentSet` cascade.
+- `sorted.set.SortNaturalTest`, `sorted.set.SortComparatorTest`,
+  `sorted.map.SortNaturalTest`, `sorted.map.SortComparatorTest` — **all PASS**.
+- A `TreeCmpProbe` exercising multi-field `Comparable` keys (primitive field 0),
+  reverse ordering, `Integer`/`Long`/`String`, `Collections.sort`,
+  `Comparator.comparing`, and a non-`Comparable` `TreeSet` is **byte-identical to
+  HotSpot (java 25)**.
+- `cargo test -p cratonvm-native-collections --lib` → 69 passed, 0 failed.

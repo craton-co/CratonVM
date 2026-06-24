@@ -85,6 +85,19 @@ through the flood) are noted as CONFIRMED.
 
 ## 1. Sorted-set/-map ordering — collection hydration dedups distinct elements
 
+> **✅ FIXED 2026-06-24 (commit 9ac7ef1d, branch `fix/hib-sortnatural-cascade`).
+> The root cause below was WRONG.** It is NOT an `invokeinterface
+> Comparable.compareTo` mis-dispatch and NOT ByteBuddy proxy / SF-build
+> corruption. The real cause: the native `TreeSet`/`TreeMap` natural-order
+> comparator (`native-collections::natural_compare`) probed **field 0** of each
+> element as a primitive — so an entity with `@Id @GeneratedValue long id`
+> (id==0 on fresh instances) compared "equal" and dedup'd at `add()` time,
+> before any persist. The `long` vs boxed `Long` id type is what made the
+> `@SessionFactory` repro fail while the `MetadataSources` repro passed. Fix:
+> gate the fast path on `unbox_wrapper`. See
+> [`hib-sortnatural-persistentsortedset-cascade-drop.md`](../hib-sortnatural-persistentsortedset-cascade-drop.md).
+> All four `sorted.{set,map}.{SortNatural,SortComparator}Test` now pass.
+
 **Tests:** `org.hibernate.orm.test.sorted.set.SortComparatorTest`,
 `org.hibernate.orm.test.sorted.set.SortNaturalTest`
 (sibling `sorted.map.*` share the cause)
