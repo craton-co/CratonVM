@@ -590,6 +590,51 @@ pub unsafe fn write_value_atomic(slot: *mut Value, value: Value) {
     (*((slot as *const u8).add(8) as *const AtomicU64)).store(w1, Ordering::Relaxed);
 }
 
+/// The largest valid discriminant of [`Value`] — the index of the last variant
+/// (`Uninitialized`). The seven variants occupy discriminants `0..=6`; the
+/// discriminant is pinned to the **low 32 bits of word 0** by the layout test
+/// `value_discriminant_is_byte0_low32` below.
+///
+/// A 16-byte slot whose discriminant word exceeds this does **not** form a
+/// valid `Value`. Reading it with `ptr::read::<Value>` and then matching on it
+/// is undefined behavior: the compiler lowers a `Value` `match` to a jump table
+/// indexed by the discriminant, so a corrupt discriminant produces a wild
+/// indexed jump (an unrecoverable SIGSEGV far outside the program).
+pub const VALUE_MAX_DISCRIMINANT: u32 = 6;
+
+/// Read a `Value` from a heap slot, validating its discriminant **before**
+/// constructing the enum.
+///
+/// A heap field cell can be corrupted by a reference-integrity defect — e.g. a
+/// live object that was reclaimed and its storage reused (HIB-CV-32) — so the
+/// 16 bytes no longer form a valid `Value`: the discriminant word holds a heap
+/// pointer instead of a small enum tag. Decoding such bytes with
+/// `ptr::read::<Value>` yields a `Value` with an out-of-range discriminant, and
+/// the next `match` on it (e.g. the jump table in `CompactValue::from_value` at
+/// a `ValueStack::push`) performs a wild indexed jump — a SIGSEGV with no
+/// diagnosable context.
+///
+/// This decoder reads the discriminant word **as raw bits first** and rejects
+/// an out-of-range value, returning `None`. The caller turns `None` into a
+/// safe, diagnosable fallback (a benign null read) instead of constructing — or
+/// ever matching on — a corrupt `Value`. It is the only sound place to bound
+/// the discriminant: once the bytes are a `Value`, inspecting them is already
+/// UB.
+///
+/// # Safety
+/// `ptr` must be a readable, 8-byte-aligned pointer to a 16-byte `Value` slot.
+#[inline]
+pub unsafe fn read_value_checked(ptr: *const Value) -> Option<Value> {
+    // Read the discriminant as raw bits — NOT as a `Value` — so an out-of-range
+    // tag never reaches a `match`. Pinned to word-0 low-32 by the layout test.
+    let disc = std::ptr::read(ptr as *const u32);
+    if disc > VALUE_MAX_DISCRIMINANT {
+        return None;
+    }
+    // Discriminant is in range; the bytes form a valid `Value`.
+    Some(std::ptr::read(ptr))
+}
+
 impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -635,6 +680,61 @@ mod tests {
     fn value_null() {
         let v = Value::Object(None);
         assert!(v.is_null());
+    }
+
+    #[test]
+    fn value_discriminant_is_byte0_low32() {
+        // `read_value_checked` validates corruption by reading the discriminant
+        // as the low 32 bits of word 0. This pins that compiler-chosen layout:
+        // every variant must encode its declaration-order discriminant there,
+        // and every valid discriminant must be <= VALUE_MAX_DISCRIMINANT. If
+        // the layout ever drifts (reordering the tag, or moving it off word 0),
+        // this fails loudly — otherwise `read_value_checked` could reject valid
+        // values (e.g. an `Int` whose payload aliases byte 0) or pass corrupt
+        // ones.
+        let cases: [(Value, u32); 7] = [
+            (Value::Int(0), 0),
+            (Value::Long(0), 1),
+            (Value::Float(0.0), 2),
+            (Value::Double(0.0), 3),
+            (Value::Object(None), 4),
+            (Value::ReturnAddress(0), 5),
+            (Value::Uninitialized, 6),
+        ];
+        for (v, disc) in cases {
+            // SAFETY: Value is asserted to be exactly 16 bytes; reinterpreting
+            // it as two u64 words reads its own initialized bytes.
+            let words = unsafe { std::mem::transmute::<Value, [u64; 2]>(v) };
+            assert_eq!(
+                words[0] as u32, disc,
+                "discriminant of {v:?} is not at word-0 low-32"
+            );
+            assert!(disc <= VALUE_MAX_DISCRIMINANT);
+        }
+    }
+
+    #[test]
+    fn read_value_checked_round_trips_valid_and_rejects_corrupt() {
+        // Valid values decode unchanged.
+        for v in [
+            Value::Int(97),
+            Value::Long(-1),
+            Value::Double(1.5),
+            Value::Object(None),
+            Value::ReturnAddress(7),
+            Value::Uninitialized,
+        ] {
+            // SAFETY: &v is a valid, aligned 16-byte Value slot.
+            let got = unsafe { read_value_checked(&v as *const Value) };
+            assert_eq!(got, Some(v));
+        }
+        // A slot whose discriminant word is a heap-pointer-shaped value (the
+        // HIB-CV-32 corruption shape: {disc = pointer-low-32, payload = 6}) is
+        // rejected rather than decoded into a UB-on-match `Value`.
+        let corrupt: [u64; 2] = [0x0000_0001_02e9_1188, 6];
+        // SAFETY: `corrupt` is a 16-byte, 8-aligned buffer; we only read it.
+        let got = unsafe { read_value_checked(corrupt.as_ptr() as *const Value) };
+        assert_eq!(got, None);
     }
 
     #[test]
