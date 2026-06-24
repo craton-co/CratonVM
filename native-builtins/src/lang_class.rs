@@ -1896,9 +1896,30 @@ pub(crate) fn native_class_is_instance(
         }
     }
 
-    let result =
-        target_class_id == this_class_id || ctx.is_subclass(target_class_id, this_class_id);
-    Ok(Some(Value::Int(if result { 1 } else { 0 })))
+    if target_class_id == this_class_id || ctx.is_subclass(target_class_id, this_class_id) {
+        return Ok(Some(Value::Int(1)));
+    }
+
+    // Consistency with `getClass()`: synthetic collection wrappers (the
+    // `List.of`/`Map.of`/`Collections.unmodifiable*` families) and other
+    // JDK-aliased objects carry an internal craton stamp class as their raw
+    // header `class_id`, but `Object.getClass()` reports a cosmetic *display*
+    // class (e.g. `java.util.ImmutableCollections$List12`) via
+    // `getclass_display_class_id`. The internal stamp is not registered as a
+    // subtype of that display class, so the raw-id check above returns false
+    // for `List12.class.isInstance(List.of("a","b"))` even though
+    // `obj.getClass() == List12.class`. `Class.isInstance` must agree with
+    // `getClass()`, so also test the object's display class id. Spring's
+    // `GenericConversionService.convert` does `sourceType.getObjectType()
+    // .isInstance(source)` and throws "Source to convert from must be an
+    // instance of […]" when this disagrees — breaking every conversion whose
+    // source is an immutable collection.
+    if let Some(disp) = crate::getclass_display_class_id(ctx, target_class_id, target) {
+        if disp == this_class_id || ctx.is_subclass(disp, this_class_id) {
+            return Ok(Some(Value::Int(1)));
+        }
+    }
+    Ok(Some(Value::Int(0)))
 }
 
 /// S111r17 — Build the JVMS array descriptor (e.g. `[Ljava/lang/Class;`,

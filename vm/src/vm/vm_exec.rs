@@ -6117,6 +6117,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             code_source,
             allow_redefine: opts.allow_redefine,
             nest_host_class_name: opts.nest_host_class_name.clone(),
+            privileged_define: opts.privileged_define,
             ..Default::default()
         };
 

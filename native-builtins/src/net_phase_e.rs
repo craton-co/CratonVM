@@ -1920,17 +1920,35 @@ fn re1_socket_read_stream(
     if stream_id < 0 {
         return Err(ioex("Socket not connected"));
     }
-    let mut tmp = vec![0u8; ln];
-    let n = {
-        let mut reg = s2_registry().lock();
-        let stream = reg
-            .streams
-            .get_mut(&stream_id)
-            .ok_or_else(|| ioex("Socket stream not found"))?;
-        stream
-            .read(&mut tmp)
-            .map_err(|e| ioex(format!("Socket read failed: {e}")))?
+    // Clone the cheap Arc<TcpStream> out under a SHORT lock, then release
+    // s2_registry BEFORE the blocking read(). Holding the global registry lock
+    // across a blocking read deadlocks every other synthetic-socket operation
+    // process-wide: any peer thread that must WRITE the response (okhttp
+    // MockWebServer's dispatcher, a request/response loopback, …) blocks
+    // forever on the same lock while this read waits for bytes that only that
+    // write can produce → the HTTP exchange times out (BUG-04 loopback hang).
+    // The Arc shares the SAME socket fd (NOT a try_clone() duplicate — a recv
+    // blocked on a Windows duplicate handle is not woken by data arriving after
+    // it blocked), so reading via `&TcpStream` here is woken correctly while the
+    // lock is free for the peer writer.
+    let stream = {
+        let reg = s2_registry().lock();
+        reg.streams
+            .get(&stream_id)
+            .ok_or_else(|| ioex("Socket stream not found"))?
+            .clone()
     };
+    let dbg = std::env::var_os("CRATONVM_DBG_SOCK").is_some();
+    if dbg {
+        eprintln!("[dbg-sock] read: sid={stream_id} want={ln} (blocking on recv...)");
+    }
+    let mut tmp = vec![0u8; ln];
+    let n = (&*stream)
+        .read(&mut tmp)
+        .map_err(|e| ioex(format!("Socket read failed: {e}")))?;
+    if dbg {
+        eprintln!("[dbg-sock] read: sid={stream_id} got={n}");
+    }
     if n == 0 {
         return Ok(Some(Value::Int(-1)));
     }
@@ -1953,17 +1971,26 @@ fn re1_socket_write_stream(
     if stream_id < 0 {
         return Err(ioex("Socket not connected"));
     }
-    let mut reg = s2_registry().lock();
-    let stream = reg
-        .streams
-        .get_mut(&stream_id)
-        .ok_or_else(|| ioex("Socket stream not found"))?;
-    stream
+    // Clone the Arc out under a short lock and write on the shared `&TcpStream`
+    // with the lock released — same-fd handle, so the bytes hit the wire
+    // immediately (no deferred-until-close like a dropped try_clone duplicate)
+    // and a concurrently-reading peer is never wedged behind the registry lock.
+    let stream = {
+        let reg = s2_registry().lock();
+        reg.streams
+            .get(&stream_id)
+            .ok_or_else(|| ioex("Socket stream not found"))?
+            .clone()
+    };
+    (&*stream)
         .write_all(&data)
         .map_err(|e| ioex(format!("Socket write failed: {e}")))?;
-    stream
+    (&*stream)
         .flush()
         .map_err(|e| ioex(format!("Socket flush failed: {e}")))?;
+    if std::env::var_os("CRATONVM_DBG_SOCK").is_some() {
+        eprintln!("[dbg-sock] write: sid={stream_id} sent={} bytes", data.len());
+    }
     Ok(None)
 }
 
@@ -2254,6 +2281,21 @@ fn register_re1_socket(r: &mut NativeMethodRegistry) {
         let len = args.get(3).and_then(|v| v.as_int()).unwrap_or(0);
         re1_socket_read_stream(ctx, owner, buf, off, len)
     });
+    // read([B)I — MUST be registered directly. Without it, `in.read(byte[])`
+    // falls to the default java.io.InputStream.read(byte[]) bytecode, which
+    // reads ONE byte then loops single-byte read() to fill the ENTIRE array,
+    // blocking forever after the first record (e.g. it gets a 5-byte "PING\n"
+    // into a 64-byte buffer then blocks waiting for byte 6 that never comes).
+    // A single bulk read returning whatever is currently available (>=1 byte)
+    // is the correct InputStream.read(byte[]) contract and unblocks every
+    // server-side request read (okhttp MockWebServer, loopback HTTP). BUG-04.
+    r.register(sis, "read", "([B)I", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let owner = stream_owner_get(this).ok_or_else(|| ioex("SocketInputStream has no owner"))?;
+        let buf = obj_arg(args, 1)?;
+        let len = ctx.array_length(buf) as i32;
+        re1_socket_read_stream(ctx, owner, buf, 0, len)
+    });
     r.register(sis, "read", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let owner = stream_owner_get(this).ok_or_else(|| ioex("SocketInputStream has no owner"))?;
@@ -2302,7 +2344,7 @@ fn register_re1_socket(r: &mut NativeMethodRegistry) {
             if sid >= 0 {
                 let mut reg = s2_registry().lock();
                 if let Some(stream) = reg.streams.get_mut(&sid) {
-                    stream
+                    (&**stream)
                         .flush()
                         .map_err(|e| ioex(format!("flush failed: {e}")))?;
                 }
@@ -2400,9 +2442,19 @@ fn re2_accept_into(
     };
     let (stream, peer) =
         accept_result.map_err(|e| ioex(format!("ServerSocket.accept failed: {e}")))?;
+    // The accept may have come from the timeout-poll path (listener set
+    // non-blocking) or a try_clone'd listener; force the accepted stream to
+    // blocking so a server-side read() actually waits for data (and is woken by
+    // it) instead of returning WouldBlock or never signalling. (BUG-04)
+    let _ = stream.set_nonblocking(false);
     let peer_port = peer.port() as i32;
     let peer_ip = peer.ip().to_string();
     let local_port = stream.local_addr().map(|a| a.port() as i32).unwrap_or(0);
+    if std::env::var_os("CRATONVM_DBG_SOCK").is_some() {
+        eprintln!(
+            "[dbg-sock] accept: peer={peer_ip}:{peer_port} local_port={local_port} nonblocking_reset"
+        );
+    }
     let stream_id = s2_alloc_stream(stream);
     let host_str = ctx.create_string(&peer_ip);
     ctx.set_field(target, SOCK_HOST, Value::Object(Some(host_str)));
@@ -3428,6 +3480,24 @@ fn classpath_resource_via_context_loader(
     }
 }
 
+/// True when `s` is a usable *full URL* (carries a scheme), as opposed to a bare
+/// `host:port` authority. A real `java.net.URL`'s field index 5 is the
+/// `authority` (e.g. `"localhost:8080"`), NOT a synthetic full-URL cache — so a
+/// plain `contains(':')` test wrongly accepts the authority as the URL, making
+/// `toExternalForm()`/`openStream` see scheme `"localhost:8080"`
+/// (`unsupported scheme: localhost:<port>`). Discriminator: in a real URL the
+/// text after the FIRST ':' is `"//..."` or a path/opaque part; in an authority
+/// it is the numeric port. So reject when everything after the first ':' is
+/// ASCII digits (a port).
+fn field5_is_full_url(s: &str) -> bool {
+    match s.split_once(':') {
+        Some((scheme, rest)) => {
+            !scheme.is_empty() && !rest.is_empty() && !rest.bytes().all(|b| b.is_ascii_digit())
+        }
+        None => false,
+    }
+}
+
 fn register_re4_url_http(r: &mut NativeMethodRegistry) {
     let url = "java/net/URL";
 
@@ -3458,7 +3528,12 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
             _ => None,
         };
         if let Some(ref s) = synth_full {
-            if s.contains(':') && !s.is_empty() {
+            // Only treat field 5 as a full-URL cache when it actually carries a
+            // scheme — a real java.net.URL's field 5 is the `authority`
+            // (`host:port`), which must fall through to the reconstruction below
+            // instead of being returned as the whole URL. (BUG: openStream then
+            // saw `unsupported scheme: localhost:<port>`.)
+            if field5_is_full_url(s) {
                 return Ok(Some(Value::Object(Some(ctx.create_string(s)))));
             }
         }
@@ -3595,8 +3670,10 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
         // real-JDK URL instances whose slot 5 is empty; reading slot 0 alone
         // yielded "jar" and tripped the unsupported-scheme branch below.
         let mut url_str = read_field_string_or(ctx, this, 5, "");
-        if !url_str.contains(':') {
-            // Either empty or just a protocol — ask the URL for its full form.
+        if !field5_is_full_url(&url_str) {
+            // Empty, just a protocol, or a real-JDK `authority` (host:port) in
+            // field 5 — ask the URL for its full form (toExternalForm now
+            // reconstructs protocol://authority/path for real URLs).
             if let Ok(Some(Value::Object(Some(s)))) = ctx.invoke(
                 "java/net/URL",
                 "toExternalForm",

@@ -13,7 +13,7 @@ use crate::{alloc_concurrent_synthetic, native_noop_with_this, obj_arg};
 use std::collections::HashMap;
 use std::io::{Read as StdRead, Write as StdWrite};
 use std::net::{TcpListener, TcpStream, UdpSocket};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 #[cfg(feature = "synthetic-jdk")]
 fn r3_get_input_stream(ctx: &dyn NativeContext, buffered_reader: ObjectRef) -> Option<ObjectRef> {
@@ -933,7 +933,16 @@ pub(crate) fn register_s1_classloading(r: &mut NativeMethodRegistry) {
 
 pub(crate) struct SocketRegistry {
     pub(crate) next_id: i32,
-    pub(crate) streams: HashMap<i32, TcpStream>,
+    // Arc<TcpStream> (not bare TcpStream): a blocking read must run on the SAME
+    // OS socket fd without holding the global registry lock, so callers clone
+    // the cheap Arc under a short lock then do I/O on the shared `&TcpStream`
+    // (std impls Read/Write for `&TcpStream`). A try_clone() duplicate fd is the
+    // wrong tool here — on Windows a recv() blocked on a *duplicate* handle is
+    // not woken by data that arrives after it blocked, only by FIN/close, which
+    // wedges every request/response loopback (okhttp MockWebServer never
+    // replies). Holding the lock across the blocking read instead deadlocks the
+    // peer writer. Arc gives a same-fd handle that outlives the lock. (BUG-04)
+    pub(crate) streams: HashMap<i32, Arc<TcpStream>>,
     pub(crate) listeners: HashMap<i32, TcpListener>,
     /// NEW-3: persistent UDP sockets backing `java.nio.channels.DatagramChannel`
     /// instances. The previous implementation re-created a `UdpSocket` on every
@@ -1014,7 +1023,7 @@ fn s2_next_free_id(reg: &mut SocketRegistry) -> i32 {
 pub(crate) fn s2_alloc_stream(stream: TcpStream) -> i32 {
     let mut reg = s2_registry().lock();
     let id = s2_next_free_id(&mut reg);
-    reg.streams.insert(id, stream);
+    reg.streams.insert(id, Arc::new(stream));
     id
 }
 
@@ -2053,7 +2062,7 @@ fn s2_try_accept_nonblocking(reg: &mut SocketRegistry, lid: i32) -> Option<i32> 
             {
                 reg.next_id = reg.next_id.checked_add(1).unwrap_or(1);
             }
-            reg.streams.insert(id, stream);
+            reg.streams.insert(id, Arc::new(stream));
             Some(id)
         }
         Err(_) => None,
@@ -2081,7 +2090,7 @@ pub(crate) fn s2_blocking_accept(lid: i32) -> Option<i32> {
             {
                 reg.next_id = reg.next_id.checked_add(1).unwrap_or(1);
             }
-            reg.streams.insert(id, stream);
+            reg.streams.insert(id, Arc::new(stream));
             Some(id)
         }
         Err(_) => None,
@@ -3282,7 +3291,7 @@ fn register_s2_socket_channel(r: &mut NativeMethodRegistry) {
         let n = {
             let mut reg = s2_registry().lock();
             if let Some(stream) = reg.streams.get_mut(&sock_id) {
-                match stream.read(&mut tmp) {
+                match (&**stream).read(&mut tmp) {
                     Ok(0) => -1i32,
                     Ok(n) => n as i32,
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => 0,
@@ -3319,7 +3328,7 @@ fn register_s2_socket_channel(r: &mut NativeMethodRegistry) {
         let n = {
             let mut reg = s2_registry().lock();
             if let Some(stream) = reg.streams.get_mut(&sock_id) {
-                match stream.write(&data) {
+                match (&**stream).write(&data) {
                     Ok(n) => n as i32,
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => 0,
                     Err(_) => -1,
