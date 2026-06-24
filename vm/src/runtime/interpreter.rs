@@ -16442,13 +16442,36 @@ pub(crate) fn try_lambda_dispatch(
                 &call_site.impl_handle.descriptor,
                 &full_args,
             );
-            // If receiver's class didn't have the method, fall back to the
+            // If receiver's class didn't have the SAM method, fall back to the
             // class specified in the lambda call site. Handles objects with
             // generic ClassId (stub/Object) targeting a specific class.
+            //
+            // HIB-CV-31 FIX: the retry must fire ONLY when the SAM itself failed
+            // to resolve on the receiver — i.e. the `NoSuchMethodError` names
+            // exactly `(receiver_class, member_name)`. The old guard fired for
+            // ANY `NoSuchMethodError`, including one raised deep INSIDE a
+            // successfully-dispatched `onFlush` body (e.g. H2's `IOUtils.readFully`
+            // calling `in.read()` on a corrupted `InputStream` reference →
+            // `java/lang/Object.read()I` NSME). Because `receiver_class`
+            // (`DefaultFlushEventListener`) != `impl_handle.class_name`
+            // (the abstract `FlushEventListener`), the old guard re-dispatched
+            // `onFlush` onto the abstract interface — which has no Code attribute
+            // — fabricating a misleading `AbstractMethodError` that both masked
+            // the real in-body error and reported a phantom dispatch failure.
+            // Constraining the NSME to the SAM's own (class, method) makes the
+            // retry serve only its intended case (generic-ClassId receiver) and
+            // lets genuine in-body linkage errors propagate unchanged.
             let result = match &result {
                 Err(MethodCallFailed::InternalError(VmError::Linkage(
-                    LinkageError::NoSuchMethodError { .. },
-                ))) if receiver_class.as_str() != &*call_site.impl_handle.class_name => {
+                    LinkageError::NoSuchMethodError {
+                        class_name: nsme_class,
+                        method_name: nsme_method,
+                        ..
+                    },
+                ))) if receiver_class.as_str() != &*call_site.impl_handle.class_name
+                    && nsme_class.as_str() == receiver_class.as_str()
+                    && nsme_method.as_str() == &*call_site.impl_handle.member_name =>
+                {
                     invoke_or_native(
                         shared,
                         thread,
