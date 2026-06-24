@@ -2368,84 +2368,97 @@ fn re2_accept_into(
     if listener_id < 0 {
         return Err(ioex("ServerSocket not bound"));
     }
-    let accept_result: std::io::Result<(TcpStream, SocketAddr)> = if timeout_ms > 0 {
+    // Poll-based accept. We deliberately do NOT block directly on a
+    // `try_clone()`'d listener handle for the no-timeout case: on Windows,
+    // closing one duplicated socket handle does not unblock a thread blocked in
+    // `accept()` on another duplicate, so a `ServerSocket.close()` that drops
+    // the registry's listener could never interrupt a blocked accept. okhttp's
+    // MockWebServer relies on exactly that interruption — its accept runs on a
+    // TaskRunner queue and `close()` waits up to 5 s for that queue to drain,
+    // then throws `AssertionError: Gave up waiting for queue to shut down`
+    // (it polluted every Spring HTTP-client test teardown).
+    //
+    // Instead we set the listener non-blocking and poll it, re-checking the
+    // registry each iteration. When `close()` removes the listener (see
+    // `re2_server_socket_close`), the next poll observes its absence and we
+    // throw `SocketException("Socket closed")`, exactly as HotSpot's blocking
+    // accept does on a closed ServerSocket. Each iteration holds the registry
+    // lock only for the non-blocking accept syscall (never across a blocking
+    // call), so the Hibernate-JTA bind/accept deadlock the old try_clone path
+    // guarded against (registry lock held across a blocking accept) cannot
+    // recur. `timeout_ms <= 0` means block indefinitely (until a connection
+    // arrives or the socket is closed); `timeout_ms > 0` honours SO_TIMEOUT.
+    enum AcceptOutcome {
+        Accepted((TcpStream, SocketAddr)),
+        Closed,
+        TimedOut,
+        Failed(std::io::Error),
+    }
+    let deadline = (timeout_ms > 0)
+        .then(|| std::time::Instant::now() + Duration::from_millis(timeout_ms as u64));
+    let outcome = loop {
         {
             let mut reg = s2_registry().lock();
-            if let Some(listener) = reg.listeners.get_mut(&listener_id) {
-                listener.set_nonblocking(true).ok();
-            } else {
-                return Err(ioex("ServerSocket: listener fd missing"));
-            }
-        }
-        let deadline = std::time::Instant::now() + Duration::from_millis(timeout_ms as u64);
-        let mut result: std::io::Result<(TcpStream, SocketAddr)> = Err(std::io::Error::new(
-            std::io::ErrorKind::WouldBlock,
-            "accept timed out",
-        ));
-        loop {
-            {
-                let mut reg = s2_registry().lock();
-                match reg.listeners.get_mut(&listener_id) {
-                    Some(listener) => match listener.accept() {
-                        Ok(pair) => {
-                            result = Ok(pair);
-                            break;
-                        }
+            match reg.listeners.get_mut(&listener_id) {
+                Some(listener) => {
+                    // Idempotent + cheap; keeps the socket pollable.
+                    listener.set_nonblocking(true).ok();
+                    match listener.accept() {
+                        Ok(pair) => break AcceptOutcome::Accepted(pair),
                         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-                        Err(e) => {
-                            result = Err(e);
-                            break;
-                        }
-                    },
-                    None => {
-                        result = Err(std::io::Error::new(
-                            std::io::ErrorKind::NotFound,
-                            "ServerSocket: listener fd missing",
-                        ));
-                        break;
+                        Err(e) => break AcceptOutcome::Failed(e),
                     }
                 }
-            }
-            if std::time::Instant::now() >= deadline {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        {
-            let mut reg = s2_registry().lock();
-            if let Some(l) = reg.listeners.get_mut(&listener_id) {
-                l.set_nonblocking(false).ok();
+                // Listener gone from the registry => another thread called
+                // ServerSocket.close(). Mirror HotSpot: throw SocketException.
+                None => break AcceptOutcome::Closed,
             }
         }
-        result
-    } else {
-        // Clone the listener handle out under a SHORT lock, then release the
-        // s2_registry lock BEFORE the blocking accept(). Holding the global
-        // registry lock across a blocking accept() deadlocks every other
-        // synthetic-socket operation process-wide: Narayana's
-        // TransactionStatusManager Listener thread (no SO_TIMEOUT set, so it
-        // takes this branch) blocks here in accept() while the main thread's
-        // SocketProcessId bind (s2_alloc_listener -> s2_registry().lock()) waits
-        // for the same lock forever — the Hibernate JTA default-mode hang.
-        // try_clone() yields an independent handle to the same listening socket,
-        // so the original stays registered and the lock is free during accept().
-        let listener = {
-            let reg = s2_registry().lock();
-            reg.listeners
-                .get(&listener_id)
-                .ok_or_else(|| ioex("ServerSocket: listener fd missing"))?
-                .try_clone()
-                .map_err(|e| ioex(format!("ServerSocket.accept: try_clone failed: {e}")))?
-        };
-        let _ = listener.set_nonblocking(false);
-        listener.accept()
+        if let Some(dl) = deadline {
+            if std::time::Instant::now() >= dl {
+                break AcceptOutcome::TimedOut;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(10));
     };
-    let (stream, peer) =
-        accept_result.map_err(|e| ioex(format!("ServerSocket.accept failed: {e}")))?;
-    // The accept may have come from the timeout-poll path (listener set
-    // non-blocking) or a try_clone'd listener; force the accepted stream to
-    // blocking so a server-side read() actually waits for data (and is woken by
-    // it) instead of returning WouldBlock or never signalling. (BUG-04)
+
+    // Restore blocking mode on the shared listener if it survived, so later
+    // accept/getLocalSocketAddress calls see the conventional state.
+    {
+        let mut reg = s2_registry().lock();
+        if let Some(l) = reg.listeners.get_mut(&listener_id) {
+            l.set_nonblocking(false).ok();
+        }
+    }
+
+    let (stream, peer) = match outcome {
+        AcceptOutcome::Accepted(pair) => pair,
+        AcceptOutcome::Closed => {
+            // A real, catchable java.net.SocketException so MockWebServer's
+            // `catch (SocketException)` accept loop terminates cleanly (and its
+            // okhttp TaskRunner queue goes idle) instead of timing out.
+            let jmsg = ctx.create_string("Socket closed");
+            return match ctx.new_object_initialized(
+                "java/net/SocketException",
+                "(Ljava/lang/String;)V",
+                &[Value::Object(Some(jmsg))],
+            ) {
+                Ok(Some(Value::Object(Some(exc)))) => Err(
+                    cratonvm_types::error::MethodCallFailed::ExceptionThrown(exc),
+                ),
+                _ => Err(ioex("ServerSocket.accept: Socket closed")),
+            };
+        }
+        AcceptOutcome::TimedOut => {
+            return Err(ioex("ServerSocket.accept failed: accept timed out"));
+        }
+        AcceptOutcome::Failed(e) => {
+            return Err(ioex(format!("ServerSocket.accept failed: {e}")));
+        }
+    };
+    // Force the accepted stream to blocking so a server-side read() actually
+    // waits for data (and is woken by it) instead of returning WouldBlock or
+    // never signalling. (BUG-04)
     let _ = stream.set_nonblocking(false);
     let peer_port = peer.port() as i32;
     let peer_ip = peer.ip().to_string();
@@ -2522,6 +2535,35 @@ fn re2_server_socket_bind(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     re2_bind_listener(ctx, this, &host, port, backlog)
 }
 
+/// `java.net.ServerSocket.close()` for the synthetic re2 surface. Drops the
+/// listener from the shared `s2` registry (so the accept poll loop in
+/// [`re2_accept_into`] observes the absence and throws `SocketException`,
+/// matching HotSpot's blocked-accept-on-close) and clears the SO_TIMEOUT.
+///
+/// Also installed as the cross-crate plain-close hook
+/// ([`cratonvm_native_api::plain_server_socket_close`]) so native-io's *winning*
+/// `ss_wrapper_close` (which shadows this registration) delegates the
+/// no-channel-back-ref (plain `new ServerSocket()`) case back here instead of
+/// no-opping. Without this, a plain `ServerSocket.close()` released nothing, so
+/// the listener stayed registered and a blocked accept never woke: okhttp's
+/// `MockWebServer.close()` waits up to 5 s for its accept TaskRunner queue to
+/// drain on teardown, then throws
+/// `AssertionError: Gave up waiting for queue to shut down` (BUG: it polluted
+/// every Spring HTTP-client test teardown). Mirrors the BUG-04 plain-bind hook.
+fn re2_server_socket_close(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let lid = ss_get(this).listener_id;
+    if lid >= 0 {
+        s2_registry().lock().listeners.remove(&lid);
+        re2_clear_accept_timeout(lid);
+    }
+    ss_set(this, |s| {
+        s.closed = 1;
+        s.listener_id = -1;
+    });
+    Ok(None)
+}
+
 fn register_re2_server_socket(r: &mut NativeMethodRegistry) {
     // NIO-SERVER-SOCKET (route 1): skip the synthetic java.net.ServerSocket
     // surface so real bytecode drives sun/nio/ch/Net. See
@@ -2534,6 +2576,10 @@ fn register_re2_server_socket(r: &mut NativeMethodRegistry) {
     // early-return above is the REAL_NET_SOCKETS path where native-io also defers
     // to real bytecode, so the hook is simply never consulted).
     cratonvm_native_api::plain_server_socket_bind::set(re2_server_socket_bind);
+    // Companion plain-close hook (see re2_server_socket_close): native-io's
+    // winning ss_wrapper_close delegates the plain ServerSocket case here so
+    // close() actually drops the listener and wakes a blocked accept().
+    cratonvm_native_api::plain_server_socket_close::set(re2_server_socket_close);
     let ss = "java/net/ServerSocket";
 
     r.register(ss, "<init>", "()V", |_ctx, args| {
@@ -2643,19 +2689,7 @@ fn register_re2_server_socket(r: &mut NativeMethodRegistry) {
         Ok(Some(Value::Int(1)))
     });
 
-    r.register(ss, "close", "()V", |_ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let lid = ss_get(this).listener_id;
-        if lid >= 0 {
-            s2_registry().lock().listeners.remove(&lid);
-            re2_clear_accept_timeout(lid);
-        }
-        ss_set(this, |s| {
-            s.closed = 1;
-            s.listener_id = -1;
-        });
-        Ok(None)
-    });
+    r.register(ss, "close", "()V", re2_server_socket_close);
 
     r.register(ss, "isBound", "()Z", |_ctx, args| {
         let this = obj_arg(args, 0)?;
