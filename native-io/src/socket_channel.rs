@@ -2289,11 +2289,21 @@ fn ss_wrapper_local_address(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     if port <= 0 {
         return Ok(Some(Value::Object(None)));
     }
-    let isa = alloc_obj(ctx, "java/net/InetSocketAddress", 2);
-    let host = ctx.create_string("0.0.0.0");
-    ctx.set_field(isa, 0, Value::Object(Some(host)));
-    ctx.set_field(isa, 1, Value::Int(port));
-    Ok(Some(Value::Object(Some(isa))))
+    // Build via the REAL `InetSocketAddress(String,int)` ctor (like
+    // `ssc_local_address` above), NOT a flat 2-slot synthetic: the real
+    // `getPort()`/`getHostString()`/`toString()` bytecode reads
+    // `this.holder.port` / `this.holder.hostname`, and a flat object has a null
+    // `holder` → `getPort()` returns 0. okhttp's `MockWebServer.getPort()` reads
+    // `(serverSocket.localSocketAddress as InetSocketAddress).port`, so the flat
+    // object made it 0 → every Spring HTTP-client test connected to
+    // `http://localhost:0` and failed (BUG-04). The real ctor populates the
+    // holder so `getPort()` returns the bound ephemeral port.
+    let h = ctx.create_string("0.0.0.0");
+    ctx.new_object_initialized(
+        "java/net/InetSocketAddress",
+        "(Ljava/lang/String;I)V",
+        &[Value::Object(Some(h)), Value::Int(port)],
+    )
 }
 
 fn ss_wrapper_is_bound(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
