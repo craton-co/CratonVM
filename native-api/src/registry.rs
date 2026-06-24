@@ -115,6 +115,17 @@ pub struct DefineClassFull {
     pub nest_host_class_name: Option<String>,
     /// If `true`, run `<clinit>` on the new class before returning.
     pub initialize: bool,
+    /// Privileged define: the bytes come from a trusted JVM-internal
+    /// code-generation path (`sun.misc.Unsafe.defineClass` /
+    /// `jdk.internal.misc.Unsafe.defineClass0`) that, on HotSpot, bypasses
+    /// `ClassLoader.preDefineClass`'s "Prohibited package name: java.*"
+    /// guard. Set by the Unsafe.defineClass natives so toolchains like
+    /// ByteBuddy can inject a privileged accessor (e.g.
+    /// `java.lang.ClassLoader$ByteBuddyAccessor$V1`) into a protected
+    /// platform package, exactly as they do on a real JVM. Off by default;
+    /// the ordinary `ClassLoader.defineClass` path leaves it false so the
+    /// spoofing guard still applies there.
+    pub privileged_define: bool,
 }
 
 /// Compute a fast 128-bit hash key for a native method triple.

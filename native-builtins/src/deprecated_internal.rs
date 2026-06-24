@@ -504,7 +504,16 @@ fn native_unsafe_define_class(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
         _ => 0,
     };
 
-    let opts = cratonvm_native_api::DefineClassFull::default();
+    // BUG-10: `Unsafe.defineClass` is the privileged JVM-internal define path
+    // that HotSpot routes around `preDefineClass`'s prohibited-package guard.
+    // ByteBuddy's `ClassInjector` injects `java.lang.ClassLoader$ByteBuddyAccessor$V1`
+    // through it (driven by AssertJ/Mockito); mark the define privileged so the
+    // H5 guard is bypassed, matching the real JVM. (Twin of the handler in
+    // `unsafe_natives.rs`; both `Unsafe.defineClass` registrations must agree.)
+    let opts = cratonvm_native_api::DefineClassFull {
+        privileged_define: true,
+        ..Default::default()
+    };
     let effective_name = if class_name.is_empty() {
         // No name supplied — backend will pull `this_class` from the
         // class file. We pass empty so the name-match check is a

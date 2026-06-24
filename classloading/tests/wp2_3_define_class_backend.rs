@@ -585,3 +585,89 @@ fn no_npe_in_memory_class_has_non_bootstrap_code_source() {
         "URL must not start with `class:` (bootstrap sentinel) so the native does not return null PD",
     );
 }
+
+/// BUG-10 — build a minimal-but-valid class file whose `this_class` names a
+/// protected platform package (`java/lang/<name>`), extending Object, with
+/// no fields/methods/attributes. Used to exercise the H5 prohibited-package
+/// guard directly (the `Hello` fixture declares `Hello`, which never trips it).
+fn minimal_java_lang_class_bytes(simple_name: &str) -> Vec<u8> {
+    let this_name = format!("java/lang/{simple_name}");
+    let super_name = "java/lang/Object";
+    let mut b: Vec<u8> = Vec::new();
+    b.extend_from_slice(&[0xCA, 0xFE, 0xBA, 0xBE]); // magic
+    b.extend_from_slice(&[0x00, 0x00]); // minor
+    b.extend_from_slice(&[0x00, 0x34]); // major 52 (Java 8)
+    b.extend_from_slice(&[0x00, 0x05]); // constant_pool_count = 5 (#1..#4)
+    // #1 CONSTANT_Class -> #2
+    b.push(7);
+    b.extend_from_slice(&[0x00, 0x02]);
+    // #2 CONSTANT_Utf8 this_name
+    b.push(1);
+    b.extend_from_slice(&(this_name.len() as u16).to_be_bytes());
+    b.extend_from_slice(this_name.as_bytes());
+    // #3 CONSTANT_Class -> #4
+    b.push(7);
+    b.extend_from_slice(&[0x00, 0x04]);
+    // #4 CONSTANT_Utf8 super_name
+    b.push(1);
+    b.extend_from_slice(&(super_name.len() as u16).to_be_bytes());
+    b.extend_from_slice(super_name.as_bytes());
+    b.extend_from_slice(&[0x00, 0x21]); // access_flags = ACC_PUBLIC|ACC_SUPER
+    b.extend_from_slice(&[0x00, 0x01]); // this_class = #1
+    b.extend_from_slice(&[0x00, 0x03]); // super_class = #3
+    b.extend_from_slice(&[0x00, 0x00]); // interfaces_count
+    b.extend_from_slice(&[0x00, 0x00]); // fields_count
+    b.extend_from_slice(&[0x00, 0x00]); // methods_count
+    b.extend_from_slice(&[0x00, 0x00]); // attributes_count
+    b
+}
+
+/// BUG-10 — a non-bootstrap loader must NOT be able to define a class in a
+/// protected platform package via the ordinary path (the H5 spoofing guard).
+#[test]
+fn h5_rejects_prohibited_package_for_ordinary_define() {
+    let mut cm = fresh_manager();
+    let bytes = minimal_java_lang_class_bytes("Bug10OrdinaryEvil");
+    let err = cm
+        .define_class_with_options(
+            "java/lang/Bug10OrdinaryEvil",
+            &bytes,
+            ClassLoaderId::Application,
+            DefineClassOptions {
+                // skip the bytecode verifier — we only want to reach the H5
+                // prohibited-package gate, not exercise full verification.
+                skip_verification: true,
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("Prohibited package name"),
+        "ordinary app-loader define into java.* must be rejected, got: {msg}"
+    );
+}
+
+/// BUG-10 — a PRIVILEGED define (`Unsafe.defineClass`) bypasses the H5 guard,
+/// matching HotSpot, so ByteBuddy/CGLIB can inject an accessor such as
+/// `java.lang.ClassLoader$ByteBuddyAccessor$V1`. Same bytes, same loader, only
+/// the `privileged_define` flag differs from the rejected case above.
+#[test]
+fn h5_allows_prohibited_package_for_privileged_define() {
+    let mut cm = fresh_manager();
+    let bytes = minimal_java_lang_class_bytes("Bug10PrivilegedAccessor");
+    let cid = cm
+        .define_class_with_options(
+            "java/lang/Bug10PrivilegedAccessor",
+            &bytes,
+            ClassLoaderId::Application,
+            DefineClassOptions {
+                skip_verification: true,
+                privileged_define: true,
+                ..Default::default()
+            },
+        )
+        .expect("privileged Unsafe.defineClass into java.* must be allowed");
+    let cls = cm.class_store.get(cid).expect("class exists");
+    assert_eq!(&*cls.name, "java/lang/Bug10PrivilegedAccessor");
+}

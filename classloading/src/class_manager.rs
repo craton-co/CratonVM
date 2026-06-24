@@ -910,6 +910,14 @@ pub struct DefineClassOptions {
     /// `nest_host` is set to the lookup class's nest host, NOT to its
     /// own name). Mirrors `Lookup.defineHiddenClass(... NESTMATE ...)`.
     pub nest_host_class_name: Option<String>,
+    /// BUG-10: Privileged define from a trusted JVM-internal code-generation
+    /// path (`sun.misc.Unsafe.defineClass`). On HotSpot, `Unsafe.defineClass`
+    /// bypasses `ClassLoader.preDefineClass`'s "Prohibited package name:
+    /// java.*" guard, so toolchains (ByteBuddy/CGLIB) can inject a privileged
+    /// accessor into a protected platform package. When `true`, the H5
+    /// prohibited-package check below is skipped — matching that semantics.
+    /// The ordinary `ClassLoader.defineClass` path leaves this `false`.
+    pub privileged_define: bool,
 }
 
 /// Options for [`ClassManager::redefine_class`] (WP2.4-B).
@@ -2602,9 +2610,16 @@ impl ClassManager {
         //     that deliberately register under a mangled name and are
         //     gated by the trusted lookup that produced them; the real
         //     JVM permits them to live in restricted packages.
+        //   * Privileged defines (`Unsafe.defineClass`, BUG-10) are the
+        //     all-powerful JVM-internal path HotSpot itself routes around
+        //     `preDefineClass`; ByteBuddy/CGLIB use it to inject an accessor
+        //     such as `java.lang.ClassLoader$ByteBuddyAccessor$V1`. Any code
+        //     that holds `Unsafe` already has full VM power, so exempting it
+        //     does not widen the threat model.
         if loader_id != ClassLoaderId::Bootstrap
             && !options.hidden
             && options.override_name.is_none()
+            && !options.privileged_define
         {
             let defined_name: &str = &class_file.this_class;
             if is_prohibited_package_name(defined_name) {
