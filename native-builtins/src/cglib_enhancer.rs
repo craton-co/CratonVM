@@ -1054,6 +1054,65 @@ fn coerce_class_arg(v: Value) -> Value {
 
 const BEAN_ANNOTATION_DESC: &str = "Lorg/springframework/context/annotation/Bean;";
 
+/// True if the method carries `@Bean` directly, or transitively through a
+/// meta-annotation (a composed annotation that is itself annotated `@Bean`,
+/// e.g. `@MyProxiedScope = @Bean @Scope(proxyMode=TARGET_CLASS)`). Mirrors
+/// Spring's meta-annotation-aware `@Bean` lookup.
+fn method_carries_bean(
+    ctx: &mut dyn NativeContext,
+    class_id: cratonvm_types::ClassId,
+    name: &str,
+    descriptor: &str,
+) -> bool {
+    let direct = ctx.method_annotations(class_id, name, descriptor);
+    let mut visited = std::collections::HashSet::new();
+    annotations_contain_bean(ctx, &direct, &mut visited, 0)
+}
+
+/// Recursive worker for [`method_carries_bean`]: returns true if `anns` (or any
+/// of their annotation types, transitively) include `@Bean`. A visited-set and
+/// a depth cap guard against the cyclic JDK meta-annotations
+/// (`@Retention`/`@Target`/`@Documented` reference each other); `java`/`jdk`/
+/// `kotlin` annotation packages are skipped outright — they never carry `@Bean`.
+fn annotations_contain_bean(
+    ctx: &mut dyn NativeContext,
+    anns: &[cratonvm_native_api::AnnotationData],
+    visited: &mut std::collections::HashSet<String>,
+    depth: u32,
+) -> bool {
+    if anns.iter().any(|a| a.type_descriptor == BEAN_ANNOTATION_DESC) {
+        return true;
+    }
+    if depth >= 5 {
+        return false;
+    }
+    // Clone the meta-annotation types first so we don't hold a borrow on `anns`
+    // across the `&mut ctx` calls below.
+    let metas: Vec<String> = anns.iter().map(|a| a.type_descriptor.clone()).collect();
+    for desc in metas {
+        if !(desc.starts_with('L') && desc.ends_with(';')) {
+            continue;
+        }
+        let internal = &desc[1..desc.len() - 1];
+        if internal.starts_with("java/")
+            || internal.starts_with("jdk/")
+            || internal.starts_with("kotlin/")
+        {
+            continue;
+        }
+        if !visited.insert(internal.to_string()) {
+            continue;
+        }
+        if let Some(cid) = ctx.class_id_by_name(internal) {
+            let meta_anns = ctx.class_annotations(cid);
+            if annotations_contain_bean(ctx, &meta_anns, visited, depth + 1) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Scan the `@Configuration` class for `@Bean` factory methods that the
 /// enhancer can safely override with shared-singleton interception. We only
 /// take **instance, no-arg, reference-returning, non-final** methods — the
@@ -1091,12 +1150,13 @@ fn scan_bean_methods(
             continue;
         }
         let return_internal = ret[1..ret.len() - 1].to_string();
-        // Must carry @Bean.
-        let has_bean = ctx
-            .method_annotations(class_id, &m.name, &m.descriptor)
-            .iter()
-            .any(|a| a.type_descriptor == BEAN_ANNOTATION_DESC);
-        if !has_bean {
+        // Must carry @Bean — directly OR via a meta-annotation (a composed
+        // annotation such as `@MyProxiedScope` that is itself meta-annotated
+        // `@Bean`). Spring's `@Bean` detection is meta-annotation aware, so the
+        // enhancer must intercept those methods too; otherwise an inter-bean
+        // reference to such a method runs the raw body and bypasses the
+        // container (e.g. the scoped-proxy is never substituted).
+        if !method_carries_bean(ctx, class_id, &m.name, &m.descriptor) {
             continue;
         }
         // Guard against duplicate (name, descriptor) — a class can't declare
