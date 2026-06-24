@@ -4037,31 +4037,110 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         },
     );
 
-    // `java.lang.Module` access checks — permissive overrides.
+    // `java.lang.Module` access checks — registry-backed exports/opens modeling.
     //
     // `getModule()` above returns named Module mirrors (so `getName()`/identity
-    // match the real JDK) but does NOT populate the Java-side `descriptor` field.
-    // Real `Module.isExported`/`isOpen` bytecode dereferences `descriptor` and
-    // NPEs (e.g. Hibernate's `JdbcTypeNameMapper.<clinit>` reflecting over
-    // `java.sql.Types`), and even with a synthetic descriptor the JDK's
-    // `descriptor.packages().contains(pkg)` check would deny access because we do
-    // not enumerate a module's packages. CratonVM has no real module-path
-    // encapsulation — every class is effectively on the class path, where the
-    // JDK performs no inter-module access checks — so these reflective access
-    // probes must all succeed. Return `true` for any non-null receiver. This
-    // matches the synthetic-jdk `register_p59_module` overrides for real-JDK mode
-    // and is the access analogue of the always-true `Module.canRead`/`canUse`
-    // natives already registered.
-    let module_access_permissive: cratonvm_native_api::NativeCallback =
-        |_ctx, args| Ok(Some(Value::Int(matches!(args.first(), Some(Value::Object(Some(_)))) as i32)));
-    for (method, descr) in [
-        ("isExported", "(Ljava/lang/String;)Z"),
-        ("isExported", "(Ljava/lang/String;Ljava/lang/Module;)Z"),
-        ("isOpen", "(Ljava/lang/String;)Z"),
-        ("isOpen", "(Ljava/lang/String;Ljava/lang/Module;)Z"),
-    ] {
-        registry.register("java/lang/Module", method, descr, module_access_permissive);
+    // match the real JDK) but does NOT populate the Java-side `descriptor` field,
+    // so the real `Module.isExported`/`isOpen` bytecode dereferences a null
+    // `descriptor` and NPEs in every reflective access check (Groovy
+    // `CachedClass.getMethods` → `ReflectionUtils.checkCanSetAccessible` →
+    // `Java9.checkAccessible` → `Module.implIsExportedOrOpen`, and Hibernate's
+    // `JdbcTypeNameMapper.<clinit>` reflecting over `java.sql.Types`). These
+    // natives are force-listed over the real bytecode (see
+    // `force_native_over_real_jdk_bytecode`) so the NPE never fires.
+    //
+    // Crucially they answer from the boot `ModuleRegistry`, which carries the
+    // accurate per-module exports/opens parsed from each module-info (java.base
+    // exports `java.lang`/`java.util`/… to all but NOT `jdk.internal.*`/`sun.*`;
+    // application-classpath jars register as automatic modules that export every
+    // package). A blanket-`true` answer also removes the NPE but regresses
+    // ByteBuddy's `JavaDispatcher`, which queries
+    // `java.base.isExported("jdk.internal.…")` and needs the real-JDK `false` to
+    // select its fallback strategy. The receiver's module name lives at synthetic
+    // slot 0 (dual-written by `getModule()` above); an unnamed module (null name →
+    // empty string) exports and opens everything, matching the JDK's
+    // `if (!isNamed()) return true;` short-circuit. The Java API uses dot-format
+    // package names; the registry is keyed on slash-format.
+    fn module_name_of_mirror(ctx: &dyn NativeContext, m: ObjectRef) -> String {
+        match ctx.get_field(m, 0) {
+            Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+            _ => String::new(), // unnamed module
+        }
     }
+    fn module_pkg_arg(ctx: &dyn NativeContext, args: &[Value]) -> Option<String> {
+        match args.get(1) {
+            Some(Value::Object(Some(s))) => Some(ctx.read_string(*s).unwrap_or_default().replace('.', "/")),
+            _ => None,
+        }
+    }
+    // Module.isExported(String) — exported unqualified (to EVERYONE).
+    registry.register(
+        "java/lang/Module",
+        "isExported",
+        "(Ljava/lang/String;)Z",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let module_name = module_name_of_mirror(ctx, this);
+            let Some(pkg) = module_pkg_arg(ctx, args) else {
+                return Ok(Some(Value::Int(0)));
+            };
+            let ok = ctx.is_package_exported_unqualified(&module_name, &pkg);
+            Ok(Some(Value::Int(ok as i32)))
+        },
+    );
+    // Module.isExported(String, Module) — exported to the given module.
+    registry.register(
+        "java/lang/Module",
+        "isExported",
+        "(Ljava/lang/String;Ljava/lang/Module;)Z",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let module_name = module_name_of_mirror(ctx, this);
+            let Some(pkg) = module_pkg_arg(ctx, args) else {
+                return Ok(Some(Value::Int(0)));
+            };
+            let to_module = match args.get(2) {
+                Some(Value::Object(Some(o))) => module_name_of_mirror(ctx, *o),
+                _ => String::new(),
+            };
+            let ok = ctx.is_package_exported_to(&module_name, &pkg, &to_module);
+            Ok(Some(Value::Int(ok as i32)))
+        },
+    );
+    // Module.isOpen(String) — opened unqualified (to EVERYONE).
+    registry.register(
+        "java/lang/Module",
+        "isOpen",
+        "(Ljava/lang/String;)Z",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let module_name = module_name_of_mirror(ctx, this);
+            let Some(pkg) = module_pkg_arg(ctx, args) else {
+                return Ok(Some(Value::Int(0)));
+            };
+            let ok = ctx.is_package_open_unqualified(&module_name, &pkg);
+            Ok(Some(Value::Int(ok as i32)))
+        },
+    );
+    // Module.isOpen(String, Module) — opened to the given module.
+    registry.register(
+        "java/lang/Module",
+        "isOpen",
+        "(Ljava/lang/String;Ljava/lang/Module;)Z",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let module_name = module_name_of_mirror(ctx, this);
+            let Some(pkg) = module_pkg_arg(ctx, args) else {
+                return Ok(Some(Value::Int(0)));
+            };
+            let to_module = match args.get(2) {
+                Some(Value::Object(Some(o))) => module_name_of_mirror(ctx, *o),
+                _ => String::new(),
+            };
+            let ok = ctx.is_package_open_to(&module_name, &pkg, &to_module);
+            Ok(Some(Value::Int(ok as i32)))
+        },
+    );
 
     registry.register(
         "java/lang/Class",

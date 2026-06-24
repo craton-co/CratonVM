@@ -738,7 +738,9 @@ impl ModuleRegistry {
             return true; // unnamed module exports everything
         }
         if let Some(desc) = self.modules.get(module_name) {
-            if desc.is_open {
+            // Automatic modules (classpath jars carrying a module-info) export
+            // every package to everyone, matching `exports_package_to`.
+            if desc.automatic || desc.is_open {
                 return true;
             }
             if desc
@@ -793,7 +795,9 @@ impl ModuleRegistry {
             return true; // unnamed module opens everything
         }
         if let Some(desc) = self.modules.get(module_name) {
-            if desc.is_open {
+            // Automatic modules open every package to everyone, matching
+            // `opens_package_to`.
+            if desc.automatic || desc.is_open {
                 return true;
             }
             if desc
