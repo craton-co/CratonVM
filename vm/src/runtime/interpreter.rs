@@ -23802,6 +23802,42 @@ fn execute_invokevirtual_cached(
                 return res;
             }
 
+            // Acquire monitor for synchronized methods. This statically-resolved
+            // `Bytecode` arm serves `invokespecial` (super-calls) and any
+            // invoke whose inline cache resolved to a non-virtual bytecode
+            // target. Unlike the `VirtualBytecode` and `invokestatic`
+            // `Bytecode` arms — which both do this — the original code here
+            // pushed the frame WITHOUT entering the method's monitor and
+            // without recording `monitor_on_exit`. A `synchronized` method
+            // reached on this cached path therefore ran without holding its
+            // lock: silently wrong for mutual exclusion, and an outright
+            // IllegalMonitorStateException the moment the body calls
+            // `wait`/`notify`/`notifyAll` on `this`. The first call (slow path
+            // `try_stackless_invoke`) acquires the monitor correctly, so the
+            // bug only surfaces on the 2nd+ call once this arm's cache entry is
+            // live. Observed as Apache Derby's embedded boot failing with
+            // `XBM01.D` — `BasePage.releaseExclusive` is a `synchronized`
+            // method invoked via `super` (invokespecial) that calls
+            // `notifyAll()` on `this` to release a page latch. Mirror the
+            // `VirtualBytecode` arm exactly.
+            let monitor_obj: Option<ObjectRef> = if cached.is_synchronized {
+                let obj = if cached.is_static {
+                    // JVMS §2.11.10: static-synchronized monitor is the Class
+                    // mirror (same object as ldc class / synchronized(X.class)).
+                    get_or_create_class_mirror(shared, cached.declaring_class_id)
+                } else {
+                    // Receiver is args_slice[0] for instance calls.
+                    match args_slice.first() {
+                        Some(Value::Object(Some(r))) => *r,
+                        _ => return Ok(CachedCallResult::CacheMiss),
+                    }
+                };
+                shared.monitors.enter(obj, thread.thread_id);
+                Some(obj)
+            } else {
+                None
+            };
+
             // T10.7 — refill per-thread pool from the shared VecPool if empty.
             thread.refill_pools_from_shared(
                 &shared.operand_stack_pool,
@@ -23811,12 +23847,13 @@ fn execute_invokevirtual_cached(
                 // Widening: small unsigned (u8/u16/i32 index) -> usize (non-negative, fits)
                 (cached.max_stack as usize).max(16) + 8,
             );
-            let frame = Frame::new_pooled_cached(
+            let mut frame = Frame::new_pooled_cached(
                 cached,
                 args_slice,
                 &mut thread.locals_pool,
                 &mut thread.stacks_pool,
             );
+            frame.monitor_on_exit = monitor_obj;
             if crate::runtime::env_cache::frame_trace() {
                 eprintln!(
                     "[FRAME_PUSH/vcached2] depth={} {}.{}{}",
