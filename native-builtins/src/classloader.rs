@@ -3489,30 +3489,6 @@ fn lk_define_class(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         return Ok(Some(v));
     }
 
-    // Define the new class in the SAME loader namespace as the lookup class,
-    // not the global application namespace (id 0). A normal `Lookup.defineClass`
-    // keeps the class file's own fixed name (no mangling, unlike a hidden class),
-    // so defining it under the application loader makes two *isolated* class
-    // loaders that each define a same-named class collide: the second define
-    // trips the duplicate-define guard ("class … already defined by application
-    // loader" → IncompatibleClassChangeError). This is exactly ByteBuddy's
-    // per-loader entity proxy (`Entity$HibernateProxy`) under Hibernate's
-    // `IsolatingClassLoader` (ProxyClassReuseTest). Derive the namespace from
-    // the lookup class's defining loader; fall back to 0 (app/bootstrap) when
-    // the lookup class has no custom defining loader.
-    let lookup_loader: Option<ObjectRef> = match args.first() {
-        Some(Value::Object(Some(lookup))) => match ctx.get_field(*lookup, LK_LOOKUP_CLASS_REF) {
-            Value::Object(Some(mirror)) => crate::lang_class::mirror_class_id(ctx, mirror)
-                .and_then(|cid| defining_loader_for(cid.as_u32())),
-            _ => None,
-        },
-        _ => None,
-    };
-    let loader_ns = match lookup_loader {
-        Some(loader) => loader_namespace_id(ctx, loader),
-        None => 0,
-    };
-
     // Extract the class file's own name; the backend will validate it
     // and reject mismatches with NoClassDefFoundError. We pass an
     // empty name so the backend skips its name-mismatch check (the
@@ -3520,7 +3496,7 @@ fn lk_define_class(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     let opts = cratonvm_native_api::DefineClassFull::default();
     // catch_unwind: backend may panic on malformed bytecode.
     let define_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        ctx.define_class_full("", &class_bytes, loader_ns, opts)
+        ctx.define_class_full("", &class_bytes, 0, opts)
     }));
     let define_result = match define_result {
         Ok(r) => r,
@@ -3537,12 +3513,6 @@ fn lk_define_class(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     };
     match define_result {
         Ok(cid) => {
-            // Record the lookup class's loader as the new class's defining loader
-            // so `proxyClass.getClassLoader()` returns that isolated loader (the
-            // test asserts `proxyClass1.getClassLoader() == cl1`).
-            if let Some(loader) = lookup_loader {
-                register_defining_loader(cid.as_u32(), loader);
-            }
             let mirror = ctx.get_class_mirror(cid);
             Ok(Some(Value::Object(Some(mirror))))
         }
