@@ -8,13 +8,14 @@ metadata:
 
 # SpringRepos tail — Groovy closure→SAM proxy dispatch + Mockito-mock SAM coercion
 
-**Status:** 🟢 MOSTLY FIXED — `9/11`. Groovy/indy + Module + Mockito-inline-mock
-layers (1–3f, g1, g2, h1, h2) all FIXED. Inline mocking now fully functions on
-CratonVM. Remaining `2/11` (h3) is a Groovy closure→env-var-lookup tail, not the
-mock framework. NOTE: the first inline-mock retransformation (ByteBuddy `Advice`
-weaving) is slow — under the default 120s `--stack-dump-on-timeout` watchdog the
-run aborts mid-weave; pass `--stack-dump-on-timeout=0` (or a larger value) to let
-it complete. That's the known interpreter throughput wall, not a hang.
+**Status:** ✅ FIXED — **`11/11` FULL GREEN.** All layers resolved: Groovy/indy
+(1–3f, g1), Module access (g2), Mockito inline-mock create+dispatch (h1 addReads0,
+h2 `ConcurrentHashMap(Map)` ctor), and the `%S` format conversion (h3). Inline
+mocking now functions end-to-end on CratonVM. NOTE: the first inline-mock
+retransformation (ByteBuddy `Advice` weaving) is slow — under the default 120s
+`--stack-dump-on-timeout` watchdog the run aborts mid-weave; pass
+`--stack-dump-on-timeout=0` (or a larger value) to let it complete. That's the
+known interpreter throughput wall, not a hang.
 `org.springframework.boot.build.groovyscripts.SpringRepositoriesExtensionTests`
 (Spring Boot buildSrc). The earlier layers are all FIXED; see
 [[spring-boot-groovy-indy-runtime-argcount-3c-FIXED]],
@@ -36,7 +37,7 @@ it complete. That's the known interpreter throughput wall, not a hang.
 | g3 | ByteBuddy `JavaDispatcher.<clinit>` → `IllegalStateException: Failed to create invoker` (reached once g2's NPE is bypassed) | 🟡 should be unblocked by the accurate g2 fix (JavaDispatcher now sees `jdk.internal.*` as not-exported and takes its fallback); not separately re-verified — SpringRepos now fails further along at the Mockito **inline-mock** wall (layer h) |
 | h1 | Mockito inline-mock **creation** aborted: `assureCanReadMockito` → `Instrumentation.redefineModule` → `Module.implAddReads` → **unregistered `addReads0`** `UnsatisfiedLinkError` → "Could not modify all classes" | ✅ FIXED — registered `java/lang/Module.addReads0(Module,Module)V` (native-builtins/lib.rs) to mirror the read edge into the boot `ModuleRegistry`. Inline mocks now CREATE; SpringRepos `0/11`→**`3/11`** (stable). |
 | h2 | `mockingDetails(m).isMock()==false` and `when(m.foo())`/`given(m)` → `NotAMockException` even though the mock dispatches (`m.foo()` records an ongoing stubbing). ROOT (NOT a ByteBuddy/advice problem): `MockUtil`'s static `mockMakers = new ConcurrentHashMap<>(Collections.singletonMap(makerClass, defaultMaker))` came up **EMPTY** because CratonVM's synthetic `ConcurrentHashMap.<init>(Map)` (`native_chm_init_from_map`) read entries via the HashMap-bucket-only `map_collect_entries`, which returns nothing for a `Collections$SingletonMap`/`TreeMap` source. So `getMockHandlerOrNull` iterated an empty `mockMakers.values()` and never found the handler. | ✅ FIXED — `native_chm_init_from_map` now uses `collect_entries_any` (the layout-agnostic `entrySet()` walk, same as `native_chm_put_all`). General fix: `new ConcurrentHashMap<>(singletonMap/treeMap/anyMap)` now copies entries. SpringRepos `3/11`→**`9/11`**. |
-| h3 | The injected `environment` `UnaryOperator<String>` (a closure the test passes to drive env-var lookups) is not consulted by the Groovy script — it returns the real default repo URL instead of the test value (`setUrl("https://…broadcom…")` vs wanted `setUrl("url")`). | 🔴 OPEN (2/11) — Mockito now fully works (`verify()` runs and compares); this is a Groovy closure→env-lookup dispatch tail, distinct from the mock framework. |
+| h3 | The injected `environment` `UnaryOperator<String>` looked up the wrong env-var key, so the Groovy script fell back to the real default repo URL (`setUrl("https://…broadcom…")` vs wanted `setUrl("url")`). ROOT (NOT a closure-dispatch bug): `fromEnv` builds the key with `"COMMERCIAL_%SREPO_URL".formatted(id)`, but CratonVM's `String.format` left the uppercase `%S` conversion **literal** (only `%X`/`%E`/`%G`/`%A`/`%H` were handled), so the key was `COMMERCIAL_%SREPO_URL` and never matched. | ✅ FIXED — recognize `%S`/`%B`/`%C` in the format specifier parser and upper-case the result in `format_arg_full` (lang_string.rs). SpringRepos `9/11`→**`11/11`** (FULL GREEN). |
 
 Net: `0/11` (all crashed) → **`4/11`** clean *(flaky: the g2 Module NPE in
 `GroovySystem.<clinit>` intermittently drops it to `0/11`)*. The 4 passing are the
