@@ -33611,6 +33611,42 @@ pub(crate) fn uri_store_named(ctx: &mut dyn NativeContext, this: ObjectRef, full
     }
 }
 
+/// Returns the byte index of the first character that `java.net.URI`'s
+/// single-string parser would reject as illegal, or `None` if every character
+/// is permitted. Mirrors the JDK parser's legal-character set for US-ASCII:
+/// unreserved (`alphanum` + `-_.!~*'()`) + reserved (`;/?:@&=+$,[]`) + the
+/// escape/fragment delimiters `%` and `#`. ASCII control characters (`<0x20`,
+/// `0x7F`) are always illegal. Non-ASCII (`>=0x80`) is deliberately left
+/// permitted here so we do not over-reject inputs that currently parse — the
+/// goal is to match HotSpot on the clearly-malformed ASCII cases (spaces,
+/// `{}<>"\^|`), not to police every Unicode edge.
+fn uri_first_illegal_index(s: &str) -> Option<usize> {
+    for (i, c) in s.char_indices() {
+        let u = c as u32;
+        if u < 0x20 || u == 0x7f {
+            return Some(i);
+        }
+        if u >= 0x80 {
+            continue;
+        }
+        let ok = c.is_ascii_alphanumeric()
+            || matches!(
+                c,
+                // unreserved marks
+                '-' | '_' | '.' | '!' | '~' | '*' | '\'' | '(' | ')'
+                // reserved (RFC 2396 + RFC 2732 host brackets)
+                | ';' | '/' | '?' | ':' | '@' | '&' | '=' | '+' | '$' | ','
+                | '[' | ']'
+                // escape + fragment delimiter
+                | '%' | '#'
+            );
+        if !ok {
+            return Some(i);
+        }
+    }
+    None
+}
+
 fn native_uri_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
@@ -33620,13 +33656,32 @@ fn native_uri_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         Some(Value::Object(Some(o))) => ctx.read_string(*o).unwrap_or_default(),
         _ => String::new(),
     };
-    // Reject ASCII control characters (e.g. a raw newline/tab) like java.net.URI
-    // does — `new URI(String)` must throw URISyntaxException for them. Our parser
-    // was lenient and accepted them, so a malformed redirect URI such as
-    // "https://keycloak.org\n" was treated as valid (keycloak
-    // SecureRedirectUrisEnforcerExecutorTest.failUriSyntax). Scoped to control
-    // chars (<0x20 / 0x7F) to avoid rejecting otherwise-accepted inputs.
-    if let Some(pos) = url_str.find(|c: char| (c as u32) < 0x20 || (c as u32) == 0x7f) {
+    // Reject illegal characters like java.net.URI's single-string parser does —
+    // `new URI(String)` must throw URISyntaxException for them. Our parser was
+    // lenient and accepted anything, so malformed input slipped through:
+    //   * control chars: "https://keycloak.org\n" treated as valid (keycloak
+    //     SecureRedirectUrisEnforcerExecutorTest.failUriSyntax);
+    //   * spaces / delimiters: "not a valid uri :{}" treated as valid, so
+    //     HttpHeaderSecurityFilter.setAntiClickJackingUri never threw and
+    //     TestHttpHeaderSecurityFilter.testAntiClickJackingInvalidUri saw no
+    //     ServletException.
+    // `uri_first_illegal_index` mirrors the JDK's legal-character set for ASCII
+    // (unreserved + reserved + `%`/`#`); non-ASCII is left to the lenient path
+    // to avoid over-rejecting inputs the gauntlet relies on. Control chars stay
+    // rejected unconditionally even with the opt-out gate (preserves the
+    // keycloak fix); the broader ASCII check is gated default-ON so it can be
+    // disabled (CRATONVM_URI_STRICT_CHARS=0) if a regression surfaces.
+    let strict_uri_chars =
+        std::env::var("CRATONVM_URI_STRICT_CHARS").map(|v| v != "0").unwrap_or(true);
+    let illegal = if strict_uri_chars {
+        uri_first_illegal_index(&url_str)
+    } else {
+        url_str
+            .char_indices()
+            .find(|(_, c)| (*c as u32) < 0x20 || (*c as u32) == 0x7f)
+            .map(|(i, _)| i)
+    };
+    if let Some(pos) = illegal {
         let input = ctx.create_string(&url_str);
         let reason = ctx.create_string("Illegal character in URI");
         if let Ok(Some(Value::Object(Some(exc)))) = ctx.new_object_initialized(
