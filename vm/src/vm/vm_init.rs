@@ -848,6 +848,7 @@ impl SharedVm {
                 uses: vec![],
                 provides: vec![],
                 is_open: false,
+                automatic: false,
             };
             let packages = vec![
                 "java/lang".to_string(),

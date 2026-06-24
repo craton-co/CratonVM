@@ -16762,6 +16762,18 @@ fn force_native_over_real_jdk_bytecode(
     method_name: &str,
     method_descriptor: &str,
 ) -> bool {
+    // java.lang.Module access checks. CratonVM's `Class.getModule()` returns a
+    // synthetic Module mirror with a NULL `descriptor` (real module-path
+    // encapsulation does not exist — every class is effectively on the class
+    // path). The real `Module.isExported`/`isOpen` bytecode dereferences
+    // `this.descriptor.isOpen()` and NPEs (e.g. Hibernate's
+    // `JdbcTypeNameMapper.<clinit>` reflecting over `java.sql.Types`). Force the
+    // permissive natives registered in `native-builtins` (return true) so every
+    // reflective access probe succeeds — the access analogue of the always-true
+    // `Module.canUse`/`canRead` overrides.
+    if class_name == "java/lang/Module" && matches!(method_name, "isExported" | "isOpen") {
+        return true;
+    }
     // SBR-02 / bug-03: fast native regex. The real-JDK `String.replaceAll` /
     // `replaceFirst` / `matches` bodies run `Pattern.compile(...).matcher(...)`
     // in the interpreter (java.util.regex), which is 30–600× slower than

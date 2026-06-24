@@ -4021,10 +4021,43 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             // Publish as the canonical mirror for this module name so future
             // getModule() calls (and the JDK's identity comparisons) see the
             // same instance. The VM registers it as a permanent GC root.
+            //
+            // NOTE: this named Module deliberately has a NULL `descriptor`. Real
+            // `java.lang.Module.isExported/isOpen` bytecode would dereference it
+            // (NPE), so those four access-check methods are overridden to a
+            // permissive native below (CratonVM has no real JPMS module-path
+            // encapsulation — every class is effectively on the class path).
             ctx.cache_module_mirror(module_name.as_deref(), m_obj);
             Ok(Some(Value::Object(Some(m_obj))))
         },
     );
+
+    // `java.lang.Module` access checks — permissive overrides.
+    //
+    // `getModule()` above returns named Module mirrors (so `getName()`/identity
+    // match the real JDK) but does NOT populate the Java-side `descriptor` field.
+    // Real `Module.isExported`/`isOpen` bytecode dereferences `descriptor` and
+    // NPEs (e.g. Hibernate's `JdbcTypeNameMapper.<clinit>` reflecting over
+    // `java.sql.Types`), and even with a synthetic descriptor the JDK's
+    // `descriptor.packages().contains(pkg)` check would deny access because we do
+    // not enumerate a module's packages. CratonVM has no real module-path
+    // encapsulation — every class is effectively on the class path, where the
+    // JDK performs no inter-module access checks — so these reflective access
+    // probes must all succeed. Return `true` for any non-null receiver. This
+    // matches the synthetic-jdk `register_p59_module` overrides for real-JDK mode
+    // and is the access analogue of the always-true `Module.canRead`/`canUse`
+    // natives already registered.
+    let module_access_permissive: cratonvm_native_api::NativeCallback =
+        |_ctx, args| Ok(Some(Value::Int(matches!(args.first(), Some(Value::Object(Some(_)))) as i32)));
+    for (method, descr) in [
+        ("isExported", "(Ljava/lang/String;)Z"),
+        ("isExported", "(Ljava/lang/String;Ljava/lang/Module;)Z"),
+        ("isOpen", "(Ljava/lang/String;)Z"),
+        ("isOpen", "(Ljava/lang/String;Ljava/lang/Module;)Z"),
+    ] {
+        registry.register("java/lang/Module", method, descr, module_access_permissive);
+    }
+
     registry.register(
         "java/lang/Class",
         "desiredAssertionStatus0",
