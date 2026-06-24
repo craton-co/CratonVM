@@ -32902,22 +32902,53 @@ fn native_fut_is_done(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     Ok(Some(Value::Int(if done != 0 { 1 } else { 0 })))
 }
 
-fn native_cf_complete(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+/// `CompletableFuture.complete(value)` — handles BOTH the synthetic side-field
+/// model and a real-JDK `java.util.concurrent.CompletableFuture`.
+///
+/// CRITICAL: the synthetic override only flips the side fields (`result`@0,
+/// `done`@1) and historically never ran `postComplete()`. For a *real-JDK*
+/// `CompletableFuture` (allocated by the genuine bytecode `<init>`, whose
+/// instance layout is `result`@0 + the lock-free `stack`@1), a thread blocked in
+/// the real `waitingGet()` (untimed `get()`/`join()`) pushes a `Signaller` onto
+/// `stack`@1 and parks via `LockSupport.park`. The synthetic override (a) never
+/// fired that Signaller (so the parked thread was never `unpark`ed → indefinite
+/// hang on every cross-thread `complete()` after the waiter blocks — the timed
+/// `get(...)` only "self-heals" because `parkNanos` re-polls `result`), and
+/// (b) clobbered `stack`@1 with the `done` int. Distinguish the two layouts by
+/// slot-1's value type: a real-JDK CF has an Object `stack` (null or a Signaller
+/// chain), a synthetic CF has an Int `done`. For the real-JDK object delegate to
+/// the genuine `completeValue` + `postComplete` so waiters are released.
+pub(crate) fn native_cf_complete(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let done = match ctx.get_field(this, FUT_FIELD_DONE) {
-        Value::Int(d) => d,
-        _ => 0,
-    };
-    if done != 0 {
-        return Ok(Some(Value::Int(0)));
-    }
     let val = args.get(1).copied().unwrap_or(Value::Object(None));
-    ctx.set_field(this, FUT_FIELD_RESULT, val);
-    ctx.set_field(this, FUT_FIELD_DONE, Value::Int(1));
-    Ok(Some(Value::Int(1)))
+    match ctx.get_field(this, FUT_FIELD_DONE) {
+        // Synthetic CF model — `done` flag lives in slot 1.
+        Value::Int(done) => {
+            if done != 0 {
+                return Ok(Some(Value::Int(0))); // already completed
+            }
+            ctx.set_field(this, FUT_FIELD_RESULT, val);
+            ctx.set_field(this, FUT_FIELD_DONE, Value::Int(1));
+            Ok(Some(Value::Int(1)))
+        }
+        // Real-JDK CompletableFuture — slot 1 is the `stack` (Completion) field.
+        // Run the genuine completion path so `postComplete()` fires any parked
+        // `Signaller` (i.e. `LockSupport.unpark` the thread blocked in `get()`).
+        _ => {
+            let triggered = ctx
+                .invoke_virtual(this, "completeValue", "(Ljava/lang/Object;)Z", &[val])?
+                .and_then(|v| v.as_int())
+                .unwrap_or(0);
+            ctx.invoke_virtual(this, "postComplete", "()V", &[])?;
+            Ok(Some(Value::Int(triggered)))
+        }
+    }
 }
 
 pub(crate) fn native_cf_then_apply(

@@ -33155,11 +33155,31 @@ fn native_cf_complete(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     } else {
         value
     };
+    // Distinguish a synthetic CF (slot 1 is the `done` marker, an Int) from a
+    // real-JDK `java.util.concurrent.CompletableFuture` (slot 1 is the lock-free
+    // `stack` reference field — null or a `Completion`/`Signaller` chain). The
+    // object's field COUNT is NOT a reliable discriminator (a real-JDK CF is
+    // allocated with ≥4 slots here), but slot 1's value type is: a synthetic CF
+    // always carries an Int `done` flag there, whereas the real `stack` field is
+    // always a reference. This is the same Int-vs-reference test the already-done
+    // check above (`synth_done`) relies on.
+    let synthetic = matches!(ctx.get_field(this, CF_FIELD_DONE), Value::Int(_));
     ctx.set_field(this, CF_FIELD_RESULT, stored);
-    // Keep the synthetic DONE marker coherent for synthetic CFs (harmless on real
-    // objects: slot 1 is the `stack` reference and isDone()/get() use `result`).
-    if ctx.object_num_fields(this) >= 4 {
+    if synthetic {
+        // Synthetic CF: keep the DONE marker coherent. These have no lock-free
+        // `stack` of waiters, so there is nothing to unpark.
         ctx.set_field(this, CF_FIELD_DONE, Value::Int(1));
+    } else {
+        // Real-JDK CompletableFuture. A thread blocked in the genuine
+        // `waitingGet()` (untimed `get()`/`join()`) pushes a `Signaller` onto
+        // `stack`@1 and parks via `LockSupport.park`. Storing `result` alone does
+        // NOT wake it — the real `complete()` runs `postComplete()`, which pops
+        // the `stack` and fires each `Signaller` (`LockSupport.unpark` of the
+        // waiting thread). Without this the parked thread hangs forever on every
+        // cross-thread `complete()` (the timed `get(...)` only "self-heals"
+        // because `parkNanos` re-polls `result`). Run `postComplete()` to release
+        // waiters — this is the missing half of the synthetic override.
+        ctx.invoke_virtual(this, "postComplete", "()V", &[])?;
     }
     Ok(Some(Value::Int(1)))
 }
@@ -33200,12 +33220,22 @@ fn native_cf_complete_exceptionally(
     // call would hit that override. The internal kafka path
     // (`kafkaCompleteExceptionally` -> `super.completeExceptionally` == this native)
     // legitimately needs the base behaviour.
+    let synthetic = matches!(ctx.get_field(this, CF_FIELD_DONE), Value::Int(_));
     ctx.invoke_special(
         "java/util/concurrent/CompletableFuture",
         "obtrudeException",
         "(Ljava/lang/Throwable;)V",
         &[Value::Object(Some(this)), exc],
     )?;
+    if !synthetic {
+        // Real-JDK CompletableFuture: `obtrudeException` only stores the result;
+        // it does NOT fire the lock-free `stack`@1 of parked `Signaller`s. The
+        // real `completeExceptionally()` runs `postComplete()` to unpark threads
+        // blocked in untimed `get()`/`join()`. Without this they hang forever on a
+        // cross-thread exceptional completion — the same defect fixed in
+        // `native_cf_complete`.
+        ctx.invoke_virtual(this, "postComplete", "()V", &[])?;
+    }
     Ok(Some(Value::Int(1)))
 }
 

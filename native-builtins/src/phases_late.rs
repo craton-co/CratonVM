@@ -697,18 +697,11 @@ pub(crate) fn register_phase55_executors(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(future))))
         },
     );
-    // complete(value) — complete the CF with a value if not already done
-    r.register(cf, "complete", "(Ljava/lang/Object;)Z", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let done = ctx.get_field(this, 1).as_int().unwrap_or(0);
-        if done != 0 {
-            return Ok(Some(Value::Int(0))); // already completed
-        }
-        ctx.set_field(this, 0, args.get(1).copied().unwrap_or(Value::Object(None)));
-        ctx.set_field(this, 1, Value::Int(1));
-        ctx.set_field(this, 2, Value::Object(None));
-        Ok(Some(Value::Int(1)))
-    });
+    // complete(value) — complete the CF with a value if not already done.
+    // Delegates to the shared, real-JDK-aware impl so a thread parked in the
+    // genuine `waitingGet()` (untimed `get()`/`join()`) is unparked via
+    // `postComplete()` instead of hanging forever. See `native_cf_complete`.
+    r.register(cf, "complete", "(Ljava/lang/Object;)Z", crate::native_cf_complete);
     // completeExceptionally(Throwable) — complete with exception
     r.register(
         cf,
@@ -11712,19 +11705,10 @@ pub(crate) fn register_p58_completable_future(r: &mut NativeMethodRegistry) {
             }
         },
     );
-    // complete — set result and mark done
-    r.register(cf, "complete", "(Ljava/lang/Object;)Z", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let done = matches!(ctx.get_field(this, FUT_FIELD_DONE), Value::Int(1));
-        if done {
-            Ok(Some(Value::Int(0))) // already completed
-        } else {
-            let val = args.get(1).copied().unwrap_or(Value::Object(None));
-            ctx.set_field(this, FUT_FIELD_RESULT, val);
-            ctx.set_field(this, FUT_FIELD_DONE, Value::Int(1));
-            Ok(Some(Value::Int(1)))
-        }
-    });
+    // complete — set result and mark done. Delegates to the shared,
+    // real-JDK-aware impl (fires parked Signallers via postComplete; see
+    // `native_cf_complete`).
+    r.register(cf, "complete", "(Ljava/lang/Object;)Z", crate::native_cf_complete);
     // thenApply on CF itself (not just CompletionStage)
     r.register(
         cf,

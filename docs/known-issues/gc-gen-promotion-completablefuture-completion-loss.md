@@ -1,125 +1,90 @@
-# gen-GC loses a `CompletableFuture` completion under promotion + allocation churn (OPEN)
+# `CompletableFuture` untimed `get()`/`join()` never wakes on cross-thread completion — FIXED
 
-**Status:** OPEN. Reliable workarounds exist (`-XX:+UseG1GC`, `CRATONVM_NO_GC_PROMOTION=1`); no clean code-level fix yet.
+**Status:** ✅ **FIXED.** The fix is in the synthetic `CompletableFuture.complete` /
+`completeExceptionally` natives (`native-collections/src/lib.rs`,
+`native-builtins/src/lib.rs`). No GC change was needed.
 
-**Severity:** blocks the Keycloak 26.6.3 / Quarkus boot (see
-[keycloak-quarkus-boot-progress.md](keycloak-quarkus-boot-progress.md)). General: any
-`CompletableFuture.get()`-on-a-worker pattern under heap churn can hang.
+> ⚠️ **The original diagnosis in this file was WRONG.** It attributed the hang to
+> the generational (copying) GC losing a young `Signaller` when the future is
+> promoted to old gen, and claimed `-XX:+UseG1GC` and `CRATONVM_NO_GC_PROMOTION=1`
+> were immune/reliable fixes. **Re-measured: the hang is 100 % deterministic and
+> GC-independent** — `default gen-GC`, `-XX:+UseG1GC`, `CRATONVM_NO_GC_PROMOTION=1`,
+> and `--nojit` **all hang 6/6**. The earlier "G1/NO_GC_PROMOTION pass" runs were
+> flaky luck, not immunity. The real cause is a native-override gap (below). This
+> file is kept (and the wrong theory called out) so the dead-end isn't re-walked.
 
 ## Symptom
 
-Under the **default generational (copying) GC**, a thread blocked in
-`CompletableFuture.get()` waiting on an async worker is **never woken**, even though
-the worker completes the future. The boot deadlock surfaces at the end of the Hibernate
-SessionFactory build:
+A thread blocked in untimed `CompletableFuture.get()` / `join()` (which funnel
+through `waitingGet()`) is **never woken** when another thread calls `complete()`
+(or `completeExceptionally()`) *after* the waiter has parked. `complete()` returns
+normally; the waiter hangs forever. The **timed** `get(timeout, unit)` works
+because its `parkNanos` loop re-polls `result` and "self-heals". This blocks every
+async-HTTP-client pattern (Spring's Jetty/Jdk/Reactor/HttpComponents
+`ClientHttpRequestFactoryTests` all `TIMEOUT`, since the blocking `send()` ==
+`CompletableFuture.get()`), and the Keycloak/Quarkus boot's `JPAConfig.startAll()`.
 
-```
-io.quarkus.runner.ApplicationImpl.doStart
- → io.quarkus.hibernate.orm.runtime.JPAConfig.startAll()
-  → java.util.concurrent.CompletableFuture.get() → waitingGet
-   → ForkJoinPool.unmanagedBlock → CompletableFuture$Signaller.block() → LockSupport.park()  ← hangs forever
-```
-
-The async persistence-unit worker finishes and returns to its pool (idle); main stays
-parked. Under heap *pressure* (small `-Xmx`) the same scenario instead **aborts** the
-process (`KERNEL32!FatalExit`, silent exit — no Java exception / panic / `System.exit`).
-
-## Root cause (confirmed mechanism)
-
-When the `CompletableFuture` is **promoted to old gen** by a young GC while a thread's
-pushed `CompletableFuture$Signaller` (linked via the future's lock-free `stack` field)
-**stays young**, the gen-GC loses that old→young reference: the young `Signaller` is not
-kept alive across a subsequent young GC, so the completing worker's `postComplete`
-never fires it → `LockSupport.unpark(mainThread)` is **never called** → the parked
-thread hangs.
-
-Confirmed:
-- `CRATONVM_NO_GC_PROMOTION=1` → **reliably fixes** it (no promotion ⇒ no old→young edge ⇒ no loss). This is the decisive structural proof the bug is promotion-related.
-- `-XX:+UseG1GC` → **immune** (G1's remembered-set/marking handles it).
-- The park machinery is sound: the park/unpark trace (`CRATONVM_DBG_PARK`) shows
-  `unpark(main)` HITS the correct `ParkState` when called, **0 lookup misses**, and the
-  poll-based `ParkState` is lost-wakeup-immune. The unpark is simply **never issued** —
-  the completion-stack linkage to the `Signaller` is gone.
-- GC path = `gc/src/gen_heap.rs::sweep_young_non_moving` (CFProbe2's heavy allocation
-  routes here under old-gen pressure, even with `CRATONVM_DISABLE_JIT=1`).
-
-## What was ruled out
-
-- **NOT a missed *next-GC* card.** Tried (and reverted): in the `new_old_young` scan
-  (`sweep_young_non_moving`, ~`gen_heap.rs:4007`) conservatively re-dirty **every**
-  promoted object's card (not just `pts`-detected ones). One run-batch passed 5/5, but a
-  later clean batch (no CPU contention) hung 3/3 at iter ~22. So the `Signaller` is lost
-  in the **same GC** as the promotion (mark-phase miss / evacuation race), not via a card
-  that's merely missing for the next GC.
-- **NOT the write barrier / flush.** `write_barrier` (`gen_heap.rs:1981`) correctly
-  cards old→young; `compare_and_swap_field` (`vm/src/vm/vm_exec.rs:4609`, the VarHandle
-  CAS used by `tryPushStack`) calls it; `flush_all` drains parked threads' per-thread
-  dirty buffers before the card scan (`gen_heap.rs:2451`). All correct statically.
-- Most likely a **promotion/evacuation × concurrently-completing-worker race** (the
-  worker's `postComplete` CAS on `cf.stack` racing the GC's scan/evacuate of that
-  object), plausibly tied to the MT-STW/safepoint machinery.
-
-## Heisenbug — why it resists in-VM instrumentation
-
-Both built-in detectors **mask** it: `CRATONVM_SP_VERIFY=1` and
-`CRATONVM_DBG_SWEEP_EDGES=1` each add a per-GC full old-gen walk whose extra time shifts
-the GC/mutator interleaving so the failing non-moving-sweep-promotion path isn't taken →
-the run passes and prints no report. Only `CRATONVM_NO_GC_PROMOTION` (a behavior change,
-not added overhead) reliably fixes it. Pinning the exact loss therefore needs a
-**non-perturbing** technique: a heap-dump diff across the failing GC, or a hardware
-watchpoint on the future's `stack` slot.
-
-## Reproducer (≈3 s)
-
-`CFProbe2` — a worker that allocates heavily (triggers GC) while main blocks on
-`cf.get()`. HotSpot: 30/30 OK. CratonVM default gen-GC: HANG (or abort at small heap).
-CratonVM `-XX:+UseG1GC`: 30/30 OK. The no-allocation variant (`CFProbe`) passes
-everywhere, confirming the hang is GC-induced.
+Minimal deterministic repro:
 
 ```java
-import java.util.concurrent.*;
-import java.util.*;
-public class CFProbe2 {
-    public static void main(String[] a) throws Exception {
-        ExecutorService ex = Executors.newFixedThreadPool(3);
-        for (int i = 0; i < 30; i++) {
-            final int n = i;
-            CompletableFuture<String> cf = CompletableFuture.supplyAsync(() -> {
-                List<byte[]> junk = new ArrayList<>();
-                long acc = 0;
-                for (int j = 0; j < 300000; j++) {
-                    byte[] b = new byte[256]; acc += b.length;
-                    junk.add(b);
-                    if (junk.size() > 2000) junk.subList(0, 1000).clear();
-                }
-                return "done" + n + ":" + acc;
-            }, ex);
-            String r = cf.get();   // main PARKS here for the heavy worker's duration
-            System.out.println("[cf2] iter " + n + " -> " + r);
-        }
-        System.out.println("[cf2] ALL 30 OK");
-        ex.shutdown();
-    }
-}
+var f = new CompletableFuture<String>();
+new Thread(() -> { Thread.sleep(500); f.complete("x"); }).start();
+f.get();   // HANGS (rc=124) — get(timeout) returns fine
 ```
 
-Run (hangs on default gen-GC, ~iter 22; OK with `-XX:+UseG1GC` or `CRATONVM_NO_GC_PROMOTION=1`):
-```
-cratonvm.exe --Xmx 2g -cp <dir> CFProbe2          # default gen-GC → HANG
-cratonvm.exe -XX:+UseG1GC --Xmx 2g -cp <dir> CFProbe2   # → ALL 30 OK
-```
+## Root cause (confirmed)
 
-## Next steps
+`java.util.concurrent.CompletableFuture.complete(Object)Z` is registered as a
+**synthetic native** (`native-collections/src/lib.rs::native_cf_complete`, plus
+shadows in `native-builtins`) that win over the real-JDK bytecode via the
+native-override path in `try_stackless_invoke`
+(`vm/src/runtime/interpreter.rs`, the `native_methods.find(class, method, desc)`
+arm fires *before* the has-own-bytecode check). The synthetic native only stored
+the `result` field and **never ran `postComplete()`**.
 
-1. Non-perturbing observation to pin the same-GC loss (heap-dump diff / HW watchpoint on
-   `cf.stack`); then a targeted fix in `sweep_young_non_moving` mark/evacuate.
-2. For a *booting* Keycloak sooner, prefer the **G1 route** (immune to this bug) and fix
-   the separate, distinct hang seen only under G1 (two persistence-unit worker threads
-   stuck executing bytecode at the same point — a worker livelock, not this GC bug).
+For a **real-JDK** `CompletableFuture` (allocated by the genuine bytecode `<init>`;
+layout = `result`@0 + the lock-free `stack`@1), the untimed `waitingGet()` pushes a
+`Signaller` onto `stack`@1 and parks via `LockSupport.park`. `complete()` is
+supposed to run `postComplete()`, which pops the `stack` and fires each `Signaller`
+(`thread = null; LockSupport.unpark(waiter)`). The synthetic native skipped that
+entirely, so the parked thread's `unpark` was **never issued** — an indefinite
+hang on every cross-thread completion. (It also wrote the synthetic `done` Int into
+slot 1, clobbering the real `stack` reference, but the missing `unpark` is the
+direct cause of the hang.)
+
+`get()` itself runs real bytecode (its native didn't win), so the waiter side was
+always correct; only the completer side dropped the wakeup. That asymmetry — real
+bytecode parks, synthetic native completes-without-`postComplete` — is the whole
+bug.
+
+## Fix
+
+The synthetic `complete` / `completeExceptionally` natives now detect a real-JDK
+`CompletableFuture` and run the genuine completion path so waiters are unparked:
+
+- **Discriminator:** slot 1's *value type*. A synthetic CF carries an Int `done`
+  flag there; a real-JDK CF's `stack` is always a reference (null or a
+  `Completion`/`Signaller` chain). The object's field **count is NOT usable** — a
+  real-JDK CF is allocated with ≥4 slots here, so the old `num_fields >= 4` check
+  misclassified it as synthetic.
+- **Real-JDK path:** after storing the result (`complete`) /
+  `obtrudeException` (`completeExceptionally`), invoke the real
+  `postComplete()` (`ctx.invoke_virtual(this, "postComplete", "()V", &[])`) to pop
+  the `stack` and `LockSupport.unpark` every parked waiter.
+- **Synthetic path:** unchanged (`done` flag model; no waiter stack).
+
+## Regression witnesses (all PASS, JIT + `--nojit` + G1)
+
+- untimed `get()` cross-thread `complete()` (race window 0 ms … 2000 ms);
+- untimed `get()` cross-thread `completeExceptionally()` → `ExecutionException`;
+- `completedFuture` / `supplyAsync` / `thenApply` / pre-completed `get()` / double
+  `complete()` (synthetic-model paths unaffected);
+- `ForkJoinPool.managedBlock`, `LockSupport.park`/`unpark`, and the cross-thread
+  Treiber-stack CAS probe.
 
 ## Related
 
-- The VarHandle static-field init fix (dev `b223fd21`) that first unblocked the whole
-  Hibernate SessionFactory build, exposing this next blocker.
-- Other moving-GC root/edge issues: [gc-moving-interpreter-lost-tag-missed-root.md](gc-moving-interpreter-lost-tag-missed-root.md),
-  [gc-stress-bintrees-main-args-unregistered-jit-frame-FIXED.md](../internal/app-jvm-bugs/gc-stress-bintrees-main-args-unregistered-jit-frame-FIXED.md) (FIXED).
+- [keycloak-quarkus-boot-progress.md](keycloak-quarkus-boot-progress.md) — the
+  `JPAConfig.startAll()` boot hang attributed here to GC was this same bug.
+- The Jetty NIO client work (`DirectByteBuffer.put(byte)` + NIO connect-probe) that
+  surfaced this as the last async-HTTP-client blocker.
