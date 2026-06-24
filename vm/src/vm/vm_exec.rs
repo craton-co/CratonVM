@@ -6084,6 +6084,12 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         cm.find_class_by_name_in_loader(name, ClassLoaderId::UserDefined(loader_id))
     }
 
+    fn class_id_defined_by_loader_exact(&self, name: &str, loader_id: u32) -> Option<ClassId> {
+        use cratonvm_types::ClassLoaderId;
+        let cm = self.shared.class_manager.read();
+        cm.class_defined_by_loader_exact(name, ClassLoaderId::UserDefined(loader_id))
+    }
+
     fn define_class_full(
         &mut self,
         name: &str,

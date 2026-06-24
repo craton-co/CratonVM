@@ -2499,14 +2499,22 @@ pub(crate) fn native_classloader_define_class1(
             // application loader"). Give this loader its own namespace so the
             // redefinition succeeds and `Class.getClassLoader()` reports it.
             // (Real-JDK mode reaches here with lid == 0 because the synthetic
-            // CL_LOADER_ID slot is a real ClassLoader field there.) Only kicks
-            // in on an actual name collision, so ByteBuddy/cglib's fresh-name
-            // defines keep their existing Application-namespace behavior.
-            if lid == 0
-                && crate::classloader::is_user_defined_loader(ctx, *loader_obj)
-                && ctx.class_id_by_name(&name).is_some()
-            {
-                lid = crate::classloader::loader_namespace_id(ctx, *loader_obj);
+            // CL_LOADER_ID slot is a real ClassLoader field there.) Legacy
+            // behavior only kicks in on an actual name collision, so
+            // ByteBuddy/cglib's fresh-name defines keep their existing
+            // Application-namespace behavior.
+            //
+            // Loader-faithful gate (CRATONVM_LOADER_AWARE_RESOLUTION): when on,
+            // EVERY user-loader define gets its own stable namespace — not just
+            // on collision — so the *first* definer of a name (an isolating
+            // loader) is isolated too instead of landing in the shared
+            // Application namespace (the ProxyClassReuseTest / IsoProbe bug).
+            if lid == 0 && crate::classloader::is_user_defined_loader(ctx, *loader_obj) {
+                if crate::classloader::loader_aware_resolution()
+                    || ctx.class_id_by_name(&name).is_some()
+                {
+                    lid = crate::classloader::loader_namespace_id(ctx, *loader_obj);
+                }
             }
             lid
         }
@@ -2609,14 +2617,17 @@ pub(crate) fn native_classloader_define_class0(
                 Value::Int(v) if v > 0 => v as u32,
                 _ => 0,
             };
-            // Same override-first / name-collision handling as defineClass1:
-            // give a user-defined loader its own namespace when redefining an
-            // already-loaded class name so the define does not collide.
-            if lid == 0
-                && crate::classloader::is_user_defined_loader(ctx, *loader_obj)
-                && ctx.class_id_by_name(&name).is_some()
-            {
-                lid = crate::classloader::loader_namespace_id(ctx, *loader_obj);
+            // Same override-first / name-collision handling as defineClass1,
+            // plus the loader-faithful gate: when
+            // CRATONVM_LOADER_AWARE_RESOLUTION is on, every user-loader define
+            // gets its own namespace (not just on collision) so the first
+            // definer is isolated too.
+            if lid == 0 && crate::classloader::is_user_defined_loader(ctx, *loader_obj) {
+                if crate::classloader::loader_aware_resolution()
+                    || ctx.class_id_by_name(&name).is_some()
+                {
+                    lid = crate::classloader::loader_namespace_id(ctx, *loader_obj);
+                }
             }
             lid
         }

@@ -38,7 +38,10 @@
 //!     the factory creating this bean (`SimpleInstantiationStrategy
 //!     .getCurrentlyInvokedFactoryMethod()` names this method) it runs the real
 //!     body via `super.<name>()`; otherwise (an inter-`@Bean`-method reference)
-//!     it returns the shared instance via `beanFactory.getBean("<name>")`.
+//!     it returns the shared instance via `beanFactory.getBean("<name>")`. Using
+//!     the factory-method thread-local (not bean-creation state) is essential for
+//!     scoped / lazy-init proxies, whose target is created under a *different*
+//!     bean name (`scopedTarget.<name>`) — see `emit_bean_override`.
 //!   * `@Bean` methods with parameters, primitive/void/array returns, or
 //!     static/final/private modifiers are left un-overridden (they run the real
 //!     body — the `proxyBeanMethods=false` trade-off), never regressing relative
@@ -326,26 +329,36 @@ struct BeanMethod {
     return_internal: String,
 }
 
-/// Emit a `@Bean`-method override that gives shared-singleton semantics:
+/// Emit a `@Bean`-method override mirroring Spring's `BeanMethodInterceptor`:
 ///
 /// ```text
-/// Object bf = this.$$beanFactory;
-/// if (!((BeanFactory) bf).isSingleton("<name>"))             // prototype/scoped
-///     return super.<name>();                                  //   → fresh each call
-/// if (((DefaultSingletonBeanRegistry) bf).isSingletonCurrentlyInCreation("<name>"))
-///     return super.<name>();                                  // we ARE creating it
-/// return (<Ret>) ((BeanFactory) bf).getBean("<name>");        // inter-bean ref → shared
+/// Method m = SimpleInstantiationStrategy.getCurrentlyInvokedFactoryMethod();
+/// if (m != null && m.getName().equals("<name>"))             // the factory is
+///     return super.<name>();                                  //   creating THIS bean
+/// return (<Ret>) ((BeanFactory) this.$$beanFactory).getBean("<name>");  // inter-bean ref → shared
 /// ```
 ///
-/// Equivalent in outcome to Spring's `BeanMethodInterceptor` but keyed on the
-/// factory's creation state rather than the `getCurrentlyInvokedFactoryMethod`
-/// thread-local: a singleton is marked "currently in creation" *before* its
-/// factory method runs, so the creating call takes `super` (the real `@Bean`
-/// body — no re-entrancy, since the super class is the original
-/// `@Configuration`) and only later inter-bean references reach `getBean`,
-/// returning the cached singleton. Non-singleton (e.g. `@Scope("prototype")`)
-/// beans always take `super`, so each reference creates a fresh instance and
-/// there is no `getBean` recursion. No-arg reference-returning methods only.
+/// This is the *exact* discriminator Spring uses
+/// (`ConfigurationClassEnhancer$BeanMethodInterceptor.isCurrentlyInvokedFactoryMethod`):
+/// `SimpleInstantiationStrategy.instantiate(..factoryMethod..)` sets a
+/// thread-local to the `@Bean` factory method it is about to invoke reflectively,
+/// so the *creating* call (which dispatches into this override) sees its own
+/// method name and runs `super` (the real `@Bean` body — no re-entrancy, since
+/// the super class is the original `@Configuration`). Any other call is an
+/// inter-bean reference and routes through `getBean`, returning the
+/// container-managed instance.
+///
+/// The previous heuristic keyed on `isSingletonCurrentlyInCreation("<name>")`,
+/// which silently breaks whenever the bean *being created* has a different name
+/// than the `@Bean` method — the case for **scoped proxies** (the real target is
+/// registered as `scopedTarget.<name>`) and **lazy-init AOP proxies**. There the
+/// creating call (`getBean("scopedTarget.<name>")` → factory method) found
+/// `<name>` NOT in creation, fell through to `getBean("<name>")` which returns
+/// the *proxy*, so the proxy's `TargetSource.getTarget()` resolved back to the
+/// proxy itself → unbounded `proxy.method() → getTarget() → proxy.method()`
+/// recursion (`StackOverflowError`). Keying on the factory-method thread-local
+/// matches Spring and is name-agnostic, fixing both. No-arg reference-returning
+/// methods only — so comparing the method name (params are always `()`) suffices.
 #[allow(clippy::too_many_arguments)]
 fn emit_bean_override(
     name_idx: u16,
@@ -355,81 +368,71 @@ fn emit_bean_override(
     super_method_ref: u16,
     bf_field_ref: u16,
     beanfactory_cast_idx: u16,
-    issingleton_ref: u16,
-    dsbr_cast_idx: u16,
-    in_creation_ref: u16,
     getbean_ref: u16,
     rettype_cast_idx: u16,
+    get_factory_method_ref: u16,
+    method_get_name_ref: u16,
+    string_equals_ref: u16,
 ) -> Vec<u8> {
     let b = |x: u16| -> [u8; 2] { x.to_be_bytes() };
     let mut code: Vec<u8> = Vec::new();
-    // 0:  aload_0
+    // 0:  invokestatic SimpleInstantiationStrategy.getCurrentlyInvokedFactoryMethod()
+    code.push(0xB8);
+    code.extend_from_slice(&b(get_factory_method_ref));
+    // 3:  astore_1   (local1 = currentlyInvoked Method, or null)
+    code.push(0x4C);
+    // 4:  aload_1
+    code.push(0x2B);
+    // 5:  ifnull → L_getbean (26); offset 21  (no factory method → inter-bean ref)
+    code.push(0xC6);
+    code.extend_from_slice(&b(21));
+    // 8:  aload_1
+    code.push(0x2B);
+    // 9:  invokevirtual Method.getName()Ljava/lang/String;
+    code.push(0xB6);
+    code.extend_from_slice(&b(method_get_name_ref));
+    // 12: ldc_w "<name>"
+    code.push(0x13);
+    code.extend_from_slice(&b(name_string_idx));
+    // 15: invokevirtual String.equals(Object)Z
+    code.push(0xB6);
+    code.extend_from_slice(&b(string_equals_ref));
+    // 18: ifeq → L_getbean (26); offset 8  (different method → inter-bean ref)
+    code.push(0x99);
+    code.extend_from_slice(&b(8));
+    // 21: L_super: aload_0  (the factory IS creating this bean → real body)
     code.push(0x2A);
-    // 1:  getfield this.$$beanFactory
+    // 22: invokespecial super.<name><desc>
+    code.push(0xB7);
+    code.extend_from_slice(&b(super_method_ref));
+    // 25: areturn
+    code.push(0xB0);
+    // 26: L_getbean: aload_0
+    code.push(0x2A);
+    // 27: getfield this.$$beanFactory
     code.push(0xB4);
     code.extend_from_slice(&b(bf_field_ref));
-    // 4:  astore_1  (local1 = bf)
-    code.push(0x3C);
-    // 5:  aload_1
-    code.push(0x2B);
-    // 6:  checkcast BeanFactory
+    // 30: checkcast BeanFactory
     code.push(0xC0);
     code.extend_from_slice(&b(beanfactory_cast_idx));
-    // 9:  ldc_w "<name>"
+    // 33: ldc_w "<name>"
     code.push(0x13);
     code.extend_from_slice(&b(name_string_idx));
-    // 12: invokeinterface BeanFactory.isSingleton(String)Z  count=2
-    code.push(0xB9);
-    code.extend_from_slice(&b(issingleton_ref));
-    code.push(0x02);
-    code.push(0x00);
-    // 17: ifeq → L_super (49); offset 32  (not a singleton → fresh via super)
-    code.push(0x99);
-    code.extend_from_slice(&b(32));
-    // 20: aload_1
-    code.push(0x2B);
-    // 21: checkcast DefaultSingletonBeanRegistry
-    code.push(0xC0);
-    code.extend_from_slice(&b(dsbr_cast_idx));
-    // 24: ldc_w "<name>"
-    code.push(0x13);
-    code.extend_from_slice(&b(name_string_idx));
-    // 27: invokevirtual isSingletonCurrentlyInCreation(String)Z
-    code.push(0xB6);
-    code.extend_from_slice(&b(in_creation_ref));
-    // 30: ifne → L_super (49); offset 19  (we are creating it → super)
-    code.push(0x9A);
-    code.extend_from_slice(&b(19));
-    // 33: aload_1
-    code.push(0x2B);
-    // 34: checkcast BeanFactory
-    code.push(0xC0);
-    code.extend_from_slice(&b(beanfactory_cast_idx));
-    // 37: ldc_w "<name>"
-    code.push(0x13);
-    code.extend_from_slice(&b(name_string_idx));
-    // 40: invokeinterface BeanFactory.getBean(String)Object  count=2
+    // 36: invokeinterface BeanFactory.getBean(String)Object  count=2
     code.push(0xB9);
     code.extend_from_slice(&b(getbean_ref));
     code.push(0x02);
     code.push(0x00);
-    // 45: checkcast <Ret>
+    // 41: checkcast <Ret>
     code.push(0xC0);
     code.extend_from_slice(&b(rettype_cast_idx));
-    // 48: areturn
+    // 44: areturn
     code.push(0xB0);
-    // 49: L_super: aload_0
-    code.push(0x2A);
-    // 50: invokespecial super.<name><desc>
-    code.push(0xB7);
-    code.extend_from_slice(&b(super_method_ref));
-    // 53: areturn
-    code.push(0xB0);
-    debug_assert_eq!(code.len(), 54);
+    debug_assert_eq!(code.len(), 45);
 
     let mut code_attr = Vec::new();
     code_attr.extend_from_slice(&2u16.to_be_bytes()); // max_stack
-    code_attr.extend_from_slice(&2u16.to_be_bytes()); // max_locals (this + bf)
+    code_attr.extend_from_slice(&2u16.to_be_bytes()); // max_locals (this + currentlyInvoked)
     code_attr.extend_from_slice(&(code.len() as u32).to_be_bytes());
     code_attr.extend_from_slice(&code);
     code_attr.extend_from_slice(&0u16.to_be_bytes()); // exception_table_length
@@ -511,23 +514,27 @@ fn build_enhancer_class(
     if !bean_methods.is_empty() {
         // Shared constant-pool refs used by every @Bean override.
         let beanfactory_cast_idx = cw.add_class("org/springframework/beans/factory/BeanFactory");
-        let issingleton_ref = cw.add_interface_methodref(
-            beanfactory_cast_idx,
-            "isSingleton",
-            "(Ljava/lang/String;)Z",
-        );
         let getbean_ref = cw.add_interface_methodref(
             beanfactory_cast_idx,
             "getBean",
             "(Ljava/lang/String;)Ljava/lang/Object;",
         );
-        let dsbr_cast_idx =
-            cw.add_class("org/springframework/beans/factory/support/DefaultSingletonBeanRegistry");
-        let in_creation_ref = cw.add_methodref(
-            dsbr_cast_idx,
-            "isSingletonCurrentlyInCreation",
-            "(Ljava/lang/String;)Z",
+        // The factory-method thread-local that distinguishes "the container is
+        // creating this bean" (→ super) from an inter-bean reference (→ getBean),
+        // exactly like Spring's BeanMethodInterceptor.isCurrentlyInvokedFactoryMethod.
+        let sis_cls = cw
+            .add_class("org/springframework/beans/factory/support/SimpleInstantiationStrategy");
+        let get_factory_method_ref = cw.add_methodref(
+            sis_cls,
+            "getCurrentlyInvokedFactoryMethod",
+            "()Ljava/lang/reflect/Method;",
         );
+        let method_cls = cw.add_class("java/lang/reflect/Method");
+        let method_get_name_ref =
+            cw.add_methodref(method_cls, "getName", "()Ljava/lang/String;");
+        let string_cls = cw.add_class("java/lang/String");
+        let string_equals_ref =
+            cw.add_methodref(string_cls, "equals", "(Ljava/lang/Object;)Z");
 
         for bm in bean_methods {
             let name_idx = cw.add_utf8(&bm.name);
@@ -543,11 +550,11 @@ fn build_enhancer_class(
                 super_method_ref,
                 bf_field_ref,
                 beanfactory_cast_idx,
-                issingleton_ref,
-                dsbr_cast_idx,
-                in_creation_ref,
                 getbean_ref,
                 rettype_cast_idx,
+                get_factory_method_ref,
+                method_get_name_ref,
+                string_equals_ref,
             );
             methods.push(override_method);
         }
@@ -1047,6 +1054,65 @@ fn coerce_class_arg(v: Value) -> Value {
 
 const BEAN_ANNOTATION_DESC: &str = "Lorg/springframework/context/annotation/Bean;";
 
+/// True if the method carries `@Bean` directly, or transitively through a
+/// meta-annotation (a composed annotation that is itself annotated `@Bean`,
+/// e.g. `@MyProxiedScope = @Bean @Scope(proxyMode=TARGET_CLASS)`). Mirrors
+/// Spring's meta-annotation-aware `@Bean` lookup.
+fn method_carries_bean(
+    ctx: &mut dyn NativeContext,
+    class_id: cratonvm_types::ClassId,
+    name: &str,
+    descriptor: &str,
+) -> bool {
+    let direct = ctx.method_annotations(class_id, name, descriptor);
+    let mut visited = std::collections::HashSet::new();
+    annotations_contain_bean(ctx, &direct, &mut visited, 0)
+}
+
+/// Recursive worker for [`method_carries_bean`]: returns true if `anns` (or any
+/// of their annotation types, transitively) include `@Bean`. A visited-set and
+/// a depth cap guard against the cyclic JDK meta-annotations
+/// (`@Retention`/`@Target`/`@Documented` reference each other); `java`/`jdk`/
+/// `kotlin` annotation packages are skipped outright — they never carry `@Bean`.
+fn annotations_contain_bean(
+    ctx: &mut dyn NativeContext,
+    anns: &[cratonvm_native_api::AnnotationData],
+    visited: &mut std::collections::HashSet<String>,
+    depth: u32,
+) -> bool {
+    if anns.iter().any(|a| a.type_descriptor == BEAN_ANNOTATION_DESC) {
+        return true;
+    }
+    if depth >= 5 {
+        return false;
+    }
+    // Clone the meta-annotation types first so we don't hold a borrow on `anns`
+    // across the `&mut ctx` calls below.
+    let metas: Vec<String> = anns.iter().map(|a| a.type_descriptor.clone()).collect();
+    for desc in metas {
+        if !(desc.starts_with('L') && desc.ends_with(';')) {
+            continue;
+        }
+        let internal = &desc[1..desc.len() - 1];
+        if internal.starts_with("java/")
+            || internal.starts_with("jdk/")
+            || internal.starts_with("kotlin/")
+        {
+            continue;
+        }
+        if !visited.insert(internal.to_string()) {
+            continue;
+        }
+        if let Some(cid) = ctx.class_id_by_name(internal) {
+            let meta_anns = ctx.class_annotations(cid);
+            if annotations_contain_bean(ctx, &meta_anns, visited, depth + 1) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Scan the `@Configuration` class for `@Bean` factory methods that the
 /// enhancer can safely override with shared-singleton interception. We only
 /// take **instance, no-arg, reference-returning, non-final** methods — the
@@ -1084,12 +1150,13 @@ fn scan_bean_methods(
             continue;
         }
         let return_internal = ret[1..ret.len() - 1].to_string();
-        // Must carry @Bean.
-        let has_bean = ctx
-            .method_annotations(class_id, &m.name, &m.descriptor)
-            .iter()
-            .any(|a| a.type_descriptor == BEAN_ANNOTATION_DESC);
-        if !has_bean {
+        // Must carry @Bean — directly OR via a meta-annotation (a composed
+        // annotation such as `@MyProxiedScope` that is itself meta-annotated
+        // `@Bean`). Spring's `@Bean` detection is meta-annotation aware, so the
+        // enhancer must intercept those methods too; otherwise an inter-bean
+        // reference to such a method runs the raw body and bypasses the
+        // container (e.g. the scoped-proxy is never substituted).
+        if !method_carries_bean(ctx, class_id, &m.name, &m.descriptor) {
             continue;
         }
         // Guard against duplicate (name, descriptor) — a class can't declare

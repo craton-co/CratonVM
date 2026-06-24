@@ -631,6 +631,20 @@ pub(crate) fn cl_bootstrap_scoped() -> bool {
     })
 }
 
+/// `CRATONVM_LOADER_AWARE_RESOLUTION` gate (default OFF). Mirrors
+/// `cratonvm_vm::runtime::env_cache::loader_aware_resolution` so the
+/// native-builtins half of loader-faithful class resolution (per-user-loader
+/// namespace assignment in `defineClass`, exact `findLoadedClass`) stays in
+/// lock-step with the interpreter half. When off, every loader-identity path
+/// keeps its exact pre-gate behavior. Empty / `"0"` ⇒ off; any other value ⇒ on.
+pub(crate) fn loader_aware_resolution() -> bool {
+    static GATE: OnceLock<bool> = OnceLock::new();
+    *GATE.get_or_init(|| match std::env::var("CRATONVM_LOADER_AWARE_RESOLUTION") {
+        Ok(v) => !v.is_empty() && v != "0",
+        Err(_) => false,
+    })
+}
+
 /// Virtual-dispatch correctness for custom `ClassLoader` subclasses.
 ///
 /// `cl_load_class` is registered as the Rust native for
@@ -824,9 +838,20 @@ pub(crate) fn find_loaded_class_for_loader(
             .class_id_by_name(internal_name)
             .map(|cid| ctx.get_class_mirror(cid));
     }
+    // Loader-faithful resolution gate: when on, the own-namespace probe is
+    // EXACT (no global delegation fallback), so a user loader never reports a
+    // class some *other* loader defined — the prerequisite for two isolating
+    // loaders to each define their own copy of a name. Off → legacy behavior
+    // (the fallback-prone `class_id_by_name_and_loader`).
+    let exact = loader_aware_resolution();
     // 1. Own-namespace copy.
     if let Some(id) = peek_loader_namespace_id(ctx, this) {
-        if let Some(cid) = ctx.class_id_by_name_and_loader(internal_name, id) {
+        let own = if exact {
+            ctx.class_id_defined_by_loader_exact(internal_name, id)
+        } else {
+            ctx.class_id_by_name_and_loader(internal_name, id)
+        };
+        if let Some(cid) = own {
             return Some(ctx.get_class_mirror(cid));
         }
     }

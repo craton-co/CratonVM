@@ -11694,11 +11694,11 @@ fn execute_instruction(
 
         // -- Object creation --
         Instruction::New(index) => {
+            let referencing_class_id = thread.frames[frame_idx].class_id;
             let class_name = {
-                let current_class_id = thread.frames[frame_idx].class_id;
                 let cm = shared.class_manager.read();
                 let class = cm
-                    .get_class(current_class_id)
+                    .get_class(referencing_class_id)
                     .ok_or_else(|| VmError::Internal {
                         message: "current class not found".to_string(),
                     })?;
@@ -11711,9 +11711,13 @@ fn execute_instruction(
                     .to_string()
             };
 
-            let target_class_id = shared
-                .load_class_concurrent(&class_name)
-                .map_err(|e| convert_class_not_found(shared, thread, &class_name, e.into()))?;
+            let target_class_id = resolve_class_loader_aware(
+                shared,
+                thread,
+                referencing_class_id,
+                &class_name,
+            )
+            .map_err(|e| convert_class_not_found(shared, thread, &class_name, e))?;
             ensure_class_initialized_shared(shared, thread, target_class_id)?;
 
             let num_fields = shared
@@ -11784,11 +11788,11 @@ fn execute_instruction(
             if length < 0 {
                 return Err(RuntimeError::NegativeArraySizeException { size: length }.into());
             }
+            let referencing_class_id = thread.frames[frame_idx].class_id;
             let component_class_name = {
-                let current_class_id = thread.frames[frame_idx].class_id;
                 let cm = shared.class_manager.read();
                 let class = cm
-                    .get_class(current_class_id)
+                    .get_class(referencing_class_id)
                     .ok_or_else(|| VmError::Internal {
                         message: "current class not found".to_string(),
                     })?;
@@ -11800,20 +11804,15 @@ fn execute_instruction(
                     })?
                     .to_string()
             };
-            let component_class_id = {
-                let res = shared
-                    .class_manager
-                    .write()
-                    .load_class(&component_class_name);
-                res.map_err(|e| {
-                    convert_class_not_found(
-                        shared,
-                        thread,
-                        &component_class_name,
-                        VmError::from(e).into(),
-                    )
-                })?
-            };
+            let component_class_id = resolve_class_loader_aware(
+                shared,
+                thread,
+                referencing_class_id,
+                &component_class_name,
+            )
+            .map_err(|e| {
+                convert_class_not_found(shared, thread, &component_class_name, e)
+            })?;
             // Widening: index conversion
             let arr = gc_alloc_array(
                 shared,
@@ -12200,11 +12199,11 @@ fn execute_instruction(
                     thread.frames[frame_idx].stack.push(Value::Object(None))?;
                 }
                 Value::Object(Some(obj_ref)) => {
+                    let referencing_class_id = thread.frames[frame_idx].class_id;
                     let target_class_name = {
-                        let current_class_id = thread.frames[frame_idx].class_id;
                         let cm = shared.class_manager.read();
                         let class =
-                            cm.get_class(current_class_id)
+                            cm.get_class(referencing_class_id)
                                 .ok_or_else(|| VmError::Internal {
                                     message: "current class not found".to_string(),
                                 })?;
@@ -12228,16 +12227,20 @@ fn execute_instruction(
                         // class_manager.write().load_class() — the write lock
                         // would block if any JIT thread holds a read lock during
                         // compilation, causing interpreter hangs under concurrent JIT.
-                        let target_class_id = shared
-                            .load_class_concurrent(&target_class_name)
-                            .map_err(|e| {
-                                convert_class_not_found(
-                                    shared,
-                                    thread,
-                                    &target_class_name,
-                                    VmError::from(e).into(),
-                                )
-                            })?;
+                        let target_class_id = resolve_class_loader_aware(
+                            shared,
+                            thread,
+                            referencing_class_id,
+                            &target_class_name,
+                        )
+                        .map_err(|e| {
+                            convert_class_not_found(
+                                shared,
+                                thread,
+                                &target_class_name,
+                                e,
+                            )
+                        })?;
                         let obj_class_id = shared.heap.class_id_of(obj_ref);
                         shared
                             .class_manager
@@ -12337,11 +12340,11 @@ fn execute_instruction(
                     thread.frames[frame_idx].stack.push(Value::Int(0))?;
                 }
                 Value::Object(Some(obj_ref)) => {
+                    let referencing_class_id = thread.frames[frame_idx].class_id;
                     let target_class_name = {
-                        let current_class_id = thread.frames[frame_idx].class_id;
                         let cm = shared.class_manager.read();
                         let class =
-                            cm.get_class(current_class_id)
+                            cm.get_class(referencing_class_id)
                                 .ok_or_else(|| VmError::Internal {
                                     message: "current class not found".to_string(),
                                 })?;
@@ -12366,16 +12369,20 @@ fn execute_instruction(
                         // Non-array object is not instanceof any array type.
                         0
                     } else {
-                        let target_class_id = shared
-                            .load_class_concurrent(&target_class_name)
-                            .map_err(|e| {
-                                convert_class_not_found(
-                                    shared,
-                                    thread,
-                                    &target_class_name,
-                                    VmError::from(e).into(),
-                                )
-                            })?;
+                        let target_class_id = resolve_class_loader_aware(
+                            shared,
+                            thread,
+                            referencing_class_id,
+                            &target_class_name,
+                        )
+                        .map_err(|e| {
+                            convert_class_not_found(
+                                shared,
+                                thread,
+                                &target_class_name,
+                                e,
+                            )
+                        })?;
                         let obj_class_id = shared.heap.class_id_of(obj_ref);
                         if shared
                             .class_manager
@@ -13522,9 +13529,14 @@ fn execute_ldc(
                     thread.frames[frame_idx].class_name()
                 );
             }
-            let class_id = shared
-                .load_class_concurrent(&class_name)
-                .map_err(|e| convert_class_not_found(shared, thread, &class_name, e.into()))?;
+            let referencing_class_id = thread.frames[frame_idx].class_id;
+            let class_id = resolve_class_loader_aware(
+                shared,
+                thread,
+                referencing_class_id,
+                &class_name,
+            )
+            .map_err(|e| convert_class_not_found(shared, thread, &class_name, e))?;
             let mirror = get_or_create_class_mirror(shared, class_id);
             thread.frames[frame_idx]
                 .stack
@@ -13775,6 +13787,181 @@ fn execute_ldc2w(shared: &SharedVm, frame: &mut Frame, index: u16) -> Result<(),
 }
 
 // ---------------------------------------------------------------------------
+// Helper: Loader-faithful CONSTANT_Class resolution
+// ---------------------------------------------------------------------------
+
+/// Standard JDK namespaces that a user-defined loader never *isolates*: `java/*`
+/// is a JVMS-prohibited package for non-bootstrap loaders, and the platform
+/// namespaces below are delegated to the parent by ~every real custom loader, so
+/// global resolution already yields the loader-correct answer. Short-circuiting
+/// them keeps the re-entrant `loadClass` invocation off the common hot path.
+#[inline]
+fn is_global_resolution_namespace(name: &str) -> bool {
+    name.starts_with("java/")
+        || name.starts_with("javax/")
+        || name.starts_with("jdk/")
+        || name.starts_with("sun/")
+        || name.starts_with("com/sun/")
+}
+
+/// Read-only loader-faithful lookup: the `ClassId` that `referencing_class_id`'s
+/// *user-defined* defining loader resolves `name` to, **without** any re-entrant
+/// `loadClass` call — i.e. only what that loader has already defined itself (its
+/// own isolated copy) or previously initiated (memoised in
+/// [`SharedVm::initiating_resolution_cache`]).
+///
+/// Returns `None` (so the caller keeps its existing global resolution) when the
+/// gate is off, the loader is built-in, the name is a JDK/array name, or the
+/// loader has not yet resolved `name`. A `Some` answer is always loader-correct:
+/// a class a loader has itself defined, or a prior validated initiating result.
+/// This is the half of loader-faithful resolution that needs no `&mut thread`,
+/// so it is safe to call from the hot field/method-owner resolvers.
+#[inline]
+fn lookup_loader_initiated(
+    shared: &SharedVm,
+    referencing_class_id: ClassId,
+    name: &str,
+) -> Option<ClassId> {
+    if !crate::runtime::env_cache::loader_aware_resolution() {
+        return None;
+    }
+    let loader = match shared
+        .class_manager
+        .read()
+        .get_loader_id(referencing_class_id)
+    {
+        Some(l @ cratonvm_types::ClassLoaderId::UserDefined(_)) => l,
+        _ => return None,
+    };
+    if name.starts_with('[') || is_global_resolution_namespace(name) {
+        return None;
+    }
+    if let Some(id) = shared
+        .initiating_resolution_cache
+        .read()
+        .get(&loader)
+        .and_then(|m| m.get(name))
+        .copied()
+    {
+        return Some(id);
+    }
+    shared
+        .class_manager
+        .read()
+        .class_defined_by_loader_exact(name, loader)
+}
+
+/// Resolve a `CONSTANT_Class` reference (`ldc X.class`, `new`/`anewarray`,
+/// `checkcast`/`instanceof`) in a *loader-faithful* way.
+///
+/// `referencing_class_id` is the class whose constant pool holds the reference
+/// (the executing frame's class). When the loader-aware gate
+/// (`CRATONVM_LOADER_AWARE_RESOLUTION`) is on **and** that class was defined by a
+/// user-defined loader, the reference is resolved through that loader as the
+/// JVMS §5.4.3 *initiating* loader — by invoking its `loadClass` — so that two
+/// isolating loaders which each define their own copy of `X` resolve `X` to
+/// their *own* copy (HotSpot semantics) instead of collapsing to the first
+/// (application) copy in CratonVM's flat global store.
+///
+/// Every other case — gate off, a built-in defining loader, a JDK/array name, a
+/// missing loader object, or *any* failure of the loader path — falls through to
+/// the legacy global [`SharedVm::load_class_concurrent`]. The loader path can
+/// therefore only ever return a *more* correct answer, never a worse failure
+/// than the pre-gate behavior.
+fn resolve_class_loader_aware(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    referencing_class_id: ClassId,
+    name: &str,
+) -> Result<ClassId, MethodCallFailed> {
+    // (1) Gate / built-in / JDK-name fast paths + already-known loader-local
+    //     answer — none of which need a re-entrant call.
+    if let Some(id) = lookup_loader_initiated(shared, referencing_class_id, name) {
+        return Ok(id);
+    }
+    // `lookup_loader_initiated` returned `None`, so either this is a legacy case
+    // (gate off / built-in loader / JDK or array name) or the loader is
+    // user-defined but has not yet resolved this name. Only the latter takes the
+    // cold loadClass path below; everything else resolves globally.
+    let user_loader = if crate::runtime::env_cache::loader_aware_resolution()
+        && !name.starts_with('[')
+        && !is_global_resolution_namespace(name)
+    {
+        match shared
+            .class_manager
+            .read()
+            .get_loader_id(referencing_class_id)
+        {
+            Some(l @ cratonvm_types::ClassLoaderId::UserDefined(_)) => Some(l),
+            _ => None,
+        }
+    } else {
+        None
+    };
+    let Some(loader) = user_loader else {
+        return shared
+            .load_class_concurrent(name)
+            .map_err(MethodCallFailed::from);
+    };
+
+    // (2) Drive the loader's own `loadClass` as the initiating loader. A
+    //     per-thread in-flight guard breaks any pathological re-entry for the
+    //     same (loader, name) by degrading to global resolution.
+    thread_local! {
+        static IN_FLIGHT: std::cell::RefCell<Vec<(cratonvm_types::ClassLoaderId, String)>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+    let reentrant =
+        IN_FLIGHT.with(|s| s.borrow().iter().any(|(l, n)| *l == loader && n == name));
+    if !reentrant {
+        if let Some(loader_obj) = cratonvm_native_builtins::classloader::defining_loader_for(
+            referencing_class_id.as_u32(),
+        ) {
+            IN_FLIGHT.with(|s| s.borrow_mut().push((loader, name.to_string())));
+            let depth = thread.frames.len();
+            let dotted = name.replace('/', ".");
+            let result = {
+                // `create_string` / `invoke_virtual` are `NativeContext` trait
+                // methods — bring the trait into scope to call them.
+                use cratonvm_native_api::NativeContext as _;
+                let mut ctx = crate::vm::NativeContextImpl { shared, thread };
+                let name_obj = ctx.create_string(&dotted);
+                ctx.invoke_virtual(
+                    loader_obj,
+                    "loadClass",
+                    "(Ljava/lang/String;)Ljava/lang/Class;",
+                    &[Value::Object(Some(name_obj))],
+                )
+            };
+            // Defensive: a re-entrant call that unwound abnormally must not leave
+            // stray frames on this thread's stack.
+            if thread.frames.len() > depth {
+                thread.frames.truncate(depth);
+            }
+            IN_FLIGHT.with(|s| {
+                s.borrow_mut().pop();
+            });
+            if let Ok(Some(Value::Object(Some(mirror)))) = result {
+                if let Some(id) = crate::vm::class_id_from_mirror(shared, mirror) {
+                    shared
+                        .initiating_resolution_cache
+                        .write()
+                        .entry(loader)
+                        .or_default()
+                        .insert(cratonvm_types::intern_arc(name), id);
+                    return Ok(id);
+                }
+            }
+            // Miss/failure: fall through to global (never worse than legacy).
+        }
+    }
+
+    shared
+        .load_class_concurrent(name)
+        .map_err(MethodCallFailed::from)
+}
+
+// ---------------------------------------------------------------------------
 // Helper: Field resolution
 // ---------------------------------------------------------------------------
 
@@ -13828,7 +14015,10 @@ fn resolve_field_ref(
         (class_name, field_name.to_string())
     };
 
-    let field_class_id = shared.load_class_concurrent(&field_class_name)?;
+    let field_class_id = match lookup_loader_initiated(shared, current_class_id, &field_class_name) {
+        Some(id) => id,
+        None => shared.load_class_concurrent(&field_class_name)?,
+    };
 
     // First check: is this a static field? Look in the declaring class's own fields.
     //

@@ -4775,6 +4775,24 @@ impl ClassManager {
 
     /// Find a class by name within a specific loader's namespace, with delegation
     /// fallback to the standard loader chain (Bootstrap → Extension → Application).
+    /// Exact-key lookup: the `ClassId` recorded under *exactly* `(loader_id,
+    /// name)`, with **no** parent-delegation / global fallback.
+    ///
+    /// Unlike [`Self::find_class_by_name_in_loader`] (which falls back to the
+    /// built-in delegation chain on a miss, making it loader-blind for names the
+    /// loader did not itself define), this answers only "has `loader_id` already
+    /// defined this exact name?". Used by loader-faithful `CONSTANT_Class`
+    /// resolution to detect a class a user-defined loader has *itself* defined
+    /// (e.g. an isolated copy) before falling through to invoking its
+    /// `loadClass`.
+    pub fn class_defined_by_loader_exact(
+        &self,
+        name: &str,
+        loader_id: ClassLoaderId,
+    ) -> Option<ClassId> {
+        loaded_classes_probe(&self.loaded_classes, loader_id, name)
+    }
+
     pub fn find_class_by_name_in_loader(
         &self,
         name: &str,
