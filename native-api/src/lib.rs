@@ -13,6 +13,7 @@ pub mod init_level;
 pub mod intrinsic;
 pub mod native_ring;
 pub mod plain_server_socket_bind;
+pub mod plain_server_socket_close;
 pub mod registry;
 pub mod server_socket_ports;
 
