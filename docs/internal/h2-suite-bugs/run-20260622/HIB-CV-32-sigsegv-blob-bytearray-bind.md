@@ -1,8 +1,12 @@
 # HIB-CV-32 — SIGSEGV "binding a byte[] BLOB parameter" is actually a corrupt `Value` in `getfield java.lang.Byte.value`
 
-**Status:** OPEN (root-caused to a corrupt heap field cell; exact GC mechanism not yet pinned)
-**Severity:** High — deterministic SIGSEGV, kills the JVM, reproduces under `--nojit`.
-**First filed:** run-20260622. **Confirmed still failing:** 2026-06-23 on dev (`f8cdd52b`; retested through `fbcf8f61` — dev moved during the session).
+> **✅ FIXED + VERIFIED on dev (merge `c9258e17`, branch `fix/gc-young-sweep-corruptor`).** Confirmed = the **same GC corruptor as HIB-CV-22/33** (victim here: a boxed `java.lang.Byte` whose reclaimed-then-reused storage made `getfield Byte.value` read a malformed `Value` `{heap-ptr, 6}`). The "distinct from HIB-CV-32" note in HIB-CV-33 is superseded — one fix resolves all three. Two parts landed: (1) **root** — `gen_heap.rs` `promotion_oom_risk` no longer diverts `--nojit` young collections into the corrupting non-moving sweep when no conservative JIT roots exist (precise moving collector runs instead; opt-out `CRATONVM_PROMOTION_OOM_GUARD_BROAD=1`); (2) **defense-in-depth** — `types/src/value.rs::read_value_checked` validates the discriminant before constructing the enum (the guard this report recommended), so a corrupt cell degrades to null+diagnostic instead of a wild SIGSEGV.
+>
+> **Independent verification (this report, 2026-06-24, dev `95a3a3ba` incl. the fix):** rebuilt release + re-ran the exact repro → **no SIGSEGV / 0 access violations, clean `System.exit(0)`**; the corruptor path is gone (the run no longer reaches `binding parameter (3:BLOB)`). `ByteArrayMappingTests` now fails **earlier and unrelatedly** with `ExceptionInInitializerError` in `org/hibernate/type/descriptor/JdbcTypeNameMapper.<clinit>` ← NPE `ModuleDescriptor.isOpen()` "this.descriptor is null" — a **separate JPMS module-descriptor bug** (being worked separately), not this crash. The analysis below stands as the root-cause record.
+
+**Status:** **FIXED** (was: deterministic SIGSEGV in the generational collector). Residual: e2e blocked on a separate JPMS `ModuleDescriptor` NPE before the BLOB path.
+**Severity:** High — deterministic SIGSEGV, killed the JVM, reproduced under `--nojit`.
+**First filed:** run-20260622. **Confirmed failing:** 2026-06-23 on dev (`f8cdd52b`…`fbcf8f61`). **Fixed+verified:** 2026-06-24 on dev (`c9258e17`/`95a3a3ba`).
 **Collector:** generational (default; no `-XX:+UseG1GC`).
 
 ---

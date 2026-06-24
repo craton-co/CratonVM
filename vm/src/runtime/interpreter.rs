@@ -16766,11 +16766,14 @@ fn force_native_over_real_jdk_bytecode(
     // synthetic Module mirror with a NULL `descriptor` (real module-path
     // encapsulation does not exist — every class is effectively on the class
     // path). The real `Module.isExported`/`isOpen` bytecode dereferences
-    // `this.descriptor.isOpen()` and NPEs (e.g. Hibernate's
+    // `this.descriptor.isOpen()` inside `implIsExportedOrOpen` and NPEs (e.g.
+    // Groovy `CachedClass.getMethods` → `checkCanSetAccessible`, Hibernate's
     // `JdbcTypeNameMapper.<clinit>` reflecting over `java.sql.Types`). Force the
-    // permissive natives registered in `native-builtins` (return true) so every
-    // reflective access probe succeeds — the access analogue of the always-true
-    // `Module.canUse`/`canRead` overrides.
+    // registry-backed natives registered in `native-builtins` so the access check
+    // is answered from the boot `ModuleRegistry`'s accurate per-module
+    // exports/opens (java.base exports `java.lang`/… to all but not
+    // `jdk.internal.*` — which ByteBuddy's `JavaDispatcher` relies on) instead of
+    // touching the null descriptor.
     if class_name == "java/lang/Module" && matches!(method_name, "isExported" | "isOpen") {
         return true;
     }
