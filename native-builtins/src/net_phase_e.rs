@@ -1920,26 +1920,26 @@ fn re1_socket_read_stream(
     if stream_id < 0 {
         return Err(ioex("Socket not connected"));
     }
-    // Clone the stream handle out under a SHORT lock, then release s2_registry
-    // BEFORE the blocking read(). Holding the global registry lock across a
-    // blocking read deadlocks every other synthetic-socket operation
+    // Clone the cheap Arc<TcpStream> out under a SHORT lock, then release
+    // s2_registry BEFORE the blocking read(). Holding the global registry lock
+    // across a blocking read deadlocks every other synthetic-socket operation
     // process-wide: any peer thread that must WRITE the response (okhttp
     // MockWebServer's dispatcher, a request/response loopback, …) blocks
     // forever on the same lock while this read waits for bytes that only that
     // write can produce → the HTTP exchange times out (BUG-04 loopback hang).
-    // try_clone() yields an independent handle to the same socket; concurrent
-    // read-on-one-clone / write-on-another is safe. (Same rationale as the
-    // blocking accept() in re2_accept_into.)
-    let mut stream = {
+    // The Arc shares the SAME socket fd (NOT a try_clone() duplicate — a recv
+    // blocked on a Windows duplicate handle is not woken by data arriving after
+    // it blocked), so reading via `&TcpStream` here is woken correctly while the
+    // lock is free for the peer writer.
+    let stream = {
         let reg = s2_registry().lock();
         reg.streams
             .get(&stream_id)
             .ok_or_else(|| ioex("Socket stream not found"))?
-            .try_clone()
-            .map_err(|e| ioex(format!("Socket read: try_clone failed: {e}")))?
+            .clone()
     };
     let mut tmp = vec![0u8; ln];
-    let n = stream
+    let n = (&*stream)
         .read(&mut tmp)
         .map_err(|e| ioex(format!("Socket read failed: {e}")))?;
     if n == 0 {
@@ -1964,24 +1964,21 @@ fn re1_socket_write_stream(
     if stream_id < 0 {
         return Err(ioex("Socket not connected"));
     }
-    // Write on the ORIGINAL registered stream under the lock — do NOT write on a
-    // try_clone'd handle and drop it: dropping the duplicate handle right after
-    // write_all defers actual transmission on Windows (the peer only sees the
-    // bytes when the socket is later close()d / shutdown), which wedges any
-    // request/response loopback (okhttp MockWebServer never replies). Holding
-    // the lock here is safe: write_all into a non-full kernel send buffer
-    // returns promptly and never blocks waiting on a peer, so it cannot form the
-    // reader-holds-lock / writer-waits-lock deadlock the blocking READ path can
-    // (that one clones to drop the lock; see re1_socket_read_stream).
-    let mut reg = s2_registry().lock();
-    let stream = reg
-        .streams
-        .get_mut(&stream_id)
-        .ok_or_else(|| ioex("Socket stream not found"))?;
-    stream
+    // Clone the Arc out under a short lock and write on the shared `&TcpStream`
+    // with the lock released — same-fd handle, so the bytes hit the wire
+    // immediately (no deferred-until-close like a dropped try_clone duplicate)
+    // and a concurrently-reading peer is never wedged behind the registry lock.
+    let stream = {
+        let reg = s2_registry().lock();
+        reg.streams
+            .get(&stream_id)
+            .ok_or_else(|| ioex("Socket stream not found"))?
+            .clone()
+    };
+    (&*stream)
         .write_all(&data)
         .map_err(|e| ioex(format!("Socket write failed: {e}")))?;
-    stream
+    (&*stream)
         .flush()
         .map_err(|e| ioex(format!("Socket flush failed: {e}")))?;
     Ok(None)
