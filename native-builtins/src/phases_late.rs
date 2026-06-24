@@ -15896,13 +15896,46 @@ fn spring_class_utils_for_name_impl(
         _ => {}
     }
 
-    // Handle array types: "String[]" → "[Ljava/lang/String;"
+    // Handle array types in Spring's source notation: "String[]", "int[]",
+    // "Foo[][]", etc. Real Spring's `ClassUtils.forName` strips one "[]" and
+    // recurses, then calls `Class.arrayType()`; we build the equivalent JVM
+    // array descriptor directly. The component may be a primitive
+    // ("int" → "I"), a reference type ("java.lang.String" → "Ljava/lang/String;"),
+    // and the array may be multi-dimensional. The previous code unconditionally
+    // built "[L<element>;" (single-dimension reference only), which produced a
+    // bogus descriptor for primitive components ("[Lboolean;") and for
+    // multi-dimensional arrays ("[Lorg/.../Foo[];") — making every such forName
+    // fall through to ClassNotFoundException (ClassUtilsTests.forName /
+    // forNameWithPrimitiveArrays, where "boolean[]", "int[]" and "Foo[][]" all
+    // failed while single-dimension "java.lang.String[]" / "Foo[]" worked).
     if dotted.ends_with("[]") {
-        let element = &dotted[..dotted.len() - 2];
-        let element_internal = element.replace('.', "/");
-        let array_desc = format!("[L{element_internal};");
-        if let Ok(cid) = ctx.ensure_class_initialized(&array_desc) {
-            return Ok(Some(Value::Object(Some(ctx.get_class_mirror(cid)))));
+        // Peel trailing "[]" pairs → dimensionality + base component name.
+        let mut base = dotted.as_str();
+        let mut dims = 0usize;
+        while let Some(stripped) = base.strip_suffix("[]") {
+            base = stripped;
+            dims += 1;
+        }
+        // Component descriptor: primitive letter, or `L<internal>;` reference
+        // form. `void` has no array type (matches real `void.class.arrayType()`
+        // throwing) → leave as None so we fall through to the CNFE path.
+        let component = match base {
+            "boolean" => Some("Z".to_string()),
+            "byte" => Some("B".to_string()),
+            "char" => Some("C".to_string()),
+            "short" => Some("S".to_string()),
+            "int" => Some("I".to_string()),
+            "long" => Some("J".to_string()),
+            "float" => Some("F".to_string()),
+            "double" => Some("D".to_string()),
+            "void" => None,
+            _ => Some(format!("L{};", base.replace('.', "/"))),
+        };
+        if let Some(component) = component {
+            let array_desc = format!("{}{component}", "[".repeat(dims));
+            if let Ok(cid) = ctx.ensure_class_initialized(&array_desc) {
+                return Ok(Some(Value::Object(Some(ctx.get_class_mirror(cid)))));
+            }
         }
     }
 
