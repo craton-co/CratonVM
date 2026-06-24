@@ -473,7 +473,12 @@ pub mod jdk25_patterns;
 pub mod letsgo_compat;
 pub mod locale_bootstrap;
 pub mod locale_resources;
-#[cfg(feature = "experimental-serialization")]
+// `register_synthetic_overrides` (gated `synthetic-jdk`) calls
+// `serialization::register_byte_array_output_stream`, so the module must also be
+// compiled in under `synthetic-jdk` — otherwise `--features synthetic-jdk` fails
+// to build (E0433: unresolved module `serialization`), which is what bitrotted
+// the synthetic-jdk gated test build.
+#[cfg(any(feature = "experimental-serialization", feature = "synthetic-jdk"))]
 pub mod serialization;
 pub mod spring_startup_bootstrap;
 pub mod unsafe_jdk25;
