@@ -15426,19 +15426,22 @@ fn natural_compare(ctx: &mut dyn NativeContext, a: &Value, b: &Value) -> MethodC
             if let (Some(sa), Some(sb)) = (sa, sb) {
                 return Ok(Some(Value::Int(sa.cmp(&sb) as i32)));
             }
-            // Try as wrapper: compare field 0 values — but ONLY when both
-            // receivers actually own a slot 0. Probing slot 0 on a zero-field
-            // object (e.g. WildFly's stateless `*$Factory` singletons, which
-            // extend `AbstractConstraintFactory` and declare no instance
-            // fields) trips the `gen_heap::get_field` out-of-bounds guard,
-            // emitting a spurious "out-of-bounds field read dropped" warning
-            // for every TreeSet/TreeMap comparison. Such objects must be
-            // compared via their real `Comparable.compareTo`, which is exactly
-            // the fallthrough below — so guarding the probe is behavior-neutral
-            // and just suppresses the noise (gap: WildFly $Factory get_field).
-            if ctx.object_num_fields(*ra) >= 1 && ctx.object_num_fields(*rb) >= 1 {
-                let fa = ctx.get_field(*ra, 0);
-                let fb = ctx.get_field(*rb, 0);
+            // Try as primitive wrapper: unbox BOTH receivers and compare the
+            // boxed primitives. CRITICAL — gate on `unbox_wrapper` (a SINGLE
+            // primitive field), NOT a raw field-0 probe. A raw probe of slot 0
+            // mis-fires on any entity / POJO whose first *declared* field is a
+            // primitive: e.g. a JPA `@Id @GeneratedValue long id`. Two freshly
+            // `new`'d, not-yet-persisted entities both have `id == 0`, so the
+            // probe returned 0 ("equal") and a natural-order TreeSet/TreeMap
+            // collapsed two distinct elements into one — dropping a child on
+            // persist (HHH-8827 `SortNaturalTest`: `owner.cats` lost a Cat;
+            // the real ordering lives in the entity's own `compareTo(name)`).
+            // `unbox_wrapper` only matches genuine 1-field wrappers (Integer,
+            // Long, Float, Double, …), so a multi-field Comparable falls through
+            // to its real `Comparable.compareTo` below — the JDK's natural-order
+            // semantics. (It also keeps the original behaviour of never probing
+            // a zero-field object, avoiding the gen_heap out-of-bounds warning.)
+            if let (Some(fa), Some(fb)) = (unbox_wrapper(&*ctx, *ra), unbox_wrapper(&*ctx, *rb)) {
                 match (fa, fb) {
                     (Value::Int(a), Value::Int(b)) => {
                         return Ok(Some(Value::Int(a.cmp(&b) as i32)))
