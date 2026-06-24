@@ -3811,8 +3811,8 @@ pub(crate) fn native_string_format(
             if let Some(&spec) = chars.get(i) {
                 i += 1;
                 match spec {
-                    's' | 'd' | 'f' | 'x' | 'X' | 'c' | 'b' | 'e' | 'E' | 'g' | 'G' | 'o' | 'h'
-                    | 'H' | 'a' | 'A' => {
+                    's' | 'S' | 'd' | 'f' | 'x' | 'X' | 'c' | 'C' | 'b' | 'B' | 'e' | 'E' | 'g'
+                    | 'G' | 'o' | 'h' | 'H' | 'a' | 'A' => {
                         // Select the argument this conversion consumes:
                         //   `%<x`  → reuse the previous conversion's index
                         //   `%N$x` → explicit 1-based index N
@@ -3881,6 +3881,21 @@ pub(crate) fn format_arg_full(
     width: Option<usize>,
     precision: Option<usize>,
 ) -> String {
+    // Uppercase string-family conversions ('S'/'B'/'C') format identically to
+    // their lowercase form, then the whole result is upper-cased — per
+    // java.util.Formatter's "If the conversion is 'S', 'B' or 'C' … the result is
+    // converted to upper case". (The numeric uppercase conversions 'X'/'E'/'G'/'A'
+    // already emit upper-case digits in `format_arg`, so they are NOT remapped
+    // here.) Format with the lowercase spec, then upper-case at the very end.
+    // Without 'S' support, Groovy's `"COMMERCIAL_%SREPO_URL".formatted(id)` left
+    // the specifier literal, so the env-var key never matched (SpringRepos).
+    let (spec, uppercase_result) = match spec {
+        'S' => ('s', true),
+        'B' => ('b', true),
+        'C' => ('c', true),
+        other => (other, false),
+    };
+
     // Get the raw formatted value first
     let raw = format_arg(ctx, val, spec);
 
@@ -3946,6 +3961,9 @@ pub(crate) fn format_arg_full(
         }
     }
 
+    if uppercase_result {
+        formatted = formatted.to_uppercase();
+    }
     formatted
 }
 

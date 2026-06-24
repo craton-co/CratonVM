@@ -478,6 +478,9 @@ fn native_retransform_classes0(ctx: &mut dyn NativeContext, args: &[Value]) -> M
         _ => return Ok(None),
     };
     let n = ctx.array_length(arr);
+    if std::env::var("CRATONVM_DBG_RETRANSFORM").is_ok() {
+        eprintln!("[RETRANSFORM] retransformClasses0 called with {n} classes");
+    }
     for i in 0..n {
         let mirror = match ctx.get_array_element(arr, i) {
             Value::Object(Some(o)) => o,
@@ -487,6 +490,11 @@ fn native_retransform_classes0(ctx: &mut dyn NativeContext, args: &[Value]) -> M
             Some(cid) => cid,
             None => continue,
         };
+        if std::env::var("CRATONVM_DBG_RETRANSFORM").is_ok() {
+            let nm = ctx.class_name_of_id(class_id).unwrap_or_default();
+            let ob = original_class_bytes(ctx, class_id);
+            eprintln!("[RETRANSFORM]   [{i}] {nm} original_bytes={}", ob.len());
+        }
         // Look up the original bytes via the application classpath
         // resource finder using `<name>.class` — we always cache them
         // under that path on define. For real hidden classes / proxy
@@ -864,6 +872,13 @@ fn run_transformer_chain(
     inst_receiver: Option<ObjectRef>,
 ) -> Vec<u8> {
     let rust_chain = snapshot_transformer_chain();
+    if std::env::var("CRATONVM_DBG_RETRANSFORM").is_ok() {
+        eprintln!(
+            "[RETRANSFORM]   run_transformer_chain: rust_chain={} entries, initial_bytes={}, retransform_only={retransform_only}",
+            rust_chain.len(),
+            initial_bytes.len()
+        );
+    }
     if rust_chain.is_empty() && inst_receiver.is_none() {
         return initial_bytes.to_vec();
     }
@@ -922,14 +937,27 @@ fn run_transformer_chain(
         let descriptor = "(Ljava/lang/ClassLoader;Ljava/lang/String;Ljava/lang/Class;\
                           Ljava/security/ProtectionDomain;[B)[B";
         let result = ctx.invoke_virtual(entry.transformer_ref, "transform", descriptor, &args);
+        let dbg = std::env::var("CRATONVM_DBG_RETRANSFORM").is_ok();
         match result {
             Ok(Some(Value::Object(Some(out_obj)))) => {
                 let out_bytes = read_byte_array(ctx, out_obj);
+                if dbg {
+                    eprintln!(
+                        "[RETRANSFORM]     transformer {:?} -> {} bytes (was {})",
+                        entry.transformer_ref,
+                        out_bytes.len(),
+                        bytes_vec.len()
+                    );
+                }
                 if !out_bytes.is_empty() {
                     bytes_vec = out_bytes;
                 }
             }
-            Ok(_) => { /* null or void: keep prior bytes */ }
+            Ok(_) => {
+                if dbg {
+                    eprintln!("[RETRANSFORM]     transformer {:?} -> null/void (no change)", entry.transformer_ref);
+                }
+            }
             Err(MethodCallFailed::ExceptionThrown(_)) => {
                 tracing::warn!(
                     "transformer threw an exception while transforming {class_name_str}; \
