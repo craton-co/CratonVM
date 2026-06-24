@@ -120,6 +120,33 @@ pub fn osr_backedge_enabled() -> bool {
     })
 }
 
+/// `CRATONVM_LOADER_AWARE_RESOLUTION` — loader-faithful `CONSTANT_Class`
+/// resolution (ProxyClassReuseTest / IsoProbe family).
+///
+/// **Default: OFF.** When ON, an implicit class-constant reference (`ldc X.class`,
+/// `new X`, `checkcast`/`instanceof X`, `anewarray X`, and field/method owner
+/// resolution) reached from bytecode defined by a *user-defined* class loader is
+/// resolved through that loader as the JVMS §5.4.3 *initiating* loader — i.e. by
+/// invoking its `loadClass` — instead of through CratonVM's flat global class
+/// store. This makes two isolating loaders that each define their own copy of a
+/// class `X` resolve `X` to their *own* copy (HotSpot semantics) rather than
+/// collapsing both to the first-loaded (application) copy.
+///
+/// Built-in-loader (bootstrap/extension/application) references keep the exact
+/// global fast path, so the new behavior only engages for classes defined by
+/// custom loaders — but that still covers web-app / OSGi / proxy loaders broadly,
+/// so the change ships gated until soaked on the full app gauntlet. Empty or
+/// `"0"` ⇒ disabled (the safe default); any other value ⇒ enabled. Read once and
+/// cached.
+#[inline]
+pub fn loader_aware_resolution() -> bool {
+    static CACHE: OnceLock<bool> = OnceLock::new();
+    *CACHE.get_or_init(|| match std::env::var("CRATONVM_LOADER_AWARE_RESOLUTION") {
+        Ok(v) => !v.is_empty() && v != "0",
+        Err(_) => false,
+    })
+}
+
 /// `CRATONVM_TIER_OSR_BACKEDGE` — wire-tiered-manager Step 6 — per-frame
 /// back-edge count at which OSR is first attempted (`Frame::should_try_osr`'s
 /// `osr_threshold` argument), default 1000 (the historical `OSR_THRESHOLD`

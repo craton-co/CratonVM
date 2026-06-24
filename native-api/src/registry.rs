@@ -2115,6 +2115,16 @@ pub trait NativeContext {
     /// Falls back to the standard delegation chain if not found.
     fn class_id_by_name_and_loader(&self, name: &str, loader_id: u32) -> Option<ClassId>;
 
+    /// Exact `(loader, name)` lookup with **no** delegation/global fallback —
+    /// only a class the loader with `loader_id` has itself defined. Used by
+    /// loader-faithful `findLoadedClass` so it never returns another loader's
+    /// class. Default impl falls back to the (fallback-prone)
+    /// [`Self::class_id_by_name_and_loader`] for contexts that do not override
+    /// it (e.g. test mocks).
+    fn class_id_defined_by_loader_exact(&self, name: &str, loader_id: u32) -> Option<ClassId> {
+        self.class_id_by_name_and_loader(name, loader_id)
+    }
+
     /// Allocate a unique classloader ID for a new user-defined classloader instance.
     fn allocate_loader_id(&mut self) -> u32;
 
