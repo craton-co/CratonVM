@@ -1938,10 +1938,17 @@ fn re1_socket_read_stream(
             .ok_or_else(|| ioex("Socket stream not found"))?
             .clone()
     };
+    let dbg = std::env::var_os("CRATONVM_DBG_SOCK").is_some();
+    if dbg {
+        eprintln!("[dbg-sock] read: sid={stream_id} want={ln} (blocking on recv...)");
+    }
     let mut tmp = vec![0u8; ln];
     let n = (&*stream)
         .read(&mut tmp)
         .map_err(|e| ioex(format!("Socket read failed: {e}")))?;
+    if dbg {
+        eprintln!("[dbg-sock] read: sid={stream_id} got={n}");
+    }
     if n == 0 {
         return Ok(Some(Value::Int(-1)));
     }
@@ -1981,6 +1988,9 @@ fn re1_socket_write_stream(
     (&*stream)
         .flush()
         .map_err(|e| ioex(format!("Socket flush failed: {e}")))?;
+    if std::env::var_os("CRATONVM_DBG_SOCK").is_some() {
+        eprintln!("[dbg-sock] write: sid={stream_id} sent={} bytes", data.len());
+    }
     Ok(None)
 }
 
@@ -2271,6 +2281,21 @@ fn register_re1_socket(r: &mut NativeMethodRegistry) {
         let len = args.get(3).and_then(|v| v.as_int()).unwrap_or(0);
         re1_socket_read_stream(ctx, owner, buf, off, len)
     });
+    // read([B)I — MUST be registered directly. Without it, `in.read(byte[])`
+    // falls to the default java.io.InputStream.read(byte[]) bytecode, which
+    // reads ONE byte then loops single-byte read() to fill the ENTIRE array,
+    // blocking forever after the first record (e.g. it gets a 5-byte "PING\n"
+    // into a 64-byte buffer then blocks waiting for byte 6 that never comes).
+    // A single bulk read returning whatever is currently available (>=1 byte)
+    // is the correct InputStream.read(byte[]) contract and unblocks every
+    // server-side request read (okhttp MockWebServer, loopback HTTP). BUG-04.
+    r.register(sis, "read", "([B)I", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let owner = stream_owner_get(this).ok_or_else(|| ioex("SocketInputStream has no owner"))?;
+        let buf = obj_arg(args, 1)?;
+        let len = ctx.array_length(buf) as i32;
+        re1_socket_read_stream(ctx, owner, buf, 0, len)
+    });
     r.register(sis, "read", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let owner = stream_owner_get(this).ok_or_else(|| ioex("SocketInputStream has no owner"))?;
@@ -2417,9 +2442,19 @@ fn re2_accept_into(
     };
     let (stream, peer) =
         accept_result.map_err(|e| ioex(format!("ServerSocket.accept failed: {e}")))?;
+    // The accept may have come from the timeout-poll path (listener set
+    // non-blocking) or a try_clone'd listener; force the accepted stream to
+    // blocking so a server-side read() actually waits for data (and is woken by
+    // it) instead of returning WouldBlock or never signalling. (BUG-04)
+    let _ = stream.set_nonblocking(false);
     let peer_port = peer.port() as i32;
     let peer_ip = peer.ip().to_string();
     let local_port = stream.local_addr().map(|a| a.port() as i32).unwrap_or(0);
+    if std::env::var_os("CRATONVM_DBG_SOCK").is_some() {
+        eprintln!(
+            "[dbg-sock] accept: peer={peer_ip}:{peer_port} local_port={local_port} nonblocking_reset"
+        );
+    }
     let stream_id = s2_alloc_stream(stream);
     let host_str = ctx.create_string(&peer_ip);
     ctx.set_field(target, SOCK_HOST, Value::Object(Some(host_str)));
