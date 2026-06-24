@@ -1920,17 +1920,28 @@ fn re1_socket_read_stream(
     if stream_id < 0 {
         return Err(ioex("Socket not connected"));
     }
-    let mut tmp = vec![0u8; ln];
-    let n = {
-        let mut reg = s2_registry().lock();
-        let stream = reg
-            .streams
-            .get_mut(&stream_id)
-            .ok_or_else(|| ioex("Socket stream not found"))?;
-        stream
-            .read(&mut tmp)
-            .map_err(|e| ioex(format!("Socket read failed: {e}")))?
+    // Clone the stream handle out under a SHORT lock, then release s2_registry
+    // BEFORE the blocking read(). Holding the global registry lock across a
+    // blocking read deadlocks every other synthetic-socket operation
+    // process-wide: any peer thread that must WRITE the response (okhttp
+    // MockWebServer's dispatcher, a request/response loopback, …) blocks
+    // forever on the same lock while this read waits for bytes that only that
+    // write can produce → the HTTP exchange times out (BUG-04 loopback hang).
+    // try_clone() yields an independent handle to the same socket; concurrent
+    // read-on-one-clone / write-on-another is safe. (Same rationale as the
+    // blocking accept() in re2_accept_into.)
+    let mut stream = {
+        let reg = s2_registry().lock();
+        reg.streams
+            .get(&stream_id)
+            .ok_or_else(|| ioex("Socket stream not found"))?
+            .try_clone()
+            .map_err(|e| ioex(format!("Socket read: try_clone failed: {e}")))?
     };
+    let mut tmp = vec![0u8; ln];
+    let n = stream
+        .read(&mut tmp)
+        .map_err(|e| ioex(format!("Socket read failed: {e}")))?;
     if n == 0 {
         return Ok(Some(Value::Int(-1)));
     }
@@ -1953,11 +1964,18 @@ fn re1_socket_write_stream(
     if stream_id < 0 {
         return Err(ioex("Socket not connected"));
     }
-    let mut reg = s2_registry().lock();
-    let stream = reg
-        .streams
-        .get_mut(&stream_id)
-        .ok_or_else(|| ioex("Socket stream not found"))?;
+    // Clone the handle out and release s2_registry before the (potentially
+    // blocking, on a full send buffer) write — same deadlock-avoidance as the
+    // read path above: a peer blocked in read() must not be wedged behind a
+    // writer holding the global registry lock.
+    let mut stream = {
+        let reg = s2_registry().lock();
+        reg.streams
+            .get(&stream_id)
+            .ok_or_else(|| ioex("Socket stream not found"))?
+            .try_clone()
+            .map_err(|e| ioex(format!("Socket write: try_clone failed: {e}")))?
+    };
     stream
         .write_all(&data)
         .map_err(|e| ioex(format!("Socket write failed: {e}")))?;
