@@ -15879,23 +15879,21 @@ fn spring_class_utils_for_name_impl(
     // untouched. The guard clears on every return path below.
     let _probe_guard = cratonvm_types::reflective_probe::ProbeGuard::new();
 
-    // Handle primitive language names (Spring converts these to wrapper classes)
-    let prim_class_id: Option<&str> = match dotted.as_str() {
-        "boolean" => Some("java/lang/Boolean"),
-        "byte" => Some("java/lang/Byte"),
-        "char" => Some("java/lang/Character"),
-        "short" => Some("java/lang/Short"),
-        "int" => Some("java/lang/Integer"),
-        "long" => Some("java/lang/Long"),
-        "float" => Some("java/lang/Float"),
-        "double" => Some("java/lang/Double"),
-        "void" => Some("java/lang/Void"),
-        _ => None,
-    };
-    if let Some(prim) = prim_class_id {
-        if let Ok(cid) = ctx.ensure_class_initialized(prim) {
-            return Ok(Some(Value::Object(Some(ctx.get_class_mirror(cid)))));
+    // Primitive language names resolve to the PRIMITIVE class (e.g. "int" ->
+    // int.class), NOT the wrapper. Real Spring delegates to
+    // resolvePrimitiveClassName, whose map is keyed by `primitiveType.getName()`
+    // and holds the primitive `Class` objects. Returning the wrapper (Integer)
+    // broke `<array value-type="int">` bean resolution —
+    // `Array.newInstance(Integer.class, n)` yields `Integer[]`, not `int[]`, so
+    // `(int[]) list.get(i)` threw `Integer cannot be cast to [I`
+    // (CollectionsWithDefaultTypesTests.buildCollectionFromMixtureOfReferencesAndValues).
+    match dotted.as_str() {
+        "boolean" | "byte" | "char" | "short" | "int" | "long" | "float" | "double"
+        | "void" => {
+            let mirror = ctx.primitive_class_mirror(&dotted);
+            return Ok(Some(Value::Object(Some(mirror))));
         }
+        _ => {}
     }
 
     // Handle array types: "String[]" → "[Ljava/lang/String;"

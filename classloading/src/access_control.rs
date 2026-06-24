@@ -372,7 +372,35 @@ pub fn check_module_access(
         return Ok(());
     }
 
-    let target_pkg = module_pkg_of(&target.name);
+    // An array type's accessibility follows its ELEMENT type (JVMS §5.4.4). The
+    // array class name is a descriptor (`[Ljava/lang/Foo;`, `[[I`), so feeding it
+    // to `module_pkg_of` mangles the package (e.g. `[Ljava/lang`) and the export
+    // lookup then spuriously fails — observed as java.xml's JAXP init hitting
+    // `module java.base does not export package [Ljava/lang to java.xml`. Peel the
+    // array dimensions and the `L…;` wrapper down to the element class; a
+    // primitive-element array (`[I`) has no package and is freely accessible.
+    let target_pkg = if let Some(elem) = target.name.strip_prefix('[') {
+        let elem = elem.trim_start_matches('[');
+        match elem
+            .strip_prefix('L')
+            .map(|s| s.strip_suffix(';').unwrap_or(s))
+        {
+            Some(cls) => module_pkg_of(cls),
+            None => return Ok(()), // primitive-element array — always accessible
+        }
+    } else {
+        module_pkg_of(&target.name)
+    };
+
+    // A type in the default (unnamed) package belongs to the unnamed module — a
+    // named module cannot own default-package types (JLS §7.4.2 / JPMS). Some
+    // CratonVM-synthesized classes nonetheless carry a named-module tag (e.g.
+    // `java.base`) while having no package; enforcing an "export" of the empty
+    // package then spuriously fails. Treat empty-package targets as
+    // unnamed-module → always accessible.
+    if target_pkg.is_empty() {
+        return Ok(());
+    }
 
     registry
         .check_module_access(accessor_mod, target_mod, target_pkg)
@@ -452,6 +480,7 @@ pub fn check_module_access_by_id(
 mod tests {
     use super::*;
     use crate::class::{Class, ClassId, ClassLoaderId, ClassState, ClassStore};
+    use crate::module::{ModuleDescriptor, ModuleExportsEntry};
     use cratonvm_reader::class_access_flags::ClassAccessFlags;
     use cratonvm_reader::class_file_version::ClassFileVersion;
     use cratonvm_reader::constant_pool::{ConstantPool, ConstantPoolEntry};
@@ -518,6 +547,78 @@ mod tests {
     #[test]
     fn package_of_default_package() {
         assert_eq!(package_of("Foo"), "");
+    }
+
+    // --- module access: array + default-package targets (regression) ---
+
+    /// Build a named-module class with an explicit `module_name`.
+    fn make_class_in_module(store: &mut ClassStore, name: &str, module: &str) -> ClassId {
+        let id = make_class(store, name, None, ClassAccessFlags::PUBLIC);
+        // `make_class` leaves `module_name: None`; set it for the module check.
+        store.get_mut(id).unwrap().module_name = Some(module.to_string());
+        id
+    }
+
+    /// java.base exports `java/lang` unqualified; java.xml reads java.base. A
+    /// non-exported package access is rejected, but an ARRAY of an exported type
+    /// and a DEFAULT-package type must be allowed — the array name is a descriptor
+    /// (`[Ljava/lang/String;`) whose package must resolve to the element's
+    /// (`java/lang`), and a default-package type belongs to the unnamed module.
+    #[test]
+    fn module_access_array_and_default_package_targets() {
+        let mut store = ClassStore::new();
+        let xml = make_class_in_module(&mut store, "javax/xml/parsers/Probe", "java.xml");
+        let arr = make_class_in_module(&mut store, "[Ljava/lang/String;", "java.base");
+        let prim_arr = make_class_in_module(&mut store, "[I", "java.base");
+        let default_pkg = make_class_in_module(&mut store, "SomeSyntheticHelper", "java.base");
+        let non_exported =
+            make_class_in_module(&mut store, "jdk/internal/misc/Unsafe", "java.base");
+
+        let mut reg = ModuleRegistry::new();
+        let mut base = ModuleDescriptor {
+            name: "java.base".to_string(),
+            version: None,
+            is_open: false,
+            requires: vec![],
+            exports: vec![ModuleExportsEntry {
+                package_name: "java/lang".to_string(),
+                to_modules: vec![],
+            }],
+            opens: vec![],
+            uses: vec![],
+            provides: vec![],
+        };
+        base.exports.shrink_to_fit();
+        reg.register(base, vec!["java/lang".to_string(), "jdk/internal/misc".to_string()]);
+        reg.register(
+            ModuleDescriptor {
+                name: "java.xml".to_string(),
+                version: None,
+                is_open: false,
+                requires: vec![],
+                exports: vec![],
+                opens: vec![],
+                uses: vec![],
+                provides: vec![],
+            },
+            vec![],
+        );
+        reg.build_readability_graph();
+
+        let g = |a: ClassId, t: ClassId| {
+            check_module_access(store.get(a).unwrap(), store.get(t).unwrap(), &reg)
+        };
+        // Array of an exported type → allowed (resolves to java/lang).
+        assert!(g(xml, arr).is_ok(), "array of exported type must be accessible");
+        // Primitive-element array → allowed.
+        assert!(g(xml, prim_arr).is_ok(), "primitive array must be accessible");
+        // Default-package (unnamed-module) type → allowed.
+        assert!(g(xml, default_pkg).is_ok(), "default-package type must be accessible");
+        // Sanity: a genuinely non-exported package is still rejected.
+        assert!(
+            g(xml, non_exported).is_err(),
+            "non-exported package must still be rejected"
+        );
     }
 
     // --- same_package_name (loader-unaware string comparison) ---
