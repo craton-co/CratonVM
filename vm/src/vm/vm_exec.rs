@@ -9550,6 +9550,33 @@ fn invoke_on_class_shared_inner(
                         || (class_name == "java/lang/ClassLoader"
                             && (method_name == "getResources"
                                 || method_name == "getSystemResources"))
+                        // URLClassLoader.findResource / findResources +
+                        // URLClassPath.addURL: the real bytecode routes through
+                        // `jdk.internal.loader.URLClassPath`, whose CratonVM shim
+                        // is a bare synthetic instance (null `unopenedUrls`/
+                        // `path`/`loaders`) — `addURL` NPEs on `synchronized
+                        // (unopenedUrls)` and `findResource(s)` return
+                        // null/empty. Force our natives (`ucp_add_url` records
+                        // the URL on `ucp.path`; `ucl_find_resource(s)` walk the
+                        // global dynamic classpath AND resolve custom-handler
+                        // URLs, e.g. ShrinkWrap's in-memory `archive:`). Without
+                        // these the natives in `register_essential_natives` stay
+                        // inert (`check_override` gates them off). `addURL` is
+                        // shimmed on `URLClassPath`, not `URLClassLoader`, because
+                        // the latter is invoked via a subclass `this.addURL(url)`
+                        // whose CP methodref names the subclass. Hibernate
+                        // `NoDepthTests` JPA variants depend on these.
+                        || (class_name == "java/net/URLClassLoader"
+                            && ((method_name == "findResource"
+                                && descriptor == "(Ljava/lang/String;)Ljava/net/URL;")
+                                || (method_name == "findResources"
+                                    && descriptor
+                                        == "(Ljava/lang/String;)Ljava/util/Enumeration;")))
+                        || (matches!(
+                            class_name,
+                            "jdk/internal/loader/URLClassPath" | "sun/misc/URLClassPath"
+                        ) && method_name == "addURL"
+                            && descriptor == "(Ljava/net/URL;)V")
                         // ActiveMQ 5.18 / log4j-slf4j2 bridge: the bytecode
                         // of `Log4jLoggerFactory.getContext` calls
                         // `LogManager.getFactory().isClassLoaderDependent()`

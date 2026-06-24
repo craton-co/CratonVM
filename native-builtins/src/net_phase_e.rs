@@ -560,6 +560,56 @@ fn value_or_string(ctx: &dyn NativeContext, v: Value, default: &str) -> String {
     value_to_string(ctx, v).unwrap_or_else(|| default.to_string())
 }
 
+/// If `url` carries a non-null, *application-provided* `URLStreamHandler`,
+/// invoke its `openConnection(URL)` and return the resulting `URLConnection`.
+///
+/// This mirrors the real `java.net.URL.openConnection()` = `handler
+/// .openConnection(this)` for schemes CratonVM does not resolve natively. The
+/// canonical user is ShrinkWrap's in-memory `archive:` handler
+/// (`ShrinkWrapClassLoader`), whose connection reads resources straight out of a
+/// heap-resident `JavaArchive` — there is no `file:`/`jar:` path to fall back
+/// to. `URL`s that CratonVM synthesises (`build_synthetic_url`,
+/// `alloc_concurrent_synthetic`) never populate `handler`, and JDK built-in
+/// handlers live under `sun.net.www.protocol.*`; both are excluded so this only
+/// fires for genuinely app-supplied handlers.
+///
+/// Returns:
+///   * `Ok(Some(conn))` — a custom handler is present; `conn` is its
+///     `URLConnection` value (possibly `Value::Object(None)` if the handler
+///     itself returned null).
+///   * `Ok(None)` — no custom handler; the caller should use its own
+///     (string-based) resolution path.
+///   * `Err(e)` — the handler threw (propagate; e.g. `FileNotFoundException`).
+pub(crate) fn url_custom_handler_connection(
+    ctx: &mut dyn NativeContext,
+    url: ObjectRef,
+) -> Result<Option<Value>, cratonvm_types::error::MethodCallFailed> {
+    let handler = match ctx.get_field_by_name(url, "handler") {
+        Value::Object(Some(h)) => h,
+        _ => return Ok(None),
+    };
+    // Skip the JDK's built-in protocol handlers — those schemes (file:, jar:,
+    // http:, …) are resolved by the dedicated arms of `openStream`/
+    // `openConnection`, and routing them back through the real handler would
+    // re-enter the very natives this is a fallback for.
+    let hclass = ctx
+        .class_name_of_id(ctx.class_id_of_object(handler))
+        .unwrap_or_default();
+    if hclass.starts_with("sun/net/") {
+        return Ok(None);
+    }
+    // `handler.openConnection(url)` — `invoke_virtual` prepends the receiver, so
+    // `args` is just the URL. A null/absent handler method or a thrown
+    // exception both propagate to the caller via `?`.
+    let conn = ctx.invoke_virtual(
+        handler,
+        "openConnection",
+        "(Ljava/net/URL;)Ljava/net/URLConnection;",
+        &[Value::Object(Some(url))],
+    )?;
+    Ok(Some(conn.unwrap_or(Value::Object(None))))
+}
+
 /// Parse a `jar:[file:]<path>!/<entry>` external form and return the entry's
 /// uncompressed size from the zip central directory, or `None` if the URL is
 /// not a resolvable jar-entry URL. Used by `JarURLConnection.getContentLength*`.
@@ -3981,6 +4031,29 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
                 .map_err(|e| ioex(format!("URL.openStream failed: {e}")))?;
             resp.body
         } else {
+            // Application-provided `URLStreamHandler` (e.g. ShrinkWrap's
+            // in-memory `archive:` handler). The scheme isn't one we resolve
+            // natively, but the URL may carry a custom handler whose connection
+            // reads from a heap-resident / custom source. Mirror the real
+            // `URL.openStream()` = `openConnection().getInputStream()` by
+            // delegating to it. A thrown `FileNotFoundException` propagates via
+            // `?` (matching the JDK's missing-resource contract).
+            match url_custom_handler_connection(ctx, this)? {
+                Some(Value::Object(Some(conn))) => {
+                    let stream = ctx.invoke_virtual(
+                        conn,
+                        "getInputStream",
+                        "()Ljava/io/InputStream;",
+                        &[],
+                    )?;
+                    return Ok(Some(stream.unwrap_or(Value::Object(None))));
+                }
+                // Custom handler present but `openConnection` returned null:
+                // surface a null stream rather than a bogus "unsupported scheme".
+                Some(_) => return Ok(Some(Value::Object(None))),
+                // No custom handler — genuinely unsupported.
+                None => {}
+            }
             return Err(ioex(format!(
                 "URL.openStream: unsupported scheme: {url_str}"
             )));
@@ -4034,6 +4107,18 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
         "()Ljava/net/URLConnection;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
+            // Application-provided `URLStreamHandler` (e.g. ShrinkWrap
+            // `archive:`): the real `URL.openConnection()` is
+            // `handler.openConnection(this)`. Delegate so the app's own
+            // `URLConnection` (which reads from its custom backing store) is
+            // returned instead of the synthetic http/jar carrier below. Only
+            // non-null, non-`sun.net.*` handlers reach this — `file:`/`jar:`/
+            // synthetic URLs fall through to the carrier path unchanged.
+            if let Some(conn @ Value::Object(Some(_))) =
+                url_custom_handler_connection(ctx, this)?
+            {
+                return Ok(Some(conn));
+            }
             // Determine the URL's external form so we can pick a carrier
             // class whose type matches what JDK callers cast the result to.
             // ActiveMQ's Main.getActiveMQHome() does
