@@ -3480,6 +3480,24 @@ fn classpath_resource_via_context_loader(
     }
 }
 
+/// True when `s` is a usable *full URL* (carries a scheme), as opposed to a bare
+/// `host:port` authority. A real `java.net.URL`'s field index 5 is the
+/// `authority` (e.g. `"localhost:8080"`), NOT a synthetic full-URL cache — so a
+/// plain `contains(':')` test wrongly accepts the authority as the URL, making
+/// `toExternalForm()`/`openStream` see scheme `"localhost:8080"`
+/// (`unsupported scheme: localhost:<port>`). Discriminator: in a real URL the
+/// text after the FIRST ':' is `"//..."` or a path/opaque part; in an authority
+/// it is the numeric port. So reject when everything after the first ':' is
+/// ASCII digits (a port).
+fn field5_is_full_url(s: &str) -> bool {
+    match s.split_once(':') {
+        Some((scheme, rest)) => {
+            !scheme.is_empty() && !rest.is_empty() && !rest.bytes().all(|b| b.is_ascii_digit())
+        }
+        None => false,
+    }
+}
+
 fn register_re4_url_http(r: &mut NativeMethodRegistry) {
     let url = "java/net/URL";
 
@@ -3510,7 +3528,12 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
             _ => None,
         };
         if let Some(ref s) = synth_full {
-            if s.contains(':') && !s.is_empty() {
+            // Only treat field 5 as a full-URL cache when it actually carries a
+            // scheme — a real java.net.URL's field 5 is the `authority`
+            // (`host:port`), which must fall through to the reconstruction below
+            // instead of being returned as the whole URL. (BUG: openStream then
+            // saw `unsupported scheme: localhost:<port>`.)
+            if field5_is_full_url(s) {
                 return Ok(Some(Value::Object(Some(ctx.create_string(s)))));
             }
         }
@@ -3647,8 +3670,10 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
         // real-JDK URL instances whose slot 5 is empty; reading slot 0 alone
         // yielded "jar" and tripped the unsupported-scheme branch below.
         let mut url_str = read_field_string_or(ctx, this, 5, "");
-        if !url_str.contains(':') {
-            // Either empty or just a protocol — ask the URL for its full form.
+        if !field5_is_full_url(&url_str) {
+            // Empty, just a protocol, or a real-JDK `authority` (host:port) in
+            // field 5 — ask the URL for its full form (toExternalForm now
+            // reconstructs protocol://authority/path for real URLs).
             if let Ok(Some(Value::Object(Some(s)))) = ctx.invoke(
                 "java/net/URL",
                 "toExternalForm",
