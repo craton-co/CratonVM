@@ -5731,7 +5731,16 @@ fn collect_view_snapshot_ordered(ctx: &mut dyn NativeContext, backing: ObjectRef
 /// classes in the sealed `java/util` package, so the prefix+suffix test is
 /// exact and cannot match an app type.
 fn is_synthetic_map_entry_class(name: &str) -> bool {
-    name.starts_with("java/util/") && name.ends_with("$Entry")
+    // `$Entry` covers the legacy fabricated names (HashMap$Entry, TreeMap$Entry,
+    // LinkedHashMap$Entry, Map$Entry); `$SimpleEntry`/`$SimpleImmutableEntry`
+    // cover the AbstractMap entries now materialised for TreeMap/HashMap/
+    // LinkedHashMap entrySet views (a real Map.Entry impl, so reflection sees
+    // getKey/getValue). All live under the sealed `java/util/` package, so the
+    // prefix+suffix test cannot match an application value type named `*Entry`.
+    name.starts_with("java/util/")
+        && (name.ends_with("$Entry")
+            || name.ends_with("$SimpleEntry")
+            || name.ends_with("$SimpleImmutableEntry"))
 }
 
 fn resync_values_view(ctx: &mut dyn NativeContext, list: ObjectRef) {
@@ -5762,7 +5771,9 @@ fn resync_values_view(ctx: &mut dyn NativeContext, list: ObjectRef) {
             .map(|(k, v)| {
                 Value::Object(Some(alloc_live_entry(
                     ctx,
-                    "java/util/HashMap$Entry",
+                    // Real Map.Entry impl (see native_tm_entry_set): reflective
+                    // property access over rebuilt TreeMap entrySet elements.
+                    "java/util/AbstractMap$SimpleEntry",
                     k,
                     v,
                     source,
@@ -23207,7 +23218,11 @@ fn native_tm_lower_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
 }
 
 fn tm_make_entry(ctx: &mut dyn NativeContext, key: Value, value: Value) -> ObjectRef {
-    let entry = alloc_synthetic(ctx, "java/util/HashMap$Entry", 2);
+    // AbstractMap$SimpleEntry is a real Map.Entry implementation, so reflection
+    // (Class.getMethods) and reflective property access see getKey/getValue.
+    // The old fabricated "HashMap$Entry" does not implement Map.Entry — see
+    // native_tm_entry_set for the SpEL EL1008E that motivated this.
+    let entry = alloc_synthetic(ctx, "java/util/AbstractMap$SimpleEntry", 2);
     ctx.set_field(entry, 0, key);
     ctx.set_field(entry, 1, value);
     entry
@@ -23624,7 +23639,10 @@ fn native_tm_entry_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         .map(|(k, v)| {
             Value::Object(Some(alloc_live_entry(
                 ctx,
-                "java/util/HashMap$Entry",
+                // Real Map.Entry impl so reflection sees getKey/getValue (SpEL
+                // `map.?[key...]` selection over a TreeMap). The fabricated
+                // "HashMap$Entry" does not implement Map.Entry → EL1008E.
+                "java/util/AbstractMap$SimpleEntry",
                 k,
                 v,
                 this,
