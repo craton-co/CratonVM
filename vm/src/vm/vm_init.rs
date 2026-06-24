@@ -358,6 +358,23 @@ pub struct SharedVm {
     /// T10.9.B: FxHashMap — ObjectRef pointer keys.
     pub class_mirrors_reverse: RwLock<FxHashMap<ObjectRef, ClassId>>,
 
+    /// Loader-faithful resolution cache (gated by
+    /// `CRATONVM_LOADER_AWARE_RESOLUTION`). Maps an *initiating* loader and an
+    /// internal class name to the `ClassId` that loader resolves it to —
+    /// CratonVM's analogue of the JVMS §5.4.3 *initiating loader* table. Only
+    /// populated for references reached from bytecode defined by a user-defined
+    /// loader: once `resolve_class_loader_aware` has driven that loader's
+    /// `loadClass` (or proved the name is bootstrap/global) for a given name,
+    /// the answer is memoised here so subsequent references skip the re-entrant
+    /// `loadClass` invocation. Grow-only — CratonVM does not unload classes, and
+    /// in-place `redefine_class` keeps the `ClassId` stable. Empty (and never
+    /// read) when the gate is off.
+    ///
+    /// Nested `loader -> (name -> id)` so a hot-path read can probe by borrowed
+    /// `&str` (`Arc<str>: Borrow<str>`) without allocating an `Arc` per lookup.
+    pub initiating_resolution_cache:
+        RwLock<FxHashMap<cratonvm_types::ClassLoaderId, FxHashMap<Arc<str>, ClassId>>>,
+
     /// Synthetic System.out PrintStream object.
     pub system_out: RwLock<Option<ObjectRef>>,
 
@@ -2387,6 +2404,7 @@ impl SharedVm {
             string_pool: RwLock::new(FxHashMap::default()),
             class_mirrors: RwLock::new(FxHashMap::default()),
             class_mirrors_reverse: RwLock::new(FxHashMap::default()),
+            initiating_resolution_cache: RwLock::new(FxHashMap::default()),
             system_out: RwLock::new(None),
             system_err: RwLock::new(None),
             system_in: RwLock::new(None),

@@ -631,6 +631,20 @@ pub(crate) fn cl_bootstrap_scoped() -> bool {
     })
 }
 
+/// `CRATONVM_LOADER_AWARE_RESOLUTION` gate (default OFF). Mirrors
+/// `cratonvm_vm::runtime::env_cache::loader_aware_resolution` so the
+/// native-builtins half of loader-faithful class resolution (per-user-loader
+/// namespace assignment in `defineClass`, exact `findLoadedClass`) stays in
+/// lock-step with the interpreter half. When off, every loader-identity path
+/// keeps its exact pre-gate behavior. Empty / `"0"` ⇒ off; any other value ⇒ on.
+pub(crate) fn loader_aware_resolution() -> bool {
+    static GATE: OnceLock<bool> = OnceLock::new();
+    *GATE.get_or_init(|| match std::env::var("CRATONVM_LOADER_AWARE_RESOLUTION") {
+        Ok(v) => !v.is_empty() && v != "0",
+        Err(_) => false,
+    })
+}
+
 /// Virtual-dispatch correctness for custom `ClassLoader` subclasses.
 ///
 /// `cl_load_class` is registered as the Rust native for
@@ -824,9 +838,20 @@ pub(crate) fn find_loaded_class_for_loader(
             .class_id_by_name(internal_name)
             .map(|cid| ctx.get_class_mirror(cid));
     }
+    // Loader-faithful resolution gate: when on, the own-namespace probe is
+    // EXACT (no global delegation fallback), so a user loader never reports a
+    // class some *other* loader defined — the prerequisite for two isolating
+    // loaders to each define their own copy of a name. Off → legacy behavior
+    // (the fallback-prone `class_id_by_name_and_loader`).
+    let exact = loader_aware_resolution();
     // 1. Own-namespace copy.
     if let Some(id) = peek_loader_namespace_id(ctx, this) {
-        if let Some(cid) = ctx.class_id_by_name_and_loader(internal_name, id) {
+        let own = if exact {
+            ctx.class_id_defined_by_loader_exact(internal_name, id)
+        } else {
+            ctx.class_id_by_name_and_loader(internal_name, id)
+        };
+        if let Some(cid) = own {
             return Some(ctx.get_class_mirror(cid));
         }
     }
@@ -3231,6 +3256,285 @@ fn ucl_find_class(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     cl_load_class_base_delegation(ctx, this, name_obj)
 }
 
+// ---------------------------------------------------------------------------
+// Real-mode `URLClassLoader.addURL` + custom-handler resource resolution.
+//
+// In real-JDK mode CratonVM serves class/resource loading from its global
+// dynamic classpath and shims `jdk.internal.loader.URLClassPath` down to
+// safe stubs (see `register_url_class_path_safe_stubs`); the `ucp` field is a
+// bare synthetic `URLClassPath` with all instance fields null. The real
+// `URLClassLoader.addURL` bytecode therefore NPEs at
+// `URLClassPath.addURL` → `synchronized (unopenedUrls)` (null monitor). The
+// native below replaces it: it records each added URL on `ucp.path` (a real
+// `ArrayList<URL>` we create on demand) and, for ordinary `file:`/`jar:` URLs,
+// also extends the global dynamic classpath.
+//
+// Recording the URLs lets `ucl_find_resource(s)` resolve resources that live
+// behind an application-supplied `URLStreamHandler` — most notably ShrinkWrap's
+// in-memory `archive:` handler, whose `JavaArchive` is reachable ONLY through
+// the handler (there is no filesystem path the global walk could find). For
+// such a base URL we build `new URL(base, name)` (which inherits the handler)
+// and probe it through the handler; a hit is returned as a real `java.net.URL`
+// whose `openStream()`/`openConnection()` reach the archive (see
+// `net_phase_e::url_custom_handler_connection`). Hibernate's
+// `NoDepthTests` JPA variants discover `META-INF/persistence.xml` this way.
+// ---------------------------------------------------------------------------
+
+/// True iff `url` carries a non-null, application-provided `URLStreamHandler`
+/// (i.e. not a JDK `sun.net.*` built-in, and not a CratonVM synthetic URL whose
+/// `handler` field is null). Pure field reads — never allocates.
+fn url_has_custom_handler(ctx: &dyn NativeContext, url: ObjectRef) -> bool {
+    let handler = match ctx.get_field_by_name(url, "handler") {
+        Value::Object(Some(h)) => h,
+        _ => return false,
+    };
+    let hclass = ctx
+        .class_name_of_id(ctx.class_id_of_object(handler))
+        .unwrap_or_default();
+    !hclass.starts_with("sun/net/")
+}
+
+/// Construct `new URL(base, name)` via the real JDK `URL(URL,String)`
+/// constructor, so the result inherits `base`'s handler and resolves `name`
+/// relative to it. Returns the fresh `URL` (the caller must pin it before any
+/// further allocation) or `None` if construction throws.
+fn resolve_url_against(
+    ctx: &mut dyn NativeContext,
+    base: ObjectRef,
+    name: &str,
+) -> Option<ObjectRef> {
+    // `create_string` can relocate `base`.
+    let p_base = ctx.pin_native_root(base);
+    let name_str = ctx.create_string(name);
+    let base = ctx.read_native_pin(p_base, base);
+    // `new_object` can relocate `base` / `name_str`.
+    let p_name = ctx.pin_native_root(name_str);
+    let url = match ctx.new_object("java/net/URL") {
+        Ok(Some(Value::Object(Some(o)))) => o,
+        _ => {
+            ctx.unpin_native_roots(p_base);
+            return None;
+        }
+    };
+    // `URL.<init>` allocates internally — pin the receiver and both args.
+    let p_url = ctx.pin_native_root(url);
+    let base = ctx.read_native_pin(p_base, base);
+    let name_str = ctx.read_native_pin(p_name, name_str);
+    let r = ctx.invoke_special(
+        "java/net/URL",
+        "<init>",
+        "(Ljava/net/URL;Ljava/lang/String;)V",
+        &[
+            Value::Object(Some(url)),
+            Value::Object(Some(base)),
+            Value::Object(Some(name_str)),
+        ],
+    );
+    let url = ctx.read_native_pin(p_url, url);
+    ctx.unpin_native_roots(p_base);
+    match r {
+        Ok(_) => Some(url),
+        Err(_) => None,
+    }
+}
+
+/// Probe whether `url` resolves to an existing resource through its custom
+/// handler: `handler.openConnection(url).getInputStream()` must yield a
+/// non-null stream without throwing. The probe stream is closed immediately.
+fn probe_resource_exists(ctx: &mut dyn NativeContext, url: ObjectRef) -> bool {
+    let conn = match crate::net_phase_e::url_custom_handler_connection(ctx, url) {
+        Ok(Some(Value::Object(Some(c)))) => c,
+        _ => return false, // null connection, no custom handler, or threw
+    };
+    let p_conn = ctx.pin_native_root(conn);
+    let conn = ctx.read_native_pin(p_conn, conn);
+    let r = ctx.invoke_virtual(conn, "getInputStream", "()Ljava/io/InputStream;", &[]);
+    ctx.unpin_native_roots(p_conn);
+    match r {
+        Ok(Some(Value::Object(Some(stream)))) => {
+            // Close the probe stream so we don't leak it (ShrinkWrap tracks
+            // opened streams for cleanup on classloader close).
+            let _ = ctx.invoke_virtual(stream, "close", "()V", &[]);
+            true
+        }
+        _ => false, // null stream (directory node) or FileNotFoundException
+    }
+}
+
+/// Build a `java.util.ArrayList<URL>` of resources named `name` reachable
+/// through the loader's custom-handler base URLs (recorded on `ucp.path` by
+/// `ucl_add_url_real`). Returns `None` when the loader has no such base URLs or
+/// none resolve — the common case for ordinary `file:`/`jar:` loaders, leaving
+/// their behaviour untouched.
+fn build_custom_handler_url_list(
+    ctx: &mut dyn NativeContext,
+    loader: ObjectRef,
+    name: &str,
+) -> Option<ObjectRef> {
+    let ucp = match ctx.get_field_by_name(loader, "ucp") {
+        Value::Object(Some(o)) => o,
+        _ => return None,
+    };
+    let path_list = match ctx.get_field_by_name(ucp, "path") {
+        Value::Object(Some(o)) => o,
+        _ => return None,
+    };
+    // Fast path: skip the work entirely unless at least one recorded base URL
+    // actually carries a custom handler (ordinary loaders record only
+    // file:/jar: URLs, whose handler is null/`sun.net.*`).
+    let p_path = ctx.pin_native_root(path_list);
+    let size = match ctx.invoke_virtual(path_list, "size", "()I", &[]) {
+        Ok(Some(Value::Int(n))) => n,
+        _ => {
+            ctx.unpin_native_roots(p_path);
+            return None;
+        }
+    };
+    let result = match ctx.new_object("java/util/ArrayList") {
+        Ok(Some(Value::Object(Some(l)))) => l,
+        _ => {
+            ctx.unpin_native_roots(p_path);
+            return None;
+        }
+    };
+    let p_result = ctx.pin_native_root(result);
+    let _ = ctx.invoke_special(
+        "java/util/ArrayList",
+        "<init>",
+        "()V",
+        &[Value::Object(Some(ctx.read_native_pin(p_result, result)))],
+    );
+    let mut matched = 0u32;
+    for i in 0..size {
+        let path_list = ctx.read_native_pin(p_path, path_list);
+        let base = match ctx.invoke_virtual(
+            path_list,
+            "get",
+            "(I)Ljava/lang/Object;",
+            &[Value::Int(i)],
+        ) {
+            Ok(Some(Value::Object(Some(b)))) => b,
+            _ => continue,
+        };
+        let p_base = ctx.pin_native_root(base);
+        if url_has_custom_handler(ctx, base) {
+            if let Some(resolved) = resolve_url_against(ctx, base, name) {
+                let p_res = ctx.pin_native_root(resolved);
+                let resolved = ctx.read_native_pin(p_res, resolved);
+                if probe_resource_exists(ctx, resolved) {
+                    let resolved = ctx.read_native_pin(p_res, resolved);
+                    let result = ctx.read_native_pin(p_result, result);
+                    let _ = ctx.invoke_virtual(
+                        result,
+                        "add",
+                        "(Ljava/lang/Object;)Z",
+                        &[Value::Object(Some(resolved))],
+                    );
+                    matched += 1;
+                }
+            }
+        }
+        // Release this iteration's pins (p_base and any p_res after it).
+        ctx.unpin_native_roots(p_base);
+    }
+    let result = ctx.read_native_pin(p_result, result);
+    ctx.unpin_native_roots(p_path); // releases p_path, p_result and the rest
+    if matched == 0 {
+        None
+    } else {
+        Some(result)
+    }
+}
+
+/// Record `url` on `ucp.path` (a real `ArrayList<URL>`, created on demand). All
+/// re-entrant Java calls are pinned so a moving GC can't stale the refs
+/// mid-sequence.
+fn record_url_on_path(ctx: &mut dyn NativeContext, ucp: ObjectRef, url: ObjectRef) {
+    let p_ucp = ctx.pin_native_root(ucp);
+    let p_url = ctx.pin_native_root(url);
+    let list = match ctx.get_field_by_name(ucp, "path") {
+        Value::Object(Some(l)) => l,
+        _ => {
+            // Lazily create the `path` ArrayList and store it on `ucp`.
+            let created = match ctx.new_object("java/util/ArrayList") {
+                Ok(Some(Value::Object(Some(l)))) => l,
+                _ => {
+                    ctx.unpin_native_roots(p_ucp);
+                    return;
+                }
+            };
+            let p_list = ctx.pin_native_root(created);
+            let created = ctx.read_native_pin(p_list, created);
+            let _ = ctx.invoke_special(
+                "java/util/ArrayList",
+                "<init>",
+                "()V",
+                &[Value::Object(Some(created))],
+            );
+            let ucp = ctx.read_native_pin(p_ucp, ucp);
+            let created = ctx.read_native_pin(p_list, created);
+            ctx.set_field_by_name(ucp, "path", Value::Object(Some(created)));
+            created
+        }
+    };
+    let p_list = ctx.pin_native_root(list);
+    let list = ctx.read_native_pin(p_list, list);
+    let url = ctx.read_native_pin(p_url, url);
+    let _ = ctx.invoke_virtual(
+        list,
+        "add",
+        "(Ljava/lang/Object;)Z",
+        &[Value::Object(Some(url))],
+    );
+    ctx.unpin_native_roots(p_ucp); // releases every pin taken here
+}
+
+/// `jdk.internal.loader.URLClassPath.addURL(URL)` for real-JDK mode.
+///
+/// `URLClassLoader.addURL` is inherited and almost always invoked via the
+/// SUBCLASS as `this.addURL(url)` (e.g. ShrinkWrap's `addArchive`), so its CP
+/// methodref names the subclass — the `check_override` / force-native gates
+/// (which key on the static call-site class) can't recognise it. But the body
+/// `URLClassLoader.addURL` is just `ucp.addURL(url)`, and `ucp` is typed
+/// `jdk.internal.loader.URLClassPath`, so shimming `URLClassPath.addURL`
+/// intercepts the same operation through a call-site the gates DO match. `this`
+/// here is the `URLClassPath` (the loader's `ucp`). See the module banner.
+pub(crate) fn ucp_add_url(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let ucp = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    let url = match args.get(1) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+
+    // Record the base URL on `ucp.path` so `ucl_find_resource(s)` can resolve
+    // against custom-handler URLs. Pin `url` across the re-entrant recording so
+    // the protocol read below still sees a live ref.
+    let p_url = ctx.pin_native_root(url);
+    let url_live = ctx.read_native_pin(p_url, url);
+    record_url_on_path(ctx, ucp, url_live);
+
+    // Ordinary file:/jar: URLs additionally extend the global dynamic
+    // classpath so classes/resources inside them load (mirrors the `<init>`
+    // natives' `register_url_array`). Custom schemes (archive:, …) have no
+    // filesystem path and are served via their handler instead.
+    let url = ctx.read_native_pin(p_url, url);
+    let proto = match ctx.get_field_by_name(url, "protocol") {
+        Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+        _ => String::new(),
+    };
+    if proto == "file" || proto == "jar" {
+        let url = ctx.read_native_pin(p_url, url);
+        if let Some(p) = extract_url_path(ctx, url) {
+            ctx.register_dynamic_classpath(&[p]);
+        }
+    }
+    ctx.unpin_native_roots(p_url);
+    Ok(None)
+}
+
 pub(crate) fn ucl_find_resource(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let name_obj = match args.get(1) {
         Some(Value::Object(Some(o))) => *o,
@@ -3259,15 +3563,137 @@ pub(crate) fn ucl_find_resource(ctx: &mut dyn NativeContext, args: &[Value]) -> 
             let url = crate::jboss_module_loader::build_synthetic_url(ctx, &spec);
             Ok(Some(Value::Object(Some(url))))
         }
-        None => Ok(Some(Value::Object(None))),
+        None => {
+            // Custom-handler fallback: resources behind an app-supplied
+            // `URLStreamHandler` (ShrinkWrap `archive:`) that `addURL` recorded
+            // on `ucp.path`. Return the first base URL that resolves `name`.
+            if let Some(Value::Object(Some(this))) = args.first().copied() {
+                if let Some(list) = build_custom_handler_url_list(ctx, this, resource_name) {
+                    let p_list = ctx.pin_native_root(list);
+                    let list = ctx.read_native_pin(p_list, list);
+                    let first = ctx.invoke_virtual(
+                        list,
+                        "get",
+                        "(I)Ljava/lang/Object;",
+                        &[Value::Int(0)],
+                    );
+                    ctx.unpin_native_roots(p_list);
+                    if let Ok(Some(v @ Value::Object(Some(_)))) = first {
+                        return Ok(Some(v));
+                    }
+                }
+            }
+            Ok(Some(Value::Object(None)))
+        }
     }
+}
+
+/// Append the elements of a `java.util.ArrayList<URL>` to the URL array carried
+/// by a synthetic `Enumeration$Impl`, returning a fresh `Enumeration$Impl` over
+/// the union. `std_enum` is the standard flat-classpath enumeration (may be
+/// `None`); `custom_list` holds the custom-handler resolved URLs. All
+/// re-entrant calls are pinned for moving-GC safety.
+fn merge_enum_with_list(
+    ctx: &mut dyn NativeContext,
+    std_enum: Option<ObjectRef>,
+    custom_list: ObjectRef,
+) -> ObjectRef {
+    let p_custom = ctx.pin_native_root(custom_list);
+    // Standard enumeration's backing URL[] (field 0 of `Enumeration$Impl`).
+    let std_arr = match std_enum {
+        Some(e) => match ctx.get_field(e, 0) {
+            Value::Object(Some(a)) => Some(a),
+            _ => None,
+        },
+        None => None,
+    };
+    let alen = std_arr.map(|a| ctx.array_length(a)).unwrap_or(0);
+    let p_std = std_arr.map(|a| ctx.pin_native_root(a));
+    let custom_list = ctx.read_native_pin(p_custom, custom_list);
+    let clen = match ctx.invoke_virtual(custom_list, "size", "()I", &[]) {
+        Ok(Some(Value::Int(n))) => n.max(0) as usize,
+        _ => 0,
+    };
+    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, alen + clen);
+    let p_arr = ctx.pin_native_root(arr);
+    if let (Some(sa), Some(psa)) = (std_arr, p_std) {
+        let sa = ctx.read_native_pin(psa, sa);
+        let arr = ctx.read_native_pin(p_arr, arr);
+        for i in 0..alen {
+            let e = ctx.get_array_element(sa, i);
+            ctx.set_array_element(arr, i, e);
+        }
+    }
+    for i in 0..clen {
+        let custom_list = ctx.read_native_pin(p_custom, custom_list);
+        let e = match ctx.invoke_virtual(
+            custom_list,
+            "get",
+            "(I)Ljava/lang/Object;",
+            &[Value::Int(i as i32)],
+        ) {
+            Ok(Some(v)) => v,
+            _ => Value::Object(None),
+        };
+        let arr = ctx.read_native_pin(p_arr, arr);
+        ctx.set_array_element(arr, alen + i, e);
+    }
+    let enm = alloc_concurrent_synthetic(ctx, "java/util/Enumeration$Impl", 2);
+    let arr = ctx.read_native_pin(p_arr, arr);
+    ctx.set_field(enm, 0, Value::Object(Some(arr)));
+    ctx.set_field(enm, 1, Value::Int(0));
+    ctx.unpin_native_roots(p_custom); // releases p_custom, p_std, p_arr
+    enm
 }
 
 pub(crate) fn ucl_find_resources(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // `findResources` is the terminal flat-classpath scan — it must NOT re-delegate
     // to `findResources` (which would recurse forever for a URLClassLoader subclass
     // that doesn't override it, e.g. GroovyClassLoader). See SB-13.
-    cl_get_resources_impl(ctx, args, false)
+    //
+    // Compute the custom-handler matches FIRST: when there are none (the common
+    // case for ordinary file:/jar: loaders) the standard scan is returned
+    // verbatim, leaving existing behaviour byte-for-byte unchanged.
+    let this = match args.first().copied() {
+        Some(Value::Object(Some(o))) => o,
+        _ => return cl_get_resources_impl(ctx, args, false),
+    };
+    let name = match args.get(1) {
+        Some(Value::Object(Some(o))) => ctx.read_string(*o).unwrap_or_default(),
+        _ => return cl_get_resources_impl(ctx, args, false),
+    };
+    let resource_name = name.trim_start_matches('/').to_string();
+
+    // Run the standard flat-classpath scan FIRST, while the `args` refs are
+    // still fresh (the custom-handler probing below allocates, which can
+    // relocate them under a moving GC). Pin its result across that probing.
+    let p_this = ctx.pin_native_root(this);
+    let std_enum = cl_get_resources_impl(ctx, args, false)?;
+    let std_ref = match std_enum {
+        Some(Value::Object(Some(e))) => Some(e),
+        _ => None,
+    };
+    let p_std = std_ref.map(|e| ctx.pin_native_root(e));
+
+    // Custom-handler matches (ShrinkWrap `archive:`), recorded by `addURL`.
+    let this = ctx.read_native_pin(p_this, this);
+    let custom = build_custom_handler_url_list(ctx, this, &resource_name);
+
+    let std_ref = match (std_ref, p_std) {
+        (Some(e), Some(p)) => Some(ctx.read_native_pin(p, e)),
+        _ => None,
+    };
+    let result = match custom {
+        Some(custom) => Some(Value::Object(Some(merge_enum_with_list(ctx, std_ref, custom)))),
+        // No custom matches: return the standard enumeration verbatim (its ref
+        // re-read post-GC), leaving ordinary loaders byte-for-byte unchanged.
+        None => match std_ref {
+            Some(e) => Some(Value::Object(Some(e))),
+            None => std_enum,
+        },
+    };
+    ctx.unpin_native_roots(p_this);
+    Ok(result)
 }
 
 fn ucl_get_urls(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {

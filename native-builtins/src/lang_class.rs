@@ -4908,6 +4908,44 @@ pub(crate) fn native_method_invoke(
                     message: Some("Method.invoke: null receiver for instance method".to_string()),
                 },
             )?;
+        // JDK contract: `Method.invoke` throws `IllegalArgumentException`
+        // ("object is not an instance of declaring class") when the receiver
+        // is not assignable to the Method's declaring class — and it does so
+        // BEFORE any dispatch. CratonVM dispatches instance invokes virtually
+        // by name on the receiver's runtime class (see `use_virtual_dispatch`
+        // below), so a wrong-type receiver previously fell through to a
+        // name-resolution miss and surfaced as `NoSuchMethodError`. That is
+        // the wrong throwable AND the wrong *kind*: `NoSuchMethodError` is an
+        // `Error`, whereas `IllegalArgumentException` is a `RuntimeException`.
+        // Callers that wrap reflective getters in `catch (RuntimeException ...)`
+        // and rely on the JDK IAE being swallowed (e.g. Hibernate 8's
+        // `UniqueSlotExtractor.collectModelPartColumnValues`, which decomposes
+        // every attribute during flush and tolerates a mismatched bidirectional
+        // getter) instead saw the `Error` escape — breaking flush/commit and
+        // cascading into unrelated failures. Restore the JDK ordering and
+        // throwable here.
+        //
+        // Skip two cases where `is_subclass` (which models the class
+        // hierarchy, NOT interface implementation, and may not model
+        // array → Object) would give a false negative and wrongly reject a
+        // valid receiver:
+        //   * the declaring class is an interface — the receiver *implements*
+        //     but is not a *subclass* of it;
+        //   * the declaring class is `java.lang.Object` — the universal
+        //     supertype, always assignable (including array receivers).
+        // In both cases keep dispatching by name (the historical behavior).
+        if let Some(declaring_id) = mirror_class_id(ctx, declaring_mirror) {
+            let skip_check = ctx.is_interface_class(declaring_id)
+                || ctx.class_name_of_id(declaring_id).as_deref() == Some("java/lang/Object");
+            if !skip_check {
+                let recv_id = ctx.class_id_of_object(recv);
+                if !ctx.is_subclass(recv_id, declaring_id) {
+                    return Err(illegal_arg_exc(
+                        "object is not an instance of declaring class".to_string(),
+                    ));
+                }
+            }
+        }
         invoke_args.push(Value::Object(Some(recv)));
     }
 
