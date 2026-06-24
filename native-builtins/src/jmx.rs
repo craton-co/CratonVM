@@ -832,6 +832,14 @@ pub fn register_memory_pool_impl(r: &mut NativeMethodRegistry) {
             undefined_usage,
         );
     }
+
+    // resetPeakUsage0()V — clears the recorded peak. Our peak metric is the
+    // UNDEFINED_USAGE sentinel (-1), so there is nothing to reset; a no-op
+    // matches the spec-defined "unavailable" behaviour and lets callers
+    // (e.g. MemoryPoolMXBean.resetPeakUsage()) complete instead of hitting
+    // an UnsatisfiedLinkError.
+    r.register(cls, "resetPeakUsage0", "()V", native_noop_with_this);
+
     r.set_category(__prev_cat);
 }
 
