@@ -1589,7 +1589,24 @@ pub(crate) fn register_wp2_1_natives(registry: &mut NativeMethodRegistry) {
             let ata = ctx.get_field_by_name(this, "actualTypeArguments");
             if let Value::Object(Some(arr)) = ata {
                 let len = ctx.array_length(arr);
-                let clone = ctx.new_ref_array(cratonvm_types::ClassId::new(0), len);
+                // Preserve the source array's component type. The stored
+                // `actualTypeArguments` is a `java/lang/reflect/Type[]` (built via
+                // generics::new_type_array); cloning into a `ClassId(0)` array made
+                // an `Object[]`, so `getActualTypeArguments() instanceof Type[]`
+                // was false and Spring's `SerializableTypeWrapper$
+                // MethodInvokeTypeProvider.getType` `(Type) result` cast threw
+                // `Object cannot be cast to java/lang/reflect/Type` — breaking
+                // every bean whose generic collection property is resolved via
+                // ResolvableType (e.g. CollectionsWithDefaultTypesTests).
+                //
+                // A ref array's header carries its COMPONENT class id, so reusing
+                // `class_id_of_object(arr)` clones with the same component without
+                // any class-loading side effect. (An earlier attempt resolved the
+                // component via `ensure_class_initialized("java/lang/reflect/Type")`
+                // on every call — that re-entrant class load broke XML/JAXP init,
+                // which calls this native while the module graph is mid-setup.)
+                let comp_cid = ctx.class_id_of_object(arr);
+                let clone = ctx.new_ref_array(comp_cid, len);
                 for i in 0..len {
                     let el = ctx.get_array_element(arr, i);
                     ctx.set_array_element(clone, i, el);
