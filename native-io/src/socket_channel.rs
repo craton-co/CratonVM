@@ -2343,6 +2343,18 @@ fn ss_wrapper_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         // C27: remove the identity-hashed key (was raw pointer before).
         let key = ctx.identity_hash_code(this);
         ss_back_ref_table().write().remove(&key);
+        return Ok(None);
+    }
+    // Plain ServerSocket (no ServerSocketChannel back-ref). This native is the
+    // last-registered — and therefore winning — `close`, but the listener it
+    // must drop lives in native-builtins' `s2` registry (the binding went
+    // through the plain-bind hook). Delegate through the cross-crate close hook
+    // it installs; previously this no-opped, so the listener stayed registered
+    // and a thread blocked in ServerSocket.accept() never woke — okhttp's
+    // MockWebServer.close() then threw `AssertionError: Gave up waiting for
+    // queue to shut down` on teardown.
+    if let Some(cb) = cratonvm_native_api::plain_server_socket_close::get() {
+        return cb(ctx, args);
     }
     Ok(None)
 }
