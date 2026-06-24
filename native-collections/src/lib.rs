@@ -5135,10 +5135,52 @@ fn native_map_equals(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     }
     // Check that every entry in `this` is present-and-equal in `other`.
     //
-    // Null-value handling (MED fix, preserved): a `null`-valued entry must be
-    // matched by `other` mapping the same key to `null` AND actually containing
-    // it (distinguish present-null from absent, per the contract). Null-keyed
-    // entries are included by dispatching the lookup with a `null` key.
+    // `AbstractMap.equals` wraps the per-entry comparison loop in
+    // `try { ... } catch (ClassCastException | NullPointerException) { return
+    // false; }`: if a key/value lookup or a value's own `equals` throws one of
+    // those (e.g. a value whose `equals` dereferences a null field — Hibernate's
+    // `DynamicFetchBuilderLegacy.equals` does exactly this for cache-key copies
+    // with a null `lockMode`), the JDK treats the maps as unequal rather than
+    // letting the exception escape. CratonVM's native `Map.equals` previously
+    // let the `?` propagate that exception, so e.g. the query-plan cache GET
+    // aborted with an NPE instead of recording a clean miss (SQLTest 3/38). Run
+    // the loop in a helper and restore the catch-and-return-false semantics.
+    match map_equals_entries(ctx, this, other) {
+        Ok(equal) => Ok(Some(Value::Int(if equal { 1 } else { 0 }))),
+        Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(exc))
+            if exc_is_cce_or_npe(ctx, exc) =>
+        {
+            Ok(Some(Value::Int(0)))
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Returns `true` iff `exc` is a `ClassCastException` or `NullPointerException`
+/// (the two exception types `AbstractMap.equals` / `AbstractMap.hashCode`
+/// swallow during cross-implementation comparison).
+fn exc_is_cce_or_npe(ctx: &mut dyn NativeContext, exc: ObjectRef) -> bool {
+    let class_id = ctx.class_id_of_object(exc);
+    matches!(
+        ctx.class_name_of_id(class_id).as_deref(),
+        Some("java/lang/ClassCastException") | Some("java/lang/NullPointerException")
+    )
+}
+
+/// The per-entry comparison loop of `Map.equals`, factored out so the caller can
+/// apply `AbstractMap.equals`'s `catch (ClassCastException | NullPointerException)
+/// { return false; }` around it. Returns `Ok(true)` if every entry in `this` is
+/// present-and-equal in `other`, `Ok(false)` otherwise.
+///
+/// Null-value handling (MED fix, preserved): a `null`-valued entry must be
+/// matched by `other` mapping the same key to `null` AND actually containing it
+/// (distinguish present-null from absent, per the contract). Null-keyed entries
+/// are included by dispatching the lookup with a `null` key.
+fn map_equals_entries(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    other: ObjectRef,
+) -> Result<bool, cratonvm_types::error::MethodCallFailed> {
     let entries = map_collect_entries(ctx, this);
     for (key, value) in &entries {
         let other_val = ctx
@@ -5152,7 +5194,7 @@ fn native_map_equals(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         match value {
             Value::Object(None) => {
                 if !matches!(other_val, Value::Object(None)) {
-                    return Ok(Some(Value::Int(0)));
+                    return Ok(false);
                 }
                 let has = ctx.invoke_virtual(
                     other,
@@ -5161,7 +5203,7 @@ fn native_map_equals(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
                     &[*key],
                 )?;
                 if !matches!(has, Some(Value::Int(1))) {
-                    return Ok(Some(Value::Int(0)));
+                    return Ok(false);
                 }
             }
             _ => {
@@ -5181,12 +5223,12 @@ fn native_map_equals(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
                     _ => values_equal(ctx, value, &other_val),
                 };
                 if !eq {
-                    return Ok(Some(Value::Int(0)));
+                    return Ok(false);
                 }
             }
         }
     }
-    Ok(Some(Value::Int(1)))
+    Ok(true)
 }
 
 // ===========================================================================
@@ -26417,10 +26459,26 @@ fn native_chm_equals(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
             return Ok(Some(Value::Int(0)));
         }
     }
+    // Compare each value with the `Map.equals` contract: `v.equals(otherVal)`.
+    // `values_equal` alone only knew identity / String contents / enum identity,
+    // so it wrongly reported unequal for equal-but-not-identical object values
+    // (e.g. two maps holding equal `List`/bean values). Route object/object
+    // pairs through `map_keys_equal` (which dispatches the value's real Java
+    // `equals`); keep `values_equal` for primitive/null/mixed cases.
+    //
+    // NOTE: unlike `AbstractMap.equals` (the HashMap family, see
+    // `native_map_equals`), `ConcurrentHashMap.equals` does NOT wrap this in
+    // `catch (ClassCastException | NullPointerException) { return false; }` — it
+    // dispatches `v.equals(val)` directly and lets such an exception propagate.
+    // So we propagate here too (the `?`), matching HotSpot.
     for (key, value) in &our_entries {
         let other_val = native_chm_get(ctx, &[Value::Object(Some(other)), *key])?
             .unwrap_or(Value::Object(None));
-        if !values_equal(ctx, value, &other_val) {
+        let eq = match (value, &other_val) {
+            (Value::Object(Some(va)), Value::Object(Some(vb))) => map_keys_equal(ctx, *va, *vb)?,
+            _ => values_equal(ctx, value, &other_val),
+        };
+        if !eq {
             return Ok(Some(Value::Int(0)));
         }
     }
