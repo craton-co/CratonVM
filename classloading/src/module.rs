@@ -119,6 +119,16 @@ pub struct ModuleDescriptor {
     pub uses: Vec<String>,
     /// Service implementations provided.
     pub provides: Vec<ModuleProvidesEntry>,
+    /// True if this descriptor was registered for a jar on the **class path**
+    /// rather than a real module path. CratonVM has no module path, so any
+    /// `module-info.class` found in an application-classpath jar describes a jar
+    /// that the real JDK would place in the *unnamed* module. We still keep the
+    /// descriptor (for `provides`/`uses` service discovery and module labelling),
+    /// but such modules get JDK *automatic-module* access semantics: they read
+    /// every other module and export/open all their packages. Without this, e.g.
+    /// `org.jboss.logging` (which does not `requires org.apache.logging.log4j`)
+    /// would fail readability and break logging init for the whole app.
+    pub automatic: bool,
 }
 
 impl ModuleDescriptor {
@@ -126,7 +136,8 @@ impl ModuleDescriptor {
     ///
     /// An open module exports every package to everyone.
     pub fn exports_package_to(&self, pkg: &str, requester: &str) -> bool {
-        if self.is_open {
+        // Automatic (classpath) modules export every package unqualified.
+        if self.automatic || self.is_open {
             return true;
         }
         self.exports
@@ -139,7 +150,8 @@ impl ModuleDescriptor {
     ///
     /// An open module opens every package to everyone.
     pub fn opens_package_to(&self, pkg: &str, requester: &str) -> bool {
-        if self.is_open {
+        // Automatic (classpath) modules open every package for deep reflection.
+        if self.automatic || self.is_open {
             return true;
         }
         self.opens
@@ -498,6 +510,16 @@ impl ModuleRegistry {
         // If the reader module has no registered descriptor, use open-world
         // assumption: unknown modules can read anything.
         if !self.modules.contains_key(reader) {
+            return true;
+        }
+
+        // Automatic (classpath) modules read every other module — JPMS gives an
+        // automatic module an implicit `requires transitive` on every other
+        // module (and on the unnamed module). On the class path (CratonVM's only
+        // loading mode for app jars) `org.jboss.logging` must be able to reach
+        // `org.apache.logging.log4j` even though its module-info does not
+        // `requires` it.
+        if self.modules.get(reader).is_some_and(|d| d.automatic) {
             return true;
         }
 
@@ -1067,6 +1089,9 @@ pub fn descriptor_from_module_attribute(
         opens,
         uses,
         provides,
+        // Source-dependent; the caller (`try_register_module_info`) sets this to
+        // true for application-classpath jars.
+        automatic: false,
     })
 }
 
@@ -1110,6 +1135,18 @@ pub fn package_of(class_name: &str) -> &str {
     }
 }
 
+/// True if `name` is a genuine JDK/platform module name (`java.*`, `jdk.*`,
+/// `javafx.*`, `oracle.*`). Everything else is an application/library module that
+/// — under CratonVM's class-path-only loading model — should get automatic-module
+/// access semantics (read/export/open all) rather than strict JPMS encapsulation.
+pub fn is_platform_module_name(name: &str) -> bool {
+    name == "java.base"
+        || name.starts_with("java.")
+        || name.starts_with("jdk.")
+        || name.starts_with("javafx.")
+        || name.starts_with("oracle.")
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -1128,6 +1165,7 @@ mod tests {
             opens: vec![],
             uses: vec![],
             provides: vec![],
+            automatic: false,
         }
     }
 

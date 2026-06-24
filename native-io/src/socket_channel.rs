@@ -2214,8 +2214,15 @@ fn ss_wrapper_bind(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         None => return Err(ioex("bind: null this")),
     };
     let Some(ssc) = ss_back_ref(ctx, this) else {
-        // Plain ServerSocket — fall through (handled elsewhere). We can't
-        // do anything for a non-channel-backed ServerSocket here.
+        // Plain ServerSocket (no ServerSocketChannel back-ref). This native is
+        // the last-registered — and therefore winning — `bind`, but the real
+        // binding logic (TcpListener + the `s2` listener table that `accept()`
+        // reads + port recording) lives in native-builtins, which we cannot
+        // call directly. Delegate through the cross-crate hook it installs
+        // (BUG-04); previously this no-opped, leaving `getLocalPort()` = 0.
+        if let Some(cb) = cratonvm_native_api::plain_server_socket_bind::get() {
+            return cb(ctx, args);
+        }
         return Ok(None);
     };
     // Delegate to ssc_bind with backlog=0 (TcpListener picks its own).
@@ -2231,6 +2238,11 @@ fn ss_wrapper_bind_backlog(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         None => return Err(ioex("bind: null this")),
     };
     let Some(ssc) = ss_back_ref(ctx, this) else {
+        // Plain ServerSocket — delegate to the native-builtins plain-bind hook
+        // (BUG-04); see ss_wrapper_bind above.
+        if let Some(cb) = cratonvm_native_api::plain_server_socket_bind::get() {
+            return cb(ctx, args);
+        }
         return Ok(None);
     };
     let sa = args.get(1).copied().unwrap_or(Value::Object(None));
@@ -2270,16 +2282,28 @@ fn ss_wrapper_local_address(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     let port = if let Some(ssc) = ss_back_ref(ctx, this) {
         cf_get(ctx, ssc, F_LOCAL_PORT).as_int().unwrap_or(0)
     } else {
-        0
+        // Plain ServerSocket — read the port recorded by the binder (BUG-04),
+        // same channel ss_wrapper_local_port uses.
+        cratonvm_native_api::server_socket_ports::get(ctx.identity_hash_code(this)).unwrap_or(0)
     };
     if port <= 0 {
         return Ok(Some(Value::Object(None)));
     }
-    let isa = alloc_obj(ctx, "java/net/InetSocketAddress", 2);
-    let host = ctx.create_string("0.0.0.0");
-    ctx.set_field(isa, 0, Value::Object(Some(host)));
-    ctx.set_field(isa, 1, Value::Int(port));
-    Ok(Some(Value::Object(Some(isa))))
+    // Build via the REAL `InetSocketAddress(String,int)` ctor (like
+    // `ssc_local_address` above), NOT a flat 2-slot synthetic: the real
+    // `getPort()`/`getHostString()`/`toString()` bytecode reads
+    // `this.holder.port` / `this.holder.hostname`, and a flat object has a null
+    // `holder` → `getPort()` returns 0. okhttp's `MockWebServer.getPort()` reads
+    // `(serverSocket.localSocketAddress as InetSocketAddress).port`, so the flat
+    // object made it 0 → every Spring HTTP-client test connected to
+    // `http://localhost:0` and failed (BUG-04). The real ctor populates the
+    // holder so `getPort()` returns the bound ephemeral port.
+    let h = ctx.create_string("0.0.0.0");
+    ctx.new_object_initialized(
+        "java/net/InetSocketAddress",
+        "(Ljava/lang/String;I)V",
+        &[Value::Object(Some(h)), Value::Int(port)],
+    )
 }
 
 fn ss_wrapper_is_bound(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -2288,7 +2312,10 @@ fn ss_wrapper_is_bound(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         None => return Ok(Some(Value::Int(0))),
     };
     let Some(ssc) = ss_back_ref(ctx, this) else {
-        return Ok(Some(Value::Int(0)));
+        // Plain ServerSocket — bound iff the binder recorded a port (BUG-04).
+        let bound =
+            cratonvm_native_api::server_socket_ports::get(ctx.identity_hash_code(this)).is_some();
+        return Ok(Some(Value::Int(if bound { 1 } else { 0 })));
     };
     let id = cf_get(ctx, ssc, F_REG_ID).as_int().unwrap_or(-1);
     Ok(Some(Value::Int(if id >= 0 { 1 } else { 0 })))

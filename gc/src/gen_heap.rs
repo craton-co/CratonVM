@@ -2577,17 +2577,43 @@ impl GenerationalHeap {
         // objects were conservatively MARKED by the full-stack scan but cannot be
         // relocated (raw register/spill slots can't be rewritten), so run the
         // NON-MOVING sweep exactly as for a registered JIT frame (`is_active()`).
-        if (crate::gc_quiescence::is_active()
-            || crate::gc_quiescence::unregistered_jit_frame_on_stack()
-            || promotion_oom_risk)
-            && !force_moving
-        {
+        let has_conservative_roots = crate::gc_quiescence::is_active()
+            || crate::gc_quiescence::unregistered_jit_frame_on_stack();
+        // HIB-CV-22/32/33 ROOT FIX: only honor `promotion_oom_risk` as a reason
+        // to divert into the non-moving sweep when there are un-rewritable
+        // conservative JIT roots to protect. The non-moving sweep exists SOLELY
+        // because a moving (Cheney) cycle cannot rewrite a JIT register/spill
+        // slot it discovered conservatively. When NO JIT frame is on any stack
+        // (`--nojit`, or a JIT-quiescent collection) there are no such roots:
+        //   * the moving collector is then fully precise and correct, AND
+        //   * its to-space is a fresh semispace the size of from-space, so the
+        //     packed live survivor set always fits (promotion failure falls back
+        //     to to-space) — the `process::abort()` that `promotion_oom_risk`
+        //     was added to avoid is effectively unreachable on this path, and
+        //   * the moving path runs the Phase-5 major GC (mark-compact) that the
+        //     non-moving sweep's early return SKIPS, relieving the very old-gen
+        //     pressure that keeps `promotion_oom_risk` latched on (otherwise the
+        //     heap wedges in non-moving mode under load — exactly when the bug
+        //     bites).
+        // Meanwhile the non-moving sweep, run on this no-conservative-root path,
+        // relies on conservative over-marking it does NOT have, exposing a
+        // precise-root/remap gap that reclaims a still-live young object — the
+        // boxed `java.lang.Byte` (HIB-CV-32), the JUnit `AtomicBoolean`
+        // (HIB-CV-22), and the SessionFactory oop (HIB-CV-33). `FORCE_MOVING`
+        // makes all three disappear, confirming the moving path is clean here.
+        // Opt out (restore the old broad diversion) with
+        // `CRATONVM_PROMOTION_OOM_GUARD_BROAD=1`.
+        let honor_promotion_oom_risk = promotion_oom_risk
+            && (has_conservative_roots
+                || std::env::var_os("CRATONVM_PROMOTION_OOM_GUARD_BROAD").is_some());
+        if (has_conservative_roots || honor_promotion_oom_risk) && !force_moving {
             tracing::debug!(
                 "running non-moving young-gen mark-sweep (jit_active={}, \
-                 unregistered_jit_frame={}, promotion_oom_risk={}) — compaction deferred.",
+                 unregistered_jit_frame={}, promotion_oom_risk={}, honored={}) — compaction deferred.",
                 crate::gc_quiescence::is_active(),
                 crate::gc_quiescence::unregistered_jit_frame_on_stack(),
                 promotion_oom_risk,
+                honor_promotion_oom_risk,
             );
             let result = self.sweep_young_non_moving(roots, finalizer_addrs);
             // BUG-V fix: the non-moving sweep still *relocates* objects via
@@ -6602,7 +6628,38 @@ fn clear_all_mark_bits_in_arena(arena: &mut Arena) {
 // SAFETY: caller guarantees `ptr` points to a valid Value within a heap object.
 #[inline]
 unsafe fn read_slot(ptr: *mut u8) -> Value {
-    std::ptr::read(ptr as *const Value)
+    // Defense-in-depth (HIB-CV-32): validate the discriminant before
+    // constructing the `Value`. If a reference-integrity defect left this cell
+    // holding bytes that do not form a valid `Value` (e.g. a swept-then-reused
+    // live object whose primitive field reads back `{heap-ptr, 6}`), decoding
+    // it as a `Value` and then matching on it — as the very next operand-stack
+    // push does — is a wild jump-table SIGSEGV with no context. Instead return
+    // a benign null (the field-read callers already normalize `Object(None)`
+    // for a primitive slot) plus a rate-limited diagnostic, turning an
+    // unrecoverable crash into a localizable one. The fast path is one aligned
+    // 32-bit load + a predictable compare on top of the read already happening.
+    match cratonvm_types::read_value_checked(ptr as *const Value) {
+        Some(v) => v,
+        None => {
+            static CORRUPT_HITS: std::sync::atomic::AtomicU64 =
+                std::sync::atomic::AtomicU64::new(0);
+            let n = CORRUPT_HITS.fetch_add(1, Ordering::Relaxed);
+            if n < 32 || std::env::var_os("CRATONVM_DIAG_HIB32").is_some() {
+                // SAFETY: `ptr` is a readable 16-byte slot (caller contract).
+                let raw = std::ptr::read(ptr as *const [u64; 2]);
+                tracing::error!(
+                    target: "cratonvm::gc::guard",
+                    slot = ?ptr,
+                    raw0 = format!("{:#018x}", raw[0]),
+                    raw1 = format!("{:#018x}", raw[1]),
+                    "gen_heap::read_slot: corrupt Value cell (out-of-range \
+                     discriminant) — returning null instead of a UB-on-match \
+                     Value. Heap reference-integrity defect (see HIB-CV-32).",
+                );
+            }
+            Value::Object(None)
+        }
+    }
 }
 
 /// Write a `Value` to a slot pointer.

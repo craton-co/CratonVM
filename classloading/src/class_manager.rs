@@ -41,8 +41,8 @@ use crate::loaders::{
     BUILTIN_LOADER_DELEGATION_CHAIN,
 };
 use crate::module::{
-    descriptor_from_module_attribute, package_of, packages_from_module_packages_attribute,
-    ModuleRegistry,
+    descriptor_from_module_attribute, is_platform_module_name, package_of,
+    packages_from_module_packages_attribute, ModuleRegistry,
 };
 use crate::vtype::ClassHierarchy;
 use cratonvm_types::error::{ClassFileError, LinkageError, RuntimeError, VmError};
@@ -1477,13 +1477,21 @@ impl ClassManager {
             Ok("0") | Ok("false") | Ok("no")
         );
         if register_modules {
-            for class_path in [
-                bootstrap.class_path(),
-                extension.class_path(),
-                application.class_path(),
+            // `automatic = true` for the application class path: those jars are
+            // on the class path (not a module path), so the real JDK puts them in
+            // the unnamed module. We keep their descriptors for service discovery
+            // and labelling but grant automatic-module access semantics so JPMS
+            // readability/exports are not enforced between app jars (which would
+            // otherwise break e.g. org.jboss.logging → org.apache.logging.log4j).
+            // Bootstrap/extension are the genuine platform modules — keep them
+            // strict.
+            for (class_path, automatic) in [
+                (bootstrap.class_path(), false),
+                (extension.class_path(), false),
+                (application.class_path(), true),
             ] {
                 for bytes in class_path.scan_module_infos() {
-                    Self::try_register_module_info(&mut module_registry, &bytes);
+                    Self::try_register_module_info(&mut module_registry, &bytes, automatic);
                 }
             }
         }
@@ -1527,7 +1535,7 @@ impl ClassManager {
 
     /// Parse a `module-info.class` byte array and register the contained
     /// module descriptor in `registry`.  Silently ignores parse failures.
-    fn try_register_module_info(registry: &mut ModuleRegistry, bytes: &[u8]) {
+    fn try_register_module_info(registry: &mut ModuleRegistry, bytes: &[u8], automatic: bool) {
         let diag_mp = std::env::var("CRATONVM_DBG_MODPROV").is_ok();
         let mut class_file = match cratonvm_reader::read_class(bytes) {
             Ok(cf) => cf,
@@ -1554,10 +1562,16 @@ impl ClassManager {
                 .and_then(|d| descriptor_from_module_attribute(d, &class_file.constant_pool))
         });
 
-        let desc = match module_desc {
+        let mut desc = match module_desc {
             Some(d) => d,
             None => return,
         };
+        // A `module-info.class` found on the application class path describes a
+        // jar the real JDK would treat as part of the unnamed module. Give it
+        // automatic-module access semantics (read/export/open all) so classpath
+        // apps are not subjected to JPMS encapsulation between their own jars
+        // (e.g. org.jboss.logging → org.apache.logging.log4j).
+        desc.automatic = automatic;
 
         // Find ModulePackages attribute for package-to-module mapping
         let packages: Vec<String> = class_file
@@ -2912,10 +2926,16 @@ impl ClassManager {
         // registry (covers module-info.class files loaded lazily during class
         // resolution, supplementing the eager scan in new()).
         if name.ends_with("module-info") || name == "module-info" {
-            if let Some(desc) = class_file.attributes.iter().find_map(|a| {
+            if let Some(mut desc) = class_file.attributes.iter().find_map(|a| {
                 a.as_decoded()
                     .and_then(|d| descriptor_from_module_attribute(d, &class_file.constant_pool))
             }) {
+                // Mirror the eager scan: a lazily-loaded module-info that is NOT a
+                // genuine platform module (java.*/jdk.*/…) is a class-path jar and
+                // gets automatic-module access semantics. Without this, a lazy
+                // re-register would overwrite the eager `automatic=true` entry with
+                // a strict one and re-break readability (e.g. org.jboss.logging).
+                desc.automatic = !is_platform_module_name(&desc.name);
                 let packages: Vec<String> = class_file
                     .attributes
                     .iter()

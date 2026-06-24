@@ -3830,7 +3830,54 @@ fn register_apply_parameters(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let this = obj_arg(args, 0)?;
             let id = engine_id_or_alloc(this);
-            let p = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLParameters", 4);
+            // BUG-08: the prior bare `alloc_concurrent_synthetic` SSLParameters left
+            // the REAL `protocols`/`cipherSuites` fields null, so the un-intercepted
+            // `SSLParameters.getProtocols()`/`getCipherSuites()` bytecode returned
+            // null. Jetty's `SslContextFactory.checkConfiguration()` does
+            // `engine.getSSLParameters().getProtocols()` then reads its array length
+            // → NPE ("Cannot read the array length because <local2> is null", 5×
+            // JettyClientHttpRequestFactoryTests). Build a REAL SSLParameters via the
+            // `(cipherSuites, protocols)` ctor populated from the engine's enabled
+            // state (falling back to the rustls-negotiable defaults) so those
+            // accessors return non-null arrays. ALPN still rides the objref-keyed
+            // side-table below (getApplicationProtocols reads it regardless of how
+            // the SSLParameters was constructed), so this does not regress ALPN.
+            const DEFAULT_CIPHERS: &[&str] = &[
+                "TLS_AES_128_GCM_SHA256",
+                "TLS_AES_256_GCM_SHA384",
+                "TLS_CHACHA20_POLY1305_SHA256",
+                "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256",
+                "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
+                "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384",
+                "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",
+                "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256",
+                "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256",
+            ];
+            let protocols = with_engine(id, |s| s.enabled_protocols.clone())
+                .filter(|l| !l.is_empty())
+                .unwrap_or_else(|| vec!["TLSv1.3".to_string(), "TLSv1.2".to_string()]);
+            let ciphers = with_engine(id, |s| s.enabled_ciphers.clone())
+                .filter(|l| !l.is_empty())
+                .unwrap_or_else(|| DEFAULT_CIPHERS.iter().map(|s| s.to_string()).collect());
+            let mk = |ctx: &mut dyn cratonvm_native_api::NativeContext, items: &[String]| {
+                let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), items.len());
+                for (i, s) in items.iter().enumerate() {
+                    let so = ctx.create_string(s);
+                    ctx.set_array_element(arr, i, Value::Object(Some(so)));
+                }
+                Value::Object(Some(arr))
+            };
+            let carr = mk(ctx, &ciphers);
+            let parr = mk(ctx, &protocols);
+            // SSLParameters(String[] cipherSuites, String[] protocols)
+            let p = match ctx.new_object_initialized(
+                "javax/net/ssl/SSLParameters",
+                "([Ljava/lang/String;[Ljava/lang/String;)V",
+                &[carr, parr],
+            )? {
+                Some(Value::Object(Some(o))) => o,
+                _ => alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLParameters", 4),
+            };
             // Stash ALPN onto the SSLParameters side-table so getApplicationProtocols echoes it.
             let alpn_list = with_engine(id, |s| {
                 s.alpn_protocols

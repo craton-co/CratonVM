@@ -1,5 +1,20 @@
 # HIB-CV-22 — JUnit `TimeoutExtension` causes "InvocationInterceptors called invocation multiple times" (non-JIT)
 
+> **✅ FIXED on dev (`c9258e17`, branch `fix/gc-young-sweep-corruptor`, 2026-06-23).**
+> Confirmed = the HIB-CV-33 GC corruptor with a *different victim* (the JUnit
+> `ValidatingInvocation.invokedOrSkipped` `AtomicBoolean`). Fix: the
+> `promotion_oom_risk` heuristic diverted `--nojit` young collections into the
+> non-moving sweep, which over-marks conservative JIT roots it does **not** have
+> without a JIT frame → reclaims a still-live young object. `gen_heap.rs` now honors
+> `promotion_oom_risk` only when conservative JIT roots are present; otherwise the
+> precise moving collector runs (== `FORCE_MOVING`, proven clean). Opt-out
+> `CRATONVM_PROMOTION_OOM_GUARD_BROAD=1`. Verified via the canonical
+> `scratch/h22repro/NatPressure` probe (fix == `FORCE_MOVING` clean / old fails),
+> bt16/bt18 == HotSpot (`--nojit` and JIT), 737 GC tests. *(Full Hibernate e2e stays
+> blocked on current dev by separate pre-existing bugs — JPMS empty-package + a
+> bootstrap native stack overflow — so validation used the report's own minimal
+> mechanism probe.)*
+
 **Run:** full Hibernate ORM suite, 2026-06-22/23
 **Binary:** `cvhibtest.exe` (dev `c863b23e`)
 **Severity:** Medium — real CratonVM-only correctness bug; **reproduces under `--nojit`** (not the JIT bug); intermittent

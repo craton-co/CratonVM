@@ -16442,13 +16442,36 @@ pub(crate) fn try_lambda_dispatch(
                 &call_site.impl_handle.descriptor,
                 &full_args,
             );
-            // If receiver's class didn't have the method, fall back to the
+            // If receiver's class didn't have the SAM method, fall back to the
             // class specified in the lambda call site. Handles objects with
             // generic ClassId (stub/Object) targeting a specific class.
+            //
+            // HIB-CV-31 FIX: the retry must fire ONLY when the SAM itself failed
+            // to resolve on the receiver — i.e. the `NoSuchMethodError` names
+            // exactly `(receiver_class, member_name)`. The old guard fired for
+            // ANY `NoSuchMethodError`, including one raised deep INSIDE a
+            // successfully-dispatched `onFlush` body (e.g. H2's `IOUtils.readFully`
+            // calling `in.read()` on a corrupted `InputStream` reference →
+            // `java/lang/Object.read()I` NSME). Because `receiver_class`
+            // (`DefaultFlushEventListener`) != `impl_handle.class_name`
+            // (the abstract `FlushEventListener`), the old guard re-dispatched
+            // `onFlush` onto the abstract interface — which has no Code attribute
+            // — fabricating a misleading `AbstractMethodError` that both masked
+            // the real in-body error and reported a phantom dispatch failure.
+            // Constraining the NSME to the SAM's own (class, method) makes the
+            // retry serve only its intended case (generic-ClassId receiver) and
+            // lets genuine in-body linkage errors propagate unchanged.
             let result = match &result {
                 Err(MethodCallFailed::InternalError(VmError::Linkage(
-                    LinkageError::NoSuchMethodError { .. },
-                ))) if receiver_class.as_str() != &*call_site.impl_handle.class_name => {
+                    LinkageError::NoSuchMethodError {
+                        class_name: nsme_class,
+                        method_name: nsme_method,
+                        ..
+                    },
+                ))) if receiver_class.as_str() != &*call_site.impl_handle.class_name
+                    && nsme_class.as_str() == receiver_class.as_str()
+                    && nsme_method.as_str() == &*call_site.impl_handle.member_name =>
+                {
                     invoke_or_native(
                         shared,
                         thread,
@@ -16739,6 +16762,18 @@ fn force_native_over_real_jdk_bytecode(
     method_name: &str,
     method_descriptor: &str,
 ) -> bool {
+    // java.lang.Module access checks. CratonVM's `Class.getModule()` returns a
+    // synthetic Module mirror with a NULL `descriptor` (real module-path
+    // encapsulation does not exist — every class is effectively on the class
+    // path). The real `Module.isExported`/`isOpen` bytecode dereferences
+    // `this.descriptor.isOpen()` and NPEs (e.g. Hibernate's
+    // `JdbcTypeNameMapper.<clinit>` reflecting over `java.sql.Types`). Force the
+    // permissive natives registered in `native-builtins` (return true) so every
+    // reflective access probe succeeds — the access analogue of the always-true
+    // `Module.canUse`/`canRead` overrides.
+    if class_name == "java/lang/Module" && matches!(method_name, "isExported" | "isOpen") {
+        return true;
+    }
     // SBR-02 / bug-03: fast native regex. The real-JDK `String.replaceAll` /
     // `replaceFirst` / `matches` bodies run `Pattern.compile(...).matcher(...)`
     // in the interpreter (java.util.regex), which is 30–600× slower than

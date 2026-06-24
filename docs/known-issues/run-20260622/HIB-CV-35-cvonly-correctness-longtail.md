@@ -100,35 +100,56 @@ collection holds **1** element instead of 2.
 `"A".compareTo("B") = -1`, `CIO.compare("B","a") = 1`). So `TreeSet`/`TreeMap`
 ordering and `String.compareTo`/`CASE_INSENSITIVE_ORDER` are correct.
 
-**Root cause (localized to PERSIST, via SQL trace — `-Dhibernate.show_sql=true`):**
+**ROOT CAUSE (precisely localized): `invokeinterface Comparable.compareTo`
+mis-dispatches to a 0-returning target for an `@Entity` class, *after Hibernate's
+`SessionFactory` build-time processing of that class* — so the user's own
+`TreeSet<Cat>` dedups two distinct cats at the SOURCE (before any persist).**
+
+A self-contained JUnit reproduction (`@DomainModel`+`@SessionFactory`, entity `Cat
+implements Comparable<Cat>`) shows, inside the test body (SF already built):
 ```
-select next value for Owner_SEQ
-select next value for Cat_SEQ          <-- ONCE  (HotSpot: twice)
-insert into Owner (id) values (?)
-insert into Cat (name,owner_id,id) ...  <-- ONCE  (HotSpot: twice)
+DIAG GenCmp(non-entity, identical structure) size=2   <- OK
+DIAG Cat(ENTITY)                              size=1   <- BUG   (k1.compareTo(k2)=1 — direct call CORRECT)
+DIAG RawCmp(raw Comparable, no bridge)        size=2   <- OK
+DIAG String / Integer                         size=2   <- OK
 ```
-Only **one** of the two distinct cats is inserted — Hibernate's cascade-persist
-processed **1** element, not 2. So the divergence is at **persist**, NOT load.
+`new TreeSet<Cat>(); add(B); add(A)` → **size 1**: the second `add` returns
+`false`. Real JDK `TreeMap.put` runs (TreeSet/TreeMap are NOT native on CratonVM),
+so its `((Comparable)key).compareTo(t.key)` — an `invokeinterface
+Comparable.compareTo(Object)` — returns **0** for two distinct `Cat`s.
 
-**Ruled out (all byte-identical to HotSpot via standalone probes):**
-- `TreeSet<Cat>` (user `Comparable`): `add` ×2 → size 2, iteration 2, `toArray` 2,
-  `addAll` 2; `TreeSet` with an explicit `Comparator` → size 2.
-- `TreeMap<String,Cat>` keyed by `"A"`/`"B"` → size 2.
-- `IdentityHashMap`, `Collections.newSetFromMap(IdentityHashMap)`, `HashSet` of
-  two distinct cats → size 2; `System.identityHashCode` distinct.
+Decisively ruled out:
+- Core collections: `TreeSet`/`TreeMap`/`IdentityHashMap`/`HashSet` of two distinct
+  `Cat`s → size 2 **standalone** (== HotSpot). Array `Class` reflection too.
+- The synthetic-bridge `compareTo(Object)`: a *non-entity* `GenCmp` with the
+  identical `Comparable<T>`+bridge shape works (size 2). A raw `Comparable`
+  (no bridge) works.
+- Megamorphic call-site pollution: warming `TreeMap.put`'s `compareTo` call site
+  with 5 Comparable types × 2000 iters does NOT reproduce it standalone.
+- Reflection on the class (`getMethods`/`getMethod("compareTo",Object)`/bridge
+  invoke) does NOT corrupt dispatch standalone.
+- GC: big heap (`-Xmx512m`) and `CRATONVM_FORCE_MOVING=1` do NOT help (so NOT the
+  HIB-CV-33 load-sensitive corruptor).
+- Direct `((Comparable)cat).compareTo(other)` from app code returns the correct
+  value even in the failing context — only the *internal* `TreeMap.put` dispatch
+  is wrong.
 
-So the dedup is **inside Hibernate's collection-wrap / cascade-persist path**, not
-in any core collection or identity primitive. The cascade iterates the (transient)
-owner's `cats` and persists each, but only sees one element — most likely the
-`PersistentSortedSet`/`PersistentSortedMap` wrap step (or the `CollectionType`
-element iterator Hibernate uses during cascade) collapses to one on CratonVM.
+So **building the `SessionFactory` over the `Comparable` entity corrupts that
+class's method-table / itable entry for `compareTo`** (only that class — sibling
+non-entity Comparables in the same run are fine). Manual `MetadataSources`
+bootstrap does NOT trigger it; the `@DomainModel`/`@SessionFactory` extension path
+does — prime suspect is the ByteBuddy proxy/instantiator generation for the entity
+(Hibernate makes `Cat$HibernateProxy` subclasses; cf. ProxyClassReuseTest), which
+may rewrite/relocate the entity's `compareTo` itable slot on CratonVM.
 
-**Next step:** trace `org.hibernate.engine.internal.Cascade` /
-`AbstractPersistentCollection.wrap` element counts (instrument or
-`org.hibernate.engine` DEBUG) to pin which step drops the second element.
+**Next step:** bisect the SF-build steps for an entity (BytecodeProvider proxy
+generation vs instantiator vs JavaType registration); instrument the interpreter's
+`invokeinterface` resolution for `Comparable.compareTo` on the entity class to see
+which target it picks after each step. Repro: `SortDiagTest` in the suite scratch
+(self-contained).
 
-**Confidence:** location HIGH (persist-side, all core collections proven OK);
-exact Hibernate step MEDIUM. Deep — deferred.
+**Confidence:** root cause HIGH and precisely reproduced; exact SF-build corruptor
+MEDIUM (bisection pending). Deep interpreter/ByteBuddy interaction — deferred.
 
 ---
 

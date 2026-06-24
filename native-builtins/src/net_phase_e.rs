@@ -2451,6 +2451,25 @@ fn re2_bind_listener(
     Ok(None)
 }
 
+/// Plain `java.net.ServerSocket.bind(SocketAddress[, int])` handler. Handles
+/// both arities (backlog read from `args[2]` when present). Registered for both
+/// descriptors below AND installed as the cross-crate plain-bind hook
+/// ([`cratonvm_native_api::plain_server_socket_bind`]) so native-io's *winning*
+/// `ss_wrapper_bind` (which shadows this registration) delegates the
+/// no-channel-back-ref (plain `new ServerSocket()`) case back here instead of
+/// no-opping — without which `new ServerSocket().bind(addr)` never bound a
+/// listener and `getLocalPort()` stayed 0 (okhttp MockWebServer → port 0; BUG-04).
+fn re2_server_socket_bind(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let sa = obj_arg(args, 1).map_err(|_| ioex("bind: null address"))?;
+    let (host, port) = read_inet_socket_address(ctx, sa)?;
+    let backlog = args
+        .get(2)
+        .and_then(|v| v.as_int())
+        .unwrap_or_else(|| ss_get(this).backlog);
+    re2_bind_listener(ctx, this, &host, port, backlog)
+}
+
 fn register_re2_server_socket(r: &mut NativeMethodRegistry) {
     // NIO-SERVER-SOCKET (route 1): skip the synthetic java.net.ServerSocket
     // surface so real bytecode drives sun/nio/ch/Net. See
@@ -2458,6 +2477,11 @@ fn register_re2_server_socket(r: &mut NativeMethodRegistry) {
     if std::env::var_os("CRATONVM_REAL_NET_SOCKETS").is_some() {
         return;
     }
+    // Install the plain-`ServerSocket` bind hook for native-io's winning
+    // `ss_wrapper_bind` to delegate to (BUG-04). Done unconditionally here (the
+    // early-return above is the REAL_NET_SOCKETS path where native-io also defers
+    // to real bytecode, so the hook is simply never consulted).
+    cratonvm_native_api::plain_server_socket_bind::set(re2_server_socket_bind);
     let ss = "java/net/ServerSocket";
 
     r.register(ss, "<init>", "()V", |_ctx, args| {
@@ -2504,20 +2528,18 @@ fn register_re2_server_socket(r: &mut NativeMethodRegistry) {
         r
     });
 
-    r.register(ss, "bind", "(Ljava/net/SocketAddress;)V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let sa = obj_arg(args, 1).map_err(|_| ioex("bind: null address"))?;
-        let (host, port) = read_inet_socket_address(ctx, sa)?;
-        let backlog = ss_get(this).backlog;
-        re2_bind_listener(ctx, this, &host, port, backlog)
-    });
-    r.register(ss, "bind", "(Ljava/net/SocketAddress;I)V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let sa = obj_arg(args, 1).map_err(|_| ioex("bind: null address"))?;
-        let backlog = args.get(2).and_then(|v| v.as_int()).unwrap_or(50);
-        let (host, port) = read_inet_socket_address(ctx, sa)?;
-        re2_bind_listener(ctx, this, &host, port, backlog)
-    });
+    r.register(
+        ss,
+        "bind",
+        "(Ljava/net/SocketAddress;)V",
+        re2_server_socket_bind,
+    );
+    r.register(
+        ss,
+        "bind",
+        "(Ljava/net/SocketAddress;I)V",
+        re2_server_socket_bind,
+    );
 
     r.register(ss, "accept", "()Ljava/net/Socket;", |ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -5801,6 +5823,52 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
     r.register(
         ctx_cls,
         "getSupportedSSLParameters",
+        "()Ljavax/net/ssl/SSLParameters;",
+        |ctx, _args| {
+            let protocols = ["TLSv1.3", "TLSv1.2"];
+            let ciphers = [
+                "TLS_AES_128_GCM_SHA256",
+                "TLS_AES_256_GCM_SHA384",
+                "TLS_CHACHA20_POLY1305_SHA256",
+                "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256",
+                "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
+                "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384",
+                "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",
+                "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256",
+                "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256",
+            ];
+            let mk = |ctx: &mut dyn NativeContext, items: &[&str]| {
+                let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, items.len());
+                for (i, &s) in items.iter().enumerate() {
+                    let so = ctx.create_string(s);
+                    ctx.set_array_element(arr, i, Value::Object(Some(so)));
+                }
+                Value::Object(Some(arr))
+            };
+            let carr = mk(ctx, &ciphers);
+            let parr = mk(ctx, &protocols);
+            // SSLParameters(String[] cipherSuites, String[] protocols)
+            ctx.new_object_initialized(
+                "javax/net/ssl/SSLParameters",
+                "([Ljava/lang/String;[Ljava/lang/String;)V",
+                &[carr, parr],
+            )
+        },
+    );
+    // getDefaultSSLParameters() — BUG-08: Jetty's `SslContextFactory.load()`
+    // (jetty-util) calls this on the SSLContext it just `getInstance`'d to seed
+    // the connector's enabled protocols/cipher suites. Like
+    // getSupportedSSLParameters above, the synthetic SSLContext carries no real
+    // `contextSpi`, so the un-intercepted `javax.net.ssl.SSLContext`
+    // .getDefaultSSLParameters() bytecode (`return contextSpi.engineGet…()`)
+    // dereferenced null → NPE (5× org.springframework.http.client.
+    // JettyClientHttpRequestFactoryTests). Return a REAL SSLParameters whose
+    // *default-enabled* protocol/cipher lists match what the rustls-backed
+    // engine negotiates — on JDK 25 the modern TLSv1.3/1.2 suites are
+    // enabled-by-default, so the default set mirrors the supported set here.
+    r.register(
+        ctx_cls,
+        "getDefaultSSLParameters",
         "()Ljavax/net/ssl/SSLParameters;",
         |ctx, _args| {
             let protocols = ["TLSv1.3", "TLSv1.2"];

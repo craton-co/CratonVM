@@ -1351,6 +1351,7 @@ mod tests {
             opens: vec![],
             uses: vec![],
             provides: vec![],
+            automatic: false,
         };
         let mut reg = ModuleRegistry::new();
         reg.register(desc("java.base"), vec![]);
