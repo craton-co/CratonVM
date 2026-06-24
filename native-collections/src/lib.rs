@@ -25799,12 +25799,21 @@ fn native_chm_init_from_map(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         _ => return Ok(None),
     };
     chm_init_segments(ctx, this, CHM_DEFAULT_SEGMENTS, CHM_DEFAULT_SEGMENT_CAP);
-    // Copy entries from source map (HashMap layout: 3-field)
+    // Copy entries from the source map. Use `collect_entries_any` (NOT the
+    // HashMap-bucket-only `map_collect_entries`) so a `TreeMap` / `Collections
+    // .singletonMap` / real-JDK unmodifiable / any third-party `Map` source is
+    // copied in full via `entrySet().iterator()` instead of being read as an
+    // empty bucket table. This matches `native_chm_put_all`. Without it,
+    // `new ConcurrentHashMap<>(Collections.singletonMap(k,v))` produced an EMPTY
+    // map — which silently broke Mockito's inline mock maker: `MockUtil`'s static
+    // `mockMakers = new ConcurrentHashMap<>(singletonMap(makerClass, maker))` came
+    // up empty, so `getMockHandlerOrNull` iterated nothing and `isMock()` was
+    // always false → `when()/given()` on any mock threw `NotAMockException`.
     let source = match args.get(1) {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
     };
-    let src_entries = map_collect_entries(ctx, source);
+    let src_entries = collect_entries_any(ctx, source);
     let _resize_flag = ChmResizeLockGuard::enter();
     for (key, value) in src_entries {
         let hash = chm_key_hash(ctx, &key)?;

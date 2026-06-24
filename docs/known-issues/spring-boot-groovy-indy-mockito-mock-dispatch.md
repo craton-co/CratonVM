@@ -8,8 +8,13 @@ metadata:
 
 # SpringRepos tail — Groovy closure→SAM proxy dispatch + Mockito-mock SAM coercion
 
-**Status:** 🟡 PARTIAL — Groovy/indy + Module layers (1–3f, g1, **g2**) all FIXED;
-remaining blocker is Mockito **inline-mock** class redefinition (layer h).
+**Status:** 🟢 MOSTLY FIXED — `9/11`. Groovy/indy + Module + Mockito-inline-mock
+layers (1–3f, g1, g2, h1, h2) all FIXED. Inline mocking now fully functions on
+CratonVM. Remaining `2/11` (h3) is a Groovy closure→env-var-lookup tail, not the
+mock framework. NOTE: the first inline-mock retransformation (ByteBuddy `Advice`
+weaving) is slow — under the default 120s `--stack-dump-on-timeout` watchdog the
+run aborts mid-weave; pass `--stack-dump-on-timeout=0` (or a larger value) to let
+it complete. That's the known interpreter throughput wall, not a hang.
 `org.springframework.boot.build.groovyscripts.SpringRepositoriesExtensionTests`
 (Spring Boot buildSrc). The earlier layers are all FIXED; see
 [[spring-boot-groovy-indy-runtime-argcount-3c-FIXED]],
@@ -29,7 +34,9 @@ remaining blocker is Mockito **inline-mock** class redefinition (layer h).
 | g1 | `MethodHandles.foldArguments` was a passthrough → `TypeTransformers.TO_REFLECTIVE_PROXY` malformed → SAM proxy built with **no interfaces** (`execute()` → `NoSuchMethodError`) | ✅ FIXED (real `MH_KIND_FOLD`; SAM proxy now has `[Action]`, `execute` dispatches to the closure — verified by `SamRealProbe`) |
 | g2 | Named `Module` (e.g. `java.base`) has a null `descriptor` → real `implIsExportedOrOpen` NPEs in every reflective access check (Groovy `CachedClass.getMethods`, `GroovySystem.<clinit>`, JUnit `@BeforeAll`) | ✅ FIXED — `Module.isExported/isOpen` natives (still force-listed) now answer from the boot `ModuleRegistry`'s **accurate** per-module exports/opens instead of blanket-`true`; the null descriptor is never touched. `java.base.isExported("java.lang")==true` (Groovy works) and `isExported("jdk.internal.misc")==false` (ByteBuddy's `JavaDispatcher` gets the real-JDK answer, so it does NOT regress). Byte-identical to HotSpot (`ModProbe`). Also: `is_package_{exported,open}_unqualified` now honor automatic modules. **Replaces the reverted blanket-permissive attempt.** |
 | g3 | ByteBuddy `JavaDispatcher.<clinit>` → `IllegalStateException: Failed to create invoker` (reached once g2's NPE is bypassed) | 🟡 should be unblocked by the accurate g2 fix (JavaDispatcher now sees `jdk.internal.*` as not-exported and takes its fallback); not separately re-verified — SpringRepos now fails further along at the Mockito **inline-mock** wall (layer h) |
-| **h** | **closure→Action coercion on a Mockito mock drives no interaction** | 🔴 OPEN |
+| h1 | Mockito inline-mock **creation** aborted: `assureCanReadMockito` → `Instrumentation.redefineModule` → `Module.implAddReads` → **unregistered `addReads0`** `UnsatisfiedLinkError` → "Could not modify all classes" | ✅ FIXED — registered `java/lang/Module.addReads0(Module,Module)V` (native-builtins/lib.rs) to mirror the read edge into the boot `ModuleRegistry`. Inline mocks now CREATE; SpringRepos `0/11`→**`3/11`** (stable). |
+| h2 | `mockingDetails(m).isMock()==false` and `when(m.foo())`/`given(m)` → `NotAMockException` even though the mock dispatches (`m.foo()` records an ongoing stubbing). ROOT (NOT a ByteBuddy/advice problem): `MockUtil`'s static `mockMakers = new ConcurrentHashMap<>(Collections.singletonMap(makerClass, defaultMaker))` came up **EMPTY** because CratonVM's synthetic `ConcurrentHashMap.<init>(Map)` (`native_chm_init_from_map`) read entries via the HashMap-bucket-only `map_collect_entries`, which returns nothing for a `Collections$SingletonMap`/`TreeMap` source. So `getMockHandlerOrNull` iterated an empty `mockMakers.values()` and never found the handler. | ✅ FIXED — `native_chm_init_from_map` now uses `collect_entries_any` (the layout-agnostic `entrySet()` walk, same as `native_chm_put_all`). General fix: `new ConcurrentHashMap<>(singletonMap/treeMap/anyMap)` now copies entries. SpringRepos `3/11`→**`9/11`**. |
+| h3 | The injected `environment` `UnaryOperator<String>` (a closure the test passes to drive env-var lookups) is not consulted by the Groovy script — it returns the real default repo URL instead of the test value (`setUrl("https://…broadcom…")` vs wanted `setUrl("url")`). | 🔴 OPEN (2/11) — Mockito now fully works (`verify()` runs and compares); this is a Groovy closure→env-lookup dispatch tail, distinct from the mock framework. |
 
 Net: `0/11` (all crashed) → **`4/11`** clean *(flaky: the g2 Module NPE in
 `GroovySystem.<clinit>` intermittently drops it to `0/11`)*. The 4 passing are the
@@ -52,6 +59,23 @@ generation still needs class redefine, so it would not by itself make the test
 pass.) The descriptor-NPE regression that this fix targets is resolved:
 `ArtifactReleaseTests` CRASH→**`8/8`**, `DocumentAutoConfigurationClassesTests`
 `0/2`→**`2/2`** (both fully green after the two fixes below).
+
+**Update 2026-06-24 (Mockito inline-mock dig — `0/11`→`3/11`):** the `addReads0`
+`UnsatisfiedLinkError` (layer h1) was the *first* domino — it aborted
+`assureCanReadMockito` *before* `retransformClasses` ever ran. Registering the
+native (it mirrors the read edge into the `ModuleRegistry`; Java-side
+`implAddReads` already updates the heap `reads` set) lets the whole inline-mock
+**creation** path complete: SpringRepos `0/11`→**`3/11`** (stable, no flakiness —
+that was the now-fixed g2 NPE). The remaining 8 fail at layer h2: mocks are
+*generated* but *inert*. Isolated probes (`mock(I.class)` then `when(m.foo())`)
+reproduce `NotAMockException` / `isMock()==false` on a `…$MockitoMock$…` instance.
+With `CRATONVM_DBG_RETRANSFORM=1` the pipeline shows `retransformClasses0` running
+on the interface (original bytes present) and the registered ByteBuddy transformer
+returning bytes — but the actual interface-mock dispatch lives in the generated
+`$MockitoMock$` *subclass* (defined separately, never entering the retransform
+set), whose `MockMethodAdvice`-woven method bodies don't reach
+`MockMethodDispatcher`. That subclass-advice→dispatcher routing is the open work;
+the instrumentation/retransform infra itself is sound.
 
 **Update 2026-06-24 (residual MethodHandle unboxing bug — FIXED):** the
 `ArtifactReleaseTests`/`DocumentAutoConfigurationClassesTests` residual was NOT a
