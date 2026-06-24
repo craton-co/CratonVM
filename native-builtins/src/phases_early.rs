@@ -12570,7 +12570,7 @@ pub(crate) fn register_phase53_socket_stubs(r: &mut NativeMethodRegistry) {
         let mut buf = [0u8; 1];
         let mut reg = s2_registry().lock();
         if let Some(stream) = reg.streams.get_mut(&sid) {
-            match stream.read(&mut buf) {
+            match (&**stream).read(&mut buf) {
                 Ok(0) => Ok(Some(Value::Int(-1))),
                 Ok(_) => Ok(Some(Value::Int(buf[0] as i32))),
                 Err(_) => Ok(Some(Value::Int(-1))),
@@ -12592,7 +12592,7 @@ pub(crate) fn register_phase53_socket_stubs(r: &mut NativeMethodRegistry) {
         let n = {
             let mut reg = s2_registry().lock();
             if let Some(stream) = reg.streams.get_mut(&sid) {
-                match stream.read(&mut tmp) {
+                match (&**stream).read(&mut tmp) {
                     Ok(0) => -1i32,
                     Ok(n) => n as i32,
                     Err(_) => -1,
@@ -12620,7 +12620,7 @@ pub(crate) fn register_phase53_socket_stubs(r: &mut NativeMethodRegistry) {
         let n = {
             let mut reg = s2_registry().lock();
             if let Some(stream) = reg.streams.get_mut(&sid) {
-                match stream.read(&mut tmp) {
+                match (&**stream).read(&mut tmp) {
                     Ok(0) => -1i32,
                     Ok(n) => n as i32,
                     Err(_) => -1,
@@ -12673,7 +12673,7 @@ pub(crate) fn register_phase53_socket_stubs(r: &mut NativeMethodRegistry) {
         }
         let mut reg = s2_registry().lock();
         if let Some(stream) = reg.streams.get_mut(&sid) {
-            let _ = stream.write_all(&[b]);
+            let _ = (&**stream).write_all(&[b]);
         }
         Ok(Some(Value::Object(None)))
     });
@@ -12696,7 +12696,7 @@ pub(crate) fn register_phase53_socket_stubs(r: &mut NativeMethodRegistry) {
         }
         let mut reg = s2_registry().lock();
         if let Some(stream) = reg.streams.get_mut(&sid) {
-            let _ = stream.write_all(&data);
+            let _ = (&**stream).write_all(&data);
         }
         Ok(Some(Value::Object(None)))
     });
@@ -12718,7 +12718,7 @@ pub(crate) fn register_phase53_socket_stubs(r: &mut NativeMethodRegistry) {
         }
         let mut reg = s2_registry().lock();
         if let Some(stream) = reg.streams.get_mut(&sid) {
-            let _ = stream.write_all(&data);
+            let _ = (&**stream).write_all(&data);
         }
         Ok(Some(Value::Object(None)))
     });
@@ -12728,7 +12728,7 @@ pub(crate) fn register_phase53_socket_stubs(r: &mut NativeMethodRegistry) {
         if sid >= 0 {
             let mut reg = s2_registry().lock();
             if let Some(stream) = reg.streams.get_mut(&sid) {
-                let _ = stream.flush();
+                let _ = (&**stream).flush();
             }
         }
         Ok(Some(Value::Object(None)))

@@ -2062,7 +2062,7 @@ fn s2_try_accept_nonblocking(reg: &mut SocketRegistry, lid: i32) -> Option<i32> 
             {
                 reg.next_id = reg.next_id.checked_add(1).unwrap_or(1);
             }
-            reg.streams.insert(id, stream);
+            reg.streams.insert(id, Arc::new(stream));
             Some(id)
         }
         Err(_) => None,
@@ -2090,7 +2090,7 @@ pub(crate) fn s2_blocking_accept(lid: i32) -> Option<i32> {
             {
                 reg.next_id = reg.next_id.checked_add(1).unwrap_or(1);
             }
-            reg.streams.insert(id, stream);
+            reg.streams.insert(id, Arc::new(stream));
             Some(id)
         }
         Err(_) => None,
@@ -3291,7 +3291,7 @@ fn register_s2_socket_channel(r: &mut NativeMethodRegistry) {
         let n = {
             let mut reg = s2_registry().lock();
             if let Some(stream) = reg.streams.get_mut(&sock_id) {
-                match stream.read(&mut tmp) {
+                match (&**stream).read(&mut tmp) {
                     Ok(0) => -1i32,
                     Ok(n) => n as i32,
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => 0,
@@ -3328,7 +3328,7 @@ fn register_s2_socket_channel(r: &mut NativeMethodRegistry) {
         let n = {
             let mut reg = s2_registry().lock();
             if let Some(stream) = reg.streams.get_mut(&sock_id) {
-                match stream.write(&data) {
+                match (&**stream).write(&data) {
                     Ok(n) => n as i32,
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => 0,
                     Err(_) => -1,

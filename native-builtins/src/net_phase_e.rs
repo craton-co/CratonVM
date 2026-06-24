@@ -2319,7 +2319,7 @@ fn register_re1_socket(r: &mut NativeMethodRegistry) {
             if sid >= 0 {
                 let mut reg = s2_registry().lock();
                 if let Some(stream) = reg.streams.get_mut(&sid) {
-                    stream
+                    (&**stream)
                         .flush()
                         .map_err(|e| ioex(format!("flush failed: {e}")))?;
                 }
