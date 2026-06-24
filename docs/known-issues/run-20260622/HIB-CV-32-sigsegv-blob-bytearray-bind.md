@@ -1,5 +1,29 @@
 # HIB-CV-32 — SIGSEGV binding a `byte[]` as a BLOB parameter (JDBC insert)
 
+> **✅ FIXED on dev (`c9258e17`, branch `fix/gc-young-sweep-corruptor`, 2026-06-23).**
+> Confirmed = the HIB-CV-33 GC corruptor (victim: a boxed `java.lang.Byte` whose
+> reclaimed-then-reused storage made `getfield Byte.value` read a malformed `Value`
+> `{heap-ptr, 6}`, then a wild jump-table SIGSEGV in `CompactValue::from_value`).
+> Two fixes landed:
+> 1. **Root** (`gen_heap.rs`): `promotion_oom_risk` no longer diverts `--nojit`
+>    young collections into the corrupting non-moving sweep when no conservative JIT
+>    roots are present — the precise moving collector runs instead (== `FORCE_MOVING`;
+>    opt-out `CRATONVM_PROMOTION_OOM_GUARD_BROAD=1`). Same fix as HIB-CV-22/33.
+> 2. **Defense-in-depth** (`types/src/value.rs` + `gen_heap.rs::read_slot`): new
+>    `read_value_checked` validates the `Value` discriminant from raw bits before
+>    constructing the enum, so any future corrupt cell degrades to a benign null +
+>    diagnostic instead of a wild SIGSEGV (the report's recommended guard). Layout
+>    pinned by a passing test.
+> Verified via `scratch/h22repro/NatPressure` (fix == `FORCE_MOVING` clean / old
+> fails), bt16/bt18 == HotSpot, 737 GC tests, `Value` layout/round-trip tests.
+> *(The `ByteArrayMappingTests` e2e stays blocked on current dev by separate
+> pre-existing bugs — JPMS empty-package + a bootstrap native stack overflow — so it
+> cannot reach the BLOB-bind path; validated via the GC mechanism probe instead.)*
+>
+> **Note for the maintainer:** this report's pre-fix note that HIB-CV-33 is
+> "Distinct from HIB-CV-32 (verified)" is superseded — they are the **same** GC
+> corruptor (different victims), resolved by one fix.
+
 **Run:** full Hibernate ORM suite, 2026-06-22/23
 **Binary:** `cvhibtest.exe` (dev `c863b23e`)
 **Severity:** High — hard VM crash (SIGSEGV) in a common data path; **deterministic, reproduces under `--nojit`**, HotSpot PASS

@@ -1,5 +1,24 @@
 # HIB-CV-33 — SIGSEGV ("execute" access violation) building a JOINED-inheritance SessionFactory
 
+> **✅ FIXED on dev (`c9258e17`, branch `fix/gc-young-sweep-corruptor`, 2026-06-23).**
+> The non-moving young sweep under `promotion_oom_risk` corrupted live young
+> objects *because it was being run without conservative JIT roots to protect*. The
+> sweep's safety rests on conservative over-marking of the un-rewritable JIT
+> register/spill slots a moving Cheney cannot relocate; with no JIT frame on the
+> stack (`--nojit`, or JIT-quiescent) there are none, so its precise-root/remap path
+> reclaimed a still-live young object. Fix (`gen_heap.rs`): only honor
+> `promotion_oom_risk` as a divert-to-non-moving reason when conservative roots are
+> actually present; otherwise the precise moving collector runs (its fresh to-space
+> always holds the packed live set, so the abort this heuristic guarded against is
+> unreachable) **and** the Phase-5 major GC — previously skipped by the non-moving
+> early-return — relieves old-gen pressure. == `FORCE_MOVING` on the `--nojit` path
+> (proven clean), JIT-active bt18-tuned path untouched. Opt-out
+> `CRATONVM_PROMOTION_OOM_GUARD_BROAD=1`. **HIB-CV-22 and HIB-CV-32 are the same
+> corruptor (different victims) and are resolved by this one fix.** Verified:
+> `scratch/h22repro/NatPressure` (fix == `FORCE_MOVING` clean / old fails),
+> bt16/bt18 == HotSpot under `--nojit` (14985902 / 68332206) **and** JIT, 737 GC
+> unit tests.
+
 **Run:** full Hibernate ORM suite, 2026-06-22/23
 **Binary:** `cvhibtest.exe` (dev `f8cdd52b`, worktree `C:/craton/CratonVM-hibtest`); reconfirmed on dev `71c0f65d`
 **Severity:** High — hard VM crash; HotSpot PASS

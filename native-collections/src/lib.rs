@@ -519,6 +519,17 @@ fn alloc_synthetic(ctx: &mut dyn NativeContext, class_name: &str, num_fields: us
     ctx.alloc_object(cid, num_fields)
 }
 
+/// Allocate a *real* JDK object of `class_name` with its natural field count and
+/// no constructor run — the caller sets the fields it needs by name. Used to
+/// produce real instances (e.g. `Collections$SingletonList`) whose methods then
+/// execute real JDK bytecode. Returns `None` if the class is unavailable so the
+/// caller can fall back to a synthetic stand-in.
+fn alloc_real_jdk(ctx: &mut dyn NativeContext, class_name: &str) -> Option<ObjectRef> {
+    let cid = ctx.ensure_class_initialized(class_name).ok()?;
+    let n = ctx.class_num_total_fields(cid);
+    Some(ctx.alloc_object(cid, n))
+}
+
 /// Allocate a reference array (Object[]) of the given length.
 fn alloc_ref_array(ctx: &mut dyn NativeContext, length: usize) -> ObjectRef {
     ctx.new_ref_array(ClassId::new(0), length)
@@ -1524,13 +1535,64 @@ fn native_al_init_capacity(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     Ok(None)
 }
 
+/// `true` iff `obj`'s runtime class is (a subclass / implementor of)
+/// `class_name`. Interface implementation counts (see `Class::is_subclass_of`).
+fn obj_is_instance_of(ctx: &dyn NativeContext, obj: ObjectRef, class_name: &str) -> bool {
+    match ctx.class_id_by_name(class_name) {
+        Some(target) => ctx.is_subclass(ctx.class_id_of_object(obj), target),
+        None => false,
+    }
+}
+
+/// `true` iff `obj` is one of CratonVM's synthetic-backed collections
+/// (ArrayList/Vector-layout list, HashSet, or HashMap-bucket map). These are
+/// served by the `native_*` fast paths and MUST NOT be delegated to real
+/// bytecode (their data lives in CratonVM-managed slots).
+fn is_synthetic_backed_collection(ctx: &mut dyn NativeContext, obj: ObjectRef) -> bool {
+    al_is_list_layout(ctx, obj)
+        || hs_backing_map(ctx, obj).is_some()
+        || map_state(ctx, obj).0.is_some()
+}
+
+/// Real-JDK completeness: the `size`/`isEmpty` natives are registered on the
+/// `Collection`/`List`/`Set`/`Map` *interfaces* as a fallback. When one is
+/// dispatched on a *real* JDK collection that CratonVM has no synthetic backing
+/// for — e.g. `Collections$SingletonList`, `Collections$EmptyList`, or any other
+/// real `List`/`Set`/`Map` implementation — run the receiver's OWN bytecode for
+/// the method instead of returning the empty sentinel.
+///
+/// `invoke_special` does an *exact* per-class native lookup (which finds nothing
+/// for these real classes) and then runs their real `Code`, so there is no
+/// recursion back into this native. Returns `None` (caller keeps its sentinel)
+/// for CratonVM's synthetic collections and for non-collection receivers
+/// (reflection / lambda-metafactory funnels a `Charset`, `String`, … here).
+fn try_delegate_real_collection(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    iface: &str,
+    method: &str,
+    descriptor: &str,
+) -> Option<MethodCallResult> {
+    if !obj_is_instance_of(ctx, this, iface) || is_synthetic_backed_collection(ctx, this) {
+        return None;
+    }
+    let cls = ctx.class_name_of_id(ctx.class_id_of_object(this))?;
+    Some(ctx.invoke_special(&cls, method, descriptor, &[Value::Object(Some(this))]))
+}
+
 pub fn native_al_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
     };
     resync_values_view(ctx, this);
-    let (_, size) = al_state(ctx, this);
+    let (data, size) = al_state(ctx, this);
+    if data.is_none() {
+        if let Some(r) = try_delegate_real_collection(ctx, this, "java/util/Collection", "size", "()I")
+        {
+            return r;
+        }
+    }
     Ok(Some(Value::Int(size)))
 }
 
@@ -1540,7 +1602,14 @@ pub fn native_al_is_empty(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         _ => return Ok(Some(Value::Int(1))),
     };
     resync_values_view(ctx, this);
-    let (_, size) = al_state(ctx, this);
+    let (data, size) = al_state(ctx, this);
+    if data.is_none() {
+        if let Some(r) =
+            try_delegate_real_collection(ctx, this, "java/util/Collection", "isEmpty", "()Z")
+        {
+            return r;
+        }
+    }
     Ok(Some(Value::Int(if size == 0 { 1 } else { 0 })))
 }
 
@@ -4176,7 +4245,12 @@ fn native_map_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     if is_chm_receiver(ctx, this) {
         return native_chm_size(ctx, args);
     }
-    let (_, size, _) = map_state(ctx, this);
+    let (buckets, size, _) = map_state(ctx, this);
+    if buckets.is_none() {
+        if let Some(r) = try_delegate_real_collection(ctx, this, "java/util/Map", "size", "()I") {
+            return r;
+        }
+    }
     Ok(Some(Value::Int(size)))
 }
 
@@ -4191,7 +4265,12 @@ fn native_map_is_empty(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     if is_chm_receiver(ctx, this) {
         return native_chm_is_empty(ctx, args);
     }
-    let (_, size, _) = map_state(ctx, this);
+    let (buckets, size, _) = map_state(ctx, this);
+    if buckets.is_none() {
+        if let Some(r) = try_delegate_real_collection(ctx, this, "java/util/Map", "isEmpty", "()Z") {
+            return r;
+        }
+    }
     Ok(Some(Value::Int(if size == 0 { 1 } else { 0 })))
 }
 
@@ -6251,7 +6330,13 @@ fn native_hs_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     resync_view_set(ctx, this);
     let backing = match hs_backing_map(ctx, this) {
         Some(m) => m,
-        None => return Ok(Some(Value::Int(0))),
+        None => {
+            if let Some(r) = try_delegate_real_collection(ctx, this, "java/util/Set", "size", "()I")
+            {
+                return r;
+            }
+            return Ok(Some(Value::Int(0)));
+        }
     };
     let map_args = [Value::Object(Some(backing))];
     native_map_size(ctx, &map_args)
@@ -6265,7 +6350,14 @@ fn native_hs_is_empty(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     resync_view_set(ctx, this);
     let backing = match hs_backing_map(ctx, this) {
         Some(m) => m,
-        None => return Ok(Some(Value::Int(1))),
+        None => {
+            if let Some(r) =
+                try_delegate_real_collection(ctx, this, "java/util/Set", "isEmpty", "()Z")
+            {
+                return r;
+            }
+            return Ok(Some(Value::Int(1)));
+        }
     };
     let map_args = [Value::Object(Some(backing))];
     native_map_is_empty(ctx, &map_args)
@@ -7847,6 +7939,13 @@ fn native_collections_singleton_list(
     args: &[Value],
 ) -> MethodCallResult {
     let val = args.first().copied().unwrap_or(Value::Object(None));
+    // Real-JDK: return a real `Collections$SingletonList` (its size/get/iterator
+    // run real bytecode; size/isEmpty reach the interface natives which delegate
+    // back to it). Falls back to a synthetic 1-element ArrayList if unavailable.
+    if let Some(o) = alloc_real_jdk(ctx, "java/util/Collections$SingletonList") {
+        ctx.set_field_by_name(o, "element", val);
+        return Ok(Some(Value::Object(Some(o))));
+    }
     let __al_n_fields = al_slots(ctx).2;
     let list = alloc_synthetic(ctx, "java/util/ArrayList", __al_n_fields);
     let arr = alloc_ref_array(ctx, 1);
@@ -28849,6 +28948,11 @@ fn native_collections_empty_iterator(
 
 fn native_collections_singleton(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let elem = args.first().cloned().unwrap_or(Value::Object(None));
+    // Real-JDK: a real `Collections$SingletonSet` (field `element`).
+    if let Some(o) = alloc_real_jdk(ctx, "java/util/Collections$SingletonSet") {
+        ctx.set_field_by_name(o, "element", elem);
+        return Ok(Some(Value::Object(Some(o))));
+    }
     let set = alloc_synthetic(ctx, "java/util/HashSet", HS_NUM_FIELDS);
     let inner_map = alloc_backing_map(ctx);
     native_map_init(ctx, &[Value::Object(Some(inner_map))])?;
@@ -28867,6 +28971,12 @@ fn native_collections_singleton_map(
 ) -> MethodCallResult {
     let key = args.first().cloned().unwrap_or(Value::Object(None));
     let val = args.get(1).cloned().unwrap_or(Value::Object(None));
+    // Real-JDK: a real `Collections$SingletonMap` (fields `k`, `v`).
+    if let Some(o) = alloc_real_jdk(ctx, "java/util/Collections$SingletonMap") {
+        ctx.set_field_by_name(o, "k", key);
+        ctx.set_field_by_name(o, "v", val);
+        return Ok(Some(Value::Object(Some(o))));
+    }
     let map = alloc_backing_map(ctx);
     native_map_init(ctx, &[Value::Object(Some(map))])?;
     native_map_put(ctx, &[Value::Object(Some(map)), key, val])?;
@@ -30307,6 +30417,32 @@ fn native_spliterators_empty(ctx: &mut dyn NativeContext, _args: &[Value]) -> Me
 }
 
 fn native_empty_iterator(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    // In the JDK, `Collections.emptyIterator()` is literally
+    // `(Iterator<T>) EmptyIterator.EMPTY_ITERATOR`, so
+    // `emptyIterator() == emptyIterator()` holds by identity. Code relies on
+    // that: Hibernate's StatelessSession persistence-context "is-cleared" check
+    // asserts `managedEntitiesIterator() == Collections.emptyIterator()`.
+    // Allocating a fresh `EmptyIterator` per call broke the identity (cf.
+    // `collections_empty_singleton` for EMPTY_LIST/MAP/SET). Return the real
+    // `Collections$EmptyIterator.EMPTY_ITERATOR` singleton when available.
+    let _ = ctx.ensure_class_initialized("java/util/Collections$EmptyIterator");
+    if let Some(cid) = ctx.class_id_by_name("java/util/Collections$EmptyIterator") {
+        if let Some(idx) = ctx.static_field_index_by_name(cid, "EMPTY_ITERATOR") {
+            if let v @ Value::Object(Some(_)) = ctx.get_static_field(cid, idx) {
+                return Ok(Some(v));
+            }
+            // Field present but not yet populated: lazily allocate the singleton,
+            // store it in the static field (GC-rooted, so it survives
+            // relocation), and return it so all callers share one instance.
+            let arr = alloc_ref_array(ctx, 0);
+            let itr = alloc_synthetic(ctx, "java/util/Collections$EmptyIterator", 2);
+            ctx.set_field(itr, 0, Value::Object(Some(arr)));
+            ctx.set_field(itr, 1, Value::Int(0));
+            ctx.set_static_field(cid, idx, Value::Object(Some(itr)));
+            return Ok(Some(Value::Object(Some(itr))));
+        }
+    }
+    // Fallback (class/field unavailable): fresh synthetic empty iterator.
     let arr = alloc_ref_array(ctx, 0);
     let itr = alloc_synthetic(ctx, "java/util/Collections$EmptyIterator", 2);
     ctx.set_field(itr, 0, Value::Object(Some(arr)));

@@ -1,99 +1,92 @@
 ---
 name: spring-boot-groovy-indy-mockito-mock-dispatch
-description: OPEN. The last layer of SpringRepositoriesExtensionTests. After fixing the indy guard AIOOBE (3c) and the void-target poly-invoke underflow (3d), the test runs cleanly (3/11 pass, no crashes) but 8 tests fail "expected size N but was 0": a Groovy invokedynamic call (`this.repositories.maven { … }`) on a Mockito mock never drives the stubbed answer, so the repositories list stays empty.
+description: PARTIAL. SpringRepositoriesExtensionTests tail. After 3c/3d (indy guard AIOOBE + void poly-invoke) and 3e (Groovy-truth cast:(Object)Z) and 3f (filterArguments closure→SAM coercion) were all FIXED, the test sits at 4/11. Two layers remain OPEN: (g) the Groovy-generated SAM proxy's execute() throws NoSuchMethodError (proxy method→InvocationHandler dispatch), and (h) closure→Action coercion on a Mockito mock drives no interaction.
 metadata:
   type: known-issue
-  area: invoke, groovy, indy, mockito
+  area: invoke, groovy, indy, proxy, mockito
 ---
 
-# SpringRepos layer 3e — Groovy indy call on a Mockito mock records no interaction
+# SpringRepos tail — Groovy closure→SAM proxy dispatch + Mockito-mock SAM coercion
 
-**Status:** 🔴 OPEN. The **last** blocker for
+**Status:** 🟡 PARTIAL — `4/11` and climbing.
 `org.springframework.boot.build.groovyscripts.SpringRepositoriesExtensionTests`
-(Spring Boot buildSrc). Previous layers (1, 2, 3, 3b, 3c, 3d) are all FIXED — see
-[[spring-boot-groovy-indy-runtime-argcount-3c-FIXED]] and
+(Spring Boot buildSrc). The earlier layers are all FIXED; see
+[[spring-boot-groovy-indy-runtime-argcount-3c-FIXED]],
+[[reference_springrepos_indy_3c_3d_guardwithtest]], and
 [[springrepos-extension-hang-jit-throughput-and-deep-recursion]].
 
-## Where it stands
-With the 3c/3d fixes (branch `fix/springrepos-indy-3c`, merged to dev), the test
-no longer crashes:
+## Layer ledger (this test)
+| Layer | Bug | Status |
+|---|---|---|
+| 1 | ANTLR JIT miscompile → parse NPE | ✅ FIXED (JIT ban) |
+| 2 | TypeVariable resolution → Mockito generics | ✅ FIXED |
+| 3/3b | MethodHandle.type() receiver + insertArguments/asCollector arity | ✅ FIXED |
+| 3c | `guardWithTest` dropped receiver → `sameClasses` AIOOBE | ✅ FIXED+MERGED (`5d36c432`) |
+| 3d | Object-returning poly-invoke of a `void` target → operand-stack underflow | ✅ FIXED+MERGED (`5d36c432`) |
+| 3e | Groovy truth: `cast:(Object)Z` not routed through `asBoolean` → falsy non-null read as true | ✅ FIXED (`cd4bfb27`, route to `DefaultTypeTransformation.castToBoolean`) |
+| 3f | `MethodHandles.filterArguments` was a passthrough → closure→SAM coercion never ran | ✅ FIXED (`1b1f8cde`, real `MH_KIND_FILTER`) |
+| **g** | **Generated SAM proxy's `execute()` → `NoSuchMethodError`** | 🔴 OPEN |
+| **h** | **closure→Action coercion on a Mockito mock drives no interaction** | 🔴 OPEN |
+
+Net: `0/11` (all crashed) → **`4/11`** clean. The 4 passing are the empty/false-
+condition cases; the 7 failing all need `maven.mavenContent { }` / `maven.content
+{ }` / `maven.credentials { }` (closures coerced to a Gradle `Action`) to drive
+their Mockito stubs, which they don't yet.
+
+## Layer g — SAM proxy `execute()` → NoSuchMethodError
+With 3f, Groovy's `TypeTransformers.createSAMTransform` now runs and wraps the
+`Closure` in a JDK dynamic proxy implementing `Action` (`jdk/proxy1/$Proxy0`).
+But invoking the SAM method on it fails:
 
 ```
-JUNIT_RESULT tests=11 passed=3 failed=8 skipped=0 aborted=0
+NoSuchMethodError: jdk/proxy1/$Proxy0.execute(Ljava/lang/Object;)V
+  caller: SamRealProbe$RealSink.mavenContent(Lorg/gradle/api/Action;)V
 ```
 
-The 3 passing are exactly the `assertThat(this.repositories).isEmpty()` cases.
-All 8 failures are the same shape:
+So CratonVM resolves `execute` as a concrete method on the generated proxy class
+and finds none, instead of routing the call to the proxy's `InvocationHandler`
+(Groovy's `ConvertedClosure`, which would call `closure.call(args)`). This is a
+`java.lang.reflect.Proxy` method-dispatch gap for proxies whose interface method
+is invoked from compiled Java/Groovy (cf. [[reference_proxy_realsuper_soak]]).
+Repro: `docs/internal/repros/springrepos-indy-3c/SamRealProbe.java` (real, non-
+mock `Action` sink).
 
-```
-java.lang.AssertionError: Expected size: 3 but was: 0 in: []
-  at ...SpringRepositoriesExtensionTests.mavenRepositoriesWhenCommercialSnapshot(...)
-```
-
-## Mechanism
-`createExtension` (test) builds a **Mockito mock** `RepositoryHandler` and stubs:
-
-```java
-RepositoryHandler repositoryHandler = mock(RepositoryHandler.class);
-given(repositoryHandler.maven(any(Closure.class))).willAnswer(this::mavenClosure);
-```
-
-`mavenClosure` runs the passed closure against a mock `MavenArtifactRepository`
-and `this.repositories.add(repository)`. The Groovy under test
-(`SpringRepositorySupport.groovy` → `SpringRepositoriesExtension.addRepository`)
-does:
-
-```groovy
-this.repositories.maven { maven -> maven.setName(name); maven.setUrl(url); … }
-```
-
-`this.repositories` is the mock; `maven { … }` is a Groovy **invokedynamic** call
-with a `Closure` argument. For the list to fill, that call must reach the mock's
-`maven(Closure)` and Mockito's interceptor must record/answer it. It doesn't —
-`this.repositories` stays empty, so `mavenClosure` is never invoked (the mock
-`repository` would be `add`ed unconditionally even if the closure body no-op'd,
-so the answer itself is not firing).
-
-## Candidate root causes (in priority order)
-1. **Overload selection.** Gradle's `RepositoryHandler` has both `maven(Closure)`
-   and `maven(Action)`. Groovy `selectMethod` may resolve the call to
-   `maven(Action)` (closures coerce to `Action`), which is NOT the stubbed
-   overload, so Mockito returns the default (`null`) and records nothing the test
-   verifies. Check which `maven` overload CratonVM's `Selector`/metaclass picks
-   for a `Closure` argument vs HotSpot.
-2. **Mockito interception bypass.** A Mockito mock is a ByteBuddy subclass whose
-   overridden methods call the `MockMethodInterceptor`. If CratonVM's Groovy-indy
-   dispatch invokes the resolved method via a path that bypasses the subclass
-   override (e.g. `invokespecial` on the declaring interface/class, or a direct
-   metamethod handle bound to the wrong target), the interceptor never runs.
-   Verify that a virtual indy dispatch on a Mockito mock hits the ByteBuddy
-   override (compare with a plain `mock.maven(closure)` from Java, which works).
-3. **Closure → mock argument-matcher mismatch.** `any(Closure.class)` must match
-   the actual argument CratonVM passes. If the closure object isn't recognized as
-   a `groovy.lang.Closure` instance by the matcher, the stub won't apply.
+## Layer h — closure→Action on a Mockito mock
+`docs/internal/repros/springrepos-indy-3c/SamCoerceProbe.java`: `repo.mavenContent
+{ }` where `repo = mock(MavenArtifactRepository.class)` and
+`given(repo.mavenContent(any(Action.class)))` is stubbed. On CratonVM the stub is
+never driven (`fired=0`), so the test's `mavenContent`/`content`/`credentials`
+descriptors stay empty → `verify(mavenContent.get(0))…` throws
+`ArrayIndexOutOfBoundsException`. Either the closure→Action coercion isn't applied
+on the mock-targeted call (so no/ wrong-typed arg), or the coerced `Action` call
+doesn't reach Mockito's ByteBuddy interceptor. Note the plain `maven(Closure)`
+overload on the same mock DOES fire (it has a `Closure` overload, no coercion
+needed), so basic Mockito interception works — the gap is specific to the
+SAM-coerced path.
 
 ## How to reproduce
 ```bash
-CV=<cvindy3c.exe or current dev build>
-JH="C:/Program Files/Java/jdk-25"
+CV=<cvindy3c.exe>; JH="C:/Program Files/Java/jdk-25"
 cd apps/spring-boot/buildSrc; CP="runner;$(cat test-classpath.txt)"
 CRATONVM_DISABLE_DEFAULT_WATCHDOG=1 "$CV" --java-home "$JH" --nojit -cp "$CP" \
   RunJUnit org.springframework.boot.build.groovyscripts.SpringRepositoriesExtensionTests
-# expect: tests=11 passed=3 failed=8 (all failures "Expected size: N but was: 0")
+# tests=11 passed=4 failed=7; failures = ArrayIndexOutOfBoundsException at verify(...get(0))
+# Isolated: "$CV" ... -cp "$CP" SamRealProbe   (layer g: proxy.execute NoSuchMethodError)
+#           "$CV" ... -cp "$CP" SamCoerceProbe (layer h: mock fired=0)
 ```
 
-**Recommended next probe:** a Groovy-free-ish Java/Groovy repro that (a) creates
-`mock(RepositoryHandler.class)`, stubs `maven(any(Closure.class))`, and (b)
-invokes `mock.maven(someClosure)` once via a Groovy indy call site and once via a
-direct Java call — assert both record the interaction. That isolates whether the
-miss is overload selection (1/3) or interception bypass (2). Decompile the
-relevant `maven` overloads on `RepositoryHandler` (and Gradle's
-`ArtifactRepositoryContainer`) to confirm the `Closure` overload exists and its
-exact signature.
+## Where to look
+- Proxy dispatch: `java/lang/reflect/Proxy` handling in the interpreter / native
+  proxy generation (does the generated `$ProxyN` route interface methods to its
+  `InvocationHandler`? `execute` must reach `ConvertedClosure.invoke`).
+- SAM transform: Groovy `org/codehaus/groovy/vmplugin/v8/TypeTransformers`
+  (`createSAMTransform`, `TO_REFLECTIVE_PROXY`/`TO_GENERATED_PROXY`,
+  `ProxyGenerator`).
+- Combinators: `native-builtins/src/lang_invoke.rs` (`MH_KIND_FILTER` /
+  `mh_dispatch_filter` landed in 3f).
 
 ## Tools / artifacts
-- Test: `apps/spring-boot/buildSrc/src/test/.../SpringRepositoriesExtensionTests.java`
-- Groovy under test: `apps/spring-boot/buildSrc/SpringRepositorySupport.groovy`
-- buildSrc tree is gitignored; runner probes live in `apps/spring-boot/buildSrc/runner/`.
-- Indy guard combinators: `native-builtins/src/lang_invoke.rs`
-  (`mhs_guard_with_test`, `mh_dispatch` arms, `auto_box_return`).
+Probes (all under `docs/internal/repros/springrepos-indy-3c/`): `SamRealProbe`
+(layer g), `SamCoerceProbe` (layer h); plus the 3e probes `CastProbe`/`NegProbe`/
+`BoolReturnProbe`/`DttProbe` (== HotSpot). buildSrc tree is gitignored; runner
+copies live in `apps/spring-boot/buildSrc/runner/`.

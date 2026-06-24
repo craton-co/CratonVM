@@ -38,8 +38,9 @@ pub use heap_types::{
 pub use intern::{intern, intern_arc, StringPool};
 pub use value::{
     decode_value, encode_value, is_object_tag, jlong_bits_as_aligned_object_ptr,
-    read_value_atomic, write_value_atomic, ObjectRef, Value, VTAG_DOUBLE, VTAG_FLOAT, VTAG_INT,
-    VTAG_LONG, VTAG_NULL, VTAG_OBJECT, VTAG_RETADDR, VTAG_UNINIT,
+    read_value_atomic, read_value_checked, write_value_atomic, ObjectRef, Value,
+    VALUE_MAX_DISCRIMINANT, VTAG_DOUBLE, VTAG_FLOAT, VTAG_INT, VTAG_LONG, VTAG_NULL, VTAG_OBJECT,
+    VTAG_RETADDR, VTAG_UNINIT,
 };
 
 #[cfg(test)]

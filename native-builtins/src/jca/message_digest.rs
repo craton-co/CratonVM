@@ -468,6 +468,11 @@ fn algorithm_supported(algo: &str) -> bool {
             | "SHA256"
             | "SHA384"
             | "SHA512"
+            // FIPS 180-4 §5.3.6 truncated SHA-512 variants (RFC 7616 DIGEST
+            // auth offers SHA-512-256). The alphanumeric-only normalise above
+            // collapses "SHA-512/256" → "SHA512256", "SHA-512/224" → "SHA512224".
+            | "SHA512224"
+            | "SHA512256"
             | "SHA3224"
             | "SHA3256"
             | "SHA3384"
@@ -484,8 +489,8 @@ fn digest_length_bytes(algo: &str) -> usize {
     match normalised.as_str() {
         "MD5" => 16,
         "SHA" | "SHA1" => 20,
-        "SHA224" | "SHA3224" => 28,
-        "SHA256" | "SHA3256" => 32,
+        "SHA224" | "SHA3224" | "SHA512224" => 28,
+        "SHA256" | "SHA3256" | "SHA512256" => 32,
         "SHA384" | "SHA3384" => 48,
         "SHA512" | "SHA3512" => 64,
         _ => 32,
@@ -554,7 +559,8 @@ mod tests {
     fn algorithm_supported_accepts_known_set() {
         for algo in [
             "MD5", "md5", "SHA-1", "SHA1", "SHA-224", "sha-224", "SHA224", "SHA-256", "SHA256",
-            "SHA-384", "SHA-512", "SHA3-224", "SHA3-256", "SHA3-384", "SHA3-512",
+            "SHA-384", "SHA-512", "SHA-512/224", "SHA-512/256", "sha-512/256", "SHA3-224",
+            "SHA3-256", "SHA3-384", "SHA3-512",
         ] {
             assert!(algorithm_supported(algo), "{algo} should be supported");
         }
@@ -576,6 +582,8 @@ mod tests {
         assert_eq!(digest_length_bytes("SHA-256"), 32);
         assert_eq!(digest_length_bytes("SHA-384"), 48);
         assert_eq!(digest_length_bytes("SHA-512"), 64);
+        assert_eq!(digest_length_bytes("SHA-512/224"), 28);
+        assert_eq!(digest_length_bytes("SHA-512/256"), 32);
         assert_eq!(digest_length_bytes("SHA3-256"), 32);
         assert_eq!(digest_length_bytes("SHA3-384"), 48);
         assert_eq!(digest_length_bytes("SHA3-512"), 64);
@@ -605,6 +613,37 @@ mod tests {
         assert_eq!(
             hex(compute_digest("SHA3-224", b"hello world")),
             "dfb7f18c77e928bb56faeb2da27291bd790bc1045cde45f3210bb6c5"
+        );
+    }
+
+    #[test]
+    fn compute_digest_sha512_truncated_matches_fips_vectors() {
+        // FIPS 180-4 §5.3.6 truncated SHA-512 variants. The "/256" and "/224"
+        // spellings exercise the alphanumeric/slash normalisation. These are
+        // the published FIPS example vectors for the one-block "abc" message
+        // and the empty input — both distinct from SHA-256/SHA-224 (the whole
+        // point of the alternate IV).
+        let hex = |h: Vec<u8>| -> String { h.iter().map(|b| format!("{b:02x}")).collect() };
+        assert_eq!(
+            hex(compute_digest("SHA-512/256", b"abc")),
+            "53048e2681941ef99b2e29b76b4c7dabe4c2d0c634fc6d46e0e2f13107e7af23"
+        );
+        assert_eq!(
+            hex(compute_digest("SHA-512/256", b"")),
+            "c672b8d1ef56ed28ab87c3622c5114069bdd3ad7b8f9737498d0c01ecef0967a"
+        );
+        assert_eq!(
+            hex(compute_digest("SHA-512/224", b"abc")),
+            "4634270f707b6a54daae7530460842e20e37ed265ceee9a43e8924aa"
+        );
+        assert_eq!(
+            hex(compute_digest("SHA-512/224", b"")),
+            "6ed0dd02806fa89e25de060c19d3ac86cabb87d6a0ddd05c333b84f4"
+        );
+        // Confirm SHA-512/256 ≠ SHA-256 (alternate IV, not a plain truncation).
+        assert_ne!(
+            hex(compute_digest("SHA-512/256", b"abc")),
+            hex(compute_digest("SHA-256", b"abc"))
         );
     }
 }

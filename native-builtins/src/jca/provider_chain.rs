@@ -68,8 +68,8 @@ use crate::{alloc_concurrent_synthetic, obj_arg};
 const COVERAGE_UNBACKED: &str =
     "coverage: none — placeholder provider for legacy app compatibility, no Service map registered";
 const COVERAGE_SUN: &str =
-    "coverage: MessageDigest{MD5,SHA-1,SHA-256,SHA-384,SHA-512,SHA3-256,SHA3-384,SHA3-512}, \
-     SecureRandom";
+    "coverage: MessageDigest{MD5,SHA-1,SHA-224,SHA-256,SHA-384,SHA-512,SHA-512/224,SHA-512/256,\
+     SHA3-224,SHA3-256,SHA3-384,SHA3-512}, SecureRandom";
 const COVERAGE_SUN_RSA_SIGN: &str = "coverage: KeyPairGenerator{RSA}, KeyFactory{RSA}, \
      Signature{SHA1withRSA,SHA256withRSA,SHA384withRSA,SHA512withRSA}";
 const COVERAGE_SUN_JCE: &str =

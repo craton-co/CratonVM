@@ -553,6 +553,28 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
         "emptyIterator",
         "()Ljava/util/Iterator;",
         |ctx, _args| {
+            // `Collections.emptyIterator()` is `(Iterator<T>) EmptyIterator.EMPTY_ITERATOR`
+            // in the JDK, so `emptyIterator() == emptyIterator()` holds by identity.
+            // Hibernate's StatelessSession "is-cleared" check asserts
+            // `managedEntitiesIterator() == Collections.emptyIterator()`; a fresh
+            // instance per call broke it. Return the process-wide singleton stored
+            // in the (GC-rooted) `EMPTY_ITERATOR` static field, lazily populating it
+            // on first use (cf. `Collections.EMPTY_MAP`).
+            // Initialize the class FIRST so its `class_id` resolves even on a
+            // cold start (the native intercepts `emptyIterator()` before any
+            // bytecode that would otherwise load `EmptyIterator`).
+            let _ = ctx.ensure_class_initialized("java/util/Collections$EmptyIterator");
+            if let Some(cid) = ctx.class_id_by_name("java/util/Collections$EmptyIterator") {
+                if let Some(idx) = ctx.static_field_index_by_name(cid, "EMPTY_ITERATOR") {
+                    if let v @ Value::Object(Some(_)) = ctx.get_static_field(cid, idx) {
+                        return Ok(Some(v));
+                    }
+                    let itr =
+                        alloc_concurrent_synthetic(ctx, "java/util/Collections$EmptyIterator", 0);
+                    ctx.set_static_field(cid, idx, Value::Object(Some(itr)));
+                    return Ok(Some(Value::Object(Some(itr))));
+                }
+            }
             let iter = alloc_concurrent_synthetic(ctx, "java/util/Collections$EmptyIterator", 0);
             Ok(Some(Value::Object(Some(iter))))
         },

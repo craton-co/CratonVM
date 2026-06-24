@@ -1,5 +1,21 @@
 # HIB-CV-31 — `AbstractMethodError: ... has no Code attribute` (interface method dispatch resolves to the abstract method)
 
+> **✅ FIXED on dev (`c9258e17`, branch `fix/gc-young-sweep-corruptor`, 2026-06-23).**
+> Re-classified (NOT an itable/dispatch defect): a mis-attributed cascade over the
+> HIB-CV-32 BLOB-bind corruption. Two fixes landed:
+> 1. **Masking defect** (`vm/src/runtime/interpreter.rs`): `try_lambda_dispatch`'s
+>    retry-on-interface guard fired for *any* `NoSuchMethodError`, including one
+>    raised deep inside a running `onFlush` body (`Object.read()I` on a corrupt
+>    `InputStream`), re-dispatching the SAM onto the abstract interface → bogus
+>    `AbstractMethodError`. Now the retry fires only when the NSME names the SAM's
+>    own `(receiver_class, member_name)`; genuine in-body errors propagate.
+> 2. **Root corruption** (== HIB-CV-32): the GC young-sweep corruptor — fixed in
+>    `gen_heap.rs` (see HIB-CV-22/32/33).
+> Verified: lambda dispatch smoke test (method-ref `BiConsumer`, `forEach`) passes
+> under JIT and `--nojit`; GC fix via `NatPressure` + bt16/bt18. *(Full Hibernate
+> e2e blocked on current dev by separate pre-existing JPMS empty-package + bootstrap
+> stack-overflow bugs.)*
+
 **Run:** full Hibernate ORM suite, 2026-06-22/23
 **Binary:** `cvhibtest.exe` (dev `c863b23e`)
 **Severity:** High — wrong virtual/interface dispatch (correctness); **deterministic, `--nojit`**, HotSpot PASS

@@ -49,6 +49,13 @@ public class GetClassProbe {
     System.out.println("unmodSet=" + c(Collections.unmodifiableSet(new HashSet<>(Set.of(1)))));
     System.out.println("unmodMap=" + c(Collections.unmodifiableMap(new HashMap<>(Map.of(1, 2)))));
     System.out.println("unmodColl=" + c(Collections.unmodifiableCollection(new ArrayList<>(List.of(1)))));
+    // Real-JDK singleton family — class + behavior (size must be 1 via the
+    // interface-native delegation to real bytecode).
+    java.util.List<Integer> sl = Collections.singletonList(7);
+    System.out.println("singletonList=" + c(sl) + "|sz=" + sl.size() + "|get=" + sl.get(0));
+    System.out.println("singletonSet=" + c(Collections.singleton(5)) + "|sz=" + Collections.singleton(5).size());
+    java.util.Map<Integer,Integer> sm = Collections.singletonMap(3, 30);
+    System.out.println("singletonMap=" + c(sm) + "|sz=" + sm.size() + "|get=" + sm.get(3));
     System.out.println("fs=" + c(FileSystems.getDefault()));
     URLConnection jc = URI.create("jar:file:/none.jar!/x").toURL().openConnection();
     System.out.println("jarConn=" + c(jc));
@@ -221,6 +228,17 @@ fn getclass_reports_concrete_classes() {
     assert_eq!(
         line("unmodColl="),
         "java.util.Collections$UnmodifiableCollection"
+    );
+    // Real-JDK singletons: concrete class AND correct behavior (size==1, the
+    // proof that the interface-native delegation to real bytecode works).
+    assert_eq!(
+        line("singletonList="),
+        "java.util.Collections$SingletonList|sz=1|get=7"
+    );
+    assert_eq!(line("singletonSet="), "java.util.Collections$SingletonSet|sz=1");
+    assert_eq!(
+        line("singletonMap="),
+        "java.util.Collections$SingletonMap|sz=1|get=30"
     );
     assert_eq!(
         line("jarConn="),
