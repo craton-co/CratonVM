@@ -1371,5 +1371,102 @@ pub fn register(registry: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(arr))))
         },
     );
+
+    // sun.util.locale.provider.LocaleResources.getDateTimePattern(int timeStyle,
+    // int dateStyle, Calendar cal) → String.  The real-JDK body fetches the
+    // date/time pattern arrays through `LocaleData.getDateFormatData(locale)` →
+    // `sun.util.resources.Bundles.of(...)`, the jdk.localedata class-based
+    // resource path CratonVM does not surface (same gap as BreakIterator /
+    // getDecimalFormatSymbolsData), so it returns a **null** pattern. The caller
+    // `DateFormatProviderImpl.getInstance` then does `new SimpleDateFormat(null,
+    // locale)` → `applyPatternImpl(null)` → `compile(null)` → NPE
+    // ("Cannot invoke String.length() because pattern is null"). This is the
+    // root of BUG-15: it breaks MessageFormat's `{n,date}` / `{n,time}` typed
+    // elements (Spring StaticMessageSource → MessageFormat) and the
+    // `DateFormat.get{Date,Time,DateTime}Instance` style factories (Spring
+    // DateFormatter style/ISO-less path, property/date editors).
+    //
+    // Answer directly from the same 9-slot en-US DateTimePatterns table
+    // `populate_format_data_en` uses (4 time FULL/LONG/MEDIUM/SHORT, 4 date
+    // FULL/LONG/MEDIUM/SHORT, combiner "{1} {0}"). Styles are
+    // FULL=0/LONG=1/MEDIUM=2/SHORT=3; a negative style means "no date" or "no
+    // time" (DateFormat.getDateInstance passes timeStyle=-1,
+    // getTimeInstance passes dateStyle=-1). With the real pattern in hand the
+    // downstream real-JDK `SimpleDateFormat` ctor + `format` run unchanged and
+    // match HotSpot. Locale-aware for the en / de families (the locales the
+    // Spring suite exercises); any other language falls back to en. Patterns
+    // are the exact JDK 25 CLDR forms (`\u{202f}` = the narrow no-break space
+    // CLDR puts before the am/pm marker); the date-time combiner is "{1}, {0}"
+    // (date + ", " + time). Consistent with the existing hardcoded
+    // `getNumberPatterns` / `getDecimalFormatSymbolsData` overrides.
+    registry.register(
+        "sun/util/locale/provider/LocaleResources",
+        "getDateTimePattern",
+        "(IILjava/util/Calendar;)Ljava/lang/String;",
+        |ctx, args| {
+            // Read this LocaleResources' `locale` field → language tag so we
+            // pick the right CLDR pattern family. Falls back to en when the
+            // field/getLanguage path yields nothing.
+            let lang = match args.first() {
+                Some(Value::Object(Some(this))) => {
+                    match ctx.get_field_by_name(*this, "locale") {
+                        Value::Object(Some(loc)) => match ctx.invoke_virtual(
+                            loc,
+                            "getLanguage",
+                            "()Ljava/lang/String;",
+                            &[],
+                        ) {
+                            Ok(Some(Value::Object(Some(s)))) => {
+                                ctx.read_string(s).unwrap_or_default()
+                            }
+                            _ => String::new(),
+                        },
+                        _ => String::new(),
+                    }
+                }
+                _ => String::new(),
+            };
+            // (time FULL/LONG/MEDIUM/SHORT, date FULL/LONG/MEDIUM/SHORT)
+            let (time, date): ([&str; 4], [&str; 4]) = if lang == "de" {
+                (
+                    ["HH:mm:ss zzzz", "HH:mm:ss z", "HH:mm:ss", "HH:mm"],
+                    ["EEEE, d. MMMM y", "d. MMMM y", "dd.MM.y", "dd.MM.yy"],
+                )
+            } else {
+                (
+                    [
+                        "h:mm:ss\u{202f}a zzzz",
+                        "h:mm:ss\u{202f}a z",
+                        "h:mm:ss\u{202f}a",
+                        "h:mm\u{202f}a",
+                    ],
+                    ["EEEE, MMMM d, y", "MMMM d, y", "MMM d, y", "M/d/yy"],
+                )
+            };
+            let style = |i: usize| -> i32 {
+                match args.get(i) {
+                    Some(Value::Int(n)) => *n,
+                    _ => -1,
+                }
+            };
+            let time_style = style(1);
+            let date_style = style(2);
+            let pick = |arr: &[&str; 4], s: i32| -> String {
+                // clamp out-of-range styles to MEDIUM rather than panic
+                let idx = if (0..=3).contains(&s) { s as usize } else { 2 };
+                arr[idx].to_string()
+            };
+            let pattern = match (date_style >= 0, time_style >= 0) {
+                // combiner "{1}, {0}" = datePattern + ", " + timePattern
+                (true, true) => format!("{}, {}", pick(&date, date_style), pick(&time, time_style)),
+                (true, false) => pick(&date, date_style),
+                (false, true) => pick(&time, time_style),
+                (false, false) => String::new(),
+            };
+            let s = ctx.create_string(&pattern);
+            Ok(Some(Value::Object(Some(s))))
+        },
+    );
+
     registry.set_category(__prev_cat);
 }
