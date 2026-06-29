@@ -15041,6 +15041,22 @@ fn execute_invoke_kind(
                         let header_bytes: [u8; 16] =
                             unsafe { std::ptr::read(obj_ref.as_ptr() as *const [u8; 16]) };
                         if header_bytes == [0u8; 16] {
+                            // BUG-03 probe (gated CRATONVM_DBG_BUG03): when a stale
+                            // (all-zero) invokevirtual receiver is seen, compare it to
+                            // THIS thread's java_thread_obj field and the registry's
+                            // remapped mirror — pinpoints whether the staleness is in
+                            // the operand-stack copy, the per-thread field, or the
+                            // registry (the moving-GC concurrent-spawn reclamation).
+                            if std::env::var_os("CRATONVM_DBG_BUG03").is_some() {
+                                let field = thread.java_thread_obj.map(|o| o.as_ptr() as usize).unwrap_or(0);
+                                let reg = shared.thread_registry.java_thread_obj(thread.thread_id)
+                                    .map(|o| o.as_ptr() as usize).unwrap_or(0);
+                                eprintln!(
+                                    "[BUG03] stale recv={:p} on tid={} method={}.{} | java_thread_obj-field=0x{:x} registry-mirror=0x{:x} (field==recv:{} reg==recv:{})",
+                                    obj_ref.as_ptr(), thread.thread_id.0, &*method_class_name, &*method_name,
+                                    field, reg, field == obj_ref.as_ptr() as usize, reg == obj_ref.as_ptr() as usize,
+                                );
+                            }
                             // "Zeroed-a-live-object" detector consumer
                             // (CRATONVM_DBG_SWEEP_ZERO): this receiver lost its
                             // header to the non-moving young sweep. Recover its

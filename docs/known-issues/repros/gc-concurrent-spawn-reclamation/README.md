@@ -41,6 +41,45 @@ All of these DO forward the thread mirror / fields across a moving GC, so the le
 - Blocked-thread snapshots — `fold_pointer_map_into_blocked`.
 - `fixup_object_fields` does NOT null unmapped refs (only rewrites forwarded ones), so old-gen refs aren't wrongly zeroed.
 
+## Decisive localization 2026-06-29 (fresh build, `CRATONVM_DBG_BUG03` probe)
+
+A targeted probe at the stale-receiver detection (interpreter.rs, gated
+`CRATONVM_DBG_BUG03`) compares the stale receiver against the holding thread's
+`java_thread_obj` field and the registry mirror. Result, **every run, on tid=0
+(main)**:
+
+```
+[BUG03] stale recv=0x..0530 on tid=0 method=java/lang/Thread.getThreadGroup
+        | java_thread_obj-field=0x..2998 registry-mirror=0x..2998
+        (field==recv:false reg==recv:false)
+```
+
+- **The `java_thread_obj` field AND the registry mirror are both FRESH and EQUAL**
+  (`0x..2998`) — they were correctly remapped across the GC that moved main's mirror.
+- **The stale value (`0x..0530`, all-zero/relocated) exists ONLY in the interpreter
+  frame** — the `parent` local (`= currentThread()`) / its operand-stack copy in
+  `Thread.<init>`.
+
+⇒ **This REFUTES hypotheses 1 and 3 below** (it is NOT the `thread_obj_for_spawn`
+capture, NOT `currentThread()`, NOT the registry). The narrowed root cause is a
+**frame-remap-coverage gap**: a moving GC (worker-initiated; reproduces with **n=1**,
+`CRATONVM_DBG_SWEEP_EDGES` silent, `NO_SELECTIVE_PROMOTE` no help) relocated main's
+mirror and updated the field + registry, but **main's interpreter frame was not
+remapped at that GC** — so the `parent` local was stranded at the old address and a
+later GC (whose pointer_map no longer contains the now-zeroed old address) can never
+recover it. The gap is a GC where main passes through **none** of the three frame-remap
+sites: `update_all_roots` (initiator), `apply_pointer_map_to_thread` (safepoint peer),
+`check_post_block_gc` (blocked-region wake) — most likely a native window during
+`Thread.start()`/`join()` where main is neither parked at the interpreter safepoint nor
+registered in the blocked-region protocol. **Next step:** add a per-GC, per-thread
+remap-coverage log (record which of the three paths runs for tid=0 each GC) and find the
+GC where main's frame is skipped; the fix is to ensure that window remaps main's frames
+(enter the blocked-region protocol around the native, or remap at native return).
+
+A start-path hardening was added regardless (worker reads its `java_thread_obj` from the
+remapped registry rather than the raw captured `thread_obj_for_spawn`, mirroring the
+existing thread-END fix) — correct, but the probe shows it is not this crash's cause.
+
 ## Leading hypotheses for the owner
 
 1. **A transient thread state with no remap site.** A thread that is mid-`Thread.start()` (the spawning thread) or a just-spawned worker in its bootstrap window may hold/own the mirror in a way that neither `update_all_roots` (initiator), `apply_pointer_map_to_thread` (parked), nor `check_post_block_gc` (blocked) covers — e.g. running native thread-setup code, or after `register`/`set_root_snapshot` but before the worker's first cooperative safepoint. The `thread_obj_for_spawn` raw `ObjectRef` captured at spawn (vm/src/vm/vm_exec.rs) is "captured … and NEVER remapped" by design (it reads back from the registry) — re-audit that read-back across *back-to-back* moving GCs.

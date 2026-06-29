@@ -3707,7 +3707,21 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             // Use the pre-created shared state
             jvm_thread.park_state = pre_park;
             jvm_thread.interrupted = pre_interrupted;
-            jvm_thread.java_thread_obj = Some(thread_obj_for_spawn);
+            // CRIT (stale-ref) — `thread_obj_for_spawn` is a raw ObjectRef captured
+            // on the PARENT at spawn and never remapped; a moving GC between the
+            // capture and this worker's startup relocates the Thread mirror, leaving
+            // the captured ref stale. The registry's `java_thread_obj` IS remapped
+            // after every GC (`update_thread_objs_after_gc`), so read the current
+            // address from there (the worker was `register`ed with this mirror on the
+            // parent before spawn), falling back to the captured ref only if absent.
+            // Mirrors the identical read-back already done at thread END (search
+            // `wake_obj`).
+            jvm_thread.java_thread_obj = Some(
+                shared_arc
+                    .thread_registry
+                    .java_thread_obj(tid)
+                    .unwrap_or(thread_obj_for_spawn),
+            );
             if is_virtual {
                 jvm_thread.kind = crate::threading::ThreadKind::Virtual;
                 // Acquire a carrier permit before executing (blocks if all carriers busy).
