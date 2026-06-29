@@ -888,6 +888,27 @@ impl ReferenceProcessor {
     pub fn cleaner_ref_count(&self) -> usize {
         self.cleaner_refs.len()
     }
+
+    /// HIB-CV-24 — `(reference_obj, referent)` for every Weak/Phantom reference
+    /// that is neither cleared nor already enqueued. Used by the VM's
+    /// before/after-GC referent fixup: the referent slots are nulled before a
+    /// collection (so the mark phase does NOT keep them alive through the live
+    /// Reference object), then survivors are restored afterwards. The addresses
+    /// are the processor's current (pre-collection) view; the caller must apply
+    /// the GC pointer map to locate the post-collection objects.
+    ///
+    /// SoftReferences are intentionally excluded — they stay strongly reachable
+    /// (kept alive) so soft-cache semantics are unchanged; only weak + phantom
+    /// references must allow their referent to be reclaimed.
+    pub fn weak_phantom_active_pairs(&self) -> Vec<(usize, usize)> {
+        let mut v = Vec::with_capacity(self.weak_refs.len() + self.phantom_refs.len());
+        for e in self.weak_refs.iter().chain(self.phantom_refs.iter()) {
+            if !e.cleared && !e.enqueued {
+                v.push((e.reference_obj, e.referent));
+            }
+        }
+        v
+    }
 }
 
 impl Default for ReferenceProcessor {

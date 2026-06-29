@@ -3071,6 +3071,12 @@ impl GenerationalHeap {
         // `deferred_dirty_cards` declared above (before Phase 1b); both the
         // dirty-card fixup and the promoted-object scan accumulate into it.
 
+        // HIB-CV-24: a live object keeps its class's defining ClassLoader alive
+        // (the instance→loader edge HotSpot gets via `Class.getClassLoader`).
+        // Cached once; `false` (and the registry's empty short-circuit) makes the
+        // per-object lookup below a no-op for the common no-custom-loader case.
+        let loader_pin_on = cratonvm_types::loader_pin::loader_pinning_enabled();
+
         loop {
             let mut made_progress = false;
 
@@ -3084,6 +3090,9 @@ impl GenerationalHeap {
                 // SAFETY: `obj_ptr` points to a copied/promoted object with a valid header.
                 let header = unsafe { &*(obj_ptr as *const ObjectHeader) };
                 let total_size = gen_object_total_size(header);
+                // HIB-CV-24: capture the class id before any forwarding may grow
+                // young_to (which would invalidate `header`).
+                let cid = header.class_id.as_u32();
 
                 // Scan/forward ref slots. Ref arrays + compact objects store
                 // 8-byte pointers; legacy objects store 16-byte Value cells.
@@ -3105,6 +3114,28 @@ impl GenerationalHeap {
                             None
                         }
                     });
+                }
+
+                // HIB-CV-24: keep this object's defining ClassLoader alive. If the
+                // loader is a young object, evacuate it like any other survivor so
+                // a live instance pins its loader (else a leaked instance's loader
+                // would be wrongly reclaimed once the side-table stops rooting it).
+                if loader_pin_on {
+                    if let Some(loader_old) = cratonvm_types::loader_pin::loader_pin_addr(cid) {
+                        let lp = loader_old as *mut u8;
+                        if young_from.contains(lp) {
+                            Self::forward_object(
+                                &young_from,
+                                &mut young_to,
+                                &mut old_gen,
+                                lp,
+                                &mut objects_copied,
+                                &mut pointer_map,
+                                &mut promoted_worklist,
+                                force_promote_all,
+                            );
+                        }
+                    }
                 }
 
                 scan_cursor += total_size;
@@ -3133,6 +3164,8 @@ impl GenerationalHeap {
                 // pushed only when `forward_object` confirmed the allocation
                 // landed in `old_gen`), with a valid copied header.
                 let header = unsafe { &*(obj_ptr as *const ObjectHeader) };
+                // HIB-CV-24: capture class id before forwarding may grow young_to.
+                let promoted_cid = header.class_id.as_u32();
 
                 // Scan/forward ref slots (ref arrays + compact objects use
                 // 8-byte pointers; legacy objects use 16-byte Value cells). A
@@ -3165,6 +3198,33 @@ impl GenerationalHeap {
                             None
                         }
                     });
+                }
+
+                // HIB-CV-24: keep this promoted object's defining ClassLoader
+                // alive (instance→loader). A young loader is evacuated; if it
+                // stays in young to-space it is an old→young edge, so defer-mark
+                // this object's card like the ref-slot case above.
+                if loader_pin_on {
+                    if let Some(loader_old) =
+                        cratonvm_types::loader_pin::loader_pin_addr(promoted_cid)
+                    {
+                        let lp = loader_old as *mut u8;
+                        if young_from.contains(lp) {
+                            let new_lp = Self::forward_object(
+                                &young_from,
+                                &mut young_to,
+                                &mut old_gen,
+                                lp,
+                                &mut objects_copied,
+                                &mut pointer_map,
+                                &mut promoted_worklist,
+                                force_promote_all,
+                            );
+                            if !old_gen.contains(new_lp) {
+                                deferred_dirty_cards.push(obj_ptr as usize);
+                            }
+                        }
+                    }
                 }
             }
 
@@ -3797,6 +3857,9 @@ impl GenerationalHeap {
             }
         }
 
+        // HIB-CV-24: a live object keeps its class's defining ClassLoader alive
+        // (instance→loader). No-op for the common no-custom-loader case.
+        let loader_pin_on = cratonvm_types::loader_pin::loader_pinning_enabled();
         // BFS: transitively mark every young object reachable from a root.
         while let Some(obj_ptr) = worklist.pop() {
             // SAFETY: `obj_ptr` was validated by `mark_young` before being
@@ -3809,6 +3872,15 @@ impl GenerationalHeap {
                 for_each_ref_slot(obj_ptr, header, |ref_ptr, _| {
                     mark_young(ref_ptr, &mut worklist);
                 });
+            }
+            // HIB-CV-24: also mark this object's defining ClassLoader so a live
+            // (e.g. leaked-via-ThreadLocal) instance keeps its loader alive.
+            if loader_pin_on {
+                if let Some(loader_addr) =
+                    cratonvm_types::loader_pin::loader_pin_addr(header.class_id.as_u32())
+                {
+                    mark_young(loader_addr as *mut u8, &mut worklist);
+                }
             }
         }
 
@@ -5044,8 +5116,30 @@ impl GenerationalHeap {
         Self::mark_young_to_old_refs(young_from, old_gen, &mut worklist);
 
         // BFS: transitively mark all reachable old-gen objects
+        // HIB-CV-24: a live object keeps its class's defining ClassLoader alive
+        // (instance→loader). Conservative — only ever marks MORE live, so it can
+        // never free a still-referenced loader. Covers the old-gen instance →
+        // old-gen loader case (young loaders are already live as major-GC roots).
+        let loader_pin_on = cratonvm_types::loader_pin::loader_pinning_enabled();
         while let Some(obj_ptr) = worklist.pop() {
             Self::scan_object_for_old_refs(obj_ptr, old_gen, &mut worklist);
+            if loader_pin_on {
+                // SAFETY: `obj_ptr` is a marked old-gen object with a valid header.
+                let header = unsafe { &*(obj_ptr as *const ObjectHeader) };
+                if let Some(loader_addr) =
+                    cratonvm_types::loader_pin::loader_pin_addr(header.class_id.as_u32())
+                {
+                    let lp = loader_addr as *mut u8;
+                    if old_gen.contains(lp) {
+                        // SAFETY: `lp` is within old gen (verified by `contains`).
+                        let h = unsafe { &mut *(lp as *mut ObjectHeader) };
+                        if h.gc_flags & GC_FLAG_MARKED == 0 {
+                            h.gc_flags |= GC_FLAG_MARKED;
+                            worklist.push(lp);
+                        }
+                    }
+                }
+            }
         }
 
         // ---- Compact phase ---- sliding compaction of old gen ----
