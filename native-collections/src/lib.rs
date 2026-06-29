@@ -26468,20 +26468,17 @@ fn native_chm_key_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         _ => return Ok(Some(Value::Object(None))),
     };
     let keys = chm_collect_all_keys(ctx, this);
-    let set = alloc_synthetic(ctx, "java/util/HashSet", 1);
-    let backing = alloc_backing_map(ctx);
-    let cap = (keys.len() * 2)
-        .max(MAP_DEFAULT_CAPACITY)
-        .next_power_of_two();
-    let buckets = alloc_ref_array(ctx, cap);
-    ctx.set_field(backing, MAP_FIELD_BUCKETS, Value::Object(Some(buckets)));
-    set_map_size(ctx, backing, 0);
-    ctx.set_field(backing, MAP_FIELD_CAPACITY, Value::Int(cap as i32));
-    ctx.set_field(set, 0, Value::Object(Some(backing)));
-    let sentinel = Value::Object(Some(set)); // reuse set ref as sentinel value
-    for key in keys {
-        native_map_put(ctx, &[Value::Object(Some(backing)), key, sentinel])?;
-    }
+    // Live view: build the backing HashSet with a view-backing that remembers
+    // the source ConcurrentHashMap, so `keySet().remove(k)` /
+    // `keySet().iterator().remove()` / `keySet().removeIf(...)` write through to
+    // the map (matching the JDK's `KeySetView`). The previous detached-snapshot
+    // copy silently dropped such removals — e.g.
+    // `CachedIntrospectionResults.clearClassLoader` does
+    // `strongClassCache.keySet().removeIf(...)` and the entries were never
+    // evicted. Write-through dispatches via the map's own `remove` (see
+    // `source_map_remove`), which handles CHM; reads resync via
+    // `collect_keys_any`, which also handles CHM.
+    let set = make_view_set_of(ctx, this, VIEW_KIND_KEYSET, &keys)?;
     Ok(Some(Value::Object(Some(set))))
 }
 
