@@ -56,9 +56,9 @@
 //!     are held across the mark/sweep, so the collector can never deadlock on
 //!     a lock owned by a frozen thread.
 //!
-//! Gated behind `CRATONVM_XT_JIT_ROOT_SCAN=1` (default off) while it bakes;
-//! flipping the default to on (opt-out) is a one-line change in [`enabled`]
-//! once the app gauntlet has validated it.
+//! Default ON (opt-out): set `CRATONVM_XT_JIT_ROOT_SCAN=0` to disable. Flipped
+//! from default-off after it was validated to suppress the
+//! multi-thread-in-JIT-under-STW root gap on the Tomcat suite (see [`enabled`]).
 
 use crate::types::ObjectRef;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -71,8 +71,11 @@ pub static XT_ROOTS_FOUND: AtomicU64 = AtomicU64::new(0);
 
 /// Whether the cross-thread STW JIT root scan is enabled.
 ///
-/// Default OFF; set `CRATONVM_XT_JIT_ROOT_SCAN=1` to enable. (When the
-/// default is eventually flipped to on, this becomes an opt-OUT check.)
+/// Default ON (opt-OUT): set `CRATONVM_XT_JIT_ROOT_SCAN=0` (or `false`/`off`)
+/// to disable. Flipped to default-on after the cross-thread STW JIT root scan
+/// (BUG-03) was validated to suppress the multi-thread-in-JIT-under-STW root
+/// gap — e.g. it lets the Tomcat `TestHttpServletDoHead*` (HTTP/2) classes
+/// complete instead of dying with the `cross_thread_jit_gap` warning.
 #[inline]
 pub fn enabled() -> bool {
     static CACHE: AtomicU64 = AtomicU64::new(u64::MAX);
@@ -80,9 +83,10 @@ pub fn enabled() -> bool {
     if c != u64::MAX {
         return c == 1;
     }
-    let on = matches!(
+    // On unless explicitly disabled.
+    let on = !matches!(
         std::env::var("CRATONVM_XT_JIT_ROOT_SCAN").as_deref(),
-        Ok("1") | Ok("true") | Ok("on")
+        Ok("0") | Ok("false") | Ok("off")
     );
     CACHE.store(on as u64, Ordering::Relaxed);
     on
