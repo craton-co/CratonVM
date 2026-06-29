@@ -2868,14 +2868,29 @@ unsafe fn jit_typecheck_resolve(
     }
 
     // Array fallback: arrays with class_id 0 (e.g. from Array.newInstance via JIT)
-    // lack class hierarchy entries.  Any reference array is assignable to
-    // [Ljava/lang/Object; and any array is assignable to java/lang/Object,
-    // java/io/Serializable, or java/lang/Cloneable.
+    // lack class hierarchy entries.  EVERY array — primitive or reference — is an
+    // Object and implements Serializable + Cloneable.
+    //
+    // The `[Ljava/lang/Object;` case is the subtle one. Under `instanceof`
+    // (strict, `lenient == false`) only a *reference* array is an instance of
+    // `Object[]`: a primitive array such as `byte[]` is NOT — `byte[] instanceof
+    // Object[]` is `false`. The old code returned `true` here for *any* array,
+    // which made JIT-compiled `Arrays.deepHashCode` take its `instanceof Object[]`
+    // branch on a `byte[]` element, recurse `deepHashCode((Object[]) byteArray)`,
+    // and dereference the raw byte payload as object pointers → SIGSEGV during
+    // Hibernate jar/class scanning (BUG-scanning-crashes: JarVisitorTest /
+    // ScannerTest / PackagedEntityManagerTest / SimpleTests). Gating the strict
+    // path on the element kind fixes it. The lenient (`checkcast`) leniency is
+    // preserved unchanged (SBR-03 keeps native `Object[]`→`T[]` casts working).
     if vm.heap.kind_of(obj_ref) == cratonvm_types::ObjectKind::Array {
-        if class_name == "[Ljava/lang/Object;"
-            || class_name == "java/lang/Object"
+        if class_name == "java/lang/Object"
             || class_name == "java/io/Serializable"
             || class_name == "java/lang/Cloneable"
+        {
+            return true;
+        }
+        if class_name == "[Ljava/lang/Object;"
+            && (lenient || vm.heap.element_type_of(obj_ref) == ArrayElementType::Reference)
         {
             return true;
         }

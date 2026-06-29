@@ -1478,7 +1478,15 @@ fn register_uri_natives(r: &mut NativeMethodRegistry) {
         }
     });
 
-    // getSchemeSpecificPart() → everything after 'scheme:' (decoded)
+    // getSchemeSpecificPart() → everything after 'scheme:', percent-DECODED.
+    // The JDK returns the decoded scheme-specific part here (the raw form is
+    // `getRawSchemeSpecificPart()` below). Skipping the decode left `%20` (and
+    // other escapes) intact, so `new JarFile(uri.getSchemeSpecificPart())` in
+    // Hibernate's `JarFileBasedArchiveDescriptor` opened a non-existent
+    // `space%20par.par` instead of `space par.par` (PackagedEntityManagerTest
+    // testSpacePar: "Unable to locate persistence.xml"). Decode mirrors the
+    // already-correct `getPath()`. A path without escapes decodes to itself, so
+    // the Spring Boot launcher path (no `%`) is unaffected.
     r.register(
         uri,
         "getSchemeSpecificPart",
@@ -1491,7 +1499,8 @@ fn register_uri_natives(r: &mut NativeMethodRegistry) {
             } else {
                 raw.clone()
             };
-            Ok(Some(Value::Object(Some(ctx.create_string(&ssp)))))
+            let decoded = uri_percent_decode(&ssp);
+            Ok(Some(Value::Object(Some(ctx.create_string(&decoded)))))
         },
     );
 
@@ -1796,9 +1805,24 @@ fn register_uri_natives(r: &mut NativeMethodRegistry) {
             // ("URI is not absolute"); Tomcat's catch handles that too.
             return Err(iae("URI is not absolute"));
         }
-        if !KNOWN_PROTOCOLS.contains(&proto_lc.as_str()) {
-            // Not one of the always-handled built-in schemes. Rather than
-            // blindly reject, defer to the REAL `java.net.URL` constructor,
+        // Hierarchical (authority-bearing) schemes that have a real built-in
+        // JDK URL stream handler MUST be parsed by the real `java.net.URL`
+        // constructor too: the synthetic build below never splits the
+        // `//host:port` authority out of the path, so it leaves host="" /
+        // port=-1 and stuffs `//host:port/path` into the file field. That
+        // silently broke any caller that inspects URL host/port/file — e.g.
+        // `Response.isEncodeable` (URL session-id rewriting) returned false for
+        // every same-origin URL, so `encodeURL`/`encodeRedirectURL` never
+        // appended `;jsessionid=…` (TestResponse: 30 failures). `new
+        // URL(String)` is un-intercepted real bytecode in real-JDK mode and
+        // parses the authority correctly, so defer these to it.
+        const AUTHORITY_HANDLER_SCHEMES: &[&str] = &["http", "https", "ftp"];
+        if !KNOWN_PROTOCOLS.contains(&proto_lc.as_str())
+            || AUTHORITY_HANDLER_SCHEMES.contains(&proto_lc.as_str())
+        {
+            // Not one of the synthetic-only built-in schemes. Rather than
+            // blindly reject (unknown scheme) or mangle the authority
+            // (http/https/ftp), defer to the REAL `java.net.URL` constructor,
             // which runs `URL.getURLStreamHandler(proto)` — consulting any
             // app-registered `URLStreamHandlerFactory` (published into
             // `URL.factory` by `native_url_set_stream_handler_factory_guard`).

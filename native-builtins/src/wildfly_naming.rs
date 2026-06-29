@@ -631,6 +631,89 @@ fn initial_context_env(ctx: &dyn NativeContext, this: ObjectRef) -> Value {
     }
 }
 
+/// True iff Apache Tomcat's `org.apache.naming.ContextBindings` reports a
+/// thread or class-loader binding — i.e. a web-app naming context is active
+/// on the current thread. This class is absent (or never bound) under
+/// WildFly / Keycloak, which use our flat in-memory store, so it is the
+/// precise gate that keeps the flat-store path untouched.
+fn tomcat_context_bound(ctx: &mut dyn NativeContext) -> bool {
+    const CB: &str = "org/apache/naming/ContextBindings";
+    if ctx.ensure_class_initialized(CB).is_err() {
+        return false;
+    }
+    if matches!(ctx.invoke(CB, "isThreadBound", "()Z", &[]), Ok(Some(Value::Int(v))) if v != 0) {
+        return true;
+    }
+    matches!(ctx.invoke(CB, "isClassLoaderBound", "()Z", &[]), Ok(Some(Value::Int(v))) if v != 0)
+}
+
+/// Obtain Apache Tomcat's per-thread `java:` `Context` (a `SelectorContext`
+/// in non-initial mode) so a `java:comp/env/...` operation resolves against
+/// the live web-app naming context bound by `NamingContextListener`.
+///
+/// `NamingManager.getURLContext("java", null)` returns null here — with a
+/// null environment the factory list never includes `org.apache.naming`, so
+/// the real `InitialContext.getURLOrDefaultInitCtx` would fall through to
+/// `getDefaultInitCtx()`. We replicate the *effective* result directly:
+/// instantiate the `java.naming.factory.initial` factory (Tomcat's
+/// `enableNaming()` sets it to `org.apache.naming.java.javaURLContextFactory`)
+/// and call its **`ObjectFactory.getObjectInstance`** method. When
+/// `ContextBindings` is bound that returns `new SelectorContext(env)` in
+/// *non-initial* mode — whose `parseName` strips the `java:` prefix and whose
+/// `getBoundContext()` returns `ContextBindings.getThread()` (the populated
+/// context). NOTE: the factory's *other* entry point,
+/// `getInitialContext(env)`, returns a SelectorContext in *initial* mode that
+/// does NOT strip `java:` and delegates to a separate, empty initial context
+/// — so it must not be used here.
+///
+/// Our native `InitialContext` intercept previously implemented only the
+/// (null-env, always-null) URL-context step, so `java:` lookups dropped to
+/// the flat WildFly store and raised `NameNotFoundException: java:comp/env
+/// not bound` (TestNamingContextListener: context start → STOPPED).
+///
+/// Returns `Ok(None)` — caller keeps the flat store — unless BOTH a non-empty
+/// `java.naming.factory.initial` is configured AND Tomcat's `ContextBindings`
+/// reports a thread/CL binding (absent under WildFly / Keycloak).
+fn tomcat_default_init_ctx(
+    ctx: &mut dyn NativeContext,
+    env: Value,
+) -> Result<Option<ObjectRef>, MethodCallFailed> {
+    let factory = match ctx.get_system_property("java.naming.factory.initial") {
+        Some(s) if !s.trim().is_empty() => s.trim().replace('.', "/"),
+        _ => return Ok(None),
+    };
+    if !tomcat_context_bound(ctx) {
+        return Ok(None);
+    }
+    if ctx.ensure_class_initialized(&factory).is_err() {
+        return Ok(None);
+    }
+    let factory_obj = match ctx.new_object_initialized(&factory, "()V", &[]) {
+        Ok(Some(Value::Object(Some(o)))) => o,
+        _ => return Ok(None),
+    };
+    // ObjectFactory.getObjectInstance(obj=null, name=null, nameCtx=null, env)
+    // → non-initial SelectorContext when ContextBindings is bound, else null.
+    match ctx.invoke_virtual(
+        factory_obj,
+        "getObjectInstance",
+        "(Ljava/lang/Object;Ljavax/naming/Name;Ljavax/naming/Context;Ljava/util/Hashtable;)\
+         Ljava/lang/Object;",
+        &[
+            Value::Object(None),
+            Value::Object(None),
+            Value::Object(None),
+            env,
+        ],
+    ) {
+        Ok(Some(Value::Object(Some(c)))) => Ok(Some(c)),
+        Ok(_) => Ok(None),
+        // A throwing factory is not fatal: fall back to the flat store.
+        Err(MethodCallFailed::ExceptionThrown(_)) => Ok(None),
+        Err(other) => Err(other),
+    }
+}
+
 fn native_context_lookup(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let name = match read_string_arg(ctx, args, 1) {
@@ -647,6 +730,15 @@ fn native_context_lookup(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
             let name_obj = ctx.create_string(&name);
             return ctx.invoke_virtual(
                 url_ctx,
+                "lookup",
+                "(Ljava/lang/String;)Ljava/lang/Object;",
+                &[Value::Object(Some(name_obj))],
+            );
+        }
+        if let Some(def_ctx) = tomcat_default_init_ctx(ctx, env)? {
+            let name_obj = ctx.create_string(&name);
+            return ctx.invoke_virtual(
+                def_ctx,
                 "lookup",
                 "(Ljava/lang/String;)Ljava/lang/Object;",
                 &[Value::Object(Some(name_obj))],
@@ -690,6 +782,15 @@ fn native_context_bind(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
                 &[Value::Object(Some(name_obj)), Value::Object(Some(value))],
             );
         }
+        if let Some(def_ctx) = tomcat_default_init_ctx(ctx, env)? {
+            let name_obj = ctx.create_string(&name);
+            return ctx.invoke_virtual(
+                def_ctx,
+                "bind",
+                "(Ljava/lang/String;Ljava/lang/Object;)V",
+                &[Value::Object(Some(name_obj)), Value::Object(Some(value))],
+            );
+        }
     }
 
     let class_name = ctx
@@ -728,6 +829,15 @@ fn native_context_rebind(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
                 &[Value::Object(Some(name_obj)), Value::Object(Some(value))],
             );
         }
+        if let Some(def_ctx) = tomcat_default_init_ctx(ctx, env)? {
+            let name_obj = ctx.create_string(&name);
+            return ctx.invoke_virtual(
+                def_ctx,
+                "rebind",
+                "(Ljava/lang/String;Ljava/lang/Object;)V",
+                &[Value::Object(Some(name_obj)), Value::Object(Some(value))],
+            );
+        }
     }
 
     let class_name = ctx
@@ -752,6 +862,15 @@ fn native_context_unbind(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
             let name_obj = ctx.create_string(&name);
             return ctx.invoke_virtual(
                 url_ctx,
+                "unbind",
+                "(Ljava/lang/String;)V",
+                &[Value::Object(Some(name_obj))],
+            );
+        }
+        if let Some(def_ctx) = tomcat_default_init_ctx(ctx, env)? {
+            let name_obj = ctx.create_string(&name);
+            return ctx.invoke_virtual(
+                def_ctx,
                 "unbind",
                 "(Ljava/lang/String;)V",
                 &[Value::Object(Some(name_obj))],

@@ -1742,6 +1742,18 @@ pub trait NativeContext {
         Vec::new()
     }
 
+    /// Get the runtime-visible TYPE_USE annotations that target a field's type
+    /// (JVMS 4.7.20 `target_type` 0x13, FIELD) with an empty `type_path`.
+    /// Backs `Field.getAnnotatedType().getDeclaredAnnotations()`. Default impl
+    /// returns an empty `Vec`.
+    fn field_type_annotations(
+        &self,
+        _class_id: ClassId,
+        _field_name: &str,
+    ) -> Vec<AnnotationData> {
+        Vec::new()
+    }
+
     /// Get the generic Signature attribute for a class (if present).
     fn class_signature(&self, class_id: ClassId) -> Option<String>;
 

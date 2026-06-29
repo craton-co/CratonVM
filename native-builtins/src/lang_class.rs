@@ -12115,22 +12115,8 @@ pub(crate) fn native_method_get_annotated_return_type(
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let anns = match method_class_name_desc(ctx, this) {
-        Some((cid, name, desc)) => {
-            let a = ctx.method_return_type_annotations(cid, &name, &desc);
-            if std::env::var_os("CRATONVM_TYPEANN_DBG").is_some() {
-                eprintln!(
-                    "[typeann-dbg] getAnnotatedReturnType FIRED name={name} desc={desc} anns={}",
-                    a.len()
-                );
-            }
-            a
-        }
-        None => {
-            if std::env::var_os("CRATONVM_TYPEANN_DBG").is_some() {
-                eprintln!("[typeann-dbg] getAnnotatedReturnType FIRED but method_class_name_desc=None");
-            }
-            Vec::new()
-        }
+        Some((cid, name, desc)) => ctx.method_return_type_annotations(cid, &name, &desc),
+        None => Vec::new(),
     };
     let type_mirror = match ctx.invoke_virtual(this, "getReturnType", "()Ljava/lang/Class;", &[]) {
         Ok(Some(Value::Object(Some(m)))) => m,
@@ -12225,6 +12211,27 @@ pub(crate) fn native_executable_get_annotated_parameter_types(
     Ok(Some(Value::Object(Some(out))))
 }
 
+/// `Field.getAnnotatedType()Ljava/lang/reflect/AnnotatedType;`
+///
+/// Builds an AnnotatedType wrapping the field's (erased) type and carrying the
+/// field's FIELD-target TYPE_USE annotations.
+pub(crate) fn native_field_get_annotated_type(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let anns = match field_class_and_name(ctx, this) {
+        Some((cid, name)) => ctx.field_type_annotations(cid, &name),
+        None => Vec::new(),
+    };
+    let type_mirror = match ctx.invoke_virtual(this, "getType", "()Ljava/lang/Class;", &[]) {
+        Ok(Some(Value::Object(Some(m)))) => m,
+        _ => ctx.get_class_mirror(cratonvm_types::ClassId::new(0)),
+    };
+    let at = make_annotated_type_with_anns(ctx, type_mirror, &anns);
+    Ok(Some(Value::Object(Some(at))))
+}
+
 /// `AnnotatedType.getDeclaredAnnotations()` / `getAnnotations()` override for
 /// the `AnnotatedTypeBaseImpl` instances CratonVM constructs. Returns the
 /// stashed `Annotation[]` (or an empty array).
@@ -12234,12 +12241,6 @@ pub(crate) fn native_annotated_type_get_declared_annotations(
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let stashed = annotated_type_stashed_anns(ctx, this);
-    if std::env::var_os("CRATONVM_TYPEANN_DBG").is_some() {
-        eprintln!(
-            "[typeann-dbg] AnnotatedType.getDeclaredAnnotations stashed-len={}",
-            stashed.map(|(_, n)| n as isize).unwrap_or(-1)
-        );
-    }
     if let Some((arr, len)) = stashed {
         if len > 0 {
             // The field holds an actual `Annotation[]` (length>0 ⇒ array kind);
