@@ -2167,6 +2167,14 @@ pub(crate) fn apply_pointer_map_to_thread(
     pointer_map: &std::collections::HashMap<usize, usize>,
     heap: &crate::memory::VmHeap,
 ) {
+    // BUG-03 trace (gated): record that the safepoint-peer remap ran for main.
+    if thread.thread_id.0 == 0 && std::env::var_os("CRATONVM_DBG_BUG03").is_some() {
+        let jto = thread.java_thread_obj.map(|o| o.as_ptr() as usize).unwrap_or(0);
+        eprintln!(
+            "[BUG03-fm] e{} path=peer(apply_pointer_map) tid0 jto=0x{:x} jto_in_map={} pm.len={}",
+            heap.collection_count(), jto, jto != 0 && pointer_map.contains_key(&jto), pointer_map.len()
+        );
+    }
     for frame in &mut thread.frames {
         frame.update_local_refs(pointer_map, heap);
         frame.stack.update_object_refs(pointer_map, heap);
@@ -12461,9 +12469,26 @@ fn execute_instruction(
                                 return Ok(InstructionResult::Continue);
                             }
                         }
+                        // Render both operands as binary (dotted) class names,
+                        // matching HotSpot's `ClassCastException` message.
+                        // Tools parse this message: mockk's `JvmAutoHinter`
+                        // applies the regex `cannot be cast to (class )?(.+/)?
+                        // (.+?)( \(...\))?$` and reads group 3 as the target
+                        // type, then `Class.forName`s it to learn a mock's
+                        // return type. With our former *internal* (slashed)
+                        // names — e.g. `... cast to java/lang/String` — the
+                        // `(.+/)?` group greedily ate `java/lang/`, leaving
+                        // group 3 = `String`, so `Class.forName("String")`
+                        // threw `ClassNotFoundException: String` and every
+                        // reified Kotlin extension test that records a mock
+                        // (`getBean<T>()`, `getProperty<T>()`) failed. Dotted
+                        // names contain no `/`, so group 3 captures the full
+                        // FQN exactly as on HotSpot.
+                        let obj_binary = obj_class_name.replace('/', ".");
+                        let target_binary = target_class_name.replace('/', ".");
                         return Err(RuntimeError::ClassCastException {
                             message: format!(
-                                "{obj_class_name} cannot be cast to {target_class_name}"
+                                "{obj_binary} cannot be cast to {target_binary}"
                             ),
                         }
                         .into());
@@ -15234,6 +15259,22 @@ fn execute_invoke_kind(
                         let header_bytes: [u8; 16] =
                             unsafe { std::ptr::read(obj_ref.as_ptr() as *const [u8; 16]) };
                         if header_bytes == [0u8; 16] {
+                            // BUG-03 probe (gated CRATONVM_DBG_BUG03): when a stale
+                            // (all-zero) invokevirtual receiver is seen, compare it to
+                            // THIS thread's java_thread_obj field and the registry's
+                            // remapped mirror — pinpoints whether the staleness is in
+                            // the operand-stack copy, the per-thread field, or the
+                            // registry (the moving-GC concurrent-spawn reclamation).
+                            if std::env::var_os("CRATONVM_DBG_BUG03").is_some() {
+                                let field = thread.java_thread_obj.map(|o| o.as_ptr() as usize).unwrap_or(0);
+                                let reg = shared.thread_registry.java_thread_obj(thread.thread_id)
+                                    .map(|o| o.as_ptr() as usize).unwrap_or(0);
+                                eprintln!(
+                                    "[BUG03] stale recv={:p} on tid={} method={}.{} | java_thread_obj-field=0x{:x} registry-mirror=0x{:x} (field==recv:{} reg==recv:{})",
+                                    obj_ref.as_ptr(), thread.thread_id.0, &*method_class_name, &*method_name,
+                                    field, reg, field == obj_ref.as_ptr() as usize, reg == obj_ref.as_ptr() as usize,
+                                );
+                            }
                             // "Zeroed-a-live-object" detector consumer
                             // (CRATONVM_DBG_SWEEP_ZERO): this receiver lost its
                             // header to the non-moving young sweep. Recover its

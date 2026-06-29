@@ -109,7 +109,9 @@ use crate::alloc_concurrent_synthetic;
 fn component_array_name(sig: &TypeSig) -> Option<String> {
     match sig {
         TypeSig::Base(ch) => Some(format!("[{}", ch)),
-        TypeSig::Class { name, type_args } if type_args.is_empty() => Some(format!("[L{};", name)),
+        TypeSig::Class { name, type_args, .. } if type_args.is_empty() => {
+            Some(format!("[L{};", name))
+        }
         TypeSig::Class { .. } => {
             // Parameterized component (e.g. List<T>) -> erase to raw class.
             // Real JDK reifier produces a GenericArrayType here, but Spring
@@ -154,7 +156,11 @@ pub fn type_sig_to_java(ctx: &mut dyn NativeContext, sig: &TypeSig) -> Value {
             let mirror = ctx.primitive_class_mirror(prim_name);
             Value::Object(Some(mirror))
         }
-        TypeSig::Class { name, type_args } if type_args.is_empty() => {
+        TypeSig::Class {
+            name,
+            type_args,
+            owner,
+        } if type_args.is_empty() && owner.is_none() => {
             // Non-parameterized class -> Class mirror.
             //
             // Use `load_class` (loads but does NOT trigger <clinit>) — calling
@@ -174,10 +180,29 @@ pub fn type_sig_to_java(ctx: &mut dyn NativeContext, sig: &TypeSig) -> Value {
                 Value::Object(None)
             }
         }
-        TypeSig::Class { name, type_args } => {
-            // Parameterized type -> ParameterizedType object
-            // field 0 = rawType (Class mirror), field 1 = actualTypeArguments (Type[])
-            let pt = alloc_concurrent_synthetic(ctx, "java/lang/reflect/ParameterizedType", 2);
+        TypeSig::Class {
+            name,
+            type_args,
+            owner,
+        } => {
+            // Parameterized type -> ParameterizedType object.
+            // field 0 = rawType (Class mirror), field 1 = actualTypeArguments
+            // (Type[]), field 2 = ownerType (Type or null).
+            //
+            // The owner is reified only when the signature used the nested
+            // `Outer<...>.Inner<...>` form, in which case HotSpot returns a
+            // ParameterizedType whose getOwnerType() is the enclosing type.
+            // Type-variable resolvers (Spring ResolvableType / GenericType-
+            // Resolver) walk this owner chain to bind variables declared by an
+            // enclosing generic class — e.g. `class TypedInnerTyped extends
+            // InnerTyped<Long>` resolves the field `T` (declared on the OUTER
+            // `EnclosedInParameterizedType<T>`) only via the owner
+            // `EnclosedInParameterizedType<Integer>`.
+            //
+            // Note: this arm also fires when the inner has NO type args but an
+            // owner is present (`type_args` empty, `owner` Some) — that still
+            // reifies as a ParameterizedType on HotSpot, so build one here.
+            let pt = alloc_concurrent_synthetic(ctx, "java/lang/reflect/ParameterizedType", 3);
             let raw_val = if let Some(cid) = ctx.class_id_by_name(name) {
                 let m = ctx.get_class_mirror(cid);
                 Value::Object(Some(m))
@@ -195,6 +220,12 @@ pub fn type_sig_to_java(ctx: &mut dyn NativeContext, sig: &TypeSig) -> Value {
                 ctx.set_array_element(args_arr, i, val);
             }
             ctx.set_field(pt, 1, Value::Object(Some(args_arr)));
+            // Owner type (field 2): reify the enclosing type node, or null.
+            let owner_val = match owner {
+                Some(o) => type_sig_to_java(ctx, o),
+                None => Value::Object(None),
+            };
+            ctx.set_field(pt, 2, owner_val);
             Value::Object(Some(pt))
         }
         TypeSig::TypeVar(name) => {
@@ -414,7 +445,11 @@ pub fn type_param_to_java(
 /// fine; a synthetic `TypeVariable` is resolved via the generic-decl scope).
 pub(crate) fn typesig_to_real_type(ctx: &mut dyn NativeContext, sig: &TypeSig) -> Value {
     match sig {
-        TypeSig::Class { name, type_args } if !type_args.is_empty() => {
+        TypeSig::Class {
+            name,
+            type_args,
+            owner,
+        } if !type_args.is_empty() || owner.is_some() => {
             let slashed = name.replace('.', "/");
             let raw = match ctx.class_id_by_name(&slashed).or_else(|| {
                 let _ = ctx.load_class(&slashed);
@@ -434,11 +469,22 @@ pub(crate) fn typesig_to_real_type(ctx: &mut dyn NativeContext, sig: &TypeSig) -
                 let v = typearg_to_real_type(ctx, a);
                 ctx.set_array_element(args, i, v);
             }
+            // Owner type: reify the enclosing `Outer<...>` node (recursively a
+            // real PTI when it is itself parameterized) so callers that walk
+            // getOwnerType() — Spring's ResolvableType/GenericTypeResolver
+            // variable resolvers — can bind type variables declared by the
+            // enclosing generic class. Null for top-level types and for
+            // `$`-flattened nested names where the signature carried no
+            // parameterized owner (owner == None).
+            let owner_val = match owner {
+                Some(o) => typesig_to_real_type(ctx, o),
+                None => Value::Object(None),
+            };
             let nfields = ctx.class_num_total_fields(pti_cid).max(3);
             let pti = ctx.alloc_object(pti_cid, nfields);
             ctx.set_field_by_name(pti, "rawType", raw);
             ctx.set_field_by_name(pti, "actualTypeArguments", Value::Object(Some(args)));
-            ctx.set_field_by_name(pti, "ownerType", Value::Object(None));
+            ctx.set_field_by_name(pti, "ownerType", owner_val);
             Value::Object(Some(pti))
         }
         _ => type_sig_to_java(ctx, sig),

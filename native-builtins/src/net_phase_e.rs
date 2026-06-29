@@ -1828,6 +1828,30 @@ fn register_uri_natives(r: &mut NativeMethodRegistry) {
                 &[Value::Object(Some(full_s))],
             );
         }
+        // Authority-based hierarchical URI (`scheme://host[:port]/path`):
+        // delegate to the real `java.net.URL(String)` constructor, which
+        // correctly splits host/port/file. The hand-rolled synthetic build
+        // below stuffs the WHOLE `//host:port/path` scheme-specific-part into
+        // the `file` slot and leaves `host` empty (slot 1 = ""), so the
+        // resulting URL's getHost()/getPort()/getAuthority() disagree with
+        // `new URL(spec)` — and URL.equals (which compares protocol+host+port)
+        // then returns false for two URLs whose toString() is identical.
+        // Spring's URLEditor/UrlResource build URLs via URI.toURL(), and
+        // UrlSet.setUrlNames calls URI.toURL() directly, so the broken host
+        // split made BeanFactoryGenericsTests' NamedUrlList/Set/Map element
+        // conversion (and setBean) produce URLs that compare unequal to the
+        // expected `new URL(...)`. Opaque / non-authority schemes (file:/C:/…,
+        // jar:file:…!/…) whose SSP has no `//` keep the hand-rolled path, where
+        // `file == scheme-specific-part` is the intended shape that Tomcat and
+        // Gradle file:/jar: handling rely on.
+        if raw[proto.len() + 1..].starts_with("//") {
+            let full_s = ctx.create_string(&raw);
+            return ctx.new_object_initialized(
+                "java/net/URL",
+                "(Ljava/lang/String;)V",
+                &[Value::Object(Some(full_s))],
+            );
+        }
         // Build a simple 13-field synthetic URL (same layout as p59_alloc_url).
         let url = alloc_concurrent_synthetic(ctx, "java/net/URL", 13);
         let file = if proto.is_empty() {

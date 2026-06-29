@@ -59,10 +59,19 @@ pub enum TypeSig {
     Base(char),
     /// A class type, possibly parameterized: `Ljava/lang/String;` or
     /// `Ljava/util/List<TT;>;`. Inner-class suffixes (`.Inner`) are
-    /// absorbed into a flat name with `$`-style separators.
+    /// absorbed into a flat `$`-joined `name` (matching `Class.getName` for
+    /// nested types) for the raw/`resolve()` view, while `owner` carries the
+    /// enclosing type as a separate node so type-variable resolvers can walk
+    /// the owner chain. `owner` is `Some` only when the signature used the
+    /// `ClassTypeSignatureSuffix` form `Outer<...>.Inner<...>` — i.e. the
+    /// enclosing class is parameterized in this context (HotSpot reifies such
+    /// a signature as a `ParameterizedType` whose `getOwnerType()` is the
+    /// enclosing `ParameterizedType`). It stays `None` for the common
+    /// `Outer$Inner` form (which `read_class_name` reads as one flat name).
     Class {
         name: String,
         type_args: Vec<TypeArg>,
+        owner: Option<Box<TypeSig>>,
     },
     /// A type variable reference: `TT;`
     TypeVar(String),
@@ -307,23 +316,42 @@ impl<'a> SigParser<'a> {
         } else {
             Vec::new()
         };
-        // Inner classes: `.Inner<...>` becomes `$Inner` in the dotted name
-        // — that's the form Class.getName uses for nested types loaded
-        // by HotSpot.
+        // Inner classes: `.Inner<...>` becomes `$Inner` in the flat name —
+        // that's the form Class.getName uses for nested types loaded by
+        // HotSpot, so it's what `resolve()`/`getRawType()` needs.
+        //
+        // Each suffix ALSO nests the type built so far as the new node's
+        // `owner`, preserving the enclosing class's type arguments. Previously
+        // the suffix's own `<args>` were parsed and DISCARDED and the outer
+        // `type_args` were (wrongly) left attached to the `$`-joined inner
+        // name — so `Outer<X>.Inner<Y>` resolved to `Inner` carrying `X` and
+        // no owner, instead of `Inner<Y>` owned by `Outer<X>`. That broke any
+        // resolver that binds a type variable declared by an enclosing generic
+        // class (Spring's ResolvableType.resolveFromOuterClass,
+        // GenericTypeResolver.getTypeVariableMap on inner classes).
+        let mut current = TypeSig::Class {
+            name: full_name.clone(),
+            type_args,
+            owner: None,
+        };
         while self.peek() == Some(b'.') {
             self.advance();
             let inner = self.read_ident();
             full_name.push('$');
             full_name.push_str(&inner);
-            if self.peek() == Some(b'<') {
-                let _ = self.parse_type_args();
-            }
+            let inner_args = if self.peek() == Some(b'<') {
+                self.parse_type_args()
+            } else {
+                Vec::new()
+            };
+            current = TypeSig::Class {
+                name: full_name.clone(),
+                type_args: inner_args,
+                owner: Some(Box::new(current)),
+            };
         }
         self.expect(b';');
-        Some(TypeSig::Class {
-            name: full_name,
-            type_args,
-        })
+        Some(current)
     }
 
     fn parse_type_var_sig(&mut self) -> Option<TypeSig> {
@@ -699,9 +727,65 @@ mod tests {
         let sig = parse_class_signature("Ljava/lang/Object;").unwrap();
         assert!(sig.type_params.is_empty());
         match &sig.super_class {
-            TypeSig::Class { name, type_args } => {
+            TypeSig::Class {
+                name,
+                type_args,
+                owner,
+            } => {
                 assert_eq!(name, "java/lang/Object");
                 assert!(type_args.is_empty());
+                assert!(owner.is_none());
+            }
+            other => panic!("expected Class, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_nested_class_owner_chain() {
+        // `Outer<Integer>.Inner<Long>` as a field signature: the inner type
+        // carries its OWN args (`Long`) and an owner node for `Outer<Integer>`,
+        // with the flat `$`-joined raw name. Regression for the bug where the
+        // inner args were discarded and the outer args left on the inner name.
+        let sig = parse_field_signature(
+            "LOuter<Ljava/lang/Integer;>.Inner<Ljava/lang/Long;>;",
+        )
+        .unwrap();
+        match sig {
+            TypeSig::Class {
+                name,
+                type_args,
+                owner,
+            } => {
+                assert_eq!(name, "Outer$Inner");
+                assert_eq!(type_args.len(), 1);
+                assert_eq!(
+                    type_args[0],
+                    TypeArg::Exact(TypeSig::Class {
+                        name: "java/lang/Long".into(),
+                        type_args: vec![],
+                        owner: None,
+                    })
+                );
+                let owner = owner.expect("owner must be present");
+                match *owner {
+                    TypeSig::Class {
+                        name,
+                        type_args,
+                        owner,
+                    } => {
+                        assert_eq!(name, "Outer");
+                        assert_eq!(
+                            type_args[0],
+                            TypeArg::Exact(TypeSig::Class {
+                                name: "java/lang/Integer".into(),
+                                type_args: vec![],
+                                owner: None,
+                            })
+                        );
+                        assert!(owner.is_none());
+                    }
+                    other => panic!("expected owner Class, got {:?}", other),
+                }
             }
             other => panic!("expected Class, got {:?}", other),
         }
