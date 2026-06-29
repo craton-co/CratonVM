@@ -44308,11 +44308,19 @@ pub(crate) fn register_p72_beans(r: &mut NativeMethodRegistry) {
             }
         },
     );
+    // getBeanDescriptor: slot 2 of our synthetic BeanInfo holds a real
+    // java.beans.BeanDescriptor (built by `introspector_get_bean_info`).
+    // Spring's CachedIntrospectionResults calls
+    // `beanInfo.getBeanDescriptor().getBeanClass()`, so returning null here
+    // NPEs (BeanWrapperTests.replaceWrappedInstance).
     r.register(
         bi,
         "getBeanDescriptor",
         "()Ljava/beans/BeanDescriptor;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            Ok(Some(ctx.get_field(this, 2)))
+        },
     );
     // SPB.11: Spring's ExtendedBeanInfo constructor calls
     // `delegate.getMethodDescriptors()` and then `findCandidateWriteMethods`
@@ -44344,24 +44352,10 @@ pub(crate) fn register_p72_beans(r: &mut NativeMethodRegistry) {
             }
         },
     );
-    // MethodDescriptor.getMethod() — synthetic overlay: the wrapped
-    // java.lang.reflect.Method lives at slot 0 of our 1-field synthetic.
-    r.register(
-        "java/beans/MethodDescriptor",
-        "getMethod",
-        "()Ljava/lang/reflect/Method;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            // Real-JDK MD has a `method` field; our synthetic stub stores the
-            // Method at slot 0. Try by name first; fall through to slot 0 when
-            // the by-name lookup misses (synthetic-stub case).
-            let by_name = ctx.get_field_by_name(this, "method");
-            if matches!(by_name, Value::Object(Some(_))) {
-                return Ok(Some(by_name));
-            }
-            Ok(Some(ctx.get_field(this, 0)))
-        },
-    );
+    // MethodDescriptor.getMethod() is left to the real JDK bytecode:
+    // `introspector_get_bean_info` now builds genuine
+    // `java.beans.MethodDescriptor` objects via their JDK constructor, so the
+    // wrapped Method resolves through the real `methodRef`.
     r.register(
         bi,
         "getEventSetDescriptors",
@@ -44373,58 +44367,23 @@ pub(crate) fn register_p72_beans(r: &mut NativeMethodRegistry) {
     );
 
     // FeatureDescriptor.getName(): JDK declares `private String name` on
-    // FeatureDescriptor. Our synthetic PropertyDescriptors are allocated with
-    // a trailing overlay, and Spring wraps them in subclasses (e.g.
-    // ExtendedBeanInfo$SimplePropertyDescriptor) that allocate a LARGER
-    // object. We've observed that on the subclass instance the bytecode
-    // `getfield FeatureDescriptor.name` resolves to a slot that disagrees
-    // with what `setName(...)` wrote — getName() comes back null even though
-    // reflective `Field.get(name)` returns the value setName stored. The
-    // root-cause is a getfield index mismatch for the subclass layout; until
-    // that's untangled, intercept getName at the FeatureDescriptor level and
-    // resolve `name` via the dynamic-hierarchy lookup that *does* agree with
-    // setName/reflection. Without this Spring's
-    // ExtendedBeanInfo$PropertyDescriptorComparator NPEs because
-    // `pd.getName().compareTo(...)` sees null on both sides.
-    // SPB.11: Bypass Spring's ExtendedBeanInfoFactory.getBeanInfo, which
-    // wraps our delegate BeanInfo in `new ExtendedBeanInfo(delegate)` and
-    // re-creates each PropertyDescriptor as a `SimplePropertyDescriptor`.
-    // That wrapping leaves `SimplePropertyDescriptor.readMethod/writeMethod/
-    // propertyType` null (the 1-arg copy ctor only forwards to the JDK PD
-    // super-ctor and does not populate the Spring subclass's own fields),
-    // so downstream `getReadMethod/getWriteMethod/getPropertyType` all
-    // return null and Spring NPEs while sorting in
-    // `PropertyDescriptorComparator` or comparing types in
-    // `findExistingPropertyDescriptor`. Our delegate already exposes the
-    // setters/getters with proper Method mirrors — return it directly.
-    let factory_native = |ctx: &mut dyn NativeContext, args: &[Value]| -> MethodCallResult {
-        let cls = match args.get(1) {
-            Some(v) => v.clone(),
-            None => return Ok(Some(Value::Object(None))),
-        };
-        // Delegate straight to our Introspector.getBeanInfo native.
-        introspector_get_bean_info(ctx, &[cls])
-    };
-    r.register(
-        "org/springframework/beans/ExtendedBeanInfoFactory",
-        "getBeanInfo",
-        "(Ljava/lang/Class;)Ljava/beans/BeanInfo;",
-        factory_native,
-    );
-    // SPB.11: Spring CIR also queries SimpleBeanInfoFactory (the fallback
-    // when no SpringFactoriesLoader-loaded BeanInfoFactory returns a
-    // BeanInfo). Its `PropertyDescriptorUtils.determineBasicProperties`
-    // path bypasses java.beans.Introspector entirely and builds Spring's
-    // own PDs — which BeanWrapperImpl then refuses to wrap (we've observed
-    // BeanWrapper.getPropertyDescriptors() returning an empty array, so
-    // `isWritableProperty("metadataReaderFactory")` returns false). Force
-    // the same delegate to feed CIR.
-    r.register(
-        "org/springframework/beans/SimpleBeanInfoFactory",
-        "getBeanInfo",
-        "(Ljava/lang/Class;)Ljava/beans/BeanInfo;",
-        factory_native,
-    );
+    // FeatureDescriptor. Resolving it via `get_field_by_name("name")` is robust
+    // for both real JDK PropertyDescriptors (the JDK ctor calls setName) and
+    // Spring subclasses (whose super-ctor calls setName), and agrees with
+    // reflective `Field.get`. Keep this override so Spring's
+    // ExtendedBeanInfo$PropertyDescriptorComparator never sees a null name.
+    //
+    // Spring's `ExtendedBeanInfoFactory`/`SimpleBeanInfoFactory.getBeanInfo`
+    // are intentionally NOT overridden anymore. `introspector_get_bean_info`
+    // now returns a BeanInfo whose PropertyDescriptors are real JDK PDs and
+    // whose `getMethodDescriptors()` exposes *all* public methods, so Spring's
+    // real `ExtendedBeanInfo` runs correctly on top of it: it discovers
+    // non-standard write methods (static / non-void-returning setters, indexed
+    // 2-arg setters) that java.beans.Introspector itself ignores. Short-
+    // circuiting those factories to the plain delegate broke
+    // CachedIntrospectionResultsTests.shouldUseExtendedBeanInfoWhenApplicable
+    // and BeanWrapperTests.cornerSpr10115/cornerSpr13837 (non-standard setters
+    // never became writable properties).
 
     // Register on both FeatureDescriptor (where getName is declared) AND
     // PropertyDescriptor (the typical invokevirtual call-site class). The
@@ -44452,15 +44411,10 @@ pub(crate) fn register_p72_beans(r: &mut NativeMethodRegistry) {
     // we materialise real `java.lang.reflect.Method` mirrors below in
     // `introspector_get_bean_info` and just hand them back here.
     let pd = "java/beans/PropertyDescriptor";
-    // Read our synthetic overlay slots that sit AFTER the real-JDK fields.
-    // See `introspector_get_bean_info` above for why we don't reuse slots 0..3.
+    // getName resolves the FeatureDescriptor `name` field by name (set by the
+    // JDK PropertyDescriptor ctor / setName), robust across subclasses.
     r.register(pd, "getName", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        // SPB.11: Prefer `FeatureDescriptor.name` (which `setName(...)` writes
-        // and reflective `Field.get(...)` agrees with). This matches both
-        // (a) our synthetic PDs (we populate `name` via `set_field_by_name`
-        // at construction) AND (b) subclasses whose super-ctor calls
-        // `setName(...)`. Subclass-safe via dynamic-hierarchy resolution.
         Ok(Some(ctx.get_field_by_name(this, "name")))
     });
 
@@ -44516,49 +44470,23 @@ pub(crate) fn register_p72_beans(r: &mut NativeMethodRegistry) {
             Ok(Some(pt))
         },
     );
-    r.register(
-        pd,
-        "getReadMethod",
-        "()Ljava/lang/reflect/Method;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            let cid = ctx.class_id_of_object(this);
-            let base = ctx.class_num_total_fields(cid);
-            Ok(Some(ctx.get_field(this, base + 1)))
-        },
-    );
-    r.register(
-        pd,
-        "getWriteMethod",
-        "()Ljava/lang/reflect/Method;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            // SPB.11: For subclasses (GTAPD etc.) prefer their own `writeMethod`
-            // instance field (resolved via dynamic-hierarchy lookup, which
-            // agrees with the slot the subclass ctor's putfield wrote to). For
-            // our synthetic PDs the by-name lookup misses → fall back to the
-            // overlay slot at `base + 2` populated in `introspector_get_bean_info`.
-            let by_name = ctx.get_field_by_name(this, "writeMethod");
-            if matches!(by_name, Value::Object(Some(_))) {
-                return Ok(Some(by_name));
-            }
-            let cid = ctx.class_id_of_object(this);
-            let base = ctx.class_num_total_fields(cid);
-            Ok(Some(ctx.get_field(this, base + 2)))
-        },
-    );
-    r.register(pd, "getPropertyType", "()Ljava/lang/Class;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let cid = ctx.class_id_of_object(this);
-        let base = ctx.class_num_total_fields(cid);
-        Ok(Some(ctx.get_field(this, base + 3)))
-    });
+    // NOTE: `java.beans.PropertyDescriptor.getReadMethod/getWriteMethod/
+    // getPropertyType` are deliberately NOT overridden. `introspector_get_bean_info`
+    // builds genuine JDK PropertyDescriptors (via the JDK ctor), so the real
+    // bytecode resolves those via the JDK `readMethodRef`/`writeMethodRef`/
+    // `propertyTypeRef`. Overriding them with synthetic overlay slots returned
+    // null on the real PD objects that callers construct directly (Spring's
+    // SimplePropertyDescriptor / IndexedPropertyDescriptor), which broke
+    // ExtendedBeanInfoTests. The GTAPD overrides above remain because Spring's
+    // GenericTypeAwarePropertyDescriptor stores read/write in its own fields.
+    let _ = pd;
     r.set_category(__prev_cat);
 }
 
 /// Real Introspector.getBeanInfo() — discovers properties via getter/setter naming conventions.
-/// BeanInfo = 2-field synthetic (propertyDescriptors=0 PD[], beanDescriptor=1)
-/// PropertyDescriptor = 4-field (name=0, readMethod=1 Method, writeMethod=2 Method, propertyType=3 Class)
+/// Returns a synthetic BeanInfo (slot 0 = PropertyDescriptor[], slot 1 =
+/// MethodDescriptor[], slot 2 = BeanDescriptor) whose descriptors are GENUINE
+/// java.beans objects built via their JDK constructors.
 ///
 /// Walks the target class plus its superclasses so that inherited setters
 /// (e.g. `ConfigurationClassPostProcessor.setMetadataReaderFactory`, declared
@@ -44586,10 +44514,14 @@ fn introspector_get_bean_info(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
                 eprintln!("BI-TRACE: mirror_class_id returned None");
             }
             // Empty BeanInfo is safer than null (matches JDK behaviour for
-            // classes with no introspectable bean properties).
+            // classes with no introspectable bean properties). 3 slots so the
+            // getMethodDescriptors (slot 1) / getBeanDescriptor (slot 2) natives
+            // read in-bounds.
             let pd_arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), 0);
-            let bean_info = alloc_concurrent_synthetic(ctx, "java/beans/BeanInfo", 2);
+            let md_arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), 0);
+            let bean_info = alloc_concurrent_synthetic(ctx, "java/beans/BeanInfo", 3);
             ctx.set_field(bean_info, 0, Value::Object(Some(pd_arr)));
+            ctx.set_field(bean_info, 1, Value::Object(Some(md_arr)));
             return Ok(Some(Value::Object(Some(bean_info))));
         }
     };
@@ -44624,6 +44556,7 @@ fn introspector_get_bean_info(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
             _ => desc.to_string(),
         }
     }
+    #[derive(Default)]
     struct PropAcc {
         name: String,
         read_method: Option<ObjectRef>,
@@ -44638,6 +44571,22 @@ fn introspector_get_bean_info(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
             ObjectRef,
             Option<cratonvm_types::ClassId>,
         )>,
+        // indexed read method `getXxx(int) -> T` (first one wins).
+        indexed_read: Option<ObjectRef>,
+        // void-returning indexed setters `setXxx(int, E)` — (mirror, E desc).
+        indexed_write_candidates: Vec<(ObjectRef, String)>,
+    }
+    fn prop_idx(props: &mut Vec<PropAcc>, name: &str) -> usize {
+        match props.iter().position(|p| p.name == name) {
+            Some(i) => i,
+            None => {
+                props.push(PropAcc {
+                    name: name.to_string(),
+                    ..Default::default()
+                });
+                props.len() - 1
+            }
+        }
     }
     let mut props: Vec<PropAcc> = Vec::new();
 
@@ -44676,6 +44625,11 @@ fn introspector_get_bean_info(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     }
     let mut seen_method_keys: std::collections::HashSet<(String, String)> =
         std::collections::HashSet::new();
+    // ALL public methods (instance + static, excluding constructors), used to
+    // build getMethodDescriptors() — java.beans BeanInfo exposes every
+    // Class.getMethods() entry, and Spring's ExtendedBeanInfo scans them for
+    // non-standard write methods.
+    let mut all_method_mirrors: Vec<ObjectRef> = Vec::new();
     for cid in scan_cids {
         // Resolve the mirror for this declaring class so the Method mirror
         // points at the class that actually declares the method.
@@ -44690,8 +44644,22 @@ fn introspector_get_bean_info(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
             if !seen_method_keys.insert(key) {
                 continue;
             }
-            // JavaBeans properties come from instance methods only.
-            if method.access_flags & 0x0008 != 0 {
+            // Collect every public, non-constructor method for the
+            // MethodDescriptor[] (mirrors Class.getMethods()).
+            if method.access_flags & 0x0001 != 0 && !name.starts_with('<') {
+                let mm_all = crate::jmx_openmbean::build_method_mirror(
+                    ctx,
+                    declaring_mirror,
+                    name,
+                    desc,
+                    method.access_flags,
+                );
+                all_method_mirrors.push(mm_all);
+            }
+            // JavaBeans properties come from PUBLIC INSTANCE methods only
+            // (java.beans uses Class.getMethods(), which is public-only — a
+            // non-public getFoo()/setFoo() is NOT a bean property).
+            if method.access_flags & 0x0008 != 0 || method.access_flags & 0x0001 == 0 {
                 continue;
             }
 
@@ -44719,21 +44687,7 @@ fn introspector_get_bean_info(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
                     desc,
                     method.access_flags,
                 );
-                let idx = match props.iter().position(|p| p.name == prop_name) {
-                    Some(i) => i,
-                    None => {
-                        props.push(PropAcc {
-                            name: prop_name.clone(),
-                            read_method: None,
-                            read_ret_mirror: None,
-                            read_ret_desc: None,
-                            read_ret_cid: None,
-                            uses_is: false,
-                            write_methods: Vec::new(),
-                        });
-                        props.len() - 1
-                    }
-                };
+                let idx = prop_idx(&mut props, &prop_name);
                 let p = &mut props[idx];
                 if is_is {
                     // A boolean isXxx() always wins and locks out plain getters.
@@ -44751,49 +44705,72 @@ fn introspector_get_bean_info(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
                 }
             }
 
-            // setter: setXxx(T) -> void with exactly one parameter.
+            // indexed getter: getXxx(int) -> T (T != void).
+            if name.starts_with("get") && name.len() > 3 {
+                let (params, ret) = crate::jmx_openmbean::parse_method_descriptor_pub(desc);
+                if params.len() == 1 && params[0] == "I" && ret != "V" {
+                    let prop_name = decapitalize(&name[3..]);
+                    let mm = crate::jmx_openmbean::build_method_mirror(
+                        ctx,
+                        declaring_mirror,
+                        name,
+                        desc,
+                        method.access_flags,
+                    );
+                    let idx = prop_idx(&mut props, &prop_name);
+                    if props[idx].indexed_read.is_none() {
+                        props[idx].indexed_read = Some(mm);
+                    }
+                }
+            }
+
+            // setter: setXxx(T) -> void (1 param) = standard write;
+            //         setXxx(int, E) -> void (2 params) = indexed write.
             if name.starts_with("set") && name.len() > 3 && desc.ends_with(")V") {
                 let (params, _ret) = crate::jmx_openmbean::parse_method_descriptor_pub(desc);
-                if params.len() != 1 {
-                    continue;
+                if params.len() == 1 {
+                    let prop_name = decapitalize(&name[3..]);
+                    let param_mirror = crate::jmx_openmbean::type_descriptor_to_class_mirror_pub(
+                        ctx, &params[0],
+                    );
+                    let param_cid = crate::lang_class::mirror_class_id(ctx, param_mirror);
+                    let mm = crate::jmx_openmbean::build_method_mirror(
+                        ctx,
+                        declaring_mirror,
+                        name,
+                        desc,
+                        method.access_flags,
+                    );
+                    let idx = prop_idx(&mut props, &prop_name);
+                    props[idx]
+                        .write_methods
+                        .push((mm, params[0].clone(), param_mirror, param_cid));
+                } else if params.len() == 2 && params[0] == "I" {
+                    // Standard (void-returning) indexed setter.
+                    let prop_name = decapitalize(&name[3..]);
+                    let mm = crate::jmx_openmbean::build_method_mirror(
+                        ctx,
+                        declaring_mirror,
+                        name,
+                        desc,
+                        method.access_flags,
+                    );
+                    let idx = prop_idx(&mut props, &prop_name);
+                    props[idx]
+                        .indexed_write_candidates
+                        .push((mm, params[1].clone()));
                 }
-                let prop_name = decapitalize(&name[3..]);
-                let param_mirror =
-                    crate::jmx_openmbean::type_descriptor_to_class_mirror_pub(ctx, &params[0]);
-                let param_cid = crate::lang_class::mirror_class_id(ctx, param_mirror);
-                let mm = crate::jmx_openmbean::build_method_mirror(
-                    ctx,
-                    declaring_mirror,
-                    name,
-                    desc,
-                    method.access_flags,
-                );
-                let idx = match props.iter().position(|p| p.name == prop_name) {
-                    Some(i) => i,
-                    None => {
-                        props.push(PropAcc {
-                            name: prop_name.clone(),
-                            read_method: None,
-                            read_ret_mirror: None,
-                            read_ret_desc: None,
-                            read_ret_cid: None,
-                            uses_is: false,
-                            write_methods: Vec::new(),
-                        });
-                        props.len() - 1
-                    }
-                };
-                props[idx]
-                    .write_methods
-                    .push((mm, params[0].clone(), param_mirror, param_cid));
             }
         }
     }
 
-    // Resolve each accumulated property into the (name, readMethod, writeMethod,
-    // propertyType) tuple the PropertyDescriptor builder below expects.
+    // Resolve each accumulated property into the
+    // (name, readMethod, writeMethod, propertyType, indexedReadMethod,
+    // indexedWriteMethod) tuple the descriptor builder below expects.
     let mut properties: Vec<(
         String,
+        Option<ObjectRef>,
+        Option<ObjectRef>,
         Option<ObjectRef>,
         Option<ObjectRef>,
         Option<ObjectRef>,
@@ -44832,13 +44809,22 @@ fn introspector_get_bean_info(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
         } else {
             write_param_mirror
         };
-        properties.push((p.name.clone(), p.read_method, write_method, type_mirror));
+        // Standard indexed write method = first void-returning setXxx(int, E).
+        let indexed_write = p.indexed_write_candidates.first().map(|(m, _)| *m);
+        properties.push((
+            p.name.clone(),
+            p.read_method,
+            write_method,
+            type_mirror,
+            p.indexed_read,
+            indexed_write,
+        ));
     }
 
     // Always include the synthetic "class" property (java.beans includes it
     // because every Object has `getClass()`). Spring's reflection caches key
     // off PD presence, so omitting it can mislead callers.
-    if !properties.iter().any(|(n, _, _, _)| n == "class") {
+    if !properties.iter().any(|(n, ..)| n == "class") {
         let class_class_mirror = match ctx.ensure_class_initialized("java/lang/Class") {
             Ok(cid) => ctx.get_class_mirror(cid),
             Err(_) => class_mirror,
@@ -44855,87 +44841,195 @@ fn introspector_get_bean_info(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
             Some(getter),
             None,
             Some(class_class_mirror),
+            None,
+            None,
         ));
     }
 
-    // Build PropertyDescriptor array.
+    // java.beans returns PropertyDescriptors sorted by name (String natural
+    // order). Spring's ExtendedBeanInfo keeps them in a TreeSet keyed by the
+    // same order, so `ExtendedBeanInfoTests.propertyDescriptorOrderIsEqual`
+    // requires our plain BeanInfo to be sorted identically. Property names are
+    // ASCII identifiers, so Rust's str ordering matches Java's char ordering.
+    properties.sort_by(|a, b| a.0.cmp(&b.0));
+
+    // Build PropertyDescriptor[] as GENUINE java.beans.PropertyDescriptor
+    // objects, constructed via the JDK ctor
+    // `PropertyDescriptor(String, Method, Method)`. The ctor populates the real
+    // `readMethodRef`/`writeMethodRef`/`propertyTypeRef`, so the unmodified JDK
+    // bytecode for `getReadMethod`/`getWriteMethod`/`getPropertyType` works.
     //
-    // CRITICAL: The real-JDK `PropertyDescriptor` class layout has typed
-    // fields at slots 0..N (e.g. an `int` flag at slot 2). Using
-    // `set_field(pd, k, Value::Object(...))` runs through the
-    // descriptor-aware write path which *coerces* our Object reference into
-    // whatever primitive type the real slot declares (we observed slot 2
-    // storing `Int(-1435209072)` after writing a Method mirror). Writing to
-    // those slots is therefore unusable for our synthetic accessors.
-    //
-    // Workaround: allocate the object with `real + 4` slots and stash our
-    // (name, readMethod, writeMethod, propertyType) tuple at the synthetic
-    // overlay slots `real..real+3`. The PD natives below (`getName`,
-    // `getReadMethod`, `getWriteMethod`, `getPropertyType`) read from the
-    // same overlay offsets via `class_num_total_fields(class_id)`. The real
-    // JDK fields are left alone (so any JDK bytecode that does still run
-    // against this object sees its defaults rather than coerced garbage).
-    let pd_class_id = ctx
-        .ensure_class_initialized("java/beans/PropertyDescriptor")
-        .ok();
-    let pd_real_fields = match pd_class_id {
-        Some(cid) => ctx.class_num_total_fields(cid),
-        None => 0,
-    };
+    // Earlier revisions allocated PD objects with synthetic *overlay* slots and
+    // intercepted the getters to read them. That was incompatible with the real
+    // PD objects callers construct directly (Spring's SimplePropertyDescriptor /
+    // GenericTypeAwarePropertyDescriptor, and java.beans.IndexedPropertyDescriptor):
+    // the overlay getters read out-of-range slots on those and returned null,
+    // breaking ExtendedBeanInfoTests.
     let pd_arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), properties.len());
-    for (i, (prop_name, getter, setter, type_mirror)) in properties.iter().enumerate() {
-        let pd = match pd_class_id {
-            Some(cid) => ctx.alloc_object(cid, pd_real_fields + 4),
-            None => alloc_concurrent_synthetic(ctx, "java/beans/PropertyDescriptor", 4),
-        };
+    for (i, (prop_name, getter, setter, _type_mirror, idx_read, idx_write)) in
+        properties.iter().enumerate()
+    {
         let name_str = ctx.create_string(prop_name);
-        let base = pd_real_fields;
-        ctx.set_field(pd, base + 0, Value::Object(Some(name_str)));
-        ctx.set_field(pd, base + 1, Value::Object(*getter));
-        ctx.set_field(pd, base + 2, Value::Object(*setter));
-        ctx.set_field(pd, base + 3, Value::Object(*type_mirror));
-        // ALSO populate JDK's real `FeatureDescriptor.name` field so that
-        // bytecode `PropertyDescriptor.getName()` (inherited from
-        // FeatureDescriptor) returns the right value. Without this, Spring's
-        // `ExtendedBeanInfo$PropertyDescriptorComparator.compare` (which calls
-        // `pd.getName().compareTo(...)`) NPEs because FeatureDescriptor.name
-        // is null on our synthetic PDs. We have no native override for
-        // getName because the method is declared on FeatureDescriptor — JDK
-        // bytecode reads its private field directly.
-        ctx.set_field_by_name(pd, "name", Value::Object(Some(name_str)));
+        // A property with any indexed accessor becomes a java.beans
+        // IndexedPropertyDescriptor (so `pd instanceof IndexedPropertyDescriptor`
+        // holds and getIndexedReadMethod/getIndexedWriteMethod work). The JDK
+        // 5-arg ctor validates index/type consistency itself.
+        let pd = if idx_read.is_some() || idx_write.is_some() {
+            match ctx.new_object_initialized(
+                "java/beans/IndexedPropertyDescriptor",
+                "(Ljava/lang/String;Ljava/lang/reflect/Method;Ljava/lang/reflect/Method;Ljava/lang/reflect/Method;Ljava/lang/reflect/Method;)V",
+                &[
+                    Value::Object(Some(name_str)),
+                    Value::Object(*getter),
+                    Value::Object(*setter),
+                    Value::Object(*idx_read),
+                    Value::Object(*idx_write),
+                ],
+            ) {
+                Ok(Some(Value::Object(Some(p)))) => Some(p),
+                // The ctor can throw IntrospectionException on an inconsistent
+                // indexed/array type pairing; retry with just the indexed read
+                // (java.beans favours the read method) before giving up.
+                _ => match ctx.new_object_initialized(
+                    "java/beans/IndexedPropertyDescriptor",
+                    "(Ljava/lang/String;Ljava/lang/reflect/Method;Ljava/lang/reflect/Method;Ljava/lang/reflect/Method;Ljava/lang/reflect/Method;)V",
+                    &[
+                        Value::Object(Some(name_str)),
+                        Value::Object(None),
+                        Value::Object(None),
+                        Value::Object(*idx_read),
+                        Value::Object(None),
+                    ],
+                ) {
+                    Ok(Some(Value::Object(Some(p)))) => Some(p),
+                    _ => None,
+                },
+            }
+        } else {
+            None
+        };
+        let pd = match pd {
+            Some(p) => p,
+            None => build_property_descriptor(ctx, name_str, *getter, *setter),
+        };
         ctx.set_array_element(pd_arr, i, Value::Object(Some(pd)));
     }
 
-    // SPB.11: Build MethodDescriptor[] populated with each setter Method
-    // mirror. Spring's ExtendedBeanInfo iterates these (via
-    // `findCandidateWriteMethods`) to discover candidate setters, and then
-    // calls `pd.setWriteMethod(method)` on the matching SimplePropertyDescriptor
-    // — without that callback, SPD's `this.writeMethod` field is left null
-    // and `pd.getWriteMethod()` returns null, surfacing as
-    // `NotWritablePropertyException` in Spring's BeanWrapperImpl. Each MD
-    // is a 1-slot synthetic with the wrapped Method at the JDK-named
-    // `method` field (resolved by name in the MethodDescriptor.getMethod
-    // native above; the synthetic stub's slot 0 IS the `method` field).
-    let setter_methods: Vec<ObjectRef> = properties
-        .iter()
-        .filter_map(|(_, _, setter, _)| *setter)
-        .collect();
-    let md_arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), setter_methods.len());
-    for (i, m) in setter_methods.iter().enumerate() {
-        let md = alloc_concurrent_synthetic(ctx, "java/beans/MethodDescriptor", 1);
-        // Write to the JDK-named field if it exists, falling back to slot 0
-        // on the synthetic stub.
-        ctx.set_field_by_name(md, "method", Value::Object(Some(*m)));
-        ctx.set_field(md, 0, Value::Object(Some(*m)));
+    // Build MethodDescriptor[] as genuine java.beans.MethodDescriptor objects
+    // over ALL public methods (java.beans BeanInfo exposes every
+    // Class.getMethods() entry). Spring's ExtendedBeanInfo.findCandidateWriteMethods
+    // scans these to discover non-standard write methods (static setters,
+    // non-void-returning setters, 2-arg indexed setters) that
+    // java.beans.Introspector itself ignores.
+    let md_arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), all_method_mirrors.len());
+    for (i, m) in all_method_mirrors.iter().enumerate() {
+        let md = match ctx.new_object_initialized(
+            "java/beans/MethodDescriptor",
+            "(Ljava/lang/reflect/Method;)V",
+            &[Value::Object(Some(*m))],
+        ) {
+            Ok(Some(Value::Object(Some(d)))) => d,
+            _ => {
+                let md = alloc_concurrent_synthetic(ctx, "java/beans/MethodDescriptor", 1);
+                ctx.set_field_by_name(md, "method", Value::Object(Some(*m)));
+                ctx.set_field(md, 0, Value::Object(Some(*m)));
+                md
+            }
+        };
         ctx.set_array_element(md_arr, i, Value::Object(Some(md)));
     }
 
-    // Build BeanInfo: slot 0 = PD[], slot 1 = MethodDescriptor[].
-    let bean_info = alloc_concurrent_synthetic(ctx, "java/beans/BeanInfo", 2);
+    // Build a real java.beans.BeanDescriptor so BeanInfo.getBeanDescriptor() is
+    // non-null (Spring's CachedIntrospectionResults calls
+    // `beanInfo.getBeanDescriptor().getBeanClass()`).
+    let bean_descriptor = match ctx.new_object_initialized(
+        "java/beans/BeanDescriptor",
+        "(Ljava/lang/Class;)V",
+        &[Value::Object(Some(class_mirror))],
+    ) {
+        Ok(Some(v @ Value::Object(Some(_)))) => v,
+        _ => Value::Object(None),
+    };
+
+    // Build BeanInfo: slot 0 = PD[], slot 1 = MethodDescriptor[],
+    // slot 2 = BeanDescriptor.
+    let bean_info = alloc_concurrent_synthetic(ctx, "java/beans/BeanInfo", 3);
     ctx.set_field(bean_info, 0, Value::Object(Some(pd_arr)));
     ctx.set_field(bean_info, 1, Value::Object(Some(md_arr)));
+    ctx.set_field(bean_info, 2, bean_descriptor);
 
     Ok(Some(Value::Object(Some(bean_info))))
+}
+
+/// Build a genuine `java.beans.PropertyDescriptor` from a name + read/write
+/// Method mirrors, matching java.beans' lenient construction.
+///
+/// The public `PropertyDescriptor(String, Method, Method)` ctor rejects a
+/// read/write pair whose property types are not *exactly* equal (e.g. a
+/// `Number getFoo()` paired with `void setFoo(Integer)` — see HotSpot, which
+/// also throws from that ctor). java.beans.Introspector itself does NOT use
+/// that ctor; it sets the methods individually, and `setWriteMethod` stores the
+/// write-method reference *before* it validates the type, so the write method
+/// survives the resulting IntrospectionException. We reproduce that: build a
+/// read-only PD, then call `setWriteMethod` and ignore a thrown
+/// IntrospectionException (the reference is already stored). The exception is
+/// fully contained by the `invoke` boundary — getReadMethod/getWriteMethod then
+/// return both methods, exactly like HotSpot.
+fn build_property_descriptor(
+    ctx: &mut dyn NativeContext,
+    name_str: ObjectRef,
+    read: Option<ObjectRef>,
+    write: Option<ObjectRef>,
+) -> ObjectRef {
+    // First try the strict 3-arg ctor; it succeeds for the common (matching or
+    // read-only/write-only) cases and yields the correct propertyType.
+    if let Ok(Some(Value::Object(Some(p)))) = ctx.new_object_initialized(
+        "java/beans/PropertyDescriptor",
+        "(Ljava/lang/String;Ljava/lang/reflect/Method;Ljava/lang/reflect/Method;)V",
+        &[
+            Value::Object(Some(name_str)),
+            Value::Object(read),
+            Value::Object(write),
+        ],
+    ) {
+        return p;
+    }
+    // Strict ctor rejected the pair (type mismatch). Build a read-only PD, then
+    // attach the write method leniently (ref stored before validation throws).
+    let pd = match ctx.new_object_initialized(
+        "java/beans/PropertyDescriptor",
+        "(Ljava/lang/String;Ljava/lang/reflect/Method;Ljava/lang/reflect/Method;)V",
+        &[
+            Value::Object(Some(name_str)),
+            Value::Object(read),
+            Value::Object(None),
+        ],
+    ) {
+        Ok(Some(Value::Object(Some(p)))) => Some(p),
+        _ => None,
+    };
+    if let (Some(pd), Some(_)) = (pd, write) {
+        // Ignore the IntrospectionException: setWriteMethod stores the ref first.
+        let _ = ctx.invoke(
+            "java/beans/PropertyDescriptor",
+            "setWriteMethod",
+            "(Ljava/lang/reflect/Method;)V",
+            &[Value::Object(Some(pd)), Value::Object(write)],
+        );
+        return pd;
+    }
+    if let Some(pd) = pd {
+        return pd;
+    }
+    // Last resort (class load failure): a bare object with the name field set
+    // keeps callers from NPEing on getName().
+    let cid = ctx
+        .ensure_class_initialized("java/beans/PropertyDescriptor")
+        .unwrap_or(cratonvm_types::ClassId::new(0));
+    let n = ctx.class_num_total_fields(cid);
+    let o = ctx.alloc_object(cid, n);
+    ctx.set_field_by_name(o, "name", Value::Object(Some(name_str)));
+    o
 }
 
 /// JavaBeans decapitalize: "FooBar" -> "fooBar", "URL" -> "URL" (first two uppercase stay)
