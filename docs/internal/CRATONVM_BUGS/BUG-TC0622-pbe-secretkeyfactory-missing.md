@@ -1,5 +1,21 @@
 # Bug TC0622 — `PBEWithMD5AndDES SecretKeyFactory not available` (PBE SecretKeyFactory unimplemented)
 
+> **RESOLVED 2026-06-29 — merged dev `58723590`** (fix commit `863eb69c`,
+> branch `claude/hungry-aryabhata-300730`). `TestSecretKeyCredentialHandler`
+> now **4/4** (was 1 failure). The native PBE path (`pbe_generate_secret` —
+> SunJCE's `PBEKey.getEncoded()` returns the 7-bit ASCII password, no key
+> derivation at factory time) already existed but was gated default-off behind
+> the broad `PBEWith*` prefix (`CRATONVM_NATIVE_PBE_KEYFACTORY=1`). Fix:
+> `pbkdf2_get_instance` now recognizes, **by default**, the exact allowlist of
+> real SunJCE `PBEKeyFactory` algorithm names (`is_known_pbe_keyfactory_alg`,
+> `phases_early.rs`) — so `PBEWithMD5AndDES` works while unknown `PBEWith*`
+> names still throw (HotSpot-faithful, mapped from `NoSuchAlgorithmException`).
+> The broad prefix stays opt-in via the env var. The "implement the PKCS#5 v1.5
+> MD5+DES KDF" recommendation below was a **misdiagnosis**: the SecretKeyFactory
+> does NOT derive a key — getEncoded is the password bytes; the MD5+DES PBKDF1
+> only runs later inside a `Cipher`. PBKDF2 path untouched; SHA-512/256
+> unaffected. See [[reference_tc0622_pbe_secretkeyfactory]].
+
 > **Root cause (one line):** CratonVM's native `SecretKeyFactory.getInstance`
 > override (`phases_early::pbkdf2_get_instance`) *unconditionally* intercepts
 > every `SecretKeyFactory.getInstance(...)` call but only recognizes
