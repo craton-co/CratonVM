@@ -720,14 +720,46 @@ fn native_context_lookup(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         Some(n) => n,
         None => return Err(throw_invalid_name(ctx, "null name")),
     };
+    do_context_lookup(ctx, this, &name)
+}
 
+/// `Context.lookup(Name)` — the `javax.naming.Name` overload. Real
+/// `InitialContext.lookup(Name)` bytecode resolves a `java:` name via
+/// `getURLOrDefaultInitCtx(name)` → `NamingManager.getURLContext("java", env)`,
+/// which currently returns null under CratonVM (the URL-context-factory lookup
+/// via `URL_PKG_PREFIXES` doesn't surface Tomcat's `javaURLContextFactory`).
+/// Without it the real path falls through to `getDefaultInitCtx()` →
+/// `javaURLContextFactory.getInitialContext(env)`, which yields an *initial*-mode
+/// `SelectorContext` backed by a fresh, empty `NamingContext` — so the lookup
+/// misses and the servlet sees a `NameNotFoundException` (Tomcat
+/// `testBug52830`: `lookup(new CompositeName("java:comp/env/boolean"))` → 500).
+///
+/// We mirror the `lookup(String)` intercept: render the `Name` to its string
+/// form (a `CompositeName` round-trips `java:comp/env/...` exactly) and run the
+/// identical delegation, which reaches the *non-initial* SelectorContext bound
+/// to the current web-app via `getObjectInstance`.
+fn native_context_lookup_name(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let name = match name_arg_to_string(ctx, args, 1)? {
+        Some(n) => n,
+        None => return Err(throw_invalid_name(ctx, "null name")),
+    };
+    do_context_lookup(ctx, this, &name)
+}
+
+/// Shared `lookup` body for both the `String` and `Name` overloads.
+fn do_context_lookup(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    name: &str,
+) -> MethodCallResult {
     // `java:` URL-scheme names: hand off to the JDK's URL-context-factory
     // chain so Tomcat's own `org.apache.naming` context resolves the name
     // against `ContextBindings`. Falls back to the flat store on null/err.
-    if is_java_url_scheme(&name) {
+    if is_java_url_scheme(name) {
         let env = initial_context_env(ctx, this);
         if let Some(url_ctx) = java_url_context(ctx, env)? {
-            let name_obj = ctx.create_string(&name);
+            let name_obj = ctx.create_string(name);
             return ctx.invoke_virtual(
                 url_ctx,
                 "lookup",
@@ -736,7 +768,7 @@ fn native_context_lookup(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
             );
         }
         if let Some(def_ctx) = tomcat_default_init_ctx(ctx, env)? {
-            let name_obj = ctx.create_string(&name);
+            let name_obj = ctx.create_string(name);
             return ctx.invoke_virtual(
                 def_ctx,
                 "lookup",
@@ -746,9 +778,28 @@ fn native_context_lookup(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         }
     }
 
-    match lookup_value(&name) {
+    match lookup_value(name) {
         Ok(obj) => Ok(Some(Value::Object(Some(obj)))),
         Err(msg) => Err(flat_store_error(ctx, &msg)),
+    }
+}
+
+/// Read a `javax.naming.Name` argument and render it to the string form the
+/// flat store / SelectorContext expect. `Name.toString()` on a `CompositeName`
+/// re-joins components with `/`, so `new CompositeName("java:comp/env/x")`
+/// round-trips back to `java:comp/env/x`. Returns `Ok(None)` for a null arg.
+fn name_arg_to_string(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    idx: usize,
+) -> Result<Option<String>, MethodCallFailed> {
+    let name_obj = match args.get(idx).copied() {
+        Some(Value::Object(Some(o))) => o,
+        _ => return Ok(None),
+    };
+    match ctx.invoke_virtual(name_obj, "toString", "()Ljava/lang/String;", &[])? {
+        Some(Value::Object(Some(s))) => Ok(ctx.read_string(s)),
+        _ => Ok(None),
     }
 }
 
@@ -982,6 +1033,15 @@ fn native_context_list_bindings(ctx: &mut dyn NativeContext, args: &[Value]) -> 
                 &[Value::Object(Some(name_obj))],
             );
         }
+        if let Some(def_ctx) = tomcat_default_init_ctx(ctx, env)? {
+            let name_obj = ctx.create_string(&name);
+            return ctx.invoke_virtual(
+                def_ctx,
+                "listBindings",
+                "(Ljava/lang/String;)Ljavax/naming/NamingEnumeration;",
+                &[Value::Object(Some(name_obj))],
+            );
+        }
     }
 
     let children = match list_bindings(&name) {
@@ -1099,6 +1159,12 @@ pub fn register_wildfly_naming_natives(r: &mut NativeMethodRegistry) {
         "lookup",
         "(Ljava/lang/String;)Ljava/lang/Object;",
         native_context_lookup,
+    );
+    r.register(
+        ic,
+        "lookup",
+        "(Ljavax/naming/Name;)Ljava/lang/Object;",
+        native_context_lookup_name,
     );
     r.register(
         ic,
