@@ -627,6 +627,18 @@ pub trait NativeContext {
     /// Get the length of an array object.
     fn array_length(&self, obj: ObjectRef) -> usize;
 
+    /// Whether `obj` is an array object (as opposed to an ordinary instance).
+    ///
+    /// This is a heap object-kind check — it does NOT go through
+    /// `class_id_of_object`/`class_name_of_id`, which for a heap-allocated
+    /// reference array report the *component* class (arrays store their element
+    /// class id + an array kind flag rather than a distinct `[L…;` class id), so
+    /// a class-name prefix test cannot reliably detect arrays. Default `false`
+    /// (mock contexts without a heap); the VM overrides it.
+    fn object_is_array(&self, _obj: ObjectRef) -> bool {
+        false
+    }
+
     /// Read an array element by index.
     ///
     /// `index` must be in `0..array_length(obj)`. The trait does NOT validate

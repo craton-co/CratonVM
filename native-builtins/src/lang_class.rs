@@ -11975,13 +11975,15 @@ fn make_annotated_type_with_anns(
 
 /// Read the stashed `Annotation[]` from an AnnotatedType built by
 /// [`make_annotated_type`] / [`make_annotated_type_with_anns`], returning
-/// `(array_ref, len)`. Returns `None` when the `annotations` field is null.
+/// `(array_ref, len)`. Returns `None` when the `annotations` field is null or
+/// not an array.
 ///
-/// `array_length` is null-safe and returns `0` for a non-array object (a real
-/// `AnnotatedTypeBaseImpl` whose `annotations` field holds a `Map`, built by
-/// bytecode paths we don't intercept — those carry no top-level annotations
-/// anyway since `getTypeAnnotationBytes0` is null). So a `Map`/non-array field
-/// reads as length-0 → empty, and only an actual `Annotation[]` yields entries.
+/// A real-JDK `AnnotatedTypeBaseImpl` (built by bytecode paths we don't
+/// intercept) stores a `Map` here, not an `Annotation[]` — `object_is_array`
+/// distinguishes the two by heap object kind (a class-name check can't: a
+/// heap reference array reports its *component* class, not a `[L…;` class).
+/// Those real instances carry no top-level type annotations anyway, since
+/// `getTypeAnnotationBytes0` is null, so reporting them as empty is correct.
 fn annotated_type_stashed_anns(
     ctx: &dyn NativeContext,
     this: ObjectRef,
@@ -11990,6 +11992,9 @@ fn annotated_type_stashed_anns(
         Value::Object(Some(a)) => a,
         _ => return None,
     };
+    if !ctx.object_is_array(arr) {
+        return None;
+    }
     Some((arr, ctx.array_length(arr)))
 }
 

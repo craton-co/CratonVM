@@ -672,6 +672,34 @@ impl LazyAttribute {
         }
     }
 
+    /// Return the decoded attribute, decoding a `Raw` body on the fly (without
+    /// mutating `self`) when it has not been eagerly decoded yet.
+    ///
+    /// Unlike [`as_decoded`] (which silently yields `None` for a `Raw`
+    /// attribute) and [`decode`] (which needs `&mut self` to cache the result),
+    /// this works behind a shared `&self` borrow — e.g. a reader-locked class
+    /// store — and never depends on a prior `force_decode_all` having run. The
+    /// already-decoded case borrows; the on-the-fly case returns an owned value.
+    /// Returns `None` only if the raw body fails to decode.
+    ///
+    /// [`as_decoded`]: LazyAttribute::as_decoded
+    /// [`decode`]: LazyAttribute::decode
+    pub fn decoded_or_decode<'a>(
+        &'a self,
+        constant_pool: &ConstantPool,
+    ) -> Option<std::borrow::Cow<'a, Attribute>> {
+        match self {
+            LazyAttribute::Decoded(attr) => Some(std::borrow::Cow::Borrowed(attr)),
+            LazyAttribute::Raw {
+                name,
+                source,
+                range,
+            } => decode_attribute_with_source_arc(name, source, range.clone(), constant_pool)
+                .ok()
+                .map(std::borrow::Cow::Owned),
+        }
+    }
+
     /// Is this attribute already decoded?
     pub fn is_decoded(&self) -> bool {
         matches!(self, LazyAttribute::Decoded(_))
