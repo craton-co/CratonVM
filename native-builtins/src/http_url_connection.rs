@@ -525,6 +525,7 @@ fn build_request(
     let mut has_user_agent = false;
     let mut has_content_length = false;
     let mut has_connection = false;
+    let mut has_content_type = false;
     for (k, v) in headers {
         let lk = k.to_ascii_lowercase();
         if lk == "user-agent" {
@@ -536,13 +537,27 @@ fn build_request(
         if lk == "connection" {
             has_connection = true;
         }
+        if lk == "content-type" {
+            has_content_type = true;
+        }
         let _ = write!(&mut out, "{k}: {v}\r\n");
     }
     if !has_user_agent {
         out.extend_from_slice(b"User-Agent: Java/CratonVM\r\n");
     }
-    if !has_content_length && (!body.is_empty() || matches!(method, "POST" | "PUT" | "PATCH")) {
+    let is_output_method = !body.is_empty() || matches!(method, "POST" | "PUT" | "PATCH");
+    if !has_content_length && is_output_method {
         let _ = write!(&mut out, "Content-Length: {}\r\n", body.len());
+    }
+    // Real-JDK `HttpURLConnection` defaults the request Content-Type to
+    // `application/x-www-form-urlencoded` when the application opened an
+    // output stream (POST/PUT/PATCH) without setting one. Servers rely on
+    // this to parse a form body into request parameters — e.g. Tomcat's
+    // `request.getParameter(...)` (TestRestCsrfPreventionFilter2's
+    // request-param nonce path returned 403 without it because the body was
+    // never parsed as parameters).
+    if !has_content_type && is_output_method {
+        out.extend_from_slice(b"Content-Type: application/x-www-form-urlencoded\r\n");
     }
     if !has_connection {
         // HttpURLConnection in real-JDK defaults to closing the connection.

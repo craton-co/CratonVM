@@ -1805,9 +1805,24 @@ fn register_uri_natives(r: &mut NativeMethodRegistry) {
             // ("URI is not absolute"); Tomcat's catch handles that too.
             return Err(iae("URI is not absolute"));
         }
-        if !KNOWN_PROTOCOLS.contains(&proto_lc.as_str()) {
-            // Not one of the always-handled built-in schemes. Rather than
-            // blindly reject, defer to the REAL `java.net.URL` constructor,
+        // Hierarchical (authority-bearing) schemes that have a real built-in
+        // JDK URL stream handler MUST be parsed by the real `java.net.URL`
+        // constructor too: the synthetic build below never splits the
+        // `//host:port` authority out of the path, so it leaves host="" /
+        // port=-1 and stuffs `//host:port/path` into the file field. That
+        // silently broke any caller that inspects URL host/port/file — e.g.
+        // `Response.isEncodeable` (URL session-id rewriting) returned false for
+        // every same-origin URL, so `encodeURL`/`encodeRedirectURL` never
+        // appended `;jsessionid=…` (TestResponse: 30 failures). `new
+        // URL(String)` is un-intercepted real bytecode in real-JDK mode and
+        // parses the authority correctly, so defer these to it.
+        const AUTHORITY_HANDLER_SCHEMES: &[&str] = &["http", "https", "ftp"];
+        if !KNOWN_PROTOCOLS.contains(&proto_lc.as_str())
+            || AUTHORITY_HANDLER_SCHEMES.contains(&proto_lc.as_str())
+        {
+            // Not one of the synthetic-only built-in schemes. Rather than
+            // blindly reject (unknown scheme) or mangle the authority
+            // (http/https/ftp), defer to the REAL `java.net.URL` constructor,
             // which runs `URL.getURLStreamHandler(proto)` — consulting any
             // app-registered `URLStreamHandlerFactory` (published into
             // `URL.factory` by `native_url_set_stream_handler_factory_guard`).
