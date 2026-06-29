@@ -5233,16 +5233,37 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                     // to the class specified in the lambda call site. This handles
                     // objects with generic ClassId (e.g., stub Object) where the
                     // lambda actually targets a specific class (e.g., PrintStream).
+                    //
+                    // CRIT (double-invoke): only retry when the NoSuchMethodError
+                    // is for THIS dispatch's own SAM method (i.e. the impl method
+                    // genuinely wasn't found on the receiver's runtime class). A
+                    // NoSuchMethodError for a DIFFERENT method means the SAM method
+                    // WAS found and ran, and the error bubbled up from a nested
+                    // call deep inside it — re-invoking here would run the
+                    // (side-effecting) method a SECOND time. That is exactly the
+                    // "InvocationInterceptors called invocation multiple times" /
+                    // NodeTestTask double-`prepare` corruption: a Hibernate
+                    // bytecode-enhanced `$$_hibernate_*` NSME thrown inside a JUnit
+                    // `TestTask::execute` lambda made `forEach` re-run `execute()`,
+                    // nulling `parentContext` on the second pass.
                     match &result {
                         Err(MethodCallFailed::InternalError(VmError::Linkage(
-                            LinkageError::NoSuchMethodError { .. },
-                        ))) if target_class.as_str() != &*lcs.impl_handle.class_name => self
-                            .invoke_or_native(
+                            LinkageError::NoSuchMethodError {
+                                method_name,
+                                method_descriptor,
+                                ..
+                            },
+                        ))) if target_class.as_str() != &*lcs.impl_handle.class_name
+                            && method_name.as_str() == &*lcs.impl_handle.member_name
+                            && method_descriptor.as_str() == &*lcs.impl_handle.descriptor =>
+                        {
+                            self.invoke_or_native(
                                 &lcs.impl_handle.class_name,
                                 &lcs.impl_handle.member_name,
                                 &lcs.impl_handle.descriptor,
                                 &full_args,
-                            ),
+                            )
+                        }
                         _ => result,
                     }
                     }
