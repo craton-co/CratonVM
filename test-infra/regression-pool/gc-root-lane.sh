@@ -180,12 +180,16 @@ gcstress_item VAAload     PASS
 gcstress_item VArgLen     PASS
 gcstress_item binarytrees PASS
 
-# --- 3. A2 ReflRepro (distinct alloc<->sweep-walker UAF; precise does NOT fix)
-hr; log "A2 ReflRepro (EXPECTED KNOWN-FAIL — precise maps do not fix this)"
+# --- 3. A2 ReflRepro — FIXED 2026-06-23 (6e3ddb05): the non-moving young sweep's
+# free-block coalescer now merges OVERLAPPING blocks (not just adjacent), so
+# Arena::alloc can't double-serve a young region. Was a GC free-list accounting
+# bug, NOT a register-resident JIT root (precise maps are orthogonal). Expected
+# PASS now; a crash/marker here is a REGRESSION → deviation.
+hr; log "A2 ReflRepro (EXPECTED PASS — FIXED 6e3ddb05; coalesce overlapping free blocks)"
 timed_run "CRATONVM_DBG_GC_STRESS=524288" "$CV" --java-home "$JDK" --Xmx 256m -cp "$CLASSDIR" ReflRepro 20000
 A2CM=$(echo "$OUT" | crash_markers)
-if [ "$RC" = 0 ] && [ "$A2CM" = 0 ]; then a2s="PASS"; else a2s="KNOWN-FAIL"; fi
-record "a2:ReflRepro" "$RC" "$WALL" "$([ "$a2s" = PASS ] && echo clean || echo crash)" "clean" "$a2s" "KNOWN-FAIL" "markers=$A2CM"
+if [ "$RC" = 0 ] && [ "$A2CM" = 0 ]; then a2s="PASS"; else a2s="REGRESSED"; fi
+record "a2:ReflRepro" "$RC" "$WALL" "$([ "$a2s" = PASS ] && echo clean || echo crash)" "clean" "$a2s" "PASS" "markers=$A2CM"
 
 # --- 4. MTRegex multi-thread GC-root stress (FLAKY by documentation:
 # pre-existing cross-thread STW JIT-root gap + a Thread.join/IMSE hang)

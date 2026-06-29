@@ -199,9 +199,20 @@ oop maps (`scan_one_frame_precise`, default-on `CRATONVM_PRECISE_JIT_MAPS`) and 
 conservative range scan, but a register-only oop is invisible to both — so it is
 never a mark root and the non-moving sweep zeroes its young slot. This is why
 `--nojit` passes (no register oops; the moving collector precisely scans + remaps
-interpreter frames) and `-Xmx8g` passes (no young GC). It is the **same unsolved
-problem** recorded for A2/A3 in `reflrepro-register-resident-jit-root-handoff.md`,
-where *every* coverage lever (`reg-spill`, `fullstack`, `shadow-pin`) also fails.
+interpreter frames) and `-Xmx8g` passes (no young GC).
+
+> **Correction (2026-06-29):** the older framing here — that A4 is "the same
+> unsolved register-resident problem as A2" — is now only half right. **A2 was
+> re-diagnosed and FIXED (`6e3ddb05`, 2026-06-23): it was *not* a register-resident
+> root at all, but a GC-side non-moving-sweep free-list double-serve** (overlapping
+> free blocks not coalesced). So A2 and A4 were *different* bugs that merely shared
+> a symptom (sweep-walk corruption under GC stress). A4's residual genuinely *is* a
+> register-only oop at a non-call safepoint (the levers `reg-spill`/`fullstack`/
+> `shadow-pin` all fail for it), which is what the original A2 hypothesis predicted
+> — that hypothesis was wrong for A2 but is the live theory for A4. On current dev
+> `Fork6` is non-fatal (26/26 ALL-OK, re-verified 2026-06-29); the cross-thread STW
+> JIT-root gap is exercised (`scan_active_jit_frames` WARN) but covered by the
+> peer's `root_snapshot`. A4 is the **last open Family-A member**.
 
 **There is no sound conservative quick-fix** — registers are not on the stack to
 scan, and the moving collector (which would remap them) cannot run while any
