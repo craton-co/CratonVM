@@ -6548,6 +6548,13 @@ pub(super) fn extract_return_type_annotations(
             None => continue,
         };
         if let Attribute::RuntimeVisibleTypeAnnotations(tas) = attr {
+            if std::env::var_os("CRATONVM_TYPEANN_DBG").is_some() {
+                eprintln!(
+                    "[typeann-dbg] extract_return: found RVTA with {} entries, targets={:?}",
+                    tas.len(),
+                    tas.iter().map(|t| t.target_type).collect::<Vec<_>>()
+                );
+            }
             return tas
                 .iter()
                 .filter(|ta| ta.target_type == TARGET_METHOD_RETURN && ta.type_path.is_empty())
@@ -11361,7 +11368,31 @@ fn invoke_on_class_shared_inner(
                         // (de)serialization fails (catalina TestGenericPrincipal:
                         // GenericPrincipal.writeReplace → SerializablePrincipal record).
                         || (class_name == "java/io/ObjectStreamClass$RecordSupport"
-                            && method_name == "deserializationCtr");
+                            && method_name == "deserializationCtr")
+                        // TYPE_USE annotation surface — the real-JDK
+                        // `getAnnotatedReturnType()` / `Parameter.getAnnotatedType()`
+                        // bytecode reads `getTypeAnnotationBytes0()` (stubbed null) +
+                        // the `jdk.internal.reflect.ConstantPool` accessor API (not
+                        // exposed), so JSpecify `@Nullable`/`@NonNull` type
+                        // annotations were invisible. Force our natives, which build
+                        // AnnotatedTypes from the parsed `RuntimeVisibleTypeAnnotations`.
+                        || (class_name == "java/lang/reflect/Method"
+                            && matches!(
+                                method_name,
+                                "getAnnotatedReturnType" | "getAnnotatedParameterTypes"
+                            ))
+                        || (class_name == "java/lang/reflect/Constructor"
+                            && method_name == "getAnnotatedParameterTypes")
+                        || (class_name == "java/lang/reflect/Parameter"
+                            && method_name == "getAnnotatedType")
+                        // Accessor overrides for the AnnotatedTypes we build (they
+                        // stash an `Annotation[]` where the real impl keeps a `Map`).
+                        || (class_name
+                            == "sun/reflect/annotation/AnnotatedTypeFactory$AnnotatedTypeBaseImpl"
+                            && matches!(
+                                method_name,
+                                "getAnnotation" | "getAnnotations" | "getDeclaredAnnotations"
+                            ));
                     if check_override
                         && shared
                             .native_methods

@@ -17311,6 +17311,46 @@ fn force_native_over_real_jdk_bytecode(
     matches!(
         (class_name, method_name, method_descriptor),
         ("java/lang/ClassLoader", "setDefaultAssertionStatus", "(Z)V")
+            // TYPE_USE annotation surface (JSpecify @Nullable/@NonNull). The real-JDK
+            // getAnnotatedReturnType()/Parameter.getAnnotatedType() bytecode can't
+            // decode our (null) getTypeAnnotationBytes0 + unexposed ConstantPool, so
+            // force our natives that parse RuntimeVisibleTypeAnnotations directly.
+            // Companion gate in vm_exec.rs `check_override`.
+            | (
+                "java/lang/reflect/Method",
+                "getAnnotatedReturnType",
+                "()Ljava/lang/reflect/AnnotatedType;"
+            )
+            | (
+                "java/lang/reflect/Method",
+                "getAnnotatedParameterTypes",
+                "()[Ljava/lang/reflect/AnnotatedType;"
+            )
+            | (
+                "java/lang/reflect/Constructor",
+                "getAnnotatedParameterTypes",
+                "()[Ljava/lang/reflect/AnnotatedType;"
+            )
+            | (
+                "java/lang/reflect/Parameter",
+                "getAnnotatedType",
+                "()Ljava/lang/reflect/AnnotatedType;"
+            )
+            | (
+                "sun/reflect/annotation/AnnotatedTypeFactory$AnnotatedTypeBaseImpl",
+                "getAnnotation",
+                "(Ljava/lang/Class;)Ljava/lang/annotation/Annotation;"
+            )
+            | (
+                "sun/reflect/annotation/AnnotatedTypeFactory$AnnotatedTypeBaseImpl",
+                "getAnnotations",
+                "()[Ljava/lang/annotation/Annotation;"
+            )
+            | (
+                "sun/reflect/annotation/AnnotatedTypeFactory$AnnotatedTypeBaseImpl",
+                "getDeclaredAnnotations",
+                "()[Ljava/lang/annotation/Annotation;"
+            )
             | ("java/net/URL", "getHost", "()Ljava/lang/String;")
             | (
                 "java/net/URL",

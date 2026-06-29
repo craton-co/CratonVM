@@ -11974,24 +11974,23 @@ fn make_annotated_type_with_anns(
 }
 
 /// Read the stashed `Annotation[]` from an AnnotatedType built by
-/// [`make_annotated_type`] / [`make_annotated_type_with_anns`]. Returns `None`
-/// when the `annotations` field is absent or not a reference array (e.g. a
-/// real-JDK `AnnotatedTypeBaseImpl` whose `annotations` field holds a `Map`,
-/// constructed by bytecode paths we don't intercept — those carry no
-/// annotations anyway since `getTypeAnnotationBytes0` is null).
+/// [`make_annotated_type`] / [`make_annotated_type_with_anns`], returning
+/// `(array_ref, len)`. Returns `None` when the `annotations` field is null.
+///
+/// `array_length` is null-safe and returns `0` for a non-array object (a real
+/// `AnnotatedTypeBaseImpl` whose `annotations` field holds a `Map`, built by
+/// bytecode paths we don't intercept — those carry no top-level annotations
+/// anyway since `getTypeAnnotationBytes0` is null). So a `Map`/non-array field
+/// reads as length-0 → empty, and only an actual `Annotation[]` yields entries.
 fn annotated_type_stashed_anns(
     ctx: &dyn NativeContext,
     this: ObjectRef,
-) -> Option<ObjectRef> {
+) -> Option<(ObjectRef, usize)> {
     let arr = match ctx.get_field_by_name(this, "annotations") {
         Value::Object(Some(a)) => a,
         _ => return None,
     };
-    let cid = ctx.class_id_of_object(arr);
-    match ctx.class_name_of_id(cid) {
-        Some(n) if n.starts_with('[') => Some(arr),
-        _ => None,
-    }
+    Some((arr, ctx.array_length(arr)))
 }
 
 /// `Method.getAnnotatedReturnType()Ljava/lang/reflect/AnnotatedType;`
@@ -12004,8 +12003,22 @@ pub(crate) fn native_method_get_annotated_return_type(
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let anns = match method_class_name_desc(ctx, this) {
-        Some((cid, name, desc)) => ctx.method_return_type_annotations(cid, &name, &desc),
-        None => Vec::new(),
+        Some((cid, name, desc)) => {
+            let a = ctx.method_return_type_annotations(cid, &name, &desc);
+            if std::env::var_os("CRATONVM_TYPEANN_DBG").is_some() {
+                eprintln!(
+                    "[typeann-dbg] getAnnotatedReturnType FIRED name={name} desc={desc} anns={}",
+                    a.len()
+                );
+            }
+            a
+        }
+        None => {
+            if std::env::var_os("CRATONVM_TYPEANN_DBG").is_some() {
+                eprintln!("[typeann-dbg] getAnnotatedReturnType FIRED but method_class_name_desc=None");
+            }
+            Vec::new()
+        }
     };
     let type_mirror = match ctx.invoke_virtual(this, "getReturnType", "()Ljava/lang/Class;", &[]) {
         Ok(Some(Value::Object(Some(m)))) => m,
@@ -12108,8 +12121,19 @@ pub(crate) fn native_annotated_type_get_declared_annotations(
     args: &[Value],
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    if let Some(arr) = annotated_type_stashed_anns(ctx, this) {
-        return Ok(Some(Value::Object(Some(arr))));
+    let stashed = annotated_type_stashed_anns(ctx, this);
+    if std::env::var_os("CRATONVM_TYPEANN_DBG").is_some() {
+        eprintln!(
+            "[typeann-dbg] AnnotatedType.getDeclaredAnnotations stashed-len={}",
+            stashed.map(|(_, n)| n as isize).unwrap_or(-1)
+        );
+    }
+    if let Some((arr, len)) = stashed {
+        if len > 0 {
+            // The field holds an actual `Annotation[]` (length>0 ⇒ array kind);
+            // return it directly.
+            return Ok(Some(Value::Object(Some(arr))));
+        }
     }
     let comp = annotation_component_class_id(ctx);
     let empty = ctx.new_ref_array(comp, 0);
@@ -12131,8 +12155,7 @@ pub(crate) fn native_annotated_type_get_annotation(
         Some(w) => w,
         None => return Ok(Some(Value::Object(None))),
     };
-    if let Some(arr) = annotated_type_stashed_anns(ctx, this) {
-        let n = ctx.array_length(arr);
+    if let Some((arr, n)) = annotated_type_stashed_anns(ctx, this) {
         for i in 0..n {
             if let Value::Object(Some(proxy)) = ctx.get_array_element(arr, i) {
                 if let Value::Object(Some(tm)) = ctx.get_field(proxy, ANN_PROXY_TYPE_MIRROR) {
