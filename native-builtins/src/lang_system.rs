@@ -2439,6 +2439,81 @@ pub(crate) fn native_array_new_array(
 /// `define_class_full` so this entry point shares the same backend
 /// (name-mismatch check, dup-define rejection, PD attribution) as
 /// the other three (Unsafe.defineClass + Lookup.defineClass).
+/// Pre-resolve a class's direct supertypes (superclass + interfaces) through the
+/// DEFINING loader before `define_class_full` links them.
+///
+/// `class_manager::define_class` resolves a class's superclass/interfaces only
+/// through CratonVM's global classpath (`load_class`) — it never calls back into
+/// the user `ClassLoader` that is defining the class. That is wrong for a loader
+/// whose classes live somewhere the global classpath cannot see: Tomcat's
+/// `WebappClassLoader` serves `/WEB-INF/lib` jars from its `WebResourceRoot`, so
+/// when it defines `org.apache.taglibs.standard.tlv.JstlCoreTLV` (a JSTL
+/// `TagLibraryValidator`) the superclass `JstlBaseTLV` — in the SAME jar — is
+/// invisible to the global store and the define fails (`ClassNotFound:
+/// JstlBaseTLV`), 500-ing every JSP that triggers TLD validation
+/// (`TestScopedAttributeELResolver`). JVMS §5.3.5 makes the defining loader the
+/// *initiating* loader for supertype resolution, so load each not-yet-loaded
+/// supertype through it first; once present in the store, `define_class_full`
+/// links cleanly.
+///
+/// Only fires for USER-DEFINED loaders and only for supertypes not already
+/// loaded, so built-in/app-loader defines (ByteBuddy, cglib, the bootstrap
+/// chain) — whose supertypes resolve from the classpath — are unaffected.
+fn preload_supertypes_via_loader(
+    ctx: &mut dyn NativeContext,
+    loader_obj: ObjectRef,
+    bytes: &[u8],
+) {
+    if !crate::classloader::is_user_defined_loader(ctx, loader_obj) {
+        return;
+    }
+    let cf = match cratonvm_reader::read_class(bytes) {
+        Ok(c) => c,
+        Err(_) => return, // malformed bytes — let define_class_full report it
+    };
+    let mut supertypes: Vec<String> = Vec::new();
+    if let Some(s) = &cf.super_class {
+        let n: &str = s;
+        if !n.is_empty() && n != "java/lang/Object" {
+            supertypes.push(n.to_string());
+        }
+    }
+    for iface in &cf.interfaces {
+        let n: &str = iface;
+        if !n.is_empty() {
+            supertypes.push(n.to_string());
+        }
+    }
+    if supertypes.is_empty() {
+        return;
+    }
+    let p_loader = ctx.pin_native_root(loader_obj);
+    let mut loader = loader_obj;
+    for internal in &supertypes {
+        loader = ctx.read_native_pin(p_loader, loader);
+        if ctx.class_id_by_name(internal).is_some() {
+            continue; // already loaded — define_class_full will link it
+        }
+        let dotted = internal.replace('/', ".");
+        let name_str = ctx.create_string(&dotted); // may relocate `loader`
+        loader = ctx.read_native_pin(p_loader, loader);
+        let p_name = ctx.pin_native_root(name_str);
+        loader = ctx.read_native_pin(p_loader, loader);
+        let name_str = ctx.read_native_pin(p_name, name_str);
+        // Best-effort: a genuine miss/throw is swallowed here and left for
+        // `define_class_full` to surface as the spec-mandated linkage error.
+        let _ = ctx.invoke_virtual(
+            loader,
+            "loadClass",
+            "(Ljava/lang/String;)Ljava/lang/Class;",
+            &[Value::Object(Some(name_str))],
+        );
+        loader = ctx.read_native_pin(p_loader, loader); // invoke may relocate
+        ctx.unpin_native_roots(p_name);
+    }
+    ctx.unpin_native_roots(p_loader);
+}
+
 pub(crate) fn native_classloader_define_class1(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -2533,6 +2608,16 @@ pub(crate) fn native_classloader_define_class1(
                 }
             }
         }
+    }
+
+    // JVMS §5.3.5 — resolve direct supertypes through the DEFINING loader before
+    // linking. `define_class_full` resolves the superclass/interfaces only via the
+    // global classpath; a user loader whose classes are invisible there (Tomcat's
+    // `WebappClassLoader` serving `/WEB-INF/lib` jars) would otherwise fail to
+    // define a class whose super lives in the same jar (JSTL `JstlCoreTLV` →
+    // `JstlBaseTLV`). No-op for built-in/app-loader defines.
+    if let Some(Value::Object(Some(loader_obj))) = args.first() {
+        preload_supertypes_via_loader(ctx, *loader_obj, &bytes);
     }
 
     let opts = cratonvm_native_api::DefineClassFull {
