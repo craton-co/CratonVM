@@ -2577,6 +2577,10 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             .unwrap_or(Value::Int(0))
     }
 
+    fn object_is_array(&self, obj: ObjectRef) -> bool {
+        self.shared.heap.kind_of(obj) == ObjectKind::Array
+    }
+
     fn set_array_element(&self, obj: ObjectRef, index: usize, value: Value) {
         let _ = self.shared.heap.set_array_element(obj, index, value);
         // write_barrier fires automatically inside set_array_element for ref arrays
@@ -6580,11 +6584,11 @@ pub(super) fn extract_return_type_annotations(
     use cratonvm_reader::attribute::Attribute;
     const TARGET_METHOD_RETURN: u8 = 0x14;
     for lazy in attributes {
-        let attr = match lazy.as_decoded() {
+        let attr = match lazy.decoded_or_decode(cp) {
             Some(a) => a,
             None => continue,
         };
-        if let Attribute::RuntimeVisibleTypeAnnotations(tas) = attr {
+        if let Attribute::RuntimeVisibleTypeAnnotations(tas) = attr.as_ref() {
             return tas
                 .iter()
                 .filter(|ta| ta.target_type == TARGET_METHOD_RETURN && ta.type_path.is_empty())
@@ -6607,11 +6611,11 @@ pub(super) fn extract_parameter_type_annotations(
     use cratonvm_reader::attribute::Attribute;
     const TARGET_METHOD_FORMAL_PARAMETER: u8 = 0x16;
     for lazy in attributes {
-        let attr = match lazy.as_decoded() {
+        let attr = match lazy.decoded_or_decode(cp) {
             Some(a) => a,
             None => continue,
         };
-        if let Attribute::RuntimeVisibleTypeAnnotations(tas) = attr {
+        if let Attribute::RuntimeVisibleTypeAnnotations(tas) = attr.as_ref() {
             let mut out: Vec<Vec<crate::native::registry::AnnotationData>> = Vec::new();
             for ta in tas {
                 if ta.target_type != TARGET_METHOD_FORMAL_PARAMETER || !ta.type_path.is_empty() {
@@ -6645,11 +6649,11 @@ pub(super) fn extract_field_type_annotations(
     use cratonvm_reader::attribute::Attribute;
     const TARGET_FIELD: u8 = 0x13;
     for lazy in attributes {
-        let attr = match lazy.as_decoded() {
+        let attr = match lazy.decoded_or_decode(cp) {
             Some(a) => a,
             None => continue,
         };
-        if let Attribute::RuntimeVisibleTypeAnnotations(tas) = attr {
+        if let Attribute::RuntimeVisibleTypeAnnotations(tas) = attr.as_ref() {
             return tas
                 .iter()
                 .filter(|ta| ta.target_type == TARGET_FIELD && ta.type_path.is_empty())
@@ -11424,32 +11428,16 @@ fn invoke_on_class_shared_inner(
                         // GenericPrincipal.writeReplace → SerializablePrincipal record).
                         || (class_name == "java/io/ObjectStreamClass$RecordSupport"
                             && method_name == "deserializationCtr")
-                        // TYPE_USE annotation surface — the real-JDK
-                        // `getAnnotatedReturnType()` / `Parameter.getAnnotatedType()`
-                        // bytecode reads `getTypeAnnotationBytes0()` (stubbed null) +
-                        // the `jdk.internal.reflect.ConstantPool` accessor API (not
-                        // exposed), so JSpecify `@Nullable`/`@NonNull` type
-                        // annotations were invisible. Force our natives, which build
-                        // AnnotatedTypes from the parsed `RuntimeVisibleTypeAnnotations`.
-                        || (class_name == "java/lang/reflect/Method"
-                            && matches!(
-                                method_name,
-                                "getAnnotatedReturnType" | "getAnnotatedParameterTypes"
-                            ))
-                        || (class_name == "java/lang/reflect/Constructor"
-                            && method_name == "getAnnotatedParameterTypes")
-                        || (class_name == "java/lang/reflect/Parameter"
-                            && method_name == "getAnnotatedType")
-                        || (class_name == "java/lang/reflect/Field"
-                            && method_name == "getAnnotatedType")
-                        // Accessor overrides for the AnnotatedTypes we build (they
-                        // stash an `Annotation[]` where the real impl keeps a `Map`).
-                        || (class_name
-                            == "sun/reflect/annotation/AnnotatedTypeFactory$AnnotatedTypeBaseImpl"
-                            && matches!(
-                                method_name,
-                                "getAnnotation" | "getAnnotations" | "getDeclaredAnnotations"
-                            ));
+                        // TYPE_USE annotation surface (JSpecify @Nullable/@NonNull):
+                        // force our natives that parse RuntimeVisibleTypeAnnotations,
+                        // since the real JDK path can't decode our null
+                        // getTypeAnnotationBytes0 + unexposed ConstantPool. Shared
+                        // source of truth with `force_native_over_real_jdk_bytecode`.
+                        || crate::runtime::interpreter::is_typeuse_annotation_native_override(
+                            class_name,
+                            method_name,
+                            descriptor,
+                        );
                     if check_override
                         && shared
                             .native_methods
