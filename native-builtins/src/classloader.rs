@@ -838,20 +838,22 @@ pub(crate) fn find_loaded_class_for_loader(
             .class_id_by_name(internal_name)
             .map(|cid| ctx.get_class_mirror(cid));
     }
-    // Loader-faithful resolution gate: when on, the own-namespace probe is
-    // EXACT (no global delegation fallback), so a user loader never reports a
-    // class some *other* loader defined — the prerequisite for two isolating
-    // loaders to each define their own copy of a name. Off → legacy behavior
-    // (the fallback-prone `class_id_by_name_and_loader`).
-    let exact = loader_aware_resolution();
-    // 1. Own-namespace copy.
+    // 1. Own-namespace copy — EXACT (no global / parent-delegation fallback).
+    // `findLoadedClass` must report ONLY a class THIS user loader has itself
+    // defined; the fallback-prone `class_id_by_name_and_loader` would otherwise
+    // hand back some OTHER loader's copy of a name this loader has not defined.
+    // That broke classloader isolation once a child loader already held a
+    // namespace (≥1 defined class): an as-yet-undefined but eligible class
+    // (e.g. an annotation interface the child overrides) resolved to the parent/
+    // app copy instead of the child defining its own, so
+    // `annotation.getClass().getClassLoader()` reported the app loader
+    // (MergedAnnotationClassLoaderTests.synthesizedUsesCorrectClassLoader).
+    // `define_class` records `(loader, name)` in `loaded_classes` regardless of
+    // the loader-aware-resolution gate, so the exact probe still finds the
+    // loader's own copy on later lookups (no duplicate definition); a genuine
+    // miss correctly falls through so the loader's own `loadClass` runs.
     if let Some(id) = peek_loader_namespace_id(ctx, this) {
-        let own = if exact {
-            ctx.class_id_defined_by_loader_exact(internal_name, id)
-        } else {
-            ctx.class_id_by_name_and_loader(internal_name, id)
-        };
-        if let Some(cid) = own {
+        if let Some(cid) = ctx.class_id_defined_by_loader_exact(internal_name, id) {
             return Some(ctx.get_class_mirror(cid));
         }
     }
