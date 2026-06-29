@@ -98,6 +98,23 @@ fn sel_dbg_enabled() -> bool {
     })
 }
 
+/// Opt-out for the Windows selector's active connect-completion probe (Phase 1b
+/// in `kernel_select_windows`). Default OFF (probe ENABLED) — set
+/// `CRATONVM_NO_SELECTOR_CONNECT_PROBE=1` to fall back to pure WSAPoll readiness
+/// for A/B debugging.
+#[cfg(windows)]
+fn connect_probe_disabled() -> bool {
+    static OFF: OnceLock<bool> = OnceLock::new();
+    *OFF.get_or_init(|| {
+        std::env::var("CRATONVM_NO_SELECTOR_CONNECT_PROBE")
+            .map(|v| {
+                let t = v.trim();
+                !t.is_empty() && t != "0" && !t.eq_ignore_ascii_case("false")
+            })
+            .unwrap_or(false)
+    })
+}
+
 /// Coarse cap (ms) applied to an otherwise-INDEFINITE `Selector.select()` so a
 /// missed wakeup self-heals (see the call site). Default 1000 ms — matches the
 /// reactor's usual finite select timeout, clears a stuck worker within ~1 s
@@ -130,6 +147,14 @@ pub const OP_READ: i32 = 1;
 pub const OP_WRITE: i32 = 4;
 pub const OP_CONNECT: i32 = 8;
 pub const OP_ACCEPT: i32 = 16;
+
+/// Max time (ms) the Windows selector blocks in WSAPoll while a non-blocking
+/// connect is still in progress, before returning to re-probe the original fd
+/// for completion (see `kernel_select_windows` Phase 1b). Small enough that a
+/// completed connect is surfaced near-instantly even if WSAPoll never reports
+/// the cloned handle's POLLOUT edge; large enough to avoid a busy spin.
+#[cfg(windows)]
+const CONNECT_REPOLL_MS: i32 = 50;
 
 // ---------------------------------------------------------------------------
 // Field indices
@@ -903,7 +928,7 @@ extern "system" {
 fn kernel_select_windows(id: i32, timeout_ms: i32) -> Result<i32, MethodCallFailed> {
     // Phase 1: snapshot under lock — pollfd entries plus the wakeup
     // receiver socket + interest/listener metadata, then drop the lock.
-    let (mut pollfds, key_index, wakeup_idx) = {
+    let (mut pollfds, key_index, wakeup_idx, connect_candidates) = {
         let regs = selectors().read();
         let Some(s) = regs.get(&id) else {
             return Err(closed_selector());
@@ -933,9 +958,20 @@ fn kernel_select_windows(id: i32, timeout_ms: i32) -> Result<i32, MethodCallFail
 
         let mut pollfds: Vec<Wsapollfd> = Vec::with_capacity(st.keys.len() + 1);
         let mut key_index: Vec<(i32, i32, bool)> = Vec::with_capacity(st.keys.len());
+        // net_fds of keys with OP_CONNECT interest backed by a non-blocking
+        // connect — probed for completion after the lock is dropped (see below).
+        let mut connect_candidates: Vec<i32> = Vec::new();
         for k in st.keys.values_mut() {
             // Reset readyOps prior to wait.
             k.ready_ops = 0;
+            // Collect OP_CONNECT candidates for the original-fd completion probe
+            // BEFORE the os_handle() gate: the selector's cloned handle may be
+            // absent/Dummy (clone failed at registration), but the connecting
+            // socket still lives in `tcp_registry` under net_fd and must be
+            // probed there. (This is exactly the case that parked the selector.)
+            if !k.handle.is_listener() && k.interest_ops & OP_CONNECT != 0 && k.net_fd > 0 {
+                connect_candidates.push(k.net_fd);
+            }
             let Some(os) = k.handle.os_handle() else {
                 continue;
             };
@@ -974,8 +1010,50 @@ fn kernel_select_windows(id: i32, timeout_ms: i32) -> Result<i32, MethodCallFail
             None
         };
 
-        (pollfds, key_index, wakeup_idx)
+        (pollfds, key_index, wakeup_idx, connect_candidates)
     };
+
+    // Phase 1b: actively probe each OP_CONNECT candidate's **original** socket
+    // for connect completion (off the live `tcp_registry` fd, not the selector's
+    // cloned handle). On Windows, `WSAPoll(POLLOUT)` of the *cloned* connecting
+    // socket can miss the connect-completion edge entirely when the connect was
+    // already in-progress at registration time — the selector then blocks
+    // forever and `finishConnect()` never runs (e.g. Jetty's HttpClient against
+    // a loopback server). Probing the original fd is deterministic. Any
+    // candidate that has completed (or failed) is delivered as OP_CONNECT-ready
+    // this cycle, and we drop the kernel wait to a non-blocking poll so we
+    // return immediately instead of parking. Opt out via
+    // CRATONVM_NO_SELECTOR_CONNECT_PROBE for A/B debugging.
+    let mut timeout_ms = timeout_ms;
+    let mut conn_ready: Vec<i32> = Vec::new();
+    if !connect_probe_disabled() {
+        let mut had_pending = false;
+        let mut not_connecting = 0usize;
+        let ncand = connect_candidates.len();
+        for net_fd in connect_candidates {
+            match crate::socket_channel::probe_connect_status(net_fd) {
+                crate::socket_channel::SelectorConnectProbe::Ready => conn_ready.push(net_fd),
+                crate::socket_channel::SelectorConnectProbe::Pending => had_pending = true,
+                crate::socket_channel::SelectorConnectProbe::NotConnecting => not_connecting += 1,
+            }
+        }
+        if sel_dbg_enabled() && ncand > 0 {
+            sel_dbg(format!(
+                "connect-probe cand={ncand} ready={} pending={had_pending} notconn={not_connecting}",
+                conn_ready.len()
+            ));
+        }
+        if !conn_ready.is_empty() {
+            // Don't block: we have OP_CONNECT readiness to deliver now.
+            timeout_ms = 0;
+        } else if had_pending && (timeout_ms < 0 || timeout_ms > CONNECT_REPOLL_MS) {
+            // A still-connecting candidate is in the wait set. WSAPoll(POLLOUT)
+            // of its cloned handle may never fire for the connect-completion
+            // edge, so bound the block and re-probe the original fd promptly
+            // rather than parking for the full (possibly 30 s) select timeout.
+            timeout_ms = CONNECT_REPOLL_MS;
+        }
+    }
 
     // Phase 2: WSAPoll without selector lock.
     let n = if pollfds.is_empty() {
@@ -1077,6 +1155,21 @@ fn kernel_select_windows(id: i32, timeout_ms: i32) -> Result<i32, MethodCallFail
     }
     for (fd, stream) in accepted_streams {
         st.pending_accepted.push_back((fd, stream));
+    }
+
+    // Deliver OP_CONNECT readiness detected by the original-fd probe (Phase 1b).
+    // Idempotent w.r.t. the WSAPoll-derived readiness above: only flips a key's
+    // ready_ops and counts it once.
+    for net_fd in conn_ready {
+        if let Some(k) = st.keys.get_mut(&net_fd) {
+            if k.interest_ops & OP_CONNECT != 0 {
+                let was_zero = k.ready_ops == 0;
+                k.ready_ops |= OP_CONNECT;
+                if was_zero {
+                    count += 1;
+                }
+            }
+        }
     }
 
     if woken || st.woken {

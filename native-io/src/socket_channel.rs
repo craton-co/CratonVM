@@ -114,6 +114,43 @@ pub(crate) enum TcpHandleClone {
     Stream(TcpStream),
 }
 
+/// Verdict from probing a registry-resident connecting socket for non-blocking
+/// connect completion. Used by the Windows NIO selector to surface `OP_CONNECT`
+/// readiness deterministically off the **original** pollable fd, rather than
+/// depending on `WSAPoll(POLLOUT)` of the selector's *cloned* handle to fire for
+/// the connect-completion edge — which on Windows can be missed entirely when
+/// the connect was still in-progress at registration time, parking the selector
+/// forever (`nio_selector::kernel_select_windows`).
+pub enum SelectorConnectProbe {
+    /// Not a connect-in-progress entry (unknown / listener / closed).
+    NotConnecting,
+    /// Still connecting — neither writable nor errored yet.
+    Pending,
+    /// Connect completed (or already promoted to a live stream) / failed: the
+    /// selector should report `OP_CONNECT` so the reactor calls finishConnect().
+    Ready,
+}
+
+/// Probe a `tcp_registry` entry by id for non-blocking connect completion.
+/// A `Connecting` entry is polled via `nb_connect::poll` on its live socket;
+/// a `Stream` entry counts as `Ready` (an immediate/loopback connect already
+/// promoted it). Everything else is `NotConnecting`.
+pub fn probe_connect_status(net_fd: i32) -> SelectorConnectProbe {
+    let map = tcp_registry().read();
+    match map.get(&net_fd) {
+        Some(TcpHandle::Connecting(s)) => match crate::nb_connect::poll(s) {
+            crate::nb_connect::ConnectPoll::Pending => SelectorConnectProbe::Pending,
+            // Both success and failure must surface OP_CONNECT so the reactor
+            // calls finishConnect(), which reads SO_ERROR and reports the
+            // outcome (a ConnectException on failure) rather than hanging.
+            crate::nb_connect::ConnectPoll::Connected
+            | crate::nb_connect::ConnectPoll::Failed(_) => SelectorConnectProbe::Ready,
+        },
+        Some(TcpHandle::Stream(_)) => SelectorConnectProbe::Ready,
+        _ => SelectorConnectProbe::NotConnecting,
+    }
+}
+
 /// Per-fd non-blocking flag. The OS state on the real socket mirrors this.
 fn tcp_blocking_state() -> &'static RwLock<HashMap<i32, bool>> {
     static FLAGS: OnceLock<RwLock<HashMap<i32, bool>>> = OnceLock::new();
