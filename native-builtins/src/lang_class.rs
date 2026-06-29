@@ -5938,10 +5938,56 @@ pub(crate) fn native_class_get_declared_methods(
 
         let methods = declared_methods_with_synthetic(ctx, class_id);
         // Filter out <init> and <clinit>
-        let visible: Vec<&MethodMetadata> = methods
+        let mut visible: Vec<&MethodMetadata> = methods
             .iter()
             .filter(|m| m.name != "<init>" && m.name != "<clinit>")
             .collect();
+
+        // Bridge-method adjacency ordering. A compiler-generated bridge method
+        // (ACC_BRIDGE, 0x40) is emitted AFTER its bridged counterpart in the
+        // class file, but typically as the LAST method of the class — so a
+        // bridged method and its bridge are not adjacent. HotSpot's
+        // `getDeclaredMethods` (symbol-table order) keeps the bridge right after
+        // its same-name bridged method, and two kinds of Spring code rely on
+        // that relative order:
+        //   * `ReflectionUtils.findMethod` / generic-type resolution take the
+        //     FIRST same-name method, which MUST stay the real (non-bridge) one,
+        //     else `getGenericReturnType()` reads the bridge's erased `Object`
+        //     return (GenericTypeResolverTests.resolveTypeFromNestedParameterizedType);
+        //   * the bridge-method tests collect all same-named methods and pick
+        //     the Object-returning bridge as `methods.get(0)`/`get(1)`, asserting
+        //     `isBridge()` (MergedAnnotationsTests.getWithTypeHierarchyFromBridgeMethod,
+        //     MergedAnnotationsComposedOnSingleAnnotatedElementTests
+        //     .typeHierarchyStrategyMultipleComposedAnnotationsOnBridgeMethod).
+        // Both are satisfied by moving each bridge to IMMEDIATELY AFTER the first
+        // same-name non-bridge method (never making a bridge the first sibling).
+        // Minimal, stable: everything else keeps its class-file position, and
+        // only classes that declare a bridge with a same-name sibling change.
+        if visible.iter().any(|m| m.access_flags & 0x0040 != 0) {
+            let mut reordered: Vec<&MethodMetadata> = Vec::with_capacity(visible.len());
+            let mut placed = vec![false; visible.len()];
+            for i in 0..visible.len() {
+                if placed[i] {
+                    continue;
+                }
+                reordered.push(visible[i]);
+                placed[i] = true;
+                // After the first same-name NON-bridge method, pull in any later
+                // same-name bridge(s) so the bridge follows its bridged method.
+                if visible[i].access_flags & 0x0040 == 0 {
+                    for j in (i + 1)..visible.len() {
+                        if !placed[j]
+                            && visible[j].access_flags & 0x0040 != 0
+                            && visible[j].name == visible[i].name
+                        {
+                            reordered.push(visible[j]);
+                            placed[j] = true;
+                        }
+                    }
+                }
+            }
+            visible = reordered;
+        }
 
         // GC-safe: `create_method_object` allocates (see `build_mirror_array`).
         let arr = build_mirror_array(ctx, visible.len(), |ctx, i| {
@@ -8130,15 +8176,34 @@ fn create_annotation_proxy(
     // this field is null, BlockJUnit4ClassRunner reports a dummy failure
     // because runsTopToBottom(Class) NPEs on equals().
     if let Some(class_name) = annotation_desc_to_class_name(&ann.type_descriptor) {
-        let cid_opt = ctx.class_id_by_name(class_name).or_else(|| {
-            // load_class returns the mirror; we only need the ClassId, so just
-            // trigger the load and re-query by name.
-            let _ = ctx.load_class(class_name);
-            ctx.class_id_by_name(class_name)
+        // Resolve the annotation TYPE through the declaring class's loader (the
+        // "container" in HotSpot's `AnnotationParser`) when one is supplied, so a
+        // child/isolating loader's OWN copy of the annotation interface is used.
+        // The type mirror backs `annotation.getClass()` and
+        // `annotation.annotationType()`, both of which must report the declaring
+        // loader for classloader-isolation patterns
+        // (MergedAnnotationClassLoaderTests.synthesizedUsesCorrectClassLoader).
+        // A meta-annotation that the child loader is NOT eligible to override
+        // delegates to the parent here, so it correctly reports the parent loader.
+        // Falls back to the global store for built-in loaders / on any loader
+        // failure (preserving the prior best-effort behavior).
+        let via_loader = container_loader.and_then(|loader| {
+            match resolve_annotation_class_via_loader(ctx, loader, class_name) {
+                Ok(mirror) => ctx.class_id_from_mirror(mirror).map(|cid| (cid, mirror)),
+                Err(_) => None,
+            }
         });
-        if let Some(cid) = cid_opt {
+        let cid_mirror = via_loader.or_else(|| {
+            let cid = ctx.class_id_by_name(class_name).or_else(|| {
+                // load_class returns the mirror; we only need the ClassId, so just
+                // trigger the load and re-query by name.
+                let _ = ctx.load_class(class_name);
+                ctx.class_id_by_name(class_name)
+            })?;
+            Some((cid, ctx.get_class_mirror(cid)))
+        });
+        if let Some((cid, mirror)) = cid_mirror {
             ann_class_id_opt = Some(cid);
-            let mirror = ctx.get_class_mirror(cid);
             ctx.set_field(proxy, ANN_PROXY_TYPE_MIRROR, Value::Object(Some(mirror)));
         } else if std::env::var("CRATONVM_IAE_TRACE").is_ok() {
             eprintln!("ANN-PROXY-NULL-MIRROR: annotation={} type_descriptor={} class_name={class_name} — type mirror NOT set (class load failed)",
