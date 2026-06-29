@@ -12198,7 +12198,7 @@ fn execute_instruction(
                 Value::Object(None) => {
                     thread.frames[frame_idx].stack.push(Value::Object(None))?;
                 }
-                Value::Object(Some(obj_ref)) => {
+                Value::Object(Some(mut obj_ref)) => {
                     let referencing_class_id = thread.frames[frame_idx].class_id;
                     let target_class_name = {
                         let cm = shared.class_manager.read();
@@ -12227,13 +12227,31 @@ fn execute_instruction(
                         // class_manager.write().load_class() — the write lock
                         // would block if any JIT thread holds a read lock during
                         // compilation, causing interpreter hangs under concurrent JIT.
-                        let target_class_id = resolve_class_loader_aware(
+                        //
+                        // GC-safety: `obj_ref` was popped off the operand stack at
+                        // the top of this handler, so it is no longer a GC root.
+                        // Under the loader-aware gate `resolve_class_loader_aware`
+                        // may re-enter Java (`ClassLoader.loadClass`) and trigger a
+                        // *moving* GC; the stale Rust-local `obj_ref` would then be a
+                        // dangling pointer, and pushing it back below would poison the
+                        // next root scan (observed: unrelated heap fields nulled →
+                        // spurious NPE/CCE). Pin it across the call and rebind to the
+                        // GC-forwarded address.
+                        let pin = thread.native_pin_roots.len();
+                        thread.native_pin_roots.push(obj_ref);
+                        let resolved = resolve_class_loader_aware(
                             shared,
                             thread,
                             referencing_class_id,
                             &target_class_name,
-                        )
-                        .map_err(|e| {
+                        );
+                        obj_ref = thread
+                            .native_pin_roots
+                            .get(pin)
+                            .copied()
+                            .unwrap_or(obj_ref);
+                        thread.native_pin_roots.truncate(pin);
+                        let target_class_id = resolved.map_err(|e| {
                             convert_class_not_found(
                                 shared,
                                 thread,
@@ -12339,7 +12357,7 @@ fn execute_instruction(
                 Value::Object(None) => {
                     thread.frames[frame_idx].stack.push(Value::Int(0))?;
                 }
-                Value::Object(Some(obj_ref)) => {
+                Value::Object(Some(mut obj_ref)) => {
                     let referencing_class_id = thread.frames[frame_idx].class_id;
                     let target_class_name = {
                         let cm = shared.class_manager.read();
@@ -12369,13 +12387,28 @@ fn execute_instruction(
                         // Non-array object is not instanceof any array type.
                         0
                     } else {
-                        let target_class_id = resolve_class_loader_aware(
+                        // GC-safety: `obj_ref` was popped off the operand stack, so
+                        // it is no longer a GC root. The loader-aware resolve may
+                        // re-enter `ClassLoader.loadClass` and trigger a moving GC;
+                        // a stale Rust-local `obj_ref` would then read garbage
+                        // (observed as `instanceof` returning the wrong answer — the
+                        // "wrong-boolean" enhancement failures). Pin across the call
+                        // and rebind to the forwarded address. See the Checkcast arm.
+                        let pin = thread.native_pin_roots.len();
+                        thread.native_pin_roots.push(obj_ref);
+                        let resolved = resolve_class_loader_aware(
                             shared,
                             thread,
                             referencing_class_id,
                             &target_class_name,
-                        )
-                        .map_err(|e| {
+                        );
+                        obj_ref = thread
+                            .native_pin_roots
+                            .get(pin)
+                            .copied()
+                            .unwrap_or(obj_ref);
+                        thread.native_pin_roots.truncate(pin);
+                        let target_class_id = resolved.map_err(|e| {
                             convert_class_not_found(
                                 shared,
                                 thread,
@@ -15790,6 +15823,41 @@ fn execute_invoke_kind(
         return res;
     }
 
+    // Loader-isolation dispatch override (gated on CRATONVM_LOADER_AWARE_RESOLUTION).
+    //
+    // `invoke_class` is the receiver's class NAME, and the dispatch below
+    // re-resolves that name via `get_loaded_class_id` — which returns ONE class
+    // per name. Under a user loader two classes can share a name: a per-loader
+    // ENHANCED copy (e.g. a Hibernate bytecode-enhanced entity — its
+    // `$$_hibernate_*` methods, dirty-tracking, and field-access interception
+    // overrides) AND the un-enhanced copy on the global classpath. Name
+    // re-resolution silently picks the global copy, so a virtual/interface call
+    // on an enhanced receiver would run the UN-enhanced method: `setX()` skips
+    // dirty tracking (`[]` instead of `["x"]`), `$$_hibernate_*` is missing
+    // (spurious NoSuchMethodError), etc. For a virtual/interface call the
+    // receiver's OWN runtime `class_id` is the authoritative dispatch target, so
+    // hand it to `try_stackless_invoke` as a dispatch-class override when it
+    // diverges from the name-resolved class. This keeps the normal stackless
+    // frame-push path (NO extra recursion), unlike routing through the recursive
+    // `invoke_on_class_shared`. Gated + divergence-only → byte-identical in the
+    // default (gate-off) / single-class-per-name case.
+    let dispatch_override: Option<ClassId> = if !is_special
+        && crate::runtime::env_cache::loader_aware_resolution()
+    {
+        receiver_class_id.filter(|rcv_cid| {
+            *rcv_cid != ClassId::new(0) && {
+                let cm = shared.class_manager.read();
+                cm.get_loaded_class_id(&invoke_class) != Some(*rcv_cid)
+                    && cm
+                        .get_class(*rcv_cid)
+                        .map(|c| &*c.name == &*invoke_class)
+                        .unwrap_or(false)
+            }
+        })
+    } else {
+        None
+    };
+
     // Try stackless frame push for bytecode methods (avoids Rust stack recursion)
     // For virtual/special calls, do NOT walk the native hierarchy — subclass
     // bytecode overrides must take priority over parent native overrides.
@@ -15802,6 +15870,7 @@ fn execute_invoke_kind(
         &method_descriptor,
         &args,
         false,
+        dispatch_override,
     )? {
         CachedCallResult::FramePushed => {
             if is_special {
@@ -15825,14 +15894,29 @@ fn execute_invoke_kind(
     }
 
     // Fallback: recursive dispatch for exotic cases (signature-polymorphic, JNI, proxy, etc.)
-    let result = invoke_shared(
-        shared,
-        thread,
-        &invoke_class,
-        &method_name,
-        &method_descriptor,
-        &args,
-    )?;
+    // Honor the loader-isolation dispatch override here too: a divergent
+    // receiver whose method the stackless path couldn't handle (synthetic stub /
+    // exotic → CacheMiss) must still dispatch on the receiver's own class_id,
+    // not the wrong name-resolved copy. Rare, so the recursive path is fine.
+    let result = if let Some(rcv_cid) = dispatch_override {
+        crate::vm::invoke_on_class_shared(
+            shared,
+            thread,
+            rcv_cid,
+            &method_name,
+            &method_descriptor,
+            &args,
+        )?
+    } else {
+        invoke_shared(
+            shared,
+            thread,
+            &invoke_class,
+            &method_name,
+            &method_descriptor,
+            &args,
+        )?
+    };
 
     if let Some(value) = result {
         let ret = crate::jit::return_type(&method_descriptor);
@@ -17565,6 +17649,12 @@ fn try_stackless_invoke(
     descriptor: &str,
     args: &[Value],
     walk_native_hierarchy: bool,
+    // Loader-isolation dispatch override: when `Some`, the bytecode-method
+    // lookup uses THIS class_id instead of re-resolving `class_name` (which can
+    // pick the wrong same-named per-loader copy). Only the divergent
+    // virtual-dispatch caller passes it; `None` everywhere else preserves the
+    // legacy name-based resolution byte-for-byte.
+    dispatch_class_override: Option<ClassId>,
 ) -> Result<CachedCallResult, MethodCallFailed> {
     use crate::runtime::frame::padded_bytecode;
     use crate::vm::{coerce_value_for_return, native_return_pushed_to_stack, safe_native_call};
@@ -17788,8 +17878,14 @@ fn try_stackless_invoke(
         return Ok(CachedCallResult::Handled);
     }
 
-    // 2. Look up class — must already be loaded for stackless path
-    let class_id = match shared.class_manager.read().get_loaded_class_id(class_name) {
+    // 2. Look up class — must already be loaded for stackless path.
+    //    A dispatch override (the receiver's own runtime class_id, supplied only
+    //    when it diverges from the name-resolved copy under loader isolation)
+    //    takes precedence so the ENHANCED per-loader copy's methods dispatch
+    //    instead of the un-enhanced global same-named class.
+    let class_id = match dispatch_class_override
+        .or_else(|| shared.class_manager.read().get_loaded_class_id(class_name))
+    {
         Some(id) => id,
         None => return Ok(CachedCallResult::CacheMiss),
     };
@@ -18260,6 +18356,7 @@ fn execute_invokestatic(
         &method_descriptor,
         &args,
         true,
+        None,
     )? {
         CachedCallResult::FramePushed => {
             populate_invoke_cache(thread, shared, current_class_id, cp_index, false);
