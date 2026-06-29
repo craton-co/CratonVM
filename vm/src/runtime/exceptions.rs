@@ -1294,6 +1294,9 @@ pub fn throw_runtime_error(
         RuntimeError::UnknownHostException { message } => {
             ("java/net/UnknownHostException", Some(message.as_str()))
         }
+        RuntimeError::SocketTimeoutException { message } => {
+            ("java/net/SocketTimeoutException", Some(message.as_str()))
+        }
         RuntimeError::FileNotFoundException { path } => {
             ("java/io/FileNotFoundException", Some(path.as_str()))
         }

@@ -37,7 +37,7 @@ use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
 
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
-use cratonvm_types::error::{MethodCallResult, RuntimeError};
+use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
 use cratonvm_types::{ArrayElementType, ObjectRef, Value};
 
 use crate::{alloc_concurrent_synthetic, obj_arg};
@@ -155,6 +155,11 @@ struct RealReq {
     method: String,                 // empty => "GET"
     headers: Vec<(String, String)>, // ordered; setRequestProperty replaces, addRequestProperty appends
     do_output: bool,
+    // Caller-configured timeouts in ms (Java semantics: 0 = infinite, unset =
+    // None → fall back to a sane default). The real-JDK carrier cannot park
+    // these in synthetic slots, so they live here keyed by object identity.
+    connect_timeout_ms: Option<i32>,
+    read_timeout_ms: Option<i32>,
 }
 
 fn real_reqs() -> &'static Mutex<HashMap<i32, RealReq>> {
@@ -236,18 +241,29 @@ fn real_body_bytes(ctx: &dyn NativeContext, this: ObjectRef) -> Vec<u8> {
 /// side-tables, since a real carrier's synthetic slots are unusable. Wrapped in
 /// a GC-safe blocking region so the blocking I/O does not stall an in-process
 /// CratonVM server's worker threads.
-fn huc_real_perform(ctx: &mut dyn NativeContext, this: ObjectRef, url_str: &str) -> i32 {
+/// Cached status sentinel marking a connection whose request timed out, so
+/// repeat getters re-raise `SocketTimeoutException` without blocking again.
+const HUC_TIMEOUT_STATUS: i32 = -2;
+
+fn huc_real_perform(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    url_str: &str,
+) -> Result<i32, MethodCallFailed> {
     let key = ctx.identity_hash_code(this);
     if let Some(st) = real_results()
         .lock()
         .ok()
         .and_then(|t| t.get(&key).map(|r| r.status))
     {
-        return st;
+        if st == HUC_TIMEOUT_STATUS {
+            return Err(socket_timeout_ex("Read timed out"));
+        }
+        return Ok(st);
     }
     let parsed = match parse_url(url_str) {
         Ok(p) => p,
-        Err(_) => return -1,
+        Err(_) => return Ok(-1),
     };
     let req = real_reqs()
         .lock()
@@ -259,16 +275,21 @@ fn huc_real_perform(ctx: &mut dyn NativeContext, this: ObjectRef, url_str: &str)
     } else {
         req.method.clone()
     };
+    // Honor the caller's setConnectTimeout/setReadTimeout (ms). Java treats 0
+    // as "infinite"; an unbounded blocking read would hang a worker forever,
+    // so 0/unset keeps the historical 30s/60s sane defaults while an explicit
+    // positive value (e.g. TomcatBaseTest's 1000ms) is honored exactly.
+    let connect_to = match req.connect_timeout_ms {
+        Some(v) if v > 0 => Duration::from_millis(v as u64),
+        _ => Duration::from_secs(30),
+    };
+    let read_to = match req.read_timeout_ms {
+        Some(v) if v > 0 => Duration::from_millis(v as u64),
+        _ => Duration::from_secs(60),
+    };
     let body = real_body_bytes(ctx, this);
     ctx.begin_blocking_region();
-    let resp = perform(
-        &parsed,
-        &method,
-        &req.headers,
-        &body,
-        Duration::from_secs(30),
-        Duration::from_secs(60),
-    );
+    let resp = perform(&parsed, &method, &req.headers, &body, connect_to, read_to);
     ctx.end_blocking_region();
     match resp {
         Ok((status, headers, body)) => {
@@ -282,9 +303,28 @@ fn huc_real_perform(ctx: &mut dyn NativeContext, this: ObjectRef, url_str: &str)
                     },
                 );
             }
-            status
+            Ok(status)
         }
-        Err(_) => -1,
+        // A read timeout maps to java.net.SocketTimeoutException (real-JDK
+        // behaviour) — code such as TestConnector.testStop catches it
+        // specifically. Cache the sentinel so later getters re-raise without
+        // blocking for another full timeout.
+        Err(ref e) if e == READ_TIMEOUT_SENTINEL => {
+            if let Ok(mut t) = real_results().lock() {
+                t.insert(
+                    key,
+                    RealResult {
+                        status: HUC_TIMEOUT_STATUS,
+                        headers: Vec::new(),
+                        body: Vec::new(),
+                    },
+                );
+            }
+            Err(socket_timeout_ex("Read timed out"))
+        }
+        // Other I/O failures (premature EOF, connection refused) follow the
+        // real JDK's `getResponseCode` contract of returning -1.
+        Err(_) => Ok(-1),
     }
 }
 
@@ -349,6 +389,13 @@ fn shared_legacy_config() -> Arc<ClientConfig> {
 
 fn ioex<S: Into<String>>(message: S) -> cratonvm_types::error::MethodCallFailed {
     RuntimeError::IOException {
+        message: message.into(),
+    }
+    .into()
+}
+
+fn socket_timeout_ex<S: Into<String>>(message: S) -> cratonvm_types::error::MethodCallFailed {
+    RuntimeError::SocketTimeoutException {
         message: message.into(),
     }
     .into()
@@ -575,6 +622,24 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|w| w == needle)
 }
 
+/// Sentinel error string returned by [`read_response`] when a socket read
+/// exceeds the configured read timeout. `huc_real_perform` recognises it and
+/// raises `java.net.SocketTimeoutException` (real-JDK behaviour) rather than
+/// folding it into the generic `-1`/IOException path.
+const READ_TIMEOUT_SENTINEL: &str = "__cratonvm_read_timeout__";
+
+/// Map a socket-read `io::Error` to an error string, flagging a timeout via
+/// [`READ_TIMEOUT_SENTINEL`]. A blocking `read` that hits `SO_RCVTIMEO`
+/// surfaces as `WouldBlock` (Unix) or `TimedOut` (Windows).
+fn read_io_err(prefix: &str, e: std::io::Error) -> String {
+    match e.kind() {
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut => {
+            READ_TIMEOUT_SENTINEL.to_string()
+        }
+        _ => format!("{prefix}: {e}"),
+    }
+}
+
 fn read_response<S: Read>(
     stream: &mut S,
     head: bool,
@@ -585,7 +650,7 @@ fn read_response<S: Read>(
     loop {
         let n = stream
             .read(&mut tmp)
-            .map_err(|e| format!("response read: {e}"))?;
+            .map_err(|e| read_io_err("response read", e))?;
         if n == 0 {
             return Err("connection closed before response head".into());
         }
@@ -939,7 +1004,7 @@ fn huc_get_response_code(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     // perform from the real URL rather than misreading our synthetic HUC_* slots.
     if let Some(url_str) = huc_real_object_url(ctx, this) {
         if url_str.starts_with("http://") || url_str.starts_with("https://") {
-            return Ok(Some(Value::Int(huc_real_perform(ctx, this, &url_str))));
+            return Ok(Some(Value::Int(huc_real_perform(ctx, this, &url_str)?)));
         }
     }
     ensure_connected(ctx, this)?;
@@ -971,7 +1036,7 @@ fn huc_get_response_message(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     // Real-JDK carrier: derive from the cached perform result.
     if let Some(url_str) = huc_real_object_url(ctx, this) {
         if url_str.starts_with("http://") || url_str.starts_with("https://") {
-            let status = huc_real_perform(ctx, this, &url_str);
+            let status = huc_real_perform(ctx, this, &url_str)?;
             let s = ctx.create_string(&status_reason(status));
             return Ok(Some(Value::Object(Some(s))));
         }
@@ -1016,7 +1081,7 @@ fn huc_get_input_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         // perform the request from the real URL and return its buffered body.
         if let Some(full) = huc_real_object_url(ctx, this) {
             if full.starts_with("http://") || full.starts_with("https://") {
-                huc_real_perform(ctx, this, &full);
+                huc_real_perform(ctx, this, &full)?;
                 let body = huc_real_body(ctx, this);
                 return Ok(Some(make_byte_array_input_stream(ctx, &body)));
             }
@@ -1063,7 +1128,7 @@ fn huc_get_error_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     // Real-JDK carrier: serve the cached body when the response was an error.
     if let Some(url_str) = huc_real_object_url(ctx, this) {
         if url_str.starts_with("http://") || url_str.starts_with("https://") {
-            let status = huc_real_perform(ctx, this, &url_str);
+            let status = huc_real_perform(ctx, this, &url_str)?;
             if status < 400 {
                 return Ok(Some(Value::Object(None)));
             }
@@ -1154,7 +1219,7 @@ fn huc_get_header_field_named(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     // Real-JDK carrier: read from the cached perform result, not synthetic slots.
     if let Some(url_str) = huc_real_object_url(ctx, this) {
         if url_str.starts_with("http://") || url_str.starts_with("https://") {
-            huc_real_perform(ctx, this, &url_str);
+            huc_real_perform(ctx, this, &url_str)?;
             let v = huc_real_headers(ctx, this)
                 .into_iter()
                 .find(|(k, _)| k.eq_ignore_ascii_case(&name))
@@ -1192,7 +1257,7 @@ fn huc_get_header_field_indexed(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     }
     if let Some(url_str) = huc_real_object_url(ctx, this) {
         if url_str.starts_with("http://") || url_str.starts_with("https://") {
-            huc_real_perform(ctx, this, &url_str);
+            huc_real_perform(ctx, this, &url_str)?;
             let v = huc_real_headers(ctx, this).get(idx as usize).cloned();
             return Ok(Some(match v {
                 Some((_k, val)) => Value::Object(Some(ctx.create_string(&val))),
@@ -1222,7 +1287,7 @@ fn huc_get_header_field_key_indexed(
     }
     if let Some(url_str) = huc_real_object_url(ctx, this) {
         if url_str.starts_with("http://") || url_str.starts_with("https://") {
-            huc_real_perform(ctx, this, &url_str);
+            huc_real_perform(ctx, this, &url_str)?;
             let v = huc_real_headers(ctx, this).get(idx as usize).cloned();
             return Ok(Some(match v {
                 Some((k, _)) => Value::Object(Some(ctx.create_string(&k))),
@@ -1249,7 +1314,7 @@ fn huc_get_header_fields(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     let this = obj_arg(args, 0)?;
     let headers = if let Some(url_str) = huc_real_object_url(ctx, this) {
         if url_str.starts_with("http://") || url_str.starts_with("https://") {
-            huc_real_perform(ctx, this, &url_str);
+            huc_real_perform(ctx, this, &url_str)?;
             huc_real_headers(ctx, this)
         } else {
             ensure_connected(ctx, this)?;
@@ -1267,7 +1332,7 @@ fn huc_get_content_length(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     let this = obj_arg(args, 0)?;
     if let Some(url_str) = huc_real_object_url(ctx, this) {
         if url_str.starts_with("http://") || url_str.starts_with("https://") {
-            huc_real_perform(ctx, this, &url_str);
+            huc_real_perform(ctx, this, &url_str)?;
             return Ok(Some(Value::Int(huc_real_body(ctx, this).len() as i32)));
         }
     }
@@ -1282,7 +1347,7 @@ fn huc_get_content_length_long(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     let this = obj_arg(args, 0)?;
     if let Some(url_str) = huc_real_object_url(ctx, this) {
         if url_str.starts_with("http://") || url_str.starts_with("https://") {
-            huc_real_perform(ctx, this, &url_str);
+            huc_real_perform(ctx, this, &url_str)?;
             return Ok(Some(Value::Long(huc_real_body(ctx, this).len() as i64)));
         }
     }
@@ -1518,6 +1583,10 @@ fn huc_set_connect_timeout(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         return Err(iae("setConnectTimeout: negative"));
     }
     if is_real_carrier(ctx, this) {
+        let key = ctx.identity_hash_code(this);
+        if let Ok(mut t) = real_reqs().lock() {
+            t.entry(key).or_default().connect_timeout_ms = Some(v);
+        }
         return Ok(None);
     }
     ctx.set_field(this, HUC_CONNECT_TIMEOUT, Value::Int(v));
@@ -1531,6 +1600,10 @@ fn huc_set_read_timeout(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         return Err(iae("setReadTimeout: negative"));
     }
     if is_real_carrier(ctx, this) {
+        let key = ctx.identity_hash_code(this);
+        if let Ok(mut t) = real_reqs().lock() {
+            t.entry(key).or_default().read_timeout_ms = Some(v);
+        }
         return Ok(None);
     }
     ctx.set_field(this, HUC_READ_TIMEOUT, Value::Int(v));
