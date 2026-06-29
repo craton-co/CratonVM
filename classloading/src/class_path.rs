@@ -1570,14 +1570,25 @@ impl ClassPath {
             if pb.is_dir() {
                 debug!("Dynamic classpath: adding directory {expanded}");
                 self.entries.push(ClassPathEntry::Directory(pb));
-            } else if pb
-                .extension()
-                .is_some_and(|e| e.eq_ignore_ascii_case("jar") || e.eq_ignore_ascii_case("zip"))
-                && pb.exists()
-            {
-                // Round 7 audit fix (MED #12): mmap large JARs on the
-                // dynamic-add path too (URLClassLoader, agent-injected
-                // jars, etc.).
+            } else if pb.extension().is_some_and(|e| e == "jmod") && pb.exists() {
+                match Self::load_jmod(&pb) {
+                    Ok(entry) => self.entries.push(entry),
+                    Err(e) => debug!("Dynamic classpath: failed to read JMOD {expanded}: {e}"),
+                }
+            } else if pb.is_file() {
+                // Any existing non-directory classpath entry is treated as a
+                // JAR/ZIP archive regardless of file extension, matching the
+                // real JDK's `URLClassPath` (a `file:` URL that does not end in
+                // '/' becomes a `JarLoader`). Hibernate's packaged-archive tests
+                // put `.par`/`.war`/`.ear` jars on a `URLClassLoader`; gating
+                // archive loading on a `.jar`/`.zip` extension made every class
+                // and resource inside them invisible (PackagedEntityManagerTest:
+                // orm.xml/cfg.xml not found, entities not discovered). `load_jar_data`
+                // fails closed (pushes no entry) when the bytes are not a valid
+                // zip, so a stray non-archive file on the classpath is harmless.
+                //
+                // Round 7 audit fix (MED #12): mmap large JARs on the dynamic-add
+                // path too (URLClassLoader, agent-injected jars, etc.).
                 match read_file_for_classpath(&pb) {
                     Ok(data) => {
                         Self::load_jar_data(&pb, data, &mut self.entries);
@@ -1585,11 +1596,6 @@ impl ClassPath {
                     Err(e) => {
                         debug!("Dynamic classpath: failed to read {expanded}: {e}");
                     }
-                }
-            } else if pb.extension().is_some_and(|e| e == "jmod") && pb.exists() {
-                match Self::load_jmod(&pb) {
-                    Ok(entry) => self.entries.push(entry),
-                    Err(e) => debug!("Dynamic classpath: failed to read JMOD {expanded}: {e}"),
                 }
             } else {
                 debug!("Dynamic classpath: skipping non-existent entry {expanded}");

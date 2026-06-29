@@ -288,19 +288,27 @@ impl ModuleRegistry {
     /// one-by-one through `Module.defineModule` (JVM JPMS API, Jigsaw
     /// agents) pays the rebuild cost on each call.
     ///
-    /// Typical Java workloads register fewer than 50 modules at once
-    /// (the JDK ships ~75 named modules, of which only ~15 are loaded
-    /// for a console app), so the O(N²) rebuild measures in
-    /// microseconds and is dwarfed by the per-module class-parse cost.
-    /// The `debug_assert!` below fires if a workload pushes module
-    /// count past 100 — at that point the incremental-rebuild fix
-    /// (only recompute readability for newly added modules, intersect
-    /// with existing closure) becomes warranted.
+    /// Since the boot module registry became eagerly populated (the
+    /// `CRATONVM_BOOT_MODULE_REGISTRY` path scans every boot/ext/app
+    /// `module-info.class` at `ClassManager::new`), the steady-state count is
+    /// no longer ~15: the JDK ships ~70 named modules and a large modular app
+    /// (e.g. the Hibernate ORM suite) pushes the total to ~140. The O(N²)
+    /// rebuild is still trivial at these scales — a few hundred modules is
+    /// sub-millisecond and dwarfed by per-module class-parse cost — so the
+    /// previous "fewer than 50" assumption (and the `<= 100` tripwire) was a
+    /// pre-eager-registration estimate that normal runs now legitimately
+    /// exceed. The `debug_assert!` below is retained only to catch genuine
+    /// *runaway* growth (a Jigsaw agent / fuzzer defining thousands of modules
+    /// one-by-one through `Module.defineModule`, where the O(N³) of
+    /// register-then-rebuild per call would bite); at that point the
+    /// incremental-rebuild fix (only recompute readability for newly added
+    /// modules, intersect with existing closure) becomes warranted.
     pub fn build_readability_graph(&mut self) {
         debug_assert!(
-            self.modules.len() <= 100,
+            self.modules.len() <= 4096,
             "ModuleRegistry: O(N²) readability rebuild grew to {} modules — \
-             time to switch to incremental update (see round-8 HIGH finding)",
+             runaway module registration; time to switch to incremental update \
+             (see round-8 HIGH finding)",
             self.modules.len()
         );
         if self.graph_built {
