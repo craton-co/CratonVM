@@ -1958,6 +1958,29 @@ pub(crate) fn update_root_snapshot(shared: &SharedVm, thread: &mut JvmThread) {
         snapshot.push(r);
     }
 
+    // This thread's own `java.lang.Thread` mirror (and any pending async
+    // exception). These live in `JvmThread` fields, not on any frame, so the
+    // frame scan above never captures them — yet `Thread.currentThread()`
+    // hands the mirror straight back to bytecode. When ANOTHER thread initiates
+    // a collection while this one is parked, the cross-thread collector marks
+    // and remaps only from this deposited snapshot (it never runs
+    // `collect_roots` for a non-current thread). Without depositing the mirror
+    // here it is (a) not marked — a non-moving sweep reclaims it — and (b) not
+    // seeded into the blocked-thread fixup chain, so a moving collection
+    // relocates it and `check_post_block_gc` leaves `self.thread.java_thread_obj`
+    // dangling. Either way the next `currentThread()` returns an all-zero-header
+    // object and real-JDK `Thread.getThreadGroup()` NPEs on a null `holder`
+    // (Tomcat TestDigestAuthenticator: a worker-thread GC orphaned the parked
+    // JUnit main thread's mirror). Depositing it closes both holes; the wake
+    // remap is `check_post_block_gc`, the safepoint-resume remap is
+    // `apply_pointer_map_to_thread` (both already forward `java_thread_obj`).
+    if let Some(obj) = thread.java_thread_obj {
+        snapshot.push(obj);
+    }
+    if let Some(exc) = thread.pending_async_exception {
+        snapshot.push(exc);
+    }
+
     // Cross-thread JIT-root hardening: also publish the conservative roots of
     // every active JIT frame on THIS thread into the snapshot.
     //

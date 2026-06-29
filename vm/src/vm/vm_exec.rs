@@ -1230,6 +1230,27 @@ impl<'a> NativeContextImpl<'a> {
         if let Some(r) = self.thread.native_pending_return {
             snapshot.push(r);
         }
+        // This thread's own `java.lang.Thread` mirror (and any pending async
+        // exception). They live in `JvmThread` fields, not on any frame, so the
+        // frame scan never captures them — yet `Thread.currentThread()` hands
+        // the mirror straight back to bytecode. This is the BLOCKING deposit
+        // path (parked in a native: socket read, sleep, join, f.get()); a GC
+        // initiated by another thread marks and remaps a blocked thread ONLY
+        // from this deposited snapshot (+ the fold into its frame fixup). Omit
+        // the mirror here and a non-moving sweep reclaims it / a moving GC
+        // strands `self.thread.java_thread_obj`, so the next `currentThread()`
+        // returns an all-zero-header object and real-JDK `getThreadGroup()`
+        // NPEs on a null `holder`. This is the intermittent Tomcat
+        // TestDigestAuthenticator failure: when a worker's GC lands while the
+        // JUnit main thread is blocked, its mirror was orphaned. Must mirror
+        // the identical deposit in `interpreter::update_root_snapshot` (the
+        // safepoint path); the wake remap is `check_post_block_gc`.
+        if let Some(obj) = self.thread.java_thread_obj {
+            snapshot.push(obj);
+        }
+        if let Some(exc) = self.thread.pending_async_exception {
+            snapshot.push(exc);
+        }
 
         drop(snapshot);
         // Publish a line-less frame trace alongside the root snapshot so another
