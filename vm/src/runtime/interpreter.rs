@@ -17200,6 +17200,46 @@ fn dump_stack_on_soe(thread: &JvmThread) {
     }
 }
 
+/// Whether `(class, method, desc)` is one of the reflection TYPE_USE-annotation
+/// methods CratonVM must serve from a Rust native instead of the real JDK
+/// bytecode (which decodes type annotations via `getTypeAnnotationBytes0()` —
+/// stubbed to null — plus the unexposed `jdk.internal.reflect.ConstantPool`).
+///
+/// This is the single source of truth for that override set: it is consulted by
+/// BOTH dispatch gates — [`force_native_over_real_jdk_bytecode`] (interpreter
+/// fast paths) and the `check_override` predicate in
+/// `vm_exec.rs::invoke_on_class_shared_inner` (the slow path). Adding a method
+/// here makes it win on every path; editing one list and not the other was the
+/// original footgun.
+pub(crate) fn is_typeuse_annotation_native_override(
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+) -> bool {
+    match class_name {
+        "java/lang/reflect/Method" => matches!(
+            (method_name, descriptor),
+            ("getAnnotatedReturnType", "()Ljava/lang/reflect/AnnotatedType;")
+                | ("getAnnotatedParameterTypes", "()[Ljava/lang/reflect/AnnotatedType;")
+        ),
+        "java/lang/reflect/Constructor" => {
+            (method_name, descriptor)
+                == ("getAnnotatedParameterTypes", "()[Ljava/lang/reflect/AnnotatedType;")
+        }
+        "java/lang/reflect/Parameter" | "java/lang/reflect/Field" => {
+            (method_name, descriptor)
+                == ("getAnnotatedType", "()Ljava/lang/reflect/AnnotatedType;")
+        }
+        "sun/reflect/annotation/AnnotatedTypeFactory$AnnotatedTypeBaseImpl" => matches!(
+            (method_name, descriptor),
+            ("getAnnotation", "(Ljava/lang/Class;)Ljava/lang/annotation/Annotation;")
+                | ("getAnnotations", "()[Ljava/lang/annotation/Annotation;")
+                | ("getDeclaredAnnotations", "()[Ljava/lang/annotation/Annotation;")
+        ),
+        _ => false,
+    }
+}
+
 fn force_native_over_real_jdk_bytecode(
     class_name: &str,
     method_name: &str,
@@ -17308,54 +17348,16 @@ fn force_native_over_real_jdk_bytecode(
     ) {
         return true;
     }
+    // TYPE_USE annotation surface (JSpecify @Nullable/@NonNull): the real-JDK
+    // getAnnotated{ReturnType,Type}/AnnotatedTypeBaseImpl bytecode can't decode
+    // our null getTypeAnnotationBytes0 + unexposed ConstantPool. Single source
+    // of truth — `check_override` (vm_exec.rs) consults the same predicate.
+    if is_typeuse_annotation_native_override(class_name, method_name, method_descriptor) {
+        return true;
+    }
     matches!(
         (class_name, method_name, method_descriptor),
         ("java/lang/ClassLoader", "setDefaultAssertionStatus", "(Z)V")
-            // TYPE_USE annotation surface (JSpecify @Nullable/@NonNull). The real-JDK
-            // getAnnotatedReturnType()/Parameter.getAnnotatedType() bytecode can't
-            // decode our (null) getTypeAnnotationBytes0 + unexposed ConstantPool, so
-            // force our natives that parse RuntimeVisibleTypeAnnotations directly.
-            // Companion gate in vm_exec.rs `check_override`.
-            | (
-                "java/lang/reflect/Method",
-                "getAnnotatedReturnType",
-                "()Ljava/lang/reflect/AnnotatedType;"
-            )
-            | (
-                "java/lang/reflect/Method",
-                "getAnnotatedParameterTypes",
-                "()[Ljava/lang/reflect/AnnotatedType;"
-            )
-            | (
-                "java/lang/reflect/Constructor",
-                "getAnnotatedParameterTypes",
-                "()[Ljava/lang/reflect/AnnotatedType;"
-            )
-            | (
-                "java/lang/reflect/Parameter",
-                "getAnnotatedType",
-                "()Ljava/lang/reflect/AnnotatedType;"
-            )
-            | (
-                "java/lang/reflect/Field",
-                "getAnnotatedType",
-                "()Ljava/lang/reflect/AnnotatedType;"
-            )
-            | (
-                "sun/reflect/annotation/AnnotatedTypeFactory$AnnotatedTypeBaseImpl",
-                "getAnnotation",
-                "(Ljava/lang/Class;)Ljava/lang/annotation/Annotation;"
-            )
-            | (
-                "sun/reflect/annotation/AnnotatedTypeFactory$AnnotatedTypeBaseImpl",
-                "getAnnotations",
-                "()[Ljava/lang/annotation/Annotation;"
-            )
-            | (
-                "sun/reflect/annotation/AnnotatedTypeFactory$AnnotatedTypeBaseImpl",
-                "getDeclaredAnnotations",
-                "()[Ljava/lang/annotation/Annotation;"
-            )
             | ("java/net/URL", "getHost", "()Ljava/lang/String;")
             | (
                 "java/net/URL",

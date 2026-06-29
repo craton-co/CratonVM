@@ -1025,18 +1025,36 @@ impl SharedVm {
             let list_iterator_id = class_manager
                 .load_class("java/util/ListIterator")
                 .expect("java/util/ListIterator must be loadable");
+            // The real-JDK `Collections$Unmodifiable*` views (and the
+            // `ImmutableCollections$*` family backing `List.of`/`Map.of`) all
+            // implement `java.io.Serializable`, so application code that
+            // serializes a collection containing one (e.g. Spring's `MimeType`,
+            // whose `parameters` field is `Collections.unmodifiableMap(...)`)
+            // round-trips. Declare it on the synthetic stamp so `instanceof
+            // Serializable` and the object-serialization natives agree; the
+            // wrappers carry no real bytecode fields, so the serialization
+            // native emits an explicit (backing, marker) record for them.
+            let serializable_id = class_manager
+                .load_class("java/io/Serializable")
+                .expect("java/io/Serializable must be loadable");
             // (synthetic class name, list of interface ClassIds it implements)
             let unmod_specs: [(&str, &[ClassId]); 6] = [
-                ("cratonvm/internal/UnmodifiableCollection", &[collection_id]),
+                (
+                    "cratonvm/internal/UnmodifiableCollection",
+                    &[collection_id, serializable_id],
+                ),
                 (
                     "cratonvm/internal/UnmodifiableList",
-                    &[list_id, collection_id],
+                    &[list_id, collection_id, serializable_id],
                 ),
                 (
                     "cratonvm/internal/UnmodifiableSet",
-                    &[set_id, collection_id],
+                    &[set_id, collection_id, serializable_id],
                 ),
-                ("cratonvm/internal/UnmodifiableMap", &[map_id]),
+                (
+                    "cratonvm/internal/UnmodifiableMap",
+                    &[map_id, serializable_id],
+                ),
                 ("cratonvm/internal/UnmodifiableItr", &[iterator_id]),
                 (
                     "cratonvm/internal/UnmodifiableListItr",

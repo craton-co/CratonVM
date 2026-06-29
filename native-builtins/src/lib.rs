@@ -41182,7 +41182,7 @@ fn native_proxy_new_instance(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     // the synthetic 3-slot `Proxy$Instance` regardless of the gate. Track the
     // *actual* allocated shape so the slot writes below match it.
     let use_real_super = real_proxy_super();
-    let (proxy, proxy_is_real_super) =
+    let (proxy, proxy_is_real_super, generated_cid) =
         match define_or_get_proxy_class(ctx, loader_namespace, &iface_cids) {
             ProxyClassOutcome::Real(cid) => {
                 // Real super → real `Proxy`'s single `h` field (slot 0); use the
@@ -41191,11 +41191,12 @@ fn native_proxy_new_instance(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
                 // synthetic stub loaded without bytecode can report 0 fields).
                 let min_fields = if use_real_super { 1 } else { 3 };
                 let n = ctx.class_num_total_fields(cid).max(min_fields);
-                (ctx.alloc_object(cid, n), use_real_super)
+                (ctx.alloc_object(cid, n), use_real_super, Some(cid))
             }
             ProxyClassOutcome::Degrade => (
                 alloc_concurrent_synthetic(ctx, "java/lang/reflect/Proxy$Instance", 3),
                 false,
+                None,
             ),
             ProxyClassOutcome::Failed(stage) => {
                 // increment 3 (§3): STRICT mode surfaces the real failure as the JDK
@@ -41208,9 +41209,30 @@ fn native_proxy_new_instance(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
                 (
                     alloc_concurrent_synthetic(ctx, "java/lang/reflect/Proxy$Instance", 3),
                     false,
+                    None,
                 )
             }
         };
+
+    // Defining-loader identity for a generated `$ProxyN`. JDK defines the proxy
+    // class in the supplied `ClassLoader`, so `proxy.getClass().getClassLoader()`
+    // returns THAT loader. `define_or_get_proxy_class` keys/defines the class by
+    // the loader's identity-hash *namespace*, which `Class.getClassLoader()` (it
+    // consults `defining_loader_for`) cannot map back to the loader instance —
+    // so a proxy over a child-loaded interface reported the app loader instead of
+    // the child (MergedAnnotationClassLoaderTests.synthesizedUsesCorrectClassLoader,
+    // where Spring's synthesize calls `Proxy.newProxyInstance(type.getClassLoader(),
+    // …)`). Register the real, user-defined loader object as the proxy class's
+    // defining loader. Only user-defined loaders are recorded; proxies created
+    // with a built-in (app/platform/bootstrap) or null loader keep the existing
+    // app-loader fallback, so the common case is unchanged.
+    if let Some(cid) = generated_cid {
+        if let Some(Value::Object(Some(loader_obj))) = args.first() {
+            if crate::classloader::is_user_defined_loader(ctx, *loader_obj) {
+                crate::classloader::register_defining_loader(cid.as_u32(), *loader_obj);
+            }
+        }
+    }
     // Handler at slot 0 — common to both layouts, so the dispatch path
     // (`proxy_invoke_handler_shared` → `get_field(proxy, 0)`) reads it uniformly.
     ctx.set_field(proxy, 0, handler);

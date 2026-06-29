@@ -128,6 +128,31 @@ pub struct DefineClassFull {
     pub privileged_define: bool,
 }
 
+/// The lambda-call-site metadata needed to round-trip a serializable lambda.
+///
+/// Mirrors the fields of `java.lang.invoke.SerializedLambda` that matter for
+/// reconstruction: the functional-interface SAM, the implementation method
+/// handle, the instantiated (specialized) descriptor, and the capture-value
+/// types. Produced by [`NativeContext::lambda_proxy_serial_metadata`] for a
+/// synthetic lambda-proxy class and consumed (alongside the captured field
+/// values) by the deserialization path, which feeds it straight into
+/// [`NativeContext::register_lambda_proxy`].
+#[derive(Clone, Debug)]
+pub struct LambdaSerialMetadata {
+    pub functional_interface: String,
+    pub sam_method_name: String,
+    pub sam_descriptor: String,
+    pub impl_class: String,
+    pub impl_member: String,
+    pub impl_descriptor: String,
+    /// JVMS `reference_kind` byte (1..=9) of the implementation method handle.
+    pub impl_ref_kind: u8,
+    pub instantiated_descriptor: String,
+    /// One type char per captured value (`'L'`, `'I'`, `'J'`, ...), in
+    /// factory-argument / proxy-field order.
+    pub capture_types: String,
+}
+
 /// Compute a fast 128-bit hash key for a native method triple.
 ///
 /// Returns a `(u64, u64)` pair. The two halves are produced by **two
@@ -627,6 +652,18 @@ pub trait NativeContext {
     /// Get the length of an array object.
     fn array_length(&self, obj: ObjectRef) -> usize;
 
+    /// Whether `obj` is an array object (as opposed to an ordinary instance).
+    ///
+    /// This is a heap object-kind check — it does NOT go through
+    /// `class_id_of_object`/`class_name_of_id`, which for a heap-allocated
+    /// reference array report the *component* class (arrays store their element
+    /// class id + an array kind flag rather than a distinct `[L…;` class id), so
+    /// a class-name prefix test cannot reliably detect arrays. Default `false`
+    /// (mock contexts without a heap); the VM overrides it.
+    fn object_is_array(&self, _obj: ObjectRef) -> bool {
+        false
+    }
+
     /// Read an array element by index.
     ///
     /// `index` must be in `0..array_length(obj)`. The trait does NOT validate
@@ -958,6 +995,16 @@ pub trait NativeContext {
     /// natives (`getName`/`getSimpleName`/`getNestHost`) to synthesize the
     /// HotSpot-style `<host>$$Lambda/0x<id>` name instead of `unknown_<id>`.
     fn lambda_proxy_host(&self, _class_id: ClassId) -> Option<String> {
+        None
+    }
+
+    /// For a synthetic lambda-proxy `ClassId`, return the full lambda
+    /// call-site metadata required to serialize and later reconstruct the
+    /// lambda (see [`LambdaSerialMetadata`]). Returns `None` for any
+    /// non-lambda class. Used by the object-serialization natives to emit a
+    /// `SerializedLambda`-equivalent record instead of attempting to serialize
+    /// the (un-loadable) synthetic `$$Lambda` proxy class by name.
+    fn lambda_proxy_serial_metadata(&self, _class_id: ClassId) -> Option<LambdaSerialMetadata> {
         None
     }
 
