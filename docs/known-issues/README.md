@@ -100,6 +100,17 @@ the ~30 docs map to **one root-cause family + ~15 distinct standalone bugs**, of
     ✅ **FIXED on dev** (moved to `docs/internal/app-jvm-bugs/`). The original gen-GC "lost young `Signaller`"
     theory was **refuted** (the hang is deterministic + GC-independent); the real cause was the synthetic
     `CompletableFuture.complete` native never running `postComplete()`. Fixed in the native — no GC change.
+18. **[GC: live young `Thread` mirror in a blocked thread's frame reclaimed (Tomcat real-net/real-AQS HARD CRASHES)](gc-blocked-thread-frame-stale-thread-mirror.md)** —
+    🟠 **OPEN on dev**, but a **defensive crash-mitigation is MERGED** (`6a04b0e3` + `e06ed934`). Six Tomcat
+    encoding/tribes classes SIGSEGV/panic (`compact_value.rs:502`) under `CRATONVM_REAL_NET_SOCKETS` +
+    `CRATONVM_REAL_AQS`: a live young `java.lang.Thread` mirror held in a **blocked** thread's frame local
+    (object-tagged, so NOT the lost-tag item 15) is reclaimed because it is missing from that thread's
+    deposited `root_snapshot`; the freed slot is reused as byte-buffer data and decoded as an object pointer.
+    Likely the **same underlying bug** as the `currentThread()`-mirror reclamation in
+    [`repros/gc-concurrent-spawn-reclamation/`](repros/gc-concurrent-spawn-reclamation/) whose fix is on an
+    **unpushed** branch (`feat/precise-maps-a4-finish`) → not on dev. The mitigation (`plausible_heap_pointer`
+    gate at every ref-decode + JIT receiver-deref boundary) degrades a stale ref to a Java NPE — all 6 are now
+    **crash-free jit+nojit** but still fail/time out (the reclamation itself is unfixed).
 
 FIXED bugs whose standalone docs were **removed** from this folder (resolved; full writeups in
 `git` history or [`docs/internal/fixed-suite-bugs/`](../internal/fixed-suite-bugs/)): A1 (reflection
