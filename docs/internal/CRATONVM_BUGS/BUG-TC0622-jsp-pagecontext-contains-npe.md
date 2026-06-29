@@ -1,5 +1,34 @@
 # Bug TC0622 — JSP runtime-compiled classes (`org.apache.jsp.*_jsp`, JSTL TLV hierarchy) fail to load on CratonVM → empty 500 → `String.contains()` on null
 
+> **✅ RESOLVED — FIXED + MERGED dev `650f149b`** (branch
+> `claude/clever-kapitsa-697e6c`, fix commit `c07e677a`, 2026-06-29). All 6
+> cluster tests pass (TestPageContext, TestScopedAttributeELResolver,
+> TestImportELResolver, TestOptionalELResolverInJsp, TestCompositeELResolver,
+> TestSessionCookieConfig); also fixed one of TestJspServlet's two failures
+> (testBug56568b). No regressions vs the dev baseline. Root cause was **four
+> layered real-JDK class-resolution defects**, each surfacing only once the
+> previous was fixed — NOT the ByteChunk/contains symptom below (that is correct
+> Tomcat behaviour for an empty 500):
+> 1. `URLClassLoader.findClass` was never served by a native in real-JDK mode.
+>    Jasper's `JasperLoader` overrides BOTH `loadClass` overloads and calls
+>    `findClass()` directly, bypassing CratonVM's `loadClass` native and reaching
+>    the real `URLClassLoader.findClass` bytecode whose shimmed `ucp.getResource`
+>    returns null → CNF for `org.apache.jsp.*_jsp`. Fixed with `ucl_real_find_class`
+>    (resolves from the global dynamic classpath the loader's `<init>` registered)
+>    + `intercept_urlclassloader_subclass_find_class` (the findClass CP methodref
+>    names the *subclass*, so the static-class force-native gate missed it).
+> 2. `defineClass1` resolved a class's superclass/interfaces only via the global
+>    classpath, never the defining loader — JSTL `JstlCoreTLV` → `JstlBaseTLV` (both
+>    in a `/WEB-INF/lib` jar served by Tomcat's `WebResourceRoot`) failed to define.
+>    Fixed with `preload_supertypes_via_loader` (JVMS §5.3.5).
+> 3 & 4. Runtime symbolic refs among webapp classes (`new JstlCoreTLV$Handler`,
+>    `invokestatic XmlUtil.newXMLReader`) resolved only globally. Fixed with a
+>    strictly-additive defining-loader fallback (`drive_defining_loader_load`) on a
+>    global resolution miss, in `resolve_class_loader_aware` + `execute_invokestatic`.
+>
+> See memory `reference_tc0622_jsp_webapp_loader_resolution` for full detail. The
+> original analysis below is retained for historical context.
+
 > **One-line root cause:** The `String.contains(...)` NPE at line 34 of both
 > tests is a **downstream symptom**, not the bug. The real defect is server-side:
 > Jasper compiles the JSP/tag to a servlet class with ECJ, but the generated
