@@ -12059,6 +12059,18 @@ fn invoke_on_class_shared_inner(
                         class_name, method_name, descriptor
                     );
                 }
+                if std::env::var_os("CRATONVM_DBG_NSME_STACK").is_some() {
+                    eprintln!("[NSME-STACK] target={class_name}.{method_name}{descriptor}");
+                    for (i, f) in thread.frames.iter().rev().enumerate().take(20) {
+                        eprintln!(
+                            "[NSME-STACK]   #{i} {}.{}{} @pc={}",
+                            f.class_name(),
+                            f.method_name(),
+                            f.method_descriptor(),
+                            f.pc
+                        );
+                    }
+                }
                 return Err(MethodCallFailed::InternalError(VmError::Linkage(
                     LinkageError::NoSuchMethodError {
                         class_name,

@@ -6449,12 +6449,16 @@ fn alloc_backing_map(ctx: &mut dyn NativeContext) -> ObjectRef {
 /// (`LinkedHashSet`, `CopyOnWriteArraySet`). These share the HashSet native
 /// surface but must be backed by a `LinkedHashMap` so the shared iterator
 /// (which walks the backing map) yields insertion order, not bucket order.
+///
+/// Uses a *subclass* check rather than an exact class-name match: real apps
+/// subclass `LinkedHashSet` (e.g. Spring's `ManagedSet`, which the bean-factory
+/// collection-merge path iterates by insertion order), and those instances
+/// dispatch through this same HashSet native surface. An exact-name match would
+/// hand a `ManagedSet` a plain `HashMap` backing, so `merge()`/`addAll()` would
+/// iterate in bucket order and break Spring's order-sensitive merge contract.
 fn hs_is_insertion_ordered(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
-    matches!(
-        ctx.class_name_of_id(ctx.class_id_of_object(this))
-            .as_deref(),
-        Some("java/util/LinkedHashSet") | Some("java/util/concurrent/CopyOnWriteArraySet")
-    )
+    obj_is_instance_of(ctx, this, "java/util/LinkedHashSet")
+        || obj_is_instance_of(ctx, this, "java/util/concurrent/CopyOnWriteArraySet")
 }
 
 /// Allocate + initialize a fresh backing map for a Set: a `LinkedHashMap`
