@@ -4811,15 +4811,50 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         fs_class,
         "getRootDirectories",
         "()Ljava/lang/Iterable;",
-        |ctx, _args| {
+        |ctx, args| {
             use cratonvm_types::ArrayElementType;
-            let root = if cfg!(windows) { "C:\\" } else { "/" };
-            let root_path = p57_alloc_path(ctx, root);
+            // A mounted-jar FileSystem (P57_FS_JAR_FIELD set) must enumerate from
+            // a jar-FS root path so `Files.walkFileTree` recurses into the
+            // archive's entries — javac's `JavacFileManager$ArchiveContainer`
+            // walks `getRootDirectories()` to index a classpath jar's packages
+            // (the in-process compiler the H2 `CREATE ALIAS` / HIB-CV-27 path
+            // depends on). A host FileSystem returns the OS root.
+            //
+            // The previous body ignored `this` and always returned the host
+            // root, wrapped in a `Collections$SingletonList` whose field 0 held
+            // the backing *array* — but the real-JDK `SingletonList` iterator
+            // reads field 0 as the single *element*, so a for-each yielded one
+            // null. That null `Path` reached the default `SimpleFileVisitor.
+            // visitFile`, whose `Objects.requireNonNull(file)` then NPE'd —
+            // crashing `ArchiveContainer.<init>` for every classpath jar and
+            // making in-process compilation fail. Use the real-JDK `ArrayList`
+            // layout instead (same as `installedProviders`), which iterates
+            // correctly.
+            let jar_field = obj_arg(args, 0)
+                .ok()
+                .map(|this| ctx.get_field(this, P57_FS_JAR_FIELD));
+            let root_path = match jar_field {
+                Some(Value::Object(Some(s))) => {
+                    let jar = ctx.read_string(s).unwrap_or_default();
+                    let rp = p57_alloc_path(ctx, &jarfs_encode(&jar, ""));
+                    if let Ok(this) = obj_arg(args, 0) {
+                        ctx.set_field(rp, P57_PATH_FS_FIELD, Value::Object(Some(this)));
+                    }
+                    rp
+                }
+                _ => {
+                    let root = if cfg!(windows) { "C:\\" } else { "/" };
+                    p57_alloc_path(ctx, root)
+                }
+            };
             let arr = ctx.new_array(ArrayElementType::Reference, 1);
             ctx.set_array_element(arr, 0, Value::Object(Some(root_path)));
-            // Wrap in a simple list-like iterable
-            let list = alloc_concurrent_synthetic(ctx, "java/util/Collections$SingletonList", 1);
-            ctx.set_field(list, 0, Value::Object(Some(arr)));
+            // Real ArrayList field layout in real-JDK mode:
+            //   [0]=AbstractList.modCount (int), [1]=elementData (Object[]), [2]=size (int).
+            let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 3);
+            ctx.set_field(list, 0, Value::Int(0));
+            ctx.set_field(list, 1, Value::Object(Some(arr)));
+            ctx.set_field(list, 2, Value::Int(1));
             Ok(Some(Value::Object(Some(list))))
         },
     );
