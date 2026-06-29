@@ -11,7 +11,7 @@
 | sorted.set.SortComparatorTest | fail (0/1) | 0/1 | OPEN — persist-side dedup (1-of-2 inserted); core collections OK |
 | sorted.set.SortNaturalTest | fail (0/1) | 0/1 | OPEN — same as above |
 | mapping.type.format.XmlFormatterTest | UOE (10/12) | 10/12 | OPEN — `byte[][]`→CollectionJavaType; `isArray` is correct |
-| util.PropertiesHelperTest | UOE (1/2) | 1/2 | OPEN — Properties live entrySet view needed |
+| util.PropertiesHelperTest | UOE (1/2) | **2/2 PASS** ✅ | FIXED — Properties live entrySet (STATIC view) |
 | stats.ExplicitQueryStatsMaxSizeTest | 0≠1000 (1/2) | 1/2 | OPEN — BoundedConcurrentHashMap LRU eviction |
 | mapping.fetch.depth.NoDepthTests | .par URL (2/4) | 2/4 | OPEN — ShrinkWrap in-memory archive URL |
 | onetoone.nopojo.DynamicMapOneToOneTest | LOADERR | HANG | OPEN — `--nojit` hbm.xml-mapping bootstrap hang (HIB-CV-23 class) |
@@ -168,7 +168,25 @@ MEDIUM (bisection pending). Deep interpreter/ByteBuddy interaction — deferred.
 
 ## 2. `UnsupportedOperationException` where HotSpot succeeds
 
-### 2a. `util.PropertiesHelperTest` — `Properties.entrySet()` is not a live view
+### 2a. `util.PropertiesHelperTest` — `Properties.entrySet()` is not a live view — ✅ FIXED
+
+> **✅ FIXED 2026-06-29 (branch `fix/hib-cv-35-properties`). PropertiesHelperTest
+> 1/2 → 2/2.** `Properties.entrySet()` now returns a **live STATIC entrySet view**
+> backed by the Properties object: each element is a 3-field
+> `java/util/Map$Entry` (key, value, sourceMap=this) so `entry.setValue(v)`
+> writes through to the side-table (`native_entry_set_value` dispatches the
+> backing `put` virtually for a Hashtable/Properties source — new
+> `is_hashtable_receiver`), and the set's `iterator().remove()` / `remove(entry)`
+> / `clear()` propagate to the side-table via the view backing's virtual
+> `remove`/`clear`. A new view-kind `VIEW_KIND_ENTRYSET_STATIC` materialises the
+> view **once** and never resyncs from the source — a normal resyncing entrySet
+> view would walk `Properties.entrySet()` on every `iterator()`/`size()` and
+> recurse (the side-table is not a natively-readable HashMap bucket array).
+> Keying write-through on the view backing (not the entries' source field) keeps
+> a later `new HashSet<>(props.entrySet())` copy correctly detached on `remove`.
+> Verified: 2 standalone repros 9/9 + 12/12 == HotSpot (incl. copy-detachment,
+> set.remove boolean, contains, clear), 2710 native unit tests, SerializationHelper
+> / StatelessSession still pass.
 
 **Symptom (CONFIRMED, reproduced):**
 `UnsupportedOperationException` at

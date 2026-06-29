@@ -1538,7 +1538,15 @@ pub(crate) fn register_wp2_1_natives(registry: &mut NativeMethodRegistry) {
         "java/lang/reflect/ParameterizedType",
         "getOwnerType",
         "()Ljava/lang/reflect/Type;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
+        // field 2 = ownerType (set by generics::type_sig_to_java for nested
+        // `Outer<...>.Inner<...>` signatures; null otherwise). Returning the
+        // field rather than a hard-coded null lets Spring's variable resolvers
+        // walk to an enclosing generic class. Synthetic PTs are allocated with
+        // 3 fields, so the slot-2 read is in bounds.
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            Ok(Some(ctx.get_field(this, 2)))
+        },
     );
 
     // S111r13 — Real-JDK ParameterizedTypeImpl native overrides.
@@ -1848,6 +1856,7 @@ pub(crate) fn register_wp2_1_natives(registry: &mut NativeMethodRegistry) {
             return Some(TypeSig::Class {
                 name: name.replace('.', "/"),
                 type_args: jdk_collect_type_args(ctx, node),
+                owner: None,
             });
         }
         if cls.ends_with("ClassTypeSignature") {
@@ -1891,6 +1900,7 @@ pub(crate) fn register_wp2_1_natives(registry: &mut NativeMethodRegistry) {
             return Some(TypeSig::Class {
                 name: name.replace('.', "/"),
                 type_args,
+                owner: None,
             });
         }
         None
@@ -1933,7 +1943,7 @@ pub(crate) fn register_wp2_1_natives(registry: &mut NativeMethodRegistry) {
             }
             if let Some(up) = jdk_first_non_bottom_bound(ctx, ta, "upperBounds") {
                 let ts = jdk_tree_to_typesig(ctx, up)?;
-                if let TypeSig::Class { name, type_args } = &ts {
+                if let TypeSig::Class { name, type_args, .. } = &ts {
                     if name == "java/lang/Object" && type_args.is_empty() {
                         return Some(TypeArg::Unbounded);
                     }

@@ -90,6 +90,9 @@ pub use cratonvm_types::{
     class_layout, compact_ref_fields_enabled, is_compact_object, object_body_size,
     register_class_layout, set_compact_ref_fields_enabled, CompactLayout,
 };
+// HIB-CV-24: class-loader liveness pinning registry (shared by gen_heap marker
+// + native-builtins side-table). See `cratonvm_types::loader_pin`.
+pub use cratonvm_types::loader_pin;
 pub use collector::{GarbageCollector, MonitorCleanup, StopTheWorldToken};
 pub use compact_header::{
     CompactAllocator, CompactHeader, CompactHeaderSavingsReport, HashCodeTable, HeaderView,

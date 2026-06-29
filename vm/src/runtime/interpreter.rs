@@ -125,6 +125,73 @@ fn no_refproc() -> bool {
     *G.get_or_init(|| std::env::var_os("CRATONVM_DBG_NO_REFPROC").is_some())
 }
 
+/// HIB-CV-24 (Manifestation B) — end-to-end Weak/Phantom reference *clearing*.
+///
+/// CratonVM's mark phase traces every reference slot strongly, including a
+/// `java.lang.ref.Reference`'s `referent`, so a *live* Weak/Phantom reference
+/// pins its referent forever and `get()` never returns null / phantom queues
+/// never fire (e.g. Hibernate's `ClassLoaderLeaksUtilityTest`). When ON
+/// (default), the VM nulls Weak/Phantom referent slots *before* a collection so
+/// the unmodified marker cannot keep the referent alive, lets the existing
+/// reference processor clear/enqueue dead ones, then restores the slots of
+/// survivors afterwards. Opt-out `CRATONVM_WEAKREF_CLEAR=0` restores the legacy
+/// (never-clearing) behavior — byte-identical, the safety net.
+fn weakref_clear_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        std::env::var("CRATONVM_WEAKREF_CLEAR")
+            .map(|v| v != "0")
+            .unwrap_or(true)
+    })
+}
+
+/// `CRATONVM_DBG_WEAKREF` — trace the Weak/Phantom referent null/restore passes.
+fn dbg_weakref() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| std::env::var_os("CRATONVM_DBG_WEAKREF").is_some())
+}
+
+/// HIB-CV-24 — pre-collection pass: null the `referent` slot of every active
+/// Weak/Phantom reference so the mark phase does NOT keep the referent alive
+/// through the (live) Reference object. Surviving referents are restored by
+/// `process_references_after_gc`. MUST run under STW, after `collect_roots` and
+/// immediately before `collect_garbage` (the Reference objects are still at
+/// their pre-collection addresses and no mutator can observe the transient
+/// null). No-op when the gate is off or no Weak/Phantom references exist.
+pub fn weakref_null_referents_pre_gc(shared: &SharedVm) {
+    if !weakref_clear_enabled() {
+        return;
+    }
+    let pairs = {
+        let rp = shared.ref_processor.lock();
+        rp.weak_phantom_active_pairs()
+    };
+    if pairs.is_empty() {
+        return;
+    }
+    if dbg_weakref() {
+        eprintln!("[weakref] pre-gc null pass: {} weak/phantom referent(s)", pairs.len());
+    }
+    for (ref_obj_addr, _referent) in pairs {
+        // The Reference object is live (or dead-but-not-yet-collected) at this
+        // point, so its memory is valid; writing its referent slot is safe.
+        // SAFETY: `ref_obj_addr` is a current Reference-object address held by
+        // the reference processor (kept current by `update_after_gc` /
+        // `remove_collected`); it points at a valid heap object header.
+        let ref_obj = unsafe { ObjectRef::from_raw(ref_obj_addr as *mut u8) };
+        // Defensive: a real `java.lang.ref.Reference` always has >= 1 field
+        // (the referent at slot 0). Skip an undersized/zeroed slot rather than
+        // write OOB.
+        if shared.heap.num_fields(ref_obj) >= 1 {
+            // Slot 0 = REF_FIELD_REFERENT (matches the real JDK Reference layout
+            // and the synthetic constant in native-builtins).
+            shared.heap.set_field(ref_obj, 0, Value::Object(None));
+        }
+    }
+}
+
 /// Cached `CRATONVM_DBG_NO_CLEANERS` gate (bc math-ec 0x4 bisect): skip ONLY
 /// `run_cleaner_actions` + `run_finalizers` (the Java invokes on queued —
 /// possibly stale — addresses), keeping `process_references_after_gc` live.
@@ -472,6 +539,8 @@ fn maybe_gc(shared: &SharedVm, thread: &mut JvmThread) {
             // STW invariant: single-threaded path means this thread is
             // the only mutator — every other thread is implicitly
             // "parked" (it doesn't exist). Construct the token directly.
+            // HIB-CV-24: null Weak/Phantom referents before marking (restored post-GC).
+            weakref_null_referents_pre_gc(shared);
             let stw = cratonvm_gc::collector::StopTheWorldToken::new();
             let result = shared
                 .heap
@@ -626,6 +695,8 @@ fn maybe_gc(shared: &SharedVm, thread: &mut JvmThread) {
                 // STW invariant: `gc_barrier.wait_for_all()` returned, so
                 // every mutator has parked at its safepoint poll OR (BUG-03)
                 // been forcibly stopped in JIT and conservatively scanned.
+                // HIB-CV-24: null Weak/Phantom referents before marking (restored post-GC).
+                weakref_null_referents_pre_gc(shared);
                 let stw = cratonvm_gc::collector::StopTheWorldToken::new();
                 let result = shared
                     .heap
@@ -704,6 +775,8 @@ fn maybe_gc_forced(shared: &SharedVm, thread: &mut JvmThread) {
     if alive_count <= 1 {
         let mut roots = collect_roots(shared, thread);
         // STW invariant: single-threaded fast path — see `maybe_gc`.
+        // HIB-CV-24: null Weak/Phantom referents before marking (restored post-GC).
+        weakref_null_referents_pre_gc(shared);
         let stw = cratonvm_gc::collector::StopTheWorldToken::new();
         let result = shared
             .heap
@@ -728,6 +801,8 @@ fn maybe_gc_forced(shared: &SharedVm, thread: &mut JvmThread) {
             // STW invariant: `wait_for_all()` returned — every mutator
             // has parked at its safepoint poll (or, BUG-03, been forcibly
             // stopped in JIT and conservatively scanned).
+            // HIB-CV-24: null Weak/Phantom referents before marking (restored post-GC).
+            weakref_null_referents_pre_gc(shared);
             let stw = cratonvm_gc::collector::StopTheWorldToken::new();
             let result = shared
                 .heap
@@ -850,6 +925,8 @@ pub fn force_gc_from_native(shared: &SharedVm, thread: &mut JvmThread) {
     if alive_count <= 1 {
         let mut roots = collect_roots(shared, thread);
         // STW invariant: single-threaded fast path — see `maybe_gc`.
+        // HIB-CV-24: null Weak/Phantom referents before marking (restored post-GC).
+        weakref_null_referents_pre_gc(shared);
         let stw = cratonvm_gc::collector::StopTheWorldToken::new();
         let (result, dead_finalizers) = shared.heap.collect_garbage_with_finalizers(
             &stw,
@@ -876,6 +953,8 @@ pub fn force_gc_from_native(shared: &SharedVm, thread: &mut JvmThread) {
             // STW invariant: `wait_for_all()` returned — every mutator
             // has parked at its safepoint poll (or, BUG-03, been forcibly
             // stopped in JIT and conservatively scanned).
+            // HIB-CV-24: null Weak/Phantom referents before marking (restored post-GC).
+            weakref_null_referents_pre_gc(shared);
             let stw = cratonvm_gc::collector::StopTheWorldToken::new();
             let (result, dead_finalizers) = shared.heap.collect_garbage_with_finalizers(
                 &stw,
@@ -1070,6 +1149,23 @@ fn process_references_after_gc(
     shared: &SharedVm,
     pointer_map: &std::collections::HashMap<usize, usize>,
 ) {
+    // HIB-CV-24 (Manifestation B): reconcile the defining-loader side-table with
+    // this collection. A user `ClassLoader` the application no longer references
+    // is now collectable (it is not GC-rooted under `CRATONVM_LOADER_UNLOAD`);
+    // prune its stale side-table entry and remap survivors using the SAME
+    // survivor predicate the reference processor uses below. Done BEFORE the
+    // diagnostic `no_refproc` short-circuit so the side-table never holds a
+    // dangling/stale ObjectRef after a collection, independent of that switch.
+    {
+        let is_marked = |addr: usize| -> bool {
+            pointer_map.contains_key(&addr) || shared.heap.is_addr_live(addr)
+        };
+        cratonvm_native_builtins::classloader::gc_reconcile_defining_loaders(
+            &is_marked,
+            pointer_map,
+        );
+    }
+
     // bc math-ec 0x4 (CRATONVM_DBG_NO_REFPROC): subsystem-level exclusion
     // switch — skip ALL post-GC reference processing (clears, enqueues,
     // finalizer/cleaner submissions). If the corruption persists with this
@@ -1266,6 +1362,57 @@ fn process_references_after_gc(
     // to avoid re-locking ref_processor which we already hold).
     while let Some(obj_addr) = ref_proc.dequeue_for_finalization() {
         shared.finalizer_thread.enqueue(obj_addr);
+    }
+
+    // HIB-CV-24 (Manifestation B): restore the referent slots of Weak/Phantom
+    // references whose referent SURVIVED, and prune Reference objects collected
+    // this cycle. The pre-collection pass (`weakref_null_referents_pre_gc`)
+    // nulled every active Weak/Phantom referent slot so the marker could not keep
+    // the referent alive through the live Reference. `process_references` above
+    // then flagged the dead-referent entries `cleared`/`enqueued` (weak cleared /
+    // phantom queued) — so the entries STILL active here are exactly those whose
+    // referent survived via a strong path. Write their (relocated) referent
+    // address back so `get()` keeps returning the live object; dead ones keep the
+    // null slot. Runs before `update_after_gc` so processor addresses are still
+    // the pre-collection (pointer-map key) view.
+    if weakref_clear_enabled() {
+        let active = ref_proc.weak_phantom_active_pairs();
+        if dbg_weakref() && !active.is_empty() {
+            eprintln!(
+                "[weakref] post-gc restore pass: {} surviving weak/phantom referent(s)",
+                active.len()
+            );
+        }
+        for (ref_obj_old, referent_old) in active {
+            // Locate the (possibly relocated) Reference object; skip if it did
+            // not itself survive — never write through freed/reused memory.
+            let ref_obj_new = match pointer_map.get(&ref_obj_old) {
+                Some(&a) => a,
+                None if shared.heap.is_addr_live(ref_obj_old) => ref_obj_old,
+                None => continue,
+            };
+            // The referent survived (this entry was not cleared/enqueued): find
+            // its post-collection address (relocated → pointer map; old-gen
+            // in place → live).
+            let referent_new = match pointer_map.get(&referent_old) {
+                Some(&a) => a,
+                None if shared.heap.is_addr_live(referent_old) => referent_old,
+                // Defensive: should not happen for an active entry, but never
+                // write a stale referent — leave the slot null.
+                None => continue,
+            };
+            // SAFETY: both addresses are live post-collection object headers.
+            let ro = unsafe { ObjectRef::from_raw(ref_obj_new as *mut u8) };
+            let rt = unsafe { ObjectRef::from_raw(referent_new as *mut u8) };
+            // Slot 0 = REF_FIELD_REFERENT. `set_field` fires the write barrier,
+            // so a young referent restored into a promoted (old-gen) Reference
+            // re-marks the old→young card.
+            shared.heap.set_field(ro, 0, Value::Object(Some(rt)));
+        }
+        // Drop entries whose Reference object was collected this cycle so the
+        // side-lists stay bounded and the pre-GC null pass never dereferences a
+        // freed Reference (same survivor predicate as everything above).
+        ref_proc.remove_collected(&is_marked);
     }
 
     // Relocate all addresses in the ref processor to match the new heap layout
@@ -12314,9 +12461,26 @@ fn execute_instruction(
                                 return Ok(InstructionResult::Continue);
                             }
                         }
+                        // Render both operands as binary (dotted) class names,
+                        // matching HotSpot's `ClassCastException` message.
+                        // Tools parse this message: mockk's `JvmAutoHinter`
+                        // applies the regex `cannot be cast to (class )?(.+/)?
+                        // (.+?)( \(...\))?$` and reads group 3 as the target
+                        // type, then `Class.forName`s it to learn a mock's
+                        // return type. With our former *internal* (slashed)
+                        // names — e.g. `... cast to java/lang/String` — the
+                        // `(.+/)?` group greedily ate `java/lang/`, leaving
+                        // group 3 = `String`, so `Class.forName("String")`
+                        // threw `ClassNotFoundException: String` and every
+                        // reified Kotlin extension test that records a mock
+                        // (`getBean<T>()`, `getProperty<T>()`) failed. Dotted
+                        // names contain no `/`, so group 3 captures the full
+                        // FQN exactly as on HotSpot.
+                        let obj_binary = obj_class_name.replace('/', ".");
+                        let target_binary = target_class_name.replace('/', ".");
                         return Err(RuntimeError::ClassCastException {
                             message: format!(
-                                "{obj_class_name} cannot be cast to {target_class_name}"
+                                "{obj_binary} cannot be cast to {target_binary}"
                             ),
                         }
                         .into());

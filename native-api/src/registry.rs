@@ -1706,6 +1706,42 @@ pub trait NativeContext {
         method_desc: &str,
     ) -> Vec<Vec<AnnotationData>>;
 
+    /// Get the runtime-visible TYPE_USE annotations that target a method's
+    /// return type (JVMS 4.7.20 `target_type` 0x14, METHOD_RETURN) with an
+    /// empty `type_path` (i.e. annotations placed directly on the top-level
+    /// return type rather than a nested array/type-argument component).
+    ///
+    /// Backs `Method.getAnnotatedReturnType().getDeclaredAnnotations()` so
+    /// JSpecify-style `@Nullable`/`@NonNull` (which are TYPE_USE-only and thus
+    /// live in `RuntimeVisibleTypeAnnotations`, not `RuntimeVisibleAnnotations`)
+    /// are surfaced to reflection. Default impl returns an empty `Vec` so mock
+    /// `NativeContext` implementations don't need to plumb the attribute store.
+    fn method_return_type_annotations(
+        &self,
+        _class_id: ClassId,
+        _method_name: &str,
+        _method_desc: &str,
+    ) -> Vec<AnnotationData> {
+        Vec::new()
+    }
+
+    /// Get the runtime-visible TYPE_USE annotations that target a method's
+    /// formal parameters (JVMS 4.7.20 `target_type` 0x16,
+    /// METHOD_FORMAL_PARAMETER) with an empty `type_path`. The outer `Vec` is
+    /// indexed by `formal_parameter_index`; entries with no annotations are
+    /// empty inner `Vec`s.
+    ///
+    /// Backs `Parameter.getAnnotatedType().getDeclaredAnnotations()`. Default
+    /// impl returns an empty `Vec`.
+    fn method_parameter_type_annotations(
+        &self,
+        _class_id: ClassId,
+        _method_name: &str,
+        _method_desc: &str,
+    ) -> Vec<Vec<AnnotationData>> {
+        Vec::new()
+    }
+
     /// Get the generic Signature attribute for a class (if present).
     fn class_signature(&self, class_id: ClassId) -> Option<String>;
 

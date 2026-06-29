@@ -54,6 +54,8 @@ pub fn reset_loader_singletons() {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .clear();
+    // HIB-CV-24: drop the GC marker's loader-pin mirror for the new VM.
+    cratonvm_types::loader_pin::clear_loader_pins();
 }
 
 /// GC root scan for the singleton built-in class loaders.
@@ -80,13 +82,20 @@ pub fn gc_scan_loader_singleton_roots(out: &mut Vec<ObjectRef>) {
         out.push(o);
     }
     // Defining-loader side-table values are live ClassLoader objects reachable
-    // only from this map — root them too (cf. the singleton stores above).
-    for o in defining_loader_store()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .values()
-    {
-        out.push(*o);
+    // only from this map. Legacy behavior roots them all (which is why a
+    // user/isolated loader could never be collected — HIB-CV-24 Manifestation B).
+    // With `CRATONVM_LOADER_UNLOAD` ON (default) we DON'T root them, so a loader
+    // the application no longer references becomes collectable; the now-stale
+    // entry is pruned post-GC by `gc_reconcile_defining_loaders`. App/platform
+    // singletons stay rooted above, so built-in loaders are unaffected.
+    if !loader_unload_enabled() {
+        for o in defining_loader_store()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+        {
+            out.push(*o);
+        }
     }
 }
 
@@ -113,19 +122,65 @@ pub fn gc_update_loader_singleton_refs(pointer_map: &std::collections::HashMap<u
             .lock()
             .unwrap_or_else(|e| e.into_inner()),
     );
-    // Remap the defining-loader side-table values (relocated ClassLoader objects).
-    {
-        let mut map = defining_loader_store()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        for obj_ref in map.values_mut() {
-            let old_addr = obj_ref.as_ptr() as usize;
-            if let Some(&new_addr) = pointer_map.get(&old_addr) {
-                debug_assert!(new_addr != 0, "GC pointer map contains null address");
-                *obj_ref = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
-            }
+    // NOTE: the defining-loader side-table is reconciled (pruned + remapped)
+    // earlier in the GC cycle by `gc_reconcile_defining_loaders`, which runs in
+    // `process_references_after_gc` *before* this remap pass and uses the same
+    // survivor predicate as reference processing. Remapping it here as well would
+    // be a no-op (its entries already hold post-collection addresses) — and worse,
+    // re-rooting/remapping a collected loader would defeat unloading — so it is
+    // intentionally NOT touched here.
+}
+
+/// HIB-CV-24 (Manifestation B) — post-GC reconciliation of the defining-loader
+/// side-table (`class_id -> user ClassLoader`).
+///
+/// For each recorded entry:
+///   * if the loader survived this collection, remap its (possibly relocated)
+///     address through `pointer_map` — old-gen survivors that did not move keep
+///     their address;
+///   * if the loader was collected (not marked), drop the entry so a later
+///     `Class.getClassLoader()` cannot return a dangling reference and the
+///     loader's memory is not pinned by this side-table.
+///
+/// `is_marked(addr)` MUST be the SAME survivor predicate the reference processor
+/// uses in this cycle (`pointer_map.contains_key(addr) || heap.is_addr_live(addr)`),
+/// so a loader is pruned EXACTLY when a phantom/weak reference to it would be
+/// enqueued/cleared — keeping the side-table consistent with reference
+/// processing. The entry is only *removed* (never dereferenced) for a dead
+/// loader, so this is safe to call after the collection has freed the memory.
+///
+/// Runs in BOTH gate modes: with `CRATONVM_LOADER_UNLOAD=0` the loaders are
+/// GC-rooted, hence always marked, so nothing is pruned and entries are merely
+/// remapped — preserving the legacy behavior.
+pub fn gc_reconcile_defining_loaders(
+    is_marked: &dyn Fn(usize) -> bool,
+    pointer_map: &std::collections::HashMap<usize, usize>,
+) {
+    let mut map = defining_loader_store()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    map.retain(|_class_id, obj_ref| {
+        let old_addr = obj_ref.as_ptr() as usize;
+        if !is_marked(old_addr) {
+            // Loader unreachable and collected this cycle — drop the stale entry.
+            // (No deref of `obj_ref`; the memory may already be freed/reused.)
+            return false;
         }
-    }
+        // Survivor: remap if it relocated (moving collection).
+        if let Some(&new_addr) = pointer_map.get(&old_addr) {
+            debug_assert!(new_addr != 0, "GC pointer map contains null address");
+            *obj_ref = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+        }
+        true
+    });
+    // HIB-CV-24: re-sync the GC marker's loader-pin registry from the
+    // authoritative side-table (now remapped/pruned) so the next collection
+    // marks loaders at their current addresses and drops collected ones.
+    let pins: Vec<(u32, usize)> = map
+        .iter()
+        .map(|(&cid, obj_ref)| (cid, obj_ref.as_ptr() as usize))
+        .collect();
+    cratonvm_types::loader_pin::replace_loader_pins(&pins);
 }
 
 // ---------------------------------------------------------------------------
@@ -179,6 +234,10 @@ pub fn register_defining_loader(class_id: u32, loader: ObjectRef) {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .insert(class_id, loader);
+    // HIB-CV-24: mirror into the loader-pin registry the GC marker consults so a
+    // live instance of this class keeps its defining loader alive (the
+    // instance→loader edge HotSpot gets for free via `Class.getClassLoader`).
+    cratonvm_types::loader_pin::set_loader_pin(class_id, loader.as_ptr() as usize);
 }
 
 /// Look up the user-defined `ClassLoader` object that defined `class_id`.
@@ -626,6 +685,25 @@ pub(crate) fn cl_bootstrap_scoped() -> bool {
     static GATE: OnceLock<bool> = OnceLock::new();
     *GATE.get_or_init(|| {
         std::env::var("CRATONVM_CL_BOOTSTRAP_SCOPED")
+            .map(|v| v != "0")
+            .unwrap_or(true)
+    })
+}
+
+/// HIB-CV-24 (Manifestation B) gate. When ON (default), a user-defined
+/// `ClassLoader` recorded in the defining-loader side-table is NOT treated as a
+/// GC root: once the application drops every reference to it the loader becomes
+/// collectable, matching HotSpot classloader-leak semantics (Hibernate's
+/// `ClassLoaderLeaksUtilityTest.testClassLoaderLeaksNegated`, which spins a
+/// PhantomReference + `System.gc()` loop waiting for an isolated loader to be
+/// collected). Post-GC reconciliation (`gc_reconcile_defining_loaders`) prunes
+/// the now-stale side-table entry and remaps survivors. Opt-out
+/// `CRATONVM_LOADER_UNLOAD=0` restores the legacy behavior where every defining
+/// loader is strong-rooted forever (no class/loader unloading) as the safety net.
+pub(crate) fn loader_unload_enabled() -> bool {
+    static GATE: OnceLock<bool> = OnceLock::new();
+    *GATE.get_or_init(|| {
+        std::env::var("CRATONVM_LOADER_UNLOAD")
             .map(|v| v != "0")
             .unwrap_or(true)
     })
