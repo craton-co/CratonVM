@@ -42,6 +42,79 @@ pub fn update_all_roots(
         return;
     }
 
+    // BUG-03 trace (gated CRATONVM_DBG_BUG03): per-GC coverage for main (tid 0).
+    // Logs, at each relocating GC, whether main's Thread mirror moves THIS GC and
+    // who the initiator is + main's blocked state — to find the GC where the mirror
+    // moves but main's frames are not remapped (the concurrent-spawn stale-`parent`
+    // root cause). Read the mirror's CURRENT (pre-step-21) registry address.
+    if std::env::var_os("CRATONVM_DBG_BUG03").is_some() {
+        let epoch = shared.heap.collection_count();
+        let main_old = shared
+            .thread_registry
+            .java_thread_obj(crate::threading::jvm_thread::ThreadId(0))
+            .map(|o| o.as_ptr() as usize)
+            .unwrap_or(0);
+        let moves = main_old != 0 && pointer_map.contains_key(&main_old);
+        let blocked = shared
+            .thread_registry
+            .dump_blocked_states()
+            .into_iter()
+            .find(|(tid, _, _)| *tid == 0)
+            .map(|(_, b, _)| b)
+            .unwrap_or(false);
+        eprintln!(
+            "[BUG03-gc] e{} initiator=tid{} main_mirror=0x{:x} moves_this_gc={} main_blocked={}",
+            epoch, thread.thread_id.0, main_old, moves, blocked
+        );
+        // On a move where main is the initiator, dump main's frame stack +
+        // whether any frame slot still holds the OLD mirror addr (which SHOULD be
+        // remapped here). Pinpoints whether `parent` is in a scanned frame (tag/
+        // slot bug) or absent (held in a native/Rust transient).
+        if moves && thread.thread_id.0 == 0 {
+            use std::fmt::Write as _;
+            let mut s = String::new();
+            for f in thread.frames.iter().rev().take(6) {
+                let _ = write!(s, " {}.{}", f.class_name(), f.method_name());
+            }
+            eprintln!("[BUG03-gc]   main frames (top-first):{}", s);
+            // Locate the OLD mirror addr in main's frames — the slot that SHOULD be
+            // remapped here. If found in a LONG/DOUBLE-kind slot, that is the
+            // mis-tagged object ref the kind-gated remap skips.
+            for (fi, f) in thread.frames.iter().enumerate() {
+                if let Some(loc) = f.dbg_locate_addr(main_old) {
+                    eprintln!(
+                        "[BUG03-gc]   FOUND main_mirror old=0x{:x} in frame#{} {}.{} @ {}",
+                        main_old, fi, f.class_name(), f.method_name(), loc
+                    );
+                }
+            }
+        }
+        // EVERY GC (main): trace slot 7 value + pc for each Thread.<init> frame, to
+        // see `parent`'s trajectory (when it diverges from the field) regardless of
+        // in-map status.
+        if thread.thread_id.0 == 0 {
+            for (fi, f) in thread.frames.iter().enumerate() {
+                if f.method_name() == "<init>"
+                    && f.class_name() == "java/lang/Thread"
+                    && f.locals_len() > 7
+                {
+                    let s7 = match f.get_local(7) {
+                        crate::types::Value::Object(Some(o)) => {
+                            let a = o.as_ptr() as usize;
+                            format!("obj=0x{:x} in_map={}", a, pointer_map.contains_key(&a))
+                        }
+                        crate::types::Value::Object(None) => "null".to_string(),
+                        other => format!("{other:?}"),
+                    };
+                    eprintln!(
+                        "[BUG03-l7] e{} frame#{} Thread.<init> pc={} local7={} stack:{}",
+                        epoch, fi, f.pc, s7, f.dbg_stack_dump()
+                    );
+                }
+            }
+        }
+    }
+
     // 1. Thread frames — locals and operand stacks (SoA layout)
     for frame in &mut thread.frames {
         frame.update_local_refs(pointer_map, &shared.heap);
