@@ -4630,6 +4630,72 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         "()[Ljava/lang/reflect/AnnotatedType;",
         lang_class::native_class_get_annotated_interfaces,
     );
+    // TYPE_USE annotation surface for executables/parameters. The real-JDK
+    // `getAnnotatedReturnType()` / `Parameter.getAnnotatedType()` parse the
+    // `RuntimeVisibleTypeAnnotations` attribute via `getTypeAnnotationBytes0()`
+    // (stubbed to null) + `jdk.internal.reflect.ConstantPool` (whose accessor
+    // API we don't expose), so JSpecify `@Nullable`/`@NonNull` were invisible.
+    // Intercept the public methods and build AnnotatedTypes carrying the parsed
+    // top-level (empty type_path) type annotations, mirroring how the public
+    // declared/parameter annotation methods are intercepted (see C24 above).
+    registry.register(
+        "java/lang/reflect/Method",
+        "getAnnotatedReturnType",
+        "()Ljava/lang/reflect/AnnotatedType;",
+        lang_class::native_method_get_annotated_return_type,
+    );
+    registry.register(
+        "java/lang/reflect/Parameter",
+        "getAnnotatedType",
+        "()Ljava/lang/reflect/AnnotatedType;",
+        lang_class::native_parameter_get_annotated_type,
+    );
+    registry.register(
+        "java/lang/reflect/Field",
+        "getAnnotatedType",
+        "()Ljava/lang/reflect/AnnotatedType;",
+        lang_class::native_field_get_annotated_type,
+    );
+    // Native dispatch keys on the concrete reflective class (see how
+    // `getParameterAnnotations` is registered on Method/Constructor, not the
+    // shared Executable), so register on both rather than Executable.
+    registry.register(
+        "java/lang/reflect/Method",
+        "getAnnotatedParameterTypes",
+        "()[Ljava/lang/reflect/AnnotatedType;",
+        lang_class::native_executable_get_annotated_parameter_types,
+    );
+    registry.register(
+        "java/lang/reflect/Constructor",
+        "getAnnotatedParameterTypes",
+        "()[Ljava/lang/reflect/AnnotatedType;",
+        lang_class::native_executable_get_annotated_parameter_types,
+    );
+    // Accessor overrides for the `AnnotatedTypeBaseImpl` instances we build —
+    // they stash an `Annotation[]` in the `annotations` field (the real impl
+    // uses a `Map`), so the real `getDeclaredAnnotations()` (`map.values()`) /
+    // `getAnnotation()` (`Class.cast(map.get(...))`) bytecode can't read it.
+    // These read the stashed array; for real-bytecode-built instances (Map in
+    // the field) they return empty, matching the null-type-annotation-bytes
+    // reality. `isAnnotationPresent()` is the inherited default → getAnnotation.
+    registry.register(
+        "sun/reflect/annotation/AnnotatedTypeFactory$AnnotatedTypeBaseImpl",
+        "getDeclaredAnnotations",
+        "()[Ljava/lang/annotation/Annotation;",
+        lang_class::native_annotated_type_get_declared_annotations,
+    );
+    registry.register(
+        "sun/reflect/annotation/AnnotatedTypeFactory$AnnotatedTypeBaseImpl",
+        "getAnnotations",
+        "()[Ljava/lang/annotation/Annotation;",
+        lang_class::native_annotated_type_get_declared_annotations,
+    );
+    registry.register(
+        "sun/reflect/annotation/AnnotatedTypeFactory$AnnotatedTypeBaseImpl",
+        "getAnnotation",
+        "(Ljava/lang/Class;)Ljava/lang/annotation/Annotation;",
+        lang_class::native_annotated_type_get_annotation,
+    );
     registry.register(
         "java/lang/Class",
         "getClassFileVersion0",

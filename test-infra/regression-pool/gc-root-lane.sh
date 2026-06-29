@@ -115,9 +115,10 @@ record() { # name rc wall precise hotspot status expected note
 
 # --- 1. GC microbenchmarks: CratonVM (precise default-on) checksum == HotSpot
 hr; log "GC microbenchmarks (precise default-on) vs HotSpot"
-bench_item() { # bench heap expected_status
-  local b="$1" heap="$2"
-  local hs ct status note=""
+bench_item() { # bench heap [timeout_override]
+  local b="$1" heap="$2" tmo="${3:-$TIMEOUT}"
+  local hs ct status note="" _savedT="$TIMEOUT"
+  TIMEOUT="$tmo"
   hs=$("$HOTSPOT" -cp "$BENCH" BenchSuite "$b" 2>/dev/null | grep -oE 'checksum=[0-9]+' | head -1 | cut -d= -f2)
   timed_run "" "$CV" --java-home "$JDK" --Xmx "$heap" -cp "$BENCH" BenchSuite "$b"
   ct=$(echo "$OUT" | grep -oE 'checksum=[0-9]+' | head -1 | cut -d= -f2)
@@ -130,6 +131,7 @@ bench_item() { # bench heap expected_status
     ct=$(echo "$OUT" | grep -oE 'checksum=[0-9]+' | head -1 | cut -d= -f2)
   fi
   if [ -n "$ct" ] && [ "$ct" = "$hs" ]; then status="PASS"; else status="FAIL"; note="${note:+$note }checksum mismatch/empty"; fi
+  TIMEOUT="$_savedT"
   record "bench:$b" "$RC" "$WALL" "${ct:-NONE}" "${hs:-NONE}" "$status" "PASS" "$note"
 }
 bench_item bintrees10 4g
@@ -137,7 +139,17 @@ bench_item bintrees14 4g
 bench_item bintrees16 4g
 [ "$QUICK" = "1" ] || bench_item bintrees18 8g
 bench_item fib44 2g          # NB perf-regressed on dev (separate issue); checksum still validated
-bench_item sieve250k 2g
+# sieve250k = sieve(250000) REPEATED 1000× (see BenchSuite.sieve(II)J). The hot
+# sieve method is invoked exactly once (the 1000-repeat is its OWN inner loop), so
+# it never reaches invocation-count tier-up, and OSR does not fire on its loops —
+# it runs INTERPRETED end-to-end. Result: correct (checksum=22044) but ~70–350×
+# slower than HotSpot, so 1000 reps ≈ 350 s on a slow box (measured here:
+# nojit ms=347868; JIT-on similar/slower). It is NOT a hang/infinite-loop (per-rep
+# time scales perfectly linearly) and NOT a miscompile. Give it a generous timeout
+# so a slow box records the correct checksum instead of an empty/timeout deviation.
+# Tracked as a JIT-throughput gap (hot once-invoked method never compiled), not a
+# GC-root-family bug. Override with SIEVE_TIMEOUT.
+bench_item sieve250k 2g "${SIEVE_TIMEOUT:-$(( TIMEOUT > 600 ? TIMEOUT : 600 ))}"
 bench_item matrix600 2g
 
 # --- 2. A3 register-invisibility family (gc-stress-bintrees-main-args)
@@ -180,12 +192,16 @@ gcstress_item VAAload     PASS
 gcstress_item VArgLen     PASS
 gcstress_item binarytrees PASS
 
-# --- 3. A2 ReflRepro (distinct alloc<->sweep-walker UAF; precise does NOT fix)
-hr; log "A2 ReflRepro (EXPECTED KNOWN-FAIL — precise maps do not fix this)"
+# --- 3. A2 ReflRepro — FIXED 2026-06-23 (6e3ddb05): the non-moving young sweep's
+# free-block coalescer now merges OVERLAPPING blocks (not just adjacent), so
+# Arena::alloc can't double-serve a young region. Was a GC free-list accounting
+# bug, NOT a register-resident JIT root (precise maps are orthogonal). Expected
+# PASS now; a crash/marker here is a REGRESSION → deviation.
+hr; log "A2 ReflRepro (EXPECTED PASS — FIXED 6e3ddb05; coalesce overlapping free blocks)"
 timed_run "CRATONVM_DBG_GC_STRESS=524288" "$CV" --java-home "$JDK" --Xmx 256m -cp "$CLASSDIR" ReflRepro 20000
 A2CM=$(echo "$OUT" | crash_markers)
-if [ "$RC" = 0 ] && [ "$A2CM" = 0 ]; then a2s="PASS"; else a2s="KNOWN-FAIL"; fi
-record "a2:ReflRepro" "$RC" "$WALL" "$([ "$a2s" = PASS ] && echo clean || echo crash)" "clean" "$a2s" "KNOWN-FAIL" "markers=$A2CM"
+if [ "$RC" = 0 ] && [ "$A2CM" = 0 ]; then a2s="PASS"; else a2s="REGRESSED"; fi
+record "a2:ReflRepro" "$RC" "$WALL" "$([ "$a2s" = PASS ] && echo clean || echo crash)" "clean" "$a2s" "PASS" "markers=$A2CM"
 
 # --- 4. MTRegex multi-thread GC-root stress (FLAKY by documentation:
 # pre-existing cross-thread STW JIT-root gap + a Thread.join/IMSE hang)

@@ -2011,8 +2011,19 @@ fn array_is_assignable(ctx: &dyn NativeContext, src_desc: &str, target_name: &st
             || tgt_comp == "java/io/Serializable"
             || tgt_comp == "java/lang/Cloneable";
     }
+    // Covariance is directional: `Object[]` is assignable to `T[]` ONLY when
+    // `T` is itself `Object`. The previous unconditional `return true` here
+    // made `Integer[].isAssignableFrom(Object[])` true (it must be false),
+    // which defeated the JDK's most-specific-return-type selection in
+    // `Class.getMethod`: comparing a covariant bridge `Object[] getValues()`
+    // against the real `Integer[] getValues()`, BOTH directions reported
+    // assignable, so neither was deemed more specific and the synthetic bridge
+    // could win (BridgeMethodResolverTests.findBridgedMethodWith…). The
+    // forward direction (`Object[]` IS assignable from a subtype array like
+    // `Integer[]`) is handled by the `is_subclass` check below; this mirrors
+    // the interpreter's strict (non-lenient) `array_is_assignable_to_impl`.
     if src_comp == "java/lang/Object" {
-        return true;
+        return tgt_comp == "java/lang/Object";
     }
     let src_id = match ctx.class_id_by_name(&src_comp) {
         Some(id) => id,
@@ -3349,6 +3360,21 @@ where
     arr
 }
 
+/// The `java/lang/Class` ClassId, for typing reflective `Class[]` results
+/// (`Method`/`Constructor` `getParameterTypes`/`getExceptionTypes`,
+/// `Class.getInterfaces`). HotSpot returns `[Ljava/lang/Class;` for all of
+/// these; allocating the backing array with an `Object` component made
+/// `Class[].isAssignableFrom(result.getClass())` false. That was masked while
+/// array assignability was (incorrectly) symmetric, but with the covariance
+/// fix it surfaced as a `ClassCastException` assigning the `Object[]` into a
+/// `Class[]` field during deserialization (ResolvableTypeTests.serialize) and
+/// would break any `(Class[])` cast. `java/lang/Class` is always loaded by the
+/// time reflection runs, so the fallback is defensive only.
+fn class_component_id(ctx: &mut dyn NativeContext) -> cratonvm_types::ClassId {
+    ctx.class_id_by_name("java/lang/Class")
+        .unwrap_or_else(|| cratonvm_types::ClassId::new(0))
+}
+
 pub(crate) fn create_field_object(
     ctx: &mut dyn NativeContext,
     meta: &FieldMetadata,
@@ -4382,7 +4408,8 @@ pub(crate) fn create_method_object(
     // Parameter type mirrors array. GC-safe: `descriptor_to_class_mirror`
     // allocates/loads classes, so the array is pinned across the fill loop
     // (see `build_mirror_array` — WildFly bug-06).
-    let param_arr = build_mirror_array(ctx, param_descs.len(), |ctx, i| {
+    let class_comp = class_component_id(ctx);
+    let param_arr = build_mirror_array_comp(ctx, class_comp, param_descs.len(), |ctx, i| {
         descriptor_to_class_mirror(ctx, &param_descs[i])
     });
 
@@ -4406,7 +4433,7 @@ pub(crate) fn create_method_object(
     // allocates/loads classes, so the array is pinned across the fill loop.
     // Build a Class<T> mirror for each thrown checked exception via the L-form
     // so class loading + caching go through the same path as elsewhere.
-    let exception_arr = build_mirror_array(ctx, exception_names.len(), |ctx, i| {
+    let exception_arr = build_mirror_array_comp(ctx, class_comp, exception_names.len(), |ctx, i| {
         let desc = format!("L{};", exception_names[i]);
         descriptor_to_class_mirror(ctx, &desc)
     });
@@ -6259,7 +6286,8 @@ pub(crate) fn create_constructor_object(
     // Parse descriptor for param types
     let (param_descs, _) = parse_descriptor_param_and_return(&meta.descriptor);
     // GC-safe: `descriptor_to_class_mirror` allocates (see `build_mirror_array`).
-    let param_arr = build_mirror_array(ctx, param_descs.len(), |ctx, i| {
+    let class_comp = class_component_id(ctx);
+    let param_arr = build_mirror_array_comp(ctx, class_comp, param_descs.len(), |ctx, i| {
         descriptor_to_class_mirror(ctx, &param_descs[i])
     });
     let desc_str = ctx.create_string(&meta.descriptor);
@@ -6274,7 +6302,7 @@ pub(crate) fn create_constructor_object(
         ctx.method_exceptions(meta.declaring_class_id, &meta.name, &meta.descriptor);
     // GC-safe (see `build_mirror_array`): each `descriptor_to_class_mirror`
     // allocates/loads classes, so the array is pinned across the fill loop.
-    let exception_arr = build_mirror_array(ctx, exception_names.len(), |ctx, i| {
+    let exception_arr = build_mirror_array_comp(ctx, class_comp, exception_names.len(), |ctx, i| {
         let desc = format!("L{};", exception_names[i]);
         descriptor_to_class_mirror(ctx, &desc)
     });
@@ -7564,7 +7592,9 @@ pub(crate) fn native_class_get_interfaces(
         eprintln!("[bb-dbg] getInterfaces({}) -> {:?}", this_name, names);
     }
     // GC-safe: `get_class_mirror` may allocate a mirror (see `build_mirror_array`).
-    let arr = build_mirror_array(ctx, iface_ids.len(), |ctx, i| {
+    // Component type is `Class` (HotSpot returns `[Ljava/lang/Class;`), not Object.
+    let class_comp = class_component_id(ctx);
+    let arr = build_mirror_array_comp(ctx, class_comp, iface_ids.len(), |ctx, i| {
         ctx.get_class_mirror(iface_ids[i])
     });
     Ok(Some(Value::Object(Some(arr))))
@@ -9827,7 +9857,9 @@ pub(crate) fn native_class_get_generic_interfaces(
     // lifecycle observer with `WELD-000409` (HIB-CV-20).
     let iface_ids = ctx.class_interfaces(class_id);
     // GC-safe: `get_class_mirror` may allocate a mirror (see `build_mirror_array`).
-    let arr = build_mirror_array(ctx, iface_ids.len(), |ctx, i| {
+    // Component type is `Class` (HotSpot returns `[Ljava/lang/Class;`), not Object.
+    let class_comp = class_component_id(ctx);
+    let arr = build_mirror_array_comp(ctx, class_comp, iface_ids.len(), |ctx, i| {
         ctx.get_class_mirror(iface_ids[i])
     });
     Ok(Some(Value::Object(Some(arr))))
@@ -10709,6 +10741,24 @@ pub(crate) fn native_class_get_package(
     };
     if matches!(module_val, Value::Object(Some(_))) {
         ctx.set_field_by_name(pkg, "module", module_val);
+    }
+    // Eagerly resolve `<pkg>.package-info` and cache it in the Package's
+    // `packageInfo` field so the real `Package.getDeclaredAnnotations()` /
+    // `getAnnotation()` / `isAnnotationPresent()` bytecode (all of which
+    // delegate to `getPackageInfo()`) surfaces package-level annotations such
+    // as JSpecify `@NullMarked` / `@NullUnmarked`. Without this, `getPackageInfo()`
+    // calls `Class.forName(<pkg>.package-info, false, module.getClassLoader())`
+    // with a *null* loader (our unnamed module reports no class loader), fails
+    // to locate the class, and caches the empty `PackageInfoProxy` sentinel —
+    // leaving every package annotation invisible. Loading via the same path the
+    // declaring class used works (best-effort: most packages have no
+    // package-info, in which case `load_class` errors and we leave the field
+    // null so the real fallback runs, matching HotSpot's empty result).
+    if !pkg_name.is_empty() {
+        let pi_internal = format!("{}/package-info", pkg_name.replace('.', "/"));
+        if let Ok(Some(v @ Value::Object(Some(_)))) = ctx.load_class(&pi_internal) {
+            ctx.set_field_by_name(pkg, "packageInfo", v);
+        }
     }
     Ok(Some(Value::Object(Some(pkg))))
 }
@@ -11950,6 +12000,244 @@ fn make_annotated_type(
         ctx.set_field(obj, 1, Value::Object(Some(empty_anns)));
     }
     obj
+}
+
+/// Like [`make_annotated_type`] but stashes a populated `Annotation[]` (built
+/// from `anns`) in the `annotations` field instead of an empty array. The
+/// AnnotatedType accessor overrides (`native_annotated_type_get_*`) read that
+/// array, so `getAnnotatedReturnType()` / `Parameter.getAnnotatedType()` surface
+/// TYPE_USE annotations (JSpecify `@Nullable` / `@NonNull`) that the real-JDK
+/// path can't decode (CratonVM stubs `getTypeAnnotationBytes0` to null and does
+/// not expose the `jdk.internal.reflect.ConstantPool` accessor API).
+fn make_annotated_type_with_anns(
+    ctx: &mut dyn NativeContext,
+    backing_type: ObjectRef,
+    anns: &[cratonvm_native_api::AnnotationData],
+) -> ObjectRef {
+    // Build the proxy array first (it allocates) before we allocate the
+    // AnnotatedType object, mirroring the GC-ordering used elsewhere.
+    let ann_arr = build_annotation_array(ctx, anns);
+
+    let cid = ctx
+        .ensure_class_initialized(
+            "sun/reflect/annotation/AnnotatedTypeFactory$AnnotatedTypeBaseImpl",
+        )
+        .or_else(|_| ctx.ensure_class_initialized("java/lang/reflect/AnnotatedType"))
+        .unwrap_or(cratonvm_types::ClassId::new(0));
+
+    let layout_fields = ctx.class_num_total_fields(cid);
+    let num_fields = if layout_fields >= 2 { layout_fields } else { 2 };
+    let obj = ctx.alloc_object(cid, num_fields);
+
+    ctx.set_field_by_name(obj, "type", Value::Object(Some(backing_type)));
+    ctx.set_field_by_name(obj, "annotations", Value::Object(Some(ann_arr)));
+    if layout_fields == 0 {
+        ctx.set_field(obj, 0, Value::Object(Some(backing_type)));
+        ctx.set_field(obj, 1, Value::Object(Some(ann_arr)));
+    }
+    obj
+}
+
+/// Read the stashed `Annotation[]` from an AnnotatedType built by
+/// [`make_annotated_type`] / [`make_annotated_type_with_anns`], returning
+/// `(array_ref, len)`. Returns `None` when the `annotations` field is null or
+/// not an array.
+///
+/// A real-JDK `AnnotatedTypeBaseImpl` (built by bytecode paths we don't
+/// intercept) stores a `Map` here, not an `Annotation[]` — `object_is_array`
+/// distinguishes the two by heap object kind (a class-name check can't: a
+/// heap reference array reports its *component* class, not a `[L…;` class).
+/// Those real instances carry no top-level type annotations anyway, since
+/// `getTypeAnnotationBytes0` is null, so reporting them as empty is correct.
+fn annotated_type_stashed_anns(
+    ctx: &dyn NativeContext,
+    this: ObjectRef,
+) -> Option<(ObjectRef, usize)> {
+    let arr = match ctx.get_field_by_name(this, "annotations") {
+        Value::Object(Some(a)) => a,
+        _ => return None,
+    };
+    if !ctx.object_is_array(arr) {
+        return None;
+    }
+    Some((arr, ctx.array_length(arr)))
+}
+
+/// `Method.getAnnotatedReturnType()Ljava/lang/reflect/AnnotatedType;`
+///
+/// Builds an AnnotatedType wrapping the (erased) return type and carrying the
+/// method's METHOD_RETURN TYPE_USE annotations.
+pub(crate) fn native_method_get_annotated_return_type(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let anns = match method_class_name_desc(ctx, this) {
+        Some((cid, name, desc)) => ctx.method_return_type_annotations(cid, &name, &desc),
+        None => Vec::new(),
+    };
+    let type_mirror = match ctx.invoke_virtual(this, "getReturnType", "()Ljava/lang/Class;", &[]) {
+        Ok(Some(Value::Object(Some(m)))) => m,
+        _ => ctx.get_class_mirror(cratonvm_types::ClassId::new(0)),
+    };
+    let at = make_annotated_type_with_anns(ctx, type_mirror, &anns);
+    Ok(Some(Value::Object(Some(at))))
+}
+
+/// `Parameter.getAnnotatedType()Ljava/lang/reflect/AnnotatedType;`
+///
+/// Builds an AnnotatedType wrapping the parameter's (erased) type and carrying
+/// that parameter's METHOD_FORMAL_PARAMETER TYPE_USE annotations.
+pub(crate) fn native_parameter_get_annotated_type(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let exec = match ctx.get_field_by_name(this, "executable") {
+        Value::Object(Some(e)) => e,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let idx = match ctx.get_field_by_name(this, "index") {
+        Value::Int(i) => i as usize,
+        _ => 0,
+    };
+    let anns = match method_class_name_desc(ctx, exec) {
+        Some((cid, name, desc)) => ctx
+            .method_parameter_type_annotations(cid, &name, &desc)
+            .get(idx)
+            .cloned()
+            .unwrap_or_default(),
+        None => Vec::new(),
+    };
+    let type_mirror = match ctx.invoke_virtual(this, "getType", "()Ljava/lang/Class;", &[]) {
+        Ok(Some(Value::Object(Some(m)))) => m,
+        _ => ctx.get_class_mirror(cratonvm_types::ClassId::new(0)),
+    };
+    let at = make_annotated_type_with_anns(ctx, type_mirror, &anns);
+    Ok(Some(Value::Object(Some(at))))
+}
+
+/// `Executable.getAnnotatedParameterTypes()[Ljava/lang/reflect/AnnotatedType;`
+///
+/// One AnnotatedType per declared parameter, each carrying that parameter's
+/// METHOD_FORMAL_PARAMETER TYPE_USE annotations.
+pub(crate) fn native_executable_get_annotated_parameter_types(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let (per_param, count) = match method_class_name_desc(ctx, this) {
+        Some((cid, name, desc)) => {
+            let pta = ctx.method_parameter_type_annotations(cid, &name, &desc);
+            (pta, count_method_params(&desc))
+        }
+        None => (Vec::new(), 0),
+    };
+    // Resolve the erased parameter type mirrors once.
+    let param_type_mirrors: Vec<ObjectRef> = match ctx.invoke_virtual(
+        this,
+        "getParameterTypes",
+        "()[Ljava/lang/Class;",
+        &[],
+    ) {
+        Ok(Some(Value::Object(Some(arr)))) => {
+            let n = ctx.array_length(arr);
+            (0..n)
+                .map(|i| match ctx.get_array_element(arr, i) {
+                    Value::Object(Some(m)) => m,
+                    _ => ctx.get_class_mirror(cratonvm_types::ClassId::new(0)),
+                })
+                .collect()
+        }
+        _ => Vec::new(),
+    };
+    let n = param_type_mirrors.len().max(count);
+    let comp = ctx
+        .class_id_by_name("java/lang/reflect/AnnotatedType")
+        .unwrap_or(cratonvm_types::ClassId::new(0));
+    let out = ctx.new_ref_array(comp, n);
+    for i in 0..n {
+        let tm = param_type_mirrors
+            .get(i)
+            .copied()
+            .unwrap_or_else(|| ctx.get_class_mirror(cratonvm_types::ClassId::new(0)));
+        let empty = Vec::new();
+        let anns = per_param.get(i).unwrap_or(&empty);
+        let at = make_annotated_type_with_anns(ctx, tm, anns);
+        ctx.set_array_element(out, i, Value::Object(Some(at)));
+    }
+    Ok(Some(Value::Object(Some(out))))
+}
+
+/// `Field.getAnnotatedType()Ljava/lang/reflect/AnnotatedType;`
+///
+/// Builds an AnnotatedType wrapping the field's (erased) type and carrying the
+/// field's FIELD-target TYPE_USE annotations.
+pub(crate) fn native_field_get_annotated_type(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let anns = match field_class_and_name(ctx, this) {
+        Some((cid, name)) => ctx.field_type_annotations(cid, &name),
+        None => Vec::new(),
+    };
+    let type_mirror = match ctx.invoke_virtual(this, "getType", "()Ljava/lang/Class;", &[]) {
+        Ok(Some(Value::Object(Some(m)))) => m,
+        _ => ctx.get_class_mirror(cratonvm_types::ClassId::new(0)),
+    };
+    let at = make_annotated_type_with_anns(ctx, type_mirror, &anns);
+    Ok(Some(Value::Object(Some(at))))
+}
+
+/// `AnnotatedType.getDeclaredAnnotations()` / `getAnnotations()` override for
+/// the `AnnotatedTypeBaseImpl` instances CratonVM constructs. Returns the
+/// stashed `Annotation[]` (or an empty array).
+pub(crate) fn native_annotated_type_get_declared_annotations(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let stashed = annotated_type_stashed_anns(ctx, this);
+    if let Some((arr, len)) = stashed {
+        if len > 0 {
+            // The field holds an actual `Annotation[]` (length>0 ⇒ array kind);
+            // return it directly.
+            return Ok(Some(Value::Object(Some(arr))));
+        }
+    }
+    let comp = annotation_component_class_id(ctx);
+    let empty = ctx.new_ref_array(comp, 0);
+    Ok(Some(Value::Object(Some(empty))))
+}
+
+/// `AnnotatedType.getAnnotation(Class)` override — scans the stashed proxy
+/// array for one whose `annotationType()` matches the requested class.
+pub(crate) fn native_annotated_type_get_annotation(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let want = match args.get(1) {
+        Some(Value::Object(Some(c))) => mirror_class_id(ctx, *c),
+        _ => None,
+    };
+    let want = match want {
+        Some(w) => w,
+        None => return Ok(Some(Value::Object(None))),
+    };
+    if let Some((arr, n)) = annotated_type_stashed_anns(ctx, this) {
+        for i in 0..n {
+            if let Value::Object(Some(proxy)) = ctx.get_array_element(arr, i) {
+                if let Value::Object(Some(tm)) = ctx.get_field(proxy, ANN_PROXY_TYPE_MIRROR) {
+                    if mirror_class_id(ctx, tm) == Some(want) {
+                        return Ok(Some(Value::Object(Some(proxy))));
+                    }
+                }
+            }
+        }
+    }
+    Ok(Some(Value::Object(None)))
 }
 
 /// Build a non-null, empty `java.security.Permissions` collection.

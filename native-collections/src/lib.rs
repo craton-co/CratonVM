@@ -4990,6 +4990,54 @@ fn native_map_entry_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     Ok(Some(Value::Object(Some(set))))
 }
 
+/// Build a **static** live `entrySet()` Set from an explicit list of
+/// `(key, value)` pairs backed by `source`. Mirrors [`native_map_entry_set`]
+/// (3-field live `Map$Entry` elements, a view backing that remembers `source`
+/// so `remove`/`iterator().remove()` and `Entry.setValue` write through to
+/// `source` via its virtual `remove`/`put`), but tagged `VIEW_KIND_ENTRYSET_STATIC`
+/// so the view is materialised **once** and never resynced from `source`.
+///
+/// This is for sources whose entries cannot be read back without re-entering
+/// `entrySet()` — `java/util/Properties`, whose data lives in a Rust side-table.
+/// A standard (resyncing) entrySet view would walk `Properties.entrySet()` on
+/// every `iterator()` and recurse. Because the write-through is keyed on this
+/// specific view backing (not on the entries' source field), a later
+/// `new HashSet<>(props.entrySet())` copy is a plain set and its `remove` is
+/// correctly detached from the source.
+pub fn make_static_entry_set(
+    ctx: &mut dyn NativeContext,
+    source: ObjectRef,
+    entries: &[(Value, Value)],
+) -> ObjectRef {
+    let set = alloc_synthetic(ctx, "java/util/HashSet", HS_NUM_FIELDS);
+    let cap = std::cmp::max(entries.len().next_power_of_two(), MAP_DEFAULT_CAPACITY);
+    let backing_map = alloc_view_backing(ctx, source, VIEW_KIND_ENTRYSET_STATIC, cap);
+    ctx.set_field(set, HS_FIELD_MAP, Value::Object(Some(backing_map)));
+    for (key, value) in entries {
+        // 3-field Map$Entry: key@0, value@1, sourceMap@2 — so `Entry.setValue`
+        // writes through to `source` (see `native_entry_set_value`).
+        let entry_obj = alloc_synthetic(ctx, "java/util/Map$Entry", 3);
+        ctx.set_field(entry_obj, 0, *key);
+        ctx.set_field(entry_obj, 1, *value);
+        ctx.set_field(entry_obj, 2, Value::Object(Some(source)));
+
+        let hash = ctx.identity_hash_code(entry_obj);
+        let (b, size, c) = map_state(ctx, backing_map);
+        let b = b.unwrap();
+        let idx = map_bucket_index(hash, c);
+        let existing = ctx.get_array_element(b, idx);
+        let head = match existing {
+            Value::Object(obj_opt) => obj_opt,
+            _ => None,
+        };
+        let sentinel = Value::Int(1);
+        let node = map_alloc_node(ctx, entry_obj, sentinel, hash, head);
+        ctx.set_array_element(b, idx, Value::Object(Some(node)));
+        set_map_size(ctx, backing_map, size + 1);
+    }
+    set
+}
+
 fn native_map_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
@@ -5272,6 +5320,22 @@ const VIEW_KIND_KEYSET: i32 = 0;
 /// `VIEW_KIND_ENTRYSET`: the set's elements are `Map.Entry` objects whose key
 /// (slot 0) identifies the source-map entry to delete on removal.
 const VIEW_KIND_ENTRYSET: i32 = 1;
+/// `VIEW_KIND_ENTRYSET_STATIC`: like `VIEW_KIND_ENTRYSET` — the elements are
+/// `Map.Entry` objects and a `remove` writes through to the source map — but the
+/// view does **not** resync its contents from the source on every
+/// `iterator()`/`size()`. Used for sources whose entries cannot be read back
+/// without re-entering this method: `java/util/Properties` keeps its data in a
+/// Rust side-table, so resyncing would walk `Properties.entrySet()` and recurse.
+/// The set's contents are materialised once at construction and then read from
+/// the backing directly; only structural `remove` (and `Entry.setValue`)
+/// propagate to the live source.
+const VIEW_KIND_ENTRYSET_STATIC: i32 = 2;
+
+/// True for either entrySet view kind (elements are `Map.Entry` objects), as
+/// opposed to a keySet view (elements are bare keys).
+fn is_entryset_kind(kind: i32) -> bool {
+    kind == VIEW_KIND_ENTRYSET || kind == VIEW_KIND_ENTRYSET_STATIC
+}
 
 /// Allocate the backing HashMap for a keySet/entrySet view: a synthetic
 /// `cratonvm/util/MapViewBacking` with the usual `(buckets, size, capacity)`
@@ -5627,6 +5691,12 @@ fn resync_view_set(ctx: &mut dyn NativeContext, set: ObjectRef) {
         None => return,
     };
     let kind = view_backing_kind(ctx, backing);
+    // A STATIC entrySet view (Properties) is materialised once and never
+    // resynced — its source cannot be read back without recursing through
+    // `Properties.entrySet()`. Leave the backing's contents untouched.
+    if kind == VIEW_KIND_ENTRYSET_STATIC {
+        return;
+    }
     // Rebuild the backing map's contents from the live source. Derive the
     // capacity from the current bucket-array length via `map_state` (NOT a raw
     // `get_field(MAP_FIELD_CAPACITY)`): a real-layout view backing keeps its
@@ -5730,6 +5800,13 @@ fn collect_keys_any(ctx: &mut dyn NativeContext, source: ObjectRef) -> Vec<Value
 /// layout `native_lhm_entry_set` and `native_hs_remove`'s key-extraction use).
 fn collect_view_snapshot_ordered(ctx: &mut dyn NativeContext, backing: ObjectRef) -> Vec<Value> {
     if let Some(source) = view_backing_source(ctx, backing) {
+        // STATIC entrySet (Properties): never resynced from the source, so read
+        // the entries straight from the backing — the same path a plain set
+        // takes — rather than walking the source (which would recurse into
+        // `Properties.entrySet()`).
+        if view_backing_kind(ctx, backing) == VIEW_KIND_ENTRYSET_STATIC {
+            return map_collect_keys(ctx, backing);
+        }
         if view_backing_kind(ctx, backing) == VIEW_KIND_ENTRYSET {
             return collect_entries_any(ctx, source)
                 .into_iter()
@@ -6505,7 +6582,7 @@ fn native_hs_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     // element is a `Map.Entry`, so delete its key (slot 0); for a keySet it is
     // the key itself.
     if let Some(source) = view_backing_source(ctx, backing) {
-        let key = if view_backing_kind(ctx, backing) == VIEW_KIND_ENTRYSET {
+        let key = if is_entryset_kind(view_backing_kind(ctx, backing)) {
             match elem {
                 Value::Object(Some(e)) => ctx.get_field(e, 0),
                 _ => elem,
@@ -6537,7 +6614,7 @@ fn native_hs_contains(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     // different `entrySet()` call (or any foreign Map.Entry) never matches and
     // `contains` wrongly returns false.
     if let Some(source) = view_backing_source(ctx, backing) {
-        if view_backing_kind(ctx, backing) == VIEW_KIND_ENTRYSET {
+        if is_entryset_kind(view_backing_kind(ctx, backing)) {
             // Non-object / null arg is never a Map.Entry → not contained.
             let entry = match elem {
                 Value::Object(Some(e)) => e,
@@ -8631,10 +8708,47 @@ fn native_entry_set_value(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     if ctx.object_num_fields(this) >= 3 {
         if let Value::Object(Some(src_map)) = ctx.get_field(this, 2) {
             let key = ctx.get_field(this, 0);
-            native_map_put(ctx, &[Value::Object(Some(src_map)), key, new_val])?;
+            if is_hashtable_receiver(ctx, src_map) {
+                // Hashtable/Properties store their entries outside the HashMap
+                // bucket array `native_map_put` writes to (Properties keeps them
+                // in a Rust side-table). Dispatch through the receiver's virtual
+                // `put` so the write reaches the real backing store — otherwise
+                // `props.entrySet().iterator()...setValue(v)` (Hibernate's
+                // `ConfigurationHelper.resolvePlaceHolders`) would silently no-op.
+                ctx.invoke_virtual(
+                    src_map,
+                    "put",
+                    "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+                    &[key, new_val],
+                )?;
+            } else {
+                native_map_put(ctx, &[Value::Object(Some(src_map)), key, new_val])?;
+            }
         }
     }
     Ok(Some(old_val))
+}
+
+/// True when `this`'s runtime class is `java/util/Hashtable` or a subclass
+/// (notably `java/util/Properties`). Such maps hold their entries outside the
+/// HashMap bucket array CratonVM models natively — `Properties` uses a Rust
+/// side-table — so live-entry `setValue` write-through and other generic
+/// mutations must dispatch through the receiver's own virtual method rather
+/// than the direct bucket-level `native_map_*`.
+fn is_hashtable_receiver(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
+    let mut cur = ctx.class_id_of_object(this);
+    for _ in 0..32 {
+        match ctx.class_name_of_id(cur) {
+            Some(n) if n == "java/util/Hashtable" || n == "java/util/Properties" => return true,
+            Some(n) if n == "java/util/HashMap" || n == "java/lang/Object" => return false,
+            _ => {}
+        }
+        match ctx.superclass_of(cur) {
+            Some(p) if p != cur => cur = p,
+            _ => return false,
+        }
+    }
+    false
 }
 
 // ===========================================================================
@@ -9380,6 +9494,18 @@ fn materialize_lazy_stream(ctx: &mut dyn NativeContext, stream: ObjectRef) {
 }
 
 /// Create a Stream from a slice of values.
+/// Public constructor for a fully-functional synthetic `java/util/stream/Stream`
+/// backed by a fixed element snapshot. Other native modules (e.g. the NIO
+/// `Files.list`/`Files.walk` shims in `native-builtins`) use this to return a
+/// working eager Stream without depending on the real `ReferencePipeline`
+/// machinery.
+pub fn make_stream_from_elements(
+    ctx: &mut dyn NativeContext,
+    elements: &[Value],
+) -> MethodCallResult {
+    make_stream(ctx, elements)
+}
+
 fn make_stream(ctx: &mut dyn NativeContext, elements: &[Value]) -> MethodCallResult {
     let stream = alloc_synthetic(ctx, "java/util/stream/Stream", STREAM_NUM_FIELDS);
     let arr = alloc_ref_array(ctx, elements.len());

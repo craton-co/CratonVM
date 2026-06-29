@@ -3843,6 +3843,10 @@ const P57_PATH_FS_FIELD: usize = 1;
 /// Field index on a synthetic `java/nio/file/FileSystem` that, when set, holds
 /// the OS path of a mounted JAR (see `newFileSystem`). Field 0 is the separator.
 const P57_FS_JAR_FIELD: usize = 1;
+/// Field index on a synthetic `java/nio/file/FileSystem` that, when set, holds
+/// the `java.home` of a mounted runtime-image (`jrt:`) filesystem. Field 0 is
+/// the separator, field 1 the mounted-JAR path; these are mutually exclusive.
+const P57_FS_JRT_FIELD: usize = 2;
 
 /// Distinguish a *real* `java/io/BufferedWriter` (built from JDK bytecode via
 /// `new BufferedWriter(writer)`) from the synthetic, fd-backed object that
@@ -4428,6 +4432,20 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                 if let Value::Object(Some(fs)) = ctx.get_field(this, P57_PATH_FS_FIELD) {
                     return Ok(Some(Value::Object(Some(fs))));
                 }
+                // Encoded virtual-FS paths produced during a walk carry no owning
+                // FileSystem; reconstruct one so `path.getFileSystem().provider()
+                // .getScheme()` reports jrt/jar (javac inspects this).
+                let p = p57_read_path(ctx, this);
+                if let Some((jh, _)) = jrtfs_decode(&p) {
+                    let fs = p57_alloc_jrt_filesystem(ctx, &jh);
+                    return Ok(Some(Value::Object(Some(fs))));
+                }
+                if let Some((jar, _)) = jarfs_decode(&p) {
+                    let fs = p57_alloc_default_filesystem(ctx);
+                    let jp = ctx.create_string(&jar);
+                    ctx.set_field(fs, P57_FS_JAR_FIELD, Value::Object(Some(jp)));
+                    return Ok(Some(Value::Object(Some(fs))));
+                }
             }
             // No owning FileSystem recorded: this is a default-filesystem
             // path, so return THE default-FS singleton (identity checks
@@ -4513,17 +4531,30 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             let other = obj_arg(args, 1)?;
             let base = p57_read_path(ctx, this);
             let target = p57_read_path(ctx, other);
-            // jar-FS: entries form a forward-prefix namespace, so `strip_prefix`
-            // suffices. JUnit5's ClasspathScanner does
-            // `relativize(...).toString().replace(fs.getSeparator(), ".")`, which
-            // needs the zipfs '/' separator, so keep '/' for jar paths.
-            if jarfs_decode(&base).is_some() || jarfs_decode(&target).is_some() {
-                let relative = std::path::Path::new(&target)
-                    .strip_prefix(std::path::Path::new(&base))
-                    .map(|p| p.to_string_lossy().to_string())
-                    .unwrap_or_else(|_| target.clone())
-                    .replace('\\', "/");
-                let result = p57_alloc_path(ctx, &relative);
+            // Virtual-FS (jar / jrt): relativize within the entry namespace and
+            // return a PLAIN relative path (NOT re-encoded). javac's
+            // `ArchiveContainer` keys its package map on
+            // `root.relativize(dir).toString()` (e.g. "org/h2/tools"), and
+            // JUnit5's ClasspathScanner does `relativize(...).toString()
+            // .replace(fs.getSeparator(), ".")`. The previous version ran
+            // `std::path::strip_prefix` on the SENTINEL-ENCODED strings, which is
+            // component-based and could not strip the shared
+            // `…<jar>\u{1}` prefix (the jar-filename+sentinel component never
+            // matched), so it returned the whole encoded target as garbage —
+            // javac then keyed packages on garbage and reported "package
+            // org.h2.tools does not exist" for every classpath jar.
+            if let (Some((_, _, be)), Some((_, _, te))) =
+                (vfs_decode(&base), vfs_decode(&target))
+            {
+                let rel = p57_relativize(&be, &te).unwrap_or(te);
+                let result = p57_alloc_path(ctx, &rel);
+                // Tag the result with the source's owning virtual FS so its
+                // `toString()` renders with '/' (the zipfs/jrtfs separator), not
+                // the host '\' — javac keys its package map on
+                // `root.relativize(dir).toString()`.
+                if let Value::Object(Some(fs)) = ctx.get_field(this, P57_PATH_FS_FIELD) {
+                    ctx.set_field(result, P57_PATH_FS_FIELD, Value::Object(Some(fs)));
+                }
                 return Ok(Some(Value::Object(Some(result))));
             }
             // Host paths: compute the real relative path (with `..` backtracking)
@@ -4581,8 +4612,8 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let this = obj_arg(args, 0)?;
             let p_raw = p57_read_path(ctx, this);
-            let p = jarfs_decode(&p_raw)
-                .map(|(_, e)| e)
+            let p = vfs_decode(&p_raw)
+                .map(|(_, _, e)| e)
                 .unwrap_or_else(|| p_raw.clone());
             let name = std::path::Path::new(&p)
                 .file_name()
@@ -4606,9 +4637,22 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                     Ok(Some(Value::Object(Some(result))))
                 }
                 None => {
-                    // Root path with no component — return an empty-named Path
-                    // so callers that immediately .toString() see "" instead of
-                    // dereferencing null.
+                    // A path with no name element is a root. The JDK contract is
+                    // `getFileName() == null` here, and javac's
+                    // `JavacFileManager$ArchiveContainer.preVisitDirectory` relies
+                    // on it: `Path name = dir.getFileName(); if (name != null &&
+                    // !SourceVersion.isName(name.toString())) SKIP_SUBTREE`. For a
+                    // jar/jrt root a non-null "" makes `isName("")` false, so the
+                    // walker SKIP_SUBTREEs the whole archive at its root — the
+                    // classpath jar (and the runtime image) go completely
+                    // unindexed and every type resolves to "package X does not
+                    // exist" (broke in-process javac / H2 CREATE ALIAS). Return
+                    // null for an encoded virtual-FS root. HOST paths keep the
+                    // legacy non-null "" (smallrye-config's Keycloak path consumer
+                    // NPEs on a null getFileName for "/").
+                    if vfs_decode(&p_raw).is_some() {
+                        return Ok(Some(Value::Object(None)));
+                    }
                     let result = p57_alloc_path(ctx, "");
                     Ok(Some(Value::Object(Some(result))))
                 }
@@ -4620,16 +4664,21 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
     r.register(path, "toString", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let p = p57_read_path(ctx, this);
-        let display = match jarfs_decode(&p) {
-            // jar-FS Path.toString() shows the in-jar entry with '/'
-            // (matches the JDK zipfs separator), regardless of host OS.
-            Some((_, e)) => {
+        let display = match vfs_decode(&p) {
+            // jar-FS / jrt-FS Path.toString() shows the in-archive entry with
+            // '/' (matches the JDK zipfs/jrtfs separator), regardless of host OS.
+            Some((_, _, e)) => {
                 if e.starts_with('/') {
                     e
                 } else {
                     format!("/{e}")
                 }
             }
+            // A plain (non-encoded) relative path whose owning FileSystem is a
+            // virtual (jar/jrt) FS renders with '/' — e.g. the result of
+            // `jarRoot.relativize(dir)` ("org/h2/tools"), which javac turns into
+            // a package name. Rendering the host '\' there would corrupt the key.
+            None if path_owned_by_virtual_fs(ctx, this) => p.replace('\\', "/"),
             // Host-FS path: render the OS-native separator. CratonVM stores
             // paths with '/' internally, but HotSpot's WindowsPath.toString()
             // renders '\'; convert at this display boundary on Windows
@@ -4690,7 +4739,9 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             // on this to build package names); the host FS renders the OS
             // separator.
             if let Ok(this) = obj_arg(args, 0) {
-                if let Value::Object(Some(_)) = ctx.get_field(this, P57_FS_JAR_FIELD) {
+                let is_virtual = matches!(ctx.get_field(this, P57_FS_JAR_FIELD), Value::Object(Some(_)))
+                    || matches!(ctx.get_field(this, P57_FS_JRT_FIELD), Value::Object(Some(_)));
+                if is_virtual {
                     let s = ctx.create_string("/");
                     return Ok(Some(Value::Object(Some(s))));
                 }
@@ -4726,15 +4777,23 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                     }
                 }
             }
-            // If this FileSystem was mounted from a JAR, produce a jar-FS path.
+            // If this FileSystem was mounted from a JAR or is the runtime image
+            // (jrt:), produce an encoded virtual-FS path so the file-IO natives
+            // resolve it against the archive / jimage rather than the host FS.
             let jar = match ctx.get_field(this, P57_FS_JAR_FIELD) {
                 Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
                 _ => String::new(),
             };
-            let result = if jar.is_empty() {
-                p57_alloc_path(ctx, &first)
-            } else {
+            let jrt = match ctx.get_field(this, P57_FS_JRT_FIELD) {
+                Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+                _ => String::new(),
+            };
+            let result = if !jar.is_empty() {
                 p57_alloc_path(ctx, &jarfs_encode(&jar, &first))
+            } else if !jrt.is_empty() {
+                p57_alloc_path(ctx, &jrtfs_encode(&jrt, &first))
+            } else {
+                p57_alloc_path(ctx, &first)
             };
             // Record the FileSystem that produced this Path so
             // `Path.getFileSystem()` returns the *same* object — required by
@@ -4749,10 +4808,26 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         fs_class,
         "provider",
         "()Ljava/nio/file/spi/FileSystemProvider;",
-        |ctx, _args| {
+        |ctx, args| {
+            // Report the scheme matching this FileSystem so callers that check
+            // `fs.provider().getScheme()` see "jrt"/"jar" for a mounted virtual
+            // FS, "file" otherwise.
+            let scheme_str = match obj_arg(args, 0) {
+                Ok(this)
+                    if matches!(ctx.get_field(this, P57_FS_JRT_FIELD), Value::Object(Some(_))) =>
+                {
+                    "jrt"
+                }
+                Ok(this)
+                    if matches!(ctx.get_field(this, P57_FS_JAR_FIELD), Value::Object(Some(_))) =>
+                {
+                    "jar"
+                }
+                _ => "file",
+            };
             let provider =
                 alloc_concurrent_synthetic(ctx, "java/nio/file/spi/FileSystemProvider", 1);
-            let scheme = ctx.create_string("file");
+            let scheme = ctx.create_string(scheme_str);
             ctx.set_field(provider, 0, Value::Object(Some(scheme)));
             Ok(Some(Value::Object(Some(provider))))
         },
@@ -4811,15 +4886,63 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         fs_class,
         "getRootDirectories",
         "()Ljava/lang/Iterable;",
-        |ctx, _args| {
+        |ctx, args| {
             use cratonvm_types::ArrayElementType;
-            let root = if cfg!(windows) { "C:\\" } else { "/" };
-            let root_path = p57_alloc_path(ctx, root);
+            // A mounted-jar FileSystem (P57_FS_JAR_FIELD set) must enumerate from
+            // a jar-FS root path so `Files.walkFileTree` recurses into the
+            // archive's entries — javac's `JavacFileManager$ArchiveContainer`
+            // walks `getRootDirectories()` to index a classpath jar's packages
+            // (the in-process compiler the H2 `CREATE ALIAS` / HIB-CV-27 path
+            // depends on). A host FileSystem returns the OS root.
+            //
+            // The previous body ignored `this` and always returned the host
+            // root, wrapped in a `Collections$SingletonList` whose field 0 held
+            // the backing *array* — but the real-JDK `SingletonList` iterator
+            // reads field 0 as the single *element*, so a for-each yielded one
+            // null. That null `Path` reached the default `SimpleFileVisitor.
+            // visitFile`, whose `Objects.requireNonNull(file)` then NPE'd —
+            // crashing `ArchiveContainer.<init>` for every classpath jar and
+            // making in-process compilation fail. Use the real-JDK `ArrayList`
+            // layout instead (same as `installedProviders`), which iterates
+            // correctly.
+            let jar_field = obj_arg(args, 0)
+                .ok()
+                .map(|this| ctx.get_field(this, P57_FS_JAR_FIELD));
+            let jrt_field = obj_arg(args, 0)
+                .ok()
+                .map(|this| ctx.get_field(this, P57_FS_JRT_FIELD));
+            let root_path = match (jar_field, jrt_field) {
+                (Some(Value::Object(Some(s))), _) => {
+                    let jar = ctx.read_string(s).unwrap_or_default();
+                    let rp = p57_alloc_path(ctx, &jarfs_encode(&jar, ""));
+                    if let Ok(this) = obj_arg(args, 0) {
+                        ctx.set_field(rp, P57_PATH_FS_FIELD, Value::Object(Some(this)));
+                    }
+                    rp
+                }
+                (_, Some(Value::Object(Some(s)))) => {
+                    // Runtime image: root is the synthetic `/` whose only child is
+                    // `/modules` (javac walks `/modules/<module>/...`).
+                    let jh = ctx.read_string(s).unwrap_or_default();
+                    let rp = p57_alloc_path(ctx, &jrtfs_encode(&jh, ""));
+                    if let Ok(this) = obj_arg(args, 0) {
+                        ctx.set_field(rp, P57_PATH_FS_FIELD, Value::Object(Some(this)));
+                    }
+                    rp
+                }
+                _ => {
+                    let root = if cfg!(windows) { "C:\\" } else { "/" };
+                    p57_alloc_path(ctx, root)
+                }
+            };
             let arr = ctx.new_array(ArrayElementType::Reference, 1);
             ctx.set_array_element(arr, 0, Value::Object(Some(root_path)));
-            // Wrap in a simple list-like iterable
-            let list = alloc_concurrent_synthetic(ctx, "java/util/Collections$SingletonList", 1);
-            ctx.set_field(list, 0, Value::Object(Some(arr)));
+            // Real ArrayList field layout in real-JDK mode:
+            //   [0]=AbstractList.modCount (int), [1]=elementData (Object[]), [2]=size (int).
+            let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 3);
+            ctx.set_field(list, 0, Value::Int(0));
+            ctx.set_field(list, 1, Value::Object(Some(arr)));
+            ctx.set_field(list, 2, Value::Int(1));
             Ok(Some(Value::Object(Some(list))))
         },
     );
@@ -4917,6 +5040,12 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let uri = obj_arg(args, 1)?;
             let text = p57_uri_full_text(ctx, uri);
+            // A jrt: URI mounts the runtime image (HIB-CV-27 in-process javac).
+            if text.starts_with("jrt:") {
+                let jh = ctx.get_system_property("java.home").unwrap_or_default();
+                let fs = p57_alloc_jrt_filesystem(ctx, &jh);
+                return Ok(Some(Value::Object(Some(fs))));
+            }
             let fs = p57_alloc_default_filesystem(ctx);
             if let Some(jar) = p57_jar_uri_to_os_path(&text) {
                 // Only mount paths that exist as regular files — a `file:`
@@ -5132,21 +5261,29 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         "()Ljava/util/List;",
         |ctx, _args| {
             use cratonvm_types::ArrayElementType;
-            let file_p = alloc_concurrent_synthetic(ctx, "java/nio/file/spi/FileSystemProvider", 1);
-            let file_s = ctx.create_string("file");
-            ctx.set_field(file_p, 0, Value::Object(Some(file_s)));
-            let jar_p = alloc_concurrent_synthetic(ctx, "java/nio/file/spi/FileSystemProvider", 1);
-            let jar_s = ctx.create_string("jar");
-            ctx.set_field(jar_p, 0, Value::Object(Some(jar_s)));
-            let arr = ctx.new_array(ArrayElementType::Reference, 2);
+            let mk_provider = |ctx: &mut dyn NativeContext, scheme: &str| {
+                let p = alloc_concurrent_synthetic(ctx, "java/nio/file/spi/FileSystemProvider", 1);
+                let s = ctx.create_string(scheme);
+                ctx.set_field(p, 0, Value::Object(Some(s)));
+                p
+            };
+            // "jrt" lets `FileSystems.getFileSystem(URI.create("jrt:/"))` resolve
+            // (the real-JDK static iterates installedProviders by scheme) so the
+            // in-process compiler can read platform classes from the runtime
+            // image (HIB-CV-27).
+            let file_p = mk_provider(ctx, "file");
+            let jar_p = mk_provider(ctx, "jar");
+            let jrt_p = mk_provider(ctx, "jrt");
+            let arr = ctx.new_array(ArrayElementType::Reference, 3);
             ctx.set_array_element(arr, 0, Value::Object(Some(file_p)));
             ctx.set_array_element(arr, 1, Value::Object(Some(jar_p)));
+            ctx.set_array_element(arr, 2, Value::Object(Some(jrt_p)));
             // Real ArrayList field layout in real-JDK mode:
             //   [0]=AbstractList.modCount (int), [1]=elementData (Object[]), [2]=size (int).
             let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 3);
             ctx.set_field(list, 0, Value::Int(0));
             ctx.set_field(list, 1, Value::Object(Some(arr)));
-            ctx.set_field(list, 2, Value::Int(2));
+            ctx.set_field(list, 2, Value::Int(3));
             Ok(Some(Value::Object(Some(list))))
         },
     );
@@ -5155,7 +5292,27 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         fsp,
         "getFileSystem",
         "(Ljava/net/URI;)Ljava/nio/file/FileSystem;",
-        |ctx, _args| {
+        |ctx, args| {
+            // `FileSystems.getFileSystem(uri)` matches an installed provider by
+            // scheme then invokes this on it, so the scheme is on `this` (field
+            // 0); also inspect the URI for robustness. A jrt: URI yields the
+            // runtime-image FileSystem (HIB-CV-27 in-process javac).
+            let scheme = obj_arg(args, 0)
+                .ok()
+                .and_then(|this| match ctx.get_field(this, 0) {
+                    Value::Object(Some(s)) => ctx.read_string(s),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            let uri_is_jrt = match args.get(1) {
+                Some(Value::Object(Some(u))) => p57_uri_full_text(ctx, *u).starts_with("jrt:"),
+                _ => false,
+            };
+            if scheme == "jrt" || uri_is_jrt {
+                let jh = ctx.get_system_property("java.home").unwrap_or_default();
+                let fs = p57_alloc_jrt_filesystem(ctx, &jh);
+                return Ok(Some(Value::Object(Some(fs))));
+            }
             let fs = p57_alloc_default_filesystem(ctx);
             Ok(Some(Value::Object(Some(fs))))
         },
@@ -5400,8 +5557,8 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let path_obj = obj_arg(args, 0)?;
             let p = p57_read_path(ctx, path_obj);
-            let is_dir = match jarfs_decode(&p) {
-                Some((jar, entry)) => matches!(jarfs_classify(&jar, &entry), JarFsKind::Dir),
+            let is_dir = match vfs_classify(&p) {
+                Some(kind) => matches!(kind, JarFsKind::Dir),
                 None => std::path::Path::new(&p).is_dir(),
             };
             Ok(Some(Value::Int(if is_dir { 1 } else { 0 })))
@@ -5415,8 +5572,8 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let path_obj = obj_arg(args, 0)?;
             let p = p57_read_path(ctx, path_obj);
-            let is_file = match jarfs_decode(&p) {
-                Some((jar, entry)) => matches!(jarfs_classify(&jar, &entry), JarFsKind::File),
+            let is_file = match vfs_classify(&p) {
+                Some(kind) => matches!(kind, JarFsKind::File),
                 None => std::path::Path::new(&p).is_file(),
             };
             Ok(Some(Value::Int(if is_file { 1 } else { 0 })))
@@ -5442,8 +5599,8 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let path_obj = obj_arg(args, 0)?;
             let p = p57_read_path(ctx, path_obj);
-            let readable = match jarfs_decode(&p) {
-                Some((jar, entry)) => !matches!(jarfs_classify(&jar, &entry), JarFsKind::Absent),
+            let readable = match vfs_classify(&p) {
+                Some(kind) => !matches!(kind, JarFsKind::Absent),
                 None => std::path::Path::new(&p).exists(),
             };
             Ok(Some(Value::Int(if readable { 1 } else { 0 })))
@@ -5465,14 +5622,77 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
     r.register(files, "size", "(Ljava/nio/file/Path;)J", |ctx, args| {
         let path_obj = obj_arg(args, 0)?;
         let p = p57_read_path(ctx, path_obj);
-        let size = match jarfs_decode(&p) {
-            Some((jar, entry)) => jarfs_read_entry(&jar, &entry)
-                .map(|b| b.len() as u64)
-                .unwrap_or(0),
+        let size = match vfs_read(&p) {
+            Some(r) => r.map(|b| b.len() as u64).unwrap_or(0),
             None => std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0),
         };
         Ok(Some(Value::Long(size as i64)))
     });
+
+    // `Files.list` / `Files.walk` return a `Stream<Path>` built (in the real
+    // JDK) by wrapping `newDirectoryStream(dir).iterator()` in a
+    // `Spliterators.spliteratorUnknownSize` Stream. On CratonVM that real
+    // bytecode path does not reach the synthetic `newDirectoryStream` provider
+    // native for non-default (jar/jrt) filesystems, so the resulting Stream is
+    // empty — which broke in-process javac (it enumerates the runtime image's
+    // packages via `Files.list`/`Files.walk` and saw zero, reporting "Unable to
+    // find package java.lang in platform classes"). Register these directly so
+    // they return a fully-functional eager synthetic Stream over the listing,
+    // uniformly for host / jar / jrt paths.
+    r.register(
+        files,
+        "list",
+        "(Ljava/nio/file/Path;)Ljava/util/stream/Stream;",
+        |ctx, args| {
+            let path_obj = obj_arg(args, 0)?;
+            let p = p57_read_path(ctx, path_obj);
+            let entries = vfs_or_host_list(&p);
+            let mut vals = Vec::with_capacity(entries.len());
+            for e in &entries {
+                let ep = p57_alloc_path(ctx, e);
+                vals.push(Value::Object(Some(ep)));
+            }
+            cratonvm_native_collections::make_stream_from_elements(ctx, &vals)
+        },
+    );
+    // Files.walk(Path, FileVisitOption...) and the maxDepth overload.
+    fn files_walk_stream(
+        ctx: &mut dyn NativeContext,
+        path_obj: ObjectRef,
+        max_depth: usize,
+    ) -> MethodCallResult {
+        let p = p57_read_path(ctx, path_obj);
+        let mut paths = Vec::new();
+        vfs_or_host_walk(&p, 0, max_depth, &mut paths);
+        let mut vals = Vec::with_capacity(paths.len());
+        for e in &paths {
+            let ep = p57_alloc_path(ctx, e);
+            vals.push(Value::Object(Some(ep)));
+        }
+        cratonvm_native_collections::make_stream_from_elements(ctx, &vals)
+    }
+    r.register(
+        files,
+        "walk",
+        "(Ljava/nio/file/Path;[Ljava/nio/file/FileVisitOption;)Ljava/util/stream/Stream;",
+        |ctx, args| {
+            let path_obj = obj_arg(args, 0)?;
+            files_walk_stream(ctx, path_obj, usize::MAX)
+        },
+    );
+    r.register(
+        files,
+        "walk",
+        "(Ljava/nio/file/Path;I[Ljava/nio/file/FileVisitOption;)Ljava/util/stream/Stream;",
+        |ctx, args| {
+            let path_obj = obj_arg(args, 0)?;
+            let max_depth = match args.get(1) {
+                Some(Value::Int(n)) if *n >= 0 => *n as usize,
+                _ => usize::MAX,
+            };
+            files_walk_stream(ctx, path_obj, max_depth)
+        },
+    );
 
     r.register(
         files,
@@ -5833,8 +6053,8 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             // Jar-filesystem entries are not real OS files (`fd_table` cannot
             // open them), so keep the in-memory snapshot path for them. (These
             // remain read-only via the methodless stub — unchanged behaviour.)
-            if let Some((jar, entry)) = jarfs_decode(&p) {
-                return match jarfs_read_entry(&jar, &entry) {
+            if let Some(read) = vfs_read(&p) {
+                return match read {
                     Ok(data) => {
                         let channel = alloc_concurrent_synthetic(
                             ctx,
@@ -5916,8 +6136,8 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let path_obj = obj_arg(args, 1)?;
             let p = p57_read_path(ctx, path_obj);
-            let read = match jarfs_decode(&p) {
-                Some((jar, entry)) => jarfs_read_entry(&jar, &entry),
+            let read = match vfs_read(&p) {
+                Some(r) => r,
                 None => std::fs::read(&p),
             };
             match read {
@@ -5980,8 +6200,8 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let path_obj = obj_arg(args, 1)?;
             let p = p57_read_path(ctx, path_obj);
-            let exists = match jarfs_decode(&p) {
-                Some((jar, entry)) => !matches!(jarfs_classify(&jar, &entry), JarFsKind::Absent),
+            let exists = match vfs_classify(&p) {
+                Some(kind) => !matches!(kind, JarFsKind::Absent),
                 None => std::path::Path::new(&p).exists(),
             };
             if !exists {
@@ -6018,18 +6238,24 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             let p = p57_read_path(ctx, path_obj);
             let stream = alloc_concurrent_synthetic(ctx, "java/nio/file/DirectoryStream", 1);
             // Build array of Path entries
-            let entries: Vec<String> = match jarfs_decode(&p) {
-                Some((jar, dir)) => jarfs_list_dir(&jar, &dir)
+            let entries: Vec<String> = if let Some((jar, dir)) = jarfs_decode(&p) {
+                jarfs_list_dir(&jar, &dir)
                     .into_iter()
                     .map(|child| jarfs_encode(&jar, &child))
-                    .collect(),
-                None => match std::fs::read_dir(&p) {
+                    .collect()
+            } else if let Some((java_home, dir)) = jrtfs_decode(&p) {
+                jrtfs_list_dir_classified(&java_home, &dir)
+                    .into_iter()
+                    .map(|(child, _)| jrtfs_encode(&java_home, &child))
+                    .collect()
+            } else {
+                match std::fs::read_dir(&p) {
                     Ok(rd) => rd
                         .filter_map(|e| e.ok())
                         .map(|e| e.path().to_string_lossy().replace('\\', "/"))
                         .collect(),
                     Err(_) => vec![],
-                },
+                }
             };
             use cratonvm_types::ArrayElementType;
             let arr = ctx.new_array(ArrayElementType::Reference, entries.len());
@@ -6324,8 +6550,8 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let path_obj = obj_arg(args, 0)?;
             let p = p57_read_path(ctx, path_obj);
-            let exists = match jarfs_decode(&p) {
-                Some((jar, entry)) => !matches!(jarfs_classify(&jar, &entry), JarFsKind::Absent),
+            let exists = match vfs_classify(&p) {
+                Some(kind) => !matches!(kind, JarFsKind::Absent),
                 None => std::path::Path::new(&p).exists(),
             };
             Ok(Some(Value::Int(if exists { 1 } else { 0 })))
@@ -6339,8 +6565,8 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let path_obj = obj_arg(args, 0)?;
             let p = p57_read_path(ctx, path_obj);
-            let exists = match jarfs_decode(&p) {
-                Some((jar, entry)) => !matches!(jarfs_classify(&jar, &entry), JarFsKind::Absent),
+            let exists = match vfs_classify(&p) {
+                Some(kind) => !matches!(kind, JarFsKind::Absent),
                 None => std::path::Path::new(&p).exists(),
             };
             Ok(Some(Value::Int(if !exists { 1 } else { 0 })))
@@ -6354,8 +6580,8 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let path_obj = obj_arg(args, 0)?;
             let p = p57_read_path(ctx, path_obj);
-            let read = match jarfs_decode(&p) {
-                Some((jar, entry)) => jarfs_read_entry(&jar, &entry),
+            let read = match vfs_read(&p) {
+                Some(r) => r,
                 None => std::fs::read(&p),
             };
             match read {
@@ -6726,8 +6952,8 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let path_obj = obj_arg(args, 0)?;
             let p = p57_read_path(ctx, path_obj);
-            let read = match jarfs_decode(&p) {
-                Some((jar, entry)) => jarfs_read_entry(&jar, &entry),
+            let read = match vfs_read(&p) {
+                Some(r) => r,
                 None => std::fs::read(&p),
             };
             match read {
@@ -6804,8 +7030,8 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             // jar-filesystem entries: a real path inside a mounted jar. If the
             // entry is present, the path itself is already "real"; otherwise
             // it does not exist.
-            if let Some((jar, entry)) = jarfs_decode(&p) {
-                if matches!(jarfs_classify(&jar, &entry), JarFsKind::Absent) {
+            if vfs_decode(&p).is_some() {
+                if matches!(vfs_classify(&p), Some(JarFsKind::Absent) | None) {
                     return Err(p57_no_such_file(ctx, &p));
                 }
                 let result = p57_alloc_path(ctx, &p);
@@ -6863,6 +7089,17 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             };
             let entry = entry.trim_start_matches('/');
             let uri_str = format!("jar:file:{jar_abs}!/{entry}");
+            let uri = alloc_concurrent_synthetic(ctx, "java/net/URI", 5);
+            let s = ctx.create_string(&uri_str);
+            ctx.set_field(uri, 0, Value::Object(Some(s)));
+            ctx.set_field(uri, 4, Value::Object(Some(s)));
+            return Ok(Some(Value::Object(Some(uri))));
+        }
+        // jrt-FS Path → `jrt:/modules/<module>/<entry>` URI (matches the JDK
+        // runtime-image scheme).
+        if let Some((_jh, entry)) = jrtfs_decode(&p) {
+            let entry = entry.trim_start_matches('/');
+            let uri_str = format!("jrt:/{entry}");
             let uri = alloc_concurrent_synthetic(ctx, "java/net/URI", 5);
             let s = ctx.create_string(&uri_str);
             ctx.set_field(uri, 0, Value::Object(Some(s)));
@@ -7633,6 +7870,18 @@ mod p57_normalize_relativize_tests {
     }
 }
 
+/// True if `path_obj`'s recorded owning FileSystem (P57_PATH_FS_FIELD) is a
+/// virtual (mounted-jar or runtime-image) FileSystem. Used by `Path.toString`
+/// to render '/' for relative paths that belong to such a FS.
+fn path_owned_by_virtual_fs(ctx: &mut dyn NativeContext, path_obj: ObjectRef) -> bool {
+    if let Value::Object(Some(fs)) = ctx.get_field(path_obj, P57_PATH_FS_FIELD) {
+        matches!(ctx.get_field(fs, P57_FS_JAR_FIELD), Value::Object(Some(_)))
+            || matches!(ctx.get_field(fs, P57_FS_JRT_FIELD), Value::Object(Some(_)))
+    } else {
+        false
+    }
+}
+
 fn p57_alloc_path(ctx: &mut dyn NativeContext, path: &str) -> ObjectRef {
     // 2 fields: [0] = path String, [1] = owning FileSystem (P57_PATH_FS_FIELD,
     // null unless set by `FileSystem.getPath`).
@@ -7853,28 +8102,128 @@ fn p68_signature_failure(ctx: &mut dyn NativeContext, msg: &str) -> MethodCallFa
 // of going to the host filesystem (which would `ENOENT`).
 const JARFS_SENTINEL: char = '\u{1}';
 
-fn jarfs_encode(jar: &str, entry: &str) -> String {
+/// Encoded-virtual-filesystem tags. Both the jar-FS and the runtime-image
+/// (jrt) FS encode their `Path`s as sentinel-delimited strings of the form
+/// `\x01<TAG>\x01<container>\x01<entry>` so the file-IO natives can detect
+/// them and read the entry out of the archive / jimage instead of the host
+/// filesystem. The TAG distinguishes the backing store: `JARFS` →
+/// `<container>` is the jar's OS path (read via the `zip` crate); `JRTFS` →
+/// `<container>` is `java.home` and `<entry>` is a jrt logical path like
+/// `modules/java.base/java/lang` (read via the jimage `lib/modules`).
+const JARFS_TAG: &str = "JARFS";
+const JRTFS_TAG: &str = "JRTFS";
+
+/// Generic encoder for the sentinel-delimited virtual-FS path form.
+fn vfs_encode(tag: &str, container: &str, entry: &str) -> String {
     let entry = entry.trim_start_matches('/');
-    format!("{JARFS_SENTINEL}JARFS{JARFS_SENTINEL}{jar}{JARFS_SENTINEL}{entry}")
+    format!("{JARFS_SENTINEL}{tag}{JARFS_SENTINEL}{container}{JARFS_SENTINEL}{entry}")
+}
+
+/// Generic decoder: returns `(tag, container, entry)` for any recognised
+/// virtual-FS path, or `None` for a plain host path. The tag is mapped to one
+/// of the `&'static` tag constants so callers can compare it by identity/value.
+fn vfs_decode(p: &str) -> Option<(&'static str, String, String)> {
+    let body = p.strip_prefix(JARFS_SENTINEL)?;
+    let t_end = body.find(JARFS_SENTINEL)?;
+    let tag = &body[..t_end];
+    let rest = &body[t_end + JARFS_SENTINEL.len_utf8()..];
+    let c_end = rest.find(JARFS_SENTINEL)?;
+    let container = rest[..c_end].to_string();
+    let entry = rest[c_end + JARFS_SENTINEL.len_utf8()..].to_string();
+    let tag: &'static str = match tag {
+        t if t == JARFS_TAG => JARFS_TAG,
+        t if t == JRTFS_TAG => JRTFS_TAG,
+        _ => return None,
+    };
+    Some((tag, container, entry))
+}
+
+fn jarfs_encode(jar: &str, entry: &str) -> String {
+    vfs_encode(JARFS_TAG, jar, entry)
 }
 
 /// If `p` is a jar-FS encoded path, return `(jar_os_path, entry)`.
 fn jarfs_decode(p: &str) -> Option<(String, String)> {
-    let body = p.strip_prefix(JARFS_SENTINEL)?.strip_prefix("JARFS")?;
-    let body = body.strip_prefix(JARFS_SENTINEL)?;
-    let sep = body.find(JARFS_SENTINEL)?;
-    let jar = body[..sep].to_string();
-    let entry = body[sep + JARFS_SENTINEL.len_utf8()..].to_string();
-    Some((jar, entry))
+    match vfs_decode(p) {
+        Some((tag, c, e)) if tag == JARFS_TAG => Some((c, e)),
+        _ => None,
+    }
+}
+
+fn jrtfs_encode(java_home: &str, entry: &str) -> String {
+    vfs_encode(JRTFS_TAG, java_home, entry)
+}
+
+/// If `p` is a jrt-FS (runtime-image) encoded path, return `(java_home, entry)`
+/// where `entry` is the jrt logical path without a leading slash (e.g.
+/// `modules/java.base/java/lang`).
+fn jrtfs_decode(p: &str) -> Option<(String, String)> {
+    match vfs_decode(p) {
+        Some((tag, c, e)) if tag == JRTFS_TAG => Some((c, e)),
+        _ => None,
+    }
 }
 
 /// Read a jar-internal entry's bytes. `entry` "" or "/" means the jar root
 /// (a directory) — callers should treat that as a directory, not a file.
+/// Cache of mounted-jar file bytes, keyed by OS path. The jar-FS helpers
+/// (`jarfs_classify`/`jarfs_list_dir`/`jarfs_read_entry`, called once per
+/// directory/file during a `Files.walkFileTree`/`Files.walk`) each previously
+/// `std::fs::read` the whole archive — O(entries × jar-size) disk traffic that
+/// made walking a large classpath (e.g. the Hibernate suite's 241 jars, some
+/// multi-MB) pathologically slow. Classpath/mounted jars are read-only for the
+/// VM lifetime, so memoise the bytes (re-parsing the in-memory zip is cheap
+/// relative to re-reading multi-MB files from disk hundreds of times).
+fn jar_bytes_cached(jar: &str) -> Option<std::sync::Arc<Vec<u8>>> {
+    use std::sync::{Arc, Mutex, OnceLock};
+    static CACHE: OnceLock<Mutex<std::collections::HashMap<String, Option<Arc<Vec<u8>>>>>> =
+        OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+    let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(cached) = guard.get(jar) {
+        return cached.clone();
+    }
+    let bytes = std::fs::read(jar).ok().map(Arc::new);
+    guard.insert(jar.to_string(), bytes.clone());
+    bytes
+}
+
+/// Cached sorted entry-name index per jar (mirrors `jrt_image`). A
+/// `Files.walkFileTree` over a jar calls `jarfs_classify` (per entry, via
+/// `readAttributes`) and `jarfs_list_dir*` (per directory) — each of which
+/// previously re-parsed the whole zip central directory, i.e. O(N²) per jar.
+/// Building the sorted name list once (`ZipArchive::file_names`, no per-entry
+/// decompression) turns those into O(log N) binary-search / prefix scans, which
+/// is what makes walking a large classpath (the Hibernate suite's 241 jars)
+/// tractable in the interpreter.
+fn jar_index(jar: &str) -> Option<std::sync::Arc<Vec<String>>> {
+    use std::sync::{Arc, Mutex, OnceLock};
+    static CACHE: OnceLock<Mutex<std::collections::HashMap<String, Option<Arc<Vec<String>>>>>> =
+        OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+    let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(cached) = guard.get(jar) {
+        return cached.clone();
+    }
+    let built = (|| {
+        let bytes = jar_bytes_cached(jar)?;
+        let cursor = std::io::Cursor::new(bytes.as_slice());
+        let zip = zip::ZipArchive::new(cursor).ok()?;
+        let mut names: Vec<String> = zip.file_names().map(|s| s.to_string()).collect();
+        names.sort_unstable();
+        names.dedup();
+        Some(Arc::new(names))
+    })();
+    guard.insert(jar.to_string(), built.clone());
+    built
+}
+
 fn jarfs_read_entry(jar: &str, entry: &str) -> std::io::Result<Vec<u8>> {
     use std::io::Read;
     let entry = entry.trim_start_matches('/');
-    let jar_bytes = std::fs::read(jar)?;
-    let cursor = std::io::Cursor::new(jar_bytes);
+    let jar_bytes =
+        jar_bytes_cached(jar).ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotFound))?;
+    let cursor = std::io::Cursor::new(jar_bytes.as_slice());
     let mut zip = zip::ZipArchive::new(cursor)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
     let mut f = zip
@@ -7894,32 +8243,23 @@ enum JarFsKind {
 
 fn jarfs_classify(jar: &str, entry: &str) -> JarFsKind {
     let entry = entry.trim_start_matches('/');
-    let jar_bytes = match std::fs::read(jar) {
-        Ok(b) => b,
-        Err(_) => return JarFsKind::Absent,
-    };
-    let cursor = std::io::Cursor::new(jar_bytes);
-    let mut zip = match zip::ZipArchive::new(cursor) {
-        Ok(z) => z,
-        Err(_) => return JarFsKind::Absent,
+    let names = match jar_index(jar) {
+        Some(n) => n,
+        None => return JarFsKind::Absent,
     };
     if entry.is_empty() {
         return JarFsKind::Dir;
     }
-    if zip.by_name(entry).is_ok() {
+    // Exact entry → a regular file.
+    if names.binary_search_by(|n| n.as_str().cmp(entry)).is_ok() {
         return JarFsKind::File;
     }
-    // An explicit directory entry, or any entry living under `entry/`.
+    // An explicit directory entry (`entry/`) or any entry living under `entry/`.
+    // The sorted index makes this the first name >= `entry/`.
     let dir_prefix = format!("{entry}/");
-    if zip.by_name(&dir_prefix).is_ok() {
+    let idx = names.partition_point(|n| n.as_str() < dir_prefix.as_str());
+    if names.get(idx).is_some_and(|n| n.starts_with(&dir_prefix)) {
         return JarFsKind::Dir;
-    }
-    for i in 0..zip.len() {
-        if let Ok(f) = zip.by_index(i) {
-            if f.name().starts_with(&dir_prefix) {
-                return JarFsKind::Dir;
-            }
-        }
     }
     JarFsKind::Absent
 }
@@ -7927,47 +8267,15 @@ fn jarfs_classify(jar: &str, entry: &str) -> JarFsKind {
 /// List the immediate children of a directory `dir` inside a JAR. Returns
 /// full entry paths (relative to the jar root).
 fn jarfs_list_dir(jar: &str, dir: &str) -> Vec<String> {
-    let dir = dir.trim_start_matches('/').trim_end_matches('/');
-    let prefix = if dir.is_empty() {
-        String::new()
-    } else {
-        format!("{dir}/")
-    };
-    let jar_bytes = match std::fs::read(jar) {
-        Ok(b) => b,
-        Err(_) => return Vec::new(),
-    };
-    let cursor = std::io::Cursor::new(jar_bytes);
-    let mut zip = match zip::ZipArchive::new(cursor) {
-        Ok(z) => z,
-        Err(_) => return Vec::new(),
-    };
-    let mut seen = std::collections::BTreeSet::new();
-    for i in 0..zip.len() {
-        if let Ok(f) = zip.by_index(i) {
-            let name = f.name();
-            if let Some(rest) = name.strip_prefix(&prefix) {
-                let rest = rest.trim_end_matches('/');
-                if rest.is_empty() {
-                    continue;
-                }
-                // Immediate child only: keep the first path segment.
-                let child = match rest.find('/') {
-                    Some(j) => &rest[..j],
-                    None => rest,
-                };
-                seen.insert(format!("{prefix}{child}"));
-            }
-        }
-    }
-    seen.into_iter().collect()
+    jarfs_list_dir_classified(jar, dir)
+        .into_iter()
+        .map(|(child, _)| child)
+        .collect()
 }
 
 /// List immediate children of `dir` inside a JAR together with an
-/// is-directory flag, in ONE pass over the archive. `walkFileTree` needs the
-/// flag per child; calling `jarfs_classify` per child would re-read and
-/// re-parse the whole zip for every entry (O(n²) over a test jar with
-/// hundreds of classes).
+/// is-directory flag, using the cached sorted entry index (a contiguous prefix
+/// range), so a `walkFileTree` does not re-parse the whole zip per directory.
 fn jarfs_list_dir_classified(jar: &str, dir: &str) -> Vec<(String, bool)> {
     let dir = dir.trim_start_matches('/').trim_end_matches('/');
     let prefix = if dir.is_empty() {
@@ -7975,37 +8283,274 @@ fn jarfs_list_dir_classified(jar: &str, dir: &str) -> Vec<(String, bool)> {
     } else {
         format!("{dir}/")
     };
-    let jar_bytes = match std::fs::read(jar) {
-        Ok(b) => b,
-        Err(_) => return Vec::new(),
+    let names = match jar_index(jar) {
+        Some(n) => n,
+        None => return Vec::new(),
     };
-    let cursor = std::io::Cursor::new(jar_bytes);
-    let mut zip = match zip::ZipArchive::new(cursor) {
-        Ok(z) => z,
-        Err(_) => return Vec::new(),
-    };
+    let start = names.partition_point(|n| n.as_str() < prefix.as_str());
     let mut seen: std::collections::BTreeMap<String, bool> = std::collections::BTreeMap::new();
-    for i in 0..zip.len() {
-        if let Ok(f) = zip.by_index(i) {
-            let name = f.name();
-            if let Some(rest) = name.strip_prefix(&prefix) {
-                let trimmed = rest.trim_end_matches('/');
-                if trimmed.is_empty() {
-                    continue;
-                }
-                // Immediate child; it is a directory when the entry path
-                // descends further (contains '/') or is an explicit
-                // directory entry (trailing '/').
-                let (child, is_dir) = match trimmed.find('/') {
-                    Some(j) => (&trimmed[..j], true),
-                    None => (trimmed, rest.ends_with('/')),
-                };
-                let e = seen.entry(format!("{prefix}{child}")).or_insert(false);
-                *e = *e || is_dir;
-            }
+    for name in &names[start..] {
+        let rest = match name.strip_prefix(&prefix) {
+            Some(r) => r,
+            None => break, // sorted: first non-match ends the prefix range
+        };
+        let trimmed = rest.trim_end_matches('/');
+        if trimmed.is_empty() {
+            continue;
         }
+        // Immediate child; it is a directory when the entry path descends
+        // further (contains '/') or is an explicit directory entry (trailing '/').
+        let (child, is_dir) = match trimmed.find('/') {
+            Some(j) => (&trimmed[..j], true),
+            None => (trimmed, rest.ends_with('/')),
+        };
+        let e = seen.entry(format!("{prefix}{child}")).or_insert(false);
+        *e = *e || is_dir;
     }
     seen.into_iter().collect()
+}
+
+// ===========================================================================
+// jrt (runtime image) filesystem — javac and any tool that compiles in-process
+// reads the platform classes from the `jrt:/` filesystem, whose entries live in
+// `<java.home>/lib/modules` (the jimage). CratonVM's synthetic providers list
+// only "file" and "jar", so `FileSystems.getFileSystem(jrt:/)` previously threw
+// `ProviderNotFoundException` and javac reported "Unable to find package
+// java.lang in platform classes". The helpers below back a synthetic jrt FS
+// using the existing `cratonvm_reader::JImageReader`.
+//
+// jrt logical layout exposed to Java: `/modules/<module>/<pkg>/<Class>.class`
+// (and the container dirs `/`, `/modules`). A jrt logical entry maps to the
+// jimage resource path `/<module>/<pkg>/<Class>.class`.
+
+/// Cached jimage reader + sorted entry-path list, keyed by `java.home`. The
+/// jimage is large (~140 MB) and javac walks the platform image many times, so
+/// both the reader and a sorted `/<module>/<resource>` list (for prefix scans)
+/// are memoised for the VM lifetime.
+struct JrtImage {
+    reader: cratonvm_reader::JImageReader,
+    entries: Vec<String>,
+}
+
+fn jrt_image(java_home: &str) -> Option<std::sync::Arc<JrtImage>> {
+    use std::sync::{Arc, Mutex, OnceLock};
+    static CACHE: OnceLock<Mutex<std::collections::HashMap<String, Option<Arc<JrtImage>>>>> =
+        OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+    let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(cached) = guard.get(java_home) {
+        return cached.clone();
+    }
+    let modules_path = std::path::Path::new(java_home)
+        .join("lib")
+        .join("modules");
+    let built = cratonvm_reader::JImageReader::open(&modules_path)
+        .ok()
+        .map(|reader| {
+            let mut entries: Vec<String> = reader
+                .iter_entries()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(p, _, _)| p)
+                .filter(|p| p.starts_with('/'))
+                .collect();
+            entries.sort_unstable();
+            entries.dedup();
+            Arc::new(JrtImage { reader, entries })
+        });
+    guard.insert(java_home.to_string(), built.clone());
+    built
+}
+
+/// Map a jrt logical entry (`modules/java.base/java/lang/String.class`) to the
+/// jimage resource path (`/java.base/java/lang/String.class`). Returns `None`
+/// for the synthetic container dirs (`""`, `modules`) which have no jimage
+/// resource of their own.
+fn jrt_entry_to_image(entry: &str) -> Option<String> {
+    let e = entry.trim_matches('/');
+    let rest = e.strip_prefix("modules")?;
+    let rest = rest.trim_start_matches('/');
+    if rest.is_empty() {
+        None
+    } else {
+        Some(format!("/{rest}"))
+    }
+}
+
+fn jrt_img_is_file(img: &JrtImage, path: &str) -> bool {
+    img.entries.binary_search(&path.to_string()).is_ok()
+}
+
+fn jrt_img_is_dir(img: &JrtImage, path: &str) -> bool {
+    let prefix = format!("{path}/");
+    let idx = img.entries.partition_point(|e| e.as_str() < prefix.as_str());
+    img.entries.get(idx).is_some_and(|e| e.starts_with(&prefix))
+}
+
+fn jrtfs_classify(java_home: &str, entry: &str) -> JarFsKind {
+    let img = match jrt_image(java_home) {
+        Some(i) => i,
+        None => return JarFsKind::Absent,
+    };
+    let e = entry.trim_matches('/');
+    // Synthetic container directories that have no backing jimage resource.
+    if e.is_empty() || e == "modules" {
+        return JarFsKind::Dir;
+    }
+    match jrt_entry_to_image(e) {
+        Some(img_path) => {
+            if jrt_img_is_file(&img, &img_path) {
+                JarFsKind::File
+            } else if jrt_img_is_dir(&img, &img_path) {
+                JarFsKind::Dir
+            } else {
+                JarFsKind::Absent
+            }
+        }
+        None => JarFsKind::Absent,
+    }
+}
+
+/// List the immediate children of a jrt logical directory, returning each as a
+/// full jrt logical entry (e.g. `modules/java.base/java/lang`) with an
+/// is-directory flag.
+fn jrtfs_list_dir_classified(java_home: &str, entry: &str) -> Vec<(String, bool)> {
+    let img = match jrt_image(java_home) {
+        Some(i) => i,
+        None => return Vec::new(),
+    };
+    let e = entry.trim_matches('/');
+    if e.is_empty() {
+        return vec![("modules".to_string(), true)];
+    }
+    if e == "modules" {
+        // Distinct module names = the first segment of each `/<module>/...`
+        // resource entry. The jimage offset table ALSO contains its own
+        // internal directory-node namespaces `/modules/...` and `/packages/...`
+        // (the jrt index); those first segments ("modules", "packages") are NOT
+        // real modules and must be excluded, or javac treats them as modules
+        // with no module-info and fails platform setup ("Unable to find package
+        // java.lang in platform classes").
+        let mut seen = std::collections::BTreeSet::new();
+        for p in &img.entries {
+            let s = p.trim_start_matches('/');
+            let module = match s.find('/') {
+                Some(i) => &s[..i],
+                None => s,
+            };
+            if module.is_empty() || module == "modules" || module == "packages" {
+                continue;
+            }
+            seen.insert(module.to_string());
+        }
+        return seen
+            .into_iter()
+            .map(|m| (format!("modules/{m}"), true))
+            .collect();
+    }
+    match jrt_entry_to_image(e) {
+        Some(img_path) => {
+            let prefix = format!("{img_path}/");
+            let mut seen: std::collections::BTreeMap<String, bool> =
+                std::collections::BTreeMap::new();
+            let start = img.entries.partition_point(|x| x.as_str() < prefix.as_str());
+            for p in &img.entries[start..] {
+                let rest = match p.strip_prefix(&prefix) {
+                    Some(r) => r,
+                    None => break, // sorted: first non-match ends the prefix range
+                };
+                if rest.is_empty() {
+                    continue;
+                }
+                let (child, is_dir) = match rest.find('/') {
+                    Some(j) => (&rest[..j], true),
+                    None => (rest, false),
+                };
+                let child_entry = format!("modules{img_path}/{child}");
+                let v = seen.entry(child_entry).or_insert(false);
+                *v = *v || is_dir;
+            }
+            seen.into_iter().collect()
+        }
+        None => Vec::new(),
+    }
+}
+
+/// Read a jrt logical entry's bytes out of the jimage.
+fn jrtfs_read(java_home: &str, entry: &str) -> std::io::Result<Vec<u8>> {
+    let img = jrt_image(java_home)
+        .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotFound))?;
+    let img_path = jrt_entry_to_image(entry)
+        .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotFound))?;
+    img.reader
+        .find_resource(&img_path)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?
+        .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotFound))
+}
+
+/// Classify any virtual-FS (jar / jrt) encoded path. Returns `None` for a plain
+/// host path so callers fall back to `std::fs`/`std::path` checks.
+fn vfs_classify(p: &str) -> Option<JarFsKind> {
+    if let Some((jar, entry)) = jarfs_decode(p) {
+        Some(jarfs_classify(&jar, &entry))
+    } else {
+        jrtfs_decode(p).map(|(jh, entry)| jrtfs_classify(&jh, &entry))
+    }
+}
+
+/// Read any virtual-FS (jar / jrt) encoded entry's bytes. Returns `None` for a
+/// plain host path (caller reads it via `std::fs`).
+fn vfs_read(p: &str) -> Option<std::io::Result<Vec<u8>>> {
+    if let Some((jar, entry)) = jarfs_decode(p) {
+        Some(jarfs_read_entry(&jar, &entry))
+    } else {
+        jrtfs_decode(p).map(|(jh, entry)| jrtfs_read(&jh, &entry))
+    }
+}
+
+/// Immediate children of a directory `p` (host / jar / jrt), as encoded path
+/// strings ready for `p57_alloc_path`.
+fn vfs_or_host_list(p: &str) -> Vec<String> {
+    if let Some((jar, dir)) = jarfs_decode(p) {
+        jarfs_list_dir(&jar, &dir)
+            .into_iter()
+            .map(|c| jarfs_encode(&jar, &c))
+            .collect()
+    } else if let Some((jh, dir)) = jrtfs_decode(p) {
+        jrtfs_list_dir_classified(&jh, &dir)
+            .into_iter()
+            .map(|(c, _)| jrtfs_encode(&jh, &c))
+            .collect()
+    } else {
+        match std::fs::read_dir(p) {
+            Ok(rd) => rd
+                .filter_map(|e| e.ok())
+                .map(|e| e.path().to_string_lossy().replace('\\', "/"))
+                .collect(),
+            Err(_) => vec![],
+        }
+    }
+}
+
+/// Is `p` (host / jar / jrt) a directory?
+fn vfs_or_host_is_dir(p: &str) -> bool {
+    match vfs_classify(p) {
+        Some(kind) => matches!(kind, JarFsKind::Dir),
+        None => std::path::Path::new(p).is_dir(),
+    }
+}
+
+/// Depth-first pre-order walk: pushes `p` then every descendant (encoded path
+/// strings). Bounded by `depth`/`max_depth` to guard against pathological host
+/// symlink cycles (jar/jrt namespaces are acyclic).
+fn vfs_or_host_walk(p: &str, depth: usize, max_depth: usize, out: &mut Vec<String>) {
+    out.push(p.to_string());
+    if depth >= max_depth || !vfs_or_host_is_dir(p) {
+        return;
+    }
+    for child in vfs_or_host_list(p) {
+        vfs_or_host_walk(&child, depth + 1, max_depth, out);
+    }
 }
 
 /// Best-effort extraction of a `java/net/URI`'s full text. Real-JDK URIs
@@ -8070,8 +8615,8 @@ fn p57_io_error(e: &std::io::Error) -> cratonvm_types::error::MethodCallFailed {
 
 /// Read a path (host file or jar-FS entry) into a UTF-8 string.
 fn p57_read_to_string(p: &str) -> std::io::Result<String> {
-    let bytes = match jarfs_decode(p) {
-        Some((jar, entry)) => jarfs_read_entry(&jar, &entry)?,
+    let bytes = match vfs_read(p) {
+        Some(r) => r?,
         None => std::fs::read(p)?,
     };
     Ok(String::from_utf8_lossy(&bytes).into_owned())
@@ -8086,8 +8631,8 @@ fn p57_read_to_string(p: &str) -> std::io::Result<String> {
 /// Output is `/`-canonical (the internal form; `p57_alloc_path` folds, `toString`
 /// renders the host separator), so this is platform-neutral.
 fn p57_normalize_path(path: &str) -> String {
-    if let Some((jar, entry)) = jarfs_decode(path) {
-        return jarfs_encode(&jar, &p57_normalize_path(&entry));
+    if let Some((tag, container, entry)) = vfs_decode(path) {
+        return vfs_encode(tag, &container, &p57_normalize_path(&entry));
     }
     let (root, names) = p57_parse_win_root(path);
     let has_root = root.is_some();
@@ -8169,16 +8714,17 @@ fn p57_relativize(base: &str, target: &str) -> Option<String> {
 /// - If `other` is empty, return `base`.
 /// - Otherwise, join `base` + separator + `other`.
 fn p57_resolve_paths(base: &str, other: &str) -> String {
-    // jar-FS aware: resolve happens within the mounted JAR's entry namespace.
-    if let Some((jar, base_entry)) = jarfs_decode(base) {
-        let other_entry = jarfs_decode(other)
-            .map(|(_, e)| e)
+    // Virtual-FS aware (jar / jrt): resolve happens within the mounted
+    // archive's (or runtime image's) entry namespace, preserving the scheme.
+    if let Some((tag, container, base_entry)) = vfs_decode(base) {
+        let other_entry = vfs_decode(other)
+            .map(|(_, _, e)| e)
             .unwrap_or_else(|| other.to_string());
         if other_entry.is_empty() {
             return base.to_string();
         }
         if other_entry.starts_with('/') {
-            return jarfs_encode(&jar, &other_entry);
+            return vfs_encode(tag, &container, &other_entry);
         }
         let be = base_entry.trim_end_matches('/');
         let joined = if be.is_empty() {
@@ -8186,7 +8732,7 @@ fn p57_resolve_paths(base: &str, other: &str) -> String {
         } else {
             format!("{be}/{other_entry}")
         };
-        return jarfs_encode(&jar, &joined);
+        return vfs_encode(tag, &container, &joined);
     }
     if other.is_empty() {
         return base.to_string();
@@ -8208,11 +8754,11 @@ fn p57_resolve_paths(base: &str, other: &str) -> String {
 
 /// Extract parent directory from a path string. Returns empty string for root-only paths.
 fn p57_parent_of(path: &str) -> String {
-    if let Some((jar, entry)) = jarfs_decode(path) {
+    if let Some((tag, container, entry)) = vfs_decode(path) {
         let trimmed = entry.trim_end_matches('/');
         return match trimmed.rfind('/') {
-            Some(i) => jarfs_encode(&jar, &entry[..i]),
-            None => jarfs_encode(&jar, ""),
+            Some(i) => vfs_encode(tag, &container, &entry[..i]),
+            None => vfs_encode(tag, &container, ""),
         };
     }
     if path.is_empty() {
@@ -8243,11 +8789,26 @@ fn p57_parent_of(path: &str) -> String {
 /// Allocate a synthetic default FileSystem object.
 /// FileSystem = 1-field synthetic (field 0 = separator String).
 fn p57_alloc_default_filesystem(ctx: &mut dyn NativeContext) -> ObjectRef {
-    // Field 0 = separator; field 1 (P57_FS_JAR_FIELD) = mounted-JAR path (or null).
-    let fs = alloc_concurrent_synthetic(ctx, "java/nio/file/FileSystem", 2);
+    // Field 0 = separator; field 1 (P57_FS_JAR_FIELD) = mounted-JAR path (or
+    // null); field 2 (P57_FS_JRT_FIELD) = mounted runtime-image java.home (or
+    // null). The jrt field exists on every FS object so the jrt-aware
+    // FileSystem.getPath/getRootDirectories natives can read it unconditionally.
+    let fs = alloc_concurrent_synthetic(ctx, "java/nio/file/FileSystem", 3);
     let sep = if cfg!(windows) { "\\" } else { "/" };
     let s = ctx.create_string(sep);
     ctx.set_field(fs, 0, Value::Object(Some(s)));
+    fs
+}
+
+/// Allocate a synthetic runtime-image (`jrt:`) FileSystem rooted at `java_home`.
+/// `getPath`/`readAttributes`/`newDirectoryStream` route through the jrt helpers
+/// when they see the P57_FS_JRT_FIELD / a `JRTFS`-encoded path.
+fn p57_alloc_jrt_filesystem(ctx: &mut dyn NativeContext, java_home: &str) -> ObjectRef {
+    let fs = alloc_concurrent_synthetic(ctx, "java/nio/file/FileSystem", 3);
+    let sep = ctx.create_string("/");
+    ctx.set_field(fs, 0, Value::Object(Some(sep)));
+    let jh = ctx.create_string(java_home);
+    ctx.set_field(fs, P57_FS_JRT_FIELD, Value::Object(Some(jh)));
     fs
 }
 
@@ -18742,6 +19303,32 @@ fn p59_files_read_attributes(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
         return Ok(Some(Value::Object(Some(bfa))));
     }
 
+    // jrt-FS (runtime image) path — attributes come from the jimage, not the
+    // host filesystem. javac's platform-class indexing walks `/modules/...`.
+    if let Some((java_home, entry)) = jrtfs_decode(&path_str) {
+        let bfa = alloc_concurrent_synthetic(ctx, "java/nio/file/attribute/BasicFileAttributes", 5);
+        let ft = filetime_alloc(ctx, 0);
+        ctx.set_field(bfa, 0, Value::Object(Some(ft)));
+        ctx.set_field(bfa, 1, Value::Object(Some(ft)));
+        ctx.set_field(bfa, 2, Value::Object(Some(ft)));
+        let (is_dir, size) = match jrtfs_classify(&java_home, &entry) {
+            JarFsKind::Dir => (1, 0i64),
+            JarFsKind::File => (
+                0,
+                jrtfs_read(&java_home, &entry).map(|b| b.len() as i64).unwrap_or(0),
+            ),
+            JarFsKind::Absent => {
+                return Err(RuntimeError::IOException {
+                    message: format!("NoSuchFileException: {entry} in jrt:/"),
+                }
+                .into());
+            }
+        };
+        ctx.set_field(bfa, 3, Value::Int(is_dir));
+        ctx.set_field(bfa, 4, Value::Long(size));
+        return Ok(Some(Value::Object(Some(bfa))));
+    }
+
     // Check if NOFOLLOW_LINKS is specified (would use symlink_metadata)
     let meta_result = if path_str.is_empty() {
         Err(std::io::Error::new(
@@ -21244,8 +21831,8 @@ pub(crate) fn register_p61_files_path(r: &mut NativeMethodRegistry) {
                     Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
                     _ => return Ok(Some(Value::Int(0))),
                 };
-                let exists = match jarfs_decode(&path_str) {
-                    Some((jar, e)) => !matches!(jarfs_classify(&jar, &e), JarFsKind::Absent),
+                let exists = match vfs_classify(&path_str) {
+                    Some(kind) => !matches!(kind, JarFsKind::Absent),
                     None => std::path::Path::new(&path_str).exists(),
                 };
                 Ok(Some(Value::Int(if exists { 1 } else { 0 })))
@@ -21264,8 +21851,8 @@ pub(crate) fn register_p61_files_path(r: &mut NativeMethodRegistry) {
                     Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
                     _ => return Ok(Some(Value::Int(1))),
                 };
-                let exists = match jarfs_decode(&path_str) {
-                    Some((jar, e)) => !matches!(jarfs_classify(&jar, &e), JarFsKind::Absent),
+                let exists = match vfs_classify(&path_str) {
+                    Some(kind) => !matches!(kind, JarFsKind::Absent),
                     None => std::path::Path::new(&path_str).exists(),
                 };
                 Ok(Some(Value::Int(if !exists { 1 } else { 0 })))
@@ -21284,8 +21871,8 @@ pub(crate) fn register_p61_files_path(r: &mut NativeMethodRegistry) {
                     Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
                     _ => return Ok(Some(Value::Int(0))),
                 };
-                let is_dir = match jarfs_decode(&path_str) {
-                    Some((jar, e)) => matches!(jarfs_classify(&jar, &e), JarFsKind::Dir),
+                let is_dir = match vfs_classify(&path_str) {
+                    Some(kind) => matches!(kind, JarFsKind::Dir),
                     None => std::path::Path::new(&path_str).is_dir(),
                 };
                 Ok(Some(Value::Int(if is_dir { 1 } else { 0 })))
@@ -21304,8 +21891,8 @@ pub(crate) fn register_p61_files_path(r: &mut NativeMethodRegistry) {
                     Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
                     _ => return Ok(Some(Value::Int(0))),
                 };
-                let is_file = match jarfs_decode(&path_str) {
-                    Some((jar, e)) => matches!(jarfs_classify(&jar, &e), JarFsKind::File),
+                let is_file = match vfs_classify(&path_str) {
+                    Some(kind) => matches!(kind, JarFsKind::File),
                     None => std::path::Path::new(&path_str).is_file(),
                 };
                 Ok(Some(Value::Int(if is_file { 1 } else { 0 })))
@@ -21320,10 +21907,8 @@ pub(crate) fn register_p61_files_path(r: &mut NativeMethodRegistry) {
                 Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
                 _ => return Ok(Some(Value::Long(0))),
             };
-            let size = match jarfs_decode(&path_str) {
-                Some((jar, e)) => jarfs_read_entry(&jar, &e)
-                    .map(|b| b.len() as i64)
-                    .unwrap_or(0),
+            let size = match vfs_read(&path_str) {
+                Some(r) => r.map(|b| b.len() as i64).unwrap_or(0),
                 None => std::fs::metadata(&path_str)
                     .map(|m| m.len() as i64)
                     .unwrap_or(0),
@@ -21343,8 +21928,8 @@ pub(crate) fn register_p61_files_path(r: &mut NativeMethodRegistry) {
                     Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
                     _ => return Ok(Some(Value::Int(0))),
                 };
-                let readable = match jarfs_decode(&path_str) {
-                    Some((jar, e)) => !matches!(jarfs_classify(&jar, &e), JarFsKind::Absent),
+                let readable = match vfs_classify(&path_str) {
+                    Some(kind) => !matches!(kind, JarFsKind::Absent),
                     None => std::path::Path::new(&path_str).exists(),
                 };
                 Ok(Some(Value::Int(if readable { 1 } else { 0 })))
@@ -27664,6 +28249,33 @@ fn p98_walk_dir(
         // ClasspathScanner would "discover" an empty jar).
         for (child, is_dir) in jarfs_list_dir_classified(&jar, &entry) {
             let es = jarfs_encode(&jar, &child);
+            let epo = alloc_concurrent_synthetic(ctx, "java/nio/file/Path", 2);
+            let s = ctx.create_string(&es);
+            ctx.set_field(epo, 0, Value::Object(Some(s)));
+            if is_dir {
+                if !p98_walk_dir(ctx, &es, visitor, epo)? {
+                    return Ok(false);
+                }
+            } else {
+                let fa = alloc_concurrent_synthetic(
+                    ctx,
+                    "java/nio/file/attribute/BasicFileAttributes",
+                    0,
+                );
+                let vr = ctx.invoke_virtual(visitor, "visitFile",
+                    "(Ljava/lang/Object;Ljava/nio/file/attribute/BasicFileAttributes;)Ljava/nio/file/FileVisitResult;",
+                    &[Value::Object(Some(epo)), Value::Object(Some(fa))])?;
+                if let Some(Value::Object(Some(r))) = vr {
+                    if ctx.get_field(r, 1).as_int().unwrap_or(0) == 1 {
+                        return Ok(false);
+                    }
+                }
+            }
+        }
+    } else if let Some((java_home, entry)) = jrtfs_decode(dir) {
+        // jrt-FS directory — children come from the jimage listing.
+        for (child, is_dir) in jrtfs_list_dir_classified(&java_home, &entry) {
+            let es = jrtfs_encode(&java_home, &child);
             let epo = alloc_concurrent_synthetic(ctx, "java/nio/file/Path", 2);
             let s = ctx.create_string(&es);
             ctx.set_field(epo, 0, Value::Object(Some(s)));

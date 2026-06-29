@@ -627,6 +627,18 @@ pub trait NativeContext {
     /// Get the length of an array object.
     fn array_length(&self, obj: ObjectRef) -> usize;
 
+    /// Whether `obj` is an array object (as opposed to an ordinary instance).
+    ///
+    /// This is a heap object-kind check — it does NOT go through
+    /// `class_id_of_object`/`class_name_of_id`, which for a heap-allocated
+    /// reference array report the *component* class (arrays store their element
+    /// class id + an array kind flag rather than a distinct `[L…;` class id), so
+    /// a class-name prefix test cannot reliably detect arrays. Default `false`
+    /// (mock contexts without a heap); the VM overrides it.
+    fn object_is_array(&self, _obj: ObjectRef) -> bool {
+        false
+    }
+
     /// Read an array element by index.
     ///
     /// `index` must be in `0..array_length(obj)`. The trait does NOT validate
@@ -1670,6 +1682,54 @@ pub trait NativeContext {
         method_name: &str,
         method_desc: &str,
     ) -> Vec<Vec<AnnotationData>>;
+
+    /// Get the runtime-visible TYPE_USE annotations that target a method's
+    /// return type (JVMS 4.7.20 `target_type` 0x14, METHOD_RETURN) with an
+    /// empty `type_path` (i.e. annotations placed directly on the top-level
+    /// return type rather than a nested array/type-argument component).
+    ///
+    /// Backs `Method.getAnnotatedReturnType().getDeclaredAnnotations()` so
+    /// JSpecify-style `@Nullable`/`@NonNull` (which are TYPE_USE-only and thus
+    /// live in `RuntimeVisibleTypeAnnotations`, not `RuntimeVisibleAnnotations`)
+    /// are surfaced to reflection. Default impl returns an empty `Vec` so mock
+    /// `NativeContext` implementations don't need to plumb the attribute store.
+    fn method_return_type_annotations(
+        &self,
+        _class_id: ClassId,
+        _method_name: &str,
+        _method_desc: &str,
+    ) -> Vec<AnnotationData> {
+        Vec::new()
+    }
+
+    /// Get the runtime-visible TYPE_USE annotations that target a method's
+    /// formal parameters (JVMS 4.7.20 `target_type` 0x16,
+    /// METHOD_FORMAL_PARAMETER) with an empty `type_path`. The outer `Vec` is
+    /// indexed by `formal_parameter_index`; entries with no annotations are
+    /// empty inner `Vec`s.
+    ///
+    /// Backs `Parameter.getAnnotatedType().getDeclaredAnnotations()`. Default
+    /// impl returns an empty `Vec`.
+    fn method_parameter_type_annotations(
+        &self,
+        _class_id: ClassId,
+        _method_name: &str,
+        _method_desc: &str,
+    ) -> Vec<Vec<AnnotationData>> {
+        Vec::new()
+    }
+
+    /// Get the runtime-visible TYPE_USE annotations that target a field's type
+    /// (JVMS 4.7.20 `target_type` 0x13, FIELD) with an empty `type_path`.
+    /// Backs `Field.getAnnotatedType().getDeclaredAnnotations()`. Default impl
+    /// returns an empty `Vec`.
+    fn field_type_annotations(
+        &self,
+        _class_id: ClassId,
+        _field_name: &str,
+    ) -> Vec<AnnotationData> {
+        Vec::new()
+    }
 
     /// Get the generic Signature attribute for a class (if present).
     fn class_signature(&self, class_id: ClassId) -> Option<String>;
