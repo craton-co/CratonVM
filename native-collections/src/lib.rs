@@ -6369,6 +6369,17 @@ fn native_hs_equals(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     if std::ptr::eq(this.as_ptr(), other.as_ptr()) {
         return Ok(Some(Value::Int(1)));
     }
+    // `AbstractSet.equals` contract (JDK): a Set equals only another Set. The
+    // `instanceof Set` guard MUST precede the `other.size()` call below —
+    // without it, `set.equals(aString)` invokes `String.size()` (no such
+    // method) and raises NoSuchMethodError instead of returning false. Spring's
+    // `AbstractBeanFactory.isPrototypeCurrentlyInCreation` hits exactly this:
+    // when ≥2 prototypes are in creation the `prototypesCurrentlyInCreation`
+    // ThreadLocal holds a `HashSet`, and `curVal.equals(beanName)` compares that
+    // set against a `String` bean name.
+    if !obj_is_instance_of(ctx, other, "java/util/Set") {
+        return Ok(Some(Value::Int(0)));
+    }
     let backing = match hs_backing_map(ctx, this) {
         Some(m) => m,
         None => return Ok(Some(Value::Int(0))),

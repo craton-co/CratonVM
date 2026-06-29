@@ -1822,6 +1822,71 @@ fn native_properties_keys(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     Ok(Some(Value::Object(Some(build_enumeration(ctx, keys)))))
 }
 
+/// Collect this Properties object's own String keys (side-table + CHM-exclusive
+/// non-String-valued entries), de-duplicating into `seen`/`out`. Mirrors the
+/// key set `native_properties_keys` exposes for a single object.
+fn collect_own_property_names(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    seen: &mut std::collections::HashSet<String>,
+    out: &mut Vec<String>,
+) {
+    for (k, _v) in snapshot_kv(ctx, this) {
+        if seen.insert(k.clone()) {
+            out.push(k);
+        }
+    }
+    let side = side_key_set(ctx, this);
+    for (_key_obj, _value, kstr) in chm_extra_entries(ctx, this, &side) {
+        if let Some(s) = kstr {
+            if seen.insert(s.clone()) {
+                out.push(s);
+            }
+        }
+    }
+}
+
+/// Native `Properties.propertyNames()Ljava/util/Enumeration;` — unlike
+/// `keys()` (Hashtable's own keys only), `propertyNames()` MUST also surface
+/// the `defaults` chain (JDK `Properties.enumerate`: `if (defaults != null)
+/// defaults.enumerate(h)` before the receiver's own entries). The real-JDK
+/// bytecode reads the internal `map` CHM via `enumerate`, which our synthetic
+/// Properties keeps in the side-table, so without this native a Properties
+/// built via `new Properties(defaults)` enumerates only its own keys and drops
+/// every inherited default (e.g. Spring's `CollectionUtils.mergePropertiesIntoMap`
+/// lost `defaults`-supplied entries). Walk the receiver then recurse through
+/// `defaults`, de-duplicating by name. `getProperty` already honours the same
+/// chain via `props_defaults`.
+fn native_properties_property_names(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => {
+            return Ok(Some(Value::Object(Some(build_enumeration(
+                ctx,
+                Vec::new(),
+            )))))
+        }
+    };
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut out: Vec<String> = Vec::new();
+    // Walk the receiver and its defaults chain. A depth cap guards against a
+    // pathological self-referential `defaults` field (the JDK chain is acyclic).
+    let mut cur = Some(this);
+    let mut depth = 0;
+    while let Some(p) = cur {
+        if depth > 64 {
+            break;
+        }
+        collect_own_property_names(ctx, p, &mut seen, &mut out);
+        cur = props_defaults(ctx, p);
+        depth += 1;
+    }
+    Ok(Some(Value::Object(Some(build_enumeration(ctx, out)))))
+}
+
 /// Native `Properties.elements()Ljava/util/Enumeration;` — companion to
 /// `keys()`, enumerating the side-table values.
 fn native_properties_elements(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -2487,6 +2552,14 @@ pub fn register_properties_sidetable(registry: &mut NativeMethodRegistry) {
         "keys",
         "()Ljava/util/Enumeration;",
         native_properties_keys,
+    );
+    // `propertyNames()` differs from `keys()`: it also enumerates the
+    // `defaults` chain (JDK contract). Distinct native — keep `keys()` own-only.
+    registry.register(
+        "java/util/Properties",
+        "propertyNames",
+        "()Ljava/util/Enumeration;",
+        native_properties_property_names,
     );
     registry.register(
         "java/util/Properties",
