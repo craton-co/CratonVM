@@ -1,6 +1,68 @@
 # Fork6 — multi-thread (ForkJoinPool worker) JIT-root reclamation
 
-**Status:** 🟡 PARTIAL (audit 2026-06-19) — the dominant **lost-tag** manifestation is mitigated (conservative interp-local roots under the non-moving sweep, `00429413`) but **only behind the experimental `CRATONVM_REAL_FORKJOINPOOL=1` gate** (the default path is byte-identical baseline). Residual **OPEN**: the worker-forked-subtask reclamation (~15%) remains, now additionally masked by a separate real-FJP `ForkJoinPool` CAS bug. The family-wide precise-JIT-maps default-on (`32649b56`) does **not** close this — see [README](README.md) A4 = OPEN/inconclusive.
+**Status:** 🟡 OPEN but **non-reproducing on current dev** (re-audit 2026-06-29) — the last open Family-A member. The dominant **lost-tag** manifestation is mitigated (conservative interp-local roots under the non-moving sweep, `00429413`) behind the experimental `CRATONVM_REAL_FORKJOINPOOL=1` gate (default path byte-identical). The worker-forked-subtask reclamation **does not reproduce** on a current-dev build (precise-maps default-on + the A2 free-list fix `6e3ddb05`): see the 2026-06-29 re-audit below.
+
+> ## Re-audit 2026-06-29 (fresh release build off dev HEAD `9928052c`, binary `cvmpjfinish.exe`, JDK-25 oracle)
+>
+> **A4 task-reclamation is NON-REPRODUCING on current dev.** Across `Fork6` (26/26
+> ALL-OK: 8 sequential + 18 concurrent-stress) **and** the aggressive `Fork6Hard`
+> (deep N=256–512, both children forked, 200–400 reps, `System.gc()` per rep),
+> there were **zero** task-reclamation signatures (`cannot be cast to ForkJoinTask`
+> / `trySetException on null` / `nullchild`). The cross-thread STW JIT-root **gap is
+> still exercised** (`scan_active_jit_frames` WARN, `cross_thread_jit_gap_hits`
+> incrementing) but **non-fatal** — covered by the peer's published `root_snapshot`.
+>
+> **Why it doesn't reproduce from Java (key finding).** `StrTask.compute`
+> (a `RecursiveTask` subclass) is **blocklisted → interpreted** (`is_fjp_subclass_blocklisted`),
+> so the forked subtask is an **interpreter local** that `scan_local_objects` /
+> `scan_locals_conservative` always root. A4 requires a task held **only** in a
+> JIT-compiled **FJP-internal** frame (`ForkJoinPool.runWorker`/`ForkJoinTask.doExec`/
+> `WorkQueue.*`) at a safepoint — a deep internal condition **not controllable from
+> Java** (hence the historical load-dependence). So A4 cannot be cleanly forced from
+> a Java repro, and any fix is **unvalidatable from the Java side**.
+>
+> **GC_STRESS surfaces a DIFFERENT, separate bug — not A4.** Running `Fork6`/`Fork6Hard`
+> under `CRATONVM_DBG_GC_STRESS=65536` fails **deterministically at rep 0** with
+> `ExceptionInInitializerError` → `NPE "Cannot read field group because this.holder
+> is null"` at `ForkJoinWorkerThread$InnocuousForkJoinWorkerThread.<clinit>` →
+> `Thread.getThreadGroup` — i.e. during FJP **worker creation** (`createWorker` →
+> `newThread`), **0 task-reclamation signatures**. This is the
+> **concurrent-spawn `Thread.holder`-null bug** ([gc-concurrent-spawn-reclamation](repros/gc-concurrent-spawn-reclamation/),
+> BUG-03's `Spawn.java`), which **masks** A4 under stress. It is a separate tracked
+> bug, not A4.
+>
+> **The concrete remaining A4 gap, precisely located.** `update_root_snapshot`
+> (running-safepoint path, `interpreter.rs:1835`) publishes a thread's precise JIT
+> roots via `scan_active_jit_frames`, but **`deposit_root_snapshot` (the BLOCKED
+> path, `vm_exec.rs:1192`) does NOT** — it scans only interpreter `thread.frames` +
+> conservative-locals + native pins. So a worker that **blocks in `join()` while its
+> compiled `runWorker`/`doExec` frame is the sole holder** of a forked subtask never
+> publishes that root. (Currently masked: other roots — deque heap entry, interp
+> local — keep the task alive.)
+>
+> **Why there is no safe+effective quick deposit fix** (and why the earlier full-band
+> deposit scan was reverted). The precise marking path's reliable coverage comes from
+> the **conservative band backstop** `scan_one_frame([scanner_sp, frame_base))`, not
+> the oop-map reads: `PreciseFrameInfo.frame_base` is the **approximate** Rust-guard
+> SP (within a few bytes of `entry_sp`), and `exact_rbp` (the true RBP) is reserved
+> for the *relocation* walk. So a **precise-only** deposit publish would be
+> **unreliable** (approximate base → wrong slots), while the **conservative** version
+> **over-retains the whole blocked stack** — the exact regression that reverted
+> attempt #1 (2026-06-19b: "12 ok / 12 bad / 6 timeout"). The complete fix therefore
+> requires **precise per-PC RBP-chain marking** (each frame's exact RBP + the active
+> safepoint's map) so a blocked/peer worker's JIT-frame oops can be marked exactly
+> without over-retention — the deferred precise-JIT-maps Stage B/C work, which also
+> wants cooperative JIT safepoints (see [bug-03](README.md)).
+>
+> **Repro added:** `repros/A4-fork6/Fork6Hard.java` (deep, both-children-forked,
+> parameterised `N reps`). Under `GC_STRESS` it deterministically reproduces the
+> concurrent-spawn `holder`-null bug (BUG-03); with `System.gc()` only it stays
+> ALL-OK (A4 non-reproducing). Net: **A4 remains OPEN/architectural** (the
+> cross-thread STW JIT-root gap is real) but is **not a reproducible fault on current
+> dev**; closing it is gated on the precise per-PC register/RBP-chain marking project,
+> not a localized patch.
+
+**Prior status (audit 2026-06-19, retained for history):** 🟡 PARTIAL — the dominant **lost-tag** manifestation is mitigated (conservative interp-local roots under the non-moving sweep, `00429413`) but **only behind the experimental `CRATONVM_REAL_FORKJOINPOOL=1` gate** (the default path is byte-identical baseline). Residual: the worker-forked-subtask reclamation (~15%), then additionally masked by a separate real-FJP `ForkJoinPool` CAS bug. The family-wide precise-JIT-maps default-on (`32649b56`) does **not** close this.
 
 > **Consolidated doc.** This merges the two previous files that described the
 > *same* bug from different sessions:
