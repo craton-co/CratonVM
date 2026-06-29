@@ -100,6 +100,26 @@ the ~30 docs map to **one root-cause family + ~15 distinct standalone bugs**, of
     ✅ **FIXED on dev** (moved to `docs/internal/app-jvm-bugs/`). The original gen-GC "lost young `Signaller`"
     theory was **refuted** (the hang is deterministic + GC-independent); the real cause was the synthetic
     `CompletableFuture.complete` native never running `postComplete()`. Fixed in the native — no GC change.
+18. **[GC: live young `Thread` mirror in a blocked thread's frame reclaimed (Tomcat real-net/real-AQS HARD CRASHES)](gc-blocked-thread-frame-stale-thread-mirror.md)** —
+    🟠 **OPEN on dev**, but a **defensive crash-mitigation is MERGED** (`6a04b0e3` + `e06ed934`). Six Tomcat
+    encoding/tribes classes SIGSEGV/panic (`compact_value.rs:502`) under `CRATONVM_REAL_NET_SOCKETS` +
+    `CRATONVM_REAL_AQS`: a live young `java.lang.Thread` mirror held in a **blocked** thread's frame local
+    (object-tagged, so NOT the lost-tag item 15) is reclaimed because it is missing from that thread's
+    deposited `root_snapshot`; the freed slot is reused as byte-buffer data and decoded as an object pointer.
+    Likely the **same underlying bug** as the `currentThread()`-mirror reclamation in
+    [`repros/gc-concurrent-spawn-reclamation/`](repros/gc-concurrent-spawn-reclamation/) whose fix is on an
+    **unpushed** branch (`feat/precise-maps-a4-finish`) → not on dev. The mitigation (`plausible_heap_pointer`
+    gate at every ref-decode + JIT receiver-deref boundary) degrades a stale ref to a Java NPE — all 6 are now
+    **crash-free jit+nojit** but still fail/time out (the reclamation itself is unfixed).
+19. **[Hibernate `type.temporal.*` — moving GC strands lambda refs in native stream/collection intrinsics](hib-temporal-gc-lambda-native-stale-local.md)** —
+    🟠 **OPEN** (fix in progress: per-native pinning). The 5 `org.hibernate.orm.test.type.temporal.*` classes
+    abort rc=1 / SIGSEGV with `linkage error: no such method java/lang/Object.<sam>` — **not** a java.time
+    binding bug. Same native-stale-Rust-local family as the StackWalker corruption
+    ([hibernate-bytearraymapping-stackwalk-gc-corruption.md](hibernate-bytearraymapping-stackwalk-gc-corruption.md)):
+    `Stream.forEach`/`sorted`, `Spliterator.tryAdvance`/`forEachRemaining`, `ArrayList.forEach` hold the lambda
+    + materialized elements in Rust locals across `invoke_virtual`; the moving young collector relocates them
+    out from under the stale local. `-Xmx8g` passes; default heap ~50–70 % crash. Fix = `pin_native_root` /
+    `read_native_pin` per native (NOT force-non-moving — that hits the HIB-CV-33 precise-root gap).
 
 FIXED bugs whose standalone docs were **removed** from this folder (resolved; full writeups in
 `git` history or [`docs/internal/fixed-suite-bugs/`](../internal/fixed-suite-bugs/)): A1 (reflection
