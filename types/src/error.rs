@@ -257,6 +257,15 @@ pub enum RuntimeError {
     #[error("UnknownHostException: {message}")]
     UnknownHostException { message: String },
 
+    /// `java.net.SocketTimeoutException` — a blocking socket operation timed
+    /// out (e.g. a read exceeded `setSoTimeout`/`setReadTimeout`). A subclass
+    /// of `InterruptedIOException`/`IOException`; must be thrown as the
+    /// concrete type because real code catches it specifically (e.g. Tomcat's
+    /// `TestConnector.testStop` does `catch (SocketTimeoutException)` to treat
+    /// a post-stop read timeout as 503 — a bare IOException escapes that catch).
+    #[error("SocketTimeoutException: {message}")]
+    SocketTimeoutException { message: String },
+
     #[error("FileNotFoundException: {path}")]
     FileNotFoundException { path: String },
 
