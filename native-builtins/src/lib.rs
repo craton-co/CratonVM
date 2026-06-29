@@ -18250,13 +18250,56 @@ pub(crate) fn native_unsafe_get_byte_mb(
 ) -> MethodCallResult {
     match unsafe_obj(args, 1) {
         None => {
-            let addr = unsafe_offset(args, 2) as i64;
+            let addr = unsafe_raw_addr(args, 2);
             let mut b = [0u8; 1];
             ctx.copy_from_native_memory(addr, &mut b);
             // getByte returns a (sign-extended) byte; getBoolean coerces 0/non-0.
             Ok(Some(Value::Int(b[0] as i8 as i32)))
         }
         Some(_) => native_unsafe_get_int(ctx, args),
+    }
+}
+
+/// Decode a raw off-heap ADDRESS argument with NO field-offset clamping.
+///
+/// The `base == null` forms of `Unsafe.{get,put}*(Object, long, …)` pass a full
+/// native address in the `long` slot, not a field index. `unsafe_offset`'s
+/// clamp (which exists to neutralise garbage *field* slot indices from
+/// compact-value drift) zeroes any value above `MAX_REASONABLE_OFFSET` that is
+/// not a tagged arena handle — which silently rewrites a **real** direct-buffer
+/// pointer (e.g. a Jetty `ByteBufferPool` allocation at `0x000002_8…`) to
+/// address 0. `DirectByteBuffer.put(byte)`/`get(byte)` (≤6-element transfers via
+/// `ScopedMemoryAccess`) then wrote/read at address 0, so e.g. Jetty
+/// HttpClient's byte-at-a-time request framing produced an all-zero request no
+/// server could parse. `copy_to/from_native_memory` already validate the
+/// address (arena-vs-raw routing, bounds, null reject), so passing the raw
+/// value through here is safe — the clamp's field-index protection is only
+/// meaningful for the `base != null` path.
+pub(crate) fn unsafe_raw_addr(args: &[Value], pos: usize) -> i64 {
+    match args.get(pos) {
+        Some(Value::Long(a)) => *a,
+        Some(Value::Int(a)) => *a as i64,
+        // Compact-value drift can surface a long's bit pattern as Double/Float
+        // on the invoke-arg boundary (see `unsafe_offset`); mirror its decode.
+        Some(Value::Double(d)) => {
+            if d.is_finite() {
+                let n = *d as i64;
+                if n >= 0 && (n as f64) == *d {
+                    return n;
+                }
+            }
+            d.to_bits() as i64
+        }
+        Some(Value::Float(f)) => {
+            if f.is_finite() {
+                let n = *f as i64;
+                if n >= 0 && (n as f32) == *f {
+                    return n;
+                }
+            }
+            f.to_bits() as u32 as i64
+        }
+        _ => 0,
     }
 }
 
@@ -18268,7 +18311,7 @@ pub(crate) fn native_unsafe_put_byte_mb(
 ) -> MethodCallResult {
     match unsafe_obj(args, 1) {
         None => {
-            let addr = unsafe_offset(args, 2) as i64;
+            let addr = unsafe_raw_addr(args, 2);
             let v = match args.get(3) {
                 Some(Value::Int(i)) => *i as u8,
                 _ => 0,
