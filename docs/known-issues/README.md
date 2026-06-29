@@ -79,7 +79,7 @@ the ~30 docs map to **one root-cause family + ~15 distinct standalone bugs**, of
       for generic by-type, with overload-aware + child-precedence override matching.
       **`LookupMethodTests` 0/7 → 7/7** (JIT and `--nojit`), **`LookupAnnotationTests` 0/10 → 10/10**.
       (The "flaky JIT `invokeVoid`" turned out to be a one-byte emitter typo — `IFEQ` vs `IFNULL` —
-      not a VM defect.) [bug-B / bug-B2 doc](springsuite-0619-getbeanclassname-bean-filter.md).
+      not a VM defect.) [bug-B / bug-B2 doc](../internal/spring/springsuite-0619-getbeanclassname-bean-filter.md) — ✅ **FIXED on dev** (`6d596473`; moved to docs/internal).
     - Still untriaged from the sweep: `ReactiveAdapterRegistry$MutinyRegistrar` NCDFE, XML
       "Unexpected failure during bean definition parsing", "Unnamed bean definition", spring-jdbc
       mass-TIMEOUT, scheduler `StringIndexOutOfBounds`, and `DataBufferUtilsTests` TIMEOUT
@@ -96,15 +96,10 @@ the ~30 docs map to **one root-cause family + ~15 distinct standalone bugs**, of
     GC-STW-vs-reactor-shutdown race exposed by snapshot timing), **NOT** a socket/OP_WRITE bug and **NOT** an
     rs_cache correctness bug. Reliably avoided by `CRATONVM_ROOTSNAP_CACHE=0` (suite-level — do NOT flip the
     global default). Supersedes the former `reactor-worker-thread-leak-at-shutdown.md` (removed — see git history).
-17. **[GC: gen-GC loses a CompletableFuture completion under promotion + churn](gc-gen-promotion-completablefuture-completion-loss.md)** —
-    🔴 **OPEN** (workarounds: `-XX:+UseG1GC` / `CRATONVM_NO_GC_PROMOTION=1`). Blocks the Keycloak/Quarkus boot
-    at the Hibernate SessionFactory build: a thread parked in `CompletableFuture.get()` (`JPAConfig.startAll`
-    → `Signaller.block` → `LockSupport.park`) is never unparked because the **gen (copying) GC loses the young
-    `Signaller`** when the future is **promoted to old gen** while the Signaller stays young. `NO_GC_PROMOTION`
-    reliably fixes; G1 immune; 3 s repro `CFProbe2` (embedded in the doc). The loss is **same-GC** (mark/evacuate
-    race vs the completing worker), NOT a missed next-GC card (conservative card-marking was insufficient).
-    **Heisenbug**: `SP_VERIFY`/`DBG_SWEEP_EDGES` mask it; needs non-perturbing observation. Path =
-    `gen_heap.rs::sweep_young_non_moving`. Same moving-GC family as #15.
+17. **[CompletableFuture untimed `get()` never wakes on cross-thread completion](../internal/app-jvm-bugs/gc-gen-promotion-completablefuture-completion-loss.md)** —
+    ✅ **FIXED on dev** (moved to `docs/internal/app-jvm-bugs/`). The original gen-GC "lost young `Signaller`"
+    theory was **refuted** (the hang is deterministic + GC-independent); the real cause was the synthetic
+    `CompletableFuture.complete` native never running `postComplete()`. Fixed in the native — no GC change.
 
 FIXED bugs whose standalone docs were **removed** from this folder (resolved; full writeups in
 `git` history or [`docs/internal/fixed-suite-bugs/`](../internal/fixed-suite-bugs/)): A1 (reflection
@@ -176,7 +171,7 @@ current (incomplete/buggy) implementation of that.
 | # | Manifestation | Repro | Status | Doc |
 |---|---|---|---|---|
 | **A1** | Reflection mirror-array builders held an `ObjectRef` array in a Rust local across allocating calls (`Field[]`/`Method[]`/annotation arrays) | `wildfly-suite/repro/MinRepro` | ✅ **FIXED on dev** (`pin_native_root` sweep) | _(doc removed; resolved)_ |
-| **A2** | **`implausible object size` young-sweep-walker crash** (reflection/String-array allocation churn) — a *distinct* bug, NOT the register root: a non-moving-sweep free-list double-serve (overlapping free blocks not coalesced) | `wildfly-suite/repro/ReflRepro` | ✅ **FIXED on dev** (`6e3ddb05`, 2026-06-23; coalesce overlapping free blocks) — `ReflRepro 8000 @ GC_STRESS=65536` → `ok=8000 bad=0` (re-verified 2026-06-29); precise maps orthogonal | [reflrepro-register-resident-jit-root-handoff.md](reflrepro-register-resident-jit-root-handoff.md) |
+| **A2** | **`implausible object size` young-sweep-walker crash** (reflection/String-array allocation churn) — a *distinct* bug, NOT the register root: a non-moving-sweep free-list double-serve (overlapping free blocks not coalesced) | `wildfly-suite/repro/ReflRepro` | ✅ **FIXED on dev** (`6e3ddb05`, 2026-06-23; coalesce overlapping free blocks) — `ReflRepro 8000 @ GC_STRESS=65536` → `ok=8000 bad=0` (re-verified 2026-06-29); precise maps orthogonal; moved to docs/internal | [reflrepro-register-resident-jit-root-handoff.md](../internal/app-jvm-bugs/reflrepro-register-resident-jit-root-handoff.md) |
 | **A3** | **Register-invisibility** — a live oop sits only in a CPU register at a young-GC safepoint, invisible to the stack-only scan (single thread) | `apps/spring-boot/buildSrc/runner/MinRegexProbe` | ✅ **FIXED on dev** (`32649b56`, precise maps default-on) | _(doc removed; resolved)_ |
 | **A4** | Multi-thread: live `ForkJoinTask`s reclaimed under **FJP worker threads** + a **lost-tag** interpreter local | `scratch/xworker/Fork6` (needs `CRATONVM_REAL_FORKJOINPOOL=1`) | 🟡 **OPEN but non-fatal here** — `Fork6` 26/26 ALL-OK on current dev (re-verified 2026-06-29; the older ~15% reclaim does not reproduce), but the cross-thread STW JIT-root gap is still *exercised* (`scan_active_jit_frames` WARN); genuine residual = a register-only oop at a non-call safepoint. Benign real-FJP `cas_long` retry noise still fires | [fork6-fjp-multithread-jit-root-reclamation.md](fork6-fjp-multithread-jit-root-reclamation.md) |
 | **A5** | **Object-binarytrees moving-GC corruption** — the compiled entry-point `main`'s JIT frame is invisible to `gc_quiescence` (invoked via `Vm::invoke` without a `JitEntryGuard`), so the **moving** young collector relocates its roots and can't rewrite the raw stack slots → stale all-zero receiver. (The earlier "register-only stale root in `bottomUpTree`" framing was wrong — `bottomUpTree` isn't even compiled at the crash.) | [`repros/gc-stress-bintrees-main-args/`](repros/gc-stress-bintrees-main-args/) (`VAAload`) | ✅ **FIXED** (dev `77c98761`) — detect an unregistered JIT frame on the native stack → non-moving sweep + full-stack mark. Residual: Windows-only (portable stack-bound is a follow-up) | [docs/internal/.../gc-stress-bintrees-main-args-unregistered-jit-frame-FIXED.md](../internal/app-jvm-bugs/gc-stress-bintrees-main-args-unregistered-jit-frame-FIXED.md) |
@@ -302,11 +297,10 @@ and already-consolidated ones (fam5/6) were left in place.
 [springrepos-extension-hang-jit-throughput-and-deep-recursion.md](springrepos-extension-hang-jit-throughput-and-deep-recursion.md)
 is a multi-defect handoff for `SpringRepositoriesExtensionTests`. The hang,
 parse-NPE (#1), generics (#2), and the indy `MethodHandle.type()` layers
-(3/3b/3c/3d) are all **fixed** — the test went from 0/11 (crashing) to **3/11
-clean (no crashes)**. The **last open layer is 3e**: a Groovy indy call on a
-**Mockito mock** (`this.repositories.maven { … }`) records no interaction, so the
-8 non-empty cases assert "expected size N but was 0" →
-[spring-boot-groovy-indy-mockito-mock-dispatch.md](spring-boot-groovy-indy-mockito-mock-dispatch.md).
+(3/3b/3c/3d) are all **fixed**, and **layer 3e is now ✅ FIXED on dev** (`7335f918`)
+— the test is **11/11 FULL GREEN**. The 3e writeup (the Groovy indy call on a
+**Mockito mock**, `this.repositories.maven { … }`) moved to
+[`docs/internal/spring/spring-boot-groovy-indy-mockito-mock-dispatch.md`](../internal/spring/spring-boot-groovy-indy-mockito-mock-dispatch.md).
 The 3c/3d fix writeup is in
 [`docs/internal/spring-boot-groovy-indy-runtime-argcount-3c-FIXED.md`](../internal/spring-boot-groovy-indy-runtime-argcount-3c-FIXED.md).
 Also still relevant: **defect #2 (= family A3 above)** and **bug C** (the
@@ -364,13 +358,13 @@ regression):
   and its ByteBuddy proxy collides. loadClass-override isolation itself works; this is deeper
   (core class-store change, broad blast radius). Min repro `.scratch-hhsf/IsoProbe3.java`. Same
   family as **SBR-14** / `SC-custom-classloader`.
-- [hib-sortnatural-persistentsortedset-cascade-drop.md](hib-sortnatural-persistentsortedset-cascade-drop.md) —
-  🔴 **OPEN.** `SortNaturalTest` (`sorted.set`/`sorted.map`): a cascaded `@OneToMany SortedSet`
+- [hib-sortnatural-persistentsortedset-cascade-drop.md](../internal/hibernate-bugs/hib-sortnatural-persistentsortedset-cascade-drop.md) —
+  ✅ **FIXED on dev** (`9ac7ef1d`; moved to docs/internal). `SortNaturalTest` (`sorted.set`/`sorted.map`): a cascaded `@OneToMany SortedSet`
   drops an element on **persist** (only 1 of 2 rows inserted; `size()` 2→1). Core `TreeSet` verified
   correct on every access path; the loss is in the Hibernate `PersistentSortedSet` cascade
   interaction. Part of the HIB-CV-35 cvonly long-tail.
-- [hib-nodepth-shrinkwrap-par-archive-url.md](hib-nodepth-shrinkwrap-par-archive-url.md) —
-  🔴 **OPEN** (niche). `NoDepthTests` JPA variants: ShrinkWrap in-memory `.par` archive +
+- [hib-nodepth-shrinkwrap-par-archive-url.md](../internal/hibernate-bugs/hib-nodepth-shrinkwrap-par-archive-url.md) —
+  ✅ **FIXED on dev** (`9258f821`; moved to docs/internal). `NoDepthTests` JPA variants: ShrinkWrap in-memory `.par` archive +
   `ShrinkWrapClassLoader` need a custom `URLStreamHandler` ("Could not create URL for archive");
   the 2 non-JPA variants pass.
 

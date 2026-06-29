@@ -850,7 +850,7 @@ VM's real file layer).
 > completion** (the future is promoted to old gen while the pushed young `Signaller` is lost by the
 > copying young GC). Full root-cause, 3 s repro, and workarounds (`-XX:+UseG1GC` /
 > `CRATONVM_NO_GC_PROMOTION=1`) in
-> **[gc-gen-promotion-completablefuture-completion-loss.md](gc-gen-promotion-completablefuture-completion-loss.md)**.
+> **[gc-gen-promotion-completablefuture-completion-loss.md](../internal/app-jvm-bugs/gc-gen-promotion-completablefuture-completion-loss.md)** (✅ now FIXED on dev — was a synthetic `CompletableFuture.complete` native missing `postComplete()`, not the GC; moved to docs/internal).
 > NOTE: with G1 (immune to that GC bug) the boot reaches the same point but hits a SEPARATE hang — two
 > persistence-unit worker threads stuck executing bytecode (a worker livelock, distinct from the GC bug).
 
