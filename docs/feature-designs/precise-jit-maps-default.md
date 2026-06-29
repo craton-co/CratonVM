@@ -388,6 +388,19 @@ expected FLAKY, 0 deviations** (lane exit 0).
 - **bt18@8g can transiently fail to allocate under concurrent host memory load**
   (one empty result observed); the lane retries a bench once on an empty result
   to absorb that, distinguishing it from a wrong checksum (a real regression).
+- **bench `sieve250k` is correct but slow → needs a longer timeout on slow boxes
+  (added 2026-06-29).** `sieve250k` = `sieve(250000)` repeated **1000×**; the hot
+  `BenchSuite.sieve(II)J` is invoked exactly once (the 1000-repeat is its own inner
+  loop) so it never hits invocation-count tier-up, and OSR does not fire on its
+  loops — it runs **interpreted** end-to-end, ~70–350× slower than HotSpot, so 1000
+  reps ≈ **350 s** on this (slow) box (measured: nojit `ms=347868 checksum=22044`;
+  per-rep time scales perfectly **linearly** ⇒ NOT a hang/infinite-loop, and the
+  checksum is always correct). It exceeded the lane's default 300 s `TIMEOUT` (and
+  the 120 s watchdog), showing as the one `gc-root-lane.sh` deviation on a slow box.
+  Fix: `bench_item` now takes a per-bench timeout override and `sieve250k` gets
+  `max(TIMEOUT, 600)` (override via `SIEVE_TIMEOUT`). This is a JIT-throughput gap
+  (hot once-invoked method never compiled — same class as bug-01), **not** a
+  GC-root-family bug and **not** touched by precise maps.
 
 This is the runnable GC-root-family acceptance set. The full named-app gauntlet
 (cassandra/tomcat/wildfly/keycloak/spring-boot/jenkins/felix) needs container
