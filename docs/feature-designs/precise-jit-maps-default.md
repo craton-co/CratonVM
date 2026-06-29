@@ -3,20 +3,34 @@
 Status: **Steps 1–8 of the delivery plan landed (2026-06-21/22). The
 precise-maps default closes the A3 register-invisibility class and is green
 across every GC-root vehicle runnable on this box (repros, benches, OSR, and the
-BouncyCastle app suites). Formally retiring the *family* still needs the A2 fix,
-the A4 cross-thread-STW scan, and the container-app gauntlet on CI — see "Step 8
-— GC-root family retirement status".**
+BouncyCastle app suites). **A2 is now also FIXED on `dev`** (commit `6e3ddb05`,
+GC-side overlapping-free-block coalescing — it was never the "register-resident
+missed root" the title chased; see the A2 known-issue doc). So formally retiring
+the *family* now needs only the A4 cross-thread-STW scan and the container-app
+gauntlet on CI — see "Step 8 — GC-root family retirement status".**
 The mechanism (`CRATONVM_PRECISE_JIT_MAPS`) is **default-on** on `dev` (opt out
 `CRATONVM_NO_PRECISE_JIT_MAPS`). **Steps 1+2** closed the call-heavy perf
 regression (frame-record CALL → inlined `mov gs:[disp], rbp`, default-on, fib44
 1.68× faster, bintrees == HotSpot). **Step 3** added the default-off coverage/
 verify GC oracles. **Step 4** recorded the GC-root acceptance lane baseline
-(12 PASS / 1 KNOWN-FAIL[A2] / 1 FLAKY[MTRegex]). **Step 5** accepted the
-conservative backstop for OSR frames. **Step 6** retained the shadow stack as
-experimental, default-off scaffolding (kept, not removed). What remains for a
-fully *validated* default: the full named-app gauntlet, plus the two still-open
-family members (A2/A4) it does **not** fix. This doc separates what is done from
-what "validated default" still requires.
+(12 PASS / 1 KNOWN-FAIL[A2] / 1 FLAKY[MTRegex] — the A2 KNOWN-FAIL has since
+flipped to PASS, below). **Step 5** accepted the conservative backstop for OSR
+frames. **Step 6** retained the shadow stack as experimental, default-off
+scaffolding (kept, not removed). What remains for a fully *validated* default:
+the full named-app gauntlet, plus the one still-open family member (A4) it does
+**not** fix. This doc separates what is done from what "validated default" still
+requires.
+
+> **Re-verification 2026-06-29** (fresh release build off `dev` HEAD `9928052c`,
+> JDK-25 HotSpot oracle, this box). A2 ReflRepro `8000 @ GC_STRESS=65536` →
+> `ok=8000 bad=0 rc=0`, and at the harsher lane params (`20000 @ GC_STRESS=524288`,
+> `--Xmx 256m`) → `ok=20000 bad=0 rc=0`; A3 `VAAload 14 @ GC_STRESS=4096` =
+> `3222190`; `bintrees16 = 14985902`, `bintrees18 = 68332206` (== HotSpot); A4
+> `Fork6` under `CRATONVM_REAL_FORKJOINPOOL=1` = **26/26 ALL-OK** (8 sequential +
+> 18 concurrent-stress), 0 corruption — the cross-thread STW JIT-root *gap* is
+> still **exercised** (`scan_active_jit_frames` WARN, `cross_thread_jit_gap_hits`
+> incrementing) but **non-fatal** (covered by the peer's last-published
+> `root_snapshot`); the benign real-FJP `cas_long FAIL` retry noise still fires.
 
 > Note on sources: the orchestration brief referenced
 > `docs/internal/reviews/full-review-2026-06-20.md`. That file does **not** exist
@@ -140,11 +154,11 @@ known-issues README):
 | Item | State | Evidence |
 |---|---|---|
 | Precise maps default-on (non-moving sweep + selective-promote) | ✅ **landed + correctness-verified on the GC microbenchmarks** | `SB-SUITE-CRASH-04` update #5: A3 (`MinRegexProbe`) green at `GC_STRESS=524288` **and** 4 MB; bt16=14985902; bt18=**68332206**=HotSpot; matrix600/sieve250k/fib44 correct. Resolved on dev `32649b56`. |
-| A2 (`ReflRepro`) register-resident UAF | 🔴 **OPEN** — precise maps do NOT fix it | `reflrepro-register-resident-jit-root-handoff.md`: distinct sweep-walker use-after-free; precise maps *retain more* and surface *more* corruption, verified still-crashing 2026-06-17/18. |
+| A2 (`ReflRepro`) heap corruption | ✅ **FIXED on dev** (`6e3ddb05`) — was GC-side free-list accounting, **not** a register-resident root nor a precise-maps concern | `reflrepro-register-resident-jit-root-handoff.md` (now headed FIXED): the non-moving young sweep's coalescer merged only *adjacent* free blocks; *overlapping* ones both survived and `Arena::alloc` double-served the region → overlapping live objects → linear-walk desync. Fix coalesces overlapping blocks too. `ReflRepro 8000 @ GC_STRESS=65536` → `ok=8000 bad=0`; re-verified 2026-06-29. Precise maps are orthogonal to this. |
 | A4 (`Fork6`, FJP multi-thread) | 🟡 **OPEN / inconclusive** — gated, separate CAS bug masks it | `fork6-fjp-multithread-jit-root-reclamation.md`: only reachable under experimental `CRATONVM_REAL_FORKJOINPOOL=1`; a real-FJP `ForkJoinPool` CAS conflict now fails the repro on both precise-on and precise-off. |
 | Moving-GC precise relocation (`remap_active_jit_frames` under a real move) | ⚠️ **implemented, not exercised on the default path** | The non-moving sweep + selective promote does not relocate JIT-held slots, so `remap_active_jit_frames` is inert by default; it is only load-bearing if a moving young gen is ever made default. |
 | OSR-point precise tracking | ✅ **decided (Step 5): conservative backstop accepted; no precise OSR maps** | OSR frames get a `JitEntryGuard` chain entry + are conservatively backstopped in `scan_one_frame_precise` (safe on the non-moving sweep) and are excluded from `fully_oop_covered` (`!compiled_via_osr`) so a future moving path PINS them. Empirically: bt16 OSR-enters `binaryTrees(I)J` and is correct under forced young GC. `CRATONVM_SHADOW_OSR_TRACK` (shadow-only, partial 68199090) is retained experimental/default-off (Step 6). See "Step 5 — OSR decision". |
-| Full app-gauntlet GC-root regression with precise on | 🟡 **repro+bench lane + app lane LANDED & green; heavy container apps still CI-deferred** | `gc-root-lane.sh` (Step 4): 12 PASS / 1 KNOWN-FAIL (A2) / 1 FLAKY (MTRegex), 0 dev. `gc-root-apps-lane.sh` (Step 7): BouncyCastle asn1+prng PASS (GC-invariant + corruption-free under 4 MB GC-stress), 0 dev. The named container apps (wildfly/kafka/h2/elasticsearch/…) are unbuilt on a dev checkout → SKIP-with-note; they need CI / a provisioned box. See "Step 7 — App GC-root gauntlet". |
+| Full app-gauntlet GC-root regression with precise on | 🟡 **repro+bench lane + app lane LANDED & green; heavy container apps still CI-deferred** | `gc-root-lane.sh` (Step 4): 12 PASS / 1 FLAKY (MTRegex), 0 dev (the former A2 KNOWN-FAIL now PASSes after `6e3ddb05`; lane expectation updated to PASS). `gc-root-apps-lane.sh` (Step 7): BouncyCastle asn1+prng PASS (GC-invariant + corruption-free under 4 MB GC-stress), 0 dev. The named container apps (wildfly/kafka/h2/elasticsearch/…) are unbuilt on a dev checkout → SKIP-with-note; they need CI / a provisioned box. See "Step 7 — App GC-root gauntlet". |
 | Perf acceptable as default | ✅ **inline frame-record landed (Steps 1+2, 2026-06-21)** | The per-invocation `jit_frame_record` CALL is now an inlined `mov gs:[disp], rbp` (default-on, Windows). fib44 inline-on ~11.8 s vs CALL-path ~19.8 s = **1.68× faster** (the no-frame-record floor is ~9 s, so inline cuts ~74 % of the frame-record overhead). bt16 also ~16 % faster. See "Inline frame-record (Steps 1+2)" below. Opt out: `CRATONVM_NO_PRECISE_INLINE_FRAME_RECORD`. |
 
 ## Proposed design (to reach a *validated* default)
@@ -174,10 +188,12 @@ here — that is `default-moving-young-gen.md`.
    register-invisibility reclaims named in the README) with precise on, against
    HotSpot, and record a green baseline. This is the actual gate on "validated".
 4. **Scope honesty for A2 / A4.** Document, in the family README and here, that
-   precise maps fix the **register-invisibility class (A3)** but NOT A2 (a
-   distinct allocation↔sweep-walker UAF) nor A4 (multi-thread, gated, separate
-   CAS bug). These are tracked separately and are NOT blockers for the
-   single-thread default; they ARE blockers for declaring the *family* retired.
+   precise maps fix the **register-invisibility class (A3)** but NOT A2 nor A4 —
+   these are *distinct* bugs. **A2 turned out to be a GC free-list double-serve,
+   fixed independently (`6e3ddb05`, 2026-06-23)**; A4 is multi-thread, gated, with
+   a separate CAS bug. Neither was ever a precise-maps concern. They are tracked
+   separately and are NOT blockers for the single-thread default; **A4 (only)**
+   now remains a blocker for declaring the *family* retired.
 5. **OSR decision.** Either (a) extend precise oop maps to OSR entry points so
    OSR frames are precisely covered (not just conservatively backstopped), or
    (b) formally accept conservative backstop for OSR frames and drop the
@@ -341,7 +357,7 @@ expected FLAKY, 0 deviations** (lane exit 0).
 | bench sieve250k / matrix600 | PASS | == (22044 / 6479950792) | |
 | a3 RHard / VStatic | PASS | == 3222190 (3/3) | `warned=3` — GC-array-guard fires (gap exercised, benign) |
 | a3 VAAload / VArgLen / binarytrees | PASS | == 3222190 (3/3) | `warned=3` — **see below** |
-| a2 ReflRepro | KNOWN-FAIL | crash (markers=251) | precise maps do **not** fix A2 (distinct alloc↔sweep UAF) |
+| a2 ReflRepro | KNOWN-FAIL *(at recording; **FIXED `6e3ddb05` 2026-06-23**, now PASS)* | crash (markers=251) → since `ok=20000 bad=0` at the lane params | was a GC free-list double-serve, **not** a precise-maps gap; lane expectation updated to PASS |
 | mt MTRegex | FLAKY | 1/3 completions | documented cross-thread STW JIT-root gap + Thread.join/IMSE hang |
 
 **Honest findings (the value of recording a baseline):**
@@ -357,9 +373,13 @@ expected FLAKY, 0 deviations** (lane exit 0).
   TSV note but is **not** auto-gated, so a human reviews it to see the guard
   firing more (a fresh gap) or — on a real fix — stopping. Precise maps on/off
   make no difference to this (per the known-issue).
-- **A2 (`ReflRepro`) and the multi-thread cross-thread gap (`MTRegex`) remain
-  open** — precise maps do not fix them; both are tracked as expected non-PASS so
-  the lane stays green while they're worked separately.
+- **A2 (`ReflRepro`) has since been FIXED** (`6e3ddb05`, 2026-06-23) — at
+  recording it was an expected KNOWN-FAIL, but the root was a GC-side free-list
+  double-serve (overlapping free blocks not coalesced), **not** anything precise
+  maps touch. The lane's A2 expectation is now PASS. **The multi-thread
+  cross-thread gap (`MTRegex`) remains open** — precise maps do not fix it; it is
+  tracked as expected non-PASS so the lane stays green while it is worked
+  separately.
 - **bench `fib44` is correct but ~166 s** due to the separate `3a966cb9` long-call
   dev regression (bisected; workaround `CRATONVM_JIT_IR_LONG=0`). The lane
   disables the VM's 120 s native-hang watchdog (`CRATONVM_DISABLE_DEFAULT_WATCHDOG`)
@@ -368,6 +388,19 @@ expected FLAKY, 0 deviations** (lane exit 0).
 - **bt18@8g can transiently fail to allocate under concurrent host memory load**
   (one empty result observed); the lane retries a bench once on an empty result
   to absorb that, distinguishing it from a wrong checksum (a real regression).
+- **bench `sieve250k` is correct but slow → needs a longer timeout on slow boxes
+  (added 2026-06-29).** `sieve250k` = `sieve(250000)` repeated **1000×**; the hot
+  `BenchSuite.sieve(II)J` is invoked exactly once (the 1000-repeat is its own inner
+  loop) so it never hits invocation-count tier-up, and OSR does not fire on its
+  loops — it runs **interpreted** end-to-end, ~70–350× slower than HotSpot, so 1000
+  reps ≈ **350 s** on this (slow) box (measured: nojit `ms=347868 checksum=22044`;
+  per-rep time scales perfectly **linearly** ⇒ NOT a hang/infinite-loop, and the
+  checksum is always correct). It exceeded the lane's default 300 s `TIMEOUT` (and
+  the 120 s watchdog), showing as the one `gc-root-lane.sh` deviation on a slow box.
+  Fix: `bench_item` now takes a per-bench timeout override and `sieve250k` gets
+  `max(TIMEOUT, 600)` (override via `SIEVE_TIMEOUT`). This is a JIT-throughput gap
+  (hot once-invoked method never compiled — same class as bug-01), **not** a
+  GC-root-family bug and **not** touched by precise maps.
 
 This is the runnable GC-root-family acceptance set. The full named-app gauntlet
 (cassandra/tomcat/wildfly/keycloak/spring-boot/jenkins/felix) needs container
@@ -495,27 +528,31 @@ maps default-on. The full named container gauntlet
 (cassandra/tomcat/wildfly/keycloak/spring-boot/jenkins/felix) remains the
 outstanding bar and is **CI-deferred** — the lane is written and gated for it,
 but those classpaths are not built here. So the GC-root *family* is not yet
-formally "retired" (that also needs A2's sweep-walker fix and A4's FJP CAS fix),
-but every GC-root vehicle runnable on this box — repros, benches, and the BC app
+formally "retired" (that also needs A4's cross-thread-STW scan + FJP CAS fix;
+A2's fix already landed `6e3ddb05`), but every GC-root vehicle runnable on this
+box — repros, benches, and the BC app
 suites — is green under the precise-maps default.
 
-## Step 8 — GC-root family retirement status (2026-06-22): A3 closed, A2/A4 open, nothing removed
+## Step 8 — GC-root family retirement status (refreshed 2026-06-29): A1/A2/A3 closed, A4 open, nothing removed
 
-The "validated default" work closes the **A3 register-invisibility class**. The
-*family* is **not yet formally retired** — A2 and A4 are distinct, deep bugs that
-this work never claimed to fix. Per the retain directive, **nothing is removed**:
+The "validated default" work closes the **A3 register-invisibility class**.
+Since this doc was first written, **A2 has also been fixed** (`6e3ddb05`,
+2026-06-23) — leaving **A4 as the only open family member**. The *family* is
+**not yet formally retired** (A4 + the container-app CI run remain), but three of
+four members are now closed. Per the retain directive, **nothing is removed**:
 the conservative backstop, the GC guards, every `CRATONVM_DBG_*` diagnostic knob,
 the shadow stack (Step 6), and all A1–A4 repros stay in the tree as
 experimental / debugging tools.
 
-**Current-dev status refresh (binary off dev `14afc6a6`, JDK-25 oracle):**
+**Current-dev status refresh (re-verified 2026-06-29, fresh release build off dev
+HEAD `9928052c`, JDK-25 oracle):**
 
 | member | status | current-dev evidence |
 |---|---|---|
 | A1 (reflection mirror-array pin) | ✅ FIXED | `pin_native_root` (long-landed) |
-| A3 (register-invisibility) | ✅ CLOSED by precise maps | repro+bench lane (Step 4) + OSR (Step 5) + BouncyCastle apps (Step 7) all green |
-| **A2** (`ReflRepro` alloc↔sweep-walker UAF) | 🔴 **OPEN, unchanged** | `ReflRepro 8000 @ GC_STRESS=65536` → **rc=139** (SIGSEGV, ~216k corruption-cascade lines). Register-/native-return-resident missed root that no *stack* scan (precise/shadow/fullstack) can see; fix is dedicated GC/JIT core work (handoff: spill object-returning call results to a scanned slot before the next safepoint, or precise per-PC register maps; the reclaimed-region-filler attempt was tried + reverted). Repro + guards retained. |
-| **A4** (`Fork6` FJP multi-thread) | 🟡 **OPEN but non-fatal on the repro here** | gated `CRATONVM_REAL_FORKJOINPOOL=1` → **6/6 ALL-OK**, 0 corruption (the doc's older ~15% reclamation does **not** reproduce on current dev); the documented cross-thread STW JIT-root gap is still *exercised* (`scan_active_jit_frames` WARN, ~2048 hits) but **non-fatal** (the parked thread's `root_snapshot` covered it). Default path throws `RejectedExecutionException` (a synthetic-FJP feature gap, not GC). The cross-thread STW JIT-root scan remains the tracked follow-up. |
+| **A2** (`ReflRepro` heap corruption) | ✅ **FIXED on dev** (`6e3ddb05`, 2026-06-23) | Was **not** a register/native-return missed root (the title's premise was refuted) — it was a GC-side free-list accounting bug: the non-moving young sweep's coalescer merged only *adjacent* free blocks, so *overlapping* free blocks both survived and `Arena::alloc` double-served the region → two live objects at overlapping addresses → linear-walk desync → the long-seen "implausible object size" / decayed `java.lang.Object` / SIGSEGV. Fix coalesces overlapping blocks too (`off <= last_end`). **Re-verified 2026-06-29:** `ReflRepro 8000 @ GC_STRESS=65536` → `ok=8000 bad=0 rc=0`, and `20000 @ GC_STRESS=524288 --Xmx 256m` → `ok=20000 bad=0 rc=0` (was rc=139). bt16/bt18 golden. Precise maps are orthogonal. A benign non-corrupting RE-SYNC residual (`bad=0`) is a perf/cleanliness follow-up. |
+| A3 (register-invisibility) | ✅ CLOSED by precise maps | repro+bench lane (Step 4) + OSR (Step 5) + BouncyCastle apps (Step 7) all green; re-verified 2026-06-29 (`VAAload 14 @ GC_STRESS=4096` = `3222190`) |
+| **A4** (`Fork6` FJP multi-thread) | 🟡 **OPEN but non-fatal on the repro here** | gated `CRATONVM_REAL_FORKJOINPOOL=1` → **26/26 ALL-OK** (8 sequential + 18 concurrent-stress, re-verified 2026-06-29), 0 corruption (the doc's older ~15% reclamation does **not** reproduce on current dev — plausibly also helped by the A2 free-list fix, which shares the non-moving-sweep path); the documented cross-thread STW JIT-root gap is still *exercised* (`scan_active_jit_frames` WARN, `cross_thread_jit_gap_hits` incrementing) but **non-fatal** (the parked thread's `root_snapshot` covered it). Benign real-FJP `cas_long FAIL` retry noise still fires. The cross-thread STW JIT-root scan remains the tracked follow-up — the genuine residual is a register-only oop at a non-call safepoint (see the A4 known-issue doc). |
 
 **Container-app gauntlet — CI-complete, not removed.** `gc-root-apps-lane.sh`
 now enumerates the named apps (tomcat / keycloak / spring-boot / cassandra /
@@ -525,11 +562,11 @@ addition to the runnable BouncyCastle suites. So the harness is the complete
 named-app gauntlet; the heavy apps are CI-deferred (unbuilt on a dev checkout),
 not dropped.
 
-**Formal retirement of the family is gated on** (separate, dedicated work): the
-A2 fix, the A4 cross-thread-STW JIT-root scan (+ the real-FJP CAS bug), and a CI
-run of the container apps. Until then this doc claims only what is proven: the
-precise-maps default closes A3 and is green across every GC-root vehicle runnable
-on this box.
+**Formal retirement of the family is now gated on** (separate, dedicated work):
+the A4 cross-thread-STW JIT-root scan (+ the real-FJP CAS bug) and a CI run of the
+container apps. (A2's fix landed `6e3ddb05`.) Until then this doc claims only what
+is proven: the precise-maps default closes A3, A1/A2 are independently fixed, and
+the default is green across every GC-root vehicle runnable on this box.
 
 ## Risks & open questions
 
@@ -542,13 +579,21 @@ on this box.
   was tried and **reverted** (broke `MinRegexProbe`). Any future "skip for
   oop-free methods" optimisation must preserve RBP-chain traversal to caller
   frames.
-- **A2 is NOT fixed and precise-on surfaces MORE of it.** Retaining more live
-  objects exposes the distinct `ReflRepro` allocation↔sweep-walker UAF earlier.
-  Open question: does the app gauntlet hit A2-class churn anywhere that was
-  previously masked by under-retention? The Step 4 sweep is partly to find out.
-- **A4 is gated and currently masked by a real-FJP CAS bug.** Cannot be cleanly
-  re-verified until that CAS bug is fixed; precise maps neither fix nor regress
-  it on current evidence.
+- **A2 is FIXED (`6e3ddb05`), and it was never a precise-maps concern.** The
+  premise that precise-on "surfaces more of A2" was based on the now-refuted
+  register-resident-root theory; the real cause was a GC free-list double-serve,
+  fixed independently. Re-verified clean 2026-06-29 (`ReflRepro` `bad=0` at both
+  the standard and the harsher lane stress). No residual risk to the precise-maps
+  default from A2. *(Historical note: precise-on retaining more live objects did
+  make the corruption surface earlier — that was a symptom-timing effect, not a
+  cause; the fix is in the sweep coalescer.)*
+- **A4 is gated; non-fatal on the repro but the cross-thread gap is real.** On
+  current dev `Fork6` is 26/26 ALL-OK (re-verified 2026-06-29) with the benign
+  real-FJP `cas_long` retry noise still firing; the `scan_active_jit_frames`
+  cross-thread STW JIT-root gap is still *exercised* (WARN) but covered by the
+  peer's `root_snapshot`. The genuine residual is a register-only oop at a
+  non-call safepoint — the deferred precise-reg-map / cross-thread-STW-scan work.
+  Precise maps neither fix nor regress it on current evidence.
 - **Moving relocation path is unexercised by default.**
   `remap_active_jit_frames` correctness under a real move is only proven on the
   (superseded, under-counting) shadow path. If the moving-default project flips,
@@ -592,13 +637,15 @@ JDK-25 app runs):
 5. **Perf within budget after inline frame-record:** call-heavy regression
    reduced from 2.5× toward parity (fib44), alloc/compute unchanged (≤~6% /
    ~0%).
-6. **Scope statement accurate:** A2 and A4 are explicitly tracked as OPEN and
-   NOT claimed closed by this work; the README family map matches reality.
+6. **Scope statement accurate:** A4 is explicitly tracked as OPEN and NOT claimed
+   closed by this work; A2 is now independently FIXED (`6e3ddb05`); the README
+   family map matches reality (updated 2026-06-29).
 
-"Validated default" does **not** require A2 or A4 to be fixed (they are
-separate bugs), but it **does** require the docs to stop implying the family is
-retired. Retiring the *family* is a superset goal that depends on A2's
-sweep-walker fix and A4's FJP CAS fix landing separately.
+"Validated default" does **not** require A4 to be fixed (it is a separate bug),
+but it **does** require the docs to stop implying the family is retired. Retiring
+the *family* is a superset goal that — now that A2 has landed — depends on A4's
+cross-thread-STW JIT-root scan (+ the real-FJP CAS bug) and the container-app CI
+run landing separately.
 
 ## Scaffolding to land first (minimal, compiling)
 

@@ -1304,6 +1304,14 @@ impl<'a> NativeContextImpl<'a> {
             std::mem::take(&mut *f)
         };
         if !fixup.is_empty() {
+            // BUG-03 trace (gated): record that the blocked-wake remap ran for main.
+            if self.thread.thread_id.0 == 0 && std::env::var_os("CRATONVM_DBG_BUG03").is_some() {
+                let jto = self.thread.java_thread_obj.map(|o| o.as_ptr() as usize).unwrap_or(0);
+                eprintln!(
+                    "[BUG03-fm] e{} path=blocked-wake(check_post_block) tid0 jto=0x{:x} jto_in_fixup={} fixup.len={}",
+                    self.shared.heap.collection_count(), jto, jto != 0 && fixup.contains_key(&jto), fixup.len()
+                );
+            }
             if std::env::var_os("CRATONVM_DBG_BLOCKGC").is_some() {
                 eprintln!(
                     "[blockgc] wake tid={} applying {} composed fixups ({} frames)",
@@ -1456,7 +1464,21 @@ impl<'a> NativeContextImpl<'a> {
             .alloc_object(holder_class, holder_num_fields);
         crate::runtime::interpreter::init_primitive_fields(self.shared, holder, holder_class);
 
+        // BUG-03 (concurrent-spawn): `holder` is a bare Rust local held across
+        // `get_or_create_main_thread_group()` (allocates the ThreadGroup + triggers
+        // Reference.<clinit> → a moving young GC) and the FieldHolder.<init> invoke.
+        // A moving GC would relocate `holder` while the local kept the old address;
+        // FieldHolder.<init> would then write `group`/priority/etc. to the STALE
+        // holder, leaving the LIVE holder with `group == null` (so the parent's
+        // `getThreadGroup()` returns null → `g.getMaxPriority()` NPE). Pin it across
+        // the allocations (the GC remaps `native_pin_roots` in place) and read the
+        // live address back. Watermark/LIFO-truncate per the native-pin convention.
+        let pin_base = self.thread.native_pin_roots.len();
+        self.thread.native_pin_roots.push(holder);
+
         let group = self.get_or_create_main_thread_group();
+        // Re-read the (GC-remapped) holder after the group allocation.
+        let holder = self.thread.native_pin_roots[pin_base];
         let args = [
             Value::Object(Some(holder)),
             Value::Object(group), // ThreadGroup (may be None if group alloc failed)
@@ -1465,15 +1487,18 @@ impl<'a> NativeContextImpl<'a> {
             Value::Int(5),        // priority = NORM_PRIORITY
             Value::Int(0),        // daemon = false
         ];
-        invoke_on_class_shared(
+        let init_result = invoke_on_class_shared(
             self.shared,
             self.thread,
             holder_class,
             "<init>",
             "(Ljava/lang/ThreadGroup;Ljava/lang/Runnable;JIZ)V",
             &args,
-        )
-        .ok()?;
+        );
+        // Read the live holder back (the invoke may have GC'd), then unpin.
+        let holder = self.thread.native_pin_roots.get(pin_base).copied().unwrap_or(holder);
+        self.thread.native_pin_roots.truncate(pin_base);
+        init_result.ok()?;
         Some(holder)
     }
 
@@ -1510,17 +1535,33 @@ impl<'a> NativeContextImpl<'a> {
         // the `synchronizedAddWeak`/`synchronizedAddStrong` NPE path the
         // `(ThreadGroup, String, int, boolean)` ctor would take with a null
         // parent, and leaves the group named "system".
+        // BUG-03 (concurrent-spawn): the group/string objects below are bare Rust
+        // locals held across their `<init>` invokes and `create_java_string` — each
+        // of which can trigger a moving young GC (Reference.<clinit> etc.) that
+        // relocates them. Pin every such object on the native-pin watermark so the
+        // GC remaps it in place, and re-read the live address from the pin after
+        // each GC-capable step (a stale local would make the ctor write fields to
+        // the old address → the live group ends up with parent/name == null).
+        let pin_base = self.thread.native_pin_roots.len();
+
         let system_tg = self.shared.heap.alloc_object(tg_class, tg_num_fields);
         crate::runtime::interpreter::init_primitive_fields(self.shared, system_tg, tg_class);
-        invoke_on_class_shared(
+        let sys_idx = self.thread.native_pin_roots.len();
+        self.thread.native_pin_roots.push(system_tg);
+        let sys_recv = self.thread.native_pin_roots[sys_idx];
+        let init_ok = invoke_on_class_shared(
             self.shared,
             self.thread,
             tg_class,
             "<init>",
             "()V",
-            &[Value::Object(Some(system_tg))],
+            &[Value::Object(Some(sys_recv))],
         )
-        .ok()?;
+        .is_ok();
+        if !init_ok {
+            self.thread.native_pin_roots.truncate(pin_base);
+            return None;
+        }
 
         // Build the conventional "main" group as a CHILD of "system" via the
         // public `ThreadGroup(ThreadGroup parent, String name)` constructor
@@ -1541,7 +1582,15 @@ impl<'a> NativeContextImpl<'a> {
         // HotSpot, where these cleaner threads never trip the leak detector.
         let main_tg = self.shared.heap.alloc_object(tg_class, tg_num_fields);
         crate::runtime::interpreter::init_primitive_fields(self.shared, main_tg, tg_class);
+        let main_idx = self.thread.native_pin_roots.len();
+        self.thread.native_pin_roots.push(main_tg);
         let main_str = super::create_java_string(self.shared, "main");
+        let str_idx = self.thread.native_pin_roots.len();
+        self.thread.native_pin_roots.push(main_str);
+        // Re-read all three (GC-remapped) before the ctor invoke.
+        let m_recv = self.thread.native_pin_roots[main_idx];
+        let m_parent = self.thread.native_pin_roots[sys_idx];
+        let m_name = self.thread.native_pin_roots[str_idx];
         let ctor_ok = invoke_on_class_shared(
             self.shared,
             self.thread,
@@ -1549,12 +1598,16 @@ impl<'a> NativeContextImpl<'a> {
             "<init>",
             "(Ljava/lang/ThreadGroup;Ljava/lang/String;)V",
             &[
-                Value::Object(Some(main_tg)),
-                Value::Object(Some(system_tg)),
-                Value::Object(Some(main_str)),
+                Value::Object(Some(m_recv)),
+                Value::Object(Some(m_parent)),
+                Value::Object(Some(m_name)),
             ],
         )
         .is_ok();
+        // Re-read after the invoke (it may have GC'd).
+        let system_tg = self.thread.native_pin_roots[sys_idx];
+        let main_tg = self.thread.native_pin_roots[main_idx];
+        let main_str = self.thread.native_pin_roots[str_idx];
         // Fallback: if the public ctor is unavailable, populate parent/name
         // directly so the hierarchy (and thus InnocuousThreadGroup placement)
         // is still correct.
@@ -1577,6 +1630,7 @@ impl<'a> NativeContextImpl<'a> {
                     .set_field(main_tg, slot, Value::Object(Some(main_str)));
             }
         }
+        self.thread.native_pin_roots.truncate(pin_base);
         *self.shared.main_thread_group.write() = Some(main_tg);
         Some(main_tg)
     }
@@ -1621,7 +1675,17 @@ impl<'a> NativeContextImpl<'a> {
                 .ok()
         });
         if let Some(obj_class) = obj_class {
+            // BUG-03 (concurrent-spawn): `thread_obj` is a bare param held across the
+            // lock allocation below, which can trigger a moving GC that relocates it.
+            // Pin it so the GC remaps it in place, then write the lock to the LIVE
+            // address (a stale `thread_obj` would drop the write → null interruptLock).
+            let pin_base = self.thread.native_pin_roots.len();
+            self.thread.native_pin_roots.push(thread_obj);
             let lock = self.shared.heap.alloc_object(obj_class, 0);
+            let thread_obj = self.thread.native_pin_roots[pin_base];
+            self.thread
+                .native_pin_roots
+                .truncate(pin_base);
             self.shared
                 .heap
                 .set_field(thread_obj, slot, Value::Object(Some(lock)));
@@ -3707,7 +3771,21 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             // Use the pre-created shared state
             jvm_thread.park_state = pre_park;
             jvm_thread.interrupted = pre_interrupted;
-            jvm_thread.java_thread_obj = Some(thread_obj_for_spawn);
+            // CRIT (stale-ref) — `thread_obj_for_spawn` is a raw ObjectRef captured
+            // on the PARENT at spawn and never remapped; a moving GC between the
+            // capture and this worker's startup relocates the Thread mirror, leaving
+            // the captured ref stale. The registry's `java_thread_obj` IS remapped
+            // after every GC (`update_thread_objs_after_gc`), so read the current
+            // address from there (the worker was `register`ed with this mirror on the
+            // parent before spawn), falling back to the captured ref only if absent.
+            // Mirrors the identical read-back already done at thread END (search
+            // `wake_obj`).
+            jvm_thread.java_thread_obj = Some(
+                shared_arc
+                    .thread_registry
+                    .java_thread_obj(tid)
+                    .unwrap_or(thread_obj_for_spawn),
+            );
             if is_virtual {
                 jvm_thread.kind = crate::threading::ThreadKind::Virtual;
                 // Acquire a carrier permit before executing (blocks if all carriers busy).
@@ -4069,7 +4147,21 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             }
         };
 
-        let thread_obj = self.shared.heap.alloc_object(class_id, num_fields);
+        // BUG-03 (concurrent-spawn Thread.holder-null): this freshly-allocated
+        // mirror is held in a Rust LOCAL across the allocating steps below
+        // (`create_java_string`, `build_thread_field_holder` → ThreadGroup +
+        // Reference.<clinit>, the system ClassLoader). Under GC stress a moving
+        // young GC fires inside one of those allocations and RELOCATES the mirror:
+        // the per-thread `java_thread_obj` field (and the registry mirror) are
+        // remapped by `update_all_roots`/`update_thread_objs_after_gc`, but a bare
+        // Rust local is NOT a GC root, so it goes stale. Using the stale local for
+        // the `set_field(holder/name/…)` calls then writes those fields to the OLD
+        // (zeroed) address — leaving the live mirror with `holder == null` — and the
+        // function returns the stale ref. `Thread.<init>`'s
+        // `currentThread().getThreadGroup()` then NPEs ("this.holder is null").
+        // FIX: keep `thread_obj` in sync with the GC-remapped field by re-reading it
+        // after every allocating step (the field is the authoritative live address).
+        let mut thread_obj = self.shared.heap.alloc_object(class_id, num_fields);
         if is_real_jdk {
             crate::runtime::interpreter::init_primitive_fields(self.shared, thread_obj, class_id);
         }
@@ -4083,6 +4175,8 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             .set_java_thread_obj(self.thread.thread_id, thread_obj);
 
         let name_str = super::create_java_string(self.shared, &self.thread.name);
+        // Re-sync after the string allocation (may have moved the mirror).
+        thread_obj = self.thread.java_thread_obj.unwrap_or(thread_obj);
 
         if is_real_jdk {
             let (name_slot, tid_slot, holder_slot, priority_slot) = {
@@ -4113,6 +4207,12 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             }
             if let Some(slot) = holder_slot {
                 if let Some(holder) = self.build_thread_field_holder() {
+                    // build_thread_field_holder allocates the FieldHolder + the
+                    // ThreadGroup and triggers Reference.<clinit> — the moving GC
+                    // that relocates the mirror. Re-sync before writing `holder`, or
+                    // it lands on the stale (old) address and the live mirror keeps
+                    // holder==null (the BUG-03 crash).
+                    thread_obj = self.thread.java_thread_obj.unwrap_or(thread_obj);
                     self.shared
                         .heap
                         .set_field(thread_obj, slot, Value::Object(Some(holder)));
@@ -4136,6 +4236,8 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                 if let Some(loader) =
                     cratonvm_native_builtins::classloader_real::get_or_create_system_cl(self)
                 {
+                    // System-CL construction allocates → may relocate the mirror.
+                    thread_obj = self.thread.java_thread_obj.unwrap_or(thread_obj);
                     self.shared
                         .heap
                         .set_field(thread_obj, slot, Value::Object(Some(loader)));
@@ -4146,11 +4248,17 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             // every `AbstractInterruptibleChannel` begin/end) never NPEs on a
             // VM-synthesized Thread object that never ran `<init>`. See
             // `ensure_thread_interrupt_lock`.
+            // Final re-sync: ensure_thread_interrupt_lock allocates a lock object,
+            // and the returned ref must be the live (post-GC) mirror.
+            thread_obj = self.thread.java_thread_obj.unwrap_or(thread_obj);
             self.ensure_thread_interrupt_lock(thread_obj);
-            return thread_obj;
+            return self.thread.java_thread_obj.unwrap_or(thread_obj);
         }
 
-        // Synthetic-JDK fixed layout: name=0, priority=1, tid=2.
+        // Synthetic-JDK fixed layout: name=0, priority=1, tid=2. `create_java_string`
+        // above may have relocated the mirror; re-sync from the GC-remapped field
+        // (same BUG-03 hazard as the real-JDK path).
+        thread_obj = self.thread.java_thread_obj.unwrap_or(thread_obj);
         self.shared
             .heap
             .set_field(thread_obj, 0, Value::Object(Some(name_str)));

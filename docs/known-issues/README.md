@@ -11,11 +11,15 @@ the ~30 docs map to **one root-cause family + ~15 distinct standalone bugs**, of
 **8 are already FIXED on `dev`** (the 6 prior + `kafka-bug-C` and the dispatch half of
 `kafka-bug-B`). Headline:
 
-**~10 distinct OPEN defects + 1 latent**, grouped as:
+**~9 distinct OPEN defects + 1 latent** (was ~10 — family-A **A2** was fixed
+2026-06-23, `6e3ddb05`), grouped as:
 
 1. **Family A — GC root coverage under JIT** (one root cause, several manifestations). Open members:
-   **A2** (register-only/native-return reclaim + non-moving-sweep walk) and **A4** (Fork6 FJP
-   multi-thread, gated). **A1/A3/A5 are FIXED** — A5 was root-caused to the **compiled entry-point
+   **A4** (Fork6 FJP multi-thread, gated) — the last open member. **A1/A2/A3/A5 are FIXED** — **A2**
+   (`ReflRepro`) was re-diagnosed and fixed 2026-06-23 (`6e3ddb05`): it was **never** a
+   register/native-return missed root, but a GC-side non-moving-sweep free-list double-serve
+   (overlapping free blocks not coalesced → `Arena::alloc` served the same region twice); A5 was
+   root-caused to the **compiled entry-point
    `main`'s JIT frame being unregistered** (invoked via `Vm::invoke` without a `JitEntryGuard`, so
    the moving young collector relocated its roots); fixed by detecting an unregistered JIT frame on
    the native stack → non-moving sweep + full-stack mark (dev `77c98761`; writeup moved to
@@ -141,18 +145,23 @@ stale reference later reads an all-zero / garbage header → `inconsistent heade
 (interpreter frames are precisely scanned and the moving collector remaps every
 root); `-Xmx8g` passes (no young GC).
 
-> **Current-dev refresh (2026-06-22, dev `14afc6a6`+, precise-jit-maps-default
-> Steps 1–8).** **A3 is CLOSED** by precise JIT oop maps (default-on) — validated
-> green across the GC-root repro+bench lane, OSR frames, and the BouncyCastle app
-> suites (`test-infra/regression-pool/gc-root-lane.sh` + `gc-root-apps-lane.sh`).
-> **A2 remains OPEN, unchanged:** `ReflRepro 8000 @ GC_STRESS=65536` still
-> `rc=139` (register-/native-return-resident missed root → UAF; no stack scan can
-> see a live register — dedicated GC/JIT core work). **A4 is OPEN but non-fatal
-> on the repro here:** gated `CRATONVM_REAL_FORKJOINPOOL=1` Fork6 is 6/6 ALL-OK on
-> current dev (the older ~15% reclamation does not reproduce), though the
-> cross-thread STW JIT-root gap is still *exercised* (`scan_active_jit_frames`
-> WARN) — that scan is the tracked follow-up. The *family is not formally
-> retired* (A2/A4 open); **nothing was removed** — all repros, GC guards,
+> **Current-dev refresh (re-verified 2026-06-29, fresh build off dev HEAD
+> `9928052c`; precise-jit-maps-default Steps 1–8).** **A3 is CLOSED** by precise
+> JIT oop maps (default-on) — validated green across the GC-root repro+bench lane,
+> OSR frames, and the BouncyCastle app suites
+> (`test-infra/regression-pool/gc-root-lane.sh` + `gc-root-apps-lane.sh`).
+> **A2 is now FIXED** (`6e3ddb05`, 2026-06-23): `ReflRepro 8000 @ GC_STRESS=65536`
+> → `ok=8000 bad=0 rc=0` (and `20000 @ GC_STRESS=524288 --Xmx 256m` → `bad=0`),
+> previously `rc=139`. It was **never** a register/native-return missed root — it
+> was a GC-side non-moving-sweep free-list double-serve (overlapping free blocks
+> not coalesced), fixed in the sweep coalescer; precise maps are orthogonal.
+> **A4 is OPEN but non-fatal on the repro here:** gated
+> `CRATONVM_REAL_FORKJOINPOOL=1` Fork6 is **26/26 ALL-OK** on current dev (8
+> sequential + 18 concurrent-stress; the older ~15% reclamation does not
+> reproduce), though the cross-thread STW JIT-root gap is still *exercised*
+> (`scan_active_jit_frames` WARN, `cross_thread_jit_gap_hits` incrementing) — that
+> scan is the tracked follow-up. The *family is not yet formally retired* (A4 +
+> container-app CI remain); **nothing was removed** — all repros, GC guards,
 > `CRATONVM_DBG_*` knobs, and the shadow stack are retained as experimental/debug
 > tools.
 >
@@ -167,9 +176,9 @@ current (incomplete/buggy) implementation of that.
 | # | Manifestation | Repro | Status | Doc |
 |---|---|---|---|---|
 | **A1** | Reflection mirror-array builders held an `ObjectRef` array in a Rust local across allocating calls (`Field[]`/`Method[]`/annotation arrays) | `wildfly-suite/repro/MinRepro` | ✅ **FIXED on dev** (`pin_native_root` sweep) | _(doc removed; resolved)_ |
-| **A2** | **`implausible object size` young-sweep-walker crash** (reflection/String-array allocation churn) — a *distinct* bug, NOT the register root | `wildfly-suite/repro/ReflRepro` | 🔴 **OPEN** — precise maps do **not** fix it (still crashes; verified 2026-06-17) | [reflrepro-register-resident-jit-root-handoff.md](reflrepro-register-resident-jit-root-handoff.md) |
+| **A2** | **`implausible object size` young-sweep-walker crash** (reflection/String-array allocation churn) — a *distinct* bug, NOT the register root: a non-moving-sweep free-list double-serve (overlapping free blocks not coalesced) | `wildfly-suite/repro/ReflRepro` | ✅ **FIXED on dev** (`6e3ddb05`, 2026-06-23; coalesce overlapping free blocks) — `ReflRepro 8000 @ GC_STRESS=65536` → `ok=8000 bad=0` (re-verified 2026-06-29); precise maps orthogonal | [reflrepro-register-resident-jit-root-handoff.md](reflrepro-register-resident-jit-root-handoff.md) |
 | **A3** | **Register-invisibility** — a live oop sits only in a CPU register at a young-GC safepoint, invisible to the stack-only scan (single thread) | `apps/spring-boot/buildSrc/runner/MinRegexProbe` | ✅ **FIXED on dev** (`32649b56`, precise maps default-on) | _(doc removed; resolved)_ |
-| **A4** | Multi-thread: live `ForkJoinTask`s reclaimed under **FJP worker threads** + a **lost-tag** interpreter local | `scratch/xworker/Fork6` (needs `CRATONVM_REAL_FORKJOINPOOL=1`) | 🟡 **OPEN / inconclusive** — a separate real-FJP CAS failure now masks the reclaim test (same with/without precise) | [fork6-fjp-multithread-jit-root-reclamation.md](fork6-fjp-multithread-jit-root-reclamation.md) |
+| **A4** | Multi-thread: live `ForkJoinTask`s reclaimed under **FJP worker threads** + a **lost-tag** interpreter local | `scratch/xworker/Fork6` (needs `CRATONVM_REAL_FORKJOINPOOL=1`) | 🟡 **OPEN but non-fatal here** — `Fork6` 26/26 ALL-OK on current dev (re-verified 2026-06-29; the older ~15% reclaim does not reproduce), but the cross-thread STW JIT-root gap is still *exercised* (`scan_active_jit_frames` WARN); genuine residual = a register-only oop at a non-call safepoint. Benign real-FJP `cas_long` retry noise still fires | [fork6-fjp-multithread-jit-root-reclamation.md](fork6-fjp-multithread-jit-root-reclamation.md) |
 | **A5** | **Object-binarytrees moving-GC corruption** — the compiled entry-point `main`'s JIT frame is invisible to `gc_quiescence` (invoked via `Vm::invoke` without a `JitEntryGuard`), so the **moving** young collector relocates its roots and can't rewrite the raw stack slots → stale all-zero receiver. (The earlier "register-only stale root in `bottomUpTree`" framing was wrong — `bottomUpTree` isn't even compiled at the crash.) | [`repros/gc-stress-bintrees-main-args/`](repros/gc-stress-bintrees-main-args/) (`VAAload`) | ✅ **FIXED** (dev `77c98761`) — detect an unregistered JIT frame on the native stack → non-moving sweep + full-stack mark. Residual: Windows-only (portable stack-bound is a follow-up) | [docs/internal/.../gc-stress-bintrees-main-args-unregistered-jit-frame-FIXED.md](../internal/app-jvm-bugs/gc-stress-bintrees-main-args-unregistered-jit-frame-FIXED.md) |
 
 > ## ✅ FIX (2026-06-17, dev `32649b56`): **precise JIT oop maps, default-on** — closes the register-invisibility root-scan gap (A3)
@@ -185,11 +194,14 @@ current (incomplete/buggy) implementation of that.
 > reverts to the broken path.
 >
 > **Scope correction (verified 2026-06-17): A2 and A4 are NOT closed by this** — they
-> have *separate* bugs. **A2** (`ReflRepro`) still crashes with `implausible object
+> have *separate* bugs. **[SUPERSEDED 2026-06-23: A2 is now FIXED — `6e3ddb05`, a
+> free-list double-serve in the sweep coalescer, not a register root; `ReflRepro`
+> `bad=0`. See the top-of-section refresh + the A2 table row. A4 remains open.]**
+> **A2** (`ReflRepro`) *(then)* still crashed with `implausible object
 > size` / `inconsistent header` on the young-sweep WALK (a core array/String
 > allocation↔sweep bug, distinct from the register root — precise maps fix root
-> *scanning*, not the sweep walker; it actually surfaces *more* of A2's corruption by
-> retaining more). **A4** (`Fork6`, under the experimental `CRATONVM_REAL_FORKJOINPOOL`
+> *scanning*, not the sweep walker; it actually surfaced *more* of A2's corruption by
+> retaining more — a symptom-timing effect, since cured). **A4** (`Fork6`, under the experimental `CRATONVM_REAL_FORKJOINPOOL`
 > gate) now fails with a real-FJP `ForkJoinPool` CAS conflict on *both* precise-on and
 > -off, masking the original reclaim — so unverified, not regressed.
 >
