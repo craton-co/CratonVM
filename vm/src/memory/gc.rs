@@ -89,6 +89,30 @@ pub fn update_all_roots(
                 }
             }
         }
+        // EVERY GC (main): trace slot 7 value + pc for each Thread.<init> frame, to
+        // see `parent`'s trajectory (when it diverges from the field) regardless of
+        // in-map status.
+        if thread.thread_id.0 == 0 {
+            for (fi, f) in thread.frames.iter().enumerate() {
+                if f.method_name() == "<init>"
+                    && f.class_name() == "java/lang/Thread"
+                    && f.locals_len() > 7
+                {
+                    let s7 = match f.get_local(7) {
+                        crate::types::Value::Object(Some(o)) => {
+                            let a = o.as_ptr() as usize;
+                            format!("obj=0x{:x} in_map={}", a, pointer_map.contains_key(&a))
+                        }
+                        crate::types::Value::Object(None) => "null".to_string(),
+                        other => format!("{other:?}"),
+                    };
+                    eprintln!(
+                        "[BUG03-l7] e{} frame#{} Thread.<init> pc={} local7={} stack:{}",
+                        epoch, fi, f.pc, s7, f.dbg_stack_dump()
+                    );
+                }
+            }
+        }
     }
 
     // 1. Thread frames — locals and operand stacks (SoA layout)

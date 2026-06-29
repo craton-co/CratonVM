@@ -1,6 +1,34 @@
-# Concurrent-thread-spawn live-object reclamation under GC stress (OPEN)
+# Concurrent-thread-spawn live-object reclamation under GC stress (✅ FIXED 2026-06-29)
 
-**Severity:** high (heap corruption / VM crash). **Manifests** only under frequent GC (tiny heap or `CRATONVM_DBG_GC_STRESS`); at normal heap sizes it is rare/absent. **Status:** OPEN — deterministic repro + characterization below; not yet root-caused to a single site.
+**Severity:** high (heap corruption / VM crash). **Manifests** only under frequent GC (tiny heap or `CRATONVM_DBG_GC_STRESS`); at normal heap sizes it is rare/absent.
+
+> **✅ FIXED 2026-06-29** (branch `feat/precise-maps-a4-finish`, NOT pushed). **ROOT CAUSE:**
+> it was **not** a missed root nor a remap gap — it was VM-internal native code holding a
+> freshly-allocated `java.lang.Thread` mirror (and its `FieldHolder` / `ThreadGroup` /
+> `interruptLock`) in a **bare Rust local across GC-capable allocations**. `currentThread()`
+> lazily builds the main mirror (`current_thread_object` → `build_thread_field_holder` →
+> `get_or_create_main_thread_group`); each step allocates (name string, FieldHolder, the
+> ThreadGroup + `Reference.<clinit>`), and a moving young GC fired there RELOCATES the mirror.
+> The per-thread `java_thread_obj` field and the registry are remapped by `update_all_roots`/
+> `update_thread_objs_after_gc`, but a **bare Rust local is not a GC root**, so it went stale:
+> the subsequent `set_field(holder/group/name/lock, …)` wrote to the OLD (now-zeroed) address
+> (`gc::guard` dropped it → live mirror kept `holder == null`), and the stale ref was returned.
+> Hence `Thread.<init>`'s `currentThread().getThreadGroup()` NPE'd (`this.holder is null`, then
+> `g is null`). **FIX:** in those four `vm_exec.rs` helpers, re-read the mirror from the
+> GC-remapped field (`java_thread_obj`) — or, where it isn't field-backed, pin it on
+> `native_pin_roots` (which the GC remaps in place) — after every allocating step, and write/
+> return the live address. **Validated:** `Spawn` → `DONE`, **0 corruption** (no-stress and at
+> `GC_STRESS=1MB` ×3); the `holder`/`group`-null NPEs are eliminated (also in `Fork6Hard`); no
+> regression (A2 `ReflRepro` `ok=8000 bad=0`, `bintrees16/18` golden, `Fork6` 3/3 ALL-OK).
+>
+> **Residual (NOT this bug):** at *pathological* GC frequency (`GC_STRESS` ≤ 256 KB, esp. 4096)
+> `Spawn` is **correct + corruption-free** but extremely **slow** (>10 min) — a GC-stress
+> *throughput* characteristic (every-few-KB moving GC × heavy thread-spawn allocation on a slow
+> box, same class as the `sieve250k` bench), not a correctness issue. And `Fork6Hard` under
+> GC stress still hits the separate **A4 FJP task-reclamation** (`ClassCastException`), tracked
+> in `fork6-fjp-multithread-jit-root-reclamation.md`.
+
+**Status (historic, pre-fix):** OPEN — deterministic repro + characterization below.
 
 ## Deterministic repro
 

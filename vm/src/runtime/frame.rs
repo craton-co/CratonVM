@@ -1437,6 +1437,12 @@ impl Frame {
         }
     }
 
+    /// BUG-03 debug: dump this frame's operand stack (kind/tag/addr per slot).
+    #[doc(hidden)]
+    pub fn dbg_stack_dump(&self) -> String {
+        self.stack.dbg_dump()
+    }
+
     /// BUG-03 debug: locate `addr` among this frame's locals/operand stack and
     /// report the slot + its kind tag. Used to find a mis-tagged object slot that
     /// the kind-gated remap skips (the concurrent-spawn stale-`parent` root cause).
