@@ -3167,6 +3167,25 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             .map(|cs| cs.impl_handle.class_name.to_string())
     }
 
+    fn lambda_proxy_serial_metadata(
+        &self,
+        class_id: ClassId,
+    ) -> Option<cratonvm_native_api::LambdaSerialMetadata> {
+        self.shared.lambda_proxies.read().get(&class_id).map(|cs| {
+            cratonvm_native_api::LambdaSerialMetadata {
+                functional_interface: cs.functional_interface.to_string(),
+                sam_method_name: cs.sam_method_name.to_string(),
+                sam_descriptor: cs.sam_descriptor.to_string(),
+                impl_class: cs.impl_handle.class_name.to_string(),
+                impl_member: cs.impl_handle.member_name.to_string(),
+                impl_descriptor: cs.impl_handle.descriptor.to_string(),
+                impl_ref_kind: cs.impl_handle.kind.as_tag(),
+                instantiated_descriptor: cs.instantiated_descriptor.to_string(),
+                capture_types: cs.capture_types.iter().collect(),
+            }
+        })
+    }
+
     fn is_subclass(&self, child: ClassId, parent: ClassId) -> bool {
         if self
             .shared

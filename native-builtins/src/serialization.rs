@@ -1153,6 +1153,128 @@ fn oos_write_primitive(addr: usize, type_code: char, val: &Value) {
     }
 }
 
+/// Sentinel class name marking a serialized lambda record (our equivalent of
+/// `java.lang.invoke.SerializedLambda`). Written by [`oos_write_value`] when it
+/// encounters a synthetic `$$Lambda` proxy and recognised by [`ois_read_object`]
+/// to drive lambda reconstruction. Not a real loadable class.
+const SERIALIZED_LAMBDA_CLASS: &str = "cratonvm/internal/SerializedLambda";
+
+/// Write a length-prefixed (u16) UTF-8 string as raw bytes — NOT a `TC_STRING`
+/// token, so it consumes no wire handle. Used for the fixed metadata fields of
+/// a serialized-lambda record, read back by [`read_lp_string`].
+fn write_lp_string(addr: usize, s: &str) {
+    let bytes = s.as_bytes();
+    oos_buf_write(addr, &(bytes.len() as u16).to_be_bytes());
+    oos_buf_write(addr, bytes);
+}
+
+/// Read a length-prefixed (u16) UTF-8 string written by [`write_lp_string`].
+fn read_lp_string(addr: usize) -> String {
+    let len_bytes = ois_buf_read(addr, 2);
+    if len_bytes.len() < 2 {
+        return String::new();
+    }
+    let len = u16::from_be_bytes([len_bytes[0], len_bytes[1]]) as usize;
+    let bytes = ois_buf_read(addr, len);
+    String::from_utf8_lossy(&bytes).to_string()
+}
+
+/// Write a single lambda-capture value. Object/array captures recurse through
+/// the shared reference writer (handles + nested graphs); primitives are
+/// packed in their *wide* form (`Z`/`B`/`S`/`C` as a 4-byte int, like the
+/// JDK's field block read by [`read_field_value`]) so the read side can decode
+/// each capture with `read_field_value` symmetrically.
+fn oos_write_capture(
+    ctx: &mut dyn NativeContext,
+    addr: usize,
+    type_code: char,
+    val: &Value,
+) -> MethodCallResult {
+    match type_code {
+        'L' | '[' => {
+            oos_write_value(ctx, addr, val)?;
+        }
+        'J' => oos_buf_write(addr, &val.as_long().unwrap_or(0).to_be_bytes()),
+        'D' => {
+            let d = match val {
+                Value::Double(d) => *d,
+                _ => 0.0,
+            };
+            oos_buf_write(addr, &d.to_be_bytes());
+        }
+        'F' => {
+            let f = match val {
+                Value::Float(f) => *f,
+                _ => 0.0,
+            };
+            oos_buf_write(addr, &f.to_be_bytes());
+        }
+        // 'I', 'Z', 'B', 'S', 'C' and any unexpected code: 4-byte int.
+        _ => oos_buf_write(addr, &val.as_int().unwrap_or(0).to_be_bytes()),
+    }
+    Ok(None)
+}
+
+/// Reconstruct a serialized lambda (the `SERIALIZED_LAMBDA_CLASS` record whose
+/// descriptor has just been consumed by [`read_class_descriptor`]). Re-registers
+/// an equivalent lambda proxy via [`NativeContext::register_lambda_proxy`] and
+/// allocates a proxy instance with the captured values, so the deserialized
+/// SAM dispatches to the same implementation method as the original.
+fn reconstruct_serialized_lambda(ctx: &mut dyn NativeContext, addr: usize) -> Value {
+    let functional_interface = read_lp_string(addr);
+    let sam_method_name = read_lp_string(addr);
+    let sam_descriptor = read_lp_string(addr);
+    let impl_class = read_lp_string(addr);
+    let impl_member = read_lp_string(addr);
+    let impl_descriptor = read_lp_string(addr);
+    let instantiated_descriptor = read_lp_string(addr);
+    let capture_types = read_lp_string(addr);
+    let ref_kind = ois_buf_read(addr, 1).first().copied().unwrap_or(6);
+    let count_bytes = ois_buf_read(addr, 4);
+    let count = if count_bytes.len() == 4 {
+        i32::from_be_bytes([count_bytes[0], count_bytes[1], count_bytes[2], count_bytes[3]]).max(0)
+            as usize
+    } else {
+        0
+    };
+    let capture_chars: Vec<char> = capture_types.chars().collect();
+
+    let proxy_raw = ctx.register_lambda_proxy(
+        &functional_interface,
+        &sam_method_name,
+        &sam_descriptor,
+        &impl_class,
+        &impl_member,
+        &impl_descriptor,
+        ref_kind,
+        &instantiated_descriptor,
+        &capture_types,
+    );
+
+    // Proxy registration failed (test mock / table full): still consume the
+    // capture bytes so the stream stays aligned, then yield null.
+    if proxy_raw == 0 {
+        ois_push_handle(addr, None);
+        for i in 0..count {
+            let tc = capture_chars.get(i).copied().unwrap_or('L');
+            let _ = read_field_value(ctx, addr, tc);
+        }
+        return Value::Object(None);
+    }
+
+    let proxy_cid = ClassId::new(proxy_raw);
+    let obj = ctx.alloc_object(proxy_cid, count);
+    // Assign the wire handle before decoding captures (mirrors the writer,
+    // which assigned the lambda's handle ahead of its payload).
+    ois_push_handle(addr, Some(obj));
+    for i in 0..count {
+        let tc = capture_chars.get(i).copied().unwrap_or('L');
+        let v = read_field_value(ctx, addr, tc);
+        ctx.set_field(obj, i, v);
+    }
+    Value::Object(Some(obj))
+}
+
 /// Recursively serialize one reference value (`null`, `String`, array, or a
 /// nested Serializable/Externalizable object), handling back-reference
 /// (cycle) detection via the per-stream wire-handle table. This is shared by
@@ -1214,6 +1336,51 @@ fn oos_write_value(ctx: &mut dyn NativeContext, addr: usize, val: &Value) -> Met
         return oos_write_array(ctx, addr, obj, &class_name);
     }
 
+    // Serializable lambdas. A synthetic `$$Lambda` proxy class is not loadable
+    // by name, so the real JDK replaces a serializable lambda with a
+    // `SerializedLambda` on write (a compiler-generated `writeReplace`) and
+    // reconstructs it on read. We do the equivalent: emit a self-describing
+    // record carrying the lambda call-site metadata plus the captured values,
+    // keyed by `SERIALIZED_LAMBDA_CLASS` so the read path can rebuild it.
+    // Without this, serializing an object that holds a serializable lambda
+    // (e.g. Spring's `TypeDescriptor`, whose `annotatedElementSupplier` field
+    // is a `() -> ...` lambda) fails on read with
+    // `ClassNotFoundException: <host>$$Lambda/0x...`. Must precede the
+    // serializability check — our proxy class carries no `Serializable` stamp.
+    if let Some(meta) = ctx.lambda_proxy_serial_metadata(class_id) {
+        // Assign the wire handle before the payload (cyclic-graph safety).
+        {
+            let mut registry = handle_registry().lock().unwrap_or_else(|e| e.into_inner());
+            registry
+                .entry(addr)
+                .or_insert_with(HandleState::new)
+                .assign_handle(obj_addr);
+        }
+        oos_buf_write(addr, &[TC_OBJECT]);
+        let svuid = compute_default_svuid(SERIALIZED_LAMBDA_CLASS);
+        write_class_desc(addr, SERIALIZED_LAMBDA_CLASS, svuid, SC_SERIALIZABLE, &[]);
+        for s in [
+            meta.functional_interface.as_str(),
+            meta.sam_method_name.as_str(),
+            meta.sam_descriptor.as_str(),
+            meta.impl_class.as_str(),
+            meta.impl_member.as_str(),
+            meta.impl_descriptor.as_str(),
+            meta.instantiated_descriptor.as_str(),
+            meta.capture_types.as_str(),
+        ] {
+            write_lp_string(addr, s);
+        }
+        oos_buf_write(addr, &[meta.impl_ref_kind]);
+        let capture_chars: Vec<char> = meta.capture_types.chars().collect();
+        oos_buf_write(addr, &(capture_chars.len() as i32).to_be_bytes());
+        for (i, tc) in capture_chars.iter().enumerate() {
+            let v = ctx.get_field(obj, i);
+            oos_write_capture(ctx, addr, *tc, &v)?;
+        }
+        return Ok(None);
+    }
+
     // Reject non-Serializable classes the way the JDK does.
     if !class_is_serializable(ctx, class_id) {
         return Err(RuntimeError::IOException {
@@ -1233,6 +1400,35 @@ fn oos_write_value(ctx: &mut dyn NativeContext, addr: usize, val: &Value) -> Met
             .entry(addr)
             .or_insert_with(HandleState::new)
             .assign_handle(obj_addr);
+    }
+
+    // Synthetic unmodifiable / immutable collection wrappers
+    // (`Collections.unmodifiable*`, `List.of`/`Set.of`/`Map.of`). These are
+    // `Serializable` in the real JDK but carry no real bytecode fields, so the
+    // generic declared-fields marshaller below would emit an empty object and
+    // drop the backing collection. Emit an explicit two-field record — slot 0
+    // (`L` backing collection) and slot 1 (`I` immutable marker) — which the
+    // read path restores positionally onto a freshly-stamped wrapper. The
+    // iterator wrappers (`UnmodifiableItr`/`ListItr`) are not `Serializable`
+    // and correctly fall through to the rejection above.
+    if class_name.starts_with("cratonvm/internal/Unmodifiable") {
+        let backing = ctx.get_field(obj, 0);
+        let marker = match ctx.get_field(obj, 1) {
+            Value::Int(i) => i,
+            _ => 0,
+        };
+        let svuid = compute_default_svuid(&class_name);
+        oos_buf_write(addr, &[TC_OBJECT]);
+        write_class_desc(
+            addr,
+            &class_name,
+            svuid,
+            SC_SERIALIZABLE,
+            &[('L', "backing"), ('I', "marker")],
+        );
+        oos_write_value(ctx, addr, &backing)?;
+        oos_write_primitive(addr, 'I', &Value::Int(marker));
+        return Ok(None);
     }
 
     // Externalizable: emit the header, then let the class's writeExternal
@@ -1986,6 +2182,12 @@ fn ois_read_object(ctx: &mut dyn NativeContext, addr: usize) -> Value {
     // `IOException("filter status: REJECTED: ...")`.
     if synthetic_read_class_rejected(addr, &desc.class_name) {
         return Value::Object(None);
+    }
+    // Serialized-lambda record (written by `oos_write_value` for a synthetic
+    // `$$Lambda` proxy): reconstruct an equivalent lambda proxy rather than
+    // attempting to instantiate the sentinel class.
+    if desc.class_name == SERIALIZED_LAMBDA_CLASS {
+        return reconstruct_serialized_lambda(ctx, addr);
     }
     let resolved = ctx.ensure_class_initialized(&desc.class_name);
     let serialized_count = desc.field_types.len().max(2);

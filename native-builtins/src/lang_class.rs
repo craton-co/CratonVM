@@ -4793,6 +4793,72 @@ fn args_match_descriptor_exactly(
     true
 }
 
+/// Build a `java.lang.invoke.SerializedLambda` standing in for the lambda
+/// `proxy`, populated from its registered call-site metadata and captured
+/// field values. This is the value the JVM's generated `writeReplace()` would
+/// return; real `ObjectOutputStream` serializes it, and `readResolve()` on the
+/// other side reconstructs the lambda via the capturing class's generated
+/// `$deserializeLambda$` (which re-runs the lambda's invokedynamic).
+fn build_serialized_lambda(
+    ctx: &mut dyn NativeContext,
+    proxy_cid: ClassId,
+    proxy: ObjectRef,
+    meta: &cratonvm_native_api::LambdaSerialMetadata,
+) -> MethodCallResult {
+    let sl_cid = match ctx.ensure_class_initialized("java/lang/invoke/SerializedLambda") {
+        Ok(id) => id,
+        // No real SerializedLambda class (e.g. synthetic-jdk mode): fall back to
+        // returning the proxy unchanged so the caller's serialization proceeds
+        // via its own path rather than NPE-ing here.
+        Err(_) => return Ok(Some(Value::Object(Some(proxy)))),
+    };
+
+    // Capturing class = where the lambda's invokedynamic appears (the class
+    // whose `$deserializeLambda$` will reconstruct it). Falls back to the impl
+    // class for proxies created off the indy path (e.g. reflective factories).
+    let capturing_name = ctx
+        .lambda_proxy_host(proxy_cid)
+        .unwrap_or_else(|| meta.impl_class.clone());
+    let capturing_mirror = match ctx.class_id_by_name(&capturing_name) {
+        Some(cid) => Value::Object(Some(ctx.get_class_mirror(cid))),
+        None => Value::Object(None),
+    };
+
+    // capturedArgs: one (boxed) value per proxy capture field, in order.
+    let capture_chars: Vec<char> = meta.capture_types.chars().collect();
+    let captured = ctx.new_ref_array(ClassId::new(0), capture_chars.len());
+    for (i, tc) in capture_chars.iter().enumerate() {
+        let raw = ctx.get_field(proxy, i);
+        let boxed = box_value(ctx, raw, &tc.to_string());
+        ctx.set_array_element(captured, i, boxed);
+    }
+
+    let total = ctx.class_num_total_fields(sl_cid).max(10);
+    let sl = ctx.alloc_object(sl_cid, total);
+    ctx.set_field_by_name(sl, "capturingClass", capturing_mirror);
+    let fic = ctx.create_string(&meta.functional_interface);
+    ctx.set_field_by_name(sl, "functionalInterfaceClass", Value::Object(Some(fic)));
+    let fimn = ctx.create_string(&meta.sam_method_name);
+    ctx.set_field_by_name(sl, "functionalInterfaceMethodName", Value::Object(Some(fimn)));
+    let fims = ctx.create_string(&meta.sam_descriptor);
+    ctx.set_field_by_name(
+        sl,
+        "functionalInterfaceMethodSignature",
+        Value::Object(Some(fims)),
+    );
+    let ic = ctx.create_string(&meta.impl_class);
+    ctx.set_field_by_name(sl, "implClass", Value::Object(Some(ic)));
+    let imn = ctx.create_string(&meta.impl_member);
+    ctx.set_field_by_name(sl, "implMethodName", Value::Object(Some(imn)));
+    let ims = ctx.create_string(&meta.impl_descriptor);
+    ctx.set_field_by_name(sl, "implMethodSignature", Value::Object(Some(ims)));
+    ctx.set_field_by_name(sl, "implMethodKind", Value::Int(meta.impl_ref_kind as i32));
+    let imt = ctx.create_string(&meta.instantiated_descriptor);
+    ctx.set_field_by_name(sl, "instantiatedMethodType", Value::Object(Some(imt)));
+    ctx.set_field_by_name(sl, "capturedArgs", Value::Object(Some(captured)));
+    Ok(Some(Value::Object(Some(sl))))
+}
+
 pub(crate) fn native_method_invoke(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -4848,6 +4914,29 @@ pub(crate) fn native_method_invoke(
         Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
         _ => String::new(),
     };
+
+    // Serializable-lambda support: `ObjectOutputStream` reflectively invokes
+    // the synthetic `writeReplace()` we expose on lambda proxies (see
+    // `declared_methods_with_synthetic`) to obtain a `SerializedLambda`
+    // stand-in. Handle it before the access check — the synthetic method is
+    // private and `ObjectStreamClass` may invoke it without first toggling the
+    // reflective `accessible` flag, which would otherwise raise
+    // IllegalAccessException. Build the record from the proxy's call-site
+    // metadata + captured fields so real OOS writes a portable form (which
+    // deserializes via the JVM-generated `$deserializeLambda$` + invokedynamic
+    // path) instead of the un-loadable `$$Lambda` class name.
+    if method_name == "writeReplace" {
+        let wr_desc = method_descriptor_for_invoke(ctx, this);
+        if wr_desc == "()Ljava/lang/Object;" {
+            if let Some(Value::Object(Some(recv))) = args.get(1) {
+                let recv = *recv;
+                let rcid = ctx.class_id_of_object(recv);
+                if let Some(meta) = ctx.lambda_proxy_serial_metadata(rcid) {
+                    return build_serialized_lambda(ctx, rcid, recv, &meta);
+                }
+            }
+        }
+    }
 
     // Access control: accessible flag lives in a CratonVM extra slot.
     let accessible = read_method_accessible(ctx, this);
@@ -5711,6 +5800,29 @@ fn declared_methods_with_synthetic(
     class_id: ClassId,
 ) -> Vec<MethodMetadata> {
     let mut methods = ctx.declared_methods(class_id);
+
+    // Serializable-lambda support: a real JVM-spun lambda class carries a
+    // private `Object writeReplace()` that `ObjectOutputStream` (via
+    // `ObjectStreamClass.getInheritableMethod`) invokes to swap the lambda for
+    // a `SerializedLambda`. Our synthetic lambda proxies have no bytecode, so
+    // without exposing one here real OOS serializes the proxy by its
+    // un-loadable `$$Lambda` class name and deserialization throws
+    // ClassNotFoundException. Report the synthetic writeReplace so reflection
+    // finds it; `native_method_invoke` builds the SerializedLambda when it is
+    // actually called. (Private + declared on the proxy class itself, matching
+    // the real lambda, so `getInheritableMethod` accepts it.)
+    if is_lambda_proxy_id(class_id) && ctx.lambda_proxy_host(class_id).is_some() {
+        if !methods.iter().any(|m| m.name == "writeReplace") {
+            methods.push(MethodMetadata {
+                name: "writeReplace".to_string(),
+                descriptor: "()Ljava/lang/Object;".to_string(),
+                access_flags: 0x0002, // ACC_PRIVATE
+                declaring_class_id: class_id,
+                exceptions: Vec::new(),
+            });
+        }
+        return methods;
+    }
 
     let class_name = match ctx.class_name_of_id(class_id) {
         Some(n) => n,

@@ -129,6 +129,23 @@ impl MethodHandleKind {
             _ => None,
         }
     }
+
+    /// Convert back to the JVMS `reference_kind` byte (1..=9). Inverse of
+    /// [`Self::from_tag`]. Used when serializing a lambda's implementation
+    /// method handle into a `SerializedLambda`-equivalent record.
+    pub fn as_tag(self) -> u8 {
+        match self {
+            Self::GetField => 1,
+            Self::GetStatic => 2,
+            Self::PutField => 3,
+            Self::PutStatic => 4,
+            Self::InvokeVirtual => 5,
+            Self::InvokeStatic => 6,
+            Self::InvokeSpecial => 7,
+            Self::NewInvokeSpecial => 8,
+            Self::InvokeInterface => 9,
+        }
+    }
 }
 
 impl fmt::Display for MethodHandleKind {

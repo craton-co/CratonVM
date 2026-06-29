@@ -28,6 +28,7 @@ pub mod test_mock;
 
 pub use intrinsic::InterpIntrinsic;
 pub use registry::{
-    AnnotationData, AnnotationElementValue, DefineClassFull, FieldMetadata, MethodMetadata,
-    NativeCallback, NativeContext, NativeKind, NativeMethodRegistry, StackTraceEntry,
+    AnnotationData, AnnotationElementValue, DefineClassFull, FieldMetadata, LambdaSerialMetadata,
+    MethodMetadata, NativeCallback, NativeContext, NativeKind, NativeMethodRegistry,
+    StackTraceEntry,
 };

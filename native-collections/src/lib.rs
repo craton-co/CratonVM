@@ -24082,8 +24082,12 @@ fn native_ts_init_collection(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     ts_set_slot(ctx, this, TS_FIELD_DATA, Value::Object(Some(buf)));
     ts_set_slot(ctx, this, TS_FIELD_SIZE, Value::Int(0));
     ts_set_slot(ctx, this, TS_FIELD_COMPARATOR, Value::Object(None));
-    // Add elements from source
-    let elems = collect_collection_elements(ctx, source);
+    // Add elements from source. Use the `_or_real` collector so a foreign /
+    // real-bytecode source whose layout the heuristics can't read (e.g. a
+    // `Collections.unmodifiableMap(LinkedCaseInsensitiveMap).keySet()` view)
+    // is still drained via its real `toArray()` — otherwise `new TreeSet<>(
+    // someView)` comes out empty (mirrors `native_hs_add_all`).
+    let elems = collect_collection_elements_or_real(ctx, source);
     for e in elems {
         native_ts_add(ctx, &[Value::Object(Some(this)), e])?;
     }
@@ -24709,7 +24713,12 @@ fn native_ts_add_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let elems = collect_collection_elements(ctx, source);
+    // `_or_real`: see `native_ts_init_collection` — a foreign source view
+    // (e.g. an unmodifiable map's keySet over a real-bytecode backing map)
+    // returns no elements from the layout heuristics, so fall back to its
+    // real `toArray()`. Without this, `TreeSet.addAll(map.keySet())` was a
+    // silent no-op (MimeType.compareTo's case-sensitive parameter check).
+    let elems = collect_collection_elements_or_real(ctx, source);
     let mut changed = false;
     for e in elems {
         let result = native_ts_add(ctx, &[Value::Object(Some(this)), e])?;
