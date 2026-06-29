@@ -4650,6 +4650,12 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         "()Ljava/lang/reflect/AnnotatedType;",
         lang_class::native_parameter_get_annotated_type,
     );
+    registry.register(
+        "java/lang/reflect/Field",
+        "getAnnotatedType",
+        "()Ljava/lang/reflect/AnnotatedType;",
+        lang_class::native_field_get_annotated_type,
+    );
     // Native dispatch keys on the concrete reflective class (see how
     // `getParameterAnnotations` is registered on Method/Constructor, not the
     // shared Executable), so register on both rather than Executable.

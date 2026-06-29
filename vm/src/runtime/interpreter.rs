@@ -17337,6 +17337,11 @@ fn force_native_over_real_jdk_bytecode(
                 "()Ljava/lang/reflect/AnnotatedType;"
             )
             | (
+                "java/lang/reflect/Field",
+                "getAnnotatedType",
+                "()Ljava/lang/reflect/AnnotatedType;"
+            )
+            | (
                 "sun/reflect/annotation/AnnotatedTypeFactory$AnnotatedTypeBaseImpl",
                 "getAnnotation",
                 "(Ljava/lang/Class;)Ljava/lang/annotation/Annotation;"

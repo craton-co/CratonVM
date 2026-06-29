@@ -5652,6 +5652,24 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         Vec::new()
     }
 
+    fn field_type_annotations(
+        &self,
+        class_id: ClassId,
+        field_name: &str,
+    ) -> Vec<crate::native::registry::AnnotationData> {
+        let cm = self.shared.class_manager.read();
+        let class = match cm.get_class(class_id) {
+            Some(c) => c,
+            None => return Vec::new(),
+        };
+        for f in &class.fields {
+            if &*f.name == field_name {
+                return extract_field_type_annotations(&f.attributes, &class.constant_pool);
+            }
+        }
+        Vec::new()
+    }
+
     fn method_annotation_default(
         &self,
         class_id: ClassId,
@@ -6548,13 +6566,6 @@ pub(super) fn extract_return_type_annotations(
             None => continue,
         };
         if let Attribute::RuntimeVisibleTypeAnnotations(tas) = attr {
-            if std::env::var_os("CRATONVM_TYPEANN_DBG").is_some() {
-                eprintln!(
-                    "[typeann-dbg] extract_return: found RVTA with {} entries, targets={:?}",
-                    tas.len(),
-                    tas.iter().map(|t| t.target_type).collect::<Vec<_>>()
-                );
-            }
             return tas
                 .iter()
                 .filter(|ta| ta.target_type == TARGET_METHOD_RETURN && ta.type_path.is_empty())
@@ -6600,6 +6611,31 @@ pub(super) fn extract_parameter_type_annotations(
                 }
             }
             return out;
+        }
+    }
+    Vec::new()
+}
+
+/// Extract TYPE_USE annotations targeting a field's type (`target_type` 0x13,
+/// FIELD) with an empty `type_path`. Backs
+/// `Field.getAnnotatedType().getDeclaredAnnotations()`.
+pub(super) fn extract_field_type_annotations(
+    attributes: &[cratonvm_reader::attribute::LazyAttribute],
+    cp: &cratonvm_reader::constant_pool::ConstantPool,
+) -> Vec<crate::native::registry::AnnotationData> {
+    use cratonvm_reader::attribute::Attribute;
+    const TARGET_FIELD: u8 = 0x13;
+    for lazy in attributes {
+        let attr = match lazy.as_decoded() {
+            Some(a) => a,
+            None => continue,
+        };
+        if let Attribute::RuntimeVisibleTypeAnnotations(tas) = attr {
+            return tas
+                .iter()
+                .filter(|ta| ta.target_type == TARGET_FIELD && ta.type_path.is_empty())
+                .filter_map(|ta| convert_annotation(&ta.annotation, cp))
+                .collect();
         }
     }
     Vec::new()
@@ -11384,6 +11420,8 @@ fn invoke_on_class_shared_inner(
                         || (class_name == "java/lang/reflect/Constructor"
                             && method_name == "getAnnotatedParameterTypes")
                         || (class_name == "java/lang/reflect/Parameter"
+                            && method_name == "getAnnotatedType")
+                        || (class_name == "java/lang/reflect/Field"
                             && method_name == "getAnnotatedType")
                         // Accessor overrides for the AnnotatedTypes we build (they
                         // stash an `Annotation[]` where the real impl keeps a `Map`).
