@@ -1272,19 +1272,53 @@ pub fn register(registry: &mut NativeMethodRegistry) {
             // re-entrant currency initialization (Kafka 4.2.0 boot path).
             ctx.set_field_by_name(this, "locale", locale);
             ctx.set_field_by_name(this, "currencyInitialized", Value::Int(1));
+            // Locale-aware decimal/grouping separators. The JDK's per-locale
+            // CLDR data lives in `jdk.localedata`, which CratonVM doesn't
+            // surface, so derive the two separators that actually vary by
+            // language from the locale's language tag (curated, like the
+            // `getDateTimePattern` override). Without this, every locale got the
+            // en/US separators and e.g. German `NumberFormat.parse("1,1")`
+            // returned 11.0 instead of 1.1 (Spring DLBF customEditor/converter).
+            // All other symbols are locale-invariant across the locales the
+            // suite exercises. (dec, grp): en='.'/',' ; de=','/'.' ;
+            // fr=','/' ' (narrow no-break space).
+            let lang = match locale {
+                Value::Object(Some(loc)) => match ctx.invoke_virtual(
+                    loc,
+                    "getLanguage",
+                    "()Ljava/lang/String;",
+                    &[],
+                ) {
+                    Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s).unwrap_or_default(),
+                    _ => String::new(),
+                },
+                _ => String::new(),
+            };
+            let (dec_sep, grp_sep): (char, char) = match lang.as_str() {
+                // Comma-decimal / dot-grouping family (German, Spanish, Italian,
+                // Dutch, Portuguese, Danish, Polish, …). Verified against JDK 25
+                // for de; the others share the CLDR ','/'.' convention.
+                "de" | "es" | "it" | "nl" | "pt" | "da" | "pl" | "ro" | "el" | "tr" | "id" => {
+                    (',', '.')
+                }
+                // French uses a narrow no-break space (U+202F) for grouping.
+                "fr" => (',', '\u{202F}'),
+                // en and everything else: US/root separators.
+                _ => ('.', ','),
+            };
             // Set every public char/string field via the corresponding
             // setter so we don't depend on instance-field layout.
             let _ = ctx.invoke_virtual(
                 this,
                 "setDecimalSeparator",
                 "(C)V",
-                &[Value::Int('.' as i32)],
+                &[Value::Int(dec_sep as i32)],
             );
             let _ = ctx.invoke_virtual(
                 this,
                 "setGroupingSeparator",
                 "(C)V",
-                &[Value::Int(',' as i32)],
+                &[Value::Int(grp_sep as i32)],
             );
             let _ = ctx.invoke_virtual(
                 this,
@@ -1322,7 +1356,7 @@ pub fn register(registry: &mut NativeMethodRegistry) {
                 this,
                 "setMonetaryDecimalSeparator",
                 "(C)V",
-                &[Value::Int('.' as i32)],
+                &[Value::Int(dec_sep as i32)],
             );
             let cs = ctx.create_string("$");
             let _ = ctx.invoke_virtual(
