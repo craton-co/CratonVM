@@ -1708,9 +1708,22 @@ fn native_properties_values(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     Ok(Some(Value::Object(Some(list))))
 }
 
-/// Native `Properties.entrySet()Ljava/util/Set;` — returns a synthetic
-/// HashSet of `AbstractMap.SimpleImmutableEntry` objects.  Spring's
-/// binder iterates this to enumerate `(key,value)` pairs.
+/// Native `Properties.entrySet()Ljava/util/Set;` — returns a **live** view of
+/// the side-table backed by this Properties object.  Each element is a 3-field
+/// `java/util/Map$Entry` (key, value, sourceMap=this), so `entry.setValue(v)`
+/// writes through to the side-table (via the receiver's virtual `put`), and the
+/// set's `iterator().remove()` deletes the key from the side-table (via the
+/// receiver's virtual `remove`).  This matches the JDK live-entrySet contract
+/// that Hibernate's `ConfigurationHelper.resolvePlaceHolders` relies on
+/// (`entries.setValue(resolved)` / `entries.remove()` while interpolating
+/// `${...}` placeholders).  The previous implementation returned detached
+/// `SimpleImmutableEntry` objects whose `setValue` threw
+/// `UnsupportedOperationException`.
+///
+/// Spring's `SpringFactoriesLoader` / binder still iterate the set the same way
+/// — the returned `java/util/HashSet` is a synthetic view-backed set (via
+/// `make_static_entry_set`), the same shape `HashMap.entrySet()` returns
+/// natively, so enumeration is unchanged.
 fn native_properties_entry_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
@@ -1734,64 +1747,39 @@ fn native_properties_entry_set(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     for (k, _v) in snapshot.iter().take(5) {
         props_diag_eprintln!("[PROPS-DBG]   entry key={}", k);
     }
-    // Build a real-JDK HashSet by allocating it via new_object + <init>
-    // and populating via HashSet.add(Object). This routes through real
-    // HashMap.put bytecode, ensuring the bucket array (`table`) is populated
-    // in a way that real-JDK HashSet/Map iterators can walk. Going through
-    // `make_hashset_with_elements`'s raw-field path produced a HashMap whose
-    // `size` field reported correctly but whose `table` did not align with
-    // what the real-JDK iterator expected, so iteration silently yielded 0
-    // entries — breaking Spring's SpringFactoriesLoader (which iterates
-    // properties.entrySet() to build the EnableAutoConfiguration list).
-    let set = match ctx.new_object("java/util/HashSet") {
-        Ok(Some(Value::Object(Some(o)))) => o,
-        _ => {
-            // Fallback: synthetic empty HashSet via collections helper.
-            let empty = cratonvm_native_collections::make_hashset_with_elements(ctx, &[]);
-            return Ok(Some(Value::Object(Some(empty))));
-        }
-    };
-    let _ = ctx.invoke(
-        "java/util/HashSet",
-        "<init>",
-        "()V",
-        &[Value::Object(Some(set))],
-    );
+    // Collect (key, value) pairs: the side-table String entries first, then any
+    // CHM-exclusive entries (non-String values, e.g. a `Class` deserializer) so
+    // consumers that enumerate `entrySet()` — Kafka's `AbstractConfig`, Spring's
+    // `SpringFactoriesLoader`, `HashMap.putAll(props)` via the generic Map
+    // iterator — observe the full map. Real stored value objects are reused.
+    let mut pairs: Vec<(Value, Value)> = Vec::with_capacity(snapshot.len());
     for (k, v) in &snapshot {
-        let entry =
-            crate::alloc_concurrent_synthetic(ctx, "java/util/AbstractMap$SimpleImmutableEntry", 2);
         let ks = ctx.create_string(k);
         let vs = ctx.create_string(v);
-        // Use field-by-name to handle any inherited-field offset (real-JDK
-        // SimpleImmutableEntry has only `key` and `value`, but be safe).
-        ctx.set_field_by_name(entry, "key", Value::Object(Some(ks)));
-        ctx.set_field_by_name(entry, "value", Value::Object(Some(vs)));
-        let _ = ctx.invoke_virtual(
-            set,
-            "add",
-            "(Ljava/lang/Object;)Z",
-            &[Value::Object(Some(entry))],
-        );
+        pairs.push((Value::Object(Some(ks)), Value::Object(Some(vs))));
     }
-    // Merge CHM-exclusive entries (non-String values, e.g. a `Class`
-    // deserializer) so consumers that enumerate `entrySet()` — Kafka's
-    // `AbstractConfig` constructor, Spring's `SpringFactoriesLoader`,
-    // `HashMap.putAll(props)` via the generic Map iterator — observe the full
-    // map. The real stored value object is reused verbatim.
     let side_keys: std::collections::HashSet<String> =
         snapshot.iter().map(|(k, _v)| k.clone()).collect();
     for (key_obj, value, _kstr) in chm_extra_entries(ctx, this, &side_keys) {
-        let entry =
-            crate::alloc_concurrent_synthetic(ctx, "java/util/AbstractMap$SimpleImmutableEntry", 2);
-        ctx.set_field_by_name(entry, "key", Value::Object(Some(key_obj)));
-        ctx.set_field_by_name(entry, "value", value);
-        let _ = ctx.invoke_virtual(
-            set,
-            "add",
-            "(Ljava/lang/Object;)Z",
-            &[Value::Object(Some(entry))],
-        );
+        pairs.push((Value::Object(Some(key_obj)), value));
     }
+    // Build a STATIC entrySet view backed by this Properties object. Each
+    // element is a 3-field live `java/util/Map$Entry` (key@0, value@1,
+    // sourceMap@2=this): `entry.setValue(v)` writes through to the side-table
+    // (`native_entry_set_value` dispatches the backing `put` virtually for a
+    // Hashtable/Properties source) and the set's `iterator().remove()` /
+    // `remove(entry)` delete the key from the side-table (the view backing's
+    // `source_map_remove`). This is what Hibernate's
+    // `ConfigurationHelper.resolvePlaceHolders` requires.
+    //
+    // The view is STATIC (never resynced from the source) on purpose: a normal
+    // resyncing entrySet view rebuilds its contents on every `iterator()` /
+    // `size()` by walking the source's `entrySet()`, which for a Properties
+    // (side-table, not natively-readable buckets) would recurse straight back
+    // into this method and collapse to an empty iterator. Tagging the backing —
+    // rather than the entries — as the write-through carrier also keeps a later
+    // `new HashSet<>(props.entrySet())` copy correctly detached on `remove`.
+    let set = cratonvm_native_collections::make_static_entry_set(ctx, this, &pairs);
     Ok(Some(Value::Object(Some(set))))
 }
 
