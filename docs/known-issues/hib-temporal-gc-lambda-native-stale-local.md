@@ -1,7 +1,16 @@
 # Hibernate `type.temporal.*` crash — moving young GC strands lambda refs in native stream/collection intrinsics
 
 **Severity:** High (process aborts rc=1 mid-class, no `@@RESULT`; also flaky SIGSEGV / rc=139).
-**Status:** 🟠 OPEN (root-caused; fix in progress — per-native pinning).
+**Status:** 🟠 PARTIALLY FIXED. Per-native pinning (this commit) corrects the stale-Rust-local bug in the
+stream/collection natives that drove the clean `java/lang/Object.<sam>` linkage-error crash — those natives
+now re-read every held ref from its pin handle after each allocating dispatch, so they can no longer
+dispatch on a relocated slot. The crash rate dropped markedly (repeated InstantTests runs now reach
+`@@RESULT/@@DONE` instead of aborting early on the stream path). A **distinct residual** remains: a broader
+GC missed-root reclamation that zeroes a connected set of *concurrency / JUnit* objects
+(`AbstractQueuedSynchronizer`, `ThreadPoolExecutor`, `ScheduledFuture`, `NodeTestTask`) in a single
+collection → "Stale pointer in invokevirtual receiver (all-zero header)" storm → SIGSEGV (~1 in 3 runs at
+the default heap). That residual is the **GC root-coverage family** (see #15 lost-tag missed-root and #18
+blocked-thread frame `Thread`-mirror reclamation), NOT a stream native — per-native pinning cannot fix it.
 **Mode:** Interpreter (default and `--nojit`). **HotSpot (JDK 25):** PASS.
 **Affected classes (5):** `org.hibernate.orm.test.type.temporal.{InstantTests, LocalDateTimeTest,
 OffsetDateTimeTest, OffsetTimeTest, ZonedDateTimeTest}`.
@@ -62,12 +71,26 @@ A **different culprit native each run** (the corruption is timing-dependent), co
 
 ## Fix
 
-**Path 1 (in progress) — per-native pinning.** Apply the established
-`pin_native_root` / `read_native_pin` / `unpin_native_roots` pattern to every stream/collection native that
-holds a ref across `ctx.invoke_virtual` (the lazy `native_stream_for_each` path, `drain_spliterator_to_array`
-and `materialize_lazy_stream` already do this correctly — use them as the template). Pin the lambda, the
-backing array, `this`, and every materialized element; re-read each from its pin handle on every loop
-iteration; re-read `this` before any post-loop `set_field`.
+**Path 1 (DONE for the lambda-stale-local crash) — per-native pinning.** Applied the established
+`pin_native_root` / `read_native_pin` / `unpin_native_roots` pattern to the stream/collection natives that
+hold a ref across `ctx.invoke_virtual` (the lazy `native_stream_for_each` path, `native_al_for_each`,
+`native_stream_peek`, `drain_spliterator_to_array`, `materialize_lazy_stream` already did this). Fixed in
+`native-collections/src/lib.rs` (new `read_pinned_elem` helper + index-permutation sort to keep pinned
+elements stable across a reorder): `native_stream_for_each` (eager path), `native_stream_sorted` /
+`native_stream_sorted_cmp`, `native_spliterator_for_each_remaining`, `native_stream_filter`,
+`native_stream_map`, `native_map_for_each`, `native_hs_for_each`. Pattern: pin the lambda + every
+materialized element (and freshly-produced results), re-read each from its handle before the (allocating)
+dispatch, and re-read `this` before any post-loop `set_field`. This removes the `[lambda-stray]` crash.
+
+**Still-unpinned siblings (same pattern, lower-priority — not on the observed temporal path):**
+`native_stream_distinct`, `native_stream_flat_map`, `native_stream_reduce_*`, `native_stream_{any,all}_match`,
+`native_stream_{min,max}`, `native_al_sort_comparator`, `native_al_remove_if`, `native_al_replace_all`.
+
+**Do NOT** try to fix this by forcing the non-moving sweep when a native is active: it re-triggers the
+documented [`HIB-CV-33`](HIB-CV-33-sigsegv-execute-fault-joined-inheritance-sf-build.md) precise-root
+reclaim gap (`gen_heap.rs` — the non-moving sweep without conservative roots reclaims live precise-rooted
+objects), which zeroes the *pinned* proxy in place (`recv_in_pins=true` yet `recv_cid=0`). Pinning in the
+moving Cheney collector itself is not possible ("a semispace cannot pin").
 
 **Do NOT** try to fix this by forcing the non-moving sweep when a native is active: it re-triggers the
 documented [`HIB-CV-33`](HIB-CV-33-sigsegv-execute-fault-joined-inheritance-sf-build.md) precise-root
