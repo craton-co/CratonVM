@@ -1028,6 +1028,421 @@ pub fn build_lookup_subclass(
     (new_name, bytes)
 }
 
+// ===========================================================================
+// Method-replacement (`<replaced-method>` / `ReplaceOverride`) subclass.
+//
+// Spring's `<replaced-method>` declares that a bean method should be replaced
+// at runtime by a `MethodReplacer` bean. Real CGLIB generates a subclass whose
+// override dispatches into `ReplaceOverrideMethodInterceptor`; that bytecode-
+// generation pipeline is incomplete in this VM (see `cce_enhance`'s note), so
+// we emit the equivalent subclass directly. For each replaced method we mirror
+// `ReplaceOverrideMethodInterceptor.intercept` + `processReturnType`:
+//
+//   MethodReplacer mr = (MethodReplacer) bf.getBean("<replacer>", MethodReplacer.class);
+//   Method m = <Super>.class.getDeclaredMethod("<name>", <paramTypes>);
+//   Object r = mr.reimplement(this, m, new Object[]{ <boxed args> });
+//   if (<primitive return> && r == null)
+//       throw new IllegalStateException(
+//           "Null return value from MethodReplacer does not match primitive return type for: " + m);
+//   return <unbox/cast r>;
+//
+// The owning factory is stored into `$$beanFactory` by the instantiation shim
+// right after `new_object`, exactly like the lookup-method subclass.
+// ===========================================================================
+
+/// One `<replaced-method>` / `ReplaceOverride` to materialise on the subclass.
+pub struct ReplaceMethodSpec {
+    /// Method name to override.
+    pub name: String,
+    /// JVM descriptor of the overridden method, e.g. `()Z` or `(Ljava/lang/String;)I`.
+    pub descriptor: String,
+    /// Bean name of the `MethodReplacer` to dispatch to.
+    pub replacer_bean_name: String,
+}
+
+/// Per-wrapper constant-pool indices for boxing args / unboxing the replacer
+/// result and the primitive `TYPE` field used to reconstruct the `Method`.
+struct WrapperRefs {
+    class_idx: u16,
+    valueof_ref: u16,
+    xvalue_ref: u16,
+    type_field_ref: u16,
+}
+
+/// Build the wrapper machinery for one primitive descriptor char.
+fn add_wrapper_refs(cw: &mut ClassWriter, ch: char) -> WrapperRefs {
+    let (cls, valueof_desc, xvalue_name, xvalue_desc) = match ch {
+        'I' => ("java/lang/Integer", "(I)Ljava/lang/Integer;", "intValue", "()I"),
+        'J' => ("java/lang/Long", "(J)Ljava/lang/Long;", "longValue", "()J"),
+        'F' => ("java/lang/Float", "(F)Ljava/lang/Float;", "floatValue", "()F"),
+        'D' => ("java/lang/Double", "(D)Ljava/lang/Double;", "doubleValue", "()D"),
+        'Z' => ("java/lang/Boolean", "(Z)Ljava/lang/Boolean;", "booleanValue", "()Z"),
+        'B' => ("java/lang/Byte", "(B)Ljava/lang/Byte;", "byteValue", "()B"),
+        'C' => ("java/lang/Character", "(C)Ljava/lang/Character;", "charValue", "()C"),
+        'S' => ("java/lang/Short", "(S)Ljava/lang/Short;", "shortValue", "()S"),
+        _ => ("java/lang/Integer", "(I)Ljava/lang/Integer;", "intValue", "()I"),
+    };
+    let class_idx = cw.add_class(cls);
+    let valueof_ref = cw.add_methodref(class_idx, "valueOf", valueof_desc);
+    let xvalue_ref = cw.add_methodref(class_idx, xvalue_name, xvalue_desc);
+    let type_field_ref = cw.add_fieldref(class_idx, "TYPE", "Ljava/lang/Class;");
+    WrapperRefs {
+        class_idx,
+        valueof_ref,
+        xvalue_ref,
+        type_field_ref,
+    }
+}
+
+/// Build a `<OriginalName>$$SpringCGLIB$$RMn` subclass overriding each replaced
+/// method. Returns the chosen internal name and the class-file bytes.
+pub fn build_replace_override_subclass(
+    super_internal_name: &str,
+    methods: &[ReplaceMethodSpec],
+) -> (String, Vec<u8>) {
+    let counter = ENHANCER_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let new_name = format!("{super_internal_name}$$SpringCGLIB$$RM{counter:x}");
+    let mut cw = ClassWriter::new();
+
+    let this_class_idx = cw.add_class(&new_name);
+    let super_class_idx = cw.add_class(super_internal_name);
+
+    let init_name_idx = cw.add_utf8("<init>");
+    let void_no_arg_desc_idx = cw.add_utf8("()V");
+    let code_attr_name_idx = cw.add_utf8("Code");
+    let super_init_methodref = cw.add_methodref(super_class_idx, "<init>", "()V");
+
+    let bf_field_name_idx = cw.add_utf8("$$beanFactory");
+    let object_desc_idx = cw.add_utf8("Ljava/lang/Object;");
+    let bf_field_ref = cw.add_fieldref(this_class_idx, "$$beanFactory", "Ljava/lang/Object;");
+
+    // Shared invocation machinery.
+    let beanfactory_cast_idx = cw.add_class("org/springframework/beans/factory/BeanFactory");
+    let getbean_name_type_ref = cw.add_interface_methodref(
+        beanfactory_cast_idx,
+        "getBean",
+        "(Ljava/lang/String;Ljava/lang/Class;)Ljava/lang/Object;",
+    );
+    let methodreplacer_cls = cw.add_class("org/springframework/beans/factory/support/MethodReplacer");
+    let reimplement_ref = cw.add_interface_methodref(
+        methodreplacer_cls,
+        "reimplement",
+        "(Ljava/lang/Object;Ljava/lang/reflect/Method;[Ljava/lang/Object;)Ljava/lang/Object;",
+    );
+    let class_cls = cw.add_class("java/lang/Class");
+    let getdeclaredmethod_ref = cw.add_methodref(
+        class_cls,
+        "getDeclaredMethod",
+        "(Ljava/lang/String;[Ljava/lang/Class;)Ljava/lang/reflect/Method;",
+    );
+    let object_cls = cw.add_class("java/lang/Object");
+    let ise_cls = cw.add_class("java/lang/IllegalStateException");
+    let ise_init_ref = cw.add_methodref(ise_cls, "<init>", "(Ljava/lang/String;)V");
+    let sb_cls = cw.add_class("java/lang/StringBuilder");
+    let sb_init_ref = cw.add_methodref(sb_cls, "<init>", "(Ljava/lang/String;)V");
+    let sb_append_obj_ref =
+        cw.add_methodref(sb_cls, "append", "(Ljava/lang/Object;)Ljava/lang/StringBuilder;");
+    let sb_tostring_ref = cw.add_methodref(sb_cls, "toString", "()Ljava/lang/String;");
+    let ise_prefix_str_idx = cw.add_string(
+        "Null return value from MethodReplacer does not match primitive return type for: ",
+    );
+
+    // Numeric primitive returns are unboxed via `((Number) result).xValue()` —
+    // matching CGLIB's `CodeEmitter.unbox`, which casts to `Number` (NOT the
+    // exact wrapper) so an `Integer` returned for a `byte`/`short`/`long`/`float`/
+    // `double` method narrows correctly (the test sets `returnValue = 123`, an
+    // Integer, for all numeric primitives). `boolean`/`char` cast to their exact
+    // wrapper (`Boolean`/`Character`).
+    let number_cls = cw.add_class("java/lang/Number");
+    let num_byte_value = cw.add_methodref(number_cls, "byteValue", "()B");
+    let num_short_value = cw.add_methodref(number_cls, "shortValue", "()S");
+    let num_int_value = cw.add_methodref(number_cls, "intValue", "()I");
+    let num_long_value = cw.add_methodref(number_cls, "longValue", "()J");
+    let num_float_value = cw.add_methodref(number_cls, "floatValue", "()F");
+    let num_double_value = cw.add_methodref(number_cls, "doubleValue", "()D");
+
+    // Per-wrapper refs (boxing args / unboxing result / primitive TYPE).
+    let wr_i = add_wrapper_refs(&mut cw, 'I');
+    let wr_j = add_wrapper_refs(&mut cw, 'J');
+    let wr_f = add_wrapper_refs(&mut cw, 'F');
+    let wr_d = add_wrapper_refs(&mut cw, 'D');
+    let wr_z = add_wrapper_refs(&mut cw, 'Z');
+    let wr_b = add_wrapper_refs(&mut cw, 'B');
+    let wr_c = add_wrapper_refs(&mut cw, 'C');
+    let wr_s = add_wrapper_refs(&mut cw, 'S');
+    let wrapper_for = |ch: char| -> &WrapperRefs {
+        match ch {
+            'I' => &wr_i,
+            'J' => &wr_j,
+            'F' => &wr_f,
+            'D' => &wr_d,
+            'Z' => &wr_z,
+            'B' => &wr_b,
+            'C' => &wr_c,
+            'S' => &wr_s,
+            _ => &wr_i,
+        }
+    };
+
+    let ctor = emit_default_ctor(
+        init_name_idx,
+        void_no_arg_desc_idx,
+        code_attr_name_idx,
+        super_init_methodref,
+    );
+    let bf_field = emit_bean_factory_field(bf_field_name_idx, object_desc_idx);
+    let mut method_bytes: Vec<Vec<u8>> = vec![ctor];
+
+    let b = |x: u16| x.to_be_bytes();
+    for m in methods {
+        let name_idx = cw.add_utf8(&m.name);
+        let desc_idx = cw.add_utf8(&m.descriptor);
+        let name_str_idx = cw.add_string(&m.name);
+        let replacer_str_idx = cw.add_string(&m.replacer_bean_name);
+
+        let params = parse_param_descriptors(&m.descriptor);
+        let ret = m
+            .descriptor
+            .split(')')
+            .nth(1)
+            .unwrap_or("V")
+            .to_string();
+        let ret_char = ret.chars().next().unwrap_or('V');
+        let primitive_ret = matches!(ret_char, 'I' | 'J' | 'F' | 'D' | 'Z' | 'B' | 'C' | 'S');
+
+        // Per-param Class constant indices (for getDeclaredMethod's Class[]).
+        let param_class_consts: Vec<Option<u16>> = params
+            .iter()
+            .map(|p| {
+                if p.starts_with('L') || p.starts_with('[') {
+                    let internal = if p.starts_with('L') && p.ends_with(';') {
+                        p[1..p.len() - 1].to_string()
+                    } else {
+                        p.clone() // array descriptor is a valid CONSTANT_Class name
+                    };
+                    Some(cw.add_class(&internal))
+                } else {
+                    None // primitive — use Wrapper.TYPE at emit time
+                }
+            })
+            .collect();
+        // Return-type checkcast class index for reference returns.
+        let ret_ref_class = if ret.starts_with('L') && ret.ends_with(';') {
+            Some(cw.add_class(&ret[1..ret.len() - 1]))
+        } else if ret.starts_with('[') {
+            Some(cw.add_class(&ret))
+        } else {
+            None
+        };
+
+        let base = 1u16 + param_slots(&params);
+        let mr_slot = base as u8;
+        let method_slot = (base + 1) as u8;
+        let args_slot = (base + 2) as u8;
+        let result_slot = (base + 3) as u8;
+        let max_locals = base + 4;
+
+        let mut code: Vec<u8> = Vec::new();
+
+        // (A) mr = (MethodReplacer) bf.getBean(replacer, MethodReplacer.class)
+        code.push(0x2A); // aload_0
+        code.push(0xB4); // getfield $$beanFactory
+        code.extend_from_slice(&b(bf_field_ref));
+        code.push(0xC0); // checkcast BeanFactory
+        code.extend_from_slice(&b(beanfactory_cast_idx));
+        code.push(0x13); // ldc_w "<replacer>"
+        code.extend_from_slice(&b(replacer_str_idx));
+        code.push(0x13); // ldc_w MethodReplacer.class
+        code.extend_from_slice(&b(methodreplacer_cls));
+        code.push(0xB9); // invokeinterface getBean(String,Class)
+        code.extend_from_slice(&b(getbean_name_type_ref));
+        code.push(0x03); // count = 3
+        code.push(0x00);
+        code.push(0xC0); // checkcast MethodReplacer
+        code.extend_from_slice(&b(methodreplacer_cls));
+        code.push(0x3A); // astore mr_slot
+        code.push(mr_slot);
+
+        // (B) method = Super.class.getDeclaredMethod(name, paramClasses)
+        code.push(0x13); // ldc_w Super.class
+        code.extend_from_slice(&b(super_class_idx));
+        code.push(0x13); // ldc_w "<name>"
+        code.extend_from_slice(&b(name_str_idx));
+        push_int(&mut code, params.len() as i32);
+        code.push(0xBD); // anewarray Class
+        code.extend_from_slice(&b(class_cls));
+        for (i, p) in params.iter().enumerate() {
+            code.push(0x59); // dup
+            push_int(&mut code, i as i32);
+            match param_class_consts[i] {
+                Some(cidx) => {
+                    code.push(0x13); // ldc_w <Param>.class
+                    code.extend_from_slice(&b(cidx));
+                }
+                None => {
+                    // primitive: getstatic Wrapper.TYPE
+                    let ch = p.chars().next().unwrap_or('I');
+                    code.push(0xB2); // getstatic
+                    code.extend_from_slice(&b(wrapper_for(ch).type_field_ref));
+                }
+            }
+            code.push(0x53); // aastore
+        }
+        code.push(0xB6); // invokevirtual Class.getDeclaredMethod
+        code.extend_from_slice(&b(getdeclaredmethod_ref));
+        code.push(0x3A); // astore method_slot
+        code.push(method_slot);
+
+        // (C) args = new Object[]{ boxed params }
+        push_int(&mut code, params.len() as i32);
+        code.push(0xBD); // anewarray Object
+        code.extend_from_slice(&b(object_cls));
+        let mut slot = 1u16;
+        for (i, p) in params.iter().enumerate() {
+            code.push(0x59); // dup
+            push_int(&mut code, i as i32);
+            let ch = p.chars().next().unwrap_or('L');
+            match ch {
+                'J' => {
+                    code.push(0x16); // lload
+                    code.push(slot as u8);
+                    code.push(0xB8); // invokestatic Long.valueOf
+                    code.extend_from_slice(&b(wr_j.valueof_ref));
+                    slot += 2;
+                }
+                'F' => {
+                    code.push(0x17); // fload
+                    code.push(slot as u8);
+                    code.push(0xB8);
+                    code.extend_from_slice(&b(wr_f.valueof_ref));
+                    slot += 1;
+                }
+                'D' => {
+                    code.push(0x18); // dload
+                    code.push(slot as u8);
+                    code.push(0xB8);
+                    code.extend_from_slice(&b(wr_d.valueof_ref));
+                    slot += 2;
+                }
+                'I' | 'Z' | 'B' | 'C' | 'S' => {
+                    code.push(0x15); // iload
+                    code.push(slot as u8);
+                    code.push(0xB8);
+                    code.extend_from_slice(&b(wrapper_for(ch).valueof_ref));
+                    slot += 1;
+                }
+                _ => {
+                    code.push(0x19); // aload (reference / array)
+                    code.push(slot as u8);
+                    slot += 1;
+                }
+            }
+            code.push(0x53); // aastore
+        }
+        code.push(0x3A); // astore args_slot
+        code.push(args_slot);
+
+        // (D) result = mr.reimplement(this, method, args)
+        code.push(0x19); // aload mr_slot
+        code.push(mr_slot);
+        code.push(0x2A); // aload_0 (this)
+        code.push(0x19); // aload method_slot
+        code.push(method_slot);
+        code.push(0x19); // aload args_slot
+        code.push(args_slot);
+        code.push(0xB9); // invokeinterface reimplement(Object,Method,Object[])
+        code.extend_from_slice(&b(reimplement_ref));
+        code.push(0x04); // count = 4
+        code.push(0x00);
+        code.push(0x3A); // astore result_slot
+        code.push(result_slot);
+
+        // (E) processReturnType + return.
+        if primitive_ret {
+            // Build the throw block first to size the ifnonnull branch.
+            let mut throw_block: Vec<u8> = Vec::new();
+            throw_block.push(0xBB); // new IllegalStateException
+            throw_block.extend_from_slice(&b(ise_cls));
+            throw_block.push(0x59); // dup
+            throw_block.push(0xBB); // new StringBuilder
+            throw_block.extend_from_slice(&b(sb_cls));
+            throw_block.push(0x59); // dup
+            throw_block.push(0x13); // ldc_w prefix
+            throw_block.extend_from_slice(&b(ise_prefix_str_idx));
+            throw_block.push(0xB7); // invokespecial StringBuilder(String)
+            throw_block.extend_from_slice(&b(sb_init_ref));
+            throw_block.push(0x19); // aload method_slot
+            throw_block.push(method_slot);
+            throw_block.push(0xB6); // invokevirtual append(Object)
+            throw_block.extend_from_slice(&b(sb_append_obj_ref));
+            throw_block.push(0xB6); // invokevirtual toString()
+            throw_block.extend_from_slice(&b(sb_tostring_ref));
+            throw_block.push(0xB7); // invokespecial IllegalStateException(String)
+            throw_block.extend_from_slice(&b(ise_init_ref));
+            throw_block.push(0xBF); // athrow
+
+            code.push(0x19); // aload result_slot
+            code.push(result_slot);
+            code.push(0xC7); // ifnonnull → L_ok (skip throw block)
+            let off = (3 + throw_block.len()) as u16;
+            code.extend_from_slice(&b(off));
+            code.extend_from_slice(&throw_block);
+            // L_ok: unbox and return. boolean/char cast to their exact wrapper;
+            // numeric primitives cast to Number and narrow (CGLIB semantics).
+            let (cast_idx, xvalue_ref, ret_op): (u16, u16, u8) = match ret_char {
+                'Z' => (wr_z.class_idx, wr_z.xvalue_ref, 0xAC), // Boolean.booleanValue → ireturn
+                'C' => (wr_c.class_idx, wr_c.xvalue_ref, 0xAC), // Character.charValue → ireturn
+                'B' => (number_cls, num_byte_value, 0xAC),
+                'S' => (number_cls, num_short_value, 0xAC),
+                'I' => (number_cls, num_int_value, 0xAC),
+                'J' => (number_cls, num_long_value, 0xAD), // lreturn
+                'F' => (number_cls, num_float_value, 0xAE), // freturn
+                'D' => (number_cls, num_double_value, 0xAF), // dreturn
+                _ => (number_cls, num_int_value, 0xAC),
+            };
+            code.push(0x19); // aload result_slot
+            code.push(result_slot);
+            code.push(0xC0); // checkcast Number / Boolean / Character
+            code.extend_from_slice(&b(cast_idx));
+            code.push(0xB6); // invokevirtual xValue()
+            code.extend_from_slice(&b(xvalue_ref));
+            code.push(ret_op);
+        } else if ret_char == 'V' {
+            // void: ignore the result, just return.
+            code.push(0xB1); // return
+        } else {
+            // reference return: null is permitted; checkcast and areturn.
+            code.push(0x19); // aload result_slot
+            code.push(result_slot);
+            if let Some(rc) = ret_ref_class {
+                code.push(0xC0); // checkcast Ret
+                code.extend_from_slice(&b(rc));
+            }
+            code.push(0xB0); // areturn
+        }
+
+        method_bytes.push(wrap_method(
+            name_idx,
+            desc_idx,
+            code_attr_name_idx,
+            &code,
+            8,
+            max_locals,
+        ));
+    }
+
+    let access_flags: u16 = 0x0001 | 0x0020 | 0x1000; // PUBLIC | SUPER | SYNTHETIC
+    let bytes = cw.finish(
+        access_flags,
+        this_class_idx,
+        super_class_idx,
+        &[],
+        &[bf_field],
+        &method_bytes,
+    );
+    (new_name, bytes)
+}
+
 // ---------------------------------------------------------------------------
 // Native intercept
 // ---------------------------------------------------------------------------

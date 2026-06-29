@@ -2177,6 +2177,16 @@ fn try_build_method_injection(
                 let n = ctx.array_length(arr);
                 for i in 0..n {
                     if let Value::Object(Some(ovr)) = ctx.get_array_element(arr, i) {
+                        // Only LookupOverride entries carry a `getBeanName`; skip
+                        // ReplaceOverride (handled by `try_build_replace_override`)
+                        // so we don't probe a non-existent method and log spurious
+                        // NoSuchMethodError warnings.
+                        let ovr_cid = ctx.class_id_of_object(ovr);
+                        if ctx.class_name_of_id(ovr_cid).as_deref()
+                            == Some("org/springframework/beans/factory/support/ReplaceOverride")
+                        {
+                            continue;
+                        }
                         let mname = match ctx.invoke_virtual(
                             ovr,
                             "getMethodName",
@@ -2318,6 +2328,152 @@ fn try_build_method_injection(
     Some(Value::Object(Some(inst)))
 }
 
+/// `<replaced-method>` / programmatic `ReplaceOverride`. Spring's CGLIB enhancer
+/// generates a subclass whose overridden methods dispatch into a configured
+/// `MethodReplacer`; that bytecode pipeline is incomplete here, so we synthesise
+/// the subclass directly (see `cglib_enhancer::build_replace_override_subclass`).
+/// Returns `Some(instance)` when at least one replaced method was overridden,
+/// `None` to fall through to the ordinary instantiation path.
+fn try_build_replace_override(
+    ctx: &mut dyn NativeContext,
+    mbd: ObjectRef,
+    owner: Value,
+    super_cid: cratonvm_types::ClassId,
+) -> Option<Value> {
+    use std::collections::{HashMap, HashSet};
+    const ACC_STATIC: u16 = 0x0008;
+    const ACC_PRIVATE: u16 = 0x0002;
+    const ACC_FINAL: u16 = 0x0010;
+    const ACC_ABSTRACT: u16 = 0x0400;
+    const ACC_NATIVE: u16 = 0x0100;
+    const REPLACE_OVERRIDE: &str =
+        "org/springframework/beans/factory/support/ReplaceOverride";
+
+    let has_overrides = matches!(
+        ctx.invoke_virtual(mbd, "hasMethodOverrides", "()Z", &[]),
+        Ok(Some(Value::Int(n))) if n != 0
+    );
+    if !has_overrides {
+        return None;
+    }
+
+    let super_internal = ctx.class_name_of_id(super_cid)?;
+
+    // Collect (methodName → replacerBeanName) for every ReplaceOverride.
+    let mut replacers: HashMap<String, String> = HashMap::new();
+    if let Ok(Some(Value::Object(Some(mo)))) = ctx.invoke_virtual(
+        mbd,
+        "getMethodOverrides",
+        "()Lorg/springframework/beans/factory/support/MethodOverrides;",
+        &[],
+    ) {
+        if let Ok(Some(Value::Object(Some(set)))) =
+            ctx.invoke_virtual(mo, "getOverrides", "()Ljava/util/Set;", &[])
+        {
+            if let Ok(Some(Value::Object(Some(arr)))) =
+                ctx.invoke_virtual(set, "toArray", "()[Ljava/lang/Object;", &[])
+            {
+                let n = ctx.array_length(arr);
+                for i in 0..n {
+                    let ovr = match ctx.get_array_element(arr, i) {
+                        Value::Object(Some(o)) => o,
+                        _ => continue,
+                    };
+                    // Only ReplaceOverride entries — LookupOverride is handled
+                    // upstream by `try_build_method_injection`.
+                    let ovr_cid = ctx.class_id_of_object(ovr);
+                    if ctx.class_name_of_id(ovr_cid).as_deref() != Some(REPLACE_OVERRIDE) {
+                        continue;
+                    }
+                    let mname = match ctx.invoke_virtual(
+                        ovr,
+                        "getMethodName",
+                        "()Ljava/lang/String;",
+                        &[],
+                    ) {
+                        Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s).unwrap_or_default(),
+                        _ => continue,
+                    };
+                    let rname = match ctx.invoke_virtual(
+                        ovr,
+                        "getMethodReplacerBeanName",
+                        "()Ljava/lang/String;",
+                        &[],
+                    ) {
+                        Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s).unwrap_or_default(),
+                        _ => continue,
+                    };
+                    if !mname.is_empty() {
+                        replacers.insert(mname, rname);
+                    }
+                }
+            }
+        }
+    }
+    if replacers.is_empty() {
+        return None;
+    }
+
+    // Enumerate overridable methods up the hierarchy whose name is replaced.
+    // Dedup by (name, descriptor) so an inherited + redeclared method yields a
+    // single override (the most-derived declaration wins — first seen walking
+    // from the bean class upward).
+    let mut seen: HashSet<(String, String)> = HashSet::new();
+    let mut specs: Vec<crate::cglib_enhancer::ReplaceMethodSpec> = Vec::new();
+    let mut cursor = Some(super_cid);
+    while let Some(cid) = cursor {
+        for m in ctx.declared_methods(cid) {
+            if m.name.starts_with('<') {
+                continue;
+            }
+            let replacer = match replacers.get(&m.name) {
+                Some(r) => r.clone(),
+                None => continue,
+            };
+            if m.access_flags & (ACC_STATIC | ACC_PRIVATE | ACC_FINAL | ACC_ABSTRACT | ACC_NATIVE)
+                != 0
+            {
+                continue;
+            }
+            if !seen.insert((m.name.clone(), m.descriptor.clone())) {
+                continue;
+            }
+            specs.push(crate::cglib_enhancer::ReplaceMethodSpec {
+                name: m.name.clone(),
+                descriptor: m.descriptor.clone(),
+                replacer_bean_name: replacer,
+            });
+        }
+        cursor = ctx.superclass_of(cid);
+    }
+    if specs.is_empty() {
+        return None;
+    }
+
+    let (new_name, bytes) =
+        crate::cglib_enhancer::build_replace_override_subclass(&super_internal, &specs);
+    let opts = DefineClassFull {
+        override_name: Some(new_name.clone()),
+        skip_verification: true,
+        ..Default::default()
+    };
+    if ctx.define_class_full(&new_name, &bytes, 0, opts).is_err() {
+        return None;
+    }
+    let inst = match ctx.new_object(&new_name) {
+        Ok(Some(Value::Object(Some(o)))) => o,
+        _ => return None,
+    };
+    let _ = ctx.invoke(&new_name, "<init>", "()V", &[Value::Object(Some(inst))]);
+    // Hand the owning factory to the generated replace overrides.
+    ctx.set_field_by_name(inst, "$$beanFactory", owner);
+    tracing::debug!(
+        "[spring-shim] replace-override: instantiated {new_name} (super={super_internal}, replaced={})",
+        specs.len()
+    );
+    Some(Value::Object(Some(inst)))
+}
+
 /// sportme: SimpleInstantiationStrategy.instantiate(RootBeanDefinition,
 /// String beanName, BeanFactory owner) → Object.
 ///
@@ -2398,6 +2554,14 @@ fn s_instantiation_strategy_instantiate(
         // whose abstract lookup methods resolve beans from the owning factory.
         let owner = args.get(3).cloned().unwrap_or(Value::Object(None));
         if let Some(inst) = try_build_method_injection(ctx, mbd, owner, cid) {
+            return Ok(Some(inst));
+        }
+        // `<replaced-method>` / programmatic `ReplaceOverride` on a (typically
+        // concrete) bean class. Real CGLIB's `Enhancer.createClass()` pipeline is
+        // incomplete in this VM, so synthesise a subclass whose overridden methods
+        // delegate to the configured `MethodReplacer` — mirroring Spring's
+        // `ReplaceOverrideMethodInterceptor` + `processReturnType`.
+        if let Some(inst) = try_build_replace_override(ctx, mbd, owner, cid) {
             return Ok(Some(inst));
         }
         let flags = ctx.class_access_flags(cid);
