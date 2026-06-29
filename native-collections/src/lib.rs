@@ -574,6 +574,21 @@ fn read_value_slice(ctx: &dyn NativeContext, handles: &[usize], orig: &[Value]) 
         .collect()
 }
 
+/// Read back ONE (post-GC, forwarded) ref pinned with [`pin_value_slice`].
+/// Non-object slots / unpinned handles are returned verbatim. Use in a
+/// per-element dispatch loop to refresh `elements[i]` just before passing it to
+/// an allocating `invoke_virtual` (the moving young collector relocates the
+/// object and remaps its native pin, but the bare `Vec` slot is not rewritten).
+#[inline]
+fn read_pinned_elem(ctx: &dyn NativeContext, handle: usize, orig: Value) -> Value {
+    match orig {
+        Value::Object(Some(o)) if handle != usize::MAX => {
+            Value::Object(Some(ctx.read_native_pin(handle, o)))
+        }
+        _ => orig,
+    }
+}
+
 /// Allocate a hash-map bucket table of `cap` entries, **capping the eager
 /// allocation to what the heap can hold**, and return `(table, actual_cap)`.
 ///
@@ -8284,15 +8299,28 @@ fn native_map_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         _ => return Ok(None),
     };
     let entries = map_collect_entries(ctx, this);
-    for (key, value) in &entries {
-        ctx.invoke_virtual(
-            action,
-            "accept",
-            "(Ljava/lang/Object;Ljava/lang/Object;)V",
-            &[*key, *value],
-        )?;
+    // GC-SAFETY: the BiConsumer `accept` allocates → moving young GC relocates
+    // `action` and every key/value; pin all and re-read from the handles before
+    // each dispatch.
+    let action_pin = ctx.pin_native_root(action);
+    let keys: Vec<Value> = entries.iter().map(|(k, _)| *k).collect();
+    let vals: Vec<Value> = entries.iter().map(|(_, v)| *v).collect();
+    let (_, khandles) = pin_value_slice(ctx, &keys);
+    let (_, vhandles) = pin_value_slice(ctx, &vals);
+    let mut result = Ok(None);
+    for i in 0..entries.len() {
+        let a = ctx.read_native_pin(action_pin, action);
+        let k = read_pinned_elem(ctx, khandles[i], keys[i]);
+        let v = read_pinned_elem(ctx, vhandles[i], vals[i]);
+        if let Err(e) =
+            ctx.invoke_virtual(a, "accept", "(Ljava/lang/Object;Ljava/lang/Object;)V", &[k, v])
+        {
+            result = Err(e);
+            break;
+        }
     }
-    Ok(None)
+    ctx.unpin_native_roots(action_pin);
+    result
 }
 
 fn native_hs_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -8310,10 +8338,21 @@ fn native_hs_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         None => return Ok(None),
     };
     let keys = collect_view_snapshot_ordered(ctx, backing);
-    for key in &keys {
-        ctx.invoke_virtual(action, "accept", "(Ljava/lang/Object;)V", &[*key])?;
+    // GC-SAFETY: `accept` allocates → moving young GC relocates `action` and the
+    // keys; pin both and re-read each from its handle before dispatch.
+    let action_pin = ctx.pin_native_root(action);
+    let (_, khandles) = pin_value_slice(ctx, &keys);
+    let mut result = Ok(None);
+    for (i, &key) in keys.iter().enumerate() {
+        let a = ctx.read_native_pin(action_pin, action);
+        let k = read_pinned_elem(ctx, khandles[i], key);
+        if let Err(e) = ctx.invoke_virtual(a, "accept", "(Ljava/lang/Object;)V", &[k]) {
+            result = Err(e);
+            break;
+        }
     }
-    Ok(None)
+    ctx.unpin_native_roots(action_pin);
+    result
 }
 
 // ===========================================================================
@@ -10795,12 +10834,35 @@ fn native_stream_filter(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         return Ok(Some(s));
     }
     let elements = stream_elements(ctx, this)?;
-    let mut kept = Vec::new();
-    for elem in &elements {
-        let result = ctx.invoke_virtual(predicate, "test", "(Ljava/lang/Object;)Z", &[*elem])?;
-        if matches!(result, Some(Value::Int(v)) if v != 0) {
-            kept.push(*elem);
+    // GC-SAFETY: `test` allocates → moving young GC relocates the predicate and
+    // the elements; pin both, re-read each before dispatch, track kept by INDEX,
+    // and rebuild the kept list by re-reading from the pins at the end.
+    let pred_pin = ctx.pin_native_root(predicate);
+    let (_, ehandles) = pin_value_slice(ctx, &elements);
+    let mut kept_idx: Vec<usize> = Vec::new();
+    let mut err = None;
+    for i in 0..elements.len() {
+        let p = ctx.read_native_pin(pred_pin, predicate);
+        let e = read_pinned_elem(ctx, ehandles[i], elements[i]);
+        match ctx.invoke_virtual(p, "test", "(Ljava/lang/Object;)Z", &[e]) {
+            Ok(r) => {
+                if matches!(r, Some(Value::Int(v)) if v != 0) {
+                    kept_idx.push(i);
+                }
+            }
+            Err(e) => {
+                err = Some(e);
+                break;
+            }
         }
+    }
+    let kept: Vec<Value> = kept_idx
+        .iter()
+        .map(|&i| read_pinned_elem(ctx, ehandles[i], elements[i]))
+        .collect();
+    ctx.unpin_native_roots(pred_pin);
+    if let Some(e) = err {
+        return Err(e);
     }
     make_derived_stream(ctx, this, &kept)
 }
@@ -10821,15 +10883,37 @@ fn native_stream_map(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         return Ok(Some(s));
     }
     let elements = stream_elements(ctx, this)?;
+    // GC-SAFETY: `apply` allocates → moving young GC relocates the function, the
+    // input elements, AND the freshly-mapped result objects that accumulate in
+    // `mapped`. Pin the function + inputs (re-read each before dispatch) and pin
+    // every result as it is produced, then rebuild `mapped` from those pins.
+    let fn_pin = ctx.pin_native_root(function);
+    let (_, ehandles) = pin_value_slice(ctx, &elements);
     let mut mapped = Vec::with_capacity(elements.len());
-    for elem in &elements {
-        let result = ctx.invoke_virtual(
-            function,
-            "apply",
-            "(Ljava/lang/Object;)Ljava/lang/Object;",
-            &[*elem],
-        )?;
-        mapped.push(result.unwrap_or(Value::Object(None)));
+    let mut result_handles: Vec<usize> = Vec::with_capacity(elements.len());
+    let mut err = None;
+    for i in 0..elements.len() {
+        let f = ctx.read_native_pin(fn_pin, function);
+        let e = read_pinned_elem(ctx, ehandles[i], elements[i]);
+        match ctx.invoke_virtual(f, "apply", "(Ljava/lang/Object;)Ljava/lang/Object;", &[e]) {
+            Ok(r) => {
+                let v = r.unwrap_or(Value::Object(None));
+                match v {
+                    Value::Object(Some(o)) => result_handles.push(ctx.pin_native_root(o)),
+                    _ => result_handles.push(usize::MAX),
+                }
+                mapped.push(v);
+            }
+            Err(e) => {
+                err = Some(e);
+                break;
+            }
+        }
+    }
+    let mapped = read_value_slice(ctx, &result_handles, &mapped);
+    ctx.unpin_native_roots(fn_pin);
+    if let Some(e) = err {
+        return Err(e);
     }
     make_derived_stream(ctx, this, &mapped)
 }
@@ -10894,29 +10978,43 @@ fn native_stream_sorted(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         Some(Value::Object(Some(r))) => *r,
         _ => return make_stream(ctx, &[]),
     };
-    let mut elements = stream_elements(ctx, this)?;
+    let elements = stream_elements(ctx, this)?;
 
-    // Check if all elements are numeric (including boxed wrappers) — sort numerically
-    let all_numeric = elements.iter().all(|v| numeric_sort_key(ctx, v).is_some());
+    // GC-SAFETY: key extraction (`obj_to_display_string` → `toString`) allocates
+    // and can trigger a moving young GC that relocates the elements out from under
+    // this bare Rust `Vec`. Pin the elements, precompute each key by re-reading
+    // from its pin handle, sort an index permutation (keys are plain, no further
+    // dispatch), then rebuild the result by re-reading from the pins.
+    let (base, ehandles) = pin_value_slice(ctx, &elements);
+    let all_numeric = (0..elements.len()).all(|i| {
+        let e = read_pinned_elem(ctx, ehandles[i], elements[i]);
+        numeric_sort_key(ctx, &e).is_some()
+    });
+    let mut idx: Vec<usize> = (0..elements.len()).collect();
     if all_numeric {
-        elements.sort_by(|a, b| {
-            let ka = numeric_sort_key(ctx, a).unwrap_or(0.0);
-            let kb = numeric_sort_key(ctx, b).unwrap_or(0.0);
-            ka.partial_cmp(&kb).unwrap_or(std::cmp::Ordering::Equal)
-        });
-    } else {
-        // Fallback: sort by string representation
-        let mut strs: Vec<(String, Value)> = elements
-            .drain(..)
-            .map(|v| {
-                let s = obj_to_display_string(ctx, &v);
-                (s, v)
+        let keys: Vec<f64> = (0..elements.len())
+            .map(|i| {
+                let e = read_pinned_elem(ctx, ehandles[i], elements[i]);
+                numeric_sort_key(ctx, &e).unwrap_or(0.0)
             })
             .collect();
-        strs.sort_by(|a, b| a.0.cmp(&b.0));
-        elements = strs.into_iter().map(|(_, v)| v).collect();
+        idx.sort_by(|&a, &b| keys[a].partial_cmp(&keys[b]).unwrap_or(std::cmp::Ordering::Equal));
+    } else {
+        // Fallback: sort by string representation.
+        let keys: Vec<String> = (0..elements.len())
+            .map(|i| {
+                let e = read_pinned_elem(ctx, ehandles[i], elements[i]);
+                obj_to_display_string(ctx, &e)
+            })
+            .collect();
+        idx.sort_by(|&a, &b| keys[a].cmp(&keys[b]));
     }
-    make_derived_stream(ctx, this, &elements)
+    let sorted: Vec<Value> = idx
+        .iter()
+        .map(|&i| read_pinned_elem(ctx, ehandles[i], elements[i]))
+        .collect();
+    ctx.unpin_native_roots(base);
+    make_derived_stream(ctx, this, &sorted)
 }
 
 fn native_stream_sorted_cmp(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -10928,22 +11026,39 @@ fn native_stream_sorted_cmp(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         Some(Value::Object(Some(r))) => *r,
         _ => return make_stream(ctx, &[]),
     };
-    let mut elems = stream_elements(ctx, this)?;
+    let elems = stream_elements(ctx, this)?;
 
-    // Stable merge sort — O(n log n) — dispatching through the Comparator.
-    // Mirrors `sort_with_comparator` (Collections.sort(List, cmp)): the
-    // comparison is fallible (a comparator that throws propagates the error
-    // out and short-circuits the sort) and a non-Int return is treated as 0
-    // ("equal"), preserving the previous insertion-sort semantics
-    // (`cmp <= 0 => keep left first` ⇒ stable).
-    merge_sort_fallible(ctx, &mut elems, |c, a, b| {
-        match comparator_compare(c, comparator, *a, *b)? {
+    // GC-SAFETY: the Comparator dispatch (and any key-extractor `apply`) allocates
+    // and re-enters Java → a moving young GC relocates the comparator and the
+    // materialized elements out from under these bare Rust locals. Pin both, sort
+    // an index permutation, and re-read the comparator + the two compared elements
+    // from their pin handles on every comparison; build the result by re-reading
+    // in sorted order. Stable merge sort — O(n log n); the comparison is fallible
+    // (a comparator that throws short-circuits) and a non-Int return is "equal".
+    let cmp_pin = ctx.pin_native_root(comparator);
+    let (_, elem_handles) = pin_value_slice(ctx, &elems);
+    let mut idx: Vec<Value> = (0..elems.len() as i32).map(Value::Int).collect();
+    let sort_res = merge_sort_fallible(ctx, &mut idx, |c, a, b| {
+        let ia = if let Value::Int(v) = a { *v as usize } else { 0 };
+        let ib = if let Value::Int(v) = b { *v as usize } else { 0 };
+        let ea = read_pinned_elem(c, elem_handles[ia], elems[ia]);
+        let eb = read_pinned_elem(c, elem_handles[ib], elems[ib]);
+        let cmp = c.read_native_pin(cmp_pin, comparator);
+        match comparator_compare(c, cmp, ea, eb)? {
             Some(Value::Int(v)) => Ok(v),
             _ => Ok(0),
         }
-    })?;
-
-    make_derived_stream(ctx, this, &elems)
+    });
+    let sorted: Vec<Value> = idx
+        .iter()
+        .map(|v| {
+            let i = if let Value::Int(x) = v { *x as usize } else { 0 };
+            read_pinned_elem(ctx, elem_handles[i], elems[i])
+        })
+        .collect();
+    ctx.unpin_native_roots(cmp_pin);
+    sort_res?;
+    make_derived_stream(ctx, this, &sorted)
 }
 
 fn native_stream_distinct(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -11080,10 +11195,22 @@ fn native_stream_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         return result;
     }
     let elements = stream_elements(ctx, this)?;
-    for elem in &elements {
-        ctx.invoke_virtual(consumer, "accept", "(Ljava/lang/Object;)V", &[*elem])?;
+    // GC-SAFETY: `accept` re-enters Java and can trigger a moving young GC that
+    // relocates the consumer and the materialized elements; pin them and re-read
+    // each from its handle before the (allocating) dispatch.
+    let con_pin = ctx.pin_native_root(consumer);
+    let (_, elem_handles) = pin_value_slice(ctx, &elements);
+    let mut result = Ok(None);
+    for (i, &elem) in elements.iter().enumerate() {
+        let c = ctx.read_native_pin(con_pin, consumer);
+        let e = read_pinned_elem(ctx, elem_handles[i], elem);
+        if let Err(err) = ctx.invoke_virtual(c, "accept", "(Ljava/lang/Object;)V", &[e]) {
+            result = Err(err);
+            break;
+        }
     }
-    Ok(None)
+    ctx.unpin_native_roots(con_pin);
+    result
 }
 
 fn native_stream_count(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -30671,38 +30798,62 @@ fn native_spliterator_for_each_remaining(
             // (which now correctly dispatches to the JDK default-method
             // bytecode for real-JDK subclasses, thanks to the
             // SPLITERATOR-FALLTHROUGH change in `invoke_on_class_shared_inner`).
+            // GC-SAFETY: each `tryAdvance` re-enters Java and can move `this` /
+            // `consumer`; pin both and re-read from their handles each iteration.
+            let this_pin = ctx.pin_native_root(this);
+            let con_pin = ctx.pin_native_root(consumer);
             let mut iters: u64 = 0;
+            let mut result = Ok(None);
             loop {
                 iters += 1;
                 if iters > 10_000_000 {
                     break;
                 }
-                let r = ctx.invoke_virtual(
-                    this,
+                let t = ctx.read_native_pin(this_pin, this);
+                let c = ctx.read_native_pin(con_pin, consumer);
+                match ctx.invoke_virtual(
+                    t,
                     "tryAdvance",
                     "(Ljava/util/function/Consumer;)Z",
-                    &[Value::Object(Some(consumer))],
-                )?;
-                match r {
-                    Some(Value::Int(1)) => continue,
-                    _ => break,
+                    &[Value::Object(Some(c))],
+                ) {
+                    Ok(Some(Value::Int(1))) => continue,
+                    Ok(_) => break,
+                    Err(e) => {
+                        result = Err(e);
+                        break;
+                    }
                 }
             }
-            return Ok(None);
+            ctx.unpin_native_roots(this_pin);
+            return result;
         }
     };
+    // GC-SAFETY: `accept` allocates and can move `this` / the backing array /
+    // `consumer`; pin them and re-read each from its handle every iteration.
+    let this_pin = ctx.pin_native_root(this);
+    let arr_pin = ctx.pin_native_root(arr);
+    let con_pin = ctx.pin_native_root(consumer);
     let mut cursor = match ctx.get_field(this, 1) {
         Value::Int(v) => v as usize,
         _ => 0,
     };
     let len = ctx.array_length(arr);
+    let mut result = Ok(None);
     while cursor < len {
-        let elem = ctx.get_array_element(arr, cursor);
+        let a = ctx.read_native_pin(arr_pin, arr);
+        let c = ctx.read_native_pin(con_pin, consumer);
+        let elem = ctx.get_array_element(a, cursor);
         cursor += 1;
-        ctx.invoke_virtual(consumer, "accept", "(Ljava/lang/Object;)V", &[elem])?;
+        if let Err(e) = ctx.invoke_virtual(c, "accept", "(Ljava/lang/Object;)V", &[elem]) {
+            result = Err(e);
+            break;
+        }
     }
+    let this = ctx.read_native_pin(this_pin, this);
     ctx.set_field(this, 1, Value::Int(cursor as i32));
-    Ok(None)
+    ctx.unpin_native_roots(this_pin);
+    result
 }
 
 fn native_spliterators_empty(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
