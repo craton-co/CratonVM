@@ -2014,12 +2014,349 @@ fn native_properties_equals(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
 /// Register the side-table-backed `Properties` natives.  Called from
 /// `register_essential_natives` (real-JDK mode) so KeycloakMain's
 /// `Version.<clinit>` finds a non-null `version` value.
+/// JDK `Properties.saveConvert` — escape a key or value for `.properties`
+/// output so it round-trips through `Properties.load` / our `parse_properties`.
+///
+/// `escape_space` escapes EVERY space (used for keys); for values only a leading
+/// space is escaped (a space inside a value is left literal). `escape_unicode`
+/// escapes every char outside `0x20..=0x7e` as `\uXXXX` — true for the
+/// `store(OutputStream)` overload (the bytes are written ISO-8859-1, so any
+/// non-Latin-1 char must be escaped), false for `store(Writer)` (the Writer's
+/// charset encodes the raw char). Mirrors `java.util.Properties.saveConvert`
+/// including the `c > 61 && c < 127` printable-ASCII fast path and the explicit
+/// `=`/`:`/`#`/`!` escapes.
+fn save_convert(s: &str, escape_space: bool, escape_unicode: bool) -> String {
+    let mut out = String::with_capacity(s.len() * 2);
+    for (i, ch) in s.chars().enumerate() {
+        let c = ch as u32;
+        // Fast path: printable ASCII above '=' (61) and below DEL (127).
+        if c > 61 && c < 127 {
+            if ch == '\\' {
+                out.push_str("\\\\");
+            } else {
+                out.push(ch);
+            }
+            continue;
+        }
+        match ch {
+            ' ' => {
+                if i == 0 || escape_space {
+                    out.push('\\');
+                }
+                out.push(' ');
+            }
+            '\t' => out.push_str("\\t"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\u{000c}' => out.push_str("\\f"),
+            '=' | ':' | '#' | '!' => {
+                out.push('\\');
+                out.push(ch);
+            }
+            _ => {
+                if (c < 0x20 || c > 0x7e) && escape_unicode {
+                    // Emit one `\uXXXX` per UTF-16 code unit, so supplementary
+                    // code points round-trip as the surrogate pair the JDK
+                    // writes (our `parse_properties` recombines them on load).
+                    let mut buf = [0u16; 2];
+                    for unit in ch.encode_utf16(&mut buf) {
+                        out.push_str(&format!("\\u{:04x}", unit));
+                    }
+                } else {
+                    out.push(ch);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Mirror `java.util.Properties.writeComments`: prefix the comment block with
+/// `#` and re-`#`-prefix after each embedded line break, terminating lines with
+/// the platform separator `eol` (the JDK uses `bw.newLine()`). Comments are
+/// ignored by `Properties.load`, so an approximate rendering is sufficient.
+fn write_comments(out: &mut String, comments: &str, eol: &str) {
+    out.push('#');
+    let mut chars = comments.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\n' => {
+                out.push_str(eol);
+                out.push('#');
+            }
+            '\r' => {
+                // Treat CRLF as a single break (swallow a following LF).
+                if chars.peek() == Some(&'\n') {
+                    chars.next();
+                }
+                out.push_str(eol);
+                out.push('#');
+            }
+            _ => out.push(ch),
+        }
+    }
+    out.push_str(eol);
+}
+
+/// Best-effort `new java.util.Date().toString()` for the `#<date>` line the JDK
+/// writes. Returns `None` (caller omits the line) if Date can't be built — the
+/// line is a comment and never affects a `load` round-trip.
+fn current_date_string(ctx: &mut dyn NativeContext) -> Option<String> {
+    let date = match ctx.new_object_initialized("java/util/Date", "()V", &[]) {
+        Ok(Some(Value::Object(Some(o)))) => o,
+        _ => return None,
+    };
+    match ctx.invoke_virtual(date, "toString", "()Ljava/lang/String;", &[]) {
+        Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s),
+        _ => None,
+    }
+}
+
+/// Walk `this.entrySet()` through the VIRTUAL dispatch and collect the
+/// `(key, value)` String pairs — faithfully mirroring what `Properties.store0`
+/// does (it iterates `entrySet()`). This honors a subclass that overrides
+/// `entrySet()`/`keySet()`: Spring's `SortedProperties.store(out, comments)`
+/// calls `super.store(...)` and depends on the iteration order coming from its
+/// overridden `entrySet()` (a sorted `TreeSet`). Reading the side-table directly
+/// would drop that ordering. Non-String keys/values are skipped (real `store0`
+/// would `ClassCastException`; the side-table model only carries Strings anyway).
+fn collect_via_virtual_entryset(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+) -> Vec<(String, String)> {
+    let this_pin = ctx.pin_native_root(this);
+    let this_cur = ctx.read_native_pin(this_pin, this);
+    let set = match ctx.invoke_virtual(this_cur, "entrySet", "()Ljava/util/Set;", &[]) {
+        Ok(Some(Value::Object(Some(s)))) => s,
+        _ => {
+            ctx.unpin_native_roots(this_pin);
+            return Vec::new();
+        }
+    };
+    let it = match ctx.invoke_virtual(set, "iterator", "()Ljava/util/Iterator;", &[]) {
+        Ok(Some(Value::Object(Some(i)))) => i,
+        _ => {
+            ctx.unpin_native_roots(this_pin);
+            return Vec::new();
+        }
+    };
+    let it_pin = ctx.pin_native_root(it);
+    let mut out = Vec::new();
+    loop {
+        let it_cur = ctx.read_native_pin(it_pin, it);
+        match ctx.invoke_virtual(it_cur, "hasNext", "()Z", &[]) {
+            Ok(Some(Value::Int(n))) if n != 0 => {}
+            _ => break,
+        }
+        let it_cur = ctx.read_native_pin(it_pin, it);
+        let entry = match ctx.invoke_virtual(it_cur, "next", "()Ljava/lang/Object;", &[]) {
+            Ok(Some(Value::Object(Some(o)))) => o,
+            _ => break,
+        };
+        let entry_pin = ctx.pin_native_root(entry);
+        let entry_cur = ctx.read_native_pin(entry_pin, entry);
+        let key_v = ctx.invoke_virtual(entry_cur, "getKey", "()Ljava/lang/Object;", &[]);
+        let entry_cur = ctx.read_native_pin(entry_pin, entry);
+        let val_v = ctx.invoke_virtual(entry_cur, "getValue", "()Ljava/lang/Object;", &[]);
+        ctx.unpin_native_roots(entry_pin);
+        let k = match key_v {
+            Ok(Some(Value::Object(Some(k)))) => ctx.read_string(k),
+            _ => None,
+        };
+        let v = match val_v {
+            Ok(Some(Value::Object(Some(v)))) => ctx.read_string(v),
+            _ => None,
+        };
+        if let (Some(k), Some(v)) = (k, v) {
+            out.push((k, v));
+        }
+        if out.len() >= MAX_PROPS_PER_OBJECT {
+            break;
+        }
+    }
+    ctx.unpin_native_roots(this_pin);
+    out
+}
+
+/// Collect the entries `store0` would serialize. For an exact `java/util/Properties`
+/// use the side-table snapshot (the fast path — `entrySet()` would return the
+/// same data). For a subclass, iterate the virtual `entrySet()` so overrides
+/// (e.g. `SortedProperties`' sorted view) are honored.
+fn collect_store_entries(ctx: &mut dyn NativeContext, this: ObjectRef) -> Vec<(String, String)> {
+    let cid = ctx.class_id_of_object(this);
+    let is_exact = ctx
+        .class_name_of_id(cid)
+        .is_none_or(|n| n == "java/util/Properties");
+    if is_exact {
+        return snapshot_kv(ctx, this);
+    }
+    let entries = collect_via_virtual_entryset(ctx, this);
+    // Fallback: if the virtual walk produced nothing (unexpected dispatch
+    // failure) but the side-table has data, don't silently drop it.
+    if entries.is_empty() {
+        return snapshot_kv(ctx, this);
+    }
+    entries
+}
+
+/// Build the full `.properties` text for `this`. This is what `Properties.store0`
+/// would produce by iterating `entrySet()` — but our synthetic `Properties` (and
+/// `System.getProperties()`) keep their entries in the side-table, not the
+/// internal `map` ConcurrentHashMap the JDK bytecode reads, so the real `store0`
+/// writes zero entries. Serializing here (via [`collect_store_entries`], which
+/// honors subclass `entrySet()` overrides) keeps `store` consistent.
+fn build_store_text(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    comments: Option<&str>,
+    escape_unicode: bool,
+) -> String {
+    // The JDK's `store0` terminates every line with `bw.newLine()` =
+    // `System.lineSeparator()`. Match it so callers that re-split the output on
+    // the platform separator (e.g. Spring's `SortedProperties.store`, which does
+    // `contents.split(System.lineSeparator())`) see the right line boundaries.
+    let eol = ctx
+        .get_system_property("line.separator")
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "\n".to_string());
+    let mut text = String::new();
+    if let Some(c) = comments {
+        write_comments(&mut text, c, &eol);
+    }
+    // Pin `this` across the Date allocation so the entry walk below sees the
+    // forwarded (post-GC) reference.
+    let this_pin = ctx.pin_native_root(this);
+    if let Some(d) = current_date_string(ctx) {
+        text.push('#');
+        text.push_str(&d);
+        text.push_str(&eol);
+    }
+    let this_cur = ctx.read_native_pin(this_pin, this);
+    let entries = collect_store_entries(ctx, this_cur);
+    ctx.unpin_native_roots(this_pin);
+    for (k, v) in entries {
+        text.push_str(&save_convert(&k, true, escape_unicode));
+        text.push('=');
+        text.push_str(&save_convert(&v, false, escape_unicode));
+        text.push_str(&eol);
+    }
+    text
+}
+
+/// Native `Properties.store(OutputStream, String)` — serializes the side-table
+/// as a `.properties` file (ISO-8859-1, `\uXXXX`-escaping non-Latin-1) and
+/// writes it to the stream. The real JDK `store0` bytecode iterates the internal
+/// `map` CHM, which our synthetic Properties never populates, so it emits 0
+/// bytes; this native fixes `Properties.store`/`save` for `System.getProperties()`,
+/// its `clone()`, and any side-table-backed Properties (Spring's
+/// `ConcurrentBeanWrapperTests`, which stores a cloned system-properties snapshot
+/// and reloads it, depends on this).
+fn native_properties_store_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    let out = match args.get(1) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    // Read the (possibly-null) comments String before any allocation.
+    let comments = match args.get(2) {
+        Some(Value::Object(Some(s))) => ctx.read_string(*s),
+        _ => None,
+    };
+    // Pin both heap roots: building the text allocates (new Date, strings) and
+    // filling the byte array allocates, either of which can move `this`/`out`.
+    let this_pin = ctx.pin_native_root(this);
+    let out_pin = ctx.pin_native_root(out);
+
+    let this_cur = ctx.read_native_pin(this_pin, this);
+    let text = build_store_text(ctx, this_cur, comments.as_deref(), true);
+
+    // ISO-8859-1 encode: with escape_unicode=true every entry char is ASCII;
+    // comment/date chars are downgraded to one byte (>0xff collapses, matching
+    // the JDK's lossy ISO-8859-1 comment write — comments don't affect `load`).
+    let bytes: Vec<u8> = text.chars().map(|c| (c as u32 & 0xff) as u8).collect();
+    let arr = ctx.new_array(ArrayElementType::Byte, bytes.len());
+    for (i, b) in bytes.iter().enumerate() {
+        ctx.set_array_element(arr, i, Value::Int(*b as i8 as i32));
+    }
+    let out_cur = ctx.read_native_pin(out_pin, out);
+    let write_res = ctx.invoke_virtual(out_cur, "write", "([B)V", &[Value::Object(Some(arr))]);
+    let out_cur = ctx.read_native_pin(out_pin, out);
+    let _ = ctx.invoke_virtual(out_cur, "flush", "()V", &[]);
+    ctx.unpin_native_roots(this_pin);
+    write_res?;
+    Ok(None)
+}
+
+/// Native `Properties.store(Writer, String)` — same as the OutputStream overload
+/// but writes the text straight to the `Writer` (no `\uXXXX` escaping; the
+/// Writer's own charset encodes the characters).
+fn native_properties_store_writer(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    let writer = match args.get(1) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    let comments = match args.get(2) {
+        Some(Value::Object(Some(s))) => ctx.read_string(*s),
+        _ => None,
+    };
+    let this_pin = ctx.pin_native_root(this);
+    let writer_pin = ctx.pin_native_root(writer);
+
+    let this_cur = ctx.read_native_pin(this_pin, this);
+    let text = build_store_text(ctx, this_cur, comments.as_deref(), false);
+
+    let str_obj = ctx.create_string(&text);
+    let writer_cur = ctx.read_native_pin(writer_pin, writer);
+    let write_res = ctx.invoke_virtual(
+        writer_cur,
+        "write",
+        "(Ljava/lang/String;)V",
+        &[Value::Object(Some(str_obj))],
+    );
+    let writer_cur = ctx.read_native_pin(writer_pin, writer);
+    let _ = ctx.invoke_virtual(writer_cur, "flush", "()V", &[]);
+    ctx.unpin_native_roots(this_pin);
+    write_res?;
+    Ok(None)
+}
+
 pub fn register_properties_sidetable(registry: &mut NativeMethodRegistry) {
     registry.register(
         "java/util/Properties",
         "equals",
         "(Ljava/lang/Object;)Z",
         native_properties_equals,
+    );
+    // `Properties.store`/`save` run real JDK `store0` bytecode that iterates the
+    // internal `map` ConcurrentHashMap. Our synthetic Properties keep entries in
+    // the side-table, not that CHM, so the bytecode writes 0 bytes. Serialize
+    // from the side-table instead (symmetric with the native `load`). Both the
+    // OutputStream and Writer overloads, plus the deprecated `save` (which
+    // delegates to store0 in the JDK), are covered.
+    registry.register(
+        "java/util/Properties",
+        "store",
+        "(Ljava/io/OutputStream;Ljava/lang/String;)V",
+        native_properties_store_stream,
+    );
+    registry.register(
+        "java/util/Properties",
+        "store",
+        "(Ljava/io/Writer;Ljava/lang/String;)V",
+        native_properties_store_writer,
+    );
+    registry.register(
+        "java/util/Properties",
+        "save",
+        "(Ljava/io/OutputStream;Ljava/lang/String;)V",
+        native_properties_store_stream,
     );
     registry.register(
         "java/util/Properties",
@@ -2369,6 +2706,52 @@ mod tests {
     fn parse_whitespace_separator() {
         let p = parse_properties(b"key value\n");
         assert_eq!(p, vec![("key".to_string(), "value".to_string())]);
+    }
+
+    #[test]
+    fn save_convert_escapes_specials() {
+        // Keys escape every space; `=`,`:`,`#`,`!` and `\` always escape.
+        assert_eq!(save_convert("a b", true, false), "a\\ b");
+        assert_eq!(save_convert("a=b:c#d!e", true, false), "a\\=b\\:c\\#d\\!e");
+        assert_eq!(save_convert("c:\\path", false, false), "c\\:\\\\path");
+        // Values only escape a LEADING space, not interior ones.
+        assert_eq!(save_convert(" lead mid", false, false), "\\ lead mid");
+        assert_eq!(save_convert("a\tb\nc", false, false), "a\\tb\\nc");
+    }
+
+    #[test]
+    fn save_convert_unicode_escaping() {
+        // escape_unicode=true escapes non-Latin chars as one `\u` per code unit.
+        assert_eq!(save_convert("\u{00e9}", false, true), "\\u00e9"); // é
+        // Supplementary code point -> surrogate pair (two \u units).
+        assert_eq!(save_convert("\u{1F600}", false, true), "\\ud83d\\ude00");
+        // escape_unicode=false leaves the char literal (Writer charset encodes it).
+        assert_eq!(save_convert("\u{00e9}", false, false), "\u{00e9}");
+    }
+
+    #[test]
+    fn save_convert_then_parse_roundtrips() {
+        // Representative of a real system-property snapshot: paths, `=`/`:`,
+        // spaces and backslashes must survive store(save_convert) -> load(parse).
+        let pairs = [
+            ("java.class.path", "C:\\a;C:/b:dir with space"),
+            ("line.separator", "\r\n"),
+            ("key with space", "v=a:l#u!e"),
+            ("plain", "value"),
+        ];
+        let mut text = String::new();
+        for (k, v) in &pairs {
+            text.push_str(&save_convert(k, true, true));
+            text.push('=');
+            text.push_str(&save_convert(v, false, true));
+            text.push('\n');
+        }
+        let parsed = parse_properties(text.as_bytes());
+        let expected: Vec<(String, String)> = pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        assert_eq!(parsed, expected);
     }
 
     #[test]
