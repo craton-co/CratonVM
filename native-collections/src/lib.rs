@@ -26451,13 +26451,33 @@ fn native_chm_equals(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     if std::ptr::eq(this.as_ptr(), other.as_ptr()) {
         return Ok(Some(Value::Int(1)));
     }
+    // `ConcurrentHashMap.equals(o)` is `false` for a non-Map argument
+    // (`if (!(o instanceof Map)) return false`).
+    if !object_is_map(ctx, other) {
+        return Ok(Some(Value::Int(0)));
+    }
     let our_entries = chm_collect_all_entries(ctx, this);
-    // Use chm_get for lookups on 'other' (which is also segmented)
-    let other_size = native_chm_size(ctx, &[Value::Object(Some(other))])?.unwrap_or(Value::Int(0));
-    if let Value::Int(os) = other_size {
-        if os != our_entries.len() as i32 {
-            return Ok(Some(Value::Int(0)));
+    // `other` may be ANY `Map`, not just a (segmented) ConcurrentHashMap —
+    // HotSpot's `CHM.equals` does `m.get(p.key)` / iterates `m.entrySet()` via
+    // the `Map` interface. Reading `other` through the CHM-specific
+    // `native_chm_size` / `native_chm_get` reported size 0 / no entries for a
+    // plain HashMap argument, so `chm.equals(hashMap)` wrongly returned false.
+    // Route `other` access through virtual dispatch (`other.size()` /
+    // `other.get(k)`) so it resolves to whatever natives/bytecode `other`'s real
+    // class provides — same cross-implementation fix as `native_map_equals`.
+    let other_size = match ctx.invoke_virtual(other, "size", "()I", &[])? {
+        Some(Value::Int(s)) => s,
+        _ => {
+            // Defensive: a Map whose size() didn't yield an int — fall back to
+            // the CHM-native read rather than mis-comparing.
+            match native_chm_size(ctx, &[Value::Object(Some(other))])? {
+                Some(Value::Int(s)) => s,
+                _ => 0,
+            }
         }
+    };
+    if other_size != our_entries.len() as i32 {
+        return Ok(Some(Value::Int(0)));
     }
     // Compare each value with the `Map.equals` contract: `v.equals(otherVal)`.
     // `values_equal` alone only knew identity / String contents / enum identity,
@@ -26472,7 +26492,8 @@ fn native_chm_equals(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     // dispatches `v.equals(val)` directly and lets such an exception propagate.
     // So we propagate here too (the `?`), matching HotSpot.
     for (key, value) in &our_entries {
-        let other_val = native_chm_get(ctx, &[Value::Object(Some(other)), *key])?
+        let other_val = ctx
+            .invoke_virtual(other, "get", "(Ljava/lang/Object;)Ljava/lang/Object;", &[*key])?
             .unwrap_or(Value::Object(None));
         let eq = match (value, &other_val) {
             (Value::Object(Some(va)), Value::Object(Some(vb))) => map_keys_equal(ctx, *va, *vb)?,
