@@ -1304,6 +1304,14 @@ impl<'a> NativeContextImpl<'a> {
             std::mem::take(&mut *f)
         };
         if !fixup.is_empty() {
+            // BUG-03 trace (gated): record that the blocked-wake remap ran for main.
+            if self.thread.thread_id.0 == 0 && std::env::var_os("CRATONVM_DBG_BUG03").is_some() {
+                let jto = self.thread.java_thread_obj.map(|o| o.as_ptr() as usize).unwrap_or(0);
+                eprintln!(
+                    "[BUG03-fm] e{} path=blocked-wake(check_post_block) tid0 jto=0x{:x} jto_in_fixup={} fixup.len={}",
+                    self.shared.heap.collection_count(), jto, jto != 0 && fixup.contains_key(&jto), fixup.len()
+                );
+            }
             if std::env::var_os("CRATONVM_DBG_BLOCKGC").is_some() {
                 eprintln!(
                     "[blockgc] wake tid={} applying {} composed fixups ({} frames)",

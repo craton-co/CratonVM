@@ -2020,6 +2020,14 @@ pub(crate) fn apply_pointer_map_to_thread(
     pointer_map: &std::collections::HashMap<usize, usize>,
     heap: &crate::memory::VmHeap,
 ) {
+    // BUG-03 trace (gated): record that the safepoint-peer remap ran for main.
+    if thread.thread_id.0 == 0 && std::env::var_os("CRATONVM_DBG_BUG03").is_some() {
+        let jto = thread.java_thread_obj.map(|o| o.as_ptr() as usize).unwrap_or(0);
+        eprintln!(
+            "[BUG03-fm] e{} path=peer(apply_pointer_map) tid0 jto=0x{:x} jto_in_map={} pm.len={}",
+            heap.collection_count(), jto, jto != 0 && pointer_map.contains_key(&jto), pointer_map.len()
+        );
+    }
     for frame in &mut thread.frames {
         frame.update_local_refs(pointer_map, heap);
         frame.stack.update_object_refs(pointer_map, heap);

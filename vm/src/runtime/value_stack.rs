@@ -1286,6 +1286,23 @@ impl ValueStack {
     /// - Genuine primitive `Long`/`Double` values: never rooted, never
     ///   rewritten — a bit-pattern that coincidentally matches a moved object's
     ///   from-space address is left untouched so the value is not corrupted.
+    /// BUG-03 debug: locate `addr` among the operand-stack slots + report kind.
+    #[doc(hidden)]
+    pub fn dbg_locate_addr(&self, addr: usize) -> Option<String> {
+        let mask = 0x7fff_ffff_ffffusize;
+        for i in 0..self.len {
+            let obj = self.slots[i].as_object_ptr().map(|p| p as usize);
+            let raw = self.slots[i].raw_bits() as usize;
+            if obj == Some(addr) || (raw & mask) == (addr & mask) {
+                return Some(format!(
+                    "stack[{}] kind={} is_object={} obj_match={}",
+                    i, self.kinds[i], self.slots[i].is_object(), obj == Some(addr)
+                ));
+            }
+        }
+        None
+    }
+
     pub fn update_object_refs(&mut self, pointer_map: &HashMap<usize, usize>, heap: &VmHeap) {
         for i in 0..self.len {
             let cv = self.slots[i];

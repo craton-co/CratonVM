@@ -80,7 +80,43 @@ A start-path hardening was added regardless (worker reads its `java_thread_obj` 
 remapped registry rather than the raw captured `thread_obj_for_spawn`, mirroring the
 existing thread-END fix) — correct, but the probe shows it is not this crash's cause.
 
-## Leading hypotheses for the owner
+## Deep-dive 2026-06-29 (cont.) — narrowed to a frame-capture/remap timing gap on the SOLE initiator
+
+Six instrument+rebuild cycles (all gated `CRATONVM_DBG_BUG03`, default-inert; retained
+in-tree) pinned the following, which **supersedes the hypotheses below**:
+
+- **The stale value is the `parent` local (`= currentThread()`) in `java/lang/Thread.<init>`,
+  slot 7** (`Thread(ThreadGroup,String,int,Runnable,long)` — params fill slots 0–6 incl. the
+  cat-2 `long stackSize` at 5–6, so `astore 7` at pc 18 is `parent`; reused as the
+  `getThreadGroup` receiver at pc 77–79). Confirmed via `verify_no_stale_refs`
+  (`CRATONVM_GC_VERIFY_STALE=1`): `POST-GC ZERO-HEADER LOCAL: Thread.<init> local[7]`.
+- **`java_thread_obj` field AND the registry mirror are always fresh + equal** at the crash;
+  only the frame copy is stale. So `currentThread()` (which returns the field) is fine — the
+  divergence is the captured `parent` copy.
+- **It is NOT a kind/tag skip.** The `[BUG03-ulr]` diag shows slot 7 is `is_object=true`,
+  `local_kinds=0 (OTHER)`, neither `skip_kind` nor `skip_nonobj` — so `update_local_refs`
+  *would* remap it. (There is no distinct object LKIND; objects are `LKIND_OTHER`.)
+- **`main` (tid 0) is the SOLE GC initiator** — the worker's body never allocates, so every
+  moving GC is main-initiated (23/23). `apply_pointer_map_to_thread` and `check_post_block_gc`
+  **never run for main** (0 lines) — consistent, not a peer/blocked gap.
+- **The smoking-gun timing:** at the GCs that actually move the mirror (e9 `0x..638`→, e10
+  `0x..648`→, e11 `0x..638`→`0x..2aa0`), the slot-7 `[BUG03-ulr]` (in-map) diag does **NOT**
+  fire — i.e. **slot 7's address is not in those pointer_maps when `update_all_roots` runs** —
+  yet slot 7 ends up holding `0x..638` (the moved-and-zeroed mirror address) at the crash. So
+  `parent` is captured/observed around the move window in a place the per-GC frame remap
+  doesn't cover (a native-return / Rust transient during `currentThread()`→`astore`, or the
+  `Thread.<init>` frame's pc is pre-`astore 7` so slot 7 still holds a not-yet-live value at
+  the scan), and the live mirror moves out from under it.
+
+**Remaining work to a fix (1–2 cycles):** trace `parent`'s exact capture (is `currentThread()`'s
+return registered as `native_pending_return`/a root in the native-return→`astore 7` window? what
+is the `Thread.<init>` frame's `pc` at e9–e11?). Candidate fixes: (a) register the
+`currentThread()` native return as a tracked root until stored; (b) on the all-zero Thread-receiver
+detection, recover via the fresh `java_thread_obj` when the stale object was the current thread's
+mirror. **A start-path mirror hardening + the full `CRATONVM_DBG_BUG03` diagnostic suite are
+committed** (branch `feat/precise-maps-a4-finish`).
+
+## Leading hypotheses for the owner (pre-2026-06-29; (1) and (3) since refuted — see above)
 
 1. **A transient thread state with no remap site.** A thread that is mid-`Thread.start()` (the spawning thread) or a just-spawned worker in its bootstrap window may hold/own the mirror in a way that neither `update_all_roots` (initiator), `apply_pointer_map_to_thread` (parked), nor `check_post_block_gc` (blocked) covers — e.g. running native thread-setup code, or after `register`/`set_root_snapshot` but before the worker's first cooperative safepoint. The `thread_obj_for_spawn` raw `ObjectRef` captured at spawn (vm/src/vm/vm_exec.rs) is "captured … and NEVER remapped" by design (it reads back from the registry) — re-audit that read-back across *back-to-back* moving GCs.
 2. **Multi-collection staleness:** mirror moved by GC1 (ref updated), then GC2 moves it again while the holding thread is in a window not covered by a remap site → the ref from GC1's new address becomes stale.

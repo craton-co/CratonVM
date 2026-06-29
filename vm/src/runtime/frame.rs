@@ -1356,6 +1356,25 @@ impl Frame {
         // Indexed loop so the per-slot `local_kinds` mark can be consulted
         // without aliasing the `&mut self.locals` borrow.
         for i in 0..self.locals.len() {
+            // BUG-03 diag (gated): for any slot whose address is in this GC's
+            // pointer_map, log the kind/tag/decision — captures the exact slot
+            // (Thread.<init> local[7] = `parent`) that the remap skips.
+            if std::env::var_os("CRATONVM_DBG_BUG03").is_some() {
+                let cv = self.locals[i];
+                let obj = cv.as_object_ptr().map(|p| p as usize);
+                let raw = cv.raw_bits() as usize;
+                let in_map = obj.map(|a| pointer_map.contains_key(&a)).unwrap_or(false)
+                    || pointer_map.contains_key(&(raw & 0x7fff_ffff_ffff));
+                if in_map {
+                    eprintln!(
+                        "[BUG03-ulr] {}.{} local[{}] kind={} is_object={} obj={:?} raw=0x{:x} skip_kind={} skip_nonobj={}",
+                        self.class_name(), self.method_name(), i, self.local_kinds[i],
+                        cv.is_object(), obj, raw,
+                        self.local_kinds[i] == LKIND_LONG || self.local_kinds[i] == LKIND_DOUBLE,
+                        !cv.is_object(),
+                    );
+                }
+            }
             // Never remap a primitive `long` / `double` slot. The `pointer_map`
             // is the *global* relocation record, so a collision long whose low
             // 47 bits happen to equal some unrelated object's from-space
@@ -1416,6 +1435,25 @@ impl Frame {
                     .unwrap_or_else(CompactValue::null);
             }
         }
+    }
+
+    /// BUG-03 debug: locate `addr` among this frame's locals/operand stack and
+    /// report the slot + its kind tag. Used to find a mis-tagged object slot that
+    /// the kind-gated remap skips (the concurrent-spawn stale-`parent` root cause).
+    #[doc(hidden)]
+    pub fn dbg_locate_addr(&self, addr: usize) -> Option<String> {
+        let mask = 0x7fff_ffff_ffffusize;
+        for i in 0..self.locals.len() {
+            let obj = self.locals[i].as_object_ptr().map(|p| p as usize);
+            let raw = self.locals[i].raw_bits() as usize;
+            if obj == Some(addr) || (raw & mask) == (addr & mask) {
+                return Some(format!(
+                    "local[{}] kind={} is_object={} obj_match={}",
+                    i, self.local_kinds[i], self.locals[i].is_object(), obj == Some(addr)
+                ));
+            }
+        }
+        self.stack.dbg_locate_addr(addr).map(|s| format!("operand-{s}"))
     }
 }
 
