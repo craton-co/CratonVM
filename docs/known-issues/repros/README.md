@@ -6,6 +6,11 @@ Easy-access, tracked copies of the standalone reproducers for the **open** bugs 
 at risk of being lost. The bugs span **Wildfly, Kafka, Hibernate, Elasticsearch,
 Keycloak and Spring** — not Spring-only.
 
+> **Re-run 2026-06-29:** the **A2** (`ReflRepro`) and **A5** (`gc-stress` bintrees) repros now
+> pass on dev (their docs moved to `docs/internal/`), and three more — `spring-bug-08`,
+> `keycloak-15`, `keycloak-16` — **no longer reproduce on dev** (see ✅ rows below). `A4`/`Fork6`
+> still exercises the architectural FJP register-root gap (non-fatal: prints `ALL-OK`).
+
 Run pattern (replace `$CV` with a built binary, `$JDK` with the JDK 25 home):
 ```
 javac <Repro>.java
@@ -19,9 +24,9 @@ $CV --java-home "$JDK" -cp <dir> <Repro>  # CratonVM (reproduces the gap)
 |---|---|---|
 | `reflrepro-…` (**A2**) | `A2-reflrepro/ReflRepro.java` | `CRATONVM_DBG_GC_STRESS=65536 $CV … -cp A2-reflrepro ReflRepro 8000` → **rc=139** (UAF). `--nojit` clean. |
 | `fork6-…` (**A4**) | `A4-fork6/Fork6.java` | `CRATONVM_REAL_FORKJOINPOOL=1 CRATONVM_DISABLE_DEFAULT_WATCHDOG=1 $CV … Fork6` → NPE/CCE in workers (~rep 4). HotSpot/`--nojit`/`-Xmx8g` print `ALL-OK`. |
-| `spring-bug-08-…` | `spring-bug-08-proxy-serialization/ProxySer.java` | serialize→deserialize a `Serializable` JDK proxy → **`UnsatisfiedLinkError: Module.defineModule0`** on deserialize. HotSpot `RESULT=OK`. |
-| `keycloak-15-…` | `keycloak-15-path-root/PathRoot.java` | `Paths.get("C:\\foo\\bar")` → `getRoot()=null`, `nameCount=3` (HotSpot `C:\`, 2). |
-| `keycloak-16-…` | `keycloak-16-stream-onclose/StreamOnClose.java` | `onClose` handler dropped (close() no-op) **and** eager `peek` (`peeked=5` vs lazy 1). |
+| `spring-bug-08-…` | `spring-bug-08-proxy-serialization/ProxySer.java` | ✅ **NOW PASSES on dev** (re-run 2026-06-29: `RESULT=OK`, no `UnsatisfiedLinkError`). Was: serialize→deserialize a `Serializable` JDK proxy → `UnsatisfiedLinkError: Module.defineModule0` on deserialize. |
+| `keycloak-15-…` | `keycloak-15-path-root/PathRoot.java` | ✅ **NOW PASSES on dev** (re-run 2026-06-29: `getRoot()=C:\`, `nameCount=2`, ==HotSpot). Was: `Paths.get("C:\\foo\\bar")` → `getRoot()=null`, `nameCount=3`. |
+| `keycloak-16-…` | `keycloak-16-stream-onclose/StreamOnClose.java` | ✅ **NOW PASSES on dev** (re-run 2026-06-29: onClose ran, lazy `peek=1`, ==HotSpot). Was: `onClose` handler dropped (close() no-op) and eager `peek` (`peeked=5`). |
 | `bug06-fam5-…` | `bug06-fam5-reflection-null/Refl5.java` | reflection-surface diff vs HotSpot (the *common* cases pass; doc needs the narrow failing path attributed). |
 | `springrepos-…` (latent deep recursion) | `springrepos-deep-recursion/GroovyNestProbe.java` | deeply-nested Groovy closures; clean `dev` runs slow-not-crash — the native-stack overflow only with the unmerged cold-path JIT experiment. |
 | `jit-regalloc-callee-saved-clobber-family` | `jit-regalloc-dup_x1/Dupx.java` | the bare `tab[index++]` `dup_x1` idiom — **does NOT** reproduce alone (matches HotSpot); kept as the negative control showing the family bug is method-shape-specific. |

@@ -1909,6 +1909,28 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         }
     }
 
+    fn add_global_root(&mut self, obj: ObjectRef) -> usize {
+        // Backed by the JNI global-ref table: a persistent, cross-thread,
+        // GC-remapped root. Used by the async-socket completion path to hold a
+        // CompletionHandler / attachment / ByteBuffer parked on a worker thread
+        // and delivered later on the AIO dispatcher thread.
+        self.shared.jni_global_refs.lock().add(obj) as usize
+    }
+
+    fn resolve_global_root(&self, handle: usize) -> Option<ObjectRef> {
+        self.shared
+            .jni_global_refs
+            .lock()
+            .resolve(handle as crate::native::jni::JObject)
+    }
+
+    fn remove_global_root(&mut self, handle: usize) -> bool {
+        self.shared
+            .jni_global_refs
+            .lock()
+            .remove(handle as crate::native::jni::JObject)
+    }
+
     fn invoke(
         &mut self,
         class_name: &str,

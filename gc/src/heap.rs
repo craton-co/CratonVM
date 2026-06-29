@@ -1535,10 +1535,28 @@ pub unsafe fn read_prim_element(base: *mut u8, index: usize, et: ArrayElementTyp
                 .checked_mul(REF_ELEMENT_SIZE)
                 .expect("array ref element offset overflow");
             let raw: u64 = std::ptr::read(base.add(offset) as *const u64);
-            if raw == 0 {
-                Value::Object(None)
-            } else {
+            // Defense-in-depth reference-slot decode. Mirrors the VTAG_OBJECT
+            // degrade in `cratonvm_types::decode_value` (operand/local SoA path)
+            // and `CompactValue::to_value`'s SUB_OBJECT plausibility gate, which
+            // this hot heap-read path previously bypassed by wrapping ANY
+            // non-zero bits verbatim. A non-null reference slot whose bits are
+            // unaligned, inside the null-guard page, or outside the 47-bit
+            // user-address range is provably NOT a live object pointer: it is
+            // reused/garbage memory surfaced through a STALE reference (a GC
+            // root-coverage gap that swept-then-reused the young slot this ref
+            // still points at — observed as 8000+ all-zero-header stale `Thread`
+            // receivers, then `0x77..`/`": contex"` buffer bytes read back here).
+            // Fabricating an `ObjectRef` from such bits SIGSEGVs on its next
+            // deref, or panics in `CompactValue::object` for >47-bit bits
+            // (compact_value.rs:502). Degrade to null instead — the field/array
+            // read callers already normalise `Object(None)`, matching HotSpot's
+            // "you get a null, not a VM crash". Pure bit ops (no heap probe), so
+            // it is safe on this hot path and never rejects a valid pointer
+            // (every real object is 8-aligned, above the guard page, ≤47-bit).
+            if cratonvm_types::plausible_heap_pointer(raw) {
                 Value::Object(Some(ObjectRef::from_raw(raw as usize as *mut u8)))
+            } else {
+                Value::Object(None)
             }
         }
     }

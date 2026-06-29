@@ -455,6 +455,29 @@ fn cold_decode_degraded_object_ptr(ptr: *mut u8) -> Value {
     Value::Object(None)
 }
 
+/// Cheap, context-free plausibility test for a raw heap-object pointer.
+///
+/// A genuine object reference on x86-64 / AArch64 user space is non-null,
+/// 8-byte aligned, above the null-guard page, and fits in 47 bits. Any value
+/// failing these is provably NOT a live object pointer — it is reused/garbage
+/// memory surfaced through a STALE reference (a GC root-coverage gap that
+/// swept-then-reused the slot a ref still points at). Pure bit ops (no heap
+/// probe), so it is safe on the hottest field/array read paths, and it NEVER
+/// rejects a valid pointer (zero false positives).
+///
+/// Shared by the interpreter decode (`read_prim_element`,
+/// `CompactValue::from_value`) and the JIT field/array read helpers
+/// (`jit_getfield`, `jit_aaload`) so a stale reference is degraded to null at
+/// EVERY read boundary — interpreter and JIT alike — instead of being
+/// dereferenced (SIGSEGV) or fabricated into an out-of-47-bit `CompactValue`
+/// (the compact_value.rs panic).
+#[inline(always)]
+pub const fn plausible_heap_pointer(raw: u64) -> bool {
+    const NULL_GUARD_PAGE: u64 = 0x1000;
+    const ADDR_BITS_47: u64 = (1u64 << 47) - 1;
+    raw >= NULL_GUARD_PAGE && raw & 0x7 == 0 && raw <= ADDR_BITS_47
+}
+
 /// Decode a compact (u64, u8) pair back into a Value.
 #[inline(always)]
 pub fn decode_value(val: u64, tag: u8) -> Value {
