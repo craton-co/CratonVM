@@ -4820,6 +4820,72 @@ fn args_match_descriptor_exactly(
     true
 }
 
+/// Build a `java.lang.invoke.SerializedLambda` standing in for the lambda
+/// `proxy`, populated from its registered call-site metadata and captured
+/// field values. This is the value the JVM's generated `writeReplace()` would
+/// return; real `ObjectOutputStream` serializes it, and `readResolve()` on the
+/// other side reconstructs the lambda via the capturing class's generated
+/// `$deserializeLambda$` (which re-runs the lambda's invokedynamic).
+fn build_serialized_lambda(
+    ctx: &mut dyn NativeContext,
+    proxy_cid: ClassId,
+    proxy: ObjectRef,
+    meta: &cratonvm_native_api::LambdaSerialMetadata,
+) -> MethodCallResult {
+    let sl_cid = match ctx.ensure_class_initialized("java/lang/invoke/SerializedLambda") {
+        Ok(id) => id,
+        // No real SerializedLambda class (e.g. synthetic-jdk mode): fall back to
+        // returning the proxy unchanged so the caller's serialization proceeds
+        // via its own path rather than NPE-ing here.
+        Err(_) => return Ok(Some(Value::Object(Some(proxy)))),
+    };
+
+    // Capturing class = where the lambda's invokedynamic appears (the class
+    // whose `$deserializeLambda$` will reconstruct it). Falls back to the impl
+    // class for proxies created off the indy path (e.g. reflective factories).
+    let capturing_name = ctx
+        .lambda_proxy_host(proxy_cid)
+        .unwrap_or_else(|| meta.impl_class.clone());
+    let capturing_mirror = match ctx.class_id_by_name(&capturing_name) {
+        Some(cid) => Value::Object(Some(ctx.get_class_mirror(cid))),
+        None => Value::Object(None),
+    };
+
+    // capturedArgs: one (boxed) value per proxy capture field, in order.
+    let capture_chars: Vec<char> = meta.capture_types.chars().collect();
+    let captured = ctx.new_ref_array(ClassId::new(0), capture_chars.len());
+    for (i, tc) in capture_chars.iter().enumerate() {
+        let raw = ctx.get_field(proxy, i);
+        let boxed = box_value(ctx, raw, &tc.to_string());
+        ctx.set_array_element(captured, i, boxed);
+    }
+
+    let total = ctx.class_num_total_fields(sl_cid).max(10);
+    let sl = ctx.alloc_object(sl_cid, total);
+    ctx.set_field_by_name(sl, "capturingClass", capturing_mirror);
+    let fic = ctx.create_string(&meta.functional_interface);
+    ctx.set_field_by_name(sl, "functionalInterfaceClass", Value::Object(Some(fic)));
+    let fimn = ctx.create_string(&meta.sam_method_name);
+    ctx.set_field_by_name(sl, "functionalInterfaceMethodName", Value::Object(Some(fimn)));
+    let fims = ctx.create_string(&meta.sam_descriptor);
+    ctx.set_field_by_name(
+        sl,
+        "functionalInterfaceMethodSignature",
+        Value::Object(Some(fims)),
+    );
+    let ic = ctx.create_string(&meta.impl_class);
+    ctx.set_field_by_name(sl, "implClass", Value::Object(Some(ic)));
+    let imn = ctx.create_string(&meta.impl_member);
+    ctx.set_field_by_name(sl, "implMethodName", Value::Object(Some(imn)));
+    let ims = ctx.create_string(&meta.impl_descriptor);
+    ctx.set_field_by_name(sl, "implMethodSignature", Value::Object(Some(ims)));
+    ctx.set_field_by_name(sl, "implMethodKind", Value::Int(meta.impl_ref_kind as i32));
+    let imt = ctx.create_string(&meta.instantiated_descriptor);
+    ctx.set_field_by_name(sl, "instantiatedMethodType", Value::Object(Some(imt)));
+    ctx.set_field_by_name(sl, "capturedArgs", Value::Object(Some(captured)));
+    Ok(Some(Value::Object(Some(sl))))
+}
+
 pub(crate) fn native_method_invoke(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -4875,6 +4941,29 @@ pub(crate) fn native_method_invoke(
         Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
         _ => String::new(),
     };
+
+    // Serializable-lambda support: `ObjectOutputStream` reflectively invokes
+    // the synthetic `writeReplace()` we expose on lambda proxies (see
+    // `declared_methods_with_synthetic`) to obtain a `SerializedLambda`
+    // stand-in. Handle it before the access check — the synthetic method is
+    // private and `ObjectStreamClass` may invoke it without first toggling the
+    // reflective `accessible` flag, which would otherwise raise
+    // IllegalAccessException. Build the record from the proxy's call-site
+    // metadata + captured fields so real OOS writes a portable form (which
+    // deserializes via the JVM-generated `$deserializeLambda$` + invokedynamic
+    // path) instead of the un-loadable `$$Lambda` class name.
+    if method_name == "writeReplace" {
+        let wr_desc = method_descriptor_for_invoke(ctx, this);
+        if wr_desc == "()Ljava/lang/Object;" {
+            if let Some(Value::Object(Some(recv))) = args.get(1) {
+                let recv = *recv;
+                let rcid = ctx.class_id_of_object(recv);
+                if let Some(meta) = ctx.lambda_proxy_serial_metadata(rcid) {
+                    return build_serialized_lambda(ctx, rcid, recv, &meta);
+                }
+            }
+        }
+    }
 
     // Access control: accessible flag lives in a CratonVM extra slot.
     let accessible = read_method_accessible(ctx, this);
@@ -5739,6 +5828,29 @@ fn declared_methods_with_synthetic(
 ) -> Vec<MethodMetadata> {
     let mut methods = ctx.declared_methods(class_id);
 
+    // Serializable-lambda support: a real JVM-spun lambda class carries a
+    // private `Object writeReplace()` that `ObjectOutputStream` (via
+    // `ObjectStreamClass.getInheritableMethod`) invokes to swap the lambda for
+    // a `SerializedLambda`. Our synthetic lambda proxies have no bytecode, so
+    // without exposing one here real OOS serializes the proxy by its
+    // un-loadable `$$Lambda` class name and deserialization throws
+    // ClassNotFoundException. Report the synthetic writeReplace so reflection
+    // finds it; `native_method_invoke` builds the SerializedLambda when it is
+    // actually called. (Private + declared on the proxy class itself, matching
+    // the real lambda, so `getInheritableMethod` accepts it.)
+    if is_lambda_proxy_id(class_id) && ctx.lambda_proxy_host(class_id).is_some() {
+        if !methods.iter().any(|m| m.name == "writeReplace") {
+            methods.push(MethodMetadata {
+                name: "writeReplace".to_string(),
+                descriptor: "()Ljava/lang/Object;".to_string(),
+                access_flags: 0x0002, // ACC_PRIVATE
+                declaring_class_id: class_id,
+                exceptions: Vec::new(),
+            });
+        }
+        return methods;
+    }
+
     let class_name = match ctx.class_name_of_id(class_id) {
         Some(n) => n,
         None => return methods,
@@ -5826,10 +5938,56 @@ pub(crate) fn native_class_get_declared_methods(
 
         let methods = declared_methods_with_synthetic(ctx, class_id);
         // Filter out <init> and <clinit>
-        let visible: Vec<&MethodMetadata> = methods
+        let mut visible: Vec<&MethodMetadata> = methods
             .iter()
             .filter(|m| m.name != "<init>" && m.name != "<clinit>")
             .collect();
+
+        // Bridge-method adjacency ordering. A compiler-generated bridge method
+        // (ACC_BRIDGE, 0x40) is emitted AFTER its bridged counterpart in the
+        // class file, but typically as the LAST method of the class — so a
+        // bridged method and its bridge are not adjacent. HotSpot's
+        // `getDeclaredMethods` (symbol-table order) keeps the bridge right after
+        // its same-name bridged method, and two kinds of Spring code rely on
+        // that relative order:
+        //   * `ReflectionUtils.findMethod` / generic-type resolution take the
+        //     FIRST same-name method, which MUST stay the real (non-bridge) one,
+        //     else `getGenericReturnType()` reads the bridge's erased `Object`
+        //     return (GenericTypeResolverTests.resolveTypeFromNestedParameterizedType);
+        //   * the bridge-method tests collect all same-named methods and pick
+        //     the Object-returning bridge as `methods.get(0)`/`get(1)`, asserting
+        //     `isBridge()` (MergedAnnotationsTests.getWithTypeHierarchyFromBridgeMethod,
+        //     MergedAnnotationsComposedOnSingleAnnotatedElementTests
+        //     .typeHierarchyStrategyMultipleComposedAnnotationsOnBridgeMethod).
+        // Both are satisfied by moving each bridge to IMMEDIATELY AFTER the first
+        // same-name non-bridge method (never making a bridge the first sibling).
+        // Minimal, stable: everything else keeps its class-file position, and
+        // only classes that declare a bridge with a same-name sibling change.
+        if visible.iter().any(|m| m.access_flags & 0x0040 != 0) {
+            let mut reordered: Vec<&MethodMetadata> = Vec::with_capacity(visible.len());
+            let mut placed = vec![false; visible.len()];
+            for i in 0..visible.len() {
+                if placed[i] {
+                    continue;
+                }
+                reordered.push(visible[i]);
+                placed[i] = true;
+                // After the first same-name NON-bridge method, pull in any later
+                // same-name bridge(s) so the bridge follows its bridged method.
+                if visible[i].access_flags & 0x0040 == 0 {
+                    for j in (i + 1)..visible.len() {
+                        if !placed[j]
+                            && visible[j].access_flags & 0x0040 != 0
+                            && visible[j].name == visible[i].name
+                        {
+                            reordered.push(visible[j]);
+                            placed[j] = true;
+                        }
+                    }
+                }
+            }
+            visible = reordered;
+        }
 
         // GC-safe: `create_method_object` allocates (see `build_mirror_array`).
         let arr = build_mirror_array(ctx, visible.len(), |ctx, i| {
@@ -5901,11 +6059,12 @@ pub(crate) fn native_class_get_declared_method(
     // `;`-delimited list of dotted class names — not a JVM descriptor,
     // but unique within `(class_id, name)` so identical Spring /
     // Hibernate / ByteBuddy probes hit the cache instead of re-walking.
-    // When `param_types_arr` is `None` the call is ambiguous (returns
-    // the *first* matching method), so we still cache against an empty
-    // string — the cached entry stays correct as long as the class
-    // hasn't been redefined (the round-8 invalidation hook drops every
-    // entry keyed on `class_id` on redefine).
+    // A `None` `param_types_arr` is semantically identical to an empty
+    // array (both mean "match a no-arg method" — see the cold-walk loop
+    // below), so both map to the same empty cache key, which is correct.
+    // The cached entry stays valid as long as the class hasn't been
+    // redefined (the round-8 invalidation hook drops every entry keyed on
+    // `class_id` on redefine).
     //
     // A `None` element in the parameter array makes the key
     // unrepresentable; we set `cache_key_ok = false` so we skip both
@@ -5960,13 +6119,29 @@ pub(crate) fn native_class_get_declared_method(
             continue;
         }
 
+        // JDK semantics: a `null` parameterTypes argument is treated as a
+        // ZERO-length array — `Class.getDeclaredMethod(name, (Class[])null)`
+        // matches ONLY a no-arg method. `Class.searchMethods` compares the
+        // query types against each candidate via `arrayContentsEq(null, p)`,
+        // which is true iff `p` is empty. Previously a `None` array skipped
+        // the arity/type check entirely and returned the FIRST same-named
+        // method regardless of parameter count, so a no-arg
+        // `getDeclaredMethod("writeReplace")` probe — exactly what
+        // `java.io.ObjectStreamClass.getInheritableMethod` issues with
+        // `argTypes == null` while resolving the serialization replacement
+        // hook — wrongly matched a 1-arg `writeReplace(Object)` overload.
+        // `ObjectStreamClass.invokeWriteReplace` then called it with 0 args
+        // → `Method.invoke` IllegalArgumentException (HIB-CV-36). Treat a
+        // missing array as "expected zero parameters".
+        let (param_descs, _) = parse_descriptor_param_and_return(&meta.descriptor);
+        let expected_count = match param_types_arr {
+            Some(pt_arr) => ctx.array_length(pt_arr),
+            None => 0,
+        };
+        if param_descs.len() != expected_count {
+            continue;
+        }
         if let Some(pt_arr) = param_types_arr {
-            // Match parameter types
-            let (param_descs, _) = parse_descriptor_param_and_return(&meta.descriptor);
-            let expected_count = ctx.array_length(pt_arr);
-            if param_descs.len() != expected_count {
-                continue;
-            }
             // Check each parameter type matches
             let mut matched = true;
             for (i, pdesc) in param_descs.iter().enumerate() {
@@ -7259,13 +7434,19 @@ pub(crate) fn native_class_get_method(
             {
                 continue;
             }
-            // Check parameter types if specified
+            // Check parameter types. A `null` array is treated as a
+            // ZERO-length one (JDK `Class.searchMethods` semantics — see
+            // `getDeclaredMethod` above / HIB-CV-36): it matches ONLY a
+            // no-arg method, never the first same-named overload.
+            let (param_descs, _) = parse_descriptor_param_and_return(&meta.descriptor);
+            let expected_count = match param_types_arr {
+                Some(pt_arr) => ctx.array_length(pt_arr),
+                None => 0,
+            };
+            if param_descs.len() != expected_count {
+                continue;
+            }
             if let Some(pt_arr) = param_types_arr {
-                let (param_descs, _) = parse_descriptor_param_and_return(&meta.descriptor);
-                let expected_count = ctx.array_length(pt_arr);
-                if param_descs.len() != expected_count {
-                    continue;
-                }
                 let mut matched = true;
                 for (i, pdesc) in param_descs.iter().enumerate() {
                     let expected_mirror = match ctx.get_array_element(pt_arr, i) {
@@ -8018,15 +8199,34 @@ fn create_annotation_proxy(
     // this field is null, BlockJUnit4ClassRunner reports a dummy failure
     // because runsTopToBottom(Class) NPEs on equals().
     if let Some(class_name) = annotation_desc_to_class_name(&ann.type_descriptor) {
-        let cid_opt = ctx.class_id_by_name(class_name).or_else(|| {
-            // load_class returns the mirror; we only need the ClassId, so just
-            // trigger the load and re-query by name.
-            let _ = ctx.load_class(class_name);
-            ctx.class_id_by_name(class_name)
+        // Resolve the annotation TYPE through the declaring class's loader (the
+        // "container" in HotSpot's `AnnotationParser`) when one is supplied, so a
+        // child/isolating loader's OWN copy of the annotation interface is used.
+        // The type mirror backs `annotation.getClass()` and
+        // `annotation.annotationType()`, both of which must report the declaring
+        // loader for classloader-isolation patterns
+        // (MergedAnnotationClassLoaderTests.synthesizedUsesCorrectClassLoader).
+        // A meta-annotation that the child loader is NOT eligible to override
+        // delegates to the parent here, so it correctly reports the parent loader.
+        // Falls back to the global store for built-in loaders / on any loader
+        // failure (preserving the prior best-effort behavior).
+        let via_loader = container_loader.and_then(|loader| {
+            match resolve_annotation_class_via_loader(ctx, loader, class_name) {
+                Ok(mirror) => ctx.class_id_from_mirror(mirror).map(|cid| (cid, mirror)),
+                Err(_) => None,
+            }
         });
-        if let Some(cid) = cid_opt {
+        let cid_mirror = via_loader.or_else(|| {
+            let cid = ctx.class_id_by_name(class_name).or_else(|| {
+                // load_class returns the mirror; we only need the ClassId, so just
+                // trigger the load and re-query by name.
+                let _ = ctx.load_class(class_name);
+                ctx.class_id_by_name(class_name)
+            })?;
+            Some((cid, ctx.get_class_mirror(cid)))
+        });
+        if let Some((cid, mirror)) = cid_mirror {
             ann_class_id_opt = Some(cid);
-            let mirror = ctx.get_class_mirror(cid);
             ctx.set_field(proxy, ANN_PROXY_TYPE_MIRROR, Value::Object(Some(mirror)));
         } else if std::env::var("CRATONVM_IAE_TRACE").is_ok() {
             eprintln!("ANN-PROXY-NULL-MIRROR: annotation={} type_descriptor={} class_name={class_name} — type mirror NOT set (class load failed)",
@@ -11974,24 +12174,28 @@ fn make_annotated_type_with_anns(
 }
 
 /// Read the stashed `Annotation[]` from an AnnotatedType built by
-/// [`make_annotated_type`] / [`make_annotated_type_with_anns`]. Returns `None`
-/// when the `annotations` field is absent or not a reference array (e.g. a
-/// real-JDK `AnnotatedTypeBaseImpl` whose `annotations` field holds a `Map`,
-/// constructed by bytecode paths we don't intercept — those carry no
-/// annotations anyway since `getTypeAnnotationBytes0` is null).
+/// [`make_annotated_type`] / [`make_annotated_type_with_anns`], returning
+/// `(array_ref, len)`. Returns `None` when the `annotations` field is null or
+/// not an array.
+///
+/// A real-JDK `AnnotatedTypeBaseImpl` (built by bytecode paths we don't
+/// intercept) stores a `Map` here, not an `Annotation[]` — `object_is_array`
+/// distinguishes the two by heap object kind (a class-name check can't: a
+/// heap reference array reports its *component* class, not a `[L…;` class).
+/// Those real instances carry no top-level type annotations anyway, since
+/// `getTypeAnnotationBytes0` is null, so reporting them as empty is correct.
 fn annotated_type_stashed_anns(
     ctx: &dyn NativeContext,
     this: ObjectRef,
-) -> Option<ObjectRef> {
+) -> Option<(ObjectRef, usize)> {
     let arr = match ctx.get_field_by_name(this, "annotations") {
         Value::Object(Some(a)) => a,
         _ => return None,
     };
-    let cid = ctx.class_id_of_object(arr);
-    match ctx.class_name_of_id(cid) {
-        Some(n) if n.starts_with('[') => Some(arr),
-        _ => None,
+    if !ctx.object_is_array(arr) {
+        return None;
     }
+    Some((arr, ctx.array_length(arr)))
 }
 
 /// `Method.getAnnotatedReturnType()Ljava/lang/reflect/AnnotatedType;`
@@ -12100,6 +12304,27 @@ pub(crate) fn native_executable_get_annotated_parameter_types(
     Ok(Some(Value::Object(Some(out))))
 }
 
+/// `Field.getAnnotatedType()Ljava/lang/reflect/AnnotatedType;`
+///
+/// Builds an AnnotatedType wrapping the field's (erased) type and carrying the
+/// field's FIELD-target TYPE_USE annotations.
+pub(crate) fn native_field_get_annotated_type(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let anns = match field_class_and_name(ctx, this) {
+        Some((cid, name)) => ctx.field_type_annotations(cid, &name),
+        None => Vec::new(),
+    };
+    let type_mirror = match ctx.invoke_virtual(this, "getType", "()Ljava/lang/Class;", &[]) {
+        Ok(Some(Value::Object(Some(m)))) => m,
+        _ => ctx.get_class_mirror(cratonvm_types::ClassId::new(0)),
+    };
+    let at = make_annotated_type_with_anns(ctx, type_mirror, &anns);
+    Ok(Some(Value::Object(Some(at))))
+}
+
 /// `AnnotatedType.getDeclaredAnnotations()` / `getAnnotations()` override for
 /// the `AnnotatedTypeBaseImpl` instances CratonVM constructs. Returns the
 /// stashed `Annotation[]` (or an empty array).
@@ -12108,8 +12333,13 @@ pub(crate) fn native_annotated_type_get_declared_annotations(
     args: &[Value],
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    if let Some(arr) = annotated_type_stashed_anns(ctx, this) {
-        return Ok(Some(Value::Object(Some(arr))));
+    let stashed = annotated_type_stashed_anns(ctx, this);
+    if let Some((arr, len)) = stashed {
+        if len > 0 {
+            // The field holds an actual `Annotation[]` (length>0 ⇒ array kind);
+            // return it directly.
+            return Ok(Some(Value::Object(Some(arr))));
+        }
     }
     let comp = annotation_component_class_id(ctx);
     let empty = ctx.new_ref_array(comp, 0);
@@ -12131,8 +12361,7 @@ pub(crate) fn native_annotated_type_get_annotation(
         Some(w) => w,
         None => return Ok(Some(Value::Object(None))),
     };
-    if let Some(arr) = annotated_type_stashed_anns(ctx, this) {
-        let n = ctx.array_length(arr);
+    if let Some((arr, n)) = annotated_type_stashed_anns(ctx, this) {
         for i in 0..n {
             if let Value::Object(Some(proxy)) = ctx.get_array_element(arr, i) {
                 if let Value::Object(Some(tm)) = ctx.get_field(proxy, ANN_PROXY_TYPE_MIRROR) {
@@ -14537,6 +14766,54 @@ mod tests {
                 );
             }
             other => panic!("G2: Method.parameterTypes MUST be a non-null array (was {other:?})",),
+        }
+    }
+
+    #[test]
+    fn hib_cv36_get_declared_method_null_argtypes_matches_only_no_arg() {
+        // HIB-CV-36: `Class.getDeclaredMethod(name, (Class[])null)` is the
+        // form `java.io.ObjectStreamClass.getInheritableMethod` uses to
+        // resolve the serialization `writeReplace` hook. Per JDK semantics
+        // a null parameterTypes array is equivalent to an EMPTY one — it
+        // must match ONLY a no-arg method, never a same-named overload that
+        // takes parameters. Previously the native skipped the arity check
+        // when the array was null and returned the FIRST same-named method,
+        // so a no-arg `getDeclaredMethod("writeReplace")` matched a 1-arg
+        // `writeReplace(Object)` → later invoked with 0 args → IAE.
+        let mut ctx = mock_ctx();
+        let cid = ctx
+            .ensure_class_initialized("com/example/WriteReplaceOnly")
+            .expect("mock ensure_class_initialized must succeed");
+        // The class declares ONLY a 1-arg `Object writeReplace(Object)`.
+        ctx.set_declared_methods(
+            cid,
+            vec![MethodMetadata {
+                name: "writeReplace".to_string(),
+                descriptor: "(Ljava/lang/Object;)Ljava/lang/Object;".to_string(),
+                access_flags: 0x00,
+                declaring_class_id: cid,
+                exceptions: Vec::new(),
+            }],
+        );
+        let mirror = make_class_mirror(&mut ctx, cid.as_u32(), "com/example/WriteReplaceOnly");
+        let name = ctx.create_string("writeReplace");
+
+        // Null argTypes (args[2] absent / None) must NOT match the 1-arg
+        // overload — it must throw NoSuchMethodException.
+        let r = native_class_get_declared_method(
+            &mut ctx,
+            &[
+                Value::Object(Some(mirror)),
+                Value::Object(Some(name)),
+                Value::Object(None),
+            ],
+        );
+        match r {
+            Err(_) => {}
+            Ok(other) => panic!(
+                "HIB-CV-36: no-arg getDeclaredMethod(\"writeReplace\") must throw \
+                 NoSuchMethodException, not match the 1-arg overload (got {other:?})",
+            ),
         }
     }
 

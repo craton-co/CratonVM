@@ -8243,13 +8243,23 @@ enum JarFsKind {
 
 fn jarfs_classify(jar: &str, entry: &str) -> JarFsKind {
     let entry = entry.trim_start_matches('/');
+    // The mounted jar's ROOT is always a directory — even when the jar file
+    // itself is missing. A manifest `Class-Path:` header routinely names sibling
+    // jars that aren't present (e.g. Derby's `Class-Path: derbyshared.jar …`,
+    // none of which live in the Gradle cache's per-artifact hash dir); javac
+    // mounts each and walks its root. Reporting the root of an absent jar as
+    // `Absent` made `readAttributes` throw `NoSuchFileException`, which javac
+    // surfaced as a fatal "cannot access <package>" (the missing jar otherwise
+    // contributes no classes, so it should walk as an EMPTY directory and be
+    // skipped — matching the net effect of HotSpot, whose zip provider throws at
+    // mount time and javac then skips the entry).
+    if entry.is_empty() {
+        return JarFsKind::Dir;
+    }
     let names = match jar_index(jar) {
         Some(n) => n,
         None => return JarFsKind::Absent,
     };
-    if entry.is_empty() {
-        return JarFsKind::Dir;
-    }
     // Exact entry → a regular file.
     if names.binary_search_by(|n| n.as_str().cmp(entry)).is_ok() {
         return JarFsKind::File;
@@ -16521,6 +16531,61 @@ fn spring_class_utils_for_name_impl(
             let array_desc = format!("{}{component}", "[".repeat(dims));
             if let Ok(cid) = ctx.ensure_class_initialized(&array_desc) {
                 return Ok(Some(Value::Object(Some(ctx.get_class_mirror(cid)))));
+            }
+        }
+    }
+
+    // Classloader-isolation: when an explicit, *user-defined* ClassLoader is
+    // supplied (e.g. Spring's OverridingClassLoader / a FilteringClassLoader),
+    // resolve the class THROUGH that loader instead of CratonVM's global
+    // classpath scanner. Real Spring's `ClassUtils.forName` calls
+    // `Class.forName(name, false, classLoader)`, whose defining-loader identity
+    // and override-first ordering are essential to classloader-isolation
+    // patterns: a child loader must define its OWN copy of an eligible class
+    // (even when the parent already loaded one), and Class-valued annotation
+    // members must then resolve through that child loader. Ignoring the loader
+    // here made every such class resolve to the app-loaded copy, defeating the
+    // isolation — so a FilteringClassLoader that rejects `*Filtered*` types was
+    // bypassed (no deferred `TypeNotPresentException`) and synthesized
+    // annotations reported the app loader instead of the child
+    // (AnnotationIntrospectionFailureTests, MergedAnnotationClassLoaderTests,
+    // TypeMappedAnnotationTests.adaptFromStringToClassWithMemberSourceUsesMemberClassLoader).
+    //
+    // Built-in loaders (app/platform/boot) and a null loader keep the global
+    // scanner below — that path resolves CratonVM's unified classpath (incl.
+    // BOOT-INF/lib fat-jars) and carries the LaunchedURLClassLoader rescue that
+    // routing through `loadClass` would lose; its inner-class retry also covers
+    // the Spring-Boot `a.b.Outer.Factory` → `a/b/Outer$Factory` factory names.
+    if let Some(Value::Object(Some(loader))) = args.get(1) {
+        let loader = *loader;
+        if crate::classloader::is_user_defined_loader(ctx, loader) {
+            let load = |ctx: &mut dyn NativeContext, n: ObjectRef| {
+                crate::lang_class::native_class_for_name(
+                    ctx,
+                    &[Value::Object(Some(n)), Value::Int(0), Value::Object(Some(loader))],
+                )
+            };
+            match load(ctx, name_obj) {
+                Ok(v) => return Ok(v),
+                Err(e) => {
+                    // Mirror Spring's inner-class retry through the SAME loader:
+                    // replace the last package separator with `$` and try once
+                    // more before surfacing the original failure.
+                    let internal = dotted.replace('.', "/");
+                    if let Some(last_slash) = internal.rfind('/') {
+                        let inner = format!(
+                            "{}${}",
+                            &internal[..last_slash],
+                            &internal[last_slash + 1..]
+                        );
+                        let inner_dotted = inner.replace('/', ".");
+                        let inner_obj = ctx.create_string(&inner_dotted);
+                        if let Ok(v) = load(ctx, inner_obj) {
+                            return Ok(v);
+                        }
+                    }
+                    return Err(e);
+                }
             }
         }
     }

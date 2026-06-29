@@ -1225,6 +1225,30 @@ impl FileDescriptorTable {
         }
     }
 
+    /// Duplicate the underlying TCP socket for `fd`, returning an independent
+    /// owned `TcpStream` handle to the same connection.
+    ///
+    /// Used by the asynchronous-socket completion path: a worker thread needs to
+    /// perform a *blocking* read on the connection while the application keeps
+    /// issuing `tcp_write`s (Future-form `AsynchronousSocketChannel.write`) on the
+    /// same fd. Holding the per-fd `Mutex<TcpStream>` across a blocking read would
+    /// deadlock those writes, so the reader takes a `try_clone()` handle (a second
+    /// OS handle onto the same full-duplex socket) and reads on it lock-free while
+    /// writes continue through the original entry. Returns an error if `fd` is not
+    /// a live TCP stream.
+    pub fn try_clone_tcp(&self, fd: FdId) -> Result<std::net::TcpStream, io::Error> {
+        let entry = self
+            .get_entry(fd)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "bad fd for tcp clone"))?;
+        match &*entry {
+            FileEntry::TcpStream(stream) => stream.lock().try_clone(),
+            _ => Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "bad fd for tcp clone",
+            )),
+        }
+    }
+
     /// Write to a TCP stream. Returns bytes written.
     pub fn tcp_write(&self, fd: FdId, data: &[u8]) -> Result<usize, io::Error> {
         let entry = self

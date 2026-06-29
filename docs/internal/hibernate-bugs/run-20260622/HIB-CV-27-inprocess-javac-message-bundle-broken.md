@@ -113,9 +113,36 @@ Fixes are in `native-builtins/src/phases_late.rs` (+ a `make_stream_from_element
 helper in `native-collections`). Probes:
 `apps/hib-suite-runner/{Hib27Probe,JrtProbe,JavacCpProbe,NioWalkProbe}.java`.
 
-**Known residual (separate, cosmetic):** for a *signed* multi-release jar
-(Apache Derby) on the classpath, javac emits a **non-fatal** `error: error
-reading <derby>.jar; Illegal character found in authority: '/'` diagnostic
-(HotSpot does not). The compile still succeeds (verified: `CREATE ALIAS OK`
-with derby on the classpath), so it does not fail the test — but it is a
-CratonVM signed-jar URL/URI divergence worth a follow-up.
+### Phantom manifest `Class-Path:` siblings (FIXED here)
+
+A jar whose manifest carries a `Class-Path:` header pointing at sibling jars
+that are NOT present resolves those entries against the jar's own directory.
+Apache Derby's `Class-Path: derbyshared.jar derbyLocale_*.jar …` is the canonical
+case — none of those live in the Gradle cache's per-artifact hash dir, so each
+resolves to a non-existent path. javac adds them to the classpath
+(`FSInfo.getJarClassPath` → `tryResolveFile`, which does NOT check existence —
+HotSpot adds them too) and later mounts each to list packages.
+
+CratonVM's synthetic jar provider mounts a non-existent jar (it does not throw
+like the JDK zip provider), and `jarfs_classify` reported the mounted root as
+`Absent` → `readAttributes(root)` threw `NoSuchFileException` → javac surfaced it
+as a fatal `cannot access <package>` (a missing jar contributes no classes, so
+it must instead behave as an EMPTY container). Fix: `jarfs_classify` now reports
+the mounted root as a directory even when the jar file is missing, so the walk
+yields nothing and javac skips the entry — the net effect HotSpot gets by
+throwing at mount time and skipping. (NB: this depends on `URI.toURL()` resolving
+`file:///…` correctly, which dev's `fix(net): URI.toURL() parse authority …`
+already does; the older pre-fix `toURL` mis-set the URL authority so the
+`Class-Path` resolution threw `Illegal character found in authority: '/'` and the
+entries were never added — i.e. the bug was previously *masked*.)
+
+Verified: H2 `CREATE ALIAS` with Derby on the classpath compiles cleanly (no
+diagnostic) and `SessionDelegatorBaseImplTest` passes. Probes:
+`apps/hib-suite-runner/{UrlChain,DerbyDiag,UriProbe,JarWalkJavac}.java`.
+
+**Remaining minor divergence (cosmetic, not needed for the test):** CratonVM's
+`URI.toURL()` for a `file:///…` URI still renders it as `file:///…` rather than
+collapsing to `file:/…` (and a hand-rolled `file:/…` URL built by the `toURL`
+native reports its slot-5 `authority` as the whole spec rather than null). It
+does not break the in-process compiler, but is worth aligning with HotSpot in a
+focused follow-up.

@@ -1230,6 +1230,27 @@ impl<'a> NativeContextImpl<'a> {
         if let Some(r) = self.thread.native_pending_return {
             snapshot.push(r);
         }
+        // This thread's own `java.lang.Thread` mirror (and any pending async
+        // exception). They live in `JvmThread` fields, not on any frame, so the
+        // frame scan never captures them — yet `Thread.currentThread()` hands
+        // the mirror straight back to bytecode. This is the BLOCKING deposit
+        // path (parked in a native: socket read, sleep, join, f.get()); a GC
+        // initiated by another thread marks and remaps a blocked thread ONLY
+        // from this deposited snapshot (+ the fold into its frame fixup). Omit
+        // the mirror here and a non-moving sweep reclaims it / a moving GC
+        // strands `self.thread.java_thread_obj`, so the next `currentThread()`
+        // returns an all-zero-header object and real-JDK `getThreadGroup()`
+        // NPEs on a null `holder`. This is the intermittent Tomcat
+        // TestDigestAuthenticator failure: when a worker's GC lands while the
+        // JUnit main thread is blocked, its mirror was orphaned. Must mirror
+        // the identical deposit in `interpreter::update_root_snapshot` (the
+        // safepoint path); the wake remap is `check_post_block_gc`.
+        if let Some(obj) = self.thread.java_thread_obj {
+            snapshot.push(obj);
+        }
+        if let Some(exc) = self.thread.pending_async_exception {
+            snapshot.push(exc);
+        }
 
         drop(snapshot);
         // Publish a line-less frame trace alongside the root snapshot so another
@@ -1886,6 +1907,28 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         if base < self.thread.native_pin_roots.len() {
             self.thread.native_pin_roots.truncate(base);
         }
+    }
+
+    fn add_global_root(&mut self, obj: ObjectRef) -> usize {
+        // Backed by the JNI global-ref table: a persistent, cross-thread,
+        // GC-remapped root. Used by the async-socket completion path to hold a
+        // CompletionHandler / attachment / ByteBuffer parked on a worker thread
+        // and delivered later on the AIO dispatcher thread.
+        self.shared.jni_global_refs.lock().add(obj) as usize
+    }
+
+    fn resolve_global_root(&self, handle: usize) -> Option<ObjectRef> {
+        self.shared
+            .jni_global_refs
+            .lock()
+            .resolve(handle as crate::native::jni::JObject)
+    }
+
+    fn remove_global_root(&mut self, handle: usize) -> bool {
+        self.shared
+            .jni_global_refs
+            .lock()
+            .remove(handle as crate::native::jni::JObject)
     }
 
     fn invoke(
@@ -2577,6 +2620,10 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             .unwrap_or(Value::Int(0))
     }
 
+    fn object_is_array(&self, obj: ObjectRef) -> bool {
+        self.shared.heap.kind_of(obj) == ObjectKind::Array
+    }
+
     fn set_array_element(&self, obj: ObjectRef, index: usize, value: Value) {
         let _ = self.shared.heap.set_array_element(obj, index, value);
         // write_barrier fires automatically inside set_array_element for ref arrays
@@ -3229,6 +3276,25 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             .read()
             .get(&class_id)
             .map(|cs| cs.impl_handle.class_name.to_string())
+    }
+
+    fn lambda_proxy_serial_metadata(
+        &self,
+        class_id: ClassId,
+    ) -> Option<cratonvm_native_api::LambdaSerialMetadata> {
+        self.shared.lambda_proxies.read().get(&class_id).map(|cs| {
+            cratonvm_native_api::LambdaSerialMetadata {
+                functional_interface: cs.functional_interface.to_string(),
+                sam_method_name: cs.sam_method_name.to_string(),
+                sam_descriptor: cs.sam_descriptor.to_string(),
+                impl_class: cs.impl_handle.class_name.to_string(),
+                impl_member: cs.impl_handle.member_name.to_string(),
+                impl_descriptor: cs.impl_handle.descriptor.to_string(),
+                impl_ref_kind: cs.impl_handle.kind.as_tag(),
+                instantiated_descriptor: cs.instantiated_descriptor.to_string(),
+                capture_types: cs.capture_types.iter().collect(),
+            }
+        })
     }
 
     fn is_subclass(&self, child: ClassId, parent: ClassId) -> bool {
@@ -5210,16 +5276,37 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                     // to the class specified in the lambda call site. This handles
                     // objects with generic ClassId (e.g., stub Object) where the
                     // lambda actually targets a specific class (e.g., PrintStream).
+                    //
+                    // CRIT (double-invoke): only retry when the NoSuchMethodError
+                    // is for THIS dispatch's own SAM method (i.e. the impl method
+                    // genuinely wasn't found on the receiver's runtime class). A
+                    // NoSuchMethodError for a DIFFERENT method means the SAM method
+                    // WAS found and ran, and the error bubbled up from a nested
+                    // call deep inside it — re-invoking here would run the
+                    // (side-effecting) method a SECOND time. That is exactly the
+                    // "InvocationInterceptors called invocation multiple times" /
+                    // NodeTestTask double-`prepare` corruption: a Hibernate
+                    // bytecode-enhanced `$$_hibernate_*` NSME thrown inside a JUnit
+                    // `TestTask::execute` lambda made `forEach` re-run `execute()`,
+                    // nulling `parentContext` on the second pass.
                     match &result {
                         Err(MethodCallFailed::InternalError(VmError::Linkage(
-                            LinkageError::NoSuchMethodError { .. },
-                        ))) if target_class.as_str() != &*lcs.impl_handle.class_name => self
-                            .invoke_or_native(
+                            LinkageError::NoSuchMethodError {
+                                method_name,
+                                method_descriptor,
+                                ..
+                            },
+                        ))) if target_class.as_str() != &*lcs.impl_handle.class_name
+                            && method_name.as_str() == &*lcs.impl_handle.member_name
+                            && method_descriptor.as_str() == &*lcs.impl_handle.descriptor =>
+                        {
+                            self.invoke_or_native(
                                 &lcs.impl_handle.class_name,
                                 &lcs.impl_handle.member_name,
                                 &lcs.impl_handle.descriptor,
                                 &full_args,
-                            ),
+                            )
+                        }
                         _ => result,
                     }
                     }
@@ -5647,6 +5734,24 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         for m in &class.methods {
             if &*m.name == method_name && &*m.descriptor == method_desc {
                 return extract_parameter_type_annotations(&m.attributes, &class.constant_pool);
+            }
+        }
+        Vec::new()
+    }
+
+    fn field_type_annotations(
+        &self,
+        class_id: ClassId,
+        field_name: &str,
+    ) -> Vec<crate::native::registry::AnnotationData> {
+        let cm = self.shared.class_manager.read();
+        let class = match cm.get_class(class_id) {
+            Some(c) => c,
+            None => return Vec::new(),
+        };
+        for f in &class.fields {
+            if &*f.name == field_name {
+                return extract_field_type_annotations(&f.attributes, &class.constant_pool);
             }
         }
         Vec::new()
@@ -6543,11 +6648,11 @@ pub(super) fn extract_return_type_annotations(
     use cratonvm_reader::attribute::Attribute;
     const TARGET_METHOD_RETURN: u8 = 0x14;
     for lazy in attributes {
-        let attr = match lazy.as_decoded() {
+        let attr = match lazy.decoded_or_decode(cp) {
             Some(a) => a,
             None => continue,
         };
-        if let Attribute::RuntimeVisibleTypeAnnotations(tas) = attr {
+        if let Attribute::RuntimeVisibleTypeAnnotations(tas) = attr.as_ref() {
             return tas
                 .iter()
                 .filter(|ta| ta.target_type == TARGET_METHOD_RETURN && ta.type_path.is_empty())
@@ -6570,11 +6675,11 @@ pub(super) fn extract_parameter_type_annotations(
     use cratonvm_reader::attribute::Attribute;
     const TARGET_METHOD_FORMAL_PARAMETER: u8 = 0x16;
     for lazy in attributes {
-        let attr = match lazy.as_decoded() {
+        let attr = match lazy.decoded_or_decode(cp) {
             Some(a) => a,
             None => continue,
         };
-        if let Attribute::RuntimeVisibleTypeAnnotations(tas) = attr {
+        if let Attribute::RuntimeVisibleTypeAnnotations(tas) = attr.as_ref() {
             let mut out: Vec<Vec<crate::native::registry::AnnotationData>> = Vec::new();
             for ta in tas {
                 if ta.target_type != TARGET_METHOD_FORMAL_PARAMETER || !ta.type_path.is_empty() {
@@ -6593,6 +6698,31 @@ pub(super) fn extract_parameter_type_annotations(
                 }
             }
             return out;
+        }
+    }
+    Vec::new()
+}
+
+/// Extract TYPE_USE annotations targeting a field's type (`target_type` 0x13,
+/// FIELD) with an empty `type_path`. Backs
+/// `Field.getAnnotatedType().getDeclaredAnnotations()`.
+pub(super) fn extract_field_type_annotations(
+    attributes: &[cratonvm_reader::attribute::LazyAttribute],
+    cp: &cratonvm_reader::constant_pool::ConstantPool,
+) -> Vec<crate::native::registry::AnnotationData> {
+    use cratonvm_reader::attribute::Attribute;
+    const TARGET_FIELD: u8 = 0x13;
+    for lazy in attributes {
+        let attr = match lazy.decoded_or_decode(cp) {
+            Some(a) => a,
+            None => continue,
+        };
+        if let Attribute::RuntimeVisibleTypeAnnotations(tas) = attr.as_ref() {
+            return tas
+                .iter()
+                .filter(|ta| ta.target_type == TARGET_FIELD && ta.type_path.is_empty())
+                .filter_map(|ta| convert_annotation(&ta.annotation, cp))
+                .collect();
         }
     }
     Vec::new()
@@ -11361,7 +11491,17 @@ fn invoke_on_class_shared_inner(
                         // (de)serialization fails (catalina TestGenericPrincipal:
                         // GenericPrincipal.writeReplace → SerializablePrincipal record).
                         || (class_name == "java/io/ObjectStreamClass$RecordSupport"
-                            && method_name == "deserializationCtr");
+                            && method_name == "deserializationCtr")
+                        // TYPE_USE annotation surface (JSpecify @Nullable/@NonNull):
+                        // force our natives that parse RuntimeVisibleTypeAnnotations,
+                        // since the real JDK path can't decode our null
+                        // getTypeAnnotationBytes0 + unexposed ConstantPool. Shared
+                        // source of truth with `force_native_over_real_jdk_bytecode`.
+                        || crate::runtime::interpreter::is_typeuse_annotation_native_override(
+                            class_name,
+                            method_name,
+                            descriptor,
+                        );
                     if check_override
                         && shared
                             .native_methods
