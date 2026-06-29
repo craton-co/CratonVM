@@ -827,7 +827,22 @@ impl CompactValue {
             Value::Long(l) => CompactValue::long(l),
             Value::Float(f) => CompactValue::float(f),
             Value::Double(d) => CompactValue::double(d),
-            Value::Object(Some(r)) => CompactValue::object(r.as_ptr() as u64),
+            Value::Object(Some(r)) => {
+                // Defense-in-depth for the named shared panic site
+                // (`object()` -> object_out_of_range -> panic at line ~502): a
+                // `Value::Object` carrying an out-of-47-bit pointer is corruption
+                // — reused/garbage memory surfaced through a stale reference by a
+                // GC root-coverage gap — never a live object on x86-64/AArch64
+                // user space. Degrade it to null (counted) instead of aborting
+                // the VM, so the corruption surfaces as a Java-level null rather
+                // than a hard crash. `try_from_pointer` performs the exact same
+                // null/47-bit checks `object()` does, so valid pointers take an
+                // identical path at zero added cost and are never degraded.
+                CompactValue::try_from_pointer(r.as_ptr() as u64).unwrap_or_else(|| {
+                    note_object_degradation();
+                    CompactValue::null()
+                })
+            }
             Value::Object(None) => CompactValue::null(),
             Value::ReturnAddress(pc) => CompactValue::return_address(pc),
             Value::Uninitialized => CompactValue::uninitialized(),

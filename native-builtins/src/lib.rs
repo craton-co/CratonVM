@@ -29096,6 +29096,7 @@ pub(crate) fn normalize_charset_name(name: &str) -> String {
         "WINDOWS1250" | "CP1250" => "windows-1250".to_string(),
         "KOI8R" => "KOI8-R".to_string(),
         "KOI8U" => "KOI8-U".to_string(),
+        "IBM850" | "CP850" | "850" | "CSPC850MULTILINGUAL" => "IBM850".to_string(),
         _ => {
             let upper = name.to_uppercase();
             if upper.contains("UTF") && upper.contains("8") {

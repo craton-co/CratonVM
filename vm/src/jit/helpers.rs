@@ -1943,6 +1943,16 @@ pub unsafe extern "C" fn jit_aaload(array_ptr: i64, index: i64) -> i64 {
         );
         return i64::MIN;
     }
+    // Defense-in-depth: a non-zero but IMPLAUSIBLE array reference (stale/garbage
+    // from a GC root-coverage gap) must not be dereferenced — the length read
+    // below would SIGSEGV. Treat it as null and take the NPE path, mirroring the
+    // `jit_getfield` receiver guard and the interpreter's stale-receiver fallback.
+    if !cratonvm_types::plausible_heap_pointer(array_ptr as u64) {
+        set_jit_pending_npe_action(
+            crate::runtime::exceptions::helpful_npe::jit_action::ALOAD_OBJECT,
+        );
+        return i64::MIN;
+    }
     // SAFETY: array_ptr is non-null and points to a live Object[] on the GC heap.
     // ptr::read is used because Value::Object may contain non-Copy ObjectRef.
     let ptr = array_ptr as *const u8;
@@ -1955,7 +1965,15 @@ pub unsafe extern "C" fn jit_aaload(array_ptr: i64, index: i64) -> i64 {
         return i64::MIN;
     }
     let elem_ptr = ptr.add(HEADER_SIZE + index as usize * REF_ELEMENT_SIZE) as *const u64;
-    std::ptr::read(elem_ptr) as i64
+    // Degrade an implausible element reference to null instead of returning bits
+    // the JIT will deref → SIGSEGV (the `0x8D8D..`-class stale ref). Mirrors
+    // `read_prim_element`'s Reference arm; valid refs (or 0=null) pass through.
+    let raw = std::ptr::read(elem_ptr);
+    if cratonvm_types::plausible_heap_pointer(raw) {
+        raw as i64
+    } else {
+        0
+    }
 }
 
 // SAFETY: Called from JIT-compiled code. vm_ptr must be a valid SharedVm pointer.
@@ -2190,6 +2208,17 @@ pub unsafe extern "C" fn jit_getfield(obj_ptr: i64, field_index: i64) -> i64 {
         set_jit_pending_npe();
         return i64::MIN;
     }
+    // Defense-in-depth: a non-zero but IMPLAUSIBLE receiver (unaligned /
+    // null-page / >47-bit) is a stale/garbage pointer surfaced through a GC
+    // root-coverage gap (e.g. the `0x8D8D..` reused-buffer fill that crashed
+    // TestMulticastPackages under JIT). Dereferencing it — even the
+    // bounds-check header read below — SIGSEGVs. Treat it as null and take the
+    // NPE path, exactly as the interpreter's stale-receiver fallback and the
+    // read-side degrade do. Valid receivers always pass (8-aligned, ≤47-bit).
+    if !cratonvm_types::plausible_heap_pointer(obj_ptr as u64) {
+        set_jit_pending_npe();
+        return i64::MIN;
+    }
     // B2 fix (audit `vm-runtime.md`): bounds-check the field slot against the
     // receiver's declared `num_slots` BEFORE the raw read, mirroring the
     // symmetric `jit_putfield_slot_in_bounds` guard on every `jit_putfield_*`
@@ -2210,7 +2239,17 @@ pub unsafe extern "C" fn jit_getfield(obj_ptr: i64, field_index: i64) -> i64 {
         // SAFETY: off is within the object body (field_index < num_slots).
         let ptr = (obj_ptr as *const u8).add(HEADER_SIZE + off);
         if is_ref {
-            return std::ptr::read(ptr as *const u64) as i64;
+            // Degrade an implausible reference (stale/garbage from a GC
+            // root-coverage gap) to null instead of handing the JIT bits it
+            // will later deref → SIGSEGV. Mirrors `read_prim_element`'s
+            // Reference arm so interpreter and JIT decode a stale ref slot
+            // identically. Valid refs (or 0=null) always pass through.
+            let raw = std::ptr::read(ptr as *const u64);
+            return if cratonvm_types::plausible_heap_pointer(raw) {
+                raw as i64
+            } else {
+                0
+            };
         }
         let val: Value = std::ptr::read(ptr as *const Value);
         return match val {
@@ -2218,7 +2257,17 @@ pub unsafe extern "C" fn jit_getfield(obj_ptr: i64, field_index: i64) -> i64 {
             Value::Long(l) => l,
             Value::Float(f) => f.to_bits() as i64,
             Value::Double(d) => d.to_bits() as i64,
-            Value::Object(Some(r)) => r.as_ptr() as i64,
+            Value::Object(Some(r)) => {
+                // Degrade an implausible (stale/garbage) object pointer to null
+                // rather than handing the JIT bits it will deref → SIGSEGV.
+                // Valid refs always pass the plausibility gate.
+                let raw = r.as_ptr() as u64;
+                if cratonvm_types::plausible_heap_pointer(raw) {
+                    raw as i64
+                } else {
+                    0
+                }
+            }
             Value::Object(None) => 0,
             _ => 0,
         };
@@ -2233,7 +2282,14 @@ pub unsafe extern "C" fn jit_getfield(obj_ptr: i64, field_index: i64) -> i64 {
         Value::Long(l) => l,
         Value::Float(f) => f.to_bits() as i64,
         Value::Double(d) => d.to_bits() as i64,
-        Value::Object(Some(r)) => r.as_ptr() as i64,
+        Value::Object(Some(r)) => {
+            let raw = r.as_ptr() as u64;
+            if cratonvm_types::plausible_heap_pointer(raw) {
+                raw as i64
+            } else {
+                0
+            }
+        }
         Value::Object(None) => 0,
         _ => 0,
     };
@@ -2608,7 +2664,14 @@ pub unsafe extern "C" fn jit_getstatic(vm_ptr: i64, class_id_raw: i64, field_ind
             // don't have here; fall back to the static field (set during init).
             let val = crate::vm::get_static_shared(vm, class_id, field_index as usize);
             return match val {
-                Value::Object(Some(r)) => r.as_ptr() as i64,
+                Value::Object(Some(r)) => {
+                    let raw = r.as_ptr() as u64;
+                    if cratonvm_types::plausible_heap_pointer(raw) {
+                        raw as i64
+                    } else {
+                        0
+                    }
+                }
                 _ => 0,
             };
         }
@@ -2620,7 +2683,14 @@ pub unsafe extern "C" fn jit_getstatic(vm_ptr: i64, class_id_raw: i64, field_ind
         Value::Long(l) => l,
         Value::Float(f) => f.to_bits() as i64,
         Value::Double(d) => d.to_bits() as i64,
-        Value::Object(Some(r)) => r.as_ptr() as i64,
+        Value::Object(Some(r)) => {
+            let raw = r.as_ptr() as u64;
+            if cratonvm_types::plausible_heap_pointer(raw) {
+                raw as i64
+            } else {
+                0
+            }
+        }
         Value::Object(None) => 0,
         _ => 0,
     }
