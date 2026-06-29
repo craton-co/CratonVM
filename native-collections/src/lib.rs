@@ -33000,7 +33000,27 @@ fn native_cf_handle(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
-    // handle(BiFunction(result, exception)) — pass the real (value, exception) pair.
+    // BUG-17: a real-JDK CF may still be asynchronously PENDING here (e.g. supplyAsync
+    // on a worker; reactor's `Mono.fromFuture` subscribes via `handle()`). Delegate to
+    // the real, non-overridden private `uniHandleStage(executor=null, fn)` — exactly
+    // what public `handle(fn)` does — so a proper NON-blocking dependent registers and
+    // fires on completion with the real value. The synthetic eager path below would
+    // fire `apply(null,null)` immediately → `.block()`/coroutine-await returns null
+    // before the value exists → sync-cache miss → `cache["tb1"]!!` NPE. (Blocking here
+    // is NOT viable: it starves the coroutine dispatcher that completes the producer.)
+    if cf_is_real_jdk(ctx, this) {
+        return ctx.invoke_special(
+            "java/util/concurrent/CompletableFuture",
+            "uniHandleStage",
+            "(Ljava/util/concurrent/Executor;Ljava/util/function/BiFunction;)Ljava/util/concurrent/CompletableFuture;",
+            &[
+                Value::Object(Some(this)),
+                Value::Object(None),
+                Value::Object(Some(bi_func)),
+            ],
+        );
+    }
+    // Synthetic CF: handle(BiFunction(result, exception)) — pass the (value, exception).
     let (val, exc) = match cf_read_state(ctx, this) {
         CfState::Normal(v) => (v, Value::Object(None)),
         CfState::Exceptional(e) => (Value::Object(None), e),
@@ -33028,8 +33048,24 @@ fn native_cf_when_complete(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
-    // Pass the real (result, exception) pair to the BiConsumer. Reading the source
-    // state layout-agnostically is what makes KafkaFuture.all()/allOf complete its
+    // BUG-17: real-JDK CF — delegate to the real private `uniWhenCompleteStage(null, c)`
+    // (== public `whenComplete(c)`) so the dependent registers NON-blockingly and fires
+    // on async completion with the real value, instead of the synthetic eager
+    // `accept(null,null)` below. See `native_cf_handle` for the full rationale.
+    if cf_is_real_jdk(ctx, this) {
+        return ctx.invoke_special(
+            "java/util/concurrent/CompletableFuture",
+            "uniWhenCompleteStage",
+            "(Ljava/util/concurrent/Executor;Ljava/util/function/BiConsumer;)Ljava/util/concurrent/CompletableFuture;",
+            &[
+                Value::Object(Some(this)),
+                Value::Object(None),
+                Value::Object(Some(consumer)),
+            ],
+        );
+    }
+    // Synthetic CF: pass the real (result, exception) pair to the BiConsumer. Reading the
+    // source state layout-agnostically is what makes KafkaFuture.all()/allOf complete its
     // dependent KafkaFutureImpl exceptionally instead of leaving it pending (which
     // made get() block forever — bug-08). The returned CF mirrors the source.
     let (val, exc) = match cf_read_state(ctx, this) {
@@ -33115,6 +33151,20 @@ fn cf_nil(ctx: &mut dyn NativeContext) -> Value {
         }
     }
     Value::Object(None)
+}
+
+/// True if `this` is a real-JDK `CompletableFuture` (or an app subclass such as
+/// `KafkaCompletableFuture`) rather than a CratonVM 4-slot *synthetic* CF. A synthetic
+/// CF encodes its completion state as a `DONE` Int in slot 1; a real CF's slot 1 is the
+/// `volatile Completion stack` reference (null, or a Completion object) — never an Int.
+///
+/// BUG-17: real-JDK dependent-stage methods (`handle`, `whenComplete`, …) must NOT use
+/// the synthetic eager model, which fires the callback immediately with `(null, null)`
+/// while the source is still asynchronously pending (e.g. `supplyAsync` on a worker —
+/// reactor's `Mono.fromFuture` subscribes via `handle()`), so `.block()` / a coroutine
+/// await returns null before the value is produced → `@Cacheable(sync=true)` cache miss.
+fn cf_is_real_jdk(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
+    !matches!(ctx.get_field(this, CF_FIELD_DONE), Value::Int(_))
 }
 
 /// True if `obj`'s runtime class is `CompletableFuture$AltResult`.

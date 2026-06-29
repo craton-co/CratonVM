@@ -11940,9 +11940,36 @@ fn p58_cf_then_run(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     Ok(Some(Value::Object(Some(cf))))
 }
 
+/// BUG-17 (synthetic `p58` CF model): a real-JDK `CompletableFuture` has its real
+/// `volatile Completion stack` reference in slot 1 (`FUT_FIELD_DONE`), never the
+/// synthetic `DONE` Int. Real-JDK dependent-stage methods must delegate to real,
+/// non-blocking JDK machinery instead of this eager model (which fires the callback
+/// with `(null, null)` while the source is still asynchronously pending).
+fn p58_cf_is_real_jdk(ctx: &mut dyn NativeContext, this: ObjectRef) -> bool {
+    !matches!(ctx.get_field(this, FUT_FIELD_DONE), Value::Int(_))
+}
+
 fn p58_cf_when_complete(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let action = obj_arg(args, 1)?;
+    // BUG-17: real-JDK CF — delegate to real private `uniWhenCompleteStage(null, c)`
+    // (== public `whenComplete(c)`) so the dependent registers NON-blockingly and fires
+    // on async completion with the real value (reactor's `Mono.fromFuture` subscribes via
+    // `handle()`; `whenComplete` is its twin). The eager `accept(result,null)` below
+    // would fire null on a still-pending async CF → `.block()`/coroutine-await returns
+    // null before the value exists → `@Cacheable(sync=true)` cache miss.
+    if p58_cf_is_real_jdk(ctx, this) {
+        return ctx.invoke_special(
+            "java/util/concurrent/CompletableFuture",
+            "uniWhenCompleteStage",
+            "(Ljava/util/concurrent/Executor;Ljava/util/function/BiConsumer;)Ljava/util/concurrent/CompletableFuture;",
+            &[
+                Value::Object(Some(this)),
+                Value::Object(None),
+                Value::Object(Some(action)),
+            ],
+        );
+    }
     let result = ctx.get_field(this, FUT_FIELD_RESULT);
     // BiConsumer.accept(result, null_exception)
     let _ = ctx.invoke_virtual(
@@ -11959,6 +11986,20 @@ fn p58_cf_when_complete(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
 fn p58_cf_handle(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let func = obj_arg(args, 1)?;
+    // BUG-17: real-JDK CF — delegate to real private `uniHandleStage(null, fn)` (== public
+    // `handle(fn)`) for a NON-blocking dependent. See `p58_cf_when_complete`.
+    if p58_cf_is_real_jdk(ctx, this) {
+        return ctx.invoke_special(
+            "java/util/concurrent/CompletableFuture",
+            "uniHandleStage",
+            "(Ljava/util/concurrent/Executor;Ljava/util/function/BiFunction;)Ljava/util/concurrent/CompletableFuture;",
+            &[
+                Value::Object(Some(this)),
+                Value::Object(None),
+                Value::Object(Some(func)),
+            ],
+        );
+    }
     let result = ctx.get_field(this, FUT_FIELD_RESULT);
     // BiFunction.apply(result, null_exception)
     let new_result = ctx.invoke_virtual(
