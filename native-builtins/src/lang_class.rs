@@ -6897,6 +6897,24 @@ pub(crate) fn native_constructor_new_instance(
         let abstract_bit = cratonvm_types::access_flags::ACC_ABSTRACT;
         let iface_bit = cratonvm_types::access_flags::ACC_INTERFACE;
         if flags & (abstract_bit | iface_bit) != 0 {
+            // `java.lang.reflect.Constructor.newInstance` throws a real
+            // `java.lang.InstantiationException` (NOT IllegalStateException) on
+            // an abstract/interface target. The exact type matters: Spring's
+            // `BeanUtils.instantiateClass` catches `InstantiationException`
+            // specifically to rethrow `BeanInstantiationException("Is it an
+            // abstract class?")` (DefaultListableBeanFactoryTests
+            // .beanDefinitionWithAbstractClass). With the wrong type that catch
+            // is missed and the bean appears to instantiate.
+            let dotted = class_name.replace('/', ".");
+            let msg = ctx.create_string(&dotted);
+            if let Ok(Some(Value::Object(Some(exc)))) = ctx.new_object_initialized(
+                "java/lang/InstantiationException",
+                "(Ljava/lang/String;)V",
+                &[Value::Object(Some(msg))],
+            ) {
+                return Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(exc));
+            }
+            // Fallback if the exception class can't be constructed.
             return Err(cratonvm_types::error::RuntimeError::IllegalStateException {
                 message: format!(
                     "InstantiationException: cannot instantiate abstract/interface type {class_name}"

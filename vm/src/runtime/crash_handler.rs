@@ -772,6 +772,36 @@ mod windows_fault {
             let _ = writeln!(report, "current_jit_callee = {}", callee);
         }
 
+        // Name the innermost native (Rust) callback active on THIS (faulting)
+        // thread, if the lightweight per-thread tracker is armed
+        // (CRATONVM_TRACK_NATIVE=1). For the HIB-CV-37 lambda/native GC-stranding
+        // class this is the stream/collection intrinsic that was driving a lambda
+        // while holding a now-stale Rust-local ObjectRef — i.e. the native that
+        // needs `pin_native_root`/`read_native_pin`. Print both the absolute fn
+        // pointer and its exe-relative RVA so it can be symbolized offline with
+        // `CRATONVM_SYMBOLIZE` against the SAME binary (closure symbols survive in
+        // the profsym/debug build). Best-effort `name_of` too (resolves only if
+        // the registry's ring names were flushed). Zero cost when disabled.
+        let cur_native = cratonvm_native_api::native_ring::innermost_native_cb();
+        if cur_native != 0 {
+            let name = cratonvm_native_api::native_ring::name_of(cur_native)
+                .unwrap_or_else(|| "<unflushed; symbolize the RVA>".to_string());
+            if module_base != 0 && cur_native >= module_base {
+                let _ = writeln!(
+                    report,
+                    "current_native (faulting thread) = exe+0x{:X}  {}",
+                    cur_native - module_base,
+                    name
+                );
+            } else {
+                let _ = writeln!(
+                    report,
+                    "current_native (faulting thread) = 0x{:016X}  {}",
+                    cur_native, name
+                );
+            }
+        }
+
         // Disassembly aid: dump the instruction bytes immediately *before* each
         // JIT-region return address (most-recent first). A return address points
         // just past the CALL that pushed it, so the preceding ~32 bytes contain

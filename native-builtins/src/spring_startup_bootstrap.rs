@@ -2153,8 +2153,16 @@ fn try_build_method_injection(
         ctx.invoke_virtual(mbd, "hasMethodOverrides", "()Z", &[]),
         Ok(Some(Value::Int(n))) if n != 0
     );
-    if !has_overrides && super_flags & ACC_ABSTRACT == 0 {
-        return None; // concrete, no overrides → ordinary path
+    // Method-injection only applies when the bean definition actually declares
+    // overrides (XML `<lookup-method>`/`<replaced-method>` or `@Lookup`, which
+    // AutowiredAnnotationBeanPostProcessor records as LookupOverrides). A *plain*
+    // abstract bean class with no overrides must NOT be silently subclassed —
+    // real Spring throws BeanInstantiationException("Is it an abstract class?")
+    // for it (DefaultListableBeanFactoryTests.beanDefinitionWithAbstractClass).
+    // The previous `|| isAbstract` clause synthesised a throwing-stub subclass
+    // for any abstract class, so such beans appeared to instantiate.
+    if !has_overrides {
+        return None;
     }
 
     // Read the lookup overrides as (methodName, paramCount, beanName). Keying on
@@ -2568,11 +2576,22 @@ fn s_instantiation_strategy_instantiate(
         let abstract_bit = cratonvm_types::access_flags::ACC_ABSTRACT;
         let iface_bit = cratonvm_types::access_flags::ACC_INTERFACE;
         if flags & (abstract_bit | iface_bit) != 0 {
-            tracing::debug!(
-                "[spring-shim] SimpleInstantiationStrategy.instantiate: {} is abstract/interface, skipping",
-                class_name
+            // An abstract/interface bean class with no lookup overrides cannot be
+            // instantiated. Real Spring's SimpleInstantiationStrategy throws a
+            // BeanInstantiationException ("Specified class is an interface" /
+            // "Is it an abstract class?"), which createBean wraps into the
+            // BeanCreationException the caller expects (DefaultListableBeanFactory
+            // Tests.beanDefinitionWith{Abstract,Interface}). Returning null here
+            // instead produced a misleading "Target object must not be null".
+            // Delegate to the real BeanUtils.instantiateClass(Class), which
+            // raises exactly that exception, and propagate it.
+            let mirror = ctx.get_class_mirror(cid);
+            return ctx.invoke(
+                "org/springframework/beans/BeanUtils",
+                "instantiateClass",
+                "(Ljava/lang/Class;)Ljava/lang/Object;",
+                &[Value::Object(Some(mirror))],
             );
-            return Ok(Some(Value::Object(None)));
         }
     }
 

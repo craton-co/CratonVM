@@ -178,6 +178,12 @@ fn now_ms() -> u128 {
 /// `record_exit` can also short-circuit without touching the lock.
 #[inline]
 pub fn record_enter(cb_ptr: usize) -> usize {
+    // Per-thread current-native stack push (crash-handler diagnostic). Done
+    // FIRST and independently of the ring's `ENABLED` gate; balanced by the
+    // pop in `record_exit`. No cross-thread lock — see the stack's doc below.
+    if track_enabled() {
+        let _ = NATIVE_STACK.try_with(|s| s.borrow_mut().push(cb_ptr));
+    }
     if !ENABLED.load(Ordering::Relaxed) {
         return usize::MAX;
     }
@@ -196,6 +202,14 @@ pub fn record_enter(cb_ptr: usize) -> usize {
 
 #[inline]
 pub fn record_exit(idx: usize) {
+    // Pop the per-thread current-native stack (see `record_enter`). Done
+    // FIRST and independently of the ring's `ENABLED`/sentinel gate so the
+    // stack stays balanced even if `enable`/`track` toggled mid-call.
+    if track_enabled() {
+        let _ = NATIVE_STACK.try_with(|s| {
+            s.borrow_mut().pop();
+        });
+    }
     if !ENABLED.load(Ordering::Relaxed) {
         return;
     }
@@ -210,6 +224,56 @@ pub fn record_exit(idx: usize) {
     if let Some(slot) = ring.entries.get_mut(idx) {
         slot.exit_ms = now;
     }
+}
+
+// ---------------------------------------------------------------------------
+// Low-overhead per-thread current-native stack (crash-handler diagnostic).
+//
+// The full ring above takes a process-global `Mutex` on EVERY native enter and
+// exit — by design useful only for the watchdog's one-shot hang dump, but far
+// too heavy to leave on under a multi-thread allocation storm (it serializes
+// all OS threads and perturbs the very timing-sensitive races we want to catch,
+// e.g. HIB-CV-37 `testQueryConcurrency`). This parallel mechanism is a thread-
+// LOCAL stack of active native callback pointers: a push on enter, a pop on
+// exit, no cross-thread lock. The VEH crash handler reads the faulting thread's
+// innermost entry to name the native that was driving a lambda when a stranded
+// (GC-relocated, un-rewritten Rust-local) `ObjectRef` faulted.
+//
+// Gated by `CRATONVM_TRACK_NATIVE=1` so the default path is byte-identical (a
+// single cached bool load + not-taken branch; no thread-local touch, no alloc).
+
+fn track_enabled() -> bool {
+    static T: OnceLock<bool> = OnceLock::new();
+    *T.get_or_init(|| std::env::var_os("CRATONVM_TRACK_NATIVE").is_some())
+}
+
+thread_local! {
+    static NATIVE_STACK: std::cell::RefCell<Vec<usize>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Innermost active native callback pointer on THIS thread, or 0 if none.
+/// Safe to call from the VEH crash handler (it runs on the faulting thread, so
+/// it reads that thread's own thread-local). Returns 0 unless
+/// `CRATONVM_TRACK_NATIVE=1` armed the tracker.
+pub fn innermost_native_cb() -> usize {
+    if !track_enabled() {
+        return 0;
+    }
+    NATIVE_STACK
+        .try_with(|s| s.borrow().last().copied().unwrap_or(0))
+        .unwrap_or(0)
+}
+
+/// Resolve the innermost active native on this thread to its
+/// `class.method descriptor` name, for the crash report. `None` if the tracker
+/// is disabled, the stack is empty, or the name is unregistered.
+pub fn innermost_native_name() -> Option<String> {
+    let cb = innermost_native_cb();
+    if cb == 0 {
+        return None;
+    }
+    name_of(cb)
 }
 
 /// Dump the ring buffer to stderr, oldest entry first.
