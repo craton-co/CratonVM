@@ -566,6 +566,85 @@ pub fn host_thread_leave_native() -> bool {
     true
 }
 
+// ---------------------------------------------------------------------------
+// Asynchronous-I/O completion dispatcher
+// ---------------------------------------------------------------------------
+
+static AIO_DISPATCH_STARTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+static AIO_DISPATCH_SHUTDOWN: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Start the AIO completion dispatcher thread (idempotent).
+///
+/// `AsynchronousSocketChannel` handler-form reads run their blocking I/O on a
+/// non-VM worker pool that parks completions but cannot invoke Java. This
+/// dispatcher is a *foreign-attached* VM thread: it sits idle in the GC-blocked
+/// region waiting on the completion condvar, and whenever a read completes it
+/// transitions to a running mutator (via [`ForeignCallGuard`]) just long enough
+/// to invoke the Java `CompletionHandler`, then returns to idle. This mirrors
+/// the dispatcher threads of a real `AsynchronousChannelGroup` pool. Wired up by
+/// `native-io`'s `set_dispatcher_launcher`, fired on the first handler-form read.
+pub fn start_aio_dispatcher() {
+    if AIO_DISPATCH_STARTED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+    let _ = std::thread::Builder::new()
+        .name("cratonvm-aio-dispatch".into())
+        .spawn(aio_dispatcher_main);
+}
+
+fn aio_dispatcher_main() {
+    use std::sync::atomic::Ordering;
+    let shared = match process_vm() {
+        Some(s) => s,
+        None => return,
+    };
+    // Attach as a foreign daemon thread and settle into the idle GC-blocked
+    // region (mirrors the genuine-first-attach path in
+    // `attach_current_thread_impl`). The empty deposited snapshot is published
+    // before the TLS context, so there is no window where this thread is a
+    // running mutator invisible to `request_stw`.
+    let raw = attach_foreign_thread(&shared, true, Some("cratonvm-aio-dispatch"));
+    with_foreign_thread(|jt| {
+        jt.gc_block_state
+            .in_blocked_region
+            .store(true, Ordering::Release);
+    });
+    let _ = shared.gc_barrier.mark_blocked_region_enter();
+    set_jni_context_arc(Arc::clone(&shared));
+    set_jni_thread(raw);
+
+    while !AIO_DISPATCH_SHUTDOWN.load(Ordering::Acquire) {
+        // Idle, GC-blocked, until a completion is ready (bounded poll so a
+        // missed wake can never wedge delivery).
+        let pending = cratonvm_native_io::async_socket::wait_for_pending(
+            std::time::Duration::from_millis(100),
+        );
+        if !pending {
+            continue;
+        }
+        // ForeignCallGuard leaves the idle region (becomes a counted mutator),
+        // waiting out any in-flight STW first, and re-enters it on drop.
+        let _fg = ForeignCallGuard::enter();
+        let _ = with_jni_context(|shared, thread| {
+            let mut ctx = crate::vm::NativeContextImpl { shared, thread };
+            cratonvm_native_io::async_socket::drain_completions_pub(&mut ctx);
+        });
+    }
+
+    // Clean detach (only reached on explicit shutdown).
+    if let Some(shared) = process_vm() {
+        if let Some(tid) = with_foreign_thread(|jt| jt.thread_id) {
+            shared.thread_registry.mark_dead(tid);
+        }
+        shared.gc_barrier.mark_blocked_region_leave();
+        detach_foreign_thread(&shared);
+    }
+    clear_jni_thread();
+    clear_jni_context();
+}
+
 /// Whether the foreign-thread attach path is enabled.
 ///
 /// Default **ON** (Step 7 of `foreign-thread-attach.md`): a genuinely foreign
