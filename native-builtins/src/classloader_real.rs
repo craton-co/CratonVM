@@ -864,6 +864,47 @@ fn cl_real_load_class_base(
     ))
 }
 
+/// Real-JDK-mode `URLClassLoader.findClass(String)`.
+///
+/// The real JDK bytecode resolves the class through the `ucp`
+/// (`jdk.internal.loader.URLClassPath`) field, which CratonVM shims to a bare
+/// synthetic instance (`register_url_class_path_safe_stubs`) whose `getResource`
+/// returns null — so the real `findClass` ALWAYS throws `ClassNotFoundException`.
+/// CratonVM instead serves `URLClassLoader` resolution from its global dynamic
+/// classpath, where each loader's `<init>` registered its URLs via
+/// [`register_url_array`]. Resolve `name` there and throw `ClassNotFoundException`
+/// on a genuine miss, matching the JDK `findClass` contract.
+///
+/// `URLClassLoader.findClass` is normally reached only from `loadClass` (which
+/// CratonVM serves natively via [`cl_real_load_class`], never touching the real
+/// `findClass`). It becomes reachable when a `URLClassLoader` subclass overrides
+/// `loadClass` and calls `findClass(name)` directly — most notably Jasper's
+/// `JasperLoader`, which loads the runtime-compiled `org.apache.jsp.*_jsp`
+/// servlet from its scratch-dir URL. Without this native every compiled JSP/tag
+/// 500s with `ClassNotFoundException: org.apache.jsp.*_jsp`. The dispatch is
+/// forced onto this native by `intercept_urlclassloader_subclass_find_class`
+/// (the subclass methodref escapes the static-class force-native gate).
+pub fn ucl_real_find_class(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> cratonvm_types::error::MethodCallResult {
+    let name_obj = match args.get(1) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let class_name = ctx.read_string(name_obj).unwrap_or_default();
+    let internal = class_name.replace('.', "/");
+    if let Ok(Some(mirror)) = ctx.load_class(&internal) {
+        return Ok(Some(mirror));
+    }
+    let exc = alloc_concurrent_synthetic(ctx, "java/lang/ClassNotFoundException", 1);
+    let msg = ctx.create_string(&class_name);
+    ctx.set_field(exc, 0, Value::Object(Some(msg)));
+    Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(
+        exc,
+    ))
+}
+
 /// Get or create the system (app) class loader singleton.
 pub fn get_or_create_system_cl(
     ctx: &mut dyn cratonvm_native_api::registry::NativeContext,

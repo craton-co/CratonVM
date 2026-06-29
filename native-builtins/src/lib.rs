@@ -7840,6 +7840,21 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;)Ljava/util/Enumeration;",
         classloader::ucl_find_resources,
     );
+    // URLClassLoader.findClass — the real bytecode resolves via the shimmed
+    // `ucp` (URLClassPath) and so throws CNFE for everything. Serve it from the
+    // global dynamic classpath instead (the loader's `<init>` registered its
+    // URLs). Reached when a subclass overrides `loadClass` and calls `findClass`
+    // directly (Jasper's `JasperLoader` loading runtime-compiled
+    // `org.apache.jsp.*_jsp` servlets); forced onto this native by
+    // `intercept_urlclassloader_subclass_find_class`. Only registered here
+    // (real-JDK mode); synthetic-JDK mode registers `ucl_find_class` via
+    // `register_classloader_natives`.
+    registry.register(
+        "java/net/URLClassLoader",
+        "findClass",
+        "(Ljava/lang/String;)Ljava/lang/Class;",
+        classloader_real::ucl_real_find_class,
+    );
     // URLClassPath.addURL — `URLClassLoader.addURL`'s body is `ucp.addURL(url)`,
     // whose real bytecode does `synchronized (unopenedUrls)` and NPEs because
     // CratonVM's `ucp` is a bare synthetic `URLClassPath` (null instance

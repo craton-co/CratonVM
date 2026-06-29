@@ -13898,67 +13898,113 @@ fn resolve_class_loader_aware(
     } else {
         None
     };
-    let Some(loader) = user_loader else {
+    if user_loader.is_some() {
+        // Gate-on path: drive the user loader FIRST (initiating-loader
+        // semantics), then fall back to the global store.
+        if let Some(id) = drive_defining_loader_load(shared, thread, referencing_class_id, name) {
+            return Ok(id);
+        }
         return shared
             .load_class_concurrent(name)
             .map_err(MethodCallFailed::from);
-    };
-
-    // (2) Drive the loader's own `loadClass` as the initiating loader. A
-    //     per-thread in-flight guard breaks any pathological re-entry for the
-    //     same (loader, name) by degrading to global resolution.
-    thread_local! {
-        static IN_FLIGHT: std::cell::RefCell<Vec<(cratonvm_types::ClassLoaderId, String)>> =
-            const { std::cell::RefCell::new(Vec::new()) };
     }
-    let reentrant =
-        IN_FLIGHT.with(|s| s.borrow().iter().any(|(l, n)| *l == loader && n == name));
-    if !reentrant {
-        if let Some(loader_obj) = cratonvm_native_builtins::classloader::defining_loader_for(
-            referencing_class_id.as_u32(),
-        ) {
-            IN_FLIGHT.with(|s| s.borrow_mut().push((loader, name.to_string())));
-            let depth = thread.frames.len();
-            let dotted = name.replace('/', ".");
-            let result = {
-                // `create_string` / `invoke_virtual` are `NativeContext` trait
-                // methods — bring the trait into scope to call them.
-                use cratonvm_native_api::NativeContext as _;
-                let mut ctx = crate::vm::NativeContextImpl { shared, thread };
-                let name_obj = ctx.create_string(&dotted);
-                ctx.invoke_virtual(
-                    loader_obj,
-                    "loadClass",
-                    "(Ljava/lang/String;)Ljava/lang/Class;",
-                    &[Value::Object(Some(name_obj))],
-                )
-            };
-            // Defensive: a re-entrant call that unwound abnormally must not leave
-            // stray frames on this thread's stack.
-            if thread.frames.len() > depth {
-                thread.frames.truncate(depth);
+
+    // Gate-off / built-in defining loader: resolve globally FIRST (the legacy
+    // fast path), and only if that misses fall back to the referencing class's
+    // defining loader. This rescues classes that live ONLY behind a custom
+    // loader and are invisible to the global classpath — e.g. a webapp class
+    // referencing another class in its own `/WEB-INF/lib` jar (Tomcat's
+    // `WebappClassLoader` serves these from its `WebResourceRoot`, not the
+    // classpath): JSTL's `JstlCoreTLV.getHandler()` does `new
+    // JstlCoreTLV$Handler(...)`, whose inner class would otherwise surface as
+    // `NoClassDefFoundError` (`TestScopedAttributeELResolver`). Strictly
+    // additive — only fires on what would already be a resolution failure, so
+    // it never changes a previously-successful (or differently-failing)
+    // resolution.
+    match shared.load_class_concurrent(name) {
+        Ok(id) => Ok(id),
+        Err(e) => {
+            if let Some(id) =
+                drive_defining_loader_load(shared, thread, referencing_class_id, name)
+            {
+                return Ok(id);
             }
-            IN_FLIGHT.with(|s| {
-                s.borrow_mut().pop();
-            });
-            if let Ok(Some(Value::Object(Some(mirror)))) = result {
-                if let Some(id) = crate::vm::class_id_from_mirror(shared, mirror) {
-                    shared
-                        .initiating_resolution_cache
-                        .write()
-                        .entry(loader)
-                        .or_default()
-                        .insert(cratonvm_types::intern_arc(name), id);
-                    return Ok(id);
-                }
-            }
-            // Miss/failure: fall through to global (never worse than legacy).
+            Err(MethodCallFailed::from(e))
         }
     }
+}
 
-    shared
-        .load_class_concurrent(name)
-        .map_err(MethodCallFailed::from)
+/// Resolve `name` by invoking the `loadClass` of the loader that DEFINED
+/// `referencing_class_id` (JVMS §5.4.3 initiating loader). Returns `None` when
+/// there is no recorded defining-loader object, the name is array/JDK-global, a
+/// re-entrant resolution for the same (class, name) is already in flight, or the
+/// loader's `loadClass` does not produce a class — in every such case the caller
+/// falls back to global resolution, so this can only ever resolve MORE classes,
+/// never fail one that global resolution would have answered.
+fn drive_defining_loader_load(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    referencing_class_id: ClassId,
+    name: &str,
+) -> Option<ClassId> {
+    if name.starts_with('[') || is_global_resolution_namespace(name) {
+        return None;
+    }
+    let loader_obj = cratonvm_native_builtins::classloader::defining_loader_for(
+        referencing_class_id.as_u32(),
+    )?;
+    // A per-thread in-flight guard breaks pathological re-entry for the same
+    // (class, name) by degrading to global resolution.
+    thread_local! {
+        static IN_FLIGHT: std::cell::RefCell<Vec<(u32, String)>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+    let key = referencing_class_id.as_u32();
+    if IN_FLIGHT.with(|s| s.borrow().iter().any(|(c, n)| *c == key && n == name)) {
+        return None;
+    }
+    let cache_loader = shared
+        .class_manager
+        .read()
+        .get_loader_id(referencing_class_id);
+    IN_FLIGHT.with(|s| s.borrow_mut().push((key, name.to_string())));
+    let depth = thread.frames.len();
+    let dotted = name.replace('/', ".");
+    let result = {
+        // `create_string` / `invoke_virtual` are `NativeContext` trait methods —
+        // bring the trait into scope to call them.
+        use cratonvm_native_api::NativeContext as _;
+        let mut ctx = crate::vm::NativeContextImpl { shared, thread };
+        let name_obj = ctx.create_string(&dotted);
+        ctx.invoke_virtual(
+            loader_obj,
+            "loadClass",
+            "(Ljava/lang/String;)Ljava/lang/Class;",
+            &[Value::Object(Some(name_obj))],
+        )
+    };
+    // Defensive: a re-entrant call that unwound abnormally must not leave stray
+    // frames on this thread's stack.
+    if thread.frames.len() > depth {
+        thread.frames.truncate(depth);
+    }
+    IN_FLIGHT.with(|s| {
+        s.borrow_mut().pop();
+    });
+    if let Ok(Some(Value::Object(Some(mirror)))) = result {
+        if let Some(id) = crate::vm::class_id_from_mirror(shared, mirror) {
+            if let Some(l) = cache_loader {
+                shared
+                    .initiating_resolution_cache
+                    .write()
+                    .entry(l)
+                    .or_default()
+                    .insert(cratonvm_types::intern_arc(name), id);
+            }
+            return Some(id);
+        }
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -15725,6 +15771,25 @@ fn execute_invoke_kind(
         return res;
     }
 
+    // `URLClassLoader.findClass` called from inside a subclass override (e.g.
+    // Jasper's `JasperLoader.loadClass` → `findClass`) names the subclass in its
+    // CP methodref, so the static-class force-native gate above misses it. Force
+    // `ucl_find_class` when the resolved declaring class is `URLClassLoader`
+    // (the real bytecode's shimmed `ucp` would otherwise throw CNF for every
+    // runtime-compiled JSP servlet).
+    if let Some(res) = intercept_urlclassloader_subclass_find_class(
+        shared,
+        thread,
+        frame_idx,
+        method_name.as_ref(),
+        method_descriptor.as_ref(),
+        receiver_class_id,
+        is_special,
+        &args,
+    ) {
+        return res;
+    }
+
     // Try stackless frame push for bytecode methods (avoids Rust stack recursion)
     // For virtual/special calls, do NOT walk the native hierarchy — subclass
     // bytecode overrides must take priority over parent native overrides.
@@ -17251,18 +17316,31 @@ fn force_native_over_real_jdk_bytecode(
             method_name,
             "getHostName" | "getCanonicalHostName" | "getHostAddress"
         ))
-        // URLClassLoader.findResource / findResources + URLClassPath.addURL —
-        // see the companion `check_override` entry in
+        // URLClassLoader.findClass / findResource / findResources +
+        // URLClassPath.addURL — see the companion `check_override` entry in
         // `vm_exec.rs::invoke_on_class_shared_inner`. The real bytecode routes
         // through the shimmed `URLClassPath` (null `unopenedUrls`/`path`), so
-        // `addURL` NPEs and `findResource(s)` find nothing. Force the natives
-        // (`ucp_add_url` / `ucl_find_resource(s)`) on the bytecode-interpreter +
-        // cached/promoted dispatch paths. `addURL` is keyed on `URLClassPath`
-        // (its `ucp.addURL(url)` call site) — the `URLClassLoader.addURL`
-        // wrapper is invoked via a subclass `this`, escaping this static-class
-        // gate. Hibernate `NoDepthTests` JPA + ShrinkWrap.
+        // `addURL` NPEs and `findClass`/`findResource(s)` find nothing. Force
+        // the natives (`ucp_add_url` / `ucl_find_class` / `ucl_find_resource(s)`)
+        // on the bytecode-interpreter + cached/promoted dispatch paths. `addURL`
+        // is keyed on `URLClassPath` (its `ucp.addURL(url)` call site) — the
+        // `URLClassLoader.addURL` wrapper is invoked via a subclass `this`,
+        // escaping this static-class gate. Hibernate `NoDepthTests` JPA +
+        // ShrinkWrap.
+        //
+        // `findClass` matters when a `URLClassLoader` subclass overrides BOTH
+        // `loadClass` overloads and calls `findClass` directly (so CratonVM's
+        // `cl_load_class` native — which would otherwise resolve from the global
+        // classpath — never runs): Jasper's `JasperLoader` does exactly this to
+        // load the runtime-compiled `org.apache.jsp.*_jsp` servlet from its
+        // scratch-dir URL. Without forcing the native, the real
+        // `URLClassLoader.findClass` reaches the shimmed `ucp.getResource` →
+        // null → `ClassNotFoundException`, 500-ing every compiled JSP/tag
+        // (TestPageContext, TestScopedAttributeELResolver, …). `ucl_find_class`
+        // delegates to the base classpath (where `<init>` already registered the
+        // loader's URLs), matching HotSpot.
         || (class_name == "java/net/URLClassLoader"
-            && matches!(method_name, "findResource" | "findResources"))
+            && matches!(method_name, "findClass" | "findResource" | "findResources"))
         || (matches!(
             class_name,
             "jdk/internal/loader/URLClassPath" | "sun/misc/URLClassPath"
@@ -17329,6 +17407,80 @@ fn intercept_force_registered_native(
     if method_name == "getTarget" && std::env::var_os("CRATONVM_DBG_CCSPROBE").is_some() {
         eprintln!("[ccs-probe] intercept_force_registered_native: dispatching native callback");
     }
+    let ret_type = crate::jit::return_type(method_descriptor);
+    Some((|| {
+        let result = crate::vm::safe_native_call(shared, thread, cb, args)?;
+        if let Some(value) = result {
+            push_invoke_return_value(
+                &mut thread.frames[frame_idx].stack,
+                coerce_value_for_return(value, ret_type),
+            )?;
+            crate::vm::native_return_pushed_to_stack(shared, thread);
+        }
+        Ok(CachedCallResult::Handled)
+    })())
+}
+
+/// `URLClassLoader.findClass(String)` invoked on a SUBCLASS receiver whose CP
+/// methodref names that subclass (so the static-class force-native gate, keyed
+/// on the methodref class, never matches). The canonical case is Jasper's
+/// `JasperLoader`, which overrides BOTH `loadClass` overloads and calls
+/// `findClass(name)` directly from inside `loadClass` to load the
+/// runtime-compiled `org.apache.jsp.*_jsp` servlet from its scratch-dir URL.
+/// Because the override runs, CratonVM's `cl_load_class` native (which would
+/// resolve the class from the global classpath) is bypassed, and dispatch lands
+/// on the real `URLClassLoader.findClass` bytecode — whose shimmed
+/// `ucp.getResource` returns null → `ClassNotFoundException`, 500-ing every
+/// compiled JSP/tag (TestPageContext, TestScopedAttributeELResolver, …).
+///
+/// Resolve `findClass` from the actual receiver class; only force the native
+/// when it lands on `java/net/URLClassLoader` itself — a subclass that declares
+/// its OWN `findClass` keeps its bytecode. `ucl_find_class` delegates to the
+/// base classpath, where the loader's `<init>` already registered its URLs,
+/// matching HotSpot. This handles the FIRST (uncached) dispatch; the cache
+/// populator (`populate_virtual_invoke_cache`) independently force-caches the
+/// native via the `declaring_name`-keyed `force_native_over_real_jdk_bytecode`
+/// entry, so repeat dispatches stay native too.
+#[inline]
+fn intercept_urlclassloader_subclass_find_class(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    frame_idx: usize,
+    method_name: &str,
+    method_descriptor: &str,
+    receiver_class_id: Option<ClassId>,
+    is_special: bool,
+    args: &[Value],
+) -> Option<Result<CachedCallResult, MethodCallFailed>> {
+    if is_special
+        || method_name != "findClass"
+        || method_descriptor != "(Ljava/lang/String;)Ljava/lang/Class;"
+    {
+        return None;
+    }
+    let recv_cid = receiver_class_id?;
+    let declaring_name = {
+        let cm = shared.class_manager.read();
+        let store = &cm.class_store;
+        let (_m, declaring_id) = crate::classloading::find_method_recursive(
+            recv_cid,
+            method_name,
+            method_descriptor,
+            store,
+        )?;
+        store.get(declaring_id).map(|c| c.name.to_string())?
+    };
+    if declaring_name != "java/net/URLClassLoader" {
+        return None;
+    }
+    // A JVMTI agent that redefined URLClassLoader makes its woven bytecode
+    // authoritative — cede to it.
+    if native_shadow_suppressed_by_redefine(shared, "java/net/URLClassLoader") {
+        return None;
+    }
+    let cb = shared
+        .native_methods
+        .find("java/net/URLClassLoader", method_name, method_descriptor)?;
     let ret_type = crate::jit::return_type(method_descriptor);
     Some((|| {
         let result = crate::vm::safe_native_call(shared, thread, cb, args)?;
@@ -18004,9 +18156,33 @@ fn execute_invokestatic(
         // Load and initialize the target class.
         // Always go through load_class_concurrent so synthetic stubs
         // get upgraded to real classes when the .class file is available.
-        let target_class_id = shared
-            .load_class_concurrent(&method_class_name)
-            .map_err(|e| convert_class_not_found(shared, thread, &method_class_name, e.into()))?;
+        let target_class_id = match shared.load_class_concurrent(&method_class_name) {
+            Ok(id) => id,
+            Err(e) => {
+                // Loader-aware rescue: the `invokestatic` owner may live ONLY
+                // behind the referencing class's defining loader (e.g. a webapp
+                // class calling a static method on a sibling in its own
+                // `/WEB-INF/lib` jar — JSTL `JstlBaseTLV` →
+                // `XmlUtil.newXMLReader`). Drive that loader before failing.
+                // Strictly additive — only on a global miss.
+                match drive_defining_loader_load(
+                    shared,
+                    thread,
+                    current_class_id,
+                    &method_class_name,
+                ) {
+                    Some(id) => id,
+                    None => {
+                        return Err(convert_class_not_found(
+                            shared,
+                            thread,
+                            &method_class_name,
+                            e.into(),
+                        ))
+                    }
+                }
+            }
+        };
         ensure_class_initialized_shared(shared, thread, target_class_id)?;
     }
 
@@ -23233,6 +23409,35 @@ fn execute_invokevirtual_vtable_fast(
             // so `execute_invoke`'s annotation_proxy interception layer
             // serves the spec-compliant `Annotation` contract.
             if &**rcv_name == "java/lang/annotation/AnnotationProxy" {
+                drop(cm);
+                return Ok(CachedCallResult::CacheMiss);
+            }
+            // `URLClassLoader.findClass` invoked on a SUBCLASS receiver (the
+            // native is registered on `URLClassLoader`, not the subclass, so the
+            // `find(rcv_name, …)` probe below misses and the parent walk would
+            // dispatch URLClassLoader's bytecode — which reads the shimmed `ucp`
+            // and throws CNF). Cede to the slow path, where
+            // `intercept_urlclassloader_subclass_find_class` forces the
+            // `ucl_find_class` native. Jasper's `JasperLoader.loadClass` →
+            // `findClass` (runtime-compiled `org.apache.jsp.*_jsp`) is the
+            // canonical case. Only when the receiver inherits (does not override)
+            // `findClass` — checked via the resolved declaring class.
+            if &*method_name == "findClass"
+                && &*method_descriptor == "(Ljava/lang/String;)Ljava/lang/Class;"
+                && &**rcv_name != "java/net/URLClassLoader"
+                && crate::classloading::find_method_recursive(
+                    receiver_class_id,
+                    &method_name,
+                    &method_descriptor,
+                    &cm.class_store,
+                )
+                .and_then(|(_m, did)| {
+                    cm.class_store
+                        .get(did)
+                        .map(|c| &*c.name == "java/net/URLClassLoader")
+                })
+                .unwrap_or(false)
+            {
                 drop(cm);
                 return Ok(CachedCallResult::CacheMiss);
             }

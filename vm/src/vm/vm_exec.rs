@@ -9572,8 +9572,20 @@ fn invoke_on_class_shared_inner(
                         // the latter is invoked via a subclass `this.addURL(url)`
                         // whose CP methodref names the subclass. Hibernate
                         // `NoDepthTests` JPA variants depend on these.
+                        // `findClass` is forced for the same shimmed-`ucp`
+                        // reason: a `URLClassLoader` subclass that overrides both
+                        // `loadClass` overloads and calls `findClass` directly
+                        // (Jasper's `JasperLoader`, loading the runtime-compiled
+                        // `org.apache.jsp.*_jsp` servlet from its scratch-dir URL)
+                        // bypasses CratonVM's `cl_load_class` native and reaches
+                        // the real `URLClassLoader.findClass`, whose shimmed
+                        // `ucp.getResource` returns null → `ClassNotFoundException`
+                        // (every compiled JSP 500s). `ucl_find_class` delegates to
+                        // the base classpath where `<init>` registered the URLs.
                         || (class_name == "java/net/URLClassLoader"
-                            && ((method_name == "findResource"
+                            && ((method_name == "findClass"
+                                && descriptor == "(Ljava/lang/String;)Ljava/lang/Class;")
+                                || (method_name == "findResource"
                                 && descriptor == "(Ljava/lang/String;)Ljava/net/URL;")
                                 || (method_name == "findResources"
                                     && descriptor
