@@ -10528,6 +10528,43 @@ fn is_pbe_keyfactory_alg(alg: &str) -> bool {
     alg.starts_with("PBEWith")
 }
 
+/// The exact set of PKCS#5 v1.5 / PKCS#12 PBE `SecretKeyFactory` algorithms that
+/// SunJCE actually registers and whose `PBEKey.getEncoded()` returns the
+/// password as 7-bit ASCII bytes (no key derivation at factory time — the
+/// MD5/SHA1+cipher PBKDF1/PBKDF2 only runs later inside a `Cipher`).
+///
+/// Recognising this exact set by default — rather than the broad `PBEWith*`
+/// prefix — keeps CratonVM faithful to HotSpot: an unregistered name like
+/// `PBEWithFooAndBar` still throws (mapped from `NoSuchAlgorithmException`),
+/// exactly as the real SunJCE provider would, instead of being silently
+/// accepted as a working factory. Every entry here is a real
+/// `com.sun.crypto.provider.PBEKeyFactory` subclass, so the password-bytes
+/// encoding [`pbe_generate_secret`] reproduces is correct for all of them. The
+/// broader `PBEWith*` prefix stays available behind
+/// `CRATONVM_NATIVE_PBE_KEYFACTORY=1` for callers that need the whole family.
+fn is_known_pbe_keyfactory_alg(alg: &str) -> bool {
+    matches!(
+        alg,
+        "PBEWithMD5AndDES"
+            | "PBEWithMD5AndTripleDES"
+            | "PBEWithSHA1AndDESede"
+            | "PBEWithSHA1AndRC2_40"
+            | "PBEWithSHA1AndRC2_128"
+            | "PBEWithSHA1AndRC4_40"
+            | "PBEWithSHA1AndRC4_128"
+            | "PBEWithHmacSHA1AndAES_128"
+            | "PBEWithHmacSHA224AndAES_128"
+            | "PBEWithHmacSHA256AndAES_128"
+            | "PBEWithHmacSHA384AndAES_128"
+            | "PBEWithHmacSHA512AndAES_128"
+            | "PBEWithHmacSHA1AndAES_256"
+            | "PBEWithHmacSHA224AndAES_256"
+            | "PBEWithHmacSHA256AndAES_256"
+            | "PBEWithHmacSHA384AndAES_256"
+            | "PBEWithHmacSHA512AndAES_256"
+    )
+}
+
 /// Side table recording which `SecretKeyFactory` synthetics are PBE (password-
 /// bytes) factories, mapping the GC-stable key from [`pbkdf2_key_for`] to the
 /// requested algorithm name. `generateSecret` consults this first: a hit takes
@@ -10625,12 +10662,16 @@ pub(crate) fn pbkdf2_get_instance(ctx: &mut dyn NativeContext, args: &[Value]) -
             pbkdf2_prf_table().lock().unwrap().insert(key, code);
             Ok(Some(Value::Object(Some(obj))))
         }
-        // PKCS#5 v1.5 PBE family (`PBEWithMD5AndDES`, …) — opt-in. SunJCE's
+        // PKCS#5 v1.5 / PKCS#12 PBE family (`PBEWithMD5AndDES`, …). SunJCE's
         // `PBEKeyFactory` returns a `PBEKey` whose `getEncoded()` is the 7-bit
         // ASCII password (no key derivation); we record the factory as PBE and
-        // let `generateSecret` reproduce that. Default-off and any unrecognised
-        // algorithm both fall through to the original `SecurityException`.
-        None if pbe_keyfactory_enabled() && is_pbe_keyfactory_alg(&alg) => {
+        // let `generateSecret` reproduce that. The exact set of real SunJCE PBE
+        // factory names is recognised by default (HotSpot-faithful: unknown
+        // `PBEWith*` names still throw); the broad `PBEWith*` prefix stays
+        // opt-in behind `CRATONVM_NATIVE_PBE_KEYFACTORY=1`.
+        None if is_known_pbe_keyfactory_alg(&alg)
+            || (pbe_keyfactory_enabled() && is_pbe_keyfactory_alg(&alg)) =>
+        {
             let obj = alloc_concurrent_synthetic(ctx, "javax/crypto/SecretKeyFactory", 1);
             let key = pbkdf2_key_for(ctx, obj);
             pbe_algo_table().lock().unwrap().insert(key, alg);
