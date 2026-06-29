@@ -100,11 +100,73 @@ loader; `LeakingTestAction.run()` passes its `getClass().getClassLoader().getNam
 run). `CLProbeB`/`CLProbeD` confirm `defineClass` attributes the right loader even
 when the class is also app-loaded. **The "defining loader recorded" item is fixed.**
 
-Residual (separate axis, NOT classloader delegation): the test still does not pass
-because `testClassLoaderLeaksNegated` (`NotLeakingTestAction`) waits the full
-180 s for the isolated loader to be **garbage-collected** and never sees it
-collected — the `defining_loader_store` side-table holds a strong, GC-rooted ref to
-every user loader that defines a class (CratonVM has no class/loader unloading). The
-phantom-reference leak detector therefore times out. This is a **class-unloading**
-gap, not a delegation/defining-loader bug, and is out of scope for HIB-CV-24.
-Follow-up: weak-ref the defining-loader side-table once class unloading exists.
+### ✅ Manifestation B leak-detection — FIXED 2026-06-29 (`fix/hibcv24-loader-unload`)
+
+`ClassLoaderLeaksUtilityTest` **1/2 → 2/2**, both sub-tests fast (3.7 s total, no
+180 s timeout), `ClassLoaderServiceImplTest` stays 7/7, ==HotSpot.
+
+**The residual was two layered gaps, the deeper one a general GC defect, not
+class-unloading-specific:**
+
+1. **GC weak/phantom-reference clearing did not work end-to-end.** CratonVM's mark
+   phase (`gen_heap::for_each_ref_slot` callers) traced *every* reference slot
+   strongly, including a `java.lang.ref.Reference`'s `referent`. So a **live**
+   `WeakReference`/`PhantomReference` pinned its referent forever — `get()` never
+   returned null, phantom queues never fired. The leak detector's `PhantomReference`
+   on the isolated loader therefore never enqueued regardless of rooting. (Proven
+   with standalone probes: a plain `new Object()` behind a `WeakReference` was never
+   cleared in either real-JDK or synthetic mode, while a finalizer on the same
+   object *did* run — finalizers are discovered at allocation, weak/phantom only in
+   their constructor native, and clearing additionally needs the marker to skip the
+   referent.)
+
+2. **The defining-loader side-table hard-rooted every user loader**
+   (`gc_scan_loader_singleton_roots`), so even with (1) fixed the loader could not
+   be collected.
+
+**Fix — three coordinated, independently-gated changes (all default-ON, opt-outs
+revert byte-identical):**
+
+- **`CRATONVM_WEAKREF_CLEAR`** — marker-free two-phase reference clearing. Before
+  every collection (`weakref_null_referents_pre_gc`, 6 collect sites) the VM nulls
+  the `referent` slot of every active Weak/Phantom reference so the *unmodified*
+  marker cannot keep the referent alive; the existing `process_references` then
+  clears/enqueues the dead ones, and `process_references_after_gc` restores the
+  slots of survivors (referent kept alive via a strong path) and runs
+  `remove_collected` to prune dead Reference objects. SoftReferences are left
+  strongly reachable (kept). This makes weak/phantom clearing work VM-wide.
+
+- **`CRATONVM_LOADER_UNLOAD`** — `gc_scan_loader_singleton_roots` no longer roots
+  the `defining_loader_store` values; `gc_reconcile_defining_loaders` (run in
+  `process_references_after_gc`) remaps survivors and prunes loaders collected this
+  cycle, using the same survivor predicate as reference processing.
+
+- **`cratonvm-types::loader_pin`** registry (mirrored from `defining_loader_store`
+  by `register_defining_loader` / `gc_reconcile` / `reset`). The GC marker consults
+  it so **a live object keeps its class's defining loader alive** — the
+  `Class`→`ClassLoader` edge HotSpot gets for free, which CratonVM lacked because an
+  object holds only a `class_id`, not its loader. Wired into the generational
+  collector's Cheney scan, promoted scan, non-moving sweep, and major-GC old-gen
+  mark. Conservative (only ever marks *more* live → cannot corrupt). This is what
+  keeps `testClassLoaderLeaksDetected` correct: the intentionally-leaked instance
+  (stowed in a `ThreadLocal`) now pins its loader, so the loader is *not* collected.
+
+Net behavior, matching HotSpot:
+- `testClassLoaderLeaksNegated` — no live instance ⇒ loader unreachable ⇒ collected
+  ⇒ phantom enqueues ⇒ assertion passes (fast, no timeout).
+- `testClassLoaderLeaksDetected` — instance leaked via `ThreadLocal` ⇒ instance
+  pins loader ⇒ loader retained ⇒ phantom never enqueues ⇒ assertion passes.
+
+**Validation:** standalone probes (`scratch/cv24/*.java`) — weak clears, phantom
+enqueues, isolated loader collected (LEAK-FREE) and JIT-mode too, leaked-instance
+RETAINED, live-loader identity stable across 200 GCs, finalizers still run, all
+opt-outs revert; `cratonvm-gc` unit tests 737/737; `ClassLoaderLeaksUtilityTest`
+2/2 + `ClassLoaderServiceImplTest` 7/7 via the real harness; sampled
+collection/bootstrap Hibernate classes green.
+
+**Not covered (future work):** G1 / ZGC collectors are not default and do not yet
+have the referent-skip / loader-pin hooks (no regression — weak/phantom clearing
+never worked there either). A young user-loader *instance* whose loader was promoted
+to old gen is not pinned across a *major* GC (rare; conservative fallback is the
+pre-fix app-loader attribution). Soft references are kept, not cleared under
+pressure (intentional — avoids the multi-phase soft-policy mark).
