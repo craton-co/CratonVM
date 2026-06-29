@@ -1881,7 +1881,12 @@ pub(crate) fn update_root_snapshot(shared: &SharedVm, thread: &mut JvmThread) {
             let maxk = thread.rs_cache.len().min(len);
             while p < maxk
                 && thread.frames[p].seq != 0
-                && thread.frames[p].seq == thread.rs_cache[p].0
+                // Key on (seq, exec_epoch): seq proves the frame was never
+                // popped; exec_epoch proves it has not RE-EXECUTED (and thus
+                // possibly reassigned a local) since it was cached. A mismatch in
+                // either ends the reusable prefix so this frame and all above it
+                // are re-scanned — the fix for the stale-reassigned-local AME.
+                && (thread.frames[p].seq, thread.frames[p].exec_epoch) == thread.rs_cache[p].0
             {
                 p += 1;
             }
@@ -1894,7 +1899,8 @@ pub(crate) fn update_root_snapshot(shared: &SharedVm, thread: &mut JvmThread) {
 
         // Build the next cache as we go (frozen frames `0..len-1`); the top is
         // never cached.
-        let mut new_cache: Vec<(u64, Vec<ObjectRef>)> = Vec::with_capacity(len.saturating_sub(1));
+        let mut new_cache: Vec<((u64, u64), Vec<ObjectRef>)> =
+            Vec::with_capacity(len.saturating_sub(1));
         // (a) reused frozen frames — copy their cached roots into the snapshot
         //     and carry the entry forward (move, no re-alloc).
         for i in 0..reuse {
@@ -1907,7 +1913,10 @@ pub(crate) fn update_root_snapshot(shared: &SharedVm, thread: &mut JvmThread) {
             let start = snapshot.len();
             scan_frame_roots(&thread.frames[i], &mut snapshot, &shared.heap);
             if i + 1 < len {
-                new_cache.push((thread.frames[i].seq, snapshot[start..].to_vec()));
+                new_cache.push((
+                    (thread.frames[i].seq, thread.frames[i].exec_epoch),
+                    snapshot[start..].to_vec(),
+                ));
             }
         }
         thread.rs_cache = new_cache;
@@ -2373,7 +2382,7 @@ pub(crate) fn remap_rs_cache_after_gc(
     // An empty map means nothing moved → cached addresses are already valid;
     // skip the walk but still re-tag the gen below so the cache is kept.
     if !pointer_map.is_empty() {
-        for (_seq, roots) in thread.rs_cache.iter_mut() {
+        for (_key, roots) in thread.rs_cache.iter_mut() {
             for r in roots.iter_mut() {
                 // Cast: object/code pointer to integer address
                 if let Some(&new_addr) = pointer_map.get(&(r.as_ptr() as usize)) {
@@ -4808,6 +4817,18 @@ pub fn pop_and_recycle_frame_with_reason(
     // T17.Δ.5 — JVMTI FramePop before the frame vanishes.
     fire_jvmti_frame_pop_if_requested(thread, was_popped_by_exception);
     if let Some(f) = thread.frames.pop() {
+        // Root-snapshot cache correctness: the frame that becomes the top again
+        // (the caller this return/unwind exposes) is about to RE-EXECUTE and may
+        // reassign its locals. Bump its `exec_epoch` so the `(seq, exec_epoch)`
+        // cache key invalidates its stale cached roots — `seq` alone is unchanged
+        // (the caller was never popped) and would otherwise reuse roots that miss
+        // a freshly-allocated local (the AME all-zero-receiver corruption). See
+        // the `Frame::seq` / `exec_epoch` docs. Cheap: one add on the (cold)
+        // return/unwind path. `wrapping_add` so a (practically impossible) u64
+        // overflow can never alias a live cache key into a false match.
+        if let Some(caller) = thread.frames.last_mut() {
+            caller.exec_epoch = caller.exec_epoch.wrapping_add(1);
+        }
         if crate::runtime::env_cache::frame_trace() {
             eprintln!(
                 "[FRAME_POP] depth={} {}.{}{}",
@@ -14159,6 +14180,12 @@ fn drive_defining_loader_load(
     // frames on this thread's stack.
     if thread.frames.len() > depth {
         thread.frames.truncate(depth);
+        // Root-snapshot cache correctness (see `pop_and_recycle_frame_with_reason`):
+        // bulk-popping stray frames re-exposes `frames[depth-1]` as the resuming
+        // top, so bump its `exec_epoch` to invalidate any stale cached roots.
+        if let Some(top) = thread.frames.last_mut() {
+            top.exec_epoch = top.exec_epoch.wrapping_add(1);
+        }
     }
     IN_FLIGHT.with(|s| {
         s.borrow_mut().pop();

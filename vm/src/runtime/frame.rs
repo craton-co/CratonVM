@@ -173,10 +173,30 @@ pub struct Frame {
     /// Per-frame-instance unique id, used ONLY by the opt-in root-snapshot
     /// cache (`CRATONVM_ROOTSNAP_CACHE`). A frame still present at index `k`
     /// with an unchanged `seq` proves — by the LIFO stack discipline — that
-    /// every frame below it has been continuously present and frozen, so its
-    /// cached GC roots are still valid. Zero (and never assigned) when the
-    /// cache gate is off, so the default build pays nothing.
+    /// every frame below it has been continuously present. Zero (and never
+    /// assigned) when the cache gate is off, so the default build pays nothing.
+    ///
+    /// CORRECTNESS NOTE: `seq` alone is INSUFFICIENT as a root-snapshot cache
+    /// key. "Continuously present" is NOT "frozen": a frame below the top can
+    /// still RE-EXECUTE and reassign its locals (it becomes the top again when a
+    /// callee returns into it, runs more bytecode — e.g. a loop that allocates a
+    /// fresh object into a local each iteration — then calls another method). Its
+    /// `seq` is unchanged (it was never popped), so a seq-only cache would reuse
+    /// stale roots that MISS the reassigned local → that live object is left
+    /// unrooted → reclaimed by the next GC → the all-zero-header
+    /// (`AbstractMethodError: ... has no Code attribute`) corruption cascade.
+    /// `exec_epoch` (below) closes this: it is bumped every time a callee returns
+    /// into this frame (i.e. the frame is about to re-execute), so the cache key
+    /// `(seq, exec_epoch)` invalidates on re-execution while still reusing the
+    /// roots of a genuinely-frozen deep frame (whose callees never return into
+    /// it until the very end — the perf case the cache exists for).
     pub seq: u64,
+
+    /// Re-execution counter for the root-snapshot cache key (paired with `seq`).
+    /// Bumped in `pop_and_recycle_frame_with_reason` when a callee frame is
+    /// popped and THIS frame becomes the top again — the precise moment it may
+    /// resume executing and mutate its locals. See the `seq` doc above.
+    pub exec_epoch: u64,
 
     // ── Cold fields (metadata, rarely-mutated state) ────────────────────
     /// Cold-path metadata (method name, descriptor, exception table, etc.).
@@ -589,6 +609,7 @@ impl Frame {
             monitor_on_exit: None,
             is_jdk_class: is_jdk,
             seq: next_frame_seq(),
+            exec_epoch: 0,
         }
     }
 
@@ -660,6 +681,7 @@ impl Frame {
             monitor_on_exit: None,
             is_jdk_class: is_jdk,
             seq: next_frame_seq(),
+            exec_epoch: 0,
         }
     }
 
@@ -710,6 +732,7 @@ impl Frame {
             monitor_on_exit: None,
             is_jdk_class: is_jdk,
             seq: next_frame_seq(),
+            exec_epoch: 0,
         }
     }
 
@@ -750,6 +773,7 @@ impl Frame {
             monitor_on_exit: None,
             is_jdk_class: is_jdk,
             seq: next_frame_seq(),
+            exec_epoch: 0,
         }
     }
 
@@ -1230,6 +1254,7 @@ impl Frame {
             monitor_on_exit: None,
             is_jdk_class: false,
             seq: next_frame_seq(),
+            exec_epoch: 0,
         }
     }
 

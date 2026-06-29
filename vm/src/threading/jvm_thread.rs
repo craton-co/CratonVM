@@ -275,13 +275,18 @@ pub struct JvmThread {
     pub frame_trace: Arc<parking_lot::Mutex<Vec<cratonvm_native_api::StackTraceEntry>>>,
 
     /// Opt-in root-snapshot cache (`CRATONVM_ROOTSNAP_CACHE`): per *frozen*
-    /// frame, `(frame.seq, that frame's scanned GC roots)`, indexed parallel to
-    /// `frames[0..rs_cache.len()]`. Lets `update_root_snapshot` reuse the deep,
-    /// continuously-frozen frames and re-scan only the churning top. Valid only
-    /// while `rs_cache_gen == heap.collection_count()` (a GC may have moved/
-    /// promoted objects, invalidating the cached addresses). Empty/unused when
-    /// the gate is off.
-    pub rs_cache: Vec<(u64, Vec<ObjectRef>)>,
+    /// frame, `((frame.seq, frame.exec_epoch), that frame's scanned GC roots)`,
+    /// indexed parallel to `frames[0..rs_cache.len()]`. Lets
+    /// `update_root_snapshot` reuse the deep, continuously-frozen frames and
+    /// re-scan only the churning top. Valid only while `rs_cache_gen ==
+    /// heap.collection_count()` (a GC may have moved/promoted objects,
+    /// invalidating the cached addresses). The key is `(seq, exec_epoch)` — NOT
+    /// `seq` alone: `seq` proves the frame was never popped, but a still-present
+    /// frame can RE-EXECUTE and reassign its locals; `exec_epoch` (bumped on
+    /// every callee-return into the frame) detects that so stale roots are never
+    /// reused (see `Frame::seq` / `Frame::exec_epoch`). Empty/unused when the
+    /// gate is off.
+    pub rs_cache: Vec<((u64, u64), Vec<ObjectRef>)>,
     /// GC collection count at which `rs_cache` was built (move/promote generation).
     pub rs_cache_gen: u64,
 
