@@ -6,9 +6,25 @@
 > override, bypassing the supplied loader. Fix defers global resolution to after
 > `findClass` for null-parent `findClass`-overriding loaders (gate
 > `CRATONVM_CL_BOOTSTRAP_SCOPED`, default-ON). `ClassLoaderServiceImplTest` 6/1→7/7
-> ==HotSpot, no parent-first regression. Manifestation B's defining-loader is also
-> correct now; its residual is a class-unloading/leak-detector gap (separate).
-> Full write-up:
+> ==HotSpot, no parent-first regression.
+>
+> ✅ **FIXED (Manifestation B) 2026-06-29** on branch `fix/hibcv24-loader-unload`.
+> The residual was NOT a delegation bug but a **GC weak/phantom-reference gap**:
+> CratonVM's mark phase traced `java.lang.ref.Reference.referent` *strongly*, so a
+> live `PhantomReference` pinned its referent forever (the leak detector's phantom
+> on the isolated loader never enqueued), and the defining-loader side-table
+> additionally hard-rooted every user loader. Three coordinated, gated fixes:
+> (1) `CRATONVM_WEAKREF_CLEAR` (default-ON) — null Weak/Phantom referent slots
+> before each collection so the unmodified marker can't keep them alive, then
+> restore survivors after (`process_references_after_gc`), making weak/phantom
+> clearing work VM-wide; (2) `CRATONVM_LOADER_UNLOAD` (default-ON) — the
+> defining-loader side-table no longer GC-roots user loaders, so a truly
+> unreachable loader is collected; (3) a `cratonvm-types::loader_pin` registry the
+> GC marker consults so a **live instance keeps its class's defining loader alive**
+> (HotSpot's `Class`→`ClassLoader` edge), preserving the intentional-leak case.
+> `ClassLoaderLeaksUtilityTest` 1/2 (180s timeout) → **2/2** (3.7s),
+> `ClassLoaderServiceImplTest` stays 7/7, ==HotSpot; gc unit tests 737/737; all
+> opt-outs revert to legacy. Full write-up:
 > `docs/internal/h2-suite-bugs/run-20260622/HIB-CV-24-classloader-isolation-delegation-FIXED.md`.
 
 
