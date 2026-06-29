@@ -568,15 +568,25 @@ fn is_java_url_scheme(name: &str) -> bool {
 /// * `Err(_)` — a non-exception VM failure escaped.
 ///
 /// The `Ok(None)` result is also the WildFly / Keycloak path: a stock JDK
-/// has *no* `java:` URL context factory, so `getURLContext("java", …)`
-/// returns `null` there and the `java:jboss/...` traffic keeps using the
+/// has *no* `java:` URL context factory configured, so `getURLContext("java",
+/// …)` returns `null` there and the `java:jboss/...` traffic keeps using the
 /// flat store. The decision is therefore made by the JDK's own
 /// `getURLContext` contract — exactly the spec'd `getURLOrDefaultInitCtx`
 /// behaviour — rather than by guessing which app server is running.
 ///
-/// `env` is the `InitialContext`'s environment `Hashtable` (may be null —
-/// `getURLContext` accepts a null environment and consults the
-/// `java.naming.factory.url.pkgs` system property, which Tomcat sets).
+/// IMPORTANT — `getURLContext` resolves the URL-context factory from the
+/// `java.naming.factory.url.pkgs` (`Context.URL_PKG_PREFIXES`) value found in
+/// the **environment `Hashtable`** (and `jndi.properties` resources), NOT from
+/// the system property. (Verified against HotSpot: `getURLContext("java",
+/// null)` and `("java", emptyEnv)` both return `null`; only `("java", env)`
+/// with `url.pkgs` set in `env` yields the `SelectorContext`.) Real
+/// `InitialContext` works because its constructor copies the system JNDI
+/// properties into `myProps`; our native `<init>` stub leaves the env empty, so
+/// we must materialise that environment here. [`url_pkgs_env`] does so from the
+/// `java.naming.factory.url.pkgs` system property Tomcat's `enableNaming()`
+/// sets — giving the spec-correct factory dispatch the input it needs. When no
+/// such property is set (plain WildFly / Keycloak) the env is left as-is and
+/// `getURLContext` returns `null`, preserving the flat-store path.
 fn java_url_context(
     ctx: &mut dyn NativeContext,
     env: Value,
@@ -590,6 +600,7 @@ fn java_url_context(
     {
         return Ok(None);
     }
+    let env = url_pkgs_env(ctx, env);
     let scheme = ctx.create_string("java");
     let result = ctx.invoke(
         "javax/naming/spi/NamingManager",
@@ -606,6 +617,43 @@ fn java_url_context(
         Err(MethodCallFailed::ExceptionThrown(_)) => Ok(None),
         Err(other) => Err(other),
     }
+}
+
+/// Materialise the environment `Hashtable` that `NamingManager.getURLContext`
+/// needs to resolve the `java:` URL-context factory.
+///
+/// `getURLContext` reads `Context.URL_PKG_PREFIXES`
+/// (`java.naming.factory.url.pkgs`) from the supplied environment, NOT from the
+/// system property. Tomcat's `enableNaming()` publishes that value as a *system*
+/// property and relies on `InitialContext`'s constructor to copy it into the
+/// per-instance environment — a step our native `<init>` stub skips. So, when
+/// the system property is present, build a `Hashtable` carrying it (preferring
+/// any value already present in `incoming`). Returns `incoming` unchanged when
+/// the property is unset (plain WildFly / Keycloak) or on any allocation error,
+/// so the caller's `getURLContext` then returns `null` and the flat store wins.
+fn url_pkgs_env(ctx: &mut dyn NativeContext, incoming: Value) -> Value {
+    let pkgs = match ctx.get_system_property("java.naming.factory.url.pkgs") {
+        Some(s) if !s.trim().is_empty() => s,
+        _ => return incoming,
+    };
+    let ht = match ctx.new_object_initialized("java/util/Hashtable", "()V", &[]) {
+        Ok(Some(Value::Object(Some(o)))) => o,
+        _ => return incoming,
+    };
+    let key = ctx.create_string("java.naming.factory.url.pkgs");
+    let val = ctx.create_string(&pkgs);
+    if ctx
+        .invoke_virtual(
+            ht,
+            "put",
+            "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+            &[Value::Object(Some(key)), Value::Object(Some(val))],
+        )
+        .is_err()
+    {
+        return incoming;
+    }
+    Value::Object(Some(ht))
 }
 
 /// Read the `InitialContext` environment table to forward to
@@ -720,14 +768,48 @@ fn native_context_lookup(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         Some(n) => n,
         None => return Err(throw_invalid_name(ctx, "null name")),
     };
+    do_context_lookup(ctx, this, &name)
+}
 
+/// `Context.lookup(Name)` — the `javax.naming.Name` overload. Real
+/// `InitialContext.lookup(Name)` bytecode resolves a `java:` name via
+/// `getURLOrDefaultInitCtx(name)` → `NamingManager.getURLContext("java",
+/// myProps)`. That works on HotSpot because the `InitialContext` constructor
+/// copies the system JNDI properties into `myProps` (so `URL_PKG_PREFIXES` is
+/// present); our native `<init>` stub skips that, leaving `myProps` empty, so
+/// the real path falls through to `getDefaultInitCtx()` →
+/// `javaURLContextFactory.getInitialContext(env)`, which yields an *initial*-mode
+/// `SelectorContext` backed by a fresh, empty `NamingContext` — the lookup
+/// misses and the servlet sees a `NameNotFoundException` (Tomcat
+/// `testBug52830`: `lookup(new CompositeName("java:comp/env/boolean"))` → 500).
+///
+/// We mirror the `lookup(String)` intercept: render the `Name` to its string
+/// form (a `CompositeName` round-trips `java:comp/env/...` exactly) and run the
+/// identical delegation, which materialises the `URL_PKG_PREFIXES` environment
+/// (see [`url_pkgs_env`]) and reaches the *non-initial* SelectorContext bound to
+/// the current web-app.
+fn native_context_lookup_name(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let name = match name_arg_to_string(ctx, args, 1)? {
+        Some(n) => n,
+        None => return Err(throw_invalid_name(ctx, "null name")),
+    };
+    do_context_lookup(ctx, this, &name)
+}
+
+/// Shared `lookup` body for both the `String` and `Name` overloads.
+fn do_context_lookup(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    name: &str,
+) -> MethodCallResult {
     // `java:` URL-scheme names: hand off to the JDK's URL-context-factory
     // chain so Tomcat's own `org.apache.naming` context resolves the name
     // against `ContextBindings`. Falls back to the flat store on null/err.
-    if is_java_url_scheme(&name) {
+    if is_java_url_scheme(name) {
         let env = initial_context_env(ctx, this);
         if let Some(url_ctx) = java_url_context(ctx, env)? {
-            let name_obj = ctx.create_string(&name);
+            let name_obj = ctx.create_string(name);
             return ctx.invoke_virtual(
                 url_ctx,
                 "lookup",
@@ -736,7 +818,7 @@ fn native_context_lookup(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
             );
         }
         if let Some(def_ctx) = tomcat_default_init_ctx(ctx, env)? {
-            let name_obj = ctx.create_string(&name);
+            let name_obj = ctx.create_string(name);
             return ctx.invoke_virtual(
                 def_ctx,
                 "lookup",
@@ -746,9 +828,28 @@ fn native_context_lookup(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         }
     }
 
-    match lookup_value(&name) {
+    match lookup_value(name) {
         Ok(obj) => Ok(Some(Value::Object(Some(obj)))),
         Err(msg) => Err(flat_store_error(ctx, &msg)),
+    }
+}
+
+/// Read a `javax.naming.Name` argument and render it to the string form the
+/// flat store / SelectorContext expect. `Name.toString()` on a `CompositeName`
+/// re-joins components with `/`, so `new CompositeName("java:comp/env/x")`
+/// round-trips back to `java:comp/env/x`. Returns `Ok(None)` for a null arg.
+fn name_arg_to_string(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    idx: usize,
+) -> Result<Option<String>, MethodCallFailed> {
+    let name_obj = match args.get(idx).copied() {
+        Some(Value::Object(Some(o))) => o,
+        _ => return Ok(None),
+    };
+    match ctx.invoke_virtual(name_obj, "toString", "()Ljava/lang/String;", &[])? {
+        Some(Value::Object(Some(s))) => Ok(ctx.read_string(s)),
+        _ => Ok(None),
     }
 }
 
@@ -982,6 +1083,15 @@ fn native_context_list_bindings(ctx: &mut dyn NativeContext, args: &[Value]) -> 
                 &[Value::Object(Some(name_obj))],
             );
         }
+        if let Some(def_ctx) = tomcat_default_init_ctx(ctx, env)? {
+            let name_obj = ctx.create_string(&name);
+            return ctx.invoke_virtual(
+                def_ctx,
+                "listBindings",
+                "(Ljava/lang/String;)Ljavax/naming/NamingEnumeration;",
+                &[Value::Object(Some(name_obj))],
+            );
+        }
     }
 
     let children = match list_bindings(&name) {
@@ -1099,6 +1209,12 @@ pub fn register_wildfly_naming_natives(r: &mut NativeMethodRegistry) {
         "lookup",
         "(Ljava/lang/String;)Ljava/lang/Object;",
         native_context_lookup,
+    );
+    r.register(
+        ic,
+        "lookup",
+        "(Ljavax/naming/Name;)Ljava/lang/Object;",
+        native_context_lookup_name,
     );
     r.register(
         ic,

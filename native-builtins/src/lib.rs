@@ -1043,6 +1043,23 @@ fn essential_class_has_static_initializer(ctx: &mut dyn NativeContext, args: &[V
     }
 }
 
+/// True when `obj`'s concrete class is `java.util.logging.Logger$ConfigurationData`.
+///
+/// Used by the `java/util/logging/Logger.{get,set}Level` natives to tell a
+/// **real-JDK** `Logger` apart from the flat synthetic loggers our own
+/// `getLogger` natives mint. A real `Logger` keeps its level in
+/// `config.levelObject` (where `config` is a `ConfigurationData`); the
+/// synthetic loggers instead stash the name in slot 0 — which is the real
+/// `config` field slot — so for them `config` resolves to a `String`, not a
+/// `ConfigurationData`. Only the real shape is written/read through; synthetic
+/// loggers keep their historic no-op/null level behaviour (their effective
+/// level is governed by the process-wide tracing subscriber).
+fn jul_logger_config_is_real(ctx: &mut dyn NativeContext, obj: ObjectRef) -> bool {
+    ctx.class_name_of_id(ctx.class_id_of_object(obj))
+        .map(|n| n == "java/util/logging/Logger$ConfigurationData")
+        .unwrap_or(false)
+}
+
 /// Register ONLY the truly native methods (`ACC_NATIVE` in real JDK class files).
 /// These methods have no bytecode — they MUST be provided by the VM as native code.
 /// Used when `use_synthetic_jdk == false` (real JDK mode).
@@ -7412,17 +7429,58 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         "(Ljava/util/logging/Level;)Z",
         |_ctx, _args| Ok(Some(Value::Int(0))),
     );
+    // BUG-R sibling: these previously hard-stubbed `setLevel`→no-op and
+    // `getLevel`→null, which is correct for our flat synthetic loggers but
+    // SHADOWS real-JDK `java.util.logging.Logger` objects. Tomcat's
+    // `ClassLoaderLogManager` builds a real `RootLogger extends Logger` via
+    // `new`, calls `setLevel(Level.INFO)`, then asserts `getLevel() == INFO`
+    // (org.apache.juli.TestClassLoaderLogManager#testBug66184). With the stubs
+    // the set was dropped and the get always returned null →
+    // "expected:<INFO> but was:<null>". A real `Logger` keeps its level in
+    // `config.levelObject`; write/read through that when `config` is a genuine
+    // `ConfigurationData`. Synthetic loggers (whose `config` slot holds the
+    // name String) keep the historic no-op/null behaviour.
     registry.register(
         "java/util/logging/Logger",
         "setLevel",
         "(Ljava/util/logging/Level;)V",
-        |_ctx, _args| Ok(None),
+        |ctx, args| {
+            let Some(Value::Object(Some(this))) = args.first().copied() else {
+                return Ok(None);
+            };
+            let level = args.get(1).copied().unwrap_or(Value::Object(None));
+            if let Value::Object(Some(config)) = ctx.get_field_by_name(this, "config") {
+                if jul_logger_config_is_real(ctx, config) {
+                    ctx.set_field_by_name(config, "levelObject", level);
+                    // Keep `levelValue` consistent with `levelObject` so any code
+                    // that reads the cached int (e.g. real `isLoggable`) agrees
+                    // with `getLevel()`. `Level.value` is the int.
+                    if let Value::Object(Some(lvl)) = level {
+                        if let Value::Int(v) = ctx.get_field_by_name(lvl, "value") {
+                            ctx.set_field_by_name(config, "levelValue", Value::Int(v));
+                        }
+                    }
+                }
+            }
+            Ok(None)
+        },
     );
     registry.register(
         "java/util/logging/Logger",
         "getLevel",
         "()Ljava/util/logging/Level;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
+        |ctx, args| {
+            let Some(Value::Object(Some(this))) = args.first().copied() else {
+                return Ok(Some(Value::Object(None)));
+            };
+            if let Value::Object(Some(config)) = ctx.get_field_by_name(this, "config") {
+                if jul_logger_config_is_real(ctx, config) {
+                    return Ok(Some(ctx.get_field_by_name(config, "levelObject")));
+                }
+            }
+            // Synthetic logger: preserve historic null (inherit from parent).
+            Ok(Some(Value::Object(None)))
+        },
     );
     registry.register(
         "java/util/logging/Logger",
@@ -29102,6 +29160,7 @@ pub(crate) fn normalize_charset_name(name: &str) -> String {
         "WINDOWS1250" | "CP1250" => "windows-1250".to_string(),
         "KOI8R" => "KOI8-R".to_string(),
         "KOI8U" => "KOI8-U".to_string(),
+        "IBM850" | "CP850" | "850" | "CSPC850MULTILINGUAL" => "IBM850".to_string(),
         _ => {
             let upper = name.to_uppercase();
             if upper.contains("UTF") && upper.contains("8") {

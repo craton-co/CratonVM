@@ -108,6 +108,7 @@ pub fn decode_bytes(name: &str, bytes: &[u8]) -> Result<Vec<u16>, CodingError> {
         "KOI8-R" => Ok(bytes.iter().map(|&b| koi8r_to_u16(b)).collect()),
         "ISO-8859-2" => Ok(bytes.iter().map(|&b| iso_8859_2_to_u16(b)).collect()),
         "ISO-8859-15" => Ok(bytes.iter().map(|&b| iso_8859_15_to_u16(b)).collect()),
+        "IBM850" => Ok(bytes.iter().map(|&b| ibm850_to_u16(b)).collect()),
         _ => Err(CodingError {
             offset: 0,
             length: 0,
@@ -139,6 +140,7 @@ pub fn encode_chars(name: &str, chars: &[u16]) -> Result<Vec<u8>, CodingError> {
         "KOI8-R" => encode_koi8r(chars),
         "ISO-8859-2" => encode_iso_8859_2(chars),
         "ISO-8859-15" => encode_iso_8859_15(chars),
+        "IBM850" => encode_ibm850(chars),
         _ => Err(CodingError {
             offset: 0,
             length: 0,
@@ -212,6 +214,7 @@ pub fn encode_chars_lossy(name: &str, chars: &[u16]) -> Vec<u8> {
             "KOI8-R" => encode_sb_lossy(chars, koi8r_rev()),
             "ISO-8859-2" => encode_sb_lossy(chars, iso_8859_2_rev()),
             "ISO-8859-15" => encode_sb_lossy(chars, iso_8859_15_rev()),
+            "IBM850" => encode_sb_lossy(chars, ibm850_rev()),
             // Unsupported charset name. The lossy signature is infallible, so
             // we cannot surface `UnsupportedCharset`. Re-encoding as UTF-8
             // silently produced bytes in the *wrong* encoding for the sink.
@@ -945,6 +948,9 @@ macro_rules! paste_sb_rev {
     (ISO_8859_15_HIGH) => {
         sb_rev_cell!(ISO_8859_15_REV_CELL, iso_8859_15_rev, ISO_8859_15_HIGH);
     };
+    (IBM850_HIGH) => {
+        sb_rev_cell!(IBM850_REV_CELL, ibm850_rev, IBM850_HIGH);
+    };
 }
 
 macro_rules! sb_rev_cell {
@@ -1063,6 +1069,27 @@ sb_table!(
     ]
 );
 
+// IBM850 / CP850 (DOS Latin-1 "Multilingual"). Bytes 0x00..=0x7F are ASCII;
+// only the 0x80..=0xFF high half is tabulated here, in byte order, per the
+// standard Unicode mapping (box-drawing glyphs map to U+25xx/U+2500-range).
+sb_table!(
+    IBM850_HIGH,
+    [
+        0x00C7, 0x00FC, 0x00E9, 0x00E2, 0x00E4, 0x00E0, 0x00E5, 0x00E7, 0x00EA, 0x00EB, 0x00E8,
+        0x00EF, 0x00EE, 0x00EC, 0x00C4, 0x00C5, 0x00C9, 0x00E6, 0x00C6, 0x00F4, 0x00F6, 0x00F2,
+        0x00FB, 0x00F9, 0x00FF, 0x00D6, 0x00DC, 0x00F8, 0x00A3, 0x00D8, 0x00D7, 0x0192, 0x00E1,
+        0x00ED, 0x00F3, 0x00FA, 0x00F1, 0x00D1, 0x00AA, 0x00BA, 0x00BF, 0x00AE, 0x00AC, 0x00BD,
+        0x00BC, 0x00A1, 0x00AB, 0x00BB, 0x2591, 0x2592, 0x2593, 0x2502, 0x2524, 0x00C1, 0x00C2,
+        0x00C0, 0x00A9, 0x2563, 0x2551, 0x2557, 0x255D, 0x00A2, 0x00A5, 0x2510, 0x2514, 0x2534,
+        0x252C, 0x251C, 0x2500, 0x253C, 0x00E3, 0x00C3, 0x255A, 0x2554, 0x2569, 0x2566, 0x2560,
+        0x2550, 0x256C, 0x00A4, 0x00F0, 0x00D0, 0x00CA, 0x00CB, 0x00C8, 0x0131, 0x00CD, 0x00CE,
+        0x00CF, 0x2518, 0x250C, 0x2588, 0x2584, 0x00A6, 0x00CC, 0x2580, 0x00D3, 0x00DF, 0x00D4,
+        0x00D2, 0x00F5, 0x00D5, 0x00B5, 0x00FE, 0x00DE, 0x00DA, 0x00DB, 0x00D9, 0x00FD, 0x00DD,
+        0x00AF, 0x00B4, 0x00AD, 0x00B1, 0x2017, 0x00BE, 0x00B6, 0x00A7, 0x00F7, 0x00B8, 0x00B0,
+        0x00A8, 0x00B7, 0x00B9, 0x00B3, 0x00B2, 0x25A0, 0x00A0,
+    ]
+);
+
 fn sb_to_u16(byte: u8, table: &[u16; 128]) -> u16 {
     if byte < 0x80 {
         byte as u16
@@ -1085,6 +1112,9 @@ fn iso_8859_2_to_u16(b: u8) -> u16 {
 }
 fn iso_8859_15_to_u16(b: u8) -> u16 {
     sb_to_u16(b, &ISO_8859_15_HIGH)
+}
+fn ibm850_to_u16(b: u8) -> u16 {
+    sb_to_u16(b, &IBM850_HIGH)
 }
 
 /// Encode UTF-16 code units into a single-byte charset using a prebuilt
@@ -1131,6 +1161,9 @@ fn encode_iso_8859_2(chars: &[u16]) -> Result<Vec<u8>, CodingError> {
 fn encode_iso_8859_15(chars: &[u16]) -> Result<Vec<u8>, CodingError> {
     encode_sb(chars, iso_8859_15_rev(), "ISO-8859-15")
 }
+fn encode_ibm850(chars: &[u16]) -> Result<Vec<u8>, CodingError> {
+    encode_sb(chars, ibm850_rev(), "IBM850")
+}
 
 /// Returns a static-lifetime copy of `name` if we recognise it.  This
 /// avoids allocating a `&'static str` from a borrowed `&str` in error
@@ -1151,6 +1184,7 @@ fn canonical_name_static(name: &str) -> &'static str {
         "windows-1252" => "windows-1252",
         "windows-1251" => "windows-1251",
         "KOI8-R" => "KOI8-R",
+        "IBM850" => "IBM850",
         _ => "(unknown)",
     }
 }
@@ -1161,7 +1195,7 @@ pub fn average_bytes_per_char(name: &str) -> f32 {
     match name {
         "UTF-8" => 1.1,
         "US-ASCII" | "ISO-8859-1" | "ISO-8859-2" | "ISO-8859-15" | "windows-1252"
-        | "windows-1251" | "KOI8-R" => 1.0,
+        | "windows-1251" | "KOI8-R" | "IBM850" => 1.0,
         "UTF-16" => 2.0,
         "UTF-16BE" | "UTF-16LE" => 2.0,
         "UTF-32" | "UTF-32BE" | "UTF-32LE" => 4.0,
@@ -1174,7 +1208,7 @@ pub fn max_bytes_per_char(name: &str) -> f32 {
     match name {
         "UTF-8" => 3.0, // per Java spec: 3 for BMP, surrogate pair encodes a single supplementary as 4 bytes but avg per UTF-16 unit is 3
         "US-ASCII" | "ISO-8859-1" | "ISO-8859-2" | "ISO-8859-15" | "windows-1252"
-        | "windows-1251" | "KOI8-R" => 1.0,
+        | "windows-1251" | "KOI8-R" | "IBM850" => 1.0,
         "UTF-16" => 4.0, // leading BOM
         "UTF-16BE" | "UTF-16LE" => 2.0,
         "UTF-32" | "UTF-32BE" | "UTF-32LE" => 4.0,

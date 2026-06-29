@@ -634,6 +634,25 @@ impl ThreadRegistry {
             if entry.alive.load(Ordering::Acquire) {
                 let snapshot = entry.root_snapshot.lock();
                 all_roots.extend(snapshot.iter().copied());
+                // Root this thread's `java.lang.Thread` mirror. The
+                // initiator's own mirror is rooted via `collect_roots`
+                // (roots.rs step 10), but a PARKED thread's mirror is only
+                // reachable through `ThreadEntry.java_thread_obj` — a raw
+                // address copy that no frame root or heap edge necessarily
+                // keeps alive (CratonVM's synthetic ThreadGroup does not
+                // retain its threads the way the real JDK's does). Without
+                // rooting it here, a GC initiated by ANOTHER thread while
+                // this one is parked sweeps the mirror; the dangling copy
+                // then surfaces as the "all-zero header" invokevirtual
+                // fallback on `Thread.currentThread()`, and the real-JDK
+                // `Thread.getThreadGroup()` reads a null `holder` and NPEs
+                // (Tomcat TestDigestAuthenticator: a worker-thread GC frees
+                // the JUnit main thread's mirror). The matching remap is
+                // `update_thread_objs_after_gc` — mirroring the async-
+                // exception slot's root+remap pairing below.
+                if let Some(obj) = entry.java_thread_obj {
+                    all_roots.push(obj);
+                }
             }
             // A posted async exception must survive even if the target
             // thread is dead-but-not-yet-reaped: it may still be consumed
@@ -1049,6 +1068,36 @@ mod tests {
             new_addr,
             "slot must be repointed to the relocated throwable",
         );
+    }
+
+    /// An alive thread's `java.lang.Thread` mirror is reported as a GC root
+    /// by `collect_all_root_snapshots`, so a collection initiated by ANOTHER
+    /// thread (while this one is parked) cannot sweep the mirror out from
+    /// under the dangling `ThreadEntry.java_thread_obj` copy. Regression for
+    /// the Tomcat TestDigestAuthenticator "this.holder is null" NPE: a worker-
+    /// thread GC freed the parked JUnit main thread's mirror, so the cached
+    /// `currentThread()` pointer dereferenced an all-zero (freed) header.
+    #[test]
+    fn alive_thread_mirror_is_a_root() {
+        let registry = ThreadRegistry::new();
+        let tid = ThreadId(1);
+
+        let mut backing = [0u64; 2];
+        let mirror = dummy_aligned_objref(&mut backing);
+
+        // Registered WITHOUT a mirror → not a root yet.
+        registry.register(tid, "main", None);
+        assert!(registry.collect_all_root_snapshots().is_empty());
+
+        // Once the mirror is published it must be rooted.
+        registry.set_java_thread_obj(tid, mirror);
+        let roots = registry.collect_all_root_snapshots();
+        assert_eq!(roots.len(), 1, "alive thread mirror must be a root");
+        assert_eq!(roots[0].as_ptr(), mirror.as_ptr());
+
+        // A dead thread's mirror is no longer rooted (it may be reclaimed).
+        registry.mark_dead(tid);
+        assert!(registry.collect_all_root_snapshots().is_empty());
     }
 
     #[test]

@@ -8243,13 +8243,23 @@ enum JarFsKind {
 
 fn jarfs_classify(jar: &str, entry: &str) -> JarFsKind {
     let entry = entry.trim_start_matches('/');
+    // The mounted jar's ROOT is always a directory — even when the jar file
+    // itself is missing. A manifest `Class-Path:` header routinely names sibling
+    // jars that aren't present (e.g. Derby's `Class-Path: derbyshared.jar …`,
+    // none of which live in the Gradle cache's per-artifact hash dir); javac
+    // mounts each and walks its root. Reporting the root of an absent jar as
+    // `Absent` made `readAttributes` throw `NoSuchFileException`, which javac
+    // surfaced as a fatal "cannot access <package>" (the missing jar otherwise
+    // contributes no classes, so it should walk as an EMPTY directory and be
+    // skipped — matching the net effect of HotSpot, whose zip provider throws at
+    // mount time and javac then skips the entry).
+    if entry.is_empty() {
+        return JarFsKind::Dir;
+    }
     let names = match jar_index(jar) {
         Some(n) => n,
         None => return JarFsKind::Absent,
     };
-    if entry.is_empty() {
-        return JarFsKind::Dir;
-    }
     // Exact entry → a regular file.
     if names.binary_search_by(|n| n.as_str().cmp(entry)).is_ok() {
         return JarFsKind::File;

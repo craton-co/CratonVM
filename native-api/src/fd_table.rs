@@ -20,6 +20,49 @@ use std::time::Duration;
 
 pub type FdId = u32;
 
+/// Connect to `addr`, trying IPv4 candidate addresses before IPv6.
+///
+/// `std::net::TcpStream::connect(host:port)` resolves the host and tries each
+/// returned address in resolver order until one succeeds. On Windows, an
+/// unqualified `localhost` resolves to `::1` (IPv6) *first*, then `127.0.0.1`
+/// — the loopback hosts-file entries are commented out by default, so the DNS
+/// client returns IPv6 ahead of IPv4. When the peer (e.g. an embedded Tomcat
+/// started with `-Djava.net.preferIPv4Stack=true`) listens on IPv4 only, the
+/// `[::1]:port` attempt is silently dropped and blocks for ~2 seconds before
+/// the stack gives up and falls back to `127.0.0.1`. That ~2s-per-connect
+/// stall is what made three serial WebSocket client connects exceed a 3s
+/// session-idle timeout.
+///
+/// Re-ordering IPv4 candidates ahead of IPv6 mirrors `preferIPv4Stack=true`
+/// and makes the common loopback case connect immediately, while still
+/// falling back to IPv6 for genuinely IPv6-only hosts. A literal IP address
+/// resolves to a single candidate, so the sort is a no-op for it.
+fn connect_prefer_ipv4(addr: &str) -> io::Result<std::net::TcpStream> {
+    use std::net::ToSocketAddrs;
+
+    let mut candidates: Vec<std::net::SocketAddr> = addr.to_socket_addrs()?.collect();
+    if candidates.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("could not resolve address: {addr}"),
+        ));
+    }
+    // Stable sort: IPv4 (key 0) before IPv6 (key 1), preserving the resolver's
+    // relative order within each family.
+    candidates.sort_by_key(|sa| u8::from(sa.is_ipv6()));
+
+    let mut last_err: Option<io::Error> = None;
+    for sa in &candidates {
+        match std::net::TcpStream::connect(sa) {
+            Ok(stream) => return Ok(stream),
+            Err(e) => last_err = Some(e),
+        }
+    }
+    Err(last_err.unwrap_or_else(|| {
+        io::Error::new(io::ErrorKind::Other, format!("connect failed: {addr}"))
+    }))
+}
+
 enum FileEntry {
     Stdin(Mutex<io::Stdin>),
     Stdout(Mutex<io::Stdout>),
@@ -1100,7 +1143,7 @@ impl FileDescriptorTable {
         if fd >= u32::MAX - 16 {
             return Err(io::Error::other("file descriptor limit exceeded"));
         }
-        let stream = std::net::TcpStream::connect(addr)?;
+        let stream = connect_prefer_ipv4(addr)?;
         self.entries
             .write()
             .insert(fd, Arc::new(FileEntry::TcpStream(Mutex::new(stream))));
@@ -1221,6 +1264,30 @@ impl FileDescriptorTable {
             _ => Err(io::Error::new(
                 io::ErrorKind::NotFound,
                 "bad fd for tcp read",
+            )),
+        }
+    }
+
+    /// Duplicate the underlying TCP socket for `fd`, returning an independent
+    /// owned `TcpStream` handle to the same connection.
+    ///
+    /// Used by the asynchronous-socket completion path: a worker thread needs to
+    /// perform a *blocking* read on the connection while the application keeps
+    /// issuing `tcp_write`s (Future-form `AsynchronousSocketChannel.write`) on the
+    /// same fd. Holding the per-fd `Mutex<TcpStream>` across a blocking read would
+    /// deadlock those writes, so the reader takes a `try_clone()` handle (a second
+    /// OS handle onto the same full-duplex socket) and reads on it lock-free while
+    /// writes continue through the original entry. Returns an error if `fd` is not
+    /// a live TCP stream.
+    pub fn try_clone_tcp(&self, fd: FdId) -> Result<std::net::TcpStream, io::Error> {
+        let entry = self
+            .get_entry(fd)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "bad fd for tcp clone"))?;
+        match &*entry {
+            FileEntry::TcpStream(stream) => stream.lock().try_clone(),
+            _ => Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "bad fd for tcp clone",
             )),
         }
     }

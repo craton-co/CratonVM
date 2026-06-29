@@ -1230,6 +1230,27 @@ impl<'a> NativeContextImpl<'a> {
         if let Some(r) = self.thread.native_pending_return {
             snapshot.push(r);
         }
+        // This thread's own `java.lang.Thread` mirror (and any pending async
+        // exception). They live in `JvmThread` fields, not on any frame, so the
+        // frame scan never captures them — yet `Thread.currentThread()` hands
+        // the mirror straight back to bytecode. This is the BLOCKING deposit
+        // path (parked in a native: socket read, sleep, join, f.get()); a GC
+        // initiated by another thread marks and remaps a blocked thread ONLY
+        // from this deposited snapshot (+ the fold into its frame fixup). Omit
+        // the mirror here and a non-moving sweep reclaims it / a moving GC
+        // strands `self.thread.java_thread_obj`, so the next `currentThread()`
+        // returns an all-zero-header object and real-JDK `getThreadGroup()`
+        // NPEs on a null `holder`. This is the intermittent Tomcat
+        // TestDigestAuthenticator failure: when a worker's GC lands while the
+        // JUnit main thread is blocked, its mirror was orphaned. Must mirror
+        // the identical deposit in `interpreter::update_root_snapshot` (the
+        // safepoint path); the wake remap is `check_post_block_gc`.
+        if let Some(obj) = self.thread.java_thread_obj {
+            snapshot.push(obj);
+        }
+        if let Some(exc) = self.thread.pending_async_exception {
+            snapshot.push(exc);
+        }
 
         drop(snapshot);
         // Publish a line-less frame trace alongside the root snapshot so another
@@ -1886,6 +1907,28 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         if base < self.thread.native_pin_roots.len() {
             self.thread.native_pin_roots.truncate(base);
         }
+    }
+
+    fn add_global_root(&mut self, obj: ObjectRef) -> usize {
+        // Backed by the JNI global-ref table: a persistent, cross-thread,
+        // GC-remapped root. Used by the async-socket completion path to hold a
+        // CompletionHandler / attachment / ByteBuffer parked on a worker thread
+        // and delivered later on the AIO dispatcher thread.
+        self.shared.jni_global_refs.lock().add(obj) as usize
+    }
+
+    fn resolve_global_root(&self, handle: usize) -> Option<ObjectRef> {
+        self.shared
+            .jni_global_refs
+            .lock()
+            .resolve(handle as crate::native::jni::JObject)
+    }
+
+    fn remove_global_root(&mut self, handle: usize) -> bool {
+        self.shared
+            .jni_global_refs
+            .lock()
+            .remove(handle as crate::native::jni::JObject)
     }
 
     fn invoke(
@@ -5233,16 +5276,37 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                     // to the class specified in the lambda call site. This handles
                     // objects with generic ClassId (e.g., stub Object) where the
                     // lambda actually targets a specific class (e.g., PrintStream).
+                    //
+                    // CRIT (double-invoke): only retry when the NoSuchMethodError
+                    // is for THIS dispatch's own SAM method (i.e. the impl method
+                    // genuinely wasn't found on the receiver's runtime class). A
+                    // NoSuchMethodError for a DIFFERENT method means the SAM method
+                    // WAS found and ran, and the error bubbled up from a nested
+                    // call deep inside it — re-invoking here would run the
+                    // (side-effecting) method a SECOND time. That is exactly the
+                    // "InvocationInterceptors called invocation multiple times" /
+                    // NodeTestTask double-`prepare` corruption: a Hibernate
+                    // bytecode-enhanced `$$_hibernate_*` NSME thrown inside a JUnit
+                    // `TestTask::execute` lambda made `forEach` re-run `execute()`,
+                    // nulling `parentContext` on the second pass.
                     match &result {
                         Err(MethodCallFailed::InternalError(VmError::Linkage(
-                            LinkageError::NoSuchMethodError { .. },
-                        ))) if target_class.as_str() != &*lcs.impl_handle.class_name => self
-                            .invoke_or_native(
+                            LinkageError::NoSuchMethodError {
+                                method_name,
+                                method_descriptor,
+                                ..
+                            },
+                        ))) if target_class.as_str() != &*lcs.impl_handle.class_name
+                            && method_name.as_str() == &*lcs.impl_handle.member_name
+                            && method_descriptor.as_str() == &*lcs.impl_handle.descriptor =>
+                        {
+                            self.invoke_or_native(
                                 &lcs.impl_handle.class_name,
                                 &lcs.impl_handle.member_name,
                                 &lcs.impl_handle.descriptor,
                                 &full_args,
-                            ),
+                            )
+                        }
                         _ => result,
                     }
                     }

@@ -6059,11 +6059,12 @@ pub(crate) fn native_class_get_declared_method(
     // `;`-delimited list of dotted class names — not a JVM descriptor,
     // but unique within `(class_id, name)` so identical Spring /
     // Hibernate / ByteBuddy probes hit the cache instead of re-walking.
-    // When `param_types_arr` is `None` the call is ambiguous (returns
-    // the *first* matching method), so we still cache against an empty
-    // string — the cached entry stays correct as long as the class
-    // hasn't been redefined (the round-8 invalidation hook drops every
-    // entry keyed on `class_id` on redefine).
+    // A `None` `param_types_arr` is semantically identical to an empty
+    // array (both mean "match a no-arg method" — see the cold-walk loop
+    // below), so both map to the same empty cache key, which is correct.
+    // The cached entry stays valid as long as the class hasn't been
+    // redefined (the round-8 invalidation hook drops every entry keyed on
+    // `class_id` on redefine).
     //
     // A `None` element in the parameter array makes the key
     // unrepresentable; we set `cache_key_ok = false` so we skip both
@@ -6118,13 +6119,29 @@ pub(crate) fn native_class_get_declared_method(
             continue;
         }
 
+        // JDK semantics: a `null` parameterTypes argument is treated as a
+        // ZERO-length array — `Class.getDeclaredMethod(name, (Class[])null)`
+        // matches ONLY a no-arg method. `Class.searchMethods` compares the
+        // query types against each candidate via `arrayContentsEq(null, p)`,
+        // which is true iff `p` is empty. Previously a `None` array skipped
+        // the arity/type check entirely and returned the FIRST same-named
+        // method regardless of parameter count, so a no-arg
+        // `getDeclaredMethod("writeReplace")` probe — exactly what
+        // `java.io.ObjectStreamClass.getInheritableMethod` issues with
+        // `argTypes == null` while resolving the serialization replacement
+        // hook — wrongly matched a 1-arg `writeReplace(Object)` overload.
+        // `ObjectStreamClass.invokeWriteReplace` then called it with 0 args
+        // → `Method.invoke` IllegalArgumentException (HIB-CV-36). Treat a
+        // missing array as "expected zero parameters".
+        let (param_descs, _) = parse_descriptor_param_and_return(&meta.descriptor);
+        let expected_count = match param_types_arr {
+            Some(pt_arr) => ctx.array_length(pt_arr),
+            None => 0,
+        };
+        if param_descs.len() != expected_count {
+            continue;
+        }
         if let Some(pt_arr) = param_types_arr {
-            // Match parameter types
-            let (param_descs, _) = parse_descriptor_param_and_return(&meta.descriptor);
-            let expected_count = ctx.array_length(pt_arr);
-            if param_descs.len() != expected_count {
-                continue;
-            }
             // Check each parameter type matches
             let mut matched = true;
             for (i, pdesc) in param_descs.iter().enumerate() {
@@ -7435,13 +7452,19 @@ pub(crate) fn native_class_get_method(
             {
                 continue;
             }
-            // Check parameter types if specified
+            // Check parameter types. A `null` array is treated as a
+            // ZERO-length one (JDK `Class.searchMethods` semantics — see
+            // `getDeclaredMethod` above / HIB-CV-36): it matches ONLY a
+            // no-arg method, never the first same-named overload.
+            let (param_descs, _) = parse_descriptor_param_and_return(&meta.descriptor);
+            let expected_count = match param_types_arr {
+                Some(pt_arr) => ctx.array_length(pt_arr),
+                None => 0,
+            };
+            if param_descs.len() != expected_count {
+                continue;
+            }
             if let Some(pt_arr) = param_types_arr {
-                let (param_descs, _) = parse_descriptor_param_and_return(&meta.descriptor);
-                let expected_count = ctx.array_length(pt_arr);
-                if param_descs.len() != expected_count {
-                    continue;
-                }
                 let mut matched = true;
                 for (i, pdesc) in param_descs.iter().enumerate() {
                     let expected_mirror = match ctx.get_array_element(pt_arr, i) {
@@ -14761,6 +14784,54 @@ mod tests {
                 );
             }
             other => panic!("G2: Method.parameterTypes MUST be a non-null array (was {other:?})",),
+        }
+    }
+
+    #[test]
+    fn hib_cv36_get_declared_method_null_argtypes_matches_only_no_arg() {
+        // HIB-CV-36: `Class.getDeclaredMethod(name, (Class[])null)` is the
+        // form `java.io.ObjectStreamClass.getInheritableMethod` uses to
+        // resolve the serialization `writeReplace` hook. Per JDK semantics
+        // a null parameterTypes array is equivalent to an EMPTY one — it
+        // must match ONLY a no-arg method, never a same-named overload that
+        // takes parameters. Previously the native skipped the arity check
+        // when the array was null and returned the FIRST same-named method,
+        // so a no-arg `getDeclaredMethod("writeReplace")` matched a 1-arg
+        // `writeReplace(Object)` → later invoked with 0 args → IAE.
+        let mut ctx = mock_ctx();
+        let cid = ctx
+            .ensure_class_initialized("com/example/WriteReplaceOnly")
+            .expect("mock ensure_class_initialized must succeed");
+        // The class declares ONLY a 1-arg `Object writeReplace(Object)`.
+        ctx.set_declared_methods(
+            cid,
+            vec![MethodMetadata {
+                name: "writeReplace".to_string(),
+                descriptor: "(Ljava/lang/Object;)Ljava/lang/Object;".to_string(),
+                access_flags: 0x00,
+                declaring_class_id: cid,
+                exceptions: Vec::new(),
+            }],
+        );
+        let mirror = make_class_mirror(&mut ctx, cid.as_u32(), "com/example/WriteReplaceOnly");
+        let name = ctx.create_string("writeReplace");
+
+        // Null argTypes (args[2] absent / None) must NOT match the 1-arg
+        // overload — it must throw NoSuchMethodException.
+        let r = native_class_get_declared_method(
+            &mut ctx,
+            &[
+                Value::Object(Some(mirror)),
+                Value::Object(Some(name)),
+                Value::Object(None),
+            ],
+        );
+        match r {
+            Err(_) => {}
+            Ok(other) => panic!(
+                "HIB-CV-36: no-arg getDeclaredMethod(\"writeReplace\") must throw \
+                 NoSuchMethodException, not match the 1-arg overload (got {other:?})",
+            ),
         }
     }
 

@@ -1774,7 +1774,12 @@ pub unsafe extern "C" fn jit_baload(array_ptr: i64, index: i64) -> i64 {
     // WS1: Rust<->JIT boundary — invalidate the per-thread JIT-scan cache
     // (see conservative_roots::note_jit_boundary).
     crate::jit::conservative_roots::note_jit_boundary();
-    if array_ptr == 0 {
+    // Treat a null OR implausible (stale/garbage, unaligned/>47-bit) array
+    // reference identically: take the NPE path instead of dereferencing it
+    // (the length/element read below would SIGSEGV). `plausible_heap_pointer(0)`
+    // is already false, so this also covers the original null check. Valid
+    // arrays always pass (8-aligned, ≤47-bit); zero false positives.
+    if !cratonvm_types::plausible_heap_pointer(array_ptr as u64) {
         // JVMS §baload: throw NullPointerException on null array reference.
         // Previously returned 0, which silently fabricated a zero byte and
         // masked real null-deref bugs in user code. Match the iaload/aaload
@@ -1820,7 +1825,12 @@ pub unsafe extern "C" fn jit_bastore(array_ptr: i64, index: i64, val: i64) {
     // WS1: Rust<->JIT boundary — invalidate the per-thread JIT-scan cache
     // (see conservative_roots::note_jit_boundary).
     crate::jit::conservative_roots::note_jit_boundary();
-    if array_ptr == 0 {
+    // Treat a null OR implausible (stale/garbage, unaligned/>47-bit) array
+    // reference identically: take the NPE path instead of dereferencing it
+    // (the length/element read below would SIGSEGV). `plausible_heap_pointer(0)`
+    // is already false, so this also covers the original null check. Valid
+    // arrays always pass (8-aligned, ≤47-bit); zero false positives.
+    if !cratonvm_types::plausible_heap_pointer(array_ptr as u64) {
         // JVMS §bastore: throw NullPointerException on null array reference.
         //
         // Round-8 CRIT fix (audit `round8-jit.md`, "false promise" item):
@@ -1875,7 +1885,12 @@ pub unsafe extern "C" fn jit_iaload(array_ptr: i64, index: i64) -> i64 {
     // WS1: Rust<->JIT boundary — invalidate the per-thread JIT-scan cache
     // (see conservative_roots::note_jit_boundary).
     crate::jit::conservative_roots::note_jit_boundary();
-    if array_ptr == 0 {
+    // Treat a null OR implausible (stale/garbage, unaligned/>47-bit) array
+    // reference identically: take the NPE path instead of dereferencing it
+    // (the length/element read below would SIGSEGV). `plausible_heap_pointer(0)`
+    // is already false, so this also covers the original null check. Valid
+    // arrays always pass (8-aligned, ≤47-bit); zero false positives.
+    if !cratonvm_types::plausible_heap_pointer(array_ptr as u64) {
         // JVMS §iaload: throw NullPointerException on null array reference.
         // Signal the interpreter via the pending-NPE flag + `i64::MIN` deopt
         // sentinel (same protocol as `jit_throw_aioobe`).
@@ -1904,7 +1919,12 @@ pub unsafe extern "C" fn jit_iastore(array_ptr: i64, index: i64, val: i64) {
     // WS1: Rust<->JIT boundary — invalidate the per-thread JIT-scan cache
     // (see conservative_roots::note_jit_boundary).
     crate::jit::conservative_roots::note_jit_boundary();
-    if array_ptr == 0 {
+    // Treat a null OR implausible (stale/garbage, unaligned/>47-bit) array
+    // reference identically: take the NPE path instead of dereferencing it
+    // (the length/element read below would SIGSEGV). `plausible_heap_pointer(0)`
+    // is already false, so this also covers the original null check. Valid
+    // arrays always pass (8-aligned, ≤47-bit); zero false positives.
+    if !cratonvm_types::plausible_heap_pointer(array_ptr as u64) {
         // JVMS §iastore: throw NullPointerException on null array reference.
         // Round-8 CRIT fix: see `jit_bastore` for full rationale. Set the
         // pending-NPE flag; the interpreter's post-JIT path now drains it
@@ -1936,7 +1956,12 @@ pub unsafe extern "C" fn jit_aaload(array_ptr: i64, index: i64) -> i64 {
     // WS1: Rust<->JIT boundary — invalidate the per-thread JIT-scan cache
     // (see conservative_roots::note_jit_boundary).
     crate::jit::conservative_roots::note_jit_boundary();
-    if array_ptr == 0 {
+    // Treat a null OR implausible (stale/garbage, unaligned/>47-bit) array
+    // reference identically: take the NPE path instead of dereferencing it
+    // (the length/element read below would SIGSEGV). `plausible_heap_pointer(0)`
+    // is already false, so this also covers the original null check. Valid
+    // arrays always pass (8-aligned, ≤47-bit); zero false positives.
+    if !cratonvm_types::plausible_heap_pointer(array_ptr as u64) {
         // JVMS §aaload: throw NullPointerException on null array reference.
         set_jit_pending_npe_action(
             crate::runtime::exceptions::helpful_npe::jit_action::ALOAD_OBJECT,
@@ -1955,7 +1980,15 @@ pub unsafe extern "C" fn jit_aaload(array_ptr: i64, index: i64) -> i64 {
         return i64::MIN;
     }
     let elem_ptr = ptr.add(HEADER_SIZE + index as usize * REF_ELEMENT_SIZE) as *const u64;
-    std::ptr::read(elem_ptr) as i64
+    // Degrade an implausible element reference to null instead of returning bits
+    // the JIT will deref → SIGSEGV (the `0x8D8D..`-class stale ref). Mirrors
+    // `read_prim_element`'s Reference arm; valid refs (or 0=null) pass through.
+    let raw = std::ptr::read(elem_ptr);
+    if cratonvm_types::plausible_heap_pointer(raw) {
+        raw as i64
+    } else {
+        0
+    }
 }
 
 // SAFETY: Called from JIT-compiled code. vm_ptr must be a valid SharedVm pointer.
@@ -1967,7 +2000,12 @@ pub unsafe extern "C" fn jit_aastore(vm_ptr: i64, array_ptr: i64, index: i64, va
     // WS1: Rust<->JIT boundary — invalidate the per-thread JIT-scan cache
     // (see conservative_roots::note_jit_boundary).
     crate::jit::conservative_roots::note_jit_boundary();
-    if array_ptr == 0 {
+    // Treat a null OR implausible (stale/garbage, unaligned/>47-bit) array
+    // reference identically: take the NPE path instead of dereferencing it
+    // (the length/element read below would SIGSEGV). `plausible_heap_pointer(0)`
+    // is already false, so this also covers the original null check. Valid
+    // arrays always pass (8-aligned, ≤47-bit); zero false positives.
+    if !cratonvm_types::plausible_heap_pointer(array_ptr as u64) {
         // JVMS §aastore: throw NullPointerException on null array reference.
         // Round-8 CRIT fix: see `jit_bastore` for full rationale. Set the
         // pending-NPE flag; the interpreter's post-JIT path now drains it
@@ -2114,7 +2152,12 @@ pub unsafe extern "C" fn jit_arraylength(array_ptr: i64) -> i64 {
     // WS1: Rust<->JIT boundary — invalidate the per-thread JIT-scan cache
     // (see conservative_roots::note_jit_boundary).
     crate::jit::conservative_roots::note_jit_boundary();
-    if array_ptr == 0 {
+    // Treat a null OR implausible (stale/garbage, unaligned/>47-bit) array
+    // reference identically: take the NPE path instead of dereferencing it
+    // (the length/element read below would SIGSEGV). `plausible_heap_pointer(0)`
+    // is already false, so this also covers the original null check. Valid
+    // arrays always pass (8-aligned, ≤47-bit); zero false positives.
+    if !cratonvm_types::plausible_heap_pointer(array_ptr as u64) {
         // JVMS §arraylength: throw NullPointerException on null array reference.
         // Previously returned -1, which JIT'd Java would happily compare against
         // and use as an array bound — masking real null-deref bugs in user code.
@@ -2179,7 +2222,12 @@ pub unsafe extern "C" fn jit_getfield(obj_ptr: i64, field_index: i64) -> i64 {
     // WS1: Rust<->JIT boundary — invalidate the per-thread JIT-scan cache
     // (see conservative_roots::note_jit_boundary).
     crate::jit::conservative_roots::note_jit_boundary();
-    if obj_ptr == 0 {
+    // Treat a null OR implausible (stale/garbage, unaligned/>47-bit) receiver
+    // identically: take the existing null path instead of dereferencing it (the
+    // field/class/header read below would SIGSEGV). `plausible_heap_pointer(0)`
+    // is already false, so this also covers the original null check. Valid
+    // objects always pass (8-aligned, ≤47-bit); zero false positives.
+    if !cratonvm_types::plausible_heap_pointer(obj_ptr as u64) {
         // JVMS §getfield: throw NullPointerException on a null receiver.
         // Previously returned 0, which silently fabricated a zero/null field
         // value and masked real null-deref bugs in user code — the same
@@ -2210,7 +2258,17 @@ pub unsafe extern "C" fn jit_getfield(obj_ptr: i64, field_index: i64) -> i64 {
         // SAFETY: off is within the object body (field_index < num_slots).
         let ptr = (obj_ptr as *const u8).add(HEADER_SIZE + off);
         if is_ref {
-            return std::ptr::read(ptr as *const u64) as i64;
+            // Degrade an implausible reference (stale/garbage from a GC
+            // root-coverage gap) to null instead of handing the JIT bits it
+            // will later deref → SIGSEGV. Mirrors `read_prim_element`'s
+            // Reference arm so interpreter and JIT decode a stale ref slot
+            // identically. Valid refs (or 0=null) always pass through.
+            let raw = std::ptr::read(ptr as *const u64);
+            return if cratonvm_types::plausible_heap_pointer(raw) {
+                raw as i64
+            } else {
+                0
+            };
         }
         let val: Value = std::ptr::read(ptr as *const Value);
         return match val {
@@ -2218,7 +2276,17 @@ pub unsafe extern "C" fn jit_getfield(obj_ptr: i64, field_index: i64) -> i64 {
             Value::Long(l) => l,
             Value::Float(f) => f.to_bits() as i64,
             Value::Double(d) => d.to_bits() as i64,
-            Value::Object(Some(r)) => r.as_ptr() as i64,
+            Value::Object(Some(r)) => {
+                // Degrade an implausible (stale/garbage) object pointer to null
+                // rather than handing the JIT bits it will deref → SIGSEGV.
+                // Valid refs always pass the plausibility gate.
+                let raw = r.as_ptr() as u64;
+                if cratonvm_types::plausible_heap_pointer(raw) {
+                    raw as i64
+                } else {
+                    0
+                }
+            }
             Value::Object(None) => 0,
             _ => 0,
         };
@@ -2233,7 +2301,14 @@ pub unsafe extern "C" fn jit_getfield(obj_ptr: i64, field_index: i64) -> i64 {
         Value::Long(l) => l,
         Value::Float(f) => f.to_bits() as i64,
         Value::Double(d) => d.to_bits() as i64,
-        Value::Object(Some(r)) => r.as_ptr() as i64,
+        Value::Object(Some(r)) => {
+            let raw = r.as_ptr() as u64;
+            if cratonvm_types::plausible_heap_pointer(raw) {
+                raw as i64
+            } else {
+                0
+            }
+        }
         Value::Object(None) => 0,
         _ => 0,
     };
@@ -2271,7 +2346,12 @@ pub unsafe extern "C" fn jit_putfield_int(obj_ptr: i64, field_index: i64, val: i
     // WS1: Rust<->JIT boundary — invalidate the per-thread JIT-scan cache
     // (see conservative_roots::note_jit_boundary).
     crate::jit::conservative_roots::note_jit_boundary();
-    if obj_ptr == 0 {
+    // Treat a null OR implausible (stale/garbage, unaligned/>47-bit) receiver
+    // identically: take the existing null path instead of dereferencing it (the
+    // field/class/header read below would SIGSEGV). `plausible_heap_pointer(0)`
+    // is already false, so this also covers the original null check. Valid
+    // objects always pass (8-aligned, ≤47-bit); zero false positives.
+    if !cratonvm_types::plausible_heap_pointer(obj_ptr as u64) {
         return;
     }
     // DIAGNOSTIC (gated by CRATONVM_DBG_JIT_PUTFIELD, one-shot, zero release
@@ -2322,7 +2402,12 @@ pub unsafe extern "C" fn jit_putfield_long(obj_ptr: i64, field_index: i64, val: 
     // WS1: Rust<->JIT boundary — invalidate the per-thread JIT-scan cache
     // (see conservative_roots::note_jit_boundary).
     crate::jit::conservative_roots::note_jit_boundary();
-    if obj_ptr == 0 {
+    // Treat a null OR implausible (stale/garbage, unaligned/>47-bit) receiver
+    // identically: take the existing null path instead of dereferencing it (the
+    // field/class/header read below would SIGSEGV). `plausible_heap_pointer(0)`
+    // is already false, so this also covers the original null check. Valid
+    // objects always pass (8-aligned, ≤47-bit); zero false positives.
+    if !cratonvm_types::plausible_heap_pointer(obj_ptr as u64) {
         return;
     }
     if !jit_putfield_slot_in_bounds(obj_ptr, field_index) {
@@ -2342,7 +2427,12 @@ pub unsafe extern "C" fn jit_putfield_float(obj_ptr: i64, field_index: i64, val:
     // WS1: Rust<->JIT boundary — invalidate the per-thread JIT-scan cache
     // (see conservative_roots::note_jit_boundary).
     crate::jit::conservative_roots::note_jit_boundary();
-    if obj_ptr == 0 {
+    // Treat a null OR implausible (stale/garbage, unaligned/>47-bit) receiver
+    // identically: take the existing null path instead of dereferencing it (the
+    // field/class/header read below would SIGSEGV). `plausible_heap_pointer(0)`
+    // is already false, so this also covers the original null check. Valid
+    // objects always pass (8-aligned, ≤47-bit); zero false positives.
+    if !cratonvm_types::plausible_heap_pointer(obj_ptr as u64) {
         return;
     }
     if !jit_putfield_slot_in_bounds(obj_ptr, field_index) {
@@ -2362,7 +2452,12 @@ pub unsafe extern "C" fn jit_putfield_double(obj_ptr: i64, field_index: i64, val
     // WS1: Rust<->JIT boundary — invalidate the per-thread JIT-scan cache
     // (see conservative_roots::note_jit_boundary).
     crate::jit::conservative_roots::note_jit_boundary();
-    if obj_ptr == 0 {
+    // Treat a null OR implausible (stale/garbage, unaligned/>47-bit) receiver
+    // identically: take the existing null path instead of dereferencing it (the
+    // field/class/header read below would SIGSEGV). `plausible_heap_pointer(0)`
+    // is already false, so this also covers the original null check. Valid
+    // objects always pass (8-aligned, ≤47-bit); zero false positives.
+    if !cratonvm_types::plausible_heap_pointer(obj_ptr as u64) {
         return;
     }
     if !jit_putfield_slot_in_bounds(obj_ptr, field_index) {
@@ -2393,7 +2488,12 @@ pub unsafe extern "C" fn jit_putfield_object(
     // WS1: Rust<->JIT boundary — invalidate the per-thread JIT-scan cache
     // (see conservative_roots::note_jit_boundary).
     crate::jit::conservative_roots::note_jit_boundary();
-    if obj_ptr == 0 {
+    // Treat a null OR implausible (stale/garbage, unaligned/>47-bit) receiver
+    // identically: take the existing null path instead of dereferencing it (the
+    // field/class/header read below would SIGSEGV). `plausible_heap_pointer(0)`
+    // is already false, so this also covers the original null check. Valid
+    // objects always pass (8-aligned, ≤47-bit); zero false positives.
+    if !cratonvm_types::plausible_heap_pointer(obj_ptr as u64) {
         return;
     }
     let obj_ref = ObjectRef::from_raw(obj_ptr as usize as *mut u8);
@@ -2502,7 +2602,12 @@ pub unsafe extern "C" fn jit_write_barrier(vm_ptr: i64, obj_ptr: i64, val_ptr: i
     // WS1: Rust<->JIT boundary — invalidate the per-thread JIT-scan cache
     // (see conservative_roots::note_jit_boundary).
     crate::jit::conservative_roots::note_jit_boundary();
-    if obj_ptr == 0 {
+    // Treat a null OR implausible (stale/garbage, unaligned/>47-bit) receiver
+    // identically: take the existing null path instead of dereferencing it (the
+    // field/class/header read below would SIGSEGV). `plausible_heap_pointer(0)`
+    // is already false, so this also covers the original null check. Valid
+    // objects always pass (8-aligned, ≤47-bit); zero false positives.
+    if !cratonvm_types::plausible_heap_pointer(obj_ptr as u64) {
         return;
     }
     if val_ptr == 0 {
@@ -2608,7 +2713,14 @@ pub unsafe extern "C" fn jit_getstatic(vm_ptr: i64, class_id_raw: i64, field_ind
             // don't have here; fall back to the static field (set during init).
             let val = crate::vm::get_static_shared(vm, class_id, field_index as usize);
             return match val {
-                Value::Object(Some(r)) => r.as_ptr() as i64,
+                Value::Object(Some(r)) => {
+                    let raw = r.as_ptr() as u64;
+                    if cratonvm_types::plausible_heap_pointer(raw) {
+                        raw as i64
+                    } else {
+                        0
+                    }
+                }
                 _ => 0,
             };
         }
@@ -2620,7 +2732,14 @@ pub unsafe extern "C" fn jit_getstatic(vm_ptr: i64, class_id_raw: i64, field_ind
         Value::Long(l) => l,
         Value::Float(f) => f.to_bits() as i64,
         Value::Double(d) => d.to_bits() as i64,
-        Value::Object(Some(r)) => r.as_ptr() as i64,
+        Value::Object(Some(r)) => {
+            let raw = r.as_ptr() as u64;
+            if cratonvm_types::plausible_heap_pointer(raw) {
+                raw as i64
+            } else {
+                0
+            }
+        }
         Value::Object(None) => 0,
         _ => 0,
     }
@@ -2915,7 +3034,12 @@ pub unsafe extern "C" fn jit_checkcast(
     // (see conservative_roots::note_jit_boundary).
     crate::jit::conservative_roots::note_jit_boundary();
     // Null reference is always a valid cast (matches JVMS §6.5.checkcast).
-    if obj_ptr == 0 {
+    // Treat a null OR implausible (stale/garbage, unaligned/>47-bit) receiver
+    // identically: take the existing null path instead of dereferencing it (the
+    // field/class/header read below would SIGSEGV). `plausible_heap_pointer(0)`
+    // is already false, so this also covers the original null check. Valid
+    // objects always pass (8-aligned, ≤47-bit); zero false positives.
+    if !cratonvm_types::plausible_heap_pointer(obj_ptr as u64) {
         return 0;
     }
     // Defensive: an unresolved typecheck site (no class_name attached) must
@@ -2961,7 +3085,12 @@ pub unsafe extern "C" fn jit_instanceof(
     // (see conservative_roots::note_jit_boundary).
     crate::jit::conservative_roots::note_jit_boundary();
     // Null reference is never an instance of anything (JVMS §6.5.instanceof).
-    if obj_ptr == 0 {
+    // Treat a null OR implausible (stale/garbage, unaligned/>47-bit) receiver
+    // identically: take the existing null path instead of dereferencing it (the
+    // field/class/header read below would SIGSEGV). `plausible_heap_pointer(0)`
+    // is already false, so this also covers the original null check. Valid
+    // objects always pass (8-aligned, ≤47-bit); zero false positives.
+    if !cratonvm_types::plausible_heap_pointer(obj_ptr as u64) {
         return 0;
     }
     if class_name_len <= 0 || class_name_ptr.is_null() {

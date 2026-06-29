@@ -37,7 +37,7 @@
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
 use cratonvm_types::{ClassId, ObjectRef, Value};
-use parking_lot::{Mutex, RwLock};
+use parking_lot::{Condvar, Mutex, RwLock};
 use std::collections::HashMap;
 use std::io::{ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -201,6 +201,272 @@ fn drain_completions(ctx: &mut dyn NativeContext) {
 }
 
 // ---------------------------------------------------------------------------
+// Handler-form read completion delivery (WP3.2 fix)
+//
+// The legacy `completion_queue` above is drained lazily by the next user-thread
+// AIO native call. That never happens for a purely event-driven client (the
+// Tomcat WebSocket client arms a read and then blocks on a latch), so those
+// completions were never delivered. The path below fixes the dominant case —
+// the handler-form `read` — with a dedicated queue, a condvar the AIO
+// *dispatcher* thread waits on, and proactive delivery from that dispatcher
+// (which holds a real `NativeContext` and can invoke the Java handler). The
+// handler / attachment / target buffer are held as global GC roots across the
+// blocking read so a moving collection cannot relocate them out from under us.
+// ---------------------------------------------------------------------------
+
+/// Outcome of a handler-form read, decided by the worker, delivered by the
+/// dispatcher.
+pub enum ReadOutcome {
+    /// `n = bytes.len()` bytes were read; write them into the buffer and deliver
+    /// `completed(n)`.
+    Bytes(Vec<u8>),
+    /// Peer closed (blocking read returned 0): deliver `completed(-1)`.
+    Eof,
+    /// Deliver `completed(count)` without touching the buffer (e.g. a zero-length
+    /// read request ⇒ `completed(0)`).
+    Count(i32),
+    /// Deliver `failed(IOException(msg))`.
+    Error(String),
+}
+
+/// A completed handler-form read awaiting delivery to its `CompletionHandler`.
+pub struct ReadCompletion {
+    /// Global-root handle for the `CompletionHandler` (never 0).
+    handler_gref: usize,
+    /// Global-root handle for the `attachment` (0 ⇒ null attachment).
+    attachment_gref: usize,
+    /// Global-root handle for the destination `ByteBuffer` (0 ⇒ none).
+    buffer_gref: usize,
+    /// What to deliver.
+    outcome: ReadOutcome,
+}
+
+fn read_completion_state() -> &'static (Mutex<std::collections::VecDeque<ReadCompletion>>, Condvar) {
+    static S: OnceLock<(Mutex<std::collections::VecDeque<ReadCompletion>>, Condvar)> =
+        OnceLock::new();
+    S.get_or_init(|| (Mutex::new(std::collections::VecDeque::new()), Condvar::new()))
+}
+
+/// Park a completed read and wake the dispatcher.
+fn push_read_completion(c: ReadCompletion) {
+    let (q, cv) = read_completion_state();
+    q.lock().push_back(c);
+    cv.notify_one();
+}
+
+/// Block up to `timeout` for at least one pending read completion. Returns
+/// `true` if one is available. Called by the AIO dispatcher thread while it is
+/// in the GC-blocked idle region (no `NativeContext` needed).
+pub fn wait_for_pending(timeout: std::time::Duration) -> bool {
+    let (q, cv) = read_completion_state();
+    let mut guard = q.lock();
+    if !guard.is_empty() {
+        return true;
+    }
+    cv.wait_for(&mut guard, timeout);
+    !guard.is_empty()
+}
+
+/// Maximum read completions delivered per dispatcher wake-up.
+const READ_DRAIN_LIMIT: usize = 256;
+
+/// Deliver pending handler-form read completions, invoking
+/// `CompletionHandler.completed` / `failed` on the calling (dispatcher) thread.
+/// Requires a live `NativeContext`, so it must run on a VM/attached thread.
+pub fn drain_completions_pub(ctx: &mut dyn NativeContext) {
+    for _ in 0..READ_DRAIN_LIMIT {
+        let next = read_completion_state().0.lock().pop_front();
+        let Some(c) = next else { break };
+        deliver_read_completion(ctx, c);
+    }
+}
+
+fn deliver_read_completion(ctx: &mut dyn NativeContext, c: ReadCompletion) {
+    // Destructure up front: the gref handles are `Copy`, the outcome is moved
+    // into the match — so the roots can still be released afterwards.
+    let ReadCompletion {
+        handler_gref,
+        attachment_gref,
+        buffer_gref,
+        outcome,
+    } = c;
+    // Nothing to deliver to if the handler root is gone; just release.
+    if ctx.resolve_global_root(handler_gref).is_none() {
+        release_read_roots(ctx, handler_gref, attachment_gref, buffer_gref);
+        return;
+    }
+    match outcome {
+        ReadOutcome::Bytes(bytes) => {
+            // The buffer write performs no Java allocation, so resolving the
+            // buffer here (before the Integer box) is safe.
+            let n = match (buffer_gref != 0)
+                .then(|| ctx.resolve_global_root(buffer_gref))
+                .flatten()
+            {
+                Some(bb) => write_into_buffer_and_advance(ctx, bb, &bytes),
+                None => 0,
+            };
+            deliver_completed(ctx, handler_gref, attachment_gref, n);
+        }
+        // Peer closed — completed(-1) per the JDK contract.
+        ReadOutcome::Eof => deliver_completed(ctx, handler_gref, attachment_gref, -1),
+        ReadOutcome::Count(cnt) => deliver_completed(ctx, handler_gref, attachment_gref, cnt),
+        ReadOutcome::Error(msg) => deliver_failed(ctx, handler_gref, attachment_gref, &msg),
+    }
+    release_read_roots(ctx, handler_gref, attachment_gref, buffer_gref);
+}
+
+fn release_read_roots(
+    ctx: &mut dyn NativeContext,
+    handler_gref: usize,
+    attachment_gref: usize,
+    buffer_gref: usize,
+) {
+    ctx.remove_global_root(handler_gref);
+    if attachment_gref != 0 {
+        ctx.remove_global_root(attachment_gref);
+    }
+    if buffer_gref != 0 {
+        ctx.remove_global_root(buffer_gref);
+    }
+}
+
+/// Box the count, then resolve handler/attachment FRESH — *after* the allocation
+/// — so a moving collection during boxing cannot leave them stale, and invoke
+/// `CompletionHandler.completed(Integer, attachment)`.
+fn deliver_completed(
+    ctx: &mut dyn NativeContext,
+    handler_gref: usize,
+    attachment_gref: usize,
+    n: i32,
+) {
+    let result_val = box_int(ctx, n);
+    let Some(h) = ctx.resolve_global_root(handler_gref) else {
+        return;
+    };
+    let attach = if attachment_gref != 0 {
+        ctx.resolve_global_root(attachment_gref)
+    } else {
+        None
+    };
+    let _ = ctx.invoke(
+        "java/nio/channels/CompletionHandler",
+        "completed",
+        "(Ljava/lang/Object;Ljava/lang/Object;)V",
+        &[Value::Object(Some(h)), result_val, Value::Object(attach)],
+    );
+}
+
+/// Build an `IOException(msg)`, then resolve handler/attachment last, and invoke
+/// `CompletionHandler.failed(Throwable, attachment)`.
+fn deliver_failed(
+    ctx: &mut dyn NativeContext,
+    handler_gref: usize,
+    attachment_gref: usize,
+    msg: &str,
+) {
+    // Temporarily root the message string so building the exception (an
+    // allocation) can't strand it under a moving collector.
+    let m = ctx.create_string(msg);
+    let m_gref = ctx.add_global_root(m);
+    let throwable = match ctx.new_object("java/io/IOException") {
+        Ok(Some(Value::Object(Some(t)))) => Some(t),
+        _ => None,
+    };
+    let Some(t) = throwable else {
+        ctx.remove_global_root(m_gref);
+        return;
+    };
+    let m_now = ctx.resolve_global_root(m_gref).unwrap_or(m);
+    ctx.set_field_by_name(t, "detailMessage", Value::Object(Some(m_now)));
+    ctx.remove_global_root(m_gref);
+    let Some(h) = ctx.resolve_global_root(handler_gref) else {
+        return;
+    };
+    let attach = if attachment_gref != 0 {
+        ctx.resolve_global_root(attachment_gref)
+    } else {
+        None
+    };
+    let _ = ctx.invoke(
+        "java/nio/channels/CompletionHandler",
+        "failed",
+        "(Ljava/lang/Throwable;Ljava/lang/Object;)V",
+        &[Value::Object(Some(h)), Value::Object(Some(t)), Value::Object(attach)],
+    );
+}
+
+/// Box an `int` into a `java.lang.Integer` for `completed(Object, Object)`.
+fn box_int(ctx: &mut dyn NativeContext, n: i32) -> Value {
+    match ctx.new_object("java/lang/Integer") {
+        Ok(Some(Value::Object(Some(boxed)))) => {
+            ctx.set_field_by_name(boxed, "value", Value::Int(n));
+            Value::Object(Some(boxed))
+        }
+        _ => Value::Int(n),
+    }
+}
+
+/// Write `bytes` into `bb` at its current position and advance `position` by the
+/// number written, mirroring `AsynchronousSocketChannel.read` filling the
+/// buffer. Returns the byte count written (clamped to the buffer's remaining).
+fn write_into_buffer_and_advance(ctx: &mut dyn NativeContext, bb: ObjectRef, bytes: &[u8]) -> i32 {
+    let position = match ctx.get_field_by_name(bb, "position") {
+        Value::Int(v) if v >= 0 => v,
+        _ => 0,
+    };
+    let (addr, arr, off, remaining) = decode_buffer(ctx, bb);
+    if remaining <= 0 {
+        return 0;
+    }
+    let n = bytes.len().min(remaining as usize);
+    if n == 0 {
+        return 0;
+    }
+    if addr != 0 {
+        // Direct buffer: write into off-heap memory at the position offset.
+        ctx.copy_to_native_memory(addr, &bytes[..n]);
+    } else if let Some(a) = arr {
+        ctx.write_byte_array_from(a, off as usize, &bytes[..n]);
+    } else {
+        return 0;
+    }
+    ctx.set_field_by_name(bb, "position", Value::Int(position + n as i32));
+    n as i32
+}
+
+// ---------------------------------------------------------------------------
+// AIO dispatcher launcher hook.
+//
+// The dispatcher thread (which attaches to the VM and can invoke Java) lives in
+// the `vm` crate. It registers a launcher closure here at startup; the first
+// handler-form read fires it exactly once via `ensure_dispatcher`.
+// ---------------------------------------------------------------------------
+
+type DispatcherLauncher = Box<dyn Fn() + Send + Sync + 'static>;
+
+fn dispatcher_launcher() -> &'static Mutex<Option<DispatcherLauncher>> {
+    static L: OnceLock<Mutex<Option<DispatcherLauncher>>> = OnceLock::new();
+    L.get_or_init(|| Mutex::new(None))
+}
+
+/// Install the AIO dispatcher launcher (called once by the VM at init).
+pub fn set_dispatcher_launcher(f: DispatcherLauncher) {
+    *dispatcher_launcher().lock() = Some(f);
+}
+
+/// Start the AIO dispatcher on first use (idempotent).
+fn ensure_dispatcher() {
+    static STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if STARTED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    if let Some(launch) = dispatcher_launcher().lock().as_ref() {
+        launch();
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Worker pool
 // ---------------------------------------------------------------------------
 
@@ -239,6 +505,22 @@ enum Job {
         id: i32,
         handler: Option<ObjectRef>,
         attachment: Option<ObjectRef>,
+    },
+    /// WP3.2 completion-delivery fix: a handler-form
+    /// `AsynchronousSocketChannel.read(ByteBuffer, A, CompletionHandler)` whose
+    /// underlying connection is owned by the VM `fd_table` (the channel was
+    /// connected via the Future-form `connect`). `stream` is an independent
+    /// `try_clone()` handle so this blocking read does not contend with the
+    /// application's concurrent Future-form writes on the same fd. The
+    /// handler / attachment / target buffer are held alive across the read as
+    /// *global* GC roots (`*_gref`); the worker parks a [`ReadCompletion`] and
+    /// the AIO dispatcher thread delivers it.
+    ReadFd {
+        stream: Arc<Mutex<TcpStream>>,
+        len: usize,
+        handler_gref: usize,
+        attachment_gref: usize,
+        buffer_gref: usize,
     },
 }
 
@@ -562,6 +844,39 @@ fn handle_job(job: Job) -> Result<(), String> {
                     }
                 }
             }
+        }
+        Job::ReadFd {
+            stream,
+            len,
+            handler_gref,
+            attachment_gref,
+            buffer_gref,
+        } => {
+            // Blocking read on the cloned handle. The clone is private to this
+            // worker, so we hold its lock for the duration without blocking the
+            // application's writes (which go through the original fd entry).
+            let mut buf = vec![0u8; len.max(1)];
+            let read_res = {
+                let s = stream.lock();
+                let mut r = &*s;
+                r.read(&mut buf)
+            };
+            let outcome = match read_res {
+                // 0 bytes from a blocking read == peer closed == EOF. Delivered
+                // to the handler as `completed(-1)` (JDK contract).
+                Ok(0) => ReadOutcome::Eof,
+                Ok(n) => {
+                    buf.truncate(n);
+                    ReadOutcome::Bytes(buf)
+                }
+                Err(e) => ReadOutcome::Error(format!("read failed: {e}")),
+            };
+            push_read_completion(ReadCompletion {
+                handler_gref,
+                attachment_gref,
+                buffer_gref,
+                outcome,
+            });
         }
     }
     Ok(())
@@ -981,17 +1296,24 @@ fn decode_buffer(ctx: &mut dyn NativeContext, bb: ObjectRef) -> (i64, Option<Obj
         },
     };
     let length = (limit - position).max(0);
-    if let Value::Long(addr) = ctx.get_field_by_name(bb, "address") {
-        if addr != 0 {
-            return (addr.wrapping_add(position as i64), None, 0, length);
-        }
-    }
+    // Heap buffer FIRST: a real-JDK `HeapByteBuffer` keeps its backing array in
+    // `hb` and — crucially — sets `Buffer.address` to the array base offset
+    // (`Unsafe.ARRAY_BYTE_BASE_OFFSET`, 16 on HotSpot), NOT 0. Checking
+    // `address != 0` before `hb` would misclassify every heap buffer as a
+    // direct buffer and write to address `0x10`. Only a true `DirectByteBuffer`
+    // has `hb == null` and a real off-heap `address`.
     if let Value::Object(Some(arr)) = ctx.get_field_by_name(bb, "hb") {
         let base_off = match ctx.get_field_by_name(bb, "offset") {
             Value::Int(v) if v >= 0 => v,
             _ => 0,
         };
         return (0, Some(arr), base_off + position, length);
+    }
+    // Direct buffer: `address` is a real off-heap pointer; advance by position.
+    if let Value::Long(addr) = ctx.get_field_by_name(bb, "address") {
+        if addr != 0 {
+            return (addr.wrapping_add(position as i64), None, 0, length);
+        }
     }
     (0, None, 0, length)
 }
@@ -1032,8 +1354,22 @@ fn read_buffer_bytes(ctx: &mut dyn NativeContext, bb: ObjectRef) -> Vec<u8> {
     }
 }
 
+/// Lowest `aio_registry` id (see `aio_next_id`). fd_table fds are always below
+/// this, so a slot-2 value in `[0, AIO_REG_BASE)` is an fd_table fd (the channel
+/// was connected via the Future-form `connect`), not a legacy registry id.
+const AIO_REG_BASE: i64 = 0x7000_0000;
+
+/// Handler-form `AsynchronousSocketChannel.read(ByteBuffer, A, CompletionHandler)`.
+///
+/// The previous worker-pool implementation parked the completion in a queue that
+/// was only drained on the next user-thread AIO native call — which never
+/// happens for an event-driven client that arms a read then blocks (the Tomcat
+/// WebSocket client), so server→client frames were silently dropped. This path
+/// instead reads the connection's fd_table fd, performs the blocking read on a
+/// `try_clone()` handle (a worker thread), and delivers the completion
+/// proactively from the AIO dispatcher thread. The handler / attachment / buffer
+/// are held as global GC roots across the read.
 fn aio_asc_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    drain_completions(ctx);
     let this = match obj_or_none(args, 0) {
         Some(o) => o,
         None => return Err(ioex("read: null channel")),
@@ -1043,35 +1379,77 @@ fn aio_asc_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult
         None => return Err(ioex("read: null ByteBuffer")),
     };
     let attachment = obj_or_none(args, 2);
-    let handler = obj_or_none(args, 3);
-    let id = read_aio_id(ctx, this).ok_or_else(|| ioex("read: not connected"))?;
-    let (addr, arr, off, length) = decode_buffer(ctx, bb);
-    if length <= 0 {
-        // Empty buffer — post a synthetic "0 bytes read" completion.
-        if let Some(h) = handler {
-            completion_queue().lock().push_back(Completion {
-                handler: h,
-                attachment,
-                outcome: Ok(CompletionKind::IntCount(0)),
+    let handler = match obj_or_none(args, 3) {
+        Some(h) => h,
+        // No CompletionHandler ⇒ nothing to deliver (the Future-form read is a
+        // separate native registered elsewhere).
+        None => return Ok(Some(Value::Object(None))),
+    };
+
+    // Start the dispatcher on first use so parked completions get delivered.
+    ensure_dispatcher();
+
+    // Register global roots + park a completion for worker-free delivery —
+    // empty-buffer and error cases that have no bytes to read.
+    let post_immediate =
+        |ctx: &mut dyn NativeContext, outcome: ReadOutcome| {
+            let hg = ctx.add_global_root(handler);
+            let ag = attachment.map(|a| ctx.add_global_root(a)).unwrap_or(0);
+            push_read_completion(ReadCompletion {
+                handler_gref: hg,
+                attachment_gref: ag,
+                buffer_gref: 0,
+                outcome,
             });
+        };
+
+    // The channel was connected via the Future-form `connect`, which stores the
+    // fd_table fd in slot 2.
+    let fd = match ctx.get_field(this, 2) {
+        Value::Int(v) if v >= 0 && (v as i64) < AIO_REG_BASE => v as u32,
+        _ => {
+            post_immediate(ctx, ReadOutcome::Error("read: not connected".to_string()));
+            return Ok(Some(Value::Object(None)));
         }
+    };
+
+    let (_, _, _, length) = decode_buffer(ctx, bb);
+    if length <= 0 {
+        post_immediate(ctx, ReadOutcome::Count(0));
         return Ok(Some(Value::Object(None)));
     }
-    if let Err(e) = job_sender().send(Job::Read {
-        id,
-        len: length as usize,
-        bb_addr: addr,
-        bb_arr: arr,
-        bb_offset: off,
-        bb_obj: bb,
-        handler,
-        attachment,
-    }) {
-        eprintln!(
-            "native-io: aio_asc_read: job channel closed; \
-             CompletionHandler will not fire (id={id}, err={e})"
-        );
-        return Err(ioex("read: aio worker pool unavailable"));
+
+    // Independent read handle so the blocking read does not contend with the
+    // application's Future-form writes on the same fd.
+    let stream = match ctx.fd_table().try_clone_tcp(fd) {
+        Ok(s) => s,
+        Err(e) => {
+            post_immediate(ctx, ReadOutcome::Error(format!("read: {e}")));
+            return Ok(Some(Value::Object(None)));
+        }
+    };
+
+    let handler_gref = ctx.add_global_root(handler);
+    let attachment_gref = attachment.map(|a| ctx.add_global_root(a)).unwrap_or(0);
+    let buffer_gref = ctx.add_global_root(bb);
+
+    if job_sender()
+        .send(Job::ReadFd {
+            stream: Arc::new(Mutex::new(stream)),
+            len: length as usize,
+            handler_gref,
+            attachment_gref,
+            buffer_gref,
+        })
+        .is_err()
+    {
+        // Pool gone: report failure to the handler (roots already taken).
+        push_read_completion(ReadCompletion {
+            handler_gref,
+            attachment_gref,
+            buffer_gref,
+            outcome: ReadOutcome::Error("read: aio worker pool unavailable".to_string()),
+        });
     }
     Ok(Some(Value::Object(None)))
 }

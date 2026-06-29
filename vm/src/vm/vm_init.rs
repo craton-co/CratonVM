@@ -4676,6 +4676,14 @@ impl Vm {
         // which owns the initPhase orchestration.
         shared.set_init_level(1);
 
+        // Install the AIO completion-dispatcher launcher. The first handler-form
+        // `AsynchronousSocketChannel.read` fires it, spinning up the
+        // foreign-attached dispatcher thread that delivers read completions to
+        // their Java `CompletionHandler` (the Tomcat WebSocket client read path).
+        cratonvm_native_io::async_socket::set_dispatcher_launcher(Box::new(|| {
+            crate::native::jni::start_aio_dispatcher();
+        }));
+
         // Round-5 MED-fix (Bug 6, 2026-05-17): emit a one-shot
         // `jdk.PhysicalMemory` event at startup so any later JFR dump
         // captures the host-RAM totals as an EveryChunk diagnostic.

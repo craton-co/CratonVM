@@ -471,6 +471,35 @@ pub trait NativeContext {
     /// [`pin_native_root`]) onward. Default impl is a no-op.
     fn unpin_native_roots(&mut self, _base: usize) {}
 
+    /// Create a *persistent* global GC root for `obj`, returning an opaque handle.
+    ///
+    /// Unlike [`pin_native_root`] (which is per-thread and unwound when the
+    /// current native call returns), a global root survives across calls and
+    /// across threads, and is remapped by the moving collector. It lives until
+    /// [`remove_global_root`] is called. Use it to hold an `ObjectRef` that a
+    /// *different* thread will consume later — e.g. an asynchronous-I/O
+    /// `CompletionHandler` / attachment / target `ByteBuffer` parked while a
+    /// worker thread performs a blocking read, then delivered on a dispatcher
+    /// thread. Backed by the same table as JNI `NewGlobalRef`.
+    ///
+    /// Default impl returns `0` (no-op) for mock contexts with no moving GC.
+    fn add_global_root(&mut self, _obj: ObjectRef) -> usize {
+        0
+    }
+
+    /// Resolve a global root handle (from [`add_global_root`]) to its current
+    /// (post-GC, possibly relocated) reference. Returns `None` for handle `0` or
+    /// an unknown handle. Default impl returns `None`.
+    fn resolve_global_root(&self, _handle: usize) -> Option<ObjectRef> {
+        None
+    }
+
+    /// Release a global root created by [`add_global_root`]. Returns `true` if the
+    /// handle was found and removed. Default impl returns `false`.
+    fn remove_global_root(&mut self, _handle: usize) -> bool {
+        false
+    }
+
     /// Invoke a method by class name, method name, descriptor, and arguments.
     fn invoke(
         &mut self,

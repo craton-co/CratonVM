@@ -1252,30 +1252,37 @@ fn native_properties_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     let (Value::Object(Some(k)), Value::Object(Some(v))) = (key_v, val_v) else {
         return Ok(Some(Value::Object(None)));
     };
-    let ks = ctx.read_string(k).unwrap_or_default();
+    // `Properties.put(Object,Object)` is inherited from `Hashtable` and accepts
+    // ANY key/value (only `setProperty`/`getProperty` are String-typed). The
+    // String→String fast path lives in the Rust side-table; everything else
+    // (non-String value, OR non-String key — e.g. Spring's `<props>` parsed
+    // into `TypedStringValue` keys, or an empty-String key) must be stored in
+    // the real JDK CHM so size()/entrySet()/get() still observe it. Dropping a
+    // non-String key here was the `mergeProperties` bug: a `ManagedProperties`
+    // populated with `TypedStringValue` keys silently came back empty.
+    let ks_opt = ctx.read_string(k);
     let vs_opt = ctx.read_string(v);
-    if !ks.is_empty() {
-        if let Some(vs) = vs_opt {
+    if let (Some(ks), Some(vs)) = (ks_opt.as_ref(), vs_opt.as_ref()) {
+        if !ks.is_empty() {
             // String→String: store in side-table AND CHM (existing path).
-            let prev = get_kv(ctx, this, &ks);
-            put_kv(ctx, this, &ks, &vs);
+            let prev = get_kv(ctx, this, ks);
+            put_kv(ctx, this, ks, vs);
             mirror_loaded_entries_to_properties_backend(ctx, this, &[(ks.clone(), vs.clone())]);
             if is_system_props(ctx, this) {
-                let _ = ctx.set_system_property(&ks, &vs);
+                let _ = ctx.set_system_property(ks, vs);
             }
-            if let Some(p) = prev {
-                return Ok(Some(Value::Object(Some(ctx.create_string(&p)))));
-            }
-        } else {
-            // Non-String value (e.g. XProperty, MemberDetails): store ONLY in
-            // the real JDK CHM so get() can retrieve the actual object via
-            // CHM.get().  The Rust side-table is string-only — do not put a
-            // synthetic "" sentinel that would shadow the real object.
-            let prev = put_non_string_into_chm(ctx, this, key_v, val_v);
-            return Ok(Some(prev));
+            return Ok(Some(match prev {
+                Some(p) => Value::Object(Some(ctx.create_string(&p))),
+                None => Value::Object(None),
+            }));
         }
     }
-    Ok(Some(Value::Object(None)))
+    // Non-String key and/or value (or an empty-String key): store directly in
+    // the real JDK CHM so get()/size()/entrySet() retrieve the actual objects.
+    // The Rust side-table is string-only — do not put a synthetic "" sentinel
+    // that would shadow the real object.
+    let prev = put_non_string_into_chm(ctx, this, key_v, val_v);
+    Ok(Some(prev))
 }
 
 /// Put a non-String (key,value) pair directly into the Properties' real JDK
@@ -1813,6 +1820,71 @@ fn native_properties_keys(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         }
     }
     Ok(Some(Value::Object(Some(build_enumeration(ctx, keys)))))
+}
+
+/// Collect this Properties object's own String keys (side-table + CHM-exclusive
+/// non-String-valued entries), de-duplicating into `seen`/`out`. Mirrors the
+/// key set `native_properties_keys` exposes for a single object.
+fn collect_own_property_names(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    seen: &mut std::collections::HashSet<String>,
+    out: &mut Vec<String>,
+) {
+    for (k, _v) in snapshot_kv(ctx, this) {
+        if seen.insert(k.clone()) {
+            out.push(k);
+        }
+    }
+    let side = side_key_set(ctx, this);
+    for (_key_obj, _value, kstr) in chm_extra_entries(ctx, this, &side) {
+        if let Some(s) = kstr {
+            if seen.insert(s.clone()) {
+                out.push(s);
+            }
+        }
+    }
+}
+
+/// Native `Properties.propertyNames()Ljava/util/Enumeration;` — unlike
+/// `keys()` (Hashtable's own keys only), `propertyNames()` MUST also surface
+/// the `defaults` chain (JDK `Properties.enumerate`: `if (defaults != null)
+/// defaults.enumerate(h)` before the receiver's own entries). The real-JDK
+/// bytecode reads the internal `map` CHM via `enumerate`, which our synthetic
+/// Properties keeps in the side-table, so without this native a Properties
+/// built via `new Properties(defaults)` enumerates only its own keys and drops
+/// every inherited default (e.g. Spring's `CollectionUtils.mergePropertiesIntoMap`
+/// lost `defaults`-supplied entries). Walk the receiver then recurse through
+/// `defaults`, de-duplicating by name. `getProperty` already honours the same
+/// chain via `props_defaults`.
+fn native_properties_property_names(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => {
+            return Ok(Some(Value::Object(Some(build_enumeration(
+                ctx,
+                Vec::new(),
+            )))))
+        }
+    };
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut out: Vec<String> = Vec::new();
+    // Walk the receiver and its defaults chain. A depth cap guards against a
+    // pathological self-referential `defaults` field (the JDK chain is acyclic).
+    let mut cur = Some(this);
+    let mut depth = 0;
+    while let Some(p) = cur {
+        if depth > 64 {
+            break;
+        }
+        collect_own_property_names(ctx, p, &mut seen, &mut out);
+        cur = props_defaults(ctx, p);
+        depth += 1;
+    }
+    Ok(Some(Value::Object(Some(build_enumeration(ctx, out)))))
 }
 
 /// Native `Properties.elements()Ljava/util/Enumeration;` — companion to
@@ -2481,6 +2553,14 @@ pub fn register_properties_sidetable(registry: &mut NativeMethodRegistry) {
         "()Ljava/util/Enumeration;",
         native_properties_keys,
     );
+    // `propertyNames()` differs from `keys()`: it also enumerates the
+    // `defaults` chain (JDK contract). Distinct native — keep `keys()` own-only.
+    registry.register(
+        "java/util/Properties",
+        "propertyNames",
+        "()Ljava/util/Enumeration;",
+        native_properties_property_names,
+    );
     registry.register(
         "java/util/Properties",
         "elements",
@@ -2554,14 +2634,22 @@ fn native_properties_put_all(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     // 1) Side-table snapshot — covers Properties->Properties putAll (the
     //    dominant case that previously silently dropped all entries because
     //    Properties stores its data outside the inherited HashMap buckets).
+    //    Also copy `other`'s CHM-only entries (non-String key/value pairs —
+    //    e.g. a `ManagedProperties` whose `<props>` keys are `TypedStringValue`)
+    //    so a Properties->Properties putAll/merge doesn't drop them.
     let snapshot = snapshot_kv(ctx, other);
-    if !snapshot.is_empty() {
+    let other_side_keys = side_key_set(ctx, other);
+    let other_chm_extra = chm_extra_entries(ctx, other, &other_side_keys);
+    if !snapshot.is_empty() || !other_chm_extra.is_empty() {
         for (k, v) in &snapshot {
             put_kv(ctx, this, k, v);
         }
         // Mirror into `this`'s real `map` CHM backing too, so the destination
         // stays consistent for generic Map walkers (cf. native_properties_put).
         mirror_loaded_entries_to_properties_backend(ctx, this, &snapshot);
+        for (key_obj, value, _kstr) in other_chm_extra {
+            put_non_string_into_chm(ctx, this, Value::Object(Some(key_obj)), value);
+        }
         return Ok(None);
     }
     // 2) Fallback — source is a regular Map (HashMap/LinkedHashMap).  Walk
@@ -2632,20 +2720,23 @@ fn native_properties_put_all(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
             Ok(Some(v)) => v,
             _ => continue,
         };
-        let k = ctx.read_string(key_obj).unwrap_or_default();
-        if k.is_empty() {
-            continue;
-        }
-        if let Some(v_str) = match val_v {
+        let k_opt = ctx.read_string(key_obj);
+        let v_str = match val_v {
             Value::Object(Some(val_obj)) => ctx.read_string(val_obj),
             _ => None,
-        } {
-            // String→String: collect for batched side-table + CHM mirror.
-            str_collected.push((k, v_str));
-        } else {
-            // Non-String value: store directly in the real JDK CHM so
-            // native_properties_get can retrieve the actual object.
-            put_non_string_into_chm(ctx, this, Value::Object(Some(key_obj)), val_v);
+        };
+        match (k_opt, v_str) {
+            (Some(k), Some(v_str)) if !k.is_empty() => {
+                // String→String: collect for batched side-table + CHM mirror.
+                str_collected.push((k, v_str));
+            }
+            _ => {
+                // Non-String key and/or value: store directly in the real JDK
+                // CHM so native_properties_get / size() / entrySet() observe it.
+                // (A non-String key — e.g. Spring's `TypedStringValue` — was
+                // previously dropped by the `k.is_empty()` skip.)
+                put_non_string_into_chm(ctx, this, Value::Object(Some(key_obj)), val_v);
+            }
         }
     }
     for (k, v) in &str_collected {
