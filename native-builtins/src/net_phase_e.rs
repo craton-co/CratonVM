@@ -1478,7 +1478,15 @@ fn register_uri_natives(r: &mut NativeMethodRegistry) {
         }
     });
 
-    // getSchemeSpecificPart() → everything after 'scheme:' (decoded)
+    // getSchemeSpecificPart() → everything after 'scheme:', percent-DECODED.
+    // The JDK returns the decoded scheme-specific part here (the raw form is
+    // `getRawSchemeSpecificPart()` below). Skipping the decode left `%20` (and
+    // other escapes) intact, so `new JarFile(uri.getSchemeSpecificPart())` in
+    // Hibernate's `JarFileBasedArchiveDescriptor` opened a non-existent
+    // `space%20par.par` instead of `space par.par` (PackagedEntityManagerTest
+    // testSpacePar: "Unable to locate persistence.xml"). Decode mirrors the
+    // already-correct `getPath()`. A path without escapes decodes to itself, so
+    // the Spring Boot launcher path (no `%`) is unaffected.
     r.register(
         uri,
         "getSchemeSpecificPart",
@@ -1491,7 +1499,8 @@ fn register_uri_natives(r: &mut NativeMethodRegistry) {
             } else {
                 raw.clone()
             };
-            Ok(Some(Value::Object(Some(ctx.create_string(&ssp)))))
+            let decoded = uri_percent_decode(&ssp);
+            Ok(Some(Value::Object(Some(ctx.create_string(&decoded)))))
         },
     );
 
