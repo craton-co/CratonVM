@@ -12,20 +12,6 @@ By default CratonVM loads the real `java.base` module from a detected JDK (via `
 `--synthetic-jdk` — it falls back to its own synthetic Rust implementations of the Java
 standard library, so it can run with **no JDK installation, no `JAVA_HOME`, no `rt.jar`**.
 
-## Status & Known Limitations
-
-CratonVM is an **experimental research JVM**. It is **NOT certified** and **MUST
-NOT be used to run untrusted Java code** in security-sensitive environments. It
-targets broad Java 8–25 language coverage and passes 6,000+ tests. A 2026-06
-multi-agent code review drove a large remediation pass that closed the JIT/GC
-"register-resident root" use-after-free family (precise JIT stack maps are now
-default-on) and hardened the crypto/network/JNI surface — but the VM has **not
-undergone a formal security audit**, parts of its cryptographic stack remain
-best-effort, and one optional moving-GC pin-consult is a documented follow-up.
-For the full, honest picture — crypto status, sandboxing knobs, partial Security
-Manager, signed-JAR trust, and tracked issues — see [SECURITY.md](SECURITY.md)
-and [docs/SECURITY_HARDENING.md](docs/SECURITY_HARDENING.md).
-
 ## Features
 
 - **Bytecode interpreter** with 140+ fast-path opcodes
