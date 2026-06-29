@@ -5506,6 +5506,44 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         Vec::new()
     }
 
+    fn method_return_type_annotations(
+        &self,
+        class_id: ClassId,
+        method_name: &str,
+        method_desc: &str,
+    ) -> Vec<crate::native::registry::AnnotationData> {
+        let cm = self.shared.class_manager.read();
+        let class = match cm.get_class(class_id) {
+            Some(c) => c,
+            None => return Vec::new(),
+        };
+        for m in &class.methods {
+            if &*m.name == method_name && &*m.descriptor == method_desc {
+                return extract_return_type_annotations(&m.attributes, &class.constant_pool);
+            }
+        }
+        Vec::new()
+    }
+
+    fn method_parameter_type_annotations(
+        &self,
+        class_id: ClassId,
+        method_name: &str,
+        method_desc: &str,
+    ) -> Vec<Vec<crate::native::registry::AnnotationData>> {
+        let cm = self.shared.class_manager.read();
+        let class = match cm.get_class(class_id) {
+            Some(c) => c,
+            None => return Vec::new(),
+        };
+        for m in &class.methods {
+            if &*m.name == method_name && &*m.descriptor == method_desc {
+                return extract_parameter_type_annotations(&m.attributes, &class.constant_pool);
+            }
+        }
+        Vec::new()
+    }
+
     fn method_annotation_default(
         &self,
         class_id: ClassId,
@@ -6380,6 +6418,73 @@ pub(super) fn extract_parameter_annotations(
                     .collect();
             }
             _ => {}
+        }
+    }
+    Vec::new()
+}
+
+/// Extract TYPE_USE annotations targeting the method return type
+/// (`target_type` 0x14, METHOD_RETURN) with an empty `type_path` — i.e.
+/// annotations placed directly on the top-level return type. Reads only the
+/// `RuntimeVisibleTypeAnnotations` attribute (RUNTIME retention), matching
+/// HotSpot's `getAnnotatedReturnType().getDeclaredAnnotations()`.
+pub(super) fn extract_return_type_annotations(
+    attributes: &[cratonvm_reader::attribute::LazyAttribute],
+    cp: &cratonvm_reader::constant_pool::ConstantPool,
+) -> Vec<crate::native::registry::AnnotationData> {
+    use cratonvm_reader::attribute::Attribute;
+    const TARGET_METHOD_RETURN: u8 = 0x14;
+    for lazy in attributes {
+        let attr = match lazy.as_decoded() {
+            Some(a) => a,
+            None => continue,
+        };
+        if let Attribute::RuntimeVisibleTypeAnnotations(tas) = attr {
+            return tas
+                .iter()
+                .filter(|ta| ta.target_type == TARGET_METHOD_RETURN && ta.type_path.is_empty())
+                .filter_map(|ta| convert_annotation(&ta.annotation, cp))
+                .collect();
+        }
+    }
+    Vec::new()
+}
+
+/// Extract TYPE_USE annotations targeting the method formal parameters
+/// (`target_type` 0x16, METHOD_FORMAL_PARAMETER) with an empty `type_path`.
+/// The outer `Vec` is indexed by `formal_parameter_index` (sized to the
+/// highest index seen); parameters without type annotations get an empty
+/// inner `Vec`. Backs `Parameter.getAnnotatedType().getDeclaredAnnotations()`.
+pub(super) fn extract_parameter_type_annotations(
+    attributes: &[cratonvm_reader::attribute::LazyAttribute],
+    cp: &cratonvm_reader::constant_pool::ConstantPool,
+) -> Vec<Vec<crate::native::registry::AnnotationData>> {
+    use cratonvm_reader::attribute::Attribute;
+    const TARGET_METHOD_FORMAL_PARAMETER: u8 = 0x16;
+    for lazy in attributes {
+        let attr = match lazy.as_decoded() {
+            Some(a) => a,
+            None => continue,
+        };
+        if let Attribute::RuntimeVisibleTypeAnnotations(tas) = attr {
+            let mut out: Vec<Vec<crate::native::registry::AnnotationData>> = Vec::new();
+            for ta in tas {
+                if ta.target_type != TARGET_METHOD_FORMAL_PARAMETER || !ta.type_path.is_empty() {
+                    continue;
+                }
+                // target_info for METHOD_FORMAL_PARAMETER is a single u1 index.
+                let idx = match ta.target_info.first() {
+                    Some(&i) => i as usize,
+                    None => continue,
+                };
+                if let Some(data) = convert_annotation(&ta.annotation, cp) {
+                    if out.len() <= idx {
+                        out.resize(idx + 1, Vec::new());
+                    }
+                    out[idx].push(data);
+                }
+            }
+            return out;
         }
     }
     Vec::new()
