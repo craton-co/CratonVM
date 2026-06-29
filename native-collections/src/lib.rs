@@ -9380,6 +9380,18 @@ fn materialize_lazy_stream(ctx: &mut dyn NativeContext, stream: ObjectRef) {
 }
 
 /// Create a Stream from a slice of values.
+/// Public constructor for a fully-functional synthetic `java/util/stream/Stream`
+/// backed by a fixed element snapshot. Other native modules (e.g. the NIO
+/// `Files.list`/`Files.walk` shims in `native-builtins`) use this to return a
+/// working eager Stream without depending on the real `ReferencePipeline`
+/// machinery.
+pub fn make_stream_from_elements(
+    ctx: &mut dyn NativeContext,
+    elements: &[Value],
+) -> MethodCallResult {
+    make_stream(ctx, elements)
+}
+
 fn make_stream(ctx: &mut dyn NativeContext, elements: &[Value]) -> MethodCallResult {
     let stream = alloc_synthetic(ctx, "java/util/stream/Stream", STREAM_NUM_FIELDS);
     let arr = alloc_ref_array(ctx, elements.len());
