@@ -12314,9 +12314,26 @@ fn execute_instruction(
                                 return Ok(InstructionResult::Continue);
                             }
                         }
+                        // Render both operands as binary (dotted) class names,
+                        // matching HotSpot's `ClassCastException` message.
+                        // Tools parse this message: mockk's `JvmAutoHinter`
+                        // applies the regex `cannot be cast to (class )?(.+/)?
+                        // (.+?)( \(...\))?$` and reads group 3 as the target
+                        // type, then `Class.forName`s it to learn a mock's
+                        // return type. With our former *internal* (slashed)
+                        // names — e.g. `... cast to java/lang/String` — the
+                        // `(.+/)?` group greedily ate `java/lang/`, leaving
+                        // group 3 = `String`, so `Class.forName("String")`
+                        // threw `ClassNotFoundException: String` and every
+                        // reified Kotlin extension test that records a mock
+                        // (`getBean<T>()`, `getProperty<T>()`) failed. Dotted
+                        // names contain no `/`, so group 3 captures the full
+                        // FQN exactly as on HotSpot.
+                        let obj_binary = obj_class_name.replace('/', ".");
+                        let target_binary = target_class_name.replace('/', ".");
                         return Err(RuntimeError::ClassCastException {
                             message: format!(
-                                "{obj_class_name} cannot be cast to {target_class_name}"
+                                "{obj_binary} cannot be cast to {target_binary}"
                             ),
                         }
                         .into());
