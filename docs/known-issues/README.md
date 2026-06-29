@@ -105,6 +105,15 @@ the ~30 docs map to **one root-cause family + ~15 distinct standalone bugs**, of
     race vs the completing worker), NOT a missed next-GC card (conservative card-marking was insufficient).
     **Heisenbug**: `SP_VERIFY`/`DBG_SWEEP_EDGES` mask it; needs non-perturbing observation. Path =
     `gen_heap.rs::sweep_young_non_moving`. Same moving-GC family as #15.
+18. **[Hibernate `type.temporal.*` — moving GC strands lambda refs in native stream/collection intrinsics](hib-temporal-gc-lambda-native-stale-local.md)** —
+    🟠 **OPEN** (fix in progress: per-native pinning). The 5 `org.hibernate.orm.test.type.temporal.*` classes
+    abort rc=1 / SIGSEGV with `linkage error: no such method java/lang/Object.<sam>` — **not** a java.time
+    binding bug. Same native-stale-Rust-local family as the StackWalker corruption
+    ([hibernate-bytearraymapping-stackwalk-gc-corruption.md](hibernate-bytearraymapping-stackwalk-gc-corruption.md)):
+    `Stream.forEach`/`sorted`, `Spliterator.tryAdvance`/`forEachRemaining`, `ArrayList.forEach` hold the lambda
+    + materialized elements in Rust locals across `invoke_virtual`; the moving young collector relocates them
+    out from under the stale local. `-Xmx8g` passes; default heap ~50–70 % crash. Fix = `pin_native_root` /
+    `read_native_pin` per native (NOT force-non-moving — that hits the HIB-CV-33 precise-root gap).
 
 FIXED bugs whose standalone docs were **removed** from this folder (resolved; full writeups in
 `git` history or [`docs/internal/fixed-suite-bugs/`](../internal/fixed-suite-bugs/)): A1 (reflection
