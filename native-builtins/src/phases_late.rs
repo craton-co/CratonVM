@@ -8166,11 +8166,64 @@ fn jrtfs_decode(p: &str) -> Option<(String, String)> {
 
 /// Read a jar-internal entry's bytes. `entry` "" or "/" means the jar root
 /// (a directory) — callers should treat that as a directory, not a file.
+/// Cache of mounted-jar file bytes, keyed by OS path. The jar-FS helpers
+/// (`jarfs_classify`/`jarfs_list_dir`/`jarfs_read_entry`, called once per
+/// directory/file during a `Files.walkFileTree`/`Files.walk`) each previously
+/// `std::fs::read` the whole archive — O(entries × jar-size) disk traffic that
+/// made walking a large classpath (e.g. the Hibernate suite's 241 jars, some
+/// multi-MB) pathologically slow. Classpath/mounted jars are read-only for the
+/// VM lifetime, so memoise the bytes (re-parsing the in-memory zip is cheap
+/// relative to re-reading multi-MB files from disk hundreds of times).
+fn jar_bytes_cached(jar: &str) -> Option<std::sync::Arc<Vec<u8>>> {
+    use std::sync::{Arc, Mutex, OnceLock};
+    static CACHE: OnceLock<Mutex<std::collections::HashMap<String, Option<Arc<Vec<u8>>>>>> =
+        OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+    let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(cached) = guard.get(jar) {
+        return cached.clone();
+    }
+    let bytes = std::fs::read(jar).ok().map(Arc::new);
+    guard.insert(jar.to_string(), bytes.clone());
+    bytes
+}
+
+/// Cached sorted entry-name index per jar (mirrors `jrt_image`). A
+/// `Files.walkFileTree` over a jar calls `jarfs_classify` (per entry, via
+/// `readAttributes`) and `jarfs_list_dir*` (per directory) — each of which
+/// previously re-parsed the whole zip central directory, i.e. O(N²) per jar.
+/// Building the sorted name list once (`ZipArchive::file_names`, no per-entry
+/// decompression) turns those into O(log N) binary-search / prefix scans, which
+/// is what makes walking a large classpath (the Hibernate suite's 241 jars)
+/// tractable in the interpreter.
+fn jar_index(jar: &str) -> Option<std::sync::Arc<Vec<String>>> {
+    use std::sync::{Arc, Mutex, OnceLock};
+    static CACHE: OnceLock<Mutex<std::collections::HashMap<String, Option<Arc<Vec<String>>>>>> =
+        OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+    let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(cached) = guard.get(jar) {
+        return cached.clone();
+    }
+    let built = (|| {
+        let bytes = jar_bytes_cached(jar)?;
+        let cursor = std::io::Cursor::new(bytes.as_slice());
+        let zip = zip::ZipArchive::new(cursor).ok()?;
+        let mut names: Vec<String> = zip.file_names().map(|s| s.to_string()).collect();
+        names.sort_unstable();
+        names.dedup();
+        Some(Arc::new(names))
+    })();
+    guard.insert(jar.to_string(), built.clone());
+    built
+}
+
 fn jarfs_read_entry(jar: &str, entry: &str) -> std::io::Result<Vec<u8>> {
     use std::io::Read;
     let entry = entry.trim_start_matches('/');
-    let jar_bytes = std::fs::read(jar)?;
-    let cursor = std::io::Cursor::new(jar_bytes);
+    let jar_bytes =
+        jar_bytes_cached(jar).ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotFound))?;
+    let cursor = std::io::Cursor::new(jar_bytes.as_slice());
     let mut zip = zip::ZipArchive::new(cursor)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
     let mut f = zip
@@ -8190,32 +8243,23 @@ enum JarFsKind {
 
 fn jarfs_classify(jar: &str, entry: &str) -> JarFsKind {
     let entry = entry.trim_start_matches('/');
-    let jar_bytes = match std::fs::read(jar) {
-        Ok(b) => b,
-        Err(_) => return JarFsKind::Absent,
-    };
-    let cursor = std::io::Cursor::new(jar_bytes);
-    let mut zip = match zip::ZipArchive::new(cursor) {
-        Ok(z) => z,
-        Err(_) => return JarFsKind::Absent,
+    let names = match jar_index(jar) {
+        Some(n) => n,
+        None => return JarFsKind::Absent,
     };
     if entry.is_empty() {
         return JarFsKind::Dir;
     }
-    if zip.by_name(entry).is_ok() {
+    // Exact entry → a regular file.
+    if names.binary_search_by(|n| n.as_str().cmp(entry)).is_ok() {
         return JarFsKind::File;
     }
-    // An explicit directory entry, or any entry living under `entry/`.
+    // An explicit directory entry (`entry/`) or any entry living under `entry/`.
+    // The sorted index makes this the first name >= `entry/`.
     let dir_prefix = format!("{entry}/");
-    if zip.by_name(&dir_prefix).is_ok() {
+    let idx = names.partition_point(|n| n.as_str() < dir_prefix.as_str());
+    if names.get(idx).is_some_and(|n| n.starts_with(&dir_prefix)) {
         return JarFsKind::Dir;
-    }
-    for i in 0..zip.len() {
-        if let Ok(f) = zip.by_index(i) {
-            if f.name().starts_with(&dir_prefix) {
-                return JarFsKind::Dir;
-            }
-        }
     }
     JarFsKind::Absent
 }
@@ -8223,47 +8267,15 @@ fn jarfs_classify(jar: &str, entry: &str) -> JarFsKind {
 /// List the immediate children of a directory `dir` inside a JAR. Returns
 /// full entry paths (relative to the jar root).
 fn jarfs_list_dir(jar: &str, dir: &str) -> Vec<String> {
-    let dir = dir.trim_start_matches('/').trim_end_matches('/');
-    let prefix = if dir.is_empty() {
-        String::new()
-    } else {
-        format!("{dir}/")
-    };
-    let jar_bytes = match std::fs::read(jar) {
-        Ok(b) => b,
-        Err(_) => return Vec::new(),
-    };
-    let cursor = std::io::Cursor::new(jar_bytes);
-    let mut zip = match zip::ZipArchive::new(cursor) {
-        Ok(z) => z,
-        Err(_) => return Vec::new(),
-    };
-    let mut seen = std::collections::BTreeSet::new();
-    for i in 0..zip.len() {
-        if let Ok(f) = zip.by_index(i) {
-            let name = f.name();
-            if let Some(rest) = name.strip_prefix(&prefix) {
-                let rest = rest.trim_end_matches('/');
-                if rest.is_empty() {
-                    continue;
-                }
-                // Immediate child only: keep the first path segment.
-                let child = match rest.find('/') {
-                    Some(j) => &rest[..j],
-                    None => rest,
-                };
-                seen.insert(format!("{prefix}{child}"));
-            }
-        }
-    }
-    seen.into_iter().collect()
+    jarfs_list_dir_classified(jar, dir)
+        .into_iter()
+        .map(|(child, _)| child)
+        .collect()
 }
 
 /// List immediate children of `dir` inside a JAR together with an
-/// is-directory flag, in ONE pass over the archive. `walkFileTree` needs the
-/// flag per child; calling `jarfs_classify` per child would re-read and
-/// re-parse the whole zip for every entry (O(n²) over a test jar with
-/// hundreds of classes).
+/// is-directory flag, using the cached sorted entry index (a contiguous prefix
+/// range), so a `walkFileTree` does not re-parse the whole zip per directory.
 fn jarfs_list_dir_classified(jar: &str, dir: &str) -> Vec<(String, bool)> {
     let dir = dir.trim_start_matches('/').trim_end_matches('/');
     let prefix = if dir.is_empty() {
@@ -8271,35 +8283,29 @@ fn jarfs_list_dir_classified(jar: &str, dir: &str) -> Vec<(String, bool)> {
     } else {
         format!("{dir}/")
     };
-    let jar_bytes = match std::fs::read(jar) {
-        Ok(b) => b,
-        Err(_) => return Vec::new(),
+    let names = match jar_index(jar) {
+        Some(n) => n,
+        None => return Vec::new(),
     };
-    let cursor = std::io::Cursor::new(jar_bytes);
-    let mut zip = match zip::ZipArchive::new(cursor) {
-        Ok(z) => z,
-        Err(_) => return Vec::new(),
-    };
+    let start = names.partition_point(|n| n.as_str() < prefix.as_str());
     let mut seen: std::collections::BTreeMap<String, bool> = std::collections::BTreeMap::new();
-    for i in 0..zip.len() {
-        if let Ok(f) = zip.by_index(i) {
-            let name = f.name();
-            if let Some(rest) = name.strip_prefix(&prefix) {
-                let trimmed = rest.trim_end_matches('/');
-                if trimmed.is_empty() {
-                    continue;
-                }
-                // Immediate child; it is a directory when the entry path
-                // descends further (contains '/') or is an explicit
-                // directory entry (trailing '/').
-                let (child, is_dir) = match trimmed.find('/') {
-                    Some(j) => (&trimmed[..j], true),
-                    None => (trimmed, rest.ends_with('/')),
-                };
-                let e = seen.entry(format!("{prefix}{child}")).or_insert(false);
-                *e = *e || is_dir;
-            }
+    for name in &names[start..] {
+        let rest = match name.strip_prefix(&prefix) {
+            Some(r) => r,
+            None => break, // sorted: first non-match ends the prefix range
+        };
+        let trimmed = rest.trim_end_matches('/');
+        if trimmed.is_empty() {
+            continue;
         }
+        // Immediate child; it is a directory when the entry path descends
+        // further (contains '/') or is an explicit directory entry (trailing '/').
+        let (child, is_dir) = match trimmed.find('/') {
+            Some(j) => (&trimmed[..j], true),
+            None => (trimmed, rest.ends_with('/')),
+        };
+        let e = seen.entry(format!("{prefix}{child}")).or_insert(false);
+        *e = *e || is_dir;
     }
     seen.into_iter().collect()
 }
