@@ -89,6 +89,47 @@ the `KeyManager`'s key+cert with the specific context rather than a global
 slot) and wiring the client identity into `build_client_config`'s `client_auth`.
 That is a distinct, larger feature than the handshake fix above.
 
+## mTLS progress (branch `claude/great-banzai-67e809`, NOT yet merged)
+
+The per-`SSLContext` mTLS feature above was implemented and the mutual-TLS
+handshake + data path now work end to end. Commits on the worktree branch
+(`03fb1851`, `f9790739`), held back from `dev` pending the residual below:
+
+- **Per-`SSLContext` identity** — keystore `engineLoad` stages its
+  `(cert_pem, key_pem)` on a thread-local (real-mode native; the
+  `KeyManagerFactory` natives are synthetic-gated, so the *real* KMF bytecode
+  runs and a native hook there is dead); `SSLContext.init` claims it onto the
+  context's object identity; `createSSLEngine` copies it to the engine
+  (`EngineState.identity_override`); `engine_begin` builds that engine's rustls
+  config from it. `HttpsURLConnection.setDefaultSSLSocketFactory` captures the
+  client identity; the native HUC client (`http_url_connection::perform`) and
+  `SSLSocketFactory.createSocket` now use the rustls client path, trusting the
+  gathered test/truststore roots and presenting the client cert.
+- **`do_unwrap` plaintext-corruption bug** — overflowed decrypted plaintext was
+  stashed into `outbound` (the encrypted wrap buffer), so the next `wrap` put
+  plaintext on the wire ("corrupt message of type InvalidContentType"). Fixed
+  with a dedicated `EngineState.plaintext_pending`. *(General TLS fix — affects
+  any large HTTPS response, not just mTLS.)*
+- **Unclean-close tolerance** — the HUC client now treats a server TCP close
+  without `close_notify` (rustls `UnexpectedEof`) as end-of-stream.
+- **Real-mode `SSLSession.getId()` and `getPeerCertificates()`** — the latter
+  returns real `X509CertImpl` mirrors of the captured rustls peer (client) cert
+  chain.
+
+Verified by wire capture: the client presents its cert, the server verifies it,
+encrypted app data flows, and the request reaches the servlet — POST returns a
+real HTTP **401** (was a hang / -1).
+
+**Residual (still OPEN), now in the auth/transport layer, not TLS:**
+1. **Client-cert authorization** — the request is TLS-authenticated but Tomcat's
+   `SSLAuthenticator`/realm still returns **401** (the client cert is not mapped
+   to the `testrole`). Next step: confirm the coyote SSL-support path actually
+   reads `SSLSession.getPeerCertificates()` and that the `X509CertImpl` mirror's
+   `getSubjectX500Principal()` matches the realm's cert→user→role mapping.
+2. **GET transport race** — the GET variant fails earlier with "connection
+   closed before response head": the server closes the TCP connection before/as
+   the client reads, so the client sees EOF before the buffered response.
+
 ## Reproduction
 
 ```
