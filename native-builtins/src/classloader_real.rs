@@ -794,6 +794,34 @@ fn cl_real_load_class_base(
     let class_name = ctx.read_string(class_name_obj).unwrap_or_default();
     let internal = class_name.replace('.', "/");
 
+    // Loader isolation for generated dynamic proxies (JVMS §5.3). A
+    // `jdk.proxyN.$ProxyM` lives in its defining loader's per-loader dynamic
+    // module, so it must resolve ONLY through a loader that can see it (its
+    // defining loader or a delegation descendant). Use the loader-aware
+    // `find_loaded_class_for_loader` (step 1 = this loader's own namespace,
+    // step 2 = a globally-known proxy whose recorded defining loader IS this
+    // loader). The loader-blind `ctx.load_class` global fallback below would
+    // otherwise hand ANY loader — a sibling, or the app loader reached via
+    // parent-first delegation — another loader's proxy, so
+    // `ClassUtils.isCacheSafe(composite, siblingLoader)` wrongly returned true
+    // via its `isLoadable` (`siblingLoader.loadClass(name)`) fallback
+    // (ClassUtilsTests.isCacheSafe). Generated proxies are never on the
+    // classpath, so a loader that cannot see this one has no other way to load
+    // it → ClassNotFoundException. (The defining loader registers its proxies
+    // under its CANONICAL namespace id — see `proxy_loader_namespace` — so the
+    // step-1 scoped lookup here finds them.)
+    if crate::classloader::is_generated_proxy_name(&internal) {
+        if let Some(mirror) =
+            crate::classloader::find_loaded_class_for_loader(ctx, this, &internal)
+        {
+            return Ok(Some(Value::Object(Some(mirror))));
+        }
+        let exc = alloc_concurrent_synthetic(ctx, "java/lang/ClassNotFoundException", 1);
+        let msg = ctx.create_string(&class_name);
+        ctx.set_field(exc, 0, Value::Object(Some(msg)));
+        return Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(exc));
+    }
+
     // HIB-CV-24 / SBR-14 — honor a supplied child/isolated `ClassLoader`.
     //
     // Step 1 below (`ctx.load_class`) resolves through CratonVM's flat global

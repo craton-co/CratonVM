@@ -1136,6 +1136,24 @@ fn native_properties_get_property_1(
             return Ok(Some(Value::Object(Some(s))));
         }
     }
+    // System-property fallback ONLY for the `System.getProperties()` view.
+    // Real `java.util.Properties.getProperty` consults nothing but the object's
+    // own entries and its `defaults` chain — it must NOT leak system properties.
+    // A plain `new Properties()` that misses here returns null. Without this
+    // gate, `new Properties().getProperty("user.dir")` returned the system value,
+    // which (e.g.) made `PropertyPlaceholderConfigurer` with
+    // SYSTEM_PROPERTIES_MODE_NEVER resolve `${user.dir}` instead of failing
+    // (PropertyResourceConfigurerTests.propertyPlaceholderConfigurerWith
+    // UnresolvableSystemProperty). The synthetic `System.getProperties()` object
+    // is marked via `mark_system_props`, so it still resolves system keys.
+    if !is_system_props(ctx, this) {
+        tracing::debug!(
+            target: "cratonvm_vm::props_sidetable",
+            ?this, key = %key,
+            "PROPS-GET sidetable MISS, non-system Properties -> null"
+        );
+        return Ok(Some(Value::Object(None)));
+    }
     tracing::debug!(
         target: "cratonvm_vm::props_sidetable",
         ?this, key = %key,

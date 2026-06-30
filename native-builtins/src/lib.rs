@@ -1074,6 +1074,15 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     let prev_category = registry.current_category();
     registry.set_category(cratonvm_native_api::NativeKind::Bridge);
 
+    // Synthetic-stream `spliterator()` natives — synthetic stream objects
+    // (stamped with the bare `java/util/stream/*Stream` interface) are produced
+    // in real-JDK mode (e.g. `OptionalInt.stream()`), and real JDK stream code
+    // (`IntStream.concat` → `a.spliterator()`) then calls `spliterator()` on
+    // them. Without this the call falls to the abstract interface method →
+    // `AbstractMethodError` (swallowed by JUnit's launcher → every parameterized
+    // /factory test reported EMPTY). See `register_synthetic_stream_spliterators`.
+    crate::phases_late::register_synthetic_stream_spliterators(registry);
+
     // RBIGDEC.1 — BigInteger / BigDecimal arithmetic + toString overrides.
     //
     // BigInteger.<clinit> can fail in real-JDK mode (intrinsic fallback,
@@ -2135,6 +2144,13 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // the current thread. Fixes "Cannot invoke currentCarrierThread on null"
     // on KC16 boot after ConcurrentHashMap / Lookup clinit B6-swallows.
     register_t19_h2_shared_secrets_shim(registry);
+    // FFM real-JDK native-library load path: jdk.internal.loader
+    // .RawNativeLibraries.load0/unload0 + NativeLibrary.findEntry0. These back
+    // `java.lang.foreign.SymbolLookup.libraryLookup` when the JDK's own bytecode
+    // runs (real-JDK mode), letting FFM bindings like Tomcat's openssl_h load
+    // libssl/libcrypto. Registered here (the always-compiled essential path)
+    // rather than in the synthetic-only `register_pe_panama`. See the fn doc.
+    crate::panama::register_pe_raw_native_libraries(registry);
     // WP1.4: SharedSecrets.getJavaXxxAccess() factories for the
     // JDK Access interfaces plus the per-interface method natives
     // (currentCarrierThread, doIntersectionPrivilege, copyMethod,
@@ -7087,7 +7103,7 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         "java/lang/reflect/Array",
         "multiNewArray",
         "(Ljava/lang/Class;[I)Ljava/lang/Object;",
-        lang_system::native_array_new_array,
+        lang_system::native_array_multi_new_array,
     );
 
     // --- java/lang/invoke/MethodHandle (signature-polymorphic) ---
@@ -9041,6 +9057,56 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         cratonvm_types::Value::Object(Some(obj))
     }
 
+    /// Localized display name for a synthetic TimeZone, honouring its `ID` and
+    /// the requested style. The previous natives hard-coded "UTC" for every
+    /// zone and style, so `TimeZone.getTimeZone("GMT").getDisplayName(false,
+    /// SHORT, US)` — and, via `SimpleDateFormat`'s `z` field which calls
+    /// `getDisplayName(daylight, style, locale)`, every HTTP `Date`/`Expires`
+    /// header that formats the GMT zone — rendered "UTC" instead of "GMT"
+    /// (Tomcat `TestCookieProcessorGeneration.testMaxAgeZero`). `getZoneStrings`
+    /// already returns the correct rows, but `SimpleDateFormat` skips them when
+    /// the zone strings are not explicitly set and falls through to
+    /// `getDisplayName`, so the fix must live here. `style` follows
+    /// `TimeZone.SHORT` (0) / `TimeZone.LONG` (1).
+    fn tz_display_name(ctx: &mut dyn NativeContext, this: ObjectRef, long_style: bool) -> String {
+        let id = match ctx.get_field_by_name(this, "ID") {
+            Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+            _ => String::new(),
+        };
+        match id.as_str() {
+            "GMT" => {
+                if long_style {
+                    "Greenwich Mean Time"
+                } else {
+                    "GMT"
+                }
+            }
+            "UTC" | "Etc/UTC" | "Etc/UCT" | "UCT" | "Zulu" | "Universal" | "Etc/Universal" => {
+                if long_style {
+                    "Coordinated Universal Time"
+                } else {
+                    "UTC"
+                }
+            }
+            _ => {
+                // Custom GMT-offset ids ("GMT+02:00") display verbatim, as
+                // HotSpot does for a ZoneInfo with no localized name. Unknown
+                // named zones keep the conservative UTC fallback this native
+                // used before (CratonVM models most zones by their standard
+                // offset, without per-zone CLDR display names).
+                if id.starts_with("GMT+") || id.starts_with("GMT-") {
+                    return id;
+                }
+                return if long_style {
+                    "Coordinated Universal Time".to_string()
+                } else {
+                    "UTC".to_string()
+                };
+            }
+        }
+        .to_string()
+    }
+
     registry.register(
         "java/util/TimeZone",
         "getTimeZone",
@@ -9076,23 +9142,46 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         "()V",
         |_ctx, _args| Ok(None),
     );
+    // getDisplayName() and getDisplayName(Locale) default to the LONG style.
     registry.register(
         "java/util/TimeZone",
         "getDisplayName",
         "()Ljava/lang/String;",
-        |ctx, _args| Ok(Some(Value::Object(Some(ctx.create_string("UTC"))))),
+        |ctx, args| {
+            let name = match args.first() {
+                Some(Value::Object(Some(o))) => tz_display_name(ctx, *o, true),
+                _ => "UTC".to_string(),
+            };
+            Ok(Some(Value::Object(Some(ctx.create_string(&name)))))
+        },
     );
     registry.register(
         "java/util/TimeZone",
         "getDisplayName",
         "(Ljava/util/Locale;)Ljava/lang/String;",
-        |ctx, _args| Ok(Some(Value::Object(Some(ctx.create_string("UTC"))))),
+        |ctx, args| {
+            let name = match args.first() {
+                Some(Value::Object(Some(o))) => tz_display_name(ctx, *o, true),
+                _ => "UTC".to_string(),
+            };
+            Ok(Some(Value::Object(Some(ctx.create_string(&name)))))
+        },
     );
+    // getDisplayName(boolean daylight, int style, Locale): style follows
+    // TimeZone.SHORT (0) / TimeZone.LONG (1). This is the variant
+    // SimpleDateFormat's `z` field calls.
     registry.register(
         "java/util/TimeZone",
         "getDisplayName",
         "(ZILjava/util/Locale;)Ljava/lang/String;",
-        |ctx, _args| Ok(Some(Value::Object(Some(ctx.create_string("UTC"))))),
+        |ctx, args| {
+            let long_style = matches!(args.get(2), Some(Value::Int(v)) if *v != 0);
+            let name = match args.first() {
+                Some(Value::Object(Some(o))) => tz_display_name(ctx, *o, long_style),
+                _ => "UTC".to_string(),
+            };
+            Ok(Some(Value::Object(Some(ctx.create_string(&name)))))
+        },
     );
     // Safety net: short-circuit ZoneInfoFile.getZoneInfo0 to return null
     // for direct callers (the higher-level TimeZone.getTimeZone is now
@@ -34157,6 +34246,50 @@ fn uri_first_illegal_index(s: &str) -> Option<usize> {
     None
 }
 
+/// Returns the index at which `java.net.URI`'s single-string parser would throw
+/// `URISyntaxException("Expected scheme-specific part", index)`, or `None` if
+/// the scheme-specific part is present (or there is no scheme at all).
+///
+/// Per RFC 2396 / the JDK parser, an absolute URI (one with a `scheme:` prefix)
+/// whose part after the colon is NOT hierarchical (does not begin with `/`)
+/// must have a non-empty opaque part (up to a `#` fragment). So `file:`,
+/// `http:`, `mailto:` and `a:` are all rejected, while `file:.`, `file:/x`,
+/// `http://h` and scheme-less relatives are accepted. Our lenient `url_parse`
+/// happily accepted `file:`, which broke Spring's `ResourceUtils.toURL` →
+/// `new URI(cleanPath("file:."))` fall-back chain (PathEditor/FileEditor
+/// `currentDirectory`).
+fn uri_empty_ssp_fail_index(s: &str) -> Option<usize> {
+    let bytes = s.as_bytes();
+    // A scheme must start with an ASCII letter.
+    if bytes.first().map(|b| b.is_ascii_alphabetic()) != Some(true) {
+        return None;
+    }
+    let mut i = 1;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if c == b':' {
+            // `s[..i]` is the scheme; the scheme-specific part starts at i+1.
+            let rest = &s[i + 1..];
+            if rest.starts_with('/') {
+                // Hierarchical (`scheme:/path`, `scheme://authority`): the part
+                // is present even if the path is otherwise empty.
+                return None;
+            }
+            // Opaque part runs up to a `#` fragment (or end of string).
+            let opaque_len = rest.find('#').unwrap_or(rest.len());
+            return if opaque_len == 0 { Some(i + 1) } else { None };
+        }
+        // Valid scheme characters: ALPHA / DIGIT / `+` / `-` / `.`.
+        if c.is_ascii_alphanumeric() || matches!(c, b'+' | b'-' | b'.') {
+            i += 1;
+            continue;
+        }
+        // Any other character before a `:` means there is no scheme.
+        return None;
+    }
+    None
+}
+
 fn native_uri_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
@@ -34194,6 +34327,24 @@ fn native_uri_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     if let Some(pos) = illegal {
         let input = ctx.create_string(&url_str);
         let reason = ctx.create_string("Illegal character in URI");
+        if let Ok(Some(Value::Object(Some(exc)))) = ctx.new_object_initialized(
+            "java/net/URISyntaxException",
+            "(Ljava/lang/String;Ljava/lang/String;I)V",
+            &[
+                Value::Object(Some(input)),
+                Value::Object(Some(reason)),
+                Value::Int(pos as i32),
+            ],
+        ) {
+            return Err(MethodCallFailed::ExceptionThrown(exc));
+        }
+    }
+    // Reject an absolute URI with an empty scheme-specific part (`file:`,
+    // `http:`, …) — the JDK parser throws here, and Spring relies on that throw
+    // to fall back to the deprecated `new URL(String)` path.
+    if let Some(pos) = uri_empty_ssp_fail_index(&url_str) {
+        let input = ctx.create_string(&url_str);
+        let reason = ctx.create_string("Expected scheme-specific part");
         if let Ok(Some(Value::Object(Some(exc)))) = ctx.new_object_initialized(
             "java/net/URISyntaxException",
             "(Ljava/lang/String;Ljava/lang/String;I)V",
@@ -40971,17 +41122,13 @@ fn native_array_new_instance_multi(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    let dims = match args.get(1) {
-        Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(Some(Value::Object(None))),
-    };
-    let len = match ctx.get_array_element(dims, 0) {
-        Value::Int(v) => v.max(0) as usize,
-        _ => 0,
-    };
-    let comp_name = array_new_instance_component_name(ctx, args.first());
-    let arr = array_new_instance_for_component(ctx, &comp_name, len);
-    Ok(Some(Value::Object(Some(arr))))
+    // `Array.newInstance(Class, int[])` must fully materialize ALL dimensions
+    // with the precise nested array type (`String[2][2]` → `[[Ljava/lang/String;`).
+    // The previous body read only `dims[0]` and built a one-dimensional array,
+    // collapsing e.g. `new String[2][2]` to `String[]`
+    // (SpEL ArrayConstructorTests.multiDimensionalArrays). Delegate to the
+    // shared nested-array builder, which also backs `Array.multiNewArray`.
+    lang_system::native_array_multi_new_array(ctx, args)
 }
 
 // ===========================================================================
@@ -41323,6 +41470,27 @@ fn native_proxy_get_handler(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     Ok(Some(ctx.get_field(proxy, 0)))
 }
 
+/// Per-loader namespace id for a generated proxy's defining loader — the cache
+/// key AND the `ClassLoaderId::UserDefined(N)` the proxy class is registered
+/// under (shared by `newProxyInstance` and `getProxyClass`).
+///
+/// For a *user-defined* loader this MUST be the loader's CANONICAL namespace id
+/// (`loader_namespace_id`), i.e. the same id the loader-scoped lookups
+/// (`peek_loader_namespace_id` / `class_defined_by_loader_exact`, used by
+/// `findLoadedClass` / `cl_real_load_class_base`'s proxy path) query. The
+/// previous raw identity-hash namespace registered the proxy under an id those
+/// scoped lookups never consult, so the DEFINING loader's own
+/// `loadClass(proxyName)` returned ClassNotFoundException (ClassUtilsTests
+/// .isCacheSafe, via `childLoader3` delegating to its definer `childLoader1`).
+/// Built-in / null loaders keep the identity-hash namespace.
+fn proxy_loader_namespace(ctx: &mut dyn NativeContext, loader_obj: ObjectRef) -> u32 {
+    if crate::classloader::is_user_defined_loader(ctx, loader_obj) {
+        crate::classloader::loader_namespace_id(ctx, loader_obj)
+    } else {
+        ctx.identity_hash_code(loader_obj) as u32
+    }
+}
+
 fn native_proxy_new_instance(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // WP2.5-B — strategy A path: emit a real `$ProxyN` class that
     // extends `java/lang/reflect/Proxy$Instance` and implements the
@@ -41346,12 +41514,30 @@ fn native_proxy_new_instance(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     let handler = args.get(2).cloned().unwrap_or(Value::Object(None));
 
     // Walk the Class[] arg into a list of iface ClassIds for cache keying.
+    //
+    // Real `Proxy.newProxyInstance` → `ProxyBuilder` validates every supplied
+    // `Class` is actually an interface, throwing
+    // `IllegalArgumentException("<fqcn> is not an interface")` otherwise
+    // (ServiceLocatorFactoryBeanTests.whenServiceLocatorInterfaceIsNotAnInterfaceType,
+    // which passes a plain class). Mirror that check here before generating the
+    // proxy class.
     let mut iface_cids: Vec<cratonvm_types::ClassId> = Vec::new();
     if let Value::Object(Some(arr)) = interfaces {
         let n = ctx.array_length(arr);
         for i in 0..n {
             if let Value::Object(Some(mirror)) = ctx.get_array_element(arr, i) {
                 if let Some(cid) = ctx.class_id_from_mirror(mirror) {
+                    let flags = ctx.class_access_flags(cid);
+                    if flags & cratonvm_types::access_flags::ACC_INTERFACE == 0 {
+                        let dotted = ctx
+                            .class_name_of_id(cid)
+                            .unwrap_or_default()
+                            .replace('/', ".");
+                        return Err(RuntimeError::IllegalArgumentException {
+                            message: format!("{dotted} is not an interface"),
+                        }
+                        .into());
+                    }
                     iface_cids.push(cid);
                 }
             }
@@ -41369,7 +41555,7 @@ fn native_proxy_new_instance(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     // get different proxy class spaces, matching JDK semantics. A null
     // ClassLoader arg = bootstrap loader = namespace 0.
     let loader_namespace: u32 = match args.first() {
-        Some(Value::Object(Some(loader_obj))) => ctx.identity_hash_code(*loader_obj) as u32,
+        Some(Value::Object(Some(loader_obj))) => proxy_loader_namespace(ctx, *loader_obj),
         _ => 0,
     };
     // proxy-real-classfile real-super migration: the generated class extends the
@@ -41486,7 +41672,7 @@ fn native_proxy_get_proxy_class(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     // Per-loader namespace = the loader instance's identity hash (bootstrap/null
     // → 0), matching `native_proxy_new_instance` so both share the cache entry.
     let loader_namespace: u32 = match args.first() {
-        Some(Value::Object(Some(loader_obj))) => ctx.identity_hash_code(*loader_obj) as u32,
+        Some(Value::Object(Some(loader_obj))) => proxy_loader_namespace(ctx, *loader_obj),
         _ => 0,
     };
     match define_or_get_proxy_class(ctx, loader_namespace, &iface_cids) {

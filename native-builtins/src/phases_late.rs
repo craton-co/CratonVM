@@ -611,6 +611,36 @@ pub(crate) fn register_phase55_executors(r: &mut NativeMethodRegistry) {
         "allOf",
         "([Ljava/util/concurrent/CompletableFuture;)Ljava/util/concurrent/CompletableFuture;",
         |ctx, args| {
+            // Real-JDK async inputs (e.g. `runAsync` on a worker) may still be PENDING:
+            // delegate to the real JDK private static `andTree` so the returned CF
+            // completes only when every input does (see `p58_cf_all_of`). The eager
+            // model below would mark it done immediately. Synthetic CFs (done-flag Int
+            // in slot 1) keep the eager model.
+            if let Some(Value::Object(Some(arr))) = args.first() {
+                let arr = *arr;
+                let len = ctx.array_length(arr);
+                let mut any_real = false;
+                for i in 0..len {
+                    if let Value::Object(Some(cf_ref)) = ctx.get_array_element(arr, i) {
+                        if !matches!(ctx.get_field(cf_ref, FUT_FIELD_DONE), Value::Int(_)) {
+                            any_real = true;
+                            break;
+                        }
+                    }
+                }
+                if any_real {
+                    return ctx.invoke_special(
+                        "java/util/concurrent/CompletableFuture",
+                        "andTree",
+                        "([Ljava/util/concurrent/CompletableFuture;II)Ljava/util/concurrent/CompletableFuture;",
+                        &[
+                            Value::Object(Some(arr)),
+                            Value::Int(0),
+                            Value::Int(len as i32 - 1),
+                        ],
+                    );
+                }
+            }
             let future =
                 alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 3);
             // Check if any constituent CF has an exception
@@ -4335,6 +4365,16 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         "(Ljava/net/URI;)Ljava/nio/file/Path;",
         |ctx, args| {
             let uri = obj_arg(args, 0)?;
+            // Opaque file-scheme URIs (`file:.`, `file:foo`) are not
+            // hierarchical: the real JDK throws here rather than yielding a
+            // path. Match that so callers like Spring's PathEditor fall back
+            // to their resource mechanism.
+            if p57_uri_is_opaque_file(&p57_uri_full_text(ctx, uri)) {
+                return Err(RuntimeError::IllegalArgumentException {
+                    message: "URI is not hierarchical".to_string(),
+                }
+                .into());
+            }
             // Resolve the URI's filesystem path. Our URI synthetic has been
             // populated by `url_parse` (URL.toURI), which writes by INDEX —
             // not by name — into slots 0..5. The real-JDK `URI` field
@@ -5327,6 +5367,15 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         "(Ljava/net/URI;)Ljava/nio/file/Path;",
         |ctx, args| {
             let uri = obj_arg(args, 1)?;
+            // Opaque file-scheme URIs (`file:.`) are not hierarchical — the
+            // real JDK's *UriSupport.fromUri throws instead of producing a
+            // path. (Spring's PathEditor depends on this throw.)
+            if p57_uri_is_opaque_file(&p57_uri_full_text(ctx, uri)) {
+                return Err(RuntimeError::IllegalArgumentException {
+                    message: "URI is not hierarchical".to_string(),
+                }
+                .into());
+            }
             // URI field 4 is the path component (from our toUri registration)
             let path_str = match ctx.get_field(uri, 4) {
                 Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
@@ -8602,6 +8651,18 @@ fn p57_uri_full_text(ctx: &mut dyn NativeContext, uri: ObjectRef) -> String {
         .unwrap_or_default()
 }
 
+/// Returns true if `text` is a `file:`-scheme URI in *opaque* form — its
+/// scheme-specific part does not begin with '/', e.g. `file:.` or `file:foo`.
+/// The real JDK's `Paths.get(URI)` / `Path.of(URI)` route file-scheme URIs
+/// through `Windows/UnixUriSupport.fromUri`, which rejects opaque URIs with
+/// `IllegalArgumentException("URI is not hierarchical")`. Spring's
+/// `PathEditor`/`FileEditor` rely on that throw to fall back to the resource
+/// mechanism (e.g. `setAsText("file:.")`).
+fn p57_uri_is_opaque_file(text: &str) -> bool {
+    text.strip_prefix("file:")
+        .is_some_and(|rest| !rest.starts_with('/'))
+}
+
 /// Convert `jar:file:/C:/x.jar!/entry` / `file:///C:/x.jar` URI text to the
 /// OS path of the backing JAR file. Returns `None` for text that does not
 /// look like a file-backed URI (empty / unparseable).
@@ -10362,6 +10423,67 @@ fn strip_unc(p: &str) -> String {
     }
 }
 
+/// String-based path canonicalization via Win32 `GetFullPathNameW` — makes the
+/// path absolute, collapses `.`/`..`, converts `/` to `\`, and strips a trailing
+/// separator, all WITHOUT opening the file (so the `cpcrypt` filesystem filter is
+/// never triggered, unlike `std::fs::canonicalize`/`GetFinalPathNameByHandleW`).
+/// Returns `None` for an empty input or on API error so the caller can fall back
+/// to the pure-Rust lexical normalizer. Does NOT resolve symlinks — matching
+/// HotSpot's largely-string-based `WinNTFileSystem.canonicalize`.
+#[cfg(windows)]
+fn win_get_full_path_name(path: &str) -> Option<String> {
+    if path.is_empty() {
+        return None;
+    }
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+    extern "system" {
+        fn GetFullPathNameW(
+            lpFileName: *const u16,
+            nBufferLength: u32,
+            lpBuffer: *mut u16,
+            lpFilePart: *mut *mut u16,
+        ) -> u32;
+    }
+    // Normalize the URI-style leading `/C:` quirk and forward slashes first, so a
+    // raw `/C:/foo` doesn't confuse GetFullPathName into a per-drive-relative join.
+    let norm = file_normalise_path(path);
+    let wide: Vec<u16> = std::ffi::OsStr::new(&norm)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    unsafe {
+        // First call (null buffer) returns the required length INCLUDING the NUL.
+        let needed = GetFullPathNameW(wide.as_ptr(), 0, std::ptr::null_mut(), std::ptr::null_mut());
+        if needed == 0 {
+            return None;
+        }
+        let mut buf: Vec<u16> = vec![0u16; needed as usize];
+        // Second call returns the length WITHOUT the NUL on success.
+        let written = GetFullPathNameW(
+            wide.as_ptr(),
+            buf.len() as u32,
+            buf.as_mut_ptr(),
+            std::ptr::null_mut(),
+        );
+        if written == 0 || written as usize >= buf.len() {
+            return None;
+        }
+        buf.truncate(written as usize);
+        let full = std::ffi::OsString::from_wide(&buf)
+            .to_string_lossy()
+            .into_owned();
+        // GetFullPathNameW preserves a trailing separator (`foo\bar\`), but the JDK's
+        // canonicalize drops it (`foo\bar`). Strip a single trailing `\` unless the
+        // result is a drive root (`C:\`) or a bare root (`\`), which must keep it.
+        let trimmed = if full.ends_with('\\') && !full.ends_with(":\\") && full.len() > 1 {
+            full.trim_end_matches('\\').to_string()
+        } else {
+            full
+        };
+        Some(trimmed)
+    }
+}
+
 /// Canonicalize a `java.io.File` path the way `File.getCanonicalPath()` does.
 ///
 /// `std::fs::canonicalize` only works for paths that *exist* on disk; the real
@@ -10371,11 +10493,78 @@ fn strip_unc(p: &str) -> String {
 /// containment check (`child.startsWith(parentDir)`) — as Felix's
 /// `getDataFile` does — would spuriously fail.
 fn file_canonicalize_path(path: &str) -> String {
-    // First try the real filesystem call (resolves symlinks for existing paths).
-    if let Ok(c) = std::fs::canonicalize(path) {
-        return strip_unc(&c.to_string_lossy());
+    // JDK-faithful canonicalization cache. The real `WinNTFileSystem.canonicalize`
+    // fronts a 30s `ExpiringCache` for exactly this reason: Tomcat (and most apps)
+    // re-resolve the same docBase/appBase/work/temp paths on every start, and each
+    // `std::fs::canonicalize` here OPENS the file → `GetFinalPathNameByHandleW`,
+    // which on this box can stall for seconds inside the Crypto Pro `cpcrypt.dll`
+    // filesystem filter. Caching keeps repeated `File.getCanonicalPath()` off the
+    // filesystem (and the filter), cutting both per-call latency and the stall
+    // variance that otherwise pushes a heavy parameterized Tomcat-churn test
+    // (~144 full start/stop cycles) past its timeout.
+    use std::sync::{Mutex, OnceLock};
+    use std::time::{Duration, Instant};
+    static CACHE: OnceLock<Mutex<std::collections::HashMap<String, (String, Instant)>>> =
+        OnceLock::new();
+    const TTL: Duration = Duration::from_secs(30);
+    let cache = CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+    if let Some((canon, at)) = cache.lock().unwrap().get(path) {
+        if at.elapsed() < TTL {
+            return canon.clone();
+        }
     }
-    // Path doesn't exist — normalize lexically. Make absolute against CWD.
+    let result = file_canonicalize_path_uncached(path);
+    {
+        let mut c = cache.lock().unwrap();
+        // Bound memory: a long-running app may canonicalize many distinct paths.
+        if c.len() > 8192 {
+            c.clear();
+        }
+        c.insert(path.to_string(), (result.clone(), Instant::now()));
+    }
+    result
+}
+
+fn file_canonicalize_path_uncached(path: &str) -> String {
+    #[cfg(windows)]
+    {
+        // DEFAULT on Windows: canonicalize the path as a STRING via `GetFullPathNameW`,
+        // which makes it absolute (against the cwd / per-drive cwd), collapses `.`/`..`,
+        // normalizes separators, and drops trailing separators — all WITHOUT opening the
+        // file. This mirrors HotSpot's `WinNTFileSystem.canonicalize`, which is largely
+        // string-based (`GetFullPathName`) and, like us, does NOT fully resolve symlinks
+        // the way `realpath`/`std::fs::canonicalize` does.
+        //
+        // Why this matters here: `std::fs::canonicalize` opens the file
+        // (`GetFinalPathNameByHandleW` → `NtQueryInformationFile`), which on a box with
+        // the Crypto Pro `cpcrypt.dll` AppCompat filesystem filter loaded triggers the
+        // filter on EVERY `File.getCanonicalPath()` and can stall for ~30s globally.
+        // `GetFullPathNameW` touches no file handle, so the filter is never engaged.
+        // HotSpot is immune for the same reason. (cf. memory notes
+        // tomcat_dohead_speed_oncpu_not_shutdown / tomcat_dohead_gc_safepoint_deadlock.)
+        //
+        // Escape hatch: set `CRATONVM_CANON_OPENFILE=1` to restore the old, symlink-
+        // resolving, file-opening behavior if an app genuinely needs realpath semantics.
+        if std::env::var_os("CRATONVM_CANON_OPENFILE").is_some() {
+            if let Ok(c) = std::fs::canonicalize(path) {
+                return strip_unc(&c.to_string_lossy());
+            }
+        } else if let Some(full) = win_get_full_path_name(path) {
+            return strip_unc(&full);
+        }
+        // GetFullPathNameW failed (empty input / API error) — fall through to the
+        // pure-Rust lexical normalization below.
+    }
+    #[cfg(not(windows))]
+    {
+        // Non-Windows has no cpcrypt-style filter hazard, so keep the symlink-resolving
+        // filesystem call for existing paths; fall through to lexical for non-existent.
+        if let Ok(c) = std::fs::canonicalize(path) {
+            return strip_unc(&c.to_string_lossy());
+        }
+    }
+    // Lexical fallback: normalize the path as a string without touching the filesystem.
+    // Make absolute against CWD, collapse `.`/`..`, normalize separators.
     let norm = file_normalise_path(path);
     let p = std::path::Path::new(&norm);
     let abs: std::path::PathBuf = if p.is_absolute() {
@@ -12604,7 +12793,38 @@ fn p58_cf_exceptionally(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     Ok(Some(Value::Object(Some(cf))))
 }
 
-fn p58_cf_all_of(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+fn p58_cf_all_of(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // Real-JDK async inputs (e.g. `CompletableFuture.runAsync` on a worker) may still
+    // be PENDING. Delegate to the real JDK private static `andTree` (== the body of
+    // the real `allOf`) so the returned CF completes only when every input does,
+    // instead of the eager "all already complete" model below which makes
+    // `allOf(...).join()` return immediately while tasks run. See `p58_cf_when_complete`
+    // (BUG-17) for the same real-JDK delegation pattern.
+    if let Some(Value::Object(Some(arr))) = args.first() {
+        let arr = *arr;
+        let len = ctx.array_length(arr);
+        let mut any_real = false;
+        for i in 0..len {
+            if let Value::Object(Some(cf)) = ctx.get_array_element(arr, i) {
+                if !matches!(ctx.get_field(cf, FUT_FIELD_DONE), Value::Int(_)) {
+                    any_real = true;
+                    break;
+                }
+            }
+        }
+        if any_real {
+            return ctx.invoke_special(
+                "java/util/concurrent/CompletableFuture",
+                "andTree",
+                "([Ljava/util/concurrent/CompletableFuture;II)Ljava/util/concurrent/CompletableFuture;",
+                &[
+                    Value::Object(Some(arr)),
+                    Value::Int(0),
+                    Value::Int(len as i32 - 1),
+                ],
+            );
+        }
+    }
     // All futures are already complete in our eager model
     let cf = p58_new_cf(ctx, Value::Object(None), true);
     Ok(Some(Value::Object(Some(cf))))
@@ -17853,7 +18073,69 @@ pub(crate) fn register_p59_spliterator(r: &mut NativeMethodRegistry) {
         "()Ljava/util/Spliterator;",
         p59_hashset_spliterator,
     );
+    // Synthetic-stream `spliterator()` — see `p_int_stream_spliterator`. Routed
+    // here for synthetic stream objects (stamped with the bare interface class)
+    // via the no-Code receiver-walk rescue; real `*Pipeline` streams keep their
+    // own bytecode. Fixes real JDK stream code (e.g. `IntStream.concat` →
+    // `a.spliterator()`) that the synthetic streams otherwise can't satisfy.
+    r.register(
+        "java/util/stream/IntStream",
+        "spliterator",
+        "()Ljava/util/Spliterator$OfInt;",
+        p_int_stream_spliterator,
+    );
+    r.register(
+        "java/util/stream/LongStream",
+        "spliterator",
+        "()Ljava/util/Spliterator$OfLong;",
+        p_long_stream_spliterator,
+    );
+    r.register(
+        "java/util/stream/DoubleStream",
+        "spliterator",
+        "()Ljava/util/Spliterator$OfDouble;",
+        p_double_stream_spliterator,
+    );
+    register_synthetic_stream_spliterators(r);
     r.set_category(__prev_cat);
+}
+
+/// Register the synthetic-stream `spliterator()` natives. Called from BOTH the
+/// synthetic-JDK path (`register_p59_spliterator`) and the real-JDK path
+/// (`register_essential_natives`) — synthetic stream objects (stamped with the
+/// bare `java/util/stream/*Stream` interface, slot 0 = element array) are
+/// produced in real-JDK mode too (e.g. `OptionalInt.stream()`), and real JDK
+/// stream code (`IntStream.concat` → `a.spliterator()`; JUnit's
+/// `getLegacyReportingIndexes`) then calls `spliterator()` on them. Without a
+/// native the call falls to the abstract interface method → AbstractMethodError.
+pub(crate) fn register_synthetic_stream_spliterators(r: &mut NativeMethodRegistry) {
+    let __prev = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
+    r.register(
+        "java/util/stream/IntStream",
+        "spliterator",
+        "()Ljava/util/Spliterator$OfInt;",
+        p_int_stream_spliterator,
+    );
+    r.register(
+        "java/util/stream/LongStream",
+        "spliterator",
+        "()Ljava/util/Spliterator$OfLong;",
+        p_long_stream_spliterator,
+    );
+    r.register(
+        "java/util/stream/DoubleStream",
+        "spliterator",
+        "()Ljava/util/Spliterator$OfDouble;",
+        p_double_stream_spliterator,
+    );
+    r.register(
+        "java/util/stream/Stream",
+        "spliterator",
+        "()Ljava/util/Spliterator;",
+        p_obj_stream_spliterator,
+    );
+    r.set_category(__prev);
 }
 
 fn p59_stream_from_spliterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -17871,6 +18153,102 @@ fn p59_stream_from_spliterator(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     let stream = alloc_concurrent_synthetic(ctx, "java/util/stream/Stream", 1);
     ctx.set_field(stream, 0, Value::Object(Some(arr)));
     Ok(Some(Value::Object(Some(stream))))
+}
+
+/// `{Int,Long,Double}Stream.spliterator()` / `Stream.spliterator()` on a
+/// SYNTHETIC stream object (one stamped with the bare `java/util/stream/*Stream`
+/// interface class, slot 0 = element array). Real JDK stream code calls
+/// `spliterator()` on these — e.g. `IntStream.concat(a,b)` does `a.spliterator()`,
+/// and JUnit's `JupiterTestDescriptor.getLegacyReportingIndexes` (run for EVERY
+/// dynamic/parameterized test via `TestIdentifier.from`) builds exactly such a
+/// concat. Since the receiver is the bare interface there is no concrete
+/// `spliterator()` override, so dispatch fell to the abstract interface method
+/// → `AbstractMethodError: IntStream.spliterator()...OfInt has no Code attribute`
+/// → swallowed by the launcher → the dynamic test never registered (whole
+/// parameterized classes reported EMPTY/found=0). Build a real primitive array
+/// from the synthetic elements and delegate to the real
+/// `java.util.Spliterators.spliterator(...)`, returning a genuine
+/// `Spliterator.OfInt/OfLong/OfDouble`/`Spliterator` the JDK machinery consumes.
+pub(crate) fn p_int_stream_spliterator(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let elems = p56_read_stream_elems(ctx, this);
+    let n = elems.len();
+    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Int, n);
+    for (i, v) in elems.into_iter().enumerate() {
+        let iv = match v {
+            Value::Int(x) => Value::Int(x),
+            Value::Object(Some(o)) => ctx.get_field(o, 0),
+            _ => Value::Int(0),
+        };
+        ctx.set_array_element(arr, i, iv);
+    }
+    ctx.invoke(
+        "java/util/Spliterators",
+        "spliterator",
+        "([IIII)Ljava/util/Spliterator$OfInt;",
+        &[Value::Object(Some(arr)), Value::Int(0), Value::Int(n as i32), Value::Int(0)],
+    )
+}
+
+pub(crate) fn p_long_stream_spliterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let elems = p56_read_stream_elems(ctx, this);
+    let n = elems.len();
+    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Long, n);
+    for (i, v) in elems.into_iter().enumerate() {
+        let lv = match v {
+            Value::Long(x) => Value::Long(x),
+            Value::Object(Some(o)) => ctx.get_field(o, 0),
+            _ => Value::Long(0),
+        };
+        ctx.set_array_element(arr, i, lv);
+    }
+    ctx.invoke(
+        "java/util/Spliterators",
+        "spliterator",
+        "([JIII)Ljava/util/Spliterator$OfLong;",
+        &[Value::Object(Some(arr)), Value::Int(0), Value::Int(n as i32), Value::Int(0)],
+    )
+}
+
+pub(crate) fn p_double_stream_spliterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let elems = p56_read_stream_elems(ctx, this);
+    let n = elems.len();
+    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Double, n);
+    for (i, v) in elems.into_iter().enumerate() {
+        let dv = match v {
+            Value::Double(x) => Value::Double(x),
+            Value::Object(Some(o)) => ctx.get_field(o, 0),
+            _ => Value::Double(0.0),
+        };
+        ctx.set_array_element(arr, i, dv);
+    }
+    ctx.invoke(
+        "java/util/Spliterators",
+        "spliterator",
+        "([DIII)Ljava/util/Spliterator$OfDouble;",
+        &[Value::Object(Some(arr)), Value::Int(0), Value::Int(n as i32), Value::Int(0)],
+    )
+}
+
+pub(crate) fn p_obj_stream_spliterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let elems = p56_read_stream_elems(ctx, this);
+    let n = elems.len();
+    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, n);
+    for (i, v) in elems.into_iter().enumerate() {
+        ctx.set_array_element(arr, i, v);
+    }
+    ctx.invoke(
+        "java/util/Spliterators",
+        "spliterator",
+        "([Ljava/lang/Object;III)Ljava/util/Spliterator;",
+        &[Value::Object(Some(arr)), Value::Int(0), Value::Int(n as i32), Value::Int(0)],
+    )
 }
 
 fn p59_int_stream_from_spliterator(

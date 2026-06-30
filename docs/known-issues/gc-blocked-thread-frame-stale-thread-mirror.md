@@ -1,8 +1,33 @@
 # GC: live young `java.lang.Thread` mirror in a blocked thread's frame reclaimed by the young collector (Tomcat real-net/real-AQS HARD CRASHES)
 
 **Status:** 🟢 **Thread-mirror manifestation RESOLVED via stale-mirror recovery** (the
-`this.holder is null` NPE family); 🟠 the **underlying frame/operand remap-coverage gap remains
-open** for non-`Thread` objects.
+`this.holder is null` NPE family); 🟢 **the JIT-spill half of the non-`Thread` gap is now fixed**
+(see "Partial fix" below — the Tomcat DoHead AQS `ConditionObject`/`ConditionNode` flood drops
+~99.8%); 🟠 a register-resident remainder still leaks (JIT `await` keeping the oop in a non-volatile
+register across `park`, never spilled — the precise-oop-map / register-invisibility family).
+
+**Partial fix (deposit-path JIT-frame parity, branch `claude/beautiful-satoshi-5c4027`).** The
+blocking-deposit snapshot builder `NativeContextImpl::deposit_root_snapshot` (`vm/src/vm/vm_exec.rs`)
+was the **only** root-snapshot builder that did NOT fold in the active-JIT-frame conservative scan
+that the safepoint builder `interpreter::update_root_snapshot` already runs
+(`scan_active_jit_frames` + the shadow-stack fold). So a worker parking **inside a JIT-compiled**
+`AbstractQueuedSynchronizer$ConditionObject.await` deposited a snapshot with **no JIT roots**: when
+`LifecycleBase.stop()` tore the executor down (making the `ConditionObject` heap-unreachable so it
+was kept alive only by the parked frame), a cross-thread STW young sweep — which marks a parked
+thread **only** from its deposited snapshot — reclaimed the live `ConditionObject` and its
+`firstWaiter`→`ConditionNode` chain. Fix = call `scan_active_jit_frames` (+ shadow fold) in
+`deposit_root_snapshot`, identical to the safepoint path; `deposit_root_snapshot` always runs on the
+parking thread itself, so the thread-local JIT scan is the SAFE single-thread-in-JIT case. Measured
+on `…DoHeadInvalidWrite0ValidWrite0` (idx 28): the AQS `ConditionObject` stale-receiver flood at
+sub-test ~77 drops from **54810 (runaway → crash)** to **~2–108 (contained, no crash)**.
+
+**REJECTED follow-up: conservative live-register capture.** An inline-asm capture of the parked
+thread's non-volatile registers (`rbx,rbp,rsi,rdi,r12-r15`) as extra roots — to close the
+register-resident remainder — was tried and **reverted**: it makes the flood WORSE, not better. On
+the safepoint path it triggered a runaway `NioEndpoint$Poller` flood; on the deposit path it pushed
+the AQS flood back up to 9069/120639. The captured registers are mostly false positives; pinning them
+under the non-moving sweep over-retains young, raises GC pressure, and exacerbates the reclamation.
+The remainder needs **precise oop maps**, not conservative register pinning.
 
 **Resolution (Thread mirrors).** A moving / promoting young GC relocates a thread's
 `java.lang.Thread` mirror and correctly remaps the registry + per-thread `java_thread_obj` field,
@@ -161,3 +186,10 @@ the unrelated minor IBM850/CP850 charset (`UnsupportedEncodingException: ibm850`
    stale `root_snapshot` while flagged `in_blocked_region` (refresh/clear on the blocking native's
    wake path), and audit that the real-net (`native-io`) and real-AQS park natives bracket with
    `begin_blocking_region`/`end_blocking_region`.
+3. ✅ **DONE (deposit-path JIT-frame parity):** `deposit_root_snapshot` now folds in
+   `scan_active_jit_frames` + the shadow-stack roots exactly like the safepoint `update_root_snapshot`
+   — closing the JIT-spill half of the blocked-thread coverage gap (see "Partial fix" above).
+4. **Remaining:** the register-resident remainder (oop kept in a non-volatile register across `park`,
+   never spilled). Needs precise oop maps / a shadow stack for parked JIT frames — conservative
+   register pinning is counterproductive (see "REJECTED follow-up"). Tracked with the
+   register-invisibility family (`SB-CRASH-04` / precise-jit-stack-maps).

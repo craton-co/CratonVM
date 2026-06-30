@@ -387,8 +387,19 @@ impl ThreadRegistry {
 
     /// Mark a thread as dead (called when the thread finishes execution).
     pub fn mark_dead(&self, thread_id: ThreadId) {
-        if let Some(entry) = self.threads.lock().get(&thread_id) {
+        if let Some(entry) = self.threads.lock().get_mut(&thread_id) {
             entry.alive.store(false, Ordering::Release);
+            // Reclaim the OS thread handle. Tomcat's poller/acceptor/pool
+            // threads are daemon threads that are never `join()`ed, so their
+            // `JoinHandle` would otherwise sit in the registry forever, leaking
+            // the underlying Windows thread HANDLE. Across heavy short-lived
+            // thread churn — e.g. a parameterized test that starts and stops a
+            // whole Tomcat instance ~140 times — this leaks hundreds of thread
+            // handles (observed: 219 Thread handles for ~21 live threads),
+            // adding steady per-iteration overhead. The thread has finished, so
+            // dropping the handle simply detaches it; a later `join()` of an
+            // already-dead thread still returns immediately (see `join`).
+            entry.join_handle.take();
         }
     }
 

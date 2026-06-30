@@ -9809,19 +9809,30 @@ const BOS_FIELD_BUF: usize = 1;
 const BOS_FIELD_COUNT: usize = 2;
 const _BOS_NUM_FIELDS: usize = 3;
 
-/// Resolve BufferedOutputStream's `buf` and `count` slot indices via the
-/// real-JDK class metadata, falling back to the legacy synthetic layout
-/// when the class isn't loaded as a real-JDK class. The `out` slot is
-/// always at absolute index 0 (FilterOutputStream's first instance field
-/// inherits to slot 0 of any subclass) so we don't bother resolving it.
-fn bos_slots(ctx: &dyn NativeContext) -> (usize, usize) {
+/// Resolve BufferedOutputStream's `out` (inherited from FilterOutputStream),
+/// `buf` and `count` slot indices via the real-JDK class metadata, falling
+/// back to the legacy synthetic layout when the class isn't loaded as a
+/// real-JDK class.
+///
+/// `out` MUST be resolved, not hardcoded to 0: in the real-JDK compact layout
+/// `buf` can land at slot 0, so storing `out` at a hardcoded slot 0 in
+/// `native_bos_init` and then `buf` at the resolved `buf` slot 0 CLOBBERS
+/// `out` with the byte[] buffer. A subsequent `out.write(int)` then dispatches
+/// `write(I)V` against the byte[] (whose only methods are Object's) →
+/// `NoSuchMethodError: java/lang/Object.write(I)V` (seen wrapping a real
+/// java.net.Socket output stream under CRATONVM_REAL_NET_SOCKETS).
+fn bos_slots(ctx: &dyn NativeContext) -> (usize, usize, usize) {
+    let out = ctx
+        .resolve_field_index("java/io/BufferedOutputStream", "out")
+        .or_else(|| ctx.resolve_field_index("java/io/FilterOutputStream", "out"))
+        .unwrap_or(BOS_FIELD_OUT);
     let buf = ctx
         .resolve_field_index("java/io/BufferedOutputStream", "buf")
         .unwrap_or(BOS_FIELD_BUF);
     let count = ctx
         .resolve_field_index("java/io/BufferedOutputStream", "count")
         .unwrap_or(BOS_FIELD_COUNT);
-    (buf, count)
+    (out, buf, count)
 }
 
 fn register_buffered_stream_natives(registry: &mut NativeMethodRegistry) {
@@ -10158,8 +10169,8 @@ fn native_bos_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     };
     let inner = args.get(1).cloned().unwrap_or(Value::Object(None));
     let buf = ctx.new_array(ArrayElementType::Byte, 8192);
-    let (buf_slot, count_slot) = bos_slots(ctx);
-    ctx.set_field(this, BOS_FIELD_OUT, inner);
+    let (out_slot, buf_slot, count_slot) = bos_slots(ctx);
+    ctx.set_field(this, out_slot, inner);
     ctx.set_field(this, buf_slot, Value::Object(Some(buf)));
     ctx.set_field(this, count_slot, Value::Int(0));
     Ok(None)
@@ -10176,8 +10187,8 @@ fn native_bos_init_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         _ => 8192,
     };
     let buf = ctx.new_array(ArrayElementType::Byte, size.max(1) as usize);
-    let (buf_slot, count_slot) = bos_slots(ctx);
-    ctx.set_field(this, BOS_FIELD_OUT, inner);
+    let (out_slot, buf_slot, count_slot) = bos_slots(ctx);
+    ctx.set_field(this, out_slot, inner);
     ctx.set_field(this, buf_slot, Value::Object(Some(buf)));
     ctx.set_field(this, count_slot, Value::Int(0));
     Ok(None)
@@ -10192,7 +10203,7 @@ fn native_bos_write(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         Some(Value::Int(v)) => *v,
         _ => 0,
     };
-    let (buf_slot, count_slot) = bos_slots(ctx);
+    let (out_slot, buf_slot, count_slot) = bos_slots(ctx);
     let count = match ctx.get_field(this, count_slot) {
         Value::Int(v) => v,
         _ => 0,
@@ -10205,7 +10216,7 @@ fn native_bos_write(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     if count >= buf_len {
         // Flush buffer to output stream then write
         native_bos_flush(ctx, args)?;
-        let inner = match ctx.get_field(this, BOS_FIELD_OUT) {
+        let inner = match ctx.get_field(this, out_slot) {
             Value::Object(Some(o)) => o,
             _ => return Ok(None),
         };
@@ -10246,7 +10257,7 @@ fn native_bos_flush(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
     };
-    let (buf_slot, count_slot) = bos_slots(ctx);
+    let (out_slot, buf_slot, count_slot) = bos_slots(ctx);
     let count = match ctx.get_field(this, count_slot) {
         Value::Int(v) => v,
         _ => 0,
@@ -10256,15 +10267,26 @@ fn native_bos_flush(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
             Value::Object(Some(b)) => b,
             _ => return Ok(None),
         };
-        let inner = match ctx.get_field(this, BOS_FIELD_OUT) {
+        let inner = match ctx.get_field(this, out_slot) {
             Value::Object(Some(o)) => o,
             _ => return Ok(None),
         };
-        for i in 0..count as usize {
-            let b = ctx.get_array_element(buf, i);
-            ctx.invoke_virtual(inner, "write", "(I)V", &[b])?;
-        }
+        // Reset count BEFORE the write so we hold no native-local oop across the
+        // invoke: a single bulk `out.write(buf, 0, count)` (matches the real
+        // BufferedOutputStream.flushBuffer) instead of a per-byte `write(int)`
+        // loop. The loop held `buf`/`inner`/`this` across N invoke_virtual calls;
+        // a GC firing mid-loop (now that blocking I/O no longer deadlocks STW)
+        // would strand those un-rooted native locals → a relocated `inner`
+        // dispatches `write` against garbage (seen as `Object.write(I)V`). `buf`
+        // and `inner` are passed AS ARGS to the single invoke (rooted for its
+        // duration); nothing is read back afterward.
         ctx.set_field(this, count_slot, Value::Int(0));
+        ctx.invoke_virtual(
+            inner,
+            "write",
+            "([BII)V",
+            &[Value::Object(Some(buf)), Value::Int(0), Value::Int(count)],
+        )?;
     }
     Ok(None)
 }
@@ -10292,7 +10314,8 @@ fn native_bos_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     native_bos_flush(ctx, args)?;
     // 2) Close the inner stream (matches the JDK
     //    `try (out) {}` block in BufferedOutputStream.close).
-    if let Value::Object(Some(inner)) = ctx.get_field(this, BOS_FIELD_OUT) {
+    let (out_slot, _, _) = bos_slots(ctx);
+    if let Value::Object(Some(inner)) = ctx.get_field(this, out_slot) {
         ctx.invoke_virtual(inner, "close", "()V", &[])?;
     }
     Ok(None)

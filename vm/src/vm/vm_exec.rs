@@ -1252,6 +1252,51 @@ impl<'a> NativeContextImpl<'a> {
             snapshot.push(exc);
         }
 
+        // Cross-thread JIT-root hardening — the BLOCKING-deposit counterpart of
+        // the identical fold in `interpreter::update_root_snapshot` (the
+        // safepoint path). Publish the conservative roots of every active JIT
+        // frame on THIS thread into the snapshot.
+        //
+        // A worker that parks via this path while inside a JIT-compiled frame
+        // (e.g. `AbstractQueuedSynchronizer$ConditionObject.await` holding the
+        // receiver `ConditionObject` and the local `ConditionNode` in JIT spill
+        // slots) would otherwise deposit a snapshot that OMITS those roots: this
+        // `deposit_root_snapshot` only scanned the interpreter `frames`,
+        // `native_pin_roots`, and the thread mirror. A cross-thread
+        // stop-the-world young collector marks a parked thread ONLY from this
+        // deposited snapshot (it never runs `collect_roots` — nor the
+        // thread-local `scan_active_jit_frames` — FOR a non-current thread), so
+        // the JIT-held objects were unreachable and the non-moving young sweep
+        // reclaimed them while still live → the all-zero-header
+        // `ConditionNode`/`ConditionObject` flood during Tomcat
+        // `LifecycleBase.stop()` (executor/poller/utility threads parked on a
+        // `Condition`), then the `implicit monitorexit … does not own the
+        // monitor` cascade and NPEs. `deposit_root_snapshot` ALWAYS runs on the
+        // thread it is snapshotting (the parking thread's own native context),
+        // so this thread-local scan captures exactly this worker's live JIT
+        // spill region — the SAFE single-thread-in-JIT case documented in
+        // `conservative_roots::scan_active_jit_frames`. It is a no-op when no
+        // JIT frame is on this thread's stack (socket read / sleep / join /
+        // ReferenceQueue.remove), false positives are filtered by
+        // `is_object_address`, and they can only over-retain (the young sweep
+        // runs non-moving while any thread is in JIT, so nothing is relocated).
+        crate::jit::conservative_roots::scan_active_jit_frames(
+            &self.shared.heap,
+            &mut snapshot,
+        );
+        // Shadow-stack precise roots (mirrors the same fold in
+        // `update_root_snapshot`): under `CRATONVM_SHADOW_STACK` the moving
+        // collector may run with threads in JIT, so a cross-thread STW cycle
+        // must see a parked worker's shadow-held oops or they are reclaimed.
+        // No-op when the gate is off or the shadow stack is empty.
+        if crate::jit::conservative_roots::shadow_stack_enabled() {
+            self.thread.shadow_stack.for_each_value(|v| {
+                if let Some(obj_ref) = self.shared.heap.is_object_address(v) {
+                    snapshot.push(obj_ref);
+                }
+            });
+        }
+
         drop(snapshot);
         // Publish a line-less frame trace alongside the root snapshot so another
         // thread can read where THIS thread is parked (cross-thread
@@ -5187,6 +5232,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             // primitives at the SAM boundary so impl sees matched types).
             let sam_desc = lcs.sam_descriptor.clone();
             let impl_desc = lcs.impl_handle.descriptor.clone();
+            let inst_desc = lcs.instantiated_descriptor.clone();
             let (_, sam_ret) = crate::runtime::interpreter::split_method_descriptor(&sam_desc);
             let (_, impl_ret) = crate::runtime::interpreter::split_method_descriptor(&impl_desc);
             let receiver_present = matches!(
@@ -5198,6 +5244,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                 self.thread,
                 &sam_desc,
                 &impl_desc,
+                &inst_desc,
                 &mut full_args,
                 receiver_present,
                 num_captures,

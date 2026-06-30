@@ -986,6 +986,20 @@ fn initialize_class_shared(
                 ) {
                     post_clinit_fixup(shared, class_id, &class_name_for_jfr);
                 }
+                // FFM/Unsafe fix: `jdk/internal/misc/UnsafeConstants.<clinit>`
+                // zero-inits ADDRESS_SIZE0/PAGE_SIZE/BIG_ENDIAN/UNALIGNED_ACCESS/
+                // DATA_CACHE_LINE_FLUSH_SIZE and relies on the JVM to overwrite
+                // them with the real platform values during bootstrap (HotSpot
+                // does this natively). CratonVM never did, so `Unsafe.ADDRESS_SIZE`
+                // (= UnsafeConstants.ADDRESS_SIZE0) stayed 0. That broke FFM:
+                // `ValueLayout.<clinit>` builds the ADDRESS layout with
+                // byteAlignment = Unsafe.ADDRESS_SIZE = 0 → IllegalArgumentException
+                // "Invalid alignment: 0" → every FFM downcall binding's <clinit>
+                // (e.g. Tomcat openssl_h) fails. Backfill the real values on the
+                // success path, before `Unsafe.<clinit>` reads them.
+                if matches!(&*class_name_for_jfr, "jdk/internal/misc/UnsafeConstants") {
+                    post_clinit_fixup(shared, class_id, &class_name_for_jfr);
+                }
                 // (Removed) R15 WildFly Module.<clinit> post-success fixup.
                 // The earlier band-aid unconditionally overwrote
                 // `BOOT_MODULE_LOADER` (and conditionally backfilled
@@ -1921,6 +1935,26 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
     };
 
     match class_name {
+        "jdk/internal/misc/UnsafeConstants" => {
+            // Inject the platform constants HotSpot would set natively at
+            // bootstrap (see the success-path call site in `init_class`). All
+            // five fields default to 0/false from the real `<clinit>`; we patch
+            // them to the x86-64 / Windows values. Booleans use Value::Int(0|1).
+            //   ADDRESS_SIZE0            = 8     (64-bit native pointer)
+            //   PAGE_SIZE                = 4096  (Windows/x86-64 base page)
+            //   BIG_ENDIAN               = false (x86-64 is little-endian)
+            //   UNALIGNED_ACCESS         = true  (x86 permits unaligned access)
+            //   DATA_CACHE_LINE_FLUSH_SIZE = 0   (CLFLUSH writeback advertised
+            //                                     disabled: isWritebackEnabled()
+            //                                     == (size != 0) stays false)
+            let mut n = 0;
+            n += set_static_by_name("ADDRESS_SIZE0", Value::Int(8)) as i32;
+            n += set_static_by_name("PAGE_SIZE", Value::Int(4096)) as i32;
+            n += set_static_by_name("BIG_ENDIAN", Value::Int(0)) as i32;
+            n += set_static_by_name("UNALIGNED_ACCESS", Value::Int(1)) as i32;
+            n += set_static_by_name("DATA_CACHE_LINE_FLUSH_SIZE", Value::Int(0)) as i32;
+            tracing::warn!("Post-clinit fixup: UnsafeConstants populated ({n}/5)");
+        }
         // (Removed) "org/jboss/modules/Module" arm.
         //
         // Earlier this arm unconditionally overwrote `BOOT_MODULE_LOADER`
