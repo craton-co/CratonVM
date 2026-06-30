@@ -25003,6 +25003,107 @@ fn native_ts_sub_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     Ok(Some(Value::Object(Some(result))))
 }
 
+// --- NavigableSet range views (`tailSet`/`headSet`/`subSet` with inclusive
+// flags). The synthetic TreeSet keeps its elements in the `ts_state` side-table
+// and never populates the inherited backing `m` TreeMap, so the real-JDK
+// bytecode for these methods NPEs on a null `m` (`this.m.tailMap(...)`). Spring's
+// PathMatchingResourcePatternResolver scans cached jar entries via
+// `NavigableSet.tailSet(entry, false)`, which tripped exactly this. Drive them
+// from the side-table like the SortedSet-returning 1-/2-arg variants above. The
+// side-table data is kept in ascending order, so a single forward scan suffices.
+
+fn arg_bool(args: &[Value], idx: usize) -> bool {
+    matches!(args.get(idx), Some(Value::Int(v)) if *v != 0)
+}
+
+fn native_ts_tail_set_inclusive(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let from_elem = args.get(1).copied().unwrap_or(Value::Object(None));
+    let inclusive = arg_bool(args, 2);
+    let (data_opt, size, comparator) = ts_state(ctx, this);
+    let result = alloc_synthetic(ctx, "java/util/TreeSet", TS_NUM_FIELDS);
+    let buf = alloc_ref_array(ctx, TS_DEFAULT_CAPACITY);
+    ts_set_slot(ctx, result, TS_FIELD_DATA, Value::Object(Some(buf)));
+    ts_set_slot(ctx, result, TS_FIELD_SIZE, Value::Int(0));
+    ts_set_slot(ctx, result, TS_FIELD_COMPARATOR, comparator);
+    if let Some(data) = data_opt {
+        for i in 0..(size as usize) {
+            let e = ctx.get_array_element(data, i);
+            let cmp = tree_compare(ctx, &comparator, e, from_elem)?;
+            let keep = if inclusive { cmp >= 0 } else { cmp > 0 };
+            if keep {
+                native_ts_add(ctx, &[Value::Object(Some(result)), e])?;
+            }
+        }
+    }
+    Ok(Some(Value::Object(Some(result))))
+}
+
+fn native_ts_head_set_inclusive(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let to_elem = args.get(1).copied().unwrap_or(Value::Object(None));
+    let inclusive = arg_bool(args, 2);
+    let (data_opt, size, comparator) = ts_state(ctx, this);
+    let result = alloc_synthetic(ctx, "java/util/TreeSet", TS_NUM_FIELDS);
+    let buf = alloc_ref_array(ctx, TS_DEFAULT_CAPACITY);
+    ts_set_slot(ctx, result, TS_FIELD_DATA, Value::Object(Some(buf)));
+    ts_set_slot(ctx, result, TS_FIELD_SIZE, Value::Int(0));
+    ts_set_slot(ctx, result, TS_FIELD_COMPARATOR, comparator);
+    if let Some(data) = data_opt {
+        for i in 0..(size as usize) {
+            let e = ctx.get_array_element(data, i);
+            let cmp = tree_compare(ctx, &comparator, e, to_elem)?;
+            // Ascending order: once we pass the upper bound, stop.
+            let stop = if inclusive { cmp > 0 } else { cmp >= 0 };
+            if stop {
+                break;
+            }
+            native_ts_add(ctx, &[Value::Object(Some(result)), e])?;
+        }
+    }
+    Ok(Some(Value::Object(Some(result))))
+}
+
+fn native_ts_sub_set_inclusive(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let from_elem = args.get(1).copied().unwrap_or(Value::Object(None));
+    let from_inclusive = arg_bool(args, 2);
+    let to_elem = args.get(3).copied().unwrap_or(Value::Object(None));
+    let to_inclusive = arg_bool(args, 4);
+    let (data_opt, size, comparator) = ts_state(ctx, this);
+    let result = alloc_synthetic(ctx, "java/util/TreeSet", TS_NUM_FIELDS);
+    let buf = alloc_ref_array(ctx, TS_DEFAULT_CAPACITY);
+    ts_set_slot(ctx, result, TS_FIELD_DATA, Value::Object(Some(buf)));
+    ts_set_slot(ctx, result, TS_FIELD_SIZE, Value::Int(0));
+    ts_set_slot(ctx, result, TS_FIELD_COMPARATOR, comparator);
+    if let Some(data) = data_opt {
+        for i in 0..(size as usize) {
+            let e = ctx.get_array_element(data, i);
+            let cmp_lo = tree_compare(ctx, &comparator, e, from_elem)?;
+            let below = if from_inclusive { cmp_lo < 0 } else { cmp_lo <= 0 };
+            if below {
+                continue;
+            }
+            let cmp_hi = tree_compare(ctx, &comparator, e, to_elem)?;
+            let above = if to_inclusive { cmp_hi > 0 } else { cmp_hi >= 0 };
+            if above {
+                break;
+            }
+            native_ts_add(ctx, &[Value::Object(Some(result)), e])?;
+        }
+    }
+    Ok(Some(Value::Object(Some(result))))
+}
+
 fn native_ts_add_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
@@ -25539,6 +25640,27 @@ fn register_tree_set_natives(registry: &mut NativeMethodRegistry) {
         "subSet",
         "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/util/SortedSet;",
         native_ts_sub_set,
+    );
+    // NavigableSet range views (inclusive flags). The inherited bytecode reads
+    // the never-populated backing `m` TreeMap and NPEs; drive them from the
+    // side-table. (PMRPR's jar-entry scan calls `tailSet(entry, false)`.)
+    registry.register(
+        c,
+        "tailSet",
+        "(Ljava/lang/Object;Z)Ljava/util/NavigableSet;",
+        native_ts_tail_set_inclusive,
+    );
+    registry.register(
+        c,
+        "headSet",
+        "(Ljava/lang/Object;Z)Ljava/util/NavigableSet;",
+        native_ts_head_set_inclusive,
+    );
+    registry.register(
+        c,
+        "subSet",
+        "(Ljava/lang/Object;ZLjava/lang/Object;Z)Ljava/util/NavigableSet;",
+        native_ts_sub_set_inclusive,
     );
     registry.register(c, "addAll", "(Ljava/util/Collection;)Z", native_ts_add_all);
     registry.register(c, "stream", "()Ljava/util/stream/Stream;", native_ts_stream);

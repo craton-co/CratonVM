@@ -33981,6 +33981,79 @@ fn native_url_to_uri(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     url_parse(ctx, uri, &full);
     Ok(Some(Value::Object(Some(uri))))
 }
+/// Read a String-typed URL field, preferring the named lookup (correct for both
+/// real-JDK `java.net.URL` and our synthetic 13-slot URL, whose slots 0..=4
+/// coincide with the real layout) and falling back to the positional slot for
+/// fully-synthetic stubs whose named lookup misses.
+fn url_str_field(
+    ctx: &mut dyn NativeContext,
+    url: ObjectRef,
+    name: &str,
+    slot: usize,
+) -> Option<String> {
+    if let Value::Object(Some(s)) = ctx.get_field_by_name(url, name) {
+        return ctx.read_string(s);
+    }
+    if let Value::Object(Some(s)) = ctx.get_field(url, slot) {
+        return ctx.read_string(s);
+    }
+    None
+}
+
+/// Canonical key for `URL.equals`/`hashCode`: the URL's external form,
+/// reconstructed from the protocol/host/port/file/ref fields.
+///
+/// The previous implementation keyed off `URL_FIELD_FULL` (slot 5). For a
+/// real-JDK `java.net.URL` slot 5 is the `authority` field, NOT a full-string
+/// cache, so two semantically-equal URLs built via different paths — e.g.
+/// `new URL("file:myjar.jar")` (real ctor, authority=null) vs
+/// `URI.create("file:myjar.jar").toURL()` (our synthetic builder, which writes
+/// the full string into slot 5) — compared unequal and hashed differently.
+/// That broke `ResourceUtils.extractJarFileURL`/`extractArchiveURL` (and any
+/// `Set<URL>` dedup). Reconstructing the external form from the layout-stable
+/// component fields is identical regardless of how the URL was constructed.
+fn url_external_form(ctx: &mut dyn NativeContext, url: ObjectRef) -> String {
+    let proto = url_str_field(ctx, url, "protocol", URL_FIELD_PROTOCOL).unwrap_or_default();
+    if proto.is_empty() {
+        // Fully-synthetic stub with only the FULL string populated.
+        return match ctx.get_field(url, URL_FIELD_FULL) {
+            Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+            _ => String::new(),
+        };
+    }
+    let host = url_str_field(ctx, url, "host", URL_FIELD_HOST).unwrap_or_default();
+    let port = match ctx.get_field_by_name(url, "port") {
+        Value::Int(p) => p,
+        _ => match ctx.get_field(url, URL_FIELD_PORT) {
+            Value::Int(p) => p,
+            _ => -1,
+        },
+    };
+    // Slot 3 (URL_FIELD_PATH) is the real-JDK `file` field, which already
+    // includes any query string — exactly what `toExternalForm` appends.
+    let file = url_str_field(ctx, url, "file", URL_FIELD_PATH).unwrap_or_default();
+    let reff = match ctx.get_field_by_name(url, "ref") {
+        Value::Object(Some(s)) => ctx.read_string(s),
+        _ => None,
+    };
+    let mut out = String::with_capacity(proto.len() + host.len() + file.len() + 8);
+    out.push_str(&proto);
+    out.push(':');
+    if !host.is_empty() {
+        out.push_str("//");
+        out.push_str(&host);
+        if port >= 0 {
+            out.push(':');
+            out.push_str(&port.to_string());
+        }
+    }
+    out.push_str(&file);
+    if let Some(r) = reff {
+        out.push('#');
+        out.push_str(&r);
+    }
+    out
+}
 fn native_url_equals(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
@@ -33990,14 +34063,8 @@ fn native_url_equals(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let a = match ctx.get_field(this, URL_FIELD_FULL) {
-        Value::Object(Some(s)) => ctx.read_string(s),
-        _ => None,
-    };
-    let b = match ctx.get_field(other, URL_FIELD_FULL) {
-        Value::Object(Some(s)) => ctx.read_string(s),
-        _ => None,
-    };
+    let a = url_external_form(ctx, this);
+    let b = url_external_form(ctx, other);
     Ok(Some(Value::Int(if a == b { 1 } else { 0 })))
 }
 fn native_url_hash_code(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -34005,10 +34072,7 @@ fn native_url_hash_code(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let s = match ctx.get_field(this, URL_FIELD_FULL) {
-        Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
-        _ => String::new(),
-    };
+    let s = url_external_form(ctx, this);
     let mut h: i32 = 0;
     for b in s.bytes() {
         h = h.wrapping_mul(31).wrapping_add(b as i32);

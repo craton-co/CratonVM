@@ -4223,13 +4223,16 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         } else {
             format!("/{norm}")
         };
-        let uri_str = format!("file://{abs}");
+        // Percent-encode the path so chars like `#`/` `/`?` stay part of the path
+        // (matches HotSpot's `Path.toUri()` — see the other `toUri` registration).
+        let encoded = encode_file_uri_path(&abs);
+        let uri_str = format!("file://{encoded}");
         let uri = alloc_concurrent_synthetic(ctx, "java/net/URI", 7);
         let raw = ctx.create_string(&uri_str);
         ctx.set_field(uri, 0, Value::Object(Some(raw)));
         let scheme = ctx.create_string("file");
         ctx.set_field(uri, 1, Value::Object(Some(scheme)));
-        let path_str = ctx.create_string(&norm);
+        let path_str = ctx.create_string(&abs);
         ctx.set_field(uri, 4, Value::Object(Some(path_str)));
         Ok(Some(Value::Object(Some(uri))))
     });
@@ -7113,12 +7116,21 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             prefixed = format!("/{}", p);
             &prefixed
         };
-        let uri_str = format!("file://{}", slash_p);
+        // Percent-encode the path component, matching `java.nio.file.Path.toUri()`
+        // (and `File.toURI()`): a path char like `#`, ` `, `?` must be `%`-escaped
+        // so it stays part of the path rather than being parsed as a URI fragment
+        // or query. HotSpot renders `…/resource#test1.txt` as
+        // `file:///…/resource%23test1.txt`; leaving the `#` literal made
+        // `toUri().toURL()` drop everything after it (Spring's
+        // PathMatchingResourcePatternResolver URL/URI-syntax assertions).
+        let encoded = encode_file_uri_path(slash_p);
+        let uri_str = format!("file://{}", encoded);
         let uri = alloc_concurrent_synthetic(ctx, "java/net/URI", 5);
         let s = ctx.create_string(&uri_str);
         ctx.set_field(uri, 0, Value::Object(Some(s)));
-        // field 4 = path component
-        let path_s = ctx.create_string(&p);
+        // field 4 = (decoded) path component, with the leading-slash form the JDK
+        // exposes via `URI.getPath()` (e.g. `/C:/…/resource#test1.txt`).
+        let path_s = ctx.create_string(slash_p);
         ctx.set_field(uri, 4, Value::Object(Some(path_s)));
         Ok(Some(Value::Object(Some(uri))))
     });
