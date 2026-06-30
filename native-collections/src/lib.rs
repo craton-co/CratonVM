@@ -7297,30 +7297,29 @@ fn native_arrays_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
 }
 
 fn native_arrays_as_list(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // HotSpot's `Arrays.asList(T...)` returns a FIXED-SIZE
+    // `java.util.Arrays$ArrayList` backed directly by the supplied array — not a
+    // resizable `java.util.ArrayList`. The previous synthetic copy reported
+    // `getClass() == java.util.ArrayList`, was `instanceof ArrayList`, and let
+    // `add()` succeed, all of which diverge from real-JDK (SpEL
+    // IndexingTests.indexIntoPropertyContainingListOfList asserts the exact
+    // runtime type `java.util.Arrays$ArrayList<...>`). Delegate to the real
+    // nested-class constructor (`Arrays$ArrayList(E[])`, which stores the array
+    // and derives `size()` from `a.length`); all operations then run real
+    // bytecode, so `getClass()`/`instanceof`/`set` (OK) and `add`/`remove`
+    // (UnsupportedOperationException) match HotSpot. This is exactly what the
+    // real `Arrays.asList` bytecode does (`new Arrays$ArrayList; invokespecial`).
     let arr = match args.first() {
         Some(Value::Object(Some(a))) => *a,
-        _ => {
-            // Return empty list
-            let __al_n_fields = al_slots(ctx).2;
-            let list = alloc_synthetic(ctx, "java/util/ArrayList", __al_n_fields);
-            let buf = alloc_ref_array(ctx, AL_DEFAULT_CAPACITY);
-            al_set_data(ctx, list, buf);
-            al_set_size(ctx, list, 0);
-            return Ok(Some(Value::Object(Some(list))));
-        }
+        // `Arrays.asList((Object[]) null)` NPEs on the real JDK; build an empty
+        // fixed-size list defensively rather than abort.
+        _ => alloc_ref_array(ctx, 0),
     };
-    let len = ctx.array_length(arr);
-    let __al_n_fields = al_slots(ctx).2;
-    let list = alloc_synthetic(ctx, "java/util/ArrayList", __al_n_fields);
-    let cap = std::cmp::max(len, AL_DEFAULT_CAPACITY);
-    let buf = alloc_ref_array(ctx, cap);
-    for i in 0..len {
-        let val = ctx.get_array_element(arr, i);
-        ctx.set_array_element(buf, i, val);
-    }
-    al_set_data(ctx, list, buf);
-    al_set_size(ctx, list, len as i32);
-    Ok(Some(Value::Object(Some(list))))
+    ctx.new_object_initialized(
+        "java/util/Arrays$ArrayList",
+        "([Ljava/lang/Object;)V",
+        &[Value::Object(Some(arr))],
+    )
 }
 
 // ===========================================================================

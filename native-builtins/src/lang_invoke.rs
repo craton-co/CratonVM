@@ -5512,6 +5512,31 @@ fn collect_trailing_varargs(
     desc: &str,
     params: &[Value],
 ) -> Vec<Value> {
+    // Cheap pre-checks BEFORE the allocating `declared_methods` lookup, so the
+    // hot path (every static/virtual MethodHandle dispatch — Groovy/Gradle/
+    // Jackson/SpEL-compiled) pays only a descriptor parse, not a full
+    // declared-methods scan.
+    let (ptypes, _) = crate::lang_class::parse_descriptor_param_and_return(desc);
+    let p = ptypes.len();
+    let last = match ptypes.last() {
+        // Varargs ALWAYS has an array as its last parameter; if not, this can't
+        // be a varargs collection — return untouched.
+        Some(t) if t.starts_with('[') => t.clone(),
+        _ => return params.to_vec(),
+    };
+    // Already packed: exactly P args and the trailing one is an array (or null).
+    // Covers a correct `invokeExact`/pre-packed call AND e.g.
+    // `#formatPrimitiveVarargs('fmt', new int[]{1})`. No collection needed
+    // regardless of varargs-ness, so skip the method-table lookup entirely.
+    if params.len() == p {
+        match params.last() {
+            Some(Value::Object(Some(arr))) if ctx.object_is_array(*arr) => return params.to_vec(),
+            Some(Value::Object(None)) => return params.to_vec(),
+            _ => {}
+        }
+    }
+    // Only now (last param is an array AND args aren't packed) confirm the
+    // target is actually ACC_VARARGS before reshaping the arguments.
     let cid = match ctx.class_id_by_name(class) {
         Some(c) => c,
         None => return params.to_vec(),
@@ -5522,23 +5547,6 @@ fn collect_trailing_varargs(
         .any(|m| m.name == name && m.descriptor == desc && (m.access_flags & 0x0080) != 0);
     if !is_varargs {
         return params.to_vec();
-    }
-    let (ptypes, _) = crate::lang_class::parse_descriptor_param_and_return(desc);
-    let p = ptypes.len();
-    let last = match ptypes.last() {
-        // Varargs flag set but last param isn't an array — bail safe (unexpected).
-        Some(t) if t.starts_with('[') => t.clone(),
-        _ => return params.to_vec(),
-    };
-    // Already packed: exactly P args and the trailing one is an array (or null).
-    // This covers a correct `invokeExact`/pre-packed call AND e.g.
-    // `#formatPrimitiveVarargs('fmt', new int[]{1})`.
-    if params.len() == p {
-        match params.last() {
-            Some(Value::Object(Some(arr))) if ctx.object_is_array(*arr) => return params.to_vec(),
-            Some(Value::Object(None)) => return params.to_vec(),
-            _ => {}
-        }
     }
     let fixed = p - 1;
     if params.len() < fixed {
