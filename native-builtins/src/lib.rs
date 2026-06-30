@@ -3948,6 +3948,17 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         "(Ljava/lang/ref/SoftReference;I)Ljava/lang/Class$ReflectionData;",
         native_class_new_reflection_data,
     );
+    // Override the getter too so the read path consults the GC-safe cas side
+    // store instead of the dangling heap slot 11 (see
+    // `native_class_reflection_data`). Without this, the slot-11 SoftReference is
+    // reclaimed by a young GC (untracked old→young edge) and the reflection path
+    // faults on an all-zero `SoftReference` (Tomcat DoHead start/stop flood).
+    registry.register(
+        "java/lang/Class",
+        "reflectionData",
+        "()Ljava/lang/Class$ReflectionData;",
+        native_class_reflection_data,
+    );
 
     // T14/T15: Override Class.getResourceAsStream / getResource so that
     // real-JDK bytecode doesn't depend on the full Module subsystem during
@@ -17435,6 +17446,105 @@ fn class_atomic_side_store(
     T.get_or_init(|| parking_lot::Mutex::new(rustc_hash::FxHashMap::default()))
 }
 
+// =====================================================================
+// GC integration for the Unsafe / Class$Atomic side stores.
+//
+// `static_obj_store`, `synthetic_field_store` and `class_atomic_side_store`
+// each hold live `ObjectRef`s that exist in NO heap slot — the value is kept
+// only in the Rust-side map (this is the whole point of the synthetic-offset
+// scheme: the field's real heap slot is unknown to our layout, so the load /
+// CAS / store is serviced from the side channel). That makes every stored ref
+// a GC root that the collector cannot reach through the heap graph.
+//
+// They were "missed in the original sweep" (see the migration note above) —
+// migrated to parking_lot but never wired into root scanning / remapping.
+// The visible failure: `java.lang.Class$Atomic.casReflectionData` stows the
+// `SoftReference<ReflectionData>` for a Class mirror here; a young GC then
+// reclaims that still-live SoftReference (all-zero header) and the whole
+// reflection subgraph hanging off it decays — the Tomcat DoHead start/stop
+// corruption flood whose FIRST victim is always a `java/lang/ref/SoftReference`
+// (then cascading Method/Field/List/etc.). A moving GC instead relocates the
+// ref and leaves the side-store entry dangling. Mirror the established
+// `gc_scan_value_of_cache_roots` / `gc_update_value_of_cache_refs` pattern.
+// =====================================================================
+
+/// GC root scan hook — called from `vm/src/memory/roots.rs::collect_roots`.
+/// Reports every `ObjectRef` held in an Unsafe / Class$Atomic side store so
+/// the collector keeps it live (these refs live in no heap slot).
+pub fn gc_scan_unsafe_side_store_roots(out: &mut Vec<cratonvm_types::ObjectRef>) {
+    // Static-field fallback store (Unsafe.{CAS,get,put}Reference on a null
+    // receiver — absolute-offset static Object fields). Sharded.
+    for shard in static_obj_store().iter() {
+        let map = shard.lock();
+        for v in map.values() {
+            if let Some(o) = v {
+                out.push(*o);
+            }
+        }
+    }
+    // Per-object synthetic-offset store (Value-typed; only Object values are
+    // heap refs — Int/Long payloads are skipped).
+    {
+        let map = synthetic_field_store().lock();
+        for v in map.values() {
+            if let Value::Object(Some(o)) = v {
+                out.push(*o);
+            }
+        }
+    }
+    // Class$Atomic reflectionData / annotationType / annotationData slots.
+    {
+        let map = class_atomic_side_store().lock();
+        for v in map.values() {
+            if let Some(o) = v {
+                out.push(*o);
+            }
+        }
+    }
+}
+
+/// GC post-collection hook — called from
+/// `vm/src/memory/gc.rs::update_all_roots`. Remaps every side-store `ObjectRef`
+/// through the collection's pointer map (a moving GC relocates the ref; a
+/// non-moving sweep's selective promotion may tenure it). Entries absent from
+/// the map did not move and stay as-is.
+pub fn gc_update_unsafe_side_store_refs(pointer_map: &std::collections::HashMap<usize, usize>) {
+    if pointer_map.is_empty() {
+        return;
+    }
+    let remap = |o: &mut cratonvm_types::ObjectRef| {
+        let old_addr = o.as_ptr() as usize;
+        if let Some(&new_addr) = pointer_map.get(&old_addr) {
+            debug_assert!(new_addr != 0, "GC pointer map contains null address");
+            *o = unsafe { cratonvm_types::ObjectRef::from_raw(new_addr as *mut u8) };
+        }
+    };
+    for shard in static_obj_store().iter() {
+        let mut map = shard.lock();
+        for v in map.values_mut() {
+            if let Some(o) = v {
+                remap(o);
+            }
+        }
+    }
+    {
+        let mut map = synthetic_field_store().lock();
+        for v in map.values_mut() {
+            if let Value::Object(Some(o)) = v {
+                remap(o);
+            }
+        }
+    }
+    {
+        let mut map = class_atomic_side_store().lock();
+        for v in map.values_mut() {
+            if let Some(o) = v {
+                remap(o);
+            }
+        }
+    }
+}
+
 #[inline]
 fn class_atomic_cas_impl(
     ctx: &mut dyn NativeContext,
@@ -17530,6 +17640,55 @@ fn native_class_reflection_data_init(
 /// JDK's `while(true)` CAS loop is replaced by a single allocation —
 /// safe because we hold no contention against any other thread on
 /// this slot (the side store and the heap slot are written together).
+///
+/// Native body of `java/lang/Class.reflectionData()Ljava/lang/Class$ReflectionData;`.
+///
+/// The JDK getter reads `this.reflectionData` (heap slot 11) directly. That slot
+/// is an old(Class mirror)→young(SoftReference) edge that the young collector
+/// reclaims/relocates WITHOUT honoring (its card never goes dirty — confirmed by
+/// `CRATONVM_DBG_RSET_AUDIT`: `Class fld[11] -> young CLEAN` every cycle), so the
+/// getfield reads a freed / dangling SoftReference (all-zero header) and
+/// `SoftReference.get()` on it faults the reflection path — the Tomcat DoHead
+/// start/stop flood whose receiver is always `java/lang/ref/SoftReference`.
+///
+/// The cas side store (`class_atomic_side_store`, slot_tag 0) holds the SAME
+/// SoftReference and is now GC-safe (`gc_scan_unsafe_side_store_roots` keeps it
+/// live, `gc_update_unsafe_side_store_refs` remaps it). Read from there instead of
+/// the dangling heap slot. `newReflectionData` keeps both in sync on write, and a
+/// missing / cleared entry simply re-creates the cache (redefinedCount is always
+/// 0 in our VM, so a present referent is always current).
+fn native_class_reflection_data(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let cached = {
+        let id = ctx.identity_hash_code(this);
+        class_atomic_side_store()
+            .lock()
+            .get(&(id, 0))
+            .copied()
+            .flatten()
+    };
+    if let Some(soft_ref) = cached {
+        // Soft referents are NOT nulled pre-GC (only weak/phantom are), and the
+        // referent is kept live by tracing the now-rooted SoftReference, so this
+        // returns the live ReflectionData.
+        if let Value::Object(Some(rd)) = ctx.get_field_by_name(soft_ref, "referent") {
+            return Ok(Some(Value::Object(Some(rd))));
+        }
+    }
+    // No live cached ReflectionData — create a fresh one (repopulates slot 11 +
+    // side store). `oldSoftRef` is irrelevant to our single-shot create path.
+    native_class_new_reflection_data(
+        ctx,
+        &[Value::Object(Some(this)), Value::Object(None), Value::Int(0)],
+    )
+}
+
 fn native_class_new_reflection_data(
     ctx: &mut dyn NativeContext,
     args: &[Value],
