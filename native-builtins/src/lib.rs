@@ -41468,6 +41468,27 @@ fn native_proxy_get_handler(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     Ok(Some(ctx.get_field(proxy, 0)))
 }
 
+/// Per-loader namespace id for a generated proxy's defining loader — the cache
+/// key AND the `ClassLoaderId::UserDefined(N)` the proxy class is registered
+/// under (shared by `newProxyInstance` and `getProxyClass`).
+///
+/// For a *user-defined* loader this MUST be the loader's CANONICAL namespace id
+/// (`loader_namespace_id`), i.e. the same id the loader-scoped lookups
+/// (`peek_loader_namespace_id` / `class_defined_by_loader_exact`, used by
+/// `findLoadedClass` / `cl_real_load_class_base`'s proxy path) query. The
+/// previous raw identity-hash namespace registered the proxy under an id those
+/// scoped lookups never consult, so the DEFINING loader's own
+/// `loadClass(proxyName)` returned ClassNotFoundException (ClassUtilsTests
+/// .isCacheSafe, via `childLoader3` delegating to its definer `childLoader1`).
+/// Built-in / null loaders keep the identity-hash namespace.
+fn proxy_loader_namespace(ctx: &mut dyn NativeContext, loader_obj: ObjectRef) -> u32 {
+    if crate::classloader::is_user_defined_loader(ctx, loader_obj) {
+        crate::classloader::loader_namespace_id(ctx, loader_obj)
+    } else {
+        ctx.identity_hash_code(loader_obj) as u32
+    }
+}
+
 fn native_proxy_new_instance(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // WP2.5-B — strategy A path: emit a real `$ProxyN` class that
     // extends `java/lang/reflect/Proxy$Instance` and implements the
@@ -41532,7 +41553,7 @@ fn native_proxy_new_instance(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     // get different proxy class spaces, matching JDK semantics. A null
     // ClassLoader arg = bootstrap loader = namespace 0.
     let loader_namespace: u32 = match args.first() {
-        Some(Value::Object(Some(loader_obj))) => ctx.identity_hash_code(*loader_obj) as u32,
+        Some(Value::Object(Some(loader_obj))) => proxy_loader_namespace(ctx, *loader_obj),
         _ => 0,
     };
     // proxy-real-classfile real-super migration: the generated class extends the
@@ -41649,7 +41670,7 @@ fn native_proxy_get_proxy_class(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     // Per-loader namespace = the loader instance's identity hash (bootstrap/null
     // → 0), matching `native_proxy_new_instance` so both share the cache entry.
     let loader_namespace: u32 = match args.first() {
-        Some(Value::Object(Some(loader_obj))) => ctx.identity_hash_code(*loader_obj) as u32,
+        Some(Value::Object(Some(loader_obj))) => proxy_loader_namespace(ctx, *loader_obj),
         _ => 0,
     };
     match define_or_get_proxy_class(ctx, loader_namespace, &iface_cids) {
