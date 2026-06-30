@@ -1,10 +1,27 @@
 # GC: live young `java.lang.Thread` mirror in a blocked thread's frame reclaimed by the young collector (Tomcat real-net/real-AQS HARD CRASHES)
 
-**Status:** 🟠 **OPEN on dev** (underlying GC defect). A **defensive crash-mitigation is MERGED to
-dev** (commits `6a04b0e3` + `e06ed934`) that converts the resulting VM aborts into a graceful
-Java-level `NullPointerException` — the VM no longer crashes, but the live object is still reclaimed
-(so the affected tests still *fail/time out*; they were already failing residuals on CratonVM before
-they regressed to crashing).
+**Status:** 🟢 **Thread-mirror manifestation RESOLVED via stale-mirror recovery** (the
+`this.holder is null` NPE family); 🟠 the **underlying frame/operand remap-coverage gap remains
+open** for non-`Thread` objects.
+
+**Resolution (Thread mirrors).** A moving / promoting young GC relocates a thread's
+`java.lang.Thread` mirror and correctly remaps the registry + per-thread `java_thread_obj` field,
+but a stale copy of the *vacated* address can survive in a running / blocked frame's operand stack
+or local. We now make that recoverable: `ThreadRegistry::update_thread_objs_after_gc` records every
+relocated mirror's **vacated address → owning tid** in a bounded table (`former_mirror_addrs`), and
+the interpreter's virtual-invoke path, on detecting an all-zero-header (`class_id == 0`) receiver,
+calls `recover_stale_mirror` to substitute that thread's live mirror before dispatch
+(`vm/src/runtime/interpreter.rs`, `vm/src/threading/thread_registry.rs`). Precise — the table is
+populated only by GC relocations and consulted only on genuinely-zeroed receivers, and a vacated
+address uniquely identifies one thread's mirror, so there are zero false substitutions. This
+eliminates the `Thread.getThreadGroup()`/`getPriority()`/`isDaemon()` NPEs (Tomcat
+`TestDigestAuthenticator` + ~10 siblings: holder-NPE count → 0 in both jit and nojit; 4 of the 12
+now PASS, the rest progress past server startup to *separate* downstream issues).
+
+A **defensive crash-mitigation was previously MERGED** (commits `6a04b0e3` + `e06ed934`) that
+converted the resulting VM aborts into a graceful Java-level `NullPointerException`; the recovery
+above now repairs the `Thread`-mirror case so it neither crashes nor NPEs. For **non-`Thread`**
+stale frame references the reclamation itself is still not prevented (see TODO).
 
 **Severity:** was *critical* (SIGSEGV / Rust panic = VM abort); now *medium* (correctness — stale
 reads degrade to null). **Manifests** under heavy concurrent networking + locking

@@ -15181,6 +15181,50 @@ fn execute_invoke_kind(
         args.push(coerce_invoke_arg_for_descriptor(pd, v));
     }
 
+    // GC-stale `java.lang.Thread`-mirror receiver recovery.
+    //
+    // A moving / promoting young GC can relocate a thread's
+    // `java.lang.Thread` mirror while a *stale copy* of its old address still
+    // sits in a running or blocked frame's operand stack / local — the
+    // frame/operand remap-coverage gap documented in
+    // `docs/known-issues/gc-blocked-thread-frame-stale-thread-mirror.md`. The
+    // registry and the per-thread `java_thread_obj` field are remapped, but
+    // the frame copy is not, so an invoke whose receiver is that copy (the
+    // classic `Thread.currentThread().getThreadGroup()` in
+    // `TaskThreadFactory.<init>`) dispatches on a zeroed object and real-JDK
+    // `Thread.getThreadGroup()` reads a null `holder` and NPEs (the Tomcat
+    // `TestDigestAuthenticator` family). When the stale receiver's address is
+    // a recorded former mirror address, recover that thread's live mirror.
+    //
+    // Precise / no false substitutions: the former-address table is populated
+    // *only* by GC mirror relocations, and we consult it *only* when the
+    // receiver header is genuinely all-zero (`class_id == 0`). A from-space
+    // slot reused for a live object has a non-zero class_id and never reaches
+    // the lookup; a vacated address uniquely identified one thread's mirror,
+    // so identity is preserved. We additionally verify the recovered mirror is
+    // itself live before substituting.
+    if !is_special {
+        let recovered: Option<ObjectRef> = if let Value::Object(Some(recv)) = &args[0] {
+            let recv = *recv;
+            if shared.heap.class_id_of(recv) == ClassId::new(0) {
+                shared
+                    .thread_registry
+                    .recover_stale_mirror(recv.as_ptr() as usize)
+                    .filter(|live| {
+                        live.as_ptr() != recv.as_ptr()
+                            && shared.heap.class_id_of(*live) != ClassId::new(0)
+                    })
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        if let Some(live) = recovered {
+            args[0] = Value::Object(Some(live));
+        }
+    }
+
     // CRATONVM_DBG_JETTY — trace every invoke into the Jetty launcher
     // package. The boot-test target (`java -jar start.jar --list-config`)
     // NPEs at `Main.start(Main.java:397)` on `args.getClasspath()`; this
@@ -17492,6 +17536,21 @@ fn force_native_over_real_jdk_bytecode(
     matches!(
         (class_name, method_name, method_descriptor),
         ("java/lang/ClassLoader", "setDefaultAssertionStatus", "(Z)V")
+            // `EndElementEvent.getNamespaces()` — the JDK Xerces StAX event impl
+            // hard-codes an empty `ReadOnlyIterator` return (it computes
+            // `fNamespaces.iterator()` then pops it). Our synthetic cursor reports
+            // end-element namespaces (getNamespaceCount/Prefix/URI) and the
+            // allocator fills `fNamespaces`, but this getter drops them, so
+            // Spring's StaxEventXMLReader emits no `endPrefixMapping`
+            // (StaxEventXMLReaderTests namespace methods). Force our native, which
+            // returns the actual `fNamespaces` iterator — the behaviour of a
+            // spec-correct provider (Woodstox is what HotSpot resolves for this
+            // suite). Companion native: `native-builtins/src/xml_stax.rs`.
+            | (
+                "com/sun/xml/internal/stream/events/EndElementEvent",
+                "getNamespaces",
+                "()Ljava/util/Iterator;",
+            )
             | ("java/net/URL", "getHost", "()Ljava/lang/String;")
             | (
                 "java/net/URL",

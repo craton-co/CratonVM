@@ -611,6 +611,36 @@ pub(crate) fn register_phase55_executors(r: &mut NativeMethodRegistry) {
         "allOf",
         "([Ljava/util/concurrent/CompletableFuture;)Ljava/util/concurrent/CompletableFuture;",
         |ctx, args| {
+            // Real-JDK async inputs (e.g. `runAsync` on a worker) may still be PENDING:
+            // delegate to the real JDK private static `andTree` so the returned CF
+            // completes only when every input does (see `p58_cf_all_of`). The eager
+            // model below would mark it done immediately. Synthetic CFs (done-flag Int
+            // in slot 1) keep the eager model.
+            if let Some(Value::Object(Some(arr))) = args.first() {
+                let arr = *arr;
+                let len = ctx.array_length(arr);
+                let mut any_real = false;
+                for i in 0..len {
+                    if let Value::Object(Some(cf_ref)) = ctx.get_array_element(arr, i) {
+                        if !matches!(ctx.get_field(cf_ref, FUT_FIELD_DONE), Value::Int(_)) {
+                            any_real = true;
+                            break;
+                        }
+                    }
+                }
+                if any_real {
+                    return ctx.invoke_special(
+                        "java/util/concurrent/CompletableFuture",
+                        "andTree",
+                        "([Ljava/util/concurrent/CompletableFuture;II)Ljava/util/concurrent/CompletableFuture;",
+                        &[
+                            Value::Object(Some(arr)),
+                            Value::Int(0),
+                            Value::Int(len as i32 - 1),
+                        ],
+                    );
+                }
+            }
             let future =
                 alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 3);
             // Check if any constituent CF has an exception
@@ -12604,7 +12634,38 @@ fn p58_cf_exceptionally(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     Ok(Some(Value::Object(Some(cf))))
 }
 
-fn p58_cf_all_of(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+fn p58_cf_all_of(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // Real-JDK async inputs (e.g. `CompletableFuture.runAsync` on a worker) may still
+    // be PENDING. Delegate to the real JDK private static `andTree` (== the body of
+    // the real `allOf`) so the returned CF completes only when every input does,
+    // instead of the eager "all already complete" model below which makes
+    // `allOf(...).join()` return immediately while tasks run. See `p58_cf_when_complete`
+    // (BUG-17) for the same real-JDK delegation pattern.
+    if let Some(Value::Object(Some(arr))) = args.first() {
+        let arr = *arr;
+        let len = ctx.array_length(arr);
+        let mut any_real = false;
+        for i in 0..len {
+            if let Value::Object(Some(cf)) = ctx.get_array_element(arr, i) {
+                if !matches!(ctx.get_field(cf, FUT_FIELD_DONE), Value::Int(_)) {
+                    any_real = true;
+                    break;
+                }
+            }
+        }
+        if any_real {
+            return ctx.invoke_special(
+                "java/util/concurrent/CompletableFuture",
+                "andTree",
+                "([Ljava/util/concurrent/CompletableFuture;II)Ljava/util/concurrent/CompletableFuture;",
+                &[
+                    Value::Object(Some(arr)),
+                    Value::Int(0),
+                    Value::Int(len as i32 - 1),
+                ],
+            );
+        }
+    }
     // All futures are already complete in our eager model
     let cf = p58_new_cf(ctx, Value::Object(None), true);
     Ok(Some(Value::Object(Some(cf))))
@@ -15737,15 +15798,14 @@ pub fn register_p59_jar(r: &mut NativeMethodRegistry) {
                 Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
                 _ => return Ok(Some(Value::Object(None))),
             };
-            if let Ok(file) = std::fs::File::open(&path) {
-                if let Ok(mut archive) = zip::ZipArchive::new(file) {
-                    if let Ok(entry) = archive.by_name(&entry_name) {
-                        let size = entry.size() as i64;
-                        let csize = entry.compressed_size() as i64;
-                        #[allow(deprecated)]
-                        let method = entry.compression().to_u16() as i32;
-                        let crc = entry.crc32() as i64 & 0xFFFF_FFFFi64;
-                        drop(entry);
+            // Cached parse (O(1) per call; avoids re-parsing the central
+            // directory on every lookup — see `jar_contents_cached`).
+            if let Some(contents) = jar_contents_cached(&path) {
+                if let Some(rec) = contents.by_name.get(&entry_name) {
+                        let size = rec.size;
+                        let csize = rec.csize;
+                        let method = rec.method;
+                        let crc = rec.crc;
                         let ze = alloc_concurrent_synthetic(ctx, "java/util/jar/JarEntry", 4);
                         let name_s = ctx.create_string(&entry_name);
                         ctx.set_field(ze, 0, Value::Object(Some(name_s)));
@@ -15765,7 +15825,6 @@ pub fn register_p59_jar(r: &mut NativeMethodRegistry) {
                         ctx.set_field_by_name(ze, "method", Value::Int(method));
                         ctx.set_field_by_name(ze, "crc", Value::Long(crc));
                         return Ok(Some(Value::Object(Some(ze))));
-                    }
                 }
             }
             Ok(Some(Value::Object(None)))
@@ -15793,15 +15852,10 @@ pub fn register_p59_jar(r: &mut NativeMethodRegistry) {
                 },
                 _ => return Ok(Some(Value::Object(None))),
             };
-            let bytes: Option<Vec<u8>> = (|| {
-                use std::io::Read;
-                let f = std::fs::File::open(&path).ok()?;
-                let mut a = zip::ZipArchive::new(f).ok()?;
-                let mut e = a.by_name(&entry_name).ok()?;
-                let mut buf = Vec::new();
-                e.read_to_end(&mut buf).ok()?;
-                Some(buf)
-            })();
+            // Cached parse + decompress (O(1) per call; avoids re-parsing the
+            // whole central directory on every entry — see `jar_contents_cached`).
+            let bytes: Option<std::sync::Arc<Vec<u8>>> =
+                jar_contents_cached(&path).and_then(|c| c.by_name.get(&entry_name).map(|r| r.bytes.clone()));
             let bytes = match bytes {
                 Some(b) => b,
                 None => return Ok(Some(Value::Object(None))),
@@ -16687,6 +16741,92 @@ fn spring_default_app_ctx_factory_create(
 // 4-field synthetic JarEntry instances (name, size, compressedSize, method).
 // =============================================================================
 
+/// One central-directory entry's metadata plus its decompressed bytes.
+pub(crate) struct JarEntryRec {
+    pub(crate) size: i64,
+    pub(crate) csize: i64,
+    pub(crate) method: i32,
+    pub(crate) crc: i64,
+    pub(crate) bytes: std::sync::Arc<Vec<u8>>,
+}
+
+/// Whole-jar parsed contents: per-name records plus central-directory order.
+pub(crate) struct JarContents {
+    pub(crate) by_name: std::collections::HashMap<String, JarEntryRec>,
+    pub(crate) order: Vec<String>,
+}
+
+/// Per-path cache of a JAR's parsed central directory + decompressed entries.
+///
+/// The `java.util.jar.JarFile` natives (`getInputStream`/`getEntry`/`entries`/
+/// `stream`/lookup) previously called `zip::ZipArchive::new(file)` on EVERY
+/// call, which re-reads and re-parses the whole central directory each time.
+/// Tomcat's `ContextConfig` annotation scanner calls `getInputStream` once per
+/// `.class` entry, making that O(N²) over a jar's entry count — for a large jar
+/// like byte-buddy (~3k classes) the web-fragment scan never finishes within
+/// the test timeout (TestValidator HANG; it passes on HotSpot where each lookup
+/// is O(1)). Parse + decompress once and cache, keyed by (path, mtime) so a jar
+/// rewritten on disk (e.g. a test-generated temp jar) is not served stale.
+pub(crate) fn jar_contents_cached(path: &str) -> Option<std::sync::Arc<JarContents>> {
+    use std::sync::{Arc, Mutex, OnceLock};
+    static CACHE: OnceLock<Mutex<std::collections::HashMap<String, Arc<JarContents>>>> =
+        OnceLock::new();
+    if path.is_empty() {
+        return None;
+    }
+    let mtime = std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let key = format!("{path}\u{0}{mtime}");
+    let cache = CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+    if let Some(c) = cache.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
+        return Some(c.clone());
+    }
+    // Build outside the lock (decompression can be slow); a concurrent racer
+    // just rebuilds and the last writer wins — the contents are identical.
+    let file = std::fs::File::open(path).ok()?;
+    let mut archive = zip::ZipArchive::new(file).ok()?;
+    let len = archive.len();
+    let mut by_name = std::collections::HashMap::with_capacity(len);
+    let mut order = Vec::with_capacity(len);
+    for i in 0..len {
+        use std::io::Read;
+        let Ok(mut entry) = archive.by_index(i) else {
+            continue;
+        };
+        let name = entry.name().to_string();
+        let size = entry.size() as i64;
+        let csize = entry.compressed_size() as i64;
+        #[allow(deprecated)]
+        let method = entry.compression().to_u16() as i32;
+        let crc = entry.crc32() as i64 & 0xFFFF_FFFFi64;
+        let mut buf = Vec::with_capacity(entry.size() as usize);
+        if entry.read_to_end(&mut buf).is_err() {
+            continue;
+        }
+        order.push(name.clone());
+        by_name.insert(
+            name,
+            JarEntryRec {
+                size,
+                csize,
+                method,
+                crc,
+                bytes: Arc::new(buf),
+            },
+        );
+    }
+    let contents = Arc::new(JarContents { by_name, order });
+    cache
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(key, contents.clone());
+    Some(contents)
+}
+
 /// Read the central directory of `path` and return a Vec of allocated
 /// synthetic `java/util/jar/JarEntry` ObjectRefs. Returns an empty Vec on
 /// any I/O / zip-parse error so callers see an empty Stream rather than
@@ -16695,31 +16835,19 @@ fn p59_jar_collect_entries(ctx: &mut dyn NativeContext, path: &str) -> Vec<Value
     if path.is_empty() {
         return Vec::new();
     }
-    let file = match std::fs::File::open(path) {
-        Ok(f) => f,
-        Err(_) => return Vec::new(),
+    let contents = match jar_contents_cached(path) {
+        Some(c) => c,
+        None => return Vec::new(),
     };
-    let mut archive = match zip::ZipArchive::new(file) {
-        Ok(a) => a,
-        Err(_) => return Vec::new(),
-    };
-    let len = archive.len();
-    let mut out = Vec::with_capacity(len);
-    for i in 0..len {
-        let (name, size, csize, method, crc) = match archive.by_index(i) {
-            Ok(entry) => {
-                let name = entry.name().to_string();
-                let size = entry.size() as i64;
-                let csize = entry.compressed_size() as i64;
-                #[allow(deprecated)]
-                let method = entry.compression().to_u16() as i32;
-                let crc = entry.crc32() as i64 & 0xFFFF_FFFFi64;
-                (name, size, csize, method, crc)
-            }
-            Err(_) => continue,
+    let mut out = Vec::with_capacity(contents.order.len());
+    for name in &contents.order {
+        let rec = match contents.by_name.get(name) {
+            Some(r) => r,
+            None => continue,
         };
+        let (size, csize, method, crc) = (rec.size, rec.csize, rec.method, rec.crc);
         let je = alloc_concurrent_synthetic(ctx, "java/util/jar/JarEntry", 4);
-        let name_s = ctx.create_string(&name);
+        let name_s = ctx.create_string(name);
         ctx.set_field(je, 0, Value::Object(Some(name_s)));
         ctx.set_field(je, 1, Value::Long(size));
         ctx.set_field(je, 2, Value::Long(csize));
@@ -16748,25 +16876,19 @@ fn p59_jar_lookup_entry(ctx: &mut dyn NativeContext, path: &str, entry_name: &st
     if path.is_empty() || entry_name.is_empty() {
         return Value::Object(None);
     }
-    let file = match std::fs::File::open(path) {
-        Ok(f) => f,
-        Err(_) => return Value::Object(None),
+    let contents = match jar_contents_cached(path) {
+        Some(c) => c,
+        None => return Value::Object(None),
     };
-    let mut archive = match zip::ZipArchive::new(file) {
-        Ok(a) => a,
-        Err(_) => return Value::Object(None),
-    };
-    let (name, size, csize, method, crc) = match archive.by_name(entry_name) {
-        Ok(entry) => {
-            let name = entry.name().to_string();
-            let size = entry.size() as i64;
-            let csize = entry.compressed_size() as i64;
-            #[allow(deprecated)]
-            let method = entry.compression().to_u16() as i32;
-            let crc = entry.crc32() as i64 & 0xFFFF_FFFFi64;
-            (name, size, csize, method, crc)
-        }
-        Err(_) => return Value::Object(None),
+    let (name, size, csize, method, crc) = match contents.by_name.get(entry_name) {
+        Some(rec) => (
+            entry_name.to_string(),
+            rec.size,
+            rec.csize,
+            rec.method,
+            rec.crc,
+        ),
+        None => return Value::Object(None),
     };
     let je = alloc_concurrent_synthetic(ctx, "java/util/jar/JarEntry", 4);
     let name_s = ctx.create_string(&name);
