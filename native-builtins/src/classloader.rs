@@ -892,6 +892,35 @@ pub(crate) fn peek_loader_namespace_id(ctx: &mut dyn NativeContext, loader: Obje
         .copied()
 }
 
+/// True for a JDK dynamic-proxy class's internal name (`jdk/proxyN/$ProxyM` on
+/// JDK 9+, `com/sun/proxy/$ProxyM` on the legacy layout). Generated proxies are
+/// never real classpath classes, so a built-in loader can only ever "find" one
+/// because it leaked into CratonVM's flat global store — see the use in
+/// [`find_loaded_class_for_loader`].
+pub(crate) fn is_generated_proxy_name(name: &str) -> bool {
+    (name.starts_with("jdk/proxy") || name.starts_with("com/sun/proxy")) && name.contains("$Proxy")
+}
+
+/// True when `cid` is a generated proxy class that loader `this` must NOT be
+/// allowed to resolve: a proxy is visible only to its defining loader and that
+/// loader's delegation descendants (JVMS §5.3). Stops CratonVM's flat global
+/// store from leaking one loader's proxy to an unrelated/sibling loader through
+/// the various name-keyed resolution natives. ClassUtilsTests.isCacheSafe.
+pub(crate) fn proxy_hidden_from(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    internal: &str,
+    cid: cratonvm_types::ClassId,
+) -> bool {
+    if !is_generated_proxy_name(internal) {
+        return false;
+    }
+    match defining_loader_for(cid.as_u32()) {
+        Some(def) => !loader_can_see_defining(ctx, this, def),
+        None => false,
+    }
+}
+
 /// Shared `findLoadedClass` logic (JVMS §5.3): returns the Class mirror for
 /// `internal_name` only if `this` loader is recorded as having loaded it —
 /// NEVER a class some OTHER loader happens to have loaded. Does NOT trigger
@@ -912,9 +941,23 @@ pub(crate) fn find_loaded_class_for_loader(
     internal_name: &str,
 ) -> Option<ObjectRef> {
     if !is_user_defined_loader(ctx, this) {
-        return ctx
-            .class_id_by_name(internal_name)
-            .map(|cid| ctx.get_class_mirror(cid));
+        return ctx.class_id_by_name(internal_name).and_then(|cid| {
+            // JVMS §5.3: a built-in loader (bootstrap/platform/app) never counts
+            // as having loaded a class that a *user-defined* loader defined.
+            // CratonVM's flat global store would otherwise let the app loader
+            // report a child loader's generated proxy as "already loaded" — and
+            // since `loadClass` delegates parent-first, a sibling custom loader
+            // then resolves it too (`ClassUtilsTests.isCacheSafe`:
+            // `child2.loadClass` of child1's `jdk.proxy1.$Proxy0`). Scope this to
+            // generated proxy names (not real classpath classes, never findable
+            // on disk) so ByteBuddy/Hibernate classes — which legitimately live
+            // in the Application namespace while registering a user-defined
+            // defining loader — keep their existing app-loader visibility.
+            if is_generated_proxy_name(internal_name) && defining_loader_for(cid.as_u32()).is_some() {
+                return None;
+            }
+            Some(ctx.get_class_mirror(cid))
+        });
     }
     // 1. Own-namespace copy — EXACT (no global / parent-delegation fallback).
     // `findLoadedClass` must report ONLY a class THIS user loader has itself
@@ -1036,18 +1079,7 @@ fn cid_visible_mirror(
     cid: cratonvm_types::ClassId,
 ) -> Option<ObjectRef> {
     if this_is_custom {
-        let def = defining_loader_for(cid.as_u32());
-        let ns = ctx.loader_id_of_class(cid);
-        if std::env::var_os("CRATONVM_DBG_LOADERISO").is_some() {
-            eprintln!(
-                "[LOADERISO] cid={} def_sidetable={} loader_ns={} this={}",
-                cid.as_u32(),
-                def.map(|d| d.as_ptr() as u64).unwrap_or(0),
-                ns,
-                this.as_ptr() as u64,
-            );
-        }
-        if let Some(def) = def {
+        if let Some(def) = defining_loader_for(cid.as_u32()) {
             if !loader_can_see_defining(ctx, this, def) {
                 return None;
             }
@@ -1080,9 +1112,6 @@ fn cl_load_class_base_delegation(
 ) -> MethodCallResult {
     let dotted = ctx.read_string(name_obj).unwrap_or_default();
     let internal = dotted.replace('.', "/");
-    if std::env::var_os("CRATONVM_DBG_LOADERISO").is_some() {
-        eprintln!("[LOADERISO] base_delegation enter name={internal} this={}", this.as_ptr() as u64);
-    }
 
     // HIB-CV-24 / SBR-14 — honor a supplied child/isolated `ClassLoader`.
     //
@@ -1273,7 +1302,7 @@ fn cl_find_class(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
 
 fn cl_find_class_module(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // module-aware variant — module arg (index 1) ignored, class name at index 2
-    let _this = obj_arg(args, 0)?;
+    let this = obj_arg(args, 0)?;
     let name_obj = match args.get(2) {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
@@ -1282,6 +1311,15 @@ fn cl_find_class_module(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     let internal = dotted.replace('.', "/");
     match ctx.ensure_class_initialized(&internal) {
         Ok(cid) => {
+            // `BuiltinClassLoader` (the app/platform loader) calls this 2-arg
+            // `findClass(module, name)` during its module/classpath search. The
+            // global resolve above ignores loader identity, so a generated proxy
+            // defined by an unrelated child loader would leak through here — this
+            // is the path that defeated the `findLoadedClass` guard in
+            // ClassUtilsTests.isCacheSafe. Hide cross-loader proxies.
+            if proxy_hidden_from(ctx, this, &internal, cid) {
+                return Ok(Some(Value::Object(None)));
+            }
             let mirror = ctx.get_class_mirror(cid);
             Ok(Some(Value::Object(Some(mirror))))
         }

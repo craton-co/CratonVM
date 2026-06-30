@@ -17536,6 +17536,21 @@ fn force_native_over_real_jdk_bytecode(
     matches!(
         (class_name, method_name, method_descriptor),
         ("java/lang/ClassLoader", "setDefaultAssertionStatus", "(Z)V")
+            // `EndElementEvent.getNamespaces()` — the JDK Xerces StAX event impl
+            // hard-codes an empty `ReadOnlyIterator` return (it computes
+            // `fNamespaces.iterator()` then pops it). Our synthetic cursor reports
+            // end-element namespaces (getNamespaceCount/Prefix/URI) and the
+            // allocator fills `fNamespaces`, but this getter drops them, so
+            // Spring's StaxEventXMLReader emits no `endPrefixMapping`
+            // (StaxEventXMLReaderTests namespace methods). Force our native, which
+            // returns the actual `fNamespaces` iterator — the behaviour of a
+            // spec-correct provider (Woodstox is what HotSpot resolves for this
+            // suite). Companion native: `native-builtins/src/xml_stax.rs`.
+            | (
+                "com/sun/xml/internal/stream/events/EndElementEvent",
+                "getNamespaces",
+                "()Ljava/util/Iterator;",
+            )
             | ("java/net/URL", "getHost", "()Ljava/lang/String;")
             | (
                 "java/net/URL",

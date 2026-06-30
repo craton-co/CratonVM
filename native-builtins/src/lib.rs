@@ -19920,6 +19920,12 @@ fn native_classloader_find_bootstrap_class(
     };
     // Convert "java.lang.String" → "java/lang/String"
     let internal_name = name.replace('.', "/");
+    // A generated dynamic-proxy class is never a bootstrap class; resolving one
+    // here would leak a user loader's proxy into the bootstrap/parent-delegation
+    // path (ClassUtilsTests.isCacheSafe). Bootstrap genuinely has no proxies.
+    if crate::classloader::is_generated_proxy_name(&internal_name) {
+        return Ok(Some(Value::Object(None)));
+    }
     // Try to load the class — load_class returns MethodCallResult
     // where Ok(Some(Value::Object(Some(obj)))) contains the class mirror
     match ctx.load_class(&internal_name) {
