@@ -824,7 +824,17 @@ fn perform(
     let req = build_request(method, parsed, headers, body);
 
     if parsed.scheme == "https" {
-        let cfg = shared_legacy_config();
+        // Build a client config that trusts the gathered test/truststore roots
+        // (not just the OS root store — a loopback test server's cert is signed
+        // by a test CA) and presents the client certificate installed via
+        // HttpsURLConnection.setDefaultSSLSocketFactory (mTLS). Falls back to the
+        // cached system-roots config when no test roots / client identity exist.
+        let huc_ident = crate::t27_tls::huc_default_client_identity();
+        let cfg = crate::t27_tls::build_engine_client_config_with_identity(
+            &["http/1.1"],
+            huc_ident.as_ref().map(|(c, k)| (c.as_str(), k.as_str())),
+        )
+        .unwrap_or_else(|_| shared_legacy_config());
         let server_name = ServerName::try_from(parsed.host.clone())
             .map_err(|e| format!("bad server name {}: {e}", parsed.host))?;
         let conn = ClientConnection::new(cfg, server_name)

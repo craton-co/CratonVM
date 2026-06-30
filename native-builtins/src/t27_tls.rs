@@ -153,6 +153,107 @@ fn require_runtime_tls_identity() -> Result<RuntimeTlsIdentity, RuntimeError> {
 }
 
 // -----------------------------------------------------------------------------
+// Per-SSLContext TLS identity (mTLS / in-process client+server)
+// -----------------------------------------------------------------------------
+//
+// The process-global `RuntimeTlsIdentity` above cannot represent an in-process
+// test that stands up BOTH a TLS server and a TLS client (e.g.
+// `TestClientCertTls13`): the server keystore (localhost cert) and the client
+// keystore (client cert) both flow through the keystore load path and clobber
+// the single global slot. We therefore also track identity PER `SSLContext`.
+//
+// Flow (matches how JSSE wires up, same thread): `KeyManagerFactory.init(ks,
+// pass)` stashes that keystore's (cert_pem, key_pem) in a thread-local; the
+// following `SSLContext.init(keyManagers, …)` moves it into a table keyed by the
+// SSLContext's object identity. `createSSLEngine()` copies it onto the engine
+// (server cert); `getSocketFactory().createSocket()` uses it as the rustls
+// client-auth identity (client-cert presentation). Keying off the thread-local
+// at KMF.init — rather than reading the `KeyManager` objects at SSLContext.init
+// — sidesteps test wrappers like `TrackingKeyManager`.
+
+thread_local! {
+    static PENDING_KM_IDENTITY: std::cell::RefCell<Option<(String, String)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// `KeyManagerFactory.init` calls this with the keystore's PEM identity.
+pub fn set_pending_km_identity(cert_pem: String, key_pem: String) {
+    PENDING_KM_IDENTITY.with(|c| *c.borrow_mut() = Some((cert_pem, key_pem)));
+}
+
+fn take_pending_km_identity() -> Option<(String, String)> {
+    PENDING_KM_IDENTITY.with(|c| c.borrow_mut().take())
+}
+
+fn ctx_identity_table() -> &'static Mutex<HashMap<u64, (String, String)>> {
+    static T: OnceLock<Mutex<HashMap<u64, (String, String)>>> = OnceLock::new();
+    T.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// `SSLContext.init` calls this to move any pending KMF identity onto the
+/// SSLContext object's per-context slot.
+pub(crate) fn attach_pending_identity_to_ctx(ctx_obj: ObjectRef) {
+    if let Some(ident) = take_pending_km_identity() {
+        ctx_identity_table()
+            .lock()
+            .insert(engine_objref_key(ctx_obj), ident);
+    }
+}
+
+/// Look up the identity previously associated with an `SSLContext` object.
+pub(crate) fn ctx_identity(ctx_obj: ObjectRef) -> Option<(String, String)> {
+    ctx_identity_table()
+        .lock()
+        .get(&engine_objref_key(ctx_obj))
+        .cloned()
+}
+
+/// Convert a PKCS#8 key DER + DER cert chain (leaf first) to the (cert_pem,
+/// key_pem) pair the rustls config builders consume. Shared by the keystore
+/// load path so it can record a per-keystore identity for the per-context flow.
+pub fn der_identity_to_pem(key_pkcs8_der: &[u8], chain_der: &[Vec<u8>]) -> (String, String) {
+    let mut cert_pem = String::new();
+    for c in chain_der {
+        cert_pem.push_str(&der_to_pem("CERTIFICATE", c));
+    }
+    let key_pem = der_to_pem("PRIVATE KEY", key_pkcs8_der);
+    (cert_pem, key_pem)
+}
+
+/// Build a rustls client config that trusts the gathered test/truststore roots
+/// (plus the platform roots) and optionally presents a client certificate.
+/// Used by the rustls-backed `SSLSocketFactory.createSocket` client path.
+pub(crate) fn build_engine_client_config_with_identity(
+    alpn: &[&str],
+    client_identity: Option<(&str, &str)>,
+) -> Result<Arc<ClientConfig>, String> {
+    let mut roots = load_native_root_store().unwrap_or_else(|_| RootCertStore::empty());
+    for der in extra_trust_roots().lock().iter() {
+        let _ = roots.add(CertificateDer::from(der.clone()));
+    }
+    build_client_config(roots, alpn, client_identity)
+}
+
+// The client identity (cert_pem, key_pem) installed via
+// `HttpsURLConnection.setDefaultSSLSocketFactory`. The native HttpsURLConnection
+// client (`http_url_connection::perform`) does not route through
+// `SSLSocketFactory.createSocket`, so it reads this global to present a client
+// certificate for mTLS (e.g. `TestClientCertTls13`'s `getUrl`/`postUrl`).
+static HUC_DEFAULT_CLIENT_IDENTITY: OnceLock<Mutex<Option<(String, String)>>> = OnceLock::new();
+
+fn huc_default_identity_slot() -> &'static Mutex<Option<(String, String)>> {
+    HUC_DEFAULT_CLIENT_IDENTITY.get_or_init(|| Mutex::new(None))
+}
+
+pub(crate) fn set_huc_default_client_identity(ident: Option<(String, String)>) {
+    *huc_default_identity_slot().lock() = ident;
+}
+
+pub fn huc_default_client_identity() -> Option<(String, String)> {
+    huc_default_identity_slot().lock().clone()
+}
+
+// -----------------------------------------------------------------------------
 // PEM helpers
 // -----------------------------------------------------------------------------
 
@@ -1143,17 +1244,39 @@ fn register_https_url_connection(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(obj))))
         },
     );
+    // Capture the client identity (cert+key) carried by the factory's
+    // SSLContext so the native HttpsURLConnection client can present a client
+    // certificate for mTLS. `setDefaultSSLSocketFactory` is static (factory =
+    // args[0]); `setSSLSocketFactory` is instance (factory = args[1]).
+    fn capture_huc_client_identity(
+        ctx: &mut dyn cratonvm_native_api::NativeContext,
+        factory: ObjectRef,
+    ) {
+        if let Value::Object(Some(sslctx)) = ctx.get_field(factory, 0) {
+            set_huc_default_client_identity(ctx_identity(sslctx));
+        }
+    }
     r.register(
         hurl,
         "setDefaultSSLSocketFactory",
         "(Ljavax/net/ssl/SSLSocketFactory;)V",
-        |_ctx, _args| Ok(None),
+        |ctx, args| {
+            if let Some(Value::Object(Some(f))) = args.first() {
+                capture_huc_client_identity(ctx, *f);
+            }
+            Ok(None)
+        },
     );
     r.register(
         hurl,
         "setSSLSocketFactory",
         "(Ljavax/net/ssl/SSLSocketFactory;)V",
-        |_ctx, _args| Ok(None),
+        |ctx, args| {
+            if let Some(Value::Object(Some(f))) = args.get(1) {
+                capture_huc_client_identity(ctx, *f);
+            }
+            Ok(None)
+        },
     );
     r.register(
         hurl,
@@ -2432,6 +2555,12 @@ pub(crate) struct EngineState {
     client_config: Option<Arc<ClientConfig>>,
     server_config: Option<Arc<ServerConfig>>,
     peer_host: Option<String>,
+    /// Per-`SSLContext` (cert_pem, key_pem) copied from the context that created
+    /// this engine via `createSSLEngine`. When set, `engine_begin` builds the
+    /// server (or client) config from THIS identity instead of the process-
+    /// global `runtime_tls_identity`, so an in-process mTLS test's server and
+    /// client engines each use their own keystore.
+    identity_override: Option<(String, String)>,
 }
 
 impl Default for EngineState {
@@ -2453,6 +2582,7 @@ impl Default for EngineState {
             client_config: None,
             server_config: None,
             peer_host: None,
+            identity_override: None,
         }
     }
 }
@@ -2832,10 +2962,22 @@ fn engine_begin(state: &mut EngineState) -> Result<(), String> {
     if state.conn.is_some() {
         return Ok(());
     }
+    let alpn_strs: Vec<&str> = state
+        .alpn_protocols
+        .iter()
+        .filter_map(|p| std::str::from_utf8(p).ok())
+        .collect();
     if state.is_client {
         let config = match state.client_config.clone() {
             Some(c) => c,
-            None => default_engine_client_config(&state.alpn_protocols)?,
+            // Per-context client identity (mTLS client-cert presentation) wins
+            // over the no-client-auth default.
+            None => match &state.identity_override {
+                Some((cert, key)) => {
+                    build_engine_client_config_with_identity(&alpn_strs, Some((cert, key)))?
+                }
+                None => default_engine_client_config(&state.alpn_protocols)?,
+            },
         };
         let host = state
             .peer_host
@@ -2849,7 +2991,33 @@ fn engine_begin(state: &mut EngineState) -> Result<(), String> {
     } else {
         let config = match state.server_config.clone() {
             Some(c) => c,
-            None => default_engine_server_config(&state.alpn_protocols, state.need_client_auth)?,
+            // Per-context server identity (this engine's own keystore) wins over
+            // the process-global runtime identity, so an in-process server and
+            // client don't clobber each other's cert.
+            None => match &state.identity_override {
+                Some((cert, key)) => {
+                    let client_ca = if state.need_client_auth {
+                        let pem = trust_roots_pem();
+                        if pem.is_empty() {
+                            None
+                        } else {
+                            Some(pem)
+                        }
+                    } else {
+                        None
+                    };
+                    build_server_config_single_cert(
+                        cert,
+                        key,
+                        &alpn_strs,
+                        state.need_client_auth,
+                        client_ca.as_deref(),
+                    )?
+                }
+                None => {
+                    default_engine_server_config(&state.alpn_protocols, state.need_client_auth)?
+                }
+            },
         };
         let sc =
             ServerConnection::new(config).map_err(|e| format!("ServerConnection::new: {}", e))?;
@@ -3970,6 +4138,16 @@ fn sslparams_alpn_table() -> &'static parking_lot::Mutex<HashMap<u64, Vec<String
 /// `register_p68_ssl` (in `phases_late.rs`) so the impl class shadows the
 /// abstract `javax.net.ssl.SSLEngine` defaults. Callers outside the impl
 /// class still hit the `phases_late.rs` 7-field stub paths.
+/// Copy an `SSLContext`'s per-context identity onto the engine `createSSLEngine`
+/// just produced, so `engine_begin` uses this engine's own keystore cert/key
+/// (server cert, or client cert for mTLS) instead of the process-global slot.
+pub(crate) fn set_engine_identity_override(engine_obj: ObjectRef, cert_pem: String, key_pem: String) {
+    let id = engine_id_or_alloc(engine_obj);
+    with_engine(id, |s| {
+        s.identity_override = Some((cert_pem, key_pem));
+    });
+}
+
 pub fn register_sslengine_real(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
@@ -4010,6 +4188,27 @@ fn register_ssl_session_real(r: &mut NativeMethodRegistry) {
     });
     r.register(cls, "getPacketBufferSize", "()I", |_ctx, _args| {
         Ok(Some(Value::Int(16709)))
+    });
+    // getId() — Tomcat's request/auth plumbing reads the TLS session id (e.g.
+    // for SSL session tracking / client-cert requests). Real JDK returns the
+    // negotiated session id bytes; the abstract interface declaration has no
+    // Code, so without a real-mode native this throws AbstractMethodError and
+    // every HTTPS request to a protected resource fails (HTTP -1). Return a
+    // stable 32-byte id derived from the session object's identity.
+    r.register(cls, "getId", "()[B", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let seed = objref_key(this);
+        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 32);
+        // SplitMix64-style fill so the 32 bytes are stable per session and not
+        // all-identical (some callers hash or compare the id).
+        let mut x = seed | 1;
+        for i in 0..32 {
+            x ^= x >> 30;
+            x = x.wrapping_mul(0xbf58476d1ce4e5b9);
+            x ^= x >> 27;
+            ctx.set_array_element(arr, i, Value::Int((x & 0xff) as i8 as i32));
+        }
+        Ok(Some(Value::Object(Some(arr))))
     });
 
     // proto/cipher slot order differs between the two real-mode shapes:

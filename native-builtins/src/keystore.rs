@@ -1174,12 +1174,16 @@ fn engine_load(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult 
     // first key entry as the server identity, and register every cert as an
     // extra client trust anchor (so an in-process loopback HTTPS client trusts
     // the embedded server). Harmless for non-TLS keystore uses.
+    let mut first_key_identity: Option<(Vec<u8>, Vec<Vec<u8>>)> = None;
     for entry in store.entries.values() {
         match &entry.kind {
             EntryKind::PrivateKey { key_der, chain } => {
                 crate::t27_tls::install_identity_from_der(key_der, chain);
                 for c in chain {
                     crate::t27_tls::add_extra_trust_root_der(c.clone());
+                }
+                if first_key_identity.is_none() {
+                    first_key_identity = Some((key_der.clone(), chain.clone()));
                 }
             }
             EntryKind::TrustedCert { cert_der } => {
@@ -1190,6 +1194,22 @@ fn engine_load(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult 
 
     let id = keystore_register(store);
     set_store_id(ctx, this, id);
+    // Record this keystore's identity PEM keyed by store_id, AND stage it on the
+    // current thread for the next `SSLContext.init`. In real-JDK mode the
+    // `KeyManagerFactory.init` natives are synthetic-gated (the real bytecode
+    // runs), so `engineLoad` — which IS a real-mode native — is the reliable
+    // capture point: a keystore is loaded immediately before its KMF/SSLContext
+    // is built on the same thread (e.g. TesterSupport.getUserKeyManagers →
+    // SSLContext.init). `SSLContext.init` consumes (clears) the thread-local, so
+    // it only sticks to the very next context built after this load.
+    if let Some((key_der, chain)) = first_key_identity {
+        let (cert_pem, key_pem) = crate::t27_tls::der_identity_to_pem(&key_der, &chain);
+        store_identity_pem_map()
+            .lock()
+            .unwrap()
+            .insert(id, (cert_pem.clone(), key_pem.clone()));
+        crate::t27_tls::set_pending_km_identity(cert_pem, key_pem);
+    }
     Ok(Some(Value::Object(None)))
 }
 
@@ -1546,6 +1566,37 @@ fn store_id_by_identity() -> &'static std::sync::Mutex<std::collections::HashMap
     static T: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<i32, i32>>> =
         std::sync::OnceLock::new();
     T.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// `store_id` → (cert_pem, key_pem) for the keystore's first key entry. Recorded
+/// at `engineLoad`; consumed by `keystore_set_pending_km_identity` (called from
+/// `KeyManagerFactory.init`) to drive the per-`SSLContext` mTLS identity flow in
+/// `t27_tls`.
+#[allow(clippy::type_complexity)]
+fn store_identity_pem_map(
+) -> &'static std::sync::Mutex<std::collections::HashMap<i32, (String, String)>> {
+    static T: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<i32, (String, String)>>,
+    > = std::sync::OnceLock::new();
+    T.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// `KeyManagerFactory.init(KeyStore, char[])` calls this so the keystore's
+/// identity is staged for the next `SSLContext.init` on this thread (see
+/// `t27_tls::set_pending_km_identity`).
+pub(crate) fn keystore_set_pending_km_identity(ctx: &mut dyn NativeContext, keystore_obj: ObjectRef) {
+    let id = get_store_id(ctx, keystore_obj);
+    if id == 0 {
+        return;
+    }
+    let ident = store_identity_pem_map()
+        .lock()
+        .unwrap()
+        .get(&id)
+        .cloned();
+    if let Some((cert, key)) = ident {
+        crate::t27_tls::set_pending_km_identity(cert, key);
+    }
 }
 
 fn get_store_id(ctx: &mut dyn NativeContext, this: ObjectRef) -> i32 {

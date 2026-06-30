@@ -6053,6 +6053,12 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let this = obj_arg(args, 0)?;
             ctx.set_field(this, 1, Value::Int(1));
+            // Per-SSLContext mTLS identity: claim the identity staged by the
+            // keystore load that fed this context's KeyManager (same thread),
+            // and attach it to this SSLContext. createSSLEngine / createSocket
+            // then use THIS context's cert+key rather than the process-global
+            // slot, so an in-process server and client don't clobber each other.
+            crate::t27_tls::attach_pending_identity_to_ctx(this);
             Ok(None)
         },
     );
@@ -6180,8 +6186,16 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
         "()Ljavax/net/ssl/SSLEngine;",
         "(Ljava/lang/String;I)Ljavax/net/ssl/SSLEngine;",
     ] {
-        r.register(ctx_cls, "createSSLEngine", desc, |ctx, _args| {
+        r.register(ctx_cls, "createSSLEngine", desc, |ctx, args| {
             let eng = alloc_concurrent_synthetic(ctx, "sun/security/ssl/SSLEngineImpl", 4);
+            // Copy this SSLContext's per-context identity (its keystore cert+key)
+            // onto the engine, so the rustls handshake presents THIS context's
+            // cert (server cert, or client cert for mTLS) instead of the global.
+            if let Ok(sslctx) = obj_arg(args, 0) {
+                if let Some((cert, key)) = crate::t27_tls::ctx_identity(sslctx) {
+                    crate::t27_tls::set_engine_identity_override(eng, cert, key);
+                }
+            }
             Ok(Some(Value::Object(Some(eng))))
         });
     }
@@ -6214,17 +6228,32 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
         "createSocket",
         "(Ljava/lang/String;I)Ljava/net/Socket;",
         |ctx, args| {
+            let this_factory = obj_arg(args, 0)?;
             let host_val = args.get(1).copied().unwrap_or(Value::Object(None));
             let host = value_or_string(ctx, host_val, "");
             let port = args.get(2).and_then(|v| v.as_int()).unwrap_or(0);
             if host.is_empty() || !(1..=65535).contains(&port) {
                 return Err(iae(format!("bad host/port: {host}:{port}")));
             }
-            let connector = native_tls::TlsConnector::builder()
-                .build()
-                .map_err(|e| ioex(format!("TLS connector: {e}")))?;
-            let id = crate::servlet::s2_tls_connect(&connector, &host, port as u16)
+            // Per-context client identity (mTLS): the SSLContext stashed on the
+            // factory by getSocketFactory (field 0) may carry a client cert+key.
+            let client_ident = match ctx.get_field(this_factory, 0) {
+                Value::Object(Some(sslctx)) => crate::t27_tls::ctx_identity(sslctx),
+                _ => None,
+            };
+            // Use the rustls client path rather than a default native-tls
+            // connector: (1) trust the gathered test/truststore roots (the
+            // native-tls default trusts only the OS root store, so it cannot
+            // validate a test CA — which broke every loopback HTTPS client),
+            // and (2) present the client certificate for mTLS when present.
+            let cfg = crate::t27_tls::build_engine_client_config_with_identity(
+                &["http/1.1"],
+                client_ident.as_ref().map(|(c, k)| (c.as_str(), k.as_str())),
+            )
+            .map_err(|e| ioex(format!("client TLS config: {e}")))?;
+            let rid = crate::t27_tls::rustls_client_connect(cfg, &host, port as u16)
                 .map_err(|e| ioex(format!("TLS connect: {e}")))?;
+            let id = crate::servlet::RUSTLS_SOCK_ID_BASE + rid;
             let sock = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSocket", 5);
             let host_s = ctx.create_string(&host);
             ctx.set_field(sock, SOCK_HOST, Value::Object(Some(host_s)));
