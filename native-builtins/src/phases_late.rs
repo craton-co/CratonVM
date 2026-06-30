@@ -10359,6 +10359,39 @@ fn strip_unc(p: &str) -> String {
 /// containment check (`child.startsWith(parentDir)`) — as Felix's
 /// `getDataFile` does — would spuriously fail.
 fn file_canonicalize_path(path: &str) -> String {
+    // JDK-faithful canonicalization cache. The real `WinNTFileSystem.canonicalize`
+    // fronts a 30s `ExpiringCache` for exactly this reason: Tomcat (and most apps)
+    // re-resolve the same docBase/appBase/work/temp paths on every start, and each
+    // `std::fs::canonicalize` here OPENS the file → `GetFinalPathNameByHandleW`,
+    // which on this box can stall for seconds inside the Crypto Pro `cpcrypt.dll`
+    // filesystem filter. Caching keeps repeated `File.getCanonicalPath()` off the
+    // filesystem (and the filter), cutting both per-call latency and the stall
+    // variance that otherwise pushes a heavy parameterized Tomcat-churn test
+    // (~144 full start/stop cycles) past its timeout.
+    use std::sync::{Mutex, OnceLock};
+    use std::time::{Duration, Instant};
+    static CACHE: OnceLock<Mutex<std::collections::HashMap<String, (String, Instant)>>> =
+        OnceLock::new();
+    const TTL: Duration = Duration::from_secs(30);
+    let cache = CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+    if let Some((canon, at)) = cache.lock().unwrap().get(path) {
+        if at.elapsed() < TTL {
+            return canon.clone();
+        }
+    }
+    let result = file_canonicalize_path_uncached(path);
+    {
+        let mut c = cache.lock().unwrap();
+        // Bound memory: a long-running app may canonicalize many distinct paths.
+        if c.len() > 8192 {
+            c.clear();
+        }
+        c.insert(path.to_string(), (result.clone(), Instant::now()));
+    }
+    result
+}
+
+fn file_canonicalize_path_uncached(path: &str) -> String {
     // First try the real filesystem call (resolves symlinks for existing paths).
     if let Ok(c) = std::fs::canonicalize(path) {
         return strip_unc(&c.to_string_lossy());
