@@ -2770,6 +2770,39 @@ fn bdru_register_bean_definition(ctx: &mut dyn NativeContext, args: &[Value]) ->
         "(Ljava/lang/String;Lorg/springframework/beans/factory/config/BeanDefinition;)V",
         &[Value::Object(Some(bean_name_obj)), Value::Object(Some(bd))],
     );
+
+    // Register the holder's aliases under the bean name. The real static
+    // `BeanDefinitionReaderUtils.registerBeanDefinition` does, after the
+    // primary registration:
+    //   String[] aliases = definitionHolder.getAliases();
+    //   if (aliases != null)
+    //       for (String alias : aliases) registry.registerAlias(beanName, alias);
+    // Omitting this silently dropped every `<bean name="...">` alias, so
+    // `getBean("<alias>")` threw NoSuchBeanDefinitionException even though the
+    // primary bean was registered (e.g. BeanNamePointcutTests' `testBean1`,
+    // an alias of bean id `tb1`). Replay the loop here so aliases survive the
+    // shim. Only meaningful when the bean name is non-empty (matching
+    // SimpleAliasRegistry.registerAlias, which requires a non-empty name); the
+    // XML parser always promotes the first name to the bean name when no id is
+    // present, so an aliased holder always has a non-empty bean name.
+    if !name.is_empty() {
+        if let Ok(Some(Value::Object(Some(aliases)))) =
+            ctx.invoke_virtual(holder, "getAliases", "()[Ljava/lang/String;", &[])
+        {
+            let n = ctx.array_length(aliases);
+            for i in 0..n {
+                if let Value::Object(Some(alias_obj)) = ctx.get_array_element(aliases, i) {
+                    let bn = ctx.create_string(&name);
+                    let _ = ctx.invoke_virtual(
+                        registry,
+                        "registerAlias",
+                        "(Ljava/lang/String;Ljava/lang/String;)V",
+                        &[Value::Object(Some(bn)), Value::Object(Some(alias_obj))],
+                    );
+                }
+            }
+        }
+    }
     Ok(None)
 }
 
