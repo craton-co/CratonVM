@@ -4103,6 +4103,46 @@ impl SharedVm {
         }
         *out = Some(out_obj);
         *err = Some(err_obj);
+        // FFM/native-access fix: stamp `java.lang.System.initialErr` with the
+        // err stream we just materialised. `jdk.internal.misc.VM.initialErr()`
+        // is `SharedSecrets.getJavaLangAccess().initialSystemErr()`, whose real
+        // JDK body (`java.lang.System$1`) is `getstatic System.initialErr;
+        // areturn`. The real JDK populates that `@Stable` field in
+        // `System.initPhase1()` (System.java:1820); CratonVM boots via a native
+        // `initPhase1` that never set it, so the field stayed null and
+        // `VM.initialErr().printf(...)` NPE'd. That printf is the JDK's
+        // restricted-native-access warning path
+        // (`java.lang.Module.ensureNativeAccess`, Module.java:322), which fires
+        // the first time an FFM downcall binding calls
+        // `SymbolLookup.libraryLookup` without `--enable-native-access`. The NPE
+        // was wrapped as ExceptionInInitializerError for the binding's <clinit>
+        // — e.g. Tomcat's `org.apache.tomcat.util.openssl.openssl_h` — taking
+        // down the entire OpenSSL/TLS protocol handler and ~17 TLS test classes.
+        // A native override on `System$1.initialSystemErr` does NOT help here:
+        // the shim is a real JDK class, so its concrete bytecode runs instead of
+        // the override — only the backing static field is consulted. Resolve the
+        // static slot by name so this is robust to the real-JDK field layout;
+        // a missing field (pure synthetic-jdk System stub) is skipped harmlessly.
+        let sys_initial_err_slot = {
+            let cm = self.class_manager.read();
+            cm.get_loaded_class_id("java/lang/System").and_then(|sid| {
+                cm.get_class(sid).and_then(|c| {
+                    let mut static_idx = 0usize;
+                    for f in &c.fields {
+                        if f.is_static() {
+                            if &*f.name == "initialErr" {
+                                return Some((sid, static_idx));
+                            }
+                            static_idx += 1;
+                        }
+                    }
+                    None
+                })
+            })
+        };
+        if let Some((sid, idx)) = sys_initial_err_slot {
+            super::set_static_shared(self, sid, idx, Value::Object(Some(err_obj)));
+        }
         (out_obj, err_obj)
     }
 }

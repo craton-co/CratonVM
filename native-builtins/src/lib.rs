@@ -2135,6 +2135,13 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // the current thread. Fixes "Cannot invoke currentCarrierThread on null"
     // on KC16 boot after ConcurrentHashMap / Lookup clinit B6-swallows.
     register_t19_h2_shared_secrets_shim(registry);
+    // FFM real-JDK native-library load path: jdk.internal.loader
+    // .RawNativeLibraries.load0/unload0 + NativeLibrary.findEntry0. These back
+    // `java.lang.foreign.SymbolLookup.libraryLookup` when the JDK's own bytecode
+    // runs (real-JDK mode), letting FFM bindings like Tomcat's openssl_h load
+    // libssl/libcrypto. Registered here (the always-compiled essential path)
+    // rather than in the synthetic-only `register_pe_panama`. See the fn doc.
+    crate::panama::register_pe_raw_native_libraries(registry);
     // WP1.4: SharedSecrets.getJavaXxxAccess() factories for the
     // JDK Access interfaces plus the per-interface method natives
     // (currentCarrierThread, doIntersectionPrivilege, copyMethod,

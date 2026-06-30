@@ -1321,6 +1321,90 @@ fn register_pe_symbol_lookup(r: &mut NativeMethodRegistry) {
     );
 }
 
+// --- RawNativeLibraries: the real-JDK FFM native-library load path ---
+//
+// In real-JDK mode `java.lang.foreign.SymbolLookup.libraryLookup(name, arena)`
+// runs the JDK's own bytecode (our higher-level `SymbolLookup.libraryLookup`
+// override does not win over a concrete method body), which routes through
+// `jdk.internal.loader.RawNativeLibraries`:
+//
+//   RawNativeLibraryImpl.open()  → RawNativeLibraries.load0(impl, name)  // dlopen/LoadLibrary
+//   RawNativeLibraryImpl.find()  → NativeLibrary.findEntry0(handle, name) // dlsym/GetProcAddress
+//   RawNativeLibraryImpl.close() → RawNativeLibraries.unload0(name, handle)// dlclose/FreeLibrary
+//
+// All three are real ACC_NATIVE methods, so a registry override always
+// dispatches to them (unlike the concrete-bytecode methods above). Without
+// them, any FFM downcall binding — e.g. Tomcat's `openssl_h` loading
+// libssl/libcrypto — dies in `<clinit>` with
+// `UnsatisfiedLinkError: RawNativeLibraries.load0`. Back them with CratonVM's
+// existing native-library table (the same `load_native_library` /
+// `find_native_symbol` the panama `SymbolLookup` above uses). This makes the
+// VM behave like HotSpot: the load is attempted, and if the library is not
+// present `load0` returns false (the caller returns null and Tomcat falls back
+// to JSSE) rather than raising.
+//
+// NOTE: registered from `register_essential_natives` (the always-compiled,
+// real-JDK path), NOT from `register_pe_panama` — the latter is only reached
+// under `#[cfg(feature = "synthetic-jdk")]` and would be dead-code-eliminated
+// in real-JDK mode, which is exactly where these natives are needed (real-JDK
+// mode runs the JDK's own FFM bytecode, which calls these natives directly).
+pub(crate) fn register_pe_raw_native_libraries(r: &mut NativeMethodRegistry) {
+    let rnl = "jdk/internal/loader/RawNativeLibraries";
+
+    // static native boolean load0(RawNativeLibraryImpl impl, String name)
+    r.register(
+        rnl,
+        "load0",
+        "(Ljdk/internal/loader/RawNativeLibraries$RawNativeLibraryImpl;Ljava/lang/String;)Z",
+        |ctx, args| {
+            let impl_obj = obj_arg(args, 0)?;
+            let name_obj = obj_arg(args, 1)?;
+            let name = ctx.read_string(name_obj).unwrap_or_default();
+            match ctx.load_native_library(&name) {
+                Ok(lib_index) => {
+                    // Stash the library index as the opaque `handle` long.
+                    // Offset by +1 so a valid index 0 never collides with the
+                    // handle==0 "not loaded" sentinel that
+                    // RawNativeLibraryImpl.open() checks before calling load0;
+                    // findEntry0 below decodes it back.
+                    ctx.set_field_by_name(impl_obj, "handle", Value::Long(lib_index + 1));
+                    Ok(Some(Value::Int(1)))
+                }
+                // Match the real native: a failed load returns false (caller
+                // returns null), it does NOT throw.
+                Err(_) => Ok(Some(Value::Int(0))),
+            }
+        },
+    );
+
+    // static native void unload0(String name, long handle)
+    //
+    // CratonVM keeps loaded libraries resident for the VM lifetime (the
+    // native-library table has no unload), so this is a no-op — matching the
+    // RawNativeLibraries contract, which explicitly permits a library to remain
+    // open after close().
+    r.register(rnl, "unload0", "(Ljava/lang/String;J)V", |_ctx, _args| Ok(None));
+
+    // static native long findEntry0(long handle, String name)  (in NativeLibrary)
+    r.register(
+        "jdk/internal/loader/NativeLibrary",
+        "findEntry0",
+        "(JLjava/lang/String;)J",
+        |ctx, args| {
+            let handle = match args.first() {
+                Some(Value::Long(n)) => *n,
+                _ => 0,
+            };
+            let name_obj = obj_arg(args, 1)?;
+            let name = ctx.read_string(name_obj).unwrap_or_default();
+            // Undo the +1 offset applied by load0 to recover the library index.
+            let lib_index = handle - 1;
+            let addr = ctx.find_native_symbol(lib_index, &name).unwrap_or(0);
+            Ok(Some(Value::Long(addr as i64)))
+        },
+    );
+}
+
 // --- Linker: create downcall handles ---
 // DowncallHandle synthetic: [0]=function_address (Long), [1]=descriptor (Object)
 
