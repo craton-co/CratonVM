@@ -1134,8 +1134,18 @@ pub(crate) fn s2_tls_connect(
     Ok(id)
 }
 
-/// NEW-13: read from a TLS stream registered via `s2_tls_connect`.
+/// Client SSLSockets backed by the rustls client path (`t27_tls`) store their
+/// stream id offset by this base, so `s2_tls_read`/`write`/`close` can route to
+/// the rustls stream table instead of the native-tls one. Native-tls and rustls
+/// ids are small counters, so the high offset never collides.
+pub(crate) const RUSTLS_SOCK_ID_BASE: i32 = 0x4000_0000;
+
+/// NEW-13: read from a TLS stream registered via `s2_tls_connect` (native-tls),
+/// or — for ids ≥ `RUSTLS_SOCK_ID_BASE` — the rustls client/server stream table.
 pub(crate) fn s2_tls_read(id: i32, buf: &mut [u8]) -> std::io::Result<usize> {
+    if id >= RUSTLS_SOCK_ID_BASE {
+        return crate::t27_tls::rustls_stream_read(id - RUSTLS_SOCK_ID_BASE, buf);
+    }
     let mut reg = s2_registry().lock();
     match reg.tls_streams.get_mut(&id) {
         Some(entry) => entry.stream.read(buf),
@@ -1146,8 +1156,12 @@ pub(crate) fn s2_tls_read(id: i32, buf: &mut [u8]) -> std::io::Result<usize> {
     }
 }
 
-/// NEW-13: write to a TLS stream registered via `s2_tls_connect`.
+/// NEW-13: write to a TLS stream registered via `s2_tls_connect` (native-tls),
+/// or — for ids ≥ `RUSTLS_SOCK_ID_BASE` — the rustls stream table.
 pub(crate) fn s2_tls_write(id: i32, data: &[u8]) -> std::io::Result<usize> {
+    if id >= RUSTLS_SOCK_ID_BASE {
+        return crate::t27_tls::rustls_stream_write(id - RUSTLS_SOCK_ID_BASE, data);
+    }
     let mut reg = s2_registry().lock();
     match reg.tls_streams.get_mut(&id) {
         Some(entry) => entry.stream.write(data),
@@ -1161,6 +1175,10 @@ pub(crate) fn s2_tls_write(id: i32, data: &[u8]) -> std::io::Result<usize> {
 /// NEW-13: perform a graceful TLS shutdown (close_notify) and drop the stream.
 /// Idempotent: closing an unknown id is a no-op.
 pub(crate) fn s2_tls_close(id: i32) -> std::io::Result<()> {
+    if id >= RUSTLS_SOCK_ID_BASE {
+        crate::t27_tls::rustls_stream_close(id - RUSTLS_SOCK_ID_BASE);
+        return Ok(());
+    }
     let mut reg = s2_registry().lock();
     if let Some(mut entry) = reg.tls_streams.remove(&id) {
         // Best-effort: if the peer already closed the connection, shutdown

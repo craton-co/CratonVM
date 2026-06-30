@@ -33385,6 +33385,11 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             ctx.set_field(this, 1, args.get(1).copied().unwrap_or(Value::Object(None)));
             ctx.set_field(this, 2, args.get(2).copied().unwrap_or(Value::Object(None)));
         }
+        // Stage this keystore's identity for the next SSLContext.init on this
+        // thread (per-SSLContext mTLS identity flow).
+        if let Some(Value::Object(Some(ks))) = args.get(1) {
+            crate::keystore::keystore_set_pending_km_identity(ctx, *ks);
+        }
         Ok(None)
     });
     r.register(

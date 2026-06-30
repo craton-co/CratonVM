@@ -640,6 +640,24 @@ fn read_io_err(prefix: &str, e: std::io::Error) -> String {
     }
 }
 
+/// Read that tolerates an unclean TLS close: many HTTP servers close the TCP
+/// connection at end-of-response without sending a TLS `close_notify`, which
+/// rustls surfaces as `UnexpectedEof` ("peer closed connection without sending
+/// TLS close_notify"). For an HTTP client that is a normal end-of-stream, so map
+/// it to `Ok(0)` (EOF) rather than a hard error.
+fn read_eof_tolerant<S: Read>(stream: &mut S, buf: &mut [u8]) -> std::io::Result<usize> {
+    match stream.read(buf) {
+        Ok(n) => Ok(n),
+        Err(e)
+            if e.kind() == std::io::ErrorKind::UnexpectedEof
+                || e.to_string().contains("close_notify") =>
+        {
+            Ok(0)
+        }
+        Err(e) => Err(e),
+    }
+}
+
 fn read_response<S: Read>(
     stream: &mut S,
     head: bool,
@@ -648,8 +666,7 @@ fn read_response<S: Read>(
     let mut tmp = [0u8; 8192];
     let head_end;
     loop {
-        let n = stream
-            .read(&mut tmp)
+        let n = read_eof_tolerant(stream, &mut tmp)
             .map_err(|e| read_io_err("response read", e))?;
         if n == 0 {
             return Err("connection closed before response head".into());
@@ -721,9 +738,7 @@ fn read_response<S: Read>(
     if let Some(target) = content_length {
         let target = target.min(MAX_RESPONSE_BODY);
         while body_buf.len() < target {
-            let n = stream
-                .read(&mut tmp)
-                .map_err(|e| format!("body read: {e}"))?;
+            let n = read_eof_tolerant(stream, &mut tmp).map_err(|e| format!("body read: {e}"))?;
             if n == 0 {
                 break;
             }
@@ -732,9 +747,7 @@ fn read_response<S: Read>(
         body_buf.truncate(target);
     } else {
         loop {
-            let n = stream
-                .read(&mut tmp)
-                .map_err(|e| format!("body read: {e}"))?;
+            let n = read_eof_tolerant(stream, &mut tmp).map_err(|e| format!("body read: {e}"))?;
             if n == 0 {
                 break;
             }
@@ -836,7 +849,17 @@ fn perform(
     let req = build_request(method, parsed, headers, body);
 
     if parsed.scheme == "https" {
-        let cfg = shared_legacy_config();
+        // Build a client config that trusts the gathered test/truststore roots
+        // (not just the OS root store — a loopback test server's cert is signed
+        // by a test CA) and presents the client certificate installed via
+        // HttpsURLConnection.setDefaultSSLSocketFactory (mTLS). Falls back to the
+        // cached system-roots config when no test roots / client identity exist.
+        let huc_ident = crate::t27_tls::huc_default_client_identity();
+        let cfg = crate::t27_tls::build_engine_client_config_with_identity(
+            &["http/1.1"],
+            huc_ident.as_ref().map(|(c, k)| (c.as_str(), k.as_str())),
+        )
+        .unwrap_or_else(|_| shared_legacy_config());
         let server_name = ServerName::try_from(parsed.host.clone())
             .map_err(|e| format!("bad server name {}: {e}", parsed.host))?;
         let conn = ClientConnection::new(cfg, server_name)
