@@ -1,49 +1,66 @@
-# OPEN: blocked-thread GC sweep frees live AQS condition objects (Tomcat DoHead)
+# PARTIALLY FIXED: Tomcat DoHead start/stop GC corruption flood
 
-**Status:** OPEN. Gates the Tomcat `TestHttpServletDoHead*` family from going fully green.
-Spawned-task id: `task_6fd2be1e`. Full investigation: memory note
-`reference_tomcat_dohead_gc_safepoint_deadlock`.
+**Status:** Dominant cause FIXED (branch `fix/dohead-aqs-gc-sweep`, commit `2ea402b7`).
+A narrower residual remains (AQS blocked-thread sweep gap). Full investigation:
+memory notes `reference_tomcat_dohead_gc_safepoint_deadlock` and
+`reference_tomcat_dohead_reflectiondata_sidestore_gc`.
 
 ## Symptom
 Running `jakarta.servlet.http.TestHttpServletDoHeadInvalidWrite0ValidWrite0` (~156
-sub-tests, each a full Tomcat start/stop) is flaky: usually finishes
-`Tests run: 156, Failures: 1`, occasionally crashes mid-run with a linkage error
-(e.g. `java/lang/Object.hasNext()Z`). During one `LifecycleBase.stop()` the stderr
-floods with:
-- `cratonvm::gc::guard: gen_heap::get/set_field out-of-bounds ... class_id=ClassId(0) class_name=java/lang/Object num_slots=0`
-- `Stale pointer detected in invokevirtual receiver (ptr=0x..., all-zero header)` for
-  `AbstractQueuedSynchronizer$ConditionNode` / `$ConditionObject`
-- then `implicit monitorexit on synchronized-method-frame-pop failed ... does not own the monitor`
-  and cascade NPEs (`mapperListener` null, `utilityExecutorLock` null).
+sub-tests, each a full Tomcat start/stop) floods stderr with:
+- `Stale pointer detected in invokevirtual receiver (ptr=0x..., all-zero header)`
+- `gen_heap::get/set_field: out-of-bounds field read dropped ... class_id=ClassId(0)`
+- cascade NPEs / `implicit monitorexit ... does not own the monitor`.
 
-## Root cause
-A stop-the-world young GC fired while executor/worker threads are **parked on AQS
-conditions** during Tomcat shutdown **frees those threads' live `ConditionNode`/
-`ConditionObject`** (all-zero header = swept while still reachable). This is the
-documented "blocked-thread / moving-young GC sweep gap": live young objects held by
-a parked thread are reclaimed. The existing `plausible_heap_pointer` gates only
-*contain* it (drop the bad reads → no SIGSEGV); the underlying free-of-live-object
-is unfixed. Related: `reference_stale_ref_decode_hardening` ("Underlying GC sweep gap
-unfixed"), `reference_blocked_thread_gc_gap`, `reference_hib_temporal_gc_lambda_native_corruption`.
+## Root cause #1 — reflectionData side-store root-hole (FIXED)
+The **first victim is always a `java/lang/ref/SoftReference`**, cascading to
+Method/Field/List/etc. — a GC root-hole in the native-builtins synthetic-offset
+side stores. `static_obj_store`, `synthetic_field_store` and
+`class_atomic_side_store` hold live `ObjectRef`s that exist in **no heap slot**
+(the synthetic-offset scheme services `Unsafe` load/CAS/store from a Rust-side map
+when the field's real slot is unknown to our layout). They were never wired into
+GC root scanning / remapping, so the collector cannot reach them through the heap
+graph. Chief offender: `Class$Atomic.casReflectionData` / `Class.newReflectionData`
+stow the `SoftReference<ReflectionData>` for a Class mirror here; a young GC then
+reclaims that still-live SoftReference and the whole reflection subgraph decays.
 
-The recently-merged GC-safepoint-deadlock fix (blocking accept/read made
-GC-cooperative) is what lets the tests reach `stop()` and hit this; the trigger is
-the park-based blocking in `stop()` (`LockSupport.park` → `vm_exec` park →
-`enter_blocked` → `deposit_root_snapshot`).
+Separately, `Class.reflectionData()` reads `this.reflectionData` (heap **slot 11**)
+directly — an old(Class mirror)→young(SoftReference) edge whose card **never goes
+dirty** (`CRATONVM_DBG_RSET_AUDIT`: `Class fld[11] -> young CLEAN` every cycle), so
+even with the side store rooted the direct getfield reads a freed/relocated ref.
 
-## Where to look
-- `vm/src/vm/vm_exec.rs` — `park` / `begin_blocking_region` / `deposit_root_snapshot`
-  (is the parked thread's root snapshot complete?).
-- `vm/src/threading/thread_registry.rs` — `collect_all_root_snapshots`.
-- `vm/src/memory/gc.rs` — the young sweep; does marking follow heap edges from rooted
-  AQS `ConditionObject.firstWaiter/lastWaiter → ConditionNode`?
+**Fix (commit 2ea402b7):**
+1. `gc_scan_unsafe_side_store_roots` (→ `roots.rs` collect_roots) +
+   `gc_update_unsafe_side_store_refs` (→ `gc.rs` update_all_roots): the side stores
+   are now scanned as roots and remapped, mirroring the established
+   `gc_scan_value_of_cache_roots` pattern.
+2. Override `Class.reflectionData()` with a native that reads the now-GC-safe cas
+   side store instead of the dangling heap slot 11.
+
+**Validated:** the SoftReference / reflection-subgraph cascade is eliminated
+(36 diverse stale receivers → 2); the run progresses ~2× further before the
+residual below bites.
+
+## Root cause #2 — AQS blocked-thread sweep gap (OPEN, residual)
+After fix #1, the only remaining stale receivers are
+`java/util/concurrent/locks/AbstractQueuedSynchronizer$ConditionNode` /
+`$ConditionObject`. `CRATONVM_DBG_STALE_RECV` shows a **ScheduledThreadPoolExecutor
+worker parked in `DelayedWorkQueue.take()` → `ConditionObject.awaitNanos()`**: its
+`ConditionNode` (awaitNanos LOCAL[3]) **and** the `DelayedWorkQueue` receiver
+(take LOCAL[0]) read all-zero — reclaimed while the worker is parked. This is the
+documented blocked-thread / moving-young GC sweep gap (a parked thread's live frame
+objects reclaimed): `reference_blocked_thread_gc_gap`,
+`reference_stale_ref_decode_hardening` ("underlying GC sweep gap unfixed"). The
+`plausible_heap_pointer` gates contain it (no SIGSEGV) but it still surfaces as a
+late corruption. Suspected angle: a worker marked dead (or whose snapshot is not
+collected) during executor shutdown while still parked in `awaitNanos`, so
+`collect_all_root_snapshots` (alive-only) skips its frame roots.
 
 ## Repro / validate (PowerShell, from `apps/tomcat-suite-runner`)
 ```
 .\run-tomcat-suite.ps1 -Vm craton -Jit on -Jdk real -Category all -RunName gcbug -Start 28 -Count 1 -TimeoutSec 700 -Parallel 1
 ```
-Env (runner sets these): `CRATONVM_REAL_NET_SOCKETS=1`, `CRATONVM_REAL_AQS=1`,
-`CRATONVM_ROOTSNAP_CACHE=1`. Build a uniquely-named binary in a separate worktree
-(`reference_worktree_build_recipe`). **Goal:** `Tests run: 156, Failures: 0`
-reliably, with no all-zero-header warnings. Tools: `--stack-dump-on-timeout`, cdb
-attach, `CRATONVM_GC_STATS=1`.
+Env: `CRATONVM_REAL_NET_SOCKETS=1`, `CRATONVM_REAL_AQS=1`, `CRATONVM_ROOTSNAP_CACHE=1`.
+Diagnostics: `CRATONVM_DBG_STALE_RECV=1` (frame dump), `CRATONVM_DBG_RSET_AUDIT=1`
+(clean-card audit). Build a uniquely-named binary in a separate worktree.
+**Goal:** `Tests run: 156, Failures: 0` with no all-zero-header warnings.
