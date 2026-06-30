@@ -7087,7 +7087,7 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         "java/lang/reflect/Array",
         "multiNewArray",
         "(Ljava/lang/Class;[I)Ljava/lang/Object;",
-        lang_system::native_array_new_array,
+        lang_system::native_array_multi_new_array,
     );
 
     // --- java/lang/invoke/MethodHandle (signature-polymorphic) ---
@@ -40971,17 +40971,13 @@ fn native_array_new_instance_multi(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    let dims = match args.get(1) {
-        Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(Some(Value::Object(None))),
-    };
-    let len = match ctx.get_array_element(dims, 0) {
-        Value::Int(v) => v.max(0) as usize,
-        _ => 0,
-    };
-    let comp_name = array_new_instance_component_name(ctx, args.first());
-    let arr = array_new_instance_for_component(ctx, &comp_name, len);
-    Ok(Some(Value::Object(Some(arr))))
+    // `Array.newInstance(Class, int[])` must fully materialize ALL dimensions
+    // with the precise nested array type (`String[2][2]` → `[[Ljava/lang/String;`).
+    // The previous body read only `dims[0]` and built a one-dimensional array,
+    // collapsing e.g. `new String[2][2]` to `String[]`
+    // (SpEL ArrayConstructorTests.multiDimensionalArrays). Delegate to the
+    // shared nested-array builder, which also backs `Array.multiNewArray`.
+    lang_system::native_array_multi_new_array(ctx, args)
 }
 
 // ===========================================================================
