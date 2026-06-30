@@ -2957,12 +2957,47 @@ pub(crate) fn coerce_arg_strict(
                 ))),
             }
         }
-        // Reference type expected — null and matching references are OK.
-        // Full assignability (L-type subclass checks, array-of-array) are
-        // handled by the VM on invoke via its verifier; we just ensure the
-        // slot kind is an Object.
+        // Reference type expected — null and assignable references are OK.
         _ => match value {
-            Value::Object(_) => Ok(value),
+            // null is assignable to any reference type.
+            Value::Object(None) => Ok(value),
+            Value::Object(Some(obj)) => {
+                // JDK contract: `Method.invoke` / `Constructor.newInstance` /
+                // `Field.set` throw `IllegalArgumentException("argument type
+                // mismatch")` BEFORE dispatch when a reference argument is not
+                // assignable to the formal parameter (field) type. CratonVM
+                // dispatches without a per-arg `checkcast`, so an unassignable
+                // reference would otherwise flow silently into the callee — e.g.
+                // an `Integer` handed to a `String` parameter runs the body and
+                // returns a bogus value instead of throwing. (Spring's
+                // `SimpleInstantiationStrategy` relies on this IAE to surface
+                // "Illegal arguments to factory method".)
+                //
+                // Be conservative to avoid false rejections: only REJECT when we
+                // can positively resolve the formal type to a concrete
+                // (non-interface) class and prove the argument is not a subtype.
+                // Pass through whenever the formal type is `Object`, an
+                // interface, an array, or unresolvable — those are either always
+                // assignable or cannot be checked safely here. This mirrors the
+                // receiver assignability check in `native_method_invoke`.
+                if expected_desc.starts_with('L') && expected_desc.ends_with(';') {
+                    let internal = &expected_desc[1..expected_desc.len() - 1];
+                    if internal != "java/lang/Object" {
+                        if let Some(expected_cid) = ctx.class_id_by_name(internal) {
+                            if !ctx.is_interface_class(expected_cid) {
+                                let arg_cid = ctx.class_id_of_object(obj);
+                                if !ctx.is_subclass(arg_cid, expected_cid) {
+                                    return Err(illegal_arg_exc(
+                                        "argument type mismatch".to_string(),
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
+                Ok(value)
+            }
+            // A primitive `Value` reached a reference parameter.
             // JDK-faithful "argument type mismatch" (see note above).
             _ => Err(illegal_arg_exc("argument type mismatch".to_string())),
         },
@@ -6862,6 +6897,24 @@ pub(crate) fn native_constructor_new_instance(
         let abstract_bit = cratonvm_types::access_flags::ACC_ABSTRACT;
         let iface_bit = cratonvm_types::access_flags::ACC_INTERFACE;
         if flags & (abstract_bit | iface_bit) != 0 {
+            // `java.lang.reflect.Constructor.newInstance` throws a real
+            // `java.lang.InstantiationException` (NOT IllegalStateException) on
+            // an abstract/interface target. The exact type matters: Spring's
+            // `BeanUtils.instantiateClass` catches `InstantiationException`
+            // specifically to rethrow `BeanInstantiationException("Is it an
+            // abstract class?")` (DefaultListableBeanFactoryTests
+            // .beanDefinitionWithAbstractClass). With the wrong type that catch
+            // is missed and the bean appears to instantiate.
+            let dotted = class_name.replace('/', ".");
+            let msg = ctx.create_string(&dotted);
+            if let Ok(Some(Value::Object(Some(exc)))) = ctx.new_object_initialized(
+                "java/lang/InstantiationException",
+                "(Ljava/lang/String;)V",
+                &[Value::Object(Some(msg))],
+            ) {
+                return Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(exc));
+            }
+            // Fallback if the exception class can't be constructed.
             return Err(cratonvm_types::error::RuntimeError::IllegalStateException {
                 message: format!(
                     "InstantiationException: cannot instantiate abstract/interface type {class_name}"

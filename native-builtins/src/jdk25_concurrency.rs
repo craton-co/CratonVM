@@ -763,12 +763,28 @@ fn native_sts_fork(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         ctx.set_field(worker, THREAD_FIELD_TARGET, Value::Object(Some(runner)));
         ctx.set_field(worker, THREAD_FIELD_VIRTUAL, Value::Int(0));
     } else {
-        // Real-JDK Thread: set name + target by name; leave the rest to the
-        // real field layout (thread_start fills in tid/daemon itself, and a
-        // plain Thread is non-virtual by construction). Do NOT write fixed slots
-        // — they hold unrelated real fields.
-        ctx.set_field_by_name(worker, "name", Value::Object(Some(name)));
-        ctx.set_field_by_name(worker, "target", Value::Object(Some(runner)));
+        // Real-JDK Thread: drive the registered
+        // `Thread.<init>(ThreadGroup, Runnable, String)` native instead of
+        // poking fields by name. That native runs `populate_real_thread_holder`,
+        // which allocates and links `Thread$FieldHolder` (group/priority/
+        // daemon/threadStatus) AND stores the runnable as `holder.task` — the
+        // slot `Thread.run()` actually reads. Setting `target` by name does NOT
+        // work on a real-JDK Thread (there is no top-level `target` field; it
+        // lives in the FieldHolder), and leaving `holder` null makes every
+        // holder access (`getThreadGroup`/`getPriority`/`isDaemon`) NPE with
+        // "Cannot read field ... because this.holder is null". Mirrors the HTTP
+        // dispatcher worker in `net_phase_e::re10_spawn_dispatcher`.
+        let _ = ctx.invoke(
+            "java/lang/Thread",
+            "<init>",
+            "(Ljava/lang/ThreadGroup;Ljava/lang/Runnable;Ljava/lang/String;)V",
+            &[
+                Value::Object(Some(worker)),
+                Value::Object(None),
+                Value::Object(Some(runner)),
+                Value::Object(Some(name)),
+            ],
+        );
     }
 
     // Record the (subtask, worker) pair BEFORE starting so a racing fast worker

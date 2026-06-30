@@ -107,7 +107,27 @@ pub struct ThreadRegistry {
     /// Keyed by `ObjectRef::as_ptr() as usize` because `ObjectRef`
     /// already hashes by pointer; we just need a `Hash + Eq` form.
     thread_obj_to_park: Mutex<FxHashMap<usize, Arc<ParkState>>>,
+    /// Vacated heap addresses of relocated `java.lang.Thread` mirrors →
+    /// owning thread id, for stale-receiver recovery (see
+    /// [`Self::recover_stale_mirror`]). Populated by
+    /// `update_thread_objs_after_gc` every time a moving / promoting young
+    /// collection relocates a mirror: the address the GC vacated. A running
+    /// or blocked frame that resumed holding a not-yet-remapped copy of that
+    /// OLD address (the frame/operand remap-coverage gap documented in
+    /// `docs/known-issues/gc-blocked-thread-frame-stale-thread-mirror.md`)
+    /// can then recover the live mirror instead of reading a zeroed object's
+    /// null `holder` and NPEing in `Thread.getThreadGroup` (Tomcat
+    /// `TestDigestAuthenticator` et al.). `.0` is the lookup map; `.1` is the
+    /// FIFO eviction order bounding it to `FORMER_MIRROR_CAP` entries.
+    former_mirror_addrs: Mutex<(FxHashMap<usize, ThreadId>, std::collections::VecDeque<usize>)>,
 }
+
+/// Upper bound on retained former-mirror addresses (see
+/// [`ThreadRegistry::former_mirror_addrs`]). Mirrors relocate rarely, and a
+/// stale frame copy is only consultable until its slot is reclaimed/reused,
+/// so a few thousand recent vacated addresses is ample; the FIFO bound keeps
+/// the table from growing across a long-running process.
+const FORMER_MIRROR_CAP: usize = 8192;
 
 impl ThreadRegistry {
     /// Create a new, empty registry. The next thread id will be 1
@@ -117,6 +137,7 @@ impl ThreadRegistry {
             threads: Mutex::new(FxHashMap::default()),
             next_id: AtomicU64::new(1),
             thread_obj_to_park: Mutex::new(FxHashMap::default()),
+            former_mirror_addrs: Mutex::new((FxHashMap::default(), std::collections::VecDeque::new())),
         }
     }
 
@@ -437,6 +458,43 @@ impl ThreadRegistry {
             .and_then(|e| e.java_thread_obj)
     }
 
+    /// Record that thread `tid`'s `java.lang.Thread` mirror just vacated
+    /// `old_addr` because a moving / promoting GC relocated it. Enables
+    /// [`Self::recover_stale_mirror`] to repair a frame that resumed holding a
+    /// stale copy of `old_addr`. Bounded FIFO ([`FORMER_MIRROR_CAP`]). Takes
+    /// only the `former_mirror_addrs` lock — callers must NOT hold the
+    /// `threads` lock across this (see `update_thread_objs_after_gc`, which
+    /// records only after dropping `threads`) so the lock order stays
+    /// `threads → former`, opposite to `recover_stale_mirror`'s
+    /// `former → threads`; neither nests, so they cannot deadlock.
+    fn record_former_mirror_addr(&self, old_addr: usize, tid: ThreadId) {
+        let mut g = self.former_mirror_addrs.lock();
+        let (map, order) = &mut *g;
+        if map.insert(old_addr, tid).is_none() {
+            order.push_back(old_addr);
+            while order.len() > FORMER_MIRROR_CAP {
+                if let Some(evict) = order.pop_front() {
+                    map.remove(&evict);
+                }
+            }
+        }
+    }
+
+    /// If `stale_addr` is a recorded former address of some thread's
+    /// `java.lang.Thread` mirror, return that thread's CURRENT (live,
+    /// GC-remapped) mirror so a stale-receiver use site can recover. Identity
+    /// preserving — a vacated address uniquely identified one thread's mirror,
+    /// so the returned mirror is the right thread's even if a *different*
+    /// thread is executing. The caller must still verify the returned object
+    /// is live (non-zero header) before use.
+    pub fn recover_stale_mirror(&self, stale_addr: usize) -> Option<ObjectRef> {
+        let tid = {
+            let g = self.former_mirror_addrs.lock();
+            *g.0.get(&stale_addr)?
+        };
+        self.java_thread_obj(tid)
+    }
+
     /// Set the Java Thread object for a given ThreadId.
     pub fn set_java_thread_obj(&self, thread_id: ThreadId, obj: ObjectRef) {
         let park_state_clone;
@@ -706,13 +764,17 @@ impl ThreadRegistry {
         }
         let mut threads = self.threads.lock();
         let mut rekeyed: Vec<(usize, usize)> = Vec::new();
-        for entry in threads.values_mut() {
+        // Vacated mirror addresses + owning tid, recorded into
+        // `former_mirror_addrs` AFTER `threads` is dropped (lock order).
+        let mut vacated: Vec<(usize, ThreadId)> = Vec::new();
+        for (tid, entry) in threads.iter_mut() {
             if let Some(ref mut obj) = entry.java_thread_obj {
                 let old_addr = obj.as_ptr() as usize;
                 if let Some(&new_addr) = pointer_map.get(&old_addr) {
                     // SAFETY: produced by the GC pointer map.
                     *obj = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
                     rekeyed.push((old_addr, new_addr));
+                    vacated.push((old_addr, *tid));
                 }
             }
             // B1 fix — repoint a pending async-exception slot too. It stores
@@ -741,6 +803,12 @@ impl ThreadRegistry {
                     idx.insert(new_addr, ps);
                 }
             }
+        }
+        // Record vacated mirror addresses for stale-receiver recovery. Done
+        // here (threads lock released) to preserve the threads → former lock
+        // order; see `record_former_mirror_addr`.
+        for (old_addr, tid) in vacated {
+            self.record_former_mirror_addr(old_addr, tid);
         }
     }
 

@@ -4223,13 +4223,16 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         } else {
             format!("/{norm}")
         };
-        let uri_str = format!("file://{abs}");
+        // Percent-encode the path so chars like `#`/` `/`?` stay part of the path
+        // (matches HotSpot's `Path.toUri()` — see the other `toUri` registration).
+        let encoded = encode_file_uri_path(&abs);
+        let uri_str = format!("file://{encoded}");
         let uri = alloc_concurrent_synthetic(ctx, "java/net/URI", 7);
         let raw = ctx.create_string(&uri_str);
         ctx.set_field(uri, 0, Value::Object(Some(raw)));
         let scheme = ctx.create_string("file");
         ctx.set_field(uri, 1, Value::Object(Some(scheme)));
-        let path_str = ctx.create_string(&norm);
+        let path_str = ctx.create_string(&abs);
         ctx.set_field(uri, 4, Value::Object(Some(path_str)));
         Ok(Some(Value::Object(Some(uri))))
     });
@@ -7113,12 +7116,21 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             prefixed = format!("/{}", p);
             &prefixed
         };
-        let uri_str = format!("file://{}", slash_p);
+        // Percent-encode the path component, matching `java.nio.file.Path.toUri()`
+        // (and `File.toURI()`): a path char like `#`, ` `, `?` must be `%`-escaped
+        // so it stays part of the path rather than being parsed as a URI fragment
+        // or query. HotSpot renders `…/resource#test1.txt` as
+        // `file:///…/resource%23test1.txt`; leaving the `#` literal made
+        // `toUri().toURL()` drop everything after it (Spring's
+        // PathMatchingResourcePatternResolver URL/URI-syntax assertions).
+        let encoded = encode_file_uri_path(slash_p);
+        let uri_str = format!("file://{}", encoded);
         let uri = alloc_concurrent_synthetic(ctx, "java/net/URI", 5);
         let s = ctx.create_string(&uri_str);
         ctx.set_field(uri, 0, Value::Object(Some(s)));
-        // field 4 = path component
-        let path_s = ctx.create_string(&p);
+        // field 4 = (decoded) path component, with the leading-slash form the JDK
+        // exposes via `URI.getPath()` (e.g. `/C:/…/resource#test1.txt`).
+        let path_s = ctx.create_string(slash_p);
         ctx.set_field(uri, 4, Value::Object(Some(path_s)));
         Ok(Some(Value::Object(Some(uri))))
     });
@@ -15758,15 +15770,14 @@ pub fn register_p59_jar(r: &mut NativeMethodRegistry) {
                 Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
                 _ => return Ok(Some(Value::Object(None))),
             };
-            if let Ok(file) = std::fs::File::open(&path) {
-                if let Ok(mut archive) = zip::ZipArchive::new(file) {
-                    if let Ok(entry) = archive.by_name(&entry_name) {
-                        let size = entry.size() as i64;
-                        let csize = entry.compressed_size() as i64;
-                        #[allow(deprecated)]
-                        let method = entry.compression().to_u16() as i32;
-                        let crc = entry.crc32() as i64 & 0xFFFF_FFFFi64;
-                        drop(entry);
+            // Cached parse (O(1) per call; avoids re-parsing the central
+            // directory on every lookup — see `jar_contents_cached`).
+            if let Some(contents) = jar_contents_cached(&path) {
+                if let Some(rec) = contents.by_name.get(&entry_name) {
+                        let size = rec.size;
+                        let csize = rec.csize;
+                        let method = rec.method;
+                        let crc = rec.crc;
                         let ze = alloc_concurrent_synthetic(ctx, "java/util/jar/JarEntry", 4);
                         let name_s = ctx.create_string(&entry_name);
                         ctx.set_field(ze, 0, Value::Object(Some(name_s)));
@@ -15786,7 +15797,6 @@ pub fn register_p59_jar(r: &mut NativeMethodRegistry) {
                         ctx.set_field_by_name(ze, "method", Value::Int(method));
                         ctx.set_field_by_name(ze, "crc", Value::Long(crc));
                         return Ok(Some(Value::Object(Some(ze))));
-                    }
                 }
             }
             Ok(Some(Value::Object(None)))
@@ -15814,15 +15824,10 @@ pub fn register_p59_jar(r: &mut NativeMethodRegistry) {
                 },
                 _ => return Ok(Some(Value::Object(None))),
             };
-            let bytes: Option<Vec<u8>> = (|| {
-                use std::io::Read;
-                let f = std::fs::File::open(&path).ok()?;
-                let mut a = zip::ZipArchive::new(f).ok()?;
-                let mut e = a.by_name(&entry_name).ok()?;
-                let mut buf = Vec::new();
-                e.read_to_end(&mut buf).ok()?;
-                Some(buf)
-            })();
+            // Cached parse + decompress (O(1) per call; avoids re-parsing the
+            // whole central directory on every entry — see `jar_contents_cached`).
+            let bytes: Option<std::sync::Arc<Vec<u8>>> =
+                jar_contents_cached(&path).and_then(|c| c.by_name.get(&entry_name).map(|r| r.bytes.clone()));
             let bytes = match bytes {
                 Some(b) => b,
                 None => return Ok(Some(Value::Object(None))),
@@ -16708,6 +16713,92 @@ fn spring_default_app_ctx_factory_create(
 // 4-field synthetic JarEntry instances (name, size, compressedSize, method).
 // =============================================================================
 
+/// One central-directory entry's metadata plus its decompressed bytes.
+pub(crate) struct JarEntryRec {
+    pub(crate) size: i64,
+    pub(crate) csize: i64,
+    pub(crate) method: i32,
+    pub(crate) crc: i64,
+    pub(crate) bytes: std::sync::Arc<Vec<u8>>,
+}
+
+/// Whole-jar parsed contents: per-name records plus central-directory order.
+pub(crate) struct JarContents {
+    pub(crate) by_name: std::collections::HashMap<String, JarEntryRec>,
+    pub(crate) order: Vec<String>,
+}
+
+/// Per-path cache of a JAR's parsed central directory + decompressed entries.
+///
+/// The `java.util.jar.JarFile` natives (`getInputStream`/`getEntry`/`entries`/
+/// `stream`/lookup) previously called `zip::ZipArchive::new(file)` on EVERY
+/// call, which re-reads and re-parses the whole central directory each time.
+/// Tomcat's `ContextConfig` annotation scanner calls `getInputStream` once per
+/// `.class` entry, making that O(N²) over a jar's entry count — for a large jar
+/// like byte-buddy (~3k classes) the web-fragment scan never finishes within
+/// the test timeout (TestValidator HANG; it passes on HotSpot where each lookup
+/// is O(1)). Parse + decompress once and cache, keyed by (path, mtime) so a jar
+/// rewritten on disk (e.g. a test-generated temp jar) is not served stale.
+pub(crate) fn jar_contents_cached(path: &str) -> Option<std::sync::Arc<JarContents>> {
+    use std::sync::{Arc, Mutex, OnceLock};
+    static CACHE: OnceLock<Mutex<std::collections::HashMap<String, Arc<JarContents>>>> =
+        OnceLock::new();
+    if path.is_empty() {
+        return None;
+    }
+    let mtime = std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let key = format!("{path}\u{0}{mtime}");
+    let cache = CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+    if let Some(c) = cache.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
+        return Some(c.clone());
+    }
+    // Build outside the lock (decompression can be slow); a concurrent racer
+    // just rebuilds and the last writer wins — the contents are identical.
+    let file = std::fs::File::open(path).ok()?;
+    let mut archive = zip::ZipArchive::new(file).ok()?;
+    let len = archive.len();
+    let mut by_name = std::collections::HashMap::with_capacity(len);
+    let mut order = Vec::with_capacity(len);
+    for i in 0..len {
+        use std::io::Read;
+        let Ok(mut entry) = archive.by_index(i) else {
+            continue;
+        };
+        let name = entry.name().to_string();
+        let size = entry.size() as i64;
+        let csize = entry.compressed_size() as i64;
+        #[allow(deprecated)]
+        let method = entry.compression().to_u16() as i32;
+        let crc = entry.crc32() as i64 & 0xFFFF_FFFFi64;
+        let mut buf = Vec::with_capacity(entry.size() as usize);
+        if entry.read_to_end(&mut buf).is_err() {
+            continue;
+        }
+        order.push(name.clone());
+        by_name.insert(
+            name,
+            JarEntryRec {
+                size,
+                csize,
+                method,
+                crc,
+                bytes: Arc::new(buf),
+            },
+        );
+    }
+    let contents = Arc::new(JarContents { by_name, order });
+    cache
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(key, contents.clone());
+    Some(contents)
+}
+
 /// Read the central directory of `path` and return a Vec of allocated
 /// synthetic `java/util/jar/JarEntry` ObjectRefs. Returns an empty Vec on
 /// any I/O / zip-parse error so callers see an empty Stream rather than
@@ -16716,31 +16807,19 @@ fn p59_jar_collect_entries(ctx: &mut dyn NativeContext, path: &str) -> Vec<Value
     if path.is_empty() {
         return Vec::new();
     }
-    let file = match std::fs::File::open(path) {
-        Ok(f) => f,
-        Err(_) => return Vec::new(),
+    let contents = match jar_contents_cached(path) {
+        Some(c) => c,
+        None => return Vec::new(),
     };
-    let mut archive = match zip::ZipArchive::new(file) {
-        Ok(a) => a,
-        Err(_) => return Vec::new(),
-    };
-    let len = archive.len();
-    let mut out = Vec::with_capacity(len);
-    for i in 0..len {
-        let (name, size, csize, method, crc) = match archive.by_index(i) {
-            Ok(entry) => {
-                let name = entry.name().to_string();
-                let size = entry.size() as i64;
-                let csize = entry.compressed_size() as i64;
-                #[allow(deprecated)]
-                let method = entry.compression().to_u16() as i32;
-                let crc = entry.crc32() as i64 & 0xFFFF_FFFFi64;
-                (name, size, csize, method, crc)
-            }
-            Err(_) => continue,
+    let mut out = Vec::with_capacity(contents.order.len());
+    for name in &contents.order {
+        let rec = match contents.by_name.get(name) {
+            Some(r) => r,
+            None => continue,
         };
+        let (size, csize, method, crc) = (rec.size, rec.csize, rec.method, rec.crc);
         let je = alloc_concurrent_synthetic(ctx, "java/util/jar/JarEntry", 4);
-        let name_s = ctx.create_string(&name);
+        let name_s = ctx.create_string(name);
         ctx.set_field(je, 0, Value::Object(Some(name_s)));
         ctx.set_field(je, 1, Value::Long(size));
         ctx.set_field(je, 2, Value::Long(csize));
@@ -16769,25 +16848,19 @@ fn p59_jar_lookup_entry(ctx: &mut dyn NativeContext, path: &str, entry_name: &st
     if path.is_empty() || entry_name.is_empty() {
         return Value::Object(None);
     }
-    let file = match std::fs::File::open(path) {
-        Ok(f) => f,
-        Err(_) => return Value::Object(None),
+    let contents = match jar_contents_cached(path) {
+        Some(c) => c,
+        None => return Value::Object(None),
     };
-    let mut archive = match zip::ZipArchive::new(file) {
-        Ok(a) => a,
-        Err(_) => return Value::Object(None),
-    };
-    let (name, size, csize, method, crc) = match archive.by_name(entry_name) {
-        Ok(entry) => {
-            let name = entry.name().to_string();
-            let size = entry.size() as i64;
-            let csize = entry.compressed_size() as i64;
-            #[allow(deprecated)]
-            let method = entry.compression().to_u16() as i32;
-            let crc = entry.crc32() as i64 & 0xFFFF_FFFFi64;
-            (name, size, csize, method, crc)
-        }
-        Err(_) => return Value::Object(None),
+    let (name, size, csize, method, crc) = match contents.by_name.get(entry_name) {
+        Some(rec) => (
+            entry_name.to_string(),
+            rec.size,
+            rec.csize,
+            rec.method,
+            rec.crc,
+        ),
+        None => return Value::Object(None),
     };
     let je = alloc_concurrent_synthetic(ctx, "java/util/jar/JarEntry", 4);
     let name_s = ctx.create_string(&name);

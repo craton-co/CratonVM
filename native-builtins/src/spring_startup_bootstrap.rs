@@ -148,240 +148,6 @@ fn create_environment(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCal
     Ok(Some(Value::Object(Some(get_noop_environment(ctx)))))
 }
 
-// ──────────────────────────────────────────────────────────────────────────────
-// MutablePropertySources native re-implementations.
-//
-// Spring's `MutablePropertySources.replace/addBefore/addAfter(name, source)`
-// dispatch through `assertPresentAndGetIndex(name)`, which calls
-// `propertySourceList.indexOf(PropertySource.named(name))`.  That `indexOf`
-// requires the placeholder PropertySource (named-only) and the real
-// `SystemEnvironmentPropertySource` entry stored in the COWAL to compare equal
-// via `PropertySource.equals(Object)` (compares names).
-//
-// In CratonVM's partial bootstrap, `List.indexOf` + virtual dispatch on
-// `PropertySource.equals` does not match — likely because the bytecode-side
-// equality runs against placeholder/element pairs whose runtime classes have
-// not had `equals` linked to the override on `PropertySource`.  The list IS
-// populated (we can see `systemProperties` / `systemEnvironment` entries via
-// `get(name)` which iterates by name), but `assertPresentAndGetIndex` still
-// fails, producing `IllegalArgumentException: PropertySource named
-// 'systemEnvironment' does not exist`.
-//
-// Fix: re-implement `replace`, `addBefore`, `addAfter` natively — iterate the
-// COWAL's `array` by name (the same logic Spring's `get(name)` uses, which
-// works), then replace / insert at the appropriate index via a copy-on-write
-// new array. This sidesteps the broken `indexOf(PropertySource.named(name))`
-// path entirely.
-// ──────────────────────────────────────────────────────────────────────────────
-
-fn mps_replace_traced(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
-        Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(None),
-    };
-    let name = args
-        .get(1)
-        .and_then(|v| {
-            if let Value::Object(Some(s)) = v {
-                ctx.read_string(*s)
-            } else {
-                None
-            }
-        })
-        .unwrap_or_default();
-    let source = args.get(2).copied().unwrap_or(Value::Object(None));
-    mps_replace_impl(ctx, this, &name, source)
-}
-
-fn mps_add_before_traced(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
-        Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(None),
-    };
-    let name = args
-        .get(1)
-        .and_then(|v| {
-            if let Value::Object(Some(s)) = v {
-                ctx.read_string(*s)
-            } else {
-                None
-            }
-        })
-        .unwrap_or_default();
-    let source = args.get(2).copied().unwrap_or(Value::Object(None));
-    mps_add_at_offset_impl(ctx, this, &name, source, 0)
-}
-
-fn mps_add_after_traced(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
-        Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(None),
-    };
-    let name = args
-        .get(1)
-        .and_then(|v| {
-            if let Value::Object(Some(s)) = v {
-                ctx.read_string(*s)
-            } else {
-                None
-            }
-        })
-        .unwrap_or_default();
-    let source = args.get(2).copied().unwrap_or(Value::Object(None));
-    mps_add_at_offset_impl(ctx, this, &name, source, 1)
-}
-
-/// Find the index of a property source by name in the MPS's COWAL.
-/// Returns (propertySourceList, array, idx-or-neg1-if-not-found, len).
-fn mps_find_index_by_name(
-    ctx: &mut dyn NativeContext,
-    mps: ObjectRef,
-    name: &str,
-) -> Option<(ObjectRef, ObjectRef, i32, usize)> {
-    let psl = match ctx.get_field_by_name(mps, "propertySourceList") {
-        Value::Object(Some(l)) => l,
-        _ => return None,
-    };
-    let arr = match ctx.get_field_by_name(psl, "array") {
-        Value::Object(Some(a)) => a,
-        _ => return None,
-    };
-    let len = ctx.array_length(arr);
-    for i in 0..len {
-        let elem = ctx.get_array_element(arr, i);
-        if let Value::Object(Some(e)) = elem {
-            let n = ctx.get_field_by_name(e, "name");
-            if let Value::Object(Some(s)) = n {
-                if ctx.read_string(s).as_deref() == Some(name) {
-                    return Some((psl, arr, i as i32, len));
-                }
-            }
-        }
-    }
-    Some((psl, arr, -1, len))
-}
-
-fn throw_iae_not_exist(ctx: &mut dyn NativeContext, name: &str) -> MethodCallResult {
-    let msg = format!("PropertySource named '{}' does not exist", name);
-    let exc = ctx
-        .new_object("java/lang/IllegalArgumentException")
-        .ok()
-        .flatten();
-    if let Some(Value::Object(Some(e))) = exc {
-        let m = ctx.create_string(&msg);
-        let _ = ctx.invoke(
-            "java/lang/IllegalArgumentException",
-            "<init>",
-            "(Ljava/lang/String;)V",
-            &[Value::Object(Some(e)), Value::Object(Some(m))],
-        );
-        return Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(e));
-    }
-    Err(cratonvm_types::error::MethodCallFailed::InternalError(
-        cratonvm_types::error::VmError::Runtime(
-            cratonvm_types::error::RuntimeError::NullPointerException { message: Some(msg) },
-        ),
-    ))
-}
-
-fn mps_replace_impl(
-    ctx: &mut dyn NativeContext,
-    mps: ObjectRef,
-    name: &str,
-    source: Value,
-) -> MethodCallResult {
-    let (psl, arr, idx, _len) = match mps_find_index_by_name(ctx, mps, name) {
-        Some(t) => t,
-        None => return throw_iae_not_exist(ctx, name),
-    };
-    if idx < 0 {
-        return throw_iae_not_exist(ctx, name);
-    }
-    // Build a new array with the replaced element; COWAL is copy-on-write.
-    let len = ctx.array_length(arr);
-    let cid = ctx
-        .class_id_by_name("java/lang/Object")
-        .unwrap_or(cratonvm_types::ClassId::new(0));
-    let new_arr = ctx.new_ref_array(cid, len);
-    let idx_u = idx as usize;
-    for i in 0..len {
-        if i == idx_u {
-            ctx.set_array_element(new_arr, i, source);
-        } else {
-            let v = ctx.get_array_element(arr, i);
-            ctx.set_array_element(new_arr, i, v);
-        }
-    }
-    ctx.set_field_by_name(psl, "array", Value::Object(Some(new_arr)));
-    Ok(None)
-}
-
-fn mps_add_at_offset_impl(
-    ctx: &mut dyn NativeContext,
-    mps: ObjectRef,
-    name: &str,
-    source: Value,
-    offset: i32,
-) -> MethodCallResult {
-    // First, remove `source` if it's already present (assertLegalRelativeAddition
-    // would have already ensured the relative name != new name).
-    let new_src_name = if let Value::Object(Some(s)) = source {
-        let n = ctx.get_field_by_name(s, "name");
-        if let Value::Object(Some(ns)) = n {
-            ctx.read_string(ns)
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-
-    let (psl, arr, target_idx, _len) = match mps_find_index_by_name(ctx, mps, name) {
-        Some(t) => t,
-        None => return throw_iae_not_exist(ctx, name),
-    };
-    if target_idx < 0 {
-        return throw_iae_not_exist(ctx, name);
-    }
-
-    // Build list of items minus the source (by identity OR by same name), then insert.
-    let len = ctx.array_length(arr);
-    let mut items: Vec<Value> = Vec::with_capacity(len + 1);
-    let mut adjusted_target = target_idx;
-    for i in 0..len {
-        let v = ctx.get_array_element(arr, i);
-        // Skip if same name as source (Spring's removeIfPresent removes by name-equality).
-        if let (Value::Object(Some(e)), Some(ref src_name)) = (v, &new_src_name) {
-            let n = ctx.get_field_by_name(e, "name");
-            if let Value::Object(Some(ns)) = n {
-                if ctx.read_string(ns).as_deref() == Some(src_name.as_str()) {
-                    if (i as i32) < target_idx {
-                        adjusted_target -= 1;
-                    }
-                    continue;
-                }
-            }
-        }
-        items.push(v);
-    }
-    let insert_at = (adjusted_target + offset) as usize;
-    if insert_at <= items.len() {
-        items.insert(insert_at, source);
-    } else {
-        items.push(source);
-    }
-
-    let cid = ctx
-        .class_id_by_name("java/lang/Object")
-        .unwrap_or(cratonvm_types::ClassId::new(0));
-    let new_arr = ctx.new_ref_array(cid, items.len());
-    for (i, v) in items.iter().enumerate() {
-        ctx.set_array_element(new_arr, i, *v);
-    }
-    ctx.set_field_by_name(psl, "array", Value::Object(Some(new_arr)));
-    Ok(None)
-}
-
 // `SpringApplication.getOrCreateEnvironment()` is normally where Spring Boot
 // builds its own `StandardServletEnvironment` / `StandardReactiveWebEnvironment`
 // via the application-context factory. In CratonVM's partial bootstrap, that
@@ -997,26 +763,19 @@ pub fn register(registry: &mut NativeMethodRegistry) {
         create_environment,
     );
 
-    // DIAGNOSTIC: log MPS.replace/addBefore/addAfter so we can see which MPS
-    // is throwing IAE and what's actually inside it at the time of the call.
-    registry.register(
-        "org/springframework/core/env/MutablePropertySources",
-        "replace",
-        "(Ljava/lang/String;Lorg/springframework/core/env/PropertySource;)V",
-        mps_replace_traced,
-    );
-    registry.register(
-        "org/springframework/core/env/MutablePropertySources",
-        "addBefore",
-        "(Ljava/lang/String;Lorg/springframework/core/env/PropertySource;)V",
-        mps_add_before_traced,
-    );
-    registry.register(
-        "org/springframework/core/env/MutablePropertySources",
-        "addAfter",
-        "(Ljava/lang/String;Lorg/springframework/core/env/PropertySource;)V",
-        mps_add_after_traced,
-    );
+    // NOTE: `MutablePropertySources.replace/addBefore/addAfter` are NO LONGER
+    // shadowed natively. They previously routed to a hand-rolled re-implementation
+    // because the real bytecode path (`assertPresentAndGetIndex` →
+    // `propertySourceList.indexOf(PropertySource.named(name))`) returned -1: the
+    // native `CopyOnWriteArrayList.indexOf` compared by reference identity instead
+    // of `equals`, so the named-only placeholder never matched the stored source.
+    // That root cause is fixed (COWAL `indexOf`/`contains`/`remove(Object)` now use
+    // `equals` semantics), so the real Spring bytecode runs and correctly performs
+    // the `assertLegalRelativeAddition` self-check ("cannot be added relative to
+    // itself") and the "does not exist" check — behaviours the native shim dropped
+    // (StandardEnvironmentTests / MutablePropertySourcesTests). The
+    // `getOrCreateEnvironment` shim below still guarantees the env's MPS is
+    // populated with the canonical systemProperties/systemEnvironment sources.
 
     // SpringApplication.getOrCreateEnvironment — return the same shim env that
     // AbstractApplicationContext.getEnvironment() returns. Without this, Spring
@@ -2153,8 +1912,16 @@ fn try_build_method_injection(
         ctx.invoke_virtual(mbd, "hasMethodOverrides", "()Z", &[]),
         Ok(Some(Value::Int(n))) if n != 0
     );
-    if !has_overrides && super_flags & ACC_ABSTRACT == 0 {
-        return None; // concrete, no overrides → ordinary path
+    // Method-injection only applies when the bean definition actually declares
+    // overrides (XML `<lookup-method>`/`<replaced-method>` or `@Lookup`, which
+    // AutowiredAnnotationBeanPostProcessor records as LookupOverrides). A *plain*
+    // abstract bean class with no overrides must NOT be silently subclassed —
+    // real Spring throws BeanInstantiationException("Is it an abstract class?")
+    // for it (DefaultListableBeanFactoryTests.beanDefinitionWithAbstractClass).
+    // The previous `|| isAbstract` clause synthesised a throwing-stub subclass
+    // for any abstract class, so such beans appeared to instantiate.
+    if !has_overrides {
+        return None;
     }
 
     // Read the lookup overrides as (methodName, paramCount, beanName). Keying on
@@ -2177,6 +1944,16 @@ fn try_build_method_injection(
                 let n = ctx.array_length(arr);
                 for i in 0..n {
                     if let Value::Object(Some(ovr)) = ctx.get_array_element(arr, i) {
+                        // Only LookupOverride entries carry a `getBeanName`; skip
+                        // ReplaceOverride (handled by `try_build_replace_override`)
+                        // so we don't probe a non-existent method and log spurious
+                        // NoSuchMethodError warnings.
+                        let ovr_cid = ctx.class_id_of_object(ovr);
+                        if ctx.class_name_of_id(ovr_cid).as_deref()
+                            == Some("org/springframework/beans/factory/support/ReplaceOverride")
+                        {
+                            continue;
+                        }
                         let mname = match ctx.invoke_virtual(
                             ovr,
                             "getMethodName",
@@ -2318,6 +2095,152 @@ fn try_build_method_injection(
     Some(Value::Object(Some(inst)))
 }
 
+/// `<replaced-method>` / programmatic `ReplaceOverride`. Spring's CGLIB enhancer
+/// generates a subclass whose overridden methods dispatch into a configured
+/// `MethodReplacer`; that bytecode pipeline is incomplete here, so we synthesise
+/// the subclass directly (see `cglib_enhancer::build_replace_override_subclass`).
+/// Returns `Some(instance)` when at least one replaced method was overridden,
+/// `None` to fall through to the ordinary instantiation path.
+fn try_build_replace_override(
+    ctx: &mut dyn NativeContext,
+    mbd: ObjectRef,
+    owner: Value,
+    super_cid: cratonvm_types::ClassId,
+) -> Option<Value> {
+    use std::collections::{HashMap, HashSet};
+    const ACC_STATIC: u16 = 0x0008;
+    const ACC_PRIVATE: u16 = 0x0002;
+    const ACC_FINAL: u16 = 0x0010;
+    const ACC_ABSTRACT: u16 = 0x0400;
+    const ACC_NATIVE: u16 = 0x0100;
+    const REPLACE_OVERRIDE: &str =
+        "org/springframework/beans/factory/support/ReplaceOverride";
+
+    let has_overrides = matches!(
+        ctx.invoke_virtual(mbd, "hasMethodOverrides", "()Z", &[]),
+        Ok(Some(Value::Int(n))) if n != 0
+    );
+    if !has_overrides {
+        return None;
+    }
+
+    let super_internal = ctx.class_name_of_id(super_cid)?;
+
+    // Collect (methodName → replacerBeanName) for every ReplaceOverride.
+    let mut replacers: HashMap<String, String> = HashMap::new();
+    if let Ok(Some(Value::Object(Some(mo)))) = ctx.invoke_virtual(
+        mbd,
+        "getMethodOverrides",
+        "()Lorg/springframework/beans/factory/support/MethodOverrides;",
+        &[],
+    ) {
+        if let Ok(Some(Value::Object(Some(set)))) =
+            ctx.invoke_virtual(mo, "getOverrides", "()Ljava/util/Set;", &[])
+        {
+            if let Ok(Some(Value::Object(Some(arr)))) =
+                ctx.invoke_virtual(set, "toArray", "()[Ljava/lang/Object;", &[])
+            {
+                let n = ctx.array_length(arr);
+                for i in 0..n {
+                    let ovr = match ctx.get_array_element(arr, i) {
+                        Value::Object(Some(o)) => o,
+                        _ => continue,
+                    };
+                    // Only ReplaceOverride entries — LookupOverride is handled
+                    // upstream by `try_build_method_injection`.
+                    let ovr_cid = ctx.class_id_of_object(ovr);
+                    if ctx.class_name_of_id(ovr_cid).as_deref() != Some(REPLACE_OVERRIDE) {
+                        continue;
+                    }
+                    let mname = match ctx.invoke_virtual(
+                        ovr,
+                        "getMethodName",
+                        "()Ljava/lang/String;",
+                        &[],
+                    ) {
+                        Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s).unwrap_or_default(),
+                        _ => continue,
+                    };
+                    let rname = match ctx.invoke_virtual(
+                        ovr,
+                        "getMethodReplacerBeanName",
+                        "()Ljava/lang/String;",
+                        &[],
+                    ) {
+                        Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s).unwrap_or_default(),
+                        _ => continue,
+                    };
+                    if !mname.is_empty() {
+                        replacers.insert(mname, rname);
+                    }
+                }
+            }
+        }
+    }
+    if replacers.is_empty() {
+        return None;
+    }
+
+    // Enumerate overridable methods up the hierarchy whose name is replaced.
+    // Dedup by (name, descriptor) so an inherited + redeclared method yields a
+    // single override (the most-derived declaration wins — first seen walking
+    // from the bean class upward).
+    let mut seen: HashSet<(String, String)> = HashSet::new();
+    let mut specs: Vec<crate::cglib_enhancer::ReplaceMethodSpec> = Vec::new();
+    let mut cursor = Some(super_cid);
+    while let Some(cid) = cursor {
+        for m in ctx.declared_methods(cid) {
+            if m.name.starts_with('<') {
+                continue;
+            }
+            let replacer = match replacers.get(&m.name) {
+                Some(r) => r.clone(),
+                None => continue,
+            };
+            if m.access_flags & (ACC_STATIC | ACC_PRIVATE | ACC_FINAL | ACC_ABSTRACT | ACC_NATIVE)
+                != 0
+            {
+                continue;
+            }
+            if !seen.insert((m.name.clone(), m.descriptor.clone())) {
+                continue;
+            }
+            specs.push(crate::cglib_enhancer::ReplaceMethodSpec {
+                name: m.name.clone(),
+                descriptor: m.descriptor.clone(),
+                replacer_bean_name: replacer,
+            });
+        }
+        cursor = ctx.superclass_of(cid);
+    }
+    if specs.is_empty() {
+        return None;
+    }
+
+    let (new_name, bytes) =
+        crate::cglib_enhancer::build_replace_override_subclass(&super_internal, &specs);
+    let opts = DefineClassFull {
+        override_name: Some(new_name.clone()),
+        skip_verification: true,
+        ..Default::default()
+    };
+    if ctx.define_class_full(&new_name, &bytes, 0, opts).is_err() {
+        return None;
+    }
+    let inst = match ctx.new_object(&new_name) {
+        Ok(Some(Value::Object(Some(o)))) => o,
+        _ => return None,
+    };
+    let _ = ctx.invoke(&new_name, "<init>", "()V", &[Value::Object(Some(inst))]);
+    // Hand the owning factory to the generated replace overrides.
+    ctx.set_field_by_name(inst, "$$beanFactory", owner);
+    tracing::debug!(
+        "[spring-shim] replace-override: instantiated {new_name} (super={super_internal}, replaced={})",
+        specs.len()
+    );
+    Some(Value::Object(Some(inst)))
+}
+
 /// sportme: SimpleInstantiationStrategy.instantiate(RootBeanDefinition,
 /// String beanName, BeanFactory owner) → Object.
 ///
@@ -2400,15 +2323,34 @@ fn s_instantiation_strategy_instantiate(
         if let Some(inst) = try_build_method_injection(ctx, mbd, owner, cid) {
             return Ok(Some(inst));
         }
+        // `<replaced-method>` / programmatic `ReplaceOverride` on a (typically
+        // concrete) bean class. Real CGLIB's `Enhancer.createClass()` pipeline is
+        // incomplete in this VM, so synthesise a subclass whose overridden methods
+        // delegate to the configured `MethodReplacer` — mirroring Spring's
+        // `ReplaceOverrideMethodInterceptor` + `processReturnType`.
+        if let Some(inst) = try_build_replace_override(ctx, mbd, owner, cid) {
+            return Ok(Some(inst));
+        }
         let flags = ctx.class_access_flags(cid);
         let abstract_bit = cratonvm_types::access_flags::ACC_ABSTRACT;
         let iface_bit = cratonvm_types::access_flags::ACC_INTERFACE;
         if flags & (abstract_bit | iface_bit) != 0 {
-            tracing::debug!(
-                "[spring-shim] SimpleInstantiationStrategy.instantiate: {} is abstract/interface, skipping",
-                class_name
+            // An abstract/interface bean class with no lookup overrides cannot be
+            // instantiated. Real Spring's SimpleInstantiationStrategy throws a
+            // BeanInstantiationException ("Specified class is an interface" /
+            // "Is it an abstract class?"), which createBean wraps into the
+            // BeanCreationException the caller expects (DefaultListableBeanFactory
+            // Tests.beanDefinitionWith{Abstract,Interface}). Returning null here
+            // instead produced a misleading "Target object must not be null".
+            // Delegate to the real BeanUtils.instantiateClass(Class), which
+            // raises exactly that exception, and propagate it.
+            let mirror = ctx.get_class_mirror(cid);
+            return ctx.invoke(
+                "org/springframework/beans/BeanUtils",
+                "instantiateClass",
+                "(Ljava/lang/Class;)Ljava/lang/Object;",
+                &[Value::Object(Some(mirror))],
             );
-            return Ok(Some(Value::Object(None)));
         }
     }
 

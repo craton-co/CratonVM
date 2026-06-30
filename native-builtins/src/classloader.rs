@@ -978,6 +978,94 @@ fn cl_load_class(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     cl_load_class_base_delegation(ctx, this, name_obj)
 }
 
+/// True if `loader` can see a class whose defining loader is `defining` — i.e.
+/// `defining` is `loader` itself or one of its delegation ancestors (parent
+/// chain). JVMS §5.3: a class defined by loader D is visible to L only if L
+/// (transitively) delegates to D. CratonVM keeps a single flat global class
+/// store, so without this check a loader can resolve an unrelated *sibling*
+/// loader's class by name — e.g. `Proxy.getProxyClass(childLoader1, …)` is
+/// globally registered as `jdk.proxy1.$Proxy0`, so `childLoader2.loadClass`
+/// found it too (HotSpot throws ClassNotFoundException). That made
+/// `ClassUtils.isCacheSafe(composite, siblingLoader)` wrongly true via its
+/// `isLoadable` fallback. ClassUtilsTests.isCacheSafe.
+fn loader_can_see_defining(
+    ctx: &mut dyn NativeContext,
+    loader: ObjectRef,
+    defining: ObjectRef,
+) -> bool {
+    if loader.as_ptr() == defining.as_ptr() {
+        return true;
+    }
+    let mut cur = loader;
+    // Bounded walk up the parent chain (defensive cap against cycles).
+    for _ in 0..256 {
+        match ctx.get_field(cur, CL_PARENT_REF) {
+            Value::Object(Some(parent)) => {
+                if parent.as_ptr() == defining.as_ptr() {
+                    return true;
+                }
+                cur = parent;
+            }
+            _ => break,
+        }
+    }
+    false
+}
+
+/// Resolve `internal` through CratonVM's global class store, but enforce loader
+/// isolation: if the resolved class was defined by a *user-defined* loader that
+/// `this` cannot see ([`loader_can_see_defining`]), return `None` so the caller
+/// falls through to `findClass` / "not found" instead of leaking another
+/// loader's class. Only user-defined defining loaders are recorded in the
+/// defining-loader registry (built-in app/platform/bootstrap loaders are not),
+/// so the common case — app/JDK classes with no registered defining loader —
+/// is unchanged and still resolves permissively.
+/// The class mirror for `cid`, unless loader isolation hides it from `this`.
+///
+/// Only enforces isolation when the *requesting* loader is itself user-defined
+/// (`this_is_custom`): a class whose registered defining loader is a user-defined
+/// loader `this` cannot see ([`loader_can_see_defining`]) is treated as not
+/// found (`None`). This targets the sibling/unrelated custom-loader case while
+/// leaving the dominant built-in (app/platform/bootstrap) resolution path — which
+/// has no JVMS-faithful per-loader namespace in CratonVM's flat store — exactly
+/// as before (no regression).
+fn cid_visible_mirror(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    this_is_custom: bool,
+    cid: cratonvm_types::ClassId,
+) -> Option<ObjectRef> {
+    if this_is_custom {
+        let def = defining_loader_for(cid.as_u32());
+        let ns = ctx.loader_id_of_class(cid);
+        if std::env::var_os("CRATONVM_DBG_LOADERISO").is_some() {
+            eprintln!(
+                "[LOADERISO] cid={} def_sidetable={} loader_ns={} this={}",
+                cid.as_u32(),
+                def.map(|d| d.as_ptr() as u64).unwrap_or(0),
+                ns,
+                this.as_ptr() as u64,
+            );
+        }
+        if let Some(def) = def {
+            if !loader_can_see_defining(ctx, this, def) {
+                return None;
+            }
+        }
+    }
+    Some(ctx.get_class_mirror(cid))
+}
+
+fn resolve_global_if_visible(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    internal: &str,
+) -> Option<ObjectRef> {
+    let cid = ctx.ensure_class_initialized(internal).ok()?;
+    let this_is_custom = matches!(ctx.get_field(this, CL_LOADER_TYPE), Value::Int(LOADER_CUSTOM));
+    cid_visible_mirror(ctx, this, this_is_custom, cid)
+}
+
 /// Base-class `ClassLoader.loadClass` parent-first delegation, reimplemented in
 /// Rust (CratonVM keeps no JDK bytecode for `ClassLoader.loadClass`).
 ///
@@ -992,6 +1080,9 @@ fn cl_load_class_base_delegation(
 ) -> MethodCallResult {
     let dotted = ctx.read_string(name_obj).unwrap_or_default();
     let internal = dotted.replace('.', "/");
+    if std::env::var_os("CRATONVM_DBG_LOADERISO").is_some() {
+        eprintln!("[LOADERISO] base_delegation enter name={internal} this={}", this.as_ptr() as u64);
+    }
 
     // HIB-CV-24 / SBR-14 — honor a supplied child/isolated `ClassLoader`.
     //
@@ -1026,6 +1117,8 @@ fn cl_load_class_base_delegation(
         _ => LOADER_APP,
     };
 
+    let this_is_custom = loader_type == LOADER_CUSTOM;
+
     // For custom loaders, check own namespace first
     if loader_type == LOADER_CUSTOM {
         let loader_id = match ctx.get_field(this, CL_LOADER_ID) {
@@ -1034,8 +1127,9 @@ fn cl_load_class_base_delegation(
         };
         if let Some(lid) = loader_id {
             if let Some(cid) = ctx.class_id_by_name_and_loader(&internal, lid) {
-                let mirror = ctx.get_class_mirror(cid);
-                return Ok(Some(Value::Object(Some(mirror))));
+                if let Some(mirror) = cid_visible_mirror(ctx, this, this_is_custom, cid) {
+                    return Ok(Some(Value::Object(Some(mirror))));
+                }
             }
         }
     }
@@ -1051,26 +1145,29 @@ fn cl_load_class_base_delegation(
             Value::Int(v) if v > 0 => Some(v as u32),
             _ => None,
         };
-        // Check parent's namespace for custom loaders
+        // Check parent's namespace for custom loaders. Apply loader-isolation:
+        // a sibling custom loader's class (e.g. a generated proxy that leaked
+        // into the app-loader namespace but whose registered defining loader is
+        // an unrelated child) must not be handed to `this`. ClassUtilsTests
+        // .isCacheSafe via `isLoadable`.
         if let Some(pid) = parent_lid {
             if let Some(cid) = ctx.class_id_by_name_and_loader(&internal, pid) {
-                let mirror = ctx.get_class_mirror(cid);
-                return Ok(Some(Value::Object(Some(mirror))));
+                if let Some(mirror) = cid_visible_mirror(ctx, this, this_is_custom, cid) {
+                    return Ok(Some(Value::Object(Some(mirror))));
+                }
             }
         }
         // For built-in parent loaders (bootstrap/platform/app), use standard delegation
         if parent_type != LOADER_CUSTOM && !defer_to_find_class {
             // Standard delegation handles bootstrap → extension → app
-            if let Ok(cid) = ctx.ensure_class_initialized(&internal) {
-                let mirror = ctx.get_class_mirror(cid);
+            if let Some(mirror) = resolve_global_if_visible(ctx, this, &internal) {
                 return Ok(Some(Value::Object(Some(mirror))));
             }
         }
     } else if !defer_to_find_class {
         // No parent (or null parent) → delegate directly to bootstrap loader
         // Bootstrap delegation: use the standard class loading chain
-        if let Ok(cid) = ctx.ensure_class_initialized(&internal) {
-            let mirror = ctx.get_class_mirror(cid);
+        if let Some(mirror) = resolve_global_if_visible(ctx, this, &internal) {
             return Ok(Some(Value::Object(Some(mirror))));
         }
     }
@@ -1080,8 +1177,7 @@ fn cl_load_class_base_delegation(
     //    Skipped when deferring to a custom `findClass` override (HIB-CV-24) so
     //    the supplied loader runs before CratonVM's global store answers.
     if !defer_to_find_class {
-        if let Ok(cid) = ctx.ensure_class_initialized(&internal) {
-            let mirror = ctx.get_class_mirror(cid);
+        if let Some(mirror) = resolve_global_if_visible(ctx, this, &internal) {
             return Ok(Some(Value::Object(Some(mirror))));
         }
     }
@@ -2882,7 +2978,22 @@ fn cl_get_resources_impl(
 /// crashes the VM with an access violation. An empty array is spec-legal
 /// (it just means "this loader contributes no URLs") and lets Spring
 /// Boot's clearCache iteration complete in zero iterations.
-fn ucp_get_urls_empty(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+fn ucp_get_urls_empty(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // If a `URLClassLoader.<init>` stashed its constructor `URL[]` on this ucp
+    // (see `record_ucl_urls`), return those so a real `getURLs()` →
+    // `ucp.getURLs()` bytecode path reflects the loader's URLs. Otherwise an
+    // empty array is spec-legal ("this loader contributes no URLs").
+    if let Some(Value::Object(Some(ucp))) = args.first() {
+        if let Value::Object(Some(stashed)) = ctx.get_field(*ucp, UCP_STASHED_URLS) {
+            let n = ctx.array_length(stashed);
+            let result = ctx.new_array(cratonvm_types::ArrayElementType::Reference, n);
+            for i in 0..n {
+                let url = ctx.get_array_element(stashed, i);
+                ctx.set_array_element(result, i, url);
+            }
+            return Ok(Some(Value::Object(Some(result))));
+        }
+    }
     tracing::debug!(
         target: "cratonvm_vm::runtime::classloader",
         "[URLClassPath shim] getURLs() returning empty URL[]"
@@ -3298,6 +3409,41 @@ fn ucl_setup(ctx: &mut dyn NativeContext, this: ObjectRef, urls: Value, parent: 
             "URLClassLoader.<init>: registered {} URLs to classpath",
             paths.len()
         );
+    }
+}
+
+/// Slot of the `URLClassPath` placeholder (`ucp`) used to stash a real-JDK-mode
+/// `URLClassLoader`'s constructor `URL[]` so `getURLs()` can return it. The ucp
+/// is a placeholder our `<init>` natives create (see `init_urlclassloader_fields`)
+/// whose real methods are all shimmed, so this slot is ours to use; storing the
+/// array here also keeps it GC-reachable via loader→ucp→array.
+const UCP_STASHED_URLS: usize = 0;
+
+/// Record a real-JDK-mode `URLClassLoader`'s constructor `URL[]` so that
+/// `getURLs()` returns the URLs the loader was built with.
+///
+/// The real-JDK-mode `URLClassLoader.<init>` natives (see `classloader_real`)
+/// wire a loader's URLs into CratonVM's GLOBAL dynamic classpath (so classes
+/// load) but never store them per-instance. Real `getURLs()` reads
+/// `ucp.getURLs()`, and our `URLClassPath` shim returns empty — so `getURLs()`
+/// yielded `[]`. That broke any code that walks a classloader's URLs, e.g.
+/// Tomcat's `StandardJarScanner`, which scans the classloader hierarchy via
+/// `getURLs()` to find TLDs: a TLD in a JAR added to a parent `URLClassLoader`
+/// (outside `/WEB-INF/lib`) was invisible, 500-ing JSPs that referenced it
+/// (`TestTagLibraryInfoImpl.testExternalTaglibDependantUsesUri`).
+///
+/// The synthetic per-instance slots used by `ucl_setup`/`ucl_get_urls` can't be
+/// reused here: a real `java.net.URLClassLoader` has the real JDK field layout,
+/// so those raw indices land on unrelated reference-typed fields (writing an
+/// `Int` count there does not read back as a count). Instead stash the original
+/// `URL[]` on the loader's `ucp` placeholder, which `ucl_get_urls` reads back.
+pub(crate) fn record_ucl_urls(ctx: &mut dyn NativeContext, this: ObjectRef, urls: Value) {
+    let url_arr = match urls {
+        Value::Object(Some(arr)) => arr,
+        _ => return,
+    };
+    if let Value::Object(Some(ucp)) = ctx.get_field_by_name(this, "ucp") {
+        ctx.set_field(ucp, UCP_STASHED_URLS, Value::Object(Some(url_arr)));
     }
 }
 
@@ -3782,6 +3928,23 @@ fn ucl_get_urls(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult
         Value::Int(n) => n.max(0) as usize,
         _ => 0,
     };
+    // Synthetic-JDK path: URLs live in the per-instance slots (`ucl_setup`/
+    // `ucl_add_url`). Real-JDK URLClassLoaders use the real field layout, so
+    // those slots are empty/garbage and the URLs were stashed on the `ucp`
+    // placeholder by `record_ucl_urls` instead — fall back to that.
+    if count == 0 {
+        if let Value::Object(Some(ucp)) = ctx.get_field_by_name(this, "ucp") {
+            if let Value::Object(Some(stashed)) = ctx.get_field(ucp, UCP_STASHED_URLS) {
+                let n = ctx.array_length(stashed);
+                let result = ctx.new_array(cratonvm_types::ArrayElementType::Reference, n);
+                for i in 0..n {
+                    let url = ctx.get_array_element(stashed, i);
+                    ctx.set_array_element(result, i, url);
+                }
+                return Ok(Some(Value::Object(Some(result))));
+            }
+        }
+    }
     // Copy stored URLs into a new array of the exact size
     let result = ctx.new_array(cratonvm_types::ArrayElementType::Reference, count);
     if let Value::Object(Some(urls_arr)) = ctx.get_field(this, UCL_URLS_ARRAY) {

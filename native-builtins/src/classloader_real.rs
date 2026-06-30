@@ -55,7 +55,13 @@ fn extract_url_path(ctx: &dyn NativeContext, url_obj: ObjectRef) -> Option<Strin
 
 /// Register every URL in a `URL[]` array with the dynamic application
 /// classpath so classes inside those jars/dirs become loadable.
-fn register_url_array(ctx: &mut dyn NativeContext, urls: Value) {
+fn register_url_array(ctx: &mut dyn NativeContext, this: ObjectRef, urls: Value) {
+    // Make `getURLs()` return the loader's URLs (stashed on the `ucp`
+    // placeholder). Without this, real-mode `getURLs()` falls through to the
+    // empty `URLClassPath` shim and a classloader's URLs are invisible to
+    // callers like Tomcat's `StandardJarScanner`. Runs before classpath
+    // registration so it happens even when no path is extractable.
+    crate::classloader::record_ucl_urls(ctx, this, urls);
     let dbg = std::env::var_os("CRATONVM_DBG_UCLREG").is_some();
     let arr = match urls {
         Value::Object(Some(a)) => a,
@@ -493,7 +499,7 @@ pub fn register_classloader_real_natives(r: &mut NativeMethodRegistry) {
         // the jars/dirs are actually loadable — without this a custom
         // URLClassLoader (Tomcat's CommonClassLoader, ActiveMQ's launcher)
         // can never find its classes and throws ClassNotFoundException.
-        register_url_array(ctx, urls);
+        register_url_array(ctx, this, urls);
         Ok(None)
     });
     r.register(
@@ -510,7 +516,7 @@ pub fn register_classloader_real_natives(r: &mut NativeMethodRegistry) {
             let urls = args.get(1).copied().unwrap_or(Value::Object(None));
             init_classloader_common_fields(ctx, this);
             init_urlclassloader_fields(ctx, this);
-            register_url_array(ctx, urls);
+            register_url_array(ctx, this, urls);
             Ok(None)
         },
     );
@@ -536,7 +542,7 @@ pub fn register_classloader_real_natives(r: &mut NativeMethodRegistry) {
             ctx.set_field_by_name(this, "parent", parent);
             init_classloader_common_fields(ctx, this);
             init_urlclassloader_fields(ctx, this);
-            register_url_array(ctx, urls);
+            register_url_array(ctx, this, urls);
             Ok(None)
         },
     );
@@ -554,7 +560,7 @@ pub fn register_classloader_real_natives(r: &mut NativeMethodRegistry) {
             ctx.set_field_by_name(this, "parent", parent);
             init_classloader_common_fields(ctx, this);
             init_urlclassloader_fields(ctx, this);
-            register_url_array(ctx, urls);
+            register_url_array(ctx, this, urls);
             Ok(None)
         },
     );
@@ -574,7 +580,7 @@ pub fn register_classloader_real_natives(r: &mut NativeMethodRegistry) {
             ctx.set_field_by_name(this, "parent", parent);
             init_classloader_common_fields(ctx, this);
             init_urlclassloader_fields(ctx, this);
-            register_url_array(ctx, urls);
+            register_url_array(ctx, this, urls);
             Ok(None)
         },
     );
@@ -618,7 +624,7 @@ pub fn register_classloader_real_natives(r: &mut NativeMethodRegistry) {
             ctx.set_field_by_name(this, "acc", acc);
             init_classloader_common_fields(ctx, this);
             init_urlclassloader_fields(ctx, this);
-            register_url_array(ctx, urls);
+            register_url_array(ctx, this, urls);
             Ok(None)
         },
     );
@@ -642,7 +648,7 @@ pub fn register_classloader_real_natives(r: &mut NativeMethodRegistry) {
             ctx.set_field_by_name(this, "acc", acc);
             init_classloader_common_fields(ctx, this);
             init_urlclassloader_fields(ctx, this);
-            register_url_array(ctx, urls);
+            register_url_array(ctx, this, urls);
             Ok(None)
         },
     );

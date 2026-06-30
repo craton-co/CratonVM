@@ -1670,6 +1670,54 @@ impl ClassManager {
         self.synthetic_upgrade_absent.insert(name.to_string());
     }
 
+    /// Access flags for a freshly-minted synthetic stub class.
+    ///
+    /// Synthetic stubs default to `ACC_PUBLIC | ACC_SUPER` (0x0021) — the right
+    /// guess for the public shim types the bootstrap mints (`PrintStream`, …).
+    /// But some synthetic names shadow JDK-internal *nested* classes that do not
+    /// exist on the classpath under that name (e.g. CratonVM's collection
+    /// iterators are minted as `java/util/HashMap$KeyItr`, whereas the real JDK
+    /// class is the package-private `java.util.HashMap$KeyIterator`). Reflecting
+    /// on such a stub via `Class.getModifiers()` returned `public`, breaking
+    /// callers that gate on the declaring class's accessibility — e.g. Spring's
+    /// `ClassUtils.getInterfaceMethodIfPossible` / `isCacheSafe`, which use
+    /// `Modifier.isPublic(clazz.getModifiers())` to decide method visibility
+    /// (`ClassUtilsTests` asserts `hashMap.keySet().iterator().getClass()` is
+    /// NOT public). Collection iterators are categorically non-public in the
+    /// JDK; map their flags to the faithful real-JDK values here so reflection
+    /// (and everything downstream of it) agrees with HotSpot.
+    fn synthetic_stub_access_flags(name: &str) -> u16 {
+        const ACC_PUBLIC_SUPER: u16 = 0x0021;
+        const ACC_FINAL: u16 = 0x0010; // real KeyIterator/ValueIterator/…
+        if Self::is_synthetic_collection_iterator(name) {
+            // Real-JDK collection iterators (KeyIterator/ValueIterator/…) are
+            // `final` and package-private.
+            ACC_FINAL
+        } else {
+            ACC_PUBLIC_SUPER
+        }
+    }
+
+    /// True for the fake names CratonVM mints for snapshot-backed collection
+    /// iterators that have no real `.class` under that name (the real JDK class
+    /// is e.g. `java.util.HashMap$KeyIterator`, package-private + `final`,
+    /// `implements java.util.Iterator`). Drives both their access flags
+    /// ([`synthetic_stub_access_flags`]) and the `Iterator` interface +
+    /// `hasNext`/`next`/`remove` method entries injected for reflection.
+    fn is_synthetic_collection_iterator(name: &str) -> bool {
+        matches!(
+            name,
+            // HashMap/LinkedHashMap key/value/entry iterators.
+            "java/util/HashMap$KeyItr"
+                | "java/util/HashMap$ValItr"
+                | "java/util/HashMap$EntryItr"
+                // TreeMap key/value/entry iterators.
+                | "java/util/TreeMap$KeyItr"
+                | "java/util/TreeMap$ValItr"
+                | "java/util/TreeMap$EntryItr"
+        )
+    }
+
     /// Register a minimal synthetic class with the given name and field count.
     ///
     /// If a class with this name is already loaded, returns its existing
@@ -1682,6 +1730,7 @@ impl ClassManager {
     ///
     /// Prefer real `.class` files for application-visible types; see `docs/jvm-no-synthetic-stubs.md`.
     pub fn ensure_synthetic_class(&mut self, name: &str, num_fields: usize) -> ClassId {
+        let synthetic_access_flags = Self::synthetic_stub_access_flags(name);
         if let Some(id) = self.get_loaded_class_id(name) {
             // Already loaded — but it might be a synthetic stub created by
             // an earlier `ensure_synthetic_class` call with an undersized
@@ -1800,6 +1849,20 @@ impl ClassManager {
                 attributes: vec![],
             }];
             (ifaces, fields)
+        } else if Self::is_synthetic_collection_iterator(name) {
+            // CratonVM's snapshot-backed collection iterators (minted under fake
+            // names like `java/util/HashMap$KeyItr`) must report
+            // `implements java.util.Iterator` so reflection matches the real JDK
+            // iterators they stand in for — Spring's `ClassUtils
+            // .getInterfaceMethodIfPossible` walks `targetClass.getInterfaces()`
+            // to late-bind `iterator.hasNext()` to `Iterator.hasNext`
+            // (ClassUtilsTests). The matching `hasNext`/`next`/`remove` method
+            // entries are declared by `synthetic_stub_ctor_methods`.
+            let ifaces = self
+                .get_loaded_class_id("java/util/Iterator")
+                .into_iter()
+                .collect();
+            (ifaces, vec![])
         } else {
             (vec![], vec![])
         };
@@ -1816,7 +1879,7 @@ impl ClassManager {
                 cratonvm_reader::constant_pool::ConstantPoolEntry::Tombstone,
             ]),
             access_flags: cratonvm_reader::class_access_flags::ClassAccessFlags::from_bits_truncate(
-                0x0021,
+                synthetic_access_flags,
             ),
             superclass: synthetic_superclass,
             interfaces: synthetic_interfaces,
@@ -8779,6 +8842,26 @@ fn synthetic_stub_ctor_methods(name: &str) -> Vec<ClassFileMethod> {
             mk("contains", "(Ljava/lang/Object;)Z"),
             mk("addIfAbsent", "(Ljava/lang/Object;)Z"),
         ]);
+    }
+    // CratonVM's snapshot-backed collection iterators (`HashMap$KeyItr` …)
+    // declare the `Iterator` query methods they implement via natives, so
+    // reflective callers can discover them. `Class.getMethod("hasNext")` returned
+    // a NoSuchMethodException without these entries, breaking Spring's
+    // `ClassUtils.getInterfaceMethodIfPossible` late-binding (ClassUtilsTests).
+    // The `Iterator` interface itself is wired up in `ensure_synthetic_class`.
+    // `remove()` is intentionally NOT declared here: not every snapshot iterator
+    // registers a `remove` native (e.g. `TreeMap$KeyItr`), and `Iterator.remove`
+    // is already routed by the force-native dispatcher, so a bare NATIVE entry
+    // with no backing impl would only risk turning the default UOE into a link
+    // error.
+    if ClassManager::is_synthetic_collection_iterator(name) {
+        let mk = |method: &str, descriptor: &str| ClassFileMethod {
+            access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::NATIVE,
+            name: cratonvm_types::intern_arc(method),
+            descriptor: cratonvm_types::intern_arc(descriptor),
+            attributes: vec![],
+        };
+        out.extend([mk("hasNext", "()Z"), mk("next", "()Ljava/lang/Object;")]);
     }
     out
 }
