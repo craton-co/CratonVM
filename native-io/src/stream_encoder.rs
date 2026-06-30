@@ -193,6 +193,39 @@ fn native_se_for_osw_charset(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     Ok(Some(Value::Object(Some(se))))
 }
 
+/// `forOutputStreamWriter(OutputStream, Object, CharsetEncoder) -> StreamEncoder`.
+///
+/// Resolves the charset name from the encoder's `charset` field and remembers
+/// the encoder itself (in the real `encoder` field) so `write_bytes` can honour
+/// its configured error actions. The previous registration routed this
+/// descriptor through `native_se_for_osw_charset`, which treated the
+/// `CharsetEncoder` as a `Charset`, failed to read a name, and silently fell
+/// back to UTF-8 — so `OutputStreamWriter(os, charset.newEncoder())` encoded as
+/// UTF-8 and never reported unmappable input (Tomcat `TestURLEncoder`, whose
+/// `URLEncoder.encode` relies on a REPORT encoder raising
+/// `UnmappableCharacterException` → `IOException` → `IllegalArgumentException`).
+fn native_se_for_osw_encoder(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let os = match obj_arg(args, 0) {
+        Some(o) => o,
+        None => return Ok(Some(Value::Object(None))),
+    };
+    let enc = obj_arg(args, 2);
+    let name = match enc {
+        Some(e) => match ctx.get_field_by_name(e, "charset") {
+            Value::Object(Some(cs)) => resolve_name(ctx, Some(cs)),
+            _ => "UTF-8".to_string(),
+        },
+        None => "UTF-8".to_string(),
+    };
+    let se = alloc_stream_encoder(ctx, os, &name);
+    if let Some(e) = enc {
+        // Real `encoder` field (distinct from the synthetic SE_OUTPUT/SE_NAME/
+        // SE_CLOSED scratch slots): write_bytes reads its error actions.
+        ctx.set_field_by_name(se, "encoder", Value::Object(Some(e)));
+    }
+    Ok(Some(Value::Object(Some(se))))
+}
+
 /// True for a UTF-16 high surrogate (the leading unit of a supplementary pair).
 fn is_high_surrogate(u: u16) -> bool {
     (0xD800..=0xDBFF).contains(&u)
@@ -223,6 +256,82 @@ fn set_pending(ctx: &dyn NativeContext, this: ObjectRef, hi: u16) {
 /// Clear any pending high surrogate.
 fn clear_pending(ctx: &dyn NativeContext, this: ObjectRef) {
     ctx.set_field_by_name(this, "haveLeftoverChar", Value::Int(0));
+}
+
+/// True when `coder`'s `field` action (`malformedInputAction` /
+/// `unmappableCharacterAction`) is `CodingErrorAction.REPORT`. A real
+/// `CharsetEncoder`'s default is REPORT, so an unreadable/absent field is
+/// treated as REPORT (strict) — but this is only consulted when an explicit
+/// encoder was supplied to the OutputStreamWriter.
+fn action_is_report(ctx: &dyn NativeContext, coder: ObjectRef, field: &str) -> bool {
+    if let Value::Object(Some(action)) = ctx.get_field_by_name(coder, field) {
+        if let Value::Object(Some(s)) = ctx.get_field_by_name(action, "name") {
+            return ctx.read_string(s).as_deref() == Some("REPORT");
+        }
+    }
+    true
+}
+
+/// Build and throw (as `Err(ExceptionThrown)`) a `java.nio.charset`
+/// coding-error exception via its JDK `(int inputLength)` constructor. These
+/// extend `CharacterCodingException` → `IOException`, so they propagate up
+/// through `OutputStreamWriter.write` exactly like the real StreamEncoder's
+/// `cr.throwException()` does.
+fn throw_coding_error(
+    ctx: &mut dyn NativeContext,
+    class: &str,
+    length: i32,
+) -> cratonvm_types::error::MethodCallFailed {
+    if let Ok(Some(Value::Object(Some(exc)))) =
+        ctx.new_object_initialized(class, "(I)V", &[Value::Int(length)])
+    {
+        return cratonvm_types::error::MethodCallFailed::ExceptionThrown(exc);
+    }
+    cratonvm_types::error::RuntimeError::IOException {
+        message: format!("{class}: coding error"),
+    }
+    .into()
+}
+
+/// Encode `chars` for the stream. When the OutputStreamWriter was built from an
+/// explicit `CharsetEncoder` (stored in the real `encoder` field) whose error
+/// actions are REPORT, encode strictly and throw on malformed/unmappable input
+/// — matching `OutputStreamWriter(os, charset.newEncoder())`. Otherwise (the
+/// OSW(Charset)/OSW(name) path, which the JDK configures as REPLACE) substitute
+/// the charset's replacement byte, preserving the prior lossy behaviour.
+fn encode_for_stream(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    name: &str,
+    chars: &[u16],
+) -> Result<Vec<u8>, cratonvm_types::error::MethodCallFailed> {
+    if let Value::Object(Some(enc)) = ctx.get_field_by_name(this, "encoder") {
+        let malformed_report = action_is_report(ctx, enc, "malformedInputAction");
+        let unmappable_report = action_is_report(ctx, enc, "unmappableCharacterAction");
+        if malformed_report || unmappable_report {
+            match engine::encode_chars(name, chars) {
+                Ok(b) => return Ok(b),
+                Err(e) => {
+                    let (report, cls) = match e.kind {
+                        engine::CodingErrorKind::Unmappable => (
+                            unmappable_report,
+                            "java/nio/charset/UnmappableCharacterException",
+                        ),
+                        engine::CodingErrorKind::Malformed => {
+                            (malformed_report, "java/nio/charset/MalformedInputException")
+                        }
+                        // UnsupportedCharset / Incomplete: fall through to lossy.
+                        _ => (false, ""),
+                    };
+                    if report {
+                        return Err(throw_coding_error(ctx, cls, e.length.max(1) as i32));
+                    }
+                    return Ok(engine::encode_chars_lossy(name, chars));
+                }
+            }
+        }
+    }
+    Ok(engine::encode_chars_lossy(name, chars))
 }
 
 /// Encode `chars` with the encoder's charset and forward to the
@@ -272,7 +381,7 @@ fn write_bytes(
         _ => return Ok(()),
     };
     let name = name_of(ctx, this);
-    let bytes = engine::encode_chars_lossy(&name, to_encode);
+    let bytes = encode_for_stream(ctx, this, &name, to_encode)?;
     if bytes.is_empty() {
         return Ok(());
     }
@@ -440,7 +549,7 @@ pub fn register_stream_encoder_natives(registry: &mut NativeMethodRegistry) {
         se,
         "forOutputStreamWriter",
         "(Ljava/io/OutputStream;Ljava/lang/Object;Ljava/nio/charset/CharsetEncoder;)Lsun/nio/cs/StreamEncoder;",
-        native_se_for_osw_charset,
+        native_se_for_osw_encoder,
     );
 
     registry.register(se, "write", "([CII)V", native_se_write_chars);
