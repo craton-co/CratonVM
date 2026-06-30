@@ -635,7 +635,8 @@ fn jar_url_entry_size(ext: &str) -> Option<i64> {
     };
     let file = std::fs::File::open(&disk).ok()?;
     let mut archive = zip::ZipArchive::new(file).ok()?;
-    let entry = archive.by_name(entry_name).ok()?;
+    let lookup = jmod_zip_entry_name(&disk, entry_name);
+    let entry = archive.by_name(&lookup).ok()?;
     Some(entry.size() as i64)
 }
 
@@ -662,6 +663,27 @@ fn jar_url_conn_ext(ctx: &mut dyn NativeContext, this: ObjectRef) -> String {
 /// Returns `Value::Object(None)` when the URL has no entry or the jar/entry is
 /// missing. Spring's `AbstractFileResolvingResource.checkReadable()` reads this
 /// (then `JarEntry.isDirectory()`) for jar resources — not `getContentLength`.
+/// `.jmod` archives store their class/resource entries under a `classes/`
+/// prefix, but a `getResource` URL into a jmod omits it (e.g.
+/// `…/java.base.jmod!/java/lang/Object.class`). Map the requested entry to its
+/// real on-disk zip-entry name, mirroring `URL.openStream` (line ~3931) and
+/// `find_resource`. Non-jmod jars and already-prefixed names pass through.
+///
+/// Without this, `JarURLConnection.getJarEntry()`/`getContentLength()` on a
+/// jmod URL (the form CratonVM hands back from `getResource` for a JDK
+/// runtime class — HotSpot uses `jrt:` instead) found nothing, so Spring's
+/// `AbstractFileResolvingResource.checkReadable()` jar branch
+/// (`getJarEntry() != null`) reported a perfectly readable JDK class resource
+/// as NOT readable (ModuleResourceTests.existingClassFileResource —
+/// `ClassPathResource("java/beans/Introspector.class").isReadable()`).
+fn jmod_zip_entry_name<'a>(disk: &str, entry: &'a str) -> std::borrow::Cow<'a, str> {
+    if disk.ends_with(".jmod") && !entry.starts_with("classes/") {
+        std::borrow::Cow::Owned(format!("classes/{entry}"))
+    } else {
+        std::borrow::Cow::Borrowed(entry)
+    }
+}
+
 fn jar_url_lookup_entry(ctx: &mut dyn NativeContext, ext: &str) -> Value {
     let after = match ext
         .strip_prefix("jar:file:")
@@ -697,7 +719,8 @@ fn jar_url_lookup_entry(ctx: &mut dyn NativeContext, ext: &str) -> Value {
     };
     // Extract the entry metadata into owned values, then drop the `archive`
     // borrow before doing any `ctx` allocation (mirrors p59_jar_collect_entries).
-    let (name, size, csize, method) = match archive.by_name(entry_name) {
+    let lookup = jmod_zip_entry_name(&disk, entry_name);
+    let (name, size, csize, method) = match archive.by_name(&lookup) {
         Ok(entry) => {
             let name = entry.name().to_string();
             let size = entry.size() as i64;
