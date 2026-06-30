@@ -1643,36 +1643,57 @@ pub(crate) fn invoke_to_string(
     // yielding garbage (long[]{1} rendered as "0"/"6" instead of "[J@hash").
     let nf = ctx.object_num_fields(obj);
     if nf == 1 && ctx.heap_kind_of(obj) != cratonvm_types::ObjectKind::Array {
-        match ctx.get_field(obj, 0) {
-            Value::Int(v) => {
-                // Could be Integer, Boolean, Byte, Short, Character.
-                // Check class name for disambiguation.
-                let class_id = ctx.class_id_of_object(obj);
-                let name = ctx.class_name_of_id(class_id).unwrap_or_default();
-                let formatted = if name.contains("Boolean") {
-                    if v != 0 { "true" } else { "false" }.to_string()
-                } else if name.contains("Character") {
-                    char::from_u32(v as u32).unwrap_or('?').to_string()
-                } else if name.contains("Byte") {
-                    (v as i8).to_string()
-                } else if name.contains("Short") {
-                    (v as i16).to_string()
-                } else {
-                    // Integer or unknown int wrapper
-                    v.to_string()
-                };
-                return Ok(formatted);
+        // This fast path MUST be gated on the class actually being a
+        // `java.lang.*` boxed primitive. An arbitrary class that happens to
+        // have a single primitive field has the same heap shape — e.g.
+        // `java.util.Collections$EmptyList`, whose only instance field is the
+        // inherited `AbstractList.modCount` (int 0). Without the gate it was
+        // rendered as that raw field value ("0") instead of dispatching its
+        // real `toString()` ("[]"), so `String.valueOf(emptyList)` /
+        // `"" + emptyList` / `sb.append(emptyList)` all produced "0". Mirrors
+        // the same gate already present in
+        // `native-collections::obj_to_display_string`.
+        let class_id = ctx.class_id_of_object(obj);
+        let name = ctx.class_name_of_id(class_id).unwrap_or_default();
+        let is_wrapper = matches!(
+            name.as_str(),
+            "java/lang/Integer"
+                | "java/lang/Long"
+                | "java/lang/Short"
+                | "java/lang/Byte"
+                | "java/lang/Boolean"
+                | "java/lang/Character"
+                | "java/lang/Float"
+                | "java/lang/Double"
+        );
+        if is_wrapper {
+            match ctx.get_field(obj, 0) {
+                Value::Int(v) => {
+                    let formatted = if name == "java/lang/Boolean" {
+                        if v != 0 { "true" } else { "false" }.to_string()
+                    } else if name == "java/lang/Character" {
+                        char::from_u32(v as u32).unwrap_or('?').to_string()
+                    } else if name == "java/lang/Byte" {
+                        (v as i8).to_string()
+                    } else if name == "java/lang/Short" {
+                        (v as i16).to_string()
+                    } else {
+                        // Integer
+                        v.to_string()
+                    };
+                    return Ok(formatted);
+                }
+                Value::Long(v) => return Ok(v.to_string()),
+                // Use the Java-spec formatters (NOT raw `{}`), so a boxed Double/Float
+                // rendered via String.valueOf(Object) / StringBuilder.append(Object) /
+                // object string-concat matches `Double.toString` — incl. the
+                // 10^-3..10^7 scientific-notation threshold, "Infinity", and "-0.0".
+                // Raw `format!("{}")` dropped the ".0", printed "inf"/"-0", and never
+                // used E-notation (e.g. boxed 1e7 -> "10000000.0", -0.0 -> "-0").
+                Value::Float(v) => return Ok(format_float(v)),
+                Value::Double(v) => return Ok(format_double(v)),
+                _ => {} // Not a primitive wrapper
             }
-            Value::Long(v) => return Ok(v.to_string()),
-            // Use the Java-spec formatters (NOT raw `{}`), so a boxed Double/Float
-            // rendered via String.valueOf(Object) / StringBuilder.append(Object) /
-            // object string-concat matches `Double.toString` — incl. the
-            // 10^-3..10^7 scientific-notation threshold, "Infinity", and "-0.0".
-            // Raw `format!("{}")` dropped the ".0", printed "inf"/"-0", and never
-            // used E-notation (e.g. boxed 1e7 -> "10000000.0", -0.0 -> "-0").
-            Value::Float(v) => return Ok(format_float(v)),
-            Value::Double(v) => return Ok(format_double(v)),
-            _ => {} // Not a primitive wrapper
         }
     }
 

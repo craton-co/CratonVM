@@ -41326,8 +41326,10 @@ fn native_array_new_instance_multi(
 static PROXY_INSTANCES_CREATED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// WP2.5-B — generated-proxy-class cache, keyed on
-/// `(loader_id, sorted_iface_class_ids)`. One generated `$ProxyN` class
-/// per (loader, interface-set) — the JDK `ProxyGenerator` does the same.
+/// `(loader_id, ordered_iface_class_ids)`. One generated `$ProxyN` class
+/// per (loader, ordered-interface-list) — the JDK `ProxyGenerator` does the
+/// same, keying on interface order so `getInterfaces()` round-trips the
+/// user-requested order.
 static PROXY_CLASS_CACHE: parking_lot::RwLock<
     Option<rustc_hash::FxHashMap<(u32, Vec<cratonvm_types::ClassId>), cratonvm_types::ClassId>>,
 > = parking_lot::RwLock::new(None);
@@ -42440,11 +42442,26 @@ fn define_or_get_proxy_class(
         return ProxyClassOutcome::Degrade;
     }
 
-    // Sort + dedup ClassIds for deterministic cache keying.
-    let mut sorted: Vec<cratonvm_types::ClassId> = iface_class_ids.to_vec();
-    sorted.sort_by_key(|c| c.as_u32());
-    sorted.dedup();
-    let cache_key = (loader_id, sorted.clone());
+    // Order-preserving dedup of the interface ClassIds. The JDK's
+    // `Proxy.getProxyClass` keys its cache on the *ordered* interface list and
+    // emits the generated class's `interfaces[]` in exactly that order —
+    // `getInterfaces()` then returns them in the user-requested order. Spring's
+    // `AopProxyUtils.proxiedUserInterfaces` depends on this: it strips the
+    // trailing infrastructure interfaces (SpringProxy/Advised/DecoratingProxy)
+    // off the END of `getInterfaces()`, so the user interfaces must come first
+    // and in insertion order. A previous implementation sorted the ClassIds by
+    // `as_u32()` for the cache key AND fed that sorted list to the emitter,
+    // which scrambled `getInterfaces()` into ClassId order (e.g. SpringProxy
+    // ahead of ITestBean) and broke the trim. Preserve first-occurrence order
+    // instead — distinct orders correctly map to distinct proxy classes, as on
+    // the JDK.
+    let mut ordered: Vec<cratonvm_types::ClassId> = Vec::with_capacity(iface_class_ids.len());
+    for &c in iface_class_ids {
+        if !ordered.contains(&c) {
+            ordered.push(c);
+        }
+    }
+    let cache_key = (loader_id, ordered.clone());
 
     {
         let guard = PROXY_CLASS_CACHE.read();
@@ -42475,11 +42492,11 @@ fn define_or_get_proxy_class(
     // Failure mode (1): spec build. `build_proxy_spec_for` returns `None`
     // only when an interface ClassId fails to resolve to a name (a
     // genuinely unloadable interface) — see its doc.
-    let (gen_name, spec) = match build_proxy_spec_for(ctx, loader_id, &sorted) {
+    let (gen_name, spec) = match build_proxy_spec_for(ctx, loader_id, &ordered) {
         Some(v) => v,
         None => {
             if dbg {
-                eprintln!("[DBG_PROXY] FALLBACK(spec): build_proxy_spec_for returned None for ifaces={sorted:?}");
+                eprintln!("[DBG_PROXY] FALLBACK(spec): build_proxy_spec_for returned None for ifaces={ordered:?}");
             }
             return ProxyClassOutcome::Failed("spec");
         }
@@ -42578,10 +42595,13 @@ pub(crate) fn resolve_serialized_proxy_class(
         }
         iface_cids.push(cid);
     }
-    // Sorted+deduped key matching `define_or_get_proxy_class`'s cache key.
-    let mut sorted = iface_cids.clone();
-    sorted.sort_by_key(|c| c.as_u32());
-    sorted.dedup();
+    // Order-insensitive set key for matching `define_or_get_proxy_class`'s
+    // (now order-preserving) cache key. Two proxies with the same interface
+    // *set* deserialize to the same generated class regardless of the order
+    // each was originally created with, so compare sorted+deduped sets.
+    let mut want_set = iface_cids.clone();
+    want_set.sort_by_key(|c| c.as_u32());
+    want_set.dedup();
     // Primary: reuse an already-generated `$ProxyN` with this interface set,
     // regardless of the loader namespace that created it. The common case —
     // an in-process write→read round-trip (e.g. Spring's
@@ -42591,7 +42611,10 @@ pub(crate) fn resolve_serialized_proxy_class(
         let guard = PROXY_CLASS_CACHE.read();
         if let Some(map) = guard.as_ref() {
             for ((_ns, key), &cid) in map.iter() {
-                if *key == sorted {
+                let mut key_set = key.clone();
+                key_set.sort_by_key(|c| c.as_u32());
+                key_set.dedup();
+                if key_set == want_set {
                     return Some(cid);
                 }
             }
@@ -42606,14 +42629,17 @@ pub(crate) fn resolve_serialized_proxy_class(
 }
 
 /// Build a [`cratonvm_classloading::proxy_gen::ProxyClassSpec`] for the
-/// given sorted interface ClassId set. Walks each interface (and its
-/// super-interfaces transitively) collecting public abstract + default
-/// instance methods, deduplicated by `(name, descriptor)`. Returns
-/// `None` if any ClassId fails to resolve to a name.
+/// given interface ClassId list. The list order is significant — it is
+/// emitted verbatim as the generated class's `interfaces[]` so that
+/// `getInterfaces()` returns the user-requested order (matching the JDK).
+/// Walks each interface (and its super-interfaces transitively) collecting
+/// public abstract + default instance methods, deduplicated by
+/// `(name, descriptor)`. Returns `None` if any ClassId fails to resolve to
+/// a name.
 fn build_proxy_spec_for(
     ctx: &mut dyn NativeContext,
     loader_id: u32,
-    sorted_ifaces: &[cratonvm_types::ClassId],
+    ordered_ifaces: &[cratonvm_types::ClassId],
 ) -> Option<(String, cratonvm_classloading::proxy_gen::ProxyClassSpec)> {
     use cratonvm_classloading::proxy_gen::{ProxyClassSpec, ProxyMethod};
 
@@ -42624,8 +42650,8 @@ fn build_proxy_spec_for(
     let n = PROXY_CLASS_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
     // Resolve iface internal names.
-    let mut iface_names: Vec<String> = Vec::with_capacity(sorted_ifaces.len());
-    for cid in sorted_ifaces {
+    let mut iface_names: Vec<String> = Vec::with_capacity(ordered_ifaces.len());
+    for cid in ordered_ifaces {
         match ctx.class_name_of_id(*cid) {
             Some(name) => iface_names.push(name),
             None => return None,
@@ -42650,7 +42676,7 @@ fn build_proxy_spec_for(
     //     `jdk/`-prefixed platform gate identically to the old `com/sun/` name,
     //     so the rename is behaviour-preserving while making `Class.getName()`
     //     match HotSpot (e.g. `jdk.proxy1.$Proxy0`).
-    let non_public_pkg = sorted_ifaces.iter().find_map(|cid| {
+    let non_public_pkg = ordered_ifaces.iter().find_map(|cid| {
         if ctx.class_access_flags(*cid) & ACC_PUBLIC == 0 {
             let name = ctx.class_name_of_id(*cid)?;
             Some(
@@ -42673,7 +42699,7 @@ fn build_proxy_spec_for(
     // same `(name, descriptor)` key appears with both flavours.
     let mut visited: std::collections::HashSet<cratonvm_types::ClassId> =
         std::collections::HashSet::new();
-    let mut work: Vec<cratonvm_types::ClassId> = sorted_ifaces.to_vec();
+    let mut work: Vec<cratonvm_types::ClassId> = ordered_ifaces.to_vec();
     let mut by_key: std::collections::HashMap<(String, String), ProxyMethod> =
         std::collections::HashMap::new();
     while let Some(cid) = work.pop() {

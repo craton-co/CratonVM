@@ -45,16 +45,24 @@ residual below bites.
 After fix #1, the only remaining stale receivers are
 `java/util/concurrent/locks/AbstractQueuedSynchronizer$ConditionNode` /
 `$ConditionObject`. `CRATONVM_DBG_STALE_RECV` shows a **ScheduledThreadPoolExecutor
-worker parked in `DelayedWorkQueue.take()` → `ConditionObject.awaitNanos()`**: its
-`ConditionNode` (awaitNanos LOCAL[3]) **and** the `DelayedWorkQueue` receiver
-(take LOCAL[0]) read all-zero — reclaimed while the worker is parked. This is the
-documented blocked-thread / moving-young GC sweep gap (a parked thread's live frame
-objects reclaimed): `reference_blocked_thread_gc_gap`,
-`reference_stale_ref_decode_hardening` ("underlying GC sweep gap unfixed"). The
-`plausible_heap_pointer` gates contain it (no SIGSEGV) but it still surfaces as a
-late corruption. Suspected angle: a worker marked dead (or whose snapshot is not
-collected) during executor shutdown while still parked in `awaitNanos`, so
-`collect_all_root_snapshots` (alive-only) skips its frame roots.
+worker parked in `DelayedWorkQueue.take()` → `ConditionObject.awaitNanos()`**: the
+`ConditionObject` (awaitNanos LOCAL[0]) is ALIVE but the `ConditionNode` (LOCAL[3])
+reads all-zero. This is the **JIT register-invisibility remainder** documented in
+`reference_tomcat_dohead_aqs_blocked_jit_register_root`: the JIT-compiled `await`
+keeps the `ConditionNode` oop in a callee-saved register across the `park` call
+(never spilled), so `scan_active_jit_frames` (the spill scan already in dev, which
+cut the flood 54810 → ~2) can't see it; and after signal-transfer its heap path (the
+AQS sync queue) is unreachable during executor shutdown, so no heap-reachable root
+reaches it. The `plausible_heap_pointer` gates contain it (no SIGSEGV) but the ~2
+stale receivers still fail the test via a downstream NPE cascade.
+
+**Dead ends (do NOT retry) — confirmed twice:** conservative register/local capture
+*backfires*. Extending `conservative_locals_enabled` to `CRATONVM_REAL_AQS` was
+re-tested here: AQS stale **2 → 105** (false-positive register/long values pinned
+under the non-moving sweep over-retain young → MORE reclamation), reverted. The
+prior session's `scan_live_callee_saved_registers` had the same result. The real fix
+is **precise oop maps / shadow stack** (a large, prior-deferred feature), not a
+conservative scan.
 
 ## Repro / validate (PowerShell, from `apps/tomcat-suite-runner`)
 ```

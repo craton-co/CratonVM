@@ -833,6 +833,32 @@ fn native_alfu_add_and_get(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     Ok(Some(Value::Long(prev.wrapping_add(delta))))
 }
 
+// incrementAndGet/decrementAndGet — long equivalents of the int variants
+// above. The synthetic `$RustJvmImpl` subclass doesn't inherit the abstract
+// AtomicLongFieldUpdater base's concrete methods, and `register_alfu`
+// previously registered only getAndIncrement/getAndDecrement/addAndGet — NOT
+// incrementAndGet/decrementAndGet. kotlinx.coroutines' CoroutineScheduler
+// calls `incrementAndGet(Object)J` (worker-id bump in createNewWorker), which
+// hit a fatal NoSuchMethodError that ABENDed the VM. Both return the NEW value
+// (fetch-add reports the previous, so we fold the delta back in).
+fn native_alfu_increment_and_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // incrementAndGet(target) ≡ getAndAdd(target, 1) + 1.
+    let this = arg_obj_or_npe(args, 0, "updater")?;
+    let target = require_target(args, 1)?;
+    let slot = impl_slot(ctx, this).unwrap_or(0);
+    let prev = ctx.atomic_fetch_add_long(target, slot, 1)?;
+    Ok(Some(Value::Long(prev.wrapping_add(1))))
+}
+
+fn native_alfu_decrement_and_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // decrementAndGet(target) ≡ getAndAdd(target, -1) - 1.
+    let this = arg_obj_or_npe(args, 0, "updater")?;
+    let target = require_target(args, 1)?;
+    let slot = impl_slot(ctx, this).unwrap_or(0);
+    let prev = ctx.atomic_fetch_add_long(target, slot, -1)?;
+    Ok(Some(Value::Long(prev.wrapping_sub(1))))
+}
+
 // ---------------------------------------------------------------------------
 // Registration entry point
 // ---------------------------------------------------------------------------
@@ -1107,7 +1133,10 @@ fn register_alfu(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/Object;J)J",
         native_alfu_get_and_add,
     );
-    // getAndIncrement / getAndDecrement / addAndGet on both impl + base.
+    // getAndIncrement / getAndDecrement / addAndGet / incrementAndGet /
+    // decrementAndGet on both impl + base. (incrementAndGet/decrementAndGet
+    // were previously missing — kotlinx.coroutines' CoroutineScheduler calls
+    // incrementAndGet(Object)J, which ABENDed the VM with NoSuchMethodError.)
     for cls in [CLS_LONG_FIELD_UPDATER_IMPL, CLS_LONG_FIELD_UPDATER] {
         r.register(
             cls,
@@ -1126,6 +1155,18 @@ fn register_alfu(r: &mut NativeMethodRegistry) {
             "addAndGet",
             "(Ljava/lang/Object;J)J",
             native_alfu_add_and_get,
+        );
+        r.register(
+            cls,
+            "incrementAndGet",
+            "(Ljava/lang/Object;)J",
+            native_alfu_increment_and_get,
+        );
+        r.register(
+            cls,
+            "decrementAndGet",
+            "(Ljava/lang/Object;)J",
+            native_alfu_decrement_and_get,
         );
     }
     r.register(
