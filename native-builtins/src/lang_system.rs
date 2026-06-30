@@ -2621,10 +2621,35 @@ fn preload_supertypes_via_loader(
     }
     let p_loader = ctx.pin_native_root(loader_obj);
     let mut loader = loader_obj;
+    // Loader-faithful gate: under CRATONVM_LOADER_AWARE_RESOLUTION the
+    // "already loaded" short-circuit must be keyed on THIS loader's namespace,
+    // not the global name index. An isolating/enhancing loader (Hibernate's
+    // package-scoped `EnhancingClassLoader`) defines its OWN enhanced copy of an
+    // in-package supertype; if a different loader already loaded the un-enhanced
+    // copy, the global `class_id_by_name` probe would wrongly skip the drive and
+    // the subclass would link the un-enhanced super (NoSuchMethodError on the
+    // enhanced `$$_hibernate_*` accessors). Driving `loadClass` here defines the
+    // loader's enhanced copy first, which `define_class_full` then prefers via
+    // the (loader,name) exact link. Gate-off keeps the global short-circuit →
+    // byte-identical.
+    let loader_faithful = crate::classloader::loader_aware_resolution();
+    let loader_ns = if loader_faithful {
+        let ns = crate::classloader::loader_namespace_id(ctx, loader);
+        loader = ctx.read_native_pin(p_loader, loader);
+        ns
+    } else {
+        0
+    };
     for internal in &supertypes {
         loader = ctx.read_native_pin(p_loader, loader);
-        if ctx.class_id_by_name(internal).is_some() {
-            continue; // already loaded — define_class_full will link it
+        let already = if loader_faithful {
+            ctx.class_id_defined_by_loader_exact(internal, loader_ns)
+                .is_some()
+        } else {
+            ctx.class_id_by_name(internal).is_some()
+        };
+        if already {
+            continue; // already present for this loader — define_class_full links it
         }
         let dotted = internal.replace('/', ".");
         let name_str = ctx.create_string(&dotted); // may relocate `loader`

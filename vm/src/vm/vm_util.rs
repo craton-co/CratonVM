@@ -704,13 +704,28 @@ fn initialize_class_shared(
     if !shared.config.skip_verification {
         let cm = shared.class_manager.read();
         let store = &cm.class_store;
+        // A class DEFINED with `skip_verification` (trusted runtime-generated
+        // bytecode — ByteBuddy / CGLIB / JDK Proxy / `Lookup.defineClass` /
+        // `Unsafe.defineClass`) is deliberately not verified at define time
+        // (`define_class_with_options`, class_manager.rs ~3267): our worklist
+        // verifier cannot model its synthesised frames. Link-time MUST honor the
+        // SAME per-class decision, otherwise the class our own define path
+        // trusted is re-verified here and a structural rule it legitimately
+        // bends is a HARD link error. Concretely: Hibernate asks ByteBuddy to
+        // build a lazy-proxy `Entity$HibernateProxy` whose getter overrides a
+        // FINAL accessor — HotSpot surfaces a *catchable* error the proxy
+        // factory handles; our link-time Pass-2 (`verify_final_method_constraint`)
+        // returned an UNCATCHABLE `InternalError` → process abort
+        // (`FinalAccessorProxyFactoryTests`). Skipping here matches define-time
+        // and HotSpot's "don't re-verify a trusted class" policy.
+        let per_class_skip = cm.class_skip_bytecode_verification(class_id);
         if let Some(class) = store.get(class_id) {
             if class.state == ClassState::Verifying {
                 // Skip verification for JDK bootstrap classes loaded
                 // from jimage (they're pre-verified by javac/jlink).
                 // This matches HotSpot's behavior: -Xverify:none for
                 // java.base, -Xverify:remote for application classes.
-                if !verifier_skip_eligible(class) {
+                if !per_class_skip && !verifier_skip_eligible(class) {
                     let hierarchy = ClassStoreHierarchy { store };
                     // Pass 2 вЂ” structural verification.
                     let structural =

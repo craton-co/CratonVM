@@ -113,6 +113,23 @@ fn loaded_classes_probe(
         .map(|(_, &id)| id)
 }
 
+/// `CRATONVM_LOADER_AWARE_RESOLUTION` gate (default OFF). Mirrors
+/// `cratonvm_vm::runtime::env_cache::loader_aware_resolution` and the
+/// native-builtins twin so the classloading half of loader-faithful class
+/// resolution (loader-faithful supertype linking in `define_class_with_options`)
+/// stays in lock-step. Default OFF keeps every define byte-identical; flip on to
+/// link an enhanced subclass to its same-loader (enhanced) supertype copy rather
+/// than the un-enhanced global one returned by `get_loaded_class_id`. Empty /
+/// `"0"` ⇒ off; any other value ⇒ on.
+fn loader_aware_resolution() -> bool {
+    use std::sync::OnceLock;
+    static GATE: OnceLock<bool> = OnceLock::new();
+    *GATE.get_or_init(|| match std::env::var("CRATONVM_LOADER_AWARE_RESOLUTION") {
+        Ok(v) => !v.is_empty() && v != "0",
+        Err(_) => false,
+    })
+}
+
 /// H5 (HIGH): return `true` if `internal_name` (a `/`-separated internal
 /// class name) lives in a runtime package that only the bootstrap loader
 /// is permitted to define classes into.
@@ -239,6 +256,29 @@ impl<'a> ClassStoreHierarchy<'a> {
                     }
                 }
                 ClassLoaderId::UserDefined(_) => {
+                    // Loader-faithful gate: an *overriding* user loader (one that
+                    // redefines `loadClass` to define its OWN per-loader copy of a
+                    // name instead of delegating — e.g. Hibernate's package-scoped
+                    // `EnhancingClassLoader`) is the JVMS §5.4.3 initiating loader
+                    // for references in the classes it defines, so its own copy
+                    // wins over a same-named parent copy. `define_class_with_options`
+                    // already links such a class's superclass to the loader's own
+                    // enhanced copy (`resolve_supertype`); the verifier's hierarchy
+                    // lookup MUST agree, otherwise an enhanced subclass's
+                    // `invokespecial <super>.<init>` is rejected (the
+                    // `uninitializedThis` owner — the loader's enhanced `Person` —
+                    // would not match a parents-first un-enhanced `Person`,
+                    // failing `is_subclass` → spurious VerifyError, define returns
+                    // null, JDK `postDefineClass` NPEs). So probe the user loader's
+                    // OWN definitions FIRST when the gate is on. A loader that does
+                    // NOT define its own copy simply misses here and falls through
+                    // to the built-in chain — same answer as before; gate-off keeps
+                    // the legacy parents-first order → byte-identical.
+                    if loader_aware_resolution() {
+                        if let Some(id) = loaded_classes_probe(self.loaded_classes, req, name) {
+                            return Some(id);
+                        }
+                    }
                     // Parents first (the entire built-in chain) …
                     for loader_id in BUILTIN_LOADER_DELEGATION_CHAIN {
                         if let Some(id) =
@@ -2741,8 +2781,33 @@ impl ClassManager {
         // Recursively load the superclass (uses parent delegation too).
         // `class_file.super_class` is `Option<Arc<str>>`; `load_class` takes
         // `&str`, so deref through the Arc.
+        //
+        // Loader-faithful gate (CRATONVM_LOADER_AWARE_RESOLUTION): `load_class`
+        // resolves a supertype via `get_loaded_class_id`, which returns ONE
+        // class per name — the un-enhanced global copy. When a user loader that
+        // defines its OWN per-loader copy of a supertype (e.g. Hibernate's
+        // package-scoped `EnhancingClassLoader`, which enhances *every* in-package
+        // class including the entity's superclass) defines a subclass, its super
+        // link must point at the loader's enhanced copy, not the global one;
+        // otherwise the subclass's vtable walk reaches the un-enhanced supertype
+        // and a `$$_hibernate_read/write_<field>` accessor declared there is a
+        // hard `NoSuchMethodError` (InheritedTest / MappedSuperclassTest crash on
+        // `entity.anUnspecifiedObject`). Prefer a copy already defined by THIS
+        // defining loader's namespace (populated first by
+        // `preload_supertypes_via_loader`, JVMS §5.3.5 initiating-loader order),
+        // falling back to the global `load_class`. Gated + only when the exact
+        // copy exists → byte-identical gate-off / no same-loader copy.
+        let loader_faithful = loader_aware_resolution();
+        let resolve_supertype = |this: &mut Self, internal: &str| -> Result<ClassId, VmError> {
+            if loader_faithful {
+                if let Some(id) = loaded_classes_probe(&this.loaded_classes, loader_id, internal) {
+                    return Ok(id);
+                }
+            }
+            this.load_class(internal)
+        };
         let superclass_id = match class_file.super_class {
-            Some(ref super_name) => match self.load_class(&**super_name) {
+            Some(ref super_name) => match resolve_supertype(self, &**super_name) {
                 Ok(id) => Some(id),
                 Err(e) => {
                     self.loading_guard.remove(name);
@@ -2753,11 +2818,13 @@ impl ClassManager {
         };
 
         // Recursively load all interfaces. Each `iface_name` is `&Arc<str>`;
-        // deref to `&str` for `load_class`.
+        // deref to `&str` for `load_class`. Same loader-faithful preference as
+        // the superclass above (an enhanced subclass must link the loader's own
+        // copy of an enhanced super-interface).
         let interface_ids: Vec<ClassId> = match class_file
             .interfaces
             .iter()
-            .map(|iface_name| self.load_class(iface_name))
+            .map(|iface_name| resolve_supertype(self, iface_name))
             .collect::<Result<Vec<_>, _>>()
         {
             Ok(ids) => ids,
