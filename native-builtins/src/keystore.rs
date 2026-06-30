@@ -1514,7 +1514,11 @@ fn read_string_arg(ctx: &mut dyn NativeContext, v: &Value) -> Option<String> {
     }
 }
 
-fn make_x509_mirror(ctx: &mut dyn NativeContext, alias: &str, cert_der: &[u8]) -> ObjectRef {
+pub(crate) fn make_x509_mirror(
+    ctx: &mut dyn NativeContext,
+    alias: &str,
+    cert_der: &[u8],
+) -> ObjectRef {
     // Build the DER byte[] once — used either as the ctor arg for the real cert
     // or stashed in the synthetic-mirror fallback.
     let arr = ctx.new_array(ArrayElementType::Byte, cert_der.len());

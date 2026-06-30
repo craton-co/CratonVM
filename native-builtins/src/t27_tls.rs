@@ -2525,6 +2525,12 @@ impl EngineConn {
             EngineConn::Server(s) => s.send_close_notify(),
         }
     }
+    fn peer_certificates(&self) -> Option<&[CertificateDer<'static>]> {
+        match self {
+            EngineConn::Client(c) => c.peer_certificates(),
+            EngineConn::Server(s) => s.peer_certificates(),
+        }
+    }
 }
 
 pub(crate) struct EngineState {
@@ -2561,6 +2567,17 @@ pub(crate) struct EngineState {
     /// global `runtime_tls_identity`, so an in-process mTLS test's server and
     /// client engines each use their own keystore.
     identity_override: Option<(String, String)>,
+    /// Decrypted application bytes that did not fit the caller's `unwrap`
+    /// destination buffers. Served first on the next `unwrap`. MUST be kept
+    /// separate from `outbound` (encrypted TLS records) — mixing decrypted
+    /// plaintext into `outbound` makes the next `wrap` emit plaintext on the
+    /// wire, which the peer rejects ("corrupt message of type InvalidContentType").
+    plaintext_pending: Vec<u8>,
+    /// The peer's certificate chain (DER, leaf first), captured once the
+    /// handshake finishes. For a server engine this is the CLIENT certificate
+    /// (mTLS) — Tomcat's SSLAuthenticator reads it via
+    /// `SSLSession.getPeerCertificates()` to authenticate/authorize the client.
+    peer_cert_chain_der: Vec<Vec<u8>>,
 }
 
 impl Default for EngineState {
@@ -2583,6 +2600,8 @@ impl Default for EngineState {
             server_config: None,
             peer_host: None,
             identity_override: None,
+            plaintext_pending: Vec::new(),
+            peer_cert_chain_der: Vec::new(),
         }
     }
 }
@@ -3135,6 +3154,14 @@ fn engine_capture_negotiation(state: &mut EngineState) {
             state.negotiated_alpn = Some(s.to_string());
         }
     }
+    // Capture the peer's certificate chain (the client cert, for a server
+    // engine) so `SSLSession.getPeerCertificates()` can hand it to Tomcat's
+    // client-cert authenticator.
+    if state.peer_cert_chain_der.is_empty() {
+        if let Some(certs) = conn.peer_certificates() {
+            state.peer_cert_chain_der = certs.iter().map(|c| c.as_ref().to_vec()).collect();
+        }
+    }
 }
 
 /// Public accessor for the negotiated ALPN of an engine — used by other
@@ -3520,6 +3547,14 @@ fn register_engine_impl_natives(r: &mut NativeMethodRegistry) {
                 ),
             );
             ctx.set_field(ses, 6, Value::Object(Some(alpn_s)));
+            // Associate the peer (client) cert chain with this session object so
+            // SSLSession.getPeerCertificates() can return it for mTLS auth.
+            let peer_chain = with_engine(id, |s| s.peer_cert_chain_der.clone()).unwrap_or_default();
+            if !peer_chain.is_empty() {
+                session_peer_certs_table()
+                    .lock()
+                    .insert(objref_key(ses), peer_chain);
+            }
             Ok(Some(Value::Object(Some(ses))))
         },
     );
@@ -3908,6 +3943,15 @@ fn do_unwrap(
             Ok((_, p)) => p,
             Err(e) => return Err(RuntimeError::IOException { message: e }.into()),
         };
+        // Serve any plaintext that overflowed a previous unwrap's dst buffers
+        // first (FIFO), ahead of the freshly-decrypted bytes.
+        let plaintext = if s.plaintext_pending.is_empty() {
+            plaintext
+        } else {
+            let mut all = std::mem::take(&mut s.plaintext_pending);
+            all.extend(plaintext);
+            all
+        };
         engine_capture_negotiation(s);
         let mut status = SR_OK;
         // If handshake wants more data and we got nothing useful, BUFFER_UNDERFLOW
@@ -3943,15 +3987,15 @@ fn do_unwrap(
     // surface, plaintext leftover indicates the caller's dst was too small;
     // we surface that via BUFFER_OVERFLOW. The caller must enlarge dst.
     let final_status = if idx < plaintext.len() {
-        // Re-inject into a per-engine plaintext cache.
+        // The caller's dst buffers were too small for all the decrypted bytes.
+        // Stash the remainder in the DEDICATED plaintext-pending buffer (NOT
+        // `outbound`, which holds encrypted TLS records destined for `wrap` —
+        // mixing plaintext there makes the next `wrap` emit it on the wire and
+        // the peer aborts with "corrupt message"). Tomcat's SecureNioChannel
+        // responds to BUFFER_OVERFLOW by enlarging the app buffer and
+        // re-unwrapping, which drains `plaintext_pending` on the retry.
         with_engine(id, |s| {
-            let leftover = &plaintext[idx..];
-            // Push leftover plaintext back into rustls reader is impossible;
-            // instead, we keep it alongside outbound (by abuse of name), so
-            // the next unwrap with a bigger dst can drain. Use inbound as a
-            // staging slot is wrong (it's TLS bytes) — extend a plaintext_buf.
-            // Initialize a side slot if needed.
-            s.outbound.extend_from_slice(leftover); // BUG-AVOIDANCE: actually use a dedicated buf.
+            s.plaintext_pending.extend_from_slice(&plaintext[idx..]);
         });
         SR_BUFFER_OVERFLOW
     } else {
@@ -4175,8 +4219,48 @@ pub fn register_sslengine_real(r: &mut NativeMethodRegistry) {
 /// `AbstractMethodError: javax/net/ssl/SSLSession.getApplicationBufferSize()I
 /// has no Code attribute`, killing the NioEndpoint socket processor so the
 /// HTTPS server never serves (~18 TLS/HTTP2-TLS/WebSocket-SSL test classes).
+/// Side-table associating an `SSLSession` object with its peer (client)
+/// certificate chain (DER, leaf first), populated by the engine's getSession().
+fn session_peer_certs_table() -> &'static Mutex<HashMap<u64, Vec<Vec<u8>>>> {
+    static T: OnceLock<Mutex<HashMap<u64, Vec<Vec<u8>>>>> = OnceLock::new();
+    T.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 fn register_ssl_session_real(r: &mut NativeMethodRegistry) {
     let cls = "javax/net/ssl/SSLSession";
+
+    // getPeerCertificates() — the client certificate chain, for mTLS. Tomcat's
+    // SSLAuthenticator / coyote SSLSupport reads this to authenticate the
+    // client; without it a client-cert-protected resource returns HTTP 401.
+    // Build real `sun.security.x509.X509CertImpl` mirrors from the captured DER
+    // (same path the keystore uses). Empty chain → throw
+    // SSLPeerUnverifiedException (real-JDK contract), which Tomcat treats as
+    // "no client cert".
+    r.register(
+        cls,
+        "getPeerCertificates",
+        "()[Ljava/security/cert/Certificate;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let chain = session_peer_certs_table()
+                .lock()
+                .get(&objref_key(this))
+                .cloned()
+                .unwrap_or_default();
+            if chain.is_empty() {
+                return Err(RuntimeError::IllegalStateException {
+                    message: "peer not authenticated (no certificate in session)".into(),
+                }
+                .into());
+            }
+            let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), chain.len());
+            for (i, der) in chain.iter().enumerate() {
+                let mirror = crate::keystore::make_x509_mirror(ctx, "peer", der);
+                ctx.set_array_element(arr, i, Value::Object(Some(mirror)));
+            }
+            Ok(Some(Value::Object(Some(arr))))
+        },
+    );
 
     // Buffer sizes are layout-independent JSSE constants. The real JDK returns
     // 16384 (max TLS plaintext record) for `getApplicationBufferSize` and 16709
