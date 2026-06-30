@@ -2275,13 +2275,27 @@ fn s_instantiation_strategy_instantiate(
     let bean_class_field = ctx.get_field_by_name(mbd, "beanClass");
     let mirror = match bean_class_field {
         Value::Object(Some(o)) => o,
-        // null beanClass — the bean is orphaned/unresolved. Return null
-        // and let Spring's doCreateBean surface a recoverable failure.
+        // null beanClass — no class was ever specified on the definition (no
+        // class name either, otherwise the field would hold the String name).
+        // Real Spring's `SimpleInstantiationStrategy.instantiate` calls
+        // `bd.getBeanClass()`, which throws
+        // `IllegalStateException("No bean class specified on bean definition")`
+        // for exactly this case; `instantiateBean` then wraps it as the
+        // BeanCreationException whose root cause is that ISE
+        // (DefaultListableBeanFactoryTests / {Autowired,Inject}AnnotationBean
+        // PostProcessorTests.incompleteBeanDefinition). Returning null instead
+        // surfaced a misleading IllegalArgumentException downstream. Orphaned
+        // /unresolved beans carry a String class NAME in `beanClass` (handled
+        // by the `mirror_cn != "java/lang/Class"` branch below), so this null
+        // case is genuinely "no class specified".
         _ => {
             tracing::debug!(
-                "[spring-shim] SimpleInstantiationStrategy.instantiate: null beanClass, skipping"
+                "[spring-shim] SimpleInstantiationStrategy.instantiate: null beanClass, throwing ISE"
             );
-            return Ok(Some(Value::Object(None)));
+            return Err(cratonvm_types::error::RuntimeError::IllegalStateException {
+                message: "No bean class specified on bean definition".to_string(),
+            }
+            .into());
         }
     };
 

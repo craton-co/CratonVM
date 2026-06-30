@@ -1074,6 +1074,15 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     let prev_category = registry.current_category();
     registry.set_category(cratonvm_native_api::NativeKind::Bridge);
 
+    // Synthetic-stream `spliterator()` natives — synthetic stream objects
+    // (stamped with the bare `java/util/stream/*Stream` interface) are produced
+    // in real-JDK mode (e.g. `OptionalInt.stream()`), and real JDK stream code
+    // (`IntStream.concat` → `a.spliterator()`) then calls `spliterator()` on
+    // them. Without this the call falls to the abstract interface method →
+    // `AbstractMethodError` (swallowed by JUnit's launcher → every parameterized
+    // /factory test reported EMPTY). See `register_synthetic_stream_spliterators`.
+    crate::phases_late::register_synthetic_stream_spliterators(registry);
+
     // RBIGDEC.1 — BigInteger / BigDecimal arithmetic + toString overrides.
     //
     // BigInteger.<clinit> can fail in real-JDK mode (intrinsic fallback,
@@ -41482,12 +41491,30 @@ fn native_proxy_new_instance(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     let handler = args.get(2).cloned().unwrap_or(Value::Object(None));
 
     // Walk the Class[] arg into a list of iface ClassIds for cache keying.
+    //
+    // Real `Proxy.newProxyInstance` → `ProxyBuilder` validates every supplied
+    // `Class` is actually an interface, throwing
+    // `IllegalArgumentException("<fqcn> is not an interface")` otherwise
+    // (ServiceLocatorFactoryBeanTests.whenServiceLocatorInterfaceIsNotAnInterfaceType,
+    // which passes a plain class). Mirror that check here before generating the
+    // proxy class.
     let mut iface_cids: Vec<cratonvm_types::ClassId> = Vec::new();
     if let Value::Object(Some(arr)) = interfaces {
         let n = ctx.array_length(arr);
         for i in 0..n {
             if let Value::Object(Some(mirror)) = ctx.get_array_element(arr, i) {
                 if let Some(cid) = ctx.class_id_from_mirror(mirror) {
+                    let flags = ctx.class_access_flags(cid);
+                    if flags & cratonvm_types::access_flags::ACC_INTERFACE == 0 {
+                        let dotted = ctx
+                            .class_name_of_id(cid)
+                            .unwrap_or_default()
+                            .replace('/', ".");
+                        return Err(RuntimeError::IllegalArgumentException {
+                            message: format!("{dotted} is not an interface"),
+                        }
+                        .into());
+                    }
                     iface_cids.push(cid);
                 }
             }
