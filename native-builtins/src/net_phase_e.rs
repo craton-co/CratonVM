@@ -6070,6 +6070,17 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
             let this = obj_arg(args, 0)?;
             let f = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSocketFactory", 1);
             ctx.set_field(f, 0, Value::Object(Some(this)));
+            // getSocketFactory() is a CLIENT-side call (the server uses
+            // createSSLEngine / getServerSocketFactory), so if this context
+            // carries a per-context identity it is the client cert. Install it
+            // as the default client identity for the native HttpsURLConnection
+            // client (`http_url_connection::perform`), which can't route through
+            // the synthetic factory. This is the reliable capture point —
+            // overriding the concrete `setDefaultSSLSocketFactory` bytecode does
+            // not work (real JDK method body wins over a native override).
+            if let Some((cert, key)) = crate::t27_tls::ctx_identity(this) {
+                crate::t27_tls::set_huc_default_client_identity(Some((cert, key)));
+            }
             Ok(Some(Value::Object(Some(f))))
         },
     );

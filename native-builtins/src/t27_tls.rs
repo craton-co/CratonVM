@@ -577,22 +577,52 @@ pub(crate) fn build_server_config_single_cert(
     require_client_cert: bool,
     client_ca_pem: Option<&str>,
 ) -> Result<Arc<ServerConfig>, String> {
+    build_server_config_single_cert_ex(
+        cert_pem,
+        key_pem,
+        alpn_protocols,
+        require_client_cert,
+        false,
+        client_ca_pem,
+    )
+}
+
+/// As `build_server_config_single_cert`, but with an explicit `optional_client_cert`
+/// mode. When `optional_client_cert` is set (and `require_client_cert` is not),
+/// the server still sends a `CertificateRequest` and validates/stores a client
+/// cert if one is presented, but does NOT reject clients that omit it — this is
+/// the JSSE `setWantClientAuth(true)` / `certificateVerification="optional"`
+/// behavior. Without it, an "optional" server never asks for the cert, so
+/// `conn.peer_certificates()` is empty and client-cert auth (e.g.
+/// `TestClientCertTls13`) returns HTTP 401.
+pub(crate) fn build_server_config_single_cert_ex(
+    cert_pem: &str,
+    key_pem: &str,
+    alpn_protocols: &[&str],
+    require_client_cert: bool,
+    optional_client_cert: bool,
+    client_ca_pem: Option<&str>,
+) -> Result<Arc<ServerConfig>, String> {
     let chain = parse_cert_chain_pem(cert_pem)?;
     let key = parse_private_key_pem(key_pem)?;
 
     let builder = ServerConfig::builder();
-    let builder = if require_client_cert {
+    let builder = if require_client_cert || optional_client_cert {
         let ca_pem = client_ca_pem
-            .ok_or_else(|| "require_client_cert=true but client_ca_pem is None".to_string())?;
+            .ok_or_else(|| "client auth requested but client_ca_pem is None".to_string())?;
         let mut roots = RootCertStore::empty();
         for cert in parse_cert_chain_pem(ca_pem)? {
             roots
                 .add(cert)
                 .map_err(|e| format!("client CA add failed: {}", e))?;
         }
-        let verifier = WebPkiClientVerifier::builder(Arc::new(roots))
-            .build()
-            .map_err(|e| format!("client verifier build failed: {}", e))?;
+        let vb = WebPkiClientVerifier::builder(Arc::new(roots));
+        let verifier = if require_client_cert {
+            vb.build()
+        } else {
+            vb.allow_unauthenticated().build()
+        }
+        .map_err(|e| format!("client verifier build failed: {}", e))?;
         builder.with_client_cert_verifier(verifier)
     } else {
         builder.with_no_client_auth()
@@ -3015,7 +3045,11 @@ fn engine_begin(state: &mut EngineState) -> Result<(), String> {
             // client don't clobber each other's cert.
             None => match &state.identity_override {
                 Some((cert, key)) => {
-                    let client_ca = if state.need_client_auth {
+                    // Request the client cert for either NEED (required) or WANT
+                    // (optional) client auth — otherwise an "optional" server
+                    // never asks and `peer_certificates()` stays empty.
+                    let request = state.need_client_auth || state.want_client_auth;
+                    let client_ca = if request {
                         let pem = trust_roots_pem();
                         if pem.is_empty() {
                             None
@@ -3025,11 +3059,12 @@ fn engine_begin(state: &mut EngineState) -> Result<(), String> {
                     } else {
                         None
                     };
-                    build_server_config_single_cert(
+                    build_server_config_single_cert_ex(
                         cert,
                         key,
                         &alpn_strs,
                         state.need_client_auth,
+                        state.want_client_auth && !state.need_client_auth,
                         client_ca.as_deref(),
                     )?
                 }
@@ -3923,11 +3958,73 @@ fn do_unwrap(
         }
     }
 
-    // Step 1: pull inbound bytes from src ByteBuffer.
-    let mut inbound = Vec::new();
-    let consumed = bb_read_into(ctx, src, &mut inbound, 16384);
+    // Step 1+2: record-oriented unwrap. Feed rustls only COMPLETE TLS records
+    // from `src` whose decrypted plaintext fits the caller's dst buffers, and
+    // advance `src` past exactly those records. Incomplete records, or records
+    // beyond what the dst can hold, are LEFT in `src` (the caller's netInBuffer)
+    // so the caller re-feeds them on its next unwrap.
+    //
+    // This is the crux of correct SSLEngine semantics over rustls: never decrypt
+    // more plaintext than the caller's buffer can take and stash the excess in
+    // our own buffer — the caller (Tomcat) cannot see that buffer and blocks
+    // reading the socket for body bytes that already arrived, yielding
+    // java.net.SocketTimeoutException → HTTP 400 on large request bodies.
+    let dst_cap: usize = dsts
+        .iter()
+        .map(|d| {
+            let (_, p, l, _) = bb_view(ctx, *d);
+            l.saturating_sub(p)
+        })
+        .sum();
 
-    // Step 2: pump rustls.
+    // Step 0: serve any plaintext that overflowed a previous unwrap's dst FIRST,
+    // WITHOUT consuming new network bytes (the caller can't see our buffer and
+    // would otherwise block on the socket). Only reached when a record's
+    // plaintext exceeded a partially-filled dst.
+    let pending = with_engine(id, |s| std::mem::take(&mut s.plaintext_pending)).unwrap_or_default();
+    if !pending.is_empty() {
+        let mut idx = 0usize;
+        for d in &dsts {
+            if idx >= pending.len() {
+                break;
+            }
+            let n = bb_write_from(ctx, *d, &pending[idx..]);
+            idx += n;
+            if n == 0 {
+                break;
+            }
+        }
+        let hs = with_engine(id, |s| handshake_status_of(s)).unwrap_or(HS_NOT_HANDSHAKING_R);
+        let status = if idx < pending.len() {
+            with_engine(id, |s| {
+                let mut rest = pending[idx..].to_vec();
+                rest.extend_from_slice(&s.plaintext_pending);
+                s.plaintext_pending = rest;
+            });
+            SR_BUFFER_OVERFLOW
+        } else {
+            SR_OK
+        };
+        let result = alloc_engine_result(ctx, status, hs, 0, idx as i32);
+        return Ok(Some(Value::Object(Some(result))));
+    }
+
+    // If the caller's dst has no room for APPLICATION data, do NOT
+    // consume/decrypt records — they would be stuck in our buffer. Return
+    // OVERFLOW so the caller drains its app buffer and retries (records stay in
+    // src). Skipped while still handshaking: handshake records produce no app
+    // plaintext, so a 0-capacity dst is normal and must not stall the handshake.
+    let handshaking = with_engine(id, |s| s.conn.as_ref().map(|c| c.is_handshaking()).unwrap_or(true))
+        .unwrap_or(true);
+    if dst_cap == 0 && !handshaking {
+        let hs = with_engine(id, |s| handshake_status_of(s)).unwrap_or(HS_NOT_HANDSHAKING_R);
+        let result = alloc_engine_result(ctx, SR_BUFFER_OVERFLOW, hs, 0, 0);
+        return Ok(Some(Value::Object(Some(result))));
+    }
+
+    let (src_arr, src_pos, src_lim, _) = bb_view(ctx, src);
+    let mut offset = src_pos;
+
     let (status, hs, plaintext) = {
         let mut g = engine_registry().write();
         let s = match g.get_mut(&id) {
@@ -3939,26 +4036,84 @@ fn do_unwrap(
                 .into())
             }
         };
-        let plaintext = match engine_unwrap_pump(s, &inbound) {
-            Ok((_, p)) => p,
-            Err(e) => return Err(RuntimeError::IOException { message: e }.into()),
-        };
-        // Serve any plaintext that overflowed a previous unwrap's dst buffers
-        // first (FIFO), ahead of the freshly-decrypted bytes.
-        let plaintext = if s.plaintext_pending.is_empty() {
-            plaintext
-        } else {
-            let mut all = std::mem::take(&mut s.plaintext_pending);
-            all.extend(plaintext);
-            all
-        };
-        engine_capture_negotiation(s);
-        let mut status = SR_OK;
-        // If handshake wants more data and we got nothing useful, BUFFER_UNDERFLOW
-        if let Some(c) = s.conn.as_ref() {
-            if c.is_handshaking() && c.wants_read() && consumed == 0 && inbound.is_empty() {
-                status = SR_BUFFER_UNDERFLOW;
+        let mut plaintext: Vec<u8> = Vec::new();
+        let mut underflow = false;
+        if let (Some(arr), Some(conn)) = (src_arr, s.conn.as_mut()) {
+            loop {
+                if offset >= src_lim {
+                    break;
+                }
+                if offset + 5 > src_lim {
+                    underflow = true; // incomplete record header
+                    break;
+                }
+                let b3 = ctx.get_array_element(arr, offset + 3).as_int().unwrap_or(0) as u8 as usize;
+                let b4 = ctx.get_array_element(arr, offset + 4).as_int().unwrap_or(0) as u8 as usize;
+                let rec_len = (b3 << 8) | b4;
+                let rec_end = offset + 5 + rec_len;
+                if rec_end > src_lim {
+                    underflow = true; // incomplete record body
+                    break;
+                }
+                // Don't start a record whose plaintext would overflow the dst
+                // (once we already have some to deliver). `rec_len >= plaintext`
+                // is a safe upper bound (TLS overhead only shrinks it).
+                if !plaintext.is_empty() && plaintext.len() + rec_len > dst_cap {
+                    break;
+                }
+                let rec_total = 5 + rec_len;
+                let mut rec = Vec::with_capacity(rec_total);
+                for i in offset..rec_end {
+                    rec.push(ctx.get_array_element(arr, i).as_int().unwrap_or(0) as u8);
+                }
+                // Feed the ENTIRE record into rustls. `read_tls` reads only as
+                // much as its deframer buffer takes per call (often less than a
+                // full 16 KiB record), so loop until the cursor is drained —
+                // otherwise rustls holds a partial record, decrypts nothing
+                // (`produced=0`), and the request body never reaches the servlet.
+                let mut cur = std::io::Cursor::new(rec);
+                let mut fed_ok = true;
+                while (cur.position() as usize) < rec_total {
+                    match conn.read_tls(&mut cur) {
+                        Ok(0) => break,
+                        Ok(_) => {}
+                        Err(_) => {
+                            fed_ok = false;
+                            break;
+                        }
+                    }
+                }
+                if !fed_ok {
+                    break;
+                }
+                if let Err(e) = conn.process_new_packets() {
+                    return Err(RuntimeError::IOException {
+                        message: format!("rustls process_new_packets: {}", e),
+                    }
+                    .into());
+                }
+                let mut tmp = [0u8; 16384];
+                loop {
+                    match conn.reader().read(&mut tmp) {
+                        Ok(0) => break,
+                        Ok(n) => plaintext.extend_from_slice(&tmp[..n]),
+                        Err(_) => break,
+                    }
+                }
+                offset = rec_end;
+                if plaintext.len() >= dst_cap {
+                    break;
+                }
             }
+        }
+        engine_capture_negotiation(s);
+        let _ = underflow;
+        let mut status = SR_OK;
+        if plaintext.is_empty() && offset == src_pos {
+            // No progress: src was empty or held only an incomplete record. Tell
+            // the caller to read more network data (matches SSLEngine semantics;
+            // returning OK here makes Tomcat's handshake loop spin forever).
+            status = SR_BUFFER_UNDERFLOW;
         }
         let hs = handshake_status_of(s);
         if hs == HS_FINISHED_R {
@@ -3966,6 +4121,8 @@ fn do_unwrap(
         }
         (status, hs, plaintext)
     };
+    let consumed = offset - src_pos;
+    bb_set_pos(ctx, src, offset);
 
     // Step 3: write plaintext into dsts (may span multiple buffers).
     let mut produced_total = 0usize;
@@ -4078,7 +4235,7 @@ fn register_apply_parameters(r: &mut NativeMethodRegistry) {
         "sun/security/ssl/SSLEngineImpl",
         "setSSLParameters",
         "(Ljavax/net/ssl/SSLParameters;)V",
-        |_ctx, args| {
+        |ctx, args| {
             let this = obj_arg(args, 0)?;
             let id = engine_id_or_alloc(this);
             if let Some(Value::Object(Some(p))) = args.get(1) {
@@ -4091,6 +4248,30 @@ fn register_apply_parameters(r: &mut NativeMethodRegistry) {
                         s.alpn_protocols = list.into_iter().map(|s| s.into_bytes()).collect();
                     });
                 }
+                // Tomcat configures client-cert auth via
+                // `SSLParameters.setNeed/WantClientAuth` + `engine.setSSLParameters`,
+                // NOT the engine's own setNeed/WantClientAuth. Read those booleans
+                // off the SSLParameters object and apply them, else the server
+                // never requests the client cert and mTLS auth returns HTTP 401.
+                let need = ctx
+                    .get_field_by_name(*p, "needClientAuth")
+                    .as_int()
+                    .unwrap_or(0)
+                    != 0;
+                let want = ctx
+                    .get_field_by_name(*p, "wantClientAuth")
+                    .as_int()
+                    .unwrap_or(0)
+                    != 0;
+                with_engine(id, |s| {
+                    if need {
+                        s.need_client_auth = true;
+                        s.want_client_auth = false;
+                    } else if want {
+                        s.want_client_auth = true;
+                        s.need_client_auth = false;
+                    }
+                });
             }
             Ok(None)
         },
