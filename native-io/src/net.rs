@@ -863,7 +863,14 @@ fn net_accept(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
 
     let (stream, peer) = {
         let listener = listener_handle.lock();
-        listener.accept().map_err(|e| net_err("accept", e))?
+        // Bracket the unbounded blocking accept() in a GC-blocking region so a
+        // stop-the-world GC requested while this thread is parked in accept()
+        // does not deadlock `wait_for_all` (the acceptor reaches no interpreter
+        // safepoint). See the matching comment in socket_channel::ssc_accept.
+        ctx.begin_blocking_region();
+        let res = listener.accept();
+        ctx.end_blocking_region();
+        res.map_err(|e| net_err("accept", e))?
     };
 
     let new_fd = register_handle(NetSocketHandle::Stream(Arc::new(Mutex::new(stream))));
@@ -1138,7 +1145,15 @@ fn net_read0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
             // The std impl is `impl Read for &TcpStream` so we can
             // read through a &TcpStream without needing &mut.
             let mut r = &*s;
-            r.read(buf).map_err(|e| net_err("read0", e))?
+            // A blocking read can park in the OS indefinitely (waiting for the
+            // peer to send / close). Bracket it in a GC-blocking region so a
+            // stop-the-world GC requested meanwhile doesn't deadlock
+            // `wait_for_all` waiting for this thread to reach a safepoint. See
+            // socket_channel::ssc_accept for the full rationale.
+            ctx.begin_blocking_region();
+            let res = r.read(buf);
+            ctx.end_blocking_region();
+            res.map_err(|e| net_err("read0", e))?
         };
         if n == 0 {
             return Ok(Some(Value::Int(-1)));

@@ -697,6 +697,30 @@ pub fn selector_cancel(id: i32, net_fd: i32) {
     }
 }
 
+/// Drop every selector's registration for `net_fd`, releasing the cloned socket
+/// handle each holds. Called when a channel is closed.
+///
+/// The selector stores caller-provided handles as `try_clone()`d duplicates
+/// (see `selector_register`). On Windows a duplicated socket keeps the
+/// underlying OS socket alive until *every* duplicate is closed — so dropping
+/// only the channel's original handle on close would NOT shut the connection,
+/// and the peer's blocking read never sees EOF (it hangs forever). The real JDK
+/// avoids this because `AbstractSelectableChannel.implCloseChannel()` cancels
+/// and removes the channel's keys as part of close; CratonVM's synthetic
+/// channel close must do the same. Removing the `KeyState` drops its cloned
+/// `TcpStream`/`TcpListener`, so once the original is also dropped the kernel
+/// fully closes the socket and emits FIN.
+///
+/// Takes only the selector locks (never `tcp_registry`), so it composes with the
+/// select path's `selectors → tcp_registry` lock order without inversion.
+pub fn deregister_fd_everywhere(net_fd: i32) {
+    let regs = selectors().read();
+    for (_sel_id, sel) in regs.iter() {
+        let mut st = sel.lock();
+        st.keys.remove(&net_fd);
+    }
+}
+
 /// Translate JDK interestOps to Linux epoll event mask.
 #[cfg(target_os = "linux")]
 fn linux_events_for(interest: i32, _is_listener: bool) -> i32 {
