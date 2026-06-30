@@ -10392,6 +10392,67 @@ fn strip_unc(p: &str) -> String {
     }
 }
 
+/// String-based path canonicalization via Win32 `GetFullPathNameW` — makes the
+/// path absolute, collapses `.`/`..`, converts `/` to `\`, and strips a trailing
+/// separator, all WITHOUT opening the file (so the `cpcrypt` filesystem filter is
+/// never triggered, unlike `std::fs::canonicalize`/`GetFinalPathNameByHandleW`).
+/// Returns `None` for an empty input or on API error so the caller can fall back
+/// to the pure-Rust lexical normalizer. Does NOT resolve symlinks — matching
+/// HotSpot's largely-string-based `WinNTFileSystem.canonicalize`.
+#[cfg(windows)]
+fn win_get_full_path_name(path: &str) -> Option<String> {
+    if path.is_empty() {
+        return None;
+    }
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+    extern "system" {
+        fn GetFullPathNameW(
+            lpFileName: *const u16,
+            nBufferLength: u32,
+            lpBuffer: *mut u16,
+            lpFilePart: *mut *mut u16,
+        ) -> u32;
+    }
+    // Normalize the URI-style leading `/C:` quirk and forward slashes first, so a
+    // raw `/C:/foo` doesn't confuse GetFullPathName into a per-drive-relative join.
+    let norm = file_normalise_path(path);
+    let wide: Vec<u16> = std::ffi::OsStr::new(&norm)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    unsafe {
+        // First call (null buffer) returns the required length INCLUDING the NUL.
+        let needed = GetFullPathNameW(wide.as_ptr(), 0, std::ptr::null_mut(), std::ptr::null_mut());
+        if needed == 0 {
+            return None;
+        }
+        let mut buf: Vec<u16> = vec![0u16; needed as usize];
+        // Second call returns the length WITHOUT the NUL on success.
+        let written = GetFullPathNameW(
+            wide.as_ptr(),
+            buf.len() as u32,
+            buf.as_mut_ptr(),
+            std::ptr::null_mut(),
+        );
+        if written == 0 || written as usize >= buf.len() {
+            return None;
+        }
+        buf.truncate(written as usize);
+        let full = std::ffi::OsString::from_wide(&buf)
+            .to_string_lossy()
+            .into_owned();
+        // GetFullPathNameW preserves a trailing separator (`foo\bar\`), but the JDK's
+        // canonicalize drops it (`foo\bar`). Strip a single trailing `\` unless the
+        // result is a drive root (`C:\`) or a bare root (`\`), which must keep it.
+        let trimmed = if full.ends_with('\\') && !full.ends_with(":\\") && full.len() > 1 {
+            full.trim_end_matches('\\').to_string()
+        } else {
+            full
+        };
+        Some(trimmed)
+    }
+}
+
 /// Canonicalize a `java.io.File` path the way `File.getCanonicalPath()` does.
 ///
 /// `std::fs::canonicalize` only works for paths that *exist* on disk; the real
@@ -10434,11 +10495,45 @@ fn file_canonicalize_path(path: &str) -> String {
 }
 
 fn file_canonicalize_path_uncached(path: &str) -> String {
-    // First try the real filesystem call (resolves symlinks for existing paths).
-    if let Ok(c) = std::fs::canonicalize(path) {
-        return strip_unc(&c.to_string_lossy());
+    #[cfg(windows)]
+    {
+        // DEFAULT on Windows: canonicalize the path as a STRING via `GetFullPathNameW`,
+        // which makes it absolute (against the cwd / per-drive cwd), collapses `.`/`..`,
+        // normalizes separators, and drops trailing separators — all WITHOUT opening the
+        // file. This mirrors HotSpot's `WinNTFileSystem.canonicalize`, which is largely
+        // string-based (`GetFullPathName`) and, like us, does NOT fully resolve symlinks
+        // the way `realpath`/`std::fs::canonicalize` does.
+        //
+        // Why this matters here: `std::fs::canonicalize` opens the file
+        // (`GetFinalPathNameByHandleW` → `NtQueryInformationFile`), which on a box with
+        // the Crypto Pro `cpcrypt.dll` AppCompat filesystem filter loaded triggers the
+        // filter on EVERY `File.getCanonicalPath()` and can stall for ~30s globally.
+        // `GetFullPathNameW` touches no file handle, so the filter is never engaged.
+        // HotSpot is immune for the same reason. (cf. memory notes
+        // tomcat_dohead_speed_oncpu_not_shutdown / tomcat_dohead_gc_safepoint_deadlock.)
+        //
+        // Escape hatch: set `CRATONVM_CANON_OPENFILE=1` to restore the old, symlink-
+        // resolving, file-opening behavior if an app genuinely needs realpath semantics.
+        if std::env::var_os("CRATONVM_CANON_OPENFILE").is_some() {
+            if let Ok(c) = std::fs::canonicalize(path) {
+                return strip_unc(&c.to_string_lossy());
+            }
+        } else if let Some(full) = win_get_full_path_name(path) {
+            return strip_unc(&full);
+        }
+        // GetFullPathNameW failed (empty input / API error) — fall through to the
+        // pure-Rust lexical normalization below.
     }
-    // Path doesn't exist — normalize lexically. Make absolute against CWD.
+    #[cfg(not(windows))]
+    {
+        // Non-Windows has no cpcrypt-style filter hazard, so keep the symlink-resolving
+        // filesystem call for existing paths; fall through to lexical for non-existent.
+        if let Ok(c) = std::fs::canonicalize(path) {
+            return strip_unc(&c.to_string_lossy());
+        }
+    }
+    // Lexical fallback: normalize the path as a string without touching the filesystem.
+    // Make absolute against CWD, collapse `.`/`..`, normalize separators.
     let norm = file_normalise_path(path);
     let p = std::path::Path::new(&norm);
     let abs: std::path::PathBuf = if p.is_absolute() {
