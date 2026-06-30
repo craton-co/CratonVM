@@ -95,16 +95,27 @@ the lookup class's recorded defining-loader (`peek_loader_namespace_id`) — the
 `defineClass1` computes — falling back to the legacy i32 path otherwise (byte-identical
 gate-off). With it, `enhancement.lazy.*` now build the SessionFactory and run.
 
-**Next OPEN layer (3rd distinct root cause): persist-time id value corruption.** The lazy
+**Next OPEN layer (3rd distinct root cause): MethodHandle field-setter accessor.** The lazy
 tests now fail deeper, at `s.persist(entity)`:
 `PropertyAccessException: Could not set value of type [java.lang.Long]: '<Entity>.id'` ←
 `IllegalArgumentException: Can not set java.lang.Long field <Entity>.id to <Entity>`.
-Chain: `AbstractSaveEventListener.saveWithGeneratedId` → `persister.setIdentifier(entity,
-generatedId)` → `EnhancedSetterImpl.set` → reflective `Field.set` — and the `generatedId`
-reaching the id setter is the **entity instance itself**, not the generated `Long`. Not JIT
-(`--nojit` reproduces). `detached.*` (generated-id persist) PASS, so basic id generation
-works — this is specific to the field-access enhanced entity. Suspect an argument-corruption
-or enhanced-getter/dispatch issue in the deep persist invoke chain. Separate follow-up.
+LOCALIZED (CRATONVM_DBG_ID invoke-arg trace): the id value is the correct `Long` all the way
+down — `setIdentifier(entity, Long)` → `EnhancedSetterImpl.set(entity, Long)` →
+`SetterFieldImpl.set(entity, Long)` → `Field.set(entity, Long)` →
+`jdk.internal.reflect.MethodHandleObjectFieldAccessorImpl.set(entity, Long)` — ALL receive the
+`Long`. The corruption is INSIDE that accessor's `set(obj, value)` (JDK bytecode): it does
+`setter.invokeExact(obj, value)` on an `asType`-adapted putField MethodHandle (call-site
+`(Object,Object)V`, MH type `(<Entity>, Long)void`); our VM throws a spurious
+`ClassCastException` from that invoke, caught at the accessor's `catch (ClassCastException)`
+which rethrows via `throwSetIllegalArgumentException(value)` — and the value it reports is the
+`<Entity>`, i.e. the caller's `value` local (slot 2) reads as the entity by then. Not JIT
+(`--nojit` reproduces). `detached.*` (generated-id persist) PASS, so plain id generation works;
+this is the FIELD-ACCESS enhanced entity forcing the MethodHandle reflective-accessor path.
+Next step: audit our `MethodHandle.invokeExact` of an `asType`-adapted instance putField
+setter (native-builtins `lang_invoke.rs`, MH_KIND_SETTER + the asType cast adapter) — the plain
+MH_KIND_SETTER path sets the field directly with no cast/CCE, so the adapter (receiver/value
+cast order, or frame/local handling on the CCE unwind) is the suspect. Separate follow-up
+(MethodHandle subsystem, not loader-faithful resolution).
 
 ### Precise root cause (traced 2026-06-30) — original SessionFactory CCE characterization
 
