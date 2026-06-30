@@ -18581,7 +18581,27 @@ fn try_stackless_invoke(
     // Intrinsics', then Intrinsics' `return` (void) would unwind out of
     // listOf silently — losing both the singletonList result AND the areturn
     // instruction. The whole program then exits 0 with no output.
-    let is_tail_call = if !is_synchronized && method_name != "<init>" {
+    //
+    // STACK-TRACE FIDELITY: HotSpot performs NO tail-call optimization, so any
+    // frame TCE eliminates is invisible to `new Throwable().getStackTrace()` —
+    // a divergence that breaks code which walks the live call stack. Spring's
+    // `ControlFlowPointcut.matches()` fires advice only when a specific caller
+    // class+method appears in the trace; eliminating a cross-method tail frame
+    // (e.g. `MyComponent.getAge` whose body is just `return proxy.getAge();`)
+    // makes that frame vanish and the cflow advice never fires
+    // (ControlFlowPointcutTests, 4 methods). Restrict TCE to SELF-recursive
+    // tail calls (caller method == callee method), where the only trace effect
+    // is collapsing repeated identical frames — the case deep tail-recursive
+    // loops (e.g. `tailSum(10000)` in `s16_tail_call_sum_10000`) need to stay
+    // within the 1024-frame stack. Cross-method tail calls now keep the
+    // caller's frame, matching HotSpot.
+    let is_self_recursive = {
+        let caller = &thread.frames[frame_idx];
+        caller.class_id == declaring_id
+            && &*caller.method_name() == method_name
+            && &*caller.method_descriptor() == descriptor
+    };
+    let is_tail_call = if is_self_recursive && !is_synchronized && method_name != "<init>" {
         let caller = &thread.frames[frame_idx];
         let pc = caller.pc;
         // Check if the byte at the current PC (after the invoke instruction)
