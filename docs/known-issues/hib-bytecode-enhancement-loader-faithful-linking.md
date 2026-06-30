@@ -111,11 +111,20 @@ which rethrows via `throwSetIllegalArgumentException(value)` — and the value i
 `<Entity>`, i.e. the caller's `value` local (slot 2) reads as the entity by then. Not JIT
 (`--nojit` reproduces). `detached.*` (generated-id persist) PASS, so plain id generation works;
 this is the FIELD-ACCESS enhanced entity forcing the MethodHandle reflective-accessor path.
-Next step: audit our `MethodHandle.invokeExact` of an `asType`-adapted instance putField
-setter (native-builtins `lang_invoke.rs`, MH_KIND_SETTER + the asType cast adapter) — the plain
-MH_KIND_SETTER path sets the field directly with no cast/CCE, so the adapter (receiver/value
-cast order, or frame/local handling on the CCE unwind) is the suspect. Separate follow-up
-(MethodHandle subsystem, not loader-faithful resolution).
+FURTHER LOCALIZED (DBG_MH on `mh_dispatch` + DBG_MHX on the `invokeExact` native): the JDK
+builds both accessors via `JLIA.unreflectField(field, isSetter)` → `IMPL_LOOKUP.unreflect{Getter,
+Setter}` → our synthetic `MH_KIND_GETTER`/`MH_KIND_SETTER` (asType is a passthrough that only
+stamps `type`). The field **GETTER** `getter.invokeExact(obj)` (`(Object)Object`) routes correctly
+to the `invokeExact` native → `mh_dispatch` (MH_KIND_GETTER) → reads the field — WORKS. The field
+**SETTER** `setter.invokeExact(obj, value)` (`(Object,Object)V`, 2-arg **void**) does NOT reach the
+`invokeExact` native / `mh_dispatch` at all — it diverges in the interpreter's signature-polymorphic
+invoke routing (`vm/src/vm/vm_exec.rs` ~11440-11710, the `check_override` / Some-vs-None-arm /
+poly-desc dispatch), throwing a spurious `ClassCastException` and leaving the caller's `value` local
+reading as the entity. The plain `MH_KIND_SETTER` path in `mh_dispatch` sets the field directly with
+no cast/CCE, so the fix is to make the 2-arg-void field-setter `invokeExact` reach it (mirroring the
+getter). Risk: that routing has many documented special cases (Groovy/Jackson/records/Spring) — needs
+a MethodHandle regression harness. Separate follow-up (MethodHandle subsystem, not loader-faithful
+resolution).
 
 ### Precise root cause (traced 2026-06-30) — original SessionFactory CCE characterization
 
