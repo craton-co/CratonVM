@@ -80,7 +80,33 @@ annotation `Class[]` element / `ClassLoaderService` / TCCL) is not the enhancing
 enhanced copy. This is a SessionFactory-integration root cause orthogonal to the dispatch/
 linking fixes above (those are necessary but not sufficient).
 
-### Precise root cause (traced 2026-06-30)
+### UPDATE 2026-06-30 — SessionFactory-build blocker FIXED (6th fix)
+
+The `PersistentAttributeInterceptable` CCE at SessionFactory build is FIXED (commit
+`f658fe12`). Root cause: `inherit_lookup_loader` (`native-builtins/src/lookup_define.rs`)
+resolved a `Lookup.defineClass` target loader via `loader_id_of_class` — an i32 that maps
+BOTH `Application` and `UserDefined(2)` to `2` — then a `< 3` threshold, so a class loaded
+by a user loader whose namespace id is 1 or 2 (the first ids `allocate_loader_id` hands out)
+was mis-routed to the Application namespace. ByteBuddy defines the entity's
+ReflectionOptimizer `<Entity>$HibernateInstantiator` via `Lookup.defineClass` against the
+ENHANCED entity (`UserDefined(2)`), but it landed under Application, so its generated
+`new <Entity>` resolved the un-enhanced copy. Fix: under the gate, derive the namespace from
+the lookup class's recorded defining-loader (`peek_loader_namespace_id`) — the same value
+`defineClass1` computes — falling back to the legacy i32 path otherwise (byte-identical
+gate-off). With it, `enhancement.lazy.*` now build the SessionFactory and run.
+
+**Next OPEN layer (3rd distinct root cause): persist-time id value corruption.** The lazy
+tests now fail deeper, at `s.persist(entity)`:
+`PropertyAccessException: Could not set value of type [java.lang.Long]: '<Entity>.id'` ←
+`IllegalArgumentException: Can not set java.lang.Long field <Entity>.id to <Entity>`.
+Chain: `AbstractSaveEventListener.saveWithGeneratedId` → `persister.setIdentifier(entity,
+generatedId)` → `EnhancedSetterImpl.set` → reflective `Field.set` — and the `generatedId`
+reaching the id setter is the **entity instance itself**, not the generated `Long`. Not JIT
+(`--nojit` reproduces). `detached.*` (generated-id persist) PASS, so basic id generation
+works — this is specific to the field-access enhanced entity. Suspect an argument-corruption
+or enhanced-getter/dispatch issue in the deep persist invoke chain. Separate follow-up.
+
+### Precise root cause (traced 2026-06-30) — original SessionFactory CCE characterization
 
 The CCE is `ManagedTypeHelper.asPersistentAttributeInterceptable(entity)` ← persister build
 (`AbstractEntityInstantiatorPojo.applyInterception` ← `UnsavedValueFactory` ←
