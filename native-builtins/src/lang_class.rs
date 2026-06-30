@@ -4537,8 +4537,6 @@ pub(crate) fn create_method_object(
         let desc = format!("L{};", exception_names[i]);
         descriptor_to_class_mirror(ctx, &desc)
     });
-    let empty_byte_arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 0);
-
     let desc_str = ctx.create_string(&meta.descriptor);
 
     // --- Real JDK Method layout (visible to Java bytecode via Getfield) ---
@@ -4556,22 +4554,35 @@ pub(crate) fn create_method_object(
     ctx.set_field_by_name(obj, "slot", Value::Int(0));
     // `callerSensitive` is a byte cache; 0 means "not yet computed".
     ctx.set_field_by_name(obj, "callerSensitive", Value::Int(0));
-    // G2: annotation byte-array fields — empty arrays, not null. JDK 25
-    // `Method.getAnnotationBytes()` callers walk these without null
-    // checks (e.g. `AnnotationParser.parseAnnotations` reads `arr.length`).
-    ctx.set_field_by_name(obj, "annotations", Value::Object(Some(empty_byte_arr)));
-    let empty_byte_arr2 = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 0);
-    ctx.set_field_by_name(
-        obj,
-        "parameterAnnotations",
-        Value::Object(Some(empty_byte_arr2)),
-    );
-    let empty_byte_arr3 = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 0);
-    ctx.set_field_by_name(
-        obj,
-        "annotationDefault",
-        Value::Object(Some(empty_byte_arr3)),
-    );
+    // Annotation raw-byte fields (`annotations`, `parameterAnnotations`,
+    // `annotationDefault`) — all `byte[]` on JDK 25. These MUST be `null`
+    // when no annotation bytes are present, NOT empty arrays.
+    //
+    // CratonVM serves method-annotation reflection via dedicated natives
+    // (`native_method_get_annotations` etc.), so the raw bytes are usually
+    // never consumed. But once any class is redefined (Mockito/ByteBuddy
+    // inline mock of a JDK class such as `java.lang.reflect.Method`), the
+    // native shadow on `java/lang/reflect/Method.getDeclaredAnnotations`
+    // is suppressed and the real JDK bytecode runs instead:
+    //   `Executable.declaredAnnotations()`
+    //     -> `AnnotationParser.parseAnnotations(getAnnotationBytes(), …)`.
+    // `parseAnnotations` short-circuits only on a `null` byte[]; a non-null
+    // EMPTY array flows into `parseAnnotations2`, whose very first read is
+    // `buf.getShort()` (the 2-byte annotation count) — a 0-length buffer
+    // underflows, surfacing as `AnnotationFormatError: Unexpected end of
+    // annotations.` That aborts `Mockito.mock(Method.class)` and any test
+    // class (e.g. spring-aop `MethodMatchersTests`) that mocks a reflection
+    // type in `<clinit>`. The class-level `getRawAnnotations` native already
+    // returns `null` for the same reason, and `create_field_object` /
+    // `create_constructor_object` leave these fields `null` — matching
+    // HotSpot, where an unannotated member's annotation bytes are `null`.
+    // The earlier "empty, not null" rationale was mistaken:
+    // `AnnotationParser` does not read `arr.length`, and the JDK getters for
+    // all three fields (`Executable.sharedGetParameterAnnotations`,
+    // `Method.getDefaultValue`) explicitly null-check before parsing.
+    ctx.set_field_by_name(obj, "annotations", Value::Object(None));
+    ctx.set_field_by_name(obj, "parameterAnnotations", Value::Object(None));
+    ctx.set_field_by_name(obj, "annotationDefault", Value::Object(None));
 
     // WP2.1: populate the JDK `signature` field from the JVMS §4.7.9 Signature
     // attribute when the method is generic. The real JDK `Method.getGenericReturnType()`
@@ -14997,11 +15008,21 @@ mod tests {
     }
 
     #[test]
-    fn g2_create_method_object_populates_annotation_byte_arrays_non_null() {
+    fn g2_create_method_object_annotation_byte_arrays_are_null() {
         // JDK 25 `Method.annotations`, `parameterAnnotations`, and
-        // `annotationDefault` are all `byte[]`. AnnotationParser walks
-        // these via `arr.length`. None must be null after
-        // `create_method_object`.
+        // `annotationDefault` are all `byte[]`. They MUST be `null` (not
+        // empty arrays) when no annotation bytes are present.
+        //
+        // `AnnotationParser.parseAnnotations` (and the parameter/default
+        // variants) short-circuit on `null` but treat a non-null EMPTY
+        // array as a truncated structure: the first `buf.getShort()` /
+        // `buf.get()` underflows and raises `AnnotationFormatError:
+        // Unexpected end of annotations.` This only surfaces once the
+        // `getDeclaredAnnotations` native shadow is suppressed by a class
+        // redefine (Mockito/ByteBuddy inline mock of `java.lang.reflect.
+        // Method`), but then it aborts every `mock(Method.class)`. HotSpot,
+        // `create_field_object`, `create_constructor_object`, and the
+        // class-level `getRawAnnotations` native all use `null` here.
         let mut ctx = mock_ctx();
         let declaring_cid = ctx
             .ensure_class_initialized("java/lang/Object")
@@ -15016,16 +15037,12 @@ mod tests {
         let m = create_method_object(&mut ctx, &meta);
 
         for field in &["annotations", "parameterAnnotations", "annotationDefault"] {
-            let v = ctx.get_field_by_name(m, field);
-            match v {
-                Value::Object(Some(arr)) => {
-                    assert_eq!(
-                        ctx.array_length(arr),
-                        0,
-                        "G2: {field} byte-array must be empty (length 0)",
-                    );
-                }
-                other => panic!("G2: Method.{field} MUST be non-null byte[] (was {other:?})",),
+            match ctx.get_field_by_name(m, field) {
+                Value::Object(None) => {}
+                other => panic!(
+                    "Method.{field} MUST be null (was {other:?}) — a non-null \
+                     empty byte[] underflows AnnotationParser",
+                ),
             }
         }
     }
