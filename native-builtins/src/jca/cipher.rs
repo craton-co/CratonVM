@@ -409,6 +409,34 @@ fn finish_cipher_bytes(
 /// instance field of the real JDK class, because field-5 is
 /// `initialized:Z` (a primitive boolean) and storing an Object there
 /// breaks the `expected object reference` invariant on read-back.
+/// Reject `Cipher.getInstance` transformations that the requested JDK
+/// provider does not actually supply, so the native shim's "accept
+/// everything" behaviour doesn't mask a real-JDK `NoSuchAlgorithmException`.
+///
+/// Concretely: SunJCE provides AES in ECB/CBC/PCBC/CTR/CTS/CFB/OFB/GCM/KW/KWP
+/// but NOT **CCM** (that AEAD mode ships with BouncyCastle, not the JDK). On
+/// HotSpot `Cipher.getInstance("AES/CCM/…","SunJCE")` throws
+/// `NoSuchAlgorithmException: No such algorithm: AES/CCM/…`. Our native AES
+/// dispatch can't do CCM either, so accepting it (returning a synthetic
+/// Cipher) is strictly wrong — it silently masks the rejection that callers
+/// like Tomcat's `EncryptInterceptor` depend on to refuse the transform
+/// (TestEncryptInterceptorAlgorithms `doTestShouldNotSucceed`). Throw the
+/// catchable checked exception so the real-JDK call site behaves as on HotSpot.
+fn check_transformation_supported(
+    ctx: &mut dyn NativeContext,
+    algo: &str,
+) -> Result<(), cratonvm_types::error::MethodCallFailed> {
+    let (_cipher, mode, _pad) = parse_transformation(algo);
+    if mode == "CCM" {
+        return Err(crate::phases_early::throw_jca_exc(
+            ctx,
+            "java/security/NoSuchAlgorithmException",
+            &format!("No such algorithm: {algo}"),
+        ));
+    }
+    Ok(())
+}
+
 fn cipher_alloc(ctx: &mut dyn NativeContext, algo: ObjectRef) -> ObjectRef {
     let obj = alloc_concurrent_synthetic(ctx, "javax/crypto/Cipher", 6);
     let algo_str = ctx.read_string(algo).unwrap_or_default();
@@ -563,22 +591,31 @@ fn cipher_do_final_impl(ctx: &mut dyn NativeContext, this: ObjectRef) -> MethodC
         .into());
     }
 
-    // Route block-cipher CBC transformations the synthetic AES path can't do
-    // (CBC chaining; DES/DESede have no native impl) to the real SunJCE
-    // CipherSpi. Used by PEMFile to decrypt encrypted private keys
-    // (AES/CBC, DESede/CBC, DES/CBC). Done BEFORE the AES key_expansion below
-    // so 8-byte DES keys aren't rejected.
+    // Route block-cipher transformations the synthetic AES path can't do
+    // (CBC/CFB/OFB chaining; DES/DESede have no native impl) to the real
+    // SunJCE CipherSpi. Used by PEMFile to decrypt encrypted private keys
+    // (AES/CBC, DESede/CBC, DES/CBC) and by Tomcat tribes
+    // TestEncryptInterceptorAlgorithms (AES/CFB/PKCS5Padding,
+    // AES/OFB/PKCS5Padding round-trips — SunJCE supports these feedback modes,
+    // our in-tree AES only does GCM/CBC/CTR/ECB). Done BEFORE the AES
+    // key_expansion below so 8-byte DES keys aren't rejected. `route_mode` is
+    // the SunJCE mode string passed to `engineSetMode`; for DES/DESede we keep
+    // the historical "CBC" (their PEM keys are CBC), for AES we forward the
+    // actual feedback mode.
     {
         let (cn, cm, _pad) = parse_transformation(&algo);
-        let route = match (cn.to_ascii_uppercase().as_str(), cm.as_str()) {
-            ("AES", "CBC") => Some(("com/sun/crypto/provider/AESCipher$General", "AES")),
-            ("DESEDE", _) | ("TRIPLEDES", _) => {
-                Some(("com/sun/crypto/provider/DESedeCipher", "DESede"))
-            }
-            ("DES", _) => Some(("com/sun/crypto/provider/DESCipher", "DES")),
-            _ => None,
-        };
-        if let Some((spi_class, key_algo)) = route {
+        let route: Option<(&'static str, &'static str, &'static str)> =
+            match (cn.to_ascii_uppercase().as_str(), cm.as_str()) {
+                ("AES", "CBC") => Some(("com/sun/crypto/provider/AESCipher$General", "AES", "CBC")),
+                ("AES", "CFB") => Some(("com/sun/crypto/provider/AESCipher$General", "AES", "CFB")),
+                ("AES", "OFB") => Some(("com/sun/crypto/provider/AESCipher$General", "AES", "OFB")),
+                ("DESEDE", _) | ("TRIPLEDES", _) => {
+                    Some(("com/sun/crypto/provider/DESedeCipher", "DESede", "CBC"))
+                }
+                ("DES", _) => Some(("com/sun/crypto/provider/DESCipher", "DES", "CBC")),
+                _ => None,
+            };
+        if let Some((spi_class, key_algo, route_mode)) = route {
             let pad_str = if algo
                 .split('/')
                 .nth(2)
@@ -590,7 +627,7 @@ fn cipher_do_final_impl(ctx: &mut dyn NativeContext, this: ObjectRef) -> MethodC
                 "PKCS5Padding"
             };
             let out = crate::phases_early::drive_real_cipher(
-                ctx, spi_class, "CBC", pad_str, mode, &key_bytes, key_algo, &iv_bytes, &data,
+                ctx, spi_class, route_mode, pad_str, mode, &key_bytes, key_algo, &iv_bytes, &data,
             )?;
             // Reset accumulators for reuse — but FIRST capture the result so a
             // moving GC during the reset alloc can't relocate it.
@@ -994,6 +1031,8 @@ fn register_cipher_dispatch(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;)Ljavax/crypto/Cipher;",
         |ctx, args| {
             let algo = obj_arg(args, 0)?;
+            let algo_str = ctx.read_string(algo).unwrap_or_default();
+            check_transformation_supported(ctx, &algo_str)?;
             let obj = cipher_alloc(ctx, algo);
             Ok(Some(Value::Object(Some(obj))))
         },
@@ -1004,6 +1043,8 @@ fn register_cipher_dispatch(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;Ljava/lang/String;)Ljavax/crypto/Cipher;",
         |ctx, args| {
             let algo = obj_arg(args, 0)?;
+            let algo_str = ctx.read_string(algo).unwrap_or_default();
+            check_transformation_supported(ctx, &algo_str)?;
             let obj = cipher_alloc(ctx, algo);
             Ok(Some(Value::Object(Some(obj))))
         },
@@ -1014,6 +1055,8 @@ fn register_cipher_dispatch(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;Ljava/security/Provider;)Ljavax/crypto/Cipher;",
         |ctx, args| {
             let algo = obj_arg(args, 0)?;
+            let algo_str = ctx.read_string(algo).unwrap_or_default();
+            check_transformation_supported(ctx, &algo_str)?;
             let obj = cipher_alloc(ctx, algo);
             Ok(Some(Value::Object(Some(obj))))
         },
