@@ -5138,24 +5138,57 @@ pub(crate) fn native_method_invoke(
         // cascading into unrelated failures. Restore the JDK ordering and
         // throwable here.
         //
-        // Skip two cases where `is_subclass` (which models the class
-        // hierarchy, NOT interface implementation, and may not model
-        // array → Object) would give a false negative and wrongly reject a
-        // valid receiver:
-        //   * the declaring class is an interface — the receiver *implements*
-        //     but is not a *subclass* of it;
-        //   * the declaring class is `java.lang.Object` — the universal
-        //     supertype, always assignable (including array receivers).
-        // In both cases keep dispatching by name (the historical behavior).
+        // The assignability test must include INTERFACE implementation, not
+        // just the superclass chain. A bare `is_subclass` walks the class
+        // hierarchy and (for synthetic lambda proxies) the lambda table, but
+        // NOT dynamic `java.lang.reflect.Proxy` instances, annotation proxies,
+        // or synthetic collection display classes — so this reuses the same
+        // robust admission rule as `Class.isInstance` (`native_class_is_instance`)
+        // to avoid false IAEs on those legitimate interface receivers.
+        //
+        // Previously this check was SKIPPED entirely when the declaring class
+        // was an interface, on the mistaken belief that we couldn't model
+        // interface implementation. That left a wrong-type receiver on an
+        // interface-declared `Method` to fall through to name-based virtual
+        // dispatch and surface an *uncatchable* `NoSuchMethodError` (a
+        // VM-internal `Error`, not a Java throwable) — which aborts the whole
+        // VM. ByteBuddy's `JavaDispatcher` reflectively invokes JDK reflect
+        // *default* methods (e.g. `AnnotatedType.getAnnotatedOwnerType()`) on
+        // sentinel receivers that do NOT implement the declaring interface
+        // (its `TypeDescription$Generic$AnnotationReader$NoOp` implements
+        // `AnnotatedElement`, not `AnnotatedType`); HotSpot throws
+        // `IllegalArgumentException` there, which ByteBuddy tolerates, whereas
+        // our `NoSuchMethodError` escaped Java entirely and ABENDed every
+        // Spring test class that mocks an interface (Mockito inline mock maker).
+        // Only `java.lang.Object` (the universal supertype, always assignable,
+        // including array receivers) is exempt.
         if let Some(declaring_id) = mirror_class_id(ctx, declaring_mirror) {
-            let skip_check = ctx.is_interface_class(declaring_id)
-                || ctx.class_name_of_id(declaring_id).as_deref() == Some("java/lang/Object");
-            if !skip_check {
-                let recv_id = ctx.class_id_of_object(recv);
-                if !ctx.is_subclass(recv_id, declaring_id) {
-                    return Err(illegal_arg_exc(
-                        "object is not an instance of declaring class".to_string(),
-                    ));
+            let declaring_is_object =
+                ctx.class_name_of_id(declaring_id).as_deref() == Some("java/lang/Object");
+            if !declaring_is_object {
+                let is_instance = matches!(
+                    native_class_is_instance(
+                        ctx,
+                        &[
+                            Value::Object(Some(declaring_mirror)),
+                            Value::Object(Some(recv)),
+                        ],
+                    ),
+                    Ok(Some(Value::Int(1)))
+                );
+                if !is_instance {
+                    let recv_cid = ctx.class_id_of_object(recv);
+                    let recv_name = ctx
+                        .class_name_of_id(recv_cid)
+                        .unwrap_or_default()
+                        .replace('/', ".");
+                    let decl_name = ctx
+                        .class_name_of_id(declaring_id)
+                        .unwrap_or_default()
+                        .replace('/', ".");
+                    return Err(illegal_arg_exc(format!(
+                        "object of type {recv_name} is not an instance of {decl_name}"
+                    )));
                 }
             }
         }
