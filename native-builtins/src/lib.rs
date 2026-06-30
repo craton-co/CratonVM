@@ -34237,6 +34237,50 @@ fn uri_first_illegal_index(s: &str) -> Option<usize> {
     None
 }
 
+/// Returns the index at which `java.net.URI`'s single-string parser would throw
+/// `URISyntaxException("Expected scheme-specific part", index)`, or `None` if
+/// the scheme-specific part is present (or there is no scheme at all).
+///
+/// Per RFC 2396 / the JDK parser, an absolute URI (one with a `scheme:` prefix)
+/// whose part after the colon is NOT hierarchical (does not begin with `/`)
+/// must have a non-empty opaque part (up to a `#` fragment). So `file:`,
+/// `http:`, `mailto:` and `a:` are all rejected, while `file:.`, `file:/x`,
+/// `http://h` and scheme-less relatives are accepted. Our lenient `url_parse`
+/// happily accepted `file:`, which broke Spring's `ResourceUtils.toURL` →
+/// `new URI(cleanPath("file:."))` fall-back chain (PathEditor/FileEditor
+/// `currentDirectory`).
+fn uri_empty_ssp_fail_index(s: &str) -> Option<usize> {
+    let bytes = s.as_bytes();
+    // A scheme must start with an ASCII letter.
+    if bytes.first().map(|b| b.is_ascii_alphabetic()) != Some(true) {
+        return None;
+    }
+    let mut i = 1;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if c == b':' {
+            // `s[..i]` is the scheme; the scheme-specific part starts at i+1.
+            let rest = &s[i + 1..];
+            if rest.starts_with('/') {
+                // Hierarchical (`scheme:/path`, `scheme://authority`): the part
+                // is present even if the path is otherwise empty.
+                return None;
+            }
+            // Opaque part runs up to a `#` fragment (or end of string).
+            let opaque_len = rest.find('#').unwrap_or(rest.len());
+            return if opaque_len == 0 { Some(i + 1) } else { None };
+        }
+        // Valid scheme characters: ALPHA / DIGIT / `+` / `-` / `.`.
+        if c.is_ascii_alphanumeric() || matches!(c, b'+' | b'-' | b'.') {
+            i += 1;
+            continue;
+        }
+        // Any other character before a `:` means there is no scheme.
+        return None;
+    }
+    None
+}
+
 fn native_uri_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
@@ -34274,6 +34318,24 @@ fn native_uri_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     if let Some(pos) = illegal {
         let input = ctx.create_string(&url_str);
         let reason = ctx.create_string("Illegal character in URI");
+        if let Ok(Some(Value::Object(Some(exc)))) = ctx.new_object_initialized(
+            "java/net/URISyntaxException",
+            "(Ljava/lang/String;Ljava/lang/String;I)V",
+            &[
+                Value::Object(Some(input)),
+                Value::Object(Some(reason)),
+                Value::Int(pos as i32),
+            ],
+        ) {
+            return Err(MethodCallFailed::ExceptionThrown(exc));
+        }
+    }
+    // Reject an absolute URI with an empty scheme-specific part (`file:`,
+    // `http:`, …) — the JDK parser throws here, and Spring relies on that throw
+    // to fall back to the deprecated `new URL(String)` path.
+    if let Some(pos) = uri_empty_ssp_fail_index(&url_str) {
+        let input = ctx.create_string(&url_str);
+        let reason = ctx.create_string("Expected scheme-specific part");
         if let Ok(Some(Value::Object(Some(exc)))) = ctx.new_object_initialized(
             "java/net/URISyntaxException",
             "(Ljava/lang/String;Ljava/lang/String;I)V",

@@ -4623,6 +4623,9 @@ pub(crate) fn mh_dispatch(
                 }
                 _ => extra_args.to_vec(),
             };
+            // Collect trailing varargs (no-op unless the target is ACC_VARARGS and
+            // the args were supplied flat — see `collect_trailing_varargs`).
+            let full = collect_trailing_varargs(ctx, &class, &name, &desc, &full);
             let adapted = adapt_invoke_args(ctx, &full, &desc);
             ctx.invoke(&class, &name, &desc, &adapted)
         }
@@ -5100,13 +5103,17 @@ pub(crate) fn mh_dispatch(
             match bound {
                 Value::Object(Some(r)) => {
                     // Bound method handle — receiver was pre-captured
-                    let adapted = adapt_invoke_args(ctx, extra_args, &desc);
+                    let collected = collect_trailing_varargs(ctx, &class, &name, &desc, extra_args);
+                    let adapted = adapt_invoke_args(ctx, &collected, &desc);
                     ctx.invoke_virtual(r, &name, &desc, &adapted)
                 }
                 _ => match extra_args.first() {
                     Some(Value::Object(Some(receiver))) => {
-                        let adapted = adapt_invoke_args(ctx, &extra_args[1..], &desc);
-                        ctx.invoke_virtual(*receiver, &name, &desc, &adapted)
+                        let receiver = *receiver;
+                        let collected =
+                            collect_trailing_varargs(ctx, &class, &name, &desc, &extra_args[1..]);
+                        let adapted = adapt_invoke_args(ctx, &collected, &desc);
+                        ctx.invoke_virtual(receiver, &name, &desc, &adapted)
                     }
                     _ => Ok(Some(Value::Object(None))),
                 },
@@ -5480,6 +5487,206 @@ fn adapt_single_arg(ctx: &mut dyn NativeContext, arg: Value, expected_type: &str
     }
 }
 
+/// Replicate `MethodHandle.asVarargsCollector` semantics for the
+/// `invokeWithArguments` "spread" path: when the resolved target method
+/// `class.name desc` is declared varargs (`ACC_VARARGS`) and the supplied
+/// `params` (the method-formal arguments, with any receiver already stripped)
+/// are NOT already in packed form, collect the trailing arguments into a fresh
+/// array of the varargs component type.
+///
+/// SpEL's `FunctionReference` hands a registered varargs `MethodHandle` the
+/// arguments FLAT (e.g. `#message('fmt', 'a', 'b', 'c')` →
+/// `invokeWithArguments(['fmt','a','b','c'])`) and relies on varargs-collector
+/// semantics to gather `'a','b','c'` into the trailing array. Without this the
+/// trailing array parameter arrived null / mis-shaped
+/// (VariableAndFunctionTests.functionWith{Primitive,}VarargsViaMethodHandle).
+///
+/// The gate is the `ACC_VARARGS` flag on the resolved target, and an
+/// already-packed call (exactly N args with the last an array) is returned
+/// unchanged — so non-varargs dispatch and the direct `invoke` / `invokeExact`
+/// callers (which pass the array explicitly) are byte-for-byte unaffected.
+fn collect_trailing_varargs(
+    ctx: &mut dyn NativeContext,
+    class: &str,
+    name: &str,
+    desc: &str,
+    params: &[Value],
+) -> Vec<Value> {
+    let cid = match ctx.class_id_by_name(class) {
+        Some(c) => c,
+        None => return params.to_vec(),
+    };
+    let is_varargs = ctx
+        .declared_methods(cid)
+        .iter()
+        .any(|m| m.name == name && m.descriptor == desc && (m.access_flags & 0x0080) != 0);
+    if !is_varargs {
+        return params.to_vec();
+    }
+    let (ptypes, _) = crate::lang_class::parse_descriptor_param_and_return(desc);
+    let p = ptypes.len();
+    let last = match ptypes.last() {
+        // Varargs flag set but last param isn't an array — bail safe (unexpected).
+        Some(t) if t.starts_with('[') => t.clone(),
+        _ => return params.to_vec(),
+    };
+    // Already packed: exactly P args and the trailing one is an array (or null).
+    // This covers a correct `invokeExact`/pre-packed call AND e.g.
+    // `#formatPrimitiveVarargs('fmt', new int[]{1})`.
+    if params.len() == p {
+        match params.last() {
+            Some(Value::Object(Some(arr))) if ctx.object_is_array(*arr) => return params.to_vec(),
+            Some(Value::Object(None)) => return params.to_vec(),
+            _ => {}
+        }
+    }
+    let fixed = p - 1;
+    if params.len() < fixed {
+        // Fewer args than the leading fixed params — let `invoke` surface the
+        // arity error rather than fabricate a result.
+        return params.to_vec();
+    }
+    let component = &last[1..]; // strip one leading '['
+    let array = build_varargs_array(ctx, component, &params[fixed..]);
+    let mut out = Vec::with_capacity(fixed + 1);
+    out.extend_from_slice(&params[..fixed]);
+    out.push(Value::Object(array));
+    out
+}
+
+/// Coerce a value to an `i32` for a category-1 primitive varargs element
+/// (int/short/byte/char/boolean), unboxing a wrapper if needed.
+fn varargs_coerce_int(ctx: &mut dyn NativeContext, v: Value) -> i32 {
+    match v {
+        Value::Int(x) => x,
+        Value::Long(x) => x as i32,
+        Value::Float(x) => x as i32,
+        Value::Double(x) => x as i32,
+        Value::Object(Some(o)) => match crate::lang_class::unbox_value(ctx, o) {
+            Value::Int(x) => x,
+            Value::Long(x) => x as i32,
+            Value::Float(x) => x as i32,
+            Value::Double(x) => x as i32,
+            _ => 0,
+        },
+        _ => 0,
+    }
+}
+
+/// Allocate the varargs array of JVM type-descriptor `component` holding `vals`,
+/// converting each element to the component type (unbox wrappers for a primitive
+/// component; box raw primitives for a reference component).
+fn build_varargs_array(
+    ctx: &mut dyn NativeContext,
+    component: &str,
+    vals: &[Value],
+) -> Option<ObjectRef> {
+    use cratonvm_types::ArrayElementType as ET;
+    let n = vals.len();
+    match component {
+        "I" | "S" | "B" | "C" | "Z" => {
+            let et = match component {
+                "I" => ET::Int,
+                "S" => ET::Short,
+                "B" => ET::Byte,
+                "C" => ET::Char,
+                _ => ET::Boolean,
+            };
+            let arr = ctx.new_array(et, n);
+            for (i, v) in vals.iter().enumerate() {
+                let iv = varargs_coerce_int(ctx, *v);
+                ctx.set_array_element(arr, i, Value::Int(iv));
+            }
+            Some(arr)
+        }
+        "J" => {
+            let arr = ctx.new_array(ET::Long, n);
+            for (i, v) in vals.iter().enumerate() {
+                let lv = match *v {
+                    Value::Long(x) => x,
+                    Value::Int(x) => x as i64,
+                    Value::Object(Some(o)) => match crate::lang_class::unbox_value(ctx, o) {
+                        Value::Long(x) => x,
+                        Value::Int(x) => x as i64,
+                        _ => 0,
+                    },
+                    _ => 0,
+                };
+                ctx.set_array_element(arr, i, Value::Long(lv));
+            }
+            Some(arr)
+        }
+        "F" => {
+            let arr = ctx.new_array(ET::Float, n);
+            for (i, v) in vals.iter().enumerate() {
+                let fv = match *v {
+                    Value::Float(x) => x,
+                    Value::Int(x) => x as f32,
+                    Value::Object(Some(o)) => match crate::lang_class::unbox_value(ctx, o) {
+                        Value::Float(x) => x,
+                        Value::Int(x) => x as f32,
+                        _ => 0.0,
+                    },
+                    _ => 0.0,
+                };
+                ctx.set_array_element(arr, i, Value::Float(fv));
+            }
+            Some(arr)
+        }
+        "D" => {
+            let arr = ctx.new_array(ET::Double, n);
+            for (i, v) in vals.iter().enumerate() {
+                let dv = match *v {
+                    Value::Double(x) => x,
+                    Value::Float(x) => x as f64,
+                    Value::Int(x) => x as f64,
+                    Value::Long(x) => x as f64,
+                    Value::Object(Some(o)) => match crate::lang_class::unbox_value(ctx, o) {
+                        Value::Double(x) => x,
+                        Value::Float(x) => x as f64,
+                        Value::Int(x) => x as f64,
+                        Value::Long(x) => x as f64,
+                        _ => 0.0,
+                    },
+                    _ => 0.0,
+                };
+                ctx.set_array_element(arr, i, Value::Double(dv));
+            }
+            Some(arr)
+        }
+        _ => {
+            // Reference component: `Ljava/lang/Object;`, `Ljava/lang/String;`,
+            // or a nested array descriptor like `[I`.
+            let comp_name = if component.starts_with('L') && component.ends_with(';') {
+                &component[1..component.len() - 1]
+            } else {
+                component
+            };
+            let comp_id = ctx
+                .ensure_class_initialized(comp_name)
+                .unwrap_or(cratonvm_types::ClassId::new(0));
+            let arr = ctx.new_ref_array(comp_id, n);
+            // Pin the array across the boxing loop: `box_value` allocates and may
+            // relocate `arr` under a moving collector.
+            let pin = ctx.pin_native_root(arr);
+            let mut arr = arr;
+            for (i, v) in vals.iter().enumerate() {
+                let ov = match *v {
+                    Value::Int(_) => crate::lang_class::box_value(ctx, *v, "I"),
+                    Value::Long(_) => crate::lang_class::box_value(ctx, *v, "J"),
+                    Value::Float(_) => crate::lang_class::box_value(ctx, *v, "F"),
+                    Value::Double(_) => crate::lang_class::box_value(ctx, *v, "D"),
+                    other => other,
+                };
+                arr = ctx.read_native_pin(pin, arr);
+                ctx.set_array_element(arr, i, ov);
+            }
+            ctx.unpin_native_roots(pin);
+            Some(arr)
+        }
+    }
+}
+
 /// Extract the return type descriptor from a method descriptor.
 /// e.g. "(II)I" → "I", "(Ljava/lang/String;)V" → "V"
 fn return_type_desc(desc: &str) -> &str {
@@ -5707,6 +5914,49 @@ pub fn register_t4_method_handle_invoke(r: &mut NativeMethodRegistry) {
                 Value::Int(k) => k,
                 _ => MH_KIND_VIRTUAL,
             };
+            // A SECOND `bindTo` on an already-bound direct (static/virtual/special)
+            // handle binds the NEXT parameter, not the one already captured in the
+            // single-slot MH_BOUND. Overwriting MH_BOUND silently dropped the first
+            // capture — e.g. `String::formatted`.bindTo(template).bindTo(argsArray)
+            // lost the `template` receiver, so dispatch invoked `formatted` on the
+            // bound `Object[]` and hard-failed `NoSuchMethodError Object.formatted`
+            // (ExpressionLanguageScenarioTests #messageBound / #messageStaticBound).
+            // Model the extra capture as `insertArguments(this, 0, {recv})`: the
+            // INSERT adapter splices `recv` into `this`'s remaining leading
+            // parameter at dispatch while `this` keeps its own prior binding.
+            if (kind == MH_KIND_STATIC || kind == MH_KIND_VIRTUAL || kind == MH_KIND_SPECIAL)
+                && matches!(ctx.get_field(this, MH_BOUND), Value::Object(Some(_)))
+            {
+                let values = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 1);
+                ctx.set_array_element(values, 0, recv);
+                let wrapper = alloc_concurrent_synthetic(ctx, "__mh_insert_wrapper__", 3);
+                ctx.set_field(wrapper, 0, Value::Object(Some(this)));
+                ctx.set_field(wrapper, 1, Value::Object(Some(values)));
+                ctx.set_field(wrapper, 2, Value::Int(0));
+                let adapter =
+                    alloc_method_handle(ctx, "__adapter__", "insert", &desc, MH_KIND_INSERT);
+                ctx.set_field(adapter, MH_BOUND, Value::Object(Some(wrapper)));
+                // Binding one value REMOVES the leading parameter from `this`'s
+                // type. The adapter's `type()` must reflect that (e.g. a fully
+                // bound handle reports arity 0); otherwise SpEL's
+                // `FunctionReference` reads a stale 1-arg type and re-wraps the
+                // call args via `setupArgumentsForVarargsInvocation`, nesting an
+                // extra empty `Object[]` into the varargs
+                // (#messageBound → "...[Ljava.lang.Object;@..."). Mirror the
+                // `MethodHandles.insertArguments` type adjustment.
+                if let Some(tdesc) = mh_type_descriptor(ctx, this) {
+                    if let Some((mut params, ret)) = split_descriptor_params(&tdesc) {
+                        if !params.is_empty() {
+                            params.remove(0); // one value inserted at pos 0
+                        }
+                        let new_desc = format!("({}){}", params.concat(), ret);
+                        if let Some(mt) = build_method_type_from_descriptor(ctx, &new_desc) {
+                            ctx.set_field_by_name(adapter, "type", Value::Object(Some(mt)));
+                        }
+                    }
+                }
+                return Ok(Some(Value::Object(Some(adapter))));
+            }
             let new_mh = alloc_method_handle(ctx, &class, &name, &desc, kind);
             // `bindTo` captures the LEADING argument, so the bound handle's
             // `type()` must have that leading parameter REMOVED (HotSpot:
@@ -5719,6 +5969,26 @@ pub fn register_t4_method_handle_invoke(r: &mut NativeMethodRegistry) {
             if kind == MH_KIND_VIRTUAL || kind == MH_KIND_SPECIAL {
                 if let Some(mt) = build_method_type_from_descriptor(ctx, &desc) {
                     ctx.set_field_by_name(new_mh, "type", Value::Object(Some(mt)));
+                }
+            } else if kind == MH_KIND_STATIC {
+                // STATIC `bindTo` captures the leading PARAMETER (not a receiver),
+                // so the bound handle's `type()` must drop that leading parameter
+                // — `(String,String[])R`.bindTo(s) -> `(String[])R`. The dispatch
+                // path keys off MH_DESC, but downstream `type()` readers do not:
+                // SpEL's `FunctionReference` reads the arity to decide varargs
+                // repackaging, and a chained `bindTo` (#messageStaticBound) derives
+                // its own arity from this one. Leaving the full type here left a
+                // stale extra parameter that mis-packed the varargs.
+                if let Some(tdesc) = mh_type_descriptor(ctx, this) {
+                    if let Some((mut params, ret)) = split_descriptor_params(&tdesc) {
+                        if !params.is_empty() {
+                            params.remove(0);
+                        }
+                        let new_desc = format!("({}){}", params.concat(), ret);
+                        if let Some(mt) = build_method_type_from_descriptor(ctx, &new_desc) {
+                            ctx.set_field_by_name(new_mh, "type", Value::Object(Some(mt)));
+                        }
+                    }
                 }
             }
             if kind == MH_KIND_LAMBDA_FACTORY {

@@ -4365,10 +4365,19 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
             } else if std::path::Path::new(&jar_part).exists() {
                 jar_part.clone()
             } else {
-                // Path doesn't exist yet (or is virtual) — hand the trimmed
-                // form to JarFile.<init>; its own open will surface a real
-                // IOException if the jar is genuinely missing.
-                trimmed.to_string()
+                // The enclosing jar genuinely does not exist on disk. The real
+                // `JarURLConnection.getJarFile()` throws `FileNotFoundException`
+                // here; our `JarFile.<init>` did NOT, so the connection handed
+                // back an empty JarFile and Spring's
+                // `AbstractFileResolvingResource.exists()` (which treats
+                // `entryName == null` — i.e. a `…!/` jar-root URL — as existing
+                // once `getJarFile()` returns) reported a NON-EXISTENT jar as
+                // present (PMRPR `javaDashJarFinds…` `writeAssetJar`
+                // `jar:file:X<path>!/` assertion). Surface the missing jar so
+                // the `catch (IOException)` turns it into `false`.
+                return Err(fnfex(format!(
+                    "JarURLConnection.getJarFile: no such jar file: {jar_part}"
+                )));
             };
             // Allocate the JarFile and run its <init>(String) native so the
             // `path` (field 0) and parsed `manifest` (field 1) are populated.
@@ -4437,6 +4446,38 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
             let this = obj_arg(args, 0)?;
             let ext = jar_url_conn_ext(ctx, this);
             Ok(Some(jar_url_lookup_entry(ctx, &ext)))
+        },
+    );
+    // java/net/JarURLConnection.getEntryName() — the entry path inside the jar
+    // (the part after `!/`), or null for a bare `jar:file:…!/` (jar root).
+    //
+    // Without this native the inherited real-JDK accessor reads the synthetic
+    // carrier's never-populated `entryName` field and returns null even for
+    // `jar:file:…!/some/entry`. Spring's `AbstractFileResolvingResource.exists()`
+    // does `entryName == null || getJarEntry() != null`, so a null entryName
+    // made a NON-EXISTENT jar entry report as existing (PMRPR
+    // `javaDashJarFinds…` `writeAssetJar` asserting `…!/assets/none.txt` is
+    // absent). Parse it the same way `jar_url_lookup_entry` does so the two stay
+    // consistent.
+    r.register(
+        "java/net/JarURLConnection",
+        "getEntryName",
+        "()Ljava/lang/String;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let ext = jar_url_conn_ext(ctx, this);
+            let entry = ext
+                .strip_prefix("jar:file:")
+                .or_else(|| ext.strip_prefix("jar:"))
+                .and_then(|a| a.splitn(2, "!/").nth(1))
+                .filter(|e| !e.is_empty());
+            match entry {
+                Some(e) => {
+                    let s = ctx.create_string(e);
+                    Ok(Some(Value::Object(Some(s))))
+                }
+                None => Ok(Some(Value::Object(None))),
+            }
         },
     );
 
