@@ -16391,6 +16391,148 @@ fn coerce_arg(
     Ok(v)
 }
 
+/// LambdaMetafactory argument adaptation (`samMethodType` → `instantiatedMethodType`).
+///
+/// When a functional-interface SAM has erased parameters (commonly `Object`,
+/// from an unbounded type variable) but the lambda is *instantiated* with a more
+/// specific type argument, javac's generated bridge method inserts a `checkcast`
+/// to the instantiated parameter type before calling the implementation method —
+/// throwing `ClassCastException` for an incompatible runtime argument (e.g.
+/// `Map<String,Object>.forEach((k, v) -> …)` where a non-`String` key was stored
+/// through a raw reference). CratonVM dispatches the lambda body *directly* from
+/// [`try_lambda_dispatch`] / `NativeContextImpl::invoke_virtual`, bypassing that
+/// synthetic bridge, so this helper replays the cast.
+///
+/// Only SAM-supplied args (`args[num_captures..]`) are checked, each against the
+/// corresponding `instantiatedMethodType` parameter. Conservative posture (never
+/// a spurious `ClassCastException`): a `null` argument, a primitive parameter, a
+/// non-narrowing (instantiated == erased) parameter, an unloaded target type, or
+/// any case we can't decide without risk all pass without throwing.
+fn checkcast_lambda_instantiated_args(
+    shared: &SharedVm,
+    sam_desc: &str,
+    inst_desc: &str,
+    args: &[Value],
+    num_captures: usize,
+) -> Result<(), MethodCallFailed> {
+    let (sam_params, _) = split_method_descriptor(sam_desc);
+    let (inst_params, _) = split_method_descriptor(inst_desc);
+    for (sam_idx, inst_tok) in inst_params.iter().enumerate() {
+        // Only a reference instantiated param can carry a checkcast.
+        if !is_reference_desc(inst_tok) {
+            continue;
+        }
+        // No narrowing vs the erased SAM param → the bridge inserts no cast.
+        if sam_params
+            .get(sam_idx)
+            .map(|s| s == inst_tok)
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        // SAM-supplied args follow the captures in `args`.
+        let obj_ref = match args.get(num_captures + sam_idx) {
+            Some(Value::Object(Some(o))) => *o,
+            // null (a `checkcast` of null always succeeds), primitive, or missing.
+            _ => continue,
+        };
+        if lambda_arg_provably_not_instance(shared, obj_ref, inst_tok) {
+            let obj_class_name = shared
+                .class_manager
+                .read()
+                .get_class(shared.heap.class_id_of(obj_ref))
+                .map(|c| c.name.to_string())
+                .unwrap_or_else(|| "?".to_string());
+            let target_binary = inst_tok
+                .strip_prefix('L')
+                .and_then(|d| d.strip_suffix(';'))
+                .unwrap_or(inst_tok)
+                .replace('/', ".");
+            // Same dotted-name shape as the `checkcast` opcode (tools such as
+            // mockk's `JvmAutoHinter` parse this text).
+            return Err(RuntimeError::ClassCastException {
+                message: format!(
+                    "{} cannot be cast to {}",
+                    obj_class_name.replace('/', "."),
+                    target_binary
+                ),
+            }
+            .into());
+        }
+    }
+    Ok(())
+}
+
+/// `true` iff `obj_ref` is *provably* not an instance of the reference
+/// descriptor `desc_tok` (`L...;` or `[...`). Fails open (returns `false`)
+/// whenever the answer can't be established without risk — an unloaded target,
+/// an array-vs-non-array shape we can't decide, or a non-class descriptor — so a
+/// genuine instance is never rejected. Only consults already-loaded classes (no
+/// class loading → no GC, no stale `obj_ref`).
+fn lambda_arg_provably_not_instance(
+    shared: &SharedVm,
+    obj_ref: ObjectRef,
+    desc_tok: &str,
+) -> bool {
+    // Array instantiated type: decide via the array-assignability rules.
+    if desc_tok.starts_with('[') {
+        return match array_descriptor_of(shared, obj_ref) {
+            Some(src) => !array_is_assignable_to(shared, &src, desc_tok),
+            None => false, // not an array — fail open
+        };
+    }
+    let target = match desc_tok.strip_prefix('L').and_then(|d| d.strip_suffix(';')) {
+        Some(t) => t,
+        None => return false,
+    };
+    if target == "java/lang/Object" {
+        return false;
+    }
+    let obj_class_id = shared.heap.class_id_of(obj_ref);
+    let (target_cid, is_sub, target_is_interface) = {
+        let cm = shared.class_manager.read();
+        match cm.get_loaded_class_id(target) {
+            // Not loaded → no instance could exist, but don't guess; fail open.
+            None => return false,
+            Some(tcid) => (
+                tcid,
+                obj_class_id == tcid || cm.is_subclass_of(obj_class_id, tcid),
+                cm.get_class(tcid).map(|c| c.is_interface()).unwrap_or(false),
+            ),
+        }
+    };
+    if is_sub
+        || lambda_proxy_satisfies(shared, obj_class_id, target_cid)
+        || synthetic_implements(shared, obj_class_id, target)
+        || proxy_instance_satisfies_target(shared, obj_ref, target)
+        || annotation_proxy_satisfies_target(shared, obj_ref, target)
+    {
+        return false;
+    }
+    // Provenance carve-out: a bare `java/lang/Object` receiver (`cid == 0`, or a
+    // synthetic alloc that lost its class identity and now reports
+    // `java/lang/Object`) carries no interface table, so we cannot prove it does
+    // NOT implement an interface target. Many VM-synthesised objects that really
+    // do implement marker interfaces (`java/io/Serializable`, `Comparable`, a
+    // functional interface, …) on HotSpot land here. Only a *concrete-class*
+    // target can be soundly rejected for such an object (e.g. `Object` → `String`
+    // in the motivating `Map<String,Object>.forEach` case). For an interface
+    // target, fail open. This never weakens the class-narrowing fix.
+    if target_is_interface {
+        let obj_is_bare = obj_class_id == ClassId::new(0)
+            || shared
+                .class_manager
+                .read()
+                .get_class(obj_class_id)
+                .map(|c| &*c.name == "java/lang/Object")
+                .unwrap_or(true);
+        if obj_is_bare {
+            return false;
+        }
+    }
+    true
+}
+
 /// Widen a primitive value from `from_tok` to `to_tok` per JVM numeric promotion.
 fn widen_primitive(from_tok: &str, to_tok: &str, v: Value) -> Value {
     let as_i32 = |v: &Value| -> Option<i32> {
@@ -16487,10 +16629,18 @@ pub fn coerce_lambda_args(
     thread: &mut JvmThread,
     sam_desc: &str,
     impl_desc: &str,
+    inst_desc: &str,
     args: &mut Vec<Value>,
     receiver_present: bool,
     num_captures: usize,
 ) -> Result<(), MethodCallFailed> {
+    // LambdaMetafactory argument adaptation: replay the `checkcast` to each
+    // instantiated parameter type that the (bypassed) synthetic SAM bridge would
+    // have performed, so a narrowed type variable still raises
+    // `ClassCastException` for an incompatible argument. Runs before the
+    // box/unbox coercion below, mirroring the bridge's cast-then-adapt order.
+    checkcast_lambda_instantiated_args(shared, sam_desc, inst_desc, args, num_captures)?;
+
     let (sam_params, _sam_ret) = split_method_descriptor(sam_desc);
     let (impl_params, _impl_ret) = split_method_descriptor(impl_desc);
 
@@ -16948,6 +17098,7 @@ pub(crate) fn try_lambda_dispatch(
     // Dispatch based on the implementation method handle kind.
     let sam_desc = call_site.sam_descriptor.clone();
     let impl_desc = call_site.impl_handle.descriptor.clone();
+    let inst_desc = call_site.instantiated_descriptor.clone();
     let (_sam_params_tmp, sam_ret) = split_method_descriptor(&sam_desc);
     let (_impl_params_tmp, impl_ret) = split_method_descriptor(&impl_desc);
     match call_site.impl_handle.kind {
@@ -16958,6 +17109,7 @@ pub(crate) fn try_lambda_dispatch(
                 thread,
                 &sam_desc,
                 &impl_desc,
+                &inst_desc,
                 &mut full_args,
                 false,
                 num_captures,
@@ -17007,6 +17159,7 @@ pub(crate) fn try_lambda_dispatch(
                 thread,
                 &sam_desc,
                 &impl_desc,
+                &inst_desc,
                 &mut full_args,
                 true,
                 num_captures,
@@ -17127,6 +17280,7 @@ pub(crate) fn try_lambda_dispatch(
                 thread,
                 &sam_desc,
                 &impl_desc,
+                &inst_desc,
                 &mut full_args,
                 true,
                 num_captures,
