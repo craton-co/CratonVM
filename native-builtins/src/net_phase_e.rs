@@ -1914,9 +1914,37 @@ fn register_uri_natives(r: &mut NativeMethodRegistry) {
         Ok(Some(Value::Int(h)))
     });
 
-    // normalize() → this (no normalization for now)
-    r.register(uri, "normalize", "()Ljava/net/URI;", |_ctx, args| {
-        Ok(Some(args.first().copied().unwrap_or(Value::Object(None))))
+    // normalize() → RFC 3986 §5.2.4 remove-dot-segments on the PATH component
+    // (matches `java.net.URI.normalize()`). The previous implementation returned
+    // `this` unchanged, so a relative TLD reference like `../WEB-INF/test.tld`
+    // (resolved by Jasper to `/jsp/../WEB-INF/test.tld`) was never collapsed to
+    // `/WEB-INF/test.tld`. The un-normalized string then became the
+    // `TldResourcePath.webappPath`, which did not equal the scanned TLD's
+    // `/WEB-INF/test.tld` key, so the TldCache lookup missed and JSP compilation
+    // 500'd ("Unable to find taglib ... for URI: [../WEB-INF/test.tld]").
+    r.register(uri, "normalize", "()Ljava/net/URI;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let raw = uri_raw_string(ctx, this);
+        let (scheme, authority, path, query, fragment) = uri_split(&raw);
+        // Opaque URIs (scheme present, no authority, path not starting with '/')
+        // and empty paths have no hierarchical path to normalize — return as-is.
+        let opaque = scheme.is_some() && authority.is_none() && !path.starts_with('/');
+        if opaque || path.is_empty() {
+            return Ok(Some(Value::Object(Some(this))));
+        }
+        let mut norm = uri_remove_dot_segments(&path);
+        // For a relative path whose first segment ends up containing a ':',
+        // prefix "./" so it cannot be re-parsed as a scheme (JDK does the same).
+        if scheme.is_none() && authority.is_none() && !norm.starts_with('/') {
+            if norm.split('/').next().map(|s| s.contains(':')).unwrap_or(false) {
+                norm = format!("./{norm}");
+            }
+        }
+        if norm == path {
+            return Ok(Some(Value::Object(Some(this))));
+        }
+        let recomposed = uri_recompose(&scheme, &authority, &norm, &query, &fragment);
+        Ok(Some(Value::Object(Some(make_uri(ctx, &recomposed)))))
     });
 
     // resolve(URI) → RFC 3986 §5.2 reference resolution. The previous
