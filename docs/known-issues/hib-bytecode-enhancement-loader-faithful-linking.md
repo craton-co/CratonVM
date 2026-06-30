@@ -78,10 +78,43 @@ The entity instance Hibernate's runtime instantiates during metamodel/persister 
 **un-enhanced** copy — i.e. Hibernate's view of the entity `Class` (via the `@DomainModel`
 annotation `Class[]` element / `ClassLoaderService` / TCCL) is not the enhancing loader's
 enhanced copy. This is a SessionFactory-integration root cause orthogonal to the dispatch/
-linking fixes above (those are necessary but not sufficient). Next step: make Hibernate's
-entity-`Class` resolution (annotation `Class` element materialisation and/or
-`ClassLoaderService.classForName`) loader-faithful so the SessionFactory instantiates enhanced
-entities. Until then, `enhancement.lazy.*` (≈54) + `mapping.lazytoone.*` (12) remain FAIL gate-on.
+linking fixes above (those are necessary but not sufficient).
+
+### Precise root cause (traced 2026-06-30)
+
+The CCE is `ManagedTypeHelper.asPersistentAttributeInterceptable(entity)` ← persister build
+(`AbstractEntityInstantiatorPojo.applyInterception` ← `UnsavedValueFactory` ←
+`BasicEntityIdentifierMappingImpl.<init>`). Confirmed via instrumentation:
+
+- `bootDescriptor.getMappedClass()` is the **enhanced** entity Class — `applyBytecodeInterception
+  = isPersistentAttributeInterceptableType(getMappedClass())` is `true` (our `isAssignableFrom`
+  uses exact mirror class_ids, so this is reliable).
+- But the entity instance Hibernate creates is the **un-enhanced** copy (`instanceof
+  PrimeAmongSecondarySupertypes` ⇒ 0; the class has zero interfaces).
+- It is instantiated by a ByteBuddy ReflectionOptimizer `<Entity>$HibernateInstantiator`
+  whose generated `new <Entity>()` resolves the entity to the un-enhanced copy because the
+  optimizer class itself is **defined under the Application loader**, not the enhancing loader
+  (observed with `--nojit`: `new …$LazyEntity from …$LazyEntity$HibernateInstantiator
+  loader=Application -> un-enhanced`). `--nojit` does NOT fix it ⇒ this is the optimizer's
+  defining loader, not a JIT `new`-resolution gap.
+- The optimizer lands under Application because Hibernate hands ByteBuddy
+  `mappedJtd.getJavaTypeClass()` (= `registry.resolveEntityTypeDescriptor(getMappedClass())`),
+  and that JavaType's class is **un-enhanced** even though the argument was enhanced.
+  `JavaTypeRegistry.resolveDescriptor` is keyed by `Class.getTypeName()` (the NAME string),
+  so a previously-registered un-enhanced JavaType for the same name is returned; its
+  `checkCached` `!=` guard does not fire (it should throw "Type registration was corrupted").
+
+So the real fix is upstream of dispatch/linking: ensure Hibernate sees ONE entity Class (the
+enhanced one). On HotSpot there is exactly one `<Entity>` (the enhancing loader's), because the
+Application loader never loads the test-package entity — Hibernate only ever uses the enhanced
+`Class` object from the `@DomainModel` annotation, never resolving it by name. On CratonVM a
+spurious **un-enhanced** copy is created (Application-loader name resolution somewhere during
+metadata build) and then leaks into the name-keyed `JavaTypeRegistry`. Candidate fixes:
+(a) prevent the spurious Application-loader load of an entity that a user loader has enhanced;
+(b) make the entity JavaType / `getReflectionOptimizer` use the enhanced `getMappedClass()`
+directly; or (c) make CratonVM Class-mirror identity loader-faithful so the registry's `==`
+guard distinguishes (and rejects) the un-enhanced copy. Until then, `enhancement.lazy.*` (≈54)
++ `mapping.lazytoone.*` (12) remain FAIL gate-on.
 
 ## Repro
 
