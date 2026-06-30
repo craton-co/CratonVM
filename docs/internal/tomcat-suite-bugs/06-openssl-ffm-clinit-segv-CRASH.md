@@ -39,6 +39,14 @@ see "Root cause (symbolized) + FIX"). Worktree `CratonVM-tcbug0609`, branch
   which is out of scope (the VM bug — the SEGV — is the thing that was real, and
   it is fixed).
 
+> **Update (2026-06-30):** the `openssl_h <clinit>` "Cannot invoke printf on null"
+> NPE referenced throughout this doc as a *benign, caught* side note has itself
+> been fixed — see [Bug 07](07-openssl-ffm-clinit-printf-npe-FIXED.md). `openssl_h`
+> now fails with the *same* `IllegalArgumentException: Cannot open library:
+> ssl.dll` as HotSpot (the behavior this doc called correct), instead of the
+> CratonVM-specific printf NPE. The SEGV root cause below (GC stale-ref in
+> `Method.invoke`) is unrelated and remains as documented.
+
 ## Symptom
 
 ```
