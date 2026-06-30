@@ -10833,7 +10833,11 @@ fn pbe_generate_secret(
 /// back to a catchable `IllegalArgumentException` if the class can't be built.
 /// `SecretKeyCredentialHandler.mutate` catches both, so either way the handler
 /// logs and returns null exactly as it does on HotSpot.
-fn throw_jca_exc(ctx: &mut dyn NativeContext, class_name: &str, msg: &str) -> MethodCallFailed {
+pub(crate) fn throw_jca_exc(
+    ctx: &mut dyn NativeContext,
+    class_name: &str,
+    msg: &str,
+) -> MethodCallFailed {
     let detail = ctx.create_string(msg);
     if let Ok(Some(Value::Object(Some(exc)))) = ctx.new_object_initialized(
         class_name,
