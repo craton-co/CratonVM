@@ -804,9 +804,21 @@ fn perform(
     let addr = format!("{}:{}", parsed.host, parsed.port);
     let mut last_err: Option<String> = None;
     let mut tcp: Option<TcpStream> = None;
-    for sa in std::net::ToSocketAddrs::to_socket_addrs(&addr.as_str())
-        .map_err(|e| format!("resolve {addr}: {e}"))?
-    {
+    let mut addrs: Vec<std::net::SocketAddr> =
+        std::net::ToSocketAddrs::to_socket_addrs(&addr.as_str())
+            .map_err(|e| format!("resolve {addr}: {e}"))?
+            .collect();
+    // preferIPv4Stack semantics: try IPv4 candidates before IPv6. On Windows a
+    // "localhost" lookup returns `[::1, 127.0.0.1]` (IPv6 first), but an
+    // embedded/test Tomcat started with -Djava.net.preferIPv4Stack=true listens
+    // on 127.0.0.1 only — so the `[::1]:port` attempt is silently dropped and
+    // `connect_timeout`'s select() stalls ~1s per request before falling back to
+    // IPv4. Re-ordering IPv4 first makes the common loopback case connect
+    // immediately while still trying IPv6 for genuinely IPv6-only hosts. A
+    // literal IP resolves to a single candidate, so the sort is a no-op. Mirrors
+    // native-api fd_table::connect_prefer_ipv4 and the merged WS-connect fix.
+    addrs.sort_by_key(|sa| u8::from(sa.is_ipv6()));
+    for sa in addrs {
         match TcpStream::connect_timeout(&sa, connect_timeout) {
             Ok(s) => {
                 tcp = Some(s);
