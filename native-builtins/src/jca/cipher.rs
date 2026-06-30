@@ -875,6 +875,54 @@ pub fn register_cipher_clinit_shim(r: &mut NativeMethodRegistry) {
         |_ctx, _args| Ok(Some(Value::Object(None))),
     );
 
+    // `javax/crypto/JceSecurityManager.getCryptoPermission(String)` — the
+    // real-JDK chokepoint for every Cipher crypto-strength decision:
+    // `Cipher.getMaxAllowedKeyLength`, `Cipher.getMaxAllowedParameterSpec`,
+    // and the init-time `checkCryptoPerm` all route through it. Its first
+    // hop is `getDefaultPermission(alg)`, whose bytecode is
+    // `getstatic JceSecurityManager.defaultPolicy` →
+    // `defaultPolicy.getPermissionCollection(alg)`. Because we no-op
+    // `JceSecurity.<clinit>` (above), `JceSecurity.defaultPolicy` is null;
+    // `JceSecurityManager.<clinit>` copies it into
+    // `JceSecurityManager.defaultPolicy`, so that too is null and the
+    // `getPermissionCollection` invokevirtual NPEs ("Cannot invoke
+    // CryptoPermissions.getPermissionCollection because defaultPolicy is
+    // null"). This breaks any real-JDK Cipher path that consults the
+    // policy — e.g. Tomcat tribes `TestEncryptInterceptor.test192/256BitKey`
+    // gate on `Cipher.getMaxAllowedKeyLength("AES") >= 192/256`. (The sibling
+    // `TestEncryptInterceptorAlgorithms` failures are a DIFFERENT root cause —
+    // the native AES dispatch lacks CFB/OFB modes and the getInstance shim
+    // doesn't reject SunJCE-unsupported transforms like CCM — not this NPE.)
+    //
+    // JDK 9+ ships `crypto.policy=unlimited` by default: the loaded
+    // `defaultPolicy` grants `CryptoAllPermission` for every algorithm, so
+    // `getCryptoPermission` resolves to `CryptoAllPermission.INSTANCE`
+    // (whose `maxKeySize` is `Integer.MAX_VALUE`) — see the real method's
+    // `if_acmpne` against `CryptoAllPermission.INSTANCE` early-return. We
+    // reproduce that unlimited outcome directly by returning the singleton:
+    // `getMaxAllowedKeyLength` then reports `Integer.MAX_VALUE` and every
+    // `checkCryptoPerm` passes. `CryptoAllPermission`'s `<clinit>`/`<init>`
+    // are trivial (just `new CryptoAllPermission()` → `CryptoPermission(
+    // String)` which sets `maxKeySize = Integer.MAX_VALUE`); they perform
+    // no `Security`/policy-file reads, so initializing the class here is
+    // safe even with our no-op'd `Security`/`JceSecurity` clinits.
+    r.register(
+        "javax/crypto/JceSecurityManager",
+        "getCryptoPermission",
+        "(Ljava/lang/String;)Ljavax/crypto/CryptoPermission;",
+        |ctx, _args| {
+            let cid = ctx.ensure_class_initialized("javax/crypto/CryptoAllPermission")?;
+            let idx = ctx
+                .static_field_index_by_name(cid, "INSTANCE")
+                .ok_or(RuntimeError::IllegalStateException {
+                    message: "javax/crypto/CryptoAllPermission.INSTANCE \
+                              static field not found"
+                        .to_string(),
+                })?;
+            Ok(Some(ctx.get_static_field(cid, idx)))
+        },
+    );
+
     register_cipher_dispatch(r);
     register_keygen_dispatch(r);
     register_param_specs(r);

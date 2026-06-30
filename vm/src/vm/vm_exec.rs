@@ -5187,6 +5187,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             // primitives at the SAM boundary so impl sees matched types).
             let sam_desc = lcs.sam_descriptor.clone();
             let impl_desc = lcs.impl_handle.descriptor.clone();
+            let inst_desc = lcs.instantiated_descriptor.clone();
             let (_, sam_ret) = crate::runtime::interpreter::split_method_descriptor(&sam_desc);
             let (_, impl_ret) = crate::runtime::interpreter::split_method_descriptor(&impl_desc);
             let receiver_present = matches!(
@@ -5198,6 +5199,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                 self.thread,
                 &sam_desc,
                 &impl_desc,
+                &inst_desc,
                 &mut full_args,
                 receiver_present,
                 num_captures,

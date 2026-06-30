@@ -2433,6 +2433,138 @@ pub(crate) fn native_array_new_array(
     Ok(Some(Value::Object(Some(arr))))
 }
 
+/// `java/lang/reflect/Array.multiNewArray(Class componentType, int[] dimensions)`
+///
+/// Allocates a fully-materialized multi-dimensional array. Distinct from the
+/// single-dim `newArray`: the result's runtime class must be the *precise*
+/// nested array type — `Array.newInstance(String.class, {2,2})` →
+/// `[[Ljava/lang/String;`, not `[Ljava/lang/String;` (SpEL
+/// `ArrayConstructorTests.multiDimensionalArrays` asserts this exactly).
+///
+/// Each non-leaf level is therefore allocated with the resolved nested-array
+/// component `ClassId` (via `ensure_class_initialized` on the `[…` descriptor)
+/// rather than the loose `ClassId(0)` the `multianewarray` *bytecode* path
+/// uses — bytecode-built multiarrays are rarely inspected via `getClass()`,
+/// reflective ones are.
+///
+/// Previously this descriptor (and `Array.newInstance(Class, int[])`) was wired
+/// to a single-dim allocator that read only `dims[0]`, collapsing the result to
+/// one dimension.
+pub(crate) fn native_array_multi_new_array(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    use cratonvm_types::error::MethodCallFailed;
+
+    // args[1] = int[] of per-dimension lengths.
+    let dims_arr = match args.get(1) {
+        Some(Value::Object(Some(a))) => *a,
+        // Defensive: a single Int (1-D shape) — defer to the single-dim path.
+        _ => return native_array_new_array(ctx, args),
+    };
+    let ndims = ctx.array_length(dims_arr);
+    if ndims <= 1 {
+        // A single dimension behaves exactly like `newArray`; reuse it so the
+        // (already well-tested) Class-mirror element-type resolution applies.
+        let len = if ndims == 1 {
+            ctx.get_array_element(dims_arr, 0)
+        } else {
+            Value::Int(0)
+        };
+        let one_dim = [args.first().copied().unwrap_or(Value::Object(None)), len];
+        return native_array_new_array(ctx, &one_dim);
+    }
+
+    let mut sizes: Vec<usize> = Vec::with_capacity(ndims);
+    for i in 0..ndims {
+        match ctx.get_array_element(dims_arr, i) {
+            Value::Int(n) => {
+                if n < 0 {
+                    return Err(RuntimeError::NegativeArraySizeException { size: n }.into());
+                }
+                sizes.push(n as usize);
+            }
+            _ => sizes.push(0),
+        }
+    }
+
+    // Resolve the leaf component type from the Class mirror (mirrors the
+    // resolution in `native_array_new_array`).
+    let comp_name = match args.first() {
+        Some(Value::Object(Some(mirror))) => crate::lang_class::mirror_class_name(&*ctx, *mirror)
+            .filter(|s| !s.is_empty())
+            .or_else(|| ctx.read_string(*mirror))
+            .map(|s| s.replace('.', "/"))
+            .unwrap_or_else(|| "java/lang/Object".to_string()),
+        _ => "java/lang/Object".to_string(),
+    };
+
+    // Either a primitive leaf (single-letter descriptor) or a reference leaf
+    // (`L…;`). The descriptor letter is what the nested array-class names are
+    // built from.
+    let (prim_et, leaf_desc) = match comp_name.as_str() {
+        "int" | "I" => (Some(cratonvm_types::ArrayElementType::Int), "I".to_string()),
+        "long" | "J" => (Some(cratonvm_types::ArrayElementType::Long), "J".to_string()),
+        "float" | "F" => (Some(cratonvm_types::ArrayElementType::Float), "F".to_string()),
+        "double" | "D" => (Some(cratonvm_types::ArrayElementType::Double), "D".to_string()),
+        "boolean" | "Z" => (Some(cratonvm_types::ArrayElementType::Boolean), "Z".to_string()),
+        "byte" | "B" => (Some(cratonvm_types::ArrayElementType::Byte), "B".to_string()),
+        "char" | "C" => (Some(cratonvm_types::ArrayElementType::Char), "C".to_string()),
+        "short" | "S" => (Some(cratonvm_types::ArrayElementType::Short), "S".to_string()),
+        other => (None, format!("L{other};")),
+    };
+
+    // Reference leaf: resolve the base component class id once (used for the
+    // innermost `String[]`-style array). Primitives ignore it.
+    let base_ref_id = if prim_et.is_none() {
+        ctx.ensure_class_initialized(&comp_name)
+            .unwrap_or(cratonvm_types::ClassId::new(0))
+    } else {
+        cratonvm_types::ClassId::new(0)
+    };
+
+    fn build(
+        ctx: &mut dyn NativeContext,
+        sizes: &[usize],
+        level: usize,
+        prim_et: Option<cratonvm_types::ArrayElementType>,
+        base_ref_id: cratonvm_types::ClassId,
+        leaf_desc: &str,
+    ) -> Result<ObjectRef, MethodCallFailed> {
+        let ndims = sizes.len();
+        let len = sizes[level];
+        if level == ndims - 1 {
+            // Innermost specified dimension: leaf array of the base type.
+            let arr = match prim_et {
+                Some(et) => ctx.new_array(et, len),
+                None => ctx.new_ref_array(base_ref_id, len),
+            };
+            return Ok(arr);
+        }
+        // Intermediate level: a reference array whose component is the nested
+        // array type one level down — descriptor `'['*(ndims-1-level) + leaf`.
+        let comp_desc: String = "[".repeat(ndims - 1 - level) + leaf_desc;
+        let comp_id = ctx
+            .ensure_class_initialized(&comp_desc)
+            .unwrap_or(cratonvm_types::ClassId::new(0));
+        let mut arr = ctx.new_ref_array(comp_id, len);
+        // Pin the parent across each sub-array allocation: under a moving
+        // collector `arr` may relocate while `build` allocates.
+        let pin = ctx.pin_native_root(arr);
+        for i in 0..len {
+            arr = ctx.read_native_pin(pin, arr);
+            let sub = build(ctx, sizes, level + 1, prim_et, base_ref_id, leaf_desc)?;
+            arr = ctx.read_native_pin(pin, arr);
+            ctx.set_array_element(arr, i, Value::Object(Some(sub)));
+        }
+        ctx.unpin_native_roots(pin);
+        Ok(arr)
+    }
+
+    let arr = build(ctx, &sizes, 0, prim_et, base_ref_id, &leaf_desc)?;
+    Ok(Some(Value::Object(Some(arr))))
+}
+
 /// `ClassLoader.defineClass1(ClassLoader, String, byte[], int, int, ProtectionDomain, String) → Class`
 ///
 /// Defines a class from a byte array. WP2.3: routes through

@@ -777,6 +777,25 @@ fn sc_configure_blocking(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
 fn sc_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     if let Some(this) = obj_or_none(args, 0) {
         if let Some(id) = read_reg_id(ctx, this) {
+            // Force a FIN now. A selector this channel was registered with holds
+            // a `try_clone()`d duplicate of the socket (see
+            // `nio_selector::selector_register`); on Windows, closing only the
+            // original handle (the `tcp_remove` below) does NOT shut the
+            // connection while that duplicate is alive, so the peer's blocking
+            // read never sees EOF and hangs forever. Shutting the socket down
+            // explicitly emits FIN regardless of any outstanding duplicate.
+            {
+                let map = tcp_registry().read();
+                if let Some(TcpHandle::Stream(s)) = map.get(&id) {
+                    let _ = s.shutdown(std::net::Shutdown::Both);
+                }
+            }
+            // Drop the selector's cloned handle too, mirroring the JDK where
+            // closing a channel cancels its keys — otherwise the poller keeps a
+            // live duplicate of a logically-closed socket. Done after dropping
+            // the tcp_registry lock above to keep the `selectors → tcp_registry`
+            // lock order of the select path (no inversion).
+            crate::nio_selector::deregister_fd_everywhere(id);
             tcp_remove(id);
         }
         // Drop the synthetic state entirely: a later isOpen()/isConnected()
@@ -1718,7 +1737,20 @@ fn ssc_accept(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
             .unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap());
         Some((stream, peer))
     } else {
-        match listener_clone.accept() {
+        // A blocking accept() parks in the OS for an unbounded time (the
+        // acceptor thread sits here whenever no connection is pending). It
+        // touches no Java heap, so bracket it in a GC-blocking region:
+        // otherwise a stop-the-world GC requested while this thread is parked
+        // in accept() counts it in `expected` and `wait_for_all` deadlocks
+        // forever (the acceptor never reaches an interpreter safepoint). This
+        // is especially likely when a single long-lived connection is reused
+        // (e.g. HTTP/2), leaving the acceptor idle in accept() for the whole
+        // exchange. `end_blocking_region` waits out any active pause before we
+        // resume touching the heap below.
+        ctx.begin_blocking_region();
+        let res = listener_clone.accept();
+        ctx.end_blocking_region();
+        match res {
             Ok((stream, peer)) => Some((stream, peer)),
             Err(e) if e.kind() == ErrorKind::WouldBlock && !blocking => None,
             Err(e) => return Err(map_err("accept", e)),

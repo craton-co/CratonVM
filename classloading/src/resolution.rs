@@ -612,11 +612,21 @@ pub enum ResolvedMember {
 /// few-thousand distinct hot triples (the same ~20-50k probes collapse
 /// onto a much smaller working set). 16 384 entries comfortably covers
 /// that working set so the steady-state hit rate is unchanged, while
-/// capping worst-case memory at ~16k * (tuple + value) ≈ a few MB even
+/// capping worst-case memory at ~128k * (tuple + value) ≈ ~16 MB even
 /// for pathological apps that reflect over tens of thousands of
 /// distinct members. Each entry is small (two `Arc<str>` clones — shared
 /// refcount bumps, not byte copies — plus a `ClassId` and a tagged enum).
-const CACHE_CAP: usize = 16 * 1024;
+///
+/// PERF (2026-06, Tomcat DoHead profiling): a large server resolves **tens
+/// of thousands** of distinct (class, member, descriptor) sites in a single
+/// start/stop — well over the old 16k cap. The cache then sat pinned AT the
+/// cap, so every insert ran the O(n) CLOCK eviction sweep: `LinkResolver::
+/// insert` (the sweep) measured **72% of total CPU** across a repeated
+/// Tomcat start/stop test, because stable JDK/Tomcat resolutions were
+/// evicted and re-resolved on every iteration. Sizing the cap to hold that
+/// working set lets it reach steady state (no eviction), turning each later
+/// iteration's resolutions into cache hits.
+const CACHE_CAP: usize = 128 * 1024;
 
 /// Number of entries to *try* to reclaim each time the cap is hit. We
 /// sweep in a batch rather than evicting a single entry per insert so
