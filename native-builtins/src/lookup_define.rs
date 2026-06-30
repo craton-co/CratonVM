@@ -190,6 +190,29 @@ fn inherit_lookup_loader(ctx: &mut dyn NativeContext, this_lookup: ObjectRef) ->
         Some(c) => c,
         None => return 0,
     };
+    // Loader-faithful gate: a class DEFINED by a user loader records that
+    // loader's object (`register_defining_loader` in `defineClass1`); inherit
+    // its namespace id directly — the SAME value `defineClass1` would compute —
+    // so a Lookup/hidden class defined against it lands in the same namespace.
+    //
+    // The legacy `loader_id_of_class` i32 path below collapses `UserDefined(n)`
+    // and the built-in `Application` BOTH to 2, and the `< 3` threshold then
+    // mis-routed any user loader whose namespace id is 1 or 2 (the first ids
+    // `allocate_loader_id` hands out) to the Application namespace. That broke
+    // Hibernate's lazy bytecode-enhancement entities: a ByteBuddy
+    // ReflectionOptimizer (`<Entity>$HibernateInstantiator`) is defined via
+    // `Lookup.defineClass` against the ENHANCED entity (e.g. `UserDefined(2)`),
+    // but landed under Application, so its generated `new <Entity>` resolved the
+    // un-enhanced global copy → SessionFactory build CCE (`<Entity>` not a
+    // `PersistentAttributeInterceptable`). Gated + only fires for a user loader
+    // that has actually been assigned a namespace → byte-identical gate-off.
+    if crate::classloader::loader_aware_resolution() {
+        if let Some(loader_obj) = crate::classloader::defining_loader_for(cid.as_u32()) {
+            if let Some(ns) = crate::classloader::peek_loader_namespace_id(ctx, loader_obj) {
+                return ns;
+            }
+        }
+    }
     let raw = ctx.loader_id_of_class(cid);
     // Negative or 0/1/2 → Application namespace (== backend loader_id 0).
     // 3+ → UserDefined(raw) (== backend loader_id raw).
