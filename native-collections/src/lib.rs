@@ -33593,6 +33593,42 @@ fn native_cf_when_complete(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
 }
 
 fn native_cf_all_of(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // Real-JDK async inputs (e.g. `CompletableFuture.runAsync` on a worker thread)
+    // may still be PENDING when `allOf` is called. The synthetic "all inputs already
+    // completed" model below would then return an already-completed CF<Void>, so
+    // `allOf(...).join()` returns immediately while the tasks are still running — the
+    // root cause of the Spring SyncTaskExecutor concurrency-limit test failures
+    // (`allOf(futures).join()` returned in ~4ms with 0 futures done). Delegate to the
+    // real JDK private static `andTree` (== the body of the real `allOf`) so the
+    // returned CF completes only when EVERY input does. Mirrors the BUG-17 real-JDK
+    // delegation in `whenComplete`/`handle`. Synthetic (KafkaFuture-style) inputs,
+    // whose completion state is encoded as a `DONE` Int in slot 1, keep the eager
+    // model below.
+    if let Some(Value::Object(Some(arr))) = args.first() {
+        let arr = *arr;
+        let len = ctx.array_length(arr);
+        let mut any_real = false;
+        for i in 0..len {
+            if let Value::Object(Some(cf_obj)) = ctx.get_array_element(arr, i) {
+                if cf_is_real_jdk(ctx, cf_obj) {
+                    any_real = true;
+                    break;
+                }
+            }
+        }
+        if any_real {
+            return ctx.invoke_special(
+                "java/util/concurrent/CompletableFuture",
+                "andTree",
+                "([Ljava/util/concurrent/CompletableFuture;II)Ljava/util/concurrent/CompletableFuture;",
+                &[
+                    Value::Object(Some(arr)),
+                    Value::Int(0),
+                    Value::Int(len as i32 - 1),
+                ],
+            );
+        }
+    }
     // In our synchronous model all input CFs are already completed. allOf returns a
     // CF<Void> that is normally done UNLESS any input completed exceptionally, in
     // which case allOf is exceptional with that throwable (real JDK semantics — and

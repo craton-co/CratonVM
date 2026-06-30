@@ -611,6 +611,36 @@ pub(crate) fn register_phase55_executors(r: &mut NativeMethodRegistry) {
         "allOf",
         "([Ljava/util/concurrent/CompletableFuture;)Ljava/util/concurrent/CompletableFuture;",
         |ctx, args| {
+            // Real-JDK async inputs (e.g. `runAsync` on a worker) may still be PENDING:
+            // delegate to the real JDK private static `andTree` so the returned CF
+            // completes only when every input does (see `p58_cf_all_of`). The eager
+            // model below would mark it done immediately. Synthetic CFs (done-flag Int
+            // in slot 1) keep the eager model.
+            if let Some(Value::Object(Some(arr))) = args.first() {
+                let arr = *arr;
+                let len = ctx.array_length(arr);
+                let mut any_real = false;
+                for i in 0..len {
+                    if let Value::Object(Some(cf_ref)) = ctx.get_array_element(arr, i) {
+                        if !matches!(ctx.get_field(cf_ref, FUT_FIELD_DONE), Value::Int(_)) {
+                            any_real = true;
+                            break;
+                        }
+                    }
+                }
+                if any_real {
+                    return ctx.invoke_special(
+                        "java/util/concurrent/CompletableFuture",
+                        "andTree",
+                        "([Ljava/util/concurrent/CompletableFuture;II)Ljava/util/concurrent/CompletableFuture;",
+                        &[
+                            Value::Object(Some(arr)),
+                            Value::Int(0),
+                            Value::Int(len as i32 - 1),
+                        ],
+                    );
+                }
+            }
             let future =
                 alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 3);
             // Check if any constituent CF has an exception
@@ -12604,7 +12634,38 @@ fn p58_cf_exceptionally(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     Ok(Some(Value::Object(Some(cf))))
 }
 
-fn p58_cf_all_of(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+fn p58_cf_all_of(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // Real-JDK async inputs (e.g. `CompletableFuture.runAsync` on a worker) may still
+    // be PENDING. Delegate to the real JDK private static `andTree` (== the body of
+    // the real `allOf`) so the returned CF completes only when every input does,
+    // instead of the eager "all already complete" model below which makes
+    // `allOf(...).join()` return immediately while tasks run. See `p58_cf_when_complete`
+    // (BUG-17) for the same real-JDK delegation pattern.
+    if let Some(Value::Object(Some(arr))) = args.first() {
+        let arr = *arr;
+        let len = ctx.array_length(arr);
+        let mut any_real = false;
+        for i in 0..len {
+            if let Value::Object(Some(cf)) = ctx.get_array_element(arr, i) {
+                if !matches!(ctx.get_field(cf, FUT_FIELD_DONE), Value::Int(_)) {
+                    any_real = true;
+                    break;
+                }
+            }
+        }
+        if any_real {
+            return ctx.invoke_special(
+                "java/util/concurrent/CompletableFuture",
+                "andTree",
+                "([Ljava/util/concurrent/CompletableFuture;II)Ljava/util/concurrent/CompletableFuture;",
+                &[
+                    Value::Object(Some(arr)),
+                    Value::Int(0),
+                    Value::Int(len as i32 - 1),
+                ],
+            );
+        }
+    }
     // All futures are already complete in our eager model
     let cf = p58_new_cf(ctx, Value::Object(None), true);
     Ok(Some(Value::Object(Some(cf))))
