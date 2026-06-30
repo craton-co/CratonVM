@@ -401,6 +401,13 @@ pub fn update_all_roots(
     //     stale pointer.
     cratonvm_native_builtins::lang_math::gc_update_value_of_cache_refs(pointer_map);
 
+    // 15a. Unsafe / Class$Atomic synthetic-offset side stores (scanned in
+    //      `roots.rs` step 15a). A moving collection relocates the stored refs
+    //      and selective promotion may tenure them; repoint them here so the
+    //      next side-store load/CAS sees the live address instead of a dangling
+    //      one. See `gc_scan_unsafe_side_store_roots`.
+    cratonvm_native_builtins::gc_update_unsafe_side_store_refs(pointer_map);
+
     // 16. Round-9 perf + GC fix: re-point the process-global LambdaMetafactory
     //     CallSite cache living in `native-builtins/src/lang_invoke.rs`.
     //     Same scan/update contract as the Integer.valueOf cache.

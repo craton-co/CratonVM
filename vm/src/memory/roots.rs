@@ -383,6 +383,19 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     //     after the first compaction.
     cratonvm_native_builtins::lang_math::gc_scan_value_of_cache_roots(&mut roots);
 
+    // 15a. Unsafe / Class$Atomic synthetic-offset side stores. These hold live
+    //      `ObjectRef`s that exist in NO heap slot (the synthetic-offset scheme
+    //      services load/CAS/store from a Rust-side map when the field's real
+    //      heap slot is unknown to our layout), so they are unreachable through
+    //      the heap graph. Chief offender: `Class$Atomic.casReflectionData`
+    //      stows the `SoftReference<ReflectionData>` here — without rooting it a
+    //      young GC reclaims the still-live SoftReference (all-zero header) and
+    //      the reflection subgraph hanging off it decays (the Tomcat DoHead
+    //      start/stop corruption flood, first victim always a
+    //      `java/lang/ref/SoftReference`). Remap companion in `gc.rs`
+    //      (`gc_update_unsafe_side_store_refs`).
+    cratonvm_native_builtins::gc_scan_unsafe_side_store_roots(&mut roots);
+
     // 16. Round-9 perf + GC fix: process-global LambdaMetafactory CallSite
     //     cache. Cached CallSites and their bootstrap-arg ObjectRef keys
     //     must stay live across collections; the matching post-compaction
