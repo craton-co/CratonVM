@@ -6037,10 +6037,21 @@ pub(crate) fn native_class_get_declared_methods(
         };
 
         let methods = declared_methods_with_synthetic(ctx, class_id);
-        // Filter out <init> and <clinit>
+        // `getDeclaredMethods0(boolean publicOnly)` — the real JDK calls this
+        // with publicOnly=true on the `Class.getMethods()` / `getMethod()` path
+        // (`privateGetPublicMethods`) and TRUSTS it to return only PUBLIC
+        // methods (mirroring `getDeclaredFields0`, which already honours the
+        // flag). Previously we ignored args[1], so `getMethods()` surfaced
+        // package-private/protected methods and `getMethod("get", int)` resolved
+        // a non-public method instead of throwing NoSuchMethodException
+        // (ReflectiveIndexAccessorTests.nonPublicReadMethod). The synthetic
+        // one-arg `getDeclaredMethods()` wrapper passes no flag → publicOnly=false.
+        let public_only = matches!(args.get(1), Some(Value::Int(v)) if *v != 0);
+        // Filter out <init> and <clinit>, plus non-public when publicOnly.
         let mut visible: Vec<&MethodMetadata> = methods
             .iter()
             .filter(|m| m.name != "<init>" && m.name != "<clinit>")
+            .filter(|m| !public_only || (m.access_flags & 0x0001) != 0)
             .collect();
 
         // Bridge-method adjacency ordering. A compiler-generated bridge method
