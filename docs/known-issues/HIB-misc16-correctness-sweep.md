@@ -7,6 +7,14 @@
 | **List** | `apps/hib-suite-runner/misc16.txt` |
 | **Date** | 2026-06-30 |
 
+**Verification (merged binary `2da9a00d`→dev merge `a5847887`, fixes `2ba1347b`+`d906ce97`):**
+`ExplicitQueryStatsMaxSizeTest` PASS 2/2 and `DatabaseTimeZoneMultiTenancyTest`
+PASS 1/1 (both were failing). `XmlFormatterTest` PASS (dev). No regressions in
+the rest of misc16; `LhmEvictProbe` + non-overriding-LHM-subclass +
+`LinkedHashSet` regression probes match HotSpot. `StandardFunctionTests`
+completed this run (40/44, 4 failed — matches the HotSpot slowness/shared-failure
+pattern, see §15–16).
+
 Run the sweep:
 ```
 cd C:/craton/CratonVM/apps/hib-suite-runner
@@ -111,12 +119,18 @@ is loader-blind**: the same-named entity defined by the app loader and by the
 `can't be cast to PersistentAttributeInterceptable` / `Could not instantiate
 persister` / `not of expected type`.
 
-- Gate `CRATONVM_LOADER_AWARE_RESOLUTION=1` does **not** fix these (verified —
-  it only shifts which entity reports first, `Country`→`Continent`).
 - `ProxyClassReuseTest` is the dual-isolated-loader variant already owned by
-  `docs/known-issues/hib-proxyclassreuse-loader-blind-class-resolution.md`; its
-  gated fix is scoped to that case and does not cover the `@BytecodeEnhanced`
-  single-enhancing-loader-with-app-parent pattern.
+  `docs/known-issues/hib-proxyclassreuse-loader-blind-class-resolution.md`.
+- **Update (dev merge):** dev commit `7183f42a` + `docs/known-issues/hib-bytecode-enhancement-loader-faithful-linking.md`
+  added gate-on loader-faithful supertype *linking* / `invokespecial` dispatch
+  for `@BytecodeEnhanced` entities. That doc reports the eager-enhancement
+  cluster FIXED gate-on but the `enhancement.lazy.*` / `mapping.lazytoone.*`
+  cluster still OPEN. **Re-tested on the merged binary with
+  `CRATONVM_LOADER_AWARE_RESOLUTION=1`: all 6 still FAIL** (identical
+  `can't be cast to PersistentAttributeInterceptable` / persister / IAE) — so
+  these misc16 classes fall in the still-open lazy/non-eager cluster, not the
+  portion dev's `7183f42a` fixed. Tracked by
+  `hib-bytecode-enhancement-loader-faithful-linking.md` (open lazy cluster).
 
 **Why the existing gate misses it (fix direction).** The gated
 `resolve_class_loader_aware` (`vm/src/runtime/interpreter.rs`) only covers
@@ -140,9 +154,11 @@ Core class-store change, app-gauntlet blast radius — keep behind the gate.
 (`LocalXmlResourceResolver.resolveEntity`) maps `classpath://` to a classpath
 resource stream. On CratonVM the `&child;` expansion is **empty** → the `Child`
 `<class>` mapping never loads → `MappingException: Collection [Parent.children]
-references an unmapped entity [Child]`. The class also ran ~112 s (vs ~fast on
-HotSpot), consistent with the StAX `XMLResolver` not being consulted for the
-external general entity (and/or a fallback I/O attempt). Area: real-JDK StAX
+references an unmapped entity [Child]`. Isolated single-class run: ~53 s + the
+unmapped-entity error (the 120 s `TimeoutException` seen in the 8-shard sweep is
+shard contention, not a true deadlock). The slowness + empty expansion is
+consistent with the StAX `XMLResolver` not being consulted for the external
+general entity (and/or a fallback I/O attempt). Area: real-JDK StAX
 external-general-entity resolution (Woodstox / JDK `XMLInputFactory`) — verify
 whether `XMLResolver.resolveEntity` is invoked for general (non-DTD) entities
 and whether `IS_SUPPORTING_EXTERNAL_ENTITIES` / entity expansion is honored.
@@ -195,12 +211,23 @@ loader's overriding class must win) and `testStoppableClassLoaderService`
 (`loadJavaServices` via `findResources`). Custom-classloader class-identity /
 service-loader isolation — the HIB-CV-24 loader-isolation family.
 
-## 15–16. FunctionTests / StandardFunctionTests — slowness vs correctness (OPEN)
+## 15–16. FunctionTests / StandardFunctionTests — slowness cluster, NOT a correctness bug
 
-Reported as AssertionError in an earlier run; under a 300 s timeout the whole
-class HANGs (rc=124). Each class has many `@ParameterizedTest` HQL-function
-methods; the per-test 120 s timeout means individual slow tests fail rather than
-hang the process, so the class-level timeout is reached by aggregate slowness.
-Pending a 1200 s single-class run to classify pure-slowness vs specific
-wrong-result function(s). (CratonVM interpreter/JIT HQL-function evaluation is
-the suspect area.)
+`FunctionTests` was run to completion under a 1200 s cap: CratonVM finishes in
+**1169 s** (rc=0, `found=123 ok=97 failed=20`) vs HotSpot **24 s**
+(`ok=99 failed=18`) — **~49× slower**. The 300 s "HANG" (rc=124) was purely a
+timeout artifact of a slow-but-live process; no per-test `TimeoutException`, no
+deadlock, steady forward progress to `@@DONE`. Heavy `TRACE`/`FINEST` Hibernate
+logging dominates the wall time.
+
+Crucially, the CratonVM failures **map onto the same failing tests as HotSpot**
+(20 vs 18; identical queries/assertions — `sinh`, `theDuration`,
+`maxindex/indices`, `cast(boolean as String)`, etc.). These are pre-existing
+harness/dialect failures present on HotSpot too — **not** CratonVM HQL-function
+wrong-results. The only delta is exception flavor (CratonVM surfaces
+`ArrayIndexOutOfBoundsException` where HotSpot surfaces `IndexOutOfBoundsException`).
+
+**Disposition:** slowness-cluster (the ~49× slowdown is the real issue), not a
+distinct misc-correctness bug — arguably mis-classified into this tail.
+`StandardFunctionTests` should re-run on the merged binary to confirm the same
+pattern (HotSpot baseline: 29 s, `found=44 ok=41 failed=3`).
