@@ -2988,7 +2988,8 @@ pub fn execute(
                     .class_manager
                     .read()
                     .class_redefine_generation(class_id)
-                    > 0;
+                    > 0
+                && !redefine_immune_reflection_native(&class_name_owned, method_name);
             if method_name != "<init>" && method_name != "<clinit>" && !class_redefined {
                 if let Some(cb) =
                     shared
@@ -17999,6 +18000,56 @@ fn native_shadow_suppressed_by_redefine(shared: &SharedVm, class_name: &str) -> 
     }
 }
 
+/// Reflection-metadata natives on the `java.lang.reflect.*` member types that
+/// must stay authoritative even after their declaring class is redefined.
+///
+/// CratonVM serves these (annotations, parameter annotations, annotation
+/// defaults, annotated types) from VM-side structures, NOT from raw class-file
+/// bytes a real `sun.reflect.annotation.AnnotationParser` + `ConstantPool`
+/// could decode. So the suppress-native-shadow-on-redefine guard — which
+/// otherwise correctly cedes a redefined class's methods to their woven
+/// bytecode so a Mockito inline mock's advice runs — must NOT fire for these.
+///
+/// The trigger: `Mockito.mock(java.lang.reflect.Method.class)` inline-redefines
+/// `java.lang.reflect.Method`. That bumps its `redefine_generation`, so EVERY
+/// subsequent `Method.getDeclaredAnnotations()` / `isAnnotationPresent(...)`
+/// call — on ANY method object, not just the mocked class — was routed to the
+/// real `Executable.declaredAnnotations()` bytecode, which under CratonVM reads
+/// empty annotation bytes and returns no annotations. JUnit's `@Test` scan then
+/// finds zero test methods and Spring AOP's `MethodMatchersTests` (whose
+/// `static final Method TEST_METHOD = mock(Method.class)` runs at class-init)
+/// discovers 0 tests where HotSpot runs 14. A mock only needs its per-INSTANCE
+/// dispatch woven; these class-level metadata accessors are not instance
+/// behaviour and the mock never stubs them, so keeping the native is correct
+/// (and matches HotSpot, where the redefine leaves real annotation reflection
+/// intact). Business-method inline mocks (e.g. `InetAddress.getHostName`) are
+/// unaffected — they are not in this list.
+fn redefine_immune_reflection_native(class_name: &str, method_name: &str) -> bool {
+    matches!(
+        class_name,
+        "java/lang/reflect/Method"
+            | "java/lang/reflect/Constructor"
+            | "java/lang/reflect/Field"
+            | "java/lang/reflect/Executable"
+            | "java/lang/reflect/AccessibleObject"
+    ) && matches!(
+        method_name,
+        "getDeclaredAnnotations"
+            | "getAnnotations"
+            | "getAnnotation"
+            | "getDeclaredAnnotation"
+            | "isAnnotationPresent"
+            | "getAnnotationsByType"
+            | "getDeclaredAnnotationsByType"
+            | "getParameterAnnotations"
+            | "getDefaultValue"
+            | "getAnnotatedReturnType"
+            | "getAnnotatedParameterTypes"
+            | "getAnnotatedExceptionTypes"
+            | "getAnnotatedReceiverType"
+    )
+}
+
 /// Dispatch a force-native override via `safe_native_call`, pushing any return
 /// value onto the caller operand stack.
 #[inline]
@@ -18026,8 +18077,12 @@ fn intercept_force_registered_native(
     }
     // A JVMTI agent that redefined this class (e.g. a Mockito inline mock)
     // makes its woven bytecode authoritative — cede to it instead of forcing
-    // the native, so the instrumentation advice runs.
-    if native_shadow_suppressed_by_redefine(shared, class_name) {
+    // the native, so the instrumentation advice runs. Reflection-metadata
+    // natives are exempt (see `redefine_immune_reflection_native`): the real
+    // bytecode cannot reproduce them under CratonVM.
+    if native_shadow_suppressed_by_redefine(shared, class_name)
+        && !redefine_immune_reflection_native(class_name, method_name)
+    {
         return None;
     }
     let cb = shared
@@ -18359,7 +18414,11 @@ fn try_stackless_invoke(
     // redefined this class, its woven bytecode is authoritative. Drop any
     // native override so dispatch falls through to the (instrumented)
     // bytecode and the advice runs. Fast-pathed on `any_class_redefined`.
-    let native_cb = if native_shadow_suppressed_by_redefine(shared, class_name) {
+    // Reflection-metadata natives stay authoritative (see
+    // `redefine_immune_reflection_native`).
+    let native_cb = if native_shadow_suppressed_by_redefine(shared, class_name)
+        && !redefine_immune_reflection_native(class_name, method_name)
+    {
         None
     } else {
         native_cb
@@ -18532,8 +18591,12 @@ fn try_stackless_invoke(
     // promotion in `populate_invoke_cache`, which keys on the CP class).
     // JVMTI redefine guard: a class redefined in place by an agent runs its
     // woven bytecode (so the mock advice fires) rather than the native shadow.
+    // Reflection-metadata natives stay authoritative (see
+    // `redefine_immune_reflection_native`) — a Mockito inline mock of
+    // `java.lang.reflect.Method` must not disable annotation reflection.
     if !(declaring_is_interface && !is_static)
-        && !native_shadow_suppressed_by_redefine(shared, &class_name_arc)
+        && (!native_shadow_suppressed_by_redefine(shared, &class_name_arc)
+            || redefine_immune_reflection_native(&class_name_arc, method_name))
     {
         if let Some(callback) = shared
             .native_methods
@@ -18599,7 +18662,27 @@ fn try_stackless_invoke(
     // Intrinsics', then Intrinsics' `return` (void) would unwind out of
     // listOf silently — losing both the singletonList result AND the areturn
     // instruction. The whole program then exits 0 with no output.
-    let is_tail_call = if !is_synchronized && method_name != "<init>" {
+    //
+    // STACK-TRACE FIDELITY: HotSpot performs NO tail-call optimization, so any
+    // frame TCE eliminates is invisible to `new Throwable().getStackTrace()` —
+    // a divergence that breaks code which walks the live call stack. Spring's
+    // `ControlFlowPointcut.matches()` fires advice only when a specific caller
+    // class+method appears in the trace; eliminating a cross-method tail frame
+    // (e.g. `MyComponent.getAge` whose body is just `return proxy.getAge();`)
+    // makes that frame vanish and the cflow advice never fires
+    // (ControlFlowPointcutTests, 4 methods). Restrict TCE to SELF-recursive
+    // tail calls (caller method == callee method), where the only trace effect
+    // is collapsing repeated identical frames — the case deep tail-recursive
+    // loops (e.g. `tailSum(10000)` in `s16_tail_call_sum_10000`) need to stay
+    // within the 1024-frame stack. Cross-method tail calls now keep the
+    // caller's frame, matching HotSpot.
+    let is_self_recursive = {
+        let caller = &thread.frames[frame_idx];
+        caller.class_id == declaring_id
+            && &*caller.method_name() == method_name
+            && &*caller.method_descriptor() == descriptor
+    };
+    let is_tail_call = if is_self_recursive && !is_synchronized && method_name != "<init>" {
         let caller = &thread.frames[frame_idx];
         let pc = caller.pc;
         // Check if the byte at the current PC (after the invoke instruction)
@@ -24044,8 +24127,13 @@ fn execute_invokevirtual_vtable_fast(
             // authoritative woven bytecode, so the per-class native shadows
             // below must be suppressed (the mock's advice has to run). Cheap
             // fast-path on `any_class_redefined`.
+            // Reflection-metadata natives stay authoritative even when the
+            // receiver class was redefined (see `redefine_immune_reflection_native`):
+            // a Mockito inline mock of `java.lang.reflect.Method` must not
+            // disable `Method.getDeclaredAnnotations()` for every method object.
             let receiver_redefined = crate::classloading::any_class_redefined()
-                && cm.class_redefine_generation(receiver_class_id) > 0;
+                && cm.class_redefine_generation(receiver_class_id) > 0
+                && !redefine_immune_reflection_native(rcv_name, &method_name);
             // WP2.7 — annotation proxies have no real bytecode for
             // equals/hashCode/toString. Force fall-through to the slow path
             // so `execute_invoke`'s annotation_proxy interception layer
@@ -24143,7 +24231,8 @@ fn execute_invokevirtual_vtable_fast(
                     // Suppress an inherited native shadow when the declaring
                     // parent has been redefined by an agent (woven bytecode wins).
                     let parent_redefined = crate::classloading::any_class_redefined()
-                        && cm.class_redefine_generation(parent_id) > 0;
+                        && cm.class_redefine_generation(parent_id) > 0
+                        && !redefine_immune_reflection_native(&parent.name, &method_name);
                     let has_native = !parent_redefined
                         && shared
                             .native_methods
