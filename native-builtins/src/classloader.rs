@@ -2978,7 +2978,22 @@ fn cl_get_resources_impl(
 /// crashes the VM with an access violation. An empty array is spec-legal
 /// (it just means "this loader contributes no URLs") and lets Spring
 /// Boot's clearCache iteration complete in zero iterations.
-fn ucp_get_urls_empty(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+fn ucp_get_urls_empty(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // If a `URLClassLoader.<init>` stashed its constructor `URL[]` on this ucp
+    // (see `record_ucl_urls`), return those so a real `getURLs()` →
+    // `ucp.getURLs()` bytecode path reflects the loader's URLs. Otherwise an
+    // empty array is spec-legal ("this loader contributes no URLs").
+    if let Some(Value::Object(Some(ucp))) = args.first() {
+        if let Value::Object(Some(stashed)) = ctx.get_field(*ucp, UCP_STASHED_URLS) {
+            let n = ctx.array_length(stashed);
+            let result = ctx.new_array(cratonvm_types::ArrayElementType::Reference, n);
+            for i in 0..n {
+                let url = ctx.get_array_element(stashed, i);
+                ctx.set_array_element(result, i, url);
+            }
+            return Ok(Some(Value::Object(Some(result))));
+        }
+    }
     tracing::debug!(
         target: "cratonvm_vm::runtime::classloader",
         "[URLClassPath shim] getURLs() returning empty URL[]"
@@ -3394,6 +3409,41 @@ fn ucl_setup(ctx: &mut dyn NativeContext, this: ObjectRef, urls: Value, parent: 
             "URLClassLoader.<init>: registered {} URLs to classpath",
             paths.len()
         );
+    }
+}
+
+/// Slot of the `URLClassPath` placeholder (`ucp`) used to stash a real-JDK-mode
+/// `URLClassLoader`'s constructor `URL[]` so `getURLs()` can return it. The ucp
+/// is a placeholder our `<init>` natives create (see `init_urlclassloader_fields`)
+/// whose real methods are all shimmed, so this slot is ours to use; storing the
+/// array here also keeps it GC-reachable via loader→ucp→array.
+const UCP_STASHED_URLS: usize = 0;
+
+/// Record a real-JDK-mode `URLClassLoader`'s constructor `URL[]` so that
+/// `getURLs()` returns the URLs the loader was built with.
+///
+/// The real-JDK-mode `URLClassLoader.<init>` natives (see `classloader_real`)
+/// wire a loader's URLs into CratonVM's GLOBAL dynamic classpath (so classes
+/// load) but never store them per-instance. Real `getURLs()` reads
+/// `ucp.getURLs()`, and our `URLClassPath` shim returns empty — so `getURLs()`
+/// yielded `[]`. That broke any code that walks a classloader's URLs, e.g.
+/// Tomcat's `StandardJarScanner`, which scans the classloader hierarchy via
+/// `getURLs()` to find TLDs: a TLD in a JAR added to a parent `URLClassLoader`
+/// (outside `/WEB-INF/lib`) was invisible, 500-ing JSPs that referenced it
+/// (`TestTagLibraryInfoImpl.testExternalTaglibDependantUsesUri`).
+///
+/// The synthetic per-instance slots used by `ucl_setup`/`ucl_get_urls` can't be
+/// reused here: a real `java.net.URLClassLoader` has the real JDK field layout,
+/// so those raw indices land on unrelated reference-typed fields (writing an
+/// `Int` count there does not read back as a count). Instead stash the original
+/// `URL[]` on the loader's `ucp` placeholder, which `ucl_get_urls` reads back.
+pub(crate) fn record_ucl_urls(ctx: &mut dyn NativeContext, this: ObjectRef, urls: Value) {
+    let url_arr = match urls {
+        Value::Object(Some(arr)) => arr,
+        _ => return,
+    };
+    if let Value::Object(Some(ucp)) = ctx.get_field_by_name(this, "ucp") {
+        ctx.set_field(ucp, UCP_STASHED_URLS, Value::Object(Some(url_arr)));
     }
 }
 
@@ -3878,6 +3928,23 @@ fn ucl_get_urls(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult
         Value::Int(n) => n.max(0) as usize,
         _ => 0,
     };
+    // Synthetic-JDK path: URLs live in the per-instance slots (`ucl_setup`/
+    // `ucl_add_url`). Real-JDK URLClassLoaders use the real field layout, so
+    // those slots are empty/garbage and the URLs were stashed on the `ucp`
+    // placeholder by `record_ucl_urls` instead — fall back to that.
+    if count == 0 {
+        if let Value::Object(Some(ucp)) = ctx.get_field_by_name(this, "ucp") {
+            if let Value::Object(Some(stashed)) = ctx.get_field(ucp, UCP_STASHED_URLS) {
+                let n = ctx.array_length(stashed);
+                let result = ctx.new_array(cratonvm_types::ArrayElementType::Reference, n);
+                for i in 0..n {
+                    let url = ctx.get_array_element(stashed, i);
+                    ctx.set_array_element(result, i, url);
+                }
+                return Ok(Some(Value::Object(Some(result))));
+            }
+        }
+    }
     // Copy stored URLs into a new array of the exact size
     let result = ctx.new_array(cratonvm_types::ArrayElementType::Reference, count);
     if let Value::Object(Some(urls_arr)) = ctx.get_field(this, UCL_URLS_ARRAY) {
