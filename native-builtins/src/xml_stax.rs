@@ -351,12 +351,17 @@ fn parse_to_events(bytes: &[u8]) -> Vec<StaxEvent> {
                 let start_ev = make_element_event(START_ELEMENT, &name, e.attributes(), &scopes);
                 let ns = start_ev.namespace_uri.clone();
                 let prefix = start_ev.prefix.clone();
+                // StAX reports the same xmlns declarations on END_ELEMENT as on
+                // the matching START_ELEMENT (they go out of scope here); a
+                // self-closing tag closes its own start, so carry its decls.
+                let namespaces = start_ev.namespaces.clone();
                 events.push(start_ev);
                 events.push(StaxEvent {
                     kind: END_ELEMENT,
                     local_name: local_name_of(&name),
                     namespace_uri: ns,
                     prefix,
+                    namespaces,
                     ..Default::default()
                 });
                 scopes.pop();
@@ -367,11 +372,21 @@ fn parse_to_events(bytes: &[u8]) -> Vec<StaxEvent> {
                 // pop the frame the matching START pushed.
                 let (prefix, local) = split_qname(&name);
                 let ns = scopes.resolve(&prefix);
+                // StAX reports getNamespaceCount()/Prefix/URI on END_ELEMENT too:
+                // the xmlns declarations on the MATCHING START_ELEMENT (the frame
+                // this end tag closes), which go out of scope here. Spring's
+                // StaxStreamXMLReader.handleEndElement (and the event API's
+                // EndElement.getNamespaces()) relies on this to emit
+                // endPrefixMapping for each declared prefix; an empty list drops
+                // those SAX callbacks. The innermost still-open frame holds
+                // exactly the matching start's decls, in source order.
+                let namespaces = scopes.frames.last().cloned().unwrap_or_default();
                 events.push(StaxEvent {
                     kind: END_ELEMENT,
                     local_name: local,
                     namespace_uri: ns,
                     prefix,
+                    namespaces,
                     ..Default::default()
                 });
                 scopes.pop();
@@ -1387,6 +1402,23 @@ fn native_is_whitespace(ctx: &mut dyn NativeContext, a: &[Value]) -> MethodCallR
 pub fn register(registry: &mut NativeMethodRegistry) {
     let __prev_cat = registry.current_category();
     registry.set_category(cratonvm_native_api::NativeKind::Bridge);
+    // The JDK Xerces StAX event impl's `EndElementEvent.getNamespaces()` is
+    // hard-wired to discard `fNamespaces.iterator()` and always return an empty
+    // `ReadOnlyIterator` (verified in the JDK 25 bytecode). The real default
+    // provider on a Woodstox classpath (HotSpot's choice for the Spring suite)
+    // returns the namespaces that go out of scope, which Spring's
+    // StaxEventXMLReader.handleEndElement turns into `endPrefixMapping` callbacks.
+    // Our synthetic cursor reports those namespaces (getNamespaceCount/Prefix/URI
+    // on END_ELEMENT) and the allocator's `fillNamespaceAttributes` populates
+    // `fNamespaces` correctly — only this final getter drops them. Shadow it with
+    // the spec-correct behaviour (force-dispatched via
+    // `interpreter::force_native_over_real_jdk_bytecode`).
+    registry.register(
+        "com/sun/xml/internal/stream/events/EndElementEvent",
+        "getNamespaces",
+        "()Ljava/util/Iterator;",
+        native_end_element_get_namespaces,
+    );
     // Factory entry points.
     registry.register(
         "javax/xml/stream/XMLInputFactory",
@@ -2053,6 +2085,35 @@ fn native_get_text_length(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     })
     .unwrap_or(0);
     Ok(Some(Value::Int(len as i32)))
+}
+
+/// `com.sun.xml.internal.stream.events.EndElementEvent.getNamespaces()` — return
+/// the namespaces that go out of scope at this end tag. The JDK body always
+/// returns an empty `ReadOnlyIterator` (it computes `fNamespaces.iterator()` then
+/// discards it); that drops the `endPrefixMapping` callbacks Spring's
+/// StaxEventXMLReader derives from `EndElement.getNamespaces()`. Return the real
+/// `fNamespaces` list's iterator instead (empty iterator when the field is
+/// null/absent), matching a correct StAX provider (Woodstox on HotSpot).
+fn native_end_element_get_namespaces(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = this_obj(args)?;
+    if let Value::Object(Some(list)) = ctx.get_field_by_name(this, "fNamespaces") {
+        return ctx.invoke(
+            "java/util/List",
+            "iterator",
+            "()Ljava/util/Iterator;",
+            &[Value::Object(Some(list))],
+        );
+    }
+    // No backing list — mirror the JDK's empty-iterator return.
+    ctx.invoke(
+        "java/util/Collections",
+        "emptyIterator",
+        "()Ljava/util/Iterator;",
+        &[],
+    )
 }
 
 /// `XMLStreamReader.getNamespaceCount()` — number of `xmlns`/`xmlns:p`

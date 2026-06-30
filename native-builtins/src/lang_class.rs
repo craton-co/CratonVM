@@ -3037,6 +3037,34 @@ pub(crate) fn wrap_as_invocation_target_exception(
 ) -> MethodCallFailed {
     let original = match failure {
         MethodCallFailed::ExceptionThrown(obj) => obj,
+        // A genuine Java `Error` raised by the invoked code — most notably an
+        // `OutOfMemoryError` from a huge allocation inside the constructor /
+        // method body (e.g. `new ArrayList(Integer.MAX_VALUE)`) — surfaces as a
+        // VM-internal `RuntimeError` rather than a materialized `Throwable`.
+        // HotSpot's `Constructor.newInstance` / `Method.invoke` wrap ANY
+        // Throwable the callee throws (Errors included) in
+        // `InvocationTargetException`, so SpEL's `catch (Exception)` can turn it
+        // into `CONSTRUCTOR_INVOCATION_PROBLEM` (ArrayConstructorTests.errorCases).
+        // Materialize the corresponding Java throwable and wrap it; every other
+        // `InternalError` kind (real VM defects) still propagates unchanged so we
+        // don't mask implementation bugs.
+        MethodCallFailed::InternalError(cratonvm_types::error::VmError::Runtime(
+            cratonvm_types::error::RuntimeError::OutOfMemoryError { message },
+        )) => {
+            let msg_obj = ctx.create_string(&message);
+            match ctx.new_object_initialized(
+                "java/lang/OutOfMemoryError",
+                "(Ljava/lang/String;)V",
+                &[Value::Object(Some(msg_obj))],
+            ) {
+                Ok(Some(Value::Object(Some(obj)))) => obj,
+                // Couldn't materialize the throwable — propagate the original
+                // internal error rather than swallow it.
+                _ => {
+                    return cratonvm_types::error::RuntimeError::OutOfMemoryError { message }.into()
+                }
+            }
+        }
         other => return other,
     };
     if std::env::var_os("CRATONVM_IAE_TRACE").is_some() {
