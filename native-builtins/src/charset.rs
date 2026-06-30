@@ -19,7 +19,7 @@
 
 use cratonvm_native_api::charset as engine;
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
-use cratonvm_types::error::{MethodCallResult, RuntimeError};
+use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
 use cratonvm_types::{ArrayElementType, ObjectRef, Value};
 
 use crate::{alloc_concurrent_synthetic, normalize_charset_name, CHARSET_FIELD_NAME};
@@ -1006,32 +1006,177 @@ pub fn register_real_charset_natives(registry: &mut NativeMethodRegistry) {
     });
 }
 
-/// `CharsetEncoder.encode(CharBuffer) -> ByteBuffer` — uses the
-/// encoder's charset (slot 0) to produce a fresh ByteBuffer.
+/// Read every remaining byte from a ByteBuffer and advance its position to the
+/// limit — mirrors `native_charset_decode_bytebuf`'s robust two-path read
+/// (normal pos/limit, then a slot scan tolerating real-JDK HeapByteBuffer
+/// layouts).
+fn read_and_consume_bytebuffer(ctx: &mut dyn NativeContext, bb: ObjectRef) -> Vec<u8> {
+    let mut bytes: Vec<u8> = Vec::new();
+    if let Some((barr, bpos, blim)) = buf_state(ctx, bb) {
+        let want = (blim - bpos).max(0) as usize;
+        if want > 0 {
+            bytes = read_byte_array(ctx, barr, bpos as usize, want);
+            set_pos(ctx, bb, blim);
+        }
+    }
+    if bytes.is_empty() {
+        for slot in 0..=8 {
+            if let Value::Object(Some(arr)) = ctx.get_field(bb, slot) {
+                let len = ctx.array_length(arr);
+                if len > 0 {
+                    let n = len.min(256);
+                    bytes = read_byte_array(ctx, arr, 0, n);
+                    break;
+                }
+            }
+        }
+    }
+    bytes
+}
+
+/// Decode `bytes` honouring a CharsetDecoder's malformed-input action.
+/// `Ok(units)` on success (REPLACE substitutes U+FFFD, IGNORE skips the bad
+/// input); `Err((exc_class, input_len))` when the action is REPORT and the
+/// input is malformed — the caller throws `exc_class(input_len)`.
+fn decode_honoring_action(
+    name: &str,
+    bytes: &[u8],
+    malformed: engine::CodingAction,
+) -> Result<Vec<u16>, (&'static str, i32)> {
+    if name == "UTF-8" {
+        let mut units = Vec::new();
+        // Each input byte yields at most one UTF-16 unit, so the byte count is
+        // always sufficient output capacity for a one-shot decode (no OVERFLOW).
+        let cap = bytes.len() + 1;
+        let (_consumed, status) = engine::utf8_decode(bytes, true, malformed, &mut units, cap);
+        return match status {
+            engine::Utf8DecodeStatus::Malformed => {
+                Err(("java/nio/charset/MalformedInputException", 1))
+            }
+            _ => Ok(units),
+        };
+    }
+    match engine::decode_bytes(name, bytes) {
+        Ok(units) => Ok(units),
+        // Unknown charset: fall back to the lossy (Latin-1) path rather than
+        // throwing, matching the name-taking decode helpers.
+        Err(e) if matches!(e.kind, engine::CodingErrorKind::UnsupportedCharset) => {
+            Ok(engine::decode_bytes_lossy(name, bytes))
+        }
+        Err(e) => match malformed {
+            engine::CodingAction::Report => Err((
+                "java/nio/charset/MalformedInputException",
+                e.length.max(1) as i32,
+            )),
+            // REPLACE / IGNORE substitute U+FFFD (byte-oriented charsets rarely
+            // malform, so a distinct IGNORE path is not worth the complexity).
+            _ => Ok(engine::decode_bytes_lossy(name, bytes)),
+        },
+    }
+}
+
+/// Encode `chars` honouring a CharsetEncoder's error actions. Symmetric to
+/// [`decode_honoring_action`]: a REPORT action throws, REPLACE / IGNORE
+/// substitute the charset's replacement byte.
+fn encode_honoring_actions(
+    name: &str,
+    chars: &[u16],
+    malformed: engine::CodingAction,
+    unmappable: engine::CodingAction,
+) -> Result<Vec<u8>, (&'static str, i32)> {
+    match engine::encode_chars(name, chars) {
+        Ok(bytes) => Ok(bytes),
+        Err(e) => {
+            let (action, cls) = match e.kind {
+                engine::CodingErrorKind::Unmappable => {
+                    (unmappable, "java/nio/charset/UnmappableCharacterException")
+                }
+                engine::CodingErrorKind::Malformed => {
+                    (malformed, "java/nio/charset/MalformedInputException")
+                }
+                // UnsupportedCharset / Incomplete: keep the prior lossy fallback.
+                _ => return Ok(engine::encode_chars_lossy(name, chars)),
+            };
+            match action {
+                engine::CodingAction::Report => Err((cls, e.length.max(1) as i32)),
+                _ => Ok(engine::encode_chars_lossy(name, chars)),
+            }
+        }
+    }
+}
+
+/// Build and throw (as `Err(ExceptionThrown)`) a `java.nio.charset`
+/// coding-error exception via its JDK `(int inputLength)` constructor.
+fn throw_coding_exception(
+    ctx: &mut dyn NativeContext,
+    class: &str,
+    length: i32,
+) -> MethodCallFailed {
+    match ctx.new_object_initialized(class, "(I)V", &[Value::Int(length)]) {
+        Ok(Some(Value::Object(Some(exc)))) => MethodCallFailed::ExceptionThrown(exc),
+        _ => RuntimeError::IOException {
+            message: format!("{class}: coding error"),
+        }
+        .into(),
+    }
+}
+
+/// `CharsetEncoder.encode(CharBuffer) -> ByteBuffer` — the public convenience
+/// method. Honours the encoder's configured error actions (symmetric to
+/// [`native_charset_decode_bytebuf_via_decoder`]): a REPORT encoder throws an
+/// `UnmappableCharacterException` / `MalformedInputException` on bad input
+/// rather than silently substituting the charset's replacement byte. The prior
+/// shim delegated to the `Charset.encode` one-shot, which always REPLACEs.
 fn native_charset_encode_charbuf_via_encoder(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
     let this = arg_obj(args, 0)?;
-    let cs = match ctx.get_field(this, 0) {
-        Value::Object(Some(c)) => c,
+    let cb = match args.get(1) {
+        Some(Value::Object(Some(b))) => *b,
         _ => return Ok(Some(Value::Object(Some(alloc_byte_buffer(ctx, &[]))))),
     };
-    native_charset_encode_charbuf(ctx, &[Value::Object(Some(cs)), args[1]])
+    let (carr, cpos, clim) = match buf_state(ctx, cb) {
+        Some(s) => s,
+        None => return Ok(Some(Value::Object(Some(alloc_byte_buffer(ctx, &[]))))),
+    };
+    let chars = read_char_array(ctx, carr, cpos as usize, (clim - cpos).max(0) as usize);
+    let name = enc_name(ctx, this);
+    let malformed = coding_action(ctx, this, "malformedInputAction");
+    let unmappable = coding_action(ctx, this, "unmappableCharacterAction");
+    match encode_honoring_actions(&name, &chars, malformed, unmappable) {
+        Ok(bytes) => {
+            // CharsetEncoder.encode(CharBuffer) consumes the input buffer.
+            set_pos(ctx, cb, clim);
+            Ok(Some(Value::Object(Some(alloc_byte_buffer(ctx, &bytes)))))
+        }
+        Err((cls, len)) => Err(throw_coding_exception(ctx, cls, len)),
+    }
 }
 
-/// `CharsetDecoder.decode(ByteBuffer) -> CharBuffer` — uses the
-/// decoder's charset (slot 0).
+/// `CharsetDecoder.decode(ByteBuffer) -> CharBuffer` — the public convenience
+/// method. Unlike `Charset.decode` (which always REPLACEs), this honours the
+/// decoder's `onMalformedInput` action: REPORT (the default) surfaces a
+/// `MalformedInputException`, while REPLACE / IGNORE substitute U+FFFD or skip
+/// the bad input. The prior shim delegated to the `Charset.decode` one-shot,
+/// dropping the action entirely — a REPORT decoder never threw and an IGNORE
+/// decoder still emitted U+FFFD (Tomcat `TestStringCache.testCodingErrorLookup`).
 fn native_charset_decode_bytebuf_via_decoder(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
     let this = arg_obj(args, 0)?;
-    let cs = match ctx.get_field(this, 0) {
-        Value::Object(Some(c)) => c,
+    let bb = match args.get(1) {
+        Some(Value::Object(Some(b))) => *b,
         _ => return Ok(Some(Value::Object(Some(alloc_char_buffer(ctx, &[]))))),
     };
-    native_charset_decode_bytebuf(ctx, &[Value::Object(Some(cs)), args[1]])
+    let bytes = read_and_consume_bytebuffer(ctx, bb);
+    let name = enc_name(ctx, this);
+    let malformed = coding_action(ctx, this, "malformedInputAction");
+    match decode_honoring_action(&name, &bytes, malformed) {
+        Ok(units) => Ok(Some(Value::Object(Some(alloc_char_buffer(ctx, &units))))),
+        Err((cls, len)) => Err(throw_coding_exception(ctx, cls, len)),
+    }
 }
 
 #[cfg(test)]
