@@ -12106,11 +12106,11 @@ fn execute_instruction(
             // than the total `[` count, in which case the unspecified inner
             // dimensions stay null and the deepest *allocated* array must
             // hold references (not the leaf type) — see `alloc_multi_array`.
-            let (leaf_et, total_array_depth) = {
-                let current_class_id = thread.frames[frame_idx].class_id;
+            let referencing_class_id = thread.frames[frame_idx].class_id;
+            let (leaf_et, total_array_depth, leaf_desc) = {
                 let cm = shared.class_manager.read();
                 let class = cm
-                    .get_class(current_class_id)
+                    .get_class(referencing_class_id)
                     .ok_or_else(|| VmError::Internal {
                         message: "current class not found".to_string(),
                     })?;
@@ -12139,10 +12139,39 @@ fn execute_instruction(
                     Some(b'Z') => ArrayElementType::Boolean,
                     _ => ArrayElementType::Reference,
                 };
-                (et, total_depth)
+                (et, total_depth, array_class_name[total_depth..].to_string())
             };
 
-            let arr = alloc_multi_array(shared, &sizes, 0, leaf_et, total_array_depth)?;
+            // Resolve the *component* class id for each allocated array level so
+            // the array objects carry their precise class (e.g. the outer level
+            // of `new String[8][8]` is a `[[Ljava/lang/String;` whose component
+            // is `[Ljava/lang/String;`). Without this every multi-dim array was
+            // allocated with `ClassId(0)` and `getClass().getName()` collapsed
+            // to `[Ljava/lang/Object;`. Each level d's component descriptor is
+            // `[`×(total_depth-d-1) followed by the leaf descriptor; a primitive
+            // leaf (`I`, `C`, …) needs no class (the element type drives naming).
+            let mut component_ids: Vec<ClassId> = Vec::with_capacity(sizes.len());
+            for d in 0..sizes.len() {
+                let comp_brackets = total_array_depth - d - 1;
+                let cid = if comp_brackets > 0 {
+                    // Component is itself an array class — resolve `[…`.
+                    let comp_desc = format!("{}{}", "[".repeat(comp_brackets), leaf_desc);
+                    resolve_class_loader_aware(shared, thread, referencing_class_id, &comp_desc)
+                        .unwrap_or(ClassId::new(0))
+                } else if leaf_desc.starts_with('L') && leaf_desc.ends_with(';') {
+                    // Reference leaf — component is the element class itself.
+                    let comp_name = &leaf_desc[1..leaf_desc.len() - 1];
+                    resolve_class_loader_aware(shared, thread, referencing_class_id, comp_name)
+                        .unwrap_or(ClassId::new(0))
+                } else {
+                    // Primitive leaf: element type carries the descriptor.
+                    ClassId::new(0)
+                };
+                component_ids.push(cid);
+            }
+
+            let arr =
+                alloc_multi_array(shared, &sizes, 0, leaf_et, total_array_depth, &component_ids)?;
             thread.frames[frame_idx]
                 .stack
                 .push(Value::Object(Some(arr)))?;
@@ -25794,7 +25823,11 @@ fn alloc_multi_array(
     depth: usize,
     leaf_et: ArrayElementType,
     total_array_depth: usize,
+    component_ids: &[ClassId],
 ) -> Result<ObjectRef, MethodCallFailed> {
+    // Component class id for the array allocated at this depth (so it carries
+    // its precise array class). Falls back to `ClassId(0)` when unresolved.
+    let level_class_id = component_ids.get(depth).copied().unwrap_or(ClassId::new(0));
     if depth >= MAX_MULTI_ARRAY_DEPTH {
         return Err(MethodCallFailed::InternalError(VmError::Runtime(
             RuntimeError::NotImplemented {
@@ -25829,7 +25862,7 @@ fn alloc_multi_array(
         };
         let arr = shared
             .heap
-            .try_alloc_array(ClassId::new(0), element_type, length)
+            .try_alloc_array(level_class_id, element_type, length)
             .ok_or_else(|| {
                 MethodCallFailed::InternalError(VmError::Runtime(RuntimeError::OutOfMemoryError {
                     message: format!(
@@ -25843,7 +25876,7 @@ fn alloc_multi_array(
         // Intermediate dimensions: always Reference (array of arrays)
         let arr = shared
             .heap
-            .try_alloc_array(ClassId::new(0), ArrayElementType::Reference, length)
+            .try_alloc_array(level_class_id, ArrayElementType::Reference, length)
             .ok_or_else(|| {
                 MethodCallFailed::InternalError(VmError::Runtime(RuntimeError::OutOfMemoryError {
                     message: format!(
@@ -25853,8 +25886,14 @@ fn alloc_multi_array(
                 }))
             })?;
         for i in 0..length {
-            let sub_array =
-                alloc_multi_array(shared, sizes, depth + 1, leaf_et, total_array_depth)?;
+            let sub_array = alloc_multi_array(
+                shared,
+                sizes,
+                depth + 1,
+                leaf_et,
+                total_array_depth,
+                component_ids,
+            )?;
             shared
                 .heap
                 .set_array_element(arr, i, Value::Object(Some(sub_array)))
@@ -26414,6 +26453,7 @@ mod tests {
             0,
             ArrayElementType::Reference,
             sizes.len(),
+            &[],
         )
         .unwrap();
 
@@ -26445,6 +26485,7 @@ mod tests {
             0,
             ArrayElementType::Reference,
             sizes.len(),
+            &[],
         )
         .unwrap();
         assert_eq!(vm.shared.heap.array_length(outer), 0);
@@ -26465,6 +26506,7 @@ mod tests {
             0,
             ArrayElementType::Reference,
             sizes.len(),
+            &[],
         )
         .unwrap();
         assert_eq!(vm.shared.heap.array_length(arr), 7);
@@ -26485,6 +26527,7 @@ mod tests {
             0,
             ArrayElementType::Reference,
             sizes.len(),
+            &[],
         )
         .unwrap();
         assert_eq!(vm.shared.heap.array_length(outer), 2);
@@ -26984,7 +27027,8 @@ mod tests {
         // 2D array with int leaves: int[3][4]
         let sizes = vec![3, 4];
         let outer =
-            alloc_multi_array(&vm.shared, &sizes, 0, ArrayElementType::Int, sizes.len()).unwrap();
+            alloc_multi_array(&vm.shared, &sizes, 0, ArrayElementType::Int, sizes.len(), &[])
+                .unwrap();
         assert_eq!(vm.shared.heap.array_length(outer), 3);
 
         let inner_val = vm.shared.heap.get_array_element(outer, 0).unwrap();
@@ -27015,6 +27059,7 @@ mod tests {
             0,
             ArrayElementType::Reference,
             sizes.len(),
+            &[],
         )
         .unwrap();
         assert_eq!(vm.shared.heap.array_length(d0), 2);
@@ -27060,7 +27105,7 @@ mod tests {
 
         // sizes.len()=3, total_array_depth=4, leaf_et=Char
         let sizes = vec![5, 30, 6];
-        let outer = alloc_multi_array(&vm.shared, &sizes, 0, ArrayElementType::Char, 4).unwrap();
+        let outer = alloc_multi_array(&vm.shared, &sizes, 0, ArrayElementType::Char, 4, &[]).unwrap();
         assert_eq!(vm.shared.heap.array_length(outer), 5);
 
         // Walk to the inner (3rd) dim and verify it's a reference array of
@@ -27102,6 +27147,7 @@ mod tests {
             0,
             ArrayElementType::Reference,
             sizes.len(),
+            &[],
         )
         .unwrap();
         assert_eq!(vm.shared.heap.array_length(outer), 1);

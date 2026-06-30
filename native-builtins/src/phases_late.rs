@@ -4335,6 +4335,16 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         "(Ljava/net/URI;)Ljava/nio/file/Path;",
         |ctx, args| {
             let uri = obj_arg(args, 0)?;
+            // Opaque file-scheme URIs (`file:.`, `file:foo`) are not
+            // hierarchical: the real JDK throws here rather than yielding a
+            // path. Match that so callers like Spring's PathEditor fall back
+            // to their resource mechanism.
+            if p57_uri_is_opaque_file(&p57_uri_full_text(ctx, uri)) {
+                return Err(RuntimeError::IllegalArgumentException {
+                    message: "URI is not hierarchical".to_string(),
+                }
+                .into());
+            }
             // Resolve the URI's filesystem path. Our URI synthetic has been
             // populated by `url_parse` (URL.toURI), which writes by INDEX —
             // not by name — into slots 0..5. The real-JDK `URI` field
@@ -5327,6 +5337,15 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         "(Ljava/net/URI;)Ljava/nio/file/Path;",
         |ctx, args| {
             let uri = obj_arg(args, 1)?;
+            // Opaque file-scheme URIs (`file:.`) are not hierarchical — the
+            // real JDK's *UriSupport.fromUri throws instead of producing a
+            // path. (Spring's PathEditor depends on this throw.)
+            if p57_uri_is_opaque_file(&p57_uri_full_text(ctx, uri)) {
+                return Err(RuntimeError::IllegalArgumentException {
+                    message: "URI is not hierarchical".to_string(),
+                }
+                .into());
+            }
             // URI field 4 is the path component (from our toUri registration)
             let path_str = match ctx.get_field(uri, 4) {
                 Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
@@ -8600,6 +8619,18 @@ fn p57_uri_full_text(ctx: &mut dyn NativeContext, uri: ObjectRef) -> String {
         .cloned()
         .or_else(|| cands.into_iter().max_by_key(|c| c.len()))
         .unwrap_or_default()
+}
+
+/// Returns true if `text` is a `file:`-scheme URI in *opaque* form — its
+/// scheme-specific part does not begin with '/', e.g. `file:.` or `file:foo`.
+/// The real JDK's `Paths.get(URI)` / `Path.of(URI)` route file-scheme URIs
+/// through `Windows/UnixUriSupport.fromUri`, which rejects opaque URIs with
+/// `IllegalArgumentException("URI is not hierarchical")`. Spring's
+/// `PathEditor`/`FileEditor` rely on that throw to fall back to the resource
+/// mechanism (e.g. `setAsText("file:.")`).
+fn p57_uri_is_opaque_file(text: &str) -> bool {
+    text.strip_prefix("file:")
+        .is_some_and(|rest| !rest.starts_with('/'))
 }
 
 /// Convert `jar:file:/C:/x.jar!/entry` / `file:///C:/x.jar` URI text to the
