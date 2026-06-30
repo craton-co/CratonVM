@@ -16165,6 +16165,24 @@ fn execute_invoke_kind(
                         .unwrap_or(false)
             }
         })
+    } else if is_special && crate::runtime::env_cache::loader_aware_resolution() {
+        // invokespecial owner is the CP-resolved class NAME (`method_class_name`),
+        // which `get_loaded_class_id` collapses to ONE copy per name — the
+        // un-enhanced global one. A `super.<method>()` / `super.<init>()` /
+        // private call from inside a per-loader ENHANCED class must reach the
+        // SAME loader's copy of the owner: e.g. enhanced
+        // `Employee.$$_hibernate_read_oca` calls `super.$$_hibernate_read_oca()`
+        // on the enhanced (mapped-superclass) `Person`, whose accessor exists
+        // ONLY on that loader's copy — name resolution picks the un-enhanced
+        // `Person` (no such method → hard NoSuchMethodError → process abort).
+        // Resolve the owner through the CALLER's loader (JVMS §5.4.3 initiating
+        // loader) and override dispatch when it diverges from the name-resolved
+        // copy. Gated + divergence-only → byte-identical gate-off / single-copy.
+        lookup_loader_initiated(shared, current_class_id, &invoke_class).filter(|owner_cid| {
+            *owner_cid != ClassId::new(0)
+                && shared.class_manager.read().get_loaded_class_id(&invoke_class)
+                    != Some(*owner_cid)
+        })
     } else {
         None
     };
