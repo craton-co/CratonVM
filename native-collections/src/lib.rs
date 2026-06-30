@@ -19088,11 +19088,27 @@ fn native_lhm_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         ctx.class_name_of_id(this_cid).as_deref() == Some("java/util/LinkedHashMap");
     if !is_plain_lhm {
         if let Value::Object(Some(head)) = lhm_get(ctx, this, "head", LHM_FIELD_HEAD) {
+            // The overlay node is a synthetic `java/util/LinkedHashMap$Node`
+            // with no real `getKey()`/`getValue()`; an override that inspects
+            // the eldest (e.g. Hibernate's `LRU.removeEldestEntry` calls
+            // `eldest.getKey()`) would hit a NoSuchMethodError. Wrap the head's
+            // key/value in a real `SimpleImmutableEntry` (which has working
+            // `getKey`/`getValue` natives) for the hook call.
+            let key = ctx.get_field(head, LHM_NODE_KEY);
+            let val = ctx.get_field(head, LHM_NODE_VALUE);
+            let eldest = match ctx.new_object_initialized(
+                "java/util/AbstractMap$SimpleImmutableEntry",
+                "(Ljava/lang/Object;Ljava/lang/Object;)V",
+                &[key, val],
+            )? {
+                Some(Value::Object(Some(e))) => e,
+                _ => return Ok(Some(Value::Object(None))),
+            };
             let verdict = ctx.invoke_virtual(
                 this,
                 "removeEldestEntry",
                 "(Ljava/util/Map$Entry;)Z",
-                &[Value::Object(Some(head))],
+                &[Value::Object(Some(eldest))],
             )?;
             if matches!(verdict, Some(Value::Int(n)) if n != 0) {
                 // Evict the eldest by key. If the override already removed it
@@ -19100,7 +19116,6 @@ fn native_lhm_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
                 // `eviction.onEntryRemove` -> `this.remove`), this is an
                 // idempotent no-op; for a plain LRU cache it performs the
                 // removal here.
-                let key = ctx.get_field(head, LHM_NODE_KEY);
                 native_lhm_remove(ctx, &[Value::Object(Some(this)), key])?;
             }
         }
