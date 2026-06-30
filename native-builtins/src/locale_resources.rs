@@ -674,14 +674,14 @@ fn rb_get_bundle(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     // Resolve the requested locale from a Locale argument (getBundle(String,
     // Locale[, ClassLoader|Control])). Other shapes (or a Control in slot 1)
     // fall back to the ROOT chain.
-    let (lang, country) = match args.get(1) {
+    let (lang, country, variant) = match args.get(1) {
         Some(Value::Object(Some(loc))) => {
             let cid = ctx.class_id_of_object(*loc);
             if ctx.class_name_of_id(cid).as_deref() == Some("java/util/Locale") {
-                // Read via getLanguage()/getCountry() so it works for both our
-                // synthetic Locales and the JDK's predefined constants
-                // (Locale.FRENCH, …) whose codes live in BaseLocale, not the
-                // synthetic side table.
+                // Read via getLanguage()/getCountry()/getVariant() so it works
+                // for both our synthetic Locales and the JDK's predefined
+                // constants (Locale.FRENCH, …) whose codes live in BaseLocale,
+                // not the synthetic side table.
                 let lang =
                     match ctx.invoke_virtual(*loc, "getLanguage", "()Ljava/lang/String;", &[]) {
                         Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s).unwrap_or_default(),
@@ -692,12 +692,17 @@ fn rb_get_bundle(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
                         Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s).unwrap_or_default(),
                         _ => String::new(),
                     };
-                (lang, country)
+                let variant =
+                    match ctx.invoke_virtual(*loc, "getVariant", "()Ljava/lang/String;", &[]) {
+                        Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s).unwrap_or_default(),
+                        _ => String::new(),
+                    };
+                (lang, country, variant)
             } else {
-                (String::new(), String::new())
+                (String::new(), String::new(), String::new())
             }
         }
-        _ => (String::new(), String::new()),
+        _ => (String::new(), String::new(), String::new()),
     };
 
     // Candidate chain, LEAST specific (ROOT) first, merged in order so a
@@ -713,6 +718,17 @@ fn rb_get_bundle(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     if !lang.is_empty() && !country.is_empty() {
         chain.push((
             format!("{bundle_name}_{lang}_{country}"),
+            lang.clone(),
+            country.clone(),
+        ));
+    }
+    // Locale variant (e.g. `en_GB_GLASGOW` -> `..._en_GB_GLASGOW.properties`).
+    // The JDK's candidate chain includes the variant as its most-specific
+    // entry; without it Spring's `ResourceBundleEditor` (which round-trips
+    // `name_en_GB_GLASGOW` through `parseLocaleString`) misses the bundle.
+    if !lang.is_empty() && !country.is_empty() && !variant.is_empty() {
+        chain.push((
+            format!("{bundle_name}_{lang}_{country}_{variant}"),
             lang.clone(),
             country.clone(),
         ));

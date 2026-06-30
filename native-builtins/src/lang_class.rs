@@ -109,6 +109,43 @@ pub(crate) fn dotted_class_name(class_id: ClassId, slashed: &str) -> Arc<str> {
     cache_insert(&DOTTED_CLASS_NAME_CACHE, class_id, dotted)
 }
 
+/// Render an array class's internal descriptor as `Class.getTypeName()` does:
+/// the element type's `getName()` form followed by one `[]` per dimension.
+///   * `[[Ljava/lang/String;` -> `java.lang.String[][]`
+///   * `[I`                   -> `int[]`
+/// Returns `None` if `desc` is not an array descriptor or has an unknown
+/// primitive element letter.
+pub(crate) fn array_descriptor_to_type_name(desc: &str) -> Option<String> {
+    let dims = desc.bytes().take_while(|&b| b == b'[').count();
+    if dims == 0 {
+        return None;
+    }
+    let elem = &desc[dims..];
+    let elem_name: String = if let Some(stripped) = elem.strip_prefix('L') {
+        stripped.strip_suffix(';').unwrap_or(stripped).replace('/', ".")
+    } else {
+        match elem {
+            "I" => "int",
+            "J" => "long",
+            "D" => "double",
+            "F" => "float",
+            "Z" => "boolean",
+            "B" => "byte",
+            "C" => "char",
+            "S" => "short",
+            "V" => "void",
+            _ => return None,
+        }
+        .to_string()
+    };
+    let mut out = String::with_capacity(elem_name.len() + dims * 2);
+    out.push_str(&elem_name);
+    for _ in 0..dims {
+        out.push_str("[]");
+    }
+    Some(out)
+}
+
 /// Last segment of a class's name after `/`, `.`, or `$` (the
 /// `Class.getSimpleName()` rule). Cached per `ClassId`.
 pub(crate) fn simple_class_name(class_id: ClassId, raw: &str) -> Arc<str> {
@@ -11296,11 +11333,28 @@ pub(crate) fn native_class_get_type_name(
             return Ok(Some(Value::Object(Some(ctx.create_string(&lname)))));
         }
     }
-    // `Class.getTypeName()` returns the dotted form for non-array refs and
-    // the dotted form of the descriptor for arrays. Both forms are pure
-    // derivations from the slashed internal name and equal what
-    // `dotted_class_name` produces — share the same cache as
-    // `Class.getName()`.
+    // Arrays: `getTypeName()` is the element's `getName()` plus one `[]` per
+    // dimension — e.g. `[[Ljava/lang/String;` -> `java.lang.String[][]` and
+    // `[I` -> `int[]`. This differs from `getName()`'s descriptor form
+    // (`[[Ljava.lang.String;`), so it must NOT reuse the
+    // `DOTTED_CLASS_NAME_CACHE` (which mirrors `getName()`). Surfaced by
+    // Spring's `ClassEditor.getAsText()` on multi-dimensional arrays.
+    {
+        let arr_name = ctx
+            .class_id_from_mirror(this)
+            .and_then(|cid| ctx.class_name_of_id(cid))
+            .or_else(|| mirror_class_name(ctx, this));
+        if let Some(name) = arr_name {
+            if name.starts_with('[') {
+                if let Some(tn) = array_descriptor_to_type_name(&name) {
+                    return Ok(Some(Value::Object(Some(ctx.create_string(&tn)))));
+                }
+            }
+        }
+    }
+    // `Class.getTypeName()` returns the dotted form for non-array refs. It is a
+    // pure derivation from the slashed internal name and equals what
+    // `dotted_class_name` produces — share the same cache as `Class.getName()`.
     if let Some(class_id) = ctx.class_id_from_mirror(this) {
         if let Some(arc) = cache_get(&DOTTED_CLASS_NAME_CACHE, class_id) {
             return Ok(Some(Value::Object(Some(ctx.create_string(&arc)))));
