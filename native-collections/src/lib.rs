@@ -7418,10 +7418,37 @@ fn register_optional_natives(r: &mut NativeMethodRegistry) {
     r.set_category(__prev_cat);
 }
 
-fn native_opt_empty(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+/// `Optional.empty()` must return the *same* instance on every call: the real
+/// JDK is `(Optional<T>) EMPTY`, so `Optional.empty() == Optional.empty()` holds
+/// by identity. Spring's `GenericConversionService`/`ObjectToOptionalConverter`
+/// produce `Optional.empty()` for null/empty conversions and callers assert
+/// `isSameAs(Optional.empty())` (an identity check). Allocating a fresh synthetic
+/// per call broke that identity. We cache the singleton in Optional's own
+/// `EMPTY` static field (a GC root) so it survives collection and stays stable.
+fn opt_empty_singleton(ctx: &mut dyn NativeContext) -> Value {
+    if let Some(cid) = ctx.class_id_by_name("java/util/Optional") {
+        let _ = ctx.ensure_class_initialized("java/util/Optional");
+        if let Some(idx) = ctx.static_field_index_by_name(cid, "EMPTY") {
+            if let v @ Value::Object(Some(_)) = ctx.get_static_field(cid, idx) {
+                // Already populated (by Optional.<clinit> `new Optional<>(null)`
+                // or a prior empty() call) — return the existing singleton.
+                return v;
+            }
+            // EMPTY not yet set: allocate once and store it back so every
+            // subsequent empty() (and our clinit fallback) shares this object.
+            let opt = alloc_synthetic(ctx, "java/util/Optional", OPT_NUM_FIELDS);
+            ctx.set_static_field(cid, idx, Value::Object(Some(opt)));
+            return Value::Object(Some(opt));
+        }
+    }
+    // Fallback (no EMPTY field, e.g. a fabricated synthetic Optional): fresh
+    // instance — identity is not guaranteed, but value semantics hold.
     let opt = alloc_synthetic(ctx, "java/util/Optional", OPT_NUM_FIELDS);
-    // field 0 stays as default (null)
-    Ok(Some(Value::Object(Some(opt))))
+    Value::Object(Some(opt))
+}
+
+fn native_opt_empty(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    Ok(Some(opt_empty_singleton(ctx)))
 }
 
 fn native_opt_of(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -7438,8 +7465,12 @@ fn native_opt_of(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
 }
 
 fn native_opt_of_nullable(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let opt = alloc_synthetic(ctx, "java/util/Optional", OPT_NUM_FIELDS);
     let val = args.first().copied().unwrap_or(Value::Object(None));
+    // Real JDK: `ofNullable(null)` is `empty()` — return the shared singleton.
+    if matches!(val, Value::Object(None)) {
+        return Ok(Some(opt_empty_singleton(ctx)));
+    }
+    let opt = alloc_synthetic(ctx, "java/util/Optional", OPT_NUM_FIELDS);
     ctx.set_field(opt, OPT_FIELD_VALUE, val);
     Ok(Some(Value::Object(Some(opt))))
 }

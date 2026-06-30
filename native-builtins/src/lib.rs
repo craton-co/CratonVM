@@ -8942,6 +8942,70 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         }
     }
 
+    // Real JDK `TimeZone.getTimeZone(id)` canonicalises a custom GMT offset id
+    // ("GMT+2", "GMT+0800", "GMT-5:30", ...) into the form "GMT±HH:MM" (e.g.
+    // "GMT+2" -> "GMT+02:00"), and `getID()` returns that normalised string.
+    // This is a faithful port of `java.util.TimeZone.parseCustomTimeZone`. IANA
+    // ids ("America/New_York"), "UTC"/"GMT" alone, and anything that fails the
+    // custom-offset grammar return `None` and are kept verbatim by the caller.
+    fn normalize_gmt_custom_id(id: &str) -> Option<String> {
+        const GMT_ID_LENGTH: usize = 3;
+        if !id.starts_with("GMT") {
+            return None;
+        }
+        let chars: Vec<char> = id.chars().collect();
+        let length = chars.len();
+        if length < GMT_ID_LENGTH + 1 {
+            return None; // "GMT" alone is the named GMT zone, not a custom offset.
+        }
+        let mut index = GMT_ID_LENGTH;
+        let negative = match chars[index] {
+            '-' => true,
+            '+' => false,
+            _ => return None,
+        };
+        index += 1;
+        let mut hours: i32 = 0;
+        let mut num: i32 = 0;
+        let mut count_delim = 0;
+        let mut len = 0;
+        while index < length {
+            let c = chars[index];
+            index += 1;
+            if c == ':' {
+                if count_delim > 0 || len > 2 {
+                    return None;
+                }
+                hours = num;
+                count_delim += 1;
+                num = 0;
+                len = 0;
+                continue;
+            }
+            if !c.is_ascii_digit() {
+                return None;
+            }
+            num = num * 10 + (c as i32 - '0' as i32);
+            len += 1;
+        }
+        if count_delim == 0 {
+            if len <= 2 {
+                hours = num;
+                num = 0;
+            } else {
+                hours = num / 100;
+                num %= 100;
+            }
+        } else if len != 2 {
+            return None;
+        }
+        if hours > 23 || num > 59 {
+            return None;
+        }
+        let sign = if negative { '-' } else { '+' };
+        Some(format!("GMT{}{:02}:{:02}", sign, hours, num))
+    }
+
     fn alloc_synth_timezone(ctx: &mut dyn NativeContext, id_str: &str) -> cratonvm_types::Value {
         // Prefer sun/util/calendar/ZoneInfo (concrete subclass of TimeZone).
         // Fall back to allocating with class-id 0 if init fails — the
@@ -8988,6 +9052,9 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
                 }
                 _ => "UTC".to_string(),
             };
+            // Canonicalise custom GMT-offset ids ("GMT+2" -> "GMT+02:00") so
+            // getID() matches the real JDK; IANA/named ids are kept verbatim.
+            let id = normalize_gmt_custom_id(&id).unwrap_or(id);
             Ok(Some(alloc_synth_timezone(ctx, &id)))
         },
     );
