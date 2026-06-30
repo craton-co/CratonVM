@@ -4270,6 +4270,45 @@ fn is_chm_receiver(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
     false
 }
 
+/// True when `source` is a `Map` whose entries CratonVM stores in a native
+/// backing it can read field-by-field by treating slot 0 as a `HashMap` bucket
+/// table: a real or synthetic `java/util/HashMap` (or any subclass), a
+/// `ConcurrentHashMap`, or a `Properties`/`Hashtable` backed by a side CHM.
+///
+/// For any OTHER `Map` — an arbitrary `AbstractMap` subclass such as Spring's
+/// `ConcurrentReferenceHashMap` (whose slot 0 is a `Segment[] segments` array,
+/// not a bucket table), Guava maps, or the JDK's
+/// `IdentityHashMap`/`WeakHashMap`/`EnumMap` — slot 0 is NOT a bucket array, so
+/// the layout-sniffing bucket scan in `map_collect_entries`/`map_state` would
+/// surface internal objects (segment locks, reference queues) as bogus entries.
+/// Callers copying from such a source must instead use the polymorphic
+/// `entrySet().iterator()` walk (`collect_entries_via_iterator`).
+///
+/// `LinkedHashMap` and `TreeMap` are also natively modeled but via their own
+/// overlays, not the HashMap bucket path; callers check `is_lhm_receiver` /
+/// `is_tree_map_receiver` before consulting this.
+fn is_native_bucket_map(ctx: &dyn NativeContext, source: ObjectRef) -> bool {
+    if is_chm_receiver(ctx, source) {
+        return true;
+    }
+    if properties_backing_chm(ctx, source).is_some() {
+        return true;
+    }
+    let mut cur = ctx.class_id_of_object(source);
+    for _ in 0..32 {
+        match ctx.class_name_of_id(cur) {
+            Some(n) if n == "java/util/HashMap" => return true,
+            Some(n) if n == "java/lang/Object" => return false,
+            _ => {}
+        }
+        match ctx.superclass_of(cur) {
+            Some(p) if p != cur => cur = p,
+            _ => return false,
+        }
+    }
+    false
+}
+
 /// True when `this`'s runtime class is `java/util/LinkedHashMap` or a subclass.
 ///
 /// CratonVM's LHM natives store entries in a side-table overlay, not in the
@@ -5504,18 +5543,30 @@ fn collect_entries_any(ctx: &mut dyn NativeContext, source: ObjectRef) -> Vec<(V
     if is_tree_map_receiver(ctx, source) {
         return tm_collect_pairs(ctx, source);
     }
-    let entries = map_collect_entries(ctx, source);
-    if !entries.is_empty() {
-        return entries;
+    // Only interpret the source's fields as a HashMap bucket table when it is
+    // actually one of the map kinds CratonVM models that way (real/synthetic
+    // `java/util/HashMap` or subclass, `ConcurrentHashMap`, or a
+    // `Properties`/`Hashtable` backed by a side CHM). An arbitrary `Map` whose
+    // slot 0 merely happens to be an object array — Spring's
+    // `ConcurrentReferenceHashMap`, whose slot 0 is `Segment[] segments` — would
+    // otherwise be walked as `HashMap$Node` chains, surfacing internal segment
+    // locks and reference queues as bogus (ReferenceQueue, map) entries. For
+    // those, skip straight to the polymorphic `entrySet().iterator()` walk.
+    if is_native_bucket_map(ctx, source) {
+        let entries = map_collect_entries(ctx, source);
+        if !entries.is_empty() {
+            return entries;
+        }
     }
-    // The HashMap/CHM bucket reader found nothing. That is either a genuinely
-    // empty map, or a `Map` whose internal layout CratonVM does not model
-    // natively — e.g. the real-JDK `Collections$Unmodifiable{Navigable,Sorted}Map`
-    // wrappers that `Settings.settings` uses (`new HashMap<>(settings.settings)`
-    // in `Settings.Builder.put(Settings)`), or any third-party `Map`. Consult
-    // the map's own `isEmpty()`; only if it actually has entries do we pay for
-    // the polymorphic `entrySet().iterator()` walk — the same contract the JDK's
-    // `HashMap.putMapEntries` relies on — so the copy works for ANY `Map`.
+    // Either a genuinely empty native map, or a `Map` whose internal layout
+    // CratonVM does not model natively — e.g. the real-JDK
+    // `Collections$Unmodifiable{Navigable,Sorted}Map` wrappers that
+    // `Settings.settings` uses (`new HashMap<>(settings.settings)` in
+    // `Settings.Builder.put(Settings)`), Spring's `ConcurrentReferenceHashMap`,
+    // or any third-party `Map`. Consult the map's own `isEmpty()`; only if it
+    // actually has entries do we pay for the polymorphic `entrySet().iterator()`
+    // walk — the same contract the JDK's `HashMap.putMapEntries` relies on — so
+    // the copy works for ANY `Map`.
     let nonempty = matches!(
         ctx.invoke(
             "java/util/Map",
@@ -5528,7 +5579,7 @@ fn collect_entries_any(ctx: &mut dyn NativeContext, source: ObjectRef) -> Vec<(V
     if nonempty {
         return collect_entries_via_iterator(ctx, source);
     }
-    entries
+    Vec::new()
 }
 
 /// Walk an arbitrary `java.util.Map` via its polymorphic
