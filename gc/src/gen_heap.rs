@@ -94,6 +94,30 @@ const YOUNG_GC_THRESHOLD_PERCENT: usize = 50;
 /// the humongous path instead of guaranteeing a copying-collector OOM.
 const HUMONGOUS_YOUNG_FRACTION_PERCENT: usize = 50;
 
+/// Absolute ceiling on the humongous threshold, independent of heap size.
+///
+/// The `HUMONGOUS_YOUNG_FRACTION_PERCENT`-of-young-semi rule scales the
+/// threshold with `--Xmx` (young semi = `Xmx / 4`), so on a *large* heap a
+/// merely-large array stays below it and lands in young — where the Cheney
+/// collector must **copy** it into to-space on every minor GC until it ages
+/// out (`PROMOTION_AGE` cycles). A handful of ~1 GiB arrays then either
+/// overflow to-space (hard OOM in the relocation path) or, when old gen is
+/// also full and humongous routing falls back to young, get corrupted under
+/// pressure. Concretely a 1 GiB array is only "humongous" when
+/// `Xmx <= 8g` (semi/2 < 1 GiB); at `--Xmx 16g` it is young and gets copied.
+/// (Observed: `TestEncryptInterceptorLargeHeap` needs `--Xmx 16g` to pass,
+/// AES-GCM `AuthenticationFailed` / relocation-OOM below that.)
+///
+/// Capping the threshold means any array larger than this ALWAYS routes
+/// directly to old gen and is never young-copied, mirroring HotSpot G1's
+/// humongous handling (large objects bypass the copying young generation).
+/// 256 MiB is well above the default-heap young-semi fraction
+/// (256 MiB heap → 64 MiB semi → 32 MiB threshold), so small/default heaps
+/// are unaffected; it only changes where genuinely large (>256 MiB) arrays
+/// live on multi-GiB heaps, which is exactly the case the fraction rule
+/// mishandles.
+const HUMONGOUS_ABSOLUTE_CAP_BYTES: usize = 256 * 1024 * 1024;
+
 /// Maximum allowed heap expansion factor (4x the initial size).
 const MAX_HEAP_EXPANSION_FACTOR: usize = 4;
 
@@ -1150,7 +1174,12 @@ impl GenerationalHeap {
         // can produce a 0-byte threshold under integer truncation — clamp
         // up to at least one allocation so the humongous path doesn't fire
         // on every small allocation in pathological cases.
-        let threshold = (semi / 100).saturating_mul(HUMONGOUS_YOUNG_FRACTION_PERCENT);
+        let frac_threshold = (semi / 100).saturating_mul(HUMONGOUS_YOUNG_FRACTION_PERCENT);
+        // Cap the fraction-based threshold so large arrays bypass the young
+        // copying space regardless of heap size (see
+        // `HUMONGOUS_ABSOLUTE_CAP_BYTES`). On small/default heaps the fraction
+        // is far below the cap, so `min` leaves behaviour unchanged.
+        let threshold = frac_threshold.min(HUMONGOUS_ABSOLUTE_CAP_BYTES);
         total_size > threshold.max(HEADER_SIZE)
     }
 
