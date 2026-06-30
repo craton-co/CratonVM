@@ -8925,6 +8925,17 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             "US/Pacific" | "America/Los_Angeles" => Some(-8 * 3600),
             "America/Anchorage" => Some(-9 * 3600),
             "Pacific/Honolulu" | "US/Hawaii" => Some(-10 * 3600),
+            // Deprecated three-letter abbreviations still accepted by
+            // `TimeZone.getTimeZone` (real-JDK rawOffset is fixed/non-DST):
+            // EST=-5, CST=-6, MST=-7, PST=-8, HST=-10. Without these the
+            // synthetic zone falls back to rawOffset 0, shifting per-session
+            // `jdbcTimeZone("CST")` JDBC timestamps by the full offset
+            // (DatabaseTimeZoneMultiTenancyTest: read-back +6h).
+            "EST" => Some(-5 * 3600),
+            "CST" => Some(-6 * 3600),
+            "MST" => Some(-7 * 3600),
+            "PST" => Some(-8 * 3600),
+            "HST" => Some(-10 * 3600),
             "America/Sao_Paulo" | "America/Argentina/Buenos_Aires" => Some(-3 * 3600),
             "America/Santiago" => Some(-4 * 3600),
             "Europe/Paris" | "Europe/Berlin" | "Europe/Rome" | "Europe/Madrid" | "CET" => {

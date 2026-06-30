@@ -19072,6 +19072,40 @@ fn native_lhm_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     lhm_link_tail(ctx, this, new_node);
 
     lhm_set(ctx, this, "size", LHM_FIELD_SIZE, Value::Int(size + 1));
+
+    // Replicate `LinkedHashMap.afterNodeInsertion(true)`: after a NEW node is
+    // inserted, consult the (overridable) `removeEldestEntry` hook on the
+    // eldest insertion-order entry and evict it when the hook returns true.
+    // The base `LinkedHashMap.removeEldestEntry` always returns false, and the
+    // `LinkedHashSet` backing map's runtime class is exactly
+    // `java/util/LinkedHashMap`, so we skip the virtual call in those cases.
+    // Only genuine subclasses (LRU caches, Hibernate's
+    // `BoundedConcurrentHashMap.LRU`) override it. Without this, bounded LHM
+    // subclasses never evict and grow without bound — e.g.
+    // `ExplicitQueryStatsMaxSizeTest` (query-plan stats trimmed at 100 entries).
+    let this_cid = ctx.class_id_of_object(this);
+    let is_plain_lhm =
+        ctx.class_name_of_id(this_cid).as_deref() == Some("java/util/LinkedHashMap");
+    if !is_plain_lhm {
+        if let Value::Object(Some(head)) = lhm_get(ctx, this, "head", LHM_FIELD_HEAD) {
+            let verdict = ctx.invoke_virtual(
+                this,
+                "removeEldestEntry",
+                "(Ljava/util/Map$Entry;)Z",
+                &[Value::Object(Some(head))],
+            )?;
+            if matches!(verdict, Some(Value::Int(n)) if n != 0) {
+                // Evict the eldest by key. If the override already removed it
+                // reentrantly (Hibernate's LRU calls `segment.remove` ->
+                // `eviction.onEntryRemove` -> `this.remove`), this is an
+                // idempotent no-op; for a plain LRU cache it performs the
+                // removal here.
+                let key = ctx.get_field(head, LHM_NODE_KEY);
+                native_lhm_remove(ctx, &[Value::Object(Some(this)), key])?;
+            }
+        }
+    }
+
     Ok(Some(Value::Object(None)))
 }
 
