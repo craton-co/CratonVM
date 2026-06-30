@@ -33098,9 +33098,12 @@ fn native_cowal_contains(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     };
     cowal_ensure_lock_and_array(ctx, this)?;
     let needle = args.get(1).copied().unwrap_or(Value::Object(None));
+    // Match by Java `equals` semantics, not reference identity — real
+    // `CopyOnWriteArrayList.contains` uses `o.equals(elem)`.
     if let Some((arr, len)) = cowal_read_snapshot(ctx, this) {
         for i in 0..len {
-            if ctx.get_array_element(arr, i) == needle {
+            let elem = ctx.get_array_element(arr, i);
+            if list_element_matches(ctx, &elem, &needle) {
                 return Ok(Some(Value::Int(1)));
             }
         }

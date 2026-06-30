@@ -24257,6 +24257,28 @@ pub fn register_concurrent_natives(registry: &mut NativeMethodRegistry) {
         ctx.set_field(this, 0, Value::Object(Some(new_arr)));
         ctx.set_field(this, 1, Value::Int(len));
     }
+
+    /// Compare a stored COWAL element against a search target with Java
+    /// `equals` semantics. Real `CopyOnWriteArrayList.indexOf`/`contains`
+    /// use `target.equals(elem)`, **not** reference identity. Spring's
+    /// `MutablePropertySources.precedenceOf` / `assertPresentAndGetIndex`
+    /// search with `PropertySource.named(name)` — a distinct
+    /// `ComparisonPropertySource` equal only by name — so an identity-only
+    /// comparison wrongly returned -1 (StandardEnvironmentTests
+    /// `propertySourceOrder`, MutablePropertySourcesTests `test`).
+    fn cowal_element_matches(ctx: &mut dyn NativeContext, elem: Value, target: Value) -> bool {
+        if elem == target {
+            return true;
+        }
+        if let (Value::Object(Some(t)), Value::Object(Some(e))) = (target, elem) {
+            if let Ok(Some(Value::Int(v))) =
+                ctx.invoke_virtual(t, "equals", "(Ljava/lang/Object;)Z", &[Value::Object(Some(e))])
+            {
+                return v != 0;
+            }
+        }
+        false
+    }
     // Reads — re-routed to use real-COWAL layout when available.  The
     // previous registrations delegated to `native_al_*` which assumed
     // ArrayList slot semantics; on a real COWAL receiver they read the
@@ -24304,7 +24326,8 @@ pub fn register_concurrent_natives(registry: &mut NativeMethodRegistry) {
         let (data, size) = cowal_read_state(ctx, this);
         if let Some(arr) = data {
             for i in 0..size {
-                if ctx.get_array_element(arr, i) == needle {
+                let elem = ctx.get_array_element(arr, i);
+                if cowal_element_matches(ctx, elem, needle) {
                     return Ok(Some(Value::Int(1)));
                 }
             }
@@ -24320,7 +24343,8 @@ pub fn register_concurrent_natives(registry: &mut NativeMethodRegistry) {
         let (data, size) = cowal_read_state(ctx, this);
         if let Some(arr) = data {
             for i in 0..size {
-                if ctx.get_array_element(arr, i) == needle {
+                let elem = ctx.get_array_element(arr, i);
+                if cowal_element_matches(ctx, elem, needle) {
                     return Ok(Some(Value::Int(i as i32)));
                 }
             }
@@ -24382,43 +24406,15 @@ pub fn register_concurrent_natives(registry: &mut NativeMethodRegistry) {
                 ctx.set_array_element(snap, i, elem);
             }
         }
-        // Build an ArrayList wrapper so the registered
-        // `ArrayList$Itr.hasNext` / `next` natives (which use
-        // `al_state(list)` → reads `elementData` / `size`) see the
-        // snapshot.  We can't reuse the COWAL `this` directly: those
-        // natives would re-enter `al_state`, hit the ArrayList slot
-        // fallback, and read the wrong fields again.
-        let (al_data_slot, al_size_slot, al_n_fields) = {
-            let d = ctx.resolve_field_index("java/util/ArrayList", "elementData");
-            let s = ctx.resolve_field_index("java/util/ArrayList", "size");
-            match (d, s) {
-                (Some(a), Some(b)) => (a, b, std::cmp::max(a, b) + 1),
-                _ => (0, 1, 2),
-            }
-        };
-        let wrapper = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", al_n_fields);
-        ctx.set_field(wrapper, al_data_slot, Value::Object(Some(snap)));
-        ctx.set_field(wrapper, al_size_slot, Value::Int(size as i32));
-        // Real-JDK `ArrayList$Itr` layout:
-        //   cursor: int @ 0
-        //   lastRet: int @ 1
-        //   expectedModCount: int @ 2
-        //   this$0: ArrayList @ 3
-        let (iter_cursor_slot, iter_list_slot, iter_n_fields) = {
-            let c = ctx.resolve_field_index("java/util/ArrayList$Itr", "cursor");
-            let l = ctx.resolve_field_index("java/util/ArrayList$Itr", "this$0");
-            match (c, l) {
-                (Some(a), Some(b)) => {
-                    let n = std::cmp::max(std::cmp::max(a, b) + 1, 4);
-                    (a, b, n)
-                }
-                _ => (1, 0, 2),
-            }
-        };
-        let iter = alloc_concurrent_synthetic(ctx, "java/util/ArrayList$Itr", iter_n_fields);
-        ctx.set_field(iter, iter_cursor_slot, Value::Int(0));
-        ctx.set_field(iter, iter_list_slot, Value::Object(Some(wrapper)));
-        Ok(Some(Value::Object(Some(iter))))
+        // Return a self-contained snapshot iterator (3-field `HashMap$KeyItr`
+        // model: keys/cursor/total).  Unlike the previous `ArrayList$Itr`
+        // wrapper, this iterator's `remove()` throws
+        // `UnsupportedOperationException` — matching real COWAL's `COWIterator`,
+        // which never supports removal (MutablePropertySourcesTests
+        // `iteratorContainsPropertySource`).  The earlier wrapper reused the
+        // mutating `ArrayList$Itr.remove` native, so `it.remove()` silently
+        // succeeded instead of throwing.
+        cratonvm_native_collections::make_iterator_from_array(ctx, snap, size)
     });
     // Writes — true copy-on-write: copy array, mutate copy, swap reference.
     // Uses `cowal_read_state` / `cowal_write_array` so both real and
@@ -24494,7 +24490,8 @@ pub fn register_concurrent_natives(registry: &mut NativeMethodRegistry) {
             let (old_arr, size) = cowal_read_state(ctx, this);
             if let Some(old) = old_arr {
                 for i in 0..size {
-                    if ctx.get_array_element(old, i) == elem {
+                    let cur = ctx.get_array_element(old, i);
+                    if cowal_element_matches(ctx, cur, elem) {
                         ctx.monitor_exit(this);
                         return Ok(Some(Value::Int(0)));
                     }
@@ -24582,7 +24579,8 @@ pub fn register_concurrent_natives(registry: &mut NativeMethodRegistry) {
         let mut found_idx: Option<usize> = None;
         if let Some(old) = old_arr {
             for i in 0..size {
-                if ctx.get_array_element(old, i) == needle {
+                let elem = ctx.get_array_element(old, i);
+                if cowal_element_matches(ctx, elem, needle) {
                     found_idx = Some(i);
                     break;
                 }
@@ -41485,6 +41483,20 @@ fn native_proxy_get_proxy_class(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     };
     match define_or_get_proxy_class(ctx, loader_namespace, &iface_cids) {
         ProxyClassOutcome::Real(cid) => {
+            // Record the user-supplied loader as the proxy class's defining
+            // loader so `proxyClass.getClassLoader()` returns THAT loader, not
+            // the app-loader fallback — exactly as `native_proxy_new_instance`
+            // does for `newProxyInstance`. Without this, a composite-interface
+            // proxy built via `Proxy.getProxyClass(childLoader, …)` reported the
+            // app loader, so `ClassUtils.isCacheSafe(composite, appLoader)`
+            // wrongly returned true (the proxy looked app-loaded rather than
+            // child-loaded). ClassUtilsTests.isCacheSafe. Only user-defined
+            // loaders are recorded; built-in/null loaders keep the fallback.
+            if let Some(Value::Object(Some(loader_obj))) = args.first() {
+                if crate::classloader::is_user_defined_loader(ctx, *loader_obj) {
+                    crate::classloader::register_defining_loader(cid.as_u32(), *loader_obj);
+                }
+            }
             let mirror = ctx.get_class_mirror(cid);
             Ok(Some(Value::Object(Some(mirror))))
         }
