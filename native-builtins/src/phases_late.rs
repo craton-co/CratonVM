@@ -17792,7 +17792,69 @@ pub(crate) fn register_p59_spliterator(r: &mut NativeMethodRegistry) {
         "()Ljava/util/Spliterator;",
         p59_hashset_spliterator,
     );
+    // Synthetic-stream `spliterator()` — see `p_int_stream_spliterator`. Routed
+    // here for synthetic stream objects (stamped with the bare interface class)
+    // via the no-Code receiver-walk rescue; real `*Pipeline` streams keep their
+    // own bytecode. Fixes real JDK stream code (e.g. `IntStream.concat` →
+    // `a.spliterator()`) that the synthetic streams otherwise can't satisfy.
+    r.register(
+        "java/util/stream/IntStream",
+        "spliterator",
+        "()Ljava/util/Spliterator$OfInt;",
+        p_int_stream_spliterator,
+    );
+    r.register(
+        "java/util/stream/LongStream",
+        "spliterator",
+        "()Ljava/util/Spliterator$OfLong;",
+        p_long_stream_spliterator,
+    );
+    r.register(
+        "java/util/stream/DoubleStream",
+        "spliterator",
+        "()Ljava/util/Spliterator$OfDouble;",
+        p_double_stream_spliterator,
+    );
+    register_synthetic_stream_spliterators(r);
     r.set_category(__prev_cat);
+}
+
+/// Register the synthetic-stream `spliterator()` natives. Called from BOTH the
+/// synthetic-JDK path (`register_p59_spliterator`) and the real-JDK path
+/// (`register_essential_natives`) — synthetic stream objects (stamped with the
+/// bare `java/util/stream/*Stream` interface, slot 0 = element array) are
+/// produced in real-JDK mode too (e.g. `OptionalInt.stream()`), and real JDK
+/// stream code (`IntStream.concat` → `a.spliterator()`; JUnit's
+/// `getLegacyReportingIndexes`) then calls `spliterator()` on them. Without a
+/// native the call falls to the abstract interface method → AbstractMethodError.
+pub(crate) fn register_synthetic_stream_spliterators(r: &mut NativeMethodRegistry) {
+    let __prev = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
+    r.register(
+        "java/util/stream/IntStream",
+        "spliterator",
+        "()Ljava/util/Spliterator$OfInt;",
+        p_int_stream_spliterator,
+    );
+    r.register(
+        "java/util/stream/LongStream",
+        "spliterator",
+        "()Ljava/util/Spliterator$OfLong;",
+        p_long_stream_spliterator,
+    );
+    r.register(
+        "java/util/stream/DoubleStream",
+        "spliterator",
+        "()Ljava/util/Spliterator$OfDouble;",
+        p_double_stream_spliterator,
+    );
+    r.register(
+        "java/util/stream/Stream",
+        "spliterator",
+        "()Ljava/util/Spliterator;",
+        p_obj_stream_spliterator,
+    );
+    r.set_category(__prev);
 }
 
 fn p59_stream_from_spliterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -17810,6 +17872,102 @@ fn p59_stream_from_spliterator(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     let stream = alloc_concurrent_synthetic(ctx, "java/util/stream/Stream", 1);
     ctx.set_field(stream, 0, Value::Object(Some(arr)));
     Ok(Some(Value::Object(Some(stream))))
+}
+
+/// `{Int,Long,Double}Stream.spliterator()` / `Stream.spliterator()` on a
+/// SYNTHETIC stream object (one stamped with the bare `java/util/stream/*Stream`
+/// interface class, slot 0 = element array). Real JDK stream code calls
+/// `spliterator()` on these — e.g. `IntStream.concat(a,b)` does `a.spliterator()`,
+/// and JUnit's `JupiterTestDescriptor.getLegacyReportingIndexes` (run for EVERY
+/// dynamic/parameterized test via `TestIdentifier.from`) builds exactly such a
+/// concat. Since the receiver is the bare interface there is no concrete
+/// `spliterator()` override, so dispatch fell to the abstract interface method
+/// → `AbstractMethodError: IntStream.spliterator()...OfInt has no Code attribute`
+/// → swallowed by the launcher → the dynamic test never registered (whole
+/// parameterized classes reported EMPTY/found=0). Build a real primitive array
+/// from the synthetic elements and delegate to the real
+/// `java.util.Spliterators.spliterator(...)`, returning a genuine
+/// `Spliterator.OfInt/OfLong/OfDouble`/`Spliterator` the JDK machinery consumes.
+pub(crate) fn p_int_stream_spliterator(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let elems = p56_read_stream_elems(ctx, this);
+    let n = elems.len();
+    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Int, n);
+    for (i, v) in elems.into_iter().enumerate() {
+        let iv = match v {
+            Value::Int(x) => Value::Int(x),
+            Value::Object(Some(o)) => ctx.get_field(o, 0),
+            _ => Value::Int(0),
+        };
+        ctx.set_array_element(arr, i, iv);
+    }
+    ctx.invoke(
+        "java/util/Spliterators",
+        "spliterator",
+        "([IIII)Ljava/util/Spliterator$OfInt;",
+        &[Value::Object(Some(arr)), Value::Int(0), Value::Int(n as i32), Value::Int(0)],
+    )
+}
+
+pub(crate) fn p_long_stream_spliterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let elems = p56_read_stream_elems(ctx, this);
+    let n = elems.len();
+    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Long, n);
+    for (i, v) in elems.into_iter().enumerate() {
+        let lv = match v {
+            Value::Long(x) => Value::Long(x),
+            Value::Object(Some(o)) => ctx.get_field(o, 0),
+            _ => Value::Long(0),
+        };
+        ctx.set_array_element(arr, i, lv);
+    }
+    ctx.invoke(
+        "java/util/Spliterators",
+        "spliterator",
+        "([JIII)Ljava/util/Spliterator$OfLong;",
+        &[Value::Object(Some(arr)), Value::Int(0), Value::Int(n as i32), Value::Int(0)],
+    )
+}
+
+pub(crate) fn p_double_stream_spliterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let elems = p56_read_stream_elems(ctx, this);
+    let n = elems.len();
+    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Double, n);
+    for (i, v) in elems.into_iter().enumerate() {
+        let dv = match v {
+            Value::Double(x) => Value::Double(x),
+            Value::Object(Some(o)) => ctx.get_field(o, 0),
+            _ => Value::Double(0.0),
+        };
+        ctx.set_array_element(arr, i, dv);
+    }
+    ctx.invoke(
+        "java/util/Spliterators",
+        "spliterator",
+        "([DIII)Ljava/util/Spliterator$OfDouble;",
+        &[Value::Object(Some(arr)), Value::Int(0), Value::Int(n as i32), Value::Int(0)],
+    )
+}
+
+pub(crate) fn p_obj_stream_spliterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let elems = p56_read_stream_elems(ctx, this);
+    let n = elems.len();
+    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, n);
+    for (i, v) in elems.into_iter().enumerate() {
+        ctx.set_array_element(arr, i, v);
+    }
+    ctx.invoke(
+        "java/util/Spliterators",
+        "spliterator",
+        "([Ljava/lang/Object;III)Ljava/util/Spliterator;",
+        &[Value::Object(Some(arr)), Value::Int(0), Value::Int(n as i32), Value::Int(0)],
+    )
 }
 
 fn p59_int_stream_from_spliterator(

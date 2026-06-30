@@ -1532,6 +1532,210 @@ fn native_jul_logger_logp(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     Ok(None)
 }
 
+/// Resolve a JUL log message argument that is EITHER a `String` OR a
+/// `java.util.function.Supplier<String>` (invoke `get()` and read it).
+fn jul_resolve_msg(ctx: &mut dyn NativeContext, o: ObjectRef) -> String {
+    if let Some(s) = ctx.read_string(o) {
+        return s;
+    }
+    if let Ok(Some(Value::Object(Some(r)))) =
+        ctx.invoke_virtual(o, "get", "()Ljava/lang/Object;", &[Value::Object(Some(o))])
+    {
+        if let Some(s) = ctx.read_string(r) {
+            return s;
+        }
+    }
+    String::new()
+}
+
+/// Render a `Throwable` as `<class>: <detail>` plus its first few stack
+/// frames, so swallowed errors logged via the throwable-carrying
+/// `Logger.log` overloads are visible instead of silently dropped.
+fn jul_render_throwable(ctx: &mut dyn NativeContext, t: ObjectRef) -> String {
+    let cls = {
+        let cid = ctx.class_id_of_object(t);
+        ctx.class_name_of_id(cid)
+            .unwrap_or_else(|| "java/lang/Throwable".to_string())
+            .replace('/', ".")
+    };
+    let detail = match ctx.get_field_by_name(t, "detailMessage") {
+        Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+        _ => String::new(),
+    };
+    let mut out = if detail.is_empty() {
+        cls
+    } else {
+        format!("{cls}: {detail}")
+    };
+    if let Ok(Some(Value::Object(Some(arr)))) = ctx.invoke_virtual(
+        t,
+        "getStackTrace",
+        "()[Ljava/lang/StackTraceElement;",
+        &[Value::Object(Some(t))],
+    ) {
+        let n = ctx.array_length(arr).min(15);
+        for i in 0..n {
+            if let Value::Object(Some(ste)) = ctx.get_array_element(arr, i) {
+                if let Ok(Some(Value::Object(Some(s)))) = ctx.invoke_virtual(
+                    ste,
+                    "toString",
+                    "()Ljava/lang/String;",
+                    &[Value::Object(Some(ste))],
+                ) {
+                    if let Some(frame) = ctx.read_string(s) {
+                        out.push_str("\n\tat ");
+                        out.push_str(&frame);
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+fn jul_level_tag(ctx: &mut dyn NativeContext, level_obj: Option<ObjectRef>) -> String {
+    let level_name = level_obj
+        .and_then(|o| match ctx.get_field_by_name(o, "name") {
+            Value::Object(Some(s)) => ctx.read_string(s),
+            _ => None,
+        })
+        .unwrap_or_else(|| "INFO".to_string());
+    match level_name.as_str() {
+        "SEVERE" => "ERROR".to_string(),
+        "WARNING" => "WARN".to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// The throwable-carrying `java/util/logging/Logger.log` overloads:
+/// `log(Level, String, Throwable)`, `log(Level, Supplier, Throwable)`, and
+/// `log(Level, Throwable, Supplier)`. The real JDK builds a `LogRecord` and
+/// routes through the (unwired) handler chain, so under the synthetic JUL
+/// these records — and the THROWABLE they carry — were silently dropped.
+/// JUnit's `ListenerRegistry.notifyEach` logs swallowed listener exceptions
+/// exactly this way, so any such error was invisible. Identify the throwable
+/// by `instanceof Throwable` and render it with a short stack trace.
+fn native_jul_logger_log_throwable(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(o)) => *o,
+        _ => None,
+    };
+    let level_obj = match args.get(1) {
+        Some(Value::Object(o)) => *o,
+        _ => None,
+    };
+    let throwable_cid = ctx.class_id_by_name("java/lang/Throwable");
+    let (mut msg, mut thrown): (String, Option<ObjectRef>) = (String::new(), None);
+    for slot in [2usize, 3usize] {
+        if let Some(Value::Object(Some(o))) = args.get(slot) {
+            let o = *o;
+            let is_throwable = throwable_cid.is_some_and(|tc| {
+                let oc = ctx.class_id_of_object(o);
+                oc == tc || ctx.is_subclass(oc, tc)
+            });
+            if is_throwable {
+                thrown = Some(o);
+            } else if msg.is_empty() {
+                msg = jul_resolve_msg(ctx, o);
+            }
+        }
+    }
+    let logger_name = this
+        .and_then(|o| match ctx.get_field(o, LOGGER_FIELD_NAME) {
+            Value::Object(Some(s)) => ctx.read_string(s),
+            _ => None,
+        })
+        .unwrap_or_default();
+    let tag = jul_level_tag(ctx, level_obj);
+    match thrown {
+        Some(t) => {
+            let r = jul_render_throwable(ctx, t);
+            if msg.is_empty() {
+                eprintln!("{tag} [{logger_name}] {r}");
+            } else {
+                eprintln!("{tag} [{logger_name}] {msg}\n{r}");
+            }
+        }
+        None => eprintln!("{tag} [{logger_name}] {msg}"),
+    }
+    Ok(None)
+}
+
+/// `java/util/logging/Logger.log(Level, Supplier<String>)` — message-supplier
+/// overload with no throwable. Resolve the supplier and emit (otherwise the
+/// synthetic JUL drops it, since the real LogRecord/handler path isn't wired).
+fn native_jul_logger_log_supplier(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(o)) => *o,
+        _ => None,
+    };
+    let level_obj = match args.get(1) {
+        Some(Value::Object(o)) => *o,
+        _ => None,
+    };
+    let msg = match args.get(2) {
+        Some(Value::Object(Some(o))) => jul_resolve_msg(ctx, *o),
+        _ => String::new(),
+    };
+    let logger_name = this
+        .and_then(|o| match ctx.get_field(o, LOGGER_FIELD_NAME) {
+            Value::Object(Some(s)) => ctx.read_string(s),
+            _ => None,
+        })
+        .unwrap_or_default();
+    let tag = jul_level_tag(ctx, level_obj);
+    eprintln!("{tag} [{logger_name}] {msg}");
+    Ok(None)
+}
+
+/// `java/util/logging/Logger.log(LogRecord)` — the overload many wrappers
+/// (incl. JUnit's `LoggerFactory$DelegatingLogger`) build a `LogRecord`
+/// directly and call. The real JDK routes it through the (unwired) handler
+/// chain, so the record — and any THROWABLE it carries — was silently
+/// dropped, hiding errors callers log-and-swallow. Read `level`/`message`/
+/// `thrown` off the record by field name and emit.
+fn native_jul_logger_log_record(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(o)) => *o,
+        _ => None,
+    };
+    let rec = match args.get(1) {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(None),
+    };
+    let level_obj = match ctx.get_field_by_name(rec, "level") {
+        Value::Object(o) => o,
+        _ => None,
+    };
+    let tag = jul_level_tag(ctx, level_obj);
+    let message = match ctx.get_field_by_name(rec, "message") {
+        Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+        _ => String::new(),
+    };
+    let thrown = match ctx.get_field_by_name(rec, "thrown") {
+        Value::Object(Some(t)) => Some(t),
+        _ => None,
+    };
+    let logger_name = this
+        .and_then(|o| match ctx.get_field(o, LOGGER_FIELD_NAME) {
+            Value::Object(Some(s)) => ctx.read_string(s),
+            _ => None,
+        })
+        .unwrap_or_default();
+    match thrown {
+        Some(t) => {
+            let r = jul_render_throwable(ctx, t);
+            if message.is_empty() {
+                eprintln!("{tag} [{logger_name}] {r}");
+            } else {
+                eprintln!("{tag} [{logger_name}] {message}\n{r}");
+            }
+        }
+        None => eprintln!("{tag} [{logger_name}] {message}"),
+    }
+    Ok(None)
+}
+
 /// `java/util/logging/Logger.isLoggable(Level)Z`.
 ///
 /// Our synthetic Logger objects carry a null `level` field and have no
@@ -2312,6 +2516,40 @@ pub fn register_logmanager_natives(registry: &mut NativeMethodRegistry) {
         "logp",
         "(Ljava/util/logging/Level;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/Throwable;)V",
         native_jul_logger_logp,
+    );
+    // Throwable/Supplier-carrying `log` overloads. The real JDK routes these
+    // through a LogRecord + handler chain the synthetic JUL doesn't wire, so
+    // the records (and their throwables) were silently dropped — hiding errors
+    // that callers log-and-swallow (e.g. JUnit's `ListenerRegistry.notifyEach`).
+    registry.register(
+        CLS_JUL_LOGGER,
+        "log",
+        "(Ljava/util/logging/Level;Ljava/lang/String;Ljava/lang/Throwable;)V",
+        native_jul_logger_log_throwable,
+    );
+    registry.register(
+        CLS_JUL_LOGGER,
+        "log",
+        "(Ljava/util/logging/Level;Ljava/util/function/Supplier;Ljava/lang/Throwable;)V",
+        native_jul_logger_log_throwable,
+    );
+    registry.register(
+        CLS_JUL_LOGGER,
+        "log",
+        "(Ljava/util/logging/Level;Ljava/lang/Throwable;Ljava/util/function/Supplier;)V",
+        native_jul_logger_log_throwable,
+    );
+    registry.register(
+        CLS_JUL_LOGGER,
+        "log",
+        "(Ljava/util/logging/Level;Ljava/util/function/Supplier;)V",
+        native_jul_logger_log_supplier,
+    );
+    registry.register(
+        CLS_JUL_LOGGER,
+        "log",
+        "(Ljava/util/logging/LogRecord;)V",
+        native_jul_logger_log_record,
     );
     // `isLoggable(Level)` — JULI's DirectJDKLog gates every log call on
     // this; the real bytecode returns false for our parent-less
