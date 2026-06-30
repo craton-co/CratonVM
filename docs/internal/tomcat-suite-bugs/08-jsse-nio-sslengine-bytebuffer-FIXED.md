@@ -67,33 +67,11 @@ keystore/truststore (`extra_trust_roots`) — the same roots the JVM TrustManage
 uses. The server now sends a `CertificateRequest` flight (handshake progresses
 past the server's first message).
 
-## Remaining (OPEN) — mTLS client-cert presentation
+## mTLS client-cert auth — FIXED (merged to `dev`, `895d82dc`)
 
-Full client-cert tests (`TestClientCertTls13`, `TestClientCert`) still fail with
-HTTP `-1` / null body: the handshake now reaches the server's
-`CertificateRequest`, but the **client never presents its certificate**. Two
-gaps:
-
-1. The production client config builders pass `client_auth = None`
-   (`build_client_config(roots, …, None)` at t27_tls.rs:1397;
-   `default_engine_client_config` uses `.with_no_client_auth()`), so the rustls
-   client sends no cert.
-2. The TLS identity is a single **process-global** `runtime_tls_identity`. In an
-   in-process mTLS test both the server keystore and the client keystore call
-   `install_identity_from_der`, clobbering each other — there is no
-   per-`SSLContext` identity to distinguish "this engine is the client, present
-   the client keystore" from "this engine is the server".
-
-Fixing this requires per-`SSLContext`/per-engine identity tracking (associate
-the `KeyManager`'s key+cert with the specific context rather than a global
-slot) and wiring the client identity into `build_client_config`'s `client_auth`.
-That is a distinct, larger feature than the handshake fix above.
-
-## mTLS progress (branch `claude/great-banzai-67e809`, NOT yet merged)
-
-The per-`SSLContext` mTLS feature above was implemented and the mutual-TLS
-handshake + data path now work end to end. Commits on the worktree branch
-(`03fb1851`, `f9790739`), held back from `dev` pending the residual below:
+`TestClientCertTls13` now passes **all 6** parameterized cases. The full
+per-`SSLContext` mutual-TLS path works end to end — handshake, client-cert
+presentation, large request body, and role-based authorization.
 
 - **Per-`SSLContext` identity** — keystore `engineLoad` stages its
   `(cert_pem, key_pem)` on a thread-local (real-mode native; the
@@ -116,25 +94,38 @@ handshake + data path now work end to end. Commits on the worktree branch
   returns real `X509CertImpl` mirrors of the captured rustls peer (client) cert
   chain.
 
-Verified by wire capture: the client presents its cert, the server verifies it,
-encrypted app data flows, and the request reaches the servlet — POST returns a
-real HTTP **401** (was a hang / -1).
+The two blockers that surfaced after the handshake worked were both fixed:
 
-**Residual (still OPEN), now in the auth/transport layer, not TLS:**
-1. **Client-cert authorization** — the request is TLS-authenticated but Tomcat's
-   `SSLAuthenticator`/realm still returns **401** (the client cert is not mapped
-   to the `testrole`). Next step: confirm the coyote SSL-support path actually
-   reads `SSLSession.getPeerCertificates()` and that the `X509CertImpl` mirror's
-   `getSubjectX500Principal()` matches the realm's cert→user→role mapping.
-2. **GET transport race** — the GET variant fails earlier with "connection
-   closed before response head": the server closes the TCP connection before/as
-   the client reads, so the client sees EOF before the buffered response.
+1. **Authorization 401 — client cert not requested.** Tomcat configures
+   client-cert auth via `SSLParameters.setNeed/WantClientAuth` +
+   `engine.setSSLParameters` (NOT the engine's own setters). The engine's
+   `setSSLParameters` ignored those booleans, so the server never sent a
+   `CertificateRequest`, `conn.peer_certificates()` was empty, and the realm
+   denied access. Fixed: `setSSLParameters` reads `need/wantClientAuth` and
+   `engine_begin` requests the cert for NEED *or* WANT (optional →
+   `WebPkiClientVerifier::allow_unauthenticated`). Also: the client identity is
+   captured in `SSLContext.getSocketFactory()` (a client-only call) because a
+   native override of the concrete `setDefaultSSLSocketFactory` body never fires.
+
+2. **Large-POST 400 (`SocketTimeoutException`) — over-eager unwrap.** The unwrap
+   decrypted whole rustls buffers, producing more plaintext than the caller's
+   dst and stashing the excess in our own buffer — invisible to Tomcat, which
+   then blocked on the socket for body bytes that had already arrived. Rewrote
+   `do_unwrap` to be **record-oriented**: feed rustls ONE complete TLS record at
+   a time (looping `read_tls` until the whole record is fed — a single `read_tls`
+   only takes a partial record), only while the dst has room, leaving excess
+   records in the caller's `netInBuffer`; serve overflow plaintext first and
+   return `BUFFER_OVERFLOW` (post-handshake) when the dst is full so the caller
+   drains and retries. This is the correct SSLEngine-over-rustls bridge and
+   benefits all large request bodies.
 
 ## Reproduction
 
 ```
 cratonvm.exe -Xmx2g -cp <cp> org.junit.runner.JUnitCore \
-  org.apache.tomcat.util.net.TestSsl                 # plain HTTPS — now handshakes
+  org.apache.tomcat.util.net.TestClientCertTls13     # mTLS — now OK (6 tests)
+cratonvm.exe -Xmx2g -cp <cp> org.junit.runner.JUnitCore \
+  org.apache.tomcat.util.net.TestSsl                 # plain HTTPS — handshakes + serves
 # env: CRATONVM_REAL_NET_SOCKETS=1 CRATONVM_REAL_AQS=1 CRATONVM_DISABLE_DEFAULT_WATCHDOG=1
 # CWD: apps/tomcat ; wire: CRATONVM_SOCKET_CAPTURE=<prefix>
 ```
