@@ -253,6 +253,17 @@ pub fn add_extra_trust_root_der(der: Vec<u8>) {
     }
 }
 
+/// Concatenate every gathered trust anchor (DER) into a PEM bundle. Used as the
+/// client-CA source for mTLS server configs when no explicit `client_ca_pem`
+/// was installed on the runtime identity (see `default_engine_server_config`).
+fn trust_roots_pem() -> String {
+    let mut pem = String::new();
+    for der in extra_trust_roots().lock().iter() {
+        pem.push_str(&der_to_pem("CERTIFICATE", der));
+    }
+    pem
+}
+
 /// Install the runtime server identity from a PKCS#8 private key DER + DER cert
 /// chain (leaf first), converting to the PEM the rustls server-config builder
 /// consumes. Called from the keystore load path when a key entry is present.
@@ -2639,13 +2650,40 @@ fn handshake_status_of(s: &EngineState) -> i32 {
 }
 
 /// Read a Java ByteBuffer's slice as `(backing_array_ref, position, limit, capacity)`.
-/// Java NIO ByteBuffer in this VM's synthetic layout: field 0=backing array,
-/// field 1=position, field 2=limit, field 3=capacity (capacity may be missing
-/// for older allocators — we fall back to limit).
+///
+/// Tomcat's NIO endpoint hands the engine **real-JDK `java.nio.HeapByteBuffer`**
+/// objects, whose layout is `Buffer{mark, position, limit, capacity, address}`
+/// then `ByteBuffer{hb, offset, …}` — i.e. the backing array `hb` is NOT at
+/// slot 0 (that's `mark`, an int). Resolve `hb`/`position`/`limit`/`capacity`
+/// by NAME first (mirroring `charset.rs::buf_state`), falling back to the
+/// VM's synthetic 5-field layout (`[0]=array,[1]=pos,[2]=limit,[3]=cap`).
+///
+/// Previously this only read the synthetic slots, so on a real `HeapByteBuffer`
+/// it read slot 0 (`mark`) as the array → `None` → `bb_read_into`/`bb_write_from`
+/// moved ZERO bytes. The server engine therefore consumed the ClientHello at the
+/// socket level but produced no ServerHello, hanging every NIO HTTPS handshake.
 fn bb_view(
     ctx: &mut dyn cratonvm_native_api::NativeContext,
     bb: ObjectRef,
 ) -> (Option<ObjectRef>, usize, usize, usize) {
+    if let Value::Object(Some(a)) = ctx.get_field_by_name(bb, "hb") {
+        let pos = ctx
+            .get_field_by_name(bb, "position")
+            .as_int()
+            .unwrap_or(0)
+            .max(0) as usize;
+        let lim = ctx
+            .get_field_by_name(bb, "limit")
+            .as_int()
+            .unwrap_or(0)
+            .max(0) as usize;
+        let cap = ctx
+            .get_field_by_name(bb, "capacity")
+            .as_int()
+            .unwrap_or(lim as i32)
+            .max(0) as usize;
+        return (Some(a), pos, lim, cap);
+    }
     let arr = match ctx.get_field(bb, 0) {
         Value::Object(Some(a)) => Some(a),
         _ => None,
@@ -2658,6 +2696,14 @@ fn bb_view(
         lim
     };
     (arr, pos, lim, cap)
+}
+
+/// Advance a ByteBuffer's `position` to `new_pos`, writing both the real-JDK
+/// named `position` field and the synthetic slot-1 so the change is visible
+/// whichever layout the buffer uses (mirrors `charset.rs::set_pos`).
+fn bb_set_pos(ctx: &mut dyn cratonvm_native_api::NativeContext, bb: ObjectRef, new_pos: usize) {
+    ctx.set_field_by_name(bb, "position", Value::Int(new_pos as i32));
+    ctx.set_field(bb, 1, Value::Int(new_pos as i32));
 }
 
 /// Read up to `(limit - position)` bytes out of a ByteBuffer, leaving its
@@ -2684,7 +2730,7 @@ fn bb_read_into(
         let b = ctx.get_array_element(arr, pos + i).as_int().unwrap_or(0) as u8;
         out.push(b);
     }
-    ctx.set_field(bb, 1, Value::Int((pos + take) as i32));
+    bb_set_pos(ctx, bb, pos + take);
     take
 }
 
@@ -2705,7 +2751,7 @@ fn bb_write_from(
     for i in 0..put {
         ctx.set_array_element(arr, pos + i, Value::Int(src[i] as i8 as i32));
     }
-    ctx.set_field(bb, 1, Value::Int((pos + put) as i32));
+    bb_set_pos(ctx, bb, pos + put);
     put
 }
 
@@ -2750,7 +2796,22 @@ fn default_engine_server_config(
         match identity.client_ca_pem.as_deref() {
             Some(ca) => Some(ca.to_string()),
             None => {
-                return Err("setNeedClientAuth(true) requires javax.net.ssl.trustStore".to_string());
+                // mTLS fallback: the identity carries no explicit client CA, so
+                // verify client certs against the trust anchors gathered from
+                // every loaded keystore/truststore (`extra_trust_roots`, fed by
+                // the keystore load path). This is the same root set the JVM's
+                // TrustManager validates against. Client-cert tests (e.g.
+                // TestClientCertTls13) load the signing CA into a truststore but
+                // never install it as the identity's `client_ca_pem`, which
+                // previously made `setNeedClientAuth(true)` fail and the mTLS
+                // handshake return no HTTP response (-1).
+                let pem = trust_roots_pem();
+                if pem.is_empty() {
+                    return Err(
+                        "setNeedClientAuth(true) requires javax.net.ssl.trustStore".to_string(),
+                    );
+                }
+                Some(pem)
             }
         }
     } else {
