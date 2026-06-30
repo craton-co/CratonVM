@@ -7,6 +7,14 @@
 | **List** | `apps/hib-suite-runner/misc16.txt` |
 | **Date** | 2026-06-30 |
 
+**Verification (merged binary `2da9a00d`→dev merge `a5847887`, fixes `2ba1347b`+`d906ce97`):**
+`ExplicitQueryStatsMaxSizeTest` PASS 2/2 and `DatabaseTimeZoneMultiTenancyTest`
+PASS 1/1 (both were failing). `XmlFormatterTest` PASS (dev). No regressions in
+the rest of misc16; `LhmEvictProbe` + non-overriding-LHM-subclass +
+`LinkedHashSet` regression probes match HotSpot. `StandardFunctionTests`
+completed this run (40/44, 4 failed — matches the HotSpot slowness/shared-failure
+pattern, see §15–16).
+
 Run the sweep:
 ```
 cd C:/craton/CratonVM/apps/hib-suite-runner
@@ -146,9 +154,11 @@ Core class-store change, app-gauntlet blast radius — keep behind the gate.
 (`LocalXmlResourceResolver.resolveEntity`) maps `classpath://` to a classpath
 resource stream. On CratonVM the `&child;` expansion is **empty** → the `Child`
 `<class>` mapping never loads → `MappingException: Collection [Parent.children]
-references an unmapped entity [Child]`. The class also ran ~112 s (vs ~fast on
-HotSpot), consistent with the StAX `XMLResolver` not being consulted for the
-external general entity (and/or a fallback I/O attempt). Area: real-JDK StAX
+references an unmapped entity [Child]`. Isolated single-class run: ~53 s + the
+unmapped-entity error (the 120 s `TimeoutException` seen in the 8-shard sweep is
+shard contention, not a true deadlock). The slowness + empty expansion is
+consistent with the StAX `XMLResolver` not being consulted for the external
+general entity (and/or a fallback I/O attempt). Area: real-JDK StAX
 external-general-entity resolution (Woodstox / JDK `XMLInputFactory`) — verify
 whether `XMLResolver.resolveEntity` is invoked for general (non-DTD) entities
 and whether `IS_SUPPORTING_EXTERNAL_ENTITIES` / entity expansion is honored.
