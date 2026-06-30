@@ -9041,6 +9041,56 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         cratonvm_types::Value::Object(Some(obj))
     }
 
+    /// Localized display name for a synthetic TimeZone, honouring its `ID` and
+    /// the requested style. The previous natives hard-coded "UTC" for every
+    /// zone and style, so `TimeZone.getTimeZone("GMT").getDisplayName(false,
+    /// SHORT, US)` — and, via `SimpleDateFormat`'s `z` field which calls
+    /// `getDisplayName(daylight, style, locale)`, every HTTP `Date`/`Expires`
+    /// header that formats the GMT zone — rendered "UTC" instead of "GMT"
+    /// (Tomcat `TestCookieProcessorGeneration.testMaxAgeZero`). `getZoneStrings`
+    /// already returns the correct rows, but `SimpleDateFormat` skips them when
+    /// the zone strings are not explicitly set and falls through to
+    /// `getDisplayName`, so the fix must live here. `style` follows
+    /// `TimeZone.SHORT` (0) / `TimeZone.LONG` (1).
+    fn tz_display_name(ctx: &mut dyn NativeContext, this: ObjectRef, long_style: bool) -> String {
+        let id = match ctx.get_field_by_name(this, "ID") {
+            Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+            _ => String::new(),
+        };
+        match id.as_str() {
+            "GMT" => {
+                if long_style {
+                    "Greenwich Mean Time"
+                } else {
+                    "GMT"
+                }
+            }
+            "UTC" | "Etc/UTC" | "Etc/UCT" | "UCT" | "Zulu" | "Universal" | "Etc/Universal" => {
+                if long_style {
+                    "Coordinated Universal Time"
+                } else {
+                    "UTC"
+                }
+            }
+            _ => {
+                // Custom GMT-offset ids ("GMT+02:00") display verbatim, as
+                // HotSpot does for a ZoneInfo with no localized name. Unknown
+                // named zones keep the conservative UTC fallback this native
+                // used before (CratonVM models most zones by their standard
+                // offset, without per-zone CLDR display names).
+                if id.starts_with("GMT+") || id.starts_with("GMT-") {
+                    return id;
+                }
+                return if long_style {
+                    "Coordinated Universal Time".to_string()
+                } else {
+                    "UTC".to_string()
+                };
+            }
+        }
+        .to_string()
+    }
+
     registry.register(
         "java/util/TimeZone",
         "getTimeZone",
@@ -9076,23 +9126,46 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         "()V",
         |_ctx, _args| Ok(None),
     );
+    // getDisplayName() and getDisplayName(Locale) default to the LONG style.
     registry.register(
         "java/util/TimeZone",
         "getDisplayName",
         "()Ljava/lang/String;",
-        |ctx, _args| Ok(Some(Value::Object(Some(ctx.create_string("UTC"))))),
+        |ctx, args| {
+            let name = match args.first() {
+                Some(Value::Object(Some(o))) => tz_display_name(ctx, *o, true),
+                _ => "UTC".to_string(),
+            };
+            Ok(Some(Value::Object(Some(ctx.create_string(&name)))))
+        },
     );
     registry.register(
         "java/util/TimeZone",
         "getDisplayName",
         "(Ljava/util/Locale;)Ljava/lang/String;",
-        |ctx, _args| Ok(Some(Value::Object(Some(ctx.create_string("UTC"))))),
+        |ctx, args| {
+            let name = match args.first() {
+                Some(Value::Object(Some(o))) => tz_display_name(ctx, *o, true),
+                _ => "UTC".to_string(),
+            };
+            Ok(Some(Value::Object(Some(ctx.create_string(&name)))))
+        },
     );
+    // getDisplayName(boolean daylight, int style, Locale): style follows
+    // TimeZone.SHORT (0) / TimeZone.LONG (1). This is the variant
+    // SimpleDateFormat's `z` field calls.
     registry.register(
         "java/util/TimeZone",
         "getDisplayName",
         "(ZILjava/util/Locale;)Ljava/lang/String;",
-        |ctx, _args| Ok(Some(Value::Object(Some(ctx.create_string("UTC"))))),
+        |ctx, args| {
+            let long_style = matches!(args.get(2), Some(Value::Int(v)) if *v != 0);
+            let name = match args.first() {
+                Some(Value::Object(Some(o))) => tz_display_name(ctx, *o, long_style),
+                _ => "UTC".to_string(),
+            };
+            Ok(Some(Value::Object(Some(ctx.create_string(&name)))))
+        },
     );
     // Safety net: short-circuit ZoneInfoFile.getZoneInfo0 to return null
     // for direct callers (the higher-level TimeZone.getTimeZone is now
