@@ -289,23 +289,42 @@ objects still size as `num_slots*SLOT_SIZE`) in both `scan_region*` functions.
 Regression-clean: bt10/14/16 exact, bt16 `GC_STRESS` exact, normal transform
 unchanged.
 
-### Residual (out of scope for the SIGSEGV fix): GC_STRESS torture-mode corruption
+### Residual (out of scope for the SIGSEGV fix): GC_STRESS missed-mark corruption
 
 With both fixes, compact-ON `transform` no longer SIGSEGVs under `GC_STRESS`, but
-a *caught, non-crashing* corruption remains on that torture load (a garbage young
-header → `java/util/logging/Level` `<clinit>` fails → linkage error; compact-OFF
-`GC_STRESS` is clean). This is a **separate, deeper** compact×GC-precision matter
-(the missed-root / autobox-under-GC family), not the reported SIGSEGV, and only
-reproduces under `GC_STRESS` (a GC on nearly every allocation) on the complex
-workload — normal-mode runs match the compact-OFF baseline. Two known threads to
-pull when picking this up: (1) the JIT inline getfield ref path returns the bare
-slot pointer and does **not** unbox an `AUTOBOX_CLASS_ID` wrapper the way heap
-`get_field` does, so a primitive type-punned into a compact reference slot leaks
-the wrapper to Java (surfaces as a `ClassCastException Object→String`); (2)
-`set_field`'s compact autobox arm computes `base` before `alloc_object`, which is
-safe today only because the heap `alloc_object` entry never GCs — revisit if that
-ever changes. Both are footprint/edge concerns gated behind the still-default-OFF
-flag.
+a *caught, non-crashing* corruption remains on that torture load (a reference
+field reads back a stale pointer → interpreted as a garbage header → e.g.
+`java/util/logging/Level` `<clinit>` `ClassCastException` → linkage error;
+compact-OFF `GC_STRESS` is clean).
+
+**Localized (2026-07-01), not yet fixed.** Minimal deterministic repro:
+`scratch/GcStressRepro.java` (mixed ref+primitive `Node` list + logging init)
+under `CRATONVM_COMPACT_REF_FIELDS=1 CRATONVM_GC_STRESS=1 -Xmx128m` — HotSpot and
+compact-OFF both print `sum=49920 OK`, compact-ON corrupts (`gen_heap::read_slot:
+corrupt Value cell`). What the investigation established:
+- It is a **missed mark / dangling reference**, not a bad write: a ref slot holds
+  a stale young pointer (e.g. `0x1A9B2440`) into freed/reused memory. A
+  `dbg_check_slot_write` bounds-guard on every GC ref-update write-back
+  (`forward_ref_slots` + the three dirty-card branches) fired **zero** times.
+- It needs **no evacuation/promotion**: `CRATONVM_SP_STATS` shows `evac=0` on the
+  corrupting run, so the promotion-fixup paths (3a/3b/3c) are not involved.
+- It is compact-specific and `GC_STRESS`-only (a GC on nearly every allocation),
+  at **all** heap sizes (64m–2g), so it is not old-gen-allocator pressure.
+- Yet every obvious compact scan **is** already flag-aware — the young mark trace
+  and BFS (`for_each_ref_slot`), the non-moving sweep sizing
+  (`gen_object_total_size`), and the dirty-card seed (`scan_dirty_cards`) all use
+  `compact_oop_scan`. So the gap is a subtler root/precision or write-barrier edge
+  in how a compact object's 8-byte reference is (not) reached by the mark under
+  the non-moving sweep — the same hard GC-precision family tracked in the
+  moving-young/roots memory cluster. This wants a dedicated pass, not a spot fix.
+
+Two lesser threads noted along the way (edge/footprint, gated behind the
+default-OFF flag): (1) the JIT inline getfield ref path returns the bare slot
+pointer and does **not** unbox an `AUTOBOX_CLASS_ID` wrapper the way heap
+`get_field` does, so a primitive type-punned into a compact reference slot could
+leak the wrapper to Java; (2) `set_field`'s compact autobox arm computes `base`
+before `alloc_object`, safe today only because the heap `alloc_object` entry never
+GCs — revisit if that changes.
 
 **Deeper follow-up (optional, not required for correctness):** the legacy
 instances themselves are a footprint miss, not a bug — they come from native/stub
