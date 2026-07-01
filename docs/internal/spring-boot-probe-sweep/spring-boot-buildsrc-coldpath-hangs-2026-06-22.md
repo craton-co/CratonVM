@@ -12,10 +12,13 @@ metadata:
 > buildSrc coldpath run. The two HotSpot-passable CratonVM-only hangs called out
 > here are no longer active: `PluginXmlParserTests` was fixed by SBR-02, and
 > `SpringRepositoriesExtensionTests` is now recorded as **11/11 FULL GREEN** in
-> the newer Groovy/indy Mockito handoff. The remaining Gradle `ProjectBuilder`
-> rows are environment-limited; broader ANTLR cold-path throughput and latent
-> deep-recursion stack recovery stay tracked in
-> [`springrepos-extension-hang-jit-throughput-and-deep-recursion.md`](../../known-issues/springrepos-extension-hang-jit-throughput-and-deep-recursion.md).
+> the newer Groovy/indy Mockito handoff and was re-verified on current `dev`
+> with `CRATONVM_JIT_ALLOW_PACKAGES=groovyjarjarantlr4/`. The remaining Gradle
+> `ProjectBuilder` rows are environment-limited; broader ANTLR cold-path
+> throughput and latent deep-recursion stack recovery stay tracked in
+> [`jit-deep-recursion-fault-recovery.md`](../../known-issues/jit-deep-recursion-fault-recovery.md).
+> Archived SpringRepos handoff:
+> [`springrepos-extension-hang-jit-throughput-and-deep-recursion.md`](../springrepos-extension-hang-jit-throughput-and-deep-recursion.md).
 
 Fresh full re-run of the `apps/spring-boot/buildSrc` JUnit suite (the only compiled
 test module in that checkout) under an optimized fat-LTO `cvsbtest` binary built
@@ -34,16 +37,15 @@ Reclassification **pinned to P-cores (`0xFFFF`), default watchdog disabled, 360s
 merely exceeded the 240s timeout. The 17 passing classes are correct but **3–110×
 slower** than HotSpot (e.g. `DependencyVersionUpgradeTests` 63/63 in 111s vs 1s). This
 is the **cold-path interpreter throughput tax**, the same family as
-the Hibernate HQL reproducer consolidated in
-[springrepos-extension-hang-jit-throughput-and-deep-recursion.md](../../known-issues/springrepos-extension-hang-jit-throughput-and-deep-recursion.md)
-§5.
+the Hibernate HQL reproducer tracked in
+[`jit-deep-recursion-fault-recovery.md`](../../known-issues/jit-deep-recursion-fault-recovery.md).
 
 ## The 5 true-hangs (P-core-pinned, watchdog off, killed at 360s)
 
 | Class | HotSpot | In known-issues before? | Notes |
 |-------|---------|-------------------------|-------|
 | `mavenplugin.PluginXmlParserTests` | PASS 2/2, 1s | **✅ FIXED** | **RESOLVED** — was a `java.util.regex` / `String.replaceAll`+literal-`replace` throughput wall in `PluginXmlParser.format()`. Fixed by flipping `CRATONVM_NATIVE_STRING_REGEX` default-ON (SBR-02, `0d7dfc28`, merge `01375f90`): the regex/replace chain routes to fast Rust-regex natives. Mirror probe `RegexLoopProbe` 100k iters nojit 7s / JIT 7.4s, output byte-identical to HotSpot (was 300s+ hang). Writeup: [`SBR-02-string-regex-throughput.md`](SBR-02-string-regex-throughput.md). |
-| `groovyscripts.SpringRepositoriesExtensionTests` | PASS 11/11, 5s | Yes (stale) | **RESOLVED by later work.** The 2026-06-22 run contradicted the older springrepos note, but the subsequent multi-layer investigation is now fixed through the Groovy/indy Mockito tail; [`spring-boot-groovy-indy-mockito-mock-dispatch.md`](../spring/spring-boot-groovy-indy-mockito-mock-dispatch.md) records **11/11 FULL GREEN**. |
+| `groovyscripts.SpringRepositoriesExtensionTests` | PASS 11/11, 5s | Historical | **RESOLVED by later work and re-verified on current dev.** The 2026-06-22 run contradicted the older springrepos note, but the subsequent multi-layer investigation is fixed through the Groovy/indy Mockito tail; [`spring-boot-groovy-indy-mockito-mock-dispatch.md`](../spring/spring-boot-groovy-indy-mockito-mock-dispatch.md) records **11/11 FULL GREEN**. A 2026-07-01 retry also passed 11/11 with the guarded ANTLR lift enabled. Archived handoff: [`../springrepos-extension-hang-jit-throughput-and-deep-recursion.md`](../springrepos-extension-hang-jit-throughput-and-deep-recursion.md). Residual infrastructure tracker: [`../../known-issues/jit-deep-recursion-fault-recovery.md`](../../known-issues/jit-deep-recursion-fault-recovery.md). |
 | `antora.GenerateAntoraPlaybookTests` | 1/2 — **env-fail**, 3s | n/a | **NOT a clean bug — env-limited** (see below) |
 | `artifacts.ArtifactReleaseTests` | 7/8 — **env-fail**, 3s | n/a | **NOT a clean bug — env-limited** |
 | `autoconfigure.DocumentAutoConfigurationClassesTests` | 1/2 — **env-fail**, 3s | n/a | **NOT a clean bug — env-limited** |
@@ -66,7 +68,7 @@ pass on either VM, **not a primary functional bug**.
 **Net active CV-only hang count on HotSpot-passable classes: 0.**
 `PluginXmlParserTests` is fixed by SBR-02, and `SpringRepositoriesExtensionTests`
 is fixed by the later SpringRepos/Groovy-indy workstream. The cold ANTLR
-throughput follow-up remains real but is tracked by the springrepos handoff, not
+throughput follow-up remains real but is tracked by the deep-recursion/fault-recovery issue, not
 by this historical suite index.
 
 ## Shared stall signature
@@ -111,7 +113,7 @@ corruption) appears in any hang log.
 
 ## Net genuine CratonVM-only defects from this run
 1. ~~`PluginXmlParserTests` true-hang~~ — **✅ FIXED** (SBR-02 native String regex default-ON; writeup [`SBR-02-string-regex-throughput.md`](SBR-02-string-regex-throughput.md)).
-2. ~~`SpringRepositoriesExtensionTests` true-hang~~ — **✅ FIXED by later SpringRepos/Groovy-indy work**; see [`spring-boot-groovy-indy-mockito-mock-dispatch.md`](../spring/spring-boot-groovy-indy-mockito-mock-dispatch.md).
+2. ~~`SpringRepositoriesExtensionTests` true-hang~~ - fixed by later SpringRepos/Groovy-indy work and re-verified on current dev; see [`spring-boot-groovy-indy-mockito-mock-dispatch.md`](../spring/spring-boot-groovy-indy-mockito-mock-dispatch.md) and archived handoff [`../springrepos-extension-hang-jit-throughput-and-deep-recursion.md`](../springrepos-extension-hang-jit-throughput-and-deep-recursion.md). Residual deep-recursion infrastructure work lives in [`../../known-issues/jit-deep-recursion-fault-recovery.md`](../../known-issues/jit-deep-recursion-fault-recovery.md).
 Everything else is env-limited (ProjectBuilder ×3), a slow-pass (Antora, G1 ×8), or clean.
 
 ## Reproduce

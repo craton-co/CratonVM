@@ -273,7 +273,7 @@ The history below predates the fix.
 
 | # | Bug | Status | Doc |
 |---|---|---|---|
-| **C** | Deep JIT→JIT recursion overruns the **native** stack (ANTLR `closure()`); same-method recursive edges and compile-time-discovered mutual direct-call cycles now route through guarded dispatch except static tail self-jumps, the ANTLR cold-path validation lift keeps the known-bad `PredictionContext` cluster interpreted, and x64 prologues now stack-bang page-by-page with one-page headroom. The full overflow path still needs a resumable fault-recovery handler / catchable `StackOverflowError` routing from the fault context. | ⚪ **LATENT / PARTIALLY CONTAINED** (not a current blocker; 2026-07-01 recursive-edge + compile-cycle routing, native-shadow gate narrowing, guarded ANTLR validation lift, and x64 stack-bang containment landed) | [springrepos-extension-hang-jit-throughput-and-deep-recursion.md](springrepos-extension-hang-jit-throughput-and-deep-recursion.md) §6–7 |
+| **C** | Deep JIT->JIT recursion overruns the **native** stack (ANTLR `closure()`); same-method recursive edges and compile-time-discovered mutual direct-call cycles now route through guarded dispatch except static tail self-jumps, the ANTLR cold-path validation lift keeps the known-bad `PredictionContext` cluster interpreted, and x64 prologues now stack-bang page-by-page with one-page headroom. The full overflow path still needs a resumable fault-recovery handler / catchable `StackOverflowError` routing from the fault context. | **LATENT / PARTIALLY CONTAINED** (not a current blocker; 2026-07-01 SpringRepos validation is green, recursive-edge + compile-cycle routing, native-shadow gate narrowing, guarded ANTLR validation lift, and x64 stack-bang containment landed) | [jit-deep-recursion-fault-recovery.md](jit-deep-recursion-fault-recovery.md) |
 | **MT-STW** | `Thread.join` monitor-ownership **desync under concurrent GC** (JIT-off): `monitor_wait`/terminate-tail used a raw `ObjectRef` captured before blocking, then `arrive_and_wait` let the in-flight STW relocate+zero it → `ensure_inflated` on the stale address synthesised a fresh `owner=None` monitor → IMSE in the javac synchronized-exit loop → joiner livelock → STW wedge. ~1–3% on `scratch_churn/Churn.java`; the tail after the four barrier+expansion fixes (`68c6993e`, 0%→~97%). | ✅ **FIXED** (`74b195b4`) — remap the receiver through `arrive_and_wait`'s returned pointer map; Churn 0 hangs / ~480 runs | [../internal/mt-stw-join-monitor-desync.md](../internal/mt-stw-join-monitor-desync.md) |
 
 > Bug **B** (JUnit `@Timeout` "interceptor invoked twice") is **FIXED** and archived — it was
@@ -321,8 +321,8 @@ and already-consolidated ones (fam5/6) were left in place.
 
 ## The springrepos handoff (mostly fixed)
 
-[springrepos-extension-hang-jit-throughput-and-deep-recursion.md](springrepos-extension-hang-jit-throughput-and-deep-recursion.md)
-is a multi-defect handoff for `SpringRepositoriesExtensionTests`. The hang,
+[`springrepos-extension-hang-jit-throughput-and-deep-recursion.md`](../internal/springrepos-extension-hang-jit-throughput-and-deep-recursion.md)
+is the archived multi-defect handoff for `SpringRepositoriesExtensionTests`. The hang,
 parse-NPE (#1), generics (#2), and the indy `MethodHandle.type()` layers
 (3/3b/3c/3d) are all **fixed**, and **layer 3e is now ✅ FIXED on dev** (`7335f918`)
 — the test is **11/11 FULL GREEN**. The 3e writeup (the Groovy indy call on a
@@ -330,10 +330,14 @@ parse-NPE (#1), generics (#2), and the indy `MethodHandle.type()` layers
 [`docs/internal/spring/spring-boot-groovy-indy-mockito-mock-dispatch.md`](../internal/spring/spring-boot-groovy-indy-mockito-mock-dispatch.md).
 The 3c/3d fix writeup is in
 [`docs/internal/spring-boot-groovy-indy-runtime-argcount-3c-FIXED.md`](../internal/spring-boot-groovy-indy-runtime-argcount-3c-FIXED.md).
-Also still relevant: **defect #2 (= family A3 above)** and **bug C** (the
-cold-path deep-recursion overflow). The Hibernate HQL census-H4 timeout
+The 2026-07-01 retry passed 11/11 with
+`CRATONVM_JIT_ALLOW_PACKAGES=groovyjarjarantlr4/`, so this handoff is no longer
+an open known-issue doc. Also still relevant: **defect #2 (= family A3 above)**
+and **bug C** (the cold-path deep-recursion/fault-recovery residual), now tracked
+in [`jit-deep-recursion-fault-recovery.md`](jit-deep-recursion-fault-recovery.md).
+The Hibernate HQL census-H4 timeout
 (`function.json.JsonArrayUnnestTest`) is the same cold ANTLR prediction
-throughput bug and is now consolidated in that handoff's Section 5.
+throughput bug and is now consolidated under bug C.
 
 ## Resolved standalone bugs (full writeups in `docs/internal/`)
 
@@ -368,8 +372,8 @@ removed; the JTA `getInetAddress` per-class report was consolidated into the res
 - [hibernate-hang-clusters-summary.md](../internal/hibernate-hang-clusters-summary.md) — census overview (now in `docs/internal/`); **H1/H2/H3 resolved 2026-06-20**, **H4 root-caused** (its own open doc below).
 - HQL/ANTLR parser census H4 (`function.json.JsonArrayUnnestTest`) is not a
   separate open issue file anymore. It is consolidated into
-  [springrepos-extension-hang-jit-throughput-and-deep-recursion.md](springrepos-extension-hang-jit-throughput-and-deep-recursion.md)
-  Section 5 as a second reproducer for the same cold ANTLR prediction
+  [jit-deep-recursion-fault-recovery.md](jit-deep-recursion-fault-recovery.md)
+  as a second reproducer for the same cold ANTLR prediction
   throughput / JIT backend-coverage cluster.
 
 Also fixed on dev this run (no standalone doc — see commit): `Locale.toLanguageTag()` dropped all subtags for real Locales (`13e8c761`).
