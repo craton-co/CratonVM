@@ -723,6 +723,18 @@ pub(crate) fn native_throwable_get_message(
 
 // --- Throwable additional methods ---
 
+/// True iff `this`'s runtime class is `java.lang.reflect.InvocationTargetException`
+/// (or a subclass) — the only standard throwable whose `getCause()` aliases to a
+/// `target` field. Used to gate the `target`-as-cause fallback so it does not
+/// leak an unrelated `target` field from other Throwable subclasses.
+fn is_invocation_target_exception(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
+    let this_cid = ctx.class_id_of_object(this);
+    match ctx.class_id_by_name("java/lang/reflect/InvocationTargetException") {
+        Some(ite_cid) => this_cid == ite_cid || ctx.is_subclass(this_cid, ite_cid),
+        None => false,
+    }
+}
+
 /// getCause() — read the cause field.
 ///
 /// Real-JDK Throwable has `cause` at slot 2 (after backtrace, detailMessage).
@@ -760,17 +772,25 @@ pub(crate) fn native_throwable_get_cause(
         }
         return Ok(Some(by_name_cause));
     }
-    // ITE / other wrappers: getCause() returns the dedicated `target`
-    // field, not the inherited Throwable.cause. Mirror that here so the
-    // wrapper exception propagates the correct cause to JLS-spec callers.
+    // `InvocationTargetException.getCause()` (and `getTargetException()`) alias
+    // to the dedicated `target` field, not the inherited `Throwable.cause`; this
+    // native backs both. But that aliasing must be gated on the receiver ACTUALLY
+    // being an ITE — a plain `Throwable` subclass that merely declares its own
+    // unrelated `target` field (e.g. Spring's `InvocationRejectedException`,
+    // which holds the rejected *bean* there) must NOT have `getCause()` return
+    // that object. Otherwise callers walking the cause chain — JUnit's
+    // `ExceptionUtils.findNestedThrowables` — `ClassCastException` casting the
+    // non-Throwable target to `Throwable`. Only read `target` for a real ITE.
     let by_name_target = ctx.get_field_by_name(this, "target");
     if let Value::Object(Some(target_obj)) = by_name_target {
-        // Same self-reference guard, in case any wrapper's bytecode
-        // initializes its `target` field with `this` as a sentinel.
-        if target_obj == this {
-            return Ok(Some(Value::Object(None)));
+        if is_invocation_target_exception(ctx, this) {
+            // Same self-reference guard, in case the `target` field is
+            // initialized with `this` as a sentinel.
+            if target_obj == this {
+                return Ok(Some(Value::Object(None)));
+            }
+            return Ok(Some(by_name_target));
         }
-        return Ok(Some(by_name_target));
     }
     // Real-JDK only: when neither `cause` nor `target` named fields hold a
     // value, the cause is genuinely null. The previous synthetic-stub
