@@ -1,8 +1,9 @@
 # Default Moving / Compacting Young Generation
 
-Status: design / not started. XL, GC-coupled. Goal is to close the
-Binary-Trees-18 ~23x throughput gap by making a *moving* young gen the default
-without regressing the correctness invariant.
+Status: **IMPLEMENTED behind `CRATONVM_MOVING_YOUNG` (default-off), validated
+correct** (see "FINISHED" section at end). XL, GC-coupled. A moving young gen now
+runs safely under live JIT frames via complete rewritable shadow coverage; the
+default flip awaits the app gauntlet + two narrow coverage-fallback cases.
 
 ## Goal
 
@@ -194,3 +195,74 @@ fetch, 72-byte tagged `Value` field cells). Separately flagged: bt16/bt18 are
 ~3–6× slower than the 2026-06-10 perf-branch numbers (bt16 1.6 s → 9.9 s;
 HotSpot only ~2× of that is box speed) — a probable throughput **regression**
 worth its own investigation, far higher value than this feature.
+
+## FINISHED — gated moving young gen validated correct (2026-07-01, `feat/moving-young-gen-finish`)
+
+Status: **IMPLEMENTED and validated behind `CRATONVM_MOVING_YOUNG` (default-off).**
+The 2026-06-21 "do NOT implement" verdict was **wrong on both counts**, and both
+were corrected before this work:
+
+1. **"GC is ~0 % of the gap" was an 8g artifact.** A later adversarial pass proved
+   the young semi-space is `Xmx/4` and minor GC fires at 50 % occupancy, so the
+   young-collection *count scales ~1/Xmx*. "2 sweeps" is just what 8g produces; at
+   realistic heaps GC runs constantly (measured: bt16 @512m = 8 collections). The
+   very 8g regime that "proved GC doesn't participate" is the one that fires 0–2
+   cycles — it masks both the participation and the corruption.
+2. **The "silent corruption" was incomplete shadow coverage, not an intrinsic
+   flaw.** `collect_live_oop_homes` (x64.rs) had been *narrowed* (B-K kafka fix) to
+   publish only register-invisible operand oops — a supplement to the conservative
+   scan, never the complete rewritable map Route A step 1 requires. A moving copy
+   then relocated frame-slot / local oops the conservative scan could mark but not
+   rewrite → dangling → the 67674804 / 68199090 under-counts.
+
+### What was implemented (Route A, completed)
+
+- **Complete coverage** (`x64.rs::collect_live_oop_homes`): under the gate,
+  publishes *every* live oop — operand entries in registers **and** frame slots,
+  plus every oop local in its register or canonical frame slot (deduped), seeded
+  with `param_oop_mask` for early ref-params. The push/reload codegen already
+  supported both `Reg` and `Frame` homes; only the enumeration was incomplete.
+- **Gate** `CRATONVM_MOVING_YOUNG` implies shadow codegen + root scan + remap
+  (`shadow_stack_maps_enabled`/`shadow_stack_enabled` OR it in).
+- **Suppress the conservative JIT scan** (`roots.rs`) under the gate — a
+  fully-precise frame needs no conservative backstop, and mixing a
+  conservatively-marked slot with a precisely-relocated object is the documented
+  corruption risk. The shadow stack is then the sole precise JIT root set.
+- **Run the moving (Cheney) cycle under live JIT** (`gen_heap.rs::collect_garbage_inner`)
+  instead of diverting to the non-moving sweep; the `honor_promotion_oom_risk`
+  guard is kept as an abort-free fallback when both generations are ~full.
+
+### Validation (this box, `cvmmovyoung.exe`)
+
+Every checksum = HotSpot; the moving cycle actually fires (SHADOW remap logs);
+0 faults, 0 aborts, 0 non-moving fallbacks:
+
+| case | heap | checksum | moving cycles | HotSpot |
+|---|---|---|---|---|
+| bt18 | 8g   | 68332206 ✓ | 2 | 68332206 |
+| bt18 | 4g   | 68332206 ✓ | 4 | — |
+| bt16 | 2g   | 14985902 ✓ | 2 | 14985902 |
+| bt16 | 512m | 14985902 ✓ | 8 | — |
+| bt14 | 256m | 3222190 ✓  | 3 | 3222190 |
+| **old reg-only** (`FORCE_MOVING+SHADOW_STACK`) | 8g | **68199090 ✗** | — | (proves the fix is *completeness*) |
+
+Default path is byte-identical (all new logic behind `if complete` / the gate);
+`cargo test -p cratonvm-gc` = 737 passed, jit lib = 847 passed (4 pre-existing
+aarch64 branch-overflow failures, unrelated to x64/GC). Perf is neutral-to-slightly
+positive at these heaps (bt14 @512m ~9 % faster; bt18 @8g ~2 % faster) — consistent
+with much of the bt gap being per-node mutator cost, not GC.
+
+### Remaining before a default flip (step 6)
+
+Not done here — the flip needs the app gauntlet, which this session could not run
+end-to-end. Two narrow coverage gaps remain and are the mandatory `step 5`
+fallback's job to catch (they never bite bt10/14/16/18):
+
+- Methods with **>64 locals** → `compute_local_oop_masks` returns empty → no local
+  oops published. Needs: fall back to non-moving for a cycle where such a frame is
+  live (or refuse to JIT it under the flag).
+- **PCs the forward oop dataflow never reached** (e.g. exception-handler-only
+  entries) publish no locals. Same fallback applies.
+
+Until those are covered by a coverage-completeness signal + fallback, keep the flag
+default-off. Route B (deopt safepoint maps) remains the eventual unification.

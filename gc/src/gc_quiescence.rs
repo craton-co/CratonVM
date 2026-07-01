@@ -34,6 +34,24 @@ static JIT_ACTIVE_DEPTH: AtomicUsize = AtomicUsize::new(0);
 pub static ENTER_COUNT: AtomicUsize = AtomicUsize::new(0);
 pub static LEAVE_COUNT: AtomicUsize = AtomicUsize::new(0);
 
+/// Whether the **default moving / compacting young generation**
+/// (`CRATONVM_MOVING_YOUNG`) is enabled. Cached on first read.
+///
+/// When on, `gen_heap::collect_garbage_inner` runs the moving (Cheney) young
+/// collection even while JIT frames are live (`is_active()`), instead of
+/// diverting to the non-moving sweep. Safe only because the JIT publishes a
+/// COMPLETE rewritable precise root map via the shadow stack and the
+/// conservative frame scan is suppressed (see the vm crate's
+/// `conservative_roots::moving_young_enabled` and
+/// `docs/feature-designs/default-moving-young-gen.md`). Off by default; gated for
+/// validation against the bt18 = 68332206 invariant.
+#[inline]
+pub fn moving_young_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("CRATONVM_MOVING_YOUNG").is_some())
+}
+
 /// Increment the global JIT-active counter. Called from the VM crate's
 /// `JitEntryGuard::enter` immediately before transferring control to JIT
 /// code. Returns the new depth (1-based).
