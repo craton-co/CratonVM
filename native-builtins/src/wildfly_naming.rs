@@ -679,6 +679,55 @@ fn initial_context_env(ctx: &dyn NativeContext, this: ObjectRef) -> Value {
     }
 }
 
+/// When a custom `InitialContextFactoryBuilder` has been installed in the JDK's
+/// `NamingManager` (e.g. Spring's `SimpleNamingContextBuilder`, which
+/// `JtaTransactionManager` serialization tests use to stub a JNDI environment),
+/// the stock `InitialContext` bytecode resolves every name through the `Context`
+/// that builder produces. Our WildFly/Tomcat-oriented natives otherwise shadow
+/// that bytecode and consult the flat store, so a `lookup` of a builder-bound
+/// name misses with `NameNotFoundException` (unlike HotSpot). Reproduce the
+/// spec'd `getDefaultInitCtx()` step: if a builder is installed, ask
+/// `NamingManager.getInitialContext(env)` for the initial `Context` and let the
+/// caller delegate to it via virtual dispatch. Returns `None` when no builder is
+/// installed, preserving the flat-store / `java:` URL-context defaults for
+/// WildFly / Keycloak / Tomcat (none of which install an
+/// `InitialContextFactoryBuilder`). The returned context's concrete class is the
+/// builder's own (e.g. `SimpleNamingContext`), never `InitialContext`, so the
+/// delegation does not recurse back into these natives.
+fn builder_initial_context(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+) -> Result<Option<ObjectRef>, MethodCallFailed> {
+    if ctx
+        .ensure_class_initialized("javax/naming/spi/NamingManager")
+        .is_err()
+    {
+        return Ok(None);
+    }
+    let has_builder = matches!(
+        ctx.invoke(
+            "javax/naming/spi/NamingManager",
+            "hasInitialContextFactoryBuilder",
+            "()Z",
+            &[],
+        )?,
+        Some(Value::Int(v)) if v != 0
+    );
+    if !has_builder {
+        return Ok(None);
+    }
+    let env = initial_context_env(ctx, this);
+    match ctx.invoke(
+        "javax/naming/spi/NamingManager",
+        "getInitialContext",
+        "(Ljava/util/Hashtable;)Ljavax/naming/Context;",
+        &[env],
+    )? {
+        Some(Value::Object(Some(c))) => Ok(Some(c)),
+        _ => Ok(None),
+    }
+}
+
 /// True iff Apache Tomcat's `org.apache.naming.ContextBindings` reports a
 /// thread or class-loader binding — i.e. a web-app naming context is active
 /// on the current thread. This class is absent (or never bound) under
@@ -803,6 +852,19 @@ fn do_context_lookup(
     this: ObjectRef,
     name: &str,
 ) -> MethodCallResult {
+    // A user-installed `InitialContextFactoryBuilder` (e.g. Spring's
+    // `SimpleNamingContextBuilder`) owns the whole namespace — resolve through
+    // its `Context`, exactly as the stock `InitialContext` bytecode would.
+    if let Some(deleg) = builder_initial_context(ctx, this)? {
+        let name_obj = ctx.create_string(name);
+        return ctx.invoke_virtual(
+            deleg,
+            "lookup",
+            "(Ljava/lang/String;)Ljava/lang/Object;",
+            &[Value::Object(Some(name_obj))],
+        );
+    }
+
     // `java:` URL-scheme names: hand off to the JDK's URL-context-factory
     // chain so Tomcat's own `org.apache.naming` context resolves the name
     // against `ContextBindings`. Falls back to the flat store on null/err.
@@ -869,6 +931,18 @@ fn native_context_bind(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         }
     };
 
+    // Delegate to a user-installed `InitialContextFactoryBuilder`'s context so
+    // reads and writes share the same namespace (see `do_context_lookup`).
+    if let Some(deleg) = builder_initial_context(ctx, this)? {
+        let name_obj = ctx.create_string(&name);
+        return ctx.invoke_virtual(
+            deleg,
+            "bind",
+            "(Ljava/lang/String;Ljava/lang/Object;)V",
+            &[Value::Object(Some(name_obj)), Value::Object(Some(value))],
+        );
+    }
+
     // `java:` URL-scheme names go through the JDK URL-context factory so
     // the binding lands in Tomcat's own context (kept consistent with the
     // namespace its `lookup` reads from).
@@ -919,6 +993,16 @@ fn native_context_rebind(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         }
     };
 
+    if let Some(deleg) = builder_initial_context(ctx, this)? {
+        let name_obj = ctx.create_string(&name);
+        return ctx.invoke_virtual(
+            deleg,
+            "rebind",
+            "(Ljava/lang/String;Ljava/lang/Object;)V",
+            &[Value::Object(Some(name_obj)), Value::Object(Some(value))],
+        );
+    }
+
     if is_java_url_scheme(&name) {
         let env = initial_context_env(ctx, this);
         if let Some(url_ctx) = java_url_context(ctx, env)? {
@@ -956,6 +1040,16 @@ fn native_context_unbind(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         Some(n) => n,
         None => return Err(throw_invalid_name(ctx, "null name")),
     };
+
+    if let Some(deleg) = builder_initial_context(ctx, this)? {
+        let name_obj = ctx.create_string(&name);
+        return ctx.invoke_virtual(
+            deleg,
+            "unbind",
+            "(Ljava/lang/String;)V",
+            &[Value::Object(Some(name_obj))],
+        );
+    }
 
     if is_java_url_scheme(&name) {
         let env = initial_context_env(ctx, this);
