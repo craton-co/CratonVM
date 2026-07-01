@@ -627,7 +627,131 @@ fn alloc_synthetic(
 // Native callback bodies.
 // ---------------------------------------------------------------------------
 
+/// `CRATONVM_REAL_STAX_FACTORY` gate (**default ON**; set `=0` to disable).
+///
+/// When ON, `XMLInputFactory.newInstance()` / `newFactory()` first try to obtain
+/// a real, concrete third-party StAX provider registered on the classpath via
+/// `ServiceLoader` (e.g. Woodstox's `com.ctc.wstx.stax.WstxInputFactory`). Such
+/// a provider runs as real JDK bytecode and honours `setXMLResolver`, external
+/// **general**-entity expansion, and `IS_SUPPORTING_EXTERNAL_ENTITIES` — none of
+/// which the synthetic cursor factory below supports (it silently ignores the
+/// resolver and leaves `&ext;` references unexpanded). This is exactly what
+/// HotSpot does when Woodstox is on the classpath, so preferring the real
+/// provider is the reference-JVM-faithful default (e.g. Hibernate's
+/// `EntityResolverTest`, whose `Parent.hbm.xml` pulls in `child.xml` via a
+/// `classpath://` SYSTEM entity).
+///
+/// The synthetic factory is retained as the fallback for when **no** concrete
+/// third-party provider is registered: the JDK's own
+/// `com.sun.xml.internal.stream.XMLInputFactoryImpl` does not run on CratonVM
+/// (its `fEntityManager` is null → NPE on first parse), so WildFly's
+/// `XMLInputFactoryUtil.create()` boot path stays on the stub when no provider
+/// is present. Validated regression-free on the Hibernate XML-binding gauntlet
+/// (12/12, `EntityResolverTest` FAIL→PASS, no others changed) and as a no-op on
+/// no-provider classpaths; the escape hatch (`=0`) restores the synthetic stub
+/// if a non-Woodstox provider ever misbehaves on CratonVM.
+///
+/// `"0"` ⇒ off (escape hatch); unset or any other value ⇒ on.
+fn real_stax_factory_gate() -> bool {
+    static GATE: OnceLock<bool> = OnceLock::new();
+    *GATE.get_or_init(|| match std::env::var("CRATONVM_REAL_STAX_FACTORY") {
+        Ok(v) => v != "0",
+        Err(_) => true,
+    })
+}
+
+/// Extract a non-null `ObjectRef` from an `invoke` result, swallowing errors /
+/// nulls into `None` (so the caller can fall back to the synthetic factory).
+fn obj_result(r: MethodCallResult) -> Option<ObjectRef> {
+    match r {
+        Ok(Some(Value::Object(Some(o)))) => Some(o),
+        _ => None,
+    }
+}
+
+/// Resolve a real, concrete StAX `XMLInputFactory` provider from the classpath
+/// via `ServiceLoader` — mirroring `FactoryFinder`'s service-provider step but
+/// **without** its JDK fallback (which is broken on CratonVM). Returns the
+/// provider object when a concrete third-party factory is registered; `None`
+/// otherwise (no provider, or any step failing → caller uses the synthetic stub).
+fn try_resolve_real_factory(ctx: &mut dyn NativeContext) -> Option<ObjectRef> {
+    // Class mirror for the service interface.
+    let name_str = ctx.create_string("javax.xml.stream.XMLInputFactory");
+    let clazz = obj_result(ctx.invoke(
+        "java/lang/Class",
+        "forName",
+        "(Ljava/lang/String;)Ljava/lang/Class;",
+        &[Value::Object(Some(name_str))],
+    ))?;
+
+    // Thread-context class loader; fall back to the system loader when null so
+    // `ServiceLoader` scans the application classpath rather than the bootstrap.
+    let tccl = match ctx.invoke("java/lang/Thread", "currentThread", "()Ljava/lang/Thread;", &[]) {
+        Ok(Some(Value::Object(Some(t)))) => obj_result(ctx.invoke(
+            "java/lang/Thread",
+            "getContextClassLoader",
+            "()Ljava/lang/ClassLoader;",
+            &[Value::Object(Some(t))],
+        )),
+        _ => None,
+    };
+    let loader = tccl.or_else(|| {
+        obj_result(ctx.invoke(
+            "java/lang/ClassLoader",
+            "getSystemClassLoader",
+            "()Ljava/lang/ClassLoader;",
+            &[],
+        ))
+    });
+    let loader_val = loader.map_or(Value::Object(None), |l| Value::Object(Some(l)));
+
+    // ServiceLoader.load(XMLInputFactory.class, loader).iterator()
+    let sl = obj_result(ctx.invoke(
+        "java/util/ServiceLoader",
+        "load",
+        "(Ljava/lang/Class;Ljava/lang/ClassLoader;)Ljava/util/ServiceLoader;",
+        &[Value::Object(Some(clazz)), loader_val],
+    ))?;
+    let it = obj_result(ctx.invoke(
+        "java/util/ServiceLoader",
+        "iterator",
+        "()Ljava/util/Iterator;",
+        &[Value::Object(Some(sl))],
+    ))?;
+
+    // First registered provider, if any.
+    match ctx.invoke("java/util/Iterator", "hasNext", "()Z", &[Value::Object(Some(it))]) {
+        Ok(Some(Value::Int(1))) => {}
+        _ => return None,
+    }
+    let provider = obj_result(ctx.invoke(
+        "java/util/Iterator",
+        "next",
+        "()Ljava/lang/Object;",
+        &[Value::Object(Some(it))],
+    ))?;
+
+    // Guard: the provider must be a concrete subclass, never the abstract base
+    // `javax/xml/stream/XMLInputFactory` itself — returning that would re-enter
+    // our natives (newInstance et al. are keyed on the abstract class) and the
+    // resolver/entity handling would be no better than the synthetic stub.
+    let cid = ctx.class_id_of_object(provider);
+    match ctx.class_name_of_id(cid) {
+        Some(n) if n != "javax/xml/stream/XMLInputFactory" => Some(provider),
+        _ => None,
+    }
+}
+
 fn native_factory_new_instance(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    // Prefer a real, concrete third-party StAX provider (e.g. Woodstox) when one
+    // is registered and the gate is on — it honours XMLResolver / external
+    // general-entity expansion that the synthetic cursor factory ignores. See
+    // `real_stax_factory_gate`.
+    if real_stax_factory_gate() {
+        if let Some(real) = try_resolve_real_factory(ctx) {
+            return Ok(Some(Value::Object(Some(real))));
+        }
+    }
     let factory = alloc_synthetic(ctx, "javax/xml/stream/XMLInputFactory")?;
     Ok(Some(Value::Object(Some(factory))))
 }
