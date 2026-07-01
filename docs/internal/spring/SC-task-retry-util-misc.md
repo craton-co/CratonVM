@@ -1,5 +1,15 @@
 # SC-task-retry-util-misc
 
+> **UPDATE 2026-07-01:** RC1 and RC3 below are resolved on current `dev`.
+> RC1's synthetic unmodifiable collection wrappers now declare
+> `java/io/Serializable` in `vm/src/vm/vm_init.rs`. RC3's `Properties.store`
+> path is now native-backed by `native-builtins/src/properties_sidetable.rs`,
+> emits the JDK-style `#<date>` line before the first entry, and has a focused
+> regression test (`render_store_text_includes_date_before_first_entry`).
+> Remaining actionable items in this cluster are RC4 (Throwable deserialize),
+> RC6 (ByteBuddy class injection), and RC7 (AQS/ForkJoinPool throttle); RC5 is
+> a timing/perf artifact.
+
 Cluster investigation: Task-executor / retry / util-misc.
 Run log: `C:/craton/CratonVM-spring0621/spring-suite/full-run/spring-core.log` (+ `spring-core.raw.log` for stack traces).
 CratonVM Rust source: `C:/craton/CratonVM-spring0621`. Spring test/main source: `C:/craton/cratonvm/apps/spring-framework/spring-core`.
@@ -10,9 +20,9 @@ Summary table:
 
 | # | Issue | Tests | Severity | Confidence | Recommendation |
 |---|-------|-------|----------|-----------|----------------|
-| 1 | `Collections.unmodifiableMap` wrapper is not `Serializable` | MimeType.serialize (1) | Medium | High | Fix |
+| 1 | ~~`Collections.unmodifiableMap` wrapper is not `Serializable`~~ | MimeType.serialize (1) | Medium | High | **Fixed on dev** |
 | 2 | Case-insensitive map value case-collapse (`LinkedCaseInsensitiveMap`) | MimeType.compareToCaseSensitivity (1) | Medium | Med-High | Handoff (merge w/ LinkedCaseInsensitiveMapTests owner) |
-| 3 | `Properties.store(OutputStream,null)` omits leading `#<date>` comment line | PropertiesPersister x2 | Low-Med | High (symptom), Med (cause) | Fix |
+| 3 | ~~`Properties.store(OutputStream,null)` omits leading `#<date>` comment line~~ | PropertiesPersister x2 | Low-Med | High | **Fixed on dev** |
 | 4 | Real `ObjectInputStream` cannot deserialize a `Throwable` | SerializationUtils.cloneException (1) | Medium | Med | Handoff |
 | 5 | Tight (20 ms) retry-timeout fires one attempt early — interpreter/Mockito timing | RetryTemplate x3 | Low | High | Handoff (env/perf) |
 | 6 | ByteBuddy `ClassInjector$UsingReflection` NoClassDefFoundError (AssertJ Assumptions) | TestGroup x2 | Medium | High | Handoff (ByteBuddy family) |
@@ -21,6 +31,12 @@ Summary table:
 ---
 
 ## Root cause 1 — `Collections.unmodifiableMap` / `Map.of` wrapper class is not `Serializable`
+
+> **STATUS: RESOLVED on dev.** The synthetic unmodifiable collection wrappers
+> now load `java/io/Serializable` and include it in their interface lists in
+> `vm/src/vm/vm_init.rs`; the comments there call out Spring `MimeType`
+> serialization specifically. The historical analysis below is retained for
+> provenance.
 
 **Symptom**
 `MimeTypeTests.serialize()` fails at *serialize* time:
@@ -97,6 +113,13 @@ LinkedCaseInsensitiveMap<String> b = new LinkedCaseInsensitiveMap<>(); b.put("fo
 
 ## Root cause 3 — `Properties.store(OutputStream, null)` omits the leading `#<date>` comment line
 
+> **STATUS: RESOLVED on dev.** `Properties.store(OutputStream,String)` and
+> `store(Writer,String)` are now registered in
+> `native-builtins/src/properties_sidetable.rs`. The store text is built from
+> side-table/virtual `entrySet()` data, includes the JDK-style date comment
+> before entries, and preserves user comments before the date line. Regression:
+> `render_store_text_includes_date_before_first_entry`.
+
 **Symptom**
 `PropertiesPersisterTests.propertiesPersister()` / `propertiesPersisterWithWhitespace()` fail (log 260-261). Actual stored bytes (raw 1345-1359):
 ```
@@ -115,6 +138,9 @@ Assertion `contains("\ncode2=message2")` fails — the **first** entry has no pr
 - All `...WithReader*` (Writer path) pass.
 
 **Root cause(s)**
+The original analysis below is superseded by the native `Properties.store`
+implementation noted above. The failure signature remains useful history.
+
 `Properties.store` is **not** registered as a CratonVM native (registration block `native-builtins/src/properties_sidetable.rs:1971-2163` lists load/getProperty/setProperty/put/entrySet/etc. — no `store`), so it runs real `Properties.store0` bytecode, which does `bw.write("#"); bw.write(new Date().toString()); bw.newLine();` before the entries. The `#date` line is entirely absent in CratonVM output, so something on that comment-write path is dropped. Leading suspect: CratonVM **shadows `BufferedWriter`** with native `write`/`newLine` overrides that delegate via `bw_delegate_out` (`native-builtins/src/phases_late.rs:3864`, registrations at `:6557/:6585/:6604/:6633/:6657/:6668`). Either the comment line write is lost there, or `new Date().toString()` yields empty and the `#`+newLine collapse. Entry lines themselves write correctly, so the defect is specific to the comment/date emission, not the body.
 
 **Reproduction sketch**
