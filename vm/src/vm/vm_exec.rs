@@ -12216,6 +12216,31 @@ fn invoke_on_class_shared_inner(
                         class_name, method_name, descriptor
                     );
                 }
+                // A missing Hibernate-enhanced `$$_hibernate_*` accessor must
+                // surface as a CATCHABLE `java.lang.NoSuchMethodError` (JVMS §5.4.3.3:
+                // an unresolved method is a `LinkageError`, which is throwable), not
+                // the uncatchable internal abort below. Under the loader-aware gate
+                // the bytecode-enhancement test harness now reaches such call sites
+                // (e.g. Hibernate's HHH-16572 `InvalidPropertyNameTest` exercises a
+                // field whose enhanced read-accessor is intentionally absent, and the
+                // loader-faithful lambda dispatch that runs the enhanced test body
+                // exposes it) — without a throwable form the process dies (CRASH)
+                // instead of the framework's error path handling it. Scope: gate-on +
+                // the `$$_hibernate_` accessor family only → gate-off byte-identical,
+                // and passing call sites (which never reach this terminal) unaffected.
+                if crate::runtime::env_cache::loader_aware_resolution()
+                    && method_name.starts_with("$$_hibernate_")
+                {
+                    let msg = format!("{class_name}.{method_name}{descriptor}");
+                    if let Ok(exc) = crate::runtime::exceptions::create_exception_object(
+                        shared,
+                        thread,
+                        "java/lang/NoSuchMethodError",
+                        Some(&msg),
+                    ) {
+                        return Err(MethodCallFailed::ExceptionThrown(exc));
+                    }
+                }
                 return Err(MethodCallFailed::InternalError(VmError::Linkage(
                     LinkageError::NoSuchMethodError {
                         class_name,

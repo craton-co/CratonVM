@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | PARTIAL — eager-enhancement cluster + the two gate-on crash *regressions* FIXED behind gate `CRATONVM_LOADER_AWARE_RESOLUTION` (default **OFF**). The `enhancement.lazy.*` / `mapping.lazytoone.*` cluster is still OPEN (deeper SessionFactory-integration blocker, see below). Branch `fix/lazy-enhancement-gate`. |
+| **Status** | PARTIAL — eager-enhancement cluster, the two gate-on crash *regressions*, the SessionFactory-build blocker, AND (2026-07-01) the `enhancement.lazy.*` cluster all FIXED behind gate `CRATONVM_LOADER_AWARE_RESOLUTION` (default **OFF**). gate-on `gated_subset` PASS **31 → 54** (0 CRASH); **19 `enhancement.lazy.*` pass** (was 0), incl. `LazyBasicFieldAccessTest`. The last layer was **loader-faithful lambda dispatch** (NOT the "MethodHandle field-setter" that the earlier note misdiagnosed — see 2026-07-01 update). Remaining lazy/lazytoone FAILs are separate residual issues. Branch `fix/lazy-enhancement-lambda-dispatch` (off dev); NOT merged. |
 | **Area** | VM core — real-JDK-mode loader-faithful resolution: superclass/interface *linking* (not just `new`/checkcast/ldc), `invokespecial` owner dispatch, and link-time verification of trusted runtime-generated classes. |
 | **Builds on** | [hib-proxyclassreuse-loader-blind-class-resolution.md](hib-proxyclassreuse-loader-blind-class-resolution.md) — the three-layer `CONSTANT_Class` / `defineClass`-namespace / `findLoadedClass` fix and the `resolve_class_loader_aware` mechanism. |
 
@@ -95,36 +95,71 @@ the lookup class's recorded defining-loader (`peek_loader_namespace_id`) — the
 `defineClass1` computes — falling back to the legacy i32 path otherwise (byte-identical
 gate-off). With it, `enhancement.lazy.*` now build the SessionFactory and run.
 
-**Next OPEN layer (3rd distinct root cause): MethodHandle field-setter accessor.** The lazy
-tests now fail deeper, at `s.persist(entity)`:
+### UPDATE 2026-07-01 — lazy cluster FIXED (7th fix: loader-faithful lambda dispatch)
+
+**The "MethodHandle field-setter" diagnosis above was WRONG** (a misdiagnosis). The
+`s.persist(entity)` failure —
 `PropertyAccessException: Could not set value of type [java.lang.Long]: '<Entity>.id'` ←
-`IllegalArgumentException: Can not set java.lang.Long field <Entity>.id to <Entity>`.
-LOCALIZED (CRATONVM_DBG_ID invoke-arg trace): the id value is the correct `Long` all the way
-down — `setIdentifier(entity, Long)` → `EnhancedSetterImpl.set(entity, Long)` →
-`SetterFieldImpl.set(entity, Long)` → `Field.set(entity, Long)` →
-`jdk.internal.reflect.MethodHandleObjectFieldAccessorImpl.set(entity, Long)` — ALL receive the
-`Long`. The corruption is INSIDE that accessor's `set(obj, value)` (JDK bytecode): it does
-`setter.invokeExact(obj, value)` on an `asType`-adapted putField MethodHandle (call-site
-`(Object,Object)V`, MH type `(<Entity>, Long)void`); our VM throws a spurious
-`ClassCastException` from that invoke, caught at the accessor's `catch (ClassCastException)`
-which rethrows via `throwSetIllegalArgumentException(value)` — and the value it reports is the
-`<Entity>`, i.e. the caller's `value` local (slot 2) reads as the entity by then. Not JIT
-(`--nojit` reproduces). `detached.*` (generated-id persist) PASS, so plain id generation works;
-this is the FIELD-ACCESS enhanced entity forcing the MethodHandle reflective-accessor path.
-FURTHER LOCALIZED (DBG_MH on `mh_dispatch` + DBG_MHX on the `invokeExact` native): the JDK
-builds both accessors via `JLIA.unreflectField(field, isSetter)` → `IMPL_LOOKUP.unreflect{Getter,
-Setter}` → our synthetic `MH_KIND_GETTER`/`MH_KIND_SETTER` (asType is a passthrough that only
-stamps `type`). The field **GETTER** `getter.invokeExact(obj)` (`(Object)Object`) routes correctly
-to the `invokeExact` native → `mh_dispatch` (MH_KIND_GETTER) → reads the field — WORKS. The field
-**SETTER** `setter.invokeExact(obj, value)` (`(Object,Object)V`, 2-arg **void**) does NOT reach the
-`invokeExact` native / `mh_dispatch` at all — it diverges in the interpreter's signature-polymorphic
-invoke routing (`vm/src/vm/vm_exec.rs` ~11440-11710, the `check_override` / Some-vs-None-arm /
-poly-desc dispatch), throwing a spurious `ClassCastException` and leaving the caller's `value` local
-reading as the entity. The plain `MH_KIND_SETTER` path in `mh_dispatch` sets the field directly with
-no cast/CCE, so the fix is to make the 2-arg-void field-setter `invokeExact` reach it (mirroring the
-getter). Risk: that routing has many documented special cases (Groovy/Jackson/records/Spring) — needs
-a MethodHandle regression harness. Separate follow-up (MethodHandle subsystem, not loader-faithful
-resolution).
+`IllegalArgumentException: Can not set java.lang.Long field <Entity>.id to <Entity>` — is
+**NOT** a MethodHandle-subsystem bug and does **not** originate in `setter.invokeExact`. The
+IAE is thrown from `jdk.internal.reflect.MethodHandleFieldAccessorImpl.ensureObj` (JDK line
+63, **before** any `invokeExact`), which does
+`declaringClass.isAssignableFrom(o.getClass())` and, when false, calls
+`throwSetIllegalArgumentException(o)` — reporting the *object* `o` (the entity), which is
+exactly why "the value reads as the entity." (Confirmed with `-Dcraton.trace`; there is no
+`ClassCastException` anywhere — `CRATONVM_DBG_CCE` is silent.)
+
+**Root cause — loader-faithful LAMBDA dispatch gap.** `isAssignableFrom` returned false
+because there are **two `<Entity>` class_ids**: the enhanced copy Hibernate's mapped class /
+reflective `Field` use (defined by the enhancing `UserDefined` loader), and an **un-enhanced
+copy the test's `new <Entity>()` created** (Application loader). Traced with per-`new` /
+`isAssignableFrom` instrumentation:
+- The test *instance* is the ENHANCED test class (`Constructor.newInstance` allocates the
+  enhancing-loader copy — correct).
+- But the enhancement test's transaction body is a **lambda** (`inTransaction(s -> { …
+  s.persist(new <Entity>()) … })`), and CratonVM dispatched that lambda's implementation
+  method to the **Application (un-enhanced)** copy of the test class. Its `new <Entity>()`
+  therefore resolved the un-enhanced entity, which is not assignable to the enhanced mapped
+  class → `ensureObj` throws.
+- Why: the lambda call site records its invokedynamic **host** class in
+  `SharedVm::lambda_proxy_hosts` (the enhanced copy), but `try_lambda_dispatch`
+  (`vm/src/runtime/interpreter.rs`) resolved the impl method by **NAME**
+  (`invoke_shared` / `load_class` / receiver-class-name `invoke_or_native`), collapsing to the
+  ONE global (un-enhanced) copy. This lambda is `kind=InvokeVirtual` (a `this::body`-shaped
+  method reference), so the collapse happens in the **virtual** arm, which re-resolved the
+  captured receiver's class NAME instead of using its runtime class_id.
+
+**Fix (gated on `CRATONVM_LOADER_AWARE_RESOLUTION`, `try_lambda_dispatch`).** Resolve the
+lambda impl class through the host's defining loader and override dispatch on divergence,
+mirroring the virtual/`invokespecial` divergence override in `execute_invoke_kind`:
+- `InvokeStatic` / `InvokeSpecial` / `NewInvokeSpecial`: `impl_class_override =
+  lookup_loader_initiated(lambda_proxy_hosts[proxy], impl_handle.class_name)` when it diverges
+  from the global name-resolved copy; dispatch via `invoke_on_class_shared[_no_retarget]` on
+  that class_id.
+- `InvokeVirtual` / `InvokeInterface`: dispatch on the captured receiver's OWN runtime
+  class_id when it is a real (non-proxy) class whose name matches yet whose id diverges from
+  the global copy.
+Divergence-only + gate → **byte-identical gate-off**.
+
+**8th fix (general robustness, still gated): missing `$$_hibernate_*` accessor → CATCHABLE
+`NoSuchMethodError`.** Making the lambda body run in the enhanced frame let Hibernate's
+HHH-16572 `InvalidPropertyNameTest` reach `entity.$$_hibernate_read_property()`, whose enhanced
+read-accessor is intentionally absent. The terminal invoke path in
+`invoke_on_class_shared_inner` (`vm_exec.rs`) raised an **uncatchable**
+`InternalError(Linkage(NoSuchMethodError))` → process abort (CRASH). Per JVMS §5.4.3.3 an
+unresolved method is a throwable `LinkageError`; under the gate + for the `$$_hibernate_`
+accessor family only, construct a catchable `java.lang.NoSuchMethodError` so the framework's
+error path handles it (CRASH → FAIL). Scoped so no passing call site (which never reaches the
+terminal) is affected; gate-off byte-identical.
+
+**Results (real-JDK, JIT on, `gated_subset.txt`).** gate-on PASS **31 → 54** (+23; **19 of
+`enhancement.lazy.*`** now pass, up from 0 — incl. `LazyBasicFieldAccessTest`,
+`LazyBasicPropertyAccessTest`, `OnlyLazyBasicUpdateTest`, `EagerAndLazyBasicUpdateTest`),
+**0 CRASH** (was 1: `InvalidPropertyNameTest` CRASH → FAIL ok=1/2), ABORTED=2 (the
+`assumeTrue` skips `InheritedTest`/`MappedSuperclassTest`). `LazyBasicFieldAccessTest`:
+gate-on ok=2/2, gate-off ok=0/2 (byte-identical to pre-fix). MethodHandle unit/integration
+tests green (`wp2_5_proxy`, `wave3_b2_dispatch`, `wave2_c_methodhandles`); native-builtins
+2711/0. Branch `fix/lazy-enhancement-lambda-dispatch` (off dev). NOT merged (needs sign-off).
 
 ### Precise root cause (traced 2026-06-30) — original SessionFactory CCE characterization
 
