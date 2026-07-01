@@ -167,6 +167,67 @@ const ARG_REGS: [u8; 4] = [RCX, RDX, R8, R9];
 #[cfg(not(target_os = "windows"))]
 const ARG_REGS: [u8; 6] = [RDI, RSI, RDX, RCX, R8, R9];
 
+/// Native-stack probe stride used by the x64 JIT prologue.
+///
+/// Windows grows a thread stack one guard page at a time, and Unix kernels use
+/// the same page granularity for stack expansion / guard detection. A JIT frame
+/// that subtracts more than one page from RSP without probing can skip over the
+/// guard page; deep compiled recursion then faults later in arbitrary helper or
+/// shadow-stack code. Probe one page at a time before the subtract, then keep a
+/// one-page headroom probe below the final RSP.
+const STACK_BANG_PAGE_SIZE: i32 = 4096;
+
+/// Keep code size bounded for malformed or extreme bytecode. A method needing a
+/// frame larger than this falls back to the interpreter instead of emitting a
+/// giant inline probe sequence.
+const MAX_STACK_BANG_PROBES: usize = 512;
+
+fn jit_stack_bang_enabled() -> bool {
+    static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| {
+        if std::env::var_os("CRATONVM_JIT_NO_STACK_BANG").is_some() {
+            return false;
+        }
+        match std::env::var("CRATONVM_JIT_STACK_BANG") {
+            Ok(v) => !matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "off" | "no"
+            ),
+            Err(_) => true,
+        }
+    })
+}
+
+/// RSP-relative displacements to probe before `sub rsp, frame_size`.
+///
+/// Returned values are negative displacements from the pre-subtract RSP. They
+/// cover every page crossed by the frame allocation and include the exact final
+/// frame bottom when it is not page-aligned.
+fn stack_bang_frame_probe_disps(frame_size: i32) -> Option<Vec<i32>> {
+    if frame_size <= 0 {
+        return Some(Vec::new());
+    }
+    let mut disps = Vec::new();
+    let mut off = STACK_BANG_PAGE_SIZE;
+    while off <= frame_size {
+        if disps.len() >= MAX_STACK_BANG_PROBES {
+            return None;
+        }
+        disps.push(-off);
+        off = off.saturating_add(STACK_BANG_PAGE_SIZE);
+        if off <= 0 {
+            return None;
+        }
+    }
+    if frame_size % STACK_BANG_PAGE_SIZE != 0 {
+        if disps.len() >= MAX_STACK_BANG_PROBES {
+            return None;
+        }
+        disps.push(-frame_size);
+    }
+    Some(disps)
+}
+
 // ---------------------------------------------------------------------------
 // AVX2 runtime detection via CPUID
 // ---------------------------------------------------------------------------
@@ -9774,6 +9835,35 @@ impl Compiler {
         }
     }
 
+    /// MOV EAX, [RSP + disp32].
+    ///
+    /// Used only for stack banging. EAX is caller-saved and is not an incoming
+    /// Java argument on either supported x64 ABI, so clobbering it in the
+    /// prologue is safe before parameter shuffling starts.
+    fn emit_stack_bang_load(&mut self, disp: i32) {
+        self.buf.emit(&[0x8B, 0x84, 0x24]);
+        self.buf.emit(&disp.to_le_bytes());
+    }
+
+    fn emit_stack_bang_before_frame_alloc(&mut self, frame_size: i32) {
+        if !jit_stack_bang_enabled() {
+            return;
+        }
+        let Some(disps) = stack_bang_frame_probe_disps(frame_size) else {
+            self.failed = true;
+            return;
+        };
+        for disp in disps {
+            self.emit_stack_bang_load(disp);
+        }
+    }
+
+    fn emit_stack_bang_headroom(&mut self) {
+        if jit_stack_bang_enabled() {
+            self.emit_stack_bang_load(-STACK_BANG_PAGE_SIZE);
+        }
+    }
+
     /// POP rbp
     fn emit_pop_rbp(&mut self) {
         self.buf.emit_byte(0x5D);
@@ -11544,7 +11634,12 @@ impl Compiler {
         let fs = self.frame_size;
         self.emit_push_rbp();
         self.emit_mov_rbp_rsp();
+        self.emit_stack_bang_before_frame_alloc(fs);
+        if self.failed {
+            return;
+        }
         self.emit_sub_rsp_imm(fs);
+        self.emit_stack_bang_headroom();
 
         // Save callee-saved GPR registers using MOV into frame slots (not PUSH).
         // Only save registers actually assigned by the allocator.
@@ -24291,6 +24386,9 @@ pub fn compile_with_param_slots(
 
     // Emit prologue
     compiler.emit_prologue();
+    if compiler.failed {
+        return None;
+    }
     let entry_offset = 0; // prologue starts at offset 0
     compiler.body_entry_offset = compiler.buf.pos(); // offset right after prologue
 
@@ -24728,6 +24826,24 @@ mod tests {
     use crate::JitInvokeInfo;
     use cratonvm_types::{ObjectRef, Value};
 
+    #[test]
+    fn stack_bang_frame_probes_cover_crossed_pages() {
+        assert_eq!(stack_bang_frame_probe_disps(0), Some(Vec::new()));
+        assert_eq!(stack_bang_frame_probe_disps(128), Some(vec![-128]));
+        assert_eq!(
+            stack_bang_frame_probe_disps(STACK_BANG_PAGE_SIZE),
+            Some(vec![-STACK_BANG_PAGE_SIZE])
+        );
+        assert_eq!(
+            stack_bang_frame_probe_disps(STACK_BANG_PAGE_SIZE + 64),
+            Some(vec![-STACK_BANG_PAGE_SIZE, -(STACK_BANG_PAGE_SIZE + 64)])
+        );
+        assert_eq!(
+            stack_bang_frame_probe_disps(STACK_BANG_PAGE_SIZE * 2),
+            Some(vec![-STACK_BANG_PAGE_SIZE, -(STACK_BANG_PAGE_SIZE * 2)])
+        );
+    }
+
     // ---- Test stub helpers for getfield/putfield ----
     // These mirror the real helpers in vm/src/jit/helpers.rs but live in the
     // jit crate so unit tests can exercise compiled code without pulling in
@@ -24922,6 +25038,50 @@ mod tests {
             jit_frem: sentinel,
             jit_drem: sentinel,
         }
+    }
+
+    #[test]
+    fn compiled_prologue_emits_stack_headroom_bang() {
+        if !jit_stack_bang_enabled() {
+            return;
+        }
+        let code: Vec<u8> = vec![0x1a, 0xac, 0, 0];
+        let compiled = compile(
+            &code,
+            2,
+            1,
+            1,
+            false,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            HashMap::new(),
+            HashMap::new(),
+            &test_helpers(),
+            std::collections::HashSet::new(),
+            HashMap::new(),
+            None,
+        )
+        .expect("simple method should compile");
+
+        let mut expected = vec![0x8B, 0x84, 0x24];
+        expected.extend_from_slice(&(-STACK_BANG_PAGE_SIZE).to_le_bytes());
+        assert!(
+            compiled
+                .code_bytes()
+                .windows(expected.len())
+                .any(|w| w == expected.as_slice()),
+            "compiled prologue should contain MOV EAX, [RSP-4096]"
+        );
     }
 
     #[test]
