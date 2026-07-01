@@ -588,6 +588,45 @@ fn lambda_proxy_class_name(ctx: &dyn NativeContext, class_id: ClassId) -> Option
     Some(format!("{host_dotted}$$Lambda/0x{:x}", class_id.as_u32()))
 }
 
+const SPRING_ENHANCED_CONFIGURATION_IFACE: &str =
+    "org/springframework/context/annotation/ConfigurationClassEnhancer$EnhancedConfiguration";
+const CRATONVM_CONFIG_CGLIB_MARKER: &str = "$$EnhancerByCGLIB$$";
+const SPRING_CONFIG_CGLIB_MARKER: &str = "$$SpringCGLIB$$";
+
+/// Spring's AOT hint collector keys reflection hints from
+/// `enhancedConfigurationClass.getName()`. CratonVM keeps its synthetic
+/// `@Configuration` subclass under a non-Spring internal name to avoid colliding
+/// with real Spring CGLIB proxy definitions, but the AOT hint surface expects
+/// the HotSpot naming policy. Expose that display name only for CratonVM's own
+/// enhanced-configuration classes; ordinary real CGLIB proxies keep their real
+/// binary names.
+fn spring_configuration_cglib_display_name(
+    ctx: &dyn NativeContext,
+    class_id: ClassId,
+    internal_name: &str,
+) -> Option<String> {
+    let (base, suffix) = internal_name.rsplit_once(CRATONVM_CONFIG_CGLIB_MARKER)?;
+    if base.is_empty() || suffix.is_empty() {
+        return None;
+    }
+    let is_enhanced_configuration = ctx.class_interfaces(class_id).iter().any(|iface_id| {
+        ctx.class_name_of_id(*iface_id)
+            .as_deref()
+            == Some(SPRING_ENHANCED_CONFIGURATION_IFACE)
+    });
+    if !is_enhanced_configuration {
+        return None;
+    }
+
+    // `cglib_enhancer` uses a hex global counter for collision-free internal
+    // names. Spring's public CGLIB suffix is decimal; 0 remains 0 for the test
+    // that motivated this, and later synthetic classes get deterministic names.
+    let suffix = u64::from_str_radix(suffix, 16)
+        .map(|n| n.to_string())
+        .unwrap_or_else(|_| suffix.to_string());
+    Some(format!("{base}{SPRING_CONFIG_CGLIB_MARKER}{suffix}"))
+}
+
 /// True only for synthetic lambda-proxy class ids (>= 0x8000_0000). Cheap gate
 /// to skip the `lambda_proxies` lock for ordinary classes.
 #[inline]
@@ -651,7 +690,12 @@ pub(crate) fn native_class_get_name(
     // reverse map is the corrupted side).
     if let Some(strict_name) = mirror_class_name_strict(ctx, this) {
         if !strict_name.is_empty() {
-            let dotted = strict_name.replace('/', ".");
+            let display_name = mirror_class_id(ctx, this)
+                .and_then(|class_id| {
+                    spring_configuration_cglib_display_name(ctx, class_id, &strict_name)
+                })
+                .unwrap_or(strict_name);
+            let dotted = display_name.replace('/', ".");
             if dbg_bb {
                 eprintln!("[bb-dbg] getName(strict) -> {:?}", dotted);
             }
@@ -671,6 +715,15 @@ pub(crate) fn native_class_get_name(
             // bypass the cache for those to preserve byte-identical
             // behaviour.
             if ctx.class_id_from_mirror(this).is_some() {
+                if let Some(name) = ctx.class_name_of_id(class_id) {
+                    if let Some(display_name) =
+                        spring_configuration_cglib_display_name(ctx, class_id, &name)
+                    {
+                        let dotted = display_name.replace('/', ".");
+                        let name_obj = ctx.create_string(&dotted);
+                        return Ok(Some(Value::Object(Some(name_obj))));
+                    }
+                }
                 if let Some(arc) = cache_get(&DOTTED_CLASS_NAME_CACHE, class_id) {
                     let name_obj = ctx.create_string(&arc);
                     return Ok(Some(Value::Object(Some(name_obj))));
@@ -687,10 +740,12 @@ pub(crate) fn native_class_get_name(
             let name = ctx
                 .class_name_of_id(class_id)
                 .unwrap_or_else(|| format!("unknown_{}", class_id.as_u32()));
-            let dotted_name = if name.contains('/') {
-                name.replace('/', ".")
+            let display_name =
+                spring_configuration_cglib_display_name(ctx, class_id, &name).unwrap_or(name);
+            let dotted_name = if display_name.contains('/') {
+                display_name.replace('/', ".")
             } else {
-                name
+                display_name
             };
             if dbg_bb {
                 eprintln!(
@@ -13145,6 +13200,79 @@ mod tests {
         };
         // getName converts / to .
         assert_eq!(ctx.read_string(obj).unwrap(), "java.lang.Object");
+    }
+
+    #[test]
+    fn class_get_name_spring_configuration_cglib_uses_aot_hint_alias() {
+        let mut ctx = mock_ctx();
+        let marker_id = ctx
+            .ensure_class_initialized(SPRING_ENHANCED_CONFIGURATION_IFACE)
+            .unwrap();
+        let cid = ctx
+            .ensure_class_initialized("com/acme/Config$$EnhancerByCGLIB$$0")
+            .unwrap();
+        ctx.set_interfaces(cid, vec![marker_id]);
+
+        let mirror = make_class_mirror(
+            &mut ctx,
+            cid.as_u32(),
+            "com/acme/Config$$EnhancerByCGLIB$$0",
+        );
+        let r = native_class_get_name(&mut ctx, &[Value::Object(Some(mirror))]);
+        let obj = match r.unwrap() {
+            Some(Value::Object(Some(o))) => o,
+            other => panic!("expected string Object, got {other:?}"),
+        };
+
+        assert_eq!(
+            ctx.read_string(obj).unwrap(),
+            "com.acme.Config$$SpringCGLIB$$0"
+        );
+    }
+
+    #[test]
+    fn class_get_name_regular_cglib_proxy_keeps_actual_name() {
+        let mut ctx = mock_ctx();
+        let cid = ctx
+            .ensure_class_initialized("com/acme/Service$$EnhancerByCGLIB$$0")
+            .unwrap();
+        let mirror = make_class_mirror(
+            &mut ctx,
+            cid.as_u32(),
+            "com/acme/Service$$EnhancerByCGLIB$$0",
+        );
+        let r = native_class_get_name(&mut ctx, &[Value::Object(Some(mirror))]);
+        let obj = match r.unwrap() {
+            Some(Value::Object(Some(o))) => o,
+            other => panic!("expected string Object, got {other:?}"),
+        };
+
+        assert_eq!(
+            ctx.read_string(obj).unwrap(),
+            "com.acme.Service$$EnhancerByCGLIB$$0"
+        );
+    }
+
+    #[test]
+    fn class_get_name_spring_configuration_cglib_alias_formats_hex_counter_as_decimal() {
+        let mut ctx = mock_ctx();
+        let marker_id = ctx
+            .ensure_class_initialized(SPRING_ENHANCED_CONFIGURATION_IFACE)
+            .unwrap();
+        let cid = ctx
+            .ensure_class_initialized("com/acme/Config$$EnhancerByCGLIB$$a")
+            .unwrap();
+        ctx.set_interfaces(cid, vec![marker_id]);
+
+        assert_eq!(
+            spring_configuration_cglib_display_name(
+                &ctx,
+                cid,
+                "com/acme/Config$$EnhancerByCGLIB$$a"
+            )
+            .as_deref(),
+            Some("com/acme/Config$$SpringCGLIB$$10")
+        );
     }
 
     #[test]
