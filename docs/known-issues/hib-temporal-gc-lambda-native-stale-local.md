@@ -82,9 +82,14 @@ elements stable across a reorder): `native_stream_for_each` (eager path), `nativ
 materialized element (and freshly-produced results), re-read each from its handle before the (allocating)
 dispatch, and re-read `this` before any post-loop `set_field`. This removes the `[lambda-stray]` crash.
 
-**Still-unpinned siblings (same pattern, lower-priority — not on the observed temporal path):**
-`native_stream_distinct`, `native_stream_flat_map`, `native_stream_reduce_*`, `native_stream_{any,all}_match`,
-`native_stream_{min,max}`, `native_al_sort_comparator`, `native_al_remove_if`, `native_al_replace_all`.
+**Additional sweep (2026-07-01):** the previously lower-priority siblings with the same stale-native-local
+pattern are now pinned as well in `native-collections/src/lib.rs`: `make_stream` / derived-stream construction,
+`Stream.iterator` / `toArray`, `native_stream_distinct`, `native_stream_flat_map`, `native_stream_peek`,
+`native_stream_reduce_*`, `native_stream_{any,all,none}_match`, `native_stream_{min,max}`,
+`native_stream_map_to_int`, plus `native_al_sort_comparator`, `native_al_remove_if`, and
+`native_al_replace_all`. The native-collections mock now has a callback-triggered moving-GC simulation and
+regression coverage for `Stream.forEach` and `ArrayList.removeIf`. This broadens the per-native pinning fix;
+it does **not** claim to close the distinct residual GC root-coverage family described above.
 
 **Do NOT** try to fix this by forcing the non-moving sweep when a native is active: it re-triggers the
 documented [`HIB-CV-33`](HIB-CV-33-sigsegv-execute-fault-joined-inheritance-sf-build.md) precise-root
