@@ -1409,6 +1409,18 @@ fn validate_for_name_dotted(dotted_name: &str) -> Result<(), MethodCallFailed> {
     Ok(())
 }
 
+/// DBG: report whether `cid` is a bytecode-enhanced entity (declares a
+/// `$$_hibernate_*` member). Trace-only.
+fn dbg_class_enhanced(ctx: &mut dyn NativeContext, cid: ClassId) -> bool {
+    ctx.declared_methods(cid)
+        .iter()
+        .any(|m| m.name.starts_with("$$_hibernate_"))
+}
+
+fn dbg_is_entity_name(n: &str) -> bool {
+    n.contains("orm/test/cache/") || n.contains("orm.test.cache.")
+}
+
 pub(crate) fn native_class_for_name(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -1529,6 +1541,14 @@ pub(crate) fn native_class_for_name(
                                 // errors raised by `<clinit>`, matching HotSpot.
                                 ctx.ensure_class_initialized(&bin_name)?;
                             }
+                        }
+                    }
+                }
+                if std::env::var("CRATONVM_IAE_TRACE").is_ok() && dbg_is_entity_name(&internal_name) {
+                    if let Value::Object(Some(mr)) = mirror {
+                        if let Some(cid) = ctx.class_id_from_mirror(mr) {
+                            let enh = dbg_class_enhanced(ctx, cid);
+                            eprintln!("FORNAME-RET name={dotted_name} loader={loader_class_name_debug} cid={} enhanced={enh} (via-loader)", cid.as_u32());
                         }
                     }
                 }
@@ -1661,6 +1681,10 @@ pub(crate) fn native_class_for_name(
                     }
                     .into(),
                 );
+            }
+            if std::env::var("CRATONVM_IAE_TRACE").is_ok() && dbg_is_entity_name(&internal_name) {
+                let enh = dbg_class_enhanced(ctx, class_id);
+                eprintln!("FORNAME-RET name={dotted_name} cid={} enhanced={enh} (global-fallback)", class_id.as_u32());
             }
             let mirror = ctx.get_class_mirror(class_id);
             Ok(Some(Value::Object(Some(mirror))))
@@ -2572,6 +2596,52 @@ pub(crate) fn native_class_new_instance(
 ///
 /// Handles primitives ("I" → int.class), object types ("Ljava/lang/String;" → String.class),
 /// array types ("[I" → int[].class), and void ("V" → void.class).
+/// Loader-faithful variant of [`descriptor_to_class_mirror`]: for an `L`-form
+/// reference type, resolve the class through the loader that DEFINED
+/// `declaring_class_id` (its own namespace) when the loader-aware gate is on, so
+/// reflective `Method`/`Field`/`Constructor` type accessors on a class defined
+/// by a child / bytecode-enhancing loader report THAT loader's copy of the type
+/// — matching `Class.forName` and the entity metamodel.
+///
+/// Without this, a bytecode-enhanced Hibernate entity (`Country`, defined by the
+/// `EnhancingClassLoader`) had `getContinent().getReturnType()` resolve the
+/// *un-enhanced* `Continent` through the flat global store, while the to-one
+/// target type (resolved via `Class.forName` through the same enhancing loader)
+/// was the *enhanced* copy — so `ToOneAttributeMapping`'s
+/// `declaredType.isAssignableFrom(targetType)` validation failed with a
+/// "mapped with targetEntity=`X`, but the attribute is declared as `X`" error
+/// (same name, divergent loader identity).
+///
+/// Uses an exact `(loader, name)` namespace probe (no Java `loadClass`, no global
+/// fallback inside the probe) so it is GC-safe to call mid-reflection-object
+/// build. Falls back to the global [`descriptor_to_class_mirror`] for
+/// primitives/arrays, gate-off, a built-in declaring loader, or a type the
+/// declaring loader did not itself define (e.g. a parent-delegated JDK type),
+/// preserving the legacy answer in every case the enhancing loader is not the
+/// type's definer.
+pub(crate) fn descriptor_to_class_mirror_via_loader(
+    ctx: &mut dyn NativeContext,
+    desc: &str,
+    declaring_class_id: ClassId,
+) -> cratonvm_types::ObjectRef {
+    if crate::classloader::loader_aware_resolution() {
+        if let Some(inner) = desc.strip_prefix('L').and_then(|s| s.strip_suffix(';')) {
+            let loader_id = ctx.loader_id_of_class(declaring_class_id);
+            // Only user-defined namespaces (>= 3) can hold a per-loader copy;
+            // built-in loaders (0/1/2) ARE the global store, so the legacy path
+            // is already correct for them.
+            if loader_id >= 3 {
+                if let Some(cid) =
+                    ctx.class_id_defined_by_loader_exact(inner, loader_id as u32)
+                {
+                    return ctx.get_class_mirror(cid);
+                }
+            }
+        }
+    }
+    descriptor_to_class_mirror(ctx, desc)
+}
+
 pub(crate) fn descriptor_to_class_mirror(
     ctx: &mut dyn NativeContext,
     desc: &str,
@@ -3491,7 +3561,10 @@ pub(crate) fn create_field_object(
 
     let class_mirror = ctx.get_class_mirror(meta.declaring_class_id);
     let name_str = ctx.create_string(&meta.name);
-    let type_mirror = descriptor_to_class_mirror(ctx, &meta.descriptor);
+    // Loader-faithful field type (gated): a field on a bytecode-enhanced /
+    // child-loader class reports that loader's copy of the field type.
+    let type_mirror =
+        descriptor_to_class_mirror_via_loader(ctx, &meta.descriptor, meta.declaring_class_id);
     let desc_str = ctx.create_string(&meta.descriptor);
 
     // --- Real JDK Field layout (visible to Java bytecode via Getfield) ---
@@ -4501,16 +4574,21 @@ pub(crate) fn create_method_object(
     let class_mirror = ctx.get_class_mirror(meta.declaring_class_id);
     let name_str = ctx.create_string(&meta.name);
 
-    // Parse descriptor for param types and return type
+    // Parse descriptor for param types and return type. Resolve reference types
+    // through the declaring class's own loader (loader-faithful) so a method on a
+    // bytecode-enhanced / child-loader class reports that loader's copy of the
+    // return / parameter types (gated; see `descriptor_to_class_mirror_via_loader`).
     let (param_descs, ret_desc) = parse_descriptor_param_and_return(&meta.descriptor);
-    let ret_mirror = descriptor_to_class_mirror(ctx, &ret_desc);
+    let ret_mirror =
+        descriptor_to_class_mirror_via_loader(ctx, &ret_desc, meta.declaring_class_id);
 
     // Parameter type mirrors array. GC-safe: `descriptor_to_class_mirror`
     // allocates/loads classes, so the array is pinned across the fill loop
     // (see `build_mirror_array` — WildFly bug-06).
     let class_comp = class_component_id(ctx);
+    let decl_cid = meta.declaring_class_id;
     let param_arr = build_mirror_array_comp(ctx, class_comp, param_descs.len(), |ctx, i| {
-        descriptor_to_class_mirror(ctx, &param_descs[i])
+        descriptor_to_class_mirror_via_loader(ctx, &param_descs[i], decl_cid)
     });
 
     // G2: Always allocate non-null array fields. JDK 25 `Method` and its
@@ -6570,9 +6648,12 @@ pub(crate) fn create_constructor_object(
     // Parse descriptor for param types
     let (param_descs, _) = parse_descriptor_param_and_return(&meta.descriptor);
     // GC-safe: `descriptor_to_class_mirror` allocates (see `build_mirror_array`).
+    // Loader-faithful (gated): a constructor on a bytecode-enhanced / child-loader
+    // class reports that loader's copy of its parameter types.
     let class_comp = class_component_id(ctx);
+    let ctor_decl_cid = meta.declaring_class_id;
     let param_arr = build_mirror_array_comp(ctx, class_comp, param_descs.len(), |ctx, i| {
-        descriptor_to_class_mirror(ctx, &param_descs[i])
+        descriptor_to_class_mirror_via_loader(ctx, &param_descs[i], ctor_decl_cid)
     });
     let desc_str = ctx.create_string(&meta.descriptor);
 
@@ -6973,6 +7054,13 @@ pub(crate) fn native_constructor_new_instance(
             message: "Constructor.newInstance: declaring class has empty name".to_string(),
         }
         .into());
+    }
+    if std::env::var("CRATONVM_IAE_TRACE").is_ok() && dbg_is_entity_name(&class_name) {
+        let (cidv, enh) = match declaring_cid {
+            Some(cid) => (cid.as_u32() as i64, dbg_class_enhanced(ctx, cid)),
+            None => (-1, false),
+        };
+        eprintln!("CTOR-NEWINSTANCE class={class_name} declaring_cid={cidv} enhanced={enh}");
     }
 
     // NEW-19: JPMS deep-reflection check. Accessible flag lives in a
@@ -8182,6 +8270,15 @@ fn cached_annotation_proxy(
     // deferred `TypeNotPresentException` for filtered types. `None` for built-in
     // loaders keeps the global resolution.
     let container_loader = crate::classloader::defining_loader_for(queried_class_id.as_u32());
+    if std::env::var("CRATONVM_IAE_TRACE").is_ok() {
+        let holder = ctx.class_name_of_id(queried_class_id).unwrap_or_default();
+        eprintln!(
+            "ANN-HOLDER cid={} holder={holder} ann={} container_loader={}",
+            queried_class_id.as_u32(),
+            ann.type_descriptor,
+            if container_loader.is_some() { "SOME" } else { "none" }
+        );
+    }
     let proxy = create_annotation_proxy(ctx, ann, container_loader);
     *annotation_proxy_cache()
         .lock()
@@ -12298,6 +12395,35 @@ pub(crate) fn native_class_get_annotated_interfaces(
 /// — the dispatch path treats this as a synthetic-stub instance.
 /// `getType()` reads slot 0 ; downstream frameworks only need that
 /// accessor + non-null-ness.
+/// Fill the real-JDK `AnnotatedTypeBaseImpl` bookkeeping fields that the
+/// bytecode paths we *don't* override still read. Specifically `location` must
+/// be non-null: `AnnotatedTypeBaseImpl.getAnnotatedOwnerType()` (not overridden)
+/// does `getLocation().popLocation((byte)1)` and NPEs on a null `location`.
+/// ByteBuddy walks owner types of parameterized method types (mock generation),
+/// hitting exactly this path — surfaced as
+/// `MockitoException … NullPointerException … AnnotatedTypeFactory.getLocation()`
+/// (`UUidV6V7GeneratorTest`). Seed `location` with `LocationInfo.BASE_LOCATION`
+/// (depth 0 → `popLocation` returns null → the owner is rebuilt with
+/// BASE_LOCATION by real-JDK code) and `allOnSameTargetTypeAnnotations` with an
+/// empty array so `getTypeAnnotations()` never returns null either.
+fn annotated_type_fill_bookkeeping(ctx: &mut dyn NativeContext, obj: ObjectRef) {
+    let base_loc = ctx
+        .ensure_class_initialized("sun/reflect/annotation/TypeAnnotation$LocationInfo")
+        .ok()
+        .and_then(|cid| {
+            ctx.static_field_index_by_name(cid, "BASE_LOCATION")
+                .map(|idx| ctx.get_static_field(cid, idx))
+        })
+        .unwrap_or(Value::Object(None));
+    ctx.set_field_by_name(obj, "location", base_loc);
+    let empty_ta = ctx.new_ref_array(cratonvm_types::ClassId::new(0), 0);
+    ctx.set_field_by_name(
+        obj,
+        "allOnSameTargetTypeAnnotations",
+        Value::Object(Some(empty_ta)),
+    );
+}
+
 fn make_annotated_type(
     ctx: &mut dyn NativeContext,
     backing_type: cratonvm_types::ObjectRef,
@@ -12323,6 +12449,8 @@ fn make_annotated_type(
     if layout_fields == 0 {
         ctx.set_field(obj, 0, Value::Object(Some(backing_type)));
         ctx.set_field(obj, 1, Value::Object(Some(empty_anns)));
+    } else {
+        annotated_type_fill_bookkeeping(ctx, obj);
     }
     obj
 }
@@ -12359,6 +12487,8 @@ fn make_annotated_type_with_anns(
     if layout_fields == 0 {
         ctx.set_field(obj, 0, Value::Object(Some(backing_type)));
         ctx.set_field(obj, 1, Value::Object(Some(ann_arr)));
+    } else {
+        annotated_type_fill_bookkeeping(ctx, obj);
     }
     obj
 }
