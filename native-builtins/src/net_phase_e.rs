@@ -4725,53 +4725,22 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
     );
 
     // -----------------------------------------------------------------------
-    // Round 76: skip @Scheduled cron registration.
+    // Round 76 (REVERTED): do NOT stub ScheduledTaskRegistrar.schedule*Task.
     //
-    // ScheduledTaskRegistrar.scheduleCronTask(CronTask) calls
-    // ConcurrentTaskScheduler.schedule(Runnable, Trigger) which constructs a
-    // ReschedulingRunnable and calls its schedule(), which in turn calls
-    // executor.schedule(this, delay, MILLIS).  Under CratonVM the
-    // DelegatedScheduledExecutorService.schedule path ends up invoking the
-    // task synchronously without populating `currentFuture`, so the very
-    // first run() trips Assert.state("No scheduled future") in
-    // obtainCurrentFuture(), aborting context refresh.
-    //
-    // We don't run @Scheduled crons in this environment, so register the
-    // ScheduledTaskRegistrar entry points as no-ops returning null.  Returning
-    // null is acceptable: callers store the result in a List<ScheduledTask>
-    // that is only used to cancel tasks at shutdown.
-    r.register(
-        "org/springframework/scheduling/config/ScheduledTaskRegistrar",
-        "scheduleCronTask",
-        "(Lorg/springframework/scheduling/config/CronTask;)Lorg/springframework/scheduling/config/ScheduledTask;",
-        |_ctx, _args| {
-            Ok(Some(Value::Object(None)))
-        },
-    );
-    r.register(
-        "org/springframework/scheduling/config/ScheduledTaskRegistrar",
-        "scheduleFixedRateTask",
-        "(Lorg/springframework/scheduling/config/FixedRateTask;)Lorg/springframework/scheduling/config/ScheduledTask;",
-        |_ctx, _args| {
-            Ok(Some(Value::Object(None)))
-        },
-    );
-    r.register(
-        "org/springframework/scheduling/config/ScheduledTaskRegistrar",
-        "scheduleFixedDelayTask",
-        "(Lorg/springframework/scheduling/config/FixedDelayTask;)Lorg/springframework/scheduling/config/ScheduledTask;",
-        |_ctx, _args| {
-            Ok(Some(Value::Object(None)))
-        },
-    );
-    r.register(
-        "org/springframework/scheduling/config/ScheduledTaskRegistrar",
-        "scheduleTriggerTask",
-        "(Lorg/springframework/scheduling/config/TriggerTask;)Lorg/springframework/scheduling/config/ScheduledTask;",
-        |_ctx, _args| {
-            Ok(Some(Value::Object(None)))
-        },
-    );
+    // A previous workaround registered scheduleCronTask/scheduleFixedRateTask/
+    // scheduleFixedDelayTask/scheduleTriggerTask as no-ops returning null to
+    // dodge a "No scheduled future" assertion in one Redis-session app whose
+    // cron fired synchronously through the DelegatedScheduledExecutorService
+    // path.  That stub is far too broad: shadowing these methods bypasses the
+    // real bytecode, so the registrar's cronTasks/fixedRateTasks/
+    // fixedDelayTasks/triggerTasks lists are never populated (they are filled
+    // by the addCronTask()/addFixedRateTask()/... calls in the taskScheduler==
+    // null branch), and getScheduledTasks() collects a null ScheduledTask.
+    // This breaks all @Scheduled processing — ScheduledAnnotationBeanPostProcessor
+    // tests saw null task lists and NPEs (scheduleOneTimeTask, which was never
+    // stubbed, was the only path that worked).  The real fix for the Redis app
+    // belongs in the ConcurrentTaskScheduler/ReschedulingRunnable execution
+    // path, not here; letting the real methods run matches HotSpot.
 
     r.register(
         "org/springframework/core/io/UrlResource",
