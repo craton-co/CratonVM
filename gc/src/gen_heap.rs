@@ -2635,14 +2635,28 @@ impl GenerationalHeap {
         let honor_promotion_oom_risk = promotion_oom_risk
             && (has_conservative_roots
                 || std::env::var_os("CRATONVM_PROMOTION_OOM_GUARD_BROAD").is_some());
-        if (has_conservative_roots || honor_promotion_oom_risk) && !force_moving {
+        // Default moving young gen (`CRATONVM_MOVING_YOUNG`): the JIT publishes a
+        // COMPLETE rewritable precise root map (shadow stack) for every live frame
+        // and the conservative scan is suppressed (see roots.rs), so a live JIT
+        // frame no longer forces the non-moving sweep — run the moving (Cheney)
+        // cycle instead. The `honor_promotion_oom_risk` guard is STILL respected as
+        // a safety fallback: when both generations are ~full the moving path can
+        // `process::abort()` on a promotion failure, so we divert to the
+        // (abort-free) non-moving sweep for that cycle regardless of the flag. The
+        // suppressed conservative scan means that fallback sweep also relies on the
+        // complete shadow map for marking — consistent, since the shadow map is the
+        // sole precise JIT root set under this flag.
+        let moving_young = crate::gc_quiescence::moving_young_enabled();
+        let divert_non_moving = (has_conservative_roots && !moving_young) || honor_promotion_oom_risk;
+        if divert_non_moving && !force_moving {
             tracing::debug!(
                 "running non-moving young-gen mark-sweep (jit_active={}, \
-                 unregistered_jit_frame={}, promotion_oom_risk={}, honored={}) — compaction deferred.",
+                 unregistered_jit_frame={}, promotion_oom_risk={}, honored={}, moving_young={}) — compaction deferred.",
                 crate::gc_quiescence::is_active(),
                 crate::gc_quiescence::unregistered_jit_frame_on_stack(),
                 promotion_oom_risk,
                 honor_promotion_oom_risk,
+                moving_young,
             );
             let result = self.sweep_young_non_moving(roots, finalizer_addrs);
             // BUG-V fix: the non-moving sweep still *relocates* objects via

@@ -293,7 +293,30 @@ pub use cratonvm_gc::gc_quiescence::is_active as gc_must_defer;
 pub fn shadow_stack_enabled() -> bool {
     use std::sync::OnceLock;
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("CRATONVM_SHADOW_STACK").is_some())
+    // `CRATONVM_MOVING_YOUNG` implies the shadow-stack root scan + remap: the
+    // moving young gen relies on the complete precise map the shadow stack now
+    // publishes (see `moving_young_enabled`).
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("CRATONVM_SHADOW_STACK").is_some() || moving_young_enabled()
+    })
+}
+
+/// Whether the **default moving / compacting young generation**
+/// (`CRATONVM_MOVING_YOUNG`) is enabled. Cached on first read.
+///
+/// When on: (1) the JIT publishes a *complete* rewritable precise root map at
+/// each safepoint (see `cratonvm_jit::x64::moving_young_enabled`), (2) the
+/// conservative JIT-frame scan in `roots.rs` is SUPPRESSED (a fully-precise frame
+/// needs no conservative backstop, and mixing a conservatively-marked slot with a
+/// precisely-relocated object would corrupt), and (3) `gen_heap` runs the moving
+/// (Cheney) young collection even while JIT frames are live instead of diverting
+/// to the non-moving sweep. Off by default; gated for validation against the
+/// bt18 = 68332206 invariant. See `docs/feature-designs/default-moving-young-gen.md`.
+#[inline]
+pub fn moving_young_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("CRATONVM_MOVING_YOUNG").is_some())
 }
 
 /// spring-bug-10 experiment (`CRATONVM_SHADOW_PIN`): when set, the shadow-stack

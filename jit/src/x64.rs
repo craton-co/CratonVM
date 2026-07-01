@@ -2059,7 +2059,35 @@ unsafe fn read_gs_qword(disp: usize) -> usize {
 pub fn shadow_stack_maps_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
-    *G.get_or_init(|| std::env::var_os("CRATONVM_SHADOW_STACK").is_some())
+    // `CRATONVM_MOVING_YOUNG` implies the shadow-stack codegen: the moving young
+    // gen requires a COMPLETE, rewritable precise root map (see
+    // `moving_young_enabled` and `collect_live_oop_homes`), so turning it on also
+    // turns on the push/reload emission.
+    *G.get_or_init(|| {
+        std::env::var_os("CRATONVM_SHADOW_STACK").is_some() || moving_young_enabled()
+    })
+}
+
+/// Whether the **default moving / compacting young generation**
+/// (`CRATONVM_MOVING_YOUNG`) is enabled. Cached on first read.
+///
+/// When on, the JIT publishes a *complete* rewritable precise root map at every
+/// GC-capable safepoint — not just the register-invisible operand oops the
+/// `CRATONVM_SHADOW_STACK`-only path publishes, but EVERY live oop (operand-stack
+/// entries in registers AND frame slots, and every oop local in its register or
+/// canonical frame slot) — so a moving (Cheney) young collection can relocate
+/// each JIT-held reference and rewrite its home in place. This completeness is
+/// what lets `gen_heap::collect_garbage_inner` run the moving cycle while JIT
+/// frames are live (the conservative frame scan is then suppressed — a
+/// fully-precise frame needs no conservative backstop). Off by default; gated so
+/// it can be validated against the bt18 = 68332206 invariant before any flip.
+///
+/// See `docs/feature-designs/default-moving-young-gen.md`.
+#[inline]
+pub fn moving_young_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| std::env::var_os("CRATONVM_MOVING_YOUNG").is_some())
 }
 
 /// DBG (CRATONVM_DBG_SHADOW_RELOAD): emit a bad-path-only logging call in
@@ -8380,6 +8408,16 @@ impl Compiler {
         // The operand-stack Reg homes (callee-saved survive the call un-spilled;
         // caller-saved/Scratch are kept for safety) are the only ones the stack
         // scan can miss, so they are exactly the set the GC must be told about.
+        // Moving young gen (`CRATONVM_MOVING_YOUNG`) requires COMPLETE coverage: a
+        // Cheney copy relocates every reachable object and the conservative frame
+        // scan is suppressed, so EVERY live JIT-held oop must be published here as a
+        // rewritable root — operand-stack entries in frame slots AND every oop
+        // local (register- or frame-resident) as well, not just the
+        // register-invisible operand oops. Under the register-only shadow path
+        // (`CRATONVM_SHADOW_STACK` without moving), the conservative scan still
+        // covers frame slots + flushed locals, so publishing only the register
+        // homes avoids the over-pin OOM the B-K kafka fix warns about.
+        let complete = moving_young_enabled();
         let n = self.stack.len().min(self.stack_oop_marks.len());
         for i in 0..n {
             if !self.stack_oop_marks[i] {
@@ -8389,8 +8427,62 @@ impl Compiler {
                 StackSlot::CalleeSaved(reg) | StackSlot::Scratch(reg) => {
                     homes.push(ShadowHome::Reg(reg))
                 }
-                StackSlot::Frame(_) | StackSlot::Xmm(_) => {}
+                // Operand entry spilled to a frame slot: covered by the
+                // conservative scan on the non-moving path, but that scan cannot
+                // REWRITE it, so the moving path must publish it here. The frame
+                // slot uses the same `[rbp - off]` convention as the push/reload
+                // (`emit_load_local`/`emit_store_local`).
+                StackSlot::Frame(off) => {
+                    if complete {
+                        homes.push(ShadowHome::Frame(off));
+                    }
+                }
+                StackSlot::Xmm(_) => {}
             }
+        }
+        // Oop locals — every reference-typed local live at this PC, in its home
+        // register (`reg_for_local`) or canonical frame slot (`local_offset`).
+        // Mirrors the enumeration in `build_and_record_deopt_point`. Only under
+        // moving coverage: on the non-moving path a register-local is flushed to
+        // its frame slot by `emit_pre_safepoint_spill` and found conservatively.
+        if complete {
+            let oop_reached = self
+                .local_oop_reached
+                .get(self.cur_bc_pc)
+                .copied()
+                .unwrap_or(false);
+            let oop_mask = if oop_reached {
+                self.local_oop_masks
+                    .get(self.cur_bc_pc)
+                    .copied()
+                    .unwrap_or(0)
+            } else {
+                0
+            };
+            for i in 0..self.num_locals {
+                if i >= 64 || (oop_mask & (1u64 << i)) == 0 {
+                    continue;
+                }
+                if let Some(r) = self.reg_for_local(i) {
+                    homes.push(ShadowHome::Reg(r));
+                } else {
+                    homes.push(ShadowHome::Frame(self.local_offset(i)));
+                }
+            }
+            // A local and an operand entry can share the same home register (or two
+            // operand entries the same frame slot). Deduplicate preserving order:
+            // the push and reload walk the identical list, so a duplicate would
+            // only re-store the same rewritten value — harmless, but it inflates
+            // shadow depth, and depth drift is a documented hazard.
+            let mut seen: Vec<ShadowHome> = Vec::with_capacity(homes.len());
+            homes.retain(|h| {
+                if seen.contains(h) {
+                    false
+                } else {
+                    seen.push(*h);
+                    true
+                }
+            });
         }
         homes
     }

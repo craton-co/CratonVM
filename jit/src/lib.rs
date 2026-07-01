@@ -5913,7 +5913,11 @@ fn try_compile_inner(
     // reference parameters, but ONLY when the precise gate is on. Off → `0`, so
     // `compute_local_oop_masks` keeps its historical empty entry state and the
     // emitted maps/codegen are byte-identical to the default path.
-    let param_oop_mask = if x64::precise_jit_maps_enabled() {
+    // Also seed it under the moving young gen (`CRATONVM_MOVING_YOUNG`): its
+    // complete-coverage shadow map must include an oop parameter live across an
+    // EARLY safepoint (before any `astore` rewrites its slot), or the moving copy
+    // would leave that register/slot stale (HIB-CV-20).
+    let param_oop_mask = if x64::precise_jit_maps_enabled() || x64::moving_young_enabled() {
         compute_param_oop_mask(&cached.method_descriptor, cached.is_static)
     } else {
         0
