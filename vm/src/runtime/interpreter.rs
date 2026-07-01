@@ -17149,6 +17149,44 @@ pub(crate) fn try_lambda_dispatch(
     let inst_desc = call_site.instantiated_descriptor.clone();
     let (_sam_params_tmp, sam_ret) = split_method_descriptor(&sam_desc);
     let (_impl_params_tmp, impl_ret) = split_method_descriptor(&impl_desc);
+
+    // Loader-faithful lambda impl resolution (gated on CRATONVM_LOADER_AWARE_RESOLUTION).
+    //
+    // The lambda's implementation method belongs to the class that CREATED the
+    // lambda — the `invokedynamic` host, recorded in `lambda_proxy_hosts` keyed
+    // by the proxy's `obj_class_id`. Under an isolating/enhancing loader that
+    // host is a per-loader ENHANCED copy of a class the application loader ALSO
+    // defines (Hibernate's package-scoped `EnhancingClassLoader`). The
+    // `InvokeStatic` / `InvokeSpecial` / `NewInvokeSpecial` arms below resolve
+    // `impl_handle.class_name` by NAME (`invoke_shared` / `load_class`), which
+    // collapses to the ONE global (un-enhanced) copy — so the lambda body runs
+    // in a frame whose class is the un-enhanced copy, and its `new <Entity>`
+    // resolves the un-enhanced entity. That entity then fails Hibernate's
+    // identity check (`MethodHandleFieldAccessorImpl.ensureObj` →
+    // `declaringClass.isAssignableFrom(o.getClass())` is false because the
+    // mapped class is the enhanced copy) → `PropertyAccessException` on
+    // `s.persist(entity)` for the field-access `enhancement.lazy.*` entities.
+    //
+    // Resolve the impl class through the HOST's defining loader and override
+    // dispatch when it diverges from the global name-resolved copy — mirroring
+    // the virtual/`invokespecial` divergence-dispatch override in
+    // `execute_invoke_kind`. Divergence-only + gate → byte-identical gate-off.
+    let impl_class_override: Option<ClassId> =
+        if crate::runtime::env_cache::loader_aware_resolution() {
+            let host = shared.lambda_proxy_hosts.read().get(&obj_class_id).copied();
+            host.and_then(|h| lookup_loader_initiated(shared, h, &call_site.impl_handle.class_name))
+                .filter(|cid| {
+                    *cid != ClassId::new(0)
+                        && shared
+                            .class_manager
+                            .read()
+                            .get_loaded_class_id(&call_site.impl_handle.class_name)
+                            != Some(*cid)
+                })
+        } else {
+            None
+        };
+
     match call_site.impl_handle.kind {
         MethodHandleKind::InvokeStatic => {
             // Static method: all args are parameters (no receiver).
@@ -17171,14 +17209,25 @@ pub(crate) fn try_lambda_dispatch(
                     full_args.len(),
                 );
             }
-            let result = invoke_shared(
-                shared,
-                thread,
-                &call_site.impl_handle.class_name,
-                &call_site.impl_handle.member_name,
-                &call_site.impl_handle.descriptor,
-                &full_args,
-            )?;
+            let result = if let Some(cid) = impl_class_override {
+                crate::vm::invoke_on_class_shared_no_retarget(
+                    shared,
+                    thread,
+                    cid,
+                    &call_site.impl_handle.member_name,
+                    &call_site.impl_handle.descriptor,
+                    &full_args,
+                )?
+            } else {
+                invoke_shared(
+                    shared,
+                    thread,
+                    &call_site.impl_handle.class_name,
+                    &call_site.impl_handle.member_name,
+                    &call_site.impl_handle.descriptor,
+                    &full_args,
+                )?
+            };
             if crate::runtime::env_cache::lambda_dbg() {
                 eprintln!(
                     "[cratonvm-dbg] lambda static-post-invoke: {}.{}{} result={:?}",
@@ -17256,6 +17305,61 @@ pub(crate) fn try_lambda_dispatch(
                 }
                 _ => call_site.impl_handle.class_name.to_string(),
             };
+            // Loader-faithful virtual dispatch (gated). `invoke_or_native` below
+            // re-resolves `receiver_class` by NAME, which collapses to the ONE
+            // global copy. When the captured receiver is a per-loader ENHANCED
+            // instance (e.g. a Hibernate bytecode-enhanced test class holding
+            // `this` for a `this::body` method-reference lambda), the global copy
+            // is the UN-enhanced one — so the lambda body would run in the wrong
+            // class's frame and its `new <Entity>` would resolve the un-enhanced
+            // entity. Dispatch on the receiver's OWN runtime class_id when it
+            // diverges from the name-resolved copy. Divergence-only + gate →
+            // byte-identical gate-off. (Mirrors the virtual divergence override
+            // in `execute_invoke_kind`.)
+            let virtual_dispatch_cid: Option<ClassId> = if crate::runtime::env_cache::loader_aware_resolution() {
+                match &full_args[0] {
+                    Value::Object(Some(r)) => {
+                        let rcv_class_id = shared.heap.class_id_of(*r);
+                        // Only override for a REAL loaded class (never a lambda
+                        // proxy — those are handled by the recurse-through-
+                        // try_lambda_dispatch guard above), whose declared name
+                        // matches `receiver_class` yet whose runtime class_id
+                        // differs from the name-resolved global copy (the
+                        // per-loader ENHANCED-vs-global divergence). Guarding on a
+                        // name match avoids acting on the `receiver_class`
+                        // impl-name fallback (used when the receiver's class isn't
+                        // resolvable), which would otherwise mis-target a proxy id.
+                        if rcv_class_id == ClassId::new(0)
+                            || shared.lambda_proxies.read().contains_key(&rcv_class_id)
+                        {
+                            None
+                        } else {
+                            let cm = shared.class_manager.read();
+                            let name_matches = cm
+                                .get_class(rcv_class_id)
+                                .map(|c| &*c.name == &*receiver_class)
+                                .unwrap_or(false);
+                            (name_matches
+                                && cm.get_loaded_class_id(&receiver_class) != Some(rcv_class_id))
+                            .then_some(rcv_class_id)
+                        }
+                    }
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            if let Some(cid) = virtual_dispatch_cid {
+                let r = invoke_on_class_shared(
+                    shared,
+                    thread,
+                    cid,
+                    &call_site.impl_handle.member_name,
+                    &call_site.impl_handle.descriptor,
+                    &full_args,
+                )?;
+                return Ok(Some(coerce_return(shared, thread, &sam_ret, &impl_ret, r)?));
+            }
             let result = invoke_or_native(
                 shared,
                 thread,
@@ -17333,10 +17437,13 @@ pub(crate) fn try_lambda_dispatch(
                 true,
                 num_captures,
             )?;
-            let class_id = shared
-                .class_manager
-                .write()
-                .load_class(&call_site.impl_handle.class_name)?;
+            let class_id = match impl_class_override {
+                Some(cid) => cid,
+                None => shared
+                    .class_manager
+                    .write()
+                    .load_class(&call_site.impl_handle.class_name)?,
+            };
             let result = invoke_on_class_shared(
                 shared,
                 thread,
@@ -17351,10 +17458,13 @@ pub(crate) fn try_lambda_dispatch(
         }
         MethodHandleKind::NewInvokeSpecial => {
             // Constructor reference: allocate object, call <init>, return the object.
-            let class_id = shared
-                .class_manager
-                .write()
-                .load_class(&call_site.impl_handle.class_name)?;
+            let class_id = match impl_class_override {
+                Some(cid) => cid,
+                None => shared
+                    .class_manager
+                    .write()
+                    .load_class(&call_site.impl_handle.class_name)?,
+            };
             ensure_class_initialized_shared(shared, thread, class_id)?;
             // Use `num_total_fields` (inherited + declared instance fields),
             // matching the `New` opcode. `c.fields.len()` is wrong here: it
