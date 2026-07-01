@@ -461,3 +461,20 @@ once); JIT wrong-results (the hot bodies run in the **interpreter**
 The profile is the deliverable here; the fix is a hot-path interpreter change
 (every `invokevirtual`, gauntlet-wide blast radius) and should be prototyped +
 soaked separately, not landed blind.
+
+### 2026-07-01 partial mitigation
+
+Implemented lever 1 for the vtable-fast path: each `JvmThread` now keeps a
+bounded native-shadow verdict cache keyed by
+`(receiver_class_id, method_name_hash, descriptor_hash)`. Repeated
+invoke-cache misses for the same receiver/method descriptor can skip both the
+direct `NativeMethodRegistry::find` probe and the superclass walk after the
+first verdict. The cache is bypassed whenever class redefinition is active, so
+Mockito/JVMTI-woven bytecode keeps the existing native-shadow suppression
+semantics.
+
+This should remove the profiled hot `NativeMethodRegistry::find` cost from warm
+miss sites, but the full Hibernate `FunctionTests` / `StandardFunctionTests`
+rerun has not been completed on this branch. Keep this cluster open until that
+end-to-end verification confirms the slowdown is gone and no other lever is
+needed.
