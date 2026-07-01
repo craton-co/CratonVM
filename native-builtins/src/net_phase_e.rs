@@ -5410,9 +5410,10 @@ fn re5_build_response(
 /// Shared request driver for `HttpClient.send` / `sendAsync`. `args[0]` is the
 /// `HttpClient`, `args[1]` the `HttpRequest`, `args[2]` the `BodyHandler`.
 ///
-/// LIMITATION: a request body is only carried when it was supplied as a literal
-/// (`BodyPublishers.ofString`); a reactive `BodyPublishers.fromPublisher(...)`
-/// body (Spring's streaming `JdkClientHttpRequest` POST/PUT path) is not driven
+/// LIMITATION: a request body is only carried when it was supplied as literal
+/// bytes (`BodyPublishers.ofString` / `ofByteArray`); a reactive
+/// `BodyPublishers.fromPublisher(...)` body (Spring's streaming
+/// `JdkClientHttpRequest` POST/PUT path) is not driven
 /// here, so the request goes out with an empty body. See
 /// docs/known-issues for the streaming-body follow-up.
 fn re5_do_request(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -5768,7 +5769,7 @@ fn register_re5_http_client(r: &mut NativeMethodRegistry) {
     );
     // method(String, BodyPublisher) — the generic verb setter Spring uses for
     // POST/PUT/PATCH (and any custom verb). Slot 0 = method name, slot 2 = body
-    // (carried only for literal `ofString` publishers; see `re5_do_request`).
+    // (carried only for literal publishers; see `re5_do_request`).
     r.register(
         bl,
         "method",
@@ -5853,7 +5854,7 @@ fn register_re5_http_client(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let body =
                 alloc_concurrent_synthetic(ctx, "java/net/http/HttpRequest$BodyPublisher", 1);
-            let bytes = match args.get(1).copied() {
+            let bytes = match args.first().copied() {
                 Some(Value::Object(Some(arr))) => {
                     String::from_utf8_lossy(&re5_read_byte_array(ctx, arr)).into_owned()
                 }
@@ -8251,6 +8252,8 @@ fn register_re10_http_server(r: &mut NativeMethodRegistry) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_utils::MockNativeContext;
+    use cratonvm_native_api::NativeContext;
 
     #[test]
     fn re1_http_parse_url_plain() {
@@ -8365,6 +8368,36 @@ mod tests {
         assert_eq!(resp.status, 204);
         assert_eq!(resp.body, Vec::<u8>::new());
         assert!(resp.headers.iter().any(|(k, _)| k == "Server"));
+    }
+
+    #[test]
+    fn re5_body_publishers_of_byte_array_reads_static_arg_slot_zero() {
+        let mut registry = NativeMethodRegistry::new();
+        register_re5_http_client(&mut registry);
+        let native = registry
+            .find(
+                "java/net/http/HttpRequest$BodyPublishers",
+                "ofByteArray",
+                "([B)Ljava/net/http/HttpRequest$BodyPublisher;",
+            )
+            .expect("ofByteArray native is registered");
+
+        let mut ctx = MockNativeContext::new();
+        let bytes = ctx.new_array(ArrayElementType::Byte, 3);
+        ctx.set_array_element(bytes, 0, Value::Int(b'a' as i32));
+        ctx.set_array_element(bytes, 1, Value::Int(b'b' as i32));
+        ctx.set_array_element(bytes, 2, Value::Int(b'c' as i32));
+
+        let publisher = match native(&mut ctx, &[Value::Object(Some(bytes))]).unwrap() {
+            Some(Value::Object(Some(publisher))) => publisher,
+            other => panic!("expected BodyPublisher object, got {other:?}"),
+        };
+        let body = match ctx.get_field(publisher, 0) {
+            Value::Object(Some(body)) => body,
+            other => panic!("expected publisher body string, got {other:?}"),
+        };
+
+        assert_eq!(ctx.read_string(body).as_deref(), Some("abc"));
     }
 
     #[test]
