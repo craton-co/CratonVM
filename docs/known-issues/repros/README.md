@@ -6,8 +6,9 @@ Easy-access, tracked copies of the standalone reproducers for the **open** bugs 
 at risk of being lost. The bugs span **Wildfly, Kafka, Hibernate, Elasticsearch,
 Keycloak and Spring** — not Spring-only.
 
-> **Re-run 2026-06-29:** the **A2** (`ReflRepro`) and **A5** (`gc-stress` bintrees) repros now
-> pass on dev (their docs moved to `docs/internal/`), and three more — `spring-bug-08`,
+> **Re-run 2026-06-29 / archive cleanup 2026-07-01:** the **A5** (`gc-stress` bintrees)
+> repro set now lives under `docs/internal/repros/gc-stress-bintrees-main-args/`; the **A2**
+> (`ReflRepro`) repro now passes on dev, and three more — `spring-bug-08`,
 > `keycloak-15`, `keycloak-16` — **no longer reproduce on dev** (see ✅ rows below). `A4`/`Fork6`
 > still exercises the architectural FJP register-root gap (non-fatal: prints `ALL-OK`).
 

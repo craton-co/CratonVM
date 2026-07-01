@@ -157,10 +157,10 @@ Two observable end-states (both are the same bug; timing decides which):
 
 Canonical: object-based binarytrees that accumulates one checksum, `maxDepth` from `args[0]`.
 Minimal repros and clean controls are in
-[`repros/gc-stress-bintrees-main-args/`](../../known-issues/repros/gc-stress-bintrees-main-args/).
+[`repros/gc-stress-bintrees-main-args/`](../repros/gc-stress-bintrees-main-args/).
 
 ```bash
-cd docs/known-issues/repros/gc-stress-bintrees-main-args
+cd docs/internal/repros/gc-stress-bintrees-main-args
 javac -d . VAAload.java
 for i in $(seq 1 8); do CRATONVM_DBG_GC_STRESS=4096 cratonvm.exe -Xmx6g -cp . VAAload 14; done
 # HotSpot / clean: 3222190 every run.  CratonVM JIT: empty (crash) ~8/8.
