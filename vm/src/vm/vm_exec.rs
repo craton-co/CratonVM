@@ -5259,14 +5259,33 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                 num_captures,
             )?;
 
+            // Loader-faithful impl owner (gated): dispatch a lambda whose
+            // enclosing class was defined by a child / bytecode-enhancing loader
+            // on that loader's copy of the impl class, not the global one (see
+            // `lambda_impl_dispatch_override`).
+            let impl_override =
+                crate::runtime::interpreter::lambda_impl_dispatch_override(self.shared, &lcs);
             // Dispatch by method handle kind.
             let raw_result = match lcs.impl_handle.kind {
-                MethodHandleKind::InvokeStatic => self.invoke_or_native(
-                    &lcs.impl_handle.class_name,
-                    &lcs.impl_handle.member_name,
-                    &lcs.impl_handle.descriptor,
-                    &full_args,
-                ),
+                MethodHandleKind::InvokeStatic => {
+                    if let Some(impl_cid) = impl_override {
+                        invoke_on_class_shared_no_retarget(
+                            self.shared,
+                            self.thread,
+                            impl_cid,
+                            &lcs.impl_handle.member_name,
+                            &lcs.impl_handle.descriptor,
+                            &full_args,
+                        )
+                    } else {
+                        self.invoke_or_native(
+                            &lcs.impl_handle.class_name,
+                            &lcs.impl_handle.member_name,
+                            &lcs.impl_handle.descriptor,
+                            &full_args,
+                        )
+                    }
+                }
                 MethodHandleKind::InvokeVirtual | MethodHandleKind::InvokeInterface => {
                     // First arg is the receiver for the target method.
                     if full_args.is_empty() {
@@ -5310,24 +5329,55 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                             Ok(None)
                         }
                     } else {
-                    let target_class = match &full_args[0] {
-                        Value::Object(Some(r)) => {
-                            let rcv_id = self.shared.heap.class_id_of(*r);
-                            self.shared
-                                .class_manager
-                                .read()
-                                .get_class(rcv_id)
-                                .map(|c| c.name.to_string())
-                                .unwrap_or_else(|| lcs.impl_handle.class_name.to_string())
-                        }
-                        _ => lcs.impl_handle.class_name.to_string(),
+                    let rcv_id_opt = match &full_args[0] {
+                        Value::Object(Some(r)) => Some(self.shared.heap.class_id_of(*r)),
+                        _ => None,
                     };
-                    let result = self.invoke_or_native(
-                        &target_class,
-                        &lcs.impl_handle.member_name,
-                        &lcs.impl_handle.descriptor,
-                        &full_args,
-                    );
+                    let target_class = match rcv_id_opt {
+                        Some(rcv_id) => self
+                            .shared
+                            .class_manager
+                            .read()
+                            .get_class(rcv_id)
+                            .map(|c| c.name.to_string())
+                            .unwrap_or_else(|| lcs.impl_handle.class_name.to_string()),
+                        None => lcs.impl_handle.class_name.to_string(),
+                    };
+                    // Loader-faithful (gated): dispatch on the receiver's exact
+                    // class_id when it diverges from the by-name global copy, so a
+                    // bytecode-enhanced receiver runs its own lambda body.
+                    let vov = if crate::runtime::env_cache::loader_aware_resolution() {
+                        rcv_id_opt.filter(|rcv| {
+                            *rcv != ClassId::new(0)
+                                && !self.shared.lambda_proxies.read().contains_key(rcv)
+                                && {
+                                    let cm = self.shared.class_manager.read();
+                                    cm.get_class(*rcv)
+                                        .map(|c| &*c.name == target_class.as_str())
+                                        .unwrap_or(false)
+                                        && cm.get_loaded_class_id(&target_class) != Some(*rcv)
+                                }
+                        })
+                    } else {
+                        None
+                    };
+                    let result = if let Some(rcv_cid) = vov {
+                        invoke_on_class_shared(
+                            self.shared,
+                            self.thread,
+                            rcv_cid,
+                            &lcs.impl_handle.member_name,
+                            &lcs.impl_handle.descriptor,
+                            &full_args,
+                        )
+                    } else {
+                        self.invoke_or_native(
+                            &target_class,
+                            &lcs.impl_handle.member_name,
+                            &lcs.impl_handle.descriptor,
+                            &full_args,
+                        )
+                    };
                     // If the receiver's class didn't have the method, fall back
                     // to the class specified in the lambda call site. This handles
                     // objects with generic ClassId (e.g., stub Object) where the
@@ -5367,18 +5417,34 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                     }
                     }
                 }
-                MethodHandleKind::InvokeSpecial => self.invoke_or_native(
-                    &lcs.impl_handle.class_name,
-                    &lcs.impl_handle.member_name,
-                    &lcs.impl_handle.descriptor,
-                    &full_args,
-                ),
+                MethodHandleKind::InvokeSpecial => {
+                    if let Some(impl_cid) = impl_override {
+                        invoke_on_class_shared_no_retarget(
+                            self.shared,
+                            self.thread,
+                            impl_cid,
+                            &lcs.impl_handle.member_name,
+                            &lcs.impl_handle.descriptor,
+                            &full_args,
+                        )
+                    } else {
+                        self.invoke_or_native(
+                            &lcs.impl_handle.class_name,
+                            &lcs.impl_handle.member_name,
+                            &lcs.impl_handle.descriptor,
+                            &full_args,
+                        )
+                    }
+                }
                 MethodHandleKind::NewInvokeSpecial => {
-                    let class_id = self
-                        .shared
-                        .class_manager
-                        .write()
-                        .load_class(&lcs.impl_handle.class_name)?;
+                    let class_id = match impl_override {
+                        Some(cid) => cid,
+                        None => self
+                            .shared
+                            .class_manager
+                            .write()
+                            .load_class(&lcs.impl_handle.class_name)?,
+                    };
                     super::ensure_class_initialized_shared(self.shared, self.thread, class_id)?;
                     // Use `num_total_fields` (inherited + declared instance
                     // fields), matching the `New` opcode and the sibling
@@ -6507,7 +6573,20 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
 
     fn allocate_loader_id(&mut self) -> u32 {
         use std::sync::atomic::{AtomicU32, Ordering};
-        static NEXT_LOADER_ID: AtomicU32 = AtomicU32::new(1);
+        // User-defined loader namespace ids MUST start at 3: the `ClassLoaderId`
+        // i32 encoding (see `loader_id_of_class` / `define_class_full`) reserves
+        // 0=Bootstrap, 1=Extension, 2=Application. Starting the counter at 1
+        // handed the first two user loaders ids 1 and 2, which alias
+        // `UserDefined(1)`↔Extension and `UserDefined(2)`↔Application — so a
+        // user-loader namespace was indistinguishable from a built-in one. That
+        // broke loader-faithful resolution for bytecode-enhanced Hibernate
+        // entities: the `EnhancingClassLoader` got namespace 2, its enhanced
+        // entity was stored as `UserDefined(2)`, and `inherit_lookup_loader`'s
+        // `raw < 3` guard then re-homed the ByteBuddy instantiator into the
+        // Application namespace, so `new Country` resolved the *un-enhanced* copy
+        // → `ClassCastException`/`PersistentAttributeInterceptable`. Starting at 3
+        // guarantees every allocated namespace is a genuine `UserDefined` id.
+        static NEXT_LOADER_ID: AtomicU32 = AtomicU32::new(3);
         NEXT_LOADER_ID.fetch_add(1, Ordering::Relaxed)
     }
 

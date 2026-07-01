@@ -35,12 +35,12 @@ CRATONVM_DISABLE_DEFAULT_WATCHDOG=1 $CV --java-home "C:/Program Files/Java/jdk-2
 | 1 | `stats.ExplicitQueryStatsMaxSizeTest` | `expected:<0> but was:<1000>` | native `LinkedHashMap.put` never ran `removeEldestEntry` eviction hook | **FIXED** (this branch) |
 | 2 | `multitenancy.DatabaseTimeZoneMultiTenancyTest` | timestamp +6h | `TimeZone.getTimeZone("CST")` (3-letter id) → rawOffset 0 | **FIXED** (this branch; HIB-CV-34 family) |
 | 3 | `mapping.type.format.XmlFormatterTest` | (was UOE) | — | **FLIPPED GREEN** on current dev — excluded |
-| 4 | `cache.EnhancedProxyCacheTest` | can't cast to `PersistentAttributeInterceptable` | loader-blind class store (enhanced class shadowed by app-loader original) | OPEN — loader-blind group |
-| 5 | `flush.AutoFlushBeforeLoadTest` | To-one mapping type mismatch / persister | loader-blind class store | OPEN — loader-blind group |
-| 6 | `jpa.callbacks.PrivateConstructorEnhancerTest` | can't cast to `PersistentAttributeInterceptable` | loader-blind class store | OPEN — loader-blind group |
-| 7 | `type.LobUnfetchedPropertyTest` | can't cast to `PersistentAttributeInterceptable` | loader-blind class store | OPEN — loader-blind group |
-| 8 | `pc.InstanceIdentityTest` | IAE "not of expected type" | loader-blind class store | OPEN — loader-blind group |
-| 9 | `proxy.ProxyClassReuseTest` | `Could not instantiate persister` (1/3) | loader-blind class store (dual-loader) | OPEN — owned by `hib-proxyclassreuse-loader-blind-class-resolution.md` |
+| 4 | `cache.EnhancedProxyCacheTest` | can't cast to `PersistentAttributeInterceptable` | `allocate_loader_id` aliased user namespace 2 onto Application + loader-blind reflection/lambda dispatch | **FIXED** (gated; §4–9) |
+| 5 | `flush.AutoFlushBeforeLoadTest` | To-one mapping type mismatch / persister | same | **FIXED** (gated; §4–9) |
+| 6 | `jpa.callbacks.PrivateConstructorEnhancerTest` | can't cast to `PersistentAttributeInterceptable` | same | **FIXED** 5/5 (gated; §4–9) |
+| 7 | `type.LobUnfetchedPropertyTest` | can't cast to `PersistentAttributeInterceptable` | same | **FIXED** (gated; §4–9) |
+| 8 | `pc.InstanceIdentityTest` | IAE "not of expected type" | same | **FIXED** (gated; §4–9) |
+| 9 | `proxy.ProxyClassReuseTest` | now `assertSame(getClassLoader(), cl1)` (was `already defined by app loader`), 2/3 | dual-isolated-loader `getClassLoader` attribution | ADVANCED (gated; proxies now distinct via keystone) — still owned by `hib-proxyclassreuse-loader-blind-class-resolution.md` |
 | 10 | `util.dtd.EntityResolverTest` | unmapped entity `[Child]` | synthetic `XMLInputFactory.newInstance()` stub shadows real Woodstox → resolver ignored, general entity not expanded | **FIXED** (default-ON; `CRATONVM_REAL_STAX_FACTORY=0` escape hatch); slowness is separate (§15–16) |
 | 11 | `jpa.transaction.TransactionTimeoutTest` | `getStatus()=0 ACTIVE` | Narayana transaction-reaper thread never fires the 2s timeout | OPEN — new |
 | 12 | `id.uuid.rfc9562.UUidV6V7GeneratorTest` | MockitoException | native `AnnotatedTypeBaseImpl.location` null → `getAnnotatedOwnerType` NPE | **NPE FIXED**; residual = 1M-iteration slowness (§15–16 cluster) |
@@ -100,37 +100,85 @@ standard time.) Same family as the FIXED HIB-CV-34 doc.
 
 ---
 
-## 4–9. Loader-blind class store — bytecode-enhancement / persister group (OPEN)
+## 4–9. Loader-blind class store — bytecode-enhancement / persister group (FIXED, gated)
 
-Six classes share **one** root cause. Five (`EnhancedProxyCacheTest`,
-`AutoFlushBeforeLoadTest`, `PrivateConstructorEnhancerTest`,
-`LobUnfetchedPropertyTest`, `InstanceIdentityTest`) carry `@BytecodeEnhanced`;
-its JUnit extension runs the test through a child `EnhancingClassLoader`
-(parent = application loader) that ByteBuddy-enhances the entity and
-`defineClass`es it so it implements `PersistentAttributeInterceptable` /
-`ManagedEntity` / `SelfDirtinessTracker`.
+Five `@BytecodeEnhanced` classes (`EnhancedProxyCacheTest`,
+`AutoFlushBeforeLoadTest`, `PrivateConstructorEnhancerTest` 5/5,
+`LobUnfetchedPropertyTest`, `InstanceIdentityTest`) now **PASS** with the gate
+`CRATONVM_LOADER_AWARE_RESOLUTION=1` (0→5). `ProxyClassReuseTest` is the
+separate dual-isolated-loader variant (still owned by
+`hib-proxyclassreuse-loader-blind-class-resolution.md`; see below).
 
-Enhancement is **not** the problem — the enhanced `.class` is generated
-correctly (`javap` confirms the interfaces + `$$_hibernate_*` members) and
-`defineClass(enhanced)` is called. CratonVM's **flat global name→ClassId store
-is loader-blind**: the same-named entity defined by the app loader and by the
-`EnhancingClassLoader` collapse to one entry, and the reference reaching
-`SingleTableEntityPersister` resolves to the *unenhanced* app-loader copy →
-`can't be cast to PersistentAttributeInterceptable` / `Could not instantiate
-persister` / `not of expected type`.
+Each test runs through a child `EnhancingClassLoader` (parent = app loader) that
+ByteBuddy-enhances the entity and `defineClass`es it so it implements
+`PersistentAttributeInterceptable` / `ManagedEntity` / `SelfDirtinessTracker`.
+Enhancement itself was never the problem — the leak was a chain of loader-blind
+resolution sites, each unmasked as the previous was fixed. Diagnosed with
+env-gated traces (`CRATONVM_IAE_TRACE`) on a single class at a time.
 
-- `ProxyClassReuseTest` is the dual-isolated-loader variant already owned by
-  `docs/known-issues/hib-proxyclassreuse-loader-blind-class-resolution.md`.
-- **Update (dev merge):** dev commit `7183f42a` + `docs/known-issues/hib-bytecode-enhancement-loader-faithful-linking.md`
-  added gate-on loader-faithful supertype *linking* / `invokespecial` dispatch
-  for `@BytecodeEnhanced` entities. That doc reports the eager-enhancement
-  cluster FIXED gate-on but the `enhancement.lazy.*` / `mapping.lazytoone.*`
-  cluster still OPEN. **Re-tested on the merged binary with
-  `CRATONVM_LOADER_AWARE_RESOLUTION=1`: all 6 still FAIL** (identical
-  `can't be cast to PersistentAttributeInterceptable` / persister / IAE) — so
-  these misc16 classes fall in the still-open lazy/non-eager cluster, not the
-  portion dev's `7183f42a` fixed. Tracked by
-  `hib-bytecode-enhancement-loader-faithful-linking.md` (open lazy cluster).
+### KEYSTONE (ungated correctness fix) — `allocate_loader_id` namespace-id collision
+
+`NativeContextImpl::allocate_loader_id()` (`vm/src/vm/vm_exec.rs`) started its
+counter at **1**, handing the first two user-defined loaders namespace ids 1 and
+2. But the `ClassLoaderId` i32 encoding (`loader_id_of_class` /
+`define_class_full`) reserves **0=Bootstrap, 1=Extension, 2=Application**, so
+`UserDefined(2)` *aliases* Application. The `EnhancingClassLoader` got namespace
+**2**, so its enhanced entity was stored as `UserDefined(2)` ≡ Application —
+indistinguishable from the un-enhanced global copy. Downstream loader-faithful
+checks that assume user ids are `>= 3` (`inherit_lookup_loader`'s `raw < 3`
+guard) then re-homed the ByteBuddy instantiator (`X$HibernateInstantiator`) into
+the Application namespace, so its `new Country` resolved the *un-enhanced* copy →
+`can't be cast to PersistentAttributeInterceptable`. **Fix:** start the counter
+at **3** so every allocated namespace is a genuine `UserDefined` id. Ungated —
+this is a strict encoding-collision correctness fix (a user namespace must never
+alias a built-in category); validated by the classloading/native-builtins unit
+suites and by gate-off tests still producing the original failure modes.
+
+### Three further loader-faithful gaps (all gated on `CRATONVM_LOADER_AWARE_RESOLUTION`)
+
+- **(a) Reflective `Method`/`Field`/`Constructor` type resolution**
+  (`native-builtins/src/lang_class.rs`) materialised return/parameter/field
+  descriptor classes through the flat global store, so an enhanced entity's
+  `getContinent()` reported the *un-enhanced* `Continent` while the to-one target
+  (via `Class.forName` through the enhancing loader) was enhanced —
+  `ToOneAttributeMapping`'s `declaredType.isAssignableFrom(targetType)` failed
+  (`mapped with targetEntity=X, but declared as X`). **Fix:**
+  `descriptor_to_class_mirror_via_loader` resolves `L`-form types through the
+  **declaring class's own loader namespace** (exact `(loader,name)` probe, no
+  Java `loadClass` → GC-safe mid-reflection-build).
+
+- **(b) Lambda impl-method dispatch** (invokedynamic;
+  `vm/src/runtime/interpreter.rs` `try_lambda_dispatch` + `vm/src/vm/vm_exec.rs`)
+  dispatched the impl by its owner **name** → global copy, so a
+  `session -> { new Entity(); }` lambda ran the *un-enhanced* enclosing-class
+  body. **Fix:** `lambda_impl_dispatch_override` resolves the impl owner through
+  the invokedynamic **caller's** loader (`lambda_proxy_hosts`) for
+  `InvokeStatic`/`InvokeSpecial`/`NewInvokeSpecial`; the
+  `InvokeVirtual`/`InvokeInterface` branches dispatch on the **receiver's exact
+  class_id** when it diverges from the by-name copy (guarded to real,
+  same-named, non-lambda-proxy receivers — mirrors the ordinary
+  `invoke_virtual` divergence override).
+
+- **(c) Lambda-arg `checkcast`** (`checkcast_lambda_instantiated_args` /
+  `lambda_arg_provably_not_instance`) rejected an enhanced entity as
+  `X cannot be cast to X` against the name-resolved (un-enhanced) copy — the
+  `ImmutableEntity::getName` method-reference receiver coercion. **Fix:** gated
+  name-equality carve-out: two same-**named** cross-loader copies are the same
+  logical type, so the cast succeeds.
+
+### Results & residual
+
+- Gate-on: the 5 `@BytecodeEnhanced` classes PASS (0→5).
+- Gate-off: byte-identical — the same *original* failure modes
+  (`can't be cast to PersistentAttributeInterceptable` / `not of expected type`),
+  no crash.
+- `ProxyClassReuseTest.testNoReuse`: **advanced** — the keystone made the two
+  isolated proxies distinct (`assertNotSame` now passes; was
+  `IncompatibleClassChangeError: already defined by application loader`). It now
+  fails only its residual `assertSame(proxyClass1.getClassLoader(), cl1)`
+  (`getClassLoader()` reports the app loader) — still the separately-owned
+  dual-isolated-loader `getClassLoader`-attribution case
+  (`hib-proxyclassreuse-loader-blind-class-resolution.md`).
 
 **Why the existing gate misses it (fix direction).** The gated
 `resolve_class_loader_aware` (`vm/src/runtime/interpreter.rs`) only covers
