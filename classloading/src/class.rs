@@ -836,6 +836,7 @@ impl ClassStore {
         let mut ref_offsets: Vec<u32> = Vec::new();
         let mut off: u32 = 0;
         let mut count: usize = 0;
+        let mut padded = false;
 
         let mut push = |r: bool, off: &mut u32| {
             field_offsets.push(*off);
@@ -864,7 +865,28 @@ impl ClassStore {
             while count < target {
                 push(true, &mut off); // padded slot -> reference (8-byte null)
                 count += 1;
+                padded = true;
             }
+        }
+
+        // A padded slot has NO field descriptor, so its true type is unknown. We
+        // cannot build a trustworthy oop-map for such a class: the untyped
+        // `ClassId(0)`-minted synthetic containers (`cratonvm/synthetic/
+        // AnonymousObject$N`, every HashMap/LinkedHashMap node, view backings, …)
+        // are all pure padding, and native code stores MIXED types into their raw
+        // slots (e.g. `map_alloc_node` writes `Int(hash)` into slot 0 and object
+        // refs into slots 1-3). Guessing every padded slot is a reference makes
+        // the GC scan a primitive slot as an 8-byte pointer (and auto-box the int
+        // on write) — under GC_STRESS this strands the node's real reference
+        // slots and corrupts the heap (missed-fixup of the compact node's key
+        // ref). Refuse the compact layout for any padded class so it falls back
+        // to the legacy uniform 16-byte tagged-`Value` cell layout, where every
+        // slot self-describes its type via its tag — exactly the compact-OFF
+        // behaviour, which is correct for these mixed-use containers. Classes
+        // whose every slot has a real descriptor (no padding) are unaffected and
+        // stay compact.
+        if padded {
+            return None;
         }
 
         Some(CompactLayout {
