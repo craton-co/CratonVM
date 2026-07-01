@@ -55,3 +55,14 @@ it also depends on a real worker-thread submit path.
 
 Until then the literal-body path (`ofString`) and all bodyless verbs work; only
 reactive-streaming request bodies are dropped.
+
+## 2026-07-01 note
+
+While investigating this item, an adjacent literal-body bug was fixed in
+`native-builtins/src/net_phase_e.rs`: `BodyPublishers.ofByteArray(byte[])` read
+argument slot 1 even though static native calls pass the byte array in slot 0,
+so byte-array publishers became empty. The focused native test
+`re5_body_publishers_of_byte_array_reads_static_arg_slot_zero` now verifies the
+registered native carries slot-0 bytes into the synthetic publisher. This does
+not fix `fromPublisher(...)`; the reactive streaming bridge described above is
+still open, so this document remains in `docs/known-issues`.
