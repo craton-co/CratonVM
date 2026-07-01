@@ -228,6 +228,112 @@ Fixed by skipping the fd-tag store when slot 0 is a compact reference field
 gauntlet, watch for the same pattern** (a primitive stored into a declared
 reference field of a synthetic/bootstrap object).
 
+## Gotcha (FIXED): legacy instances of a compact-layout class + inline codegen
+
+**Symptom:** a hard SIGSEGV (`EXCEPTION_ACCESS_VIOLATION`, `pc` in a non-`.text`
+heap address — a jump through a corrupted pointer) ~1 s into a reflection /
+class-load-heavy workload (found on the commons-math `transform` suite run via
+the JUnit Launcher API). Flag-off is clean.
+
+**Root cause:** compactness is a **per-object** property, decided at allocation
+by `plan_object_alloc` as `layout.field_count() == num_fields` and recorded in
+the header's `GC_FLAG_COMPACT` bit. A class can have a **registered compact
+layout yet still allocate LEGACY (16-byte-cell) instances** whenever an
+allocation's `num_fields` disagrees with the layout's field count — most
+commonly native/synthetic-stub allocations whose *padded* stub field count
+exceeds the real declared count the layout was built from (observed:
+`java/lang/reflect/Method` alloc 23 vs layout 20, `ConcurrentHashMap` 16 vs 12,
+`ArrayList` 4 vs 3, plus the stream/`Path`/`Collector` stubs with layout count
+0). Every **heap** and **helper** field-access path already keys on the
+per-object `GC_FLAG_COMPACT` bit and handles both layouts — but the **JIT inline
+getfield / putfield-ref** emitters (the perf lever) baked the compact byte offset
+and assumed *every* instance of a registered-layout class is compact. Reading a
+legacy object at the compact offset returns a mangled word (the 16-byte cell's
+`{tag=4, partial-pointer}` first qword read as an 8-byte pointer, e.g.
+`0x1AB297C0_00000004`); when that bogus reference is later dereferenced/called
+the VM jumps through it → SIGSEGV.
+
+**Fix:** make the inline emitters key on the per-object flag, exactly like every
+other access path. Inline getfield now tests `gc_flags & GC_FLAG_COMPACT` (header
+byte 21) after the null check and branches: compact → 8-byte ref / packed cell
+read; legacy → the uniform `index * SLOT_SIZE` 16-byte-cell read (mirroring the
+non-compact inline arm), all inline (no helper). Inline putfield-ref adds the
+same not-compact case to its bail set, routing legacy receivers to the
+per-object-flag-aware `jit_putfield_object` helper. Primitive putfields already
+routed through the type helpers (`putfield_int/long/…`), which honor the flag, so
+they needed no change. (`jit/src/x64.rs`, getfield opcode `0xb4` compact arm +
+putfield opcode `0xb5` compact-ref arm.)
+
+Validated: commons-math `transform` compact-ON now runs with **no SIGSEGV** and
+the same 54–56/56 pass rate as compact-OFF (both vary run-to-run identically);
+bt10/14/16/18 checksums exact compact-ON incl. `GC_STRESS`; flag-off unchanged.
+A gated diagnostic `CRATONVM_DBG_COMPACT_LEGACY=1` (`gen_heap.rs`
+`plan_object_alloc`) prints every class that allocates a legacy instance despite
+a registered layout — use it to spot the same pattern when soaking new apps.
+
+### Second fix: old-gen walker sized promoted compact objects as legacy
+
+Running the same suite under `CRATONVM_GC_STRESS=1` surfaced a *distinct*
+compact SIGSEGV (this one at a native/JIT `.text` `pc`, not a heap jump).
+`OldGen::scan_region` / `scan_region_filtered` (`old_gen.rs`) — the walkers
+behind `walk_objects` (major-GC compaction) and `walk_objects_in_card_ranges`
+(minor-GC dirty-card scan) — sized every `kind == Object` as
+`HEADER_SIZE + num_slots*SLOT_SIZE`, **ignoring `GC_FLAG_COMPACT`**. A promoted
+compact object (body in `array_length`, e.g. 152 B) was therefore strided as
+`num_slots*16` (e.g. 200 B), which (a) tripped the size-consistency skip in
+`scan_dirty_cards` (`gen_object_total_size` said 152, the walker said 200) so its
+old→young reference slots were **not scanned** — a missed root — and (b) desynced
+the whole old-gen walk after that object. Fixed by sizing the `Object` arm via
+`cratonvm_types::object_body_size(header)` (honours the per-object flag; legacy
+objects still size as `num_slots*SLOT_SIZE`) in both `scan_region*` functions.
+Regression-clean: bt10/14/16 exact, bt16 `GC_STRESS` exact, normal transform
+unchanged.
+
+### Residual (out of scope for the SIGSEGV fix): GC_STRESS missed-mark corruption
+
+With both fixes, compact-ON `transform` no longer SIGSEGVs under `GC_STRESS`, but
+a *caught, non-crashing* corruption remains on that torture load (a reference
+field reads back a stale pointer → interpreted as a garbage header → e.g.
+`java/util/logging/Level` `<clinit>` `ClassCastException` → linkage error;
+compact-OFF `GC_STRESS` is clean).
+
+**Localized (2026-07-01), not yet fixed.** Minimal deterministic repro:
+`scratch/GcStressRepro.java` (mixed ref+primitive `Node` list + logging init)
+under `CRATONVM_COMPACT_REF_FIELDS=1 CRATONVM_GC_STRESS=1 -Xmx128m` — HotSpot and
+compact-OFF both print `sum=49920 OK`, compact-ON corrupts (`gen_heap::read_slot:
+corrupt Value cell`). What the investigation established:
+- It is a **missed mark / dangling reference**, not a bad write: a ref slot holds
+  a stale young pointer (e.g. `0x1A9B2440`) into freed/reused memory. A
+  `dbg_check_slot_write` bounds-guard on every GC ref-update write-back
+  (`forward_ref_slots` + the three dirty-card branches) fired **zero** times.
+- It needs **no evacuation/promotion**: `CRATONVM_SP_STATS` shows `evac=0` on the
+  corrupting run, so the promotion-fixup paths (3a/3b/3c) are not involved.
+- It is compact-specific and `GC_STRESS`-only (a GC on nearly every allocation),
+  at **all** heap sizes (64m–2g), so it is not old-gen-allocator pressure.
+- Yet every obvious compact scan **is** already flag-aware — the young mark trace
+  and BFS (`for_each_ref_slot`), the non-moving sweep sizing
+  (`gen_object_total_size`), and the dirty-card seed (`scan_dirty_cards`) all use
+  `compact_oop_scan`. So the gap is a subtler root/precision or write-barrier edge
+  in how a compact object's 8-byte reference is (not) reached by the mark under
+  the non-moving sweep — the same hard GC-precision family tracked in the
+  moving-young/roots memory cluster. This wants a dedicated pass, not a spot fix.
+
+Two lesser threads noted along the way (edge/footprint, gated behind the
+default-OFF flag): (1) the JIT inline getfield ref path returns the bare slot
+pointer and does **not** unbox an `AUTOBOX_CLASS_ID` wrapper the way heap
+`get_field` does, so a primitive type-punned into a compact reference slot could
+leak the wrapper to Java; (2) `set_field`'s compact autobox arm computes `base`
+before `alloc_object`, safe today only because the heap `alloc_object` entry never
+GCs — revisit if that changes.
+
+**Deeper follow-up (optional, not required for correctness):** the legacy
+instances themselves are a footprint miss, not a bug — they come from native/stub
+allocations passing the padded stub count instead of the class's real
+`num_total_fields`. Reconciling the synthetic-stub field counts with the real
+declared layout would let these classes go compact too (more footprint win), but
+is a larger, riskier change; the per-object flag already makes both layouts
+correct, so this is left as a throughput lever, not a correctness fix.
+
 ## Stage 5 — observability (deferred, non-critical)
 
 HPROF instance dump (`serviceability.rs`) and the field-watch corruption

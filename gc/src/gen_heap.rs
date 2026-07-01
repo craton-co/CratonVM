@@ -6536,6 +6536,17 @@ fn plan_object_alloc(class_id: ClassId, num_fields: usize) -> Option<(usize, u32
             if layout.field_count() == num_fields {
                 let total = HEADER_SIZE.checked_add(layout.body_size as usize)?;
                 return Some((total, layout.body_size, GC_FLAG_COMPACT));
+            } else if std::env::var_os("CRATONVM_DBG_COMPACT_LEGACY").is_some() {
+                let name = crate::gc::resolve_class_info(class_id.as_u32())
+                    .map(|(n, _)| n)
+                    .unwrap_or_else(|| "<unresolved>".to_string());
+                eprintln!(
+                    "[compact-legacy] class={} id={} alloc num_fields={} != layout.field_count={} -> LEGACY object",
+                    name,
+                    class_id.as_u32(),
+                    num_fields,
+                    layout.field_count(),
+                );
             }
         }
     }
