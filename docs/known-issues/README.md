@@ -428,25 +428,28 @@ JIT divide-by-zero re-run) has since been fixed; the other two remain open:
   — they described the *same* Fork6 bug (A4). Added this index framing the
   A1–A4 family + standalone B/C, and recorded the current-`dev` A3 verification.
 
-## Spring Framework full-suite run (2026-06-21) — new entries
+## Spring Framework full-suite run (2026-06-21) — archived
 
-A fresh full `spring-core` run (binary built from dev) surfaced these CratonVM
-divergences. Consolidated index: [spring-core-suite-2026-06-21.md](spring-core-suite-2026-06-21.md).
-**8 fixes from this run already landed on `dev`** (stream close-handler OOB, CHM.remove(null)+
-LinkedHashMap.putIfAbsent, generic-bounds reify CCE, keySet.contains delegate, StAX cursor natives,
-lambda-SAM param-type dispatch, `String.format("%s",boolean)`, and synthetic `Collector`
-supplier/accumulator/finisher/combiner, plus JSpecify nullness reflection). The **open** ones documented here:
+A full `spring-core` run (binary built from dev) surfaced a cluster of CratonVM
+divergences. The historical suite index has moved to
+[docs/internal/spring/spring-core-suite-2026-06-21.md](../internal/spring/spring-core-suite-2026-06-21.md).
+Most contained fixes from that sweep have landed on `dev`, including the stream
+close-handler OOB, CHM null-key parity, LinkedHashMap null-replace behavior,
+generic-bounds reification, keySet containment, StAX cursor natives, lambda-SAM
+dispatch, JSpecify nullness reflection, and synthetic `Collector` SAM registration.
 
-- ~~SC-custom-classloader-ignored.md~~ — ✅ RESOLVED (`Class.forName`/`loadClass` now honor user `ClassLoader`s — override-first redefinition + loader-scoped `findLoadedClass` + non-colliding `defineClass`). Moved to [docs/internal/fixed-suite-bugs/SC-custom-classloader-ignored.md](../internal/fixed-suite-bugs/SC-custom-classloader-ignored.md). Unblocks the annotation `TypeNotPresentException` foundation (Bug A).
-- ~~SC-annotation-introspection-family.md~~ — Bug A (Class-attr `TypeNotPresentException`) ✅ FIXED — Class members resolve through the declaring class's loader + deferred `TypeNotPresentException`; see [docs/internal/fixed-suite-bugs/SC-custom-classloader-ignored.md](../internal/fixed-suite-bugs/SC-custom-classloader-ignored.md) and `vm/tests/annotation_loader_isolation.rs`. Bug B FIXED on dev; Bug C (Spring scan traversal) / Bug D (HotSpot `getDeclaredMethods` ordering — not cleanly fixable) were the residual. Doc removed in the dev docs refactor.
-- [SC-env-classreading.md](SC-env-classreading.md) — getenv/getProperties identity; `Object.equals` shadows overrides (`precedenceOf`=-1); `int.class` via classreading; custom-CL `getResourceAsStream`.
-- [SC-resource-io-family.md](SC-resource-io-family.md) — NIO write-channel stub, `Path.toUri()` authority; several FileNotFoundExceptions are harness-CWD artifacts.
-- [SC-stax-xml-family.md](SC-stax-xml-family.md) — namespace SAX-event-sequence mismatch (cursor natives + element prefix already fixed on dev).
-- [SC-task-retry-util-misc.md](../internal/spring/SC-task-retry-util-misc.md) — Throwable deser, retry timing, ByteBuddy ClassInjector, AQS throttle. (`Properties.store` #date and unmodifiable-wrapper `Serializable` are fixed on dev.)
-- [SC-misc-core-spring.md](SC-misc-core-spring.md) — SortedProperties OutputStream store (CHM.remove(null) fixed on dev).
-- [SC-hangs-mergedannotations-charsequence.md](SC-hangs-mergedannotations-charsequence.md) — two hangs: `MergedAnnotations.stream().toArray()` re-entry; Reactor `StepVerifier` producer never scheduled.
+Residual handoffs from the sweep are retained in focused internal Spring notes:
 
-Cross-cutting: ByteBuddy `ClassInjector$UsingReflection` failure breaks AssertJ `assertSoftly` + Mockito; JUnit "TimeoutExtension multiple times" masks underlying VM errors.
+- [SC-env-classreading.md](../internal/spring/SC-env-classreading.md) — `Object.equals` override precedence and custom-CL resource-stream follow-up.
+- [SC-resource-io-family.md](../internal/spring/SC-resource-io-family.md) — remaining Resource/IO handoffs; several FileNotFoundExceptions are harness-CWD artifacts.
+- [SC-stax-xml-family.md](../internal/spring/SC-stax-xml-family.md) — namespace SAX-event-sequence mismatch after the fixed cursor-native/prefix items.
+- [SC-task-retry-util-misc.md](../internal/spring/SC-task-retry-util-misc.md) — Throwable deser, retry timing, ByteBuddy ClassInjector, and AQS throttle handoffs.
+- [SC-misc-core-spring.md](../internal/spring/SC-misc-core-spring.md) — SortedProperties OutputStream store handoff; CHM null-key methods are fixed on dev.
+- [SC-hangs-mergedannotations-charsequence.md](../internal/spring/SC-hangs-mergedannotations-charsequence.md) — two hangs: `MergedAnnotations.stream().toArray()` re-entry and Reactor `StepVerifier` producer scheduling.
+
+Cross-cutting: ByteBuddy `ClassInjector$UsingReflection` failure breaks AssertJ
+`assertSoftly` + Mockito; JUnit "TimeoutExtension multiple times" masks
+underlying VM errors.
 
 ## Open bug docs relocated from `docs/internal/` (2026-06-22)
 

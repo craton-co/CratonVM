@@ -1,10 +1,21 @@
 ﻿# Misc spring-core cluster вЂ” two independent issues
 
+> **UPDATE 2026-07-01:** Issue A is fixed on current `dev`. `native_chm_remove`
+> already rejected null keys, and this pass added the same JDK-parity null-key
+> guard to `ConcurrentHashMap.get`, `containsKey`, `getOrDefault`, and
+> `remove(key,value)`, with registry-level coverage in
+> `concurrent_hashmap_null_key_methods_throw_npe`. Issue B remains a handoff
+> pending empirical OutputStream-vs-Writer capture.
+
 This cluster contains TWO distinct root causes. They are unrelated; assess/fix separately.
 
 ---
 
 ## Issue A вЂ” `SimpleAliasRegistryTests.removeNullAlias` (HIGH confidence, FIX-ready)
+
+> **STATUS: RESOLVED on dev.** The historical analysis below is retained for
+> provenance. `ConcurrentHashMap.remove(null)` now throws `NullPointerException`;
+> this pass also covered the sibling null-key read/removal methods listed below.
 
 ### Symptom
 `removeNullAlias` asserts `registry.removeAlias(null)` throws `NullPointerException`. Under CratonVM no NPE is thrown; instead an `IllegalStateException("No alias 'null' registered")` is thrown, so AssertJ's `assertThatNullPointerException()` fails (empty-message AssertionError).
