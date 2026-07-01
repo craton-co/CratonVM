@@ -373,12 +373,13 @@ fn build_connection_graph(graph: &Graph) -> ConnectionGraph {
             // escaping state.  Without this, `this`/argument holders defaulted
             // to `NoEscape` and the store-publish rule below never fired for
             // them, letting a value stored into `this.field` be wrongly
-            // scalar-replaced (which elides the `putfield`, leaving the field
-            // null and the getter returning `null` under JIT — keycloak
-            // `CredentialModelTest.canCreateDefaultCredentialModel`).  This
-            // realises the assumption the store rule's comment already makes
-            // ("covers Param/Call holders").  Marking a primitive param is
-            // harmless: primitives are never allocations or field holders.
+            // scalar-replaced (which would elide the `putfield` and leave the
+            // field null).  This was first investigated while chasing the
+            // keycloak CredentialModel lazy-init failure; that specific failure
+            // was later shown not to use this scalar-replacement path, but this
+            // invariant is still required for any IR-compiled lazy-init getter.
+            // Marking a primitive param is harmless: primitives are never
+            // allocations or field holders.
             Op::Param(_) => {
                 cg.set_escape(id, EscapeState::GlobalEscape);
             }
@@ -1189,7 +1190,8 @@ mod tests {
 
     #[test]
     fn test_value_stored_into_param_field_escapes() {
-        // Regression for the keycloak `CredentialModelTest` lazy-init getter:
+        // Regression for a lazy-init getter shape first audited during the
+        // keycloak `CredentialModelTest` investigation:
         //
         //   Map getAdditionalParameters() {
         //       if (additionalParameters == null)
@@ -1200,9 +1202,11 @@ mod tests {
         // `this` is `Param(0)`.  The freshly allocated map is published into a
         // field of `this`, so the caller can reach it after the method returns.
         // It MUST be treated as escaping and MUST NOT be scalar-replaced —
-        // scalar-replacing it elides the `putfield`, leaving the instance field
-        // null and the getter returning `null` under JIT (a value that can
-        // never legitimately be null on a correct JVM).
+        // scalar-replacing it would elide the `putfield`, leaving the instance
+        // field null and the getter returning `null` (a value that can never
+        // legitimately be null on a correct JVM). The real keycloak failure
+        // later proved to be outside this IR scalar-replacement path, but the
+        // invariant remains valid.
         let mut g = Graph::new();
         let this = g.add_node(Op::Param(0), vec![]);
         let map = g.add_node(

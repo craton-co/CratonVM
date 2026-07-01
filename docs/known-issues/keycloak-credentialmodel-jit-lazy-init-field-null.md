@@ -1,11 +1,28 @@
 # JIT miscompile — lazy-init getter returns `null` (CredentialModelTest)
 
-**Status:** 🔴 **OPEN** — CratonVM-only, **JIT-only** (passes `--nojit`). Handoff from the keycloak
+**Status:** 🟡 **MITIGATED 2026-07-01** — CratonVM-only, **JIT-only** (passes `--nojit`). The real
+Keycloak lazy-init getters are now kept interpreted by a targeted skip-list entry; full
+`KcRunner` verification still needs the out-of-tree Keycloak classpath. Handoff from the keycloak
 full-suite run (kcfull-2026-06-18 report 18, "Root C"). **The original escape-analysis hypothesis is
 REFUTED (2026-06-21)** — see "Investigation 2026-06-21" below. Not standalone-reproducible; needs the
-real keycloak class + its Jackson-deserialization caller context.
-**Severity:** correctness. A `new`-stored-to-field-then-returned object is dropped under JIT,
-so a lazy-init accessor returns `null` where it can never legitimately do so.
+real keycloak class + its Jackson-deserialization caller context to root-cause the underlying
+single-pass codegen issue.
+**Severity:** correctness. The lazy-init accessor can return `null` after it should have stored
+and returned an initialized map, which is never legitimate on a correct JVM.
+
+## Mitigation (2026-07-01)
+
+`vm/src/jit/skip_list.rs` now de-JITs only:
+
+- `org/keycloak/models/credential/dto/PasswordCredentialData.getAdditionalParameters`
+- `org/keycloak/models/credential/dto/PasswordSecretData.getAdditionalParameters`
+
+The surrounding `CredentialModel.getPasswordCredentialData` path remains JIT-eligible, and the
+entries are liftable for investigation with
+`CRATONVM_JIT_ALLOW_PACKAGES=org/keycloak/models/credential/` or `SkipPolicy::Aggressive`.
+
+This is a correctness containment fix for the suite-visible failure, not a proof that the
+context-sensitive single-pass `getfield`/`putfield`/`areturn` codegen issue is solved.
 
 ## Symptom
 `org.keycloak.models.credential.CredentialModelTest.canCreateDefaultCredentialModel` fails:
@@ -98,13 +115,14 @@ so lock elision never runs on real bytecode), so it does **not** explain keycloa
 hardening of the lattice (closes the violated invariant) carried alongside the investigation.
 
 ## Fix direction (revised)
-1. Reproduce against the **real** class with the Jackson-deser caller chain (needs the kc
+1. Verify the targeted skip-list mitigation against the real `KcRunner` classpath.
+2. Reproduce against the **real** class with the Jackson-deser caller chain (needs the kc
    classpath), with `CRATONVM_DBG_JIT_DISASM=1` on the **single-pass** compile of
    `getAdditionalParameters` / `getPasswordCredentialData`. The escape/scalar path is ruled out;
    look at the single-pass `getfield`→null-branch→`putfield`→`getfield`→`areturn` codegen and
    the register state under the deser allocation churn (could be a Family-A GC-root reclaim of
    the freshly-stored field value, not a codegen bug — re-check under `--nojit` + GC stress).
-2. Keep the bare-`Box`/`LazyNull`/`EaRepro` repros green and `bintrees18` checksum unchanged
+3. Keep the bare-`Box`/`LazyNull`/`EaRepro` repros green and `bintrees18` checksum unchanged
    (`68332206`).
 
 ## Repro
