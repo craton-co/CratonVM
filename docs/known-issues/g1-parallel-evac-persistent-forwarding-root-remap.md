@@ -151,6 +151,27 @@ self-forwarded objects' in-place slot rewrites to the serial Phase-4 pass so the
 never race a concurrent copy-read) — not the forwarding-protocol reasoning that
 fixed the dominant bug.
 
+## Fix candidate 2026-07-01 - deferred self-forward scans
+
+Implemented the targeted restructure suggested above: freshly self-forwarded
+CSet objects are no longer scanned by parallel workers. The parallel workers
+record them in a deferred worklist instead of pushing them onto the shared gray
+queue, then the driver drains that list serially after all worker threads have
+joined. During that serial drain, copied children and further self-forwarded
+children are appended to the same serial worklist, so the full transitive closure
+is still recorded in `pointer_map` before Phase 4/5.
+
+This removes the suspected copy-read vs in-place-slot-rewrite race: a
+self-forwarded holder remains in from-space, and its slots are mutated only after
+the parallel copy phase is complete. Focused coverage:
+
+- `parallel_self_forwarded_holders_are_drained_serially`
+- `parallel_self_forward_clears_forwarding_ptr_across_cycles`
+- `parallel_fast_path_hit_is_recorded_and_root_remapped`
+
+Status remains fix-candidate until the original `SteadyChurn @16m --nojit`
+parallel-evac repro is soaked clean enough to retire this known issue.
+
 Parallel evac therefore stays **opt-in/experimental** and mixed stays serial until
 this residual race is also fixed. Default G1 (serial) and Generational are
 unaffected.
