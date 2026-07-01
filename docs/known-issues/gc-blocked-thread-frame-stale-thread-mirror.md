@@ -140,18 +140,19 @@ mirror (see "Likely same underlying bug" below). The initiator can't safely scan
 live frames — that is *why* the snapshot mechanism exists — so the gap is that the snapshot is
 stale/incomplete relative to the blocked thread's current frame.
 
-## Likely the same underlying bug as `gc-concurrent-spawn-reclamation` (whose fix is NOT on dev)
+## Related fixed sibling: `gc-concurrent-spawn-reclamation`
 
-`docs/known-issues/repros/gc-concurrent-spawn-reclamation/README.md` is marked **✅ FIXED 2026-06-29**
-but on branch **`feat/precise-maps-a4-finish` which was NOT pushed** — so **the fix is not on dev**,
-and these Tomcat crashes confirm the bug is **still live on dev**. Its root cause: `currentThread()`
-lazily builds the main mirror (`current_thread_object` → `build_thread_field_holder` →
-`get_or_create_main_thread_group`); each step allocates, a young GC relocates the mirror, and VM
-native code holds it in a **bare Rust local across the allocation** → stale. Its fix: in the four
-`vm_exec.rs` helpers, re-read the mirror from the GC-remapped `java_thread_obj` field (or pin on
-`native_pin_roots`) after every allocating step. If `currentThread()` returns a stale mirror, that
-stale value is exactly what lands in `StandardContext.bind` `LOCAL[4]` here — so porting that fix to
-dev is the most likely complete fix. Siblings in the same "all-zero header stale receiver" family:
+The concurrent-spawn `currentThread()` mirror construction bug is fixed on current `dev` and its
+closed repro now lives under
+`docs/internal/repros/gc-concurrent-spawn-reclamation/README.md`. Its root cause was
+`current_thread_object` / `build_thread_field_holder` / `get_or_create_main_thread_group` holding
+freshly allocated thread-mirror state in bare Rust locals across GC-capable allocations. The fix
+re-reads the mirror from the GC-remapped `java_thread_obj` field after allocating steps and pins
+field-holder / thread-group construction through `native_pin_roots`.
+
+That sibling no longer explains the Tomcat residual by itself. This doc remains open for the
+blocked-thread frame/snapshot gap and the register-resident remainder described below. Siblings in
+the same "all-zero header stale receiver" family:
 `gc-moving-interpreter-lost-tag-missed-root.md` (OPEN, lost-tag variant),
 `fork6-fjp-multithread-jit-root-reclamation.md` (A4), and the non-moving-sweep correctness section in
 `README.md`.
@@ -179,10 +180,9 @@ the unrelated minor IBM850/CP850 charset (`UnsupportedEncodingException: ibm850`
 
 ## Proper fix (TODO)
 
-1. **Port the `gc-concurrent-spawn-reclamation` `currentThread()` re-read fix to dev** (most likely
-   the complete fix for the Tomcat manifestation) and re-verify the 6 classes *pass*, not just
-   survive.
-2. Failing that, close the blocked-thread frame-coverage gap so a thread cannot execute Java with a
+1. **DONE:** the `gc-concurrent-spawn-reclamation` `currentThread()` re-read / pin fix is on dev.
+   It closes that sibling's lazy thread-mirror construction corruption, but not the Tomcat residual.
+2. Close the blocked-thread frame-coverage gap so a thread cannot execute Java with a
    stale `root_snapshot` while flagged `in_blocked_region` (refresh/clear on the blocking native's
    wake path), and audit that the real-net (`native-io`) and real-AQS park natives bracket with
    `begin_blocking_region`/`end_blocking_region`.

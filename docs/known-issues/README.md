@@ -112,11 +112,12 @@ fixes). Headline:
     `CRATONVM_REAL_AQS`: a live young `java.lang.Thread` mirror held in a **blocked** thread's frame local
     (object-tagged, so NOT the lost-tag item 15) is reclaimed because it is missing from that thread's
     deposited `root_snapshot`; the freed slot is reused as byte-buffer data and decoded as an object pointer.
-    Likely the **same underlying bug** as the `currentThread()`-mirror reclamation in
-    [`repros/gc-concurrent-spawn-reclamation/`](repros/gc-concurrent-spawn-reclamation/) whose fix is on an
-    **unpushed** branch (`feat/precise-maps-a4-finish`) → not on dev. The mitigation (`plausible_heap_pointer`
+    Related to the now-fixed `currentThread()` mirror construction corruption archived at
+    [`../internal/repros/gc-concurrent-spawn-reclamation/`](../internal/repros/gc-concurrent-spawn-reclamation/).
+    Current `dev` has that re-read / pin fix and the stale-mirror recovery table, but this Tomcat item remains
+    open for the blocked-frame snapshot gap and register-resident remainder. The mitigation (`plausible_heap_pointer`
     gate at every ref-decode + JIT receiver-deref boundary) degrades a stale ref to a Java NPE — all 6 are now
-    **crash-free jit+nojit** but still fail/time out (the reclamation itself is unfixed).
+    **crash-free jit+nojit** but still fail/time out (the residual reclamation itself is unfixed).
 19. **[Hibernate `type.temporal.*` — moving GC strands lambda refs in native stream/collection intrinsics](hib-temporal-gc-lambda-native-stale-local.md)** —
     🟠 **OPEN** (fix in progress: per-native pinning). The 5 `org.hibernate.orm.test.type.temporal.*` classes
     abort rc=1 / SIGSEGV with `linkage error: no such method java/lang/Object.<sam>` — **not** a java.time

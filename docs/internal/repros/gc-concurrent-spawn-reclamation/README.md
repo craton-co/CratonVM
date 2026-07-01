@@ -2,7 +2,8 @@
 
 **Severity:** high (heap corruption / VM crash). **Manifests** only under frequent GC (tiny heap or `CRATONVM_DBG_GC_STRESS`); at normal heap sizes it is rare/absent.
 
-> **✅ FIXED 2026-06-29** (branch `feat/precise-maps-a4-finish`, NOT pushed). **ROOT CAUSE:**
+> **✅ FIXED 2026-06-29; archived from `docs/known-issues` on 2026-07-01.** The fix is present
+> on current `dev`. **ROOT CAUSE:**
 > it was **not** a missed root nor a remap gap — it was VM-internal native code holding a
 > freshly-allocated `java.lang.Thread` mirror (and its `FieldHolder` / `ThreadGroup` /
 > `interruptLock`) in a **bare Rust local across GC-capable allocations**. `currentThread()`
