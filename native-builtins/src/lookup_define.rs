@@ -278,6 +278,35 @@ fn lk_define_class_b(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
 
     match ctx.define_class_full("", &class_bytes, loader_id, opts) {
         Ok(cid) => {
+            // Record the exact defining ClassLoader so `Class.getClassLoader()`
+            // on the freshly-defined class reports the LOOKUP class's loader
+            // instead of the app-loader fallback — the same thing `defineClass1`
+            // / `ClassLoader.defineClass` already do for their define paths.
+            //
+            // ByteBuddy's reuse-check for a generated helper is
+            //   result = referenceClass.getClassLoader().loadClass(name);
+            //   if (result.getClassLoader() == referenceClass.getClassLoader()) return result;
+            // and CGLIB's `WeakCacheKey` compares likewise. Without a registered
+            // defining loader, an already-defined Hibernate ReflectionOptimizer /
+            // access-optimizer bridge reports the app loader, so ByteBuddy fails
+            // the identity check and RE-defines it → duplicate-define collision
+            // ("already defined by user-defined(N) loader") on the second
+            // `getReflectionOptimizer` for a class sharing a mapped superclass
+            // (FetchGraphTest / SpecializedEntity). Gated (loader-faithful) so
+            // gate-off stays byte-identical; only a lookup class defined by a
+            // user loader has a recorded defining loader to propagate.
+            if crate::classloader::loader_aware_resolution() {
+                if let Value::Object(Some(mirror)) = ctx.get_field(this_lookup, LK_LOOKUP_CLASS_REF)
+                {
+                    if let Some(lookup_cid) = crate::lang_class::mirror_class_id(ctx, mirror) {
+                        if let Some(loader) =
+                            crate::classloader::defining_loader_for(lookup_cid.as_u32())
+                        {
+                            crate::classloader::register_defining_loader(cid.as_u32(), loader);
+                        }
+                    }
+                }
+            }
             let mirror = ctx.get_class_mirror(cid);
             Ok(Some(Value::Object(Some(mirror))))
         }
