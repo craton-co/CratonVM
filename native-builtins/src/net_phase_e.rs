@@ -34,9 +34,9 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
-use std::sync::{Arc, OnceLock};
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex as StdMutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 
@@ -5349,6 +5349,37 @@ const RE5_RESP_HEADERS: usize = 2; // String[] of "key: value"
 const RE5_RESP_HANDLER_TAG: usize = 3; // String: how body() materialises
 const RE5_RESP_NUM_FIELDS: usize = 4;
 
+const RE5_BP_LITERAL_BODY: usize = 0; // String literal body, or null
+const RE5_BP_FLOW_PUBLISHER: usize = 1; // Flow.Publisher for fromPublisher(...)
+const RE5_BP_NUM_FIELDS: usize = 2;
+
+const RE5_COLLECTOR_HANDLER: &str = "cratonvm/net/http/BodyPublisherCollectorHandler";
+const RE5_FLOW_SUBSCRIBER: &str = "java/util/concurrent/Flow$Subscriber";
+const RE5_PUBLISHER_WAIT: Duration = Duration::from_secs(5);
+
+#[derive(Default)]
+struct Re5PublisherCollector {
+    inner: StdMutex<Re5PublisherCollectorState>,
+    cv: Condvar,
+}
+
+#[derive(Default)]
+struct Re5PublisherCollectorState {
+    bytes: Vec<u8>,
+    done: bool,
+    failed: bool,
+}
+
+fn re5_collectors() -> &'static Mutex<HashMap<u64, Arc<Re5PublisherCollector>>> {
+    static MAP: OnceLock<Mutex<HashMap<u64, Arc<Re5PublisherCollector>>>> = OnceLock::new();
+    MAP.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn re5_next_collector_id() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
 /// Read a `byte[]` heap object into a `Vec<u8>` (high byte ignored).
 fn re5_read_byte_array(ctx: &dyn NativeContext, arr: ObjectRef) -> Vec<u8> {
     let len = ctx.array_length(arr);
@@ -5359,6 +5390,256 @@ fn re5_read_byte_array(ctx: &dyn NativeContext, arr: ObjectRef) -> Vec<u8> {
         }
     }
     out
+}
+
+fn re5_bb_int_metadata(ctx: &dyn NativeContext, buf: ObjectRef, slot: usize, name: &str) -> i32 {
+    if let Value::Int(v) = ctx.get_field(buf, slot) {
+        if v != 0 {
+            return v;
+        }
+    }
+    if let Value::Int(v) = ctx.get_field_by_name(buf, name) {
+        if v != 0 {
+            return v;
+        }
+    }
+    match ctx.get_field(buf, slot) {
+        Value::Int(v) => v,
+        _ => 0,
+    }
+}
+
+fn re5_set_bb_position(ctx: &dyn NativeContext, buf: ObjectRef, pos: i32) {
+    ctx.set_field(buf, 1, Value::Int(pos));
+    ctx.set_field_by_name(buf, "position", Value::Int(pos));
+}
+
+fn re5_read_heap_byte_buffer(ctx: &dyn NativeContext, buf: ObjectRef) -> Option<Vec<u8>> {
+    let pos = re5_bb_int_metadata(ctx, buf, 1, "position");
+    let lim = re5_bb_int_metadata(ctx, buf, 2, "limit");
+    let cap = re5_bb_int_metadata(ctx, buf, 3, "capacity");
+    if !(0 <= pos && pos <= lim && lim <= cap) {
+        return None;
+    }
+    let arr = match ctx.get_field(buf, 0) {
+        Value::Object(Some(a)) => a,
+        _ => match ctx.get_field_by_name(buf, "hb") {
+            Value::Object(Some(a)) => a,
+            _ => return None,
+        },
+    };
+    let array_offset = match ctx.get_field_by_name(buf, "offset") {
+        Value::Int(v) if v > 0 => v as usize,
+        _ => 0,
+    };
+    let start = array_offset.checked_add(pos as usize)?;
+    let n = (lim - pos) as usize;
+    if start.checked_add(n)? > ctx.array_length(arr) {
+        return None;
+    }
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        match ctx.get_array_element(arr, start + i) {
+            Value::Int(v) => out.push((v & 0xff) as u8),
+            _ => out.push(0),
+        }
+    }
+    re5_set_bb_position(ctx, buf, lim);
+    Some(out)
+}
+
+fn re5_method_name(ctx: &dyn NativeContext, method_obj: ObjectRef) -> String {
+    match ctx.get_field_by_name(method_obj, "name") {
+        Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+        _ => match ctx.get_field(method_obj, 1) {
+            Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+            _ => String::new(),
+        },
+    }
+}
+
+fn re5_arg_array_element(ctx: &dyn NativeContext, arr: Option<ObjectRef>, idx: usize) -> Value {
+    match arr {
+        Some(a) if idx < ctx.array_length(a) => ctx.get_array_element(a, idx),
+        _ => Value::Object(None),
+    }
+}
+
+fn re5_collector_for_handler(
+    ctx: &dyn NativeContext,
+    handler: ObjectRef,
+) -> Option<Arc<Re5PublisherCollector>> {
+    let id = match ctx.get_field(handler, 0) {
+        Value::Long(v) if v > 0 => v as u64,
+        Value::Int(v) if v > 0 => v as u64,
+        _ => return None,
+    };
+    re5_collectors().lock().get(&id).cloned()
+}
+
+fn re5_collector_handler_invoke(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let handler = obj_arg(args, 0)?;
+    let method_obj = match args.get(2) {
+        Some(Value::Object(Some(m))) => *m,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let method_name = re5_method_name(ctx, method_obj);
+    let args_arr = match args.get(3) {
+        Some(Value::Object(o)) => *o,
+        _ => None,
+    };
+    let Some(collector) = re5_collector_for_handler(ctx, handler) else {
+        return Ok(Some(Value::Object(None)));
+    };
+
+    match method_name.as_str() {
+        "onSubscribe" => {
+            if let Value::Object(Some(subscription)) = re5_arg_array_element(ctx, args_arr, 0) {
+                ctx.invoke_virtual(subscription, "request", "(J)V", &[Value::Long(i64::MAX)])?;
+            }
+        }
+        "onNext" => {
+            if let Value::Object(Some(item)) = re5_arg_array_element(ctx, args_arr, 0) {
+                if let Some(bytes) = re5_read_heap_byte_buffer(ctx, item) {
+                    let mut state = collector.inner.lock().unwrap_or_else(|e| e.into_inner());
+                    state.bytes.extend_from_slice(&bytes);
+                }
+            }
+        }
+        "onComplete" => {
+            let mut state = collector.inner.lock().unwrap_or_else(|e| e.into_inner());
+            state.done = true;
+            collector.cv.notify_all();
+        }
+        "onError" => {
+            let mut state = collector.inner.lock().unwrap_or_else(|e| e.into_inner());
+            state.done = true;
+            state.failed = true;
+            collector.cv.notify_all();
+        }
+        _ => {}
+    }
+    Ok(Some(Value::Object(None)))
+}
+
+fn re5_new_collector_subscriber(ctx: &mut dyn NativeContext, id: u64) -> Option<ObjectRef> {
+    let handler = alloc_concurrent_synthetic(ctx, RE5_COLLECTOR_HANDLER, 1);
+    let pin_base = ctx.pin_native_root(handler);
+    ctx.set_field(handler, 0, Value::Long(id as i64));
+    let iface_cid = match ctx.ensure_class_initialized(RE5_FLOW_SUBSCRIBER) {
+        Ok(cid) => cid,
+        Err(_) => {
+            ctx.unpin_native_roots(pin_base);
+            return None;
+        }
+    };
+    let iface_mirror = ctx.get_class_mirror(iface_cid);
+    let ifaces = ctx.new_ref_array(ClassId::new(0), 1);
+    let ifaces_pin = ctx.pin_native_root(ifaces);
+    let ifaces_cur = ctx.read_native_pin(ifaces_pin, ifaces);
+    ctx.set_array_element(ifaces_cur, 0, Value::Object(Some(iface_mirror)));
+    let handler_cur = ctx.read_native_pin(pin_base, handler);
+    let result = ctx.invoke(
+        "java/lang/reflect/Proxy",
+        "newProxyInstance",
+        "(Ljava/lang/ClassLoader;[Ljava/lang/Class;Ljava/lang/reflect/InvocationHandler;)Ljava/lang/Object;",
+        &[
+            Value::Object(None),
+            Value::Object(Some(ifaces_cur)),
+            Value::Object(Some(handler_cur)),
+        ],
+    );
+    ctx.unpin_native_roots(pin_base);
+    match result.ok().flatten() {
+        Some(Value::Object(Some(proxy))) => Some(proxy),
+        _ => None,
+    }
+}
+
+fn re5_collect_publisher_body(
+    ctx: &mut dyn NativeContext,
+    publisher: ObjectRef,
+) -> Option<Vec<u8>> {
+    let id = re5_next_collector_id();
+    let collector = Arc::new(Re5PublisherCollector::default());
+    re5_collectors().lock().insert(id, Arc::clone(&collector));
+
+    let subscriber = match re5_new_collector_subscriber(ctx, id) {
+        Some(s) => s,
+        None => {
+            re5_collectors().lock().remove(&id);
+            return None;
+        }
+    };
+
+    let pin_base = ctx.pin_native_root(publisher);
+    let sub_pin = ctx.pin_native_root(subscriber);
+    let publisher_cur = ctx.read_native_pin(pin_base, publisher);
+    let subscriber_cur = ctx.read_native_pin(sub_pin, subscriber);
+    let subscribe_result = ctx.invoke_virtual(
+        publisher_cur,
+        "subscribe",
+        "(Ljava/util/concurrent/Flow$Subscriber;)V",
+        &[Value::Object(Some(subscriber_cur))],
+    );
+    ctx.unpin_native_roots(pin_base);
+    if subscribe_result.is_err() {
+        re5_collectors().lock().remove(&id);
+        return None;
+    }
+
+    let deadline = Instant::now() + RE5_PUBLISHER_WAIT;
+    let mut state = collector.inner.lock().unwrap_or_else(|e| e.into_inner());
+    while !state.done {
+        let now = Instant::now();
+        if now >= deadline {
+            break;
+        }
+        let wait_for = deadline.saturating_duration_since(now);
+        let (next, timeout) = collector
+            .cv
+            .wait_timeout(state, wait_for)
+            .unwrap_or_else(|e| e.into_inner());
+        state = next;
+        if timeout.timed_out() {
+            break;
+        }
+    }
+    let out = if state.failed {
+        None
+    } else {
+        Some(state.bytes.clone())
+    };
+    drop(state);
+    re5_collectors().lock().remove(&id);
+    out
+}
+
+fn re5_body_publisher_value(ctx: &dyn NativeContext, body_publisher: ObjectRef) -> Value {
+    match ctx.get_field(body_publisher, RE5_BP_LITERAL_BODY) {
+        Value::Object(Some(_)) => ctx.get_field(body_publisher, RE5_BP_LITERAL_BODY),
+        _ => Value::Object(Some(body_publisher)),
+    }
+}
+
+fn re5_request_body_bytes(ctx: &mut dyn NativeContext, req: ObjectRef) -> Vec<u8> {
+    match ctx.get_field(req, 2) {
+        Value::Object(Some(body)) => {
+            if let Some(s) = ctx.read_string(body) {
+                return s.into_bytes();
+            }
+            if let Value::Object(Some(literal)) = ctx.get_field(body, RE5_BP_LITERAL_BODY) {
+                if let Some(s) = ctx.read_string(literal) {
+                    return s.into_bytes();
+                }
+            }
+            if let Value::Object(Some(publisher)) = ctx.get_field(body, RE5_BP_FLOW_PUBLISHER) {
+                return re5_collect_publisher_body(ctx, publisher).unwrap_or_default();
+            }
+            Vec::new()
+        }
+        _ => Vec::new(),
+    }
 }
 
 /// Determine how `HttpResponse.body()` should materialise from the BodyHandler
@@ -5410,24 +5691,22 @@ fn re5_build_response(
 /// Shared request driver for `HttpClient.send` / `sendAsync`. `args[0]` is the
 /// `HttpClient`, `args[1]` the `HttpRequest`, `args[2]` the `BodyHandler`.
 ///
-/// LIMITATION: a request body is only carried when it was supplied as literal
-/// bytes (`BodyPublishers.ofString` / `ofByteArray`); a reactive
-/// `BodyPublishers.fromPublisher(...)` body (Spring's streaming
-/// `JdkClientHttpRequest` POST/PUT path) is not driven
-/// here, so the request goes out with an empty body. See
-/// docs/known-issues for the streaming-body follow-up.
+/// Request bodies supplied as literal bytes (`BodyPublishers.ofString` /
+/// `ofByteArray`) are already present on the synthetic request. Reactive
+/// `BodyPublishers.fromPublisher(...)` bodies are collected here through a
+/// scoped generated `Flow.Subscriber` proxy before the wire request is built.
 fn re5_do_request(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let req = obj_arg(args, 1)?;
     let handler_tag = re5_handler_tag(ctx, args.get(2).copied());
     let method = read_field_string_or(ctx, req, 0, "GET");
     let uri = read_field_string_or(ctx, req, 1, "");
-    let body_str = read_field_string_or(ctx, req, 2, "");
+    let body = re5_request_body_bytes(ctx, req);
     let hdrs_val = ctx.get_field(req, 3);
     let headers = huc_extract_req_headers(ctx, hdrs_val);
     if uri.is_empty() {
         return Err(ioex("HttpRequest.uri is empty"));
     }
-    let resp = http_perform_request(&method, &uri, &headers, body_str.as_bytes(), 10)
+    let resp = http_perform_request(&method, &uri, &headers, &body, 10)
         .map_err(|e| ioex(format!("HttpClient request failed: {e}")))?;
     let out = re5_build_response(ctx, resp.status, &resp.headers, &resp.body, &handler_tag);
     Ok(Some(Value::Object(Some(out))))
@@ -5489,6 +5768,13 @@ fn re5_uri_string(ctx: &mut dyn NativeContext, uri: ObjectRef) -> ObjectRef {
 }
 
 fn register_re5_http_client(r: &mut NativeMethodRegistry) {
+    r.register(
+        RE5_COLLECTOR_HANDLER,
+        "invoke",
+        "(Ljava/lang/Object;Ljava/lang/reflect/Method;[Ljava/lang/Object;)Ljava/lang/Object;",
+        re5_collector_handler_invoke,
+    );
+
     let hc = "java/net/http/HttpClient";
     r.register(
         hc,
@@ -5719,7 +6005,7 @@ fn register_re5_http_client(r: &mut NativeMethodRegistry) {
             let m = ctx.create_string("POST");
             ctx.set_field(this, 0, Value::Object(Some(m)));
             if let Some(Value::Object(Some(bp))) = args.get(1) {
-                let body = ctx.get_field(*bp, 0);
+                let body = re5_body_publisher_value(ctx, *bp);
                 ctx.set_field(this, 2, body);
             }
             Ok(Some(Value::Object(Some(this))))
@@ -5734,7 +6020,7 @@ fn register_re5_http_client(r: &mut NativeMethodRegistry) {
             let m = ctx.create_string("PUT");
             ctx.set_field(this, 0, Value::Object(Some(m)));
             if let Some(Value::Object(Some(bp))) = args.get(1) {
-                let body = ctx.get_field(*bp, 0);
+                let body = re5_body_publisher_value(ctx, *bp);
                 ctx.set_field(this, 2, body);
             }
             Ok(Some(Value::Object(Some(this))))
@@ -5780,7 +6066,7 @@ fn register_re5_http_client(r: &mut NativeMethodRegistry) {
                 ctx.set_field(this, 0, m);
             }
             if let Some(Value::Object(Some(bp))) = args.get(2) {
-                let body = ctx.get_field(*bp, 0);
+                let body = re5_body_publisher_value(ctx, *bp);
                 ctx.set_field(this, 2, body);
             }
             Ok(Some(Value::Object(Some(this))))
@@ -5825,13 +6111,17 @@ fn register_re5_http_client(r: &mut NativeMethodRegistry) {
         "ofString",
         "(Ljava/lang/String;)Ljava/net/http/HttpRequest$BodyPublisher;",
         |ctx, args| {
-            let body =
-                alloc_concurrent_synthetic(ctx, "java/net/http/HttpRequest$BodyPublisher", 1);
+            let body = alloc_concurrent_synthetic(
+                ctx,
+                "java/net/http/HttpRequest$BodyPublisher",
+                RE5_BP_NUM_FIELDS,
+            );
             ctx.set_field(
                 body,
-                0,
+                RE5_BP_LITERAL_BODY,
                 args.first().copied().unwrap_or(Value::Object(None)),
             );
+            ctx.set_field(body, RE5_BP_FLOW_PUBLISHER, Value::Object(None));
             Ok(Some(Value::Object(Some(body))))
         },
     );
@@ -5840,10 +6130,14 @@ fn register_re5_http_client(r: &mut NativeMethodRegistry) {
         "noBody",
         "()Ljava/net/http/HttpRequest$BodyPublisher;",
         |ctx, _args| {
-            let body =
-                alloc_concurrent_synthetic(ctx, "java/net/http/HttpRequest$BodyPublisher", 1);
+            let body = alloc_concurrent_synthetic(
+                ctx,
+                "java/net/http/HttpRequest$BodyPublisher",
+                RE5_BP_NUM_FIELDS,
+            );
             let empty = ctx.create_string("");
-            ctx.set_field(body, 0, Value::Object(Some(empty)));
+            ctx.set_field(body, RE5_BP_LITERAL_BODY, Value::Object(Some(empty)));
+            ctx.set_field(body, RE5_BP_FLOW_PUBLISHER, Value::Object(None));
             Ok(Some(Value::Object(Some(body))))
         },
     );
@@ -5852,8 +6146,11 @@ fn register_re5_http_client(r: &mut NativeMethodRegistry) {
         "ofByteArray",
         "([B)Ljava/net/http/HttpRequest$BodyPublisher;",
         |ctx, args| {
-            let body =
-                alloc_concurrent_synthetic(ctx, "java/net/http/HttpRequest$BodyPublisher", 1);
+            let body = alloc_concurrent_synthetic(
+                ctx,
+                "java/net/http/HttpRequest$BodyPublisher",
+                RE5_BP_NUM_FIELDS,
+            );
             let bytes = match args.first().copied() {
                 Some(Value::Object(Some(arr))) => {
                     String::from_utf8_lossy(&re5_read_byte_array(ctx, arr)).into_owned()
@@ -5861,23 +6158,30 @@ fn register_re5_http_client(r: &mut NativeMethodRegistry) {
                 _ => String::new(),
             };
             let s = ctx.create_string(&bytes);
-            ctx.set_field(body, 0, Value::Object(Some(s)));
+            ctx.set_field(body, RE5_BP_LITERAL_BODY, Value::Object(Some(s)));
+            ctx.set_field(body, RE5_BP_FLOW_PUBLISHER, Value::Object(None));
             Ok(Some(Value::Object(Some(body))))
         },
     );
     // fromPublisher(Flow.Publisher[, contentLength]) — Spring's streaming
-    // POST/PUT path. The body is produced reactively by a `Flow.Publisher` we
-    // cannot drive from here, so the publisher carries no literal bytes (slot 0
-    // = null) and the request is sent body-less. Registered so the call returns
-    // a BodyPublisher rather than throwing AbstractMethodError. See known-issues.
+    // POST/PUT path. Keep the original publisher in slot 1; `send` subscribes a
+    // scoped collector proxy and turns emitted ByteBuffers into the wire body.
     for desc in [
         "(Ljava/util/concurrent/Flow$Publisher;)Ljava/net/http/HttpRequest$BodyPublisher;",
         "(Ljava/util/concurrent/Flow$Publisher;J)Ljava/net/http/HttpRequest$BodyPublisher;",
     ] {
-        r.register(bps, "fromPublisher", desc, |ctx, _args| {
-            let body =
-                alloc_concurrent_synthetic(ctx, "java/net/http/HttpRequest$BodyPublisher", 1);
-            ctx.set_field(body, 0, Value::Object(None));
+        r.register(bps, "fromPublisher", desc, |ctx, args| {
+            let body = alloc_concurrent_synthetic(
+                ctx,
+                "java/net/http/HttpRequest$BodyPublisher",
+                RE5_BP_NUM_FIELDS,
+            );
+            ctx.set_field(body, RE5_BP_LITERAL_BODY, Value::Object(None));
+            ctx.set_field(
+                body,
+                RE5_BP_FLOW_PUBLISHER,
+                args.first().copied().unwrap_or(Value::Object(None)),
+            );
             Ok(Some(Value::Object(Some(body))))
         });
     }
@@ -8398,6 +8702,100 @@ mod tests {
         };
 
         assert_eq!(ctx.read_string(body).as_deref(), Some("abc"));
+    }
+
+    #[test]
+    fn re5_body_publishers_from_publisher_preserves_flow_publisher() {
+        let mut registry = NativeMethodRegistry::new();
+        register_re5_http_client(&mut registry);
+        let native = registry
+            .find(
+                "java/net/http/HttpRequest$BodyPublishers",
+                "fromPublisher",
+                "(Ljava/util/concurrent/Flow$Publisher;J)Ljava/net/http/HttpRequest$BodyPublisher;",
+            )
+            .expect("fromPublisher native is registered");
+
+        let mut ctx = MockNativeContext::new();
+        let publisher = ctx.fresh_object_ref();
+        let body_publisher =
+            match native(&mut ctx, &[Value::Object(Some(publisher)), Value::Long(3)]).unwrap() {
+                Some(Value::Object(Some(bp))) => bp,
+                other => panic!("expected BodyPublisher object, got {other:?}"),
+            };
+
+        assert!(matches!(
+            ctx.get_field(body_publisher, RE5_BP_LITERAL_BODY),
+            Value::Object(None)
+        ));
+        assert_eq!(
+            ctx.get_field(body_publisher, RE5_BP_FLOW_PUBLISHER),
+            Value::Object(Some(publisher))
+        );
+    }
+
+    #[test]
+    fn re5_request_builder_keeps_reactive_body_publisher_until_send() {
+        let mut registry = NativeMethodRegistry::new();
+        register_re5_http_client(&mut registry);
+        let method_native = registry
+            .find(
+                "java/net/http/HttpRequest$Builder",
+                "method",
+                "(Ljava/lang/String;Ljava/net/http/HttpRequest$BodyPublisher;)Ljava/net/http/HttpRequest$Builder;",
+            )
+            .expect("builder method native is registered");
+
+        let mut ctx = MockNativeContext::new();
+        let builder = alloc_concurrent_synthetic(&mut ctx, "java/net/http/HttpRequest$Builder", 4);
+        let verb = ctx.create_string("POST");
+        let body_publisher = alloc_concurrent_synthetic(
+            &mut ctx,
+            "java/net/http/HttpRequest$BodyPublisher",
+            RE5_BP_NUM_FIELDS,
+        );
+        let publisher = ctx.fresh_object_ref();
+        ctx.set_field(body_publisher, RE5_BP_LITERAL_BODY, Value::Object(None));
+        ctx.set_field(
+            body_publisher,
+            RE5_BP_FLOW_PUBLISHER,
+            Value::Object(Some(publisher)),
+        );
+
+        let ret = method_native(
+            &mut ctx,
+            &[
+                Value::Object(Some(builder)),
+                Value::Object(Some(verb)),
+                Value::Object(Some(body_publisher)),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(ret, Some(Value::Object(Some(builder))));
+        assert_eq!(
+            ctx.get_field(builder, 2),
+            Value::Object(Some(body_publisher))
+        );
+    }
+
+    #[test]
+    fn re5_heap_byte_buffer_reader_copies_remaining_bytes_and_advances() {
+        let mut ctx = MockNativeContext::new();
+        let arr = ctx.new_array(ArrayElementType::Byte, 5);
+        for (i, b) in b"hello".iter().enumerate() {
+            ctx.set_array_element(arr, i, Value::Int(*b as i32));
+        }
+        let buf = alloc_concurrent_synthetic(&mut ctx, "java/nio/HeapByteBuffer", 4);
+        ctx.set_field(buf, 0, Value::Object(Some(arr)));
+        ctx.set_field(buf, 1, Value::Int(1));
+        ctx.set_field(buf, 2, Value::Int(4));
+        ctx.set_field(buf, 3, Value::Int(5));
+
+        let bytes = re5_read_heap_byte_buffer(&ctx, buf).expect("heap buffer must be readable");
+
+        assert_eq!(bytes, b"ell");
+        assert_eq!(ctx.get_field(buf, 1), Value::Int(4));
     }
 
     #[test]

@@ -42,7 +42,7 @@ CRATONVM_DISABLE_DEFAULT_WATCHDOG=1 $CV --java-home "C:/Program Files/Java/jdk-2
 | 8 | `pc.InstanceIdentityTest` | IAE "not of expected type" | same | **FIXED** (gated; §4–9) |
 | 9 | `proxy.ProxyClassReuseTest` | now `assertSame(getClassLoader(), cl1)` (was `already defined by app loader`), 2/3 | dual-isolated-loader `getClassLoader` attribution | ADVANCED (gated; proxies now distinct via keystone) — still owned by `hib-proxyclassreuse-loader-blind-class-resolution.md` |
 | 10 | `util.dtd.EntityResolverTest` | unmapped entity `[Child]` | synthetic `XMLInputFactory.newInstance()` stub shadows real Woodstox → resolver ignored, general entity not expanded | **FIXED** (default-ON; `CRATONVM_REAL_STAX_FACTORY=0` escape hatch); slowness is separate (§15–16) |
-| 11 | `jpa.transaction.TransactionTimeoutTest` | `getStatus()=0 ACTIVE` | Narayana transaction-reaper thread never fires the 2s timeout | OPEN — new |
+| 11 | `jpa.transaction.TransactionTimeoutTest` | `getStatus()=0 ACTIVE` | `ConcurrentHashMap.entrySet()` returned a dead snapshot, so Narayana's transaction reaper could not remove live entries | **FIXED** (dev; see internal CHM entrySet write-through doc) |
 | 12 | `id.uuid.rfc9562.UUidV6V7GeneratorTest` | MockitoException | native `AnnotatedTypeBaseImpl.location` null → `getAnnotatedOwnerType` NPE | **NPE FIXED**; residual = 1M-iteration slowness (§15–16 cluster) |
 | 13 | `batchfetch.DynamicBatchFetchTest` | `testMultiLoad` 120s timeout (param-binding 1/2 now passes) | slowness (2000-row multiLoad); old param-binding failure appears fixed | Route → slowness cluster (§15-16) |
 | 14 | `service.ClassLoaderServiceImplTest` | AssertionError (2/2) | (a) real-mode `loadClass` skipped `findLoadedClass` (override-first copy lost); (b) `ServiceLoader` read a `file:` descriptor URL as a classpath resource | **FIXED** (this branch; HIB-CV-24 family) |
@@ -280,17 +280,18 @@ any classpath bundling a *non-Woodstox* provider (Aalto etc.).
 
 ---
 
-## 11. TransactionTimeoutTest — JTA transaction-reaper never fires (OPEN, new)
+## 11. TransactionTimeoutTest - JTA transaction-reaper entry removal (FIXED on dev)
 
-`testH2` sets a 2 s JTA timeout, begins, then runs `select sleep(10000)` (H2
-alias → `Thread.sleep`). Expected: a `QueryTimeout`/`LockTimeout` or a
-rolled-back/marking status. Actual final `transactionManager.getStatus() == 0`
-(`STATUS_ACTIVE`) — assertion `Expecting actual: 0 to be in: [4, 9, 1]`. The
-alias slept the full 10 s and the transaction was never marked/rolled-back.
-JTA platform is Arjuna/Narayana; its **TransactionReaper** background daemon
-that watches per-transaction deadlines isn't firing under CratonVM (scheduled
-wakeup / daemon-thread scheduling / async abort divergence). Distinct from
-`HIB-CV-19` (null TM). Moderately deep (background-timer thread).
+This row was stale. The timeout daemon and Narayana scheduling path were not the
+root cause. The real failure was CratonVM's native `ConcurrentHashMap.entrySet()`
+returning a dead snapshot instead of a live write-through view, so Narayana's
+`TransactionReaper` bookkeeping could not remove active timeout entries through
+the entry-set iterator path.
+
+The fix lives in `native-collections/src/lib.rs`: `ConcurrentHashMap.entrySet()`
+now returns a live synthetic view, and `HashSet.remove` delegates entry-set
+removal back to the source map. The detailed fixed write-up is
+`docs/internal/hibernate-bugs/hibernate-jta-narayana-reaper-chm-entryset-writethrough.md`.
 
 ---
 
