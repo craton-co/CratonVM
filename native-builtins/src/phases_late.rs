@@ -1409,13 +1409,13 @@ pub(crate) fn register_phase55_collection_extras(r: &mut NativeMethodRegistry) {
         coll,
         "synchronizedList",
         "(Ljava/util/List;)Ljava/util/List;",
-        |_ctx, args| Ok(Some(args[0])),
+        crate::native_synchronized_list,
     );
     r.register(
         coll,
         "synchronizedSet",
         "(Ljava/util/Set;)Ljava/util/Set;",
-        |_ctx, args| Ok(Some(args[0])),
+        crate::native_synchronized_set,
     );
     r.register(
         coll,
@@ -1427,7 +1427,7 @@ pub(crate) fn register_phase55_collection_extras(r: &mut NativeMethodRegistry) {
         coll,
         "synchronizedCollection",
         "(Ljava/util/Collection;)Ljava/util/Collection;",
-        |_ctx, args| Ok(Some(args[0])),
+        crate::native_synchronized_collection,
     );
     r.register(
         coll,

@@ -17,7 +17,10 @@ use crate::{
     alloc_concurrent_synthetic, build_real_layout_string_hashset, native_noop,
     native_noop_with_this, native_return_false, native_return_zero, obj_arg,
 };
-use crate::{native_return_first_arg, native_return_null, native_synchronized_map};
+use crate::{
+    native_return_first_arg, native_return_null, native_synchronized_collection,
+    native_synchronized_list, native_synchronized_map, native_synchronized_set,
+};
 
 pub(crate) fn register_collections_extras_natives(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
@@ -64,13 +67,13 @@ pub(crate) fn register_collections_extras_natives(r: &mut NativeMethodRegistry) 
         cu,
         "synchronizedList",
         "(Ljava/util/List;)Ljava/util/List;",
-        native_return_first_arg,
+        native_synchronized_list,
     );
     r.register(
         cu,
         "synchronizedSet",
         "(Ljava/util/Set;)Ljava/util/Set;",
-        native_return_first_arg,
+        native_synchronized_set,
     );
     r.register(
         cu,
@@ -82,7 +85,7 @@ pub(crate) fn register_collections_extras_natives(r: &mut NativeMethodRegistry) 
         cu,
         "synchronizedCollection",
         "(Ljava/util/Collection;)Ljava/util/Collection;",
-        native_return_first_arg,
+        native_synchronized_collection,
     );
     r.register(
         cu,
@@ -1788,7 +1791,7 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
         cu,
         "synchronizedList",
         "(Ljava/util/List;)Ljava/util/List;",
-        native_return_first_arg,
+        native_synchronized_list,
     );
     r.register(
         cu,
@@ -1800,7 +1803,7 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
         cu,
         "synchronizedSet",
         "(Ljava/util/Set;)Ljava/util/Set;",
-        native_return_first_arg,
+        native_synchronized_set,
     );
     r.register(
         cu,

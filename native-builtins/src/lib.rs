@@ -40762,6 +40762,61 @@ pub(crate) fn native_synchronized_map(
     }
 }
 
+/// `Collections.synchronizedList(l)` — wrap in the real `SynchronizedList` (or
+/// `SynchronizedRandomAccessList` when the backing list implements `RandomAccess`,
+/// matching `Collections.synchronizedList`), not the raw list. Same rationale as
+/// [`native_synchronized_map`]: the identity stub left mutation unsynchronized.
+pub(crate) fn native_synchronized_list(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    match args.first() {
+        Some(v @ Value::Object(Some(list))) => {
+            let is_random_access = match ctx.class_id_by_name("java/util/RandomAccess") {
+                Some(ra) => ctx.is_subclass(ctx.class_id_of_object(*list), ra),
+                None => false,
+            };
+            let cls = if is_random_access {
+                "java/util/Collections$SynchronizedRandomAccessList"
+            } else {
+                "java/util/Collections$SynchronizedList"
+            };
+            ctx.new_object_initialized(cls, "(Ljava/util/List;)V", &[v.clone()])
+        }
+        other => Ok(Some(other.cloned().unwrap_or(Value::Object(None)))),
+    }
+}
+
+/// `Collections.synchronizedSet(s)` — wrap in the real `SynchronizedSet`.
+pub(crate) fn native_synchronized_set(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    match args.first() {
+        Some(v @ Value::Object(Some(_))) => ctx.new_object_initialized(
+            "java/util/Collections$SynchronizedSet",
+            "(Ljava/util/Set;)V",
+            &[v.clone()],
+        ),
+        other => Ok(Some(other.cloned().unwrap_or(Value::Object(None)))),
+    }
+}
+
+/// `Collections.synchronizedCollection(c)` — wrap in the real `SynchronizedCollection`.
+pub(crate) fn native_synchronized_collection(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    match args.first() {
+        Some(v @ Value::Object(Some(_))) => ctx.new_object_initialized(
+            "java/util/Collections$SynchronizedCollection",
+            "(Ljava/util/Collection;)V",
+            &[v.clone()],
+        ),
+        other => Ok(Some(other.cloned().unwrap_or(Value::Object(None)))),
+    }
+}
+
 // IntSummaryStatistics: 4-field synthetic (count=0 Long, sum=1 Long, min=2 Int, max=3 Int)
 const ISS_FIELD_COUNT: usize = 0;
 const ISS_FIELD_SUM: usize = 1;

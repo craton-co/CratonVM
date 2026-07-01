@@ -30195,7 +30195,7 @@ fn register_collections_extras_natives(r: &mut NativeMethodRegistry) {
         c,
         "synchronizedList",
         "(Ljava/util/List;)Ljava/util/List;",
-        native_collections_identity,
+        native_collections_synchronized_list,
     );
     r.register(
         c,
@@ -30207,13 +30207,13 @@ fn register_collections_extras_natives(r: &mut NativeMethodRegistry) {
         c,
         "synchronizedSet",
         "(Ljava/util/Set;)Ljava/util/Set;",
-        native_collections_identity,
+        native_collections_synchronized_set,
     );
     r.register(
         c,
         "synchronizedCollection",
         "(Ljava/util/Collection;)Ljava/util/Collection;",
-        native_collections_identity,
+        native_collections_synchronized_collection,
     );
     r.register(
         c,
@@ -30334,6 +30334,60 @@ fn native_collections_synchronized_map(
         Some(v @ Value::Object(Some(_))) => ctx.new_object_initialized(
             "java/util/Collections$SynchronizedMap",
             "(Ljava/util/Map;)V",
+            &[v.clone()],
+        ),
+        other => Ok(Some(other.cloned().unwrap_or(Value::Object(None)))),
+    }
+}
+
+/// `Collections.synchronizedList(l)` — real `SynchronizedList`, or
+/// `SynchronizedRandomAccessList` when the backing implements `RandomAccess`.
+/// Same rationale as [`native_collections_synchronized_map`].
+fn native_collections_synchronized_list(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    match args.first() {
+        Some(v @ Value::Object(Some(list))) => {
+            let is_random_access = match ctx.class_id_by_name("java/util/RandomAccess") {
+                Some(ra) => ctx.is_subclass(ctx.class_id_of_object(*list), ra),
+                None => false,
+            };
+            let cls = if is_random_access {
+                "java/util/Collections$SynchronizedRandomAccessList"
+            } else {
+                "java/util/Collections$SynchronizedList"
+            };
+            ctx.new_object_initialized(cls, "(Ljava/util/List;)V", &[v.clone()])
+        }
+        other => Ok(Some(other.cloned().unwrap_or(Value::Object(None)))),
+    }
+}
+
+/// `Collections.synchronizedSet(s)` — real `SynchronizedSet`.
+fn native_collections_synchronized_set(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    match args.first() {
+        Some(v @ Value::Object(Some(_))) => ctx.new_object_initialized(
+            "java/util/Collections$SynchronizedSet",
+            "(Ljava/util/Set;)V",
+            &[v.clone()],
+        ),
+        other => Ok(Some(other.cloned().unwrap_or(Value::Object(None)))),
+    }
+}
+
+/// `Collections.synchronizedCollection(c)` — real `SynchronizedCollection`.
+fn native_collections_synchronized_collection(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    match args.first() {
+        Some(v @ Value::Object(Some(_))) => ctx.new_object_initialized(
+            "java/util/Collections$SynchronizedCollection",
+            "(Ljava/util/Collection;)V",
             &[v.clone()],
         ),
         other => Ok(Some(other.cloned().unwrap_or(Value::Object(None)))),
