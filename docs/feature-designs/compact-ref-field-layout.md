@@ -228,6 +228,57 @@ Fixed by skipping the fd-tag store when slot 0 is a compact reference field
 gauntlet, watch for the same pattern** (a primitive stored into a declared
 reference field of a synthetic/bootstrap object).
 
+## Gotcha (FIXED): legacy instances of a compact-layout class + inline codegen
+
+**Symptom:** a hard SIGSEGV (`EXCEPTION_ACCESS_VIOLATION`, `pc` in a non-`.text`
+heap address — a jump through a corrupted pointer) ~1 s into a reflection /
+class-load-heavy workload (found on the commons-math `transform` suite run via
+the JUnit Launcher API). Flag-off is clean.
+
+**Root cause:** compactness is a **per-object** property, decided at allocation
+by `plan_object_alloc` as `layout.field_count() == num_fields` and recorded in
+the header's `GC_FLAG_COMPACT` bit. A class can have a **registered compact
+layout yet still allocate LEGACY (16-byte-cell) instances** whenever an
+allocation's `num_fields` disagrees with the layout's field count — most
+commonly native/synthetic-stub allocations whose *padded* stub field count
+exceeds the real declared count the layout was built from (observed:
+`java/lang/reflect/Method` alloc 23 vs layout 20, `ConcurrentHashMap` 16 vs 12,
+`ArrayList` 4 vs 3, plus the stream/`Path`/`Collector` stubs with layout count
+0). Every **heap** and **helper** field-access path already keys on the
+per-object `GC_FLAG_COMPACT` bit and handles both layouts — but the **JIT inline
+getfield / putfield-ref** emitters (the perf lever) baked the compact byte offset
+and assumed *every* instance of a registered-layout class is compact. Reading a
+legacy object at the compact offset returns a mangled word (the 16-byte cell's
+`{tag=4, partial-pointer}` first qword read as an 8-byte pointer, e.g.
+`0x1AB297C0_00000004`); when that bogus reference is later dereferenced/called
+the VM jumps through it → SIGSEGV.
+
+**Fix:** make the inline emitters key on the per-object flag, exactly like every
+other access path. Inline getfield now tests `gc_flags & GC_FLAG_COMPACT` (header
+byte 21) after the null check and branches: compact → 8-byte ref / packed cell
+read; legacy → the uniform `index * SLOT_SIZE` 16-byte-cell read (mirroring the
+non-compact inline arm), all inline (no helper). Inline putfield-ref adds the
+same not-compact case to its bail set, routing legacy receivers to the
+per-object-flag-aware `jit_putfield_object` helper. Primitive putfields already
+routed through the type helpers (`putfield_int/long/…`), which honor the flag, so
+they needed no change. (`jit/src/x64.rs`, getfield opcode `0xb4` compact arm +
+putfield opcode `0xb5` compact-ref arm.)
+
+Validated: commons-math `transform` compact-ON now runs with **no SIGSEGV** and
+the same 54–56/56 pass rate as compact-OFF (both vary run-to-run identically);
+bt10/14/16/18 checksums exact compact-ON incl. `GC_STRESS`; flag-off unchanged.
+A gated diagnostic `CRATONVM_DBG_COMPACT_LEGACY=1` (`gen_heap.rs`
+`plan_object_alloc`) prints every class that allocates a legacy instance despite
+a registered layout — use it to spot the same pattern when soaking new apps.
+
+**Deeper follow-up (optional, not required for correctness):** the legacy
+instances themselves are a footprint miss, not a bug — they come from native/stub
+allocations passing the padded stub count instead of the class's real
+`num_total_fields`. Reconciling the synthetic-stub field counts with the real
+declared layout would let these classes go compact too (more footprint win), but
+is a larger, riskier change; the per-object flag already makes both layouts
+correct, so this is left as a throughput lever, not a correctness fix.
+
 ## Stage 5 — observability (deferred, non-critical)
 
 HPROF instance dump (`serviceability.rs`) and the field-watch corruption
