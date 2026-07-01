@@ -338,6 +338,22 @@ interpreter** (or throw a catchable `StackOverflowError`). Hard part: the handle
 with almost no stack left (use a reserved guard region / alternate stack) and must
 unwind/deopt the JIT'd frame. This removes the per-call cost entirely.
 
+### 2026-07-01 partial containment: recursive-edge dispatch routing
+
+Production JIT metadata now routes recursive call sites through guarded dispatch
+helpers instead of raw direct compiled edges, except for static tail-recursive
+self-calls that x64 lowers to a jump back to the method body. Non-tail
+`invokestatic` self-calls get `JitInvokeInfo`, same-method `invokespecial` sites
+avoid direct callee compilation, and recursive `invokevirtual` / `invokeinterface`
+sites keep dispatch metadata but do not allocate MIC/PIC slots, so inline-cache
+hits cannot bypass `enter_jit_dispatch`.
+
+This is a general containment for same-method recursive edges and should prevent
+the known deep ANTLR-style recursion from overrunning the native stack once the
+cold-path leaf-compilation experiment is retried. It is not the full
+stack-banging / fault-recovery design above: mutually-recursive direct calls and
+the cold-path throughput experiment still need separate validation.
+
 ---
 
 ## 8. Repros & tooling (all under `apps/spring-boot/buildSrc/runner/`)
