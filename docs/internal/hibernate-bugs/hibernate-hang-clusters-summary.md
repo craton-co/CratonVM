@@ -10,7 +10,8 @@
 > select HQL takes 12.7s/52s/>600s to *parse* (1/2/3 items), terminating; warm re-parse of the same shape is
 > 649ms (DFA cache works); `--nojit` ≈ JIT-on and `-Xmx8g` doesn't help (the deeply-recursive ANTLR ATN-sim
 > hot loop is never JIT-compiled — no OSR). Full root-cause + minimal repro:
-> [hql-antlr-parser-cold-prediction-throughput.md](../known-issues/hql-antlr-parser-cold-prediction-throughput.md). 🔴 OPEN
+> [springrepos-extension-hang-jit-throughput-and-deep-recursion.md](../../known-issues/springrepos-extension-hang-jit-throughput-and-deep-recursion.md)
+> §5, "Hibernate HQL reproducer". 🔴 OPEN
 > (deferred JIT-throughput cluster; mitigation = run the suite in one shared JVM to amortize warmup).
 > The real Hibernate JUnit launcher works on CratonVM —
 > `JtaCustomAfterCompletionTest` passes end-to-end (the earlier `@ExtendWith` "blocker" was a misdiagnosed
@@ -69,9 +70,10 @@ at 52s). Re-parsing the same *shape* with a different entity drops to 649ms (ANT
 fork-per-class suite re-pays the cold cost per class → >600s "hang". `--nojit` ≈ JIT-on and `-Xmx8g` doesn't
 help — the JIT never compiles the deeply-recursive ANTLR ATN-simulation hot loop (no OSR for on-stack
 recursive methods). **Full characterization + minimal repro:**
-[hql-antlr-parser-cold-prediction-throughput.md](../known-issues/hql-antlr-parser-cold-prediction-throughput.md). Deferred
+[springrepos-extension-hang-jit-throughput-and-deep-recursion.md](../../known-issues/springrepos-extension-hang-jit-throughput-and-deep-recursion.md)
+§5, "Hibernate HQL reproducer". Deferred
 JIT-throughput cluster (cf.
-[springrepos-extension-hang-jit-throughput-and-deep-recursion.md](../known-issues/springrepos-extension-hang-jit-throughput-and-deep-recursion.md)).
+[springrepos-extension-hang-jit-throughput-and-deep-recursion.md](../../known-issues/springrepos-extension-hang-jit-throughput-and-deep-recursion.md)).
 **Mitigation:** run the suite in a single shared JVM (amortizes the per-shape DFA warmup).
 
 ## Environmental (NOT a CV-only bug)
@@ -86,5 +88,5 @@ JIT-throughput cluster (cf.
 | H1 JAXB class-load storm | class-loading rescan storm (NOT `retainAll`) | ✅ **fixed on dev** (`1db07c35`/`25c42e13`) |
 | H2 ByteBuddy `MethodGraph` | bootstrap proxy gen | ✅ **does-not-reproduce** — JoinedSubclass boots ~16s `--nojit` |
 | H3 JTA / socket | `accept()` deadlock (NOT loopback-pairing) | ✅ **fixed** on branch `fix/hib-jta-xa-loopback` (`e0426050`) |
-| H4 `JsonArrayUnnestTest` | HQL/ANTLR cold-prediction throughput (NOT JSON, NOT a loop) | 🔴 **OPEN** — root-caused 2026-06-20; interpreted ANTLR ATN-sim, JIT no-OSR; [own doc](../known-issues/hql-antlr-parser-cold-prediction-throughput.md) |
+| H4 `JsonArrayUnnestTest` | HQL/ANTLR cold-prediction throughput (NOT JSON, NOT a loop) | 🔴 **OPEN** — root-caused 2026-06-20; interpreted ANTLR ATN-sim, JIT no-OSR; [consolidated doc](../../known-issues/springrepos-extension-hang-jit-throughput-and-deep-recursion.md) §5 |
 | DefaultCatalogAndSchema | environmental (HS hangs too) | — excluded |

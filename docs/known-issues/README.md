@@ -330,7 +330,9 @@ parse-NPE (#1), generics (#2), and the indy `MethodHandle.type()` layers
 The 3c/3d fix writeup is in
 [`docs/internal/spring-boot-groovy-indy-runtime-argcount-3c-FIXED.md`](../internal/spring-boot-groovy-indy-runtime-argcount-3c-FIXED.md).
 Also still relevant: **defect #2 (= family A3 above)** and **bug C** (the
-cold-path deep-recursion overflow).
+cold-path deep-recursion overflow). The Hibernate HQL census-H4 timeout
+(`function.json.JsonArrayUnnestTest`) is the same cold ANTLR prediction
+throughput bug and is now consolidated in that handoff's Section 5.
 
 ## Resolved standalone bugs (full writeups in `docs/internal/`)
 
@@ -363,7 +365,11 @@ Per-run bug reports from the (gitignored) `apps/hibernate-orm/cratonvm-bug-repor
 removed; the JTA `getInetAddress` per-class report was consolidated into the resolved JTA doc in
 [`docs/internal/`](../internal/).)
 - [hibernate-hang-clusters-summary.md](../internal/hibernate-hang-clusters-summary.md) — census overview (now in `docs/internal/`); **H1/H2/H3 resolved 2026-06-20**, **H4 root-caused** (its own open doc below).
-- [hql-antlr-parser-cold-prediction-throughput.md](hql-antlr-parser-cold-prediction-throughput.md) — 🔴 **OPEN** (census H4, root-caused 2026-06-20; one cold-path native-shadow gate narrowed 2026-07-01). `function.json.JsonArrayUnnestTest` "hang" is the **HQL/ANTLR parser**, not JSON: cold full-context prediction runs interpreted (~1000× HotSpot) because the ATN-simulation hot methods (`closure_`, `closureCheckingStopState`, `mergeArrays`, …) are declined by the single-pass JIT backend (instrumented via `CRATONVM_DBG_JITC`). Terminates (2-item select = 52s), warm re-parse = 0.65s; deferred JIT-backend-coverage cluster. Mitigation: run the suite in one shared JVM.
+- HQL/ANTLR parser census H4 (`function.json.JsonArrayUnnestTest`) is not a
+  separate open issue file anymore. It is consolidated into
+  [springrepos-extension-hang-jit-throughput-and-deep-recursion.md](springrepos-extension-hang-jit-throughput-and-deep-recursion.md)
+  Section 5 as a second reproducer for the same cold ANTLR prediction
+  throughput / JIT backend-coverage cluster.
 
 Also fixed on dev this run (no standalone doc — see commit): `Locale.toLanguageTag()` dropped all subtags for real Locales (`13e8c761`).
 

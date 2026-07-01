@@ -25,7 +25,9 @@ Reclassification **pinned to P-cores (`0xFFFF`), default watchdog disabled, 360s
 merely exceeded the 240s timeout. The 17 passing classes are correct but **3–110×
 slower** than HotSpot (e.g. `DependencyVersionUpgradeTests` 63/63 in 111s vs 1s). This
 is the **cold-path interpreter throughput tax**, the same family as
-[[hql-antlr-parser-cold-prediction-throughput]] and the `springrepos` §5 cold path.
+the Hibernate HQL reproducer consolidated in
+[springrepos-extension-hang-jit-throughput-and-deep-recursion.md](springrepos-extension-hang-jit-throughput-and-deep-recursion.md)
+§5.
 
 ## The 5 true-hangs (P-core-pinned, watchdog off, killed at 360s)
 
