@@ -97,6 +97,127 @@ fn essential_dur_parse(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         let n: u64 = std::str::from_utf8(&b[start..j]).ok()?.parse().ok()?;
         Some((n, sign, j))
     }
+    // Pure ISO-8601 duration parser: `[+-]P[nD][T[nH][nM][n[.n]S]]`. Returns
+    // `(seconds, nanos)`, or `None` when the text is not a valid ISO-8601
+    // duration. On `None` the caller throws a real
+    // `java.time.format.DateTimeParseException` — the same type
+    // `java.time.Duration.parse` raises — because Spring's
+    // `DurationFormatterUtils.parseIso8601` propagates the failure and callers
+    // (DurationFormatterUtilsTests.parseIsoThrows) assert on that exact cause
+    // type; an `IllegalArgumentException` here is observably wrong.
+    fn parse_iso(trimmed: &str) -> Option<(i64, i64)> {
+        let bytes = trimmed.as_bytes();
+        if bytes.is_empty() {
+            return None;
+        }
+        let mut i = 0usize;
+        let mut negative = false;
+        if bytes[i] == b'+' {
+            i += 1;
+        } else if bytes[i] == b'-' {
+            negative = true;
+            i += 1;
+        }
+        if i >= bytes.len() || (bytes[i] != b'P' && bytes[i] != b'p') {
+            return None;
+        }
+        i += 1;
+        let mut total_seconds: i128 = 0;
+        let mut total_nanos: i32 = 0;
+        let mut saw_any = false;
+        // Days segment
+        if i < bytes.len() && bytes[i] != b'T' && bytes[i] != b't' {
+            let (n, sign, consumed) = parse_signed(&bytes[i..])?;
+            i += consumed;
+            if i >= bytes.len() || (bytes[i] != b'D' && bytes[i] != b'd') {
+                return None;
+            }
+            i += 1;
+            total_seconds = total_seconds.saturating_add(sign * n as i128 * 86_400);
+            saw_any = true;
+        }
+        // Time segment
+        if i < bytes.len() {
+            if bytes[i] != b'T' && bytes[i] != b't' {
+                return None;
+            }
+            i += 1;
+            let mut last_pos = 0;
+            let mut t_saw = false;
+            while i < bytes.len() {
+                let (n, sign, consumed) = parse_signed(&bytes[i..])?;
+                i += consumed;
+                // Fractional seconds (only valid before S, but parse leniently)
+                let mut frac_nanos: i64 = 0;
+                if i < bytes.len() && (bytes[i] == b'.' || bytes[i] == b',') {
+                    i += 1;
+                    let start = i;
+                    while i < bytes.len() && bytes[i].is_ascii_digit() {
+                        i += 1;
+                    }
+                    if start == i {
+                        return None;
+                    }
+                    let take = (i - start).min(9);
+                    let digits = &trimmed[start..start + take];
+                    let mut nanos: i64 = digits.parse::<i64>().unwrap_or(0);
+                    for _ in digits.len()..9 {
+                        nanos *= 10;
+                    }
+                    frac_nanos = nanos;
+                }
+                if i >= bytes.len() {
+                    return None;
+                }
+                let unit = bytes[i];
+                i += 1;
+                let pos = match unit {
+                    b'H' | b'h' => 1,
+                    b'M' | b'm' => 2,
+                    b'S' | b's' => 3,
+                    _ => return None,
+                };
+                if pos <= last_pos {
+                    return None;
+                }
+                last_pos = pos;
+                t_saw = true;
+                saw_any = true;
+                match pos {
+                    1 => total_seconds = total_seconds.saturating_add(sign * n as i128 * 3600),
+                    2 => total_seconds = total_seconds.saturating_add(sign * n as i128 * 60),
+                    3 => {
+                        total_seconds = total_seconds.saturating_add(sign * n as i128);
+                        let mut combined = total_nanos as i64 + sign as i64 * frac_nanos;
+                        while combined < 0 {
+                            combined += 1_000_000_000;
+                            total_seconds -= 1;
+                        }
+                        while combined >= 1_000_000_000 {
+                            combined -= 1_000_000_000;
+                            total_seconds += 1;
+                        }
+                        total_nanos = combined as i32;
+                    }
+                    _ => {}
+                }
+            }
+            if !t_saw {
+                return None;
+            }
+        }
+        if !saw_any {
+            return None;
+        }
+        if negative {
+            let total = -(total_seconds * 1_000_000_000 + total_nanos as i128);
+            total_seconds = total.div_euclid(1_000_000_000);
+            total_nanos = total.rem_euclid(1_000_000_000) as i32;
+        }
+        let secs = total_seconds.clamp(i64::MIN as i128, i64::MAX as i128) as i64;
+        Some((secs, total_nanos as i64))
+    }
+
     let s_obj = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => {
@@ -127,129 +248,48 @@ fn essential_dur_parse(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         }
     };
     let trimmed = text.trim().to_string();
-    let raw_err = || cratonvm_types::error::RuntimeError::IllegalArgumentException {
-        message: format!("Text cannot be parsed to a Duration: {trimmed}"),
+    let (secs, nanos) = match parse_iso(&trimmed) {
+        Some(v) => v,
+        None => return Err(throw_duration_parse_exc(ctx, &trimmed)),
     };
-    let bytes = trimmed.as_bytes();
-    if bytes.is_empty() {
-        return Err(raw_err().into());
-    }
-    let mut i = 0usize;
-    let mut negative = false;
-    if bytes[i] == b'+' {
-        i += 1;
-    } else if bytes[i] == b'-' {
-        negative = true;
-        i += 1;
-    }
-    if i >= bytes.len() || (bytes[i] != b'P' && bytes[i] != b'p') {
-        return Err(raw_err().into());
-    }
-    i += 1;
-    let mut total_seconds: i128 = 0;
-    let mut total_nanos: i32 = 0;
-    let mut saw_any = false;
-    // Days segment
-    if i < bytes.len() && bytes[i] != b'T' && bytes[i] != b't' {
-        let (n, sign, consumed) = parse_signed(&bytes[i..]).ok_or_else(raw_err)?;
-        i += consumed;
-        if i >= bytes.len() || (bytes[i] != b'D' && bytes[i] != b'd') {
-            return Err(raw_err().into());
-        }
-        i += 1;
-        total_seconds = total_seconds.saturating_add(sign * n as i128 * 86_400);
-        saw_any = true;
-    }
-    // Time segment
-    if i < bytes.len() {
-        if bytes[i] != b'T' && bytes[i] != b't' {
-            return Err(raw_err().into());
-        }
-        i += 1;
-        let mut last_pos = 0;
-        let mut t_saw = false;
-        while i < bytes.len() {
-            let (n, sign, consumed) = parse_signed(&bytes[i..]).ok_or_else(raw_err)?;
-            i += consumed;
-            // Fractional seconds (only valid before S, but parse leniently)
-            let mut frac_nanos: i64 = 0;
-            if i < bytes.len() && (bytes[i] == b'.' || bytes[i] == b',') {
-                i += 1;
-                let start = i;
-                while i < bytes.len() && bytes[i].is_ascii_digit() {
-                    i += 1;
-                }
-                if start == i {
-                    return Err(raw_err().into());
-                }
-                let take = (i - start).min(9);
-                let digits = &trimmed[start..start + take];
-                let mut nanos: i64 = digits.parse::<i64>().unwrap_or(0);
-                for _ in digits.len()..9 {
-                    nanos *= 10;
-                }
-                frac_nanos = nanos;
-            }
-            if i >= bytes.len() {
-                return Err(raw_err().into());
-            }
-            let unit = bytes[i];
-            i += 1;
-            let pos = match unit {
-                b'H' | b'h' => 1,
-                b'M' | b'm' => 2,
-                b'S' | b's' => 3,
-                _ => return Err(raw_err().into()),
-            };
-            if pos <= last_pos {
-                return Err(raw_err().into());
-            }
-            last_pos = pos;
-            t_saw = true;
-            saw_any = true;
-            match pos {
-                1 => total_seconds = total_seconds.saturating_add(sign * n as i128 * 3600),
-                2 => total_seconds = total_seconds.saturating_add(sign * n as i128 * 60),
-                3 => {
-                    total_seconds = total_seconds.saturating_add(sign * n as i128);
-                    let mut combined = total_nanos as i64 + sign as i64 * frac_nanos;
-                    while combined < 0 {
-                        combined += 1_000_000_000;
-                        total_seconds -= 1;
-                    }
-                    while combined >= 1_000_000_000 {
-                        combined -= 1_000_000_000;
-                        total_seconds += 1;
-                    }
-                    total_nanos = combined as i32;
-                }
-                _ => {}
-            }
-        }
-        if !t_saw {
-            return Err(raw_err().into());
-        }
-    }
-    if !saw_any {
-        return Err(raw_err().into());
-    }
-    if negative {
-        let total = -(total_seconds * 1_000_000_000 + total_nanos as i128);
-        total_seconds = total.div_euclid(1_000_000_000);
-        total_nanos = total.rem_euclid(1_000_000_000) as i32;
-    }
-    let secs = total_seconds.clamp(i64::MIN as i128, i64::MAX as i128) as i64;
     // Delegate to JDK's `Duration.ofSeconds(long,long)` so the returned
     // object has the proper internal layout.
     match ctx.invoke(
         "java/time/Duration",
         "ofSeconds",
         "(JJ)Ljava/time/Duration;",
-        &[Value::Long(secs), Value::Long(total_nanos as i64)],
+        &[Value::Long(secs), Value::Long(nanos)],
     ) {
         Ok(Some(v)) => Ok(Some(v)),
-        Ok(None) => Err(raw_err().into()),
+        Ok(None) => Err(throw_duration_parse_exc(ctx, &trimmed)),
         Err(e) => Err(e),
+    }
+}
+
+/// Build the `java.time.format.DateTimeParseException` that
+/// `java.time.Duration.parse` raises for malformed ISO-8601 text: message
+/// "Text cannot be parsed to a Duration", the offending text as `parsedData`,
+/// and `errorIndex` 0. Returned as an `ExceptionThrown` so callers that inspect
+/// the cause type (Spring `DurationFormatterUtils`) observe the real JDK type.
+/// Falls back to `IllegalArgumentException` only if the exception object cannot
+/// be constructed.
+fn throw_duration_parse_exc(ctx: &mut dyn NativeContext, text: &str) -> MethodCallFailed {
+    let msg = ctx.create_string("Text cannot be parsed to a Duration");
+    let parsed = ctx.create_string(text);
+    match ctx.new_object_initialized(
+        "java/time/format/DateTimeParseException",
+        "(Ljava/lang/String;Ljava/lang/CharSequence;I)V",
+        &[
+            Value::Object(Some(msg)),
+            Value::Object(Some(parsed)),
+            Value::Int(0),
+        ],
+    ) {
+        Ok(Some(Value::Object(Some(exc)))) => MethodCallFailed::ExceptionThrown(exc),
+        _ => RuntimeError::IllegalArgumentException {
+            message: format!("Text cannot be parsed to a Duration: {text}"),
+        }
+        .into(),
     }
 }
 

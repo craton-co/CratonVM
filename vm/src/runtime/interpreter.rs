@@ -17814,8 +17814,14 @@ fn force_native_over_real_jdk_bytecode(
     // SimpleDateFormat runs with a valid pattern. Companion native registered in
     // `native-builtins::locale_resources::register`; same locale-data-gap class
     // as the BreakIterator / getDecimalFormatSymbolsData overrides.
+    // The java.time localized-formatting path
+    // (DateTimeFormatterBuilder.getLocalizedDateTimePattern →
+    // getJavaTimeDateTimePattern) reads the same unsurfaced jdk.localedata
+    // bundle and otherwise returns null → `appendPattern(null)` NPE ("pattern"),
+    // breaking Spring's LocalDate/LocalDateTime style formatting & parsing.
     if class_name == "sun/util/locale/provider/LocaleResources"
-        && method_name == "getDateTimePattern"
+        && (method_name == "getDateTimePattern"
+            || method_name == "getJavaTimeDateTimePattern")
     {
         return true;
     }

@@ -382,6 +382,35 @@ fn timezone_offset_minutes(tok: &str) -> Option<i32> {
     if named.is_some() {
         return named;
     }
+    // JDK `Date.parse` matches zone words by PREFIX — its scan compares the zone
+    // table against `regionMatches(true, 0, s, start, len)` where `len` is the
+    // *scanned token's* length — so an abbreviated zone like "GM" is accepted as
+    // GMT (this is exactly what `new Date("... 13:30:00 GM")` relies on). Mirror
+    // that for multi-character all-alphabetic tokens, walking the zone table in
+    // JDK order so ambiguous prefixes resolve identically. Single-letter tokens
+    // are skipped (they'd collide with month / AM-PM prefixes and never occur in
+    // the forms we parse); numeric offsets ("+0100", "GMT-5") fall through below.
+    if tok.len() >= 2 && tok.bytes().all(|b| b.is_ascii_alphabetic()) {
+        const ZONES: &[(&str, i32)] = &[
+            ("GMT", 0),
+            ("UT", 0),
+            ("UTC", 0),
+            ("EST", 5 * 60),
+            ("EDT", 4 * 60),
+            ("CST", 6 * 60),
+            ("CDT", 5 * 60),
+            ("MST", 7 * 60),
+            ("MDT", 6 * 60),
+            ("PST", 8 * 60),
+            ("PDT", 7 * 60),
+        ];
+        let upper = tok.to_ascii_uppercase();
+        for (name, off) in ZONES {
+            if name.starts_with(upper.as_str()) {
+                return Some(*off);
+            }
+        }
+    }
     // Numeric offset, optionally prefixed by GMT/UTC: "+HH:MM", "+HHMM", "-HHMM".
     let body = tok
         .strip_prefix("GMT")

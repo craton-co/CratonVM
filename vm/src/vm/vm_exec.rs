@@ -11533,7 +11533,12 @@ fn invoke_on_class_shared_inner(
                         // downstream real-JDK SimpleDateFormat runs with a valid
                         // pattern.
                         || (class_name == "sun/util/locale/provider/LocaleResources"
-                            && method_name == "getDateTimePattern")
+                            && (method_name == "getDateTimePattern"
+                                // java.time localized formatting path
+                                // (getLocalizedDateTimePattern) reads the same
+                                // unsurfaced jdk.localedata bundle and otherwise
+                                // returns null → appendPattern(null) NPE.
+                                || method_name == "getJavaTimeDateTimePattern"))
                         // java.time text names: `CalendarDataUtility.retrieve
                         // JavaTimeFieldValueName(s)` back `DateTimeTextProvider`'s
                         // `EEE`/`MMM`/`a`/`G` lookups. Same locale-data gap as
