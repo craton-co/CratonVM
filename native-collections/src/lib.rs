@@ -559,6 +559,14 @@ fn pin_value_slice(ctx: &mut dyn NativeContext, vals: &[Value]) -> (usize, Vec<u
     (base, handles)
 }
 
+#[inline]
+fn pin_value(ctx: &mut dyn NativeContext, v: Value) -> usize {
+    match v {
+        Value::Object(Some(o)) => ctx.pin_native_root(o),
+        _ => usize::MAX,
+    }
+}
+
 /// Read back the (post-GC, forwarded) refs for a slice pinned with
 /// [`pin_value_slice`]. Non-object slots are returned verbatim.
 fn read_value_slice(ctx: &dyn NativeContext, handles: &[usize], orig: &[Value]) -> Vec<Value> {
@@ -9114,30 +9122,61 @@ fn native_map_compute_if_absent(ctx: &mut dyn NativeContext, args: &[Value]) -> 
         _ => return Ok(Some(Value::Object(None))),
     };
 
+    let this_pin = ctx.pin_native_root(this);
+    let key_pin = pin_value(ctx, key);
+    let function_pin = ctx.pin_native_root(function);
+
     // Check if key already present.
-    let existing = native_map_get(ctx, &[Value::Object(Some(this)), key])?;
+    let this_cur = ctx.read_native_pin(this_pin, this);
+    let key_cur = read_pinned_elem(ctx, key_pin, key);
+    let existing = match native_map_get(ctx, &[Value::Object(Some(this_cur)), key_cur]) {
+        Ok(v) => v,
+        Err(e) => {
+            ctx.unpin_native_roots(this_pin);
+            return Err(e);
+        }
+    };
     if let Some(Value::Object(Some(_))) = existing {
+        ctx.unpin_native_roots(this_pin);
         return Ok(existing);
     }
 
     // Key absent — call function.apply(key).
-    let result = ctx.invoke_virtual(
-        function,
+    let function_cur = ctx.read_native_pin(function_pin, function);
+    let key_cur = read_pinned_elem(ctx, key_pin, key);
+    let result = match ctx.invoke_virtual(
+        function_cur,
         "apply",
         "(Ljava/lang/Object;)Ljava/lang/Object;",
-        &[key],
-    )?;
+        &[key_cur],
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            ctx.unpin_native_roots(this_pin);
+            return Err(e);
+        }
+    };
     // Keep the result boxed — maps store Object references; unboxing here makes
     // the value read back as null (TreeMap's native_tm_compute_if_absent stores
     // it boxed and is correct). The boxed wrapper is what the JDK stores/returns.
     let new_val = result.unwrap_or(Value::Object(None));
 
     if let Value::Object(None) = new_val {
+        ctx.unpin_native_roots(this_pin);
         return Ok(Some(Value::Object(None)));
     }
 
-    native_map_put(ctx, &[Value::Object(Some(this)), key, new_val])?;
-    Ok(Some(new_val))
+    let new_val_pin = pin_value(ctx, new_val);
+    let this_cur = ctx.read_native_pin(this_pin, this);
+    let key_cur = read_pinned_elem(ctx, key_pin, key);
+    let new_val_cur = read_pinned_elem(ctx, new_val_pin, new_val);
+    if let Err(e) = native_map_put(ctx, &[Value::Object(Some(this_cur)), key_cur, new_val_cur]) {
+        ctx.unpin_native_roots(this_pin);
+        return Err(e);
+    }
+    let ret = read_pinned_elem(ctx, new_val_pin, new_val);
+    ctx.unpin_native_roots(this_pin);
+    Ok(Some(ret))
 }
 
 fn native_map_compute(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -9151,28 +9190,65 @@ fn native_map_compute(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         _ => return Ok(Some(Value::Object(None))),
     };
 
-    let existing = native_map_get(ctx, &[Value::Object(Some(this)), key])?;
-    let old_val = existing.unwrap_or(Value::Object(None));
+    let this_pin = ctx.pin_native_root(this);
+    let key_pin = pin_value(ctx, key);
+    let bi_function_pin = ctx.pin_native_root(bi_function);
 
-    let result = ctx.invoke_virtual(
-        bi_function,
+    let this_cur = ctx.read_native_pin(this_pin, this);
+    let key_cur = read_pinned_elem(ctx, key_pin, key);
+    let existing = match native_map_get(ctx, &[Value::Object(Some(this_cur)), key_cur]) {
+        Ok(v) => v,
+        Err(e) => {
+            ctx.unpin_native_roots(this_pin);
+            return Err(e);
+        }
+    };
+    let old_val = existing.unwrap_or(Value::Object(None));
+    let old_val_pin = pin_value(ctx, old_val);
+
+    let bi_function_cur = ctx.read_native_pin(bi_function_pin, bi_function);
+    let key_cur = read_pinned_elem(ctx, key_pin, key);
+    let old_val_cur = read_pinned_elem(ctx, old_val_pin, old_val);
+    let result = match ctx.invoke_virtual(
+        bi_function_cur,
         "apply",
         "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
-        &[key, old_val],
-    )?;
+        &[key_cur, old_val_cur],
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            ctx.unpin_native_roots(this_pin);
+            return Err(e);
+        }
+    };
     // Keep boxed — maps store Object references (unboxing reads back as null).
     let new_val = result.unwrap_or(Value::Object(None));
 
     if let Value::Object(None) = new_val {
         // Remove mapping if new value is null.
         if let Value::Object(Some(_)) = old_val {
-            native_map_remove(ctx, &[Value::Object(Some(this)), key])?;
+            let this_cur = ctx.read_native_pin(this_pin, this);
+            let key_cur = read_pinned_elem(ctx, key_pin, key);
+            if let Err(e) = native_map_remove(ctx, &[Value::Object(Some(this_cur)), key_cur]) {
+                ctx.unpin_native_roots(this_pin);
+                return Err(e);
+            }
         }
+        ctx.unpin_native_roots(this_pin);
         return Ok(Some(Value::Object(None)));
     }
 
-    native_map_put(ctx, &[Value::Object(Some(this)), key, new_val])?;
-    Ok(Some(new_val))
+    let new_val_pin = pin_value(ctx, new_val);
+    let this_cur = ctx.read_native_pin(this_pin, this);
+    let key_cur = read_pinned_elem(ctx, key_pin, key);
+    let new_val_cur = read_pinned_elem(ctx, new_val_pin, new_val);
+    if let Err(e) = native_map_put(ctx, &[Value::Object(Some(this_cur)), key_cur, new_val_cur]) {
+        ctx.unpin_native_roots(this_pin);
+        return Err(e);
+    }
+    let ret = read_pinned_elem(ctx, new_val_pin, new_val);
+    ctx.unpin_native_roots(this_pin);
+    Ok(Some(ret))
 }
 
 fn native_map_compute_if_present(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -9186,30 +9262,68 @@ fn native_map_compute_if_present(ctx: &mut dyn NativeContext, args: &[Value]) ->
         _ => return Ok(Some(Value::Object(None))),
     };
 
-    let existing = native_map_get(ctx, &[Value::Object(Some(this)), key])?;
+    let this_pin = ctx.pin_native_root(this);
+    let key_pin = pin_value(ctx, key);
+    let bi_function_pin = ctx.pin_native_root(bi_function);
+
+    let this_cur = ctx.read_native_pin(this_pin, this);
+    let key_cur = read_pinned_elem(ctx, key_pin, key);
+    let existing = match native_map_get(ctx, &[Value::Object(Some(this_cur)), key_cur]) {
+        Ok(v) => v,
+        Err(e) => {
+            ctx.unpin_native_roots(this_pin);
+            return Err(e);
+        }
+    };
     let old_val = existing.unwrap_or(Value::Object(None));
 
     // Only apply if key is present (old_val is non-null)
     if let Value::Object(None) = old_val {
+        ctx.unpin_native_roots(this_pin);
         return Ok(Some(Value::Object(None)));
     }
+    let old_val_pin = pin_value(ctx, old_val);
 
-    let result = ctx.invoke_virtual(
-        bi_function,
+    let bi_function_cur = ctx.read_native_pin(bi_function_pin, bi_function);
+    let key_cur = read_pinned_elem(ctx, key_pin, key);
+    let old_val_cur = read_pinned_elem(ctx, old_val_pin, old_val);
+    let result = match ctx.invoke_virtual(
+        bi_function_cur,
         "apply",
         "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
-        &[key, old_val],
-    )?;
+        &[key_cur, old_val_cur],
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            ctx.unpin_native_roots(this_pin);
+            return Err(e);
+        }
+    };
     // Keep boxed — maps store Object references (unboxing reads back as null).
     let new_val = result.unwrap_or(Value::Object(None));
 
     if let Value::Object(None) = new_val {
-        native_map_remove(ctx, &[Value::Object(Some(this)), key])?;
+        let this_cur = ctx.read_native_pin(this_pin, this);
+        let key_cur = read_pinned_elem(ctx, key_pin, key);
+        if let Err(e) = native_map_remove(ctx, &[Value::Object(Some(this_cur)), key_cur]) {
+            ctx.unpin_native_roots(this_pin);
+            return Err(e);
+        }
+        ctx.unpin_native_roots(this_pin);
         return Ok(Some(Value::Object(None)));
     }
 
-    native_map_put(ctx, &[Value::Object(Some(this)), key, new_val])?;
-    Ok(Some(new_val))
+    let new_val_pin = pin_value(ctx, new_val);
+    let this_cur = ctx.read_native_pin(this_pin, this);
+    let key_cur = read_pinned_elem(ctx, key_pin, key);
+    let new_val_cur = read_pinned_elem(ctx, new_val_pin, new_val);
+    if let Err(e) = native_map_put(ctx, &[Value::Object(Some(this_cur)), key_cur, new_val_cur]) {
+        ctx.unpin_native_roots(this_pin);
+        return Err(e);
+    }
+    let ret = read_pinned_elem(ctx, new_val_pin, new_val);
+    ctx.unpin_native_roots(this_pin);
+    Ok(Some(ret))
 }
 
 fn native_map_merge(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -9224,31 +9338,69 @@ fn native_map_merge(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         _ => return Ok(Some(Value::Object(None))),
     };
 
-    let existing = native_map_get(ctx, &[Value::Object(Some(this)), key])?;
+    let this_pin = ctx.pin_native_root(this);
+    let key_pin = pin_value(ctx, key);
+    let value_pin = pin_value(ctx, value);
+    let bi_function_pin = ctx.pin_native_root(bi_function);
+
+    let this_cur = ctx.read_native_pin(this_pin, this);
+    let key_cur = read_pinned_elem(ctx, key_pin, key);
+    let existing = match native_map_get(ctx, &[Value::Object(Some(this_cur)), key_cur]) {
+        Ok(v) => v,
+        Err(e) => {
+            ctx.unpin_native_roots(this_pin);
+            return Err(e);
+        }
+    };
     let old_val = existing.unwrap_or(Value::Object(None));
+    let old_val_pin = pin_value(ctx, old_val);
 
     let new_val = if let Value::Object(Some(_)) = old_val {
         // Key present — merge with BiFunction.
-        let result = ctx.invoke_virtual(
-            bi_function,
+        let bi_function_cur = ctx.read_native_pin(bi_function_pin, bi_function);
+        let old_val_cur = read_pinned_elem(ctx, old_val_pin, old_val);
+        let value_cur = read_pinned_elem(ctx, value_pin, value);
+        let result = match ctx.invoke_virtual(
+            bi_function_cur,
             "apply",
             "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
-            &[old_val, value],
-        )?;
+            &[old_val_cur, value_cur],
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                ctx.unpin_native_roots(this_pin);
+                return Err(e);
+            }
+        };
         // Keep boxed — maps store Object references (unboxing reads back as null).
         result.unwrap_or(Value::Object(None))
     } else {
         // Key absent — use value directly.
-        value
+        read_pinned_elem(ctx, value_pin, value)
     };
 
     if let Value::Object(None) = new_val {
-        native_map_remove(ctx, &[Value::Object(Some(this)), key])?;
+        let this_cur = ctx.read_native_pin(this_pin, this);
+        let key_cur = read_pinned_elem(ctx, key_pin, key);
+        if let Err(e) = native_map_remove(ctx, &[Value::Object(Some(this_cur)), key_cur]) {
+            ctx.unpin_native_roots(this_pin);
+            return Err(e);
+        }
+        ctx.unpin_native_roots(this_pin);
         return Ok(Some(Value::Object(None)));
     }
 
-    native_map_put(ctx, &[Value::Object(Some(this)), key, new_val])?;
-    Ok(Some(new_val))
+    let new_val_pin = pin_value(ctx, new_val);
+    let this_cur = ctx.read_native_pin(this_pin, this);
+    let key_cur = read_pinned_elem(ctx, key_pin, key);
+    let new_val_cur = read_pinned_elem(ctx, new_val_pin, new_val);
+    if let Err(e) = native_map_put(ctx, &[Value::Object(Some(this_cur)), key_cur, new_val_cur]) {
+        ctx.unpin_native_roots(this_pin);
+        return Err(e);
+    }
+    let ret = read_pinned_elem(ctx, new_val_pin, new_val);
+    ctx.unpin_native_roots(this_pin);
+    Ok(Some(ret))
 }
 
 fn native_map_replace_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -9261,19 +9413,41 @@ fn native_map_replace_all(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         _ => return Ok(None),
     };
 
+    let this_pin = ctx.pin_native_root(this);
+    let bi_function_pin = ctx.pin_native_root(bi_function);
     let entries = map_collect_entries(ctx, this);
-    for (key, value) in &entries {
-        let result = ctx.invoke_virtual(
-            bi_function,
+    let flat: Vec<Value> = entries.iter().flat_map(|(k, v)| [*k, *v]).collect();
+    let (_, flat_pins) = pin_value_slice(ctx, &flat);
+    for i in 0..entries.len() {
+        let bi_function_cur = ctx.read_native_pin(bi_function_pin, bi_function);
+        let key = read_pinned_elem(ctx, flat_pins[i * 2], flat[i * 2]);
+        let value = read_pinned_elem(ctx, flat_pins[i * 2 + 1], flat[i * 2 + 1]);
+        let result = match ctx.invoke_virtual(
+            bi_function_cur,
             "apply",
             "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
-            &[*key, *value],
-        )?;
+            &[key, value],
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                ctx.unpin_native_roots(this_pin);
+                return Err(e);
+            }
+        };
         // Keep boxed — maps store Object references (unboxing reads back as null).
         let new_val = result.unwrap_or(Value::Object(None));
-        native_map_put(ctx, &[Value::Object(Some(this)), *key, new_val])?;
+        let new_val_pin = pin_value(ctx, new_val);
+        let this_cur = ctx.read_native_pin(this_pin, this);
+        let key = read_pinned_elem(ctx, flat_pins[i * 2], flat[i * 2]);
+        let new_val_cur = read_pinned_elem(ctx, new_val_pin, new_val);
+        if let Err(e) = native_map_put(ctx, &[Value::Object(Some(this_cur)), key, new_val_cur]) {
+            ctx.unpin_native_roots(this_pin);
+            return Err(e);
+        }
+        ctx.unpin_native_roots(new_val_pin);
     }
 
+    ctx.unpin_native_roots(this_pin);
     Ok(None)
 }
 
@@ -24791,25 +24965,54 @@ fn native_tm_compute_if_absent(ctx: &mut dyn NativeContext, args: &[Value]) -> M
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Object(None))),
     };
+    let this_pin = ctx.pin_native_root(this);
+    let key_pin = pin_value(ctx, key);
+    let mapper_pin = ctx.pin_native_root(mapper);
     // Round-9 HIGH: route through `native_tm_get` / `native_tm_put` so the
     // fast-mode BTreeMap path applies for natural-ordering maps.
-    let existing =
-        native_tm_get(ctx, &[Value::Object(Some(this)), key])?.unwrap_or(Value::Object(None));
+    let this_cur = ctx.read_native_pin(this_pin, this);
+    let key_cur = read_pinned_elem(ctx, key_pin, key);
+    let existing = match native_tm_get(ctx, &[Value::Object(Some(this_cur)), key_cur]) {
+        Ok(v) => v.unwrap_or(Value::Object(None)),
+        Err(e) => {
+            ctx.unpin_native_roots(this_pin);
+            return Err(e);
+        }
+    };
     if !matches!(existing, Value::Object(None)) {
+        ctx.unpin_native_roots(this_pin);
         return Ok(Some(existing));
     }
-    let result = ctx.invoke_virtual(
-        mapper,
+    let mapper_cur = ctx.read_native_pin(mapper_pin, mapper);
+    let key_cur = read_pinned_elem(ctx, key_pin, key);
+    let result = match ctx.invoke_virtual(
+        mapper_cur,
         "apply",
         "(Ljava/lang/Object;)Ljava/lang/Object;",
-        &[key],
-    )?;
+        &[key_cur],
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            ctx.unpin_native_roots(this_pin);
+            return Err(e);
+        }
+    };
     let val = result.unwrap_or(Value::Object(None));
     if matches!(val, Value::Object(None)) {
+        ctx.unpin_native_roots(this_pin);
         return Ok(Some(Value::Object(None)));
     }
-    native_tm_put(ctx, &[Value::Object(Some(this)), key, val])?;
-    Ok(Some(val))
+    let val_pin = pin_value(ctx, val);
+    let this_cur = ctx.read_native_pin(this_pin, this);
+    let key_cur = read_pinned_elem(ctx, key_pin, key);
+    let val_cur = read_pinned_elem(ctx, val_pin, val);
+    if let Err(e) = native_tm_put(ctx, &[Value::Object(Some(this_cur)), key_cur, val_cur]) {
+        ctx.unpin_native_roots(this_pin);
+        return Err(e);
+    }
+    let ret = read_pinned_elem(ctx, val_pin, val);
+    ctx.unpin_native_roots(this_pin);
+    Ok(Some(ret))
 }
 
 fn native_tm_merge(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -24823,28 +25026,64 @@ fn native_tm_merge(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Object(None))),
     };
+    let this_pin = ctx.pin_native_root(this);
+    let key_pin = pin_value(ctx, key);
+    let value_pin = pin_value(ctx, value);
+    let remap_pin = ctx.pin_native_root(remap_fn);
     // Round-9 HIGH: route through `native_tm_get` / `native_tm_put` so the
     // fast-mode BTreeMap path applies for natural-ordering maps.
-    let existing =
-        native_tm_get(ctx, &[Value::Object(Some(this)), key])?.unwrap_or(Value::Object(None));
+    let this_cur = ctx.read_native_pin(this_pin, this);
+    let key_cur = read_pinned_elem(ctx, key_pin, key);
+    let existing = match native_tm_get(ctx, &[Value::Object(Some(this_cur)), key_cur]) {
+        Ok(v) => v.unwrap_or(Value::Object(None)),
+        Err(e) => {
+            ctx.unpin_native_roots(this_pin);
+            return Err(e);
+        }
+    };
+    let existing_pin = pin_value(ctx, existing);
     let new_val = if matches!(existing, Value::Object(None)) {
-        value
+        read_pinned_elem(ctx, value_pin, value)
     } else {
-        let merged = ctx.invoke_virtual(
-            remap_fn,
+        let remap_cur = ctx.read_native_pin(remap_pin, remap_fn);
+        let existing_cur = read_pinned_elem(ctx, existing_pin, existing);
+        let value_cur = read_pinned_elem(ctx, value_pin, value);
+        let merged = match ctx.invoke_virtual(
+            remap_cur,
             "apply",
             "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
-            &[existing, value],
-        )?;
+            &[existing_cur, value_cur],
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                ctx.unpin_native_roots(this_pin);
+                return Err(e);
+            }
+        };
         merged.unwrap_or(Value::Object(None))
     };
     if matches!(new_val, Value::Object(None)) {
         // JDK Map.merge contract: null result removes the mapping.
-        native_tm_remove(ctx, &[Value::Object(Some(this)), key])?;
+        let this_cur = ctx.read_native_pin(this_pin, this);
+        let key_cur = read_pinned_elem(ctx, key_pin, key);
+        if let Err(e) = native_tm_remove(ctx, &[Value::Object(Some(this_cur)), key_cur]) {
+            ctx.unpin_native_roots(this_pin);
+            return Err(e);
+        }
+        ctx.unpin_native_roots(this_pin);
         return Ok(Some(Value::Object(None)));
     }
-    native_tm_put(ctx, &[Value::Object(Some(this)), key, new_val])?;
-    Ok(Some(new_val))
+    let new_val_pin = pin_value(ctx, new_val);
+    let this_cur = ctx.read_native_pin(this_pin, this);
+    let key_cur = read_pinned_elem(ctx, key_pin, key);
+    let new_val_cur = read_pinned_elem(ctx, new_val_pin, new_val);
+    if let Err(e) = native_tm_put(ctx, &[Value::Object(Some(this_cur)), key_cur, new_val_cur]) {
+        ctx.unpin_native_roots(this_pin);
+        return Err(e);
+    }
+    let ret = read_pinned_elem(ctx, new_val_pin, new_val);
+    ctx.unpin_native_roots(this_pin);
+    Ok(Some(ret))
 }
 
 // TreeMap key iterator: snapshot-based, returns keys in sorted order

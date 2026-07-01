@@ -98,6 +98,14 @@ registered here, and `Collections$UnmodifiableList$ListItr.forEachRemaining`. Fo
 simulate a moving GC during callbacks for `LinkedHashMap.forEach` and `TreeMap.forEach` in
 `native-collections/tests/gc_native_pins.rs`.
 
+**Additional map-functional sweep (2026-07-01, follow-up):** `HashMap.computeIfAbsent`,
+`HashMap.compute`, `HashMap.computeIfPresent`, `HashMap.merge`, `HashMap.replaceAll`, plus the
+analogous `TreeMap.computeIfAbsent` / `TreeMap.merge` paths now pin and re-read their map receiver,
+callback, keys, old values, merge values, and callback results across `invoke_virtual`. The same
+generic HashMap helpers are used by `ConcurrentHashMap.compute`, `merge`, and `replaceAll` after segment
+selection. The native-collections mock relocation hook now also rewrites heap fields/array slots for
+moved pins, and `gc_native_pins.rs` covers `HashMap.replaceAll` under callback-triggered moving GC.
+
 **Do NOT** try to fix this by forcing the non-moving sweep when a native is active: it re-triggers the
 documented [`HIB-CV-33`](HIB-CV-33-sigsegv-execute-fault-joined-inheritance-sf-build.md) precise-root
 reclaim gap (`gen_heap.rs` — the non-moving sweep without conservative roots reclaims live precise-rooted

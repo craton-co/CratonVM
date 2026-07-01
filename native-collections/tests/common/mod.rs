@@ -263,6 +263,21 @@ impl MockCtx {
                 new_roots.push(root);
             }
         }
+        if !moved.is_empty() {
+            for entry in self.heap_mut() {
+                let values = match entry {
+                    HeapEntry::Object { fields, .. } => fields,
+                    HeapEntry::Array { elements } => elements,
+                };
+                for value in values {
+                    if let Value::Object(Some(obj)) = value {
+                        if let Some(new_obj) = moved.get(&(obj.as_ptr() as usize)).copied() {
+                            *obj = new_obj;
+                        }
+                    }
+                }
+            }
+        }
         // SAFETY: single-threaded test code.
         unsafe {
             *self.native_pin_roots.get() = new_roots;
