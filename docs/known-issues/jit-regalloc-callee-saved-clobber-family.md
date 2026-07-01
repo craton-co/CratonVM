@@ -77,8 +77,7 @@ Grouped from `is_known_miscompile`:
 - **Reflection / generics:** `Class.{getGenericInterfaces,getGenericSuperclass,getGenericInfo}`,
   `ClassRepository.{getSuperInterfaces,getSuperclass,make}`, `AbstractRepository.getTree`.
 - **ByteBuddy (Hibernate proxy build):** `ByteBuddyState.make`.
-- **Misc:** `AbstractCollection.{addAll,toArray}`, `HashSet.{<init>,iterator}`, plus the
-  `cratonvm/TckLang.exc_hierarchy` regalloc-parameter-mapping reproducer.
+- **Misc:** `AbstractCollection.{addAll,toArray}`, `HashSet.{<init>,iterator}`.
 
 ## Key finding (kafka-bug-C, 2026-06-18): it is NOT reproducible by bytecode shape
 
@@ -104,6 +103,12 @@ The family is being chipped away, not stuck:
 - **bug-03 / Matcher.search** — was misfiled as a `search` miscompile; the real bug was the
   virtual-dispatch *bail* using the static call-site class, fixed in
   `jit/.../helpers.rs::bail_to_interpreter`.
+- **TckLang.exc_hierarchy** (`RuntimeException instanceof Exception && Throwable`) — **lifted**
+  after the 2026-07-01 retry. The former `Int(0)` reproducer now passes under forced inline JIT:
+  `CRATONVM_JIT_ALLOW_PACKAGES=cratonvm/`, `CRATONVM_JIT_THRESHOLD=1`, `CRATONVM_BG_COMPILE=0`
+  with `cargo test -p cratonvm-vm --features synthetic-jdk --test interpreter_tests
+  test_s46_exc_hierarchy -- --nocapture`. The stale `cratonvm/TckLang.exc_hierarchy`
+  `is_known_miscompile` entry was removed.
 
 ### Length-table hardening (2026-06-21) — defense-in-depth against the CM-FASTMATH class
 
@@ -148,6 +153,18 @@ what remains open is the **general** clobber.
   `emit_inline_tlab_new`/`regalloc.rs` site, add a `bench/*` regression witness, then lift that ban.
 
 ## Root-cause progress log
+
+### 2026-07-01 — `TckLang.exc_hierarchy` retry no longer reproduces
+
+Retried the documented `cratonvm/TckLang.exc_hierarchy` member with the method forced through the
+inline JIT path (`CRATONVM_JIT_ALLOW_PACKAGES=cratonvm/`, `CRATONVM_JIT_THRESHOLD=1`,
+`CRATONVM_BG_COMPILE=0`). The test now returns the expected `Int(1)`, so the old `Int(0)`
+reproducer is stale on current `dev`. Removed the targeted `is_known_miscompile` ban and the
+ignored/panicking Tier-1 reproducer note.
+
+This does **not** close the umbrella family: the remaining `java/util`, JUC, reflection/generic,
+ByteBuddy, and other targeted bans still represent active or not-yet-retried members of the
+callee-saved/regalloc family.
 
 ### 2026-07-01 — wide local / wide branch liveness hardening
 

@@ -82,6 +82,7 @@ fn setup_modules(vm: &mut Vm, extra_opens: &[(&str, &str, &str)]) {
         uses: vec![],
         provides: vec![],
         is_open: false,
+        automatic: false,
     };
     cm.module_registry.register(desc, vec![]);
 

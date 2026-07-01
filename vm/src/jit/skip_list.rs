@@ -1291,11 +1291,6 @@ fn is_known_miscompile(class_name: &str, method_name: &str) -> bool {
         // reason. KEEP until the original heavy real-JCA harness conditions
         // can be recreated.
         | ("org/junit/runner/JUnitCore", "main")
-        // NEW-1.4 — regalloc parameter-mapping bug, surfaces as
-        // `test_s46_exc_hierarchy` returning Int(0) instead of Int(1).
-        // Tracked by the committed reproducer in
-        // `vm/tests/tier1_tests.rs::t1_known_regalloc_miscompile_exc_hierarchy_reproducer`.
-        | ("cratonvm/TckLang", "exc_hierarchy")
         // W2-CHM (Cluster B-CHM, Session 108) — JIT miscompiles
         // `Integer.valueOf(int)` / `Integer.<init>(int)` such that the
         // returned `Integer` has `value=0` instead of the requested int
@@ -2335,8 +2330,9 @@ mod tests {
     }
 
     #[test]
-    fn cratonvm_targeted_miscompile_only_skipped() {
-        // T1.1.g — exc_hierarchy is the NEW-1.4 reproducer.
+    fn cratonvm_exc_hierarchy_lifted_after_retry() {
+        // 2026-07-01 retry: the former NEW-1.4 reproducer now passes under
+        // forced inline JIT, so this stale targeted ban must stay lifted.
         assert_eq!(
             check(
                 "cratonvm/TckLang",
@@ -2345,7 +2341,7 @@ mod tests {
                 true,
                 SkipPolicy::Conservative
             ),
-            Some(SkipReason::RustJvmTestFixture)
+            None
         );
     }
 
@@ -2367,21 +2363,6 @@ mod tests {
             ),
             None,
             "non-miscompile TckLang methods must be JIT-eligible"
-        );
-    }
-
-    #[test]
-    fn cratonvm_targeted_overridable_via_allow_packages() {
-        assert_eq!(
-            check_with(
-                "cratonvm/TckLang",
-                "exc_hierarchy",
-                false,
-                true,
-                SkipPolicy::Conservative,
-                &["cratonvm/"],
-            ),
-            None
         );
     }
 
@@ -2600,14 +2581,20 @@ mod tests {
     /// remain interpreted through the generic constructor gate.
     #[test]
     fn integer_long_valueof_lifted_but_constructors_stay_guarded() {
-        for (cls, mn) in [("java/lang/Integer", "valueOf"), ("java/lang/Long", "valueOf")] {
+        for (cls, mn) in [
+            ("java/lang/Integer", "valueOf"),
+            ("java/lang/Long", "valueOf"),
+        ] {
             assert_eq!(
                 check(cls, mn, false, true, SkipPolicy::Conservative),
                 None,
                 "{cls}.{mn} should remain JIT-eligible after the W2-CHM lift"
             );
         }
-        for (cls, mn) in [("java/lang/Integer", "<init>"), ("java/lang/Long", "<init>")] {
+        for (cls, mn) in [
+            ("java/lang/Integer", "<init>"),
+            ("java/lang/Long", "<init>"),
+        ] {
             assert!(
                 check(cls, mn, false, true, SkipPolicy::Conservative).is_some(),
                 "{cls}.{mn} must stay guarded by the constructor policy"
@@ -2843,7 +2830,7 @@ mod tests {
         assert!(is_known_miscompile("java/util/HashMap", "put"));
         assert!(is_known_miscompile("java/util/HashMap", "get"));
         assert!(is_known_miscompile("java/util/HashMap", "resize"));
-        assert!(is_known_miscompile("cratonvm/TckLang", "exc_hierarchy"));
+        assert!(!is_known_miscompile("cratonvm/TckLang", "exc_hierarchy"));
         assert!(is_known_miscompile(
             "org/keycloak/models/credential/dto/PasswordCredentialData",
             "getAdditionalParameters"

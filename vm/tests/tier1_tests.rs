@@ -1108,54 +1108,6 @@ fn t1_card_table_dirty_cards_round_trip() {
 // T1.6.4 — Unsafe.compareAndSwap* atomicity under parallel load
 // ===========================================================================
 
-/// T1.1.22-25 — regalloc miscompile reproducer for `exc_hierarchy`.
-///
-/// Under `CRATONVM_JIT_ALLOW_PACKAGES=cratonvm/`, the JIT-compiled
-/// version of `cratonvm/TckLang.exc_hierarchy` returns `Int(0)`
-/// instead of `Int(1)`. The method is:
-///
-/// ```java
-/// public static int exc_hierarchy() {
-///   RuntimeException re = new RuntimeException();
-///   return (re instanceof Exception && re instanceof Throwable) ? 1 : 0;
-/// }
-/// ```
-///
-/// Structural regalloc invariants (added in CP2) would catch any
-/// future category-level regression, but the original miscompile is
-/// not in regalloc itself — it appears to be in the interaction
-/// between `new RuntimeException` and the chained `instanceof` checks
-/// across the `&&` short-circuit branch. Isolating it requires
-/// interactive bytecode-level JIT tracing tools that do not yet
-/// exist in the repo.
-///
-/// The test is marked `#[ignore]` so it stays in the suite as a
-/// committed reproducer; the T1.1.22-25 fix is tracked as a
-/// follow-up under the main roadmap's NEW-1.3 entry. The structural
-/// invariants in `regalloc::regalloc_invariants_hold` prevent any
-/// adjacent regalloc regression from sneaking in.
-#[test]
-#[ignore = "Known T1.1.22-25 miscompile under CRATONVM_JIT_ALLOW_PACKAGES=cratonvm/; \
-            structural invariants cover the adjacent failure modes; \
-            fix requires interactive JIT tracing tools tracked as NEW-1.3 follow-up"]
-fn t1_known_regalloc_miscompile_exc_hierarchy_reproducer() {
-    // This test exists only to document the reproducer. Running it
-    // requires enabling the `cratonvm/` JIT package override at
-    // process startup, which affects global JIT state and can't be
-    // done from a per-test harness. The canonical repro path is:
-    //
-    //   $Env:CRATONVM_JIT_ALLOW_PACKAGES="cratonvm/"
-    //   cargo test -p cratonvm-vm --features synthetic-jdk \
-    //       --test interpreter_tests test_s46_exc_hierarchy
-    //
-    // Expected after fix: `Ok(Some(Int(1)))`.
-    // Observed today: `Ok(Some(Int(0)))`.
-    panic!(
-        "see test docstring for canonical reproducer steps — \
-         structural invariants are the active defense, full fix deferred"
-    );
-}
-
 /// T1.6.4 — `compare_and_swap_field` is atomic from the mutator's
 /// perspective: N threads each doing M increment-via-CAS operations
 /// on the same field produce exactly N*M as the final count. This
