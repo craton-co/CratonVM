@@ -3738,13 +3738,15 @@ pub fn execute(
                                 0xb8 => 3,   // invokestatic
                                 _ => continue,
                             };
-                            // Skip self-calls (invokestatic targeting the same method) —
-                            // these are handled by the self_call_patches mechanism
-                            if invoke_kind == 3
-                                && target_class == &*class_name_str
+                            let is_recursive_call = target_class == &*class_name_str
                                 && method_name_ref == method_name
-                                && descriptor_ref == method_descriptor
-                            {
+                                && descriptor_ref == method_descriptor;
+                            let use_raw_tail_self_call = invoke_kind == 3
+                                && is_recursive_call
+                                && crate::jit::invokestatic_self_call_uses_tail_jump(
+                                    &padded, code_len, pc,
+                                );
+                            if use_raw_tail_self_call {
                                 continue;
                             }
                             // Math.sqrt intrinsic: inline as SQRTSD (no dispatch overhead)
@@ -20338,6 +20340,15 @@ fn compile_osr_artifact(
                         0xb8 => 3,
                         _ => continue,
                     };
+                    let is_recursive_call = target_class == class_name.as_str()
+                        && mn == method_name.as_str()
+                        && desc == method_descriptor.as_str();
+                    let use_raw_tail_self_call = invoke_kind == 3
+                        && is_recursive_call
+                        && crate::jit::invokestatic_self_call_uses_tail_jump(code, code_len, pc);
+                    if use_raw_tail_self_call {
+                        continue;
+                    }
 
                     // Math.sqrt intrinsic: inline as SQRTSD (no dispatch overhead)
                     if invoke_kind == 3
@@ -20359,7 +20370,7 @@ fn compile_osr_artifact(
                     }
 
                     // For invokestatic, schedule eager callee compilation (after lock release)
-                    if invoke_kind == 3 {
+                    if invoke_kind == 3 && !is_recursive_call {
                         pending_callee_compiles.push((
                             pc,
                             target_class.to_string(),
@@ -20376,7 +20387,11 @@ fn compile_osr_artifact(
                         continue;
                     }
 
-                    let num_jit_args = param_count + 1; // +1 for receiver (non-static)
+                    let num_jit_args = if invoke_kind == 3 {
+                        param_count
+                    } else {
+                        param_count + 1
+                    };
                     let return_type = crate::jit::return_type(desc);
                     let class_box: Box<str> = target_class.to_string().into_boxed_str();
                     let method_box: Box<str> = mn.to_string().into_boxed_str();

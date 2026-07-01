@@ -5665,10 +5665,12 @@ fn try_compile_inner(
             let num_jit_args = num_params + if has_receiver { 1 } else { 0 };
             let ret_type = return_type(&descriptor);
 
-            let is_self_call = invoke_kind == 3
-                && class_name == &*cached.class_name
+            let is_recursive_call = class_name == &*cached.class_name
                 && method_name == &*cached.method_name
                 && descriptor == &*cached.method_descriptor;
+            let use_raw_tail_self_call = invoke_kind == 3
+                && is_recursive_call
+                && invokestatic_self_call_uses_tail_jump(code, code_len, pc);
 
             // RBC.3 — a site planned for inlining MUST still get a
             // `JitInvokeInfo` dispatch fallback (below). The codegen's
@@ -5684,7 +5686,7 @@ fn try_compile_inner(
             // dump). Skip only the direct-call/intrinsic attempts, then fall
             // through to the info construction.
             let mut planned_inline = false;
-            if !is_self_call && (invoke_kind == 3 || invoke_kind == 1) {
+            if !is_recursive_call && (invoke_kind == 3 || invoke_kind == 1) {
                 // Try inlining first (before direct calls — inlining is more profitable)
                 if inline_budget_remaining > 0 {
                     if let Some(resolver_fn) = inline_resolver.as_ref() {
@@ -5771,7 +5773,7 @@ fn try_compile_inner(
             // the resolver is absent or cannot resolve the class id,
             // `guard_class_id` stays 0 and the CRC32 codegen bails the site
             // to normal dispatch (0 is never a real class id).
-            if !is_self_call && (invoke_kind == 0 || invoke_kind == 2) {
+            if !is_recursive_call && (invoke_kind == 0 || invoke_kind == 2) {
                 // First the layout-independent instance intrinsics.
                 if let Some((entry, num_params, ret)) =
                     try_resolve_intrinsic(&class_name, &method_name, &descriptor)
@@ -5840,7 +5842,10 @@ fn try_compile_inner(
                 }
             }
 
-            if is_self_call {
+            // Keep only static tail self-calls on the raw backend path. Every
+            // other recursive site gets dispatch metadata so the helper stack
+            // guard runs before re-entering compiled code.
+            if use_raw_tail_self_call {
                 continue;
             }
 
@@ -5885,7 +5890,7 @@ fn try_compile_inner(
             owned_invoke_infos.push(info);
             invoke_info.push((pc, info_ptr));
 
-            if invoke_kind == 0 || invoke_kind == 2 {
+            if (invoke_kind == 0 || invoke_kind == 2) && !is_recursive_call {
                 let mic = Box::new(JitMICSlot::new());
                 if let Some(prof) = profile {
                     if let Some(receiver_counts) = prof.receivers.get(&pc) {
@@ -6824,6 +6829,17 @@ pub fn return_type(descriptor: &str) -> u8 {
         }
     }
     b'V'
+}
+
+/// Whether an `invokestatic` self-call can safely use the backend raw tail jump.
+///
+/// Non-tail recursive compiled calls grow the native stack and bypass the
+/// dispatch helpers' stack-depth guard. Tail self-calls are different: x64 lowers
+/// them to a jump back to the method body, so they do not consume another native
+/// frame and can keep the raw path.
+#[inline]
+pub fn invokestatic_self_call_uses_tail_jump(code: &[u8], code_len: usize, pc: usize) -> bool {
+    pc + 3 < code_len && pc + 3 < code.len() && matches!(code[pc + 3], 0xac..=0xb0)
 }
 
 // ---------------------------------------------------------------------------
@@ -8767,6 +8783,22 @@ mod tests {
     #[test]
     fn test_count_param_slots_empty_string() {
         assert_eq!(count_param_slots(""), 0);
+    }
+
+    #[test]
+    fn invokestatic_self_call_tail_jump_predicate() {
+        let tail_call = [0x1a, 0xb8, 0x00, 0x01, 0xac, 0x00, 0x00];
+        assert!(invokestatic_self_call_uses_tail_jump(&tail_call, 5, 1));
+
+        let non_tail_call = [0x1a, 0xb8, 0x00, 0x01, 0x1a, 0xac, 0x00, 0x00];
+        assert!(!invokestatic_self_call_uses_tail_jump(&non_tail_call, 6, 1));
+
+        let void_return_tail_shape = [0xb8, 0x00, 0x01, 0xb1, 0x00, 0x00];
+        assert!(!invokestatic_self_call_uses_tail_jump(
+            &void_return_tail_shape,
+            4,
+            0
+        ));
     }
 
     // ── return_type tests ───────────────────────────────────────────
