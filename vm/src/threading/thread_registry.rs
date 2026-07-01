@@ -119,7 +119,10 @@ pub struct ThreadRegistry {
     /// null `holder` and NPEing in `Thread.getThreadGroup` (Tomcat
     /// `TestDigestAuthenticator` et al.). `.0` is the lookup map; `.1` is the
     /// FIFO eviction order bounding it to `FORMER_MIRROR_CAP` entries.
-    former_mirror_addrs: Mutex<(FxHashMap<usize, ThreadId>, std::collections::VecDeque<usize>)>,
+    former_mirror_addrs: Mutex<(
+        FxHashMap<usize, ThreadId>,
+        std::collections::VecDeque<usize>,
+    )>,
 }
 
 /// Upper bound on retained former-mirror addresses (see
@@ -137,7 +140,10 @@ impl ThreadRegistry {
             threads: Mutex::new(FxHashMap::default()),
             next_id: AtomicU64::new(1),
             thread_obj_to_park: Mutex::new(FxHashMap::default()),
-            former_mirror_addrs: Mutex::new((FxHashMap::default(), std::collections::VecDeque::new())),
+            former_mirror_addrs: Mutex::new((
+                FxHashMap::default(),
+                std::collections::VecDeque::new(),
+            )),
         }
     }
 
@@ -1177,6 +1183,77 @@ mod tests {
         // A dead thread's mirror is no longer rooted (it may be reclaimed).
         registry.mark_dead(tid);
         assert!(registry.collect_all_root_snapshots().is_empty());
+    }
+
+    #[test]
+    fn moved_thread_mirror_records_former_address_for_recovery() {
+        let registry = ThreadRegistry::new();
+        let tid = ThreadId(1);
+
+        let mut old_backing = [0u64; 2];
+        let mut new_backing = [0u64; 2];
+        let old_ref = dummy_aligned_objref(&mut old_backing);
+        let new_ref = dummy_aligned_objref(&mut new_backing);
+        let old_addr = old_ref.as_ptr() as usize;
+        let new_addr = new_ref.as_ptr() as usize;
+        assert_ne!(old_addr, new_addr);
+
+        registry.register(tid, "main", Some(old_ref));
+
+        let mut pm = HashMap::new();
+        pm.insert(old_addr, new_addr);
+        registry.update_thread_objs_after_gc(&pm);
+
+        assert_eq!(
+            registry.java_thread_obj(tid).unwrap().as_ptr() as usize,
+            new_addr,
+            "registry mirror must be remapped to the live address",
+        );
+        assert_eq!(
+            registry.recover_stale_mirror(old_addr).unwrap().as_ptr() as usize,
+            new_addr,
+            "former mirror address must recover the live mirror",
+        );
+        assert!(
+            registry.recover_stale_mirror(new_addr).is_none(),
+            "the current live address is not itself a former address",
+        );
+    }
+
+    #[test]
+    fn stale_mirror_recovery_survives_multiple_moves() {
+        let registry = ThreadRegistry::new();
+        let tid = ThreadId(1);
+
+        let mut first_backing = [0u64; 2];
+        let mut second_backing = [0u64; 2];
+        let mut third_backing = [0u64; 2];
+        let first = dummy_aligned_objref(&mut first_backing);
+        let second = dummy_aligned_objref(&mut second_backing);
+        let third = dummy_aligned_objref(&mut third_backing);
+        let first_addr = first.as_ptr() as usize;
+        let second_addr = second.as_ptr() as usize;
+        let third_addr = third.as_ptr() as usize;
+        assert_ne!(first_addr, second_addr);
+        assert_ne!(second_addr, third_addr);
+
+        registry.register(tid, "main", Some(first));
+
+        let mut pm1 = HashMap::new();
+        pm1.insert(first_addr, second_addr);
+        registry.update_thread_objs_after_gc(&pm1);
+
+        let mut pm2 = HashMap::new();
+        pm2.insert(second_addr, third_addr);
+        registry.update_thread_objs_after_gc(&pm2);
+
+        for stale_addr in [first_addr, second_addr] {
+            assert_eq!(
+                registry.recover_stale_mirror(stale_addr).unwrap().as_ptr() as usize,
+                third_addr,
+                "any retained former mirror address should recover the current mirror",
+            );
+        }
     }
 
     #[test]

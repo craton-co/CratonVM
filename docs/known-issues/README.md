@@ -112,11 +112,12 @@ fixes). Headline:
     `CRATONVM_REAL_AQS`: a live young `java.lang.Thread` mirror held in a **blocked** thread's frame local
     (object-tagged, so NOT the lost-tag item 15) is reclaimed because it is missing from that thread's
     deposited `root_snapshot`; the freed slot is reused as byte-buffer data and decoded as an object pointer.
-    Likely the **same underlying bug** as the `currentThread()`-mirror reclamation in
-    [`repros/gc-concurrent-spawn-reclamation/`](repros/gc-concurrent-spawn-reclamation/) whose fix is on an
-    **unpushed** branch (`feat/precise-maps-a4-finish`) → not on dev. The mitigation (`plausible_heap_pointer`
+    Related to the now-fixed `currentThread()` mirror construction corruption archived at
+    [`../internal/repros/gc-concurrent-spawn-reclamation/`](../internal/repros/gc-concurrent-spawn-reclamation/).
+    Current `dev` has that re-read / pin fix and the stale-mirror recovery table, but this Tomcat item remains
+    open for the blocked-frame snapshot gap and register-resident remainder. The mitigation (`plausible_heap_pointer`
     gate at every ref-decode + JIT receiver-deref boundary) degrades a stale ref to a Java NPE — all 6 are now
-    **crash-free jit+nojit** but still fail/time out (the reclamation itself is unfixed).
+    **crash-free jit+nojit** but still fail/time out (the residual reclamation itself is unfixed).
 19. **[Hibernate `type.temporal.*` — moving GC strands lambda refs in native stream/collection intrinsics](hib-temporal-gc-lambda-native-stale-local.md)** —
     🟠 **OPEN** (fix in progress: per-native pinning). The 5 `org.hibernate.orm.test.type.temporal.*` classes
     abort rc=1 / SIGSEGV with `linkage error: no such method java/lang/Object.<sam>` — **not** a java.time
@@ -197,10 +198,10 @@ current (incomplete/buggy) implementation of that.
 | # | Manifestation | Repro | Status | Doc |
 |---|---|---|---|---|
 | **A1** | Reflection mirror-array builders held an `ObjectRef` array in a Rust local across allocating calls (`Field[]`/`Method[]`/annotation arrays) | `wildfly-suite/repro/MinRepro` | ✅ **FIXED on dev** (`pin_native_root` sweep) | _(doc removed; resolved)_ |
-| **A2** | **`implausible object size` young-sweep-walker crash** (reflection/String-array allocation churn) — a *distinct* bug, NOT the register root: a non-moving-sweep free-list double-serve (overlapping free blocks not coalesced) | `wildfly-suite/repro/ReflRepro` | ✅ **FIXED on dev** (`6e3ddb05`, 2026-06-23; coalesce overlapping free blocks) — `ReflRepro 8000 @ GC_STRESS=65536` → `ok=8000 bad=0` (re-verified 2026-06-29); precise maps orthogonal; moved to docs/internal | [reflrepro-register-resident-jit-root-handoff.md](../internal/app-jvm-bugs/reflrepro-register-resident-jit-root-handoff.md) |
+| **A2** | **`implausible object size` young-sweep-walker crash** (reflection/String-array allocation churn) — a *distinct* bug, NOT the register root: a non-moving-sweep free-list double-serve (overlapping free blocks not coalesced) | [`../internal/repros/A2-reflrepro/`](../internal/repros/A2-reflrepro/) | ✅ **FIXED on dev** (`6e3ddb05`, 2026-06-23; coalesce overlapping free blocks) — `ReflRepro 8000 @ GC_STRESS=65536` → `ok=8000 bad=0` (re-verified 2026-06-29); precise maps orthogonal; moved to docs/internal | [reflrepro-register-resident-jit-root-handoff.md](../internal/app-jvm-bugs/reflrepro-register-resident-jit-root-handoff.md) |
 | **A3** | **Register-invisibility** — a live oop sits only in a CPU register at a young-GC safepoint, invisible to the stack-only scan (single thread) | `apps/spring-boot/buildSrc/runner/MinRegexProbe` | ✅ **FIXED on dev** (`32649b56`, precise maps default-on) | _(doc removed; resolved)_ |
 | **A4** | Multi-thread: live `ForkJoinTask`s reclaimed under **FJP worker threads** + a **lost-tag** interpreter local | `scratch/xworker/Fork6` (needs `CRATONVM_REAL_FORKJOINPOOL=1`) | 🟡 **OPEN but non-fatal here** — `Fork6` 26/26 ALL-OK on current dev (re-verified 2026-06-29; the older ~15% reclaim does not reproduce), but the cross-thread STW JIT-root gap is still *exercised* (`scan_active_jit_frames` WARN); genuine residual = a register-only oop at a non-call safepoint. Benign real-FJP `cas_long` retry noise still fires | [fork6-fjp-multithread-jit-root-reclamation.md](fork6-fjp-multithread-jit-root-reclamation.md) |
-| **A5** | **Object-binarytrees moving-GC corruption** — the compiled entry-point `main`'s JIT frame is invisible to `gc_quiescence` (invoked via `Vm::invoke` without a `JitEntryGuard`), so the **moving** young collector relocates its roots and can't rewrite the raw stack slots → stale all-zero receiver. (The earlier "register-only stale root in `bottomUpTree`" framing was wrong — `bottomUpTree` isn't even compiled at the crash.) | [`repros/gc-stress-bintrees-main-args/`](repros/gc-stress-bintrees-main-args/) (`VAAload`) | ✅ **FIXED** (dev `77c98761`) — detect an unregistered JIT frame on the native stack → non-moving sweep + full-stack mark. Residual: Windows-only (portable stack-bound is a follow-up) | [docs/internal/.../gc-stress-bintrees-main-args-unregistered-jit-frame-FIXED.md](../internal/app-jvm-bugs/gc-stress-bintrees-main-args-unregistered-jit-frame-FIXED.md) |
+| **A5** | **Object-binarytrees moving-GC corruption** — the compiled entry-point `main`'s JIT frame is invisible to `gc_quiescence` (invoked via `Vm::invoke` without a `JitEntryGuard`), so the **moving** young collector relocates its roots and can't rewrite the raw stack slots → stale all-zero receiver. (The earlier "register-only stale root in `bottomUpTree`" framing was wrong — `bottomUpTree` isn't even compiled at the crash.) | [`../internal/repros/gc-stress-bintrees-main-args/`](../internal/repros/gc-stress-bintrees-main-args/) (`VAAload`) | ✅ **FIXED** (dev `77c98761`) — detect an unregistered JIT frame on the native stack → non-moving sweep + full-stack mark. Repro archived under `docs/internal`. Residual: Windows-only (portable stack-bound is a follow-up) | [docs/internal/.../gc-stress-bintrees-main-args-unregistered-jit-frame-FIXED.md](../internal/app-jvm-bugs/gc-stress-bintrees-main-args-unregistered-jit-frame-FIXED.md) |
 
 > ## ✅ FIX (2026-06-17, dev `32649b56`): **precise JIT oop maps, default-on** — closes the register-invisibility root-scan gap (A3)
 > `CRATONVM_PRECISE_JIT_MAPS` is now **default-on** (opt out: `CRATONVM_NO_PRECISE_JIT_MAPS`).
@@ -272,7 +273,7 @@ The history below predates the fix.
 
 | # | Bug | Status | Doc |
 |---|---|---|---|
-| **C** | Deep JIT→JIT recursion overruns the **native** stack (ANTLR `closure()`); same-method recursive edges now route through guarded dispatch except static tail self-jumps, and first-call/upgrade native-shadow gates now allow bytecode identity overrides unless they invoke a native-shadowed target, but the full overflow path still needs stack-banging + a fault-recovery handler. | ⚪ **LATENT / PARTIALLY CONTAINED** (not a current blocker; 2026-07-01 recursive-edge routing + native-shadow gate narrowing landed) | [springrepos-extension-hang-jit-throughput-and-deep-recursion.md](springrepos-extension-hang-jit-throughput-and-deep-recursion.md) §6–7 |
+| **C** | Deep JIT→JIT recursion overruns the **native** stack (ANTLR `closure()`); same-method recursive edges and compile-time-discovered mutual direct-call cycles now route through guarded dispatch except static tail self-jumps, and first-call/upgrade native-shadow gates now allow bytecode identity overrides unless they invoke a native-shadowed target, but the full overflow path still needs stack-banging + a fault-recovery handler. | ⚪ **LATENT / PARTIALLY CONTAINED** (not a current blocker; 2026-07-01 recursive-edge + compile-cycle routing, plus native-shadow gate narrowing, landed) | [springrepos-extension-hang-jit-throughput-and-deep-recursion.md](springrepos-extension-hang-jit-throughput-and-deep-recursion.md) §6–7 |
 | **MT-STW** | `Thread.join` monitor-ownership **desync under concurrent GC** (JIT-off): `monitor_wait`/terminate-tail used a raw `ObjectRef` captured before blocking, then `arrive_and_wait` let the in-flight STW relocate+zero it → `ensure_inflated` on the stale address synthesised a fresh `owner=None` monitor → IMSE in the javac synchronized-exit loop → joiner livelock → STW wedge. ~1–3% on `scratch_churn/Churn.java`; the tail after the four barrier+expansion fixes (`68c6993e`, 0%→~97%). | ✅ **FIXED** (`74b195b4`) — remap the receiver through `arrive_and_wait`'s returned pointer map; Churn 0 hangs / ~480 runs | [../internal/mt-stw-join-monitor-desync.md](../internal/mt-stw-join-monitor-desync.md) |
 
 > Bug **B** (JUnit `@Timeout` "interceptor invoked twice") is **FIXED** and archived — it was
@@ -330,7 +331,9 @@ parse-NPE (#1), generics (#2), and the indy `MethodHandle.type()` layers
 The 3c/3d fix writeup is in
 [`docs/internal/spring-boot-groovy-indy-runtime-argcount-3c-FIXED.md`](../internal/spring-boot-groovy-indy-runtime-argcount-3c-FIXED.md).
 Also still relevant: **defect #2 (= family A3 above)** and **bug C** (the
-cold-path deep-recursion overflow).
+cold-path deep-recursion overflow). The Hibernate HQL census-H4 timeout
+(`function.json.JsonArrayUnnestTest`) is the same cold ANTLR prediction
+throughput bug and is now consolidated in that handoff's Section 5.
 
 ## Resolved standalone bugs (full writeups in `docs/internal/`)
 
@@ -363,7 +366,11 @@ Per-run bug reports from the (gitignored) `apps/hibernate-orm/cratonvm-bug-repor
 removed; the JTA `getInetAddress` per-class report was consolidated into the resolved JTA doc in
 [`docs/internal/`](../internal/).)
 - [hibernate-hang-clusters-summary.md](../internal/hibernate-hang-clusters-summary.md) — census overview (now in `docs/internal/`); **H1/H2/H3 resolved 2026-06-20**, **H4 root-caused** (its own open doc below).
-- [hql-antlr-parser-cold-prediction-throughput.md](hql-antlr-parser-cold-prediction-throughput.md) — 🔴 **OPEN** (census H4, root-caused 2026-06-20; one cold-path native-shadow gate narrowed 2026-07-01). `function.json.JsonArrayUnnestTest` "hang" is the **HQL/ANTLR parser**, not JSON: cold full-context prediction runs interpreted (~1000× HotSpot) because the ATN-simulation hot methods (`closure_`, `closureCheckingStopState`, `mergeArrays`, …) are declined by the single-pass JIT backend (instrumented via `CRATONVM_DBG_JITC`). Terminates (2-item select = 52s), warm re-parse = 0.65s; deferred JIT-backend-coverage cluster. Mitigation: run the suite in one shared JVM.
+- HQL/ANTLR parser census H4 (`function.json.JsonArrayUnnestTest`) is not a
+  separate open issue file anymore. It is consolidated into
+  [springrepos-extension-hang-jit-throughput-and-deep-recursion.md](springrepos-extension-hang-jit-throughput-and-deep-recursion.md)
+  Section 5 as a second reproducer for the same cold ANTLR prediction
+  throughput / JIT backend-coverage cluster.
 
 Also fixed on dev this run (no standalone doc — see commit): `Locale.toLanguageTag()` dropped all subtags for real Locales (`13e8c761`).
 

@@ -716,7 +716,8 @@ fn should_skip_jit_internal(
         //    simulation is a one-shot, branch-heavy interpreter loop, not a
         //    benchmarked hot path — exactly the BouncyCastle / ByteBuddy /
         //    Spring archetype banned above. Same root family as the
-        //    `hql-antlr-parser-cold-prediction-throughput` known issue.
+        //    Hibernate HQL reproducer in
+        //    `springrepos-extension-hang-jit-throughput-and-deep-recursion.md`.
         //
         // Lifted by `CRATONVM_JIT_ALLOW_PACKAGES=groovyjarjarantlr4/`.
         if class_name.starts_with("groovyjarjarantlr4/")

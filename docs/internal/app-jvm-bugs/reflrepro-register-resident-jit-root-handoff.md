@@ -207,7 +207,7 @@ list with a non-zero header. Committed: clear-on-swap `d8d85f62`; robust free-bl
 `f9138bf0` (validated bt16=14985902/bt18=68332206 golden).
 
 Repro (unchanged): `CRATONVM_DBG_GC_STRESS=65536 cvmregroots.exe --java-home <jdk25> -cp
-docs/known-issues/repros/A2-reflrepro ReflRepro 8000`. `javac` the class first.
+docs/internal/repros/A2-reflrepro ReflRepro 8000`. `javac` the class first.
 
 ---
 ## RE-DIAGNOSIS 2026-06-18 (worktree `CratonVM-shadowdbg`, branch `dbg/shadow-reload-probe` @ `c9b56f7d`; precise-maps default-on + shadow reload fix) — SUPERSEDED in part by 2026-06-22 above (the `=all` test was never run in this section)

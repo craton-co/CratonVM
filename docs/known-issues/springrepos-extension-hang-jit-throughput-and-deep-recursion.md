@@ -41,7 +41,7 @@ fix below).
 >
 > | # | Bug | Path | Status |
 > |---|-----|------|--------|
-> | 1 | **JIT miscompile in the ANTLR `PredictionContext` equality/hash cluster** → a null `PredictionContext` flows into interpreted `ATNConfigSet.optimizeConfigs` → `ATN.getCachedContext` **NPE** → Groovy `MultipleCompilationErrorsException: General error during parsing: NullPointerException` → 0/11 run. `--nojit` parses cleanly. **Bisected** (`CRATONVM_JIT_BISECT_SKIP` on a standalone `GroovyScriptProbe`) from ~105 compiled ANTLR methods down to **7**: `PredictionContext.{calculateHashCode,hashCode}`, `PredictionContext$IdentityEqualityComparator.hashCode`, `SingletonPredictionContext.{equals,isEmpty,size}`, `ObjectEqualityComparator.equals` (a wrong hash/equals corrupts ATN config-context dedup → null context). | **JIT only** | ✅ **FIXED** on branch `fix/springrepos-coldpath` (`978c783a`): ban `groovyjarjarantlr4/` from JIT (`vm/src/jit/skip_list.rs`), matching the BouncyCastle/ByteBuddy precedent. Verified: `GroovyScriptProbe` parses the script OK under default JIT (was NPE). Open follow-up: the exact single method / codegen archetype (for a surgical 7-method ban or a real codegen fix). NB a *partial* ANTLR ban exposes a separate conservative-root-scan-over-deep-interpreter-recursion throughput cliff (cf. [[hql-antlr-parser-cold-prediction-throughput]]). |
+> | 1 | **JIT miscompile in the ANTLR `PredictionContext` equality/hash cluster** → a null `PredictionContext` flows into interpreted `ATNConfigSet.optimizeConfigs` → `ATN.getCachedContext` **NPE** → Groovy `MultipleCompilationErrorsException: General error during parsing: NullPointerException` → 0/11 run. `--nojit` parses cleanly. **Bisected** (`CRATONVM_JIT_BISECT_SKIP` on a standalone `GroovyScriptProbe`) from ~105 compiled ANTLR methods down to **7**: `PredictionContext.{calculateHashCode,hashCode}`, `PredictionContext$IdentityEqualityComparator.hashCode`, `SingletonPredictionContext.{equals,isEmpty,size}`, `ObjectEqualityComparator.equals` (a wrong hash/equals corrupts ATN config-context dedup → null context). | **JIT only** | ✅ **FIXED** on branch `fix/springrepos-coldpath` (`978c783a`): ban `groovyjarjarantlr4/` from JIT (`vm/src/jit/skip_list.rs`), matching the BouncyCastle/ByteBuddy precedent. Verified: `GroovyScriptProbe` parses the script OK under default JIT (was NPE). Open follow-up: the exact single method / codegen archetype (for a surgical 7-method ban or a real codegen fix). NB a *partial* ANTLR ban exposes a separate conservative-root-scan-over-deep-interpreter-recursion throughput cliff; the Hibernate HQL reproducer is consolidated in §5 below. |
 > | 2 | **Type-variable USE resolved only against the immediate decl** → a method bound `<S extends T>` (Gradle `RepositoryHandler.withType`/`named`) fell back to a synthetic `TypeVariable` stub (right name, but not identity-equal to the class's real `T`, bound defaulted to `Object`) → ByteBuddy `TypeVariableSource.findExpectedVariable` throws `Cannot resolve T` → **all 11 Mockito mocks fail**. | both (JIT + `--nojit`) | ✅ **FIXED** on branch `fix/springrepos-coldpath` (`f7942b09`, `native-builtins/src/generics.rs`): walk the enclosing generic scope (method → declaring class → outer). Verified: probe reports bound `[T]` matching HotSpot; "Cannot resolve T" gone. General fix — repairs Mockito-on-generics VM-wide. |
 > | 3 | **Groovy invokedynamic / MethodHandle receiver mismatch** — after #2, dispatch reaches `vmplugin.v8.Selector.correctCoerce` and threw `GroovyBugError: argument array length and parameter array length should be the same`. **Root cause (found via a `java.lang.invoke` probe vs HotSpot):** CratonVM's `Lookup.unreflect`/`findVirtual` omitted the leading **receiver** from a virtual/special `MethodHandle.type()` (`int m(Object)` → `(Object)int` pcount 1 vs HotSpot `(Recv,Object)int` pcount 2), and `bindTo` didn't drop it. | both | ◐ **PARTIAL** (`fix/springrepos-coldpath` `bcbe2f23`): receiver now included in `type()` + dropped on `bindTo` (`native-builtins/src/lang_invoke.rs`), verified == HotSpot (probe + lambda/method-ref/concat smoke + 23/23 invoke tests). GroovyBugError is **gone**. **Layer 3b also fixed** (`894d718c`): CratonVM's `insertArguments`/`asCollector` set the adapter `type()` to the target's raw descriptor unchanged (lost arity); now they track the adapted MethodType (drop bound params / replace the trailing array param), verified == HotSpot via a guard-chain probe (`insertArguments` pc 2→1, `asCollector` pc=2). **Layer 3c FIXED** (`fix/springrepos-indy-3c` `5d36c432`, `native-builtins/src/lang_invoke.rs`): the `sameClasses` AIOOBE was `MethodHandles.guardWithTest` copying the target's **raw** descriptor (`mh_read_desc`), which omits the receiver for an unbound virtual target → the GUARD adapter's `type()` was one param short → `Selector.setGuards` sized the `SAME_CLASSES` collector below `classes.length`. Fix: chain off the EFFECTIVE type (`mh_type_descriptor`). **Layer 3d FIXED** (same commit): once 3c cleared, `fromCache`'s `invokeExact` underflowed because an Object-returning poly-invoke of a `void` target (`addRepositories`) returned `Ok(None)`; `auto_box_return` now maps `Ok(None)`→null for `L`/`[` returns. **Net: 0/11 (all crashed) → 3/11 (clean).** **Remaining (3e, OPEN):** the 8 non-empty cases fail "expected size N but was 0" — a Groovy indy call (`this.repositories.maven { … }`) on a **Mockito mock** records no interaction → see [[spring-boot-groovy-indy-mockito-mock-dispatch]]. Full detail: [[spring-boot-groovy-indy-runtime-argcount-3c-FIXED]]. |
 >
@@ -250,6 +250,42 @@ deeper recursive compiled paths still need robust native-stack handling (§6-§7
 dev already passes the test (root-snapshot), so this is a **pure throughput
 follow-up**, not a blocker.
 
+### Hibernate HQL reproducer (same cold ANTLR prediction bug)
+
+The Hibernate census H4 timeout (`function.json.JsonArrayUnnestTest`) is the same
+underlying throughput defect, surfaced through Hibernate's HQL parser instead of
+Groovy. `em.createQuery(hql)` with a multi-item select list spends tens of seconds
+in ANTLR cold full-context prediction on CratonVM while HotSpot finishes in
+milliseconds. The parse happens before semantic resolution, so a trivial
+`SessionFactory` plus an HQL string that references even non-existent entities is
+enough to reproduce.
+
+Measured on the 2026-06-20/2026-07-01 `dev` lineage:
+
+| HQL shape | CratonVM | HotSpot |
+|---|---:|---:|
+| `select e.id from Book e` (1 select item) | 12.7 s | ~ms |
+| `select e.id, e.name from Book e` (2 items) | 52-58 s | ~ms |
+| `select e.id, index(p), p.name from Book e ...` (3 items) | >600 s timeout | ~ms |
+
+This is not an infinite loop, GC pressure, or a broken ANTLR cache: the 2-item
+case completes, `-Xmx8g` is unchanged, and a warm parse of the same grammar shape
+drops from 55,836 ms to about 649 ms. `--nojit` is essentially identical to
+JIT-on for the cold parse (51.9 s vs 55.8 s), which confirms the hot
+`ParserATNSimulator.adaptivePredict -> closure/closureCheckingStopState/
+computeReachSet` path is still running interpreted.
+
+`CRATONVM_DBG_JITC` showed the relevant ATN-simulation methods crossing the
+invocation threshold but being declined by the single-pass backend:
+`ParserATNSimulator.closureCheckingStopState` (~3925 compile attempts),
+`ParserATNSimulator.closure_` (~3922), `ATNConfigSet.add` (~1311),
+`ParserATNSimulator.ruleTransition` (~1003), and
+`PredictionContext.mergeArrays` (~316). These are object- and exception-heavy
+methods (`closure_` includes `athrow`, repeated `checkcast`/`instanceof`, and
+`invokeinterface` sites), so this remains a backend-coverage project rather than
+a one-line VM fix. Running the Hibernate suite in one shared JVM is the current
+mitigation because it amortizes ANTLR DFA warmup across classes.
+
 ---
 
 ## 6. Cold-path fix ATTEMPT → uncovered a NATIVE STACK OVERFLOW (the real next bug)
@@ -347,9 +383,24 @@ hits cannot bypass `enter_jit_dispatch`.
 
 This is a general containment for same-method recursive edges and should prevent
 the known deep ANTLR-style recursion from overrunning the native stack once the
-cold-path leaf-compilation experiment is retried. It is not the full
-stack-banging / fault-recovery design above: mutually-recursive direct calls and
-the cold-path throughput experiment still need separate validation.
+cold-path leaf-compilation experiment is retried.
+
+### 2026-07-01 follow-up: compile-cycle direct-call routing
+
+The direct-call metadata path now also tracks the current per-thread JIT compile
+stack. If compiling `A` recursively compiles `B`, and `B` resolves an invoke back
+to any outer method on that stack, the whole cycle path is marked as requiring
+guarded dispatch for future direct-call attempts. Parent compilers consult that
+marker after callee compilation returns, so the original `A -> B` site does not
+bake a raw machine `CALL` once `B -> A` has exposed the cycle. The OSR
+`direct_calls2` path uses the same marker before emitting eager invokestatic
+direct calls. This closes the previously-open mutually-recursive direct-call gap
+for compile-time-discovered cycles; pinned by
+`recursive_compile_cycle_routes_parent_direct_call_through_dispatch`.
+
+This is still not the full stack-banging / fault-recovery design above, and the
+cold-path throughput experiment still needs separate validation before this doc
+can be archived.
 
 ---
 

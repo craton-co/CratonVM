@@ -27,7 +27,7 @@
 > is null"` at `ForkJoinWorkerThread$InnocuousForkJoinWorkerThread.<clinit>` →
 > `Thread.getThreadGroup` — i.e. during FJP **worker creation** (`createWorker` →
 > `newThread`), **0 task-reclamation signatures**. This is the
-> **concurrent-spawn `Thread.holder`-null bug** ([gc-concurrent-spawn-reclamation](repros/gc-concurrent-spawn-reclamation/),
+> **concurrent-spawn `Thread.holder`-null bug** ([gc-concurrent-spawn-reclamation](../internal/repros/gc-concurrent-spawn-reclamation/),
 > BUG-03's `Spawn.java`), which **masks** A4 under stress. It is a separate tracked
 > bug, not A4.
 >

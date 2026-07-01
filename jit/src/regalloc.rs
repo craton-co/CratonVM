@@ -233,17 +233,24 @@ pub(crate) fn bc_len(code: &[u8], pc: usize) -> usize {
 fn branch_target(code: &[u8], pc: usize) -> Option<usize> {
     match code[pc] {
         0x99..=0xa6 | 0xa7 | 0xc6 | 0xc7 => {
-            if pc + 2 >= code.len() {
-                return None;
-            }
             // JVM branch offsets are big-endian signed i16.
-            let offset = i16::from_be_bytes([code[pc + 1], code[pc + 2]]) as i32;
+            let offset = i16::from_be_bytes([*code.get(pc + 1)?, *code.get(pc + 2)?]) as i32;
             let target = pc as i32 + offset;
             // Validate the target is non-negative (valid bytecode offset)
             if target < 0 {
                 return None;
             }
             Some(target as usize)
+        }
+        0xc8 | 0xc9 => {
+            // goto_w / jsr_w use a signed 32-bit branch offset.
+            let offset = i32::from_be_bytes([
+                *code.get(pc + 1)?,
+                *code.get(pc + 2)?,
+                *code.get(pc + 3)?,
+                *code.get(pc + 4)?,
+            ]);
+            pc.checked_add_signed(offset as isize)
         }
         _ => None,
     }
@@ -254,6 +261,7 @@ fn is_unconditional(op: u8) -> bool {
     matches!(
         op,
         0xa7    // goto
+        | 0xc8  // goto_w
         | 0xaa  // tableswitch
         | 0xab  // lookupswitch
         | 0xac  // ireturn
@@ -494,8 +502,8 @@ fn local_access(code: &[u8], pc: usize) -> Option<(usize, bool, bool)> {
         0x26..=0x29 => Some(((code[pc] - 0x26) as usize, true, false)),
         // aload_0..aload_3
         0x2a..=0x2d => Some(((code[pc] - 0x2a) as usize, true, false)),
-        // iload, lload, fload, dload, aload (wide index)
-        0x15..=0x19 => Some((code[pc + 1] as usize, true, false)),
+        // iload, lload, fload, dload, aload (u8 index)
+        0x15..=0x19 => Some((*code.get(pc + 1)? as usize, true, false)),
 
         // istore_0..istore_3
         0x3b..=0x3e => Some(((code[pc] - 0x3b) as usize, false, true)),
@@ -507,11 +515,25 @@ fn local_access(code: &[u8], pc: usize) -> Option<(usize, bool, bool)> {
         0x47..=0x4a => Some(((code[pc] - 0x47) as usize, false, true)),
         // astore_0..astore_3
         0x4b..=0x4e => Some(((code[pc] - 0x4b) as usize, false, true)),
-        // istore, lstore, fstore, dstore, astore (wide index)
-        0x36..=0x3a => Some((code[pc + 1] as usize, false, true)),
+        // istore, lstore, fstore, dstore, astore (u8 index)
+        0x36..=0x3a => Some((*code.get(pc + 1)? as usize, false, true)),
 
         // iinc: both reads and writes the local
-        0x84 => Some((code[pc + 1] as usize, true, true)),
+        0x84 => Some((*code.get(pc + 1)? as usize, true, true)),
+
+        // wide: widened local index for load/store/ret or widened iinc.
+        // `ret` uses a return-address local, not a Java value local this
+        // allocator should color, and plain `ret` is ignored above too.
+        0xc4 => {
+            let modified = *code.get(pc + 1)?;
+            let idx = u16::from_be_bytes([*code.get(pc + 2)?, *code.get(pc + 3)?]) as usize;
+            match modified {
+                0x15..=0x19 => Some((idx, true, false)),
+                0x36..=0x3a => Some((idx, false, true)),
+                0x84 => Some((idx, true, true)),
+                _ => None,
+            }
+        }
 
         _ => None,
     }
@@ -847,18 +869,38 @@ fn find_float_locals(code: &[u8], code_len: usize, num_locals: usize) -> u64 {
                     float_mask |= 1u64 << idx;
                 }
             }
-            // fload, dload (wide)
+            // fload, dload (u8 index)
             0x17 | 0x18 => {
-                let idx = code[pc + 1] as usize;
+                let Some(&raw_idx) = code.get(pc + 1) else {
+                    pc += bc_len(code, pc);
+                    continue;
+                };
+                let idx = raw_idx as usize;
                 if idx < 64 {
                     float_mask |= 1u64 << idx;
                 }
             }
-            // fstore, dstore (wide)
+            // fstore, dstore (u8 index)
             0x38 | 0x39 => {
-                let idx = code[pc + 1] as usize;
+                let Some(&raw_idx) = code.get(pc + 1) else {
+                    pc += bc_len(code, pc);
+                    continue;
+                };
+                let idx = raw_idx as usize;
                 if idx < 64 {
                     float_mask |= 1u64 << idx;
+                }
+            }
+            // wide fload/dload/fstore/dstore: same float-category mark with
+            // a widened local index.
+            0xc4 => {
+                if matches!(code.get(pc + 1), Some(&0x17 | &0x18 | &0x38 | &0x39)) {
+                    if let (Some(&hi), Some(&lo)) = (code.get(pc + 2), code.get(pc + 3)) {
+                        let idx = u16::from_be_bytes([hi, lo]) as usize;
+                        if idx < 64 {
+                            float_mask |= 1u64 << idx;
+                        }
+                    }
                 }
             }
             _ => {}
@@ -1248,10 +1290,98 @@ mod tests {
     // `code[pc]` for these arms.
     #[test]
     fn bc_len_five_byte_ops() {
-        assert_eq!(bc_len(&[0xb9, 0x00, 0x10, 0x02, 0x00], 0), 5, "invokeinterface");
-        assert_eq!(bc_len(&[0xba, 0x00, 0x10, 0x00, 0x00], 0), 5, "invokedynamic");
+        assert_eq!(
+            bc_len(&[0xb9, 0x00, 0x10, 0x02, 0x00], 0),
+            5,
+            "invokeinterface"
+        );
+        assert_eq!(
+            bc_len(&[0xba, 0x00, 0x10, 0x00, 0x00], 0),
+            5,
+            "invokedynamic"
+        );
         assert_eq!(bc_len(&[0xc8, 0x00, 0x00, 0x00, 0x10], 0), 5, "goto_w");
         assert_eq!(bc_len(&[0xc9, 0x00, 0x00, 0x00, 0x10], 0), 5, "jsr_w");
+    }
+
+    #[test]
+    fn local_access_decodes_wide_locals() {
+        assert_eq!(
+            local_access(&[0xc4, 0x15, 0x00, 0x3f], 0),
+            Some((63, true, false)),
+            "wide iload"
+        );
+        assert_eq!(
+            local_access(&[0xc4, 0x39, 0x00, 0x3e], 0),
+            Some((62, false, true)),
+            "wide dstore"
+        );
+        assert_eq!(
+            local_access(&[0xc4, 0x84, 0x00, 0x05, 0x00, 0x01], 0),
+            Some((5, true, true)),
+            "wide iinc"
+        );
+        assert_eq!(
+            local_access(&[0xc4, 0xa9, 0x00, 0x05], 0),
+            None,
+            "wide ret is not a Java-value local access for register allocation"
+        );
+        assert_eq!(local_access(&[0x15], 0), None, "truncated iload");
+    }
+
+    #[test]
+    fn find_float_locals_decodes_wide_float_and_double_locals() {
+        #[rustfmt::skip]
+        let code = [
+            0xc4, 0x17, 0x00, 0x05, // wide fload 5
+            0xc4, 0x39, 0x00, 0x06, // wide dstore 6
+            0xaf,                   // dreturn
+        ];
+        let mask = find_float_locals(&code, code.len(), 7);
+        assert_ne!(
+            mask & (1u64 << 5),
+            0,
+            "wide fload local should be float-classified"
+        );
+        assert_ne!(
+            mask & (1u64 << 6),
+            0,
+            "wide dstore local should be float-classified"
+        );
+    }
+
+    #[test]
+    fn branch_target_decodes_wide_branches() {
+        let goto_w = [0xc8, 0x00, 0x00, 0x00, 0x05, 0xb1];
+        let jsr_w = [0xc9, 0x00, 0x00, 0x00, 0x05, 0xb1];
+        assert_eq!(branch_target(&goto_w, 0), Some(5));
+        assert_eq!(branch_target(&jsr_w, 0), Some(5));
+        assert!(
+            is_unconditional(0xc8),
+            "goto_w is terminal for CFG fallthrough"
+        );
+        assert!(
+            !is_unconditional(0xc9),
+            "jsr_w still has a fallthrough return-address path"
+        );
+    }
+
+    #[test]
+    fn build_cfg_goto_w_has_target_successor_without_fallthrough() {
+        // goto_w +6 -> return at pc 6. The byte at pc 5 is dead fallthrough.
+        let code = [0xc8, 0x00, 0x00, 0x00, 0x06, 0x03, 0xb1];
+        let blocks = build_cfg(&code, code.len());
+        let entry = blocks
+            .iter()
+            .find(|block| block.start_pc == 0)
+            .expect("entry block");
+        assert_eq!(
+            entry.successors.len(),
+            1,
+            "goto_w should not add fallthrough"
+        );
+        let succ = &blocks[entry.successors[0]];
+        assert_eq!(succ.start_pc, 6);
     }
 
     // CM-FASTMATH end-to-end regression: the exact bytecode shape of
