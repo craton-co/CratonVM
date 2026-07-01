@@ -191,6 +191,94 @@ mod tests {
         assert_eq!(layout.ref_offsets, vec![0, 24]);
     }
 
+    /// Regression: mixed reference + `double`/`long`/`float` fields.
+    ///
+    /// The compact layout stores a reference field as a bare 8-byte pointer but
+    /// keeps every primitive field (including `double`/`long`) as a 16-byte
+    /// tagged `Value` cell. A primitive's byte offset therefore shifts by only
+    /// **8** bytes per preceding reference field — NOT the uniform
+    /// `index * SLOT_SIZE` the non-compact layout assumes. Reading a `double`
+    /// with the non-compact assumption lands it on (or overlapping) a reference
+    /// slot and pushes a pointer where a `double` is expected — the
+    /// "expected double on stack, got ref(..)" class of failure this test
+    /// guards against (compact-ref SIGSEGV follow-up, `docs/feature-designs/
+    /// compact-ref-field-layout.md`).
+    #[test]
+    fn mixed_ref_double_long_float_offsets() {
+        use crate::heap_types::REF_FIELD_SIZE;
+
+        // Fields (declaration order): Object a; double x; Object b; double y;
+        //                             long z;   Object c; float f
+        // descriptors:                L        D         L        D
+        //                             J        L         F
+        // prefix-sum (ref=8, prim=16):
+        //   a  L  off 0  (ref, +8)  -> 8
+        //   x  D  off 8  (prim,+16) -> 24
+        //   b  L  off 24 (ref, +8)  -> 32
+        //   y  D  off 32 (prim,+16) -> 48
+        //   z  J  off 48 (prim,+16) -> 64
+        //   c  L  off 64 (ref, +8)  -> 72
+        //   f  F  off 72 (prim,+16) -> 88
+        let layout = CompactLayout {
+            field_offsets: vec![0, 8, 24, 32, 48, 64, 72],
+            is_ref: vec![true, false, true, false, false, true, false],
+            ref_offsets: vec![0, 24, 64],
+            body_size: 88,
+        };
+
+        // Cross-check the literal layout against the prefix-sum rule it encodes,
+        // so a change to REF_FIELD_SIZE / SLOT_SIZE (or a mis-sized field) is
+        // caught here rather than corrupting objects at runtime.
+        let is_ref = [true, false, true, false, false, true, false];
+        let mut expect_off = 0u32;
+        let mut expect_refs = Vec::new();
+        for (i, &r) in is_ref.iter().enumerate() {
+            assert_eq!(
+                layout.field_offset(i),
+                Some(expect_off),
+                "field {i} offset must follow the 8-byte-per-ref prefix sum",
+            );
+            assert_eq!(layout.field_is_ref(i), Some(r), "field {i} ref-ness");
+            if r {
+                expect_refs.push(expect_off);
+                expect_off += REF_FIELD_SIZE as u32;
+            } else {
+                expect_off += SLOT_SIZE as u32;
+            }
+        }
+        assert_eq!(layout.body_size, expect_off, "body size = sum of field sizes");
+        assert_eq!(layout.ref_offsets, expect_refs, "oop-map = reference offsets");
+        assert_eq!(layout.field_count(), 7);
+        assert_eq!(layout.field_offset(7), None, "out-of-range index");
+
+        // The crux of the bug: each `double` sits at its ref-shifted offset, and
+        // its 16-byte cell never overlaps a reference slot. If the double were
+        // read at the non-compact `index * SLOT_SIZE` offset it would land on a
+        // ref slot and decode a pointer as a double.
+        assert_eq!(layout.field_offset(1), Some(8)); // double x, one ref before
+        assert_ne!(8, 1 * SLOT_SIZE as u32, "non-compact assumption would use 16");
+        assert_eq!(layout.field_offset(3), Some(32)); // double y, two refs before
+        assert_ne!(32, 3 * SLOT_SIZE as u32, "non-compact assumption would use 48");
+
+        // No primitive field's [off, off+SLOT_SIZE) byte range may overlap any
+        // reference field's [off, off+REF_FIELD_SIZE) range — that overlap is
+        // exactly how a double read yields a ref's bytes.
+        for (i, &r) in is_ref.iter().enumerate() {
+            if r {
+                continue;
+            }
+            let p0 = layout.field_offset(i).unwrap();
+            let p1 = p0 + SLOT_SIZE as u32;
+            for &ro in &layout.ref_offsets {
+                let r1 = ro + REF_FIELD_SIZE as u32;
+                assert!(
+                    p1 <= ro || r1 <= p0,
+                    "primitive field {i} at [{p0},{p1}) overlaps ref slot [{ro},{r1})",
+                );
+            }
+        }
+    }
+
     #[test]
     fn registry_round_trip() {
         clear_class_layouts();
