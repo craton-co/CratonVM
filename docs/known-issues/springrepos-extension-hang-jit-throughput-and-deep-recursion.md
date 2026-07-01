@@ -221,49 +221,46 @@ Verified (no miscompile): bt18 = `68332206`; Mockito/ByteBuddy
 `InteractiveUpgradeResolverTests` 1/1; `DependencyVersionUpgradeTests` 63/63;
 `ArtifactVersionDependencyVersionTests` 20/20; `LibraryTests` 4/4.
 
-**⚠️ ByteBuddy caveat (for anyone extending this).** The interpreter's *own* compile
-path (`try_jit_upgrade_with_gate`) and the first-call path (~`interpreter.rs:2801`)
-**still carry the over-broad parent-walk** — left intact deliberately. It guards a
-real ByteBuddy miscompile: a compiled method whose body contains an inner
-`invokevirtual Object.equals` mis-dispatches it to constant `false`
-(`LazyProjection.equals` → "Failed to resolve super class … Object"). The **correct**
-generalisation (if you remove those walks to compile `hashCode`/`equals` overrides
-on the interpreter path too) is a `jit_method_calls_native_shadowed(declaring_id,
-code)` guard: compile an override **unless its bytecode internally invokes a method
-that resolves to a native** (that is the actual mis-dispatch trigger). A leaf like
-`PredictionContext.hashCode` (no inner invoke) compiles; `ATNConfig.hashCode` (calls
-the *override* `PredictionContext.hashCode`, not native) compiles; `LazyProjection.
-equals` (calls `Object.equals`) is still refused. **This was prototyped — see §6.**
+**2026-07-01 update — precise native-shadow guard landed for the interpreter
+paths.** The first-call path and `try_jit_upgrade_with_gate` no longer reject every
+bytecode override merely because an ancestor has a native identity method. They
+now use the intended `jit_method_calls_native_shadowed(declaring_id, code)` guard:
+compile an override **unless its bytecode internally invokes a method that resolves
+to a native**. A leaf like `PredictionContext.hashCode` (no inner invoke) can
+compile; `ATNConfig.hashCode` (calls the *override* `PredictionContext.hashCode`,
+not native) can compile; `LazyProjection.equals` (calls `Object.equals`) is still
+refused. This keeps the ByteBuddy safety case while removing the cold interpreter
+path's parent-walk over-refusal.
 
 ---
 
 ## 5. The cold path (residual throughput) — what it really is
 
 After fixes 2+3, the hot `hashCode` methods compile, yet a fresh interpreter
-leaf-frame profile still shows them interpreted. The watchdog samples **only
-interpreter frames**, and the reason they show is: the **first-time recursive
-simulation of each new grammar decision runs interpreted**. The interpreter *does*
-dispatch interpreted call-sites to already-compiled callees (the
-`CachedInvokeTarget::Bytecode` fast-path checks the JIT cache every call); the gap is
-that the interpreter's *own* compile path (`try_jit_upgrade_with_gate`) still has the
-over-broad native-shadow walk (§4 caveat), so the leaf methods don't compile *there*
-during the interpreted simulation (only via the rarer MIC path from already-JIT'd
-callers).
+leaf-frame profile still shows much of the ATN simulation interpreted. The
+watchdog samples **only interpreter frames**, and the reason they show is: the
+**first-time recursive simulation of each new grammar decision runs interpreted**.
+The interpreter *does* dispatch interpreted call-sites to already-compiled callees
+(the `CachedInvokeTarget::Bytecode` fast-path checks the JIT cache every call).
+The 2026-07-01 native-shadow narrowing removes one leaf-method blocker in the
+interpreter's own compile path, but the broad throughput bug remains: larger
+ATN-simulation bodies still exceed the single-pass backend's supported shape, and
+deeper recursive compiled paths still need robust native-stack handling (§6-§7).
 
 dev already passes the test (root-snapshot), so this is a **pure throughput
-follow-up**, not a blocker. The remaining lever is to let the ATN-sim leaf methods
-compile via the interpreter path (the §6 guard) — **but that uncovers the crash in
-§6.**
+follow-up**, not a blocker.
 
 ---
 
 ## 6. Cold-path fix ATTEMPT → uncovered a NATIVE STACK OVERFLOW (the real next bug)
 
-Applying the precise §4 inner-invoke guard to `try_jit_upgrade_with_gate` +
-`try_jit_compile_callee_slow` let the ATN-sim cluster compile via the interpreted
-simulation path. It **passed** bt18 (`68332206`) and ByteBuddy/Mockito 1/1 — **but
-the real parse SIGSEGV'd ~5.5 min in**, deep in `ParserATNSimulator.closure`
-recursion. **Reverted; NOT on dev.**
+The earlier broad cold-path experiment that applied the precise §4 inner-invoke
+guard and forced more ATN-sim compilation through the interpreted simulation path
+**passed** bt18 (`68332206`) and ByteBuddy/Mockito 1/1 — **but the real parse
+SIGSEGV'd ~5.5 min in**, deep in `ParserATNSimulator.closure` recursion. That
+broad experiment was reverted. The narrower 2026-07-01 change keeps the precise
+native-shadow guard for first-call/upgrade paths, but this full parse path still
+needs separate validation after the stack-overflow work.
 
 **The crash is a NATIVE STACK OVERFLOW, not a value-miscompile** (so NOT a codegen
 bisect). VEH dump signature:
@@ -273,7 +270,7 @@ bisect). VEH dump signature:
 - faulting frame spill slots literally spell **`"operand stack overflow"`**;
 - stack = `closure → closure → …` 110+ frames.
 
-**Mechanism:** the cold-path fix makes the ATN-sim **leaf** methods compile, so each
+**Mechanism:** the cold-path experiment makes the ATN-sim **leaf** methods compile, so each
 `closure()` level stays in JIT'd native code (native stack) instead of bailing to
 the interpreter (VM frame stack). The deep ANTLR `closure()` recursion then overruns
 the **native** stack, and the VM's overflow path (GC / shadow-stack scan or
