@@ -2090,6 +2090,16 @@ pub fn moving_young_enabled() -> bool {
     *G.get_or_init(|| std::env::var_os("CRATONVM_MOVING_YOUNG").is_some())
 }
 
+fn shadow2_diag_enabled(method_label: &str) -> bool {
+    if std::env::var_os("CRATONVM_DBG_SHADOW2").is_none() {
+        return false;
+    }
+    match std::env::var("CRATONVM_DBG_SHADOW2_FILTER") {
+        Ok(filter) if !filter.is_empty() => method_label.contains(&filter),
+        _ => true,
+    }
+}
+
 /// DBG (CRATONVM_DBG_SHADOW_RELOAD): emit a bad-path-only logging call in
 /// `emit_shadow_reload` that reports (thread, orig-savebase, reloaded value,
 /// actual-read-address) whenever a reload loads a non-pointer (`< 0x10000`).
@@ -6323,6 +6333,8 @@ pub const LOCAL_REGS: [u8; 5] = [R12, R13, R14, R15, RBX];
 
 /// JIT compiler state.
 struct Compiler {
+    /// Human-readable method key used only by env-gated diagnostics.
+    method_label: String,
     buf: ExecutableBuffer,
     /// Simulated operand stack — maps JVM stack positions to frame offsets.
     stack: Vec<StackSlot>,
@@ -7261,6 +7273,7 @@ mod deopt_snapshot_tests {
 impl Compiler {
     #[allow(clippy::too_many_arguments)]
     fn new(
+        method_label: String,
         buf: ExecutableBuffer,
         num_locals: usize,
         num_params: usize,
@@ -7487,6 +7500,7 @@ impl Compiler {
         let arith_scratch_base: i32 = ((arith_scratch_local as i32) + 1) * 8; // Cast: x86-64 immediate encoding
 
         Self {
+            method_label,
             buf,
             stack: Vec::with_capacity(max_stack),
             next_spill_offset: base_spill,
@@ -8509,15 +8523,26 @@ impl Compiler {
         }
         self.pending_shadow.clear();
         let homes = self.collect_live_oop_homes();
-        if !homes.is_empty() && std::env::var_os("CRATONVM_DBG_SHADOW2").is_some() {
+        if !homes.is_empty() && shadow2_diag_enabled(&self.method_label) {
             let lm = self
                 .local_oop_masks
                 .get(self.cur_bc_pc)
                 .copied()
                 .unwrap_or(0);
+            let reached = self
+                .local_oop_reached
+                .get(self.cur_bc_pc)
+                .copied()
+                .unwrap_or(false);
             eprintln!(
-                "[SHADOW2] push pc={} stack={:?} marks={:?} local_mask={:#x} homes={:?}",
-                self.cur_bc_pc, &self.stack, &self.stack_oop_marks, lm, homes
+                "[SHADOW2] method={} pc={} stack={:?} marks={:?} local_reached={} local_mask={:#x} homes={:?}",
+                self.method_label,
+                self.cur_bc_pc,
+                &self.stack,
+                &self.stack_oop_marks,
+                reached,
+                lm,
+                homes
             );
         }
         if homes.is_empty() {
@@ -24059,6 +24084,7 @@ pub fn compile_with_param_slots(
     let num_scalar_slots = sr_plan.total_slots;
 
     let mut compiler = Compiler::new(
+        method_key.to_string(),
         buf,
         max_locals,
         num_params,
