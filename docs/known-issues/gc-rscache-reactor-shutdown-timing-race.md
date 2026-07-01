@@ -1,6 +1,6 @@
 # GC: rs_cache-presence-triggered GC-STW-vs-reactor-shutdown timing race (reactor worker leak)
 
-**Status:** 🔴 **OPEN** (root cause); **reliable workaround validated** (`CRATONVM_ROOTSNAP_CACHE=0`).
+**Status:** 🟡 **FIX CANDIDATE** (root cause pinned 2026-07-01); **reliable workaround validated** (`CRATONVM_ROOTSNAP_CACHE=0`).
 Found/characterized 2026-06-20 (branch `fix/es-restclient-gc-safety`). Supersedes an earlier
 investigation pass (the former `reactor-worker-thread-leak-at-shutdown.md`, now removed — see git history).
 `--nojit` (moving young collector), GC-pressure-dependent.
@@ -26,7 +26,7 @@ worker.)
   ([gc-moving-interpreter-lost-tag-missed-root.md](gc-moving-interpreter-lost-tag-missed-root.md)) is
   INDEPENDENT: a leak occurred with **zero** corruption, and green runs occurred with corruption.
 
-## Root cause (as far as localized)
+## Root cause (pinned 2026-07-01)
 
 The leak is **GC-frequency-driven** and **rs_cache-PRESENCE-triggered**:
 
@@ -38,11 +38,44 @@ The leak is **GC-frequency-driven** and **rs_cache-PRESENCE-triggered**:
 
 So the rs_cache (the frozen-frame root-**snapshot** optimization in `update_root_snapshot`) is correct, but
 its mere presence makes per-snapshot work cheaper and thereby **shifts thread/GC timing** enough to expose a
-latent **GC-stop-the-world vs. reactor-shutdown coordination race** — a reactor worker that is spawned /
-parked / terminating in a narrow window around an STW pause during `restClient.close()` ends up neither
-making progress nor reaching `mark_dead`. Disabling the cache changes the interleaving so the window is not
-hit. The actual race (which thread state + which STW edge) is **not yet pinned**; it is Heisenbug-prone (any
-`eprintln` tracing changes the timing and hides it).
+latent **GC-stop-the-world vs. reactor-shutdown coordination race**.
+
+The pinned race is the thread-exit edge:
+
+- `request_stw` previously accepted a precomputed `alive_count` sampled outside the GC barrier transition
+  lock, then subtracted `threads_blocked` under the lock.
+- A terminating thread entered a GC-blocked region, could be marked dead, and only later decremented
+  `threads_blocked`.
+- A GC initiator in that window could observe `alive_count` without the terminating thread but still subtract
+  the terminating thread from `threads_blocked`, under-counting `expected` by one. That lets STW proceed
+  while a live mutator/reactor worker has not arrived.
+- The old thread-exit path also kept a raw `Thread` object address across the final blocked/mark-dead/notify
+  sequence; a moving GC in that window could remap the object and make the final `Thread.join()` wakeup use a
+  stale monitor-table lookup.
+
+Disabling the cache changes the interleaving so this window is not hit; it does not fix the underlying STW
+accounting race.
+
+## Fix candidate
+
+The 2026-07-01 fix candidate makes the transition atomic and removes the stale monitor lookup:
+
+- `GcBarrier::request_stw_counted` computes `alive_count` while holding the barrier transition lock.
+- `BlockedGuard::finish_after` and `mark_blocked_region_leave_after` run liveness changes while holding that
+  same transition lock and decrement `threads_blocked` before the state becomes observable to the next STW.
+- Java thread termination now acquires a stable inflated `Arc<Monitor>` for the `Thread` object before
+  `mark_dead`, then uses that handle for the final `notifyAll`/`exit` after liveness teardown.
+- Foreign-thread/AIO detach paths use the same atomic blocked-dead leave helper, so the fix is not limited to
+  `java.lang.Thread` teardown.
+
+Verification so far:
+
+- `cargo test -p cratonvm-vm blocked_dead_transition --lib`
+- `cargo test -p cratonvm-vm inflated_handle_survives_object_remap_for_thread_exit_notify --lib`
+- `cargo test -p cratonvm-vm foreign_ --lib`
+
+The ES `RestClientSingleHostIntegTests` soak has **not** been rerun yet, so this doc stays in
+`docs/known-issues` rather than moving to `docs/internal`.
 
 ## Reliable workaround (validated)
 
@@ -63,11 +96,8 @@ Keep it a suite-level env until the race itself is fixed.
 
 ## Next step
 
-Root-cause the STW-vs-reactor-shutdown race with timing-neutral instrumentation (deterministic scheduling,
-or recording thread states + STW barrier arrivals via lock-free ring buffers rather than `eprintln`).
-Focus on the thread-lifecycle edges during `restClient.close()`: a worker still in `alive_count` but not
-arriving at the STW barrier, vs. one that finished `run()` but hasn't reached `mark_dead`
-(`vm_exec.rs` thread-exit closure).
+Rerun the ES RestClient soak at `-Xmx1g` with the default rootsnap cache enabled. If the single-host suite is
+green across the prior failure envelope, move this doc to `docs/internal`.
 
 ## Related
 
