@@ -24556,7 +24556,11 @@ fn execute_invokevirtual_vtable_fast(
                 drop(cm);
                 return Ok(CachedCallResult::CacheMiss);
             }
-            if cached_native_shadow != Some(false) {
+            if cached_native_shadow != Some(false)
+                && shared
+                    .native_methods
+                    .might_have_method_descriptor(&method_name, &method_descriptor)
+            {
                 let direct_native_shadow = !receiver_redefined
                     && shared
                         .native_methods
@@ -24625,6 +24629,8 @@ fn execute_invokevirtual_vtable_fast(
                     }
                     cid = parent_id;
                 }
+            }
+            if cached_native_shadow != Some(false) {
                 remember_vtable_native_shadow(thread, native_shadow_cache_key, false);
             }
         }
@@ -25578,7 +25584,10 @@ fn populate_virtual_invoke_cache(
             // `Namespace.hashCode()` (a `List.of` parts list) became unstable,
             // so `NamespacedHierarchicalStore` lookups missed and every
             // @ParameterizedTest died in `getDeclarationContext` (NPE).
-            let native_override_below_declaring = {
+            let native_override_below_declaring = if shared
+                .native_methods
+                .might_have_method_descriptor(&method_name, &descriptor)
+            {
                 let mut cid = receiver_class_id;
                 let mut hit = false;
                 loop {
@@ -25600,6 +25609,8 @@ fn populate_virtual_invoke_cache(
                     }
                 }
                 hit
+            } else {
+                false
             };
             if let Some(kind) = (!native_override_below_declaring)
                 .then(|| {
@@ -25666,10 +25677,17 @@ fn populate_virtual_invoke_cache(
         } else {
             rcv_name
         };
-        if let Some(callback) = shared
+        let native_signature_may_exist = shared
             .native_methods
-            .find(&lookup_name, &method_name, &descriptor)
-        {
+            .might_have_method_descriptor(&method_name, &descriptor);
+        let direct_native_callback = if native_signature_may_exist {
+            shared
+                .native_methods
+                .find(&lookup_name, &method_name, &descriptor)
+        } else {
+            None
+        };
+        if let Some(callback) = direct_native_callback {
             // WP2.4-F1: gate bound to the receiver class (where dispatch
             // landed). A redefine of the receiver swaps the method body.
             let gate =
@@ -25718,7 +25736,7 @@ fn populate_virtual_invoke_cache(
         if receiver_has_own_bytecode {
             // Skip the ancestor-native promotion entirely — fall through
             // to the bytecode dispatch path below.
-        } else {
+        } else if native_signature_may_exist {
             let mut cid = receiver_class_id;
             while let Some(parent_id) = cm.get_class(cid).and_then(|c| c.superclass) {
                 if let Some(parent) = cm.get_class(parent_id) {
