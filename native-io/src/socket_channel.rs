@@ -175,6 +175,44 @@ fn tcp_remove(id: i32) {
     tcp_blocking_state().write().remove(&id);
 }
 
+const ACCEPT_CLOSE_POLL: Duration = Duration::from_millis(10);
+
+fn tcp_listener_still_registered(id: i32) -> bool {
+    matches!(tcp_registry().read().get(&id), Some(TcpHandle::Listener(_)))
+}
+
+fn accept_close_aware(
+    listener: &TcpListener,
+    id: i32,
+    blocking: bool,
+) -> std::io::Result<Option<(TcpStream, SocketAddr)>> {
+    listener.set_nonblocking(true)?;
+
+    if !blocking {
+        return match listener.accept() {
+            Ok(pair) => Ok(Some(pair)),
+            Err(e) if e.kind() == ErrorKind::WouldBlock => Ok(None),
+            Err(e) => Err(e),
+        };
+    }
+
+    loop {
+        match listener.accept() {
+            Ok(pair) => return Ok(Some(pair)),
+            Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                if !tcp_listener_still_registered(id) {
+                    return Err(std::io::Error::new(
+                        ErrorKind::Interrupted,
+                        "server channel closed",
+                    ));
+                }
+                std::thread::sleep(ACCEPT_CLOSE_POLL);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Errors
 // ---------------------------------------------------------------------------
@@ -1726,11 +1764,6 @@ fn ssc_accept(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
             _ => return Err(ioex("accept: id is not a listener")),
         }
     };
-    // A cloned socket does not reliably inherit the parent's blocking mode on
-    // Windows, so set it explicitly to match the channel. Without this a
-    // non-blocking accept() would block forever instead of returning null.
-    let _ = listener_clone.set_nonblocking(!blocking);
-
     let accepted = if let Some(stream) = preaccepted {
         let peer = stream
             .peer_addr()
@@ -1746,13 +1779,20 @@ fn ssc_accept(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
         // is especially likely when a single long-lived connection is reused
         // (e.g. HTTP/2), leaving the acceptor idle in accept() for the whole
         // exchange. `end_blocking_region` waits out any active pause before we
-        // resume touching the heap below.
-        ctx.begin_blocking_region();
-        let res = listener_clone.accept();
-        ctx.end_blocking_region();
+        // resume touching the heap below. The actual wait is a close-aware
+        // nonblocking poll loop: close() drops the registry entry, which wakes
+        // this path promptly even if the OS would leave our duplicate listener
+        // blocked in accept().
+        let res = if blocking {
+            ctx.begin_blocking_region();
+            let res = accept_close_aware(&listener_clone, id, true);
+            ctx.end_blocking_region();
+            res
+        } else {
+            accept_close_aware(&listener_clone, id, false)
+        };
         match res {
-            Ok((stream, peer)) => Some((stream, peer)),
-            Err(e) if e.kind() == ErrorKind::WouldBlock && !blocking => None,
+            Ok(pair) => pair,
             Err(e) => return Err(map_err("accept", e)),
         }
     };
@@ -1762,9 +1802,7 @@ fn ssc_accept(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     };
 
     // Inherit non-blocking flag of the parent channel.
-    if !blocking {
-        let _ = stream.set_nonblocking(true);
-    }
+    let _ = stream.set_nonblocking(!blocking);
 
     let local_port = stream.local_addr().map(|a| a.port() as i32).unwrap_or(0);
     let new_id = tcp_register(TcpHandle::Stream(stream));
@@ -2463,6 +2501,34 @@ mod tests {
                 "()Ljava/nio/channels/SocketChannel;"
             )
             .is_some());
+    }
+
+    #[test]
+    fn blocking_accept_observes_channel_close_promptly() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let id = tcp_register(TcpHandle::Listener(listener));
+        let accept_listener = {
+            let regs = tcp_registry().read();
+            match regs.get(&id) {
+                Some(TcpHandle::Listener(l)) => l.try_clone().unwrap(),
+                _ => panic!("listener must be registered"),
+            }
+        };
+
+        let waiter = std::thread::spawn(move || {
+            let start = std::time::Instant::now();
+            let err = accept_close_aware(&accept_listener, id, true).unwrap_err();
+            (err.kind(), start.elapsed())
+        });
+
+        std::thread::sleep(Duration::from_millis(50));
+        tcp_remove(id);
+        let (kind, elapsed) = waiter.join().unwrap();
+        assert_eq!(kind, ErrorKind::Interrupted);
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "close-aware accept should wake promptly, got {elapsed:?}"
+        );
     }
 
     #[test]

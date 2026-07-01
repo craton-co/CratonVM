@@ -1445,7 +1445,10 @@ fn is_known_miscompile(class_name: &str, method_name: &str) -> bool {
         // inner helpers walk the waiter list and re-link nodes via
         // putfield-on-fresh-allocation; without skipping them, the
         // signaling path corrupts the next-pointer and waiters are
-        // never woken (latch.await stays parked indefinitely).
+        // never woken (latch.await stays parked indefinitely). The
+        // ConditionObject wait variants are also skipped: when compiled,
+        // awaitNanos can park with the live ConditionNode only in a
+        // callee-saved register, outside the blocked-thread GC snapshot.
         | ("java/util/concurrent/locks/AbstractQueuedSynchronizer", "acquire")
         | ("java/util/concurrent/locks/AbstractQueuedSynchronizer", "release")
         | ("java/util/concurrent/locks/AbstractQueuedSynchronizer", "acquireShared")
@@ -1456,6 +1459,9 @@ fn is_known_miscompile(class_name: &str, method_name: &str) -> bool {
         | ("java/util/concurrent/locks/AbstractQueuedSynchronizer$ConditionObject", "signalAll")
         | ("java/util/concurrent/locks/AbstractQueuedSynchronizer$ConditionObject", "doSignal")
         | ("java/util/concurrent/locks/AbstractQueuedSynchronizer$ConditionObject", "await")
+        | ("java/util/concurrent/locks/AbstractQueuedSynchronizer$ConditionObject", "awaitNanos")
+        | ("java/util/concurrent/locks/AbstractQueuedSynchronizer$ConditionObject", "awaitUntil")
+        | ("java/util/concurrent/locks/AbstractQueuedSynchronizer$ConditionObject", "awaitUninterruptibly")
         | ("java/util/concurrent/locks/AbstractQueuedSynchronizer$ConditionObject", "newConditionNode")
         | ("java/util/concurrent/locks/AbstractQueuedSynchronizer$ConditionObject", "enableWait")
         // ReentrantLock guards LBQ — every offer/take takes the lock
@@ -2211,6 +2217,38 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn aqs_condition_wait_variants_skipped_under_conservative() {
+        // Tomcat DoHead shutdown parks ScheduledThreadPoolExecutor workers in
+        // ConditionObject.awaitNanos. Keep every wait variant interpreted under
+        // the normal policy so parked-frame GC snapshots do not miss a
+        // register-resident ConditionNode.
+        for method in ["await", "awaitNanos", "awaitUntil", "awaitUninterruptibly"] {
+            assert_eq!(
+                check(
+                    "java/util/concurrent/locks/AbstractQueuedSynchronizer$ConditionObject",
+                    method,
+                    false,
+                    true,
+                    SkipPolicy::Conservative,
+                ),
+                Some(SkipReason::JavaUtilCollection),
+                "AQS ConditionObject.{method} must be JIT-skipped under Conservative"
+            );
+            assert_eq!(
+                check(
+                    "java/util/concurrent/locks/AbstractQueuedSynchronizer$ConditionObject",
+                    method,
+                    false,
+                    true,
+                    SkipPolicy::Aggressive,
+                ),
+                None,
+                "Aggressive policy still deliberately lifts targeted java/util bans"
+            );
+        }
     }
 
     #[test]

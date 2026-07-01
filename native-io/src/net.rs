@@ -559,6 +559,37 @@ fn register_handle(h: NetSocketHandle) -> i32 {
     id
 }
 
+const NET_ACCEPT_CLOSE_POLL: Duration = Duration::from_millis(10);
+
+fn net_listener_still_registered(fd: i32) -> bool {
+    matches!(
+        net_sockets().read().get(&fd),
+        Some(NetSocketHandle::Listener(_))
+    )
+}
+
+fn net_accept_close_aware(
+    listener: &TcpListener,
+    fd: i32,
+) -> std::io::Result<(TcpStream, SocketAddr)> {
+    listener.set_nonblocking(true)?;
+    loop {
+        match listener.accept() {
+            Ok(pair) => return Ok(pair),
+            Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                if !net_listener_still_registered(fd) {
+                    return Err(std::io::Error::new(
+                        ErrorKind::Interrupted,
+                        "server socket closed",
+                    ));
+                }
+                std::thread::sleep(NET_ACCEPT_CLOSE_POLL);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 /// Convert a `std::io::Error` into the closest matching JDK IOException subtype.
 /// Because `RuntimeError` only has a generic `IOException` variant we encode the
 /// Java class name in the message prefix — the same convention used by
@@ -867,11 +898,15 @@ fn net_accept(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
         // stop-the-world GC requested while this thread is parked in accept()
         // does not deadlock `wait_for_all` (the acceptor reaches no interpreter
         // safepoint). See the matching comment in socket_channel::ssc_accept.
+        // The loop is close-aware: close(fd) marks the registry entry Closed,
+        // which wakes us promptly even though this Arc keeps the OS listener
+        // alive until accept returns.
         ctx.begin_blocking_region();
-        let res = listener.accept();
+        let res = net_accept_close_aware(&listener, fd);
         ctx.end_blocking_region();
         res.map_err(|e| net_err("accept", e))?
     };
+    let _ = stream.set_nonblocking(false);
 
     let new_fd = register_handle(NetSocketHandle::Stream(Arc::new(Mutex::new(stream))));
     dbgnet!("accept fd={fd:#x} -> newfd={new_fd:#x} peer={peer}");
@@ -2051,6 +2086,30 @@ mod tests {
         assert_eq!(_test_peek_kind(fd), "closed");
         remove_fd(fd);
         assert_eq!(_test_peek_kind(fd), "missing");
+    }
+
+    #[test]
+    fn t19_5_accept_observes_close_promptly() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let handle = Arc::new(Mutex::new(listener));
+        let fd = register_handle(NetSocketHandle::Listener(Arc::clone(&handle)));
+
+        let waiter = thread::spawn(move || {
+            let listener = handle.lock();
+            let start = std::time::Instant::now();
+            let err = net_accept_close_aware(&listener, fd).unwrap_err();
+            (err.kind(), start.elapsed())
+        });
+
+        thread::sleep(Duration::from_millis(50));
+        net_sockets().write().insert(fd, NetSocketHandle::Closed);
+        let (kind, elapsed) = waiter.join().unwrap();
+        assert_eq!(kind, ErrorKind::Interrupted);
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "close-aware Net.accept should wake promptly, got {elapsed:?}"
+        );
+        remove_fd(fd);
     }
 
     #[test]
