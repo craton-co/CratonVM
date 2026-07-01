@@ -678,7 +678,9 @@ fn maybe_gc(shared: &SharedVm, thread: &mut JvmThread) {
             run_finalizers(shared, thread);
         } else {
             // Multi-threaded path: coordinate via GC barrier
-            if shared.gc_barrier.request_stw(thread.thread_id, alive_count) {
+            if shared.gc_barrier.request_stw_counted(thread.thread_id, || {
+                u32::try_from(shared.thread_registry.alive_count()).unwrap_or(u32::MAX)
+            }) {
                 // We are the GC initiator. BUG-03 — forcibly stop in-JIT
                 // peers and conservatively scan them before waiting for the
                 // cooperative mutators.
@@ -790,7 +792,9 @@ fn maybe_gc_forced(shared: &SharedVm, thread: &mut JvmThread) {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         note_gc_productivity(shared, before_live);
     } else {
-        if shared.gc_barrier.request_stw(thread.thread_id, alive_count) {
+        if shared.gc_barrier.request_stw_counted(thread.thread_id, || {
+            u32::try_from(shared.thread_registry.alive_count()).unwrap_or(u32::MAX)
+        }) {
             // BUG-03 — forcibly stop + conservatively scan in-JIT peers.
             let mut xt_roots: Vec<ObjectRef> = Vec::new();
             let taken = stw_take_over_and_wait(shared, &mut xt_roots);
@@ -942,7 +946,9 @@ pub fn force_gc_from_native(shared: &SharedVm, thread: &mut JvmThread) {
             shared.finalizer_thread.enqueue(*new_addr);
         }
     } else {
-        if shared.gc_barrier.request_stw(thread.thread_id, alive_count) {
+        if shared.gc_barrier.request_stw_counted(thread.thread_id, || {
+            u32::try_from(shared.thread_registry.alive_count()).unwrap_or(u32::MAX)
+        }) {
             // BUG-03 — forcibly stop + conservatively scan in-JIT peers.
             let mut xt_roots: Vec<ObjectRef> = Vec::new();
             let taken = stw_take_over_and_wait(shared, &mut xt_roots);
@@ -2439,17 +2445,16 @@ fn maybe_concurrent_gc(shared: &SharedVm, thread: &mut JvmThread) {
         return;
     }
 
-    // Truncation-checked: alive_count (usize) to u32; thread count realistically bounded
-    let alive_count = u32::try_from(shared.thread_registry.alive_count()).unwrap_or(u32::MAX);
     let (old_gen_base, old_gen_size) = shared.heap.old_gen_info();
 
     // Create a temporary concurrent marker for this cycle
     let marker = cratonvm_gc::ConcurrentMarker::new(old_gen_base, old_gen_size);
 
     // Phase 1: Initial Mark — brief STW pause
-    let initial_mark_done = shared
-        .gc_barrier
-        .brief_stw(thread.thread_id, alive_count, || {
+    let initial_mark_done = shared.gc_barrier.brief_stw_counted(
+        thread.thread_id,
+        || u32::try_from(shared.thread_registry.alive_count()).unwrap_or(u32::MAX),
+        || {
             // Collect root pointers for old-gen marking
             let roots = collect_roots(shared, thread);
             let snapshot_roots = shared.thread_registry.collect_all_root_snapshots();
@@ -2461,7 +2466,8 @@ fn maybe_concurrent_gc(shared: &SharedVm, thread: &mut JvmThread) {
             if let Some(guard) = shared.heap.old_gen_lock() {
                 marker.initial_mark(&root_ptrs, &*guard);
             }
-        });
+        },
+    );
 
     if !initial_mark_done {
         return; // Another STW was in progress
@@ -2473,10 +2479,9 @@ fn maybe_concurrent_gc(shared: &SharedVm, thread: &mut JvmThread) {
     }
 
     // Phase 3: Remark — brief STW pause
-    shared.gc_barrier.brief_stw(
+    shared.gc_barrier.brief_stw_counted(
         thread.thread_id,
-        // Truncation-checked: alive_count (usize) to u32; thread count realistically bounded
-        u32::try_from(shared.thread_registry.alive_count()).unwrap_or(u32::MAX),
+        || u32::try_from(shared.thread_registry.alive_count()).unwrap_or(u32::MAX),
         || {
             // Round-5 fix (CRIT — UAF): drain the initiator's per-thread
             // SATB buffer before remark drains the global queue. Other
@@ -2515,32 +2520,33 @@ fn maybe_concurrent_gc(shared: &SharedVm, thread: &mut JvmThread) {
 /// 3. Remark (brief STW) — drain SATB buffers, re-mark roots
 /// 4. Cleanup — compute per-region liveness, free empty regions
 fn g1_concurrent_mark_cycle(shared: &SharedVm, thread: &mut JvmThread) {
-    // Truncation-checked: alive_count (usize) to u32; thread count realistically bounded
-    let alive_count = u32::try_from(shared.thread_registry.alive_count()).unwrap_or(u32::MAX);
-
     // Phase 1: Initial Mark — brief STW pause
     // Activates SATB write barrier and marks root-reachable objects
     let initial_mark_done = shared
         .gc_barrier
-        .brief_stw(thread.thread_id, alive_count, || {
-            // Round-5 fix (CRIT — UAF): drain the initiator's per-thread
-            // SATB buffer on the way into initial-mark. Other mutators
-            // already flushed on their `safepoint_check` arrival; the
-            // initiator hasn't, and any buffered overwrites from before
-            // SATB activation must reach the global queue before the
-            // marker starts consuming it.
-            shared.heap.flush_thread_satb();
-            shared.heap.g1_start_concurrent_mark();
-            // Mark roots into the G1 mark bitmap
-            let roots = collect_roots(shared, thread);
-            let snapshot_roots = shared.thread_registry.collect_all_root_snapshots();
-            let all_roots: Vec<cratonvm_types::ObjectRef> = roots
-                .into_iter()
-                .chain(snapshot_roots.into_iter())
-                .collect();
-            shared.heap.g1_mark_roots(&all_roots);
-            tracing::debug!("[G1] Initial mark: {} roots marked", all_roots.len());
-        });
+        .brief_stw_counted(
+            thread.thread_id,
+            || u32::try_from(shared.thread_registry.alive_count()).unwrap_or(u32::MAX),
+            || {
+                // Round-5 fix (CRIT — UAF): drain the initiator's per-thread
+                // SATB buffer on the way into initial-mark. Other mutators
+                // already flushed on their `safepoint_check` arrival; the
+                // initiator hasn't, and any buffered overwrites from before
+                // SATB activation must reach the global queue before the
+                // marker starts consuming it.
+                shared.heap.flush_thread_satb();
+                shared.heap.g1_start_concurrent_mark();
+                // Mark roots into the G1 mark bitmap
+                let roots = collect_roots(shared, thread);
+                let snapshot_roots = shared.thread_registry.collect_all_root_snapshots();
+                let all_roots: Vec<cratonvm_types::ObjectRef> = roots
+                    .into_iter()
+                    .chain(snapshot_roots.into_iter())
+                    .collect();
+                shared.heap.g1_mark_roots(&all_roots);
+                tracing::debug!("[G1] Initial mark: {} roots marked", all_roots.len());
+            },
+        );
 
     if !initial_mark_done {
         return; // Another STW in progress

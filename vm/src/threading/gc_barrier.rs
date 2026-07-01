@@ -91,6 +91,20 @@ impl GcBarrier {
     /// `alive_count` is the total number of alive threads (including the initiator).
     /// Returns `true` if the request was accepted, `false` if another STW is in progress.
     pub fn request_stw(&self, initiator: ThreadId, alive_count: u32) -> bool {
+        self.request_stw_counted(initiator, || alive_count)
+    }
+
+    /// Request a stop-the-world pause, computing `alive_count` while the
+    /// barrier transition lock is held.
+    ///
+    /// This is the production entry point for VM GC initiators. It serializes
+    /// the alive-thread snapshot with blocked-region transitions such as thread
+    /// termination, avoiding mixed observations like "thread already dead" plus
+    /// "same thread still counted blocked".
+    pub fn request_stw_counted<F>(&self, initiator: ThreadId, alive_count: F) -> bool
+    where
+        F: FnOnce() -> u32,
+    {
         let mut inner = self.inner.lock();
         if self.stw_requested.load(Ordering::Acquire) {
             return false;
@@ -117,6 +131,7 @@ impl GcBarrier {
         //    arrive at the barrier *before* it parks, so the initiator
         //    is not left waiting for a thread that counted in `expected`
         //    and then vanished into a block.
+        let alive_count = alive_count();
         let blocked = self.threads_blocked.load(Ordering::Acquire);
         let blocked_u32 = u32::try_from(blocked).unwrap_or(u32::MAX);
         inner.expected = alive_count.saturating_sub(1).saturating_sub(blocked_u32);
@@ -196,6 +211,19 @@ impl GcBarrier {
     /// LATER pause counts us in `expected` and we arrive exactly once via
     /// `check_post_block_gc`.
     pub fn mark_blocked_region_leave(&self) {
+        self.mark_blocked_region_leave_after(|| {});
+    }
+
+    /// End a region opened by `mark_blocked_region_enter` after running `f`
+    /// while holding the barrier transition lock.
+    ///
+    /// Use this when leaving the blocked population is coupled to another
+    /// scheduler-visible state change, such as marking a thread dead. The two
+    /// changes then serialize as one observation against `request_stw_counted`.
+    pub fn mark_blocked_region_leave_after<F>(&self, f: F)
+    where
+        F: FnOnce(),
+    {
         let mut inner = self.inner.lock();
         Self::wait_out_pause_locked(
             &self.stw_requested,
@@ -203,7 +231,18 @@ impl GcBarrier {
             &self.gc_complete,
             &mut inner,
         );
-        self.threads_blocked.fetch_sub(1, Ordering::AcqRel);
+
+        struct LeaveOnDrop<'a>(&'a GcBarrier);
+
+        impl Drop for LeaveOnDrop<'_> {
+            fn drop(&mut self) {
+                self.0.threads_blocked.fetch_sub(1, Ordering::AcqRel);
+            }
+        }
+
+        let leave = LeaveOnDrop(self);
+        f();
+        drop(leave);
     }
 
     /// Wait out the CURRENTLY-active stop-the-world pause (if any), keyed on the
@@ -398,7 +437,17 @@ impl GcBarrier {
     where
         F: FnOnce(),
     {
-        if !self.request_stw(initiator, alive_count) {
+        self.brief_stw_counted(initiator, || alive_count, work)
+    }
+
+    /// [`brief_stw`] variant that computes the alive-thread count under the
+    /// barrier transition lock.
+    pub fn brief_stw_counted<C, F>(&self, initiator: ThreadId, alive_count: C, work: F) -> bool
+    where
+        C: FnOnce() -> u32,
+        F: FnOnce(),
+    {
+        if !self.request_stw_counted(initiator, alive_count) {
             return false;
         }
         self.wait_for_all();
@@ -427,6 +476,24 @@ pub struct BlockedGuard<'a> {
     /// thread entered the blocked state. The caller should arrive at the
     /// barrier before parking — see `GcBarrier::enter_blocked`.
     pub pre_stw: bool,
+}
+
+impl<'a> BlockedGuard<'a> {
+    /// Finish this blocked region after running `f` while holding the same
+    /// barrier transition lock used by `request_stw_counted`.
+    ///
+    /// This is for transitions that must be observed atomically with leaving
+    /// the blocked population. Thread termination uses it to flip
+    /// `alive=false` and decrement `threads_blocked` as one state change; a GC
+    /// initiator can no longer see a dead thread still included in the blocked
+    /// count and under-estimate `expected`.
+    pub fn finish_after<F>(self, f: F)
+    where
+        F: FnOnce(),
+    {
+        let this = std::mem::ManuallyDrop::new(self);
+        this.barrier.mark_blocked_region_leave_after(f);
+    }
 }
 
 impl Drop for BlockedGuard<'_> {
@@ -598,5 +665,47 @@ mod tests {
         barrier.complete_gc(HashMap::new());
         let _ = h.join();
         assert_eq!(barrier.gc_generation.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn blocked_dead_transition_is_observed_atomically() {
+        let barrier = GcBarrier::new();
+        let guard = barrier.enter_blocked();
+        let mut alive = 3u32; // initiator + live mutator + terminating blocked thread
+
+        guard.finish_after(|| {
+            alive = 2; // the terminating thread is now dead
+        });
+
+        assert!(barrier.request_stw_counted(ThreadId(0), || alive));
+        {
+            let inner = barrier.inner.lock();
+            assert_eq!(
+                inner.expected, 1,
+                "dead blocked thread must not be subtracted from the live mutator quota",
+            );
+        }
+        barrier.complete_gc(HashMap::new());
+    }
+
+    #[test]
+    fn manual_blocked_dead_transition_is_observed_atomically() {
+        let barrier = GcBarrier::new();
+        let _pre_stw = barrier.mark_blocked_region_enter();
+        let mut alive = 3u32; // initiator + live mutator + terminating blocked thread
+
+        barrier.mark_blocked_region_leave_after(|| {
+            alive = 2; // the terminating blocked thread is now dead
+        });
+
+        assert!(barrier.request_stw_counted(ThreadId(0), || alive));
+        {
+            let inner = barrier.inner.lock();
+            assert_eq!(
+                inner.expected, 1,
+                "manual dead blocked thread must not be subtracted from the live mutator quota",
+            );
+        }
+        barrier.complete_gc(HashMap::new());
     }
 }
