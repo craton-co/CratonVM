@@ -960,6 +960,24 @@ pub fn new_hashmap(reg: &NativeMethodRegistry, ctx: &mut MockCtx) -> ObjectRef {
     hm
 }
 
+/// Allocate a fresh empty `java/util/concurrent/ConcurrentHashMap`.
+pub fn new_concurrent_hashmap(reg: &NativeMethodRegistry, ctx: &mut MockCtx) -> ObjectRef {
+    let cid = ctx
+        .ensure_class_initialized("java/util/concurrent/ConcurrentHashMap")
+        .unwrap();
+    let chm = ctx.alloc_object(cid, 4);
+    call(
+        reg,
+        ctx,
+        "java/util/concurrent/ConcurrentHashMap",
+        "<init>",
+        "()V",
+        &[Value::Object(Some(chm))],
+    )
+    .unwrap();
+    chm
+}
+
 /// Allocate a fresh `java/util/LinkedHashMap`. `access_order = true` builds
 /// it via the `(IFZ)V` ctor with capacity 16, load factor 0.75.
 pub fn new_linked_hashmap(

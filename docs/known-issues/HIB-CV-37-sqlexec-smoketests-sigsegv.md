@@ -80,8 +80,10 @@ pin/re-read pattern to `LinkedHashMap.forEach`, `ArrayDeque.forEach`, `TreeMap.f
 surface. A later same-day sweep also covered the HashMap functional helpers (`computeIfAbsent`,
 `compute`, `computeIfPresent`, `merge`, `replaceAll`) plus TreeMap `computeIfAbsent` / `merge`; the
 ConcurrentHashMap `compute`, `merge`, and `replaceAll` wrappers flow through those HashMap helpers after
-segment selection. The full `SmokeTests.testQueryConcurrency` repro has not yet been re-run, so this doc
-stays in `docs/known-issues`.
+segment selection. Another follow-up covered `ConcurrentHashMap` bulk callbacks (`forEachEntry`,
+`forEachKey`, `forEachValue`, `search`) with mock moving-GC regressions for `forEachKey` and `search`.
+The full `SmokeTests.testQueryConcurrency` repro has not yet been re-run, so this doc stays in
+`docs/known-issues`.
 
 ### #2 DynamicBatchFetchTest — confirmed separate, non-crash, single-threaded
 `ExecutionException: JDBC parameter value not bound` from `AbstractJdbcParameter.bindParameterValue`

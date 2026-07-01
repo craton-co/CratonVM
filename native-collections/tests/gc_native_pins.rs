@@ -6,8 +6,8 @@
 mod common;
 
 use common::{
-    boxed_int, build_registry, call, new_arraylist, new_hashmap, new_linked_hashmap, new_treemap,
-    MockCtx,
+    boxed_int, build_registry, call, new_arraylist, new_concurrent_hashmap, new_hashmap,
+    new_linked_hashmap, new_treemap, MockCtx,
 };
 use cratonvm_native_api::NativeContext;
 use cratonvm_types::Value;
@@ -15,6 +15,7 @@ use cratonvm_types::Value;
 const STREAM: &str = "java/util/stream/Stream";
 const AL: &str = "java/util/ArrayList";
 const HM: &str = "java/util/HashMap";
+const CHM: &str = "java/util/concurrent/ConcurrentHashMap";
 const LHM: &str = "java/util/LinkedHashMap";
 const TM: &str = "java/util/TreeMap";
 
@@ -265,6 +266,115 @@ fn hashmap_replace_all_reads_forwarded_function_and_entries() {
     );
     assert_ne!(
         log[1].3[1], v2,
+        "second value must be re-read from its native pin after callback GC"
+    );
+}
+
+#[test]
+fn concurrent_hashmap_for_each_key_reads_forwarded_action_and_keys() {
+    let reg = build_registry();
+    let mut ctx = MockCtx::new();
+    let chm = new_concurrent_hashmap(&reg, &mut ctx);
+    let k1 = boxed_int(&mut ctx, 1);
+    let v1 = object_value(&mut ctx, 801);
+    let k2 = boxed_int(&mut ctx, 2);
+    let v2 = object_value(&mut ctx, 802);
+    let action = ctx.alloc_object_simple(803);
+
+    for (k, v) in [(k1, v1), (k2, v2)] {
+        call(
+            &reg,
+            &mut ctx,
+            CHM,
+            "put",
+            "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+            &[Value::Object(Some(chm)), k, v],
+        )
+        .unwrap();
+    }
+
+    ctx.set_relocate_pins_on_invoke(true);
+    call(
+        &reg,
+        &mut ctx,
+        CHM,
+        "forEachKey",
+        "(JLjava/util/function/Consumer;)V",
+        &[
+            Value::Object(Some(chm)),
+            Value::Long(1),
+            Value::Object(Some(action)),
+        ],
+    )
+    .unwrap();
+
+    let log = ctx.invoke_virtual_log();
+    assert_eq!(log.len(), 2, "ConcurrentHashMap.forEachKey should visit two keys");
+    assert_eq!(log[0].0, action.as_ptr() as usize);
+    assert_ne!(
+        log[1].0,
+        action.as_ptr() as usize,
+        "Consumer must be re-read from its native pin after callback GC"
+    );
+    assert!(
+        log[1].3[0] != k1 && log[1].3[0] != k2,
+        "second key must be re-read from its native pin after callback GC"
+    );
+}
+
+#[test]
+fn concurrent_hashmap_search_reads_forwarded_function_and_entries() {
+    let reg = build_registry();
+    let mut ctx = MockCtx::new();
+    let chm = new_concurrent_hashmap(&reg, &mut ctx);
+    let k1 = boxed_int(&mut ctx, 1);
+    let v1 = object_value(&mut ctx, 901);
+    let k2 = boxed_int(&mut ctx, 2);
+    let v2 = object_value(&mut ctx, 902);
+    let function = ctx.alloc_object_simple(903);
+
+    for (k, v) in [(k1, v1), (k2, v2)] {
+        call(
+            &reg,
+            &mut ctx,
+            CHM,
+            "put",
+            "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+            &[Value::Object(Some(chm)), k, v],
+        )
+        .unwrap();
+    }
+
+    ctx.set_relocate_pins_on_invoke(true);
+    let result = call(
+        &reg,
+        &mut ctx,
+        CHM,
+        "search",
+        "(JLjava/util/function/BiFunction;)Ljava/lang/Object;",
+        &[
+            Value::Object(Some(chm)),
+            Value::Long(1),
+            Value::Object(Some(function)),
+        ],
+    )
+    .unwrap();
+
+    assert_eq!(result, Some(Value::Object(None)));
+    let log = ctx.invoke_virtual_log();
+    assert_eq!(log.len(), 2, "ConcurrentHashMap.search should visit two entries");
+    assert_eq!(log[0].0, function.as_ptr() as usize);
+    assert_ne!(
+        log[1].0,
+        function.as_ptr() as usize,
+        "BiFunction must be re-read from its native pin after callback GC"
+    );
+    assert!(
+        log[1].3[0] != k1 && log[1].3[0] != k2,
+        "second key must be re-read from its native pin after callback GC"
+    );
+    assert!(
+        log[1].3[1] != v1 && log[1].3[1] != v2,
         "second value must be re-read from its native pin after callback GC"
     );
 }
