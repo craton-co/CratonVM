@@ -182,17 +182,27 @@ fixes on top of `f658fe12`'s `inherit_lookup_loader` peek:
 
 Sample (`lazycluster.txt`, gate-on): 7/9 PASS incl. `OnlyLazyBasicUpdateTest`
 20/20, `EagerAndLazyBasicUpdateTest` 40/40, `LazyGroup*`, `LazyBasic*`.
-**Residual (new 4th surface):** `lazy.proxy.FetchGraphTest` /
-`SpecializedEntity` — `Lookup.defineClass ... already defined by
-user-defined(4) loader`. Now that the ByteBuddy optimizer bridge
-(`<Entity>$HibernateAccessOptimizerBridge…` / `$HibernateInstantiator`)
-correctly lands in the enhancing namespace, a second `getReflectionOptimizer`
-for a related class in the same inheritance hierarchy **re-defines** the same
-bridge — ByteBuddy's `referenceClass.getClassLoader().loadClass(bridgeName)`
-reuse-check is not finding the first namespace-defined copy, so it hits the
-duplicate-define guard. Next fix: make `findLoadedClass` / `loadClass` on the
-enhancing loader surface classes it defined via `Lookup.defineClass` (so the
-reuse-check succeeds instead of re-defining).
+
+### UPDATE (4th surface) — `Lookup.defineClass` optimizer/bridge duplicate-define FIXED (`b2317b72`)
+
+Now that the ByteBuddy optimizer / access-optimizer bridge correctly lands in
+the enhancing namespace, a second `getReflectionOptimizer` for a class sharing a
+mapped superclass RE-defined the same helper →
+`Lookup.defineClass … already defined by user-defined(4) loader`
+(SessionFactory-build failure for `lazy.proxy.FetchGraphTest` / `SpecializedEntity`).
+Root cause: `lk_define_class_b` never called `register_defining_loader`, so the
+helper's `Class.getClassLoader()` returned the app-loader fallback, and
+ByteBuddy's reuse-check `result.getClassLoader() == referenceClass.getClassLoader()`
+failed → re-define → collision. FIX (gated): register the lookup class's defining
+loader for the newly-defined class, matching `defineClass1` /
+`ClassLoader.defineClass`. `FetchGraphTest` now builds the SessionFactory
+(0→17 tests run) with **no regression** to the 5 misc16 classes.
+
+**Residual (5th surface, NOT loader-faithful):** `FetchGraphTest` now fails at
+runtime — `NPE: $$_hibernate_read_specializedEntities() is null` — a lazy
+*collection* enhancement-runtime bug (the enhanced entity's lazy `Set` field is
+not initialized), distinct from the loader-identity family. `BasicAttributesLazyGroupTest`
+similarly has a residual (`Nested Jupiter execution failed: 1 failure(s)`).
 
 ## Repro
 
