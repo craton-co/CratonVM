@@ -5641,63 +5641,45 @@ fn collect_entries_via_iterator_inner(
     source: ObjectRef,
 ) -> Vec<(Value, Value)> {
     let mut out = Vec::new();
-    let set = match ctx.invoke(
-        "java/util/Map",
-        "entrySet",
-        "()Ljava/util/Set;",
-        &[Value::Object(Some(source))],
-    ) {
+    // Dispatch through `invoke_virtual` on each concrete receiver — NOT
+    // `ctx.invoke("java/util/Map", ...)`. The latter keys the native lookup on
+    // the *interface* class name and so fires the natively-modelled
+    // `native_map_entry_set` (bucket-scan) regardless of the receiver's real
+    // type. For a `Map` whose layout CratonVM does NOT model — e.g. Spring's
+    // `MessageHeaders` (backed by a private `HashMap` field, slot 0 is not a
+    // bucket array) or the real-JDK `Collections$Unmodifiable*Map` wrappers —
+    // that bucket scan reads nothing and the walk returns EMPTY, silently
+    // dropping every entry (the `new HashMap<>(messageHeaders)` copy losing the
+    // `contentType` header). Virtual dispatch instead resolves each call on the
+    // receiver's actual class, running its real `entrySet()`/`iterator()`/
+    // `Map.Entry` bytecode — exactly what a `for (e : map.entrySet())` loop does.
+    let set = match ctx.invoke_virtual(source, "entrySet", "()Ljava/util/Set;", &[]) {
         Ok(Some(Value::Object(Some(s)))) => s,
         _ => return out,
     };
-    let it = match ctx.invoke(
-        "java/util/Set",
-        "iterator",
-        "()Ljava/util/Iterator;",
-        &[Value::Object(Some(set))],
-    ) {
+    let it = match ctx.invoke_virtual(set, "iterator", "()Ljava/util/Iterator;", &[]) {
         Ok(Some(Value::Object(Some(i)))) => i,
         _ => return out,
     };
     loop {
         let has_next = matches!(
-            ctx.invoke(
-                "java/util/Iterator",
-                "hasNext",
-                "()Z",
-                &[Value::Object(Some(it))],
-            ),
+            ctx.invoke_virtual(it, "hasNext", "()Z", &[]),
             Ok(Some(Value::Int(n))) if n != 0
         );
         if !has_next {
             break;
         }
-        let entry = match ctx.invoke(
-            "java/util/Iterator",
-            "next",
-            "()Ljava/lang/Object;",
-            &[Value::Object(Some(it))],
-        ) {
+        let entry = match ctx.invoke_virtual(it, "next", "()Ljava/lang/Object;", &[]) {
             Ok(Some(Value::Object(Some(e)))) => e,
             _ => break,
         };
         let key = ctx
-            .invoke(
-                "java/util/Map$Entry",
-                "getKey",
-                "()Ljava/lang/Object;",
-                &[Value::Object(Some(entry))],
-            )
+            .invoke_virtual(entry, "getKey", "()Ljava/lang/Object;", &[])
             .ok()
             .flatten()
             .unwrap_or(Value::Object(None));
         let value = ctx
-            .invoke(
-                "java/util/Map$Entry",
-                "getValue",
-                "()Ljava/lang/Object;",
-                &[Value::Object(Some(entry))],
-            )
+            .invoke_virtual(entry, "getValue", "()Ljava/lang/Object;", &[])
             .ok()
             .flatten()
             .unwrap_or(Value::Object(None));
