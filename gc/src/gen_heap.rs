@@ -3387,6 +3387,79 @@ impl GenerationalHeap {
 
         let bytes_copied = young_to.used();
 
+        if moving_young_dangling_verify_enabled() {
+            let mut missed_young = 0usize;
+            let mut missed_old = 0usize;
+            let mut reported = 0usize;
+            let cap = 40usize;
+            let mut scan_obj = |space: &str, obj: *mut u8, header: &ObjectHeader| -> usize {
+                let mut n = 0usize;
+                // SAFETY: caller passes live objects from young_to/old_gen walks while STW.
+                unsafe {
+                    for_each_ref_slot(obj, header, |raw, slot_id| {
+                        let t = raw as usize;
+                        if !young_from.contains(raw as *const u8) {
+                            return;
+                        }
+                        let th = &*(raw as *const ObjectHeader);
+                        if !th.is_forwarded() {
+                            return;
+                        }
+                        n += 1;
+                        if reported < cap {
+                            reported += 1;
+                            let referrer = crate::gc::resolve_class_info(header.class_id.as_u32())
+                                .map(|(name, _)| name)
+                                .unwrap_or_else(|| format!("cid#{}", header.class_id.as_u32()));
+                            let target = crate::gc::resolve_class_info(th.class_id.as_u32())
+                                .map(|(name, _)| name)
+                                .unwrap_or_else(|| format!("cid#{}", th.class_id.as_u32()));
+                            let expected = pointer_map
+                                .get(&t)
+                                .copied()
+                                .unwrap_or_else(|| th.forwarding_address() as usize);
+                            eprintln!(
+                                "[moving-young-verify] MISSED-HEAP-REWRITE {} {}@0x{:x} slot={} -> forwarded {} old=0x{:x} new=0x{:x}",
+                                space,
+                                referrer,
+                                obj as usize,
+                                slot_id,
+                                target,
+                                t,
+                                expected,
+                            );
+                        }
+                    });
+                }
+                n
+            };
+
+            let mut cursor = 0usize;
+            let young_used = young_to.used();
+            while cursor < young_used {
+                // SAFETY: young_to is bump-allocated; cursor advances by object size.
+                let obj = unsafe { young_to.base_ptr_mut().add(cursor) };
+                let header = unsafe { &*(obj as *const ObjectHeader) };
+                let size = gen_object_total_size(header);
+                if size < HEADER_SIZE || cursor + size > young_used {
+                    break;
+                }
+                missed_young += scan_obj("YOUNG", obj, header);
+                cursor += size;
+            }
+            for (obj, _size) in old_gen.walk_objects() {
+                // SAFETY: walk_objects yields live old-gen object starts.
+                let header = unsafe { &*(obj as *const ObjectHeader) };
+                missed_old += scan_obj("OLD", obj, header);
+            }
+            eprintln!(
+                "[moving-young-verify] forwarded_heap_refs_remaining young={} old={} pointer_map={}",
+                missed_young,
+                missed_old,
+                pointer_map.len(),
+            );
+        }
+
         // bc math-ec 0x4 seed-phase bisect: count `0x4` slots in the Cheney
         // to-space survivors and in old gen AFTER the minor (Cheney +
         // promotion) collection, BEFORE the possible major GC. A jump above
@@ -6373,6 +6446,17 @@ fn seedhunt_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
     *G.get_or_init(|| std::env::var_os("CRATONVM_DBG_SEEDHUNT").is_some())
+}
+
+/// Moving-young diagnostic: after Cheney scanning but before from-space reset,
+/// report any surviving heap reference that still points at a forwarded
+/// young-from object. Nonzero means a heap reference rewrite was missed; zero
+/// with a wrong result points at an unenumerated root/home outside the heap.
+#[inline]
+fn moving_young_dangling_verify_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| std::env::var_os("CRATONVM_MOVING_YOUNG_VERIFY").is_some())
 }
 
 /// Scan a single object's reference slots for the `0x4` seed signature
