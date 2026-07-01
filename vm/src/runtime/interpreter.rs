@@ -20397,7 +20397,7 @@ fn compile_osr_artifact(
             for (ipc, callee_class, callee_method, callee_desc, param_count) in
                 pending_callee_compiles
             {
-                if let Some((entry, needs_ctx)) =
+                let compiled_callee =
                     // Eager direct-call callee compile — optimized (C2) tier.
                     try_jit_compile_callee(
                         shared,
@@ -20405,43 +20405,51 @@ fn compile_osr_artifact(
                         &callee_method,
                         &callee_desc,
                         true,
-                    )
-                {
-                    direct_calls2.push((
-                        ipc,
-                        crate::jit::JitDirectCall {
-                            entry,
-                            needs_context: needs_ctx,
-                            num_params: param_count,
-                            return_type: crate::jit::return_type(&callee_desc),
-                            guard_class_id: 0,
-                        },
-                    ));
-                } else {
-                    // Compilation failed — fall back to dispatch helper
-                    let class_box: Box<str> = callee_class.into_boxed_str();
-                    let method_box: Box<str> = callee_method.into_boxed_str();
-                    let desc_box: Box<str> = callee_desc.clone().into_boxed_str();
-                    let class_ref = &*class_box as *const str; // Cast: string slice to raw pointer for JIT lifetime
-                    let method_ref = &*method_box as *const str; // Cast: string slice to raw pointer for JIT lifetime
-                    let desc_ref = &*desc_box as *const str; // Cast: string slice to raw pointer for JIT lifetime
-                    owned_jit_strings2.push(class_box);
-                    owned_jit_strings2.push(method_box);
-                    owned_jit_strings2.push(desc_box);
-                    let return_type = crate::jit::return_type(&callee_desc);
-                    // SAFETY: class_ref, method_ref, desc_ref point into the boxed strs that were just pushed to owned_jit_strings2, which outlives the JitInvokeInfo.
-                    let info = Box::new(crate::jit::JitInvokeInfo {
-                        class_name: unsafe { &*class_ref },
-                        method_name: unsafe { &*method_ref },
-                        descriptor: unsafe { &*desc_ref },
-                        num_jit_args: param_count,
-                        return_type,
-                        invoke_kind: 3,
-                    });
-                    let info_ptr: *const _ = &*info;
-                    owned_jit_invoke_infos2.push(info);
-                    invoke_info.push((ipc, info_ptr));
+                    );
+                if let Some((entry, needs_ctx)) = compiled_callee {
+                    if !crate::jit::jit_direct_call_requires_dispatch(
+                        &callee_class,
+                        &callee_method,
+                        &callee_desc,
+                    ) {
+                        direct_calls2.push((
+                            ipc,
+                            crate::jit::JitDirectCall {
+                                entry,
+                                needs_context: needs_ctx,
+                                num_params: param_count,
+                                return_type: crate::jit::return_type(&callee_desc),
+                                guard_class_id: 0,
+                            },
+                        ));
+                        continue;
+                    }
                 }
+
+                // Compilation failed, or the callee participates in a recursive
+                // compile cycle. Fall back to the guarded dispatch helper.
+                let class_box: Box<str> = callee_class.into_boxed_str();
+                let method_box: Box<str> = callee_method.into_boxed_str();
+                let desc_box: Box<str> = callee_desc.clone().into_boxed_str();
+                let class_ref = &*class_box as *const str; // Cast: string slice to raw pointer for JIT lifetime
+                let method_ref = &*method_box as *const str; // Cast: string slice to raw pointer for JIT lifetime
+                let desc_ref = &*desc_box as *const str; // Cast: string slice to raw pointer for JIT lifetime
+                owned_jit_strings2.push(class_box);
+                owned_jit_strings2.push(method_box);
+                owned_jit_strings2.push(desc_box);
+                let return_type = crate::jit::return_type(&callee_desc);
+                // SAFETY: class_ref, method_ref, desc_ref point into the boxed strs that were just pushed to owned_jit_strings2, which outlives the JitInvokeInfo.
+                let info = Box::new(crate::jit::JitInvokeInfo {
+                    class_name: unsafe { &*class_ref },
+                    method_name: unsafe { &*method_ref },
+                    descriptor: unsafe { &*desc_ref },
+                    num_jit_args: param_count,
+                    return_type,
+                    invoke_kind: 3,
+                });
+                let info_ptr: *const _ = &*info;
+                owned_jit_invoke_infos2.push(info);
+                invoke_info.push((ipc, info_ptr));
             }
 
             // Resolve the deferred trivial-ctor sites (cm_lock released). Emit an

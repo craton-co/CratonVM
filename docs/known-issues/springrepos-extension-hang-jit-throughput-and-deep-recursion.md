@@ -383,9 +383,24 @@ hits cannot bypass `enter_jit_dispatch`.
 
 This is a general containment for same-method recursive edges and should prevent
 the known deep ANTLR-style recursion from overrunning the native stack once the
-cold-path leaf-compilation experiment is retried. It is not the full
-stack-banging / fault-recovery design above: mutually-recursive direct calls and
-the cold-path throughput experiment still need separate validation.
+cold-path leaf-compilation experiment is retried.
+
+### 2026-07-01 follow-up: compile-cycle direct-call routing
+
+The direct-call metadata path now also tracks the current per-thread JIT compile
+stack. If compiling `A` recursively compiles `B`, and `B` resolves an invoke back
+to any outer method on that stack, the whole cycle path is marked as requiring
+guarded dispatch for future direct-call attempts. Parent compilers consult that
+marker after callee compilation returns, so the original `A -> B` site does not
+bake a raw machine `CALL` once `B -> A` has exposed the cycle. The OSR
+`direct_calls2` path uses the same marker before emitting eager invokestatic
+direct calls. This closes the previously-open mutually-recursive direct-call gap
+for compile-time-discovered cycles; pinned by
+`recursive_compile_cycle_routes_parent_direct_call_through_dispatch`.
+
+This is still not the full stack-banging / fault-recovery design above, and the
+cold-path throughput experiment still needs separate validation before this doc
+can be archived.
 
 ---
 

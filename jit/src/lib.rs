@@ -91,7 +91,7 @@ pub mod x64;
 
 use std::collections::HashMap;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use rustc_hash::{FxHashMap, FxHasher};
 use std::hash::Hasher;
@@ -4551,6 +4551,129 @@ pub fn jit_bail_shortcircuits() -> u64 {
     JIT_BAIL_SHORTCIRCUITS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct JitCompileMethodKey {
+    class_name: String,
+    method_name: String,
+    descriptor: String,
+}
+
+impl JitCompileMethodKey {
+    fn new(class_name: &str, method_name: &str, descriptor: &str) -> Self {
+        Self {
+            class_name: class_name.to_string(),
+            method_name: method_name.to_string(),
+            descriptor: descriptor.to_string(),
+        }
+    }
+
+    fn from_cached(cached: &CachedBytecodeMethod) -> Self {
+        Self::new(
+            &cached.class_name,
+            &cached.method_name,
+            &cached.method_descriptor,
+        )
+    }
+
+    fn matches(&self, class_name: &str, method_name: &str, descriptor: &str) -> bool {
+        self.class_name == class_name
+            && self.method_name == method_name
+            && self.descriptor == descriptor
+    }
+}
+
+thread_local! {
+    static JIT_COMPILE_STACK: std::cell::RefCell<Vec<JitCompileMethodKey>> =
+        std::cell::RefCell::new(Vec::new());
+}
+
+static JIT_RECURSIVE_CYCLE_METHODS: OnceLock<
+    parking_lot::RwLock<rustc_hash::FxHashSet<JitCompileMethodKey>>,
+> = OnceLock::new();
+
+fn jit_recursive_cycle_methods(
+) -> &'static parking_lot::RwLock<rustc_hash::FxHashSet<JitCompileMethodKey>> {
+    JIT_RECURSIVE_CYCLE_METHODS
+        .get_or_init(|| parking_lot::RwLock::new(rustc_hash::FxHashSet::default()))
+}
+
+struct JitCompileStackGuard {
+    key: JitCompileMethodKey,
+}
+
+impl JitCompileStackGuard {
+    fn enter(cached: &CachedBytecodeMethod) -> Self {
+        let key = JitCompileMethodKey::from_cached(cached);
+        JIT_COMPILE_STACK.with(|stack| stack.borrow_mut().push(key.clone()));
+        Self { key }
+    }
+}
+
+impl Drop for JitCompileStackGuard {
+    fn drop(&mut self) {
+        JIT_COMPILE_STACK.with(|stack| {
+            let popped = stack.borrow_mut().pop();
+            debug_assert_eq!(popped.as_ref(), Some(&self.key));
+        });
+    }
+}
+
+fn mark_jit_recursive_cycle_method(key: JitCompileMethodKey) {
+    jit_recursive_cycle_methods().write().insert(key);
+}
+
+fn mark_current_jit_compile_method_recursive_cycle() {
+    if let Some(key) = JIT_COMPILE_STACK.with(|stack| stack.borrow().last().cloned()) {
+        mark_jit_recursive_cycle_method(key);
+    }
+}
+
+/// Returns true when `target` closes a compile-time cycle to an outer method.
+/// When that happens, every method on the cycle path is marked so callers that
+/// compiled the callee recursively can still avoid baking a raw direct call.
+fn note_jit_recursive_compile_cycle(
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+) -> bool {
+    let cycle_path = JIT_COMPILE_STACK.with(|stack| {
+        let stack = stack.borrow();
+        let current_idx = stack.len().checked_sub(1)?;
+        let target_idx = stack[..current_idx]
+            .iter()
+            .position(|k| k.matches(class_name, method_name, descriptor))?;
+        Some(stack[target_idx..].to_vec())
+    });
+
+    if let Some(path) = cycle_path {
+        let mut recursive = jit_recursive_cycle_methods().write();
+        for key in path {
+            recursive.insert(key);
+        }
+        true
+    } else {
+        false
+    }
+}
+
+/// Direct JIT-to-JIT calls into recursive compile-cycle participants bypass the
+/// dispatch depth guard. Such targets must stay on the dispatch path.
+#[doc(hidden)]
+pub fn jit_direct_call_requires_dispatch(
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+) -> bool {
+    let key = JitCompileMethodKey::new(class_name, method_name, descriptor);
+    jit_recursive_cycle_methods().read().contains(&key)
+}
+
+#[cfg(test)]
+fn clear_jit_recursive_cycle_methods_for_test() {
+    jit_recursive_cycle_methods().write().clear();
+    JIT_COMPILE_STACK.with(|stack| stack.borrow_mut().clear());
+}
+
 /// Try to JIT-compile a cached bytecode method.
 ///
 /// The `helpers` parameter provides function pointer addresses for runtime callbacks
@@ -4682,6 +4805,8 @@ pub fn try_compile(
         JIT_CODE_CACHE_CAP_REFUSALS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         return None;
     }
+
+    let _compile_stack_guard = JitCompileStackGuard::enter(cached);
 
     // Inner pipeline: returns None on either a transient resolver miss
     // OR a permanent backend bail.  Only the latter pollutes the bail-
@@ -5665,11 +5790,16 @@ fn try_compile_inner(
             let num_jit_args = num_params + if has_receiver { 1 } else { 0 };
             let ret_type = return_type(&descriptor);
 
-            let is_recursive_call = class_name == &*cached.class_name
+            let is_same_method_recursive_call = class_name == &*cached.class_name
                 && method_name == &*cached.method_name
                 && descriptor == &*cached.method_descriptor;
+            let closes_active_compile_cycle =
+                note_jit_recursive_compile_cycle(&class_name, &method_name, &descriptor);
+            let recursive_cycle_target = closes_active_compile_cycle
+                || jit_direct_call_requires_dispatch(&class_name, &method_name, &descriptor);
+            let is_recursive_call = is_same_method_recursive_call || recursive_cycle_target;
             let use_raw_tail_self_call = invoke_kind == 3
-                && is_recursive_call
+                && is_same_method_recursive_call
                 && invokestatic_self_call_uses_tail_jump(code, code_len, pc);
 
             // RBC.3 — a site planned for inlining MUST still get a
@@ -5714,20 +5844,29 @@ fn try_compile_inner(
                         if let Some((entry, callee_needs_ctx)) =
                             compiler(&class_name, &method_name, &descriptor)
                         {
-                            if callee_needs_ctx {
+                            if jit_direct_call_requires_dispatch(
+                                &class_name,
+                                &method_name,
+                                &descriptor,
+                            ) {
                                 needs_heap = true;
+                                mark_current_jit_compile_method_recursive_cycle();
+                            } else {
+                                if callee_needs_ctx {
+                                    needs_heap = true;
+                                }
+                                direct_calls.push((
+                                    pc,
+                                    JitDirectCall {
+                                        entry,
+                                        needs_context: callee_needs_ctx,
+                                        num_params,
+                                        return_type: ret_type,
+                                        guard_class_id: 0,
+                                    },
+                                ));
+                                continue;
                             }
-                            direct_calls.push((
-                                pc,
-                                JitDirectCall {
-                                    entry,
-                                    needs_context: callee_needs_ctx,
-                                    num_params,
-                                    return_type: ret_type,
-                                    guard_class_id: 0,
-                                },
-                            ));
-                            continue;
                         }
                     }
                     needs_heap = true;
@@ -8802,6 +8941,120 @@ mod tests {
     }
 
     // ── return_type tests ───────────────────────────────────────────
+
+    #[test]
+    fn recursive_compile_cycle_routes_parent_direct_call_through_dispatch() {
+        use std::sync::Arc;
+
+        clear_jit_recursive_cycle_methods_for_test();
+
+        let a_cached = CachedBytecodeMethod {
+            declaring_class_id: cratonvm_types::ClassId::new(1),
+            class_name: Arc::from("pkg/A"),
+            method_name: Arc::from("a"),
+            method_descriptor: Arc::from("()V"),
+            source_file: None,
+            code: Arc::from([0xb8, 0x00, 0x01, 0xb1, 0x00, 0x00].as_slice()),
+            exception_table: Arc::from(Vec::new().as_slice()),
+            max_stack: 0,
+            max_locals: 0,
+            num_params: 0,
+            is_synchronized: false,
+            is_static: true,
+        };
+        let b_cached = CachedBytecodeMethod {
+            declaring_class_id: cratonvm_types::ClassId::new(2),
+            class_name: Arc::from("pkg/B"),
+            method_name: Arc::from("b"),
+            method_descriptor: Arc::from("()V"),
+            source_file: None,
+            code: Arc::from([0xb8, 0x00, 0x01, 0xb1, 0x00, 0x00].as_slice()),
+            exception_table: Arc::from(Vec::new().as_slice()),
+            max_stack: 0,
+            max_locals: 0,
+            num_params: 0,
+            is_synchronized: false,
+            is_static: true,
+        };
+        // SAFETY: every helper address is an integer slot. This test only
+        // inspects emitted metadata and never executes the generated code.
+        let helpers: JitRuntimeHelpers = unsafe { std::mem::zeroed() };
+        let a_resolver = |cp_idx: u16| -> Option<(String, String, String)> {
+            (cp_idx == 1).then(|| ("pkg/B".to_string(), "b".to_string(), "()V".to_string()))
+        };
+        let b_resolver = |cp_idx: u16| -> Option<(String, String, String)> {
+            (cp_idx == 1).then(|| ("pkg/A".to_string(), "a".to_string(), "()V".to_string()))
+        };
+        let callee_compiler =
+            |class_name: &str, method_name: &str, descriptor: &str| -> Option<(usize, bool)> {
+                assert_eq!((class_name, method_name, descriptor), ("pkg/B", "b", "()V"));
+                let compiled_b = try_compile(
+                    &b_cached,
+                    None,
+                    None,
+                    None,
+                    Some(&b_resolver),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    &helpers,
+                    None,
+                    None,
+                    None,
+                    None,
+                    false,
+                    false,
+                    false,
+                    false,
+                    false,
+                    false,
+                )?;
+                assert_eq!(
+                    compiled_b._jit_invoke_infos.len(),
+                    1,
+                    "B -> A must use dispatch after seeing A on the compile stack"
+                );
+                let compiled_b = Box::leak(Box::new(compiled_b));
+                Some((compiled_b.entry_ptr() as usize, compiled_b.needs_context()))
+            };
+
+        let compiled_a = try_compile(
+            &a_cached,
+            None,
+            None,
+            None,
+            Some(&a_resolver),
+            Some(&callee_compiler),
+            None,
+            None,
+            None,
+            None,
+            &helpers,
+            None,
+            None,
+            None,
+            None,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+        )
+        .expect("A should compile");
+
+        assert!(jit_direct_call_requires_dispatch("pkg/A", "a", "()V"));
+        assert!(jit_direct_call_requires_dispatch("pkg/B", "b", "()V"));
+        assert_eq!(
+            compiled_a._jit_invoke_infos.len(),
+            1,
+            "A -> B must fall back to dispatch once B is marked as a cycle participant"
+        );
+
+        clear_jit_recursive_cycle_methods_for_test();
+    }
 
     #[test]
     fn test_return_type_basic() {
