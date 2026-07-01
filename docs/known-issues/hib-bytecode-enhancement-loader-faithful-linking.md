@@ -2,9 +2,19 @@
 
 | | |
 |---|---|
-| **Status** | PARTIAL — eager-enhancement cluster, the two gate-on crash *regressions*, the SessionFactory-build blocker, AND (2026-07-01) the `enhancement.lazy.*` cluster all FIXED behind gate `CRATONVM_LOADER_AWARE_RESOLUTION` (default **OFF**). gate-on `gated_subset` PASS **31 → 54** (0 CRASH); **19 `enhancement.lazy.*` pass** (was 0), incl. `LazyBasicFieldAccessTest`. The last layer was **loader-faithful lambda dispatch** (NOT the "MethodHandle field-setter" that the earlier note misdiagnosed — see 2026-07-01 update). Remaining lazy/lazytoone FAILs are separate residual issues. Branch `fix/lazy-enhancement-lambda-dispatch` (off dev); NOT merged. |
+| **Status** | PARTIAL — eager-enhancement cluster, the two gate-on crash *regressions*, the SessionFactory-build blocker, AND (2026-07-01) the `enhancement.lazy.*` cluster all FIXED behind gate `CRATONVM_LOADER_AWARE_RESOLUTION` (default **OFF**). gate-on `gated_subset` PASS **31 → 54** (0 CRASH); **19 `enhancement.lazy.*` pass** (was 0), incl. `LazyBasicFieldAccessTest`. The last layer was **loader-faithful lambda dispatch** (NOT the "MethodHandle field-setter" that the earlier note misdiagnosed — see 2026-07-01 update). Remaining lazy/lazytoone FAILs are separate residual issues, so this doc stays in `known-issues` until they are split or app-verified. |
 | **Area** | VM core — real-JDK-mode loader-faithful resolution: superclass/interface *linking* (not just `new`/checkcast/ldc), `invokespecial` owner dispatch, and link-time verification of trusted runtime-generated classes. |
 | **Builds on** | [hib-proxyclassreuse-loader-blind-class-resolution.md](hib-proxyclassreuse-loader-blind-class-resolution.md) — the three-layer `CONSTANT_Class` / `defineClass`-namespace / `findLoadedClass` fix and the `resolve_class_loader_aware` mechanism. |
+
+> **RETRY 2026-07-01:** Source audit on current `dev` confirms the named loader-aware pieces
+> are present (`allocate_loader_id` starts at 3, `lambda_impl_dispatch_override` is wired,
+> lookup-defined classes register their defining loader, and builtin `findLoadedClass` hides
+> user namespaces). The focused builtin classloader test passed via
+> `cargo test -p cratonvm-native-builtins test_builtin_find_loaded_class -- --nocapture`.
+> A broader `cratonvm-vm` loader test build failed before execution because the linker ran out
+> of disk space, and the Hibernate app fixture is gitignored outside this worktree. No archive
+> move yet: the remaining lazy/lazytoone residuals still need either a focused split doc or an
+> app-level green rerun.
 
 ## Context
 

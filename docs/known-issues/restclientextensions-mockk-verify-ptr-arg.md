@@ -3,6 +3,13 @@
 **Status:** OPEN (3/5) · **Mode:** real-JDK, JIT on · HotSpot passes 5/5
 **Dev verified on:** `3cc5bf29`
 
+> **RETRY 2026-07-01:** Could not rerun the documented suite target from this checkout.
+> The separate worktree has no gitignored `apps/` fixtures, and the main checkout has no
+> `apps/spring-suite-runner` / `run-suite.sh` path or `RestClientExtensionsTests` class
+> artifact to invoke. No code change was attempted. The next useful step remains the one
+> below: rebuild or restore the Spring suite runner and instrument mockk
+> `SignatureMatcherDetector` / `JvmSignatureValueGenerator`.
+
 ## Symptom
 
 `org.springframework.web.client.RestClientExtensionsTests` — Kotlin + mockk. 3 of 5
