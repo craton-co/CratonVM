@@ -1268,6 +1268,32 @@ impl ValueStack {
         }
     }
 
+    /// Conservative operand-stack scan for the non-moving sweep.
+    ///
+    /// Mirrors `Frame::scan_locals_conservative`: when JIT quiescence has
+    /// already forced the young collector onto its non-moving sweep, a
+    /// false-positive root can only over-retain. That lets ForkJoin stress
+    /// recover object refs whose stack slot lost its CompactValue object tag
+    /// before the safepoint snapshot was published.
+    pub fn scan_object_refs_conservative(&self, roots: &mut Vec<ObjectRef>, heap: &VmHeap) {
+        for i in 0..self.len {
+            let cv = self.slots[i];
+            let cands = [
+                cv.as_object_ptr().unwrap_or(0),
+                cv.as_long().map(|l| l as u64).unwrap_or(0),
+                cv.to_bits(),
+            ];
+            for c in cands {
+                if c != 0 {
+                    if let Some(obj) = heap.is_object_address(c as usize) {
+                        roots.push(obj);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
     /// Update object references after GC using the pointer map.
     ///
     /// Symmetric to [`Self::scan_object_refs`]: every slot the scan yields as a
@@ -2442,6 +2468,28 @@ mod tests {
         assert!(
             roots.is_empty(),
             "primitive Long slots must not be treated as GC roots"
+        );
+    }
+
+    /// Lost-tag operand-stack refs are retained by the non-moving conservative
+    /// scan when the raw payload still names a valid heap object.
+    #[test]
+    fn t10_gc_conservative_scan_roots_lost_tag_stack_slot() {
+        use crate::classloading::ClassId;
+        use crate::memory::vm_heap::{GcBackend, VmHeap};
+
+        let heap = VmHeap::new(GcBackend::Generational, 16 * 1024 * 1024);
+        let obj = heap.alloc_object(ClassId::new(0), 0);
+        let addr = obj.as_ptr() as usize;
+
+        let mut stack = ValueStack::new(4);
+        stack.push_compact_long(CompactValue::long(addr as i64));
+
+        let mut roots = Vec::new();
+        stack.scan_object_refs_conservative(&mut roots, &heap);
+        assert!(
+            roots.iter().any(|r| r.as_ptr() as usize == addr),
+            "non-moving conservative stack scan must retain lost-tag object refs"
         );
     }
 

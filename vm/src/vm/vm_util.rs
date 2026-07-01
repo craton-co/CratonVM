@@ -369,10 +369,12 @@ pub fn ensure_class_initialized_shared(
                     // `expected`, the GC initiator wedges in wait_for_all
                     // forever (and the 30s re-park loop never arrives).
                     // Run the full blocking-site protocol: deposit roots,
-                    // mark GC-blocked (collections proceed and fold our
-                    // frame fixups), wait, then re-sync on wake.
+                    // retire the TLAB while its arena is still valid, mark
+                    // GC-blocked (collections proceed and fold our frame
+                    // fixups), wait, then re-sync on wake.
                     let mut ctx = crate::vm::vm_exec::NativeContextImpl { shared, thread };
                     ctx.deposit_root_snapshot();
+                    ctx.thread.tlab.retire();
                     let blk = shared.gc_barrier.enter_blocked();
                     if blk.pre_stw {
                         let _ = shared.gc_barrier.arrive_and_wait(

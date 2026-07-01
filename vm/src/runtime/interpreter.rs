@@ -480,13 +480,14 @@ fn stw_take_over_and_wait(
             warned = true;
         }
     }
-    // Publish the reserved TLAB tails of the now-frozen in-JIT peers so the
-    // non-moving young sweep skips them (their owners never reached a safepoint
-    // to retire/tail-fill, so the tails would otherwise desync the heap walk).
+    // Publish any reserved TLAB tails still present after the barrier is
+    // satisfied. Usually only forcibly-stopped in-JIT peers have one; collecting
+    // all live threads also hardens the sweep against a blocked/tearing-down
+    // thread that missed its retire before it left the counted mutator set.
     // Cleared by the caller after the collection completes.
-    if taken.count() > 0 {
+    let regions = shared.thread_registry.collect_reserved_tlab_tails();
+    if taken.count() > 0 || !regions.is_empty() {
         cratonvm_gc::gc_quiescence::mark_moving_young_coverage_incomplete();
-        let regions = shared.thread_registry.collect_reserved_tlab_tails();
         shared.heap.set_jit_tlab_skip_regions(&regions);
     }
     taken
@@ -1977,6 +1978,11 @@ pub(crate) fn update_root_snapshot(shared: &SharedVm, thread: &mut JvmThread) {
                     }
                 }
                 snapshot.truncate(write);
+            }
+            if conservative_locals {
+                frame
+                    .stack
+                    .scan_object_refs_conservative(&mut snapshot, &shared.heap);
             }
         }
     }
