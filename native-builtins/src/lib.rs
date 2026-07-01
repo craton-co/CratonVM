@@ -14469,7 +14469,21 @@ fn native_object_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     // ordinary classes).
     let class_id = getclass_display_class_id(ctx, class_id, this).unwrap_or(class_id);
     let dotted = object_to_string_dotted_name(ctx, class_id);
-    let hash = ctx.identity_hash_code(this);
+    // JDK contract: `Object.toString` is
+    //   getClass().getName() + "@" + Integer.toHexString(hashCode())
+    // where `hashCode()` is a VIRTUAL call — so a subclass that overrides
+    // `hashCode()` (in bytecode) must have that value appear here, NOT the raw
+    // identity hash. Dispatch virtually and only fall back to the identity hash
+    // if dispatch cannot produce an int (e.g. a mid-teardown receiver). Without
+    // this, value-hashed objects whose `toString` leaks into a cache key differ
+    // spuriously across runs — e.g. Spring's `AnnotationTransactionAttributeSource`
+    // (hashCode = annotationParsers.hashCode()) embedded in the CGLIB proxy
+    // `AdvisorKeyEntry`, which broke cross-context proxy-class caching
+    // (EnableTransactionManagementTests.cglibProxyClassIsCachedAcrossApplicationContexts).
+    let hash = match ctx.invoke_virtual(this, "hashCode", "()I", &[]) {
+        Ok(Some(Value::Int(h))) => h,
+        _ => ctx.identity_hash_code(this),
+    };
     // Build "dotted@hash" with a single pre-sized buffer (saves the realloc
     // that `format!` would do, but more importantly limits us to one heap
     // alloc for this call — the per-object hash means we cannot cache this).
