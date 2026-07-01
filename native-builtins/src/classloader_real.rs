@@ -822,6 +822,35 @@ fn cl_real_load_class_base(
         return Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(exc));
     }
 
+    // JVMS §5.3.2 step 1 — `findLoadedClass` FIRST (user-defined loaders only).
+    //
+    // `ClassLoader.loadClass` begins with `c = findLoadedClass(name); if (c ==
+    // null) { ...delegate... }`. A user loader that has itself defined this name
+    // — the override-first redefinition case: `TestClassLoader.overrideClass(
+    // Entity.class)` then `loadClass("jakarta.persistence.Entity")` — MUST get
+    // its OWN copy back, before the flat-global `ctx.load_class` (step 1 below)
+    // hands back the application loader's original. HotSpot returns the
+    // overridden class here (HHH-7084 `testSystemClassLoaderNotOverriding`);
+    // without this, `loadClass` returned the app-loader copy while
+    // `findLoadedClass` (correctly) returned the overridden one.
+    //
+    // `find_loaded_class_for_loader` is the exact, real-mode-safe logic the
+    // `findLoadedClass` native uses (identity-hash namespace store +
+    // defining-loader registry, NO global fallback), so it returns ONLY a class
+    // THIS loader actually defined / is the defining loader of — `None`
+    // otherwise, correctly deferring to parent delegation / `findClass`. Scoped
+    // to user-defined loaders so built-in (app/platform/bootstrap) resolution is
+    // completely unchanged; the null-parent `findClass`-overriding deferral path
+    // (Hibernate's `AggregatedClassLoader`) is preserved because that loader has
+    // not defined the class itself (→ `None`).
+    if crate::classloader::is_user_defined_loader(ctx, this) {
+        if let Some(mirror) =
+            crate::classloader::find_loaded_class_for_loader(ctx, this, &internal)
+        {
+            return Ok(Some(Value::Object(Some(mirror))));
+        }
+    }
+
     // HIB-CV-24 / SBR-14 — honor a supplied child/isolated `ClassLoader`.
     //
     // Step 1 below (`ctx.load_class`) resolves through CratonVM's flat global
