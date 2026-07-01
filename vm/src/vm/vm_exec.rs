@@ -1216,6 +1216,11 @@ impl<'a> NativeContextImpl<'a> {
                     }
                 }
             }
+            if conservative_locals {
+                frame
+                    .stack
+                    .scan_object_refs_conservative(&mut snapshot, &self.shared.heap);
+            }
             // A synchronized method's implicit monitorexit target. For
             // instance methods it duplicates local 0, but a STATIC
             // synchronized method locks the class mirror, which lives in no
@@ -4055,6 +4060,13 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                 crate::debug::events::EventKind::ThreadDeath,
                 tid.0 as u64,
             );
+            // CRIT (terminating-thread TLAB tail): this worker is about to
+            // enter termination-monitor blocking and then clear its published
+            // TLAB address before `jvm_thread` is dropped. Retire while the
+            // thread is still a live, running mutator so the unused tail is
+            // filled for any non-moving sweep and no later collection has to
+            // parse raw zeroed TLAB bytes with no owner to report a skip region.
+            jvm_thread.tlab.retire();
             // CRIT (stale-ref UAF) — `thread_obj_for_spawn` is a raw ObjectRef
             // captured at spawn and NEVER remapped. Over this thread's whole
             // lifetime the GC relocates the Thread object (or a young-GC `grow`

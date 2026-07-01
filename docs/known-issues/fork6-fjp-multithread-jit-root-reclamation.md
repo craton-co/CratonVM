@@ -1,6 +1,6 @@
 # Fork6 — multi-thread (ForkJoinPool worker) JIT-root reclamation
 
-**Status:** 🟡 OPEN but **non-reproducing on current dev** (re-audit 2026-06-29) — the last open Family-A member. The dominant **lost-tag** manifestation is mitigated (conservative interp-local roots under the non-moving sweep, `00429413`) behind the experimental `CRATONVM_REAL_FORKJOINPOOL=1` gate (default path byte-identical). The worker-forked-subtask reclamation **does not reproduce** on a current-dev build (precise-maps default-on + the A2 free-list fix `6e3ddb05`): see the 2026-06-29 re-audit below.
+**Status:** 🟡 OPEN. Non-stress `Fork6`/`Fork6Hard` remains non-reproducing on current `dev`, but the 2026-07-01 aggressive `GC_STRESS` retry still reproduces stale `ForkJoinTask` / `Fork6Hard$StrTask` receivers and heap-walk corruption. The bug remains under `docs/known-issues`.
 
 > ## Re-audit 2026-06-29 (fresh release build off dev HEAD `9928052c`, binary `cvmpjfinish.exe`, JDK-25 oracle)
 >
@@ -84,6 +84,46 @@
 > Status remains fix-candidate until the real `CRATONVM_REAL_FORKJOINPOOL=1`
 > Fork6/Fork6Hard lane and the Tomcat real-net/real-AQS classes are soaked on a
 > fresh unique binary.
+
+> ## Retry 2026-07-01 -- TLAB-tail hardening plus stress repro
+>
+> Branch `codex/fork6-fjp-retry-20260701`, based on current local `dev`
+> `f7506e02`. Unique binaries used during this retry:
+> `target/release/cvmp-fork6-retry-f7506e02.exe`,
+> `target/debug/cvmp-fork6-tlabtail-20260701.exe`, and
+> `target/debug/cvmp-fork6-stackroots-20260701.exe`. Final post-build sanity
+> binary: `target/debug/cvmp-fork6-final-20260701.exe`.
+>
+> Controls still pass. HotSpot passes `Fork6` and `Fork6Hard 256 20`; CratonVM
+> passes plain `Fork6`, `Fork6Hard 256 40`, and a 12-process concurrent
+> non-stress lane. Under real FJP, `GC_STRESS=1048576` and `524288` pass on
+> `Fork6Hard 128 20`.
+>
+> Lower stress intervals still fail. `GC_STRESS=262144` and `65536` reproduce
+> stale all-zero `Fork6Hard$StrTask` / `ForkJoinTask` receivers, class-id-0
+> object reads, `HIB-CV-32` corrupt `CompactValue` guards, non-moving sweep
+> re-sync/stopping-walk diagnostics, and occasional SIGSEGV. The older
+> "GC_STRESS only exposes the separate holder-null bug" statement is therefore
+> superseded for current `dev`: holder-null is gone, but aggressive stress still
+> exposes this or an adjacent JIT-root coverage failure.
+>
+> Changes landed from this retry are defensive, not a closure: terminate spawned
+> Java threads with `tlab.retire()` before clearing the published TLAB address;
+> retire the TLAB before entering the class-initialization blocked wait; publish
+> every live thread's remaining reserved TLAB tail after the STW barrier, not
+> only OS-suspended JIT peers; and extend the existing real-FJP/non-moving
+> conservative lost-tag scan from interpreter locals to operand-stack slots.
+> Focused unit coverage was added for live/unretired TLAB-tail publication and
+> lost-tag operand-stack rooting. These changes harden real gaps but do not
+> make the aggressive stress lane pass.
+>
+> Best current suspicion after this retry: a peer can be inside a Rust/runtime
+> helper called from JIT, with JIT return frames and task refs on its native
+> stack, while its current `Rip` is outside a registered JIT code range. The
+> cross-thread takeover path only holds peers whose current `Rip` is in JIT; if
+> this helper window reaches GC, roots can be missed without the thread being
+> safely frozen. Confirming that needs targeted `xt_root_scan` instrumentation
+> or a deterministic worker-state repro before a safe fix.
 
 **Prior status (audit 2026-06-19, retained for history):** 🟡 PARTIAL — the dominant **lost-tag** manifestation is mitigated (conservative interp-local roots under the non-moving sweep, `00429413`) but **only behind the experimental `CRATONVM_REAL_FORKJOINPOOL=1` gate** (the default path is byte-identical baseline). Residual: the worker-forked-subtask reclamation (~15%), then additionally masked by a separate real-FJP `ForkJoinPool` CAS bug. The family-wide precise-JIT-maps default-on (`32649b56`) does **not** close this.
 

@@ -219,11 +219,12 @@ impl ThreadRegistry {
     /// thread, as absolute `(cursor, end)` pairs.
     ///
     /// Called by the multi-threaded GC initiator AFTER the STW barrier is
-    /// satisfied (so no peer is running Java): at that point a parked or
-    /// blocked peer has already retired its TLAB (`reserved_tail` → `None`),
-    /// and only a peer the cross-thread JIT root scan forcibly OS-suspended
-    /// still has a non-empty reserved tail. Those tails are the regions the
-    /// non-moving young sweep must skip (see
+    /// satisfied (so no counted peer is running Java): at that point normal
+    /// parked or blocked peers should already have retired their TLAB
+    /// (`reserved_tail` -> `None`), but collecting every alive thread makes the
+    /// collector robust if a blocked or tearing-down path missed that retire.
+    /// The non-empty tails are the regions the non-moving young sweep must skip
+    /// (see
     /// [`cratonvm_gc::vm_heap::VmHeap::set_jit_tlab_skip_regions`]).
     ///
     /// SAFETY: reads each alive thread's `Tlab` through its published address.
@@ -1183,6 +1184,40 @@ mod tests {
         // A dead thread's mirror is no longer rooted (it may be reclaimed).
         registry.mark_dead(tid);
         assert!(registry.collect_all_root_snapshots().is_empty());
+    }
+
+    #[test]
+    fn collect_reserved_tlab_tails_reports_only_alive_unretired_tlabs() {
+        let registry = ThreadRegistry::new();
+        let tid = ThreadId(1);
+        registry.register(tid, "worker", None);
+
+        let mut backing = vec![0u64; 128];
+        let ptr = backing.as_mut_ptr() as *mut u8;
+        let size = backing.len() * std::mem::size_of::<u64>();
+        let mut tlab = unsafe { cratonvm_gc::Tlab::new(ptr, size) };
+        assert!(tlab.alloc(64, 8).is_some());
+
+        registry.set_tlab_addr(tid, &tlab as *const cratonvm_gc::Tlab as usize);
+
+        let tails = registry.collect_reserved_tlab_tails();
+        assert_eq!(tails, vec![(ptr as usize + 64, ptr as usize + size)]);
+
+        tlab.retire();
+        assert!(
+            registry.collect_reserved_tlab_tails().is_empty(),
+            "retired TLABs must not publish skip regions"
+        );
+
+        backing.fill(0);
+        let mut tlab = unsafe { cratonvm_gc::Tlab::new(ptr, size) };
+        assert!(tlab.alloc(64, 8).is_some());
+        registry.set_tlab_addr(tid, &tlab as *const cratonvm_gc::Tlab as usize);
+        registry.mark_dead(tid);
+        assert!(
+            registry.collect_reserved_tlab_tails().is_empty(),
+            "dead threads must not publish stale TLAB pointers"
+        );
     }
 
     #[test]

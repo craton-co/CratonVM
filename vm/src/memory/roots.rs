@@ -106,6 +106,11 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
                 }
             }
         }
+        if conservative_locals {
+            frame
+                .stack
+                .scan_object_refs_conservative(&mut roots, &shared.heap);
+        }
     }
 
     // 2. Static fields — all classes
