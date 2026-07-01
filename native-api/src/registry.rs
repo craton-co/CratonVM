@@ -3186,6 +3186,33 @@ impl NativeMethodRegistry {
         let key = native_method_hash("", method_name, descriptor);
         self.by_method_desc.get(&key).copied()
     }
+
+    /// Cheap conservative prefilter for hot call paths that only need to know
+    /// whether a class-qualified native lookup could possibly succeed.
+    ///
+    /// A false result is definitive for clean descriptors: no registered native
+    /// has this `(method_name, descriptor)` pair on any class, so callers may
+    /// skip class-specific `find()` probes and superclass walks. Descriptors
+    /// that would trigger the compatibility rewrite path return true even when
+    /// the exact index misses, preserving `find()` semantics.
+    #[inline]
+    pub fn might_have_method_descriptor(&self, method_name: &str, descriptor: &str) -> bool {
+        let key = native_method_hash("", method_name, descriptor);
+        if self.by_method_desc.contains_key(&key) {
+            return true;
+        }
+        let has_whitespace_or_nul = descriptor
+            .bytes()
+            .any(|b| b.is_ascii_whitespace() || b == b'\0');
+        let object_return_quirk = match descriptor.rfind(')') {
+            Some(rparen) => {
+                let ret = &descriptor[rparen + 1..];
+                ret.starts_with('L') && !ret.ends_with(';')
+            }
+            None => false,
+        };
+        has_whitespace_or_nul || object_return_quirk
+    }
 }
 
 impl Default for NativeMethodRegistry {
@@ -3329,6 +3356,27 @@ mod tests {
         assert!(registry.find("java/lang/Math", "abs", "(I)I").is_some());
         assert!(registry.find("java/lang/Math", "abs", "(J)J").is_some());
         assert!(registry.find("java/lang/Math", "abs", "(D)D").is_none());
+    }
+
+    #[test]
+    fn method_descriptor_prefilter_ignores_class() {
+        let mut registry = NativeMethodRegistry::new();
+        registry.register(
+            "java/lang/Object",
+            "toString",
+            "()Ljava/lang/String;",
+            dummy_native,
+        );
+        assert!(registry.might_have_method_descriptor("toString", "()Ljava/lang/String;"));
+        assert!(!registry.might_have_method_descriptor("toString", "()I"));
+        assert!(!registry.might_have_method_descriptor("hashCode", "()Ljava/lang/String;"));
+    }
+
+    #[test]
+    fn method_descriptor_prefilter_is_conservative_for_quirky_descriptors() {
+        let registry = NativeMethodRegistry::new();
+        assert!(registry.might_have_method_descriptor("m", " ()V"));
+        assert!(registry.might_have_method_descriptor("m", "()Ljava/lang/String"));
     }
 
     #[test]

@@ -493,3 +493,18 @@ This reduces the cost of every `NativeMethodRegistry::find` call, including
 paths not covered by the vtable-fast verdict cache above. It still does not
 claim to close the Hibernate `FunctionTests` / `StandardFunctionTests` slowness
 cluster until those external tests are rerun.
+
+### 2026-07-01 follow-up: native-shadow signature prefilter
+
+Implemented another general hot-path mitigation: `NativeMethodRegistry` now
+exposes a conservative O(1) membership check for `(method_name, descriptor)`.
+When a clean descriptor has no native registration on any class, the
+interpreter can skip class-qualified native probes and superclass walks
+entirely.
+
+This prefilter is used in `execute_invokevirtual_vtable_fast`, the intrinsic
+native-override guard, and `populate_virtual_invoke_cache`. Positive or
+descriptor-quirk cases still run the existing class-sensitive lookup logic, so
+native override priority and descriptor compatibility behavior are unchanged.
+The full Hibernate `FunctionTests` / `StandardFunctionTests` rerun is still
+outstanding, so keep this slowness cluster open.
