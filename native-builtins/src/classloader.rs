@@ -2793,6 +2793,28 @@ fn cl_get_resources(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
 /// `URLClassLoader.findResources` → `ucl_find_resources` → back here; re-delegating
 /// would call `findResources` again, recursing until the native stack overflows
 /// (the recursion bypasses the `execute()` depth guard). See SB-13.
+/// True iff the receiver's class (or an ancestor below `java/lang/ClassLoader`)
+/// declares its own `findResources(String)` override. When it does, the
+/// `getResources` native delegates to that override; when it does not, the
+/// loader relies on the default parent-delegating `ClassLoader.getResources`
+/// semantics and the native falls back to the flat classpath scan.
+fn loader_overrides_find_resources(ctx: &mut dyn NativeContext, this_ref: ObjectRef) -> bool {
+    const FIND_RESOURCES_DESC: &str = "(Ljava/lang/String;)Ljava/util/Enumeration;";
+    let mut cid = Some(ctx.class_id_of_object(this_ref));
+    while let Some(c) = cid {
+        match ctx.class_name_of_id(c).as_deref() {
+            // Reached the base class (or an untyped class): no override found.
+            Some("java/lang/ClassLoader") | Some("java/lang/Object") | None => return false,
+            _ => {}
+        }
+        if ctx.class_declares_method(c, "findResources", FIND_RESOURCES_DESC) {
+            return true;
+        }
+        cid = ctx.superclass_of(c);
+    }
+    false
+}
+
 fn cl_get_resources_impl(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -2855,8 +2877,27 @@ fn cl_get_resources_impl(
             if is_classloader_instance(ctx, this_ref) {
                 let class_id = ctx.class_id_of_object(this_ref);
                 if let Some(class_name) = ctx.class_name_of_id(class_id) {
-                    if !is_builtin_loader_class(&class_name) {
-                        // Pin the receiver across the allocating create_string.
+                    if !is_builtin_loader_class(&class_name)
+                        && loader_overrides_find_resources(ctx, this_ref)
+                    {
+                        // The loader actually OVERRIDES findResources (e.g. ES
+                        // EmbeddedImplClassLoader, JBoss ModuleClassLoader): run
+                        // its override, which reads its own resource roots.
+                        //
+                        // A loader that does NOT override findResources inherits
+                        // the default (empty) implementation. The real JDK
+                        // `ClassLoader.getResources` = parent.getResources(name)
+                        // ++ this.findResources(name); for such a loader that is
+                        // just parent.getResources. Delegating to the empty
+                        // default here dropped the parent's results entirely —
+                        // e.g. Spring's CandidateComponentsTestClassLoader, which
+                        // overrides only getResources (calling super.getResources)
+                        // to disable the component index, saw ZERO classpath
+                        // resources and every scan-based component scan returned
+                        // empty. So we skip this branch and fall through to the
+                        // flat classpath scan below, which stands in for the
+                        // builtin parent's getResources. Mirrors the parent-first
+                        // delegation already done in the singular `cl_get_resource`.
                         let pin = ctx.pin_native_root(this_ref);
                         let name_arg = Value::Object(Some(ctx.create_string(&name)));
                         let this_ref = ctx.read_native_pin(pin, this_ref);

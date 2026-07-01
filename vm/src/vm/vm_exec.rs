@@ -2561,6 +2561,15 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             .is_some()
     }
 
+    fn class_declares_method(&self, class_id: ClassId, name: &str, descriptor: &str) -> bool {
+        // Declared-only check: inspect this exact class, NOT its superclasses.
+        let cm = self.shared.class_manager.read();
+        match cm.class_store.get(class_id) {
+            Some(class) => class.find_method(name, descriptor).is_some(),
+            None => false,
+        }
+    }
+
     fn new_array(&mut self, element_type: ArrayElementType, length: usize) -> ObjectRef {
         self.shared
             .heap

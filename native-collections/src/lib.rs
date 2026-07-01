@@ -6654,26 +6654,75 @@ fn native_hs_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         Some(m) => m,
         None => return Ok(Some(Value::Int(0))),
     };
+    // Live entrySet view: `remove(o)` follows the JDK `EntrySetView.remove`
+    // contract — `map.remove(e.getKey(), e.getValue())`. The boolean result must
+    // reflect whether the SOURCE map held that exact `(k, v)` mapping, not
+    // whether the detached view snapshot did (the snapshot buckets entries by
+    // identity hash and may have been rebuilt by a resync, so a snapshot-based
+    // answer was unreliable — it returned `false` even when the write-through
+    // removed the mapping, breaking callers that gate on the return such as
+    // Narayana `ReaperElementManager.flushPending`). Reads of this same view
+    // resync from the (now-updated) source, so we don't also mutate the snapshot.
+    if let Some(source) = view_backing_source(ctx, backing) {
+        if is_entryset_kind(view_backing_kind(ctx, backing)) {
+            let (key, want_val) = match elem {
+                Value::Object(Some(e)) => (ctx.get_field(e, 0), ctx.get_field(e, 1)),
+                // A non-Map.Entry argument is never contained in an entrySet.
+                _ => return Ok(Some(Value::Int(0))),
+            };
+            // JDK `EntrySetView.remove(o)` == `map.remove(e.getKey(),
+            // e.getValue())`: remove (and report true) iff the SOURCE currently
+            // maps `key` to a value equal to `want_val`. We evaluate that with
+            // `containsKey` + `get` + value-equality rather than dispatching the
+            // 2-arg `Map.remove(k,v)`, because for a natively-backed
+            // LinkedHashMap/TreeMap the 2-arg form resolves to the JDK
+            // `Map.remove` DEFAULT method whose real bytecode (`removeNode` ->
+            // `afterNodeRemoval`) walks linkage the native backing never
+            // populated and throws. The write-through itself is the native 1-arg
+            // `remove(Object)` (`source_map_remove`), exactly as the keySet path
+            // and the pre-fix entrySet path used. This mirrors `native_hs_contains`.
+            let has_key = matches!(
+                ctx.invoke_virtual(source, "containsKey", "(Ljava/lang/Object;)Z", &[key])?,
+                Some(Value::Int(1))
+            );
+            if !has_key {
+                return Ok(Some(Value::Int(0)));
+            }
+            let got = ctx
+                .invoke_virtual(
+                    source,
+                    "get",
+                    "(Ljava/lang/Object;)Ljava/lang/Object;",
+                    &[key],
+                )?
+                .unwrap_or(Value::Object(None));
+            let eq = values_equal(ctx, &got, &want_val)
+                || match (got, want_val) {
+                    (Value::Object(Some(a)), Value::Object(Some(b))) => map_keys_equal(ctx, a, b)?,
+                    _ => false,
+                };
+            if eq {
+                source_map_remove(ctx, source, key)?;
+                return Ok(Some(Value::Int(1)));
+            }
+            return Ok(Some(Value::Int(0)));
+        }
+        // keySet view: remove the key from both the snapshot (for the result)
+        // and the source map (write-through).
+        let remove_args = [Value::Object(Some(backing)), elem];
+        let old = native_map_remove(ctx, &remove_args)?;
+        let was_present = !matches!(old, Some(Value::Object(None)));
+        source_map_remove(ctx, source, elem)?;
+        return Ok(Some(Value::Int(if was_present { 1 } else { 0 })));
+    }
+    // Ordinary (non-view) HashSet: remove from the backing only.
     let remove_args = [Value::Object(Some(backing)), elem];
     let old = native_map_remove(ctx, &remove_args)?;
-    let was_present = !matches!(old, Some(Value::Object(None)));
-    // Live keySet/entrySet view: propagate the removal to the source map.
-    // The backing carries the source-map reference + kind when this HashSet
-    // was produced by `Map.keySet()` / `Map.entrySet()`. For an entrySet the
-    // element is a `Map.Entry`, so delete its key (slot 0); for a keySet it is
-    // the key itself.
-    if let Some(source) = view_backing_source(ctx, backing) {
-        let key = if is_entryset_kind(view_backing_kind(ctx, backing)) {
-            match elem {
-                Value::Object(Some(e)) => ctx.get_field(e, 0),
-                _ => elem,
-            }
-        } else {
-            elem
-        };
-        source_map_remove(ctx, source, key)?;
-    }
-    Ok(Some(Value::Int(if was_present { 1 } else { 0 })))
+    Ok(Some(Value::Int(if !matches!(old, Some(Value::Object(None))) {
+        1
+    } else {
+        0
+    })))
 }
 
 fn native_hs_contains(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -26906,12 +26955,23 @@ fn native_chm_entry_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     // Spring DefaultSingletonBeanRegistry.destroyBean iterating the
     // dependentBeanMap (a ConcurrentHashMap) entrySet.
     let set = alloc_synthetic(ctx, "java/util/HashSet", HS_NUM_FIELDS);
-    let backing = alloc_backing_map(ctx);
     let cap = std::cmp::max(entries.len().next_power_of_two(), MAP_DEFAULT_CAPACITY);
-    let buckets = alloc_ref_array(ctx, cap);
-    ctx.set_field(backing, MAP_FIELD_BUCKETS, Value::Object(Some(buckets)));
-    set_map_size(ctx, backing, 0);
-    ctx.set_field(backing, MAP_FIELD_CAPACITY, Value::Int(cap as i32));
+    // Live entrySet view: back the HashSet with a view-backing that remembers the
+    // source ConcurrentHashMap (+ VIEW_KIND_ENTRYSET), exactly like
+    // `native_chm_key_set` (keySet) and the generic `native_map_entry_set`
+    // (HashMap). This is what makes removing THROUGH the set write through to the
+    // map — `entrySet().remove(e)` / `entrySet().iterator().remove()` /
+    // `entrySet().removeIf(...)` (see `native_hs_remove`, which pulls the source
+    // off the backing and deletes `e.getKey()` from it). The previous plain
+    // snapshot backing (`alloc_backing_map`, no source marker) made
+    // `view_backing_source` return `None`, so those removals silently vanished:
+    // Narayana's `TransactionReaper` drains its `pendingInsertions` CHM via
+    // `entrySet().remove(entry)` in `ReaperElementManager.flushPending`, so with a
+    // dead snapshot the timed-out transaction was never moved into the reaper's
+    // sorted queue and never rolled back (Hibernate `TransactionTimeoutTest`).
+    // Reads resync from the live map via `collect_entries_any`, which routes a
+    // segmented CHM through `chm_collect_all_entries`.
+    let backing = alloc_view_backing(ctx, this, VIEW_KIND_ENTRYSET, cap);
     ctx.set_field(set, HS_FIELD_MAP, Value::Object(Some(backing)));
     for (key, value) in &entries {
         let entry_obj = alloc_live_entry(ctx, "java/util/Map$Entry", *key, *value, this);

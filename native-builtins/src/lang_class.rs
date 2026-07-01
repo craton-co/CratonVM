@@ -1409,6 +1409,18 @@ fn validate_for_name_dotted(dotted_name: &str) -> Result<(), MethodCallFailed> {
     Ok(())
 }
 
+/// DBG: report whether `cid` is a bytecode-enhanced entity (declares a
+/// `$$_hibernate_*` member). Trace-only.
+fn dbg_class_enhanced(ctx: &mut dyn NativeContext, cid: ClassId) -> bool {
+    ctx.declared_methods(cid)
+        .iter()
+        .any(|m| m.name.starts_with("$$_hibernate_"))
+}
+
+fn dbg_is_entity_name(n: &str) -> bool {
+    n.contains("orm/test/cache/") || n.contains("orm.test.cache.")
+}
+
 pub(crate) fn native_class_for_name(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -1529,6 +1541,14 @@ pub(crate) fn native_class_for_name(
                                 // errors raised by `<clinit>`, matching HotSpot.
                                 ctx.ensure_class_initialized(&bin_name)?;
                             }
+                        }
+                    }
+                }
+                if std::env::var("CRATONVM_IAE_TRACE").is_ok() && dbg_is_entity_name(&internal_name) {
+                    if let Value::Object(Some(mr)) = mirror {
+                        if let Some(cid) = ctx.class_id_from_mirror(mr) {
+                            let enh = dbg_class_enhanced(ctx, cid);
+                            eprintln!("FORNAME-RET name={dotted_name} loader={loader_class_name_debug} cid={} enhanced={enh} (via-loader)", cid.as_u32());
                         }
                     }
                 }
@@ -1661,6 +1681,10 @@ pub(crate) fn native_class_for_name(
                     }
                     .into(),
                 );
+            }
+            if std::env::var("CRATONVM_IAE_TRACE").is_ok() && dbg_is_entity_name(&internal_name) {
+                let enh = dbg_class_enhanced(ctx, class_id);
+                eprintln!("FORNAME-RET name={dotted_name} cid={} enhanced={enh} (global-fallback)", class_id.as_u32());
             }
             let mirror = ctx.get_class_mirror(class_id);
             Ok(Some(Value::Object(Some(mirror))))
@@ -7031,6 +7055,13 @@ pub(crate) fn native_constructor_new_instance(
         }
         .into());
     }
+    if std::env::var("CRATONVM_IAE_TRACE").is_ok() && dbg_is_entity_name(&class_name) {
+        let (cidv, enh) = match declaring_cid {
+            Some(cid) => (cid.as_u32() as i64, dbg_class_enhanced(ctx, cid)),
+            None => (-1, false),
+        };
+        eprintln!("CTOR-NEWINSTANCE class={class_name} declaring_cid={cidv} enhanced={enh}");
+    }
 
     // NEW-19: JPMS deep-reflection check. Accessible flag lives in a
     // CratonVM extra slot; when true the check is already paid (JEP 403).
@@ -8239,6 +8270,15 @@ fn cached_annotation_proxy(
     // deferred `TypeNotPresentException` for filtered types. `None` for built-in
     // loaders keeps the global resolution.
     let container_loader = crate::classloader::defining_loader_for(queried_class_id.as_u32());
+    if std::env::var("CRATONVM_IAE_TRACE").is_ok() {
+        let holder = ctx.class_name_of_id(queried_class_id).unwrap_or_default();
+        eprintln!(
+            "ANN-HOLDER cid={} holder={holder} ann={} container_loader={}",
+            queried_class_id.as_u32(),
+            ann.type_descriptor,
+            if container_loader.is_some() { "SOME" } else { "none" }
+        );
+    }
     let proxy = create_annotation_proxy(ctx, ann, container_loader);
     *annotation_proxy_cache()
         .lock()
