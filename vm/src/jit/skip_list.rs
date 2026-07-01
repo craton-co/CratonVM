@@ -406,6 +406,17 @@ fn should_skip_jit_internal(
         return Some(SkipReason::UnnamedThread);
     }
 
+    // ANTLR-COLDPATH.1 — the Groovy-shaded ANTLR runtime blanket ban is
+    // liftable for cold-path validation, but the PredictionContext equality /
+    // hash cluster is a known correctness defect. Keep that cluster
+    // interpreted even when `CRATONVM_JIT_ALLOW_PACKAGES=groovyjarjarantlr4/`
+    // lifts the surrounding package, so validation compiles the ATN simulator
+    // leaves without reintroducing the old null-PredictionContext parse
+    // corruption.
+    if is_antlr_prediction_context_miscompile(class_name, method_name) {
+        return Some(SkipReason::RustJvmTestFixture);
+    }
+
     // T1.1.g — the historical blanket bans for `java/util/*` and
     // `cratonvm/*` have been narrowed to targeted per-method
     // exclusions covering only the specific reproducible miscompiles
@@ -719,7 +730,9 @@ fn should_skip_jit_internal(
         //    Hibernate HQL reproducer in
         //    `springrepos-extension-hang-jit-throughput-and-deep-recursion.md`.
         //
-        // Lifted by `CRATONVM_JIT_ALLOW_PACKAGES=groovyjarjarantlr4/`.
+        // Lifted by `CRATONVM_JIT_ALLOW_PACKAGES=groovyjarjarantlr4/` for
+        // cold-path validation, but the PredictionContext equality/hash
+        // cluster above stays interpreted.
         if class_name.starts_with("groovyjarjarantlr4/")
             && !package_allowed("groovyjarjarantlr4/", allow_packages)
         {
@@ -2058,6 +2071,25 @@ fn is_known_miscompile(class_name: &str, method_name: &str) -> bool {
     )
 }
 
+fn is_antlr_prediction_context_miscompile(class_name: &str, method_name: &str) -> bool {
+    matches!(
+        (class_name, method_name),
+        (
+            "groovyjarjarantlr4/v4/runtime/atn/PredictionContext",
+            "calculateHashCode" | "hashCode"
+        ) | (
+            "groovyjarjarantlr4/v4/runtime/atn/PredictionContext$IdentityEqualityComparator",
+            "hashCode"
+        ) | (
+            "groovyjarjarantlr4/v4/runtime/atn/SingletonPredictionContext",
+            "equals" | "isEmpty" | "size"
+        ) | (
+            "groovyjarjarantlr4/v4/runtime/misc/ObjectEqualityComparator",
+            "equals"
+        )
+    )
+}
+
 /// True if `prefix` matches any entry in `allow_packages`. An entry matches if
 /// `prefix` starts with the entry, so `CRATONVM_JIT_ALLOW_PACKAGES=java/util`
 /// lifts the `java/util/` ban.
@@ -2331,6 +2363,84 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn antlr_coldpath_blanket_ban_holds_by_default() {
+        assert_eq!(
+            check(
+                "groovyjarjarantlr4/v4/runtime/atn/ParserATNSimulator",
+                "closure_",
+                false,
+                true,
+                SkipPolicy::Conservative,
+            ),
+            Some(SkipReason::RustJvmTestFixture),
+            "ANTLR cold-path methods stay interpreted by default"
+        );
+    }
+
+    #[test]
+    fn antlr_coldpath_validation_lifts_non_bad_atn_methods() {
+        assert_eq!(
+            check_with(
+                "groovyjarjarantlr4/v4/runtime/atn/ParserATNSimulator",
+                "closure_",
+                false,
+                true,
+                SkipPolicy::Conservative,
+                &["groovyjarjarantlr4/"],
+            ),
+            None,
+            "CRATONVM_JIT_ALLOW_PACKAGES=groovyjarjarantlr4/ is the cold-path validation lift"
+        );
+    }
+
+    #[test]
+    fn antlr_prediction_context_cluster_stays_interpreted_under_validation_lift() {
+        for (cls, mn) in [
+            (
+                "groovyjarjarantlr4/v4/runtime/atn/PredictionContext",
+                "calculateHashCode",
+            ),
+            (
+                "groovyjarjarantlr4/v4/runtime/atn/PredictionContext",
+                "hashCode",
+            ),
+            (
+                "groovyjarjarantlr4/v4/runtime/atn/PredictionContext$IdentityEqualityComparator",
+                "hashCode",
+            ),
+            (
+                "groovyjarjarantlr4/v4/runtime/atn/SingletonPredictionContext",
+                "equals",
+            ),
+            (
+                "groovyjarjarantlr4/v4/runtime/atn/SingletonPredictionContext",
+                "isEmpty",
+            ),
+            (
+                "groovyjarjarantlr4/v4/runtime/atn/SingletonPredictionContext",
+                "size",
+            ),
+            (
+                "groovyjarjarantlr4/v4/runtime/misc/ObjectEqualityComparator",
+                "equals",
+            ),
+        ] {
+            assert_eq!(
+                check_with(
+                    cls,
+                    mn,
+                    false,
+                    true,
+                    SkipPolicy::Conservative,
+                    &["groovyjarjarantlr4/"],
+                ),
+                Some(SkipReason::RustJvmTestFixture),
+                "{cls}.{mn} must stay interpreted during ANTLR cold-path validation"
+            );
+        }
     }
 
     #[test]

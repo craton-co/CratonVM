@@ -250,6 +250,23 @@ deeper recursive compiled paths still need robust native-stack handling (§6-§7
 dev already passes the test (root-snapshot), so this is a **pure throughput
 follow-up**, not a blocker.
 
+### 2026-07-01 cold-path validation guard
+
+The coarse ANTLR package ban can now be lifted for validation with
+`CRATONVM_JIT_ALLOW_PACKAGES=groovyjarjarantlr4/` without re-enabling the known
+parse-corrupting `PredictionContext` equality/hash cluster. The skip list keeps
+these seven methods interpreted even under that package lift:
+`PredictionContext.{calculateHashCode,hashCode}`,
+`PredictionContext$IdentityEqualityComparator.hashCode`,
+`SingletonPredictionContext.{equals,isEmpty,size}`, and
+`ObjectEqualityComparator.equals`.
+
+This turns the old all-or-nothing cold-path experiment into a narrower validation
+mode: the ATN simulator leaves can be retried after the recursive direct-call
+routing fix, while the already-bisected correctness defect remains contained.
+Pinned by `antlr_coldpath_validation_lifts_non_bad_atn_methods` and
+`antlr_prediction_context_cluster_stays_interpreted_under_validation_lift`.
+
 ### Hibernate HQL reproducer (same cold ANTLR prediction bug)
 
 The Hibernate census H4 timeout (`function.json.JsonArrayUnnestTest`) is the same
@@ -436,7 +453,9 @@ can be archived.
 - 3 general fixes landed on `dev` (pdcache, AssertionError preload,
   hashCode/equals-override compile + cache-key) — all regression-validated.
 - `dev` **passes** `SpringRepositoriesExtensionTests` via the root-snapshot fix.
-- Remaining: (a) the cold-path throughput follow-up (let ATN-sim leaf methods compile
-  via the interpreter path using the §4 inner-invoke guard), which (b) requires the
-  **§7 deep-recursion stack guard (stack banging + fault recovery)** first, because
-  enabling it surfaces the native stack overflow. Neither is a blocker.
+- Remaining: (a) run the real Groovy/HQL cold-path validation with
+  `CRATONVM_JIT_ALLOW_PACKAGES=groovyjarjarantlr4/` now that the known-bad
+  PredictionContext cluster remains interpreted and recursive compile cycles route
+  through guarded dispatch, and (b) finish the **§7 deep-recursion stack guard
+  (stack banging + fault recovery)** before making that lift a production default.
+  Neither is a blocker.
