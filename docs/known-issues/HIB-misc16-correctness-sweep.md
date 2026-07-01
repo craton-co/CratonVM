@@ -246,20 +246,35 @@ wakeup / daemon-thread scheduling / async abort divergence). Distinct from
 
 ---
 
-## 12. UUidV6V7GeneratorTest — Mockito → JDK `AnnotatedTypeFactory` NPE (OPEN, new)
+## 12. UUidV6V7GeneratorTest — Mockito → JDK `AnnotatedTypeFactory` NPE (NPE FIXED; residual hang)
 
 Mockito inline-mock self-attach **succeeds** here (not the kafka bug-09 case).
 ByteBuddy then copies type annotations onto the generated mock's methods and
-calls `AnnotatedType.getAnnotatedOwnerType()` on parameterized types, where the
-real JDK `sun.reflect.annotation.AnnotatedTypeFactory$AnnotatedTypeBaseImpl.
-getLocation()` returns **null** → `NullPointerException` in `popLocation(byte)`
-(`AnnotatedTypeFactory.java:190`), surfacing as
-`MockitoException: cannot mock … SharedSessionContractImplementor`. CratonVM
-feeds the JDK annotated-type factory a malformed/empty `LocationInfo` for these
-owner/parameterized types — sibling of the kafka bug-09 fix #6
-(`getExecutableTypeAnnotationBytes`), now in the `getAnnotatedOwnerType` path.
-Area: `native-builtins` type-annotation-bytes provisioning for parameterized /
-owner types.
+calls `AnnotatedType.getAnnotatedOwnerType()`, where the real JDK
+`AnnotatedTypeBaseImpl.getLocation()` returned **null** → `NullPointerException`
+in `popLocation(byte)` (`AnnotatedTypeFactory.java:190`), surfacing as
+`MockitoException: cannot mock … SharedSessionContractImplementor`.
+
+**Root cause (FIXED).** CratonVM *natively constructs* `AnnotatedTypeBaseImpl`
+(`make_annotated_type` / `make_annotated_type_with_anns`, `native-builtins/src/lang_class.rs`)
+but set only the `type` and `annotations` fields — leaving `location` **null**.
+The non-overridden JDK `getAnnotatedOwnerType()` does `getLocation().popLocation((byte)1)`
+→ NPE. **Fix** (`annotated_type_fill_bookkeeping`): seed
+`location = TypeAnnotation$LocationInfo.BASE_LOCATION` (depth 0 → `popLocation`
+returns null → the owner is rebuilt with BASE_LOCATION by real-JDK code) and
+`allOnSameTargetTypeAnnotations = empty[]`. Isolated with `AtypeProbe.java`
+(no Mockito): pre-fix throws the exact NPE on `getAnnotatedOwnerType()` for a
+nested class and `Map.Entry`; post-fix returns the owner type, matching HotSpot.
+Branch `fix/annotatedtype-location` (commit `3ee5ffaf`, off dev `29acdee7`).
+
+**Residual (separate, OPEN).** With the NPE gone, mock generation proceeds
+further and then **CPU-loops** (100% one core, no progress) inside ByteBuddy /
+Mockito `SubclassBytecodeGenerator.mockClass` for the large
+`SharedSessionContractImplementor` interface — the class-level run now times out
+(120 s/method) instead of failing fast. HotSpot mocks it quickly, so this is a
+distinct CratonVM defect exposed by the NPE fix (busy-loop in JIT-compiled Java;
+needs a symbol build to pinpoint the method — cf. `bug-E-mockito-bytebuddy-hang`).
+So the fix removes the *documented* NPE but does not yet make the test pass.
 
 ---
 
