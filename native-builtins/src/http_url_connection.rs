@@ -1197,7 +1197,13 @@ fn huc_get_output_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     // buffered BAOS tracked by identity; a write-after-`connect()` is legal here
     // exactly as on HotSpot (the body is sent lazily by `getResponseCode`).
     if is_real_carrier(ctx, this) {
-        let do_output = with_real_req(ctx, this, |r| r.do_output);
+        // `doOutput` may have been staged either through our own `setDoOutput`
+        // native (identity-keyed side-table) or via the `java/net/HttpURLConnection`
+        // setter natives that write the real `URLConnection.doOutput` field
+        // directly (whichever won registration). Consult BOTH so the gate never
+        // spuriously reports false and refuses a legitimate write.
+        let do_output = with_real_req(ctx, this, |r| r.do_output)
+            || matches!(ctx.get_field_by_name(this, "doOutput"), Value::Int(1));
         if !do_output {
             return Err(ioex("HttpURLConnection.getOutputStream: doOutput=false"));
         }
@@ -1605,6 +1611,13 @@ fn huc_set_do_output(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     let v = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
     if is_real_carrier(ctx, this) {
         with_real_req(ctx, this, |r| r.do_output = v != 0);
+        // Also mirror onto the real `URLConnection.doOutput` field so the
+        // inherited `getDoOutput()` bytecode (declared on URLConnection, not
+        // overridden here → our per-class native is never consulted for it)
+        // returns the caller's value. Spring's SimpleClientHttpRequest gates the
+        // request-body write on `getDoOutput()`; a stale `false` drops the body
+        // and the server blocks on the promised Content-Length → "Read timed out".
+        ctx.set_field_by_name(this, "doOutput", Value::Int(v));
         return Ok(None);
     }
     ctx.set_field(this, HUC_DO_OUTPUT, Value::Int(v));
@@ -1775,6 +1788,19 @@ fn register_one(r: &mut NativeMethodRegistry, cls: &str) {
     r.register(cls, "setDoOutput", "(Z)V", huc_set_do_output);
     r.register(cls, "setConnectTimeout", "(I)V", huc_set_connect_timeout);
     r.register(cls, "setReadTimeout", "(I)V", huc_set_read_timeout);
+    // Streaming-mode setters are no-ops: our `perform` buffers the request body
+    // (via the overridden `getOutputStream` BAOS) and derives `Content-Length`
+    // from the body / the converter's own header, so the JDK's fixed-length /
+    // chunked streaming machinery is bypassed. The real setters guard on
+    // `chunkLength != -1` / `fixedContentLengthLong != -1`, but our synthetically
+    // constructed carrier never runs URLConnection's field initializers, so those
+    // fields are 0 (not -1) and `setFixedLengthStreamingMode` would throw
+    // `IllegalStateException("Chunked encoding streaming mode set")`. Spring's
+    // `SimpleClientHttpRequest.executeInternal` calls this once `getDoOutput()` is
+    // true — so it only surfaced after the doOutput fix let the body path run.
+    r.register(cls, "setFixedLengthStreamingMode", "(I)V", |_ctx, _args| Ok(None));
+    r.register(cls, "setFixedLengthStreamingMode", "(J)V", |_ctx, _args| Ok(None));
+    r.register(cls, "setChunkedStreamingMode", "(I)V", |_ctx, _args| Ok(None));
     r.register(
         cls,
         "setInstanceFollowRedirects",

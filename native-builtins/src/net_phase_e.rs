@@ -4909,7 +4909,18 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
     r.register(huc, "setDoOutput", "(Z)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let v = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
-        ctx.set_field(this, HUC_DO_OUTPUT, Value::Int(v));
+        // Real-JDK carrier (slot 0 holds the real `URLConnection.url` object,
+        // not our synthetic conn-id int): set the REAL `doOutput` field by name
+        // so the inherited `getDoOutput()` bytecode reports the caller's value.
+        // Writing the synthetic `HUC_DO_OUTPUT` slot on a real object aliases
+        // `connected` — it leaves `doOutput` false (Spring then skips the
+        // request-body write → server blocks on the promised Content-Length →
+        // "Read timed out") AND spuriously marks the connection connected.
+        if matches!(ctx.get_field(this, 0), Value::Object(Some(_))) {
+            ctx.set_field_by_name(this, "doOutput", Value::Int(v));
+        } else {
+            ctx.set_field(this, HUC_DO_OUTPUT, Value::Int(v));
+        }
         Ok(None)
     });
 

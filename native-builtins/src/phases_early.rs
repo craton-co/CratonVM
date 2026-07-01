@@ -14903,7 +14903,16 @@ pub(crate) fn register_phase54_net_extras(r: &mut NativeMethodRegistry) {
     r.register(huc, "setDoOutput", "(Z)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let v = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
-        ctx.set_field(this, 8, Value::Int(v));
+        // Real-JDK carrier (slot 0 holds the real `URLConnection.url`): set the
+        // REAL `doOutput` field by name so inherited `getDoOutput()` reports it.
+        // Writing the synthetic slot 8 on a real object aliases `readTimeout`
+        // and leaves `doOutput` false → Spring skips the request body → server
+        // "Read timed out". See the twin fix in net_phase_e::register_re4_url_http.
+        if matches!(ctx.get_field(this, 0), Value::Object(Some(_))) {
+            ctx.set_field_by_name(this, "doOutput", Value::Int(v));
+        } else {
+            ctx.set_field(this, 8, Value::Int(v));
+        }
         Ok(None)
     });
     r.register(
