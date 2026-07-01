@@ -62,6 +62,29 @@
 > dev**; closing it is gated on the precise per-PC register/RBP-chain marking project,
 > not a localized patch.
 
+> ## Fix candidate 2026-07-01 — bounded cross-thread JIT takeover wait
+>
+> Current `dev` contains a default-on Windows cross-thread JIT takeover path
+> (`vm/src/jit/xt_root_scan.rs`): the STW initiator suspends peers whose `Rip` is
+> inside registered JIT code, scans their integer registers and stack
+> conservatively, excludes them from the barrier quota, and resumes them after
+> GC. That is the broad infrastructure direction for this A4 family because it
+> captures register-resident peer roots at GC time instead of relying on stale
+> snapshots.
+>
+> The takeover driver had a residual barrier race: it performed several takeover
+> passes before `wait_for_all()`, then switched to one unbounded wait. A mutator
+> that entered JIT after the final pre-wait pass could still never arrive
+> cooperatively, recreating the original STW hang/root-gap window. The fix
+> candidate changes the driver to interleave short bounded waits with additional
+> takeover passes until the barrier is actually satisfied. New focused coverage:
+> `barrier_late_reduce_expected_can_satisfy_bounded_wait`; refreshed coverage:
+> `cross_thread_jit_gap_detector_obeys_xt_takeover_gate`.
+>
+> Status remains fix-candidate until the real `CRATONVM_REAL_FORKJOINPOOL=1`
+> Fork6/Fork6Hard lane and the Tomcat real-net/real-AQS classes are soaked on a
+> fresh unique binary.
+
 **Prior status (audit 2026-06-19, retained for history):** 🟡 PARTIAL — the dominant **lost-tag** manifestation is mitigated (conservative interp-local roots under the non-moving sweep, `00429413`) but **only behind the experimental `CRATONVM_REAL_FORKJOINPOOL=1` gate** (the default path is byte-identical baseline). Residual: the worker-forked-subtask reclamation (~15%), then additionally masked by a separate real-FJP `ForkJoinPool` CAS bug. The family-wide precise-JIT-maps default-on (`32649b56`) does **not** close this.
 
 > **Consolidated doc.** This merges the two previous files that described the

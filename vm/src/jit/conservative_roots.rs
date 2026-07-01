@@ -2114,6 +2114,7 @@ mod tests {
             native_pc_offset: 0,
             bytecode_pc: 0,
             frame_slot_offsets: vec![-16],
+            moving_young_coverage_complete: false,
         });
         cm.fully_oop_covered = true;
 
@@ -2131,14 +2132,15 @@ mod tests {
     /// Cross-thread-JIT-gap detector: when a PEER thread holds a live JIT
     /// frame while THIS thread's chain is empty, the detector recognizes the
     /// unsupported multi-thread-in-JIT condition and bumps its diagnostic
-    /// counter. The detector must NEVER mutate the root set — it only observes.
+    /// counter only if cross-thread takeover is disabled. The detector must
+    /// NEVER mutate the root set; it only observes.
     ///
     /// We drive a peer thread into JIT via a handshake (it pushes an entry,
     /// signals, then waits to be released), so the peer's `GLOBAL_JIT_DEPTH`
     /// contribution is live for the duration of our assertions. The main test
     /// thread keeps an empty chain.
     #[test]
-    fn cross_thread_jit_gap_detector_trips_on_peer_in_jit() {
+    fn cross_thread_jit_gap_detector_obeys_xt_takeover_gate() {
         use std::sync::mpsc;
         // Pre-condition: this thread must not itself be in JIT.
         assert_eq!(current_thread_jit_depth(), 0);
@@ -2163,15 +2165,23 @@ mod tests {
             "peer thread should be observable via GLOBAL_JIT_DEPTH"
         );
 
-        // The detector must increment its counter (and must not panic, since
-        // CRATONVM_STRICT_JIT_ROOTS is not set in the test environment).
+        // The detector must align with the takeover gate: default-on takeover
+        // makes this a covered condition, while explicit opt-out keeps the old
+        // diagnostic hit.
         let before = CROSS_THREAD_JIT_GAP_HITS.load(Ordering::Relaxed);
         warn_cross_thread_jit_gap();
         let after = CROSS_THREAD_JIT_GAP_HITS.load(Ordering::Relaxed);
-        assert!(
-            after > before,
-            "detector must record the cross-thread JIT gap (before={before}, after={after})"
-        );
+        if crate::jit::xt_root_scan::enabled() {
+            assert_eq!(
+                after, before,
+                "enabled cross-thread takeover should suppress gap hits"
+            );
+        } else {
+            assert!(
+                after > before,
+                "detector must record the cross-thread JIT gap when takeover is disabled (before={before}, after={after})"
+            );
+        }
 
         // Release the peer and join.
         release_tx.send(()).unwrap();
