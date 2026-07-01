@@ -185,6 +185,20 @@ struct SharedEvac<'a> {
 }
 
 impl<'a> SharedEvac<'a> {
+    fn record_fresh_child(
+        old_ptr: *mut u8,
+        new_ptr: *mut u8,
+        defer_self_forwarded: bool,
+        children: &mut Vec<usize>,
+        deferred_self_forwarded: &mut Vec<usize>,
+    ) {
+        if defer_self_forwarded && old_ptr == new_ptr {
+            deferred_self_forwarded.push(new_ptr as usize);
+        } else {
+            children.push(new_ptr as usize);
+        }
+    }
+
     /// Claim/bump-allocate `size` bytes into `tlab`. Returns the destination
     /// address, or `None` on free-region-pool exhaustion (the same loss
     /// semantics the serial allocator has when it cannot find space).
@@ -379,6 +393,8 @@ impl<'a> SharedEvac<'a> {
         objs: &mut usize,
         bytes: &mut usize,
         children: &mut Vec<usize>,
+        deferred_self_forwarded: &mut Vec<usize>,
+        defer_self_forwarded: bool,
     ) {
         let (kind, etype, alen, nslots) = {
             let h = &*(obj_ptr as *const ObjectHeader);
@@ -400,7 +416,13 @@ impl<'a> SharedEvac<'a> {
                             {
                                 std::ptr::write(slot_ptr as *mut u64, new_ptr as u64);
                                 if fresh {
-                                    children.push(new_ptr as usize);
+                                    Self::record_fresh_child(
+                                        ref_ptr,
+                                        new_ptr,
+                                        defer_self_forwarded,
+                                        children,
+                                        deferred_self_forwarded,
+                                    );
                                 }
                             }
                         }
@@ -421,7 +443,13 @@ impl<'a> SharedEvac<'a> {
                                 let nv = Value::Object(Some(ObjectRef::from_raw(new_ptr)));
                                 std::ptr::write(slot_ptr as *mut Value, nv);
                                 if fresh {
-                                    children.push(new_ptr as usize);
+                                    Self::record_fresh_child(
+                                        ref_ptr,
+                                        new_ptr,
+                                        defer_self_forwarded,
+                                        children,
+                                        deferred_self_forwarded,
+                                    );
                                 }
                             }
                         }
@@ -442,6 +470,7 @@ impl<'a> SharedEvac<'a> {
         forwards: &mut Vec<(usize, usize)>,
         objs: &mut usize,
         bytes: &mut usize,
+        deferred_self_forwarded: &mut Vec<usize>,
     ) {
         if self.cset.contains(&source_idx) {
             return;
@@ -494,7 +523,13 @@ impl<'a> SharedEvac<'a> {
                                 {
                                     std::ptr::write(slot_ptr as *mut u64, new_ptr as u64);
                                     if fresh {
-                                        newly.push(new_ptr as usize);
+                                        Self::record_fresh_child(
+                                            ref_ptr,
+                                            new_ptr,
+                                            true,
+                                            &mut newly,
+                                            deferred_self_forwarded,
+                                        );
                                     }
                                 }
                             }
@@ -515,7 +550,13 @@ impl<'a> SharedEvac<'a> {
                                     let nv = Value::Object(Some(ObjectRef::from_raw(new_ptr)));
                                     std::ptr::write(slot_ptr as *mut Value, nv);
                                     if fresh {
-                                        newly.push(new_ptr as usize);
+                                        Self::record_fresh_child(
+                                            ref_ptr,
+                                            new_ptr,
+                                            true,
+                                            &mut newly,
+                                            deferred_self_forwarded,
+                                        );
                                     }
                                 }
                             }
@@ -542,6 +583,7 @@ impl<'a> SharedEvac<'a> {
         objs: &mut usize,
         bytes: &mut usize,
         forwards: &mut Vec<(usize, usize)>,
+        deferred_self_forwarded: &mut Vec<usize>,
     ) {
         let mut children: Vec<usize> = Vec::new();
         loop {
@@ -555,7 +597,16 @@ impl<'a> SharedEvac<'a> {
             match item {
                 Some(addr) => {
                     children.clear();
-                    self.process_object(tlab, addr as *mut u8, forwards, objs, bytes, &mut children);
+                    self.process_object(
+                        tlab,
+                        addr as *mut u8,
+                        forwards,
+                        objs,
+                        bytes,
+                        &mut children,
+                        deferred_self_forwarded,
+                        true,
+                    );
                     if !children.is_empty() {
                         // Add children to the outstanding count BEFORE retiring
                         // the parent so the counter never transiently hits 0
@@ -572,6 +623,40 @@ impl<'a> SharedEvac<'a> {
                     std::thread::yield_now();
                 }
             }
+        }
+        self.retire_all(tlab);
+    }
+
+    /// Drain evacuation-failed objects after the parallel closure is complete.
+    ///
+    /// A self-forwarded object stays in its original CSet region, so scanning it
+    /// rewrites that from-space object's slots in place. Doing that rewrite in a
+    /// worker can race another worker that is still copying the same object as a
+    /// source. The driver therefore scans these in-place objects only after all
+    /// parallel workers have stopped.
+    unsafe fn drain_deferred_self_forwarded(
+        &self,
+        tlab: &mut TlabSet,
+        forwards: &mut Vec<(usize, usize)>,
+        objs: &mut usize,
+        bytes: &mut usize,
+        work: &mut Vec<usize>,
+    ) {
+        let mut ignored_deferred = Vec::new();
+        let mut scan = 0usize;
+        while scan < work.len() {
+            let addr = work[scan];
+            scan += 1;
+            self.process_object(
+                tlab,
+                addr as *mut u8,
+                forwards,
+                objs,
+                bytes,
+                work,
+                &mut ignored_deferred,
+                false,
+            );
         }
         self.retire_all(tlab);
     }
@@ -2030,19 +2115,29 @@ impl G1Collector {
         let mut bytes = 0usize;
         let mut main_tlab = TlabSet::default();
         let mut main_forwards: Vec<(usize, usize)> = Vec::new();
+        let mut main_deferred_self_forwarded: Vec<usize> = Vec::new();
 
         // Phase 1 (driver): seed roots.
         for root in roots.iter_mut() {
             let old_ptr = root.as_ptr();
             if let Some(ridx) = self.lookup_region_for_addr(old_ptr as usize) {
                 if cset_set.contains(&ridx) {
-                    if let Some((new_ptr, fresh)) =
-                        shared.evacuate(&mut main_tlab, old_ptr, &mut main_forwards, &mut objs, &mut bytes)
+                    if let Some((new_ptr, fresh)) = shared.evacuate(
+                        &mut main_tlab,
+                        old_ptr,
+                        &mut main_forwards,
+                        &mut objs,
+                        &mut bytes,
+                    )
                     {
                         *root = ObjectRef::from_raw(new_ptr);
                         if fresh {
-                            outstanding.fetch_add(1, Ordering::AcqRel);
-                            queue.lock().push(new_ptr as usize);
+                            if new_ptr == old_ptr {
+                                main_deferred_self_forwarded.push(new_ptr as usize);
+                            } else {
+                                outstanding.fetch_add(1, Ordering::AcqRel);
+                                queue.lock().push(new_ptr as usize);
+                            }
                         }
                     }
                 }
@@ -2067,57 +2162,86 @@ impl G1Collector {
                 &mut main_forwards,
                 &mut objs,
                 &mut bytes,
+                &mut main_deferred_self_forwarded,
             );
         }
 
         // Phase 3: parallel transitive closure.
         let nworkers = self.parallel_worker_count();
-        let (extra_objs, extra_bytes, worker_forwards): (usize, usize, Vec<Vec<(usize, usize)>>) =
-            std::thread::scope(|s| {
-                let mut handles = Vec::new();
-                for _ in 1..nworkers {
-                    let shared_ref = &shared;
-                    handles.push(s.spawn(move || {
-                        let mut tlab = TlabSet::default();
-                        let mut o = 0usize;
-                        let mut b = 0usize;
-                        let mut f: Vec<(usize, usize)> = Vec::new();
-                        unsafe {
-                            shared_ref.run_worker(&mut tlab, &mut o, &mut b, &mut f);
-                        }
-                        (o, b, f)
-                    }));
-                }
-                // The driver participates as a worker, reusing its seeded TLAB
-                // and accumulators.
-                unsafe {
-                    shared.run_worker(&mut main_tlab, &mut objs, &mut bytes, &mut main_forwards);
-                }
-                let mut to = 0usize;
-                let mut tb = 0usize;
-                let mut allf: Vec<Vec<(usize, usize)>> = Vec::new();
-                for h in handles {
-                    let (o, b, f) = h.join().expect("g1 parallel-evac worker panicked");
-                    to += o;
-                    tb += b;
-                    allf.push(f);
-                }
-                (to, tb, allf)
-            });
+        let (extra_objs, extra_bytes, worker_forwards, worker_deferred): (
+            usize,
+            usize,
+            Vec<Vec<(usize, usize)>>,
+            Vec<Vec<usize>>,
+        ) = std::thread::scope(|s| {
+            let mut handles = Vec::new();
+            for _ in 1..nworkers {
+                let shared_ref = &shared;
+                handles.push(s.spawn(move || {
+                    let mut tlab = TlabSet::default();
+                    let mut o = 0usize;
+                    let mut b = 0usize;
+                    let mut f: Vec<(usize, usize)> = Vec::new();
+                    let mut d: Vec<usize> = Vec::new();
+                    unsafe {
+                        shared_ref.run_worker(&mut tlab, &mut o, &mut b, &mut f, &mut d);
+                    }
+                    (o, b, f, d)
+                }));
+            }
+            // The driver participates as a worker, reusing its seeded TLAB
+            // and accumulators.
+            unsafe {
+                shared.run_worker(
+                    &mut main_tlab,
+                    &mut objs,
+                    &mut bytes,
+                    &mut main_forwards,
+                    &mut main_deferred_self_forwarded,
+                );
+            }
+            let mut to = 0usize;
+            let mut tb = 0usize;
+            let mut allf: Vec<Vec<(usize, usize)>> = Vec::new();
+            let mut alld: Vec<Vec<usize>> = Vec::new();
+            for h in handles {
+                let (o, b, f, d) = h.join().expect("g1 parallel-evac worker panicked");
+                to += o;
+                tb += b;
+                allf.push(f);
+                alld.push(d);
+            }
+            (to, tb, allf, alld)
+        });
         objs += extra_objs;
         bytes += extra_bytes;
+
+        for f in worker_forwards {
+            main_forwards.extend(f);
+        }
+        for d in worker_deferred {
+            main_deferred_self_forwarded.extend(d);
+        }
+
+        if !main_deferred_self_forwarded.is_empty() {
+            let mut serial_tlab = TlabSet::default();
+            unsafe {
+                shared.drain_deferred_self_forwarded(
+                    &mut serial_tlab,
+                    &mut main_forwards,
+                    &mut objs,
+                    &mut bytes,
+                    &mut main_deferred_self_forwarded,
+                );
+            }
+        }
 
         // Merge the per-worker forward shards into the pointer map consumed by
         // the VM root remap and Phases 4/5.
         let mut pointer_map: HashMap<usize, usize> =
-            HashMap::with_capacity(main_forwards.len() + extra_objs);
+            HashMap::with_capacity(main_forwards.len());
         for (o, n) in main_forwards {
             pointer_map.insert(o, n);
-        }
-        for f in worker_forwards {
-            for (o, n) in f {
-                pointer_map.insert(o, n);
-            }
         }
 
         // DEFECT-2 FIX (part 2 of 2): restore the evacuator's
@@ -7920,6 +8044,52 @@ mod tests {
             Some(12345),
             "live object lost across a second collection (stale self-forward UAF)"
         );
+    }
+
+    /// Regression for the residual parallel self-forward race: workers must not
+    /// scan evacuation-failed CSet objects in place while other workers may still
+    /// be copying from them. The parallel closure defers those in-place scans to
+    /// a serial drain, and that drain must still discover transitive children.
+    #[test]
+    fn parallel_self_forwarded_holders_are_drained_serially() {
+        let gc = G1Collector::new(parallel_config(4, 6));
+        let child = gc.alloc_object(ClassId::new(2), 1);
+        gc.set_field(child, 0, Value::Int(77));
+        let parent = gc.alloc_object(ClassId::new(1), 1);
+        gc.set_field(parent, 0, Value::Object(Some(child)));
+
+        let parent_addr = parent.as_ptr() as usize;
+        let child_addr = child.as_ptr() as usize;
+        let mut roots = vec![parent];
+
+        // Force evacuation failure: leave the young CSet with no free to-space.
+        {
+            let mut regions = gc.regions.lock();
+            for r in regions.iter_mut() {
+                if r.region_type == RegionType::Free {
+                    r.region_type = RegionType::Old;
+                }
+            }
+        }
+
+        let r = gc.young_collection_parallel(&mut roots, &NoopMonitors);
+
+        assert_eq!(roots[0].as_ptr() as usize, parent_addr);
+        assert_eq!(r.pointer_map.get(&parent_addr), Some(&parent_addr));
+        assert_eq!(
+            r.pointer_map.get(&child_addr),
+            Some(&child_addr),
+            "serial drain did not discover the self-forwarded child"
+        );
+
+        let drained_child = match gc.get_field(roots[0], 0) {
+            Value::Object(Some(o)) => o,
+            other => panic!("parent child ref lost after serial drain: {other:?}"),
+        };
+        assert_eq!(drained_child.as_ptr() as usize, child_addr);
+        assert_eq!(gc.get_field(drained_child, 0).as_int(), Some(77));
+        assert!(gc.get_header(roots[0]).forwarding_ptr.is_null());
+        assert!(gc.get_header(drained_child).forwarding_ptr.is_null());
     }
 
     /// Regression (defect 2: persistent forwarding_ptr root-remap). When the
