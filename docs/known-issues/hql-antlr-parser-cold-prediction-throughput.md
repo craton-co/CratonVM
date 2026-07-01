@@ -7,6 +7,13 @@ Same family as the deferred ANTLR deep-recursion / instance-method-tier-up clust
 ([[jit-instance-methods-no-invocation-tierup]],
 [springrepos-extension-hang-jit-throughput-and-deep-recursion.md](springrepos-extension-hang-jit-throughput-and-deep-recursion.md) §6–7).
 
+**2026-07-01 note:** one cold interpreter-path blocker was narrowed: first-call JIT and
+`try_jit_upgrade_with_gate` now allow bytecode overrides of native identity methods
+unless the method body actually invokes a native-shadowed target. This should help
+ANTLR leaf methods such as `PredictionContext.hashCode`, but this HQL issue remains
+open because the larger ATN-simulation bodies still backend-bail and deep compiled
+recursion still needs stack-banging/fault recovery.
+
 ## Symptom
 
 `em.createQuery(hql)` for an HQL statement with a **multi-item select list** takes tens of seconds to PARSE
