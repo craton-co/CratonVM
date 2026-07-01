@@ -45,7 +45,7 @@ CRATONVM_DISABLE_DEFAULT_WATCHDOG=1 $CV --java-home "C:/Program Files/Java/jdk-2
 | 11 | `jpa.transaction.TransactionTimeoutTest` | `getStatus()=0 ACTIVE` | Narayana transaction-reaper thread never fires the 2s timeout | OPEN — new |
 | 12 | `id.uuid.rfc9562.UUidV6V7GeneratorTest` | MockitoException | native `AnnotatedTypeBaseImpl.location` null → `getAnnotatedOwnerType` NPE | **NPE FIXED**; residual = 1M-iteration slowness (§15–16 cluster) |
 | 13 | `batchfetch.DynamicBatchFetchTest` | `testMultiLoad` 120s timeout (param-binding 1/2 now passes) | slowness (2000-row multiLoad); HIB-CV-37 #2 param-binding appears fixed | Route → HIB-CV-37 |
-| 14 | `service.ClassLoaderServiceImplTest` | AssertionError | custom-loader class identity / `loadJavaServices` | Route → HIB-CV-24 |
+| 14 | `service.ClassLoaderServiceImplTest` | AssertionError (2/2) | (a) real-mode `loadClass` skipped `findLoadedClass` (override-first copy lost); (b) `ServiceLoader` read a `file:` descriptor URL as a classpath resource | **FIXED** (this branch; HIB-CV-24 family) |
 | 15 | `query.hql.FunctionTests` | HANG @300s (really ~49× slow) | CPU-bound in interpreter `NativeMethodRegistry::find` (per-invoke native-shadow check, invoke-cache miss); NOT logging | OPEN — slowness (profiled) |
 | 16 | `query.hql.StandardFunctionTests` | HANG @300s (really slow) | same slowness cluster as §15 | OPEN — slowness |
 
@@ -293,12 +293,53 @@ now **passes**; the remaining failure is `testMultiLoad` exceeding the 120 s
 per-test timeout (2000-row insert + `byMultipleIds` multiLoad — slowness, not
 wrong-result). Tracked under `HIB-CV-37`.
 
-## 14. ClassLoaderServiceImplTest — route → HIB-CV-24
+## 14. ClassLoaderServiceImplTest — FIXED (two real-JDK-mode loader bugs)
 
-Both tests `AssertionError` — `testSystemClassLoaderNotOverriding` (a custom
-loader's overriding class must win) and `testStoppableClassLoaderService`
-(`loadJavaServices` via `findResources`). Custom-classloader class-identity /
-service-loader isolation — the HIB-CV-24 loader-isolation family.
+Both tests `AssertionError`; both root-caused and **FIXED** (this branch). Each
+was a distinct, independent real-JDK-mode defect, isolated with standalone
+probes (`ClProbe`/`SlProbe`, custom `ClassLoader` subclass — no Hibernate stack).
+Real-JDK-mode note: `ClassLoader.loadClass`/`findLoadedClass`/`defineClass1` run
+through `native-builtins/src/classloader_real.rs` (+ `service_loader.rs`), **not**
+the synthetic-mode `classloader.rs` natives — the fixes had to land there.
+
+**14a. `testSystemClassLoaderNotOverriding` (HHH-7084) — `loadClass` skipped
+`findLoadedClass`.** `TestClassLoader.overrideClass(Entity.class)` calls
+`defineClass("jakarta.persistence.Entity", bytes…)` to define its OWN copy, then
+`loadClass(name)` must return THAT copy (JVMS §5.3.2 step 1: `c =
+findLoadedClass(name)` before any parent delegation). Probe delta on the unfixed
+binary: `findLoadedClass(name)` correctly returned the overridden class, but
+`loadClass(name)` returned the **app-loader original** — so `assertThat(
+anotherClass).isNotSameAs(testClass)` failed at line 49. Root cause:
+`cl_real_load_class_base` (real-mode base delegation) went straight to the
+flat-global `ctx.load_class` without first consulting the loader's own-defined
+class. **Fix:** for a user-defined loader, call
+`find_loaded_class_for_loader(this, name)` (the exact, no-global-fallback logic
+the `findLoadedClass` native already uses) FIRST and return its result; `None`
+falls through to the existing delegation, so built-in loaders and the null-parent
+`findClass`-deferral path (`AggregatedClassLoader`) are unchanged.
+
+**14b. `testStoppableClassLoaderService` (HHH-8363) — `ServiceLoader` read a
+`file:` descriptor URL as a classpath resource.** `TestClassLoader` overrides
+`findResources` to return a forced `file:` URL for the `TypeContributor` service
+descriptor; `loadJavaServices` must find exactly 1 provider. Probe delta:
+`discover_providers` (`service_loader.rs`) DID obtain the URL via
+`loader.findResources`, but then extracted its path and looked it up with
+`find_all_resource_bytes` — a **classpath-relative** lookup — so an absolute
+`file:/C:/…/META-INF/services/<spi>` path missed and the provider list came back
+empty (`hasSize(1)` got 0 at line 91). **Fix:** when the descriptor URL is a
+plain `file:` URL (no `!/` jar separator), read the file directly from the
+filesystem (`std::fs::read` on the percent-decoded path); the classpath lookup
+remains the fallback for `jar:`/`classpath:` URLs.
+
+**Verification (branch binary):** `service.ClassLoaderServiceImplTest` **2/2
+PASS** (was 0/2). No regressions: sibling
+`bootstrap.registry.classloading.ClassLoaderServiceImplTest` 7/7 (unchanged),
+`proxy.ProxyClassReuseTest` 2 ok/1 fail (unchanged — its `testNoReuse` is the
+still-OPEN dual-isolated-loader item, `hib-proxyclassreuse-loader-blind-class-resolution.md`),
+a normal-delegation probe (custom loader → app/bootstrap parent, stable identity,
+CNFE on miss) matches HotSpot exactly, and `cratonvm-classloading` (527) +
+`cratonvm-native-builtins` (2711) unit tests green. HIB-CV-24 loader-isolation
+family.
 
 ## 15–16. FunctionTests / StandardFunctionTests — slowness cluster, NOT a correctness bug
 
