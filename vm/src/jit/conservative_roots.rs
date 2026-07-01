@@ -340,17 +340,24 @@ pub fn moving_young_osr_shadow_fallback_needed() -> bool {
             // from the live JIT cache entry; it remains valid while the guard is
             // on the stack.
             let cm: &cratonvm_jit::CompiledMethod = unsafe { &*info.compiled_method };
-            if !cm.compiled_via_osr {
-                return false;
-            }
-            let shadow_layout_ok = cm.shadow_thread_slot_off != 0
-                && cm.shadow_savetop_slot_off != 0
-                && cm.shadow_off_in_thread != 0;
-            let precise_map_ok = !cm.has_precise_oop_maps()
-                || (cm.fully_oop_covered && info.exact_rbp != 0);
-            !shadow_layout_ok || debug_shadow_disabled || !precise_map_ok
+            moving_young_osr_method_needs_fallback(cm, info.exact_rbp, debug_shadow_disabled)
         })
     })
+}
+
+fn moving_young_osr_method_needs_fallback(
+    cm: &cratonvm_jit::CompiledMethod,
+    exact_rbp: usize,
+    debug_shadow_disabled: bool,
+) -> bool {
+    if !cm.compiled_via_osr {
+        return false;
+    }
+    let shadow_layout_ok = cm.shadow_thread_slot_off != 0
+        && cm.shadow_savetop_slot_off != 0
+        && cm.shadow_off_in_thread != 0;
+    let precise_map_ok = !cm.has_precise_oop_maps() || (cm.fully_oop_covered && exact_rbp != 0);
+    !shadow_layout_ok || debug_shadow_disabled || !precise_map_ok
 }
 
 /// spring-bug-10 experiment (`CRATONVM_SHADOW_PIN`): when set, the shadow-stack
@@ -1900,6 +1907,62 @@ mod tests {
         assert!(any_thread_in_jit());
         drop(_g);
         assert_eq!(current_thread_jit_depth(), local_before);
+    }
+
+    fn dummy_compiled_method() -> cratonvm_jit::CompiledMethod {
+        cratonvm_jit::CompiledMethod::new(
+            cratonvm_jit::ExecutableBuffer::new(64)
+                .expect("executable buffer alloc must succeed in tests"),
+        )
+    }
+
+    fn add_shadow_osr_layout(cm: &mut cratonvm_jit::CompiledMethod) {
+        cm.compiled_via_osr = true;
+        cm.shadow_thread_slot_off = 8;
+        cm.shadow_savetop_slot_off = 16;
+        cm.shadow_off_in_thread = 24;
+    }
+
+    #[test]
+    fn moving_young_osr_fallback_ignores_non_osr_methods() {
+        let cm = dummy_compiled_method();
+        assert!(!moving_young_osr_method_needs_fallback(&cm, 0, false));
+    }
+
+    #[test]
+    fn moving_young_osr_fallback_requires_shadow_layout() {
+        let mut cm = dummy_compiled_method();
+        cm.compiled_via_osr = true;
+        assert!(moving_young_osr_method_needs_fallback(&cm, 0, false));
+    }
+
+    #[test]
+    fn moving_young_osr_fallback_accepts_shadow_layout_without_precise_maps() {
+        let mut cm = dummy_compiled_method();
+        add_shadow_osr_layout(&mut cm);
+        assert!(!moving_young_osr_method_needs_fallback(&cm, 0, false));
+    }
+
+    #[test]
+    fn moving_young_osr_fallback_requires_exact_rbp_for_precise_maps() {
+        let mut cm = dummy_compiled_method();
+        add_shadow_osr_layout(&mut cm);
+        cm.push_oop_map(cratonvm_jit::OopMapEntry {
+            native_pc_offset: 0,
+            bytecode_pc: 0,
+            frame_slot_offsets: vec![-16],
+        });
+        cm.fully_oop_covered = true;
+
+        assert!(moving_young_osr_method_needs_fallback(&cm, 0, false));
+        assert!(!moving_young_osr_method_needs_fallback(&cm, 0x1000, false));
+    }
+
+    #[test]
+    fn moving_young_osr_fallback_honors_debug_shadow_disable() {
+        let mut cm = dummy_compiled_method();
+        add_shadow_osr_layout(&mut cm);
+        assert!(moving_young_osr_method_needs_fallback(&cm, 0, true));
     }
 
     /// Cross-thread-JIT-gap detector: when a PEER thread holds a live JIT
