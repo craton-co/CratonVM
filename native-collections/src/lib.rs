@@ -27082,6 +27082,16 @@ fn register_concurrent_hashmap_natives(r: &mut NativeMethodRegistry) {
 
 // --- ConcurrentHashMap segmented native functions (Phase 86.2) ---
 
+fn chm_reject_null_key(key: &Value) -> Result<(), MethodCallFailed> {
+    if matches!(key, Value::Object(None)) {
+        return Err(RuntimeError::NullPointerException {
+            message: Some("ConcurrentHashMap does not permit null keys".to_string()),
+        }
+        .into());
+    }
+    Ok(())
+}
+
 fn native_chm_init_default(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
@@ -27286,6 +27296,7 @@ fn native_chm_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         _ => return Ok(Some(Value::Object(None))),
     };
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
+    chm_reject_null_key(&key)?;
     let hash = chm_key_hash(ctx, &key)?;
     match chm_segment_for(ctx, this, hash) {
         Some(seg) => Ok(Some(
@@ -27301,6 +27312,7 @@ fn native_chm_contains_key(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         _ => return Ok(Some(Value::Int(0))),
     };
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
+    chm_reject_null_key(&key)?;
     let hash = chm_key_hash(ctx, &key)?;
     match chm_segment_for(ctx, this, hash) {
         Some(seg) => {
@@ -27324,6 +27336,7 @@ fn native_chm_get_or_default(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     };
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     let default = args.get(2).copied().unwrap_or(Value::Object(None));
+    chm_reject_null_key(&key)?;
     let hash = chm_key_hash(ctx, &key)?;
     match chm_segment_for(ctx, this, hash) {
         Some(seg) => match chm_seg_get(ctx, seg, key)? {
@@ -27387,12 +27400,7 @@ fn native_chm_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     // permitted), mirroring the guard in native_chm_put. Without this, Spring's
     // SimpleAliasRegistry.removeAlias(null) returned silently instead of NPE
     // (SimpleAliasRegistryTests.removeNullAlias).
-    if matches!(key, Value::Object(None)) {
-        return Err(RuntimeError::NullPointerException {
-            message: Some("ConcurrentHashMap does not permit null keys".to_string()),
-        }
-        .into());
-    }
+    chm_reject_null_key(&key)?;
     let hash = chm_key_hash(ctx, &key)?;
     match chm_segment_for(ctx, this, hash) {
         Some(seg) => {
@@ -27818,6 +27826,7 @@ fn native_chm_remove_kv(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     };
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     let expected_val = args.get(2).copied().unwrap_or(Value::Object(None));
+    chm_reject_null_key(&key)?;
     let hash = chm_key_hash(ctx, &key)?;
     match chm_segment_for(ctx, this, hash) {
         Some(seg) => {

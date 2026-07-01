@@ -12,13 +12,27 @@
 
 mod common;
 
-use common::{boxed_int, build_registry, call, new_hashmap, MockCtx};
+use common::{boxed_int, build_registry, call, new_concurrent_hashmap, new_hashmap, MockCtx};
 use cratonvm_native_api::NativeContext;
+use cratonvm_types::error::{MethodCallFailed, RuntimeError, VmError};
 use cratonvm_types::Value;
 
 const HM: &str = "java/util/HashMap";
+const CHM: &str = "java/util/concurrent/ConcurrentHashMap";
 const PUT: &str = "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;";
 const GET: &str = "(Ljava/lang/Object;)Ljava/lang/Object;";
+
+fn assert_null_pointer(result: cratonvm_types::error::MethodCallResult) {
+    assert!(
+        matches!(
+            result,
+            Err(MethodCallFailed::InternalError(VmError::Runtime(
+                RuntimeError::NullPointerException { .. }
+            )))
+        ),
+        "expected NullPointerException, got {result:?}"
+    );
+}
 
 #[test]
 fn empty_get_returns_null() {
@@ -87,6 +101,39 @@ fn single_put_get_round_trip() {
     )
     .unwrap();
     assert_eq!(size, Some(Value::Int(1)));
+}
+
+#[test]
+fn concurrent_hashmap_null_key_methods_throw_npe() {
+    let reg = build_registry();
+    let mut ctx = MockCtx::new();
+    let chm = new_concurrent_hashmap(&reg, &mut ctx);
+    let fallback = boxed_int(&mut ctx, 99);
+
+    for (method, desc, args) in [
+        (
+            "get",
+            "(Ljava/lang/Object;)Ljava/lang/Object;",
+            vec![Value::Object(Some(chm)), Value::Object(None)],
+        ),
+        (
+            "containsKey",
+            "(Ljava/lang/Object;)Z",
+            vec![Value::Object(Some(chm)), Value::Object(None)],
+        ),
+        (
+            "getOrDefault",
+            "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+            vec![Value::Object(Some(chm)), Value::Object(None), fallback],
+        ),
+        (
+            "remove",
+            "(Ljava/lang/Object;Ljava/lang/Object;)Z",
+            vec![Value::Object(Some(chm)), Value::Object(None), fallback],
+        ),
+    ] {
+        assert_null_pointer(call(&reg, &mut ctx, CHM, method, desc, &args));
+    }
 }
 
 #[test]
