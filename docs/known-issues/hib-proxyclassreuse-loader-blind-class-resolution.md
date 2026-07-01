@@ -139,9 +139,41 @@ It was committed (`1deffb7d`) and then reverted (`b1e5e6c7`).
 > and `native-builtins/src/lookup_define.rs::lk_define_class_b` (live, registered
 > last). Only edit the live one.
 
+## Manifestation — Spring `scripting.bsh.BshScriptFactoryTests` (2026-07-01)
+
+Same family; a concrete instance of the **"Known remaining limitation"** above
+(builtin-loader `findLoadedClass` / `get_loaded_class_id` scanning `user_loaders`).
+3 methods fail (`staticPrototypeScript`, `resourceScriptFromTag`,
+`nonStaticPrototypeScript`) with `ClassCastException: MyMessenger cannot be cast to
+org.springframework.scripting.ConfigurableMessenger` (or `$Proxy29 …`).
+
+Two BeanShell scripts declare the **same class name `MyMessenger`**:
+`MessengerInstance.bsh` (`implements Messenger`) and `MessengerImpl.bsh`
+(`implements TestBeanAwareMessenger`). `ScriptFactoryPostProcessor` eagerly evals
+*all* script beans (even lazy ones) to predict types, so both run. On HotSpot each
+bsh interpreter defines its `MyMessenger` into a distinct per-interpreter
+`BshClassLoader`; on CratonVM the **first** define lands in the Application namespace
+and the **second** interpreter's `findLoadedClass("MyMessenger")` on the app loader
+**reuses** it (`find_loaded_class_for_loader`'s guard only skips generated `$Proxy`
+names, not bsh classes), so the second class — with the correct interface — is never
+generated. Only one `MyMessenger` is ever defined.
+
+Confirmed the **gate alone is insufficient here**: `CRATONVM_LOADER_AWARE_RESOLUTION=1`
+isolates the first define to `UserDefined(N)` but the bug persists, because
+`find_loaded_class_for_loader` for a *builtin* requesting loader still returns the
+user-loader's class via the global walk — the reverse-direction pollution flagged in
+"Known remaining limitation". Complete fix = per-loader-namespaced resolution **plus**
+a `find_loaded_class_for_loader` correction (broadening its `is_generated_proxy_name`
+guard without hiding ByteBuddy/Hibernate/CGLIB/Mockito app-namespace classes — the
+same conflict this doc is about). Standalone seconds-fast repro:
+`ClassPathXmlApplicationContext("bshContext.xml")` run directly on `cratonvm.exe`
+(HotSpot baseline needs `--add-opens java.base/java.lang=ALL-UNNAMED` for bsh's
+reflective `defineClass`).
+
 ## Impact
 
 - `ProxyClassReuseTest.testNoReuse` (1 of 3 methods).
+- Spring `BshScriptFactoryTests` (3 methods) — see manifestation above.
 - The same loader-blind resolution underlies other custom-loader-isolation
   residuals (cf. **SBR-14** `URLClassLoader(parent=null)` bypass and the
   `SC-custom-classloader` family). Any application that relies on the same class
