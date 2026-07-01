@@ -703,6 +703,9 @@ mod windows_fault {
         if module_base != 0 && fault_addr >= module_base {
             let _ = writeln!(report, "#  faulting RVA: 0x{:X}", fault_addr - module_base);
         }
+        if let Some(name) = cratonvm_jit::lookup_jit_method_name(fault_addr) {
+            let _ = writeln!(report, "#  faulting JIT method: {}", name);
+        }
         let _ = writeln!(report, "#");
         let _ = writeln!(report, "Native frames (most recent call first) [raw]:");
         for (i, &a) in raw.iter().take(n).enumerate() {

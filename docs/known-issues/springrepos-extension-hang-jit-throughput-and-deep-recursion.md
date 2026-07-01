@@ -419,6 +419,26 @@ This is still not the full stack-banging / fault-recovery design above, and the
 cold-path throughput experiment still needs separate validation before this doc
 can be archived.
 
+### 2026-07-01 follow-up: x64 stack-bang containment
+
+The x64 single-pass backend now emits stack-bang probes in every normal compiled
+method prologue. Before `sub rsp, frame_size`, it touches each 4 KiB page crossed
+by the frame allocation and bails compilation if an extreme frame would need more
+than 512 inline probes. After the subtract, it touches one additional page below
+the final RSP so a missed direct-recursion edge trips at the method prologue
+instead of later corrupting shadow-stack / operand-stack metadata. This is
+default-on and can be disabled for A/B runs with `CRATONVM_JIT_STACK_BANG=0` or
+`CRATONVM_JIT_NO_STACK_BANG=1`.
+
+The Windows VEH crash report also names the faulting JIT method for the faulting
+RIP when `CRATONVM_DBG_JIT_NAMES=1`, including the `EXCEPTION_STACK_OVERFLOW`
+case where the handler intentionally skips stack walking.
+
+This is still containment, not full Java-level recovery: the handler does not yet
+rewrite the trapped JIT frame into a resumable deopt or stash a catchable
+`StackOverflowError` from the fault context. The remaining production-grade item
+is the fault-recovery half of the design.
+
 ---
 
 ## 8. Repros & tooling (all under `apps/spring-boot/buildSrc/runner/`)
@@ -458,4 +478,6 @@ can be archived.
   PredictionContext cluster remains interpreted and recursive compile cycles route
   through guarded dispatch, and (b) finish the **§7 deep-recursion stack guard
   (stack banging + fault recovery)** before making that lift a production default.
-  Neither is a blocker.
+  The stack-bang probes are now in place; the remaining part is resumable
+  fault recovery / catchable `StackOverflowError` routing from the fault
+  context. Neither is a blocker.
