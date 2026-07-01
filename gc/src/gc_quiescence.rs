@@ -156,6 +156,35 @@ pub fn unregistered_jit_frame_on_stack() -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// Per-cycle fallback for incomplete rewritable JIT coverage
+// ---------------------------------------------------------------------------
+//
+// `CRATONVM_MOVING_YOUNG` is only sound while every live JIT-held oop is
+// published through a precise, rewritable root channel. If the VM detects an
+// active JIT frame whose coverage is incomplete, it conservatively scans that
+// frame and sets this per-thread flag so the generational collector runs the
+// non-moving young sweep for this cycle instead of moving objects behind raw
+// JIT frame slots.
+
+thread_local! {
+    static FORCE_NON_MOVING_JIT_ROOTS: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+pub fn set_force_non_moving_jit_roots() {
+    FORCE_NON_MOVING_JIT_ROOTS.with(|c| c.set(true));
+}
+
+pub fn clear_force_non_moving_jit_roots() {
+    FORCE_NON_MOVING_JIT_ROOTS.with(|c| c.set(false));
+}
+
+#[inline]
+pub fn force_non_moving_jit_roots() -> bool {
+    FORCE_NON_MOVING_JIT_ROOTS.with(|c| c.get())
+}
+
+// ---------------------------------------------------------------------------
 // Stage B (precise oop maps, B-K fix) — movable precise-JIT roots
 // ---------------------------------------------------------------------------
 //

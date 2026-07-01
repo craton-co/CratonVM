@@ -58,6 +58,10 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     // reflects only THIS collection's stack (republished by the JIT-frame scan
     // below, under G1). See that scan site and `G1Collector::young_collection`.
     cratonvm_gc::gc_quiescence::clear_pinned_jit_roots();
+    // Reset the per-cycle incomplete-JIT-coverage fallback. The JIT root scan
+    // below sets it again if moving-young must use the conservative/non-moving
+    // path for this collection.
+    cratonvm_gc::gc_quiescence::clear_force_non_moving_jit_roots();
     // A5 fix: reset the unregistered-JIT-frame flag; `scan_active_jit_frames`
     // below re-sets it iff it finds a guard-less JIT frame on the native stack,
     // and the generational collector consults it to pick the non-moving sweep.
@@ -304,15 +308,23 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     let jit_scan_start = roots.len();
     // Moving young gen (`CRATONVM_MOVING_YOUNG`): the shadow stack now publishes a
     // COMPLETE rewritable precise root map for every live JIT frame, so the
-    // conservative frame scan is SUPPRESSED. Running it anyway would fold
-    // un-rewritable slot values into `roots` that the moving Cheney copy would
-    // relocate but could not patch — and a false-positive non-oop word would pin
-    // (or mis-relocate) a random object. "Once a frame is precise, it must be
-    // fully precise" (default-moving-young-gen.md, Risks): rely solely on the
-    // shadow stack (folded in at 14b below) plus the interpreter/statics/JNI
-    // roots. On any non-moving path this scan remains the authoritative JIT root
-    // set.
-    if !crate::jit::conservative_roots::moving_young_enabled() {
+    // conservative frame scan is normally SUPPRESSED. Running it anyway would
+    // fold un-rewritable slot values into `roots` that the moving Cheney copy
+    // would relocate but could not patch — and a false-positive non-oop word
+    // would pin (or mis-relocate) a random object. "Once a frame is precise, it
+    // must be fully precise" (default-moving-young-gen.md, Risks): rely solely
+    // on the shadow stack (folded in at 14b below) plus the
+    // interpreter/statics/JNI roots. If an active OSR frame cannot prove that
+    // coverage, we deliberately re-enable the conservative scan and tell the
+    // collector to use the non-moving sweep for this cycle. On any non-moving
+    // path this scan remains the authoritative JIT root set.
+    let moving_young = crate::jit::conservative_roots::moving_young_enabled();
+    let moving_young_osr_fallback =
+        moving_young && crate::jit::conservative_roots::moving_young_osr_shadow_fallback_needed();
+    if moving_young_osr_fallback {
+        cratonvm_gc::gc_quiescence::set_force_non_moving_jit_roots();
+    }
+    if !moving_young || moving_young_osr_fallback {
         crate::jit::conservative_roots::scan_active_jit_frames(&shared.heap, &mut roots);
     }
     // G1 pin-in-place for conservative JIT roots: the generational collector
@@ -355,7 +367,8 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
         // "pinning OOMs bt18" was reasoned for pinning the WHOLE operand stack,
         // never measured for this transient minimal set; this gate lets us
         // measure it directly.
-        let pin = crate::jit::conservative_roots::shadow_pin_roots();
+        let pin =
+            crate::jit::conservative_roots::shadow_pin_roots() || moving_young_osr_fallback;
         // spring-bug-10 diagnostic: log this thread's shadow-stack depth at each
         // GC. A monotonically growing depth across collections means the JIT
         // `top` is DRIFTING (a push without a paired reload) — which makes the

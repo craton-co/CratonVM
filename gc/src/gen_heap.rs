@@ -2645,18 +2645,26 @@ impl GenerationalHeap {
         // (abort-free) non-moving sweep for that cycle regardless of the flag. The
         // suppressed conservative scan means that fallback sweep also relies on the
         // complete shadow map for marking — consistent, since the shadow map is the
-        // sole precise JIT root set under this flag.
-        let moving_young = crate::gc_quiescence::moving_young_enabled();
-        let divert_non_moving = (has_conservative_roots && !moving_young) || honor_promotion_oom_risk;
+        // sole precise JIT root set under this flag. If the VM detected an
+        // incomplete OSR shadow layout during root gathering, it sets
+        // `force_non_moving_jit_roots`; then this cycle treats moving-young as
+        // unavailable and uses the conservative/non-moving fallback instead.
+        let moving_young_requested = crate::gc_quiescence::moving_young_enabled();
+        let force_non_moving_jit_roots = crate::gc_quiescence::force_non_moving_jit_roots();
+        let moving_young = moving_young_requested && !force_non_moving_jit_roots;
+        let divert_non_moving =
+            (has_conservative_roots && !moving_young) || honor_promotion_oom_risk;
         if divert_non_moving && !force_moving {
             tracing::debug!(
                 "running non-moving young-gen mark-sweep (jit_active={}, \
-                 unregistered_jit_frame={}, promotion_oom_risk={}, honored={}, moving_young={}) — compaction deferred.",
+                 unregistered_jit_frame={}, promotion_oom_risk={}, honored={}, moving_young={}, \
+                 force_non_moving_jit_roots={}) — compaction deferred.",
                 crate::gc_quiescence::is_active(),
                 crate::gc_quiescence::unregistered_jit_frame_on_stack(),
                 promotion_oom_risk,
                 honor_promotion_oom_risk,
                 moving_young,
+                force_non_moving_jit_roots,
             );
             let result = self.sweep_young_non_moving(roots, finalizer_addrs);
             // BUG-V fix: the non-moving sweep still *relocates* objects via

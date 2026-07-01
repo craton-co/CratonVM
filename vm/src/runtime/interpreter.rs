@@ -20781,12 +20781,11 @@ fn try_osr(
 
     // Set JIT thread for invoke dispatch callbacks (save/restore for re-entrancy)
     let saved_jit_thread = crate::jit::helpers::set_jit_thread(thread);
-    // Shadow-stack (follow-up §1): capture this `*mut JvmThread` so the OSR
-    // trampoline can cache it and the OSR-entered frame's safepoints push/reload
-    // precisely (instead of skipping shadow tracking). `set_jit_thread` just
-    // allocated this thread's shadow stack — it's the same thread. The value is a
-    // raw address (Copy `i64`, holds no borrow), so the closure below captures it
-    // by value and `thread` stays free for later use.
+    // Capture this `*mut JvmThread` so the OSR trampoline can cache it and the
+    // OSR-entered frame's safepoints push/reload precisely. `set_jit_thread`
+    // just allocated this thread's shadow stack; the value is a raw address
+    // (Copy `i64`, holds no borrow), so the closure below captures it by value
+    // and `thread` stays free for later use.
     // Cast: reinterpret pointer/address to typed pointer
     let thread_ptr = thread as *mut JvmThread as i64;
     // NEW-1.5 + T1.1.a: record native stack pointer for GC root scan.

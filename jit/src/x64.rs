@@ -15596,14 +15596,11 @@ impl Compiler {
                 } else {
                     self.osr_entry_native[pc] = self.buf.pos() as i32; // Cast: x86-64 immediate encoding
                                                                        // Shadow-stack note: this position is reached by BOTH the OSR
-                                                                       // entry (which bypasses the prologue → thread/watermark slots
-                                                                       // uninitialised) AND the initial fall-through (slots already
-                                                                       // set by the prologue). So we can't (re)initialise the slots
-                                                                       // here without corrupting the normal path. Instead the VM-side
-                                                                       // OSR setup zeroes the slots before jumping (see
-                                                                       // `CompiledMethod::shadow_thread_slot_off` / try_osr), which
-                                                                       // makes OSR-entered frames skip shadow tracking via the
-                                                                       // null-guards (safe; precise OSR-frame tracking is a follow-up).
+                                                                       // entry (which bypasses the prologue) AND the initial fall-through
+                                                                       // (slots already set by the prologue). So we can't (re)initialise
+                                                                       // the slots here without corrupting the normal path. The OSR
+                                                                       // trampoline initializes the cached thread/watermark slots before
+                                                                       // jumping here.
 
                     // deopt-osr Step 7: this PC is an OSR-vetted loop boundary
                     // (outside every LICM-hoisted body — the `else` branch), so
@@ -24450,6 +24447,7 @@ pub fn compile_with_param_slots(
     cm.osr_callee_saved_xmms = Some(compiler.alloc_used_xmms.clone());
     cm.osr_xmm_saved_base = compiler.xmm_saved_base;
     cm.osr_heap_local_offset = compiler.heap_local_offset;
+    cm.osr_frame_record = compiler.helpers.frame_record;
 
     // T1.1.a — transfer precise oop maps collected during codegen.
     // The GC root walker's `JitEntryGuard::enter_with_compiled` path
@@ -24521,7 +24519,10 @@ pub fn compile_with_param_slots(
     // register-locals (`safepoint_pcs`) also recorded a precise oop map
     // (`mapped_safepoint_pcs`), the precise gate is on (so the sp-id slot
     // exists and the per-safepoint id is stored), and there is no construct the
-    // current mapping cannot describe (inlined-callee safepoints, OSR entry).
+    // current mapping cannot describe (inlined-callee safepoints). OSR entry
+    // used to be a coverage breaker because it bypassed the prologue's shadow
+    // and exact-RBP setup; the OSR trampoline now mirrors both before jumping to
+    // the loop body, so OSR artifacts use the same completeness predicate.
     // Stage B consults this to decide whether the GC may skip the conservative
     // backstop for this frame and treat its precise oops as movable. It is a
     // NECESSARY codegen precondition; the runtime `CRATONVM_DBG_VERIFY_OOP_MAPS`
@@ -24531,15 +24532,14 @@ pub fn compile_with_param_slots(
     // is on AND Stage B lands.
     cm.fully_oop_covered = compiler.precise_maps
         && compiler.sp_id_slot_off != 0
-        && !cm.compiled_via_osr
         && compiler.inline_sites.is_empty()
         && compiler
             .safepoint_pcs
             .is_subset(&compiler.mapped_safepoint_pcs);
     // Shadow-stack — frame offsets + thread-struct offset, so the OSR trampoline
     // can replicate the prologue's shadow setup (cache the thread ptr + snapshot
-    // the `top` watermark) for OSR-entered frames (follow-up §1). All 0 when the
-    // shadow-stack gate was off at compile.
+    // the `top` watermark) for OSR-entered frames. All 0 when shadow-stack
+    // support was off at compile.
     cm.shadow_thread_slot_off = compiler.shadow_thread_slot_off;
     cm.shadow_savetop_slot_off = compiler.shadow_savetop_slot_off;
     cm.shadow_off_in_thread = compiler.shadow_off_in_thread;

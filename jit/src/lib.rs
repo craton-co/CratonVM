@@ -914,11 +914,8 @@ pub fn jit_names_enabled() -> bool {
 /// the whole-method re-run — the safety net. The flip rides on the
 /// correctness-verified non-moving young-gen + conservative-OSR-backstop GC
 /// foundation (precise-jit-maps default-on); it does NOT enable the OSR-exit
-/// in-place transfer (`CRATONVM_OSR_EXIT_TRANSFER`) or the moving-GC OSR-frame
-/// tracking (`CRATONVM_SHADOW_OSR_TRACK`), which stay default-off — so OSR-exit
-/// uses the safe reject path. When a moving young gen later becomes the default,
-/// re-evaluate the OSR-frame relocation (`SHADOW_OSR_TRACK`) before relying on
-/// OSR-exit transfer.
+/// in-place transfer (`CRATONVM_OSR_EXIT_TRANSFER`), which stays default-off —
+/// so OSR-exit uses the safe reject path.
 pub fn deopt_real_enabled() -> bool {
     static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *CACHE.get_or_init(|| match std::env::var("CRATONVM_DEOPT_REAL") {
@@ -1110,13 +1107,16 @@ pub struct CompiledMethod {
     pub osr_xmm_saved_base: i32,
     /// OSR metadata: offset of VM context pointer in frame.
     pub osr_heap_local_offset: i32,
+    /// OSR metadata: optional `jit_frame_record` helper pointer. Normal method
+    /// entry records exact RBP from the JIT prologue; OSR bypasses that
+    /// prologue, so the trampoline records its own RBP after `mov rbp, rsp`.
+    /// 0 when precise maps are disabled or the helper table is absent.
+    pub osr_frame_record: usize,
     /// Shadow-stack: frame offset (`[rbp - off]`) of the cached thread-pointer
-    /// slot. A normal entry sets it in the prologue. An OSR entry (which bypasses
-    /// the prologue thread-fetch) zeroes it by default → the push/reload/epilogue
-    /// null-guards make that frame SKIP shadow tracking; under the opt-in
-    /// `CRATONVM_SHADOW_OSR_TRACK` sub-gate it instead stores the real
-    /// `*mut JvmThread` passed through `osr_enter` so the OSR frame is tracked
-    /// (follow-up §1). 0 when shadow disabled.
+    /// slot. A normal entry sets it in the prologue. An OSR entry bypasses that
+    /// prologue, so the OSR trampoline stores the real `*mut JvmThread` passed
+    /// through `osr_enter` and snapshots the shadow watermark before jumping to
+    /// the loop body. 0 when shadow disabled.
     pub shadow_thread_slot_off: i32,
     /// Shadow-stack: frame offset (`[rbp - off]`) of the saved `top` watermark
     /// slot. The OSR trampoline snapshots `thread.shadow_stack.top` here at entry
@@ -1392,6 +1392,7 @@ impl CompiledMethod {
             osr_callee_saved_xmms: None,
             osr_xmm_saved_base: 0,
             osr_heap_local_offset: 0,
+            osr_frame_record: 0,
             shadow_thread_slot_off: 0,
             shadow_savetop_slot_off: 0,
             shadow_off_in_thread: 0,
@@ -1448,6 +1449,7 @@ impl CompiledMethod {
             osr_callee_saved_xmms: None,
             osr_xmm_saved_base: 0,
             osr_heap_local_offset: 0,
+            osr_frame_record: 0,
             shadow_thread_slot_off: 0,
             shadow_savetop_slot_off: 0,
             shadow_off_in_thread: 0,
@@ -1789,9 +1791,9 @@ impl CompiledMethod {
     /// `vm_ptr` must be a valid SharedVm pointer. `jit_locals` must contain exactly
     /// `osr_num_locals` i64 values in local-index order. `thread_ptr` must be the
     /// current `*mut JvmThread` (whose shadow stack is already allocated by
-    /// `set_jit_thread`) when the shadow-stack gate is on, so this OSR-entered
-    /// frame is precisely tracked; pass 0 to opt out of shadow tracking (tests).
-    /// See `emit_osr_trampoline` (follow-up §1).
+    /// `set_jit_thread`) when shadow-stack frame slots exist, so this
+    /// OSR-entered frame is precisely tracked; pass 0 to opt out of shadow
+    /// tracking in tests.
     #[cfg(target_arch = "x86_64")]
     #[inline(never)]
     pub unsafe fn osr_enter(
@@ -1834,6 +1836,7 @@ impl CompiledMethod {
             self.osr_callee_saved_xmms.as_deref(),
             self.osr_xmm_saved_base,
             self.osr_heap_local_offset,
+            self.osr_frame_record,
             self.needs_context,
             dead_mask,
             self.shadow_thread_slot_off,
@@ -1867,35 +1870,13 @@ fn osr_trampoline_cache() -> &'static parking_lot::Mutex<FxHashMap<usize, Arc<Ex
     CACHE.get_or_init(|| parking_lot::Mutex::new(FxHashMap::default()))
 }
 
-/// Shadow-stack OSR-frame tracking sub-gate (follow-up §1), default-OFF.
-///
-/// When set, an OSR-entered frame replicates the prologue's shadow setup (caches
-/// the real thread ptr + snapshots the `top` watermark) so its live oops are
-/// pushed/reloaded and precisely relocated under a moving GC, instead of skipping
-/// shadow tracking. Kept separate from `CRATONVM_SHADOW_STACK` because tracking
-/// the OSR'd `binaryTrees` frame currently regresses bt18 (a conservative-pin ×
-/// precise-move interaction). Read once and cached so the cached trampoline
-/// bodies (keyed by `target_addr`) stay consistent for the whole run.
-///
-/// **EXPERIMENTAL — retained default-off scaffolding (precise-jit-maps-default.md
-/// Steps 5 + 6, 2026-06-22).** Step 5 accepted the conservative backstop for OSR
-/// frames as the default policy, so this sub-gate is *not* the correctness path;
-/// it is a **partial** moving-relocation aid (moves bt18 67674804 → 68199090,
-/// still short of the golden 68332206) for a possible future moving young gen.
-/// Step 6 decided to **keep, not remove** it — experimental, default-off, paired
-/// with `cratonvm_jit::x64::shadow_stack_maps_enabled`; do not enable in production.
-fn osr_shadow_track_enabled() -> bool {
-    static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *G.get_or_init(|| std::env::var_os("CRATONVM_SHADOW_OSR_TRACK").is_some())
-}
-
 /// Emit a fresh OSR trampoline body for the given destination + frame layout.
 ///
 /// The emitted code expects three arguments via the platform C ABI:
 ///   * arg0 (RCX on Windows / RDI on SysV) = `locals_ptr: *const i64`
 ///   * arg1 (RDX on Windows / RSI on SysV) = `vm_ptr: i64` (only read when `needs_context`)
-///   * arg2 (R8 on Windows / RDX on SysV) = `thread_ptr: i64` (only read when the
-///     shadow-stack OSR-tracking sub-gate is on; see `osr_shadow_track_enabled`)
+///   * arg2 (R8 on Windows / RDX on SysV) = `thread_ptr: i64` (read when shadow
+///     slots exist; tests may pass 0, which disables tracking via null guards)
 ///
 /// It saves callee-saved registers used for locals, optionally stores `vm_ptr`
 /// into the heap-local slot, sets up shadow-stack tracking for the OSR frame,
@@ -1915,6 +1896,7 @@ unsafe fn emit_osr_trampoline(
     callee_saved_xmms: Option<&[u8]>,
     xmm_saved_base: i32,
     heap_local_offset: i32,
+    frame_record: usize,
     needs_context: bool,
     dead_mask: u64,
     shadow_thread_slot_off: i32,
@@ -1925,7 +1907,7 @@ unsafe fn emit_osr_trampoline(
 
     // Platform C-ABI argument register numbers.
     // arg0 carries `locals_ptr`, arg1 carries `vm_ptr`, arg2 carries `thread_ptr`
-    // (the shadow-stack thread pointer, follow-up §1). All three are caller-saved
+    // (the shadow-stack thread pointer). All three are caller-saved
     // on both ABIs, and none overlaps any register in `LOCAL_REGS`, so saving
     // arg0 into R10 first cannot clobber a callee-saved local target before
     // we've spilled it, and arg2 survives to the shadow-track block below
@@ -2047,31 +2029,64 @@ unsafe fn emit_osr_trampoline(
         tramp.emit(&neg_off.to_le_bytes());
     }
 
-    // Shadow-stack OSR-frame handling (follow-up §1). An OSR entry bypasses the
-    // prologue thread-fetch, so the cached-thread slot would otherwise hold stale
-    // stack garbage. Two modes:
-    //   * DEFAULT (gate off): zero the slot (clobber-free `MOV qword [rbp-off],0`,
-    //     REX.W C7 /0) so the push/reload/epilogue null-guards make this frame
-    //     SKIP shadow tracking — the proven-golden behaviour for
-    //     `CRATONVM_SHADOW_STACK` (bt18 relies on its make/check spine + the
-    //     from-space staleness window for the OSR'd `binaryTrees` frame).
-    //   * `CRATONVM_SHADOW_OSR_TRACK=1`: TRACK this frame by replicating the
-    //     prologue's shadow setup — store the real `*mut JvmThread` (arg2, passed
-    //     by try_osr→osr_enter) into the cached-thread slot and snapshot the
-    //     shadow `top` watermark into the savetop slot, so the epilogue restores
-    //     `top` and the per-safepoint push/reload relocate this frame's oops
-    //     precisely. Opt-in / default-OFF: tracking the OSR'd `binaryTrees` frame
-    //     currently regresses bt18 (a conservative-pin × precise-move interaction
-    //     under investigation), so it stays behind its own sub-gate while the
-    //     main `CRATONVM_SHADOW_STACK` path keeps the golden SKIP behaviour.
-    //
-    // Register safety (track path): arg2 is still live here — the code above only
-    // stashed arg0→R10, spilled callee-saved regs (writes memory), and stored
-    // arg1→heap slot; arg2 (R8 on Windows / RDX on SysV) is in neither LOCAL_REGS
-    // nor those destinations. R11 is caller-saved scratch, free here. All offsets
-    // are constant per `target_addr`, so the cached trampoline body stays valid.
-    if shadow_thread_slot_off != 0 && shadow_savetop_slot_off != 0 && osr_shadow_track_enabled() {
-        // --- TRACK ---
+    // OSR bypasses the compiled method's normal prologue, including the exact
+    // RBP publication used by precise JIT maps. Mirror the prologue here after
+    // live ABI arguments have been saved to their frame homes: prefer the
+    // default inline TLS store when available; fall back to the helper-table
+    // callback on non-Windows / inline opt-out. The helper call can clobber
+    // caller-saved registers, so preserve the incoming locals/thread pointers
+    // in the frame's reserved helper-call stack-arg area.
+    let inline_rbp_disp = if frame_record != 0 {
+        crate::x64::inline_rbp_tls_disp()
+    } else {
+        0
+    };
+    if inline_rbp_disp != 0 {
+        // MOV qword ptr gs:[disp32], RBP
+        tramp.emit_byte(0x65);
+        tramp.emit_byte(0x48);
+        tramp.emit_byte(0x89);
+        tramp.emit_byte(0x2C);
+        tramp.emit_byte(0x25);
+        tramp.emit(&(inline_rbp_disp as u32).to_le_bytes());
+    }
+    let call_frame_record = frame_record != 0
+        && (inline_rbp_disp == 0 || crate::x64::verify_inline_frame_record_enabled());
+    if call_frame_record {
+        // MOV [rsp + 32], R10
+        tramp.emit(&[0x4C, 0x89, 0x54, 0x24, 32]);
+        // MOV R11, arg2_reg
+        let rex = 0x48 | 0x01 | if arg2_reg >= 8 { 0x04 } else { 0x00 };
+        tramp.emit_byte(rex);
+        tramp.emit_byte(0x89);
+        tramp.emit_byte(0xC0 | ((arg2_reg & 7) << 3) | 3);
+        // MOV [rsp + 40], R11
+        tramp.emit(&[0x4C, 0x89, 0x5C, 0x24, 40]);
+        // MOV arg0_reg, RBP
+        let rex = 0x48 | if arg0_reg >= 8 { 0x01 } else { 0x00 };
+        tramp.emit_byte(rex);
+        tramp.emit_byte(0x89);
+        tramp.emit_byte(0xC0 | (5 << 3) | (arg0_reg & 7));
+        // CALL frame_record via RAX.
+        tramp.emit(&[0x48, 0xB8]);
+        tramp.emit(&(frame_record as i64).to_le_bytes());
+        tramp.emit(&[0xFF, 0xD0]);
+        // MOV R10, [rsp + 32]
+        tramp.emit(&[0x4C, 0x8B, 0x54, 0x24, 32]);
+        // MOV R11, [rsp + 40]
+        tramp.emit(&[0x4C, 0x8B, 0x5C, 0x24, 40]);
+        // MOV arg2_reg, R11
+        let rex = 0x48 | 0x04 | if arg2_reg >= 8 { 0x01 } else { 0x00 };
+        tramp.emit_byte(rex);
+        tramp.emit_byte(0x89);
+        tramp.emit_byte(0xC0 | (3 << 3) | (arg2_reg & 7));
+    }
+
+    // Shadow-stack OSR-frame handling. An OSR entry bypasses the prologue's
+    // `get_current_thread` sequence, so the trampoline must initialize the same
+    // cached-thread and saved-watermark slots. A null `thread_ptr` (unit tests)
+    // is stored as null and guarded exactly like the normal prologue path.
+    if shadow_thread_slot_off != 0 && shadow_savetop_slot_off != 0 {
         // MOV [rbp - shadow_thread_slot_off], arg2   (cache the thread pointer)
         let neg_thr = -shadow_thread_slot_off;
         let rex = 0x48 | if arg2_reg >= 8 { 0x04 } else { 0x00 }; // REX.W (+R if arg2 extended)
@@ -2079,6 +2094,17 @@ unsafe fn emit_osr_trampoline(
         tramp.emit_byte(0x89); // MOV r/m64, r64
         tramp.emit_byte(0x85 | ((arg2_reg & 7) << 3)); // mod=10, reg=arg2, rm=rbp(5)
         tramp.emit(&neg_thr.to_le_bytes());
+
+        // TEST arg2, arg2; JE skip_savetop
+        let rex = 0x48
+            | if arg2_reg >= 8 { 0x04 } else { 0x00 }
+            | if arg2_reg >= 8 { 0x01 } else { 0x00 };
+        tramp.emit_byte(rex);
+        tramp.emit_byte(0x85);
+        tramp.emit_byte(0xC0 | ((arg2_reg & 7) << 3) | (arg2_reg & 7));
+        tramp.emit(&[0x0F, 0x84]);
+        let skip_savetop = tramp.pos();
+        tramp.emit(&0i32.to_le_bytes());
 
         // R11 = [arg2 + shadow_off_in_thread]   (shadow `top`, ShadowStack TOP=0)
         let rex = 0x48 | 0x04 | if arg2_reg >= 8 { 0x01 } else { 0x00 }; // REX.W + R(r11) (+B if arg2 extended)
@@ -2093,8 +2119,11 @@ unsafe fn emit_osr_trampoline(
         tramp.emit_byte(0x89); // MOV r/m64, r64
         tramp.emit_byte(0x80 | (3 << 3) | 5); // mod=10, reg=R11&7=3, rm=rbp(5) → 0x9D
         tramp.emit(&neg_sav.to_le_bytes());
+        let rel = (tramp.pos() as i64) - (skip_savetop as i64 + 4);
+        tramp.try_patch_i32(skip_savetop, rel as i32).ok();
     } else if shadow_thread_slot_off != 0 {
-        // --- SKIP (default) --- zero the cached thread slot so null-guards skip.
+        // Defensive partial-layout fallback: zero the cached thread slot so the
+        // push/reload/epilogue null guards skip rather than reading stale stack.
         let neg_off = -shadow_thread_slot_off;
         tramp.emit_byte(0x48); // REX.W
         tramp.emit_byte(0xC7); // MOV r/m64, imm32 (sign-extended)
@@ -2201,6 +2230,7 @@ unsafe fn osr_trampoline(
     callee_saved_xmms: Option<&[u8]>,
     xmm_saved_base: i32,
     heap_local_offset: i32,
+    frame_record: usize,
     needs_context: bool,
     dead_mask: u64,
     shadow_thread_slot_off: i32,
@@ -2242,6 +2272,7 @@ unsafe fn osr_trampoline(
                 callee_saved_xmms,
                 xmm_saved_base,
                 heap_local_offset,
+                frame_record,
                 needs_context,
                 dead_mask,
                 shadow_thread_slot_off,
@@ -2272,8 +2303,8 @@ unsafe fn osr_trampoline(
 
     // The cached trampoline takes (locals_ptr, vm_ptr, thread_ptr) via the
     // platform C ABI. `vm_ptr` is only read when `needs_context`, and
-    // `thread_ptr` only when the shadow-stack gate is on (follow-up §1); both
-    // are passed unconditionally (caller-saved registers, ignored if unused).
+    // `thread_ptr` only when shadow-stack frame slots exist; both are passed
+    // unconditionally (caller-saved registers, ignored if unused).
     let tramp_fn: unsafe extern "C" fn(*const i64, i64, i64) -> i64 = std::mem::transmute(code_ptr);
 
     // SAFETY: `tramp_arc` holds an Arc clone of the cached buffer, keeping the
