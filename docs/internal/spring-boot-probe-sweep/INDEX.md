@@ -26,11 +26,11 @@ Wall time: probe sweep START 20:31 → END 20:45 (~14 min; dominated by the 11 �
 | ID | Title | Class | Probes | Rec. |
 |----|-------|-------|--------|------|
 | [SBR-01](SBR-01-groovy-parseclass-hang.md) | `GroovyClassLoader.parseClass` hangs (no output, >60 s) | HANG | 9 Groovy probes | **HANDOFF** |
-| [SBR-02](SBR-02-regex-replaceall-throughput-wall.md) | `String.replaceAll` throughput wall (~30–60× slower) | HANG/perf | MinRegexProbe, RegexLoopProbe | **HANDOFF** (=SB-12) |
-| [SBR-03](../../internal/SBR-03-array-interface-instanceof.md) | `Object[] instanceof I[]` returns `true` (HS `false`) | DIFF/correctness | ArrInstProbe | ✅ **FIXED** dev `a245002c` |
+| [SBR-02](SBR-02-string-regex-throughput.md) | `String.replaceAll` throughput wall (~30–60× slower) | HANG/perf | MinRegexProbe, RegexLoopProbe | ✅ **FIXED** dev `0d7dfc28` |
+| [SBR-03](SBR-03-array-interface-instanceof.md) | `Object[] instanceof I[]` returns `true` (HS `false`) | DIFF/correctness | ArrInstProbe | ✅ **FIXED** dev `a245002c` |
 | [SBR-04](SBR-04-annotation-getclass-proxy-tostring.md) | Annotation `getClass()` = annotation type not `$ProxyN`; `toString` format | DIFF | DAnnCore, DAnnWalk | FIX (=SB-09) |
 | [SBR-05](SBR-05-getdeclaredmethods-order.md) | `getDeclaredMethods()` order differs from HotSpot | DIFF (spec-unspec) | DTags, DAnnWalk | LOW |
-| [SBR-06](../../internal/SBR-06-field-getgenerictype-raw.md) | Constructor `Parameter.getParameterizedType()` erases generics → raw `Class` | DIFF | GenProbe | ✅ **FIXED** dev `bce39db7` |
+| [SBR-06](SBR-06-field-getgenerictype-raw.md) | Constructor `Parameter.getParameterizedType()` erases generics → raw `Class` | DIFF | GenProbe | ✅ **FIXED** dev `bce39db7` |
 | [SBR-07](SBR-07-getsimplename-nested.md) | `getSimpleName()` on nested class returns `Outer$Inner` | DIFF | KProtoProbe | ✅ FIXED (dev 2026-06-23) |
 | [SBR-08](SBR-08-jarurl-openconnection-abstract.md) | jar-URL `openConnection()` → abstract `java.net.JarURLConnection` | DIFF | KExactProbe, KUrlProbe | FIX |
 | [SBR-09](SBR-09-nio-filesystem-attrview-abstract.md) | NIO `FileSystem`/`FileAttributeView` report abstract types | DIFF | FSEq, DirProbe | FIX |
@@ -62,8 +62,8 @@ individual reports) but deferred as not-safe-one-liners:
 - **SBR-05** won't-fix (order is spec-unspecified; JUnit re-sorts).
 
 ### Suggested split
-- **Handoff (deep / framework-impacting):** SBR-01 (Groovy compiler), SBR-02 (regex/interpreter throughput), SBR-14 (classloader isolation).
+- **Handoff (deep / framework-impacting):** SBR-01 (Groovy compiler), SBR-14 (classloader isolation).
 - **Fix here (well-scoped):** SBR-03, SBR-06, SBR-07, SBR-12 are small, self-contained correctness gaps with crisp repros.
 - **Low priority:** SBR-05 (`getDeclaredMethods` order is spec-unspecified; documenting only).
 
-Note: SBR-04 overlaps prior `SB-09`; SBR-02 overlaps prior `SB-12`/`SB-16` perf family. The rest (SBR-03, 06–14) are **newly surfaced** by this probe sweep.
+Note: SBR-04 overlaps prior `SB-09`; SBR-02 overlapped prior `SB-12`/`SB-16` perf family and is now fixed. The rest (SBR-03, 06–14) are **newly surfaced** by this probe sweep.
