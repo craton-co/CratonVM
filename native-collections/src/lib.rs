@@ -19857,18 +19857,37 @@ fn native_lhm_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(None),
     };
+    let consumer_pin = ctx.pin_native_root(consumer);
     let mut cur = lhm_get(ctx, this, "head", LHM_FIELD_HEAD);
     while let Value::Object(Some(node)) = cur {
+        let node_pin = ctx.pin_native_root(node);
         let key = ctx.get_field(node, LHM_NODE_KEY);
         let val = ctx.get_field(node, LHM_NODE_VALUE);
-        ctx.invoke_virtual(
+        let key_pin = match key {
+            Value::Object(Some(o)) => ctx.pin_native_root(o),
+            _ => usize::MAX,
+        };
+        let val_pin = match val {
+            Value::Object(Some(o)) => ctx.pin_native_root(o),
+            _ => usize::MAX,
+        };
+        let consumer = ctx.read_native_pin(consumer_pin, consumer);
+        let key = read_pinned_elem(ctx, key_pin, key);
+        let val = read_pinned_elem(ctx, val_pin, val);
+        if let Err(e) = ctx.invoke_virtual(
             consumer,
             "accept",
             "(Ljava/lang/Object;Ljava/lang/Object;)V",
             &[key, val],
-        )?;
+        ) {
+            ctx.unpin_native_roots(consumer_pin);
+            return Err(e);
+        }
+        let node = ctx.read_native_pin(node_pin, node);
         cur = ctx.get_field(node, LHM_NODE_AFTER);
+        ctx.unpin_native_roots(node_pin);
     }
+    ctx.unpin_native_roots(consumer_pin);
     Ok(None)
 }
 
@@ -20539,9 +20558,17 @@ fn native_ad_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         _ => return Ok(None),
     };
     let elems = ad_collect_elements(ctx, this);
-    for e in &elems {
-        ctx.invoke_virtual(consumer, "accept", "(Ljava/lang/Object;)V", &[*e])?;
+    let consumer_pin = ctx.pin_native_root(consumer);
+    let (_, elem_pins) = pin_value_slice(ctx, &elems);
+    for (i, e) in elems.iter().enumerate() {
+        let consumer = ctx.read_native_pin(consumer_pin, consumer);
+        let elem = read_pinned_elem(ctx, elem_pins[i], *e);
+        if let Err(e) = ctx.invoke_virtual(consumer, "accept", "(Ljava/lang/Object;)V", &[elem]) {
+            ctx.unpin_native_roots(consumer_pin);
+            return Err(e);
+        }
     }
+    ctx.unpin_native_roots(consumer_pin);
     Ok(None)
 }
 
@@ -24507,14 +24534,24 @@ fn native_tm_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         _ => return Ok(None),
     };
     let pairs = tm_collect_pairs(ctx, this);
-    for (k, v) in pairs {
-        ctx.invoke_virtual(
+    let action_pin = ctx.pin_native_root(action);
+    let flat: Vec<Value> = pairs.iter().flat_map(|(k, v)| [*k, *v]).collect();
+    let (_, flat_pins) = pin_value_slice(ctx, &flat);
+    for i in 0..pairs.len() {
+        let action = ctx.read_native_pin(action_pin, action);
+        let k = read_pinned_elem(ctx, flat_pins[i * 2], flat[i * 2]);
+        let v = read_pinned_elem(ctx, flat_pins[i * 2 + 1], flat[i * 2 + 1]);
+        if let Err(e) = ctx.invoke_virtual(
             action,
             "accept",
             "(Ljava/lang/Object;Ljava/lang/Object;)V",
             &[k, v],
-        )?;
+        ) {
+            ctx.unpin_native_roots(action_pin);
+            return Err(e);
+        }
     }
+    ctx.unpin_native_roots(action_pin);
     Ok(None)
 }
 
@@ -25371,10 +25408,26 @@ fn native_ts_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(d) => d,
         None => return Ok(None),
     };
+    let action_pin = ctx.pin_native_root(action);
+    let data_pin = ctx.pin_native_root(data);
     for i in 0..(size as usize) {
+        let data = ctx.read_native_pin(data_pin, data);
         let v = ctx.get_array_element(data, i);
-        ctx.invoke_virtual(action, "accept", "(Ljava/lang/Object;)V", &[v])?;
+        let v_pin = match v {
+            Value::Object(Some(o)) => ctx.pin_native_root(o),
+            _ => usize::MAX,
+        };
+        let action = ctx.read_native_pin(action_pin, action);
+        let v = read_pinned_elem(ctx, v_pin, v);
+        if let Err(e) = ctx.invoke_virtual(action, "accept", "(Ljava/lang/Object;)V", &[v]) {
+            ctx.unpin_native_roots(action_pin);
+            return Err(e);
+        }
+        if v_pin != usize::MAX {
+            ctx.unpin_native_roots(v_pin);
+        }
     }
+    ctx.unpin_native_roots(action_pin);
     Ok(None)
 }
 
@@ -27265,14 +27318,24 @@ fn native_chm_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         _ => return Ok(None),
     };
     let entries = chm_collect_all_entries(ctx, this);
-    for (key, value) in entries {
-        ctx.invoke_virtual(
+    let action_pin = ctx.pin_native_root(action);
+    let flat: Vec<Value> = entries.iter().flat_map(|(k, v)| [*k, *v]).collect();
+    let (_, flat_pins) = pin_value_slice(ctx, &flat);
+    for i in 0..entries.len() {
+        let action = ctx.read_native_pin(action_pin, action);
+        let key = read_pinned_elem(ctx, flat_pins[i * 2], flat[i * 2]);
+        let value = read_pinned_elem(ctx, flat_pins[i * 2 + 1], flat[i * 2 + 1]);
+        if let Err(e) = ctx.invoke_virtual(
             action,
             "accept",
             "(Ljava/lang/Object;Ljava/lang/Object;)V",
             &[key, value],
-        )?;
+        ) {
+            ctx.unpin_native_roots(action_pin);
+            return Err(e);
+        }
     }
+    ctx.unpin_native_roots(action_pin);
     Ok(None)
 }
 
@@ -27573,14 +27636,24 @@ fn native_chm_for_each_parallel(ctx: &mut dyn NativeContext, args: &[Value]) -> 
         _ => return Ok(None),
     };
     let entries = chm_collect_all_entries(ctx, this);
-    for (key, value) in entries {
-        ctx.invoke_virtual(
+    let action_pin = ctx.pin_native_root(action);
+    let flat: Vec<Value> = entries.iter().flat_map(|(k, v)| [*k, *v]).collect();
+    let (_, flat_pins) = pin_value_slice(ctx, &flat);
+    for i in 0..entries.len() {
+        let action = ctx.read_native_pin(action_pin, action);
+        let key = read_pinned_elem(ctx, flat_pins[i * 2], flat[i * 2]);
+        let value = read_pinned_elem(ctx, flat_pins[i * 2 + 1], flat[i * 2 + 1]);
+        if let Err(e) = ctx.invoke_virtual(
             action,
             "accept",
             "(Ljava/lang/Object;Ljava/lang/Object;)V",
             &[key, value],
-        )?;
+        ) {
+            ctx.unpin_native_roots(action_pin);
+            return Err(e);
+        }
     }
+    ctx.unpin_native_roots(action_pin);
     Ok(None)
 }
 
@@ -29668,12 +29741,30 @@ fn native_unmod_listitr_for_each_remaining(
         Some(Value::Object(Some(c))) => *c,
         _ => return Ok(None),
     };
+    let this_pin = ctx.pin_native_root(this);
+    let snapshot_pin = ctx.pin_native_root(snapshot);
+    let consumer_pin = ctx.pin_native_root(consumer);
     while cursor < len {
+        let this = ctx.read_native_pin(this_pin, this);
+        let snapshot = ctx.read_native_pin(snapshot_pin, snapshot);
         let elem = ctx.get_array_element(snapshot, cursor as usize);
+        let elem_pin = match elem {
+            Value::Object(Some(o)) => ctx.pin_native_root(o),
+            _ => usize::MAX,
+        };
         cursor += 1;
         ctx.set_field(this, UNMOD_LIST_ITR_CURSOR, Value::Int(cursor));
-        ctx.invoke_virtual(consumer, "accept", "(Ljava/lang/Object;)V", &[elem])?;
+        let consumer = ctx.read_native_pin(consumer_pin, consumer);
+        let elem = read_pinned_elem(ctx, elem_pin, elem);
+        if let Err(e) = ctx.invoke_virtual(consumer, "accept", "(Ljava/lang/Object;)V", &[elem]) {
+            ctx.unpin_native_roots(this_pin);
+            return Err(e);
+        }
+        if elem_pin != usize::MAX {
+            ctx.unpin_native_roots(elem_pin);
+        }
     }
+    ctx.unpin_native_roots(this_pin);
     Ok(None)
 }
 
