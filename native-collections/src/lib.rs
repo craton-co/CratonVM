@@ -29477,7 +29477,7 @@ fn register_collections_extras_natives(r: &mut NativeMethodRegistry) {
         c,
         "synchronizedMap",
         "(Ljava/util/Map;)Ljava/util/Map;",
-        native_collections_identity,
+        native_collections_synchronized_map,
     );
     r.register(
         c,
@@ -29594,6 +29594,26 @@ fn register_collections_extras_natives(r: &mut NativeMethodRegistry) {
 /// Identity — just returns the first argument (used for synchronized wrappers)
 fn native_collections_identity(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     Ok(Some(args.first().cloned().unwrap_or(Value::Object(None))))
+}
+
+/// `Collections.synchronizedMap(m)` — wrap in a REAL `Collections$SynchronizedMap`
+/// so every method (notably `computeIfAbsent`) is `synchronized (mutex)`. The old
+/// identity stub returned the bare map, making `synchronizedMap(...).computeIfAbsent`
+/// non-atomic under concurrency (duplicate values for the same key) — which broke
+/// Spring's `ConcurrencyLimitBeanPostProcessor` per-proxy throttle cache. Null
+/// passes through.
+fn native_collections_synchronized_map(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    match args.first() {
+        Some(v @ Value::Object(Some(_))) => ctx.new_object_initialized(
+            "java/util/Collections$SynchronizedMap",
+            "(Ljava/util/Map;)V",
+            &[v.clone()],
+        ),
+        other => Ok(Some(other.cloned().unwrap_or(Value::Object(None)))),
+    }
 }
 
 // `List.copyOf` / `Set.copyOf` / `Map.copyOf` — return an INDEPENDENT immutable

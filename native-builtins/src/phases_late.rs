@@ -1421,7 +1421,7 @@ pub(crate) fn register_phase55_collection_extras(r: &mut NativeMethodRegistry) {
         coll,
         "synchronizedMap",
         "(Ljava/util/Map;)Ljava/util/Map;",
-        |_ctx, args| Ok(Some(args[0])),
+        crate::native_synchronized_map,
     );
     r.register(
         coll,

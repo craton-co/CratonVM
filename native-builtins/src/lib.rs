@@ -40677,6 +40677,29 @@ fn native_return_first_arg(_ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     Ok(Some(args.first().cloned().unwrap_or(Value::Object(None))))
 }
 
+/// `Collections.synchronizedMap(m)` — return a REAL `Collections$SynchronizedMap`
+/// wrapper, not the bare map. The historical identity stub left every method
+/// unsynchronized, so `synchronizedMap(...).computeIfAbsent(...)` was not atomic
+/// under concurrency: Spring's `ConcurrencyLimitBeanPostProcessor` keeps its
+/// per-proxy throttle holders in a `synchronizedMap(IdentityHashMap)` and races
+/// created DUPLICATE holders → duplicate throttles → the @ConcurrencyLimit cap
+/// was exceeded (flaky `IllegalStateException` in ConcurrencyLimitTests). The
+/// real wrapper's `computeIfAbsent` runs `synchronized (mutex) { m.compute… }`,
+/// which CratonVM executes correctly. Null passes through.
+pub(crate) fn native_synchronized_map(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    match args.first() {
+        Some(v @ Value::Object(Some(_))) => ctx.new_object_initialized(
+            "java/util/Collections$SynchronizedMap",
+            "(Ljava/util/Map;)V",
+            &[v.clone()],
+        ),
+        other => Ok(Some(other.cloned().unwrap_or(Value::Object(None)))),
+    }
+}
+
 // IntSummaryStatistics: 4-field synthetic (count=0 Long, sum=1 Long, min=2 Int, max=3 Int)
 const ISS_FIELD_COUNT: usize = 0;
 const ISS_FIELD_SUM: usize = 1;

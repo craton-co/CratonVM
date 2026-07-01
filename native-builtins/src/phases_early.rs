@@ -17,7 +17,7 @@ use crate::{
     alloc_concurrent_synthetic, build_real_layout_string_hashset, native_noop,
     native_noop_with_this, native_return_false, native_return_zero, obj_arg,
 };
-use crate::{native_return_first_arg, native_return_null};
+use crate::{native_return_first_arg, native_return_null, native_synchronized_map};
 
 pub(crate) fn register_collections_extras_natives(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
@@ -76,7 +76,7 @@ pub(crate) fn register_collections_extras_natives(r: &mut NativeMethodRegistry) 
         cu,
         "synchronizedMap",
         "(Ljava/util/Map;)Ljava/util/Map;",
-        native_return_first_arg,
+        native_synchronized_map,
     );
     r.register(
         cu,
@@ -1794,7 +1794,7 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
         cu,
         "synchronizedMap",
         "(Ljava/util/Map;)Ljava/util/Map;",
-        native_return_first_arg,
+        native_synchronized_map,
     );
     r.register(
         cu,
