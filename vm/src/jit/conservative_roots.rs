@@ -884,6 +884,160 @@ fn jit_range_scan_legacy() -> bool {
     *ON.get_or_init(|| std::env::var_os("CRATONVM_JIT_RANGE_SCAN_LEGACY").is_some())
 }
 
+fn moving_young_frame_coverage_complete(rbp: usize, cm: &cratonvm_jit::CompiledMethod) -> bool {
+    let sp_id_off = cm.sp_id_slot_off;
+    if sp_id_off == 0 {
+        return false;
+    }
+    let id_addr = rbp.wrapping_sub(sp_id_off as usize);
+    if id_addr & 0x7 != 0 {
+        return false;
+    }
+    // SAFETY: aligned safepoint-id slot in a live JIT frame on this thread.
+    let sp_id = (unsafe { (id_addr as *const usize).read() }) as u32;
+    let mut found = false;
+    for map in cm.oop_maps.iter().filter(|m| m.bytecode_pc == sp_id) {
+        found = true;
+        if !map.moving_young_coverage_complete {
+            return false;
+        }
+    }
+    found
+}
+
+/// Refresh the current thread's moving-young coverage status for the active
+/// JIT frames it owns. Returns `true` when every live frame reachable from this
+/// thread has a complete active-safepoint proof; on `false`, the GC-side
+/// per-cycle flag is marked so the collector diverts to the non-moving sweep.
+pub fn refresh_moving_young_coverage_for_current_thread() -> bool {
+    if !moving_young_enabled() {
+        return true;
+    }
+    let dbg = std::env::var_os("CRATONVM_MOVING_YOUNG_COVERAGE_DBG").is_some();
+    let scanner_sp = current_stack_pointer();
+    if !dbg_no_prune() {
+        let _ = prune_returned_jit_entries(scanner_sp);
+    }
+
+    let mut complete = true;
+
+    JIT_ENTRY_CHAIN.with(|c| {
+        {
+            let mut chain = c.borrow_mut();
+            if let Some(top) = chain.last_mut() {
+                if let Some(info) = top.precise.as_mut() {
+                    info.exact_rbp = top_rbp_get();
+                }
+            }
+        }
+
+        let chain = c.borrow();
+        if dbg {
+            eprintln!(
+                "[moving-young-coverage] chain_len={} top_rbp=0x{:x} scanner_sp=0x{:x}",
+                chain.len(),
+                top_rbp_get(),
+                scanner_sp,
+            );
+        }
+        for (entry_idx, entry) in chain.iter().enumerate() {
+            let Some(info) = entry.precise else {
+                if dbg {
+                    eprintln!("[moving-young-coverage] incomplete: JIT entry has no precise map");
+                }
+                complete = false;
+                continue;
+            };
+            // SAFETY: the compiled method pointer is the same Arc-stable pointer
+            // used by the existing precise scan/remap paths.
+            let cm: &cratonvm_jit::CompiledMethod =
+                unsafe { &*(info.compiled_method as *const cratonvm_jit::CompiledMethod) };
+            let exact_rbp = info.exact_rbp;
+            if exact_rbp == 0 {
+                if dbg {
+                    eprintln!(
+                        "[moving-young-coverage] incomplete: missing exact rbp entry_idx={} scanner_sp=0x{:x} entry_sp=0x{:x} maps={} sp_id_off={}",
+                        entry_idx,
+                        scanner_sp,
+                        entry.entry_sp,
+                        cm.oop_maps.len(),
+                        cm.sp_id_slot_off,
+                    );
+                }
+                complete = false;
+                continue;
+            }
+            if !moving_young_frame_coverage_complete(exact_rbp, cm) {
+                if dbg {
+                    eprintln!(
+                        "[moving-young-coverage] incomplete: active frame map at rbp=0x{:x}",
+                        exact_rbp
+                    );
+                }
+                complete = false;
+            }
+
+            let mut child_rbp = exact_rbp;
+            let mut guard = 0usize;
+            while guard < 4096 {
+                guard += 1;
+                if child_rbp == 0 || child_rbp & 0x7 != 0 {
+                    break;
+                }
+                if child_rbp < scanner_sp || child_rbp >= entry.entry_sp {
+                    break;
+                }
+                // SAFETY: `child_rbp` is an aligned address inside this live
+                // thread's JIT stack band, same invariant as
+                // `remap_active_jit_frames`.
+                let parent_rbp = unsafe { (child_rbp as *const usize).read() };
+                let ret_addr = unsafe { ((child_rbp + 8) as *const usize).read() };
+                let Some(cm_ptr) = cratonvm_jit::lookup_jit_code_range(ret_addr) else {
+                    break;
+                };
+                let cm: &cratonvm_jit::CompiledMethod =
+                    unsafe { &*(cm_ptr as *const cratonvm_jit::CompiledMethod) };
+                if !moving_young_frame_coverage_complete(parent_rbp, cm) {
+                    if dbg {
+                        eprintln!(
+                            "[moving-young-coverage] incomplete: parent frame map at rbp=0x{:x}",
+                            parent_rbp
+                        );
+                    }
+                    complete = false;
+                }
+                if parent_rbp <= child_rbp {
+                    break;
+                }
+                child_rbp = parent_rbp;
+            }
+        }
+    });
+
+    #[cfg(target_os = "windows")]
+    if cratonvm_jit::jit_code_range_count() > 0 {
+        let cover_hi = JIT_ENTRY_CHAIN
+            .with(|c| c.borrow().iter().map(|e| e.entry_sp).max())
+            .unwrap_or(scanner_sp);
+        let search_lo = scanner_sp.max(cover_hi);
+        let high = current_thread_stack_high();
+        if high > search_lo && native_stack_has_jit_frame(search_lo, high) {
+            if dbg {
+                eprintln!(
+                    "[moving-young-coverage] incomplete: unregistered JIT frame on native stack"
+                );
+            }
+            cratonvm_gc::gc_quiescence::set_unregistered_jit_frame_on_stack();
+            complete = false;
+        }
+    }
+
+    if !complete {
+        cratonvm_gc::gc_quiescence::mark_moving_young_coverage_incomplete();
+    }
+    complete
+}
+
 /// Returns true if any thread anywhere in the process is currently inside a
 /// JIT call. Used by the GC to decide whether compaction is safe.
 #[inline]
@@ -1255,6 +1409,15 @@ pub fn set_top_frame_base(rbp: usize) {
     // `frame_base` is deliberately NOT touched — the marking path uses it as the
     // upper bound of its conservative sweep.
     top_rbp_set(rbp);
+    if moving_young_enabled() {
+        JIT_ENTRY_CHAIN.with(|c| {
+            if let Some(top) = c.borrow_mut().last_mut() {
+                if let Some(info) = top.precise.as_mut() {
+                    info.exact_rbp = rbp;
+                }
+            }
+        });
+    }
 }
 
 /// Sync `TOP_RBP` to the current top entry's saved `exact_rbp` (or 0 when the
@@ -2048,16 +2211,19 @@ mod tests {
             native_pc_offset: 0x40,
             bytecode_pc: 0,
             frame_slot_offsets: vec![-8],
+            moving_young_coverage_complete: false,
         });
         cm.push_oop_map(cratonvm_jit::OopMapEntry {
             native_pc_offset: 0x10,
             bytecode_pc: 0,
             frame_slot_offsets: vec![-16, -24],
+            moving_young_coverage_complete: false,
         });
         cm.push_oop_map(cratonvm_jit::OopMapEntry {
             native_pc_offset: 0x20,
             bytecode_pc: 0,
             frame_slot_offsets: vec![],
+            moving_young_coverage_complete: false,
         });
 
         // Exact-match lookups succeed regardless of insertion order.
@@ -2114,6 +2280,7 @@ mod tests {
             native_pc_offset: 0,
             bytecode_pc: 0,
             frame_slot_offsets: vec![-16],
+            moving_young_coverage_complete: false,
         });
         assert!(cm.has_precise_oop_maps());
 

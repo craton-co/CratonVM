@@ -314,7 +314,7 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     // would pin (or mis-relocate) a random object. "Once a frame is precise, it
     // must be fully precise" (default-moving-young-gen.md, Risks): rely solely
     // on the shadow stack (folded in at 14b below) plus the
-    // interpreter/statics/JNI roots. If an active OSR frame cannot prove that
+    // interpreter/statics/JNI roots. If any active JIT frame cannot prove that
     // coverage, we deliberately re-enable the conservative scan and tell the
     // collector to use the non-moving sweep for this cycle. On any non-moving
     // path this scan remains the authoritative JIT root set.
@@ -323,8 +323,13 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
         moving_young && crate::jit::conservative_roots::moving_young_osr_shadow_fallback_needed();
     if moving_young_osr_fallback {
         cratonvm_gc::gc_quiescence::set_force_non_moving_jit_roots();
+        cratonvm_gc::gc_quiescence::mark_moving_young_coverage_incomplete();
     }
-    if !moving_young || moving_young_osr_fallback {
+    let moving_young_precise_only = moving_young
+        && !moving_young_osr_fallback
+        && crate::jit::conservative_roots::refresh_moving_young_coverage_for_current_thread()
+        && !cratonvm_gc::gc_quiescence::moving_young_coverage_incomplete();
+    if !moving_young_precise_only {
         crate::jit::conservative_roots::scan_active_jit_frames(&shared.heap, &mut roots);
     }
     // G1 pin-in-place for conservative JIT roots: the generational collector

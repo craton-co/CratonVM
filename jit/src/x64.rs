@@ -6727,6 +6727,11 @@ struct Compiler {
     /// walker falls back to the conservative scan — this never loses
     /// an oop, it only pins extra false positives.
     stack_oop_marks: Vec<bool>,
+    /// True while `stack_oop_marks` is an exact type map for the current
+    /// simulated operand stack. Reconstructed conservative merge states clear
+    /// oop bits safely for non-moving GC, but moving-young must treat those
+    /// safepoints as incomplete and fall back.
+    stack_oop_marks_exact: bool,
     /// T1.1.a — collected oop maps, indexed by native PC offset of the
     /// instruction *after* the safepoint call. Transferred to
     /// `CompiledMethod::oop_maps` at finalize time.
@@ -6854,6 +6859,10 @@ struct Compiler {
     /// matching post-call reload. Cleared at each push start so an unbalanced
     /// (no-reload) safepoint cannot feed stale homes to a later reload.
     pending_shadow: Vec<ShadowHome>,
+    /// Completeness proof for the most recent shadow push. The paired
+    /// `OopMapEntry` carries this bit so GC can reject moving-young relocation
+    /// when the active safepoint is not fully covered.
+    pending_shadow_coverage_complete: bool,
     /// Lazy-prologue perf lever: byte range `[start, end)` of the prologue's
     /// (NOP-able) `get_current_thread` fetch sequence. After codegen, if
     /// `shadow_pushed_any` is still false (the method never published a
@@ -7371,7 +7380,7 @@ impl Compiler {
         // PC, written by `emit_pre_safepoint_spill` before each GC-capable
         // call so the GC root walker can recover the exact oop map. Off by
         // default → no slot reserved → frame layout byte-identical.
-        let precise_maps = precise_jit_maps_enabled();
+        let precise_maps = precise_jit_maps_enabled() || moving_young_enabled();
         // Step 1 (inline frame-record) — cache the validated TLS displacement
         // (0 when the opt-in flag is off or the OS probe failed → CALL path).
         let inline_rbp_tls_disp = if precise_maps { inline_rbp_tls_disp() } else { 0 };
@@ -7641,6 +7650,7 @@ impl Compiler {
             string_layout: None,
             deopt_stubs: Vec::new(),
             stack_oop_marks: Vec::with_capacity(16),
+            stack_oop_marks_exact: true,
             oop_maps: Vec::new(),
             local_oop_masks: Vec::new(),
             local_kinds: Vec::new(),
@@ -7664,6 +7674,7 @@ impl Compiler {
             shadow_savebase_slot_off,
             shadow_off_in_thread,
             pending_shadow: Vec::new(),
+            pending_shadow_coverage_complete: false,
             shadow_fetch_start: 0,
             shadow_fetch_end: 0,
             shadow_pushed_any: false,
@@ -8152,6 +8163,9 @@ impl Compiler {
     /// reference should call [`Self::mark_top_as_oop`] immediately
     /// after.
     fn push_stack(&mut self) -> StackSlot {
+        if self.stack.is_empty() && self.stack_oop_marks.is_empty() {
+            self.stack_oop_marks_exact = true;
+        }
         let offset = self.next_spill_offset;
         self.next_spill_offset += 8;
         let slot = StackSlot::Frame(offset);
@@ -8175,6 +8189,9 @@ impl Compiler {
     /// holds continuously, which is the load-bearing prerequisite for a
     /// *moving* GC that rewrites precisely-mapped slots.
     fn stack_push(&mut self, slot: StackSlot, is_oop: bool) {
+        if self.stack.is_empty() && self.stack_oop_marks.is_empty() {
+            self.stack_oop_marks_exact = true;
+        }
         self.stack.push(slot);
         self.stack_oop_marks.push(is_oop);
     }
@@ -8204,7 +8221,11 @@ impl Compiler {
         // default false to avoid panics and continue with conservative
         // fallback for this frame slice.
         if self.stack_oop_marks.pop().is_none() {
+            self.stack_oop_marks_exact = false;
             // desync — conservative fallback
+        }
+        if self.stack.is_empty() && self.stack_oop_marks.is_empty() {
+            self.stack_oop_marks_exact = true;
         }
         // Reclaim spill space if this was a Frame slot at the top
         if let StackSlot::Frame(off) = slot {
@@ -8404,6 +8425,9 @@ impl Compiler {
         if self.failed {
             return;
         }
+        if moving_young_enabled() {
+            self.flush_scratch_registers();
+        }
         for idx in 0..self.local_assignments.len() {
             if let Some(reg) = self.local_assignments[idx] {
                 let off = self.local_offset(idx);
@@ -8463,6 +8487,38 @@ impl Compiler {
         // shadow stack so a moving collector can rewrite it precisely. Paired
         // with `emit_shadow_reload` in `emit_oop_map_for_safepoint`. Gated.
         self.emit_shadow_push();
+    }
+
+    /// Return whether the shadow-stack push can prove it will publish every
+    /// live oop for the current safepoint. Any `false` result is a correctness
+    /// signal to the GC: if this frame is live here, moving-young must divert to
+    /// the non-moving sweep for that cycle.
+    fn moving_young_safepoint_coverage_complete(&self) -> bool {
+        if !moving_young_enabled() || self.failed {
+            return false;
+        }
+        if self.stack.len() != self.stack_oop_marks.len() {
+            return false;
+        }
+        if !self.stack.is_empty() && !self.stack_oop_marks_exact {
+            return false;
+        }
+        for (slot, &is_oop) in self.stack.iter().zip(self.stack_oop_marks.iter()) {
+            if is_oop && matches!(slot, StackSlot::Scratch(_) | StackSlot::Xmm(_)) {
+                return false;
+            }
+        }
+        if self.num_locals > 64 {
+            return false;
+        }
+        if self.num_locals == 0 {
+            return true;
+        }
+        self.local_oop_reached
+            .get(self.cur_bc_pc)
+            .copied()
+            .unwrap_or(false)
+            && self.local_oop_masks.get(self.cur_bc_pc).is_some()
     }
 
     /// Collect the homes of every live oop at the current safepoint: operand-
@@ -8574,15 +8630,18 @@ impl Compiler {
     /// (no-reload) safepoint cannot hand stale homes to a later reload.
     fn emit_shadow_push(&mut self) {
         if self.failed || !self.shadow_enabled || self.shadow_thread_slot_off == 0 {
+            self.pending_shadow_coverage_complete = false;
             return;
         }
         // Bisect toggle: CRATONVM_SHADOW_NOPUSH skips the push/reload codegen
         // (keeps the prologue thread-fetch + gate flip) so the SEGV can be
         // localized to push/reload vs the rest without a rebuild.
         if shadow_nopush() {
+            self.pending_shadow_coverage_complete = false;
             return;
         }
         self.pending_shadow.clear();
+        self.pending_shadow_coverage_complete = self.moving_young_safepoint_coverage_complete();
         let homes = self.collect_live_oop_homes();
         if !homes.is_empty() && shadow2_diag_enabled(&self.method_label) {
             let lm = self
@@ -8864,6 +8923,9 @@ impl Compiler {
         // sweeps the frame region — but a desync would silently degrade
         // precision (and is unsafe for the *moving* path), so the assert
         // is the real guard.
+        if self.stack.len() != self.stack_oop_marks.len() {
+            self.stack_oop_marks_exact = false;
+        }
         debug_assert_eq!(
             self.stack.len(),
             self.stack_oop_marks.len(),
@@ -8937,7 +8999,9 @@ impl Compiler {
                 // walker can match the value the JIT stored into the sp-id slot.
                 bytecode_pc: self.cur_bc_pc as u32, // Cast: bytecode PC fits u32
                 frame_slot_offsets: slots,
+                moving_young_coverage_complete: self.pending_shadow_coverage_complete,
             });
+            self.pending_shadow_coverage_complete = false;
         }
         // Stage 4 (precise oop maps) — reload oop register-locals from their
         // (GC-updated) canonical slots after the safepoint. `native_pc` above
@@ -8948,7 +9012,7 @@ impl Compiler {
         // callee-saved register. Without this, Stage 3 updates the slot but the
         // code keeps reading the stale register → register-invisibility
         // persists. Gated off by default (no reload → byte-identical codegen).
-        if self.precise_maps {
+        if self.precise_maps && !moving_young_enabled() {
             self.emit_post_safepoint_reload();
         }
     }
@@ -15640,6 +15704,7 @@ impl Compiler {
                                                                                  // marks is read.
                     self.stack_oop_marks.clear();
                     self.stack_oop_marks.resize(expected_depth, false);
+                    self.stack_oop_marks_exact = expected_depth == 0;
                 } else {
                     self.pc_to_native[pc] = -1;
                     pc += bytecode_len_at(code, pc);
