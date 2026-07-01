@@ -2325,11 +2325,23 @@ fn s_instantiation_strategy_instantiate(
         }
     };
 
+    // JVMS §5.3 — instantiate the EXACT class the bean definition's `beanClass`
+    // Class mirror denotes, resolved straight from the mirror's own ClassId.
+    // A same simple name can be defined by several loaders (Groovy/BeanShell
+    // `parseClass` gives each redefinition a fresh script loader), and
+    // `class_id_by_name(class_name)` collapses them onto the first/global
+    // definer (the app-loader copy). That made a bean of the SECOND `TestBean`
+    // instantiate as the FIRST — `GroovyClassLoadingTests` then failed
+    // `ReflectionUtils.invokeMethod(class2.method, bean)` with
+    // "object of type TestBean is not an instance of TestBean". Prefer the
+    // mirror's exact id; only fall back to by-name when the mirror carries none.
+    let exact_cid = ctx.class_id_from_mirror(mirror);
+
     // Refuse to instantiate interfaces / abstract classes / arrays —
     // mirrors `Class.newInstance` JDK semantics. Returning null is the
     // safest behaviour: downstream Spring will surface a
     // BeanInstantiationException it can recover from.
-    if let Some(cid) = ctx.class_id_by_name(&class_name) {
+    if let Some(cid) = exact_cid.or_else(|| ctx.class_id_by_name(&class_name)) {
         // bug-B2: method-injection (`<lookup-method>` / `@Lookup`). The bean class
         // is abstract; synthesise + instantiate a concrete CGLIB-style subclass
         // whose abstract lookup methods resolve beans from the owning factory.
@@ -2374,6 +2386,24 @@ fn s_instantiation_strategy_instantiate(
             class_name
         );
         return Ok(Some(Value::Object(None)));
+    }
+
+    // Allocate + run `<init>()V` against the EXACT class id from the mirror when
+    // known (loader-faithful, JVMS §5.3), so a bean whose `beanClass` is a
+    // loader-private script class is not silently instantiated as a same-named
+    // class from another loader. Fall back to the by-name path only when the
+    // mirror carries no ClassId.
+    if let Some(cid) = exact_cid {
+        return match ctx.new_object_initialized_with_class_id(cid, "()V", &[]) {
+            Ok(Some(v @ Value::Object(Some(_)))) => Ok(Some(v)),
+            _ => {
+                tracing::debug!(
+                    "[spring-shim] SimpleInstantiationStrategy.instantiate: exact-id new_object({}) failed, returning null",
+                    class_name
+                );
+                Ok(Some(Value::Object(None)))
+            }
+        };
     }
 
     match ctx.new_object(&class_name) {
