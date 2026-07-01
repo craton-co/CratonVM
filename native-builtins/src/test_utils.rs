@@ -200,6 +200,9 @@ fn mock_jdk_field_slot(name: &str) -> Option<usize> {
     }
 }
 
+pub(crate) type InvokeVirtualHook =
+    fn(&mut MockNativeContext, ObjectRef, &str, &str, &[Value]) -> Option<MethodCallResult>;
+
 pub(crate) struct MockNativeContext {
     heap: UnsafeCell<Vec<HeapEntry>>,
     /// Maps ObjectRef pointer values to heap indices
@@ -218,6 +221,9 @@ pub(crate) struct MockNativeContext {
     upcall_entries: UnsafeCell<Vec<cratonvm_native_api::ffi::UpcallEntry>>,
     /// invoke_virtual callback result (set by test to control upcall behavior)
     pub(crate) invoke_virtual_result: UnsafeCell<Option<MethodCallResult>>,
+    /// Optional method-aware virtual-call hook for tests that need an invoked
+    /// object to perform side effects before returning.
+    pub(crate) invoke_virtual_hook: UnsafeCell<Option<InvokeVirtualHook>>,
     /// NEW-8: tracks class IDs that have been marked as hidden via
     /// `set_class_hidden`. Consulted by the `is_class_hidden` override.
     hidden_classes: UnsafeCell<std::collections::HashSet<u32>>,
@@ -354,6 +360,7 @@ impl MockNativeContext {
             next_alloc_id: UnsafeCell::new(seed.next_alloc_id),
             upcall_entries: UnsafeCell::new(Vec::new()),
             invoke_virtual_result: UnsafeCell::new(None),
+            invoke_virtual_hook: UnsafeCell::new(None),
             hidden_classes: UnsafeCell::new(std::collections::HashSet::new()),
             last_defined_class_name: UnsafeCell::new(None),
             class_flags_override: UnsafeCell::new(HashMap::new()),
@@ -563,6 +570,14 @@ impl MockNativeContext {
     pub(crate) fn set_invoke_virtual_result(&self, result: MethodCallResult) {
         // SAFETY: single-threaded test context; no aliasing of the cell.
         unsafe { *self.invoke_virtual_result.get() = Some(result) };
+    }
+
+    /// Install a method-aware virtual-call hook. Returning `Some(result)` from
+    /// the hook handles the call; returning `None` falls through to the legacy
+    /// single-shot scripted result.
+    pub(crate) fn set_invoke_virtual_hook(&self, hook: InvokeVirtualHook) {
+        // SAFETY: single-threaded test context; no aliasing of the cell.
+        unsafe { *self.invoke_virtual_hook.get() = Some(hook) };
     }
 
     /// FIX(test-isolation): map a `thread_id` handed out by
@@ -1194,11 +1209,16 @@ impl NativeContext for MockNativeContext {
 
     fn invoke_virtual(
         &mut self,
-        _receiver: ObjectRef,
-        _method_name: &str,
-        _descriptor: &str,
-        _args: &[Value],
+        receiver: ObjectRef,
+        method_name: &str,
+        descriptor: &str,
+        args: &[Value],
     ) -> MethodCallResult {
+        if let Some(hook) = unsafe { *self.invoke_virtual_hook.get() } {
+            if let Some(result) = hook(self, receiver, method_name, descriptor, args) {
+                return result;
+            }
+        }
         let result = unsafe { &mut *self.invoke_virtual_result.get() };
         if let Some(r) = result.take() {
             r
