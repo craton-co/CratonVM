@@ -185,6 +185,68 @@ struct SharedEvac<'a> {
 }
 
 impl<'a> SharedEvac<'a> {
+    fn append_self_forwarded_from_forwards(
+        forwards: &[(usize, usize)],
+        deferred_self_forwarded: &mut Vec<usize>,
+    ) {
+        let mut seen: std::collections::HashSet<usize> =
+            deferred_self_forwarded.iter().copied().collect();
+        for &(old, new) in forwards {
+            if old == new && seen.insert(old) {
+                deferred_self_forwarded.push(old);
+            }
+        }
+    }
+
+    unsafe fn append_kept_cset_region_objects(
+        &self,
+        forwards: &[(usize, usize)],
+        serial_work: &mut Vec<usize>,
+    ) {
+        let mut kept_regions = std::collections::HashSet::new();
+        for &(old, new) in forwards {
+            if old != new {
+                continue;
+            }
+            if let Some(region_idx) = self.collector.lookup_region_for_addr(old) {
+                if self.cset.contains(&region_idx) {
+                    kept_regions.insert(region_idx);
+                }
+            }
+        }
+        if kept_regions.is_empty() {
+            return;
+        }
+
+        let mut seen: std::collections::HashSet<usize> =
+            serial_work.iter().copied().collect();
+        for region_idx in kept_regions {
+            let region = &*self.regions_base.0.add(region_idx);
+            if region.region_type == RegionType::Free {
+                continue;
+            }
+            let cursor = region.cursor;
+            let base = region.data.addr() as *mut u8;
+            let mut offset = 0usize;
+            while offset < cursor {
+                let obj_ptr = base.add(offset);
+                let header = &*(obj_ptr as *const ObjectHeader);
+                if is_humongous_filler(header) {
+                    break;
+                }
+                let obj_size = object_total_size(header);
+                if obj_size < HEADER_SIZE || offset + obj_size > cursor {
+                    break;
+                }
+                let addr = obj_ptr as usize;
+                if seen.insert(addr) {
+                    serial_work.push(addr);
+                }
+                offset += obj_size;
+            }
+        }
+    }
+
     fn record_fresh_child(
         old_ptr: *mut u8,
         new_ptr: *mut u8,
@@ -2221,6 +2283,22 @@ impl G1Collector {
         }
         for d in worker_deferred {
             main_deferred_self_forwarded.extend(d);
+        }
+
+        // The identity forward itself is the authoritative signal that an
+        // evacuation-failed object stayed in its CSet region. Derive the serial
+        // drain set from the merged forward shards as a backstop for every
+        // caller path, rather than relying only on the side-channel populated
+        // when a caller observes `fresh && old == new`.
+        SharedEvac::append_self_forwarded_from_forwards(
+            &main_forwards,
+            &mut main_deferred_self_forwarded,
+        );
+        unsafe {
+            shared.append_kept_cset_region_objects(
+                &main_forwards,
+                &mut main_deferred_self_forwarded,
+            );
         }
 
         if !main_deferred_self_forwarded.is_empty() {
@@ -8090,6 +8168,21 @@ mod tests {
         assert_eq!(gc.get_field(drained_child, 0).as_int(), Some(77));
         assert!(gc.get_header(roots[0]).forwarding_ptr.is_null());
         assert!(gc.get_header(drained_child).forwarding_ptr.is_null());
+    }
+
+    #[test]
+    fn parallel_identity_forwards_seed_serial_drain() {
+        let mut deferred = vec![0x1000usize];
+        let forwards = vec![
+            (0x2000usize, 0x3000usize),
+            (0x4000usize, 0x4000usize),
+            (0x4000usize, 0x4000usize),
+            (0x1000usize, 0x1000usize),
+        ];
+
+        SharedEvac::append_self_forwarded_from_forwards(&forwards, &mut deferred);
+
+        assert_eq!(deferred, vec![0x1000usize, 0x4000usize]);
     }
 
     /// Regression (defect 2: persistent forwarding_ptr root-remap). When the

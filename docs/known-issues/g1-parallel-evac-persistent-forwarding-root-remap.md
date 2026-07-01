@@ -166,11 +166,28 @@ self-forwarded holder remains in from-space, and its slots are mutated only afte
 the parallel copy phase is complete. Focused coverage:
 
 - `parallel_self_forwarded_holders_are_drained_serially`
+- `parallel_identity_forwards_seed_serial_drain`
 - `parallel_self_forward_clears_forwarding_ptr_across_cycles`
 - `parallel_fast_path_hit_is_recorded_and_root_remapped`
 
-Status remains fix-candidate until the original `SteadyChurn @16m --nojit`
-parallel-evac repro is soaked clean enough to retire this known issue.
+Follow-up hardening in this turn derives the serial drain set from the merged
+forward shards' identity entries (`old == new`) before Phase 4/5. That makes the
+identity forward itself authoritative, so a caller-side missed
+`fresh && old == new` side-channel cannot leave a self-forwarded holder unscanned.
+It also conservatively serial-scans every object in a CSet region that will be
+kept because at least one object in that region self-forwarded. That is a
+correctness backstop for evacuation-failure regions: no slot in a kept region is
+allowed to retain a stale reference into a CSet region that Phase 5 may free.
+Focused coverage: `parallel_identity_forwards_seed_serial_drain` plus the
+existing self-forward serial-drain tests.
+
+Status remains fix-candidate/open until the original `SteadyChurn @16m --nojit`
+parallel-evac repro is soaked clean enough to retire this known issue. The
+original `scratch/g1par/SteadyChurn.java` source was not tracked and was not
+present under `C:\craton` on 2026-07-01. A tracked recreation now lives at
+`docs/known-issues/repros/g1-parallel-steady-churn/`; it matches the documented
+HotSpot checksum but is not yet equivalent retirement evidence because the
+current recreation also trips serial G1 at longer runs.
 
 Parallel evac therefore stays **opt-in/experimental** and mixed stays serial until
 this residual race is also fixed. Default G1 (serial) and Generational are
