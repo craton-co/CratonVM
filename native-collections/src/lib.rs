@@ -35341,6 +35341,73 @@ mod tests {
     }
 
     #[test]
+    fn collector_contract_interface_methods_registered() {
+        let r = build_registry();
+        let collector = "java/util/stream/Collector";
+        assert!(
+            r.find(collector, "supplier", "()Ljava/util/function/Supplier;")
+                .is_some(),
+            "Collector.supplier"
+        );
+        assert!(
+            r.find(
+                collector,
+                "accumulator",
+                "()Ljava/util/function/BiConsumer;"
+            )
+            .is_some(),
+            "Collector.accumulator"
+        );
+        assert!(
+            r.find(collector, "finisher", "()Ljava/util/function/Function;")
+                .is_some(),
+            "Collector.finisher"
+        );
+        assert!(
+            r.find(
+                collector,
+                "combiner",
+                "()Ljava/util/function/BinaryOperator;"
+            )
+            .is_some(),
+            "Collector.combiner"
+        );
+
+        assert!(
+            r.find("java/util/function/Supplier", "get", "()Ljava/lang/Object;")
+                .is_some(),
+            "Supplier.get"
+        );
+        assert!(
+            r.find(
+                "java/util/function/BiConsumer",
+                "accept",
+                "(Ljava/lang/Object;Ljava/lang/Object;)V"
+            )
+            .is_some(),
+            "BiConsumer.accept"
+        );
+        assert!(
+            r.find(
+                "java/util/function/Function",
+                "apply",
+                "(Ljava/lang/Object;)Ljava/lang/Object;"
+            )
+            .is_some(),
+            "Function.apply"
+        );
+        assert!(
+            r.find(
+                "java/util/function/BinaryOperator",
+                "apply",
+                "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;"
+            )
+            .is_some(),
+            "BinaryOperator.apply"
+        );
+    }
+
+    #[test]
     #[cfg(feature = "synthetic-jdk")]
     fn concurrent_linked_queue_registered() {
         let r = build_registry();
