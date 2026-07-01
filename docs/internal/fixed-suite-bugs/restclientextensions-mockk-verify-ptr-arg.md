@@ -1,3 +1,38 @@
+# Fixed 2026-07-01: spring-web `RestClientExtensionsTests` mockk `verify{}` PTR args
+
+## Resolution 2026-07-01
+
+Current `dev` no longer reproduces this issue. The original report below was
+verified failing on `3cc5bf29`; the current workspace at `89db75ae` passes the
+same single-class repro in real-JDK, JIT-on mode.
+
+Verification:
+
+```
+cd apps/spring-suite-runner
+CRATONVM_BIN=/c/craton/CratonVM/target/release/cratonvm.exe \
+  ./run-suite.sh run --jdk real --jit on --batch 1 \
+  --only 'web\.client\.RestClientExtensionsTests' --tag codex-verify
+# RESULT: OK, found=5, passed=5, failed=0, ms=83478
+```
+
+Negative-control check with cross-thread JIT root takeover disabled also passes,
+so the adjacent `dfd3d560` takeover wait change is not required for this class:
+
+```
+CRATONVM_BIN=/c/craton/CratonVM/target/release/cratonvm.exe \
+CRATONVM_XT_JIT_ROOT_SCAN=0 \
+  ./run-suite.sh run --jdk real --jit on --batch 1 \
+  --only 'web\.client\.RestClientExtensionsTests' --tag codex-verify-noxt
+# RESULT: OK, found=5, passed=5, failed=0, ms=69494
+```
+
+The exact causal commit was not isolated from the post-report `dev` movement, but
+the suite behavior is fixed on current `dev`. The historical report is retained
+below for traceability.
+
+## Original Report
+
 # spring-web `RestClientExtensionsTests` — mockk `verify{}` rejects structurally-equal `ParameterizedTypeReference` args
 
 **Status:** OPEN (3/5) · **Mode:** real-JDK, JIT on · HotSpot passes 5/5
