@@ -43,9 +43,12 @@ enum HeapEntry {
 pub(crate) struct MockNativeContext {
     heap: UnsafeCell<Vec<HeapEntry>>,
     ptr_to_index: UnsafeCell<HashMap<usize, usize>>,
+    named_fields: UnsafeCell<HashMap<(usize, String), Value>>,
     next_ptr: usize,
     pub scripts: Vec<InvokeScript>,
     pub calls: UnsafeCell<Vec<InvokeCall>>,
+    blocking_begin_count: usize,
+    blocking_end_count: usize,
     /// Optional `ObjectRef` -> Rust-side `String` mapping so `read_string`
     /// can return a real value. Populated lazily by `attach_string` /
     /// `create_string` so most tests pay nothing for it.
@@ -63,9 +66,12 @@ impl MockNativeContext {
         Self {
             heap: UnsafeCell::new(Vec::new()),
             ptr_to_index: UnsafeCell::new(HashMap::new()),
+            named_fields: UnsafeCell::new(HashMap::new()),
             next_ptr: 8,
             scripts: Vec::new(),
             calls: UnsafeCell::new(Vec::new()),
+            blocking_begin_count: 0,
+            blocking_end_count: 0,
             strings: UnsafeCell::new(HashMap::new()),
             class_table: vec![String::new()],
             obj_class: HashMap::new(),
@@ -122,6 +128,12 @@ impl MockNativeContext {
     fn ptr_map_ref(&self) -> &HashMap<usize, usize> {
         unsafe { &*self.ptr_to_index.get() }
     }
+    fn named_fields_mut(&self) -> &mut HashMap<(usize, String), Value> {
+        unsafe { &mut *self.named_fields.get() }
+    }
+    fn named_fields_ref(&self) -> &HashMap<(usize, String), Value> {
+        unsafe { &*self.named_fields.get() }
+    }
 
     fn alloc_entry(&mut self, entry: HeapEntry) -> ObjectRef {
         let idx = self.heap_mut().len();
@@ -149,6 +161,10 @@ impl MockNativeContext {
             descriptor: desc.to_string(),
             result,
         });
+    }
+
+    pub(crate) fn blocking_region_counts(&self) -> (usize, usize) {
+        (self.blocking_begin_count, self.blocking_end_count)
     }
 
     pub(crate) fn recorded_calls(&self) -> &[InvokeCall] {
@@ -277,10 +293,16 @@ impl NativeContext for MockNativeContext {
     fn get_stack_trace(&self, _h: i32) -> Option<&[StackTraceEntry]> {
         None
     }
-    fn get_field_by_name(&self, _o: ObjectRef, _n: &str) -> Value {
-        Value::Object(None)
+    fn get_field_by_name(&self, o: ObjectRef, n: &str) -> Value {
+        self.named_fields_ref()
+            .get(&(o.as_ptr() as usize, n.to_string()))
+            .copied()
+            .unwrap_or(Value::Object(None))
     }
-    fn set_field_by_name(&self, _o: ObjectRef, _n: &str, _v: Value) {}
+    fn set_field_by_name(&self, o: ObjectRef, n: &str, v: Value) {
+        self.named_fields_mut()
+            .insert((o.as_ptr() as usize, n.to_string()), v);
+    }
     fn resolve_field_index(&self, _c: &str, _f: &str) -> Option<usize> {
         None
     }
@@ -440,6 +462,12 @@ impl NativeContext for MockNativeContext {
         false
     }
     fn park(&mut self, _t: Option<std::time::Duration>) {}
+    fn begin_blocking_region(&mut self) {
+        self.blocking_begin_count += 1;
+    }
+    fn end_blocking_region(&mut self) {
+        self.blocking_end_count += 1;
+    }
     fn unpark(&self, _o: ObjectRef) {}
     fn allocate_instance(&mut self, _c: &str) -> Option<ObjectRef> {
         None

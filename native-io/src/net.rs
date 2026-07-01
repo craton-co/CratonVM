@@ -1211,7 +1211,14 @@ fn net_write0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
         let n = {
             let s = stream_handle.lock();
             let mut w = &*s;
-            w.write(buf).map_err(|e| net_err("write0", e))?
+            // A blocking write can park behind socket backpressure just like
+            // read0 parks waiting for peer data. Keep it in the same
+            // GC-blocking protocol as accept/read so STW does not wait for a
+            // thread that is asleep in the OS.
+            ctx.begin_blocking_region();
+            let res = w.write(buf);
+            ctx.end_blocking_region();
+            res.map_err(|e| net_err("write0", e))?
         };
         socket_capture('w', fd, &buf[..n]);
         Ok(Some(Value::Int(n as i32)))
@@ -1910,6 +1917,41 @@ mod tests {
         client.read_exact(&mut buf).unwrap();
         assert_eq!(&buf, b"world");
         srv.join().unwrap();
+    }
+
+    #[test]
+    fn t19_5_write0_enters_blocking_region() {
+        let server = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = server.local_addr().unwrap().port();
+
+        let srv = thread::spawn(move || {
+            let (mut s, _) = server.accept().unwrap();
+            let mut buf = [0u8; 5];
+            s.read_exact(&mut buf).unwrap();
+            assert_eq!(&buf, b"hello");
+        });
+
+        let client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let fd = register_handle(NetSocketHandle::Stream(Arc::new(Mutex::new(client))));
+        let mut ctx = MockNativeContext::new();
+        let fd_obj = ctx.alloc_object(0);
+        ctx.set_field_by_name(fd_obj, "fd", Value::Int(fd));
+
+        let bytes = *b"hello";
+        let result = net_write0(
+            &mut ctx,
+            &[
+                Value::Object(Some(fd_obj)),
+                Value::Long(bytes.as_ptr() as i64),
+                Value::Int(bytes.len() as i32),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(result, Some(Value::Int(bytes.len() as i32)));
+        assert_eq!(ctx.blocking_region_counts(), (1, 1));
+        srv.join().unwrap();
+        remove_fd(fd);
     }
 
     #[test]

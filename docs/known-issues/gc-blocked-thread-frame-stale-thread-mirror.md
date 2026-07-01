@@ -186,6 +186,13 @@ the unrelated minor IBM850/CP850 charset (`UnsupportedEncodingException: ibm850`
    stale `root_snapshot` while flagged `in_blocked_region` (refresh/clear on the blocking native's
    wake path), and audit that the real-net (`native-io`) and real-AQS park natives bracket with
    `begin_blocking_region`/`end_blocking_region`.
+
+   2026-07-01 update: the real-net `sun.nio.ch.Net.write0` / `SocketDispatcher.write0`
+   path now brackets the blocking `TcpStream::write` in the same GC-blocking
+   protocol as `accept` and `read0`. This closes one native-I/O audit gap where
+   a VM thread could sleep in the OS on socket backpressure while still counted
+   as runnable by STW. The document remains open for the broader blocked-frame
+   and register-resident JIT root remainder.
 3. ✅ **DONE (deposit-path JIT-frame parity):** `deposit_root_snapshot` now folds in
    `scan_active_jit_frames` + the shadow-stack roots exactly like the safepoint `update_root_snapshot`
    — closing the JIT-spill half of the blocked-thread coverage gap (see "Partial fix" above).
