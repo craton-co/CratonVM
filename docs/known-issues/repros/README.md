@@ -30,6 +30,7 @@ $CV --java-home "$JDK" -cp <dir> <Repro>  # CratonVM (reproduces the gap)
 | `bug06-fam5-…` | `bug06-fam5-reflection-null/Refl5.java` | reflection-surface diff vs HotSpot (the *common* cases pass; doc needs the narrow failing path attributed). |
 | `springrepos-…` (latent deep recursion) | `springrepos-deep-recursion/GroovyNestProbe.java` | deeply-nested Groovy closures; clean `dev` runs slow-not-crash — the native-stack overflow only with the unmerged cold-path JIT experiment. |
 | `jit-regalloc-callee-saved-clobber-family` | `jit-regalloc-dup_x1/Dupx.java` | the bare `tab[index++]` `dup_x1` idiom — **does NOT** reproduce alone (matches HotSpot); kept as the negative control showing the family bug is method-shape-specific. |
+| `g1-parallel-evac-persistent-forwarding-root-remap` | `g1-parallel-steady-churn/SteadyChurn.java` | tracked recreation of the lost `scratch/g1par/SteadyChurn.java` shape plus `run-g1-parallel-steady-churn.ps1`. HotSpot prints `2002062093760` for `2000000`; not retirement evidence yet because this recreation still also trips serial G1 before the original serial-clean boundary is recovered. |
 
 ## GC-root-race / Family-A probe (needs `GC_STRESS` or load)
 
