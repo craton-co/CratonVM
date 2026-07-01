@@ -170,6 +170,16 @@ same conflict this doc is about). Standalone seconds-fast repro:
 (HotSpot baseline needs `--add-opens java.base/java.lang=ALL-UNNAMED` for bsh's
 reflective `defineClass`).
 
+2026-07-01 update: implemented and unit-tested the builtin-loader reverse-pollution
+half in `native-builtins/src/classloader.rs`. Builtin loaders now reject actual
+user-loader namespace hits (`loader_id > 2`) returned by the flat global lookup,
+while preserving Application-namespace classes that merely record a user-defined
+defining loader. Focused verification:
+`cargo test -p cratonvm-native-builtins test_builtin_find_loaded_class -- --nocapture`
+passes the new "hide user namespace" and "keep application namespace" cases. Full
+Spring BeanShell / Hibernate app repros were not rerun in this session, so this
+document remains in `docs/known-issues`.
+
 ## Impact
 
 - `ProxyClassReuseTest.testNoReuse` (1 of 3 methods).
