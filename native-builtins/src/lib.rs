@@ -3408,7 +3408,21 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
                     .unwrap_or_default()
                     .replace('/', ".")
             };
-            let hash = ctx.identity_hash_code(this);
+            // JDK `Object.toString` is `getName() + "@" + Integer.toHexString(hashCode())`
+            // where `hashCode()` is a VIRTUAL call. A receiver that overrides
+            // `hashCode()` (in bytecode) must have THAT value rendered here, not the
+            // raw identity hash — otherwise a value-hashed object whose default
+            // `toString` leaks into an equals/cache key varies spuriously across runs.
+            // This broke real-CGLIB cross-context proxy-class caching: Spring's
+            // `AnnotationTransactionAttributeSource` (hashCode = annotationParsers
+            // .hashCode()) is embedded via `toString()` in the CGLIB `AdvisorKeyEntry`
+            // (EnableTransactionManagementTests.cglibProxyClassIsCachedAcrossApplicationContexts).
+            // Objects that do NOT override hashCode dispatch to the Object.hashCode
+            // native (identity), so behaviour is unchanged for them (incl. arrays).
+            let hash = match ctx.invoke_virtual(this, "hashCode", "()I", &[]) {
+                Ok(Some(Value::Int(h))) => h,
+                _ => ctx.identity_hash_code(this),
+            };
             let hex = format!("{:x}", hash as u32);
             let result = format!("{}@{}", dot_name, hex);
             Ok(Some(Value::Object(Some(ctx.create_string(&result)))))
@@ -14469,7 +14483,15 @@ fn native_object_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     // ordinary classes).
     let class_id = getclass_display_class_id(ctx, class_id, this).unwrap_or(class_id);
     let dotted = object_to_string_dotted_name(ctx, class_id);
-    let hash = ctx.identity_hash_code(this);
+    // JDK `Object.toString` renders `Integer.toHexString(hashCode())`, a VIRTUAL
+    // call — a bytecode `hashCode()` override must show through here (see the twin
+    // fix in the `Object.toString` registration near the top of this file for the
+    // CGLIB proxy-cache rationale). Non-overriding receivers dispatch to the
+    // identity native, so their rendering is unchanged.
+    let hash = match ctx.invoke_virtual(this, "hashCode", "()I", &[]) {
+        Ok(Some(Value::Int(h))) => h,
+        _ => ctx.identity_hash_code(this),
+    };
     // Build "dotted@hash" with a single pre-sized buffer (saves the realloc
     // that `format!` would do, but more importantly limits us to one heap
     // alloc for this call — the per-object hash means we cannot cache this).
