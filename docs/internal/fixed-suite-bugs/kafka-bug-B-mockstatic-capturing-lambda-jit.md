@@ -1,13 +1,20 @@
-# Bug B residual — `mockStatic` capturing-lambda stub bypassed by JIT
+# Bug B residual — `mockStatic` capturing-lambda stub bypassed by JIT (fixed)
 
 | | |
 |---|---|
 | **Severity** | Medium (blocks the last Kafka `ClientUtilsTest` reverse-lookup case; narrow trigger) |
 | **Kind** | JIT correctness — stale call target after JVMTI class redefinition |
 | **Surfaced by** | `org.apache.kafka.clients.ClientUtilsTest.testParseAndValidateAddressesWithReverseLookup` (`ksuite/repro/MockClientUtils.java`, line 17) |
-| **CratonVM** | FAIL (JIT on) · **works with `--nojit`** · **HotSpot** OK |
-| **Status** | OPEN — root-caused to JIT dispatch-cache invalidation on redefine |
+| **CratonVM** | Fixed on `dev` · previously failed with JIT on · **HotSpot** OK |
+| **Status** | FIXED 2026-07-01 — redefine now quiesces compiled dispatch paths after class redefinition |
 | **Predecessor** | The dispatch/shadowing half of Bug B is **FIXED on `dev`** — see [`kafka-bug-B-mockito-mockstatic-mock-dispatch.md`](kafka-bug-B-mockito-mockstatic-mock-dispatch.md) |
+
+## Resolution (2026-07-01)
+
+Fixed on `dev` by `353e93c0`, merged via `25fd5d11`: class redefinition now clears compiled
+methods and JIT dispatch helpers/interpreter paths stop using cached or newly-published compiled
+targets once any class has been redefined. This implements the conservative blanket quiesce option
+recommended below.
 
 ## Summary
 

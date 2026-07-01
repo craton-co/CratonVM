@@ -4,14 +4,20 @@ This folder collects CratonVM-only defects found while running upstream Java
 suites. The docs had grown to describe the **same underlying bug from several
 angles**; this index is the consolidated map. Read it first.
 
+## Bug-document lifecycle
+
+Every unresolved bug document belongs under `docs/known-issues`. Once the bug
+is fixed, resolved, or refuted, move the write-up out of this folder and archive
+it under `docs/internal`.
+
 ## How many distinct bugs are here?
 
-After consolidation (full re-count 2026-06-18, kafka-bug-B/C status reconciled 2026-06-20),
+After consolidation (full re-count 2026-06-18, kafka-bug-B/C status reconciled 2026-07-01),
 the ~30 docs map to **one root-cause family + ~15 distinct standalone bugs**, of which
-**8 are already FIXED on `dev`** (the 6 prior + `kafka-bug-C` and the dispatch half of
-`kafka-bug-B`). Headline:
+**9 are already FIXED on `dev`** (the 6 prior + `kafka-bug-C` and both `kafka-bug-B`
+fixes). Headline:
 
-**~9 distinct OPEN defects + 1 latent** (was ~10 — family-A **A2** was fixed
+**~8 distinct OPEN defects + 1 latent** (was ~10 — family-A **A2** was fixed
 2026-06-23, `6e3ddb05`), grouped as:
 
 1. **Family A — GC root coverage under JIT** (one root cause, several manifestations). Open members:
@@ -37,10 +43,10 @@ the ~30 docs map to **one root-cause family + ~15 distinct standalone bugs**, of
    now runs 174/178, `AnnotationUtilsTests` 72/72. Only the synthesis value-mismatches remain open.)
 6. **`spring-bug-08`** — serializable JDK-proxy round-trip (open).
 7. **`spring-bug-11` residual** — Groovy hang at `BEGIN` (the SIGSEGV half is FIXED via bug-12; open).
-8. **`kafka-bug-B`** — Mockito `mockStatic` + `mock`/`mockConstruction` dispatch: the dispatch/shadowing
-   half is **FIXED on `dev`** (doc removed); a narrow **residual** stays open — a `mockStatic`
-   capturing-lambda stub bypassed by a stale JIT call site
-   ([kafka-bug-B-mockstatic-capturing-lambda-jit.md](kafka-bug-B-mockstatic-capturing-lambda-jit.md), works with `--nojit`).
+8. ~~**`kafka-bug-B`**~~ — Mockito `mockStatic` + `mock`/`mockConstruction` dispatch:
+   **FIXED on `dev`**. The stale JIT call-site residual was fixed by redef-time compiled
+   dispatch quiescing; archived at
+   [`docs/internal/fixed-suite-bugs/kafka-bug-B-mockstatic-capturing-lambda-jit.md`](../internal/fixed-suite-bugs/kafka-bug-B-mockstatic-capturing-lambda-jit.md).
 9. ~~**`kafka-bug-C`**~~ — `WeakHashMap.values().stream()` infinite hang: **FIXED on `dev`** (`1cd0ab26`; doc removed).
 10. **Hibernate JTA** (Narayana) — ✅ **RESOLVED 2026-06-20** (docs → [`docs/internal/`](../internal/)).
     L0 fixed on dev; **L1 was never broken (refuted)**; **L2 = an `accept()` deadlock** (global `s2_registry`
@@ -304,7 +310,7 @@ and already-consolidated ones (fam5/6) were left in place.
 | Serializable proxy round-trip | VM-CORRECTNESS (proxy + serialization) | ✅ **RESOLVED on `dev`** — the standalone serialize→deserialize JDK-proxy repro round-trips correctly; `SerializableTypeWrapperTests` generic-type-render residual tracked on branch `fix/generic-array-type-tostring`. Doc removed. | _(removed)_ |
 | JUnit-platform execution `LoadError` | VM-CORRECTNESS / dispatch | 🔴 **OPEN** — JUnit platform internals; Family-A GC-root race (NOT related to the now-fixed bug-04, which was a non-`Comparable` compare exception-type bug, not a GC race) | [spring-bug-10-junit-platform-execution-loaderr.md](../internal/spring-bug-10-junit-platform-execution-loaderr.md) |
 | Groovy / scheduler crashes (rc=139) | VM-CRASH | 🟡 **PARTIAL** — Groovy SIGSEGV fixed via the bug-12 HashMap-layout fix; residual = a separate Groovy **hang at BEGIN** (inventory, needs per-cluster trace) | [spring-bug-11-groovy-and-scheduler-crashes.md](../internal/spring-bug-11-groovy-and-scheduler-crashes.md) |
-| Mockito `mockStatic` + mock dispatch | VM-CORRECTNESS (Mockito dispatch) | ✅ **FIXED on `dev`** — the dispatch/shadowing half landed (doc removed). A narrow **residual** remains open (the `mockStatic` capturing-lambda stub is bypassed by a stale JIT call site; works with `--nojit`). | open residual: [kafka-bug-B-mockstatic-capturing-lambda-jit.md](kafka-bug-B-mockstatic-capturing-lambda-jit.md) |
+| Mockito `mockStatic` + mock dispatch | VM-CORRECTNESS (Mockito dispatch) | ✅ **FIXED on `dev`** — the dispatch/shadowing half landed earlier, and the stale JIT call-site residual was fixed by redefine-time compiled dispatch quiescing. | [fixed residual](../internal/fixed-suite-bugs/kafka-bug-B-mockstatic-capturing-lambda-jit.md) |
 | `WeakHashMap` stream infinite hang | VM-HANG → JIT codegen | ✅ **FIXED on `dev`** (`1cd0ab26`, JIT ban; verified; doc removed). The underlying `dup_x1` field-post-increment codegen weakness is tracked in the [JIT regalloc family doc](jit-regalloc-callee-saved-clobber-family.md). | _(removed)_ |
 
 > `spring-bug-10` is a **Family A** (GC-root-coverage-under-JIT) manifestation seen from the
