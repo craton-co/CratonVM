@@ -17657,6 +17657,33 @@ fn force_native_over_real_jdk_bytecode(
     {
         return true;
     }
+    // java.time text names: `sun.util.locale.provider.CalendarDataUtility
+    // .retrieveJavaTimeFieldValueName(s)` feed `DateTimeTextProvider`'s
+    // `EEE`/`MMM`/`a`/`G` lookups. The real-JDK bodies walk the same
+    // `jdk.localedata` CLDR bundles we don't surface (as getDateTimePattern
+    // above) and return null/empty, so `DateTimeFormatter` prints the raw
+    // numeric field (e.g. Spring `HttpHeaders` RFC-1123 dates render
+    // "4, 18 12 2008" not "Thu, 18 Dec 2008"). Force our natives (registered
+    // in `native-builtins::locale_resources::register`) which answer from the
+    // en/US CLDR name tables directly.
+    if class_name == "sun/util/locale/provider/CalendarDataUtility"
+        && matches!(
+            method_name,
+            "retrieveJavaTimeFieldValueName" | "retrieveJavaTimeFieldValueNames"
+        )
+    {
+        return true;
+    }
+    // Unicode normalization: `java.text.Normalizer.normalize/isNormalized` — the
+    // real-JDK bodies drive `sun.text.normalizer` off ICU normalization data
+    // (`jdk.localedata`-adjacent tables) that CratonVM doesn't surface, so they
+    // return garbage (e.g. `normalize("ï", NFD)` yields six U+0226 chars).
+    // Force our natives (registered in `register_p61_text_formatting`), which
+    // use the `unicode-normalization` crate for faithful NFC/NFD/NFKC/NFKD. Fixes
+    // Spring `ContentDisposition.transliterateToAscii` (accent decomposition).
+    if class_name == "java/text/Normalizer" && matches!(method_name, "normalize" | "isNormalized") {
+        return true;
+    }
     // SBR-02 / bug-03: fast native regex. The real-JDK `String.replaceAll` /
     // `replaceFirst` / `matches` bodies run `Pattern.compile(...).matcher(...)`
     // in the interpreter (java.util.regex), which is 30–600× slower than

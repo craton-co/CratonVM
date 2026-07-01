@@ -556,6 +556,7 @@ name = "cratonvm-native-api"
 version = "0.3.0"
 dependencies = [
  "cratonvm-types",
+ "encoding_rs",
  "native-tls",
  "parking_lot",
  "rustc-hash",
@@ -1011,6 +1012,15 @@ dependencies = [
  "sec1",
  "subtle",
  "zeroize",
+]
+
+[[package]]
+name = "encoding_rs"
+version = "0.8.35"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "75030f3c4f45dafd7586dd6780965a8c7e8e285a5ecb86713e63a79c5b2766f3"
+dependencies = [
+ "cfg-if",
 ]
 
 [[package]]

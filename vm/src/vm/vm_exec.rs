@@ -11446,6 +11446,30 @@ fn invoke_on_class_shared_inner(
                         // pattern.
                         || (class_name == "sun/util/locale/provider/LocaleResources"
                             && method_name == "getDateTimePattern")
+                        // java.time text names: `CalendarDataUtility.retrieve
+                        // JavaTimeFieldValueName(s)` back `DateTimeTextProvider`'s
+                        // `EEE`/`MMM`/`a`/`G` lookups. Same locale-data gap as
+                        // getDateTimePattern — the real bodies return null/empty
+                        // so `DateTimeFormatter` prints the raw numeric field
+                        // (Spring `HttpHeaders` RFC-1123 dates render "4, 18 12
+                        // 2008" not "Thu, 18 Dec 2008"). Force the natives
+                        // (locale_resources.rs) which answer from the en/US CLDR
+                        // name tables directly.
+                        || (class_name == "sun/util/locale/provider/CalendarDataUtility"
+                            && matches!(
+                                method_name,
+                                "retrieveJavaTimeFieldValueName"
+                                | "retrieveJavaTimeFieldValueNames"
+                            ))
+                        // Unicode normalization: `java.text.Normalizer.normalize
+                        // /isNormalized` real-JDK bodies drive `sun.text
+                        // .normalizer` off ICU data we don't surface, returning
+                        // garbage (`normalize("ï", NFD)` → six U+0226). Force the
+                        // `unicode-normalization`-backed natives
+                        // (register_p61_text_formatting) — fixes Spring
+                        // ContentDisposition accent transliteration.
+                        || (class_name == "java/text/Normalizer"
+                            && matches!(method_name, "normalize" | "isNormalized"))
                         // METHODHANDLES ARRAY ACCESSORS: `MethodHandles.
                         // arrayElementGetter` / `arrayElementSetter` are concrete
                         // static factories whose JDK 25 bytecode routes through

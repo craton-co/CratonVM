@@ -87,6 +87,27 @@ pub const REPLACEMENT_BYTE: u8 = b'?';
 /// Replacement code point used by the lossy variants for decoding.
 pub const REPLACEMENT_CHAR: u16 = 0xFFFD;
 
+/// Map a CratonVM canonical charset name (as produced by
+/// `normalize_charset_name`) to its `encoding_rs` implementation, for the
+/// legacy / CJK multi-byte families the hand-written codecs above don't cover.
+/// Single-byte and Unicode charsets are handled directly and return `None`
+/// here so they keep their existing (faster, Java-exact) paths.
+fn multibyte_encoding(name: &str) -> Option<&'static encoding_rs::Encoding> {
+    Some(match name {
+        "Shift_JIS" => encoding_rs::SHIFT_JIS,
+        "EUC-JP" => encoding_rs::EUC_JP,
+        "ISO-2022-JP" => encoding_rs::ISO_2022_JP,
+        "Big5" => encoding_rs::BIG5,
+        "EUC-KR" => encoding_rs::EUC_KR,
+        // The JDK's GB2312 is a subset of GBK; encoding_rs folds both into GBK.
+        "GBK" | "GB2312" => encoding_rs::GBK,
+        "GB18030" => encoding_rs::GB18030,
+        // windows-1250 has no hand-written table above; encoding_rs covers it.
+        "windows-1250" => encoding_rs::WINDOWS_1250,
+        _ => return None,
+    })
+}
+
 /// Decode a byte slice into a sequence of UTF-16 code units.
 ///
 /// Only canonical names produced by `normalize_charset_name` are accepted.
@@ -109,12 +130,29 @@ pub fn decode_bytes(name: &str, bytes: &[u8]) -> Result<Vec<u16>, CodingError> {
         "ISO-8859-2" => Ok(bytes.iter().map(|&b| iso_8859_2_to_u16(b)).collect()),
         "ISO-8859-15" => Ok(bytes.iter().map(|&b| iso_8859_15_to_u16(b)).collect()),
         "IBM850" => Ok(bytes.iter().map(|&b| ibm850_to_u16(b)).collect()),
-        _ => Err(CodingError {
-            offset: 0,
-            length: 0,
-            kind: CodingErrorKind::UnsupportedCharset,
-            charset: canonical_name_static(name),
-        }),
+        other => {
+            // Legacy / CJK multi-byte charsets via encoding_rs. Strict decode:
+            // `_without_replacement` returns None on malformed input (mirrors
+            // the JDK's REPORT action), which we surface as a Malformed error.
+            if let Some(enc) = multibyte_encoding(other) {
+                match enc.decode_without_bom_handling_and_without_replacement(bytes) {
+                    Some(cow) => Ok(cow.encode_utf16().collect()),
+                    None => Err(CodingError {
+                        offset: 0,
+                        length: 0,
+                        kind: CodingErrorKind::Malformed,
+                        charset: canonical_name_static(name),
+                    }),
+                }
+            } else {
+                Err(CodingError {
+                    offset: 0,
+                    length: 0,
+                    kind: CodingErrorKind::UnsupportedCharset,
+                    charset: canonical_name_static(name),
+                })
+            }
+        }
     }
 }
 
@@ -141,12 +179,34 @@ pub fn encode_chars(name: &str, chars: &[u16]) -> Result<Vec<u8>, CodingError> {
         "ISO-8859-2" => encode_iso_8859_2(chars),
         "ISO-8859-15" => encode_iso_8859_15(chars),
         "IBM850" => encode_ibm850(chars),
-        _ => Err(CodingError {
-            offset: 0,
-            length: 0,
-            kind: CodingErrorKind::UnsupportedCharset,
-            charset: canonical_name_static(name),
-        }),
+        other => {
+            // Legacy / CJK multi-byte charsets via encoding_rs. `encode`
+            // substitutes unmappable code points with an HTML numeric character
+            // reference and flags `had_errors`; the strict (REPORT) contract
+            // requires an error instead, so surface Unmappable when that fires
+            // and only return the byte string when every unit mapped cleanly.
+            if let Some(enc) = multibyte_encoding(other) {
+                let s = String::from_utf16_lossy(chars);
+                let (encoded, _, had_errors) = enc.encode(&s);
+                if had_errors {
+                    Err(CodingError {
+                        offset: 0,
+                        length: 0,
+                        kind: CodingErrorKind::Unmappable,
+                        charset: canonical_name_static(name),
+                    })
+                } else {
+                    Ok(encoded.into_owned())
+                }
+            } else {
+                Err(CodingError {
+                    offset: 0,
+                    length: 0,
+                    kind: CodingErrorKind::UnsupportedCharset,
+                    charset: canonical_name_static(name),
+                })
+            }
+        }
     }
 }
 
@@ -175,7 +235,16 @@ pub fn decode_bytes_lossy(name: &str, bytes: &[u8]) -> Vec<u16> {
         // charset that maps every byte 0x00..=0xFF losslessly and identically.
         // This preserves the bytes' identity (round-trippable) rather than
         // fabricating replacement characters for valid data.
-        _ => bytes.iter().map(|&b| b as u16).collect(),
+        other => {
+            // Legacy / CJK multi-byte charsets via encoding_rs: tolerant decode
+            // substitutes U+FFFD for malformed sequences (the REPLACE action).
+            if let Some(enc) = multibyte_encoding(other) {
+                let (cow, _had_errors) = enc.decode_without_bom_handling(bytes);
+                cow.encode_utf16().collect()
+            } else {
+                bytes.iter().map(|&b| b as u16).collect()
+            }
+        }
     }
 }
 
@@ -215,18 +284,51 @@ pub fn encode_chars_lossy(name: &str, chars: &[u16]) -> Vec<u8> {
             "ISO-8859-2" => encode_sb_lossy(chars, iso_8859_2_rev()),
             "ISO-8859-15" => encode_sb_lossy(chars, iso_8859_15_rev()),
             "IBM850" => encode_sb_lossy(chars, ibm850_rev()),
-            // Unsupported charset name. The lossy signature is infallible, so
-            // we cannot surface `UnsupportedCharset`. Re-encoding as UTF-8
-            // silently produced bytes in the *wrong* encoding for the sink.
-            // Fall back to ISO-8859-1 (the byte-identity charset) with `'?'`
-            // substitution: representable units keep their byte value, the
-            // rest become `'?'`. Still lossy, but never the wrong encoding.
-            _ => chars
-                .iter()
-                .map(|&c| if c < 0x100 { c as u8 } else { REPLACEMENT_BYTE })
-                .collect(),
+            // Legacy / CJK multi-byte charsets via encoding_rs, with `'?'`
+            // substitution for unmappable units (the REPLACE action) — reached
+            // only when the strict `encode_chars` above already reported an
+            // unmappable unit, so most of the string is representable.
+            //
+            // Unsupported charset name: the lossy signature is infallible, so we
+            // cannot surface `UnsupportedCharset`. Re-encoding as UTF-8 silently
+            // produced bytes in the *wrong* encoding for the sink. Fall back to
+            // ISO-8859-1 (the byte-identity charset) with `'?'` substitution:
+            // representable units keep their byte value, the rest become `'?'`.
+            // Still lossy, but never the wrong encoding.
+            _ => {
+                if let Some(enc) = multibyte_encoding(name) {
+                    encode_multibyte_lossy(enc, chars)
+                } else {
+                    chars
+                        .iter()
+                        .map(|&c| if c < 0x100 { c as u8 } else { REPLACEMENT_BYTE })
+                        .collect()
+                }
+            }
         },
     }
+}
+
+/// Lossy multi-byte encode: encode each code point in `chars` with the given
+/// `encoding_rs` encoding, substituting [`REPLACEMENT_BYTE`] (`'?'`) for any
+/// unmappable one. Encodes code-point-by-code-point so a single unmappable
+/// char becomes exactly one `'?'` rather than an HTML numeric char reference.
+/// Stateless CJK codecs (Shift_JIS, EUC-*, GBK, Big5) round-trip exactly this
+/// way; only stateful ISO-2022-JP is approximated on the (untested) lossy path.
+fn encode_multibyte_lossy(enc: &'static encoding_rs::Encoding, chars: &[u16]) -> Vec<u8> {
+    let s = String::from_utf16_lossy(chars);
+    let mut out = Vec::with_capacity(s.len());
+    let mut buf = [0u8; 4];
+    for ch in s.chars() {
+        let one = ch.encode_utf8(&mut buf);
+        let (encoded, _, had_errors) = enc.encode(one);
+        if had_errors {
+            out.push(REPLACEMENT_BYTE);
+        } else {
+            out.extend_from_slice(&encoded);
+        }
+    }
+    out
 }
 
 /// Lossy single-byte encode: encode each mappable code unit in the target

@@ -14735,6 +14735,33 @@ fn p58_pushback_reader_unread(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
 // CharsetDecoder = 3-field (charset=0, avgCharsPerByte=1 Float, maxCharsPerByte=2 Float)
 // =============================================================================
 
+/// Seed a freshly-built synthetic `CharsetEncoder`/`CharsetDecoder` with the
+/// JDK-default coding-error actions (`CodingErrorAction.REPORT`) for the
+/// `malformedInputAction` / `unmappableCharacterAction` fields.
+///
+/// The real `java.nio.charset.CharsetEncoder`/`CharsetDecoder` constructors
+/// initialise both fields to `CodingErrorAction.REPORT`. Our `newEncoder` /
+/// `newDecoder` shims allocate the coder object directly and only wrote the
+/// charset / avg / max slots, leaving these two fields `null`. When real-JDK
+/// bytecode runs on such a coder — e.g. `CharsetEncoder.canEncode` (Spring's
+/// `HttpHeaders.encodeBasicAuth` → `encoder.canEncode(username)`) — its
+/// `finally` block calls `onMalformedInput(malformedInputAction())` with a
+/// `null` argument, throwing `IllegalArgumentException("Null action")`. Seed
+/// the fields so the JDK bytecode sees the same defaults HotSpot would.
+/// `set_field_by_name` is a no-op when the field is absent (synthetic-JDK
+/// mode), so this is safe in both modes.
+fn seed_coder_error_actions(ctx: &mut dyn NativeContext, coder: ObjectRef) {
+    let report = match ctx.ensure_class_initialized("java/nio/charset/CodingErrorAction") {
+        Ok(cid) => match ctx.static_field_index_by_name(cid, "REPORT") {
+            Some(idx) => ctx.get_static_field(cid, idx),
+            None => return,
+        },
+        Err(_) => return,
+    };
+    ctx.set_field_by_name(coder, "malformedInputAction", report);
+    ctx.set_field_by_name(coder, "unmappableCharacterAction", report);
+}
+
 pub fn register_p58_charset_coder(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
@@ -14883,6 +14910,7 @@ pub fn register_p58_charset_coder(r: &mut NativeMethodRegistry) {
             ctx.set_field(enc_obj, 0, Value::Object(Some(this)));
             ctx.set_field(enc_obj, 1, Value::Float(1.0));
             ctx.set_field(enc_obj, 2, Value::Float(4.0));
+            seed_coder_error_actions(ctx, enc_obj);
             Ok(Some(Value::Object(Some(enc_obj))))
         },
     );
@@ -14896,6 +14924,7 @@ pub fn register_p58_charset_coder(r: &mut NativeMethodRegistry) {
             ctx.set_field(dec_obj, 0, Value::Object(Some(this)));
             ctx.set_field(dec_obj, 1, Value::Float(1.0));
             ctx.set_field(dec_obj, 2, Value::Float(1.0));
+            seed_coder_error_actions(ctx, dec_obj);
             Ok(Some(Value::Object(Some(dec_obj))))
         },
     );
@@ -21374,8 +21403,18 @@ pub(crate) fn register_p61_text_formatting(r: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
                 _ => return Ok(Some(Value::Object(None))),
             };
+            // Read the Form's ordinal via `Enum.ordinal()` so this works for
+            // BOTH the real-JDK `Normalizer.Form` enum (real Enum layout: name
+            // at field 0, ordinal at field 1) and the synthetic one — reading
+            // field 0 as an int would pick up the `name` String reference and
+            // always yield 0 (NFC). NFC=0, NFD=1, NFKC=2, NFKD=3.
             let form_ordinal = match args.get(1) {
-                Some(Value::Object(Some(f))) => ctx.get_field(*f, 0).as_int().unwrap_or(0),
+                Some(Value::Object(Some(f))) => ctx
+                    .invoke_virtual(*f, "ordinal", "()I", &[])
+                    .ok()
+                    .flatten()
+                    .and_then(|v| v.as_int())
+                    .unwrap_or(0),
                 _ => 0,
             };
             let normalized = match form_ordinal {
