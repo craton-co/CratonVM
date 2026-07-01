@@ -2277,6 +2277,31 @@ fn collect_store_entries(ctx: &mut dyn NativeContext, this: ObjectRef) -> Vec<(S
     entries
 }
 
+fn render_store_text(
+    comments: Option<&str>,
+    date: Option<&str>,
+    entries: &[(String, String)],
+    escape_unicode: bool,
+    eol: &str,
+) -> String {
+    let mut text = String::new();
+    if let Some(c) = comments {
+        write_comments(&mut text, c, eol);
+    }
+    if let Some(d) = date {
+        text.push('#');
+        text.push_str(d);
+        text.push_str(eol);
+    }
+    for (k, v) in entries {
+        text.push_str(&save_convert(k, true, escape_unicode));
+        text.push('=');
+        text.push_str(&save_convert(v, false, escape_unicode));
+        text.push_str(eol);
+    }
+    text
+}
+
 /// Build the full `.properties` text for `this`. This is what `Properties.store0`
 /// would produce by iterating `entrySet()` — but our synthetic `Properties` (and
 /// `System.getProperties()`) keep their entries in the side-table, not the
@@ -2297,28 +2322,14 @@ fn build_store_text(
         .get_system_property("line.separator")
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "\n".to_string());
-    let mut text = String::new();
-    if let Some(c) = comments {
-        write_comments(&mut text, c, &eol);
-    }
     // Pin `this` across the Date allocation so the entry walk below sees the
     // forwarded (post-GC) reference.
     let this_pin = ctx.pin_native_root(this);
-    if let Some(d) = current_date_string(ctx) {
-        text.push('#');
-        text.push_str(&d);
-        text.push_str(&eol);
-    }
+    let date = current_date_string(ctx);
     let this_cur = ctx.read_native_pin(this_pin, this);
     let entries = collect_store_entries(ctx, this_cur);
     ctx.unpin_native_roots(this_pin);
-    for (k, v) in entries {
-        text.push_str(&save_convert(&k, true, escape_unicode));
-        text.push('=');
-        text.push_str(&save_convert(&v, false, escape_unicode));
-        text.push_str(&eol);
-    }
-    text
+    render_store_text(comments, date.as_deref(), &entries, escape_unicode, &eol)
 }
 
 /// Native `Properties.store(OutputStream, String)` — serializes the side-table
@@ -2849,6 +2860,33 @@ mod tests {
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
         assert_eq!(parsed, expected);
+    }
+
+    #[test]
+    fn render_store_text_includes_date_before_first_entry() {
+        let entries = vec![
+            ("code2".to_string(), "message2".to_string()),
+            ("code1".to_string(), "message1".to_string()),
+        ];
+        let text = render_store_text(
+            None,
+            Some("Thu Jan 01 00:00:00 UTC 1970"),
+            &entries,
+            true,
+            "\n",
+        );
+        assert!(text.starts_with("#Thu Jan 01 00:00:00 UTC 1970\n"));
+        assert!(
+            text.contains("\ncode2=message2\n"),
+            "first entry must be newline-prefixed by the date comment: {text:?}"
+        );
+    }
+
+    #[test]
+    fn render_store_text_keeps_user_comment_before_date() {
+        let entries = vec![("key".to_string(), "value".to_string())];
+        let text = render_store_text(Some("header"), Some("DATE"), &entries, true, "\r\n");
+        assert_eq!(text, "#header\r\n#DATE\r\nkey=value\r\n");
     }
 
     #[test]

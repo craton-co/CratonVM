@@ -442,7 +442,7 @@ supplier/accumulator/finisher/combiner, plus JSpecify nullness reflection). The 
 - [SC-env-classreading.md](SC-env-classreading.md) — getenv/getProperties identity; `Object.equals` shadows overrides (`precedenceOf`=-1); `int.class` via classreading; custom-CL `getResourceAsStream`.
 - [SC-resource-io-family.md](SC-resource-io-family.md) — NIO write-channel stub, `Path.toUri()` authority; several FileNotFoundExceptions are harness-CWD artifacts.
 - [SC-stax-xml-family.md](SC-stax-xml-family.md) — namespace SAX-event-sequence mismatch (cursor natives + element prefix already fixed on dev).
-- [SC-task-retry-util-misc.md](SC-task-retry-util-misc.md) — Properties.store #date line, Throwable deser, retry timing, ByteBuddy ClassInjector, AQS throttle.
+- [SC-task-retry-util-misc.md](../internal/spring/SC-task-retry-util-misc.md) — Throwable deser, retry timing, ByteBuddy ClassInjector, AQS throttle. (`Properties.store` #date and unmodifiable-wrapper `Serializable` are fixed on dev.)
 - [SC-misc-core-spring.md](SC-misc-core-spring.md) — SortedProperties OutputStream store (CHM.remove(null) fixed on dev).
 - [SC-hangs-mergedannotations-charsequence.md](SC-hangs-mergedannotations-charsequence.md) — two hangs: `MergedAnnotations.stream().toArray()` re-entry; Reactor `StepVerifier` producer never scheduled.
 
