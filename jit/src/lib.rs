@@ -3274,6 +3274,17 @@ impl JitMICSlot {
             .store(class_id, std::sync::atomic::Ordering::Release);
     }
 
+    /// Drop only the compiled-entry half of the MIC.
+    ///
+    /// The receiver class/name cache remains useful for helper-side dispatch,
+    /// but generated inline code treats a zero entry pointer as unresolved.
+    pub fn clear_compiled_entry(&self) {
+        self.cached_entry_ptr
+            .store(0, std::sync::atomic::Ordering::Release);
+        self.cached_needs_context
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// Record a cache hit.
     #[inline]
     pub fn record_hit(&self) {
@@ -3591,6 +3602,22 @@ impl JitPICSlot {
         self.hits[i].store(0, std::sync::atomic::Ordering::Relaxed);
         // Publish the new class_id last.
         self.class_ids[i].store(class_id, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Remove all cached compiled targets from this PIC.
+    ///
+    /// Clear class ids first so generated inline code misses immediately, then
+    /// zero the target metadata.
+    pub fn clear_entries(&self) {
+        for i in 0..JIT_PIC_ENTRIES {
+            self.class_ids[i].store(0, std::sync::atomic::Ordering::Release);
+        }
+        for i in 0..JIT_PIC_ENTRIES {
+            self.entry_ptrs[i].store(0, std::sync::atomic::Ordering::Release);
+            self.needs_context[i].store(false, std::sync::atomic::Ordering::Relaxed);
+            self.hits[i].store(0, std::sync::atomic::Ordering::Relaxed);
+            *self.class_names[i].lock() = None;
+        }
     }
 
     /// Total observed invocations (hits across all entries + misses).
@@ -4023,6 +4050,20 @@ impl JitCache {
             }
             self.methods.remove(&h);
         }
+        count
+    }
+
+    /// Invalidate every compiled method in the cache.
+    ///
+    /// JVMTI redefine can invalidate caller-side direct calls and inline caches,
+    /// not just methods declared by the redefined class. A full flush is rare
+    /// but conservative and keeps the code-range registry in sync.
+    pub fn clear_all(&mut self) -> usize {
+        let count = self.methods.len();
+        for (_key, cm) in self.methods.values() {
+            unregister_jit_code_range(cm.entry_ptr() as usize);
+        }
+        self.methods.clear();
         count
     }
 }
@@ -8263,6 +8304,30 @@ mod tests {
     }
 
     #[test]
+    fn test_jit_pic_slot_clear_entries_drops_compiled_targets() {
+        let pic = JitPICSlot::new();
+        pic.install(1, "A", 0x1000, false);
+        pic.install(2, "B", 0x2000, true);
+        pic.install(3, "C", 0x3000, false);
+        assert_eq!(pic.entries_used(), 3);
+
+        pic.clear_entries();
+
+        assert_eq!(pic.entries_used(), 0);
+        assert!(pic.lookup(1).is_none());
+        assert!(pic.lookup(2).is_none());
+        assert!(pic.lookup(3).is_none());
+        for i in 0..JIT_PIC_ENTRIES {
+            assert_eq!(
+                pic.entry_ptrs[i].load(std::sync::atomic::Ordering::Acquire),
+                0
+            );
+            assert!(!pic.needs_context[i].load(std::sync::atomic::Ordering::Relaxed));
+            assert!(pic.class_names[i].lock().is_none());
+        }
+    }
+
+    #[test]
     fn test_jit_pic_slot_lru_evicts_least_hit() {
         let pic = JitPICSlot::new();
         pic.install(1, "A", 0x1000, false);
@@ -8557,6 +8622,41 @@ mod tests {
 
         let result = cache.get(&class, &method, &desc);
         assert!(result.is_some());
+    }
+
+    #[test]
+    fn test_jit_cache_clear_all_evicts_entries() {
+        let mut cache = JitCache::new();
+        let class_a: Arc<str> = Arc::from("TestClassA");
+        let method_a: Arc<str> = Arc::from("testA");
+        let desc_a: Arc<str> = Arc::from("()V");
+        let class_b: Arc<str> = Arc::from("TestClassB");
+        let method_b: Arc<str> = Arc::from("testB");
+        let desc_b: Arc<str> = Arc::from("(I)I");
+
+        let mut buf_a = ExecutableBuffer::new(16).expect("alloc failed");
+        buf_a.emit(&[0xC3]); // RET
+        cache.put(
+            class_a.clone(),
+            method_a.clone(),
+            desc_a.clone(),
+            CompiledMethod::new(buf_a),
+        );
+
+        let mut buf_b = ExecutableBuffer::new(16).expect("alloc failed");
+        buf_b.emit(&[0xC3]); // RET
+        cache.put(
+            class_b.clone(),
+            method_b.clone(),
+            desc_b.clone(),
+            CompiledMethod::new(buf_b),
+        );
+
+        assert_eq!(cache.len(), 2);
+        assert_eq!(cache.clear_all(), 2);
+        assert!(cache.is_empty());
+        assert!(cache.get(&class_a, &method_a, &desc_a).is_none());
+        assert!(cache.get(&class_b, &method_b, &desc_b).is_none());
     }
 
     #[test]
@@ -8880,6 +8980,31 @@ mod tests {
             0xDEAD_BEEF
         );
         assert!(mic
+            .cached_needs_context
+            .load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    #[test]
+    fn s33_mic_slot_clear_compiled_entry_keeps_receiver_cache() {
+        let mic = JitMICSlot::new();
+        mic.update(7, "com/example/MyClass", 0xDEAD_BEEF, true);
+        mic.clear_compiled_entry();
+
+        assert_eq!(
+            mic.cached_class_id
+                .load(std::sync::atomic::Ordering::Acquire),
+            7
+        );
+        assert_eq!(
+            mic.cached_class_name.lock().as_deref(),
+            Some("com/example/MyClass")
+        );
+        assert_eq!(
+            mic.cached_entry_ptr
+                .load(std::sync::atomic::Ordering::Acquire),
+            0
+        );
+        assert!(!mic
             .cached_needs_context
             .load(std::sync::atomic::Ordering::Relaxed));
     }
