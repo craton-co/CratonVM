@@ -106,6 +106,11 @@ generic HashMap helpers are used by `ConcurrentHashMap.compute`, `merge`, and `r
 selection. The native-collections mock relocation hook now also rewrites heap fields/array slots for
 moved pins, and `gc_native_pins.rs` covers `HashMap.replaceAll` under callback-triggered moving GC.
 
+**Additional CHM bulk sweep (2026-07-01, follow-up):** the `ConcurrentHashMap` bulk operations
+registered here (`forEachEntry`, `forEachKey`, `forEachValue`, and `search`) now pin and re-read their
+callback plus the collected key/value snapshots across each callback dispatch. Focused regressions cover
+`ConcurrentHashMap.forEachKey` and `ConcurrentHashMap.search` under callback-triggered moving GC.
+
 **Do NOT** try to fix this by forcing the non-moving sweep when a native is active: it re-triggers the
 documented [`HIB-CV-33`](HIB-CV-33-sigsegv-execute-fault-joined-inheritance-sf-build.md) precise-root
 reclaim gap (`gen_heap.rs` — the non-moving sweep without conservative roots reclaims live precise-rooted

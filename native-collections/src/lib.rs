@@ -26927,17 +26927,27 @@ fn register_concurrent_hashmap_natives(r: &mut NativeMethodRegistry) {
                 _ => return Ok(None),
             };
             let entries = chm_collect_all_entries(ctx, this);
-            for (key, value) in entries {
+            let action_pin = ctx.pin_native_root(action);
+            let flat: Vec<Value> = entries.iter().flat_map(|(k, v)| [*k, *v]).collect();
+            let (_, flat_pins) = pin_value_slice(ctx, &flat);
+            for i in 0..entries.len() {
                 let entry = ctx.alloc_object(ClassId::new(0), NODE_NUM_FIELDS);
+                let key = read_pinned_elem(ctx, flat_pins[i * 2], flat[i * 2]);
+                let value = read_pinned_elem(ctx, flat_pins[i * 2 + 1], flat[i * 2 + 1]);
+                let action = ctx.read_native_pin(action_pin, action);
                 ctx.set_field(entry, NODE_FIELD_KEY, key);
                 ctx.set_field(entry, NODE_FIELD_VALUE, value);
-                ctx.invoke_virtual(
+                if let Err(e) = ctx.invoke_virtual(
                     action,
                     "accept",
                     "(Ljava/lang/Object;)V",
                     &[Value::Object(Some(entry))],
-                )?;
+                ) {
+                    ctx.unpin_native_roots(action_pin);
+                    return Err(e);
+                }
             }
+            ctx.unpin_native_roots(action_pin);
             Ok(None)
         },
     );
@@ -26955,9 +26965,17 @@ fn register_concurrent_hashmap_natives(r: &mut NativeMethodRegistry) {
                 _ => return Ok(None),
             };
             let keys = chm_collect_all_keys(ctx, this);
-            for key in keys {
-                ctx.invoke_virtual(action, "accept", "(Ljava/lang/Object;)V", &[key])?;
+            let action_pin = ctx.pin_native_root(action);
+            let (_, key_pins) = pin_value_slice(ctx, &keys);
+            for i in 0..keys.len() {
+                let action = ctx.read_native_pin(action_pin, action);
+                let key = read_pinned_elem(ctx, key_pins[i], keys[i]);
+                if let Err(e) = ctx.invoke_virtual(action, "accept", "(Ljava/lang/Object;)V", &[key]) {
+                    ctx.unpin_native_roots(action_pin);
+                    return Err(e);
+                }
             }
+            ctx.unpin_native_roots(action_pin);
             Ok(None)
         },
     );
@@ -26975,9 +26993,17 @@ fn register_concurrent_hashmap_natives(r: &mut NativeMethodRegistry) {
                 _ => return Ok(None),
             };
             let vals = chm_collect_all_values(ctx, this);
-            for val in vals {
-                ctx.invoke_virtual(action, "accept", "(Ljava/lang/Object;)V", &[val])?;
+            let action_pin = ctx.pin_native_root(action);
+            let (_, val_pins) = pin_value_slice(ctx, &vals);
+            for i in 0..vals.len() {
+                let action = ctx.read_native_pin(action_pin, action);
+                let val = read_pinned_elem(ctx, val_pins[i], vals[i]);
+                if let Err(e) = ctx.invoke_virtual(action, "accept", "(Ljava/lang/Object;)V", &[val]) {
+                    ctx.unpin_native_roots(action_pin);
+                    return Err(e);
+                }
             }
+            ctx.unpin_native_roots(action_pin);
             Ok(None)
         },
     );
@@ -26995,17 +27021,31 @@ fn register_concurrent_hashmap_natives(r: &mut NativeMethodRegistry) {
                 _ => return Ok(Some(Value::Object(None))),
             };
             let entries = chm_collect_all_entries(ctx, this);
-            for (key, val) in entries {
-                let result = ctx.invoke_virtual(
+            let func_pin = ctx.pin_native_root(func);
+            let flat: Vec<Value> = entries.iter().flat_map(|(k, v)| [*k, *v]).collect();
+            let (_, flat_pins) = pin_value_slice(ctx, &flat);
+            for i in 0..entries.len() {
+                let func = ctx.read_native_pin(func_pin, func);
+                let key = read_pinned_elem(ctx, flat_pins[i * 2], flat[i * 2]);
+                let val = read_pinned_elem(ctx, flat_pins[i * 2 + 1], flat[i * 2 + 1]);
+                let result = match ctx.invoke_virtual(
                     func,
                     "apply",
                     "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
                     &[key, val],
-                )?;
+                ) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        ctx.unpin_native_roots(func_pin);
+                        return Err(e);
+                    }
+                };
                 if let Some(Value::Object(Some(_))) = result {
+                    ctx.unpin_native_roots(func_pin);
                     return Ok(result);
                 }
             }
+            ctx.unpin_native_roots(func_pin);
             Ok(Some(Value::Object(None)))
         },
     );
