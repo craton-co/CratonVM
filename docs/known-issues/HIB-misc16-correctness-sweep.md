@@ -43,7 +43,7 @@ CRATONVM_DISABLE_DEFAULT_WATCHDOG=1 $CV --java-home "C:/Program Files/Java/jdk-2
 | 9 | `proxy.ProxyClassReuseTest` | `Could not instantiate persister` (1/3) | loader-blind class store (dual-loader) | OPEN — owned by `hib-proxyclassreuse-loader-blind-class-resolution.md` |
 | 10 | `util.dtd.EntityResolverTest` | unmapped entity `[Child]` | synthetic `XMLInputFactory.newInstance()` stub shadows real Woodstox → resolver ignored, general entity not expanded | **FIXED** (default-ON; `CRATONVM_REAL_STAX_FACTORY=0` escape hatch); slowness is separate (§15–16) |
 | 11 | `jpa.transaction.TransactionTimeoutTest` | `getStatus()=0 ACTIVE` | Narayana transaction-reaper thread never fires the 2s timeout | OPEN — new |
-| 12 | `id.uuid.rfc9562.UUidV6V7GeneratorTest` | MockitoException | JDK `AnnotatedTypeFactory.getAnnotatedOwnerType` NPE (type-annotation bytes) | OPEN — new |
+| 12 | `id.uuid.rfc9562.UUidV6V7GeneratorTest` | MockitoException | native `AnnotatedTypeBaseImpl.location` null → `getAnnotatedOwnerType` NPE | **NPE FIXED**; residual = 1M-iteration slowness (§15–16 cluster) |
 | 13 | `batchfetch.DynamicBatchFetchTest` | `testMultiLoad` 120s timeout (param-binding 1/2 now passes) | slowness (2000-row multiLoad); HIB-CV-37 #2 param-binding appears fixed | Route → HIB-CV-37 |
 | 14 | `service.ClassLoaderServiceImplTest` | AssertionError | custom-loader class identity / `loadJavaServices` | Route → HIB-CV-24 |
 | 15 | `query.hql.FunctionTests` | HANG @300s | (slowness vs wrong-result — see below) | OPEN — slowness/correctness |
@@ -267,14 +267,21 @@ returns null → the owner is rebuilt with BASE_LOCATION by real-JDK code) and
 nested class and `Map.Entry`; post-fix returns the owner type, matching HotSpot.
 Branch `fix/annotatedtype-location` (commit `3ee5ffaf`, off dev `29acdee7`).
 
-**Residual (separate, OPEN).** With the NPE gone, mock generation proceeds
-further and then **CPU-loops** (100% one core, no progress) inside ByteBuddy /
-Mockito `SubclassBytecodeGenerator.mockClass` for the large
-`SharedSessionContractImplementor` interface — the class-level run now times out
-(120 s/method) instead of failing fast. HotSpot mocks it quickly, so this is a
-distinct CratonVM defect exposed by the NPE fix (busy-loop in JIT-compiled Java;
-needs a symbol build to pinpoint the method — cf. `bug-E-mockito-bytebuddy-hang`).
-So the fix removes the *documented* NPE but does not yet make the test pass.
+**Residual = slowness cluster (not a distinct bug).** With the NPE gone, the
+`mock(SharedSessionContractImplementor.class)` call **succeeds** and the test
+body runs. A watchdog Java thread-dump shows the hot frame is
+`org.assertj.core.api.StringAssert.<init>` inside `testMonotonicity` — the test
+does **`ITERATIONS = 1_000_000`** UUID generations followed by 2 × 1 000 000
+`assertThat(...)` comparisons (`assertThat(uuid.toString()).isGreaterThan(...)`).
+On HotSpot this JITs to a tight loop and finishes well under the 120 s per-test
+JUnit timeout; on CratonVM the interpreter/early-JIT runs the 3 M-operation loop
+too slowly to finish in 120 s. JUnit's `SameThreadTimeoutInvocation` cannot
+preempt the running loop, so the default stack-dump watchdog aborts the process
+first (the earlier "MockitoException" was the *real* VM bug; this residual is the
+same slowness family as §15–16 `FunctionTests`). **Verdict:** the AnnotatedType
+fix removes the actual VM defect; the remaining failure is CratonVM loop
+throughput on a 1 M-iteration microbenchmark-style test — route to the slowness
+cluster, not a new correctness bug.
 
 ---
 
