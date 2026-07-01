@@ -7916,8 +7916,9 @@ impl Compiler {
     /// over:
     /// ```
     fn emit_osr_exit_after_trigger(&mut self, pc: usize, n: usize) {
-        // Per-site counter, leaked so its address outlives the emitted code (the
-        // baked imm64). Test-only path; the leak is intentional and bounded.
+        // LEAK(intentional): per-site counter, leaked so its address outlives
+        // the emitted code's baked imm64. Test-only path; bounded by emitted
+        // OSR trigger sites in this test.
         let counter: *mut i64 = Box::leak(Box::new(0i64));
 
         self.buf.emit_byte(0x50); // push rax
@@ -33241,9 +33242,15 @@ mod tests {
         let mut non_escaping = std::collections::HashSet::new();
         non_escaping.insert(0usize);
         let new_info = vec![(0usize, 7u32, 1usize, true, true)]; // class_id 7, 1 field
+        // LEAK(intentional): this test JitInvokeInfo is referenced by raw
+        // pointer from generated code, so it and its string fields must remain
+        // valid for the process lifetime.
         let init_info = Box::leak(Box::new(JitInvokeInfo {
+            // LEAK(intentional): field of leaked JitInvokeInfo.
             class_name: Box::leak("Foo".to_string().into_boxed_str()),
+            // LEAK(intentional): field of leaked JitInvokeInfo.
             method_name: Box::leak("<init>".to_string().into_boxed_str()),
+            // LEAK(intentional): field of leaked JitInvokeInfo.
             descriptor: Box::leak("()V".to_string().into_boxed_str()),
             num_jit_args: 1,
             return_type: b'V',
