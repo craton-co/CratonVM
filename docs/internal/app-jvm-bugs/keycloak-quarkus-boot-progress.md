@@ -1,5 +1,14 @@
 # Keycloak 26.6.3 (Quarkus) boot under CratonVM — progress & gap chain
 
+> **ARCHIVED 2026-07-01:** This is a historical Keycloak boot gap chain. The
+> concrete non-GC/JIT blockers captured here have been fixed or split into
+> focused internal notes. The last named blocker, real-JDK
+> `CompletableFuture.complete(...)` not running `postComplete()`, is fixed on
+> `dev` and tracked in
+> [gc-gen-promotion-completablefuture-completion-loss.md](gc-gen-promotion-completablefuture-completion-loss.md).
+> The remaining G1/two-worker hang noted near the end is a separate deep runtime
+> follow-up and should get its own `docs/known-issues` entry if reproduced.
+
 **Status:** 🟡 PARTIAL (updated 2026-06-20, branch `fix/keycloak-gap5-shutdownctx`) — **Gaps 1–5 FIXED; Gap 4 re-fixed; Gap 6 is the new frontier.** Gap 1 `JarEntry` getSize/getMethod=0, Gap 2 NIO missing-file `NoSuchFileException`, Gap 3 stale `sanitizeDisabledMappers` stub removed. **Gap 4 (static-synchronized → `Class` mirror, JVMS §2.11.10) had REGRESSED on dev for the real boot** — `0e81bc70` missed THREE interpreter invoke fast-paths (cached / stackless-cached / vcached) that still locked the synthetic `get_class_lock_object`, so `ApplicationStateNotification.notifyStartupFailed` (static-sync `notifyAll`) threw `IllegalMonitorStateException` and MASKED every real `<clinit>` failure; now fixed at all three sites (commit `8a3c6c07`). **Gap 5 (Quarkus recorder `ShutdownContext` null NPE) FIXED** — the `StartupContext` native shim shadowed the real `<init>` that registers the `StartupContext$1` `ShutdownContext` proxy under `getValue("io.quarkus.runtime.ShutdownContext")`; shim removed, real bytecode runs (commit `5a489187`). **Gaps 6 & 7 (@ConfigMapping) FIXED** (commits `bec91280`, `4ce68fd9`): `getConfigMapping` now builds the real `<iface>$$CMImpl` from live config via SmallRye `configMappingObject` **with default values applied** (mirrors `mapConfiguration`: `withMapping` + merge `getDefaultValues`) — no fabrication. **This unblocked the whole config cluster, ArC bean creation, and Keycloak's real startup.** The boot now runs through `Arc.initialize()` + CDI bean creation, Keycloak provider init, and Hibernate ORM/JPA, reaching the server-running lifecycle (`ApplicationLifecycleManager.waitForExit`). **Seven gaps fixed; the real ArC CDI container runs.**
 
 > **UPDATE (2026-06-20, branch `fix/keycloak-gap8-datasource`, synced with `dev`):** **Gap 8 (Agroal
@@ -850,7 +859,7 @@ VM's real file layer).
 > completion** (the future is promoted to old gen while the pushed young `Signaller` is lost by the
 > copying young GC). Full root-cause, 3 s repro, and workarounds (`-XX:+UseG1GC` /
 > `CRATONVM_NO_GC_PROMOTION=1`) in
-> **[gc-gen-promotion-completablefuture-completion-loss.md](../internal/app-jvm-bugs/gc-gen-promotion-completablefuture-completion-loss.md)** (✅ now FIXED on dev — was a synthetic `CompletableFuture.complete` native missing `postComplete()`, not the GC; moved to docs/internal).
+> **[gc-gen-promotion-completablefuture-completion-loss.md](gc-gen-promotion-completablefuture-completion-loss.md)** (✅ now FIXED on dev — was a synthetic `CompletableFuture.complete` native missing `postComplete()`, not the GC; moved to docs/internal).
 > NOTE: with G1 (immune to that GC bug) the boot reaches the same point but hits a SEPARATE hang — two
 > persistence-unit worker threads stuck executing bytecode (a worker livelock, distinct from the GC bug).
 
