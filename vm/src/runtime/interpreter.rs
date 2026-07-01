@@ -3399,27 +3399,16 @@ pub fn execute(
         // under deep recursion and must run in the interpreter pending a
         // proper regalloc fix.
         let fjp_skip = is_fjp_subclass_blocklisted(shared, &class_name_str);
-        // S111r15 — refuse to JIT a method shadowed by a Rust native at this
-        // FIRST-CALL compile path too. Without this, `Character.toLowerCase(C)C`
-        // (whose JDK bytecode delegates to `(I)I` → `CharacterData.of/
-        // toLowerCase` virtual chain) gets JIT-compiled, and after warm-up
-        // the resulting machine code returns 0 for most inputs, corrupting
-        // Spring's `BeanPropertyName.toDashedForm` (`bannerMode` →
-        // `r\0\0\0\0\0\0\0-\0\0\0\0\0\0`) and tripping
-        // `InvalidConfigurationPropertyNameException` during SportMe boot.
+        // S111r15 - refuse to JIT a method directly backed by a Rust native at
+        // this FIRST-CALL compile path too. Without this, `Character.toLowerCase(C)C`
+        // bypassed the native override and corrupted Spring property-name parsing.
         //
-        // bytebuddy_probe — also walk the parent chain so a method whose
-        // *inherited* identity (`Object.equals`/`hashCode`/`toString`) is
-        // serviced by a Rust native cannot be JIT-compiled here. Mirrors the
-        // walk in `try_jit_compile_callee`. Without the parent walk,
-        // `LazyProjection.equals` (ByteBuddy's hierarchy walker, which itself
-        // declares no `equals` native but inherits the identity native
-        // registered on `java/lang/Object`) was JIT-compiled at this site;
-        // the resulting machine code mis-dispatched the inner `invokevirtual
-        // Object.equals` to a constant `false`, breaking ByteBuddy's
-        // `MethodGraph$Compiler$Default.compile` superclass-resolve lookup
-        // (`Failed to resolve super class class java.lang.Object from
-        // [class java.lang.Object]`).
+        // bytebuddy_probe / ANTLR cold-path follow-up: do not reject every
+        // bytecode override merely because an ancestor has an identity native
+        // (`Object.equals`/`hashCode`/`toString`). A real override shadows that
+        // native and can compile. Keep the ByteBuddy safety case by rejecting
+        // methods whose own bytecode contains an invoke that resolves to a
+        // native-shadowed target such as `Object.equals`.
         let native_skip = if shared
             .native_methods
             .find(&class_name_str, method_name, method_descriptor)
@@ -3427,25 +3416,12 @@ pub fn execute(
         {
             true
         } else {
-            let cm = shared.class_manager.read();
-            let mut found = false;
-            if let Some(start_cid) = cm.find_class_by_name(&class_name_str) {
-                let mut cid = start_cid;
-                while let Some(parent_id) = cm.get_class(cid).and_then(|c| c.superclass) {
-                    if let Some(parent) = cm.get_class(parent_id) {
-                        if shared
-                            .native_methods
-                            .find(&parent.name, method_name, method_descriptor)
-                            .is_some()
-                        {
-                            found = true;
-                            break;
-                        }
-                    }
-                    cid = parent_id;
-                }
-            }
-            found
+            jit_method_calls_native_shadowed(
+                shared,
+                class_id,
+                &code_attr.code,
+                code_attr.code.len(),
+            )
         };
         // DEBUG diagnostic — print every JIT compile decision for the
         // LazyProjection.equals method while bytebuddy_probe diagnosis
@@ -21156,6 +21132,108 @@ fn is_elidable_construction(cm: &crate::classloading::ClassManager, class_id: Cl
     matches!(cp.get_name_and_type(nat_idx), Some(("<init>", "()V")))
 }
 
+#[inline]
+fn jit_native_shadow_invoke_index(instruction: &Instruction) -> Option<u16> {
+    match instruction {
+        Instruction::Invokevirtual(index)
+        | Instruction::Invokespecial(index)
+        | Instruction::Invokestatic(index) => Some(*index),
+        Instruction::Invokeinterface { index, .. } => Some(*index),
+        _ => None,
+    }
+}
+
+fn jit_invoke_targets_native_shadow(
+    shared: &SharedVm,
+    caller_class_id: ClassId,
+    cp_idx: u16,
+) -> bool {
+    let (target_class, method_name, descriptor, declaring_class) = {
+        let cm = shared.class_manager.read();
+        let Some(caller) = cm.get_class(caller_class_id) else {
+            return true;
+        };
+        let (class_index, nat_index) = match caller.constant_pool.get(cp_idx) {
+            Some(ConstantPoolEntry::MethodReference {
+                class_index,
+                name_and_type_index,
+            })
+            | Some(ConstantPoolEntry::InterfaceMethodReference {
+                class_index,
+                name_and_type_index,
+            }) => (*class_index, *name_and_type_index),
+            _ => return true,
+        };
+        let Some(target_class) = caller
+            .constant_pool
+            .get_class_name(class_index)
+            .map(str::to_string)
+        else {
+            return true;
+        };
+        let Some((method_name, descriptor)) = caller.constant_pool.get_name_and_type(nat_index)
+        else {
+            return true;
+        };
+        let method_name = method_name.to_string();
+        let descriptor = descriptor.to_string();
+        let declaring_class = if let Some(target_id) = cm.find_class_by_name(&target_class) {
+            let store = cm.class_store();
+            crate::classloading::find_method_recursive(target_id, &method_name, &descriptor, store)
+                .and_then(|(_, declaring_id)| {
+                    store
+                        .get(declaring_id)
+                        .map(|declaring| declaring.name.to_string())
+                })
+        } else {
+            None
+        };
+        (target_class, method_name, descriptor, declaring_class)
+    };
+
+    if shared
+        .native_methods
+        .find(&target_class, &method_name, &descriptor)
+        .is_some()
+    {
+        return true;
+    }
+
+    declaring_class.is_some_and(|declaring_class| {
+        shared
+            .native_methods
+            .find(&declaring_class, &method_name, &descriptor)
+            .is_some()
+    })
+}
+
+fn jit_method_calls_native_shadowed(
+    shared: &SharedVm,
+    caller_class_id: ClassId,
+    code: &[u8],
+    code_len: usize,
+) -> bool {
+    let scan_len = code_len.min(code.len());
+    let scan_code = &code[..scan_len];
+    let mut pc = 0;
+    while pc < scan_len {
+        let (instruction, next_pc) = match Instruction::decode(scan_code, pc) {
+            Ok(decoded) => decoded,
+            Err(_) => return true,
+        };
+        if let Some(cp_idx) = jit_native_shadow_invoke_index(&instruction) {
+            if jit_invoke_targets_native_shadow(shared, caller_class_id, cp_idx) {
+                return true;
+            }
+        }
+        if next_pc <= pc || next_pc > scan_len {
+            return true;
+        }
+        pc = next_pc;
+    }
+    false
+}
+
 /// Shared body for the JIT `cp_elidable_init_resolver` closures: given the
 /// holder class `holder_cid` and an `invokespecial` constant-pool index, return
 /// `true` iff it targets a no-arg `<init>()V` whose construction is elidable
@@ -21291,18 +21369,10 @@ fn try_jit_upgrade_with_gate(
     // `r\0\0\0\0\0\0\0-\0\0\0\0\0\0`) and tripping
     // `InvalidConfigurationPropertyNameException` during SportMe boot.
     //
-    // bytebuddy_probe — also walk the parent chain so a method whose
-    // *inherited* identity (`Object.equals`/`hashCode`/`toString`) is
-    // serviced by a Rust native cannot be JIT-compiled via this upgrade
-    // path either. Mirrors the walk in `try_jit_compile_callee`. Without
-    // it, `LazyProjection.equals` (ByteBuddy's hierarchy walker, which
-    // itself has no `equals` native but inherits the identity native
-    // registered on `java/lang/Object`) was JIT-compiled here, and the
-    // resulting machine code mis-dispatched the inner `invokevirtual
-    // Object.equals` to a constant `false`, breaking ByteBuddy's
-    // `MethodGraph$Compiler$Default.compile` superclass-resolve lookup
-    // (`Failed to resolve super class class java.lang.Object from
-    // [class java.lang.Object]`).
+    // bytebuddy_probe / ANTLR cold-path follow-up: reject an override on this
+    // upgrade path only when its body invokes a native-shadowed target such as
+    // `Object.equals`. A bytecode override that merely has an identity native
+    // somewhere up its ancestor chain is allowed to compile.
     {
         if shared
             .native_methods
@@ -21324,33 +21394,22 @@ fn try_jit_upgrade_with_gate(
             }
             return None;
         }
-        let cm = shared.class_manager.read();
-        if let Some(start_cid) = cm.find_class_by_name(&cached.class_name) {
-            let mut cid = start_cid;
-            while let Some(parent_id) = cm.get_class(cid).and_then(|c| c.superclass) {
-                if let Some(parent) = cm.get_class(parent_id) {
-                    if shared
-                        .native_methods
-                        .find(&parent.name, &cached.method_name, &cached.method_descriptor)
-                        .is_some()
-                    {
-                        if std::env::var_os("CRATONVM_DBG_BBLP").is_some()
-                            && cached.class_name.contains("LazyProjection")
-                            && &*cached.method_name == "equals"
-                        {
-                            eprintln!(
-                                "[BBLP-upgrade] parent-native skip {}.{}{} via parent={}",
-                                cached.class_name,
-                                cached.method_name,
-                                cached.method_descriptor,
-                                parent.name
-                            );
-                        }
-                        return None;
-                    }
-                }
-                cid = parent_id;
+        if jit_method_calls_native_shadowed(
+            shared,
+            cached.declaring_class_id,
+            &cached.code,
+            cached.code.len().saturating_sub(2),
+        ) {
+            if std::env::var_os("CRATONVM_DBG_BBLP").is_some()
+                && cached.class_name.contains("LazyProjection")
+                && &*cached.method_name == "equals"
+            {
+                eprintln!(
+                    "[BBLP-upgrade] inner-native skip {}.{}{}",
+                    cached.class_name, cached.method_name, cached.method_descriptor
+                );
             }
+            return None;
         }
         if std::env::var_os("CRATONVM_DBG_BBLP").is_some()
             && cached.class_name.contains("LazyProjection")
@@ -26505,6 +26564,33 @@ fn double_to_long(v: f64) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn jit_native_shadow_invoke_index_covers_all_method_invokes() {
+        assert_eq!(
+            jit_native_shadow_invoke_index(&Instruction::Invokevirtual(7)),
+            Some(7)
+        );
+        assert_eq!(
+            jit_native_shadow_invoke_index(&Instruction::Invokespecial(11)),
+            Some(11)
+        );
+        assert_eq!(
+            jit_native_shadow_invoke_index(&Instruction::Invokestatic(13)),
+            Some(13)
+        );
+        assert_eq!(
+            jit_native_shadow_invoke_index(&Instruction::Invokeinterface {
+                index: 17,
+                count: 1,
+            }),
+            Some(17)
+        );
+        assert_eq!(
+            jit_native_shadow_invoke_index(&Instruction::Invokedynamic(19)),
+            None
+        );
+    }
 
     // -----------------------------------------------------------------------
     // real-frame-deopt — IR-path deopt frame-value mapping (type source)
