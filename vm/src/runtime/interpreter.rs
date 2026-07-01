@@ -3465,7 +3465,9 @@ pub fn execute(
         // `try_osr` so the user-facing CRATONVM_DISABLE_JIT flag actually disables
         // the FIRST-CALL JIT compile path here too.
         let env_disable_jit = crate::runtime::env_cache::disable_jit();
+        let redefine_jit_quiesced = crate::classloading::any_class_redefined();
         if env_disable_jit
+            || redefine_jit_quiesced
             || already_skipped
             || static_skip_reason.is_some()
             || fjp_skip
@@ -19590,9 +19592,10 @@ fn execute_invokestatic_cached(
     // (e.g. Mockito `mockStatic(X)` woves X's static methods) — evict and
     // re-resolve so the woven bytecode + advice run. Fast-pathed on
     // `any_class_redefined`.
-    if crate::classloading::any_class_redefined()
+    let redefine_jit_quiesced = crate::classloading::any_class_redefined();
+    if redefine_jit_quiesced
         && matches!(
-            target,
+            &target,
             CachedInvokeTarget::Native { .. } | CachedInvokeTarget::Intrinsic { .. }
         )
     {
@@ -19602,6 +19605,10 @@ fn execute_invokestatic_cached(
                 return Ok(CachedCallResult::CacheMiss);
             }
         }
+    }
+    if redefine_jit_quiesced && matches!(&target, CachedInvokeTarget::Jit { .. }) {
+        thread.invoke_cache.evict(caller_class_id, cp_index, false);
+        return Ok(CachedCallResult::CacheMiss);
     }
     if crate::runtime::env_cache::modstatic_dbg() {
         if let Ok((mcn, mn, _, _)) = resolve_method_ref(shared, caller_class_id, cp_index) {
@@ -19685,7 +19692,7 @@ fn execute_invokestatic_cached(
         } => {
             // Fast path: check if the method was already JIT-compiled (e.g. by OSR)
             // before going through the invocation counter.
-            {
+            if !redefine_jit_quiesced {
                 let jit_cache = shared.jit_cache.read();
                 if let Some(compiled) = jit_cache.get(
                     &cached.class_name,
@@ -19792,7 +19799,7 @@ fn execute_invokestatic_cached(
             let should_attempt = past_threshold
                 && (invoc_count == jit_invocation_threshold
                     || (invoc_count - jit_invocation_threshold) % JIT_RETRY_STRIDE == 0);
-            if should_attempt {
+            if should_attempt && !redefine_jit_quiesced {
                 // Consult tiered compilation manager for recommended tier
                 let tiered_key = crate::jit::tiered::MethodKey::new(
                     cached.class_name.as_ref(),
@@ -20726,6 +20733,9 @@ fn try_osr(
     class_id: ClassId,
     entry_pc: usize,
 ) -> Option<Option<Value>> {
+    if crate::classloading::any_class_redefined() {
+        return None;
+    }
     let frame = &thread.frames[frame_idx];
     let class_name = frame.class_name().to_string();
     let method_name = frame.method_name().to_string();
@@ -21231,6 +21241,9 @@ fn try_jit_upgrade_with_gate(
     // (the caller-method counter path here, and the dispatcher path there).
     // Useful for bisecting JIT-vs-interpreter bugs during bootstrap crashes.
     if crate::runtime::env_cache::disable_jit() {
+        return None;
+    }
+    if crate::classloading::any_class_redefined() {
         return None;
     }
     // RBC.4 — short-circuit permanently-uncompilable methods BEFORE the
@@ -22170,6 +22183,9 @@ pub fn try_jit_compile_callee(
     if crate::runtime::env_cache::disable_jit() {
         return None;
     }
+    if crate::classloading::any_class_redefined() {
+        return None;
+    }
     // RBC.4 — short-circuit permanently-uncompilable methods before the
     // FJP/native-shadow hierarchy walks (see try_jit_upgrade_with_gate).
     if crate::jit::is_jit_bail_listed(class_name, method_name, descriptor) {
@@ -22812,6 +22828,9 @@ fn background_compile_task(
         Some(s) => s,
         None => return 0, // VM dropped (teardown) — nothing to compile.
     };
+    if crate::classloading::any_class_redefined() {
+        return 0;
+    }
     let optimized = crate::jit::tiered::tier_uses_optimized_backend(task.target_tier);
     if std::env::var_os("CRATONVM_DBG_JITC").is_some() {
         eprintln!(
@@ -24860,6 +24879,7 @@ fn execute_invokevirtual_cached(
                     // frame push below (the operand stack is untouched).
                     if !is_special
                         && !cached.is_synchronized
+                        && !crate::classloading::any_class_redefined()
                         && crate::runtime::env_cache::jit_virtual_tierup()
                     {
                         // Fast path: already compiled (by this counter or OSR)?

@@ -3685,7 +3685,11 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
     // (`ctx.invoke_virtual`). Hot monomorphic virtual sites are already served
     // by the receiver-guarded MIC helper (`jit_invoke_virtual_mic`).
     let statically_bound = matches!(info.invoke_kind, 1 | 3);
-    let cached_entry = if statically_bound {
+    let redefine_jit_quiesced = crate::classloading::any_class_redefined();
+    if redefine_jit_quiesced {
+        DISPATCH_CACHE.with(|dc| dc.borrow_mut().clear());
+    }
+    let cached_entry = if statically_bound && !redefine_jit_quiesced {
         DISPATCH_CACHE.with(|dc| {
             dc.borrow()
                 .get(&info_key)
@@ -3735,7 +3739,7 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
     // wasted allocations per hot call. Deref coercion handles the conversion.
     // Gated on `statically_bound`: the lookup key is the static CP class, which
     // is only the correct dispatch target for invokespecial/invokestatic.
-    if statically_bound {
+    if statically_bound && !redefine_jit_quiesced {
         let jit_cache = vm.jit_cache.read();
         if let Some(compiled) = jit_cache.get(info.class_name, info.method_name, info.descriptor) {
             let entry = compiled.entry_ptr() as usize;
@@ -3787,6 +3791,7 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
     // caching it under the callsite key would re-introduce the supertype
     // miscompile for a virtual/interface site.
     let should_compile = statically_bound
+        && !redefine_jit_quiesced
         && DISPATCH_COUNTER.with(|dc| {
             let mut map = dc.borrow_mut();
             let count = map.entry(info_key).or_insert(0);
@@ -4218,6 +4223,14 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
     }
 
     let mic = &*(mic_ptr as *const JitMICSlot);
+    let redefine_jit_quiesced = crate::classloading::any_class_redefined();
+    if redefine_jit_quiesced {
+        mic.clear_compiled_entry();
+        if pic_ptr != 0 {
+            let pic = &*(pic_ptr as *const JitPICSlot);
+            pic.clear_entries();
+        }
+    }
     let cached_cid = mic
         .cached_class_id
         .load(std::sync::atomic::Ordering::Acquire);
@@ -4246,7 +4259,7 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
         let entry = mic
             .cached_entry_ptr
             .load(std::sync::atomic::Ordering::Acquire);
-        if entry != 0 {
+        if entry != 0 && !redefine_jit_quiesced {
             // Direct call to the compiled callee — same ABI as `jit_invoke_dispatch`
             // uses after a JIT-cache hit (receiver + params in `args_slice`, optional
             // leading `vm_ptr` when `cached_needs_context` is true).  **Do not** pass
@@ -4367,7 +4380,9 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
         // unequal (bc-java InterleaveTest, junit assertEquals(Object,Object)).
         // `find_method_recursive` (inside `try_jit_compile_callee`) walks up
         // from the receiver class to the real override.
-        let compile_res = {
+        let compile_res = if redefine_jit_quiesced {
+            None
+        } else {
             let _g = mic_prof::CycGuard::new(&mic_prof::CYC_COMPILE_PROBE);
             crate::runtime::interpreter::try_jit_compile_callee(
                 vm,
@@ -4484,7 +4499,9 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
     // (`class_name`), not the static `info.class_name` — see the matching
     // VIRTUAL DISPATCH FIX in the cache-hit branch above. `class_name` here is
     // an `Arc<str>`; deref to `&str` for the resolver.
-    let compile_res = {
+    let compile_res = if redefine_jit_quiesced {
+        None
+    } else {
         let _g = mic_prof::CycGuard::new(&mic_prof::CYC_COMPILE_PROBE);
         crate::runtime::interpreter::try_jit_compile_callee(
             vm,
