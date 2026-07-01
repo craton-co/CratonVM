@@ -432,13 +432,12 @@ JIT divide-by-zero re-run) has since been fixed; the other two remain open:
 
 A fresh full `spring-core` run (binary built from dev) surfaced these CratonVM
 divergences. Consolidated index: [spring-core-suite-2026-06-21.md](spring-core-suite-2026-06-21.md).
-**7 fixes from this run already landed on `dev`** (stream close-handler OOB, CHM.remove(null)+
+**8 fixes from this run already landed on `dev`** (stream close-handler OOB, CHM.remove(null)+
 LinkedHashMap.putIfAbsent, generic-bounds reify CCE, keySet.contains delegate, StAX cursor natives,
 lambda-SAM param-type dispatch, `String.format("%s",boolean)`, and synthetic `Collector`
-supplier/accumulator/finisher/combiner). The **open** ones documented here:
+supplier/accumulator/finisher/combiner, plus JSpecify nullness reflection). The **open** ones documented here:
 
 - ~~SC-custom-classloader-ignored.md~~ — ✅ RESOLVED (`Class.forName`/`loadClass` now honor user `ClassLoader`s — override-first redefinition + loader-scoped `findLoadedClass` + non-colliding `defineClass`). Moved to [docs/internal/fixed-suite-bugs/SC-custom-classloader-ignored.md](../internal/fixed-suite-bugs/SC-custom-classloader-ignored.md). Unblocks the annotation `TypeNotPresentException` foundation (Bug A).
-- [SC-jspecify-nullness-reflection.md](SC-jspecify-nullness-reflection.md) — type-use + package annotations dropped by reflection (`getTypeAnnotationBytes0` null) — 26 tests.
 - ~~SC-annotation-introspection-family.md~~ — Bug A (Class-attr `TypeNotPresentException`) ✅ FIXED — Class members resolve through the declaring class's loader + deferred `TypeNotPresentException`; see [docs/internal/fixed-suite-bugs/SC-custom-classloader-ignored.md](../internal/fixed-suite-bugs/SC-custom-classloader-ignored.md) and `vm/tests/annotation_loader_isolation.rs`. Bug B FIXED on dev; Bug C (Spring scan traversal) / Bug D (HotSpot `getDeclaredMethods` ordering — not cleanly fixable) were the residual. Doc removed in the dev docs refactor.
 - [SC-env-classreading.md](SC-env-classreading.md) — getenv/getProperties identity; `Object.equals` shadows overrides (`precedenceOf`=-1); `int.class` via classreading; custom-CL `getResourceAsStream`.
 - [SC-resource-io-family.md](SC-resource-io-family.md) — NIO write-channel stub, `Path.toUri()` authority; several FileNotFoundExceptions are harness-CWD artifacts.

@@ -200,6 +200,16 @@ fn mock_jdk_field_slot(name: &str) -> Option<usize> {
     }
 }
 
+fn mock_parameter_field_slot(name: &str) -> Option<usize> {
+    match name {
+        "name" => Some(0),
+        "modifiers" => Some(1),
+        "executable" => Some(2),
+        "index" => Some(3),
+        _ => None,
+    }
+}
+
 pub(crate) type InvokeVirtualHook =
     fn(&mut MockNativeContext, ObjectRef, &str, &str, &[Value]) -> Option<MethodCallResult>;
 
@@ -334,6 +344,15 @@ pub(crate) struct MockNativeContext {
     /// `raw` follows the `loader_id_of_class` encoding (0=Bootstrap,
     /// 1=Extension, 2=Application, N>=3=UserDefined(N)).
     pub(crate) loader_id_override: UnsafeCell<HashMap<u32, i32>>,
+    /// Per-method return TYPE_USE annotation overrides for tests.
+    pub(crate) method_return_type_annotations_override:
+        UnsafeCell<HashMap<(u32, String, String), Vec<AnnotationData>>>,
+    /// Per-method-parameter TYPE_USE annotation overrides for tests.
+    pub(crate) method_parameter_type_annotations_override:
+        UnsafeCell<HashMap<(u32, String, String), Vec<Vec<AnnotationData>>>>,
+    /// Per-field TYPE_USE annotation overrides for tests.
+    pub(crate) field_type_annotations_override:
+        UnsafeCell<HashMap<(u32, String), Vec<AnnotationData>>>,
 }
 
 impl MockNativeContext {
@@ -384,6 +403,9 @@ impl MockNativeContext {
             last_define_full_opts: UnsafeCell::new(None),
             last_define_full_loader: UnsafeCell::new(None),
             loader_id_override: UnsafeCell::new(HashMap::new()),
+            method_return_type_annotations_override: UnsafeCell::new(HashMap::new()),
+            method_parameter_type_annotations_override: UnsafeCell::new(HashMap::new()),
+            field_type_annotations_override: UnsafeCell::new(HashMap::new()),
         }
     }
 
@@ -404,6 +426,62 @@ impl MockNativeContext {
     pub(crate) fn last_define_full_loader(&self) -> Option<u32> {
         // SAFETY: single-threaded test code.
         unsafe { *self.last_define_full_loader.get() }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn set_method_return_type_annotations(
+        &self,
+        class_id: ClassId,
+        method_name: &str,
+        method_desc: &str,
+        annotations: Vec<AnnotationData>,
+    ) {
+        // SAFETY: single-threaded test code.
+        unsafe {
+            (*self.method_return_type_annotations_override.get()).insert(
+                (
+                    class_id.as_u32(),
+                    method_name.to_string(),
+                    method_desc.to_string(),
+                ),
+                annotations,
+            );
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn set_method_parameter_type_annotations(
+        &self,
+        class_id: ClassId,
+        method_name: &str,
+        method_desc: &str,
+        annotations: Vec<Vec<AnnotationData>>,
+    ) {
+        // SAFETY: single-threaded test code.
+        unsafe {
+            (*self.method_parameter_type_annotations_override.get()).insert(
+                (
+                    class_id.as_u32(),
+                    method_name.to_string(),
+                    method_desc.to_string(),
+                ),
+                annotations,
+            );
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn set_field_type_annotations(
+        &self,
+        class_id: ClassId,
+        field_name: &str,
+        annotations: Vec<AnnotationData>,
+    ) {
+        // SAFETY: single-threaded test code.
+        unsafe {
+            (*self.field_type_annotations_override.get())
+                .insert((class_id.as_u32(), field_name.to_string()), annotations);
+        }
     }
 
     /// WP8.11.5: declare that `child_id` has a nest host named `host`.
@@ -673,14 +751,28 @@ impl NativeContext for MockNativeContext {
         // path still reads the right value. Unknown names are treated as
         // absent (returning `Int(0)` rather than silently shadowing slot
         // 0, which would corrupt slot-0 test state).
-        match mock_jdk_field_slot(field_name) {
+        let slot = if self.class_name_of_id(self.class_id_of_object(obj)).as_deref()
+            == Some("java/lang/reflect/Parameter")
+        {
+            mock_parameter_field_slot(field_name).or_else(|| mock_jdk_field_slot(field_name))
+        } else {
+            mock_jdk_field_slot(field_name)
+        };
+        match slot {
             Some(slot) => self.get_field(obj, slot),
             None => Value::Int(0),
         }
     }
 
     fn set_field_by_name(&self, obj: ObjectRef, field_name: &str, value: Value) {
-        if let Some(slot) = mock_jdk_field_slot(field_name) {
+        let slot = if self.class_name_of_id(self.class_id_of_object(obj)).as_deref()
+            == Some("java/lang/reflect/Parameter")
+        {
+            mock_parameter_field_slot(field_name).or_else(|| mock_jdk_field_slot(field_name))
+        } else {
+            mock_jdk_field_slot(field_name)
+        };
+        if let Some(slot) = slot {
             self.set_field(obj, slot, value);
         }
         // Unknown name → silently ignore (matches real-JDK mode when
@@ -715,6 +807,11 @@ impl NativeContext for MockNativeContext {
             HeapEntry::Array { elements, .. } => elements.len(),
             _ => 0,
         }
+    }
+
+    fn object_is_array(&self, obj: ObjectRef) -> bool {
+        let idx = self.entry_index(obj);
+        matches!(&self.heap_ref()[idx], HeapEntry::Array { .. })
     }
 
     fn get_array_element(&self, obj: ObjectRef, index: usize) -> Value {
@@ -1205,6 +1302,54 @@ impl NativeContext for MockNativeContext {
 
     fn field_annotations(&self, _class_id: ClassId, _field_name: &str) -> Vec<AnnotationData> {
         Vec::new()
+    }
+
+    fn method_return_type_annotations(
+        &self,
+        class_id: ClassId,
+        method_name: &str,
+        method_desc: &str,
+    ) -> Vec<AnnotationData> {
+        // SAFETY: single-threaded test code.
+        unsafe {
+            (*self.method_return_type_annotations_override.get())
+                .get(&(
+                    class_id.as_u32(),
+                    method_name.to_string(),
+                    method_desc.to_string(),
+                ))
+                .cloned()
+                .unwrap_or_default()
+        }
+    }
+
+    fn method_parameter_type_annotations(
+        &self,
+        class_id: ClassId,
+        method_name: &str,
+        method_desc: &str,
+    ) -> Vec<Vec<AnnotationData>> {
+        // SAFETY: single-threaded test code.
+        unsafe {
+            (*self.method_parameter_type_annotations_override.get())
+                .get(&(
+                    class_id.as_u32(),
+                    method_name.to_string(),
+                    method_desc.to_string(),
+                ))
+                .cloned()
+                .unwrap_or_default()
+        }
+    }
+
+    fn field_type_annotations(&self, class_id: ClassId, field_name: &str) -> Vec<AnnotationData> {
+        // SAFETY: single-threaded test code.
+        unsafe {
+            (*self.field_type_annotations_override.get())
+                .get(&(class_id.as_u32(), field_name.to_string()))
+                .cloned()
+                .unwrap_or_default()
+        }
     }
 
     fn invoke_virtual(
