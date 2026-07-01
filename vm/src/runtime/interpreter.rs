@@ -24161,6 +24161,35 @@ fn execute_jit_call_decoded(
 /// Bounds: `class_id` out-of-range and `slot` out-of-range both return
 /// `CacheMiss` via `VtableManager::resolve_virtual_slot`'s own bounds
 /// checks (see `vtable.rs` tests).
+const NATIVE_SHADOW_CACHE_MAX_ENTRIES: usize = 8192;
+
+#[inline]
+fn vtable_native_shadow_cache_key(
+    receiver_class_id: ClassId,
+    method_name: &str,
+    method_descriptor: &str,
+) -> (u32, u64, u64) {
+    (
+        receiver_class_id.as_u32(),
+        crate::runtime::fx_collections::fx_hash_str(method_name),
+        crate::runtime::fx_collections::fx_hash_str(method_descriptor),
+    )
+}
+
+#[inline]
+fn remember_vtable_native_shadow(
+    thread: &mut JvmThread,
+    key: Option<(u32, u64, u64)>,
+    verdict: bool,
+) {
+    if let Some(key) = key {
+        if thread.native_shadow_cache.len() >= NATIVE_SHADOW_CACHE_MAX_ENTRIES {
+            thread.native_shadow_cache.clear();
+        }
+        thread.native_shadow_cache.insert(key, verdict);
+    }
+}
+
 #[inline]
 fn execute_invokevirtual_vtable_fast(
     shared: &SharedVm,
@@ -24395,71 +24424,89 @@ fn execute_invokevirtual_vtable_fast(
                 drop(cm);
                 return Ok(CachedCallResult::CacheMiss);
             }
-            if !receiver_redefined
-                && shared
-                    .native_methods
-                    .find(rcv_name, &method_name, &method_descriptor)
-                    .is_some()
-            {
+            let native_shadow_cache_key = (!crate::classloading::any_class_redefined()).then(|| {
+                vtable_native_shadow_cache_key(
+                    receiver_class_id,
+                    &method_name,
+                    &method_descriptor,
+                )
+            });
+            let cached_native_shadow = native_shadow_cache_key
+                .and_then(|key| thread.native_shadow_cache.get(&key).copied());
+            if cached_native_shadow == Some(true) {
+                drop(cm);
+                return Ok(CachedCallResult::CacheMiss);
+            }
+            if cached_native_shadow != Some(false) {
+                let direct_native_shadow = !receiver_redefined
+                    && shared
+                        .native_methods
+                        .find(rcv_name, &method_name, &method_descriptor)
+                        .is_some();
+                if direct_native_shadow {
+                    remember_vtable_native_shadow(thread, native_shadow_cache_key, true);
+                    if &**rcv_name == "java/lang/invoke/ConstantCallSite"
+                        && std::env::var_os("CRATONVM_DBG_CCSPROBE").is_some()
+                    {
+                        eprintln!(
+                            "[ccs-probe] vtable_fast: native found for {} {}{} — emitting CacheMiss",
+                            rcv_name, method_name, method_descriptor,
+                        );
+                    }
+                    drop(cm);
+                    return Ok(CachedCallResult::CacheMiss);
+                }
                 if &**rcv_name == "java/lang/invoke/ConstantCallSite"
                     && std::env::var_os("CRATONVM_DBG_CCSPROBE").is_some()
                 {
                     eprintln!(
-                        "[ccs-probe] vtable_fast: native found for {} {}{} — emitting CacheMiss",
+                        "[ccs-probe] vtable_fast: native NOT found for {} {}{}",
                         rcv_name, method_name, method_descriptor,
                     );
                 }
-                drop(cm);
-                return Ok(CachedCallResult::CacheMiss);
-            }
-            if &**rcv_name == "java/lang/invoke/ConstantCallSite"
-                && std::env::var_os("CRATONVM_DBG_CCSPROBE").is_some()
-            {
-                eprintln!(
-                    "[ccs-probe] vtable_fast: native NOT found for {} {}{}",
-                    rcv_name, method_name, method_descriptor,
-                );
-            }
-            // FJP fix: walk the parent chain to find natives registered on
-            // a superclass (e.g. `RecursiveTask.fork()` defined on
-            // `ForkJoinTask` but registered as a Rust native at
-            // `RecursiveTask`). Without this walk, the vtable would
-            // dispatch the inherited JDK bytecode for `fork()`, which uses
-            // Unsafe CAS and bypasses our native side-table.
-            let mut cid = receiver_class_id;
-            while let Some(parent_id) = cm.get_class(cid).and_then(|c| c.superclass) {
-                if let Some(parent) = cm.get_class(parent_id) {
-                    // S107 collection-toString fix: if this parent has its
-                    // own bytecode for the method, the bytecode override wins
-                    // over any deeper native ancestor (e.g. Object.toString).
-                    // Stop walking so the vtable bytecode path runs.
-                    //
-                    // Round 19 (peaceful-sammet) — IMPORTANT exception: if
-                    // the parent has BOTH bytecode AND a Rust native, the
-                    // native wins. See `populate_virtual_invoke_cache` for
-                    // the LinkedHashMap-overlay rationale.
-                    let has_bytecode = parent
-                        .find_method(&method_name, &method_descriptor)
-                        .is_some();
-                    // Suppress an inherited native shadow when the declaring
-                    // parent has been redefined by an agent (woven bytecode wins).
-                    let parent_redefined = crate::classloading::any_class_redefined()
-                        && cm.class_redefine_generation(parent_id) > 0
-                        && !redefine_immune_reflection_native(&parent.name, &method_name);
-                    let has_native = !parent_redefined
-                        && shared
-                            .native_methods
-                            .find(&parent.name, &method_name, &method_descriptor)
+                // FJP fix: walk the parent chain to find natives registered on
+                // a superclass (e.g. `RecursiveTask.fork()` defined on
+                // `ForkJoinTask` but registered as a Rust native at
+                // `RecursiveTask`). Without this walk, the vtable would
+                // dispatch the inherited JDK bytecode for `fork()`, which uses
+                // Unsafe CAS and bypasses our native side-table.
+                let mut cid = receiver_class_id;
+                while let Some(parent_id) = cm.get_class(cid).and_then(|c| c.superclass) {
+                    if let Some(parent) = cm.get_class(parent_id) {
+                        // S107 collection-toString fix: if this parent has its
+                        // own bytecode for the method, the bytecode override wins
+                        // over any deeper native ancestor (e.g. Object.toString).
+                        // Stop walking so the vtable bytecode path runs.
+                        //
+                        // Round 19 (peaceful-sammet) — IMPORTANT exception: if
+                        // the parent has BOTH bytecode AND a Rust native, the
+                        // native wins. See `populate_virtual_invoke_cache` for
+                        // the LinkedHashMap-overlay rationale.
+                        let has_bytecode = parent
+                            .find_method(&method_name, &method_descriptor)
                             .is_some();
-                    if has_native {
-                        drop(cm);
-                        return Ok(CachedCallResult::CacheMiss);
+                        // Suppress an inherited native shadow when the declaring
+                        // parent has been redefined by an agent (woven bytecode wins).
+                        let parent_redefined = crate::classloading::any_class_redefined()
+                            && cm.class_redefine_generation(parent_id) > 0
+                            && !redefine_immune_reflection_native(&parent.name, &method_name);
+                        let has_native = !parent_redefined
+                            && shared
+                                .native_methods
+                                .find(&parent.name, &method_name, &method_descriptor)
+                                .is_some();
+                        if has_native {
+                            remember_vtable_native_shadow(thread, native_shadow_cache_key, true);
+                            drop(cm);
+                            return Ok(CachedCallResult::CacheMiss);
+                        }
+                        if has_bytecode {
+                            break;
+                        }
                     }
-                    if has_bytecode {
-                        break;
-                    }
+                    cid = parent_id;
                 }
-                cid = parent_id;
+                remember_vtable_native_shadow(thread, native_shadow_cache_key, false);
             }
         }
         drop(cm);

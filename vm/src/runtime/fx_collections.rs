@@ -172,7 +172,7 @@ pub struct ResolutionCache {
 
 /// Hash a string with `FxHasher` and return the `u64` digest.
 #[inline]
-fn fx_hash_str(s: &str) -> u64 {
+pub(crate) fn fx_hash_str(s: &str) -> u64 {
     let mut h = FxHasher::default();
     h.write(s.as_bytes());
     h.finish()
