@@ -637,6 +637,17 @@ pub trait NativeContext {
     /// Returns `true` if the method is found.
     fn method_exists(&self, class_name: &str, method_name: &str, descriptor: &str) -> bool;
 
+    /// True iff `class_id` ITSELF declares (not merely inherits) a method with
+    /// the given name+descriptor. Unlike [`method_exists`], this does NOT walk
+    /// superclasses — it answers "does this exact class override the method?".
+    /// Used by the `ClassLoader.getResources` native to distinguish a custom
+    /// loader that overrides `findResources` (delegate to it) from one that
+    /// merely inherits the default (fall back to parent-delegated scan).
+    /// Default returns `false` so mock/test contexts compile unchanged.
+    fn class_declares_method(&self, _class_id: ClassId, _name: &str, _descriptor: &str) -> bool {
+        false
+    }
+
     /// Allocate a primitive array (element_type: Boolean=4..Long=11).
     fn new_array(&mut self, element_type: ArrayElementType, length: usize) -> ObjectRef;
 

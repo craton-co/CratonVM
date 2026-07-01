@@ -539,7 +539,14 @@ impl OldGen {
                     + array_data_size(header.array_length as usize, header.element_type)
                         .expect("array_data_size overflow in old_gen scan")
             } else {
-                HEADER_SIZE + header.num_slots as usize * SLOT_SIZE
+                // Compact reference-field layout: a promoted compact object's body
+                // size is in the header's `array_length`, not `num_slots*SLOT_SIZE`.
+                // `object_body_size` honours the per-object `GC_FLAG_COMPACT` bit
+                // (legacy objects still size as `num_slots*SLOT_SIZE`). Without this
+                // the walker strides `num_slots*16` over a compact object, desyncing
+                // the whole old-gen walk and tripping the size-consistency skip in
+                // `scan_dirty_cards` (→ missed old→young roots → corruption).
+                HEADER_SIZE + cratonvm_types::object_body_size(header)
             };
             if total_size < HEADER_SIZE || offset + total_size > end_offset {
                 break;
@@ -578,7 +585,11 @@ impl OldGen {
                     + array_data_size(header.array_length as usize, header.element_type)
                         .expect("array_data_size overflow in old_gen scan")
             } else {
-                HEADER_SIZE + header.num_slots as usize * SLOT_SIZE
+                // Compact reference-field layout: honour the per-object
+                // `GC_FLAG_COMPACT` bit (body size in `array_length`); legacy
+                // objects still size as `num_slots*SLOT_SIZE`. See the matching
+                // note in `scan_region_filtered`.
+                HEADER_SIZE + cratonvm_types::object_body_size(header)
             };
             // Sanity check: if total_size is 0 or too large, stop scanning
             if total_size < HEADER_SIZE || offset + total_size > end_offset {

@@ -949,6 +949,25 @@ fn print_stream_target_fd(ctx: &mut dyn NativeContext, stream: Option<ObjectRef>
     2
 }
 
+/// True iff `stream` is the `System.out` or `System.err` static — the two
+/// streams the fd fast path can reach directly. Any other non-null stream is a
+/// user-provided sink (e.g. a `ByteArrayOutputStream`/`StringWriter`-backed
+/// `PrintWriter`) that must be driven through its own `println`.
+fn is_system_out_or_err(ctx: &mut dyn NativeContext, stream: ObjectRef) -> bool {
+    if let Some(sys) = ctx.class_id_by_name("java/lang/System") {
+        for name in ["out", "err"] {
+            if let Some(idx) = ctx.static_field_index_by_name(sys, name) {
+                if let Value::Object(Some(std)) = ctx.get_static_field(sys, idx) {
+                    if std == stream {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
 /// printStackTrace() / printStackTrace(PrintStream) / printStackTrace(PrintWriter).
 ///
 /// Walks the full cause chain (with a cycle guard) and prints each
@@ -970,15 +989,15 @@ pub(crate) fn native_throwable_print_stack_trace(
     Ok(None)
 }
 
-/// Shared body for all three `printStackTrace` overloads: writes the header +
-/// captured frames for the throwable and its cause chain to `fd`.
-fn print_throwable_chain_to_fd(ctx: &mut dyn NativeContext, this: ObjectRef, fd: u32) {
-    // Header for the top-level throwable.
-    let header = throwable_header_line(ctx, this);
-    emit_stack_line(ctx, header, fd);
-    for f in throwable_frame_lines(ctx, this) {
-        emit_stack_line(ctx, f, fd);
-    }
+/// Collect the full printStackTrace text (header + captured frames for the
+/// throwable and its cause chain) as a list of lines, WITHOUT emitting them.
+/// Shared by the fd sink and the stream-object sink so both produce identical
+/// text. Reading the trace store here does no user-visible allocation, so it is
+/// safe to run before any `invoke_virtual` that could trigger GC.
+fn collect_throwable_chain_lines(ctx: &mut dyn NativeContext, this: ObjectRef) -> Vec<String> {
+    let mut lines = Vec::new();
+    lines.push(throwable_header_line(ctx, this));
+    lines.extend(throwable_frame_lines(ctx, this));
 
     // Walk the cause chain with a cycle guard. Limit depth defensively
     // to avoid pathological loops if `cause` was somehow self-referential
@@ -992,13 +1011,46 @@ fn print_throwable_chain_to_fd(ctx: &mut dyn NativeContext, this: ObjectRef, fd:
             break;
         }
         seen.push(c);
-        let inner = throwable_header_line(ctx, c);
-        emit_stack_line(ctx, format!("Caused by: {inner}"), fd);
-        for f in throwable_frame_lines(ctx, c) {
-            emit_stack_line(ctx, f, fd);
-        }
+        lines.push(format!("Caused by: {}", throwable_header_line(ctx, c)));
+        lines.extend(throwable_frame_lines(ctx, c));
         current = throwable_cause(ctx, c);
     }
+    lines
+}
+
+/// Shared body for the fd sink of all `printStackTrace` overloads: writes the
+/// header + captured frames for the throwable and its cause chain to `fd`.
+fn print_throwable_chain_to_fd(ctx: &mut dyn NativeContext, this: ObjectRef, fd: u32) {
+    for line in collect_throwable_chain_lines(ctx, this) {
+        emit_stack_line(ctx, line, fd);
+    }
+}
+
+/// Stream-object sink for `printStackTrace(PrintStream)` / `(PrintWriter)` when
+/// the target is a user-provided stream (NOT System.out/err, which use the fd
+/// fast path). The native fd write cannot reach a buffer such as a
+/// `ByteArrayOutputStream`-backed `PrintWriter`, so we drive the trace through
+/// the stream object's own `println(String)` — exactly like HotSpot's
+/// `Throwable.printStackTrace(PrintWriter)` — so the text lands wherever the
+/// stream points. Both PrintStream and PrintWriter declare `println(String)V`.
+fn print_throwable_chain_to_stream_obj(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    stream: ObjectRef,
+) {
+    let lines = collect_throwable_chain_lines(ctx, this);
+    // Pin the stream across the allocating create_string / re-entrant println.
+    let pin = ctx.pin_native_root(stream);
+    for line in lines {
+        // Keep test consumers that scan `printed_lines` working.
+        ctx.record_printed_line(line.clone());
+        let s = ctx.read_native_pin(pin, stream);
+        let arg = Value::Object(Some(ctx.create_string(&line)));
+        let s = ctx.read_native_pin(pin, s);
+        // Best-effort: ignore a secondary failure while printing a trace.
+        let _ = ctx.invoke_virtual(s, "println", "(Ljava/lang/String;)V", &[arg]);
+    }
+    ctx.unpin_native_roots(pin);
 }
 
 /// addSuppressed(Throwable) — append to suppressed list stored in field 2
@@ -1822,7 +1874,22 @@ pub(crate) fn native_throwable_print_stack_trace_to_stream(
         Some(Value::Object(Some(s))) => Some(*s),
         _ => None,
     };
-    let fd = print_stream_target_fd(ctx, stream);
-    print_throwable_chain_to_fd(ctx, this, fd);
+    match stream {
+        // Null stream (e.g. System.err still null on early boot): fall back to
+        // the stderr fd so a catch-handler's printStackTrace never NPEs.
+        None => print_throwable_chain_to_fd(ctx, this, 2),
+        // System.out / System.err: keep the battle-tested host-fd sink so
+        // boot-time exception dumps stay visible exactly as before.
+        Some(s) if is_system_out_or_err(ctx, s) => {
+            let fd = print_stream_target_fd(ctx, Some(s));
+            print_throwable_chain_to_fd(ctx, this, fd);
+        }
+        // Any other stream is a user sink the fd write cannot reach (e.g. a
+        // ByteArrayOutputStream-backed PrintWriter). Drive it through the
+        // object's own println so the trace is actually captured — this is the
+        // path Spring's AggressiveFactoryBeanInstantiationTests.checkLinkageError
+        // and every log-to-string idiom depends on.
+        Some(s) => print_throwable_chain_to_stream_obj(ctx, this, s),
+    }
     Ok(None)
 }

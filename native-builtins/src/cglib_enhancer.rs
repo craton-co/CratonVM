@@ -360,6 +360,7 @@ struct BeanMethod {
 /// matches Spring and is name-agnostic, fixing both. No-arg reference-returning
 /// methods only — so comparing the method name (params are always `()`) suffices.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn emit_bean_override(
     name_idx: u16,
     descriptor_idx: u16,
@@ -373,6 +374,17 @@ fn emit_bean_override(
     get_factory_method_ref: u16,
     method_get_name_ref: u16,
     string_equals_ref: u16,
+    // Configuration-bean-name-generator support (mirrors
+    // BeanAnnotationHelper.determineBeanNameFor): when the beanFactory has a
+    // ConfigurationBeanNameGenerator registered under
+    // CONFIGURATION_BEAN_NAME_GENERATOR, the inter-bean `getBean` must resolve
+    // the generator-derived name (e.g. FullyQualifiedConfigurationBeanNameGenerator
+    // → "declaringClass.methodName"), not the plain method name.
+    singleton_registry_cast_idx: u16,
+    get_singleton_ref: u16,
+    config_gen_iface_idx: u16,
+    cfg_gen_name_string_idx: u16,
+    fq_name_string_idx: u16,
 ) -> Vec<u8> {
     let b = |x: u16| -> [u8; 2] { x.to_be_bytes() };
     let mut code: Vec<u8> = Vec::new();
@@ -407,32 +419,80 @@ fn emit_bean_override(
     code.extend_from_slice(&b(super_method_ref));
     // 25: areturn
     code.push(0xB0);
-    // 26: L_getbean: aload_0
+    // --- L_getbean (26): resolve the container bean name, then getBean(name). ---
+    // String beanName = "<plain name>";
+    // if (bf instanceof SingletonBeanRegistry sbr
+    //         && sbr.getSingleton(CONFIGURATION_BEAN_NAME_GENERATOR)
+    //                instanceof ConfigurationBeanNameGenerator) {
+    //     beanName = "<fq name>";   // e.g. declaringClass.methodName
+    // }
+    // return (<Ret>) ((BeanFactory) bf).getBean(beanName);
+    // 26: aload_0
     code.push(0x2A);
-    // 27: getfield this.$$beanFactory
+    // 27: getfield this.$$beanFactory     (Object bf)
     code.push(0xB4);
     code.extend_from_slice(&b(bf_field_ref));
-    // 30: checkcast BeanFactory
-    code.push(0xC0);
-    code.extend_from_slice(&b(beanfactory_cast_idx));
-    // 33: ldc_w "<name>"
+    // 30: astore_2   (local2 = bf)
+    code.push(0x4D);
+    // 31: ldc_w "<name>"   (default = plain method name)
     code.push(0x13);
     code.extend_from_slice(&b(name_string_idx));
-    // 36: invokeinterface BeanFactory.getBean(String)Object  count=2
+    // 34: astore_3   (local3 = beanName)
+    code.push(0x4E);
+    // 35: aload_2
+    code.push(0x2C);
+    // 36: instanceof SingletonBeanRegistry
+    code.push(0xC1);
+    code.extend_from_slice(&b(singleton_registry_cast_idx));
+    // 39: ifeq → L_get (64); offset 25
+    code.push(0x99);
+    code.extend_from_slice(&b(25));
+    // 42: aload_2
+    code.push(0x2C);
+    // 43: checkcast SingletonBeanRegistry
+    code.push(0xC0);
+    code.extend_from_slice(&b(singleton_registry_cast_idx));
+    // 46: ldc_w CONFIGURATION_BEAN_NAME_GENERATOR
+    code.push(0x13);
+    code.extend_from_slice(&b(cfg_gen_name_string_idx));
+    // 49: invokeinterface SingletonBeanRegistry.getSingleton(String)Object  count=2
+    code.push(0xB9);
+    code.extend_from_slice(&b(get_singleton_ref));
+    code.push(0x02);
+    code.push(0x00);
+    // 54: instanceof ConfigurationBeanNameGenerator
+    code.push(0xC1);
+    code.extend_from_slice(&b(config_gen_iface_idx));
+    // 57: ifeq → L_get (64); offset 7
+    code.push(0x99);
+    code.extend_from_slice(&b(7));
+    // 60: ldc_w "<fq name>"
+    code.push(0x13);
+    code.extend_from_slice(&b(fq_name_string_idx));
+    // 63: astore_3   (local3 = fq name)
+    code.push(0x4E);
+    // 64: L_get: aload_2
+    code.push(0x2C);
+    // 65: checkcast BeanFactory
+    code.push(0xC0);
+    code.extend_from_slice(&b(beanfactory_cast_idx));
+    // 68: aload_3   (beanName)
+    code.push(0x2D);
+    // 69: invokeinterface BeanFactory.getBean(String)Object  count=2
     code.push(0xB9);
     code.extend_from_slice(&b(getbean_ref));
     code.push(0x02);
     code.push(0x00);
-    // 41: checkcast <Ret>
+    // 74: checkcast <Ret>
     code.push(0xC0);
     code.extend_from_slice(&b(rettype_cast_idx));
-    // 44: areturn
+    // 77: areturn
     code.push(0xB0);
-    debug_assert_eq!(code.len(), 45);
+    debug_assert_eq!(code.len(), 78);
 
     let mut code_attr = Vec::new();
     code_attr.extend_from_slice(&2u16.to_be_bytes()); // max_stack
-    code_attr.extend_from_slice(&2u16.to_be_bytes()); // max_locals (this + currentlyInvoked)
+    code_attr.extend_from_slice(&4u16.to_be_bytes()); // max_locals (this, method, bf, beanName)
     code_attr.extend_from_slice(&(code.len() as u32).to_be_bytes());
     code_attr.extend_from_slice(&code);
     code_attr.extend_from_slice(&0u16.to_be_bytes()); // exception_table_length
@@ -536,10 +596,31 @@ fn build_enhancer_class(
         let string_equals_ref =
             cw.add_methodref(string_cls, "equals", "(Ljava/lang/Object;)Z");
 
+        // ConfigurationBeanNameGenerator support: when the container has a
+        // ConfigurationBeanNameGenerator registered under
+        // CONFIGURATION_BEAN_NAME_GENERATOR, an inter-bean `getBean` must use the
+        // generator-derived name (mirrors BeanAnnotationHelper.determineBeanNameFor).
+        let singleton_registry_cast_idx =
+            cw.add_class("org/springframework/beans/factory/config/SingletonBeanRegistry");
+        let get_singleton_ref = cw.add_interface_methodref(
+            singleton_registry_cast_idx,
+            "getSingleton",
+            "(Ljava/lang/String;)Ljava/lang/Object;",
+        );
+        let config_gen_iface_idx =
+            cw.add_class("org/springframework/context/annotation/ConfigurationBeanNameGenerator");
+        let cfg_gen_name_string_idx = cw.add_string(
+            "org.springframework.context.annotation.internalConfigurationBeanNameGenerator",
+        );
+        // Dotted declaring-class name for the "declaringClass.methodName" default
+        // used by FullyQualifiedConfigurationBeanNameGenerator.deriveBeanName.
+        let super_dotted = super_internal_name.replace('/', ".");
+
         for bm in bean_methods {
             let name_idx = cw.add_utf8(&bm.name);
             let desc_idx = cw.add_utf8(&bm.descriptor);
             let name_string_idx = cw.add_string(&bm.name);
+            let fq_name_string_idx = cw.add_string(&format!("{super_dotted}.{}", bm.name));
             let super_method_ref = cw.add_methodref(super_class_idx, &bm.name, &bm.descriptor);
             let rettype_cast_idx = cw.add_class(&bm.return_internal);
             let override_method = emit_bean_override(
@@ -555,6 +636,11 @@ fn build_enhancer_class(
                 get_factory_method_ref,
                 method_get_name_ref,
                 string_equals_ref,
+                singleton_registry_cast_idx,
+                get_singleton_ref,
+                config_gen_iface_idx,
+                cfg_gen_name_string_idx,
+                fq_name_string_idx,
             );
             methods.push(override_method);
         }

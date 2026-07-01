@@ -159,8 +159,40 @@ metadata build) and then leaks into the name-keyed `JavaTypeRegistry`. Candidate
 (a) prevent the spurious Application-loader load of an entity that a user loader has enhanced;
 (b) make the entity JavaType / `getReflectionOptimizer` use the enhanced `getMappedClass()`
 directly; or (c) make CratonVM Class-mirror identity loader-faithful so the registry's `==`
-guard distinguishes (and rejects) the un-enhanced copy. Until then, `enhancement.lazy.*` (≈54)
-+ `mapping.lazytoone.*` (12) remain FAIL gate-on.
+guard distinguishes (and rejects) the un-enhanced copy.
+
+### UPDATE 2026-07-01 — lazy cluster CORE FIXED by the misc16 loader-faithful merge (`27f647ff`)
+
+The `enhancement.lazy.*` cluster is now **mostly green** gate-on, resolved by the
+misc16 `@BytecodeEnhanced` work merged into dev (`fix/hib-misc-correctness`,
+commit `a663624d`; see `HIB-misc16-correctness-sweep.md §4–9`). Two additive
+fixes on top of `f658fe12`'s `inherit_lookup_loader` peek:
+
+1. **KEYSTONE (ungated):** `allocate_loader_id()` now starts at **3**, so a user
+   loader's namespace id can never alias the reserved `Extension(1)`/
+   `Application(2)` encodings in the first place — the class-store side of the
+   same collision `f658fe12` patched in `inherit_lookup_loader` (belt-and-suspenders).
+2. **The "next OPEN layer" (field-setter `Field.set` CCE) is FIXED** — but the
+   cause was NOT the MethodHandle accessor: the `s -> { entity = new X(); }`
+   setup **lambda** ran the *un-enhanced* enclosing-class body (loader-blind
+   lambda impl dispatch), so `new X` produced an un-enhanced receiver and
+   `Field.set(unenhancedEntity, Long)` mismatched the enhanced mapped class.
+   Fixed by loader-faithful lambda impl dispatch + reflective type resolution +
+   a lambda-arg checkcast carve-out (all gated).
+
+Sample (`lazycluster.txt`, gate-on): 7/9 PASS incl. `OnlyLazyBasicUpdateTest`
+20/20, `EagerAndLazyBasicUpdateTest` 40/40, `LazyGroup*`, `LazyBasic*`.
+**Residual (new 4th surface):** `lazy.proxy.FetchGraphTest` /
+`SpecializedEntity` — `Lookup.defineClass ... already defined by
+user-defined(4) loader`. Now that the ByteBuddy optimizer bridge
+(`<Entity>$HibernateAccessOptimizerBridge…` / `$HibernateInstantiator`)
+correctly lands in the enhancing namespace, a second `getReflectionOptimizer`
+for a related class in the same inheritance hierarchy **re-defines** the same
+bridge — ByteBuddy's `referenceClass.getClassLoader().loadClass(bridgeName)`
+reuse-check is not finding the first namespace-defined copy, so it hits the
+duplicate-define guard. Next fix: make `findLoadedClass` / `loadClass` on the
+enhancing loader surface classes it defined via `Lookup.defineClass` (so the
+reuse-check succeeds instead of re-defining).
 
 ## Repro
 

@@ -16557,6 +16557,26 @@ fn lambda_arg_provably_not_instance(
     {
         return false;
     }
+    // Loader-split carve-out (gated): under loader-faithful resolution the same
+    // logical type can exist as several per-loader copies (a Hibernate
+    // bytecode-enhanced entity and its un-enhanced global copy, distinct
+    // `ClassId`s sharing a name). `get_loaded_class_id(target)` picks only ONE,
+    // so a lambda-arg `checkcast` to that type (e.g. adapting the receiver of a
+    // `ImmutableEntity::getName` method reference) would spuriously reject an
+    // instance of the OTHER copy — `X cannot be cast to X`. Treat an object
+    // whose class NAME equals the target's as an instance. Gate-off unchanged;
+    // only same-named cross-loader pairs are affected, never distinct types.
+    if crate::runtime::env_cache::loader_aware_resolution() {
+        let same_name = shared
+            .class_manager
+            .read()
+            .get_class(obj_class_id)
+            .map(|c| &*c.name == target)
+            .unwrap_or(false);
+        if same_name {
+            return false;
+        }
+    }
     // Provenance carve-out: a bare `java/lang/Object` receiver (`cid == 0`, or a
     // synthetic alloc that lost its class identity and now reports
     // `java/lang/Object`) carries no interface table, so we cannot prove it does
@@ -16788,6 +16808,43 @@ pub(crate) fn lambda_args_sam_compatible(
     true
 }
 
+/// Loader-faithful dispatch target for a lambda's implementation method.
+///
+/// The `invokedynamic` that materialised this lambda lives in the class recorded
+/// in `lambda_proxy_hosts` (its enclosing/defining class). Resolve the impl
+/// method's owner through THAT class's loader (JVMS §5.4.3 initiating loader) so
+/// a lambda whose enclosing class was defined by a child / bytecode-enhancing
+/// loader dispatches to that loader's copy of the impl method — not the flat
+/// global copy the by-name `invoke_shared`/`load_class` path would pick. This
+/// mirrors the `invokespecial`/`invokevirtual` divergence override already
+/// applied to ordinary bytecode dispatch (search "dispatch_override").
+///
+/// Concrete failure without this: a Hibernate `@BytecodeEnhanced` test's
+/// `s -> { new Continent(); ... }` lambda ran the UN-enhanced host copy, so
+/// `new Continent` resolved the un-enhanced entity and the reflective
+/// `Field.set` on it mismatched the enhanced mapped class.
+///
+/// Returns the loader-local `ClassId` only when it diverges from the by-name
+/// resolution; `None` (gate off, built-in host loader, or no per-loader copy)
+/// keeps the legacy name-based dispatch byte-for-byte.
+pub(crate) fn lambda_impl_dispatch_override(
+    shared: &SharedVm,
+    call_site: &crate::classloading::resolution::LambdaCallSite,
+) -> Option<ClassId> {
+    if !crate::runtime::env_cache::loader_aware_resolution() {
+        return None;
+    }
+    let host = *shared
+        .lambda_proxy_hosts
+        .read()
+        .get(&call_site.proxy_class_id)?;
+    let name = &call_site.impl_handle.class_name;
+    lookup_loader_initiated(shared, host, name).filter(|cid| {
+        *cid != ClassId::new(0)
+            && shared.class_manager.read().get_loaded_class_id(name) != Some(*cid)
+    })
+}
+
 /// Try to dispatch a method call on a lambda proxy object.
 ///
 /// Returns:
@@ -16976,14 +17033,27 @@ pub(crate) fn try_lambda_dispatch(
 
                 // Dispatch to the implementation handle.
                 let result_val = match lcs.impl_handle.kind {
-                    MethodHandleKind::InvokeStatic => invoke_shared(
-                        shared,
-                        thread,
-                        &lcs.impl_handle.class_name,
-                        &lcs.impl_handle.member_name,
-                        &lcs.impl_handle.descriptor,
-                        &full_args,
-                    )?,
+                    MethodHandleKind::InvokeStatic => {
+                        if let Some(impl_cid) = lambda_impl_dispatch_override(shared, &lcs) {
+                            crate::vm::invoke_on_class_shared_no_retarget(
+                                shared,
+                                thread,
+                                impl_cid,
+                                &lcs.impl_handle.member_name,
+                                &lcs.impl_handle.descriptor,
+                                &full_args,
+                            )?
+                        } else {
+                            invoke_shared(
+                                shared,
+                                thread,
+                                &lcs.impl_handle.class_name,
+                                &lcs.impl_handle.member_name,
+                                &lcs.impl_handle.descriptor,
+                                &full_args,
+                            )?
+                        }
+                    }
                     MethodHandleKind::InvokeVirtual | MethodHandleKind::InvokeInterface => {
                         if full_args.is_empty() {
                             crate::runtime::diagnostics::record_swallow(
@@ -16997,26 +17067,55 @@ pub(crate) fn try_lambda_dispatch(
                             );
                             return Ok(None);
                         }
-                        let receiver_class = match &full_args[0] {
-                            Value::Object(Some(r)) => {
-                                let rcv = shared.heap.class_id_of(*r);
-                                shared
-                                    .class_manager
-                                    .read()
-                                    .get_class(rcv)
-                                    .map(|c| c.name.to_string())
-                                    .unwrap_or_else(|| lcs.impl_handle.class_name.to_string())
-                            }
-                            _ => lcs.impl_handle.class_name.to_string(),
+                        let rcv_id_opt = match &full_args[0] {
+                            Value::Object(Some(r)) => Some(shared.heap.class_id_of(*r)),
+                            _ => None,
                         };
-                        invoke_or_native(
-                            shared,
-                            thread,
-                            &receiver_class,
-                            &lcs.impl_handle.member_name,
-                            &lcs.impl_handle.descriptor,
-                            &full_args,
-                        )?
+                        let receiver_class = match rcv_id_opt {
+                            Some(rcv) => shared
+                                .class_manager
+                                .read()
+                                .get_class(rcv)
+                                .map(|c| c.name.to_string())
+                                .unwrap_or_else(|| lcs.impl_handle.class_name.to_string()),
+                            None => lcs.impl_handle.class_name.to_string(),
+                        };
+                        // Loader-faithful (gated): dispatch on the receiver's exact
+                        // class_id when it diverges from the by-name global copy.
+                        let vov = if crate::runtime::env_cache::loader_aware_resolution() {
+                            rcv_id_opt.filter(|rcv| {
+                                *rcv != ClassId::new(0)
+                                    && !shared.lambda_proxies.read().contains_key(rcv)
+                                    && {
+                                        let cm = shared.class_manager.read();
+                                        cm.get_class(*rcv)
+                                            .map(|c| &*c.name == receiver_class.as_str())
+                                            .unwrap_or(false)
+                                            && cm.get_loaded_class_id(&receiver_class) != Some(*rcv)
+                                    }
+                            })
+                        } else {
+                            None
+                        };
+                        if let Some(rcv_cid) = vov {
+                            invoke_on_class_shared(
+                                shared,
+                                thread,
+                                rcv_cid,
+                                &lcs.impl_handle.member_name,
+                                &lcs.impl_handle.descriptor,
+                                &full_args,
+                            )?
+                        } else {
+                            invoke_or_native(
+                                shared,
+                                thread,
+                                &receiver_class,
+                                &lcs.impl_handle.member_name,
+                                &lcs.impl_handle.descriptor,
+                                &full_args,
+                            )?
+                        }
                     }
                     other => {
                         crate::runtime::diagnostics::record_swallow(
@@ -17171,14 +17270,29 @@ pub(crate) fn try_lambda_dispatch(
                     full_args.len(),
                 );
             }
-            let result = invoke_shared(
-                shared,
-                thread,
-                &call_site.impl_handle.class_name,
-                &call_site.impl_handle.member_name,
-                &call_site.impl_handle.descriptor,
-                &full_args,
-            )?;
+            let result = if let Some(impl_cid) = lambda_impl_dispatch_override(shared, &call_site) {
+                // Loader-faithful: the enclosing class was defined by a user
+                // loader whose copy of the impl owner diverges from the global
+                // one; dispatch on the exact loader-local class (static → no
+                // receiver retarget).
+                crate::vm::invoke_on_class_shared_no_retarget(
+                    shared,
+                    thread,
+                    impl_cid,
+                    &call_site.impl_handle.member_name,
+                    &call_site.impl_handle.descriptor,
+                    &full_args,
+                )?
+            } else {
+                invoke_shared(
+                    shared,
+                    thread,
+                    &call_site.impl_handle.class_name,
+                    &call_site.impl_handle.member_name,
+                    &call_site.impl_handle.descriptor,
+                    &full_args,
+                )?
+            };
             if crate::runtime::env_cache::lambda_dbg() {
                 eprintln!(
                     "[cratonvm-dbg] lambda static-post-invoke: {}.{}{} result={:?}",
@@ -17244,26 +17358,65 @@ pub(crate) fn try_lambda_dispatch(
                 }
             }
             // Resolve the actual class of the receiver for virtual dispatch.
-            let receiver_class = match &full_args[0] {
-                Value::Object(Some(r)) => {
-                    let rcv_class_id = shared.heap.class_id_of(*r);
-                    shared
-                        .class_manager
-                        .read()
-                        .get_class(rcv_class_id)
-                        .map(|c| c.name.to_string())
-                        .unwrap_or_else(|| call_site.impl_handle.class_name.to_string())
-                }
-                _ => call_site.impl_handle.class_name.to_string(),
+            let recv_class_id_opt = match &full_args[0] {
+                Value::Object(Some(r)) => Some(shared.heap.class_id_of(*r)),
+                _ => None,
             };
-            let result = invoke_or_native(
-                shared,
-                thread,
-                &receiver_class,
-                &call_site.impl_handle.member_name,
-                &call_site.impl_handle.descriptor,
-                &full_args,
-            );
+            let receiver_class = match recv_class_id_opt {
+                Some(rcv_class_id) => shared
+                    .class_manager
+                    .read()
+                    .get_class(rcv_class_id)
+                    .map(|c| c.name.to_string())
+                    .unwrap_or_else(|| call_site.impl_handle.class_name.to_string()),
+                None => call_site.impl_handle.class_name.to_string(),
+            };
+            // Loader-faithful (gated): when the receiver's runtime class diverges
+            // from the by-name global resolution — a per-loader (e.g. bytecode-
+            // enhanced) copy — dispatch on the receiver's EXACT class_id so the
+            // lambda body runs that loader's copy. `invoke_or_native` otherwise
+            // collapses `receiver_class` (a name) to the global copy, running the
+            // un-enhanced lambda body (`new Country` → un-enhanced entity →
+            // reflective `Field.set` mismatch). Mirrors the ordinary
+            // invoke_virtual divergence override.
+            let virtual_override = if crate::runtime::env_cache::loader_aware_resolution() {
+                recv_class_id_opt.filter(|rcv| {
+                    *rcv != ClassId::new(0)
+                        && !shared.lambda_proxies.read().contains_key(rcv)
+                        && {
+                            let cm = shared.class_manager.read();
+                            // Only when `receiver_class` truly names the receiver's
+                            // own real class (not the impl-handle fallback for a
+                            // lambda-proxy / generic-ClassId receiver) AND that name
+                            // globally resolves to a DIFFERENT (per-loader) copy.
+                            cm.get_class(*rcv)
+                                .map(|c| &*c.name == receiver_class.as_str())
+                                .unwrap_or(false)
+                                && cm.get_loaded_class_id(&receiver_class) != Some(*rcv)
+                        }
+                })
+            } else {
+                None
+            };
+            let result = if let Some(rcv_cid) = virtual_override {
+                invoke_on_class_shared(
+                    shared,
+                    thread,
+                    rcv_cid,
+                    &call_site.impl_handle.member_name,
+                    &call_site.impl_handle.descriptor,
+                    &full_args,
+                )
+            } else {
+                invoke_or_native(
+                    shared,
+                    thread,
+                    &receiver_class,
+                    &call_site.impl_handle.member_name,
+                    &call_site.impl_handle.descriptor,
+                    &full_args,
+                )
+            };
             // If receiver's class didn't have the SAM method, fall back to the
             // class specified in the lambda call site. Handles objects with
             // generic ClassId (stub/Object) targeting a specific class.
@@ -17333,10 +17486,15 @@ pub(crate) fn try_lambda_dispatch(
                 true,
                 num_captures,
             )?;
-            let class_id = shared
-                .class_manager
-                .write()
-                .load_class(&call_site.impl_handle.class_name)?;
+            // Loader-faithful owner resolution (gated): prefer the enclosing
+            // loader's copy of the impl class when it diverges from the global.
+            let class_id = match lambda_impl_dispatch_override(shared, &call_site) {
+                Some(cid) => cid,
+                None => shared
+                    .class_manager
+                    .write()
+                    .load_class(&call_site.impl_handle.class_name)?,
+            };
             let result = invoke_on_class_shared(
                 shared,
                 thread,
@@ -17351,10 +17509,14 @@ pub(crate) fn try_lambda_dispatch(
         }
         MethodHandleKind::NewInvokeSpecial => {
             // Constructor reference: allocate object, call <init>, return the object.
-            let class_id = shared
-                .class_manager
-                .write()
-                .load_class(&call_site.impl_handle.class_name)?;
+            // Loader-faithful owner resolution (gated), same rationale as above.
+            let class_id = match lambda_impl_dispatch_override(shared, &call_site) {
+                Some(cid) => cid,
+                None => shared
+                    .class_manager
+                    .write()
+                    .load_class(&call_site.impl_handle.class_name)?,
+            };
             ensure_class_initialized_shared(shared, thread, class_id)?;
             // Use `num_total_fields` (inherited + declared instance fields),
             // matching the `New` opcode. `c.fields.len()` is wrong here: it
