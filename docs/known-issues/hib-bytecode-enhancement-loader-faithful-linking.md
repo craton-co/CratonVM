@@ -95,71 +95,32 @@ the lookup class's recorded defining-loader (`peek_loader_namespace_id`) — the
 `defineClass1` computes — falling back to the legacy i32 path otherwise (byte-identical
 gate-off). With it, `enhancement.lazy.*` now build the SessionFactory and run.
 
-### UPDATE 2026-07-01 — lazy cluster FIXED (7th fix: loader-faithful lambda dispatch)
+### UPDATE 2026-07-01 — lazy lambda fix (landed on dev via misc16) + crash→catchable NSME
 
-**The "MethodHandle field-setter" diagnosis above was WRONG** (a misdiagnosis). The
-`s.persist(entity)` failure —
-`PropertyAccessException: Could not set value of type [java.lang.Long]: '<Entity>.id'` ←
-`IllegalArgumentException: Can not set java.lang.Long field <Entity>.id to <Entity>` — is
-**NOT** a MethodHandle-subsystem bug and does **not** originate in `setter.invokeExact`. The
-IAE is thrown from `jdk.internal.reflect.MethodHandleFieldAccessorImpl.ensureObj` (JDK line
-63, **before** any `invokeExact`), which does
-`declaringClass.isAssignableFrom(o.getClass())` and, when false, calls
-`throwSetIllegalArgumentException(o)` — reporting the *object* `o` (the entity), which is
-exactly why "the value reads as the entity." (Confirmed with `-Dcraton.trace`; there is no
-`ClassCastException` anywhere — `CRATONVM_DBG_CCE` is silent.)
+The `s.persist(entity)` failure — `PropertyAccessException` / `IllegalArgumentException: Can
+not set java.lang.Long field <Entity>.id to <Entity>` — is **NOT** a MethodHandle-subsystem
+bug (the "MethodHandle field-setter" note above was a misdiagnosis). The IAE is thrown from
+`jdk.internal.reflect.MethodHandleFieldAccessorImpl.ensureObj` **before** any `invokeExact`:
+`declaringClass.isAssignableFrom(o.getClass())` is false because the enhancement-test
+transaction **lambda** body ran the *un-enhanced* enclosing-class copy, so its `new <Entity>()`
+produced an un-enhanced entity that mismatched the enhanced mapped class. This exact diagnosis
+and the loader-faithful **lambda impl dispatch** fix landed on dev independently via the misc16
+`@BytecodeEnhanced` sweep — see the "misc16 loader-faithful merge" update below (`27f647ff`),
+the authoritative account. (Independently re-derived here via New-opcode / `Constructor.newInstance`
+/ `isAssignableFrom` instrumentation: the test instance is the enhanced `UserDefined(2)` copy,
+but the lambda body's `new <Entity>` resolved the un-enhanced `Application` copy — cid 3014 vs 413.)
 
-**Root cause — loader-faithful LAMBDA dispatch gap.** `isAssignableFrom` returned false
-because there are **two `<Entity>` class_ids**: the enhanced copy Hibernate's mapped class /
-reflective `Field` use (defined by the enhancing `UserDefined` loader), and an **un-enhanced
-copy the test's `new <Entity>()` created** (Application loader). Traced with per-`new` /
-`isAssignableFrom` instrumentation:
-- The test *instance* is the ENHANCED test class (`Constructor.newInstance` allocates the
-  enhancing-loader copy — correct).
-- But the enhancement test's transaction body is a **lambda** (`inTransaction(s -> { …
-  s.persist(new <Entity>()) … })`), and CratonVM dispatched that lambda's implementation
-  method to the **Application (un-enhanced)** copy of the test class. Its `new <Entity>()`
-  therefore resolved the un-enhanced entity, which is not assignable to the enhanced mapped
-  class → `ensureObj` throws.
-- Why: the lambda call site records its invokedynamic **host** class in
-  `SharedVm::lambda_proxy_hosts` (the enhanced copy), but `try_lambda_dispatch`
-  (`vm/src/runtime/interpreter.rs`) resolved the impl method by **NAME**
-  (`invoke_shared` / `load_class` / receiver-class-name `invoke_or_native`), collapsing to the
-  ONE global (un-enhanced) copy. This lambda is `kind=InvokeVirtual` (a `this::body`-shaped
-  method reference), so the collapse happens in the **virtual** arm, which re-resolved the
-  captured receiver's class NAME instead of using its runtime class_id.
-
-**Fix (gated on `CRATONVM_LOADER_AWARE_RESOLUTION`, `try_lambda_dispatch`).** Resolve the
-lambda impl class through the host's defining loader and override dispatch on divergence,
-mirroring the virtual/`invokespecial` divergence override in `execute_invoke_kind`:
-- `InvokeStatic` / `InvokeSpecial` / `NewInvokeSpecial`: `impl_class_override =
-  lookup_loader_initiated(lambda_proxy_hosts[proxy], impl_handle.class_name)` when it diverges
-  from the global name-resolved copy; dispatch via `invoke_on_class_shared[_no_retarget]` on
-  that class_id.
-- `InvokeVirtual` / `InvokeInterface`: dispatch on the captured receiver's OWN runtime
-  class_id when it is a real (non-proxy) class whose name matches yet whose id diverges from
-  the global copy.
-Divergence-only + gate → **byte-identical gate-off**.
-
-**8th fix (general robustness, still gated): missing `$$_hibernate_*` accessor → CATCHABLE
-`NoSuchMethodError`.** Making the lambda body run in the enhanced frame let Hibernate's
-HHH-16572 `InvalidPropertyNameTest` reach `entity.$$_hibernate_read_property()`, whose enhanced
-read-accessor is intentionally absent. The terminal invoke path in
-`invoke_on_class_shared_inner` (`vm_exec.rs`) raised an **uncatchable**
-`InternalError(Linkage(NoSuchMethodError))` → process abort (CRASH). Per JVMS §5.4.3.3 an
-unresolved method is a throwable `LinkageError`; under the gate + for the `$$_hibernate_`
-accessor family only, construct a catchable `java.lang.NoSuchMethodError` so the framework's
-error path handles it (CRASH → FAIL). Scoped so no passing call site (which never reaches the
-terminal) is affected; gate-off byte-identical.
-
-**Results (real-JDK, JIT on, `gated_subset.txt`).** gate-on PASS **31 → 54** (+23; **19 of
-`enhancement.lazy.*`** now pass, up from 0 — incl. `LazyBasicFieldAccessTest`,
-`LazyBasicPropertyAccessTest`, `OnlyLazyBasicUpdateTest`, `EagerAndLazyBasicUpdateTest`),
-**0 CRASH** (was 1: `InvalidPropertyNameTest` CRASH → FAIL ok=1/2), ABORTED=2 (the
-`assumeTrue` skips `InheritedTest`/`MappedSuperclassTest`). `LazyBasicFieldAccessTest`:
-gate-on ok=2/2, gate-off ok=0/2 (byte-identical to pre-fix). MethodHandle unit/integration
-tests green (`wp2_5_proxy`, `wave3_b2_dispatch`, `wave2_c_methodhandles`); native-builtins
-2711/0. Branch `fix/lazy-enhancement-lambda-dispatch` (off dev). NOT merged (needs sign-off).
+**Net addition of this merge (`fix/lazy-enhancement-lambda-dispatch`, `vm_exec.rs` only):** a
+missing `$$_hibernate_*` accessor at the terminal invoke path in `invoke_on_class_shared_inner`
+now raises a **catchable** `java.lang.NoSuchMethodError` instead of an uncatchable
+`InternalError(Linkage)` process abort. Once the enhanced lambda body runs, Hibernate's
+HHH-16572 `InvalidPropertyNameTest` reaches `entity.$$_hibernate_read_property()` (an
+intentionally-absent enhanced accessor); per JVMS §5.4.3.3 an unresolved method is a throwable
+`LinkageError`. Scoped to gate-on + the `$$_hibernate_` family only (passing call sites never
+reach the terminal) → CRASH → FAIL, gate-off byte-identical. Verified on this worktree's build:
+gate-on `gated_subset` PASS **31 → 54** (19 `enhancement.lazy.*`, incl. `LazyBasicFieldAccessTest`
+ok=2/2), **0 CRASH** (`InvalidPropertyNameTest` CRASH → FAIL ok=1/2); gate-off byte-identical;
+MethodHandle integration tests green (`wp2_5_proxy`/`wave3_b2_dispatch`/`wave2_c_methodhandles`).
 
 ### Precise root cause (traced 2026-06-30) — original SessionFactory CCE characterization
 
