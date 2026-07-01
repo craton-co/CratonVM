@@ -221,7 +221,7 @@ per-framework native short-circuits by making the real container bytecode run.
 >   .waitForExit` (real AQS `ConditionObject.awaitUninterruptibly` + ForkJoinPool — the concurrency
 >   the Risks section feared is exercised and works). The boot does not yet bind HTTP — a **separate
 >   deeper blocker** (a worker thread stuck in native before Liquibase / HTTP bind) is the next
->   frontier; see `docs/known-issues/keycloak-quarkus-boot-progress.md` Gap 8/9.
+>   frontier; see `docs/internal/app-jvm-bugs/keycloak-quarkus-boot-progress.md` Gap 8/9.
 > - **Default flip (deferred):** flipping `real_agroal()` to default-on (opt-out
 >   `CRATONVM_SYNTHETIC_AGROAL`, mirroring AQS / Spring-startup) is gated on the Keycloak boot going
 >   fully green, per Step 2's "validate the suite before flipping" rule. The shim is broken for the
