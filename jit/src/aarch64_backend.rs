@@ -878,6 +878,7 @@ impl Arm64Backend {
             // records no safepoint-id, so leave the bytecode PC unset.
             bytecode_pc: 0,
             frame_slot_offsets: slots,
+            moving_young_coverage_complete: false,
         });
     }
 

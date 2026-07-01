@@ -62,6 +62,9 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     // below re-sets it iff it finds a guard-less JIT frame on the native stack,
     // and the generational collector consults it to pick the non-moving sweep.
     cratonvm_gc::gc_quiescence::clear_unregistered_jit_frame_on_stack();
+    let moving_young_precise_only = crate::jit::conservative_roots::moving_young_enabled()
+        && crate::jit::conservative_roots::refresh_moving_young_coverage_for_current_thread()
+        && !cratonvm_gc::gc_quiescence::moving_young_coverage_incomplete();
 
     // 1. Thread frames — scan locals and operand stacks (SoA layout).
     //
@@ -312,7 +315,7 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     // shadow stack (folded in at 14b below) plus the interpreter/statics/JNI
     // roots. On any non-moving path this scan remains the authoritative JIT root
     // set.
-    if !crate::jit::conservative_roots::moving_young_enabled() {
+    if !moving_young_precise_only {
         crate::jit::conservative_roots::scan_active_jit_frames(&shared.heap, &mut roots);
     }
     // G1 pin-in-place for conservative JIT roots: the generational collector

@@ -25,9 +25,65 @@
 //!   defers compaction (it may still mark, but it does not relocate any
 //!   object — see `gen_heap::collect_garbage_inner`).
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+#[cfg(not(test))]
 static JIT_ACTIVE_DEPTH: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(test)]
+thread_local! {
+    static TEST_JIT_ACTIVE_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(not(test))]
+#[inline]
+fn active_depth_enter() -> usize {
+    JIT_ACTIVE_DEPTH.fetch_add(1, Ordering::AcqRel) + 1
+}
+
+#[cfg(test)]
+#[inline]
+fn active_depth_enter() -> usize {
+    TEST_JIT_ACTIVE_DEPTH.with(|d| {
+        let next = d.get().saturating_add(1);
+        d.set(next);
+        next
+    })
+}
+
+#[cfg(not(test))]
+#[inline]
+fn active_depth_leave() -> usize {
+    let prev = JIT_ACTIVE_DEPTH.fetch_update(Ordering::Release, Ordering::Acquire, |d| {
+        Some(d.saturating_sub(1))
+    });
+    match prev {
+        Ok(p) => p.saturating_sub(1),
+        Err(_) => 0,
+    }
+}
+
+#[cfg(test)]
+#[inline]
+fn active_depth_leave() -> usize {
+    TEST_JIT_ACTIVE_DEPTH.with(|d| {
+        let next = d.get().saturating_sub(1);
+        d.set(next);
+        next
+    })
+}
+
+#[cfg(not(test))]
+#[inline]
+fn active_depth_get() -> usize {
+    JIT_ACTIVE_DEPTH.load(Ordering::Acquire)
+}
+
+#[cfg(test)]
+#[inline]
+fn active_depth_get() -> usize {
+    TEST_JIT_ACTIVE_DEPTH.with(|d| d.get())
+}
 
 /// DBG: total enter()/leave() calls — an imbalance means a leaked JIT entry
 /// that keeps the non-moving sweep wedged on after JIT calls have returned.
@@ -50,6 +106,39 @@ pub fn moving_young_enabled() -> bool {
     use std::sync::OnceLock;
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var_os("CRATONVM_MOVING_YOUNG").is_some())
+}
+
+static MOVING_YOUNG_COVERAGE_INCOMPLETE: AtomicBool = AtomicBool::new(false);
+static MOVING_YOUNG_COVERAGE_FALLBACKS: AtomicUsize = AtomicUsize::new(0);
+
+/// Start a new VM young-GC root-publication cycle. The VM calls this before
+/// mutators publish the snapshots that the collector will use for the cycle.
+pub fn begin_moving_young_coverage_cycle() {
+    MOVING_YOUNG_COVERAGE_INCOMPLETE.store(false, Ordering::Release);
+}
+
+/// Record that at least one live JIT frame in this collection lacks a complete
+/// moving-young coverage proof. The collector must use the non-moving sweep.
+pub fn mark_moving_young_coverage_incomplete() {
+    MOVING_YOUNG_COVERAGE_INCOMPLETE.store(true, Ordering::Release);
+}
+
+/// Whether the current collection has observed an incomplete moving-young JIT
+/// frame/safepoint coverage proof.
+#[inline]
+pub fn moving_young_coverage_incomplete() -> bool {
+    MOVING_YOUNG_COVERAGE_INCOMPLETE.load(Ordering::Acquire)
+}
+
+/// Bump the diagnostic fallback counter and return the post-increment value.
+pub fn record_moving_young_coverage_fallback() -> usize {
+    MOVING_YOUNG_COVERAGE_FALLBACKS.fetch_add(1, Ordering::Relaxed) + 1
+}
+
+/// Number of moving-young cycles diverted to the non-moving sweep because at
+/// least one live JIT frame did not have complete coverage.
+pub fn moving_young_coverage_fallback_count() -> usize {
+    MOVING_YOUNG_COVERAGE_FALLBACKS.load(Ordering::Relaxed)
 }
 
 /// Increment the global JIT-active counter. Called from the VM crate's
@@ -82,7 +171,7 @@ pub fn moving_young_enabled() -> bool {
 /// visibility — it only adds the missing acquire half.
 pub fn enter() -> usize {
     ENTER_COUNT.fetch_add(1, Ordering::Relaxed);
-    JIT_ACTIVE_DEPTH.fetch_add(1, Ordering::AcqRel) + 1
+    active_depth_enter()
 }
 
 /// Decrement the global JIT-active counter. Called from the VM crate's
@@ -91,25 +180,19 @@ pub fn enter() -> usize {
 /// release version saturates at 0 so a stray pop never wraps the counter.
 pub fn leave() -> usize {
     LEAVE_COUNT.fetch_add(1, Ordering::Relaxed);
-    let prev = JIT_ACTIVE_DEPTH.fetch_update(Ordering::Release, Ordering::Acquire, |d| {
-        Some(d.saturating_sub(1))
-    });
-    match prev {
-        Ok(p) => p.saturating_sub(1),
-        Err(_) => 0,
-    }
+    active_depth_leave()
 }
 
 /// Returns true if any thread is currently inside a JIT call.
 #[inline]
 pub fn is_active() -> bool {
-    JIT_ACTIVE_DEPTH.load(Ordering::Acquire) > 0
+    active_depth_get() > 0
 }
 
 /// Current depth (mostly useful for tests and JFR diagnostics).
 #[inline]
 pub fn depth() -> usize {
-    JIT_ACTIVE_DEPTH.load(Ordering::Acquire)
+    active_depth_get()
 }
 
 // ---------------------------------------------------------------------------

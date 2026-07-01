@@ -1251,6 +1251,9 @@ impl<'a> NativeContextImpl<'a> {
         if let Some(exc) = self.thread.pending_async_exception {
             snapshot.push(exc);
         }
+        let moving_young_precise_only = crate::jit::conservative_roots::moving_young_enabled()
+            && crate::jit::conservative_roots::refresh_moving_young_coverage_for_current_thread()
+            && !cratonvm_gc::gc_quiescence::moving_young_coverage_incomplete();
 
         // Cross-thread JIT-root hardening — the BLOCKING-deposit counterpart of
         // the identical fold in `interpreter::update_root_snapshot` (the
@@ -1280,10 +1283,12 @@ impl<'a> NativeContextImpl<'a> {
         // ReferenceQueue.remove), false positives are filtered by
         // `is_object_address`, and they can only over-retain (the young sweep
         // runs non-moving while any thread is in JIT, so nothing is relocated).
-        crate::jit::conservative_roots::scan_active_jit_frames(
-            &self.shared.heap,
-            &mut snapshot,
-        );
+        if !moving_young_precise_only {
+            crate::jit::conservative_roots::scan_active_jit_frames(
+                &self.shared.heap,
+                &mut snapshot,
+            );
+        }
         // Shadow-stack precise roots (mirrors the same fold in
         // `update_root_snapshot`): under `CRATONVM_SHADOW_STACK` the moving
         // collector may run with threads in JIT, so a cross-thread STW cycle

@@ -5127,7 +5127,11 @@ mod tests {
 
         // Out-of-band deopt flag → genuine sentinel, peeked non-destructively.
         set_jit_deopt_pending();
-        assert_eq!(jit_dispatch_threw(), 1, "a pending deopt must report 1 (bail)");
+        assert_eq!(
+            jit_dispatch_threw(),
+            1,
+            "a pending deopt must report 1 (bail)"
+        );
         assert_eq!(jit_dispatch_threw(), 1, "the peek must be non-clearing");
         assert!(
             take_jit_deopt_pending(),
@@ -5993,7 +5997,9 @@ pub fn build_helpers() -> JitRuntimeHelpers {
         // the precise gate is on; otherwise leave it 0 so the prologue emits
         // nothing extra. The JIT also gates emission on its own cached flag,
         // but keying the pointer on the same env keeps the default build inert.
-        frame_record: if cratonvm_jit::x64::precise_jit_maps_enabled() {
+        frame_record: if cratonvm_jit::x64::precise_jit_maps_enabled()
+            || cratonvm_jit::x64::moving_young_enabled()
+        {
             // Step 1 self-check: when inline frame-record is active AND the
             // verify knob is on, wire the verify helper here instead — the
             // prologue calls it right after the inline store to assert the

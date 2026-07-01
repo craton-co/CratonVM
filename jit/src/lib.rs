@@ -756,6 +756,9 @@ pub struct OopMapEntry {
     /// well below 32 KiB in the current JIT; a larger frame would fail
     /// the compile-time max_locals check before reaching this code.
     pub frame_slot_offsets: Vec<i16>,
+    /// True only when the moving-young shadow-stack publication for this
+    /// safepoint proved complete enough for relocation under live JIT frames.
+    pub moving_young_coverage_complete: bool,
 }
 
 impl OopMapEntry {
@@ -767,6 +770,7 @@ impl OopMapEntry {
             native_pc_offset,
             bytecode_pc: 0,
             frame_slot_offsets: Vec::new(),
+            moving_young_coverage_complete: false,
         }
     }
 

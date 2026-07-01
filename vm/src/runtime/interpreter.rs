@@ -477,6 +477,7 @@ fn stw_take_over_and_wait(
     // to retire/tail-fill, so the tails would otherwise desync the heap walk).
     // Cleared by the caller after the collection completes.
     if taken.count() > 0 {
+        cratonvm_gc::gc_quiescence::mark_moving_young_coverage_incomplete();
         let regions = shared.thread_registry.collect_reserved_tlab_tails();
         shared.heap.set_jit_tlab_skip_regions(&regions);
     }
@@ -502,6 +503,7 @@ fn maybe_gc(shared: &SharedVm, thread: &mut JvmThread) {
         // mutator.
         shared.heap.flush_thread_satb();
         // Update our root snapshot before requesting STW
+        cratonvm_gc::gc_quiescence::begin_moving_young_coverage_cycle();
         update_root_snapshot(shared, thread);
         mtroots_set_gc_ctx(shared, thread, 2); // 2 = alloc-young (maybe_gc)
         mtroots_dump_initiator(shared, thread, 2);
@@ -767,6 +769,7 @@ fn maybe_gc_forced(shared: &SharedVm, thread: &mut JvmThread) {
     // path is also an initiator path; drain its per-thread SATB buffer
     // before scanning roots.
     shared.heap.flush_thread_satb();
+    cratonvm_gc::gc_quiescence::begin_moving_young_coverage_cycle();
     update_root_snapshot(shared, thread);
     mtroots_set_gc_ctx(shared, thread, 3); // 3 = forced-alloc (maybe_gc_forced)
     mtroots_dump_initiator(shared, thread, 3);
@@ -911,6 +914,7 @@ pub fn force_gc_from_native(shared: &SharedVm, thread: &mut JvmThread) {
     // Round-5 fix (CRIT — UAF): drain this thread's per-thread SATB
     // buffer before initiating GC; see `maybe_gc` for the full rationale.
     shared.heap.flush_thread_satb();
+    cratonvm_gc::gc_quiescence::begin_moving_young_coverage_cycle();
     update_root_snapshot(shared, thread);
     mtroots_set_gc_ctx(shared, thread, 1); // 1 = System.gc
     mtroots_dump_initiator(shared, thread, 1);
@@ -1990,6 +1994,10 @@ pub(crate) fn update_root_snapshot(shared: &SharedVm, thread: &mut JvmThread) {
         snapshot.push(exc);
     }
 
+    let moving_young_precise_only = crate::jit::conservative_roots::moving_young_enabled()
+        && crate::jit::conservative_roots::refresh_moving_young_coverage_for_current_thread()
+        && !cratonvm_gc::gc_quiescence::moving_young_coverage_incomplete();
+
     // Cross-thread JIT-root hardening: also publish the conservative roots of
     // every active JIT frame on THIS thread into the snapshot.
     //
@@ -2011,7 +2019,9 @@ pub(crate) fn update_root_snapshot(shared: &SharedVm, thread: &mut JvmThread) {
     // relocation bug (it reproduces with the young sweep capturing these JIT
     // roots and with the concurrent old-gen collector disabled). See
     // docs/real-raf-segv-root-cause.md.
-    crate::jit::conservative_roots::scan_active_jit_frames(&shared.heap, &mut snapshot);
+    if !moving_young_precise_only {
+        crate::jit::conservative_roots::scan_active_jit_frames(&shared.heap, &mut snapshot);
+    }
 
     // §4 (multi-thread shadow scan, marking half). Also publish THIS thread's
     // shadow-stack precise roots into the snapshot. With `CRATONVM_SHADOW_STACK`
@@ -4094,7 +4104,9 @@ pub fn execute(
                                 .map(|m| m.is_static())
                         })
                         .unwrap_or(false);
-                    let param_oop_mask = if crate::jit::x64::precise_jit_maps_enabled() {
+                    let param_oop_mask = if crate::jit::x64::precise_jit_maps_enabled()
+                        || crate::jit::x64::moving_young_enabled()
+                    {
                         crate::jit::compute_param_oop_mask(method_descriptor, early_is_static)
                     } else {
                         0
@@ -4380,11 +4392,10 @@ pub fn execute(
                             // conservative sweep. Otherwise the walker falls back to
                             // the pure conservative scan. The guard pops on drop so
                             // it's panic-safe.
-                            let _jit_root_guard =
-                                crate::jit::conservative_roots::JitEntryGuard::enter_with_compiled(
+                            let jit_result = {
+                                let _jit_root_guard = crate::jit::conservative_roots::JitEntryGuard::enter_with_compiled(
                                     &compiled,
                                 );
-                            let jit_result = {
                                 let compiled_ref = &compiled;
                                 let args_slice = &jit_args[..jit_count];
                                 let needs_heap = compiled_ref.needs_heap();
@@ -20634,7 +20645,9 @@ fn compile_osr_artifact(
             // Seed it via `compile_with_param_slots` (legacy `&[]`/`0` slot layout,
             // unchanged) so the reload covers oop params too. Gate on the precise-
             // maps flag so the gate-off path stays byte-identical (mask = 0).
-            let param_oop_mask = if crate::jit::x64::precise_jit_maps_enabled() {
+            let param_oop_mask = if crate::jit::x64::precise_jit_maps_enabled()
+                || crate::jit::x64::moving_young_enabled()
+            {
                 crate::jit::compute_param_oop_mask(&method_descriptor, osr_method_is_static)
             } else {
                 0
@@ -20793,28 +20806,30 @@ fn try_osr(
     // Uses the precise-oop-map path when the compiled method has
     // populated maps; falls back to conservative otherwise.
     let _qd0 = cratonvm_gc::gc_quiescence::depth();
-    let _jit_root_guard =
-        crate::jit::conservative_roots::JitEntryGuard::enter_with_compiled(&*compiled);
-
     let vm_ptr = shared as *const _ as i64; // Cast: JIT ABI -- pointer to i64 register
-    let result_i64 = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        // SAFETY: compiled is a finalized JIT CompiledMethod whose entry point was validated; jit_locals match the method's local variable layout at the OSR entry point.
-        unsafe { compiled.osr_enter(vm_ptr, &jit_locals, entry_pc, thread_ptr) }
-    }));
-    // DBG: detect a quiescence LEAK across the OSR call (a nested JIT entry
-    // that did not pop). After osr_enter returns, depth should be back to
-    // _qd0 + 1 (this site's own still-held guard). Anything higher leaked.
-    {
-        let now = cratonvm_gc::gc_quiescence::depth();
-        if now > _qd0 + 1 && std::env::var_os("CRATONVM_DBG_CORRUPT_FRAMES").is_some() {
-            eprintln!(
-                "[quiesce-leak] OSR site leaked: depth before={} after={} (expected {})",
-                _qd0,
-                now,
-                _qd0 + 1
-            );
+    let result_i64 = {
+        let _jit_root_guard =
+            crate::jit::conservative_roots::JitEntryGuard::enter_with_compiled(&*compiled);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            // SAFETY: compiled is a finalized JIT CompiledMethod whose entry point was validated; jit_locals match the method's local variable layout at the OSR entry point.
+            unsafe { compiled.osr_enter(vm_ptr, &jit_locals, entry_pc, thread_ptr) }
+        }));
+        // DBG: detect a quiescence LEAK across the OSR call (a nested JIT entry
+        // that did not pop). Before this site's own guard drops, depth should be
+        // back to _qd0 + 1. Anything higher leaked.
+        {
+            let now = cratonvm_gc::gc_quiescence::depth();
+            if now > _qd0 + 1 && std::env::var_os("CRATONVM_DBG_CORRUPT_FRAMES").is_some() {
+                eprintln!(
+                    "[quiesce-leak] OSR site leaked: depth before={} after={} (expected {})",
+                    _qd0,
+                    now,
+                    _qd0 + 1
+                );
+            }
         }
-    }
+        result
+    };
 
     crate::jit::helpers::restore_jit_thread(saved_jit_thread);
     // Round-9 vm CRIT fix (audit `round9-vm.md` CRIT-2): the previous OSR
@@ -23458,14 +23473,16 @@ fn execute_jit_call(
         // transitively trigger GC via a helper. Push the entry guard
         // so the root scanner can find spill slots in this frame;
         // uses precise oop maps when the compiled method has them.
-        let _jit_root_guard =
-            crate::jit::conservative_roots::JitEntryGuard::enter_with_compiled(&*compiled);
         // SAFETY: compiled is a finalized JIT CompiledMethod whose entry point was validated; args match the method's JVM descriptor.
-        let fast_result: Result<i64, cratonvm_jit::CompileError> = unsafe {
-            if needs_heap {
-                compiled.try_call_with_context(vm_ptr, args_slice)
-            } else {
-                compiled.try_call(args_slice)
+        let fast_result: Result<i64, cratonvm_jit::CompileError> = {
+            let _jit_root_guard =
+                crate::jit::conservative_roots::JitEntryGuard::enter_with_compiled(&*compiled);
+            unsafe {
+                if needs_heap {
+                    compiled.try_call_with_context(vm_ptr, args_slice)
+                } else {
+                    compiled.try_call(args_slice)
+                }
             }
         };
         match fast_result {
@@ -23478,17 +23495,19 @@ fn execute_jit_call(
         }
     } else {
         let saved_jit_thread = crate::jit::helpers::set_jit_thread(thread);
-        let _jit_root_guard =
-            crate::jit::conservative_roots::JitEntryGuard::enter_with_compiled(&*compiled);
-        let jit_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            if needs_heap {
-                // SAFETY: compiled is a finalized JIT CompiledMethod whose entry point was validated; args match the method's JVM descriptor.
-                unsafe { compiled.try_call_with_context(vm_ptr, args_slice) }
-            } else {
-                // SAFETY: compiled is a finalized JIT CompiledMethod whose entry point was validated; args match the method's JVM descriptor.
-                unsafe { compiled.try_call(args_slice) }
-            }
-        }));
+        let jit_result = {
+            let _jit_root_guard =
+                crate::jit::conservative_roots::JitEntryGuard::enter_with_compiled(&*compiled);
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                if needs_heap {
+                    // SAFETY: compiled is a finalized JIT CompiledMethod whose entry point was validated; args match the method's JVM descriptor.
+                    unsafe { compiled.try_call_with_context(vm_ptr, args_slice) }
+                } else {
+                    // SAFETY: compiled is a finalized JIT CompiledMethod whose entry point was validated; args match the method's JVM descriptor.
+                    unsafe { compiled.try_call(args_slice) }
+                }
+            }))
+        };
         crate::jit::helpers::restore_jit_thread(saved_jit_thread);
         // Check for pending Java exception from JIT dispatch callbacks.
         // The JIT-executed method has its own exception table; we must try
@@ -23906,14 +23925,16 @@ fn execute_jit_call_decoded(
 
     // Run the compiled body. Mirrors execute_jit_call's run+exception logic.
     let result = if !compiled.has_dispatch {
-        let _jit_root_guard =
-            crate::jit::conservative_roots::JitEntryGuard::enter_with_compiled(&*compiled);
         // SAFETY: compiled is a finalized JIT CompiledMethod with a validated entry; args match its JVM descriptor (receiver-aware).
-        let fast_result: Result<i64, cratonvm_jit::CompileError> = unsafe {
-            if needs_heap {
-                compiled.try_call_with_context(vm_ptr, args_jit)
-            } else {
-                compiled.try_call(args_jit)
+        let fast_result: Result<i64, cratonvm_jit::CompileError> = {
+            let _jit_root_guard =
+                crate::jit::conservative_roots::JitEntryGuard::enter_with_compiled(&*compiled);
+            unsafe {
+                if needs_heap {
+                    compiled.try_call_with_context(vm_ptr, args_jit)
+                } else {
+                    compiled.try_call(args_jit)
+                }
             }
         };
         match fast_result {
@@ -23926,18 +23947,20 @@ fn execute_jit_call_decoded(
         }
     } else {
         let saved_jit_thread = crate::jit::helpers::set_jit_thread(thread);
-        let _jit_root_guard =
-            crate::jit::conservative_roots::JitEntryGuard::enter_with_compiled(&*compiled);
-        let jit_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            // SAFETY: see the fast-path SAFETY note above.
-            unsafe {
-                if needs_heap {
-                    compiled.try_call_with_context(vm_ptr, args_jit)
-                } else {
-                    compiled.try_call(args_jit)
+        let jit_result = {
+            let _jit_root_guard =
+                crate::jit::conservative_roots::JitEntryGuard::enter_with_compiled(&*compiled);
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                // SAFETY: see the fast-path SAFETY note above.
+                unsafe {
+                    if needs_heap {
+                        compiled.try_call_with_context(vm_ptr, args_jit)
+                    } else {
+                        compiled.try_call(args_jit)
+                    }
                 }
-            }
-        }));
+            }))
+        };
         crate::jit::helpers::restore_jit_thread(saved_jit_thread);
         if let Some(exc) = crate::jit::helpers::take_jit_pending_exception() {
             // Clear the out-of-band deopt signal (MEDIUM `i64::MIN`-collision
