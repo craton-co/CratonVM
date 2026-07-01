@@ -8,6 +8,14 @@
 | **Severity** | medium (CratonVM-only; pre-existing — fails identically at baseline `b0aab8f9`). Same class as SBR-14 / SC-custom-classloader isolation residuals. |
 | **Discovered** | 2026-06-24, triaging the Hibernate suite residuals after the collection-delegation stack-overflow fix (`7b224d8a`). |
 
+> **RETRY 2026-07-01:** Re-ran the focused builtin-loader reverse-pollution coverage on
+> current `dev`: `cargo test -p cratonvm-native-builtins test_builtin_find_loaded_class -- --nocapture`
+> passed both cases (`hides_user_namespace_hit`, `keeps_application_namespace_hit`). A broader
+> `cratonvm-vm` custom-loader test build did not reach execution because MSVC link failed with
+> insufficient disk space while producing debug test binaries. The gitignored Hibernate app
+> fixture is not present in this worktree, so `ProxyClassReuseTest` / BeanShell app-level reruns
+> were not retried here.
+
 ## Fix (2026-06-24) — gated, three interacting layers
 
 Triage (via `.scratch-loader/probe/IsoProbe.java` + `IsoProbe2.java` + `LoadProbe.java`)
@@ -176,9 +184,9 @@ user-loader namespace hits (`loader_id > 2`) returned by the flat global lookup,
 while preserving Application-namespace classes that merely record a user-defined
 defining loader. Focused verification:
 `cargo test -p cratonvm-native-builtins test_builtin_find_loaded_class -- --nocapture`
-passes the new "hide user namespace" and "keep application namespace" cases. Full
-Spring BeanShell / Hibernate app repros were not rerun in this session, so this
-document remains in `docs/known-issues`.
+passes the new "hide user namespace" and "keep application namespace" cases (re-run
+2026-07-01). Full Spring BeanShell / Hibernate app repros were not rerun in this
+session, so this document remains in `docs/known-issues`.
 
 ## Impact
 

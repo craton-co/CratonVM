@@ -6,6 +6,15 @@
 > `getDeclaredMethod`-on-null surfaced in any annotation-cluster class. Consistent with the
 > "cross-family cascade, needs suite-level bisection" diagnosis below — not a single reflection-null.
 
+> **RETRY 2026-07-01:** Rebuilt the tracked standalone probe
+> `docs/known-issues/repros/bug06-fam5-reflection-null/Refl5.java` with JDK 25 and ran it on
+> HotSpot plus the current `dev` CratonVM binary
+> (`C:\craton\CratonVM\target\release\cratonvm.exe`, timestamp 2026-07-01 01:30). The
+> reflection output still matches exactly through `DONE`; CratonVM only appends its normal
+> watchdog/VM-exit diagnostics. No standalone reproduction was recovered. Keep this open
+> only for suite-level per-test attribution of the original `getDeclaredMethod`-on-null
+> aggregate.
+
 **Severity:** Medium — CV-unique reflection mismatch in the Spring suite assertion tail.
 **Status:** 🟡 PARTIAL (audit 2026-06-19) — the one clean family-5 reflection-null is **FIXED**: lambda/method-ref `getGenericSuperclass` now returns `Object` not `null` (`9d0974cf`, default path; `lang_class.rs` lambda guard). Residual **OPEN**: the headline `getDeclaredMethod`-on-null ×28 is a cross-family **cascade** (bug-04 GC + bug-05 generics + synthetic-type gaps), not a single reflection-null; per-test attribution never completed. Refl5/Refl6/BridgeProbe/SpringFam5 are byte-identical to HotSpot. Handoff / needs suite-level bisection.
 **Mode:** Interpreter (JIT-off); the null comes from a native, not codegen.

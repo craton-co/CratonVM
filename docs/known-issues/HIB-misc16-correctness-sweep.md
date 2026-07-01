@@ -15,6 +15,16 @@ the rest of misc16; `LhmEvictProbe` + non-overriding-LHM-subclass +
 completed this run (40/44, 4 failed — matches the HotSpot slowness/shared-failure
 pattern, see §15–16).
 
+**Retry (2026-07-01, non-GC/JIT pass):** focused unit coverage for the native-registry
+slowness mitigations still passes on current `dev`:
+`cargo test -p cratonvm-native-api method_descriptor_prefilter -- --nocapture`
+(2/2) and
+`cargo test -p cratonvm-native-api hash_single_scan_preserves_legacy_keys -- --nocapture`
+(1/1). The full Hibernate `FunctionTests` / `StandardFunctionTests` rerun was not
+available from the separate worktree because `apps/` is gitignored there; a broader
+`cratonvm-vm` test build also failed before execution with MSVC linker disk-space
+errors. Keep §15–16 open until the app-level timing rerun is completed.
+
 Run the sweep:
 ```
 cd C:/craton/CratonVM/apps/hib-suite-runner
@@ -507,4 +517,6 @@ native-override guard, and `populate_virtual_invoke_cache`. Positive or
 descriptor-quirk cases still run the existing class-sensitive lookup logic, so
 native override priority and descriptor compatibility behavior are unchanged.
 The full Hibernate `FunctionTests` / `StandardFunctionTests` rerun is still
-outstanding, so keep this slowness cluster open.
+outstanding, so keep this slowness cluster open. Focused prefilter and hash-key
+regressions were re-run green on 2026-07-01; app-level timing remains the missing
+acceptance signal.

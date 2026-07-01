@@ -6,6 +6,16 @@
 | **Area** | VM core — real-JDK-mode loader-faithful resolution: superclass/interface *linking* (not just `new`/checkcast/ldc), `invokespecial` owner dispatch, and link-time verification of trusted runtime-generated classes. |
 | **Builds on** | [hib-proxyclassreuse-loader-blind-class-resolution.md](../../known-issues/hib-proxyclassreuse-loader-blind-class-resolution.md) — the three-layer `CONSTANT_Class` / `defineClass`-namespace / `findLoadedClass` fix and the `resolve_class_loader_aware` mechanism. |
 
+> **RETRY 2026-07-01:** Source audit on current `dev` confirms the named loader-aware pieces
+> are present (`allocate_loader_id` starts at 3, `lambda_impl_dispatch_override` is wired,
+> lookup-defined classes register their defining loader, and builtin `findLoadedClass` hides
+> user namespaces). The focused builtin classloader test passed via
+> `cargo test -p cratonvm-native-builtins test_builtin_find_loaded_class -- --nocapture`.
+> A broader `cratonvm-vm` loader test build failed before execution because the linker ran out
+> of disk space, and the Hibernate app fixture is gitignored outside this worktree. This file
+> remains archived; any remaining lazy/lazytoone residual should be tracked in a separate
+> `docs/known-issues` entry if reproduced.
+
 ## Context
 
 `org.hibernate.orm.test.bytecode.enhancement.*` tests load the test + entity classes
