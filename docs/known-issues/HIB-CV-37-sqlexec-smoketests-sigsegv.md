@@ -77,7 +77,10 @@ pin/re-read pattern to `LinkedHashMap.forEach`, `ArrayDeque.forEach`, `TreeMap.f
 `TreeSet.forEach`, both registered `ConcurrentHashMap.forEach` forms, and
 `Collections$UnmodifiableList$ListItr.forEachRemaining`. New mock moving-GC regressions cover
 `LinkedHashMap.forEach` and `TreeMap.forEach`. This narrows the HIB-CV-37 #1 native-callback GC
-surface, but the full `SmokeTests.testQueryConcurrency` repro has not yet been re-run, so this doc
+surface. A later same-day sweep also covered the HashMap functional helpers (`computeIfAbsent`,
+`compute`, `computeIfPresent`, `merge`, `replaceAll`) plus TreeMap `computeIfAbsent` / `merge`; the
+ConcurrentHashMap `compute`, `merge`, and `replaceAll` wrappers flow through those HashMap helpers after
+segment selection. The full `SmokeTests.testQueryConcurrency` repro has not yet been re-run, so this doc
 stays in `docs/known-issues`.
 
 ### #2 DynamicBatchFetchTest — confirmed separate, non-crash, single-threaded

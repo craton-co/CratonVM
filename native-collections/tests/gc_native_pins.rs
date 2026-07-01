@@ -6,13 +6,15 @@
 mod common;
 
 use common::{
-    boxed_int, build_registry, call, new_arraylist, new_linked_hashmap, new_treemap, MockCtx,
+    boxed_int, build_registry, call, new_arraylist, new_hashmap, new_linked_hashmap, new_treemap,
+    MockCtx,
 };
 use cratonvm_native_api::NativeContext;
 use cratonvm_types::Value;
 
 const STREAM: &str = "java/util/stream/Stream";
 const AL: &str = "java/util/ArrayList";
+const HM: &str = "java/util/HashMap";
 const LHM: &str = "java/util/LinkedHashMap";
 const TM: &str = "java/util/TreeMap";
 
@@ -204,6 +206,58 @@ fn treemap_for_each_reads_forwarded_action_and_pairs() {
         log[1].0,
         action.as_ptr() as usize,
         "BiConsumer must be re-read from its native pin after callback GC"
+    );
+    assert_ne!(
+        log[1].3[0], k2,
+        "second key must be re-read from its native pin after callback GC"
+    );
+    assert_ne!(
+        log[1].3[1], v2,
+        "second value must be re-read from its native pin after callback GC"
+    );
+}
+
+#[test]
+fn hashmap_replace_all_reads_forwarded_function_and_entries() {
+    let reg = build_registry();
+    let mut ctx = MockCtx::new();
+    let hm = new_hashmap(&reg, &mut ctx);
+    let k1 = boxed_int(&mut ctx, 1);
+    let v1 = object_value(&mut ctx, 701);
+    let k2 = boxed_int(&mut ctx, 2);
+    let v2 = object_value(&mut ctx, 702);
+    let function = ctx.alloc_object_simple(703);
+
+    for (k, v) in [(k1, v1), (k2, v2)] {
+        call(
+            &reg,
+            &mut ctx,
+            HM,
+            "put",
+            "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+            &[Value::Object(Some(hm)), k, v],
+        )
+        .unwrap();
+    }
+
+    ctx.set_relocate_pins_on_invoke(true);
+    call(
+        &reg,
+        &mut ctx,
+        HM,
+        "replaceAll",
+        "(Ljava/util/function/BiFunction;)V",
+        &[Value::Object(Some(hm)), Value::Object(Some(function))],
+    )
+    .unwrap();
+
+    let log = ctx.invoke_virtual_log();
+    assert_eq!(log.len(), 2, "HashMap.replaceAll should visit two entries");
+    assert_eq!(log[0].0, function.as_ptr() as usize);
+    assert_ne!(
+        log[1].0,
+        function.as_ptr() as usize,
+        "BiFunction must be re-read from its native pin after callback GC"
     );
     assert_ne!(
         log[1].3[0], k2,
