@@ -1,7 +1,7 @@
-# Repro classes for the remaining (open) known-issue bugs
+# Archived repro classes from fixed and investigated known issues
 
-Easy-access, tracked copies of the standalone reproducers for the **open** bugs in
-`docs/known-issues/`. Previously these lived only in gitignored locations
+Easy-access, tracked copies of standalone reproducers archived from
+`docs/known-issues/` and prior investigation notes. Previously these lived only in gitignored locations
 (`wildfly-suite/`, `spring-suite/`, `scratch/`, `apps/*/.cratonvm-suite/`) and were
 at risk of being lost. The bugs span **Wildfly, Kafka, Hibernate, Elasticsearch,
 Keycloak and Spring** — not Spring-only.
@@ -17,7 +17,7 @@ $CV --java-home "$JDK" -cp <dir> <Repro>  # CratonVM (reproduces the gap)
 
 | Bug doc | Repro here | How to trigger / expected |
 |---|---|---|
-| `reflrepro-…` (**A2**) | `A2-reflrepro/ReflRepro.java` | `CRATONVM_DBG_GC_STRESS=65536 $CV … -cp A2-reflrepro ReflRepro 8000` → **rc=139** (UAF). `--nojit` clean. |
+| `reflrepro-…` (**A2**, fixed) | `A2-reflrepro/ReflRepro.java` | ✅ **NOW PASSES on dev** (re-run 2026-06-29: `CRATONVM_DBG_GC_STRESS=65536 $CV … -cp A2-reflrepro ReflRepro 8000` → `ok=8000 bad=0 rc=0`). Was: rc=139 UAF from GC free-list double-serve. |
 | `fork6-…` (**A4**) | `A4-fork6/Fork6.java` | `CRATONVM_REAL_FORKJOINPOOL=1 CRATONVM_DISABLE_DEFAULT_WATCHDOG=1 $CV … Fork6` → NPE/CCE in workers (~rep 4). HotSpot/`--nojit`/`-Xmx8g` print `ALL-OK`. |
 | `spring-bug-08-…` | `spring-bug-08-proxy-serialization/ProxySer.java` | serialize→deserialize a `Serializable` JDK proxy → **`UnsatisfiedLinkError: Module.defineModule0`** on deserialize. HotSpot `RESULT=OK`. |
 | `keycloak-15-…` | `keycloak-15-path-root/PathRoot.java` | `Paths.get("C:\\foo\\bar")` → `getRoot()=null`, `nameCount=3` (HotSpot `C:\`, 2). |
