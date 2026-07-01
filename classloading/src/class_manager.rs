@@ -145,6 +145,20 @@ fn loader_aware_resolution() -> bool {
 /// so a benign top-level class such as `javax/Foo` or a user package like
 /// `javaland/Foo` is not falsely rejected.
 fn is_prohibited_package_name(internal_name: &str) -> bool {
+    // Exemption: `sun.reflect.misc.MethodUtil` is a JDK-internal reflection
+    // helper (a `SecureClassLoader` subclass in `java.base`) whose sole job is
+    // to `defineClass` a companion `sun.reflect.misc.Trampoline` into its own
+    // `sun.reflect.misc` package and invoke target methods through it. The JDK
+    // reaches this path from `javax.management` (`RequiredModelMBean` /
+    // `StandardMBean` reflective attribute + operation dispatch), so blocking
+    // it breaks real-JDK JMX. HotSpot's `ClassLoader.preDefineClass` actually
+    // only rejects the `java.*` prefix for non-platform loaders — it does NOT
+    // reject `sun.*` here (package encapsulation is enforced elsewhere), so
+    // this Trampoline define is legitimate. Exempt exactly that package so the
+    // broader `sun/**` spoofing guard below still stands.
+    if internal_name.starts_with("sun/reflect/misc/") {
+        return false;
+    }
     const PROHIBITED_PREFIXES: [&str; 3] = ["java", "jdk/internal", "sun"];
     for prefix in PROHIBITED_PREFIXES {
         if let Some(rest) = internal_name.strip_prefix(prefix) {

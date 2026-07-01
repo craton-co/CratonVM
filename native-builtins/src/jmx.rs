@@ -63,7 +63,19 @@ pub fn register_jmx_natives(r: &mut NativeMethodRegistry) {
     register_operating_system_mxbean(r);
     register_compilation_mxbean(r);
     register_gc_mxbean(r);
-    register_mbean_server(r);
+    // NOTE: `register_mbean_server` is intentionally NOT called here. The
+    // synthetic in-process MBeanServer (built on the *interface*
+    // `javax/management/MBeanServer`) is only correct in pure-synthetic-JDK
+    // mode, where there is no real `java.management` module. In real-JDK mode
+    // it shadows the real JDK's concrete `com.sun.jmx.mbeanserver.JmxMBeanServer`
+    // (via the `MBeanServerFactory.createMBeanServer` override) and its
+    // interface-only receiver makes every un-overridden MBeanServer method
+    // (e.g. `addNotificationListener`) throw `AbstractMethodError: ... has no
+    // Code attribute` — exactly the failure the `getPlatformMBeanServer`
+    // KAFKA-MBEAN note (below) already avoids. `register_builtins`
+    // (pure-synthetic mode only) calls `register_mbean_server` explicitly; the
+    // real-JDK boot paths deliberately skip it so real `javax.management`
+    // bytecode runs end-to-end.
     register_vm_management_impl(r);
     r.set_category(__prev_cat);
 }
@@ -2177,7 +2189,7 @@ fn mbs_lookup_bean_at(ctx: &dyn NativeContext, server: ObjectRef, i: usize) -> O
     }
 }
 
-fn register_mbean_server(r: &mut NativeMethodRegistry) {
+pub fn register_mbean_server(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
     let cls = "javax/management/MBeanServer";
