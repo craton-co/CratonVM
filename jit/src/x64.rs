@@ -15537,6 +15537,29 @@ impl Compiler {
                     }
                 }
             }
+            // Reclaim spill slots at every instruction boundary. Each pre-call
+            // flush (`flush_scratch_registers`) spills live operand-stack values
+            // to fresh frame slots via `next_spill_offset += 8` and never rolls
+            // that cursor back once the operands are consumed. Individual
+            // stack-consuming handlers (invoke/switch/athrow/…) call
+            // `reset_spills()` themselves, but a straight-line basic block full
+            // of flush-bearing ops that DON'T (e.g. a long `putfield` run such
+            // as `Token.copyTo`'s ~25 field stores, each emitting a
+            // `jit_putfield_object` write-barrier CALL → flush) leaks one slot
+            // per op. With `spill_size == max_stack*8` that cursor eventually
+            // marches past the reserved spill region and into the callee-saved
+            // GPR save area (`callee_saved_base`), overwriting the CALLER's
+            // saved R12/R13. The epilogue then restores garbage into the
+            // caller's callee-saved registers — e.g. HSQLDB's `Token.duplicate`
+            // (which holds the freshly-`new`ed Token in a callee-saved local
+            // across the `copyTo` call) returned null, breaking every embedded
+            // in-memory database open after warm-up. `reset_spills` only lowers
+            // the allocation cursor to just past the highest LIVE frame slot, so
+            // it never disturbs a live value — it just recycles the dead scratch
+            // slots the previous instruction left behind.
+            if !dead {
+                self.reset_spills();
+            }
             // OSR soundness: record the pre-hoist native position as the OSR
             // entry for this PC. The LICM preheaders emitted just below
             // initialise hoist spill slots that the rewritten in-loop loads

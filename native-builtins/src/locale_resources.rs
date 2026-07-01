@@ -1020,6 +1020,124 @@ fn rb_contains_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     )
 }
 
+// java.time text-name support (DateTimeTextProvider path).
+//
+// `java.time.format.DateTimeFormatterBuilder` text fields (`EEE`/`MMM`/`a`/`G`)
+// resolve their localized strings through
+// `java.time.format.DateTimeTextProvider.createStore`, which asks
+// `sun.util.locale.provider.CalendarDataUtility.retrieveJavaTimeFieldValueNames`
+// (plural → `Map<name,value>`) and, for narrow month/day whose names collapse
+// in a Map, `retrieveJavaTimeFieldValueName` (singular). Both walk the
+// `jdk.localedata` class-based CLDR bundles CratonVM doesn't surface, so they
+// return null/empty and the formatter falls back to the raw NUMERIC value —
+// e.g. Spring's RFC-1123 `HttpHeaders` date formatter (built with `Locale.US`)
+// renders "4, 18 12 2008 …" instead of "Thu, 18 Dec 2008 …". We answer these
+// two statics directly from the en/US CLDR name tables, mirroring the
+// `FormatData` / `getDateTimePattern` overrides in this file. Only English
+// (and the root locale) is served; other languages return null so the
+// formatter keeps its existing numeric fallback rather than showing English.
+
+// java.util.Calendar field constants.
+const CAL_ERA: i32 = 0;
+const CAL_MONTH: i32 = 2;
+const CAL_DAY_OF_WEEK: i32 = 7;
+const CAL_AM_PM: i32 = 9;
+// java.util.Calendar.STANDALONE_MASK — English standalone names equal the
+// format names, so we fold it away before selecting a style.
+const CAL_STANDALONE_MASK: i32 = 0x8000;
+// Calendar text-style bases (after masking off STANDALONE): SHORT_FORMAT=1,
+// LONG_FORMAT=2, NARROW_FORMAT=4. ALL_STYLES=0 is not modelled.
+const CAL_STYLE_SHORT: i32 = 1;
+const CAL_STYLE_LONG: i32 = 2;
+const CAL_STYLE_NARROW: i32 = 4;
+
+fn int_arg(args: &[Value], i: usize) -> i32 {
+    match args.get(i) {
+        Some(Value::Int(n)) => *n,
+        _ => -1,
+    }
+}
+
+/// True when the `Locale` argument is English or the root/empty locale — the
+/// only families our hardcoded en/US CLDR names are valid for. A missing
+/// locale is treated as English (the JDK default the Spring suite runs under).
+fn locale_is_english(ctx: &mut dyn NativeContext, arg: Option<&Value>) -> bool {
+    match arg {
+        Some(Value::Object(Some(loc))) => match ctx.invoke_virtual(
+            *loc,
+            "getLanguage",
+            "()Ljava/lang/String;",
+            &[],
+        ) {
+            Ok(Some(Value::Object(Some(s)))) => {
+                let lang = ctx.read_string(s).unwrap_or_default();
+                lang.is_empty() || lang == "en"
+            }
+            _ => true,
+        },
+        _ => true,
+    }
+}
+
+/// English CLDR display names for a `gregory` Calendar field at a given style,
+/// returned as `(name, Calendar field value)` pairs in field-value order.
+/// `None` for fields/styles we don't model (e.g. `ALL_STYLES`). The Calendar
+/// values follow the JDK convention: `MONTH` JANUARY=0..DECEMBER=11,
+/// `DAY_OF_WEEK` SUNDAY=1..SATURDAY=7, `ERA` BC=0/AD=1, `AM_PM` AM=0/PM=1 —
+/// exactly what `DateTimeTextProvider.createStore` re-keys.
+fn en_calendar_field_names(field: i32, style: i32) -> Option<Vec<(&'static str, i32)>> {
+    let base = style & !CAL_STANDALONE_MASK;
+    match field {
+        CAL_MONTH => {
+            let names: &[&str; 12] = match base {
+                CAL_STYLE_LONG => &[
+                    "January", "February", "March", "April", "May", "June", "July", "August",
+                    "September", "October", "November", "December",
+                ],
+                CAL_STYLE_SHORT => &[
+                    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov",
+                    "Dec",
+                ],
+                CAL_STYLE_NARROW => {
+                    &["J", "F", "M", "A", "M", "J", "J", "A", "S", "O", "N", "D"]
+                }
+                _ => return None,
+            };
+            Some((0..12).map(|i| (names[i as usize], i)).collect())
+        }
+        CAL_DAY_OF_WEEK => {
+            // Index 0 = Sunday; Calendar value = index + 1 (SUNDAY=1).
+            let names: &[&str; 7] = match base {
+                CAL_STYLE_LONG => &[
+                    "Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday",
+                ],
+                CAL_STYLE_SHORT => &["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"],
+                CAL_STYLE_NARROW => &["S", "M", "T", "W", "T", "F", "S"],
+                _ => return None,
+            };
+            Some((0..7).map(|i| (names[i as usize], i + 1)).collect())
+        }
+        CAL_ERA => {
+            let names: &[&str; 2] = match base {
+                CAL_STYLE_LONG => &["Before Christ", "Anno Domini"],
+                CAL_STYLE_SHORT => &["BC", "AD"],
+                CAL_STYLE_NARROW => &["B", "A"],
+                _ => return None,
+            };
+            Some(vec![(names[0], 0), (names[1], 1)])
+        }
+        CAL_AM_PM => {
+            let names: &[&str; 2] = match base {
+                CAL_STYLE_NARROW => &["a", "p"],
+                CAL_STYLE_SHORT | CAL_STYLE_LONG => &["AM", "PM"],
+                _ => return None,
+            };
+            Some(vec![(names[0], 0), (names[1], 1)])
+        }
+        _ => None,
+    }
+}
+
 pub fn register(registry: &mut NativeMethodRegistry) {
     let __prev_cat = registry.current_category();
     registry.set_category(cratonvm_native_api::NativeKind::Bridge);
@@ -1518,5 +1636,188 @@ pub fn register(registry: &mut NativeMethodRegistry) {
         },
     );
 
+    // sun.util.locale.provider.CalendarDataUtility.retrieveJavaTimeFieldValueNames(
+    //     String id, int field, int style, Locale locale) -> Map<String,Integer>
+    // The java.time text-name entry point (see the module note above). Build a
+    // real java.util.HashMap of name -> Calendar-value so the downstream
+    // real-JDK `DateTimeTextProvider.createStore` bytecode can iterate its
+    // `entrySet()` unchanged. Serve only the `gregory` calendar in English;
+    // everything else returns null (numeric fallback), matching HotSpot for
+    // the locales the suite exercises.
+    registry.register(
+        "sun/util/locale/provider/CalendarDataUtility",
+        "retrieveJavaTimeFieldValueNames",
+        "(Ljava/lang/String;IILjava/util/Locale;)Ljava/util/Map;",
+        |ctx, args| {
+            if !calendar_id_is_gregorian(ctx, args.first()) || !locale_is_english(ctx, args.get(3))
+            {
+                return Ok(Some(Value::Object(None)));
+            }
+            let field = int_arg(args, 1);
+            let style = int_arg(args, 2);
+            // Narrow month/day names have duplicates ("J"/"J"/"J", "S"/"S")
+            // that a Map<String,Integer> would collapse; DateTimeTextProvider
+            // handles those via the singular per-value lookup below, so return
+            // null here to steer it there.
+            let base = style & !CAL_STANDALONE_MASK;
+            if base == CAL_STYLE_NARROW && (field == CAL_MONTH || field == CAL_DAY_OF_WEEK) {
+                return Ok(Some(Value::Object(None)));
+            }
+            let entries = match en_calendar_field_names(field, style) {
+                Some(e) => e,
+                None => return Ok(Some(Value::Object(None))),
+            };
+            let map = match ctx.new_object_initialized("java/util/HashMap", "()V", &[])? {
+                Some(Value::Object(Some(m))) => m,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            for (name, val) in entries {
+                let k = ctx.create_string(name);
+                let boxed = ctx
+                    .invoke(
+                        "java/lang/Integer",
+                        "valueOf",
+                        "(I)Ljava/lang/Integer;",
+                        &[Value::Int(val)],
+                    )?
+                    .unwrap_or(Value::Object(None));
+                ctx.invoke_virtual(
+                    map,
+                    "put",
+                    "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+                    &[Value::Object(Some(k)), boxed],
+                )?;
+            }
+            Ok(Some(Value::Object(Some(map))))
+        },
+    );
+
+    // sun.util.locale.provider.CalendarDataUtility.retrieveJavaTimeFieldValueName(
+    //     String id, int field, int value, int style, Locale locale) -> String
+    // Singular sibling of the above — used by `DateTimeTextProvider` for narrow
+    // month/day (and as a fallback for any other style whose plural map came
+    // back null). Returns the single English CLDR name for the requested
+    // Calendar field value.
+    registry.register(
+        "sun/util/locale/provider/CalendarDataUtility",
+        "retrieveJavaTimeFieldValueName",
+        "(Ljava/lang/String;IIILjava/util/Locale;)Ljava/lang/String;",
+        |ctx, args| {
+            if !calendar_id_is_gregorian(ctx, args.first()) || !locale_is_english(ctx, args.get(4))
+            {
+                return Ok(Some(Value::Object(None)));
+            }
+            let field = int_arg(args, 1);
+            let value = int_arg(args, 2);
+            let style = int_arg(args, 3);
+            let entries = match en_calendar_field_names(field, style) {
+                Some(e) => e,
+                None => return Ok(Some(Value::Object(None))),
+            };
+            for (name, val) in entries {
+                if val == value {
+                    let s = ctx.create_string(name);
+                    return Ok(Some(Value::Object(Some(s))));
+                }
+            }
+            Ok(Some(Value::Object(None)))
+        },
+    );
+
+    // java.text.Normalizer.normalize / isNormalized — real Unicode normalization
+    // via the `unicode-normalization` crate.
+    //
+    // The real-JDK bodies drive `sun.text.normalizer` off ICU normalization
+    // tables that CratonVM's jimage path does not surface, so in real-JDK mode
+    // they return garbage (e.g. `normalize("ï", NFD)` yields six U+0226 chars),
+    // breaking Spring `ContentDisposition.transliterateToAscii` (which NFD-
+    // decomposes accented filename chars). These natives are ALSO registered by
+    // `phases_late::register_p61_text_formatting`, but that runs only in
+    // synthetic-JDK mode (`register_synthetic_overrides`); the real-JDK boot
+    // path registers only `register_essential_natives` (this function), so the
+    // Normalizer natives must be surfaced here too. Companion force-native gate:
+    // `interpreter.rs::force_native_over_real_jdk_bytecode` /
+    // `vm_exec.rs` `check_override` pin these over the broken JDK bytecode.
+    registry.register(
+        "java/text/Normalizer",
+        "normalize",
+        "(Ljava/lang/CharSequence;Ljava/text/Normalizer$Form;)Ljava/lang/String;",
+        |ctx, args| {
+            use unicode_normalization::UnicodeNormalization;
+            let input = match args.first() {
+                Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            // java.text.Normalizer.Form ordinals: NFD=0, NFC=1, NFKD=2, NFKC=3
+            // (declaration order in the JDK enum — NOT alphabetical).
+            let form_ordinal = normalizer_form_ordinal(ctx, args.get(1));
+            let normalized = match form_ordinal {
+                0 => input.nfd().collect::<String>(),  // NFD
+                1 => input.nfc().collect::<String>(),  // NFC
+                2 => input.nfkd().collect::<String>(), // NFKD
+                3 => input.nfkc().collect::<String>(), // NFKC
+                _ => input,
+            };
+            let s = ctx.create_string(&normalized);
+            Ok(Some(Value::Object(Some(s))))
+        },
+    );
+    registry.register(
+        "java/text/Normalizer",
+        "isNormalized",
+        "(Ljava/lang/CharSequence;Ljava/text/Normalizer$Form;)Z",
+        |ctx, args| {
+            use unicode_normalization::{
+                is_nfc_quick, is_nfd_quick, is_nfkc_quick, is_nfkd_quick, IsNormalized,
+            };
+            let input = match args.first() {
+                Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+                _ => return Ok(Some(Value::Int(1))),
+            };
+            // Form ordinals: NFD=0, NFC=1, NFKD=2, NFKC=3 (JDK enum order).
+            let form_ordinal = normalizer_form_ordinal(ctx, args.get(1));
+            let normalized = match form_ordinal {
+                0 => is_nfd_quick(input.chars()) == IsNormalized::Yes,
+                1 => is_nfc_quick(input.chars()) == IsNormalized::Yes,
+                2 => is_nfkd_quick(input.chars()) == IsNormalized::Yes,
+                3 => is_nfkc_quick(input.chars()) == IsNormalized::Yes,
+                _ => true,
+            };
+            Ok(Some(Value::Int(if normalized { 1 } else { 0 })))
+        },
+    );
+
     registry.set_category(__prev_cat);
+}
+
+/// Read a `java.text.Normalizer.Form` enum argument's ordinal (NFC=0, NFD=1,
+/// NFKC=2, NFKD=3) via `Enum.ordinal()`. The virtual call works for both the
+/// real-JDK `Form` enum (Enum layout: `name` at field 0, `ordinal` at field 1)
+/// and the synthetic one — reading field 0 as an int would pick up the `name`
+/// String reference and always yield 0 (NFC). Defaults to 0 (NFC) when the
+/// argument is null or the call fails.
+fn normalizer_form_ordinal(ctx: &mut dyn NativeContext, form: Option<&Value>) -> i32 {
+    match form {
+        Some(Value::Object(Some(f))) => ctx
+            .invoke_virtual(*f, "ordinal", "()I", &[])
+            .ok()
+            .flatten()
+            .and_then(|v| v.as_int())
+            .unwrap_or(0),
+        _ => 0,
+    }
+}
+
+/// True when the calendar-type id argument denotes the Gregorian/ISO calendar
+/// (`DateTimeTextProvider` always passes `"gregory"`). Non-Gregorian ids
+/// (`japanese`, `buddhist`, …) return false so their own providers keep
+/// running — we must not answer them with Gregorian names.
+fn calendar_id_is_gregorian(ctx: &mut dyn NativeContext, arg: Option<&Value>) -> bool {
+    match arg {
+        Some(Value::Object(Some(s))) => {
+            let id = ctx.read_string(*s).unwrap_or_default();
+            id.eq_ignore_ascii_case("gregory") || id.eq_ignore_ascii_case("iso8601")
+        }
+        _ => false,
+    }
 }

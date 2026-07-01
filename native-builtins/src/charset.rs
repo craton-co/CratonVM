@@ -319,14 +319,15 @@ pub fn encode_with_charset(ctx: &dyn NativeContext, charset: ObjectRef, chars: &
 
 /// Returns `true` when `canon` (a name already produced by
 /// `normalize_charset_name`) is a charset the transcoding engine can
-/// actually decode/encode. A name like `"Shift_JIS"` normalizes cleanly
-/// yet the engine does not implement it, so the lossy helpers would
-/// silently fall back to Latin-1; this probe lets the name-taking native
-/// methods surface an unsupported-charset error instead.
+/// actually decode/encode. A name like `"KOI8-U"` normalizes cleanly yet the
+/// engine does not implement it, so the lossy helpers would silently fall back
+/// to Latin-1; this probe lets the name-taking native methods surface an
+/// unsupported-charset error instead. (Legacy CJK names such as `"Shift_JIS"`
+/// ARE implemented — via encoding_rs — and so report supported.)
 ///
-/// Probing with an empty input slice short-circuits in the engine's
-/// charset-name `match` (the `_ => Err(UnsupportedCharset)` arm fires
-/// before any byte/char is examined), so this does no transcoding work.
+/// Probing with an empty input slice does no real transcoding work: an
+/// unsupported name hits the engine's `UnsupportedCharset` arm immediately,
+/// and a supported one decodes the empty slice to an empty result.
 pub(crate) fn engine_supports(canon: &str) -> bool {
     !matches!(
         engine::decode_bytes(canon, &[]),
@@ -1233,13 +1234,25 @@ mod tests {
 
     #[test]
     fn engine_supports_rejects_unimplemented_canonical_name() {
-        // `normalize_charset_name` canonicalizes "Shift_JIS" successfully, but
-        // the transcoding engine has no Shift_JIS coder — the name-path natives
-        // must surface an unsupported-charset error rather than fall back to
-        // a lossy Latin-1 encode.
-        assert_eq!(normalize_charset_name("Shift_JIS"), "Shift_JIS");
-        assert!(!engine_supports("Shift_JIS"));
-        assert!(!engine_supports("EUC-JP"));
+        // `normalize_charset_name` canonicalizes "KOI8-U" successfully, but the
+        // transcoding engine has no KOI8-U coder — the name-path natives must
+        // surface an unsupported-charset error rather than fall back to a lossy
+        // Latin-1 encode. (Shift_JIS / EUC-JP are now handled via encoding_rs;
+        // see `shift_jis_decodes_via_encoding_rs`.)
+        assert_eq!(normalize_charset_name("KOI8-U"), "KOI8-U");
+        assert!(!engine_supports("KOI8-U"));
+    }
+
+    #[test]
+    fn shift_jis_decodes_via_encoding_rs() {
+        // "日本語" in Shift_JIS = 93FA 967B 8CEA. The engine must now decode it
+        // (previously it fell through to a Latin-1 read that produced "ú{ê"),
+        // matching HotSpot for Spring's ContentDisposition Shift_JIS filenames.
+        assert!(engine_supports("Shift_JIS"));
+        let bytes = [0x93u8, 0xFA, 0x96, 0x7B, 0x8C, 0xEA];
+        let decoded = engine::decode_bytes("Shift_JIS", &bytes).expect("valid Shift_JIS");
+        let expected: Vec<u16> = "日本語".encode_utf16().collect();
+        assert_eq!(decoded, expected);
     }
 
     #[test]
@@ -1274,7 +1287,7 @@ mod tests {
         // FIX (charset-nb): `String.getBytes(Charset)` for an unsupported
         // charset must FAIL LOUD rather than silently substitute Latin-1 bytes.
         let mut ctx = mock_ctx();
-        let cs = make_charset(&mut ctx, "Shift_JIS");
+        let cs = make_charset(&mut ctx, "KOI8-U");
         let this = ctx.create_string("hello");
         let err = native_string_get_bytes_charset(
             &mut ctx,
@@ -1289,7 +1302,7 @@ mod tests {
             "expected UnsupportedOperationException, got: {msg}"
         );
         assert!(
-            msg.contains("Shift_JIS"),
+            msg.contains("KOI8-U"),
             "error should name the unsupported charset, got: {msg}"
         );
     }

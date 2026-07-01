@@ -12842,7 +12842,15 @@ pub fn register_synthetic_overrides(registry: &mut NativeMethodRegistry) {
 
     // --- Phase 8.4: JMX (Java Management Extensions) ---
     #[cfg(feature = "experimental-jmx")]
-    register_jmx_natives(registry);
+    {
+        register_jmx_natives(registry);
+        // Pure-synthetic-JDK mode has no real `java.management` module, so the
+        // in-process synthetic MBeanServer (createMBeanServer / getAttribute /
+        // registerMBean / queryNames …) is required here. Real-JDK boot paths
+        // (vm_init.rs) deliberately call `register_jmx_natives` WITHOUT this so
+        // the concrete `com.sun.jmx.mbeanserver.JmxMBeanServer` bytecode runs.
+        crate::jmx::register_mbean_server(registry);
+    }
 
     // --- Phase 9.2: HTTP/2 Client (java.net.http.*) ---
     register_http2_natives(registry);
