@@ -6,9 +6,9 @@ Easy-access, tracked copies of the standalone reproducers for the **open** bugs 
 at risk of being lost. The bugs span **Wildfly, Kafka, Hibernate, Elasticsearch,
 Keycloak and Spring** — not Spring-only.
 
-> **Re-run 2026-06-29 / archive cleanup 2026-07-01:** the **A5** (`gc-stress` bintrees)
-> repro set now lives under `docs/internal/repros/gc-stress-bintrees-main-args/`; the **A2**
-> (`ReflRepro`) repro now passes on dev, and three more — `spring-bug-08`,
+> **Re-run 2026-06-29 / archive cleanup 2026-07-01:** the **A2** (`ReflRepro`)
+> and **A5** (`gc-stress` bintrees) repro sets now live under `docs/internal/repros/`;
+> three more — `spring-bug-08`,
 > `keycloak-15`, `keycloak-16` — **no longer reproduce on dev** (see ✅ rows below). `A4`/`Fork6`
 > still exercises the architectural FJP register-root gap (non-fatal: prints `ALL-OK`).
 
@@ -23,7 +23,6 @@ $CV --java-home "$JDK" -cp <dir> <Repro>  # CratonVM (reproduces the gap)
 
 | Bug doc | Repro here | How to trigger / expected |
 |---|---|---|
-| `reflrepro-…` (**A2**) | `A2-reflrepro/ReflRepro.java` | `CRATONVM_DBG_GC_STRESS=65536 $CV … -cp A2-reflrepro ReflRepro 8000` → **rc=139** (UAF). `--nojit` clean. |
 | `fork6-…` (**A4**) | `A4-fork6/Fork6.java` | `CRATONVM_REAL_FORKJOINPOOL=1 CRATONVM_DISABLE_DEFAULT_WATCHDOG=1 $CV … Fork6` → NPE/CCE in workers (~rep 4). HotSpot/`--nojit`/`-Xmx8g` print `ALL-OK`. |
 | `spring-bug-08-…` | `spring-bug-08-proxy-serialization/ProxySer.java` | ✅ **NOW PASSES on dev** (re-run 2026-06-29: `RESULT=OK`, no `UnsatisfiedLinkError`). Was: serialize→deserialize a `Serializable` JDK proxy → `UnsatisfiedLinkError: Module.defineModule0` on deserialize. |
 | `keycloak-15-…` | `keycloak-15-path-root/PathRoot.java` | ✅ **NOW PASSES on dev** (re-run 2026-06-29: `getRoot()=C:\`, `nameCount=2`, ==HotSpot). Was: `Paths.get("C:\\foo\\bar")` → `getRoot()=null`, `nameCount=3`. |
