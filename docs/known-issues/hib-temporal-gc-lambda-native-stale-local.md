@@ -91,6 +91,13 @@ pattern are now pinned as well in `native-collections/src/lib.rs`: `make_stream`
 regression coverage for `Stream.forEach` and `ArrayList.removeIf`. This broadens the per-native pinning fix;
 it does **not** claim to close the distinct residual GC root-coverage family described above.
 
+**Additional callback sweep (2026-07-01, follow-up):** the same pin/re-read pattern now covers more
+collection callback loops that can be reached from real app code: `LinkedHashMap.forEach`,
+`ArrayDeque.forEach`, `TreeMap.forEach`, `TreeSet.forEach`, both `ConcurrentHashMap.forEach` overloads
+registered here, and `Collections$UnmodifiableList$ListItr.forEachRemaining`. Focused regressions now
+simulate a moving GC during callbacks for `LinkedHashMap.forEach` and `TreeMap.forEach` in
+`native-collections/tests/gc_native_pins.rs`.
+
 **Do NOT** try to fix this by forcing the non-moving sweep when a native is active: it re-triggers the
 documented [`HIB-CV-33`](HIB-CV-33-sigsegv-execute-fault-joined-inheritance-sf-build.md) precise-root
 reclaim gap (`gen_heap.rs` — the non-moving sweep without conservative roots reclaims live precise-rooted

@@ -72,6 +72,14 @@ Built a `profsym` binary (`CratonVM-cv37/build-cv37sym.bat` → full symbols) an
   or force the non-moving sweep while a native holds Rust-local refs) are noted as harder/riskier —
   the latter previously re-triggered the CV-33 precise-root reclaim gap.
 
+**Follow-up 2026-07-01:** another native-collections callback sweep applied the established
+pin/re-read pattern to `LinkedHashMap.forEach`, `ArrayDeque.forEach`, `TreeMap.forEach`,
+`TreeSet.forEach`, both registered `ConcurrentHashMap.forEach` forms, and
+`Collections$UnmodifiableList$ListItr.forEachRemaining`. New mock moving-GC regressions cover
+`LinkedHashMap.forEach` and `TreeMap.forEach`. This narrows the HIB-CV-37 #1 native-callback GC
+surface, but the full `SmokeTests.testQueryConcurrency` repro has not yet been re-run, so this doc
+stays in `docs/known-issues`.
+
 ### #2 DynamicBatchFetchTest — confirmed separate, non-crash, single-threaded
 `ExecutionException: JDBC parameter value not bound` from `AbstractJdbcParameter.bindParameterValue`
 (AbstractJdbcParameter.java:84): `IdentityHashMap`-keyed binding store
