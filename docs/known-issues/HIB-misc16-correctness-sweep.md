@@ -478,3 +478,17 @@ miss sites, but the full Hibernate `FunctionTests` / `StandardFunctionTests`
 rerun has not been completed on this branch. Keep this cluster open until that
 end-to-end verification confirms the slowdown is gone and no other lever is
 needed.
+
+### 2026-07-01 follow-up: native-registry hash hot-path hardening
+
+Implemented lever 3 as a general registry-side mitigation: `native_method_hash`
+now updates both 64-bit FNV-style accumulators during one scan over
+`class.method.descriptor` instead of walking the same long Hibernate
+class/method/descriptor strings twice. The key format is intentionally
+unchanged, and a focused regression compares representative hashes against the
+legacy independent two-pass calculation.
+
+This reduces the cost of every `NativeMethodRegistry::find` call, including
+paths not covered by the vtable-fast verdict cache above. It still does not
+claim to close the Hibernate `FunctionTests` / `StandardFunctionTests` slowness
+cluster until those external tests are rerun.
