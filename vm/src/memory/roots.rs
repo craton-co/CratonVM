@@ -302,7 +302,19 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     //     this scan is a full, current walk.
     crate::jit::conservative_roots::invalidate_scan_cache_for_gc();
     let jit_scan_start = roots.len();
-    crate::jit::conservative_roots::scan_active_jit_frames(&shared.heap, &mut roots);
+    // Moving young gen (`CRATONVM_MOVING_YOUNG`): the shadow stack now publishes a
+    // COMPLETE rewritable precise root map for every live JIT frame, so the
+    // conservative frame scan is SUPPRESSED. Running it anyway would fold
+    // un-rewritable slot values into `roots` that the moving Cheney copy would
+    // relocate but could not patch — and a false-positive non-oop word would pin
+    // (or mis-relocate) a random object. "Once a frame is precise, it must be
+    // fully precise" (default-moving-young-gen.md, Risks): rely solely on the
+    // shadow stack (folded in at 14b below) plus the interpreter/statics/JNI
+    // roots. On any non-moving path this scan remains the authoritative JIT root
+    // set.
+    if !crate::jit::conservative_roots::moving_young_enabled() {
+        crate::jit::conservative_roots::scan_active_jit_frames(&shared.heap, &mut roots);
+    }
     // G1 pin-in-place for conservative JIT roots: the generational collector
     // protects a conservatively-scanned JIT root (a register/spill slot the
     // collector cannot rewrite) by running its NON-MOVING young sweep while any
