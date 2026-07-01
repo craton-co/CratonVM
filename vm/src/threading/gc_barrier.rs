@@ -667,6 +667,34 @@ mod tests {
         assert_eq!(barrier.gc_generation.load(Ordering::Relaxed), 1);
     }
 
+    /// BUG-03 — cross-thread JIT takeover may discover an in-JIT mutator only
+    /// after a bounded wait has already timed out. Reducing `expected` after
+    /// such a timeout must release the initiator once all non-cooperative peers
+    /// have been removed from the quota.
+    #[test]
+    fn barrier_late_reduce_expected_can_satisfy_bounded_wait() {
+        let barrier = GcBarrier::new();
+        assert!(barrier.request_stw(ThreadId(0), 3));
+
+        assert!(
+            !barrier.wait_for_all_timeout(std::time::Duration::from_millis(1)),
+            "two non-initiator mutators are still pending"
+        );
+
+        barrier.reduce_expected(1);
+        assert!(
+            !barrier.wait_for_all_timeout(std::time::Duration::from_millis(1)),
+            "one mutator is still pending after the first takeover"
+        );
+
+        barrier.reduce_expected(1);
+        assert!(
+            barrier.wait_for_all_timeout(std::time::Duration::from_millis(1)),
+            "late takeover should satisfy the reduced barrier quota"
+        );
+        barrier.complete_gc(HashMap::new());
+    }
+
     #[test]
     fn blocked_dead_transition_is_observed_atomically() {
         let barrier = GcBarrier::new();

@@ -437,8 +437,9 @@ fn mtroots_selfcheck(thread: &JvmThread, heap: &crate::memory::VmHeap, location:
 /// be waited for normally. The returned [`TakenOver`] must be `resume`d once
 /// the collection has completed.
 ///
-/// When the feature is disabled (`CRATONVM_XT_JIT_ROOT_SCAN` unset) this is
-/// byte-for-byte the legacy `wait_for_all()` — zero behaviour change.
+/// When the feature is disabled (`CRATONVM_XT_JIT_ROOT_SCAN=0`) or unsupported
+/// for the current heap, this is byte-for-byte the legacy `wait_for_all()` —
+/// zero behaviour change.
 fn stw_take_over_and_wait(
     shared: &SharedVm,
     xt_roots: &mut Vec<ObjectRef>,
@@ -452,26 +453,33 @@ fn stw_take_over_and_wait(
         return xt::TakenOver::default();
     }
     let mut taken = xt::TakenOver::default();
-    // Take over every currently-in-JIT peer, re-scanning until a pass finds no
-    // new one (a peer may enter JIT between passes). Each taken peer is excluded
-    // from the barrier's `expected`. Then do ONE blocking wait for the remaining
-    // cooperative mutators. A peer we could not classify as in-JIT (e.g. its
-    // compiled code range is not registered) is simply waited for cooperatively,
-    // exactly as on the default path — no worse than baseline, and no spin.
-    // Bounded round cap as a backstop against pathological churn.
-    const MAX_ROUNDS: u32 = 64;
+    // Take over currently-in-JIT peers, then wait briefly for the remaining
+    // cooperative mutators. If the wait does not complete, scan again: a peer can
+    // enter JIT after the previous takeover pass and would otherwise never
+    // arrive at the barrier. Keep looping until the barrier is satisfied.
+    const WAIT_SLICE: std::time::Duration = std::time::Duration::from_millis(1);
+    const WARN_AFTER_ROUNDS: u32 = 64;
     let mut rounds = 0u32;
+    let mut warned = false;
     loop {
         let newly = xt::take_over_pass(&mut taken, &|a| shared.heap.is_object_address(a), xt_roots);
         if newly > 0 {
             shared.gc_barrier.reduce_expected(newly as u32);
         }
         rounds += 1;
-        if newly == 0 || rounds >= MAX_ROUNDS {
+        if shared.gc_barrier.wait_for_all_timeout(WAIT_SLICE) {
             break;
         }
+        if !warned && rounds >= WARN_AFTER_ROUNDS {
+            tracing::warn!(
+                rounds,
+                pending = shared.gc_barrier.pending_count(),
+                taken = taken.count(),
+                "STW cross-thread JIT takeover is still waiting for cooperative mutators"
+            );
+            warned = true;
+        }
     }
-    shared.gc_barrier.wait_for_all();
     // Publish the reserved TLAB tails of the now-frozen in-JIT peers so the
     // non-moving young sweep skips them (their owners never reached a safepoint
     // to retire/tail-fill, so the tails would otherwise desync the heap walk).
