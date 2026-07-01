@@ -17,8 +17,9 @@ Branch `fix/spring-core-suite-bugs` (off latest dev `6eeb1fe6`); each verified v
 | [stax-xml-family](SC-stax-xml-family.md) | med | ◑ PARTIAL `cd8c9b9f` | 4 cursor natives + getName prefix → StaxStream 1/6→4/6 (2 namespace-SAX-sequence tests remain) |
 | annotation-introspection **Bug B** | high | ✅ FIXED `00c71bb6` | lambda SAM dispatch now checks param types → AnnotationFilter 11/11, AnnotationTypeMappings 43/43, MergedAnnotationsRepeatable 24/24 (general correctness fix) |
 | [jspecify-nullness-reflection](../internal/spring/SC-jspecify-nullness-reflection.md) | med | FIXED 2026-07-01 | TYPE_USE `AnnotatedType` and package-info annotations are implemented; native-level regression coverage added for return/parameter/field type-use annotations |
+| [stream-collector-supplier-no-code](../internal/fixed-suite-bugs/SC-stream-collector-supplier-no-code.md) | med | FIXED 2026-07-01 | synthetic `Collector` supplier/accumulator/finisher/combiner plus returned functional-interface SAMs are registered; registry regression coverage added |
 
-**Session total: 8 bugs fixed, ~43 spring-core tests recovered. Branch rebased onto current dev (merge `75ffb42c`).**
+**Session total: 9 bugs fixed, ~44 spring-core tests recovered. Branch rebased onto current dev (merge `75ffb42c`).**
 Remaining annotation-introspection sub-bugs (same report): A (TypeNotPresent/classloader, AnnotationIntrospectionFailureTests 0/4), C (enclosing-class scan), D (bridge-method) — separate deeper fixes.
 
 ## spring-core — open clusters (run 1, 262 classes)
@@ -29,7 +30,6 @@ Remaining annotation-introspection sub-bugs (same report): A (TypeNotPresent/cla
 | [env-classreading](SC-env-classreading.md) | high | high | FIX+HO | 6 | ~~getenv/getProperties identity~~ **✅fixed on dev** (`fea93ba8`); `Object.equals` shadows override (precedenceOf=-1) [open,HO]; ~~`int.class`→Integer~~ **✅fixed on dev**; custom-ClassLoader `getResourceAsStream`=null [open,HO] — triaged 2026-06-22, see doc |
 | [stax-xml-family](SC-stax-xml-family.md) | med | high | FIX | 7 | StAX→SAX bridge: 3 unregistered cursor natives + `getName()` drops element prefix |
 | [map-multivaluemap-family](../internal/fixed-suite-bugs/SC-map-multivaluemap-family.md) | med | high | ✅FIXED | 6 | keySet.contains skips `containsKey` override; LHM putIfAbsent drops null-replace; Map.equals fails on foreign-Map arg — **all 3 fixed on dev** (RC-3 `e115b0bd`); archived. +2 ByteBuddy handoff (bug-E) |
-| [stream-collector-supplier-no-code](SC-stream-collector-supplier-no-code.md) | med | high | FIX | 1 | synthetic `Collector` lacks supplier/accumulator/finisher/combiner bodies → AbstractMethodError |
 | [aot-runtimehints-resource-count](../internal/fixed-suite-bugs/SC-aot-runtimehints-resource-count.md) | med | high | ✅FIXED | 3 | `Stream.distinct()` ignored Java equals/hashCode → dup resource globs (8 vs 5) — **fixed on dev** (`029f2c87`); archived. (4 reflection/jni/etc writer tests = unconfirmed separate residual.) |
 | [task-retry-util-misc](SC-task-retry-util-misc.md) | med | med-high | MIXED | 14 | 6 causes: non-Serializable unmod-map; Properties.store missing #date; Throwable deser; retry 20ms timing; **ByteBuddy ClassInjector [handoff]**; AQS throttle |
 | [resource-io-family](SC-resource-io-family.md) | med | high | FIX | ~25 | ~~NIO write-channel stub no `write`~~ **✅A fixed** (`fd14c4ea`); `Path.toUri()` `file://` = **⚪not-a-bug** (HotSpot matches on Win); ~~`newOutputStream`-on-dir exception type~~ **✅C fixed** (`9e14cc2d`, AccessDeniedException); **many FileNotFoundException are harness CWD [env]**; E/F/G handoffs — triaged 2026-06-22, see doc |
