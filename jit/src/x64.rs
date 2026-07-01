@@ -167,6 +167,67 @@ const ARG_REGS: [u8; 4] = [RCX, RDX, R8, R9];
 #[cfg(not(target_os = "windows"))]
 const ARG_REGS: [u8; 6] = [RDI, RSI, RDX, RCX, R8, R9];
 
+/// Native-stack probe stride used by the x64 JIT prologue.
+///
+/// Windows grows a thread stack one guard page at a time, and Unix kernels use
+/// the same page granularity for stack expansion / guard detection. A JIT frame
+/// that subtracts more than one page from RSP without probing can skip over the
+/// guard page; deep compiled recursion then faults later in arbitrary helper or
+/// shadow-stack code. Probe one page at a time before the subtract, then keep a
+/// one-page headroom probe below the final RSP.
+const STACK_BANG_PAGE_SIZE: i32 = 4096;
+
+/// Keep code size bounded for malformed or extreme bytecode. A method needing a
+/// frame larger than this falls back to the interpreter instead of emitting a
+/// giant inline probe sequence.
+const MAX_STACK_BANG_PROBES: usize = 512;
+
+fn jit_stack_bang_enabled() -> bool {
+    static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| {
+        if std::env::var_os("CRATONVM_JIT_NO_STACK_BANG").is_some() {
+            return false;
+        }
+        match std::env::var("CRATONVM_JIT_STACK_BANG") {
+            Ok(v) => !matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "off" | "no"
+            ),
+            Err(_) => true,
+        }
+    })
+}
+
+/// RSP-relative displacements to probe before `sub rsp, frame_size`.
+///
+/// Returned values are negative displacements from the pre-subtract RSP. They
+/// cover every page crossed by the frame allocation and include the exact final
+/// frame bottom when it is not page-aligned.
+fn stack_bang_frame_probe_disps(frame_size: i32) -> Option<Vec<i32>> {
+    if frame_size <= 0 {
+        return Some(Vec::new());
+    }
+    let mut disps = Vec::new();
+    let mut off = STACK_BANG_PAGE_SIZE;
+    while off <= frame_size {
+        if disps.len() >= MAX_STACK_BANG_PROBES {
+            return None;
+        }
+        disps.push(-off);
+        off = off.saturating_add(STACK_BANG_PAGE_SIZE);
+        if off <= 0 {
+            return None;
+        }
+    }
+    if frame_size % STACK_BANG_PAGE_SIZE != 0 {
+        if disps.len() >= MAX_STACK_BANG_PROBES {
+            return None;
+        }
+        disps.push(-frame_size);
+    }
+    Some(disps)
+}
+
 // ---------------------------------------------------------------------------
 // AVX2 runtime detection via CPUID
 // ---------------------------------------------------------------------------
@@ -6666,6 +6727,11 @@ struct Compiler {
     /// walker falls back to the conservative scan — this never loses
     /// an oop, it only pins extra false positives.
     stack_oop_marks: Vec<bool>,
+    /// True while `stack_oop_marks` is an exact type map for the current
+    /// simulated operand stack. Reconstructed conservative merge states clear
+    /// oop bits safely for non-moving GC, but moving-young must treat those
+    /// safepoints as incomplete and fall back.
+    stack_oop_marks_exact: bool,
     /// T1.1.a — collected oop maps, indexed by native PC offset of the
     /// instruction *after* the safepoint call. Transferred to
     /// `CompiledMethod::oop_maps` at finalize time.
@@ -6793,6 +6859,10 @@ struct Compiler {
     /// matching post-call reload. Cleared at each push start so an unbalanced
     /// (no-reload) safepoint cannot feed stale homes to a later reload.
     pending_shadow: Vec<ShadowHome>,
+    /// Completeness proof for the most recent shadow push. The paired
+    /// `OopMapEntry` carries this bit so GC can reject moving-young relocation
+    /// when the active safepoint is not fully covered.
+    pending_shadow_coverage_complete: bool,
     /// Lazy-prologue perf lever: byte range `[start, end)` of the prologue's
     /// (NOP-able) `get_current_thread` fetch sequence. After codegen, if
     /// `shadow_pushed_any` is still false (the method never published a
@@ -7310,7 +7380,7 @@ impl Compiler {
         // PC, written by `emit_pre_safepoint_spill` before each GC-capable
         // call so the GC root walker can recover the exact oop map. Off by
         // default → no slot reserved → frame layout byte-identical.
-        let precise_maps = precise_jit_maps_enabled();
+        let precise_maps = precise_jit_maps_enabled() || moving_young_enabled();
         // Step 1 (inline frame-record) — cache the validated TLS displacement
         // (0 when the opt-in flag is off or the OS probe failed → CALL path).
         let inline_rbp_tls_disp = if precise_maps { inline_rbp_tls_disp() } else { 0 };
@@ -7580,6 +7650,7 @@ impl Compiler {
             string_layout: None,
             deopt_stubs: Vec::new(),
             stack_oop_marks: Vec::with_capacity(16),
+            stack_oop_marks_exact: true,
             oop_maps: Vec::new(),
             local_oop_masks: Vec::new(),
             local_kinds: Vec::new(),
@@ -7603,6 +7674,7 @@ impl Compiler {
             shadow_savebase_slot_off,
             shadow_off_in_thread,
             pending_shadow: Vec::new(),
+            pending_shadow_coverage_complete: false,
             shadow_fetch_start: 0,
             shadow_fetch_end: 0,
             shadow_pushed_any: false,
@@ -8091,6 +8163,9 @@ impl Compiler {
     /// reference should call [`Self::mark_top_as_oop`] immediately
     /// after.
     fn push_stack(&mut self) -> StackSlot {
+        if self.stack.is_empty() && self.stack_oop_marks.is_empty() {
+            self.stack_oop_marks_exact = true;
+        }
         let offset = self.next_spill_offset;
         self.next_spill_offset += 8;
         let slot = StackSlot::Frame(offset);
@@ -8114,6 +8189,9 @@ impl Compiler {
     /// holds continuously, which is the load-bearing prerequisite for a
     /// *moving* GC that rewrites precisely-mapped slots.
     fn stack_push(&mut self, slot: StackSlot, is_oop: bool) {
+        if self.stack.is_empty() && self.stack_oop_marks.is_empty() {
+            self.stack_oop_marks_exact = true;
+        }
         self.stack.push(slot);
         self.stack_oop_marks.push(is_oop);
     }
@@ -8143,7 +8221,11 @@ impl Compiler {
         // default false to avoid panics and continue with conservative
         // fallback for this frame slice.
         if self.stack_oop_marks.pop().is_none() {
+            self.stack_oop_marks_exact = false;
             // desync — conservative fallback
+        }
+        if self.stack.is_empty() && self.stack_oop_marks.is_empty() {
+            self.stack_oop_marks_exact = true;
         }
         // Reclaim spill space if this was a Frame slot at the top
         if let StackSlot::Frame(off) = slot {
@@ -8343,6 +8425,9 @@ impl Compiler {
         if self.failed {
             return;
         }
+        if moving_young_enabled() {
+            self.flush_scratch_registers();
+        }
         for idx in 0..self.local_assignments.len() {
             if let Some(reg) = self.local_assignments[idx] {
                 let off = self.local_offset(idx);
@@ -8402,6 +8487,38 @@ impl Compiler {
         // shadow stack so a moving collector can rewrite it precisely. Paired
         // with `emit_shadow_reload` in `emit_oop_map_for_safepoint`. Gated.
         self.emit_shadow_push();
+    }
+
+    /// Return whether the shadow-stack push can prove it will publish every
+    /// live oop for the current safepoint. Any `false` result is a correctness
+    /// signal to the GC: if this frame is live here, moving-young must divert to
+    /// the non-moving sweep for that cycle.
+    fn moving_young_safepoint_coverage_complete(&self) -> bool {
+        if !moving_young_enabled() || self.failed {
+            return false;
+        }
+        if self.stack.len() != self.stack_oop_marks.len() {
+            return false;
+        }
+        if !self.stack.is_empty() && !self.stack_oop_marks_exact {
+            return false;
+        }
+        for (slot, &is_oop) in self.stack.iter().zip(self.stack_oop_marks.iter()) {
+            if is_oop && matches!(slot, StackSlot::Scratch(_) | StackSlot::Xmm(_)) {
+                return false;
+            }
+        }
+        if self.num_locals > 64 {
+            return false;
+        }
+        if self.num_locals == 0 {
+            return true;
+        }
+        self.local_oop_reached
+            .get(self.cur_bc_pc)
+            .copied()
+            .unwrap_or(false)
+            && self.local_oop_masks.get(self.cur_bc_pc).is_some()
     }
 
     /// Collect the homes of every live oop at the current safepoint: operand-
@@ -8513,15 +8630,18 @@ impl Compiler {
     /// (no-reload) safepoint cannot hand stale homes to a later reload.
     fn emit_shadow_push(&mut self) {
         if self.failed || !self.shadow_enabled || self.shadow_thread_slot_off == 0 {
+            self.pending_shadow_coverage_complete = false;
             return;
         }
         // Bisect toggle: CRATONVM_SHADOW_NOPUSH skips the push/reload codegen
         // (keeps the prologue thread-fetch + gate flip) so the SEGV can be
         // localized to push/reload vs the rest without a rebuild.
         if shadow_nopush() {
+            self.pending_shadow_coverage_complete = false;
             return;
         }
         self.pending_shadow.clear();
+        self.pending_shadow_coverage_complete = self.moving_young_safepoint_coverage_complete();
         let homes = self.collect_live_oop_homes();
         if !homes.is_empty() && shadow2_diag_enabled(&self.method_label) {
             let lm = self
@@ -8803,6 +8923,9 @@ impl Compiler {
         // sweeps the frame region — but a desync would silently degrade
         // precision (and is unsafe for the *moving* path), so the assert
         // is the real guard.
+        if self.stack.len() != self.stack_oop_marks.len() {
+            self.stack_oop_marks_exact = false;
+        }
         debug_assert_eq!(
             self.stack.len(),
             self.stack_oop_marks.len(),
@@ -8876,7 +8999,9 @@ impl Compiler {
                 // walker can match the value the JIT stored into the sp-id slot.
                 bytecode_pc: self.cur_bc_pc as u32, // Cast: bytecode PC fits u32
                 frame_slot_offsets: slots,
+                moving_young_coverage_complete: self.pending_shadow_coverage_complete,
             });
+            self.pending_shadow_coverage_complete = false;
         }
         // Stage 4 (precise oop maps) — reload oop register-locals from their
         // (GC-updated) canonical slots after the safepoint. `native_pc` above
@@ -8887,7 +9012,7 @@ impl Compiler {
         // callee-saved register. Without this, Stage 3 updates the slot but the
         // code keeps reading the stale register → register-invisibility
         // persists. Gated off by default (no reload → byte-identical codegen).
-        if self.precise_maps {
+        if self.precise_maps && !moving_young_enabled() {
             self.emit_post_safepoint_reload();
         }
     }
@@ -9771,6 +9896,35 @@ impl Compiler {
             self.buf.emit_byte(0x81); // ADD r/m64, imm32
             self.modrm_reg(0, RSP);
             self.buf.emit(&imm.to_le_bytes());
+        }
+    }
+
+    /// MOV EAX, [RSP + disp32].
+    ///
+    /// Used only for stack banging. EAX is caller-saved and is not an incoming
+    /// Java argument on either supported x64 ABI, so clobbering it in the
+    /// prologue is safe before parameter shuffling starts.
+    fn emit_stack_bang_load(&mut self, disp: i32) {
+        self.buf.emit(&[0x8B, 0x84, 0x24]);
+        self.buf.emit(&disp.to_le_bytes());
+    }
+
+    fn emit_stack_bang_before_frame_alloc(&mut self, frame_size: i32) {
+        if !jit_stack_bang_enabled() {
+            return;
+        }
+        let Some(disps) = stack_bang_frame_probe_disps(frame_size) else {
+            self.failed = true;
+            return;
+        };
+        for disp in disps {
+            self.emit_stack_bang_load(disp);
+        }
+    }
+
+    fn emit_stack_bang_headroom(&mut self) {
+        if jit_stack_bang_enabled() {
+            self.emit_stack_bang_load(-STACK_BANG_PAGE_SIZE);
         }
     }
 
@@ -11544,7 +11698,12 @@ impl Compiler {
         let fs = self.frame_size;
         self.emit_push_rbp();
         self.emit_mov_rbp_rsp();
+        self.emit_stack_bang_before_frame_alloc(fs);
+        if self.failed {
+            return;
+        }
         self.emit_sub_rsp_imm(fs);
+        self.emit_stack_bang_headroom();
 
         // Save callee-saved GPR registers using MOV into frame slots (not PUSH).
         // Only save registers actually assigned by the allocator.
@@ -15545,6 +15704,7 @@ impl Compiler {
                                                                                  // marks is read.
                     self.stack_oop_marks.clear();
                     self.stack_oop_marks.resize(expected_depth, false);
+                    self.stack_oop_marks_exact = expected_depth == 0;
                 } else {
                     self.pc_to_native[pc] = -1;
                     pc += bytecode_len_at(code, pc);
@@ -24291,6 +24451,9 @@ pub fn compile_with_param_slots(
 
     // Emit prologue
     compiler.emit_prologue();
+    if compiler.failed {
+        return None;
+    }
     let entry_offset = 0; // prologue starts at offset 0
     compiler.body_entry_offset = compiler.buf.pos(); // offset right after prologue
 
@@ -24728,6 +24891,24 @@ mod tests {
     use crate::JitInvokeInfo;
     use cratonvm_types::{ObjectRef, Value};
 
+    #[test]
+    fn stack_bang_frame_probes_cover_crossed_pages() {
+        assert_eq!(stack_bang_frame_probe_disps(0), Some(Vec::new()));
+        assert_eq!(stack_bang_frame_probe_disps(128), Some(vec![-128]));
+        assert_eq!(
+            stack_bang_frame_probe_disps(STACK_BANG_PAGE_SIZE),
+            Some(vec![-STACK_BANG_PAGE_SIZE])
+        );
+        assert_eq!(
+            stack_bang_frame_probe_disps(STACK_BANG_PAGE_SIZE + 64),
+            Some(vec![-STACK_BANG_PAGE_SIZE, -(STACK_BANG_PAGE_SIZE + 64)])
+        );
+        assert_eq!(
+            stack_bang_frame_probe_disps(STACK_BANG_PAGE_SIZE * 2),
+            Some(vec![-STACK_BANG_PAGE_SIZE, -(STACK_BANG_PAGE_SIZE * 2)])
+        );
+    }
+
     // ---- Test stub helpers for getfield/putfield ----
     // These mirror the real helpers in vm/src/jit/helpers.rs but live in the
     // jit crate so unit tests can exercise compiled code without pulling in
@@ -24922,6 +25103,50 @@ mod tests {
             jit_frem: sentinel,
             jit_drem: sentinel,
         }
+    }
+
+    #[test]
+    fn compiled_prologue_emits_stack_headroom_bang() {
+        if !jit_stack_bang_enabled() {
+            return;
+        }
+        let code: Vec<u8> = vec![0x1a, 0xac, 0, 0];
+        let compiled = compile(
+            &code,
+            2,
+            1,
+            1,
+            false,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            HashMap::new(),
+            HashMap::new(),
+            &test_helpers(),
+            std::collections::HashSet::new(),
+            HashMap::new(),
+            None,
+        )
+        .expect("simple method should compile");
+
+        let mut expected = vec![0x8B, 0x84, 0x24];
+        expected.extend_from_slice(&(-STACK_BANG_PAGE_SIZE).to_le_bytes());
+        assert!(
+            compiled
+                .code_bytes()
+                .windows(expected.len())
+                .any(|w| w == expected.as_slice()),
+            "compiled prologue should contain MOV EAX, [RSP-4096]"
+        );
     }
 
     #[test]

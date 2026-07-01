@@ -182,49 +182,35 @@ fn native_method_hash(class: &str, method: &str, descriptor: &str) -> (u64, u64)
     // pattern *and* different magnitude, so the second hash is not a
     // re-seeded copy of the first.
     const ALT_PRIME: u64 = 0x880355f21e6d1965;
-    (
-        fmix64(hash_pass(
-            class,
-            method,
-            descriptor,
-            0xcbf29ce484222325,
-            FNV_PRIME,
-        )),
-        fmix64(hash_pass(
-            class,
-            method,
-            descriptor,
-            0x9e3779b97f4a7c15,
-            ALT_PRIME,
-        )),
-    )
+    let mut h1 = 0xcbf29ce484222325;
+    let mut h2 = 0x9e3779b97f4a7c15;
+
+    hash_component_pair(&mut h1, &mut h2, class, FNV_PRIME, ALT_PRIME);
+    hash_byte_pair(&mut h1, &mut h2, b'.', FNV_PRIME, ALT_PRIME);
+    hash_component_pair(&mut h1, &mut h2, method, FNV_PRIME, ALT_PRIME);
+    hash_byte_pair(&mut h1, &mut h2, b'.', FNV_PRIME, ALT_PRIME);
+    hash_component_pair(&mut h1, &mut h2, descriptor, FNV_PRIME, ALT_PRIME);
+
+    (fmix64(h1), fmix64(h2))
 }
 
-/// A single FNV-1a-style multiply/xor pass over
-/// `class . method . descriptor` with a caller-supplied offset basis
-/// **and** multiplier. Varying the multiplier (not just the basis) is
-/// what makes two passes statistically independent rather than
-/// correlated affine transforms of the same accumulator.
+/// Update both independent native-method hash accumulators for one byte.
 #[inline]
-fn hash_pass(class: &str, method: &str, descriptor: &str, basis: u64, prime: u64) -> u64 {
-    let mut h: u64 = basis;
-    for b in class.bytes() {
-        h ^= b as u64;
-        h = h.wrapping_mul(prime);
+fn hash_byte_pair(h1: &mut u64, h2: &mut u64, byte: u8, prime1: u64, prime2: u64) {
+    *h1 ^= byte as u64;
+    *h1 = h1.wrapping_mul(prime1);
+    *h2 ^= byte as u64;
+    *h2 = h2.wrapping_mul(prime2);
+}
+
+/// One scan over a component, updating the two statistically independent
+/// FNV-style accumulators in parallel. This preserves the previous key format
+/// while avoiding two full byte walks for every hot-path registry lookup.
+#[inline]
+fn hash_component_pair(h1: &mut u64, h2: &mut u64, component: &str, prime1: u64, prime2: u64) {
+    for byte in component.bytes() {
+        hash_byte_pair(h1, h2, byte, prime1, prime2);
     }
-    h ^= b'.' as u64;
-    h = h.wrapping_mul(prime);
-    for b in method.bytes() {
-        h ^= b as u64;
-        h = h.wrapping_mul(prime);
-    }
-    h ^= b'.' as u64;
-    h = h.wrapping_mul(prime);
-    for b in descriptor.bytes() {
-        h ^= b as u64;
-        h = h.wrapping_mul(prime);
-    }
-    h
 }
 
 /// splitmix64 finalizer — an avalanche mix that spreads every input bit
@@ -3228,6 +3214,40 @@ mod tests {
         Ok(Some(Value::Int(42)))
     }
 
+    fn legacy_native_method_hash(class: &str, method: &str, descriptor: &str) -> (u64, u64) {
+        fn pass(class: &str, method: &str, descriptor: &str, basis: u64, prime: u64) -> u64 {
+            let mut h = basis;
+            for (idx, component) in [class, method, descriptor].iter().enumerate() {
+                for byte in component.bytes() {
+                    h ^= byte as u64;
+                    h = h.wrapping_mul(prime);
+                }
+                if idx < 2 {
+                    h ^= b'.' as u64;
+                    h = h.wrapping_mul(prime);
+                }
+            }
+            h
+        }
+
+        (
+            fmix64(pass(
+                class,
+                method,
+                descriptor,
+                0xcbf29ce484222325,
+                0x100000001b3,
+            )),
+            fmix64(pass(
+                class,
+                method,
+                descriptor,
+                0x9e3779b97f4a7c15,
+                0x880355f21e6d1965,
+            )),
+        )
+    }
+
     // -----------------------------------------------------------------------
     // NativeMethodRegistry basics
     // -----------------------------------------------------------------------
@@ -3372,6 +3392,26 @@ mod tests {
         // the same triple yields two distinct 64-bit values.
         let (h1, h2) = native_method_hash("java/lang/Object", "hashCode", "()I");
         assert_ne!(h1, h2);
+    }
+
+    #[test]
+    fn hash_single_scan_preserves_legacy_keys() {
+        let cases = [
+            ("java/lang/Object", "hashCode", "()I"),
+            (
+                "org/hibernate/query/sqm/function/AbstractSqmSelfRenderingFunctionDescriptor",
+                "generateSqmExpression",
+                "(Ljava/util/List;Lorg/hibernate/query/ReturnableType;Lorg/hibernate/query/spi/QueryEngine;)Lorg/hibernate/query/sqm/tree/expression/SqmExpression;",
+            ),
+            ("", "methodOnly", "(Ljava/lang/Object;)V"),
+        ];
+
+        for (class, method, descriptor) in cases {
+            assert_eq!(
+                native_method_hash(class, method, descriptor),
+                legacy_native_method_hash(class, method, descriptor)
+            );
+        }
     }
 
     #[test]

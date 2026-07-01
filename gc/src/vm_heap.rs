@@ -1215,6 +1215,10 @@ impl VmHeap {
         if let VmHeap::G1(g1) = self {
             g1.print_gc_summary();
         }
+        let fallbacks = crate::gc_quiescence::moving_young_coverage_fallback_count();
+        if crate::gc_quiescence::moving_young_enabled() || fallbacks > 0 {
+            eprintln!("[GC] moving_young_coverage_fallbacks={fallbacks}");
+        }
     }
 
     /// Get the number of fields (slots) in an object.

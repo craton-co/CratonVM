@@ -948,11 +948,15 @@ pub(crate) fn find_loaded_class_for_loader(
             // report a child loader's generated proxy as "already loaded" — and
             // since `loadClass` delegates parent-first, a sibling custom loader
             // then resolves it too (`ClassUtilsTests.isCacheSafe`:
-            // `child2.loadClass` of child1's `jdk.proxy1.$Proxy0`). Scope this to
-            // generated proxy names (not real classpath classes, never findable
-            // on disk) so ByteBuddy/Hibernate classes — which legitimately live
-            // in the Application namespace while registering a user-defined
-            // defining loader — keep their existing app-loader visibility.
+            // `child2.loadClass` of child1's `jdk.proxy1.$Proxy0`).
+            //
+            // Actual user-loader namespace hits are not visible to built-in
+            // loaders. Application-namespace classes that merely record a
+            // user-defined defining loader still keep their app-loader
+            // visibility below.
+            if ctx.loader_id_of_class(cid) > 2 {
+                return None;
+            }
             if is_generated_proxy_name(internal_name) && defining_loader_for(cid.as_u32()).is_some() {
                 return None;
             }
@@ -6028,7 +6032,8 @@ pub(crate) fn register_classloader_natives(r: &mut NativeMethodRegistry) {
 #[cfg(test)]
 mod classloader_tests {
     use super::*;
-    use cratonvm_native_api::NativeMethodRegistry;
+    use crate::test_utils::MockNativeContext;
+    use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 
     fn make_registry() -> NativeMethodRegistry {
         let mut r = NativeMethodRegistry::new();
@@ -6136,6 +6141,32 @@ mod classloader_tests {
                 "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/Class;"
             )
             .is_some());
+    }
+
+    #[test]
+    fn test_builtin_find_loaded_class_hides_user_namespace_hit() {
+        let mut ctx = MockNativeContext::new();
+        let loader = match ctx.new_object("java/lang/ClassLoader").unwrap() {
+            Some(Value::Object(Some(obj))) => obj,
+            other => panic!("expected classloader object, got {other:?}"),
+        };
+        let cid = ctx.ensure_class_initialized("leak/OnlyChild").unwrap();
+        ctx.set_loader_id_override(cid, 7);
+
+        assert!(find_loaded_class_for_loader(&mut ctx, loader, "leak/OnlyChild").is_none());
+    }
+
+    #[test]
+    fn test_builtin_find_loaded_class_keeps_application_namespace_hit() {
+        let mut ctx = MockNativeContext::new();
+        let loader = match ctx.new_object("java/lang/ClassLoader").unwrap() {
+            Some(Value::Object(Some(obj))) => obj,
+            other => panic!("expected classloader object, got {other:?}"),
+        };
+        let cid = ctx.ensure_class_initialized("framework/Generated").unwrap();
+        ctx.set_loader_id_override(cid, 2);
+
+        assert!(find_loaded_class_for_loader(&mut ctx, loader, "framework/Generated").is_some());
     }
 
     #[test]

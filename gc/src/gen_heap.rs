@@ -2646,15 +2646,27 @@ impl GenerationalHeap {
         // suppressed conservative scan means that fallback sweep also relies on the
         // complete shadow map for marking — consistent, since the shadow map is the
         // sole precise JIT root set under this flag. If the VM detected an
-        // incomplete OSR shadow layout during root gathering, it sets
-        // `force_non_moving_jit_roots`; then this cycle treats moving-young as
-        // unavailable and uses the conservative/non-moving fallback instead.
+        // incomplete JIT coverage proof during root gathering, this cycle treats
+        // moving-young as unavailable and uses the conservative/non-moving
+        // fallback instead.
         let moving_young_requested = crate::gc_quiescence::moving_young_enabled();
         let force_non_moving_jit_roots = crate::gc_quiescence::force_non_moving_jit_roots();
-        let moving_young = moving_young_requested && !force_non_moving_jit_roots;
-        let divert_non_moving =
-            (has_conservative_roots && !moving_young) || honor_promotion_oom_risk;
-        if divert_non_moving && !force_moving {
+        let coverage_incomplete = crate::gc_quiescence::moving_young_coverage_incomplete();
+        let divert_for_incomplete_moving_coverage =
+            moving_young_requested && (force_non_moving_jit_roots || coverage_incomplete);
+        let moving_young = moving_young_requested && !divert_for_incomplete_moving_coverage;
+        let divert_non_moving = (has_conservative_roots && !moving_young_requested)
+            || honor_promotion_oom_risk
+            || divert_for_incomplete_moving_coverage;
+        if divert_non_moving && (!force_moving || divert_for_incomplete_moving_coverage) {
+            if divert_for_incomplete_moving_coverage {
+                let n = crate::gc_quiescence::record_moving_young_coverage_fallback();
+                if std::env::var_os("CRATONVM_MOVING_YOUNG_FALLBACKS").is_some() {
+                    eprintln!(
+                        "[moving-young] coverage fallback #{n}: incomplete live JIT safepoint map; running non-moving young sweep"
+                    );
+                }
+            }
             tracing::debug!(
                 "running non-moving young-gen mark-sweep (jit_active={}, \
                  unregistered_jit_frame={}, promotion_oom_risk={}, honored={}, moving_young={}, \

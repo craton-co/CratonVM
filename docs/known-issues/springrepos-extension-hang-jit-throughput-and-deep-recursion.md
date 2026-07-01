@@ -250,6 +250,23 @@ deeper recursive compiled paths still need robust native-stack handling (§6-§7
 dev already passes the test (root-snapshot), so this is a **pure throughput
 follow-up**, not a blocker.
 
+### 2026-07-01 cold-path validation guard
+
+The coarse ANTLR package ban can now be lifted for validation with
+`CRATONVM_JIT_ALLOW_PACKAGES=groovyjarjarantlr4/` without re-enabling the known
+parse-corrupting `PredictionContext` equality/hash cluster. The skip list keeps
+these seven methods interpreted even under that package lift:
+`PredictionContext.{calculateHashCode,hashCode}`,
+`PredictionContext$IdentityEqualityComparator.hashCode`,
+`SingletonPredictionContext.{equals,isEmpty,size}`, and
+`ObjectEqualityComparator.equals`.
+
+This turns the old all-or-nothing cold-path experiment into a narrower validation
+mode: the ATN simulator leaves can be retried after the recursive direct-call
+routing fix, while the already-bisected correctness defect remains contained.
+Pinned by `antlr_coldpath_validation_lifts_non_bad_atn_methods` and
+`antlr_prediction_context_cluster_stays_interpreted_under_validation_lift`.
+
 ### Hibernate HQL reproducer (same cold ANTLR prediction bug)
 
 The Hibernate census H4 timeout (`function.json.JsonArrayUnnestTest`) is the same
@@ -402,6 +419,26 @@ This is still not the full stack-banging / fault-recovery design above, and the
 cold-path throughput experiment still needs separate validation before this doc
 can be archived.
 
+### 2026-07-01 follow-up: x64 stack-bang containment
+
+The x64 single-pass backend now emits stack-bang probes in every normal compiled
+method prologue. Before `sub rsp, frame_size`, it touches each 4 KiB page crossed
+by the frame allocation and bails compilation if an extreme frame would need more
+than 512 inline probes. After the subtract, it touches one additional page below
+the final RSP so a missed direct-recursion edge trips at the method prologue
+instead of later corrupting shadow-stack / operand-stack metadata. This is
+default-on and can be disabled for A/B runs with `CRATONVM_JIT_STACK_BANG=0` or
+`CRATONVM_JIT_NO_STACK_BANG=1`.
+
+The Windows VEH crash report also names the faulting JIT method for the faulting
+RIP when `CRATONVM_DBG_JIT_NAMES=1`, including the `EXCEPTION_STACK_OVERFLOW`
+case where the handler intentionally skips stack walking.
+
+This is still containment, not full Java-level recovery: the handler does not yet
+rewrite the trapped JIT frame into a resumable deopt or stash a catchable
+`StackOverflowError` from the fault context. The remaining production-grade item
+is the fault-recovery half of the design.
+
 ---
 
 ## 8. Repros & tooling (all under `apps/spring-boot/buildSrc/runner/`)
@@ -436,7 +473,11 @@ can be archived.
 - 3 general fixes landed on `dev` (pdcache, AssertionError preload,
   hashCode/equals-override compile + cache-key) — all regression-validated.
 - `dev` **passes** `SpringRepositoriesExtensionTests` via the root-snapshot fix.
-- Remaining: (a) the cold-path throughput follow-up (let ATN-sim leaf methods compile
-  via the interpreter path using the §4 inner-invoke guard), which (b) requires the
-  **§7 deep-recursion stack guard (stack banging + fault recovery)** first, because
-  enabling it surfaces the native stack overflow. Neither is a blocker.
+- Remaining: (a) run the real Groovy/HQL cold-path validation with
+  `CRATONVM_JIT_ALLOW_PACKAGES=groovyjarjarantlr4/` now that the known-bad
+  PredictionContext cluster remains interpreted and recursive compile cycles route
+  through guarded dispatch, and (b) finish the **§7 deep-recursion stack guard
+  (stack banging + fault recovery)** before making that lift a production default.
+  The stack-bang probes are now in place; the remaining part is resumable
+  fault recovery / catchable `StackOverflowError` routing from the fault
+  context. Neither is a blocker.

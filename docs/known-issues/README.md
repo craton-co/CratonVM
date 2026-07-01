@@ -35,7 +35,7 @@ fixes). Headline:
    but **no longer reproduces** (doc removed). The suite-scale field evidence in
    `jit-junit-discovery-reflection-corruption.md` is the same race.
 2. **Standalone B** — JUnit `@Timeout` interceptor double-`proceed()` (open).
-3. **Standalone C** — deep JIT→JIT recursion native-stack overflow (latent; only with an unmerged experiment).
+3. **Standalone C** — deep JIT→JIT recursion native-stack overflow (latent; stack-bang containment landed; resumable fault recovery still open).
 4. **bug-06 F5** — reflection native returns null vs a `Class`/`Method` (open, unattributed).
 5. **bug-06 F6 / `spring-bug-06` / `spring-bug-01`** — annotation **synthesis** value-mismatches.
    (The `MergedAnnotations` **hang** + the `AnnotationUtilsTests` "~2 GB OOM" in this cluster were the
@@ -273,7 +273,7 @@ The history below predates the fix.
 
 | # | Bug | Status | Doc |
 |---|---|---|---|
-| **C** | Deep JIT→JIT recursion overruns the **native** stack (ANTLR `closure()`); same-method recursive edges and compile-time-discovered mutual direct-call cycles now route through guarded dispatch except static tail self-jumps, and first-call/upgrade native-shadow gates now allow bytecode identity overrides unless they invoke a native-shadowed target, but the full overflow path still needs stack-banging + a fault-recovery handler. | ⚪ **LATENT / PARTIALLY CONTAINED** (not a current blocker; 2026-07-01 recursive-edge + compile-cycle routing, plus native-shadow gate narrowing, landed) | [springrepos-extension-hang-jit-throughput-and-deep-recursion.md](springrepos-extension-hang-jit-throughput-and-deep-recursion.md) §6–7 |
+| **C** | Deep JIT→JIT recursion overruns the **native** stack (ANTLR `closure()`); same-method recursive edges and compile-time-discovered mutual direct-call cycles now route through guarded dispatch except static tail self-jumps, the ANTLR cold-path validation lift keeps the known-bad `PredictionContext` cluster interpreted, and x64 prologues now stack-bang page-by-page with one-page headroom. The full overflow path still needs a resumable fault-recovery handler / catchable `StackOverflowError` routing from the fault context. | ⚪ **LATENT / PARTIALLY CONTAINED** (not a current blocker; 2026-07-01 recursive-edge + compile-cycle routing, native-shadow gate narrowing, guarded ANTLR validation lift, and x64 stack-bang containment landed) | [springrepos-extension-hang-jit-throughput-and-deep-recursion.md](springrepos-extension-hang-jit-throughput-and-deep-recursion.md) §6–7 |
 | **MT-STW** | `Thread.join` monitor-ownership **desync under concurrent GC** (JIT-off): `monitor_wait`/terminate-tail used a raw `ObjectRef` captured before blocking, then `arrive_and_wait` let the in-flight STW relocate+zero it → `ensure_inflated` on the stale address synthesised a fresh `owner=None` monitor → IMSE in the javac synchronized-exit loop → joiner livelock → STW wedge. ~1–3% on `scratch_churn/Churn.java`; the tail after the four barrier+expansion fixes (`68c6993e`, 0%→~97%). | ✅ **FIXED** (`74b195b4`) — remap the receiver through `arrive_and_wait`'s returned pointer map; Churn 0 hangs / ~480 runs | [../internal/mt-stw-join-monitor-desync.md](../internal/mt-stw-join-monitor-desync.md) |
 
 > Bug **B** (JUnit `@Timeout` "interceptor invoked twice") is **FIXED** and archived — it was
