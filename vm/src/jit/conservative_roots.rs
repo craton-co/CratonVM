@@ -143,8 +143,9 @@ pub(crate) struct PreciseFrameInfo {
     pub entry_ptr: *const u8,
     /// Stage 3/5 (precise relocation) — the EXACT RBP of the *innermost*
     /// active JIT frame, recorded by [`set_top_frame_base`] from the deepest
-    /// prologue's `frame_record` helper. Used ONLY as the start of the
-    /// `remap_active_jit_frames` RBP-chain walk. It is kept SEPARATE from
+    /// prologue's `frame_record` helper. Used by precise slot scans for OSR
+    /// boundary frames and as the start of the `remap_active_jit_frames`
+    /// RBP-chain walk. It is kept SEPARATE from
     /// `frame_base` (the Rust-guard SP captured at entry) because the marking
     /// path [`scan_one_frame_precise`] uses `frame_base` as the UPPER bound of
     /// its conservative sweep `[scanner_sp, frame_base)`: clobbering it with
@@ -181,8 +182,8 @@ thread_local! {
     /// ~1.8B times for fib44) writes ONLY this `Cell` (a single TLS store, no
     /// `RefCell` borrow / `Vec::last_mut` / Option matching), cutting the
     /// per-call cost. It is synced with the chain at the rare push/pop/retain
-    /// boundaries and flushed into the top entry by `remap_active_jit_frames`
-    /// before the relocation walk — the ONLY reader of `exact_rbp`. Invariant:
+    /// boundaries and flushed into the top entry before GC marking/remap reads
+    /// `exact_rbp`. Invariant:
     /// `TOP_RBP` == the live `exact_rbp` of `JIT_ENTRY_CHAIN.last()` (or 0 when
     /// the chain is empty / the top is not yet precise).
     static TOP_RBP: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -293,7 +294,63 @@ pub use cratonvm_gc::gc_quiescence::is_active as gc_must_defer;
 pub fn shadow_stack_enabled() -> bool {
     use std::sync::OnceLock;
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("CRATONVM_SHADOW_STACK").is_some())
+    // `CRATONVM_MOVING_YOUNG` implies the shadow-stack root scan + remap: the
+    // moving young gen relies on the complete precise map the shadow stack now
+    // publishes (see `moving_young_enabled`).
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("CRATONVM_SHADOW_STACK").is_some() || moving_young_enabled()
+    })
+}
+
+/// Whether the **default moving / compacting young generation**
+/// (`CRATONVM_MOVING_YOUNG`) is enabled. Cached on first read.
+///
+/// When on: (1) the JIT publishes a *complete* rewritable precise root map at
+/// each safepoint (see `cratonvm_jit::x64::moving_young_enabled`), (2) the
+/// conservative JIT-frame scan in `roots.rs` is SUPPRESSED (a fully-precise frame
+/// needs no conservative backstop, and mixing a conservatively-marked slot with a
+/// precisely-relocated object would corrupt), and (3) `gen_heap` runs the moving
+/// (Cheney) young collection even while JIT frames are live instead of diverting
+/// to the non-moving sweep. Off by default; gated for validation against the
+/// bt18 = 68332206 invariant. See `docs/feature-designs/default-moving-young-gen.md`.
+#[inline]
+pub fn moving_young_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("CRATONVM_MOVING_YOUNG").is_some())
+}
+
+/// Returns true when moving-young must fall back to the conservative
+/// JIT-frame scan + non-moving sweep because an active OSR artifact cannot
+/// prove rewritable shadow coverage for this collection.
+pub fn moving_young_osr_shadow_fallback_needed() -> bool {
+    if !moving_young_enabled() {
+        return false;
+    }
+    let debug_shadow_disabled = std::env::var_os("CRATONVM_SHADOW_NOPUSH").is_some()
+        || std::env::var_os("CRATONVM_SHADOW_NORELOAD").is_some();
+    JIT_ENTRY_CHAIN.with(|c| {
+        let mut chain = c.borrow_mut();
+        flush_top_rbp_cache_to_chain(chain.as_mut_slice());
+        chain.iter().any(|entry| {
+            let Some(info) = entry.precise else {
+                return false;
+            };
+            // SAFETY: the chain entry stores a CompiledMethod pointer borrowed
+            // from the live JIT cache entry; it remains valid while the guard is
+            // on the stack.
+            let cm: &cratonvm_jit::CompiledMethod = unsafe { &*info.compiled_method };
+            if !cm.compiled_via_osr {
+                return false;
+            }
+            let shadow_layout_ok = cm.shadow_thread_slot_off != 0
+                && cm.shadow_savetop_slot_off != 0
+                && cm.shadow_off_in_thread != 0;
+            let precise_map_ok = !cm.has_precise_oop_maps()
+                || (cm.fully_oop_covered && info.exact_rbp != 0);
+            !shadow_layout_ok || debug_shadow_disabled || !precise_map_ok
+        })
+    })
 }
 
 /// spring-bug-10 experiment (`CRATONVM_SHADOW_PIN`): when set, the shadow-stack
@@ -524,9 +581,11 @@ impl JitEntryGuard {
     /// When the root walker encounters an entry of this shape it uses
     /// the compiled method's oop maps to enumerate oops exactly rather
     /// than blindly scanning the spill region. A compiled method with
-    /// no oop maps (`cm.has_precise_oop_maps() == false`) falls back
-    /// to the conservative scan automatically — this helper checks
-    /// that condition and chooses the appropriate path.
+    /// no oop maps (`cm.has_precise_oop_maps() == false`) usually falls
+    /// back to the conservative scan automatically. The exception is an
+    /// OSR frame under `CRATONVM_MOVING_YOUNG`: keep the metadata entry
+    /// so the moving-young coverage guard can inspect the OSR artifact's
+    /// rewritable shadow layout before allowing a moving collection.
     ///
     /// **Safety**: the caller must hold a live borrow of `cm` for the
     /// duration of the returned guard. In practice this is trivial:
@@ -537,10 +596,12 @@ impl JitEntryGuard {
     /// valid for any in-flight GC walker.
     #[inline(always)]
     pub fn enter_with_compiled(cm: &cratonvm_jit::CompiledMethod) -> Self {
-        if !cm.has_precise_oop_maps() {
-            // No maps populated — fall back to conservative. This is
-            // the default path today because the JIT compiler does
-            // not yet write oop maps during codegen.
+        let keep_osr_moving_metadata = moving_young_enabled() && cm.compiled_via_osr;
+        if !cm.has_precise_oop_maps() && !keep_osr_moving_metadata {
+            // No maps populated and no moving-young OSR metadata needed:
+            // fall back to conservative. This is the default path today
+            // because the JIT compiler does not yet write oop maps during
+            // codegen.
             return Self::enter();
         }
         let sp = current_stack_pointer();
@@ -1150,6 +1211,10 @@ pub fn scan_active_jit_frames(heap: &VmHeap, out: &mut Vec<ObjectRef>) {
 /// metadata.
 pub fn scan_active_jit_frames_with_sp(scanner_sp: usize, heap: &VmHeap, out: &mut Vec<ObjectRef>) {
     JIT_ENTRY_CHAIN.with(|c| {
+        {
+            let mut chain = c.borrow_mut();
+            flush_top_rbp_cache_to_chain(chain.as_mut_slice());
+        }
         let chain = c.borrow();
         for entry in chain.iter() {
             match entry.precise {
@@ -1196,6 +1261,15 @@ fn reload_top_rbp_cache(v: &[JitFrameChainEntry]) {
     top_rbp_set(val);
 }
 
+#[inline]
+fn flush_top_rbp_cache_to_chain(v: &mut [JitFrameChainEntry]) {
+    if let Some(top) = v.last_mut() {
+        if let Some(info) = top.precise.as_mut() {
+            info.exact_rbp = top_rbp_get();
+        }
+    }
+}
+
 /// Stage 3 — precisely relocate the oop slots of every active JIT frame on
 /// the current thread after a moving collection.
 ///
@@ -1233,14 +1307,10 @@ pub fn remap_active_jit_frames(pointer_map: &std::collections::HashMap<usize, us
     let dbg_examined = std::cell::Cell::new(0usize);
     JIT_ENTRY_CHAIN.with(|c| {
         // Flush the cached top `exact_rbp` into the top chain entry so the walk
-        // below (the only reader) sees the live innermost RBP.
+        // below sees the live innermost RBP.
         {
             let mut v = c.borrow_mut();
-            if let Some(top) = v.last_mut() {
-                if let Some(info) = top.precise.as_mut() {
-                    info.exact_rbp = top_rbp_get();
-                }
-            }
+            flush_top_rbp_cache_to_chain(v.as_mut_slice());
         }
         let chain = c.borrow();
         for entry in chain.iter() {
@@ -1248,6 +1318,38 @@ pub fn remap_active_jit_frames(pointer_map: &std::collections::HashMap<usize, us
             let Some(info) = entry.precise else { continue };
             dbg_precise += 1;
             let entry_sp = entry.entry_sp;
+            // OSR enters through a trampoline that jumps into the compiled
+            // body, so the OSR frame's return address points back to Rust
+            // rather than to a JIT child/parent pair. The parent-walk below
+            // therefore has no JIT return address it can use to resolve this
+            // boundary frame. Now that the trampoline records its exact RBP,
+            // remap the OSR frame directly with the CompiledMethod stored in
+            // the chain entry.
+            if info.exact_rbp != 0
+                && info.exact_rbp & 0x7 == 0
+                && info.exact_rbp >= scanner_sp
+                && info.exact_rbp < entry_sp
+            {
+                // SAFETY: `info.compiled_method` came from the live chain entry
+                // and is kept alive by the JIT cache while the frame is active.
+                let boundary_cm: &cratonvm_jit::CompiledMethod =
+                    unsafe { &*(info.compiled_method as *const cratonvm_jit::CompiledMethod) };
+                if boundary_cm.compiled_via_osr {
+                    // SAFETY: exact_rbp was range/alignment checked above; the
+                    // return address slot is the standard x64 `[rbp+8]`.
+                    let ret_addr = unsafe { ((info.exact_rbp + 8) as *const usize).read() };
+                    if cratonvm_jit::lookup_jit_code_range(ret_addr).is_none() {
+                        let (found, examined, n) =
+                            remap_one_jit_frame(info.exact_rbp, boundary_cm, pointer_map);
+                        dbg_frames += 1;
+                        dbg_slots.set(dbg_slots.get() + n);
+                        if found {
+                            dbg_maps_found.set(dbg_maps_found.get() + 1);
+                        }
+                        dbg_examined.set(dbg_examined.get() + examined);
+                    }
+                }
+            }
             // Stage 5 — walk the JIT RBP chain from the innermost frame
             // (`info.frame_base`, the EXACT RBP recorded by the deepest
             // prologue's `set_top_frame_base`) outward to the interpreter
@@ -1453,10 +1555,15 @@ fn verify_precise_covers_conservative(
     cm: &cratonvm_jit::CompiledMethod,
     heap: &VmHeap,
 ) {
+    let slot_base = if cm.compiled_via_osr && info.exact_rbp != 0 {
+        info.exact_rbp
+    } else {
+        info.frame_base
+    };
     let mut mapped: std::collections::HashSet<usize> = std::collections::HashSet::new();
     for map in &cm.oop_maps {
         for &off in &map.frame_slot_offsets {
-            mapped.insert((info.frame_base as isize + off as isize) as usize);
+            mapped.insert((slot_base as isize + off as isize) as usize);
         }
     }
     let scanner_sp = current_stack_pointer();
@@ -1472,11 +1579,12 @@ fn verify_precise_covers_conservative(
             if STEP3_LOG_COUNT.fetch_add(1, Ordering::Relaxed) < STEP3_LOG_CAP {
                 let delta = (addr as isize) - (info.frame_base as isize);
                 eprintln!(
-                    "[VERIFY-OOP-MAPS] unmapped in-band oop: code@{:p} frame_base={:#x} \
+                    "[VERIFY-OOP-MAPS] unmapped in-band oop: code@{:p} frame_base={:#x} slot_base={:#x} \
                      slot=[rbp{}{:#x}] addr={:#x} val={:#x} maps={} covered={} \
                      (NB band may include nested-JIT-callee slots)",
                     info.entry_ptr,
                     info.frame_base,
+                    slot_base,
                     if delta >= 0 { "+" } else { "-" },
                     delta.unsigned_abs(),
                     addr,
@@ -1516,6 +1624,12 @@ fn scan_one_frame_precise(info: PreciseFrameInfo, heap: &VmHeap, out: &mut Vec<O
         verify_precise_covers_conservative(info, cm, heap);
     }
 
+    let slot_base = if cm.compiled_via_osr && info.exact_rbp != 0 {
+        info.exact_rbp
+    } else {
+        info.frame_base
+    };
+
     // Without call-frame introspection we can't directly recover the
     // "current" native PC inside the active JIT frame. Two approaches
     // are available; this implementation uses the simpler one:
@@ -1540,7 +1654,7 @@ fn scan_one_frame_precise(info: PreciseFrameInfo, heap: &VmHeap, out: &mut Vec<O
     // When approach 2 lands in a future session it can replace the
     // loop below without touching any other code.
     for map in &cm.oop_maps {
-        scan_oop_slots(info.frame_base, &map.frame_slot_offsets, heap, out);
+        scan_oop_slots(slot_base, &map.frame_slot_offsets, heap, out);
     }
     // T1.1.a — Conservative sweep between the scanner's current SP and
     // the captured frame base to cover any oop living in a spill slot

@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | PARTIAL — eager-enhancement cluster + the two gate-on crash *regressions* FIXED behind gate `CRATONVM_LOADER_AWARE_RESOLUTION` (default **OFF**). The `enhancement.lazy.*` / `mapping.lazytoone.*` cluster is still OPEN (deeper SessionFactory-integration blocker, see below). Branch `fix/lazy-enhancement-gate`. |
+| **Status** | PARTIAL — eager-enhancement cluster, the two gate-on crash *regressions*, the SessionFactory-build blocker, AND (2026-07-01) the `enhancement.lazy.*` cluster all FIXED behind gate `CRATONVM_LOADER_AWARE_RESOLUTION` (default **OFF**). gate-on `gated_subset` PASS **31 → 54** (0 CRASH); **19 `enhancement.lazy.*` pass** (was 0), incl. `LazyBasicFieldAccessTest`. The last layer was **loader-faithful lambda dispatch** (NOT the "MethodHandle field-setter" that the earlier note misdiagnosed — see 2026-07-01 update). Remaining lazy/lazytoone FAILs are separate residual issues. Branch `fix/lazy-enhancement-lambda-dispatch` (off dev); NOT merged. |
 | **Area** | VM core — real-JDK-mode loader-faithful resolution: superclass/interface *linking* (not just `new`/checkcast/ldc), `invokespecial` owner dispatch, and link-time verification of trusted runtime-generated classes. |
 | **Builds on** | [hib-proxyclassreuse-loader-blind-class-resolution.md](hib-proxyclassreuse-loader-blind-class-resolution.md) — the three-layer `CONSTANT_Class` / `defineClass`-namespace / `findLoadedClass` fix and the `resolve_class_loader_aware` mechanism. |
 
@@ -95,36 +95,32 @@ the lookup class's recorded defining-loader (`peek_loader_namespace_id`) — the
 `defineClass1` computes — falling back to the legacy i32 path otherwise (byte-identical
 gate-off). With it, `enhancement.lazy.*` now build the SessionFactory and run.
 
-**Next OPEN layer (3rd distinct root cause): MethodHandle field-setter accessor.** The lazy
-tests now fail deeper, at `s.persist(entity)`:
-`PropertyAccessException: Could not set value of type [java.lang.Long]: '<Entity>.id'` ←
-`IllegalArgumentException: Can not set java.lang.Long field <Entity>.id to <Entity>`.
-LOCALIZED (CRATONVM_DBG_ID invoke-arg trace): the id value is the correct `Long` all the way
-down — `setIdentifier(entity, Long)` → `EnhancedSetterImpl.set(entity, Long)` →
-`SetterFieldImpl.set(entity, Long)` → `Field.set(entity, Long)` →
-`jdk.internal.reflect.MethodHandleObjectFieldAccessorImpl.set(entity, Long)` — ALL receive the
-`Long`. The corruption is INSIDE that accessor's `set(obj, value)` (JDK bytecode): it does
-`setter.invokeExact(obj, value)` on an `asType`-adapted putField MethodHandle (call-site
-`(Object,Object)V`, MH type `(<Entity>, Long)void`); our VM throws a spurious
-`ClassCastException` from that invoke, caught at the accessor's `catch (ClassCastException)`
-which rethrows via `throwSetIllegalArgumentException(value)` — and the value it reports is the
-`<Entity>`, i.e. the caller's `value` local (slot 2) reads as the entity by then. Not JIT
-(`--nojit` reproduces). `detached.*` (generated-id persist) PASS, so plain id generation works;
-this is the FIELD-ACCESS enhanced entity forcing the MethodHandle reflective-accessor path.
-FURTHER LOCALIZED (DBG_MH on `mh_dispatch` + DBG_MHX on the `invokeExact` native): the JDK
-builds both accessors via `JLIA.unreflectField(field, isSetter)` → `IMPL_LOOKUP.unreflect{Getter,
-Setter}` → our synthetic `MH_KIND_GETTER`/`MH_KIND_SETTER` (asType is a passthrough that only
-stamps `type`). The field **GETTER** `getter.invokeExact(obj)` (`(Object)Object`) routes correctly
-to the `invokeExact` native → `mh_dispatch` (MH_KIND_GETTER) → reads the field — WORKS. The field
-**SETTER** `setter.invokeExact(obj, value)` (`(Object,Object)V`, 2-arg **void**) does NOT reach the
-`invokeExact` native / `mh_dispatch` at all — it diverges in the interpreter's signature-polymorphic
-invoke routing (`vm/src/vm/vm_exec.rs` ~11440-11710, the `check_override` / Some-vs-None-arm /
-poly-desc dispatch), throwing a spurious `ClassCastException` and leaving the caller's `value` local
-reading as the entity. The plain `MH_KIND_SETTER` path in `mh_dispatch` sets the field directly with
-no cast/CCE, so the fix is to make the 2-arg-void field-setter `invokeExact` reach it (mirroring the
-getter). Risk: that routing has many documented special cases (Groovy/Jackson/records/Spring) — needs
-a MethodHandle regression harness. Separate follow-up (MethodHandle subsystem, not loader-faithful
-resolution).
+### UPDATE 2026-07-01 — lazy lambda fix (landed on dev via misc16) + crash→catchable NSME
+
+The `s.persist(entity)` failure — `PropertyAccessException` / `IllegalArgumentException: Can
+not set java.lang.Long field <Entity>.id to <Entity>` — is **NOT** a MethodHandle-subsystem
+bug (the "MethodHandle field-setter" note above was a misdiagnosis). The IAE is thrown from
+`jdk.internal.reflect.MethodHandleFieldAccessorImpl.ensureObj` **before** any `invokeExact`:
+`declaringClass.isAssignableFrom(o.getClass())` is false because the enhancement-test
+transaction **lambda** body ran the *un-enhanced* enclosing-class copy, so its `new <Entity>()`
+produced an un-enhanced entity that mismatched the enhanced mapped class. This exact diagnosis
+and the loader-faithful **lambda impl dispatch** fix landed on dev independently via the misc16
+`@BytecodeEnhanced` sweep — see the "misc16 loader-faithful merge" update below (`27f647ff`),
+the authoritative account. (Independently re-derived here via New-opcode / `Constructor.newInstance`
+/ `isAssignableFrom` instrumentation: the test instance is the enhanced `UserDefined(2)` copy,
+but the lambda body's `new <Entity>` resolved the un-enhanced `Application` copy — cid 3014 vs 413.)
+
+**Net addition of this merge (`fix/lazy-enhancement-lambda-dispatch`, `vm_exec.rs` only):** a
+missing `$$_hibernate_*` accessor at the terminal invoke path in `invoke_on_class_shared_inner`
+now raises a **catchable** `java.lang.NoSuchMethodError` instead of an uncatchable
+`InternalError(Linkage)` process abort. Once the enhanced lambda body runs, Hibernate's
+HHH-16572 `InvalidPropertyNameTest` reaches `entity.$$_hibernate_read_property()` (an
+intentionally-absent enhanced accessor); per JVMS §5.4.3.3 an unresolved method is a throwable
+`LinkageError`. Scoped to gate-on + the `$$_hibernate_` family only (passing call sites never
+reach the terminal) → CRASH → FAIL, gate-off byte-identical. Verified on this worktree's build:
+gate-on `gated_subset` PASS **31 → 54** (19 `enhancement.lazy.*`, incl. `LazyBasicFieldAccessTest`
+ok=2/2), **0 CRASH** (`InvalidPropertyNameTest` CRASH → FAIL ok=1/2); gate-off byte-identical;
+MethodHandle integration tests green (`wp2_5_proxy`/`wave3_b2_dispatch`/`wave2_c_methodhandles`).
 
 ### Precise root cause (traced 2026-06-30) — original SessionFactory CCE characterization
 
@@ -182,17 +178,27 @@ fixes on top of `f658fe12`'s `inherit_lookup_loader` peek:
 
 Sample (`lazycluster.txt`, gate-on): 7/9 PASS incl. `OnlyLazyBasicUpdateTest`
 20/20, `EagerAndLazyBasicUpdateTest` 40/40, `LazyGroup*`, `LazyBasic*`.
-**Residual (new 4th surface):** `lazy.proxy.FetchGraphTest` /
-`SpecializedEntity` — `Lookup.defineClass ... already defined by
-user-defined(4) loader`. Now that the ByteBuddy optimizer bridge
-(`<Entity>$HibernateAccessOptimizerBridge…` / `$HibernateInstantiator`)
-correctly lands in the enhancing namespace, a second `getReflectionOptimizer`
-for a related class in the same inheritance hierarchy **re-defines** the same
-bridge — ByteBuddy's `referenceClass.getClassLoader().loadClass(bridgeName)`
-reuse-check is not finding the first namespace-defined copy, so it hits the
-duplicate-define guard. Next fix: make `findLoadedClass` / `loadClass` on the
-enhancing loader surface classes it defined via `Lookup.defineClass` (so the
-reuse-check succeeds instead of re-defining).
+
+### UPDATE (4th surface) — `Lookup.defineClass` optimizer/bridge duplicate-define FIXED (`b2317b72`)
+
+Now that the ByteBuddy optimizer / access-optimizer bridge correctly lands in
+the enhancing namespace, a second `getReflectionOptimizer` for a class sharing a
+mapped superclass RE-defined the same helper →
+`Lookup.defineClass … already defined by user-defined(4) loader`
+(SessionFactory-build failure for `lazy.proxy.FetchGraphTest` / `SpecializedEntity`).
+Root cause: `lk_define_class_b` never called `register_defining_loader`, so the
+helper's `Class.getClassLoader()` returned the app-loader fallback, and
+ByteBuddy's reuse-check `result.getClassLoader() == referenceClass.getClassLoader()`
+failed → re-define → collision. FIX (gated): register the lookup class's defining
+loader for the newly-defined class, matching `defineClass1` /
+`ClassLoader.defineClass`. `FetchGraphTest` now builds the SessionFactory
+(0→17 tests run) with **no regression** to the 5 misc16 classes.
+
+**Residual (5th surface, NOT loader-faithful):** `FetchGraphTest` now fails at
+runtime — `NPE: $$_hibernate_read_specializedEntities() is null` — a lazy
+*collection* enhancement-runtime bug (the enhanced entity's lazy `Set` field is
+not initialized), distinct from the loader-identity family. `BasicAttributesLazyGroupTest`
+similarly has a residual (`Nested Jupiter execution failed: 1 failure(s)`).
 
 ## Repro
 

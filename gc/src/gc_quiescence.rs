@@ -34,6 +34,24 @@ static JIT_ACTIVE_DEPTH: AtomicUsize = AtomicUsize::new(0);
 pub static ENTER_COUNT: AtomicUsize = AtomicUsize::new(0);
 pub static LEAVE_COUNT: AtomicUsize = AtomicUsize::new(0);
 
+/// Whether the **default moving / compacting young generation**
+/// (`CRATONVM_MOVING_YOUNG`) is enabled. Cached on first read.
+///
+/// When on, `gen_heap::collect_garbage_inner` runs the moving (Cheney) young
+/// collection even while JIT frames are live (`is_active()`), instead of
+/// diverting to the non-moving sweep. Safe only because the JIT publishes a
+/// COMPLETE rewritable precise root map via the shadow stack and the
+/// conservative frame scan is suppressed (see the vm crate's
+/// `conservative_roots::moving_young_enabled` and
+/// `docs/feature-designs/default-moving-young-gen.md`). Off by default; gated for
+/// validation against the bt18 = 68332206 invariant.
+#[inline]
+pub fn moving_young_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("CRATONVM_MOVING_YOUNG").is_some())
+}
+
 /// Increment the global JIT-active counter. Called from the VM crate's
 /// `JitEntryGuard::enter` immediately before transferring control to JIT
 /// code. Returns the new depth (1-based).
@@ -135,6 +153,35 @@ pub fn clear_unregistered_jit_frame_on_stack() {
 #[inline]
 pub fn unregistered_jit_frame_on_stack() -> bool {
     UNREGISTERED_JIT_FRAME.with(|c| c.get())
+}
+
+// ---------------------------------------------------------------------------
+// Per-cycle fallback for incomplete rewritable JIT coverage
+// ---------------------------------------------------------------------------
+//
+// `CRATONVM_MOVING_YOUNG` is only sound while every live JIT-held oop is
+// published through a precise, rewritable root channel. If the VM detects an
+// active JIT frame whose coverage is incomplete, it conservatively scans that
+// frame and sets this per-thread flag so the generational collector runs the
+// non-moving young sweep for this cycle instead of moving objects behind raw
+// JIT frame slots.
+
+thread_local! {
+    static FORCE_NON_MOVING_JIT_ROOTS: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+pub fn set_force_non_moving_jit_roots() {
+    FORCE_NON_MOVING_JIT_ROOTS.with(|c| c.set(true));
+}
+
+pub fn clear_force_non_moving_jit_roots() {
+    FORCE_NON_MOVING_JIT_ROOTS.with(|c| c.set(false));
+}
+
+#[inline]
+pub fn force_non_moving_jit_roots() -> bool {
+    FORCE_NON_MOVING_JIT_ROOTS.with(|c| c.get())
 }
 
 // ---------------------------------------------------------------------------

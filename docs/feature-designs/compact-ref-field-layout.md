@@ -289,34 +289,58 @@ objects still size as `num_slots*SLOT_SIZE`) in both `scan_region*` functions.
 Regression-clean: bt10/14/16 exact, bt16 `GC_STRESS` exact, normal transform
 unchanged.
 
-### Residual (out of scope for the SIGSEGV fix): GC_STRESS missed-mark corruption
+### Third fix: refuse a compact layout built on padding (untyped containers)
 
-With both fixes, compact-ON `transform` no longer SIGSEGVs under `GC_STRESS`, but
-a *caught, non-crashing* corruption remains on that torture load (a reference
-field reads back a stale pointer → interpreted as a garbage header → e.g.
-`java/util/logging/Level` `<clinit>` `ClassCastException` → linkage error;
-compact-OFF `GC_STRESS` is clean).
+`build_compact_layout` (`classloading/src/class.rs`) previously guessed every
+**padded** slot (a `num_total_fields` slot with no field descriptor) as an 8-byte
+reference. But the pure-padding classes are the untyped `ClassId(0)`-minted
+synthetic containers — `cratonvm/synthetic/AnonymousObject$N`, i.e. **every
+HashMap / LinkedHashMap node**, view backing, etc. — and native code stores MIXED
+types into their raw slots (`map_alloc_node` writes `Int(hash)` into slot 0 and
+object refs into slots 1-3). Guessing slot 0 is a reference makes compact
+**auto-box** the int and gives the GC a wrong oop-map; under `GC_STRESS` this
+strands the node's real reference slots. A class with no descriptors cannot have
+a trustworthy oop-map, so `build_compact_layout` now returns `None` (→ legacy
+uniform 16-byte tagged-`Value` cells, where every slot self-describes via its tag
+— exactly the correct, compact-OFF behaviour for these containers) whenever any
+padding is needed. Classes whose every slot has a real descriptor (bt `TreeNode`,
+etc.) are unaffected and stay compact. Regression-clean: bt10/14/16 + bt16
+`GC_STRESS` checksums exact, normal `transform` unchanged. Trade-off: HashMap-node
+footprint reverts to legacy (they were never safely compactable without real
+field types); the bt16 throughput win rests on `TreeNode`, which is unaffected.
 
-**Localized (2026-07-01), not yet fixed.** Minimal deterministic repro:
-`scratch/GcStressRepro.java` (mixed ref+primitive `Node` list + logging init)
-under `CRATONVM_COMPACT_REF_FIELDS=1 CRATONVM_GC_STRESS=1 -Xmx128m` — HotSpot and
-compact-OFF both print `sum=49920 OK`, compact-ON corrupts (`gen_heap::read_slot:
-corrupt Value cell`). What the investigation established:
-- It is a **missed mark / dangling reference**, not a bad write: a ref slot holds
-  a stale young pointer (e.g. `0x1A9B2440`) into freed/reused memory. A
-  `dbg_check_slot_write` bounds-guard on every GC ref-update write-back
-  (`forward_ref_slots` + the three dirty-card branches) fired **zero** times.
-- It needs **no evacuation/promotion**: `CRATONVM_SP_STATS` shows `evac=0` on the
-  corrupting run, so the promotion-fixup paths (3a/3b/3c) are not involved.
-- It is compact-specific and `GC_STRESS`-only (a GC on nearly every allocation),
-  at **all** heap sizes (64m–2g), so it is not old-gen-allocator pressure.
-- Yet every obvious compact scan **is** already flag-aware — the young mark trace
-  and BFS (`for_each_ref_slot`), the non-moving sweep sizing
-  (`gen_object_total_size`), and the dirty-card seed (`scan_dirty_cards`) all use
-  `compact_oop_scan`. So the gap is a subtler root/precision or write-barrier edge
-  in how a compact object's 8-byte reference is (not) reached by the mark under
-  the non-moving sweep — the same hard GC-precision family tracked in the
-  moving-young/roots memory cluster. This wants a dedicated pass, not a spot fix.
+### Residual (out of scope): GC_STRESS corruption is the moving-young GC-precision family
+
+With all three fixes, compact-ON `transform` still shows a *caught, mostly
+non-crashing* corruption under `GC_STRESS` only (`java/util/logging/Level`
+init → `ClassCastException` / linkage error). Minimal deterministic repro:
+`scratch/GcStressRepro.java` (Node churn **plus** `Level.INFO` init); the
+**identical repro with the logging removed is 100 % clean**, so the corruption is
+specific to the **weak-reference / reference-processing path**, not general
+compact GC.
+
+Root cause established (2026-07-01), **not a compact-layout bug and not a single
+fixable defect**:
+- Byte-level heap scans show an 8-byte pointer written at a **legacy
+  `java.lang.ref.Reference`'s offset 0** (its `class_id`); the corrupt values
+  resolve to `Level$KnownLevel` and `ReferenceQueue` — the weak-ref machinery.
+- `interpreter.rs` reference processing enqueues/clears through **raw pre-GC
+  addresses**; its stale-address guards (`is_stale_young` is young-only, the
+  `num_fields<2` reused-slot check is admittedly weak — the code cites prior
+  `bc-math-ec 0x4` and `h2-testscript-segv` root-cause battles) miss an old-gen
+  Reference whose slot was reused, linking garbage into a live `ReferenceQueue`.
+- BUT `CRATONVM_DBG_NO_REFPROC=1` (disable ALL reference processing) does **not**
+  make it clean — it still corrupts occasionally and yields a *wrong* `sum` — so
+  reference processing is one manifestation, not the sole writer. The corruption
+  is **nondeterministic and multi-faceted**: the deep moving-young /
+  missed-root GC-precision family that is an active open cluster **even without
+  compact** (see the GC/moving-young/roots memory group). Compact's smaller
+  footprint merely shifts GC timing enough to expose it on this load.
+
+Because it is compact-*exposed*, not compact-*caused*, and disabling the prime
+suspect subsystem does not resolve it, a targeted compact-side fix cannot close
+it; it belongs to the ongoing GC-precision effort. Flag stays default-OFF, so
+this torture-mode residual gates nothing.
 
 Two lesser threads noted along the way (edge/footprint, gated behind the
 default-OFF flag): (1) the JIT inline getfield ref path returns the bare slot

@@ -808,6 +808,29 @@ unsafe fn try_call_compiled_entry(
     }
 }
 
+/// Call a compiled entry from a JIT dispatch helper while suspending the
+/// debug borrow tracker for the outer JIT frame.
+///
+/// A compiled callee can immediately re-enter JIT dispatch and borrow the
+/// same `JvmThread`. That nested borrow is a child reborrow of the outer JIT
+/// frame, but the direct fast paths do not go through `set_jit_thread`, so the
+/// debug tracker must be suspended explicitly around the raw call.
+#[inline]
+// SAFETY: same entry ABI contract as `try_call_compiled_entry`.
+unsafe fn try_call_compiled_entry_reentrant(
+    entry: usize,
+    needs_ctx: bool,
+    vm_ptr: i64,
+    args_slice: &[i64],
+) -> Option<i64> {
+    #[cfg(debug_assertions)]
+    let borrow = suspend_jit_borrow();
+    let result = try_call_compiled_entry(entry, needs_ctx, vm_ptr, args_slice);
+    #[cfg(debug_assertions)]
+    restore_jit_borrow(borrow);
+    result
+}
+
 /// Bail a JIT-dispatched call out to the interpreter when the compiled
 /// callee has more arguments than `call_jit_compiled_method_entry`'s
 /// register-arg dispatch tables can pass. Issues `invoke_or_native` with
@@ -3685,7 +3708,11 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
     // (`ctx.invoke_virtual`). Hot monomorphic virtual sites are already served
     // by the receiver-guarded MIC helper (`jit_invoke_virtual_mic`).
     let statically_bound = matches!(info.invoke_kind, 1 | 3);
-    let cached_entry = if statically_bound {
+    let redefine_jit_quiesced = crate::classloading::any_class_redefined();
+    if redefine_jit_quiesced {
+        DISPATCH_CACHE.with(|dc| dc.borrow_mut().clear());
+    }
+    let cached_entry = if statically_bound && !redefine_jit_quiesced {
         DISPATCH_CACHE.with(|dc| {
             dc.borrow()
                 .get(&info_key)
@@ -3708,7 +3735,7 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
         // wave-2 changed it to fall through to the slow path, and this wave goes one
         // step further by routing directly through `bail_to_interpreter` so the bail is
         // explicit at the call site (matches the MIC fast-path at `:1722`).
-        if let Some(rc) = try_call_compiled_entry(entry, needs_ctx, vm_ptr, args_slice) {
+        if let Some(rc) = try_call_compiled_entry_reentrant(entry, needs_ctx, vm_ptr, args_slice) {
             if crate::runtime::env_cache::jit_dispatch_dbg() {
                 eprintln!(
                     "[JIT_DISPATCH_RET/dcache] {}.{}{} ret=0x{:x}",
@@ -3735,7 +3762,7 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
     // wasted allocations per hot call. Deref coercion handles the conversion.
     // Gated on `statically_bound`: the lookup key is the static CP class, which
     // is only the correct dispatch target for invokespecial/invokestatic.
-    if statically_bound {
+    if statically_bound && !redefine_jit_quiesced {
         let jit_cache = vm.jit_cache.read();
         if let Some(compiled) = jit_cache.get(info.class_name, info.method_name, info.descriptor) {
             let entry = compiled.entry_ptr() as usize;
@@ -3763,7 +3790,9 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
             // via `bail_to_interpreter` rather than silently returning 0 (the original
             // wave-2 fall-through was already correct; this just makes the bail
             // explicit at the call site to match the MIC fast-path).
-            if let Some(rc) = try_call_compiled_entry(entry, needs_ctx, vm_ptr, args_slice) {
+            if let Some(rc) =
+                try_call_compiled_entry_reentrant(entry, needs_ctx, vm_ptr, args_slice)
+            {
                 if crate::runtime::env_cache::jit_dispatch_dbg() {
                     eprintln!(
                         "[JIT_DISPATCH_RET/jcache] {}.{}{} ret=0x{:x}",
@@ -3787,6 +3816,7 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
     // caching it under the callsite key would re-introduce the supertype
     // miscompile for a virtual/interface site.
     let should_compile = statically_bound
+        && !redefine_jit_quiesced
         && DISPATCH_COUNTER.with(|dc| {
             let mut map = dc.borrow_mut();
             let count = map.entry(info_key).or_insert(0);
@@ -3814,7 +3844,9 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
             // SAFETY: entry was just produced by try_compile_callee, which returns a validated
             // JIT entry pointer. CRIT round-5 fix: bail explicitly to the interpreter on
             // >ARG_REGS args via `bail_to_interpreter` (matches the MIC fast-path).
-            if let Some(rc) = try_call_compiled_entry(entry, needs_ctx, vm_ptr, args_slice) {
+            if let Some(rc) =
+                try_call_compiled_entry_reentrant(entry, needs_ctx, vm_ptr, args_slice)
+            {
                 // BUG-H: route a callee-thrown implicit exception through the
                 // callee's own exception table (see dcache site above).
                 return route_implicit_exc_through_callee(vm, info, args_slice, rc);
@@ -4218,6 +4250,14 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
     }
 
     let mic = &*(mic_ptr as *const JitMICSlot);
+    let redefine_jit_quiesced = crate::classloading::any_class_redefined();
+    if redefine_jit_quiesced {
+        mic.clear_compiled_entry();
+        if pic_ptr != 0 {
+            let pic = &*(pic_ptr as *const JitPICSlot);
+            pic.clear_entries();
+        }
+    }
     let cached_cid = mic
         .cached_class_id
         .load(std::sync::atomic::Ordering::Acquire);
@@ -4246,7 +4286,7 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
         let entry = mic
             .cached_entry_ptr
             .load(std::sync::atomic::Ordering::Acquire);
-        if entry != 0 {
+        if entry != 0 && !redefine_jit_quiesced {
             // Direct call to the compiled callee — same ABI as `jit_invoke_dispatch`
             // uses after a JIT-cache hit (receiver + params in `args_slice`, optional
             // leading `vm_ptr` when `cached_needs_context` is true).  **Do not** pass
@@ -4264,25 +4304,7 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
             mic_prof::bump(&mic_prof::MIC_HIT_ENTRY);
             let rc_opt = {
                 let _g = mic_prof::CycGuard::new(&mic_prof::CYC_HIT_ENTRY_CALL);
-                // DEBUG-ONLY soundness: this MIC-hit fast path re-enters a compiled
-                // callee directly while THIS frame still holds its `_jit_thread_guard`
-                // (acquired above). If the callee makes its own JIT dispatch (e.g. an
-                // `invokeinterface` to a JIT'd `Consumer.accept` whose body reaches a
-                // helper taking `jit_thread_mut`), that inner borrow is a legitimate
-                // *child reborrow* — but the fast path never told the borrow tracker, so
-                // it tripped `jit_thread_mut`'s `debug_assert!` ("sibling fabrication").
-                // The interpreter/bail re-entry path suspends the flag via
-                // `set_jit_thread`; mirror just the flag half here. Release is unaffected
-                // (the flag and these fns are `#[cfg(debug_assertions)]`; the aliasing is
-                // the accepted nested-reborrow pattern). Repro: scratch `D2` — an
-                // anonymous `Consumer` driven through an `invokeinterface` loop — panicked
-                // here before this wrap; with it, `D2` matches HotSpot.
-                #[cfg(debug_assertions)]
-                let _borrow = suspend_jit_borrow();
-                let r = try_call_compiled_entry(entry as usize, needs_ctx, vm_ptr, args_slice);
-                #[cfg(debug_assertions)]
-                restore_jit_borrow(_borrow);
-                r
+                try_call_compiled_entry_reentrant(entry as usize, needs_ctx, vm_ptr, args_slice)
             };
             if let Some(rc) = rc_opt {
                 // BUG-H: if the receiver-resolved callee threw an implicit
@@ -4367,7 +4389,9 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
         // unequal (bc-java InterleaveTest, junit assertEquals(Object,Object)).
         // `find_method_recursive` (inside `try_jit_compile_callee`) walks up
         // from the receiver class to the real override.
-        let compile_res = {
+        let compile_res = if redefine_jit_quiesced {
+            None
+        } else {
             let _g = mic_prof::CycGuard::new(&mic_prof::CYC_COMPILE_PROBE);
             crate::runtime::interpreter::try_jit_compile_callee(
                 vm,
@@ -4484,7 +4508,9 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
     // (`class_name`), not the static `info.class_name` — see the matching
     // VIRTUAL DISPATCH FIX in the cache-hit branch above. `class_name` here is
     // an `Arc<str>`; deref to `&str` for the resolver.
-    let compile_res = {
+    let compile_res = if redefine_jit_quiesced {
+        None
+    } else {
         let _g = mic_prof::CycGuard::new(&mic_prof::CYC_COMPILE_PROBE);
         crate::runtime::interpreter::try_jit_compile_callee(
             vm,
@@ -4896,6 +4922,32 @@ pub unsafe extern "C" fn jit_uncommon_trap(vm_ptr: i64, reason: i64, bci: i64) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compiled_entry_reentrant_wrapper_preserves_no_ctx_abi() {
+        unsafe extern "C" fn ret_seven() -> i64 {
+            7
+        }
+
+        // SAFETY: the test function has the no-context, zero-arg ABI selected below.
+        let result = unsafe {
+            try_call_compiled_entry_reentrant(ret_seven as *const () as usize, false, 0, &[])
+        };
+        assert_eq!(result, Some(7));
+    }
+
+    #[test]
+    fn compiled_entry_reentrant_wrapper_preserves_ctx_abi() {
+        unsafe extern "C" fn add_ctx_arg(ctx: i64, arg: i64) -> i64 {
+            ctx + arg
+        }
+
+        // SAFETY: the test function has the with-context, one-arg ABI selected below.
+        let result = unsafe {
+            try_call_compiled_entry_reentrant(add_ctx_arg as *const () as usize, true, 5, &[7])
+        };
+        assert_eq!(result, Some(12));
+    }
 
     #[test]
     fn jit_checkcast_null_ptr_returns_zero() {

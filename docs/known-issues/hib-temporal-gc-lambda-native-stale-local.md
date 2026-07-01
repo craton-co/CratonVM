@@ -82,9 +82,34 @@ elements stable across a reorder): `native_stream_for_each` (eager path), `nativ
 materialized element (and freshly-produced results), re-read each from its handle before the (allocating)
 dispatch, and re-read `this` before any post-loop `set_field`. This removes the `[lambda-stray]` crash.
 
-**Still-unpinned siblings (same pattern, lower-priority — not on the observed temporal path):**
-`native_stream_distinct`, `native_stream_flat_map`, `native_stream_reduce_*`, `native_stream_{any,all}_match`,
-`native_stream_{min,max}`, `native_al_sort_comparator`, `native_al_remove_if`, `native_al_replace_all`.
+**Additional sweep (2026-07-01):** the previously lower-priority siblings with the same stale-native-local
+pattern are now pinned as well in `native-collections/src/lib.rs`: `make_stream` / derived-stream construction,
+`Stream.iterator` / `toArray`, `native_stream_distinct`, `native_stream_flat_map`, `native_stream_peek`,
+`native_stream_reduce_*`, `native_stream_{any,all,none}_match`, `native_stream_{min,max}`,
+`native_stream_map_to_int`, plus `native_al_sort_comparator`, `native_al_remove_if`, and
+`native_al_replace_all`. The native-collections mock now has a callback-triggered moving-GC simulation and
+regression coverage for `Stream.forEach` and `ArrayList.removeIf`. This broadens the per-native pinning fix;
+it does **not** claim to close the distinct residual GC root-coverage family described above.
+
+**Additional callback sweep (2026-07-01, follow-up):** the same pin/re-read pattern now covers more
+collection callback loops that can be reached from real app code: `LinkedHashMap.forEach`,
+`ArrayDeque.forEach`, `TreeMap.forEach`, `TreeSet.forEach`, both `ConcurrentHashMap.forEach` overloads
+registered here, and `Collections$UnmodifiableList$ListItr.forEachRemaining`. Focused regressions now
+simulate a moving GC during callbacks for `LinkedHashMap.forEach` and `TreeMap.forEach` in
+`native-collections/tests/gc_native_pins.rs`.
+
+**Additional map-functional sweep (2026-07-01, follow-up):** `HashMap.computeIfAbsent`,
+`HashMap.compute`, `HashMap.computeIfPresent`, `HashMap.merge`, `HashMap.replaceAll`, plus the
+analogous `TreeMap.computeIfAbsent` / `TreeMap.merge` paths now pin and re-read their map receiver,
+callback, keys, old values, merge values, and callback results across `invoke_virtual`. The same
+generic HashMap helpers are used by `ConcurrentHashMap.compute`, `merge`, and `replaceAll` after segment
+selection. The native-collections mock relocation hook now also rewrites heap fields/array slots for
+moved pins, and `gc_native_pins.rs` covers `HashMap.replaceAll` under callback-triggered moving GC.
+
+**Additional CHM bulk sweep (2026-07-01, follow-up):** the `ConcurrentHashMap` bulk operations
+registered here (`forEachEntry`, `forEachKey`, `forEachValue`, and `search`) now pin and re-read their
+callback plus the collected key/value snapshots across each callback dispatch. Focused regressions cover
+`ConcurrentHashMap.forEachKey` and `ConcurrentHashMap.search` under callback-triggered moving GC.
 
 **Do NOT** try to fix this by forcing the non-moving sweep when a native is active: it re-triggers the
 documented [`HIB-CV-33`](HIB-CV-33-sigsegv-execute-fault-joined-inheritance-sf-build.md) precise-root

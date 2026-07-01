@@ -3465,7 +3465,9 @@ pub fn execute(
         // `try_osr` so the user-facing CRATONVM_DISABLE_JIT flag actually disables
         // the FIRST-CALL JIT compile path here too.
         let env_disable_jit = crate::runtime::env_cache::disable_jit();
+        let redefine_jit_quiesced = crate::classloading::any_class_redefined();
         if env_disable_jit
+            || redefine_jit_quiesced
             || already_skipped
             || static_skip_reason.is_some()
             || fjp_skip
@@ -17814,8 +17816,14 @@ fn force_native_over_real_jdk_bytecode(
     // SimpleDateFormat runs with a valid pattern. Companion native registered in
     // `native-builtins::locale_resources::register`; same locale-data-gap class
     // as the BreakIterator / getDecimalFormatSymbolsData overrides.
+    // The java.time localized-formatting path
+    // (DateTimeFormatterBuilder.getLocalizedDateTimePattern →
+    // getJavaTimeDateTimePattern) reads the same unsurfaced jdk.localedata
+    // bundle and otherwise returns null → `appendPattern(null)` NPE ("pattern"),
+    // breaking Spring's LocalDate/LocalDateTime style formatting & parsing.
     if class_name == "sun/util/locale/provider/LocaleResources"
-        && method_name == "getDateTimePattern"
+        && (method_name == "getDateTimePattern"
+            || method_name == "getJavaTimeDateTimePattern")
     {
         return true;
     }
@@ -19590,9 +19598,10 @@ fn execute_invokestatic_cached(
     // (e.g. Mockito `mockStatic(X)` woves X's static methods) — evict and
     // re-resolve so the woven bytecode + advice run. Fast-pathed on
     // `any_class_redefined`.
-    if crate::classloading::any_class_redefined()
+    let redefine_jit_quiesced = crate::classloading::any_class_redefined();
+    if redefine_jit_quiesced
         && matches!(
-            target,
+            &target,
             CachedInvokeTarget::Native { .. } | CachedInvokeTarget::Intrinsic { .. }
         )
     {
@@ -19602,6 +19611,10 @@ fn execute_invokestatic_cached(
                 return Ok(CachedCallResult::CacheMiss);
             }
         }
+    }
+    if redefine_jit_quiesced && matches!(&target, CachedInvokeTarget::Jit { .. }) {
+        thread.invoke_cache.evict(caller_class_id, cp_index, false);
+        return Ok(CachedCallResult::CacheMiss);
     }
     if crate::runtime::env_cache::modstatic_dbg() {
         if let Ok((mcn, mn, _, _)) = resolve_method_ref(shared, caller_class_id, cp_index) {
@@ -19685,7 +19698,7 @@ fn execute_invokestatic_cached(
         } => {
             // Fast path: check if the method was already JIT-compiled (e.g. by OSR)
             // before going through the invocation counter.
-            {
+            if !redefine_jit_quiesced {
                 let jit_cache = shared.jit_cache.read();
                 if let Some(compiled) = jit_cache.get(
                     &cached.class_name,
@@ -19792,7 +19805,7 @@ fn execute_invokestatic_cached(
             let should_attempt = past_threshold
                 && (invoc_count == jit_invocation_threshold
                     || (invoc_count - jit_invocation_threshold) % JIT_RETRY_STRIDE == 0);
-            if should_attempt {
+            if should_attempt && !redefine_jit_quiesced {
                 // Consult tiered compilation manager for recommended tier
                 let tiered_key = crate::jit::tiered::MethodKey::new(
                     cached.class_name.as_ref(),
@@ -20726,6 +20739,9 @@ fn try_osr(
     class_id: ClassId,
     entry_pc: usize,
 ) -> Option<Option<Value>> {
+    if crate::classloading::any_class_redefined() {
+        return None;
+    }
     let frame = &thread.frames[frame_idx];
     let class_name = frame.class_name().to_string();
     let method_name = frame.method_name().to_string();
@@ -20765,12 +20781,11 @@ fn try_osr(
 
     // Set JIT thread for invoke dispatch callbacks (save/restore for re-entrancy)
     let saved_jit_thread = crate::jit::helpers::set_jit_thread(thread);
-    // Shadow-stack (follow-up §1): capture this `*mut JvmThread` so the OSR
-    // trampoline can cache it and the OSR-entered frame's safepoints push/reload
-    // precisely (instead of skipping shadow tracking). `set_jit_thread` just
-    // allocated this thread's shadow stack — it's the same thread. The value is a
-    // raw address (Copy `i64`, holds no borrow), so the closure below captures it
-    // by value and `thread` stays free for later use.
+    // Capture this `*mut JvmThread` so the OSR trampoline can cache it and the
+    // OSR-entered frame's safepoints push/reload precisely. `set_jit_thread`
+    // just allocated this thread's shadow stack; the value is a raw address
+    // (Copy `i64`, holds no borrow), so the closure below captures it by value
+    // and `thread` stays free for later use.
     // Cast: reinterpret pointer/address to typed pointer
     let thread_ptr = thread as *mut JvmThread as i64;
     // NEW-1.5 + T1.1.a: record native stack pointer for GC root scan.
@@ -21231,6 +21246,9 @@ fn try_jit_upgrade_with_gate(
     // (the caller-method counter path here, and the dispatcher path there).
     // Useful for bisecting JIT-vs-interpreter bugs during bootstrap crashes.
     if crate::runtime::env_cache::disable_jit() {
+        return None;
+    }
+    if crate::classloading::any_class_redefined() {
         return None;
     }
     // RBC.4 — short-circuit permanently-uncompilable methods BEFORE the
@@ -22170,6 +22188,9 @@ pub fn try_jit_compile_callee(
     if crate::runtime::env_cache::disable_jit() {
         return None;
     }
+    if crate::classloading::any_class_redefined() {
+        return None;
+    }
     // RBC.4 — short-circuit permanently-uncompilable methods before the
     // FJP/native-shadow hierarchy walks (see try_jit_upgrade_with_gate).
     if crate::jit::is_jit_bail_listed(class_name, method_name, descriptor) {
@@ -22812,6 +22833,9 @@ fn background_compile_task(
         Some(s) => s,
         None => return 0, // VM dropped (teardown) — nothing to compile.
     };
+    if crate::classloading::any_class_redefined() {
+        return 0;
+    }
     let optimized = crate::jit::tiered::tier_uses_optimized_backend(task.target_tier);
     if std::env::var_os("CRATONVM_DBG_JITC").is_some() {
         eprintln!(
@@ -24137,6 +24161,35 @@ fn execute_jit_call_decoded(
 /// Bounds: `class_id` out-of-range and `slot` out-of-range both return
 /// `CacheMiss` via `VtableManager::resolve_virtual_slot`'s own bounds
 /// checks (see `vtable.rs` tests).
+const NATIVE_SHADOW_CACHE_MAX_ENTRIES: usize = 8192;
+
+#[inline]
+fn vtable_native_shadow_cache_key(
+    receiver_class_id: ClassId,
+    method_name: &str,
+    method_descriptor: &str,
+) -> (u32, u64, u64) {
+    (
+        receiver_class_id.as_u32(),
+        crate::runtime::fx_collections::fx_hash_str(method_name),
+        crate::runtime::fx_collections::fx_hash_str(method_descriptor),
+    )
+}
+
+#[inline]
+fn remember_vtable_native_shadow(
+    thread: &mut JvmThread,
+    key: Option<(u32, u64, u64)>,
+    verdict: bool,
+) {
+    if let Some(key) = key {
+        if thread.native_shadow_cache.len() >= NATIVE_SHADOW_CACHE_MAX_ENTRIES {
+            thread.native_shadow_cache.clear();
+        }
+        thread.native_shadow_cache.insert(key, verdict);
+    }
+}
+
 #[inline]
 fn execute_invokevirtual_vtable_fast(
     shared: &SharedVm,
@@ -24371,71 +24424,89 @@ fn execute_invokevirtual_vtable_fast(
                 drop(cm);
                 return Ok(CachedCallResult::CacheMiss);
             }
-            if !receiver_redefined
-                && shared
-                    .native_methods
-                    .find(rcv_name, &method_name, &method_descriptor)
-                    .is_some()
-            {
+            let native_shadow_cache_key = (!crate::classloading::any_class_redefined()).then(|| {
+                vtable_native_shadow_cache_key(
+                    receiver_class_id,
+                    &method_name,
+                    &method_descriptor,
+                )
+            });
+            let cached_native_shadow = native_shadow_cache_key
+                .and_then(|key| thread.native_shadow_cache.get(&key).copied());
+            if cached_native_shadow == Some(true) {
+                drop(cm);
+                return Ok(CachedCallResult::CacheMiss);
+            }
+            if cached_native_shadow != Some(false) {
+                let direct_native_shadow = !receiver_redefined
+                    && shared
+                        .native_methods
+                        .find(rcv_name, &method_name, &method_descriptor)
+                        .is_some();
+                if direct_native_shadow {
+                    remember_vtable_native_shadow(thread, native_shadow_cache_key, true);
+                    if &**rcv_name == "java/lang/invoke/ConstantCallSite"
+                        && std::env::var_os("CRATONVM_DBG_CCSPROBE").is_some()
+                    {
+                        eprintln!(
+                            "[ccs-probe] vtable_fast: native found for {} {}{} — emitting CacheMiss",
+                            rcv_name, method_name, method_descriptor,
+                        );
+                    }
+                    drop(cm);
+                    return Ok(CachedCallResult::CacheMiss);
+                }
                 if &**rcv_name == "java/lang/invoke/ConstantCallSite"
                     && std::env::var_os("CRATONVM_DBG_CCSPROBE").is_some()
                 {
                     eprintln!(
-                        "[ccs-probe] vtable_fast: native found for {} {}{} — emitting CacheMiss",
+                        "[ccs-probe] vtable_fast: native NOT found for {} {}{}",
                         rcv_name, method_name, method_descriptor,
                     );
                 }
-                drop(cm);
-                return Ok(CachedCallResult::CacheMiss);
-            }
-            if &**rcv_name == "java/lang/invoke/ConstantCallSite"
-                && std::env::var_os("CRATONVM_DBG_CCSPROBE").is_some()
-            {
-                eprintln!(
-                    "[ccs-probe] vtable_fast: native NOT found for {} {}{}",
-                    rcv_name, method_name, method_descriptor,
-                );
-            }
-            // FJP fix: walk the parent chain to find natives registered on
-            // a superclass (e.g. `RecursiveTask.fork()` defined on
-            // `ForkJoinTask` but registered as a Rust native at
-            // `RecursiveTask`). Without this walk, the vtable would
-            // dispatch the inherited JDK bytecode for `fork()`, which uses
-            // Unsafe CAS and bypasses our native side-table.
-            let mut cid = receiver_class_id;
-            while let Some(parent_id) = cm.get_class(cid).and_then(|c| c.superclass) {
-                if let Some(parent) = cm.get_class(parent_id) {
-                    // S107 collection-toString fix: if this parent has its
-                    // own bytecode for the method, the bytecode override wins
-                    // over any deeper native ancestor (e.g. Object.toString).
-                    // Stop walking so the vtable bytecode path runs.
-                    //
-                    // Round 19 (peaceful-sammet) — IMPORTANT exception: if
-                    // the parent has BOTH bytecode AND a Rust native, the
-                    // native wins. See `populate_virtual_invoke_cache` for
-                    // the LinkedHashMap-overlay rationale.
-                    let has_bytecode = parent
-                        .find_method(&method_name, &method_descriptor)
-                        .is_some();
-                    // Suppress an inherited native shadow when the declaring
-                    // parent has been redefined by an agent (woven bytecode wins).
-                    let parent_redefined = crate::classloading::any_class_redefined()
-                        && cm.class_redefine_generation(parent_id) > 0
-                        && !redefine_immune_reflection_native(&parent.name, &method_name);
-                    let has_native = !parent_redefined
-                        && shared
-                            .native_methods
-                            .find(&parent.name, &method_name, &method_descriptor)
+                // FJP fix: walk the parent chain to find natives registered on
+                // a superclass (e.g. `RecursiveTask.fork()` defined on
+                // `ForkJoinTask` but registered as a Rust native at
+                // `RecursiveTask`). Without this walk, the vtable would
+                // dispatch the inherited JDK bytecode for `fork()`, which uses
+                // Unsafe CAS and bypasses our native side-table.
+                let mut cid = receiver_class_id;
+                while let Some(parent_id) = cm.get_class(cid).and_then(|c| c.superclass) {
+                    if let Some(parent) = cm.get_class(parent_id) {
+                        // S107 collection-toString fix: if this parent has its
+                        // own bytecode for the method, the bytecode override wins
+                        // over any deeper native ancestor (e.g. Object.toString).
+                        // Stop walking so the vtable bytecode path runs.
+                        //
+                        // Round 19 (peaceful-sammet) — IMPORTANT exception: if
+                        // the parent has BOTH bytecode AND a Rust native, the
+                        // native wins. See `populate_virtual_invoke_cache` for
+                        // the LinkedHashMap-overlay rationale.
+                        let has_bytecode = parent
+                            .find_method(&method_name, &method_descriptor)
                             .is_some();
-                    if has_native {
-                        drop(cm);
-                        return Ok(CachedCallResult::CacheMiss);
+                        // Suppress an inherited native shadow when the declaring
+                        // parent has been redefined by an agent (woven bytecode wins).
+                        let parent_redefined = crate::classloading::any_class_redefined()
+                            && cm.class_redefine_generation(parent_id) > 0
+                            && !redefine_immune_reflection_native(&parent.name, &method_name);
+                        let has_native = !parent_redefined
+                            && shared
+                                .native_methods
+                                .find(&parent.name, &method_name, &method_descriptor)
+                                .is_some();
+                        if has_native {
+                            remember_vtable_native_shadow(thread, native_shadow_cache_key, true);
+                            drop(cm);
+                            return Ok(CachedCallResult::CacheMiss);
+                        }
+                        if has_bytecode {
+                            break;
+                        }
                     }
-                    if has_bytecode {
-                        break;
-                    }
+                    cid = parent_id;
                 }
-                cid = parent_id;
+                remember_vtable_native_shadow(thread, native_shadow_cache_key, false);
             }
         }
         drop(cm);
@@ -24860,6 +24931,7 @@ fn execute_invokevirtual_cached(
                     // frame push below (the operand stack is untouched).
                     if !is_special
                         && !cached.is_synchronized
+                        && !crate::classloading::any_class_redefined()
                         && crate::runtime::env_cache::jit_virtual_tierup()
                     {
                         // Fast path: already compiled (by this counter or OSR)?

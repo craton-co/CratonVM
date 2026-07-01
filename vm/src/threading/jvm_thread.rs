@@ -27,6 +27,7 @@ use parking_lot::{Condvar as PLCondvar, Mutex as PLMutex};
 
 use crate::classloading::resolution::InvokeCache;
 use crate::native::registry::StackTraceEntry;
+use crate::runtime::fx_collections::FxHashMap;
 use crate::runtime::frame::Frame;
 use crate::types::{ObjectRef, Value};
 
@@ -312,6 +313,19 @@ pub struct JvmThread {
     /// No locking needed since each thread owns its cache.
     pub invoke_cache: InvokeCache,
 
+    /// Thread-local cache for the vtable-fast native-shadow guard.
+    ///
+    /// On invoke-cache misses, `execute_invokevirtual_vtable_fast` checks whether
+    /// the receiver class or one of its native-shadowed ancestors should cede
+    /// dispatch to the native/intrinsic path. HQL/lambda-heavy workloads can miss
+    /// the invoke cache repeatedly, and the old guard paid a native-registry hash
+    /// lookup for every ancestor on every miss.
+    ///
+    /// Keyed by `(receiver_class_id, method_name_hash, descriptor_hash)` and
+    /// bypassed whenever class redefinition is active, because redefine can
+    /// suppress native shadows for woven bytecode.
+    pub native_shadow_cache: FxHashMap<(u32, u64, u64), bool>,
+
     /// Whether this is a platform or virtual thread (JEP 444, Java 21).
     pub kind: ThreadKind,
 
@@ -467,6 +481,7 @@ impl JvmThread {
             native_pin_roots: Vec::new(),
             native_pending_return: None,
             invoke_cache: InvokeCache::new(),
+            native_shadow_cache: FxHashMap::default(),
             kind: ThreadKind::Platform,
             pin_count: 0,
             pin_reason: "",

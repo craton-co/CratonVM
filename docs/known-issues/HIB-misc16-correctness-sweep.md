@@ -44,7 +44,7 @@ CRATONVM_DISABLE_DEFAULT_WATCHDOG=1 $CV --java-home "C:/Program Files/Java/jdk-2
 | 10 | `util.dtd.EntityResolverTest` | unmapped entity `[Child]` | synthetic `XMLInputFactory.newInstance()` stub shadows real Woodstox → resolver ignored, general entity not expanded | **FIXED** (default-ON; `CRATONVM_REAL_STAX_FACTORY=0` escape hatch); slowness is separate (§15–16) |
 | 11 | `jpa.transaction.TransactionTimeoutTest` | `getStatus()=0 ACTIVE` | Narayana transaction-reaper thread never fires the 2s timeout | OPEN — new |
 | 12 | `id.uuid.rfc9562.UUidV6V7GeneratorTest` | MockitoException | native `AnnotatedTypeBaseImpl.location` null → `getAnnotatedOwnerType` NPE | **NPE FIXED**; residual = 1M-iteration slowness (§15–16 cluster) |
-| 13 | `batchfetch.DynamicBatchFetchTest` | `testMultiLoad` 120s timeout (param-binding 1/2 now passes) | slowness (2000-row multiLoad); HIB-CV-37 #2 param-binding appears fixed | Route → HIB-CV-37 |
+| 13 | `batchfetch.DynamicBatchFetchTest` | `testMultiLoad` 120s timeout (param-binding 1/2 now passes) | slowness (2000-row multiLoad); old param-binding failure appears fixed | Route → slowness cluster (§15-16) |
 | 14 | `service.ClassLoaderServiceImplTest` | AssertionError (2/2) | (a) real-mode `loadClass` skipped `findLoadedClass` (override-first copy lost); (b) `ServiceLoader` read a `file:` descriptor URL as a classpath resource | **FIXED** (this branch; HIB-CV-24 family) |
 | 15 | `query.hql.FunctionTests` | HANG @300s (really ~49× slow) | CPU-bound in interpreter `NativeMethodRegistry::find` (per-invoke native-shadow check, invoke-cache miss); NOT logging | OPEN — slowness (profiled) |
 | 16 | `query.hql.StandardFunctionTests` | HANG @300s (really slow) | same slowness cluster as §15 | OPEN — slowness |
@@ -333,13 +333,14 @@ cluster, not a new correctness bug.
 
 ---
 
-## 13. DynamicBatchFetchTest — route → HIB-CV-37
+## 13. DynamicBatchFetchTest — route → slowness cluster
 
 `found=2 ok=1 failed=1`: the previously-failing `testDynamicBatchFetch`
-(HIB-CV-37 #2 — `JdbcParameterBindingsImpl` IdentityHashMap param-binding miss)
-now **passes**; the remaining failure is `testMultiLoad` exceeding the 120 s
-per-test timeout (2000-row insert + `byMultipleIds` multiLoad — slowness, not
-wrong-result). Tracked under `HIB-CV-37`.
+`JdbcParameterBindingsImpl` IdentityHashMap param-binding miss now **passes**;
+the remaining failure is `testMultiLoad` exceeding the 120 s per-test timeout
+(2000-row insert + `byMultipleIds` multiLoad — slowness, not wrong-result).
+Keep it with the Hibernate slowness work unless a fresh correctness failure
+appears.
 
 ## 14. ClassLoaderServiceImplTest — FIXED (two real-JDK-mode loader bugs)
 
@@ -460,3 +461,20 @@ once); JIT wrong-results (the hot bodies run in the **interpreter**
 The profile is the deliverable here; the fix is a hot-path interpreter change
 (every `invokevirtual`, gauntlet-wide blast radius) and should be prototyped +
 soaked separately, not landed blind.
+
+### 2026-07-01 partial mitigation
+
+Implemented lever 1 for the vtable-fast path: each `JvmThread` now keeps a
+bounded native-shadow verdict cache keyed by
+`(receiver_class_id, method_name_hash, descriptor_hash)`. Repeated
+invoke-cache misses for the same receiver/method descriptor can skip both the
+direct `NativeMethodRegistry::find` probe and the superclass walk after the
+first verdict. The cache is bypassed whenever class redefinition is active, so
+Mockito/JVMTI-woven bytecode keeps the existing native-shadow suppression
+semantics.
+
+This should remove the profiled hot `NativeMethodRegistry::find` cost from warm
+miss sites, but the full Hibernate `FunctionTests` / `StandardFunctionTests`
+rerun has not been completed on this branch. Keep this cluster open until that
+end-to-end verification confirms the slowdown is gone and no other lever is
+needed.

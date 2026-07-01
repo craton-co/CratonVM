@@ -559,6 +559,14 @@ fn pin_value_slice(ctx: &mut dyn NativeContext, vals: &[Value]) -> (usize, Vec<u
     (base, handles)
 }
 
+#[inline]
+fn pin_value(ctx: &mut dyn NativeContext, v: Value) -> usize {
+    match v {
+        Value::Object(Some(o)) => ctx.pin_native_root(o),
+        _ => usize::MAX,
+    }
+}
+
 /// Read back the (post-GC, forwarded) refs for a slice pinned with
 /// [`pin_value_slice`]. Non-object slots are returned verbatim.
 fn read_value_slice(ctx: &dyn NativeContext, handles: &[usize], orig: &[Value]) -> Vec<Value> {
@@ -8791,17 +8799,45 @@ fn sort_with_comparator(
     // The comparison is fallible: a comparator that throws propagates the
     // error out and short-circuits the sort. A non-Int return is treated as
     // 0 ("equal"), preserving the previous insertion-sort semantics.
-    merge_sort_fallible(ctx, &mut elems, |c, a, b| {
-        match comparator_compare(c, comparator, *a, *b)? {
+    let data_pin = ctx.pin_native_root(data);
+    let cmp_pin = ctx.pin_native_root(comparator);
+    let (_, elem_handles) = pin_value_slice(ctx, &elems);
+    let mut idx: Vec<Value> = (0..elems.len() as i32).map(Value::Int).collect();
+    let sort_result = merge_sort_fallible(ctx, &mut idx, |c, a, b| {
+        let ia = if let Value::Int(v) = a {
+            *v as usize
+        } else {
+            0
+        };
+        let ib = if let Value::Int(v) = b {
+            *v as usize
+        } else {
+            0
+        };
+        let cmp = c.read_native_pin(cmp_pin, comparator);
+        let ea = read_pinned_elem(c, elem_handles[ia], elems[ia]);
+        let eb = read_pinned_elem(c, elem_handles[ib], elems[ib]);
+        match comparator_compare(c, cmp, ea, eb)? {
             Some(Value::Int(v)) => Ok(v),
             _ => Ok(0),
         }
-    })?;
-
-    // Write sorted elements back.
-    for (i, val) in elems.iter().enumerate() {
-        ctx.set_array_element(data, i, *val);
+    });
+    if let Err(e) = sort_result {
+        ctx.unpin_native_roots(data_pin);
+        return Err(e);
     }
+
+    let data = ctx.read_native_pin(data_pin, data);
+    for (out, slot) in idx.iter().enumerate() {
+        let i = if let Value::Int(v) = slot {
+            *v as usize
+        } else {
+            0
+        };
+        let val = read_pinned_elem(ctx, elem_handles[i], elems[i]);
+        ctx.set_array_element(data, out, val);
+    }
+    ctx.unpin_native_roots(data_pin);
     Ok(None)
 }
 
@@ -8959,39 +8995,65 @@ fn native_al_remove_if(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     // Live map view: removed elements must also be deleted from the source map.
     let view_src = values_view_source(ctx, this);
 
+    let this_pin = ctx.pin_native_root(this);
+    let data_pin = ctx.pin_native_root(data);
+    let pred_pin = ctx.pin_native_root(predicate);
+    let source_pin = view_src.map(|source| ctx.pin_native_root(source));
+
     // Snapshot elements, then test each with the predicate.
-    let mut keep = Vec::with_capacity(size);
-    let mut dropped = Vec::new();
+    let elements: Vec<Value> = (0..size).map(|i| ctx.get_array_element(data, i)).collect();
+    let (_, elem_handles) = pin_value_slice(ctx, &elements);
+    let mut keep_idx = Vec::with_capacity(size);
+    let mut dropped_idx = Vec::new();
     for i in 0..size {
-        let elem = ctx.get_array_element(data, i);
-        let result = ctx.invoke_virtual(predicate, "test", "(Ljava/lang/Object;)Z", &[elem])?;
+        let predicate = ctx.read_native_pin(pred_pin, predicate);
+        let elem = read_pinned_elem(ctx, elem_handles[i], elements[i]);
+        let result = match ctx.invoke_virtual(predicate, "test", "(Ljava/lang/Object;)Z", &[elem]) {
+            Ok(r) => r,
+            Err(e) => {
+                ctx.unpin_native_roots(this_pin);
+                return Err(e);
+            }
+        };
         let is_true = matches!(result, Some(Value::Int(v)) if v != 0);
         if is_true {
-            dropped.push(elem);
+            dropped_idx.push(i);
         } else {
-            keep.push(elem);
+            keep_idx.push(i);
         }
     }
 
-    let removed = keep.len() < size;
+    let removed = keep_idx.len() < size;
 
     // Write back kept elements.
-    for (i, val) in keep.iter().enumerate() {
-        ctx.set_array_element(data, i, *val);
+    let data = ctx.read_native_pin(data_pin, data);
+    for (i, &elem_idx) in keep_idx.iter().enumerate() {
+        let val = read_pinned_elem(ctx, elem_handles[elem_idx], elements[elem_idx]);
+        ctx.set_array_element(data, i, val);
     }
     // Clear trailing slots (the `values()`-view source marker, if any, lives
     // beyond `size` and is therefore untouched).
-    for i in keep.len()..size {
+    for i in keep_idx.len()..size {
         ctx.set_array_element(data, i, Value::Object(None));
     }
-    al_set_size(ctx, this, keep.len() as i32);
+    let this = ctx.read_native_pin(this_pin, this);
+    al_set_size(ctx, this, keep_idx.len() as i32);
 
     if let Some(source) = view_src {
-        for elem in dropped {
-            propagate_list_removal(ctx, source, elem)?;
+        for &elem_idx in &dropped_idx {
+            let source = match source_pin {
+                Some(pin) => ctx.read_native_pin(pin, source),
+                None => source,
+            };
+            let elem = read_pinned_elem(ctx, elem_handles[elem_idx], elements[elem_idx]);
+            if let Err(e) = propagate_list_removal(ctx, source, elem) {
+                ctx.unpin_native_roots(this_pin);
+                return Err(e);
+            }
         }
     }
 
+    ctx.unpin_native_roots(this_pin);
     Ok(Some(Value::Int(if removed { 1 } else { 0 })))
 }
 
@@ -9015,21 +9077,33 @@ fn native_al_replace_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         _ => return Ok(None),
     };
 
+    let data_pin = ctx.pin_native_root(data);
+    let op_pin = ctx.pin_native_root(operator);
     for i in 0..size {
+        let data = ctx.read_native_pin(data_pin, data);
         let elem = ctx.get_array_element(data, i);
-        let result = ctx.invoke_virtual(
+        let operator = ctx.read_native_pin(op_pin, operator);
+        let result = match ctx.invoke_virtual(
             operator,
             "apply",
             "(Ljava/lang/Object;)Ljava/lang/Object;",
             &[elem],
-        )?;
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                ctx.unpin_native_roots(data_pin);
+                return Err(e);
+            }
+        };
         // Store the boxed result as-is. Collections hold Object references;
         // unboxing to a raw primitive here corrupts array storage (the value
         // reads back as null). Matches the JDK and the TreeMap natives.
         let new_val = result.unwrap_or(Value::Object(None));
+        let data = ctx.read_native_pin(data_pin, data);
         ctx.set_array_element(data, i, new_val);
     }
 
+    ctx.unpin_native_roots(data_pin);
     Ok(None)
 }
 
@@ -9048,30 +9122,61 @@ fn native_map_compute_if_absent(ctx: &mut dyn NativeContext, args: &[Value]) -> 
         _ => return Ok(Some(Value::Object(None))),
     };
 
+    let this_pin = ctx.pin_native_root(this);
+    let key_pin = pin_value(ctx, key);
+    let function_pin = ctx.pin_native_root(function);
+
     // Check if key already present.
-    let existing = native_map_get(ctx, &[Value::Object(Some(this)), key])?;
+    let this_cur = ctx.read_native_pin(this_pin, this);
+    let key_cur = read_pinned_elem(ctx, key_pin, key);
+    let existing = match native_map_get(ctx, &[Value::Object(Some(this_cur)), key_cur]) {
+        Ok(v) => v,
+        Err(e) => {
+            ctx.unpin_native_roots(this_pin);
+            return Err(e);
+        }
+    };
     if let Some(Value::Object(Some(_))) = existing {
+        ctx.unpin_native_roots(this_pin);
         return Ok(existing);
     }
 
     // Key absent — call function.apply(key).
-    let result = ctx.invoke_virtual(
-        function,
+    let function_cur = ctx.read_native_pin(function_pin, function);
+    let key_cur = read_pinned_elem(ctx, key_pin, key);
+    let result = match ctx.invoke_virtual(
+        function_cur,
         "apply",
         "(Ljava/lang/Object;)Ljava/lang/Object;",
-        &[key],
-    )?;
+        &[key_cur],
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            ctx.unpin_native_roots(this_pin);
+            return Err(e);
+        }
+    };
     // Keep the result boxed — maps store Object references; unboxing here makes
     // the value read back as null (TreeMap's native_tm_compute_if_absent stores
     // it boxed and is correct). The boxed wrapper is what the JDK stores/returns.
     let new_val = result.unwrap_or(Value::Object(None));
 
     if let Value::Object(None) = new_val {
+        ctx.unpin_native_roots(this_pin);
         return Ok(Some(Value::Object(None)));
     }
 
-    native_map_put(ctx, &[Value::Object(Some(this)), key, new_val])?;
-    Ok(Some(new_val))
+    let new_val_pin = pin_value(ctx, new_val);
+    let this_cur = ctx.read_native_pin(this_pin, this);
+    let key_cur = read_pinned_elem(ctx, key_pin, key);
+    let new_val_cur = read_pinned_elem(ctx, new_val_pin, new_val);
+    if let Err(e) = native_map_put(ctx, &[Value::Object(Some(this_cur)), key_cur, new_val_cur]) {
+        ctx.unpin_native_roots(this_pin);
+        return Err(e);
+    }
+    let ret = read_pinned_elem(ctx, new_val_pin, new_val);
+    ctx.unpin_native_roots(this_pin);
+    Ok(Some(ret))
 }
 
 fn native_map_compute(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -9085,28 +9190,65 @@ fn native_map_compute(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         _ => return Ok(Some(Value::Object(None))),
     };
 
-    let existing = native_map_get(ctx, &[Value::Object(Some(this)), key])?;
-    let old_val = existing.unwrap_or(Value::Object(None));
+    let this_pin = ctx.pin_native_root(this);
+    let key_pin = pin_value(ctx, key);
+    let bi_function_pin = ctx.pin_native_root(bi_function);
 
-    let result = ctx.invoke_virtual(
-        bi_function,
+    let this_cur = ctx.read_native_pin(this_pin, this);
+    let key_cur = read_pinned_elem(ctx, key_pin, key);
+    let existing = match native_map_get(ctx, &[Value::Object(Some(this_cur)), key_cur]) {
+        Ok(v) => v,
+        Err(e) => {
+            ctx.unpin_native_roots(this_pin);
+            return Err(e);
+        }
+    };
+    let old_val = existing.unwrap_or(Value::Object(None));
+    let old_val_pin = pin_value(ctx, old_val);
+
+    let bi_function_cur = ctx.read_native_pin(bi_function_pin, bi_function);
+    let key_cur = read_pinned_elem(ctx, key_pin, key);
+    let old_val_cur = read_pinned_elem(ctx, old_val_pin, old_val);
+    let result = match ctx.invoke_virtual(
+        bi_function_cur,
         "apply",
         "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
-        &[key, old_val],
-    )?;
+        &[key_cur, old_val_cur],
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            ctx.unpin_native_roots(this_pin);
+            return Err(e);
+        }
+    };
     // Keep boxed — maps store Object references (unboxing reads back as null).
     let new_val = result.unwrap_or(Value::Object(None));
 
     if let Value::Object(None) = new_val {
         // Remove mapping if new value is null.
         if let Value::Object(Some(_)) = old_val {
-            native_map_remove(ctx, &[Value::Object(Some(this)), key])?;
+            let this_cur = ctx.read_native_pin(this_pin, this);
+            let key_cur = read_pinned_elem(ctx, key_pin, key);
+            if let Err(e) = native_map_remove(ctx, &[Value::Object(Some(this_cur)), key_cur]) {
+                ctx.unpin_native_roots(this_pin);
+                return Err(e);
+            }
         }
+        ctx.unpin_native_roots(this_pin);
         return Ok(Some(Value::Object(None)));
     }
 
-    native_map_put(ctx, &[Value::Object(Some(this)), key, new_val])?;
-    Ok(Some(new_val))
+    let new_val_pin = pin_value(ctx, new_val);
+    let this_cur = ctx.read_native_pin(this_pin, this);
+    let key_cur = read_pinned_elem(ctx, key_pin, key);
+    let new_val_cur = read_pinned_elem(ctx, new_val_pin, new_val);
+    if let Err(e) = native_map_put(ctx, &[Value::Object(Some(this_cur)), key_cur, new_val_cur]) {
+        ctx.unpin_native_roots(this_pin);
+        return Err(e);
+    }
+    let ret = read_pinned_elem(ctx, new_val_pin, new_val);
+    ctx.unpin_native_roots(this_pin);
+    Ok(Some(ret))
 }
 
 fn native_map_compute_if_present(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -9120,30 +9262,68 @@ fn native_map_compute_if_present(ctx: &mut dyn NativeContext, args: &[Value]) ->
         _ => return Ok(Some(Value::Object(None))),
     };
 
-    let existing = native_map_get(ctx, &[Value::Object(Some(this)), key])?;
+    let this_pin = ctx.pin_native_root(this);
+    let key_pin = pin_value(ctx, key);
+    let bi_function_pin = ctx.pin_native_root(bi_function);
+
+    let this_cur = ctx.read_native_pin(this_pin, this);
+    let key_cur = read_pinned_elem(ctx, key_pin, key);
+    let existing = match native_map_get(ctx, &[Value::Object(Some(this_cur)), key_cur]) {
+        Ok(v) => v,
+        Err(e) => {
+            ctx.unpin_native_roots(this_pin);
+            return Err(e);
+        }
+    };
     let old_val = existing.unwrap_or(Value::Object(None));
 
     // Only apply if key is present (old_val is non-null)
     if let Value::Object(None) = old_val {
+        ctx.unpin_native_roots(this_pin);
         return Ok(Some(Value::Object(None)));
     }
+    let old_val_pin = pin_value(ctx, old_val);
 
-    let result = ctx.invoke_virtual(
-        bi_function,
+    let bi_function_cur = ctx.read_native_pin(bi_function_pin, bi_function);
+    let key_cur = read_pinned_elem(ctx, key_pin, key);
+    let old_val_cur = read_pinned_elem(ctx, old_val_pin, old_val);
+    let result = match ctx.invoke_virtual(
+        bi_function_cur,
         "apply",
         "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
-        &[key, old_val],
-    )?;
+        &[key_cur, old_val_cur],
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            ctx.unpin_native_roots(this_pin);
+            return Err(e);
+        }
+    };
     // Keep boxed — maps store Object references (unboxing reads back as null).
     let new_val = result.unwrap_or(Value::Object(None));
 
     if let Value::Object(None) = new_val {
-        native_map_remove(ctx, &[Value::Object(Some(this)), key])?;
+        let this_cur = ctx.read_native_pin(this_pin, this);
+        let key_cur = read_pinned_elem(ctx, key_pin, key);
+        if let Err(e) = native_map_remove(ctx, &[Value::Object(Some(this_cur)), key_cur]) {
+            ctx.unpin_native_roots(this_pin);
+            return Err(e);
+        }
+        ctx.unpin_native_roots(this_pin);
         return Ok(Some(Value::Object(None)));
     }
 
-    native_map_put(ctx, &[Value::Object(Some(this)), key, new_val])?;
-    Ok(Some(new_val))
+    let new_val_pin = pin_value(ctx, new_val);
+    let this_cur = ctx.read_native_pin(this_pin, this);
+    let key_cur = read_pinned_elem(ctx, key_pin, key);
+    let new_val_cur = read_pinned_elem(ctx, new_val_pin, new_val);
+    if let Err(e) = native_map_put(ctx, &[Value::Object(Some(this_cur)), key_cur, new_val_cur]) {
+        ctx.unpin_native_roots(this_pin);
+        return Err(e);
+    }
+    let ret = read_pinned_elem(ctx, new_val_pin, new_val);
+    ctx.unpin_native_roots(this_pin);
+    Ok(Some(ret))
 }
 
 fn native_map_merge(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -9158,31 +9338,69 @@ fn native_map_merge(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         _ => return Ok(Some(Value::Object(None))),
     };
 
-    let existing = native_map_get(ctx, &[Value::Object(Some(this)), key])?;
+    let this_pin = ctx.pin_native_root(this);
+    let key_pin = pin_value(ctx, key);
+    let value_pin = pin_value(ctx, value);
+    let bi_function_pin = ctx.pin_native_root(bi_function);
+
+    let this_cur = ctx.read_native_pin(this_pin, this);
+    let key_cur = read_pinned_elem(ctx, key_pin, key);
+    let existing = match native_map_get(ctx, &[Value::Object(Some(this_cur)), key_cur]) {
+        Ok(v) => v,
+        Err(e) => {
+            ctx.unpin_native_roots(this_pin);
+            return Err(e);
+        }
+    };
     let old_val = existing.unwrap_or(Value::Object(None));
+    let old_val_pin = pin_value(ctx, old_val);
 
     let new_val = if let Value::Object(Some(_)) = old_val {
         // Key present — merge with BiFunction.
-        let result = ctx.invoke_virtual(
-            bi_function,
+        let bi_function_cur = ctx.read_native_pin(bi_function_pin, bi_function);
+        let old_val_cur = read_pinned_elem(ctx, old_val_pin, old_val);
+        let value_cur = read_pinned_elem(ctx, value_pin, value);
+        let result = match ctx.invoke_virtual(
+            bi_function_cur,
             "apply",
             "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
-            &[old_val, value],
-        )?;
+            &[old_val_cur, value_cur],
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                ctx.unpin_native_roots(this_pin);
+                return Err(e);
+            }
+        };
         // Keep boxed — maps store Object references (unboxing reads back as null).
         result.unwrap_or(Value::Object(None))
     } else {
         // Key absent — use value directly.
-        value
+        read_pinned_elem(ctx, value_pin, value)
     };
 
     if let Value::Object(None) = new_val {
-        native_map_remove(ctx, &[Value::Object(Some(this)), key])?;
+        let this_cur = ctx.read_native_pin(this_pin, this);
+        let key_cur = read_pinned_elem(ctx, key_pin, key);
+        if let Err(e) = native_map_remove(ctx, &[Value::Object(Some(this_cur)), key_cur]) {
+            ctx.unpin_native_roots(this_pin);
+            return Err(e);
+        }
+        ctx.unpin_native_roots(this_pin);
         return Ok(Some(Value::Object(None)));
     }
 
-    native_map_put(ctx, &[Value::Object(Some(this)), key, new_val])?;
-    Ok(Some(new_val))
+    let new_val_pin = pin_value(ctx, new_val);
+    let this_cur = ctx.read_native_pin(this_pin, this);
+    let key_cur = read_pinned_elem(ctx, key_pin, key);
+    let new_val_cur = read_pinned_elem(ctx, new_val_pin, new_val);
+    if let Err(e) = native_map_put(ctx, &[Value::Object(Some(this_cur)), key_cur, new_val_cur]) {
+        ctx.unpin_native_roots(this_pin);
+        return Err(e);
+    }
+    let ret = read_pinned_elem(ctx, new_val_pin, new_val);
+    ctx.unpin_native_roots(this_pin);
+    Ok(Some(ret))
 }
 
 fn native_map_replace_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -9195,19 +9413,41 @@ fn native_map_replace_all(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         _ => return Ok(None),
     };
 
+    let this_pin = ctx.pin_native_root(this);
+    let bi_function_pin = ctx.pin_native_root(bi_function);
     let entries = map_collect_entries(ctx, this);
-    for (key, value) in &entries {
-        let result = ctx.invoke_virtual(
-            bi_function,
+    let flat: Vec<Value> = entries.iter().flat_map(|(k, v)| [*k, *v]).collect();
+    let (_, flat_pins) = pin_value_slice(ctx, &flat);
+    for i in 0..entries.len() {
+        let bi_function_cur = ctx.read_native_pin(bi_function_pin, bi_function);
+        let key = read_pinned_elem(ctx, flat_pins[i * 2], flat[i * 2]);
+        let value = read_pinned_elem(ctx, flat_pins[i * 2 + 1], flat[i * 2 + 1]);
+        let result = match ctx.invoke_virtual(
+            bi_function_cur,
             "apply",
             "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
-            &[*key, *value],
-        )?;
+            &[key, value],
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                ctx.unpin_native_roots(this_pin);
+                return Err(e);
+            }
+        };
         // Keep boxed — maps store Object references (unboxing reads back as null).
         let new_val = result.unwrap_or(Value::Object(None));
-        native_map_put(ctx, &[Value::Object(Some(this)), *key, new_val])?;
+        let new_val_pin = pin_value(ctx, new_val);
+        let this_cur = ctx.read_native_pin(this_pin, this);
+        let key = read_pinned_elem(ctx, flat_pins[i * 2], flat[i * 2]);
+        let new_val_cur = read_pinned_elem(ctx, new_val_pin, new_val);
+        if let Err(e) = native_map_put(ctx, &[Value::Object(Some(this_cur)), key, new_val_cur]) {
+            ctx.unpin_native_roots(this_pin);
+            return Err(e);
+        }
+        ctx.unpin_native_roots(new_val_pin);
     }
 
+    ctx.unpin_native_roots(this_pin);
     Ok(None)
 }
 
@@ -9381,28 +9621,52 @@ fn native_map_of_entries(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
 /// Helper: create an ArrayList from a slice of values.
 fn make_list_of(ctx: &mut dyn NativeContext, elems: &[Value]) -> MethodCallResult {
     let __al_n_fields = al_slots(ctx).2;
+    let (elem_base, elem_handles) = pin_value_slice(ctx, elems);
     let list = alloc_synthetic(ctx, "java/util/ArrayList", __al_n_fields);
+    let list_pin = ctx.pin_native_root(list);
     let cap = std::cmp::max(elems.len(), AL_DEFAULT_CAPACITY);
     let buf = alloc_ref_array(ctx, cap);
+    let buf_pin = ctx.pin_native_root(buf);
     for (i, val) in elems.iter().enumerate() {
-        ctx.set_array_element(buf, i, *val);
+        let buf = ctx.read_native_pin(buf_pin, buf);
+        let val = read_pinned_elem(ctx, elem_handles[i], *val);
+        ctx.set_array_element(buf, i, val);
     }
+    let list = ctx.read_native_pin(list_pin, list);
+    let buf = ctx.read_native_pin(buf_pin, buf);
     al_set_data(ctx, list, buf);
     al_set_size(ctx, list, elems.len() as i32);
+    ctx.unpin_native_roots(if elem_base == usize::MAX {
+        list_pin
+    } else {
+        elem_base
+    });
     Ok(Some(Value::Object(Some(list))))
 }
 
 /// Helper: create an ArrayList (returns ObjectRef, not MethodCallResult).
 fn make_list_of_raw(ctx: &mut dyn NativeContext, elems: &[Value]) -> ObjectRef {
     let __al_n_fields = al_slots(ctx).2;
+    let (elem_base, elem_handles) = pin_value_slice(ctx, elems);
     let list = alloc_synthetic(ctx, "java/util/ArrayList", __al_n_fields);
+    let list_pin = ctx.pin_native_root(list);
     let cap = std::cmp::max(elems.len(), AL_DEFAULT_CAPACITY);
     let buf = alloc_ref_array(ctx, cap);
+    let buf_pin = ctx.pin_native_root(buf);
     for (i, val) in elems.iter().enumerate() {
-        ctx.set_array_element(buf, i, *val);
+        let buf = ctx.read_native_pin(buf_pin, buf);
+        let val = read_pinned_elem(ctx, elem_handles[i], *val);
+        ctx.set_array_element(buf, i, val);
     }
+    let list = ctx.read_native_pin(list_pin, list);
+    let buf = ctx.read_native_pin(buf_pin, buf);
     al_set_data(ctx, list, buf);
     al_set_size(ctx, list, elems.len() as i32);
+    ctx.unpin_native_roots(if elem_base == usize::MAX {
+        list_pin
+    } else {
+        elem_base
+    });
     list
 }
 
@@ -9688,13 +9952,25 @@ pub fn make_stream_from_elements(
 }
 
 fn make_stream(ctx: &mut dyn NativeContext, elements: &[Value]) -> MethodCallResult {
+    let (elem_base, elem_handles) = pin_value_slice(ctx, elements);
     let stream = alloc_synthetic(ctx, "java/util/stream/Stream", STREAM_NUM_FIELDS);
+    let stream_pin = ctx.pin_native_root(stream);
     let arr = alloc_ref_array(ctx, elements.len());
+    let arr_pin = ctx.pin_native_root(arr);
     for (i, val) in elements.iter().enumerate() {
-        ctx.set_array_element(arr, i, *val);
+        let arr = ctx.read_native_pin(arr_pin, arr);
+        let val = read_pinned_elem(ctx, elem_handles[i], *val);
+        ctx.set_array_element(arr, i, val);
     }
+    let stream = ctx.read_native_pin(stream_pin, stream);
+    let arr = ctx.read_native_pin(arr_pin, arr);
     ctx.set_field(stream, STREAM_FIELD_ELEMENTS, Value::Object(Some(arr)));
     ctx.set_field(stream, STREAM_FIELD_CLOSE_HANDLERS, Value::Object(None));
+    ctx.unpin_native_roots(if elem_base == usize::MAX {
+        stream_pin
+    } else {
+        elem_base
+    });
     Ok(Some(Value::Object(Some(stream))))
 }
 
@@ -9728,10 +10004,19 @@ fn make_derived_stream(
     src: ObjectRef,
     elements: &[Value],
 ) -> MethodCallResult {
-    let r = make_stream(ctx, elements)?;
+    let src_pin = ctx.pin_native_root(src);
+    let r = match make_stream(ctx, elements) {
+        Ok(r) => r,
+        Err(e) => {
+            ctx.unpin_native_roots(src_pin);
+            return Err(e);
+        }
+    };
     if let Some(Value::Object(Some(dst))) = &r {
+        let src = ctx.read_native_pin(src_pin, src);
         stream_inherit_close_handlers(ctx, src, *dst);
     }
+    ctx.unpin_native_roots(src_pin);
     Ok(r)
 }
 
@@ -11066,24 +11351,55 @@ fn native_stream_flat_map(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         _ => return make_stream(ctx, &[]),
     };
     let elements = stream_elements_mut(ctx, this)?;
+    let fn_pin = ctx.pin_native_root(function);
+    let (_, elem_handles) = pin_value_slice(ctx, &elements);
     let mut flat = Vec::new();
-    for elem in &elements {
-        let result = ctx.invoke_virtual(
+    let mut flat_handles = Vec::new();
+    for i in 0..elements.len() {
+        let function = ctx.read_native_pin(fn_pin, function);
+        let elem = read_pinned_elem(ctx, elem_handles[i], elements[i]);
+        let result = match ctx.invoke_virtual(
             function,
             "apply",
             "(Ljava/lang/Object;)Ljava/lang/Object;",
-            &[*elem],
-        )?;
+            &[elem],
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                ctx.unpin_native_roots(fn_pin);
+                return Err(e);
+            }
+        };
         if let Some(Value::Object(Some(inner_stream))) = result {
-            let inner = stream_elements_mut(ctx, inner_stream)?;
-            flat.extend(inner);
+            let inner_pin = ctx.pin_native_root(inner_stream);
+            let inner = match stream_elements_mut(ctx, inner_stream) {
+                Ok(v) => v,
+                Err(e) => {
+                    ctx.unpin_native_roots(fn_pin);
+                    return Err(e);
+                }
+            };
+            for v in inner {
+                if let Value::Object(Some(o)) = v {
+                    flat_handles.push(ctx.pin_native_root(o));
+                } else {
+                    flat_handles.push(usize::MAX);
+                }
+                flat.push(v);
+            }
             // JDK contract: each mapped stream is closed after its contents are
             // placed into the result (this is what runs keycloak's flatMap-inner
             // onClose handlers). Real ClosingStream.close() → delegate.close();
             // a synthetic inner runs its own handlers.
-            ctx.invoke_virtual(inner_stream, "close", "()V", &[])?;
+            let inner_stream = ctx.read_native_pin(inner_pin, inner_stream);
+            if let Err(e) = ctx.invoke_virtual(inner_stream, "close", "()V", &[]) {
+                ctx.unpin_native_roots(fn_pin);
+                return Err(e);
+            }
         }
     }
+    let flat = read_value_slice(ctx, &flat_handles, &flat);
+    ctx.unpin_native_roots(fn_pin);
     make_derived_stream(ctx, this, &flat)
 }
 
@@ -11205,8 +11521,10 @@ fn native_stream_distinct(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         _ => return make_stream(ctx, &[]),
     };
     let elements = stream_elements(ctx, this)?;
+    let (elem_base, elem_handles) = pin_value_slice(ctx, &elements);
     let mut unique: Vec<Value> = Vec::new();
-    for elem in &elements {
+    let mut unique_handles: Vec<usize> = Vec::new();
+    for i in 0..elements.len() {
         // `Stream.distinct()` dedups via the element's `equals`/`hashCode`
         // (it builds a `HashSet`). `values_equal` only recognises identity,
         // String, enum, and unboxed primitives — for any other two distinct
@@ -11219,15 +11537,27 @@ fn native_stream_distinct(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         // `equals` — exactly as already done for `List.contains`/`indexOf` and
         // `Collectors.groupingBy` keys.
         let mut dup = false;
-        for u in &unique {
-            if list_element_matches(ctx, elem, u) {
+        for (u_idx, u) in unique.iter().enumerate() {
+            let elem = read_pinned_elem(ctx, elem_handles[i], elements[i]);
+            let u = read_pinned_elem(ctx, unique_handles[u_idx], *u);
+            if list_element_matches(ctx, &elem, &u) {
                 dup = true;
                 break;
             }
         }
         if !dup {
-            unique.push(*elem);
+            let elem = read_pinned_elem(ctx, elem_handles[i], elements[i]);
+            if let Value::Object(Some(o)) = elem {
+                unique_handles.push(ctx.pin_native_root(o));
+            } else {
+                unique_handles.push(usize::MAX);
+            }
+            unique.push(elem);
         }
+    }
+    let unique = read_value_slice(ctx, &unique_handles, &unique);
+    if elem_base != usize::MAX {
+        ctx.unpin_native_roots(elem_base);
     }
     make_derived_stream(ctx, this, &unique)
 }
@@ -11281,9 +11611,18 @@ fn native_stream_peek(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         return Ok(Some(s));
     }
     let elements = stream_elements(ctx, this)?;
-    for elem in &elements {
-        ctx.invoke_virtual(consumer, "accept", "(Ljava/lang/Object;)V", &[*elem])?;
+    let con_pin = ctx.pin_native_root(consumer);
+    let (_, elem_handles) = pin_value_slice(ctx, &elements);
+    for i in 0..elements.len() {
+        let consumer = ctx.read_native_pin(con_pin, consumer);
+        let elem = read_pinned_elem(ctx, elem_handles[i], elements[i]);
+        if let Err(e) = ctx.invoke_virtual(consumer, "accept", "(Ljava/lang/Object;)V", &[elem]) {
+            ctx.unpin_native_roots(con_pin);
+            return Err(e);
+        }
     }
+    let elements = read_value_slice(ctx, &elem_handles, &elements);
+    ctx.unpin_native_roots(con_pin);
     make_derived_stream(ctx, this, &elements)
 }
 
@@ -11378,13 +11717,26 @@ fn native_stream_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         }
     };
     let elements = stream_elements(ctx, this)?;
+    let (elem_base, elem_handles) = pin_value_slice(ctx, &elements);
     let arr = alloc_ref_array(ctx, elements.len());
+    let arr_pin = ctx.pin_native_root(arr);
     for (i, val) in elements.iter().enumerate() {
-        ctx.set_array_element(arr, i, *val);
+        let arr = ctx.read_native_pin(arr_pin, arr);
+        let val = read_pinned_elem(ctx, elem_handles[i], *val);
+        ctx.set_array_element(arr, i, val);
     }
+    let arr = ctx.read_native_pin(arr_pin, arr);
     let itr = alloc_synthetic(ctx, "java/util/ServiceLoader$Itr", 2);
+    let itr_pin = ctx.pin_native_root(itr);
+    let arr = ctx.read_native_pin(arr_pin, arr);
+    let itr = ctx.read_native_pin(itr_pin, itr);
     ctx.set_field(itr, 0, Value::Object(Some(arr)));
     ctx.set_field(itr, 1, Value::Int(0));
+    ctx.unpin_native_roots(if elem_base == usize::MAX {
+        arr_pin
+    } else {
+        elem_base
+    });
     Ok(Some(Value::Object(Some(itr))))
 }
 
@@ -11397,10 +11749,20 @@ fn native_stream_to_array(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         }
     };
     let elements = stream_elements(ctx, this)?;
+    let (elem_base, elem_handles) = pin_value_slice(ctx, &elements);
     let arr = alloc_ref_array(ctx, elements.len());
+    let arr_pin = ctx.pin_native_root(arr);
     for (i, val) in elements.iter().enumerate() {
-        ctx.set_array_element(arr, i, *val);
+        let arr = ctx.read_native_pin(arr_pin, arr);
+        let val = read_pinned_elem(ctx, elem_handles[i], *val);
+        ctx.set_array_element(arr, i, val);
     }
+    let arr = ctx.read_native_pin(arr_pin, arr);
+    ctx.unpin_native_roots(if elem_base == usize::MAX {
+        arr_pin
+    } else {
+        elem_base
+    });
     Ok(Some(Value::Object(Some(arr))))
 }
 
@@ -11428,10 +11790,16 @@ fn native_stream_to_array_gen(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     };
     let generator = args.get(1).copied().unwrap_or(Value::Object(None));
     let elements = stream_elements(ctx, this)?;
+    let (elem_base, elem_handles) = pin_value_slice(ctx, &elements);
+    let gen_pin = match generator {
+        Value::Object(Some(g)) => Some(ctx.pin_native_root(g)),
+        _ => None,
+    };
     let len = elements.len();
     // Try to use the generator's apply(int) to allocate a typed array.
     let arr = match generator {
         Value::Object(Some(g)) => {
+            let g = gen_pin.map_or(g, |pin| ctx.read_native_pin(pin, g));
             let r = ctx.invoke_virtual(
                 g,
                 "apply",
@@ -11445,17 +11813,30 @@ fn native_stream_to_array_gen(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
         }
         _ => alloc_ref_array(ctx, len),
     };
+    let arr_pin = ctx.pin_native_root(arr);
     // If generator returned a too-small array (or fallback Object[]),
     // ensure it has enough slots.
+    let arr = ctx.read_native_pin(arr_pin, arr);
     let cap = ctx.array_length(arr);
-    let arr = if cap < len {
-        alloc_ref_array(ctx, len)
+    let (arr, arr_pin) = if cap < len {
+        ctx.unpin_native_roots(arr_pin);
+        let arr = alloc_ref_array(ctx, len);
+        let pin = ctx.pin_native_root(arr);
+        (arr, pin)
     } else {
-        arr
+        (arr, arr_pin)
     };
     for (i, val) in elements.iter().enumerate() {
-        ctx.set_array_element(arr, i, *val);
+        let arr = ctx.read_native_pin(arr_pin, arr);
+        let val = read_pinned_elem(ctx, elem_handles[i], *val);
+        ctx.set_array_element(arr, i, val);
     }
+    let arr = ctx.read_native_pin(arr_pin, arr);
+    ctx.unpin_native_roots(if elem_base == usize::MAX {
+        gen_pin.unwrap_or(arr_pin)
+    } else {
+        elem_base
+    });
     Ok(Some(Value::Object(Some(arr))))
 }
 
@@ -11480,9 +11861,20 @@ fn native_stream_find_first(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         return Ok(Some(Value::Object(Some(opt))));
     }
     let elements = stream_elements(ctx, this)?;
+    let first_pin = elements.first().and_then(|v| match v {
+        Value::Object(Some(o)) => Some(ctx.pin_native_root(*o)),
+        _ => None,
+    });
     let opt = alloc_synthetic(ctx, "java/util/Optional", OPT_NUM_FIELDS);
     if let Some(first) = elements.first() {
-        ctx.set_field(opt, OPT_FIELD_VALUE, *first);
+        let first = match (*first, first_pin) {
+            (Value::Object(Some(o)), Some(pin)) => Value::Object(Some(ctx.read_native_pin(pin, o))),
+            _ => *first,
+        };
+        ctx.set_field(opt, OPT_FIELD_VALUE, first);
+    }
+    if let Some(pin) = first_pin {
+        ctx.unpin_native_roots(pin);
     }
     Ok(Some(Value::Object(Some(opt))))
 }
@@ -11498,7 +11890,9 @@ fn native_stream_any_match(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     };
     if lazy_streams_enabled() && stream_is_synthetic(ctx, this) && stream_has_chain(ctx, this) {
         let mut matched = false;
-        stream_pull(ctx, this, |c, v| {
+        let pred_pin = ctx.pin_native_root(predicate);
+        let pull_result = stream_pull(ctx, this, |c, v| {
+            let predicate = c.read_native_pin(pred_pin, predicate);
             let r = c.invoke_virtual(predicate, "test", "(Ljava/lang/Object;)Z", &[v])?;
             if matches!(r, Some(Value::Int(x)) if x != 0) {
                 matched = true;
@@ -11506,16 +11900,30 @@ fn native_stream_any_match(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
             } else {
                 Ok(PullStep::Continue)
             }
-        })?;
+        });
+        ctx.unpin_native_roots(pred_pin);
+        pull_result?;
         return Ok(Some(Value::Int(if matched { 1 } else { 0 })));
     }
     let elements = stream_elements(ctx, this)?;
-    for elem in &elements {
-        let result = ctx.invoke_virtual(predicate, "test", "(Ljava/lang/Object;)Z", &[*elem])?;
+    let pred_pin = ctx.pin_native_root(predicate);
+    let (_, elem_handles) = pin_value_slice(ctx, &elements);
+    for i in 0..elements.len() {
+        let predicate = ctx.read_native_pin(pred_pin, predicate);
+        let elem = read_pinned_elem(ctx, elem_handles[i], elements[i]);
+        let result = match ctx.invoke_virtual(predicate, "test", "(Ljava/lang/Object;)Z", &[elem]) {
+            Ok(r) => r,
+            Err(e) => {
+                ctx.unpin_native_roots(pred_pin);
+                return Err(e);
+            }
+        };
         if matches!(result, Some(Value::Int(v)) if v != 0) {
+            ctx.unpin_native_roots(pred_pin);
             return Ok(Some(Value::Int(1)));
         }
     }
+    ctx.unpin_native_roots(pred_pin);
     Ok(Some(Value::Int(0)))
 }
 
@@ -11530,7 +11938,9 @@ fn native_stream_all_match(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     };
     if lazy_streams_enabled() && stream_is_synthetic(ctx, this) && stream_has_chain(ctx, this) {
         let mut all = true;
-        stream_pull(ctx, this, |c, v| {
+        let pred_pin = ctx.pin_native_root(predicate);
+        let pull_result = stream_pull(ctx, this, |c, v| {
+            let predicate = c.read_native_pin(pred_pin, predicate);
             let r = c.invoke_virtual(predicate, "test", "(Ljava/lang/Object;)Z", &[v])?;
             if !matches!(r, Some(Value::Int(x)) if x != 0) {
                 all = false;
@@ -11538,16 +11948,30 @@ fn native_stream_all_match(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
             } else {
                 Ok(PullStep::Continue)
             }
-        })?;
+        });
+        ctx.unpin_native_roots(pred_pin);
+        pull_result?;
         return Ok(Some(Value::Int(if all { 1 } else { 0 })));
     }
     let elements = stream_elements(ctx, this)?;
-    for elem in &elements {
-        let result = ctx.invoke_virtual(predicate, "test", "(Ljava/lang/Object;)Z", &[*elem])?;
+    let pred_pin = ctx.pin_native_root(predicate);
+    let (_, elem_handles) = pin_value_slice(ctx, &elements);
+    for i in 0..elements.len() {
+        let predicate = ctx.read_native_pin(pred_pin, predicate);
+        let elem = read_pinned_elem(ctx, elem_handles[i], elements[i]);
+        let result = match ctx.invoke_virtual(predicate, "test", "(Ljava/lang/Object;)Z", &[elem]) {
+            Ok(r) => r,
+            Err(e) => {
+                ctx.unpin_native_roots(pred_pin);
+                return Err(e);
+            }
+        };
         if !matches!(result, Some(Value::Int(v)) if v != 0) {
+            ctx.unpin_native_roots(pred_pin);
             return Ok(Some(Value::Int(0)));
         }
     }
+    ctx.unpin_native_roots(pred_pin);
     Ok(Some(Value::Int(1)))
 }
 
@@ -11562,7 +11986,9 @@ fn native_stream_none_match(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     };
     if lazy_streams_enabled() && stream_is_synthetic(ctx, this) && stream_has_chain(ctx, this) {
         let mut none = true;
-        stream_pull(ctx, this, |c, v| {
+        let pred_pin = ctx.pin_native_root(predicate);
+        let pull_result = stream_pull(ctx, this, |c, v| {
+            let predicate = c.read_native_pin(pred_pin, predicate);
             let r = c.invoke_virtual(predicate, "test", "(Ljava/lang/Object;)Z", &[v])?;
             if matches!(r, Some(Value::Int(x)) if x != 0) {
                 none = false;
@@ -11570,16 +11996,30 @@ fn native_stream_none_match(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
             } else {
                 Ok(PullStep::Continue)
             }
-        })?;
+        });
+        ctx.unpin_native_roots(pred_pin);
+        pull_result?;
         return Ok(Some(Value::Int(if none { 1 } else { 0 })));
     }
     let elements = stream_elements(ctx, this)?;
-    for elem in &elements {
-        let result = ctx.invoke_virtual(predicate, "test", "(Ljava/lang/Object;)Z", &[*elem])?;
+    let pred_pin = ctx.pin_native_root(predicate);
+    let (_, elem_handles) = pin_value_slice(ctx, &elements);
+    for i in 0..elements.len() {
+        let predicate = ctx.read_native_pin(pred_pin, predicate);
+        let elem = read_pinned_elem(ctx, elem_handles[i], elements[i]);
+        let result = match ctx.invoke_virtual(predicate, "test", "(Ljava/lang/Object;)Z", &[elem]) {
+            Ok(r) => r,
+            Err(e) => {
+                ctx.unpin_native_roots(pred_pin);
+                return Err(e);
+            }
+        };
         if matches!(result, Some(Value::Int(v)) if v != 0) {
+            ctx.unpin_native_roots(pred_pin);
             return Ok(Some(Value::Int(0)));
         }
     }
+    ctx.unpin_native_roots(pred_pin);
     Ok(Some(Value::Int(1)))
 }
 
@@ -11594,14 +12034,29 @@ fn native_stream_reduce_identity(ctx: &mut dyn NativeContext, args: &[Value]) ->
         _ => return Ok(Some(identity)),
     };
     let elements = stream_elements(ctx, this)?;
+    let op_pin = ctx.pin_native_root(operator);
+    let (_, elem_handles) = pin_value_slice(ctx, &elements);
     let mut acc = identity;
-    for elem in &elements {
-        let result = ctx.invoke_virtual(
+    let mut acc_handle = match acc {
+        Value::Object(Some(o)) => ctx.pin_native_root(o),
+        _ => usize::MAX,
+    };
+    for i in 0..elements.len() {
+        let operator = ctx.read_native_pin(op_pin, operator);
+        let acc_arg = read_pinned_elem(ctx, acc_handle, acc);
+        let elem = read_pinned_elem(ctx, elem_handles[i], elements[i]);
+        let result = match ctx.invoke_virtual(
             operator,
             "apply",
             "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
-            &[acc, *elem],
-        )?;
+            &[acc_arg, elem],
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                ctx.unpin_native_roots(op_pin);
+                return Err(e);
+            }
+        };
         // Keep the operator result as-is. `coerce_return` inside invoke_virtual
         // already boxes primitives to match the SAM's `Ljava/lang/Object;`
         // return type, so `checkcast` in callers like JoinedList.<init> sees
@@ -11609,7 +12064,13 @@ fn native_stream_reduce_identity(ctx: &mut dyn NativeContext, args: &[Value]) ->
         // was a T16.9 leftover that violated the `T reduce(T, BinaryOperator<T>)`
         // contract and broke any caller that stores the result as a reference.
         acc = result.unwrap_or(Value::Object(None));
+        acc_handle = match acc {
+            Value::Object(Some(o)) => ctx.pin_native_root(o),
+            _ => usize::MAX,
+        };
     }
+    let acc = read_pinned_elem(ctx, acc_handle, acc);
+    ctx.unpin_native_roots(op_pin);
     Ok(Some(acc))
 }
 
@@ -11633,17 +12094,37 @@ fn native_stream_reduce_optional(ctx: &mut dyn NativeContext, args: &[Value]) ->
     if elements.is_empty() {
         return Ok(Some(Value::Object(Some(opt))));
     }
+    let opt_pin = ctx.pin_native_root(opt);
+    let op_pin = ctx.pin_native_root(operator);
+    let (_, elem_handles) = pin_value_slice(ctx, &elements);
     let mut acc = elements[0];
-    for elem in elements.iter().skip(1) {
-        let result = ctx.invoke_virtual(
+    let mut acc_handle = elem_handles[0];
+    for i in 1..elements.len() {
+        let operator = ctx.read_native_pin(op_pin, operator);
+        let acc_arg = read_pinned_elem(ctx, acc_handle, acc);
+        let elem = read_pinned_elem(ctx, elem_handles[i], elements[i]);
+        let result = match ctx.invoke_virtual(
             operator,
             "apply",
             "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
-            &[acc, *elem],
-        )?;
+            &[acc_arg, elem],
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                ctx.unpin_native_roots(opt_pin);
+                return Err(e);
+            }
+        };
         acc = result.unwrap_or(Value::Object(None));
+        acc_handle = match acc {
+            Value::Object(Some(o)) => ctx.pin_native_root(o),
+            _ => usize::MAX,
+        };
     }
+    let opt = ctx.read_native_pin(opt_pin, opt);
+    let acc = read_pinned_elem(ctx, acc_handle, acc);
     ctx.set_field(opt, OPT_FIELD_VALUE, acc);
+    ctx.unpin_native_roots(opt_pin);
     Ok(Some(Value::Object(Some(opt))))
 }
 
@@ -11667,14 +12148,31 @@ fn native_stream_min(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     if elements.is_empty() {
         return Ok(Some(Value::Object(Some(opt))));
     }
+    let opt_pin = ctx.pin_native_root(opt);
+    let cmp_pin = ctx.pin_native_root(comparator);
+    let (_, elem_handles) = pin_value_slice(ctx, &elements);
     let mut best = elements[0];
-    for elem in elements.iter().skip(1) {
-        let cmp = comparator_compare(ctx, comparator, *elem, best)?;
+    let mut best_handle = elem_handles[0];
+    for i in 1..elements.len() {
+        let comparator = ctx.read_native_pin(cmp_pin, comparator);
+        let elem = read_pinned_elem(ctx, elem_handles[i], elements[i]);
+        let best_arg = read_pinned_elem(ctx, best_handle, best);
+        let cmp = match comparator_compare(ctx, comparator, elem, best_arg) {
+            Ok(r) => r,
+            Err(e) => {
+                ctx.unpin_native_roots(opt_pin);
+                return Err(e);
+            }
+        };
         if matches!(cmp, Some(Value::Int(v)) if v < 0) {
-            best = *elem;
+            best = elem;
+            best_handle = elem_handles[i];
         }
     }
+    let opt = ctx.read_native_pin(opt_pin, opt);
+    let best = read_pinned_elem(ctx, best_handle, best);
     ctx.set_field(opt, OPT_FIELD_VALUE, best);
+    ctx.unpin_native_roots(opt_pin);
     Ok(Some(Value::Object(Some(opt))))
 }
 
@@ -11698,14 +12196,31 @@ fn native_stream_max(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     if elements.is_empty() {
         return Ok(Some(Value::Object(Some(opt))));
     }
+    let opt_pin = ctx.pin_native_root(opt);
+    let cmp_pin = ctx.pin_native_root(comparator);
+    let (_, elem_handles) = pin_value_slice(ctx, &elements);
     let mut best = elements[0];
-    for elem in elements.iter().skip(1) {
-        let cmp = comparator_compare(ctx, comparator, *elem, best)?;
+    let mut best_handle = elem_handles[0];
+    for i in 1..elements.len() {
+        let comparator = ctx.read_native_pin(cmp_pin, comparator);
+        let elem = read_pinned_elem(ctx, elem_handles[i], elements[i]);
+        let best_arg = read_pinned_elem(ctx, best_handle, best);
+        let cmp = match comparator_compare(ctx, comparator, elem, best_arg) {
+            Ok(r) => r,
+            Err(e) => {
+                ctx.unpin_native_roots(opt_pin);
+                return Err(e);
+            }
+        };
         if matches!(cmp, Some(Value::Int(v)) if v > 0) {
-            best = *elem;
+            best = elem;
+            best_handle = elem_handles[i];
         }
     }
+    let opt = ctx.read_native_pin(opt_pin, opt);
+    let best = read_pinned_elem(ctx, best_handle, best);
     ctx.set_field(opt, OPT_FIELD_VALUE, best);
+    ctx.unpin_native_roots(opt_pin);
     Ok(Some(Value::Object(Some(opt))))
 }
 
@@ -11728,16 +12243,29 @@ fn native_stream_map_to_int(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         _ => return make_int_stream(ctx, &[]),
     };
     let elements = stream_elements(ctx, this)?;
+    let this_pin = ctx.pin_native_root(this);
+    let fn_pin = ctx.pin_native_root(function);
+    let (_, elem_handles) = pin_value_slice(ctx, &elements);
     let mut ints = Vec::with_capacity(elements.len());
-    for elem in &elements {
+    for i in 0..elements.len() {
+        let function = ctx.read_native_pin(fn_pin, function);
+        let elem = read_pinned_elem(ctx, elem_handles[i], elements[i]);
         let result =
-            ctx.invoke_virtual(function, "applyAsInt", "(Ljava/lang/Object;)I", &[*elem])?;
+            match ctx.invoke_virtual(function, "applyAsInt", "(Ljava/lang/Object;)I", &[elem]) {
+                Ok(r) => r,
+                Err(e) => {
+                    ctx.unpin_native_roots(this_pin);
+                    return Err(e);
+                }
+            };
         ints.push(result.unwrap_or(Value::Int(0)));
     }
     let r = make_int_stream(ctx, &ints)?;
     if let Some(Value::Object(Some(dst))) = &r {
+        let this = ctx.read_native_pin(this_pin, this);
         stream_inherit_close_handlers(ctx, this, *dst);
     }
+    ctx.unpin_native_roots(this_pin);
     Ok(r)
 }
 
@@ -19503,18 +20031,37 @@ fn native_lhm_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(None),
     };
+    let consumer_pin = ctx.pin_native_root(consumer);
     let mut cur = lhm_get(ctx, this, "head", LHM_FIELD_HEAD);
     while let Value::Object(Some(node)) = cur {
+        let node_pin = ctx.pin_native_root(node);
         let key = ctx.get_field(node, LHM_NODE_KEY);
         let val = ctx.get_field(node, LHM_NODE_VALUE);
-        ctx.invoke_virtual(
+        let key_pin = match key {
+            Value::Object(Some(o)) => ctx.pin_native_root(o),
+            _ => usize::MAX,
+        };
+        let val_pin = match val {
+            Value::Object(Some(o)) => ctx.pin_native_root(o),
+            _ => usize::MAX,
+        };
+        let consumer = ctx.read_native_pin(consumer_pin, consumer);
+        let key = read_pinned_elem(ctx, key_pin, key);
+        let val = read_pinned_elem(ctx, val_pin, val);
+        if let Err(e) = ctx.invoke_virtual(
             consumer,
             "accept",
             "(Ljava/lang/Object;Ljava/lang/Object;)V",
             &[key, val],
-        )?;
+        ) {
+            ctx.unpin_native_roots(consumer_pin);
+            return Err(e);
+        }
+        let node = ctx.read_native_pin(node_pin, node);
         cur = ctx.get_field(node, LHM_NODE_AFTER);
+        ctx.unpin_native_roots(node_pin);
     }
+    ctx.unpin_native_roots(consumer_pin);
     Ok(None)
 }
 
@@ -20185,9 +20732,17 @@ fn native_ad_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         _ => return Ok(None),
     };
     let elems = ad_collect_elements(ctx, this);
-    for e in &elems {
-        ctx.invoke_virtual(consumer, "accept", "(Ljava/lang/Object;)V", &[*e])?;
+    let consumer_pin = ctx.pin_native_root(consumer);
+    let (_, elem_pins) = pin_value_slice(ctx, &elems);
+    for (i, e) in elems.iter().enumerate() {
+        let consumer = ctx.read_native_pin(consumer_pin, consumer);
+        let elem = read_pinned_elem(ctx, elem_pins[i], *e);
+        if let Err(e) = ctx.invoke_virtual(consumer, "accept", "(Ljava/lang/Object;)V", &[elem]) {
+            ctx.unpin_native_roots(consumer_pin);
+            return Err(e);
+        }
     }
+    ctx.unpin_native_roots(consumer_pin);
     Ok(None)
 }
 
@@ -24153,14 +24708,24 @@ fn native_tm_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         _ => return Ok(None),
     };
     let pairs = tm_collect_pairs(ctx, this);
-    for (k, v) in pairs {
-        ctx.invoke_virtual(
+    let action_pin = ctx.pin_native_root(action);
+    let flat: Vec<Value> = pairs.iter().flat_map(|(k, v)| [*k, *v]).collect();
+    let (_, flat_pins) = pin_value_slice(ctx, &flat);
+    for i in 0..pairs.len() {
+        let action = ctx.read_native_pin(action_pin, action);
+        let k = read_pinned_elem(ctx, flat_pins[i * 2], flat[i * 2]);
+        let v = read_pinned_elem(ctx, flat_pins[i * 2 + 1], flat[i * 2 + 1]);
+        if let Err(e) = ctx.invoke_virtual(
             action,
             "accept",
             "(Ljava/lang/Object;Ljava/lang/Object;)V",
             &[k, v],
-        )?;
+        ) {
+            ctx.unpin_native_roots(action_pin);
+            return Err(e);
+        }
     }
+    ctx.unpin_native_roots(action_pin);
     Ok(None)
 }
 
@@ -24400,25 +24965,54 @@ fn native_tm_compute_if_absent(ctx: &mut dyn NativeContext, args: &[Value]) -> M
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Object(None))),
     };
+    let this_pin = ctx.pin_native_root(this);
+    let key_pin = pin_value(ctx, key);
+    let mapper_pin = ctx.pin_native_root(mapper);
     // Round-9 HIGH: route through `native_tm_get` / `native_tm_put` so the
     // fast-mode BTreeMap path applies for natural-ordering maps.
-    let existing =
-        native_tm_get(ctx, &[Value::Object(Some(this)), key])?.unwrap_or(Value::Object(None));
+    let this_cur = ctx.read_native_pin(this_pin, this);
+    let key_cur = read_pinned_elem(ctx, key_pin, key);
+    let existing = match native_tm_get(ctx, &[Value::Object(Some(this_cur)), key_cur]) {
+        Ok(v) => v.unwrap_or(Value::Object(None)),
+        Err(e) => {
+            ctx.unpin_native_roots(this_pin);
+            return Err(e);
+        }
+    };
     if !matches!(existing, Value::Object(None)) {
+        ctx.unpin_native_roots(this_pin);
         return Ok(Some(existing));
     }
-    let result = ctx.invoke_virtual(
-        mapper,
+    let mapper_cur = ctx.read_native_pin(mapper_pin, mapper);
+    let key_cur = read_pinned_elem(ctx, key_pin, key);
+    let result = match ctx.invoke_virtual(
+        mapper_cur,
         "apply",
         "(Ljava/lang/Object;)Ljava/lang/Object;",
-        &[key],
-    )?;
+        &[key_cur],
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            ctx.unpin_native_roots(this_pin);
+            return Err(e);
+        }
+    };
     let val = result.unwrap_or(Value::Object(None));
     if matches!(val, Value::Object(None)) {
+        ctx.unpin_native_roots(this_pin);
         return Ok(Some(Value::Object(None)));
     }
-    native_tm_put(ctx, &[Value::Object(Some(this)), key, val])?;
-    Ok(Some(val))
+    let val_pin = pin_value(ctx, val);
+    let this_cur = ctx.read_native_pin(this_pin, this);
+    let key_cur = read_pinned_elem(ctx, key_pin, key);
+    let val_cur = read_pinned_elem(ctx, val_pin, val);
+    if let Err(e) = native_tm_put(ctx, &[Value::Object(Some(this_cur)), key_cur, val_cur]) {
+        ctx.unpin_native_roots(this_pin);
+        return Err(e);
+    }
+    let ret = read_pinned_elem(ctx, val_pin, val);
+    ctx.unpin_native_roots(this_pin);
+    Ok(Some(ret))
 }
 
 fn native_tm_merge(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -24432,28 +25026,64 @@ fn native_tm_merge(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Object(None))),
     };
+    let this_pin = ctx.pin_native_root(this);
+    let key_pin = pin_value(ctx, key);
+    let value_pin = pin_value(ctx, value);
+    let remap_pin = ctx.pin_native_root(remap_fn);
     // Round-9 HIGH: route through `native_tm_get` / `native_tm_put` so the
     // fast-mode BTreeMap path applies for natural-ordering maps.
-    let existing =
-        native_tm_get(ctx, &[Value::Object(Some(this)), key])?.unwrap_or(Value::Object(None));
+    let this_cur = ctx.read_native_pin(this_pin, this);
+    let key_cur = read_pinned_elem(ctx, key_pin, key);
+    let existing = match native_tm_get(ctx, &[Value::Object(Some(this_cur)), key_cur]) {
+        Ok(v) => v.unwrap_or(Value::Object(None)),
+        Err(e) => {
+            ctx.unpin_native_roots(this_pin);
+            return Err(e);
+        }
+    };
+    let existing_pin = pin_value(ctx, existing);
     let new_val = if matches!(existing, Value::Object(None)) {
-        value
+        read_pinned_elem(ctx, value_pin, value)
     } else {
-        let merged = ctx.invoke_virtual(
-            remap_fn,
+        let remap_cur = ctx.read_native_pin(remap_pin, remap_fn);
+        let existing_cur = read_pinned_elem(ctx, existing_pin, existing);
+        let value_cur = read_pinned_elem(ctx, value_pin, value);
+        let merged = match ctx.invoke_virtual(
+            remap_cur,
             "apply",
             "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
-            &[existing, value],
-        )?;
+            &[existing_cur, value_cur],
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                ctx.unpin_native_roots(this_pin);
+                return Err(e);
+            }
+        };
         merged.unwrap_or(Value::Object(None))
     };
     if matches!(new_val, Value::Object(None)) {
         // JDK Map.merge contract: null result removes the mapping.
-        native_tm_remove(ctx, &[Value::Object(Some(this)), key])?;
+        let this_cur = ctx.read_native_pin(this_pin, this);
+        let key_cur = read_pinned_elem(ctx, key_pin, key);
+        if let Err(e) = native_tm_remove(ctx, &[Value::Object(Some(this_cur)), key_cur]) {
+            ctx.unpin_native_roots(this_pin);
+            return Err(e);
+        }
+        ctx.unpin_native_roots(this_pin);
         return Ok(Some(Value::Object(None)));
     }
-    native_tm_put(ctx, &[Value::Object(Some(this)), key, new_val])?;
-    Ok(Some(new_val))
+    let new_val_pin = pin_value(ctx, new_val);
+    let this_cur = ctx.read_native_pin(this_pin, this);
+    let key_cur = read_pinned_elem(ctx, key_pin, key);
+    let new_val_cur = read_pinned_elem(ctx, new_val_pin, new_val);
+    if let Err(e) = native_tm_put(ctx, &[Value::Object(Some(this_cur)), key_cur, new_val_cur]) {
+        ctx.unpin_native_roots(this_pin);
+        return Err(e);
+    }
+    let ret = read_pinned_elem(ctx, new_val_pin, new_val);
+    ctx.unpin_native_roots(this_pin);
+    Ok(Some(ret))
 }
 
 // TreeMap key iterator: snapshot-based, returns keys in sorted order
@@ -25017,10 +25647,26 @@ fn native_ts_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(d) => d,
         None => return Ok(None),
     };
+    let action_pin = ctx.pin_native_root(action);
+    let data_pin = ctx.pin_native_root(data);
     for i in 0..(size as usize) {
+        let data = ctx.read_native_pin(data_pin, data);
         let v = ctx.get_array_element(data, i);
-        ctx.invoke_virtual(action, "accept", "(Ljava/lang/Object;)V", &[v])?;
+        let v_pin = match v {
+            Value::Object(Some(o)) => ctx.pin_native_root(o),
+            _ => usize::MAX,
+        };
+        let action = ctx.read_native_pin(action_pin, action);
+        let v = read_pinned_elem(ctx, v_pin, v);
+        if let Err(e) = ctx.invoke_virtual(action, "accept", "(Ljava/lang/Object;)V", &[v]) {
+            ctx.unpin_native_roots(action_pin);
+            return Err(e);
+        }
+        if v_pin != usize::MAX {
+            ctx.unpin_native_roots(v_pin);
+        }
     }
+    ctx.unpin_native_roots(action_pin);
     Ok(None)
 }
 
@@ -26281,17 +26927,27 @@ fn register_concurrent_hashmap_natives(r: &mut NativeMethodRegistry) {
                 _ => return Ok(None),
             };
             let entries = chm_collect_all_entries(ctx, this);
-            for (key, value) in entries {
+            let action_pin = ctx.pin_native_root(action);
+            let flat: Vec<Value> = entries.iter().flat_map(|(k, v)| [*k, *v]).collect();
+            let (_, flat_pins) = pin_value_slice(ctx, &flat);
+            for i in 0..entries.len() {
                 let entry = ctx.alloc_object(ClassId::new(0), NODE_NUM_FIELDS);
+                let key = read_pinned_elem(ctx, flat_pins[i * 2], flat[i * 2]);
+                let value = read_pinned_elem(ctx, flat_pins[i * 2 + 1], flat[i * 2 + 1]);
+                let action = ctx.read_native_pin(action_pin, action);
                 ctx.set_field(entry, NODE_FIELD_KEY, key);
                 ctx.set_field(entry, NODE_FIELD_VALUE, value);
-                ctx.invoke_virtual(
+                if let Err(e) = ctx.invoke_virtual(
                     action,
                     "accept",
                     "(Ljava/lang/Object;)V",
                     &[Value::Object(Some(entry))],
-                )?;
+                ) {
+                    ctx.unpin_native_roots(action_pin);
+                    return Err(e);
+                }
             }
+            ctx.unpin_native_roots(action_pin);
             Ok(None)
         },
     );
@@ -26309,9 +26965,17 @@ fn register_concurrent_hashmap_natives(r: &mut NativeMethodRegistry) {
                 _ => return Ok(None),
             };
             let keys = chm_collect_all_keys(ctx, this);
-            for key in keys {
-                ctx.invoke_virtual(action, "accept", "(Ljava/lang/Object;)V", &[key])?;
+            let action_pin = ctx.pin_native_root(action);
+            let (_, key_pins) = pin_value_slice(ctx, &keys);
+            for i in 0..keys.len() {
+                let action = ctx.read_native_pin(action_pin, action);
+                let key = read_pinned_elem(ctx, key_pins[i], keys[i]);
+                if let Err(e) = ctx.invoke_virtual(action, "accept", "(Ljava/lang/Object;)V", &[key]) {
+                    ctx.unpin_native_roots(action_pin);
+                    return Err(e);
+                }
             }
+            ctx.unpin_native_roots(action_pin);
             Ok(None)
         },
     );
@@ -26329,9 +26993,17 @@ fn register_concurrent_hashmap_natives(r: &mut NativeMethodRegistry) {
                 _ => return Ok(None),
             };
             let vals = chm_collect_all_values(ctx, this);
-            for val in vals {
-                ctx.invoke_virtual(action, "accept", "(Ljava/lang/Object;)V", &[val])?;
+            let action_pin = ctx.pin_native_root(action);
+            let (_, val_pins) = pin_value_slice(ctx, &vals);
+            for i in 0..vals.len() {
+                let action = ctx.read_native_pin(action_pin, action);
+                let val = read_pinned_elem(ctx, val_pins[i], vals[i]);
+                if let Err(e) = ctx.invoke_virtual(action, "accept", "(Ljava/lang/Object;)V", &[val]) {
+                    ctx.unpin_native_roots(action_pin);
+                    return Err(e);
+                }
             }
+            ctx.unpin_native_roots(action_pin);
             Ok(None)
         },
     );
@@ -26349,17 +27021,31 @@ fn register_concurrent_hashmap_natives(r: &mut NativeMethodRegistry) {
                 _ => return Ok(Some(Value::Object(None))),
             };
             let entries = chm_collect_all_entries(ctx, this);
-            for (key, val) in entries {
-                let result = ctx.invoke_virtual(
+            let func_pin = ctx.pin_native_root(func);
+            let flat: Vec<Value> = entries.iter().flat_map(|(k, v)| [*k, *v]).collect();
+            let (_, flat_pins) = pin_value_slice(ctx, &flat);
+            for i in 0..entries.len() {
+                let func = ctx.read_native_pin(func_pin, func);
+                let key = read_pinned_elem(ctx, flat_pins[i * 2], flat[i * 2]);
+                let val = read_pinned_elem(ctx, flat_pins[i * 2 + 1], flat[i * 2 + 1]);
+                let result = match ctx.invoke_virtual(
                     func,
                     "apply",
                     "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
                     &[key, val],
-                )?;
+                ) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        ctx.unpin_native_roots(func_pin);
+                        return Err(e);
+                    }
+                };
                 if let Some(Value::Object(Some(_))) = result {
+                    ctx.unpin_native_roots(func_pin);
                     return Ok(result);
                 }
             }
+            ctx.unpin_native_roots(func_pin);
             Ok(Some(Value::Object(None)))
         },
     );
@@ -26911,14 +27597,24 @@ fn native_chm_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         _ => return Ok(None),
     };
     let entries = chm_collect_all_entries(ctx, this);
-    for (key, value) in entries {
-        ctx.invoke_virtual(
+    let action_pin = ctx.pin_native_root(action);
+    let flat: Vec<Value> = entries.iter().flat_map(|(k, v)| [*k, *v]).collect();
+    let (_, flat_pins) = pin_value_slice(ctx, &flat);
+    for i in 0..entries.len() {
+        let action = ctx.read_native_pin(action_pin, action);
+        let key = read_pinned_elem(ctx, flat_pins[i * 2], flat[i * 2]);
+        let value = read_pinned_elem(ctx, flat_pins[i * 2 + 1], flat[i * 2 + 1]);
+        if let Err(e) = ctx.invoke_virtual(
             action,
             "accept",
             "(Ljava/lang/Object;Ljava/lang/Object;)V",
             &[key, value],
-        )?;
+        ) {
+            ctx.unpin_native_roots(action_pin);
+            return Err(e);
+        }
     }
+    ctx.unpin_native_roots(action_pin);
     Ok(None)
 }
 
@@ -27219,14 +27915,24 @@ fn native_chm_for_each_parallel(ctx: &mut dyn NativeContext, args: &[Value]) -> 
         _ => return Ok(None),
     };
     let entries = chm_collect_all_entries(ctx, this);
-    for (key, value) in entries {
-        ctx.invoke_virtual(
+    let action_pin = ctx.pin_native_root(action);
+    let flat: Vec<Value> = entries.iter().flat_map(|(k, v)| [*k, *v]).collect();
+    let (_, flat_pins) = pin_value_slice(ctx, &flat);
+    for i in 0..entries.len() {
+        let action = ctx.read_native_pin(action_pin, action);
+        let key = read_pinned_elem(ctx, flat_pins[i * 2], flat[i * 2]);
+        let value = read_pinned_elem(ctx, flat_pins[i * 2 + 1], flat[i * 2 + 1]);
+        if let Err(e) = ctx.invoke_virtual(
             action,
             "accept",
             "(Ljava/lang/Object;Ljava/lang/Object;)V",
             &[key, value],
-        )?;
+        ) {
+            ctx.unpin_native_roots(action_pin);
+            return Err(e);
+        }
     }
+    ctx.unpin_native_roots(action_pin);
     Ok(None)
 }
 
@@ -29314,12 +30020,30 @@ fn native_unmod_listitr_for_each_remaining(
         Some(Value::Object(Some(c))) => *c,
         _ => return Ok(None),
     };
+    let this_pin = ctx.pin_native_root(this);
+    let snapshot_pin = ctx.pin_native_root(snapshot);
+    let consumer_pin = ctx.pin_native_root(consumer);
     while cursor < len {
+        let this = ctx.read_native_pin(this_pin, this);
+        let snapshot = ctx.read_native_pin(snapshot_pin, snapshot);
         let elem = ctx.get_array_element(snapshot, cursor as usize);
+        let elem_pin = match elem {
+            Value::Object(Some(o)) => ctx.pin_native_root(o),
+            _ => usize::MAX,
+        };
         cursor += 1;
         ctx.set_field(this, UNMOD_LIST_ITR_CURSOR, Value::Int(cursor));
-        ctx.invoke_virtual(consumer, "accept", "(Ljava/lang/Object;)V", &[elem])?;
+        let consumer = ctx.read_native_pin(consumer_pin, consumer);
+        let elem = read_pinned_elem(ctx, elem_pin, elem);
+        if let Err(e) = ctx.invoke_virtual(consumer, "accept", "(Ljava/lang/Object;)V", &[elem]) {
+            ctx.unpin_native_roots(this_pin);
+            return Err(e);
+        }
+        if elem_pin != usize::MAX {
+            ctx.unpin_native_roots(elem_pin);
+        }
     }
+    ctx.unpin_native_roots(this_pin);
     Ok(None)
 }
 

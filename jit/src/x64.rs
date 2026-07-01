@@ -2059,7 +2059,45 @@ unsafe fn read_gs_qword(disp: usize) -> usize {
 pub fn shadow_stack_maps_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
-    *G.get_or_init(|| std::env::var_os("CRATONVM_SHADOW_STACK").is_some())
+    // `CRATONVM_MOVING_YOUNG` implies the shadow-stack codegen: the moving young
+    // gen requires a COMPLETE, rewritable precise root map (see
+    // `moving_young_enabled` and `collect_live_oop_homes`), so turning it on also
+    // turns on the push/reload emission.
+    *G.get_or_init(|| {
+        std::env::var_os("CRATONVM_SHADOW_STACK").is_some() || moving_young_enabled()
+    })
+}
+
+/// Whether the **default moving / compacting young generation**
+/// (`CRATONVM_MOVING_YOUNG`) is enabled. Cached on first read.
+///
+/// When on, the JIT publishes a *complete* rewritable precise root map at every
+/// GC-capable safepoint — not just the register-invisible operand oops the
+/// `CRATONVM_SHADOW_STACK`-only path publishes, but EVERY live oop (operand-stack
+/// entries in registers AND frame slots, and every oop local in its register or
+/// canonical frame slot) — so a moving (Cheney) young collection can relocate
+/// each JIT-held reference and rewrite its home in place. This completeness is
+/// what lets `gen_heap::collect_garbage_inner` run the moving cycle while JIT
+/// frames are live (the conservative frame scan is then suppressed — a
+/// fully-precise frame needs no conservative backstop). Off by default; gated so
+/// it can be validated against the bt18 = 68332206 invariant before any flip.
+///
+/// See `docs/feature-designs/default-moving-young-gen.md`.
+#[inline]
+pub fn moving_young_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| std::env::var_os("CRATONVM_MOVING_YOUNG").is_some())
+}
+
+fn shadow2_diag_enabled(method_label: &str) -> bool {
+    if std::env::var_os("CRATONVM_DBG_SHADOW2").is_none() {
+        return false;
+    }
+    match std::env::var("CRATONVM_DBG_SHADOW2_FILTER") {
+        Ok(filter) if !filter.is_empty() => method_label.contains(&filter),
+        _ => true,
+    }
 }
 
 /// DBG (CRATONVM_DBG_SHADOW_RELOAD): emit a bad-path-only logging call in
@@ -6295,6 +6333,8 @@ pub const LOCAL_REGS: [u8; 5] = [R12, R13, R14, R15, RBX];
 
 /// JIT compiler state.
 struct Compiler {
+    /// Human-readable method key used only by env-gated diagnostics.
+    method_label: String,
     buf: ExecutableBuffer,
     /// Simulated operand stack — maps JVM stack positions to frame offsets.
     stack: Vec<StackSlot>,
@@ -7233,6 +7273,7 @@ mod deopt_snapshot_tests {
 impl Compiler {
     #[allow(clippy::too_many_arguments)]
     fn new(
+        method_label: String,
         buf: ExecutableBuffer,
         num_locals: usize,
         num_params: usize,
@@ -7459,6 +7500,7 @@ impl Compiler {
         let arith_scratch_base: i32 = ((arith_scratch_local as i32) + 1) * 8; // Cast: x86-64 immediate encoding
 
         Self {
+            method_label,
             buf,
             stack: Vec::with_capacity(max_stack),
             next_spill_offset: base_spill,
@@ -8380,6 +8422,16 @@ impl Compiler {
         // The operand-stack Reg homes (callee-saved survive the call un-spilled;
         // caller-saved/Scratch are kept for safety) are the only ones the stack
         // scan can miss, so they are exactly the set the GC must be told about.
+        // Moving young gen (`CRATONVM_MOVING_YOUNG`) requires COMPLETE coverage: a
+        // Cheney copy relocates every reachable object and the conservative frame
+        // scan is suppressed, so EVERY live JIT-held oop must be published here as a
+        // rewritable root — operand-stack entries in frame slots AND every oop
+        // local (register- or frame-resident) as well, not just the
+        // register-invisible operand oops. Under the register-only shadow path
+        // (`CRATONVM_SHADOW_STACK` without moving), the conservative scan still
+        // covers frame slots + flushed locals, so publishing only the register
+        // homes avoids the over-pin OOM the B-K kafka fix warns about.
+        let complete = moving_young_enabled();
         let n = self.stack.len().min(self.stack_oop_marks.len());
         for i in 0..n {
             if !self.stack_oop_marks[i] {
@@ -8389,8 +8441,62 @@ impl Compiler {
                 StackSlot::CalleeSaved(reg) | StackSlot::Scratch(reg) => {
                     homes.push(ShadowHome::Reg(reg))
                 }
-                StackSlot::Frame(_) | StackSlot::Xmm(_) => {}
+                // Operand entry spilled to a frame slot: covered by the
+                // conservative scan on the non-moving path, but that scan cannot
+                // REWRITE it, so the moving path must publish it here. The frame
+                // slot uses the same `[rbp - off]` convention as the push/reload
+                // (`emit_load_local`/`emit_store_local`).
+                StackSlot::Frame(off) => {
+                    if complete {
+                        homes.push(ShadowHome::Frame(off));
+                    }
+                }
+                StackSlot::Xmm(_) => {}
             }
+        }
+        // Oop locals — every reference-typed local live at this PC, in its home
+        // register (`reg_for_local`) or canonical frame slot (`local_offset`).
+        // Mirrors the enumeration in `build_and_record_deopt_point`. Only under
+        // moving coverage: on the non-moving path a register-local is flushed to
+        // its frame slot by `emit_pre_safepoint_spill` and found conservatively.
+        if complete {
+            let oop_reached = self
+                .local_oop_reached
+                .get(self.cur_bc_pc)
+                .copied()
+                .unwrap_or(false);
+            let oop_mask = if oop_reached {
+                self.local_oop_masks
+                    .get(self.cur_bc_pc)
+                    .copied()
+                    .unwrap_or(0)
+            } else {
+                0
+            };
+            for i in 0..self.num_locals {
+                if i >= 64 || (oop_mask & (1u64 << i)) == 0 {
+                    continue;
+                }
+                if let Some(r) = self.reg_for_local(i) {
+                    homes.push(ShadowHome::Reg(r));
+                } else {
+                    homes.push(ShadowHome::Frame(self.local_offset(i)));
+                }
+            }
+            // A local and an operand entry can share the same home register (or two
+            // operand entries the same frame slot). Deduplicate preserving order:
+            // the push and reload walk the identical list, so a duplicate would
+            // only re-store the same rewritten value — harmless, but it inflates
+            // shadow depth, and depth drift is a documented hazard.
+            let mut seen: Vec<ShadowHome> = Vec::with_capacity(homes.len());
+            homes.retain(|h| {
+                if seen.contains(h) {
+                    false
+                } else {
+                    seen.push(*h);
+                    true
+                }
+            });
         }
         homes
     }
@@ -8417,15 +8523,26 @@ impl Compiler {
         }
         self.pending_shadow.clear();
         let homes = self.collect_live_oop_homes();
-        if !homes.is_empty() && std::env::var_os("CRATONVM_DBG_SHADOW2").is_some() {
+        if !homes.is_empty() && shadow2_diag_enabled(&self.method_label) {
             let lm = self
                 .local_oop_masks
                 .get(self.cur_bc_pc)
                 .copied()
                 .unwrap_or(0);
+            let reached = self
+                .local_oop_reached
+                .get(self.cur_bc_pc)
+                .copied()
+                .unwrap_or(false);
             eprintln!(
-                "[SHADOW2] push pc={} stack={:?} marks={:?} local_mask={:#x} homes={:?}",
-                self.cur_bc_pc, &self.stack, &self.stack_oop_marks, lm, homes
+                "[SHADOW2] method={} pc={} stack={:?} marks={:?} local_reached={} local_mask={:#x} homes={:?}",
+                self.method_label,
+                self.cur_bc_pc,
+                &self.stack,
+                &self.stack_oop_marks,
+                reached,
+                lm,
+                homes
             );
         }
         if homes.is_empty() {
@@ -15445,6 +15562,29 @@ impl Compiler {
                     }
                 }
             }
+            // Reclaim spill slots at every instruction boundary. Each pre-call
+            // flush (`flush_scratch_registers`) spills live operand-stack values
+            // to fresh frame slots via `next_spill_offset += 8` and never rolls
+            // that cursor back once the operands are consumed. Individual
+            // stack-consuming handlers (invoke/switch/athrow/…) call
+            // `reset_spills()` themselves, but a straight-line basic block full
+            // of flush-bearing ops that DON'T (e.g. a long `putfield` run such
+            // as `Token.copyTo`'s ~25 field stores, each emitting a
+            // `jit_putfield_object` write-barrier CALL → flush) leaks one slot
+            // per op. With `spill_size == max_stack*8` that cursor eventually
+            // marches past the reserved spill region and into the callee-saved
+            // GPR save area (`callee_saved_base`), overwriting the CALLER's
+            // saved R12/R13. The epilogue then restores garbage into the
+            // caller's callee-saved registers — e.g. HSQLDB's `Token.duplicate`
+            // (which holds the freshly-`new`ed Token in a callee-saved local
+            // across the `copyTo` call) returned null, breaking every embedded
+            // in-memory database open after warm-up. `reset_spills` only lowers
+            // the allocation cursor to just past the highest LIVE frame slot, so
+            // it never disturbs a live value — it just recycles the dead scratch
+            // slots the previous instruction left behind.
+            if !dead {
+                self.reset_spills();
+            }
             // OSR soundness: record the pre-hoist native position as the OSR
             // entry for this PC. The LICM preheaders emitted just below
             // initialise hoist spill slots that the rewritten in-loop loads
@@ -15481,14 +15621,11 @@ impl Compiler {
                 } else {
                     self.osr_entry_native[pc] = self.buf.pos() as i32; // Cast: x86-64 immediate encoding
                                                                        // Shadow-stack note: this position is reached by BOTH the OSR
-                                                                       // entry (which bypasses the prologue → thread/watermark slots
-                                                                       // uninitialised) AND the initial fall-through (slots already
-                                                                       // set by the prologue). So we can't (re)initialise the slots
-                                                                       // here without corrupting the normal path. Instead the VM-side
-                                                                       // OSR setup zeroes the slots before jumping (see
-                                                                       // `CompiledMethod::shadow_thread_slot_off` / try_osr), which
-                                                                       // makes OSR-entered frames skip shadow tracking via the
-                                                                       // null-guards (safe; precise OSR-frame tracking is a follow-up).
+                                                                       // entry (which bypasses the prologue) AND the initial fall-through
+                                                                       // (slots already set by the prologue). So we can't (re)initialise
+                                                                       // the slots here without corrupting the normal path. The OSR
+                                                                       // trampoline initializes the cached thread/watermark slots before
+                                                                       // jumping here.
 
                     // deopt-osr Step 7: this PC is an OSR-vetted loop boundary
                     // (outside every LICM-hoisted body — the `else` branch), so
@@ -23944,6 +24081,7 @@ pub fn compile_with_param_slots(
     let num_scalar_slots = sr_plan.total_slots;
 
     let mut compiler = Compiler::new(
+        method_key.to_string(),
         buf,
         max_locals,
         num_params,
@@ -24335,6 +24473,7 @@ pub fn compile_with_param_slots(
     cm.osr_callee_saved_xmms = Some(compiler.alloc_used_xmms.clone());
     cm.osr_xmm_saved_base = compiler.xmm_saved_base;
     cm.osr_heap_local_offset = compiler.heap_local_offset;
+    cm.osr_frame_record = compiler.helpers.frame_record;
 
     // T1.1.a — transfer precise oop maps collected during codegen.
     // The GC root walker's `JitEntryGuard::enter_with_compiled` path
@@ -24406,7 +24545,10 @@ pub fn compile_with_param_slots(
     // register-locals (`safepoint_pcs`) also recorded a precise oop map
     // (`mapped_safepoint_pcs`), the precise gate is on (so the sp-id slot
     // exists and the per-safepoint id is stored), and there is no construct the
-    // current mapping cannot describe (inlined-callee safepoints, OSR entry).
+    // current mapping cannot describe (inlined-callee safepoints). OSR entry
+    // used to be a coverage breaker because it bypassed the prologue's shadow
+    // and exact-RBP setup; the OSR trampoline now mirrors both before jumping to
+    // the loop body, so OSR artifacts use the same completeness predicate.
     // Stage B consults this to decide whether the GC may skip the conservative
     // backstop for this frame and treat its precise oops as movable. It is a
     // NECESSARY codegen precondition; the runtime `CRATONVM_DBG_VERIFY_OOP_MAPS`
@@ -24416,15 +24558,14 @@ pub fn compile_with_param_slots(
     // is on AND Stage B lands.
     cm.fully_oop_covered = compiler.precise_maps
         && compiler.sp_id_slot_off != 0
-        && !cm.compiled_via_osr
         && compiler.inline_sites.is_empty()
         && compiler
             .safepoint_pcs
             .is_subset(&compiler.mapped_safepoint_pcs);
     // Shadow-stack — frame offsets + thread-struct offset, so the OSR trampoline
     // can replicate the prologue's shadow setup (cache the thread ptr + snapshot
-    // the `top` watermark) for OSR-entered frames (follow-up §1). All 0 when the
-    // shadow-stack gate was off at compile.
+    // the `top` watermark) for OSR-entered frames. All 0 when shadow-stack
+    // support was off at compile.
     cm.shadow_thread_slot_off = compiler.shadow_thread_slot_off;
     cm.shadow_savetop_slot_off = compiler.shadow_savetop_slot_off;
     cm.shadow_off_in_thread = compiler.shadow_off_in_thread;

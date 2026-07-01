@@ -2635,14 +2635,36 @@ impl GenerationalHeap {
         let honor_promotion_oom_risk = promotion_oom_risk
             && (has_conservative_roots
                 || std::env::var_os("CRATONVM_PROMOTION_OOM_GUARD_BROAD").is_some());
-        if (has_conservative_roots || honor_promotion_oom_risk) && !force_moving {
+        // Default moving young gen (`CRATONVM_MOVING_YOUNG`): the JIT publishes a
+        // COMPLETE rewritable precise root map (shadow stack) for every live frame
+        // and the conservative scan is suppressed (see roots.rs), so a live JIT
+        // frame no longer forces the non-moving sweep — run the moving (Cheney)
+        // cycle instead. The `honor_promotion_oom_risk` guard is STILL respected as
+        // a safety fallback: when both generations are ~full the moving path can
+        // `process::abort()` on a promotion failure, so we divert to the
+        // (abort-free) non-moving sweep for that cycle regardless of the flag. The
+        // suppressed conservative scan means that fallback sweep also relies on the
+        // complete shadow map for marking — consistent, since the shadow map is the
+        // sole precise JIT root set under this flag. If the VM detected an
+        // incomplete OSR shadow layout during root gathering, it sets
+        // `force_non_moving_jit_roots`; then this cycle treats moving-young as
+        // unavailable and uses the conservative/non-moving fallback instead.
+        let moving_young_requested = crate::gc_quiescence::moving_young_enabled();
+        let force_non_moving_jit_roots = crate::gc_quiescence::force_non_moving_jit_roots();
+        let moving_young = moving_young_requested && !force_non_moving_jit_roots;
+        let divert_non_moving =
+            (has_conservative_roots && !moving_young) || honor_promotion_oom_risk;
+        if divert_non_moving && !force_moving {
             tracing::debug!(
                 "running non-moving young-gen mark-sweep (jit_active={}, \
-                 unregistered_jit_frame={}, promotion_oom_risk={}, honored={}) — compaction deferred.",
+                 unregistered_jit_frame={}, promotion_oom_risk={}, honored={}, moving_young={}, \
+                 force_non_moving_jit_roots={}) — compaction deferred.",
                 crate::gc_quiescence::is_active(),
                 crate::gc_quiescence::unregistered_jit_frame_on_stack(),
                 promotion_oom_risk,
                 honor_promotion_oom_risk,
+                moving_young,
+                force_non_moving_jit_roots,
             );
             let result = self.sweep_young_non_moving(roots, finalizer_addrs);
             // BUG-V fix: the non-moving sweep still *relocates* objects via
@@ -3364,6 +3386,79 @@ impl GenerationalHeap {
         }
 
         let bytes_copied = young_to.used();
+
+        if moving_young_dangling_verify_enabled() {
+            let mut missed_young = 0usize;
+            let mut missed_old = 0usize;
+            let mut reported = 0usize;
+            let cap = 40usize;
+            let mut scan_obj = |space: &str, obj: *mut u8, header: &ObjectHeader| -> usize {
+                let mut n = 0usize;
+                // SAFETY: caller passes live objects from young_to/old_gen walks while STW.
+                unsafe {
+                    for_each_ref_slot(obj, header, |raw, slot_id| {
+                        let t = raw as usize;
+                        if !young_from.contains(raw as *const u8) {
+                            return;
+                        }
+                        let th = &*(raw as *const ObjectHeader);
+                        if !th.is_forwarded() {
+                            return;
+                        }
+                        n += 1;
+                        if reported < cap {
+                            reported += 1;
+                            let referrer = crate::gc::resolve_class_info(header.class_id.as_u32())
+                                .map(|(name, _)| name)
+                                .unwrap_or_else(|| format!("cid#{}", header.class_id.as_u32()));
+                            let target = crate::gc::resolve_class_info(th.class_id.as_u32())
+                                .map(|(name, _)| name)
+                                .unwrap_or_else(|| format!("cid#{}", th.class_id.as_u32()));
+                            let expected = pointer_map
+                                .get(&t)
+                                .copied()
+                                .unwrap_or_else(|| th.forwarding_address() as usize);
+                            eprintln!(
+                                "[moving-young-verify] MISSED-HEAP-REWRITE {} {}@0x{:x} slot={} -> forwarded {} old=0x{:x} new=0x{:x}",
+                                space,
+                                referrer,
+                                obj as usize,
+                                slot_id,
+                                target,
+                                t,
+                                expected,
+                            );
+                        }
+                    });
+                }
+                n
+            };
+
+            let mut cursor = 0usize;
+            let young_used = young_to.used();
+            while cursor < young_used {
+                // SAFETY: young_to is bump-allocated; cursor advances by object size.
+                let obj = unsafe { young_to.base_ptr_mut().add(cursor) };
+                let header = unsafe { &*(obj as *const ObjectHeader) };
+                let size = gen_object_total_size(header);
+                if size < HEADER_SIZE || cursor + size > young_used {
+                    break;
+                }
+                missed_young += scan_obj("YOUNG", obj, header);
+                cursor += size;
+            }
+            for (obj, _size) in old_gen.walk_objects() {
+                // SAFETY: walk_objects yields live old-gen object starts.
+                let header = unsafe { &*(obj as *const ObjectHeader) };
+                missed_old += scan_obj("OLD", obj, header);
+            }
+            eprintln!(
+                "[moving-young-verify] forwarded_heap_refs_remaining young={} old={} pointer_map={}",
+                missed_young,
+                missed_old,
+                pointer_map.len(),
+            );
+        }
 
         // bc math-ec 0x4 seed-phase bisect: count `0x4` slots in the Cheney
         // to-space survivors and in old gen AFTER the minor (Cheney +
@@ -6351,6 +6446,17 @@ fn seedhunt_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
     *G.get_or_init(|| std::env::var_os("CRATONVM_DBG_SEEDHUNT").is_some())
+}
+
+/// Moving-young diagnostic: after Cheney scanning but before from-space reset,
+/// report any surviving heap reference that still points at a forwarded
+/// young-from object. Nonzero means a heap reference rewrite was missed; zero
+/// with a wrong result points at an unenumerated root/home outside the heap.
+#[inline]
+fn moving_young_dangling_verify_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| std::env::var_os("CRATONVM_MOVING_YOUNG_VERIFY").is_some())
 }
 
 /// Scan a single object's reference slots for the `0x4` seed signature

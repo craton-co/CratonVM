@@ -149,7 +149,19 @@ what remains open is the **general** clobber.
 
 ## Root-cause progress log
 
-### 2026-06-18 — a distinct JIT→JIT-reentry borrow-suspend gap (candidate fix on a WIP branch)
+### 2026-07-01 — JIT reentry borrow-suspend gap fixed
+
+The distinct borrow-tracker sub-bug below is fixed on branch
+`codex/jit-known-issues-20260701-2`: all direct compiled-entry fast paths now route through a
+single `try_call_compiled_entry_reentrant` wrapper that suspends/restores the debug JIT borrow
+flag around the raw callee call. This covers the thread-local `DISPATCH_CACHE` hit, the JIT-cache
+hit, the post-compile fast path in `jit_invoke_dispatch`, and the MIC-hit path in
+`jit_invoke_virtual_mic`.
+
+This closes the JIT-to-JIT reentry borrow-suspend gap only. The broader regalloc/callee-saved
+clobber family and the `WeakHashMap`-style JIT codegen work remain open.
+
+### 2026-06-18 — a distinct JIT→JIT-reentry borrow-suspend gap (historical diagnosis)
 
 While hunting the kafka-bug-C (`WeakHashMap` stream) hang, a scratch reproducer (`Dx4`: a field-
 post-increment `while (idx<hi || cur!=null)` loop driving `Consumer.accept` via **invokeinterface**
@@ -167,16 +179,16 @@ fixing in its own right:
   is a legit child reborrow, but the tracker wasn't told → debug assert (and in **release**, where
   the assert is compiled out, two un-suspended `&mut JvmThread` = aliasing UB). The 3 sibling fast-
   path sites in `jit_invoke_dispatch` (2987/3036/3080) likely share the gap.
-- **Candidate fix:** branch `wip/jit-reentry-borrow-suspend` (NOT merged) wraps the re-entry in
+- **Historical WIP:** branch `wip/jit-reentry-borrow-suspend` wrapped the re-entry in
   `set_jit_thread`/`restore_jit_thread`. The panic goes away and normal `invokevirtual` dispatch
   still works — **but** `Dx4` then *hangs in BOTH JIT and interpreter* (so `Dx4` is a *compound*
   repro carrying a second, non-JIT bug, and is NOT a clean kafka-bug-C repro, which is JIT-only).
   The `WeakHashMap` hang is unchanged. So this fix removes a real (masking) debug false-positive but
   does not close the user-facing hang.
-- **Not merged because:** it is a HOT-PATH change (every MIC-hit dispatch), not yet regression-
-  verified, and doesn't fix the target hang. Next: regression-test it + extend to the 3
-  `jit_invoke_dispatch` sites; and build a JIT-*only* `WeakHashMap`-style repro (drop whatever makes
-  `Dx4` hang in the interpreter) to chase the actual clobber.
+- **Why it stayed open at the time:** it was a HOT-PATH change (every MIC-hit dispatch), not yet
+  regression-verified, and didn't fix the target hang. The JIT reentry borrow gap is now closed by
+  the 2026-07-01 shared-wrapper fix above; a JIT-*only* `WeakHashMap`-style repro is still needed to
+  chase the actual clobber.
 
 ## Related
 

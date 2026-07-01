@@ -1795,11 +1795,15 @@ impl<'a> NativeContextImpl<'a> {
         // conservative guard against any future relaxation of that invariant.
         // Redefinition is rare, so the rebuild cost is negligible.
         self.shared.field_descriptor_cache.write().clear();
-        // Best-effort JIT cache eviction by name (the
-        // `fire_jit_invalidate_hook` call inside `redefine_class` already
-        // notifies the registered hook keyed by `class_id`; this catches
-        // any name-keyed sibling caches).
-        let _ = self.shared.jit_cache.write().invalidate_for_class(&name);
+        // JVMTI redefinition can stale caller-side direct calls and inline
+        // dispatch caches, not just compiled bodies declared by `name`. Full
+        // eviction is rare and keeps agent-woven bytecode authoritative.
+        let evicted = self.shared.jit_cache.write().clear_all();
+        if evicted > 0 {
+            tracing::debug!(
+                "JIT: fully invalidated {evicted} method(s) due to redefineClass: {name}"
+            );
+        }
         let _ = self.shared.invalidate_jit_for_class(&name);
         Ok(())
     }
@@ -11533,7 +11537,12 @@ fn invoke_on_class_shared_inner(
                         // downstream real-JDK SimpleDateFormat runs with a valid
                         // pattern.
                         || (class_name == "sun/util/locale/provider/LocaleResources"
-                            && method_name == "getDateTimePattern")
+                            && (method_name == "getDateTimePattern"
+                                // java.time localized formatting path
+                                // (getLocalizedDateTimePattern) reads the same
+                                // unsurfaced jdk.localedata bundle and otherwise
+                                // returns null → appendPattern(null) NPE.
+                                || method_name == "getJavaTimeDateTimePattern"))
                         // java.time text names: `CalendarDataUtility.retrieve
                         // JavaTimeFieldValueName(s)` back `DateTimeTextProvider`'s
                         // `EEE`/`MMM`/`a`/`G` lookups. Same locale-data gap as
@@ -12239,6 +12248,31 @@ fn invoke_on_class_shared_inner(
                         "[cratonvm] unimplemented: {}.{}{} — no native implementation and no loadable bytecode (CratonVM)",
                         class_name, method_name, descriptor
                     );
+                }
+                // A missing Hibernate-enhanced `$$_hibernate_*` accessor must
+                // surface as a CATCHABLE `java.lang.NoSuchMethodError` (JVMS §5.4.3.3:
+                // an unresolved method is a `LinkageError`, which is throwable), not
+                // the uncatchable internal abort below. Under the loader-aware gate
+                // the bytecode-enhancement test harness now reaches such call sites
+                // (e.g. Hibernate's HHH-16572 `InvalidPropertyNameTest` exercises a
+                // field whose enhanced read-accessor is intentionally absent, and the
+                // loader-faithful lambda dispatch that runs the enhanced test body
+                // exposes it) — without a throwable form the process dies (CRASH)
+                // instead of the framework's error path handling it. Scope: gate-on +
+                // the `$$_hibernate_` accessor family only → gate-off byte-identical,
+                // and passing call sites (which never reach this terminal) unaffected.
+                if crate::runtime::env_cache::loader_aware_resolution()
+                    && method_name.starts_with("$$_hibernate_")
+                {
+                    let msg = format!("{class_name}.{method_name}{descriptor}");
+                    if let Ok(exc) = crate::runtime::exceptions::create_exception_object(
+                        shared,
+                        thread,
+                        "java/lang/NoSuchMethodError",
+                        Some(&msg),
+                    ) {
+                        return Err(MethodCallFailed::ExceptionThrown(exc));
+                    }
                 }
                 return Err(MethodCallFailed::InternalError(VmError::Linkage(
                     LinkageError::NoSuchMethodError {

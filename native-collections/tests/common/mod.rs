@@ -60,6 +60,11 @@ pub struct MockCtx {
     /// re-implementing the callable receiver. Each entry is
     /// `(receiver_ptr, method_name, descriptor, args)`.
     invoke_virtual_log: UnsafeCell<Vec<(usize, String, String, Vec<Value>)>>,
+    /// Per-native-call roots, mirroring `JvmThread::native_pin_roots`.
+    native_pin_roots: UnsafeCell<Vec<ObjectRef>>,
+    /// Test hook: simulate a moving GC during every Java callback by relocating
+    /// all currently pinned roots before `invoke_virtual` returns.
+    relocate_pins_on_invoke: UnsafeCell<bool>,
 }
 
 impl Default for MockCtx {
@@ -108,6 +113,8 @@ impl MockCtx {
             next_identity: UnsafeCell::new(hash_base),
             invoke_virtual_result: UnsafeCell::new(None),
             invoke_virtual_log: UnsafeCell::new(Vec::new()),
+            native_pin_roots: UnsafeCell::new(Vec::new()),
+            relocate_pins_on_invoke: UnsafeCell::new(false),
         }
     }
 
@@ -127,6 +134,13 @@ impl MockCtx {
         // SAFETY: single-threaded test code.
         unsafe {
             *self.invoke_virtual_result.get() = Some(r);
+        }
+    }
+
+    pub fn set_relocate_pins_on_invoke(&self, enabled: bool) {
+        // SAFETY: single-threaded test code.
+        unsafe {
+            *self.relocate_pins_on_invoke.get() = enabled;
         }
     }
 
@@ -230,6 +244,44 @@ impl MockCtx {
         }
         // SAFETY: new_ptr_val is non-null (>= 8) and 8-aligned.
         unsafe { ObjectRef::from_raw(new_ptr_val as *mut u8) }
+    }
+
+    fn relocate_native_pins(&mut self) {
+        // SAFETY: single-threaded test code.
+        let old_roots = unsafe { (*self.native_pin_roots.get()).clone() };
+        let mut moved = HashMap::new();
+        let mut new_roots = Vec::with_capacity(old_roots.len());
+        for root in old_roots {
+            let key = root.as_ptr() as usize;
+            if let Some(new_root) = moved.get(&key).copied() {
+                new_roots.push(new_root);
+            } else if self.entry_index(root).is_some() {
+                let new_root = self.relocate_object(root);
+                moved.insert(key, new_root);
+                new_roots.push(new_root);
+            } else {
+                new_roots.push(root);
+            }
+        }
+        if !moved.is_empty() {
+            for entry in self.heap_mut() {
+                let values = match entry {
+                    HeapEntry::Object { fields, .. } => fields,
+                    HeapEntry::Array { elements } => elements,
+                };
+                for value in values {
+                    if let Value::Object(Some(obj)) = value {
+                        if let Some(new_obj) = moved.get(&(obj.as_ptr() as usize)).copied() {
+                            *obj = new_obj;
+                        }
+                    }
+                }
+            }
+        }
+        // SAFETY: single-threaded test code.
+        unsafe {
+            *self.native_pin_roots.get() = new_roots;
+        }
     }
 }
 
@@ -743,10 +795,40 @@ impl NativeContext for MockCtx {
             ));
         }
         let slot = unsafe { &mut *self.invoke_virtual_result.get() };
-        if let Some(r) = slot.take() {
+        let result = if let Some(r) = slot.take() {
             r
         } else {
             Ok(None)
+        };
+        if unsafe { *self.relocate_pins_on_invoke.get() } {
+            self.relocate_native_pins();
+        }
+        result
+    }
+
+    fn pin_native_root(&mut self, obj: ObjectRef) -> usize {
+        // SAFETY: single-threaded test code.
+        let roots = unsafe { &mut *self.native_pin_roots.get() };
+        let idx = roots.len();
+        roots.push(obj);
+        idx
+    }
+
+    fn read_native_pin(&self, handle: usize, fallback: ObjectRef) -> ObjectRef {
+        // SAFETY: single-threaded test code.
+        unsafe {
+            (&*self.native_pin_roots.get())
+                .get(handle)
+                .copied()
+                .unwrap_or(fallback)
+        }
+    }
+
+    fn unpin_native_roots(&mut self, base: usize) {
+        // SAFETY: single-threaded test code.
+        let roots = unsafe { &mut *self.native_pin_roots.get() };
+        if base < roots.len() {
+            roots.truncate(base);
         }
     }
 
@@ -876,6 +958,24 @@ pub fn new_hashmap(reg: &NativeMethodRegistry, ctx: &mut MockCtx) -> ObjectRef {
     )
     .unwrap();
     hm
+}
+
+/// Allocate a fresh empty `java/util/concurrent/ConcurrentHashMap`.
+pub fn new_concurrent_hashmap(reg: &NativeMethodRegistry, ctx: &mut MockCtx) -> ObjectRef {
+    let cid = ctx
+        .ensure_class_initialized("java/util/concurrent/ConcurrentHashMap")
+        .unwrap();
+    let chm = ctx.alloc_object(cid, 4);
+    call(
+        reg,
+        ctx,
+        "java/util/concurrent/ConcurrentHashMap",
+        "<init>",
+        "()V",
+        &[Value::Object(Some(chm))],
+    )
+    .unwrap();
+    chm
 }
 
 /// Allocate a fresh `java/util/LinkedHashMap`. `access_order = true` builds
