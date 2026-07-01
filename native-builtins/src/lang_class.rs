@@ -13094,6 +13094,142 @@ mod tests {
         mirror
     }
 
+    fn jspecify_nullable_annotation() -> cratonvm_native_api::AnnotationData {
+        cratonvm_native_api::AnnotationData {
+            type_descriptor: "Lorg/jspecify/annotations/Nullable;".to_string(),
+            elements: Vec::new(),
+        }
+    }
+
+    fn ensure_nullable_annotation_type(ctx: &mut crate::test_utils::MockNativeContext) {
+        ctx.ensure_class_initialized("java/lang/annotation/Annotation")
+            .unwrap();
+        ctx.ensure_class_initialized("org/jspecify/annotations/Nullable")
+            .unwrap();
+    }
+
+    fn declared_annotation_count(
+        ctx: &mut crate::test_utils::MockNativeContext,
+        annotated_type: ObjectRef,
+    ) -> usize {
+        let anns = native_annotated_type_get_declared_annotations(
+            ctx,
+            &[Value::Object(Some(annotated_type))],
+        )
+        .unwrap();
+        match anns {
+            Some(Value::Object(Some(arr))) => ctx.array_length(arr),
+            other => panic!("expected Annotation[] from AnnotatedType, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn jspecify_type_use_method_return_annotations_reach_annotated_type() {
+        let mut ctx = mock_ctx();
+        ensure_nullable_annotation_type(&mut ctx);
+        let owner = ctx.ensure_class_initialized("com/example/JSpecifyProbe").unwrap();
+        let desc = "()Ljava/lang/String;";
+        let meta = cratonvm_native_api::MethodMetadata {
+            name: "nullableReturn".to_string(),
+            descriptor: desc.to_string(),
+            access_flags: 0x0001,
+            declaring_class_id: owner,
+            exceptions: Vec::new(),
+        };
+        let method = create_method_object(&mut ctx, &meta);
+        ctx.set_method_return_type_annotations(
+            owner,
+            "nullableReturn",
+            desc,
+            vec![jspecify_nullable_annotation()],
+        );
+
+        let annotated_type =
+            native_method_get_annotated_return_type(&mut ctx, &[Value::Object(Some(method))])
+                .unwrap();
+        let annotated_type = match annotated_type {
+            Some(Value::Object(Some(obj))) => obj,
+            other => panic!("expected AnnotatedType, got {other:?}"),
+        };
+
+        assert_eq!(declared_annotation_count(&mut ctx, annotated_type), 1);
+    }
+
+    #[test]
+    fn jspecify_type_use_parameter_annotations_use_parameter_index() {
+        let mut ctx = mock_ctx();
+        ensure_nullable_annotation_type(&mut ctx);
+        let owner = ctx.ensure_class_initialized("com/example/JSpecifyProbe").unwrap();
+        let desc = "(Ljava/lang/String;Ljava/lang/String;)V";
+        let meta = cratonvm_native_api::MethodMetadata {
+            name: "nullableParameter".to_string(),
+            descriptor: desc.to_string(),
+            access_flags: 0x0001,
+            declaring_class_id: owner,
+            exceptions: Vec::new(),
+        };
+        let method = create_method_object(&mut ctx, &meta);
+        ctx.set_method_parameter_type_annotations(
+            owner,
+            "nullableParameter",
+            desc,
+            vec![Vec::new(), vec![jspecify_nullable_annotation()]],
+        );
+
+        let params = crate::lang_reflect::native_method_get_parameters(
+            &mut ctx,
+            &[Value::Object(Some(method))],
+        )
+        .unwrap();
+        let params = match params {
+            Some(Value::Object(Some(arr))) => arr,
+            other => panic!("expected Parameter[], got {other:?}"),
+        };
+        let param = match ctx.get_array_element(params, 1) {
+            Value::Object(Some(obj)) => obj,
+            other => panic!("expected second Parameter, got {other:?}"),
+        };
+
+        let annotated_type =
+            native_parameter_get_annotated_type(&mut ctx, &[Value::Object(Some(param))]).unwrap();
+        let annotated_type = match annotated_type {
+            Some(Value::Object(Some(obj))) => obj,
+            other => panic!("expected AnnotatedType, got {other:?}"),
+        };
+
+        assert_eq!(declared_annotation_count(&mut ctx, annotated_type), 1);
+    }
+
+    #[test]
+    fn jspecify_type_use_field_annotations_reach_annotated_type() {
+        let mut ctx = mock_ctx();
+        ensure_nullable_annotation_type(&mut ctx);
+        let owner = ctx.ensure_class_initialized("com/example/JSpecifyProbe").unwrap();
+        let meta = cratonvm_native_api::FieldMetadata {
+            name: "nullableField".to_string(),
+            descriptor: "Ljava/lang/String;".to_string(),
+            access_flags: 0x0001,
+            slot_index: 0,
+            declaring_class_id: owner,
+            is_static: false,
+        };
+        let field = create_field_object(&mut ctx, &meta);
+        ctx.set_field_type_annotations(
+            owner,
+            "nullableField",
+            vec![jspecify_nullable_annotation()],
+        );
+
+        let annotated_type =
+            native_field_get_annotated_type(&mut ctx, &[Value::Object(Some(field))]).unwrap();
+        let annotated_type = match annotated_type {
+            Some(Value::Object(Some(obj))) => obj,
+            other => panic!("expected AnnotatedType, got {other:?}"),
+        };
+
+        assert_eq!(declared_annotation_count(&mut ctx, annotated_type), 1);
+    }
+
     // -----------------------------------------------------------------------
     // parse_descriptor_param_and_return (pure function)
     // -----------------------------------------------------------------------

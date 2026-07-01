@@ -1,4 +1,11 @@
-﻿# Bug: JSpecify type-use & package-level nullness annotations are invisible to reflection
+﻿# Fixed 2026-07-01: JSpecify type-use & package-level nullness annotations are visible to reflection
+
+## Resolution 2026-07-01
+Current `dev` has both gaps from this report implemented:
+- `Method.getAnnotatedReturnType()`, `Parameter.getAnnotatedType()`, `Executable.getAnnotatedParameterTypes()`, and `Field.getAnnotatedType()` are registered natively and surface `RuntimeVisibleTypeAnnotations` through `AnnotatedType`.
+- `Class.getPackage()` now wires a package `Module` and resolves `<pkg>/package-info`, so package-level declaration annotations such as JSpecify `@NullMarked` / `@NullUnmarked` are visible through `Package`.
+
+This branch adds native-level regression coverage for the TYPE_USE half: method return, indexed method parameter, and field annotations now round-trip through the `AnnotatedType` annotation APIs. The original report below is retained as historical root-cause documentation.
 
 ## Symptom
 26 `jspecify*` methods in `org.springframework.core.NullnessTests` plus `org.springframework.core.MethodParameterTests.jspecifyNullableParameter` fail with a bare `AssertionError` (no message вЂ” the assertion compares the computed `Nullness` enum against the expected one). In every case CratonVM computes `Nullness.UNSPECIFIED` where the test expects `NULLABLE` or `NON_NULL`.

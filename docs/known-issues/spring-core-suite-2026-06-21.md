@@ -16,8 +16,9 @@ Branch `fix/spring-core-suite-bugs` (off latest dev `6eeb1fe6`); each verified v
 | map-multivaluemap | med | ✅ FIXED `63c120af` | keySet().contains honors overridden containsKey → LinkedCaseInsensitiveMap 18/18 |
 | [stax-xml-family](SC-stax-xml-family.md) | med | ◑ PARTIAL `cd8c9b9f` | 4 cursor natives + getName prefix → StaxStream 1/6→4/6 (2 namespace-SAX-sequence tests remain) |
 | annotation-introspection **Bug B** | high | ✅ FIXED `00c71bb6` | lambda SAM dispatch now checks param types → AnnotationFilter 11/11, AnnotationTypeMappings 43/43, MergedAnnotationsRepeatable 24/24 (general correctness fix) |
+| [jspecify-nullness-reflection](../internal/spring/SC-jspecify-nullness-reflection.md) | med | FIXED 2026-07-01 | TYPE_USE `AnnotatedType` and package-info annotations are implemented; native-level regression coverage added for return/parameter/field type-use annotations |
 
-**Session total: 7 bugs fixed, ~17 spring-core tests recovered. Branch rebased onto current dev (merge `75ffb42c`).**
+**Session total: 8 bugs fixed, ~43 spring-core tests recovered. Branch rebased onto current dev (merge `75ffb42c`).**
 Remaining annotation-introspection sub-bugs (same report): A (TypeNotPresent/classloader, AnnotationIntrospectionFailureTests 0/4), C (enclosing-class scan), D (bridge-method) — separate deeper fixes.
 
 ## spring-core — open clusters (run 1, 262 classes)
@@ -25,7 +26,6 @@ Remaining annotation-introspection sub-bugs (same report): A (TypeNotPresent/cla
 |----|-----|------|-----|-------|-----------|
 | [generic-type-signature-cce](SC-generic-type-signature-cce.md) | high | high | FIX | 9 | real `TypeVariableImpl.getBounds()` reifier not overridden → CCE `FieldTypeSignature→Type[]` |
 | [annotation-introspection-family](SC-annotation-introspection-family.md) | high | high | FIX | 12 | 4 distinct: Class-attr TypeNotPresent, lambda SAM/default overload, classloader ctx, bridge merge |
-| [jspecify-nullness-reflection](SC-jspecify-nullness-reflection.md) | med | high | FIX | 26 | type-use + package annotations dropped (`getTypeAnnotationBytes0`=null; synthetic Package no pkg-info) |
 | [env-classreading](SC-env-classreading.md) | high | high | FIX+HO | 6 | ~~getenv/getProperties identity~~ **✅fixed on dev** (`fea93ba8`); `Object.equals` shadows override (precedenceOf=-1) [open,HO]; ~~`int.class`→Integer~~ **✅fixed on dev**; custom-ClassLoader `getResourceAsStream`=null [open,HO] — triaged 2026-06-22, see doc |
 | [stax-xml-family](SC-stax-xml-family.md) | med | high | FIX | 7 | StAX→SAX bridge: 3 unregistered cursor natives + `getName()` drops element prefix |
 | [map-multivaluemap-family](../internal/fixed-suite-bugs/SC-map-multivaluemap-family.md) | med | high | ✅FIXED | 6 | keySet.contains skips `containsKey` override; LHM putIfAbsent drops null-replace; Map.equals fails on foreign-Map arg — **all 3 fixed on dev** (RC-3 `e115b0bd`); archived. +2 ByteBuddy handoff (bug-E) |
