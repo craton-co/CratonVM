@@ -18558,17 +18558,41 @@ impl Compiler {
                         // `Object(None) => 0`); a primitive field keeps its
                         // 16-byte cell, payload at the same +4/+8 within-cell
                         // offsets as the legacy path.
-                        let type_tag = self
+                        //
+                        // CRITICAL: a class with a registered compact layout may
+                        // still have LEGACY-laid-out (16-byte-cell) instances —
+                        // any allocation whose `num_fields` disagrees with the
+                        // layout's field count falls back to the uniform layout
+                        // (`plan_object_alloc`), e.g. native/synthetic-stub
+                        // allocations of `java/lang/reflect/Method`,
+                        // `ConcurrentHashMap`, `ArrayList`, … whose stub field
+                        // count exceeds the real declared count the layout was
+                        // built from. The compact offset is only valid for a
+                        // genuinely-compact object, so we MUST key on the
+                        // per-object `GC_FLAG_COMPACT` header bit (byte 21) the
+                        // same way every heap/helper access path does — reading a
+                        // legacy object at the compact offset returns a mangled
+                        // {tag,partial-pointer} word that SIGSEGVs when later
+                        // dereferenced/called. For a legacy receiver we take the
+                        // uniform `index * SLOT_SIZE` 16-byte-cell path inline.
+                        let (_, field_index, type_tag) = self
                             .field_info_idx
                             .get(&pc)
-                            .map(|&i| self.field_info[i].2)
-                            .unwrap_or(b'I');
+                            .map(|&i| self.field_info[i])
+                            .unwrap_or((pc, 0, b'I'));
                         let cell_off = (HEADER_SIZE + c_off as usize) as i32; // Cast: x86-64 disp32
+                        let legacy_cell_off = (HEADER_SIZE + field_index * SLOT_SIZE) as i32; // Cast: disp32
                         let obj_slot = self.pop_stack();
                         self.load_slot_to_reg(RAX, obj_slot);
                         // Null check: TEST RAX,RAX; JZ <null> (result 0).
                         self.emit_test_r64_r64(RAX);
                         let null_patch = self.emit_jcc_rel32_patch(0x84); // JE
+                        // Per-object compactness: gc_flags byte @21 & GC_FLAG_COMPACT.
+                        // Zero ⇒ legacy 16-byte-cell object → uniform-layout read.
+                        self.emit_mov_r32_mem_disp32(RCX, RAX, 21);
+                        self.emit_and_r64_imm8(RCX, cratonvm_types::GC_FLAG_COMPACT as i8);
+                        let legacy_patch = self.emit_jcc_rel32_patch(0x84); // JZ → legacy
+                        // --- compact path (8-byte ref / packed primitive cell) ---
                         if c_is_ref {
                             // 8-byte raw pointer at the cell base.
                             self.emit_mov_r64_mem_disp32(RAX, RAX, cell_off);
@@ -18597,10 +18621,51 @@ impl Compiler {
                                 }
                             }
                         }
-                        let done_patch = self.emit_jmp_rel32_patch();
+                        let done_compact_patch = self.emit_jmp_rel32_patch();
+                        // --- legacy path (uniform 16-byte Value cell) ---
+                        // Mirrors the non-compact inline getfield arm: a reference
+                        // (or long/double) field is the 8-byte payload at
+                        // `legacy_cell + PAYLOAD64`; float is 4 bytes at PAYLOAD32;
+                        // int-category is a sign-extended 4-byte load at PAYLOAD32.
+                        self.patch_rel32_to_here(legacy_patch);
+                        if c_is_ref {
+                            self.emit_mov_r64_mem_disp32(
+                                RAX,
+                                RAX,
+                                legacy_cell_off + FIELD_CELL_PAYLOAD64_OFFSET as i32,
+                            );
+                        } else {
+                            match type_tag {
+                                b'J' | b'D' => {
+                                    self.emit_mov_r64_mem_disp32(
+                                        RAX,
+                                        RAX,
+                                        legacy_cell_off + FIELD_CELL_PAYLOAD64_OFFSET as i32,
+                                    );
+                                }
+                                b'F' => {
+                                    self.emit_mov_r32_mem_disp32(
+                                        RAX,
+                                        RAX,
+                                        legacy_cell_off + FIELD_CELL_PAYLOAD32_OFFSET as i32,
+                                    );
+                                }
+                                _ => {
+                                    self.emit_movsxd_r64_mem_disp32(
+                                        RAX,
+                                        RAX,
+                                        legacy_cell_off + FIELD_CELL_PAYLOAD32_OFFSET as i32,
+                                    );
+                                }
+                            }
+                        }
+                        let done_legacy_patch = self.emit_jmp_rel32_patch();
+                        // --- null path: RAX := 0 ---
                         self.patch_rel32_to_here(null_patch);
                         self.emit_xor_reg_self(RAX);
-                        self.patch_rel32_to_here(done_patch);
+                        // join
+                        self.patch_rel32_to_here(done_compact_patch);
+                        self.patch_rel32_to_here(done_legacy_patch);
                         self.push_from_rax();
                         pc += 3;
                     } else if let Some(&info_idx) = self
@@ -18772,6 +18837,22 @@ impl Compiler {
                                 // null receiver → helper.
                                 self.emit_test_r64_r64(RAX);
                                 bail.push(self.emit_jcc_rel32_patch(0x84)); // JZ
+                                // LEGACY receiver (no GC_FLAG_COMPACT) → helper: the
+                                // compact 8-byte cell offset is only valid for a
+                                // genuinely-compact object. A class with a registered
+                                // compact layout can still have uniform 16-byte-cell
+                                // instances (any allocation whose `num_fields`
+                                // disagrees with the layout field count — e.g.
+                                // native/synthetic-stub `Method`/`ArrayList`/… whose
+                                // padded stub count exceeds the real declared count).
+                                // `jit_putfield_object` keys on the per-object flag
+                                // and does the correct uniform-layout store. Without
+                                // this the compact-offset old-value read + store would
+                                // scribble a pointer into the wrong bytes of a legacy
+                                // object → heap corruption / SIGSEGV.
+                                self.emit_mov_r32_mem_disp32(RCX, RAX, 21);
+                                self.emit_and_r64_imm8(RCX, cratonvm_types::GC_FLAG_COMPACT as i8);
+                                bail.push(self.emit_jcc_rel32_patch(0x84)); // JZ not-compact → helper
                                 // old-gen receiver → helper (card). gc_flags @21 bit0.
                                 self.emit_mov_r32_mem_disp32(RCX, RAX, 21);
                                 self.emit_and_r64_imm8(RCX, 1);
