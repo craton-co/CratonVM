@@ -4061,70 +4061,61 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             // GC (`update_thread_objs_after_gc`), so read the current address
             // from there while the thread is still registered (before
             // `mark_dead`), falling back to the captured ref only if absent.
-            let mut wake_obj = shared_arc
+            let wake_obj = shared_arc
                 .thread_registry
                 .java_thread_obj(tid)
                 .unwrap_or(thread_obj_for_spawn);
 
-            // CRIT (multi-thread STW deadlock) — leave the mutator population
-            // through the blocked-region protocol BEFORE marking dead, so a
-            // concurrent stop-the-world is not left waiting on a thread that has
-            // terminated and can never reach an interpreter safepoint to arrive.
+            // WP4.1 — wake any thread waiting in `Thread.join()` for us.
             //
-            // This thread was alive — and so potentially counted in a concurrent
-            // `request_stw`'s `expected` — right up to here. `enter_blocked`
-            // serializes against `request_stw` under the barrier lock and bumps
-            // `threads_blocked`: that increment makes our (stale) inclusion in
-            // `alive_count` cancel out in `expected = alive - 1 - blocked`, AND
-            // `pre_stw` tells us whether a STW that already counted us is active —
-            // in which case we arrive exactly once. Without this, a worker that
-            // finishes near a GC (e.g. 6 threads each looping `System.gc()`;
-            // scratch_churn/Churn.java) was counted but never arrived, hanging
-            // the initiator's `wait_for_all` forever. Previously the
-            // arrive-on-terminate lived only in the monitor-CONTENDED arm below,
-            // so the common uncontended path skipped it.
+            // Acquire a stable inflated monitor handle while this thread is
+            // still alive. After `mark_dead`, GC no longer scans this thread's
+            // locals, so the final notify/exit must not re-lookup through the
+            // raw `Thread` object address; a moving GC may have remapped that
+            // object and the monitor-table key. The `Arc<Monitor>` remains
+            // valid across such remaps.
+            let term_monitor = match shared_arc.monitors.enter_inflated_or_contend(wake_obj, tid) {
+                Ok((monitor, contended)) => {
+                    if contended {
+                        let blk = shared_arc.gc_barrier.enter_blocked();
+                        if blk.pre_stw {
+                            let _ = shared_arc.gc_barrier.arrive_and_wait(tid);
+                        }
+                        monitor.block_enter(tid);
+                        drop(blk);
+                    }
+                    Some(monitor)
+                }
+                Err(e) => {
+                    eprintln!(
+                        "Thread {} could not acquire termination monitor for join notification: {:?}",
+                        tid, e
+                    );
+                    None
+                }
+            };
+
+            // CRIT (multi-thread STW deadlock / undercount): transition from
+            // alive mutator to dead thread through the blocked-region protocol.
+            // `finish_after` serializes `mark_dead` with `request_stw_counted`,
+            // so a GC initiator cannot observe this thread as both dead and
+            // still included in `threads_blocked`.
             let term_blk = shared_arc.gc_barrier.enter_blocked();
             if term_blk.pre_stw {
-                // Arrive at the in-flight STW. CRIT (same desync as
-                // `monitor_wait`): that collection can RELOCATE our Thread
-                // object, leaving `wake_obj` (a raw ref captured above) dangling
-                // at a freed/zeroed slot — the `enter_or_contend`/`notify_all`/
-                // `exit` below would then operate on the wrong (stale) monitor
-                // and never wake the real joiner. Remap `wake_obj` through the
-                // returned pointer map.
-                let pm = shared_arc.gc_barrier.arrive_and_wait(tid);
-                if let Some(&new) = pm.get(&(wake_obj.as_ptr() as usize)) {
-                    // SAFETY: relocated header address from the GC pointer map.
-                    wake_obj = unsafe { ObjectRef::from_raw(new as *mut u8) };
-                }
+                let _ = shared_arc.gc_barrier.arrive_and_wait(tid);
             }
-            // BUG-03 — stop publishing this worker's TLAB address before the
-            // `JvmThread` (and its TLAB) is dropped at closure end, so the
-            // collector can never read a dangling pointer.
-            shared_arc.thread_registry.clear_tlab_addr(tid);
-            shared_arc.thread_registry.mark_dead(tid);
+            term_blk.finish_after(|| {
+                // BUG-03 — stop publishing this worker's TLAB address before
+                // the `JvmThread` (and its TLAB) is dropped at closure end, so
+                // the collector can never read a dangling pointer.
+                shared_arc.thread_registry.clear_tlab_addr(tid);
+                shared_arc.thread_registry.mark_dead(tid);
+            });
 
-            // WP4.1 вЂ” wake any thread waiting in `Thread.join()` for us.
-            //
-            // Real-JDK `Thread.join()` enters this Thread's object monitor
-            // and calls `Object.wait()` while `isAlive()` is true.  HotSpot
-            // signals the joiner by calling `Thread.notifyAll()` from the
-            // VM right before the thread terminates.  We replicate the
-            // wakeup here: take the monitor briefly, fire `notify_all`,
-            // and release it.  Without this, `join()` spins forever
-            // because nobody ever wakes the waiter.
-            //
-            // We are already inside the `term_blk` blocked region, so a CONTENDED
-            // monitor acquire here cannot wedge a concurrent STW (we are excluded
-            // from `expected` and hold no Java frames to scan).
-            if let Some(m) = shared_arc.monitors.enter_or_contend(wake_obj, tid) {
-                m.block_enter(tid);
+            if let Some(monitor) = term_monitor {
+                let _ = monitor.notify_all(tid);
+                let _ = monitor.exit(tid);
             }
-            let _ = shared_arc.monitors.notify_all(wake_obj, tid);
-            let _ = shared_arc.monitors.exit(wake_obj, tid);
-            // Leave the termination blocked region (gen-keyed checked drop waits
-            // out any active pause before decrementing the blocked count).
-            drop(term_blk);
         })
         .expect("failed to spawn child Java thread (OS refused; check ulimit / thread count)");
 

@@ -507,7 +507,7 @@ impl Monitor {
     ///
     /// Returns `Err` if the calling thread does not own the monitor
     /// (`IllegalMonitorStateException`).
-    fn exit(&self, thread_id: ThreadId) -> Result<(), MonitorError> {
+    pub(crate) fn exit(&self, thread_id: ThreadId) -> Result<(), MonitorError> {
         let mut state = self.state.lock();
         match state.owner {
             Some(owner) if owner == thread_id => {
@@ -735,7 +735,7 @@ impl Monitor {
     /// Object.notifyAll() — wake all threads waiting on this monitor.
     ///
     /// The calling thread must own this monitor.
-    fn notify_all(&self, thread_id: ThreadId) -> Result<(), MonitorError> {
+    pub(crate) fn notify_all(&self, thread_id: ThreadId) -> Result<(), MonitorError> {
         let state = self.state.lock();
         if state.owner != Some(thread_id) {
             return Err(MonitorError::NotOwner);
@@ -746,7 +746,8 @@ impl Monitor {
 }
 
 /// Monitor operation error.
-enum MonitorError {
+#[derive(Debug)]
+pub(crate) enum MonitorError {
     /// The current thread does not own the monitor.
     NotOwner,
 }
@@ -1069,6 +1070,24 @@ impl MonitorTable {
                 }
             }
         }
+    }
+
+    /// Force the object's monitor into inflated form and acquire it if
+    /// possible without blocking. Returns the stable monitor handle and whether
+    /// the caller must block on it.
+    ///
+    /// This is used by thread termination: once it has the `Arc<Monitor>`, the
+    /// final `mark_dead`/`notifyAll`/`exit` sequence no longer needs to
+    /// re-lookup the monitor through the Java `Thread` object's raw address,
+    /// which may be remapped by a concurrent moving GC.
+    pub(crate) fn enter_inflated_or_contend(
+        &self,
+        obj_ref: ObjectRef,
+        thread_id: ThreadId,
+    ) -> Result<(Arc<Monitor>, bool), MethodCallFailed> {
+        let monitor = self.ensure_inflated(obj_ref, thread_id)?;
+        let contended = !monitor.try_enter(thread_id);
+        Ok((monitor, contended))
     }
 
     /// Get or create a monitor without touching the mark word — used only
@@ -1727,6 +1746,34 @@ mod tests {
 
         // Exit using the NEW address should succeed — the registry was
         // re-keyed so the inflated Monitor is found.
+        assert!(table.exit(new_obj, tid).is_ok());
+    }
+
+    #[test]
+    fn inflated_handle_survives_object_remap_for_thread_exit_notify() {
+        let table = MonitorTable::new();
+        let obj = test_object();
+        let tid = ThreadId(1);
+
+        let (monitor, contended) = table.enter_inflated_or_contend(obj, tid).expect("inflate");
+        assert!(!contended, "fresh monitor should be acquired immediately");
+
+        let old_addr = obj.as_ptr() as usize;
+        let heap2 = Heap::new();
+        let new_obj = heap2.alloc_object(ClassId::new(0), 0);
+        let new_addr = new_obj.as_ptr() as usize;
+        let old_mark = header_of(obj).mark_word.load(Ordering::Acquire);
+        header_of(new_obj)
+            .mark_word
+            .store(old_mark, Ordering::Release);
+
+        let mut pointer_map = std::collections::HashMap::new();
+        pointer_map.insert(old_addr, new_addr);
+        table.remap_after_gc(&pointer_map);
+
+        monitor.notify_all(tid).expect("notify via stable handle");
+        monitor.exit(tid).expect("exit via stable handle");
+        table.enter(new_obj, tid);
         assert!(table.exit(new_obj, tid).is_ok());
     }
 

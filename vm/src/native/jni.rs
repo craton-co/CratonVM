@@ -636,9 +636,12 @@ fn aio_dispatcher_main() {
     // Clean detach (only reached on explicit shutdown).
     if let Some(shared) = process_vm() {
         if let Some(tid) = with_foreign_thread(|jt| jt.thread_id) {
-            shared.thread_registry.mark_dead(tid);
+            shared.gc_barrier.mark_blocked_region_leave_after(|| {
+                shared.thread_registry.mark_dead(tid);
+            });
+        } else {
+            shared.gc_barrier.mark_blocked_region_leave();
         }
-        shared.gc_barrier.mark_blocked_region_leave();
         detach_foreign_thread(&shared);
     }
     clear_jni_thread();
@@ -6229,16 +6232,16 @@ extern "C" fn jni_detach_current_thread(_vm: JavaVM) -> JInt {
         }
         if let Some(shared) = process_vm() {
             let tid = with_foreign_thread(|jt| jt.thread_id);
-            // Mark dead while still in the idle blocked region (excluded from
-            // every STW's `expected`), so no current/future request_stw waits
-            // for us.
+            // Mark dead and leave the idle blocked region as one barrier
+            // transition, so request_stw_counted cannot observe this thread as
+            // dead while it is still included in the blocked count.
             if let Some(tid) = tid {
-                shared.thread_registry.mark_dead(tid);
+                shared.gc_barrier.mark_blocked_region_leave_after(|| {
+                    shared.thread_registry.mark_dead(tid);
+                });
+            } else {
+                shared.gc_barrier.mark_blocked_region_leave();
             }
-            // Leave the idle blocked region: this waits out any in-flight STW
-            // (during which our empty snapshot is scanned harmlessly) before we
-            // reclaim, so teardown never races a live collection (§3.4).
-            shared.gc_barrier.mark_blocked_region_leave();
             // Reclaim: mark_dead (idempotent) + retire the (empty) TLAB + drop.
             detach_foreign_thread(&shared);
         } else {
