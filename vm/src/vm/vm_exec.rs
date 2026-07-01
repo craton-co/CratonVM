@@ -1795,11 +1795,15 @@ impl<'a> NativeContextImpl<'a> {
         // conservative guard against any future relaxation of that invariant.
         // Redefinition is rare, so the rebuild cost is negligible.
         self.shared.field_descriptor_cache.write().clear();
-        // Best-effort JIT cache eviction by name (the
-        // `fire_jit_invalidate_hook` call inside `redefine_class` already
-        // notifies the registered hook keyed by `class_id`; this catches
-        // any name-keyed sibling caches).
-        let _ = self.shared.jit_cache.write().invalidate_for_class(&name);
+        // JVMTI redefinition can stale caller-side direct calls and inline
+        // dispatch caches, not just compiled bodies declared by `name`. Full
+        // eviction is rare and keeps agent-woven bytecode authoritative.
+        let evicted = self.shared.jit_cache.write().clear_all();
+        if evicted > 0 {
+            tracing::debug!(
+                "JIT: fully invalidated {evicted} method(s) due to redefineClass: {name}"
+            );
+        }
         let _ = self.shared.invalidate_jit_for_class(&name);
         Ok(())
     }
