@@ -149,6 +149,25 @@ what remains open is the **general** clobber.
 
 ## Root-cause progress log
 
+### 2026-07-01 — wide local / wide branch liveness hardening
+
+The 2026-06-21 length-table fix made `regalloc.rs::bc_len` walk `wide`
+(0xc4), `goto_w` (0xc8), and `jsr_w` (0xc9) at the correct instruction
+lengths, but two metadata helpers still lagged behind it: `local_access` did not
+decode widened local operands, `find_float_locals` did not mark widened
+`fload`/`dload`/`fstore`/`dstore` locals as XMM-only, and CFG branch metadata did
+not treat `goto_w` / `jsr_w` as wide-offset branches. Today this is latent
+because `jit_scan` rejects these opcodes, but once accepted it would miss local
+uses/defs or branch targets while the PC walk itself stayed in sync, which is the
+same class of silent liveness bug as CM-FASTMATH.
+
+Fixed on branch `codex/jit-known-issues-20260701-8`: decode `wide`
+load/store/iinc local metadata, classify widened float/double locals, decode
+`goto_w` / `jsr_w` branch targets, and mark `goto_w` as an unconditional CFG
+transfer. Added unit tests for all four metadata paths. This is a general
+defense-in-depth fix for the regalloc metadata layer only; the broader
+callee-saved clobber / targeted-ban family remains open.
+
 ### 2026-07-01 — JIT reentry borrow-suspend gap fixed
 
 The distinct borrow-tracker sub-bug below is fixed on branch
