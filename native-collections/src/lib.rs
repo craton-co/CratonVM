@@ -4298,6 +4298,21 @@ fn is_native_bucket_map(ctx: &dyn NativeContext, source: ObjectRef) -> bool {
     for _ in 0..32 {
         match ctx.class_name_of_id(cur) {
             Some(n) if n == "java/util/HashMap" => return true,
+            // A plain `java/util/Hashtable` stores its entries in the same
+            // synthetic HashMap-style bucket table (`native_map_put` on
+            // `java/util/Hashtable` — its `size()`/`keySet()` read those buckets
+            // via `map_state`/`map_collect_keys`). Without recognising it here,
+            // `collect_entries_any` skipped the direct `map_collect_entries`
+            // bucket walk and fell through to the polymorphic
+            // `entrySet().iterator()` path — which re-enters the very
+            // `Hashtable.entrySet()` view being resynced and comes back EMPTY.
+            // That made `entrySet()` iterate zero times while `keySet()` worked,
+            // breaking `new ObjectName(domain, Hashtable)` (Spring JMX naming).
+            // `Properties` (a Hashtable subclass) keeps its data in a side-table
+            // so `map_collect_entries` returns empty for it — the caller's
+            // `!entries.is_empty()` guard then falls through to the existing
+            // Properties path, so this does not disturb Properties.
+            Some(n) if n == "java/util/Hashtable" => return true,
             Some(n) if n == "java/lang/Object" => return false,
             _ => {}
         }
@@ -25930,10 +25945,34 @@ fn chm_all_segments(ctx: &dyn NativeContext, this: ObjectRef) -> Vec<ObjectRef> 
 
 /// Collect all entries from all segments.
 fn chm_collect_all_entries(ctx: &dyn NativeContext, this: ObjectRef) -> Vec<(Value, Value)> {
+    // Walk each segment's bucket table DIRECTLY (via `map_state` +
+    // `get_node_key`/`get_node_value`), symmetrically with
+    // `chm_collect_all_keys` / `chm_collect_all_values`. The previous
+    // implementation delegated to `map_collect_entries(seg)`, which re-runs the
+    // receiver-type predicates (`properties_backing_chm` / `is_chm_receiver` /
+    // `is_lhm_receiver`) on the *segment*. When a segment is itself classified
+    // as a bucket-backed map with no nested segments, that delegation returned
+    // an empty vec — so `entrySet()` over a CHM-backed `Hashtable`/`Properties`
+    // came back size 0 even though `keySet()`/`values()` (which walk segments
+    // directly) were correct. That broke `javax.management.ObjectName`'s
+    // Hashtable-constructor path (`new ObjectName(domain, table)` →
+    // `entrySet()` iteration yielded nothing → null `Property` → NPE), which
+    // Spring's JMX naming strategies rely on. Walking directly here keeps the
+    // three collectors consistent.
     let mut entries = Vec::new();
     for seg in chm_all_segments(ctx, this) {
-        let seg_entries = map_collect_entries(ctx, seg);
-        entries.extend(seg_entries);
+        let (buckets, _size, cap) = map_state(ctx, seg);
+        if let Some(b) = buckets {
+            for i in 0..(cap as usize) {
+                let mut node_val = ctx.get_array_element(b, i);
+                while let Value::Object(Some(node)) = node_val {
+                    let key = get_node_key(ctx, node);
+                    let value = get_node_value(ctx, node);
+                    entries.push((key, value));
+                    node_val = ctx.get_field(node, NODE_FIELD_NEXT);
+                }
+            }
+        }
     }
     entries
 }
