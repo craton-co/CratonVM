@@ -8,6 +8,14 @@ metadata:
 
 # Spring Boot buildSrc suite — cold-path true-hangs (dev `d95a836e`, 2026-06-22)
 
+> **2026-07-01 update:** the SpringRepos row below is historical. Current `dev`
+> was re-run with `CRATONVM_JIT_ALLOW_PACKAGES=groovyjarjarantlr4/` and
+> `org.springframework.boot.build.groovyscripts.SpringRepositoriesExtensionTests`
+> passed 11/11. The archived handoff is
+> [`docs/internal/springrepos-extension-hang-jit-throughput-and-deep-recursion.md`](../internal/springrepos-extension-hang-jit-throughput-and-deep-recursion.md);
+> the remaining latent infrastructure work is
+> [`jit-deep-recursion-fault-recovery.md`](jit-deep-recursion-fault-recovery.md).
+
 Fresh full re-run of the `apps/spring-boot/buildSrc` JUnit suite (the only compiled
 test module in that checkout) under an optimized fat-LTO `cvsbtest` binary built
 from `dev` `d95a836e`, vs HotSpot 25. Harness `buildSrc/runner/compare-suite.sh`.
@@ -25,16 +33,15 @@ Reclassification **pinned to P-cores (`0xFFFF`), default watchdog disabled, 360s
 merely exceeded the 240s timeout. The 17 passing classes are correct but **3–110×
 slower** than HotSpot (e.g. `DependencyVersionUpgradeTests` 63/63 in 111s vs 1s). This
 is the **cold-path interpreter throughput tax**, the same family as
-the Hibernate HQL reproducer consolidated in
-[springrepos-extension-hang-jit-throughput-and-deep-recursion.md](springrepos-extension-hang-jit-throughput-and-deep-recursion.md)
-§5.
+the Hibernate HQL reproducer tracked in
+[`jit-deep-recursion-fault-recovery.md`](jit-deep-recursion-fault-recovery.md).
 
 ## The 5 true-hangs (P-core-pinned, watchdog off, killed at 360s)
 
 | Class | HotSpot | In known-issues before? | Notes |
 |-------|---------|-------------------------|-------|
 | `mavenplugin.PluginXmlParserTests` | PASS 2/2, 1s | **✅ FIXED** | **RESOLVED** — was a `java.util.regex` / `String.replaceAll`+literal-`replace` throughput wall in `PluginXmlParser.format()`. Fixed by flipping `CRATONVM_NATIVE_STRING_REGEX` default-ON (SBR-02, `0d7dfc28`, merge `01375f90`): the regex/replace chain routes to fast Rust-regex natives. Mirror probe `RegexLoopProbe` 100k iters nojit 7s / JIT 7.4s, output byte-identical to HotSpot (was 300s+ hang). Writeup: [`docs/internal/SBR-02-string-regex-throughput.md`](../internal/SBR-02-string-regex-throughput.md). |
-| `groovyscripts.SpringRepositoriesExtensionTests` | PASS 11/11, 5s | Yes (stale) | **CONTRADICTS** [[springrepos-extension-hang-jit-throughput-and-deep-recursion]], which states "dev **passes** this test." On `d95a836e`, P-core-pinned + watchdog-off, it still **hangs >360s**. Either a regression since dev `0c904c04`, or the real 163-line script's cold ANTLR ATN simulation genuinely needs >360s. |
+| `groovyscripts.SpringRepositoriesExtensionTests` | PASS 11/11, 5s | Historical | **RESOLVED on current dev.** The old `d95a836e` hang is stale; a 2026-07-01 retry passed 11/11 with the guarded ANTLR lift enabled. Archived handoff: [`../internal/springrepos-extension-hang-jit-throughput-and-deep-recursion.md`](../internal/springrepos-extension-hang-jit-throughput-and-deep-recursion.md). Residual infrastructure tracker: [`jit-deep-recursion-fault-recovery.md`](jit-deep-recursion-fault-recovery.md). |
 | `antora.GenerateAntoraPlaybookTests` | 1/2 — **env-fail**, 3s | n/a | **NOT a clean bug — env-limited** (see below) |
 | `artifacts.ArtifactReleaseTests` | 7/8 — **env-fail**, 3s | n/a | **NOT a clean bug — env-limited** |
 | `autoconfigure.DocumentAutoConfigurationClassesTests` | 1/2 — **env-fail**, 3s | n/a | **NOT a clean bug — env-limited** |
@@ -100,7 +107,7 @@ corruption) appears in any hang log.
 
 ## Net genuine CratonVM-only defects from this run
 1. ~~`PluginXmlParserTests` true-hang~~ — **✅ FIXED** (SBR-02 native String regex default-ON; writeup [`docs/internal/SBR-02-string-regex-throughput.md`](../internal/SBR-02-string-regex-throughput.md)).
-2. `SpringRepositoriesExtensionTests` true-hang ([[springrepos-extension-hang-jit-throughput-and-deep-recursion]], re-opened).
+2. ~~`SpringRepositoriesExtensionTests` true-hang~~ - resolved on current dev; the archived handoff moved to [`../internal/springrepos-extension-hang-jit-throughput-and-deep-recursion.md`](../internal/springrepos-extension-hang-jit-throughput-and-deep-recursion.md). Residual deep-recursion infrastructure work lives in [`jit-deep-recursion-fault-recovery.md`](jit-deep-recursion-fault-recovery.md).
 Everything else is env-limited (ProjectBuilder ×3), a slow-pass (Antora, G1 ×8), or clean.
 
 ## Reproduce

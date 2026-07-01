@@ -1,8 +1,8 @@
 ---
 name: springrepos-extension-hang-jit-throughput-and-deep-recursion
-description: Handoff for the Spring Boot buildSrc SpringRepositoriesExtensionTests hang. 3 fixes landed on dev (pdcache NPE, AssertionError-preload JIT bail, hashCode/equals-override JIT compile). dev passes the test via the peer's root-snapshot fix. Residual = cold-path interpreted ATN simulation; enabling it to JIT-compile exposes a NATIVE STACK OVERFLOW in deep closure() recursion (not a value miscompile). Deep-recursion stack guard designed + prototyped (explicit prologue check works but taxes hot path; correct fix = stack banging + fault recovery).
+description: Archived handoff for the Spring Boot buildSrc SpringRepositoriesExtensionTests hang. Current dev re-verified 2026-07-01: the class passes 11/11 with the guarded ANTLR cold-path lift enabled. Remaining deep-recursion/fault-recovery work is split to docs/known-issues/jit-deep-recursion-fault-recovery.md.
 metadata:
-  type: known-issue
+  type: internal
   area: jit, classloader, groovy, throughput
 ---
 
@@ -12,6 +12,57 @@ Scope: the one genuine CratonVM-only item from the Spring Boot buildSrc suite
 (`org.springframework.boot.build.groovyscripts.SpringRepositoriesExtensionTests`).
 HotSpot passes it 11/11 in ~5s. This doc captures everything learned across the
 investigation, what landed, and what remains.
+
+**Archived status (2026-07-01):** FIXED / VERIFIED. Current `dev` passes
+`SpringRepositoriesExtensionTests` 11/11 with
+`CRATONVM_JIT_ALLOW_PACKAGES=groovyjarjarantlr4/`, so the stale hang/re-opened
+status below is historical. The remaining infrastructure item is not this test:
+deep JIT recursion still lacks production-grade resumable fault recovery and is
+tracked in
+[`docs/known-issues/jit-deep-recursion-fault-recovery.md`](../known-issues/jit-deep-recursion-fault-recovery.md).
+
+## 2026-07-01 Retry
+
+Built current `dev` in a fresh retry worktree and copied the release executable
+to a unique binary name:
+
+```text
+C:\craton\CratonVM-codex-springrepos-jit-retry-20260701-1\cvspringretry-20260701-1.exe
+```
+
+Validation used the out-of-tree Spring Boot buildSrc runner artifacts from the
+main checkout:
+
+```powershell
+$env:CRATONVM_DISABLE_DEFAULT_WATCHDOG = '1'
+$env:CRATONVM_JIT_ALLOW_PACKAGES = 'groovyjarjarantlr4/'
+$CP = 'runner;' + (Get-Content 'C:\craton\CratonVM\apps\spring-boot\buildSrc\test-classpath.txt' -Raw).Trim()
+
+.\cvspringretry-20260701-1.exe --java-home 'C:\Program Files\Java\jdk-25' `
+    --stack-dump-on-timeout 0 -cp $CP `
+    RunJUnitV org.springframework.boot.build.groovyscripts.SpringRepositoriesExtensionTests
+```
+
+Result:
+
+```text
+JUNIT_RESULT tests=11 passed=11 failed=0 skipped=0 aborted=0
+```
+
+The narrower parse probe also passed under the same guarded ANTLR lift:
+
+```text
+WARMUP(trivial) parsed in 6654ms
+SCRIPT parsed OK: SpringRepositorySupport in 43549ms
+```
+
+`GroovyNestProbe` no longer reproduced the historical native-stack crash in the
+old failure window, but it is still a throughput stressor rather than a clean
+fixed test: it reached `depth=20 parsed 20421ms`, threw Groovy
+`CompilationFailedException` at depths 40 and 80, then remained CPU-bound at
+depth 160 until manually stopped after 526 seconds. That residual belongs to the
+new deep-recursion/fault-recovery tracker, not this archived SpringRepos test
+handoff.
 
 **Current status:** `dev` **passes** this test (via the peer's GC-root-snapshot
 fix, commit `1d523351`). Three additional general JIT/classloader fixes landed on
