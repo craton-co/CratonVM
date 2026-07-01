@@ -46,8 +46,8 @@ CRATONVM_DISABLE_DEFAULT_WATCHDOG=1 $CV --java-home "C:/Program Files/Java/jdk-2
 | 12 | `id.uuid.rfc9562.UUidV6V7GeneratorTest` | MockitoException | native `AnnotatedTypeBaseImpl.location` null → `getAnnotatedOwnerType` NPE | **NPE FIXED**; residual = 1M-iteration slowness (§15–16 cluster) |
 | 13 | `batchfetch.DynamicBatchFetchTest` | `testMultiLoad` 120s timeout (param-binding 1/2 now passes) | slowness (2000-row multiLoad); HIB-CV-37 #2 param-binding appears fixed | Route → HIB-CV-37 |
 | 14 | `service.ClassLoaderServiceImplTest` | AssertionError | custom-loader class identity / `loadJavaServices` | Route → HIB-CV-24 |
-| 15 | `query.hql.FunctionTests` | HANG @300s | (slowness vs wrong-result — see below) | OPEN — slowness/correctness |
-| 16 | `query.hql.StandardFunctionTests` | HANG @300s | (slowness vs wrong-result — see below) | OPEN — slowness/correctness |
+| 15 | `query.hql.FunctionTests` | HANG @300s (really ~49× slow) | CPU-bound in interpreter `NativeMethodRegistry::find` (per-invoke native-shadow check, invoke-cache miss); NOT logging | OPEN — slowness (profiled) |
+| 16 | `query.hql.StandardFunctionTests` | HANG @300s (really slow) | same slowness cluster as §15 | OPEN — slowness |
 
 ---
 
@@ -306,8 +306,9 @@ service-loader isolation — the HIB-CV-24 loader-isolation family.
 **1169 s** (rc=0, `found=123 ok=97 failed=20`) vs HotSpot **24 s**
 (`ok=99 failed=18`) — **~49× slower**. The 300 s "HANG" (rc=124) was purely a
 timeout artifact of a slow-but-live process; no per-test `TimeoutException`, no
-deadlock, steady forward progress to `@@DONE`. Heavy `TRACE`/`FINEST` Hibernate
-logging dominates the wall time.
+deadlock, steady forward progress to `@@DONE`. (The process is CPU-bound in the
+interpreter — see the profile below; logging volume is high but not the CPU
+cost.)
 
 Crucially, the CratonVM failures **map onto the same failing tests as HotSpot**
 (20 vs 18; identical queries/assertions — `sinh`, `theDuration`,
@@ -320,3 +321,53 @@ wrong-results. The only delta is exception flavor (CratonVM surfaces
 distinct misc-correctness bug — arguably mis-classified into this tail.
 `StandardFunctionTests` should re-run on the merged binary to confirm the same
 pattern (HotSpot baseline: 29 s, `found=44 ok=41 failed=3`).
+
+### Profile (cdb sampling, `release-with-debug` binary + PDB)
+
+Sampled the live `FunctionTests` executor thread (`main-vm`) with `cdb -pv`
+(24 top-frame + 10 deep-frame samples). The result is unusually concentrated:
+
+- **CPU-bound**, not I/O/logging-bound: the thread shows ~1:1 user-CPU-to-wall
+  time; **0 of 34 samples** landed in any logging / `format` / `write` / `fmt`
+  frame. The earlier "heavy TRACE/FINEST logging dominates" guess is **wrong** —
+  `-Dhibernate.show_sql`/`format_sql` add stdout volume but negligible CPU.
+- **24/24 top frames** and **10/10 deep chains** are the *same* stack:
+  `cratonvm_native_api::registry::NativeMethodRegistry::find`
+  (× the two `hash_pass` FNV passes) ← `interpreter::execute_invokevirtual_vtable_fast`
+  ← `execute_frame` ← `execute` ← `vm_exec::invoke_on_class_shared_inner`
+  ← `invoke_shared` ← `interpreter::try_lambda_dispatch`.
+
+**Root cause.** `execute_invokevirtual_vtable_fast` is the **invoke-cache MISS
+path** (per its own Step-1 comment). Before reading the vtable it runs a
+native-shadow check — `native_methods.find(receiver, m, d)` **and** a
+superclass-chain walk calling `find(parent, m, d)` for every ancestor
+(`interpreter.rs` ~24185–24250, the "FJP fix") — to catch methods natively
+shadowed on a supertype. `NativeMethodRegistry::find` recomputes
+`native_method_hash` = **two full FNV byte-passes over
+`class · method · descriptor`** (long Hibernate names/descriptors) on **every
+call**. For this HQL/lambda workload the per-call-site `invoke_cache` misses
+repeatedly (lambda / reflective-getter dispatch through `try_lambda_dispatch`),
+so `vtable_fast` — and its double string-hash × parent-chain-depth — re-runs on
+nearly every `invokevirtual`. That single check is ~100 % of on-CPU time.
+
+**Also ruled out:** per-test SessionFactory rebuild (FunctionTests uses
+*class-level* `@DomainModel(GAMBIT)`/`@SessionFactory` + `@BeforeAll` → built
+once); JIT wrong-results (the hot bodies run in the **interpreter**
+`execute_frame`, i.e. they are not getting JIT-compiled — a second lever).
+
+**Fix levers (highest → lowest leverage; all hot-path, need broad regression soak):**
+1. **Memoize the native-shadow verdict** per `(receiver_class_id, method, desc)`
+   (or per call-site) so `find()` + the parent-chain walk run once, not per
+   invoke. Kills the dominant cost directly.
+2. **Fix the `invoke_cache` miss** on the `try_lambda_dispatch` /
+   reflective-invoke path so `vtable_fast` stops re-running for warm sites.
+3. **Cheaper `native_method_hash`** — single pass, or precompute/intern the
+   (class,method,desc) hash on the resolved-method record instead of re-hashing
+   raw `&str` each call.
+4. **JIT-compile the interpreted lambda/reflection-invoked bodies** (they'd
+   inline the call and skip `vtable_fast`+`find` entirely); investigate why they
+   stay interpreted (invocation counting on these dispatch paths).
+
+The profile is the deliverable here; the fix is a hot-path interpreter change
+(every `invokevirtual`, gauntlet-wide blast radius) and should be prototyped +
+soaked separately, not landed blind.
