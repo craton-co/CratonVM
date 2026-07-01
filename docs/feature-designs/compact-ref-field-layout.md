@@ -271,6 +271,42 @@ A gated diagnostic `CRATONVM_DBG_COMPACT_LEGACY=1` (`gen_heap.rs`
 `plan_object_alloc`) prints every class that allocates a legacy instance despite
 a registered layout — use it to spot the same pattern when soaking new apps.
 
+### Second fix: old-gen walker sized promoted compact objects as legacy
+
+Running the same suite under `CRATONVM_GC_STRESS=1` surfaced a *distinct*
+compact SIGSEGV (this one at a native/JIT `.text` `pc`, not a heap jump).
+`OldGen::scan_region` / `scan_region_filtered` (`old_gen.rs`) — the walkers
+behind `walk_objects` (major-GC compaction) and `walk_objects_in_card_ranges`
+(minor-GC dirty-card scan) — sized every `kind == Object` as
+`HEADER_SIZE + num_slots*SLOT_SIZE`, **ignoring `GC_FLAG_COMPACT`**. A promoted
+compact object (body in `array_length`, e.g. 152 B) was therefore strided as
+`num_slots*16` (e.g. 200 B), which (a) tripped the size-consistency skip in
+`scan_dirty_cards` (`gen_object_total_size` said 152, the walker said 200) so its
+old→young reference slots were **not scanned** — a missed root — and (b) desynced
+the whole old-gen walk after that object. Fixed by sizing the `Object` arm via
+`cratonvm_types::object_body_size(header)` (honours the per-object flag; legacy
+objects still size as `num_slots*SLOT_SIZE`) in both `scan_region*` functions.
+Regression-clean: bt10/14/16 exact, bt16 `GC_STRESS` exact, normal transform
+unchanged.
+
+### Residual (out of scope for the SIGSEGV fix): GC_STRESS torture-mode corruption
+
+With both fixes, compact-ON `transform` no longer SIGSEGVs under `GC_STRESS`, but
+a *caught, non-crashing* corruption remains on that torture load (a garbage young
+header → `java/util/logging/Level` `<clinit>` fails → linkage error; compact-OFF
+`GC_STRESS` is clean). This is a **separate, deeper** compact×GC-precision matter
+(the missed-root / autobox-under-GC family), not the reported SIGSEGV, and only
+reproduces under `GC_STRESS` (a GC on nearly every allocation) on the complex
+workload — normal-mode runs match the compact-OFF baseline. Two known threads to
+pull when picking this up: (1) the JIT inline getfield ref path returns the bare
+slot pointer and does **not** unbox an `AUTOBOX_CLASS_ID` wrapper the way heap
+`get_field` does, so a primitive type-punned into a compact reference slot leaks
+the wrapper to Java (surfaces as a `ClassCastException Object→String`); (2)
+`set_field`'s compact autobox arm computes `base` before `alloc_object`, which is
+safe today only because the heap `alloc_object` entry never GCs — revisit if that
+ever changes. Both are footprint/edge concerns gated behind the still-default-OFF
+flag.
+
 **Deeper follow-up (optional, not required for correctness):** the legacy
 instances themselves are a footprint miss, not a bug — they come from native/stub
 allocations passing the padded stub count instead of the class's real
