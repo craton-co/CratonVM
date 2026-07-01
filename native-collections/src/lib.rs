@@ -33543,6 +33543,26 @@ fn native_cf_then_compose(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
+    // BUG-17: real-JDK CF — delegate to the real private `uniComposeStage(null, fn)`
+    // (== public `thenCompose(fn)`). The synthetic eager path below reads `result`
+    // (slot 0) raw and passes it to the function; for a real CF completed with `null`
+    // that field holds the `AltResult(NIL)` sentinel, so the function would receive the
+    // internal AltResult object instead of `null` (Spring's reactive-cache miss path
+    // then mistakes it for a hit and the future resolves to null). Delegating decodes
+    // AltResult→null and registers a proper NON-blocking dependent for async-pending
+    // sources. See `native_cf_handle` / `native_cf_when_complete` for the same pattern.
+    if cf_is_real_jdk(ctx, this) {
+        return ctx.invoke_special(
+            "java/util/concurrent/CompletableFuture",
+            "uniComposeStage",
+            "(Ljava/util/concurrent/Executor;Ljava/util/function/Function;)Ljava/util/concurrent/CompletableFuture;",
+            &[
+                Value::Object(Some(this)),
+                Value::Object(None),
+                Value::Object(Some(func)),
+            ],
+        );
+    }
     let val = ctx.get_field(this, CF_FIELD_RESULT);
     let result_cf = ctx.invoke_virtual(
         func,
