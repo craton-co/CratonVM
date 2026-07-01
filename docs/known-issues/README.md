@@ -499,19 +499,19 @@ FIXED/resolved bugs stay in `docs/internal/` — they are moved out only when fi
 A 103-probe sweep of `apps/spring-boot/buildSrc/runner/` (each a standalone
 `main()`) under a fresh dev build (`cvsbfull.exe`, worktree `CratonVM-sbfull`) vs
 HotSpot jdk-25 found **14 CratonVM-only bugs** (0 crash, 11 hang, 19 real DIFF).
-Index + per-bug reports: [spring-boot-probe-sweep/INDEX.md](spring-boot-probe-sweep/INDEX.md).
+Index + per-bug reports: [spring-boot-probe-sweep/INDEX.md](../internal/spring-boot-probe-sweep/INDEX.md).
 
 **3 FIXED + merged to `dev`** (writeups in [`docs/internal/`](../internal/)):
-- **SBR-03** (`a245002c`) strict array `instanceof` ([writeup](../internal/SBR-03-array-interface-instanceof.md)) — `Object[] instanceof I[]` → `false`.
+- **SBR-03** (`a245002c`) strict array `instanceof` ([writeup](../internal/spring-boot-probe-sweep/SBR-03-array-interface-instanceof.md)) — `Object[] instanceof I[]` → `false`.
 - **SBR-06** (`bce39db7`) Constructor `Parameter.getParameterizedType()` generics
-  ([writeup](../internal/SBR-06-field-getgenerictype-raw.md)) — populate the Constructor mirror's `signature` field.
+  ([writeup](../internal/spring-boot-probe-sweep/SBR-06-field-getgenerictype-raw.md)) — populate the Constructor mirror's `signature` field.
 - **SBR-02** (`0d7dfc28`, merge `01375f90`) regex `replaceAll` / literal `replace` throughput wall
-  ([writeup](../internal/SBR-02-string-regex-throughput.md)) — flip `CRATONVM_NATIVE_STRING_REGEX`
+  ([writeup](../internal/spring-boot-probe-sweep/SBR-02-string-regex-throughput.md)) — flip `CRATONVM_NATIVE_STRING_REGEX`
   default-ON; `String.{replaceAll,replaceFirst,matches,replace(CharSequence,…)}` route to fast
   Rust-regex natives. Was the `PluginXmlParserTests` hang.
 
 **Open** (root-caused; none a safe one-liner — see each report):
-- **SBR-01** Groovy `parseClass` hang ×9 — overlaps [spring-boot-buildsrc-coldpath-hangs](spring-boot-buildsrc-coldpath-hangs-2026-06-22.md). **handoff**
+- **SBR-01** Groovy `parseClass` hang ×9 — see [SBR-01-groovy-parseclass-hang.md](../internal/spring-boot-probe-sweep/SBR-01-groovy-parseclass-hang.md); the overlapping buildSrc coldpath suite index is archived at [spring-boot-buildsrc-coldpath-hangs-2026-06-22.md](../internal/spring-boot-probe-sweep/spring-boot-buildsrc-coldpath-hangs-2026-06-22.md). **handoff**
 - **SBR-14** custom `URLClassLoader(parent=null)` bypassed → `AppClassLoader` (classloader isolation). **handoff**
 - **SBR-04** annotation `getClass()`/`toString`; **SBR-05** `getDeclaredMethods` order (won't-fix, spec-unspecified);
   **SBR-07** `getSimpleName` (real defect = `getDeclaringClass0`/InnerClasses for Kotlin classes);
