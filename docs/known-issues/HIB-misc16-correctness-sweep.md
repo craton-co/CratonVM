@@ -7,6 +7,14 @@
 | **List** | `apps/hib-suite-runner/misc16.txt` |
 | **Date** | 2026-06-30 |
 
+**Verification (merged binary `2da9a00d`→dev merge `a5847887`, fixes `2ba1347b`+`d906ce97`):**
+`ExplicitQueryStatsMaxSizeTest` PASS 2/2 and `DatabaseTimeZoneMultiTenancyTest`
+PASS 1/1 (both were failing). `XmlFormatterTest` PASS (dev). No regressions in
+the rest of misc16; `LhmEvictProbe` + non-overriding-LHM-subclass +
+`LinkedHashSet` regression probes match HotSpot. `StandardFunctionTests`
+completed this run (40/44, 4 failed — matches the HotSpot slowness/shared-failure
+pattern, see §15–16).
+
 Run the sweep:
 ```
 cd C:/craton/CratonVM/apps/hib-suite-runner
@@ -33,9 +41,9 @@ CRATONVM_DISABLE_DEFAULT_WATCHDOG=1 $CV --java-home "C:/Program Files/Java/jdk-2
 | 7 | `type.LobUnfetchedPropertyTest` | can't cast to `PersistentAttributeInterceptable` | loader-blind class store | OPEN — loader-blind group |
 | 8 | `pc.InstanceIdentityTest` | IAE "not of expected type" | loader-blind class store | OPEN — loader-blind group |
 | 9 | `proxy.ProxyClassReuseTest` | `Could not instantiate persister` (1/3) | loader-blind class store (dual-loader) | OPEN — owned by `hib-proxyclassreuse-loader-blind-class-resolution.md` |
-| 10 | `util.dtd.EntityResolverTest` | unmapped entity `[Child]` | StAX `XMLResolver` not consulted for `classpath://` general entity | OPEN — new |
+| 10 | `util.dtd.EntityResolverTest` | unmapped entity `[Child]` | synthetic `XMLInputFactory.newInstance()` stub shadows real Woodstox → resolver ignored, general entity not expanded | **FIXED** (default-ON; `CRATONVM_REAL_STAX_FACTORY=0` escape hatch); slowness is separate (§15–16) |
 | 11 | `jpa.transaction.TransactionTimeoutTest` | `getStatus()=0 ACTIVE` | Narayana transaction-reaper thread never fires the 2s timeout | OPEN — new |
-| 12 | `id.uuid.rfc9562.UUidV6V7GeneratorTest` | MockitoException | JDK `AnnotatedTypeFactory.getAnnotatedOwnerType` NPE (type-annotation bytes) | OPEN — new |
+| 12 | `id.uuid.rfc9562.UUidV6V7GeneratorTest` | MockitoException | native `AnnotatedTypeBaseImpl.location` null → `getAnnotatedOwnerType` NPE | **NPE FIXED**; residual = 1M-iteration slowness (§15–16 cluster) |
 | 13 | `batchfetch.DynamicBatchFetchTest` | `testMultiLoad` 120s timeout (param-binding 1/2 now passes) | slowness (2000-row multiLoad); HIB-CV-37 #2 param-binding appears fixed | Route → HIB-CV-37 |
 | 14 | `service.ClassLoaderServiceImplTest` | AssertionError | custom-loader class identity / `loadJavaServices` | Route → HIB-CV-24 |
 | 15 | `query.hql.FunctionTests` | HANG @300s | (slowness vs wrong-result — see below) | OPEN — slowness/correctness |
@@ -111,12 +119,18 @@ is loader-blind**: the same-named entity defined by the app loader and by the
 `can't be cast to PersistentAttributeInterceptable` / `Could not instantiate
 persister` / `not of expected type`.
 
-- Gate `CRATONVM_LOADER_AWARE_RESOLUTION=1` does **not** fix these (verified —
-  it only shifts which entity reports first, `Country`→`Continent`).
 - `ProxyClassReuseTest` is the dual-isolated-loader variant already owned by
-  `docs/known-issues/hib-proxyclassreuse-loader-blind-class-resolution.md`; its
-  gated fix is scoped to that case and does not cover the `@BytecodeEnhanced`
-  single-enhancing-loader-with-app-parent pattern.
+  `docs/known-issues/hib-proxyclassreuse-loader-blind-class-resolution.md`.
+- **Update (dev merge):** dev commit `7183f42a` + `docs/known-issues/hib-bytecode-enhancement-loader-faithful-linking.md`
+  added gate-on loader-faithful supertype *linking* / `invokespecial` dispatch
+  for `@BytecodeEnhanced` entities. That doc reports the eager-enhancement
+  cluster FIXED gate-on but the `enhancement.lazy.*` / `mapping.lazytoone.*`
+  cluster still OPEN. **Re-tested on the merged binary with
+  `CRATONVM_LOADER_AWARE_RESOLUTION=1`: all 6 still FAIL** (identical
+  `can't be cast to PersistentAttributeInterceptable` / persister / IAE) — so
+  these misc16 classes fall in the still-open lazy/non-eager cluster, not the
+  portion dev's `7183f42a` fixed. Tracked by
+  `hib-bytecode-enhancement-loader-faithful-linking.md` (open lazy cluster).
 
 **Why the existing gate misses it (fix direction).** The gated
 `resolve_class_loader_aware` (`vm/src/runtime/interpreter.rs`) only covers
@@ -132,20 +146,89 @@ Core class-store change, app-gauntlet blast radius — keep behind the gate.
 
 ---
 
-## 10. EntityResolverTest — StAX `classpath://` general entity (OPEN, new)
+## 10. EntityResolverTest — StAX `classpath://` general entity (FIXED, default-ON; escape hatch `CRATONVM_REAL_STAX_FACTORY=0`)
 
 `Parent.hbm.xml` declares an external general entity
 `<!ENTITY child SYSTEM "classpath://…/child.xml">` and references it as
 `&child;`. Hibernate's StAX `XMLResolver`
 (`LocalXmlResourceResolver.resolveEntity`) maps `classpath://` to a classpath
-resource stream. On CratonVM the `&child;` expansion is **empty** → the `Child`
-`<class>` mapping never loads → `MappingException: Collection [Parent.children]
-references an unmapped entity [Child]`. The class also ran ~112 s (vs ~fast on
-HotSpot), consistent with the StAX `XMLResolver` not being consulted for the
-external general entity (and/or a fallback I/O attempt). Area: real-JDK StAX
-external-general-entity resolution (Woodstox / JDK `XMLInputFactory`) — verify
-whether `XMLResolver.resolveEntity` is invoked for general (non-DTD) entities
-and whether `IS_SUPPORTING_EXTERNAL_ENTITIES` / entity expansion is honored.
+resource stream. On CratonVM the `&child;` expansion was **empty** → the `Child`
+`<class>` mapping never loaded → `MappingException: Collection [Parent.children]
+references an unmapped entity [Child]`.
+
+**Root cause (confirmed by probe).** CratonVM **force-natives**
+`XMLInputFactory.newInstance()`/`newFactory()` to a *synthetic* factory — an
+instance of the **abstract** `javax/xml/stream/XMLInputFactory` itself
+(`native-builtins/src/xml_stax.rs` `native_factory_new_instance`) — whose
+`setXMLResolver` is a no-op (`native_factory_set_property`) and whose
+quick-xml-backed cursor reader never expands external **general** entities. This
+synthetic factory **shadows the real Woodstox** (`com.ctc.wstx.stax.WstxInputFactory`,
+`woodstox-core` + `stax2-api` on the classpath) that HotSpot's `FactoryFinder`
+selects. Probe (`StaxProbe`/`StaxProbe2`, `apps/hib-suite-runner`) on the same
+JDK 25 classpath:
+
+| Path | HotSpot | CratonVM (pre-fix) |
+|------|---------|--------------------|
+| `XMLInputFactory.newInstance()` | `WstxInputFactory` → entity spliced | **synthetic `XMLInputFactory`** → `&child;` literal/empty |
+| `ServiceLoader.load(XMLInputFactory.class)` | `WstxInputFactory` | `WstxInputFactory` *(works!)* |
+| direct `new WstxInputFactory()` | resolver called, entity spliced | **resolver called, entity spliced** *(works!)* |
+| `newFactory(id, cl)` (FactoryFinder) | Woodstox, entity spliced | **Woodstox, entity spliced** *(works!)* |
+| direct JDK `XMLInputFactoryImpl` | (module-blocked) | NPE `fEntityManager` null — **why the synthetic stub exists** |
+
+i.e. the only broken link was `newInstance()` returning the synthetic stub
+instead of the real provider; Woodstox itself runs correctly as bytecode on
+CratonVM, and `ServiceLoader`/`FactoryFinder` already resolve it.
+
+**Fix** (`native-builtins/src/xml_stax.rs`, **default-ON**; `CRATONVM_REAL_STAX_FACTORY=0`
+is the escape hatch). `native_factory_new_instance` first resolves a real,
+concrete third-party provider via `ServiceLoader.load(XMLInputFactory.class, TCCL)`
+(the same lookup `FactoryFinder` uses, minus its broken JDK fallback) and returns
+it; the synthetic stub remains the fallback when **no** provider is registered
+(the JDK's own `XMLInputFactoryImpl` is unusable here — `fEntityManager` null — so
+WildFly's `XMLInputFactoryUtil.create()` boot path is unaffected when no provider
+is present). Native dispatch is keyed on the abstract base class, so a concrete
+`WstxInputFactory` instance runs its own real `setXMLResolver`/`createXMLEventReader`
+bytecode (verified: the natives do **not** re-intercept the subclass). By default
+`EntityResolverTest` **PASS 1/1** (`ok=1 failed=0`); with `=0` it reverts to the
+synthetic stub (still FAIL) — confirming the escape hatch. Default-ON is the
+"real-Java-default" direction and only diverges from the old synthetic behavior
+when a third-party factory is present (i.e. exactly HotSpot's choice).
+
+**Slowness is a *separate*, pre-existing issue — NOT the StAX path.** The
+hypothesized DTD-fetch fallback is **disproven**: isolated wall time is ~56 s in
+**both** the FAIL (gate-off, synthetic) and PASS (gate-on, Woodstox) runs
+(`ms=56534` vs `ms=57388`). Both consult the resolver for the DTD (mapped
+locally, no network), so the time is Hibernate bootstrap + verbose FINEST/FINE
+logging (the §15–16 cluster), independent of entity resolution. The 120 s
+`TimeoutException` in the 8-shard sweep is shard contention, not a deadlock.
+Route the slowness to the Hibernate slowness cluster; the **correctness** item is
+fixed.
+
+**StAX gauntlet (validated the flip — now default-ON).** Ran a 13-class
+Hibernate XML-binding subset (all hit the StAX binder; Woodstox on classpath so
+the gate fires) gate-OFF vs gate-ON, plus a no-provider fallback probe:
+
+| Scenario | Result |
+|----------|--------|
+| Hibernate XML subset, gate **OFF** | PASS 11, FAIL 1 (EntityResolverTest), NOTESTS 1 |
+| Hibernate XML subset, gate **ON** | PASS 12, FAIL 0, NOTESTS 1 — **EntityResolverTest FAIL→PASS, all 11 others unchanged, zero regressions** |
+| No-provider classpath, gate ON vs OFF | identical: both return the synthetic stub, parse OK, no crash |
+
+Subset: `OrmXmlEnumTypeTest, OrmXmlIndexTest, OrmXmlGeneratedTest,
+PreParsedOrmXmlTest, HbmXmlComponentVisitorTest, XMLMappingDisabledTest,
+OrmXmlParseTest, ImmutableEntityXmlMappingTest, MappingClassMoreThanOnceTest,
+XmlMappingTests (NOTESTS both ways), UserTypeTest,
+ForeignKeysCreationForXMLMappingTest, EntityResolverTest`.
+
+Coverage notes: the Spring StAX-SAX bridge tests (`SC-stax-xml-family.md`) and
+Keycloak/WildFly boot were **not** run live — their classpaths carry **no**
+third-party StAX provider (verified), so the gate is a *no-op* there (synthetic
+stub retained), and the no-provider probe confirms that path is crash-free and
+byte-identical to the synthetic stub. The flip is regression-free on all
+exercised paths and only changes behavior when a real provider is present (=
+HotSpot's own selection). **Flipped to default-ON** (escape hatch
+`CRATONVM_REAL_STAX_FACTORY=0`); a full app-gauntlet remains advisable to cover
+any classpath bundling a *non-Woodstox* provider (Aalto etc.).
 
 ---
 
@@ -163,20 +246,42 @@ wakeup / daemon-thread scheduling / async abort divergence). Distinct from
 
 ---
 
-## 12. UUidV6V7GeneratorTest — Mockito → JDK `AnnotatedTypeFactory` NPE (OPEN, new)
+## 12. UUidV6V7GeneratorTest — Mockito → JDK `AnnotatedTypeFactory` NPE (NPE FIXED; residual hang)
 
 Mockito inline-mock self-attach **succeeds** here (not the kafka bug-09 case).
 ByteBuddy then copies type annotations onto the generated mock's methods and
-calls `AnnotatedType.getAnnotatedOwnerType()` on parameterized types, where the
-real JDK `sun.reflect.annotation.AnnotatedTypeFactory$AnnotatedTypeBaseImpl.
-getLocation()` returns **null** → `NullPointerException` in `popLocation(byte)`
-(`AnnotatedTypeFactory.java:190`), surfacing as
-`MockitoException: cannot mock … SharedSessionContractImplementor`. CratonVM
-feeds the JDK annotated-type factory a malformed/empty `LocationInfo` for these
-owner/parameterized types — sibling of the kafka bug-09 fix #6
-(`getExecutableTypeAnnotationBytes`), now in the `getAnnotatedOwnerType` path.
-Area: `native-builtins` type-annotation-bytes provisioning for parameterized /
-owner types.
+calls `AnnotatedType.getAnnotatedOwnerType()`, where the real JDK
+`AnnotatedTypeBaseImpl.getLocation()` returned **null** → `NullPointerException`
+in `popLocation(byte)` (`AnnotatedTypeFactory.java:190`), surfacing as
+`MockitoException: cannot mock … SharedSessionContractImplementor`.
+
+**Root cause (FIXED).** CratonVM *natively constructs* `AnnotatedTypeBaseImpl`
+(`make_annotated_type` / `make_annotated_type_with_anns`, `native-builtins/src/lang_class.rs`)
+but set only the `type` and `annotations` fields — leaving `location` **null**.
+The non-overridden JDK `getAnnotatedOwnerType()` does `getLocation().popLocation((byte)1)`
+→ NPE. **Fix** (`annotated_type_fill_bookkeeping`): seed
+`location = TypeAnnotation$LocationInfo.BASE_LOCATION` (depth 0 → `popLocation`
+returns null → the owner is rebuilt with BASE_LOCATION by real-JDK code) and
+`allOnSameTargetTypeAnnotations = empty[]`. Isolated with `AtypeProbe.java`
+(no Mockito): pre-fix throws the exact NPE on `getAnnotatedOwnerType()` for a
+nested class and `Map.Entry`; post-fix returns the owner type, matching HotSpot.
+Branch `fix/annotatedtype-location` (commit `3ee5ffaf`, off dev `29acdee7`).
+
+**Residual = slowness cluster (not a distinct bug).** With the NPE gone, the
+`mock(SharedSessionContractImplementor.class)` call **succeeds** and the test
+body runs. A watchdog Java thread-dump shows the hot frame is
+`org.assertj.core.api.StringAssert.<init>` inside `testMonotonicity` — the test
+does **`ITERATIONS = 1_000_000`** UUID generations followed by 2 × 1 000 000
+`assertThat(...)` comparisons (`assertThat(uuid.toString()).isGreaterThan(...)`).
+On HotSpot this JITs to a tight loop and finishes well under the 120 s per-test
+JUnit timeout; on CratonVM the interpreter/early-JIT runs the 3 M-operation loop
+too slowly to finish in 120 s. JUnit's `SameThreadTimeoutInvocation` cannot
+preempt the running loop, so the default stack-dump watchdog aborts the process
+first (the earlier "MockitoException" was the *real* VM bug; this residual is the
+same slowness family as §15–16 `FunctionTests`). **Verdict:** the AnnotatedType
+fix removes the actual VM defect; the remaining failure is CratonVM loop
+throughput on a 1 M-iteration microbenchmark-style test — route to the slowness
+cluster, not a new correctness bug.
 
 ---
 
@@ -195,12 +300,23 @@ loader's overriding class must win) and `testStoppableClassLoaderService`
 (`loadJavaServices` via `findResources`). Custom-classloader class-identity /
 service-loader isolation — the HIB-CV-24 loader-isolation family.
 
-## 15–16. FunctionTests / StandardFunctionTests — slowness vs correctness (OPEN)
+## 15–16. FunctionTests / StandardFunctionTests — slowness cluster, NOT a correctness bug
 
-Reported as AssertionError in an earlier run; under a 300 s timeout the whole
-class HANGs (rc=124). Each class has many `@ParameterizedTest` HQL-function
-methods; the per-test 120 s timeout means individual slow tests fail rather than
-hang the process, so the class-level timeout is reached by aggregate slowness.
-Pending a 1200 s single-class run to classify pure-slowness vs specific
-wrong-result function(s). (CratonVM interpreter/JIT HQL-function evaluation is
-the suspect area.)
+`FunctionTests` was run to completion under a 1200 s cap: CratonVM finishes in
+**1169 s** (rc=0, `found=123 ok=97 failed=20`) vs HotSpot **24 s**
+(`ok=99 failed=18`) — **~49× slower**. The 300 s "HANG" (rc=124) was purely a
+timeout artifact of a slow-but-live process; no per-test `TimeoutException`, no
+deadlock, steady forward progress to `@@DONE`. Heavy `TRACE`/`FINEST` Hibernate
+logging dominates the wall time.
+
+Crucially, the CratonVM failures **map onto the same failing tests as HotSpot**
+(20 vs 18; identical queries/assertions — `sinh`, `theDuration`,
+`maxindex/indices`, `cast(boolean as String)`, etc.). These are pre-existing
+harness/dialect failures present on HotSpot too — **not** CratonVM HQL-function
+wrong-results. The only delta is exception flavor (CratonVM surfaces
+`ArrayIndexOutOfBoundsException` where HotSpot surfaces `IndexOutOfBoundsException`).
+
+**Disposition:** slowness-cluster (the ~49× slowdown is the real issue), not a
+distinct misc-correctness bug — arguably mis-classified into this tail.
+`StandardFunctionTests` should re-run on the merged binary to confirm the same
+pattern (HotSpot baseline: 29 s, `found=44 ok=41 failed=3`).

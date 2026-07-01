@@ -78,10 +78,89 @@ The entity instance Hibernate's runtime instantiates during metamodel/persister 
 **un-enhanced** copy — i.e. Hibernate's view of the entity `Class` (via the `@DomainModel`
 annotation `Class[]` element / `ClassLoaderService` / TCCL) is not the enhancing loader's
 enhanced copy. This is a SessionFactory-integration root cause orthogonal to the dispatch/
-linking fixes above (those are necessary but not sufficient). Next step: make Hibernate's
-entity-`Class` resolution (annotation `Class` element materialisation and/or
-`ClassLoaderService.classForName`) loader-faithful so the SessionFactory instantiates enhanced
-entities. Until then, `enhancement.lazy.*` (≈54) + `mapping.lazytoone.*` (12) remain FAIL gate-on.
+linking fixes above (those are necessary but not sufficient).
+
+### UPDATE 2026-06-30 — SessionFactory-build blocker FIXED (6th fix)
+
+The `PersistentAttributeInterceptable` CCE at SessionFactory build is FIXED (commit
+`f658fe12`). Root cause: `inherit_lookup_loader` (`native-builtins/src/lookup_define.rs`)
+resolved a `Lookup.defineClass` target loader via `loader_id_of_class` — an i32 that maps
+BOTH `Application` and `UserDefined(2)` to `2` — then a `< 3` threshold, so a class loaded
+by a user loader whose namespace id is 1 or 2 (the first ids `allocate_loader_id` hands out)
+was mis-routed to the Application namespace. ByteBuddy defines the entity's
+ReflectionOptimizer `<Entity>$HibernateInstantiator` via `Lookup.defineClass` against the
+ENHANCED entity (`UserDefined(2)`), but it landed under Application, so its generated
+`new <Entity>` resolved the un-enhanced copy. Fix: under the gate, derive the namespace from
+the lookup class's recorded defining-loader (`peek_loader_namespace_id`) — the same value
+`defineClass1` computes — falling back to the legacy i32 path otherwise (byte-identical
+gate-off). With it, `enhancement.lazy.*` now build the SessionFactory and run.
+
+**Next OPEN layer (3rd distinct root cause): MethodHandle field-setter accessor.** The lazy
+tests now fail deeper, at `s.persist(entity)`:
+`PropertyAccessException: Could not set value of type [java.lang.Long]: '<Entity>.id'` ←
+`IllegalArgumentException: Can not set java.lang.Long field <Entity>.id to <Entity>`.
+LOCALIZED (CRATONVM_DBG_ID invoke-arg trace): the id value is the correct `Long` all the way
+down — `setIdentifier(entity, Long)` → `EnhancedSetterImpl.set(entity, Long)` →
+`SetterFieldImpl.set(entity, Long)` → `Field.set(entity, Long)` →
+`jdk.internal.reflect.MethodHandleObjectFieldAccessorImpl.set(entity, Long)` — ALL receive the
+`Long`. The corruption is INSIDE that accessor's `set(obj, value)` (JDK bytecode): it does
+`setter.invokeExact(obj, value)` on an `asType`-adapted putField MethodHandle (call-site
+`(Object,Object)V`, MH type `(<Entity>, Long)void`); our VM throws a spurious
+`ClassCastException` from that invoke, caught at the accessor's `catch (ClassCastException)`
+which rethrows via `throwSetIllegalArgumentException(value)` — and the value it reports is the
+`<Entity>`, i.e. the caller's `value` local (slot 2) reads as the entity by then. Not JIT
+(`--nojit` reproduces). `detached.*` (generated-id persist) PASS, so plain id generation works;
+this is the FIELD-ACCESS enhanced entity forcing the MethodHandle reflective-accessor path.
+FURTHER LOCALIZED (DBG_MH on `mh_dispatch` + DBG_MHX on the `invokeExact` native): the JDK
+builds both accessors via `JLIA.unreflectField(field, isSetter)` → `IMPL_LOOKUP.unreflect{Getter,
+Setter}` → our synthetic `MH_KIND_GETTER`/`MH_KIND_SETTER` (asType is a passthrough that only
+stamps `type`). The field **GETTER** `getter.invokeExact(obj)` (`(Object)Object`) routes correctly
+to the `invokeExact` native → `mh_dispatch` (MH_KIND_GETTER) → reads the field — WORKS. The field
+**SETTER** `setter.invokeExact(obj, value)` (`(Object,Object)V`, 2-arg **void**) does NOT reach the
+`invokeExact` native / `mh_dispatch` at all — it diverges in the interpreter's signature-polymorphic
+invoke routing (`vm/src/vm/vm_exec.rs` ~11440-11710, the `check_override` / Some-vs-None-arm /
+poly-desc dispatch), throwing a spurious `ClassCastException` and leaving the caller's `value` local
+reading as the entity. The plain `MH_KIND_SETTER` path in `mh_dispatch` sets the field directly with
+no cast/CCE, so the fix is to make the 2-arg-void field-setter `invokeExact` reach it (mirroring the
+getter). Risk: that routing has many documented special cases (Groovy/Jackson/records/Spring) — needs
+a MethodHandle regression harness. Separate follow-up (MethodHandle subsystem, not loader-faithful
+resolution).
+
+### Precise root cause (traced 2026-06-30) — original SessionFactory CCE characterization
+
+The CCE is `ManagedTypeHelper.asPersistentAttributeInterceptable(entity)` ← persister build
+(`AbstractEntityInstantiatorPojo.applyInterception` ← `UnsavedValueFactory` ←
+`BasicEntityIdentifierMappingImpl.<init>`). Confirmed via instrumentation:
+
+- `bootDescriptor.getMappedClass()` is the **enhanced** entity Class — `applyBytecodeInterception
+  = isPersistentAttributeInterceptableType(getMappedClass())` is `true` (our `isAssignableFrom`
+  uses exact mirror class_ids, so this is reliable).
+- But the entity instance Hibernate creates is the **un-enhanced** copy (`instanceof
+  PrimeAmongSecondarySupertypes` ⇒ 0; the class has zero interfaces).
+- It is instantiated by a ByteBuddy ReflectionOptimizer `<Entity>$HibernateInstantiator`
+  whose generated `new <Entity>()` resolves the entity to the un-enhanced copy because the
+  optimizer class itself is **defined under the Application loader**, not the enhancing loader
+  (observed with `--nojit`: `new …$LazyEntity from …$LazyEntity$HibernateInstantiator
+  loader=Application -> un-enhanced`). `--nojit` does NOT fix it ⇒ this is the optimizer's
+  defining loader, not a JIT `new`-resolution gap.
+- The optimizer lands under Application because Hibernate hands ByteBuddy
+  `mappedJtd.getJavaTypeClass()` (= `registry.resolveEntityTypeDescriptor(getMappedClass())`),
+  and that JavaType's class is **un-enhanced** even though the argument was enhanced.
+  `JavaTypeRegistry.resolveDescriptor` is keyed by `Class.getTypeName()` (the NAME string),
+  so a previously-registered un-enhanced JavaType for the same name is returned; its
+  `checkCached` `!=` guard does not fire (it should throw "Type registration was corrupted").
+
+So the real fix is upstream of dispatch/linking: ensure Hibernate sees ONE entity Class (the
+enhanced one). On HotSpot there is exactly one `<Entity>` (the enhancing loader's), because the
+Application loader never loads the test-package entity — Hibernate only ever uses the enhanced
+`Class` object from the `@DomainModel` annotation, never resolving it by name. On CratonVM a
+spurious **un-enhanced** copy is created (Application-loader name resolution somewhere during
+metadata build) and then leaks into the name-keyed `JavaTypeRegistry`. Candidate fixes:
+(a) prevent the spurious Application-loader load of an entity that a user loader has enhanced;
+(b) make the entity JavaType / `getReflectionOptimizer` use the enhanced `getMappedClass()`
+directly; or (c) make CratonVM Class-mirror identity loader-faithful so the registry's `==`
+guard distinguishes (and rejects) the un-enhanced copy. Until then, `enhancement.lazy.*` (≈54)
++ `mapping.lazytoone.*` (12) remain FAIL gate-on.
 
 ## Repro
 
