@@ -421,13 +421,32 @@ fn discover_providers(
                     ext_str.clone()
                 };
                 if !entry_path.is_empty() {
-                    let bytes_list = ctx.find_all_resource_bytes(&entry_path);
-                    for bytes in &bytes_list {
-                        parse_provider_lines(bytes, &mut providers);
-                    }
-                    if bytes_list.is_empty() {
-                        if let Some(bytes) = ctx.find_resource(&entry_path) {
+                    let mut got = false;
+                    // A plain `file:` URL (no `!/` jar separator) names a real
+                    // filesystem path, NOT a classpath-relative resource. The
+                    // `find_*_resource_bytes` helpers only search the classpath, so
+                    // an absolute path like `C:/…/META-INF/services/<spi>` misses
+                    // and the provider list comes back empty. Read the file
+                    // directly. This is the common case for a custom loader whose
+                    // `findResources` override hands back a descriptor URL from a
+                    // directory on disk (Hibernate's `ClassLoaderServiceImplTest`
+                    // `TestClassLoader`, HHH-8363).
+                    if ext_str.starts_with("file:") && !ext_str.contains("!/") {
+                        let fs_path = percent_decode(&entry_path);
+                        if let Ok(bytes) = std::fs::read(&fs_path) {
                             parse_provider_lines(&bytes, &mut providers);
+                            got = true;
+                        }
+                    }
+                    if !got {
+                        let bytes_list = ctx.find_all_resource_bytes(&entry_path);
+                        for bytes in &bytes_list {
+                            parse_provider_lines(bytes, &mut providers);
+                        }
+                        if bytes_list.is_empty() {
+                            if let Some(bytes) = ctx.find_resource(&entry_path) {
+                                parse_provider_lines(&bytes, &mut providers);
+                            }
                         }
                     }
                     count += 1;
@@ -620,6 +639,30 @@ fn parse_provider_lines(bytes: &[u8], out: &mut Vec<String>) {
             out.push(token.to_string());
         }
     }
+}
+
+/// Percent-decode a URL path component (`%20` → space, etc.) so a `file:` URL
+/// derived path opens as a real filesystem path. Leaves malformed `%` escapes
+/// and non-`%` bytes untouched. Kept intentionally small — descriptor URLs only
+/// need the handful of escapes the JDK's `URLEncoder`/`sun.net.www` layer emits.
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hi = (bytes[i + 1] as char).to_digit(16);
+            let lo = (bytes[i + 2] as char).to_digit(16);
+            if let (Some(h), Some(l)) = (hi, lo) {
+                out.push((h * 16 + l) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 fn is_valid_provider_name(s: &str) -> bool {
