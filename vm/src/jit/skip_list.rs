@@ -430,10 +430,7 @@ fn should_skip_jit_internal(
 
     if policy == SkipPolicy::Conservative {
         if is_known_miscompile(class_name, method_name)
-            && !package_allowed("java/util/", allow_packages)
-            && !package_allowed("cratonvm/", allow_packages)
-            && !package_allowed("java/lang/", allow_packages)
-            && !package_allowed("java/security/", allow_packages)
+            && !package_allowed(class_name, allow_packages)
         {
             return Some(if class_name.starts_with("java/util/") {
                 SkipReason::JavaUtilCollection
@@ -1321,9 +1318,9 @@ fn is_known_miscompile(class_name: &str, method_name: &str) -> bool {
         // mapped onto the String parameter register. Banning these keeps
         // the parse path in the interpreter where calling-convention
         // marshalling is correct. Also covers `parseInt` for symmetry —
-        // same archetype (String, int) -> int. Other parsing helpers
-        // (Integer.valueOf, Long.valueOf already banned above) cover the
-        // (String) -> Number boxing path.
+        // same archetype (String, int) -> int. `Integer.valueOf` was lifted
+        // by the W2-CHM retest above; the remaining boxing constructors are
+        // still covered by the constructor gate.
         | ("java/lang/Long", "parseLong")
         | ("java/lang/Integer", "parseInt")
         // RBC.1 (Session 109) — BouncyCastleProvider.<clinit> drives a
@@ -1555,32 +1552,6 @@ fn is_known_miscompile(class_name: &str, method_name: &str) -> bool {
         | ("java/util/WeakHashMap$Entry", "<init>")
         | ("java/util/WeakHashMap", "getTable")
         | ("java/util/WeakHashMap", "expungeStaleEntries")
-        // kafka-bug-C (2026-06-18) — the *stream/spliterator* sibling of the
-        // Tomcat Bug B iterator ban above. `WeakHashMap.values().stream()`
-        // (e.g. log4j2 `InternalLoggerRegistry` streaming its logger
-        // WeakHashMap during init) hangs forever JIT-on but completes JIT-off;
-        // it is the root cause of the dominant kafka `consumer.internals`
-        // TIMEOUT cluster (`ConsumerRecordsTest` + 13 classes). Bisected
-        // (`CRATONVM_JIT_BISECT_ONLY=java/util/WeakHashMap` +
-        // `CRATONVM_JIT_BISECT_SKIP=...$ValueSpliterator.tryAdvance`) to a single
-        // method: the JIT miscompiles `ValueSpliterator.tryAdvance`'s
-        // `current = tab[index++]` field-post-increment (bytecode 60-77:
-        // `dup_x1; iconst_1; iadd; putfield index` — the `index++` store is
-        // dropped, so the inner `while (index < hi || current != null)` loop
-        // never advances `index` past a null table slot and spins). Skipping
-        // just that method makes the 3-line repro return; `getFence`/`size`/
-        // `expungeStaleEntries` skips do NOT (verified). The same
-        // `current = tab[index++]` loop appears in `forEachRemaining` and in
-        // the Key/Entry spliterators (keySet()/entrySet() streams), so ban the
-        // whole shape pre-emptively. Underlying dup_x1 codegen defect tracked
-        // in docs/known-issues/kafka-bug-C-weakhashmap-stream-infinite-hang.md
-        // for a general fix (the `CRATONVM_JIT_NO_DUPX` lever is unstable here).
-        | ("java/util/WeakHashMap$ValueSpliterator", "tryAdvance")
-        | ("java/util/WeakHashMap$ValueSpliterator", "forEachRemaining")
-        | ("java/util/WeakHashMap$KeySpliterator", "tryAdvance")
-        | ("java/util/WeakHashMap$KeySpliterator", "forEachRemaining")
-        | ("java/util/WeakHashMap$EntrySpliterator", "tryAdvance")
-        | ("java/util/WeakHashMap$EntrySpliterator", "forEachRemaining")
         // Tomcat Bug D (apps/tomcat suite) — `org.apache.catalina.filters.
         // TestRemoteCIDRFilter` SIGSEGVs in JIT mode but completes cleanly with
         // `CRATONVM_DISABLE_JIT=1`. Root cause (CRATONVM_BUGS/BUG-D-*): a JIT
@@ -1942,6 +1913,25 @@ fn is_known_miscompile(class_name: &str, method_name: &str) -> bool {
         | (
             "io/smallrye/config/ConfigValueConfigSource$ConfigValueProperties",
             "load0",
+        )
+        // KC-CRED.LAZY (2026-07-01) — Keycloak `CredentialModelTest.
+        // canCreateDefaultCredentialModel` returns `null` from a lazy-init
+        // `getAdditionalParameters()` getter under JIT, while `--nojit` and
+        // HotSpot return `{}`. The bare lazy-init shape compiles correctly in
+        // isolation, and the original escape-analysis/scalar-replacement
+        // theory was refuted; the failure needs the real
+        // PasswordCredentialData / PasswordSecretData classes reached through
+        // Jackson deserialization. Keep just these two getters interpreted
+        // until the context-sensitive single-pass `getfield`/`putfield`/
+        // `areturn` codegen issue can be reproduced in-tree. Liftable via
+        // `CRATONVM_JIT_ALLOW_PACKAGES=org/keycloak/models/credential/`.
+        | (
+            "org/keycloak/models/credential/dto/PasswordCredentialData",
+            "getAdditionalParameters",
+        )
+        | (
+            "org/keycloak/models/credential/dto/PasswordSecretData",
+            "getAdditionalParameters",
         )
         // BC-ASN1.1 (current session) — `apps/_test-suites/bc-java`'s
         // `org.bouncycastle.asn1.test.RegressionTest` SEGFAULTs (rc=139) on
@@ -2325,6 +2315,79 @@ mod tests {
     }
 
     #[test]
+    fn known_miscompile_overrides_apply_to_actual_package() {
+        // Non-java targeted entries document their own allow-package escape
+        // hatches. The override must be checked against the current class, not
+        // only a fixed set of historical package roots.
+        assert_eq!(
+            check_with(
+                "io/smallrye/config/ConfigValueConfigSource$ConfigValueProperties$LineReader",
+                "readLine",
+                false,
+                true,
+                SkipPolicy::Conservative,
+                &["io/smallrye/config/"],
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn keycloak_credential_lazy_init_getters_are_interpreted() {
+        for cls in [
+            "org/keycloak/models/credential/dto/PasswordCredentialData",
+            "org/keycloak/models/credential/dto/PasswordSecretData",
+        ] {
+            assert_eq!(
+                check(
+                    cls,
+                    "getAdditionalParameters",
+                    false,
+                    true,
+                    SkipPolicy::Conservative
+                ),
+                Some(SkipReason::RustJvmTestFixture),
+                "{cls}.getAdditionalParameters must stay interpreted under Conservative"
+            );
+            assert_eq!(
+                check(
+                    cls,
+                    "getAdditionalParameters",
+                    false,
+                    true,
+                    SkipPolicy::Aggressive
+                ),
+                None,
+                "{cls}.getAdditionalParameters should remain debuggable under Aggressive"
+            );
+            assert_eq!(
+                check_with(
+                    cls,
+                    "getAdditionalParameters",
+                    false,
+                    true,
+                    SkipPolicy::Conservative,
+                    &["org/keycloak/models/credential/"],
+                ),
+                None,
+                "{cls}.getAdditionalParameters should be liftable for bisection"
+            );
+        }
+
+        assert_eq!(
+            check(
+                "org/keycloak/models/credential/CredentialModel",
+                "getPasswordCredentialData",
+                false,
+                true,
+                SkipPolicy::Conservative
+            ),
+            None,
+            "do not blanket-ban the surrounding Keycloak credential model"
+        );
+    }
+
+    #[test]
     fn user_class_never_skipped() {
         assert_eq!(
             check(
@@ -2353,9 +2416,9 @@ mod tests {
     // ------------------------------------------------------------------
 
     /// NEW-1.2 CI gate: java/lang/* is no longer blanket-banned.
-    /// (W2-CHM narrowed `Integer.valueOf` / `<init>` and `Long.valueOf` /
-    /// `<init>` to targeted bans — see `is_known_miscompile` — so unrelated
-    /// `java/lang/*` methods like `String.indexOf` still demonstrate the
+    /// (W2-CHM now keeps only boxing constructors under the constructor gate;
+    /// `Integer.valueOf` / `Long.valueOf` are JIT-eligible after the 2026-06-11
+    /// retest, so unrelated `java/lang/*` methods like `String.indexOf` still demonstrate the
     /// "no blanket ban" guarantee.)
     #[test]
     fn java_lang_is_jit_eligible_after_new_1_2() {
@@ -2379,27 +2442,26 @@ mod tests {
                 SkipPolicy::Conservative
             ),
             None,
-            "Integer.toString stays JIT-eligible — only valueOf/<init> are skip-listed"
+            "Integer.toString stays JIT-eligible — only constructors remain guarded"
         );
     }
 
-    /// W2-CHM CI gate: `Integer.valueOf` and `Integer.<init>` are skipped
-    /// under the conservative policy because the JIT miscompiles them
-    /// (Integer's value field reads back as 0 when allocated via the
-    /// allocate-then-putfield JIT sequence after the OSR + per-callee
-    /// invocation thresholds are crossed in the same outer frame).
-    /// `Long.valueOf` / `Long.<init>` are skipped by the same logic.
+    /// W2-CHM CI gate: `Integer.valueOf` / `Long.valueOf` were lifted after
+    /// the regalloc/length-table fixes, while field-storing boxing constructors
+    /// remain interpreted through the generic constructor gate.
     #[test]
-    fn integer_long_box_methods_skipped_under_conservative_policy() {
-        for (cls, mn) in [
-            ("java/lang/Integer", "valueOf"),
-            ("java/lang/Integer", "<init>"),
-            ("java/lang/Long", "valueOf"),
-            ("java/lang/Long", "<init>"),
-        ] {
+    fn integer_long_valueof_lifted_but_constructors_stay_guarded() {
+        for (cls, mn) in [("java/lang/Integer", "valueOf"), ("java/lang/Long", "valueOf")] {
+            assert_eq!(
+                check(cls, mn, false, true, SkipPolicy::Conservative),
+                None,
+                "{cls}.{mn} should remain JIT-eligible after the W2-CHM lift"
+            );
+        }
+        for (cls, mn) in [("java/lang/Integer", "<init>"), ("java/lang/Long", "<init>")] {
             assert!(
                 check(cls, mn, false, true, SkipPolicy::Conservative).is_some(),
-                "{cls}.{mn} must be skipped under Conservative policy (W2-CHM)"
+                "{cls}.{mn} must stay guarded by the constructor policy"
             );
         }
     }
@@ -2633,10 +2695,22 @@ mod tests {
         assert!(is_known_miscompile("java/util/HashMap", "get"));
         assert!(is_known_miscompile("java/util/HashMap", "resize"));
         assert!(is_known_miscompile("cratonvm/TckLang", "exc_hierarchy"));
+        assert!(is_known_miscompile(
+            "org/keycloak/models/credential/dto/PasswordCredentialData",
+            "getAdditionalParameters"
+        ));
+        assert!(is_known_miscompile(
+            "org/keycloak/models/credential/dto/PasswordSecretData",
+            "getAdditionalParameters"
+        ));
         // Everything else must NOT be in the list.
         assert!(!is_known_miscompile("java/util/HashMap", "size"));
         assert!(!is_known_miscompile("java/util/ArrayList", "add"));
         assert!(!is_known_miscompile("cratonvm/TckLang", "str_length"));
+        assert!(!is_known_miscompile(
+            "org/keycloak/models/credential/CredentialModel",
+            "getPasswordCredentialData"
+        ));
         assert!(!is_known_miscompile("com/example/Foo", "bar"));
     }
 }
