@@ -308,6 +308,15 @@ fn lkind_of_value(v: &Value) -> u8 {
     }
 }
 
+#[inline]
+fn lost_tag_local_candidates(cv: CompactValue) -> [u64; 3] {
+    [
+        cv.as_object_ptr().unwrap_or(0),
+        cv.as_long().map(|l| l as u64).unwrap_or(0),
+        cv.raw_bits(),
+    ]
+}
+
 fn init_locals(max_locals: u16, args: &[Value]) -> (Vec<CompactValue>, Vec<u8>, u16) {
     let eff = effective_max_locals(max_locals, args);
     let n = eff as usize;
@@ -1313,6 +1322,21 @@ impl Frame {
                         roots.push(unsafe { ObjectRef::from_raw(ptr as *mut u8) });
                     }
                 }
+            } else {
+                // Moving-GC lost-tag hardening: a reference-typed local can
+                // transiently carry a raw object address under a non-object
+                // CompactValue tag at a safepoint. Primitive long/double
+                // locals were excluded above; use the strict header probe so
+                // this fallback only roots real live objects.
+                for candidate in lost_tag_local_candidates(*cv) {
+                    if candidate == 0 {
+                        continue;
+                    }
+                    if let Some(obj) = heap.is_object_address(candidate as usize) {
+                        roots.push(obj);
+                        break;
+                    }
+                }
             }
         }
     }
@@ -1437,27 +1461,40 @@ impl Frame {
                 continue;
             }
             let cv = self.locals[i];
-            if !cv.is_object() {
-                continue;
-            }
-            let Some(old_ptr) = cv.as_object_ptr() else {
-                continue;
-            };
-            // Gate on `pointer_map` membership, NOT a live-header probe of
-            // `old_ptr`. After a moving GC, `old_ptr` is the *from-space*
-            // address, whose header has already been zeroed/reclaimed — so
-            // `heap.is_object_address(old_ptr)` returns `None` for precisely
-            // the slots that were relocated and need remapping, leaving them
-            // dangling. That was the H2 `TestAll` `System.gc()` crash:
-            // POST-GC STALE LOCAL + ZERO-HEADER on `Utils.collectGarbage` /
-            // `TestAll.*` frames, cascading into the OOBFIELD `class_id=0`
-            // probe, an IllegalMonitorStateException on frame pop, and a final
-            // NPE. The `pointer_map` is the authoritative record of
-            // relocations and is exactly the criterion `verify_no_stale_refs`
-            // uses, so remap iff the slot's address is a key.
-            if let Some(&new_addr) = pointer_map.get(&(old_ptr as usize)) {
-                self.locals[i] = CompactValue::try_from_pointer(new_addr as u64)
-                    .unwrap_or_else(CompactValue::null);
+            if cv.is_object() {
+                let Some(old_ptr) = cv.as_object_ptr() else {
+                    continue;
+                };
+                // Gate on `pointer_map` membership, NOT a live-header probe of
+                // `old_ptr`. After a moving GC, `old_ptr` is the *from-space*
+                // address, whose header has already been zeroed/reclaimed — so
+                // `heap.is_object_address(old_ptr)` returns `None` for precisely
+                // the slots that were relocated and need remapping, leaving them
+                // dangling. That was the H2 `TestAll` `System.gc()` crash:
+                // POST-GC STALE LOCAL + ZERO-HEADER on `Utils.collectGarbage` /
+                // `TestAll.*` frames, cascading into the OOBFIELD `class_id=0`
+                // probe, an IllegalMonitorStateException on frame pop, and a final
+                // NPE. The `pointer_map` is the authoritative record of
+                // relocations and is exactly the criterion `verify_no_stale_refs`
+                // uses, so remap iff the slot's address is a key.
+                if let Some(&new_addr) = pointer_map.get(&(old_ptr as usize)) {
+                    self.locals[i] = CompactValue::try_from_pointer(new_addr as u64)
+                        .unwrap_or_else(CompactValue::null);
+                }
+            } else {
+                for candidate in lost_tag_local_candidates(cv) {
+                    if candidate == 0 {
+                        continue;
+                    }
+                    let Some(&new_addr) = pointer_map.get(&(candidate as usize)) else {
+                        continue;
+                    };
+                    if heap.is_object_address(new_addr).is_some() {
+                        self.locals[i] = CompactValue::try_from_pointer(new_addr as u64)
+                            .unwrap_or_else(CompactValue::null);
+                    }
+                    break;
+                }
             }
         }
     }
@@ -1480,11 +1517,16 @@ impl Frame {
             if obj == Some(addr) || (raw & mask) == (addr & mask) {
                 return Some(format!(
                     "local[{}] kind={} is_object={} obj_match={}",
-                    i, self.local_kinds[i], self.locals[i].is_object(), obj == Some(addr)
+                    i,
+                    self.local_kinds[i],
+                    self.locals[i].is_object(),
+                    obj == Some(addr)
                 ));
             }
         }
-        self.stack.dbg_locate_addr(addr).map(|s| format!("operand-{s}"))
+        self.stack
+            .dbg_locate_addr(addr)
+            .map(|s| format!("operand-{s}"))
     }
 }
 
@@ -1783,6 +1825,77 @@ mod tests {
         // …yet only the reference slot is rooted; the collision long is not.
         assert_eq!(roots.len(), 1, "only the genuine reference is a GC root");
         assert_eq!(roots[0].as_ptr() as u64, addr);
+    }
+
+    #[test]
+    fn scan_local_objects_roots_lost_tag_other_local() {
+        use crate::memory::VmHeap;
+        use cratonvm_gc::GcBackend;
+
+        let heap = VmHeap::new(GcBackend::Generational, 16 * 1024 * 1024);
+        let obj = heap.alloc_object(ClassId::new(0), 0);
+        let addr = obj.as_ptr() as u64;
+
+        let mut frame = Frame::new(
+            ClassId::new(0),
+            "T".to_string(),
+            "m".to_string(),
+            "()V".to_string(),
+            None,
+            vec![0xb1],
+            vec![],
+            10,
+            2,
+            &[],
+        );
+
+        // Model a reference-typed local whose CompactValue object tag was lost:
+        // the slot kind is still LKIND_OTHER, but the bits are a raw heap addr.
+        frame.set_local_compact_unchecked(0, CompactValue::long(addr as i64));
+        assert!(!frame.get_local_compact(0).is_object());
+
+        let mut roots = Vec::new();
+        frame.scan_local_objects(&mut roots, &heap);
+
+        assert_eq!(roots.len(), 1);
+        assert_eq!(roots[0].as_ptr() as u64, addr);
+    }
+
+    #[test]
+    fn update_local_refs_remaps_lost_tag_other_local() {
+        use crate::memory::VmHeap;
+        use cratonvm_gc::GcBackend;
+        use std::collections::HashMap;
+
+        let heap = VmHeap::new(GcBackend::Generational, 16 * 1024 * 1024);
+        let old_obj = heap.alloc_object(ClassId::new(0), 0);
+        let new_obj = heap.alloc_object(ClassId::new(0), 0);
+        let old_addr = old_obj.as_ptr() as u64;
+        let new_addr = new_obj.as_ptr() as u64;
+        assert_ne!(old_addr, new_addr);
+
+        let mut frame = Frame::new(
+            ClassId::new(0),
+            "T".to_string(),
+            "m".to_string(),
+            "()V".to_string(),
+            None,
+            vec![0xb1],
+            vec![],
+            10,
+            2,
+            &[],
+        );
+        frame.set_local_compact_unchecked(0, CompactValue::long(old_addr as i64));
+        assert!(!frame.get_local_compact(0).is_object());
+
+        let mut map = HashMap::new();
+        map.insert(old_addr as usize, new_addr as usize);
+        frame.update_local_refs(&map, &heap);
+
+        let remapped = frame.get_local_compact(0);
+        assert!(remapped.is_object());
+        assert_eq!(remapped.as_object_ptr(), Some(new_addr));
     }
 
     /// Symmetric `update_local_refs` regression: a collision long whose payload
