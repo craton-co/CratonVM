@@ -4,13 +4,11 @@
  * cratonvm.h — public C header for the libcratonvm flat embedding API
  * (Layer 2 of docs/feature-designs/embedding-api.md).
  *
- * STATUS: hand-written stub. The flat C ABI is small and stable enough to
- * maintain by hand for now; the design's intent is to generate this with
- * cbindgen as a build step (see "Next steps" in the design doc). The
- * declarations here match the `#[repr(C)]` / `#[no_mangle] pub extern "C"`
- * items in libcratonvm/src/lib.rs exactly. If you regenerate with cbindgen,
- * keep this file's contents byte-compatible (handle types, CratonValue layout,
- * tag values, function signatures).
+ * STATUS: checked-in public header for the flat C ABI. The declarations here
+ * match the `#[repr(C)]` / `#[no_mangle] pub extern "C"` flat API items in
+ * libcratonvm/src/lib.rs. cbindgen regeneration is opt-in; when regenerated,
+ * keep the ABI coverage aligned with this file (handle types, CratonValue
+ * layout, constants, and function signatures).
  *
  * This header covers ONLY the flat `cratonvm_*` API. The JNI Invocation-API
  * entry points (JNI_CreateJavaVM / JNI_GetDefaultJavaVMInitArgs /
@@ -40,6 +38,19 @@ typedef uint64_t CratonRef;
 
 /* u64 class handle (a widened ClassId). 0 is a valid class id. */
 typedef uint64_t CratonClass;
+
+/* JNI-compatible return codes and default version used by this flat API.
+ * Prefixed names avoid collisions when a host also includes a JDK <jni.h>. */
+enum {
+    CRATONVM_JNI_OK       = 0,
+    CRATONVM_JNI_ERR      = -1,
+    CRATONVM_JNI_EDETACHED = -2,
+    CRATONVM_JNI_EVERSION = -3,
+    CRATONVM_JNI_ENOMEM   = -4,
+    CRATONVM_JNI_EEXIST   = -5,
+    CRATONVM_JNI_EINVAL   = -6,
+    CRATONVM_JNI_VERSION  = 0x00010008
+};
 
 /* ---- VM init args (jni.h-compatible; reused by cratonvm_create) -------- */
 
@@ -91,11 +102,27 @@ typedef struct CratonValue {
 /* Build and bootstrap a VM. `args` may be NULL for defaults. Only one VM
  * surface may be active in-process: either one JNI Invocation-API VM or one
  * flat CratonVm. Returns NULL on failure (cratonvm_last_error() then holds the
- * message). The returned handle must be released with cratonvm_destroy(). */
+ * message). Unsupported JNI versions and unrecognized/malformed options fail
+ * unless ignoreUnrecognized is nonzero. The returned handle must be released
+ * with cratonvm_destroy(). */
 CratonVm *cratonvm_create(const JavaVMInitArgs *args);
 
 /* Drop the VM and free the handle. NULL is a no-op. */
 void cratonvm_destroy(CratonVm *vm);
+
+/* Release one object/string/throwable token previously returned by this VM.
+ * Passing 0 (Java null) is a no-op success. Each nonzero CratonRef returned by
+ * libcratonvm pins a JNI global ref until the host balances it with this call
+ * or destroys the VM. Returns 0 (JNI_OK) on success or -1 (JNI_ERR) for a bad
+ * VM handle or stale/fabricated token. */
+cratonvm_jint cratonvm_release_ref(CratonVm *vm, CratonRef reference);
+
+/* Mark the calling VM-driving host thread as parked in native code while it
+ * performs a blocking host wait, then re-enter the VM. Balance every enter with
+ * one leave. Both return 0 (JNI_OK) on success or -1 (JNI_ERR) when no VM is
+ * available. */
+cratonvm_jint cratonvm_thread_enter_native(void);
+cratonvm_jint cratonvm_thread_leave_native(void);
 
 /* ---- operations ------------------------------------------------------- */
 

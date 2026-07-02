@@ -56,14 +56,15 @@
 
 #![allow(clippy::missing_safety_doc)]
 
+use std::fmt;
 use std::os::raw::{c_char, c_void};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::Mutex;
 
 use cratonvm_vm::config::VmConfig;
 use cratonvm_vm::native::jni::{
-    clear_jni_context, get_java_vm, get_jni_env, host_thread_enter_native, host_thread_leave_native,
-    set_destroy_vm_hook, set_jni_context_arc,
+    clear_jni_context, get_java_vm, get_jni_env, host_thread_enter_native,
+    host_thread_leave_native, set_destroy_vm_hook, set_jni_context_arc,
 };
 use cratonvm_vm::vm::Vm;
 
@@ -72,7 +73,10 @@ use cratonvm_vm::vm::Vm;
 // identical to the function-table side).
 // ---------------------------------------------------------------------------
 
-pub use cratonvm_vm::native::jni::{JInt, JNIEnv, JSize, JavaVM};
+pub type JInt = i32;
+pub type JNIEnv = *const *const usize;
+pub type JSize = i32;
+pub type JavaVM = *const *const usize;
 
 /// `jni.h`: success.
 pub const JNI_OK: JInt = 0;
@@ -94,6 +98,27 @@ pub const JNI_EINVAL: JInt = -6;
 /// Kept in lockstep with `cratonvm_vm::native::jni::JNI_VERSION_1_8` so the
 /// Invocation API and the function-table side agree on a single value.
 pub const JNI_VERSION: JInt = cratonvm_vm::native::jni::JNI_VERSION_1_8;
+
+pub const CRATONVM_JNI_OK: JInt = JNI_OK;
+pub const CRATONVM_JNI_ERR: JInt = JNI_ERR;
+pub const CRATONVM_JNI_EDETACHED: JInt = JNI_EDETACHED;
+pub const CRATONVM_JNI_EVERSION: JInt = JNI_EVERSION;
+pub const CRATONVM_JNI_ENOMEM: JInt = JNI_ENOMEM;
+pub const CRATONVM_JNI_EEXIST: JInt = JNI_EEXIST;
+pub const CRATONVM_JNI_EINVAL: JInt = JNI_EINVAL;
+pub const CRATONVM_JNI_VERSION: JInt = JNI_VERSION;
+
+const JNI_VERSION_1_1: JInt = 0x0001_0001;
+const JNI_VERSION_1_2: JInt = 0x0001_0002;
+const JNI_VERSION_1_4: JInt = 0x0001_0004;
+const JNI_VERSION_1_6: JInt = 0x0001_0006;
+
+fn is_supported_jni_version(version: JInt) -> bool {
+    matches!(
+        version,
+        JNI_VERSION_1_1 | JNI_VERSION_1_2 | JNI_VERSION_1_4 | JNI_VERSION_1_6 | JNI_VERSION
+    )
+}
 
 // ---------------------------------------------------------------------------
 // JNI Invocation-API argument structs (jni.h layout, `#[repr(C)]`).
@@ -277,13 +302,18 @@ pub extern "C" fn JNI_GetDefaultJavaVMInitArgs(args: *mut c_void) -> JInt {
         let init = unsafe { &mut *(args as *mut JavaVMInitArgs) };
         // HotSpot's GetDefaultJavaVMInitArgs returns JNI_EVERSION if the caller
         // pre-set a version it doesn't support, JNI_OK otherwise, and always
-        // writes back the supported version. We accept anything and report
-        // ours.
+        // writes back the supported version. We also accept version 0 as a
+        // compatibility "discover the default" request used by older examples.
+        let requested_version = init.version;
         init.version = JNI_VERSION;
         init.n_options = 0;
         init.options = std::ptr::null_mut();
         init.ignore_unrecognized = 0;
-        JNI_OK
+        if requested_version != 0 && !is_supported_jni_version(requested_version) {
+            JNI_EVERSION
+        } else {
+            JNI_OK
+        }
     }))
     .unwrap_or(JNI_ERR)
 }
@@ -326,58 +356,149 @@ pub extern "C" fn JNI_GetCreatedJavaVMs(
 // JNI_CreateJavaVM
 // ---------------------------------------------------------------------------
 
+// Errors while validating / parsing JavaVMInitArgs. JNI_CreateJavaVM maps
+// UnsupportedVersion to JNI_EVERSION and all option/shape errors to JNI_ERR.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum InitArgsError {
+    UnsupportedVersion(JInt),
+    InvalidArgs(&'static str),
+    InvalidOption(String),
+    UnrecognizedOption(String),
+}
+
+impl fmt::Display for InitArgsError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            InitArgsError::UnsupportedVersion(version) => {
+                write!(f, "unsupported JNI version 0x{version:08x}")
+            }
+            InitArgsError::InvalidArgs(msg) => f.write_str(msg),
+            InitArgsError::InvalidOption(msg) => f.write_str(msg),
+            InitArgsError::UnrecognizedOption(opt) => {
+                write!(f, "unrecognized JavaVM option {opt:?}")
+            }
+        }
+    }
+}
+
+fn validate_or_ignore(
+    ignore_unrecognized: bool,
+    error: InitArgsError,
+) -> Result<(), InitArgsError> {
+    if ignore_unrecognized {
+        Ok(())
+    } else {
+        Err(error)
+    }
+}
+
+unsafe fn option_to_str<'a>(
+    opts: &'a [JavaVMOption],
+    index: usize,
+    ignore_unrecognized: bool,
+) -> Result<Option<&'a str>, InitArgsError> {
+    let opt = &opts[index];
+    if opt.option_string.is_null() {
+        validate_or_ignore(
+            ignore_unrecognized,
+            InitArgsError::InvalidOption(format!("JavaVM option {index} has a null optionString")),
+        )?;
+        return Ok(None);
+    }
+    match std::ffi::CStr::from_ptr(opt.option_string).to_str() {
+        Ok(s) => Ok(Some(s)),
+        Err(_) => {
+            validate_or_ignore(
+                ignore_unrecognized,
+                InitArgsError::InvalidOption(format!("JavaVM option {index} is not valid UTF-8")),
+            )?;
+            Ok(None)
+        }
+    }
+}
+
 /// Parse a `JavaVMInitArgs` into a [`VmConfig`].
 ///
 /// Recognises the common HotSpot option forms an embedder is likely to pass:
 /// `-Xmx<size>`, `-cp`/`-classpath`/`--class-path <path>` (the path may be the
 /// next option or glued as `-cp=<path>`), and `-D<key>=<value>`. Unrecognised
-/// options are ignored (matching `ignoreUnrecognized`-friendly behaviour);
-/// they are never fatal in this first increment.
+/// options are ignored only when `ignoreUnrecognized` is non-zero.
 ///
 /// # Safety
 /// `args` must be a valid `*const JavaVMInitArgs` with `options` pointing at
 /// `n_options` valid, NUL-terminated [`JavaVMOption`] strings.
-unsafe fn config_from_args(args: *const JavaVMInitArgs) -> VmConfig {
+unsafe fn config_from_args(args: *const JavaVMInitArgs) -> Result<VmConfig, InitArgsError> {
     let mut cfg = VmConfig::with_host_jdk_default();
     if args.is_null() {
-        return cfg;
+        return Ok(cfg);
     }
     let init = &*args;
-    if init.options.is_null() || init.n_options <= 0 {
-        return cfg;
+    if !is_supported_jni_version(init.version) {
+        return Err(InitArgsError::UnsupportedVersion(init.version));
+    }
+    if init.n_options < 0 {
+        return Err(InitArgsError::InvalidArgs(
+            "JavaVMInitArgs.nOptions must not be negative",
+        ));
+    }
+    if init.n_options == 0 {
+        return Ok(cfg);
+    }
+    if init.options.is_null() {
+        return Err(InitArgsError::InvalidArgs(
+            "JavaVMInitArgs.options is null but nOptions is nonzero",
+        ));
     }
     let opts = std::slice::from_raw_parts(init.options, init.n_options as usize);
+    let ignore_unrecognized = init.ignore_unrecognized != 0;
 
     let mut classpath: Vec<String> = Vec::new();
     let mut i = 0usize;
     while i < opts.len() {
-        let opt = &opts[i];
-        if opt.option_string.is_null() {
+        let Some(s) = option_to_str(opts, i, ignore_unrecognized)? else {
             i += 1;
             continue;
-        }
-        let s = match std::ffi::CStr::from_ptr(opt.option_string).to_str() {
-            Ok(s) => s,
-            Err(_) => {
-                i += 1;
-                continue;
-            }
         };
 
         if let Some(size) = s.strip_prefix("-Xmx") {
             if let Some(bytes) = parse_mem_size(size) {
                 cfg = cfg.with_max_heap_size(bytes);
+            } else {
+                validate_or_ignore(
+                    ignore_unrecognized,
+                    InitArgsError::InvalidOption(format!("invalid -Xmx size in option {s:?}")),
+                )?;
             }
         } else if s == "-cp" || s == "-classpath" || s == "--class-path" {
             // Path is the following option.
             if let Some(next) = opts.get(i + 1) {
-                if !next.option_string.is_null() {
-                    if let Ok(p) = std::ffi::CStr::from_ptr(next.option_string).to_str() {
-                        push_classpath(&mut classpath, p);
+                if next.option_string.is_null() {
+                    validate_or_ignore(
+                        ignore_unrecognized,
+                        InitArgsError::InvalidOption(format!(
+                            "classpath option {s:?} has a null value"
+                        )),
+                    )?;
+                } else {
+                    match std::ffi::CStr::from_ptr(next.option_string).to_str() {
+                        Ok(p) => push_classpath(&mut classpath, p),
+                        Err(_) => validate_or_ignore(
+                            ignore_unrecognized,
+                            InitArgsError::InvalidOption(format!(
+                                "classpath value after option {s:?} is not valid UTF-8"
+                            )),
+                        )?,
                     }
                 }
                 i += 2;
                 continue;
+            } else {
+                validate_or_ignore(
+                    ignore_unrecognized,
+                    InitArgsError::InvalidOption(format!(
+                        "classpath option {s:?} requires a following value"
+                    )),
+                )?;
             }
         } else if let Some(p) = s
             .strip_prefix("-cp=")
@@ -391,15 +512,21 @@ unsafe fn config_from_args(args: *const JavaVMInitArgs) -> VmConfig {
             } else {
                 cfg.system_properties.push((def.to_string(), String::new()));
             }
+        } else if matches!(s, "vfprintf" | "exit" | "abort") {
+            // Standard Invocation API callbacks are recognized but unused.
+        } else {
+            validate_or_ignore(
+                ignore_unrecognized,
+                InitArgsError::UnrecognizedOption(s.to_string()),
+            )?;
         }
-        // else: unrecognised — ignored in increment 1.
         i += 1;
     }
 
     if !classpath.is_empty() {
         cfg = cfg.with_classpath(classpath);
     }
-    cfg
+    Ok(cfg)
 }
 
 /// Split a classpath string on the platform separator and append the parts.
@@ -458,8 +585,9 @@ fn bootstrap(vm: &mut Vm) {
 /// writes back the `JavaVM*` (invocation table) and `JNIEnv*` (function table).
 ///
 /// Returns [`JNI_OK`] on success, [`JNI_EEXIST`] if a VM already exists
-/// (one-VM-per-process), [`JNI_EINVAL`] on bad pointers, or [`JNI_ERR`] on a
-/// caught panic / unexpected failure.
+/// (one-VM-per-process), [`JNI_EVERSION`] for an unsupported requested JNI
+/// version, [`JNI_EINVAL`] on bad pointers, or [`JNI_ERR`] on invalid options,
+/// a caught panic, or an unexpected failure.
 ///
 /// # Safety
 /// `pvm` and `penv` must be writable out-pointers; `args`, when non-null, must
@@ -488,7 +616,11 @@ pub extern "C" fn JNI_CreateJavaVM(
         }
 
         // SAFETY: `args` is a valid `*const JavaVMInitArgs` or null (handled).
-        let config = unsafe { config_from_args(args as *const JavaVMInitArgs) };
+        let config = match unsafe { config_from_args(args as *const JavaVMInitArgs) } {
+            Ok(config) => config,
+            Err(InitArgsError::UnsupportedVersion(_)) => return JNI_EVERSION,
+            Err(_) => return JNI_ERR,
+        };
 
         let mut vm = Box::new(Vm::new(config));
         bootstrap(&mut vm);
@@ -585,11 +717,14 @@ fn destroy_created_vm() -> JInt {
 /// no-op for it. Returns [`JNI_OK`], or [`JNI_ERR`] if no VM exists.
 #[no_mangle]
 pub extern "C" fn cratonvm_thread_enter_native() -> JInt {
-    if host_thread_enter_native() {
-        JNI_OK
-    } else {
-        JNI_ERR
-    }
+    catch_unwind(AssertUnwindSafe(|| {
+        if host_thread_enter_native() {
+            JNI_OK
+        } else {
+            JNI_ERR
+        }
+    }))
+    .unwrap_or(JNI_ERR)
 }
 
 /// `jint cratonvm_thread_leave_native(void)`
@@ -600,11 +735,14 @@ pub extern "C" fn cratonvm_thread_enter_native() -> JInt {
 /// foreign attached thread. Returns [`JNI_OK`], or [`JNI_ERR`] if no VM exists.
 #[no_mangle]
 pub extern "C" fn cratonvm_thread_leave_native() -> JInt {
-    if host_thread_leave_native() {
-        JNI_OK
-    } else {
-        JNI_ERR
-    }
+    catch_unwind(AssertUnwindSafe(|| {
+        if host_thread_leave_native() {
+            JNI_OK
+        } else {
+            JNI_ERR
+        }
+    }))
+    .unwrap_or(JNI_ERR)
 }
 
 // ===========================================================================
@@ -689,6 +827,14 @@ pub mod craton_tag {
     /// The call failed; inspect [`super::cratonvm_last_error`].
     pub const ERROR: JInt = -1;
 }
+
+pub const CRATON_TAG_VOID: JInt = craton_tag::VOID;
+pub const CRATON_TAG_INT: JInt = craton_tag::INT;
+pub const CRATON_TAG_LONG: JInt = craton_tag::LONG;
+pub const CRATON_TAG_FLOAT: JInt = craton_tag::FLOAT;
+pub const CRATON_TAG_DOUBLE: JInt = craton_tag::DOUBLE;
+pub const CRATON_TAG_OBJECT: JInt = craton_tag::OBJECT;
+pub const CRATON_TAG_ERROR: JInt = craton_tag::ERROR;
 
 /// A C-ABI tagged value exchanged with the flat API. `tag` is one of the
 /// [`craton_tag`] constants; `payload` is interpreted accordingly:
@@ -794,7 +940,8 @@ impl CratonValue {
 // monotonically increasing per-VM counter: tokens are never reused, so a token
 // for a destroyed table (or one the host invented) is rejected by a table miss
 // rather than aliasing a live entry (no ABA). Identical object refs dedup to a
-// single token so repeated returns of one object do not grow the table.
+// single token with a reference count, so repeated returns of one object do not
+// grow the table and `cratonvm_release_ref` can release each returned token.
 // ---------------------------------------------------------------------------
 
 use std::collections::HashMap;
@@ -803,14 +950,22 @@ use std::sync::OnceLock;
 use cratonvm_vm::native::jni::JObject;
 use cratonvm_vm::SharedVm;
 
-/// One VM's opaque-token ↔ global-ref mapping.
+/// One live opaque object token.
+struct VmHandleEntry {
+    /// The `JniGlobalRefs` handle that owns the GC-rooted `ObjectRef`.
+    gref: JObject,
+    /// Number of live API returns that handed this token to the host.
+    refs: usize,
+}
+
+/// One VM's opaque-token to global-ref mapping.
 #[derive(Default)]
 struct VmHandleTable {
     /// Next token to hand out. Starts at 1 (`0` is the reserved null token) and
     /// only ever increases, so a token is never reused for a different object.
     next_token: u64,
-    /// token → the `JniGlobalRefs` handle that owns the GC-rooted `ObjectRef`.
-    by_token: HashMap<u64, JObject>,
+    /// token -> GC-rooted entry.
+    by_token: HashMap<u64, VmHandleEntry>,
 }
 
 /// Process-global registry of per-VM handle tables, keyed by the `SharedVm`'s
@@ -845,11 +1000,12 @@ fn register_handle(shared: &SharedVm, o: Option<ObjectRef>) -> CratonRef {
     let mut grefs = shared.jni_global_refs.lock();
     // Dedup by resolving each global ref to its current post-GC address. This
     // keeps the table correct when a moving collector rewrites the global refs.
-    for (&tok, &gref) in &table.by_token {
+    for (&tok, entry) in &mut table.by_token {
         if grefs
-            .resolve(gref)
+            .resolve(entry.gref)
             .is_some_and(|current| current.as_ptr() == oref.as_ptr())
         {
+            entry.refs = entry.refs.saturating_add(1);
             return tok;
         }
     }
@@ -857,7 +1013,7 @@ fn register_handle(shared: &SharedVm, o: Option<ObjectRef>) -> CratonRef {
     let gref = grefs.add(oref);
     table.next_token = table.next_token.checked_add(1).unwrap_or(1).max(1);
     let tok = table.next_token;
-    table.by_token.insert(tok, gref);
+    table.by_token.insert(tok, VmHandleEntry { gref, refs: 1 });
     tok
 }
 
@@ -871,10 +1027,35 @@ fn resolve_handle(shared: &SharedVm, h: CratonRef) -> Option<ObjectRef> {
         return None;
     }
     let tables = handle_tables().lock().ok()?;
-    let gref = *tables.get(&vm_key(shared))?.by_token.get(&h)?;
+    let gref = tables.get(&vm_key(shared))?.by_token.get(&h)?.gref;
     // `JniGlobalRefs::resolve` validates the gref is still live and returns the
     // current (post-GC) address.
     shared.jni_global_refs.lock().resolve(gref)
+}
+
+fn release_handle(shared: &SharedVm, h: CratonRef) -> bool {
+    if h == 0 {
+        return true;
+    }
+    let mut tables = match handle_tables().lock() {
+        Ok(tables) => tables,
+        Err(_) => return false,
+    };
+    let Some(table) = tables.get_mut(&vm_key(shared)) else {
+        return false;
+    };
+    let Some(entry) = table.by_token.get_mut(&h) else {
+        return false;
+    };
+    if entry.refs > 1 {
+        entry.refs -= 1;
+        return true;
+    }
+    let entry = table
+        .by_token
+        .remove(&h)
+        .expect("entry was present while releasing handle");
+    shared.jni_global_refs.lock().remove(entry.gref)
 }
 
 fn decode_craton_args(api: &str, shared: &SharedVm, args: &[CratonValue]) -> Option<Vec<Value>> {
@@ -907,8 +1088,8 @@ fn drop_handle_table(shared: &SharedVm) {
     if let Ok(mut tables) = handle_tables().lock() {
         if let Some(table) = tables.remove(&vm_key(shared)) {
             let mut grefs = shared.jni_global_refs.lock();
-            for gref in table.by_token.into_values() {
-                grefs.remove(gref);
+            for entry in table.by_token.into_values() {
+                grefs.remove(entry.gref);
             }
         }
     }
@@ -946,7 +1127,9 @@ fn clear_last_error() {
 /// null (defaults are used). Reuses the exact `Vm::new` + [`bootstrap`] +
 /// `set_jni_context_arc` path the Invocation API uses, so the returned handle's
 /// thread may immediately invoke. Returns null on failure (and sets the
-/// thread's last error, retrievable via [`cratonvm_last_error`]).
+/// thread's last error, retrievable via [`cratonvm_last_error`]). Non-null
+/// init args must request a supported JNI version; unrecognized or malformed
+/// options fail unless `ignoreUnrecognized` is non-zero.
 /// Fails if a JNI Invocation-API VM or another flat `CratonVm` is already
 /// active in this process.
 ///
@@ -978,7 +1161,13 @@ pub extern "C" fn cratonvm_create(args: *const JavaVMInitArgs) -> *mut CratonVm 
         };
         // SAFETY: caller contract — `args` is a valid `*const JavaVMInitArgs`
         // or null (handled inside `config_from_args`).
-        let config = unsafe { config_from_args(args) };
+        let config = match unsafe { config_from_args(args) } {
+            Ok(config) => config,
+            Err(e) => {
+                set_last_error(format!("cratonvm_create: {e}"));
+                return std::ptr::null_mut();
+            }
+        };
         let mut vm = Vm::new(config);
         bootstrap(&mut vm);
         // (`Vm::new` already published the process-global VM cell.)
@@ -1031,6 +1220,42 @@ pub extern "C" fn cratonvm_destroy(vm: *mut CratonVm) {
         drop(boxed);
         release_flat_vm(vm_key);
     }));
+}
+
+/// `jint cratonvm_release_ref(CratonVm *vm, CratonRef reference)`
+///
+/// Release one live object/string/throwable token previously returned by this
+/// VM. Passing `0` (Java null) is a no-op success. Releasing a nonzero token
+/// invalidates one returned handle; when all returns of that token have been
+/// balanced, the backing JNI global ref is removed and the object is no longer
+/// pinned as a GC root by libcratonvm.
+///
+/// # Safety
+/// `vm` must be a handle returned by [`cratonvm_create`] that has not already
+/// been destroyed, or null. `reference` must be `0` or a live [`CratonRef`]
+/// returned by this VM and not already fully released.
+#[no_mangle]
+pub extern "C" fn cratonvm_release_ref(vm: *mut CratonVm, reference: CratonRef) -> JInt {
+    catch_unwind(AssertUnwindSafe(|| {
+        clear_last_error();
+        // SAFETY: `vm` per caller contract.
+        unsafe {
+            with_vm(vm, JNI_ERR, |h| {
+                if release_handle(&h.vm.shared, reference) {
+                    JNI_OK
+                } else {
+                    set_last_error(format!(
+                        "cratonvm_release_ref: stale or unknown CratonRef object token 0x{reference:x}"
+                    ));
+                    JNI_ERR
+                }
+            })
+        }
+    }))
+    .unwrap_or_else(|_| {
+        set_last_error("cratonvm_release_ref: panic");
+        JNI_ERR
+    })
 }
 
 // --- helpers to deref the handle safely ------------------------------------
@@ -2060,6 +2285,19 @@ mod tests {
     }
 
     #[test]
+    fn default_init_args_rejects_unsupported_version() {
+        let mut args = JavaVMInitArgs {
+            version: 0x0001_0009,
+            n_options: 0,
+            options: std::ptr::null_mut(),
+            ignore_unrecognized: 0,
+        };
+        let rc = JNI_GetDefaultJavaVMInitArgs(&mut args as *mut _ as *mut c_void);
+        assert_eq!(rc, JNI_EVERSION);
+        assert_eq!(args.version, JNI_VERSION);
+    }
+
+    #[test]
     fn default_init_args_null_is_err() {
         assert_eq!(JNI_GetDefaultJavaVMInitArgs(std::ptr::null_mut()), JNI_ERR);
     }
@@ -2105,6 +2343,47 @@ mod tests {
             push_classpath(&mut out, "a.jar:b.jar::c.jar");
         }
         assert_eq!(out, vec!["a.jar", "b.jar", "c.jar"]);
+    }
+
+    #[test]
+    fn config_from_args_rejects_unsupported_jni_version() {
+        let args = JavaVMInitArgs {
+            version: 0x0001_0009,
+            n_options: 0,
+            options: std::ptr::null_mut(),
+            ignore_unrecognized: 1,
+        };
+        let result = unsafe { config_from_args(&args) };
+        assert_eq!(
+            result.err(),
+            Some(InitArgsError::UnsupportedVersion(0x0001_0009))
+        );
+    }
+
+    #[test]
+    fn config_from_args_honors_ignore_unrecognized() {
+        let unknown = std::ffi::CString::new("-XX:NoSuchCratonOption").unwrap();
+        let mut opts = [JavaVMOption {
+            option_string: unknown.as_ptr() as *mut c_char,
+            extra_info: std::ptr::null_mut(),
+        }];
+        let mut args = JavaVMInitArgs {
+            version: JNI_VERSION,
+            n_options: opts.len() as JInt,
+            options: opts.as_mut_ptr(),
+            ignore_unrecognized: 0,
+        };
+
+        let result = unsafe { config_from_args(&args) };
+        assert_eq!(
+            result.err(),
+            Some(InitArgsError::UnrecognizedOption(
+                "-XX:NoSuchCratonOption".to_string()
+            ))
+        );
+
+        args.ignore_unrecognized = 1;
+        assert!(unsafe { config_from_args(&args) }.is_ok());
     }
 
     // -- Layer 2 flat C API ------------------------------------------------
@@ -2231,6 +2510,36 @@ mod tests {
     }
 
     #[test]
+    fn release_handle_balances_deduped_object_tokens() {
+        let shared = SharedVm::new(VmConfig::default());
+        // SAFETY: this aligned fake ref is stored in JniGlobalRefs and compared
+        // by address; the test never dereferences it as a heap object.
+        let obj = unsafe { ObjectRef::from_raw(0x3000 as *mut u8) };
+
+        let first = register_handle(&shared, Some(obj));
+        let second = register_handle(&shared, Some(obj));
+        assert_eq!(second, first, "same object should dedup to one token");
+
+        assert!(release_handle(&shared, first));
+        assert!(
+            resolve_handle(&shared, first).is_some(),
+            "one release should leave the deduped token live"
+        );
+
+        assert!(release_handle(&shared, second));
+        assert!(
+            resolve_handle(&shared, first).is_none(),
+            "balanced releases should remove the token"
+        );
+        assert!(
+            !release_handle(&shared, first),
+            "fully released tokens must be rejected as stale"
+        );
+
+        drop_handle_table(&shared);
+    }
+
+    #[test]
     fn null_object_handle_resolves_to_null_without_vm() {
         // The reserved null token (`0`) must short-circuit before any handle
         // table or `SharedVm` access, so a dangling reference is safe here.
@@ -2239,6 +2548,7 @@ mod tests {
         assert!(resolve_handle(shared, 0).is_none());
         // `register_handle(None)` likewise returns the null token without access.
         assert_eq!(register_handle(shared, None), 0);
+        assert!(release_handle(shared, 0));
     }
 
     #[test]
@@ -2460,6 +2770,13 @@ mod tests {
         cratonvm_destroy(std::ptr::null_mut());
     }
 
+    #[test]
+    fn release_ref_null_handle_returns_err() {
+        clear_last_error();
+        assert_eq!(cratonvm_release_ref(std::ptr::null_mut(), 0), JNI_ERR);
+        assert!(last_error_string().is_some());
+    }
+
     #[cfg(not(flat_api_live_vm))]
     #[test]
     fn flat_vm_state_allows_only_one_active_surface() {
@@ -2643,24 +2960,48 @@ mod tests {
             let desc_j = CString::new("J").unwrap();
             let mut idx_i: JInt = -1;
             assert_eq!(
-                cratonvm_field_index_desc(vm, scls, hash_name.as_ptr(), desc_i.as_ptr(), &mut idx_i),
+                cratonvm_field_index_desc(
+                    vm,
+                    scls,
+                    hash_name.as_ptr(),
+                    desc_i.as_ptr(),
+                    &mut idx_i
+                ),
                 JNI_OK,
                 "field_index_desc(String.hash, I) failed: {:?}",
                 last_error_string()
             );
-            assert_eq!(idx_i, hash_idx, "descriptor-matched slot must equal name-only slot");
+            assert_eq!(
+                idx_i, hash_idx,
+                "descriptor-matched slot must equal name-only slot"
+            );
             let mut idx_j: JInt = -1;
             assert_eq!(
-                cratonvm_field_index_desc(vm, scls, hash_name.as_ptr(), desc_j.as_ptr(), &mut idx_j),
+                cratonvm_field_index_desc(
+                    vm,
+                    scls,
+                    hash_name.as_ptr(),
+                    desc_j.as_ptr(),
+                    &mut idx_j
+                ),
                 JNI_ERR,
                 "field_index_desc(String.hash, J) should not match an int field"
             );
             let mut idx_n: JInt = -1;
             assert_eq!(
-                cratonvm_field_index_desc(vm, scls, hash_name.as_ptr(), std::ptr::null(), &mut idx_n),
+                cratonvm_field_index_desc(
+                    vm,
+                    scls,
+                    hash_name.as_ptr(),
+                    std::ptr::null(),
+                    &mut idx_n
+                ),
                 JNI_OK
             );
-            assert_eq!(idx_n, hash_idx, "null descriptor must be name-only resolution");
+            assert_eq!(
+                idx_n, hash_idx,
+                "null descriptor must be name-only resolution"
+            );
         }
         // name-based read agrees with index-based read at the resolved slot.
         let by_name = cratonvm_get_field_by_name(vm, s, hash_name.as_ptr());
@@ -2717,6 +3058,13 @@ mod tests {
         assert_eq!(cratonvm_load_class(vm, bad.as_ptr(), &mut bad_cls), JNI_ERR);
         assert!(last_error_string().is_some());
 
+        assert_eq!(
+            cratonvm_release_ref(vm, s),
+            JNI_OK,
+            "release_ref failed: {:?}",
+            last_error_string()
+        );
+
         cratonvm_destroy(vm);
     }
 
@@ -2753,7 +3101,10 @@ mod tests {
             .filter_map(|s| usize::from_str_radix(s, 16).ok())
             .collect();
         for (rva, name) in cratonvm_vm::runtime::crash_handler::symbolize_rvas(&rvas) {
-            eprintln!("0x{rva:x} => {}", name.unwrap_or_else(|| "<unresolved>".to_string()));
+            eprintln!(
+                "0x{rva:x} => {}",
+                name.unwrap_or_else(|| "<unresolved>".to_string())
+            );
         }
     }
 
@@ -2793,7 +3144,12 @@ mod tests {
             &mut env as *mut *mut c_void,
             &mut args as *mut JavaVMInitArgs as *mut c_void,
         );
-        assert_eq!(rc, JNI_OK, "JNI_CreateJavaVM failed: {:?}", last_error_string());
+        assert_eq!(
+            rc,
+            JNI_OK,
+            "JNI_CreateJavaVM failed: {:?}",
+            last_error_string()
+        );
         assert!(!vm.is_null() && !env.is_null());
 
         // Read a JNIEnv/JavaVM function-table slot (the tables are
@@ -2807,8 +3163,7 @@ mod tests {
         // handles are GC-stable integers (a ClassId-as-handle and an encoded
         // method id), so they are shareable across threads.
         type FindClassFn = extern "C" fn(*mut c_void, *const c_char) -> u64;
-        type GetStaticMidFn =
-            extern "C" fn(*mut c_void, u64, *const c_char, *const c_char) -> u64;
+        type GetStaticMidFn = extern "C" fn(*mut c_void, u64, *const c_char, *const c_char) -> u64;
         let find_class: FindClassFn =
             unsafe { std::mem::transmute(tbl_slot(env as *const *const usize, 6)) };
         let get_static_mid: GetStaticMidFn =
@@ -2884,7 +3239,10 @@ mod tests {
         };
 
         let parse_env = |k: &str, d: usize| -> usize {
-            std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
+            std::env::var(k)
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(d)
         };
         let k_threads = parse_env("CRATONVM_SOAK_K", 6);
         let iters = parse_env("CRATONVM_SOAK_ITERS", 4000);
@@ -2897,76 +3255,81 @@ mod tests {
             // Host threads must give the VM interpreter enough native stack; the
             // debug interpreter recurses deeply (the VM's own worker carriers use
             // 8 MiB). Rust's ~2 MiB default thread stack is too small.
-            handles.push(std::thread::Builder::new()
-                .name(format!("foreign-{t}"))
-                .stack_size(16 * 1024 * 1024)
-                .spawn(move || {
-                let vm = shared.vm as *const *const usize;
-                type AttachFn =
-                    extern "C" fn(*const *const usize, *mut *mut c_void, *mut c_void) -> JInt;
-                type DetachFn = extern "C" fn(*const *const usize) -> JInt;
-                type CallObjAFn =
-                    extern "C" fn(*mut c_void, u64, u64, *const c_void) -> u64;
-                type DeleteLocalFn = extern "C" fn(*mut c_void, u64);
-                // SAFETY: vm is the process-global invocation table.
-                let attach: AttachFn = unsafe { std::mem::transmute(*(*vm).add(4)) };
-                let detach: DetachFn = unsafe { std::mem::transmute(*(*vm).add(5)) };
+            handles.push(
+                std::thread::Builder::new()
+                    .name(format!("foreign-{t}"))
+                    .stack_size(16 * 1024 * 1024)
+                    .spawn(move || {
+                        let vm = shared.vm as *const *const usize;
+                        type AttachFn = extern "C" fn(
+                            *const *const usize,
+                            *mut *mut c_void,
+                            *mut c_void,
+                        ) -> JInt;
+                        type DetachFn = extern "C" fn(*const *const usize) -> JInt;
+                        type CallObjAFn =
+                            extern "C" fn(*mut c_void, u64, u64, *const c_void) -> u64;
+                        type DeleteLocalFn = extern "C" fn(*mut c_void, u64);
+                        // SAFETY: vm is the process-global invocation table.
+                        let attach: AttachFn = unsafe { std::mem::transmute(*(*vm).add(4)) };
+                        let detach: DetachFn = unsafe { std::mem::transmute(*(*vm).add(5)) };
 
-                let mut wenv: *mut c_void = std::ptr::null_mut();
-                let arc = attach(vm, &mut wenv as *mut *mut c_void, std::ptr::null_mut());
-                assert_eq!(arc, JNI_OK, "AttachCurrentThread failed on worker {t}");
-                assert!(!wenv.is_null());
+                        let mut wenv: *mut c_void = std::ptr::null_mut();
+                        let arc = attach(vm, &mut wenv as *mut *mut c_void, std::ptr::null_mut());
+                        assert_eq!(arc, JNI_OK, "AttachCurrentThread failed on worker {t}");
+                        assert!(!wenv.is_null());
 
-                type CallVoidAFn = extern "C" fn(*mut c_void, u64, u64, *const c_void);
-                let call: CallObjAFn = unsafe {
-                    std::mem::transmute(*(*(wenv as *const *const usize)).add(116))
-                };
-                let call_void: CallVoidAFn = unsafe {
-                    std::mem::transmute(*(*(wenv as *const *const usize)).add(143))
-                };
-                let delete_local: DeleteLocalFn = unsafe {
-                    std::mem::transmute(*(*(wenv as *const *const usize)).add(24))
-                };
+                        type CallVoidAFn = extern "C" fn(*mut c_void, u64, u64, *const c_void);
+                        let call: CallObjAFn = unsafe {
+                            std::mem::transmute(*(*(wenv as *const *const usize)).add(116))
+                        };
+                        let call_void: CallVoidAFn = unsafe {
+                            std::mem::transmute(*(*(wenv as *const *const usize)).add(143))
+                        };
+                        let delete_local: DeleteLocalFn = unsafe {
+                            std::mem::transmute(*(*(wenv as *const *const usize)).add(24))
+                        };
 
-                let mut local = 0usize;
-                for i in 0..iters {
-                    // jvalue: an `I` arg occupies the low 4 bytes of the union.
-                    let jv: i64 = ((t * iters + i) as i32) as i64;
-                    let s = call(
-                        wenv,
-                        shared.cls,
-                        shared.mid,
-                        &jv as *const i64 as *const c_void,
-                    );
-                    if s != 0 {
-                        local += 1;
-                        // Free the per-call result promptly to bound the live set.
-                        delete_local(wenv, s);
-                    }
-                    // EVERY foreign thread periodically forces a stop-the-world
-                    // GC while its siblings are mid-call — the strongest form of
-                    // the participation path under test: N concurrent initiators
-                    // racing `request_stw` (one wins, the losers fall through to
-                    // `safepoint_check` and arrive). This previously deadlocked on
-                    // the multi-thread-STW barrier bugs (generation-reuse in
-                    // `arrive_and_wait`, the blocked-region wait-out, terminate-
-                    // without-arrive, and a forced-GC young-arena over-expansion);
-                    // those are fixed (see vm/src/threading/gc_barrier.rs and the
-                    // `collect_garbage_inner` expansion gate), so the concurrent
-                    // form is restored. NOTE: a *separate*, deeper residual —
-                    // monitor-ownership desync in Java `Thread.join` under
-                    // concurrent GC (scratch_churn/Churn.java) — does NOT affect
-                    // this soak: foreign workers detach via the host join, never
-                    // Java `Thread.join`.
-                    if i % 64 == 0 {
-                        call_void(wenv, shared.sys_cls, shared.gc_mid, std::ptr::null());
-                    }
-                }
-                total_calls.fetch_add(local, Ordering::Relaxed);
-                let dr = detach(vm);
-                assert_eq!(dr, JNI_OK, "DetachCurrentThread failed on worker {t}");
-            })
-            .expect("failed to spawn foreign host thread"));
+                        let mut local = 0usize;
+                        for i in 0..iters {
+                            // jvalue: an `I` arg occupies the low 4 bytes of the union.
+                            let jv: i64 = ((t * iters + i) as i32) as i64;
+                            let s = call(
+                                wenv,
+                                shared.cls,
+                                shared.mid,
+                                &jv as *const i64 as *const c_void,
+                            );
+                            if s != 0 {
+                                local += 1;
+                                // Free the per-call result promptly to bound the live set.
+                                delete_local(wenv, s);
+                            }
+                            // EVERY foreign thread periodically forces a stop-the-world
+                            // GC while its siblings are mid-call — the strongest form of
+                            // the participation path under test: N concurrent initiators
+                            // racing `request_stw` (one wins, the losers fall through to
+                            // `safepoint_check` and arrive). This previously deadlocked on
+                            // the multi-thread-STW barrier bugs (generation-reuse in
+                            // `arrive_and_wait`, the blocked-region wait-out, terminate-
+                            // without-arrive, and a forced-GC young-arena over-expansion);
+                            // those are fixed (see vm/src/threading/gc_barrier.rs and the
+                            // `collect_garbage_inner` expansion gate), so the concurrent
+                            // form is restored. NOTE: a *separate*, deeper residual —
+                            // monitor-ownership desync in Java `Thread.join` under
+                            // concurrent GC (scratch_churn/Churn.java) — does NOT affect
+                            // this soak: foreign workers detach via the host join, never
+                            // Java `Thread.join`.
+                            if i % 64 == 0 {
+                                call_void(wenv, shared.sys_cls, shared.gc_mid, std::ptr::null());
+                            }
+                        }
+                        total_calls.fetch_add(local, Ordering::Relaxed);
+                        let dr = detach(vm);
+                        assert_eq!(dr, JNI_OK, "DetachCurrentThread failed on worker {t}");
+                    })
+                    .expect("failed to spawn foreign host thread"),
+            );
         }
 
         // Deadlock watchdog: if the workers do not all finish within the
@@ -3001,7 +3364,9 @@ mod tests {
                         vm.gc_barrier.pending_count(),
                     );
                     for (tid, blocked, snap) in vm.thread_registry.dump_blocked_states() {
-                        eprintln!("[soak/watchdog]   tid={tid} blocked={blocked} snapshot_len={snap}");
+                        eprintln!(
+                            "[soak/watchdog]   tid={tid} blocked={blocked} snapshot_len={snap}"
+                        );
                     }
                 }
                 std::process::abort();
@@ -3016,7 +3381,8 @@ mod tests {
         assert_eq!(cratonvm_thread_enter_native(), JNI_OK);
 
         for h in handles {
-            h.join().expect("a worker thread panicked (UAF/crash or failed assert)");
+            h.join()
+                .expect("a worker thread panicked (UAF/crash or failed assert)");
         }
         finished.store(true, Ordering::Release);
 

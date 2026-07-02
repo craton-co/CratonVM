@@ -19,9 +19,9 @@
 //! ```
 //!
 //! With `CRATONVM_REGEN_HEADER` set, the script invokes the `cbindgen` CLI with
-//! `cbindgen.toml` and overwrites the checked-in header. The header is otherwise
-//! maintained by hand to stay byte-compatible with `cbindgen.toml`, so a
-//! regeneration produces a no-op diff.
+//! `cbindgen.toml` and overwrites the checked-in header. The checked-in header
+//! is maintained by hand to stay ABI-compatible with `cbindgen.toml`; a
+//! regeneration may still differ in comments or JNI-style field spelling.
 
 use std::path::Path;
 use std::process::Command;

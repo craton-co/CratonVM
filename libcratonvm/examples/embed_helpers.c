@@ -111,6 +111,13 @@ int main(void) {
     printf("field_index_desc String.hash: I->slot %d, NULL->slot %d, J->no-match (ok)\n",
            idx_i, idx_n);
 
+    if (cratonvm_release_ref(vm, cratonvm_as_object(rv)) != 0 ||
+        cratonvm_release_ref(vm, cratonvm_as_object(sub)) != 0 ||
+        cratonvm_release_ref(vm, s) != 0) {
+        fprintf(stderr, "release_ref failed: %s\n", cratonvm_last_error(vm));
+        return 1;
+    }
+
     cratonvm_destroy(vm);
     printf("embed_helpers: OK\n");
     return 0;
