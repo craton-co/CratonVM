@@ -1171,24 +1171,19 @@ fn engine_load(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult 
     };
 
     // Bridge the parsed keystore into the rustls-backed TLS engine: install the
-    // first key entry as the server identity, and register every cert as an
-    // extra client trust anchor (so an in-process loopback HTTPS client trusts
-    // the embedded server). Harmless for non-TLS keystore uses.
+    // first key entry as the server identity. Trust anchors are intentionally
+    // not mirrored into any process-global TLS root set here; explicit
+    // truststores are scoped by TrustManagerFactory/SSLContext instead.
     let mut first_key_identity: Option<(Vec<u8>, Vec<Vec<u8>>)> = None;
     for entry in store.entries.values() {
         match &entry.kind {
             EntryKind::PrivateKey { key_der, chain } => {
                 crate::t27_tls::install_identity_from_der(key_der, chain);
-                for c in chain {
-                    crate::t27_tls::add_extra_trust_root_der(c.clone());
-                }
                 if first_key_identity.is_none() {
                     first_key_identity = Some((key_der.clone(), chain.clone()));
                 }
             }
-            EntryKind::TrustedCert { cert_der } => {
-                crate::t27_tls::add_extra_trust_root_der(cert_der.clone());
-            }
+            EntryKind::TrustedCert { .. } => {}
         }
     }
 
@@ -1444,9 +1439,6 @@ fn engine_set_certificate_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> 
         // throw KeyStoreException, but a valid Certificate always encodes).
         return Ok(None);
     }
-    // Mirror into the rustls trust set too (harmless for non-TLS uses), matching
-    // engine_load's bridging.
-    crate::t27_tls::add_extra_trust_root_der(der.clone());
     keystore_set_cert_entry(id, &alias, der);
     Ok(None)
 }
