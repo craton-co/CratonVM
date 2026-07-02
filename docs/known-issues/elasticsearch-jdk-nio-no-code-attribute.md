@@ -68,3 +68,32 @@ C:\craton\CratonVM-elasticsearch-current-suite-20260702\apps\elasticsearch-suite
 C:\craton\CratonVM-elasticsearch-current-suite-20260702\apps\elasticsearch-suite-runner\.suite\results\es-current-full-jiton-20260702\all-jit\logs\server.org.elasticsearch.index.engine.InternalEngineFieldInfoCachingTests.out.log
 C:\craton\CratonVM-elasticsearch-current-suite-20260702\apps\elasticsearch-suite-runner\.suite\results\es-current-full-jiton-20260702\all-jit\logs\server.org.elasticsearch.index.query.functionscore.FunctionScoreEquivalenceTests.out.log
 ```
+
+## No-JIT partial evidence
+
+Run `es-nojit-full-20260702` was stopped by request after 1366 recorded
+classes. The partial no-JIT run produced 9 log files with:
+
+```text
+java.lang.AbstractMethodError: method java/nio/Buffer.isReadOnly()Z has no Code attribute
+```
+
+Representative no-JIT row:
+
+```text
+index=1363
+module=server
+class=org.elasticsearch.index.codec.vectors.ES815BitFlatVectorFormatTests
+CratonVM no-JIT=FAIL, 106.824s
+HotSpot=FAIL
+```
+
+Other no-JIT examples include `ES940DiskBBQBFloat16VectorsFormatTests`,
+`ESNextOversamplingMetaTests`, `ES818BinaryQuantizedVectorsFormatTests`, and
+`ES93BinaryQuantizedVectorsFormatTests`.
+
+Evidence:
+
+```text
+C:\craton\CratonVM-elasticsearch-nojit-suite-20260702\apps\elasticsearch-suite-runner\.suite\results\es-nojit-full-20260702\all-nojit\logs\server.org.elasticsearch.index.codec.vectors.ES815BitFlatVectorFormatTests.out.log
+```

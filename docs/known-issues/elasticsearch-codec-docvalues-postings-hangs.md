@@ -60,3 +60,33 @@ C:\craton\CratonVM-elasticsearch-current-suite-20260702\apps\elasticsearch-suite
 C:\craton\CratonVM-elasticsearch-current-suite-20260702\apps\elasticsearch-suite-runner\.suite\results\es-current-full-jiton-20260702\all-jit\logs\server.org.elasticsearch.index.codec.bloomfilter.ES85BloomFilterPostingsFormatTests.out.log
 C:\craton\CratonVM-elasticsearch-full-suite-20260702\apps\elasticsearch-suite-runner\.suite\results\es-full-hotspot-20260702\hotspot-jit\results.tsv
 ```
+
+## No-JIT partial evidence
+
+Run `es-nojit-full-20260702` was stopped by request after 1366 recorded
+classes. The partial no-JIT run found 9 codec/doc-values/postings HANG rows:
+
+- 6 were CratonVM-only versus HotSpot PASS.
+- 3 overlapped HotSpot baseline failures.
+- The same 300-second runner timeout was used.
+
+Additional no-JIT classes in this family include
+`ES819TSDBDocValuesFormatTests` and `ES95TSDBDocValuesFormatTests`; under
+JIT-on those classes crashed, while no-JIT hung.
+
+Representative no-JIT row:
+
+```text
+index=1341
+module=server
+class=org.elasticsearch.index.codec.bloomfilter.ES85BloomFilterPostingsFormatTests
+CratonVM no-JIT=HANG, 300.050s
+HotSpot=PASS, 54.417s
+```
+
+Evidence:
+
+```text
+C:\craton\CratonVM-elasticsearch-nojit-suite-20260702\apps\elasticsearch-suite-runner\.suite\results\es-nojit-full-20260702\all-nojit\results.tsv
+C:\craton\CratonVM-elasticsearch-nojit-suite-20260702\apps\elasticsearch-suite-runner\.suite\results\es-nojit-full-20260702\all-nojit\logs\server.org.elasticsearch.index.codec.bloomfilter.ES85BloomFilterPostingsFormatTests.out.log
+```

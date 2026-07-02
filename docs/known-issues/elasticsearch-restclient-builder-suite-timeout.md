@@ -57,3 +57,20 @@ C:\craton\CratonVM-elasticsearch-current-suite-20260702\apps\elasticsearch-suite
 C:\craton\CratonVM-elasticsearch-current-suite-20260702\apps\elasticsearch-suite-runner\.suite\results\es-current-full-jiton-20260702\all-jit\logs\server.org.elasticsearch.index.codec.vectors.es816.BinaryQuantizationTests.out.log
 C:\craton\CratonVM-elasticsearch-full-suite-20260702\apps\elasticsearch-suite-runner\.suite\results\es-full-hotspot-20260702\hotspot-jit\results.tsv
 ```
+
+## No-JIT partial evidence
+
+Run `es-nojit-full-20260702` was stopped by request after 1366 recorded
+classes. The partial no-JIT run reproduced both known timeout-accounting
+classes:
+
+```text
+index=16  org.elasticsearch.client.RestClientBuilderIntegTests  FAIL/PASS versus HotSpot
+index=1357 org.elasticsearch.index.codec.vectors.es816.BinaryQuantizationTests FAIL/FAIL versus HotSpot
+```
+
+Evidence:
+
+```text
+C:\craton\CratonVM-elasticsearch-nojit-suite-20260702\apps\elasticsearch-suite-runner\.suite\results\es-nojit-full-20260702\all-nojit\results.tsv
+```
