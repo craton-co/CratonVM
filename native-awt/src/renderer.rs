@@ -18,6 +18,15 @@ use std::f64::consts::PI;
 /// than any real surface needs while keeping the worst-case work bounded.
 const MAX_ARC_STEPS: usize = 1 << 16;
 
+/// Hard cap for one software rendering surface. At 4 bytes per ARGB pixel this
+/// bounds a renderer scratch buffer to 256 MiB before allocator overhead.
+pub const MAX_RENDERER_PIXELS: usize = 64 * 1024 * 1024;
+
+/// Maximum temporary pixels used by one `copyArea` chunk. The fallback path
+/// processes larger visible regions in chunks so caller-controlled extents do
+/// not translate into caller-controlled temporary allocations.
+const MAX_COPY_AREA_TEMP_PIXELS: usize = 1 << 20;
+
 // ── Supporting types ──────────────────────────────────────────────────
 
 /// Axis-aligned integer rectangle.
@@ -631,12 +640,21 @@ pub struct SoftwareRenderer {
 /// equals `safe_width * safe_height`, preserving the renderer invariant that
 /// `pixels.len() == width * height`.
 fn safe_buffer_dims(width: u32, height: u32) -> (u32, u32, usize) {
-    match width.checked_mul(height) {
-        Some(len) => (width, height, len as usize),
-        // Overflow: cannot represent `width * height` pixels. Degrade to a
-        // 1x1 surface rather than aborting the whole VM.
-        None => (1, 1, 1),
+    match width.checked_mul(height).map(|len| len as usize) {
+        Some(len) if len <= MAX_RENDERER_PIXELS => (width, height, len),
+        // Overflow or cap breach: degrade to a 1x1 surface rather than
+        // aborting the whole VM.
+        _ => (1, 1, 1),
     }
+}
+
+fn zeroed_pixels(len: usize) -> Option<Vec<u32>> {
+    let mut pixels = Vec::new();
+    if pixels.try_reserve_exact(len).is_err() {
+        return None;
+    }
+    pixels.resize(len, 0x00000000);
+    Some(pixels)
 }
 
 impl SoftwareRenderer {
@@ -645,9 +663,14 @@ impl SoftwareRenderer {
     /// If `width * height` overflows `usize` the surface is clamped to 1x1
     /// (see [`safe_buffer_dims`]); allocation never panics.
     pub fn new(width: u32, height: u32) -> Self {
-        let (width, height, len) = safe_buffer_dims(width, height);
+        let (mut width, mut height, len) = safe_buffer_dims(width, height);
+        let pixels = zeroed_pixels(len).unwrap_or_else(|| {
+            width = 0;
+            height = 0;
+            Vec::new()
+        });
         Self {
-            pixels: vec![0x00000000; len],
+            pixels,
             width,
             height,
             clip: None,
@@ -664,10 +687,15 @@ impl SoftwareRenderer {
     /// If `width * height` overflows `usize` the surface is clamped to 1x1
     /// (see [`safe_buffer_dims`]); reallocation never panics.
     pub fn resize(&mut self, width: u32, height: u32) {
-        let (width, height, len) = safe_buffer_dims(width, height);
+        let (mut width, mut height, len) = safe_buffer_dims(width, height);
+        let pixels = zeroed_pixels(len).unwrap_or_else(|| {
+            width = 0;
+            height = 0;
+            Vec::new()
+        });
         self.width = width;
         self.height = height;
-        self.pixels = vec![0x00000000; len];
+        self.pixels = pixels;
     }
 
     pub fn pixels(&self) -> &[u32] {
@@ -1443,6 +1471,33 @@ impl SoftwareRenderer {
         }
     }
 
+    fn copy_area_chunk_with_zeros(
+        &mut self,
+        temp: &mut Vec<u32>,
+        dst_x: i64,
+        dst_y: i64,
+        src_x: i64,
+        src_y: i64,
+        len: usize,
+        stride: usize,
+    ) {
+        temp.clear();
+        for offset in 0..len {
+            let sx = src_x + offset as i64;
+            let color =
+                if src_y >= 0 && src_y < self.height as i64 && sx >= 0 && sx < self.width as i64 {
+                    let idx = src_y as usize * stride + sx as usize;
+                    self.pixels[idx]
+                } else {
+                    0
+                };
+            temp.push(color);
+        }
+
+        let dst_start = dst_y as usize * stride + dst_x as usize;
+        self.pixels[dst_start..dst_start + len].copy_from_slice(temp);
+    }
+
     /// Copy a rectangular region within the buffer.
     pub fn copy_area(&mut self, x: i32, y: i32, w: u32, h: u32, dx: i32, dy: i32) {
         if w == 0 || h == 0 || (dx == 0 && dy == 0) {
@@ -1463,8 +1518,10 @@ impl SoftwareRenderer {
         // out-of-source area; to preserve identical behavior we keep that path
         // available, but the fast path is only used when the *entire* source
         // rect is in-bounds (the common case).
-        let full_src_in_bounds =
-            src_x0 == x && src_y0 == y && src_x1 == x + w as i32 && src_y1 == y + h as i32;
+        let full_src_in_bounds = src_x0 as i64 == x as i64
+            && src_y0 as i64 == y as i64
+            && src_x1 as i64 == x as i64 + w as i64
+            && src_y1 as i64 == y as i64 + h as i64;
 
         if full_src_in_bounds {
             // Compute destination rect (matching the source offset).
@@ -1543,41 +1600,67 @@ impl SoftwareRenderer {
         // each). `w * h` as a plain u32 multiply panics on overflow in debug
         // and wraps in release (under-sizing the temp buffer). Compute the
         // span in `usize` with `checked_mul` and bail rather than risk either.
-        let Some(temp_len) = (w as usize).checked_mul(h as usize) else {
+        let width = self.width as i64;
+        let height = self.height as i64;
+        let x = x as i64;
+        let y = y as i64;
+        let dx = dx as i64;
+        let dy = dy as i64;
+        let w = w as i64;
+        let h = h as i64;
+
+        let dst_x0 = x.saturating_add(dx);
+        let dst_y0 = y.saturating_add(dy);
+        let dst_x1 = dst_x0.saturating_add(w);
+        let dst_y1 = dst_y0.saturating_add(h);
+        let out_x0 = dst_x0.clamp(0, width);
+        let out_y0 = dst_y0.clamp(0, height);
+        let out_x1 = dst_x1.clamp(0, width);
+        let out_y1 = dst_y1.clamp(0, height);
+        if out_x0 >= out_x1 || out_y0 >= out_y1 {
             return;
-        };
-        let mut temp = Vec::with_capacity(temp_len);
-        for sy in 0..h as i32 {
-            for sx in 0..w as i32 {
-                let src_x = x + sx;
-                let src_y = y + sy;
-                if src_x >= 0
-                    && src_y >= 0
-                    && src_x < self.width as i32
-                    && src_y < self.height as i32
-                {
-                    temp.push(self.pixels[(src_y as u32 * self.width + src_x as u32) as usize]);
-                } else {
-                    temp.push(0);
-                }
-            }
         }
 
-        // Write to destination
-        for sy in 0..h as i32 {
-            for sx in 0..w as i32 {
-                let dst_x = x + sx + dx;
-                let dst_y = y + sy + dy;
-                if dst_x >= 0
-                    && dst_y >= 0
-                    && dst_x < self.width as i32
-                    && dst_y < self.height as i32
-                {
-                    let idx = (dst_y as u32 * self.width + dst_x as u32) as usize;
-                    // Index `temp` in `usize`: `sy * w` can exceed u32 range even
-                    // when `w * h` fits in `usize` (guaranteed above).
-                    let tidx = sy as usize * w as usize + sx as usize;
-                    self.pixels[idx] = temp[tidx];
+        let copy_w = (out_x1 - out_x0) as usize;
+        let copy_h = (out_y1 - out_y0) as usize;
+        let chunk_cap = copy_w.min(MAX_COPY_AREA_TEMP_PIXELS).max(1);
+        let mut temp = Vec::new();
+        if temp.try_reserve_exact(chunk_cap).is_err() {
+            return;
+        }
+        let stride = self.width as usize;
+
+        for row_index in 0..copy_h {
+            let row_offset = if dy > 0 {
+                copy_h - 1 - row_index
+            } else {
+                row_index
+            };
+            let dst_y = out_y0 + row_offset as i64;
+            let src_y = dst_y - dy;
+
+            if dy == 0 && dx > 0 {
+                let mut end = copy_w;
+                while end > 0 {
+                    let start = end.saturating_sub(chunk_cap);
+                    let len = end - start;
+                    let dst_x = out_x0 + start as i64;
+                    let src_x = dst_x - dx;
+                    self.copy_area_chunk_with_zeros(
+                        &mut temp, dst_x, dst_y, src_x, src_y, len, stride,
+                    );
+                    end = start;
+                }
+            } else {
+                let mut start = 0;
+                while start < copy_w {
+                    let len = (copy_w - start).min(chunk_cap);
+                    let dst_x = out_x0 + start as i64;
+                    let src_x = dst_x - dx;
+                    self.copy_area_chunk_with_zeros(
+                        &mut temp, dst_x, dst_y, src_x, src_y, len, stride,
+                    );
+                    start += len;
                 }
             }
         }
@@ -2292,6 +2375,23 @@ mod tests {
     }
 
     #[test]
+    fn test_non_overflowing_surface_above_cap_is_clamped() {
+        let mut r = SoftwareRenderer::new(8_193, 8_193);
+        assert_eq!(
+            r.pixels().len(),
+            (r.width() as usize) * (r.height() as usize)
+        );
+        assert!(r.pixels().len() <= MAX_RENDERER_PIXELS);
+
+        r.resize(8_193, 8_193);
+        assert_eq!(
+            r.pixels().len(),
+            (r.width() as usize) * (r.height() as usize)
+        );
+        assert!(r.pixels().len() <= MAX_RENDERER_PIXELS);
+    }
+
+    #[test]
     fn test_wu_line_antialias() {
         let mut r = SoftwareRenderer::new(10, 10);
         r.set_antialias(true);
@@ -2394,6 +2494,18 @@ mod tests {
         // Source rect starts at -8 (partly OOB → fallback path) with extents
         // whose product overflows u32.
         r.copy_area(-8, -8, 0xFFFF_FFFF, 0xFFFF_FFFF, 4, 4);
+    }
+
+    #[test]
+    fn test_copy_area_clips_temp_to_visible_destination() {
+        let mut r = SoftwareRenderer::new(16, 16);
+        r.set_color(0xFF_112233);
+        r.fill_rect(0, 0, 16, 16);
+
+        r.copy_area(-8, -8, i32::MAX as u32, i32::MAX as u32, 20, 20);
+
+        assert_eq!(r.pixels()[(12 * 16 + 12) as usize], 0);
+        assert_eq!(r.pixels()[0], 0xFF_112233);
     }
 
     #[test]

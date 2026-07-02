@@ -52,6 +52,12 @@ impl ImageType {
     }
 }
 
+/// Hard cap for a single Java-controlled ARGB raster. This matches the
+/// registry's 256 MiB soft budget at four bytes per pixel and prevents one
+/// live pinned `BufferedImage` from allocating multiple GiB before eviction can
+/// help.
+pub const MAX_IMAGE_PIXELS: usize = 64 * 1024 * 1024;
+
 // ── BufferedImageData ────────────────────────────────────────────────────
 
 /// Pixel buffer backing a `BufferedImage`.
@@ -78,11 +84,11 @@ impl BufferedImageData {
     /// overflow as a recoverable error.
     pub fn new(width: u32, height: u32, image_type: ImageType) -> Self {
         Self::try_new(width, height, image_type)
-            .expect("pixel-buffer size overflow in BufferedImageData::new")
+            .expect("pixel-buffer allocation rejected in BufferedImageData::new")
     }
 
-    /// Fallible constructor: returns `None` if `width * height` overflows
-    /// (the pixel count cannot be represented as a `u32`).
+    /// Fallible constructor: returns `None` if `width * height` overflows,
+    /// exceeds [`MAX_IMAGE_PIXELS`], or cannot be reserved.
     ///
     /// `BufferedImage.<init>` floors dimensions at 1 but never caps them, so
     /// Java-controlled sizes can reach ~2^31 per axis. The pixel count is the
@@ -91,16 +97,22 @@ impl BufferedImageData {
     /// the backing `Vec` is allocated, instead of overflowing the multiply.
     pub fn try_new(width: u32, height: u32, image_type: ImageType) -> Option<Self> {
         let len = width.checked_mul(height)? as usize;
+        if len > MAX_IMAGE_PIXELS {
+            return None;
+        }
         let fill = if image_type.has_alpha() {
             0x0000_0000 // transparent
         } else {
             0xFF00_0000 // opaque black
         };
+        let mut pixels = Vec::new();
+        pixels.try_reserve_exact(len).ok()?;
+        pixels.resize(len, fill);
         Some(BufferedImageData {
             image_type,
             width,
             height,
-            pixels: vec![fill; len],
+            pixels,
             next_graphics_id: 1,
         })
     }
@@ -585,6 +597,16 @@ mod tests {
         assert!(BufferedImageData::try_new(0xFFFF_FFFF, 0xFFFF_FFFF, ImageType::IntArgb).is_none());
         // A normal size still succeeds.
         assert!(BufferedImageData::try_new(16, 16, ImageType::IntArgb).is_some());
+    }
+
+    #[test]
+    fn try_new_rejects_non_overflowing_raster_above_cap() {
+        let side = 8_193u32;
+        assert!(
+            (side as usize) * (side as usize) > MAX_IMAGE_PIXELS,
+            "test dimensions must exceed the cap without overflowing"
+        );
+        assert!(BufferedImageData::try_new(side, side, ImageType::IntArgb).is_none());
     }
 
     #[test]
