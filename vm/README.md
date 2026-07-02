@@ -39,6 +39,21 @@ let mut vm = Vm::new(VmConfig::default());
 Pre-1.0. API stability is best-effort. Tied to the
 [CratonVM](https://github.com/craton-co/cratonvm) workspace version.
 
+## Build Fixtures
+
+`build.rs` compiles Java test fixtures only when `javac` is available. Generated
+`.class` files are staged under Cargo's `OUT_DIR/test-classes` and exposed to
+tests as `CRATONVM_TEST_CLASSES_DIR`; ordinary builds do not write generated
+classes back into `vm/tests/resources`.
+
+## Benchmark Readiness
+
+VM benchmark gates use committed JSON baselines under `vm/bench/`. Missing or
+malformed baselines are gate errors. The checked-in zero-valued baselines are
+explicit placeholders, so `bench-gate` reports them as bootstrap entries until a
+deliberate baseline refresh captures real medians. Lower-bound placeholder
+benchmarks are named with `lower_bound` in `vm/benches/vm_benchmarks.rs`.
+
 ## License
 
 Apache-2.0. See `LICENSE` and `NOTICE` at the workspace root.

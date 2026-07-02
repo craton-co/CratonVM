@@ -99,9 +99,9 @@ fn workspace_root() -> PathBuf {
         .to_path_buf()
 }
 
-/// The classpath directory: `vm/tests/resources/`. `vm/build.rs` compiles
-/// `tests/resources/cratonvm/*.java` into this tree, so a class in package
-/// `cratonvm` resolves as `cratonvm/<Name>.class` underneath it.
+/// The committed fixture classpath directory: `vm/tests/resources/`.
+/// `vm/build.rs` stages freshly compiled classes under
+/// `CRATONVM_TEST_CLASSES_DIR`; this test still uses committed fixtures.
 fn classpath_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests")

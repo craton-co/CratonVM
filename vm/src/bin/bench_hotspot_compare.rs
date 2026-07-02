@@ -281,8 +281,8 @@ USAGE:
     bench-hotspot-compare [OPTIONS]
 
 OPTIONS:
-    --rust-baseline FILE     default: bench/baseline.json
-    --hotspot-baseline FILE  default: bench/hotspot-baseline.json
+    --rust-baseline FILE     default: vm/bench/baseline.json
+    --hotspot-baseline FILE  default: vm/bench/hotspot-baseline.json
     --threshold X            geomean ratio threshold (default: 1.5)
     --report FILE            also write a JSON report
     -h, --help               show this help
@@ -311,10 +311,10 @@ fn main() -> ExitCode {
     }
     let rust_path = args
         .rust_baseline
-        .unwrap_or_else(|| PathBuf::from("bench/baseline.json"));
+        .unwrap_or_else(default_rust_baseline_path);
     let hotspot_path = args
         .hotspot_baseline
-        .unwrap_or_else(|| PathBuf::from("bench/hotspot-baseline.json"));
+        .unwrap_or_else(default_hotspot_baseline_path);
     let threshold = args.threshold.unwrap_or(1.5);
 
     let rust = match load_baseline(&rust_path) {
@@ -361,6 +361,14 @@ fn main() -> ExitCode {
         return ExitCode::from(1);
     }
     ExitCode::from(0)
+}
+
+fn default_rust_baseline_path() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("bench/baseline.json")
+}
+
+fn default_hotspot_baseline_path() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("bench/hotspot-baseline.json")
 }
 
 #[cfg(test)]
@@ -542,7 +550,7 @@ mod tests {
 
     // T17.E.1 — every metric name the capture scripts write is the exact
     // set of criterion IDs the CratonVM side also writes into
-    // `bench/baseline.json`. If someone adds a new kernel on either side
+    // `vm/bench/baseline.json`. If someone adds a new kernel on either side
     // without the other, the comparator silently marks it `Asymmetric`
     // — this test wedges that contract so the next roadmap entry has
     // to update both scripts.
@@ -589,7 +597,7 @@ mod tests {
             for name in &expected_metric_names {
                 assert!(
                     parsed.metrics.contains_key(*name),
-                    "bench/hotspot-baseline.json is missing metric `{name}` — \
+                    "vm/bench/hotspot-baseline.json is missing metric `{name}` — \
                      update scripts/capture-hotspot-baseline.{{sh,ps1}} in lockstep",
                 );
             }
