@@ -174,6 +174,10 @@ fn require_runtime_tls_identity() -> Result<RuntimeTlsIdentity, RuntimeError> {
 thread_local! {
     static PENDING_KM_IDENTITY: std::cell::RefCell<Option<(String, String)>> =
         const { std::cell::RefCell::new(None) };
+    static PENDING_TM_TRUST_ROOTS: std::cell::RefCell<Option<TlsTrustRoots>> =
+        const { std::cell::RefCell::new(None) };
+    static SELECTED_CONTEXT_TRUST_ROOTS: std::cell::RefCell<Option<TlsTrustRoots>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// `KeyManagerFactory.init` calls this with the keystore's PEM identity.
@@ -185,27 +189,73 @@ fn take_pending_km_identity() -> Option<(String, String)> {
     PENDING_KM_IDENTITY.with(|c| c.borrow_mut().take())
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct TlsTrustRoots {
+    root_ders: Vec<Vec<u8>>,
+}
+
+/// `TrustManagerFactory.init` calls this with the exact anchor set that should
+/// be scoped to the next `SSLContext.init` on this thread. A configured custom
+/// truststore is therefore restrictive instead of being added to native roots.
+pub(crate) fn set_pending_tm_trust_roots(root_ders: Vec<Vec<u8>>) {
+    let mut deduped: Vec<Vec<u8>> = Vec::new();
+    for der in root_ders {
+        if !der.is_empty() && !deduped.iter().any(|r| r == &der) {
+            deduped.push(der);
+        }
+    }
+    PENDING_TM_TRUST_ROOTS.with(|c| {
+        *c.borrow_mut() = Some(TlsTrustRoots { root_ders: deduped });
+    });
+}
+
+fn take_pending_tm_trust_roots() -> Option<TlsTrustRoots> {
+    PENDING_TM_TRUST_ROOTS.with(|c| c.borrow_mut().take())
+}
+
+fn set_selected_context_trust_roots(roots: Option<TlsTrustRoots>) {
+    SELECTED_CONTEXT_TRUST_ROOTS.with(|c| *c.borrow_mut() = roots);
+}
+
+fn selected_context_trust_roots() -> Option<TlsTrustRoots> {
+    SELECTED_CONTEXT_TRUST_ROOTS.with(|c| c.borrow().clone())
+}
+
+fn take_selected_context_trust_roots() -> Option<TlsTrustRoots> {
+    SELECTED_CONTEXT_TRUST_ROOTS.with(|c| c.borrow_mut().take())
+}
+
 fn ctx_identity_table() -> &'static Mutex<HashMap<u64, (String, String)>> {
     static T: OnceLock<Mutex<HashMap<u64, (String, String)>>> = OnceLock::new();
     T.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// `SSLContext.init` calls this to move any pending KMF identity onto the
-/// SSLContext object's per-context slot.
+fn ctx_trust_roots_table() -> &'static Mutex<HashMap<u64, TlsTrustRoots>> {
+    static T: OnceLock<Mutex<HashMap<u64, TlsTrustRoots>>> = OnceLock::new();
+    T.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// `SSLContext.init` calls this to move pending KMF identity and TMF trust
+/// roots onto the SSLContext object's per-context slots.
 pub(crate) fn attach_pending_identity_to_ctx(ctx_obj: ObjectRef) {
     if let Some(ident) = take_pending_km_identity() {
         ctx_identity_table()
             .lock()
             .insert(engine_objref_key(ctx_obj), ident);
     }
+    if let Some(roots) = take_pending_tm_trust_roots() {
+        ctx_trust_roots_table()
+            .lock()
+            .insert(engine_objref_key(ctx_obj), roots);
+    }
 }
 
 /// Look up the identity previously associated with an `SSLContext` object.
 pub(crate) fn ctx_identity(ctx_obj: ObjectRef) -> Option<(String, String)> {
-    ctx_identity_table()
-        .lock()
-        .get(&engine_objref_key(ctx_obj))
-        .cloned()
+    let key = engine_objref_key(ctx_obj);
+    let trust_roots = ctx_trust_roots_table().lock().get(&key).cloned();
+    set_selected_context_trust_roots(trust_roots);
+    ctx_identity_table().lock().get(&key).cloned()
 }
 
 /// Convert a PKCS#8 key DER + DER cert chain (leaf first) to the (cert_pem,
@@ -220,17 +270,16 @@ pub fn der_identity_to_pem(key_pkcs8_der: &[u8], chain_der: &[Vec<u8>]) -> (Stri
     (cert_pem, key_pem)
 }
 
-/// Build a rustls client config that trusts the gathered test/truststore roots
-/// (plus the platform roots) and optionally presents a client certificate.
+/// Build a rustls client config that trusts the roots scoped to the selected
+/// SSLContext, or the platform roots when no context trust is configured, and
+/// optionally presents a client certificate.
 /// Used by the rustls-backed `SSLSocketFactory.createSocket` client path.
 pub(crate) fn build_engine_client_config_with_identity(
     alpn: &[&str],
     client_identity: Option<(&str, &str)>,
 ) -> Result<Arc<ClientConfig>, String> {
-    let mut roots = load_native_root_store().unwrap_or_else(|_| RootCertStore::empty());
-    for der in extra_trust_roots().lock().iter() {
-        let _ = roots.add(CertificateDer::from(der.clone()));
-    }
+    let trust_roots = active_client_trust_roots();
+    let roots = root_store_for_trust_roots(trust_roots.as_ref());
     build_client_config(roots, alpn, client_identity)
 }
 
@@ -240,17 +289,28 @@ pub(crate) fn build_engine_client_config_with_identity(
 // `SSLSocketFactory.createSocket`, so it reads this global to present a client
 // certificate for mTLS (e.g. `TestClientCertTls13`'s `getUrl`/`postUrl`).
 static HUC_DEFAULT_CLIENT_IDENTITY: OnceLock<Mutex<Option<(String, String)>>> = OnceLock::new();
+static HUC_DEFAULT_TRUST_ROOTS: OnceLock<Mutex<Option<TlsTrustRoots>>> = OnceLock::new();
 
 fn huc_default_identity_slot() -> &'static Mutex<Option<(String, String)>> {
     HUC_DEFAULT_CLIENT_IDENTITY.get_or_init(|| Mutex::new(None))
 }
 
+fn huc_default_trust_roots_slot() -> &'static Mutex<Option<TlsTrustRoots>> {
+    HUC_DEFAULT_TRUST_ROOTS.get_or_init(|| Mutex::new(None))
+}
+
 pub(crate) fn set_huc_default_client_identity(ident: Option<(String, String)>) {
     *huc_default_identity_slot().lock() = ident;
+    *huc_default_trust_roots_slot().lock() = selected_context_trust_roots();
+    set_selected_context_trust_roots(None);
 }
 
 pub fn huc_default_client_identity() -> Option<(String, String)> {
     huc_default_identity_slot().lock().clone()
+}
+
+fn huc_default_trust_roots() -> Option<TlsTrustRoots> {
+    huc_default_trust_roots_slot().lock().clone()
 }
 
 // -----------------------------------------------------------------------------
@@ -288,16 +348,15 @@ pub(crate) fn parse_private_key_pem(pem: &str) -> Result<PrivateKeyDer<'static>,
 }
 
 // -----------------------------------------------------------------------------
-// Keystore → runtime identity / trust bridge (JSSE server connector)
+// Keystore -> runtime identity / scoped trust bridge (JSSE server connector)
 // -----------------------------------------------------------------------------
 //
 // Tomcat's JSSE connector loads its server cert/key from a JKS/PKCS12 keystore
 // and its trust anchors from a truststore, then drives the rustls-backed
-// SSLEngine. The keystore natives (keystore.rs) parse the DER; these helpers
-// convert that DER into the PEM the rustls config builders consume and register
-// the certs as extra client trust roots. For Tomcat's in-process loopback HTTPS
-// tests (test client + embedded server in one VM) this makes the client trust
-// the server's (self-signed/test-CA) cert automatically.
+// SSLEngine. The keystore natives (keystore.rs) parse identity DER into the PEM
+// the rustls config builders consume. Trust anchors flow through
+// TrustManagerFactory -> SSLContext via `set_pending_tm_trust_roots`, so a
+// configured custom truststore remains scoped and restrictive.
 
 /// Standard base64 (RFC 4648) encoder — dependency-free so we don't add a crate
 /// just to render DER as PEM.
@@ -336,31 +395,37 @@ fn der_to_pem(label: &str, der: &[u8]) -> String {
     format!("-----BEGIN {label}-----\n{body}-----END {label}-----\n")
 }
 
-/// Extra client trust roots (DER) gathered from loaded keystores/truststores.
-static EXTRA_TRUST_ROOTS: OnceLock<Mutex<Vec<Vec<u8>>>> = OnceLock::new();
-fn extra_trust_roots() -> &'static Mutex<Vec<Vec<u8>>> {
-    EXTRA_TRUST_ROOTS.get_or_init(|| Mutex::new(Vec::new()))
+/// Legacy entry point kept for older callers. Keystore loads must not mutate a
+/// process-wide TLS root set; trust roots are scoped through
+/// `set_pending_tm_trust_roots` and the following `SSLContext.init`.
+pub fn add_extra_trust_root_der(_der: Vec<u8>) {}
+
+fn root_store_for_trust_roots(trust_roots: Option<&TlsTrustRoots>) -> RootCertStore {
+    let mut roots = match trust_roots {
+        Some(_) => RootCertStore::empty(),
+        None => load_native_root_store().unwrap_or_else(|_| RootCertStore::empty()),
+    };
+    if let Some(bundle) = trust_roots {
+        for der in &bundle.root_ders {
+            let _ = roots.add(CertificateDer::from(der.clone()));
+        }
+    }
+    roots
 }
 
-/// Register a cert (DER) as an additional client trust anchor. Called from the
-/// keystore load path for every cert in a key/trust store.
-pub fn add_extra_trust_root_der(der: Vec<u8>) {
-    if der.is_empty() {
-        return;
-    }
-    let mut roots = extra_trust_roots().lock();
-    if !roots.iter().any(|r| r == &der) {
-        roots.push(der);
-    }
+fn active_client_trust_roots() -> Option<TlsTrustRoots> {
+    take_selected_context_trust_roots().or_else(huc_default_trust_roots)
 }
 
-/// Concatenate every gathered trust anchor (DER) into a PEM bundle. Used as the
+/// Concatenate scoped trust anchors (DER) into a PEM bundle. Used as the
 /// client-CA source for mTLS server configs when no explicit `client_ca_pem`
-/// was installed on the runtime identity (see `default_engine_server_config`).
-fn trust_roots_pem() -> String {
+/// was installed on the runtime identity.
+fn trust_roots_pem(trust_roots: Option<&TlsTrustRoots>) -> String {
     let mut pem = String::new();
-    for der in extra_trust_roots().lock().iter() {
-        pem.push_str(&der_to_pem("CERTIFICATE", der));
+    if let Some(bundle) = trust_roots {
+        for der in &bundle.root_ders {
+            pem.push_str(&der_to_pem("CERTIFICATE", der));
+        }
     }
     pem
 }
@@ -1636,6 +1701,7 @@ mod tests {
     use super::test_fixtures::*;
     use super::*;
     use cratonvm_native_api::NativeContext;
+    use cratonvm_types::ObjectRef;
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::sync::Arc;
@@ -1686,6 +1752,46 @@ mod tests {
             key_pem: SERVER_KEY_PEM.to_string(),
             client_ca_pem: Some(CA_CRT_PEM.to_string()),
         })
+    }
+
+    fn fake_object_ref(tag: usize) -> ObjectRef {
+        let ptr = (0x1000_0000usize + tag * 0x1000) as *mut u8;
+        unsafe { ObjectRef::from_raw(ptr) }
+    }
+
+    #[test]
+    fn scoped_trust_roots_attach_to_one_ssl_context() {
+        let ca_der = parse_cert_chain_pem(CA_CRT_PEM).unwrap()[0]
+            .as_ref()
+            .to_vec();
+        set_selected_context_trust_roots(None);
+
+        let ctx = fake_object_ref(1);
+        set_pending_tm_trust_roots(vec![ca_der.clone()]);
+        attach_pending_identity_to_ctx(ctx);
+
+        assert!(ctx_identity(ctx).is_none());
+        let selected = selected_context_trust_roots().expect("context trust roots selected");
+        assert_eq!(selected.root_ders, vec![ca_der]);
+        let root_store = root_store_for_trust_roots(Some(&selected));
+        assert_eq!(root_store.roots.len(), 1);
+
+        let other_ctx = fake_object_ref(2);
+        assert!(ctx_identity(other_ctx).is_none());
+        assert!(selected_context_trust_roots().is_none());
+    }
+
+    #[test]
+    fn legacy_extra_trust_registration_does_not_expand_global_roots() {
+        let ca_der = parse_cert_chain_pem(CA_CRT_PEM).unwrap()[0]
+            .as_ref()
+            .to_vec();
+        set_selected_context_trust_roots(None);
+
+        add_extra_trust_root_der(ca_der);
+
+        assert!(selected_context_trust_roots().is_none());
+        assert!(trust_roots_pem(None).is_empty());
     }
 
     #[test]
@@ -2597,6 +2703,8 @@ pub(crate) struct EngineState {
     /// global `runtime_tls_identity`, so an in-process mTLS test's server and
     /// client engines each use their own keystore.
     identity_override: Option<(String, String)>,
+    /// Trust roots copied from the SSLContext that created this engine.
+    trust_roots_override: Option<TlsTrustRoots>,
     /// Decrypted application bytes that did not fit the caller's `unwrap`
     /// destination buffers. Served first on the next `unwrap`. MUST be kept
     /// separate from `outbound` (encrypted TLS records) — mixing decrypted
@@ -2630,6 +2738,7 @@ impl Default for EngineState {
             server_config: None,
             peer_host: None,
             identity_override: None,
+            trust_roots_override: None,
             plaintext_pending: Vec::new(),
             peer_cert_chain_der: Vec::new(),
         }
@@ -2935,15 +3044,11 @@ fn bb_write_from(
 }
 
 /// Build a default rustls ClientConfig for engine paths that didn't have an
-/// SSLContext attach a real one. Uses native roots + ALPN list from state.
+/// SSLContext attach a real one. Uses selected context roots when present,
+/// otherwise native roots, plus ALPN from state.
 fn default_engine_client_config(alpn: &[Vec<u8>]) -> Result<Arc<ClientConfig>, String> {
-    let mut roots = load_native_root_store().unwrap_or_else(|_| RootCertStore::empty());
-    // Add trust anchors gathered from loaded keystores/truststores so an
-    // in-process loopback client trusts the embedded server's (self-signed or
-    // test-CA) cert — Tomcat's JSSE HTTPS tests run both ends in one VM.
-    for der in extra_trust_roots().lock().iter() {
-        let _ = roots.add(CertificateDer::from(der.clone()));
-    }
+    let trust_roots = take_selected_context_trust_roots();
+    let roots = root_store_for_trust_roots(trust_roots.as_ref());
     let mut config = ClientConfig::builder()
         .with_root_certificates(roots)
         .with_no_client_auth();
@@ -2975,16 +3080,8 @@ fn default_engine_server_config(
         match identity.client_ca_pem.as_deref() {
             Some(ca) => Some(ca.to_string()),
             None => {
-                // mTLS fallback: the identity carries no explicit client CA, so
-                // verify client certs against the trust anchors gathered from
-                // every loaded keystore/truststore (`extra_trust_roots`, fed by
-                // the keystore load path). This is the same root set the JVM's
-                // TrustManager validates against. Client-cert tests (e.g.
-                // TestClientCertTls13) load the signing CA into a truststore but
-                // never install it as the identity's `client_ca_pem`, which
-                // previously made `setNeedClientAuth(true)` fail and the mTLS
-                // handshake return no HTTP response (-1).
-                let pem = trust_roots_pem();
+                let trust_roots = take_selected_context_trust_roots();
+                let pem = trust_roots_pem(trust_roots.as_ref());
                 if pem.is_empty() {
                     return Err(
                         "setNeedClientAuth(true) requires javax.net.ssl.trustStore".to_string(),
@@ -3023,7 +3120,12 @@ fn engine_begin(state: &mut EngineState) -> Result<(), String> {
             // over the no-client-auth default.
             None => match &state.identity_override {
                 Some((cert, key)) => {
-                    build_engine_client_config_with_identity(&alpn_strs, Some((cert, key)))?
+                    let trust_roots = state
+                        .trust_roots_override
+                        .clone()
+                        .or_else(take_selected_context_trust_roots);
+                    let roots = root_store_for_trust_roots(trust_roots.as_ref());
+                    build_client_config(roots, &alpn_strs, Some((cert, key)))?
                 }
                 None => default_engine_client_config(&state.alpn_protocols)?,
             },
@@ -3050,7 +3152,11 @@ fn engine_begin(state: &mut EngineState) -> Result<(), String> {
                     // never asks and `peer_certificates()` stays empty.
                     let request = state.need_client_auth || state.want_client_auth;
                     let client_ca = if request {
-                        let pem = trust_roots_pem();
+                        let trust_roots = state
+                            .trust_roots_override
+                            .clone()
+                            .or_else(take_selected_context_trust_roots);
+                        let pem = trust_roots_pem(trust_roots.as_ref());
                         if pem.is_empty() {
                             None
                         } else {
@@ -4368,8 +4474,10 @@ fn sslparams_alpn_table() -> &'static parking_lot::Mutex<HashMap<u64, Vec<String
 /// (server cert, or client cert for mTLS) instead of the process-global slot.
 pub(crate) fn set_engine_identity_override(engine_obj: ObjectRef, cert_pem: String, key_pem: String) {
     let id = engine_id_or_alloc(engine_obj);
+    let trust_roots = take_selected_context_trust_roots();
     with_engine(id, |s| {
         s.identity_override = Some((cert_pem, key_pem));
+        s.trust_roots_override = trust_roots;
     });
 }
 

@@ -58,8 +58,9 @@
 //!      (or, for a self-signed root, against its own SPKI).
 //!   3. Issuer ↔ subject DN continuity along the chain.
 //!   4. Intermediate `BasicConstraints.cA = TRUE` (RFC 5280 §4.2.1.9).
-//!   5. The last cert's subject DN matches the subject DN of a trust anchor
-//!      pulled from `rustls_native_certs::load_native_certs()`.
+//!   5. The chain terminates at the actual configured trust anchor, or at a
+//!      certificate signed by that anchor. Same-subject certificates supplied
+//!      by the peer are verified against the stored anchor's SPKI.
 //!   6. Name constraints (RFC 5280 §4.2.1.10) — every CA's `NameConstraints`
 //!      extension (permitted / excluded subtrees) is enforced against the
 //!      subject DN and SubjectAltName of every certificate beneath it in the
@@ -134,11 +135,11 @@ pub struct KeyManagerState {
     pub client_aliases_by_key_type: HashMap<String, Vec<String>>,
 }
 
-/// Trust-manager state. We keep the explicit anchors loaded out of the
-/// caller's `KeyStore` plus the system trust store as a fallback. Both
-/// roles fold into `anchors`, which is keyed by subject-DN DER for fast
-/// chain-end matching. `anchor_ders` is the original DER bytes so
-/// `getAcceptedIssuers()` can return them as `X509Certificate[]`.
+/// Trust-manager state. A null/default `TrustManagerFactory.init` state is
+/// populated from the system trust store; an explicit caller `KeyStore` is
+/// restrictive and contains only that store's anchors. Anchors are keyed by
+/// subject-DN DER for fast chain-end matching. `anchor_ders` is the original
+/// DER bytes so `getAcceptedIssuers()` can return them as `X509Certificate[]`.
 #[derive(Clone, Debug, Default)]
 pub struct TrustManagerState {
     pub keystore_id: i32,
@@ -967,10 +968,10 @@ pub fn build_key_manager_state(keystore_id: i32) -> KeyManagerState {
     state
 }
 
-/// Build a `TrustManagerState` from a `LoadedKeyStore`'s trusted-cert
-/// entries plus the system trust store. The user keystore is consulted
-/// first; system roots fold in afterwards as fallback so the user's
-/// explicit `keystore.jks` can override platform defaults.
+/// Build a `TrustManagerState` from either a caller-supplied `LoadedKeyStore`
+/// or the system trust store. Non-zero `keystore_id` means an explicit
+/// truststore was configured, so it is restrictive: platform roots are not
+/// appended as fallback.
 pub fn build_trust_manager_state(keystore_id: i32) -> TrustManagerState {
     let mut state = TrustManagerState {
         keystore_id,
@@ -978,7 +979,28 @@ pub fn build_trust_manager_state(keystore_id: i32) -> TrustManagerState {
         ..Default::default()
     };
 
+    let explicit_truststore = keystore_id != 0;
+
     // (1) User-supplied trust anchors out of the bound keystore.
+    if explicit_truststore {
+        if let Some(store) = keystore::keystore_lookup(keystore_id) {
+            for (_alias, entry) in &store.entries {
+                let der = match &entry.kind {
+                    keystore::EntryKind::TrustedCert { cert_der } => cert_der.clone(),
+                    keystore::EntryKind::PrivateKey { chain, .. } => {
+                        // The last cert in a private-key chain is the trust root.
+                        match chain.last() {
+                            Some(d) => d.clone(),
+                            None => continue,
+                        }
+                    }
+                };
+                insert_anchor(&mut state, der);
+            }
+        }
+        return state;
+    }
+
     if let Some(store) = keystore::keystore_lookup(keystore_id) {
         for (_alias, entry) in &store.entries {
             let der = match &entry.kind {
@@ -995,7 +1017,7 @@ pub fn build_trust_manager_state(keystore_id: i32) -> TrustManagerState {
         }
     }
 
-    // (2) System trust store via rustls-native-certs.
+    // (2) System trust store via rustls-native-certs for the default manager.
     let result = rustls_native_certs::load_native_certs();
     for cert in result.certs {
         let der = cert.as_ref().to_vec();
@@ -1029,6 +1051,17 @@ fn insert_anchor(state: &mut TrustManagerState, der: Vec<u8>) {
             full_cert_der: Some(der),
         },
     );
+}
+
+fn presented_cert_is_anchor(
+    anchor: &AnchorInfo,
+    presented_der: &[u8],
+    parsed: &ParsedCert,
+) -> bool {
+    match anchor.full_cert_der.as_deref() {
+        Some(anchor_der) => anchor_der == presented_der,
+        None => anchor.subject_der == parsed.subject_der && anchor.spki_der == parsed.spki_der,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1164,10 +1197,9 @@ impl std::fmt::Display for TrustError {
 ///   2. Date-check every cert.
 ///   3. Verify chain continuity (issuer ↔ subject DN match).
 ///   4. Verify each non-leaf cert has `BasicConstraints.cA = TRUE`.
-///   5. Find a trust anchor whose subject DN matches the last cert's
-///      subject (the chain ends at an anchor) or the last cert's issuer
-///      (the chain stops one hop short of the anchor — the classic
-///      `[leaf, intermediate]` shape).
+///   5. Find the configured trust anchor: the last cert may be the stored
+///      anchor itself, or it may be signed by an anchor whose subject matches
+///      the last cert's issuer.
 ///   6. Cryptographically verify each cert's signature against its issuer's
 ///      SPKI — `parsed[i+1].spki_der` for intermediate hops, the matched
 ///      trust anchor's SPKI for the last cert (skipped when the last cert
@@ -1235,21 +1267,15 @@ pub fn validate_chain(chain: &[Vec<u8>], trust: &TrustManagerState) -> Result<()
 
     // Step 5: trust anchor.
     let last = &parsed[parsed.len() - 1];
-    // The last cert's issuer must be present in the trust set — unless the
-    // last cert is itself the anchor (self-signed root packaged in the
-    // chain). We accept either presentation.
-    //
-    // We probe `subject_der` first so a self-signed root that the caller
-    // both put in the trust set AND repeated at the bottom of the chain is
-    // recognised as the anchor itself — RFC 5280 §6.1.1 says a trust
-    // anchor's public key is taken as authoritative without further
-    // verification, so the cryptographic step below must NOT attempt to
-    // re-verify it. Only when the cert is *not* itself an anchor do we
-    // fall through to the issuer-DN lookup (cross-signed roots, classic
-    // intermediate-anchored chains).
+    let last_der = &chain[chain.len() - 1];
+    // The last cert's issuer must be present in the trust set unless the last
+    // cert is the actual stored trust anchor. A same-subject certificate
+    // supplied by the peer is not enough: if its DER/SPKI differs from the
+    // anchor, verify it against the matched anchor instead of treating it as
+    // authoritative.
     let (anchor, last_is_anchor): (&AnchorInfo, bool) = match trust.anchors.get(&last.subject_der) {
-        Some(a) => (a, true),
-        None => match trust.anchors.get(&last.issuer_der) {
+        Some(a) if presented_cert_is_anchor(a, last_der, last) => (a, true),
+        _ => match trust.anchors.get(&last.issuer_der) {
             Some(a) => (a, false),
             None => return Err(TrustError::NoTrustAnchor),
         },
@@ -2540,6 +2566,7 @@ fn tmf_engine_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         _ => 0,
     };
     let state = build_trust_manager_state(ks_id);
+    crate::t27_tls::set_pending_tm_trust_roots(state.anchor_ders.clone());
     let id = next_tm_id();
     tm_registry().write().insert(id, state);
     set_tm_id(ctx, this, id);
@@ -3109,6 +3136,40 @@ mod tests {
     }
 
     #[test]
+    fn build_trust_manager_state_custom_store_is_restrictive() {
+        let custom_anchor = mk_cert(&CertSpec {
+            not_before_utc: "200101000000Z",
+            not_after_utc: "300101000000Z",
+            subject_cn: "Custom Only Root",
+            issuer_cn: "Custom Only Root",
+            spki_alg: OID_RSA,
+            key_usage_bits: Some(KU_KEY_CERT_SIGN),
+            ext_key_usages: &[],
+            basic_constraints_ca: Some(true),
+            subject_alt_dns: &[],
+        });
+        let store = keystore::LoadedKeyStore {
+            entries: [(
+                "custom-root".to_string(),
+                keystore::KeyStoreEntry {
+                    alias: "custom-root".to_string(),
+                    creation_time_ms: 0,
+                    kind: keystore::EntryKind::TrustedCert {
+                        cert_der: custom_anchor.clone(),
+                    },
+                },
+            )]
+            .into_iter()
+            .collect(),
+        };
+        let id = keystore::keystore_register(store);
+        let state = build_trust_manager_state(id);
+        assert_eq!(state.keystore_id, id);
+        assert_eq!(state.anchor_ders, vec![custom_anchor]);
+        assert_eq!(state.anchors.len(), 1);
+    }
+
+    #[test]
     fn key_usage_bit_extraction_is_correct() {
         let cert = mk_cert(&CertSpec {
             not_before_utc: "200101000000Z",
@@ -3324,6 +3385,64 @@ mod tests {
         let mut trust = TrustManagerState::default();
         insert_anchor(&mut trust, root.clone());
         validate_chain(&[leaf, root], &trust).expect("real RSA chain must validate");
+    }
+
+    #[test]
+    fn validate_chain_rejects_same_subject_fake_root() {
+        let (trusted_pk, trusted_sk) = shared_rsa_root();
+        let trusted_spki = Rsa::public_key_to_der(trusted_pk);
+        let (fake_pk, fake_sk) = Rsa::generate_keypair(1024);
+        let fake_spki = Rsa::public_key_to_der(&fake_pk);
+
+        let trusted_root = mk_rsa_signed_cert(
+            &SignedCertSpec {
+                not_before_utc: "200101000000Z",
+                not_after_utc: "490101000000Z",
+                subject_cn: "Collision Root",
+                issuer_cn: "Collision Root",
+                spki_der: &trusted_spki,
+                sig_alg_oid: OID_SIG_SHA256_RSA,
+                key_usage_bits: Some(KU_KEY_CERT_SIGN | KU_DIGITAL_SIGNATURE),
+                ext_key_usages: &[],
+                basic_constraints_ca: Some(true),
+            },
+            trusted_sk,
+        );
+        let fake_root = mk_rsa_signed_cert(
+            &SignedCertSpec {
+                not_before_utc: "200101000000Z",
+                not_after_utc: "490101000000Z",
+                subject_cn: "Collision Root",
+                issuer_cn: "Collision Root",
+                spki_der: &fake_spki,
+                sig_alg_oid: OID_SIG_SHA256_RSA,
+                key_usage_bits: Some(KU_KEY_CERT_SIGN | KU_DIGITAL_SIGNATURE),
+                ext_key_usages: &[],
+                basic_constraints_ca: Some(true),
+            },
+            &fake_sk,
+        );
+        let leaf = mk_rsa_signed_cert(
+            &SignedCertSpec {
+                not_before_utc: "200101000000Z",
+                not_after_utc: "300101000000Z",
+                subject_cn: "leaf.example.com",
+                issuer_cn: "Collision Root",
+                spki_der: &fake_spki,
+                sig_alg_oid: OID_SIG_SHA256_RSA,
+                key_usage_bits: Some(KU_DIGITAL_SIGNATURE | KU_KEY_ENCIPHERMENT),
+                ext_key_usages: &[OID_KP_SERVER_AUTH],
+                basic_constraints_ca: Some(false),
+            },
+            &fake_sk,
+        );
+
+        let mut trust = TrustManagerState::default();
+        insert_anchor(&mut trust, trusted_root);
+        match validate_chain(&[leaf, fake_root], &trust) {
+            Err(TrustError::BadSignature { at }) => assert_eq!(at, 1),
+            other => panic!("expected fake root signature failure, got {:?}", other),
+        }
     }
 
     #[test]
