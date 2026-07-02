@@ -9,6 +9,7 @@ description = "Java core native methods for CratonVM (java.lang.*)"
 readme = "README.md"
 repository.workspace = true
 homepage.workspace = true
+documentation.workspace = true
 keywords.workspace = true
 categories.workspace = true
 
