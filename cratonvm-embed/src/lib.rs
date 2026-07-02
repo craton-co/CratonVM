@@ -13,6 +13,23 @@
 //! `cdylib`/`staticlib` with the JNI Invocation API + the flat `cratonvm_*` C
 //! ABI). This crate is for **Rust** hosts that want a stable, minimal API.
 //!
+//! ## Semver boundary
+//!
+//! The facade contract is the documented re-export list plus the helper
+//! function signatures in this crate. `Vm`, `SharedVm`, and `JvmThread` are
+//! concrete re-exports from `cratonvm-vm`, so their public inherent methods are
+//! visible to downstream crates and form the practical Rust API while this crate
+//! is on the 0.3 line. Treat methods not documented here as lower-level VM
+//! pass-throughs rather than the intended long-term facade surface.
+//!
+//! ## Feature policy
+//!
+//! `cratonvm-embed` disables `cratonvm-vm` default features by default so the
+//! facade dependency graph stays headless and avoids optional desktop or
+//! experimental crates. Enable `vm-defaults` to mirror the VM crate's default
+//! feature set, or enable individual forwarded features such as `awt` or
+//! `experimental-tls`.
+//!
 //! ## Lifecycle (API contract)
 //!
 //! ```text
@@ -61,14 +78,16 @@ pub use cratonvm_vm::ClassId;
 /// Build a `java.lang.String[]` from Rust strings — the array a host passes to
 /// a `main(String[])` (or any `[Ljava/lang/String;` parameter).
 ///
-/// Each element is an interned `java.lang.String` (the same constructor the
-/// interpreter uses for an `ldc` of a literal). Returns the array handle, or a
-/// [`VmError`] if `java.lang.String` cannot be loaded.
+/// Each element is a fresh, uninterned `java.lang.String`, matching launcher
+/// argument behavior rather than string-literal (`ldc`) interning. Returns the
+/// array handle, or a [`VmError`] if `java.lang.String` cannot be loaded. String
+/// allocation itself uses the VM allocator and can still abort on heap
+/// exhaustion, matching the underlying VM helper contract.
 pub fn make_string_array(vm: &mut Vm, items: &[&str]) -> Result<ObjectRef, VmError> {
     let string_class = vm.load_class("java/lang/String")?;
     let arr = vm.new_ref_array(string_class, items.len());
     for (i, s) in items.iter().enumerate() {
-        let js = cratonvm_vm::vm::create_java_string(&vm.shared, s);
+        let js = cratonvm_vm::vm::create_java_string_uninterned(&vm.shared, s);
         // Index is in `[0, items.len())` by construction, so the bounds-check
         // (the `Err(i32)` AIOOBE index) cannot fire; ignore it.
         let _ = vm
@@ -174,5 +193,41 @@ mod tests {
         _assert_sized::<VmError>();
         _assert_sized::<MethodCallFailed>();
         _assert_sized::<StackTraceFrame>();
+    }
+
+    /// Compile-time pin for the facade helper signatures documented as the
+    /// stable embedding surface. These do not bootstrap a VM, so they stay
+    /// cheap and avoid depending on host JDK availability.
+    #[test]
+    fn facade_helper_signatures_are_pinned() {
+        type MakeStringArrayFn = for<'vm, 'items, 'item> fn(
+            &'vm mut Vm,
+            &'items [&'item str],
+        ) -> Result<ObjectRef, VmError>;
+        type ReadStringFn = for<'vm> fn(&'vm Vm, ObjectRef) -> Option<String>;
+        type ObjectClassNameFn = for<'vm> fn(&'vm Vm, ObjectRef) -> Option<String>;
+        type DescribeFailureFn =
+            for<'vm, 'err> fn(&'vm Vm, &'err MethodCallFailed) -> String;
+        type FieldIndexFn =
+            for<'vm, 'name> fn(&'vm Vm, ClassId, &'name str) -> Option<usize>;
+        type FieldIndexDescFn = for<'vm, 'name, 'desc> fn(
+            &'vm Vm,
+            ClassId,
+            &'name str,
+            Option<&'desc str>,
+        ) -> Option<usize>;
+        type GetFieldByNameFn =
+            for<'vm, 'name> fn(&'vm Vm, ObjectRef, &'name str) -> Option<Value>;
+        type SetFieldByNameFn =
+            for<'vm, 'name> fn(&'vm Vm, ObjectRef, &'name str, Value) -> bool;
+
+        let _make: MakeStringArrayFn = make_string_array;
+        let _read: ReadStringFn = read_string;
+        let _object_class: ObjectClassNameFn = object_class_name;
+        let _describe: DescribeFailureFn = describe_failure;
+        let _field_index: FieldIndexFn = field_index;
+        let _field_index_desc: FieldIndexDescFn = field_index_desc;
+        let _get_field: GetFieldByNameFn = get_field_by_name;
+        let _set_field: SetFieldByNameFn = set_field_by_name;
     }
 }

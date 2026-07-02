@@ -17,6 +17,26 @@ its internals. For a **C / non-Rust** host, use the
 
 This crate is `#![forbid(unsafe_code)]`.
 
+## Semver and feature boundary
+
+The facade contract is the documented re-export list and helper functions. Today
+`Vm`, `SharedVm`, and `JvmThread` are concrete re-exports from `cratonvm-vm`, so
+their public inherent methods are visible to downstream crates; methods not
+documented here should be treated as lower-level VM pass-throughs rather than the
+intended long-term facade surface.
+
+By default, `cratonvm-embed` disables `cratonvm-vm` default features. This keeps
+the default dependency graph headless and avoids optional desktop or experimental
+VM crates. Enable the VM-like bundle explicitly when you need it:
+
+```toml
+[dependencies]
+cratonvm-embed = { version = "0.3", features = ["vm-defaults"] }
+```
+
+You can also enable individual forwarded features such as `awt`,
+`synthetic-jdk`, `experimental-tls`, or `gpu-offload`.
+
 ## What it exposes
 
 ### Re-exported types
@@ -30,12 +50,15 @@ This crate is `#![forbid(unsafe_code)]`.
 ### Convenience helpers
 
 - `make_string_array(vm, &["..."])` — build a `java.lang.String[]` (e.g. the
-  `args` for a `main(String[])`).
+  `args` for a `main(String[])`). Elements are fresh, uninterned strings.
 - `read_string(vm, obj)` — read a `java.lang.String` handle back into a Rust `String`.
 - `object_class_name(vm, obj)` — the runtime-class internal name of a heap object.
 - `describe_failure(vm, &err)` — human-readable text for a failed call.
 - `field_index(vm, class_id, name)` — resolve a named instance field to its layout
   slot index.
+- `field_index_desc(vm, class_id, name, Some(desc))` - resolve a named instance
+  field with a JVM descriptor such as `"I"` or `"Ljava/lang/String;"`, useful
+  when a subclass shadows a superclass field with the same name.
 - `get_field_by_name(vm, obj, name)` / `set_field_by_name(vm, obj, name, value)` —
   read/write an instance field by name (resolved against the object's runtime class).
 

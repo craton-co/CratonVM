@@ -15,8 +15,29 @@ categories.workspace = true
 description = "Curated, semver-stable Rust facade for embedding CratonVM (Layer 1 of the embedding API)"
 readme = "README.md"
 
+[features]
+# Keep the default facade dependency graph headless/packageable. Hosts that
+# need the VM crate's desktop or experimental runtime features opt in below.
+default = []
+vm-defaults = [
+    "awt",
+    "experimental-tls",
+    "experimental-jmx",
+    "experimental-serialization",
+    "experimental-aot",
+    "experimental-debug",
+]
+awt = ["cratonvm-vm/awt"]
+synthetic-jdk = ["cratonvm-vm/synthetic-jdk"]
+experimental-tls = ["cratonvm-vm/experimental-tls"]
+experimental-jmx = ["cratonvm-vm/experimental-jmx"]
+experimental-serialization = ["cratonvm-vm/experimental-serialization"]
+experimental-aot = ["cratonvm-vm/experimental-aot"]
+experimental-debug = ["cratonvm-vm/experimental-debug"]
+gpu-offload = ["cratonvm-vm/gpu-offload"]
+
 [dependencies]
-cratonvm-vm = { path = "../vm", version = "0.3.0" }
+cratonvm-vm = { path = "../vm", version = "0.3.0", default-features = false }
 
 [lints]
 workspace = true
