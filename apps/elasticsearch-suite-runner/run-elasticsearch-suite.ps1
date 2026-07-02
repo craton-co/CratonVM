@@ -70,6 +70,21 @@ function ConvertTo-SafeName([string]$Value) {
   return ($Value -replace '[^A-Za-z0-9_.-]', '_')
 }
 
+function Get-LogBaseName([string]$Module, [string]$Class) {
+  $safe = ConvertTo-SafeName "$Module.$Class"
+  if ($safe.Length -le 80) { return $safe }
+
+  $sha = [System.Security.Cryptography.SHA256]::Create()
+  try {
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes("$Module`t$Class")
+    $hashBytes = $sha.ComputeHash($bytes)
+    $hash = ([System.BitConverter]::ToString($hashBytes) -replace '-', '').Substring(0, 12).ToLowerInvariant()
+  } finally {
+    $sha.Dispose()
+  }
+  return "$($safe.Substring(0, 64)).$hash"
+}
+
 function ConvertTo-InvariantString([double]$Value) {
   return $Value.ToString('F3', [System.Globalization.CultureInfo]::InvariantCulture)
 }
@@ -443,7 +458,7 @@ function New-ProcessRecord {
     }
   }
 
-  $safe = ConvertTo-SafeName "$module.$class"
+  $safe = Get-LogBaseName -Module $module -Class $class
   $logDir = Join-Path $ModeOut 'logs'
   New-Item -ItemType Directory -Force -Path $logDir | Out-Null
   $outFile = Join-Path $logDir "$safe.out.log"
@@ -830,7 +845,7 @@ if ($AllModes) {
   exit 0
 }
 
-$classes = Get-SelectedClasses
+$classes = @(Get-SelectedClasses)
 Write-Info "selected $($classes.Count) classes (category=$Category start=$Start count=$Count)"
 
 if ($ListOnly) {
