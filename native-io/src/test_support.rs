@@ -78,6 +78,16 @@ impl MockNativeContext {
         }
     }
 
+    fn ensure_mock_class(&mut self, class_name: &str) -> ClassId {
+        match self.class_table.iter().position(|n| n == class_name) {
+            Some(i) => ClassId::new(i as u32),
+            None => {
+                self.class_table.push(class_name.to_string());
+                ClassId::new((self.class_table.len() - 1) as u32)
+            }
+        }
+    }
+
     /// Allocate an object whose `class_id_of_object` / `class_name_of_id`
     /// resolve to `class_name`. Used by tests that exercise natives which
     /// branch on the receiver's runtime class (e.g. the `ByteArrayInputStream`
@@ -88,13 +98,7 @@ impl MockNativeContext {
         class_name: &str,
     ) -> ObjectRef {
         let obj = self.alloc_object(num_fields);
-        let cid = match self.class_table.iter().position(|n| n == class_name) {
-            Some(i) => ClassId::new(i as u32),
-            None => {
-                self.class_table.push(class_name.to_string());
-                ClassId::new((self.class_table.len() - 1) as u32)
-            }
-        };
+        let cid = self.ensure_mock_class(class_name);
         self.obj_class.insert(obj.as_ptr() as usize, cid);
         obj
     }
@@ -343,11 +347,13 @@ impl NativeContext for MockNativeContext {
     fn set_system_property(&mut self, _k: &str, _v: &str) -> Option<String> {
         None
     }
-    fn alloc_object(&mut self, _c: ClassId, num_fields: usize) -> ObjectRef {
-        MockNativeContext::alloc_object(self, num_fields)
+    fn alloc_object(&mut self, c: ClassId, num_fields: usize) -> ObjectRef {
+        let obj = MockNativeContext::alloc_object(self, num_fields);
+        self.obj_class.insert(obj.as_ptr() as usize, c);
+        obj
     }
-    fn ensure_class_initialized(&mut self, _n: &str) -> Result<ClassId, MethodCallFailed> {
-        Ok(ClassId::new(0))
+    fn ensure_class_initialized(&mut self, n: &str) -> Result<ClassId, MethodCallFailed> {
+        Ok(self.ensure_mock_class(n))
     }
     fn is_subclass(&self, _c: ClassId, _p: ClassId) -> bool {
         false
@@ -358,8 +364,14 @@ impl NativeContext for MockNativeContext {
     fn is_interface_class(&self, _c: ClassId) -> bool {
         false
     }
-    fn class_id_by_name(&self, _n: &str) -> Option<ClassId> {
-        None
+    fn class_id_by_name(&self, n: &str) -> Option<ClassId> {
+        self.class_table
+            .iter()
+            .position(|name| name == n)
+            .map(|i| ClassId::new(i as u32))
+    }
+    fn ensure_synthetic_class(&mut self, name: &str, _num_fields: usize) -> ClassId {
+        self.ensure_mock_class(name)
     }
     fn loader_id_of_class(&self, _c: ClassId) -> i32 {
         2

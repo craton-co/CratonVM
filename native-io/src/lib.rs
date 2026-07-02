@@ -410,25 +410,7 @@ pub(crate) fn validate_path(path: &str) -> Result<String, MethodCallFailed> {
     // `..`/`.` segment against the real filesystem), THEN check that the
     // fully-resolved path is contained within the sandbox root. The
     // sandbox root is the process current working directory.
-    let sandbox_root = match fs::canonicalize(std::env::current_dir().unwrap_or_default()) {
-        Ok(r) => r,
-        Err(_) => {
-            // Can't establish a sandbox root — fall back to the textual
-            // `..`-component rejection so we never silently accept a
-            // traversal.
-            if Path::new(path)
-                .components()
-                .any(|c| matches!(c, std::path::Component::ParentDir))
-            {
-                return Err(MethodCallFailed::InternalError(VmError::Runtime(
-                    RuntimeError::SecurityException {
-                        message: format!("Path traversal detected: {}", path),
-                    },
-                )));
-            }
-            return Ok(path.to_string());
-        }
-    };
+    let sandbox_root = cwd_sandbox_root(std::env::current_dir())?;
 
     // Resolve the path against the real filesystem. If the path itself
     // exists, canonicalize it directly. If it does not yet exist (e.g.
@@ -510,6 +492,22 @@ pub(crate) fn validate_path(path: &str) -> Result<String, MethodCallFailed> {
     }
 
     Ok(canonical.to_string_lossy().into_owned())
+}
+
+fn cwd_sandbox_root(cwd: io::Result<PathBuf>) -> Result<PathBuf, MethodCallFailed> {
+    let cwd = cwd.map_err(|e| {
+        MethodCallFailed::InternalError(VmError::Runtime(RuntimeError::SecurityException {
+            message: format!("Unable to establish CWD sandbox root: {e}"),
+        }))
+    })?;
+    fs::canonicalize(&cwd).map_err(|e| {
+        MethodCallFailed::InternalError(VmError::Runtime(RuntimeError::SecurityException {
+            message: format!(
+                "Unable to canonicalize CWD sandbox root {}: {e}",
+                cwd.display()
+            ),
+        }))
+    })
 }
 
 /// Convenience: validate and return path, or an IO-style error.
@@ -12956,10 +12954,14 @@ const EVENT_DELETE: i32 = 2;
 const EVENT_MODIFY: i32 = 4;
 
 fn alloc_synthetic(ctx: &mut dyn NativeContext, class_name: &str, num_fields: usize) -> ObjectRef {
-    match ctx.ensure_class_initialized(class_name) {
-        Ok(cid) => ctx.alloc_object(cid, num_fields),
-        Err(_) => ctx.alloc_object(ClassId::new(0), num_fields),
-    }
+    let cid = match ctx.ensure_class_initialized(class_name) {
+        Ok(cid) => cid,
+        Err(_) => match ctx.class_id_by_name(class_name) {
+            Some(cid) => cid,
+            None => ctx.ensure_synthetic_class(class_name, num_fields),
+        },
+    };
+    ctx.alloc_object(cid, num_fields)
 }
 
 fn obj_arg92(args: &[Value], index: usize) -> Result<ObjectRef, MethodCallFailed> {
@@ -13045,6 +13047,38 @@ fn register_async_file_channel(r: &mut NativeMethodRegistry) {
 
     // isOpen() → boolean
     r.register(afc, "isOpen", "()Z", native_afc_is_open);
+
+    let completed_future = "java/util/concurrent/CompletedFuture";
+    r.register(
+        completed_future,
+        "cancel",
+        "(Z)Z",
+        native_completed_future_cancel,
+    );
+    r.register(
+        completed_future,
+        "isCancelled",
+        "()Z",
+        native_completed_future_is_cancelled,
+    );
+    r.register(
+        completed_future,
+        "isDone",
+        "()Z",
+        native_completed_future_is_done,
+    );
+    r.register(
+        completed_future,
+        "get",
+        "()Ljava/lang/Object;",
+        native_completed_future_get,
+    );
+    r.register(
+        completed_future,
+        "get",
+        "(JLjava/util/concurrent/TimeUnit;)Ljava/lang/Object;",
+        native_completed_future_get,
+    );
     r.set_category(__prev_cat);
 }
 
@@ -13181,12 +13215,12 @@ fn native_afc_read_handler(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         Err(e) => {
             // Call handler.failed(exception, attachment)
             let exc_msg = format!("{:?}", e);
-            let exc_str = ctx.create_string(&exc_msg);
+            let exc = afc_io_exception(ctx, &exc_msg);
             let _ = ctx.invoke_virtual(
                 handler,
                 "failed",
                 "(Ljava/lang/Throwable;Ljava/lang/Object;)V",
-                &[Value::Object(Some(exc_str)), attachment],
+                &[Value::Object(Some(exc)), attachment],
             );
         }
         _ => {}
@@ -13225,12 +13259,12 @@ fn native_afc_write_handler(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         }
         Err(e) => {
             let exc_msg = format!("{:?}", e);
-            let exc_str = ctx.create_string(&exc_msg);
+            let exc = afc_io_exception(ctx, &exc_msg);
             let _ = ctx.invoke_virtual(
                 handler,
                 "failed",
                 "(Ljava/lang/Throwable;Ljava/lang/Object;)V",
-                &[Value::Object(Some(exc_str)), attachment],
+                &[Value::Object(Some(exc)), attachment],
             );
         }
         _ => {}
@@ -13276,6 +13310,58 @@ fn wrap_completed_future(ctx: &mut dyn NativeContext, value: Value) -> Value {
     ctx.set_field(future, 0, value);
     ctx.set_field(future, 1, Value::Int(1)); // done
     Value::Object(Some(future))
+}
+
+fn native_completed_future_cancel(
+    _ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    Ok(Some(Value::Int(0)))
+}
+
+fn native_completed_future_is_cancelled(
+    _ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    Ok(Some(Value::Int(0)))
+}
+
+fn native_completed_future_is_done(
+    _ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    Ok(Some(Value::Int(1)))
+}
+
+fn native_completed_future_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    Ok(Some(ctx.get_field(this, 0)))
+}
+
+fn afc_io_exception(ctx: &mut dyn NativeContext, message: &str) -> ObjectRef {
+    let msg = ctx.create_string(message);
+    let msg_root = ctx.add_global_root(msg);
+    let msg_now = ctx.resolve_global_root(msg_root).unwrap_or(msg);
+    let constructed = ctx.new_object_initialized(
+        "java/io/IOException",
+        "(Ljava/lang/String;)V",
+        &[Value::Object(Some(msg_now))],
+    );
+
+    let exc = match constructed {
+        Ok(Some(Value::Object(Some(exc)))) => exc,
+        _ => {
+            let exc = alloc_synthetic(ctx, "java/io/IOException", 2);
+            let msg_now = ctx.resolve_global_root(msg_root).unwrap_or(msg);
+            ctx.set_field_by_name(exc, "detailMessage", Value::Object(Some(msg_now)));
+            exc
+        }
+    };
+    let _ = ctx.remove_global_root(msg_root);
+    exc
 }
 
 // ---------------------------------------------------------------------------
@@ -15422,6 +15508,47 @@ mod io_tests {
     }
 
     #[test]
+    fn path_validation_confined_root_lookup_failure_fails_closed() {
+        let result = cwd_sandbox_root(Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "cwd vanished",
+        )));
+
+        assert!(result.is_err(), "CWD lookup failure was accepted");
+        let err = format!("{:?}", result.unwrap_err());
+        assert!(
+            err.contains("Unable to establish CWD sandbox root"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn path_validation_confined_root_canonicalization_failure_fails_closed() {
+        let mut missing = std::env::temp_dir();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        missing.push(format!("cratonvm_missing_cwd_root_{nanos}"));
+        assert!(
+            !missing.exists(),
+            "test root unexpectedly exists: {missing:?}"
+        );
+
+        let result = cwd_sandbox_root(Ok(missing));
+
+        assert!(
+            result.is_err(),
+            "CWD root canonicalization failure was accepted"
+        );
+        let err = format!("{:?}", result.unwrap_err());
+        assert!(
+            err.contains("Unable to canonicalize CWD sandbox root"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
     fn path_validation_rejects_null_byte() {
         set_path_validation_enabled(true);
         let result = validate_path("/etc/passwd\0.txt");
@@ -15730,6 +15857,119 @@ mod io_tests {
         let _ = native_afc_close(&mut ctx, &[Value::Object(Some(channel))]);
         let _ = std::fs::remove_file(&path);
         set_path_confine_to_cwd(prev_confine);
+    }
+
+    #[test]
+    fn async_file_completed_future_methods_are_registered_and_completed() {
+        let mut registry = NativeMethodRegistry::new();
+        register_async_file_channel(&mut registry);
+        let cancel = registry
+            .find("java/util/concurrent/CompletedFuture", "cancel", "(Z)Z")
+            .expect("CompletedFuture.cancel must be registered");
+        let is_cancelled = registry
+            .find("java/util/concurrent/CompletedFuture", "isCancelled", "()Z")
+            .expect("CompletedFuture.isCancelled must be registered");
+        let is_done = registry
+            .find("java/util/concurrent/CompletedFuture", "isDone", "()Z")
+            .expect("CompletedFuture.isDone must be registered");
+        let get = registry
+            .find(
+                "java/util/concurrent/CompletedFuture",
+                "get",
+                "()Ljava/lang/Object;",
+            )
+            .expect("CompletedFuture.get must be registered");
+        let timed_get = registry
+            .find(
+                "java/util/concurrent/CompletedFuture",
+                "get",
+                "(JLjava/util/concurrent/TimeUnit;)Ljava/lang/Object;",
+            )
+            .expect("CompletedFuture timed get must be registered");
+
+        let mut ctx = MockNativeContext::new();
+        let future = match wrap_completed_future(&mut ctx, Value::Int(123)) {
+            Value::Object(Some(o)) => o,
+            other => panic!("expected future object, got {other:?}"),
+        };
+
+        assert_eq!(
+            get(&mut ctx, &[Value::Object(Some(future))]).unwrap(),
+            Some(Value::Int(123))
+        );
+        assert_eq!(
+            timed_get(
+                &mut ctx,
+                &[
+                    Value::Object(Some(future)),
+                    Value::Long(1),
+                    Value::Object(None),
+                ],
+            )
+            .unwrap(),
+            Some(Value::Int(123))
+        );
+        assert_eq!(
+            is_done(&mut ctx, &[Value::Object(Some(future))]).unwrap(),
+            Some(Value::Int(1))
+        );
+        assert_eq!(
+            cancel(&mut ctx, &[Value::Object(Some(future)), Value::Int(1)],).unwrap(),
+            Some(Value::Int(0))
+        );
+        assert_eq!(
+            is_cancelled(&mut ctx, &[Value::Object(Some(future))]).unwrap(),
+            Some(Value::Int(0))
+        );
+    }
+
+    #[test]
+    fn async_file_completion_handler_failed_receives_throwable() {
+        let mut ctx = MockNativeContext::new();
+        let channel = ctx.alloc_object(AFC_NUM_FIELDS);
+        ctx.set_field(channel, AFC_FIELD_OPEN, Value::Int(0));
+        ctx.set_field(channel, AFC_FIELD_FD, Value::Int(1));
+        let bb = alloc_byte_buffer(&mut ctx, 4);
+        let handler = ctx.alloc_object_with_class(0, "java/nio/channels/CompletionHandler");
+
+        let result = native_afc_read_handler(
+            &mut ctx,
+            &[
+                Value::Object(Some(channel)),
+                Value::Object(Some(bb)),
+                Value::Long(0),
+                Value::Object(None),
+                Value::Object(Some(handler)),
+            ],
+        );
+
+        assert!(result.is_ok(), "handler path returned error: {result:?}");
+        let calls = ctx.recorded_calls();
+        assert_eq!(calls.len(), 1, "unexpected calls: {calls:?}");
+        let call = &calls[0];
+        assert_eq!(call.method_name, "failed");
+        assert_eq!(
+            call.descriptor,
+            "(Ljava/lang/Throwable;Ljava/lang/Object;)V"
+        );
+        let thrown = match call.args.first() {
+            Some(Value::Object(Some(o))) => *o,
+            other => panic!("failed() first argument was not an object: {other:?}"),
+        };
+        assert!(
+            ctx.read_string(thrown).is_none(),
+            "failed() received a Java String instead of Throwable"
+        );
+        let thrown_class = ctx.class_name_of_id(ctx.class_id_of_object(thrown));
+        assert_eq!(thrown_class.as_deref(), Some("java/io/IOException"));
+        let message = match ctx.get_field_by_name(thrown, "detailMessage") {
+            Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+            other => panic!("throwable detailMessage was not a string: {other:?}"),
+        };
+        assert!(
+            message.contains("AsynchronousFileChannel is closed"),
+            "unexpected throwable message: {message}"
+        );
     }
 
     #[test]
