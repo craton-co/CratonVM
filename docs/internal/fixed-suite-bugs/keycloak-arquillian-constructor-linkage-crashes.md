@@ -1,8 +1,9 @@
 # Keycloak Arquillian constructor linkage crashes
 
-Status: open
+Status: fixed
 
 Date observed: 2026-07-02
+Date fixed: 2026-07-02
 
 ## Summary
 
@@ -46,7 +47,27 @@ rc=1
 seconds=5.287
 ```
 
-## Initial Diagnosis
+## Resolution
+
+This was a Keycloak suite-runner classpath defect, not 546 independent
+`Arquillian.<init>(Class)` VM linkage defects.
+
+`apps\keycloak-suite-runner\run-keycloak-suite.ps1` now builds and caches a
+Maven test runtime classpath per selected module. For long Windows classpaths it
+generates a pathing JAR with a folded manifest `Class-Path`, so both HotSpot and
+CratonVM can launch the same accurate dependency set without exceeding command
+line limits.
+
+For `testsuite/integration-arquillian/tests/base`, the generated classpath
+contains:
+
+- `keycloak-tests-utils-shared`, which provides
+  `org.keycloak.testsuite.util.oauth.AccessTokenResponse`
+- `arquillian-junit-core`
+- matching JUnit Platform/Jupiter runtime entries inferred from the module's
+  Maven dependency versions
+
+## Original Diagnosis
 
 This is not yet confirmed as 546 independent VM bugs. The expanded run used the
 single generated `apps\keycloak\kc-universal-cp.txt` classpath. That classpath
@@ -60,10 +81,24 @@ is incomplete for the expanded Keycloak suite:
   `Arquillian.<init>(Ljava/lang/Class;)V`; `javap` shows that constructor exists
   in the locally available Arquillian JUnit jars.
 
-The current suspicion is an invalid test runtime classpath and/or a CratonVM
+The current suspicion was an invalid test runtime classpath and/or a CratonVM
 method-resolution path that reports the missing superclass dependency as a
-missing constructor. The first step is to rebuild a module-accurate classpath for
-the Arquillian tests and rerun a small sample under both HotSpot and CratonVM.
+missing constructor.
+
+The classpath suspicion was confirmed: once launched through the generated
+module classpath and pathing JAR, HotSpot discovered 59 tests and CratonVM no
+longer reported the Arquillian constructor as missing.
+
+The same CratonVM probe then reached a later, separate linkage failure:
+
+```text
+NoSuchMethodError
+method="java/lang/String.getAnnotation(Ljava/lang/Class;)Ljava/lang/annotation/Annotation;"
+caller="java/lang/Package.getAnnotation(Ljava/lang/Class;)Ljava/lang/annotation/Annotation; @pc=8"
+```
+
+That residual belongs to the existing package annotation reflection gap, not to
+the Arquillian constructor issue.
 
 ## Repro
 
@@ -88,12 +123,11 @@ C:\craton\CratonVM-keycloak-runner-others-20260702-01\apps\keycloak-suite-runner
 C:\craton\CratonVM-keycloak-runner-others-20260702-01\apps\keycloak-suite-runner\.suite\results\hotspot-crash-signature-probe-20260702-01\hotspot-jit\results.tsv
 ```
 
-## Next Steps
+## Verification
 
-- Generate a module-specific Maven test classpath for
-  `testsuite/integration-arquillian/tests/base`.
-- Ensure `arquillian-junit-core` and Keycloak testsuite utility classes are on
-  that classpath.
-- Rerun a one-class HotSpot/CratonVM comparison.
-- If HotSpot passes discovery but CratonVM still reports this constructor as
-  missing, reduce to `KcArquillian.<init>` superclass invocation.
+- HotSpot one-class probe with module pathing JAR:
+  `org.keycloak.testsuite.account.AccountRestServiceTest`
+  reached Arquillian discovery, found 59 tests, and failed later because
+  `auth-server-undertow` was not configured.
+- CratonVM one-class probe with the same pathing JAR no longer reported
+  `org/jboss/arquillian/junit/Arquillian.<init>(Ljava/lang/Class;)V`.
