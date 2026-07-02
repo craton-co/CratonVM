@@ -343,6 +343,7 @@ mod tests {
             this_field_cps: vec![],
             writes_param_mask: 0,
             is_reduction: false,
+            allow_div_by_zero: false,
         };
         let params = build_param_list(&sig);
         // (a_ptr, a_len, b_ptr, b_len, ret_ptr, ret_len, failure_flag) = 7
@@ -366,12 +367,54 @@ mod tests {
             this_field_cps: vec![],
             writes_param_mask: 0,
             is_reduction: false,
+            allow_div_by_zero: false,
         };
         let params = build_param_list(&sig);
         // (a_ptr, a_len, b_ptr, b_len, ret_ptr, failure_flag) = 6
         assert_eq!(params.len(), 6);
         assert_eq!(params[4].name, "ret_ptr");
         assert_eq!(params[5].name, "failure_flag");
+    }
+
+    fn lower_i32_remainder_body(allow_div_by_zero: bool) -> String {
+        let bytes = [0x1A, 0x1B, 0x70, 0xAC]; // iload_0; iload_1; irem; ireturn
+        let sig = KernelSignature {
+            param_kinds: vec![ParamKind::I32, ParamKind::I32],
+            return_kind: ParamKind::I32,
+            estimated_work: 1,
+            needs_d2h_sync: false,
+            this_field_cps: vec![],
+            writes_param_mask: 0,
+            is_reduction: false,
+            allow_div_by_zero,
+        };
+        let mut emitter = Emitter::new(&bytes, &sig);
+        emitter.bind_param_locals().expect("bind params");
+        emitter.walk(0, bytes.len(), None).expect("lower irem body");
+        emitter.finalize_epilogue();
+        emitter.into_body()
+    }
+
+    #[test]
+    fn strict_integer_remainder_emits_zero_guard() {
+        let text = lower_i32_remainder_body(false);
+        assert!(text.contains("setp.eq.s32"));
+        assert!(text.contains("bra L_bounds_fail"));
+        assert!(text.contains("L_bounds_fail:"));
+    }
+
+    #[test]
+    fn allow_div_by_zero_skips_integer_remainder_zero_guard() {
+        let text = lower_i32_remainder_body(true);
+        assert!(text.contains("rem.s32"));
+        assert!(
+            !text.contains("setp.eq.s32"),
+            "AllowDivByZero must skip the zero-divisor predicate\n{text}"
+        );
+        assert!(
+            !text.contains("L_bounds_fail:"),
+            "irem with AllowDivByZero has no deopt guard to emit\n{text}"
+        );
     }
 
     // ─────────────── real-class lowering tests ──────────────────────
@@ -581,27 +624,19 @@ mod tests {
         assert!(matches!(shape, super::loop_recog::LoopShape::StraightLine));
     }
 
-    // AUDIT 2026-05-16: `frem`/`drem` previously emitted a non-existent
-    // `rem.f32`/`rem.f64` PTX mnemonic that ptxas rejects on every
-    // kernel. The fix routes both through `LoweringError::UnsupportedNode`
-    // so the analyzer skips the method entirely. These two tests pin the
-    // behavior so the bug cannot regress.
+    // AUDIT 2026-05-16/2026-07-02: `frem`/`drem` previously emitted a
+    // non-existent `rem.f32`/`rem.f64` PTX mnemonic, then drifted into an
+    // analyzer-eligible/lowering-rejected split. The analyzer now rejects
+    // these methods before lowering. The emitter keeps its defensive
+    // UnsupportedNode arms, but normal admission must never reach them.
 
     #[test]
-    fn frem_is_rejected_by_lowering() {
+    fn frem_is_rejected_by_analyzer() {
         let method = load_method("FloatRemainder", "fremScalar", "(FF)F");
-        // `fremScalar` is a straight-line method — analyze decides it is
-        // eligible. Lowering must then reject `frem` (0x72).
-        let sig = match analyze(&method) {
-            OffloadVerdict::Eligible(s) => s,
-            v => panic!("expected FloatRemainder.fremScalar to be analyzer-eligible, got {v:?}"),
-        };
-        let err = lower_method("FloatRemainder", &method, &sig, 7, 5)
-            .expect_err("frem must not lower (PTX has no rem.f32)");
-        let msg = format!("{err}");
-        assert!(
-            msg.contains("frem"),
-            "expected error message to mention 'frem', got: {msg}",
+        assert_eq!(
+            analyze(&method),
+            OffloadVerdict::Rejected(crate::analyzer::Reason::FloatRemainder),
+            "frem must be rejected before lowering"
         );
     }
 
@@ -709,18 +744,12 @@ mod tests {
     }
 
     #[test]
-    fn drem_is_rejected_by_lowering() {
+    fn drem_is_rejected_by_analyzer() {
         let method = load_method("FloatRemainder", "dremScalar", "(DD)D");
-        let sig = match analyze(&method) {
-            OffloadVerdict::Eligible(s) => s,
-            v => panic!("expected FloatRemainder.dremScalar to be analyzer-eligible, got {v:?}"),
-        };
-        let err = lower_method("FloatRemainder", &method, &sig, 7, 5)
-            .expect_err("drem must not lower (PTX has no rem.f64)");
-        let msg = format!("{err}");
-        assert!(
-            msg.contains("drem"),
-            "expected error message to mention 'drem', got: {msg}",
+        assert_eq!(
+            analyze(&method),
+            OffloadVerdict::Rejected(crate::analyzer::Reason::FloatRemainder),
+            "drem must be rejected before lowering"
         );
     }
 }

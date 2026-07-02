@@ -937,23 +937,27 @@ impl<'a> Emitter<'a> {
 
     /// AUDIT 2026-05-16: Java throws ArithmeticException on integer
     /// divide-by-zero and silently wraps `INT_MIN / -1`. PTX
-    /// `div.s32`/`rem.s32` are undefined in both cases. Guard with
-    /// predicates that branch to the deopt exit (`bounds_fail_label`,
-    /// which sets the failure flag and returns — the VM then re-runs
-    /// the method on the CPU with proper Java semantics).
+    /// `div.s32`/`rem.s32` are undefined in both cases. In strict mode,
+    /// guard with predicates that branch to the deopt exit
+    /// (`bounds_fail_label`, which sets the failure flag and returns —
+    /// the VM then re-runs the method on the CPU with proper Java
+    /// semantics). `ALLOW_DIV_BY_ZERO` skips only the zero-divisor guard.
     fn div_or_rem_i32(&mut self, mnemonic: &str, is_div: bool) -> Result<(), LoweringError> {
         let b = self.stack.pop()?; // divisor
         let a = self.stack.pop()?; // dividend
-        self.used_bounds_label = true;
-        // Zero-divisor guard (applies to both div and rem).
-        let p_zero = self.regs.fresh_reg(RegKind::Pred);
-        writeln!(self.body, "    setp.eq.s32 {}, {}, 0;", p_zero.name, b.name).unwrap();
-        writeln!(
-            self.body,
-            "    @{} bra {};",
-            p_zero.name, self.bounds_fail_label
-        )
-        .unwrap();
+        let guard_zero = !self.sig.allow_div_by_zero;
+        self.used_bounds_label |= guard_zero || is_div;
+        if guard_zero {
+            // Zero-divisor guard (applies to both div and rem).
+            let p_zero = self.regs.fresh_reg(RegKind::Pred);
+            writeln!(self.body, "    setp.eq.s32 {}, {}, 0;", p_zero.name, b.name).unwrap();
+            writeln!(
+                self.body,
+                "    @{} bra {};",
+                p_zero.name, self.bounds_fail_label
+            )
+            .unwrap();
+        }
         // INT_MIN / -1 overflow guard (div only; Java rem of INT_MIN by
         // -1 is defined as 0 so PTX rem.s32 needs no extra guard once
         // the divisor is non-zero).
@@ -1007,15 +1011,18 @@ impl<'a> Emitter<'a> {
     fn div_or_rem_i64(&mut self, mnemonic: &str, is_div: bool) -> Result<(), LoweringError> {
         let b = self.stack.pop()?;
         let a = self.stack.pop()?;
-        self.used_bounds_label = true;
-        let p_zero = self.regs.fresh_reg(RegKind::Pred);
-        writeln!(self.body, "    setp.eq.s64 {}, {}, 0;", p_zero.name, b.name).unwrap();
-        writeln!(
-            self.body,
-            "    @{} bra {};",
-            p_zero.name, self.bounds_fail_label
-        )
-        .unwrap();
+        let guard_zero = !self.sig.allow_div_by_zero;
+        self.used_bounds_label |= guard_zero || is_div;
+        if guard_zero {
+            let p_zero = self.regs.fresh_reg(RegKind::Pred);
+            writeln!(self.body, "    setp.eq.s64 {}, {}, 0;", p_zero.name, b.name).unwrap();
+            writeln!(
+                self.body,
+                "    @{} bra {};",
+                p_zero.name, self.bounds_fail_label
+            )
+            .unwrap();
+        }
         if is_div {
             let p_min = self.regs.fresh_reg(RegKind::Pred);
             let p_neg1 = self.regs.fresh_reg(RegKind::Pred);
