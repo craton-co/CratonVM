@@ -552,20 +552,28 @@ mod tests {
         );
     }
 
-    /// `ptxas` round-trip — `#[ignore]` by default because most CI
-    /// boxes have no CUDA toolkit. Set `PTXAS` env var to override
-    /// the binary location; otherwise we look for `ptxas` on PATH.
+    /// `ptxas` round-trip. This is ignored by default and becomes a
+    /// regular test when the `gpu-it` feature is enabled. Set `PTXAS`
+    /// to override the binary location; otherwise we look for `ptxas`
+    /// on PATH.
     #[test]
-    #[ignore = "requires NVIDIA CUDA toolkit (`ptxas`) — manual GPU verification"]
+    #[cfg_attr(
+        not(feature = "gpu-it"),
+        ignore = "requires NVIDIA CUDA toolkit (`ptxas`); enable feature `gpu-it` to run"
+    )]
     fn ptxas_round_trip_vector_add() {
         let m = lower_fixture("EligibleVectorAdd", "vectorAdd", "([I[I[I)V");
         let text = m.render();
         let tmpdir = std::env::temp_dir();
-        let src_path = tmpdir.join("jit_cuda_vector_add.ptx");
+        let stem = format!("cratonvm_jit_cuda_vector_add_{}", std::process::id());
+        let src_path = tmpdir.join(format!("{stem}.ptx"));
+        let out_path = tmpdir.join(format!("{stem}.cubin"));
         std::fs::write(&src_path, &text).expect("write ptx");
         let ptxas = std::env::var("PTXAS").unwrap_or_else(|_| "ptxas".to_string());
         let out = std::process::Command::new(&ptxas)
             .arg("-arch=sm_75")
+            .arg("-o")
+            .arg(&out_path)
             .arg(&src_path)
             .output()
             .expect("invoke ptxas");

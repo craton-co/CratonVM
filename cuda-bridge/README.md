@@ -10,7 +10,7 @@ allocation, memcpy, and kernel launch.
 | --------------- | ---------------------------------------------------------------------------- |
 | _none_          | Crate compiles; every entry point returns `DeviceError::NoDriver`.           |
 | `cuda`          | Real driver bindings via `cudarc`. Requires CUDA Toolkit 12.x.               |
-| `gpu-it`        | Enables `cuda` plus tests that launch real kernels (need an attached GPU).   |
+| `gpu-it`        | Reserved driver-backed integration alias for `cuda`; no local GPU tests yet. |
 
 ## CUDA toolkit version
 
@@ -24,19 +24,19 @@ than a runtime crash.
 ## Usage sketch
 
 ```ignore
-let ctx = cuda_bridge::DeviceContext::new(0)?;
-let module = cuda_bridge::DeviceModule::from_ptx(&ctx, PTX, &["vector_add"])?;
-let a = cuda_bridge::DeviceBuffer::from_host(&ctx, &[1i32, 2, 3, 4])?;
-let b = cuda_bridge::DeviceBuffer::from_host(&ctx, &[10i32, 20, 30, 40])?;
-let out = cuda_bridge::DeviceBuffer::<i32>::zeros(&ctx, 4)?;
-let cfg = cuda_bridge::LaunchConfig::elementwise(4);
+let ctx = cratonvm_cuda_bridge::DeviceContext::new(0)?;
+let module = cratonvm_cuda_bridge::DeviceModule::from_ptx(&ctx, PTX, &["vector_add"])?;
+let a = cratonvm_cuda_bridge::DeviceBuffer::from_host(&ctx, &[1i32, 2, 3, 4])?;
+let b = cratonvm_cuda_bridge::DeviceBuffer::from_host(&ctx, &[10i32, 20, 30, 40])?;
+let out = cratonvm_cuda_bridge::DeviceBuffer::<i32>::zeros(&ctx, 4)?;
+let cfg = cratonvm_cuda_bridge::LaunchConfig::elementwise(4);
 
 // Build the argument list with the `KernelArgs` builder: each
 // `push_*` call appends one kernel parameter in declaration order.
 // `push_device_ptr` retains a keep-alive handle to the buffer's
 // device allocation, so the buffers cannot be freed before the
 // launch reads them.
-let args = cuda_bridge::KernelArgs::new()
+let args = cratonvm_cuda_bridge::KernelArgs::new()
     .push_device_ptr(&a)
     .push_device_ptr(&b)
     .push_device_ptr(&out)

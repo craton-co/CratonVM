@@ -37,7 +37,8 @@ optional = true
 default = []
 # Compile against a real libcuda / nvcuda.dll via cudarc.
 cuda = ["dep:cudarc"]
-# Run integration tests that require an attached NVIDIA GPU.
+# Reserved for driver-backed integration jobs; today this is an alias
+# for `cuda` because this crate has no local kernel-launching GPU tests.
 gpu-it = ["cuda"]
 
 [lints]
