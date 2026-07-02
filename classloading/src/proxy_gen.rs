@@ -143,7 +143,34 @@ pub struct ProxyMethod {
 /// populated by a generated `<clinit>` that resolves each method via
 /// `Class.forName(iface).getMethod(name, paramTypes)`. Each method body
 /// then uses `GETSTATIC m_<i>` instead of recreating a `Method` per call.
+fn invalid_proxy_classfile(class_name: &str, message: impl Into<String>) -> ClassFileError {
+    ClassFileError::InvalidClassFile {
+        class_name: class_name.to_string(),
+        message: message.into(),
+    }
+}
+
+/// Emit a JVM classfile for the given proxy spec.
 pub fn emit_proxy_classfile(spec: &ProxyClassSpec) -> Result<Vec<u8>, ClassFileError> {
+    if spec.interfaces.len() > u16::MAX as usize {
+        return Err(invalid_proxy_classfile(
+            &spec.gen_class_name,
+            format!(
+                "proxy implements {} interfaces, exceeding the classfile u2 limit",
+                spec.interfaces.len()
+            ),
+        ));
+    }
+    if spec.methods.len() > (u16::MAX as usize).saturating_sub(3) {
+        return Err(invalid_proxy_classfile(
+            &spec.gen_class_name,
+            format!(
+                "proxy declares {} methods, exceeding the classfile methods_count limit",
+                spec.methods.len().saturating_add(3)
+            ),
+        ));
+    }
+
     let mut cp = CpBuilder::new();
 
     // Resolve all class/method/string CP indices we'll need up-front.
@@ -257,6 +284,8 @@ pub fn emit_proxy_classfile(spec: &ProxyClassSpec) -> Result<Vec<u8>, ClassFileE
     }
 
     // ── Assemble ClassFile (JVMS §4.1) ───────────────────────────────────
+    cp.check(&spec.gen_class_name)?;
+
     let mut out = Vec::with_capacity(
         256 + cp.entries.len() + method_blobs.iter().map(|b| b.len()).sum::<usize>(),
     );
@@ -497,6 +526,7 @@ pub struct CpBuilder {
     /// 12+ allocations-per-method overhead on `proxy_gen` emission.
     utf8_dedup: HashMap<String, u16>,
     count: u16,
+    error: Option<String>,
 }
 
 impl CpBuilder {
@@ -506,6 +536,7 @@ impl CpBuilder {
             dedup: HashMap::new(),
             utf8_dedup: HashMap::new(),
             count: 0,
+            error: None,
         }
     }
 
@@ -513,11 +544,28 @@ impl CpBuilder {
     /// emission never produces them (no LDC2_W of a long/double constant),
     /// so the simple +1 is sufficient.
     fn next_index(&mut self) -> u16 {
-        self.count = self
-            .count
-            .checked_add(1)
-            .expect("constant pool overflow (>65535 entries)");
+        if self.error.is_some() {
+            return 0;
+        }
+        if self.count >= u16::MAX - 1 {
+            return self.fail("constant pool overflow (>65534 entries)");
+        }
+        self.count += 1;
         self.count
+    }
+
+    fn fail(&mut self, message: impl Into<String>) -> u16 {
+        if self.error.is_none() {
+            self.error = Some(message.into());
+        }
+        0
+    }
+
+    fn check(&self, class_name: &str) -> Result<(), ClassFileError> {
+        match &self.error {
+            Some(message) => Err(invalid_proxy_classfile(class_name, message.clone())),
+            None => Ok(()),
+        }
     }
 
     /// CONSTANT_Utf8 (tag 1, JVMS §4.4.7).
@@ -527,13 +575,21 @@ impl CpBuilder {
     /// cache miss. `HashMap<String, _>::get(&str)` works because
     /// `String: Borrow<str>` — the lookup hashes the `&str` directly.
     pub fn add_utf8(&mut self, s: &str) -> u16 {
+        if self.error.is_some() {
+            return 0;
+        }
         if let Some(&i) = self.utf8_dedup.get(s) {
             return i;
         }
-        let idx = self.next_index();
-        self.entries.push(1);
         let bytes = s.as_bytes();
-        assert!(bytes.len() <= u16::MAX as usize, "UTF-8 entry too long");
+        if bytes.len() > u16::MAX as usize {
+            return self.fail(format!("UTF-8 entry too long: {} bytes", bytes.len()));
+        }
+        let idx = self.next_index();
+        if idx == 0 {
+            return 0;
+        }
+        self.entries.push(1);
         self.entries
             .extend_from_slice(&(bytes.len() as u16).to_be_bytes());
         self.entries.extend_from_slice(bytes);
@@ -548,7 +604,13 @@ impl CpBuilder {
             return i;
         }
         let name_idx = self.add_utf8(internal_name);
+        if name_idx == 0 {
+            return 0;
+        }
         let idx = self.next_index();
+        if idx == 0 {
+            return 0;
+        }
         self.entries.push(7);
         self.entries.extend_from_slice(&name_idx.to_be_bytes());
         self.dedup.insert(key, idx);
@@ -558,11 +620,17 @@ impl CpBuilder {
     /// CONSTANT_String (tag 8).
     pub fn add_string(&mut self, s: &str) -> u16 {
         let utf8_idx = self.add_utf8(s);
+        if utf8_idx == 0 {
+            return 0;
+        }
         let key = CpKey::String(utf8_idx);
         if let Some(&i) = self.dedup.get(&key) {
             return i;
         }
         let idx = self.next_index();
+        if idx == 0 {
+            return 0;
+        }
         self.entries.push(8);
         self.entries.extend_from_slice(&utf8_idx.to_be_bytes());
         self.dedup.insert(key, idx);
@@ -573,11 +641,17 @@ impl CpBuilder {
     pub fn add_name_and_type(&mut self, name: &str, desc: &str) -> u16 {
         let n = self.add_utf8(name);
         let d = self.add_utf8(desc);
+        if n == 0 || d == 0 {
+            return 0;
+        }
         let key = CpKey::NameAndType(n, d);
         if let Some(&i) = self.dedup.get(&key) {
             return i;
         }
         let idx = self.next_index();
+        if idx == 0 {
+            return 0;
+        }
         self.entries.push(12);
         self.entries.extend_from_slice(&n.to_be_bytes());
         self.entries.extend_from_slice(&d.to_be_bytes());
@@ -593,7 +667,13 @@ impl CpBuilder {
         }
         let class_idx = self.add_class(owner);
         let nat_idx = self.add_name_and_type(name, desc);
+        if class_idx == 0 || nat_idx == 0 {
+            return 0;
+        }
         let idx = self.next_index();
+        if idx == 0 {
+            return 0;
+        }
         self.entries.push(10);
         self.entries.extend_from_slice(&class_idx.to_be_bytes());
         self.entries.extend_from_slice(&nat_idx.to_be_bytes());
@@ -609,7 +689,13 @@ impl CpBuilder {
         }
         let class_idx = self.add_class(owner);
         let nat_idx = self.add_name_and_type(name, desc);
+        if class_idx == 0 || nat_idx == 0 {
+            return 0;
+        }
         let idx = self.next_index();
+        if idx == 0 {
+            return 0;
+        }
         self.entries.push(9);
         self.entries.extend_from_slice(&class_idx.to_be_bytes());
         self.entries.extend_from_slice(&nat_idx.to_be_bytes());
@@ -625,7 +711,13 @@ impl CpBuilder {
         }
         let class_idx = self.add_class(owner);
         let nat_idx = self.add_name_and_type(name, desc);
+        if class_idx == 0 || nat_idx == 0 {
+            return 0;
+        }
         let idx = self.next_index();
+        if idx == 0 {
+            return 0;
+        }
         self.entries.push(11);
         self.entries.extend_from_slice(&class_idx.to_be_bytes());
         self.entries.extend_from_slice(&nat_idx.to_be_bytes());
@@ -640,6 +732,9 @@ impl CpBuilder {
             return i;
         }
         let idx = self.next_index();
+        if idx == 0 {
+            return 0;
+        }
         self.entries.push(3);
         self.entries.extend_from_slice(&value.to_be_bytes());
         self.dedup.insert(key, idx);
@@ -911,6 +1006,45 @@ fn emit_synthetic_one_arg_ctor(
     )
 }
 
+fn checked_iconst_usize(value: usize, context: &str) -> Result<i32, ClassFileError> {
+    if value > i16::MAX as usize {
+        return Err(invalid_proxy_classfile(
+            "",
+            format!("{context} value {value} exceeds current proxy iconst/sipush encoding"),
+        ));
+    }
+    Ok(value as i32)
+}
+
+fn checked_load_slot(slot: u16, method_name: &str) -> Result<u8, ClassFileError> {
+    u8::try_from(slot).map_err(|_| {
+        invalid_proxy_classfile(
+            "",
+            format!(
+                "proxy method {method_name} requires local slot {slot}, exceeding non-wide load encoding"
+            ),
+        )
+    })
+}
+
+fn checked_param_slot_count(params: &[DescKind], method_name: &str) -> Result<u16, ClassFileError> {
+    params.iter().try_fold(0u16, |acc, kind| {
+        acc.checked_add(kind.slots()).ok_or_else(|| {
+            invalid_proxy_classfile(
+                "",
+                format!("proxy method {method_name} parameter slots exceed u2 max_locals"),
+            )
+        })
+    })
+}
+
+fn checked_proxy_max_stack(units: u16, context: &str) -> Result<u16, ClassFileError> {
+    4u16.checked_add(units.checked_mul(2).ok_or_else(|| {
+        invalid_proxy_classfile("", format!("{context} max_stack calculation overflowed"))
+    })?)
+    .ok_or_else(|| invalid_proxy_classfile("", format!("{context} max_stack exceeds u2 limit")))
+}
+
 /// Emit method_info for one proxy method (delegating into
 /// `Proxy$Dispatch.invokeProxy`).
 ///
@@ -935,6 +1069,7 @@ fn emit_proxy_method(
 
     let params = descriptor_param_slots(&m.descriptor)?;
     let ret = descriptor_return(&m.descriptor)?;
+    let param_count_i32 = checked_iconst_usize(params.len(), "proxy method parameter count")?;
 
     let mut code = CodeBuilder::new();
 
@@ -944,13 +1079,14 @@ fn emit_proxy_method(
     code.bytes.push(0xB2 /* GETSTATIC */);
     code.bytes.extend_from_slice(&m_field_ref.to_be_bytes());
     // 3) Build Object[] of length params.len() and box each arg.
-    code.emit_iconst(params.len() as i32);
+    code.emit_iconst(param_count_i32);
     code.emit_anewarray(object_class_idx);
 
-    let mut local_slot: u8 = 1; // 0 = this
+    let mut local_slot: u16 = 1; // 0 = this
     for (i, kind) in params.iter().enumerate() {
+        let load_slot = checked_load_slot(local_slot, &m.name)?;
         code.emit_dup();
-        code.emit_iconst(i as i32);
+        code.emit_iconst(checked_iconst_usize(i, "proxy method argument index")?);
         match kind {
             DescKind::Int => {
                 // For Z/B/C/S/I we must box via the matching wrapper so the
@@ -960,34 +1096,37 @@ fn emit_proxy_method(
                 // byte at this parameter position.
                 let wrapper = int_family_param_wrapper(&m.descriptor, i);
                 let prim_letter = int_family_param_letter(&m.descriptor, i);
-                code.emit_iload(local_slot);
+                code.emit_iload(load_slot);
                 let valueof_desc = format!("({prim_letter})L{wrapper};");
                 let r = cp.add_methodref(wrapper, "valueOf", &valueof_desc);
                 code.emit_invokestatic(r);
             }
             DescKind::Long => {
-                code.emit_lload(local_slot);
+                code.emit_lload(load_slot);
                 let r = cp.add_methodref("java/lang/Long", "valueOf", "(J)Ljava/lang/Long;");
                 code.emit_invokestatic(r);
             }
             DescKind::Float => {
-                code.emit_fload(local_slot);
+                code.emit_fload(load_slot);
                 let r = cp.add_methodref("java/lang/Float", "valueOf", "(F)Ljava/lang/Float;");
                 code.emit_invokestatic(r);
             }
             DescKind::Double => {
-                code.emit_dload(local_slot);
+                code.emit_dload(load_slot);
                 let r = cp.add_methodref("java/lang/Double", "valueOf", "(D)Ljava/lang/Double;");
                 code.emit_invokestatic(r);
             }
             DescKind::Reference(_) => {
-                code.emit_aload(local_slot);
+                code.emit_aload(load_slot);
             }
         }
         code.emit_aastore();
-        local_slot = local_slot
-            .checked_add(kind.slots() as u8)
-            .expect("local slot overflow");
+        local_slot = local_slot.checked_add(kind.slots()).ok_or_else(|| {
+            invalid_proxy_classfile(
+                "",
+                format!("proxy method {} local slot calculation overflowed", m.name),
+            )
+        })?;
     }
 
     // 5) INVOKESTATIC Proxy$Dispatch.invokeProxy(...)
@@ -1067,10 +1206,15 @@ fn emit_proxy_method(
 
     // Conservative max_stack: 4 baseline (this/name/desc/array) + 2*params
     // for safety (room for primitive-load + DUP + box-call temporaries).
-    let param_slot_count: u16 = params.iter().map(|k| k.slots()).sum();
-    let max_stack: u16 = 4 + param_slot_count * 2;
+    let param_slot_count = checked_param_slot_count(&params, &m.name)?;
+    let max_stack = checked_proxy_max_stack(param_slot_count, "proxy method")?;
     // max_locals: 1 (this) + param_slot_count.
-    let max_locals: u16 = 1 + param_slot_count;
+    let max_locals = 1u16.checked_add(param_slot_count).ok_or_else(|| {
+        invalid_proxy_classfile(
+            "",
+            format!("proxy method {} max_locals exceeds u2 limit", m.name),
+        )
+    })?;
     // ACC_PUBLIC | ACC_FINAL (proxy methods are non-overridable).
     let access_flags: u16 = 0x0001 | 0x0010;
 
@@ -1135,7 +1279,10 @@ fn emit_clinit(
         //    NOT JVM slot count — long/double count once each).
         let params = descriptor_param_slots(&m.descriptor)?;
         let param_count = params.len();
-        code.emit_iconst(param_count as i32);
+        code.emit_iconst(checked_iconst_usize(
+            param_count,
+            "proxy <clinit> parameter count",
+        )?);
         code.emit_anewarray(class_class_idx);
 
         // Defensive: param_class_names should match params.len(). If a
@@ -1144,7 +1291,7 @@ fn emit_clinit(
         let names = &m.param_class_names;
         for (j, kind) in params.iter().enumerate() {
             code.emit_dup();
-            code.emit_iconst(j as i32);
+            code.emit_iconst(checked_iconst_usize(j, "proxy <clinit> parameter index")?);
             match kind {
                 // Primitive param → GETSTATIC <Wrapper>.TYPE
                 DescKind::Int => {
@@ -1195,7 +1342,10 @@ fn emit_clinit(
 
         // Per-method peak: 4 baseline (Class + String + Class[] + working
         // slot) + 2*param_count for DUP + per-element push.
-        let peak = 4u16.saturating_add(2u16.saturating_mul(param_count as u16));
+        let peak_units = u16::try_from(param_count).map_err(|_| {
+            invalid_proxy_classfile("", "proxy <clinit> parameter count exceeds u2 limit")
+        })?;
+        let peak = checked_proxy_max_stack(peak_units, "proxy <clinit>")?;
         if peak > max_stack {
             max_stack = peak;
         }
@@ -1578,6 +1728,59 @@ mod tests {
         assert!(descriptor_param_slots("(Ljava/lang/String)V").is_err());
         assert!(descriptor_return("()Q").is_err());
         assert!(descriptor_return("()Ljava/lang/String").is_err());
+    }
+
+    #[test]
+    fn proxy_emit_rejects_oversized_utf8_name_without_panic() {
+        let mut spec = supplier_spec();
+        spec.gen_class_name = format!("pkg/{}", "A".repeat(u16::MAX as usize + 1));
+        let err = emit_proxy_classfile(&spec).expect_err("oversized Utf8 must be rejected");
+        match err {
+            ClassFileError::InvalidClassFile { message, .. } => {
+                assert!(message.contains("UTF-8 entry too long"), "got: {message}");
+            }
+            other => panic!("expected InvalidClassFile, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cp_builder_overflow_records_error_without_panic() {
+        let mut cp = CpBuilder::new();
+        cp.count = u16::MAX - 1;
+        assert_eq!(cp.add_utf8("overflow"), 0);
+        let err = cp.check("Overflow").expect_err("overflow must be recorded");
+        match err {
+            ClassFileError::InvalidClassFile { message, .. } => {
+                assert!(message.contains("constant pool overflow"), "got: {message}");
+            }
+            other => panic!("expected InvalidClassFile, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn proxy_emit_rejects_local_slot_overflow_without_panic() {
+        let param_count = 300usize;
+        let descriptor = format!("({})V", "I".repeat(param_count));
+        let spec = ProxyClassSpec {
+            gen_class_name: "java/lang/reflect/$Proxy_slots".to_string(),
+            super_class: "java/lang/reflect/Proxy$Instance".to_string(),
+            interfaces: vec!["x/ManyArgs".to_string()],
+            methods: vec![ProxyMethod {
+                name: "many".to_string(),
+                descriptor,
+                is_default: false,
+                iface_owner: "x/ManyArgs".to_string(),
+                param_class_names: vec!["java/lang/Integer".to_string(); param_count],
+                exception_types: vec![],
+            }],
+        };
+        let err = emit_proxy_classfile(&spec).expect_err("local slot overflow must be rejected");
+        match err {
+            ClassFileError::InvalidClassFile { message, .. } => {
+                assert!(message.contains("local slot"), "got: {message}");
+            }
+            other => panic!("expected InvalidClassFile, got {other:?}"),
+        }
     }
 
     #[test]
