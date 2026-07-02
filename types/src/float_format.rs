@@ -13,14 +13,13 @@
 //! Both forms always carry at least one fractional digit (`"3.0"`, `"1.0E7"`),
 //! and the exponent has no `+` sign and no leading zeros.
 //!
-//! NOTE: for the smallest subnormals (e.g. `Double.MIN_VALUE`) the JDK emits a
-//! *non-shortest* representation (`"4.9E-324"`) while Ryū yields the genuinely
-//! shortest `"5.0E-324"`; both round-trip to the same bits. We follow Ryū, so
-//! those extreme edge cases differ from HotSpot in their last digit. Every
-//! normal-magnitude value matches HotSpot exactly.
+//! Subnormal values need a small detour: Rust/Ryu can emit shorter strings such
+//! as `"5e-324"` for `Double.MIN_VALUE`, while HotSpot/JDK 25 emits
+//! `"4.9E-324"`. For subnormals only, we generate fixed-scientific candidates
+//! with increasing precision and keep the first one that parses back to the
+//! original bits, matching the JDK output shape.
 
-/// Format an `f64` exactly as `java.lang.Double.toString(double)` does
-/// (modulo the documented smallest-subnormal edge case).
+/// Format an `f64` exactly as `java.lang.Double.toString(double)` does.
 pub fn java_double_to_string(v: f64) -> String {
     if v.is_nan() {
         return "NaN".to_string();
@@ -39,7 +38,11 @@ pub fn java_double_to_string(v: f64) -> String {
         };
     }
     // Shortest round-tripping digits + base-10 exponent of the leading digit.
-    let sci = format!("{:e}", v.abs());
+    let abs = v.abs();
+    if abs < f64::MIN_POSITIVE {
+        return layout_subnormal_f64(v.is_sign_negative(), abs);
+    }
+    let sci = format!("{:e}", abs);
     layout_java(v.is_sign_negative(), &sci)
 }
 
@@ -63,8 +66,75 @@ pub fn java_float_to_string(v: f32) -> String {
             "0.0".to_string()
         };
     }
-    let sci = format!("{:e}", v.abs());
+    let abs = v.abs();
+    if abs < f32::MIN_POSITIVE {
+        return layout_subnormal_f32(v.is_sign_negative(), abs);
+    }
+    let sci = format!("{:e}", abs);
     layout_java(v.is_sign_negative(), &sci)
+}
+
+fn layout_subnormal_f64(negative: bool, abs: f64) -> String {
+    debug_assert!(abs > 0.0 && abs < f64::MIN_POSITIVE);
+    for fractional_digits in 1..=17 {
+        let sci = format!("{:.*e}", fractional_digits, abs);
+        let candidate = layout_fixed_scientific(false, &sci);
+        if candidate
+            .parse::<f64>()
+            .map(|parsed| parsed.to_bits() == abs.to_bits())
+            .unwrap_or(false)
+        {
+            return if negative {
+                format!("-{candidate}")
+            } else {
+                candidate
+            };
+        }
+    }
+    layout_java(negative, &format!("{:.17e}", abs))
+}
+
+fn layout_subnormal_f32(negative: bool, abs: f32) -> String {
+    debug_assert!(abs > 0.0 && abs < f32::MIN_POSITIVE);
+    for fractional_digits in 1..=9 {
+        let sci = format!("{:.*e}", fractional_digits, abs);
+        let candidate = layout_fixed_scientific(false, &sci);
+        if candidate
+            .parse::<f32>()
+            .map(|parsed| parsed.to_bits() == abs.to_bits())
+            .unwrap_or(false)
+        {
+            return if negative {
+                format!("-{candidate}")
+            } else {
+                candidate
+            };
+        }
+    }
+    layout_java(negative, &format!("{:.9e}", abs))
+}
+
+fn layout_fixed_scientific(negative: bool, sci: &str) -> String {
+    let (mantissa, exp_str) = sci.split_once('e').expect("Rust {:e} always has 'e'");
+    let exp: i32 = exp_str.parse().expect("Rust {:e} exponent is an integer");
+    let mut mantissa = mantissa.to_string();
+
+    if let Some(dot) = mantissa.find('.') {
+        while mantissa.ends_with('0') && mantissa.len() > dot + 2 {
+            mantissa.pop();
+        }
+    } else {
+        mantissa.push_str(".0");
+    }
+
+    let mut out = String::new();
+    if negative {
+        out.push('-');
+    }
+    out.push_str(&mantissa);
+    out.push('E');
+    out.push_str(&exp.to_string());
+    out
 }
 
 /// Shared layout from Rust's `{:e}` scientific string (`"d"` or `"d.ddd"`,
@@ -139,7 +209,10 @@ mod tests {
         assert_eq!(java_double_to_string(0.1), "0.1");
         assert_eq!(java_double_to_string(0.001), "0.001");
         assert_eq!(java_double_to_string(0.5), "0.5");
-        assert_eq!(java_double_to_string(0.30000000000000004), "0.30000000000000004");
+        assert_eq!(
+            java_double_to_string(0.30000000000000004),
+            "0.30000000000000004"
+        );
         assert_eq!(java_double_to_string(1.0 / 3.0), "0.3333333333333333");
         assert_eq!(java_double_to_string(9999999.0), "9999999.0"); // < 10^7 → plain
         assert_eq!(java_double_to_string(1000000.0), "1000000.0");
@@ -155,6 +228,19 @@ mod tests {
         assert_eq!(java_double_to_string(1e300), "1.0E300");
         assert_eq!(java_double_to_string(1e-300), "1.0E-300");
         assert_eq!(java_double_to_string(f64::MAX), "1.7976931348623157E308");
+    }
+
+    #[test]
+    fn double_subnormal_jdk25_cases() {
+        assert_eq!(java_double_to_string(f64::from_bits(1)), "4.9E-324");
+        assert_eq!(java_double_to_string(f64::from_bits(2)), "9.9E-324");
+        assert_eq!(java_double_to_string(f64::from_bits(3)), "1.5E-323");
+        assert_eq!(java_double_to_string(f64::from_bits(10)), "4.9E-323");
+        assert_eq!(
+            java_double_to_string(f64::from_bits(0x000f_ffff_ffff_ffff)),
+            "2.225073858507201E-308"
+        );
+        assert_eq!(java_double_to_string(-f64::from_bits(1)), "-4.9E-324");
     }
 
     #[test]
@@ -180,16 +266,45 @@ mod tests {
         assert_eq!(java_float_to_string(123.456), "123.456");
     }
 
+    #[test]
+    fn float_subnormal_jdk25_cases() {
+        assert_eq!(java_float_to_string(f32::from_bits(1)), "1.4E-45");
+        assert_eq!(java_float_to_string(f32::from_bits(2)), "2.8E-45");
+        assert_eq!(java_float_to_string(f32::from_bits(3)), "4.2E-45");
+        assert_eq!(java_float_to_string(f32::from_bits(10)), "1.4E-44");
+        assert_eq!(
+            java_float_to_string(f32::from_bits(0x007f_ffff)),
+            "1.1754942E-38"
+        );
+        assert_eq!(java_float_to_string(-f32::from_bits(1)), "-1.4E-45");
+    }
+
     // Round-trip: every formatted normal value must parse back to the same bits.
     #[test]
     fn double_round_trips() {
         for &v in &[
-            3.0f64, 1024.0, 0.1, 123.456, 1e7, 1.5e10, 1e-4, 1e300, 1e-300,
-            f64::MAX, -7.0, 9999999.0, 6.022e23, 1.602e-19,
+            3.0f64,
+            1024.0,
+            0.1,
+            123.456,
+            1e7,
+            1.5e10,
+            1e-4,
+            1e300,
+            1e-300,
+            f64::MAX,
+            -7.0,
+            9999999.0,
+            6.022e23,
+            1.602e-19,
         ] {
             let s = java_double_to_string(v);
             let parsed: f64 = s.parse().unwrap_or_else(|_| panic!("unparseable: {s}"));
-            assert_eq!(parsed.to_bits(), v.to_bits(), "round-trip failed: {v} -> {s}");
+            assert_eq!(
+                parsed.to_bits(),
+                v.to_bits(),
+                "round-trip failed: {v} -> {s}"
+            );
         }
     }
 }
