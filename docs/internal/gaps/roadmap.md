@@ -2,7 +2,11 @@
 
 ## Current State
 
-CratonVM is within 1.50x of HotSpot JDK 25 C2 on QuickBench, has 5,100+ tests, ~331,000+ lines of Rust, and a custom x86-64 JIT compiler with 26 optimization rounds. All Java LTS versions through Java 25 are supported:
+CratonVM runs Java SE 8-25 bytecode on a custom x86-64 JIT with 26 optimization
+rounds, but current QuickBench performance has regressed from the March 2026
+Round 26 snapshot. The 2026-07-02 `b80c50b5` measurement is 46.2x slower than
+HotSpot C2 by default and 8.25x slower with `CRATONVM_JIT_OSR=1
+CRATONVM_JIT_THRESHOLD=1`. All Java LTS versions through Java 25 are supported:
 
 - **Java 11:** Nest-based access control
 - **Java 17:** Records, sealed classes
@@ -10,23 +14,20 @@ CratonVM is within 1.50x of HotSpot JDK 25 C2 on QuickBench, has 5,100+ tests, ~
 - **Java 25:** Stream gatherers, scoped values, structured concurrency, class file version 69
 - **Panama FFI:** MemorySegment, Arena, ValueLayout, SymbolLookup, Linker (8-arg downcalls), upcall handles, struct/union layouts, string marshaling
 
-### Current Benchmark (vs HotSpot JDK 25 C2, Round 26)
+### Current Benchmark (vs HotSpot JDK 25 C2)
 
-| Benchmark | JDK 25 C2 | CratonVM | Ratio |
-|-----------|-----------|---------|-------|
-| Arithmetic 300M | 889 ms | 1,676 ms | 1.89x |
-| Fibonacci(42) | 1,876 ms | 2,457 ms | 1.31x |
-| Sieve 100K×500 | 324 ms | 510 ms | 1.57x |
-| Matrix 500×500 | 351 ms | 518 ms | 1.48x |
-| **QuickBench TOTAL** | **3,440 ms** | **5,161 ms** | **1.50x** |
-| SieveBench standalone | 316 ms | 492 ms | 1.56x |
-| MatrixScale 500×500 | 355 ms | 502 ms | 1.41x |
-| Binary Trees (depth=18) | 714 ms | 16,657 ms | 23.3x |
-| N-Body (5M steps) | 459 ms | 4,150 ms | 9.0x |
+| Benchmark               | JDK 25 C2    | CratonVM default | Default ratio | CratonVM OSR, threshold=1 | OSR ratio |
+|-------------------------|--------------|------------------|---------------|---------------------------|-----------|
+| Arithmetic 300M         | 991 ms       | 73,820 ms        | 74.5x         | 1,534 ms                  | 1.55x     |
+| Fibonacci(42)           | 2,071 ms     | 28,969 ms        | 14.0x         | 28,525 ms                 | 13.8x     |
+| Sieve 100Kx500          | 358 ms       | 31,665 ms        | 88.4x         | 466 ms                    | 1.30x     |
+| Matrix 500x500          | 336 ms       | 39,078 ms        | 116.3x        | 452 ms                    | 1.35x     |
+| **QuickBench TOTAL**    | **3,756 ms** | **173,532 ms**   | **46.2x**     | **30,977 ms**             | **8.25x** |
+| Binary Trees (depth=18) | 681 ms       | 19,737 ms        | 29.0x         | 36,665 ms                 | 53.8x     |
 
-*Measured 2026-03-31 on Windows 11, JDK 25.0.1 LTS vs CratonVM release build.*
+*Measured 2026-07-02 on Windows 11, JDK 25.0.1 LTS vs CratonVM release build `b80c50b5`. The benchmark sources are the historical `bench/QuickBench.java` and `bench/binarytrees.java` from commit `2cea208`; `bench/` is currently untracked.*
 
-Round 26 added: loop unrolling, speculative bounds check elimination, OSR with JIT cache fast-path, graph-coloring register allocation.
+Historical Round 26 added: loop unrolling, speculative bounds check elimination, OSR with JIT cache fast-path, graph-coloring register allocation.
 
 ### Known Limitations — Real-World App Blockers
 
@@ -35,7 +36,7 @@ Round 26 added: loop unrolling, speculative bounds check elimination, OSR with J
 | **No `java.util.stream` collect()** | Streams-heavy code stack-overflows | Phase 16.1 (Iterative Interpreter) |
 | **JIT crashes on FP math** | Any double-precision computation segfaults | Phase 16.2 (JIT FP Codegen) |
 | **JIT miscompilation on complex control flow** | Wrong results on permutation/branch-heavy code | Phase 16.3 (JIT Control Flow) |
-| **GC 23x slower on allocation-heavy workloads** | Binary Trees, real-world object creation | Phase 16.4 (GC Fast Path) |
+| **GC/allocation throughput gap on allocation-heavy workloads** | Binary Trees, real-world object creation (29.0x default in 2026-07-02 snapshot) | Phase 16.4 (GC Fast Path) |
 | **No reflection-based frameworks** | Spring, Hibernate, Jackson unusable | Phase 3 + Phase 4 |
 | **No networking/sockets** | Server apps, HTTP clients unusable | Phase 9 |
 | **No JDBC** | Database apps unusable | Phase 4 |
@@ -77,7 +78,7 @@ These are the **immediate blockers** preventing CratonVM from running any non-tr
 
 ### ✅ Phase J: Beyond 1.0x — Beat C2 Consistently
 
-Now matching C2 overall, the remaining per-benchmark gaps (Sieve 1.5x, Matrix 1.3x) can be closed with advanced optimizations. C2 wins through method inlining + escape analysis + advanced register allocation.
+The March 2026 Round 26 snapshot briefly showed near-C2 loop kernels, but the current 2026-07-02 snapshot is no longer matching C2 overall. The strongest current loop kernels under `CRATONVM_JIT_OSR=1 CRATONVM_JIT_THRESHOLD=1` are Arithmetic (1.55x), Sieve (1.30x), and Matrix (1.35x); Fibonacci (13.8x) and Binary Trees (29.0x default) are the highest-priority performance gaps.
 
 #### J1: Method Inlining (Target: -30% total time)
 - **What:** Inline small methods (< 35 bytecodes) at JIT call sites

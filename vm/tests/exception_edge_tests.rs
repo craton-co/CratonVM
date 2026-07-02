@@ -8,6 +8,7 @@
 //! exception-in-finally, cross-interface exceptions, and more.
 
 use cratonvm_vm::config::VmConfig;
+use cratonvm_vm::error::{MethodCallFailed, MethodCallResult};
 use cratonvm_vm::types::Value;
 use cratonvm_vm::vm::Vm;
 
@@ -32,6 +33,23 @@ fn printed_ints(vm: &Vm) -> Vec<i32> {
         .iter()
         .filter_map(|v| v.as_int())
         .collect()
+}
+
+fn describe_result(vm: &Vm, result: &MethodCallResult) -> String {
+    match result {
+        Err(MethodCallFailed::ExceptionThrown(exc)) => {
+            let class_id = vm.shared.heap.class_id_of(*exc);
+            let class_name = vm
+                .shared
+                .class_manager
+                .read()
+                .get_class(class_id)
+                .map(|class| class.name.to_string())
+                .unwrap_or_else(|| format!("<unknown class {:?}>", class_id));
+            format!("Err(ExceptionThrown({class_name}, {exc:?}))")
+        }
+        other => format!("{other:?}"),
+    }
 }
 
 macro_rules! require_class_files {
@@ -59,7 +77,8 @@ fn test_finally_on_normal_return() {
     );
     assert!(
         result.is_ok(),
-        "testFinallyOnNormalReturn failed: {result:?}"
+        "testFinallyOnNormalReturn failed: {}",
+        describe_result(&vm, &result)
     );
     assert_eq!(printed_ints(&vm), vec![1, 2, 3]);
 }
@@ -74,7 +93,11 @@ fn test_finally_on_exception() {
         "()V",
         &[],
     );
-    assert!(result.is_ok(), "testFinallyOnException failed: {result:?}");
+    assert!(
+        result.is_ok(),
+        "testFinallyOnException failed: {}",
+        describe_result(&vm, &result)
+    );
     assert_eq!(printed_ints(&vm), vec![1, 2, 3]);
 }
 
@@ -88,7 +111,11 @@ fn test_exception_in_finally() {
         "()V",
         &[],
     );
-    assert!(result.is_ok(), "testExceptionInFinally failed: {result:?}");
+    assert!(
+        result.is_ok(),
+        "testExceptionInFinally failed: {}",
+        describe_result(&vm, &result)
+    );
     assert_eq!(printed_ints(&vm), vec![1, 2]);
 }
 
@@ -102,7 +129,11 @@ fn test_deep_unwinding() {
         "()V",
         &[],
     );
-    assert!(result.is_ok(), "testDeepUnwinding failed: {result:?}");
+    assert!(
+        result.is_ok(),
+        "testDeepUnwinding failed: {}",
+        describe_result(&vm, &result)
+    );
     assert_eq!(printed_ints(&vm), vec![1, 2]);
 }
 
@@ -116,7 +147,11 @@ fn test_catch_superclass() {
         "()V",
         &[],
     );
-    assert!(result.is_ok(), "testCatchSuperclass failed: {result:?}");
+    assert!(
+        result.is_ok(),
+        "testCatchSuperclass failed: {}",
+        describe_result(&vm, &result)
+    );
     assert_eq!(printed_ints(&vm), vec![1]);
 }
 
@@ -130,7 +165,11 @@ fn test_first_matching_catch() {
         "()V",
         &[],
     );
-    assert!(result.is_ok(), "testFirstMatchingCatch failed: {result:?}");
+    assert!(
+        result.is_ok(),
+        "testFirstMatchingCatch failed: {}",
+        describe_result(&vm, &result)
+    );
     assert_eq!(printed_ints(&vm), vec![1]);
 }
 
@@ -146,7 +185,10 @@ fn test_return_from_try_with_finally() {
     );
     match result {
         Ok(Some(Value::Int(42))) => {}
-        other => panic!("Expected Ok(Some(Int(42))), got: {other:?}"),
+        other => panic!(
+            "Expected Ok(Some(Int(42))), got: {}",
+            describe_result(&vm, &other)
+        ),
     }
     assert_eq!(printed_ints(&vm), vec![1]);
 }
@@ -163,7 +205,10 @@ fn test_return_from_catch_with_finally() {
     );
     match result {
         Ok(Some(Value::Int(99))) => {}
-        other => panic!("Expected Ok(Some(Int(99))), got: {other:?}"),
+        other => panic!(
+            "Expected Ok(Some(Int(99))), got: {}",
+            describe_result(&vm, &other)
+        ),
     }
     assert_eq!(printed_ints(&vm), vec![1, 2]);
 }
@@ -180,7 +225,8 @@ fn test_catch_all_after_specific() {
     );
     assert!(
         result.is_ok(),
-        "testCatchAllAfterSpecific failed: {result:?}"
+        "testCatchAllAfterSpecific failed: {}",
+        describe_result(&vm, &result)
     );
     assert_eq!(printed_ints(&vm), vec![1, 2]);
 }
@@ -195,7 +241,11 @@ fn test_null_check_in_catch() {
         "()V",
         &[],
     );
-    assert!(result.is_ok(), "testNullCheckInCatch failed: {result:?}");
+    assert!(
+        result.is_ok(),
+        "testNullCheckInCatch failed: {}",
+        describe_result(&vm, &result)
+    );
     assert_eq!(printed_ints(&vm), vec![1, 2]);
 }
 
@@ -211,7 +261,8 @@ fn test_rethrow_preserves_identity() {
     );
     assert!(
         result.is_ok(),
-        "testRethrowPreservesIdentity failed: {result:?}"
+        "testRethrowPreservesIdentity failed: {}",
+        describe_result(&vm, &result)
     );
     assert_eq!(printed_ints(&vm), vec![1, 2]);
 }
@@ -226,7 +277,11 @@ fn test_clinit_exception() {
         "()V",
         &[],
     );
-    assert!(result.is_ok(), "testClinitException failed: {result:?}");
+    assert!(
+        result.is_ok(),
+        "testClinitException failed: {}",
+        describe_result(&vm, &result)
+    );
     assert_eq!(printed_ints(&vm), vec![1]);
 }
 
@@ -240,7 +295,11 @@ fn test_finally_in_loop() {
         "()V",
         &[],
     );
-    assert!(result.is_ok(), "testFinallyInLoop failed: {result:?}");
+    assert!(
+        result.is_ok(),
+        "testFinallyInLoop failed: {}",
+        describe_result(&vm, &result)
+    );
     assert_eq!(printed_ints(&vm), vec![1, 2, 3]);
 }
 
@@ -254,7 +313,11 @@ fn test_chained_exceptions() {
         "()V",
         &[],
     );
-    assert!(result.is_ok(), "testChainedExceptions failed: {result:?}");
+    assert!(
+        result.is_ok(),
+        "testChainedExceptions failed: {}",
+        describe_result(&vm, &result)
+    );
     assert_eq!(printed_ints(&vm), vec![1, 2, 3]);
 }
 

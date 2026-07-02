@@ -37,6 +37,8 @@ param(
   [string[]]$CratonArgs = @(),
 
   [switch]$RefreshLists,
+  [switch]$RefreshClasspaths,
+  [switch]$UniversalClasspath,
   [switch]$ListOnly,
   [switch]$AllModes
 )
@@ -88,6 +90,16 @@ function ConvertTo-SafeFileStem([string]$Value) {
   }
   $prefixLength = $maxLength - $hash.Length - 1
   return "$($safe.Substring(0, $prefixLength))-$hash"
+}
+
+function Get-Sha256Hex([string]$Value) {
+  $sha = [System.Security.Cryptography.SHA256]::Create()
+  try {
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes($Value)
+    return (([System.BitConverter]::ToString($sha.ComputeHash($bytes))) -replace '-', '').ToLowerInvariant()
+  } finally {
+    $sha.Dispose()
+  }
 }
 
 function ConvertTo-InvariantString([double]$Value) {
@@ -196,6 +208,140 @@ function ConvertTo-RepoRelativeModule([string]$Root, [string]$TestClassesDir) {
     $rel = $rel.Substring(0, $rel.Length - $suffix.Length).TrimEnd('\','/')
   }
   return ($rel -replace '\\','/')
+}
+
+function Resolve-MavenExe {
+  $cmd = Join-Path $script:KeycloakDir 'mvnw.cmd'
+  if (Test-Path $cmd) { return [System.IO.Path]::GetFullPath($cmd) }
+  $sh = Join-Path $script:KeycloakDir 'mvnw'
+  if (Test-Path $sh) { return [System.IO.Path]::GetFullPath($sh) }
+  return 'mvn'
+}
+
+function Split-ClasspathEntries([string]$Classpath) {
+  if (-not $Classpath) { return @() }
+  $separator = [string][System.IO.Path]::PathSeparator
+  return @($Classpath -split [regex]::Escape($separator) | Where-Object { $_ })
+}
+
+function Add-UniqueClasspathEntry {
+  param(
+    [System.Collections.Generic.List[string]]$Entries,
+    [hashtable]$Seen,
+    [string]$Entry
+  )
+
+  if (-not $Entry) { return }
+  try {
+    $full = [System.IO.Path]::GetFullPath($Entry)
+    $key = $full.ToLowerInvariant()
+    $value = $full
+  } catch {
+    $key = $Entry.ToLowerInvariant()
+    $value = $Entry
+  }
+  if (-not $Seen.ContainsKey($key)) {
+    $Entries.Add($value)
+    $Seen[$key] = $true
+  }
+}
+
+function Add-InferredJUnitRuntimeEntries {
+  param(
+    [System.Collections.Generic.List[string]]$Entries,
+    [hashtable]$Seen
+  )
+
+  $snapshot = @($Entries)
+  foreach ($entry in $snapshot) {
+    if ($entry -match 'junit-platform-engine[\\/](?<version>[^\\/]+)[\\/]junit-platform-engine-[^\\/]+\.jar$') {
+      $version = $Matches.version
+      $launcher = $entry -replace 'junit-platform-engine[\\/][^\\/]+[\\/]junit-platform-engine-[^\\/]+\.jar$', "junit-platform-launcher\$version\junit-platform-launcher-$version.jar"
+      if (Test-Path $launcher) {
+        Add-UniqueClasspathEntry -Entries $Entries -Seen $Seen -Entry $launcher
+      }
+    }
+    if ($entry -match 'junit-jupiter-api[\\/](?<version>[^\\/]+)[\\/]junit-jupiter-api-[^\\/]+\.jar$') {
+      $version = $Matches.version
+      $engine = $entry -replace 'junit-jupiter-api[\\/][^\\/]+[\\/]junit-jupiter-api-[^\\/]+\.jar$', "junit-jupiter-engine\$version\junit-jupiter-engine-$version.jar"
+      if (Test-Path $engine) {
+        Add-UniqueClasspathEntry -Entries $Entries -Seen $Seen -Entry $engine
+      }
+    }
+  }
+}
+
+function ConvertTo-ManifestClasspathUrl([string]$Entry) {
+  $full = [System.IO.Path]::GetFullPath($Entry)
+  if ((Test-Path $full -PathType Container) -and -not ($full.EndsWith('\') -or $full.EndsWith('/'))) {
+    $full += [System.IO.Path]::DirectorySeparatorChar
+  }
+  return ([System.Uri]$full).AbsoluteUri
+}
+
+function Split-ManifestLine([string]$Line) {
+  $max = 70
+  $out = New-Object System.Collections.Generic.List[string]
+  if ($Line.Length -le $max) {
+    $out.Add($Line)
+    return @($out)
+  }
+
+  $out.Add($Line.Substring(0, $max))
+  $offset = $max
+  while ($offset -lt $Line.Length) {
+    $take = [Math]::Min($max - 1, $Line.Length - $offset)
+    $out.Add(' ' + $Line.Substring($offset, $take))
+    $offset += $take
+  }
+  return @($out)
+}
+
+function New-PathingJar {
+  param(
+    [string]$Module,
+    [string[]]$Entries
+  )
+
+  $pathingDir = Join-Path $script:WorkRoot 'pathing-jars'
+  New-Item -ItemType Directory -Force -Path $pathingDir | Out-Null
+  $signature = (($Entries | ForEach-Object { [System.IO.Path]::GetFullPath($_) }) -join "`n")
+  $hash = (Get-Sha256Hex $signature).Substring(0, 16)
+  $stem = ConvertTo-SafeFileStem $(if ($Module) { $Module } else { 'universal' })
+  $jarPath = Join-Path $pathingDir "$stem-$hash.jar"
+  if (Test-Path $jarPath) { return [System.IO.Path]::GetFullPath($jarPath) }
+
+  Add-Type -AssemblyName System.IO.Compression | Out-Null
+  Add-Type -AssemblyName System.IO.Compression.FileSystem | Out-Null
+  $urls = @($Entries | ForEach-Object { ConvertTo-ManifestClasspathUrl $_ })
+  $lines = New-Object System.Collections.Generic.List[string]
+  $lines.Add('Manifest-Version: 1.0')
+  $lines.Add('Main-Class: KcRunner')
+  foreach ($line in (Split-ManifestLine ('Class-Path: ' + ($urls -join ' ')))) {
+    $lines.Add($line)
+  }
+  $lines.Add('')
+
+  if (Test-Path $jarPath) { Remove-Item -LiteralPath $jarPath -Force }
+  $zip = [System.IO.Compression.ZipFile]::Open($jarPath, [System.IO.Compression.ZipArchiveMode]::Create)
+  try {
+    $entry = $zip.CreateEntry('META-INF/MANIFEST.MF')
+    $stream = $entry.Open()
+    try {
+      $writer = [System.IO.StreamWriter]::new($stream, [System.Text.Encoding]::ASCII)
+      try {
+        $writer.NewLine = "`r`n"
+        foreach ($line in $lines) { $writer.WriteLine($line) }
+      } finally {
+        $writer.Dispose()
+      }
+    } finally {
+      $stream.Dispose()
+    }
+  } finally {
+    $zip.Dispose()
+  }
+  return [System.IO.Path]::GetFullPath($jarPath)
 }
 
 function Import-ResultRows([string]$Path) {
@@ -357,9 +503,7 @@ function Get-SelectedClasses {
   return Select-ClassRange $list
 }
 
-function Get-Classpath {
-  param([object[]]$Classes = @())
-
+function Get-UniversalClasspathEntries {
   $runnerDir = Join-Path $script:KeycloakDir 'kc-runner'
   $cpFile = Join-Path $script:KeycloakDir 'kc-universal-cp.txt'
   if (-not (Test-Path $runnerDir)) { Die "missing KcRunner directory: $runnerDir" }
@@ -369,36 +513,93 @@ function Get-Classpath {
   $cp = (Get-Content -Path $cpFile -Raw).Trim()
   if (-not $cp) { Die "empty classpath file: $cpFile" }
 
-  $separator = [string][System.IO.Path]::PathSeparator
+  $entries = New-Object System.Collections.Generic.List[string]
   $seen = @{}
-  foreach ($entry in (@($runnerDir) + ($cp -split [regex]::Escape($separator)))) {
-    if (-not $entry) { continue }
-    try {
-      $key = [System.IO.Path]::GetFullPath($entry).ToLowerInvariant()
-    } catch {
-      $key = $entry.ToLowerInvariant()
-    }
-    $seen[$key] = $true
+  foreach ($entry in (@($runnerDir) + (Split-ClasspathEntries $cp))) {
+    Add-UniqueClasspathEntry -Entries $entries -Seen $seen -Entry $entry
+  }
+  return @($entries)
+}
+
+function Get-ModuleClasspathEntries {
+  param([string]$Module)
+
+  if (-not $Module -or $UniversalClasspath) {
+    return Get-UniversalClasspathEntries
   }
 
-  $extraEntries = New-Object System.Collections.Generic.List[string]
-  foreach ($row in $Classes) {
-    $module = [string]$row.module
-    if (-not $module) { continue }
-    $modulePath = $module -replace '/', '\'
-    $testClassesDir = Join-Path (Join-Path $script:KeycloakDir $modulePath) 'target\test-classes'
-    if (-not (Test-Path $testClassesDir)) { continue }
-    $full = [System.IO.Path]::GetFullPath($testClassesDir)
-    $key = $full.ToLowerInvariant()
-    if (-not $seen.ContainsKey($key)) {
-      $extraEntries.Add($full)
-      $seen[$key] = $true
+  if (-not $script:ModuleClasspathCache) { $script:ModuleClasspathCache = @{} }
+  if ($script:ModuleClasspathCache.ContainsKey($Module)) {
+    return @($script:ModuleClasspathCache[$Module])
+  }
+
+  $modulePath = $Module -replace '/', '\'
+  $moduleRoot = Join-Path $script:KeycloakDir $modulePath
+  $pom = Join-Path $moduleRoot 'pom.xml'
+  if (-not (Test-Path $pom)) {
+    Write-Info "module has no pom.xml, using universal classpath: $Module"
+    $entries = @(Get-UniversalClasspathEntries)
+    $script:ModuleClasspathCache[$Module] = $entries
+    return $entries
+  }
+
+  $cacheDir = Join-Path $script:WorkRoot 'classpaths'
+  New-Item -ItemType Directory -Force -Path $cacheDir | Out-Null
+  $safe = ConvertTo-SafeFileStem $Module
+  $cpFile = Join-Path $cacheDir "$safe.test.cp.txt"
+  $needsRefresh = $RefreshClasspaths -or -not (Test-Path $cpFile) -or -not ((Get-Content -Path $cpFile -Raw -ErrorAction SilentlyContinue).Trim())
+  if ($needsRefresh) {
+    $mvn = Resolve-MavenExe
+    $outLog = Join-Path $cacheDir "$safe.maven.out.log"
+    $errLog = Join-Path $cacheDir "$safe.maven.err.log"
+    Write-Info "building Maven test classpath for $Module"
+    $record = Start-RedirectedProcess -FilePath $mvn -Arguments @(
+      '-pl', $Module,
+      '-DincludeScope=test',
+      "-Dmdep.outputFile=$cpFile",
+      '-DskipTests',
+      'dependency:build-classpath'
+    ) -WorkingDirectory $script:KeycloakDir -StdoutPath $outLog -StderrPath $errLog
+    $exit = Complete-RedirectedProcess $record
+    if ($exit -ne 0) {
+      Die "Maven dependency:build-classpath failed for $Module (exit $exit). Logs: $outLog $errLog"
     }
   }
-  if ($extraEntries.Count -gt 0) {
-    Write-Info "added selected module test classpath entries: $($extraEntries.Count)"
+
+  $runnerDir = Join-Path $script:KeycloakDir 'kc-runner'
+  if (-not (Test-Path (Join-Path $runnerDir 'KcRunner.class'))) { Die "missing KcRunner.class in $runnerDir" }
+
+  $entries = New-Object System.Collections.Generic.List[string]
+  $seen = @{}
+  Add-UniqueClasspathEntry -Entries $entries -Seen $seen -Entry $runnerDir
+  Add-UniqueClasspathEntry -Entries $entries -Seen $seen -Entry (Join-Path $moduleRoot 'target\classes')
+  Add-UniqueClasspathEntry -Entries $entries -Seen $seen -Entry (Join-Path $moduleRoot 'target\test-classes')
+  foreach ($entry in (Split-ClasspathEntries ((Get-Content -Path $cpFile -Raw).Trim()))) {
+    Add-UniqueClasspathEntry -Entries $entries -Seen $seen -Entry $entry
   }
-  return ((@($runnerDir) + @($extraEntries) + @($cp)) -join $separator)
+  Add-InferredJUnitRuntimeEntries -Entries $entries -Seen $seen
+
+  $result = @($entries)
+  Write-Info "module classpath $Module entries=$($result.Count)"
+  $script:ModuleClasspathCache[$Module] = $result
+  return $result
+}
+
+function Get-LaunchSpec {
+  param([object]$ClassRow)
+
+  $module = ''
+  if ($ClassRow -and ($ClassRow.PSObject.Properties.Name -contains 'module')) {
+    $module = [string]$ClassRow.module
+  }
+  $entries = @(Get-ModuleClasspathEntries -Module $module)
+  $separator = [string][System.IO.Path]::PathSeparator
+  $cp = ($entries -join $separator)
+  if ($cp.Length -gt 24000) {
+    $jar = New-PathingJar -Module $module -Entries $entries
+    return [pscustomobject]@{ kind = 'jar'; value = $jar; entries = $entries.Count; length = $cp.Length }
+  }
+  return [pscustomobject]@{ kind = 'cp'; value = $cp; entries = $entries.Count; length = $cp.Length }
 }
 
 function Resolve-CratonExe {
@@ -437,11 +638,12 @@ function New-ProcessRecord {
   param(
     [object]$ClassRow,
     [string]$ModeOut,
-    [string]$Cp,
+    [object]$LaunchSpec,
     [string]$ExePath,
     [string]$JavaExe,
     [string]$JdkPath,
-    [bool]$NoJit
+    [bool]$NoJit,
+    [int]$Retries = 0
   )
 
   $module = [string]$ClassRow.module
@@ -456,13 +658,22 @@ function New-ProcessRecord {
     $file = $JavaExe
     $args = @("-Xmx$MaxHeap", '-Dfile.encoding=UTF-8', '-Djava.awt.headless=true')
     if ($NoJit) { $args += '-Xint' }
-    $args += @('-cp', $Cp, 'KcRunner', $class)
+    if ($LaunchSpec.kind -eq 'jar') {
+      $args += @('-jar', $LaunchSpec.value, $class)
+    } else {
+      $args += @('-cp', $LaunchSpec.value, 'KcRunner', $class)
+    }
   } else {
     $file = $ExePath
     $args = @('--java-home', $JdkPath, '--stack-dump-on-timeout', '0', '--Xmx', $MaxHeap)
     if ($NoJit) { $args += '--nojit' }
     if ($CratonArgs.Count -gt 0) { $args += $CratonArgs }
-    $args += @('-Dfile.encoding=UTF-8', '-Djava.awt.headless=true', '-cp', $Cp, 'KcRunner', $class)
+    $args += @('-Dfile.encoding=UTF-8', '-Djava.awt.headless=true')
+    if ($LaunchSpec.kind -eq 'jar') {
+      $args += @('--jar', $LaunchSpec.value, $class)
+    } else {
+      $args += @('-cp', $LaunchSpec.value, 'KcRunner', $class)
+    }
   }
 
   $psi = [System.Diagnostics.ProcessStartInfo]::new()
@@ -489,7 +700,35 @@ function New-ProcessRecord {
     start = Get-Date
     outFile = $outFile
     errFile = $errFile
+    retries = $Retries
   }
+}
+
+function Read-ProcessOutputs([object]$Record) {
+  try { $Record.stdoutTask.Wait(5000) | Out-Null } catch {}
+  try { $Record.stderrTask.Wait(5000) | Out-Null } catch {}
+  $stdout = ''
+  $stderr = ''
+  try { $stdout = $Record.stdoutTask.Result } catch {}
+  try { $stderr = $Record.stderrTask.Result } catch {}
+  return [pscustomobject]@{ stdout = $stdout; stderr = $stderr }
+}
+
+function Test-SilentAbnormalExit([object]$ExitCode, [string]$Stdout, [string]$Stderr) {
+  # A CratonVM process that exits on its own (not killed by our -TimeoutSec
+  # watchdog, which is recorded as the literal string 'TIMEOUT' rather than
+  # a numeric code) but leaves BOTH stdout and stderr completely empty is
+  # not explainable by anything inside CratonVM itself: the top-level
+  # main-vm Ok/Err handler, the visibility-first panic hook, the Windows
+  # vectored hardware-fault handler, and System.exit/Runtime.exit all print
+  # at least one diagnostic line before the process terminates (see
+  # docs/internal/keycloak-empty-stderr-process-exits.md). A zero-output
+  # abnormal exit is therefore the signature of something OUTSIDE the
+  # process (OS/AV/resource-pressure termination) killing it before any of
+  # that code could run.
+  if ([string]$ExitCode -eq 'TIMEOUT') { return $false }
+  if ([int64]$ExitCode -eq 0) { return $false }
+  return ($Stdout.Trim().Length -eq 0 -and $Stderr.Trim().Length -eq 0)
 }
 
 function Complete-ProcessRecord {
@@ -497,15 +736,13 @@ function Complete-ProcessRecord {
     [object]$Record,
     [string]$ResultPath,
     [object]$ExitCode,
-    [double]$Seconds
+    [double]$Seconds,
+    [string]$Stdout,
+    [string]$Stderr
   )
 
-  try { $Record.stdoutTask.Wait(5000) | Out-Null } catch {}
-  try { $Record.stderrTask.Wait(5000) | Out-Null } catch {}
-  $stdout = ''
-  $stderr = ''
-  try { $stdout = $Record.stdoutTask.Result } catch {}
-  try { $stderr = $Record.stderrTask.Result } catch {}
+  $stdout = $Stdout
+  $stderr = $Stderr
   [System.IO.File]::WriteAllText($Record.outFile, $stdout, [System.Text.Encoding]::UTF8)
   [System.IO.File]::WriteAllText($Record.errFile, $stderr, [System.Text.Encoding]::UTF8)
 
@@ -519,6 +756,8 @@ function Complete-ProcessRecord {
 
   if ([string]$ExitCode -eq 'TIMEOUT') {
     $status = 'HANG'
+  } elseif (Test-SilentAbnormalExit -ExitCode $ExitCode -Stdout $stdout -Stderr $stderr) {
+    $status = 'SILENTEXIT'
   } elseif ($combined -match '(?i)EXCEPTION_ACCESS_VIOLATION|SIGSEGV|fatal runtime error|panicked at|stack smashing|illegal instruction|STATUS_ACCESS|STATUS_STACK_BUFFER|caught fatal signal|cratonvm panic|internal error: entered unreachable') {
     $status = 'CRASH'
   }
@@ -552,11 +791,17 @@ function Complete-ProcessRecord {
   }
 
   $note = ''
-  $noteMatch = [regex]::Match($combined, '(?im)^(?!\s+at\s)(.*(?:Exception|Error|Caused by|KCRUNNER_LOAD_FAIL|panicked|not implemented|NoClassDef|NoSuchMethod|AbstractMethod|AssertionError).*)$')
-  if ($noteMatch.Success) {
-    $note = (($noteMatch.Groups[1].Value -replace "`t", ' ') -replace "`r|`n", ' ')
-    if ($note.Length -gt 180) { $note = $note.Substring(0, 180) }
+  if ($status -eq 'SILENTEXIT') {
+    $note = "no stdout/stderr captured (rc=$ExitCode)"
+    if ($Record.retries -gt 0) { $note += "; unchanged after $($Record.retries) retry(ies)" }
+    $note += '; not a known CratonVM-internal exit path -- see docs/internal/keycloak-empty-stderr-process-exits.md'
+  } else {
+    $noteMatch = [regex]::Match($combined, '(?im)^(?!\s+at\s)(.*(?:Exception|Error|Caused by|KCRUNNER_LOAD_FAIL|panicked|not implemented|NoClassDef|NoSuchMethod|AbstractMethod|AssertionError).*)$')
+    if ($noteMatch.Success) {
+      $note = (($noteMatch.Groups[1].Value -replace "`t", ' ') -replace "`r|`n", ' ')
+    }
   }
+  if ($note.Length -gt 180) { $note = $note.Substring(0, 180) }
   if ($status -eq 'PASS' -or $status -eq 'EMPTY') {
     $note = ''
   }
@@ -588,7 +833,6 @@ function Complete-ProcessRecord {
 function Invoke-Mode {
   param([object[]]$Classes)
 
-  $cp = Get-Classpath -Classes $Classes
   $jdk = Resolve-Jdk
   $java = Join-Path $jdk 'bin\java.exe'
   if (-not (Test-Path $java)) { Die "HotSpot java.exe not found: $java" }
@@ -636,12 +880,26 @@ function Invoke-Mode {
       $elapsed = ((Get-Date) - $record.start).TotalSeconds
       if ($record.proc.HasExited) {
         $code = $record.proc.ExitCode
-        Complete-ProcessRecord -Record $record -ResultPath $results -ExitCode $code -Seconds ([Math]::Round($elapsed, 3))
-        try { $record.proc.Dispose() } catch {}
+        $outputs = Read-ProcessOutputs $record
+        if ((Test-SilentAbnormalExit -ExitCode $code -Stdout $outputs.stdout -Stderr $outputs.stderr) -and $record.retries -lt 1) {
+          # No CratonVM-internal path exits silently (see Test-SilentAbnormalExit) --
+          # this looks like an external/transient kill (OS, AV, resource pressure).
+          # Retry once, transparently, before recording anything: most occurrences
+          # of this signature do not reproduce on a second attempt.
+          Write-Info ("  [retry] {0} rc={1} with no stdout/stderr -- retrying once" -f $record.class, $code)
+          try { $record.proc.Dispose() } catch {}
+          $retryRow = [pscustomobject]@{ module = $record.module; class = $record.class }
+          $retryLaunch = Get-LaunchSpec -ClassRow $retryRow
+          $still.Add((New-ProcessRecord -ClassRow $retryRow -ModeOut $modeOut -LaunchSpec $retryLaunch -ExePath $craton -JavaExe $java -JdkPath $jdk -NoJit:($Jit -eq 'off') -Retries ($record.retries + 1)))
+        } else {
+          Complete-ProcessRecord -Record $record -ResultPath $results -ExitCode $code -Seconds ([Math]::Round($elapsed, 3)) -Stdout $outputs.stdout -Stderr $outputs.stderr
+          try { $record.proc.Dispose() } catch {}
+        }
       } elseif ($elapsed -ge $TimeoutSec) {
         try { $record.proc.Kill($true) } catch { try { $record.proc.Kill() } catch {} }
         try { $record.proc.WaitForExit(5000) | Out-Null } catch {}
-        Complete-ProcessRecord -Record $record -ResultPath $results -ExitCode 'TIMEOUT' -Seconds ([Math]::Round($elapsed, 3))
+        $outputs = Read-ProcessOutputs $record
+        Complete-ProcessRecord -Record $record -ResultPath $results -ExitCode 'TIMEOUT' -Seconds ([Math]::Round($elapsed, 3)) -Stdout $outputs.stdout -Stderr $outputs.stderr
         try { $record.proc.Dispose() } catch {}
       } else {
         $still.Add($record)
@@ -655,7 +913,8 @@ function Invoke-Mode {
       Drain-Running
       if ($script:RunningRecords.Count -ge $Parallel) { Start-Sleep -Milliseconds 200 }
     }
-    $script:RunningRecords.Add((New-ProcessRecord -ClassRow $classRow -ModeOut $modeOut -Cp $cp -ExePath $craton -JavaExe $java -JdkPath $jdk -NoJit:($Jit -eq 'off')))
+    $launch = Get-LaunchSpec -ClassRow $classRow
+    $script:RunningRecords.Add((New-ProcessRecord -ClassRow $classRow -ModeOut $modeOut -LaunchSpec $launch -ExePath $craton -JavaExe $java -JdkPath $jdk -NoJit:($Jit -eq 'off')))
   }
   while ($script:RunningRecords.Count -gt 0) {
     Drain-Running
@@ -757,6 +1016,8 @@ function Invoke-AllModes {
     if ($Exe) { $args += @('-Exe', $Exe) }
     if ($RefCsv) { $args += @('-RefCsv', $RefCsv) }
     if ($ClassList) { $args += @('-ClassList', $ClassList) }
+    if ($RefreshClasspaths) { $args += '-RefreshClasspaths' }
+    if ($UniversalClasspath) { $args += '-UniversalClasspath' }
     if ($CratonArgs.Count -gt 0) {
       foreach ($extra in $CratonArgs) { $args += @('-CratonArgs', $extra) }
     }

@@ -1,52 +1,60 @@
 # Benchmarks
 
-CratonVM is benchmarked against HotSpot's C2 compiler (OpenJDK 25). These are
-representative results from the **QuickBench** micro-suite plus the
-allocation-heavy **Binary Trees** workload. Numbers are illustrative of the
-JIT's standing, not a guarantee — see the caveats below.
+CratonVM is benchmarked against HotSpot's C2 compiler (JDK 25). These are
+representative single-run snapshots from the historical **QuickBench**
+micro-suite plus the allocation-heavy **Binary Trees** workload. Numbers move
+with hardware, OS load, JDK version, and VM configuration.
 
 ## QuickBench vs. HotSpot JDK 25 C2
 
-*Measured on Windows 11 against OpenJDK 25 C2. Ratio = CratonVM time ÷ HotSpot
-time (lower is better; 1.00× is parity).*
+*Measured 2026-07-02 on Windows 11 against JDK 25.0.1 C2 and CratonVM code
+`b80c50b5`. Ratio = CratonVM time / HotSpot time (lower is better; 1.00x is
+parity). The OSR column sets `CRATONVM_JIT_OSR=1` and
+`CRATONVM_JIT_THRESHOLD=1`.*
 
-| Benchmark | JDK 25 C2 | CratonVM | Ratio |
-|-----------|-----------|----------|-------|
-| Arithmetic (300M ops) | 889 ms | 1,676 ms | 1.89× |
-| Fibonacci(42), recursive | 1,876 ms | 2,457 ms | 1.31× |
-| Sieve (100K × 500 reps) | 324 ms | 510 ms | 1.57× |
-| Matrix 500×500 multiply | 351 ms | 518 ms | 1.48× |
-| **QuickBench TOTAL** | **3,440 ms** | **5,161 ms** | **1.50×** |
-| Binary Trees (depth = 18) | 714 ms | 16,657 ms | 23.3× |
+| Benchmark                 | JDK 25 C2    | CratonVM default | Default ratio | CratonVM OSR, threshold=1 | OSR ratio |
+|---------------------------|--------------|------------------|---------------|---------------------------|-----------|
+| Arithmetic (300M ops)     | 991 ms       | 73,820 ms        | 74.5x         | 1,534 ms                  | 1.55x     |
+| Fibonacci(42), recursive  | 2,071 ms     | 28,969 ms        | 14.0x         | 28,525 ms                 | 13.8x     |
+| Sieve (100K x 500 reps)   | 358 ms       | 31,665 ms        | 88.4x         | 466 ms                    | 1.30x     |
+| Matrix 500x500 multiply   | 336 ms       | 39,078 ms        | 116.3x        | 452 ms                    | 1.35x     |
+| **QuickBench TOTAL**      | **3,756 ms** | **173,532 ms**   | **46.2x**     | **30,977 ms**             | **8.25x** |
+| Binary Trees (depth = 18) | 681 ms       | 19,737 ms        | 29.0x         | 36,665 ms                 | 53.8x     |
 
 **Reading the results:**
 
-- On compute-bound code, CratonVM's JIT lands within **~1.3×–1.9×** of HotSpot
-  C2, and **~1.5× overall** on QuickBench. Fibonacci — recursive call overhead —
-  is within ~7% of C2.
-- **Binary Trees is the outlier.** It is dominated by short-lived allocation and
-  garbage collection, and CratonVM is currently far behind there (~23×).
-  Closing this gap through GC-throughput work is a tracked roadmap item — see
+- Default launcher settings leave these one-shot hot loops mostly interpreted,
+  so the default QuickBench total is not competitive.
+- With OSR enabled and the invocation threshold lowered, Arithmetic, Sieve, and
+  Matrix are close to HotSpot C2. Recursive Fibonacci remains a call-heavy JIT
+  gap, and Binary Trees remains dominated by allocation/GC throughput.
+- Closing the Fibonacci and Binary Trees gaps is a tracked roadmap item; see
   [Roadmap](../contributing/roadmap.md).
-
-For context, the same JIT is roughly **28× faster than the HotSpot
-interpreter** (`-Xint`) on these workloads.
 
 ## Running the benchmarks yourself
 
 ```bash
-# Build the release binary first
+# Build the release binary first.
 cargo build --release -p cratonvm-cli
 
-# CratonVM
-cargo run --release -p cratonvm-cli -- --classpath bench QuickBench
+# Restore the historical benchmark sources into ignored scratch space.
+mkdir -p .bench-cache/quickbench
+git show 2cea208:bench/QuickBench.java > .bench-cache/quickbench/QuickBench.java
+git show 2cea208:bench/binarytrees.java > .bench-cache/quickbench/binarytrees.java
+javac -d .bench-cache/quickbench .bench-cache/quickbench/QuickBench.java .bench-cache/quickbench/binarytrees.java
 
-# HotSpot for comparison
-java -cp bench QuickBench
+# CratonVM default.
+target/release/cratonvm --classpath .bench-cache/quickbench QuickBench
+
+# CratonVM with OSR + low threshold.
+CRATONVM_JIT_OSR=1 CRATONVM_JIT_THRESHOLD=1 target/release/cratonvm --classpath .bench-cache/quickbench QuickBench
+
+# HotSpot for comparison.
+java -cp .bench-cache/quickbench QuickBench
 ```
 
-For larger workloads, give CratonVM more heap (e.g. `--Xmx 8g` for Binary
-Trees), and use `--nojit` to capture interpreter-only timings.
+For larger workloads, give CratonVM more heap (for example `--Xmx 8g` for
+Binary Trees) and use `--nojit` to capture interpreter-only timings.
 
 The VM Criterion gate reads committed baselines from `vm/bench/`. A missing or
 malformed baseline is a gate error; the checked-in zero-valued baselines are
@@ -59,11 +67,10 @@ baseline refresh records real medians. Generated Criterion output under
 Benchmark numbers move with hardware, OS, JDK version, and workload. To get
 reproducible figures:
 
-1. **Use `--release` builds only** — debug builds are 10–50× slower.
+1. **Use `--release` builds only** - debug builds are 10-50x slower.
 2. Run multiple times and take the **median**.
 3. Disable CPU turbo boost for stable timing.
 4. Close other applications to reduce noise.
 5. Use single-threaded settings for single-threaded benchmarks.
 
-See [Profiling](profiling.md) for measurement tooling, and [How the JIT Got
-Fast](jit-internals.md) for the engineering behind these numbers.
+See [Profiling](profiling.md) for measurement tooling.

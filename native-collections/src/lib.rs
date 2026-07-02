@@ -34106,6 +34106,20 @@ fn register_concurrent_completeness_natives(r: &mut NativeMethodRegistry) {
 
     // --- CompletionStage methods ---
 
+    r.register(
+        cf,
+        "thenApply",
+        "(Ljava/util/function/Function;)Ljava/util/concurrent/CompletableFuture;",
+        native_cf_then_apply_p31,
+    );
+
+    r.register(
+        cf,
+        "thenAccept",
+        "(Ljava/util/function/Consumer;)Ljava/util/concurrent/CompletableFuture;",
+        native_cf_then_accept_p31,
+    );
+
     // thenRun: run Runnable after completion, return new CF with null result
     r.register(
         cf,
@@ -35077,55 +35091,78 @@ fn native_cf_all_of(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
             );
         }
     }
-    // In our synchronous model all input CFs are already completed. allOf returns a
-    // CF<Void> that is normally done UNLESS any input completed exceptionally, in
-    // which case allOf is exceptional with that throwable (real JDK semantics — and
-    // required so KafkaFuture.allOf().whenComplete() propagates the failure).
+    // Synthetic inputs still must not make allOf complete eagerly while any source
+    // remains pending. Otherwise allOf(...).join() can observe completion before
+    // the modeled source future has reached a terminal state.
     let mut exc: Option<Value> = None;
+    let mut pending = false;
     if let Some(Value::Object(Some(arr))) = args.first() {
         let arr = *arr;
         let len = ctx.array_length(arr);
         for i in 0..len {
             if let Value::Object(Some(cf_obj)) = ctx.get_array_element(arr, i) {
-                if let CfState::Exceptional(e) = cf_read_state(ctx, cf_obj) {
-                    exc = Some(e);
-                    break;
+                match cf_read_state(ctx, cf_obj) {
+                    CfState::Exceptional(e) => {
+                        exc = Some(e);
+                        break;
+                    }
+                    CfState::Pending => pending = true,
+                    CfState::Normal(_) => {}
                 }
             }
         }
     }
-    let state = match exc {
-        Some(e) => CfState::Exceptional(e),
-        None => CfState::Normal(Value::Object(None)),
-    };
-    Ok(Some(cf_make_completed(ctx, state)))
+    match exc {
+        Some(e) => Ok(Some(cf_make_completed(ctx, CfState::Exceptional(e)))),
+        None if pending => Ok(Some(cf_make_synthetic(ctx, CfState::Pending))),
+        None => Ok(Some(cf_make_completed(
+            ctx,
+            CfState::Normal(Value::Object(None)),
+        ))),
+    }
 }
 
 fn native_cf_any_of(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    // Return the result of the first CF in the array (all are completed)
     let arr = match args.first() {
         Some(Value::Object(Some(a))) => *a,
-        _ => {
-            let cf = alloc_synthetic(ctx, "java/util/concurrent/CompletableFuture", 4);
-            ctx.set_field(cf, CF_FIELD_RESULT, Value::Object(None));
-            ctx.set_field(cf, CF_FIELD_DONE, Value::Int(1));
-            return Ok(Some(Value::Object(Some(cf))));
-        }
+        _ => return Ok(Some(cf_make_synthetic(ctx, CfState::Pending))),
     };
     let len = ctx.array_length(arr);
-    let result = if len > 0 {
-        let first = ctx.get_array_element(arr, 0);
-        match first {
-            Value::Object(Some(cf_obj)) => ctx.get_field(cf_obj, CF_FIELD_RESULT),
-            _ => Value::Object(None),
+
+    let mut any_real = false;
+    for i in 0..len {
+        if let Value::Object(Some(cf_obj)) = ctx.get_array_element(arr, i) {
+            if cf_is_real_jdk(ctx, cf_obj) {
+                any_real = true;
+                break;
+            }
         }
-    } else {
-        Value::Object(None)
-    };
-    let cf = alloc_synthetic(ctx, "java/util/concurrent/CompletableFuture", 4);
-    ctx.set_field(cf, CF_FIELD_RESULT, result);
-    ctx.set_field(cf, CF_FIELD_DONE, Value::Int(1));
-    Ok(Some(Value::Object(Some(cf))))
+    }
+    if any_real {
+        return ctx.invoke_special(
+            "java/util/concurrent/CompletableFuture",
+            "orTree",
+            "([Ljava/util/concurrent/CompletableFuture;II)Ljava/util/concurrent/CompletableFuture;",
+            &[
+                Value::Object(Some(arr)),
+                Value::Int(0),
+                Value::Int(len as i32 - 1),
+            ],
+        );
+    }
+
+    for i in 0..len {
+        if let Value::Object(Some(cf_obj)) = ctx.get_array_element(arr, i) {
+            match cf_read_state(ctx, cf_obj) {
+                CfState::Pending => {}
+                CfState::Normal(v) => return Ok(Some(cf_make_completed(ctx, CfState::Normal(v)))),
+                CfState::Exceptional(e) => {
+                    return Ok(Some(cf_make_completed(ctx, CfState::Exceptional(e))))
+                }
+            }
+        }
+    }
+    Ok(Some(cf_make_synthetic(ctx, CfState::Pending)))
 }
 
 const CF_ALT_RESULT_CLASS: &str = "java/util/concurrent/CompletableFuture$AltResult";

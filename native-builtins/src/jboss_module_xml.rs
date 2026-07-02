@@ -28,6 +28,7 @@ pub struct ModuleXml {
     pub main_class: Option<String>,
     pub properties: Vec<(String, String)>,
     pub resource_roots: Vec<ResourceRoot>,
+    pub artifacts: Vec<String>,
     pub dependencies: Vec<Dependency>,
 }
 
@@ -211,6 +212,16 @@ pub fn parse_module_xml_bytes(bytes: &[u8]) -> Result<ModuleXml, ParseError> {
                         }
                         if !path.is_empty() {
                             mx.resource_roots.push(ResourceRoot { path, name });
+                        }
+                    }
+                    "artifact" => {
+                        for a in e.attributes().flatten() {
+                            if a.key.as_ref() == b"name" {
+                                let name = attr_str(&a)?;
+                                if !name.is_empty() {
+                                    mx.artifacts.push(name);
+                                }
+                            }
                         }
                     }
                     "system" if path_stack.last().map(String::as_str) == Some("dependencies") => {
@@ -521,6 +532,27 @@ mod tests {
         assert_eq!(mx.resource_roots[0].path, "a.jar");
         assert!(mx.resource_roots[0].name.is_none());
         assert_eq!(mx.resource_roots[1].name.as_deref(), Some("bee"));
+    }
+
+    #[test]
+    fn parses_artifacts() {
+        let src = r#"<?xml version="1.0"?>
+<module name="x" xmlns="urn:jboss:module:1.9">
+  <resources>
+    <artifact name="org.wildfly.core:wildfly-process-controller:33.0.0.Beta1"/>
+    <artifact name="io.netty:netty-transport-native-unix-common:4.1.133.Final:linux-x86_64"/>
+  </resources>
+</module>"#;
+        let mx = parse_module_xml_bytes(src.as_bytes()).unwrap();
+        assert_eq!(mx.artifacts.len(), 2);
+        assert_eq!(
+            mx.artifacts[0],
+            "org.wildfly.core:wildfly-process-controller:33.0.0.Beta1"
+        );
+        assert_eq!(
+            mx.artifacts[1],
+            "io.netty:netty-transport-native-unix-common:4.1.133.Final:linux-x86_64"
+        );
     }
 
     #[test]

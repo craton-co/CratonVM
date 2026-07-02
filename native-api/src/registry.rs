@@ -824,6 +824,8 @@ pub trait NativeContext {
     /// back to `copy_nonoverlapping` for distinct backings).
     ///
     /// Returns `true` on success, `false` on bounds / element-type mismatch.
+    /// Even a zero-length copy only succeeds after the array kind, primitive
+    /// element type, and offset bounds have been validated.
     fn bulk_array_copy(
         &mut self,
         src: ObjectRef,
@@ -832,9 +834,6 @@ pub trait NativeContext {
         dst_off: usize,
         len: usize,
     ) -> bool {
-        if len == 0 {
-            return true;
-        }
         if self.heap_kind_of(src) != ObjectKind::Array
             || self.heap_kind_of(dst) != ObjectKind::Array
         {
@@ -855,6 +854,9 @@ pub trait NativeContext {
         };
         if src_end > self.array_length(src) || dst_end > self.array_length(dst) {
             return false;
+        }
+        if len == 0 {
+            return true;
         }
 
         for i in 0..len {

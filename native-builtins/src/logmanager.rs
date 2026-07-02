@@ -427,6 +427,35 @@ fn get_or_create_logger(ctx: &mut dyn NativeContext, name: &str) -> ObjectRef {
     obj
 }
 
+fn jboss_log_manager_requested(ctx: &dyn NativeContext) -> bool {
+    matches!(
+        ctx.get_system_property("java.util.logging.manager")
+            .as_deref()
+            .map(str::trim),
+        Some("org.jboss.logmanager.LogManager" | "org/jboss/logmanager/LogManager")
+    )
+}
+
+fn native_jul_static_get_logger(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let name = match args.first() {
+        Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+        _ => String::new(),
+    };
+    if jboss_log_manager_requested(ctx) {
+        let logger = get_or_create_jboss_logger(ctx, &name);
+        return Ok(Some(Value::Object(Some(logger))));
+    }
+    let logger = get_or_create_logger(ctx, &name);
+    Ok(Some(Value::Object(Some(logger))))
+}
+
+fn native_jul_static_get_logger_with_bundle(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    native_jul_static_get_logger(ctx, args)
+}
+
 /// Test-only helper: wipe the singleton + logger registry so tests
 /// don't see state bleed between parallel threads.
 #[cfg(test)]
@@ -945,6 +974,31 @@ fn native_jboss_logger_get_name(ctx: &mut dyn NativeContext, args: &[Value]) -> 
 }
 
 fn native_jboss_logger_get_use_parent_handlers(
+    _ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    Ok(Some(Value::Int(1)))
+}
+
+fn native_jboss_logger_get_handlers(
+    ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    let arr = match ctx.ensure_class_initialized("java/util/logging/Handler") {
+        Ok(handler_cid) => ctx.new_ref_array(handler_cid, 0),
+        Err(_) => ctx.new_array(ArrayElementType::Reference, 0),
+    };
+    Ok(Some(Value::Object(Some(arr))))
+}
+
+fn native_jboss_logger_handler_noop(
+    _ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    Ok(None)
+}
+
+fn native_jboss_logger_get_use_parent_filters(
     _ctx: &mut dyn NativeContext,
     _args: &[Value],
 ) -> MethodCallResult {
@@ -2237,7 +2291,43 @@ pub fn register_logmanager_natives(registry: &mut NativeMethodRegistry) {
         "org/jboss/logmanager/Logger",
         "setUseParentHandlers",
         "(Z)V",
-        |_ctx, _args| Ok(None),
+        native_jboss_logger_handler_noop,
+    );
+    registry.register(
+        "org/jboss/logmanager/Logger",
+        "getHandlers",
+        "()[Ljava/util/logging/Handler;",
+        native_jboss_logger_get_handlers,
+    );
+    registry.register(
+        "org/jboss/logmanager/Logger",
+        "addHandler",
+        "(Ljava/util/logging/Handler;)V",
+        native_jboss_logger_handler_noop,
+    );
+    registry.register(
+        "org/jboss/logmanager/Logger",
+        "removeHandler",
+        "(Ljava/util/logging/Handler;)V",
+        native_jboss_logger_handler_noop,
+    );
+    registry.register(
+        "org/jboss/logmanager/Logger",
+        "setHandlers",
+        "([Ljava/util/logging/Handler;)V",
+        native_jboss_logger_handler_noop,
+    );
+    registry.register(
+        "org/jboss/logmanager/Logger",
+        "setUseParentFilters",
+        "(Z)V",
+        native_jboss_logger_handler_noop,
+    );
+    registry.register(
+        "org/jboss/logmanager/Logger",
+        "getUseParentFilters",
+        "()Z",
+        native_jboss_logger_get_use_parent_filters,
     );
     // Keycloak boot NPE — `Logger.logRaw` real-JDK bytecode dereferences
     // `this.loggerNode` and NPEs at `LoggerNode.isLoggable` (pc=48) and
@@ -2457,6 +2547,22 @@ pub fn register_logmanager_natives(registry: &mut NativeMethodRegistry) {
             registry.register(jlog, m, sig, native_jboss_logger_trace);
         }
     }
+
+    // Static JUL factory methods. When WildFly installs
+    // org.jboss.logmanager.LogManager, JBoss's own Logger.getLogger delegates
+    // here and immediately checkcasts the result to org.jboss.logmanager.Logger.
+    registry.register(
+        CLS_JUL_LOGGER,
+        "getLogger",
+        "(Ljava/lang/String;)Ljava/util/logging/Logger;",
+        native_jul_static_get_logger,
+    );
+    registry.register(
+        CLS_JUL_LOGGER,
+        "getLogger",
+        "(Ljava/lang/String;Ljava/lang/String;)Ljava/util/logging/Logger;",
+        native_jul_static_get_logger_with_bundle,
+    );
 
     // JUL convenience methods for callers that bypass jboss-logging.
     registry.register(
@@ -2797,6 +2903,63 @@ mod tests {
             _ => String::new(),
         };
         assert_eq!(stored_name, "com.example.App");
+    }
+
+    #[test]
+    fn t19_h3_static_jul_get_logger_defaults_to_jul_logger() {
+        let _g = test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        reset_state_for_tests();
+        let mut ctx = mock_ctx();
+        let name = ctx.create_string("com.example.App");
+        let logger = match native_jul_static_get_logger(&mut ctx, &[Value::Object(Some(name))])
+            .unwrap()
+            .unwrap()
+        {
+            Value::Object(Some(o)) => o,
+            other => panic!("expected logger, got {:?}", other),
+        };
+        let cid = ctx.class_id_of_object(logger);
+        let class_name = ctx.class_name_of_id(cid).unwrap_or_default();
+        assert_eq!(class_name, CLS_JUL_LOGGER);
+    }
+
+    #[test]
+    fn t19_h3_static_jul_get_logger_honors_jboss_logmanager_property() {
+        let _g = test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        reset_state_for_tests();
+        let mut ctx = mock_ctx();
+        ctx.set_system_property(
+            "java.util.logging.manager",
+            "org.jboss.logmanager.LogManager",
+        );
+        let name = ctx.create_string("com.example.App");
+        let logger = match native_jul_static_get_logger(&mut ctx, &[Value::Object(Some(name))])
+            .unwrap()
+            .unwrap()
+        {
+            Value::Object(Some(o)) => o,
+            other => panic!("expected logger, got {:?}", other),
+        };
+        let cid = ctx.class_id_of_object(logger);
+        let class_name = ctx.class_name_of_id(cid).unwrap_or_default();
+        assert_eq!(class_name, "org/jboss/logmanager/Logger");
+    }
+
+    #[test]
+    fn t19_h3_jboss_logger_get_handlers_returns_empty_array() {
+        let _g = test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        reset_state_for_tests();
+        let mut ctx = mock_ctx();
+        let logger = get_or_create_jboss_logger(&mut ctx, "com.example.App");
+        let handlers =
+            match native_jboss_logger_get_handlers(&mut ctx, &[Value::Object(Some(logger))])
+                .unwrap()
+                .unwrap()
+            {
+                Value::Object(Some(arr)) => arr,
+                other => panic!("expected handler array, got {:?}", other),
+            };
+        assert_eq!(ctx.array_length(handlers), 0);
     }
 
     #[test]

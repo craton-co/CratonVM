@@ -253,7 +253,19 @@ fn native_unsafe_park_with_blocker(
     } else {
         Some(std::time::Duration::from_nanos(nanos as u64))
     };
+    // AQS-PARK-PIN: pin the blocker across the block so it can't be lost to
+    // the JIT register-invisibility gap regardless of which JDK park overload
+    // is live (see the matching fix in `NativeContextImpl::park`,
+    // vm/src/vm/vm_exec.rs, and `native_lock_support_park`). Mirrors
+    // `monitor_wait_keepalive`.
+    let pin = match args.get(1) {
+        Some(Value::Object(Some(o))) => Some(ctx.pin_native_root(*o)),
+        _ => None,
+    };
     ctx.park(timeout);
+    if let Some(pin) = pin {
+        ctx.unpin_native_roots(pin);
+    }
     Ok(None)
 }
 

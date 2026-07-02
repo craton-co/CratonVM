@@ -12493,16 +12493,73 @@ fn annotated_type_fill_bookkeeping(ctx: &mut dyn NativeContext, obj: ObjectRef) 
     );
 }
 
+/// Which real-JDK `sun.reflect.annotation.AnnotatedTypeFactory` impl class
+/// should back an `AnnotatedType` wrapping `backing_type`, mirroring
+/// `AnnotatedTypeFactory.buildAnnotatedType`'s own dispatch: an array `Type`
+/// (array `Class` or `GenericArrayType`) → `AnnotatedArrayTypeImpl`,
+/// `TypeVariable` → `AnnotatedTypeVariableImpl`, `ParameterizedType` →
+/// `AnnotatedParameterizedTypeImpl`, `WildcardType` → `AnnotatedWildcardTypeImpl`,
+/// else (plain `Class`) → the base impl. All four subclasses extend
+/// `AnnotatedTypeBaseImpl` and declare no extra fields, so the base class's
+/// 4-field layout (`type`, `location`, `allOnSameTargetTypeAnnotations`,
+/// `annotations`) is inherited unchanged — picking the right subclass only
+/// changes which `AnnotatedXxxType` sub-interface the constructed object
+/// satisfies via `instanceof`.
+///
+/// Always building the base class regardless of `Type` kind is exactly the
+/// gap that broke ByteBuddy's `JavaDispatcher` (used by Mockito): its own
+/// reflective readers assume real JDK's per-kind subclasses (e.g. checking
+/// `instanceof AnnotatedParameterizedType` / calling
+/// `getAnnotatedActualTypeArguments()`, which only that subclass declares)
+/// and fail with a receiver-type mismatch a few frames up the call chain
+/// when handed a plain `AnnotatedTypeBaseImpl` instead — see
+/// `docs/known-issues/elasticsearch-bytebuddy-annotatedtype-proxy-mismatch.md`.
+fn annotated_type_impl_class_name(
+    ctx: &mut dyn NativeContext,
+    backing_type: cratonvm_types::ObjectRef,
+) -> &'static str {
+    const BASE: &str = "sun/reflect/annotation/AnnotatedTypeFactory$AnnotatedTypeBaseImpl";
+    const ARRAY: &str = "sun/reflect/annotation/AnnotatedTypeFactory$AnnotatedArrayTypeImpl";
+    const TYPE_VAR: &str = "sun/reflect/annotation/AnnotatedTypeFactory$AnnotatedTypeVariableImpl";
+    const PARAMETERIZED: &str =
+        "sun/reflect/annotation/AnnotatedTypeFactory$AnnotatedParameterizedTypeImpl";
+    const WILDCARD: &str = "sun/reflect/annotation/AnnotatedTypeFactory$AnnotatedWildcardTypeImpl";
+
+    let cid = ctx.class_id_of_object(backing_type);
+    match ctx.class_name_of_id(cid).unwrap_or_default().as_str() {
+        "java/lang/reflect/GenericArrayType" => ARRAY,
+        "java/lang/reflect/TypeVariable"
+        | "sun/reflect/generics/reflectiveObjects/TypeVariableImpl" => TYPE_VAR,
+        "java/lang/reflect/ParameterizedType"
+        | "sun/reflect/generics/reflectiveObjects/ParameterizedTypeImpl" => PARAMETERIZED,
+        "java/lang/reflect/WildcardType"
+        | "sun/reflect/generics/reflectiveObjects/WildcardTypeImpl" => WILDCARD,
+        "java/lang/Class" => {
+            // A Class is only an "array Type" (needing AnnotatedArrayTypeImpl)
+            // when it represents an array type; otherwise it's a plain type.
+            if mirror_class_name(ctx, backing_type)
+                .map(|n| n.starts_with('['))
+                .unwrap_or(false)
+            {
+                ARRAY
+            } else {
+                BASE
+            }
+        }
+        _ => BASE,
+    }
+}
+
 fn make_annotated_type(
     ctx: &mut dyn NativeContext,
     backing_type: cratonvm_types::ObjectRef,
 ) -> cratonvm_types::ObjectRef {
-    // Try the impl class first (real-JDK layout); fall back to the
-    // interface name (synthetic-mode placeholder).
+    // Select the real-JDK impl class matching the backing Type's kind (see
+    // `annotated_type_impl_class_name`); fall back to the interface name
+    // (synthetic-mode placeholder) if the impl class can't be loaded.
+    let impl_name = annotated_type_impl_class_name(ctx, backing_type);
     let cid = ctx
-        .ensure_class_initialized(
-            "sun/reflect/annotation/AnnotatedTypeFactory$AnnotatedTypeBaseImpl",
-        )
+        .ensure_class_initialized(impl_name)
         .or_else(|_| ctx.ensure_class_initialized("java/lang/reflect/AnnotatedType"))
         .unwrap_or(cratonvm_types::ClassId::new(0));
 
@@ -12540,10 +12597,12 @@ fn make_annotated_type_with_anns(
     // AnnotatedType object, mirroring the GC-ordering used elsewhere.
     let ann_arr = build_annotation_array(ctx, anns);
 
+    // Select the real-JDK impl class matching the backing Type's kind (see
+    // `annotated_type_impl_class_name`); fall back to the interface name
+    // (synthetic-mode placeholder) if the impl class can't be loaded.
+    let impl_name = annotated_type_impl_class_name(ctx, backing_type);
     let cid = ctx
-        .ensure_class_initialized(
-            "sun/reflect/annotation/AnnotatedTypeFactory$AnnotatedTypeBaseImpl",
-        )
+        .ensure_class_initialized(impl_name)
         .or_else(|_| ctx.ensure_class_initialized("java/lang/reflect/AnnotatedType"))
         .unwrap_or(cratonvm_types::ClassId::new(0));
 
@@ -12589,8 +12648,18 @@ fn annotated_type_stashed_anns(
 
 /// `Method.getAnnotatedReturnType()Ljava/lang/reflect/AnnotatedType;`
 ///
-/// Builds an AnnotatedType wrapping the (erased) return type and carrying the
-/// method's METHOD_RETURN TYPE_USE annotations.
+/// Builds an AnnotatedType wrapping the return type and carrying the
+/// method's METHOD_RETURN TYPE_USE annotations. Uses the GENERIC return type
+/// (`getGenericReturnType()`, falling back to the erased `Class` only when
+/// that call yields nothing) — not the erased one — so a parameterized/
+/// array/type-variable/wildcard return type reifies as a real
+/// `ParameterizedType`/`GenericArrayType`/etc. and `make_annotated_type_with_anns`
+/// can pick the matching `AnnotatedXxxType` impl class (see
+/// `annotated_type_impl_class_name`). Building the AnnotatedType from the
+/// erased type reflects a plain `Class` even for a generic return type,
+/// which real JDK never does — third-party reflective readers that check
+/// `instanceof AnnotatedParameterizedType` (ByteBuddy's `JavaDispatcher`,
+/// used by Mockito) then diverge from HotSpot.
 pub(crate) fn native_method_get_annotated_return_type(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -12600,18 +12669,42 @@ pub(crate) fn native_method_get_annotated_return_type(
         Some((cid, name, desc)) => ctx.method_return_type_annotations(cid, &name, &desc),
         None => Vec::new(),
     };
-    let type_mirror = match ctx.invoke_virtual(this, "getReturnType", "()Ljava/lang/Class;", &[]) {
+    let type_mirror = match ctx.invoke_virtual(
+        this,
+        "getGenericReturnType",
+        "()Ljava/lang/reflect/Type;",
+        &[],
+    ) {
         Ok(Some(Value::Object(Some(m)))) => m,
-        _ => ctx.get_class_mirror(cratonvm_types::ClassId::new(0)),
+        _ => match ctx.invoke_virtual(this, "getReturnType", "()Ljava/lang/Class;", &[]) {
+            Ok(Some(Value::Object(Some(m)))) => m,
+            _ => ctx.get_class_mirror(cratonvm_types::ClassId::new(0)),
+        },
     };
     let at = make_annotated_type_with_anns(ctx, type_mirror, &anns);
     Ok(Some(Value::Object(Some(at))))
 }
 
+/// `Parameter.getType()`, as a `Class` mirror — the fallback backing `Type`
+/// for [`native_parameter_get_annotated_type`] when the declaring
+/// executable's generic parameter type isn't available.
+fn parameter_erased_type_mirror(ctx: &mut dyn NativeContext, this: ObjectRef) -> ObjectRef {
+    match ctx.invoke_virtual(this, "getType", "()Ljava/lang/Class;", &[]) {
+        Ok(Some(Value::Object(Some(m)))) => m,
+        _ => ctx.get_class_mirror(cratonvm_types::ClassId::new(0)),
+    }
+}
+
 /// `Parameter.getAnnotatedType()Ljava/lang/reflect/AnnotatedType;`
 ///
-/// Builds an AnnotatedType wrapping the parameter's (erased) type and carrying
-/// that parameter's METHOD_FORMAL_PARAMETER TYPE_USE annotations.
+/// Builds an AnnotatedType wrapping the parameter's type and carrying that
+/// parameter's METHOD_FORMAL_PARAMETER TYPE_USE annotations. Prefers the
+/// GENERIC parameter type (the `idx`'th element of the declaring
+/// executable's `getGenericParameterTypes()`) over the erased one — see
+/// `native_method_get_annotated_return_type` for why; falls back to the
+/// erased `getType()` when the generic array is unavailable or the index is
+/// out of range (e.g. a synthetic/mandated parameter with no Signature
+/// entry).
 pub(crate) fn native_parameter_get_annotated_type(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -12633,9 +12726,19 @@ pub(crate) fn native_parameter_get_annotated_type(
             .unwrap_or_default(),
         None => Vec::new(),
     };
-    let type_mirror = match ctx.invoke_virtual(this, "getType", "()Ljava/lang/Class;", &[]) {
-        Ok(Some(Value::Object(Some(m)))) => m,
-        _ => ctx.get_class_mirror(cratonvm_types::ClassId::new(0)),
+    let type_mirror = match ctx.invoke_virtual(
+        exec,
+        "getGenericParameterTypes",
+        "()[Ljava/lang/reflect/Type;",
+        &[],
+    ) {
+        Ok(Some(Value::Object(Some(arr)))) if idx < ctx.array_length(arr) => {
+            match ctx.get_array_element(arr, idx) {
+                Value::Object(Some(m)) => m,
+                _ => parameter_erased_type_mirror(ctx, this),
+            }
+        }
+        _ => parameter_erased_type_mirror(ctx, this),
     };
     let at = make_annotated_type_with_anns(ctx, type_mirror, &anns);
     Ok(Some(Value::Object(Some(at))))
@@ -12644,7 +12747,11 @@ pub(crate) fn native_parameter_get_annotated_type(
 /// `Executable.getAnnotatedParameterTypes()[Ljava/lang/reflect/AnnotatedType;`
 ///
 /// One AnnotatedType per declared parameter, each carrying that parameter's
-/// METHOD_FORMAL_PARAMETER TYPE_USE annotations.
+/// METHOD_FORMAL_PARAMETER TYPE_USE annotations. Prefers the GENERIC
+/// parameter types (`getGenericParameterTypes()`) over the erased ones —
+/// see `native_method_get_annotated_return_type` for why — falling back
+/// per-element to the erased mirror when the generic array's length
+/// doesn't match the erased one (e.g. synthetic/mandated parameters).
 pub(crate) fn native_executable_get_annotated_parameter_types(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -12657,8 +12764,9 @@ pub(crate) fn native_executable_get_annotated_parameter_types(
         }
         None => (Vec::new(), 0),
     };
-    // Resolve the erased parameter type mirrors once.
-    let param_type_mirrors: Vec<ObjectRef> =
+    // Resolve the erased parameter type mirrors once (fallback + length
+    // reference for the generic array below).
+    let erased_type_mirrors: Vec<ObjectRef> =
         match ctx.invoke_virtual(this, "getParameterTypes", "()[Ljava/lang/Class;", &[]) {
             Ok(Some(Value::Object(Some(arr)))) => {
                 let n = ctx.array_length(arr);
@@ -12671,13 +12779,32 @@ pub(crate) fn native_executable_get_annotated_parameter_types(
             }
             _ => Vec::new(),
         };
-    let n = param_type_mirrors.len().max(count);
+    let generic_type_mirrors: Vec<ObjectRef> = match ctx.invoke_virtual(
+        this,
+        "getGenericParameterTypes",
+        "()[Ljava/lang/reflect/Type;",
+        &[],
+    ) {
+        Ok(Some(Value::Object(Some(arr))))
+            if ctx.array_length(arr) == erased_type_mirrors.len() =>
+        {
+            let n = ctx.array_length(arr);
+            (0..n)
+                .map(|i| match ctx.get_array_element(arr, i) {
+                    Value::Object(Some(m)) => m,
+                    _ => erased_type_mirrors[i],
+                })
+                .collect()
+        }
+        _ => erased_type_mirrors,
+    };
+    let n = generic_type_mirrors.len().max(count);
     let comp = ctx
         .class_id_by_name("java/lang/reflect/AnnotatedType")
         .unwrap_or(cratonvm_types::ClassId::new(0));
     let out = ctx.new_ref_array(comp, n);
     for i in 0..n {
-        let tm = param_type_mirrors
+        let tm = generic_type_mirrors
             .get(i)
             .copied()
             .unwrap_or_else(|| ctx.get_class_mirror(cratonvm_types::ClassId::new(0)));
@@ -12691,8 +12818,10 @@ pub(crate) fn native_executable_get_annotated_parameter_types(
 
 /// `Field.getAnnotatedType()Ljava/lang/reflect/AnnotatedType;`
 ///
-/// Builds an AnnotatedType wrapping the field's (erased) type and carrying the
-/// field's FIELD-target TYPE_USE annotations.
+/// Builds an AnnotatedType wrapping the field's type and carrying the
+/// field's FIELD-target TYPE_USE annotations. Prefers the GENERIC field type
+/// (`getGenericType()`) over the erased one — see
+/// `native_method_get_annotated_return_type` for why.
 pub(crate) fn native_field_get_annotated_type(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -12702,10 +12831,14 @@ pub(crate) fn native_field_get_annotated_type(
         Some((cid, name)) => ctx.field_type_annotations(cid, &name),
         None => Vec::new(),
     };
-    let type_mirror = match ctx.invoke_virtual(this, "getType", "()Ljava/lang/Class;", &[]) {
-        Ok(Some(Value::Object(Some(m)))) => m,
-        _ => ctx.get_class_mirror(cratonvm_types::ClassId::new(0)),
-    };
+    let type_mirror =
+        match ctx.invoke_virtual(this, "getGenericType", "()Ljava/lang/reflect/Type;", &[]) {
+            Ok(Some(Value::Object(Some(m)))) => m,
+            _ => match ctx.invoke_virtual(this, "getType", "()Ljava/lang/Class;", &[]) {
+                Ok(Some(Value::Object(Some(m)))) => m,
+                _ => ctx.get_class_mirror(cratonvm_types::ClassId::new(0)),
+            },
+        };
     let at = make_annotated_type_with_anns(ctx, type_mirror, &anns);
     Ok(Some(Value::Object(Some(at))))
 }

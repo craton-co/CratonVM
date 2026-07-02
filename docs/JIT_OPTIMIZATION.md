@@ -1,6 +1,6 @@
 # CratonVM JIT Compiler — Round 26 Performance Results
 
-## The Journey: From 97x Slower to Within 1.5x of JDK C2
+## The Journey: From 97x Slower to the March 2026 Round 26 Snapshot
 
 ```
                     Performance vs OpenJDK -Xint (interpreter mode)
@@ -29,7 +29,7 @@
   Round 25     ◀═══════════════════  (SoA Value layout: 16B → 9B per slot)
   Round 26     ◀═══════════════════  (loop unrolling, speculative BCE, OSR fast-path)
                ▏                                                    ←── OpenJDK -Xint
-               ▏  ◀═════                                           ←── OpenJDK C2 (1.50x)
+               ▏  ◀═════                                           ←── OpenJDK C2 (historical R26)
 ```
 
 ---
@@ -46,7 +46,9 @@ A Java Virtual Machine written entirely in Rust:
 - Multi-threading with monitors, locks, and barriers
 - Lambda/invokedynamic support
 - **x86-64 JIT compiler** (~7,200 lines, ~140 bytecodes, 26 optimization rounds)
-- **Within 1.50x of JDK C2** on QuickBench (Fibonacci 1.31x)
+- Historical March 2026 Round 26 snapshot reached 1.50x of JDK C2 on QuickBench.
+- Current 2026-07-02 snapshot (`b80c50b5`) is 46.2x slower by default and
+  8.25x slower with `CRATONVM_JIT_OSR=1 CRATONVM_JIT_THRESHOLD=1`.
 
 ---
 
@@ -147,9 +149,11 @@ A Java Virtual Machine written entirely in Rust:
 
 ## Benchmark Results
 
-### QuickBench — Scaled Workloads (Round 26)
+### QuickBench — Scaled Workloads (Historical Round 26)
 
-*Measured 2026-03-31 on Windows 11, JDK 25.0.1 LTS.*
+*Historical measurement from 2026-03-31 on Windows 11, JDK 25.0.1 LTS. This is
+not the current benchmark snapshot; see the README and mdBook Benchmarks page
+for the 2026-07-02 `b80c50b5` numbers.*
 
 ```
   Benchmark               JDK C2      CratonVM R26    Ratio     Notes
@@ -162,7 +166,7 @@ A Java Virtual Machine written entirely in Rust:
   TOTAL                    3440 ms      5161 ms      1.50x
 
   Binary Trees (depth=18)   714 ms     16657 ms     23.3x     ✗ GC allocation bottleneck
-  Overall:   1.50x on QuickBench vs HotSpot C2 (Binary Trees tracked separately)
+  Historical overall: 1.50x on QuickBench vs HotSpot C2 (Binary Trees tracked separately)
 ```
 
 ★ = JIT-compiled to native x86-64 machine code
@@ -189,7 +193,7 @@ A Java Virtual Machine written entirely in Rust:
   R14 full-regs ███████████████████████████████                3978 ms (1.93x slower)
   R20 compact+  █████████████████████████████████████████      9562 ms (1.8x slower)
   R25 SoA+SIMD  ████████████████████                           5210 ms (1.51x)
-  R26 unroll    ███████████████████                            5161 ms (1.50x) ← latest
+  R26 unroll    ███████████████████                            5161 ms (1.50x) ← March 2026 snapshot
                ────────────────────────────────────────────────────────────────
   JDK C2        █████████████                                  3440 ms  (1.0x)
   JDK -Xint    █████████████████████████████████████████████ 144543 ms (27.7x)
@@ -473,7 +477,7 @@ A Java Virtual Machine written entirely in Rust:
   Phase 5 (R21-25)  BCE + invokevirtual + OSR + SIMD + SoA        COMPLETE
   Phase 6 (R26)     Loop unrolling + speculative BCE + regalloc    COMPLETE
   -----------------------------------------------------------------------
-  Result:           1.50x vs JDK C2 (Fibonacci 1.31x)             DONE
+  March 2026 result: 1.50x vs JDK C2 (Fibonacci 1.31x)            HISTORICAL
 ```
 
 ### Timeline
@@ -507,4 +511,4 @@ A Java Virtual Machine written entirely in Rust:
 | Optimization rounds | **26** |
 | Total speedup (small) | **253x** (5064ms → 20ms) |
 | vs JDK -Xint | **~28x FASTER** |
-| vs JDK C2 | **1.50x QuickBench (Fibonacci 1.31x)** |
+| vs JDK C2 | Historical March 2026: **1.50x QuickBench (Fibonacci 1.31x)**; current 2026-07-02: **46.2x default / 8.25x OSR+threshold** |

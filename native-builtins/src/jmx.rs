@@ -2823,6 +2823,13 @@ mod jmx_tests {
     use super::*;
     use cratonvm_native_api::NativeMethodRegistry;
 
+    fn registry_with_synthetic_mbean_server() -> NativeMethodRegistry {
+        let mut r = NativeMethodRegistry::new();
+        register_jmx_natives(&mut r);
+        register_mbean_server(&mut r);
+        r
+    }
+
     #[test]
     fn test_management_factory_registration() {
         let mut r = NativeMethodRegistry::new();
@@ -3016,8 +3023,7 @@ mod jmx_tests {
 
     #[test]
     fn test_mbean_server_registration() {
-        let mut r = NativeMethodRegistry::new();
-        register_jmx_natives(&mut r);
+        let r = registry_with_synthetic_mbean_server();
         let cls = "javax/management/MBeanServer";
         assert!(r.find(cls, "<init>", "()V").is_some());
         assert!(r
@@ -3049,8 +3055,7 @@ mod jmx_tests {
     fn test_mbean_server_flow_methods_registered() {
         // The full in-process JMX flow must expose register / unregister /
         // get / set / invoke / query so a basic round-trip works.
-        let mut r = NativeMethodRegistry::new();
-        register_jmx_natives(&mut r);
+        let r = registry_with_synthetic_mbean_server();
         let cls = "javax/management/MBeanServer";
         let methods = [
             ("registerMBean", "(Ljava/lang/Object;Ljavax/management/ObjectName;)Ljavax/management/ObjectInstance;"),
@@ -3208,8 +3213,7 @@ mod jmx_tests {
 
     #[test]
     fn test_all_mxbean_classes_have_init() {
-        let mut r = NativeMethodRegistry::new();
-        register_jmx_natives(&mut r);
+        let r = registry_with_synthetic_mbean_server();
         let classes = [
             "java/lang/management/ManagementFactory",
             "java/lang/management/RuntimeMXBean",
@@ -3387,8 +3391,7 @@ mod jmx_tests {
         // control the code, we just assert the expected counts are used
         // by calling the alloc functions via the factory and checking
         // the registry has the right init methods.
-        let mut r = NativeMethodRegistry::new();
-        register_jmx_natives(&mut r);
+        let r = registry_with_synthetic_mbean_server();
 
         // All 10 classes should have <init>
         let expected_classes = 10;

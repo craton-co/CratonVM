@@ -36,10 +36,16 @@ if matches!(verdict, OffloadVerdict::Eligible { .. }) {
 ## Fixtures and GPU-toolchain checks
 
 `build.rs` requires `javac` on `PATH` to compile the Java fixture set. When
-`javac` is missing, source discovery fails, or compilation fails, the build
-emits a `cargo:warning=` and the generated fixture directory remains empty;
-fixture-dependent tests then fail loudly with `failed to read fixture` instead
-of passing against stale checked-in `.class` files.
+`javac` is missing, source discovery fails, or required fixture compilation
+fails, the build emits a `cargo:warning=` and the generated fixture directory
+remains empty; fixture-dependent tests then fail loudly with
+`failed to read fixture` instead of passing against stale checked-in `.class`
+files.
+
+Some optional fixtures import `craton.gpu.*` runtime or annotation classes. If
+the dependent `craton-gpu` crate does not export a Java classpath for those
+classes, `build.rs` skips only those API-dependent fixtures and still compiles
+the core analyzer/lowering fixtures used by default tests.
 
 The optional `gpu-it` feature enables the `ptxas` round-trip test that is
 ignored by default:

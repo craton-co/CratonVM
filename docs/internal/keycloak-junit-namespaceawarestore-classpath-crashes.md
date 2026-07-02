@@ -1,8 +1,11 @@
 # Keycloak JUnit NamespaceAwareStore classpath crashes
 
-Status: open
+Status: fixed (classpath normalized; see Fix below). A separate, unrelated
+missing-dependency issue was uncovered once this bug stopped masking it — see
+Follow-on issue.
 
 Date observed: 2026-07-02
+Date fixed: 2026-07-02
 
 ## Summary
 
@@ -103,12 +106,54 @@ C:\craton\CratonVM-keycloak-runner-others-20260702-01\apps\keycloak-suite-runner
 C:\craton\CratonVM-keycloak-runner-others-20260702-01\apps\keycloak-suite-runner\.suite\results\hotspot-crash-signature-probe-20260702-01\hotspot-jit\logs\tests_base.org.keycloak.tests.account.AccountConsoleDisabledTest.out.log
 ```
 
-## Next Steps
+## Fix
 
-- Rebuild `kc-universal-cp.txt` or replace it with module-specific test
-  classpaths so only one compatible JUnit stack is present.
-- Prefer JUnit 6 artifacts for the new Keycloak test framework classes that call
-  `computeIfAbsent`.
-- Rerun the 338 affected classes after classpath normalization.
-- Adjust runner status classification if CratonVM linkage exits should be
-  reported separately from native crashes.
+`apps\keycloak\kc-universal-cp.txt` is a local, gitignored, machine-generated
+file (not checked in, no in-repo generator script), so the fix was applied
+directly to that file on this machine:
+
+- Removed every JUnit 5.10.3 / junit-platform 1.10.3 jar
+  (`junit-jupiter-api`, `junit-jupiter-engine`, `junit-jupiter-params`,
+  `junit-platform-commons`, `junit-platform-engine`,
+  `junit-platform-launcher`, `junit-vintage-engine`).
+- Pinned every one of those artifacts to the single 6.0.3 release already
+  present in `~/.m2/repository`, adding `junit-platform-launcher-6.0.3.jar`
+  and `junit-vintage-engine-6.0.3.jar` (previously only 1.10.3/5.10.3 copies
+  were on the classpath).
+- Left `junit-4.13.2.jar` (plain JUnit 4, used via the vintage engine) alone.
+
+Verified with a direct repro (`KcRunner org.keycloak.tests.account.
+AccountConsoleDisabledTest` on `target\release\cratonvm.exe`): the
+`NamespaceAwareStore.computeIfAbsent` `NoSuchMethodError` no longer occurs.
+
+Rerun the 338 affected classes with the normalized classpath to confirm the
+fix holds across the full set. Since `kc-universal-cp.txt` isn't tracked in
+git, this fix needs to be re-applied (or, better, encoded into whatever
+process regenerates the file) on any other machine/worktree that runs the
+suite.
+
+## Follow-on issue (separate bug, uncovered by this fix)
+
+With the JUnit crash resolved, the same repro class now fails deeper in
+Keycloak's new test framework config bootstrap:
+
+```text
+NoSuchMethodError: io/smallrye/config/SmallRyeConfigBuilder.addDefaultSources()...
+  (fixed by adding smallrye-config/smallrye-config-common/smallrye-config-core
+   3.16.0 to kc-universal-cp.txt — those jars were missing entirely)
+```
+
+then, after adding those:
+
+```text
+linkage error: no class def found: org/keycloak/testframework/config/Config
+```
+
+`javap` on `Config.class` shows `initConfig()` constructs
+`io/quarkus/runtime/configuration/CharsetConverter`,
+`MemorySizeConverter`, and `InetSocketAddressConverter` — all from
+`quarkus-core`, which is entirely absent from `kc-universal-cp.txt` (only
+`resteasy-reactive-common{,-types}` quarkus jars are present). This is a
+distinct, pre-existing missing-dependency gap (quarkus-core and its
+transitive deps were never added to the universal classpath), not a JUnit
+version-mismatch issue. Needs its own investigation/fix — track separately.

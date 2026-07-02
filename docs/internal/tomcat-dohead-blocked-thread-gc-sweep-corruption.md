@@ -96,3 +96,26 @@ with `CRATONVM_REAL_NET_SOCKETS=1`, `CRATONVM_REAL_AQS=1`, and
 As of 2026-07-01, `apps/tomcat-suite-runner` is not present in this checkout, so
 the Tomcat class could not be rerun here. Goal for any external runner check:
 `Tests run: 156, Failures: 0` with no all-zero-header warnings.
+
+## Addendum 2026-07-02: register-only residual closed (large-write variant)
+
+The harder large-write sibling,
+`TestHttpServletDoHeadInvalidWrite1023ValidWrite1023`, still crashed (SIGSEGV /
+non-moving-sweep desync) after the fixes above, because its heavier AQS churn
+exposed a *register-only* remainder: the `ConditionObject`/`ConditionNode`
+chain held purely in a callee-saved JIT register that is never spilled to any
+scannable stack slot for the whole blocked window, so even the
+`scan_active_jit_frames` stack scan (from Root Cause 2/3 above) missed it.
+
+Fixed on `fix/aqs-park-jit-root-pin` (commit `23388aba`, merged to dev as
+`71aef458`): `NativeContextImpl::park` (vm/src/vm/vm_exec.rs) now re-reads the
+real `java.lang.Thread.parkBlocker` field (already written by real-JDK
+`LockSupport.setCurrentBlocker` before every tracked park) and pins it as an
+extra `native_pin_roots` entry for the duration of the block — the same
+`monitor_wait_keepalive` (BUG-W) pattern, applied to `park`. Verified 6/6 clean
+repro runs (`-Xmx500m`, 150s) vs. an unfixed-dev baseline reproducing the
+corruption the same day. See memory
+`reference_tomcat_dohead_aqs_blocked_jit_register_root` and
+`reference_dohead_jit_heap_corruption_open` for full detail, including the
+still-unmerged, complementary Layer-2 sweep-walker hardening
+(`fix/dohead-sweep-freelist`).

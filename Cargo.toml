@@ -18,6 +18,7 @@ rust-version = "1.80"
 license = "Apache-2.0"
 repository = "https://github.com/craton-co/cratonvm"
 homepage = "https://craton.com.ar"
+documentation = "https://github.com/craton-co/cratonvm/tree/main/docs"
 description = "A Java Virtual Machine written entirely in Rust with a custom x86-64 JIT compiler"
 keywords = ["jvm", "java", "virtual-machine", "interpreter", "jit"]
 categories = ["compilers", "emulators"]

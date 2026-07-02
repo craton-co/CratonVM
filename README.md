@@ -40,16 +40,16 @@ standard library, so it can run with **no JDK installation, no `JAVA_HOME`, no `
 
 ### Benchmark (vs HotSpot JDK 25 C2)
 
-| Benchmark | JDK 25 C2 | CratonVM default | Default ratio | CratonVM OSR, threshold=1 | OSR ratio |
-|-----------|-----------|------------------|---------------|---------------------------|-----------|
-| Arithmetic 300M | 901 ms | 76,789 ms | 85.2x | 82,534 ms | 91.6x |
-| Fibonacci(42) | 1,922 ms | 31,513 ms | 16.4x | 36,158 ms | 18.8x |
-| Sieve 100Kx500 | 290 ms | 42,858 ms | 147.8x | 609 ms | 2.10x |
-| Matrix 500x500 | 309 ms | 50,835 ms | 164.5x | 831 ms | 2.69x |
-| **QuickBench TOTAL** | **3,422 ms** | **201,995 ms** | **59.0x** | **120,132 ms** | **35.1x** |
-| Binary Trees (depth=18) | 725 ms | 24,075 ms | 33.2x | 27,151 ms | 37.4x |
+| Benchmark               | JDK 25 C2    | CratonVM default | Default ratio | CratonVM OSR, threshold=1 | OSR ratio |
+|-------------------------|--------------|------------------|---------------|---------------------------|-----------|
+| Arithmetic 300M         | 991 ms       | 73,820 ms        | 74.5x         | 1,534 ms                  | 1.55x     |
+| Fibonacci(42)           | 2,071 ms     | 28,969 ms        | 14.0x         | 28,525 ms                 | 13.8x     |
+| Sieve 100Kx500          | 358 ms       | 31,665 ms        | 88.4x         | 466 ms                    | 1.30x     |
+| Matrix 500x500          | 336 ms       | 39,078 ms        | 116.3x        | 452 ms                    | 1.35x     |
+| **QuickBench TOTAL**    | **3,756 ms** | **173,532 ms**   | **46.2x**     | **30,977 ms**             | **8.25x** |
+| Binary Trees (depth=18) | 681 ms       | 19,737 ms        | 29.0x         | 36,665 ms                 | 53.8x     |
 
-*Single-run snapshot measured 2026-07-02 on Microsoft Windows 11 Home, JDK 25.0.1 LTS, CratonVM code `c2b78b8a`, release build. The benchmark sources are the historical `bench/QuickBench.java` and `bench/binarytrees.java` from commit `2cea208`; `bench/` is currently untracked. The default column uses the launcher default, where OSR is disabled. The OSR column sets `CRATONVM_JIT_OSR=1 CRATONVM_JIT_THRESHOLD=1`; on this snapshot it recovers Sieve and Matrix, while Arithmetic, Fibonacci, and Binary Trees remain current regressions.*
+*Single-run snapshot measured 2026-07-02 on Microsoft Windows 11 Home, JDK 25.0.1 LTS, CratonVM code `b80c50b5`, release build. The benchmark sources are the historical `bench/QuickBench.java` and `bench/binarytrees.java` from commit `2cea208`; `bench/` is currently untracked. The default column uses the launcher default, where OSR is disabled. The OSR column sets `CRATONVM_JIT_OSR=1 CRATONVM_JIT_THRESHOLD=1`; on this snapshot it recovers Arithmetic, Sieve, and Matrix, while Fibonacci and Binary Trees remain current regressions.*
 
 See [docs/JIT_OPTIMIZATION.md](docs/JIT_OPTIMIZATION.md) for the full 26-round JIT optimization journey.
 
@@ -296,5 +296,8 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines on how to contribute.
 ## License
 
 Licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE) for details.
+Copyright 2024-2026 Craton Software Company. Project ownership and notice
+material live in [NOTICE](NOTICE); the root license file intentionally remains
+the unmodified Apache License 2.0 text.
 
 See [TRADEMARKS.md](TRADEMARKS.md) for trademark attributions and notices.

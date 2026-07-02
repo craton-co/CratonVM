@@ -166,6 +166,27 @@ pub(crate) fn validate_module_name(name: &str) -> Result<(), RuntimeError> {
 /// the first `loadModule` call.
 static MP_ROOT_CACHE: OnceLock<Option<PathBuf>> = OnceLock::new();
 
+/// Process-wide Maven repository hint captured from `-Dmaven.repo.local`.
+/// Build-tree WildFly distributions use `<artifact name="g:a:v"/>` entries in
+/// module.xml instead of copied `<resource-root>` jars, so the native resolver
+/// has to map those coordinates to the same local repository Maven used.
+static MAVEN_REPO_ROOT: OnceLock<Mutex<Option<PathBuf>>> = OnceLock::new();
+
+fn maven_repo_root_slot() -> &'static Mutex<Option<PathBuf>> {
+    MAVEN_REPO_ROOT.get_or_init(|| Mutex::new(None))
+}
+
+fn remember_maven_repo_root(root: Option<String>) {
+    let Some(raw) = root else {
+        return;
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    *maven_repo_root_slot().lock() = Some(PathBuf::from(trimmed));
+}
+
 /// Find the `-mp <path>` argument in the process command line.
 ///
 /// JBoss Modules consumes this flag from `Main.main(String[])` — by
@@ -251,6 +272,86 @@ fn module_path_root() -> Option<PathBuf> {
         return Some(p);
     }
     resolve_mp_root()
+}
+
+fn maven_repo_candidates() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if let Some(cached) = maven_repo_root_slot().lock().clone() {
+        roots.push(cached);
+    }
+    for key in ["CRATONVM_MAVEN_REPO_LOCAL", "MAVEN_REPO_LOCAL", "M2_REPO"] {
+        if let Ok(raw) = std::env::var(key) {
+            let trimmed = raw.trim();
+            if !trimmed.is_empty() {
+                roots.push(PathBuf::from(trimmed));
+            }
+        }
+    }
+    if let Ok(userprofile) = std::env::var("USERPROFILE") {
+        if !userprofile.trim().is_empty() {
+            roots.push(PathBuf::from(userprofile).join(".m2").join("repository"));
+        }
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        if !home.trim().is_empty() {
+            roots.push(PathBuf::from(home).join(".m2").join("repository"));
+        }
+    }
+    roots
+}
+
+fn is_safe_maven_part(part: &str) -> bool {
+    !part.is_empty()
+        && part != "."
+        && part != ".."
+        && !part.contains("..")
+        && part
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-' | b'+'))
+}
+
+fn resolve_artifact_path(coord: &str) -> Option<PathBuf> {
+    if coord.contains('$') || coord.contains('{') || coord.contains('}') {
+        return None;
+    }
+    let parts: Vec<&str> = coord.split(':').collect();
+    let (group, artifact, version, classifier) = match parts.as_slice() {
+        [g, a, v] => (*g, *a, *v, None),
+        [g, a, v, c] => (*g, *a, *v, Some(*c)),
+        _ => return None,
+    };
+    if ![group, artifact, version]
+        .iter()
+        .all(|part| is_safe_maven_part(part))
+        || classifier
+            .map(|part| !is_safe_maven_part(part))
+            .unwrap_or(false)
+    {
+        return None;
+    }
+
+    let mut relative = PathBuf::new();
+    for segment in group.split('.') {
+        if !is_safe_maven_part(segment) {
+            return None;
+        }
+        relative.push(segment);
+    }
+    relative.push(artifact);
+    relative.push(version);
+    let filename = match classifier {
+        Some(c) => format!("{artifact}-{version}-{c}.jar"),
+        None => format!("{artifact}-{version}.jar"),
+    };
+    relative.push(filename);
+
+    for root in maven_repo_candidates() {
+        let candidate = root.join(&relative);
+        if candidate.is_file() {
+            return std::fs::canonicalize(&candidate).ok().or(Some(candidate));
+        }
+    }
+    None
 }
 
 // ===========================================================================
@@ -441,7 +542,7 @@ pub(crate) fn resolve_module(root: &Path, name: &str) -> Result<ResolvedModule, 
     })?;
     // Resource roots are relative to module_dir.  Materialize each as
     // an absolute path and confirm it stays under the canonical root.
-    let mut resource_roots = Vec::with_capacity(mx.resource_roots.len());
+    let mut resource_roots = Vec::with_capacity(mx.resource_roots.len() + mx.artifacts.len());
     for rr in &mx.resource_roots {
         // Reject `..` segments at the input layer too — defense in depth.
         if rr.path.contains("..") {
@@ -452,6 +553,15 @@ pub(crate) fn resolve_module(root: &Path, name: &str) -> Result<ResolvedModule, 
         let absolute = module_dir.join(&rr.path);
         ensure_under_root(root, &absolute)?;
         resource_roots.push(absolute);
+    }
+    for coord in &mx.artifacts {
+        match resolve_artifact_path(coord) {
+            Some(path) => resource_roots.push(path),
+            None if std::env::var_os("CRATONVM_DBG_WF").is_some() => {
+                eprintln!("[jboss-module] artifact {coord:?} did not resolve in local Maven repo");
+            }
+            None => {}
+        }
     }
     Ok(ResolvedModule {
         module_xml_path,
@@ -543,6 +653,9 @@ pub(crate) fn clear_module_cache_for_test() {
         c.lock().clear();
     }
     let _ = REGISTERED_PATHS.get().map(|m| m.lock().clear());
+    if let Some(c) = MAVEN_REPO_ROOT.get() {
+        *c.lock() = None;
+    }
 }
 
 /// Set of resource-root paths that have already been pushed onto the shared
@@ -799,6 +912,10 @@ pub(crate) fn native_loader_load_module(
     if let Err(e) = validate_module_name(&name) {
         return Err(e.into());
     }
+    remember_maven_repo_root(
+        ctx.get_system_property("maven.repo.local")
+            .or_else(|| ctx.get_system_property("localRepository")),
+    );
 
     // Cache hit?
     {
@@ -1810,6 +1927,54 @@ fn is_jdk_internal_class(name: &str) -> bool {
         || n.starts_with("org/ietf/")
 }
 
+fn property_bridge_module_for_class(
+    ctx: &dyn NativeContext,
+    class_name: &str,
+) -> Option<&'static str> {
+    let jmx_builder = ctx
+        .get_system_property("javax.management.builder.initial")
+        .unwrap_or_default();
+    if jmx_builder.trim() == class_name && class_name.starts_with("org.jboss.as.jmx.") {
+        return Some("org.jboss.as.jmx");
+    }
+
+    let log_manager = ctx
+        .get_system_property("java.util.logging.manager")
+        .unwrap_or_default();
+    if log_manager.trim() == class_name && class_name.starts_with("org.jboss.logmanager.") {
+        return Some("org.jboss.logmanager");
+    }
+
+    None
+}
+
+/// Load a JVM-property-selected implementation class that WildFly exposes as a
+/// JBoss module rather than as a flat application-classpath entry.
+///
+/// OpenJDK's early bootstrap hooks (notably
+/// `java.util.logging.LogManager.initLogManager`) ask the *system* class loader
+/// for classes named by system properties. In a WildFly process those property
+/// classes live under `modules/system/...`, so CratonVM has to expose the
+/// corresponding module roots before the ordinary app loader can find them.
+pub(crate) fn load_property_bridge_class(
+    ctx: &mut dyn NativeContext,
+    class_name: &str,
+) -> Option<Value> {
+    let bridge_module = property_bridge_module_for_class(ctx, class_name)?;
+    let internal = class_name.replace('.', "/");
+    let entry_path = format!("{internal}.class");
+    let (_bridge_modules, mut roots) = module_visibility_closure(bridge_module);
+    roots.extend(transitive_linkage_roots(bridge_module));
+    register_resource_roots(ctx, &roots);
+    if find_entry_in_roots(&roots, &entry_path).is_none() {
+        return None;
+    }
+    match ctx.load_class(&internal) {
+        Ok(Some(mirror)) => Some(mirror),
+        _ => None,
+    }
+}
+
 /// Resolve the Module name behind a ModuleClassLoader instance.
 ///
 /// MCL.slot(0) → Module backref → Module.slot(0) → String name.
@@ -1910,6 +2075,28 @@ pub(crate) fn native_module_classloader_load_class(
         // fixture), behave like a plain delegating loader so apps that
         // don't depend on isolation still work.
         visible = true;
+    }
+
+    if !visible {
+        if let Some(bridge_module) = property_bridge_module_for_class(ctx, &class_name) {
+            let (bridge_modules, mut roots) = module_visibility_closure(bridge_module);
+            roots.extend(transitive_linkage_roots(bridge_module));
+            register_resource_roots(ctx, &roots);
+            if find_entry_in_roots(&roots, &entry_path).is_some() {
+                visible = true;
+                if dbg {
+                    eprintln!(
+                        "[mcl.loadClass] property bridge module={bridge_module:?} \
+                         closure={bridge_modules:?} exposed {entry_path:?}"
+                    );
+                }
+            } else if dbg {
+                eprintln!(
+                    "[mcl.loadClass] property bridge module={bridge_module:?} \
+                     did not expose {entry_path:?}"
+                );
+            }
+        }
     }
 
     if !visible {
@@ -2677,6 +2864,18 @@ mod tests {
         s
     }
 
+    fn make_module_xml_with_artifacts(name: &str, artifacts: &[&str]) -> String {
+        let mut s = format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<module name=\"{}\" xmlns=\"urn:jboss:module:1.9\">\n  <resources>\n",
+            name
+        );
+        for artifact in artifacts {
+            s.push_str(&format!("    <artifact name=\"{}\"/>\n", artifact));
+        }
+        s.push_str("  </resources>\n</module>\n");
+        s
+    }
+
     // -----------------------------------------------------------------
     // validate_module_name
     // -----------------------------------------------------------------
@@ -2718,6 +2917,33 @@ mod tests {
         assert!(validate_module_name("foo\nbar").is_err());
         assert!(validate_module_name("foo\tbar").is_err());
         assert!(validate_module_name("foo\x7fbar").is_err());
+    }
+
+    #[test]
+    fn t19_h4_property_bridge_maps_jmx_builder() {
+        let _g = TEST_LOCK.lock();
+        let mut ctx = MockNativeContext::new();
+        ctx.set_system_property(
+            "javax.management.builder.initial",
+            "org.jboss.as.jmx.PluggableMBeanServerBuilder",
+        );
+        assert_eq!(
+            property_bridge_module_for_class(&ctx, "org.jboss.as.jmx.PluggableMBeanServerBuilder"),
+            Some("org.jboss.as.jmx")
+        );
+        assert_eq!(
+            property_bridge_module_for_class(&ctx, "org.jboss.as.server.Main"),
+            None
+        );
+
+        ctx.set_system_property(
+            "java.util.logging.manager",
+            "org.jboss.logmanager.LogManager",
+        );
+        assert_eq!(
+            property_bridge_module_for_class(&ctx, "org.jboss.logmanager.LogManager"),
+            Some("org.jboss.logmanager")
+        );
     }
 
     // -----------------------------------------------------------------
@@ -2834,6 +3060,34 @@ mod tests {
         assert_eq!(r.resource_roots.len(), 2);
         assert!(r.resource_roots[0].ends_with("a.jar"));
         assert!(r.resource_roots[1].ends_with("b.jar"));
+    }
+
+    #[test]
+    fn t19_h4_resolve_module_artifact_roots_from_maven_repo() {
+        let _g = TEST_LOCK.lock();
+        clear_module_cache_for_test();
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("modules");
+        let repo = tmp.path().join("repo");
+        let main_dir = root.join("com/example/foo/main");
+        write(
+            &main_dir.join("module.xml"),
+            &make_module_xml_with_artifacts("com.example.foo", &["com.acme:tool:1.0"]),
+        );
+        let jar = repo.join("com/acme/tool/1.0/tool-1.0.jar");
+        write(&jar, "PK");
+
+        let prev = std::env::var("CRATONVM_MAVEN_REPO_LOCAL").ok();
+        std::env::set_var("CRATONVM_MAVEN_REPO_LOCAL", &repo);
+        let r = resolve_module(&root, "com.example.foo").unwrap();
+        match prev {
+            Some(value) => std::env::set_var("CRATONVM_MAVEN_REPO_LOCAL", value),
+            None => std::env::remove_var("CRATONVM_MAVEN_REPO_LOCAL"),
+        }
+        clear_module_cache_for_test();
+
+        assert_eq!(r.resource_roots.len(), 1);
+        assert!(r.resource_roots[0].ends_with("tool-1.0.jar"));
     }
 
     #[test]

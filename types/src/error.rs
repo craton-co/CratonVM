@@ -278,6 +278,9 @@ pub enum RuntimeError {
     #[error("IllegalStateException: {message}")]
     IllegalStateException { message: String },
 
+    #[error("IllegalThreadStateException: {message}")]
+    IllegalThreadStateException { message: String },
+
     /// Thrown when a method is invoked by an unauthorized caller. Used by the
     /// Panama native-access gate when `--enable-native-access` has not been
     /// granted to the calling module — matches OpenJDK's

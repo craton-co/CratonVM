@@ -427,6 +427,10 @@ impl ObjectHeader {
             monitor_ptr & (MARK_STATE_MASK as usize) == 0,
             "Monitor pointer must have its low 2 bits clear (>= 4-byte aligned)"
         );
+        assert!(
+            crate::plausible_heap_pointer(monitor_ptr as u64),
+            "Monitor pointer must be a non-null, 8-byte aligned plausible user-space pointer"
+        );
         (monitor_ptr as u64) | MARK_INFLATED
     }
 
@@ -872,7 +876,7 @@ mod tests {
         assert_eq!(ObjectHeader::inflated_monitor(mark) as usize, real_ptr);
 
         // Synthetic aligned pointers covering the upper bits.
-        for &p in &[0x1000usize, 0xDEAD_BEE0usize, usize::MAX & !0b11] {
+        for &p in &[0x1000usize, 0xDEAD_BEE0usize, 0x0000_7FFF_FFFF_FFF8usize] {
             let m = ObjectHeader::make_inflated(p);
             assert_eq!(ObjectHeader::mark_state(m), MARK_INFLATED);
             assert_eq!(ObjectHeader::inflated_monitor(m) as usize, p);
@@ -946,5 +950,17 @@ mod tests {
         // This is a release-active assertion, not a debug-only tripwire:
         // otherwise the state tag would mask the corrupted low bits.
         let _ = ObjectHeader::make_inflated(0x1001);
+    }
+
+    #[test]
+    #[should_panic(expected = "plausible user-space pointer")]
+    fn make_inflated_rejects_null_pointer() {
+        let _ = ObjectHeader::make_inflated(0);
+    }
+
+    #[test]
+    #[should_panic(expected = "plausible user-space pointer")]
+    fn make_inflated_rejects_four_byte_aligned_pointer() {
+        let _ = ObjectHeader::make_inflated(0x1004);
     }
 }
