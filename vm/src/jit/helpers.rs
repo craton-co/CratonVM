@@ -3369,7 +3369,7 @@ fn handle_jit_dispatch_error(
     err: crate::error::MethodCallFailed,
     info: &JitInvokeInfo,
 ) -> i64 {
-    use crate::error::{ClassFileError, LinkageError, MethodCallFailed, RuntimeError, VmError};
+    use crate::error::{ClassFileError, MethodCallFailed, RuntimeError, VmError};
     match err {
         MethodCallFailed::ExceptionThrown(exc) => {
             set_jit_pending_exception(exc);
@@ -3444,83 +3444,25 @@ fn handle_jit_dispatch_error(
         // Mirror the interpreter: build the matching Java throwable so
         // the caller's exception table can find a handler.
         MethodCallFailed::InternalError(VmError::Linkage(linkage_err)) => {
-            let (exc_class, detail) = match &linkage_err {
-                LinkageError::NoClassDefFoundError { class_name } => {
-                    ("java/lang/NoClassDefFoundError", class_name.clone())
-                }
-                LinkageError::NoSuchFieldError {
-                    class_name,
-                    field_name,
-                } => (
-                    "java/lang/NoSuchFieldError",
-                    format!("{}.{}", class_name, field_name),
-                ),
-                LinkageError::NoSuchMethodError {
-                    class_name,
-                    method_name,
-                    method_descriptor,
-                } => (
-                    "java/lang/NoSuchMethodError",
-                    format!("{}.{}{}", class_name, method_name, method_descriptor),
-                ),
-                LinkageError::IncompatibleClassChangeError { message } => {
-                    ("java/lang/IncompatibleClassChangeError", message.clone())
-                }
-                LinkageError::AbstractMethodError {
-                    class_name,
-                    method_name,
-                } => (
-                    "java/lang/AbstractMethodError",
-                    format!("{}.{}", class_name, method_name),
-                ),
-                LinkageError::IllegalAccessError { message } => {
-                    ("java/lang/IllegalAccessError", message.clone())
-                }
-                LinkageError::VerifyError {
-                    class_name,
-                    method_name,
-                    message,
-                } => (
-                    "java/lang/VerifyError",
-                    format!("{}.{}: {}", class_name, method_name, message),
-                ),
-                LinkageError::ClassFormatError {
-                    class_name,
-                    message,
-                } => (
-                    "java/lang/ClassFormatError",
-                    format!("{}: {}", class_name, message),
-                ),
-                LinkageError::UnsupportedClassRedefinitionError {
-                    class_name,
-                    message,
-                } => (
-                    "java/lang/UnsupportedOperationException",
-                    format!("{}: {}", class_name, message),
-                ),
-            };
-            if let Ok(exc) = crate::runtime::exceptions::create_exception_object(
-                vm,
-                thread,
-                exc_class,
-                Some(&detail),
-            ) {
-                set_jit_pending_exception(exc);
-            } else {
-                // Throwable construction failed (heap / rt.jar gap) — fall
-                // back to the legacy InternalError wrap so the failure is
-                // still visible rather than silently dropped.
-                let msg = format!(
-                    "JIT dispatch into {}.{}{} failed: {}",
-                    info.class_name, info.method_name, info.descriptor, linkage_err,
-                );
-                if let Ok(exc) = crate::runtime::exceptions::create_exception_object(
-                    vm,
-                    thread,
-                    "java/lang/InternalError",
-                    Some(&msg),
-                ) {
+            let converted =
+                crate::runtime::exceptions::throw_linkage_error(vm, thread, linkage_err);
+            match converted {
+                MethodCallFailed::ExceptionThrown(exc) => {
                     set_jit_pending_exception(exc);
+                }
+                MethodCallFailed::InternalError(vm_err2) => {
+                    let msg = format!(
+                        "JIT dispatch into {}.{}{} failed: {}",
+                        info.class_name, info.method_name, info.descriptor, vm_err2,
+                    );
+                    if let Ok(exc) = crate::runtime::exceptions::create_exception_object(
+                        vm,
+                        thread,
+                        "java/lang/InternalError",
+                        Some(&msg),
+                    ) {
+                        set_jit_pending_exception(exc);
+                    }
                 }
             }
         }

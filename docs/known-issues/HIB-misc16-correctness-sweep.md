@@ -20,7 +20,10 @@ slowness mitigations still passes on current `dev`:
 `cargo test -p cratonvm-native-api method_descriptor_prefilter -- --nocapture`
 (2/2) and
 `cargo test -p cratonvm-native-api hash_single_scan_preserves_legacy_keys -- --nocapture`
-(1/1). The full Hibernate `FunctionTests` / `StandardFunctionTests` rerun was not
+(1/1). Added and verified the intrinsic-table signature prefilter:
+`cargo test -p cratonvm-native-builtins intrinsics::tests -- --nocapture`
+(24/24, including `signature_prefilter_is_conservative`). The full Hibernate
+`FunctionTests` / `StandardFunctionTests` rerun was not
 available from the separate worktree because `apps/` is gitignored there; a broader
 `cratonvm-vm` test build also failed before execution with MSVC linker disk-space
 errors. Keep §15–16 open until the app-level timing rerun is completed.
@@ -520,3 +523,19 @@ The full Hibernate `FunctionTests` / `StandardFunctionTests` rerun is still
 outstanding, so keep this slowness cluster open. Focused prefilter and hash-key
 regressions were re-run green on 2026-07-01; app-level timing remains the missing
 acceptance signal.
+
+### 2026-07-01 follow-up: intrinsic signature prefilter
+
+Implemented the same cheap-prefilter shape for interpreter intrinsics. The
+vtable-fast path and virtual invoke-cache population now first ask whether the
+`(method_name, descriptor)` pair can possibly be intrinsic before walking the
+class hierarchy to find the resolved declaring class. A `false` result skips the
+`class_manager` read + `find_method_recursive` intrinsic guard entirely; a
+`true` result still performs the existing declaring-class lookup and exact
+`intrinsics::lookup`, so overridden subclass behavior and JVMTI redefine
+suppression remain unchanged.
+
+This should reduce another warm-miss cost for Hibernate/framework call sites
+whose signatures are not in the tiny intrinsic table. It is still a mitigation,
+not closure: the full Hibernate `FunctionTests` / `StandardFunctionTests`
+timing rerun remains outstanding.

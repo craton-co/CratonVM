@@ -103,6 +103,47 @@ pub fn lookup(class: &str, name: &str, desc: &str) -> Option<InterpIntrinsic> {
     })
 }
 
+/// Conservative class-agnostic prefilter for hot virtual-dispatch paths.
+///
+/// A `false` result is definitive: no intrinsic entry has this
+/// `(method_name, descriptor)` pair on any class, so callers can skip the
+/// declaring-class lookup they would otherwise need before calling [`lookup`].
+/// A `true` result only means "maybe"; callers must still resolve the actual
+/// declaring class and use [`lookup`] for the final, sound decision.
+#[inline]
+pub fn might_have_method_descriptor(name: &str, desc: &str) -> bool {
+    matches!(
+        (name, desc),
+        ("getClass", "()Ljava/lang/Class;")
+            | ("hashCode", "()I")
+            | ("length", "()I")
+            | ("charAt", "(I)C")
+            | ("isEmpty", "()Z")
+            | ("arraycopy", "(Ljava/lang/Object;ILjava/lang/Object;II)V")
+            | ("append", "(Ljava/lang/String;)Ljava/lang/StringBuilder;")
+            | ("append", "(I)Ljava/lang/StringBuilder;")
+            | ("append", "(C)Ljava/lang/StringBuilder;")
+            | ("append", "(J)Ljava/lang/StringBuilder;")
+            | ("append", "(Z)Ljava/lang/StringBuilder;")
+            | ("append", "(Ljava/lang/Object;)Ljava/lang/StringBuilder;")
+            | ("toString", "()Ljava/lang/String;")
+            | ("valueOf", "(I)Ljava/lang/Integer;")
+            | ("intValue", "()I")
+            | ("parseInt", "(Ljava/lang/String;)I")
+            | ("valueOf", "(J)Ljava/lang/Long;")
+            | ("longValue", "()J")
+            | ("parseLong", "(Ljava/lang/String;)J")
+            | ("abs", "(I)I")
+            | ("abs", "(J)J")
+            | ("abs", "(D)D")
+            | ("min", "(II)I")
+            | ("max", "(II)I")
+            | ("min", "(JJ)J")
+            | ("max", "(JJ)J")
+            | ("sqrt", "(D)D")
+    )
+}
+
 /// `true` if `kind` names a *static* JDK method (`invokestatic` target with
 /// no receiver), `false` for an instance method (`invokevirtual`/
 /// `invokeinterface` target whose `args[0]` is the receiver).
@@ -288,5 +329,20 @@ mod tests {
             None
         );
         assert_eq!(lookup("com/example/Foo", "bar", "()V"), None);
+    }
+
+    #[test]
+    fn signature_prefilter_is_conservative() {
+        assert!(might_have_method_descriptor("length", "()I"));
+        assert!(might_have_method_descriptor("max", "(JJ)J"));
+        assert!(might_have_method_descriptor(
+            "append",
+            "(Ljava/lang/Object;)Ljava/lang/StringBuilder;"
+        ));
+        assert!(!might_have_method_descriptor(
+            "concat",
+            "(Ljava/lang/String;)Ljava/lang/String;"
+        ));
+        assert!(!might_have_method_descriptor("length", "()J"));
     }
 }

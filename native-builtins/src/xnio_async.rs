@@ -87,18 +87,15 @@ const OPT_NAME: usize = 1; // String — name e.g. "WORKER_IO_THREADS"
 const OPT_TYPE_CLASS: usize = 2; // Class<?> — the T bound
 
 /// `org.xnio.OptionMap` — 1 field.
-// TRAILING extra slot (slot 1, beyond the real fields). In real-JDK mode
-// `org.xnio.OptionMap` is the loaded class whose slot 0 is the Object field
-// `value` (a Map); a Long written there does not round-trip (read back as an
-// Object → as_long() None → handle 0 → "stale handle"). Mirrors the
-// ServiceController `_mscId` trailing-slot pattern. Allocate with 2 slots.
+// TRAILING extra slot (slot 1, beyond the real fields) when synthetic layouts
+// can be widened. Real-JDK mode may clamp instances to the loaded class's real
+// one-field layout, so the Rust handle is also stored in a GC-stable side table.
 const OM_ENTRIES_HANDLE: usize = 1; // long id → `Arc<OptionMapInner>` in registry
 
 /// `org.xnio.OptionMap$Builder` — 1 field.
-// TRAILING extra slot (slot 1, beyond the real fields). Real `OptionMap$Builder`
-// slot 0 is the Object field `list`; a Long there reads back as Object →
-// as_long() None → handle 0 → "stale or unknown handle" at the first
-// `Builder.set` (WildFly `ManagementWorkerService.installService`). Allocate 2 slots.
+// Same trailing-slot + side-table arrangement as OptionMap. Real
+// `OptionMap$Builder` slot 0 is the Object field `list`; writing a Long there
+// would not round-trip, and some loaded layouts do not admit the trailing slot.
 const OMB_PENDING_HANDLE: usize = 1; // long id → `Arc<BuilderInner>` in registry
 
 /// `org.xnio.IoFuture` — 3 fields.
@@ -356,6 +353,8 @@ pub(crate) struct Registries {
     pub(crate) maps: Mutex<HashMap<i64, Arc<OptionMapInner>>>,
     pub(crate) builders: Mutex<HashMap<i64, Arc<BuilderInner>>>,
     pub(crate) futures: Mutex<HashMap<i64, Arc<IoFutureInner>>>,
+    map_handles_by_obj: Mutex<HashMap<usize, i64>>,
+    builder_handles_by_obj: Mutex<HashMap<usize, i64>>,
     pub(crate) next_handle: AtomicU8,
 }
 
@@ -365,8 +364,105 @@ fn registries() -> &'static Registries {
         maps: Mutex::new(HashMap::new()),
         builders: Mutex::new(HashMap::new()),
         futures: Mutex::new(HashMap::new()),
+        map_handles_by_obj: Mutex::new(HashMap::new()),
+        builder_handles_by_obj: Mutex::new(HashMap::new()),
         next_handle: AtomicU8::new(0),
     })
+}
+
+// Real XNIO classes loaded from the JDK/WildFly classpath can have too few
+// instance fields for our synthetic trailing handle slot. Key the fallback by a
+// GC-stable identity hash and use a per-hash generation to distinguish genuine
+// 32-bit hash collisions among live wrappers.
+struct XnioObjKeyEntry {
+    last_ptr: usize,
+    generation: u32,
+}
+
+fn xnio_obj_key_registry() -> &'static Mutex<HashMap<u32, Vec<XnioObjKeyEntry>>> {
+    static R: OnceLock<Mutex<HashMap<u32, Vec<XnioObjKeyEntry>>>> = OnceLock::new();
+    R.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[inline]
+fn pack_xnio_obj_key(hash: u32, generation: u32) -> usize {
+    ((hash as usize) << 32) | (generation as usize)
+}
+
+fn xnio_obj_key_for(ctx: &dyn NativeContext, obj: ObjectRef) -> usize {
+    let hash = ctx.identity_hash_code(obj) as u32;
+    let ptr = obj.as_ptr() as usize;
+    let mut reg = xnio_obj_key_registry().lock();
+    let slots = reg.entry(hash).or_default();
+    if let Some(slot) = slots.iter().find(|s| s.last_ptr == ptr) {
+        return pack_xnio_obj_key(hash, slot.generation);
+    }
+    if hash != 0 && slots.len() == 1 {
+        slots[0].last_ptr = ptr;
+        return pack_xnio_obj_key(hash, slots[0].generation);
+    }
+    let generation = slots.len() as u32;
+    slots.push(XnioObjKeyEntry {
+        last_ptr: ptr,
+        generation,
+    });
+    pack_xnio_obj_key(hash, generation)
+}
+
+#[inline]
+fn read_handle_slot(ctx: &dyn NativeContext, obj: ObjectRef, slot: usize) -> i64 {
+    if ctx.object_num_fields(obj) <= slot {
+        return 0;
+    }
+    ctx.get_field(obj, slot).as_long().unwrap_or(0)
+}
+
+#[inline]
+fn write_handle_slot_if_present(ctx: &dyn NativeContext, obj: ObjectRef, slot: usize, handle: i64) {
+    if ctx.object_num_fields(obj) > slot {
+        ctx.set_field(obj, slot, Value::Long(handle));
+    }
+}
+
+fn remember_map_handle(ctx: &dyn NativeContext, obj: ObjectRef, handle: i64) {
+    let key = xnio_obj_key_for(ctx, obj);
+    registries().map_handles_by_obj.lock().insert(key, handle);
+}
+
+fn remember_builder_handle(ctx: &dyn NativeContext, obj: ObjectRef, handle: i64) {
+    let key = xnio_obj_key_for(ctx, obj);
+    registries()
+        .builder_handles_by_obj
+        .lock()
+        .insert(key, handle);
+}
+
+fn map_handle_for(ctx: &dyn NativeContext, obj: ObjectRef) -> i64 {
+    let slot_handle = read_handle_slot(ctx, obj, OM_ENTRIES_HANDLE);
+    if slot_handle != 0 {
+        return slot_handle;
+    }
+    let key = xnio_obj_key_for(ctx, obj);
+    registries()
+        .map_handles_by_obj
+        .lock()
+        .get(&key)
+        .copied()
+        .unwrap_or(0)
+}
+
+fn builder_handle_for(ctx: &dyn NativeContext, obj: ObjectRef) -> i64 {
+    let slot_handle = read_handle_slot(ctx, obj, OMB_PENDING_HANDLE);
+    if slot_handle != 0 {
+        return slot_handle;
+    }
+    let key = xnio_obj_key_for(ctx, obj);
+    registries()
+        .builder_handles_by_obj
+        .lock()
+        .get(&key)
+        .copied()
+        .unwrap_or(0)
 }
 
 fn next_handle() -> i64 {
@@ -689,7 +785,8 @@ fn native_option_parse_value(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
 fn alloc_option_map(ctx: &mut dyn NativeContext, inner: Arc<OptionMapInner>) -> ObjectRef {
     let obj = alloc_concurrent_synthetic(ctx, "org/xnio/OptionMap", 2);
     let h = register_map(inner);
-    ctx.set_field(obj, OM_ENTRIES_HANDLE, Value::Long(h));
+    write_handle_slot_if_present(ctx, obj, OM_ENTRIES_HANDLE, h);
+    remember_map_handle(ctx, obj, h);
     obj
 }
 
@@ -720,7 +817,8 @@ fn native_option_map_builder(ctx: &mut dyn NativeContext, _args: &[Value]) -> Me
     let inner = Arc::new(BuilderInner::default());
     let obj = alloc_concurrent_synthetic(ctx, "org/xnio/OptionMap$Builder", 2);
     let h = register_builder(inner);
-    ctx.set_field(obj, OMB_PENDING_HANDLE, Value::Long(h));
+    write_handle_slot_if_present(ctx, obj, OMB_PENDING_HANDLE, h);
+    remember_builder_handle(ctx, obj, h);
     Ok(Some(Value::Object(Some(obj))))
 }
 
@@ -728,10 +826,7 @@ fn builder_from_this(
     ctx: &dyn NativeContext,
     this: ObjectRef,
 ) -> Result<Arc<BuilderInner>, MethodCallFailed> {
-    let h = ctx
-        .get_field(this, OMB_PENDING_HANDLE)
-        .as_long()
-        .unwrap_or(0);
+    let h = builder_handle_for(ctx, this);
     lookup_builder(h).ok_or_else(|| ise("OptionMap.Builder: stale or unknown handle"))
 }
 
@@ -835,10 +930,7 @@ fn inner_from_map(
     ctx: &dyn NativeContext,
     this: ObjectRef,
 ) -> Result<Arc<OptionMapInner>, MethodCallFailed> {
-    let h = ctx
-        .get_field(this, OM_ENTRIES_HANDLE)
-        .as_long()
-        .unwrap_or(0);
+    let h = map_handle_for(ctx, this);
     lookup_map(h).ok_or_else(|| ise("OptionMap: stale or unknown handle"))
 }
 
@@ -1825,6 +1917,47 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(size, Value::Int(0));
+    }
+
+    #[test]
+    fn t19_7_e_option_map_one_field_layout_uses_side_table_handle() {
+        let mut ctx = mock_ctx();
+        let cid = ctx.ensure_class_initialized("org/xnio/OptionMap").unwrap();
+        let m = ctx.alloc_object(cid, 1);
+
+        let mut entries = HashMap::new();
+        entries.insert(
+            OptionKey {
+                declaring_class: "org/xnio/Options".to_string(),
+                name: "WORKER_IO_THREADS".to_string(),
+            },
+            OptionValue::Int(7),
+        );
+        let h = register_map(Arc::new(OptionMapInner { entries }));
+        write_handle_slot_if_present(&ctx, m, OM_ENTRIES_HANDLE, h);
+        remember_map_handle(&ctx, m, h);
+
+        assert_eq!(ctx.object_num_fields(m), 1);
+        assert_eq!(read_handle_slot(&ctx, m, OM_ENTRIES_HANDLE), 0);
+        let inner = inner_from_map(&ctx, m).unwrap();
+        assert_eq!(inner.entries.len(), 1);
+    }
+
+    #[test]
+    fn t19_7_e_option_map_builder_one_field_layout_uses_side_table_handle() {
+        let mut ctx = mock_ctx();
+        let cid = ctx
+            .ensure_class_initialized("org/xnio/OptionMap$Builder")
+            .unwrap();
+        let b = ctx.alloc_object(cid, 1);
+        let h = register_builder(Arc::new(BuilderInner::default()));
+        write_handle_slot_if_present(&ctx, b, OMB_PENDING_HANDLE, h);
+        remember_builder_handle(&ctx, b, h);
+
+        assert_eq!(ctx.object_num_fields(b), 1);
+        assert_eq!(read_handle_slot(&ctx, b, OMB_PENDING_HANDLE), 0);
+        let inner = builder_from_this(&ctx, b).unwrap();
+        assert!(!inner.consumed.load(Ordering::SeqCst));
     }
 
     #[test]

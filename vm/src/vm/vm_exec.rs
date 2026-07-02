@@ -10558,7 +10558,7 @@ fn invoke_on_class_shared_inner(
                         // decoder-factory discovery, which can return null in
                         // partial-bootstrap states and NPE on connect().
                         || (class_name == "org/apache/maven/surefire/booter/ForkedBooter"
-                            && method_name == "lookupDecoderFactory")
+                            && matches!(method_name, "lookupDecoderFactory" | "acknowledgedExit"))
                         // WP6.1: Provider.getEngineName(String) вЂ” the
                         // real JDK bytecode reads `knownEngines` (a
                         // static HashMap) which `Provider.<clinit>` would
@@ -12282,13 +12282,15 @@ fn invoke_on_class_shared_inner(
                         return Err(MethodCallFailed::ExceptionThrown(exc));
                     }
                 }
-                return Err(MethodCallFailed::InternalError(VmError::Linkage(
+                return Err(crate::runtime::exceptions::throw_linkage_error(
+                    shared,
+                    thread,
                     LinkageError::NoSuchMethodError {
                         class_name,
                         method_name: method_name.to_string(),
                         method_descriptor: descriptor.to_string(),
                     },
-                )));
+                ));
             }
         }
     };
