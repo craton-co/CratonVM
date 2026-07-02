@@ -514,6 +514,11 @@ pub struct DeviceBuffer<T> {
     pub(crate) inner: backend::DeviceBufferInner<T>,
     /// Per-buffer "last write" event slot. See type-level docs.
     pub(crate) last_write: LastWriteSlot,
+    /// Owned host staging buffers that may still be read by queued H2D
+    /// copies. The safe async upload path stores its private staging
+    /// copy here so the caller's borrowed host slice can be dropped as
+    /// soon as `from_host_async` returns.
+    pub(crate) _host_uploads: Vec<std::sync::Arc<Vec<T>>>,
 }
 
 /// Shared handle to a buffer's last-write event. See [`DeviceBuffer`].
@@ -638,6 +643,7 @@ impl<T: DeviceElem> DeviceBuffer<T> {
         backend::DeviceBufferInner::uninit(&ctx.0, len).map(|inner| Self {
             inner,
             last_write: new_last_write_slot(),
+            _host_uploads: Vec::new(),
         })
     }
 
@@ -647,6 +653,7 @@ impl<T: DeviceElem> DeviceBuffer<T> {
         backend::DeviceBufferInner::zeros(&ctx.0, len).map(|inner| Self {
             inner,
             last_write: new_last_write_slot(),
+            _host_uploads: Vec::new(),
         })
     }
 
@@ -656,6 +663,7 @@ impl<T: DeviceElem> DeviceBuffer<T> {
         backend::DeviceBufferInner::from_host(&ctx.0, host).map(|inner| Self {
             inner,
             last_write: new_last_write_slot(),
+            _host_uploads: Vec::new(),
         })
     }
 
@@ -667,13 +675,7 @@ impl<T: DeviceElem> DeviceBuffer<T> {
     /// callers can inspect the op log; in `cuda` mode `record_op` is a
     /// no-op (the driver owns the queue).
     ///
-    /// CONTRACT (AUDIT 2026-05-29, H10a fix): the host slice `host`
-    /// must outlive `stream.synchronize()` (the next synchronisation of
-    /// the USER stream the upload was submitted on). After that sync
-    /// returns, the H→D DMA has retired and the host slice may be
-    /// safely dropped, moved, or reused.
-    ///
-    /// This contract is now actually honoured: the H→D copy is
+    /// The H→D copy is
     /// submitted on `stream.raw()` (the user stream) and the buffer's
     /// `last_write` event is recorded on that same stream. Previously
     /// the copy ran on the context's `copy_h2d` stream while the doc
@@ -685,7 +687,53 @@ impl<T: DeviceElem> DeviceBuffer<T> {
     /// The recorded `last_write` event also lets a subsequent
     /// `launch_on_stream` order its kernel behind this upload (via
     /// `cuStreamWaitEvent` on the per-buffer event) without racing.
+    ///
+    /// Current safety contract: this safe wrapper owns a staging copy
+    /// of `host` inside the returned buffer, so the caller may drop or
+    /// reuse `host` immediately after return. Use
+    /// [`DeviceBuffer::from_host_async_unchecked`] for borrowed-host
+    /// non-blocking DMA.
     pub fn from_host_async(ctx: &DeviceContext, host: &[T], stream: &Stream) -> Result<Self> {
+        let staging = std::sync::Arc::new(host.to_vec());
+        // SAFETY: `staging` owns a stable heap allocation for the host
+        // bytes. On success it is stored in the returned buffer; on
+        // failure we synchronize before dropping it, and leak it if the
+        // cleanup synchronize itself fails.
+        match unsafe { Self::from_host_async_unchecked(ctx, staging.as_slice(), stream) } {
+            Ok(mut buffer) => {
+                buffer._host_uploads.push(staging);
+                Ok(buffer)
+            }
+            Err(err) => {
+                if let Err(sync_err) = stream.synchronize() {
+                    std::mem::forget(staging);
+                    return Err(DeviceError::Memcpy(format!(
+                        "from_host_async failed ({err}); cleanup stream synchronize failed \
+                         ({sync_err}); leaked host staging to keep any queued DMA valid"
+                    )));
+                }
+                Err(err)
+            }
+        }
+    }
+
+    /// Borrowed-host async upload variant.
+    ///
+    /// Unlike [`DeviceBuffer::from_host_async`], this function does not
+    /// copy `host` into owned staging memory.
+    ///
+    /// # Safety
+    ///
+    /// `host` must remain allocated at the same address and unmodified
+    /// until `stream.synchronize()` (or an equivalent event wait known
+    /// to observe this upload's completion) has returned. This
+    /// requirement holds even if this function returns an error after
+    /// submitting work to the stream.
+    pub unsafe fn from_host_async_unchecked(
+        ctx: &DeviceContext,
+        host: &[T],
+        stream: &Stream,
+    ) -> Result<Self> {
         let _ = Self::ASSERT_DEVICE_REPR;
         // H10c: bind the context to this thread before driving any
         // CUDA handle. Cheap per-thread TLS check; required for the
@@ -697,12 +745,14 @@ impl<T: DeviceElem> DeviceBuffer<T> {
         let event = std::sync::Arc::new(Event::new(ctx)?);
         // Submit the H→D copy AND record `last_write` on the USER
         // stream (see `from_host_async_unchecked` / `upload_on_stream`).
-        let inner = backend::DeviceBufferInner::from_host_async_unchecked(
-            &ctx.0,
-            host,
-            stream.raw(),
-            event.cu_event_raw(),
-        )?;
+        let inner = unsafe {
+            backend::DeviceBufferInner::from_host_async_unchecked(
+                &ctx.0,
+                host,
+                stream.raw(),
+                event.cu_event_raw(),
+            )?
+        };
         // Surface the upload on the user `stream`'s op log for callers
         // that introspect the queue. In cuda mode `record_op` is a
         // no-op so this collapses to nothing.
@@ -711,7 +761,11 @@ impl<T: DeviceElem> DeviceBuffer<T> {
         });
         let last_write = new_last_write_slot();
         *last_write.lock().unwrap_or_else(|p| p.into_inner()) = Some(event);
-        Ok(Self { inner, last_write })
+        Ok(Self {
+            inner,
+            last_write,
+            _host_uploads: Vec::new(),
+        })
     }
 
     /// Copy `len()` elements back into `dst` (must be at least
@@ -748,10 +802,54 @@ impl<T: DeviceElem> DeviceBuffer<T> {
     /// device memory. It also called the host-blocking synchronous
     /// `to_host`, which defeated the async contract.
     ///
-    /// The copy is NOT host-blocked here; the caller must
-    /// `stream.synchronize()` (or wait on a recorded event) before
-    /// reading `dst`, and `dst` must stay valid until then.
+    /// Current safety contract: this safe wrapper downloads into owned
+    /// staging memory, synchronizes `stream`, then copies into `dst`.
+    /// Use [`DeviceBuffer::to_host_async_unchecked`] for borrowed-host
+    /// non-blocking DMA.
     pub fn to_host_async(&self, dst: &mut [T], stream: &Stream) -> Result<()> {
+        if dst.len() != self.len() {
+            return Err(DeviceError::Memcpy(format!(
+                "to_host_async length mismatch: dst.len()={}, slice.len()={}",
+                dst.len(),
+                self.len()
+            )));
+        }
+        let mut staging = vec![<T as bytemuck::Zeroable>::zeroed(); dst.len()];
+        // SAFETY: `staging` is owned by this function and remains alive
+        // until after the stream synchronize below. If synchronization
+        // fails, leak the staging buffer rather than invalidating a
+        // destination that the driver might still own.
+        if let Err(err) = unsafe { self.to_host_async_unchecked(staging.as_mut_slice(), stream) } {
+            if let Err(sync_err) = stream.synchronize() {
+                std::mem::forget(staging);
+                return Err(DeviceError::Memcpy(format!(
+                    "to_host_async failed ({err}); cleanup stream synchronize failed \
+                     ({sync_err}); leaked host staging to keep any queued DMA valid"
+                )));
+            }
+            return Err(err);
+        }
+        if let Err(sync_err) = stream.synchronize() {
+            std::mem::forget(staging);
+            return Err(sync_err);
+        }
+        dst.copy_from_slice(&staging);
+        Ok(())
+    }
+
+    /// Borrowed-destination async download variant.
+    ///
+    /// Unlike [`DeviceBuffer::to_host_async`], this function returns
+    /// without synchronizing `stream` and writes directly into `dst`.
+    ///
+    /// # Safety
+    ///
+    /// `dst` must remain allocated at the same address and unread by the
+    /// CPU until `stream.synchronize()` (or an equivalent event wait
+    /// known to observe this download's completion) has returned. This
+    /// requirement holds even if this function returns an error after
+    /// submitting work to the stream.
+    pub unsafe fn to_host_async_unchecked(&self, dst: &mut [T], stream: &Stream) -> Result<()> {
         // H10c: bind the context to this thread before driving CUDA.
         self.inner.bind_to_thread()?;
         let bytes = std::mem::size_of_val(dst);
@@ -794,6 +892,7 @@ impl<T: DeviceElem> DeviceBuffer<T> {
         backend::DeviceBufferInner::uninit(&ctx.0, len).map(|inner| Self {
             inner,
             last_write: new_last_write_slot(),
+            _host_uploads: Vec::new(),
         })
     }
 
@@ -802,6 +901,7 @@ impl<T: DeviceElem> DeviceBuffer<T> {
         backend::DeviceBufferInner::zeros(&ctx.0, len).map(|inner| Self {
             inner,
             last_write: new_last_write_slot(),
+            _host_uploads: Vec::new(),
         })
     }
 
@@ -810,6 +910,7 @@ impl<T: DeviceElem> DeviceBuffer<T> {
         backend::DeviceBufferInner::from_host(&ctx.0, host).map(|inner| Self {
             inner,
             last_write: new_last_write_slot(),
+            _host_uploads: Vec::new(),
         })
     }
 
@@ -840,6 +941,22 @@ impl<T: DeviceElem> DeviceBuffer<T> {
     /// op log thus faithfully reflects the submitted work even when
     /// the no-driver allocation immediately errors.
     pub fn from_host_async(ctx: &DeviceContext, host: &[T], stream: &Stream) -> Result<Self> {
+        // SAFETY: stub mode never submits DMA to a real driver, so the
+        // borrowed-host lifetime contract is vacuous here.
+        unsafe { Self::from_host_async_unchecked(ctx, host, stream) }
+    }
+
+    /// Stub-mode counterpart of the borrowed-host async upload API.
+    ///
+    /// # Safety
+    ///
+    /// In real cuda builds the host slice must outlive the queued DMA;
+    /// in stub mode no DMA is submitted.
+    pub unsafe fn from_host_async_unchecked(
+        ctx: &DeviceContext,
+        host: &[T],
+        stream: &Stream,
+    ) -> Result<Self> {
         // Allocate the last_write event up front. `Event::new` in stub
         // mode never fails (it allocates a Mutex + atomic id) so this
         // is allowed to succeed even on the no-driver path.
@@ -851,7 +968,11 @@ impl<T: DeviceElem> DeviceBuffer<T> {
         let inner = backend::DeviceBufferInner::from_host(&ctx.0, host)?;
         let last_write = new_last_write_slot();
         *last_write.lock().unwrap_or_else(|p| p.into_inner()) = Some(event);
-        Ok(Self { inner, last_write })
+        Ok(Self {
+            inner,
+            last_write,
+            _host_uploads: Vec::new(),
+        })
     }
 
     /// Copy `len()` elements back into `dst` (must be at least
@@ -871,6 +992,19 @@ impl<T: DeviceElem> DeviceBuffer<T> {
     /// The op log thus shows `EventWait { event_id: <last_write> }`
     /// immediately before `DownloadAsync`.
     pub fn to_host_async(&self, dst: &mut [T], stream: &Stream) -> Result<()> {
+        // SAFETY: stub mode never submits DMA to a real driver, so the
+        // borrowed-destination lifetime contract is vacuous here.
+        unsafe { self.to_host_async_unchecked(dst, stream) }
+    }
+
+    /// Stub-mode counterpart of the borrowed-destination async
+    /// download API.
+    ///
+    /// # Safety
+    ///
+    /// In real cuda builds the destination slice must outlive the
+    /// queued DMA; in stub mode no DMA is submitted.
+    pub unsafe fn to_host_async_unchecked(&self, dst: &mut [T], stream: &Stream) -> Result<()> {
         // Wait on last_write BEFORE the download.
         if let Some(ev) = self
             .last_write
@@ -913,6 +1047,7 @@ impl<T: DeviceElem> DeviceBuffer<T> {
                 _phantom: std::marker::PhantomData,
             },
             last_write: new_last_write_slot(),
+            _host_uploads: Vec::new(),
         }
     }
 }
@@ -1011,6 +1146,67 @@ mod stub_tests {
         *arg_slot.lock().unwrap() = Some(ev);
         let seen = buf_slot.lock().unwrap().as_ref().map(|e| e.id());
         assert_eq!(seen, Some(ev_id));
+    }
+
+    #[test]
+    fn unchecked_upload_records_ordering_before_stub_error() {
+        let ctx = DeviceContext::for_test();
+        let stream = Stream::for_test();
+        let host = [1_u32, 2, 3, 4];
+
+        match unsafe { DeviceBuffer::<u32>::from_host_async_unchecked(&ctx, &host, &stream) } {
+            Err(DeviceError::NoDriver) => {}
+            Err(other) => panic!("expected NoDriver, got {other:?}"),
+            Ok(_) => panic!("expected NoDriver, got Ok(DeviceBuffer)"),
+        }
+
+        let ops = stream.ops();
+        assert_eq!(
+            ops.len(),
+            2,
+            "unchecked upload should record event + upload before stub allocation error"
+        );
+        assert!(
+            matches!(ops[0], StreamOp::EventRecord { .. }),
+            "upload must publish its last_write event before the UploadAsync op: {ops:?}"
+        );
+        assert_eq!(
+            ops[1],
+            StreamOp::UploadAsync {
+                bytes: std::mem::size_of_val(&host)
+            }
+        );
+    }
+
+    #[test]
+    fn unchecked_download_records_borrowed_dma_without_synchronizing() {
+        let ctx = DeviceContext::for_test();
+        let stream = Stream::for_test();
+        let buf: DeviceBuffer<f32> = DeviceBuffer::for_test();
+        let last_write = std::sync::Arc::new(Event::new(&ctx).expect("stub event"));
+        let last_write_id = last_write.id();
+        *buf.last_write.lock().unwrap_or_else(|p| p.into_inner()) = Some(last_write);
+
+        let mut dst = [0.0_f32; 2];
+        match unsafe { buf.to_host_async_unchecked(&mut dst, &stream) } {
+            Err(DeviceError::NoDriver) => {}
+            Err(other) => panic!("expected NoDriver, got {other:?}"),
+            Ok(()) => panic!("expected NoDriver, got Ok(())"),
+        }
+
+        let ops = stream.ops();
+        assert_eq!(
+            ops,
+            vec![
+                StreamOp::EventWait {
+                    event_id: last_write_id
+                },
+                StreamOp::DownloadAsync {
+                    bytes: std::mem::size_of_val(&dst)
+                },
+            ],
+            "unchecked download must not insert a Synchronize op"
+        );
     }
 
     /// AUDIT 2026-06-21: every PTX load must get a process-unique module
