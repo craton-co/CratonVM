@@ -135,7 +135,7 @@ fn runtime_tls_identity_slot() -> &'static Mutex<Option<RuntimeTlsIdentity>> {
 /// previously installed identity. Pass `None` to clear (used by tests to
 /// restore a known starting state).
 #[allow(dead_code)]
-pub fn set_runtime_tls_identity(identity: Option<RuntimeTlsIdentity>) {
+pub(crate) fn set_runtime_tls_identity(identity: Option<RuntimeTlsIdentity>) {
     *runtime_tls_identity_slot().lock() = identity;
 }
 

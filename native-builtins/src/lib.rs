@@ -814,6 +814,141 @@ fn get_context_class_loader() -> Option<ObjectRef> {
         .unwrap_or_else(|e| e.into_inner())
 }
 
+fn explicit_null_context_class_loader_store() -> &'static Mutex<std::collections::HashSet<i32>> {
+    static INSTANCE: OnceLock<Mutex<std::collections::HashSet<i32>>> = OnceLock::new();
+    INSTANCE.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+}
+
+fn set_thread_context_loader_explicit_null(
+    ctx: &dyn NativeContext,
+    thread: ObjectRef,
+    explicit_null: bool,
+) {
+    let key = ctx.identity_hash_code(thread);
+    let mut guard = explicit_null_context_class_loader_store()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if explicit_null {
+        guard.insert(key);
+    } else {
+        guard.remove(&key);
+    }
+}
+
+fn thread_context_loader_is_explicit_null(ctx: &dyn NativeContext, thread: ObjectRef) -> bool {
+    let key = ctx.identity_hash_code(thread);
+    explicit_null_context_class_loader_store()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains(&key)
+}
+
+fn native_thread_set_context_class_loader(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    let loader = args.get(1).copied().unwrap_or(Value::Object(None));
+    set_thread_context_loader_explicit_null(ctx, this, matches!(loader, Value::Object(None)));
+    ctx.set_field_by_name(this, "contextClassLoader", loader);
+    Ok(None)
+}
+
+fn native_thread_get_context_class_loader(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    if let Some(Value::Object(Some(this))) = args.first() {
+        match ctx.get_field_by_name(*this, "contextClassLoader") {
+            Value::Object(Some(loader)) => {
+                return Ok(Some(Value::Object(Some(loader))));
+            }
+            _ => {
+                if thread_context_loader_is_explicit_null(ctx, *this) {
+                    return Ok(Some(Value::Object(None)));
+                }
+            }
+        }
+    }
+    if let Some(loader) = get_context_class_loader() {
+        return Ok(Some(Value::Object(Some(loader))));
+    }
+    let obj = crate::classloader::get_or_create_app_loader(ctx);
+    Ok(Some(Value::Object(Some(obj))))
+}
+
+#[cfg(test)]
+mod context_class_loader_tests {
+    use super::*;
+    use crate::test_utils::mock_ctx;
+
+    #[test]
+    fn explicit_null_context_class_loader_round_trips() {
+        let mut ctx = mock_ctx();
+        let thread = ctx.fresh_object_ref();
+
+        native_thread_set_context_class_loader(
+            &mut ctx,
+            &[Value::Object(Some(thread)), Value::Object(None)],
+        )
+        .expect("setContextClassLoader(null) should not throw");
+
+        let got = native_thread_get_context_class_loader(&mut ctx, &[Value::Object(Some(thread))])
+            .expect("getContextClassLoader should not throw");
+        assert_eq!(got, Some(Value::Object(None)));
+    }
+
+    #[test]
+    fn essential_define_class2_registration_uses_bytebuffer_handler() {
+        let mut registry = NativeMethodRegistry::new();
+        register_essential_natives(&mut registry);
+        let callback = registry
+            .find(
+                "java/lang/ClassLoader",
+                "defineClass2",
+                "(Ljava/lang/ClassLoader;Ljava/lang/String;Ljava/nio/ByteBuffer;IILjava/security/ProtectionDomain;Ljava/lang/String;)Ljava/lang/Class;",
+            )
+            .expect("defineClass2 native should be registered");
+
+        let mut ctx = mock_ctx();
+        let bytes = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 4);
+        let bb = ctx.alloc_object(cratonvm_types::ClassId::new(0), 4);
+        ctx.set_field(bb, 0, Value::Object(Some(bytes)));
+        ctx.set_field(bb, 1, Value::Int(0));
+        ctx.set_field(bb, 2, Value::Int(4));
+        ctx.set_field(bb, 3, Value::Int(4));
+        let name = ctx.create_string("com/example/Foo");
+
+        let result = callback(
+            &mut ctx,
+            &[
+                Value::Object(None),
+                Value::Object(Some(name)),
+                Value::Object(Some(bb)),
+                Value::Int(0),
+                Value::Int(4),
+                Value::Object(None),
+                Value::Object(None),
+            ],
+        );
+
+        match result {
+            Err(cratonvm_types::error::MethodCallFailed::InternalError(
+                cratonvm_types::error::VmError::Linkage(
+                    cratonvm_types::error::LinkageError::ClassFormatError { message, .. },
+                ),
+            )) => assert!(
+                message.contains("defineClass2"),
+                "expected defineClass2 ByteBuffer handler failure, got {message}"
+            ),
+            other => panic!("defineClass2 did not dispatch to the ByteBuffer handler: {other:?}"),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Reference / ReferenceQueue field layout constants
 // These are used by essential natives for java.lang.ref.* handling.
@@ -6838,8 +6973,8 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // T15: defineClass0/1 — real implementations that extract bytes and define classes
     registry.register("java/lang/ClassLoader", "defineClass0", "(Ljava/lang/ClassLoader;Ljava/lang/Class;Ljava/lang/String;[BIILjava/security/ProtectionDomain;ZILjava/lang/Object;)Ljava/lang/Class;", lang_system::native_classloader_define_class0);
     registry.register("java/lang/ClassLoader", "defineClass1", "(Ljava/lang/ClassLoader;Ljava/lang/String;[BIILjava/security/ProtectionDomain;Ljava/lang/String;)Ljava/lang/Class;", lang_system::native_classloader_define_class1);
-    // defineClass2 uses ByteBuffer — less common; keep as null fallback for now
-    registry.register("java/lang/ClassLoader", "defineClass2", "(Ljava/lang/ClassLoader;Ljava/lang/String;Ljava/nio/ByteBuffer;IILjava/security/ProtectionDomain;Ljava/lang/String;)Ljava/lang/Class;", lang_system::native_classloader_define_class1);
+    // defineClass2 uses ByteBuffer; keep it on the ByteBuffer-specific handler.
+    registry.register("java/lang/ClassLoader", "defineClass2", "(Ljava/lang/ClassLoader;Ljava/lang/String;Ljava/nio/ByteBuffer;IILjava/security/ProtectionDomain;Ljava/lang/String;)Ljava/lang/Class;", lang_system::native_classloader_define_class2);
     registry.register(
         "java/lang/ClassLoader",
         "retrieveDirectives",
@@ -6852,35 +6987,13 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         "java/lang/Thread",
         "setContextClassLoader",
         "(Ljava/lang/ClassLoader;)V",
-        |ctx, args| {
-            let this = match args.first() {
-                Some(Value::Object(Some(o))) => *o,
-                _ => return Ok(None),
-            };
-            let loader = args.get(1).copied().unwrap_or(Value::Object(None));
-            ctx.set_field_by_name(this, "contextClassLoader", loader);
-            Ok(None)
-        },
+        native_thread_set_context_class_loader,
     );
     registry.register(
         "java/lang/Thread",
         "getContextClassLoader",
         "()Ljava/lang/ClassLoader;",
-        |ctx, args| {
-            if let Some(Value::Object(Some(this))) = args.first() {
-                match ctx.get_field_by_name(*this, "contextClassLoader") {
-                    Value::Object(Some(loader)) => {
-                        return Ok(Some(Value::Object(Some(loader))));
-                    }
-                    _ => {}
-                }
-            }
-            if let Some(loader) = get_context_class_loader() {
-                return Ok(Some(Value::Object(Some(loader))));
-            }
-            let obj = crate::classloader::get_or_create_app_loader(ctx);
-            Ok(Some(Value::Object(Some(obj))))
-        },
+        native_thread_get_context_class_loader,
     );
     // setAccessible(boolean) — must write the JDK `override` field so that
     // subsequent Method.invoke / Field.get/set / Constructor.newInstance
