@@ -1028,6 +1028,58 @@ pub fn register_flag_impl(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(arr))))
         },
     );
+
+    // JDK 25 exposes the management-flag backend as
+    // `com.sun.management.internal.Flag`. CratonVM does not expose mutable VM
+    // flags through JMM, so mirror the older `sun.management.Flag` surface with
+    // empty/zero answers and no-op mutators.
+    let internal_cls = "com/sun/management/internal/Flag";
+    r.register(internal_cls, "initialize", "()V", |_ctx, _args| Ok(None));
+    r.register(
+        internal_cls,
+        "getInternalFlagCount",
+        "()I",
+        |_ctx, _args| Ok(Some(Value::Int(0))),
+    );
+    r.register(
+        internal_cls,
+        "getAllFlagNames",
+        "()[Ljava/lang/String;",
+        |ctx, _args| {
+            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
+            Ok(Some(Value::Object(Some(arr))))
+        },
+    );
+    r.register(
+        internal_cls,
+        "getFlags",
+        "([Ljava/lang/String;[Lcom/sun/management/internal/Flag;I)I",
+        |_ctx, _args| Ok(Some(Value::Int(0))),
+    );
+    r.register(
+        internal_cls,
+        "setLongValue",
+        "(Ljava/lang/String;J)V",
+        |_ctx, _args| Ok(None),
+    );
+    r.register(
+        internal_cls,
+        "setDoubleValue",
+        "(Ljava/lang/String;D)V",
+        |_ctx, _args| Ok(None),
+    );
+    r.register(
+        internal_cls,
+        "setBooleanValue",
+        "(Ljava/lang/String;Z)V",
+        |_ctx, _args| Ok(None),
+    );
+    r.register(
+        internal_cls,
+        "setStringValue",
+        "(Ljava/lang/String;Ljava/lang/String;)V",
+        |_ctx, _args| Ok(None),
+    );
     r.set_category(__prev_cat);
 }
 
@@ -3229,6 +3281,31 @@ mod jmx_tests {
             r.find(cls, "getAvailableProcessors", "()I").is_some(),
             "VMManagementImpl.getAvailableProcessors missing"
         );
+    }
+
+    #[test]
+    fn test_jdk25_internal_flag_natives_registered() {
+        let mut r = NativeMethodRegistry::new();
+        register_flag_impl(&mut r);
+        let cls = "com/sun/management/internal/Flag";
+        for (name, desc) in [
+            ("initialize", "()V"),
+            ("getInternalFlagCount", "()I"),
+            ("getAllFlagNames", "()[Ljava/lang/String;"),
+            (
+                "getFlags",
+                "([Ljava/lang/String;[Lcom/sun/management/internal/Flag;I)I",
+            ),
+            ("setLongValue", "(Ljava/lang/String;J)V"),
+            ("setDoubleValue", "(Ljava/lang/String;D)V"),
+            ("setBooleanValue", "(Ljava/lang/String;Z)V"),
+            ("setStringValue", "(Ljava/lang/String;Ljava/lang/String;)V"),
+        ] {
+            assert!(
+                r.find(cls, name, desc).is_some(),
+                "missing {cls}.{name}{desc}"
+            );
+        }
     }
 
     #[test]

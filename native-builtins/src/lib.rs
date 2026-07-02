@@ -1249,6 +1249,11 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     let prev_category = registry.current_category();
     registry.set_category(cratonvm_native_api::NativeKind::Bridge);
 
+    // JDK 25 VectorSupport declares these three ACC_NATIVE methods in
+    // java.base. Keep them in the real-JDK essential path; the broader
+    // incubator Vector API shims remain synthetic-only overrides.
+    crate::vector_api::register_vector_support_natives(registry);
+
     // Synthetic-stream `spliterator()` natives — synthetic stream objects
     // (stamped with the bare `java/util/stream/*Stream` interface) are produced
     // in real-JDK mode (e.g. `OptionalInt.stream()`), and real JDK stream code
@@ -45359,6 +45364,28 @@ fn register_pd_structured_concurrency(r: &mut NativeMethodRegistry) {
                 })
         },
     );
+}
+
+#[cfg(test)]
+mod vector_support_essential_tests {
+    use super::*;
+
+    #[test]
+    fn register_essential_includes_jdk25_vector_support_natives() {
+        let mut registry = NativeMethodRegistry::new();
+        register_essential_natives(&mut registry);
+        let vector_support = "jdk/internal/vm/vector/VectorSupport";
+
+        assert!(registry
+            .find(vector_support, "registerNatives", "()I")
+            .is_some());
+        assert!(registry
+            .find(vector_support, "getCPUFeatures", "()Ljava/lang/String;")
+            .is_some());
+        assert!(registry
+            .find(vector_support, "getMaxLaneCount", "(Ljava/lang/Class;)I")
+            .is_some());
+    }
 }
 
 // ===========================================================================

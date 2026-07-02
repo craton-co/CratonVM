@@ -1245,6 +1245,7 @@ fn bv_species(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
 // ShortVector natives
 // ---------------------------------------------------------------------------
 const SV_VEC: &str = "jdk/incubator/vector/ShortVector";
+const VECTOR_SUPPORT: &str = "jdk/internal/vm/vector/VectorSupport";
 
 fn sv_vec_zero(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let si = species_idx_from_arg(ctx, args);
@@ -1646,6 +1647,30 @@ fn vo_is_associative(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     Ok(Some(Value::Int(if is_associative(code) { 1 } else { 0 })))
 }
 
+fn vector_support_register_natives(
+    _ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    Ok(Some(Value::Int(0)))
+}
+
+fn vector_support_get_cpu_features(
+    ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    let features = ctx.create_string("");
+    Ok(Some(Value::Object(Some(features))))
+}
+
+fn vector_support_get_max_lane_count(
+    _ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    // Conservative fallback: expose at most 64-bit vectors through the JDK 25
+    // VectorSupport sizing path unless a wider implementation is wired later.
+    Ok(Some(Value::Int(2)))
+}
+
 // ---------------------------------------------------------------------------
 // Registration
 // ---------------------------------------------------------------------------
@@ -1653,6 +1678,7 @@ fn vo_is_associative(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
 pub(crate) fn register_vector_api_natives(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
+    register_vector_support_natives(r);
     register_vector_species(r);
     register_int_vector(r);
     register_long_vector(r);
@@ -1663,6 +1689,30 @@ pub(crate) fn register_vector_api_natives(r: &mut NativeMethodRegistry) {
     register_vector_mask(r);
     register_vector_shuffle(r);
     register_vector_operators(r);
+    r.set_category(__prev_cat);
+}
+
+pub(crate) fn register_vector_support_natives(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
+    r.register(
+        VECTOR_SUPPORT,
+        "registerNatives",
+        "()I",
+        vector_support_register_natives,
+    );
+    r.register(
+        VECTOR_SUPPORT,
+        "getCPUFeatures",
+        "()Ljava/lang/String;",
+        vector_support_get_cpu_features,
+    );
+    r.register(
+        VECTOR_SUPPORT,
+        "getMaxLaneCount",
+        "(Ljava/lang/Class;)I",
+        vector_support_get_max_lane_count,
+    );
     r.set_category(__prev_cat);
 }
 
@@ -2444,6 +2494,18 @@ mod vector_api_tests {
     }
 
     // --- Registration tests ---
+
+    #[test]
+    fn test_vector_support_jdk25_natives_registered() {
+        let r = make_registry();
+        assert!(r.find(VECTOR_SUPPORT, "registerNatives", "()I").is_some());
+        assert!(r
+            .find(VECTOR_SUPPORT, "getCPUFeatures", "()Ljava/lang/String;")
+            .is_some());
+        assert!(r
+            .find(VECTOR_SUPPORT, "getMaxLaneCount", "(Ljava/lang/Class;)I")
+            .is_some());
+    }
 
     #[test]
     fn test_vs_of_int_registered() {

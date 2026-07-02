@@ -287,6 +287,10 @@ pub(crate) struct MockNativeContext {
     /// has been mapped). Tests populate via `set_resource(name, bytes)` to
     /// simulate a classpath that contains the named resource.
     pub(crate) resources_override: UnsafeCell<HashMap<String, Vec<u8>>>,
+    /// JPMS service-provider declarations keyed by slash-format service name.
+    /// Tests populate this to exercise `ServiceLoader`'s module `provides`
+    /// path without standing up a full ClassManager/module registry.
+    pub(crate) module_providers_override: UnsafeCell<HashMap<String, Vec<String>>>,
     /// T19_K2: tracks each `register_native_thread` call so tests can
     /// assert that Vert.x / XNIO event loops correctly route through the
     /// new VM-tracking entry point. Each entry is `(name, daemon, alive)`.
@@ -394,6 +398,7 @@ impl MockNativeContext {
             interfaces_override: UnsafeCell::new(HashMap::new()),
             osc_cache_map: UnsafeCell::new(HashMap::new()),
             resources_override: UnsafeCell::new(HashMap::new()),
+            module_providers_override: UnsafeCell::new(HashMap::new()),
             registered_native_threads: UnsafeCell::new(Vec::new()),
             next_native_tid: UnsafeCell::new(seed.next_native_tid),
             native_tid_base: seed.next_native_tid,
@@ -532,6 +537,21 @@ impl MockNativeContext {
     pub(crate) fn set_resource(&self, name: &str, bytes: Vec<u8>) {
         // SAFETY: single-threaded test code.
         unsafe { (*self.resources_override.get()).insert(name.to_string(), bytes) };
+    }
+
+    /// Register JPMS `provides` implementations for `service_name`.
+    ///
+    /// Both names use binary slash format, matching `ModuleDescriptor` storage:
+    /// `org/example/SPI` -> `org/example/Provider`.
+    #[allow(dead_code)]
+    pub(crate) fn set_module_providers(&self, service_name: &str, providers: Vec<&str>) {
+        // SAFETY: single-threaded test code.
+        unsafe {
+            (*self.module_providers_override.get()).insert(
+                service_name.to_string(),
+                providers.into_iter().map(str::to_string).collect(),
+            );
+        }
     }
 
     /// T19_K2: read the list of `register_native_thread` calls. Each
@@ -688,11 +708,26 @@ impl NativeContext for MockNativeContext {
 
     fn invoke(
         &mut self,
-        _class_name: &str,
-        _method_name: &str,
-        _descriptor: &str,
-        _args: &[Value],
+        class_name: &str,
+        method_name: &str,
+        descriptor: &str,
+        args: &[Value],
     ) -> MethodCallResult {
+        if class_name == "java/lang/Class"
+            && method_name == "getName"
+            && descriptor == "()Ljava/lang/String;"
+        {
+            if let Some(Value::Object(Some(mirror))) = args.first() {
+                if let Value::Int(raw_id) = self.get_field(*mirror, 0) {
+                    let class_name = self
+                        .class_name_of_id(ClassId::new(raw_id as u32))
+                        .unwrap_or_default()
+                        .replace('/', ".");
+                    let name_obj = self.create_string(&class_name);
+                    return Ok(Some(Value::Object(Some(name_obj))));
+                }
+            }
+        }
         Ok(None)
     }
 
@@ -1474,6 +1509,16 @@ impl NativeContext for MockNativeContext {
         let trimmed = name.trim_start_matches('/');
         // SAFETY: single-threaded test code.
         unsafe { (*self.resources_override.get()).get(trimmed).cloned() }
+    }
+
+    fn service_providers_from_modules(&self, service_class: &str) -> Vec<String> {
+        // SAFETY: single-threaded test code.
+        unsafe {
+            (*self.module_providers_override.get())
+                .get(service_class)
+                .cloned()
+                .unwrap_or_default()
+        }
     }
 
     fn list_application_class_names(&self) -> Vec<String> {
