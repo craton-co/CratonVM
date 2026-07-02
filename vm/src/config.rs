@@ -255,10 +255,11 @@ pub struct VmConfig {
     /// T6.3.3 — JVMTI agents requested on the command line.
     ///
     /// Each entry is a verbatim command-line token of the form
-    /// `-agentlib:<lib>[=<opts>]`, `-agentpath:<path>[=<opts>]`, or
-    /// `-javaagent:<jarpath>[=<opts>]`. The VM startup path hands each
-    /// token to `AgentRegistry::parse_agent_option` which walks the
-    /// list in the canonical `Agent_OnLoad` order.
+    /// `-agentlib:<lib>[=<opts>]` or `-agentpath:<path>[=<opts>]`. The VM
+    /// startup path loads each native library and calls `Agent_OnLoad` in
+    /// declaration order. Java instrumentation agents use
+    /// `runtime::agent_loader::parse_javaagent_spec` plus `invoke_premains`
+    /// after VM bootstrap.
     pub jvmti_agent_options: Vec<String>,
 
     // -----------------------------------------------------------------------

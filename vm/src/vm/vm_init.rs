@@ -237,6 +237,56 @@ fn derive_locale() -> (String, String) {
 /// (`HashMap`/`LinkedHashMap` nodes, view backings, …), which use a handful of
 /// small field counts.
 pub const ANON_CLASS_CACHE_LEN: usize = 256;
+const DEFAULT_MAX_HEAP_SIZE: usize = 256 * 1024 * 1024;
+
+fn apply_container_default_heap(config: &mut VmConfig) {
+    if !config.use_container_support || config.max_heap_size != DEFAULT_MAX_HEAP_SIZE {
+        return;
+    }
+
+    let info = crate::runtime::container::detect_container();
+    let suggested =
+        crate::runtime::container::suggested_default_max_heap(&info, config.max_heap_size);
+    if suggested != config.max_heap_size {
+        tracing::info!(
+            "container: default max heap adjusted from {} to {} bytes",
+            config.max_heap_size,
+            suggested
+        );
+        config.max_heap_size = suggested;
+    }
+}
+
+#[cfg(feature = "experimental-debug")]
+fn load_startup_jvmti_agents(config: &VmConfig, env: &mut crate::jvmti::JvmtiEnv) {
+    for option in &config.jvmti_agent_options {
+        if option.starts_with("-javaagent:") {
+            panic!(
+                "failed to load JVMTI startup agent `{option}`: \
+                 -javaagent must run through runtime::agent_loader::invoke_premains"
+            );
+        }
+        if !option.starts_with("-agentlib:") && !option.starts_with("-agentpath:") {
+            panic!("failed to load JVMTI startup agent `{option}`: unsupported agent option");
+        }
+
+        let (path, options) = crate::jvmti::parse_agent_arg(option);
+        env.agent_registry
+            .load_agent(&path, &options)
+            .unwrap_or_else(|err| {
+                panic!("failed to load JVMTI startup agent `{option}`: {err}")
+            });
+    }
+}
+
+#[cfg(not(feature = "experimental-debug"))]
+fn reject_startup_jvmti_agents_when_disabled(config: &VmConfig) {
+    if let Some(option) = config.jvmti_agent_options.first() {
+        panic!(
+            "failed to load JVMTI startup agent `{option}`: JVMTI support is not compiled in"
+        );
+    }
+}
 
 pub struct SharedVm {
     /// VM configuration (immutable after construction).
@@ -773,7 +823,16 @@ pub struct SharedVm {
 
 impl SharedVm {
     /// Create a new SharedVm from a VmConfig.
-    pub fn new(config: VmConfig) -> Self {
+    pub fn new(mut config: VmConfig) -> Self {
+        apply_container_default_heap(&mut config);
+
+        #[cfg(feature = "experimental-debug")]
+        let mut jvmti_env = crate::jvmti::create_jvmti_env();
+        #[cfg(feature = "experimental-debug")]
+        load_startup_jvmti_agents(&config, &mut jvmti_env);
+        #[cfg(not(feature = "experimental-debug"))]
+        reject_startup_jvmti_agents_when_disabled(&config);
+
         // Register the application's own directories as trusted file-I/O
         // sandbox roots. native-io confines file operations to the process
         // CWD by default; that is far too strict for a real JVM, which is
@@ -2466,7 +2525,7 @@ impl SharedVm {
             #[cfg(feature = "experimental-debug")]
             debug_state: parking_lot::Mutex::new(crate::debug::DebugState::new()),
             #[cfg(feature = "experimental-debug")]
-            jvmti_env: parking_lot::Mutex::new(crate::jvmti::create_jvmti_env()),
+            jvmti_env: parking_lot::Mutex::new(jvmti_env),
             #[cfg(feature = "experimental-debug")]
             breakpoints_active: std::sync::atomic::AtomicBool::new(false),
             #[cfg(feature = "experimental-debug")]
@@ -5429,6 +5488,54 @@ impl crate::runtime::serviceability::VmDiagnosticState for SharedVm {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn container_heap_sizing_leaves_explicit_heap_unchanged() {
+        let mut config = VmConfig::default();
+        config.max_heap_size = 512 * 1024 * 1024;
+
+        apply_container_default_heap(&mut config);
+
+        assert_eq!(config.max_heap_size, 512 * 1024 * 1024);
+    }
+
+    #[test]
+    fn container_heap_sizing_respects_disabled_container_support() {
+        let mut config = VmConfig::default();
+        config.use_container_support = false;
+
+        apply_container_default_heap(&mut config);
+
+        assert_eq!(config.max_heap_size, DEFAULT_MAX_HEAP_SIZE);
+    }
+
+    #[cfg(feature = "experimental-debug")]
+    #[test]
+    #[should_panic(expected = "failed to load JVMTI startup agent")]
+    fn startup_jvmti_missing_native_agent_panics() {
+        let mut config = VmConfig::default();
+        config
+            .jvmti_agent_options
+            .push("-agentpath:definitely-not-a-real-agent-library".to_string());
+        let mut env = crate::jvmti::create_jvmti_env();
+
+        load_startup_jvmti_agents(&config, &mut env);
+    }
+
+    #[cfg(feature = "experimental-debug")]
+    #[test]
+    #[should_panic(
+        expected = "-javaagent must run through runtime::agent_loader::invoke_premains"
+    )]
+    fn startup_jvmti_rejects_javaagent_tokens() {
+        let mut config = VmConfig::default();
+        config
+            .jvmti_agent_options
+            .push("-javaagent:agent.jar=opts".to_string());
+        let mut env = crate::jvmti::create_jvmti_env();
+
+        load_startup_jvmti_agents(&config, &mut env);
+    }
 
     // -----------------------------------------------------------------------
     // T2.1.3: JDK module classifier

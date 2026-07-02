@@ -107,9 +107,9 @@ impl AgentRegistry {
     /// 3. Call the entry point
     /// 4. Register the agent in the registry
     ///
-    /// If the library cannot be loaded (e.g., file not found), the agent is
-    /// still registered with metadata for diagnostic purposes, but marked as
-    /// not having called `Agent_OnLoad`.
+    /// Startup agents are fail-closed: a missing library, missing entry point,
+    /// invalid options string, or non-zero `Agent_OnLoad` return aborts loading
+    /// and leaves the registry unchanged.
     pub fn load_agent(&mut self, path: &str, options: &str) -> Result<(), JvmtiError> {
         self.load_agent_for_phase(path, options, AgentPhase::OnLoad, std::ptr::null_mut())
     }
@@ -144,68 +144,58 @@ impl AgentRegistry {
             on_load_called: false,
         };
 
-        // Attempt to load the dynamic library via libloading.
-        match unsafe { libloading::Library::new(&resolved_path) } {
-            Ok(lib) => {
-                tracing::info!("Loaded agent library: {}", resolved_path);
-
-                // Determine which entry point to look up.
-                let entry_name: &[u8] = match phase {
-                    AgentPhase::OnLoad => b"Agent_OnLoad",
-                    AgentPhase::Live => b"Agent_OnAttach",
-                };
-
-                let options_cstring = std::ffi::CString::new(options).unwrap_or_default();
-
-                // Look up and call the appropriate entry point.
-                let call_result: Option<i32> = match phase {
-                    AgentPhase::OnLoad => unsafe {
-                        lib.get::<AgentOnLoadFn>(entry_name)
-                            .ok()
-                            .map(|f| f(vm_ptr, options_cstring.as_ptr(), std::ptr::null_mut()))
-                    },
-                    AgentPhase::Live => unsafe {
-                        lib.get::<AgentOnAttachFn>(entry_name)
-                            .ok()
-                            .map(|f| f(vm_ptr, options_cstring.as_ptr(), std::ptr::null_mut()))
-                    },
-                };
-
-                match call_result {
-                    Some(0) => {
-                        info.on_load_called = true;
-                        tracing::info!(
-                            "Agent {} entry point returned success",
-                            std::str::from_utf8(entry_name).unwrap_or("?")
-                        );
-                    }
-                    Some(code) => {
-                        tracing::warn!(
-                            "Agent {} returned error code: {}",
-                            std::str::from_utf8(entry_name).unwrap_or("?"),
-                            code
-                        );
-                    }
-                    None => {
-                        tracing::warn!(
-                            "Agent library {} does not export '{}' -- registered without calling entry point",
-                            resolved_path,
-                            std::str::from_utf8(entry_name).unwrap_or("?")
-                        );
-                    }
-                }
-
-                info.library = AgentLibrary { library: Some(lib) };
+        let lib = unsafe { libloading::Library::new(&resolved_path) }.map_err(|err| {
+            JvmtiError::AgentLibraryLoadFailed {
+                path: resolved_path.clone(),
+                cause: err.to_string(),
             }
-            Err(err) => {
-                tracing::warn!(
-                    "Could not load agent library '{}': {} -- registering metadata only",
-                    resolved_path,
-                    err
-                );
-            }
+        })?;
+        tracing::info!("Loaded agent library: {}", resolved_path);
+
+        let entry_name: &[u8] = match phase {
+            AgentPhase::OnLoad => b"Agent_OnLoad",
+            AgentPhase::Live => b"Agent_OnAttach",
+        };
+        let entry_symbol = std::str::from_utf8(entry_name).unwrap_or("?").to_string();
+
+        let options_cstring =
+            std::ffi::CString::new(options).map_err(|err| JvmtiError::InvalidAgentOptions {
+                path: resolved_path.clone(),
+                cause: err.to_string(),
+            })?;
+
+        let code = match phase {
+            AgentPhase::OnLoad => unsafe {
+                let entry = lib.get::<AgentOnLoadFn>(entry_name).map_err(|_| {
+                    JvmtiError::AgentEntryPointMissing {
+                        path: resolved_path.clone(),
+                        symbol: entry_symbol.clone(),
+                    }
+                })?;
+                entry(vm_ptr, options_cstring.as_ptr(), std::ptr::null_mut())
+            },
+            AgentPhase::Live => unsafe {
+                let entry = lib.get::<AgentOnAttachFn>(entry_name).map_err(|_| {
+                    JvmtiError::AgentEntryPointMissing {
+                        path: resolved_path.clone(),
+                        symbol: entry_symbol.clone(),
+                    }
+                })?;
+                entry(vm_ptr, options_cstring.as_ptr(), std::ptr::null_mut())
+            },
+        };
+
+        if code != 0 {
+            return Err(JvmtiError::AgentEntryPointFailed {
+                path: resolved_path,
+                symbol: entry_symbol,
+                code,
+            });
         }
 
+        info.on_load_called = true;
+        tracing::info!("Agent {} entry point returned success", entry_symbol);
+        info.library = AgentLibrary { library: Some(lib) };
         self.agents.push(info);
         Ok(())
     }
@@ -336,16 +326,19 @@ mod tests {
     }
 
     #[test]
-    fn test_load_multiple_agents() {
+    fn test_missing_agents_fail_closed_without_registration() {
         let mut registry = AgentRegistry::new();
-        registry.load_agent("agent1.so", "opt1").unwrap();
-        registry.load_agent("agent2.so", "opt2").unwrap();
-        registry.load_agent("agent3.so", "").unwrap();
+        let err = registry
+            .load_agent("definitely_not_a_real_library_1", "opt1")
+            .expect_err("missing startup agent must fail closed");
+        assert!(matches!(err, JvmtiError::AgentLibraryLoadFailed { .. }));
+        assert!(registry.agents().is_empty());
 
-        assert_eq!(registry.agents().len(), 3);
-        assert_eq!(registry.agents()[0].name, "agent1.so");
-        assert_eq!(registry.agents()[1].options, "opt2");
-        assert_eq!(registry.agents()[2].phase, AgentPhase::OnLoad);
+        let err = registry
+            .load_agent("definitely_not_a_real_library_2", "opt2")
+            .expect_err("subsequent missing agent must also fail closed");
+        assert!(matches!(err, JvmtiError::AgentLibraryLoadFailed { .. }));
+        assert!(registry.agents().is_empty());
     }
 
     #[test]
@@ -383,13 +376,14 @@ mod tests {
     }
 
     #[test]
-    fn test_nonexistent_library_registers_metadata() {
+    fn test_nonexistent_library_fails_closed() {
         let mut registry = AgentRegistry::new();
-        // Loading a nonexistent library should still succeed (metadata only)
         let result = registry.load_agent("nonexistent_agent_lib_xyz", "opts");
-        assert!(result.is_ok());
-        assert_eq!(registry.agents().len(), 1);
-        assert!(!registry.agents()[0].on_load_called);
+        assert!(matches!(
+            result,
+            Err(JvmtiError::AgentLibraryLoadFailed { .. })
+        ));
+        assert!(registry.agents().is_empty());
     }
 
     #[test]
@@ -419,12 +413,9 @@ mod tests {
     /// T2.9.20 — End-to-end JNI agent loading pipeline test.
     ///
     /// Since `-agentlib:hprof` is built into modern JVMs (not a separate
-    /// shared library), this test verifies the full agent infrastructure:
-    /// parse → resolve → register → unload lifecycle. It also exercises
-    /// the `AgentPhase::Live` (Attach API) path and verifies that
-    /// loading a nonexistent library gracefully records metadata without
-    /// panicking, which is the correct behavior when the agent .so/.dll
-    /// is not present on the host.
+    /// shared library), this test verifies parsing, platform resolution, and
+    /// fail-closed handling when a requested agent .so/.dll is not present on
+    /// the host.
     #[test]
     fn t2_9_20_agent_loading_pipeline_end_to_end() {
         // 1. Parse all three agent argument styles
@@ -449,33 +440,23 @@ mod tests {
         #[cfg(target_os = "macos")]
         assert_eq!(resolved, "libhprof.dylib");
 
-        // 3. Full lifecycle: load multiple agents, query, unload
+        // 3. Missing native libraries fail closed and leave no metadata behind.
         let mut registry = AgentRegistry::new();
-        // OnLoad phase agents (simulates -agentlib at VM startup)
-        registry.load_agent("agent_alpha", "verbose").unwrap();
-        registry.load_agent("agent_beta", "").unwrap();
-        assert_eq!(registry.agents().len(), 2);
-        assert_eq!(registry.agents()[0].phase, AgentPhase::OnLoad);
-        assert_eq!(registry.agents()[1].options, "");
+        let err = registry
+            .load_agent("agent_alpha", "verbose")
+            .expect_err("missing OnLoad agent must fail");
+        assert!(matches!(err, JvmtiError::AgentLibraryLoadFailed { .. }));
+        assert!(registry.agents().is_empty());
 
-        // Live phase agent (simulates Attach API)
-        registry
+        // Live phase agents use the same fail-closed contract.
+        let err = registry
             .load_agent_live("dynamic_agent", "monitor", std::ptr::null_mut())
-            .unwrap();
-        assert_eq!(registry.agents().len(), 3);
-        assert_eq!(registry.agents()[2].phase, AgentPhase::Live);
-        assert_eq!(registry.agents()[2].name, "dynamic_agent");
+            .expect_err("missing live agent must fail");
+        assert!(matches!(err, JvmtiError::AgentLibraryLoadFailed { .. }));
+        assert!(registry.agents().is_empty());
 
-        // 4. Unload all agents (calls Agent_OnUnload if loaded)
+        // 4. Unload remains safe on an empty registry.
         registry.unload_all();
-        // After unload, agents are still in the registry (metadata preserved)
-        // but their libraries are released.
-
-        // 5. Verify nonexistent library does not panic
-        let mut r2 = AgentRegistry::new();
-        r2.load_agent("definitely_not_a_real_library_12345", "opts")
-            .unwrap();
-        assert!(!r2.agents()[0].library.is_loaded());
-        assert!(!r2.agents()[0].on_load_called);
+        assert!(registry.agents().is_empty());
     }
 }
