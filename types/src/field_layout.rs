@@ -94,6 +94,15 @@ pub fn set_compact_ref_fields_enabled(enabled: bool) {
 /// so a `Vec` indexed by id is compact. Only populated when the flag is on.
 static CLASS_LAYOUTS: RwLock<Vec<Option<Arc<CompactLayout>>>> = RwLock::new(Vec::new());
 
+/// Maximum slot count for the dense layout registry.
+///
+/// Class IDs are expected to be allocator-issued and dense. A sparse or corrupt
+/// ID near `u32::MAX` would otherwise make `register_class_layout` try to resize
+/// the Vec to billions of entries. One million classes is already far above the
+/// current VM scale; if that ever becomes a real workload, replace this registry
+/// with a sparse map instead of raising the limit blindly.
+const MAX_DENSE_CLASS_LAYOUTS: usize = 1 << 20;
+
 /// Monotonic generation, bumped on every (re)registration. Lets hot-path
 /// consumers (the GC scan) cache a `(class_id -> Arc)` lookup and cheaply
 /// validate it with a single atomic load instead of re-taking the registry
@@ -108,8 +117,14 @@ pub fn layout_generation() -> u64 {
 
 /// Register (or replace, on redefine) the compact layout for a class.
 pub fn register_class_layout(class_id: u32, layout: Arc<CompactLayout>) {
-    let mut v = CLASS_LAYOUTS.write().unwrap();
     let idx = class_id as usize;
+    assert!(
+        idx < MAX_DENSE_CLASS_LAYOUTS,
+        "compact field-layout class_id {class_id} exceeds dense registry limit \
+         ({MAX_DENSE_CLASS_LAYOUTS}); refusing sparse allocation"
+    );
+
+    let mut v = CLASS_LAYOUTS.write().unwrap();
     if idx >= v.len() {
         v.resize(idx + 1, None);
     }
@@ -134,7 +149,10 @@ pub fn class_layout(class_id: u32) -> Option<Arc<CompactLayout>> {
 #[inline]
 pub fn compact_field_slot(class_id: u32, index: usize) -> Option<(usize, bool)> {
     let layout = class_layout(class_id)?;
-    Some((layout.field_offset(index)? as usize, layout.field_is_ref(index)?))
+    Some((
+        layout.field_offset(index)? as usize,
+        layout.field_is_ref(index)?,
+    ))
 }
 
 /// Clear the registry (test-only).
@@ -246,8 +264,14 @@ mod tests {
                 expect_off += SLOT_SIZE as u32;
             }
         }
-        assert_eq!(layout.body_size, expect_off, "body size = sum of field sizes");
-        assert_eq!(layout.ref_offsets, expect_refs, "oop-map = reference offsets");
+        assert_eq!(
+            layout.body_size, expect_off,
+            "body size = sum of field sizes"
+        );
+        assert_eq!(
+            layout.ref_offsets, expect_refs,
+            "oop-map = reference offsets"
+        );
         assert_eq!(layout.field_count(), 7);
         assert_eq!(layout.field_offset(7), None, "out-of-range index");
 
@@ -256,9 +280,17 @@ mod tests {
         // read at the non-compact `index * SLOT_SIZE` offset it would land on a
         // ref slot and decode a pointer as a double.
         assert_eq!(layout.field_offset(1), Some(8)); // double x, one ref before
-        assert_ne!(8, 1 * SLOT_SIZE as u32, "non-compact assumption would use 16");
+        assert_ne!(
+            8,
+            1 * SLOT_SIZE as u32,
+            "non-compact assumption would use 16"
+        );
         assert_eq!(layout.field_offset(3), Some(32)); // double y, two refs before
-        assert_ne!(32, 3 * SLOT_SIZE as u32, "non-compact assumption would use 48");
+        assert_ne!(
+            32,
+            3 * SLOT_SIZE as u32,
+            "non-compact assumption would use 48"
+        );
 
         // No primitive field's [off, off+SLOT_SIZE) byte range may overlap any
         // reference field's [off, off+REF_FIELD_SIZE) range — that overlap is
@@ -300,6 +332,33 @@ mod tests {
         });
         register_class_layout(7, layout2);
         assert_eq!(class_layout(7).unwrap().body_size, 16);
+        clear_class_layouts();
+    }
+
+    #[test]
+    fn registry_rejects_sparse_class_id_without_poisoning_lock() {
+        clear_class_layouts();
+        let layout = Arc::new(CompactLayout {
+            field_offsets: vec![0],
+            is_ref: vec![true],
+            ref_offsets: vec![0],
+            body_size: 8,
+        });
+
+        let rejected = std::panic::catch_unwind({
+            let layout = Arc::clone(&layout);
+            move || register_class_layout(u32::MAX, layout)
+        });
+        assert!(
+            rejected.is_err(),
+            "corrupt high class_id must be rejected before dense allocation"
+        );
+
+        // The guard fires before taking CLASS_LAYOUTS, so a later valid
+        // registration must still succeed instead of observing a poisoned lock.
+        register_class_layout(0, Arc::clone(&layout));
+        assert!(Arc::ptr_eq(&class_layout(0).unwrap(), &layout));
+        assert!(class_layout(u32::MAX).is_none());
         clear_class_layouts();
     }
 }

@@ -301,9 +301,10 @@ impl ObjectRef {
 //
 // 4. **Current execution model** — The VM currently executes Java threads
 //    on a single OS thread with cooperative scheduling. This makes the
-//    Send+Sync bounds trivially sound. When true OS-thread parallelism is
-//    added (threading/jvm_thread.rs), the monitor protocol in (2) provides
-//    the necessary synchronization.
+//    Send+Sync bounds sound only for the current scheduler. Before true
+//    OS-thread-parallel Java execution is enabled, this impl must be
+//    re-audited and either backed by a complete concurrent-root/relocation
+//    protocol or replaced with a narrower handle/transfer representation.
 //
 // !!! KNOWN LATENT RISK — RE-AUDIT BEFORE ENABLING MULTI-THREADED EXECUTION !!!
 //
