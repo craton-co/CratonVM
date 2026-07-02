@@ -35,7 +35,7 @@ typedef uint8_t cratonvm_jboolean;
 /* Opaque, owning VM handle from cratonvm_create(); free with cratonvm_destroy(). */
 typedef struct CratonVm CratonVm;
 
-/* u64 object/string/throwable handle (ObjectRef::as_ptr(); 0 == null). */
+/* Opaque u64 object/string/throwable token (0 == null). */
 typedef uint64_t CratonRef;
 
 /* u64 class handle (a widened ClassId). 0 is a valid class id. */
@@ -75,6 +75,11 @@ enum {
  *   tag == DOUBLE -> bit-cast payload to double
  *   tag == OBJECT -> (CratonRef)payload
  *   tag == VOID / ERROR -> payload unspecified
+ *
+ * Inbound values passed as method args or field values must use INT, LONG,
+ * FLOAT, DOUBLE, or OBJECT. Unknown tags and stale/fabricated nonzero OBJECT
+ * tokens fail the call and set cratonvm_last_error(); they are not coerced to
+ * null.
  */
 typedef struct CratonValue {
     cratonvm_jint tag;
@@ -83,9 +88,10 @@ typedef struct CratonValue {
 
 /* ---- lifecycle -------------------------------------------------------- */
 
-/* Build and bootstrap a VM. `args` may be NULL for defaults. Returns NULL on
- * failure (cratonvm_last_error() then holds the message). The returned handle
- * must be released with cratonvm_destroy(). */
+/* Build and bootstrap a VM. `args` may be NULL for defaults. Only one VM
+ * surface may be active in-process: either one JNI Invocation-API VM or one
+ * flat CratonVm. Returns NULL on failure (cratonvm_last_error() then holds the
+ * message). The returned handle must be released with cratonvm_destroy(). */
 CratonVm *cratonvm_create(const JavaVMInitArgs *args);
 
 /* Drop the VM and free the handle. NULL is a no-op. */
