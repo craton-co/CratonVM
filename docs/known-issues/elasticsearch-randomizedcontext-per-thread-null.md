@@ -44,6 +44,28 @@ org.elasticsearch.lucene.queries.InetAddressRandomBinaryDocValuesRangeQueryTests
 org.elasticsearch.search.vectors.DiversifyingChildrenIVFKnnFloatSlicedVectorQueryTests
 ```
 
+### Related symptom: duplicate `createTempDir()` paths → node-lock cascade
+
+After the JDK-NIO `AbstractMethodError`s were fixed (see
+`docs/internal/elasticsearch-jdk-nio-no-code-attribute.md`),
+`InternalEngineFieldInfoCachingTests` and `NoOpEngineTests` still fail
+deterministically (no stale lock files involved) with:
+
+```text
+java.lang.IllegalStateException: failed to obtain node locks, tried [X, X]
+Caused by: org.apache.lucene.store.LockObtainFailedException: Lock held by this virtual machine
+```
+
+`ESTestCase.tmpPaths()` calls `createTempDir()` 1-3 times
+(`TestUtil.nextInt(random(), 1, 3)`) to build `path.data`; in this run it
+returned the SAME path twice instead of two distinct temp directories, so
+`NodeEnvironment` tries to lock the same physical directory twice in one
+process. `createTempDir()`'s naming is per-thread/RandomizedContext-scoped
+state, so this is very likely the same underlying per-thread-state defect
+tracked by this doc, manifesting as silent name collision rather than an
+outright NPE. Not yet root-caused independently — flagging here rather than
+opening a duplicate doc.
+
 ## Repro
 
 ```powershell
