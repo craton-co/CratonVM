@@ -158,6 +158,14 @@ pub fn read_class_arc(source: Arc<[u8]>) -> Result<ClassFile, ClassReaderError> 
 
     // Class attributes
     let attributes = read_attributes(&mut buf, &constant_pool, &source)?;
+    if buf.remaining() != 0 {
+        return Err(ClassReaderError::InvalidClassData {
+            message: format!(
+                "class file has {} trailing bytes after class attributes",
+                buf.remaining()
+            ),
+        });
+    }
 
     Ok(ClassFile {
         version,

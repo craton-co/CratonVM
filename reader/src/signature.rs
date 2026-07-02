@@ -453,6 +453,14 @@ impl<'a> SigParser<'a> {
     }
 }
 
+fn finish_full_parse<T>(parser: &SigParser<'_>, parsed: Option<T>) -> Option<T> {
+    if parser.depth_exceeded || !parser.at_end() {
+        None
+    } else {
+        parsed
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Public parse API
 // ---------------------------------------------------------------------------
@@ -461,22 +469,14 @@ impl<'a> SigParser<'a> {
 pub fn parse_class_signature(sig: &str) -> Option<ClassSig> {
     let mut p = SigParser::new(sig);
     let r = p.parse_class_sig();
-    if p.depth_exceeded {
-        None
-    } else {
-        r
-    }
+    finish_full_parse(&p, r)
 }
 
 /// Parse a method signature string.
 pub fn parse_method_signature(sig: &str) -> Option<MethodSig> {
     let mut p = SigParser::new(sig);
     let r = p.parse_method_sig();
-    if p.depth_exceeded {
-        None
-    } else {
-        r
-    }
+    finish_full_parse(&p, r)
 }
 
 /// Parse a field signature string (a single reference type signature).
@@ -490,11 +490,7 @@ pub fn parse_method_signature(sig: &str) -> Option<MethodSig> {
 pub fn parse_field_signature(sig: &str) -> Option<TypeSig> {
     let mut p = SigParser::new(sig);
     let r = p.parse_type_sig();
-    if p.depth_exceeded {
-        None
-    } else {
-        r
-    }
+    finish_full_parse(&p, r)
 }
 
 // ---------------------------------------------------------------------------
@@ -637,7 +633,7 @@ pub fn parse_class_signature_cached(sig: &Arc<str>) -> Option<Arc<ClassSig>> {
     // `MAX_SIG_DEPTH` must be treated (and cached) as Invalid, otherwise
     // the cached path would accept — and memoize — a partial AST the
     // uncached path rejects, defeating the recursion/DoS guard.
-    let parsed = if p.depth_exceeded { None } else { parsed };
+    let parsed = finish_full_parse(&p, parsed);
     let mut cache = signature_cache().lock();
     match parsed {
         Some(c) => {
@@ -664,7 +660,7 @@ pub fn parse_method_signature_cached(sig: &Arc<str>) -> Option<Arc<MethodSig>> {
     let parsed = p.parse_method_sig();
     // Honor the sticky depth-exceeded guard exactly like the uncached
     // `parse_method_signature` (see `parse_class_signature_cached`).
-    let parsed = if p.depth_exceeded { None } else { parsed };
+    let parsed = finish_full_parse(&p, parsed);
     let mut cache = signature_cache().lock();
     match parsed {
         Some(m) => {
@@ -691,7 +687,7 @@ pub fn parse_field_signature_cached(sig: &Arc<str>) -> Option<Arc<TypeSig>> {
     let parsed = p.parse_type_sig();
     // Honor the sticky depth-exceeded guard exactly like the uncached
     // `parse_field_signature` (see `parse_class_signature_cached`).
-    let parsed = if p.depth_exceeded { None } else { parsed };
+    let parsed = finish_full_parse(&p, parsed);
     let mut cache = signature_cache().lock();
     match parsed {
         Some(t) => {
@@ -796,6 +792,24 @@ mod tests {
         let sig = parse_method_signature("()V").unwrap();
         assert!(sig.param_types.is_empty());
         assert!(matches!(sig.return_type, TypeSig::Base('V')));
+    }
+
+    #[test]
+    fn trailing_garbage_rejected_by_uncached_parsers() {
+        assert!(parse_class_signature("Ljava/lang/Object;garbage").is_none());
+        assert!(parse_method_signature("()Vgarbage").is_none());
+        assert!(parse_field_signature("Ljava/lang/Object;garbage").is_none());
+    }
+
+    #[test]
+    fn trailing_garbage_rejected_by_cached_parsers() {
+        let class_sig: Arc<str> = Arc::from("Ljava/lang/Object;cached_class_garbage");
+        let method_sig: Arc<str> = Arc::from("()Vcached_method_garbage");
+        let field_sig: Arc<str> = Arc::from("Ljava/lang/Object;cached_field_garbage");
+
+        assert!(parse_class_signature_cached(&class_sig).is_none());
+        assert!(parse_method_signature_cached(&method_sig).is_none());
+        assert!(parse_field_signature_cached(&field_sig).is_none());
     }
 
     #[test]

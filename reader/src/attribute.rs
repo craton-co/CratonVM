@@ -950,13 +950,13 @@ pub fn decode_attribute_with_source_arc(
 /// `.class` can nest a `Code` attribute inside a `Code` body, or a
 /// `Record` inside a `Record` component's attribute table, arbitrarily
 /// deep; without a cap that recursion overflows the native stack and
-/// aborts the process (a DoS on untrusted input). 64 far exceeds any
+/// aborts the process (a DoS on untrusted input). 16 far exceeds any
 /// attribute nesting a real compiler emits (a `Code` body holds leaf
 /// attributes like `LineNumberTable`/`StackMapTable`; legitimate
 /// `Record`/`Code` nesting is never more than one or two levels). Mirrors
 /// [`MAX_ANNOTATION_DEPTH`] used for the annotation/element-value recursion
 /// below.
-const MAX_ATTRIBUTE_DEPTH: usize = 64;
+const MAX_ATTRIBUTE_DEPTH: usize = 16;
 
 /// Decode dispatch — switches on attribute name. Kept separate from
 /// [`decode_attribute_with_source`] so the post-parse length check lives
@@ -3403,7 +3403,7 @@ mod tests {
             b
         }
 
-        // 200 levels — comfortably above MAX_ATTRIBUTE_DEPTH (64) and small
+        // 200 levels — comfortably above MAX_ATTRIBUTE_DEPTH (16) and small
         // enough that *building* the bytes here does not itself overflow.
         let mut body = code_body(None);
         for _ in 0..200 {

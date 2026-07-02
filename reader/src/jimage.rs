@@ -637,8 +637,12 @@ impl JImageReader {
         }
         let index = if redirect < 0 {
             // Direct index into the offset table.
-            match (-redirect).checked_sub(1) {
-                Some(i) => i as usize,
+            match i64::from(redirect)
+                .checked_neg()
+                .and_then(|i| i.checked_sub(1))
+                .and_then(|i| usize::try_from(i).ok())
+            {
+                Some(i) => i,
                 None => return Ok(None),
             }
         } else {
@@ -1194,6 +1198,19 @@ mod tests {
             .find_resource("/java.base/does/not/Exist.class")
             .unwrap();
         assert!(miss.is_none());
+    }
+
+    #[test]
+    fn i32_min_redirect_is_absent_not_overflow() {
+        let path = "/java.base/does/not/Exist.class";
+        let mut data = test_builder::build_simple(&sample_resources());
+        let table_len = u32::from_le_bytes(data[16..20].try_into().unwrap()) as usize;
+        let bucket = (jimage_hash(path, HASH_MULTIPLIER) as usize) % table_len;
+        let redirect_offset = HEADER_SIZE + bucket * 4;
+        data[redirect_offset..redirect_offset + 4].copy_from_slice(&i32::MIN.to_le_bytes());
+
+        let reader = JImageReader::from_bytes(data).unwrap();
+        assert!(reader.find_resource(path).unwrap().is_none());
     }
 
     #[test]
