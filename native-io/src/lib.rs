@@ -37,7 +37,6 @@
 use std::collections::HashMap;
 use std::fs;
 use std::io::{self, Read, Seek, SeekFrom, Write};
-use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -13886,47 +13885,6 @@ fn native_we_context(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
 // 92.3: DatagramChannel (UDP)
 // ---------------------------------------------------------------------------
 
-fn udp_policy_denied(reason: String) -> MethodCallFailed {
-    RuntimeError::IOException {
-        message: format!("send denied by outbound policy: {reason}"),
-    }
-    .into()
-}
-
-fn udp_target_literal(target: SocketAddr) -> String {
-    match target {
-        SocketAddr::V4(_) => format!("{}:{}", target.ip(), target.port()),
-        SocketAddr::V6(_) => format!("[{}]:{}", target.ip(), target.port()),
-    }
-}
-
-fn check_udp_outbound_target(target: &str) -> Result<(), MethodCallFailed> {
-    if let Err(reason) = outbound_policy::check_outbound(target) {
-        return Err(udp_policy_denied(reason));
-    }
-
-    let addrs: Vec<SocketAddr> = target
-        .to_socket_addrs()
-        .map_err(|e| RuntimeError::IOException {
-            message: format!("send target {target}: {e}"),
-        })?
-        .collect();
-    if addrs.is_empty() {
-        return Err(RuntimeError::IOException {
-            message: format!("send target {target}: no resolved addresses"),
-        }
-        .into());
-    }
-
-    for addr in addrs {
-        let literal = udp_target_literal(addr);
-        if let Err(reason) = outbound_policy::check_outbound(&literal) {
-            return Err(udp_policy_denied(reason));
-        }
-    }
-    Ok(())
-}
-
 fn register_datagram_channel(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
@@ -14091,57 +14049,6 @@ fn native_dc_bind(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     let addr_s = ctx.create_string(&actual_addr);
     ctx.set_field(this, DC_FIELD_ADDR, Value::Object(Some(addr_s)));
     Ok(Some(Value::Object(Some(this))))
-}
-
-fn native_dc_send(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = obj_arg92(args, 0)?;
-    let bb = obj_arg92(args, 1)?;
-    let target_obj = obj_arg92(args, 2)?;
-
-    if !matches!(ctx.get_field(this, DC_FIELD_OPEN), Value::Int(1)) {
-        return Err(RuntimeError::IOException {
-            message: "DatagramChannel is closed".into(),
-        }
-        .into());
-    }
-
-    let fd_id = match ctx.get_field(this, DC_FIELD_FD) {
-        Value::Int(v) => v as u32,
-        _ => return Ok(Some(Value::Int(0))),
-    };
-
-    // Read target address
-    let target_str = ctx
-        .read_string(target_obj)
-        .or_else(|| match ctx.get_field(target_obj, 0) {
-            Value::Object(Some(s)) => ctx.read_string(s),
-            _ => None,
-        })
-        .unwrap_or_default();
-
-    // Extract data from ByteBuffer
-    let (arr, pos, lim, _) = bb_state(ctx, bb)?;
-    let remaining = (lim - pos) as usize;
-    if remaining == 0 {
-        return Ok(Some(Value::Int(0)));
-    }
-    check_udp_outbound_target(&target_str)?;
-    let mut data = vec![0u8; remaining];
-    for i in 0..remaining {
-        if let Value::Int(b) = ctx.get_array_element(arr, pos as usize + i) {
-            data[i] = b as u8;
-        }
-    }
-
-    let n = ctx
-        .fd_table()
-        .udp_send(fd_id, &data, &target_str)
-        .map_err(|e| RuntimeError::IOException {
-            message: format!("send: {e}"),
-        })?;
-
-    buf_set_position(ctx, bb, pos + n as i32);
-    Ok(Some(Value::Int(n as i32)))
 }
 
 fn native_dc_receive(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -15167,6 +15074,21 @@ mod io_tests {
         assert_eq!(
             actual as usize, guarded as usize,
             "DatagramChannel.send must remain routed through guarded UDP send"
+        );
+    }
+
+    #[test]
+    fn phase92_datagram_channel_does_not_register_public_send() {
+        let mut r = NativeMethodRegistry::new();
+        register_datagram_channel(&mut r);
+        assert!(
+            r.find(
+                "java/nio/channels/DatagramChannel",
+                "send",
+                "(Ljava/nio/ByteBuffer;Ljava/net/SocketAddress;)I",
+            )
+            .is_none(),
+            "phase92 DatagramChannel must not override datagram.rs guarded send"
         );
     }
 
