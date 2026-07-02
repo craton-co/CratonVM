@@ -1759,6 +1759,7 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         "java/lang/ClassCastException",
         "java/lang/IllegalArgumentException",
         "java/lang/IllegalStateException",
+        "java/lang/IllegalThreadStateException",
         "java/lang/UnsupportedOperationException",
         "java/lang/NullPointerException",
         "java/lang/IndexOutOfBoundsException",

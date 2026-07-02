@@ -1319,6 +1319,10 @@ pub fn throw_runtime_error(
         RuntimeError::IllegalStateException { message } => {
             ("java/lang/IllegalStateException", Some(message.as_str()))
         }
+        RuntimeError::IllegalThreadStateException { message } => (
+            "java/lang/IllegalThreadStateException",
+            Some(message.as_str()),
+        ),
         RuntimeError::IllegalCallerException { message } => {
             // Task #57: route the new variant to `java.lang.IllegalCallerException`
             // so the Panama native-access gate raises the JDK-conventional class
