@@ -34106,6 +34106,20 @@ fn register_concurrent_completeness_natives(r: &mut NativeMethodRegistry) {
 
     // --- CompletionStage methods ---
 
+    r.register(
+        cf,
+        "thenApply",
+        "(Ljava/util/function/Function;)Ljava/util/concurrent/CompletableFuture;",
+        native_cf_then_apply_p31,
+    );
+
+    r.register(
+        cf,
+        "thenAccept",
+        "(Ljava/util/function/Consumer;)Ljava/util/concurrent/CompletableFuture;",
+        native_cf_then_accept_p31,
+    );
+
     // thenRun: run Runnable after completion, return new CF with null result
     r.register(
         cf,

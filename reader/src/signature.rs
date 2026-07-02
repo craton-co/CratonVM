@@ -801,24 +801,18 @@ mod tests {
 
     #[test]
     fn trailing_garbage_rejected_after_complex_generic_signatures() {
-        assert!(
-            parse_class_signature(
-                "<T:Ljava/lang/Object;>Ljava/lang/Object;Ljava/io/Serializable;garbage"
-            )
-            .is_none()
-        );
-        assert!(
-            parse_method_signature(concat!(
-                "<T:Ljava/lang/Object;>",
-                "(Ljava/util/List<TT;>;)",
-                "Ljava/util/List<TT;>;",
-                "^Ljava/lang/Exception;garbage"
-            ))
-            .is_none()
-        );
-        assert!(
-            parse_field_signature("[Ljava/util/List<+Ljava/lang/Number;>;garbage").is_none()
-        );
+        assert!(parse_class_signature(
+            "<T:Ljava/lang/Object;>Ljava/lang/Object;Ljava/io/Serializable;garbage"
+        )
+        .is_none());
+        assert!(parse_method_signature(concat!(
+            "<T:Ljava/lang/Object;>",
+            "(Ljava/util/List<TT;>;)",
+            "Ljava/util/List<TT;>;",
+            "^Ljava/lang/Exception;garbage"
+        ))
+        .is_none());
+        assert!(parse_field_signature("[Ljava/util/List<+Ljava/lang/Number;>;garbage").is_none());
     }
 
     #[test]

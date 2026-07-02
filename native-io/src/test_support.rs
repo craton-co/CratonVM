@@ -530,6 +530,30 @@ impl NativeContext for MockNativeContext {
         None
     }
     fn free_native_memory(&mut self, _a: i64) {}
+    fn copy_from_native_memory(&self, addr: i64, out: &mut [u8]) -> bool {
+        if out.is_empty() {
+            return true;
+        }
+        if addr <= 0 {
+            return false;
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(addr as *const u8, out.as_mut_ptr(), out.len());
+        }
+        true
+    }
+    fn copy_to_native_memory(&mut self, addr: i64, data: &[u8]) -> bool {
+        if data.is_empty() {
+            return true;
+        }
+        if addr <= 0 {
+            return false;
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(data.as_ptr(), addr as *mut u8, data.len());
+        }
+        true
+    }
     fn load_native_library(&mut self, _p: &str) -> Result<i64, MethodCallFailed> {
         Ok(0)
     }

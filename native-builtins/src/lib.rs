@@ -39,6 +39,28 @@ pub(crate) fn bootstrap_property_fallback(key: &str) -> Option<String> {
     }
 }
 
+fn register_test_harness_natives(registry: &mut NativeMethodRegistry) {
+    registry.register(
+        "cratonvm/test/Util",
+        "tempPrint",
+        "(I)V",
+        native_temp_print_int,
+    );
+    registry.register(
+        "cratonvm/test/Util",
+        "tempPrint",
+        "(Ljava/lang/String;)V",
+        native_temp_print_string,
+    );
+    registry.register("cratonvm/Util", "tempPrint", "(I)V", native_temp_print_int);
+    registry.register(
+        "cratonvm/Util",
+        "tempPrint",
+        "(Ljava/lang/String;)V",
+        native_temp_print_string,
+    );
+}
+
 /// Native `Duration.parse(CharSequence)` for real-JDK mode.
 ///
 /// JDK 25's `Duration.parse` (Duration.java:395) drives a compiled regex
@@ -1248,6 +1270,10 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // to `Intrinsic` individually later.)
     let prev_category = registry.current_category();
     registry.set_category(cratonvm_native_api::NativeKind::Bridge);
+
+    // Integration-test harness support. These classes are not part of the JDK,
+    // but test VMs use real-JDK mode and still need the print capture natives.
+    register_test_harness_natives(registry);
 
     // JDK 25 VectorSupport declares these three ACC_NATIVE methods in
     // java.base. Keep them in the real-JDK essential path; the broader
@@ -12780,28 +12806,6 @@ pub fn register_synthetic_overrides(registry: &mut NativeMethodRegistry) {
         "canAccess",
         "(Ljava/lang/Object;)Z",
         native_return_true,
-    );
-
-    // --- Test harness: tempPrint ---
-    // Used by integration tests to capture output without needing full I/O.
-    registry.register(
-        "cratonvm/test/Util",
-        "tempPrint",
-        "(I)V",
-        native_temp_print_int,
-    );
-    registry.register(
-        "cratonvm/test/Util",
-        "tempPrint",
-        "(Ljava/lang/String;)V",
-        native_temp_print_string,
-    );
-    registry.register("cratonvm/Util", "tempPrint", "(I)V", native_temp_print_int);
-    registry.register(
-        "cratonvm/Util",
-        "tempPrint",
-        "(Ljava/lang/String;)V",
-        native_temp_print_string,
     );
 
     // --- java.lang.Enum ---
