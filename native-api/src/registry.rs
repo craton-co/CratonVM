@@ -57,6 +57,20 @@ use cratonvm_types::ClassId;
 use cratonvm_types::{ArrayElementType, ObjectKind};
 use cratonvm_types::{ObjectRef, Value};
 
+fn value_matches_primitive_array(element_type: ArrayElementType, value: Value) -> bool {
+    match element_type {
+        ArrayElementType::Boolean
+        | ArrayElementType::Byte
+        | ArrayElementType::Char
+        | ArrayElementType::Short
+        | ArrayElementType::Int => matches!(value, Value::Int(_)),
+        ArrayElementType::Long => matches!(value, Value::Long(_)),
+        ArrayElementType::Float => matches!(value, Value::Float(_)),
+        ArrayElementType::Double => matches!(value, Value::Double(_)),
+        ArrayElementType::Reference => false,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Reflection metadata types
 // ---------------------------------------------------------------------------
@@ -592,31 +606,17 @@ pub trait NativeContext {
     /// raw `copy_nonoverlapping`, because `Util.getTemporaryDirectBuffer` backs
     /// its temp buffers with arena handles — dereferencing one raw SIGSEGVs.
     ///
-    /// The default implementation does a raw read (sufficient for test mocks /
-    /// real pointers); the real VM overrides it to route arena handles through
-    /// the off-heap store. Returns false if the range is invalid.
-    fn copy_from_native_memory(&self, addr: i64, out: &mut [u8]) -> bool {
-        if addr <= 0 {
-            return false;
-        }
-        // SAFETY: default path assumes `addr` is a real, readable pointer.
-        unsafe {
-            std::ptr::copy_nonoverlapping(addr as *const u8, out.as_mut_ptr(), out.len());
-        }
-        true
+    /// The default implementation fails closed. Implementations that can prove
+    /// the address range is valid must override this and perform their own
+    /// pointer/arena validation before copying.
+    fn copy_from_native_memory(&self, _addr: i64, _out: &mut [u8]) -> bool {
+        false
     }
 
     /// Write `data` to native memory at `addr`. See [`Self::copy_from_native_memory`]
     /// for the arena-handle vs raw-pointer distinction.
-    fn copy_to_native_memory(&mut self, addr: i64, data: &[u8]) -> bool {
-        if addr <= 0 {
-            return false;
-        }
-        // SAFETY: default path assumes `addr` is a real, writable pointer.
-        unsafe {
-            std::ptr::copy_nonoverlapping(data.as_ptr(), addr as *mut u8, data.len());
-        }
-        true
+    fn copy_to_native_memory(&mut self, _addr: i64, _data: &[u8]) -> bool {
+        false
     }
 
     /// Check if a method exists in a class (searches the class hierarchy).
@@ -832,9 +832,48 @@ pub trait NativeContext {
         dst_off: usize,
         len: usize,
     ) -> bool {
+        if len == 0 {
+            return true;
+        }
+        if self.heap_kind_of(src) != ObjectKind::Array
+            || self.heap_kind_of(dst) != ObjectKind::Array
+        {
+            return false;
+        }
+        let src_type = self.heap_element_type_of(src);
+        let dst_type = self.heap_element_type_of(dst);
+        if src_type != dst_type || src_type == ArrayElementType::Reference {
+            return false;
+        }
+        let src_end = match src_off.checked_add(len) {
+            Some(end) => end,
+            None => return false,
+        };
+        let dst_end = match dst_off.checked_add(len) {
+            Some(end) => end,
+            None => return false,
+        };
+        if src_end > self.array_length(src) || dst_end > self.array_length(dst) {
+            return false;
+        }
+
         for i in 0..len {
-            let v = self.get_array_element(src, src_off + i);
-            self.set_array_element(dst, dst_off + i, v);
+            if !value_matches_primitive_array(src_type, self.get_array_element(src, src_off + i)) {
+                return false;
+            }
+        }
+
+        let same_array = src.as_ptr() == dst.as_ptr();
+        if same_array && dst_off > src_off {
+            for i in (0..len).rev() {
+                let v = self.get_array_element(src, src_off + i);
+                self.set_array_element(dst, dst_off + i, v);
+            }
+        } else {
+            for i in 0..len {
+                let v = self.get_array_element(src, src_off + i);
+                self.set_array_element(dst, dst_off + i, v);
+            }
         }
         true
     }
