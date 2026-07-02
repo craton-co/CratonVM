@@ -8464,13 +8464,92 @@ fn native_path_to_absolute(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         _ => return Ok(Some(Value::Object(None))),
     };
     let s = read_path_str(ctx, this);
-    let abs = std::fs::canonicalize(&s).unwrap_or_else(|_| {
-        let mut cwd = std::env::current_dir().unwrap_or_default();
-        cwd.push(&s);
-        cwd
-    });
-    let result = alloc_path(ctx, &abs.to_string_lossy());
+    let abs = nio_absolute_path_string(&s);
+    let result = alloc_path(ctx, &abs);
     Ok(Some(Value::Object(Some(result))))
+}
+
+fn nio_absolute_path_string(path: &str) -> String {
+    #[cfg(windows)]
+    {
+        return nio_windows_absolute_path_string(path);
+    }
+    #[cfg(not(windows))]
+    {
+        let p = std::path::Path::new(path);
+        if p.is_absolute() {
+            path.to_string()
+        } else {
+            std::env::current_dir()
+                .unwrap_or_default()
+                .join(p)
+                .to_string_lossy()
+                .into_owned()
+        }
+    }
+}
+
+#[cfg(windows)]
+fn nio_windows_absolute_path_string(path: &str) -> String {
+    let s = path.replace('\\', "/");
+    let b = s.as_bytes();
+    let is_sep = |c: u8| c == b'/' || c == b'\\';
+    let has_drive = b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':';
+    let drive_absolute = has_drive && b.len() >= 3 && is_sep(b[2]);
+    let unc_absolute = b.len() >= 2 && is_sep(b[0]) && is_sep(b[1]);
+    if drive_absolute || unc_absolute {
+        return s;
+    }
+
+    let mut cwd = std::env::current_dir()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .replace('\\', "/");
+    if let Some(stripped) = cwd.strip_prefix("//?/") {
+        cwd = stripped.to_string();
+    }
+    while cwd.len() > 3 && cwd.ends_with('/') {
+        cwd.pop();
+    }
+
+    let cwd_drive = cwd
+        .as_bytes()
+        .get(0..2)
+        .filter(|d| d[0].is_ascii_alphabetic() && d[1] == b':')
+        .and_then(|_| cwd.get(0..2))
+        .unwrap_or("");
+
+    if b.first().is_some_and(|c| is_sep(*c)) {
+        let rest = s.trim_start_matches(|c| c == '/' || c == '\\');
+        if cwd_drive.is_empty() {
+            return format!("/{rest}");
+        }
+        return format!("{cwd_drive}/{rest}");
+    }
+
+    if has_drive {
+        let drive = &s[..2];
+        let rest = s[2..].trim_start_matches(|c| c == '/' || c == '\\');
+        if cwd
+            .get(0..2)
+            .is_some_and(|d| d.eq_ignore_ascii_case(drive))
+        {
+            if rest.is_empty() {
+                return cwd;
+            }
+            return format!("{cwd}/{rest}");
+        }
+        if rest.is_empty() {
+            return format!("{drive}/");
+        }
+        return format!("{drive}/{rest}");
+    }
+
+    if s.is_empty() {
+        cwd
+    } else {
+        format!("{cwd}/{s}")
+    }
 }
 
 /// `java.nio.file.Path.toRealPath([Ljava/nio/file/LinkOption;)` —

@@ -4122,15 +4122,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let this = obj_arg(args, 0)?;
             let p = p57_read_path(ctx, this);
-            let abs = if p.starts_with('/') || (p.len() >= 2 && p.as_bytes()[1] == b':') {
-                p
-            } else {
-                // Use real CWD for relative paths
-                match std::env::current_dir() {
-                    Ok(cwd) => format!("{}/{}", cwd.to_string_lossy(), p),
-                    Err(_) => p,
-                }
-            };
+            let abs = p57_absolute_path_string(&p);
             let result = p57_alloc_path(ctx, &abs);
             Ok(Some(Value::Object(Some(result))))
         },
@@ -7041,21 +7033,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             // ("could not find jboss-modules.jar" though it exists). A drive-letter
             // (`C:`), UNC (`\\`/`//`), or leading-separator path is already absolute
             // and returned unchanged; a relative path is anchored to the CWD.
-            let b = p.as_bytes();
-            let is_abs =
-                matches!(b.first(), Some(b'/') | Some(b'\\')) || (b.len() >= 2 && b[1] == b':');
-            let abs = if is_abs {
-                p.clone()
-            } else {
-                format!(
-                    "{}/{}",
-                    std::env::current_dir()
-                        .unwrap_or_default()
-                        .to_string_lossy()
-                        .replace('\\', "/"),
-                    p
-                )
-            };
+            let abs = p57_absolute_path_string(&p);
             let result = p57_alloc_path(ctx, &abs);
             Ok(Some(Value::Object(Some(result))))
         },
@@ -7693,6 +7671,89 @@ fn p57_to_os_path(p: &str) -> String {
         return p[1..].to_string();
     }
     p.to_string()
+}
+
+fn p57_absolute_path_string(path: &str) -> String {
+    #[cfg(windows)]
+    {
+        return p57_windows_absolute_path_string(path);
+    }
+    #[cfg(not(windows))]
+    {
+        let p = std::path::Path::new(path);
+        if p.is_absolute() {
+            path.to_string()
+        } else {
+            std::env::current_dir()
+                .unwrap_or_default()
+                .join(p)
+                .to_string_lossy()
+                .into_owned()
+        }
+    }
+}
+
+#[cfg(windows)]
+fn p57_windows_absolute_path_string(path: &str) -> String {
+    let s = path.replace('\\', "/");
+    let b = s.as_bytes();
+    let is_sep = |c: u8| c == b'/' || c == b'\\';
+    let has_drive = b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':';
+    let drive_absolute = has_drive && b.len() >= 3 && is_sep(b[2]);
+    let unc_absolute = b.len() >= 2 && is_sep(b[0]) && is_sep(b[1]);
+    if drive_absolute || unc_absolute {
+        return s;
+    }
+
+    let mut cwd = std::env::current_dir()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .replace('\\', "/");
+    if let Some(stripped) = cwd.strip_prefix("//?/") {
+        cwd = stripped.to_string();
+    }
+    while cwd.len() > 3 && cwd.ends_with('/') {
+        cwd.pop();
+    }
+
+    let cwd_drive = cwd
+        .as_bytes()
+        .get(0..2)
+        .filter(|d| d[0].is_ascii_alphabetic() && d[1] == b':')
+        .and_then(|_| cwd.get(0..2))
+        .unwrap_or("");
+
+    if b.first().is_some_and(|c| is_sep(*c)) {
+        let rest = s.trim_start_matches(|c| c == '/' || c == '\\');
+        if cwd_drive.is_empty() {
+            return format!("/{rest}");
+        }
+        return format!("{cwd_drive}/{rest}");
+    }
+
+    if has_drive {
+        let drive = &s[..2];
+        let rest = s[2..].trim_start_matches(|c| c == '/' || c == '\\');
+        if cwd
+            .get(0..2)
+            .is_some_and(|d| d.eq_ignore_ascii_case(drive))
+        {
+            if rest.is_empty() {
+                return cwd;
+            }
+            return format!("{cwd}/{rest}");
+        }
+        if rest.is_empty() {
+            return format!("{drive}/");
+        }
+        return format!("{drive}/{rest}");
+    }
+
+    if s.is_empty() {
+        cwd
+    } else {
+        format!("{cwd}/{s}")
+    }
 }
 
 /// keycloak-15: explicit Windows (sun.nio.fs.WindowsPath) root/name parsing for
@@ -22514,13 +22575,9 @@ pub(crate) fn register_p61_files_path(r: &mut NativeMethodRegistry) {
             let abs = if jarfs_decode(&path_str).is_some() {
                 path_str
             } else {
-                std::fs::canonicalize(&path_str)
-                    .map(|p| p.to_string_lossy().into_owned())
-                    .unwrap_or(path_str)
+                p57_absolute_path_string(&path_str)
             };
-            let p = alloc_concurrent_synthetic(ctx, "java/nio/file/Path", 2);
-            let s = ctx.create_string(&abs);
-            ctx.set_field(p, 0, Value::Object(Some(s)));
+            let p = p57_alloc_path(ctx, &abs);
             Ok(Some(Value::Object(Some(p))))
         },
     );
