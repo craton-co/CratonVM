@@ -6403,6 +6403,8 @@ struct Compiler {
     next_spill_offset: i32,
     /// Base spill offset (first slot after locals).
     base_spill_offset: i32,
+    /// Exclusive end of the operand-stack spill area.
+    spill_limit_offset: i32,
     /// Number of local variable slots.
     num_locals: usize,
     /// Number of parameter slots.
@@ -7545,6 +7547,7 @@ impl Compiler {
         let frame_size = (total + 15) & !15;
 
         let base_spill = locals_size + 8; // first spill slot after locals
+        let spill_limit = base_spill.saturating_add(spill_size);
 
         // Heap pointer stored in the extra local slot (beyond max_locals)
         let heap_local_offset = if needs_heap {
@@ -7575,6 +7578,7 @@ impl Compiler {
             stack: Vec::with_capacity(max_stack),
             next_spill_offset: base_spill,
             base_spill_offset: base_spill,
+            spill_limit_offset: spill_limit,
             num_locals,
             num_params,
             num_reg_locals,
@@ -8156,6 +8160,44 @@ impl Compiler {
         box_ptr
     }
 
+    fn checked_spill_range_end(&mut self, start: i32, slots: usize) -> Option<i32> {
+        let bytes = slots
+            .checked_mul(8)
+            .and_then(|n| i32::try_from(n).ok());
+        let Some(bytes) = bytes else {
+            self.failed = true;
+            return None;
+        };
+        let Some(end) = start.checked_add(bytes) else {
+            self.failed = true;
+            return None;
+        };
+        if start < self.base_spill_offset || end > self.spill_limit_offset {
+            self.failed = true;
+            return None;
+        }
+        Some(end)
+    }
+
+    fn reserve_spill_slots(&mut self, slots: usize) -> Option<i32> {
+        let start = self.next_spill_offset;
+        let end = self.checked_spill_range_end(start, slots)?;
+        self.next_spill_offset = end;
+        Some(start)
+    }
+
+    fn spill_range_fits(&mut self, start: i32, slots: usize) -> bool {
+        self.checked_spill_range_end(start, slots).is_some()
+    }
+
+    fn set_spill_depth(&mut self, depth: usize) -> bool {
+        let Some(end) = self.checked_spill_range_end(self.base_spill_offset, depth) else {
+            return false;
+        };
+        self.next_spill_offset = end;
+        true
+    }
+
     /// Push a value onto the simulated operand stack.
     /// Allocates a spill slot and returns the frame offset.
     ///
@@ -8163,16 +8205,15 @@ impl Compiler {
     /// `false` by default. Callers that know the value is an object
     /// reference should call [`Self::mark_top_as_oop`] immediately
     /// after.
-    fn push_stack(&mut self) -> StackSlot {
+    fn push_stack(&mut self) -> Option<StackSlot> {
         if self.stack.is_empty() && self.stack_oop_marks.is_empty() {
             self.stack_oop_marks_exact = true;
         }
-        let offset = self.next_spill_offset;
-        self.next_spill_offset += 8;
+        let offset = self.reserve_spill_slots(1)?;
         let slot = StackSlot::Frame(offset);
         self.stack.push(slot);
         self.stack_oop_marks.push(false);
-        slot
+        Some(slot)
     }
 
     /// Stage 1 (precise oop maps) — push a *given* slot onto the simulated
@@ -8285,8 +8326,7 @@ impl Compiler {
                     self.stack_oop_marks.push(top_is_oop);
                 } else {
                     self.emit_mov_reg_reg(RAX, reg);
-                    let slot = self.push_stack();
-                    if let StackSlot::Frame(off) = slot {
+                    if let Some(StackSlot::Frame(off)) = self.push_stack() {
                         self.emit_store_local(off, RAX);
                     }
                 }
@@ -9090,6 +9130,10 @@ impl Compiler {
                 next = next.max(off + 8);
             }
         }
+        if next > self.spill_limit_offset {
+            self.failed = true;
+            return;
+        }
         self.next_spill_offset = next;
     }
 
@@ -9124,6 +9168,9 @@ impl Compiler {
         // the park target last — before any other all-blocked state can occur.
         let base = self.base_spill_offset;
         let len = self.stack.len();
+        if !self.spill_range_fits(base, len) {
+            return;
+        }
         // Pending relocations: (position, source). `None` source = the value
         // is parked in RCX awaiting its canonical slot.
         let mut pending: Vec<(usize, Option<StackSlot>)> = (0..len)
@@ -9202,7 +9249,7 @@ impl Compiler {
                 }
             }
         }
-        self.next_spill_offset = base + (len as i32) * 8; // Cast: x86-64 immediate encoding
+        self.set_spill_depth(len);
     }
 
     // -----------------------------------------------------------------------
@@ -12800,10 +12847,10 @@ impl Compiler {
         // showed regressions: the frequent flush_scratch_registers calls before
         // backward branches, calls, and other operations negate the benefit by
         // adding an extra MOV per flush.
-        let slot = self.push_stack();
-        match slot {
-            StackSlot::Frame(off) => self.emit_store_local(off, RAX),
-            _ => unreachable!("push_stack always returns Frame"),
+        match self.push_stack() {
+            Some(StackSlot::Frame(off)) => self.emit_store_local(off, RAX),
+            Some(_) => unreachable!("push_stack always returns Frame"),
+            None => {}
         }
     }
 
@@ -12949,10 +12996,11 @@ impl Compiler {
         let callee_max_locals = site.callee_max_locals;
         let _return_type = site.return_type;
 
-        // Allocate callee locals in caller's spill area
-        let callee_local_base = self.next_spill_offset;
         let callee_locals_size = callee_max_locals.max(callee_num_args);
-        self.next_spill_offset += (callee_locals_size as i32) * 8; // Cast: x86-64 immediate encoding
+        // Allocate callee locals in caller's spill area.
+        let Some(callee_local_base) = self.reserve_spill_slots(callee_locals_size) else {
+            return false;
+        };
 
         // Pop arguments from caller stack and store into callee locals.
         // Args are pushed left-to-right, so stack top = last arg.
@@ -14062,13 +14110,17 @@ impl Compiler {
         // value — `leaf(a) + leafBig(a)` miscompiled because `leaf(a)`'s result
         // was overwritten by `iload a` for leafBig's argument. Keep next_spill
         // above the live operand-stack top so the return value is preserved.
-        self.next_spill_offset = if self.stack.len() > caller_base_depth {
+        let next_spill = if self.stack.len() > caller_base_depth {
             // A return value occupies one slot at `save_spill`.
-            save_spill + 8
+            let Some(end) = self.checked_spill_range_end(save_spill, 1) else {
+                return false;
+            };
+            end
         } else {
             // Void callee: nothing pushed, callee operand stack fully reclaimed.
             save_spill
         };
+        self.next_spill_offset = next_spill;
 
         true
     }
@@ -14170,8 +14222,9 @@ impl Compiler {
             })
             .collect();
         for (idx, reg) in scratch_slots {
-            let off = self.next_spill_offset;
-            self.next_spill_offset += 8;
+            let Some(off) = self.reserve_spill_slots(1) else {
+                return;
+            };
             self.emit_store_local(off, reg);
             self.stack[idx] = StackSlot::Frame(off);
         }
@@ -14193,8 +14246,9 @@ impl Compiler {
             })
             .collect();
         for (idx, xmm) in xmm_slots {
-            let off = self.next_spill_offset;
-            self.next_spill_offset += 8;
+            let Some(off) = self.reserve_spill_slots(1) else {
+                return;
+            };
             // Direct MOVQ [rbp-off], XMM — saves the round-trip
             // through RAX (3 bytes per spill, ~90 bytes across the
             // 30 flush sites). RAX is preserved, which matters when
@@ -14238,8 +14292,9 @@ impl Compiler {
                 })
                 .collect();
             for (idx, reg) in callee_oop_slots {
-                let off = self.next_spill_offset;
-                self.next_spill_offset += 8;
+                let Some(off) = self.reserve_spill_slots(1) else {
+                    return;
+                };
                 self.emit_store_local(off, reg);
                 self.stack[idx] = StackSlot::Frame(off);
             }
@@ -14276,8 +14331,9 @@ impl Compiler {
             // All scratch XMMs busy — fall back to frame spill.
             // Direct MOVQ [rbp-off], XMM0 — RCX is left untouched, which
             // helps callers that have RCX live across this flush.
-            let off = self.next_spill_offset;
-            self.next_spill_offset += 8;
+            let Some(off) = self.reserve_spill_slots(1) else {
+                return;
+            };
             self.emit_movq_mem_rbp_from_xmm(off, 0);
             for idx in xmm0_slots {
                 self.stack[idx] = StackSlot::Frame(off);
@@ -14314,8 +14370,9 @@ impl Compiler {
             return;
         }
         // Spill the register value once
-        let off = self.next_spill_offset;
-        self.next_spill_offset += 8;
+        let Some(off) = self.reserve_spill_slots(1) else {
+            return;
+        };
         self.emit_store_local(off, reg);
         // Update all CalleeSaved/Scratch entries for this register to the shared spill slot
         for slot in &mut self.stack {
@@ -15678,13 +15735,15 @@ impl Compiler {
                         .get(&pc)
                         .copied()
                         .unwrap_or(0);
+                    if !self.set_spill_depth(expected_depth) {
+                        return false;
+                    }
                     self.stack.clear();
                     let base = self.base_spill_offset;
                     for i in 0..expected_depth {
                         let canonical_off = base + (i as i32) * 8; // Cast: x86-64 immediate encoding
                         self.stack.push(StackSlot::Frame(canonical_off));
                     }
-                    self.next_spill_offset = base + (expected_depth as i32) * 8; // Cast: x86-64 immediate encoding
                                                                                  // SECURITY FIX (V15): rebuild the parallel oop-mark
                                                                                  // vector in lock-step with the reconstructed stack.
                                                                                  // Previously only `self.stack` was rebuilt here, leaving
@@ -17064,8 +17123,7 @@ impl Compiler {
                             } else {
                                 // No scratch available — load to RAX and push via frame
                                 self.emit_mov_reg_reg(RAX, reg);
-                                let slot = self.push_stack();
-                                if let StackSlot::Frame(off) = slot {
+                                if let Some(StackSlot::Frame(off)) = self.push_stack() {
                                     self.emit_store_local(off, RAX);
                                 }
                             }
@@ -20013,6 +20071,9 @@ impl Compiler {
                             // max_stack >= 5). They are scratch-only:
                             // arraycopy pushes nothing, so the next bytecode
                             // re-allocates spill slots from the same base.
+                            if !self.spill_range_fits(self.next_spill_offset, 5) {
+                                return false;
+                            }
                             let s_src = self.next_spill_offset;
                             let s_src_pos = self.next_spill_offset + 8;
                             let s_dst = self.next_spill_offset + 16;
@@ -20878,7 +20939,11 @@ impl Compiler {
 
                         let args_base_offset = pre_pop_spill;
                         if n > 0 {
-                            self.next_spill_offset = args_base_offset + (n as i32) * 8; // Cast: x86-64 immediate encoding
+                            let Some(args_end) = self.checked_spill_range_end(args_base_offset, n)
+                            else {
+                                return false;
+                            };
+                            self.next_spill_offset = args_end;
                                                                                         // Store args in reverse offset order so they form
                                                                                         // a contiguous ascending-address buffer:
                                                                                         //   arg[0] at [rbp - highest_offset] (lowest addr)
@@ -22107,6 +22172,10 @@ impl Compiler {
                                 // intrinsic pushes nothing (void return), so
                                 // the next bytecode re-allocates spill slots
                                 // from the same base.
+                                let scratch_slots = if is_byte_form { 2 } else { 4 };
+                                if !self.spill_range_fits(self.next_spill_offset, scratch_slots) {
+                                    return false;
+                                }
                                 let s_recv = self.next_spill_offset;
                                 let s_a = self.next_spill_offset + 8;
                                 let s_b = self.next_spill_offset + 16;
@@ -22393,7 +22462,12 @@ impl Compiler {
 
                             let args_base_offset = pre_pop_spill;
                             if n > 0 {
-                                self.next_spill_offset = args_base_offset + (n as i32) * 8; // Cast: x86-64 immediate encoding
+                                let Some(args_end) =
+                                    self.checked_spill_range_end(args_base_offset, n)
+                                else {
+                                    return false;
+                                };
+                                self.next_spill_offset = args_end;
                                                                                             // Store args in reverse offset order (same fix
                                                                                             // as invokestatic): higher offsets → lower addresses,
                                                                                             // so arg[0] at highest offset = lowest address.
@@ -23794,12 +23868,20 @@ thread_local! {
     /// legacy/helper field path. Same-thread, synchronous compile, no nesting.
     static PENDING_COMPACT_FIELD_INFO: std::cell::RefCell<Vec<(usize, u32, bool)>> =
         const { std::cell::RefCell::new(Vec::new()) };
+    static PENDING_VERIFIED_MAX_STACK: std::cell::RefCell<Option<usize>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// Stage the compact-field-info for the next [`compile`] call on this thread.
 /// Call immediately before `compile`; the wrapper takes (clears) it.
 pub fn set_pending_compact_field_info(info: Vec<(usize, u32, bool)>) {
     PENDING_COMPACT_FIELD_INFO.with(|c| *c.borrow_mut() = info);
+}
+
+/// Stage the reader/verifier max_stack for the next x64 compile on this thread.
+/// Synthetic callers that do not stage it keep using the local estimator.
+pub(crate) fn set_pending_verified_max_stack(max_stack: usize) {
+    PENDING_VERIFIED_MAX_STACK.with(|c| *c.borrow_mut() = Some(max_stack));
 }
 
 pub fn compile(
@@ -23933,6 +24015,8 @@ pub fn compile_with_param_slots(
     // production, so a non-empty key is still byte-identical there.
     method_key: &str,
 ) -> Option<CompiledMethod> {
+    let verified_max_stack = PENDING_VERIFIED_MAX_STACK.with(|c| c.borrow_mut().take());
+
     // Estimate buffer size: extra for invoke dispatch calls (~40 bytes each).
     // This is a heuristic only — see the `buf.overflowed()` bailout below for
     // the safety net. The multipliers are kept generous (and saturating to
@@ -23948,8 +24032,13 @@ pub fn compile_with_param_slots(
         .saturating_add(inline_extra);
     let buf = ExecutableBuffer::new(estimated_size.max(4096))?;
 
-    // Calculate max stack depth statically (simplified: use a generous upper bound)
-    let max_stack = estimate_max_stack(code, code_len);
+    // Size operand-stack spills from the reader/verifier max_stack when the
+    // production path supplies it. Keep the local estimator as a defensive floor
+    // for legacy tests and future synthetic call sites.
+    let estimated_max_stack = estimate_max_stack(code, code_len);
+    let max_stack = verified_max_stack
+        .map(|verified| verified.max(estimated_max_stack))
+        .unwrap_or(estimated_max_stack);
     // Bug-4 frame sizing, part B: the invoke-dispatch sites carve their
     // outgoing args buffer at the CURRENT spill watermark and extend it by
     // n*8 bytes for the call's duration. At worst (operand stack at
@@ -23980,7 +24069,9 @@ pub fn compile_with_param_slots(
         .values()
         .map(|s| s.callee_max_locals.saturating_add(s.callee_code_len))
         .sum();
-    let max_stack = max_stack + max_invoke_args + inline_stack_reserve;
+    let max_stack = max_stack
+        .saturating_add(max_invoke_args)
+        .saturating_add(inline_stack_reserve);
 
     // LICM: detect loops and find invariant aaload sequences to hoist
     let loops = detect_loops(code, code_len);
@@ -24763,7 +24854,7 @@ fn estimate_max_stack(code: &[u8], code_len: usize) -> usize {
         let op = code[pc];
         match op {
             // Push operations (aconst_null, load const/local/ref, bipush, sipush → +1)
-            0x01..=0x11 | 0x15..=0x19 | 0x1a..=0x2d => {
+            0x01..=0x14 | 0x15..=0x19 | 0x1a..=0x2d => {
                 depth += 1;
                 if depth > max_depth {
                     max_depth = depth;
@@ -24844,9 +24935,28 @@ fn estimate_max_stack(code: &[u8], code_len: usize) -> usize {
             0x57 => {
                 depth = depth.saturating_sub(1);
             }
+            // Pop2
+            0x58 => {
+                depth = depth.saturating_sub(2);
+            }
             // Dup: +1
             0x59 => {
                 depth += 1;
+                if depth > max_depth {
+                    max_depth = depth;
+                }
+            }
+            // dup_x1 / dup_x2 add one copy of the top operand.
+            0x5a | 0x5b => {
+                depth += 1;
+                if depth > max_depth {
+                    max_depth = depth;
+                }
+            }
+            // dup2* can add two category-1 slots; category-2 values are still
+            // one slot in this x64 operand-stack model.
+            0x5c..=0x5e => {
+                depth += 2;
                 if depth > max_depth {
                     max_depth = depth;
                 }
@@ -24858,6 +24968,13 @@ fn estimate_max_stack(code: &[u8], code_len: usize) -> usize {
             // goto: 0
             0xa7 => {
                 depth = 0;
+            }
+            // jsr pushes a returnAddress in legacy bytecode.
+            0xa8 => {
+                depth += 1;
+                if depth > max_depth {
+                    max_depth = depth;
+                }
             }
             // invokestatic/invokevirtual/invokespecial/invokeinterface: conservatively
             // assume they push 1 result (pops are hard to estimate without descriptors)
@@ -24880,7 +24997,11 @@ fn estimate_max_stack(code: &[u8], code_len: usize) -> usize {
         // (incl. switch pad/offset tables) as phantom opcodes; a phantom
         // return zeroed `depth` and could UNDER-estimate the frame's operand
         // stack (the CM-FASTMATH length-table desync family).
-        pc += bytecode_len_at(code, pc);
+        let len = bytecode_len_at(code, pc);
+        if len == 0 {
+            break;
+        }
+        pc += len;
     }
     // Add safety margin (conservative for invoke stack effects not tracked above)
     max_depth + 4
@@ -24908,6 +25029,70 @@ mod tests {
             stack_bang_frame_probe_disps(STACK_BANG_PAGE_SIZE * 2),
             Some(vec![-STACK_BANG_PAGE_SIZE, -(STACK_BANG_PAGE_SIZE * 2)])
         );
+    }
+
+    #[test]
+    fn estimate_max_stack_counts_ldc_family_and_dup_pushes() {
+        let ldc_code = [
+            0x12, 0x01, // ldc #1
+            0x13, 0x00, 0x02, // ldc_w #2
+            0x14, 0x00, 0x03, // ldc2_w #3
+            0xac, // ireturn
+            0x00, 0x00,
+        ];
+        assert!(
+            estimate_max_stack(&ldc_code, 9) >= 3,
+            "ldc/ldc_w/ldc2_w must contribute stack pushes"
+        );
+
+        let dup_code = [
+            0x03, // iconst_0
+            0x04, // iconst_1
+            0x5a, // dup_x1: depth 2 -> 3
+            0x5c, // dup2: conservative depth 3 -> 5
+            0xac, // ireturn
+            0x00, 0x00,
+        ];
+        assert!(
+            estimate_max_stack(&dup_code, 5) >= 5,
+            "dup_x*/dup2* must contribute stack pushes"
+        );
+    }
+
+    #[test]
+    fn push_stack_refuses_to_cross_spill_limit() {
+        let alloc_result = crate::regalloc::RegAllocResult {
+            assignments: Vec::new(),
+            xmm_assignments: Vec::new(),
+            used_callee_saved: Vec::new(),
+            used_xmm_regs: Vec::new(),
+            block_live_in: Vec::new(),
+        };
+        let mut compiler = Compiler::new(
+            "spill-limit-test".to_string(),
+            ExecutableBuffer::new(4096).expect("test executable buffer"),
+            0,
+            0,
+            1,
+            false,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            alloc_result,
+            test_helpers(),
+            0,
+        );
+
+        assert!(matches!(compiler.push_stack(), Some(StackSlot::Frame(_))));
+        assert_eq!(compiler.next_spill_offset, compiler.spill_limit_offset);
+
+        let cursor = compiler.next_spill_offset;
+        assert!(compiler.push_stack().is_none());
+        assert!(compiler.failed);
+        assert_eq!(compiler.next_spill_offset, cursor);
     }
 
     // ---- Test stub helpers for getfield/putfield ----

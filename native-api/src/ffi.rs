@@ -549,11 +549,14 @@ impl UpcallTable {
         slot.entry.as_ref()
     }
 
-    /// Return the current generation of `index`, or `None` if the index is out
-    /// of range. Lets a caller mint an [`UpcallHandle`] for a slot it already
-    /// holds (e.g. one returned by the legacy [`register`](Self::register)).
+    /// Return the current generation of live slot `index`, or `None` if the
+    /// index is out of range or the slot is currently vacant. Lets a caller
+    /// mint an [`UpcallHandle`] for a slot it already holds (e.g. one returned
+    /// by the legacy [`register`](Self::register)).
     pub fn generation_of(&self, index: usize) -> Option<u64> {
-        self.slots.get(index).map(|s| s.generation)
+        self.slots
+            .get(index)
+            .and_then(|s| s.entry.as_ref().map(|_| s.generation))
     }
 
     /// Remove an entry by slot index.
@@ -566,8 +569,8 @@ impl UpcallTable {
             slot.entry = None;
             // Bump the slot's generation so a stale handle for the just-removed
             // entry can never match again.
-            self.next_generation = self.next_generation.saturating_add(1);
             slot.generation = self.next_generation;
+            self.next_generation = self.next_generation.saturating_add(1);
         }
     }
 
@@ -1132,6 +1135,43 @@ mod tests {
         assert!(table.get_checked(h).is_some());
         let bad = UpcallHandle::new(slot, gen.wrapping_add(1));
         assert!(table.get_checked(bad).is_none());
+    }
+
+    #[test]
+    fn upcall_generation_of_removed_slot_fails_closed_after_reuse() {
+        let mut table = UpcallTable::new();
+        let handle = table.register_handle(UpcallEntry {
+            target: dummy_obj_ref(),
+            method_name: "first".to_string(),
+            method_descriptor: "()V".to_string(),
+            param_kinds: vec![],
+            return_kind: LAYOUT_INT,
+        });
+
+        table.remove(handle.slot);
+        assert!(
+            table.generation_of(handle.slot).is_none(),
+            "vacant slots must not expose a generation that can be reused"
+        );
+
+        let removed_generation = table.slots[handle.slot].generation;
+        let stale_after_remove = UpcallHandle::new(handle.slot, removed_generation);
+        assert!(table.get_checked(stale_after_remove).is_none());
+
+        let reused = table.register_handle(UpcallEntry {
+            target: dummy_obj_ref(),
+            method_name: "second".to_string(),
+            method_descriptor: "()V".to_string(),
+            param_kinds: vec![],
+            return_kind: LAYOUT_INT,
+        });
+        assert_eq!(reused.slot, handle.slot);
+        assert_ne!(
+            reused.generation, removed_generation,
+            "reused slots must receive a generation distinct from the vacant slot"
+        );
+        assert!(table.get_checked(stale_after_remove).is_none());
+        assert_eq!(table.get_checked(reused).unwrap().method_name, "second");
     }
 
     #[test]

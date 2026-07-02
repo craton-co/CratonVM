@@ -32,6 +32,18 @@ pub enum JvmtiError {
     WrongPhase,
     /// An internal error occurred.
     Internal,
+    /// A requested startup/attach agent library could not be loaded.
+    AgentLibraryLoadFailed { path: String, cause: String },
+    /// A loaded agent library did not export the required entry point.
+    AgentEntryPointMissing { path: String, symbol: String },
+    /// An agent entry point returned a non-zero error code.
+    AgentEntryPointFailed {
+        path: String,
+        symbol: String,
+        code: i32,
+    },
+    /// Agent options could not be passed to the native entry point.
+    InvalidAgentOptions { path: String, cause: String },
 }
 
 impl std::fmt::Display for JvmtiError {
@@ -43,6 +55,24 @@ impl std::fmt::Display for JvmtiError {
             JvmtiError::AccessDenied => write!(f, "JVMTI access denied"),
             JvmtiError::WrongPhase => write!(f, "wrong VM phase for JVMTI operation"),
             JvmtiError::Internal => write!(f, "internal JVMTI error"),
+            JvmtiError::AgentLibraryLoadFailed { path, cause } => {
+                write!(f, "failed to load JVMTI agent library `{path}`: {cause}")
+            }
+            JvmtiError::AgentEntryPointMissing { path, symbol } => {
+                write!(
+                    f,
+                    "JVMTI agent library `{path}` does not export `{symbol}`"
+                )
+            }
+            JvmtiError::AgentEntryPointFailed { path, symbol, code } => {
+                write!(
+                    f,
+                    "JVMTI agent `{path}` entry point `{symbol}` returned {code}"
+                )
+            }
+            JvmtiError::InvalidAgentOptions { path, cause } => {
+                write!(f, "invalid JVMTI options for `{path}`: {cause}")
+            }
         }
     }
 }
@@ -637,11 +667,13 @@ mod tests {
         // Create env, load agent, set capabilities, enable events, fire.
         let mut env = create_jvmti_env();
 
-        // Load an agent.
-        env.agent_registry
+        // Missing native agents fail closed and leave the registry unchanged.
+        let err = env
+            .agent_registry
             .load_agent("myagent.so", "debug=true")
-            .unwrap();
-        assert_eq!(env.agent_registry.agents().len(), 1);
+            .expect_err("missing native agent should fail closed");
+        assert!(matches!(err, JvmtiError::AgentLibraryLoadFailed { .. }));
+        assert!(env.agent_registry.agents().is_empty());
 
         // Request capabilities.
         let mut req = JvmtiCapabilities::default();

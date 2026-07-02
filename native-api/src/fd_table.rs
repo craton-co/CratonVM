@@ -20,6 +20,11 @@ use std::time::Duration;
 
 pub type FdId = u32;
 
+const PIPE_BUFFER_INITIAL_CAPACITY: usize = 8192;
+/// Hard cap for in-memory pipes. Writers get partial progress or WouldBlock
+/// instead of growing the VecDeque without bound.
+const PIPE_BUFFER_CAPACITY: usize = 64 * 1024;
+
 /// Connect to `addr`, trying IPv4 candidate addresses before IPv6.
 ///
 /// `std::net::TcpStream::connect(host:port)` resolves the host and tries each
@@ -58,9 +63,8 @@ fn connect_prefer_ipv4(addr: &str) -> io::Result<std::net::TcpStream> {
             Err(e) => last_err = Some(e),
         }
     }
-    Err(last_err.unwrap_or_else(|| {
-        io::Error::new(io::ErrorKind::Other, format!("connect failed: {addr}"))
-    }))
+    Err(last_err
+        .unwrap_or_else(|| io::Error::new(io::ErrorKind::Other, format!("connect failed: {addr}"))))
 }
 
 enum FileEntry {
@@ -210,7 +214,7 @@ mod socket2_raw {
         }
         let err = pfd.revents & (POLLERR | POLLHUP) != 0;
         let readable = pfd.revents & POLLIN != 0 || err;
-        let writable = pfd.revents & POLLOUT != 0;
+        let writable = pfd.revents & POLLOUT != 0 || err;
         (readable, writable)
     }
 
@@ -250,7 +254,7 @@ mod socket2_raw {
         }
         let err = pfd.revents & (POLLERR | POLLHUP) != 0;
         let readable = pfd.revents & POLLRDNORM != 0 || err;
-        let writable = pfd.revents & POLLWRNORM != 0;
+        let writable = pfd.revents & POLLWRNORM != 0 || err;
         (readable, writable)
     }
 }
@@ -971,7 +975,10 @@ impl FileDescriptorTable {
                     f.sync_all()
                 }
             }
-            _ => Err(io::Error::new(io::ErrorKind::NotFound, "bad fd for rw_sync")),
+            _ => Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "bad fd for rw_sync",
+            )),
         }
     }
 
@@ -1361,8 +1368,7 @@ impl FileDescriptorTable {
                 // observe a transient non-blocking window. The lock is
                 // still taken so the raw handle stays valid for the call.
                 let s = sock.lock();
-                let (readable, _) = poll_socket_readiness(&*s);
-                (readable, true) // UDP sockets are always writable
+                poll_socket_readiness(&*s)
             }
             FileEntry::TcpStream(stream) => {
                 // Non-destructive readiness probe — see the UdpSocket arm.
@@ -1372,8 +1378,7 @@ impl FileDescriptorTable {
                 // `WouldBlock` and also clobbered a deliberately
                 // non-blocking socket back to blocking.
                 let s = stream.lock();
-                let (readable, _) = poll_socket_readiness(&*s);
-                (readable, true) // TCP streams are generally writable
+                poll_socket_readiness(&*s)
             }
             FileEntry::TcpListener { listener, pending } => {
                 // A connection already stashed by a prior poll counts as
@@ -1396,7 +1401,10 @@ impl FileDescriptorTable {
                 let b = buf.lock();
                 (!b.is_empty(), false)
             }
-            FileEntry::PipeWrite(_) => (false, true),
+            FileEntry::PipeWrite(buf) => {
+                let b = buf.lock();
+                (false, b.len() < PIPE_BUFFER_CAPACITY)
+            }
             _ => (false, false),
         }
     }
@@ -1788,7 +1796,9 @@ impl FileDescriptorTable {
 
     /// Create an in-memory pipe. Returns (read_fd, write_fd).
     pub fn open_pipe(&self) -> (FdId, FdId) {
-        let buf = Arc::new(Mutex::new(VecDeque::with_capacity(8192)));
+        let buf = Arc::new(Mutex::new(VecDeque::with_capacity(
+            PIPE_BUFFER_INITIAL_CAPACITY,
+        )));
         let read_fd = self.alloc_fd_or_abort();
         let write_fd = self.alloc_fd_or_abort();
         let mut entries = self.entries.write();
@@ -1847,9 +1857,20 @@ impl FileDescriptorTable {
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "bad fd for pipe write"))?;
         match &*entry {
             FileEntry::PipeWrite(pipe) => {
+                if data.is_empty() {
+                    return Ok(0);
+                }
                 let mut p = pipe.lock();
-                p.extend(data);
-                Ok(data.len())
+                let available = PIPE_BUFFER_CAPACITY.saturating_sub(p.len());
+                if available == 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WouldBlock,
+                        "pipe buffer full",
+                    ));
+                }
+                let n = data.len().min(available);
+                p.extend(&data[..n]);
+                Ok(n)
             }
             _ => Err(io::Error::new(
                 io::ErrorKind::NotFound,
@@ -2274,6 +2295,31 @@ mod tests {
         assert_eq!(table.available(0).unwrap(), 0);
     }
 
+    #[test]
+    fn pipe_write_caps_buffer_and_reports_backpressure() {
+        let table = FileDescriptorTable::new();
+        let (read_fd, write_fd) = table.open_pipe();
+
+        let almost_full = vec![0x41; PIPE_BUFFER_CAPACITY - 1];
+        assert_eq!(
+            table.pipe_write(write_fd, &almost_full).unwrap(),
+            PIPE_BUFFER_CAPACITY - 1
+        );
+        assert_eq!(table.poll_ready(write_fd), (false, true));
+
+        assert_eq!(table.pipe_write(write_fd, b"xy").unwrap(), 1);
+        assert_eq!(table.poll_ready(write_fd), (false, false));
+
+        let err = table.pipe_write(write_fd, b"z").unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(table.pipe_write(write_fd, b"").unwrap(), 0);
+
+        let mut one = [0u8; 1];
+        assert_eq!(table.pipe_read(read_fd, &mut one).unwrap(), 1);
+        assert_eq!(table.poll_ready(write_fd), (false, true));
+        assert_eq!(table.pipe_write(write_fd, b"z").unwrap(), 1);
+    }
+
     // -----------------------------------------------------------------------
     // Multiple concurrent opens
     // -----------------------------------------------------------------------
@@ -2500,6 +2546,43 @@ mod tests {
         let client = std::net::TcpStream::connect(addr).unwrap();
         let (server, _) = listener.accept().unwrap();
         (client, listener, server)
+    }
+
+    #[test]
+    fn poll_ready_tcp_reports_os_read_write_bits() {
+        let (client, _listener, _server) = loopback_pair();
+        let table = FileDescriptorTable::new();
+        let fd = table.insert_tcp_stream(client);
+
+        let expected = {
+            let entry = table.get_entry(fd).unwrap();
+            match &*entry {
+                FileEntry::TcpStream(stream) => {
+                    let stream = stream.lock();
+                    poll_socket_readiness(&*stream)
+                }
+                _ => unreachable!(),
+            }
+        };
+        assert_eq!(table.poll_ready(fd), expected);
+    }
+
+    #[test]
+    fn poll_ready_udp_reports_os_read_write_bits() {
+        let table = FileDescriptorTable::new();
+        let fd = table.open_udp(Some("127.0.0.1:0")).unwrap();
+
+        let expected = {
+            let entry = table.get_entry(fd).unwrap();
+            match &*entry {
+                FileEntry::UdpSocket(sock) => {
+                    let sock = sock.lock();
+                    poll_socket_readiness(&*sock)
+                }
+                _ => unreachable!(),
+            }
+        };
+        assert_eq!(table.poll_ready(fd), expected);
     }
 
     /// Differentiates a non-blocking socket from a blocking one by

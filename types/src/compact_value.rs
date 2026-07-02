@@ -54,6 +54,11 @@ pub enum CompactValueError {
     /// The original slot is left unchanged so callers can choose to ignore,
     /// retry with a checked constructor, or fail upwards.
     PointerOutOfRange { ptr: u64 },
+
+    /// `update_object_ptr` was called with a pointer that fits in the 47-bit
+    /// payload but cannot be a VM heap object pointer by the same
+    /// context-free plausibility rules enforced by `CompactValue::object`.
+    InvalidObjectPointer { ptr: u64 },
 }
 
 impl fmt::Display for CompactValueError {
@@ -62,6 +67,10 @@ impl fmt::Display for CompactValueError {
             CompactValueError::PointerOutOfRange { ptr } => write!(
                 f,
                 "CompactValue: pointer {ptr:#x} exceeds 47-bit address space",
+            ),
+            CompactValueError::InvalidObjectPointer { ptr } => write!(
+                f,
+                "CompactValue: pointer {ptr:#x} is not a plausible heap object pointer",
             ),
         }
     }
@@ -171,7 +180,7 @@ const NULL_GUARD_PAGE: u64 = 0x1000; // 4 KiB
 /// as proof of a live object.
 #[inline(always)]
 fn object_payload_is_plausible(payload: u64) -> bool {
-    payload >= NULL_GUARD_PAGE && payload % 8 == 0
+    crate::plausible_heap_pointer(payload)
 }
 
 // Sub-tag values (3 bits)
@@ -454,8 +463,9 @@ impl CompactValue {
     /// addresses) and on AArch64 user-space the high bits are likewise zero.
     ///
     /// # Panics
-    /// Panics (in **both** debug and release builds) if `ptr` is zero or has
-    /// bits set outside the 47-bit payload range.  A pointer that does not fit
+    /// Panics (in **both** debug and release builds) if `ptr` is zero,
+    /// unaligned, below the null-guard page, or has bits set outside the
+    /// 47-bit payload range.  A pointer that does not fit
     /// would otherwise be silently truncated by `& PAYLOAD_MASK` into a bogus
     /// heap reference — an unrecoverable corruption — so an immediate panic is
     /// strictly better than producing a dangling object handle.  Callers that
@@ -475,7 +485,16 @@ impl CompactValue {
         if ptr & !PAYLOAD_MASK != 0 {
             Self::object_out_of_range(ptr);
         }
+        if !object_payload_is_plausible(ptr) {
+            Self::object_invalid_pointer(ptr);
+        }
         Self(make_tagged(SUB_OBJECT, ptr & PAYLOAD_MASK))
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn object_invalid_pointer(ptr: u64) -> ! {
+        panic!("CompactValue::object: pointer {ptr:#x} is not a plausible heap object pointer");
     }
 
     /// Cold out-of-line handler for an out-of-47-bit object pointer reaching
@@ -502,9 +521,9 @@ impl CompactValue {
         panic!("CompactValue::object: pointer {ptr:#x} exceeds 47-bit address space");
     }
 
-    /// Checked constructor: returns `Some(CompactValue)` if `ptr` fits in the
-    /// 47-bit payload, or `None` if it is null or has any bits set above bit
-    /// 46.
+    /// Checked constructor: returns `Some(CompactValue)` if `ptr` is a
+    /// plausible compact heap object pointer, or `None` if it is null,
+    /// unaligned, below the null-guard page, or has any bits set above bit 46.
     ///
     /// Safe counterpart to [`object`](Self::object) for callers that derive
     /// pointers from platform-supplied addresses (e.g. `mmap(MAP_FIXED)`,
@@ -512,10 +531,7 @@ impl CompactValue {
     /// not hold.
     #[inline]
     pub fn try_from_pointer(ptr: u64) -> Option<Self> {
-        if ptr == 0 {
-            return None;
-        }
-        if ptr & !PAYLOAD_MASK != 0 {
+        if !object_payload_is_plausible(ptr) {
             return None;
         }
         Some(Self(make_tagged(SUB_OBJECT, ptr)))
@@ -1142,8 +1158,10 @@ impl CompactValue {
     /// # Errors
     ///
     /// Returns [`CompactValueError::PointerOutOfRange`] if `new_ptr` has bits
-    /// set above bit 46 (i.e. it does not fit in the 47-bit NaN-box payload).
-    /// The slot is left unchanged in that case. Asymmetry note: the
+    /// set above bit 46 (i.e. it does not fit in the 47-bit NaN-box payload),
+    /// or [`CompactValueError::InvalidObjectPointer`] if it otherwise fails
+    /// the compact object pointer plausibility rules. The slot is left
+    /// unchanged in either case. Asymmetry note: the
     /// constructor [`object`](Self::object) refuses the same condition with a
     /// panic in both debug and release — historically `update_object_ptr`
     /// silently truncated in release, which would produce a corrupted
@@ -1163,16 +1181,19 @@ impl CompactValue {
         if new_ptr & !PAYLOAD_MASK != 0 {
             return Err(CompactValueError::PointerOutOfRange { ptr: new_ptr });
         }
+        if !object_payload_is_plausible(new_ptr) {
+            return Err(CompactValueError::InvalidObjectPointer { ptr: new_ptr });
+        }
         self.0 = make_tagged(SUB_OBJECT, new_ptr & PAYLOAD_MASK);
         Ok(())
     }
 
     /// Unchecked variant of [`update_object_ptr`].
     ///
-    /// Replaces the object-pointer payload without verifying that `new_ptr`
-    /// fits in the 47-bit address space. In debug builds an assertion still
-    /// catches an out-of-range pointer; in release the high bits are masked
-    /// off, which would corrupt the reference.
+    /// Replaces the object-pointer payload without release-mode verification.
+    /// In debug builds an assertion still catches a pointer that fails the
+    /// compact object pointer plausibility rules; in release the high bits are
+    /// masked off, which would corrupt the reference.
     ///
     /// # Safety
     ///
@@ -1182,7 +1203,8 @@ impl CompactValue {
     /// guarantee one of the following invariants for the result to be
     /// correct:
     ///
-    /// * `new_ptr & !PAYLOAD_MASK == 0` (the pointer fits in 47 bits), OR
+    /// * `object_payload_is_plausible(new_ptr)` (the pointer is encodable as a
+    ///   compact object pointer), OR
     /// * `self` is **not** an object slot (the call is a no-op).
     ///
     /// The canonical caller is the GC compaction scanner, where every
@@ -1192,8 +1214,8 @@ impl CompactValue {
     pub fn update_object_ptr_unchecked(&mut self, new_ptr: u64) {
         if self.is_object() {
             debug_assert!(
-                new_ptr & !PAYLOAD_MASK == 0,
-                "CompactValue::update_object_ptr_unchecked: pointer {:#x} exceeds 47-bit address space",
+                object_payload_is_plausible(new_ptr),
+                "CompactValue::update_object_ptr_unchecked: pointer {:#x} is not a plausible heap object pointer",
                 new_ptr
             );
             self.0 = make_tagged(SUB_OBJECT, new_ptr & PAYLOAD_MASK);
@@ -1900,6 +1922,18 @@ mod tests {
         let _ = CompactValue::object(ptr);
     }
 
+    #[test]
+    #[should_panic(expected = "not a plausible heap object pointer")]
+    fn object_pointer_unaligned_panics() {
+        let _ = CompactValue::object(0x1001);
+    }
+
+    #[test]
+    #[should_panic(expected = "not a plausible heap object pointer")]
+    fn object_pointer_null_page_panics() {
+        let _ = CompactValue::object(0x8);
+    }
+
     /// The checked constructor returns `None` instead of panicking for
     /// out-of-range pointers.
     #[test]
@@ -1911,6 +1945,17 @@ mod tests {
     #[test]
     fn try_from_pointer_rejects_null() {
         assert!(CompactValue::try_from_pointer(0).is_none());
+    }
+
+    #[test]
+    fn try_from_pointer_rejects_unaligned() {
+        assert!(CompactValue::try_from_pointer(0x1001).is_none());
+    }
+
+    #[test]
+    fn try_from_pointer_rejects_null_page() {
+        assert!(CompactValue::try_from_pointer(0x8).is_none());
+        assert!(CompactValue::try_from_pointer(0xff8).is_none());
     }
 
     #[test]
@@ -2210,6 +2255,19 @@ mod tests {
         }
         // Slot untouched on failure.
         assert_eq!(cv.as_object_ptr(), Some(original));
+    }
+
+    #[test]
+    fn update_object_ptr_rejects_implausible_pointer() {
+        let original = 0x0000_1234_5678_ABC0;
+        for bad in [0x1001u64, 0x8, 0xff8] {
+            let mut cv = CompactValue::object(original);
+            match cv.update_object_ptr(bad) {
+                Err(CompactValueError::InvalidObjectPointer { ptr }) => assert_eq!(ptr, bad),
+                other => panic!("expected InvalidObjectPointer, got {other:?}"),
+            }
+            assert_eq!(cv.as_object_ptr(), Some(original));
+        }
     }
 
     /// `update_object_ptr` round-trips an in-range pointer — the canonical

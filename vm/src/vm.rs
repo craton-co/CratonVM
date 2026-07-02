@@ -7596,7 +7596,10 @@ mod tests {
                     .get_class(cid)
                     .map(|c| c.name.to_string())
                     .unwrap_or_default();
-                assert_eq!(name, "java/lang/Integer", "expected Integer from Supplier::get");
+                assert_eq!(
+                    name, "java/lang/Integer",
+                    "expected Integer from Supplier::get"
+                );
             }
             other => panic!("expected an Integer object, got {:?}", other),
         }
@@ -61495,7 +61498,7 @@ mod tests {
         let monitors = crate::threading::monitor::MonitorTable::new();
         let mut roots: Vec<ObjectRef> = Vec::new();
         // Single-threaded test — no other mutator exists.
-        let stw = cratonvm_gc::collector::StopTheWorldToken::new();
+        let stw = unsafe { cratonvm_gc::collector::StopTheWorldToken::new() };
         for _ in 0..2000 {
             match heap.try_alloc_object(ClassId::new(0), 4) {
                 Some(_obj) => {} // ephemeral РІР‚вЂќ don't root
@@ -61556,7 +61559,7 @@ mod tests {
         let monitors = crate::threading::monitor::MonitorTable::new();
         let mut kept: Vec<ObjectRef> = Vec::new();
         // Single-threaded test — no other mutator exists.
-        let stw = cratonvm_gc::collector::StopTheWorldToken::new();
+        let stw = unsafe { cratonvm_gc::collector::StopTheWorldToken::new() };
         for i in 0..500 {
             let obj = match heap.try_alloc_object(ClassId::new(0), 2) {
                 Some(obj) => obj,

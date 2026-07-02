@@ -58,6 +58,39 @@ use crate::registry::{
 /// avoids any lifetime threading through the mock.
 type FieldKey = (usize, String);
 
+struct MockArray {
+    element_type: ArrayElementType,
+    values: Vec<Value>,
+}
+
+fn default_array_value(element_type: ArrayElementType) -> Value {
+    match element_type {
+        ArrayElementType::Boolean
+        | ArrayElementType::Byte
+        | ArrayElementType::Char
+        | ArrayElementType::Short
+        | ArrayElementType::Int => Value::Int(0),
+        ArrayElementType::Long => Value::Long(0),
+        ArrayElementType::Float => Value::Float(0.0),
+        ArrayElementType::Double => Value::Double(0.0),
+        ArrayElementType::Reference => Value::Object(None),
+    }
+}
+
+fn value_matches_array_type(element_type: ArrayElementType, value: Value) -> bool {
+    match element_type {
+        ArrayElementType::Boolean
+        | ArrayElementType::Byte
+        | ArrayElementType::Char
+        | ArrayElementType::Short
+        | ArrayElementType::Int => matches!(value, Value::Int(_)),
+        ArrayElementType::Long => matches!(value, Value::Long(_)),
+        ArrayElementType::Float => matches!(value, Value::Float(_)),
+        ArrayElementType::Double => matches!(value, Value::Double(_)),
+        ArrayElementType::Reference => matches!(value, Value::Object(_)),
+    }
+}
+
 /// Minimal NativeContext suitable for exercising trait default impls.
 ///
 /// Single-threaded test code only — the inner `UnsafeCell` is the same
@@ -66,6 +99,8 @@ type FieldKey = (usize, String);
 pub struct MockNativeContext {
     /// Field store keyed by `(object_pointer, slot_or_name)`.
     fields: UnsafeCell<HashMap<FieldKey, Value>>,
+    /// Tiny array backing store keyed by the synthetic object pointer.
+    arrays: UnsafeCell<HashMap<usize, MockArray>>,
     /// Per-object identity hash codes. Allocated on first call to
     /// [`identity_hash_code`] for each pointer.
     identity_hashes: UnsafeCell<HashMap<usize, i32>>,
@@ -97,6 +132,7 @@ impl MockNativeContext {
     pub fn new() -> Self {
         Self {
             fields: UnsafeCell::new(HashMap::new()),
+            arrays: UnsafeCell::new(HashMap::new()),
             identity_hashes: UnsafeCell::new(HashMap::new()),
             next_hash: AtomicI32::new(1),
             next_ptr: AtomicUsize::new(8),
@@ -131,6 +167,16 @@ impl MockNativeContext {
     fn fields_ref(&self) -> &HashMap<FieldKey, Value> {
         // SAFETY: single-threaded test code.
         unsafe { &*self.fields.get() }
+    }
+
+    fn arrays_mut(&self) -> &mut HashMap<usize, MockArray> {
+        // SAFETY: single-threaded test code, no aliased references escape.
+        unsafe { &mut *self.arrays.get() }
+    }
+
+    fn arrays_ref(&self) -> &HashMap<usize, MockArray> {
+        // SAFETY: single-threaded test code.
+        unsafe { &*self.arrays.get() }
     }
 }
 
@@ -223,29 +269,58 @@ impl NativeContext for MockNativeContext {
     }
 
     // --------------------------------------------------------------
-    // Arrays — stubs. Default-impl tests don't drive them, but the
-    // trait demands an implementation.
+    // Arrays - minimal backing store for trait default-impl tests.
     // --------------------------------------------------------------
 
-    fn new_array(&mut self, _et: ArrayElementType, _length: usize) -> ObjectRef {
-        self.fresh_object_ref()
+    fn new_array(&mut self, et: ArrayElementType, length: usize) -> ObjectRef {
+        let obj = self.fresh_object_ref();
+        let default = default_array_value(et);
+        self.arrays_mut().insert(
+            obj.as_ptr() as usize,
+            MockArray {
+                element_type: et,
+                values: vec![default; length],
+            },
+        );
+        obj
     }
-    fn new_ref_array(&mut self, _c: ClassId, _length: usize) -> ObjectRef {
-        self.fresh_object_ref()
+    fn new_ref_array(&mut self, _c: ClassId, length: usize) -> ObjectRef {
+        self.new_array(ArrayElementType::Reference, length)
     }
-    fn array_length(&self, _o: ObjectRef) -> usize {
-        0
+    fn array_length(&self, o: ObjectRef) -> usize {
+        self.arrays_ref()
+            .get(&(o.as_ptr() as usize))
+            .map_or(0, |arr| arr.values.len())
     }
-    fn get_array_element(&self, _o: ObjectRef, _i: usize) -> Value {
-        Value::Int(0)
+    fn get_array_element(&self, o: ObjectRef, i: usize) -> Value {
+        match self.arrays_ref().get(&(o.as_ptr() as usize)) {
+            Some(arr) => arr
+                .values
+                .get(i)
+                .copied()
+                .unwrap_or_else(|| default_array_value(arr.element_type)),
+            None => Value::Int(0),
+        }
     }
-    fn set_array_element(&self, _o: ObjectRef, _i: usize, _v: Value) {}
+    fn set_array_element(&self, o: ObjectRef, i: usize, v: Value) {
+        if let Some(arr) = self.arrays_mut().get_mut(&(o.as_ptr() as usize)) {
+            if i < arr.values.len() && value_matches_array_type(arr.element_type, v) {
+                arr.values[i] = v;
+            }
+        }
+    }
 
-    fn heap_kind_of(&self, _o: ObjectRef) -> ObjectKind {
-        ObjectKind::Object
+    fn heap_kind_of(&self, o: ObjectRef) -> ObjectKind {
+        if self.arrays_ref().contains_key(&(o.as_ptr() as usize)) {
+            ObjectKind::Array
+        } else {
+            ObjectKind::Object
+        }
     }
-    fn heap_element_type_of(&self, _o: ObjectRef) -> ArrayElementType {
-        ArrayElementType::Reference
+    fn heap_element_type_of(&self, o: ObjectRef) -> ArrayElementType {
+        self.arrays_ref()
+            .get(&(o.as_ptr() as usize))
+            .map_or(ArrayElementType::Reference, |arr| arr.element_type)
     }
 
     // --------------------------------------------------------------
@@ -628,5 +703,85 @@ mod tests {
             .expect("CAS loop should succeed against a fresh Int field");
         assert_eq!(prev, 10, "fetch_add should return the previous value");
         assert_eq!(ctx.get_field(obj, 0), Value::Int(15));
+    }
+
+    fn fill_int_array(ctx: &MockNativeContext, arr: ObjectRef, values: &[i32]) {
+        for (i, value) in values.iter().enumerate() {
+            ctx.set_array_element(arr, i, Value::Int(*value));
+        }
+    }
+
+    fn read_int_array(ctx: &MockNativeContext, arr: ObjectRef) -> Vec<i32> {
+        (0..ctx.array_length(arr))
+            .map(|i| match ctx.get_array_element(arr, i) {
+                Value::Int(value) => value,
+                other => panic!("expected Int array element, got {other:?}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn default_native_memory_copy_fails_closed() {
+        let mut ctx = MockNativeContext::new();
+        let src = [1u8, 2, 3, 4];
+        let mut out = [0xAAu8; 4];
+
+        assert!(!ctx.copy_from_native_memory(src.as_ptr() as i64, &mut out));
+        assert_eq!(out, [0xAA; 4], "failed read must not mutate output");
+
+        let mut dst = [0u8; 4];
+        assert!(!ctx.copy_to_native_memory(dst.as_mut_ptr() as i64, &[9, 8, 7, 6]));
+        assert_eq!(dst, [0; 4], "failed write must not touch destination");
+    }
+
+    #[test]
+    fn default_bulk_array_copy_copies_matching_primitive_arrays() {
+        let mut ctx = MockNativeContext::new();
+        let src = ctx.new_array(ArrayElementType::Int, 4);
+        let dst = ctx.new_array(ArrayElementType::Int, 4);
+        fill_int_array(&ctx, src, &[10, 20, 30, 40]);
+
+        assert!(ctx.bulk_array_copy(src, 1, dst, 0, 3));
+        assert_eq!(read_int_array(&ctx, dst), vec![20, 30, 40, 0]);
+    }
+
+    #[test]
+    fn default_bulk_array_copy_handles_same_array_overlap() {
+        let mut ctx = MockNativeContext::new();
+        let arr = ctx.new_array(ArrayElementType::Int, 5);
+        fill_int_array(&ctx, arr, &[1, 2, 3, 4, 5]);
+
+        assert!(ctx.bulk_array_copy(arr, 0, arr, 1, 4));
+        assert_eq!(read_int_array(&ctx, arr), vec![1, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn default_bulk_array_copy_rejects_length_and_offset_overflow() {
+        let mut ctx = MockNativeContext::new();
+        let src = ctx.new_array(ArrayElementType::Int, 3);
+        let dst = ctx.new_array(ArrayElementType::Int, 2);
+        fill_int_array(&ctx, src, &[1, 2, 3]);
+        fill_int_array(&ctx, dst, &[9, 9]);
+
+        assert!(!ctx.bulk_array_copy(src, 0, dst, 0, 3));
+        assert_eq!(read_int_array(&ctx, dst), vec![9, 9]);
+
+        assert!(!ctx.bulk_array_copy(src, usize::MAX, dst, 0, 1));
+        assert_eq!(read_int_array(&ctx, dst), vec![9, 9]);
+    }
+
+    #[test]
+    fn default_bulk_array_copy_rejects_type_mismatch_and_references() {
+        let mut ctx = MockNativeContext::new();
+        let bytes = ctx.new_array(ArrayElementType::Byte, 2);
+        let ints = ctx.new_array(ArrayElementType::Int, 2);
+        fill_int_array(&ctx, bytes, &[1, 2]);
+        fill_int_array(&ctx, ints, &[7, 7]);
+
+        assert!(!ctx.bulk_array_copy(bytes, 0, ints, 0, 2));
+        assert_eq!(read_int_array(&ctx, ints), vec![7, 7]);
+
+        let refs = ctx.new_ref_array(ClassId::new(0), 1);
+        assert!(!ctx.bulk_array_copy(refs, 0, refs, 0, 1));
     }
 }

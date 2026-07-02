@@ -3,6 +3,12 @@ name = "cratonvm-fuzz"
 version = "0.0.0"
 publish = false
 edition = "2021"
+rust-version = "1.80"
+authors = ["Craton Software Company"]
+license = "Apache-2.0"
+readme = "README.md"
+repository = "https://github.com/craton-co/cratonvm"
+homepage = "https://craton.com.ar"
 
 # The fuzz crate is intentionally *not* a workspace member and does NOT
 # inherit workspace lints. libFuzzer-driven `fuzz_target!` macros expand
@@ -51,7 +57,7 @@ test = false
 doc = false
 
 [[bin]]
-name = "read_class"
+name = "fuzz_read_class"
 path = "fuzz_targets/read_class.rs"
 test = false
 doc = false

@@ -98,6 +98,32 @@ fn take_invocation_event_callback(event_hash: i32) -> Option<u64> {
     invocation_event_callbacks().lock().remove(event_hash)
 }
 
+fn add_global_root_or_oom(
+    ctx: &mut dyn NativeContext,
+    obj: ObjectRef,
+    label: &str,
+) -> Result<usize, cratonvm_types::error::MethodCallFailed> {
+    let handle = ctx.add_global_root(obj);
+    if handle == 0 {
+        return Err(RuntimeError::OutOfMemoryError {
+            message: format!("failed to create global root for {label}"),
+        }
+        .into());
+    }
+    Ok(handle)
+}
+
+fn release_global_roots<I>(ctx: &mut dyn NativeContext, handles: I)
+where
+    I: IntoIterator<Item = usize>,
+{
+    for handle in handles {
+        if handle != 0 {
+            ctx.remove_global_root(handle);
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Peer → Java source ObjectRef side-table
 // ---------------------------------------------------------------------------
@@ -153,17 +179,12 @@ const MAX_PEER_SOURCES: usize = 10_000;
 
 #[derive(Clone, Copy)]
 struct PeerSourceEntry {
-    /// Raw object pointer captured at registration. Only valid to
-    /// resurrect while `gc_gen` still matches the live GC count.
-    ptr: usize,
+    /// Opaque handle returned by `NativeContext::add_global_root`.
+    root_handle: usize,
     /// Stable VM identity hash of the source component (GC-move
     /// independent). Retained as a consistency tag for the eventual
     /// hash→ObjectRef resolution path.
     java_hash: i32,
-    /// GC collection count observed when this entry was (re)registered.
-    /// A change means a moving collection may have relocated/freed the
-    /// object, so `ptr` must not be resurrected.
-    gc_gen: u64,
 }
 
 struct PeerSourceTable {
@@ -179,17 +200,23 @@ impl PeerSourceTable {
         }
     }
 
-    fn insert(&mut self, key: u64, entry: PeerSourceEntry) {
+    fn insert(&mut self, key: u64, entry: PeerSourceEntry) -> Vec<usize> {
+        let mut removed_roots = Vec::new();
         while self.map.len() >= MAX_PEER_SOURCES {
             if let Some(old) = self.order.pop_front() {
-                self.map.remove(&old);
+                if let Some(entry) = self.map.remove(&old) {
+                    removed_roots.push(entry.root_handle);
+                }
             } else {
                 break;
             }
         }
-        if self.map.insert(key, entry).is_none() {
+        if let Some(previous) = self.map.insert(key, entry) {
+            removed_roots.push(previous.root_handle);
+        } else {
             self.order.push_back(key);
         }
+        removed_roots
     }
 
     fn get(&self, key: u64) -> Option<PeerSourceEntry> {
@@ -206,15 +233,27 @@ fn peer_source_table() -> &'static Mutex<PeerSourceTable> {
 /// stable VM identity hash and `gc_gen` is the current GC collection count
 /// (both read from an active `NativeContext` by the caller). See the module
 /// comment for why the GC generation is captured.
-fn register_peer_source(peer_id: PeerId, source: ObjectRef, java_hash: i32, gc_gen: u64) {
-    peer_source_table().lock().insert(
+fn register_peer_source(
+    ctx: &mut dyn NativeContext,
+    peer_id: PeerId,
+    source: ObjectRef,
+    java_hash: i32,
+) {
+    let Ok(root_handle) = add_global_root_or_oom(ctx, source, "AWT peer source") else {
+        tracing::warn!(
+            peer_id = peer_id.0,
+            "AWT peer source not rooted; events for this peer may use a null source"
+        );
+        return;
+    };
+    let removed_roots = peer_source_table().lock().insert(
         peer_id.0,
         PeerSourceEntry {
-            ptr: source.as_ptr() as usize,
+            root_handle,
             java_hash,
-            gc_gen,
         },
     );
+    release_global_roots(ctx, removed_roots);
 }
 
 /// Resolve the Java source component for a peer, given the *current* GC
@@ -222,27 +261,24 @@ fn register_peer_source(peer_id: PeerId, source: ObjectRef, java_hash: i32, gc_g
 /// the pointer is null, or any GC has occurred since registration — in the
 /// last case the moving collector may have relocated or freed the object, so
 /// resurrecting the raw pointer would be a use-after-free.
-fn lookup_peer_source(peer_id: PeerId, current_gc_gen: u64) -> Option<ObjectRef> {
+fn lookup_peer_source_with<F>(peer_id: PeerId, resolve: F) -> Option<ObjectRef>
+where
+    F: FnOnce(usize) -> Option<ObjectRef>,
+{
     let entry = peer_source_table().lock().get(peer_id.0)?;
-    if entry.ptr == 0 {
+    if entry.root_handle == 0 {
         // Null is never a valid heap object — `ObjectRef::from_raw` requires
         // non-null (debug_assert) and the VM never represents `null` this way.
         return None;
     }
-    if entry.gc_gen != current_gc_gen {
-        // A collection ran since the source was registered. The cached pointer
-        // may be dangling (object freed) or relocated (moving collector) —
-        // refuse to resurrect it. See the precise invariant in the SAFETY note.
-        return None;
-    }
+    // A collection ran since the source was registered. The cached pointer
+    // may be dangling (object freed) or relocated (moving collector) —
+    // refuse to resurrect it. See the precise invariant in the SAFETY note.
     // Liveness sanity check consistent with `ObjectRef::from_raw`'s second
     // precondition: every CratonVM heap object is 8-byte aligned. A cached
     // pointer that is not 8-byte aligned cannot designate a real object, so a
     // bogus/corrupt entry that slipped past the GC-gen gate fails closed here
     // rather than constructing a malformed `ObjectRef`.
-    if entry.ptr & 0b111 != 0 {
-        return None;
-    }
     // SAFETY: `entry.ptr` is non-null and 8-byte aligned (both checked above),
     // satisfying `ObjectRef::from_raw`'s preconditions. The pointer still
     // designates the same live heap object because no collection has run since
@@ -261,7 +297,19 @@ fn lookup_peer_source(peer_id: PeerId, current_gc_gen: u64) -> Option<ObjectRef>
     // We only reconstruct the ref to hand it back to the VM as a
     // `Value::Object(Some(ref))` event source; we never mutate through it here.
     let _ = entry.java_hash; // retained for the future hash→ref resolution path
-    Some(unsafe { ObjectRef::from_raw(entry.ptr as *mut u8) })
+    resolve(entry.root_handle)
+}
+
+fn lookup_peer_source(ctx: &dyn NativeContext, peer_id: PeerId) -> Option<ObjectRef> {
+    let entry = peer_source_table().lock().get(peer_id.0)?;
+    if entry.root_handle == 0 {
+        return None;
+    }
+    let source = ctx.resolve_global_root(entry.root_handle)?;
+    if ctx.identity_hash_code(source) != entry.java_hash {
+        return None;
+    }
+    Some(source)
 }
 
 // ---------------------------------------------------------------------------
@@ -583,22 +631,17 @@ fn read_string(ctx: &dyn NativeContext, args: &[Value], idx: usize) -> Option<St
 /// Get or create peer for a Java component object.
 fn ensure_peer(ctx: &mut dyn NativeContext, obj: ObjectRef, ctype: ComponentType) -> PeerId {
     let hash = ctx.identity_hash_code(obj);
-    // Stamp the source registration with the current GC collection count so
-    // `lookup_peer_source` can fail closed if a (moving) collection runs
-    // before the event is synthesised. See the peer-source module comment.
-    let gc_gen = ctx.gc_collection_count();
-    let mut reg = peer::peer_registry().lock();
-    if let Some(id) = reg.peer_for_java(hash) {
-        // Keep the source entry fresh: re-register on every observation so a
-        // live component being repeatedly touched keeps a same-generation,
-        // valid pointer. Stale entries here would feed bad sources into
-        // `EventQueue.getNextEvent`.
-        register_peer_source(id, obj, hash, gc_gen);
-        return id;
-    }
-    let id = reg.create_peer(ctype);
-    reg.register_java_mapping(hash, id);
-    register_peer_source(id, obj, hash, gc_gen);
+    let id = {
+        let mut reg = peer::peer_registry().lock();
+        if let Some(id) = reg.peer_for_java(hash) {
+            id
+        } else {
+            let id = reg.create_peer(ctype);
+            reg.register_java_mapping(hash, id);
+            id
+        }
+    };
+    register_peer_source(ctx, id, obj, hash);
     id
 }
 
@@ -2045,11 +2088,10 @@ fn register_event_natives(registry: &mut NativeMethodRegistry) {
                 // collection can relocate/free the Runnable before dispatch.
                 // The dispatch site fails closed on a generation mismatch
                 // (see `take_runnable_checked`), mirroring `lookup_peer_source`.
-                edt::get_edt().invoke_later_runnable(
-                    runnable,
-                    PeerId(0),
-                    ctx.gc_collection_count(),
-                );
+                let root_handle = add_global_root_or_oom(ctx, runnable, "AWT Runnable")?;
+                let (_, removed_roots) =
+                    edt::get_edt().invoke_later_runnable(root_handle, PeerId(0));
+                release_global_roots(ctx, removed_roots);
             }
             void_ok()
         },
@@ -2067,16 +2109,21 @@ fn register_event_natives(registry: &mut NativeMethodRegistry) {
                 // into the JDK-spec'd `IllegalStateException` so the Java
                 // caller observes the documented behaviour instead.
                 //
-                // Stamp the current GC count so dispatch can fail closed if a
-                // moving collection runs before the Runnable is dispatched.
-                let gc_gen = ctx.gc_collection_count();
-                if let Err(InvokeAndWaitError::OnEdt) =
-                    edt::get_edt().invoke_and_wait_runnable(runnable, PeerId(0), gc_gen)
-                {
-                    return Err(RuntimeError::IllegalStateException {
-                        message: InvokeAndWaitError::OnEdt.jdk_message().to_string(),
+                let root_handle = add_global_root_or_oom(ctx, runnable, "AWT Runnable")?;
+                match edt::get_edt().invoke_and_wait_runnable(root_handle, PeerId(0)) {
+                    Ok((callback_id, removed_roots)) => {
+                        release_global_roots(ctx, removed_roots);
+                        if let Some(root_handle) = edt::get_edt().take_runnable_root(callback_id) {
+                            release_global_roots(ctx, [root_handle]);
+                        }
                     }
-                    .into());
+                    Err(InvokeAndWaitError::OnEdt) => {
+                        release_global_roots(ctx, [root_handle]);
+                        return Err(RuntimeError::IllegalStateException {
+                            message: InvokeAndWaitError::OnEdt.jdk_message().to_string(),
+                        }
+                        .into());
+                    }
                 }
             }
             void_ok()
@@ -2148,7 +2195,7 @@ fn register_event_natives(registry: &mut NativeMethodRegistry) {
             // Pass the current GC count so `lookup_peer_source` only resurrects
             // the cached source pointer if no (moving) collection has run since
             // it was registered (finding H8).
-            let source = lookup_peer_source(evt.source_peer_id, ctx.gc_collection_count());
+            let source = lookup_peer_source(ctx, evt.source_peer_id);
             if let Some(plan) = plan_event_synthesis(&evt, source) {
                 return materialise_event(ctx, &plan);
             }
@@ -2176,7 +2223,7 @@ fn register_event_natives(registry: &mut NativeMethodRegistry) {
                 // Swing's dispatch loop only consults `getNextEvent` anyway.
                 return null_ok();
             }
-            let source = lookup_peer_source(evt.source_peer_id, ctx.gc_collection_count());
+            let source = lookup_peer_source(ctx, evt.source_peer_id);
             if let Some(plan) = plan_event_synthesis(&evt, source) {
                 return materialise_event(ctx, &plan);
             }
@@ -2216,9 +2263,8 @@ fn register_event_natives(registry: &mut NativeMethodRegistry) {
             // a generation mismatch `take_runnable_checked` returns `None`, we
             // skip the `run()` call entirely, and only signal completion so a
             // blocked `invokeAndWait` waiter doesn't hang.
-            let runnable =
-                edt::get_edt().take_runnable_checked(callback_id, ctx.gc_collection_count());
-            if let Some(runnable) = runnable {
+            let root_handle = edt::get_edt().take_runnable_root(callback_id);
+            if let Some(root_handle) = root_handle {
                 // Run on whatever thread invoked us — by contract this is
                 // the EDT, since the EDT dispatch loop is what calls
                 // `dispatch()`.  We propagate failures out of the native so
@@ -2226,7 +2272,18 @@ fn register_event_natives(registry: &mut NativeMethodRegistry) {
                 // completion in BOTH the success and failure paths
                 // (otherwise an exception in `run()` would hang
                 // `invokeAndWait` forever).
-                let result = ctx.invoke_virtual(runnable, "run", "()V", &[]);
+                let result = match ctx.resolve_global_root(root_handle) {
+                    Some(runnable) => ctx.invoke_virtual(runnable, "run", "()V", &[]),
+                    None => {
+                        tracing::warn!(
+                            callback_id,
+                            root_handle,
+                            "InvocationEvent.dispatch: Runnable global root could not be resolved"
+                        );
+                        void_ok()
+                    }
+                };
+                release_global_roots(ctx, [root_handle]);
                 edt::get_edt().signal_invocation_complete(callback_id);
                 // Surface any exception thrown by Runnable.run() to the EDT.
                 result?;
@@ -2593,11 +2650,10 @@ fn register_swing_natives(registry: &mut NativeMethodRegistry) {
                 // then post. Stamp the current GC count so dispatch fails
                 // closed if a moving collection runs first (see
                 // `take_runnable_checked` / `lookup_peer_source`).
-                edt::get_edt().invoke_later_runnable(
-                    runnable,
-                    PeerId(0),
-                    ctx.gc_collection_count(),
-                );
+                let root_handle = add_global_root_or_oom(ctx, runnable, "Swing Runnable")?;
+                let (_, removed_roots) =
+                    edt::get_edt().invoke_later_runnable(root_handle, PeerId(0));
+                release_global_roots(ctx, removed_roots);
             }
             void_ok()
         },
@@ -2614,16 +2670,21 @@ fn register_swing_natives(registry: &mut NativeMethodRegistry) {
                 // the JDK exactly so existing exception filters keep
                 // working.
                 //
-                // Stamp the current GC count so dispatch can fail closed if a
-                // moving collection runs before the Runnable is dispatched.
-                let gc_gen = ctx.gc_collection_count();
-                if let Err(InvokeAndWaitError::OnEdt) =
-                    edt::get_edt().invoke_and_wait_runnable(runnable, PeerId(0), gc_gen)
-                {
-                    return Err(RuntimeError::IllegalStateException {
-                        message: InvokeAndWaitError::OnEdt.jdk_message().to_string(),
+                let root_handle = add_global_root_or_oom(ctx, runnable, "Swing Runnable")?;
+                match edt::get_edt().invoke_and_wait_runnable(root_handle, PeerId(0)) {
+                    Ok((callback_id, removed_roots)) => {
+                        release_global_roots(ctx, removed_roots);
+                        if let Some(root_handle) = edt::get_edt().take_runnable_root(callback_id) {
+                            release_global_roots(ctx, [root_handle]);
+                        }
                     }
-                    .into());
+                    Err(InvokeAndWaitError::OnEdt) => {
+                        release_global_roots(ctx, [root_handle]);
+                        return Err(RuntimeError::IllegalStateException {
+                            message: InvokeAndWaitError::OnEdt.jdk_message().to_string(),
+                        }
+                        .into());
+                    }
                 }
             }
             void_ok()
@@ -2741,6 +2802,24 @@ mod tests {
         plan.fields.iter().find(|(n, _)| *n == name).map(|(_, v)| v)
     }
 
+    fn register_peer_source_root_for_test(peer_id: PeerId, root_handle: usize, java_hash: i32) {
+        peer_source_table().lock().insert(
+            peer_id.0,
+            PeerSourceEntry {
+                root_handle,
+                java_hash,
+            },
+        );
+    }
+
+    fn lookup_peer_source_for_test(
+        peer_id: PeerId,
+        root_handle: usize,
+        source: ObjectRef,
+    ) -> Option<ObjectRef> {
+        lookup_peer_source_with(peer_id, |handle| (handle == root_handle).then_some(source))
+    }
+
     /// TASK #28: drive a synthetic MouseEvent end-to-end through a local
     /// EDT queue and the `getNextEvent` synthesis pipeline. Before this
     /// task `getNextEvent` returned null for every non-invocation event
@@ -2761,9 +2840,10 @@ mod tests {
         // peer-source table is process-wide but keyed by peer id, so a
         // unique peer id per test avoids cross-test interference.
         let source = fake_object_ref(7);
+        let root = 7_007;
         // gc_gen 0 on both register and lookup: no collection runs in-test,
         // so the same-generation gate (finding H8) permits the round-trip.
-        register_peer_source(PeerId(7), source, 7, 0);
+        register_peer_source_root_for_test(PeerId(7), root, 7);
 
         // Inject a synthetic MOUSE_PRESSED via a local EDT (the same
         // entry point the platform backends use after translating a
@@ -2786,8 +2866,11 @@ mod tests {
         assert_eq!(evt.id, event_id::MOUSE_PRESSED);
 
         // And this is what it would write into the Java MouseEvent object:
-        let plan = plan_event_synthesis(&evt, lookup_peer_source(evt.source_peer_id, 0))
-            .expect("MouseEvent must produce a plan");
+        let plan = plan_event_synthesis(
+            &evt,
+            lookup_peer_source_for_test(evt.source_peer_id, root, source),
+        )
+        .expect("MouseEvent must produce a plan");
         assert_eq!(plan.class_name, "java/awt/event/MouseEvent");
         assert_eq!(
             find_field(&plan, "id"),
@@ -2818,7 +2901,8 @@ mod tests {
     #[test]
     fn window_closing_event_returns_correct_window_event_class() {
         let source = fake_object_ref(3);
-        register_peer_source(PeerId(3), source, 3, 0);
+        let root = 3_003;
+        register_peer_source_root_for_test(PeerId(3), root, 3);
 
         let edt = crate::edt::EventDispatchThread::new();
         edt.post_event(AwtEvent::window(event_id::WINDOW_CLOSING, PeerId(3), 999));
@@ -2826,8 +2910,11 @@ mod tests {
         let evt = edt.poll_event().expect("window event must be present");
         assert_eq!(evt.id, event_id::WINDOW_CLOSING);
 
-        let plan = plan_event_synthesis(&evt, lookup_peer_source(evt.source_peer_id, 0))
-            .expect("WindowEvent must produce a plan");
+        let plan = plan_event_synthesis(
+            &evt,
+            lookup_peer_source_for_test(evt.source_peer_id, root, source),
+        )
+        .expect("WindowEvent must produce a plan");
         assert_eq!(plan.class_name, "java/awt/event/WindowEvent");
         assert_eq!(
             find_field(&plan, "id"),
@@ -2848,7 +2935,8 @@ mod tests {
     #[test]
     fn key_event_carries_keycode_keychar_and_modifiers() {
         let source = fake_object_ref(5);
-        register_peer_source(PeerId(5), source, 5, 0);
+        let root = 5_005;
+        register_peer_source_root_for_test(PeerId(5), root, 5);
 
         let evt = AwtEvent::key(
             event_id::KEY_PRESSED,
@@ -2858,8 +2946,11 @@ mod tests {
             'a',
             modifiers::SHIFT_DOWN_MASK,
         );
-        let plan = plan_event_synthesis(&evt, lookup_peer_source(evt.source_peer_id, 0))
-            .expect("KeyEvent must produce a plan");
+        let plan = plan_event_synthesis(
+            &evt,
+            lookup_peer_source_for_test(evt.source_peer_id, root, source),
+        )
+        .expect("KeyEvent must produce a plan");
         assert_eq!(plan.class_name, "java/awt/event/KeyEvent");
         assert_eq!(
             find_field(&plan, "keyCode"),
@@ -2893,18 +2984,24 @@ mod tests {
     /// would be a use-after-free. The same-generation entry round-trips;
     /// a later generation yields `None`.
     #[test]
-    fn peer_source_lookup_fails_closed_after_gc() {
+    fn peer_source_lookup_uses_global_root_handle() {
         let source = fake_object_ref(11);
-        // Registered at GC generation 5.
-        register_peer_source(PeerId(11), source, 11, 5);
-        // Same generation -> the pointer is provably still valid.
-        assert_eq!(lookup_peer_source(PeerId(11), 5), Some(source));
-        // A later generation means a (moving) collection ran -> refuse to
-        // resurrect the possibly-stale pointer.
-        assert_eq!(lookup_peer_source(PeerId(11), 6), None);
-        assert_eq!(lookup_peer_source(PeerId(11), u64::MAX), None);
+        let root = 11_011;
+        register_peer_source_root_for_test(PeerId(11), root, 11);
+        assert_eq!(
+            lookup_peer_source_for_test(PeerId(11), root, source),
+            Some(source)
+        );
+        assert_eq!(
+            lookup_peer_source_with(PeerId(11), |_| None),
+            None,
+            "unresolvable global-root handles fail closed"
+        );
         // Unknown peer -> None.
-        assert_eq!(lookup_peer_source(PeerId(9999), 5), None);
+        assert_eq!(
+            lookup_peer_source_for_test(PeerId(9999), root, source),
+            None
+        );
     }
 
     /// V3: `lookup_peer_source` must fail closed on a cached pointer that
@@ -2913,30 +3010,29 @@ mod tests {
     /// objects are 8-byte aligned), so the guard returns `None` rather than
     /// feeding a malformed pointer to `ObjectRef::from_raw`.
     #[test]
-    fn peer_source_lookup_rejects_misaligned_pointer() {
+    fn peer_source_lookup_rejects_zero_root_handle() {
         // Insert a misaligned entry directly (a real `ObjectRef` can't carry
         // a misaligned pointer, but a corrupt/forged side-table entry could).
         peer_source_table().lock().insert(
             424242,
             PeerSourceEntry {
-                ptr: 0x1001,
+                root_handle: 0,
                 java_hash: 7,
-                gc_gen: 9,
             },
         );
         // Matching generation, non-null — only the alignment guard stops it.
-        assert_eq!(lookup_peer_source(PeerId(424242), 9), None);
+        let source = fake_object_ref(42);
+        assert_eq!(lookup_peer_source_for_test(PeerId(424242), 0, source), None);
 
         // A null cached pointer also fails closed at the same generation.
         peer_source_table().lock().insert(
             424243,
             PeerSourceEntry {
-                ptr: 0,
+                root_handle: 0,
                 java_hash: 7,
-                gc_gen: 9,
             },
         );
-        assert_eq!(lookup_peer_source(PeerId(424243), 9), None);
+        assert_eq!(lookup_peer_source_for_test(PeerId(424243), 0, source), None);
     }
 
     /// Component / Focus / Action events are TODO and intentionally

@@ -140,8 +140,8 @@ pub struct Observation {
 }
 
 impl Observation {
-    /// An empty observation placeholder (used by stubs until the runner is
-    /// wired). Never produced by a real run.
+    /// An empty observation placeholder for tests and synthetic ledger rows.
+    /// Never produced by a real run.
     pub fn empty() -> Self {
         Self {
             stdout: String::new(),

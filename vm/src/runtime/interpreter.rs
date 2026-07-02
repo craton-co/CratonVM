@@ -172,7 +172,10 @@ pub fn weakref_null_referents_pre_gc(shared: &SharedVm) {
         return;
     }
     if dbg_weakref() {
-        eprintln!("[weakref] pre-gc null pass: {} weak/phantom referent(s)", pairs.len());
+        eprintln!(
+            "[weakref] pre-gc null pass: {} weak/phantom referent(s)",
+            pairs.len()
+        );
     }
     for (ref_obj_addr, _referent) in pairs {
         // The Reference object is live (or dead-but-not-yet-collected) at this
@@ -552,7 +555,7 @@ fn maybe_gc(shared: &SharedVm, thread: &mut JvmThread) {
             // "parked" (it doesn't exist). Construct the token directly.
             // HIB-CV-24: null Weak/Phantom referents before marking (restored post-GC).
             weakref_null_referents_pre_gc(shared);
-            let stw = cratonvm_gc::collector::StopTheWorldToken::new();
+            let stw = unsafe { cratonvm_gc::collector::StopTheWorldToken::new() };
             let result = shared
                 .heap
                 .collect_garbage(&stw, &mut roots, &shared.monitors);
@@ -710,7 +713,7 @@ fn maybe_gc(shared: &SharedVm, thread: &mut JvmThread) {
                 // been forcibly stopped in JIT and conservatively scanned.
                 // HIB-CV-24: null Weak/Phantom referents before marking (restored post-GC).
                 weakref_null_referents_pre_gc(shared);
-                let stw = cratonvm_gc::collector::StopTheWorldToken::new();
+                let stw = unsafe { cratonvm_gc::collector::StopTheWorldToken::new() };
                 let result = shared
                     .heap
                     .collect_garbage(&stw, &mut roots, &shared.monitors);
@@ -791,7 +794,7 @@ fn maybe_gc_forced(shared: &SharedVm, thread: &mut JvmThread) {
         // STW invariant: single-threaded fast path — see `maybe_gc`.
         // HIB-CV-24: null Weak/Phantom referents before marking (restored post-GC).
         weakref_null_referents_pre_gc(shared);
-        let stw = cratonvm_gc::collector::StopTheWorldToken::new();
+        let stw = unsafe { cratonvm_gc::collector::StopTheWorldToken::new() };
         let result = shared
             .heap
             .collect_garbage(&stw, &mut roots, &shared.monitors);
@@ -814,12 +817,12 @@ fn maybe_gc_forced(shared: &SharedVm, thread: &mut JvmThread) {
             let snapshot_roots = shared.thread_registry.collect_all_root_snapshots();
             roots.extend(snapshot_roots);
             roots.extend(xt_roots); // BUG-03 cross-thread JIT conservative roots
-            // STW invariant: `wait_for_all()` returned — every mutator
-            // has parked at its safepoint poll (or, BUG-03, been forcibly
-            // stopped in JIT and conservatively scanned).
-            // HIB-CV-24: null Weak/Phantom referents before marking (restored post-GC).
+                                    // STW invariant: `wait_for_all()` returned — every mutator
+                                    // has parked at its safepoint poll (or, BUG-03, been forcibly
+                                    // stopped in JIT and conservatively scanned).
+                                    // HIB-CV-24: null Weak/Phantom referents before marking (restored post-GC).
             weakref_null_referents_pre_gc(shared);
-            let stw = cratonvm_gc::collector::StopTheWorldToken::new();
+            let stw = unsafe { cratonvm_gc::collector::StopTheWorldToken::new() };
             let result = shared
                 .heap
                 .collect_garbage(&stw, &mut roots, &shared.monitors);
@@ -835,7 +838,7 @@ fn maybe_gc_forced(shared: &SharedVm, thread: &mut JvmThread) {
             shared.gc_barrier.complete_gc(result.pointer_map);
             shared.heap.clear_jit_tlab_skip_regions(); // BUG-03
             crate::jit::xt_root_scan::resume(taken); // BUG-03 resume frozen peers
-            // T19.3.G1 — count forced cycles (multi-threaded initiator).
+                                                     // T19.3.G1 — count forced cycles (multi-threaded initiator).
             shared
                 .gc_cycle_count
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -944,7 +947,7 @@ pub fn force_gc_from_native(shared: &SharedVm, thread: &mut JvmThread) {
         // STW invariant: single-threaded fast path — see `maybe_gc`.
         // HIB-CV-24: null Weak/Phantom referents before marking (restored post-GC).
         weakref_null_referents_pre_gc(shared);
-        let stw = cratonvm_gc::collector::StopTheWorldToken::new();
+        let stw = unsafe { cratonvm_gc::collector::StopTheWorldToken::new() };
         let (result, dead_finalizers) = shared.heap.collect_garbage_with_finalizers(
             &stw,
             &mut roots,
@@ -969,12 +972,12 @@ pub fn force_gc_from_native(shared: &SharedVm, thread: &mut JvmThread) {
             let snapshot_roots = shared.thread_registry.collect_all_root_snapshots();
             roots.extend(snapshot_roots);
             roots.extend(xt_roots); // BUG-03 cross-thread JIT conservative roots
-            // STW invariant: `wait_for_all()` returned — every mutator
-            // has parked at its safepoint poll (or, BUG-03, been forcibly
-            // stopped in JIT and conservatively scanned).
-            // HIB-CV-24: null Weak/Phantom referents before marking (restored post-GC).
+                                    // STW invariant: `wait_for_all()` returned — every mutator
+                                    // has parked at its safepoint poll (or, BUG-03, been forcibly
+                                    // stopped in JIT and conservatively scanned).
+                                    // HIB-CV-24: null Weak/Phantom referents before marking (restored post-GC).
             weakref_null_referents_pre_gc(shared);
-            let stw = cratonvm_gc::collector::StopTheWorldToken::new();
+            let stw = unsafe { cratonvm_gc::collector::StopTheWorldToken::new() };
             let (result, dead_finalizers) = shared.heap.collect_garbage_with_finalizers(
                 &stw,
                 &mut roots,
@@ -2231,10 +2234,16 @@ pub(crate) fn apply_pointer_map_to_thread(
 ) {
     // BUG-03 trace (gated): record that the safepoint-peer remap ran for main.
     if thread.thread_id.0 == 0 && std::env::var_os("CRATONVM_DBG_BUG03").is_some() {
-        let jto = thread.java_thread_obj.map(|o| o.as_ptr() as usize).unwrap_or(0);
+        let jto = thread
+            .java_thread_obj
+            .map(|o| o.as_ptr() as usize)
+            .unwrap_or(0);
         eprintln!(
             "[BUG03-fm] e{} path=peer(apply_pointer_map) tid0 jto=0x{:x} jto_in_map={} pm.len={}",
-            heap.collection_count(), jto, jto != 0 && pointer_map.contains_key(&jto), pointer_map.len()
+            heap.collection_count(),
+            jto,
+            jto != 0 && pointer_map.contains_key(&jto),
+            pointer_map.len()
         );
     }
     for frame in &mut thread.frames {
@@ -2546,31 +2555,29 @@ fn maybe_concurrent_gc(shared: &SharedVm, thread: &mut JvmThread) {
 fn g1_concurrent_mark_cycle(shared: &SharedVm, thread: &mut JvmThread) {
     // Phase 1: Initial Mark — brief STW pause
     // Activates SATB write barrier and marks root-reachable objects
-    let initial_mark_done = shared
-        .gc_barrier
-        .brief_stw_counted(
-            thread.thread_id,
-            || u32::try_from(shared.thread_registry.alive_count()).unwrap_or(u32::MAX),
-            || {
-                // Round-5 fix (CRIT — UAF): drain the initiator's per-thread
-                // SATB buffer on the way into initial-mark. Other mutators
-                // already flushed on their `safepoint_check` arrival; the
-                // initiator hasn't, and any buffered overwrites from before
-                // SATB activation must reach the global queue before the
-                // marker starts consuming it.
-                shared.heap.flush_thread_satb();
-                shared.heap.g1_start_concurrent_mark();
-                // Mark roots into the G1 mark bitmap
-                let roots = collect_roots(shared, thread);
-                let snapshot_roots = shared.thread_registry.collect_all_root_snapshots();
-                let all_roots: Vec<cratonvm_types::ObjectRef> = roots
-                    .into_iter()
-                    .chain(snapshot_roots.into_iter())
-                    .collect();
-                shared.heap.g1_mark_roots(&all_roots);
-                tracing::debug!("[G1] Initial mark: {} roots marked", all_roots.len());
-            },
-        );
+    let initial_mark_done = shared.gc_barrier.brief_stw_counted(
+        thread.thread_id,
+        || u32::try_from(shared.thread_registry.alive_count()).unwrap_or(u32::MAX),
+        || {
+            // Round-5 fix (CRIT — UAF): drain the initiator's per-thread
+            // SATB buffer on the way into initial-mark. Other mutators
+            // already flushed on their `safepoint_check` arrival; the
+            // initiator hasn't, and any buffered overwrites from before
+            // SATB activation must reach the global queue before the
+            // marker starts consuming it.
+            shared.heap.flush_thread_satb();
+            shared.heap.g1_start_concurrent_mark();
+            // Mark roots into the G1 mark bitmap
+            let roots = collect_roots(shared, thread);
+            let snapshot_roots = shared.thread_registry.collect_all_root_snapshots();
+            let all_roots: Vec<cratonvm_types::ObjectRef> = roots
+                .into_iter()
+                .chain(snapshot_roots.into_iter())
+                .collect();
+            shared.heap.g1_mark_roots(&all_roots);
+            tracing::debug!("[G1] Initial mark: {} roots marked", all_roots.len());
+        },
+    );
 
     if !initial_mark_done {
         return; // Another STW in progress
@@ -3781,7 +3788,11 @@ pub fn execute(
                                 && descriptor_ref == "()V"
                                 && !ctor_direct_call_off
                             {
-                                pending_ctor_sites.push((pc, target_class.to_string(), param_count));
+                                pending_ctor_sites.push((
+                                    pc,
+                                    target_class.to_string(),
+                                    param_count,
+                                ));
                                 continue;
                             }
                             let num_jit_args = if invoke_kind == 3 {
@@ -3839,10 +3850,19 @@ pub fn execute(
                         if dbg_ctor {
                             eprintln!(
                                 "[ctor-fix] {}.{}{} ctor site pc={} target={} elidable={}",
-                                &*class_name_str, method_name, method_descriptor, pc, tclass, elidable,
+                                &*class_name_str,
+                                method_name,
+                                method_descriptor,
+                                pc,
+                                tclass,
+                                elidable,
                             );
                         }
-                        let info_class: &str = if elidable { "java/lang/Object" } else { &tclass };
+                        let info_class: &str = if elidable {
+                            "java/lang/Object"
+                        } else {
+                            &tclass
+                        };
                         let class_box: Box<str> = info_class.to_string().into_boxed_str();
                         let method_box: Box<str> = "<init>".to_string().into_boxed_str();
                         let desc_box: Box<str> = "()V".to_string().into_boxed_str();
@@ -3987,8 +4007,11 @@ pub fn execute(
                                                     field.field_index,
                                                 )
                                             {
-                                                compact_field_info
-                                                    .push((pc_f, c_off as u32, c_ref));
+                                                compact_field_info.push((
+                                                    pc_f,
+                                                    c_off as u32,
+                                                    c_ref,
+                                                ));
                                             }
                                         }
                                     }
@@ -4522,30 +4545,35 @@ pub fn execute(
                                 // post-frame-push handler walker can catch it in the JIT'd
                                 // method, instead of re-running from entry (which double-
                                 // executes side effects preceding the trap).
-                                let arith_routed = if crate::jit::helpers::take_jit_pending_arithmetic() {
-                                    match crate::runtime::exceptions::throw_runtime_error(
-                                        shared,
-                                        thread,
-                                        RuntimeError::ArithmeticException {
-                                            message: "/ by zero".to_string(),
-                                        },
-                                    ) {
-                                        MethodCallFailed::ExceptionThrown(exc) => {
-                                            jit_early_exception = Some(exc);
-                                            true
+                                let arith_routed =
+                                    if crate::jit::helpers::take_jit_pending_arithmetic() {
+                                        match crate::runtime::exceptions::throw_runtime_error(
+                                            shared,
+                                            thread,
+                                            RuntimeError::ArithmeticException {
+                                                message: "/ by zero".to_string(),
+                                            },
+                                        ) {
+                                            MethodCallFailed::ExceptionThrown(exc) => {
+                                                jit_early_exception = Some(exc);
+                                                true
+                                            }
+                                            other => return Err(other),
                                         }
-                                        other => return Err(other),
-                                    }
-                                } else {
-                                    false
-                                };
+                                    } else {
+                                        false
+                                    };
                                 // Deopt sentinel: i64::MIN means the JIT method was deoptimized
                                 // via jit_uncommon_trap.  Fall through to the interpreter to
                                 // re-execute the method from scratch.
                                 // If an NPE or AIOOBE was routed above, also fall through so
                                 // the post-frame-push exception handler walker (~line 2340)
                                 // gets a chance to catch it in the JIT'd method.
-                                if !npe_routed && !aioobe_routed && !arith_routed && result != i64::MIN {
+                                if !npe_routed
+                                    && !aioobe_routed
+                                    && !arith_routed
+                                    && result != i64::MIN
+                                {
                                     return match ret_type {
                                         // Cast: JIT ABI -- i64 register convention
                                         b'I' | b'Z' | b'B' | b'C' | b'S' => {
@@ -8668,11 +8696,12 @@ fn build_deopt_frame_inner(
     // roots them. On any materialization failure (unsupported field / unknown
     // id) the pins are released and we fall back to re-run (`?` → `None`).
     use cratonvm_jit::deopt::FrameValue;
-    let has_virtual = rframe
-        .locals
-        .iter()
-        .chain(rframe.stack.iter())
-        .any(|v| matches!(v, FrameValue::VirtualObject(_) | FrameValue::VirtualObjectRef(_)));
+    let has_virtual = rframe.locals.iter().chain(rframe.stack.iter()).any(|v| {
+        matches!(
+            v,
+            FrameValue::VirtualObject(_) | FrameValue::VirtualObjectRef(_)
+        )
+    });
     if has_virtual && std::env::var_os("CRATONVM_DBG_SCALAR_DEOPT").is_some() {
         eprintln!(
             "[DBG_SCALAR_DEOPT] build_deopt_frame_inner: materializing virtual object(s) at bci={}",
@@ -8708,11 +8737,7 @@ fn build_deopt_frame_inner(
         }
         let mut copy = rframe.clone();
         crate::runtime::deopt_materialize::materialize_virtual_objects(
-            shared,
-            thread,
-            &mut copy,
-            /* stress_gc */ false,
-            /* keep_pins */ true,
+            shared, thread, &mut copy, /* stress_gc */ false, /* keep_pins */ true,
         )
         .ok()?;
         materialized_frame = copy;
@@ -8950,7 +8975,10 @@ fn transfer_osr_exit_into_live_frame(
     let trace = std::env::var_os("CRATONVM_DBG_DEOPT").is_some();
     let bail = |why: &str| -> Option<()> {
         if trace {
-            eprintln!("[cratonvm-deopt] OSR-exit transfer reject ({why}) at bci={}", rframe.bci);
+            eprintln!(
+                "[cratonvm-deopt] OSR-exit transfer reject ({why}) at bci={}",
+                rframe.bci
+            );
         }
         None
     };
@@ -8965,12 +8993,12 @@ fn transfer_osr_exit_into_live_frame(
     if !rframe.monitors.is_empty() {
         return bail("held monitors");
     }
-    if rframe
-        .locals
-        .iter()
-        .chain(rframe.stack.iter())
-        .any(|v| matches!(v, FrameValue::VirtualObject(_) | FrameValue::VirtualObjectRef(_)))
-    {
+    if rframe.locals.iter().chain(rframe.stack.iter()).any(|v| {
+        matches!(
+            v,
+            FrameValue::VirtualObject(_) | FrameValue::VirtualObjectRef(_)
+        )
+    }) {
         return bail("virtual-object slot");
     }
 
@@ -9382,8 +9410,16 @@ mod deopt_step3_tests {
         );
         // The cat-2 collapse kept the float at slot 2 and the int at slot 3 — had
         // the long's upper half NOT been dropped, these would shift by one.
-        assert_eq!(frame.get_local(2), Value::Float(2.5), "float at its own slot");
-        assert_eq!(frame.get_local(3), Value::Int(9), "int not shifted by collapse");
+        assert_eq!(
+            frame.get_local(2),
+            Value::Float(2.5),
+            "float at its own slot"
+        );
+        assert_eq!(
+            frame.get_local(3),
+            Value::Int(9),
+            "int not shifted by collapse"
+        );
         assert_eq!(frame.stack.len(), 1);
         assert_eq!(
             frame.stack.peek_at(0),
@@ -9579,8 +9615,14 @@ mod deopt_step3_tests {
             other => panic!("local 0 must be the materialized object, got {other:?}"),
         };
         // The lock is held at depth 2: two exits succeed, a third fails (not owned).
-        assert!(shared.monitors.exit(obj, thread.thread_id).is_ok(), "exit 1 (2->1)");
-        assert!(shared.monitors.exit(obj, thread.thread_id).is_ok(), "exit 2 (1->0)");
+        assert!(
+            shared.monitors.exit(obj, thread.thread_id).is_ok(),
+            "exit 1 (2->1)"
+        );
+        assert!(
+            shared.monitors.exit(obj, thread.thread_id).is_ok(),
+            "exit 2 (1->0)"
+        );
         assert!(
             shared.monitors.exit(obj, thread.thread_id).is_err(),
             "exit 3 must fail — monitor no longer held"
@@ -9615,21 +9657,22 @@ mod deopt_step3_tests {
         buf.emit(&[0xC3]); // ret
         let mut cm = cratonvm_jit::CompiledMethod::new(buf);
         cm.compilation_epoch = epoch;
-        cm.deopt_points.push(cratonvm_jit::deopt::DeoptimizationPoint {
-            native_offset: 0,
-            bci,
-            reason: cratonvm_jit::deopt::DeoptReason::BoundsCheck,
-            action: cratonvm_jit::deopt::DeoptAction::Reinterpret,
-            speculation_id: 0,
-            frame_state: cratonvm_jit::deopt::FrameState {
-                method_key: String::new(),
+        cm.deopt_points
+            .push(cratonvm_jit::deopt::DeoptimizationPoint {
+                native_offset: 0,
                 bci,
-                locals: Vec::new(),
-                stack: Vec::new(),
-                monitors: Vec::new(),
-                caller: None,
-            },
-        });
+                reason: cratonvm_jit::deopt::DeoptReason::BoundsCheck,
+                action: cratonvm_jit::deopt::DeoptAction::Reinterpret,
+                speculation_id: 0,
+                frame_state: cratonvm_jit::deopt::FrameState {
+                    method_key: String::new(),
+                    bci,
+                    locals: Vec::new(),
+                    stack: Vec::new(),
+                    monitors: Vec::new(),
+                    caller: None,
+                },
+            });
         cm
     }
 
@@ -9722,10 +9765,14 @@ mod deopt_step3_tests {
         for n in 1..=4u32 {
             let cm = cm_with_deopt_point(0, 5);
             let rf = rframe(vec![FrameValue::Int(1)], vec![], 5);
-            let _ = real_frame_deopt_resume_and_despeculate(&shared, &mut thread, &cm, &cached, &rf);
+            let _ =
+                real_frame_deopt_resume_and_despeculate(&shared, &mut thread, &cm, &cached, &rf);
             let despec_now = cratonvm_jit::deopt::despec_contains(key, 5);
             if n < 4 {
-                assert!(!despec_now, "must NOT de-spec before the per-bci limit (n={n})");
+                assert!(
+                    !despec_now,
+                    "must NOT de-spec before the per-bci limit (n={n})"
+                );
             } else {
                 assert!(despec_now, "must de-spec once the per-bci limit is reached");
             }
@@ -9774,7 +9821,7 @@ mod deopt_step3_tests {
         let bad = FrameValue::VirtualObject(VirtualObjectState {
             id: 0,
             class_id: 1,
-            num_fields: 2, // claims 2…
+            num_fields: 2,                          // claims 2…
             field_values: vec![FrameValue::Int(1)], // …but carries 1
         });
         let rf = rframe(vec![bad], vec![], 0);
@@ -9939,10 +9986,22 @@ mod deopt_step3_tests {
         assert_eq!(frame.pc, 3);
         // long: all 64 bits at slot 0 (raw word — local_kinds disambiguates
         // long-vs-double, which the NaN-boxed get_local cannot).
-        assert_eq!(frame.get_local_raw(0), 0x7_0000_0001, "long keeps all 64 bits");
+        assert_eq!(
+            frame.get_local_raw(0),
+            0x7_0000_0001,
+            "long keeps all 64 bits"
+        );
         // The cat-2 write did not shift the float (slot 2) or int (slot 3).
-        assert_eq!(frame.get_local(2), Value::Float(2.5), "float at its own slot");
-        assert_eq!(frame.get_local(3), Value::Int(9), "int not shifted by the cat-2 write");
+        assert_eq!(
+            frame.get_local(2),
+            Value::Float(2.5),
+            "float at its own slot"
+        );
+        assert_eq!(
+            frame.get_local(3),
+            Value::Int(9),
+            "int not shifted by the cat-2 write"
+        );
         assert_eq!(frame.stack.len(), 1);
         assert_eq!(frame.stack.peek_at(0), Value::Double(std::f64::consts::PI));
     }
@@ -9954,7 +10013,14 @@ mod deopt_step3_tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
         let cached = minimal_cached();
-        seed_live_frame(&shared, &mut thread, &cached, vec![FrameValue::Int(0)], vec![], 0);
+        seed_live_frame(
+            &shared,
+            &mut thread,
+            &cached,
+            vec![FrameValue::Int(0)],
+            vec![],
+            0,
+        );
 
         let advanced = rframe(
             vec![FrameValue::Int(1)],
@@ -9979,12 +10045,23 @@ mod deopt_step3_tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
         let cached = minimal_cached();
-        seed_live_frame(&shared, &mut thread, &cached, vec![FrameValue::Int(0)], vec![], 0);
+        seed_live_frame(
+            &shared,
+            &mut thread,
+            &cached,
+            vec![FrameValue::Int(0)],
+            vec![],
+            0,
+        );
 
         let obj = shared.heap.alloc_object(cratonvm_types::ClassId::new(7), 0);
         // Cast: object pointer to integer address.
         let addr = obj.as_ptr() as usize as u64;
-        let advanced = rframe(vec![FrameValue::Object(addr), FrameValue::Int(9)], vec![], 3);
+        let advanced = rframe(
+            vec![FrameValue::Object(addr), FrameValue::Int(9)],
+            vec![],
+            3,
+        );
         assert!(transfer_osr_exit_into_live_frame(&shared, &mut thread, 0, &advanced).is_some());
 
         // No Java allocation between in-stub capture and the in-place write, so the
@@ -10020,7 +10097,11 @@ mod deopt_step3_tests {
             5,
         );
 
-        let bad = rframe(vec![FrameValue::Int(99), FrameValue::Unsupported], vec![], 8);
+        let bad = rframe(
+            vec![FrameValue::Int(99), FrameValue::Unsupported],
+            vec![],
+            8,
+        );
         assert!(transfer_osr_exit_into_live_frame(&shared, &mut thread, 0, &bad).is_none());
 
         // Frame fully intact.
@@ -10040,7 +10121,14 @@ mod deopt_step3_tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
         let cached = minimal_cached();
-        seed_live_frame(&shared, &mut thread, &cached, vec![FrameValue::Int(1)], vec![], 0);
+        seed_live_frame(
+            &shared,
+            &mut thread,
+            &cached,
+            vec![FrameValue::Int(1)],
+            vec![],
+            0,
+        );
 
         let bad = rframe(vec![vobj(0, 5, vec![FrameValue::Int(1)])], vec![], 0);
         assert!(transfer_osr_exit_into_live_frame(&shared, &mut thread, 0, &bad).is_none());
@@ -10053,7 +10141,14 @@ mod deopt_step3_tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
         let cached = minimal_cached();
-        seed_live_frame(&shared, &mut thread, &cached, vec![FrameValue::Int(1)], vec![], 0);
+        seed_live_frame(
+            &shared,
+            &mut thread,
+            &cached,
+            vec![FrameValue::Int(1)],
+            vec![],
+            0,
+        );
 
         let mut inlined = rframe(vec![FrameValue::Int(2)], vec![], 0);
         inlined.caller_frames.push(rframe(vec![], vec![], 0));
@@ -11913,11 +12008,11 @@ fn execute_instruction(
             let referencing_class_id = thread.frames[frame_idx].class_id;
             let class_name = {
                 let cm = shared.class_manager.read();
-                let class = cm
-                    .get_class(referencing_class_id)
-                    .ok_or_else(|| VmError::Internal {
-                        message: "current class not found".to_string(),
-                    })?;
+                let class =
+                    cm.get_class(referencing_class_id)
+                        .ok_or_else(|| VmError::Internal {
+                            message: "current class not found".to_string(),
+                        })?;
                 class
                     .constant_pool
                     .get_class_name(*index)
@@ -11927,13 +12022,9 @@ fn execute_instruction(
                     .to_string()
             };
 
-            let target_class_id = resolve_class_loader_aware(
-                shared,
-                thread,
-                referencing_class_id,
-                &class_name,
-            )
-            .map_err(|e| convert_class_not_found(shared, thread, &class_name, e))?;
+            let target_class_id =
+                resolve_class_loader_aware(shared, thread, referencing_class_id, &class_name)
+                    .map_err(|e| convert_class_not_found(shared, thread, &class_name, e))?;
             ensure_class_initialized_shared(shared, thread, target_class_id)?;
 
             let num_fields = shared
@@ -12007,11 +12098,11 @@ fn execute_instruction(
             let referencing_class_id = thread.frames[frame_idx].class_id;
             let component_class_name = {
                 let cm = shared.class_manager.read();
-                let class = cm
-                    .get_class(referencing_class_id)
-                    .ok_or_else(|| VmError::Internal {
-                        message: "current class not found".to_string(),
-                    })?;
+                let class =
+                    cm.get_class(referencing_class_id)
+                        .ok_or_else(|| VmError::Internal {
+                            message: "current class not found".to_string(),
+                        })?;
                 class
                     .constant_pool
                     .get_class_name(*index)
@@ -12026,9 +12117,7 @@ fn execute_instruction(
                 referencing_class_id,
                 &component_class_name,
             )
-            .map_err(|e| {
-                convert_class_not_found(shared, thread, &component_class_name, e)
-            })?;
+            .map_err(|e| convert_class_not_found(shared, thread, &component_class_name, e))?;
             // Widening: index conversion
             let arr = gc_alloc_array(
                 shared,
@@ -12126,11 +12215,11 @@ fn execute_instruction(
             let referencing_class_id = thread.frames[frame_idx].class_id;
             let (leaf_et, total_array_depth, leaf_desc) = {
                 let cm = shared.class_manager.read();
-                let class = cm
-                    .get_class(referencing_class_id)
-                    .ok_or_else(|| VmError::Internal {
-                        message: "current class not found".to_string(),
-                    })?;
+                let class =
+                    cm.get_class(referencing_class_id)
+                        .ok_or_else(|| VmError::Internal {
+                            message: "current class not found".to_string(),
+                        })?;
                 let array_class_name =
                     class.constant_pool.get_class_name(*index).ok_or_else(|| {
                         VmError::Internal {
@@ -12187,8 +12276,14 @@ fn execute_instruction(
                 component_ids.push(cid);
             }
 
-            let arr =
-                alloc_multi_array(shared, &sizes, 0, leaf_et, total_array_depth, &component_ids)?;
+            let arr = alloc_multi_array(
+                shared,
+                &sizes,
+                0,
+                leaf_et,
+                total_array_depth,
+                &component_ids,
+            )?;
             thread.frames[frame_idx]
                 .stack
                 .push(Value::Object(Some(arr)))?;
@@ -12447,11 +12542,11 @@ fn execute_instruction(
                     let referencing_class_id = thread.frames[frame_idx].class_id;
                     let target_class_name = {
                         let cm = shared.class_manager.read();
-                        let class =
-                            cm.get_class(referencing_class_id)
-                                .ok_or_else(|| VmError::Internal {
-                                    message: "current class not found".to_string(),
-                                })?;
+                        let class = cm.get_class(referencing_class_id).ok_or_else(|| {
+                            VmError::Internal {
+                                message: "current class not found".to_string(),
+                            }
+                        })?;
                         class
                             .constant_pool
                             .get_class_name(*index)
@@ -12490,19 +12585,10 @@ fn execute_instruction(
                             referencing_class_id,
                             &target_class_name,
                         );
-                        obj_ref = thread
-                            .native_pin_roots
-                            .get(pin)
-                            .copied()
-                            .unwrap_or(obj_ref);
+                        obj_ref = thread.native_pin_roots.get(pin).copied().unwrap_or(obj_ref);
                         thread.native_pin_roots.truncate(pin);
                         let target_class_id = resolved.map_err(|e| {
-                            convert_class_not_found(
-                                shared,
-                                thread,
-                                &target_class_name,
-                                e,
-                            )
+                            convert_class_not_found(shared, thread, &target_class_name, e)
                         })?;
                         let obj_class_id = shared.heap.class_id_of(obj_ref);
                         shared
@@ -12595,9 +12681,7 @@ fn execute_instruction(
                         let obj_binary = obj_class_name.replace('/', ".");
                         let target_binary = target_class_name.replace('/', ".");
                         return Err(RuntimeError::ClassCastException {
-                            message: format!(
-                                "{obj_binary} cannot be cast to {target_binary}"
-                            ),
+                            message: format!("{obj_binary} cannot be cast to {target_binary}"),
                         }
                         .into());
                     }
@@ -12623,11 +12707,11 @@ fn execute_instruction(
                     let referencing_class_id = thread.frames[frame_idx].class_id;
                     let target_class_name = {
                         let cm = shared.class_manager.read();
-                        let class =
-                            cm.get_class(referencing_class_id)
-                                .ok_or_else(|| VmError::Internal {
-                                    message: "current class not found".to_string(),
-                                })?;
+                        let class = cm.get_class(referencing_class_id).ok_or_else(|| {
+                            VmError::Internal {
+                                message: "current class not found".to_string(),
+                            }
+                        })?;
                         class
                             .constant_pool
                             .get_class_name(*index)
@@ -12664,19 +12748,10 @@ fn execute_instruction(
                             referencing_class_id,
                             &target_class_name,
                         );
-                        obj_ref = thread
-                            .native_pin_roots
-                            .get(pin)
-                            .copied()
-                            .unwrap_or(obj_ref);
+                        obj_ref = thread.native_pin_roots.get(pin).copied().unwrap_or(obj_ref);
                         thread.native_pin_roots.truncate(pin);
                         let target_class_id = resolved.map_err(|e| {
-                            convert_class_not_found(
-                                shared,
-                                thread,
-                                &target_class_name,
-                                e,
-                            )
+                            convert_class_not_found(shared, thread, &target_class_name, e)
                         })?;
                         let obj_class_id = shared.heap.class_id_of(obj_ref);
                         if shared
@@ -13825,13 +13900,9 @@ fn execute_ldc(
                 );
             }
             let referencing_class_id = thread.frames[frame_idx].class_id;
-            let class_id = resolve_class_loader_aware(
-                shared,
-                thread,
-                referencing_class_id,
-                &class_name,
-            )
-            .map_err(|e| convert_class_not_found(shared, thread, &class_name, e))?;
+            let class_id =
+                resolve_class_loader_aware(shared, thread, referencing_class_id, &class_name)
+                    .map_err(|e| convert_class_not_found(shared, thread, &class_name, e))?;
             let mirror = get_or_create_class_mirror(shared, class_id);
             thread.frames[frame_idx]
                 .stack
@@ -14219,8 +14290,7 @@ fn resolve_class_loader_aware(
     match shared.load_class_concurrent(name) {
         Ok(id) => Ok(id),
         Err(e) => {
-            if let Some(id) =
-                drive_defining_loader_load(shared, thread, referencing_class_id, name)
+            if let Some(id) = drive_defining_loader_load(shared, thread, referencing_class_id, name)
             {
                 return Ok(id);
             }
@@ -14245,9 +14315,8 @@ fn drive_defining_loader_load(
     if name.starts_with('[') || is_global_resolution_namespace(name) {
         return None;
     }
-    let loader_obj = cratonvm_native_builtins::classloader::defining_loader_for(
-        referencing_class_id.as_u32(),
-    )?;
+    let loader_obj =
+        cratonvm_native_builtins::classloader::defining_loader_for(referencing_class_id.as_u32())?;
     // A per-thread in-flight guard breaks pathological re-entry for the same
     // (class, name) by degrading to global resolution.
     thread_local! {
@@ -14362,7 +14431,8 @@ fn resolve_field_ref(
         (class_name, field_name.to_string())
     };
 
-    let field_class_id = match lookup_loader_initiated(shared, current_class_id, &field_class_name) {
+    let field_class_id = match lookup_loader_initiated(shared, current_class_id, &field_class_name)
+    {
         Some(id) => id,
         None => shared.load_class_concurrent(&field_class_name)?,
     };
@@ -15439,9 +15509,15 @@ fn execute_invoke_kind(
                             // the operand-stack copy, the per-thread field, or the
                             // registry (the moving-GC concurrent-spawn reclamation).
                             if std::env::var_os("CRATONVM_DBG_BUG03").is_some() {
-                                let field = thread.java_thread_obj.map(|o| o.as_ptr() as usize).unwrap_or(0);
-                                let reg = shared.thread_registry.java_thread_obj(thread.thread_id)
-                                    .map(|o| o.as_ptr() as usize).unwrap_or(0);
+                                let field = thread
+                                    .java_thread_obj
+                                    .map(|o| o.as_ptr() as usize)
+                                    .unwrap_or(0);
+                                let reg = shared
+                                    .thread_registry
+                                    .java_thread_obj(thread.thread_id)
+                                    .map(|o| o.as_ptr() as usize)
+                                    .unwrap_or(0);
                                 eprintln!(
                                     "[BUG03] stale recv={:p} on tid={} method={}.{} | java_thread_obj-field=0x{:x} registry-mirror=0x{:x} (field==recv:{} reg==recv:{})",
                                     obj_ref.as_ptr(), thread.thread_id.0, &*method_class_name, &*method_name,
@@ -16169,40 +16245,42 @@ fn execute_invoke_kind(
     // frame-push path (NO extra recursion), unlike routing through the recursive
     // `invoke_on_class_shared`. Gated + divergence-only → byte-identical in the
     // default (gate-off) / single-class-per-name case.
-    let dispatch_override: Option<ClassId> = if !is_special
-        && crate::runtime::env_cache::loader_aware_resolution()
-    {
-        receiver_class_id.filter(|rcv_cid| {
-            *rcv_cid != ClassId::new(0) && {
-                let cm = shared.class_manager.read();
-                cm.get_loaded_class_id(&invoke_class) != Some(*rcv_cid)
-                    && cm
-                        .get_class(*rcv_cid)
-                        .map(|c| &*c.name == &*invoke_class)
-                        .unwrap_or(false)
-            }
-        })
-    } else if is_special && crate::runtime::env_cache::loader_aware_resolution() {
-        // invokespecial owner is the CP-resolved class NAME (`method_class_name`),
-        // which `get_loaded_class_id` collapses to ONE copy per name — the
-        // un-enhanced global one. A `super.<method>()` / `super.<init>()` /
-        // private call from inside a per-loader ENHANCED class must reach the
-        // SAME loader's copy of the owner: e.g. enhanced
-        // `Employee.$$_hibernate_read_oca` calls `super.$$_hibernate_read_oca()`
-        // on the enhanced (mapped-superclass) `Person`, whose accessor exists
-        // ONLY on that loader's copy — name resolution picks the un-enhanced
-        // `Person` (no such method → hard NoSuchMethodError → process abort).
-        // Resolve the owner through the CALLER's loader (JVMS §5.4.3 initiating
-        // loader) and override dispatch when it diverges from the name-resolved
-        // copy. Gated + divergence-only → byte-identical gate-off / single-copy.
-        lookup_loader_initiated(shared, current_class_id, &invoke_class).filter(|owner_cid| {
-            *owner_cid != ClassId::new(0)
-                && shared.class_manager.read().get_loaded_class_id(&invoke_class)
-                    != Some(*owner_cid)
-        })
-    } else {
-        None
-    };
+    let dispatch_override: Option<ClassId> =
+        if !is_special && crate::runtime::env_cache::loader_aware_resolution() {
+            receiver_class_id.filter(|rcv_cid| {
+                *rcv_cid != ClassId::new(0) && {
+                    let cm = shared.class_manager.read();
+                    cm.get_loaded_class_id(&invoke_class) != Some(*rcv_cid)
+                        && cm
+                            .get_class(*rcv_cid)
+                            .map(|c| &*c.name == &*invoke_class)
+                            .unwrap_or(false)
+                }
+            })
+        } else if is_special && crate::runtime::env_cache::loader_aware_resolution() {
+            // invokespecial owner is the CP-resolved class NAME (`method_class_name`),
+            // which `get_loaded_class_id` collapses to ONE copy per name — the
+            // un-enhanced global one. A `super.<method>()` / `super.<init>()` /
+            // private call from inside a per-loader ENHANCED class must reach the
+            // SAME loader's copy of the owner: e.g. enhanced
+            // `Employee.$$_hibernate_read_oca` calls `super.$$_hibernate_read_oca()`
+            // on the enhanced (mapped-superclass) `Person`, whose accessor exists
+            // ONLY on that loader's copy — name resolution picks the un-enhanced
+            // `Person` (no such method → hard NoSuchMethodError → process abort).
+            // Resolve the owner through the CALLER's loader (JVMS §5.4.3 initiating
+            // loader) and override dispatch when it diverges from the name-resolved
+            // copy. Gated + divergence-only → byte-identical gate-off / single-copy.
+            lookup_loader_initiated(shared, current_class_id, &invoke_class).filter(|owner_cid| {
+                *owner_cid != ClassId::new(0)
+                    && shared
+                        .class_manager
+                        .read()
+                        .get_loaded_class_id(&invoke_class)
+                        != Some(*owner_cid)
+            })
+        } else {
+            None
+        };
 
     // Try stackless frame push for bytecode methods (avoids Rust stack recursion)
     // For virtual/special calls, do NOT walk the native hierarchy — subclass
@@ -16533,11 +16611,7 @@ fn checkcast_lambda_instantiated_args(
 /// an array-vs-non-array shape we can't decide, or a non-class descriptor — so a
 /// genuine instance is never rejected. Only consults already-loaded classes (no
 /// class loading → no GC, no stale `obj_ref`).
-fn lambda_arg_provably_not_instance(
-    shared: &SharedVm,
-    obj_ref: ObjectRef,
-    desc_tok: &str,
-) -> bool {
+fn lambda_arg_provably_not_instance(shared: &SharedVm, obj_ref: ObjectRef, desc_tok: &str) -> bool {
     // Array instantiated type: decide via the array-assignability rules.
     if desc_tok.starts_with('[') {
         return match array_descriptor_of(shared, obj_ref) {
@@ -16561,7 +16635,9 @@ fn lambda_arg_provably_not_instance(
             Some(tcid) => (
                 tcid,
                 obj_class_id == tcid || cm.is_subclass_of(obj_class_id, tcid),
-                cm.get_class(tcid).map(|c| c.is_interface()).unwrap_or(false),
+                cm.get_class(tcid)
+                    .map(|c| c.is_interface())
+                    .unwrap_or(false),
             ),
         }
     };
@@ -17397,19 +17473,17 @@ pub(crate) fn try_lambda_dispatch(
             // invoke_virtual divergence override.
             let virtual_override = if crate::runtime::env_cache::loader_aware_resolution() {
                 recv_class_id_opt.filter(|rcv| {
-                    *rcv != ClassId::new(0)
-                        && !shared.lambda_proxies.read().contains_key(rcv)
-                        && {
-                            let cm = shared.class_manager.read();
-                            // Only when `receiver_class` truly names the receiver's
-                            // own real class (not the impl-handle fallback for a
-                            // lambda-proxy / generic-ClassId receiver) AND that name
-                            // globally resolves to a DIFFERENT (per-loader) copy.
-                            cm.get_class(*rcv)
-                                .map(|c| &*c.name == receiver_class.as_str())
-                                .unwrap_or(false)
-                                && cm.get_loaded_class_id(&receiver_class) != Some(*rcv)
-                        }
+                    *rcv != ClassId::new(0) && !shared.lambda_proxies.read().contains_key(rcv) && {
+                        let cm = shared.class_manager.read();
+                        // Only when `receiver_class` truly names the receiver's
+                        // own real class (not the impl-handle fallback for a
+                        // lambda-proxy / generic-ClassId receiver) AND that name
+                        // globally resolves to a DIFFERENT (per-loader) copy.
+                        cm.get_class(*rcv)
+                            .map(|c| &*c.name == receiver_class.as_str())
+                            .unwrap_or(false)
+                            && cm.get_loaded_class_id(&receiver_class) != Some(*rcv)
+                    }
                 })
             } else {
                 None
@@ -17777,22 +17851,34 @@ pub(crate) fn is_typeuse_annotation_native_override(
     match class_name {
         "java/lang/reflect/Method" => matches!(
             (method_name, descriptor),
-            ("getAnnotatedReturnType", "()Ljava/lang/reflect/AnnotatedType;")
-                | ("getAnnotatedParameterTypes", "()[Ljava/lang/reflect/AnnotatedType;")
+            (
+                "getAnnotatedReturnType",
+                "()Ljava/lang/reflect/AnnotatedType;"
+            ) | (
+                "getAnnotatedParameterTypes",
+                "()[Ljava/lang/reflect/AnnotatedType;"
+            )
         ),
         "java/lang/reflect/Constructor" => {
             (method_name, descriptor)
-                == ("getAnnotatedParameterTypes", "()[Ljava/lang/reflect/AnnotatedType;")
+                == (
+                    "getAnnotatedParameterTypes",
+                    "()[Ljava/lang/reflect/AnnotatedType;",
+                )
         }
         "java/lang/reflect/Parameter" | "java/lang/reflect/Field" => {
-            (method_name, descriptor)
-                == ("getAnnotatedType", "()Ljava/lang/reflect/AnnotatedType;")
+            (method_name, descriptor) == ("getAnnotatedType", "()Ljava/lang/reflect/AnnotatedType;")
         }
         "sun/reflect/annotation/AnnotatedTypeFactory$AnnotatedTypeBaseImpl" => matches!(
             (method_name, descriptor),
-            ("getAnnotation", "(Ljava/lang/Class;)Ljava/lang/annotation/Annotation;")
-                | ("getAnnotations", "()[Ljava/lang/annotation/Annotation;")
-                | ("getDeclaredAnnotations", "()[Ljava/lang/annotation/Annotation;")
+            (
+                "getAnnotation",
+                "(Ljava/lang/Class;)Ljava/lang/annotation/Annotation;"
+            ) | ("getAnnotations", "()[Ljava/lang/annotation/Annotation;")
+                | (
+                    "getDeclaredAnnotations",
+                    "()[Ljava/lang/annotation/Annotation;"
+                )
         ),
         _ => false,
     }
@@ -17836,8 +17922,7 @@ fn force_native_over_real_jdk_bytecode(
     // bundle and otherwise returns null → `appendPattern(null)` NPE ("pattern"),
     // breaking Spring's LocalDate/LocalDateTime style formatting & parsing.
     if class_name == "sun/util/locale/provider/LocaleResources"
-        && (method_name == "getDateTimePattern"
-            || method_name == "getJavaTimeDateTimePattern")
+        && (method_name == "getDateTimePattern" || method_name == "getJavaTimeDateTimePattern")
     {
         return true;
     }
@@ -18381,9 +18466,10 @@ fn intercept_urlclassloader_subclass_find_class(
     if native_shadow_suppressed_by_redefine(shared, "java/net/URLClassLoader") {
         return None;
     }
-    let cb = shared
-        .native_methods
-        .find("java/net/URLClassLoader", method_name, method_descriptor)?;
+    let cb =
+        shared
+            .native_methods
+            .find("java/net/URLClassLoader", method_name, method_descriptor)?;
     let ret_type = crate::jit::return_type(method_descriptor);
     Some((|| {
         let result = crate::vm::safe_native_call(shared, thread, cb, args)?;
@@ -20402,7 +20488,8 @@ fn compile_osr_artifact(
                     }
 
                     // Trivial constructor: defer for after-lock elidability resolution.
-                    if invoke_kind == 1 && mn == "<init>" && desc == "()V" && !ctor_direct_call_off {
+                    if invoke_kind == 1 && mn == "<init>" && desc == "()V" && !ctor_direct_call_off
+                    {
                         pending_ctor_sites.push((pc, target_class.to_string(), param_count));
                         continue;
                     }
@@ -20509,7 +20596,11 @@ fn compile_osr_artifact(
                         is_elidable_construction(&cm2, tid)
                     })
                     .unwrap_or(false);
-                let info_class: &str = if elidable { "java/lang/Object" } else { &tclass };
+                let info_class: &str = if elidable {
+                    "java/lang/Object"
+                } else {
+                    &tclass
+                };
                 let class_box: Box<str> = info_class.to_string().into_boxed_str();
                 let method_box: Box<str> = "<init>".to_string().into_boxed_str();
                 let desc_box: Box<str> = "()V".to_string().into_boxed_str();
@@ -20714,7 +20805,7 @@ fn compile_osr_artifact(
                 None, // string_layout — String intrinsics land in a later wave
                 &[],  // param_jvm_slots — legacy "arg index == slot" layout (OSR
                 // bails category-2 params elsewhere; unchanged behavior)
-                0,    // param_slot_span — legacy layout
+                0, // param_slot_span — legacy layout
                 param_oop_mask,
                 compact_field_info,
                 "", // method_key — OSR path disables the per-bci de-spec consult
@@ -21307,11 +21398,7 @@ fn jit_method_calls_native_shadowed(
 /// `field_resolver` precedent (resolve-with-load BEFORE taking the inner `cm`
 /// read), so no VM read lock is alive across the load. MUST NOT be called with
 /// a `class_manager` lock already held.
-fn resolve_jit_elidable_init_loading(
-    shared: &SharedVm,
-    holder_cid: ClassId,
-    cp_idx: u16,
-) -> bool {
+fn resolve_jit_elidable_init_loading(shared: &SharedVm, holder_cid: ClassId, cp_idx: u16) -> bool {
     // 1. Extract the target class name + confirm a no-arg `<init>()V` ref
     //    (brief `cm` read, dropped before the load).
     let target_name = {
@@ -21351,7 +21438,11 @@ fn resolve_jit_elidable_init_loading(
             "[ctor-fix] elidable-resolver: {} elidable=true find_class_by_name={}{}",
             target_name,
             via_find,
-            if via_find { "" } else { "  <- APP-CLASS GAP CLOSED" },
+            if via_find {
+                ""
+            } else {
+                "  <- APP-CLASS GAP CLOSED"
+            },
         );
     }
     elidable
@@ -21569,7 +21660,15 @@ fn try_jit_upgrade_with_gate(
         };
         let (_, descriptor) = class.constant_pool.get_name_and_type(nat_idx)?;
         let type_tag = *descriptor.as_bytes().first()?;
-        Some({ let (c_off, c_ref) = cratonvm_types::compact_field_slot(field.declaring_class_id.as_u32(), field.field_index).map(|(o, r)| (o as u32, r)).unwrap_or((0, false)); (field.field_index, type_tag, c_off, c_ref) })
+        Some({
+            let (c_off, c_ref) = cratonvm_types::compact_field_slot(
+                field.declaring_class_id.as_u32(),
+                field.field_index,
+            )
+            .map(|(o, r)| (o as u32, r))
+            .unwrap_or((0, false));
+            (field.field_index, type_tag, c_off, c_ref)
+        })
     };
     let static_field_resolver = |cp_idx: u16| -> Option<(u32, usize, u8, bool)> {
         let field = resolve_field_ref(shared, class_id, cp_idx).ok()?;
@@ -21688,380 +21787,388 @@ fn try_jit_upgrade_with_gate(
 
     // Callee compiler: given (class_name, method_name, descriptor), try to JIT-compile
     // the callee and return (entry_ptr, needs_context). Used for cross-method direct calls.
-    let callee_compiler =
-        |callee_class: &str, callee_method: &str, callee_desc: &str| -> Option<(usize, bool)> {
-            // RFJP.1 — never JIT a callee on a class transitively extending
-            // `java/util/concurrent/ForkJoinTask`; matches `try_jit_compile_callee`.
-            if is_fjp_subclass_blocklisted(shared, callee_class) {
-                return None;
-            }
-            // S111r15 — refuse to compile a callee that has a Rust native
-            // shadow. Mirrors the gate in `try_jit_compile_callee` /
-            // `try_jit_upgrade_with_gate` / first-call JIT / OSR. Without
-            // this check, the recursive callee-compile path direct-called
-            // `Character.toLowerCase(C)C`'s JDK bytecode (which delegates
-            // to `(I)I` → `CharacterData.of/toLowerCase` virtual chain),
-            // and the resulting machine code returned 0 for most inputs
-            // after warm-up. Result: Spring's
-            // `BeanPropertyName.toDashedForm` produced
-            // `r\0\0\0\0\0\0\0-\0\0\0\0\0\0` for `bannerMode`, tripping
-            // `InvalidConfigurationPropertyNameException` in SportMe.
-            if shared
-                .native_methods
-                .find(callee_class, callee_method, callee_desc)
-                .is_some()
-            {
-                return None;
-            }
-            // BUG-H: refuse a *direct* JIT→JIT call into a callee that declares
-            // a non-empty exception table. The direct machine-code `CALL`
-            // bypasses the interpreter↔JIT boundary, so an implicit runtime
-            // exception (AIOOBE/NPE) the callee should catch locally escapes its
-            // own `catch` and is mis-routed through the caller's table
-            // (`TestHexUtils`/`HexUtils.getDec`: `T[i-'0']` in `catch (AIOOBE)`).
-            // Returning None here drops the site to the dispatch helper
-            // (`jit_invoke_dispatch`), which re-executes such a throwing callee
-            // in the interpreter so the exception routes through the callee's
-            // own exception table. Callees without a table keep the fast direct
-            // call (no perf change on the bench/gauntlet hot paths).
-            {
-                let cm = shared.class_manager.read();
-                if let Some(callee_cid) = cm.find_class_by_name(callee_class) {
-                    let store = cm.class_store();
-                    if let Some((method, _decl)) = crate::classloading::find_method_recursive(
-                        callee_cid,
-                        callee_method,
-                        callee_desc,
-                        store,
-                    ) {
-                        if method
-                            .code()
-                            .map_or(false, |c| !c.exception_table.is_empty())
-                        {
-                            return None;
-                        }
+    let callee_compiler = |callee_class: &str,
+                           callee_method: &str,
+                           callee_desc: &str|
+     -> Option<(usize, bool)> {
+        // RFJP.1 — never JIT a callee on a class transitively extending
+        // `java/util/concurrent/ForkJoinTask`; matches `try_jit_compile_callee`.
+        if is_fjp_subclass_blocklisted(shared, callee_class) {
+            return None;
+        }
+        // S111r15 — refuse to compile a callee that has a Rust native
+        // shadow. Mirrors the gate in `try_jit_compile_callee` /
+        // `try_jit_upgrade_with_gate` / first-call JIT / OSR. Without
+        // this check, the recursive callee-compile path direct-called
+        // `Character.toLowerCase(C)C`'s JDK bytecode (which delegates
+        // to `(I)I` → `CharacterData.of/toLowerCase` virtual chain),
+        // and the resulting machine code returned 0 for most inputs
+        // after warm-up. Result: Spring's
+        // `BeanPropertyName.toDashedForm` produced
+        // `r\0\0\0\0\0\0\0-\0\0\0\0\0\0` for `bannerMode`, tripping
+        // `InvalidConfigurationPropertyNameException` in SportMe.
+        if shared
+            .native_methods
+            .find(callee_class, callee_method, callee_desc)
+            .is_some()
+        {
+            return None;
+        }
+        // BUG-H: refuse a *direct* JIT→JIT call into a callee that declares
+        // a non-empty exception table. The direct machine-code `CALL`
+        // bypasses the interpreter↔JIT boundary, so an implicit runtime
+        // exception (AIOOBE/NPE) the callee should catch locally escapes its
+        // own `catch` and is mis-routed through the caller's table
+        // (`TestHexUtils`/`HexUtils.getDec`: `T[i-'0']` in `catch (AIOOBE)`).
+        // Returning None here drops the site to the dispatch helper
+        // (`jit_invoke_dispatch`), which re-executes such a throwing callee
+        // in the interpreter so the exception routes through the callee's
+        // own exception table. Callees without a table keep the fast direct
+        // call (no perf change on the bench/gauntlet hot paths).
+        {
+            let cm = shared.class_manager.read();
+            if let Some(callee_cid) = cm.find_class_by_name(callee_class) {
+                let store = cm.class_store();
+                if let Some((method, _decl)) = crate::classloading::find_method_recursive(
+                    callee_cid,
+                    callee_method,
+                    callee_desc,
+                    store,
+                ) {
+                    if method
+                        .code()
+                        .map_or(false, |c| !c.exception_table.is_empty())
+                    {
+                        return None;
                     }
                 }
             }
-            // Check JIT cache first
-            let callee_class_arc: Arc<str> = Arc::from(callee_class);
-            let callee_method_arc: Arc<str> = Arc::from(callee_method);
-            let callee_desc_arc: Arc<str> = Arc::from(callee_desc);
+        }
+        // Check JIT cache first
+        let callee_class_arc: Arc<str> = Arc::from(callee_class);
+        let callee_method_arc: Arc<str> = Arc::from(callee_method);
+        let callee_desc_arc: Arc<str> = Arc::from(callee_desc);
+        {
+            let jit_cache = shared.jit_cache.read();
+            if let Some(compiled) =
+                jit_cache.get(&callee_class_arc, &callee_method_arc, &callee_desc_arc)
             {
-                let jit_cache = shared.jit_cache.read();
-                if let Some(compiled) =
-                    jit_cache.get(&callee_class_arc, &callee_method_arc, &callee_desc_arc)
-                {
-                    // Cast: object/code pointer to integer address
-                    return Some((compiled.entry_ptr() as usize, compiled.needs_context()));
-                    // Cast: JIT entry point to address
-                }
+                // Cast: object/code pointer to integer address
+                return Some((compiled.entry_ptr() as usize, compiled.needs_context()));
+                // Cast: JIT entry point to address
             }
+        }
 
-            // Look up the callee class and method
-            let cm = shared.class_manager.read();
-            let callee_class_id = cm.find_class_by_name(callee_class)?;
-            let store = cm.class_store();
-            let (method, declaring_id) = crate::classloading::find_method_recursive(
-                callee_class_id,
+        // Look up the callee class and method
+        let cm = shared.class_manager.read();
+        let callee_class_id = cm.find_class_by_name(callee_class)?;
+        let store = cm.class_store();
+        let (method, declaring_id) = crate::classloading::find_method_recursive(
+            callee_class_id,
+            callee_method,
+            callee_desc,
+            store,
+        )?;
+        let code_attr = method.code()?;
+        let declaring_class_name = store.get(declaring_id).map(|c| &*c.name)?;
+        let source_file = store
+            .get(declaring_id)
+            .and_then(|c| c.source_file.as_deref())
+            .map(Arc::from);
+        let num_params = count_method_params(callee_desc);
+
+        let callee_cached = CachedBytecodeMethod {
+            declaring_class_id: declaring_id,
+            class_name: Arc::from(declaring_class_name),
+            method_name: Arc::from(callee_method),
+            method_descriptor: Arc::from(callee_desc),
+            source_file,
+            code: crate::runtime::frame::padded_bytecode(&code_attr.code),
+            exception_table: Arc::from(code_attr.exception_table.as_slice()),
+            max_stack: code_attr.max_stack,
+            max_locals: code_attr.max_locals,
+            num_params: num_params as u16, // Widening: parameter count conversion
+            is_synchronized: method.is_synchronized(),
+            is_static: method.is_static(),
+        };
+        drop(cm);
+
+        // S-HIB.1 twin — apply the static skip list to recursive callee
+        // compilations from THIS closure too. Before this check, the
+        // closure honored only the FJP blocklist + native-shadow gate, so
+        // a threshold compile could silently callee-compile methods every
+        // other path bans: complex `<init>`/`<clinit>` bodies (observed:
+        // `java/util/regex/Pattern.<init>` attempted during the
+        // `Pattern.compile` upgrade), `is_known_miscompile` entries, and
+        // anything in `CRATONVM_JIT_BISECT_SKIP` — which also made
+        // skip-based bisection silently unsound for any method reachable
+        // as a direct callee. Mirrors `try_jit_compile_callee`.
+        {
+            let policy = if shared.config.jit_aggressive_compilation {
+                crate::jit::skip_list::SkipPolicy::Aggressive
+            } else {
+                crate::jit::skip_list::SkipPolicy::Conservative
+            };
+            let init_complexity = if callee_method == "<init>" || callee_method == "<clinit>" {
+                crate::jit::skip_list::classify_init_complexity(&callee_cached.code)
+            } else {
+                crate::jit::skip_list::InitComplexity::Unknown
+            };
+            let is_iface_default = {
+                let cm2 = shared.class_manager.read();
+                cm2.get_class(callee_cached.declaring_class_id)
+                    .map_or(false, |c| c.is_interface())
+            };
+            if crate::jit::skip_list::should_skip_jit_with_init(
+                &callee_cached.class_name,
                 callee_method,
-                callee_desc,
-                store,
-            )?;
-            let code_attr = method.code()?;
-            let declaring_class_name = store.get(declaring_id).map(|c| &*c.name)?;
-            let source_file = store
-                .get(declaring_id)
-                .and_then(|c| c.source_file.as_deref())
-                .map(Arc::from);
-            let num_params = count_method_params(callee_desc);
-
-            let callee_cached = CachedBytecodeMethod {
-                declaring_class_id: declaring_id,
-                class_name: Arc::from(declaring_class_name),
-                method_name: Arc::from(callee_method),
-                method_descriptor: Arc::from(callee_desc),
-                source_file,
-                code: crate::runtime::frame::padded_bytecode(&code_attr.code),
-                exception_table: Arc::from(code_attr.exception_table.as_slice()),
-                max_stack: code_attr.max_stack,
-                max_locals: code_attr.max_locals,
-                num_params: num_params as u16, // Widening: parameter count conversion
-                is_synchronized: method.is_synchronized(),
-                is_static: method.is_static(),
-            };
-            drop(cm);
-
-            // S-HIB.1 twin — apply the static skip list to recursive callee
-            // compilations from THIS closure too. Before this check, the
-            // closure honored only the FJP blocklist + native-shadow gate, so
-            // a threshold compile could silently callee-compile methods every
-            // other path bans: complex `<init>`/`<clinit>` bodies (observed:
-            // `java/util/regex/Pattern.<init>` attempted during the
-            // `Pattern.compile` upgrade), `is_known_miscompile` entries, and
-            // anything in `CRATONVM_JIT_BISECT_SKIP` — which also made
-            // skip-based bisection silently unsound for any method reachable
-            // as a direct callee. Mirrors `try_jit_compile_callee`.
+                is_iface_default,
+                std::thread::current().name().is_some(),
+                policy,
+                crate::jit::skip_list::allow_packages_from_env(),
+                init_complexity,
+            )
+            .is_some()
             {
-                let policy = if shared.config.jit_aggressive_compilation {
-                    crate::jit::skip_list::SkipPolicy::Aggressive
-                } else {
-                    crate::jit::skip_list::SkipPolicy::Conservative
-                };
-                let init_complexity = if callee_method == "<init>" || callee_method == "<clinit>" {
-                    crate::jit::skip_list::classify_init_complexity(&callee_cached.code)
-                } else {
-                    crate::jit::skip_list::InitComplexity::Unknown
-                };
-                let is_iface_default = {
-                    let cm2 = shared.class_manager.read();
-                    cm2.get_class(callee_cached.declaring_class_id)
-                        .map_or(false, |c| c.is_interface())
-                };
-                if crate::jit::skip_list::should_skip_jit_with_init(
-                    &callee_cached.class_name,
-                    callee_method,
-                    is_iface_default,
-                    std::thread::current().name().is_some(),
-                    policy,
-                    crate::jit::skip_list::allow_packages_from_env(),
-                    init_complexity,
-                )
-                .is_some()
-                {
-                    return None;
-                }
+                return None;
             }
+        }
 
-            // Build resolvers for the callee's constant pool
-            let callee_cid = declaring_id;
-            let c_resolver = |cp_idx: u16| -> Option<String> {
-                let cm = shared.class_manager.read();
-                let class = cm.get_class(callee_cid)?;
-                class
-                    .constant_pool
-                    .get_class_name(cp_idx)
-                    .map(|s| s.to_string())
+        // Build resolvers for the callee's constant pool
+        let callee_cid = declaring_id;
+        let c_resolver = |cp_idx: u16| -> Option<String> {
+            let cm = shared.class_manager.read();
+            let class = cm.get_class(callee_cid)?;
+            class
+                .constant_pool
+                .get_class_name(cp_idx)
+                .map(|s| s.to_string())
+        };
+        let c_field_resolver = |cp_idx: u16| -> Option<(usize, u8, u32, bool)> {
+            let field = resolve_field_ref(shared, callee_cid, cp_idx).ok()?;
+            let cm = shared.class_manager.read();
+            let class = cm.get_class(callee_cid)?;
+            let nat_idx = match class.constant_pool.get(cp_idx) {
+                Some(ConstantPoolEntry::FieldReference {
+                    name_and_type_index,
+                    ..
+                }) => *name_and_type_index,
+                _ => return None,
             };
-            let c_field_resolver = |cp_idx: u16| -> Option<(usize, u8, u32, bool)> {
-                let field = resolve_field_ref(shared, callee_cid, cp_idx).ok()?;
-                let cm = shared.class_manager.read();
-                let class = cm.get_class(callee_cid)?;
-                let nat_idx = match class.constant_pool.get(cp_idx) {
-                    Some(ConstantPoolEntry::FieldReference {
-                        name_and_type_index,
-                        ..
-                    }) => *name_and_type_index,
-                    _ => return None,
-                };
-                let (_, descriptor) = class.constant_pool.get_name_and_type(nat_idx)?;
-                let type_tag = *descriptor.as_bytes().first()?;
-                Some({ let (c_off, c_ref) = cratonvm_types::compact_field_slot(field.declaring_class_id.as_u32(), field.field_index).map(|(o, r)| (o as u32, r)).unwrap_or((0, false)); (field.field_index, type_tag, c_off, c_ref) })
-            };
-            let c_static_field_resolver = |cp_idx: u16| -> Option<(u32, usize, u8, bool)> {
-                let field = resolve_field_ref(shared, callee_cid, cp_idx).ok()?;
-                let cm = shared.class_manager.read();
-                let class = cm.get_class(callee_cid)?;
-                let nat_idx = match class.constant_pool.get(cp_idx) {
-                    Some(ConstantPoolEntry::FieldReference {
-                        name_and_type_index,
-                        ..
-                    }) => *name_and_type_index,
-                    _ => return None,
-                };
-                let (_, descriptor) = class.constant_pool.get_name_and_type(nat_idx)?;
-                let type_tag = *descriptor.as_bytes().first()?;
-                Some((
+            let (_, descriptor) = class.constant_pool.get_name_and_type(nat_idx)?;
+            let type_tag = *descriptor.as_bytes().first()?;
+            Some({
+                let (c_off, c_ref) = cratonvm_types::compact_field_slot(
                     field.declaring_class_id.as_u32(),
                     field.field_index,
-                    type_tag,
-                    field.is_volatile,
-                ))
-            };
-            let c_invoke_resolver = |cp_idx: u16| -> Option<(String, String, String)> {
-                let cm = shared.class_manager.read();
-                let class = cm.get_class(callee_cid)?;
-                let (class_idx, nat_idx) = match class.constant_pool.get(cp_idx) {
-                    Some(ConstantPoolEntry::MethodReference {
-                        class_index,
-                        name_and_type_index,
-                        ..
-                    }) => (*class_index, *name_and_type_index),
-                    Some(ConstantPoolEntry::InterfaceMethodReference {
-                        class_index,
-                        name_and_type_index,
-                        ..
-                    }) => (*class_index, *name_and_type_index),
-                    _ => return None,
-                };
-                let target_class = class.constant_pool.get_class_name(class_idx)?;
-                let (method_name, descriptor) = class.constant_pool.get_name_and_type(nat_idx)?;
-                Some((
-                    target_class.to_string(),
-                    method_name.to_string(),
-                    descriptor.to_string(),
-                ))
-            };
-
-            // new/anewarray resolver for callee's constant pool
-            let c_new_resolver = |cp_idx: u16| -> Option<(u32, usize, bool, bool)> {
-                let cm = shared.class_manager.read();
-                resolve_jit_new_site(&cm, callee_cid, cp_idx)
-            };
-            // Elidable-`<init>` resolver for `new` scalar replacement, default-ON
-            // (opt-out: CRATONVM_JIT_SCALAR_NEW=0).
-            let c_scalar_new_on =
-                std::env::var("CRATONVM_JIT_SCALAR_NEW").map_or(true, |v| v != "0");
-            let c_elidable_init_resolver = |cp_idx: u16| -> bool {
-                resolve_jit_elidable_init_loading(shared, callee_cid, cp_idx)
-            };
-            // invoke class-id resolver for the callee's constant pool — maps
-            // an invoke* CP index to its declared class id, for the CRC32/
-            // CRC32C `update` receiver class-id guard.
-            let c_invoke_class_id_resolver = |cp_idx: u16| -> Option<u32> {
-                let cm = shared.class_manager.read();
-                let class = cm.get_class(callee_cid)?;
-                let class_idx = match class.constant_pool.get(cp_idx) {
-                    Some(ConstantPoolEntry::MethodReference { class_index, .. }) => *class_index,
-                    Some(ConstantPoolEntry::InterfaceMethodReference { class_index, .. }) => {
-                        *class_index
-                    }
-                    _ => return None,
-                };
-                let target_class = class.constant_pool.get_class_name(class_idx)?;
-                Some(cm.find_class_by_name(target_class)?.as_u32())
-            };
-
-            let c_ldc2w_resolver = |cp_idx: u16| -> Option<(i64, bool)> {
-                let cm = shared.class_manager.read();
-                let class = cm.get_class(callee_cid)?;
-                // inc 35: `(bits, is_double)`.
-                match class.constant_pool.get(cp_idx)? {
-                    ConstantPoolEntry::Long(v) => Some((*v, false)),
-                    ConstantPoolEntry::Double(v) => Some((v.to_bits() as i64, true)), // Cast: JIT ABI -- float bits to i64
-                    _ => None,
-                }
-            };
-
-            // RBC.2 — `ldc`/`ldc_w` int/float constants. Without this resolver
-            // every method containing an `ldc` (e.g. BC's `Nat*.gte` loading
-            // Integer.MIN_VALUE) failed codegen at the 0x12 arm and stayed
-            // interpreted forever. String/Class ldc returns None → compile
-            // bails (matches the OSR path's behaviour).
-            let c_ldc_resolver = |cp_idx: u16| -> Option<i64> {
-                let cm = shared.class_manager.read();
-                let class = cm.get_class(callee_cid)?;
-                match class.constant_pool.get(cp_idx)? {
-                    ConstantPoolEntry::Integer(v) => Some(*v as i64), // Cast: JIT ABI — i64 register convention
-                    ConstantPoolEntry::Float(v) => Some(v.to_bits() as i64), // Cast: JIT ABI -- float bits to i64
-                    _ => None,
-                }
-            };
-
-            // Compile callee without recursive inlining (None for callee_compiler)
-            let c_pgo_profile = {
-                let profile_key = crate::jit::profile::MethodKey {
-                    class_id: callee_cached.declaring_class_id.as_u32(),
-                    method_name: callee_cached.method_name.clone(),
-                    descriptor: callee_cached.method_descriptor.clone(),
-                };
-                shared.profile_store.get_profile(&profile_key)
-            };
-            let c_helpers = crate::jit::helpers::build_helpers();
-            let c_string_layout_resolver = || resolve_string_field_layout(shared);
-            let mut compiled = crate::jit::try_compile(
-                &callee_cached,
-                Some(&c_resolver),
-                Some(&c_field_resolver),
-                Some(&c_static_field_resolver),
-                Some(&c_invoke_resolver),
-                None, // no recursive inlining
-                Some(&c_new_resolver),
-                Some(&c_ldc_resolver),
-                Some(&c_ldc2w_resolver),
-                c_pgo_profile.as_ref(),
-                &c_helpers,
-                None, // no inlining in early-compile path
-                // String call-site intrinsics (length/charAt/hashCode/equals/…):
-                // resolve java/lang/String's value/coder/hash field layout so the
-                // JIT inlines these accessors instead of crossing the VM→native
-                // boundary per call (bug-03). `resolve_string_field_layout`
-                // returns None → intrinsics bail to dispatch when String isn't
-                // loaded yet.
-                Some(&c_string_layout_resolver),
-                Some(&c_invoke_class_id_resolver),
-                if c_scalar_new_on {
-                    Some(&c_elidable_init_resolver)
-                } else {
-                    None
-                },
-                // Early-compile path is the optimized (C2-equivalent) tier — the
-                // tiered C1 routing only flows through the background worker.
-                true,
-                // Gap B: int-only invokestatic → Op::Call. Now default-ON
-                // (inc 23, soaked: bt10/14/16/18 == HotSpot + IrCall/IrCallGc
-                // probes == HotSpot, ON==OFF). `CRATONVM_JIT_IR_CALL=0` is the
-                // opt-out — restores single-pass dispatch for invokestatic.
-                std::env::var("CRATONVM_JIT_IR_CALL").map_or(true, |v| v != "0"),
-                // inc 24/29: invokespecial → Op::Call. Now default-ON;
-                // `CRATONVM_JIT_IR_CALL_SPECIAL=0` opts out.
-                std::env::var("CRATONVM_JIT_IR_CALL_SPECIAL").map_or(true, |v| v != "0"),
-                // inc 25/29: long methods → IR path. Now default-ON; `CRATONVM_JIT_IR_LONG=0` opts out.
-                std::env::var("CRATONVM_JIT_IR_LONG").map_or(true, |v| v != "0"),
-                // inc 26: invokevirtual/invokeinterface → Op::Call (dynamic
-                // dispatch via the helper), gated default-OFF (its own soak).
-                // `CRATONVM_JIT_IR_CALL_VIRTUAL=1` opts in.
-                std::env::var_os("CRATONVM_JIT_IR_CALL_VIRTUAL").is_some(),
-                // inc 30 + Slices A/B/C: double/float XMM value tier. Now
-                // default-ON — the tier is opcode-complete (frem/drem, FP arrays,
-                // FP-slot deopt resume all landed) and validated == HotSpot
-                // (bt10/14/16/18 checksums + FP E2E probes). `CRATONVM_JIT_IR_FP=0`
-                // is the opt-out (restores the int/long/ref-only IR path).
-                std::env::var("CRATONVM_JIT_IR_FP").map_or(true, |v| v != "0"),
-            )?;
-            let entry = compiled.entry_ptr() as usize; // Cast: JIT entry point to address
-            let needs_ctx = compiled.needs_context();
-            if std::env::var_os("CRATONVM_DBG_JITC").is_some() {
-                eprintln!(
-                    "[cratonvm-jitc] callee-compile {}.{}{} entry={:p} len={}",
-                    callee_cached.class_name,
-                    callee_cached.method_name,
-                    callee_cached.method_descriptor,
-                    compiled.entry_ptr(),
-                    compiled.code_bytes().len()
-                );
-            }
-            crate::jit::disasm::maybe_dump_annotated(
-                "callee",
-                &callee_cached.class_name,
-                &callee_cached.method_name,
-                &callee_cached.method_descriptor,
-                compiled.entry_ptr(),
-                compiled.code_bytes(),
-                compiled.osr_pc_to_native.as_deref(),
-                compiled.osr_local_assignments.as_deref(),
-            );
-
-            // Store in JIT cache
-            stamp_compilation_epoch(
-                shared,
-                &callee_cached.class_name,
-                &callee_cached.method_name,
-                &callee_cached.method_descriptor,
-                &mut compiled,
-            );
-            {
-                let mut jit_cache = shared.jit_cache.write();
-                jit_cache.put(
-                    callee_cached.class_name.clone(),
-                    callee_cached.method_name.clone(),
-                    callee_cached.method_descriptor.clone(),
-                    compiled,
-                );
-            }
-
-            Some((entry, needs_ctx))
+                )
+                .map(|(o, r)| (o as u32, r))
+                .unwrap_or((0, false));
+                (field.field_index, type_tag, c_off, c_ref)
+            })
         };
+        let c_static_field_resolver = |cp_idx: u16| -> Option<(u32, usize, u8, bool)> {
+            let field = resolve_field_ref(shared, callee_cid, cp_idx).ok()?;
+            let cm = shared.class_manager.read();
+            let class = cm.get_class(callee_cid)?;
+            let nat_idx = match class.constant_pool.get(cp_idx) {
+                Some(ConstantPoolEntry::FieldReference {
+                    name_and_type_index,
+                    ..
+                }) => *name_and_type_index,
+                _ => return None,
+            };
+            let (_, descriptor) = class.constant_pool.get_name_and_type(nat_idx)?;
+            let type_tag = *descriptor.as_bytes().first()?;
+            Some((
+                field.declaring_class_id.as_u32(),
+                field.field_index,
+                type_tag,
+                field.is_volatile,
+            ))
+        };
+        let c_invoke_resolver = |cp_idx: u16| -> Option<(String, String, String)> {
+            let cm = shared.class_manager.read();
+            let class = cm.get_class(callee_cid)?;
+            let (class_idx, nat_idx) = match class.constant_pool.get(cp_idx) {
+                Some(ConstantPoolEntry::MethodReference {
+                    class_index,
+                    name_and_type_index,
+                    ..
+                }) => (*class_index, *name_and_type_index),
+                Some(ConstantPoolEntry::InterfaceMethodReference {
+                    class_index,
+                    name_and_type_index,
+                    ..
+                }) => (*class_index, *name_and_type_index),
+                _ => return None,
+            };
+            let target_class = class.constant_pool.get_class_name(class_idx)?;
+            let (method_name, descriptor) = class.constant_pool.get_name_and_type(nat_idx)?;
+            Some((
+                target_class.to_string(),
+                method_name.to_string(),
+                descriptor.to_string(),
+            ))
+        };
+
+        // new/anewarray resolver for callee's constant pool
+        let c_new_resolver = |cp_idx: u16| -> Option<(u32, usize, bool, bool)> {
+            let cm = shared.class_manager.read();
+            resolve_jit_new_site(&cm, callee_cid, cp_idx)
+        };
+        // Elidable-`<init>` resolver for `new` scalar replacement, default-ON
+        // (opt-out: CRATONVM_JIT_SCALAR_NEW=0).
+        let c_scalar_new_on = std::env::var("CRATONVM_JIT_SCALAR_NEW").map_or(true, |v| v != "0");
+        let c_elidable_init_resolver =
+            |cp_idx: u16| -> bool { resolve_jit_elidable_init_loading(shared, callee_cid, cp_idx) };
+        // invoke class-id resolver for the callee's constant pool — maps
+        // an invoke* CP index to its declared class id, for the CRC32/
+        // CRC32C `update` receiver class-id guard.
+        let c_invoke_class_id_resolver = |cp_idx: u16| -> Option<u32> {
+            let cm = shared.class_manager.read();
+            let class = cm.get_class(callee_cid)?;
+            let class_idx = match class.constant_pool.get(cp_idx) {
+                Some(ConstantPoolEntry::MethodReference { class_index, .. }) => *class_index,
+                Some(ConstantPoolEntry::InterfaceMethodReference { class_index, .. }) => {
+                    *class_index
+                }
+                _ => return None,
+            };
+            let target_class = class.constant_pool.get_class_name(class_idx)?;
+            Some(cm.find_class_by_name(target_class)?.as_u32())
+        };
+
+        let c_ldc2w_resolver = |cp_idx: u16| -> Option<(i64, bool)> {
+            let cm = shared.class_manager.read();
+            let class = cm.get_class(callee_cid)?;
+            // inc 35: `(bits, is_double)`.
+            match class.constant_pool.get(cp_idx)? {
+                ConstantPoolEntry::Long(v) => Some((*v, false)),
+                ConstantPoolEntry::Double(v) => Some((v.to_bits() as i64, true)), // Cast: JIT ABI -- float bits to i64
+                _ => None,
+            }
+        };
+
+        // RBC.2 — `ldc`/`ldc_w` int/float constants. Without this resolver
+        // every method containing an `ldc` (e.g. BC's `Nat*.gte` loading
+        // Integer.MIN_VALUE) failed codegen at the 0x12 arm and stayed
+        // interpreted forever. String/Class ldc returns None → compile
+        // bails (matches the OSR path's behaviour).
+        let c_ldc_resolver = |cp_idx: u16| -> Option<i64> {
+            let cm = shared.class_manager.read();
+            let class = cm.get_class(callee_cid)?;
+            match class.constant_pool.get(cp_idx)? {
+                ConstantPoolEntry::Integer(v) => Some(*v as i64), // Cast: JIT ABI — i64 register convention
+                ConstantPoolEntry::Float(v) => Some(v.to_bits() as i64), // Cast: JIT ABI -- float bits to i64
+                _ => None,
+            }
+        };
+
+        // Compile callee without recursive inlining (None for callee_compiler)
+        let c_pgo_profile = {
+            let profile_key = crate::jit::profile::MethodKey {
+                class_id: callee_cached.declaring_class_id.as_u32(),
+                method_name: callee_cached.method_name.clone(),
+                descriptor: callee_cached.method_descriptor.clone(),
+            };
+            shared.profile_store.get_profile(&profile_key)
+        };
+        let c_helpers = crate::jit::helpers::build_helpers();
+        let c_string_layout_resolver = || resolve_string_field_layout(shared);
+        let mut compiled = crate::jit::try_compile(
+            &callee_cached,
+            Some(&c_resolver),
+            Some(&c_field_resolver),
+            Some(&c_static_field_resolver),
+            Some(&c_invoke_resolver),
+            None, // no recursive inlining
+            Some(&c_new_resolver),
+            Some(&c_ldc_resolver),
+            Some(&c_ldc2w_resolver),
+            c_pgo_profile.as_ref(),
+            &c_helpers,
+            None, // no inlining in early-compile path
+            // String call-site intrinsics (length/charAt/hashCode/equals/…):
+            // resolve java/lang/String's value/coder/hash field layout so the
+            // JIT inlines these accessors instead of crossing the VM→native
+            // boundary per call (bug-03). `resolve_string_field_layout`
+            // returns None → intrinsics bail to dispatch when String isn't
+            // loaded yet.
+            Some(&c_string_layout_resolver),
+            Some(&c_invoke_class_id_resolver),
+            if c_scalar_new_on {
+                Some(&c_elidable_init_resolver)
+            } else {
+                None
+            },
+            // Early-compile path is the optimized (C2-equivalent) tier — the
+            // tiered C1 routing only flows through the background worker.
+            true,
+            // Gap B: int-only invokestatic → Op::Call. Now default-ON
+            // (inc 23, soaked: bt10/14/16/18 == HotSpot + IrCall/IrCallGc
+            // probes == HotSpot, ON==OFF). `CRATONVM_JIT_IR_CALL=0` is the
+            // opt-out — restores single-pass dispatch for invokestatic.
+            std::env::var("CRATONVM_JIT_IR_CALL").map_or(true, |v| v != "0"),
+            // inc 24/29: invokespecial → Op::Call. Now default-ON;
+            // `CRATONVM_JIT_IR_CALL_SPECIAL=0` opts out.
+            std::env::var("CRATONVM_JIT_IR_CALL_SPECIAL").map_or(true, |v| v != "0"),
+            // inc 25/29: long methods → IR path. Now default-ON; `CRATONVM_JIT_IR_LONG=0` opts out.
+            std::env::var("CRATONVM_JIT_IR_LONG").map_or(true, |v| v != "0"),
+            // inc 26: invokevirtual/invokeinterface → Op::Call (dynamic
+            // dispatch via the helper), gated default-OFF (its own soak).
+            // `CRATONVM_JIT_IR_CALL_VIRTUAL=1` opts in.
+            std::env::var_os("CRATONVM_JIT_IR_CALL_VIRTUAL").is_some(),
+            // inc 30 + Slices A/B/C: double/float XMM value tier. Now
+            // default-ON — the tier is opcode-complete (frem/drem, FP arrays,
+            // FP-slot deopt resume all landed) and validated == HotSpot
+            // (bt10/14/16/18 checksums + FP E2E probes). `CRATONVM_JIT_IR_FP=0`
+            // is the opt-out (restores the int/long/ref-only IR path).
+            std::env::var("CRATONVM_JIT_IR_FP").map_or(true, |v| v != "0"),
+        )?;
+        let entry = compiled.entry_ptr() as usize; // Cast: JIT entry point to address
+        let needs_ctx = compiled.needs_context();
+        if std::env::var_os("CRATONVM_DBG_JITC").is_some() {
+            eprintln!(
+                "[cratonvm-jitc] callee-compile {}.{}{} entry={:p} len={}",
+                callee_cached.class_name,
+                callee_cached.method_name,
+                callee_cached.method_descriptor,
+                compiled.entry_ptr(),
+                compiled.code_bytes().len()
+            );
+        }
+        crate::jit::disasm::maybe_dump_annotated(
+            "callee",
+            &callee_cached.class_name,
+            &callee_cached.method_name,
+            &callee_cached.method_descriptor,
+            compiled.entry_ptr(),
+            compiled.code_bytes(),
+            compiled.osr_pc_to_native.as_deref(),
+            compiled.osr_local_assignments.as_deref(),
+        );
+
+        // Store in JIT cache
+        stamp_compilation_epoch(
+            shared,
+            &callee_cached.class_name,
+            &callee_cached.method_name,
+            &callee_cached.method_descriptor,
+            &mut compiled,
+        );
+        {
+            let mut jit_cache = shared.jit_cache.write();
+            jit_cache.put(
+                callee_cached.class_name.clone(),
+                callee_cached.method_name.clone(),
+                callee_cached.method_descriptor.clone(),
+                compiled,
+            );
+        }
+
+        Some((entry, needs_ctx))
+    };
 
     let pgo_profile = {
         let profile_key = crate::jit::profile::MethodKey {
@@ -22572,7 +22679,15 @@ fn try_jit_compile_callee_slow(
         };
         let (_, descriptor) = class.constant_pool.get_name_and_type(nat_idx)?;
         let type_tag = *descriptor.as_bytes().first()?;
-        Some({ let (c_off, c_ref) = cratonvm_types::compact_field_slot(field.declaring_class_id.as_u32(), field.field_index).map(|(o, r)| (o as u32, r)).unwrap_or((0, false)); (field.field_index, type_tag, c_off, c_ref) })
+        Some({
+            let (c_off, c_ref) = cratonvm_types::compact_field_slot(
+                field.declaring_class_id.as_u32(),
+                field.field_index,
+            )
+            .map(|(o, r)| (o as u32, r))
+            .unwrap_or((0, false));
+            (field.field_index, type_tag, c_off, c_ref)
+        })
     };
     let static_field_resolver = |cp_idx: u16| -> Option<(u32, usize, u8, bool)> {
         let field = resolve_field_ref(shared, cid, cp_idx).ok()?;
@@ -22943,10 +23058,13 @@ fn fetch_osr_compile_inputs(
         .methods
         .iter()
         .find(|m| &*m.name == method_name && &*m.descriptor == descriptor)?;
-    let code_attr = method.attributes.iter().find_map(|a| match a.as_decoded() {
-        Some(cratonvm_reader::attribute::Attribute::Code(ca)) => Some(ca),
-        _ => None,
-    })?;
+    let code_attr = method
+        .attributes
+        .iter()
+        .find_map(|a| match a.as_decoded() {
+            Some(cratonvm_reader::attribute::Attribute::Code(ca)) => Some(ca),
+            _ => None,
+        })?;
     // `padded_bytecode` only copies bytes (Rust-heap alloc, no VM lock / no
     // blocking / no managed allocation), so building it under the `cm` read
     // lock is GC-STW-safe; the lock drops at function return.
@@ -23837,9 +23955,9 @@ fn execute_jit_call(
                 // wiring (record the deopt, evict, escalate to not-entrant /
                 // not-compilable, advance the live epoch). Resumes the trapping
                 // frame only when the artifact has not been superseded.
-                if let Some(r) =
-                    real_frame_deopt_resume_and_despeculate(shared, thread, compiled, cached, &rframe)
-                {
+                if let Some(r) = real_frame_deopt_resume_and_despeculate(
+                    shared, thread, compiled, cached, &rframe,
+                ) {
                     return Ok(r);
                 }
             }
@@ -24567,13 +24685,14 @@ fn execute_invokevirtual_vtable_fast(
                 drop(cm);
                 return Ok(CachedCallResult::CacheMiss);
             }
-            let native_shadow_cache_key = (!crate::classloading::any_class_redefined()).then(|| {
-                vtable_native_shadow_cache_key(
-                    receiver_class_id,
-                    &method_name,
-                    &method_descriptor,
-                )
-            });
+            let native_shadow_cache_key =
+                (!crate::classloading::any_class_redefined()).then(|| {
+                    vtable_native_shadow_cache_key(
+                        receiver_class_id,
+                        &method_name,
+                        &method_descriptor,
+                    )
+                });
             let cached_native_shadow = native_shadow_cache_key
                 .and_then(|key| thread.native_shadow_cache.get(&key).copied());
             if cached_native_shadow == Some(true) {
@@ -25127,8 +25246,7 @@ fn execute_invokevirtual_cached(
                                         cached.method_name.as_ref(),
                                         cached.method_descriptor.as_ref(),
                                     );
-                                    let _ =
-                                        shared.tiered_manager.on_method_invocation(&tiered_key);
+                                    let _ = shared.tiered_manager.on_method_invocation(&tiered_key);
                                 } else if let Some(CachedInvokeTarget::Jit { compiled, .. }) =
                                     try_jit_upgrade_with_gate(shared, &cached, entry_gate.clone())
                                 {
@@ -27741,9 +27859,15 @@ mod tests {
 
         // 2D array with int leaves: int[3][4]
         let sizes = vec![3, 4];
-        let outer =
-            alloc_multi_array(&vm.shared, &sizes, 0, ArrayElementType::Int, sizes.len(), &[])
-                .unwrap();
+        let outer = alloc_multi_array(
+            &vm.shared,
+            &sizes,
+            0,
+            ArrayElementType::Int,
+            sizes.len(),
+            &[],
+        )
+        .unwrap();
         assert_eq!(vm.shared.heap.array_length(outer), 3);
 
         let inner_val = vm.shared.heap.get_array_element(outer, 0).unwrap();
@@ -27820,7 +27944,8 @@ mod tests {
 
         // sizes.len()=3, total_array_depth=4, leaf_et=Char
         let sizes = vec![5, 30, 6];
-        let outer = alloc_multi_array(&vm.shared, &sizes, 0, ArrayElementType::Char, 4, &[]).unwrap();
+        let outer =
+            alloc_multi_array(&vm.shared, &sizes, 0, ArrayElementType::Char, 4, &[]).unwrap();
         assert_eq!(vm.shared.heap.array_length(outer), 5);
 
         // Walk to the inner (3rd) dim and verify it's a reference array of

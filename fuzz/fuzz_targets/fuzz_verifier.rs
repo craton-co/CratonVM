@@ -31,7 +31,16 @@ use libfuzzer_sys::fuzz_target;
 
 use cratonvm_classloading::{ClassLoaderId, ClassManager};
 
+/// Keep verifier runs bounded. A verifier input is more expensive than a
+/// reader-only input because successful parses allocate a fresh class manager,
+/// load optional boot paths, link, and run verification.
+const MAX_INPUT: usize = 2 * 1024 * 1024;
+
 fuzz_target!(|data: &[u8]| {
+    if data.len() > MAX_INPUT {
+        return;
+    }
+
     // `define_class` requires the supplied name to equal the class file's
     // `this_class` (the prohibited-package / name-binding check). Parse first
     // to recover the name; if the bytes are not even a structurally readable

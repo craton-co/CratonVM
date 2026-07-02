@@ -17,6 +17,11 @@ categories.workspace = true
 # unimplemented error is thrown. See docs/synthetic-vs-real-explained.md.
 default = []
 synthetic-jdk = []
+# Compatibility shims that are intentionally default-off. Declaring these keeps
+# source cfgs and downstream feature requests visible to Cargo's check-cfg.
+app-stubs = []
+legacy-synthetic-crypto = []
+synthetic-quarkus-arc = []
 # NEW-13: `experimental-tls` is now a no-op alias. The native-tls backed
 # javax.net.ssl implementation is always compiled and registered.
 experimental-tls = []

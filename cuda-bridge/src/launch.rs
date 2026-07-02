@@ -54,6 +54,29 @@ use crate::{
 };
 use std::sync::Arc;
 
+fn clear_last_write_slots(slots: &[crate::LastWriteSlot]) {
+    for slot in slots {
+        *slot.lock().unwrap_or_else(|p| p.into_inner()) = None;
+    }
+}
+
+fn recover_after_completion_event_failure(
+    stream: &Stream,
+    last_write_slots: &[crate::LastWriteSlot],
+    err: crate::DeviceError,
+) -> Result<()> {
+    match stream.synchronize() {
+        Ok(()) => {
+            clear_last_write_slots(last_write_slots);
+            Err(err)
+        }
+        Err(sync_err) => Err(crate::DeviceError::Launch(format!(
+            "kernel completion event recording failed ({err}); stream synchronize cleanup failed \
+             ({sync_err})"
+        ))),
+    }
+}
+
 impl DeviceModule {
     /// Submit a kernel launch on a specific stream.
     ///
@@ -127,6 +150,11 @@ impl DeviceModule {
         }
 
         // ── 3. Submit the kernel launch. ──
+        // Allocate the completion event before submitting the kernel.
+        // If event creation fails, no kernel has been queued and the
+        // buffer ordering slots still describe the pre-launch state.
+        let kernel_done = Arc::new(Event::new(ctx)?);
+
         #[cfg(not(feature = "cuda"))]
         {
             // Stub mode: no driver to call; just record the launch op.
@@ -190,8 +218,9 @@ impl DeviceModule {
         // in stub mode, so the same call serves both backends; a
         // subsequent `cuStreamWaitEvent(any_stream, kernel_done)`
         // correctly gates that stream behind this kernel.
-        let kernel_done = Arc::new(Event::new(ctx)?);
-        stream.record_event(&kernel_done)?;
+        if let Err(err) = stream.record_event(&kernel_done) {
+            return recover_after_completion_event_failure(stream, &last_write_slots, err);
+        }
         for slot in &last_write_slots {
             *slot.lock().unwrap_or_else(|p| p.into_inner()) = Some(kernel_done.clone());
         }

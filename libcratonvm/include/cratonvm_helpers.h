@@ -21,8 +21,11 @@
  * cratonvm.h directly. It is kept in a SEPARATE header (not cratonvm.h) so the
  * core header stays a faithful, cbindgen-regenerable mirror of the Rust ABI.
  *
- * Requires C99 (compound literals, variadic macros) or C++11. The float/double
- * constructors/readers bit-cast via memcpy to avoid aliasing UB.
+ * Requires C99 for the varargs-like macros (compound literals, variadic
+ * macros). The inline constructors/readers are C++11-compatible, but the
+ * CRATONVM_ARGS / cratonvm_invoke_*_v macros are not standard C++ because they
+ * rely on C99 compound literals. The float/double constructors/readers bit-cast
+ * via memcpy to avoid aliasing UB.
  */
 
 #ifndef CRATONVM_HELPERS_H

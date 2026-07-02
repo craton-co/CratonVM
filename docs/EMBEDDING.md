@@ -179,6 +179,25 @@ the whole internal VM crate's surface as your compatibility contract.
 cratonvm-embed = "0.3"
 ```
 
+By default, the facade disables `cratonvm-vm` default features so the Rust
+embedding dependency graph stays headless and does not pull optional desktop or
+experimental crates into package/readiness checks. To mirror the VM crate's
+current default feature set, opt in explicitly:
+
+```toml
+[dependencies]
+cratonvm-embed = { version = "0.3", features = ["vm-defaults"] }
+```
+
+Individual VM features can also be forwarded through the facade, including
+`awt`, `synthetic-jdk`, `experimental-tls`, and `gpu-offload`.
+
+The facade contract is the documented re-export list and helper functions.
+Because `Vm`, `SharedVm`, and `JvmThread` are concrete re-exports from
+`cratonvm-vm`, their public inherent methods are visible to downstream crates;
+methods not documented here should be treated as lower-level VM pass-throughs
+rather than the intended long-term facade surface.
+
 ### Minimal Rust example
 
 ```rust
@@ -200,10 +219,11 @@ The facade re-exports the VM types unchanged and adds a small set of helpers:
 
 | Helper | Purpose |
 |---|---|
-| `make_string_array(vm, &["a", "b"])` | Build a `java.lang.String[]` (e.g. for `main(String[])`). |
+| `make_string_array(vm, &["a", "b"])` | Build a `java.lang.String[]` with fresh, uninterned elements (e.g. for `main(String[])`). |
 | `read_string(vm, obj)` | Read a `String` handle back to a Rust `String`. |
 | `object_class_name(vm, obj)` | Runtime class internal name of an object. |
-| `field_index` / `get_field_by_name` / `set_field_by_name` | Name-based instance-field access (GC-barrier correct on write). |
+| `field_index` / `field_index_desc` | Resolve instance fields by name, or by name plus descriptor when overload-style disambiguation is needed. |
+| `get_field_by_name` / `set_field_by_name` | Name-based instance-field access (GC-barrier correct on write). |
 | `describe_failure(vm, &err)` | Human-readable text for a `MethodCallFailed`. |
 
 The crate is `#![forbid(unsafe_code)]`: all unsafety stays behind the underlying

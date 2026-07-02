@@ -84,4 +84,10 @@ pub struct KernelSignature {
     /// arrays, void returns, straight-line scalar returns where every
     /// thread computes the same value and racing on `ret_ptr` is benign).
     pub is_reduction: bool,
+
+    /// Annotation policy propagated from `@GpuKernel(admit =
+    /// ALLOW_DIV_BY_ZERO)`. When true, integer `idiv`/`ldiv`/`irem`/`lrem`
+    /// lowering skips only the explicit divisor-zero deopt guard. Other
+    /// guards, such as signed-minimum divided by `-1`, remain in force.
+    pub allow_div_by_zero: bool,
 }

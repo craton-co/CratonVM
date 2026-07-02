@@ -11,6 +11,10 @@ cratonvm [OPTIONS] <CLASS_NAME> [ARGS...]
 cratonvm [OPTIONS] --jar <FILE.jar> [ARGS...]
 ```
 
+The installed launcher is named `cratonvm`. A `java[.exe]` alias is built only
+when `cratonvm-cli` is compiled with the `java-bin-alias` Cargo feature; the
+alias is off by default to avoid shadowing the system JDK.
+
 For the environment-variable side of configuration, see
 [Configuration](configuration.md) and the
 [Environment Variables reference](../reference/environment-variables.md).

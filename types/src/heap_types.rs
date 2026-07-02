@@ -423,7 +423,7 @@ impl ObjectHeader {
     /// or naturally 8-aligned in practice.
     #[inline(always)]
     pub fn make_inflated(monitor_ptr: usize) -> u64 {
-        debug_assert!(
+        assert!(
             monitor_ptr & (MARK_STATE_MASK as usize) == 0,
             "Monitor pointer must have its low 2 bits clear (>= 4-byte aligned)"
         );
@@ -943,8 +943,8 @@ mod tests {
     #[test]
     #[should_panic(expected = "Monitor pointer must have its low 2 bits clear")]
     fn make_inflated_rejects_misaligned_pointer() {
-        // debug_assert! catches this in debug builds; the test runs under
-        // `cargo test` (debug profile) so the panic is observable.
+        // This is a release-active assertion, not a debug-only tripwire:
+        // otherwise the state tag would mask the corrupted low bits.
         let _ = ObjectHeader::make_inflated(0x1001);
     }
 }

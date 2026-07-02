@@ -118,25 +118,108 @@ impl RunSummary {
             if !r.diverged() {
                 continue;
             }
-            // Store timing-stripped observations so the committed ledger is
-            // stable across regenerations and drift checks use plain equality.
-            let cratonvm = r
-                .representative()
-                .map(|m| m.cratonvm.canonical())
-                .unwrap_or_else(Observation::empty);
-            ledger.entries.push(LedgerEntry {
-                id: format!("div-{i:04}"),
-                class: r.program.clone(),
-                repro_path: r.source.to_string_lossy().into_owned(),
-                classification: r.classification().unwrap_or(Classification::Universal),
-                cratonvm,
-                hotspot: r.hotspot.canonical(),
-                status: LedgerStatus::New,
-                first_seen: captured_at.clone(),
-                linked_doc: None,
-            });
+            ledger.entries.push(Self::ledger_entry_for_result(
+                r,
+                format!("div-{i:04}"),
+                LedgerStatus::New,
+                captured_at.clone(),
+                None,
+            ));
         }
         ledger
+    }
+
+    /// Build an updated ledger from this run while preserving human triage in
+    /// an existing ledger. Existing entries keep their `id`, `status`,
+    /// `first_seen`, and `linked_doc`; observed rows get fresh observations and
+    /// classification, and brand-new divergences append as `New`.
+    pub fn to_merged_ledger(
+        &self,
+        existing: Option<&Ledger>,
+        host: String,
+        captured_at: String,
+        jdk: String,
+    ) -> Ledger {
+        let Some(existing) = existing else {
+            return self.to_ledger(host, captured_at, jdk);
+        };
+
+        use std::collections::{HashMap, HashSet};
+
+        let mut ledger = Ledger::new(host, captured_at.clone(), jdk);
+        ledger.entries = existing.entries.clone();
+
+        let mut used_ids: HashSet<String> = HashSet::new();
+        let mut by_class: HashMap<String, usize> = HashMap::new();
+        for (idx, entry) in ledger.entries.iter().enumerate() {
+            used_ids.insert(entry.id.clone());
+            by_class.entry(entry.class.clone()).or_insert(idx);
+        }
+
+        for r in self.results.iter().filter(|r| r.diverged()) {
+            if let Some(&idx) = by_class.get(&r.program) {
+                let previous = ledger.entries[idx].clone();
+                ledger.entries[idx] = Self::ledger_entry_for_result(
+                    r,
+                    previous.id,
+                    previous.status,
+                    previous.first_seen,
+                    previous.linked_doc,
+                );
+            } else {
+                let id = next_divergence_id(&used_ids);
+                used_ids.insert(id.clone());
+                by_class.insert(r.program.clone(), ledger.entries.len());
+                ledger.entries.push(Self::ledger_entry_for_result(
+                    r,
+                    id,
+                    LedgerStatus::New,
+                    captured_at.clone(),
+                    None,
+                ));
+            }
+        }
+
+        ledger
+    }
+
+    fn ledger_entry_for_result(
+        r: &ProgramResult,
+        id: String,
+        status: LedgerStatus,
+        first_seen: String,
+        linked_doc: Option<String>,
+    ) -> LedgerEntry {
+        // Store timing-stripped observations so the committed ledger is stable
+        // across regenerations and drift checks use plain equality.
+        let cratonvm = r
+            .representative()
+            .map(|m| m.cratonvm.canonical())
+            .unwrap_or_else(Observation::empty);
+        LedgerEntry {
+            id,
+            class: r.program.clone(),
+            repro_path: r.source.to_string_lossy().into_owned(),
+            classification: r.classification().unwrap_or(Classification::Universal),
+            cratonvm,
+            hotspot: r.hotspot.canonical(),
+            status,
+            first_seen,
+            linked_doc,
+        }
+    }
+}
+
+fn next_divergence_id(used_ids: &std::collections::HashSet<String>) -> String {
+    let mut i = 0usize;
+    loop {
+        let id = format!("div-{i:04}");
+        if !used_ids.contains(&id) {
+            return id;
+        }
+        i = i
+            .checked_add(1)
+            .expect("divergence id counter exhausted usize");
     }
 }
 
@@ -238,7 +321,7 @@ pub enum RunOne {
 /// Run one already-compiled `main_class` (found on `classpath`) across every
 /// `mode` against a single HotSpot reference, honoring the determinism
 /// pre-flight and divergence re-confirmation from `config`. Shared by
-/// [`run_corpus`] and the bytecode-mutation tier (`difftest mutate`).
+/// [`run_corpus`] and the bytecode-mutation tier (`cratonvm-difftest mutate`).
 pub fn run_one(
     bin: &Path,
     classpath: &Path,
@@ -556,11 +639,28 @@ mod tests {
         }
     }
 
+    fn temp_program_dir(test_name: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!(
+            "cratonvm_difftest_{test_name}_{}_{}",
+            std::process::id(),
+            nanos
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp program dir");
+        dir
+    }
+
     #[test]
     fn discover_finds_java_and_class_sorted() {
-        let seeds = Path::new(env!("CARGO_MANIFEST_DIR")).join("seeds");
-        let progs = discover_programs(&seeds);
-        assert!(!progs.is_empty(), "seeds dir should have programs");
+        let dir = temp_program_dir("discover");
+        std::fs::write(dir.join("B.class"), b"class bytes").expect("write class");
+        std::fs::write(dir.join("A.java"), "public class A {}\n").expect("write java");
+        std::fs::write(dir.join("ignore.txt"), "not runnable\n").expect("write txt");
+
+        let progs = discover_programs(&dir);
         assert!(progs.iter().all(|p| {
             matches!(
                 p.extension().and_then(|s| s.to_str()),
@@ -570,6 +670,14 @@ mod tests {
         let mut sorted = progs.clone();
         sorted.sort();
         assert_eq!(progs, sorted);
+        assert_eq!(progs.len(), 2);
+        let names: Vec<_> = progs
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["A.java".to_string(), "B.class".to_string()]);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -676,6 +784,61 @@ mod tests {
             linked_doc: None,
         });
         l
+    }
+
+    #[test]
+    fn update_ledger_preserves_existing_triage_and_links() {
+        let mut existing = ledger_with("X", LedgerStatus::Known, "old");
+        existing.host = "old-host".into();
+        existing.captured_at = "old-capture".into();
+        existing.jdk = "old-jdk".into();
+        existing.entries[0].first_seen = "old-first-seen".into();
+        existing.entries[0].linked_doc = Some("docs/internal/x.md".into());
+        existing.entries.push(LedgerEntry {
+            id: "div-0001".into(),
+            class: "Z".into(),
+            repro_path: "seeds/Z.java".into(),
+            classification: Classification::Universal,
+            cratonvm: Observation {
+                stdout: "stale".into(),
+                exit_code: Some(0),
+                ..Observation::empty()
+            },
+            hotspot: Observation::empty(),
+            status: LedgerStatus::Fixed,
+            first_seen: "fixed-first-seen".into(),
+            linked_doc: Some("docs/internal/z.md".into()),
+        });
+
+        let summary = summary_of(vec![diverging_program("X"), diverging_program("Y")]);
+        let merged = summary.to_merged_ledger(
+            Some(&existing),
+            "new-host".into(),
+            "new-capture".into(),
+            "new-jdk".into(),
+        );
+
+        assert_eq!(merged.host, "new-host");
+        assert_eq!(merged.captured_at, "new-capture");
+        assert_eq!(merged.jdk, "new-jdk");
+        assert_eq!(merged.entries.len(), 3);
+
+        let x = merged.entries.iter().find(|e| e.class == "X").unwrap();
+        assert_eq!(x.id, "div-0000");
+        assert_eq!(x.status, LedgerStatus::Known);
+        assert_eq!(x.first_seen, "old-first-seen");
+        assert_eq!(x.linked_doc.as_deref(), Some("docs/internal/x.md"));
+        assert_eq!(x.cratonvm.stdout, "42");
+
+        let z = merged.entries.iter().find(|e| e.class == "Z").unwrap();
+        assert_eq!(z.status, LedgerStatus::Fixed);
+        assert_eq!(z.linked_doc.as_deref(), Some("docs/internal/z.md"));
+
+        let y = merged.entries.iter().find(|e| e.class == "Y").unwrap();
+        assert_eq!(y.id, "div-0002");
+        assert_eq!(y.status, LedgerStatus::New);
+        assert_eq!(y.first_seen, "new-capture");
+        assert!(y.linked_doc.is_none());
     }
 
     fn summary_of(results: Vec<ProgramResult>) -> RunSummary {

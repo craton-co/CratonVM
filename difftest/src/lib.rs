@@ -24,7 +24,7 @@
 //! format-aware bytecode mutator (also a libFuzzer target +
 //! OSS-Fuzz-onboarded); [`minimize`] ddmin-shrinks a confirmed divergence to a
 //! minimal repro under `difftest/regression/`. The macro tier reuses
-//! `difftest run` over any directory of real programs (`--check-determinism`
+//! `cratonvm-difftest run` over any directory of real programs (`--check-determinism`
 //! to reject flaky ones); see `README.md`.
 //!
 //! The cooperating pieces, each its own module:

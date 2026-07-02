@@ -10,7 +10,7 @@ Machine implemented from scratch in Rust.
 Defines the data types every other CratonVM crate depends on: the JVM
 `Value` enum, NaN-boxed `CompactValue` for stack slots, `ObjectHeader`
 and `ObjectKind` for the in-heap object model, `ClassId` /
-`ClassLoaderId` identifiers, the lock-free `StringPool` interner, and
+`ClassLoaderId` identifiers, the concurrent `StringPool` interner, and
 `ACC_*` access-flag constants. Sits below the entire stack with no
 dependencies on the rest of the workspace.
 
@@ -37,6 +37,10 @@ Pre-1.0. API stability is best-effort. Tied to the
 
 ## License
 
-Apache-2.0. See `LICENSE` and `NOTICE` at the workspace root.
+Apache-2.0. The crate declares this in Cargo metadata and source files
+carry SPDX headers. In a workspace checkout, see `LICENSE` and `NOTICE` at
+the repository root; standalone package consumers should rely on the Cargo
+license field and SPDX headers because those root files may not be adjacent
+to the packaged `types/` directory.
 
 Copyright 2024-2026 Craton Software Company.

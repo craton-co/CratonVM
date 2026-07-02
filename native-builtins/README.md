@@ -13,9 +13,10 @@ Implements the essential native surface the JDK requires to boot:
 the unsafe / VarHandle / MethodHandle plumbing, `MessageDigest` and
 `Signature` JCA hooks, security providers, and framework shims (SLF4J
 binder stubs, Spring-Boot Logback initialization, reflective proxy
-generation). Default-on `legacy-synthetic-crypto` feature exposes
-provider stubs; modern algorithms (ML-KEM, ML-DSA, HKDF) deliberately
-reject with `NoSuchAlgorithmException`.
+generation). The default build is synthetic-stub-free. Compatibility
+surfaces such as `app-stubs`, `legacy-synthetic-crypto`, and
+`synthetic-quarkus-arc` are declared but default-off; opt into them only
+for targeted legacy compatibility or fuzz coverage.
 
 ## Non-goals
 

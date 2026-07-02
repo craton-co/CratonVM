@@ -36,10 +36,11 @@
 
 use std::collections::HashMap;
 use std::fs;
-use std::io::{self};
-use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::OnceLock;
+use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::net::{SocketAddr, ToSocketAddrs};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use parking_lot::Mutex;
 
@@ -409,25 +410,7 @@ pub(crate) fn validate_path(path: &str) -> Result<String, MethodCallFailed> {
     // `..`/`.` segment against the real filesystem), THEN check that the
     // fully-resolved path is contained within the sandbox root. The
     // sandbox root is the process current working directory.
-    let sandbox_root = match fs::canonicalize(std::env::current_dir().unwrap_or_default()) {
-        Ok(r) => r,
-        Err(_) => {
-            // Can't establish a sandbox root — fall back to the textual
-            // `..`-component rejection so we never silently accept a
-            // traversal.
-            if Path::new(path)
-                .components()
-                .any(|c| matches!(c, std::path::Component::ParentDir))
-            {
-                return Err(MethodCallFailed::InternalError(VmError::Runtime(
-                    RuntimeError::SecurityException {
-                        message: format!("Path traversal detected: {}", path),
-                    },
-                )));
-            }
-            return Ok(path.to_string());
-        }
-    };
+    let sandbox_root = cwd_sandbox_root(std::env::current_dir())?;
 
     // Resolve the path against the real filesystem. If the path itself
     // exists, canonicalize it directly. If it does not yet exist (e.g.
@@ -509,6 +492,22 @@ pub(crate) fn validate_path(path: &str) -> Result<String, MethodCallFailed> {
     }
 
     Ok(canonical.to_string_lossy().into_owned())
+}
+
+fn cwd_sandbox_root(cwd: io::Result<PathBuf>) -> Result<PathBuf, MethodCallFailed> {
+    let cwd = cwd.map_err(|e| {
+        MethodCallFailed::InternalError(VmError::Runtime(RuntimeError::SecurityException {
+            message: format!("Unable to establish CWD sandbox root: {e}"),
+        }))
+    })?;
+    fs::canonicalize(&cwd).map_err(|e| {
+        MethodCallFailed::InternalError(VmError::Runtime(RuntimeError::SecurityException {
+            message: format!(
+                "Unable to canonicalize CWD sandbox root {}: {e}",
+                cwd.display()
+            ),
+        }))
+    })
 }
 
 /// Convenience: validate and return path, or an IO-style error.
@@ -12586,6 +12585,307 @@ const AFC_FIELD_PATH: usize = 1;
 const AFC_FIELD_OPEN: usize = 2;
 const AFC_NUM_FIELDS: usize = 3;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AfcSyncMode {
+    None,
+    Data,
+    All,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct AfcOpenOptions {
+    read: bool,
+    write: bool,
+    create: bool,
+    create_new: bool,
+    truncate: bool,
+    delete_on_close: bool,
+    sync: AfcSyncMode,
+}
+
+impl Default for AfcOpenOptions {
+    fn default() -> Self {
+        Self {
+            read: false,
+            write: false,
+            create: false,
+            create_new: false,
+            truncate: false,
+            delete_on_close: false,
+            sync: AfcSyncMode::None,
+        }
+    }
+}
+
+struct AfcFileHandle {
+    file: fs::File,
+    readable: bool,
+    writable: bool,
+    sync: AfcSyncMode,
+    delete_on_close: Option<PathBuf>,
+}
+
+type AfcFileEntry = Arc<Mutex<AfcFileHandle>>;
+
+fn afc_files() -> &'static Mutex<HashMap<u32, AfcFileEntry>> {
+    static FILES: OnceLock<Mutex<HashMap<u32, AfcFileEntry>>> = OnceLock::new();
+    FILES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn afc_next_file_id() -> io::Result<u32> {
+    static NEXT: AtomicU32 = AtomicU32::new(1);
+    let id = NEXT.fetch_add(1, Ordering::Relaxed);
+    if id == 0 || id > i32::MAX as u32 {
+        return Err(io::Error::new(
+            io::ErrorKind::Other,
+            "asynchronous file handle limit exceeded",
+        ));
+    }
+    Ok(id)
+}
+
+fn afc_insert_file(handle: AfcFileHandle) -> io::Result<u32> {
+    let id = afc_next_file_id()?;
+    afc_files()
+        .lock()
+        .insert(id, Arc::new(Mutex::new(handle)));
+    Ok(id)
+}
+
+fn afc_file_entry(id: u32) -> io::Result<AfcFileEntry> {
+    afc_files().lock().get(&id).cloned().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("bad asynchronous file handle {id}"),
+        )
+    })
+}
+
+fn afc_remove_file(id: u32) {
+    if let Some(entry) = afc_files().lock().remove(&id) {
+        let delete_on_close = entry.lock().delete_on_close.clone();
+        drop(entry);
+        if let Some(path) = delete_on_close {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
+fn afc_option_error(message: impl Into<String>) -> MethodCallFailed {
+    RuntimeError::IllegalArgumentException {
+        message: message.into(),
+    }
+    .into()
+}
+
+fn afc_unsupported_option(message: impl Into<String>) -> MethodCallFailed {
+    RuntimeError::UnsupportedOperationException {
+        message: message.into(),
+    }
+    .into()
+}
+
+fn afc_position_arg(args: &[Value], index: usize) -> Result<u64, MethodCallFailed> {
+    match args.get(index) {
+        Some(Value::Long(n)) if *n < 0 => Err(RuntimeError::IllegalArgumentException {
+            message: "position must be non-negative".to_string(),
+        }
+        .into()),
+        Some(Value::Long(n)) => Ok(*n as u64),
+        Some(Value::Int(n)) if *n < 0 => Err(RuntimeError::IllegalArgumentException {
+            message: "position must be non-negative".to_string(),
+        }
+        .into()),
+        Some(Value::Int(n)) => Ok(*n as u64),
+        _ => Ok(0),
+    }
+}
+
+fn read_afc_open_option_name(ctx: &dyn NativeContext, option: ObjectRef) -> Option<String> {
+    if let Some(name) = ctx.read_string(option) {
+        return Some(name);
+    }
+
+    for field_name in ["name", "option", "value"] {
+        if let Value::Object(Some(s)) = ctx.get_field_by_name(option, field_name) {
+            if let Some(name) = ctx.read_string(s) {
+                return Some(name);
+            }
+        }
+    }
+
+    let field_count = ctx.object_num_fields(option).min(8);
+    for i in 0..field_count {
+        if let Value::Object(Some(s)) = ctx.get_field(option, i) {
+            if let Some(name) = ctx.read_string(s) {
+                return Some(name);
+            }
+        }
+    }
+
+    None
+}
+
+fn normalize_afc_open_option_name(raw: &str) -> String {
+    raw.trim()
+        .rsplit(['.', '/', '$'])
+        .next()
+        .unwrap_or(raw)
+        .trim()
+        .replace('-', "_")
+        .to_ascii_uppercase()
+}
+
+fn parse_afc_open_options(
+    ctx: &dyn NativeContext,
+    value: Option<&Value>,
+) -> Result<AfcOpenOptions, MethodCallFailed> {
+    let mut opts = AfcOpenOptions::default();
+    let Some(Value::Object(Some(arr))) = value else {
+        opts.read = true;
+        return Ok(opts);
+    };
+
+    let mut saw_access = false;
+    for i in 0..ctx.array_length(*arr) {
+        let option = match ctx.get_array_element(*arr, i) {
+            Value::Object(Some(o)) => o,
+            Value::Object(None) => {
+                return Err(RuntimeError::NullPointerException {
+                    message: Some("OpenOption[] contains null".to_string()),
+                }
+                .into())
+            }
+            other => {
+                return Err(afc_option_error(format!(
+                    "OpenOption[] element {i} is not an object: {other:?}"
+                )))
+            }
+        };
+
+        let raw = read_afc_open_option_name(ctx, option).ok_or_else(|| {
+            afc_unsupported_option(format!("unrecognized OpenOption object {option:?}"))
+        })?;
+        match normalize_afc_open_option_name(&raw).as_str() {
+            "READ" => {
+                opts.read = true;
+                saw_access = true;
+            }
+            "WRITE" => {
+                opts.write = true;
+                saw_access = true;
+            }
+            "CREATE" => opts.create = true,
+            "CREATE_NEW" => opts.create_new = true,
+            "TRUNCATE_EXISTING" => opts.truncate = true,
+            "DELETE_ON_CLOSE" => opts.delete_on_close = true,
+            "SPARSE" => {}
+            "SYNC" => opts.sync = AfcSyncMode::All,
+            "DSYNC" if opts.sync != AfcSyncMode::All => opts.sync = AfcSyncMode::Data,
+            "DSYNC" => {}
+            "APPEND" => {
+                return Err(afc_unsupported_option(
+                    "AsynchronousFileChannel.open does not support APPEND",
+                ))
+            }
+            other => {
+                return Err(afc_unsupported_option(format!(
+                    "unsupported OpenOption {other}"
+                )))
+            }
+        }
+    }
+
+    if !saw_access {
+        opts.read = true;
+    }
+    if !opts.write && (opts.create || opts.create_new || opts.truncate) {
+        return Err(afc_option_error(
+            "CREATE, CREATE_NEW, and TRUNCATE_EXISTING require WRITE",
+        ));
+    }
+    Ok(opts)
+}
+
+fn afc_open_file(path: &str, opts: AfcOpenOptions) -> io::Result<u32> {
+    if !opts.read && !opts.write {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "AsynchronousFileChannel requires READ or WRITE",
+        ));
+    }
+
+    let mut open = fs::OpenOptions::new();
+    open.read(opts.read).write(opts.write);
+    if opts.create_new {
+        open.create_new(true);
+    } else {
+        open.create(opts.create);
+    }
+    if opts.write && opts.truncate {
+        open.truncate(true);
+    }
+
+    let file = open.open(path)?;
+    afc_insert_file(AfcFileHandle {
+        file,
+        readable: opts.read,
+        writable: opts.write,
+        sync: opts.sync,
+        delete_on_close: opts.delete_on_close.then(|| PathBuf::from(path)),
+    })
+}
+
+fn afc_read_at(id: u32, buf: &mut [u8], position: u64) -> io::Result<usize> {
+    let entry = afc_file_entry(id)?;
+    let mut handle = entry.lock();
+    if !handle.readable {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "channel was not opened for reading",
+        ));
+    }
+    let saved = handle.file.stream_position()?;
+    handle.file.seek(SeekFrom::Start(position))?;
+    let read_result = handle.file.read(buf);
+    let restore_result = handle.file.seek(SeekFrom::Start(saved));
+    match (read_result, restore_result) {
+        (Err(e), _) => Err(e),
+        (Ok(_), Err(e)) => Err(e),
+        (Ok(n), Ok(_)) => Ok(n),
+    }
+}
+
+fn afc_write_at(id: u32, data: &[u8], position: u64) -> io::Result<usize> {
+    let entry = afc_file_entry(id)?;
+    let mut handle = entry.lock();
+    if !handle.writable {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "channel was not opened for writing",
+        ));
+    }
+    let saved = handle.file.stream_position()?;
+    handle.file.seek(SeekFrom::Start(position))?;
+    let write_result = handle.file.write_all(data).and_then(|_| match handle.sync {
+        AfcSyncMode::None => Ok(()),
+        AfcSyncMode::Data => handle.file.sync_data(),
+        AfcSyncMode::All => handle.file.sync_all(),
+    });
+    let restore_result = handle.file.seek(SeekFrom::Start(saved));
+    match (write_result, restore_result) {
+        (Err(e), _) => Err(e),
+        (Ok(_), Err(e)) => Err(e),
+        (Ok(_), Ok(_)) => Ok(data.len()),
+    }
+}
+
+fn afc_file_size(id: u32) -> io::Result<u64> {
+    let entry = afc_file_entry(id)?;
+    let handle = entry.lock();
+    Ok(handle.file.metadata()?.len())
+}
+
 /// WatchService layout: 3 fields
 /// [0] = registrations (Object — array of WatchKey objects)
 /// [1] = count (Int)
@@ -12654,10 +12954,14 @@ const EVENT_DELETE: i32 = 2;
 const EVENT_MODIFY: i32 = 4;
 
 fn alloc_synthetic(ctx: &mut dyn NativeContext, class_name: &str, num_fields: usize) -> ObjectRef {
-    match ctx.ensure_class_initialized(class_name) {
-        Ok(cid) => ctx.alloc_object(cid, num_fields),
-        Err(_) => ctx.alloc_object(ClassId::new(0), num_fields),
-    }
+    let cid = match ctx.ensure_class_initialized(class_name) {
+        Ok(cid) => cid,
+        Err(_) => match ctx.class_id_by_name(class_name) {
+            Some(cid) => cid,
+            None => ctx.ensure_synthetic_class(class_name, num_fields),
+        },
+    };
+    ctx.alloc_object(cid, num_fields)
 }
 
 fn obj_arg92(args: &[Value], index: usize) -> Result<ObjectRef, MethodCallFailed> {
@@ -12743,32 +13047,56 @@ fn register_async_file_channel(r: &mut NativeMethodRegistry) {
 
     // isOpen() → boolean
     r.register(afc, "isOpen", "()Z", native_afc_is_open);
+
+    let completed_future = "java/util/concurrent/CompletedFuture";
+    r.register(
+        completed_future,
+        "cancel",
+        "(Z)Z",
+        native_completed_future_cancel,
+    );
+    r.register(
+        completed_future,
+        "isCancelled",
+        "()Z",
+        native_completed_future_is_cancelled,
+    );
+    r.register(
+        completed_future,
+        "isDone",
+        "()Z",
+        native_completed_future_is_done,
+    );
+    r.register(
+        completed_future,
+        "get",
+        "()Ljava/lang/Object;",
+        native_completed_future_get,
+    );
+    r.register(
+        completed_future,
+        "get",
+        "(JLjava/util/concurrent/TimeUnit;)Ljava/lang/Object;",
+        native_completed_future_get,
+    );
     r.set_category(__prev_cat);
 }
 
-fn native_afc_open(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_afc_open(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let path_obj = obj_arg92(args, 0)?;
-    let path_str = ctx
-        .read_string(path_obj)
-        .or_else(|| match ctx.get_field(path_obj, 0) {
-            Value::Object(Some(s)) => ctx.read_string(s),
-            _ => None,
-        })
-        .unwrap_or_default();
+    let path_str = validated_path(&read_path_str(ctx, path_obj))?;
+    let options = parse_afc_open_options(ctx, args.get(1))?;
 
-    let fd_id = ctx
-        .fd_table()
-        .open_read_write(&path_str, true)
-        .map_err(|e| RuntimeError::IOException {
-            message: format!("AsynchronousFileChannel.open: {e}"),
-        })?;
+    let handle_id = afc_open_file(&path_str, options).map_err(|e| RuntimeError::IOException {
+        message: format!("AsynchronousFileChannel.open: {e}"),
+    })?;
 
     let afc = alloc_synthetic(
         ctx,
         "java/nio/channels/AsynchronousFileChannel",
         AFC_NUM_FIELDS,
     );
-    ctx.set_field(afc, AFC_FIELD_FD, Value::Int(fd_id as i32));
+    ctx.set_field(afc, AFC_FIELD_FD, Value::Int(handle_id as i32));
     let path_s = ctx.create_string(&path_str);
     ctx.set_field(afc, AFC_FIELD_PATH, Value::Object(Some(path_s)));
     ctx.set_field(afc, AFC_FIELD_OPEN, Value::Int(1));
@@ -12778,10 +13106,7 @@ fn native_afc_open(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
 fn native_afc_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg92(args, 0)?;
     let bb = obj_arg92(args, 1)?;
-    let position = match args.get(2) {
-        Some(Value::Long(n)) => *n as u64,
-        _ => 0,
-    };
+    let position = afc_position_arg(args, 2)?;
 
     if !matches!(ctx.get_field(this, AFC_FIELD_OPEN), Value::Int(1)) {
         return Err(RuntimeError::IOException {
@@ -12790,8 +13115,8 @@ fn native_afc_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         .into());
     }
 
-    let fd_id = match ctx.get_field(this, AFC_FIELD_FD) {
-        Value::Int(v) => v as u32,
+    let handle_id = match ctx.get_field(this, AFC_FIELD_FD) {
+        Value::Int(v) if v > 0 => v as u32,
         _ => return Ok(Some(Value::Int(-1))),
     };
 
@@ -12802,12 +13127,9 @@ fn native_afc_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     }
 
     let mut buf = vec![0u8; remaining];
-    let n = ctx
-        .fd_table()
-        .pread_at(fd_id, &mut buf, position)
-        .map_err(|e| RuntimeError::IOException {
-            message: format!("async read: {e}"),
-        })?;
+    let n = afc_read_at(handle_id, &mut buf, position).map_err(|e| RuntimeError::IOException {
+        message: format!("async read: {e}"),
+    })?;
 
     if n == 0 {
         return Ok(Some(wrap_completed_future(ctx, Value::Int(-1))));
@@ -12823,10 +13145,7 @@ fn native_afc_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
 fn native_afc_write(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg92(args, 0)?;
     let bb = obj_arg92(args, 1)?;
-    let position = match args.get(2) {
-        Some(Value::Long(n)) => *n as u64,
-        _ => 0,
-    };
+    let position = afc_position_arg(args, 2)?;
 
     if !matches!(ctx.get_field(this, AFC_FIELD_OPEN), Value::Int(1)) {
         return Err(RuntimeError::IOException {
@@ -12835,8 +13154,8 @@ fn native_afc_write(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         .into());
     }
 
-    let fd_id = match ctx.get_field(this, AFC_FIELD_FD) {
-        Value::Int(v) => v as u32,
+    let handle_id = match ctx.get_field(this, AFC_FIELD_FD) {
+        Value::Int(v) if v > 0 => v as u32,
         _ => return Ok(Some(Value::Int(-1))),
     };
 
@@ -12853,12 +13172,9 @@ fn native_afc_write(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         }
     }
 
-    let n = ctx
-        .fd_table()
-        .pwrite_at(fd_id, &data, position)
-        .map_err(|e| RuntimeError::IOException {
-            message: format!("async write: {e}"),
-        })?;
+    let n = afc_write_at(handle_id, &data, position).map_err(|e| RuntimeError::IOException {
+        message: format!("async write: {e}"),
+    })?;
 
     buf_set_position(ctx, bb, pos + n as i32);
     Ok(Some(wrap_completed_future(ctx, Value::Int(n as i32))))
@@ -12868,10 +13184,7 @@ fn native_afc_write(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
 fn native_afc_read_handler(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg92(args, 0)?;
     let bb = obj_arg92(args, 1)?;
-    let position = match args.get(2) {
-        Some(Value::Long(n)) => *n as u64,
-        _ => 0,
-    };
+    let position = afc_position_arg(args, 2)?;
     let attachment = args.get(3).copied().unwrap_or(Value::Object(None));
     let handler = obj_arg92(args, 4)?;
 
@@ -12902,12 +13215,12 @@ fn native_afc_read_handler(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         Err(e) => {
             // Call handler.failed(exception, attachment)
             let exc_msg = format!("{:?}", e);
-            let exc_str = ctx.create_string(&exc_msg);
+            let exc = afc_io_exception(ctx, &exc_msg);
             let _ = ctx.invoke_virtual(
                 handler,
                 "failed",
                 "(Ljava/lang/Throwable;Ljava/lang/Object;)V",
-                &[Value::Object(Some(exc_str)), attachment],
+                &[Value::Object(Some(exc)), attachment],
             );
         }
         _ => {}
@@ -12919,10 +13232,7 @@ fn native_afc_read_handler(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
 fn native_afc_write_handler(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg92(args, 0)?;
     let bb = obj_arg92(args, 1)?;
-    let position = match args.get(2) {
-        Some(Value::Long(n)) => *n as u64,
-        _ => 0,
-    };
+    let position = afc_position_arg(args, 2)?;
     let attachment = args.get(3).copied().unwrap_or(Value::Object(None));
     let handler = obj_arg92(args, 4)?;
 
@@ -12949,12 +13259,12 @@ fn native_afc_write_handler(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         }
         Err(e) => {
             let exc_msg = format!("{:?}", e);
-            let exc_str = ctx.create_string(&exc_msg);
+            let exc = afc_io_exception(ctx, &exc_msg);
             let _ = ctx.invoke_virtual(
                 handler,
                 "failed",
                 "(Ljava/lang/Throwable;Ljava/lang/Object;)V",
-                &[Value::Object(Some(exc_str)), attachment],
+                &[Value::Object(Some(exc)), attachment],
             );
         }
         _ => {}
@@ -12962,35 +13272,32 @@ fn native_afc_write_handler(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     Ok(None)
 }
 
-fn native_afc_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_afc_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg92(args, 0)?;
-    let fd_id = match ctx.get_field(this, AFC_FIELD_FD) {
-        Value::Int(v) => v as u32,
+    let handle_id = match ctx.get_field(this, AFC_FIELD_FD) {
+        Value::Int(v) if v > 0 => v as u32,
         _ => return Ok(Some(Value::Long(0))),
     };
-    let size = ctx
-        .fd_table()
-        .file_size(fd_id)
-        .map_err(|e| RuntimeError::IOException {
-            message: format!("size: {e}"),
-        })?;
+    let size = afc_file_size(handle_id).map_err(|e| RuntimeError::IOException {
+        message: format!("size: {e}"),
+    })?;
     Ok(Some(Value::Long(size as i64)))
 }
 
-fn native_afc_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_afc_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg92(args, 0)?;
     if matches!(ctx.get_field(this, AFC_FIELD_OPEN), Value::Int(1)) {
-        let fd_id = match ctx.get_field(this, AFC_FIELD_FD) {
-            Value::Int(v) => v as u32,
+        let handle_id = match ctx.get_field(this, AFC_FIELD_FD) {
+            Value::Int(v) if v > 0 => v as u32,
             _ => 0,
         };
-        let _ = ctx.fd_table().close(fd_id);
+        afc_remove_file(handle_id);
         ctx.set_field(this, AFC_FIELD_OPEN, Value::Int(0));
     }
     Ok(None)
 }
 
-fn native_afc_is_open(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_afc_is_open(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg92(args, 0)?;
     let open = matches!(ctx.get_field(this, AFC_FIELD_OPEN), Value::Int(1));
     Ok(Some(Value::Int(if open { 1 } else { 0 })))
@@ -13003,6 +13310,58 @@ fn wrap_completed_future(ctx: &mut dyn NativeContext, value: Value) -> Value {
     ctx.set_field(future, 0, value);
     ctx.set_field(future, 1, Value::Int(1)); // done
     Value::Object(Some(future))
+}
+
+fn native_completed_future_cancel(
+    _ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    Ok(Some(Value::Int(0)))
+}
+
+fn native_completed_future_is_cancelled(
+    _ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    Ok(Some(Value::Int(0)))
+}
+
+fn native_completed_future_is_done(
+    _ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    Ok(Some(Value::Int(1)))
+}
+
+fn native_completed_future_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    Ok(Some(ctx.get_field(this, 0)))
+}
+
+fn afc_io_exception(ctx: &mut dyn NativeContext, message: &str) -> ObjectRef {
+    let msg = ctx.create_string(message);
+    let msg_root = ctx.add_global_root(msg);
+    let msg_now = ctx.resolve_global_root(msg_root).unwrap_or(msg);
+    let constructed = ctx.new_object_initialized(
+        "java/io/IOException",
+        "(Ljava/lang/String;)V",
+        &[Value::Object(Some(msg_now))],
+    );
+
+    let exc = match constructed {
+        Ok(Some(Value::Object(Some(exc)))) => exc,
+        _ => {
+            let exc = alloc_synthetic(ctx, "java/io/IOException", 2);
+            let msg_now = ctx.resolve_global_root(msg_root).unwrap_or(msg);
+            ctx.set_field_by_name(exc, "detailMessage", Value::Object(Some(msg_now)));
+            exc
+        }
+    };
+    let _ = ctx.remove_global_root(msg_root);
+    exc
 }
 
 // ---------------------------------------------------------------------------
@@ -13020,7 +13379,6 @@ use notify::{
     event::{CreateKind, EventKind, ModifyKind, RemoveKind},
     RecursiveMode, Watcher as NotifyWatcher,
 };
-use std::path::PathBuf;
 use std::sync::mpsc;
 
 type NotifyResult = Result<notify::Event, notify::Error>;
@@ -13533,6 +13891,48 @@ fn native_we_context(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
 // 92.3: DatagramChannel (UDP)
 // ---------------------------------------------------------------------------
 
+fn udp_policy_denied(reason: String) -> MethodCallFailed {
+    RuntimeError::IOException {
+        message: format!("send denied by outbound policy: {reason}"),
+    }
+    .into()
+}
+
+fn udp_target_literal(target: SocketAddr) -> String {
+    match target {
+        SocketAddr::V4(_) => format!("{}:{}", target.ip(), target.port()),
+        SocketAddr::V6(_) => format!("[{}]:{}", target.ip(), target.port()),
+    }
+}
+
+fn check_udp_outbound_target(target: &str) -> Result<(), MethodCallFailed> {
+    if let Err(reason) = outbound_policy::check_outbound(target) {
+        return Err(udp_policy_denied(reason));
+    }
+
+    let addrs: Vec<SocketAddr> =
+        target
+            .to_socket_addrs()
+            .map_err(|e| RuntimeError::IOException {
+                message: format!("send target {target}: {e}"),
+            })?
+            .collect();
+    if addrs.is_empty() {
+        return Err(RuntimeError::IOException {
+            message: format!("send target {target}: no resolved addresses"),
+        }
+        .into());
+    }
+
+    for addr in addrs {
+        let literal = udp_target_literal(addr);
+        if let Err(reason) = outbound_policy::check_outbound(&literal) {
+            return Err(udp_policy_denied(reason));
+        }
+    }
+    Ok(())
+}
+
 fn register_datagram_channel(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
@@ -13555,12 +13955,8 @@ fn register_datagram_channel(r: &mut NativeMethodRegistry) {
     );
 
     // send(ByteBuffer, SocketAddress) → int
-    r.register(
-        dc,
-        "send",
-        "(Ljava/nio/ByteBuffer;Ljava/net/SocketAddress;)I",
-        native_dc_send,
-    );
+    // The public send native is registered by datagram.rs; keep that guarded
+    // callback as the final registration.
 
     // receive(ByteBuffer) → SocketAddress
     r.register(
@@ -13735,6 +14131,7 @@ fn native_dc_send(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     if remaining == 0 {
         return Ok(Some(Value::Int(0)));
     }
+    check_udp_outbound_target(&target_str)?;
     let mut data = vec![0u8; remaining];
     for i in 0..remaining {
         if let Value::Int(b) = ctx.get_array_element(arr, pos as usize + i) {
@@ -14209,6 +14606,7 @@ fn native_sel_is_open(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
 #[cfg(test)]
 mod io_tests {
     use super::*;
+    use crate::test_support::{confine_test_lock, MockNativeContext};
     use cratonvm_native_api::fd_table::FileDescriptorTable;
     use std::io::Write;
 
@@ -14762,6 +15160,23 @@ mod io_tests {
     }
 
     #[test]
+    fn datagram_channel_send_keeps_guarded_registration() {
+        let r = io_registry();
+        let actual = r
+            .find(
+                "java/nio/channels/DatagramChannel",
+                "send",
+                "(Ljava/nio/ByteBuffer;Ljava/net/SocketAddress;)I",
+            )
+            .expect("DatagramChannel.send registered");
+        let guarded = datagram::guarded_send_callback_for_test();
+        assert_eq!(
+            actual as usize, guarded as usize,
+            "DatagramChannel.send must remain routed through guarded UDP send"
+        );
+    }
+
+    #[test]
     fn file_methods_registered() {
         let r = io_registry();
         let f = "java/io/File";
@@ -15093,6 +15508,47 @@ mod io_tests {
     }
 
     #[test]
+    fn path_validation_confined_root_lookup_failure_fails_closed() {
+        let result = cwd_sandbox_root(Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "cwd vanished",
+        )));
+
+        assert!(result.is_err(), "CWD lookup failure was accepted");
+        let err = format!("{:?}", result.unwrap_err());
+        assert!(
+            err.contains("Unable to establish CWD sandbox root"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn path_validation_confined_root_canonicalization_failure_fails_closed() {
+        let mut missing = std::env::temp_dir();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        missing.push(format!("cratonvm_missing_cwd_root_{nanos}"));
+        assert!(
+            !missing.exists(),
+            "test root unexpectedly exists: {missing:?}"
+        );
+
+        let result = cwd_sandbox_root(Ok(missing));
+
+        assert!(
+            result.is_err(),
+            "CWD root canonicalization failure was accepted"
+        );
+        let err = format!("{:?}", result.unwrap_err());
+        assert!(
+            err.contains("Unable to canonicalize CWD sandbox root"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
     fn path_validation_rejects_null_byte() {
         set_path_validation_enabled(true);
         let result = validate_path("/etc/passwd\0.txt");
@@ -15266,6 +15722,255 @@ mod io_tests {
     // ===================================================================
     // Phase 92.1: AsynchronousFileChannel Tests
     // ===================================================================
+
+    fn make_afc_path(ctx: &mut MockNativeContext, path_str: &str) -> ObjectRef {
+        let obj = ctx.alloc_object(1);
+        let s = ctx.create_string(path_str);
+        ctx.set_field(obj, PATH_FIELD_STR, Value::Object(Some(s)));
+        obj
+    }
+
+    fn make_afc_options(ctx: &mut MockNativeContext, names: &[&str]) -> ObjectRef {
+        let arr = ctx.new_ref_array(ClassId::new(0), names.len());
+        for (i, name) in names.iter().enumerate() {
+            let opt = ctx.create_string(name);
+            ctx.set_array_element(arr, i, Value::Object(Some(opt)));
+        }
+        arr
+    }
+
+    fn temp_afc_path(tag: &str) -> std::path::PathBuf {
+        let mut p = std::env::temp_dir();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        p.push(format!("cratonvm_afc_{tag}_{nanos}.bin"));
+        p
+    }
+
+    #[test]
+    fn async_file_channel_open_rejects_out_of_cwd_when_confined() {
+        let _g = confine_test_lock().lock();
+        let prev_confine = is_path_confine_to_cwd();
+        let prev_validation = is_path_validation_enabled();
+        set_path_validation_enabled(true);
+        set_path_confine_to_cwd(true);
+
+        let path = temp_afc_path("confined");
+        let path_str = path.to_string_lossy().into_owned();
+        let mut ctx = MockNativeContext::new();
+        let p = make_afc_path(&mut ctx, &path_str);
+        let res = native_afc_open(&mut ctx, &[Value::Object(Some(p))]);
+
+        assert!(
+            res.is_err(),
+            "confined async open accepted out-of-cwd path: {res:?}"
+        );
+        let err = format!("{:?}", res.unwrap_err());
+        assert!(
+            err.contains("SecurityException") || err.contains("outside sandbox"),
+            "unexpected error: {err}"
+        );
+
+        set_path_confine_to_cwd(prev_confine);
+        set_path_validation_enabled(prev_validation);
+    }
+
+    #[test]
+    fn async_file_channel_write_without_create_does_not_create_file() {
+        let _g = confine_test_lock().lock();
+        let prev_confine = is_path_confine_to_cwd();
+        set_path_confine_to_cwd(false);
+
+        let path = temp_afc_path("write_no_create");
+        let path_str = path.to_string_lossy().into_owned();
+        let _ = std::fs::remove_file(&path);
+
+        let mut ctx = MockNativeContext::new();
+        let p = make_afc_path(&mut ctx, &path_str);
+        let opts = make_afc_options(&mut ctx, &["WRITE"]);
+        let res = native_afc_open(
+            &mut ctx,
+            &[Value::Object(Some(p)), Value::Object(Some(opts))],
+        );
+
+        assert!(res.is_err(), "WRITE without CREATE created a channel");
+        assert!(
+            !path.exists(),
+            "WRITE without CREATE must not create missing files"
+        );
+
+        set_path_confine_to_cwd(prev_confine);
+    }
+
+    #[test]
+    fn async_file_channel_rejects_negative_positions() {
+        let _g = confine_test_lock().lock();
+        let prev_confine = is_path_confine_to_cwd();
+        set_path_confine_to_cwd(false);
+
+        let path = temp_afc_path("negative_position");
+        std::fs::write(&path, b"abcdef").unwrap();
+        let path_str = path.to_string_lossy().into_owned();
+
+        let mut ctx = MockNativeContext::new();
+        let p = make_afc_path(&mut ctx, &path_str);
+        let opts = make_afc_options(&mut ctx, &["READ", "WRITE"]);
+        let channel = match native_afc_open(
+            &mut ctx,
+            &[Value::Object(Some(p)), Value::Object(Some(opts))],
+        )
+        .expect("open ok")
+        {
+            Some(Value::Object(Some(o))) => o,
+            other => panic!("expected channel object, got {other:?}"),
+        };
+        let bb = alloc_byte_buffer(&mut ctx, 4);
+
+        let read_res = native_afc_read(
+            &mut ctx,
+            &[
+                Value::Object(Some(channel)),
+                Value::Object(Some(bb)),
+                Value::Long(-1),
+            ],
+        );
+        assert!(
+            read_res.is_err(),
+            "negative read position was accepted: {read_res:?}"
+        );
+
+        let write_res = native_afc_write(
+            &mut ctx,
+            &[
+                Value::Object(Some(channel)),
+                Value::Object(Some(bb)),
+                Value::Long(-1),
+            ],
+        );
+        assert!(
+            write_res.is_err(),
+            "negative write position was accepted: {write_res:?}"
+        );
+
+        let _ = native_afc_close(&mut ctx, &[Value::Object(Some(channel))]);
+        let _ = std::fs::remove_file(&path);
+        set_path_confine_to_cwd(prev_confine);
+    }
+
+    #[test]
+    fn async_file_completed_future_methods_are_registered_and_completed() {
+        let mut registry = NativeMethodRegistry::new();
+        register_async_file_channel(&mut registry);
+        let cancel = registry
+            .find("java/util/concurrent/CompletedFuture", "cancel", "(Z)Z")
+            .expect("CompletedFuture.cancel must be registered");
+        let is_cancelled = registry
+            .find("java/util/concurrent/CompletedFuture", "isCancelled", "()Z")
+            .expect("CompletedFuture.isCancelled must be registered");
+        let is_done = registry
+            .find("java/util/concurrent/CompletedFuture", "isDone", "()Z")
+            .expect("CompletedFuture.isDone must be registered");
+        let get = registry
+            .find(
+                "java/util/concurrent/CompletedFuture",
+                "get",
+                "()Ljava/lang/Object;",
+            )
+            .expect("CompletedFuture.get must be registered");
+        let timed_get = registry
+            .find(
+                "java/util/concurrent/CompletedFuture",
+                "get",
+                "(JLjava/util/concurrent/TimeUnit;)Ljava/lang/Object;",
+            )
+            .expect("CompletedFuture timed get must be registered");
+
+        let mut ctx = MockNativeContext::new();
+        let future = match wrap_completed_future(&mut ctx, Value::Int(123)) {
+            Value::Object(Some(o)) => o,
+            other => panic!("expected future object, got {other:?}"),
+        };
+
+        assert_eq!(
+            get(&mut ctx, &[Value::Object(Some(future))]).unwrap(),
+            Some(Value::Int(123))
+        );
+        assert_eq!(
+            timed_get(
+                &mut ctx,
+                &[
+                    Value::Object(Some(future)),
+                    Value::Long(1),
+                    Value::Object(None),
+                ],
+            )
+            .unwrap(),
+            Some(Value::Int(123))
+        );
+        assert_eq!(
+            is_done(&mut ctx, &[Value::Object(Some(future))]).unwrap(),
+            Some(Value::Int(1))
+        );
+        assert_eq!(
+            cancel(&mut ctx, &[Value::Object(Some(future)), Value::Int(1)],).unwrap(),
+            Some(Value::Int(0))
+        );
+        assert_eq!(
+            is_cancelled(&mut ctx, &[Value::Object(Some(future))]).unwrap(),
+            Some(Value::Int(0))
+        );
+    }
+
+    #[test]
+    fn async_file_completion_handler_failed_receives_throwable() {
+        let mut ctx = MockNativeContext::new();
+        let channel = ctx.alloc_object(AFC_NUM_FIELDS);
+        ctx.set_field(channel, AFC_FIELD_OPEN, Value::Int(0));
+        ctx.set_field(channel, AFC_FIELD_FD, Value::Int(1));
+        let bb = alloc_byte_buffer(&mut ctx, 4);
+        let handler = ctx.alloc_object_with_class(0, "java/nio/channels/CompletionHandler");
+
+        let result = native_afc_read_handler(
+            &mut ctx,
+            &[
+                Value::Object(Some(channel)),
+                Value::Object(Some(bb)),
+                Value::Long(0),
+                Value::Object(None),
+                Value::Object(Some(handler)),
+            ],
+        );
+
+        assert!(result.is_ok(), "handler path returned error: {result:?}");
+        let calls = ctx.recorded_calls();
+        assert_eq!(calls.len(), 1, "unexpected calls: {calls:?}");
+        let call = &calls[0];
+        assert_eq!(call.method_name, "failed");
+        assert_eq!(
+            call.descriptor,
+            "(Ljava/lang/Throwable;Ljava/lang/Object;)V"
+        );
+        let thrown = match call.args.first() {
+            Some(Value::Object(Some(o))) => *o,
+            other => panic!("failed() first argument was not an object: {other:?}"),
+        };
+        assert!(
+            ctx.read_string(thrown).is_none(),
+            "failed() received a Java String instead of Throwable"
+        );
+        let thrown_class = ctx.class_name_of_id(ctx.class_id_of_object(thrown));
+        assert_eq!(thrown_class.as_deref(), Some("java/io/IOException"));
+        let message = match ctx.get_field_by_name(thrown, "detailMessage") {
+            Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+            other => panic!("throwable detailMessage was not a string: {other:?}"),
+        };
+        assert!(
+            message.contains("AsynchronousFileChannel is closed"),
+            "unexpected throwable message: {message}"
+        );
+    }
 
     #[test]
     fn test_92_1_async_file_channel_read() {

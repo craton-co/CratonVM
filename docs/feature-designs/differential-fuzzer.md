@@ -5,12 +5,20 @@
 > and mutate Java programs (and bytecode), run them on **both** CratonVM and a
 > real JDK, and **diff observable behavior** — stdout/stderr, thrown exception
 > type+message, return value, and process exit code — automatically, with
-> corpus growth, crash minimization, and a CI gate.
+> corpus growth, crash minimization, and an advisory-to-blocking CI gate path.
 >
 > **Goal · Current state · Design · Incremental delivery · Risks · Validation ·
 > Scaffolding to land first.**
 
 ---
+
+> **Status update (2026-07-02).** `difftest/` is now a workspace member package
+> named `cratonvm-difftest`; the installed binary is still named `difftest`
+> until the unique binary rename lands. Its CI job is advisory
+> (`continue-on-error`) while cross-platform ledger stability is proven.
+> `fuzz/` remains a separate standalone workspace with 11 declared targets, but
+> its build is currently blocked by the `legacy-synthetic-crypto` feature drift
+> tracked in the public known-issues review.
 
 ## 1. Problem & motivation
 
@@ -146,7 +154,7 @@ analogue of `hotspot-baseline.json` is `bench/differential-divergences.json`
 
 ### 2.6 The parser fuzz crate (panic-only, to be reused for plumbing)
 
-`fuzz/` (libFuzzer via `cargo +nightly fuzz`, 10 `[[bin]]` targets) fuzzes
+`fuzz/` (libFuzzer via `cargo +nightly fuzz`, 11 `[[bin]]` targets) fuzzes
 *bytes* with a panic-only oracle. `fuzz-review.md` documents it has **no corpus,
 no regression dir, no `fuzz.toml`, no CI hook, no oracle beyond panic**, and one
 broken target. We **reuse its libFuzzer plumbing and corpus discipline** (seed /
@@ -169,8 +177,10 @@ rc/first-error. The fuzzer's "macro corpus" tier (whole programs from
 
 Four cooperating pieces: a **generator**, a **two-VM runner**, a **diff oracle
 + minimizer**, and a **divergence ledger + CI gate**. All in one new crate
-`difftest/` (a normal workspace member, unlike `fuzz/`), driven by a
-`difftest` binary, reusing `vm-cli`'s arg shape and §2.2's subprocess model.
+`difftest/` (a normal workspace member, unlike `fuzz/`), packaged as
+`cratonvm-difftest` and currently driven by a `difftest` binary, reusing
+`vm-cli`'s arg shape and §2.2's subprocess model. Renaming the binary to
+`cratonvm-difftest` is a packaging follow-up.
 
 ```
             ┌───────────── corpus ─────────────┐
@@ -356,9 +366,9 @@ suites.
   `--allow-jdk-downgrade`).
 - **Macro tier** drives `scripts/app-checker.sh` programs as oversized seeds
   (rc + first-error diff against `java`), reusing `triage.sh` classification.
-- **CI:** add a `difftest gate` step beside the existing `bench-hotspot-compare`
-  gate in `.github/workflows/ci.yml` (the review notes there is *no* fuzz/diff
-  CI hook today — this adds the first one).
+- **CI:** keep the `difftest gate` step in `.github/workflows/ci.yml`
+  advisory until the ledger is stable on hosted runners, then remove
+  `continue-on-error` to make it blocking.
 
 ---
 
@@ -381,7 +391,7 @@ strict-by-default normalization. Wire the existing
 `vm/tests/resources/cratonvm/*.java` + a dozen `difftest/seeds/` as the first
 corpus. Port `diff_basic_arithmetic` / `diff_string_operations` to drive the
 new runner. *Green:* `difftest run --corpus seeds` reproduces the manual loop
-for ~20 seeds and writes the ledger; `cargo test -p difftest -- --ignored` runs
+for ~20 seeds and writes the ledger; `cargo test -p cratonvm-difftest -- --ignored` runs
 it. **Immediately useful** — replaces the eyeball loop for the seed set.
 
 **Step 2 — Mode matrix + auto-classification.** Add the per-mode subprocess
@@ -395,7 +405,8 @@ automates the most common manual triage in `MEMORY.md`.
 determinism pre-flight (§3.3), promote `bench/differential-divergences.json` to
 the committed ledger with `known|fixed|new` status, implement `difftest gate`
 with the §3.5 exit codes, and add the CI step. *Green:* CI runs the seed corpus
-on every PR; new divergences fail the build, known ones don't.
+on every PR; new divergences fail the difftest job, and the job becomes
+blocking only after `continue-on-error` is removed.
 
 **Step 4 — Grammar-based source generator.** Implement §3.1 tier 2 (typed
 self-printing Java generator) behind `difftest gen --grammar`, seeded weighted
@@ -539,9 +550,9 @@ this design doc:
    `difftest/README.md` documenting the run/min/gate workflow (mirroring
    `fuzz/README.md`'s structure, which the review wants but `fuzz/` lacks).
 
-7. **CI placeholder** — a commented-out / smoke-only `difftest gate` step
-   sketch alongside the `bench-hotspot-compare` gate (no enforcement until
-   Step 3), so the integration point is visible from the first PR.
+7. **CI integration** — an advisory `difftest gate` step in
+   `.github/workflows/ci.yml` using `continue-on-error` until Step 3 is stable
+   enough to enforce on hosted runners.
 
 **Explicitly not in Step 0:** no generator logic, no mutator, no real diffing
 beyond compiling the types, **no edits to any VM source crate** (the whole
@@ -577,7 +588,8 @@ small, reviewable, build-green PR.
   must **reject** it (two HotSpot runs disagree) rather than admit a flaky
   ledger entry.
 - **CI gate check (Step 3):** a synthetic "regress one seed" branch must turn
-  the `difftest gate` red (exit 1); the baseline branch stays green (exit 0).
+  the `difftest gate` job red (exit 1); the baseline branch stays green
+  (exit 0). While advisory, this reports drift without blocking the whole PR.
 - **No-regression guard:** the new crate must not perturb VM behavior — `bt18`
   still `68332206` and the existing differential/intrinsic_diff tests still pass
   (the feature is additive tooling; it touches no VM source crate).

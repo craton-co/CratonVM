@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2024-2026 Craton Software Company
 
-use std::sync::Arc;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use smallvec::smallvec;
@@ -22,34 +21,55 @@ use crate::recording::FlightRecorder;
 // `recorder.type_registry.find_by_name(NAME)` — a hashmap probe of a literal
 // string — on every call, even when no recording was active.
 //
-// We now cache the resolved ID per call-site in a `OnceLock<EventTypeId>`.
-// Combined with the `crate::is_enabled()` fast-path guard at the top of every
-// emit_* function, the disabled-path cost drops from ~30-100 ns (HashMap probe
-// + Vec alloc) to ~2-3 ns (one relaxed atomic load + branch).
+// We cache one resolved ID per call-site. A cache hit is accepted only for the
+// registry instance and length that populated it, so the enabled path never
+// reuses an ID assigned by another EventTypeRegistry.
 //
 // The cache is populated ONLY on a successful lookup. An unsuccessful lookup
 // (registry not yet initialised, or type genuinely absent) must NOT be cached:
-// `OnceLock` is write-once, so caching the `INVALID` sentinel would
-// permanently drop every later emit of that event type even after the type is
-// registered. On a miss we return `None` for this call and leave the cache
-// unset so a subsequent call can still succeed.
+// a subsequent call may use a fully initialised registry and still succeed.
+
+#[derive(Clone, Copy)]
+struct CachedEventTypeId {
+    registry_key: usize,
+    registry_len: usize,
+    id: EventTypeId,
+}
+
+type EventTypeIdCache = OnceLock<CachedEventTypeId>;
 
 /// Look up an event-type ID by name, caching the result in the supplied
-/// `OnceLock`. Returns `None` if the registry has no such type.
+/// per-call-site cache. Returns `None` if the registry has no such type.
 #[inline]
 fn cached_event_id(
-    cache: &'static OnceLock<EventTypeId>,
+    cache: &'static EventTypeIdCache,
     recorder: &FlightRecorder,
     name: &str,
 ) -> Option<EventTypeId> {
-    if let Some(&id) = cache.get() {
-        // Only valid ids are ever stored, so a hit is always usable.
-        return Some(id);
+    let registry = &recorder.type_registry;
+    let registry_key = registry as *const EventTypeRegistry as usize;
+    let registry_len = registry.len();
+
+    if let Some(cached) = cache.get() {
+        if cached.registry_key == registry_key && cached.registry_len == registry_len {
+            if registry
+                .get(cached.id)
+                .is_some_and(|event_type| event_type.name.as_str() == name)
+            {
+                return Some(cached.id);
+            }
+        }
     }
-    let id = recorder.type_registry.find_by_name(name)?;
-    // Successful lookup — populate the cache. `set` may fail if another thread
-    // raced us here; that is harmless since both threads resolved the same id.
-    let _ = cache.set(id);
+
+    let id = registry.find_by_name(name)?;
+    // Cache only successful lookups; misses may resolve later.
+    if cache.get().is_none() {
+        let _ = cache.set(CachedEventTypeId {
+            registry_key,
+            registry_len,
+            id,
+        });
+    }
     Some(id)
 }
 
@@ -1013,7 +1033,7 @@ pub fn emit_gc_event(
     if !crate::is_enabled() {
         return;
     }
-    static ID: OnceLock<EventTypeId> = OnceLock::new();
+    static ID: EventTypeIdCache = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.GarbageCollection") {
         // Round-4: name/cause are now `&'static str` (every caller passes
         // a string literal — GC collector name and pause cause are part of
@@ -1058,7 +1078,7 @@ pub fn emit_class_load_event(
     if !crate::is_enabled() {
         return;
     }
-    static ID: OnceLock<EventTypeId> = OnceLock::new();
+    static ID: EventTypeIdCache = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.ClassLoad") {
         let mut fields = crate::event::EventFields::with_capacity(3);
         fields.push(EventValue::String(Arc::from(class_name)));
@@ -1089,7 +1109,7 @@ pub fn emit_class_load_event_arc(
     if !crate::is_enabled() {
         return;
     }
-    static ID: OnceLock<EventTypeId> = OnceLock::new();
+    static ID: EventTypeIdCache = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.ClassLoad") {
         let mut fields = crate::event::EventFields::with_capacity(3);
         fields.push(EventValue::String(class_name));
@@ -1123,7 +1143,7 @@ pub fn emit_thread_start_event(
     if !crate::is_enabled() {
         return;
     }
-    static ID: OnceLock<EventTypeId> = OnceLock::new();
+    static ID: EventTypeIdCache = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.ThreadStart") {
         // `thread_name` is the user-supplied Java thread name — still Arc.
         // Round-9 HIGH-5: callers that already hold an `Arc<str>` should
@@ -1156,7 +1176,7 @@ pub fn emit_thread_start_event_arc(
     if !crate::is_enabled() {
         return;
     }
-    static ID: OnceLock<EventTypeId> = OnceLock::new();
+    static ID: EventTypeIdCache = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.ThreadStart") {
         let mut fields = crate::event::EventFields::with_capacity(2);
         fields.push(EventValue::String(thread_name));
@@ -1190,7 +1210,7 @@ pub fn emit_compilation_event(
     if !crate::is_enabled() {
         return;
     }
-    static ID: OnceLock<EventTypeId> = OnceLock::new();
+    static ID: EventTypeIdCache = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.Compilation") {
         // `method` is a fully-qualified Java method descriptor, dynamic — Arc.
         // Prefer `emit_compilation_event_arc` when the method descriptor is
@@ -1231,7 +1251,7 @@ pub fn emit_compilation_event_arc(
     if !crate::is_enabled() {
         return;
     }
-    static ID: OnceLock<EventTypeId> = OnceLock::new();
+    static ID: EventTypeIdCache = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.Compilation") {
         let mut fields = crate::event::EventFields::with_capacity(7);
         fields.push(EventValue::String(method));
@@ -1264,7 +1284,7 @@ pub fn emit_thread_end_event(
     if !crate::is_enabled() {
         return;
     }
-    static ID: OnceLock<EventTypeId> = OnceLock::new();
+    static ID: EventTypeIdCache = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.ThreadEnd") {
         // Round-9 HIGH-5: prefer `emit_thread_end_event_arc` below when the
         // Thread name is already interned as an `Arc<str>`.
@@ -1292,7 +1312,7 @@ pub fn emit_thread_end_event_arc(
     if !crate::is_enabled() {
         return;
     }
-    static ID: OnceLock<EventTypeId> = OnceLock::new();
+    static ID: EventTypeIdCache = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.ThreadEnd") {
         let mut fields = crate::event::EventFields::with_capacity(1);
         fields.push(EventValue::String(thread_name));
@@ -1320,7 +1340,7 @@ pub fn emit_thread_sleep_event(
     if !crate::is_enabled() {
         return;
     }
-    static ID: OnceLock<EventTypeId> = OnceLock::new();
+    static ID: EventTypeIdCache = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.ThreadSleep") {
         let event = EventInstance {
             type_id,
@@ -1350,7 +1370,7 @@ pub fn emit_monitor_wait_event(
     if !crate::is_enabled() {
         return;
     }
-    static ID: OnceLock<EventTypeId> = OnceLock::new();
+    static ID: EventTypeIdCache = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.JavaMonitorWait") {
         // Round-5: `notifier_thread` callers pass literals ("unknown" today;
         // future "GC", "main", etc. taxonomies) — `Str` skips one Arc alloc.
@@ -1390,7 +1410,7 @@ pub fn emit_monitor_wait_event_arc(
     if !crate::is_enabled() {
         return;
     }
-    static ID: OnceLock<EventTypeId> = OnceLock::new();
+    static ID: EventTypeIdCache = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.JavaMonitorWait") {
         let mut fields = crate::event::EventFields::with_capacity(5);
         fields.push(EventValue::String(monitor_class));
@@ -1429,7 +1449,7 @@ pub fn emit_monitor_enter_event(
     if !crate::is_enabled() {
         return;
     }
-    static ID: OnceLock<EventTypeId> = OnceLock::new();
+    static ID: EventTypeIdCache = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.JavaMonitorEnter") {
         let mut fields = crate::event::EventFields::with_capacity(3);
         fields.push(EventValue::String(Arc::from(monitor_class)));
@@ -1461,7 +1481,7 @@ pub fn emit_monitor_enter_event_arc(
     if !crate::is_enabled() {
         return;
     }
-    static ID: OnceLock<EventTypeId> = OnceLock::new();
+    static ID: EventTypeIdCache = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.JavaMonitorEnter") {
         let mut fields = crate::event::EventFields::with_capacity(3);
         fields.push(EventValue::String(monitor_class));
@@ -1493,7 +1513,7 @@ pub fn emit_class_unload_event(
     if !crate::is_enabled() {
         return;
     }
-    static ID: OnceLock<EventTypeId> = OnceLock::new();
+    static ID: EventTypeIdCache = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.ClassUnload") {
         // class_name is dynamic; defining_loader is taxonomy literal.
         // Prefer `emit_class_unload_event_arc` when an interned `Arc<str>` is
@@ -1526,7 +1546,7 @@ pub fn emit_class_unload_event_arc(
     if !crate::is_enabled() {
         return;
     }
-    static ID: OnceLock<EventTypeId> = OnceLock::new();
+    static ID: EventTypeIdCache = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.ClassUnload") {
         let mut fields = crate::event::EventFields::with_capacity(2);
         fields.push(EventValue::String(class_name));
@@ -1557,7 +1577,7 @@ pub fn emit_thread_park_event(
     if !crate::is_enabled() {
         return;
     }
-    static ID: OnceLock<EventTypeId> = OnceLock::new();
+    static ID: EventTypeIdCache = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.ThreadPark") {
         // Round-4: `parked_class` is always a literal class name (`LockSupport`).
         let mut fields = crate::event::EventFields::with_capacity(3);
@@ -1590,7 +1610,7 @@ pub fn emit_virtual_thread_pinned_event(
     if !crate::is_enabled() {
         return;
     }
-    static ID: OnceLock<EventTypeId> = OnceLock::new();
+    static ID: EventTypeIdCache = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.VirtualThreadPinned") {
         // Round-4: `pin_reason` is a JEP-491 enum literal (e.g. "Synchronized",
         // "Native"). Thread name is dynamic. Prefer
@@ -1626,7 +1646,7 @@ pub fn emit_virtual_thread_pinned_event_arc(
     if !crate::is_enabled() {
         return;
     }
-    static ID: OnceLock<EventTypeId> = OnceLock::new();
+    static ID: EventTypeIdCache = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.VirtualThreadPinned") {
         let mut fields = crate::event::EventFields::with_capacity(3);
         fields.push(EventValue::String(thread_name));
@@ -1657,7 +1677,7 @@ pub fn emit_gc_heap_summary_event(
     if !crate::is_enabled() {
         return;
     }
-    static ID: OnceLock<EventTypeId> = OnceLock::new();
+    static ID: EventTypeIdCache = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.GCHeapSummary") {
         // Round-4: `when` is "Before GC" / "After GC", `heap_space` is "Eden",
         // "Survivor", "Old", etc. — fixed enum-like literals.
@@ -1693,7 +1713,7 @@ pub fn emit_allocation_in_new_tlab_event(
     if !crate::is_enabled() {
         return;
     }
-    static ID: OnceLock<EventTypeId> = OnceLock::new();
+    static ID: EventTypeIdCache = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.ObjectAllocationInNewTLAB") {
         // `object_class` is a Java class name — fully dynamic.
         // Prefer `emit_allocation_in_new_tlab_event_arc` from callers that
@@ -1725,7 +1745,7 @@ pub fn emit_allocation_outside_tlab_event(
     if !crate::is_enabled() {
         return;
     }
-    static ID: OnceLock<EventTypeId> = OnceLock::new();
+    static ID: EventTypeIdCache = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.ObjectAllocationOutsideTLAB") {
         // Prefer `emit_allocation_outside_tlab_event_arc` from callers that
         // already hold a constant-pool `Arc<str>`.
@@ -1757,7 +1777,7 @@ pub fn emit_allocation_in_new_tlab_event_arc(
     if !crate::is_enabled() {
         return;
     }
-    static ID: OnceLock<EventTypeId> = OnceLock::new();
+    static ID: EventTypeIdCache = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.ObjectAllocationInNewTLAB") {
         let mut fields = crate::event::EventFields::with_capacity(3);
         fields.push(EventValue::String(object_class));
@@ -1786,7 +1806,7 @@ pub fn emit_allocation_outside_tlab_event_arc(
     if !crate::is_enabled() {
         return;
     }
-    static ID: OnceLock<EventTypeId> = OnceLock::new();
+    static ID: EventTypeIdCache = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.ObjectAllocationOutsideTLAB") {
         let mut fields = crate::event::EventFields::with_capacity(2);
         fields.push(EventValue::String(object_class));
@@ -1813,7 +1833,7 @@ pub fn emit_gc_phase_pause_event(
     if !crate::is_enabled() {
         return;
     }
-    static ID: OnceLock<EventTypeId> = OnceLock::new();
+    static ID: EventTypeIdCache = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.GCPhasePause") {
         // Round-4: `phase_name` is from the fixed GC-phase taxonomy
         // ("Pause Init Mark", "Pause Remark", etc.) — always a literal.
@@ -1842,7 +1862,7 @@ pub fn emit_young_gc_event(
     if !crate::is_enabled() {
         return;
     }
-    static ID: OnceLock<EventTypeId> = OnceLock::new();
+    static ID: EventTypeIdCache = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.YoungGarbageCollection") {
         let mut fields = crate::event::EventFields::with_capacity(2);
         fields.push(EventValue::Int(gc_id));
@@ -1868,7 +1888,7 @@ pub fn emit_old_gc_event(
     if !crate::is_enabled() {
         return;
     }
-    static ID: OnceLock<EventTypeId> = OnceLock::new();
+    static ID: EventTypeIdCache = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.OldGarbageCollection") {
         let mut fields = crate::event::EventFields::with_capacity(1);
         fields.push(EventValue::Int(gc_id));
@@ -1896,7 +1916,7 @@ pub fn emit_metaspace_summary_event(
     if !crate::is_enabled() {
         return;
     }
-    static ID: OnceLock<EventTypeId> = OnceLock::new();
+    static ID: EventTypeIdCache = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.MetaspaceSummary") {
         // Round-4: `when` is "Before GC" / "After GC" — literal.
         let mut fields = crate::event::EventFields::with_capacity(5);
@@ -1928,7 +1948,7 @@ pub fn emit_execution_sample_event(
     if !crate::is_enabled() {
         return;
     }
-    static ID: OnceLock<EventTypeId> = OnceLock::new();
+    static ID: EventTypeIdCache = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.ExecutionSample") {
         // Round-4: `state` is a fixed JVM thread-state enum
         // ("RUNNABLE", "BLOCKED", ...) — literal. Thread name and stack
@@ -1963,7 +1983,7 @@ pub fn emit_execution_sample_event_arc(
     if !crate::is_enabled() {
         return;
     }
-    static ID: OnceLock<EventTypeId> = OnceLock::new();
+    static ID: EventTypeIdCache = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.ExecutionSample") {
         let mut fields = crate::event::EventFields::with_capacity(3);
         fields.push(EventValue::String(sampled_thread));
@@ -1991,7 +2011,7 @@ pub fn emit_cpu_load_event(
     if !crate::is_enabled() {
         return;
     }
-    static ID: OnceLock<EventTypeId> = OnceLock::new();
+    static ID: EventTypeIdCache = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.CPULoad") {
         let mut fields = crate::event::EventFields::with_capacity(3);
         fields.push(EventValue::Float(jvm_user));
@@ -2020,7 +2040,7 @@ pub fn emit_thread_statistics_event(
     if !crate::is_enabled() {
         return;
     }
-    static ID: OnceLock<EventTypeId> = OnceLock::new();
+    static ID: EventTypeIdCache = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.JavaThreadStatistics") {
         let mut fields = crate::event::EventFields::with_capacity(4);
         fields.push(EventValue::Long(active_count));
@@ -2051,7 +2071,7 @@ pub fn emit_active_recording_event(
     if !crate::is_enabled() {
         return;
     }
-    static ID: OnceLock<EventTypeId> = OnceLock::new();
+    static ID: EventTypeIdCache = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.ActiveRecording") {
         // Recording metadata: `name` and `destination` are user-supplied —
         // keep `&str` + Arc. Round-4: thread_id from per-thread cache.
@@ -2086,7 +2106,7 @@ pub fn emit_active_setting_event(
     if !crate::is_enabled() {
         return;
     }
-    static ID: OnceLock<EventTypeId> = OnceLock::new();
+    static ID: EventTypeIdCache = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.ActiveSetting") {
         let mut fields = crate::event::EventFields::with_capacity(3);
         fields.push(EventValue::Long(recording_id));
@@ -2116,7 +2136,7 @@ pub fn emit_active_setting_event_arc(
     if !crate::is_enabled() {
         return;
     }
-    static ID: OnceLock<EventTypeId> = OnceLock::new();
+    static ID: EventTypeIdCache = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.ActiveSetting") {
         let mut fields = crate::event::EventFields::with_capacity(3);
         fields.push(EventValue::Long(recording_id));
@@ -2152,7 +2172,7 @@ pub fn emit_deoptimization_event(
     if !crate::is_enabled() {
         return;
     }
-    static ID: OnceLock<EventTypeId> = OnceLock::new();
+    static ID: EventTypeIdCache = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.Deoptimization") {
         // Round-4: `reason` and `action` are fixed JIT taxonomies
         // ("class_check", "reinterpret", etc.). Method is dynamic.
@@ -2190,7 +2210,7 @@ pub fn emit_deoptimization_event_arc(
     if !crate::is_enabled() {
         return;
     }
-    static ID: OnceLock<EventTypeId> = OnceLock::new();
+    static ID: EventTypeIdCache = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.Deoptimization") {
         let mut fields = crate::event::EventFields::with_capacity(5);
         fields.push(EventValue::String(method));
@@ -2225,7 +2245,7 @@ pub fn emit_file_read_event(
     if !crate::is_enabled() {
         return;
     }
-    static ID: OnceLock<EventTypeId> = OnceLock::new();
+    static ID: EventTypeIdCache = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.FileRead") {
         let event = EventInstance {
             type_id,
@@ -2258,7 +2278,7 @@ pub fn emit_file_read_event_arc(
     if !crate::is_enabled() {
         return;
     }
-    static ID: OnceLock<EventTypeId> = OnceLock::new();
+    static ID: EventTypeIdCache = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.FileRead") {
         let event = EventInstance {
             type_id,
@@ -2289,7 +2309,7 @@ pub fn emit_file_write_event(
     if !crate::is_enabled() {
         return;
     }
-    static ID: OnceLock<EventTypeId> = OnceLock::new();
+    static ID: EventTypeIdCache = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.FileWrite") {
         let event = EventInstance {
             type_id,
@@ -2318,7 +2338,7 @@ pub fn emit_file_write_event_arc(
     if !crate::is_enabled() {
         return;
     }
-    static ID: OnceLock<EventTypeId> = OnceLock::new();
+    static ID: EventTypeIdCache = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.FileWrite") {
         let event = EventInstance {
             type_id,
@@ -2348,7 +2368,7 @@ pub fn emit_socket_read_event(
     if !crate::is_enabled() {
         return;
     }
-    static ID: OnceLock<EventTypeId> = OnceLock::new();
+    static ID: EventTypeIdCache = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.SocketRead") {
         let event = EventInstance {
             type_id,
@@ -2382,7 +2402,7 @@ pub fn emit_socket_read_event_arc(
     if !crate::is_enabled() {
         return;
     }
-    static ID: OnceLock<EventTypeId> = OnceLock::new();
+    static ID: EventTypeIdCache = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.SocketRead") {
         let event = EventInstance {
             type_id,
@@ -2415,7 +2435,7 @@ pub fn emit_socket_write_event(
     if !crate::is_enabled() {
         return;
     }
-    static ID: OnceLock<EventTypeId> = OnceLock::new();
+    static ID: EventTypeIdCache = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.SocketWrite") {
         let event = EventInstance {
             type_id,
@@ -2446,7 +2466,7 @@ pub fn emit_socket_write_event_arc(
     if !crate::is_enabled() {
         return;
     }
-    static ID: OnceLock<EventTypeId> = OnceLock::new();
+    static ID: EventTypeIdCache = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.SocketWrite") {
         let event = EventInstance {
             type_id,
@@ -2474,7 +2494,7 @@ pub fn emit_safepoint_begin_event(
     if !crate::is_enabled() {
         return;
     }
-    static ID: OnceLock<EventTypeId> = OnceLock::new();
+    static ID: EventTypeIdCache = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.SafepointBegin") {
         let mut fields = crate::event::EventFields::with_capacity(3);
         fields.push(EventValue::Long(safepoint_id));
@@ -2502,7 +2522,7 @@ pub fn emit_safepoint_end_event(
     if !crate::is_enabled() {
         return;
     }
-    static ID: OnceLock<EventTypeId> = OnceLock::new();
+    static ID: EventTypeIdCache = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.SafepointEnd") {
         let mut fields = crate::event::EventFields::with_capacity(1);
         fields.push(EventValue::Long(safepoint_id));
@@ -2527,7 +2547,7 @@ pub fn emit_system_gc_event(
     if !crate::is_enabled() {
         return;
     }
-    static ID: OnceLock<EventTypeId> = OnceLock::new();
+    static ID: EventTypeIdCache = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.SystemGC") {
         let event = EventInstance {
             type_id,
@@ -2551,7 +2571,7 @@ pub fn emit_allocation_requiring_gc_event(
     if !crate::is_enabled() {
         return;
     }
-    static ID: OnceLock<EventTypeId> = OnceLock::new();
+    static ID: EventTypeIdCache = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.AllocationRequiringGC") {
         let event = EventInstance {
             type_id,
@@ -2575,7 +2595,7 @@ pub fn emit_java_exception_throw_event(
     if !crate::is_enabled() {
         return;
     }
-    static ID: OnceLock<EventTypeId> = OnceLock::new();
+    static ID: EventTypeIdCache = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.JavaExceptionThrow") {
         // message and thrown_class are dynamic; Arc. Prefer
         // `emit_java_exception_throw_event_arc` from sites holding the
@@ -2610,7 +2630,7 @@ pub fn emit_java_exception_throw_event_arc(
     if !crate::is_enabled() {
         return;
     }
-    static ID: OnceLock<EventTypeId> = OnceLock::new();
+    static ID: EventTypeIdCache = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.JavaExceptionThrow") {
         let mut fields = crate::event::EventFields::with_capacity(2);
         fields.push(EventValue::String(message));
@@ -2640,7 +2660,7 @@ pub fn emit_network_utilization_event(
     if !crate::is_enabled() {
         return;
     }
-    static ID: OnceLock<EventTypeId> = OnceLock::new();
+    static ID: EventTypeIdCache = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.NetworkUtilization") {
         let mut fields = crate::event::EventFields::with_capacity(3);
         fields.push(EventValue::String(Arc::from(interface)));
@@ -2671,7 +2691,7 @@ pub fn emit_network_utilization_event_arc(
     if !crate::is_enabled() {
         return;
     }
-    static ID: OnceLock<EventTypeId> = OnceLock::new();
+    static ID: EventTypeIdCache = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.NetworkUtilization") {
         let mut fields = crate::event::EventFields::with_capacity(3);
         fields.push(EventValue::String(interface));
@@ -2699,7 +2719,7 @@ pub fn emit_thread_cpu_load_event(
     if !crate::is_enabled() {
         return;
     }
-    static ID: OnceLock<EventTypeId> = OnceLock::new();
+    static ID: EventTypeIdCache = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.ThreadCPULoad") {
         let event = EventInstance {
             type_id,
@@ -2726,7 +2746,7 @@ pub fn emit_allocation_sample_event(
     if !crate::is_enabled() {
         return;
     }
-    static ID: OnceLock<EventTypeId> = OnceLock::new();
+    static ID: EventTypeIdCache = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.ObjectAllocationSample") {
         let event = EventInstance {
             type_id,
@@ -2754,7 +2774,7 @@ pub fn emit_allocation_sample_event_arc(
     if !crate::is_enabled() {
         return;
     }
-    static ID: OnceLock<EventTypeId> = OnceLock::new();
+    static ID: EventTypeIdCache = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.ObjectAllocationSample") {
         let event = EventInstance {
             type_id,
@@ -2792,7 +2812,7 @@ pub fn emit_java_error_throw_event(
     if !crate::is_enabled() {
         return;
     }
-    static ID: OnceLock<EventTypeId> = OnceLock::new();
+    static ID: EventTypeIdCache = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.JavaErrorThrow") {
         // Field order matches registration at builtin.rs line 790:
         //   0: message (string), 1: thrownClass (string)
@@ -2939,7 +2959,7 @@ pub fn emit_physical_memory_event(
     // the wired emit to no-op in vm-cli (which never calls start_recording),
     // making `emit_physical_memory_event` dead code. The repository ingest
     // path itself is safe for un-recorded pushes; skip the global gate here.
-    static ID: OnceLock<EventTypeId> = OnceLock::new();
+    static ID: EventTypeIdCache = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.PhysicalMemory") {
         // Field order matches registration at builtin.rs line 709:
         //   0: totalSize (long), 1: usedSize (long)
@@ -2987,7 +3007,7 @@ pub fn emit_initial_environment_variable_event(
     if !crate::is_enabled() {
         return;
     }
-    static ID: OnceLock<EventTypeId> = OnceLock::new();
+    static ID: EventTypeIdCache = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.InitialEnvironmentVariable") {
         // Field order matches the registration above: key, value.
         let mut fields = crate::event::EventFields::with_capacity(2);
@@ -3023,7 +3043,7 @@ pub fn emit_exception_statistics_event(
     if !crate::is_enabled() {
         return;
     }
-    static ID: OnceLock<EventTypeId> = OnceLock::new();
+    static ID: EventTypeIdCache = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.ExceptionStatistics") {
         // Field order matches the registration above: throwables.
         let mut fields = crate::event::EventFields::with_capacity(1);
@@ -3056,7 +3076,7 @@ pub fn emit_module_require_event(
     if !crate::is_enabled() {
         return;
     }
-    static ID: OnceLock<EventTypeId> = OnceLock::new();
+    static ID: EventTypeIdCache = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.ModuleRequire") {
         // Field order: source, requiredModule.
         let mut fields = crate::event::EventFields::with_capacity(2);
@@ -3088,7 +3108,7 @@ pub fn emit_module_export_event(
     if !crate::is_enabled() {
         return;
     }
-    static ID: OnceLock<EventTypeId> = OnceLock::new();
+    static ID: EventTypeIdCache = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.ModuleExport") {
         // Field order: exportedPackage, targetModule.
         let mut fields = crate::event::EventFields::with_capacity(2);
@@ -4236,6 +4256,61 @@ mod tests {
         fr.drain_per_thread_into_repository();
         let rec = fr.get_recording_mut(rid).unwrap();
         assert_eq!(rec.event_count(), 1);
+    }
+
+    #[test]
+    fn test_builtin_event_id_cache_is_registry_keyed() {
+        let _g = drain_ring_baseline();
+
+        let mut first = make_recorder();
+        let first_gc_id = first
+            .type_registry
+            .find_by_name("jdk.GarbageCollection")
+            .unwrap();
+        let first_rid = first.new_recording(RecordingSettings::new("first"));
+        first.start_recording(first_rid);
+        emit_gc_event(&mut first, 1, "G1 Young", "Allocation Failure", 1000, 500);
+        first.drain_per_thread_into_repository();
+        {
+            let rec = first.get_recording_mut(first_rid).unwrap();
+            assert_eq!(rec.event_count(), 1);
+            assert_eq!(rec.get_events()[0].type_id, first_gc_id);
+        }
+        first.stop_recording(first_rid);
+
+        let mut second = FlightRecorder::new();
+        let custom_id = register_custom_event(
+            &mut second.type_registry,
+            "test.BeforeBuiltins",
+            &["Test"],
+            "pre-registered custom event",
+            &[],
+            true,
+            false,
+            None,
+        );
+        assert_eq!(custom_id, EventTypeId(1));
+        register_builtin_events(&mut second.type_registry);
+        let second_gc_id = second
+            .type_registry
+            .find_by_name("jdk.GarbageCollection")
+            .unwrap();
+        assert_ne!(first_gc_id, second_gc_id);
+
+        let second_rid = second.new_recording(RecordingSettings::new("second"));
+        second.start_recording(second_rid);
+        emit_gc_event(
+            &mut second,
+            2,
+            "G1 Young",
+            "Allocation Failure",
+            2000,
+            500,
+        );
+        second.drain_per_thread_into_repository();
+        let rec = second.get_recording_mut(second_rid).unwrap();
+        assert_eq!(rec.event_count(), 1);
+        assert_eq!(rec.get_events()[0].type_id, second_gc_id);
     }
 
     #[test]

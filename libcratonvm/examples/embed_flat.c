@@ -38,7 +38,7 @@
  *
  * This file re-declares the slice of the libcratonvm flat C ABI it touches so
  * it builds standalone. The declarations below match the `#[repr(C)]` types in
- * libcratonvm/src/lib.rs exactly and are kept byte-compatible with the public
+ * libcratonvm/src/lib.rs exactly and are kept ABI-compatible with the public
  * header at libcratonvm/include/cratonvm.h — a real host would instead do
  * `#include "cratonvm.h"` (add `-I libcratonvm/include` to the build command)
  * and delete the re-declarations below.
@@ -101,6 +101,7 @@ typedef struct CratonValue {
 
 extern CratonVm   *cratonvm_create(const JavaVMInitArgs *args);
 extern void        cratonvm_destroy(CratonVm *vm);
+extern jint        cratonvm_release_ref(CratonVm *vm, CratonRef reference);
 extern jint        cratonvm_load_class(CratonVm *vm, const char *name, CratonClass *out_class);
 extern CratonValue cratonvm_invoke_static(CratonVm *vm, const char *cls,
                        const char *method, const char *sig,
@@ -182,7 +183,12 @@ int main(void) {
         }
     }
 
-    /* 6. Tear down. */
+    /* 6. Release object refs, then tear down. */
+    if (cratonvm_release_ref(vm, s) != JNI_OK) {
+        print_err(vm, "cratonvm_release_ref");
+        cratonvm_destroy(vm);
+        return 1;
+    }
     cratonvm_destroy(vm);
     printf("embed_flat: OK\n");
     return 0;

@@ -326,7 +326,7 @@ impl Header {
         let locations_size = read_u32(20);
         let strings_size = read_u32(24);
 
-        if major_version != 1 {
+        if major_version != 1 || minor_version != 0 {
             return Err(JImageError::UnsupportedVersion {
                 major: major_version,
                 minor: minor_version,
@@ -637,8 +637,12 @@ impl JImageReader {
         }
         let index = if redirect < 0 {
             // Direct index into the offset table.
-            match (-redirect).checked_sub(1) {
-                Some(i) => i as usize,
+            match i64::from(redirect)
+                .checked_neg()
+                .and_then(|i| i.checked_sub(1))
+                .and_then(|i| usize::try_from(i).ok())
+            {
+                Some(i) => i,
                 None => return Ok(None),
             }
         } else {
@@ -1154,6 +1158,17 @@ mod tests {
     }
 
     #[test]
+    fn header_parse_unsupported_minor_version() {
+        let mut bytes = vec![0u8; HEADER_SIZE];
+        bytes[0..4].copy_from_slice(&JIMAGE_MAGIC.to_le_bytes());
+        bytes[4..8].copy_from_slice(&((1u32 << 16) | 1).to_le_bytes());
+        assert!(matches!(
+            Header::parse(&bytes),
+            Err(JImageError::UnsupportedVersion { major: 1, minor: 1 })
+        ));
+    }
+
+    #[test]
     fn builder_produces_valid_header() {
         let data = test_builder::build_simple(&sample_resources());
         let reader = JImageReader::from_bytes(data).expect("from_bytes");
@@ -1194,6 +1209,19 @@ mod tests {
             .find_resource("/java.base/does/not/Exist.class")
             .unwrap();
         assert!(miss.is_none());
+    }
+
+    #[test]
+    fn i32_min_redirect_is_absent_not_overflow() {
+        let path = "/java.base/does/not/Exist.class";
+        let mut data = test_builder::build_simple(&sample_resources());
+        let table_len = u32::from_le_bytes(data[16..20].try_into().unwrap()) as usize;
+        let bucket = (jimage_hash(path, HASH_MULTIPLIER) as usize) % table_len;
+        let redirect_offset = HEADER_SIZE + bucket * 4;
+        data[redirect_offset..redirect_offset + 4].copy_from_slice(&i32::MIN.to_le_bytes());
+
+        let reader = JImageReader::from_bytes(data).unwrap();
+        assert!(reader.find_resource(path).unwrap().is_none());
     }
 
     #[test]

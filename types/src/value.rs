@@ -301,9 +301,10 @@ impl ObjectRef {
 //
 // 4. **Current execution model** — The VM currently executes Java threads
 //    on a single OS thread with cooperative scheduling. This makes the
-//    Send+Sync bounds trivially sound. When true OS-thread parallelism is
-//    added (threading/jvm_thread.rs), the monitor protocol in (2) provides
-//    the necessary synchronization.
+//    Send+Sync bounds sound only for the current scheduler. Before true
+//    OS-thread-parallel Java execution is enabled, this impl must be
+//    re-audited and either backed by a complete concurrent-root/relocation
+//    protocol or replaced with a narrower handle/transfer representation.
 //
 // !!! KNOWN LATENT RISK — RE-AUDIT BEFORE ENABLING MULTI-THREADED EXECUTION !!!
 //
@@ -425,21 +426,22 @@ pub fn encode_value(v: Value) -> (u64, u8) {
 }
 
 /// Cold path for [`decode_value`]'s `VTAG_OBJECT` branch: a `VTAG_OBJECT`
-/// slot whose pointer is null or unaligned (a corrupted or zero-initialized
-/// stale slot). This degrades to `Value::Object(None)` in release builds and
-/// counts the reclassification (non-fatal) and returns `Object(None)`.
+/// slot whose pointer is implausible (a corrupted or zero-initialized stale
+/// slot). This degrades to `Value::Object(None)` in release builds and counts
+/// the reclassification (non-fatal) and returns `Object(None)`.
 ///
 /// Splitting this out as a `#[cold]` non-inlined function mirrors
 /// `compact_value::cold_degraded_object_ptr` and gives LLVM permission to
 /// place it off the hot path, freeing icache for the well-formed object
-/// branch in `decode_value`. The well-formed slot satisfies both predicates,
-/// so this is taken essentially never in steady-state interpretation.
+/// branch in `decode_value`. The well-formed slot satisfies the plausibility
+/// predicate, so this is taken essentially never in steady-state interpretation.
 #[cold]
 #[inline(never)]
 fn cold_decode_degraded_object_ptr(ptr: *mut u8) -> Value {
     // T14 / KC16 SIGSEGV audit: gracefully handle corrupted or
-    // zero-initialized slots that have VTAG_OBJECT but a null or unaligned
-    // pointer. This is a deliberately-handled, *counted, non-fatal*
+    // zero-initialized slots that have VTAG_OBJECT but an implausible pointer
+    // (null, unaligned, null-page, or outside the supported address range).
+    // This is a deliberately-handled, *counted, non-fatal*
     // reclassification — never dereference the bogus pointer, return
     // Object(None) instead. This is a recoverable fallback, NOT an invariant
     // violation, so it must not `panic!`/`debug_assert!(false)` (a prior
@@ -488,12 +490,12 @@ pub fn decode_value(val: u64, tag: u8) -> Value {
         VTAG_DOUBLE => Value::Double(f64::from_bits(val)),
         VTAG_OBJECT => {
             let ptr = val as *mut u8;
-            // The degraded paths (null or unaligned pointer arising from a
+            // The degraded paths (implausible pointer payloads arising from a
             // stale slot) are split into a `#[cold]` helper: every
-            // well-formed object slot satisfies both predicates, so the
-            // branch predictor and LLVM's basic-block layout treat them as
+            // well-formed object slot satisfies the plausibility predicate, so
+            // the branch predictor and LLVM's basic-block layout treat them as
             // cold.
-            if ptr.is_null() || (ptr as usize) % 8 != 0 {
+            if !plausible_heap_pointer(val) {
                 cold_decode_degraded_object_ptr(ptr)
             } else {
                 Value::Object(Some(unsafe { ObjectRef::from_raw(ptr) }))
@@ -517,15 +519,17 @@ pub fn is_object_tag(tag: u8) -> bool {
 /// JNI and internal bridges sometimes surface `jobject` handles as raw `i64`
 /// (`Value::Long`). When those bits are written into a reference local without
 /// widening to [`VTAG_OBJECT`], they must still be traced like
-/// `coerce_value_for_return(..., b'L')` does on the read path: **non-zero** and
-/// **8-byte aligned** (`usize` object pointers are always aligned in this VM).
+/// `coerce_value_for_return(..., b'L')` does on the read path: **non-zero**,
+/// **8-byte aligned**, above the null-guard page, and inside the supported
+/// user-space address range.
 ///
-/// Returns `None` for patterns that `coerce_value_for_return` maps to `null`.
+/// Returns `None` for patterns that `coerce_value_for_return` maps to `null`
+/// or that cannot be a VM heap object pointer by the context-free plausibility
+/// rules used by [`decode_value`].
 #[inline(always)]
 pub fn jlong_bits_as_aligned_object_ptr(bits: u64) -> Option<usize> {
-    let p = bits as usize;
-    if p != 0 && p % 8 == 0 {
-        Some(p)
+    if plausible_heap_pointer(bits) && bits <= usize::MAX as u64 {
+        Some(bits as usize)
     } else {
         None
     }
@@ -695,8 +699,10 @@ mod tests {
     fn jlong_bits_as_aligned_object_ptr_matches_coerce_contract() {
         assert_eq!(jlong_bits_as_aligned_object_ptr(0), None);
         assert_eq!(jlong_bits_as_aligned_object_ptr(4), None);
+        assert_eq!(jlong_bits_as_aligned_object_ptr(8), None);
         assert_eq!(jlong_bits_as_aligned_object_ptr(0x1000), Some(0x1000));
         assert_eq!(jlong_bits_as_aligned_object_ptr(0x1008), Some(0x1008));
+        assert_eq!(jlong_bits_as_aligned_object_ptr(1u64 << 47), None);
     }
 
     #[test]
@@ -858,9 +864,26 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn decode_value_rejects_null_page_object() {
+        assert!(matches!(decode_value(8, VTAG_OBJECT), Value::Object(None)));
+        assert!(matches!(
+            decode_value(0xff8, VTAG_OBJECT),
+            Value::Object(None)
+        ));
+    }
+
+    #[test]
+    fn decode_value_rejects_out_of_range_object() {
+        assert!(matches!(
+            decode_value(1u64 << 47, VTAG_OBJECT),
+            Value::Object(None)
+        ));
+    }
+
     /// HIGH long↔object audit: a `VTAG_OBJECT` slot whose pointer is null or
-    /// unaligned degrades to `Object(None)` and must bump the shared
-    /// degradation counter so the reclassification is countable in release.
+    /// otherwise implausible degrades to `Object(None)` and must bump the
+    /// shared degradation counter so the reclassification is countable in release.
     /// Mirrors the precedent of `decode_value_rejects_null_object` /
     /// `decode_value_rejects_unaligned_object`, which exercise the same
     /// release-mode degrade path.
@@ -875,9 +898,16 @@ mod tests {
             decode_value(0x1001, VTAG_OBJECT),
             Value::Object(None)
         ));
+        // Aligned null-page pointer with VTAG_OBJECT -> degrade.
+        assert!(matches!(decode_value(8, VTAG_OBJECT), Value::Object(None)));
+        // Above the supported 47-bit user-space range -> degrade.
+        assert!(matches!(
+            decode_value(1u64 << 47, VTAG_OBJECT),
+            Value::Object(None)
+        ));
         assert!(
-            object_degradation_count() >= 2,
-            "expected at least 2 degradations recorded, got {}",
+            object_degradation_count() >= 4,
+            "expected at least 4 degradations recorded, got {}",
             object_degradation_count()
         );
     }

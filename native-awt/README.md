@@ -34,6 +34,15 @@ cratonvm_native_awt::register_awt_natives(&mut reg);
 Pre-1.0. API stability is best-effort. Tied to the
 [CratonVM](https://github.com/craton-co/cratonvm) workspace version.
 
+## Hardening Notes
+
+- Pending EDT callbacks and peer event sources are held through VM global
+  roots, then resolved at dispatch/event-synthesis time.
+- Java-controlled image and renderer buffers have hard pixel caps and use
+  fallible reservation paths before allocating backing storage.
+- `copyArea` clips to the visible destination before allocating temporary
+  storage, then processes large visible spans in bounded chunks.
+
 ## License
 
 Apache-2.0. See `LICENSE` and `NOTICE` at the workspace root.

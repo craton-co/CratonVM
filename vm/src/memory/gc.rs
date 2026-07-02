@@ -84,7 +84,11 @@ pub fn update_all_roots(
                 if let Some(loc) = f.dbg_locate_addr(main_old) {
                     eprintln!(
                         "[BUG03-gc]   FOUND main_mirror old=0x{:x} in frame#{} {}.{} @ {}",
-                        main_old, fi, f.class_name(), f.method_name(), loc
+                        main_old,
+                        fi,
+                        f.class_name(),
+                        f.method_name(),
+                        loc
                     );
                 }
             }
@@ -108,7 +112,11 @@ pub fn update_all_roots(
                     };
                     eprintln!(
                         "[BUG03-l7] e{} frame#{} Thread.<init> pc={} local7={} stack:{}",
-                        epoch, fi, f.pc, s7, f.dbg_stack_dump()
+                        epoch,
+                        fi,
+                        f.pc,
+                        s7,
+                        f.dbg_stack_dump()
                     );
                 }
             }

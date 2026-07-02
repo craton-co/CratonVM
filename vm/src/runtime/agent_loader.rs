@@ -15,10 +15,9 @@
 //!   4. Resolve and call `Premain-Class.premain(String, Instrumentation)`
 //!      *before* invoking the application's `main(String[])`, falling
 //!      back to `premain(String)` if the two-arg form is unavailable.
-//!   5. Catch any agent exception, log it, and continue (per the
-//!      `java.lang.instrument` package spec) — only fatal `Error`s should
-//!      abort the VM, and we let those bubble up via the normal
-//!      `MethodCallFailed::InternalError` path.
+//!   5. Fail closed if the agent cannot be loaded, its `premain` cannot be
+//!      resolved, or `premain` throws. HotSpot aborts startup when a requested
+//!      startup instrumentation agent fails.
 //!
 //! This module is the **JAR-side** loader: it does not own the
 //! `Instrumentation` Rust state (Owner A, see `runtime/instrument.rs`),
@@ -89,10 +88,8 @@ pub struct LoadedAgent {
 // Errors
 // ---------------------------------------------------------------------------
 
-/// Failure modes for agent loading. Most callers in CLI / VM startup will
-/// turn these into a `tracing::warn!` and continue — only the
-/// `PremainFatalError` variant (a Java `Error` thrown by the agent's
-/// `premain`) should abort the VM.
+/// Failure modes for agent loading. CLI / VM startup must treat every variant
+/// as fatal for a requested startup `-javaagent`.
 #[derive(Debug)]
 pub enum AgentLoadError {
     /// The `-javaagent:` argument did not start with the expected prefix.
@@ -108,10 +105,10 @@ pub enum AgentLoadError {
         class: String,
         descriptors_tried: Vec<String>,
     },
-    /// The agent's `premain` threw a fatal `Error` (e.g. `OutOfMemoryError`
-    /// or any `java.lang.Error` subclass) — the VM should NOT continue.
-    /// Plain `Exception`s are caught and turned into warnings instead.
+    /// The agent's `premain` threw any Java `Throwable`; startup must abort.
     PremainFatalError { class: String, message: String },
+    /// The VM could not create the Instrumentation implementation object.
+    InstrumentationUnavailable { class: String, cause: String },
     /// The Premain-Class itself failed to load (e.g. ClassNotFoundException).
     PremainClassNotFound { class: String, cause: String },
     /// Internal VM error (linkage failure, out-of-memory during mirror
@@ -147,7 +144,13 @@ impl fmt::Display for AgentLoadError {
                 )
             }
             AgentLoadError::PremainFatalError { class, message } => {
-                write!(f, "premain of `{class}` threw fatal Error: {message}")
+                write!(f, "premain of `{class}` threw: {message}")
+            }
+            AgentLoadError::InstrumentationUnavailable { class, cause } => {
+                write!(
+                    f,
+                    "could not initialize Instrumentation for `{class}`: {cause}"
+                )
             }
             AgentLoadError::PremainClassNotFound { class, cause } => {
                 write!(f, "Premain-Class `{class}` failed to load: {cause}")
@@ -288,37 +291,17 @@ fn boolean_attribute(attrs: &std::collections::HashMap<String, String>, key: &st
 /// bootstrap subsystems are alive) but BEFORE invoking the
 /// application's `main`.
 ///
-/// On a per-agent failure we log a `tracing::warn!` and proceed —
-/// matching HotSpot's behaviour for a non-fatal agent fault. Only an
-/// `AgentLoadError::PremainFatalError` (a Java `Error`) bubbles up to
-/// the caller, which can decide whether to abort the VM.
+/// On a per-agent failure, the first error is returned immediately.
+/// Any requested agent failure aborts startup, matching HotSpot's
+/// fail-closed handling for startup instrumentation agents.
 pub fn invoke_premains(
     shared: &SharedVm,
     thread: &mut JvmThread,
     agents: &[LoadedAgent],
 ) -> Result<(), AgentLoadError> {
     for agent in agents {
-        match invoke_one_premain(shared, thread, agent) {
-            Ok(()) => {
-                tracing::info!("javaagent: {} premain completed", agent.premain_class);
-            }
-            Err(e @ AgentLoadError::PremainFatalError { .. }) => {
-                // Per spec a fatal Error from the agent should abort
-                // the VM. Surface immediately.
-                return Err(e);
-            }
-            Err(other) => {
-                // All other failures: warn and continue. The user's
-                // application still gets to run, just without the
-                // misconfigured agent.
-                tracing::warn!(
-                    "javaagent: skipping `{}` ({}): {}",
-                    agent.jar_path.display(),
-                    agent.premain_class,
-                    other
-                );
-            }
-        }
+        invoke_one_premain(shared, thread, agent)?;
+        tracing::info!("javaagent: {} premain completed", agent.premain_class);
     }
     Ok(())
 }
@@ -364,13 +347,6 @@ fn invoke_one_premain(
         });
     }
 
-    // Step 7: build the Instrumentation mirror. We try to instantiate
-    // `sun.instrument.InstrumentationImpl` if it's loadable; otherwise
-    // we synthesise a placeholder and pass `null` to the agent — this
-    // matches what HotSpot does when running with `-noverify` and a
-    // toy agent that happens not to use the Instrumentation argument.
-    let instrumentation_ref = build_instrumentation_mirror(shared, thread, agent);
-
     // Step 8: pick a method signature and invoke.
     //
     // The spec says we MUST first try the two-arg form
@@ -387,17 +363,14 @@ fn invoke_one_premain(
         Value::Object(Some(crate::vm::create_java_string(shared, &agent_args_str)));
 
     let result = if has_two_arg {
-        let inst_arg = match instrumentation_ref {
-            Some(o) => Value::Object(Some(o)),
-            None => Value::Object(None),
-        };
+        let instrumentation_ref = build_instrumentation_mirror(shared, thread, agent)?;
         crate::vm::invoke_or_native(
             shared,
             thread,
             &premain_internal,
             "premain",
             two_arg_desc,
-            &[agent_args_obj, inst_arg],
+            &[agent_args_obj, Value::Object(Some(instrumentation_ref))],
         )
     } else if has_one_arg {
         crate::vm::invoke_or_native(
@@ -418,9 +391,6 @@ fn invoke_one_premain(
     match result {
         Ok(_) => Ok(()),
         Err(MethodCallFailed::ExceptionThrown(exc_ref)) => {
-            // Decide fatal-vs-warn: any java.lang.Error subclass is fatal,
-            // anything else (Exception / RuntimeException / Throwable
-            // bare) is non-fatal per the instrument package spec.
             let exc_class_name = {
                 let cm = shared.class_manager.read();
                 let cid = shared.heap.class_id_of(exc_ref);
@@ -428,19 +398,10 @@ fn invoke_one_premain(
                     .map(|c| c.name.to_string())
                     .unwrap_or_else(|| format!("class#{cid}"))
             };
-            if is_error_subclass(shared, &exc_class_name) {
-                Err(AgentLoadError::PremainFatalError {
-                    class: agent.premain_class.clone(),
-                    message: exc_class_name,
-                })
-            } else {
-                tracing::warn!(
-                    "javaagent: premain of `{}` threw {} (continuing)",
-                    agent.premain_class,
-                    exc_class_name
-                );
-                Ok(())
-            }
+            Err(AgentLoadError::PremainFatalError {
+                class: agent.premain_class.clone(),
+                message: exc_class_name,
+            })
         }
         Err(MethodCallFailed::InternalError(err)) => Err(AgentLoadError::Internal(format!(
             "premain of {}: {err}",
@@ -459,12 +420,14 @@ fn build_instrumentation_mirror(
     shared: &SharedVm,
     thread: &mut JvmThread,
     agent: &LoadedAgent,
-) -> Option<cratonvm_types::ObjectRef> {
+) -> Result<cratonvm_types::ObjectRef, AgentLoadError> {
     let class_internal = "sun/instrument/InstrumentationImpl";
-    let class_id = match shared.load_class_concurrent(class_internal) {
-        Ok(id) => id,
-        Err(_) => return None,
-    };
+    let class_id = shared.load_class_concurrent(class_internal).map_err(|err| {
+        AgentLoadError::InstrumentationUnavailable {
+            class: agent.premain_class.clone(),
+            cause: format!("failed to load {class_internal}: {err}"),
+        }
+    })?;
 
     // Pull num_total_fields so we allocate the right object size.
     let num_fields = {
@@ -475,12 +438,12 @@ fn build_instrumentation_mirror(
     };
     let inst_obj = shared.heap.alloc_object(class_id, num_fields);
 
-    // Best-effort init: the real-JDK constructor takes
+    // The real-JDK constructor takes
     // `(JLjava/lang/String;ZZ)V` (id, agentArgs, isRetransformable,
-    // isRedefineClasses) — try to call it but don't fail if unavailable.
+    // isRedefineClasses). A constructor failure aborts the requested agent.
     let init_descriptor = "(JLjava/lang/String;ZZ)V";
     let agent_args_str = agent.agent_args.clone().unwrap_or_default();
-    let _ = crate::vm::invoke_or_native(
+    crate::vm::invoke_or_native(
         shared,
         thread,
         class_internal,
@@ -493,9 +456,13 @@ fn build_instrumentation_mirror(
             Value::Int(if agent.can_retransform { 1 } else { 0 }),
             Value::Int(if agent.can_redefine { 1 } else { 0 }),
         ],
-    );
+    )
+    .map_err(|err| AgentLoadError::InstrumentationUnavailable {
+        class: agent.premain_class.clone(),
+        cause: format!("failed to initialize {class_internal}: {err}"),
+    })?;
 
-    Some(inst_obj)
+    Ok(inst_obj)
 }
 
 /// Returns `true` iff a class declares (or inherits) a method with the
@@ -510,39 +477,6 @@ fn method_present(shared: &SharedVm, class_internal: &str, name: &str, descripto
     cm.get_class(cid)
         .and_then(|c| c.find_method(name, descriptor))
         .is_some()
-}
-
-/// Walk the loaded-class hierarchy to decide whether `exc_class_name`
-/// (slash-separated internal name) is a subclass of `java.lang.Error`.
-/// Returns `false` if the class isn't loaded — agents that throw
-/// uninstantiated classes are treated as non-fatal which is the
-/// conservative choice.
-fn is_error_subclass(shared: &SharedVm, exc_class_name: &str) -> bool {
-    if exc_class_name == "java/lang/Error" {
-        return true;
-    }
-    let cm = shared.class_manager.read();
-    let mut cid = match cm.get_loaded_class_id(exc_class_name) {
-        Some(id) => id,
-        None => return false,
-    };
-    // Iterative walk up the superclass chain.
-    let mut steps = 0usize;
-    while steps < 64 {
-        let cls = match cm.get_class(cid) {
-            Some(c) => c,
-            None => return false,
-        };
-        if &*cls.name == "java/lang/Error" {
-            return true;
-        }
-        cid = match cls.superclass {
-            Some(s) => s,
-            None => return false,
-        };
-        steps += 1;
-    }
-    false
 }
 
 // ---------------------------------------------------------------------------
