@@ -9,9 +9,11 @@
 //! Java object. The `Value` layout is size/alignment-asserted to stay
 //! compatible with the JIT slot layout.
 
+use std::collections::HashSet;
 use std::fmt;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 
 /// A JVM runtime value.
 ///
@@ -119,6 +121,31 @@ fn debug_assert_aligned(ptr: *mut u8) {
 // a stable integer, so we derive a non-zero u64 token from it via its `Hash`.
 const SINGLE_THREAD_GUARD_UNSET: u64 = 0;
 static SINGLE_THREAD_GUARD: AtomicU64 = AtomicU64::new(SINGLE_THREAD_GUARD_UNSET);
+static KNOWN_OBJECT_REFS: OnceLock<Mutex<HashSet<usize>>> = OnceLock::new();
+
+fn known_object_refs() -> &'static Mutex<HashSet<usize>> {
+    KNOWN_OBJECT_REFS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn lock_known_object_refs() -> std::sync::MutexGuard<'static, HashSet<usize>> {
+    known_object_refs().lock().unwrap_or_else(|e| e.into_inner())
+}
+
+#[inline]
+fn record_object_ref_payload(ptr: *mut u8) {
+    let raw = ptr as u64;
+    if plausible_heap_pointer(raw) {
+        lock_known_object_refs().insert(ptr as usize);
+    }
+}
+
+#[inline]
+pub(crate) fn object_ref_payload_is_known(raw: u64) -> bool {
+    if !plausible_heap_pointer(raw) || raw > usize::MAX as u64 {
+        return false;
+    }
+    lock_known_object_refs().contains(&(raw as usize))
+}
 
 /// Derive a stable, non-zero u64 token for the current OS thread.
 ///
@@ -240,6 +267,7 @@ impl ObjectRef {
         // MED tripwire: assert the single-OS-thread invariant the Send/Sync
         // impls rely on (opt-in via CRATONVM_ASSERT_SINGLE_OS_THREAD).
         enforce_single_os_thread();
+        record_object_ref_payload(ptr);
         Self {
             ptr: unsafe { NonNull::new_unchecked(ptr) },
         }
@@ -264,6 +292,7 @@ impl ObjectRef {
         // MED tripwire: assert the single-OS-thread invariant the Send/Sync
         // impls rely on (opt-in via CRATONVM_ASSERT_SINGLE_OS_THREAD).
         enforce_single_os_thread();
+        record_object_ref_payload(ptr.as_ptr());
         Self { ptr }
     }
 
@@ -426,9 +455,9 @@ pub fn encode_value(v: Value) -> (u64, u8) {
 }
 
 /// Cold path for [`decode_value`]'s `VTAG_OBJECT` branch: a `VTAG_OBJECT`
-/// slot whose pointer is implausible (a corrupted or zero-initialized stale
-/// slot). This degrades to `Value::Object(None)` in release builds and counts
-/// the reclassification (non-fatal) and returns `Object(None)`.
+/// slot whose pointer is implausible or lacks prior `ObjectRef` provenance.
+/// This degrades to `Value::Object(None)` in release builds, counts the
+/// reclassification, and returns `Object(None)`.
 ///
 /// Splitting this out as a `#[cold]` non-inlined function mirrors
 /// `compact_value::cold_degraded_object_ptr` and gives LLVM permission to
@@ -439,8 +468,9 @@ pub fn encode_value(v: Value) -> (u64, u8) {
 #[inline(never)]
 fn cold_decode_degraded_object_ptr(ptr: *mut u8) -> Value {
     // T14 / KC16 SIGSEGV audit: gracefully handle corrupted or
-    // zero-initialized slots that have VTAG_OBJECT but an implausible pointer
-    // (null, unaligned, null-page, or outside the supported address range).
+    // zero-initialized slots that have VTAG_OBJECT but an unacceptable pointer
+    // (null, unaligned, null-page, outside the supported address range, or
+    // never seen through ObjectRef construction).
     // This is a deliberately-handled, *counted, non-fatal*
     // reclassification — never dereference the bogus pointer, return
     // Object(None) instead. This is a recoverable fallback, NOT an invariant
@@ -481,6 +511,12 @@ pub const fn plausible_heap_pointer(raw: u64) -> bool {
 }
 
 /// Decode a compact (u64, u8) pair back into a Value.
+///
+/// For `VTAG_OBJECT`, this safe context-free decoder only recreates an
+/// `ObjectRef` for payloads that have already crossed the unsafe
+/// `ObjectRef::from_raw` / `from_raw_nonnull` boundary in this process.
+/// Arbitrary aligned raw bits degrade to null instead of fabricating a fresh
+/// object reference.
 #[inline(always)]
 pub fn decode_value(val: u64, tag: u8) -> Value {
     match tag {
@@ -490,12 +526,11 @@ pub fn decode_value(val: u64, tag: u8) -> Value {
         VTAG_DOUBLE => Value::Double(f64::from_bits(val)),
         VTAG_OBJECT => {
             let ptr = val as *mut u8;
-            // The degraded paths (implausible pointer payloads arising from a
-            // stale slot) are split into a `#[cold]` helper: every
-            // well-formed object slot satisfies the plausibility predicate, so
-            // the branch predictor and LLVM's basic-block layout treat them as
-            // cold.
-            if !plausible_heap_pointer(val) {
+            // The degraded paths (implausible or never-seen pointer payloads)
+            // are split into a `#[cold]` helper: every well-formed object slot
+            // should have crossed ObjectRef construction already, so the branch
+            // predictor and LLVM's basic-block layout treat them as cold.
+            if !object_ref_payload_is_known(val) {
                 cold_decode_degraded_object_ptr(ptr)
             } else {
                 Value::Object(Some(unsafe { ObjectRef::from_raw(ptr) }))
@@ -504,6 +539,26 @@ pub fn decode_value(val: u64, tag: u8) -> Value {
         VTAG_NULL => Value::Object(None),
         VTAG_RETADDR => Value::ReturnAddress(val as u32),
         _ => Value::Uninitialized,
+    }
+}
+
+/// Decode a compact `(u64, u8)` pair with a caller-supplied live-heap check.
+///
+/// This is the preferred path for code that has heap context. It accepts a
+/// non-null object payload only when it is both pointer-plausible and the
+/// supplied predicate confirms that the address is currently a live object.
+#[inline]
+pub fn decode_value_checked(val: u64, tag: u8, is_heap_object: impl Fn(u64) -> bool) -> Value {
+    match tag {
+        VTAG_OBJECT => {
+            let ptr = val as *mut u8;
+            if plausible_heap_pointer(val) && is_heap_object(val) {
+                Value::Object(Some(unsafe { ObjectRef::from_raw(ptr) }))
+            } else {
+                cold_decode_degraded_object_ptr(ptr)
+            }
+        }
+        _ => decode_value(val, tag),
     }
 }
 
@@ -518,17 +573,16 @@ pub fn is_object_tag(tag: u8) -> bool {
 ///
 /// JNI and internal bridges sometimes surface `jobject` handles as raw `i64`
 /// (`Value::Long`). When those bits are written into a reference local without
-/// widening to [`VTAG_OBJECT`], they must still be traced like
-/// `coerce_value_for_return(..., b'L')` does on the read path: **non-zero**,
-/// **8-byte aligned**, above the null-guard page, and inside the supported
-/// user-space address range.
+/// widening to [`VTAG_OBJECT`], they may be traced only if they look like a
+/// plausible pointer and have already crossed the unsafe `ObjectRef`
+/// construction boundary in this process.
 ///
 /// Returns `None` for patterns that `coerce_value_for_return` maps to `null`
-/// or that cannot be a VM heap object pointer by the context-free plausibility
-/// rules used by [`decode_value`].
+/// or that cannot be a VM heap object pointer by the rules used by
+/// [`decode_value`].
 #[inline(always)]
 pub fn jlong_bits_as_aligned_object_ptr(bits: u64) -> Option<usize> {
-    if plausible_heap_pointer(bits) && bits <= usize::MAX as u64 {
+    if object_ref_payload_is_known(bits) {
         Some(bits as usize)
     } else {
         None
@@ -700,8 +754,13 @@ mod tests {
         assert_eq!(jlong_bits_as_aligned_object_ptr(0), None);
         assert_eq!(jlong_bits_as_aligned_object_ptr(4), None);
         assert_eq!(jlong_bits_as_aligned_object_ptr(8), None);
-        assert_eq!(jlong_bits_as_aligned_object_ptr(0x1000), Some(0x1000));
-        assert_eq!(jlong_bits_as_aligned_object_ptr(0x1008), Some(0x1008));
+        assert_eq!(
+            jlong_bits_as_aligned_object_ptr(0x0000_5DDD_EEEE_F000),
+            None
+        );
+        let known = 0x0000_5555_7777_8000usize;
+        let _obj = unsafe { ObjectRef::from_raw(known as *mut u8) };
+        assert_eq!(jlong_bits_as_aligned_object_ptr(known as u64), Some(known));
         assert_eq!(jlong_bits_as_aligned_object_ptr(1u64 << 47), None);
     }
 
@@ -837,6 +896,22 @@ mod tests {
         assert!(is_object_tag(tag));
         let decoded = decode_value(val, tag);
         assert!(matches!(decoded, Value::Object(Some(r)) if r.as_ptr() as u64 == 0x1234_5678_ABC0));
+        let checked = decode_value_checked(val, tag, |addr| addr == val);
+        assert!(matches!(checked, Value::Object(Some(r)) if r.as_ptr() as u64 == 0x1234_5678_ABC0));
+    }
+
+    #[test]
+    fn decode_value_rejects_unseen_plausible_object_payload() {
+        let unseen = 0x0000_6AAA_BBBB_C000u64;
+        assert!(plausible_heap_pointer(unseen));
+        assert!(matches!(
+            decode_value(unseen, VTAG_OBJECT),
+            Value::Object(None)
+        ));
+        assert!(matches!(
+            decode_value_checked(unseen, VTAG_OBJECT, |_| false),
+            Value::Object(None)
+        ));
     }
 
     #[test]
