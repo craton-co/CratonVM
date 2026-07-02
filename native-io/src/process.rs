@@ -62,6 +62,7 @@ use std::collections::HashMap;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 
@@ -585,6 +586,43 @@ fn handle_of(ctx: &mut dyn NativeContext, proc_ref: ObjectRef) -> i64 {
     }
 }
 
+fn time_unit_to_millis(ctx: &mut dyn NativeContext, value: i64, unit: Option<ObjectRef>) -> i64 {
+    if value <= 0 {
+        return 0;
+    }
+
+    if let Some(unit) = unit {
+        if let Ok(Some(Value::Long(ms))) =
+            ctx.invoke_virtual(unit, "toMillis", "(J)J", &[Value::Long(value)])
+        {
+            return ms.max(0);
+        }
+
+        let ordinal = match ctx.get_field_by_name(unit, "ordinal") {
+            Value::Int(o) => o,
+            _ => ctx.get_field(unit, 0).as_int().unwrap_or(2),
+        };
+
+        fn sat_mul(value: i64, factor: i64) -> i64 {
+            value.checked_mul(factor).unwrap_or(i64::MAX)
+        }
+
+        return match ordinal {
+            0 => value / 1_000_000,
+            1 => value / 1_000,
+            2 => value,
+            3 => sat_mul(value, 1_000),
+            4 => sat_mul(value, 60_000),
+            5 => sat_mul(value, 3_600_000),
+            6 => sat_mul(value, 86_400_000),
+            _ => value,
+        }
+        .max(0);
+    }
+
+    value
+}
+
 // ---------------------------------------------------------------------------
 // Native method implementations
 // ---------------------------------------------------------------------------
@@ -822,6 +860,75 @@ fn native_process_wait_for(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     Ok(Some(Value::Int(code)))
 }
 
+/// `java.lang.Process.waitFor(long, TimeUnit)Z`.
+///
+/// WildFly uses this overload to detect launch failures without blocking
+/// forever on the server process. A missing registration raised
+/// `NoSuchMethodError`; delegating to the blocking `waitFor()` would be just as
+/// bad for long-lived servers, so poll the process table until the timeout
+/// expires.
+fn native_process_wait_for_timeout(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let timeout = match args.get(1) {
+        Some(Value::Long(v)) => *v,
+        Some(Value::Int(v)) => *v as i64,
+        _ => 0,
+    };
+    let unit = match args.get(2) {
+        Some(Value::Object(Some(o))) => Some(*o),
+        _ => None,
+    };
+
+    let handle = handle_of(ctx, this);
+    if handle == 0 {
+        let exited = !matches!(
+            ctx.get_field(this, PROC_FIELD_EXIT),
+            Value::Int(EXIT_NOT_YET)
+        );
+        return Ok(Some(Value::Int(if exited { 1 } else { 0 })));
+    }
+
+    if let Some(code) = try_exit_handle(handle) {
+        ctx.set_field(this, PROC_FIELD_EXIT, Value::Int(code));
+        return Ok(Some(Value::Int(1)));
+    }
+    if timeout <= 0 {
+        return Ok(Some(Value::Int(0)));
+    }
+
+    let mut timeout_ms = time_unit_to_millis(ctx, timeout, unit);
+    if timeout_ms == 0 {
+        timeout_ms = 1;
+    }
+    let timeout_ms = timeout_ms as u64;
+    let Some(deadline) = Instant::now().checked_add(Duration::from_millis(timeout_ms)) else {
+        let code = wait_for_handle(handle);
+        ctx.set_field(this, PROC_FIELD_EXIT, Value::Int(code));
+        return Ok(Some(Value::Int(1)));
+    };
+
+    loop {
+        if let Some(code) = try_exit_handle(handle) {
+            ctx.set_field(this, PROC_FIELD_EXIT, Value::Int(code));
+            return Ok(Some(Value::Int(1)));
+        }
+
+        let now = Instant::now();
+        if now >= deadline {
+            return Ok(Some(Value::Int(0)));
+        }
+
+        let remaining = deadline.saturating_duration_since(now);
+        std::thread::sleep(remaining.min(Duration::from_millis(10)));
+    }
+}
+
 /// `java.lang.Process.exitValue()I`
 ///
 /// Throws `IllegalThreadStateException` if the process is still running
@@ -840,7 +947,7 @@ fn native_process_exit_value(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
             ctx.set_field(this, PROC_FIELD_EXIT, Value::Int(code));
             Ok(Some(Value::Int(code)))
         }
-        None => Err(RuntimeError::IllegalStateException {
+        None => Err(RuntimeError::IllegalThreadStateException {
             message: "process has not exited".to_string(),
         }
         .into()),
@@ -1115,6 +1222,12 @@ pub fn register_process_natives(registry: &mut NativeMethodRegistry) {
     // objects `spawn_and_wrap` actually creates.
     for proc_cls in ["java/lang/Process", SYNTHETIC_PROCESS_CLASS] {
         registry.register(proc_cls, "waitFor", "()I", native_process_wait_for);
+        registry.register(
+            proc_cls,
+            "waitFor",
+            "(JLjava/util/concurrent/TimeUnit;)Z",
+            native_process_wait_for_timeout,
+        );
         registry.register(proc_cls, "exitValue", "()I", native_process_exit_value);
         registry.register(proc_cls, "isAlive", "()Z", native_process_is_alive);
         registry.register(proc_cls, "destroy", "()V", native_process_destroy);

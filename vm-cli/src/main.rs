@@ -1271,6 +1271,18 @@ fn normalize_java_launcher_argv(args: Vec<String>) -> Vec<String> {
             // name (see the comment above).
             i += 1;
         }
+        // HotSpot VM-selection flags. Modern HotSpot accepts `-server` and
+        // `-client` for compatibility (the server VM is effectively the only
+        // implementation on current JDKs). WildFly's HostController launch
+        // command still passes `-server`; accept-and-ignore it so the `java`
+        // shim remains drop-in compatible instead of clap interpreting
+        // `-server` as a short-option cluster and aborting on `-s`.
+        else if a == "-server" || a == "-client" {
+            if std::env::var_os("CRATONVM_DBG_ARGS").is_some() {
+                eprintln!("[cratonvm] ignoring HotSpot VM selection flag: {a}");
+            }
+            i += 1;
+        }
         // Assertion control flags: `-ea`/`-enableassertions[:<pkgname>...|:<classname>]`,
         // `-da`/`-disableassertions[...]`, `-esa`/`-enablesystemassertions`,
         // `-dsa`/`-disablesystemassertions`. CratonVM does not implement assertion
@@ -4750,6 +4762,21 @@ mod tests {
         let raw = argv(&["java", "-Xint", "-Xbatch", "-Xrs", "-Xnoclassgc", "Main"]);
         let out = normalize_java_launcher_argv(raw);
         assert_eq!(out, argv(&["java", "Main"]));
+    }
+
+    #[test]
+    fn hotspot_server_flag_passes_clap_after_full_pipeline() {
+        // WildFly HostController still launches child JVMs with `-server`.
+        // HotSpot accepts it as a VM-selection hint; CratonVM ignores it but
+        // must not let clap parse it as short flags (`-s -e ...`).
+        let argv0: Vec<String> = argv(&["java", "-server", "-classpath", "x", "Main"]);
+        let stage1 = insert_program_args_separator(argv0);
+        let stage2 = normalize_java_launcher_argv(stage1);
+        let (stage3, _props) = extract_system_properties(stage2);
+        let (stage4, _hot) = extract_hotspot_flags(stage3);
+        let parsed = Args::try_parse_from(stage4).expect("clap must accept HotSpot -server");
+        assert_eq!(parsed.classpath.as_deref(), Some("x"));
+        assert_eq!(parsed.class_name.as_deref(), Some("Main"));
     }
 
     #[test]

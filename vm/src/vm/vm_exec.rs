@@ -11074,6 +11074,13 @@ fn invoke_on_class_shared_inner(
                                 | "getEffectiveLevel"
                                 | "getName"
                                 | "getUseParentHandlers"
+                                | "setUseParentHandlers"
+                                | "getHandlers"
+                                | "addHandler"
+                                | "removeHandler"
+                                | "setHandlers"
+                                | "setUseParentFilters"
+                                | "getUseParentFilters"
                                 // Keycloak boot NPE — `Logger.logRaw` bytecode
                                 // dereferences `this.loggerNode` (NPE at pc=48
                                 // calling `LoggerNode.isLoggable` and at pc=70

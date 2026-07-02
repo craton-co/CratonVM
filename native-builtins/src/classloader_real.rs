@@ -886,6 +886,11 @@ fn cl_real_load_class_base(
         if let Ok(Some(mirror)) = ctx.load_class(&internal) {
             return Ok(Some(mirror));
         }
+        if let Some(mirror) =
+            crate::jboss_module_loader::load_property_bridge_class(ctx, &class_name)
+        {
+            return Ok(Some(mirror));
+        }
     }
 
     // 2. Custom-classloader extension point: if the receiver overrides
