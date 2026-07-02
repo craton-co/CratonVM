@@ -93,7 +93,7 @@ pub fn read_class_arc(source: Arc<[u8]>) -> Result<ClassFile, ClassReaderError> 
 
     // Access flags, this class, super class
     let access_flags_raw = buf.read_u16()?;
-    let access_flags = ClassAccessFlags::from_bits_truncate(access_flags_raw);
+    let access_flags = ClassAccessFlags::from_bits_retain(access_flags_raw);
 
     // Resolve `this_class` / `super_class` / interface names directly to
     // the pool-interned `Arc<str>` rather than allocating fresh Strings.
@@ -463,7 +463,7 @@ fn read_field(
     source: &Arc<[u8]>,
 ) -> Result<ClassFileField, ClassReaderError> {
     let access_flags_raw = buf.read_u16()?;
-    let access_flags = FieldAccessFlags::from_bits_truncate(access_flags_raw);
+    let access_flags = FieldAccessFlags::from_bits_retain(access_flags_raw);
     let name_index = buf.read_u16()?;
     // Fetch the `Arc<str>` straight from the constant pool — it was already
     // interned at parse time via `cratonvm_types::intern_arc`, so this is a
@@ -498,7 +498,7 @@ fn read_method(
     source: &Arc<[u8]>,
 ) -> Result<ClassFileMethod, ClassReaderError> {
     let access_flags_raw = buf.read_u16()?;
-    let access_flags = MethodAccessFlags::from_bits_truncate(access_flags_raw);
+    let access_flags = MethodAccessFlags::from_bits_retain(access_flags_raw);
     let name_index = buf.read_u16()?;
     // Fetch the `Arc<str>` straight from the constant pool — it was already
     // interned at parse time via `cratonvm_types::intern_arc`, so this is a
