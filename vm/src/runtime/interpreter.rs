@@ -2091,7 +2091,7 @@ pub(crate) fn update_root_snapshot(shared: &SharedVm, thread: &mut JvmThread) {
 /// Called at safepoints: allocation sites and backward branches (loop iterations).
 /// If STW is active, this thread deposits its roots and waits for GC to complete,
 /// then applies the pointer map to update its own frame references.
-fn safepoint_check(shared: &SharedVm, thread: &mut JvmThread) {
+pub(crate) fn safepoint_check(shared: &SharedVm, thread: &mut JvmThread) {
     use std::sync::atomic::Ordering;
     // bc math-ec 0x4 (CRATONVM_DBG_MEMWATCH): O(1) poll of one absolute
     // watched address at full safepoint frequency — catches the corrupting
@@ -18029,6 +18029,14 @@ fn force_native_over_real_jdk_bytecode(
     // our null getTypeAnnotationBytes0 + unexposed ConstantPool. Single source
     // of truth — `check_override` (vm_exec.rs) consults the same predicate.
     if is_typeuse_annotation_native_override(class_name, method_name, method_descriptor) {
+        return true;
+    }
+    // Surefire fork bootstrap/teardown: bypass ServiceLoader decoder discovery
+    // and the acknowledgedExit semaphore path, both of which rely on JDK
+    // internals CratonVM shadows with registered natives.
+    if class_name == "org/apache/maven/surefire/booter/ForkedBooter"
+        && matches!(method_name, "lookupDecoderFactory" | "acknowledgedExit")
+    {
         return true;
     }
     matches!(

@@ -2879,6 +2879,12 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     );
     registry.register(
         "org/apache/maven/surefire/booter/ForkedBooter",
+        "acknowledgedExit",
+        "()V",
+        native_surefire_forkedbooter_acknowledged_exit,
+    );
+    registry.register(
+        "org/apache/maven/surefire/booter/ForkedBooter",
         "exit",
         "()V",
         native_surefire_forkedbooter_exit1,
@@ -14016,6 +14022,68 @@ fn native_surefire_forkedbooter_run(
         );
     }
     Ok(None)
+}
+
+fn surefire_ignore(label: &str, result: MethodCallResult) {
+    if let Err(err) = result {
+        eprintln!("[SUREFIRE-ACK-EXIT] {label} ignored: {err:?}");
+    }
+}
+
+fn native_surefire_forkedbooter_acknowledged_exit(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let is_null = |v: Value| matches!(v, Value::Object(None));
+    let ev = ctx.get_field_by_name(this, "eventChannel");
+    let cr = ctx.get_field_by_name(this, "commandReader");
+    eprintln!(
+        "[SUREFIRE-ACK-EXIT] invoked; eventChannel_null={} commandReader_null={}",
+        is_null(ev),
+        is_null(cr),
+    );
+
+    if let Value::Object(Some(event_channel)) = ev {
+        surefire_ignore(
+            "eventChannel.bye",
+            ctx.invoke_virtual(event_channel, "bye", "()V", &[]),
+        );
+        surefire_ignore(
+            "eventChannel.onJvmExit",
+            ctx.invoke_virtual(event_channel, "onJvmExit", "()V", &[]),
+        );
+    }
+    surefire_ignore(
+        "cancelPingScheduler",
+        ctx.invoke_special(
+            "org/apache/maven/surefire/booter/ForkedBooter",
+            "cancelPingScheduler",
+            "()V",
+            &[Value::Object(Some(this))],
+        ),
+    );
+    if let Value::Object(Some(command_reader)) = cr {
+        surefire_ignore(
+            "commandReader.stop",
+            ctx.invoke_virtual(command_reader, "stop", "()V", &[]),
+        );
+    }
+    surefire_ignore(
+        "closeForkChannel",
+        ctx.invoke_special(
+            "org/apache/maven/surefire/booter/ForkedBooter",
+            "closeForkChannel",
+            "()V",
+            &[Value::Object(Some(this))],
+        ),
+    );
+
+    if std::env::var("CRATONVM_SOFT_EXIT").as_deref() == Ok("1") {
+        eprintln!("[SUREFIRE-ACK-EXIT] soft-returning due to CRATONVM_SOFT_EXIT=1");
+        return Ok(None);
+    }
+    std::process::exit(0);
 }
 
 fn native_surefire_forkedbooter_exit1(
@@ -27727,18 +27795,109 @@ fn native_cdl_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
 // declared slot type, survives the coercion, and is traced/relocated by the
 // GC. The raw-Int fallback covers legacy synthetic allocations
 // (alloc_concurrent_synthetic — no real layout, so the Int writes survive).
+struct SemObjKeyEntry {
+    last_ptr: usize,
+    generation: u32,
+}
+
+fn sem_obj_key_registry(
+) -> &'static parking_lot::Mutex<std::collections::HashMap<u32, Vec<SemObjKeyEntry>>> {
+    static R: std::sync::OnceLock<
+        parking_lot::Mutex<std::collections::HashMap<u32, Vec<SemObjKeyEntry>>>,
+    > = std::sync::OnceLock::new();
+    R.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()))
+}
+
+#[inline]
+fn pack_sem_obj_key(hash: u32, generation: u32) -> usize {
+    ((hash as usize) << 32) | generation as usize
+}
+
+fn sem_obj_key_for(ctx: &dyn NativeContext, obj: ObjectRef) -> usize {
+    let hash = ctx.identity_hash_code(obj) as u32;
+    let ptr = obj.as_ptr() as usize;
+    let mut reg = sem_obj_key_registry().lock();
+    let slots = reg.entry(hash).or_default();
+    if let Some(slot) = slots.iter().find(|s| s.last_ptr == ptr) {
+        return pack_sem_obj_key(hash, slot.generation);
+    }
+    if hash != 0 && slots.len() == 1 {
+        slots[0].last_ptr = ptr;
+        return pack_sem_obj_key(hash, slots[0].generation);
+    }
+    let generation = slots.len() as u32;
+    slots.push(SemObjKeyEntry {
+        last_ptr: ptr,
+        generation,
+    });
+    pack_sem_obj_key(hash, generation)
+}
+
+#[derive(Clone, Copy)]
+struct SemState {
+    permits: i32,
+    fair: i32,
+}
+
+fn sem_states_by_obj() -> &'static parking_lot::Mutex<std::collections::HashMap<usize, SemState>>
+{
+    static H: std::sync::OnceLock<parking_lot::Mutex<std::collections::HashMap<usize, SemState>>> =
+        std::sync::OnceLock::new();
+    H.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn sem_side_state(ctx: &dyn NativeContext, this: ObjectRef) -> SemState {
+    let key = sem_obj_key_for(ctx, this);
+    let mut states = sem_states_by_obj().lock();
+    *states.entry(key).or_insert(SemState {
+        permits: 0,
+        fair: 0,
+    })
+}
+
+fn sem_set_side_state(ctx: &dyn NativeContext, this: ObjectRef, state: SemState) {
+    let key = sem_obj_key_for(ctx, this);
+    sem_states_by_obj().lock().insert(key, state);
+}
+
+fn sem_has_holder_slot(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
+    ctx.object_num_fields(this) > SEM_FIELD_PERMITS
+}
+
+fn sem_prepare(ctx: &mut dyn NativeContext, this: ObjectRef) -> ObjectRef {
+    if sem_has_holder_slot(ctx, this) {
+        sem_holder(ctx, this).0
+    } else {
+        let _ = sem_side_state(ctx, this);
+        this
+    }
+}
+
 fn sem_holder(ctx: &mut dyn NativeContext, this: ObjectRef) -> (ObjectRef, ObjectRef) {
+    let has_permits_slot = sem_has_holder_slot(ctx, this);
+    if !has_permits_slot {
+        let _ = sem_side_state(ctx, this);
+        return (this, this);
+    }
     if let Value::Object(Some(h)) = ctx.get_field(this, SEM_FIELD_PERMITS) {
         return (this, h);
     }
     // Install the holder, migrating any legacy raw-Int values.
-    let legacy_permits = match ctx.get_field(this, SEM_FIELD_PERMITS) {
-        Value::Int(v) => v,
-        _ => 0,
+    let legacy_permits = if has_permits_slot {
+        match ctx.get_field(this, SEM_FIELD_PERMITS) {
+            Value::Int(v) => v,
+            _ => 0,
+        }
+    } else {
+        0
     };
-    let legacy_fair = match ctx.get_field(this, SEM_FIELD_FAIR) {
-        Value::Int(v) => v,
-        _ => 0,
+    let legacy_fair = if ctx.object_num_fields(this) > SEM_FIELD_FAIR {
+        match ctx.get_field(this, SEM_FIELD_FAIR) {
+            Value::Int(v) => v,
+            _ => 0,
+        }
+    } else {
+        0
     };
     // Pin `this` across the allocation — a moving GC during `new_array` would
     // relocate the receiver and leave the Rust-local copy stale (the
@@ -27749,11 +27908,25 @@ fn sem_holder(ctx: &mut dyn NativeContext, this: ObjectRef) -> (ObjectRef, Objec
     ctx.unpin_native_roots(this_pin);
     ctx.set_array_element(h, 0, Value::Int(legacy_permits));
     ctx.set_array_element(h, 1, Value::Int(legacy_fair));
-    ctx.set_field(this, SEM_FIELD_PERMITS, Value::Object(Some(h)));
+    if ctx.object_num_fields(this) > SEM_FIELD_PERMITS {
+        ctx.set_field(this, SEM_FIELD_PERMITS, Value::Object(Some(h)));
+    } else {
+        sem_set_side_state(
+            ctx,
+            this,
+            SemState {
+                permits: legacy_permits,
+                fair: legacy_fair,
+            },
+        );
+    }
     (this, h)
 }
 
 fn sem_permits(ctx: &mut dyn NativeContext, this: ObjectRef) -> i32 {
+    if !sem_has_holder_slot(ctx, this) {
+        return sem_side_state(ctx, this).permits;
+    }
     let (_, h) = sem_holder(ctx, this);
     match ctx.get_array_element(h, 0) {
         Value::Int(v) => v,
@@ -27762,6 +27935,12 @@ fn sem_permits(ctx: &mut dyn NativeContext, this: ObjectRef) -> i32 {
 }
 
 fn sem_set_permits(ctx: &mut dyn NativeContext, this: ObjectRef, permits: i32) {
+    if !sem_has_holder_slot(ctx, this) {
+        let mut state = sem_side_state(ctx, this);
+        state.permits = permits;
+        sem_set_side_state(ctx, this, state);
+        return;
+    }
     let (_, h) = sem_holder(ctx, this);
     ctx.set_array_element(h, 0, Value::Int(permits));
 }
@@ -27775,10 +27954,14 @@ fn native_sem_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         Some(Value::Int(v)) => *v,
         _ => 0,
     };
-    let (this, h) = sem_holder(ctx, this);
-    let _ = this;
-    ctx.set_array_element(h, 0, Value::Int(permits));
-    ctx.set_array_element(h, 1, Value::Int(0));
+    if sem_has_holder_slot(ctx, this) {
+        let (this, h) = sem_holder(ctx, this);
+        let _ = this;
+        ctx.set_array_element(h, 0, Value::Int(permits));
+        ctx.set_array_element(h, 1, Value::Int(0));
+    } else {
+        sem_set_side_state(ctx, this, SemState { permits, fair: 0 });
+    }
     Ok(None)
 }
 
@@ -27795,10 +27978,14 @@ fn native_sem_init_fair(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         Some(Value::Int(v)) => *v,
         _ => 0,
     };
-    let (this, h) = sem_holder(ctx, this);
-    let _ = this;
-    ctx.set_array_element(h, 0, Value::Int(permits));
-    ctx.set_array_element(h, 1, Value::Int(fair));
+    if sem_has_holder_slot(ctx, this) {
+        let (this, h) = sem_holder(ctx, this);
+        let _ = this;
+        ctx.set_array_element(h, 0, Value::Int(permits));
+        ctx.set_array_element(h, 1, Value::Int(fair));
+    } else {
+        sem_set_side_state(ctx, this, SemState { permits, fair });
+    }
     Ok(None)
 }
 
@@ -27809,7 +27996,7 @@ fn native_sem_init_fair(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
 fn sem_acquire_blocking(ctx: &mut dyn NativeContext, this: ObjectRef, n: i32) -> MethodCallResult {
     // Install the holder up-front (re-binding `this` across the possible
     // allocation) so no allocation happens inside the monitor section.
-    let (this, _) = sem_holder(ctx, this);
+    let this = sem_prepare(ctx, this);
     loop {
         ctx.monitor_enter(this);
         let permits = sem_permits(ctx, this);
@@ -27845,7 +28032,7 @@ fn native_sem_acquire_n(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
 }
 
 fn sem_release_n_inner(ctx: &mut dyn NativeContext, this: ObjectRef, n: i32) -> MethodCallResult {
-    let (this, _) = sem_holder(ctx, this);
+    let this = sem_prepare(ctx, this);
     ctx.monitor_enter(this);
     let permits = sem_permits(ctx, this);
     sem_set_permits(ctx, this, permits + n);
@@ -27876,7 +28063,7 @@ fn native_sem_release_n(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
 }
 
 fn sem_try_acquire_inner(ctx: &mut dyn NativeContext, this: ObjectRef, n: i32) -> bool {
-    let (this, _) = sem_holder(ctx, this);
+    let this = sem_prepare(ctx, this);
     ctx.monitor_enter(this);
     let permits = sem_permits(ctx, this);
     let ok = permits >= n;
@@ -27963,7 +28150,7 @@ fn native_sem_drain_permits(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let (this, _) = sem_holder(ctx, this);
+    let this = sem_prepare(ctx, this);
     ctx.monitor_enter(this);
     let permits = sem_permits(ctx, this);
     sem_set_permits(ctx, this, 0);
@@ -27976,6 +28163,9 @@ fn native_sem_is_fair(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
     };
+    if !sem_has_holder_slot(ctx, this) {
+        return Ok(Some(Value::Int(sem_side_state(ctx, this).fair)));
+    }
     let (_, h) = sem_holder(ctx, this);
     let fair = match ctx.get_array_element(h, 1) {
         Value::Int(v) => v,

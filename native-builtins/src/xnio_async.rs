@@ -437,6 +437,17 @@ fn remember_builder_handle(ctx: &dyn NativeContext, obj: ObjectRef, handle: i64)
         .insert(key, handle);
 }
 
+fn remember_option_map_inner(
+    ctx: &dyn NativeContext,
+    obj: ObjectRef,
+    inner: Arc<OptionMapInner>,
+) -> Arc<OptionMapInner> {
+    let h = register_map(inner.clone());
+    write_handle_slot_if_present(ctx, obj, OM_ENTRIES_HANDLE, h);
+    remember_map_handle(ctx, obj, h);
+    inner
+}
+
 fn map_handle_for(ctx: &dyn NativeContext, obj: ObjectRef) -> i64 {
     let slot_handle = read_handle_slot(ctx, obj, OM_ENTRIES_HANDLE);
     if slot_handle != 0 {
@@ -784,15 +795,16 @@ fn native_option_parse_value(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
 
 fn alloc_option_map(ctx: &mut dyn NativeContext, inner: Arc<OptionMapInner>) -> ObjectRef {
     let obj = alloc_concurrent_synthetic(ctx, "org/xnio/OptionMap", 2);
-    let h = register_map(inner);
-    write_handle_slot_if_present(ctx, obj, OM_ENTRIES_HANDLE, h);
-    remember_map_handle(ctx, obj, h);
+    remember_option_map_inner(ctx, obj, inner);
     obj
 }
 
-/// `OptionMap.<clinit>()V` — no-op; EMPTY is lazy-init via
-/// `native_option_map_empty_get`.
-fn native_option_map_clinit(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+/// `OptionMap.<clinit>()V` — populate the public EMPTY static with a
+/// Rust-backed empty map so GETSTATIC callers do not observe the uninitialized
+/// real-JDK field.
+fn native_option_map_clinit(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    let obj = alloc_option_map(ctx, OptionMapInner::empty());
+    ctx.set_static_field_by_name("org/xnio/OptionMap", "EMPTY", Value::Object(Some(obj)));
     Ok(None)
 }
 
@@ -934,11 +946,160 @@ fn inner_from_map(
     lookup_map(h).ok_or_else(|| ise("OptionMap: stale or unknown handle"))
 }
 
+fn real_option_map_value(ctx: &dyn NativeContext, this: ObjectRef) -> Option<ObjectRef> {
+    match ctx.get_field_by_name(this, "value") {
+        Value::Object(Some(map)) => Some(map),
+        _ => match ctx.get_field(this, 0) {
+            Value::Object(Some(map)) => Some(map),
+            _ => None,
+        },
+    }
+}
+
+fn invoke_object(
+    ctx: &mut dyn NativeContext,
+    receiver: ObjectRef,
+    name: &str,
+    descriptor: &str,
+    args: &[Value],
+) -> Option<ObjectRef> {
+    match ctx.invoke_virtual(receiver, name, descriptor, args) {
+        Ok(Some(Value::Object(Some(obj)))) => Some(obj),
+        _ => None,
+    }
+}
+
+fn java_boxed_int(ctx: &mut dyn NativeContext, obj: ObjectRef) -> Option<i32> {
+    match ctx.invoke_virtual(obj, "intValue", "()I", &[]) {
+        Ok(Some(Value::Int(v))) => Some(v),
+        _ => None,
+    }
+}
+
+fn java_boxed_long(ctx: &mut dyn NativeContext, obj: ObjectRef) -> Option<i64> {
+    match ctx.invoke_virtual(obj, "longValue", "()J", &[]) {
+        Ok(Some(Value::Long(v))) => Some(v),
+        Ok(Some(Value::Int(v))) => Some(v as i64),
+        _ => None,
+    }
+}
+
+fn java_boxed_bool(ctx: &mut dyn NativeContext, obj: ObjectRef) -> Option<bool> {
+    match ctx.invoke_virtual(obj, "booleanValue", "()Z", &[]) {
+        Ok(Some(Value::Int(v))) => Some(v != 0),
+        _ => None,
+    }
+}
+
+fn option_value_from_java(
+    ctx: &mut dyn NativeContext,
+    opt: ObjectRef,
+    value: Value,
+) -> OptionValue {
+    let ty = read_option_type(ctx, opt).unwrap_or_default();
+    match value {
+        Value::Int(v) => {
+            if ty == "java/lang/Boolean" {
+                OptionValue::Bool(v != 0)
+            } else {
+                OptionValue::Int(v)
+            }
+        }
+        Value::Long(v) => OptionValue::Long(v),
+        Value::Object(Some(obj)) => match ty.as_str() {
+            "java/lang/Integer" => java_boxed_int(ctx, obj)
+                .map(OptionValue::Int)
+                .unwrap_or(OptionValue::Obj(Some(obj))),
+            "java/lang/Long" => java_boxed_long(ctx, obj)
+                .map(OptionValue::Long)
+                .unwrap_or(OptionValue::Obj(Some(obj))),
+            "java/lang/Boolean" => java_boxed_bool(ctx, obj)
+                .map(OptionValue::Bool)
+                .unwrap_or(OptionValue::Obj(Some(obj))),
+            "java/lang/String" => ctx
+                .read_string(obj)
+                .map(OptionValue::Str)
+                .unwrap_or(OptionValue::Obj(Some(obj))),
+            _ => ctx
+                .read_string(obj)
+                .map(OptionValue::Str)
+                .unwrap_or(OptionValue::Obj(Some(obj))),
+        },
+        Value::Object(None) => OptionValue::Obj(None),
+        _ => OptionValue::Obj(None),
+    }
+}
+
+fn collect_real_option_map_entries(
+    ctx: &mut dyn NativeContext,
+    map: ObjectRef,
+) -> HashMap<OptionKey, OptionValue> {
+    let mut out = HashMap::new();
+    let Some(set) = invoke_object(ctx, map, "entrySet", "()Ljava/util/Set;", &[]) else {
+        return out;
+    };
+    let Some(it) = invoke_object(ctx, set, "iterator", "()Ljava/util/Iterator;", &[]) else {
+        return out;
+    };
+    loop {
+        let has_next = matches!(
+            ctx.invoke_virtual(it, "hasNext", "()Z", &[]),
+            Ok(Some(Value::Int(v))) if v != 0
+        );
+        if !has_next {
+            break;
+        }
+        let Some(entry) = invoke_object(ctx, it, "next", "()Ljava/lang/Object;", &[]) else {
+            break;
+        };
+        let Some(opt) = invoke_object(ctx, entry, "getKey", "()Ljava/lang/Object;", &[]) else {
+            continue;
+        };
+        let Some((declaring_class, name)) = read_option_coords(ctx, opt) else {
+            continue;
+        };
+        let value = ctx
+            .invoke_virtual(entry, "getValue", "()Ljava/lang/Object;", &[])
+            .ok()
+            .flatten()
+            .unwrap_or(Value::Object(None));
+        out.insert(
+            OptionKey {
+                declaring_class,
+                name,
+            },
+            option_value_from_java(ctx, opt, value),
+        );
+    }
+    out
+}
+
+fn inner_from_map_any(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+) -> Result<Arc<OptionMapInner>, MethodCallFailed> {
+    let h = map_handle_for(ctx, this);
+    if let Some(inner) = lookup_map(h) {
+        return Ok(inner);
+    }
+
+    if let Some(map) = real_option_map_value(ctx, this) {
+        let entries = collect_real_option_map_entries(ctx, map);
+        return Ok(remember_option_map_inner(
+            ctx,
+            this,
+            Arc::new(OptionMapInner { entries }),
+        ));
+    }
+
+    Err(ise("OptionMap: stale or unknown handle"))
+}
+
 /// `OptionMap.get(Option)Ljava/lang/Object;` and the typed overloads.
 fn native_option_map_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let opt = obj_arg(args, 1)?;
-    let inner = inner_from_map(ctx, this)?;
+    let inner = inner_from_map_any(ctx, this)?;
     let (decl, name) =
         read_option_coords(ctx, opt).ok_or_else(|| iae("OptionMap.get: option has no name"))?;
     let key = OptionKey {
@@ -970,7 +1131,7 @@ fn native_option_map_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
 fn native_option_map_contains(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let opt = obj_arg(args, 1)?;
-    let inner = inner_from_map(ctx, this)?;
+    let inner = inner_from_map_any(ctx, this)?;
     let (decl, name) = match read_option_coords(ctx, opt) {
         Some(pair) => pair,
         None => return Ok(Some(Value::Int(0))),
@@ -989,8 +1150,28 @@ fn native_option_map_contains(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
 /// `OptionMap.size()I`
 fn native_option_map_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    let inner = inner_from_map(ctx, this)?;
+    let inner = inner_from_map_any(ctx, this)?;
     Ok(Some(Value::Int(inner.entries.len() as i32)))
+}
+
+fn native_option_map_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let inner = inner_from_map_any(ctx, this)?;
+    let mut opts = Vec::with_capacity(inner.entries.len());
+    for key in inner.entries.keys() {
+        let opt = alloc_concurrent_synthetic(ctx, "org/xnio/Option", 3);
+        let declaring = ctx.create_string(&key.declaring_class);
+        ctx.set_field(opt, OPT_DECLARING_CLASS, Value::Object(Some(declaring)));
+        let name = ctx.create_string(&key.name);
+        ctx.set_field(opt, OPT_NAME, Value::Object(Some(name)));
+        ctx.set_field(opt, OPT_TYPE_CLASS, Value::Object(None));
+        opts.push(Value::Object(Some(opt)));
+    }
+    let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), opts.len());
+    for (i, opt) in opts.iter().enumerate() {
+        ctx.set_array_element(arr, i, *opt);
+    }
+    cratonvm_native_collections::make_iterator_from_array(ctx, arr, opts.len())
 }
 
 // ---------------------------------------------------------------------------
@@ -1615,6 +1796,12 @@ pub fn register_xnio_async_natives(registry: &mut NativeMethodRegistry) {
         native_option_map_contains,
     );
     registry.register("org/xnio/OptionMap", "size", "()I", native_option_map_size);
+    registry.register(
+        "org/xnio/OptionMap",
+        "iterator",
+        "()Ljava/util/Iterator;",
+        native_option_map_iterator,
+    );
 
     // Builder
     registry.register(
