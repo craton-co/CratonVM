@@ -5,7 +5,7 @@
 //!
 //! On a confirmed divergence, shrink to a minimal reproducer that **still
 //! diverges** (re-confirmed each step) under an interestingness predicate
-//! supplied by the caller — for `difftest min` that predicate is "the candidate
+//! supplied by the caller — for `cratonvm-difftest min` that predicate is "the candidate
 //! still compiles AND still diverges from HotSpot" (see `cmd_min`).
 //!
 //! The algorithm is classic **ddmin** (Zeller & Hildebrandt's delta debugging)

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2024-2026 Craton Software Company
 
-//! `difftest` — the semantic differential fuzzer CLI (design
+//! `cratonvm-difftest` — the semantic differential fuzzer CLI (design
 //! `docs/feature-designs/differential-fuzzer.md`).
 //!
 //! Subcommands:
@@ -42,12 +42,13 @@ mod exit {
 
 #[derive(Parser)]
 #[command(
-    name = "difftest",
+    name = "cratonvm-difftest",
     version,
     about = "Semantic differential fuzzer: diff Java behavior on CratonVM vs a real JDK",
     long_about = "Runs Java programs on both CratonVM and a real JDK and diffs observable \
                   behavior (stdout, stderr, exception type+message, exit code).\n\n\
-                  Step 0 scaffold: subcommands print their plan; `gate` already honors the \
+                  `run` and `gate` execute the configured corpus; `gen`, `mutate`, and `min` \
+                  provide the corpus-growth and reproducer workflows. `gate` honors the \
                   exit-code contract (0 ok / 1 new divergence / 2 fixed-regressed / 3 bootstrap)."
 )]
 struct Cli {
@@ -92,10 +93,6 @@ struct RunArgs {
     /// Explicit JDK home (else `DIFFTEST_JAVA_HOME`, else PATH).
     #[arg(long)]
     jdk: Option<PathBuf>,
-
-    /// Allow a non-pinned JDK build for the HotSpot oracle.
-    #[arg(long)]
-    allow_jdk_downgrade: bool,
 
     /// Divergence ledger path (default: the committed `difftest/ledger.json`).
     #[arg(long)]
@@ -216,7 +213,6 @@ impl RunArgs {
             },
             timeout: Duration::from_secs(self.timeout_secs),
             jdk_home: self.jdk.clone(),
-            allow_jdk_downgrade: self.allow_jdk_downgrade,
             ledger: self
                 .ledger
                 .clone()
@@ -262,7 +258,7 @@ fn cmd_run(args: &RunArgs) -> ExitCode {
     let config = args.to_runner_config();
     let modes: Vec<&str> = config.modes.iter().map(|m| m.label()).collect();
     println!(
-        "difftest run — corpus {} | cratonvm[{}] vs java | timeout {}s",
+        "cratonvm-difftest run — corpus {} | cratonvm[{}] vs java | timeout {}s",
         config.corpus.display(),
         modes.join(","),
         config.timeout.as_secs()
@@ -274,13 +270,13 @@ fn cmd_run(args: &RunArgs) -> ExitCode {
             e @ (RunError::CratonvmBinaryMissing | RunError::JavaMissing | RunError::EmptyCorpus),
         ) => {
             eprintln!(
-                "difftest run: {e} — bootstrap, exit {} (non-fatal).",
+                "cratonvm-difftest run: {e} — bootstrap, exit {} (non-fatal).",
                 exit::BOOTSTRAP
             );
             return ExitCode::from(exit::BOOTSTRAP);
         }
         Err(e) => {
-            eprintln!("difftest run: {e}");
+            eprintln!("cratonvm-difftest run: {e}");
             return ExitCode::from(exit::BOOTSTRAP);
         }
     };
@@ -290,11 +286,21 @@ fn cmd_run(args: &RunArgs) -> ExitCode {
     if config.update_ledger {
         let jdk =
             runner::jdk_version(config.jdk_home.as_deref()).unwrap_or_else(|| "unknown".into());
-        let ledger = summary.to_ledger(host_tag(), captured_at(), jdk);
+        let existing = match Ledger::load(&config.ledger) {
+            Ok(existing) => existing,
+            Err(e) => {
+                eprintln!(
+                    "cratonvm-difftest run: could not merge existing ledger {} ({e}); writing fresh ledger.",
+                    config.ledger.display()
+                );
+                None
+            }
+        };
+        let ledger = summary.to_merged_ledger(existing.as_ref(), host_tag(), captured_at(), jdk);
         match ledger.save(&config.ledger) {
             Ok(()) => println!("wrote ledger: {}", config.ledger.display()),
             Err(e) => eprintln!(
-                "difftest run: could not write ledger {}: {e}",
+                "cratonvm-difftest run: could not write ledger {}: {e}",
                 config.ledger.display()
             ),
         }
@@ -326,7 +332,7 @@ fn cmd_gen(args: &GenArgs) -> ExitCode {
             Some(f) => vec![f],
             None => {
                 eprintln!(
-                    "difftest gen: unknown --family {:?} (expected arith|concat|exceptions|all)",
+                    "cratonvm-difftest gen: unknown --family {:?} (expected arith|concat|exceptions|all)",
                     args.family
                 );
                 return ExitCode::from(exit::BOOTSTRAP);
@@ -335,7 +341,10 @@ fn cmd_gen(args: &GenArgs) -> ExitCode {
     };
 
     if let Err(e) = std::fs::create_dir_all(&out) {
-        eprintln!("difftest gen: cannot create {}: {e}", out.display());
+        eprintln!(
+            "cratonvm-difftest gen: cannot create {}: {e}",
+            out.display()
+        );
         return ExitCode::from(exit::BOOTSTRAP);
     }
 
@@ -345,18 +354,21 @@ fn cmd_gen(args: &GenArgs) -> ExitCode {
             let path = out.join(format!("{}.java", prog.name));
             match std::fs::write(&path, &prog.source) {
                 Ok(()) => written += 1,
-                Err(e) => eprintln!("difftest gen: cannot write {}: {e}", path.display()),
+                Err(e) => eprintln!(
+                    "cratonvm-difftest gen: cannot write {}: {e}",
+                    path.display()
+                ),
             }
         }
     }
 
     println!(
-        "difftest gen — wrote {written} program(s) (family={}, seed={}) to {}",
+        "cratonvm-difftest gen — wrote {written} program(s) (family={}, seed={}) to {}",
         args.family,
         args.seed,
         out.display()
     );
-    println!("  next: difftest run --corpus {}", out.display());
+    println!("  next: cratonvm-difftest run --corpus {}", out.display());
     ExitCode::from(exit::OK)
 }
 
@@ -369,7 +381,7 @@ fn cmd_mutate(args: &MutateArgs) -> ExitCode {
         Some(b) => b,
         None => {
             eprintln!(
-                "difftest mutate: cratonvm binary not found (build it / set CRATONVM_BIN) — \
+                "cratonvm-difftest mutate: cratonvm binary not found (build it / set CRATONVM_BIN) — \
                  exit {}.",
                 exit::BOOTSTRAP
             );
@@ -378,7 +390,7 @@ fn cmd_mutate(args: &MutateArgs) -> ExitCode {
     };
     if !runner::java_available(args.jdk.as_deref()) {
         eprintln!(
-            "difftest mutate: java not found — exit {}.",
+            "cratonvm-difftest mutate: java not found — exit {}.",
             exit::BOOTSTRAP
         );
         return ExitCode::from(exit::BOOTSTRAP);
@@ -394,7 +406,7 @@ fn cmd_mutate(args: &MutateArgs) -> ExitCode {
         match runner::compile_java(&args.program, &workdir, args.jdk.as_deref(), timeout) {
             Ok(name) => (name.clone(), workdir.join(format!("{name}.class"))),
             Err(e) => {
-                eprintln!("difftest mutate: {e}");
+                eprintln!("cratonvm-difftest mutate: {e}");
                 let _ = std::fs::remove_dir_all(&workdir);
                 return ExitCode::from(exit::BOOTSTRAP);
             }
@@ -412,7 +424,10 @@ fn cmd_mutate(args: &MutateArgs) -> ExitCode {
     let bytes = match std::fs::read(&class_path) {
         Ok(b) => b,
         Err(e) => {
-            eprintln!("difftest mutate: cannot read {}: {e}", class_path.display());
+            eprintln!(
+                "cratonvm-difftest mutate: cannot read {}: {e}",
+                class_path.display()
+            );
             let _ = std::fs::remove_dir_all(&workdir);
             return ExitCode::from(exit::BOOTSTRAP);
         }
@@ -420,7 +435,7 @@ fn cmd_mutate(args: &MutateArgs) -> ExitCode {
     let n_consts = mutate::numeric_constants(&bytes).len();
     if n_consts == 0 {
         println!(
-            "difftest mutate: {} has no numeric constants to perturb — nothing to do.",
+            "cratonvm-difftest mutate: {} has no numeric constants to perturb — nothing to do.",
             class_name
         );
         let _ = std::fs::remove_dir_all(&workdir);
@@ -428,7 +443,7 @@ fn cmd_mutate(args: &MutateArgs) -> ExitCode {
     }
 
     println!(
-        "difftest mutate — {} ({n_consts} numeric constant(s)) | {} mutants | modes {} | seed {}",
+        "cratonvm-difftest mutate — {} ({n_consts} numeric constant(s)) | {} mutants | modes {} | seed {}",
         class_name,
         args.count,
         args.modes
@@ -485,7 +500,7 @@ fn cmd_mutate(args: &MutateArgs) -> ExitCode {
         }
     }
 
-    println!("difftest mutate — {ran} mutant(s) ran, {diverged} diverged");
+    println!("cratonvm-difftest mutate — {ran} mutant(s) ran, {diverged} diverged");
     let _ = std::fs::remove_dir_all(&workdir);
     ExitCode::from(exit::OK)
 }
@@ -499,19 +514,22 @@ fn cmd_min(args: &MinArgs) -> ExitCode {
         Some(b) => b,
         None => {
             eprintln!(
-                "difftest min: cratonvm binary not found — exit {}.",
+                "cratonvm-difftest min: cratonvm binary not found — exit {}.",
                 exit::BOOTSTRAP
             );
             return ExitCode::from(exit::BOOTSTRAP);
         }
     };
     if !runner::java_available(args.jdk.as_deref()) {
-        eprintln!("difftest min: java not found — exit {}.", exit::BOOTSTRAP);
+        eprintln!(
+            "cratonvm-difftest min: java not found — exit {}.",
+            exit::BOOTSTRAP
+        );
         return ExitCode::from(exit::BOOTSTRAP);
     }
     if args.program.extension().and_then(|s| s.to_str()) != Some("java") {
         eprintln!(
-            "difftest min: source minimization needs a .java seed (got {}).",
+            "cratonvm-difftest min: source minimization needs a .java seed (got {}).",
             args.program.display()
         );
         return ExitCode::from(exit::BOOTSTRAP);
@@ -519,7 +537,10 @@ fn cmd_min(args: &MinArgs) -> ExitCode {
     let source = match std::fs::read_to_string(&args.program) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("difftest min: cannot read {}: {e}", args.program.display());
+            eprintln!(
+                "cratonvm-difftest min: cannot read {}: {e}",
+                args.program.display()
+            );
             return ExitCode::from(exit::BOOTSTRAP);
         }
     };
@@ -558,10 +579,12 @@ fn cmd_min(args: &MinArgs) -> ExitCode {
     };
 
     let original_lines = source.lines().count();
-    println!("difftest min — confirming {class_name} ({original_lines} lines) diverges ...");
+    println!(
+        "cratonvm-difftest min — confirming {class_name} ({original_lines} lines) diverges ..."
+    );
     if !predicate(&source) {
         eprintln!(
-            "difftest min: {class_name} does not compile-and-diverge under modes {} — \
+            "cratonvm-difftest min: {class_name} does not compile-and-diverge under modes {} — \
              nothing to minimize.",
             config
                 .modes
@@ -589,7 +612,7 @@ fn cmd_min(args: &MinArgs) -> ExitCode {
     let write_ok = std::fs::write(&out, &minimized.source).is_ok();
 
     println!(
-        "difftest min — {class_name}: {original_lines} → {} lines ({} reduction steps)",
+        "cratonvm-difftest min — {class_name}: {original_lines} → {} lines ({} reduction steps)",
         minimized.lines, minimized.steps
     );
     if write_ok {
@@ -618,7 +641,7 @@ fn cmd_gate(args: &RunArgs) -> ExitCode {
     // before a JDK / the cratonvm binary is provisioned.
     if harness::discover_programs(&config.corpus).is_empty() {
         eprintln!(
-            "difftest gate: corpus {} is empty — bootstrap, exit {} (non-fatal).",
+            "cratonvm-difftest gate: corpus {} is empty — bootstrap, exit {} (non-fatal).",
             config.corpus.display(),
             exit::BOOTSTRAP
         );
@@ -626,7 +649,7 @@ fn cmd_gate(args: &RunArgs) -> ExitCode {
     }
     if runner::cratonvm_binary().is_none() || !runner::java_available(config.jdk_home.as_deref()) {
         eprintln!(
-            "difftest gate: cratonvm binary or java not found (build cratonvm / set CRATONVM_BIN, \
+            "cratonvm-difftest gate: cratonvm binary or java not found (build cratonvm / set CRATONVM_BIN, \
              --jdk / DIFFTEST_JAVA_HOME / PATH) — bootstrap, exit {} (non-fatal).",
             exit::BOOTSTRAP
         );
@@ -640,7 +663,7 @@ fn cmd_gate(args: &RunArgs) -> ExitCode {
         Ok(None) => Ledger::new(host_tag(), captured_at(), "unknown".into()),
         Err(e) => {
             eprintln!(
-                "difftest gate: note — {} is not in the promoted ledger schema ({e}); \
+                "cratonvm-difftest gate: note — {} is not in the promoted ledger schema ({e}); \
                  treating as an empty baseline.",
                 config.ledger.display()
             );
@@ -652,7 +675,7 @@ fn cmd_gate(args: &RunArgs) -> ExitCode {
         Ok(s) => s,
         Err(e) => {
             eprintln!(
-                "difftest gate: {e} — bootstrap, exit {} (non-fatal).",
+                "cratonvm-difftest gate: {e} — bootstrap, exit {} (non-fatal).",
                 exit::BOOTSTRAP
             );
             return ExitCode::from(exit::BOOTSTRAP);
@@ -668,6 +691,6 @@ fn cmd_gate(args: &RunArgs) -> ExitCode {
         exit::FIXED_REGRESSED => "FAIL — a fixed divergence re-opened",
         _ => "bootstrap",
     };
-    println!("difftest gate: {verdict}. exit {code}.");
+    println!("cratonvm-difftest gate: {verdict}. exit {code}.");
     ExitCode::from(code)
 }
