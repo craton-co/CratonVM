@@ -441,7 +441,8 @@ function New-ProcessRecord {
     [string]$ExePath,
     [string]$JavaExe,
     [string]$JdkPath,
-    [bool]$NoJit
+    [bool]$NoJit,
+    [int]$Retries = 0
   )
 
   $module = [string]$ClassRow.module
@@ -489,7 +490,35 @@ function New-ProcessRecord {
     start = Get-Date
     outFile = $outFile
     errFile = $errFile
+    retries = $Retries
   }
+}
+
+function Read-ProcessOutputs([object]$Record) {
+  try { $Record.stdoutTask.Wait(5000) | Out-Null } catch {}
+  try { $Record.stderrTask.Wait(5000) | Out-Null } catch {}
+  $stdout = ''
+  $stderr = ''
+  try { $stdout = $Record.stdoutTask.Result } catch {}
+  try { $stderr = $Record.stderrTask.Result } catch {}
+  return [pscustomobject]@{ stdout = $stdout; stderr = $stderr }
+}
+
+function Test-SilentAbnormalExit([object]$ExitCode, [string]$Stdout, [string]$Stderr) {
+  # A CratonVM process that exits on its own (not killed by our -TimeoutSec
+  # watchdog, which is recorded as the literal string 'TIMEOUT' rather than
+  # a numeric code) but leaves BOTH stdout and stderr completely empty is
+  # not explainable by anything inside CratonVM itself: the top-level
+  # main-vm Ok/Err handler, the visibility-first panic hook, the Windows
+  # vectored hardware-fault handler, and System.exit/Runtime.exit all print
+  # at least one diagnostic line before the process terminates (see
+  # docs/internal/keycloak-empty-stderr-process-exits.md). A zero-output
+  # abnormal exit is therefore the signature of something OUTSIDE the
+  # process (OS/AV/resource-pressure termination) killing it before any of
+  # that code could run.
+  if ([string]$ExitCode -eq 'TIMEOUT') { return $false }
+  if ([int64]$ExitCode -eq 0) { return $false }
+  return ($Stdout.Trim().Length -eq 0 -and $Stderr.Trim().Length -eq 0)
 }
 
 function Complete-ProcessRecord {
@@ -497,15 +526,13 @@ function Complete-ProcessRecord {
     [object]$Record,
     [string]$ResultPath,
     [object]$ExitCode,
-    [double]$Seconds
+    [double]$Seconds,
+    [string]$Stdout,
+    [string]$Stderr
   )
 
-  try { $Record.stdoutTask.Wait(5000) | Out-Null } catch {}
-  try { $Record.stderrTask.Wait(5000) | Out-Null } catch {}
-  $stdout = ''
-  $stderr = ''
-  try { $stdout = $Record.stdoutTask.Result } catch {}
-  try { $stderr = $Record.stderrTask.Result } catch {}
+  $stdout = $Stdout
+  $stderr = $Stderr
   [System.IO.File]::WriteAllText($Record.outFile, $stdout, [System.Text.Encoding]::UTF8)
   [System.IO.File]::WriteAllText($Record.errFile, $stderr, [System.Text.Encoding]::UTF8)
 
@@ -519,6 +546,8 @@ function Complete-ProcessRecord {
 
   if ([string]$ExitCode -eq 'TIMEOUT') {
     $status = 'HANG'
+  } elseif (Test-SilentAbnormalExit -ExitCode $ExitCode -Stdout $stdout -Stderr $stderr) {
+    $status = 'SILENTEXIT'
   } elseif ($combined -match '(?i)EXCEPTION_ACCESS_VIOLATION|SIGSEGV|fatal runtime error|panicked at|stack smashing|illegal instruction|STATUS_ACCESS|STATUS_STACK_BUFFER|caught fatal signal|cratonvm panic|internal error: entered unreachable') {
     $status = 'CRASH'
   }
@@ -552,11 +581,17 @@ function Complete-ProcessRecord {
   }
 
   $note = ''
-  $noteMatch = [regex]::Match($combined, '(?im)^(?!\s+at\s)(.*(?:Exception|Error|Caused by|KCRUNNER_LOAD_FAIL|panicked|not implemented|NoClassDef|NoSuchMethod|AbstractMethod|AssertionError).*)$')
-  if ($noteMatch.Success) {
-    $note = (($noteMatch.Groups[1].Value -replace "`t", ' ') -replace "`r|`n", ' ')
-    if ($note.Length -gt 180) { $note = $note.Substring(0, 180) }
+  if ($status -eq 'SILENTEXIT') {
+    $note = "no stdout/stderr captured (rc=$ExitCode)"
+    if ($Record.retries -gt 0) { $note += "; unchanged after $($Record.retries) retry(ies)" }
+    $note += '; not a known CratonVM-internal exit path -- see docs/internal/keycloak-empty-stderr-process-exits.md'
+  } else {
+    $noteMatch = [regex]::Match($combined, '(?im)^(?!\s+at\s)(.*(?:Exception|Error|Caused by|KCRUNNER_LOAD_FAIL|panicked|not implemented|NoClassDef|NoSuchMethod|AbstractMethod|AssertionError).*)$')
+    if ($noteMatch.Success) {
+      $note = (($noteMatch.Groups[1].Value -replace "`t", ' ') -replace "`r|`n", ' ')
+    }
   }
+  if ($note.Length -gt 180) { $note = $note.Substring(0, 180) }
   if ($status -eq 'PASS' -or $status -eq 'EMPTY') {
     $note = ''
   }
@@ -636,12 +671,25 @@ function Invoke-Mode {
       $elapsed = ((Get-Date) - $record.start).TotalSeconds
       if ($record.proc.HasExited) {
         $code = $record.proc.ExitCode
-        Complete-ProcessRecord -Record $record -ResultPath $results -ExitCode $code -Seconds ([Math]::Round($elapsed, 3))
-        try { $record.proc.Dispose() } catch {}
+        $outputs = Read-ProcessOutputs $record
+        if ((Test-SilentAbnormalExit -ExitCode $code -Stdout $outputs.stdout -Stderr $outputs.stderr) -and $record.retries -lt 1) {
+          # No CratonVM-internal path exits silently (see Test-SilentAbnormalExit) --
+          # this looks like an external/transient kill (OS, AV, resource pressure).
+          # Retry once, transparently, before recording anything: most occurrences
+          # of this signature do not reproduce on a second attempt.
+          Write-Info ("  [retry] {0} rc={1} with no stdout/stderr -- retrying once" -f $record.class, $code)
+          try { $record.proc.Dispose() } catch {}
+          $retryRow = [pscustomobject]@{ module = $record.module; class = $record.class }
+          $still.Add((New-ProcessRecord -ClassRow $retryRow -ModeOut $modeOut -Cp $cp -ExePath $craton -JavaExe $java -JdkPath $jdk -NoJit:($Jit -eq 'off') -Retries ($record.retries + 1)))
+        } else {
+          Complete-ProcessRecord -Record $record -ResultPath $results -ExitCode $code -Seconds ([Math]::Round($elapsed, 3)) -Stdout $outputs.stdout -Stderr $outputs.stderr
+          try { $record.proc.Dispose() } catch {}
+        }
       } elseif ($elapsed -ge $TimeoutSec) {
         try { $record.proc.Kill($true) } catch { try { $record.proc.Kill() } catch {} }
         try { $record.proc.WaitForExit(5000) | Out-Null } catch {}
-        Complete-ProcessRecord -Record $record -ResultPath $results -ExitCode 'TIMEOUT' -Seconds ([Math]::Round($elapsed, 3))
+        $outputs = Read-ProcessOutputs $record
+        Complete-ProcessRecord -Record $record -ResultPath $results -ExitCode 'TIMEOUT' -Seconds ([Math]::Round($elapsed, 3)) -Stdout $outputs.stdout -Stderr $outputs.stderr
         try { $record.proc.Dispose() } catch {}
       } else {
         $still.Add($record)
