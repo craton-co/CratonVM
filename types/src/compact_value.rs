@@ -884,18 +884,17 @@ impl CompactValue {
     /// `Value::Object(Some(_))` returned here — route the decode through
     /// [`to_value_checked`](Self::to_value_checked) with a live-heap predicate,
     /// or through [`decode_by_descriptor`](Self::decode_by_descriptor) when the
-    /// declared type is known. The unchecked form can fabricate a heap
-    /// reference from attacker-controlled long bits.**
+    /// declared type is known. The context-free form now rejects merely
+    /// plausible raw payloads without prior `ObjectRef` provenance.**
     ///
     /// `CompactValue::long` stores i64 bits **verbatim** (see its docs). A
     /// primitive long whose top bits coincide with `NANBOX_BITS`, whose
     /// sub-tag field equals `SUB_OBJECT`, and whose 47-bit payload is
     /// **non-zero and 8-byte aligned** is *indistinguishable from a real heap
-    /// reference at the bit level*. For such a slot this method returns
-    /// `Value::Object(Some(ObjectRef::from_raw(payload)))` — i.e. it will
-    /// fabricate a heap pointer out of a primitive long. Attacker-controlled
-    /// bytecode (`lxor`/`ladd` producing a chosen 64-bit pattern, then
-    /// `lstore` into a slot a context-free consumer reads) can drive this.
+    /// reference at the bit level*. For such a slot, see the current hardening
+    /// note below.
+    /// Prior versions could fabricate a heap pointer out of a primitive long;
+    /// current code rejects merely plausible payloads without provenance.
     ///
     /// `to_value` therefore makes **no guarantee** that an
     /// `Value::Object(Some(_))` it returns points at a live heap object. The
@@ -904,7 +903,8 @@ impl CompactValue {
     /// collision and returned as `Value::Long`, bumping
     /// [`object_degradation_count`]). That filter is necessary but **not
     /// sufficient**: a long whose low 47 bits happen to form an aligned,
-    /// non-null address still decodes as an object here.
+    /// non-null address is still rejected here without prior `ObjectRef`
+    /// provenance.
     ///
     /// Callers reading a slot that *may* hold a primitive long (operand-stack
     /// slots, locals, GC roots — anything not provably a reference by JVM
@@ -925,6 +925,10 @@ impl CompactValue {
     /// the slot is a reference. Do not introduce new context-free
     /// `to_value()`/`is_object()` reference consumers without one of the
     /// guards above.
+    ///
+    /// Current hardening also requires prior `ObjectRef` provenance before
+    /// this method recreates an object. A merely plausible raw payload is
+    /// degraded to the bit-exact long.
     #[inline(always)]
     pub fn to_value(&self) -> Value {
         if !is_nan_tagged(self.0) {
@@ -971,21 +975,24 @@ impl CompactValue {
                 // the allocator never hands out null-page addresses), so any
                 // unaligned, null, or null-page payload must be a long. Return
                 // `Value::Long` for those to preserve bits; reserve the Object
-                // decode for plausible-pointer payloads.
+                // decode for plausible payloads with recorded ObjectRef provenance.
                 //
                 // HARD-AUDIT (HIGH long↔object type-confusion): this remains a
                 // CONTEXT-FREE decoder — `object_payload_is_plausible` rejects
                 // only the cheaply-impossible payloads. An aligned, above-guard
-                // long bit pattern still fabricates an `ObjectRef` here. Callers
+                // long bit pattern is now degraded unless its payload has prior
+                // `ObjectRef` provenance. Callers
                 // that do not already KNOW the slot is a reference from JVM type
                 // context MUST decode via `to_value_checked` / `decode_by_descriptor`
                 // instead — see this method's Safety contract.
-                if object_payload_is_plausible(payload) {
+                if object_payload_is_plausible(payload)
+                    && crate::value::object_ref_payload_is_known(payload)
+                {
                     let ptr = payload as *mut u8;
                     Value::Object(Some(unsafe { ObjectRef::from_raw(ptr) }))
                 } else {
                     // Provably-not-a-reference SUB_OBJECT slot (null, unaligned,
-                    // or null-page): count the degradation so the silent
+                    // null-page, or never-seen): count the degradation so the silent
                     // reclassification is visible in release builds.
                     note_object_degradation();
                     Value::Long(self.0 as i64)
@@ -1336,7 +1343,18 @@ impl CompactValue {
                 _ => self.to_value(),
             },
             b'L' | b'[' => match sub {
-                SUB_OBJECT | SUB_NULL => self.to_value(),
+                SUB_OBJECT => {
+                    let payload = self.0 & PAYLOAD_MASK;
+                    if object_payload_is_plausible(payload)
+                        && crate::value::object_ref_payload_is_known(payload)
+                    {
+                        self.to_value()
+                    } else {
+                        note_object_degradation();
+                        Value::Object(None)
+                    }
+                }
+                SUB_NULL => self.to_value(),
                 // A non-reference value landing in a reference slot becomes
                 // null — the JVM verifier would have caught this pre-runtime,
                 // so this is a defensive fallback. `SUB_RETADDR` and
@@ -2697,6 +2715,7 @@ mod tests {
     #[test]
     fn decode_by_descriptor_reference_keeps_object() {
         let ptr: u64 = 0x0000_1234_5678_ABC0;
+        let _obj = unsafe { ObjectRef::from_raw(ptr as *mut u8) };
         let cv = CompactValue::object(ptr);
         match cv.decode_by_descriptor(b'L') {
             Value::Object(Some(o)) => assert_eq!(o.as_ptr() as u64, ptr),
@@ -2784,26 +2803,39 @@ mod tests {
     // that read/reset it so parallel `cargo test` runs don't interleave.
     static DEGRADE_COUNTER_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    #[test]
+    fn decode_by_descriptor_l_rejects_unseen_subobject_payload() {
+        let _guard = DEGRADE_COUNTER_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let raw = make_tagged(SUB_OBJECT, 0x0000_6CCC_DDDD_E000);
+        let cv = CompactValue::from_bits(raw);
+        assert!(matches!(cv.decode_by_descriptor(b'L'), Value::Object(None)));
+    }
+
     /// A primitive long whose bits land in the `SUB_OBJECT` space with an
-    /// aligned, non-null payload is decoded as a *fabricated* object by the
-    /// unchecked `to_value`. `to_value_checked` with a heap predicate that
-    /// rejects the address degrades it back to the bit-exact long and counts
-    /// the degradation. This is the core of the HIGH finding.
+    /// aligned, non-null payload must not be decoded as a fabricated object by
+    /// the context-free `to_value`. `to_value_checked` with a heap predicate
+    /// that rejects the address also degrades it back to the bit-exact long
+    /// and counts the degradation.
     #[test]
     fn to_value_checked_degrades_fabricated_pointer_to_long() {
         let _guard = DEGRADE_COUNTER_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         // Aligned (multiple of 8), non-null payload inside a SUB_OBJECT slot.
-        let aligned = 0x1234_5678_ABC0u64; // % 8 == 0, non-zero
+        let aligned = 0x0000_6BAD_CAFE_D000u64; // % 8 == 0, non-zero
         let raw = make_tagged(SUB_OBJECT, aligned);
         let cv = CompactValue::from_bits(raw);
 
-        // Unchecked path fabricates an object reference (the danger).
+        // Context-free path rejects the never-seen payload instead of
+        // fabricating an object reference.
+        reset_object_degradation_count();
         match cv.to_value() {
-            Value::Object(Some(o)) => assert_eq!(o.as_ptr() as u64, aligned),
-            other => panic!("unchecked to_value should fabricate object, got {other:?}"),
+            Value::Long(x) => assert_eq!(x as u64, raw),
+            other => panic!("unchecked to_value should degrade to Long, got {other:?}"),
         }
+        assert_eq!(object_degradation_count(), 1);
 
         // Checked path with a heap that says "not a live object" degrades to
         // the bit-exact long and records the reclassification.
@@ -2890,7 +2922,8 @@ mod tests {
         let _ = CompactValue::from_bits(make_tagged(SUB_OBJECT, 0)).to_value();
         // Unaligned payload SUB_OBJECT → Long, counted.
         let _ = CompactValue::from_bits(make_tagged(SUB_OBJECT, 0x1001)).to_value();
-        assert_eq!(object_degradation_count(), 2);
+        let _ = CompactValue::from_bits(make_tagged(SUB_OBJECT, 0x0000_6AAA_BBBB_C000)).to_value();
+        assert_eq!(object_degradation_count(), 3);
     }
 
     // ── HIGH: null-page plausibility guard for the unchecked SUB_OBJECT decode ──
@@ -2984,16 +3017,16 @@ mod tests {
         }
     }
 
-    /// Regression guard: the hardening must not reject *genuine* object
-    /// pointers. A plausible payload (aligned, above the guard page) still
-    /// decodes as an object via the unchecked `to_value`, exactly as before.
+    /// Regression guard: the hardening must not reject object pointers that
+    /// already crossed the unsafe `ObjectRef` construction boundary.
     #[test]
-    fn to_value_unchecked_keeps_plausible_object() {
+    fn to_value_unchecked_keeps_known_object() {
         for &ptr in &[NULL_GUARD_PAGE, 0x4000u64, 0x1234_5678_ABC0u64] {
+            let _obj = unsafe { ObjectRef::from_raw(ptr as *mut u8) };
             let cv = CompactValue::object(ptr);
             match cv.to_value() {
                 Value::Object(Some(o)) => assert_eq!(o.as_ptr() as u64, ptr),
-                other => panic!("plausible object {ptr:#x} must decode as Object; got {other:?}"),
+                other => panic!("known object {ptr:#x} must decode as Object; got {other:?}"),
             }
         }
     }
