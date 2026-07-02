@@ -2,6 +2,12 @@
 
 This document describes how to cut a new release of CratonVM.
 
+> **Current readiness note (2026-07-02):** the repository is not ready for a
+> public release tag or broad crates.io publish wave until the release-readiness
+> blockers recorded in `docs/known-issues/full-scoped-review-2026-07-02.md`
+> are resolved. Do not infer release readiness from local source-tree package
+> checks alone; verify the exact release commit with the gates below.
+
 ## 1. Versioning
 
 - We follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.PATCH`.
@@ -39,9 +45,10 @@ This document describes how to cut a new release of CratonVM.
 
 2. **Wait for required CI green** on the PR. `.github/workflows/ci.yml` runs
    `cargo fmt --check`, `cargo build`, `cargo clippy`, and `cargo test`
-   across the workspace on Linux and Windows. Required checks must pass.
-   Coverage and semantic difftest jobs are advisory until their
-   `continue-on-error` settings are intentionally removed.
+   across the workspace on Linux and Windows. Required checks must pass on the
+   exact commit being tagged. Coverage, semantic difftest, real-path smoke, and
+   fuzz-smoke jobs are advisory until their `continue-on-error` settings are
+   intentionally removed.
 
 3. **Merge the PR** into `main` (squash or merge — match repo policy).
 
@@ -76,8 +83,9 @@ non-shippable crates each carry their own `publish = false` in their
 - `cratonvm-cuda-bridge` - thin CUDA Driver API bridge (GPU offload, opt-in/immature).
 - `cratonvm-fuzz` - the standalone libFuzzer harness (nightly-only internal target, never published).
 
-Everything else is intended to be publishable after its package check and
-dry-run pass: `cratonvm-types`, `cratonvm-reader`, `cratonvm-native-api`,
+Everything else is intended to be publishable only after package-list,
+package-copy, and dry-run checks pass for that exact crate:
+`cratonvm-types`, `cratonvm-reader`, `cratonvm-native-api`,
 `cratonvm-jit-api`, `cratonvm-jit`, `cratonvm-gc`,
 `cratonvm-native-collections`, `cratonvm-native-io`,
 `cratonvm-classloading`, `cratonvm-native-builtins`, `cratonvm-jfr`,
@@ -91,6 +99,12 @@ which reaches `cratonvm-native-awt`; downstream packages such as
 `cratonvm-vm`. Split or disable those default-feature edges before publishing
 the dependent crates, and verify with `cargo package` / `cargo publish
 --dry-run`.
+
+Also re-check packaged-copy tests and crates.io dependency availability before
+publishing. A source-tree test pass is not enough: packaged archives can exclude
+fixtures, and higher-level crates cannot dry-run until their versioned
+dependencies are already available from crates.io or are otherwise split out of
+the publish graph.
 
 To publish:
 

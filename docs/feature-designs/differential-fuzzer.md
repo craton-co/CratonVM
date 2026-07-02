@@ -13,12 +13,12 @@
 ---
 
 > **Status update (2026-07-02).** `difftest/` is now a workspace member package
-> named `cratonvm-difftest`; the installed binary is still named `difftest`
-> until the unique binary rename lands. Its CI job is advisory
-> (`continue-on-error`) while cross-platform ledger stability is proven.
-> `fuzz/` remains a separate standalone workspace with 11 declared targets, but
-> its build is currently blocked by the `legacy-synthetic-crypto` feature drift
-> tracked in the public known-issues review.
+> named `cratonvm-difftest`, and its installed binary is also named
+> `cratonvm-difftest` to satisfy the repository's unique-binary rule. Its CI job
+> is advisory (`continue-on-error`) while cross-platform ledger stability is
+> proven. `fuzz/` remains a separate standalone workspace with 11 declared
+> targets; treat fuzz-build status as advisory release evidence until the
+> current fuzz-smoke job is green on the release commit.
 
 ## 1. Problem & motivation
 
@@ -178,9 +178,9 @@ rc/first-error. The fuzzer's "macro corpus" tier (whole programs from
 Four cooperating pieces: a **generator**, a **two-VM runner**, a **diff oracle
 + minimizer**, and a **divergence ledger + CI gate**. All in one new crate
 `difftest/` (a normal workspace member, unlike `fuzz/`), packaged as
-`cratonvm-difftest` and currently driven by a `difftest` binary, reusing
-`vm-cli`'s arg shape and §2.2's subprocess model. Renaming the binary to
-`cratonvm-difftest` is a packaging follow-up.
+`cratonvm-difftest` and driven by the `cratonvm-difftest` binary, reusing
+`vm-cli`'s arg shape and §2.2's subprocess model. Earlier scaffold notes in
+this design doc that mention a generic `difftest` binary are historical.
 
 ```
             ┌───────────── corpus ─────────────┐
