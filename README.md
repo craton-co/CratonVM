@@ -40,16 +40,16 @@ standard library, so it can run with **no JDK installation, no `JAVA_HOME`, no `
 
 ### Benchmark (vs HotSpot JDK 25 C2)
 
-| Benchmark | JDK 25 C2 | CratonVM | Ratio |
-|-----------|-----------|---------|-------|
-| Arithmetic 300M | 889 ms | 1,676 ms | 1.89x |
-| Fibonacci(42) | 1,876 ms | 2,457 ms | 1.31x |
-| Sieve 100K×500 | 324 ms | 510 ms | 1.57x |
-| Matrix 500×500 | 351 ms | 518 ms | 1.48x |
-| **QuickBench TOTAL** | **3,440 ms** | **5,161 ms** | **1.50x** |
-| Binary Trees (depth=18) | 714 ms | 16,657 ms | 23.3x |
+| Benchmark | JDK 25 C2 | CratonVM default | Default ratio | CratonVM OSR, threshold=1 | OSR ratio |
+|-----------|-----------|------------------|---------------|---------------------------|-----------|
+| Arithmetic 300M | 1,067 ms | 89,683 ms | 84.1x | 2,414 ms | 2.26x |
+| Fibonacci(42) | 2,237 ms | 39,040 ms | 17.5x | 45,371 ms | 20.3x |
+| Sieve 100Kx500 | 326 ms | 62,581 ms | 192.0x | 608 ms | 1.87x |
+| Matrix 500x500 | 338 ms | 92,980 ms | 275.1x | 644 ms | 1.91x |
+| **QuickBench TOTAL** | **3,968 ms** | **284,284 ms** | **71.6x** | **49,037 ms** | **12.4x** |
+| Binary Trees (depth=18) | 813 ms | 35,377 ms | 43.5x | 26,713 ms | 32.9x |
 
-*Measured 2026-03-31 on Windows 11, JDK 25.0.1 LTS. Round 26 JIT: OSR, loop unrolling, speculative BCE, graph-coloring regalloc.*
+*Single-run snapshot measured 2026-07-02 on Microsoft Windows 11 Home, JDK 25.0.1 LTS, CratonVM `06097539`, release build. The benchmark sources are the historical `bench/QuickBench.java` and `bench/binarytrees.java` from commit `2cea208`; `bench/` is currently untracked. The default column uses the launcher default, where OSR is disabled. The OSR column sets `CRATONVM_JIT_OSR=1 CRATONVM_JIT_THRESHOLD=1`, which recovers the loop-heavy kernels but not recursive Fibonacci.*
 
 See [docs/JIT_OPTIMIZATION.md](docs/JIT_OPTIMIZATION.md) for the full 26-round JIT optimization journey.
 
