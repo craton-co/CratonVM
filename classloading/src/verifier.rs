@@ -76,6 +76,7 @@
 //! model. Java 7+ classes that ship `StackMapTable` and no subroutines take
 //! the fast path through `bytecode_verifier::verify_bytecode` unchanged.
 
+use std::collections::{HashMap, HashSet};
 #[cfg(test)]
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -934,6 +935,20 @@ fn method_uses_jsr_or_ret(method: &ClassFileMethod) -> bool {
 /// interpreter cannot defend against (out-of-range jumps, truncated
 /// instructions) without requiring a working type-state model — which is
 /// what makes it the right fallback for `jsr`/`ret` methods.
+#[derive(Debug, Clone)]
+struct StructuralInstruction {
+    pc: usize,
+    next_pc: usize,
+    insn: Instruction,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct JsrSite {
+    target: usize,
+}
+
+/// Decode-only structural validation used before type-state verification and
+/// as the bounded fallback for legal legacy jsr/ret methods.
 fn verify_method_structural_only(
     class: &Class,
     method: &ClassFileMethod,
@@ -955,7 +970,9 @@ fn verify_method_structural_only(
         });
     }
 
-    // Decode every instruction and collect branch targets.
+    let mut decoded = Vec::new();
+    let mut instruction_starts = HashSet::new();
+    let mut instruction_by_pc = HashMap::new();
     let mut pc = 0usize;
     while pc < code_len {
         let (insn, next_pc) =
@@ -969,8 +986,38 @@ fn verify_method_structural_only(
         // confirm each one lies inside the code array. We do NOT do
         // type-state verification here — we only check that the program
         // counter never falls off the edge of the method.
-        for target in instruction_branch_targets(&insn, pc) {
-            if target as usize > code_len {
+        if next_pc <= pc {
+            // Pathological: decoder claimed zero/negative advance.
+            return Err(LinkageError::VerifyError {
+                class_name: class.name.to_string(),
+                method_name: method.name.to_string(),
+                message: format!("instruction at offset {pc} did not advance program counter"),
+            });
+        }
+        instruction_starts.insert(pc);
+        instruction_by_pc.insert(pc, decoded.len());
+        decoded.push(StructuralInstruction { pc, next_pc, insn });
+        pc = next_pc;
+    }
+
+    // Validate exception handler ranges (JVMS §4.9.1).
+    let mut branch_targets_by_pc: HashMap<usize, Vec<usize>> = HashMap::new();
+    let mut jsr_sites = Vec::new();
+    let mut ret_sites = Vec::new();
+
+    for decoded_insn in &decoded {
+        let pc = decoded_insn.pc;
+        let next_pc = decoded_insn.next_pc;
+        let mut branch_targets = Vec::new();
+
+        for target in instruction_branch_targets(&decoded_insn.insn, pc).map_err(|message| {
+            LinkageError::VerifyError {
+                class_name: class.name.to_string(),
+                method_name: method.name.to_string(),
+                message: format!("branch target at offset {pc} overflowed: {message}"),
+            }
+        })? {
+            if target < 0 || target >= code_len as i64 {
                 return Err(LinkageError::VerifyError {
                     class_name: class.name.to_string(),
                     method_name: method.name.to_string(),
@@ -980,20 +1027,82 @@ fn verify_method_structural_only(
                     ),
                 });
             }
+            let target = target as usize;
+            if !instruction_starts.contains(&target) {
+                return Err(LinkageError::VerifyError {
+                    class_name: class.name.to_string(),
+                    method_name: method.name.to_string(),
+                    message: format!(
+                        "branch target {target} at offset {pc} does not land on an \
+                         instruction boundary"
+                    ),
+                });
+            }
+            branch_targets.push(target);
         }
 
-        if next_pc <= pc {
-            // Pathological: decoder claimed zero/negative advance.
-            return Err(LinkageError::VerifyError {
-                class_name: class.name.to_string(),
-                method_name: method.name.to_string(),
-                message: format!("instruction at offset {pc} did not advance program counter"),
-            });
+        match &decoded_insn.insn {
+            Instruction::Jsr(_) | Instruction::JsrW(_) => {
+                let Some(&target) = branch_targets.first() else {
+                    return Err(LinkageError::VerifyError {
+                        class_name: class.name.to_string(),
+                        method_name: method.name.to_string(),
+                        message: format!("jsr at offset {pc} has no valid subroutine target"),
+                    });
+                };
+                if next_pc >= code_len || !instruction_starts.contains(&next_pc) {
+                    return Err(LinkageError::VerifyError {
+                        class_name: class.name.to_string(),
+                        method_name: method.name.to_string(),
+                        message: format!(
+                            "jsr return address {next_pc} at offset {pc} does not land on an \
+                             instruction boundary"
+                        ),
+                    });
+                }
+                jsr_sites.push(JsrSite { target });
+            }
+            Instruction::Ret(index) => {
+                if *index >= code_attr.max_locals {
+                    return Err(LinkageError::VerifyError {
+                        class_name: class.name.to_string(),
+                        method_name: method.name.to_string(),
+                        message: format!(
+                            "ret at offset {pc} references local {index}, but max_locals is {}",
+                            code_attr.max_locals
+                        ),
+                    });
+                }
+                ret_sites.push((pc, *index));
+            }
+            _ => {}
         }
-        pc = next_pc;
+
+        branch_targets_by_pc.insert(pc, branch_targets);
     }
 
-    // Validate exception handler ranges (JVMS §4.9.1).
+    if !ret_sites.is_empty() {
+        let covered_rets = covered_ret_sites(
+            &decoded,
+            &instruction_by_pc,
+            &branch_targets_by_pc,
+            &jsr_sites,
+            code_len,
+        );
+        for (ret_pc, index) in ret_sites {
+            if !covered_rets.contains(&(ret_pc, index)) {
+                return Err(LinkageError::VerifyError {
+                    class_name: class.name.to_string(),
+                    method_name: method.name.to_string(),
+                    message: format!(
+                        "ret at offset {ret_pc} using local {index} is not covered by a \
+                         reachable jsr/astore subroutine prologue"
+                    ),
+                });
+            }
+        }
+    }
+
     for entry in &code_attr.exception_table {
         let start = entry.start_pc as usize;
         let end = entry.end_pc as usize;
@@ -1021,9 +1130,149 @@ fn verify_method_structural_only(
                 ),
             });
         }
+        if !instruction_starts.contains(&start) {
+            return Err(LinkageError::VerifyError {
+                class_name: class.name.to_string(),
+                method_name: method.name.to_string(),
+                message: format!(
+                    "exception handler start_pc={start} does not land on an instruction boundary"
+                ),
+            });
+        }
+        if end != code_len && !instruction_starts.contains(&end) {
+            return Err(LinkageError::VerifyError {
+                class_name: class.name.to_string(),
+                method_name: method.name.to_string(),
+                message: format!(
+                    "exception handler end_pc={end} does not land on an instruction boundary"
+                ),
+            });
+        }
+        if !instruction_starts.contains(&handler) {
+            return Err(LinkageError::VerifyError {
+                class_name: class.name.to_string(),
+                method_name: method.name.to_string(),
+                message: format!(
+                    "exception handler handler_pc={handler} does not land on an instruction boundary"
+                ),
+            });
+        }
     }
 
     Ok(())
+}
+
+fn covered_ret_sites(
+    decoded: &[StructuralInstruction],
+    instruction_by_pc: &HashMap<usize, usize>,
+    branch_targets_by_pc: &HashMap<usize, Vec<usize>>,
+    jsr_sites: &[JsrSite],
+    code_len: usize,
+) -> HashSet<(usize, u16)> {
+    let mut saved_at: HashMap<usize, HashSet<u16>> = HashMap::new();
+    let mut worklist = Vec::new();
+    for site in jsr_sites {
+        let entry = saved_at.entry(site.target).or_default();
+        if entry.is_empty() {
+            worklist.push(site.target);
+        }
+    }
+
+    let mut covered = HashSet::new();
+    while let Some(pc) = worklist.pop() {
+        let Some(&idx) = instruction_by_pc.get(&pc) else {
+            continue;
+        };
+        let decoded_insn = &decoded[idx];
+        let saved = saved_at.get(&pc).cloned().unwrap_or_default();
+
+        if let Instruction::Ret(index) = &decoded_insn.insn {
+            if saved.contains(index) {
+                covered.insert((pc, *index));
+            }
+            continue;
+        }
+
+        let mut out_saved = saved;
+        if let Instruction::Astore(index) = &decoded_insn.insn {
+            out_saved.insert(*index);
+        }
+
+        let branch_targets = branch_targets_by_pc
+            .get(&pc)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        for succ in structural_successors(decoded_insn, branch_targets, code_len) {
+            match saved_at.entry(succ) {
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(out_saved.clone());
+                    worklist.push(succ);
+                }
+                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                    let before = entry.get().len();
+                    entry.get_mut().extend(out_saved.iter().copied());
+                    if entry.get().len() != before {
+                        worklist.push(succ);
+                    }
+                }
+            }
+        }
+    }
+    covered
+}
+
+fn structural_successors(
+    decoded_insn: &StructuralInstruction,
+    branch_targets: &[usize],
+    code_len: usize,
+) -> Vec<usize> {
+    let mut successors = Vec::new();
+    match &decoded_insn.insn {
+        Instruction::Goto(_)
+        | Instruction::GotoW(_)
+        | Instruction::Jsr(_)
+        | Instruction::JsrW(_) => {
+            successors.extend_from_slice(branch_targets);
+        }
+        Instruction::Ifeq(_)
+        | Instruction::Ifne(_)
+        | Instruction::Iflt(_)
+        | Instruction::Ifge(_)
+        | Instruction::Ifgt(_)
+        | Instruction::Ifle(_)
+        | Instruction::IfIcmpeq(_)
+        | Instruction::IfIcmpne(_)
+        | Instruction::IfIcmplt(_)
+        | Instruction::IfIcmpge(_)
+        | Instruction::IfIcmpgt(_)
+        | Instruction::IfIcmple(_)
+        | Instruction::IfAcmpeq(_)
+        | Instruction::IfAcmpne(_)
+        | Instruction::Ifnull(_)
+        | Instruction::Ifnonnull(_) => {
+            successors.extend_from_slice(branch_targets);
+            if decoded_insn.next_pc < code_len {
+                successors.push(decoded_insn.next_pc);
+            }
+        }
+        Instruction::Tableswitch { .. } | Instruction::Lookupswitch { .. } => {
+            successors.extend_from_slice(branch_targets);
+        }
+        Instruction::Ret(_)
+        | Instruction::Ireturn
+        | Instruction::Lreturn
+        | Instruction::Freturn
+        | Instruction::Dreturn
+        | Instruction::Areturn
+        | Instruction::Return
+        | Instruction::Athrow => {}
+        _ => {
+            if decoded_insn.next_pc < code_len {
+                successors.push(decoded_insn.next_pc);
+            }
+        }
+    }
+    successors
 }
 
 /// Compute the absolute branch targets reachable from `insn` at `pc`.
@@ -1036,15 +1285,12 @@ fn verify_method_structural_only(
 /// arms of `tableswitch`/`lookupswitch`, and the targets of
 /// `goto`/`goto_w`/`jsr`/`jsr_w`. `ret` is intentionally excluded — its
 /// target is data-flow-dependent and cannot be validated structurally.
-fn instruction_branch_targets(insn: &Instruction, pc: usize) -> Vec<u16> {
-    let pc_i32 = pc as i32;
-    let target = |off: i32| -> Option<u16> {
-        let t = pc_i32.checked_add(off)?;
-        if (0..=u16::MAX as i32).contains(&t) {
-            Some(t as u16)
-        } else {
-            None
-        }
+fn instruction_branch_targets(insn: &Instruction, pc: usize) -> Result<Vec<i64>, &'static str> {
+    let pc_i64 = i64::try_from(pc).map_err(|_| "program counter does not fit in i64")?;
+    let target = |off: i64| -> Result<i64, &'static str> {
+        pc_i64
+            .checked_add(off)
+            .ok_or("program counter plus branch offset overflowed")
     };
     match insn {
         Instruction::Ifeq(o)
@@ -1064,37 +1310,29 @@ fn instruction_branch_targets(insn: &Instruction, pc: usize) -> Vec<u16> {
         | Instruction::Ifnull(o)
         | Instruction::Ifnonnull(o)
         | Instruction::Goto(o)
-        | Instruction::Jsr(o) => target(*o as i32).into_iter().collect(),
-        Instruction::GotoW(o) | Instruction::JsrW(o) => target(*o).into_iter().collect(),
+        | Instruction::Jsr(o) => Ok(vec![target(*o as i64)?]),
+        Instruction::GotoW(o) | Instruction::JsrW(o) => Ok(vec![target(*o as i64)?]),
         Instruction::Tableswitch {
             default, offsets, ..
         } => {
             let mut v = Vec::with_capacity(offsets.len() + 1);
-            if let Some(t) = target(*default) {
-                v.push(t);
-            }
+            v.push(target(*default as i64)?);
             for off in offsets {
-                if let Some(t) = target(*off) {
-                    v.push(t);
-                }
+                v.push(target(*off as i64)?);
             }
-            v
+            Ok(v)
         }
         Instruction::Lookupswitch { default, pairs } => {
             let mut v = Vec::with_capacity(pairs.len() + 1);
-            if let Some(t) = target(*default) {
-                v.push(t);
-            }
+            v.push(target(*default as i64)?);
             for (_, off) in pairs {
-                if let Some(t) = target(*off) {
-                    v.push(t);
-                }
+                v.push(target(*off as i64)?);
             }
-            v
+            Ok(v)
         }
         // `ret` jumps to a returnAddress stored in a local — the target
         // is dynamic, not encoded in the instruction. Not checked here.
-        _ => Vec::new(),
+        _ => Ok(Vec::new()),
     }
 }
 
@@ -2574,6 +2812,89 @@ mod tests {
             }
             other => panic!("expected VerifyError for default jsr rejection, got {other:?}"),
         }
+    }
+
+    fn assert_legacy_jsr_structural_rejects(code: Vec<u8>, max_locals: u16, needle: &str) {
+        let class = make_pre_java7_jsr_class("legacy", "()V", 2, max_locals, code, vec![]);
+        match verify_class_bytecode_inner(&class, &PermissiveHierarchy, true) {
+            Err(LinkageError::VerifyError { message, .. }) => {
+                assert!(
+                    message.contains(needle),
+                    "expected VerifyError containing '{needle}', got: {message}"
+                );
+            }
+            other => panic!("expected structural VerifyError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn legacy_jsr_structural_rejects_negative_target() {
+        assert_legacy_jsr_structural_rejects(
+            vec![
+                0xa8, 0xff, 0xff, // 0: jsr -1 -> negative target
+                0xb1, // 3: return
+            ],
+            1,
+            "out of range",
+        );
+    }
+
+    #[test]
+    fn legacy_jsr_structural_rejects_code_len_target() {
+        assert_legacy_jsr_structural_rejects(
+            vec![
+                0xa8, 0x00, 0x04, // 0: jsr +4 -> code_len
+                0xb1, // 3: return
+            ],
+            1,
+            "out of range",
+        );
+    }
+
+    #[test]
+    fn legacy_jsr_structural_rejects_huge_wide_target() {
+        assert_legacy_jsr_structural_rejects(
+            vec![
+                0xc9, 0x7f, 0xff, 0xff, 0xff, // 0: jsr_w i32::MAX
+                0xb1, // 5: return
+            ],
+            1,
+            "out of range",
+        );
+    }
+
+    #[test]
+    fn legacy_jsr_structural_rejects_non_instruction_target() {
+        assert_legacy_jsr_structural_rejects(
+            vec![
+                0xa8, 0x00, 0x01, // 0: jsr +1 -> operand byte, not opcode
+                0xb1, // 3: return
+            ],
+            1,
+            "instruction boundary",
+        );
+    }
+
+    #[test]
+    fn legacy_ret_structural_rejects_uncovered_local() {
+        assert_legacy_jsr_structural_rejects(
+            vec![
+                0xa9, 0x00, // 0: ret 0 without a reachable jsr/astore
+            ],
+            1,
+            "not covered",
+        );
+    }
+
+    #[test]
+    fn legacy_ret_structural_rejects_local_out_of_range() {
+        assert_legacy_jsr_structural_rejects(
+            vec![
+                0xa9, 0x01, // 0: ret 1 with max_locals = 1
+            ],
+            1,
+            "max_locals",
+        );
     }
 
     /// Sanity: the JSR scanner must not be fooled by a `tableswitch`
