@@ -12,7 +12,7 @@
 //! path. The parser MUST NEVER panic on arbitrary input; any `Err` is
 //! the documented contract for malformed class data.
 //!
-//! Run with: cargo +nightly fuzz run read_class
+//! Run with: cargo +nightly fuzz run fuzz_read_class
 #![no_main]
 
 use std::sync::Arc;
