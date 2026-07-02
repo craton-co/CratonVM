@@ -296,5 +296,8 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines on how to contribute.
 ## License
 
 Licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE) for details.
+Copyright 2024-2026 Craton Software Company. Project ownership and notice
+material live in [NOTICE](NOTICE); the root license file intentionally remains
+the unmodified Apache License 2.0 text.
 
 See [TRADEMARKS.md](TRADEMARKS.md) for trademark attributions and notices.
