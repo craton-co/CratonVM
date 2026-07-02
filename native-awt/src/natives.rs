@@ -17,7 +17,7 @@ use rustc_hash::FxHashMap;
 
 use crate::edt;
 use crate::edt::InvokeAndWaitError;
-use crate::event::PeerId;
+use crate::event::{event_id, AwtEvent, PeerId};
 use crate::graphics2d::Graphics2DState;
 use crate::image::{self, ImageId, ImageType};
 use crate::peer::{self, ComponentType};
@@ -2065,6 +2065,133 @@ fn materialise_event(ctx: &mut dyn NativeContext, plan: &EventSynthesisPlan) -> 
     Ok(obj_val)
 }
 
+fn event_int_field(ctx: &dyn NativeContext, obj: ObjectRef, field: &str, default: i32) -> i32 {
+    match ctx.get_field_by_name(obj, field) {
+        Value::Int(v) => v,
+        _ => default,
+    }
+}
+
+fn event_long_field(ctx: &dyn NativeContext, obj: ObjectRef, field: &str, default: i64) -> i64 {
+    match ctx.get_field_by_name(obj, field) {
+        Value::Long(v) => v,
+        Value::Int(v) => v as i64,
+        _ => default,
+    }
+}
+
+fn event_object_field(ctx: &dyn NativeContext, obj: ObjectRef, field: &str) -> Option<ObjectRef> {
+    match ctx.get_field_by_name(obj, field) {
+        Value::Object(Some(v)) => Some(v),
+        _ => None,
+    }
+}
+
+fn current_time_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn peer_for_posted_event_source(ctx: &dyn NativeContext, event_obj: ObjectRef) -> PeerId {
+    let Some(source) = event_object_field(ctx, event_obj, "source") else {
+        return PeerId(0);
+    };
+    let hash = ctx.identity_hash_code(source);
+    peer::peer_registry()
+        .lock()
+        .peer_for_java(hash)
+        .unwrap_or(PeerId(0))
+}
+
+fn posted_awt_event_from_java(ctx: &dyn NativeContext, event_obj: ObjectRef) -> Option<AwtEvent> {
+    let id = event_int_field(ctx, event_obj, "id", 0);
+    let peer = peer_for_posted_event_source(ctx, event_obj);
+    let timestamp =
+        event_long_field(ctx, event_obj, "when", current_time_millis() as i64).max(0) as u64;
+
+    match id {
+        event_id::MOUSE_CLICKED
+        | event_id::MOUSE_PRESSED
+        | event_id::MOUSE_RELEASED
+        | event_id::MOUSE_MOVED
+        | event_id::MOUSE_ENTERED
+        | event_id::MOUSE_EXITED
+        | event_id::MOUSE_DRAGGED => Some(AwtEvent::mouse(
+            id,
+            peer,
+            timestamp,
+            event_int_field(ctx, event_obj, "x", 0),
+            event_int_field(ctx, event_obj, "y", 0),
+            event_int_field(ctx, event_obj, "button", 0),
+            event_int_field(ctx, event_obj, "clickCount", 0),
+            event_int_field(
+                ctx,
+                event_obj,
+                "modifiersEx",
+                event_int_field(ctx, event_obj, "modifiers", 0),
+            ),
+        )),
+        event_id::MOUSE_WHEEL => Some(AwtEvent::mouse_wheel(
+            peer,
+            timestamp,
+            event_int_field(ctx, event_obj, "x", 0),
+            event_int_field(ctx, event_obj, "y", 0),
+            event_int_field(
+                ctx,
+                event_obj,
+                "modifiersEx",
+                event_int_field(ctx, event_obj, "modifiers", 0),
+            ),
+            event_int_field(
+                ctx,
+                event_obj,
+                "wheelRotation",
+                event_int_field(ctx, event_obj, "scrollAmount", 0),
+            ),
+        )),
+        event_id::KEY_TYPED | event_id::KEY_PRESSED | event_id::KEY_RELEASED => {
+            let key_char = char::from_u32(event_int_field(ctx, event_obj, "keyChar", 0) as u32)
+                .unwrap_or('\0');
+            Some(AwtEvent::key(
+                id,
+                peer,
+                timestamp,
+                event_int_field(ctx, event_obj, "keyCode", 0),
+                key_char,
+                event_int_field(
+                    ctx,
+                    event_obj,
+                    "modifiersEx",
+                    event_int_field(ctx, event_obj, "modifiers", 0),
+                ),
+            ))
+        }
+        event_id::WINDOW_OPENED
+        | event_id::WINDOW_CLOSING
+        | event_id::WINDOW_CLOSED
+        | event_id::WINDOW_ACTIVATED
+        | event_id::WINDOW_DEACTIVATED
+        | event_id::WINDOW_GAINED_FOCUS
+        | event_id::WINDOW_LOST_FOCUS => Some(AwtEvent::window(id, peer, timestamp)),
+        event_id::PAINT | event_id::UPDATE => {
+            let rect = event_object_field(ctx, event_obj, "updateRect");
+            let field_obj = rect.unwrap_or(event_obj);
+            Some(AwtEvent::paint(
+                id,
+                peer,
+                timestamp,
+                event_int_field(ctx, field_obj, "x", 0),
+                event_int_field(ctx, field_obj, "y", 0),
+                event_int_field(ctx, field_obj, "width", 0).max(0),
+                event_int_field(ctx, field_obj, "height", 0).max(0),
+            ))
+        }
+        _ => None,
+    }
+}
+
 fn register_event_natives(registry: &mut NativeMethodRegistry) {
     registry.register(
         "java/awt/EventQueue",
@@ -2133,7 +2260,21 @@ fn register_event_natives(registry: &mut NativeMethodRegistry) {
         "java/awt/EventQueue",
         "postEvent",
         "(Ljava/awt/AWTEvent;)V",
-        |_ctx, _args| void_ok(),
+        |ctx, args| {
+            let Some(event_obj) = get_obj(args, 1) else {
+                return void_ok();
+            };
+            if let Some(evt) = posted_awt_event_from_java(ctx, event_obj) {
+                edt::get_edt().post_event(evt);
+            } else {
+                let id = event_int_field(ctx, event_obj, "id", 0);
+                tracing::debug!(
+                    id,
+                    "EventQueue.postEvent ignored unsupported AWTEvent family"
+                );
+            }
+            void_ok()
+        },
     );
     registry.register(
         "java/awt/EventQueue",

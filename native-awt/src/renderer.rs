@@ -50,22 +50,27 @@ impl Rect {
 
     /// Returns `true` if the point (px, py) lies inside this rectangle.
     pub fn contains(&self, px: i32, py: i32) -> bool {
-        px >= self.x
-            && py >= self.y
-            && px < self.x + self.width as i32
-            && py < self.y + self.height as i32
+        let px = px as i64;
+        let py = py as i64;
+        let x0 = self.x as i64;
+        let y0 = self.y as i64;
+        let x1 = x0 + self.width as i64;
+        let y1 = y0 + self.height as i64;
+        px >= x0 && py >= y0 && px < x1 && py < y1
     }
 
     /// Returns the intersection of two rectangles, or `None` if they don't overlap.
     pub fn intersect(&self, other: &Rect) -> Option<Rect> {
-        let x1 = self.x.max(other.x);
-        let y1 = self.y.max(other.y);
-        let x2 = (self.x + self.width as i32).min(other.x + other.width as i32);
-        let y2 = (self.y + self.height as i32).min(other.y + other.height as i32);
+        let x1 = (self.x as i64).max(other.x as i64);
+        let y1 = (self.y as i64).max(other.y as i64);
+        let x2 = (self.x as i64 + self.width as i64)
+            .min(other.x as i64 + other.width as i64);
+        let y2 = (self.y as i64 + self.height as i64)
+            .min(other.y as i64 + other.height as i64);
         if x2 > x1 && y2 > y1 {
             Some(Rect {
-                x: x1,
-                y: y1,
+                x: x1.clamp(i32::MIN as i64, i32::MAX as i64) as i32,
+                y: y1.clamp(i32::MIN as i64, i32::MAX as i64) as i32,
                 width: (x2 - x1) as u32,
                 height: (y2 - y1) as u32,
             })
@@ -1505,10 +1510,10 @@ impl SoftwareRenderer {
         }
 
         // Compute the intersection of the source rect with the buffer.
-        let src_x0 = x.max(0);
-        let src_y0 = y.max(0);
-        let src_x1 = x.saturating_add(w as i32).min(self.width as i32);
-        let src_y1 = y.saturating_add(h as i32).min(self.height as i32);
+        let src_x0 = (x as i64).max(0);
+        let src_y0 = (y as i64).max(0);
+        let src_x1 = (x as i64 + w as i64).min(self.width as i64);
+        let src_y1 = (y as i64 + h as i64).min(self.height as i64);
         if src_x0 >= src_x1 || src_y0 >= src_y1 {
             return;
         }
@@ -1518,33 +1523,33 @@ impl SoftwareRenderer {
         // out-of-source area; to preserve identical behavior we keep that path
         // available, but the fast path is only used when the *entire* source
         // rect is in-bounds (the common case).
-        let full_src_in_bounds = src_x0 as i64 == x as i64
-            && src_y0 as i64 == y as i64
-            && src_x1 as i64 == x as i64 + w as i64
-            && src_y1 as i64 == y as i64 + h as i64;
+        let full_src_in_bounds = src_x0 == x as i64
+            && src_y0 == y as i64
+            && src_x1 == x as i64 + w as i64
+            && src_y1 == y as i64 + h as i64;
 
         if full_src_in_bounds {
             // Compute destination rect (matching the source offset).
-            let dst_x0 = x.saturating_add(dx);
-            let dst_y0 = y.saturating_add(dy);
-            let dst_x1 = dst_x0.saturating_add(w as i32);
-            let dst_y1 = dst_y0.saturating_add(h as i32);
+            let dst_x0 = x as i64 + dx as i64;
+            let dst_y0 = y as i64 + dy as i64;
+            let dst_x1 = dst_x0 + w as i64;
+            let dst_y1 = dst_y0 + h as i64;
 
             // Clip destination to the buffer; compute how much to shave off each
             // side and apply the same shave to the source so they stay aligned.
             let clip_left = (-dst_x0).max(0);
             let clip_top = (-dst_y0).max(0);
-            let clip_right = (dst_x1 - self.width as i32).max(0);
-            let clip_bottom = (dst_y1 - self.height as i32).max(0);
+            let clip_right = (dst_x1 - self.width as i64).max(0);
+            let clip_bottom = (dst_y1 - self.height as i64).max(0);
 
-            let copy_w = (w as i32 - clip_left - clip_right).max(0);
-            let copy_h = (h as i32 - clip_top - clip_bottom).max(0);
+            let copy_w = (w as i64 - clip_left - clip_right).max(0);
+            let copy_h = (h as i64 - clip_top - clip_bottom).max(0);
             if copy_w <= 0 || copy_h <= 0 {
                 return;
             }
 
-            let s_x = (x + clip_left) as usize;
-            let s_y = (y + clip_top) as usize;
+            let s_x = (x as i64 + clip_left) as usize;
+            let s_y = (y as i64 + clip_top) as usize;
             let d_x = (dst_x0 + clip_left) as usize;
             let d_y = (dst_y0 + clip_top) as usize;
             let copy_w = copy_w as usize;
@@ -1927,6 +1932,17 @@ mod tests {
 
         let c = Rect::new(20, 20, 5, 5);
         assert!(a.intersect(&c).is_none());
+    }
+
+    #[test]
+    fn rect_extreme_edges_do_not_overflow() {
+        let r = Rect::new(i32::MAX - 4, i32::MAX - 4, 10, 10);
+        assert!(r.contains(i32::MAX - 1, i32::MAX - 1));
+        assert!(!r.contains(i32::MAX - 5, i32::MAX - 1));
+
+        let a = Rect::new(i32::MAX - 10, 0, 20, 10);
+        let b = Rect::new(i32::MAX - 5, 0, 20, 10);
+        assert_eq!(a.intersect(&b), Some(Rect::new(i32::MAX - 5, 0, 15, 10)));
     }
 
     #[test]
@@ -2494,6 +2510,13 @@ mod tests {
         // Source rect starts at -8 (partly OOB → fallback path) with extents
         // whose product overflows u32.
         r.copy_area(-8, -8, 0xFFFF_FFFF, 0xFFFF_FFFF, 4, 4);
+    }
+
+    #[test]
+    fn test_copy_area_extreme_destination_no_overflow() {
+        let mut r = SoftwareRenderer::new(16, 16);
+        r.copy_area(0, 0, 8, 8, i32::MAX, i32::MAX);
+        r.copy_area(i32::MAX - 4, i32::MAX - 4, 8, 8, 1, 1);
     }
 
     #[test]

@@ -31,8 +31,15 @@ cratonvm_native_awt::register_awt_natives(&mut reg);
 
 ## Status
 
-Pre-1.0. API stability is best-effort. Tied to the
+Pre-1.0 and headless-first. API stability is best-effort and tied to the
 [CratonVM](https://github.com/craton-co/cratonvm) workspace version.
+
+The registered natives are categorized as `Bridge` natives because they back
+real JDK AWT/Swing/Java2D classes. They are not a full desktop backend:
+`Frame.setVisible(true)` does not create an OS window yet, and the Win32/X11/Cocoa
+backend modules remain scaffolded. In-process `Graphics2D` rendering, EDT
+`invokeLater`/`invokeAndWait`, and EventQueue delivery for invocation, mouse,
+key, window, and paint/update events are the supported readiness tier.
 
 ## Hardening Notes
 
@@ -40,6 +47,8 @@ Pre-1.0. API stability is best-effort. Tied to the
   roots, then resolved at dispatch/event-synthesis time.
 - Java-controlled image and renderer buffers have hard pixel caps and use
   fallible reservation paths before allocating backing storage.
+- Geometry and coordinate arithmetic widens before combining Java `int`
+  positions with dimensions, then clips or saturates at the native boundary.
 - `copyArea` clips to the visible destination before allocating temporary
   storage, then processes large visible spans in bounded chunks.
 

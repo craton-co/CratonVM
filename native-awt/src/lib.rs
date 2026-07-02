@@ -27,12 +27,10 @@
 //! ## Runtime mode: headless-only
 //!
 //! The current native-method surface (see [`natives::register_all`]) operates
-//! in **headless-only** mode and aligns with `docs/javafx-status.md` and the
-//! workspace README: every `Frame.setVisible`, `Graphics.drawString`, and
-//! mouse / keyboard event is handled in-process without touching an OS window
-//! manager. `EventQueue.getNextEvent` only synthesises `Invocation` events
-//! today; `Mouse*`, `Key*`, and `Window*` events from the platform layer are
-//! not yet plumbed through to Java listeners.
+//! in **headless-only** mode: `Graphics2D` rasterizes into in-memory buffers,
+//! and `EventQueue` can synthesize invocation, mouse, key, window, and paint
+//! events for Java listeners. The platform backends are still scaffold-only,
+//! so `Frame.setVisible(true)` does not open an on-screen window today.
 //!
 //! ## Platform backends (scaffolded, not yet wired)
 //!
@@ -81,9 +79,9 @@ pub mod platform;
 pub mod renderer;
 pub mod swing;
 
-use cratonvm_native_api::NativeMethodRegistry;
+use cratonvm_native_api::{NativeKind, NativeMethodRegistry};
 
 /// Register all AWT/Swing/Java2D native methods with the VM.
 pub fn register_awt_natives(registry: &mut NativeMethodRegistry) {
-    natives::register_all(registry);
+    registry.with_category(NativeKind::Bridge, natives::register_all);
 }

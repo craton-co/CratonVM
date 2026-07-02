@@ -12,7 +12,7 @@ in synthetic mode — without any JDK at all.
 | `cratonvm-native-builtins` | `java.lang.*`, plus security/crypto, reflection, and related. |
 | `cratonvm-native-collections` | `java.util.*` collections. |
 | `cratonvm-native-io` | `java.io.*` and `java.nio.*`. |
-| `cratonvm-native-awt` | AWT/Swing/Java2D native peers (headless). |
+| `cratonvm-native-awt` | AWT/Swing/Java2D bridge natives for headless peers and in-memory rendering. |
 | `cratonvm-native-api` | The `NativeContext` trait and FD table that the above depend on. |
 
 Together they register **thousands of native methods**. See [Standard Library
@@ -51,6 +51,11 @@ You can dump the full classified registry at runtime with
 `--dump-native-registry`, and audit which natives a program *needs but lacks*
 with `--XX:AuditMissingNatives` — see [Debugging &
 Diagnostics](../user-guide/debugging.md).
+
+`cratonvm-native-awt` registrations are classified as **Bridge** natives:
+they satisfy native entry points reached by real JDK AWT/Swing/Java2D classes.
+That category does not imply full desktop readiness; current support is
+headless and does not instantiate OS windows.
 
 ## Real-JDK vs. synthetic
 

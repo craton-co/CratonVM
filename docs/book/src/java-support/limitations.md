@@ -12,8 +12,10 @@ covered in the [Security](../security/overview.md) chapters.
   `HttpsURLConnection` are not backed. Terminate TLS in front of the VM (a
   reverse proxy or service-mesh sidecar). See [Cryptography](../security/cryptography.md).
 - **No `java.sql` / JDBC** — there is no database connectivity.
-- **AWT / Swing / Java2D are headless.** They are implemented natively with no
-  on-screen rendering. **JavaFX is out of tree** and not a core module.
+- **AWT / Swing / Java2D are headless.** They are implemented natively with
+  in-memory `Graphics2D` rendering and EDT/EventQueue support for common
+  invocation, mouse, key, window, and paint events, but no on-screen window
+  backend is wired yet. **JavaFX is out of tree** and not a core module.
 - **No JAR main-class auto-detection from the classpath** — name the class
   explicitly, or use `--jar` (which reads `Main-Class` from the manifest).
 
