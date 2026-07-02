@@ -1,65 +1,58 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2024-2026 Craton Software Company
 
-//! Build script for craton-gpu.
-//!
-//! Compiles the Java annotation source files using `javac` (if
-//! available) and packages them into a jar via `jar` (if available).
-//!
-//! The `.java` sources are NOT shipped inside this crate — they live in
-//! an external standalone Maven project (the craton-gpu-java repo). The
-//! source tree is located at build time via, in priority order: the
-//! `$CRATON_GPU_JAVA_SRC` env override, a `../craton-gpu-java/...`
-//! sibling checkout, or (on Windows only) a `C:/craton/...` default
-//! install. See `resolve_java_root` for the exact resolution. When no
-//! source tree is found the build degrades gracefully to an empty jar
-//! plus a `cargo:warning=` — it never fails.
-//!
-//! The resulting paths are surfaced to the Rust crate via two
-//! `cargo:rustc-env=` variables:
-//!
-//! * `CRATON_GPU_ANNOTATIONS_JAR` — absolute path to the produced
-//!   jar, or empty string when the jar could not be produced.
-//! * `CRATON_GPU_ANNOTATIONS_DIR` — absolute path to a directory
-//!   that either contains the compiled `.class` files or is empty
-//!   (the directory is always created so `env!()` in lib.rs has a
-//!   valid value).
-//!
-//! The same two paths are *also* emitted as cargo build-script
-//! metadata via the `links = "craton-gpu-annotations"` declaration
-//! in `Cargo.toml`:
-//!
-//! * `cargo:annotations_dir=...`
-//! * `cargo:annotations_jar=...`
-//!
-//! Cargo exposes these to dependents' build scripts as env vars
-//! `DEP_CRATON_GPU_ANNOTATIONS_ANNOTATIONS_DIR` /
-//! `DEP_CRATON_GPU_ANNOTATIONS_ANNOTATIONS_JAR`. The `rustc-env` form
-//! alone is not enough — cargo intentionally does NOT propagate
-//! `rustc-env=` vars to dependents' build scripts.
-//!
-//! The build script is intentionally resilient: a missing `javac`,
-//! a missing `jar`, or a complete absence of `.java` sources only
-//! produces a `cargo:warning=`. It never fails the build.
+// Build script for craton-gpu.
+//
+// Compiles the Java annotation source files using `javac` when available
+// and packages them into a jar with `jar` when available.
+//
+// The `.java` sources are not shipped inside this crate. They live in an
+// external standalone Maven project, the craton-gpu-java repo. The source
+// tree is located at build time via, in priority order: the
+// `$CRATON_GPU_JAVA_SRC` env override, a `craton-gpu-java` checkout beside
+// the CratonVM workspace, or on Windows only, the `C:/craton/...` default
+// install. When no source tree is found the build degrades gracefully to an
+// empty annotations directory plus a `cargo:warning=`; it never fails.
+//
+// The resulting paths are surfaced to the Rust crate via two
+// `cargo:rustc-env=` variables:
+//
+// * `CRATON_GPU_ANNOTATIONS_JAR` - absolute path to the produced jar, or
+//   empty string when the jar could not be produced.
+// * `CRATON_GPU_ANNOTATIONS_DIR` - absolute path to a directory that either
+//   contains the compiled `.class` files or is empty.
+//
+// The same two paths are also emitted as cargo build-script metadata via the
+// `links = "craton-gpu-annotations"` declaration in `Cargo.toml`:
+//
+// * `cargo:annotations_dir=...`
+// * `cargo:annotations_jar=...`
+//
+// Cargo exposes these to dependents' build scripts as env vars
+// `DEP_CRATON_GPU_ANNOTATIONS_ANNOTATIONS_DIR` and
+// `DEP_CRATON_GPU_ANNOTATIONS_ANNOTATIONS_JAR`. The `rustc-env` form alone
+// is not enough; cargo intentionally does not propagate `rustc-env=` vars to
+// dependents' build scripts.
 
 use std::ffi::OsString;
 use std::fs;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn main() {
-    // Java sources moved to a standalone Maven project (the
-    // craton-gpu-java repo) — see that repo's README.md. They are NOT
-    // shipped inside this crate. Locate them via, in priority order:
-    //   1. $CRATON_GPU_JAVA_SRC env var (full absolute path to a
-    //      directory containing `craton/gpu/*.java`); a set-but-invalid
-    //      value is diagnosed via cargo:warning and then ignored,
-    //   2. ../craton-gpu-java/src/main/java (portable sibling checkout;
-    //      tried on every platform),
+    // Java sources moved to a standalone Maven project, the craton-gpu-java
+    // repo. They are not shipped inside this crate. Locate them via, in
+    // priority order:
+    //   1. $CRATON_GPU_JAVA_SRC env var (full absolute path to a directory
+    //      containing `craton/gpu/*.java`); a set-but-invalid value is
+    //      diagnosed via cargo:warning and then ignored,
+    //   2. craton-gpu-java/src/main/java beside the CratonVM workspace
+    //      checkout (portable sibling checkout; tried on every platform),
     //   3. C:/craton/craton-gpu-java/src/main/java (Windows-only default
     //      install; never consulted on Linux/macOS).
-    // If none exists, the build script emits empty paths and a warning
-    // — same fallback behaviour as before the move. The build NEVER fails.
+    // If none exists, the build script emits empty paths and a warning. The
+    // build never fails.
     println!("cargo:rerun-if-env-changed=CRATON_GPU_JAVA_SRC");
     println!("cargo:rerun-if-changed=build.rs");
 
@@ -67,44 +60,52 @@ fn main() {
     let classes_dir = out_dir.join("classes");
     let jar_path = out_dir.join("craton-gpu-annotations.jar");
 
-    // Always (re)create the classes dir so the env! in lib.rs has a
-    // valid path even when nothing got compiled.
-    if let Err(e) = fs::create_dir_all(&classes_dir) {
-        println!(
-            "cargo:warning=craton-gpu: failed to create {}: {}",
-            classes_dir.display(),
-            e
-        );
-    }
-
-    let java_root = resolve_java_root();
-    // Tell cargo to rerun when the chosen source tree changes. Only emit
-    // this when `java_root` actually exists: `resolve_java_root` returns a
-    // default candidate even when nothing is present, and cargo treats a
-    // missing `rerun-if-changed` path as perpetually dirty, which would
-    // force this build script to re-run on every build on hosts without
-    // the Java sources. The early-return paths below still emit the
-    // rustc-env / cargo metadata lines unconditionally.
-    if java_root.is_dir() {
-        println!("cargo:rerun-if-changed={}", java_root.display());
-    }
-
-    // Helper: emit ALL four lines (two rustc-env, two cargo metadata)
-    // and return. The rustc-env lines feed `env!()` in this crate's
-    // own `src/lib.rs`; the `cargo:annotations_*` lines feed
-    // `DEP_CRATON_GPU_ANNOTATIONS_ANNOTATIONS_*` in dependents'
-    // build.rs (via the `links` key in Cargo.toml).
+    // Helper: emit all four lines (two rustc-env, two cargo metadata) and
+    // return. The rustc-env lines feed `env!()` in this crate's own
+    // `src/lib.rs`; the `cargo:annotations_*` lines feed
+    // `DEP_CRATON_GPU_ANNOTATIONS_ANNOTATIONS_*` in dependents' build.rs
+    // through the `links` key in Cargo.toml.
     let emit_env = |jar: &str, dir: &Path| {
         println!("cargo:rustc-env=CRATON_GPU_ANNOTATIONS_JAR={}", jar);
         println!(
             "cargo:rustc-env=CRATON_GPU_ANNOTATIONS_DIR={}",
             dir.display()
         );
-        // Build-script metadata for dependents (see Cargo.toml `links`).
-        // Empty strings are fine — dependents must tolerate them.
+        // Build-script metadata for dependents. Empty strings are fine;
+        // dependents must tolerate them.
         println!("cargo:annotations_jar={}", jar);
         println!("cargo:annotations_dir={}", dir.display());
     };
+
+    // Always reset the classes dir so stale .class files from an earlier
+    // successful build cannot leak through failure or empty-source paths.
+    if let Err(e) = prepare_clean_dir(&classes_dir) {
+        println!(
+            "cargo:warning=craton-gpu: failed to reset {}: {}; annotations will not be compiled",
+            classes_dir.display(),
+            e
+        );
+        let fallback_dir = prepare_clean_fallback_dir(&out_dir);
+        emit_env("", &fallback_dir);
+        return;
+    }
+
+    if let Err(e) = remove_file_if_exists(&jar_path) {
+        println!(
+            "cargo:warning=craton-gpu: failed to remove stale jar {}: {}",
+            jar_path.display(),
+            e
+        );
+    }
+
+    let java_root = resolve_java_root();
+    // Tell cargo to rerun when the chosen source tree changes. Only emit this
+    // when `java_root` actually exists: `resolve_java_root` returns a default
+    // candidate even when nothing is present, and cargo treats a missing
+    // `rerun-if-changed` path as perpetually dirty.
+    if java_root.is_dir() {
+        println!("cargo:rerun-if-changed={}", java_root.display());
+    }
 
     // 1. Is javac on PATH?
     if !javac_available() {
@@ -126,10 +127,8 @@ fn main() {
     }
 
     // Re-run when any individual `.java` source changes. The directory
-    // `rerun-if-changed` above is not enough: on many platforms a
-    // directory's mtime does not change when a file *inside* it is
-    // edited, so per-file lines are required to catch edits to
-    // existing annotation sources.
+    // `rerun-if-changed` above is not enough: on many platforms a directory's
+    // mtime does not change when a file inside it is edited.
     for src in &sources {
         println!("cargo:rerun-if-changed={}", src.display());
     }
@@ -150,18 +149,20 @@ fn main() {
     }
     let javac_status = javac.status();
     match javac_status {
-        Ok(status) if status.success() => { /* fall through to jar */ }
+        Ok(status) if status.success() => {}
         Ok(status) => {
             println!(
                 "cargo:warning=craton-gpu: javac exited with {}; annotations not packaged",
                 status
             );
-            emit_env("", &classes_dir);
+            let empty_dir = clean_failed_generation_dir(&classes_dir, &out_dir);
+            emit_env("", &empty_dir);
             return;
         }
         Err(e) => {
             println!("cargo:warning=craton-gpu: failed to invoke javac: {}", e);
-            emit_env("", &classes_dir);
+            let empty_dir = clean_failed_generation_dir(&classes_dir, &out_dir);
+            emit_env("", &empty_dir);
             return;
         }
     }
@@ -182,71 +183,149 @@ fn main() {
 }
 
 /// Resolve the Java source root, in priority order:
-/// 1. `$CRATON_GPU_JAVA_SRC` (treated as an absolute path to a
-///    directory containing `craton/gpu/*.java`). A set-but-invalid
-///    value is diagnosed via `cargo:warning=` and then ignored.
-/// 2. `../craton-gpu-java/src/main/java` (sibling of CratonVM repo) —
-///    portable, tried on every platform.
-/// 3. `C:/craton/craton-gpu-java/src/main/java` (default install) —
-///    **Windows only**; never consulted on Linux/macOS.
+/// 1. `$CRATON_GPU_JAVA_SRC`, treated as an absolute path to a directory
+///    containing `craton/gpu/*.java`. A set-but-invalid value is diagnosed via
+///    `cargo:warning=` and then ignored.
+/// 2. `craton-gpu-java/src/main/java` beside the CratonVM workspace checkout.
+///    This is portable and tried on every platform.
+/// 3. `C:/craton/craton-gpu-java/src/main/java`, a default install path
+///    consulted only on Windows.
 ///
-/// Returns the first path that exists; if none exists, returns a
-/// platform-appropriate fallback (the Windows install path on Windows,
-/// the OS-agnostic sibling path elsewhere) — the caller (`main`) will
-/// discover the absence and emit a `cargo:warning=` instead of failing
-/// the build.
+/// Returns the first path that exists. If none exists, returns a
+/// platform-appropriate fallback; the caller discovers the absence and emits a
+/// `cargo:warning=` instead of failing the build.
 fn resolve_java_root() -> PathBuf {
-    if let Some(v) = std::env::var_os("CRATON_GPU_JAVA_SRC") {
-        let p = PathBuf::from(v);
-        if p.is_dir() {
-            return p;
-        }
-        // Fix (1): a set-but-invalid override used to be silently ignored,
-        // so a typo'd path would mysteriously fall back to the built-in
-        // candidates with no clue why the override "did nothing". Diagnose
-        // it via cargo:warning. We still fall through to the candidate list
-        // (and ultimately to an empty-jar warning) per the no-fail contract.
+    let manifest_dir = std::env::var_os("CARGO_MANIFEST_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+    let resolution = resolve_java_root_from(
+        std::env::var_os("CRATON_GPU_JAVA_SRC"),
+        &manifest_dir,
+        cfg!(windows),
+    );
+    if let Some(p) = resolution.invalid_override {
         println!(
             "cargo:warning=craton-gpu: $CRATON_GPU_JAVA_SRC is set to {} but that is not a directory; ignoring the override and falling back to the default source-resolution candidates",
             p.display()
         );
     }
-    // The first candidate is relative and OS-agnostic: cargo guarantees
-    // the build script's CWD is the crate root (craton-gpu/), so `..`
-    // resolves to the CratonVM workspace parent and finds a sibling
-    // craton-gpu-java checkout. This is the portable fallback used on
-    // every platform.
-    let sibling = PathBuf::from("../craton-gpu-java/src/main/java");
-    if sibling.is_dir() {
-        return sibling;
+    resolution.path
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct JavaRootResolution {
+    path: PathBuf,
+    invalid_override: Option<PathBuf>,
+}
+
+fn resolve_java_root_from(
+    env_override: Option<OsString>,
+    manifest_dir: &Path,
+    is_windows: bool,
+) -> JavaRootResolution {
+    if let Some(v) = env_override {
+        let override_path = PathBuf::from(v);
+        if override_path.is_dir() {
+            return JavaRootResolution {
+                path: override_path,
+                invalid_override: None,
+            };
+        }
+
+        let sibling = documented_sibling_java_root(manifest_dir);
+        if sibling.is_dir() {
+            return JavaRootResolution {
+                path: sibling,
+                invalid_override: Some(override_path),
+            };
+        }
+
+        return JavaRootResolution {
+            path: platform_fallback_java_root(sibling, is_windows),
+            invalid_override: Some(override_path),
+        };
     }
-    // Fix (3): the `C:/craton/...` absolute default is Windows-only — on
-    // Linux/macOS it can never exist and, worse, returning it as the final
-    // fallback used to surface a bogus Windows path in the build warning,
-    // making a clean non-Windows checkout look broken. Only consult (and
-    // only return) the Windows install path when actually building on
-    // Windows. On other hosts the OS-agnostic sibling path is the final
-    // fallback; `main` discovers its absence and emits a `cargo:warning=`,
-    // degrading gracefully to an empty jar per the resilient-build contract.
-    #[cfg(windows)]
-    {
+
+    let sibling = documented_sibling_java_root(manifest_dir);
+    if sibling.is_dir() {
+        return JavaRootResolution {
+            path: sibling,
+            invalid_override: None,
+        };
+    }
+
+    JavaRootResolution {
+        path: platform_fallback_java_root(sibling, is_windows),
+        invalid_override: None,
+    }
+}
+
+fn documented_sibling_java_root(manifest_dir: &Path) -> PathBuf {
+    let workspace_root = manifest_dir.parent().unwrap_or(manifest_dir);
+    let workspace_parent = workspace_root.parent().unwrap_or(workspace_root);
+    workspace_parent
+        .join("craton-gpu-java")
+        .join("src")
+        .join("main")
+        .join("java")
+}
+
+fn platform_fallback_java_root(sibling: PathBuf, is_windows: bool) -> PathBuf {
+    if is_windows {
         let win_default = PathBuf::from("C:/craton/craton-gpu-java/src/main/java");
         if win_default.is_dir() {
             return win_default;
         }
-        win_default
+        return win_default;
     }
-    // Non-Windows: return the portable sibling path (which does not exist
-    // here, by the check above) so the warning names a sensible relative
-    // location and instructs the user to set $CRATON_GPU_JAVA_SRC.
-    #[cfg(not(windows))]
-    {
-        sibling
+    sibling
+}
+
+fn prepare_clean_dir(dir: &Path) -> std::io::Result<()> {
+    match fs::remove_dir_all(dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    fs::create_dir_all(dir)
+}
+
+fn prepare_clean_fallback_dir(out_dir: &Path) -> PathBuf {
+    let fallback_dir = out_dir.join("empty-classes");
+    if let Err(e) = prepare_clean_dir(&fallback_dir) {
+        println!(
+            "cargo:warning=craton-gpu: failed to create clean fallback annotations dir {}: {}",
+            fallback_dir.display(),
+            e
+        );
+    }
+    fallback_dir
+}
+
+fn clean_failed_generation_dir(classes_dir: &Path, out_dir: &Path) -> PathBuf {
+    match prepare_clean_dir(classes_dir) {
+        Ok(()) => classes_dir.to_path_buf(),
+        Err(e) => {
+            println!(
+                "cargo:warning=craton-gpu: failed to clear generated classes after javac failure at {}: {}",
+                classes_dir.display(),
+                e
+            );
+            prepare_clean_fallback_dir(out_dir)
+        }
     }
 }
 
-/// Probe for `javac` on PATH by running `javac -version`. Both
-/// stdout and stderr are discarded; only the exit status matters.
+fn remove_file_if_exists(path: &Path) -> std::io::Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+/// Probe for `javac` on PATH by running `javac -version`. Both stdout and
+/// stderr are discarded; only the exit status matters.
 fn javac_available() -> bool {
     let mut cmd = Command::new("javac");
     cmd.arg("-version");
@@ -263,10 +342,9 @@ fn collect_java(root: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
         let ftype = entry.file_type()?;
         if ftype.is_dir() {
             collect_java(&path, out)?;
-        } else if ftype.is_file()
-            && path.extension().map(|e| e == "java").unwrap_or(false) {
-                out.push(path);
-            }
+        } else if ftype.is_file() && path.extension().map(|e| e == "java").unwrap_or(false) {
+            out.push(path);
+        }
     }
     Ok(())
 }
@@ -274,14 +352,12 @@ fn collect_java(root: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
 /// Invoke `jar --create --file <jar> -C <classes_dir> .`.
 ///
 /// NOTE (reproducibility): the JDK `jar` tool embeds each entry's file
-/// modification timestamp into the archive, so the produced jar is NOT
+/// modification timestamp into the archive, so the produced jar is not
 /// byte-reproducible across builds even when the `.class` inputs are
-/// identical. There is no portable `jar` flag to normalize timestamps
-/// (the `--date` option only exists on recent JDKs and is not relied on
-/// here), so we leave the behaviour as-is. Downstream consumers that
-/// cache on content should key on the compiled class directory
-/// (`CRATON_GPU_ANNOTATIONS_DIR`), whose contents are deterministic,
-/// rather than on the hash of this jar.
+/// identical. There is no portable `jar` flag to normalize timestamps across
+/// the supported JDK range, so downstream consumers that cache on content
+/// should key on the compiled class directory rather than on the hash of this
+/// jar.
 fn build_jar(classes_dir: &Path, jar_path: &Path) -> Result<(), String> {
     let mut cmd = Command::new("jar");
     cmd.arg("--create");
