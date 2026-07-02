@@ -149,6 +149,9 @@ index, module, class, vm, jit, rc, status, seconds, tests, failed,
 stdoutLog, stderrLog, note
 ```
 
+Long module/class names are truncated in log filenames and get a stable hash
+suffix. The full class name is always preserved in `results.tsv`.
+
 Status values:
 
 - `PASS`: JUnitCore exited 0.
