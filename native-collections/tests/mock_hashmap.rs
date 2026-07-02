@@ -439,6 +439,78 @@ fn keyset_iterator_visits_all_keys() {
 }
 
 #[test]
+fn keyset_initial_backing_retains_null_key() {
+    let reg = build_registry();
+    let mut ctx = MockCtx::new();
+    let hm = new_hashmap(&reg, &mut ctx);
+    let non_null_key = boxed_int(&mut ctx, 42);
+    let value = boxed_int(&mut ctx, 7);
+
+    call(
+        &reg,
+        &mut ctx,
+        HM,
+        "put",
+        PUT,
+        &[Value::Object(Some(hm)), Value::Object(None), value],
+    )
+    .unwrap();
+    call(
+        &reg,
+        &mut ctx,
+        HM,
+        "put",
+        PUT,
+        &[Value::Object(Some(hm)), non_null_key, value],
+    )
+    .unwrap();
+
+    let key_set = call(
+        &reg,
+        &mut ctx,
+        HM,
+        "keySet",
+        "()Ljava/util/Set;",
+        &[Value::Object(Some(hm))],
+    )
+    .unwrap();
+    let key_set_obj = match key_set {
+        Some(Value::Object(Some(o))) => o,
+        other => panic!("keySet returned {:?}", other),
+    };
+    let backing = match ctx.get_field(key_set_obj, 0) {
+        Value::Object(Some(o)) => o,
+        other => panic!("keySet backing was {:?}", other),
+    };
+
+    let has_null = call(
+        &reg,
+        &mut ctx,
+        HM,
+        "containsKey",
+        "(Ljava/lang/Object;)Z",
+        &[Value::Object(Some(backing)), Value::Object(None)],
+    )
+    .unwrap();
+    assert_eq!(
+        has_null,
+        Some(Value::Int(1)),
+        "fresh keySet backing must retain the legal null key"
+    );
+
+    let size = call(
+        &reg,
+        &mut ctx,
+        HM,
+        "size",
+        "()I",
+        &[Value::Object(Some(backing))],
+    )
+    .unwrap();
+    assert_eq!(size, Some(Value::Int(2)));
+}
+
+#[test]
 fn colliding_keys_iterate_in_tail_append_order_like_hotspot() {
     // HotSpot HashMap.putVal (JDK 8+) appends a new colliding key at the TAIL
     // of its bin, so iterating a single bucket yields *insertion* order. Keys
