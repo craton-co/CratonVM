@@ -4250,8 +4250,8 @@ mod tests {
     fn test_emit_gc_event() {
         let mut fr = make_recorder();
         let rid = fr.new_recording(RecordingSettings::new("test"));
-        fr.start_recording(rid);
         let _g = drain_ring_baseline();
+        fr.start_recording(rid);
         emit_gc_event(&mut fr, 1, "G1 Young", "Allocation Failure", 1000, 500);
         fr.drain_per_thread_into_repository();
         let rec = fr.get_recording_mut(rid).unwrap();
@@ -4310,8 +4310,8 @@ mod tests {
     fn test_emit_class_load_event() {
         let mut fr = make_recorder();
         let rid = fr.new_recording(RecordingSettings::new("test"));
-        fr.start_recording(rid);
         let _g = drain_ring_baseline();
+        fr.start_recording(rid);
         emit_class_load_event(
             &mut fr,
             "java/lang/Object",
@@ -4329,8 +4329,8 @@ mod tests {
     fn test_emit_thread_start_event() {
         let mut fr = make_recorder();
         let rid = fr.new_recording(RecordingSettings::new("test"));
-        fr.start_recording(rid);
         let _g = drain_ring_baseline();
+        fr.start_recording(rid);
         emit_thread_start_event(&mut fr, "main", "", 1, 3000);
         fr.drain_per_thread_into_repository();
         let rec = fr.get_recording_mut(rid).unwrap();
@@ -4341,8 +4341,8 @@ mod tests {
     fn test_emit_compilation_event() {
         let mut fr = make_recorder();
         let rid = fr.new_recording(RecordingSettings::new("test"));
-        fr.start_recording(rid);
         let _g = drain_ring_baseline();
+        fr.start_recording(rid);
         emit_compilation_event(
             &mut fr,
             "java/lang/String.hashCode:()I",
@@ -4364,8 +4364,8 @@ mod tests {
     fn test_emit_allocation_in_new_tlab_event() {
         let mut fr = make_recorder();
         let rid = fr.new_recording(RecordingSettings::new("test"));
-        fr.start_recording(rid);
         let _g = drain_ring_baseline();
+        fr.start_recording(rid);
         emit_allocation_in_new_tlab_event(&mut fr, "java/lang/Object", 64, 4096, 1, 5000);
         fr.drain_per_thread_into_repository();
         let rec = fr.get_recording_mut(rid).unwrap();
@@ -4393,8 +4393,8 @@ mod tests {
     fn test_emit_thread_end_event() {
         let mut fr = make_recorder();
         let rid = fr.new_recording(RecordingSettings::new("test"));
-        fr.start_recording(rid);
         let _g = drain_ring_baseline();
+        fr.start_recording(rid);
         emit_thread_end_event(&mut fr, "worker-1", 42, 6000);
         fr.drain_per_thread_into_repository();
         let rec = fr.get_recording_mut(rid).unwrap();
@@ -4405,8 +4405,8 @@ mod tests {
     fn test_emit_thread_sleep_event() {
         let mut fr = make_recorder();
         let rid = fr.new_recording(RecordingSettings::new("test"));
-        fr.start_recording(rid);
         let _g = drain_ring_baseline();
+        fr.start_recording(rid);
         emit_thread_sleep_event(&mut fr, 1_000_000, 1, 7000, 1_000_000);
         fr.drain_per_thread_into_repository();
         let rec = fr.get_recording_mut(rid).unwrap();
@@ -4417,8 +4417,8 @@ mod tests {
     fn test_emit_monitor_wait_event() {
         let mut fr = make_recorder();
         let rid = fr.new_recording(RecordingSettings::new("test"));
-        fr.start_recording(rid);
         let _g = drain_ring_baseline();
+        fr.start_recording(rid);
         emit_monitor_wait_event(
             &mut fr,
             "java/lang/Object",
@@ -4439,8 +4439,8 @@ mod tests {
     fn test_emit_monitor_enter_event() {
         let mut fr = make_recorder();
         let rid = fr.new_recording(RecordingSettings::new("test"));
-        fr.start_recording(rid);
         let _g = drain_ring_baseline();
+        fr.start_recording(rid);
         emit_monitor_enter_event(&mut fr, "java/util/HashMap", "main", 0xBEEF, 1, 9000, 200);
         fr.drain_per_thread_into_repository();
         let rec = fr.get_recording_mut(rid).unwrap();
@@ -4451,8 +4451,8 @@ mod tests {
     fn test_emit_class_unload_event() {
         let mut fr = make_recorder();
         let rid = fr.new_recording(RecordingSettings::new("test"));
-        fr.start_recording(rid);
         let _g = drain_ring_baseline();
+        fr.start_recording(rid);
         emit_class_unload_event(&mut fr, "com/example/OldClass", "app", 10000);
         fr.drain_per_thread_into_repository();
         let rec = fr.get_recording_mut(rid).unwrap();
@@ -4463,8 +4463,8 @@ mod tests {
     fn test_emit_thread_park_event() {
         let mut fr = make_recorder();
         let rid = fr.new_recording(RecordingSettings::new("test"));
-        fr.start_recording(rid);
         let _g = drain_ring_baseline();
+        fr.start_recording(rid);
         emit_thread_park_event(
             &mut fr,
             "java/util/concurrent/locks/AQS",
@@ -4483,8 +4483,8 @@ mod tests {
     fn test_emit_gc_heap_summary_event() {
         let mut fr = make_recorder();
         let rid = fr.new_recording(RecordingSettings::new("test"));
-        fr.start_recording(rid);
         let _g = drain_ring_baseline();
+        fr.start_recording(rid);
         emit_gc_heap_summary_event(
             &mut fr,
             1,
@@ -4504,8 +4504,8 @@ mod tests {
     fn test_emit_thread_sleep_saturating_add() {
         let mut fr = make_recorder();
         let rid = fr.new_recording(RecordingSettings::new("test"));
-        fr.start_recording(rid);
         let _g = drain_ring_baseline();
+        fr.start_recording(rid);
         // Use u64::MAX to test saturating_add doesn't overflow
         emit_thread_sleep_event(&mut fr, i64::MAX, 1, u64::MAX - 10, u64::MAX);
         fr.drain_per_thread_into_repository();
@@ -4537,8 +4537,8 @@ mod tests {
     fn s41_emit_deoptimization_event() {
         let mut fr = make_recorder();
         let rid = fr.new_recording(RecordingSettings::new("test"));
-        fr.start_recording(rid);
         let _g = drain_ring_baseline();
+        fr.start_recording(rid);
         emit_deoptimization_event(
             &mut fr,
             "com/example/Foo.bar:()V",
@@ -4569,8 +4569,8 @@ mod tests {
     fn s41_emit_file_read_event() {
         let mut fr = make_recorder();
         let rid = fr.new_recording(RecordingSettings::new("test"));
-        fr.start_recording(rid);
         let _g = drain_ring_baseline();
+        fr.start_recording(rid);
         emit_file_read_event(&mut fr, "fd:3", 1024, false, 1, 10000, 500);
         fr.drain_per_thread_into_repository();
         let rec = fr.get_recording_mut(rid).unwrap();
@@ -4583,8 +4583,8 @@ mod tests {
     fn s41_emit_file_write_event() {
         let mut fr = make_recorder();
         let rid = fr.new_recording(RecordingSettings::new("test"));
-        fr.start_recording(rid);
         let _g = drain_ring_baseline();
+        fr.start_recording(rid);
         emit_file_write_event(&mut fr, "fd:1", 512, 1, 10000, 300);
         fr.drain_per_thread_into_repository();
         let rec = fr.get_recording_mut(rid).unwrap();
@@ -4595,8 +4595,8 @@ mod tests {
     fn s41_emit_socket_read_event() {
         let mut fr = make_recorder();
         let rid = fr.new_recording(RecordingSettings::new("test"));
-        fr.start_recording(rid);
         let _g = drain_ring_baseline();
+        fr.start_recording(rid);
         emit_socket_read_event(&mut fr, "localhost", 8080, 256, false, 1, 10000, 2000);
         fr.drain_per_thread_into_repository();
         let rec = fr.get_recording_mut(rid).unwrap();
@@ -4609,8 +4609,8 @@ mod tests {
     fn s41_emit_socket_write_event() {
         let mut fr = make_recorder();
         let rid = fr.new_recording(RecordingSettings::new("test"));
-        fr.start_recording(rid);
         let _g = drain_ring_baseline();
+        fr.start_recording(rid);
         emit_socket_write_event(&mut fr, "example.com", 443, 128, 1, 10000, 1000);
         fr.drain_per_thread_into_repository();
         let rec = fr.get_recording_mut(rid).unwrap();
@@ -4621,8 +4621,8 @@ mod tests {
     fn s41_emit_gc_phase_pause_event() {
         let mut fr = make_recorder();
         let rid = fr.new_recording(RecordingSettings::new("test"));
-        fr.start_recording(rid);
         let _g = drain_ring_baseline();
+        fr.start_recording(rid);
         emit_gc_phase_pause_event(&mut fr, 1, "Mark", 10000, 5000);
         fr.drain_per_thread_into_repository();
         let rec = fr.get_recording_mut(rid).unwrap();
@@ -4633,8 +4633,8 @@ mod tests {
     fn s41_emit_young_gc_event() {
         let mut fr = make_recorder();
         let rid = fr.new_recording(RecordingSettings::new("test"));
-        fr.start_recording(rid);
         let _g = drain_ring_baseline();
+        fr.start_recording(rid);
         emit_young_gc_event(&mut fr, 1, 15, 10000, 3000);
         fr.drain_per_thread_into_repository();
         let rec = fr.get_recording_mut(rid).unwrap();
@@ -4645,8 +4645,8 @@ mod tests {
     fn s41_emit_old_gc_event() {
         let mut fr = make_recorder();
         let rid = fr.new_recording(RecordingSettings::new("test"));
-        fr.start_recording(rid);
         let _g = drain_ring_baseline();
+        fr.start_recording(rid);
         emit_old_gc_event(&mut fr, 2, 20000, 10000);
         fr.drain_per_thread_into_repository();
         let rec = fr.get_recording_mut(rid).unwrap();
@@ -4657,8 +4657,8 @@ mod tests {
     fn s41_emit_metaspace_summary_event() {
         let mut fr = make_recorder();
         let rid = fr.new_recording(RecordingSettings::new("test"));
-        fr.start_recording(rid);
         let _g = drain_ring_baseline();
+        fr.start_recording(rid);
         emit_metaspace_summary_event(&mut fr, 1, "After GC", 1024, 2048, 4096, 15000);
         fr.drain_per_thread_into_repository();
         let rec = fr.get_recording_mut(rid).unwrap();
@@ -4669,8 +4669,8 @@ mod tests {
     fn s41_emit_allocation_outside_tlab_event() {
         let mut fr = make_recorder();
         let rid = fr.new_recording(RecordingSettings::new("test"));
-        fr.start_recording(rid);
         let _g = drain_ring_baseline();
+        fr.start_recording(rid);
         emit_allocation_outside_tlab_event(&mut fr, "java/lang/Object", 64, 1, 10000);
         fr.drain_per_thread_into_repository();
         let rec = fr.get_recording_mut(rid).unwrap();
@@ -4681,8 +4681,8 @@ mod tests {
     fn s41_emit_execution_sample_event() {
         let mut fr = make_recorder();
         let rid = fr.new_recording(RecordingSettings::new("test"));
-        fr.start_recording(rid);
         let _g = drain_ring_baseline();
+        fr.start_recording(rid);
         emit_execution_sample_event(&mut fr, "main", "Main.run:5", "RUNNABLE", 1, 10000);
         fr.drain_per_thread_into_repository();
         let rec = fr.get_recording_mut(rid).unwrap();
@@ -4693,8 +4693,8 @@ mod tests {
     fn s41_emit_cpu_load_event() {
         let mut fr = make_recorder();
         let rid = fr.new_recording(RecordingSettings::new("test"));
-        fr.start_recording(rid);
         let _g = drain_ring_baseline();
+        fr.start_recording(rid);
         emit_cpu_load_event(&mut fr, 0.25, 0.05, 0.60, 10000);
         fr.drain_per_thread_into_repository();
         let rec = fr.get_recording_mut(rid).unwrap();
@@ -4715,8 +4715,8 @@ mod tests {
     fn s41_emit_thread_statistics_event() {
         let mut fr = make_recorder();
         let rid = fr.new_recording(RecordingSettings::new("test"));
-        fr.start_recording(rid);
         let _g = drain_ring_baseline();
+        fr.start_recording(rid);
         emit_thread_statistics_event(&mut fr, 10, 3, 50, 12, 10000);
         fr.drain_per_thread_into_repository();
         let rec = fr.get_recording_mut(rid).unwrap();
@@ -4727,8 +4727,8 @@ mod tests {
     fn s41_emit_active_recording_event() {
         let mut fr = make_recorder();
         let rid = fr.new_recording(RecordingSettings::new("test"));
-        fr.start_recording(rid);
         let _g = drain_ring_baseline();
+        fr.start_recording(rid);
         emit_active_recording_event(&mut fr, 1, "default", "/tmp/rec.jfr", 0, 0, 10000);
         fr.drain_per_thread_into_repository();
         let rec = fr.get_recording_mut(rid).unwrap();
@@ -4739,8 +4739,8 @@ mod tests {
     fn s41_emit_active_setting_event() {
         let mut fr = make_recorder();
         let rid = fr.new_recording(RecordingSettings::new("test"));
-        fr.start_recording(rid);
         let _g = drain_ring_baseline();
+        fr.start_recording(rid);
         emit_active_setting_event(&mut fr, 1, "threshold", "10ms", 10000);
         fr.drain_per_thread_into_repository();
         let rec = fr.get_recording_mut(rid).unwrap();
@@ -4924,8 +4924,8 @@ mod tests {
             None,
         );
         let rid = fr.new_recording(RecordingSettings::new("test"));
-        fr.start_recording(rid);
         let _g = drain_ring_baseline();
+        fr.start_recording(rid);
         emit_custom_event(
             &mut fr,
             "test.CustomEvent",
@@ -5241,8 +5241,8 @@ mod tests {
     fn t6_emit_safepoint_events() {
         let mut fr = make_recorder();
         let rid = fr.new_recording(RecordingSettings::new("test"));
-        fr.start_recording(rid);
         let _g = drain_ring_baseline();
+        fr.start_recording(rid);
         emit_safepoint_begin_event(&mut fr, 1, 10, 0, 1000);
         emit_safepoint_end_event(&mut fr, 1, 1000, 500);
         fr.drain_per_thread_into_repository();
@@ -5254,8 +5254,8 @@ mod tests {
     fn t6_emit_exception_event() {
         let mut fr = make_recorder();
         let rid = fr.new_recording(RecordingSettings::new("test"));
-        fr.start_recording(rid);
         let _g = drain_ring_baseline();
+        fr.start_recording(rid);
         emit_java_exception_throw_event(
             &mut fr,
             "test error",
@@ -5272,8 +5272,8 @@ mod tests {
     fn t6_emit_network_utilization() {
         let mut fr = make_recorder();
         let rid = fr.new_recording(RecordingSettings::new("test"));
-        fr.start_recording(rid);
         let _g = drain_ring_baseline();
+        fr.start_recording(rid);
         emit_network_utilization_event(&mut fr, "eth0", 1024, 512, 1000);
         fr.drain_per_thread_into_repository();
         let rec = fr.get_recording(rid).unwrap();

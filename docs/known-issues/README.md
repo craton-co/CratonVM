@@ -424,6 +424,19 @@ JIT divide-by-zero re-run) has since been fixed; the other two remain open:
   [t11-safety-annotation-coverage.md](t11-safety-annotation-coverage.md). Documentation-only but
   large (~264 cast annotations in interpreter.rs); must be authored accurately, not marker-spammed.
 
+## Keycloak suite classpath (2026-07-02)
+
+- ✅ **Mixed JUnit 5.10.3/6.0.3 runtime on `kc-universal-cp.txt`** — FIXED (local
+  classpath file normalized to a single JUnit 6.0.3 stack). Caused 338 `CRASH` rows
+  (`NamespaceAwareStore.computeIfAbsent` `NoSuchMethodError`) across `tests/base`
+  and `tests/clustering`. Historical record moved to
+  [../internal/keycloak-junit-namespaceawarestore-classpath-crashes.md](../internal/keycloak-junit-namespaceawarestore-classpath-crashes.md).
+- [keycloak-testframework-quarkus-config-classpath-gap.md](keycloak-testframework-quarkus-config-classpath-gap.md) —
+  🔴 open. Uncovered by the fix above: `org.keycloak.testframework.config.Config`
+  needs `quarkus-core` (for `CharsetConverter`/`MemorySizeConverter`/
+  `InetSocketAddressConverter`), which is entirely absent from
+  `kc-universal-cp.txt`.
+
 ## Consolidation log
 
 - **2026-06-17:** Merged `precise-jit-stack-maps-multithread-fjp-worker-testcase.md`
