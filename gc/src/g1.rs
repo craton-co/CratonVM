@@ -70,9 +70,10 @@ unsafe fn array_element_from_unaligned_ptr(element_type: ArrayElementType, p: *c
             ArrayElementType::Long => Value::Long(std::ptr::read_unaligned(p as *const i64)),
             ArrayElementType::Float => Value::Float(std::ptr::read_unaligned(p as *const f32)),
             ArrayElementType::Double => Value::Double(std::ptr::read_unaligned(p as *const f64)),
-            ArrayElementType::Byte | ArrayElementType::Boolean => {
+            ArrayElementType::Byte => {
                 Value::Int(std::ptr::read_unaligned(p as *const i8) as i32)
             }
+            ArrayElementType::Boolean => Value::Int(std::ptr::read_unaligned(p) as i32),
             ArrayElementType::Short => Value::Int(std::ptr::read_unaligned(p as *const i16) as i32),
             ArrayElementType::Char => Value::Int(std::ptr::read_unaligned(p as *const u16) as i32),
             ArrayElementType::Reference => {
@@ -1794,41 +1795,9 @@ impl G1Collector {
         // the release/quiet path; aborts in debug.
         self.verify_no_dangling_into_cset(&regions, &cset_set, &pointer_map);
 
-        // TODO(round-9 gc HIGH-9, humongous-reclaim-young):
-        // ----------------------------------------------------
-        // Today humongous regions are reclaimed only by the full GC
-        // path. A young-only collection cannot tell whether a
-        // humongous span is unreachable, because:
-        //
-        //   * The humongous start region's RSet records inbound
-        //     cross-region references from *other regions*, but young
-        //     collections don't scan every region's outgoing edges —
-        //     only the CSet's, plus their RSet sources.
-        //   * Continuation regions don't carry their own RSets; the
-        //     HumongousFiller sentinel parks them outside the walker.
-        //   * Roots may pin a humongous span directly (no other
-        //     region in the heap references it), and the young phase
-        //     evacuates roots into Eden/Survivor but doesn't surface
-        //     "this humongous is now unreferenced".
-        //
-        // A correct young-time humongous reclaim would need:
-        //   1. Extend the RSet on the HumongousStart region to track
-        //      inbound refs from *all* regions, not just non-young.
-        //   2. Track root pins per-humongous (e.g. a per-region
-        //      `root_refcount: AtomicU32` updated as roots are
-        //      evacuated, decremented when a slot stops pointing at
-        //      this region's start address).
-        //   3. After phase 5 (CSet free), iterate humongous starts
-        //      and reclaim any whose `rset.is_empty() && root_refcount
-        //      == 0`. Reclamation must zero both the start region
-        //      and every contiguous continuation region.
-        //
-        // None of (1)..(3) are local edits; they touch the RSet
-        // schema and the root-evacuation loop. Deferred to a focused
-        // change. Until then, humongous garbage is only collected on
-        // full GC, which is functionally correct but means long-lived
-        // mutators that churn humongous allocations will see
-        // unnecessary heap growth between full GCs.
+        // Young and mixed evacuation leave humongous spans in place. Their
+        // reachability is decided by the concurrent-mark cleanup phase, which
+        // can see the whole heap and reclaims unmarked, unpinned spans there.
 
         // Reset current eden if it was in the CSet
         let cur_eden = self.current_eden.load(Ordering::Relaxed);
@@ -4043,6 +4012,8 @@ impl G1Collector {
             }
         }
 
+        self.reclaim_dead_humongous_spans_locked(&mut regions);
+
         // Audit fix (HIGH-3): clear any stragglers from the gray set and
         // deactivate the SATB write barrier — the cycle is fully done.
         self.mark_worklist.lock().clear();
@@ -4069,6 +4040,51 @@ impl G1Collector {
         self.marking_complete.store(true, Ordering::Release);
         self.mixed_gc_remaining
             .store(self.config.mixed_gc_count_target as u64, Ordering::Relaxed);
+    }
+
+    /// Reclaim dead humongous spans after a mark cycle.
+    ///
+    /// Young and mixed evacuation cannot infer humongous reachability from a
+    /// partial collection set. Cleanup runs after whole-heap marking, so an
+    /// unmarked `HumongousStart` with no pinned slice is safe to recycle along
+    /// with each contiguous continuation region.
+    fn reclaim_dead_humongous_spans_locked(&self, regions: &mut [G1Region]) -> usize {
+        let region_size = self.config.region_size;
+        if region_size == 0 {
+            return 0;
+        }
+
+        let mut reclaimed = 0usize;
+        let mut i = 0usize;
+        while i < regions.len() {
+            if regions[i].region_type != RegionType::HumongousStart {
+                i += 1;
+                continue;
+            }
+
+            let total_size = regions[i].cursor;
+            let regions_needed = total_size.div_ceil(region_size).max(1);
+            let Some(end) = i
+                .checked_add(regions_needed)
+                .filter(|&end| end <= regions.len())
+            else {
+                i += 1;
+                continue;
+            };
+
+            let pinned = regions[i..end].iter().any(|r| r.pinned);
+            if regions[i].live_bytes == 0 && !pinned {
+                reclaimed = reclaimed.saturating_add(total_size);
+                for region in &mut regions[i..end] {
+                    region.reset();
+                }
+                i = end;
+            } else {
+                i += 1;
+            }
+        }
+
+        reclaimed
     }
 
     // -----------------------------------------------------------------------
@@ -5913,6 +5929,22 @@ mod tests {
     }
 
     #[test]
+    fn boolean_array_element_decode_zero_extends_raw_byte() {
+        let raw = [0xffu8; 1];
+
+        unsafe {
+            assert_eq!(
+                array_element_from_unaligned_ptr(ArrayElementType::Byte, raw.as_ptr()),
+                Value::Int(-1)
+            );
+            assert_eq!(
+                array_element_from_unaligned_ptr(ArrayElementType::Boolean, raw.as_ptr()),
+                Value::Int(255)
+            );
+        }
+    }
+
+    #[test]
     fn descriptor_defaults_initialize_reference_and_tail_slots() {
         let gc = make_collector();
         let obj = gc.alloc_object_with_descriptors(ClassId::new(7), 4, b"IL");
@@ -6079,6 +6111,16 @@ mod tests {
     }
 
     #[test]
+    fn boolean_array_elements_zero_extend_like_shared_heap_path() {
+        let gc = make_collector();
+        let arr = gc.alloc_array(ClassId::new(0), ArrayElementType::Boolean, 1);
+
+        gc.set_array_element(arr, 0, Value::Int(255)).unwrap();
+
+        assert_eq!(gc.get_array_element(arr, 0).unwrap(), Value::Int(255));
+    }
+
+    #[test]
     fn alloc_array_bounds_check() {
         let gc = make_collector();
         let arr = gc.alloc_array(ClassId::new(0), ArrayElementType::Int, 2);
@@ -6096,6 +6138,31 @@ mod tests {
         let large = gc.alloc_array(ClassId::new(0), ArrayElementType::Int, 150_000);
         assert_eq!(gc.array_length(large), 150_000);
         assert!(gc.count_regions(RegionType::HumongousStart) >= 1);
+    }
+
+    #[test]
+    fn cleanup_reclaims_dead_humongous_span_and_keeps_marked_span() {
+        let gc = make_collector();
+        let live = gc.alloc_array(ClassId::new(0), ArrayElementType::Long, 200_000);
+        let _dead = gc.alloc_array(ClassId::new(0), ArrayElementType::Long, 200_000);
+
+        gc.set_array_element(live, 199_999, Value::Long(0x1234_5678))
+            .unwrap();
+        assert_eq!(gc.count_regions(RegionType::HumongousStart), 2);
+        assert_eq!(gc.count_regions(RegionType::HumongousContinuation), 2);
+
+        gc.start_concurrent_mark();
+        gc.remark(&[live]);
+        assert!(gc.concurrent_mark_step(usize::MAX));
+        gc.cleanup();
+
+        assert_eq!(gc.count_regions(RegionType::HumongousStart), 1);
+        assert_eq!(gc.count_regions(RegionType::HumongousContinuation), 1);
+        assert!(gc.is_humongous(live));
+        assert_eq!(
+            gc.get_array_element(live, 199_999).unwrap(),
+            Value::Long(0x1234_5678)
+        );
     }
 
     // C2 (round-12 gc): a humongous array spans multiple non-contiguous region

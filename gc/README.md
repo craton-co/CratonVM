@@ -28,11 +28,15 @@ the VM can swap collectors at startup.
 ## Usage
 
 ```rust
-use cratonvm_gc::{VmHeap, GcBackend};
+use cratonvm_gc::{ArrayElementType, GcBackend, VmHeap};
+use cratonvm_types::{ClassId, Value};
 
 let heap = VmHeap::new(GcBackend::Generational, 64 * 1024 * 1024);
-// VM threads call heap.allocate_object / heap.allocate_array;
-// safepoints trigger heap.collect via the GarbageCollector trait.
+let obj = heap.alloc_object(ClassId::new(1), 2);
+let ints = heap.alloc_array(ClassId::new(2), ArrayElementType::Int, 16);
+heap.set_field(obj, 0, Value::Int(42));
+heap.set_array_element(ints, 0, Value::Int(7)).unwrap();
+// Safepoints call heap.collect_garbage(&stw, roots, monitors).
 ```
 
 ## Status

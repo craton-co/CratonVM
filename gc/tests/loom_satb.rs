@@ -39,26 +39,21 @@
 //! RUSTFLAGS="--cfg loom" cargo test --test loom_satb --release
 //! ```
 //!
-//! Without `--cfg loom` the file compiles to an empty test that
-//! `#[ignore]`s itself with a pointer to this comment. CI does not run
-//! loom by default — it is far too slow to be a per-PR gate
+//! Without `--cfg loom` the file compiles to a passing documentation stub
+//! with a pointer to this comment. CI does not run loom by default — it is
+//! far too slow to be a per-PR gate
 //! (interleavings explode combinatorially), but should be run
 //! before any change to `satb.rs`.
 
-// Without --cfg loom this is a stub so the test file still compiles
-// in the normal `cargo test` invocation. The orchestrator's normal
-// build will skip the loom-only test entirely (loom isn't even a
-// dependency in that configuration).
+// Without --cfg loom this is a stub so the test file still compiles in the
+// normal `cargo test` invocation. The real model remains behind cfg(loom),
+// and gc/build.rs declares that cfg for rustc's check-cfg validation.
 #[cfg(not(loom))]
 #[test]
-#[ignore = "loom model-check — run with RUSTFLAGS=\"--cfg loom\" cargo test --test loom_satb"]
 fn satb_fsm_loom_model_check() {
-    // The orchestrator does not build with `--cfg loom`, so this stub
-    // documents the loom test exists and where to find it. See the
-    // module-level comment for the actual model under test.
-    eprintln!(
-        "loom SATB FSM model not run — re-run with \
-         RUSTFLAGS=\"--cfg loom\" cargo test --test loom_satb"
+    assert!(
+        !cfg!(loom),
+        "loom model runs only with RUSTFLAGS=\"--cfg loom\" cargo test --test loom_satb"
     );
 }
 
