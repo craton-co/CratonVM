@@ -36,7 +36,11 @@ fixes). Headline:
    `jit-junit-discovery-reflection-corruption.md` is the same race.
 2. **Standalone B** — JUnit `@Timeout` interceptor double-`proceed()` (open).
 3. **Standalone C** — deep JIT→JIT recursion native-stack overflow (latent; stack-bang containment landed; resumable fault recovery still open).
-4. **bug-06 F5** — reflection native returns null vs a `Class`/`Method` (open, unattributed).
+4. ~~**bug-06 F5**~~ — reflection native returns null vs a `Class`/`Method`: **✅ CLOSED 2026-07-02,
+   failcause extinct** — 0 instances in the clean 2026-06-30/07-01 full re-runs and in a fresh
+   196-class nojit+jit sweep on dev `ffb247e5`; it was a cross-family cascade whose sources
+   (fam1/3/4, `toArray` recursion, bug-04 GC, bug-05 generics) are all fixed (doc moved to
+   [`docs/internal/fixed-suite-bugs/bug06-fam5-reflection-getdeclaredmethod-null.md`](../internal/fixed-suite-bugs/bug06-fam5-reflection-getdeclaredmethod-null.md)).
 5. **bug-06 F6 / `spring-bug-06` / `spring-bug-01`** — annotation **synthesis** value-mismatches.
    (The `MergedAnnotations` **hang** + the `AnnotationUtilsTests` "~2 GB OOM" in this cluster were the
    `toArray` self-recursion and are **FIXED** 2026-06-20, commit `8795b88d`; `MergedAnnotationsTests`
@@ -291,14 +295,14 @@ The history below predates the fix.
 ## Standalone — bug-06 assertion-mismatch family (Spring suite reflection/annotation tail)
 
 The bug-06 census (`spring-suite/crash-reports-2026-06-16/bug-06-assertion-mismatch-families.md`)
-clustered ~529 genuine assertion mismatches into 6 families. Families 1–4 are fixed
+clustered ~529 genuine assertion mismatches into 6 families. Families 1–5 are closed
 (field-updaters `fe52db3a`; `HttpClient.executor`; synthetic-`Object` superclass `40b6d94a`;
-`findLoadedClass` no-load `4b923e86`, all on `dev`). The two open families are reflection/annotation
-**native-return-value** correctness, not GC/JIT:
+`findLoadedClass` no-load `4b923e86`; F5 extinct 2026-07-02, all on `dev`). The one open family is
+annotation-synthesis **native-return-value** correctness, not GC/JIT:
 
 | # | Bug | Status | Doc |
 |---|---|---|---|
-| **F5** | Reflection native returns `null` where HotSpot returns a `Class`/`Method` (`getDeclaredMethod on null` ×28). Common paths **verified clean** (`Refl5` == HotSpot); the failing narrow generic/proxy path is not yet attributed to a test. **Do not** touch `synthetic_class_mirror` slot 0 (refuted hypothesis). | 🔴 **OPEN** — needs per-test attribution | [bug06-fam5-reflection-getdeclaredmethod-null.md](bug06-fam5-reflection-getdeclaredmethod-null.md) |
+| **F5** | Reflection native returns `null` where HotSpot returns a `Class`/`Method` (`getDeclaredMethod on null` ×28). Common paths **verified clean** (`Refl5` == HotSpot); the ×28 aggregate was a cross-family cascade and is **extinct** — 0 instances in the clean 2026-06-30/07-01 full re-runs and a fresh 196-class nojit+jit sweep on dev `ffb247e5`. **Do not** touch `synthetic_class_mirror` slot 0 (refuted hypothesis). | ✅ **CLOSED 2026-07-02** — failcause extinct, nothing to attribute | [bug06-fam5-reflection-getdeclaredmethod-null.md](../internal/fixed-suite-bugs/bug06-fam5-reflection-getdeclaredmethod-null.md) (moved) |
 | **F6** | Spring annotation **synthesis** (`@AliasFor`/`MergedAnnotation`/`MirrorSets`) value mismatches (the `AnnotationUtilsTests` "~2 GB OOM" half was the `toArray` self-recursion, now **FIXED**). | 🔴 **OPEN** — `[[spring-bug-01]]` umbrella | _(doc removed; tracked on branch `fix/bug06-fam6-repeatable-merge`)_ |
 
 ## Consolidated suite bug docs (open & distinct — copied in 2026-06-18)
