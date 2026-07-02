@@ -18,8 +18,31 @@ Tests that require `javac` skip gracefully when no JDK is on the `PATH`.
 
 The CI pipeline is configured to run `cargo fmt --check`, `cargo build`,
 `cargo clippy -D warnings`, and `cargo test` across the workspace on Linux and
-Windows. Coverage and semantic difftest jobs are advisory today; check the
-current Actions run before treating a branch as release-ready.
+Windows. Coverage, semantic difftest, and fuzz smoke jobs are advisory today;
+check the current Actions run before treating a branch as release-ready.
+
+## Local CI Checklist
+
+For a release-readiness pass, record the result of each layer:
+
+```bash
+cargo fmt --all --check
+cargo build --workspace --all-targets
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace --all-targets --no-fail-fast
+cargo llvm-cov --workspace --lcov --output-path lcov.info
+```
+
+Then check the coverage target:
+
+```powershell
+pwsh scripts/check-lcov-threshold.ps1 -Path lcov.info -LineThreshold 85
+```
+
+The repository currently treats **85% line coverage** as the release-readiness
+target. If a branch cannot produce a whole-workspace LCOV report, or reports
+below 85%, call that out explicitly instead of treating the coverage job as
+green.
 
 ## Test layers
 
@@ -57,9 +80,31 @@ production lints. It currently declares 11 targets. Build it on nightly:
 cargo +nightly fuzz build
 ```
 
-The fuzz workspace is not a blocking CI gate today, and the current review
-tracks a build blocker around the `legacy-synthetic-crypto` feature until the
-native-builtins feature declarations and fuzz manifest are aligned.
+For a bounded smoke of an individual target, use a short run budget, for
+example:
+
+```bash
+cargo +nightly fuzz run fuzz_classfile -- -runs=128
+```
+
+The fuzz workspace is not a blocking CI gate today. CI runs an advisory fuzz
+build smoke so target drift is visible, and the current review tracks a build
+blocker around the `legacy-synthetic-crypto` feature until the native-builtins
+feature declarations and fuzz manifest are aligned.
+
+## Semantic Differential Smoke
+
+`cratonvm-difftest` compares CratonVM behavior with a reference JDK over the
+seed corpus. The CI gate is advisory while the ledger is stabilized on hosted
+runners. A local smoke run should use JDK 25 as the oracle:
+
+```bash
+cargo run -p cratonvm-difftest --bin cratonvm-difftest -- gate --corpus difftest/seeds
+```
+
+Exit code `0` means no new divergence was found. Exit code `1` or `2` indicates
+new drift or reopened fixed behavior. Exit code `3` is bootstrap/non-fatal
+when prerequisites such as `java` or the corpus are missing.
 
 ## Writing tests
 
@@ -73,5 +118,6 @@ native-builtins feature declarations and fuzz manifest are aligned.
 ## Code coverage
 
 Coverage is generated with `cargo-llvm-cov` locally and in an advisory CI job.
-No minimum coverage threshold is enforced today. See the repository's coverage
-documentation for invocation details.
+Release-ready branches are expected to meet the 85% line coverage target. See
+the repository's coverage documentation for invocation details and the current
+advisory-to-blocking promotion checklist.
