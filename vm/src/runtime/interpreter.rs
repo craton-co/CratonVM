@@ -18028,6 +18028,17 @@ fn force_native_over_real_jdk_bytecode(
     {
         return true;
     }
+    // WF-XNIO: `OptionMap$Builder.addAll(OptionMap)` copies through
+    // `OptionMap.iterator()`. Our XNIO map/builder state lives in native side
+    // tables, and the synthetic array iterator can resolve as
+    // `java/lang/Object.next()` through this path. Force the registered native
+    // to copy entries directly; companion gate in vm_exec.rs.
+    if class_name == "org/xnio/OptionMap$Builder"
+        && method_name == "addAll"
+        && method_descriptor == "(Lorg/xnio/OptionMap;)Lorg/xnio/OptionMap$Builder;"
+    {
+        return true;
+    }
     matches!(
         (class_name, method_name, method_descriptor),
         ("java/lang/ClassLoader", "setDefaultAssertionStatus", "(Z)V")

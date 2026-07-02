@@ -927,6 +927,22 @@ fn native_builder_set_bool(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     Ok(Some(Value::Object(Some(this))))
 }
 
+/// `Builder.addAll(OptionMap)Lorg/xnio/OptionMap$Builder;`
+fn native_builder_add_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let source = obj_arg(args, 1)?;
+    let b = builder_from_this(ctx, this)?;
+    check_builder_live(&b)?;
+    let source_inner = inner_from_map_any(ctx, source)?;
+
+    let mut pending = b.pending.lock();
+    for (key, value) in source_inner.entries.iter() {
+        pending.insert(key.clone(), value.clone());
+    }
+
+    Ok(Some(Value::Object(Some(this))))
+}
+
 /// `Builder.getMap()Lorg/xnio/OptionMap;`
 fn native_builder_get_map(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
@@ -1098,8 +1114,10 @@ fn inner_from_map_any(
     Err(ise("OptionMap: stale or unknown handle"))
 }
 
-/// `OptionMap.get(Option)Ljava/lang/Object;` and the typed overloads.
-fn native_option_map_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+fn option_map_get_key(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> Result<(Arc<OptionMapInner>, OptionKey, Option<Value>), MethodCallFailed> {
     let this = obj_arg(args, 0)?;
     let opt = obj_arg(args, 1)?;
     let inner = inner_from_map_any(ctx, this)?;
@@ -1110,6 +1128,88 @@ fn native_option_map_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         name,
     };
     let default_val = args.get(2).copied();
+    Ok((inner, key, default_val))
+}
+
+fn value_as_int(ctx: &dyn NativeContext, value: Value) -> Option<i32> {
+    match value {
+        Value::Int(n) => Some(n),
+        Value::Long(n) => i32::try_from(n).ok(),
+        Value::Object(Some(obj)) => match crate::lang_class::unbox_value(ctx, obj) {
+            Value::Int(n) => Some(n),
+            Value::Long(n) => i32::try_from(n).ok(),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn value_as_long(ctx: &dyn NativeContext, value: Value) -> Option<i64> {
+    match value {
+        Value::Long(n) => Some(n),
+        Value::Int(n) => Some(n as i64),
+        Value::Object(Some(obj)) => match crate::lang_class::unbox_value(ctx, obj) {
+            Value::Long(n) => Some(n),
+            Value::Int(n) => Some(n as i64),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn value_as_bool(ctx: &dyn NativeContext, value: Value) -> Option<bool> {
+    match value {
+        Value::Int(n) => Some(n != 0),
+        Value::Long(n) => Some(n != 0),
+        Value::Object(Some(obj)) => match crate::lang_class::unbox_value(ctx, obj) {
+            Value::Int(n) => Some(n != 0),
+            Value::Long(n) => Some(n != 0),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn option_value_as_int(ctx: &dyn NativeContext, value: &OptionValue) -> Option<i32> {
+    match value {
+        OptionValue::Int(n) => Some(*n),
+        OptionValue::Long(n) => i32::try_from(*n).ok(),
+        OptionValue::Bool(b) => Some(if *b { 1 } else { 0 }),
+        OptionValue::Str(s) => s.parse().ok(),
+        OptionValue::Obj(Some(obj)) => value_as_int(ctx, Value::Object(Some(*obj))),
+        OptionValue::Obj(None) => None,
+    }
+}
+
+fn option_value_as_long(ctx: &dyn NativeContext, value: &OptionValue) -> Option<i64> {
+    match value {
+        OptionValue::Long(n) => Some(*n),
+        OptionValue::Int(n) => Some(*n as i64),
+        OptionValue::Bool(b) => Some(if *b { 1 } else { 0 }),
+        OptionValue::Str(s) => s.parse().ok(),
+        OptionValue::Obj(Some(obj)) => value_as_long(ctx, Value::Object(Some(*obj))),
+        OptionValue::Obj(None) => None,
+    }
+}
+
+fn option_value_as_bool(ctx: &dyn NativeContext, value: &OptionValue) -> Option<bool> {
+    match value {
+        OptionValue::Bool(b) => Some(*b),
+        OptionValue::Int(n) => Some(*n != 0),
+        OptionValue::Long(n) => Some(*n != 0),
+        OptionValue::Str(s) => match s.to_ascii_lowercase().as_str() {
+            "true" => Some(true),
+            "false" => Some(false),
+            _ => None,
+        },
+        OptionValue::Obj(Some(obj)) => value_as_bool(ctx, Value::Object(Some(*obj))),
+        OptionValue::Obj(None) => None,
+    }
+}
+
+/// `OptionMap.get(Option)Ljava/lang/Object;` and `get(Option, Object)Object`.
+fn native_option_map_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let (inner, key, default_val) = option_map_get_key(ctx, args)?;
 
     match inner.entries.get(&key) {
         Some(OptionValue::Int(n)) => Ok(Some(Value::Int(*n))),
@@ -1128,6 +1228,44 @@ fn native_option_map_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
             }
         }
     }
+}
+
+/// `OptionMap.get(Option<Integer>, int)I`
+fn native_option_map_get_int(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let (inner, key, default_val) = option_map_get_key(ctx, args)?;
+    let default_int = default_val.and_then(|v| value_as_int(ctx, v)).unwrap_or(0);
+    let value = inner
+        .entries
+        .get(&key)
+        .and_then(|v| option_value_as_int(ctx, v))
+        .unwrap_or(default_int);
+    Ok(Some(Value::Int(value)))
+}
+
+/// `OptionMap.get(Option<Long>, long)J`
+fn native_option_map_get_long(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let (inner, key, default_val) = option_map_get_key(ctx, args)?;
+    let default_long = default_val.and_then(|v| value_as_long(ctx, v)).unwrap_or(0);
+    let value = inner
+        .entries
+        .get(&key)
+        .and_then(|v| option_value_as_long(ctx, v))
+        .unwrap_or(default_long);
+    Ok(Some(Value::Long(value)))
+}
+
+/// `OptionMap.get(Option<Boolean>, boolean)Z`
+fn native_option_map_get_bool(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let (inner, key, default_val) = option_map_get_key(ctx, args)?;
+    let default_bool = default_val
+        .and_then(|v| value_as_bool(ctx, v))
+        .unwrap_or(false);
+    let value = inner
+        .entries
+        .get(&key)
+        .and_then(|v| option_value_as_bool(ctx, v))
+        .unwrap_or(default_bool);
+    Ok(Some(Value::Int(if value { 1 } else { 0 })))
 }
 
 /// `OptionMap.contains(Option)Z`
@@ -1778,19 +1916,19 @@ pub fn register_xnio_async_natives(registry: &mut NativeMethodRegistry) {
         "org/xnio/OptionMap",
         "get",
         "(Lorg/xnio/Option;I)I",
-        native_option_map_get,
+        native_option_map_get_int,
     );
     registry.register(
         "org/xnio/OptionMap",
         "get",
         "(Lorg/xnio/Option;J)J",
-        native_option_map_get,
+        native_option_map_get_long,
     );
     registry.register(
         "org/xnio/OptionMap",
         "get",
         "(Lorg/xnio/Option;Z)Z",
-        native_option_map_get,
+        native_option_map_get_bool,
     );
     registry.register(
         "org/xnio/OptionMap",
@@ -1830,6 +1968,12 @@ pub fn register_xnio_async_natives(registry: &mut NativeMethodRegistry) {
         "set",
         "(Lorg/xnio/Option;Z)Lorg/xnio/OptionMap$Builder;",
         native_builder_set_bool,
+    );
+    registry.register(
+        "org/xnio/OptionMap$Builder",
+        "addAll",
+        "(Lorg/xnio/OptionMap;)Lorg/xnio/OptionMap$Builder;",
+        native_builder_add_all,
     );
     registry.register(
         "org/xnio/OptionMap$Builder",
@@ -2197,6 +2341,72 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(has, Value::Int(1));
+    }
+
+    #[test]
+    fn t19_7_e_option_map_builder_add_all_copies_entries() {
+        let mut ctx = mock_ctx();
+        let opt = make_option(
+            &mut ctx,
+            "org/xnio/Options",
+            "TCP_NODELAY",
+            "java/lang/Boolean",
+        );
+
+        let source_builder = new_builder(&mut ctx);
+        native_builder_set_bool(
+            &mut ctx,
+            &[
+                Value::Object(Some(source_builder)),
+                Value::Object(Some(opt)),
+                Value::Int(1),
+            ],
+        )
+        .unwrap();
+        let source_map =
+            match native_builder_get_map(&mut ctx, &[Value::Object(Some(source_builder))])
+                .unwrap()
+                .unwrap()
+            {
+                Value::Object(Some(o)) => o,
+                _ => panic!("expected source map"),
+            };
+
+        let dest_builder = new_builder(&mut ctx);
+        let returned = native_builder_add_all(
+            &mut ctx,
+            &[
+                Value::Object(Some(dest_builder)),
+                Value::Object(Some(source_map)),
+            ],
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(returned, Value::Object(Some(dest_builder)));
+
+        let dest_map = match native_builder_get_map(&mut ctx, &[Value::Object(Some(dest_builder))])
+            .unwrap()
+            .unwrap()
+        {
+            Value::Object(Some(o)) => o,
+            _ => panic!("expected destination map"),
+        };
+        let got = native_option_map_get_bool(
+            &mut ctx,
+            &[
+                Value::Object(Some(dest_map)),
+                Value::Object(Some(opt)),
+                Value::Int(0),
+            ],
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(got, Value::Int(1));
+
+        let size = native_option_map_size(&mut ctx, &[Value::Object(Some(dest_map))])
+            .unwrap()
+            .unwrap();
+        assert_eq!(size, Value::Int(1));
     }
 
     #[test]
@@ -2615,6 +2825,37 @@ mod tests {
         .unwrap()
         .unwrap();
         // Bool is encoded as Int(0/1).
+        assert_eq!(got, Value::Int(1));
+    }
+
+    #[test]
+    fn t19_7_e_option_map_get_bool_unboxes_object_entry() {
+        let mut ctx = mock_ctx();
+        let opt = make_option(&mut ctx, "org/xnio/Options", "SECURE", "java/lang/Boolean");
+        let boolean_cid = ctx.ensure_class_initialized("java/lang/Boolean").unwrap();
+        let boxed_true = ctx.alloc_object(boolean_cid, 1);
+        ctx.set_field(boxed_true, 0, Value::Int(1));
+
+        let mut entries = HashMap::new();
+        entries.insert(
+            OptionKey {
+                declaring_class: "org/xnio/Options".to_string(),
+                name: "SECURE".to_string(),
+            },
+            OptionValue::Obj(Some(boxed_true)),
+        );
+        let map = alloc_option_map(&mut ctx, Arc::new(OptionMapInner { entries }));
+
+        let got = native_option_map_get_bool(
+            &mut ctx,
+            &[
+                Value::Object(Some(map)),
+                Value::Object(Some(opt)),
+                Value::Int(0),
+            ],
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(got, Value::Int(1));
     }
 

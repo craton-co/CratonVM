@@ -51,7 +51,9 @@
 //! so it overrides the older bypass registration at the registry layer (last
 //! writer wins — `native-api/src/registry.rs:1336-1338`).
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 
 use cratonvm_native_api::{DefineClassFull, NativeContext, NativeMethodRegistry};
 use cratonvm_types::error::{MethodCallResult, RuntimeError};
@@ -60,6 +62,56 @@ use cratonvm_types::Value;
 /// Monotonic counter for generating unique enhancer subclass names. Mirrors
 /// CGLIB's own `KeyFactory.generateName` counter.
 static ENHANCER_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Per-superclass-name suffix counters for `build_enhancer_class`'s
+/// `$$EnhancerByCGLIB$$<n>` names — real CGLIB's `DefaultNamingPolicy` keys
+/// its counter by the base class name, so the first proxy generated for any
+/// given `@Configuration` class always gets suffix `0`, no matter how many
+/// *other* classes were enhanced earlier in the same JVM/session. Using the
+/// single global `ENHANCER_COUNTER` here (shared with the unrelated
+/// `$$SpringCGLIB$$LM*`/`$$SpringCGLIB$$RM*` lookup/replace-method enhancers)
+/// made every class's suffix depend on unrelated enhancement activity
+/// elsewhere in the same test run, breaking
+/// `AnnotationConfigApplicationContextTests.refreshForAotRegisterHintsForCglibProxy`,
+/// which hardcodes the literal expected name `...$$SpringCGLIB$$0` for the
+/// first (and only) proxy of its `CglibConfiguration` class.
+fn config_enhancer_counters() -> &'static Mutex<HashMap<String, u64>> {
+    static COUNTERS: OnceLock<Mutex<HashMap<String, u64>>> = OnceLock::new();
+    COUNTERS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Next `$$EnhancerByCGLIB$$<n>` suffix for `super_internal_name`, starting
+/// at 0 for the first enhancement of any given class.
+fn next_config_enhancer_counter(super_internal_name: &str) -> u64 {
+    let mut counters = config_enhancer_counters()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let counter = counters.entry(super_internal_name.to_string()).or_insert(0);
+    let value = *counter;
+    *counter += 1;
+    value
+}
+
+/// Cache of already-enhanced `@Configuration` classes, keyed by the ORIGINAL
+/// (unenhanced) class's `ClassId`. Real CGLIB's `AbstractClassGenerator`
+/// caches generated proxy classes per (superclass, callback-filter,
+/// classloader) key and returns the SAME `Class` object on a repeat
+/// `Enhancer.createClass()` for an identical configuration, rather than
+/// generating a fresh numbered subclass every time. `cce_enhance` used to
+/// regenerate + `defineClass` a brand-new `$$EnhancerByCGLIB$$<n>` subclass
+/// on every call — harmless for ordinary bean creation (each instance is
+/// independent regardless of which identical-shape class it's an instance
+/// of) but wrong whenever code depends on repeated `enhance()` calls for the
+/// SAME `@Configuration` class returning the IDENTICAL `Class` object, e.g.
+/// `AnnotationConfigApplicationContextTests.refreshForAotRegisterHintsForCglibProxy`
+/// hardcodes the literal name `...$$SpringCGLIB$$0`, which only holds if
+/// `CglibConfiguration` is enhanced exactly once per JVM session — other
+/// test methods in the same class also register `CglibConfiguration` and
+/// enhance it independently, bumping the counter before this test runs.
+fn config_enhancer_class_cache() -> &'static Mutex<HashMap<u32, cratonvm_types::ClassId>> {
+    static CACHE: OnceLock<Mutex<HashMap<u32, cratonvm_types::ClassId>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
 
 /// Spring's marker interface for an enhanced `@Configuration` class.
 const SPRING_MARKER_IFACE: &str =
@@ -327,6 +379,12 @@ struct BeanMethod {
     descriptor: String,
     /// Internal name of the (reference) return type, for the result checkcast.
     return_internal: String,
+    /// True when `return_internal` is (or transitively implements/extends)
+    /// `org/springframework/beans/factory/FactoryBean`. An inter-bean
+    /// reference to such a method must resolve the *raw* FactoryBean via
+    /// `getBean("&<name>")`, not the product via `getBean("<name>")` — see
+    /// `emit_bean_override`'s `beanname_lookup_idx` and SPR-6602.
+    is_factory_bean: bool,
 }
 
 /// Emit a `@Bean`-method override mirroring Spring's `BeanMethodInterceptor`:
@@ -384,7 +442,21 @@ fn emit_bean_override(
     get_singleton_ref: u16,
     config_gen_iface_idx: u16,
     cfg_gen_name_string_idx: u16,
-    fq_name_string_idx: u16,
+    // Default beanName used for the inter-bean `getBean` call (offset 31)
+    // and its ConfigurationBeanNameGenerator-derived override (offset 60).
+    // Equal to `name_string_idx`/`fq_name_string_idx` (the plain names) for
+    // ordinary `@Bean` methods; "&"-prefixed for FactoryBean-typed ones so
+    // the raw factory is resolved instead of its product (SPR-6602 et al).
+    beanname_lookup_idx: u16,
+    fq_beanname_lookup_idx: u16,
+    // Mirrors Spring's `resolveBeanReference`: after resolving an inter-bean
+    // reference, if a factory method is currently being invoked (local1
+    // non-null — i.e. this call happened DURING another bean's creation, not
+    // from arbitrary user code), register a dependency edge from the
+    // resolved bean onto that outer bean via
+    // `ConfigurableBeanFactory.registerDependentBean(beanName, outerBeanName)`.
+    configurable_bf_cast_idx: u16,
+    register_dependent_bean_ref: u16,
 ) -> Vec<u8> {
     let b = |x: u16| -> [u8; 2] { x.to_be_bytes() };
     let mut code: Vec<u8> = Vec::new();
@@ -434,9 +506,11 @@ fn emit_bean_override(
     code.extend_from_slice(&b(bf_field_ref));
     // 30: astore_2   (local2 = bf)
     code.push(0x4D);
-    // 31: ldc_w "<name>"   (default = plain method name)
+    // 31: ldc_w "<name>"   (default beanName — plain, or "&name" for a
+    //     FactoryBean-typed method so the raw factory is resolved instead
+    //     of its product; see `beanname_lookup_idx`)
     code.push(0x13);
-    code.extend_from_slice(&b(name_string_idx));
+    code.extend_from_slice(&b(beanname_lookup_idx));
     // 34: astore_3   (local3 = beanName)
     code.push(0x4E);
     // 35: aload_2
@@ -466,9 +540,9 @@ fn emit_bean_override(
     // 57: ifeq → L_get (64); offset 7
     code.push(0x99);
     code.extend_from_slice(&b(7));
-    // 60: ldc_w "<fq name>"
+    // 60: ldc_w "<fq name>"   (plain, or "&"-prefixed for FactoryBean methods)
     code.push(0x13);
-    code.extend_from_slice(&b(fq_name_string_idx));
+    code.extend_from_slice(&b(fq_beanname_lookup_idx));
     // 63: astore_3   (local3 = fq name)
     code.push(0x4E);
     // 64: L_get: aload_2
@@ -486,13 +560,45 @@ fn emit_bean_override(
     // 74: checkcast <Ret>
     code.push(0xC0);
     code.extend_from_slice(&b(rettype_cast_idx));
-    // 77: areturn
+    // --- registerDependentBean(beanName, outerBeanName), mirroring Spring's
+    // resolveBeanReference: only when a factory method IS currently being
+    // invoked (local1 non-null), i.e. this getBean happened while another
+    // @Bean method was under construction, not from arbitrary user code. ---
+    // 77: astore 4   (local4 = result)
+    code.push(0x3A);
+    code.push(0x04);
+    // 79: aload_1   (currentlyInvoked Method, or null)
+    code.push(0x2B);
+    // 80: ifnull → L_return (97); offset 17  (no outer factory method → skip)
+    code.push(0xC6);
+    code.extend_from_slice(&b(17));
+    // 83: aload_2   (bf)
+    code.push(0x2C);
+    // 84: checkcast ConfigurableBeanFactory
+    code.push(0xC0);
+    code.extend_from_slice(&b(configurable_bf_cast_idx));
+    // 87: aload_3   (beanName)
+    code.push(0x2D);
+    // 88: aload_1   (currentlyInvoked Method)
+    code.push(0x2B);
+    // 89: invokevirtual Method.getName()Ljava/lang/String;   (outerBeanName)
+    code.push(0xB6);
+    code.extend_from_slice(&b(method_get_name_ref));
+    // 92: invokeinterface ConfigurableBeanFactory.registerDependentBean(String,String)V  count=3
+    code.push(0xB9);
+    code.extend_from_slice(&b(register_dependent_bean_ref));
+    code.push(0x03);
+    code.push(0x00);
+    // 97: L_return: aload 4
+    code.push(0x19);
+    code.push(0x04);
+    // 99: areturn
     code.push(0xB0);
-    debug_assert_eq!(code.len(), 78);
+    debug_assert_eq!(code.len(), 100);
 
     let mut code_attr = Vec::new();
-    code_attr.extend_from_slice(&2u16.to_be_bytes()); // max_stack
-    code_attr.extend_from_slice(&4u16.to_be_bytes()); // max_locals (this, method, bf, beanName)
+    code_attr.extend_from_slice(&3u16.to_be_bytes()); // max_stack (bumped for the 3-deep registerDependentBean call)
+    code_attr.extend_from_slice(&5u16.to_be_bytes()); // max_locals (this, method, bf, beanName, result)
     code_attr.extend_from_slice(&(code.len() as u32).to_be_bytes());
     code_attr.extend_from_slice(&code);
     code_attr.extend_from_slice(&0u16.to_be_bytes()); // exception_table_length
@@ -527,7 +633,7 @@ fn build_enhancer_class(
     super_internal_name: &str,
     bean_methods: &[BeanMethod],
 ) -> (String, Vec<u8>) {
-    let counter = ENHANCER_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let counter = next_config_enhancer_counter(super_internal_name);
     let new_name = format!("{super_internal_name}$$EnhancerByCGLIB$${counter:x}");
 
     let mut cw = ClassWriter::new();
@@ -605,6 +711,19 @@ fn build_enhancer_class(
             "getSingleton",
             "(Ljava/lang/String;)Ljava/lang/Object;",
         );
+        // Spring's BeanMethodInterceptor.resolveBeanReference registers a bean
+        // dependency edge (beanFactory.getDependentBeans(...)) whenever an
+        // inter-bean reference resolves while another @Bean method is being
+        // created — used to order singleton destruction correctly and
+        // surfaced directly by ConfigurationClassPostProcessorTests'
+        // enhancementIsPresent* assertions.
+        let configurable_bf_cast_idx =
+            cw.add_class("org/springframework/beans/factory/config/ConfigurableBeanFactory");
+        let register_dependent_bean_ref = cw.add_interface_methodref(
+            configurable_bf_cast_idx,
+            "registerDependentBean",
+            "(Ljava/lang/String;Ljava/lang/String;)V",
+        );
         let config_gen_iface_idx =
             cw.add_class("org/springframework/context/annotation/ConfigurationBeanNameGenerator");
         let cfg_gen_name_string_idx = cw.add_string(
@@ -619,6 +738,22 @@ fn build_enhancer_class(
             let desc_idx = cw.add_utf8(&bm.descriptor);
             let name_string_idx = cw.add_string(&bm.name);
             let fq_name_string_idx = cw.add_string(&format!("{super_dotted}.{}", bm.name));
+            // FactoryBean-typed @Bean methods: an inter-bean reference must
+            // resolve the raw factory via getBean("&<name>"), not the
+            // product via getBean("<name>") — see SPR-6602/11202/15275 and
+            // `is_factory_bean_type`. The Method.getName() comparison
+            // (name_string_idx, offset 12) always stays the plain method
+            // name; only the default-beanName lookup constants change.
+            let beanname_lookup_idx = if bm.is_factory_bean {
+                cw.add_string(&format!("&{}", bm.name))
+            } else {
+                name_string_idx
+            };
+            let fq_beanname_lookup_idx = if bm.is_factory_bean {
+                cw.add_string(&format!("&{super_dotted}.{}", bm.name))
+            } else {
+                fq_name_string_idx
+            };
             let super_method_ref = cw.add_methodref(super_class_idx, &bm.name, &bm.descriptor);
             let rettype_cast_idx = cw.add_class(&bm.return_internal);
             let override_method = emit_bean_override(
@@ -638,7 +773,10 @@ fn build_enhancer_class(
                 get_singleton_ref,
                 config_gen_iface_idx,
                 cfg_gen_name_string_idx,
-                fq_name_string_idx,
+                beanname_lookup_idx,
+                fq_beanname_lookup_idx,
+                configurable_bf_cast_idx,
+                register_dependent_bean_ref,
             );
             methods.push(override_method);
         }
@@ -1661,6 +1799,58 @@ fn annotations_contain_bean(
     false
 }
 
+/// Resolve `internal_name` to a `ClassId`, force-loading it first if it
+/// hasn't been touched yet (a `@Bean` method's return type may not be loaded
+/// at enhancement time — only its descriptor string has been read so far).
+fn resolve_or_load_class_id(
+    ctx: &mut dyn NativeContext,
+    internal_name: &str,
+) -> Option<cratonvm_types::ClassId> {
+    if let Some(id) = ctx.class_id_by_name(internal_name) {
+        return Some(id);
+    }
+    let _ = ctx.load_class(internal_name);
+    ctx.class_id_by_name(internal_name)
+}
+
+/// True when `return_internal` (a `@Bean` method's declared return type) IS
+/// `org/springframework/beans/factory/FactoryBean`, or transitively
+/// implements/extends it (directly, via a superclass such as
+/// `AbstractFactoryBean`, or via an extended interface). Mirrors the check
+/// real Spring's `ConfigurationClassEnhancer.BeanMethodInterceptor` uses (via
+/// `factoryContainsBean(beanFactory, "&" + beanName)`) to decide whether an
+/// inter-`@Bean`-method reference must resolve the raw factory bean rather
+/// than its product — see SPR-6602 / SPR-11202 / SPR-15275.
+fn is_factory_bean_type(ctx: &mut dyn NativeContext, return_internal: &str) -> bool {
+    let factory_bean_id =
+        match resolve_or_load_class_id(ctx, "org/springframework/beans/factory/FactoryBean") {
+            Some(id) => id,
+            None => return false,
+        };
+    let start = match resolve_or_load_class_id(ctx, return_internal) {
+        Some(id) => id,
+        None => return false,
+    };
+    let mut queue = std::collections::VecDeque::new();
+    let mut seen = std::collections::HashSet::new();
+    queue.push_back(start);
+    while let Some(cur) = queue.pop_front() {
+        if cur == factory_bean_id {
+            return true;
+        }
+        if !seen.insert(cur) {
+            continue;
+        }
+        for iface in ctx.class_interfaces(cur) {
+            queue.push_back(iface);
+        }
+        if let Some(sup) = ctx.superclass_of(cur) {
+            queue.push_back(sup);
+        }
+    }
+    false
+}
+
 /// Scan the `@Configuration` class for `@Bean` factory methods that the
 /// enhancer can safely override with shared-singleton interception. We only
 /// take **instance, no-arg, reference-returning, non-final** methods — the
@@ -1669,54 +1859,98 @@ fn annotations_contain_bean(
 /// static/final/private modifiers are left un-overridden (they run the real
 /// body directly, i.e. the `proxyBeanMethods=false` trade-off), which never
 /// regresses behaviour relative to the previous no-override enhancer.
+/// Internal package name (everything before the last `/`, empty for the
+/// unnamed/default package) of a loaded class.
+fn package_of(ctx: &dyn NativeContext, class_id: cratonvm_types::ClassId) -> String {
+    let name = ctx.class_name_of_id(class_id).unwrap_or_default();
+    match name.rfind('/') {
+        Some(idx) => name[..idx].to_string(),
+        None => String::new(),
+    }
+}
+
+/// Walks `class_id` and its superclass chain (stopping at `Object`) so
+/// `@Bean` methods **inherited** from a base `@Configuration` class are
+/// overridden too, not just ones declared directly on the concrete class —
+/// SPR-8756's "workaround" case (`protected @Bean` method in a base class in
+/// a different package, inherited and called via a public wrapper).
+/// Package-private (default-access) methods are only eligible when declared
+/// in the SAME package as `class_id` itself: per JLS §8.4.8.1 a
+/// package-private method is not inherited/overridable by a subclass in a
+/// different package, so CGLIB has nothing legitimate to override there —
+/// the call runs the real body directly (SPR-8756's "repro" case). Once a
+/// (name, descriptor) signature has been considered at one level it is never
+/// reconsidered further up the chain (the most-derived declaration wins, or
+/// — for an ineligible package-private one — Java simply can't see the
+/// ancestor's member at all).
 fn scan_bean_methods(
     ctx: &mut dyn NativeContext,
     class_id: cratonvm_types::ClassId,
 ) -> Vec<BeanMethod> {
-    const ACC_STATIC: u16 = 0x0008;
+    const ACC_PUBLIC: u16 = 0x0001;
     const ACC_PRIVATE: u16 = 0x0002;
+    const ACC_PROTECTED: u16 = 0x0004;
+    const ACC_STATIC: u16 = 0x0008;
     const ACC_FINAL: u16 = 0x0010;
     let mut out = Vec::new();
     let mut seen = std::collections::HashSet::new();
-    for m in ctx.declared_methods(class_id) {
-        if m.name.starts_with('<') {
-            continue;
+    let concrete_package = package_of(ctx, class_id);
+
+    let mut cur = Some(class_id);
+    while let Some(cid) = cur {
+        for m in ctx.declared_methods(cid) {
+            if m.name.starts_with('<') {
+                continue;
+            }
+            if m.access_flags & (ACC_STATIC | ACC_PRIVATE | ACC_FINAL) != 0 {
+                continue;
+            }
+            // No-arg only.
+            if !m.descriptor.starts_with("()") {
+                continue;
+            }
+            // Reference return only (Lxxx;) — parse the return-type internal name.
+            let ret = match m.descriptor.split(')').nth(1) {
+                Some(r) => r,
+                None => continue,
+            };
+            if !(ret.starts_with('L') && ret.ends_with(';')) {
+                continue;
+            }
+            // Guard against duplicate (name, descriptor) across the whole
+            // chain — a more-derived class's declaration (or non-eligibility
+            // decision) shadows any ancestor's.
+            let key = (m.name.clone(), m.descriptor.clone());
+            if seen.contains(&key) {
+                continue;
+            }
+            let is_package_private =
+                m.access_flags & (ACC_PUBLIC | ACC_PROTECTED | ACC_PRIVATE) == 0;
+            if is_package_private && cid != class_id && package_of(ctx, cid) != concrete_package {
+                seen.insert(key);
+                continue;
+            }
+            // Must carry @Bean — directly OR via a meta-annotation (a composed
+            // annotation such as `@MyProxiedScope` that is itself meta-annotated
+            // `@Bean`). Spring's `@Bean` detection is meta-annotation aware, so the
+            // enhancer must intercept those methods too; otherwise an inter-bean
+            // reference to such a method runs the raw body and bypasses the
+            // container (e.g. the scoped-proxy is never substituted).
+            if !method_carries_bean(ctx, cid, &m.name, &m.descriptor) {
+                seen.insert(key);
+                continue;
+            }
+            seen.insert(key);
+            let return_internal = ret[1..ret.len() - 1].to_string();
+            let is_factory_bean = is_factory_bean_type(ctx, &return_internal);
+            out.push(BeanMethod {
+                name: m.name.clone(),
+                descriptor: m.descriptor.clone(),
+                return_internal,
+                is_factory_bean,
+            });
         }
-        if m.access_flags & (ACC_STATIC | ACC_PRIVATE | ACC_FINAL) != 0 {
-            continue;
-        }
-        // No-arg only.
-        if !m.descriptor.starts_with("()") {
-            continue;
-        }
-        // Reference return only (Lxxx;) — parse the return-type internal name.
-        let ret = match m.descriptor.split(')').nth(1) {
-            Some(r) => r,
-            None => continue,
-        };
-        if !(ret.starts_with('L') && ret.ends_with(';')) {
-            continue;
-        }
-        let return_internal = ret[1..ret.len() - 1].to_string();
-        // Must carry @Bean — directly OR via a meta-annotation (a composed
-        // annotation such as `@MyProxiedScope` that is itself meta-annotated
-        // `@Bean`). Spring's `@Bean` detection is meta-annotation aware, so the
-        // enhancer must intercept those methods too; otherwise an inter-bean
-        // reference to such a method runs the raw body and bypasses the
-        // container (e.g. the scoped-proxy is never substituted).
-        if !method_carries_bean(ctx, class_id, &m.name, &m.descriptor) {
-            continue;
-        }
-        // Guard against duplicate (name, descriptor) — a class can't declare
-        // two, but be defensive since the override is keyed on name.
-        if !seen.insert((m.name.clone(), m.descriptor.clone())) {
-            continue;
-        }
-        out.push(BeanMethod {
-            name: m.name.clone(),
-            descriptor: m.descriptor.clone(),
-            return_internal,
-        });
+        cur = ctx.superclass_of(cid);
     }
     out
 }
@@ -1752,6 +1986,19 @@ fn cce_enhance(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult 
         }
     };
 
+    // Real CGLIB caches the generated proxy class per superclass and
+    // returns the SAME `Class` on a repeat `enhance()` call instead of
+    // generating a fresh numbered subclass every time — see
+    // `config_enhancer_class_cache`'s doc comment.
+    if let Some(&cached_id) = config_enhancer_class_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&super_class_id.as_u32())
+    {
+        let mirror = ctx.get_class_mirror(cached_id);
+        return Ok(Some(Value::Object(Some(mirror))));
+    }
+
     let super_name = match ctx.class_name_of_id(super_class_id) {
         Some(n) => n,
         None => {
@@ -1773,6 +2020,10 @@ fn cce_enhance(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult 
 
     match ctx.define_class_full(&new_name, &bytes, 0, opts) {
         Ok(cid) => {
+            config_enhancer_class_cache()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(super_class_id.as_u32(), cid);
             let mirror = ctx.get_class_mirror(cid);
             eprintln!(
                 "[CCE] enhance: defined {new_name} (super={super_name}, marker={SPRING_MARKER_IFACE}, intercepted @Bean methods={})",

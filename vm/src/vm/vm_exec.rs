@@ -11699,6 +11699,15 @@ fn invoke_on_class_shared_inner(
                         // GenericPrincipal.writeReplace → SerializablePrincipal record).
                         || (class_name == "java/io/ObjectStreamClass$RecordSupport"
                             && method_name == "deserializationCtr")
+                        // WF-XNIO: `OptionMap$Builder.addAll(OptionMap)` is
+                        // concrete bytecode, but it iterates over a native-backed
+                        // `OptionMap` and can resolve the synthetic iterator as
+                        // `java/lang/Object.next()`. Force the native copy path;
+                        // companion entry in interpreter.rs.
+                        || (class_name == "org/xnio/OptionMap$Builder"
+                            && method_name == "addAll"
+                            && descriptor
+                                == "(Lorg/xnio/OptionMap;)Lorg/xnio/OptionMap$Builder;")
                         // TYPE_USE annotation surface (JSpecify @Nullable/@NonNull):
                         // force our natives that parse RuntimeVisibleTypeAnnotations,
                         // since the real JDK path can't decode our null

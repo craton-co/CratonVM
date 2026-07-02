@@ -3653,14 +3653,64 @@ impl ClassManager {
             };
 
             if let Some(&slot) = name_to_slot.get(&key) {
-                // Override inherited slot in place — same slot index so
-                // that subclass dispatch remains index-stable across
-                // further inheritance. Record the super's slot for CHA
-                // invalidation.
-                if let Some(s) = super_u32 {
-                    overrides.push((s, slot));
+                // JLS 8.4.8.1/8.4.8.4: a package-private (default-access)
+                // method is only overridden by a same-named/same-descriptor
+                // subclass method declared in the SAME runtime package as
+                // the method it would shadow — otherwise the two are
+                // unrelated, independent methods that must occupy separate
+                // vtable slots (a different-package subclass has nothing
+                // to legitimately override). Public/protected methods are
+                // unaffected by package and always override as before.
+                let new_is_pkg_private = !method
+                    .access_flags
+                    .contains(cratonvm_reader::class_access_flags::MethodAccessFlags::PUBLIC)
+                    && !method
+                        .access_flags
+                        .contains(cratonvm_reader::class_access_flags::MethodAccessFlags::PROTECTED);
+                let existing_is_pkg_private = entries[slot]
+                    .as_ref()
+                    .and_then(|e| {
+                        self.class_store
+                            .get(ClassId::new(e.declaring_class_id))
+                            .and_then(|dc| dc.methods.get(e.method_index as usize))
+                    })
+                    .map(|dm| {
+                        !dm.access_flags.contains(
+                            cratonvm_reader::class_access_flags::MethodAccessFlags::PUBLIC,
+                        ) && !dm.access_flags.contains(
+                            cratonvm_reader::class_access_flags::MethodAccessFlags::PROTECTED,
+                        )
+                    })
+                    .unwrap_or(false);
+                let is_true_override = if new_is_pkg_private || existing_is_pkg_private {
+                    entries[slot]
+                        .as_ref()
+                        .and_then(|e| self.class_store.get(ClassId::new(e.declaring_class_id)))
+                        .map(|declaring_super| {
+                            crate::access_control::same_runtime_package(class, declaring_super)
+                        })
+                        .unwrap_or(true)
+                } else {
+                    true
+                };
+
+                if is_true_override {
+                    // Override inherited slot in place — same slot index so
+                    // that subclass dispatch remains index-stable across
+                    // further inheritance. Record the super's slot for CHA
+                    // invalidation.
+                    if let Some(s) = super_u32 {
+                        overrides.push((s, slot));
+                    }
+                    entries[slot] = Some(new_entry);
+                } else {
+                    // Not a true override (cross-package package-private
+                    // shadowing) — append a fresh, independent slot, same as
+                    // an unrelated new method signature.
+                    let new_slot = entries.len();
+                    entries.push(Some(new_entry));
+                    name_to_slot.insert(key, new_slot);
                 }
-                entries[slot] = Some(new_entry);
             } else {
                 // New method signature: append a fresh slot.
                 let slot = entries.len();
