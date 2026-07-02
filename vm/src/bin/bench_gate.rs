@@ -5,7 +5,7 @@
 //!
 //! Reads the criterion run output in `target/criterion/<bench>/.../estimates.json`,
 //! compares each metric against a committed baseline JSON file
-//! (`bench/baseline.json` by default), and exits non-zero if any
+//! (`vm/bench/baseline.json` by default), and exits non-zero if any
 //! metric regressed more than the configured threshold (default 15%,
 //! per roadmap NEW-20.2).
 //!
@@ -16,7 +16,7 @@
 //! ## CLI
 //!
 //! ```text
-//! bench-gate                         # gate against bench/baseline.json + 15%
+//! bench-gate                         # gate against vm/bench/baseline.json + 15%
 //! bench-gate --baseline FILE
 //! bench-gate --threshold 0.10        # 10% instead of 15%
 //! bench-gate --update-baseline       # overwrite baseline with current run
@@ -494,7 +494,7 @@ USAGE:
                [--report FILE] [--criterion-dir DIR]
 
 OPTIONS:
-    --baseline FILE        baseline JSON file (default: bench/baseline.json)
+    --baseline FILE        baseline JSON file (default: vm/bench/baseline.json)
     --threshold F          regression threshold as a fraction (default: 0.15)
     --update-baseline      overwrite the baseline with the current run
     --report FILE          write the report as JSON to FILE
@@ -517,7 +517,7 @@ fn run(args: CliArgs) -> Result<i32, GateError> {
     let threshold = args.threshold.unwrap_or(0.15);
     let baseline_path = args
         .baseline
-        .unwrap_or_else(|| PathBuf::from("bench/baseline.json"));
+        .unwrap_or_else(default_baseline_path);
     let criterion_dir = args
         .criterion_dir
         .unwrap_or_else(|| PathBuf::from("target/criterion"));
@@ -536,15 +536,7 @@ fn run(args: CliArgs) -> Result<i32, GateError> {
         return Ok(0);
     }
 
-    let baseline = match load_baseline(&baseline_path) {
-        Ok(b) => b,
-        Err(GateError::BaselineCorrupt(_)) => {
-            // First-time bootstrap: create an empty baseline so every metric
-            // shows up as NEW and the gate passes.
-            Baseline::default()
-        }
-        Err(e) => return Err(e),
-    };
+    let baseline = load_baseline(&baseline_path)?;
 
     let report = compare(&baseline, &run, threshold);
     print!("{}", format_report(&report));
@@ -559,6 +551,10 @@ fn run(args: CliArgs) -> Result<i32, GateError> {
 
 fn host_label() -> String {
     format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH,)
+}
+
+fn default_baseline_path() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("bench/baseline.json")
 }
 
 fn main() -> ExitCode {
@@ -724,7 +720,54 @@ mod tests {
         let path = dir.join("baseline.json");
         fs::write(&path, "{not valid json").unwrap();
         let err = load_baseline(&path).unwrap_err();
-        matches!(err, GateError::BaselineCorrupt(_));
+        assert!(matches!(err, GateError::BaselineCorrupt(_)));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn run_fails_when_baseline_is_missing() {
+        let dir = std::env::temp_dir().join("cratonvm-bench-gate-missing-baseline");
+        let _ = fs::remove_dir_all(&dir);
+        let criterion = dir.join("criterion").join("foo").join("new");
+        fs::create_dir_all(&criterion).unwrap();
+        fs::write(
+            criterion.join("estimates.json"),
+            r#"{"median":{"point_estimate":100.0}}"#,
+        )
+        .unwrap();
+
+        let err = run(CliArgs {
+            baseline: Some(dir.join("baseline.json")),
+            criterion_dir: Some(dir.join("criterion")),
+            ..CliArgs::default()
+        })
+        .unwrap_err();
+        assert!(matches!(err, GateError::BaselineCorrupt(_)));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn run_update_baseline_bootstraps_missing_file() {
+        let dir = std::env::temp_dir().join("cratonvm-bench-gate-update-baseline");
+        let _ = fs::remove_dir_all(&dir);
+        let criterion = dir.join("criterion").join("foo").join("new");
+        fs::create_dir_all(&criterion).unwrap();
+        fs::write(
+            criterion.join("estimates.json"),
+            r#"{"median":{"point_estimate":100.0}}"#,
+        )
+        .unwrap();
+        let baseline = dir.join("baseline.json");
+
+        let code = run(CliArgs {
+            baseline: Some(baseline.clone()),
+            criterion_dir: Some(dir.join("criterion")),
+            update_baseline: true,
+            ..CliArgs::default()
+        })
+        .unwrap();
+        assert_eq!(code, 0);
+        assert!(baseline.exists());
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -784,7 +827,7 @@ mod tests {
         let p = std::env::temp_dir().join("cratonvm-bench-gate-missing-xyz");
         let _ = fs::remove_dir_all(&p);
         let err = collect_run(&p).unwrap_err();
-        matches!(err, GateError::NoData(_));
+        assert!(matches!(err, GateError::NoData(_)));
     }
 
     #[test]
@@ -809,13 +852,13 @@ mod tests {
     #[test]
     fn parse_args_rejects_negative_threshold() {
         let err = parse_args(["--threshold", "-0.1"].iter().map(|s| s.to_string())).unwrap_err();
-        matches!(err, GateError::BadArgs(_));
+        assert!(matches!(err, GateError::BadArgs(_)));
     }
 
     #[test]
     fn parse_args_rejects_unknown_flag() {
         let err = parse_args(["--nope"].iter().map(|s| s.to_string())).unwrap_err();
-        matches!(err, GateError::BadArgs(_));
+        assert!(matches!(err, GateError::BadArgs(_)));
     }
 
     #[test]

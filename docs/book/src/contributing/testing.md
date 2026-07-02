@@ -27,7 +27,7 @@ current Actions run before treating a branch as release-ready.
 |-------|-------|----------------|
 | Unit tests | `#[cfg(test)]` modules beside the code | Individual functions and data structures. |
 | Integration tests | `vm/tests/` | Compiled `.class` files run through the full VM pipeline. |
-| Java test classes | `test_classes/` and test resources | Real Java sources compiled by `build.rs` when `javac` is available. |
+| Java test classes | `test_classes/`, `OUT_DIR/test-classes`, and test resources | Real Java sources compiled by `build.rs` when `javac` is available. Generated classes are staged in `OUT_DIR/test-classes` and exposed as `CRATONVM_TEST_CLASSES_DIR`; committed fixtures remain under test resources. |
 | Regression suite | `regression-suite/` | A fast, deterministic set of Java classes diffed against HotSpot. |
 | Differential harness | `difftest/` | Differential testing against a reference JDK. |
 | Fuzzing | `fuzz/` (separate workspace) | libFuzzer harness, nightly-only. |

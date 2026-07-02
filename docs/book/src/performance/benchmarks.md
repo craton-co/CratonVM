@@ -48,6 +48,12 @@ java -cp bench QuickBench
 For larger workloads, give CratonVM more heap (e.g. `--Xmx 8g` for Binary
 Trees), and use `--nojit` to capture interpreter-only timings.
 
+The VM Criterion gate reads committed baselines from `vm/bench/`. A missing or
+malformed baseline is a gate error; the checked-in zero-valued baselines are
+only placeholders and are reported as bootstrap entries until a deliberate
+baseline refresh records real medians. Generated Criterion output under
+`vm/target_bench/` is historical local data, not the package or gate baseline.
+
 ## Caveats & methodology
 
 Benchmark numbers move with hardware, OS, JDK version, and workload. To get

@@ -19,6 +19,9 @@ readme = "README.md"
 exclude = [
     "tests/resources/**",
     "tests/wildfly_boot_fixtures/**",
+    # Historical Criterion output is useful for local comparisons but is
+    # generated data and must not be included in source packages.
+    "target_bench/**",
     "**/*.class",
 ]
 
@@ -91,7 +94,7 @@ regex = "1"
 libloading = "0.8"
 rustc-hash.workspace = true
 # NEW-20: bench-gate binary uses serde to read criterion estimates.json
-# files and the committed bench/baseline.json file.
+# files and the committed vm/bench/baseline.json file.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
@@ -111,14 +114,14 @@ name = "vm_benchmarks"
 harness = false
 
 # NEW-20: benchmark-gate CLI. Compares the criterion run output in
-# target/criterion/ against the committed bench/baseline.json and
+# target/criterion/ against the committed vm/bench/baseline.json and
 # exits non-zero on regression > threshold.
 [[bin]]
 name = "bench-gate"
 path = "src/bin/bench_gate.rs"
 
-# T5.1.2: HotSpot C2 ratio comparator. Reads bench/baseline.json and
-# bench/hotspot-baseline.json, prints a per-metric ratio table plus
+# T5.1.2: HotSpot C2 ratio comparator. Reads vm/bench/baseline.json and
+# vm/bench/hotspot-baseline.json, prints a per-metric ratio table plus
 # geomean, exits non-zero when the geomean exceeds the threshold (1.5??
 # by default per T5.8.1).
 [[bin]]

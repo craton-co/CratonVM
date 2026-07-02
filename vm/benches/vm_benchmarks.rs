@@ -965,6 +965,10 @@ fn bench_dacapo_avrora_sim(c: &mut Criterion) {
 // land the bench bodies switch over without re-shuffling the group list.
 // =============================================================================
 
+// Readiness note: benchmarks in this section whose underlying VM hook is not
+// exposed yet are named `*_lower_bound_*` and are placeholder coverage, not
+// release-quality measurements of the final subsystem path.
+
 /// Counting loop the JIT promotes to compiled code. Reuses the existing
 /// `make_counting_loop_bytecode` helper so the bytecode shape matches what
 /// the JIT scanner already recognises. With the JIT enabled (default), a
@@ -1025,6 +1029,8 @@ fn bench_jit_hot_loop(c: &mut Criterion) {
 /// collector). Allocations happen once outside the timed region so the
 /// bench isolates the barrier cost from the allocator.
 ///
+/// Placeholder lower-bound benchmark.
+///
 /// TODO: wire to actual write-barrier code path once the heap exposes a
 /// `store_ref(obj, field, value)` API that bypasses interpreter
 /// dispatch; today we time the heap-level alloc + a synthetic touch loop
@@ -1036,7 +1042,7 @@ fn bench_gc_write_barrier(c: &mut Criterion) {
     let holder = shared.heap.alloc_object(ClassId::new(1), 4);
     let referent = shared.heap.alloc_object(ClassId::new(1), 4);
 
-    c.bench_function("gc_write_barrier_tight_loop", |b| {
+    c.bench_function("gc_write_barrier_lower_bound_touch_loop", |b| {
         b.iter(|| {
             for _ in 0..1_000 {
                 // Touch both objects so the bench reflects the cache
@@ -1054,6 +1060,8 @@ fn bench_gc_write_barrier(c: &mut Criterion) {
 /// interpreter takes for `monitorenter` / `monitorexit` on a freshly
 /// allocated object.
 ///
+/// Placeholder lower-bound benchmark.
+///
 /// TODO: wire to actual monitor enter/exit code path once `MonitorTable`
 /// exposes a `enter_for_bench(obj)` test hook; today we time the heap
 /// allocation that backs the monitor and a synthetic loop that touches
@@ -1062,7 +1070,7 @@ fn bench_monitor_enter_exit(c: &mut Criterion) {
     let shared = Arc::new(SharedVm::new(VmConfig::default()));
     let obj = shared.heap.alloc_object(ClassId::new(1), 4);
 
-    c.bench_function("monitor_enter_exit_tight_loop", |b| {
+    c.bench_function("monitor_enter_exit_lower_bound_touch_loop", |b| {
         b.iter(|| {
             for _ in 0..1_000 {
                 // Drive the monitor table — `&shared.monitors` is the
@@ -1082,6 +1090,8 @@ fn bench_monitor_enter_exit(c: &mut Criterion) {
 /// frame chain to the catch — all on the slow path. Measures the steady
 /// cost of a try/throw/catch micro-pattern.
 ///
+/// Placeholder lower-bound benchmark.
+///
 /// TODO: wire to actual exception throw/catch code path via a bytecode
 /// fixture (`new Exception; athrow; goto handler`) once a stable
 /// interpreter entry for that shape is exposed; today we time the
@@ -1090,7 +1100,7 @@ fn bench_monitor_enter_exit(c: &mut Criterion) {
 fn bench_exception_throw_catch(c: &mut Criterion) {
     let shared = Arc::new(SharedVm::new(VmConfig::default()));
 
-    c.bench_function("exception_throw_catch_tight_loop", |b| {
+    c.bench_function("exception_throw_catch_lower_bound_alloc_loop", |b| {
         b.iter(|| {
             for _ in 0..100 {
                 // The Throwable allocation is the dominant cost on this

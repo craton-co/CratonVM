@@ -4,8 +4,9 @@
 //! Build script for cratonvm-vm.
 //!
 //! Automatically compiles Java test classes in `tests/resources/cratonvm/` if
-//! `javac` is available on the PATH. This allows integration tests to run
-//! without a manual compilation step.
+//! `javac` is available on the PATH. Generated classes are staged under
+//! `OUT_DIR/test-classes` and exposed through `CRATONVM_TEST_CLASSES_DIR`;
+//! the build script does not mutate the source tree.
 //!
 //! Java files are compiled in two passes:
 //! 1. Legacy files: plain `javac` (no version flags).
@@ -42,7 +43,15 @@ fn compile_files(
     for f in files {
         cmd.arg(f);
     }
-    let output = cmd.output().expect("failed to execute javac");
+    let output = match cmd.output() {
+        Ok(output) => output,
+        Err(e) => {
+            if log_failure {
+                println!("cargo:warning=failed to execute javac ({extra_args:?}): {e}");
+            }
+            return false;
+        }
+    };
     if !output.status.success() {
         // Only surface the failure as a cargo warning when it's the
         // *final* attempt — speculative "try -source 7 first, fall
@@ -64,38 +73,61 @@ fn compile_files(
 /// source changed. On Windows the `CreateProcess` + JVM startup cost
 /// alone is ~200ms; on macOS the toolchain shim adds another ~100ms.
 ///
-/// Cache strategy: write `present` or `absent` to
-/// `$OUT_DIR/javac-version.txt` after the first probe. Subsequent
-/// builds read the cache and skip the shell-out. The cache is
-/// invalidated automatically when:
+/// Cache strategy: write `present` or `absent` plus the PATH/JAVA_HOME
+/// fingerprint to `$OUT_DIR/javac-version.txt` after the first probe.
+/// Subsequent builds with the same environment read the cache and skip
+/// the shell-out. The cache is invalidated automatically when:
 ///   * `OUT_DIR` is wiped (`cargo clean`).
 ///   * The user updates their `PATH` and triggers a rerun via the
 ///     `cargo:rerun-if-env-changed=PATH` directive we emit below.
 ///   * The Java sources change (existing `cargo:rerun-if-changed`).
 fn javac_available_cached(out_dir: &Path) -> bool {
     let cache_path = out_dir.join("javac-version.txt");
+    let fingerprint = javac_env_fingerprint();
     if let Ok(prev) = std::fs::read_to_string(&cache_path) {
-        return prev.trim() == "present";
+        let mut lines = prev.lines();
+        let state = lines.next().unwrap_or("");
+        let cached_fingerprint = lines.collect::<Vec<_>>().join("\n");
+        if cached_fingerprint == fingerprint {
+            return state == "present";
+        }
     }
     let javac_check = Command::new("javac").arg("-version").output();
     let present = javac_check.is_ok_and(|o| o.status.success());
     // Best-effort cache write; if the FS is read-only we'll just
     // shell out again next build (no correctness impact).
-    let _ = std::fs::write(&cache_path, if present { "present" } else { "absent" });
+    let _ = std::fs::write(
+        &cache_path,
+        format!("{}\n{}\n", if present { "present" } else { "absent" }, fingerprint),
+    );
     present
+}
+
+fn javac_env_fingerprint() -> String {
+    let path = std::env::var_os("PATH")
+        .map(|v| v.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let java_home = std::env::var_os("JAVA_HOME")
+        .map(|v| v.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    format!("PATH={path}\nJAVA_HOME={java_home}")
 }
 
 fn main() {
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
     let out_dir_var = std::env::var("OUT_DIR").expect("OUT_DIR set by cargo");
     let out_dir = Path::new(&out_dir_var);
-    // Java files live under `tests/resources/cratonvm/`; the classpath
-    // used by the integration tests is `tests/resources/`, so every
-    // `.class` must land one level up from the sources (output dir =
-    // `tests/resources`). Javac then places each compiled class
-    // under its package directory (e.g. `cratonvm/TckIo.class`).
+    // Java files live under `tests/resources/cratonvm/`. Generated
+    // classes are staged under OUT_DIR so builds/tests are read-only
+    // with respect to the source checkout. Tests that need freshly
+    // compiled fixtures should prefer CRATONVM_TEST_CLASSES_DIR, while
+    // legacy tests can still read committed fixtures from tests/resources.
     let sources_dir = Path::new(&manifest_dir).join("tests/resources/cratonvm");
-    let output_dir = Path::new(&manifest_dir).join("tests/resources");
+    let output_dir = out_dir.join("test-classes");
+    println!(
+        "cargo:rustc-env=CRATONVM_TEST_CLASSES_DIR={}",
+        output_dir.display()
+    );
 
     // Round-11 cross-cutting HIGH-6: declare an explicit allow-list of
     // rerun triggers so cargo does not re-execute this build script on
@@ -114,7 +146,7 @@ fn main() {
     // including `IntrinsicDiff.java` and `SyntheticDiff.java` (the differential
     // exercise programs for the intrinsic table and the synthetic native
     // overlay respectively) — is picked up by this glob and compiled by the
-    // legacy pass below, landing at `tests/resources/cratonvm/<Name>.class`.
+    // legacy pass below, landing at `$OUT_DIR/test-classes/cratonvm/<Name>.class`.
     let java_files: Vec<PathBuf> = std::fs::read_dir(&sources_dir)
         .into_iter()
         .flatten()
@@ -137,6 +169,23 @@ fn main() {
         println!(
             "cargo:warning=javac not found on PATH — skipping Java test class compilation. \
              Integration tests will be skipped."
+        );
+        return;
+    }
+
+    if let Err(e) = std::fs::remove_dir_all(&output_dir) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            println!(
+                "cargo:warning=failed to clear {} before javac staging: {e}",
+                output_dir.display()
+            );
+            return;
+        }
+    }
+    if let Err(e) = std::fs::create_dir_all(&output_dir) {
+        println!(
+            "cargo:warning=failed to create javac staging dir {}: {e}",
+            output_dir.display()
         );
         return;
     }
