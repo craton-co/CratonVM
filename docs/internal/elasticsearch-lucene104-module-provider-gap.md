@@ -1,8 +1,10 @@
-# Elasticsearch Lucene104 module-provider discovery gap
+# Elasticsearch Lucene104 provider initialization gap
 
-Status: open
+Status: fixed
 
 Date observed: 2026-07-02
+
+Date fixed: 2026-07-02
 
 ## Summary
 
@@ -25,9 +27,51 @@ The provider is present in the Lucene 10.4 core jar module descriptor:
 provides org.apache.lucene.codecs.Codec with org.apache.lucene.codecs.lucene104.Lucene104Codec
 ```
 
-This points at a CratonVM service-provider discovery gap around Lucene's
-`module-info.class` provider declarations. It is not a missing classpath entry:
-HotSpot uses the same `build\craton-testcp.txt` file and finds the provider.
+This initially looked like a CratonVM service-provider discovery gap around
+Lucene's `module-info.class` provider declarations. The direct probe showed the
+JPMS `provides` entry was discoverable, but Lucene's `NamedSPILoader` discarded
+`Lucene104Codec` because the provider constructor failed while initializing
+Lucene's vectorization stack.
+
+The CratonVM-only blocker was missing JDK 25 native coverage reached by that
+constructor:
+
+```text
+com/sun/management/internal/Flag.initialize()V
+jdk/internal/vm/vector/VectorSupport.registerNatives()I
+jdk/internal/vm/vector/VectorSupport.getCPUFeatures()Ljava/lang/String;
+jdk/internal/vm/vector/VectorSupport.getMaxLaneCount(Ljava/lang/Class;)I
+```
+
+The fix adds the JDK 25 `Flag` management native surface, registers the
+`VectorSupport` ACC_NATIVE methods in the real-JDK essential native path, and
+pins JPMS module `provides` discovery with a ServiceLoader regression test.
+
+## Verification
+
+Focused tests:
+
+```powershell
+cargo test -p cratonvm-native-builtins register_essential_includes_jdk25_vector_support_natives
+cargo test -p cratonvm-native-builtins service_loader::tests::discover_providers_includes_jpms_module_provides_entries
+cargo test -p cratonvm-native-builtins vector_api_tests::test_vector_support_jdk25_natives_registered
+cargo test -p cratonvm-native-builtins --features experimental-jmx jmx::jmx_tests::test_jdk25_internal_flag_natives_registered
+```
+
+Runtime probe:
+
+```powershell
+cargo build --release -p cratonvm-cli
+Copy-Item target\release\cratonvm.exe target\release\cratonvm-lucene104-module-provider-20260702.exe -Force
+$env:CRATONVM_STRICT_SWALLOWS='1'
+.\target\release\cratonvm-lucene104-module-provider-20260702.exe --java-home 'C:\Program Files\Java\jdk-25' -cp 'target\lucene104-probe;C:\Users\Victor\.gradle\caches\modules-2\files-2.1\org.apache.lucene\lucene-core\10.4.0\7493bc763cd5e91f2a8f7722c2f90d8ce15c6319\lucene-core-10.4.0.jar' Lucene104Probe
+```
+
+The probe exits 0 and prints:
+
+```text
+Lucene104
+```
 
 ## Repro
 
@@ -138,5 +182,6 @@ Elasticsearch native access logs a `LoaderHelper.findPlatformLibDir` NPE under
 both HotSpot and CratonVM in this fixture. HotSpot continues and passes the
 affected tests, so that warning is not the primary CratonVM-only failure.
 
-The current blocker happens later during Lucene codec initialization:
-`org.apache.lucene.codecs.Codec$Holder.<clinit>` cannot resolve `Lucene104`.
+The original visible failure happened during Lucene codec initialization:
+`org.apache.lucene.codecs.Codec$Holder.<clinit>` could not resolve `Lucene104`
+after `NamedSPILoader` discarded the provider whose constructor had failed.

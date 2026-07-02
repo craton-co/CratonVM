@@ -1587,6 +1587,7 @@ pub fn register_service_loader_natives(r: &mut NativeMethodRegistry) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_utils::mock_ctx;
 
     #[test]
     fn provider_name_validation_accepts_fqn() {
@@ -1633,5 +1634,36 @@ mod tests {
         let mut out = Vec::new();
         parse_provider_lines(body, &mut out);
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn discover_providers_includes_jpms_module_provides_entries() {
+        let mut ctx = mock_ctx();
+        ctx.set_module_providers(
+            "org/apache/lucene/codecs/Codec",
+            vec!["org/apache/lucene/codecs/lucene104/Lucene104Codec"],
+        );
+
+        let service_id = ctx
+            .ensure_class_initialized("org/apache/lucene/codecs/Codec")
+            .expect("create service class");
+        let service_mirror = ctx.get_class_mirror(service_id);
+        let sl = match build_service_loader(
+            &mut ctx,
+            Value::Object(Some(service_mirror)),
+            Value::Object(None),
+        )
+        .expect("build ServiceLoader")
+        {
+            Some(Value::Object(Some(sl))) => sl,
+            other => panic!("expected ServiceLoader object, got {other:?}"),
+        };
+
+        let providers = discover_providers(&mut ctx, sl).expect("discover providers");
+        assert_eq!(
+            providers,
+            vec!["org.apache.lucene.codecs.lucene104.Lucene104Codec"],
+            "module-info `provides Codec with Lucene104Codec` must participate in ServiceLoader discovery",
+        );
     }
 }
