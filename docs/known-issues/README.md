@@ -13,11 +13,11 @@ it under `docs/internal`.
 ## How many distinct bugs are here?
 
 After consolidation (full re-count 2026-06-18, kafka-bug-B/C status reconciled 2026-07-01),
-the ~30 docs map to **one root-cause family + ~15 distinct standalone bugs**, of which
+the ~30 docs map to **one root-cause family + ~16 distinct standalone bugs**, of which
 **9 are already FIXED on `dev`** (the 6 prior + `kafka-bug-C` and both `kafka-bug-B`
 fixes). Headline:
 
-**~8 distinct OPEN defects + 1 latent** (was ~10 — family-A **A2** was fixed
+**~9 distinct OPEN defects + 1 latent** (was ~10 — family-A **A2** was fixed
 2026-06-23, `6e3ddb05`), grouped as:
 
 1. **Family A — GC root coverage under JIT** (one root cause, several manifestations). Open members:
@@ -127,6 +127,13 @@ fixes). Headline:
     + materialized elements in Rust locals across `invoke_virtual`; the moving young collector relocates them
     out from under the stale local. `-Xmx8g` passes; default heap ~50–70 % crash. Fix = `pin_native_root` /
     `read_native_pin` per native (NOT force-non-moving — that hits the HIB-CV-33 precise-root gap).
+
+20. **[Elasticsearch Lucene104 module-provider discovery gap](elasticsearch-lucene104-module-provider-gap.md)** -
+    **OPEN**. Elasticsearch JUnit classes that initialize Lucene fail under CratonVM because
+    `org.apache.lucene.codecs.Codec$Holder` cannot discover `Lucene104`. HotSpot passes the
+    same classpath. The Lucene 10.4 core jar declares
+    `provides org.apache.lucene.codecs.Codec with org.apache.lucene.codecs.lucene104.Lucene104Codec`
+    in `module-info.class`, so the blocker is a CratonVM service-provider/module-provider discovery gap.
 
 FIXED bugs whose standalone docs were **removed** from this folder (resolved; full writeups in
 `git` history or [`docs/internal/fixed-suite-bugs/`](../internal/fixed-suite-bugs/)): A1 (reflection
