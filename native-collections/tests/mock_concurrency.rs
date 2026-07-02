@@ -1,0 +1,289 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company.
+
+//! Focused coverage for synthetic concurrency natives.
+
+mod common;
+
+use common::{boxed_int, build_registry, call, MockCtx};
+use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError, VmError};
+use cratonvm_types::{ObjectRef, Value};
+
+const CF: &str = "java/util/concurrent/CompletableFuture";
+const SL: &str = "java/util/concurrent/locks/StampedLock";
+
+fn alloc_obj(ctx: &mut MockCtx, class_name: &str, fields: usize) -> ObjectRef {
+    let cid = ctx.ensure_class_initialized(class_name).unwrap();
+    ctx.alloc_object(cid, fields)
+}
+
+fn new_cf(ctx: &mut MockCtx, done: i32, result: Value) -> ObjectRef {
+    let cf = alloc_obj(ctx, CF, 4);
+    ctx.set_field(cf, 0, result);
+    ctx.set_field(cf, 1, Value::Int(done));
+    cf
+}
+
+fn new_stamped_lock(reg: &NativeMethodRegistry, ctx: &mut MockCtx) -> ObjectRef {
+    let lock = alloc_obj(ctx, SL, 2);
+    call(reg, ctx, SL, "<init>", "()V", &[Value::Object(Some(lock))]).unwrap();
+    lock
+}
+
+fn object_result(result: MethodCallResult) -> ObjectRef {
+    match result.unwrap().unwrap() {
+        Value::Object(Some(obj)) => obj,
+        other => panic!("expected object result, got {other:?}"),
+    }
+}
+
+fn assert_npe(result: MethodCallResult) {
+    assert!(
+        matches!(
+            &result,
+            Err(MethodCallFailed::InternalError(VmError::Runtime(
+                RuntimeError::NullPointerException { .. }
+            )))
+        ),
+        "expected NullPointerException, got {result:?}"
+    );
+}
+
+fn callback_count(ctx: &MockCtx, method: &str) -> usize {
+    ctx.invoke_virtual_log()
+        .iter()
+        .filter(|(_, m, _, _)| m == method)
+        .count()
+}
+
+fn is_completed_exceptionally(
+    reg: &NativeMethodRegistry,
+    ctx: &mut MockCtx,
+    cf: ObjectRef,
+) -> bool {
+    matches!(
+        call(
+            reg,
+            ctx,
+            CF,
+            "isCompletedExceptionally",
+            "()Z",
+            &[Value::Object(Some(cf))]
+        )
+        .unwrap(),
+        Some(Value::Int(1))
+    )
+}
+
+fn alt_result_exception(ctx: &MockCtx, cf: ObjectRef) -> Value {
+    match ctx.get_field(cf, 0) {
+        Value::Object(Some(alt)) => ctx.get_field(alt, 0),
+        other => panic!("expected AltResult in result slot, got {other:?}"),
+    }
+}
+
+#[test]
+fn cf_pending_dependents_do_not_eagerly_invoke_callbacks_with_null() {
+    let reg = build_registry();
+    let mut ctx = MockCtx::new();
+    let pending = new_cf(&mut ctx, 0, Value::Object(None));
+
+    let func = alloc_obj(&mut ctx, "test/Function", 0);
+    let then_apply = object_result(call(
+        &reg,
+        &mut ctx,
+        CF,
+        "thenApply",
+        "(Ljava/util/function/Function;)Ljava/util/concurrent/CompletableFuture;",
+        &[Value::Object(Some(pending)), Value::Object(Some(func))],
+    ));
+    assert_eq!(ctx.get_field(then_apply, 1), Value::Int(0));
+    assert_eq!(callback_count(&ctx, "apply"), 0);
+
+    ctx.clear_invoke_virtual_log();
+    let consumer = alloc_obj(&mut ctx, "test/BiConsumer", 0);
+    let when_complete = object_result(call(
+        &reg,
+        &mut ctx,
+        CF,
+        "whenComplete",
+        "(Ljava/util/function/BiConsumer;)Ljava/util/concurrent/CompletableFuture;",
+        &[Value::Object(Some(pending)), Value::Object(Some(consumer))],
+    ));
+    assert_eq!(ctx.get_field(when_complete, 1), Value::Int(0));
+    assert_eq!(callback_count(&ctx, "accept"), 0);
+}
+
+#[test]
+fn cf_exceptional_then_apply_propagates_without_invoking_function() {
+    let reg = build_registry();
+    let mut ctx = MockCtx::new();
+    let throwable = alloc_obj(&mut ctx, "java/lang/RuntimeException", 2);
+    let failed = new_cf(&mut ctx, 2, Value::Object(Some(throwable)));
+    let func = alloc_obj(&mut ctx, "test/Function", 0);
+
+    let dependent = object_result(call(
+        &reg,
+        &mut ctx,
+        CF,
+        "thenApply",
+        "(Ljava/util/function/Function;)Ljava/util/concurrent/CompletableFuture;",
+        &[Value::Object(Some(failed)), Value::Object(Some(func))],
+    ));
+
+    assert_eq!(callback_count(&ctx, "apply"), 0);
+    assert!(is_completed_exceptionally(&reg, &mut ctx, dependent));
+    assert_eq!(
+        alt_result_exception(&ctx, dependent),
+        Value::Object(Some(throwable))
+    );
+}
+
+#[test]
+fn cf_callback_failure_completes_dependent_exceptionally() {
+    let reg = build_registry();
+    let mut ctx = MockCtx::new();
+    let value = boxed_int(&mut ctx, 7);
+    let source = new_cf(&mut ctx, 1, value);
+    let consumer = alloc_obj(&mut ctx, "test/BiConsumer", 0);
+    let thrown = alloc_obj(&mut ctx, "java/lang/IllegalStateException", 2);
+    ctx.set_invoke_virtual_result(Err(MethodCallFailed::ExceptionThrown(thrown)));
+
+    let dependent = object_result(call(
+        &reg,
+        &mut ctx,
+        CF,
+        "whenComplete",
+        "(Ljava/util/function/BiConsumer;)Ljava/util/concurrent/CompletableFuture;",
+        &[Value::Object(Some(source)), Value::Object(Some(consumer))],
+    ));
+
+    assert_eq!(callback_count(&ctx, "accept"), 1);
+    assert!(is_completed_exceptionally(&reg, &mut ctx, dependent));
+    assert_eq!(
+        alt_result_exception(&ctx, dependent),
+        Value::Object(Some(thrown))
+    );
+}
+
+#[test]
+fn cf_null_callbacks_throw_null_pointer_exception() {
+    let reg = build_registry();
+    let mut ctx = MockCtx::new();
+    let value = boxed_int(&mut ctx, 1);
+    let source = new_cf(&mut ctx, 1, value);
+
+    for (method, desc) in [
+        (
+            "thenApply",
+            "(Ljava/util/function/Function;)Ljava/util/concurrent/CompletableFuture;",
+        ),
+        (
+            "thenAccept",
+            "(Ljava/util/function/Consumer;)Ljava/util/concurrent/CompletableFuture;",
+        ),
+        (
+            "thenRun",
+            "(Ljava/lang/Runnable;)Ljava/util/concurrent/CompletableFuture;",
+        ),
+        (
+            "exceptionally",
+            "(Ljava/util/function/Function;)Ljava/util/concurrent/CompletableFuture;",
+        ),
+        (
+            "handle",
+            "(Ljava/util/function/BiFunction;)Ljava/util/concurrent/CompletableFuture;",
+        ),
+        (
+            "whenComplete",
+            "(Ljava/util/function/BiConsumer;)Ljava/util/concurrent/CompletableFuture;",
+        ),
+    ] {
+        assert_npe(call(
+            &reg,
+            &mut ctx,
+            CF,
+            method,
+            desc,
+            &[Value::Object(Some(source)), Value::Object(None)],
+        ));
+    }
+
+    let other_value = boxed_int(&mut ctx, 2);
+    let other = new_cf(&mut ctx, 1, other_value);
+    assert_npe(call(
+        &reg,
+        &mut ctx,
+        CF,
+        "thenCombine",
+        "(Ljava/util/concurrent/CompletionStage;Ljava/util/function/BiFunction;)Ljava/util/concurrent/CompletableFuture;",
+        &[
+            Value::Object(Some(source)),
+            Value::Object(Some(other)),
+            Value::Object(None),
+        ],
+    ));
+}
+
+#[test]
+fn stamped_lock_read_lock_does_not_grant_while_writer_remains_held() {
+    let reg = build_registry();
+    let mut ctx = MockCtx::new();
+    let lock = new_stamped_lock(&reg, &mut ctx);
+
+    let write_stamp = call(
+        &reg,
+        &mut ctx,
+        SL,
+        "writeLock",
+        "()J",
+        &[Value::Object(Some(lock))],
+    )
+    .unwrap();
+    assert!(matches!(write_stamp, Some(Value::Long(stamp)) if stamp != 0));
+    assert_eq!(ctx.get_field(lock, 0), Value::Int(1));
+
+    let read_stamp = call(
+        &reg,
+        &mut ctx,
+        SL,
+        "readLock",
+        "()J",
+        &[Value::Object(Some(lock))],
+    )
+    .unwrap();
+    assert_eq!(read_stamp, Some(Value::Long(0)));
+    assert_eq!(ctx.get_field(lock, 0), Value::Int(1));
+}
+
+#[test]
+fn stamped_lock_write_lock_does_not_grant_while_reader_remains_held() {
+    let reg = build_registry();
+    let mut ctx = MockCtx::new();
+    let lock = new_stamped_lock(&reg, &mut ctx);
+
+    let read_stamp = call(
+        &reg,
+        &mut ctx,
+        SL,
+        "readLock",
+        "()J",
+        &[Value::Object(Some(lock))],
+    )
+    .unwrap();
+    assert!(matches!(read_stamp, Some(Value::Long(stamp)) if stamp != 0));
+    assert_eq!(ctx.get_field(lock, 0), Value::Int(2));
+
+    let write_stamp = call(
+        &reg,
+        &mut ctx,
+        SL,
+        "writeLock",
+        "()J",
+        &[Value::Object(Some(lock))],
+    )
+    .unwrap();
+    assert_eq!(write_stamp, Some(Value::Long(0)));
+    assert_eq!(ctx.get_field(lock, 0), Value::Int(2));
+}
