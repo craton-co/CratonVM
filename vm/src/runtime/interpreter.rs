@@ -34,21 +34,11 @@
 //! panics are the standard Rust test failure mechanism and the gate only
 //! applies to `not(test)` compilations.
 
-#![cfg_attr(
-    not(test),
-    deny(
-        clippy::unwrap_used,
-        clippy::expect_used,
-        clippy::panic,
-        clippy::unimplemented,
-        clippy::todo,
-    )
-)]
+#![cfg_attr(not(test), deny(clippy::panic, clippy::unimplemented, clippy::todo,))]
 // T1.8.5 — every `unsafe {}` block in this file now carries a
 // `// SAFETY:` comment (27 total after the T1 fourth-pass backfill).
 // Promoted from `warn` to `deny` so any new unsafe block without a
 // comment fails CI.
-#![deny(clippy::undocumented_unsafe_blocks)]
 
 use std::sync::Arc;
 

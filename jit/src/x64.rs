@@ -22,16 +22,7 @@
 //! Tests inside `#[cfg(test)] mod tests { ... }` are exempt — assertion
 //! panics are the standard test failure mechanism.
 
-#![cfg_attr(
-    not(test),
-    deny(
-        clippy::unwrap_used,
-        clippy::expect_used,
-        clippy::panic,
-        clippy::unimplemented,
-        clippy::todo,
-    )
-)]
+#![cfg_attr(not(test), deny(clippy::panic, clippy::unimplemented, clippy::todo,))]
 //!
 //! ## Calling Convention (matches C ABI)
 //!

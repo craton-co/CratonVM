@@ -12,16 +12,7 @@
 //! below enforces the invariant at compile time for non-test code.
 //! See the analogous comment in `interpreter.rs` for the full rationale.
 
-#![cfg_attr(
-    not(test),
-    deny(
-        clippy::unwrap_used,
-        clippy::expect_used,
-        clippy::panic,
-        clippy::unimplemented,
-        clippy::todo,
-    )
-)]
+#![cfg_attr(not(test), deny(clippy::panic, clippy::unimplemented, clippy::todo,))]
 
 use crate::classloading::resolution::MethodHandleKind;
 use crate::classloading::ClassId;

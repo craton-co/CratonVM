@@ -146,7 +146,7 @@ fn single_thread_guard_enabled() -> bool {
         2 => true,
         _ => {
             let on = std::env::var_os("CRATONVM_ASSERT_SINGLE_OS_THREAD")
-                .map(|v| v != "0" && v != "")
+                .map(|v| v != "0" && !v.is_empty())
                 .unwrap_or(false);
             CACHED.store(if on { 2 } else { 1 }, Ordering::Relaxed);
             on

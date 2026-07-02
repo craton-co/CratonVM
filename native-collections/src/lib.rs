@@ -16422,6 +16422,57 @@ pub fn comparator_compare(
     let tag = match tag {
         Some(t) => t,
         None => {
+            // A descriptor-blind `thenComparing` dispatch can store a key
+            // extractor lambda directly in the secondary-comparator slot. If
+            // the receiver is one of those lambda proxies, skip the doomed
+            // `compare(Object,Object)` probe and run the corresponding
+            // `Comparator.comparing*` semantics up front.
+            let lambda_iface = ctx.lambda_functional_interface(ctx.class_id_of_object(comparator));
+            match lambda_iface.as_deref() {
+                Some("java/util/function/Function") => {
+                    return compare_with_key_function(ctx, comparator, a, b);
+                }
+                Some("java/util/function/ToIntFunction") => {
+                    let ia = comparing_key_as_i64(
+                        ctx,
+                        comparator,
+                        "applyAsInt",
+                        "(Ljava/lang/Object;)I",
+                        a,
+                    )?;
+                    let ib = comparing_key_as_i64(
+                        ctx,
+                        comparator,
+                        "applyAsInt",
+                        "(Ljava/lang/Object;)I",
+                        b,
+                    )?;
+                    return Ok(Some(Value::Int(ia.cmp(&ib) as i32)));
+                }
+                Some("java/util/function/ToLongFunction") => {
+                    let ia = comparing_key_as_i64(
+                        ctx,
+                        comparator,
+                        "applyAsLong",
+                        "(Ljava/lang/Object;)J",
+                        a,
+                    )?;
+                    let ib = comparing_key_as_i64(
+                        ctx,
+                        comparator,
+                        "applyAsLong",
+                        "(Ljava/lang/Object;)J",
+                        b,
+                    )?;
+                    return Ok(Some(Value::Int(ia.cmp(&ib) as i32)));
+                }
+                Some("java/util/function/ToDoubleFunction") => {
+                    let da = comparing_key_as_f64(ctx, comparator, a)?;
+                    let db = comparing_key_as_f64(ctx, comparator, b)?;
+                    return Ok(Some(Value::Int(double_compare(da, db))));
+                }
+                _ => {}
+            }
             // Not a factory comparator — invoke its `compare` (lambda path).
             //
             // Fallback: if `compare` does not resolve, the object is actually a
@@ -16445,27 +16496,10 @@ pub fn comparator_compare(
                 &[a, b],
             ) {
                 Ok(v) => Ok(v),
-                Err(compare_err) => {
-                    match ctx.invoke_virtual(
-                        comparator,
-                        "apply",
-                        "(Ljava/lang/Object;)Ljava/lang/Object;",
-                        &[a],
-                    ) {
-                        Ok(Some(ka)) => {
-                            let kb = ctx
-                                .invoke_virtual(
-                                    comparator,
-                                    "apply",
-                                    "(Ljava/lang/Object;)Ljava/lang/Object;",
-                                    &[b],
-                                )?
-                                .unwrap_or(Value::Object(None));
-                            natural_compare(ctx, &ka, &kb)
-                        }
-                        _ => Err(compare_err),
-                    }
-                }
+                Err(compare_err) => match compare_with_key_function(ctx, comparator, a, b) {
+                    Ok(v) => Ok(v),
+                    Err(_) => Err(compare_err),
+                },
             };
         }
     };
@@ -16560,6 +16594,31 @@ pub fn comparator_compare(
         }
         _ => Ok(Some(Value::Int(0))),
     }
+}
+
+fn compare_with_key_function(
+    ctx: &mut dyn NativeContext,
+    key_fn: ObjectRef,
+    a: Value,
+    b: Value,
+) -> MethodCallResult {
+    let ka = ctx
+        .invoke_virtual(
+            key_fn,
+            "apply",
+            "(Ljava/lang/Object;)Ljava/lang/Object;",
+            &[a],
+        )?
+        .unwrap_or(Value::Object(None));
+    let kb = ctx
+        .invoke_virtual(
+            key_fn,
+            "apply",
+            "(Ljava/lang/Object;)Ljava/lang/Object;",
+            &[b],
+        )?
+        .unwrap_or(Value::Object(None));
+    natural_compare(ctx, &ka, &kb)
 }
 
 /// Invoke a primitive key-extractor SAM (`applyAsInt`/`applyAsLong`) on `arg`

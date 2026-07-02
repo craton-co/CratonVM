@@ -1063,7 +1063,7 @@ fn t1_concurrent_mark_visits_every_reachable_object_once() {
     // an object only if the marking pass enqueued it twice.
     if shared.heap.needs_gc() {
         // Single-threaded test harness — no other mutator exists.
-        let stw = cratonvm_gc::collector::StopTheWorldToken::new();
+        let stw = unsafe { cratonvm_gc::collector::StopTheWorldToken::new() };
         let _ = shared
             .heap
             .collect_garbage(&stw, &mut roots, &shared.monitors);
