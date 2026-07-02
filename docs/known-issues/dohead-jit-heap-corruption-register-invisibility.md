@@ -1,0 +1,138 @@
+# Tomcat `TestHttpServletDoHead*` — JIT-only young-gen heap corruption / SIGSEGV (OPEN)
+
+Status: **OPEN.** Root-caused to the JIT×GC root-precision family; no reliable fix
+landed. Both attempted conservative mitigations (full-GPR safepoint spill, shadow
+stack) were **empirically insufficient**. Documented here so the dead-ends are not
+re-walked.
+
+## Symptom
+
+`jakarta.servlet.http.TestHttpServletDoHeadInvalidWrite1023ValidWrite1023` (suite
+index 38, real-JDK, JIT on) and its large-write siblings intermittently corrupt the
+non-moving young generation and crash:
+
+```
+WARN cratonvm_gc::gen_heap: GC: implausible num_slots <heap-pointer> on kind=Object header (class_id=0)
+WARN cratonvm_gc::gen_heap: non-moving sweep: stopping walk at offset N — implausible object size 0
+...
+# EXCEPTION_ACCESS_VIOLATION (SIGSEGV) at pc=<native helper RVA>
+#  Faulting access: read at address 0x0000000000000028   (= HEADER_SIZE; null-base field read at off 40)
+#  thread: "Thread-NNNN"   (a Tomcat worker)
+```
+
+The corrupt "header" is 16 zero bytes followed by a run of packed 8-byte young-gen
+heap pointers (no `Value` tags) — i.e. an `Object[]` element region / compact-object
+body that the sweep walker reaches at a mis-aligned offset after a **live young
+object was reclaimed and its slot freed/reused**. The crash is the downstream
+use-after-free: a native helper called from JIT reads a reference field (offset 0x28)
+of a null/dead object.
+
+Newly exposed by the DoHead root-deposit fixes `886e2d66` + `24cf0b19`, which turned
+the family's prior uniform HANG into a MIX (some variants PASS, several CRASH).
+
+## What is confirmed
+
+- **JIT-only.** `--nojit` runs produce **zero** corruption warnings (the class then
+  just HANGs on the pre-existing HTTP/2 `testDoHeadHttp2` blocked-thread hang, which
+  is a separate issue). JIT-on corrupts. So the corruptor is in / triggered by
+  JIT-compiled code.
+- **Deterministic-ish repro at a small heap.** `-Xmx500m` makes young GC frequent
+  enough that the class crashes in **~2–3 of every 6 runs** at a 150 s timeout
+  (vs. rarely at the 2 g suite default). `-Xmx300m` is too small (hangs/OOMs).
+- **Crash = UAF.** Null-base field read at offset 0x28 in a native helper invoked
+  from JIT — a still-live young object was collected.
+
+## Dead ends (do NOT re-try without new evidence)
+
+Every black-box A/B below is **confounded** two ways and must be read with N≥6 and
+the crash (NOSUMMARY/FAIL) as the signal, NOT the corruption count:
+1. **Corruption count tracks execution progress**, not the toggle — a run that hangs
+   early on the HTTP/2 test shows 0 corruption without being "fixed."
+2. **The crash itself is flaky** (~30–50% at -Xmx500m/150 s), so N=3 samples routinely
+   mislead (a clean 0/0/0 batch is pure luck).
+
+- `CRATONVM_JIT_SAFEPOINT_REG_SPILL=all` (blind-spill the full GPR file at every
+  GC-capable safepoint so the conservative scan marks every register-resident oop).
+  Measured **3/6 crashes** — indistinguishable from the `=0` baseline's **2/6**.
+  A default-flip of this gate was built and measured; it does not help and adds
+  per-safepoint spill cost. Reverted. (An early N=3 env-A/B showed a spurious
+  0/0/0 — flakiness.) `=1` (callee-saved only) also crashed.
+- `CRATONVM_SHADOW_STACK=1` (precise rewritable JIT roots). Reduced but did not
+  eliminate corruption (one run still 32 events); and it is explicitly EXPERIMENTAL /
+  "do not enable in production" (partial moving-gen scaffolding, under-counts bt18).
+- `CRATONVM_NO_SELECTIVE_PROMOTE=1` — still corrupts (96 events in one run), so the
+  selective-promotion **relocation** hypothesis is refuted: the corruptor is not
+  selective promotion moving a JIT-referenced object.
+- `CRATONVM_PRECISE_JIT_MAPS=1` — corruption count went UP (confounded; it also
+  switches on the moving young collector, which relocates more and has its own
+  residual). Uninformative.
+- `CRATONVM_GC_STRESS=1` — unusable: dies at startup with an unrelated
+  "ServiceLoader.getName() returned null" under BOTH jit and nojit (a separate
+  GC-stress startup bug), before reaching this code path.
+
+## Root cause (CONFIRMED via `CRATONVM_DBG_A2` instrumented detector)
+
+`CRATONVM_DBG_A2` reproduces at -Xmx500m WITHOUT suppressing the bug (unlike
+`CRATONVM_DBG_SWEEP_ZERO`, whose per-dead-object ring write is heavy enough to make
+the heisenbug vanish — 0 corruption in 4 runs). The A2 breadcrumb + alloc records
+show:
+
+- **`mismatch=0`**: the walker's computed size never disagrees with an object's real
+  allocated size → NOT a walker/sizing bug.
+- Every "corruption" is the walk landing at a **mid-object offset** inside a REAL
+  live legacy object (e.g. `cursor covered by alloc class_id=1748 ns=24
+  REAL_size=424 mid-object offset=240`), reached after **striding regions the sweep
+  ZEROED in a prior cycle** (`prior slot was FREED by the sweep`). A 424-byte zeroed
+  region reads as consecutive 40-byte all-zero `Object`s; 424 isn't a multiple of 40,
+  so the walk oversteps off the object grid into a live legacy object's `Value`-cell
+  data (disc=4 Object tag → the `class_id=4, array_length=1` false-positive header).
+  **The walk desync is a downstream SYMPTOM, benign (it re-syncs / over-retains).**
+- **The FATAL cause** is upstream: the crash is preceded by a **64,145-event flood**
+  of `Stale pointer detected in invokevirtual receiver (all-zero header) — falling
+  back to CP class java/util/concurrent/locks/AbstractQueuedSynchronizer$ConditionNode`
+  (and `$ConditionObject`). So the objects the sweep reclaims **while still live** are
+  AQS `ConditionNode`/`ConditionObject` held by **parked Tomcat worker threads** (in
+  JIT-compiled `ConditionObject.await()` → `LockSupport.park`). Those regions are then
+  zeroed+freed, and their zeroed spans are what desync the walk.
+
+This is **exactly** the documented AQS blocked-thread register-invisibility residual
+(`reference_tomcat_dohead_aqs_blocked_jit_register_root`): the JIT `await` keeps the
+`ConditionNode` oop in a **callee-saved register** across `park`, never spilled to the
+frame; during executor shutdown the AQS sync queue is torn down so the node is
+heap-unreachable; and `deposit_root_snapshot`'s conservative frame scan
+(`scan_active_jit_frames`, vm_exec.rs ~1287 — the 24cf0b19 fix IS present here) sees
+only the frame/spill region, not the register. The large-write DoHead load amplifies
+the churn, so the memory's post-fix ~2-108 flood becomes ~64k here.
+
+Why the mitigations don't work: `SAFEPOINT_REG_SPILL=all` should spill the register at
+the `park` call site, but empirically the flood/crash persists (3/6) — the spill is not
+reaching the register-resident `ConditionNode` there (or `park`'s invoke does not emit
+the pre-safepoint spill). Selective promotion is irrelevant (reclamation, not
+relocation). The **real fix is precise oop maps / shadow stack** (deferred;
+`CRATONVM_SHADOW_STACK` is experimental/non-production) — OR a targeted heap root that
+keeps a thread's parked-on `ConditionObject`+node chain reachable across `park` (cf.
+the BUG-W `pin_native_root` pattern for `monitor_wait`).
+
+## How to reproduce the diagnosis
+
+`CRATONVM_DBG_A2=1` at -Xmx500m (does NOT suppress). Then:
+`grep 'ConditionNode\|ConditionObject' <FQN>.log.err | wc -l` → the flood;
+`grep '\[A2\] BREADCRUMB' <FQN>.log.err` → mid-object offsets + `mismatch=0`.
+
+Related: `reference_tomcat_dohead_aqs_blocked_jit_register_root`,
+`fork6-fjp-multithread-jit-root-reclamation.md`,
+`gc-blocked-thread-frame-stale-thread-mirror.md`. Precise oop maps / shadow stack are
+the deferred "real fix".
+
+## Repro
+
+```
+cd apps/tomcat-suite-runner
+# crashes ~2-3 of 6 runs; use -Xmx500m and count NOSUMMARY/FAIL, not corruption warnings
+.\run-tomcat-suite.ps1 -Vm craton -Jit on -Jdk real -Category all -RunName dohead `
+  -Start 38 -Count 1 -TimeoutSec 150 -Parallel 1 -MaxHeap 500m -Exe <cratonvm.exe>
+# logs: apps/tomcat/.suite/results/dohead/real-jit/<FQN>.log(.err)
+```
+`--nojit` is the clean control (never corrupts). Do NOT run bt benchmarks or other
+VMs concurrently with the repro — CPU contention perturbs the timing-sensitive
+window and produces exit-code-5 / false-clean runs.

@@ -159,6 +159,40 @@ pub static A2_PROBE_HITS: AtomicU64 = AtomicU64::new(0);
 /// walk-desync root). Exposed for the gated diagnostic + tests.
 pub static A2_FL_OVERLAP_HITS: AtomicU64 = AtomicU64::new(0);
 
+/// DoHead walk-desync hardening (2026-07-02) — count of times a linear young
+/// from-space walk OVERSHOT into a known free block (`cursor > off`). Each hit
+/// is proof the walk grid and the free list disagreed upstream (an unlisted
+/// zeroed span or a mis-sized header) — the seed of the phantom-stride /
+/// mid-live-object free corruption family. Kept as a plain counter so a
+/// repro run can grep it without a debug gate.
+pub static SWEEP_WALK_OVERSHOOT_HITS: AtomicU64 = AtomicU64::new(0);
+
+/// DoHead walk-desync hardening — count of all-zero spans (word0 == 0 at a
+/// walk-grid offset, at least `HEADER_SIZE` of zero bytes) encountered by a
+/// young walk OUTSIDE the free list. These are freed-then-reused-then-
+/// clobbered slots or freed-but-unlisted residue; they are SKIPPED (never
+/// re-freed, never zeroed — the span may be a live allocation whose header a
+/// stale register-held reference clobbered, so re-freeing would double-serve
+/// live memory).
+pub static SWEEP_ZERO_SPAN_HITS: AtomicU64 = AtomicU64::new(0);
+
+/// DoHead walk-desync hardening — count of forwarded young objects whose
+/// forwarding target failed validation (not inside old gen). Such a header is
+/// a phantom write from a desynced walk or corruption; the span is retained
+/// instead of zeroed+freed.
+pub static SWEEP_BAD_FORWARD_HITS: AtomicU64 = AtomicU64::new(0);
+
+/// DoHead walk-desync hardening — count of selective-promotion UNWIND events:
+/// the evacuation walk saw a grid anomaly (zero span, implausible header,
+/// free-block overshoot, or a span crossing a free hole) and dropped the
+/// candidates collected since the last trustworthy anchor (a free-block
+/// boundary). Their forwarding pointers were never installed (installs are
+/// deferred until a stretch is anchor-verified); the already-copied old-gen
+/// bytes are unreachable garbage for the next major GC. Candidates on
+/// verified stretches still promote, so a persistent unparseable span cannot
+/// starve promotion.
+pub static SWEEP_PROMOTION_ABORT_HITS: AtomicU64 = AtomicU64::new(0);
+
 /// DBG: optional young-GC stress threshold (bytes). Read from
 /// `CRATONVM_DBG_GC_STRESS`, or `CRATONVM_GC_STRESS` as an accepted alias
 /// (the latter is what several handoff/repro docs use; without the alias the
@@ -4097,22 +4131,87 @@ impl GenerationalHeap {
                 }
             }
 
-            // (2) Evacuate non-pinned marked survivors to old gen. Install a
-            // forwarding pointer in each young source; record young→old in
-            // `evac_map` (returned for the VM-level remap). Stop if old gen
-            // fills (leave the remainder in young — correctness over completeness).
+            // (2) Evacuate non-pinned marked survivors to old gen. Record
+            // young→old in `evac_map` (returned for the VM-level remap). Stop
+            // if old gen fills (leave the remainder in young — correctness
+            // over completeness).
+            //
+            // DoHead walk-desync hardening (2026-07-02): forwarding-pointer
+            // installs into the young sources are DEFERRED and only applied
+            // for candidates collected on ANCHOR-VERIFIED stretches of the
+            // walk grid. The old exact-match free-block skip (`cursor == off`)
+            // wedged after a single overshoot and then strode every later
+            // free block as phantom zeroed "objects" — a phantom that
+            // happened to read as marked+aged was "evacuated" with a
+            // forwarding pointer written INTO a live object's interior, which
+            // the main sweep then zeroed and freed via `is_forwarded()` (the
+            // fatal mid-live-object reclaim). Now: robust skip; every anomaly
+            // (zero span, implausible header, free-block overshoot, span
+            // crossing a free hole) UNWINDS the candidates collected since
+            // the last trustworthy anchor (a free-block boundary) — their
+            // already-copied old-gen bytes become unreachable garbage for the
+            // next major GC — and the walk re-anchors at the next free block.
+            // Candidates between two clean anchors (or between the last
+            // anchor and a clean end-of-walk) are grid-verified and their
+            // installs proceed. This bounds phantom installs without
+            // starving promotion when a persistent unparseable span exists
+            // (only a moving cycle reclaims those). Survivors inside skipped
+            // stretches are handled by pass 3a's conservative rewrite.
             let mut evacuated: Vec<*mut u8> = Vec::new();
+            let mut fwd_installs: Vec<(usize, *mut u8)> = Vec::new();
             {
                 // PERF: reuse the once-computed sorted free-block snapshot.
                 let mut free_iter = sweep_free_blocks.iter().peekable();
                 let used = sweep_used;
                 let mut cursor = 0usize;
                 let mut old_full = false;
+                // Candidate counts at the last trustworthy anchor.
+                let mut fwd_wm = 0usize;
+                let mut evac_wm = 0usize;
+                // Drop candidates collected since the last anchor (suspect
+                // stretch): remove them from evac_map, orphan their copies.
+                fn unwind_evac(
+                    fwd_installs: &mut Vec<(usize, *mut u8)>,
+                    evacuated: &mut Vec<*mut u8>,
+                    evac_map: &mut HashMap<usize, usize>,
+                    fwd_wm: usize,
+                    evac_wm: usize,
+                ) {
+                    if fwd_installs.len() > fwd_wm {
+                        let n = SWEEP_PROMOTION_ABORT_HITS.fetch_add(1, Ordering::Relaxed);
+                        if n < 8 {
+                            tracing::warn!(
+                                "selective promotion: unwound {} candidate(s) collected \
+                                 on a suspect walk stretch (grid anomaly since last anchor)",
+                                fwd_installs.len() - fwd_wm,
+                            );
+                        }
+                        for (src, _) in fwd_installs.drain(fwd_wm..) {
+                            evac_map.remove(&src);
+                        }
+                        evacuated.truncate(evac_wm);
+                    }
+                }
                 while cursor < used && !old_full {
-                    if let Some(&&(off, sz)) = free_iter.peek() {
-                        if cursor == off {
-                            cursor += sz;
-                            free_iter.next();
+                    {
+                        let (resynced, overshot) =
+                            skip_free_blocks(&mut cursor, &mut free_iter);
+                        if overshot {
+                            // The stride that crossed into the block was
+                            // mis-sized: candidates since the last anchor are
+                            // suspect. The cursor now sits at the block end —
+                            // a fresh anchor.
+                            unwind_evac(
+                                &mut fwd_installs,
+                                &mut evacuated,
+                                &mut evac_map,
+                                fwd_wm,
+                                evac_wm,
+                            );
+                        }
+                        if resynced {
+                            fwd_wm = fwd_installs.len();
+                            evac_wm = evacuated.len();
                             continue;
                         }
                     }
@@ -4127,14 +4226,59 @@ impl GenerationalHeap {
                         // SAFETY: offset 4 lies within the >=8-byte gap.
                         let gap = unsafe { std::ptr::read((src as *const u8).add(4) as *const u32) }
                             as usize;
-                        if (8..HEADER_SIZE).contains(&gap) && cursor + gap <= used {
+                        if (8..HEADER_SIZE).contains(&gap)
+                            && gap & 7 == 0
+                            && cursor + gap <= used
+                        {
                             cursor += gap;
                             continue;
                         }
                     }
-                    let total_size = gen_object_total_size(header);
-                    if total_size < HEADER_SIZE || cursor + total_size > used {
+                    // All-zero header word: an unlisted zeroed span (never a
+                    // walkable object unless the zero run is shorter than a
+                    // header — the real `ClassId(0)` container case, which
+                    // parses normally below). Anomaly: unwind candidates since
+                    // the last anchor and re-anchor at the next free block.
+                    let word0 = unsafe { *(src as *const u64) };
+                    let mut anomaly = false;
+                    if word0 == 0 {
+                        let limit =
+                            free_iter.peek().map(|&&(off, _)| off).unwrap_or(used).min(used);
+                        let run_end = zero_run_end(from_base, cursor, limit);
+                        if run_end - cursor >= HEADER_SIZE {
+                            anomaly = true;
+                        }
+                    }
+                    let total_size = if anomaly { 0 } else { gen_object_total_size(header) };
+                    if anomaly || total_size < HEADER_SIZE || cursor + total_size > used {
+                        unwind_evac(
+                            &mut fwd_installs,
+                            &mut evacuated,
+                            &mut evac_map,
+                            fwd_wm,
+                            evac_wm,
+                        );
+                        if resync_to_next_free_block(&mut cursor, &mut free_iter) {
+                            continue;
+                        }
                         break;
+                    }
+                    // Over-sized-header clamp (mirrors the main walk): an
+                    // object can never span a pre-existing free hole. Do not
+                    // evacuate through such a header; candidates since the
+                    // last anchor are suspect.
+                    if let Some(&&(foff, _fsz)) = free_iter.peek() {
+                        if foff > cursor && foff < cursor + total_size {
+                            unwind_evac(
+                                &mut fwd_installs,
+                                &mut evacuated,
+                                &mut evac_map,
+                                fwd_wm,
+                                evac_wm,
+                            );
+                            cursor = foff;
+                            continue;
+                        }
                     }
                     let addr = src as usize;
                     // Only tenure objects that have survived enough GCs
@@ -4167,14 +4311,9 @@ impl GenerationalHeap {
                                 dhdr.forwarding_ptr = std::ptr::null_mut();
                                 dhdr.gc_flags |= GC_FLAG_OLD_GEN;
                                 dhdr.gc_flags &= !GC_FLAG_MARKED;
-                                // Install forwarding pointer in the young source.
-                                // SAFETY: src is a live young object header.
-                                unsafe {
-                                    std::ptr::addr_of_mut!(
-                                        (*(src as *mut ObjectHeader)).forwarding_ptr
-                                    )
-                                    .write(dst);
-                                }
+                                // Forwarding-pointer install into the young
+                                // source is deferred until the walk validates.
+                                fwd_installs.push((addr, dst));
                                 evac_map.insert(addr, dst as usize);
                                 evacuated.push(dst);
                             }
@@ -4182,6 +4321,19 @@ impl GenerationalHeap {
                         }
                     }
                     cursor += total_size;
+                }
+            }
+            // Install forwarding pointers for the surviving candidates —
+            // every entry left in `fwd_installs` was collected on a stretch
+            // whose strides were verified against the next anchor (or a
+            // clean end-of-walk); suspect stretches were unwound above.
+            for &(src_addr, dst) in &fwd_installs {
+                // SAFETY: `src_addr` is a live young object header on an
+                // anchor-verified stretch; writing its forwarding_ptr field
+                // is the install the copy loop deferred.
+                unsafe {
+                    std::ptr::addr_of_mut!((*(src_addr as *mut ObjectHeader)).forwarding_ptr)
+                        .write(dst);
                 }
             }
 
@@ -4252,7 +4404,19 @@ impl GenerationalHeap {
                     // SAFETY: `is_y` confirmed an 8-aligned young address.
                     let h = unsafe { &*(target as *const ObjectHeader) };
                     if h.is_forwarded() {
-                        Some(h.forwarding_address() as usize)
+                        // DoHead walk-desync hardening (2026-07-02): only
+                        // follow forwarding pointers that actually land in
+                        // old gen — selective promotion never forwards
+                        // anywhere else. A corrupt/phantom forwarding field
+                        // (e.g. a span retained by the main sweep's
+                        // bad-forward check in an earlier cycle) must not
+                        // rewrite live references to a garbage target.
+                        let fwd = h.forwarding_ptr;
+                        if old_gen.contains(fwd) {
+                            Some(fwd as usize)
+                        } else {
+                            None
+                        }
                     } else {
                         None
                     }
@@ -4260,18 +4424,43 @@ impl GenerationalHeap {
 
                 // (3a) References inside surviving (pinned / non-evacuated) young
                 // objects → rewrite to the evacuated copies in old gen.
+                //
+                // DoHead walk-desync hardening (2026-07-02): this pass runs
+                // only after the evacuation walk validated the whole grid, so
+                // anomalies here should be impossible — but a wedge in THIS
+                // walk (the old exact-match skip) would leave every survivor
+                // past the wedge un-fixed-up while the main sweep zeroes the
+                // evacuated sources: mass dangling references. Use the same
+                // robust traversal; on an (unexpected) anomaly, re-anchor at
+                // the next free block and keep fixing up rather than break.
                 {
                     // PERF: reuse the once-computed sorted free-block snapshot.
                     let mut free_iter = sweep_free_blocks.iter().peekable();
                     let used = sweep_used;
                     let mut cursor = 0usize;
-                    while cursor < used {
-                        if let Some(&&(off, sz)) = free_iter.peek() {
-                            if cursor == off {
-                                cursor += sz;
-                                free_iter.next();
-                                continue;
+                    // Conservative fallback for a stretch this walk cannot
+                    // parse (the evacuation walk resynced over the same
+                    // stretch, so survivors inside it were not evacuated —
+                    // but they may still REFERENCE evacuated objects, and an
+                    // un-rewritten reference dangles once the main sweep
+                    // zeroes the forwarded sources). Exact-match rewrite of
+                    // any aligned word equal to an evacuated source address.
+                    let rewrite_stretch = |lo: usize, hi: usize| {
+                        let mut w = lo & !7;
+                        while w + 8 <= hi {
+                            // SAFETY: `[from_base+lo, from_base+hi)` is mapped
+                            // from-space memory.
+                            let cell = (from_base + w) as *mut u64;
+                            let word = unsafe { *cell } as usize;
+                            if let Some(&dst) = evac_map.get(&word) {
+                                unsafe { *cell = dst as u64 };
                             }
+                            w += 8;
+                        }
+                    };
+                    while cursor < used {
+                        if skip_free_blocks(&mut cursor, &mut free_iter).0 {
+                            continue;
                         }
                         let obj = (from_base + cursor) as *mut u8;
                         // SAFETY: cursor within used; from-space mapped.
@@ -4283,13 +4472,34 @@ impl GenerationalHeap {
                             let gap =
                                 unsafe { std::ptr::read((obj as *const u8).add(4) as *const u32) }
                                     as usize;
-                            if (8..HEADER_SIZE).contains(&gap) && cursor + gap <= used {
+                            if (8..HEADER_SIZE).contains(&gap) && gap & 7 == 0 && cursor + gap <= used {
                                 cursor += gap;
                                 continue;
                             }
                         }
-                        let total_size = gen_object_total_size(header);
-                        if total_size < HEADER_SIZE || cursor + total_size > used {
+                        let word0 = unsafe { *(obj as *const u64) };
+                        let mut anomaly = false;
+                        if word0 == 0 {
+                            let limit = free_iter
+                                .peek()
+                                .map(|&&(off, _)| off)
+                                .unwrap_or(used)
+                                .min(used);
+                            let run_end = zero_run_end(from_base, cursor, limit);
+                            if run_end - cursor >= HEADER_SIZE {
+                                anomaly = true;
+                            }
+                        }
+                        let total_size =
+                            if anomaly { 0 } else { gen_object_total_size(header) };
+                        if anomaly || total_size < HEADER_SIZE || cursor + total_size > used {
+                            let stretch_lo = cursor;
+                            let resynced = resync_to_next_free_block(&mut cursor, &mut free_iter);
+                            let stretch_hi = if resynced { cursor } else { used };
+                            rewrite_stretch(stretch_lo, stretch_hi);
+                            if resynced {
+                                continue;
+                            }
                             break;
                         }
                         if header.gc_flags & GC_FLAG_MARKED != 0 && !header.is_forwarded() {
@@ -4369,12 +4579,9 @@ impl GenerationalHeap {
                     let used = sweep_used;
                     let mut c = 0usize;
                     while c < used {
-                        if let Some(&&(off, sz)) = fi.peek() {
-                            if c == off {
-                                c += sz;
-                                fi.next();
-                                continue;
-                            }
+                        // DoHead hardening: robust skip (see skip_free_blocks).
+                        if skip_free_blocks(&mut c, &mut fi).0 {
+                            continue;
                         }
                         let o = (from_base + c) as *mut u8;
                         // SAFETY: `c < used` and the free-block list skips reclaimed gaps,
@@ -4505,12 +4712,9 @@ impl GenerationalHeap {
                 let used_dbg = young_from.used();
                 let mut c = 0usize;
                 while c < used_dbg {
-                    if let Some(&&(off, sz)) = free_it.peek() {
-                        if c == off {
-                            c += sz;
-                            free_it.next();
-                            continue;
-                        }
+                    // DoHead hardening: robust skip (see skip_free_blocks).
+                    if skip_free_blocks(&mut c, &mut free_it).0 {
+                        continue;
                     }
                     let optr = (from_base + c) as *mut u8;
                     // SAFETY: `c < used_dbg` and the free-block list skips reclaimed gaps,
@@ -4635,9 +4839,20 @@ impl GenerationalHeap {
                 }
             }
         }
-        let mut dead_regions: Vec<(usize, usize)> = Vec::new();
+        // (offset, size, class_id, kind_byte) of every span the walk decided
+        // to reclaim. DoHead walk-desync hardening (2026-07-02): zeroing and
+        // free-list publication are DEFERRED to the publication loop after the
+        // walk, so that a later-detected grid anomaly (free-block overshoot /
+        // implausible header) can UNWIND the suspect entries collected since
+        // the last trustworthy anchor (`dead_watermark`) instead of having
+        // already zeroed what may be a live object's interior.
+        let mut dead_regions: Vec<(usize, usize, u32, u8)> = Vec::new();
         let mut bytes_swept: usize = 0;
         let mut objects_swept: usize = 0;
+        // Index into `dead_regions` at the last trustworthy walk anchor
+        // (walk start, or the end of a known free block). Entries above the
+        // watermark were collected while striding an unverified stretch.
+        let mut dead_watermark: usize = 0;
         let mut objects_live: usize = 0;
 
         let mut cursor: usize = 0;
@@ -4669,25 +4884,19 @@ impl GenerationalHeap {
             // Now: drop free blocks the cursor has wholly passed, and if the cursor
             // lands AT or INSIDE a free block, resync to that block's end.
             {
-                let mut resynced = false;
-                while let Some(&&(off, sz)) = free_iter.peek() {
-                    if cursor >= off + sz {
-                        // Walk is already past this entire free block — drop it and
-                        // re-examine the next one.
-                        free_iter.next();
-                        continue;
-                    }
-                    if cursor >= off {
-                        // Cursor is within `[off, off + sz)` — skip the remainder of
-                        // this free block and resync the walk to a real boundary.
-                        cursor = off + sz;
-                        free_iter.next();
-                        resynced = true;
-                    }
-                    // `cursor < off`: the next free block is still ahead; stop.
-                    break;
+                let (resynced, overshot) = skip_free_blocks(&mut cursor, &mut free_iter);
+                if overshot {
+                    // The previous stride ran INTO a known free block: the
+                    // walk grid broke somewhere after the last anchor, so
+                    // every reclaim decision made since then is suspect —
+                    // it may cover a live object's interior. Unwind them
+                    // (they have not been zeroed or published yet;
+                    // over-retention is always safe under this sweep).
+                    dead_regions.truncate(dead_watermark);
                 }
                 if resynced {
+                    // A free block's end is ground truth — a fresh anchor.
+                    dead_watermark = dead_regions.len();
                     continue;
                 }
             }
@@ -4716,12 +4925,60 @@ impl GenerationalHeap {
                 // SAFETY: offset 4 lies within the >=8-byte gap.
                 let gap =
                     unsafe { std::ptr::read((obj_ptr as *const u8).add(4) as *const u32) } as usize;
-                if (8..HEADER_SIZE).contains(&gap) && cursor + gap <= used {
+                if (8..HEADER_SIZE).contains(&gap) && gap & 7 == 0 && cursor + gap <= used {
                     cursor += gap;
                     continue;
                 }
                 // Malformed sentinel (should be impossible) — fall through to
                 // the corrupt-header re-sync path below.
+            }
+            // DoHead walk-desync hardening (2026-07-02): an all-zero header
+            // word at a grid offset is NEVER a walkable object — it is a
+            // reclaimed-then-zeroed span that is missing from the free list
+            // (freed-but-unlisted residue), or a freed-then-REUSED slot whose
+            // new owner's header was clobbered back to zero by a stale
+            // register-held reference (the DoHead AQS family). The old code
+            // strode such spans as 40-byte phantom "objects" and re-FREED
+            // each one: spans are 40+16n bytes, so the final phantom window
+            // crossed the span's end into the next LIVE object's header,
+            // zeroing it and minting a free block inside a live object →
+            // overlapping allocations → UAF. Instead: never parse, never
+            // free (the span may be a live-but-clobbered allocation whose
+            // memory must not be double-served); skip to the next known
+            // free-block anchor and resume on-grid there.
+            let word0 = unsafe { *(obj_ptr as *const u64) };
+            if word0 == 0 {
+                let limit = free_iter.peek().map(|&&(off, _)| off).unwrap_or(used).min(used);
+                let run_end = zero_run_end(from_base, cursor, limit);
+                if run_end - cursor >= HEADER_SIZE {
+                    let n = SWEEP_ZERO_SPAN_HITS.fetch_add(1, Ordering::Relaxed);
+                    if n < 8 {
+                        tracing::warn!(
+                            "non-moving sweep: unlisted all-zero span at offset {} \
+                             (run {} bytes, next anchor at {}) — skipped, not freed",
+                            cursor,
+                            run_end - cursor,
+                            limit,
+                        );
+                    }
+                    // A zero span is anomaly evidence like any other: the
+                    // walk can only claim `cursor` is on-grid if every stride
+                    // since the last anchor was correctly sized — and a
+                    // mis-sized stride landing in a live object's zeroed
+                    // interior produces exactly this signature. Unwind the
+                    // reclaim decisions collected since the anchor
+                    // (over-retention is always safe), then re-anchor at the
+                    // next free block, or stop if no anchor remains.
+                    dead_regions.truncate(dead_watermark);
+                    if resync_to_next_free_block(&mut cursor, &mut free_iter) {
+                        continue;
+                    }
+                    break;
+                }
+                // Zero run shorter than a header: a real `ClassId(0)` ad-hoc
+                // container's header legitimately starts with zero words
+                // (class_id=0, kind=Object, hash=0) but has a non-zero
+                // `num_slots`/`gc_flags` word — parse it normally below.
             }
             let total_size = gen_object_total_size(header);
             // Defensive: a corrupt / zero-size header would desynchronise
@@ -4914,57 +5171,38 @@ impl GenerationalHeap {
                     }
                 }
 
-                // Defensive recovery: instead of `break` (which abandons
-                // the rest of the arena and leaves dead objects unreclaimed
-                // → young exhaust → OOM/SIGSEGV downstream), scan forward
-                // in 8-byte (slot) increments looking for the next
-                // plausible-looking header. This re-syncs the walker past
-                // the corrupted region so the remainder of the arena can
-                // still contribute free spans. The skipped region is left
-                // out of `existing_free` — conservatively treated as live —
-                // and will be recovered by the next major-GC compaction.
-                const MAX_RESYNC_SKIP: usize = 1 << 20; // 1 MiB scan budget
-                const MAX_PLAUSIBLE_OBJ_BYTES: usize = 1 << 28; // 256 MiB sanity ceiling
-                let mut probe = cursor + 8;
-                let mut found = false;
-                while probe + HEADER_SIZE <= used && probe - cursor <= MAX_RESYNC_SKIP {
-                    // SAFETY: probe + HEADER_SIZE <= used, region mapped.
-                    let probe_hdr = unsafe { &*((from_base + probe) as *const ObjectHeader) };
-                    let probe_size = gen_object_total_size(probe_hdr);
-                    let kind_byte = probe_hdr.kind as u8;
-                    if kind_byte <= 1
-                        && (HEADER_SIZE..=MAX_PLAUSIBLE_OBJ_BYTES).contains(&probe_size)
-                        && probe + probe_size <= used
-                        && probe_hdr.num_slots <= (1 << 24)
-                        && probe_hdr.array_length <= i32::MAX as u32
-                    {
-                        tracing::warn!(
-                            "non-moving sweep: RE-SYNCED at offset {} (skipped {} bytes) — \
-                             class_id={} kind=0x{:02x} size={}; abandoned region treated as live, \
-                             will be recovered by next major GC",
-                            probe,
-                            probe - cursor,
-                            probe_hdr.class_id.as_u32(),
-                            probe_hdr.kind as u8,
-                            probe_size,
-                        );
-                        cursor = probe;
-                        found = true;
-                        break;
-                    }
-                    probe += 8;
-                }
-                if !found {
+                // Defensive recovery — DoHead walk-desync hardening
+                // (2026-07-02): re-anchor at the START of the next known
+                // free block instead of the old 8-byte plausibility probe.
+                // The probe's check ACCEPTED an all-zero header (size = 40
+                // passes every bound), so it could "re-sync" onto the first
+                // zeroed word OFF the object grid and resume phantom-freeing
+                // from an arbitrary offset — feeding the very overlap it was
+                // recovering from. Free-block boundaries are the only ground
+                // truth downstream; the stretch up to the anchor is retained
+                // (recovered when a moving collection next resets the space).
+                // The implausible header ALSO means the grid may have broken
+                // BEFORE `cursor` (a mis-sized stride that happened to keep
+                // passing the plausibility checks), so unwind the reclaim
+                // decisions made since the last anchor — they may cover a
+                // live object's interior. They have not been zeroed or
+                // published yet (deferred to the publication loop).
+                dead_regions.truncate(dead_watermark);
+                if resync_to_next_free_block(&mut cursor, &mut free_iter) {
                     tracing::warn!(
-                        "non-moving sweep: no re-sync within {} bytes from offset {} — \
-                         abandoning rest of arena ({} bytes opaque)",
-                        MAX_RESYNC_SKIP,
+                        "non-moving sweep: re-anchored at next free block (offset {}); \
+                         skipped stretch retained until a moving cycle resets from-space",
                         cursor,
-                        used - cursor,
                     );
-                    break;
+                    continue;
                 }
-                continue;
+                tracing::warn!(
+                    "non-moving sweep: no free-block anchor remains after offset {} — \
+                     abandoning rest of arena ({} bytes retained)",
+                    cursor,
+                    used - cursor,
+                );
+                break;
             }
 
             // A2 fix: an object can never span a pre-existing free HOLE (holes are
@@ -4991,6 +5229,11 @@ impl GenerationalHeap {
                         );
                     }
                     A2_FL_OVERLAP_HITS.fetch_add(1, Ordering::Relaxed);
+                    // A hole-crossing header is grid-break evidence: the
+                    // decisions since the last anchor are suspect — unwind
+                    // them (over-retention safe) before re-anchoring at the
+                    // hole, where the skip loop takes over.
+                    dead_regions.truncate(dead_watermark);
                     cursor = foff;
                     continue;
                 }
@@ -5016,18 +5259,31 @@ impl GenerationalHeap {
                 // tested to rule out a register-only dangling read — it did NOT
                 // fix bintrees18's wrong checksum, so the residual corruption is
                 // a structural wrong-address fixup, not a dangling read.)
-                record_swept(
-                    obj_ptr as usize,
-                    header.class_id.as_u32(),
-                    header.kind as u8,
-                    sweep_zero_cycle,
-                );
-                // SAFETY: span within from-space (checked above).
-                unsafe { std::ptr::write_bytes(obj_ptr, 0, total_size) };
-                crate::a2dbg::record_free(obj_ptr as usize);
-                dead_regions.push((cursor, total_size));
-                bytes_swept += total_size;
-                objects_swept += 1;
+                //
+                // DoHead walk-desync hardening (2026-07-02): selective
+                // promotion only ever forwards INTO old gen, so a forwarding
+                // target outside it is a phantom write from a desynced walk
+                // (or header corruption) — retain the span instead of zeroing
+                // and freeing what may be a live object's interior.
+                let fwd = header.forwarding_ptr;
+                if !old_gen.contains(fwd) {
+                    let n = SWEEP_BAD_FORWARD_HITS.fetch_add(1, Ordering::Relaxed);
+                    if n < 8 {
+                        tracing::warn!(
+                            "non-moving sweep: forwarded young object at offset {} has \
+                             non-old-gen target {:p} — retaining span, not freeing",
+                            cursor,
+                            fwd,
+                        );
+                    }
+                } else {
+                    dead_regions.push((
+                        cursor,
+                        total_size,
+                        header.class_id.as_u32(),
+                        header.kind as u8,
+                    ));
+                }
             } else if header.gc_flags & GC_FLAG_MARKED != 0 {
                 // Survivor: clear the mark, keep in place, and age it so the
                 // next sweep can tenure it once it reaches PROMOTION_AGE
@@ -5037,22 +5293,17 @@ impl GenerationalHeap {
                 header.gc_age = header.gc_age.saturating_add(1);
                 objects_live += 1;
             } else {
-                // Dead: zero the whole object span so a later conservative
-                // root scan cannot resurrect a stale header inside the
-                // reclaimed hole, then record it for the free list.
-                record_swept(
-                    obj_ptr as usize,
+                // Dead: record the span for reclamation. Zeroing (so a later
+                // conservative root scan cannot resurrect a stale header
+                // inside the hole) and free-list publication are deferred to
+                // the publication loop below, so a grid anomaly detected
+                // later in the walk can still unwind this decision.
+                dead_regions.push((
+                    cursor,
+                    total_size,
                     header.class_id.as_u32(),
                     header.kind as u8,
-                    sweep_zero_cycle,
-                );
-                // SAFETY: `[obj_ptr, obj_ptr+total_size)` lies within the
-                // live from-space region (checked above).
-                unsafe { std::ptr::write_bytes(obj_ptr, 0, total_size) };
-                crate::a2dbg::record_free(obj_ptr as usize);
-                dead_regions.push((cursor, total_size));
-                bytes_swept += total_size;
-                objects_swept += 1;
+                ));
             }
             cursor += total_size;
         }
@@ -5084,7 +5335,7 @@ impl GenerationalHeap {
         // Either way it is the direct source of the overlapping free blocks the
         // coalescer then has to merge.
         if std::env::var_os("CRATONVM_DBG_A2").is_some() {
-            for &(doff, dsz) in &dead_regions {
+            for &(doff, dsz, _, _) in &dead_regions {
                 for &(foff, fsz) in &existing_free {
                     if doff < foff + fsz && foff < doff + dsz {
                         let n = A2_FL_OVERLAP_HITS.load(Ordering::Relaxed);
@@ -5100,7 +5351,22 @@ impl GenerationalHeap {
                 }
             }
         }
-        for (off, sz) in dead_regions {
+        // DoHead walk-desync hardening (2026-07-02): zeroing was deferred from
+        // the walk's disposition arms to here so that anomaly-triggered
+        // unwinding (dead_regions.truncate above) never has to un-zero.
+        // Everything surviving in `dead_regions` was collected on a verified
+        // stretch of the walk grid. Zero each span (so a later conservative
+        // root scan cannot resurrect a stale header inside the hole) and
+        // publish it to the free list.
+        for &(off, sz, class_id, kind_byte) in &dead_regions {
+            let obj_addr = from_base + off;
+            record_swept(obj_addr, class_id, kind_byte, sweep_zero_cycle);
+            // SAFETY: `[off, off+sz)` lies within the live from-space region
+            // (validated by the walk before the span was collected).
+            unsafe { std::ptr::write_bytes(obj_addr as *mut u8, 0, sz) };
+            crate::a2dbg::record_free(obj_addr);
+            bytes_swept += sz;
+            objects_swept += 1;
             young_from.add_free_block(off, sz);
         }
 
@@ -5116,7 +5382,11 @@ impl GenerationalHeap {
         // the necessary partner of the evacuation above — without it the default-on
         // selective sweep drains young but leaves a 500k-entry free list, so
         // allocation goes O(n) and bt18 throughput collapses (the rc=127 cliff).
-        if selective_on && std::env::var_os("CRATONVM_SP_NO_COALESCE").is_none() {
+        // DoHead walk-desync hardening (2026-07-02): run the coalescer (and
+        // its overlap-merge safety invariant, 6e3ddb05) regardless of
+        // `selective_on` — with promotion disabled the free list still
+        // fragments and overlapping blocks would still double-serve.
+        if std::env::var_os("CRATONVM_SP_NO_COALESCE").is_none() {
             let sorted = young_from.free_blocks_sorted();
             if sorted.len() > 1 {
                 young_from.clear_free_list();
@@ -5313,13 +5583,23 @@ impl GenerationalHeap {
         let free_blocks = young_from.free_blocks_sorted();
         let mut free_iter = free_blocks.iter().peekable();
         let mut cursor: usize = 0;
-        while cursor < young_from.used() {
-            if let Some(&&(off, sz)) = free_iter.peek() {
-                if cursor == off {
-                    cursor += sz;
-                    free_iter.next();
-                    continue;
-                }
+        let base = young_from.base_ptr() as usize;
+        let used = young_from.used();
+        // DoHead walk-desync hardening (2026-07-02): a stretch this walk
+        // cannot parse (zero span / implausible header) must NOT be silently
+        // dropped — an old object referenced only from that stretch would go
+        // unmarked and be freed by the compaction (use-after-free). Fall back
+        // to a conservative word scan of the stretch: mark every aligned word
+        // that is EXACTLY an old-gen object base. Over-marking is always
+        // safe; base validation is mandatory (`OldGen::contains` is a raw
+        // range check, so an interior/colliding word would otherwise get a
+        // mark-bit write into a live object's payload and feed a garbage
+        // "header" into the BFS). The sorted base list is built lazily — only
+        // sweeps that actually hit an unparseable stretch pay for it.
+        let mut old_bases: Option<Vec<usize>> = None;
+        while cursor < used {
+            if skip_free_blocks(&mut cursor, &mut free_iter).0 {
+                continue;
             }
             // SAFETY: `cursor` is within `young_from.used()`; pointer arithmetic stays in the arena.
             let obj_ptr = unsafe { young_from.base_ptr().add(cursor) as *mut u8 };
@@ -5333,13 +5613,55 @@ impl GenerationalHeap {
                 // SAFETY: offset 4 lies within the >=8-byte gap.
                 let gap =
                     unsafe { std::ptr::read((obj_ptr as *const u8).add(4) as *const u32) } as usize;
-                if (8..HEADER_SIZE).contains(&gap) && cursor + gap <= young_from.used() {
+                if (8..HEADER_SIZE).contains(&gap) && gap & 7 == 0 && cursor + gap <= used {
                     cursor += gap;
                     continue;
                 }
             }
-            let total_size = gen_object_total_size(header);
-            if total_size < HEADER_SIZE {
+            // Unlisted zeroed span (see the sweep walk): zero words carry no
+            // old-gen refs, so re-anchor at the next free block; the
+            // remainder up to the anchor is conservatively word-scanned.
+            let word0 = unsafe { *(obj_ptr as *const u64) };
+            let mut anomaly = false;
+            if word0 == 0 {
+                let limit = free_iter.peek().map(|&&(off, _)| off).unwrap_or(used).min(used);
+                let run_end = zero_run_end(base, cursor, limit);
+                if run_end - cursor >= HEADER_SIZE {
+                    anomaly = true;
+                }
+            }
+            let total_size = if anomaly { 0 } else { gen_object_total_size(header) };
+            if anomaly || total_size < HEADER_SIZE || cursor + total_size > used {
+                let stretch_lo = cursor;
+                let resynced = resync_to_next_free_block(&mut cursor, &mut free_iter);
+                let stretch_hi = if resynced { cursor } else { used };
+                let bases = old_bases.get_or_insert_with(|| {
+                    let mut v: Vec<usize> = old_gen
+                        .walk_objects()
+                        .into_iter()
+                        .map(|(p, _)| p as usize)
+                        .collect();
+                    v.sort_unstable();
+                    v
+                });
+                let mut w = stretch_lo & !7;
+                while w + 8 <= stretch_hi {
+                    // SAFETY: `[base+w, base+w+8)` is mapped from-space memory.
+                    let word = unsafe { *((base + w) as *const u64) } as usize;
+                    if bases.binary_search(&word).is_ok() {
+                        // SAFETY: `word` is a verified old-gen object BASE;
+                        // its header is valid and mutable for marking.
+                        let ref_header = unsafe { &mut *(word as *mut ObjectHeader) };
+                        if ref_header.gc_flags & GC_FLAG_MARKED == 0 {
+                            ref_header.gc_flags |= GC_FLAG_MARKED;
+                            worklist.push(word as *mut u8);
+                        }
+                    }
+                    w += 8;
+                }
+                if resynced {
+                    continue;
+                }
                 break;
             }
 
@@ -5397,13 +5719,31 @@ impl GenerationalHeap {
         let free_blocks = young_from.free_blocks_sorted();
         let mut free_iter = free_blocks.iter().peekable();
         let mut cursor: usize = 0;
-        while cursor < young_from.used() {
-            if let Some(&&(off, sz)) = free_iter.peek() {
-                if cursor == off {
-                    cursor += sz;
-                    free_iter.next();
-                    continue;
+        let base = young_from.base_ptr() as usize;
+        let used = young_from.used();
+        // DoHead walk-desync hardening (2026-07-02): a stretch this walk
+        // cannot parse must not be dropped — a stale reference to a MOVED
+        // old-gen object is a guaranteed dangling pointer. Fall back to a
+        // conservative word rewrite over the stretch: any aligned word that
+        // exactly matches a relocated old address is rewritten to the new
+        // address. (A primitive that happens to equal a moved object's old
+        // address would be corrupted — vanishingly unlikely — whereas an
+        // unrewritten real reference is a certain use-after-free.)
+        let rewrite_stretch_conservatively = |lo: usize, hi: usize| {
+            let mut w = lo & !7;
+            while w + 8 <= hi {
+                // SAFETY: `[base+lo, base+hi)` is mapped from-space memory.
+                let cell = (base + w) as *mut u64;
+                let word = unsafe { *cell } as usize;
+                if let Some(&new_addr) = compact_map.get(&word) {
+                    unsafe { *cell = new_addr as u64 };
                 }
+                w += 8;
+            }
+        };
+        while cursor < used {
+            if skip_free_blocks(&mut cursor, &mut free_iter).0 {
+                continue;
             }
             // SAFETY: `cursor` is within `young_from.used()`; pointer arithmetic stays in the arena.
             let obj_ptr = unsafe { young_from.base_ptr().add(cursor) as *mut u8 };
@@ -5417,13 +5757,29 @@ impl GenerationalHeap {
                 // SAFETY: offset 4 lies within the >=8-byte gap.
                 let gap =
                     unsafe { std::ptr::read((obj_ptr as *const u8).add(4) as *const u32) } as usize;
-                if (8..HEADER_SIZE).contains(&gap) && cursor + gap <= young_from.used() {
+                if (8..HEADER_SIZE).contains(&gap) && gap & 7 == 0 && cursor + gap <= used {
                     cursor += gap;
                     continue;
                 }
             }
-            let total_size = gen_object_total_size(header);
-            if total_size < HEADER_SIZE {
+            let word0 = unsafe { *(obj_ptr as *const u64) };
+            let mut anomaly = false;
+            if word0 == 0 {
+                let limit = free_iter.peek().map(|&&(off, _)| off).unwrap_or(used).min(used);
+                let run_end = zero_run_end(base, cursor, limit);
+                if run_end - cursor >= HEADER_SIZE {
+                    anomaly = true;
+                }
+            }
+            let total_size = if anomaly { 0 } else { gen_object_total_size(header) };
+            if anomaly || total_size < HEADER_SIZE || cursor + total_size > used {
+                let stretch_lo = cursor;
+                let resynced = resync_to_next_free_block(&mut cursor, &mut free_iter);
+                let stretch_hi = if resynced { cursor } else { used };
+                rewrite_stretch_conservatively(stretch_lo, stretch_hi);
+                if resynced {
+                    continue;
+                }
                 break;
             }
 
@@ -6246,13 +6602,10 @@ impl GenerationalHeap {
             let mut offset: usize = 0;
             while offset < used {
                 // Skip known free blocks — their bytes are stale dead spans and
-                // must never be parsed as object headers.
-                if let Some(&&(off, sz)) = free_iter.peek() {
-                    if offset == off {
-                        offset += sz;
-                        free_iter.next();
-                        continue;
-                    }
+                // must never be parsed as object headers. DoHead walk-desync
+                // hardening (2026-07-02): robust skip (handles overshoot).
+                if skip_free_blocks(&mut offset, &mut free_iter).0 {
+                    continue;
                 }
                 let ptr = (base + offset) as *mut u8;
                 // SAFETY: `ptr` is within `young_from.used()` region; reading the header is valid.
@@ -6276,19 +6629,36 @@ impl GenerationalHeap {
                     // SAFETY: offset 4 lies within the >=8-byte gap.
                     let gap =
                         unsafe { std::ptr::read((ptr as *const u8).add(4) as *const u32) } as usize;
-                    if (8..HEADER_SIZE).contains(&gap) && offset + gap <= used {
+                    if (8..HEADER_SIZE).contains(&gap) && gap & 7 == 0 && offset + gap <= used {
                         offset += gap;
                         continue;
                     }
                     // Malformed sentinel (should be impossible) — fall through to
                     // the corrupt-header stop below.
                 }
+                // DoHead walk-desync hardening (2026-07-02): an unlisted
+                // zeroed span is not parseable — re-anchor at the next free
+                // block instead of breaking (which would silently drop every
+                // later object from the enumeration) or striding phantoms.
+                let word0 = unsafe { *(ptr as *const u64) };
+                let mut anomaly = false;
+                if word0 == 0 {
+                    let limit =
+                        free_iter.peek().map(|&&(off, _)| off).unwrap_or(used).min(used);
+                    let run_end = zero_run_end(base, offset, limit);
+                    if run_end - offset >= HEADER_SIZE {
+                        anomaly = true;
+                    }
+                }
                 // `gen_object_total_size` returns 0 for an array with an
                 // implausible length or a kind=Object header with a non-zero
                 // array_length / oversized num_slots; the `< HEADER_SIZE` check
-                // below then stops the walk cleanly (matching the sweep).
-                let total_size = gen_object_total_size(header);
-                if total_size < HEADER_SIZE || offset + total_size > used {
+                // below then re-anchors the walk (matching the sweep).
+                let total_size = if anomaly { 0 } else { gen_object_total_size(header) };
+                if anomaly || total_size < HEADER_SIZE || offset + total_size > used {
+                    if resync_to_next_free_block(&mut offset, &mut free_iter) {
+                        continue;
+                    }
                     break;
                 }
                 result.push((ptr, total_size));
@@ -6804,6 +7174,123 @@ pub(crate) unsafe fn forward_ref_slots(
 /// zero-size or out-of-range header stops the walk (we cannot safely
 /// continue past unknown structure), but every header we *did* reach gets
 /// its mark cleared. Cheap (one byte per header) and idempotent.
+/// DoHead walk-desync hardening (2026-07-02): robust free-block skip shared by
+/// every linear young from-space walk.
+///
+/// Advances `free_iter` past blocks the cursor has wholly passed; if the
+/// cursor sits AT or INSIDE a block, jumps the cursor to the block's end.
+/// Returns `(resynced, overshot)`: `resynced` means the cursor moved (the
+/// caller must `continue` its loop); `overshot` means the cursor was found
+/// STRICTLY INSIDE a block (`cursor > off`) — proof that an earlier stride
+/// was mis-sized and everything parsed since the previous anchor is suspect.
+///
+/// This generalizes the main sweep's robust skip: the old exact-match skip
+/// (`cursor == off`) wedged its iterator forever after a single overshoot,
+/// after which every later free block was walked as a run of zeroed 40-byte
+/// phantom `Object`s (class_id=0, num_slots=0 → size 40) — the A2 / ReflRepro
+/// / DoHead walk-desync corruption family.
+#[inline]
+fn skip_free_blocks(
+    cursor: &mut usize,
+    free_iter: &mut std::iter::Peekable<std::slice::Iter<'_, (usize, usize)>>,
+) -> (bool, bool) {
+    let mut resynced = false;
+    let mut overshot = false;
+    while let Some(&&(off, sz)) = free_iter.peek() {
+        if *cursor >= off + sz {
+            // Walk is already past this entire free block — drop it and
+            // re-examine the next one.
+            free_iter.next();
+            continue;
+        }
+        if *cursor >= off {
+            if *cursor > off {
+                overshot = true;
+                let n = SWEEP_WALK_OVERSHOOT_HITS.fetch_add(1, Ordering::Relaxed);
+                if n < 8 {
+                    tracing::warn!(
+                        "young walk: cursor {} overshot into free block [{}, {}) — \
+                         resynced at block end (walk grid / free list disagree upstream)",
+                        *cursor,
+                        off,
+                        off + sz,
+                    );
+                }
+            }
+            // Cursor is within `[off, off + sz)` — skip the remainder of this
+            // free block and resync the walk to a real boundary.
+            *cursor = off + sz;
+            free_iter.next();
+            resynced = true;
+        }
+        // `cursor < off`: the next free block is still ahead; stop.
+        break;
+    }
+    (resynced, overshot)
+}
+
+/// DoHead walk-desync hardening: measure the all-zero run starting at
+/// `start` (an 8-aligned walk-grid offset), in 8-byte words, capped at
+/// `limit`. Returns the run's END offset (always 8-aligned unless the run
+/// reaches an unaligned `limit` exactly). A run `>= HEADER_SIZE` at a grid
+/// offset can never be a legally allocated object header in place — real
+/// headers have a non-zero first word (`class_id | kind | element_type`) or,
+/// for the zero-slot `ClassId(0)` ad-hoc container, at most `HEADER_SIZE`
+/// zero bytes followed by the next real header.
+///
+/// The caller must guarantee `[base+start, base+limit)` is mapped arena
+/// memory (both offsets within the arena's committed capacity).
+#[inline]
+fn zero_run_end(base: usize, start: usize, limit: usize) -> usize {
+    let mut r = start;
+    // SAFETY (caller contract): the scanned range is mapped arena memory.
+    while r + 8 <= limit && unsafe { *((base + r) as *const u64) } == 0 {
+        r += 8;
+    }
+    if r < limit && limit - r < 8 {
+        // Sub-word tail before `limit`: absorb it only if fully zero, so a
+        // run ending exactly at a free-block boundary is reported as such.
+        let all_zero =
+            (r..limit).all(|i| unsafe { *((base + i) as *const u8) } == 0);
+        if all_zero {
+            r = limit;
+        }
+    }
+    r
+}
+
+/// DoHead walk-desync hardening: after a walk anomaly (zero span or
+/// implausible header), re-anchor the cursor at the START of the next known
+/// free block — the only downstream offsets that are ground truth — leaving
+/// `[old cursor, anchor)` unparsed (conservatively retained). Returns `false`
+/// when no anchor remains (caller should stop its walk; the remainder of the
+/// arena is retained). The byte-pattern re-sync probe this replaces could
+/// lock onto arbitrary zeroed words OFF the object grid (its plausibility
+/// check accepts an all-zero header) and resume freeing from there.
+#[inline]
+fn resync_to_next_free_block(
+    cursor: &mut usize,
+    free_iter: &mut std::iter::Peekable<std::slice::Iter<'_, (usize, usize)>>,
+) -> bool {
+    while let Some(&&(off, sz)) = free_iter.peek() {
+        if off + sz <= *cursor {
+            free_iter.next();
+            continue;
+        }
+        if *cursor > off {
+            // Already inside the block — resume on-grid at its end.
+            *cursor = off + sz;
+            free_iter.next();
+        } else {
+            // Land ON the block start; the caller's skip loop consumes it
+            // and resumes on-grid at its end.
+            *cursor = off;
+        }
+        return true;
+    }
+    false
+}
+
 fn clear_all_mark_bits_in_arena(arena: &mut Arena) {
     let base = arena.base_ptr() as usize;
     let used = arena.used();
@@ -6812,13 +7299,12 @@ fn clear_all_mark_bits_in_arena(arena: &mut Arena) {
     let mut cursor: usize = 0;
     while cursor < used {
         // Skip known free blocks — their bytes are stale and must not be
-        // parsed as object headers.
-        if let Some(&&(off, sz)) = free_iter.peek() {
-            if cursor == off {
-                cursor += sz;
-                free_iter.next();
-                continue;
-            }
+        // parsed as object headers. DoHead walk-desync hardening
+        // (2026-07-02): robust skip — the old exact-match wedged after one
+        // overshoot and then CLEARED "mark bits" (a byte write at header
+        // offset 21) through phantom headers inside live objects.
+        if skip_free_blocks(&mut cursor, &mut free_iter).0 {
+            continue;
         }
         // `cursor` is within `used`; the arena's `[base, base+used)` region
         // is backed by mapped, allocated memory. The integer-to-pointer cast
@@ -6838,20 +7324,32 @@ fn clear_all_mark_bits_in_arena(arena: &mut Arena) {
             // SAFETY: offset 4 lies within the >=8-byte gap.
             let gap =
                 unsafe { std::ptr::read((obj_ptr as *const u8).add(4) as *const u32) } as usize;
-            if (8..HEADER_SIZE).contains(&gap) && cursor + gap <= used {
+            if (8..HEADER_SIZE).contains(&gap) && gap & 7 == 0 && cursor + gap <= used {
                 cursor += gap;
                 continue;
             }
         }
-        let total_size = gen_object_total_size(header);
-        if total_size < HEADER_SIZE || cursor + total_size > used {
-            // Corruption — same defence as the sweep loop. Stop rather than
-            // risk parsing arbitrary bytes as a header. Any marks past this
-            // point remain, but on the normal-completion path of the sweep
-            // this branch is unreachable; on the break path the sweep
-            // already abandoned freeing past this offset for the same
-            // reason, so any retained mark is no worse than the sweep's own
-            // pre-existing conservativism.
+        // DoHead walk-desync hardening (2026-07-02): an unlisted zeroed span
+        // is not parseable — re-anchor at the next free block (carries no
+        // mark bits to clear) instead of striding it as phantom objects and
+        // writing the mark-clear byte into live-object interiors.
+        let word0 = unsafe { *(obj_ptr as *const u64) };
+        let mut anomaly = false;
+        if word0 == 0 {
+            let limit = free_iter.peek().map(|&&(off, _)| off).unwrap_or(used).min(used);
+            let run_end = zero_run_end(base, cursor, limit);
+            if run_end - cursor >= HEADER_SIZE {
+                anomaly = true;
+            }
+        }
+        let total_size = if anomaly { 0 } else { gen_object_total_size(header) };
+        if anomaly || total_size < HEADER_SIZE || cursor + total_size > used {
+            // Corruption — same defence as the sweep loop: re-anchor at the
+            // next free block rather than risk parsing arbitrary bytes as a
+            // header (marks in the skipped stretch remain — retention only).
+            if resync_to_next_free_block(&mut cursor, &mut free_iter) {
+                continue;
+            }
             break;
         }
         header.gc_flags &= !GC_FLAG_MARKED;
