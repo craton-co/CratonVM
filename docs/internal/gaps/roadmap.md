@@ -16,14 +16,14 @@ CRATONVM_JIT_THRESHOLD=1`. All Java LTS versions through Java 25 are supported:
 
 ### Current Benchmark (vs HotSpot JDK 25 C2)
 
-| Benchmark | JDK 25 C2 | CratonVM default | Default ratio | CratonVM OSR, threshold=1 | OSR ratio |
-|-----------|-----------|------------------|---------------|---------------------------|-----------|
-| Arithmetic 300M | 991 ms | 73,820 ms | 74.5x | 1,534 ms | 1.55x |
-| Fibonacci(42) | 2,071 ms | 28,969 ms | 14.0x | 28,525 ms | 13.8x |
-| Sieve 100Kx500 | 358 ms | 31,665 ms | 88.4x | 466 ms | 1.30x |
-| Matrix 500x500 | 336 ms | 39,078 ms | 116.3x | 452 ms | 1.35x |
-| **QuickBench TOTAL** | **3,756 ms** | **173,532 ms** | **46.2x** | **30,977 ms** | **8.25x** |
-| Binary Trees (depth=18) | 681 ms | 19,737 ms | 29.0x | 36,665 ms | 53.8x |
+| Benchmark               | JDK 25 C2    | CratonVM default | Default ratio | CratonVM OSR, threshold=1 | OSR ratio |
+|-------------------------|--------------|------------------|---------------|---------------------------|-----------|
+| Arithmetic 300M         | 991 ms       | 73,820 ms        | 74.5x         | 1,534 ms                  | 1.55x     |
+| Fibonacci(42)           | 2,071 ms     | 28,969 ms        | 14.0x         | 28,525 ms                 | 13.8x     |
+| Sieve 100Kx500          | 358 ms       | 31,665 ms        | 88.4x         | 466 ms                    | 1.30x     |
+| Matrix 500x500          | 336 ms       | 39,078 ms        | 116.3x        | 452 ms                    | 1.35x     |
+| **QuickBench TOTAL**    | **3,756 ms** | **173,532 ms**   | **46.2x**     | **30,977 ms**             | **8.25x** |
+| Binary Trees (depth=18) | 681 ms       | 19,737 ms        | 29.0x         | 36,665 ms                 | 53.8x     |
 
 *Measured 2026-07-02 on Windows 11, JDK 25.0.1 LTS vs CratonVM release build `b80c50b5`. The benchmark sources are the historical `bench/QuickBench.java` and `bench/binarytrees.java` from commit `2cea208`; `bench/` is currently untracked.*
 

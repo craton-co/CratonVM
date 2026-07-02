@@ -12,14 +12,14 @@ with hardware, OS load, JDK version, and VM configuration.
 parity). The OSR column sets `CRATONVM_JIT_OSR=1` and
 `CRATONVM_JIT_THRESHOLD=1`.*
 
-| Benchmark | JDK 25 C2 | CratonVM default | Default ratio | CratonVM OSR, threshold=1 | OSR ratio |
-|-----------|-----------|------------------|---------------|---------------------------|-----------|
-| Arithmetic (300M ops) | 991 ms | 73,820 ms | 74.5x | 1,534 ms | 1.55x |
-| Fibonacci(42), recursive | 2,071 ms | 28,969 ms | 14.0x | 28,525 ms | 13.8x |
-| Sieve (100K x 500 reps) | 358 ms | 31,665 ms | 88.4x | 466 ms | 1.30x |
-| Matrix 500x500 multiply | 336 ms | 39,078 ms | 116.3x | 452 ms | 1.35x |
-| **QuickBench TOTAL** | **3,756 ms** | **173,532 ms** | **46.2x** | **30,977 ms** | **8.25x** |
-| Binary Trees (depth = 18) | 681 ms | 19,737 ms | 29.0x | 36,665 ms | 53.8x |
+| Benchmark                 | JDK 25 C2    | CratonVM default | Default ratio | CratonVM OSR, threshold=1 | OSR ratio |
+|---------------------------|--------------|------------------|---------------|---------------------------|-----------|
+| Arithmetic (300M ops)     | 991 ms       | 73,820 ms        | 74.5x         | 1,534 ms                  | 1.55x     |
+| Fibonacci(42), recursive  | 2,071 ms     | 28,969 ms        | 14.0x         | 28,525 ms                 | 13.8x     |
+| Sieve (100K x 500 reps)   | 358 ms       | 31,665 ms        | 88.4x         | 466 ms                    | 1.30x     |
+| Matrix 500x500 multiply   | 336 ms       | 39,078 ms        | 116.3x        | 452 ms                    | 1.35x     |
+| **QuickBench TOTAL**      | **3,756 ms** | **173,532 ms**   | **46.2x**     | **30,977 ms**             | **8.25x** |
+| Binary Trees (depth = 18) | 681 ms       | 19,737 ms        | 29.0x         | 36,665 ms                 | 53.8x     |
 
 **Reading the results:**
 
