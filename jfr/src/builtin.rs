@@ -4299,14 +4299,7 @@ mod tests {
 
         let second_rid = second.new_recording(RecordingSettings::new("second"));
         second.start_recording(second_rid);
-        emit_gc_event(
-            &mut second,
-            2,
-            "G1 Young",
-            "Allocation Failure",
-            2000,
-            500,
-        );
+        emit_gc_event(&mut second, 2, "G1 Young", "Allocation Failure", 2000, 500);
         second.drain_per_thread_into_repository();
         let rec = second.get_recording_mut(second_rid).unwrap();
         assert_eq!(rec.event_count(), 1);

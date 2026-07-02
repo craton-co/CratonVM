@@ -2005,7 +2005,12 @@ fn try_build_method_injection(
             .iter()
             .rev()
             .find(|(n, c, _)| n == name && *c == pc)
-            .or_else(|| overrides.iter().rev().find(|(n, c, _)| n == name && *c == -1))
+            .or_else(|| {
+                overrides
+                    .iter()
+                    .rev()
+                    .find(|(n, c, _)| n == name && *c == -1)
+            })
             .map(|(_, _, b)| b.clone())
     };
 
@@ -2113,8 +2118,7 @@ fn try_build_replace_override(
     const ACC_FINAL: u16 = 0x0010;
     const ACC_ABSTRACT: u16 = 0x0400;
     const ACC_NATIVE: u16 = 0x0100;
-    const REPLACE_OVERRIDE: &str =
-        "org/springframework/beans/factory/support/ReplaceOverride";
+    const REPLACE_OVERRIDE: &str = "org/springframework/beans/factory/support/ReplaceOverride";
 
     let has_overrides = matches!(
         ctx.invoke_virtual(mbd, "hasMethodOverrides", "()Z", &[]),
@@ -2152,15 +2156,14 @@ fn try_build_replace_override(
                     if ctx.class_name_of_id(ovr_cid).as_deref() != Some(REPLACE_OVERRIDE) {
                         continue;
                     }
-                    let mname = match ctx.invoke_virtual(
-                        ovr,
-                        "getMethodName",
-                        "()Ljava/lang/String;",
-                        &[],
-                    ) {
-                        Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s).unwrap_or_default(),
-                        _ => continue,
-                    };
+                    let mname =
+                        match ctx.invoke_virtual(ovr, "getMethodName", "()Ljava/lang/String;", &[])
+                        {
+                            Ok(Some(Value::Object(Some(s)))) => {
+                                ctx.read_string(s).unwrap_or_default()
+                            }
+                            _ => continue,
+                        };
                     let rname = match ctx.invoke_virtual(
                         ovr,
                         "getMethodReplacerBeanName",

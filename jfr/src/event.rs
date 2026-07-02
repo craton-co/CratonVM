@@ -93,10 +93,16 @@ pub enum EventTypeValidationError {
     DuplicateName(String),
     InvalidCategory(String),
     InvalidDescription,
-    EmptyFieldName { field_index: usize },
-    InvalidFieldName { field_index: usize },
+    EmptyFieldName {
+        field_index: usize,
+    },
+    InvalidFieldName {
+        field_index: usize,
+    },
     DuplicateFieldName(String),
-    InvalidFieldDescription { field_index: usize },
+    InvalidFieldDescription {
+        field_index: usize,
+    },
     UnknownFieldType {
         field_index: usize,
         type_name: String,
@@ -369,7 +375,9 @@ impl EventTypeRegistry {
             return Err(EventTypeValidationError::InvalidName);
         }
         if self.name_to_id.contains_key(&event_type.name) {
-            return Err(EventTypeValidationError::DuplicateName(event_type.name.clone()));
+            return Err(EventTypeValidationError::DuplicateName(
+                event_type.name.clone(),
+            ));
         }
         if !metadata_text_is_clean(&event_type.description) {
             return Err(EventTypeValidationError::InvalidDescription);
@@ -394,9 +402,7 @@ impl EventTypeRegistry {
                 ));
             }
             if !metadata_text_is_clean(&field.description) {
-                return Err(EventTypeValidationError::InvalidFieldDescription {
-                    field_index: idx,
-                });
+                return Err(EventTypeValidationError::InvalidFieldDescription { field_index: idx });
             }
             if FieldKind::from_declared(&field.type_name).is_none() {
                 return Err(EventTypeValidationError::UnknownFieldType {

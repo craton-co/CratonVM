@@ -122,7 +122,10 @@ pub(crate) fn array_descriptor_to_type_name(desc: &str) -> Option<String> {
     }
     let elem = &desc[dims..];
     let elem_name: String = if let Some(stripped) = elem.strip_prefix('L') {
-        stripped.strip_suffix(';').unwrap_or(stripped).replace('/', ".")
+        stripped
+            .strip_suffix(';')
+            .unwrap_or(stripped)
+            .replace('/', ".")
     } else {
         match elem {
             "I" => "int",
@@ -610,9 +613,7 @@ fn spring_configuration_cglib_display_name(
         return None;
     }
     let is_enhanced_configuration = ctx.class_interfaces(class_id).iter().any(|iface_id| {
-        ctx.class_name_of_id(*iface_id)
-            .as_deref()
-            == Some(SPRING_ENHANCED_CONFIGURATION_IFACE)
+        ctx.class_name_of_id(*iface_id).as_deref() == Some(SPRING_ENHANCED_CONFIGURATION_IFACE)
     });
     if !is_enhanced_configuration {
         return None;
@@ -1599,7 +1600,8 @@ pub(crate) fn native_class_for_name(
                         }
                     }
                 }
-                if std::env::var("CRATONVM_IAE_TRACE").is_ok() && dbg_is_entity_name(&internal_name) {
+                if std::env::var("CRATONVM_IAE_TRACE").is_ok() && dbg_is_entity_name(&internal_name)
+                {
                     if let Value::Object(Some(mr)) = mirror {
                         if let Some(cid) = ctx.class_id_from_mirror(mr) {
                             let enh = dbg_class_enhanced(ctx, cid);
@@ -1739,7 +1741,10 @@ pub(crate) fn native_class_for_name(
             }
             if std::env::var("CRATONVM_IAE_TRACE").is_ok() && dbg_is_entity_name(&internal_name) {
                 let enh = dbg_class_enhanced(ctx, class_id);
-                eprintln!("FORNAME-RET name={dotted_name} cid={} enhanced={enh} (global-fallback)", class_id.as_u32());
+                eprintln!(
+                    "FORNAME-RET name={dotted_name} cid={} enhanced={enh} (global-fallback)",
+                    class_id.as_u32()
+                );
             }
             let mirror = ctx.get_class_mirror(class_id);
             Ok(Some(Value::Object(Some(mirror))))
@@ -2686,9 +2691,7 @@ pub(crate) fn descriptor_to_class_mirror_via_loader(
             // built-in loaders (0/1/2) ARE the global store, so the legacy path
             // is already correct for them.
             if loader_id >= 3 {
-                if let Some(cid) =
-                    ctx.class_id_defined_by_loader_exact(inner, loader_id as u32)
-                {
+                if let Some(cid) = ctx.class_id_defined_by_loader_exact(inner, loader_id as u32) {
                     return ctx.get_class_mirror(cid);
                 }
             }
@@ -3111,9 +3114,7 @@ pub(crate) fn coerce_arg_strict(
                     widen_primitive_value(raw, src_prim, expected_desc)
                         .ok_or_else(|| illegal_arg_exc("argument type mismatch".to_string()))
                 }
-                Value::Object(None) => {
-                    Err(illegal_arg_exc("argument type mismatch".to_string()))
-                }
+                Value::Object(None) => Err(illegal_arg_exc("argument type mismatch".to_string())),
                 _ => Err(illegal_arg_exc(format!(
                     "{context}: unexpected VM value for primitive {expected_desc}"
                 ))),
@@ -4634,8 +4635,7 @@ pub(crate) fn create_method_object(
     // bytecode-enhanced / child-loader class reports that loader's copy of the
     // return / parameter types (gated; see `descriptor_to_class_mirror_via_loader`).
     let (param_descs, ret_desc) = parse_descriptor_param_and_return(&meta.descriptor);
-    let ret_mirror =
-        descriptor_to_class_mirror_via_loader(ctx, &ret_desc, meta.declaring_class_id);
+    let ret_mirror = descriptor_to_class_mirror_via_loader(ctx, &ret_desc, meta.declaring_class_id);
 
     // Parameter type mirrors array. GC-safe: `descriptor_to_class_mirror`
     // allocates/loads classes, so the array is pinned across the fill loop
@@ -4666,10 +4666,11 @@ pub(crate) fn create_method_object(
     // allocates/loads classes, so the array is pinned across the fill loop.
     // Build a Class<T> mirror for each thrown checked exception via the L-form
     // so class loading + caching go through the same path as elsewhere.
-    let exception_arr = build_mirror_array_comp(ctx, class_comp, exception_names.len(), |ctx, i| {
-        let desc = format!("L{};", exception_names[i]);
-        descriptor_to_class_mirror(ctx, &desc)
-    });
+    let exception_arr =
+        build_mirror_array_comp(ctx, class_comp, exception_names.len(), |ctx, i| {
+            let desc = format!("L{};", exception_names[i]);
+            descriptor_to_class_mirror(ctx, &desc)
+        });
     let desc_str = ctx.create_string(&meta.descriptor);
 
     // --- Real JDK Method layout (visible to Java bytecode via Getfield) ---
@@ -5110,7 +5111,11 @@ fn build_serialized_lambda(
     let fic = ctx.create_string(&meta.functional_interface);
     ctx.set_field_by_name(sl, "functionalInterfaceClass", Value::Object(Some(fic)));
     let fimn = ctx.create_string(&meta.sam_method_name);
-    ctx.set_field_by_name(sl, "functionalInterfaceMethodName", Value::Object(Some(fimn)));
+    ctx.set_field_by_name(
+        sl,
+        "functionalInterfaceMethodName",
+        Value::Object(Some(fimn)),
+    );
     let fims = ctx.create_string(&meta.sam_descriptor);
     ctx.set_field_by_name(
         sl,
@@ -6722,10 +6727,11 @@ pub(crate) fn create_constructor_object(
         ctx.method_exceptions(meta.declaring_class_id, &meta.name, &meta.descriptor);
     // GC-safe (see `build_mirror_array`): each `descriptor_to_class_mirror`
     // allocates/loads classes, so the array is pinned across the fill loop.
-    let exception_arr = build_mirror_array_comp(ctx, class_comp, exception_names.len(), |ctx, i| {
-        let desc = format!("L{};", exception_names[i]);
-        descriptor_to_class_mirror(ctx, &desc)
-    });
+    let exception_arr =
+        build_mirror_array_comp(ctx, class_comp, exception_names.len(), |ctx, i| {
+            let desc = format!("L{};", exception_names[i]);
+            descriptor_to_class_mirror(ctx, &desc)
+        });
 
     // --- Real JDK Constructor layout ---
     ctx.set_field_by_name(obj, "clazz", Value::Object(Some(class_mirror)));
@@ -6743,9 +6749,7 @@ pub(crate) fn create_constructor_object(
     // constructor parameter (e.g. a record's canonical `List<Foo>` component) came
     // back as raw `List` from `Parameter.getParameterizedType()` while
     // `Constructor.getGenericParameterTypes()` (a registered native) was correct.
-    if let Some(sig) =
-        ctx.method_signature(meta.declaring_class_id, &meta.name, &meta.descriptor)
-    {
+    if let Some(sig) = ctx.method_signature(meta.declaring_class_id, &meta.name, &meta.descriptor) {
         let sig_obj = ctx.create_string(&sig);
         ctx.set_field_by_name(obj, "signature", Value::Object(Some(sig_obj)));
     }
@@ -7175,7 +7179,9 @@ pub(crate) fn native_constructor_new_instance(
                 "(Ljava/lang/String;)V",
                 &[Value::Object(Some(msg))],
             ) {
-                return Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(exc));
+                return Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(
+                    exc,
+                ));
             }
             // Fallback if the exception class can't be constructed.
             return Err(cratonvm_types::error::RuntimeError::IllegalStateException {
@@ -8331,7 +8337,11 @@ fn cached_annotation_proxy(
             "ANN-HOLDER cid={} holder={holder} ann={} container_loader={}",
             queried_class_id.as_u32(),
             ann.type_descriptor,
-            if container_loader.is_some() { "SOME" } else { "none" }
+            if container_loader.is_some() {
+                "SOME"
+            } else {
+                "none"
+            }
         );
     }
     let proxy = create_annotation_proxy(ctx, ann, container_loader);
@@ -8813,7 +8823,9 @@ pub(crate) fn annotation_element_to_java_typed(
                     match resolve_annotation_class_via_loader(ctx, loader, &owned) {
                         Ok(mirror) => {
                             if iae_trace_cls {
-                                eprintln!("ANN-CLASS desc={desc} class={owned} via-container-loader ok");
+                                eprintln!(
+                                    "ANN-CLASS desc={desc} class={owned} via-container-loader ok"
+                                );
                             }
                             return Value::Object(Some(mirror));
                         }
@@ -8821,9 +8833,11 @@ pub(crate) fn annotation_element_to_java_typed(
                             if iae_trace_cls {
                                 eprintln!("ANN-CLASS desc={desc} class={owned} container-loader CNFE -> TypeNotPresentException");
                             }
-                            if let Some(tnpe) =
-                                make_type_not_present_exception(ctx, &owned.replace('/', "."), Some(cnfe))
-                            {
+                            if let Some(tnpe) = make_type_not_present_exception(
+                                ctx,
+                                &owned.replace('/', "."),
+                                Some(cnfe),
+                            ) {
                                 return Value::Object(Some(tnpe));
                             }
                             // Could not build the sentinel — fall through to global.
@@ -12644,23 +12658,19 @@ pub(crate) fn native_executable_get_annotated_parameter_types(
         None => (Vec::new(), 0),
     };
     // Resolve the erased parameter type mirrors once.
-    let param_type_mirrors: Vec<ObjectRef> = match ctx.invoke_virtual(
-        this,
-        "getParameterTypes",
-        "()[Ljava/lang/Class;",
-        &[],
-    ) {
-        Ok(Some(Value::Object(Some(arr)))) => {
-            let n = ctx.array_length(arr);
-            (0..n)
-                .map(|i| match ctx.get_array_element(arr, i) {
-                    Value::Object(Some(m)) => m,
-                    _ => ctx.get_class_mirror(cratonvm_types::ClassId::new(0)),
-                })
-                .collect()
-        }
-        _ => Vec::new(),
-    };
+    let param_type_mirrors: Vec<ObjectRef> =
+        match ctx.invoke_virtual(this, "getParameterTypes", "()[Ljava/lang/Class;", &[]) {
+            Ok(Some(Value::Object(Some(arr)))) => {
+                let n = ctx.array_length(arr);
+                (0..n)
+                    .map(|i| match ctx.get_array_element(arr, i) {
+                        Value::Object(Some(m)) => m,
+                        _ => ctx.get_class_mirror(cratonvm_types::ClassId::new(0)),
+                    })
+                    .collect()
+            }
+            _ => Vec::new(),
+        };
     let n = param_type_mirrors.len().max(count);
     let comp = ctx
         .class_id_by_name("java/lang/reflect/AnnotatedType")
@@ -13127,7 +13137,9 @@ mod tests {
     fn jspecify_type_use_method_return_annotations_reach_annotated_type() {
         let mut ctx = mock_ctx();
         ensure_nullable_annotation_type(&mut ctx);
-        let owner = ctx.ensure_class_initialized("com/example/JSpecifyProbe").unwrap();
+        let owner = ctx
+            .ensure_class_initialized("com/example/JSpecifyProbe")
+            .unwrap();
         let desc = "()Ljava/lang/String;";
         let meta = cratonvm_native_api::MethodMetadata {
             name: "nullableReturn".to_string(),
@@ -13159,7 +13171,9 @@ mod tests {
     fn jspecify_type_use_parameter_annotations_use_parameter_index() {
         let mut ctx = mock_ctx();
         ensure_nullable_annotation_type(&mut ctx);
-        let owner = ctx.ensure_class_initialized("com/example/JSpecifyProbe").unwrap();
+        let owner = ctx
+            .ensure_class_initialized("com/example/JSpecifyProbe")
+            .unwrap();
         let desc = "(Ljava/lang/String;Ljava/lang/String;)V";
         let meta = cratonvm_native_api::MethodMetadata {
             name: "nullableParameter".to_string(),
@@ -13204,7 +13218,9 @@ mod tests {
     fn jspecify_type_use_field_annotations_reach_annotated_type() {
         let mut ctx = mock_ctx();
         ensure_nullable_annotation_type(&mut ctx);
-        let owner = ctx.ensure_class_initialized("com/example/JSpecifyProbe").unwrap();
+        let owner = ctx
+            .ensure_class_initialized("com/example/JSpecifyProbe")
+            .unwrap();
         let meta = cratonvm_native_api::FieldMetadata {
             name: "nullableField".to_string(),
             descriptor: "Ljava/lang/String;".to_string(),

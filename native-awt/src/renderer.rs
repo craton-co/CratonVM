@@ -63,10 +63,8 @@ impl Rect {
     pub fn intersect(&self, other: &Rect) -> Option<Rect> {
         let x1 = (self.x as i64).max(other.x as i64);
         let y1 = (self.y as i64).max(other.y as i64);
-        let x2 = (self.x as i64 + self.width as i64)
-            .min(other.x as i64 + other.width as i64);
-        let y2 = (self.y as i64 + self.height as i64)
-            .min(other.y as i64 + other.height as i64);
+        let x2 = (self.x as i64 + self.width as i64).min(other.x as i64 + other.width as i64);
+        let y2 = (self.y as i64 + self.height as i64).min(other.y as i64 + other.height as i64);
         if x2 > x1 && y2 > y1 {
             Some(Rect {
                 x: x1.clamp(i32::MIN as i64, i32::MAX as i64) as i32,

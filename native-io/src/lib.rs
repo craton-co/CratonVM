@@ -8529,10 +8529,7 @@ fn nio_windows_absolute_path_string(path: &str) -> String {
     if has_drive {
         let drive = &s[..2];
         let rest = s[2..].trim_start_matches(|c| c == '/' || c == '\\');
-        if cwd
-            .get(0..2)
-            .is_some_and(|d| d.eq_ignore_ascii_case(drive))
-        {
+        if cwd.get(0..2).is_some_and(|d| d.eq_ignore_ascii_case(drive)) {
             if rest.is_empty() {
                 return cwd;
             }
@@ -12646,9 +12643,7 @@ fn afc_next_file_id() -> io::Result<u32> {
 
 fn afc_insert_file(handle: AfcFileHandle) -> io::Result<u32> {
     let id = afc_next_file_id()?;
-    afc_files()
-        .lock()
-        .insert(id, Arc::new(Mutex::new(handle)));
+    afc_files().lock().insert(id, Arc::new(Mutex::new(handle)));
     Ok(id)
 }
 
@@ -13910,13 +13905,12 @@ fn check_udp_outbound_target(target: &str) -> Result<(), MethodCallFailed> {
         return Err(udp_policy_denied(reason));
     }
 
-    let addrs: Vec<SocketAddr> =
-        target
-            .to_socket_addrs()
-            .map_err(|e| RuntimeError::IOException {
-                message: format!("send target {target}: {e}"),
-            })?
-            .collect();
+    let addrs: Vec<SocketAddr> = target
+        .to_socket_addrs()
+        .map_err(|e| RuntimeError::IOException {
+            message: format!("send target {target}: {e}"),
+        })?
+        .collect();
     if addrs.is_empty() {
         return Err(RuntimeError::IOException {
             message: format!("send target {target}: no resolved addresses"),

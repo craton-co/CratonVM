@@ -27,8 +27,8 @@ use parking_lot::{Condvar as PLCondvar, Mutex as PLMutex};
 
 use crate::classloading::resolution::InvokeCache;
 use crate::native::registry::StackTraceEntry;
-use crate::runtime::fx_collections::FxHashMap;
 use crate::runtime::frame::Frame;
+use crate::runtime::fx_collections::FxHashMap;
 use crate::types::{ObjectRef, Value};
 
 /// Pool type for SoA locals and stack vecs: (values, tags).

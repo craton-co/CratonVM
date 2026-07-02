@@ -582,19 +582,17 @@ fn build_enhancer_class(
         // The factory-method thread-local that distinguishes "the container is
         // creating this bean" (→ super) from an inter-bean reference (→ getBean),
         // exactly like Spring's BeanMethodInterceptor.isCurrentlyInvokedFactoryMethod.
-        let sis_cls = cw
-            .add_class("org/springframework/beans/factory/support/SimpleInstantiationStrategy");
+        let sis_cls =
+            cw.add_class("org/springframework/beans/factory/support/SimpleInstantiationStrategy");
         let get_factory_method_ref = cw.add_methodref(
             sis_cls,
             "getCurrentlyInvokedFactoryMethod",
             "()Ljava/lang/reflect/Method;",
         );
         let method_cls = cw.add_class("java/lang/reflect/Method");
-        let method_get_name_ref =
-            cw.add_methodref(method_cls, "getName", "()Ljava/lang/String;");
+        let method_get_name_ref = cw.add_methodref(method_cls, "getName", "()Ljava/lang/String;");
         let string_cls = cw.add_class("java/lang/String");
-        let string_equals_ref =
-            cw.add_methodref(string_cls, "equals", "(Ljava/lang/Object;)Z");
+        let string_equals_ref = cw.add_methodref(string_cls, "equals", "(Ljava/lang/Object;)Z");
 
         // ConfigurationBeanNameGenerator support: when the container has a
         // ConfigurationBeanNameGenerator registered under
@@ -899,8 +897,7 @@ pub fn build_lookup_subclass(
     let ame_init_ref = cw.add_methodref(ame_class_idx, "<init>", "()V");
 
     let class_class_idx = cw.add_class("java/lang/Class");
-    let object_getclass_ref =
-        cw.add_methodref(object_class_idx, "getClass", "()Ljava/lang/Class;");
+    let object_getclass_ref = cw.add_methodref(object_class_idx, "getClass", "()Ljava/lang/Class;");
     let class_getsuperclass_ref =
         cw.add_methodref(class_class_idx, "getSuperclass", "()Ljava/lang/Class;");
     let class_getdeclaredmethod_ref = cw.add_methodref(
@@ -924,8 +921,7 @@ pub fn build_lookup_subclass(
         cw.add_interface_methodref(objectprovider_cls, "getObject", "()Ljava/lang/Object;");
     let class_getname_ref = cw.add_methodref(class_class_idx, "getName", "()Ljava/lang/String;");
     let string_cls = cw.add_class("java/lang/String");
-    let string_equals_ref =
-        cw.add_methodref(string_cls, "equals", "(Ljava/lang/Object;)Z");
+    let string_equals_ref = cw.add_methodref(string_cls, "equals", "(Ljava/lang/Object;)Z");
     let nullbean_fqn_string_idx =
         cw.add_string("org.springframework.beans.factory.support.NullBean");
 
@@ -985,7 +981,14 @@ pub fn build_lookup_subclass(
             code.push(0xB7); // invokespecial
             code.extend_from_slice(&b(cp.ame_init_ref));
             code.push(0xBF); // athrow
-            method_bytes.push(wrap_method(name_idx, desc_idx, code_attr_name_idx, &code, 2, mlocals));
+            method_bytes.push(wrap_method(
+                name_idx,
+                desc_idx,
+                code_attr_name_idx,
+                &code,
+                2,
+                mlocals,
+            ));
             continue;
         }
 
@@ -1099,7 +1102,14 @@ pub fn build_lookup_subclass(
             code.extend_from_slice(&b(rettype_class_idx));
             code.push(0xB0);
         }
-        method_bytes.push(wrap_method(name_idx, desc_idx, code_attr_name_idx, &code, 8, mlocals));
+        method_bytes.push(wrap_method(
+            name_idx,
+            desc_idx,
+            code_attr_name_idx,
+            &code,
+            8,
+            mlocals,
+        ));
     }
 
     let access_flags: u16 = 0x0001 | 0x0020 | 0x1000; // PUBLIC | SUPER | SYNTHETIC
@@ -1158,15 +1168,50 @@ struct WrapperRefs {
 /// Build the wrapper machinery for one primitive descriptor char.
 fn add_wrapper_refs(cw: &mut ClassWriter, ch: char) -> WrapperRefs {
     let (cls, valueof_desc, xvalue_name, xvalue_desc) = match ch {
-        'I' => ("java/lang/Integer", "(I)Ljava/lang/Integer;", "intValue", "()I"),
+        'I' => (
+            "java/lang/Integer",
+            "(I)Ljava/lang/Integer;",
+            "intValue",
+            "()I",
+        ),
         'J' => ("java/lang/Long", "(J)Ljava/lang/Long;", "longValue", "()J"),
-        'F' => ("java/lang/Float", "(F)Ljava/lang/Float;", "floatValue", "()F"),
-        'D' => ("java/lang/Double", "(D)Ljava/lang/Double;", "doubleValue", "()D"),
-        'Z' => ("java/lang/Boolean", "(Z)Ljava/lang/Boolean;", "booleanValue", "()Z"),
+        'F' => (
+            "java/lang/Float",
+            "(F)Ljava/lang/Float;",
+            "floatValue",
+            "()F",
+        ),
+        'D' => (
+            "java/lang/Double",
+            "(D)Ljava/lang/Double;",
+            "doubleValue",
+            "()D",
+        ),
+        'Z' => (
+            "java/lang/Boolean",
+            "(Z)Ljava/lang/Boolean;",
+            "booleanValue",
+            "()Z",
+        ),
         'B' => ("java/lang/Byte", "(B)Ljava/lang/Byte;", "byteValue", "()B"),
-        'C' => ("java/lang/Character", "(C)Ljava/lang/Character;", "charValue", "()C"),
-        'S' => ("java/lang/Short", "(S)Ljava/lang/Short;", "shortValue", "()S"),
-        _ => ("java/lang/Integer", "(I)Ljava/lang/Integer;", "intValue", "()I"),
+        'C' => (
+            "java/lang/Character",
+            "(C)Ljava/lang/Character;",
+            "charValue",
+            "()C",
+        ),
+        'S' => (
+            "java/lang/Short",
+            "(S)Ljava/lang/Short;",
+            "shortValue",
+            "()S",
+        ),
+        _ => (
+            "java/lang/Integer",
+            "(I)Ljava/lang/Integer;",
+            "intValue",
+            "()I",
+        ),
     };
     let class_idx = cw.add_class(cls);
     let valueof_ref = cw.add_methodref(class_idx, "valueOf", valueof_desc);
@@ -1209,7 +1254,8 @@ pub fn build_replace_override_subclass(
         "getBean",
         "(Ljava/lang/String;Ljava/lang/Class;)Ljava/lang/Object;",
     );
-    let methodreplacer_cls = cw.add_class("org/springframework/beans/factory/support/MethodReplacer");
+    let methodreplacer_cls =
+        cw.add_class("org/springframework/beans/factory/support/MethodReplacer");
     let reimplement_ref = cw.add_interface_methodref(
         methodreplacer_cls,
         "reimplement",
@@ -1226,8 +1272,11 @@ pub fn build_replace_override_subclass(
     let ise_init_ref = cw.add_methodref(ise_cls, "<init>", "(Ljava/lang/String;)V");
     let sb_cls = cw.add_class("java/lang/StringBuilder");
     let sb_init_ref = cw.add_methodref(sb_cls, "<init>", "(Ljava/lang/String;)V");
-    let sb_append_obj_ref =
-        cw.add_methodref(sb_cls, "append", "(Ljava/lang/Object;)Ljava/lang/StringBuilder;");
+    let sb_append_obj_ref = cw.add_methodref(
+        sb_cls,
+        "append",
+        "(Ljava/lang/Object;)Ljava/lang/StringBuilder;",
+    );
     let sb_tostring_ref = cw.add_methodref(sb_cls, "toString", "()Ljava/lang/String;");
     let ise_prefix_str_idx = cw.add_string(
         "Null return value from MethodReplacer does not match primitive return type for: ",
@@ -1287,12 +1336,7 @@ pub fn build_replace_override_subclass(
         let replacer_str_idx = cw.add_string(&m.replacer_bean_name);
 
         let params = parse_param_descriptors(&m.descriptor);
-        let ret = m
-            .descriptor
-            .split(')')
-            .nth(1)
-            .unwrap_or("V")
-            .to_string();
+        let ret = m.descriptor.split(')').nth(1).unwrap_or("V").to_string();
         let ret_char = ret.chars().next().unwrap_or('V');
         let primitive_ret = matches!(ret_char, 'I' | 'J' | 'F' | 'D' | 'Z' | 'B' | 'C' | 'S');
 
@@ -1581,7 +1625,10 @@ fn annotations_contain_bean(
     visited: &mut std::collections::HashSet<String>,
     depth: u32,
 ) -> bool {
-    if anns.iter().any(|a| a.type_descriptor == BEAN_ANNOTATION_DESC) {
+    if anns
+        .iter()
+        .any(|a| a.type_descriptor == BEAN_ANNOTATION_DESC)
+    {
         return true;
     }
     if depth >= 5 {

@@ -385,7 +385,10 @@ mod imp {
             }
         }
         if dbg() && !taken.handles.is_empty() {
-            eprintln!("[xt-jit-roots] resumed {} taken-over peer(s)", taken.handles.len());
+            eprintln!(
+                "[xt-jit-roots] resumed {} taken-over peer(s)",
+                taken.handles.len()
+            );
         }
     }
 }

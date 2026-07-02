@@ -1847,11 +1847,7 @@ fn eliminate_dead_nodes(graph: &mut Graph) {
         .filter(|(_, n)| {
             matches!(
                 n.op,
-                Op::Return
-                    | Op::Store(_)
-                    | Op::Call { .. }
-                    | Op::ArrayLoad(_)
-                    | Op::ArrayStore(_)
+                Op::Return | Op::Store(_) | Op::Call { .. } | Op::ArrayLoad(_) | Op::ArrayStore(_)
             )
         })
         .map(|(id, _)| id as NodeId)
@@ -3587,7 +3583,10 @@ mod tests {
             "trivial-phi elimination must expose the Param base to the load"
         );
         let changed = licm(&mut g);
-        assert!(changed, "LICM must hoist once the base is the invariant Param");
+        assert!(
+            changed,
+            "LICM must hoist once the base is the invariant Param"
+        );
         assert_eq!(
             g.nodes[load as usize].inputs[0], preheader,
             "the hoisted load's control must be re-anchored to the pre-header"

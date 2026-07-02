@@ -317,7 +317,12 @@ fn event_is_writable(event: &EventInstance, registry: &EventTypeRegistry) -> boo
         );
         return false;
     }
-    for (idx, (field, value)) in event_type.fields.iter().zip(event.fields.iter()).enumerate() {
+    for (idx, (field, value)) in event_type
+        .fields
+        .iter()
+        .zip(event.fields.iter())
+        .enumerate()
+    {
         let Some(declared) = FieldKind::from_declared(&field.type_name) else {
             tracing::debug!(
                 type_id = event.type_id.0,
@@ -1465,12 +1470,13 @@ pub fn read_events(
     let mut pos = events_start;
     let mut out = Vec::new();
     while pos < events_end {
-        let (total_size, size_len) = decode_compressed_int(&data[pos..events_end]).ok_or_else(|| {
-            JfrDumpError::Io(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "record size decode failed",
-            ))
-        })?;
+        let (total_size, size_len) =
+            decode_compressed_int(&data[pos..events_end]).ok_or_else(|| {
+                JfrDumpError::Io(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "record size decode failed",
+                ))
+            })?;
         let min_event_header_size = size_len as u64 + 4;
         if total_size < min_event_header_size {
             return Err(JfrDumpError::Io(io::Error::new(
@@ -1497,21 +1503,23 @@ pub fn read_events(
         }
 
         let mut rpos = pos + size_len;
-        let (type_id_raw, tc) = decode_compressed_int(&data[rpos..record_end]).ok_or_else(|| {
-            JfrDumpError::Io(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "type_id decode failed",
-            ))
-        })?;
+        let (type_id_raw, tc) =
+            decode_compressed_int(&data[rpos..record_end]).ok_or_else(|| {
+                JfrDumpError::Io(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "type_id decode failed",
+                ))
+            })?;
         rpos += tc;
         let type_id = EventTypeId(type_id_raw as u32);
 
-        let (start_time_raw, sc) = decode_compressed_long(&data[rpos..record_end]).ok_or_else(|| {
-            JfrDumpError::Io(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "start_time decode failed",
-            ))
-        })?;
+        let (start_time_raw, sc) =
+            decode_compressed_long(&data[rpos..record_end]).ok_or_else(|| {
+                JfrDumpError::Io(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "start_time decode failed",
+                ))
+            })?;
         rpos += sc;
         // Round-5 Fix 3: minor=1 stores the on-wire field as a delta from
         // the chunk's start_time; re-add it. minor=0 (legacy) stores
@@ -1531,12 +1539,13 @@ pub fn read_events(
         })?;
         rpos += dc;
 
-        let (thread_id, tdc) = decode_compressed_long(&data[rpos..record_end]).ok_or_else(|| {
-            JfrDumpError::Io(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "thread_id decode failed",
-            ))
-        })?;
+        let (thread_id, tdc) =
+            decode_compressed_long(&data[rpos..record_end]).ok_or_else(|| {
+                JfrDumpError::Io(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "thread_id decode failed",
+                ))
+            })?;
         rpos += tdc;
 
         let ty = registry.get(type_id).ok_or_else(|| {

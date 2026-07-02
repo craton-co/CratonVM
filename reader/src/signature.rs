@@ -742,10 +742,8 @@ mod tests {
         // carries its OWN args (`Long`) and an owner node for `Outer<Integer>`,
         // with the flat `$`-joined raw name. Regression for the bug where the
         // inner args were discarded and the outer args left on the inner name.
-        let sig = parse_field_signature(
-            "LOuter<Ljava/lang/Integer;>.Inner<Ljava/lang/Long;>;",
-        )
-        .unwrap();
+        let sig =
+            parse_field_signature("LOuter<Ljava/lang/Integer;>.Inner<Ljava/lang/Long;>;").unwrap();
         match sig {
             TypeSig::Class {
                 name,

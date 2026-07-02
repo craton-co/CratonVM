@@ -2535,9 +2535,7 @@ impl ClassManager {
                 // reactive-messaging / RSocket test classes. Only the reflective
                 // path is gated (the probe flag is set by the Class.forName
                 // native); genuine constant-pool resolution still gets its stub.
-                if is_enterprise_stub_prefix(name)
-                    && cratonvm_types::reflective_probe::active()
-                {
+                if is_enterprise_stub_prefix(name) && cratonvm_types::reflective_probe::active() {
                     return Err(VmError::ClassFile(ClassFileError::ClassNotFound {
                         class_name: name.to_string(),
                     }));
@@ -9039,7 +9037,10 @@ mod tests {
             "io/smallrye/mutiny/Multi",
             "io/smallrye/mutiny/groups/UniConvert",
         ] {
-            assert!(is_enterprise_stub_prefix(n), "expected enterprise prefix: {n}");
+            assert!(
+                is_enterprise_stub_prefix(n),
+                "expected enterprise prefix: {n}"
+            );
             // …and they are a subset of is_jdk_class (the stub gate).
             assert!(is_jdk_class(n), "expected is_jdk_class: {n}");
         }
@@ -9051,7 +9052,10 @@ mod tests {
             "reactor/core/publisher/Flux",
             "io/reactivex/rxjava3/core/Flowable",
         ] {
-            assert!(!is_enterprise_stub_prefix(n), "unexpected enterprise prefix: {n}");
+            assert!(
+                !is_enterprise_stub_prefix(n),
+                "unexpected enterprise prefix: {n}"
+            );
         }
     }
 

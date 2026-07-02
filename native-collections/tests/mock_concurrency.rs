@@ -35,7 +35,15 @@ fn new_stamped_lock(reg: &NativeMethodRegistry, ctx: &mut MockCtx) -> ObjectRef 
 
 fn new_priority_blocking_queue(reg: &NativeMethodRegistry, ctx: &mut MockCtx) -> ObjectRef {
     let queue = alloc_obj(ctx, PBQ, 2);
-    call(reg, ctx, PBQ, "<init>", "()V", &[Value::Object(Some(queue))]).unwrap();
+    call(
+        reg,
+        ctx,
+        PBQ,
+        "<init>",
+        "()V",
+        &[Value::Object(Some(queue))],
+    )
+    .unwrap();
     queue
 }
 
@@ -316,7 +324,11 @@ fn priority_blocking_queue_take_removes_available_head() {
     let mut ctx = MockCtx::new();
     let queue = new_priority_blocking_queue(&reg, &mut ctx);
 
-    for value in [boxed_int(&mut ctx, 30), boxed_int(&mut ctx, 10), boxed_int(&mut ctx, 20)] {
+    for value in [
+        boxed_int(&mut ctx, 30),
+        boxed_int(&mut ctx, 10),
+        boxed_int(&mut ctx, 20),
+    ] {
         let offered = call(
             &reg,
             &mut ctx,

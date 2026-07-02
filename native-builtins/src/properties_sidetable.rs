@@ -2831,7 +2831,7 @@ mod tests {
     fn save_convert_unicode_escaping() {
         // escape_unicode=true escapes non-Latin chars as one `\u` per code unit.
         assert_eq!(save_convert("\u{00e9}", false, true), "\\u00e9"); // é
-        // Supplementary code point -> surrogate pair (two \u units).
+                                                                      // Supplementary code point -> surrogate pair (two \u units).
         assert_eq!(save_convert("\u{1F600}", false, true), "\\ud83d\\ude00");
         // escape_unicode=false leaves the char literal (Writer charset encodes it).
         assert_eq!(save_convert("\u{00e9}", false, false), "\u{00e9}");

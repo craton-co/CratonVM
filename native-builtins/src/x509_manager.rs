@@ -650,9 +650,7 @@ pub fn parse_certificate(der: &[u8]) -> Result<ParsedCert, CertParseError> {
                                 GN_TAG_DIRECTORY => {
                                     // [4] EXPLICIT Name — gn.content is the
                                     // wrapped `Name` SEQUENCE DER.
-                                    if let Ok(name) =
-                                        read_tlv_tagged(gn.content, TAG_SEQUENCE)
-                                    {
+                                    if let Ok(name) = read_tlv_tagged(gn.content, TAG_SEQUENCE) {
                                         san_dir_names.push(name.full.to_vec());
                                     }
                                 }
@@ -1368,7 +1366,11 @@ fn check_name_constraints(
     // Certificates subject to name-constraint checking: everything except the
     // trust anchor itself (a trust anchor is authoritative — RFC 5280 §6.1.1).
     // When the last cert is the anchor, exclude it; otherwise check all.
-    let top_checked = if last_is_anchor { n.saturating_sub(1) } else { n };
+    let top_checked = if last_is_anchor {
+        n.saturating_sub(1)
+    } else {
+        n
+    };
 
     for j in 0..top_checked {
         let cert = &parsed[j];
@@ -1403,11 +1405,20 @@ fn check_name_constraints(
 fn enforce_name_constraints(cert: &ParsedCert, nc: &NameConstraints) -> Result<(), NcViolation> {
     // dNSName
     for name in &cert.san_dns_names {
-        if nc.excluded.dns.iter().any(|c| dns_constraint_matches(c, name)) {
+        if nc
+            .excluded
+            .dns
+            .iter()
+            .any(|c| dns_constraint_matches(c, name))
+        {
             return Err(NcViolation::Dns(name.clone()));
         }
         if !nc.permitted.dns.is_empty()
-            && !nc.permitted.dns.iter().any(|c| dns_constraint_matches(c, name))
+            && !nc
+                .permitted
+                .dns
+                .iter()
+                .any(|c| dns_constraint_matches(c, name))
         {
             return Err(NcViolation::Dns(name.clone()));
         }
@@ -1427,11 +1438,20 @@ fn enforce_name_constraints(cert: &ParsedCert, nc: &NameConstraints) -> Result<(
 
     // rfc822Name (email)
     for email in &cert.san_rfc822_names {
-        if nc.excluded.email.iter().any(|c| email_constraint_matches(c, email)) {
+        if nc
+            .excluded
+            .email
+            .iter()
+            .any(|c| email_constraint_matches(c, email))
+        {
             return Err(NcViolation::Email(email.clone()));
         }
         if !nc.permitted.email.is_empty()
-            && !nc.permitted.email.iter().any(|c| email_constraint_matches(c, email))
+            && !nc
+                .permitted
+                .email
+                .iter()
+                .any(|c| email_constraint_matches(c, email))
         {
             return Err(NcViolation::Email(email.clone()));
         }
@@ -1441,11 +1461,20 @@ fn enforce_name_constraints(cert: &ParsedCert, nc: &NameConstraints) -> Result<(
     for uri in &cert.san_uris {
         match uri_host(uri) {
             Some(host) => {
-                if nc.excluded.uri.iter().any(|c| dns_constraint_matches(c, &host)) {
+                if nc
+                    .excluded
+                    .uri
+                    .iter()
+                    .any(|c| dns_constraint_matches(c, &host))
+                {
                     return Err(NcViolation::Uri(uri.clone()));
                 }
                 if !nc.permitted.uri.is_empty()
-                    && !nc.permitted.uri.iter().any(|c| dns_constraint_matches(c, &host))
+                    && !nc
+                        .permitted
+                        .uri
+                        .iter()
+                        .any(|c| dns_constraint_matches(c, &host))
                 {
                     return Err(NcViolation::Uri(uri.clone()));
                 }
@@ -1476,8 +1505,7 @@ fn enforce_name_constraints(cert: &ParsedCert, nc: &NameConstraints) -> Result<(
         if nc.excluded.dir.iter().any(|c| dir_name_within(c, dn)) {
             return Err(NcViolation::DirName);
         }
-        if !nc.permitted.dir.is_empty()
-            && !nc.permitted.dir.iter().any(|c| dir_name_within(c, dn))
+        if !nc.permitted.dir.is_empty() && !nc.permitted.dir.iter().any(|c| dir_name_within(c, dn))
         {
             return Err(NcViolation::DirName);
         }
@@ -1559,7 +1587,10 @@ fn ip_constraint_matches(constraint: &[u8], presented: &[u8]) -> bool {
 fn uri_host(uri: &str) -> Option<String> {
     let after = uri.split_once("://").map(|(_, b)| b).unwrap_or(uri);
     let authority = after.split(['/', '?', '#']).next().unwrap_or("");
-    let hostport = authority.rsplit_once('@').map(|(_, b)| b).unwrap_or(authority);
+    let hostport = authority
+        .rsplit_once('@')
+        .map(|(_, b)| b)
+        .unwrap_or(authority);
     let host = if let Some(rest) = hostport.strip_prefix('[') {
         // IPv6 literal: take up to ']'.
         rest.split_once(']').map(|(h, _)| h).unwrap_or(rest)
@@ -3800,7 +3831,10 @@ mod tests {
         assert!(dns_constraint_matches("example.com", "www.example.com"));
         assert!(dns_constraint_matches("example.com", "a.b.example.com"));
         assert!(!dns_constraint_matches("example.com", "notexample.com"));
-        assert!(!dns_constraint_matches("example.com", "example.com.evil.com"));
+        assert!(!dns_constraint_matches(
+            "example.com",
+            "example.com.evil.com"
+        ));
         assert!(!dns_constraint_matches("example.com", "com"));
         // Empty constraint matches everything.
         assert!(dns_constraint_matches("", "anything.test"));
@@ -3812,13 +3846,25 @@ mod tests {
     #[test]
     fn email_constraint_matching_follows_rfc5280() {
         // Full mailbox: exact match.
-        assert!(email_constraint_matches("ann@example.com", "ann@example.com"));
-        assert!(!email_constraint_matches("ann@example.com", "bob@example.com"));
+        assert!(email_constraint_matches(
+            "ann@example.com",
+            "ann@example.com"
+        ));
+        assert!(!email_constraint_matches(
+            "ann@example.com",
+            "bob@example.com"
+        ));
         // Host constraint: any mailbox at that host, not a subdomain.
         assert!(email_constraint_matches("example.com", "ann@example.com"));
-        assert!(!email_constraint_matches("example.com", "ann@sub.example.com"));
+        assert!(!email_constraint_matches(
+            "example.com",
+            "ann@sub.example.com"
+        ));
         // Leading-dot: subdomains only.
-        assert!(email_constraint_matches(".example.com", "ann@sub.example.com"));
+        assert!(email_constraint_matches(
+            ".example.com",
+            "ann@sub.example.com"
+        ));
         assert!(!email_constraint_matches(".example.com", "ann@example.com"));
         // Malformed presented address (no host).
         assert!(!email_constraint_matches("example.com", "no-at-sign"));
@@ -3841,10 +3887,22 @@ mod tests {
 
     #[test]
     fn uri_host_extraction() {
-        assert_eq!(uri_host("https://host.example.com/path"), Some("host.example.com".into()));
-        assert_eq!(uri_host("http://user@h.example.com:8443/x"), Some("h.example.com".into()));
-        assert_eq!(uri_host("https://[2001:db8::1]:443/"), Some("2001:db8::1".into()));
-        assert_eq!(uri_host("HTTPS://Host.Example.COM"), Some("host.example.com".into()));
+        assert_eq!(
+            uri_host("https://host.example.com/path"),
+            Some("host.example.com".into())
+        );
+        assert_eq!(
+            uri_host("http://user@h.example.com:8443/x"),
+            Some("h.example.com".into())
+        );
+        assert_eq!(
+            uri_host("https://[2001:db8::1]:443/"),
+            Some("2001:db8::1".into())
+        );
+        assert_eq!(
+            uri_host("HTTPS://Host.Example.COM"),
+            Some("host.example.com".into())
+        );
         assert_eq!(uri_host(""), None);
     }
 
@@ -3893,18 +3951,36 @@ mod tests {
         insert_anchor(&mut trust, root.clone());
 
         // Leaf inside the permitted subtree validates.
-        let san_ok =
-            extension(OID_EXT_SUBJECT_ALT_NAME, false, san_dns_value(&["host.example.com"]));
-        let leaf_ok =
-            mk_rsa_cert_with_exts("host.example.com", "NC Root", &root_spki, false, &san_ok, root_sk);
+        let san_ok = extension(
+            OID_EXT_SUBJECT_ALT_NAME,
+            false,
+            san_dns_value(&["host.example.com"]),
+        );
+        let leaf_ok = mk_rsa_cert_with_exts(
+            "host.example.com",
+            "NC Root",
+            &root_spki,
+            false,
+            &san_ok,
+            root_sk,
+        );
         validate_chain(&[leaf_ok, root.clone()], &trust)
             .expect("leaf within permitted subtree must validate");
 
         // Leaf outside the permitted subtree is rejected at index 0.
-        let san_bad =
-            extension(OID_EXT_SUBJECT_ALT_NAME, false, san_dns_value(&["host.evil.com"]));
-        let leaf_bad =
-            mk_rsa_cert_with_exts("host.evil.com", "NC Root", &root_spki, false, &san_bad, root_sk);
+        let san_bad = extension(
+            OID_EXT_SUBJECT_ALT_NAME,
+            false,
+            san_dns_value(&["host.evil.com"]),
+        );
+        let leaf_bad = mk_rsa_cert_with_exts(
+            "host.evil.com",
+            "NC Root",
+            &root_spki,
+            false,
+            &san_bad,
+            root_sk,
+        );
         match validate_chain(&[leaf_bad, root.clone()], &trust) {
             Err(TrustError::NameConstraintViolation { at, .. }) => assert_eq!(at, 0),
             other => panic!("expected NameConstraintViolation, got {:?}", other),
@@ -3924,10 +4000,19 @@ mod tests {
         insert_anchor(&mut trust, root.clone());
 
         // A name outside the excluded subtree is fine.
-        let san_ok =
-            extension(OID_EXT_SUBJECT_ALT_NAME, false, san_dns_value(&["host.good.com"]));
-        let leaf_ok =
-            mk_rsa_cert_with_exts("host.good.com", "X Root", &root_spki, false, &san_ok, root_sk);
+        let san_ok = extension(
+            OID_EXT_SUBJECT_ALT_NAME,
+            false,
+            san_dns_value(&["host.good.com"]),
+        );
+        let leaf_ok = mk_rsa_cert_with_exts(
+            "host.good.com",
+            "X Root",
+            &root_spki,
+            false,
+            &san_ok,
+            root_sk,
+        );
         validate_chain(&[leaf_ok, root.clone()], &trust).expect("non-excluded leaf must validate");
 
         // A name inside the excluded subtree is rejected.
@@ -3956,11 +4041,21 @@ mod tests {
         // validate names of every kind (regression guard for the new step).
         let (root_pk, root_sk) = shared_rsa_root();
         let root_spki = Rsa::public_key_to_der(root_pk);
-        let root = mk_rsa_cert_with_exts("Plain Root", "Plain Root", &root_spki, true, &[], root_sk);
-        let san =
-            extension(OID_EXT_SUBJECT_ALT_NAME, false, san_dns_value(&["anything.example"]));
-        let leaf =
-            mk_rsa_cert_with_exts("anything.example", "Plain Root", &root_spki, false, &san, root_sk);
+        let root =
+            mk_rsa_cert_with_exts("Plain Root", "Plain Root", &root_spki, true, &[], root_sk);
+        let san = extension(
+            OID_EXT_SUBJECT_ALT_NAME,
+            false,
+            san_dns_value(&["anything.example"]),
+        );
+        let leaf = mk_rsa_cert_with_exts(
+            "anything.example",
+            "Plain Root",
+            &root_spki,
+            false,
+            &san,
+            root_sk,
+        );
         let mut trust = TrustManagerState::default();
         insert_anchor(&mut trust, root.clone());
         validate_chain(&[leaf, root], &trust).expect("unconstrained chain must validate");

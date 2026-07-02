@@ -75,7 +75,11 @@ fn cratonvm_binary() -> Option<PathBuf> {
         .parent()
         .unwrap()
         .join("target");
-    let exe = if cfg!(windows) { "cratonvm.exe" } else { "cratonvm" };
+    let exe = if cfg!(windows) {
+        "cratonvm.exe"
+    } else {
+        "cratonvm"
+    };
     for profile in &["release", "debug"] {
         let candidate = target.join(profile).join(exe);
         if candidate.exists() {
@@ -148,7 +152,9 @@ fn getclass_reports_concrete_classes() {
             return;
         }
     };
-    let javac = jdk.join("bin").join(if cfg!(windows) { "javac.exe" } else { "javac" });
+    let javac = jdk
+        .join("bin")
+        .join(if cfg!(windows) { "javac.exe" } else { "javac" });
     let classes = match compile_probe(&javac) {
         Some(d) => d,
         None => {
@@ -235,7 +241,10 @@ fn getclass_reports_concrete_classes() {
         line("singletonList="),
         "java.util.Collections$SingletonList|sz=1|get=7"
     );
-    assert_eq!(line("singletonSet="), "java.util.Collections$SingletonSet|sz=1");
+    assert_eq!(
+        line("singletonSet="),
+        "java.util.Collections$SingletonSet|sz=1"
+    );
     assert_eq!(
         line("singletonMap="),
         "java.util.Collections$SingletonMap|sz=1|get=30"

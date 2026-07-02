@@ -1383,7 +1383,9 @@ pub(crate) fn register_pe_raw_native_libraries(r: &mut NativeMethodRegistry) {
     // native-library table has no unload), so this is a no-op — matching the
     // RawNativeLibraries contract, which explicitly permits a library to remain
     // open after close().
-    r.register(rnl, "unload0", "(Ljava/lang/String;J)V", |_ctx, _args| Ok(None));
+    r.register(rnl, "unload0", "(Ljava/lang/String;J)V", |_ctx, _args| {
+        Ok(None)
+    });
 
     // static native long findEntry0(long handle, String name)  (in NativeLibrary)
     r.register(
@@ -2191,7 +2193,11 @@ pub fn gc_scan_upcall_target_roots(out: &mut Vec<ObjectRef>) {
     for entry in reg.values() {
         // SAFETY: `userdata` is a leaked `&'static UpcallUserdata`, alive for the
         // whole process (the closure captures the same allocation).
-        let addr = unsafe { (*entry.userdata).target.load(std::sync::atomic::Ordering::Relaxed) };
+        let addr = unsafe {
+            (*entry.userdata)
+                .target
+                .load(std::sync::atomic::Ordering::Relaxed)
+        };
         if addr != 0 {
             // SAFETY: a non-zero, 8-byte-aligned heap address previously stored
             // from a live `ObjectRef`; used only as a GC root here.
@@ -2287,10 +2293,7 @@ unsafe extern "C" fn upcall_dispatch(
             target,
             "invoke",
             "([Ljava/lang/Object;)Ljava/lang/Object;",
-            &[
-                Value::Object(Some(target)),
-                Value::Object(Some(arr)),
-            ],
+            &[Value::Object(Some(target)), Value::Object(Some(arr))],
         )
     });
 
@@ -4803,7 +4806,9 @@ mod tests {
         map.insert(0xABCD_0000usize, 0xABCD_8000usize);
         gc_update_upcall_target_refs(&map);
         assert_eq!(
-            userdata_ptr.target.load(std::sync::atomic::Ordering::Relaxed),
+            userdata_ptr
+                .target
+                .load(std::sync::atomic::Ordering::Relaxed),
             0xABCD_8000,
             "upcall target must be remapped in place"
         );

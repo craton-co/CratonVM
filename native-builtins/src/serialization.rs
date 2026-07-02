@@ -1232,8 +1232,13 @@ fn reconstruct_serialized_lambda(ctx: &mut dyn NativeContext, addr: usize) -> Va
     let ref_kind = ois_buf_read(addr, 1).first().copied().unwrap_or(6);
     let count_bytes = ois_buf_read(addr, 4);
     let count = if count_bytes.len() == 4 {
-        i32::from_be_bytes([count_bytes[0], count_bytes[1], count_bytes[2], count_bytes[3]]).max(0)
-            as usize
+        i32::from_be_bytes([
+            count_bytes[0],
+            count_bytes[1],
+            count_bytes[2],
+            count_bytes[3],
+        ])
+        .max(0) as usize
     } else {
         0
     };

@@ -3451,8 +3451,12 @@ mod tests {
         assert!(cp.find_class_source_path("pkg\\Foo").is_none());
         assert!(cp.find_class_code_source_info("pkg\\Foo").is_none());
         assert!(cp.find_resource("pkg\\config.properties").is_none());
-        assert!(cp.find_all_resource_bytes("pkg\\config.properties").is_empty());
-        assert!(cp.find_all_resource_urls("pkg\\config.properties").is_empty());
+        assert!(cp
+            .find_all_resource_bytes("pkg\\config.properties")
+            .is_empty());
+        assert!(cp
+            .find_all_resource_urls("pkg\\config.properties")
+            .is_empty());
     }
 
     #[test]

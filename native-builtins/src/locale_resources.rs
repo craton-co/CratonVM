@@ -1063,18 +1063,15 @@ fn int_arg(args: &[Value], i: usize) -> i32 {
 /// locale is treated as English (the JDK default the Spring suite runs under).
 fn locale_is_english(ctx: &mut dyn NativeContext, arg: Option<&Value>) -> bool {
     match arg {
-        Some(Value::Object(Some(loc))) => match ctx.invoke_virtual(
-            *loc,
-            "getLanguage",
-            "()Ljava/lang/String;",
-            &[],
-        ) {
-            Ok(Some(Value::Object(Some(s)))) => {
-                let lang = ctx.read_string(s).unwrap_or_default();
-                lang.is_empty() || lang == "en"
+        Some(Value::Object(Some(loc))) => {
+            match ctx.invoke_virtual(*loc, "getLanguage", "()Ljava/lang/String;", &[]) {
+                Ok(Some(Value::Object(Some(s)))) => {
+                    let lang = ctx.read_string(s).unwrap_or_default();
+                    lang.is_empty() || lang == "en"
+                }
+                _ => true,
             }
-            _ => true,
-        },
+        }
         _ => true,
     }
 }
@@ -1091,16 +1088,24 @@ fn en_calendar_field_names(field: i32, style: i32) -> Option<Vec<(&'static str, 
         CAL_MONTH => {
             let names: &[&str; 12] = match base {
                 CAL_STYLE_LONG => &[
-                    "January", "February", "March", "April", "May", "June", "July", "August",
-                    "September", "October", "November", "December",
+                    "January",
+                    "February",
+                    "March",
+                    "April",
+                    "May",
+                    "June",
+                    "July",
+                    "August",
+                    "September",
+                    "October",
+                    "November",
+                    "December",
                 ],
                 CAL_STYLE_SHORT => &[
                     "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov",
                     "Dec",
                 ],
-                CAL_STYLE_NARROW => {
-                    &["J", "F", "M", "A", "M", "J", "J", "A", "S", "O", "N", "D"]
-                }
+                CAL_STYLE_NARROW => &["J", "F", "M", "A", "M", "J", "J", "A", "S", "O", "N", "D"],
                 _ => return None,
             };
             Some((0..12).map(|i| (names[i as usize], i)).collect())
@@ -1109,7 +1114,13 @@ fn en_calendar_field_names(field: i32, style: i32) -> Option<Vec<(&'static str, 
             // Index 0 = Sunday; Calendar value = index + 1 (SUNDAY=1).
             let names: &[&str; 7] = match base {
                 CAL_STYLE_LONG => &[
-                    "Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday",
+                    "Sunday",
+                    "Monday",
+                    "Tuesday",
+                    "Wednesday",
+                    "Thursday",
+                    "Friday",
+                    "Saturday",
                 ],
                 CAL_STYLE_SHORT => &["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"],
                 CAL_STYLE_NARROW => &["S", "M", "T", "W", "T", "F", "S"],
@@ -1417,15 +1428,12 @@ pub fn register(registry: &mut NativeMethodRegistry) {
             // suite exercises. (dec, grp): en='.'/',' ; de=','/'.' ;
             // fr=','/' ' (narrow no-break space).
             let lang = match locale {
-                Value::Object(Some(loc)) => match ctx.invoke_virtual(
-                    loc,
-                    "getLanguage",
-                    "()Ljava/lang/String;",
-                    &[],
-                ) {
-                    Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s).unwrap_or_default(),
-                    _ => String::new(),
-                },
+                Value::Object(Some(loc)) => {
+                    match ctx.invoke_virtual(loc, "getLanguage", "()Ljava/lang/String;", &[]) {
+                        Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s).unwrap_or_default(),
+                        _ => String::new(),
+                    }
+                }
                 _ => String::new(),
             };
             let (dec_sep, grp_sep): (char, char) = match lang.as_str() {

@@ -949,13 +949,13 @@ pub fn register_cipher_clinit_shim(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;)Ljavax/crypto/CryptoPermission;",
         |ctx, _args| {
             let cid = ctx.ensure_class_initialized("javax/crypto/CryptoAllPermission")?;
-            let idx = ctx
-                .static_field_index_by_name(cid, "INSTANCE")
-                .ok_or(RuntimeError::IllegalStateException {
+            let idx = ctx.static_field_index_by_name(cid, "INSTANCE").ok_or(
+                RuntimeError::IllegalStateException {
                     message: "javax/crypto/CryptoAllPermission.INSTANCE \
                               static field not found"
                         .to_string(),
-                })?;
+                },
+            )?;
             Ok(Some(ctx.get_static_field(cid, idx)))
         },
     );

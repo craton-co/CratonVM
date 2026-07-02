@@ -2136,9 +2136,7 @@ pub fn shadow_stack_maps_enabled() -> bool {
     // gen requires a COMPLETE, rewritable precise root map (see
     // `moving_young_enabled` and `collect_live_oop_homes`), so turning it on also
     // turns on the push/reload emission.
-    *G.get_or_init(|| {
-        std::env::var_os("CRATONVM_SHADOW_STACK").is_some() || moving_young_enabled()
-    })
+    *G.get_or_init(|| std::env::var_os("CRATONVM_SHADOW_STACK").is_some() || moving_young_enabled())
 }
 
 /// Whether the **default moving / compacting young generation**
@@ -7397,7 +7395,11 @@ impl Compiler {
         let precise_maps = precise_jit_maps_enabled() || moving_young_enabled();
         // Step 1 (inline frame-record) — cache the validated TLS displacement
         // (0 when the opt-in flag is off or the OS probe failed → CALL path).
-        let inline_rbp_tls_disp = if precise_maps { inline_rbp_tls_disp() } else { 0 };
+        let inline_rbp_tls_disp = if precise_maps {
+            inline_rbp_tls_disp()
+        } else {
+            0
+        };
         let verify_inline_frame_record = verify_inline_frame_record_enabled();
         let shadow_enabled = shadow_stack_maps_enabled();
         // SB-CRASH-04 (register-invisibility): blind-spill used callee-saved
@@ -8173,9 +8175,7 @@ impl Compiler {
     }
 
     fn checked_spill_range_end(&mut self, start: i32, slots: usize) -> Option<i32> {
-        let bytes = slots
-            .checked_mul(8)
-            .and_then(|n| i32::try_from(n).ok());
+        let bytes = slots.checked_mul(8).and_then(|n| i32::try_from(n).ok());
         let Some(bytes) = bytes else {
             self.failed = true;
             return None;
@@ -12743,11 +12743,7 @@ impl Compiler {
         self.emit_mov_dword_mem_disp32_imm32(R11, 4, 0);
         // offset 12: array_length. For a compact object this carries the body
         // size in bytes (object_body_size reads it); a legacy object writes 0.
-        self.emit_mov_dword_mem_disp32_imm32(
-            R11,
-            12,
-            compact_body.map(|b| b as i32).unwrap_or(0),
-        );
+        self.emit_mov_dword_mem_disp32_imm32(R11, 12, compact_body.map(|b| b as i32).unwrap_or(0));
         // Layout reminder (from `types/src/heap_types.rs`):
         //   off 16: num_slots (u32) — Object kind only; arrays use
         //   array_length at offset 12, but `new` only allocates Objects.
@@ -15756,24 +15752,24 @@ impl Compiler {
                         let canonical_off = base + (i as i32) * 8; // Cast: x86-64 immediate encoding
                         self.stack.push(StackSlot::Frame(canonical_off));
                     }
-                                                                                 // SECURITY FIX (V15): rebuild the parallel oop-mark
-                                                                                 // vector in lock-step with the reconstructed stack.
-                                                                                 // Previously only `self.stack` was rebuilt here, leaving
-                                                                                 // `stack_oop_marks` holding stale type bits from the DEAD
-                                                                                 // predecessor path. At the next safepoint,
-                                                                                 // `emit_oop_map_for_safepoint` would index those stale
-                                                                                 // bits against the freshly canonicalised frame slots and
-                                                                                 // could emit an oop map that mislabels a slot (a stale
-                                                                                 // `true` pins a non-reference word; a stale `false` would
-                                                                                 // omit a real oop, which the conservative frame sweep
-                                                                                 // still catches, but we must not rely on that here). We
-                                                                                 // reset every reconstructed slot to `false` (conservative
-                                                                                 // / sound default): the merge-target's own bytecode will
-                                                                                 // re-tag any slot that genuinely holds an oop as it
-                                                                                 // re-executes the producing instruction. Resetting to a
-                                                                                 // known length also keeps marks aligned with `stack`,
-                                                                                 // satisfying the lock-step invariant assumed everywhere
-                                                                                 // marks is read.
+                    // SECURITY FIX (V15): rebuild the parallel oop-mark
+                    // vector in lock-step with the reconstructed stack.
+                    // Previously only `self.stack` was rebuilt here, leaving
+                    // `stack_oop_marks` holding stale type bits from the DEAD
+                    // predecessor path. At the next safepoint,
+                    // `emit_oop_map_for_safepoint` would index those stale
+                    // bits against the freshly canonicalised frame slots and
+                    // could emit an oop map that mislabels a slot (a stale
+                    // `true` pins a non-reference word; a stale `false` would
+                    // omit a real oop, which the conservative frame sweep
+                    // still catches, but we must not rely on that here). We
+                    // reset every reconstructed slot to `false` (conservative
+                    // / sound default): the merge-target's own bytecode will
+                    // re-tag any slot that genuinely holds an oop as it
+                    // re-executes the producing instruction. Resetting to a
+                    // known length also keeps marks aligned with `stack`,
+                    // satisfying the lock-step invariant assumed everywhere
+                    // marks is read.
                     self.stack_oop_marks.clear();
                     self.stack_oop_marks.resize(expected_depth, false);
                     self.stack_oop_marks_exact = expected_depth == 0;
@@ -18916,7 +18912,9 @@ impl Compiler {
                         .filter(|_| std::env::var_os("DISABLE_INLINE_GETFIELD").is_none())
                     {
                         if std::env::var_os("CRATONVM_DBG_COMPACT_INLINE").is_some() {
-                            eprintln!("[compact-inline] getfield pc={pc} off={c_off} ref={c_is_ref}");
+                            eprintln!(
+                                "[compact-inline] getfield pc={pc} off={c_off} ref={c_is_ref}"
+                            );
                         }
                         // Compact reference-field layout inline getfield. The
                         // packed byte offset + ref-ness were resolved at compile
@@ -18955,12 +18953,12 @@ impl Compiler {
                         // Null check: TEST RAX,RAX; JZ <null> (result 0).
                         self.emit_test_r64_r64(RAX);
                         let null_patch = self.emit_jcc_rel32_patch(0x84); // JE
-                        // Per-object compactness: gc_flags byte @21 & GC_FLAG_COMPACT.
-                        // Zero ⇒ legacy 16-byte-cell object → uniform-layout read.
+                                                                          // Per-object compactness: gc_flags byte @21 & GC_FLAG_COMPACT.
+                                                                          // Zero ⇒ legacy 16-byte-cell object → uniform-layout read.
                         self.emit_mov_r32_mem_disp32(RCX, RAX, 21);
                         self.emit_and_r64_imm8(RCX, cratonvm_types::GC_FLAG_COMPACT as i8);
                         let legacy_patch = self.emit_jcc_rel32_patch(0x84); // JZ → legacy
-                        // --- compact path (8-byte ref / packed primitive cell) ---
+                                                                            // --- compact path (8-byte ref / packed primitive cell) ---
                         if c_is_ref {
                             // 8-byte raw pointer at the cell base.
                             self.emit_mov_r64_mem_disp32(RAX, RAX, cell_off);
@@ -19205,37 +19203,37 @@ impl Compiler {
                                 // null receiver → helper.
                                 self.emit_test_r64_r64(RAX);
                                 bail.push(self.emit_jcc_rel32_patch(0x84)); // JZ
-                                // LEGACY receiver (no GC_FLAG_COMPACT) → helper: the
-                                // compact 8-byte cell offset is only valid for a
-                                // genuinely-compact object. A class with a registered
-                                // compact layout can still have uniform 16-byte-cell
-                                // instances (any allocation whose `num_fields`
-                                // disagrees with the layout field count — e.g.
-                                // native/synthetic-stub `Method`/`ArrayList`/… whose
-                                // padded stub count exceeds the real declared count).
-                                // `jit_putfield_object` keys on the per-object flag
-                                // and does the correct uniform-layout store. Without
-                                // this the compact-offset old-value read + store would
-                                // scribble a pointer into the wrong bytes of a legacy
-                                // object → heap corruption / SIGSEGV.
+                                                                            // LEGACY receiver (no GC_FLAG_COMPACT) → helper: the
+                                                                            // compact 8-byte cell offset is only valid for a
+                                                                            // genuinely-compact object. A class with a registered
+                                                                            // compact layout can still have uniform 16-byte-cell
+                                                                            // instances (any allocation whose `num_fields`
+                                                                            // disagrees with the layout field count — e.g.
+                                                                            // native/synthetic-stub `Method`/`ArrayList`/… whose
+                                                                            // padded stub count exceeds the real declared count).
+                                                                            // `jit_putfield_object` keys on the per-object flag
+                                                                            // and does the correct uniform-layout store. Without
+                                                                            // this the compact-offset old-value read + store would
+                                                                            // scribble a pointer into the wrong bytes of a legacy
+                                                                            // object → heap corruption / SIGSEGV.
                                 self.emit_mov_r32_mem_disp32(RCX, RAX, 21);
                                 self.emit_and_r64_imm8(RCX, cratonvm_types::GC_FLAG_COMPACT as i8);
                                 bail.push(self.emit_jcc_rel32_patch(0x84)); // JZ not-compact → helper
-                                // old-gen receiver → helper (card). gc_flags @21 bit0.
+                                                                            // old-gen receiver → helper (card). gc_flags @21 bit0.
                                 self.emit_mov_r32_mem_disp32(RCX, RAX, 21);
                                 self.emit_and_r64_imm8(RCX, 1);
                                 bail.push(self.emit_jcc_rel32_patch(0x85)); // JNZ old-gen
-                                // non-null OLD value → helper (SATB). The old ref
-                                // is the 8-byte pointer AT the cell base.
+                                                                            // non-null OLD value → helper (SATB). The old ref
+                                                                            // is the 8-byte pointer AT the cell base.
                                 self.emit_mov_r64_mem_disp32(RCX, RAX, cell_off);
                                 self.emit_test_r64_r64(RCX);
                                 bail.push(self.emit_jcc_rel32_patch(0x85)); // JNZ non-null old
-                                // bounds: field_index < num_slots (header u32 @16).
+                                                                            // bounds: field_index < num_slots (header u32 @16).
                                 self.emit_mov_r32_mem_disp32(RCX, RAX, 16);
                                 self.emit_mov_imm64(RDX, field_index as i64);
                                 self.emit_cmp_r32_r32(RDX, RCX);
                                 let oob = self.emit_jcc_rel32_patch(0x83); // JAE → drop
-                                // FAST STORE: bare 8-byte pointer at the cell base.
+                                                                           // FAST STORE: bare 8-byte pointer at the cell base.
                                 self.load_slot_to_reg(RDX, val_slot);
                                 self.emit_mov_mem_disp32_r64(RAX, RDX, cell_off);
                                 let done = self.emit_jmp_rel32_patch();
@@ -19260,13 +19258,13 @@ impl Compiler {
                                 // null receiver → helper (matches the helper's no-op).
                                 self.emit_test_r64_r64(RAX);
                                 bail.push(self.emit_jcc_rel32_patch(0x84)); // JZ
-                                // old-gen receiver → helper (card barrier). gc_flags is
-                                // the byte at header offset 21; GC_FLAG_OLD_GEN == bit 0.
+                                                                            // old-gen receiver → helper (card barrier). gc_flags is
+                                                                            // the byte at header offset 21; GC_FLAG_OLD_GEN == bit 0.
                                 self.emit_mov_r32_mem_disp32(RCX, RAX, 21);
                                 self.emit_and_r64_imm8(RCX, 1);
                                 bail.push(self.emit_jcc_rel32_patch(0x85)); // JNZ old-gen
-                                // non-null OLD value → helper (SATB). Read the cell's
-                                // 8-byte payload; a null old value never needs SATB.
+                                                                            // non-null OLD value → helper (SATB). Read the cell's
+                                                                            // 8-byte payload; a null old value never needs SATB.
                                 self.emit_mov_r64_mem_disp32(
                                     RCX,
                                     RAX,
@@ -19274,15 +19272,15 @@ impl Compiler {
                                 );
                                 self.emit_test_r64_r64(RCX);
                                 bail.push(self.emit_jcc_rel32_patch(0x85)); // JNZ non-null old
-                                // bounds: field_index < num_slots (header u32 @16).
-                                // 32-bit compare — an 8-byte read would fold in the
-                                // adjacent gc_age/gc_flags bytes.
+                                                                            // bounds: field_index < num_slots (header u32 @16).
+                                                                            // 32-bit compare — an 8-byte read would fold in the
+                                                                            // adjacent gc_age/gc_flags bytes.
                                 self.emit_mov_r32_mem_disp32(RCX, RAX, 16); // RCX = num_slots
                                 self.emit_mov_imm64(RDX, field_index as i64); // RDX = field_index
                                 self.emit_cmp_r32_r32(RDX, RCX); // cmp field_index, num_slots
                                 let oob = self.emit_jcc_rel32_patch(0x83); // JAE → out of bounds, drop
-                                // FAST STORE. tag dword = 4 (+ zeroed pad dword) via a
-                                // sign-extended imm32 qword store; payload = value.
+                                                                           // FAST STORE. tag dword = 4 (+ zeroed pad dword) via a
+                                                                           // sign-extended imm32 qword store; payload = value.
                                 self.emit_mov_imm64(RCX, 4);
                                 self.emit_mov_mem_disp32_r64(
                                     RAX,
@@ -20956,12 +20954,12 @@ impl Compiler {
                                 return false;
                             };
                             self.next_spill_offset = args_end;
-                                                                                        // Store args in reverse offset order so they form
-                                                                                        // a contiguous ascending-address buffer:
-                                                                                        //   arg[0] at [rbp - highest_offset] (lowest addr)
-                                                                                        //   arg[n-1] at [rbp - args_base_offset] (highest addr)
-                                                                                        // This is necessary because modrm_rbp_disp negates
-                                                                                        // the offset, so higher offsets map to lower addresses.
+                            // Store args in reverse offset order so they form
+                            // a contiguous ascending-address buffer:
+                            //   arg[0] at [rbp - highest_offset] (lowest addr)
+                            //   arg[n-1] at [rbp - args_base_offset] (highest addr)
+                            // This is necessary because modrm_rbp_disp negates
+                            // the offset, so higher offsets map to lower addresses.
                             for (i, slot) in arg_slots.iter().enumerate() {
                                 let buf_offset = args_base_offset + ((n - 1 - i) as i32) * 8; // Cast: x86-64 immediate encoding
                                 self.load_slot_to_reg(RAX, *slot);
@@ -22480,9 +22478,9 @@ impl Compiler {
                                     return false;
                                 };
                                 self.next_spill_offset = args_end;
-                                                                                            // Store args in reverse offset order (same fix
-                                                                                            // as invokestatic): higher offsets → lower addresses,
-                                                                                            // so arg[0] at highest offset = lowest address.
+                                // Store args in reverse offset order (same fix
+                                // as invokestatic): higher offsets → lower addresses,
+                                // so arg[0] at highest offset = lowest address.
                                 for (i, slot) in arg_slots.iter().enumerate() {
                                     let buf_offset = args_base_offset + ((n - 1 - i) as i32) * 8; // Cast: x86-64 immediate encoding
                                     self.load_slot_to_reg(RAX, *slot);
@@ -24440,8 +24438,7 @@ pub fn compile_with_param_slots(
         // Fire ONLY in a method that actually has a scalar object live at that
         // bci — so the global env doesn't perturb unrelated methods (e.g. the
         // driver `main`, which has no scalar replacement).
-        crate::deopt_eager_bci_override()
-            .filter(|n| compiler.sr_local_prov_at.contains_key(n))
+        crate::deopt_eager_bci_override().filter(|n| compiler.sr_local_prov_at.contains_key(n))
     } else {
         None
     };
@@ -33439,9 +33436,9 @@ mod tests {
         let mut non_escaping = std::collections::HashSet::new();
         non_escaping.insert(0usize);
         let new_info = vec![(0usize, 7u32, 1usize, true, true)]; // class_id 7, 1 field
-        // LEAK(intentional): this test JitInvokeInfo is referenced by raw
-        // pointer from generated code, so it and its string fields must remain
-        // valid for the process lifetime.
+                                                                 // LEAK(intentional): this test JitInvokeInfo is referenced by raw
+                                                                 // pointer from generated code, so it and its string fields must remain
+                                                                 // valid for the process lifetime.
         let init_info = Box::leak(Box::new(JitInvokeInfo {
             // LEAK(intentional): field of leaked JitInvokeInfo.
             class_name: Box::leak("Foo".to_string().into_boxed_str()),
@@ -33454,19 +33451,44 @@ mod tests {
             invoke_kind: 0xb7,
         }));
         let invoke_info = vec![(4usize, init_info as *const JitInvokeInfo)];
-        let plan = plan_scalar_replacement(&code, code_len, &non_escaping, &new_info, &invoke_info, 0);
+        let plan =
+            plan_scalar_replacement(&code, code_len, &non_escaping, &new_info, &invoke_info, 0);
 
-        assert!(plan.objects.contains_key(&0), "Foo should be scalar-replaced");
+        assert!(
+            plan.objects.contains_key(&0),
+            "Foo should be scalar-replaced"
+        );
         // Both monitor ops are over the scalar object (relockable, not blocking).
-        assert!(plan.monitor_scalar_ops.contains(&11), "monitorenter@11 is scalar");
-        assert!(plan.monitor_scalar_ops.contains(&18), "monitorexit@18 is scalar");
+        assert!(
+            plan.monitor_scalar_ops.contains(&11),
+            "monitorenter@11 is scalar"
+        );
+        assert!(
+            plan.monitor_scalar_ops.contains(&18),
+            "monitorexit@18 is scalar"
+        );
         // The lock is held (depth 1) across the block body and AT the monitorexit
         // entry (it executes the unlock), but NOT before the enter / after the exit.
-        assert_eq!(plan.monitor_at.get(&12).map(|v| v.as_slice()), Some([(0usize, 1u32)].as_slice()));
-        assert_eq!(plan.monitor_at.get(&14).map(|v| v.as_slice()), Some([(0usize, 1u32)].as_slice()));
-        assert_eq!(plan.monitor_at.get(&18).map(|v| v.as_slice()), Some([(0usize, 1u32)].as_slice()));
-        assert!(!plan.monitor_at.contains_key(&11), "not held before the enter executes");
-        assert!(!plan.monitor_at.contains_key(&19), "released after the exit");
+        assert_eq!(
+            plan.monitor_at.get(&12).map(|v| v.as_slice()),
+            Some([(0usize, 1u32)].as_slice())
+        );
+        assert_eq!(
+            plan.monitor_at.get(&14).map(|v| v.as_slice()),
+            Some([(0usize, 1u32)].as_slice())
+        );
+        assert_eq!(
+            plan.monitor_at.get(&18).map(|v| v.as_slice()),
+            Some([(0usize, 1u32)].as_slice())
+        );
+        assert!(
+            !plan.monitor_at.contains_key(&11),
+            "not held before the enter executes"
+        );
+        assert!(
+            !plan.monitor_at.contains_key(&19),
+            "released after the exit"
+        );
     }
 
     #[test]
@@ -35757,4 +35779,3 @@ mod tests {
         );
     }
 }
-

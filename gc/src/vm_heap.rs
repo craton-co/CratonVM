@@ -284,11 +284,7 @@ impl VmHeap {
     /// allocation path including the old-generation spill, but returns `None`
     /// on true heap exhaustion instead of aborting the VM. Lets the JIT
     /// object-alloc helper raise a catchable `OutOfMemoryError`.
-    pub fn try_alloc_object_full(
-        &self,
-        class_id: ClassId,
-        num_fields: usize,
-    ) -> Option<ObjectRef> {
+    pub fn try_alloc_object_full(&self, class_id: ClassId, num_fields: usize) -> Option<ObjectRef> {
         match self {
             VmHeap::Generational(h) => h.try_alloc_object_full(class_id, num_fields),
             VmHeap::G1(h) => h.try_alloc_object(class_id, num_fields),
@@ -1119,11 +1115,11 @@ impl VmHeap {
     pub fn g1_mark_roots(&self, roots: &[cratonvm_types::ObjectRef]) {
         if let VmHeap::G1(g1) = self {
             g1.remark(roots); // remark marks roots + drains SATB
-            // The worker (spawned by `g1_start_concurrent_mark` just before this)
-            // may have already drained the initially-empty worklist and parked
-            // with `quiesced=true`. These roots seed real work, so wake it and
-            // clear the premature quiescence — otherwise the completion poll
-            // could fire before the seeded graph is marked.
+                              // The worker (spawned by `g1_start_concurrent_mark` just before this)
+                              // may have already drained the initially-empty worklist and parked
+                              // with `quiesced=true`. These roots seed real work, so wake it and
+                              // clear the premature quiescence — otherwise the completion poll
+                              // could fire before the seeded graph is marked.
             if let Some(ctrl) = g1.concurrent_mark.lock().as_ref() {
                 ctrl.notify_work_available();
             }

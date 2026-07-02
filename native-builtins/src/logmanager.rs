@@ -1615,7 +1615,10 @@ fn jul_level_tag(ctx: &mut dyn NativeContext, level_obj: Option<ObjectRef>) -> S
 /// JUnit's `ListenerRegistry.notifyEach` logs swallowed listener exceptions
 /// exactly this way, so any such error was invisible. Identify the throwable
 /// by `instanceof Throwable` and render it with a short stack trace.
-fn native_jul_logger_log_throwable(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+fn native_jul_logger_log_throwable(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(o)) => *o,
         _ => None,

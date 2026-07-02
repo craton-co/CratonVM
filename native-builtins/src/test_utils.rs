@@ -751,7 +751,9 @@ impl NativeContext for MockNativeContext {
         // path still reads the right value. Unknown names are treated as
         // absent (returning `Int(0)` rather than silently shadowing slot
         // 0, which would corrupt slot-0 test state).
-        let slot = if self.class_name_of_id(self.class_id_of_object(obj)).as_deref()
+        let slot = if self
+            .class_name_of_id(self.class_id_of_object(obj))
+            .as_deref()
             == Some("java/lang/reflect/Parameter")
         {
             mock_parameter_field_slot(field_name).or_else(|| mock_jdk_field_slot(field_name))
@@ -765,7 +767,9 @@ impl NativeContext for MockNativeContext {
     }
 
     fn set_field_by_name(&self, obj: ObjectRef, field_name: &str, value: Value) {
-        let slot = if self.class_name_of_id(self.class_id_of_object(obj)).as_deref()
+        let slot = if self
+            .class_name_of_id(self.class_id_of_object(obj))
+            .as_deref()
             == Some("java/lang/reflect/Parameter")
         {
             mock_parameter_field_slot(field_name).or_else(|| mock_jdk_field_slot(field_name))

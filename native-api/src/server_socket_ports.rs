@@ -42,7 +42,10 @@ pub fn record(identity_hash: i32, port: i32) {
 /// identity hash, if any. Called from the winning `getLocalPort` native when it
 /// has no channel back-ref (i.e. a plain `ServerSocket`).
 pub fn get(identity_hash: i32) -> Option<i32> {
-    table().lock().ok().and_then(|t| t.get(&identity_hash).copied())
+    table()
+        .lock()
+        .ok()
+        .and_then(|t| t.get(&identity_hash).copied())
 }
 
 /// Drop the recorded port for a closed `ServerSocket` (best-effort).

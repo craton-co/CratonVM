@@ -181,7 +181,10 @@ pub enum Op {
     /// `double` selects `ucomisd` vs `ucomiss`. `nan_greater` is the JVMS
     /// unordered rule: a NaN operand yields `+1` for the `g` variants
     /// (`fcmpg`/`dcmpg`) and `-1` for the `l` variants (`fcmpl`/`dcmpl`).
-    FCmp { double: bool, nan_greater: bool },
+    FCmp {
+        double: bool,
+        nan_greater: bool,
+    },
 
     // ── Type conversion ──────────────────────────────────────────────
     I2L,
@@ -707,8 +710,12 @@ impl IrBuilder {
     /// match only `Op::Const`, never `Op::ConstF`, so the integer fold/identity
     /// passes never touch a float constant — FP arithmetic is never mis-folded.)
     fn fconst(&mut self, val: f32) -> NodeId {
-        self.graph
-            .add(Op::ConstF(val.to_bits() as u64), IrType::Float, vec![], None)
+        self.graph.add(
+            Op::ConstF(val.to_bits() as u64),
+            IrType::Float,
+            vec![],
+            None,
+        )
     }
 
     /// FP value tier (inc 30): a `double` constant, stored as its raw 64-bit
@@ -2978,5 +2985,3 @@ mod tests {
         assert!(!ir_compatible_sized(&scan, 201));
     }
 }
-
-

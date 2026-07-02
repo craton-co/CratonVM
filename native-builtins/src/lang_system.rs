@@ -641,8 +641,7 @@ pub(crate) fn native_thread_start0(
         )
     {
         let parent = ctx.current_thread_object();
-        if let Value::Object(Some(parent_ccl)) =
-            ctx.get_field_by_name(parent, "contextClassLoader")
+        if let Value::Object(Some(parent_ccl)) = ctx.get_field_by_name(parent, "contextClassLoader")
         {
             ctx.set_field_by_name(this, "contextClassLoader", Value::Object(Some(parent_ccl)));
         }
@@ -1553,7 +1552,9 @@ fn set_system_env_singleton(obj: ObjectRef) -> ObjectRef {
 
 /// The cached `System.getProperties()` `Properties` singleton, if already built.
 pub fn system_props_singleton() -> Option<ObjectRef> {
-    *system_props_store().lock().unwrap_or_else(|e| e.into_inner())
+    *system_props_store()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
 }
 
 /// Publish `obj` as the `System.getProperties()` singleton, unless another
@@ -1561,7 +1562,9 @@ pub fn system_props_singleton() -> Option<ObjectRef> {
 /// `obj` is discarded (it becomes unreachable and is collected). Returns the
 /// canonical singleton so all callers converge on one identity.
 pub fn set_system_props_singleton(obj: ObjectRef) -> ObjectRef {
-    let mut g = system_props_store().lock().unwrap_or_else(|e| e.into_inner());
+    let mut g = system_props_store()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     match *g {
         Some(existing) => existing,
         None => {
@@ -1578,7 +1581,10 @@ pub fn gc_scan_system_singleton_roots(out: &mut Vec<ObjectRef>) {
     if let Some(o) = *system_env_store().lock().unwrap_or_else(|e| e.into_inner()) {
         out.push(o);
     }
-    if let Some(o) = *system_props_store().lock().unwrap_or_else(|e| e.into_inner()) {
+    if let Some(o) = *system_props_store()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+    {
         out.push(o);
     }
 }
@@ -1600,7 +1606,11 @@ pub fn gc_update_system_singleton_refs(pointer_map: &std::collections::HashMap<u
         }
     };
     remap(&mut system_env_store().lock().unwrap_or_else(|e| e.into_inner()));
-    remap(&mut system_props_store().lock().unwrap_or_else(|e| e.into_inner()));
+    remap(
+        &mut system_props_store()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()),
+    );
 }
 
 /// Reset the cached system singletons. Called when creating a new VM so a stale
@@ -1608,7 +1618,9 @@ pub fn gc_update_system_singleton_refs(pointer_map: &std::collections::HashMap<u
 /// `classloader::reset_loader_singletons`).
 pub fn reset_system_singletons() {
     *system_env_store().lock().unwrap_or_else(|e| e.into_inner()) = None;
-    *system_props_store().lock().unwrap_or_else(|e| e.into_inner()) = None;
+    *system_props_store()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = None;
 }
 
 pub(crate) fn native_system_getenv_all(
@@ -1987,7 +1999,10 @@ pub(crate) fn native_thread_sleep_nanos(
                     .take(12)
                     .map(|e| format!("{}.{}:{}", e.class_name, e.method_name, e.line_number))
                     .collect();
-                eprintln!("[SLEEP-NANOS-TRACE #{n} nanos={nanos}] {}", frames.join(" <- "));
+                eprintln!(
+                    "[SLEEP-NANOS-TRACE #{n} nanos={nanos}] {}",
+                    frames.join(" <- ")
+                );
             }
         }
         // Check interrupted before sleeping — clear flag and throw
@@ -2504,13 +2519,34 @@ pub(crate) fn native_array_multi_new_array(
     // built from.
     let (prim_et, leaf_desc) = match comp_name.as_str() {
         "int" | "I" => (Some(cratonvm_types::ArrayElementType::Int), "I".to_string()),
-        "long" | "J" => (Some(cratonvm_types::ArrayElementType::Long), "J".to_string()),
-        "float" | "F" => (Some(cratonvm_types::ArrayElementType::Float), "F".to_string()),
-        "double" | "D" => (Some(cratonvm_types::ArrayElementType::Double), "D".to_string()),
-        "boolean" | "Z" => (Some(cratonvm_types::ArrayElementType::Boolean), "Z".to_string()),
-        "byte" | "B" => (Some(cratonvm_types::ArrayElementType::Byte), "B".to_string()),
-        "char" | "C" => (Some(cratonvm_types::ArrayElementType::Char), "C".to_string()),
-        "short" | "S" => (Some(cratonvm_types::ArrayElementType::Short), "S".to_string()),
+        "long" | "J" => (
+            Some(cratonvm_types::ArrayElementType::Long),
+            "J".to_string(),
+        ),
+        "float" | "F" => (
+            Some(cratonvm_types::ArrayElementType::Float),
+            "F".to_string(),
+        ),
+        "double" | "D" => (
+            Some(cratonvm_types::ArrayElementType::Double),
+            "D".to_string(),
+        ),
+        "boolean" | "Z" => (
+            Some(cratonvm_types::ArrayElementType::Boolean),
+            "Z".to_string(),
+        ),
+        "byte" | "B" => (
+            Some(cratonvm_types::ArrayElementType::Byte),
+            "B".to_string(),
+        ),
+        "char" | "C" => (
+            Some(cratonvm_types::ArrayElementType::Char),
+            "C".to_string(),
+        ),
+        "short" | "S" => (
+            Some(cratonvm_types::ArrayElementType::Short),
+            "S".to_string(),
+        ),
         other => (None, format!("L{other};")),
     };
 
@@ -2740,11 +2776,7 @@ fn read_byte_buffer_define_class_slice(
 /// Only fires for USER-DEFINED loaders and only for supertypes not already
 /// loaded, so built-in/app-loader defines (ByteBuddy, cglib, the bootstrap
 /// chain) — whose supertypes resolve from the classpath — are unaffected.
-fn preload_supertypes_via_loader(
-    ctx: &mut dyn NativeContext,
-    loader_obj: ObjectRef,
-    bytes: &[u8],
-) {
+fn preload_supertypes_via_loader(ctx: &mut dyn NativeContext, loader_obj: ObjectRef, bytes: &[u8]) {
     if !crate::classloader::is_user_defined_loader(ctx, loader_obj) {
         return;
     }
@@ -3577,7 +3609,10 @@ mod t15_tests {
                 Value::Object(None), // source
             ],
         );
-        assert!(r.is_err(), "invalid class bytes must throw, not return null");
+        assert!(
+            r.is_err(),
+            "invalid class bytes must throw, not return null"
+        );
     }
 
     #[test]
@@ -3638,7 +3673,10 @@ mod t15_tests {
                 Value::Object(None),
             ],
         );
-        assert!(r.is_err(), "invalid class bytes must throw, not return null");
+        assert!(
+            r.is_err(),
+            "invalid class bytes must throw, not return null"
+        );
     }
 
     #[test]

@@ -216,7 +216,11 @@ pub(crate) fn fill_stack_trace_element(
 /// synthetic-stub layout — that mirror clobbered Throwable.backtrace with
 /// a String reference and corrupted any downstream consumer that read
 /// backtrace as an Object[].
-pub(crate) fn write_throwable_detail_message(ctx: &mut dyn NativeContext, this: ObjectRef, msg: Value) {
+pub(crate) fn write_throwable_detail_message(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    msg: Value,
+) {
     write_throwable_field_cached(
         ctx,
         &THROWABLE_DETAIL_MESSAGE_INDEX,

@@ -1327,11 +1327,7 @@ mod tests {
 
     use crate::module::ModuleDescriptor;
 
-    fn make_class_in_module(
-        store: &mut ClassStore,
-        name: &str,
-        module: Option<&str>,
-    ) -> ClassId {
+    fn make_class_in_module(store: &mut ClassStore, name: &str, module: Option<&str>) -> ClassId {
         let id = make_class(store, name, None, ClassAccessFlags::PUBLIC);
         store.get_mut(id).unwrap().module_name = module.map(|m| m.to_string());
         id
@@ -1367,11 +1363,13 @@ mod tests {
         // CratonVM synthesises as `[I` under module `java.base` with an empty
         // package. The JPMS check must not deny access to an array class.
         let mut store = ClassStore::new();
-        let accessor =
-            make_class_in_module(&mut store, "jdk/xml/internal/XMLSecurityManager", Some("java.xml"));
+        let accessor = make_class_in_module(
+            &mut store,
+            "jdk/xml/internal/XMLSecurityManager",
+            Some("java.xml"),
+        );
         let prim_arr = make_class_in_module(&mut store, "[I", Some("java.base"));
-        let ref_arr =
-            make_class_in_module(&mut store, "[Ljava/lang/Object;", Some("java.base"));
+        let ref_arr = make_class_in_module(&mut store, "[Ljava/lang/Object;", Some("java.base"));
         let reg = strict_registry();
         assert!(check_module_access(
             store.get(accessor).unwrap(),
@@ -1393,8 +1391,7 @@ mod tests {
         // CratonVM artifact (e.g. a synthetic/hidden class), not a real export
         // boundary — don't deny on it.
         let mut store = ClassStore::new();
-        let accessor =
-            make_class_in_module(&mut store, "jdk/xml/internal/Foo", Some("java.xml"));
+        let accessor = make_class_in_module(&mut store, "jdk/xml/internal/Foo", Some("java.xml"));
         let target = make_class_in_module(&mut store, "DefaultPkgClass", Some("java.base"));
         let reg = strict_registry();
         assert!(check_module_access(
@@ -1411,10 +1408,8 @@ mod tests {
         // named module is still denied — the exemptions above don't neuter the
         // check for real classes.
         let mut store = ClassStore::new();
-        let accessor =
-            make_class_in_module(&mut store, "jdk/xml/internal/Foo", Some("java.xml"));
-        let target =
-            make_class_in_module(&mut store, "java/lang/invoke/Hidden", Some("java.base"));
+        let accessor = make_class_in_module(&mut store, "jdk/xml/internal/Foo", Some("java.xml"));
+        let target = make_class_in_module(&mut store, "java/lang/invoke/Hidden", Some("java.base"));
         let reg = strict_registry();
         assert!(check_module_access(
             store.get(accessor).unwrap(),

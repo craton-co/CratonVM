@@ -731,7 +731,12 @@ pub(crate) fn register_phase55_executors(r: &mut NativeMethodRegistry) {
     // Delegates to the shared, real-JDK-aware impl so a thread parked in the
     // genuine `waitingGet()` (untimed `get()`/`join()`) is unparked via
     // `postComplete()` instead of hanging forever. See `native_cf_complete`.
-    r.register(cf, "complete", "(Ljava/lang/Object;)Z", crate::native_cf_complete);
+    r.register(
+        cf,
+        "complete",
+        "(Ljava/lang/Object;)Z",
+        crate::native_cf_complete,
+    );
     // completeExceptionally(Throwable) — complete with exception
     r.register(
         cf,
@@ -4578,9 +4583,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             // matched), so it returned the whole encoded target as garbage —
             // javac then keyed packages on garbage and reported "package
             // org.h2.tools does not exist" for every classpath jar.
-            if let (Some((_, _, be)), Some((_, _, te))) =
-                (vfs_decode(&base), vfs_decode(&target))
-            {
+            if let (Some((_, _, be)), Some((_, _, te))) = (vfs_decode(&base), vfs_decode(&target)) {
                 let rel = p57_relativize(&be, &te).unwrap_or(te);
                 let result = p57_alloc_path(ctx, &rel);
                 // Tag the result with the source's owning virtual FS so its
@@ -4774,8 +4777,13 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             // on this to build package names); the host FS renders the OS
             // separator.
             if let Ok(this) = obj_arg(args, 0) {
-                let is_virtual = matches!(ctx.get_field(this, P57_FS_JAR_FIELD), Value::Object(Some(_)))
-                    || matches!(ctx.get_field(this, P57_FS_JRT_FIELD), Value::Object(Some(_)));
+                let is_virtual = matches!(
+                    ctx.get_field(this, P57_FS_JAR_FIELD),
+                    Value::Object(Some(_))
+                ) || matches!(
+                    ctx.get_field(this, P57_FS_JRT_FIELD),
+                    Value::Object(Some(_))
+                );
                 if is_virtual {
                     let s = ctx.create_string("/");
                     return Ok(Some(Value::Object(Some(s))));
@@ -4849,12 +4857,18 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             // FS, "file" otherwise.
             let scheme_str = match obj_arg(args, 0) {
                 Ok(this)
-                    if matches!(ctx.get_field(this, P57_FS_JRT_FIELD), Value::Object(Some(_))) =>
+                    if matches!(
+                        ctx.get_field(this, P57_FS_JRT_FIELD),
+                        Value::Object(Some(_))
+                    ) =>
                 {
                     "jrt"
                 }
                 Ok(this)
-                    if matches!(ctx.get_field(this, P57_FS_JAR_FIELD), Value::Object(Some(_))) =>
+                    if matches!(
+                        ctx.get_field(this, P57_FS_JAR_FIELD),
+                        Value::Object(Some(_))
+                    ) =>
                 {
                     "jar"
                 }
@@ -7734,10 +7748,7 @@ fn p57_windows_absolute_path_string(path: &str) -> String {
     if has_drive {
         let drive = &s[..2];
         let rest = s[2..].trim_start_matches(|c| c == '/' || c == '\\');
-        if cwd
-            .get(0..2)
-            .is_some_and(|d| d.eq_ignore_ascii_case(drive))
-        {
+        if cwd.get(0..2).is_some_and(|d| d.eq_ignore_ascii_case(drive)) {
             if rest.is_empty() {
                 return cwd;
             }
@@ -8473,9 +8484,7 @@ fn jrt_image(java_home: &str) -> Option<std::sync::Arc<JrtImage>> {
     if let Some(cached) = guard.get(java_home) {
         return cached.clone();
     }
-    let modules_path = std::path::Path::new(java_home)
-        .join("lib")
-        .join("modules");
+    let modules_path = std::path::Path::new(java_home).join("lib").join("modules");
     let built = cratonvm_reader::JImageReader::open(&modules_path)
         .ok()
         .map(|reader| {
@@ -8515,7 +8524,9 @@ fn jrt_img_is_file(img: &JrtImage, path: &str) -> bool {
 
 fn jrt_img_is_dir(img: &JrtImage, path: &str) -> bool {
     let prefix = format!("{path}/");
-    let idx = img.entries.partition_point(|e| e.as_str() < prefix.as_str());
+    let idx = img
+        .entries
+        .partition_point(|e| e.as_str() < prefix.as_str());
     img.entries.get(idx).is_some_and(|e| e.starts_with(&prefix))
 }
 
@@ -8585,7 +8596,9 @@ fn jrtfs_list_dir_classified(java_home: &str, entry: &str) -> Vec<(String, bool)
             let prefix = format!("{img_path}/");
             let mut seen: std::collections::BTreeMap<String, bool> =
                 std::collections::BTreeMap::new();
-            let start = img.entries.partition_point(|x| x.as_str() < prefix.as_str());
+            let start = img
+                .entries
+                .partition_point(|x| x.as_str() < prefix.as_str());
             for p in &img.entries[start..] {
                 let rest = match p.strip_prefix(&prefix) {
                     Some(r) => r,
@@ -8610,8 +8623,8 @@ fn jrtfs_list_dir_classified(java_home: &str, entry: &str) -> Vec<(String, bool)
 
 /// Read a jrt logical entry's bytes out of the jimage.
 fn jrtfs_read(java_home: &str, entry: &str) -> std::io::Result<Vec<u8>> {
-    let img = jrt_image(java_home)
-        .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotFound))?;
+    let img =
+        jrt_image(java_home).ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotFound))?;
     let img_path = jrt_entry_to_image(entry)
         .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotFound))?;
     img.reader
@@ -12541,7 +12554,12 @@ pub(crate) fn register_p58_completable_future(r: &mut NativeMethodRegistry) {
     // complete — set result and mark done. Delegates to the shared,
     // real-JDK-aware impl (fires parked Signallers via postComplete; see
     // `native_cf_complete`).
-    r.register(cf, "complete", "(Ljava/lang/Object;)Z", crate::native_cf_complete);
+    r.register(
+        cf,
+        "complete",
+        "(Ljava/lang/Object;)Z",
+        crate::native_cf_complete,
+    );
     // thenApply on CF itself (not just CompletionStage)
     r.register(
         cf,
@@ -16051,29 +16069,29 @@ pub fn register_p59_jar(r: &mut NativeMethodRegistry) {
             // directory on every lookup — see `jar_contents_cached`).
             if let Some(contents) = jar_contents_cached(&path) {
                 if let Some(rec) = contents.by_name.get(&entry_name) {
-                        let size = rec.size;
-                        let csize = rec.csize;
-                        let method = rec.method;
-                        let crc = rec.crc;
-                        let ze = alloc_concurrent_synthetic(ctx, "java/util/jar/JarEntry", 4);
-                        let name_s = ctx.create_string(&entry_name);
-                        ctx.set_field(ze, 0, Value::Object(Some(name_s)));
-                        ctx.set_field(ze, 1, Value::Long(size));
-                        ctx.set_field(ze, 2, Value::Long(csize));
-                        ctx.set_field(ze, 3, Value::Int(method));
-                        // Real-JDK mode: `ZipEntry.getSize()/getMethod()/...` run
-                        // real bytecode that reads the REAL fields by their actual
-                        // offset, NOT the synthetic slots above. Quarkus'
-                        // RunnerClassLoader sizes its class-byte read from
-                        // `entry.getSize()`; if that returns 0 the class is defined
-                        // from a 0-length array → ClassFormatError. Mirror the real
-                        // field names (matches zip_real_jar::alloc_zip_entry).
-                        ctx.set_field_by_name(ze, "name", Value::Object(Some(name_s)));
-                        ctx.set_field_by_name(ze, "size", Value::Long(size));
-                        ctx.set_field_by_name(ze, "csize", Value::Long(csize));
-                        ctx.set_field_by_name(ze, "method", Value::Int(method));
-                        ctx.set_field_by_name(ze, "crc", Value::Long(crc));
-                        return Ok(Some(Value::Object(Some(ze))));
+                    let size = rec.size;
+                    let csize = rec.csize;
+                    let method = rec.method;
+                    let crc = rec.crc;
+                    let ze = alloc_concurrent_synthetic(ctx, "java/util/jar/JarEntry", 4);
+                    let name_s = ctx.create_string(&entry_name);
+                    ctx.set_field(ze, 0, Value::Object(Some(name_s)));
+                    ctx.set_field(ze, 1, Value::Long(size));
+                    ctx.set_field(ze, 2, Value::Long(csize));
+                    ctx.set_field(ze, 3, Value::Int(method));
+                    // Real-JDK mode: `ZipEntry.getSize()/getMethod()/...` run
+                    // real bytecode that reads the REAL fields by their actual
+                    // offset, NOT the synthetic slots above. Quarkus'
+                    // RunnerClassLoader sizes its class-byte read from
+                    // `entry.getSize()`; if that returns 0 the class is defined
+                    // from a 0-length array → ClassFormatError. Mirror the real
+                    // field names (matches zip_real_jar::alloc_zip_entry).
+                    ctx.set_field_by_name(ze, "name", Value::Object(Some(name_s)));
+                    ctx.set_field_by_name(ze, "size", Value::Long(size));
+                    ctx.set_field_by_name(ze, "csize", Value::Long(csize));
+                    ctx.set_field_by_name(ze, "method", Value::Int(method));
+                    ctx.set_field_by_name(ze, "crc", Value::Long(crc));
+                    return Ok(Some(Value::Object(Some(ze))));
                 }
             }
             Ok(Some(Value::Object(None)))
@@ -16103,8 +16121,8 @@ pub fn register_p59_jar(r: &mut NativeMethodRegistry) {
             };
             // Cached parse + decompress (O(1) per call; avoids re-parsing the
             // whole central directory on every entry — see `jar_contents_cached`).
-            let bytes: Option<std::sync::Arc<Vec<u8>>> =
-                jar_contents_cached(&path).and_then(|c| c.by_name.get(&entry_name).map(|r| r.bytes.clone()));
+            let bytes: Option<std::sync::Arc<Vec<u8>>> = jar_contents_cached(&path)
+                .and_then(|c| c.by_name.get(&entry_name).map(|r| r.bytes.clone()));
             let bytes = match bytes {
                 Some(b) => b,
                 None => return Ok(Some(Value::Object(None))),
@@ -16799,8 +16817,7 @@ fn spring_class_utils_for_name_impl(
     // `(int[]) list.get(i)` threw `Integer cannot be cast to [I`
     // (CollectionsWithDefaultTypesTests.buildCollectionFromMixtureOfReferencesAndValues).
     match dotted.as_str() {
-        "boolean" | "byte" | "char" | "short" | "int" | "long" | "float" | "double"
-        | "void" => {
+        "boolean" | "byte" | "char" | "short" | "int" | "long" | "float" | "double" | "void" => {
             let mirror = ctx.primitive_class_mirror(&dotted);
             return Ok(Some(Value::Object(Some(mirror))));
         }
@@ -16877,7 +16894,11 @@ fn spring_class_utils_for_name_impl(
             let load = |ctx: &mut dyn NativeContext, n: ObjectRef| {
                 crate::lang_class::native_class_for_name(
                     ctx,
-                    &[Value::Object(Some(n)), Value::Int(0), Value::Object(Some(loader))],
+                    &[
+                        Value::Object(Some(n)),
+                        Value::Int(0),
+                        Value::Object(Some(loader)),
+                    ],
                 )
             };
             match load(ctx, name_obj) {
@@ -18279,11 +18300,19 @@ pub(crate) fn p_int_stream_spliterator(
         "java/util/Spliterators",
         "spliterator",
         "([IIII)Ljava/util/Spliterator$OfInt;",
-        &[Value::Object(Some(arr)), Value::Int(0), Value::Int(n as i32), Value::Int(0)],
+        &[
+            Value::Object(Some(arr)),
+            Value::Int(0),
+            Value::Int(n as i32),
+            Value::Int(0),
+        ],
     )
 }
 
-pub(crate) fn p_long_stream_spliterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn p_long_stream_spliterator(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let elems = p56_read_stream_elems(ctx, this);
     let n = elems.len();
@@ -18300,11 +18329,19 @@ pub(crate) fn p_long_stream_spliterator(ctx: &mut dyn NativeContext, args: &[Val
         "java/util/Spliterators",
         "spliterator",
         "([JIII)Ljava/util/Spliterator$OfLong;",
-        &[Value::Object(Some(arr)), Value::Int(0), Value::Int(n as i32), Value::Int(0)],
+        &[
+            Value::Object(Some(arr)),
+            Value::Int(0),
+            Value::Int(n as i32),
+            Value::Int(0),
+        ],
     )
 }
 
-pub(crate) fn p_double_stream_spliterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn p_double_stream_spliterator(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let elems = p56_read_stream_elems(ctx, this);
     let n = elems.len();
@@ -18321,11 +18358,19 @@ pub(crate) fn p_double_stream_spliterator(ctx: &mut dyn NativeContext, args: &[V
         "java/util/Spliterators",
         "spliterator",
         "([DIII)Ljava/util/Spliterator$OfDouble;",
-        &[Value::Object(Some(arr)), Value::Int(0), Value::Int(n as i32), Value::Int(0)],
+        &[
+            Value::Object(Some(arr)),
+            Value::Int(0),
+            Value::Int(n as i32),
+            Value::Int(0),
+        ],
     )
 }
 
-pub(crate) fn p_obj_stream_spliterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn p_obj_stream_spliterator(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let elems = p56_read_stream_elems(ctx, this);
     let n = elems.len();
@@ -18337,7 +18382,12 @@ pub(crate) fn p_obj_stream_spliterator(ctx: &mut dyn NativeContext, args: &[Valu
         "java/util/Spliterators",
         "spliterator",
         "([Ljava/lang/Object;III)Ljava/util/Spliterator;",
-        &[Value::Object(Some(arr)), Value::Int(0), Value::Int(n as i32), Value::Int(0)],
+        &[
+            Value::Object(Some(arr)),
+            Value::Int(0),
+            Value::Int(n as i32),
+            Value::Int(0),
+        ],
     )
 }
 
@@ -19866,7 +19916,9 @@ fn p59_files_read_attributes(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
             JarFsKind::Dir => (1, 0i64),
             JarFsKind::File => (
                 0,
-                jrtfs_read(&java_home, &entry).map(|b| b.len() as i64).unwrap_or(0),
+                jrtfs_read(&java_home, &entry)
+                    .map(|b| b.len() as i64)
+                    .unwrap_or(0),
             ),
             JarFsKind::Absent => {
                 return Err(RuntimeError::IOException {
@@ -20263,15 +20315,15 @@ pub(crate) fn register_p59_module(r: &mut NativeMethodRegistry) {
             // Read the module of the class the mirror REFLECTS via
             // `class_id_from_mirror` — `class_id_of_object` would return
             // `java/lang/Class` and mis-report every class as java.base.
-            let module_name: Option<String> = if let Some(Value::Object(Some(mirror))) = args.first()
-            {
-                let class_id = ctx
-                    .class_id_from_mirror(*mirror)
-                    .unwrap_or_else(|| ctx.class_id_of_object(*mirror));
-                ctx.module_name_of_class(class_id)
-            } else {
-                None
-            };
+            let module_name: Option<String> =
+                if let Some(Value::Object(Some(mirror))) = args.first() {
+                    let class_id = ctx
+                        .class_id_from_mirror(*mirror)
+                        .unwrap_or_else(|| ctx.class_id_of_object(*mirror));
+                    ctx.module_name_of_class(class_id)
+                } else {
+                    None
+                };
             if let Some(cached) = ctx.get_cached_module_mirror(module_name.as_deref()) {
                 return Ok(Some(Value::Object(Some(cached))));
             }
@@ -45282,9 +45334,8 @@ fn introspector_get_bean_info(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
                 let (params, _ret) = crate::jmx_openmbean::parse_method_descriptor_pub(desc);
                 if params.len() == 1 {
                     let prop_name = decapitalize(&name[3..]);
-                    let param_mirror = crate::jmx_openmbean::type_descriptor_to_class_mirror_pub(
-                        ctx, &params[0],
-                    );
+                    let param_mirror =
+                        crate::jmx_openmbean::type_descriptor_to_class_mirror_pub(ctx, &params[0]);
                     let param_cid = crate::lang_class::mirror_class_id(ctx, param_mirror);
                     let mm = crate::jmx_openmbean::build_method_mirror(
                         ctx,

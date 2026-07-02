@@ -924,7 +924,10 @@ pub fn deopt_real_enabled() -> bool {
     static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *CACHE.get_or_init(|| match std::env::var("CRATONVM_DEOPT_REAL") {
         // Explicit opt-out values disable; any other value (and unset) → ON.
-        Ok(v) => !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "off" | "no"),
+        Ok(v) => !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off" | "no"
+        ),
         Err(_) => true,
     })
 }
@@ -1358,10 +1361,13 @@ impl CompiledMethod {
         // SAFETY: a non-null `deopt_epoch_guard` is the leaked, retained guard
         // baked by `emit_deopt_stubs` (valid for the process lifetime).
         let guard = unsafe { &*self.deopt_epoch_guard };
-        guard.creation_epoch.store(creation_epoch, Ordering::Relaxed);
         guard
-            .live_epoch_cell
-            .store(live_epoch_cell as *mut std::sync::atomic::AtomicU64, Ordering::Release);
+            .creation_epoch
+            .store(creation_epoch, Ordering::Relaxed);
+        guard.live_epoch_cell.store(
+            live_epoch_cell as *mut std::sync::atomic::AtomicU64,
+            Ordering::Release,
+        );
     }
 
     /// Create from a completed executable buffer (pure method, no context needed).
@@ -4638,11 +4644,7 @@ fn mark_current_jit_compile_method_recursive_cycle() {
 /// Returns true when `target` closes a compile-time cycle to an outer method.
 /// When that happens, every method on the cycle path is marked so callers that
 /// compiled the callee recursively can still avoid baking a raw direct call.
-fn note_jit_recursive_compile_cycle(
-    class_name: &str,
-    method_name: &str,
-    descriptor: &str,
-) -> bool {
+fn note_jit_recursive_compile_cycle(class_name: &str, method_name: &str, descriptor: &str) -> bool {
     let cycle_path = JIT_COMPILE_STACK.with(|stack| {
         let stack = stack.borrow();
         let current_idx = stack.len().checked_sub(1)?;
@@ -5521,7 +5523,8 @@ fn try_compile_inner(
                             && deopt_real_enabled()
                             && !ea_result.scalar_replaceable.is_empty()
                         {
-                            sr_map = Some(build_scalar_replacement_map(&graph, &id_map, &ea_result));
+                            sr_map =
+                                Some(build_scalar_replacement_map(&graph, &id_map, &ea_result));
                         }
                         apply_ea_to_ir(&mut graph, &id_map, &ea_result);
                     }
@@ -5603,17 +5606,11 @@ fn try_compile_inner(
                         // longs, so a live "== HotSpot" probe alone is vacuous).
                         if ir_emit_long
                             && std::env::var_os("CRATONVM_DBG_IR_LONG").is_some()
-                            && method_uses_category2(
-                                code,
-                                code_len,
-                                &cached.method_descriptor,
-                            )
+                            && method_uses_category2(code, code_len, &cached.method_descriptor)
                         {
                             eprintln!(
                                 "[cratonvm-irlong] {}.{}{}: long method took the IR pipeline",
-                                cached.class_name,
-                                cached.method_name,
-                                cached.method_descriptor,
+                                cached.class_name, cached.method_name, cached.method_descriptor,
                             );
                         }
                         return Some(compiled);
@@ -7708,8 +7705,8 @@ mod tests {
             None,
             None,
             None,
-            true, // optimize
-            true, // ir_emit_calls
+            true,  // optimize
+            true,  // ir_emit_calls
             false, // ir_emit_special_calls (testing invokestatic, not special)
             false, // ir_emit_long
             false, // ir_emit_virtual_calls
@@ -7805,8 +7802,21 @@ mod tests {
         // to Op::Call → IR pipeline. Crossing the flags proves SPECIAL is the gate.
         IR_LOWER_COMPILES.with(|c| c.set(0));
         let with = try_compile(
-            &cached, None, None, None, Some(&invoke_resolver), None, None, None, None, None,
-            &helpers, None, None, None, None,
+            &cached,
+            None,
+            None,
+            None,
+            Some(&invoke_resolver),
+            None,
+            None,
+            None,
+            None,
+            None,
+            &helpers,
+            None,
+            None,
+            None,
+            None,
             true,  // optimize
             false, // ir_emit_calls (invokestatic) OFF
             true,  // ir_emit_special_calls ON
@@ -7833,8 +7843,21 @@ mod tests {
         // admit invokespecial.
         IR_LOWER_COMPILES.with(|c| c.set(0));
         let _without = try_compile(
-            &cached, None, None, None, Some(&invoke_resolver), None, None, None, None, None,
-            &helpers, None, None, None, None,
+            &cached,
+            None,
+            None,
+            None,
+            Some(&invoke_resolver),
+            None,
+            None,
+            None,
+            None,
+            None,
+            &helpers,
+            None,
+            None,
+            None,
+            None,
             true,  // optimize
             true,  // ir_emit_calls (invokestatic) ON
             false, // ir_emit_special_calls OFF
@@ -8003,8 +8026,21 @@ mod tests {
         // to Op::Call → IR pipeline. Crossing the flags proves VIRTUAL is the gate.
         IR_LOWER_COMPILES.with(|c| c.set(0));
         let with = try_compile(
-            &cached, None, None, None, Some(&invoke_resolver), None, None, None, None, None,
-            &helpers, None, None, None, None,
+            &cached,
+            None,
+            None,
+            None,
+            Some(&invoke_resolver),
+            None,
+            None,
+            None,
+            None,
+            None,
+            &helpers,
+            None,
+            None,
+            None,
+            None,
             true,  // optimize
             false, // ir_emit_calls (invokestatic) OFF
             false, // ir_emit_special_calls OFF
@@ -8031,8 +8067,21 @@ mod tests {
         // admit invokevirtual.
         IR_LOWER_COMPILES.with(|c| c.set(0));
         let _without = try_compile(
-            &cached, None, None, None, Some(&invoke_resolver), None, None, None, None, None,
-            &helpers, None, None, None, None,
+            &cached,
+            None,
+            None,
+            None,
+            Some(&invoke_resolver),
+            None,
+            None,
+            None,
+            None,
+            None,
+            &helpers,
+            None,
+            None,
+            None,
+            None,
             true,  // optimize
             true,  // ir_emit_calls ON
             true,  // ir_emit_special_calls ON

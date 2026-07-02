@@ -20,29 +20,28 @@ pub mod reflective_probe;
 mod value;
 
 pub use class_id::{ClassId, ClassLoaderId};
+pub use compact_value::{CompactTag, CompactValue, CompactValueError};
 pub use field_layout::{
     class_layout, compact_field_slot, compact_ref_fields_enabled, is_compact_object,
     layout_generation, object_body_size, register_class_layout, set_compact_ref_fields_enabled,
     CompactLayout,
 };
 pub use float_format::{java_double_to_string, java_float_to_string};
-pub use compact_value::{CompactTag, CompactValue, CompactValueError};
 pub use heap_types::{
     array_data_size, array_data_size_checked, element_byte_size, ArrayElementType, ObjectHeader,
     ObjectKind, ARRAY_LENGTH_OFFSET, AUTOBOX_CLASS_ID, FIELD_CELL_PAYLOAD32_OFFSET,
-    FIELD_CELL_PAYLOAD64_OFFSET, FIELD_CELL_TAG_OFFSET, GC_FLAG_MARKED, GC_FLAG_OLD_GEN,
-    HEADER_SIZE, INFLATED_PTR_MASK, MARK_INFLATED, MARK_NEUTRAL, MARK_STATE_MASK, MARK_THIN_LOCKED,
-    GC_FLAG_COMPACT, MARK_WORD_OFFSET, REF_ELEMENT_SIZE, REF_FIELD_SIZE, SLOT_SIZE,
-    THIN_LOCK_OWNER_MASK, THIN_LOCK_OWNER_SHIFT,
-    THIN_LOCK_RECURSION_MASK, THIN_LOCK_RECURSION_SHIFT,
+    FIELD_CELL_PAYLOAD64_OFFSET, FIELD_CELL_TAG_OFFSET, GC_FLAG_COMPACT, GC_FLAG_MARKED,
+    GC_FLAG_OLD_GEN, HEADER_SIZE, INFLATED_PTR_MASK, MARK_INFLATED, MARK_NEUTRAL, MARK_STATE_MASK,
+    MARK_THIN_LOCKED, MARK_WORD_OFFSET, REF_ELEMENT_SIZE, REF_FIELD_SIZE, SLOT_SIZE,
+    THIN_LOCK_OWNER_MASK, THIN_LOCK_OWNER_SHIFT, THIN_LOCK_RECURSION_MASK,
+    THIN_LOCK_RECURSION_SHIFT,
 };
 pub use intern::{intern, intern_arc, StringPool};
 pub use value::{
     decode_value, encode_value, is_object_tag, jlong_bits_as_aligned_object_ptr,
     plausible_heap_pointer, read_value_atomic, read_value_checked, write_value_atomic, ObjectRef,
-    Value,
-    VALUE_MAX_DISCRIMINANT, VTAG_DOUBLE, VTAG_FLOAT, VTAG_INT, VTAG_LONG, VTAG_NULL, VTAG_OBJECT,
-    VTAG_RETADDR, VTAG_UNINIT,
+    Value, VALUE_MAX_DISCRIMINANT, VTAG_DOUBLE, VTAG_FLOAT, VTAG_INT, VTAG_LONG, VTAG_NULL,
+    VTAG_OBJECT, VTAG_RETADDR, VTAG_UNINIT,
 };
 
 #[cfg(test)]

@@ -811,15 +811,16 @@ fn cl_real_load_class_base(
     // under its CANONICAL namespace id — see `proxy_loader_namespace` — so the
     // step-1 scoped lookup here finds them.)
     if crate::classloader::is_generated_proxy_name(&internal) {
-        if let Some(mirror) =
-            crate::classloader::find_loaded_class_for_loader(ctx, this, &internal)
+        if let Some(mirror) = crate::classloader::find_loaded_class_for_loader(ctx, this, &internal)
         {
             return Ok(Some(Value::Object(Some(mirror))));
         }
         let exc = alloc_concurrent_synthetic(ctx, "java/lang/ClassNotFoundException", 1);
         let msg = ctx.create_string(&class_name);
         ctx.set_field(exc, 0, Value::Object(Some(msg)));
-        return Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(exc));
+        return Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(
+            exc,
+        ));
     }
 
     // JVMS §5.3.2 step 1 — `findLoadedClass` FIRST (user-defined loaders only).
@@ -844,8 +845,7 @@ fn cl_real_load_class_base(
     // (Hibernate's `AggregatedClassLoader`) is preserved because that loader has
     // not defined the class itself (→ `None`).
     if crate::classloader::is_user_defined_loader(ctx, this) {
-        if let Some(mirror) =
-            crate::classloader::find_loaded_class_for_loader(ctx, this, &internal)
+        if let Some(mirror) = crate::classloader::find_loaded_class_for_loader(ctx, this, &internal)
         {
             return Ok(Some(Value::Object(Some(mirror))));
         }

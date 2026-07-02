@@ -113,12 +113,12 @@ pub fn register_multicast_socket_overrides(r: &mut NativeMethodRegistry) {
         let bind_addr = format!("0.0.0.0:{port}");
         // MulticastSocket sets SO_REUSEADDR before bind (JDK semantics) so
         // multiple receivers / repeated bind cycles can share the group port.
-        let fd_id =
-            ctx.fd_table()
-                .open_udp_reuse(Some(&bind_addr))
-                .map_err(|e| RuntimeError::IOException {
-                    message: format!("MulticastSocket bind failed: {e}"),
-                })?;
+        let fd_id = ctx
+            .fd_table()
+            .open_udp_reuse(Some(&bind_addr))
+            .map_err(|e| RuntimeError::IOException {
+                message: format!("MulticastSocket bind failed: {e}"),
+            })?;
         let nfields = ctx.object_num_fields(this);
         if nfields >= 5 {
             ctx.set_field(this, 0, Value::Int(port));
@@ -145,12 +145,12 @@ pub fn register_multicast_socket_overrides(r: &mut NativeMethodRegistry) {
             Some(Value::Object(Some(o))) => *o,
             _ => return Ok(None),
         };
-        let fd_id =
-            ctx.fd_table()
-                .open_udp_reuse(Some("0.0.0.0:0"))
-                .map_err(|e| RuntimeError::IOException {
-                    message: format!("MulticastSocket bind failed: {e}"),
-                })?;
+        let fd_id = ctx
+            .fd_table()
+            .open_udp_reuse(Some("0.0.0.0:0"))
+            .map_err(|e| RuntimeError::IOException {
+                message: format!("MulticastSocket bind failed: {e}"),
+            })?;
         let nfields = ctx.object_num_fields(this);
         if nfields >= 5 {
             ctx.set_field(this, 0, Value::Int(0));
@@ -399,7 +399,9 @@ pub fn register_multicast_socket_overrides(r: &mut NativeMethodRegistry) {
                         buf[i] = ctx.get_array_element(arr, off + i).as_int().unwrap_or(0) as u8;
                     }
                 }
-                let _ = ctx.fd_table().udp_send(fd as u32, &buf, &format!("{host}:{port}"));
+                let _ = ctx
+                    .fd_table()
+                    .udp_send(fd as u32, &buf, &format!("{host}:{port}"));
             }
         }
         Ok(None)
@@ -410,59 +412,65 @@ pub fn register_multicast_socket_overrides(r: &mut NativeMethodRegistry) {
     // loop on it (Tribes' McastServiceImpl.receive) continue cleanly; all other
     // recv errors are likewise reported as timeouts to keep the daemon loop
     // alive rather than tearing it down.
-    r.register(ms, "receive", "(Ljava/net/DatagramPacket;)V", |ctx, args| {
-        let this = match args.first() {
-            Some(Value::Object(Some(o))) => *o,
-            _ => return Ok(None),
-        };
-        let fd = ctx.get_field(this, 3).as_int().unwrap_or(-1);
-        if fd < 0 || ctx.get_field(this, 1).as_int().unwrap_or(0) != 0 {
-            return Err(RuntimeError::IOException {
-                message: "Socket closed".into(),
-            }
-            .into());
-        }
-        let timeout = ctx.get_field(this, 2).as_int().unwrap_or(0);
-        if timeout > 0 {
-            let _ = ctx
-                .fd_table()
-                .udp_set_read_timeout(fd as u32, Some(Duration::from_millis(timeout as u64)));
-        }
-        let pkt = match args.get(1) {
-            Some(Value::Object(Some(p))) => *p,
-            _ => return Ok(None),
-        };
-        let arr = match ms_iv_obj(ctx, pkt, "getData", "()[B") {
-            Some(a) => a,
-            None => {
+    r.register(
+        ms,
+        "receive",
+        "(Ljava/net/DatagramPacket;)V",
+        |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(None),
+            };
+            let fd = ctx.get_field(this, 3).as_int().unwrap_or(-1);
+            if fd < 0 || ctx.get_field(this, 1).as_int().unwrap_or(0) != 0 {
                 return Err(RuntimeError::IOException {
-                    message: "DatagramPacket has no buffer".into(),
+                    message: "Socket closed".into(),
                 }
-                .into())
+                .into());
             }
-        };
-        let cap = ctx.array_length(arr);
-        let mut buf = vec![0u8; cap.max(1)];
-        match ctx.fd_table().udp_recv(fd as u32, &mut buf) {
-            Ok((n, src)) => {
-                let copy = n.min(cap);
-                for i in 0..copy {
-                    ctx.set_array_element(arr, i, Value::Int(buf[i] as i8 as i32));
-                }
-                let _ = ctx.invoke_virtual(pkt, "setLength", "(I)V", &[Value::Int(copy as i32)]);
-                if let Some(c) = src.rfind(':') {
-                    if let Ok(p) = src[c + 1..].parse::<i32>() {
-                        let _ = ctx.invoke_virtual(pkt, "setPort", "(I)V", &[Value::Int(p)]);
+            let timeout = ctx.get_field(this, 2).as_int().unwrap_or(0);
+            if timeout > 0 {
+                let _ = ctx
+                    .fd_table()
+                    .udp_set_read_timeout(fd as u32, Some(Duration::from_millis(timeout as u64)));
+            }
+            let pkt = match args.get(1) {
+                Some(Value::Object(Some(p))) => *p,
+                _ => return Ok(None),
+            };
+            let arr = match ms_iv_obj(ctx, pkt, "getData", "()[B") {
+                Some(a) => a,
+                None => {
+                    return Err(RuntimeError::IOException {
+                        message: "DatagramPacket has no buffer".into(),
                     }
+                    .into())
                 }
-                Ok(None)
+            };
+            let cap = ctx.array_length(arr);
+            let mut buf = vec![0u8; cap.max(1)];
+            match ctx.fd_table().udp_recv(fd as u32, &mut buf) {
+                Ok((n, src)) => {
+                    let copy = n.min(cap);
+                    for i in 0..copy {
+                        ctx.set_array_element(arr, i, Value::Int(buf[i] as i8 as i32));
+                    }
+                    let _ =
+                        ctx.invoke_virtual(pkt, "setLength", "(I)V", &[Value::Int(copy as i32)]);
+                    if let Some(c) = src.rfind(':') {
+                        if let Ok(p) = src[c + 1..].parse::<i32>() {
+                            let _ = ctx.invoke_virtual(pkt, "setPort", "(I)V", &[Value::Int(p)]);
+                        }
+                    }
+                    Ok(None)
+                }
+                Err(e) => Err(RuntimeError::IOException {
+                    message: format!("SocketTimeoutException: Receive timed out: {e}"),
+                }
+                .into()),
             }
-            Err(e) => Err(RuntimeError::IOException {
-                message: format!("SocketTimeoutException: Receive timed out: {e}"),
-            }
-            .into()),
-        }
-    });
+        },
+    );
 
     r.set_category(__prev_cat);
 }

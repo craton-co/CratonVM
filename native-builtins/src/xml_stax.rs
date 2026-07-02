@@ -686,7 +686,12 @@ fn try_resolve_real_factory(ctx: &mut dyn NativeContext) -> Option<ObjectRef> {
 
     // Thread-context class loader; fall back to the system loader when null so
     // `ServiceLoader` scans the application classpath rather than the bootstrap.
-    let tccl = match ctx.invoke("java/lang/Thread", "currentThread", "()Ljava/lang/Thread;", &[]) {
+    let tccl = match ctx.invoke(
+        "java/lang/Thread",
+        "currentThread",
+        "()Ljava/lang/Thread;",
+        &[],
+    ) {
         Ok(Some(Value::Object(Some(t)))) => obj_result(ctx.invoke(
             "java/lang/Thread",
             "getContextClassLoader",
@@ -720,7 +725,12 @@ fn try_resolve_real_factory(ctx: &mut dyn NativeContext) -> Option<ObjectRef> {
     ))?;
 
     // First registered provider, if any.
-    match ctx.invoke("java/util/Iterator", "hasNext", "()Z", &[Value::Object(Some(it))]) {
+    match ctx.invoke(
+        "java/util/Iterator",
+        "hasNext",
+        "()Z",
+        &[Value::Object(Some(it))],
+    ) {
         Ok(Some(Value::Int(1))) => {}
         _ => return None,
     }

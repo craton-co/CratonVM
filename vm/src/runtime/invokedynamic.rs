@@ -578,12 +578,14 @@ fn bootstrap_generic(
 
     let callsite = match callsite_val {
         Some(Value::Object(Some(cs))) => cs,
-        _ => return Err(VmError::Internal {
-            message: format!(
+        _ => {
+            return Err(VmError::Internal {
+                message: format!(
                 "invokedynamic generic: bootstrap {bsm_class}.{bsm_method} returned a non-CallSite"
             ),
+            }
+            .into())
         }
-        .into()),
     };
     // Pin the CallSite across getTarget().
     thread.native_pin_roots.push(callsite);

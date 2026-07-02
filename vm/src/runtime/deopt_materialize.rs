@@ -587,7 +587,11 @@ mod tests {
         .expect("materialization should succeed");
 
         // The defining local was materialized to a real Object.
-        let local_addr = mapped.iter().find(|&&(s, _)| s == 1).expect("local 1 materialized").1;
+        let local_addr = mapped
+            .iter()
+            .find(|&&(s, _)| s == 1)
+            .expect("local 1 materialized")
+            .1;
         assert_eq!(frame.locals[1], FrameValue::Object(local_addr));
         // The monitor's object was rewritten to the SAME shell; depth preserved.
         assert_eq!(frame.monitors[0].object, FrameValue::Object(local_addr));

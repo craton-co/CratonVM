@@ -422,12 +422,12 @@ fn build_instrumentation_mirror(
     agent: &LoadedAgent,
 ) -> Result<cratonvm_types::ObjectRef, AgentLoadError> {
     let class_internal = "sun/instrument/InstrumentationImpl";
-    let class_id = shared.load_class_concurrent(class_internal).map_err(|err| {
-        AgentLoadError::InstrumentationUnavailable {
+    let class_id = shared
+        .load_class_concurrent(class_internal)
+        .map_err(|err| AgentLoadError::InstrumentationUnavailable {
             class: agent.premain_class.clone(),
             cause: format!("failed to load {class_internal}: {err}"),
-        }
-    })?;
+        })?;
 
     // Pull num_total_fields so we allocate the right object size.
     let num_fields = {

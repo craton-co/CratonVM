@@ -1823,11 +1823,7 @@ pub trait NativeContext {
     /// (JVMS 4.7.20 `target_type` 0x13, FIELD) with an empty `type_path`.
     /// Backs `Field.getAnnotatedType().getDeclaredAnnotations()`. Default impl
     /// returns an empty `Vec`.
-    fn field_type_annotations(
-        &self,
-        _class_id: ClassId,
-        _field_name: &str,
-    ) -> Vec<AnnotationData> {
+    fn field_type_annotations(&self, _class_id: ClassId, _field_name: &str) -> Vec<AnnotationData> {
         Vec::new()
     }
 

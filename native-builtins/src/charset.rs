@@ -656,7 +656,8 @@ fn native_decoder_decode(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         let action = coding_action(ctx, this, "malformedInputAction");
         let avail = (clim - cpos).max(0) as usize;
         let mut units: Vec<u16> = Vec::new();
-        let (consumed, status) = engine::utf8_decode(&bytes, end_of_input, action, &mut units, avail);
+        let (consumed, status) =
+            engine::utf8_decode(&bytes, end_of_input, action, &mut units, avail);
         let written = write_char_array(ctx, carr, cpos as usize, &units);
         set_pos(ctx, cb, cpos + written as i32);
         set_pos(ctx, bb, bpos + consumed as i32);
@@ -1409,8 +1410,16 @@ mod tests {
         )
         .expect("encode must not error");
         assert_eq!(coder_tag(&ctx, r), CR_OVERFLOW);
-        assert_eq!(bb_bytes(&ctx, bb), vec![0x41], "only the whole 'A' atom fits");
-        assert_eq!(cb_pos(&ctx, cb), 1, "only 'A' consumed; the pair is retried");
+        assert_eq!(
+            bb_bytes(&ctx, bb),
+            vec![0x41],
+            "only the whole 'A' atom fits"
+        );
+        assert_eq!(
+            cb_pos(&ctx, cb),
+            1,
+            "only 'A' consumed; the pair is retried"
+        );
     }
 
     #[test]
@@ -1432,6 +1441,10 @@ mod tests {
         )
         .expect("encode must not error");
         assert_eq!(coder_tag(&ctx, r), CR_MALFORMED);
-        assert_eq!(cb_pos(&ctx, cb), 1, "position advances to the bad surrogate");
+        assert_eq!(
+            cb_pos(&ctx, cb),
+            1,
+            "position advances to the bad surrogate"
+        );
     }
 }

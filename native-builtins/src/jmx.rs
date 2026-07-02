@@ -2111,9 +2111,7 @@ fn mbs_query_set(
             // Real HashSet unavailable (test mock): best-effort unfiltered
             // synthetic set of the original names, preserving prior behaviour.
             let s = ctx.read_native_pin(server_pin, server);
-            let len = mbs_onames(ctx, s)
-                .map(|a| ctx.array_length(a))
-                .unwrap_or(0);
+            let len = mbs_onames(ctx, s).map(|a| ctx.array_length(a)).unwrap_or(0);
             let mut elems = Vec::with_capacity(len);
             if let Some(arr) = mbs_onames(ctx, s) {
                 for i in 0..len {
@@ -2170,7 +2168,12 @@ fn mbs_query_set(
             let elem_pin = ctx.pin_native_root(elem);
             let set_now = ctx.read_native_pin(set_pin, set);
             let e = ctx.read_native_pin(elem_pin, elem);
-            let _ = ctx.invoke_virtual(set_now, "add", "(Ljava/lang/Object;)Z", &[Value::Object(Some(e))]);
+            let _ = ctx.invoke_virtual(
+                set_now,
+                "add",
+                "(Ljava/lang/Object;)Z",
+                &[Value::Object(Some(e))],
+            );
             ctx.unpin_native_roots(elem_pin);
         }
         ctx.unpin_native_roots(on_pin);
@@ -2708,7 +2711,12 @@ pub fn register_mbean_server(r: &mut NativeMethodRegistry) {
             "(Ljava/lang/String;)Ljavax/management/MBeanServer;",
         ),
     ] {
-        r.register("javax/management/MBeanServerFactory", name, desc, create_server);
+        r.register(
+            "javax/management/MBeanServerFactory",
+            name,
+            desc,
+            create_server,
+        );
     }
     for (name, desc) in [
         ("newMBeanServer", "()Ljavax/management/MBeanServer;"),
@@ -2717,7 +2725,12 @@ pub fn register_mbean_server(r: &mut NativeMethodRegistry) {
             "(Ljava/lang/String;)Ljavax/management/MBeanServer;",
         ),
     ] {
-        r.register("javax/management/MBeanServerFactory", name, desc, new_server);
+        r.register(
+            "javax/management/MBeanServerFactory",
+            name,
+            desc,
+            new_server,
+        );
     }
     r.set_category(__prev_cat);
 }

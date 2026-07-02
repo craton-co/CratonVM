@@ -875,7 +875,10 @@ pub(crate) fn loader_namespace_id(ctx: &mut dyn NativeContext, loader: ObjectRef
 /// Read-only probe of a user loader's namespace id (no allocation). `None` when
 /// the loader is built-in, or has not yet been assigned one (it has defined no
 /// class under a distinct namespace).
-pub(crate) fn peek_loader_namespace_id(ctx: &mut dyn NativeContext, loader: ObjectRef) -> Option<u32> {
+pub(crate) fn peek_loader_namespace_id(
+    ctx: &mut dyn NativeContext,
+    loader: ObjectRef,
+) -> Option<u32> {
     if !is_user_defined_loader(ctx, loader) {
         return None;
     }
@@ -957,7 +960,8 @@ pub(crate) fn find_loaded_class_for_loader(
             if ctx.loader_id_of_class(cid) > 2 {
                 return None;
             }
-            if is_generated_proxy_name(internal_name) && defining_loader_for(cid.as_u32()).is_some() {
+            if is_generated_proxy_name(internal_name) && defining_loader_for(cid.as_u32()).is_some()
+            {
                 return None;
             }
             Some(ctx.get_class_mirror(cid))
@@ -1098,7 +1102,10 @@ fn resolve_global_if_visible(
     internal: &str,
 ) -> Option<ObjectRef> {
     let cid = ctx.ensure_class_initialized(internal).ok()?;
-    let this_is_custom = matches!(ctx.get_field(this, CL_LOADER_TYPE), Value::Int(LOADER_CUSTOM));
+    let this_is_custom = matches!(
+        ctx.get_field(this, CL_LOADER_TYPE),
+        Value::Int(LOADER_CUSTOM)
+    );
     cid_visible_mirror(ctx, this, this_is_custom, cid)
 }
 
@@ -3716,15 +3723,11 @@ fn build_custom_handler_url_list(
     let mut matched = 0u32;
     for i in 0..size {
         let path_list = ctx.read_native_pin(p_path, path_list);
-        let base = match ctx.invoke_virtual(
-            path_list,
-            "get",
-            "(I)Ljava/lang/Object;",
-            &[Value::Int(i)],
-        ) {
-            Ok(Some(Value::Object(Some(b)))) => b,
-            _ => continue,
-        };
+        let base =
+            match ctx.invoke_virtual(path_list, "get", "(I)Ljava/lang/Object;", &[Value::Int(i)]) {
+                Ok(Some(Value::Object(Some(b)))) => b,
+                _ => continue,
+            };
         let p_base = ctx.pin_native_root(base);
         if url_has_custom_handler(ctx, base) {
             if let Some(resolved) = resolve_url_against(ctx, base, name) {
@@ -3880,12 +3883,8 @@ pub(crate) fn ucl_find_resource(ctx: &mut dyn NativeContext, args: &[Value]) -> 
                 if let Some(list) = build_custom_handler_url_list(ctx, this, resource_name) {
                     let p_list = ctx.pin_native_root(list);
                     let list = ctx.read_native_pin(p_list, list);
-                    let first = ctx.invoke_virtual(
-                        list,
-                        "get",
-                        "(I)Ljava/lang/Object;",
-                        &[Value::Int(0)],
-                    );
+                    let first =
+                        ctx.invoke_virtual(list, "get", "(I)Ljava/lang/Object;", &[Value::Int(0)]);
                     ctx.unpin_native_roots(p_list);
                     if let Ok(Some(v @ Value::Object(Some(_)))) = first {
                         return Ok(Some(v));
@@ -3993,7 +3992,9 @@ pub(crate) fn ucl_find_resources(ctx: &mut dyn NativeContext, args: &[Value]) ->
         _ => None,
     };
     let result = match custom {
-        Some(custom) => Some(Value::Object(Some(merge_enum_with_list(ctx, std_ref, custom)))),
+        Some(custom) => Some(Value::Object(Some(merge_enum_with_list(
+            ctx, std_ref, custom,
+        )))),
         // No custom matches: return the standard enumeration verbatim (its ref
         // re-read post-GC), leaving ordinary loaders byte-for-byte unchanged.
         None => match std_ref {

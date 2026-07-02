@@ -113,9 +113,8 @@ impl CompilationPolicy {
     /// compile/OSR on the first observation, defeating warmup. An absent or
     /// unparseable value leaves the [`Default`].
     pub fn with_overrides(get: impl Fn(&str) -> Option<String>) -> Self {
-        let num = |name: &str| -> Option<u32> {
-            get(name)?.trim().parse::<u32>().ok().map(|v| v.max(1))
-        };
+        let num =
+            |name: &str| -> Option<u32> { get(name)?.trim().parse::<u32>().ok().map(|v| v.max(1)) };
         let mut p = Self::default();
         if let Some(v) = num("CRATONVM_TIER_C1_THRESHOLD") {
             p.c1_threshold = v;
@@ -1148,7 +1147,10 @@ mod tests {
             p.c2_min_invocations, 1_000,
             "unparseable value keeps the default"
         );
-        assert!(!p.tiered_enabled, "CRATONVM_TIER_ENABLED=0 disables tiering");
+        assert!(
+            !p.tiered_enabled,
+            "CRATONVM_TIER_ENABLED=0 disables tiering"
+        );
     }
 
     #[test]
@@ -1169,14 +1171,18 @@ mod tests {
         let mgr = TieredCompilationManager::with_default_policy();
         let key = test_key();
         // Unlike on_backedge, the first call enqueues immediately (no 10k count).
-        let task = mgr.request_osr(&key, 42).expect("first request should enqueue");
+        let task = mgr
+            .request_osr(&key, 42)
+            .expect("first request should enqueue");
         assert_eq!(task.osr_bci, Some(42));
         assert_eq!(task.priority, CompilationPriority::High);
         assert_eq!(task.target_tier, CompilationTier::C2);
         // Idempotent while queued: a second request is a no-op (no double compile).
         assert!(mgr.request_osr(&key, 42).is_none());
         // The task really is on the queue, and the OSR stat counted exactly once.
-        let dq = mgr.dequeue_compilation().expect("an OSR task should be queued");
+        let dq = mgr
+            .dequeue_compilation()
+            .expect("an OSR task should be queued");
         assert_eq!(dq.osr_bci, Some(42));
         assert_eq!(
             mgr.stats()
@@ -1195,7 +1201,10 @@ mod tests {
         let key = test_key();
         mgr.on_method_invocation(&key);
         mgr.compilation_complete(&key, CompilationTier::C2, 1);
-        assert!(mgr.request_osr(&key, 7).is_none(), "C2 method: no OSR enqueue");
+        assert!(
+            mgr.request_osr(&key, 7).is_none(),
+            "C2 method: no OSR enqueue"
+        );
 
         // C2-bailed method → no OSR enqueue.
         let mgr2 = TieredCompilationManager::with_default_policy();

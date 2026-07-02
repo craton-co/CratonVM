@@ -59,10 +59,7 @@ impl std::fmt::Display for JvmtiError {
                 write!(f, "failed to load JVMTI agent library `{path}`: {cause}")
             }
             JvmtiError::AgentEntryPointMissing { path, symbol } => {
-                write!(
-                    f,
-                    "JVMTI agent library `{path}` does not export `{symbol}`"
-                )
+                write!(f, "JVMTI agent library `{path}` does not export `{symbol}`")
             }
             JvmtiError::AgentEntryPointFailed { path, symbol, code } => {
                 write!(

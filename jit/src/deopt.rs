@@ -1016,9 +1016,7 @@ fn materialize_virtual_objects_impl(
     _frame: &FrameState,
     virtual_objects: usize,
 ) -> VirtualObjectMaterializationResult {
-    Err(VirtualObjectMaterializationError::GcMaterializerUnavailable {
-        virtual_objects,
-    })
+    Err(VirtualObjectMaterializationError::GcMaterializerUnavailable { virtual_objects })
 }
 
 // ---------------------------------------------------------------------------
@@ -1305,7 +1303,9 @@ pub extern "C" fn x64_deopt_entry(
                 eprintln!(
                     "[cratonvm-deopt] x64 frame-deopt SUPERSEDED (creation_epoch={} < live) — \
                      skipping reconstruction, routing to safe re-run",
-                    guard.creation_epoch.load(std::sync::atomic::Ordering::Relaxed),
+                    guard
+                        .creation_epoch
+                        .load(std::sync::atomic::Ordering::Relaxed),
                 );
             }
             // Stash a sentinel so the VM treats this as deopt-and-re-run
@@ -1373,7 +1373,7 @@ mod x64_deopt_entry_tests {
             },
         };
         let _ = take_last_deopt(); // clear any prior stash
-        // Null guard ⇒ no staleness check (the production / unstamped path).
+                                   // Null guard ⇒ no staleness check (the production / unstamped path).
         let r = x64_deopt_entry(&point, 0, &regs as *const SavedRegisters, std::ptr::null());
         assert_eq!(r, i64::MIN, "entry returns the deopt sentinel");
 
@@ -1406,9 +1406,10 @@ mod x64_deopt_entry_tests {
         let live = Box::new(AtomicU64::new(3)); // live epoch = 3
         let guard = DeoptEpochGuard::new();
         guard.creation_epoch.store(1, Ordering::Relaxed); // artifact made at epoch 1 < 3
-        guard
-            .live_epoch_cell
-            .store(live.as_ref() as *const AtomicU64 as *mut AtomicU64, Ordering::Release);
+        guard.live_epoch_cell.store(
+            live.as_ref() as *const AtomicU64 as *mut AtomicU64,
+            Ordering::Release,
+        );
 
         let _ = take_last_deopt();
         // point is NULL on purpose: the superseded check must fire before any
@@ -1428,9 +1429,10 @@ mod x64_deopt_entry_tests {
         let live = Box::new(AtomicU64::new(2));
         let guard = DeoptEpochGuard::new();
         guard.creation_epoch.store(2, Ordering::Relaxed); // == live ⇒ fresh
-        guard
-            .live_epoch_cell
-            .store(live.as_ref() as *const AtomicU64 as *mut AtomicU64, Ordering::Release);
+        guard.live_epoch_cell.store(
+            live.as_ref() as *const AtomicU64 as *mut AtomicU64,
+            Ordering::Release,
+        );
         assert!(!guard.is_superseded());
 
         let regs = SavedRegisters::default();
@@ -1495,7 +1497,10 @@ mod tests {
         assert!(despec_contains(m, 7));
         assert!(despec_contains(m, 12));
         assert!(!despec_contains(m, 8), "a different bci must not match");
-        assert!(!despec_contains("OtherClass.m:()V", 7), "a different method must not match");
+        assert!(
+            !despec_contains("OtherClass.m:()V", 7),
+            "a different method must not match"
+        );
         assert!(!despec_contains("", 7), "an empty key never matches");
         assert_eq!(despec_count_for(m), 2);
     }
@@ -1581,7 +1586,10 @@ mod tests {
         assert_eq!(rf.locals[0], FrameValue::Object(0x1111_2222_3333_4444));
         assert_eq!(rf.locals[1], FrameValue::Int(0xDEAD_BEEF));
         // StackSlotLong reads the full 64-bit word (NOT truncated to i32).
-        assert_eq!(rf.locals[2], FrameValue::Long(0xFEDC_BA98_7654_3210u64 as i64));
+        assert_eq!(
+            rf.locals[2],
+            FrameValue::Long(0xFEDC_BA98_7654_3210u64 as i64)
+        );
         assert_eq!(rf.locals[3], FrameValue::Unsupported);
     }
 
@@ -1595,11 +1603,7 @@ mod tests {
         let float_bits: u32 = 1.5f32.to_bits(); // 0x3FC0_0000
         let double_bits: u64 = std::f64::consts::PI.to_bits();
         // buf[0] @ rbp-16 (float bits in low 32, high garbage), buf[1] @ rbp-8 (double).
-        let buf: [u64; 3] = [
-            0xDEAD_BEEF_0000_0000 | float_bits as u64,
-            double_bits,
-            0,
-        ];
+        let buf: [u64; 3] = [0xDEAD_BEEF_0000_0000 | float_bits as u64, double_bits, 0];
         let rbp = (&buf[2] as *const u64) as u64;
 
         let mut regs = SavedRegisters::default();
@@ -1640,7 +1644,10 @@ mod tests {
         assert_eq!(rf.locals[2], FrameValue::Float(float_bits as u64));
         assert_eq!(rf.locals[3], FrameValue::Double(double_bits));
         // RegisterLong keeps all 64 bits (NOT truncated like Register -> Int).
-        assert_eq!(rf.locals[4], FrameValue::Long(0xFEDC_BA98_7654_3210u64 as i64));
+        assert_eq!(
+            rf.locals[4],
+            FrameValue::Long(0xFEDC_BA98_7654_3210u64 as i64)
+        );
         // RegisterRef carries the full heap pointer as an Object (NOT a truncated
         // Int that would also drop it from the GC scan).
         assert_eq!(rf.locals[5], FrameValue::Object(0x0000_7F12_3456_7890));
@@ -1807,7 +1814,7 @@ mod tests {
         // intra-frame id edge) passes through unchanged.
         let mut regs = SavedRegisters::default();
         regs.gpr[3] = 0x1234; // a RegisterRef field reads this GPR as an object ptr
-        // Stand-in native frame: a StackSlot(off) reads *(rbp + off) as i64.
+                              // Stand-in native frame: a StackSlot(off) reads *(rbp + off) as i64.
         let buf: [i64; 4] = [0, 111, 0xBEEFi64, 0];
         let rbp = buf.as_ptr() as u64;
         let vo = FrameValue::VirtualObject(VirtualObjectState {
@@ -1815,9 +1822,9 @@ mod tests {
             class_id: 7,
             num_fields: 4,
             field_values: vec![
-                FrameValue::StackSlot(8),      // buf[1] = 111 → Int(111)
-                FrameValue::StackSlotRef(16),  // buf[2] = 0xBEEF → Object(0xBEEF)
-                FrameValue::RegisterRef(3),    // gpr[3] = 0x1234 → Object(0x1234)
+                FrameValue::StackSlot(8),        // buf[1] = 111 → Int(111)
+                FrameValue::StackSlotRef(16),    // buf[2] = 0xBEEF → Object(0xBEEF)
+                FrameValue::RegisterRef(3),      // gpr[3] = 0x1234 → Object(0x1234)
                 FrameValue::VirtualObjectRef(5), // intra-frame edge → unchanged
             ],
         });

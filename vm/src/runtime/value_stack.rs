@@ -1322,8 +1322,11 @@ impl ValueStack {
             let _ = write!(
                 s,
                 " [{}]kind={} is_obj={} obj={:?} raw=0x{:x};",
-                i, self.kinds[i], cv.is_object(),
-                cv.as_object_ptr().map(|p| p as usize), cv.raw_bits()
+                i,
+                self.kinds[i],
+                cv.is_object(),
+                cv.as_object_ptr().map(|p| p as usize),
+                cv.raw_bits()
             );
         }
         s
@@ -1339,7 +1342,10 @@ impl ValueStack {
             if obj == Some(addr) || (raw & mask) == (addr & mask) {
                 return Some(format!(
                     "stack[{}] kind={} is_object={} obj_match={}",
-                    i, self.kinds[i], self.slots[i].is_object(), obj == Some(addr)
+                    i,
+                    self.kinds[i],
+                    self.slots[i].is_object(),
+                    obj == Some(addr)
                 ));
             }
         }

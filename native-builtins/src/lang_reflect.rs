@@ -1943,7 +1943,10 @@ pub(crate) fn register_wp2_1_natives(registry: &mut NativeMethodRegistry) {
             }
             if let Some(up) = jdk_first_non_bottom_bound(ctx, ta, "upperBounds") {
                 let ts = jdk_tree_to_typesig(ctx, up)?;
-                if let TypeSig::Class { name, type_args, .. } = &ts {
+                if let TypeSig::Class {
+                    name, type_args, ..
+                } = &ts
+                {
                     if name == "java/lang/Object" && type_args.is_empty() {
                         return Some(TypeArg::Unbounded);
                     }

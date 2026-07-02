@@ -46,9 +46,9 @@ use crate::heap::{
 use crate::old_gen::OldGen;
 // Compact reference-field layout (CRATONVM_COMPACT_REF_FIELDS). Reference
 // instance fields are stored as 8-byte pointers per the per-class oop-map.
+use crate::satb::SatbQueue;
 use crate::{class_layout, compact_ref_fields_enabled, is_compact_object, object_body_size};
 use cratonvm_types::GC_FLAG_COMPACT;
-use crate::satb::SatbQueue;
 use cratonvm_types::{ClassId, ObjectRef, Value};
 
 // ---------------------------------------------------------------------------
@@ -4819,7 +4819,10 @@ impl GenerationalHeap {
                             cursor, loff, lsz,
                         );
                     }
-                    eprintln!("[A2] corruption @off={} from_base={:#x} used={}", cursor, from_base, used);
+                    eprintln!(
+                        "[A2] corruption @off={} from_base={:#x} used={}",
+                        cursor, from_base, used
+                    );
                     for k in 0..8usize {
                         let off = cursor + k * 16;
                         if off + 16 > used {
@@ -4828,14 +4831,12 @@ impl GenerationalHeap {
                         // SAFETY: off+16 <= used, region mapped.
                         let disc = unsafe { *((from_base + off) as *const u64) };
                         let payload = unsafe { *((from_base + off + 8) as *const u64) };
-                        let in_young = payload >= from_base as u64
-                            && payload < (from_base + used) as u64;
+                        let in_young =
+                            payload >= from_base as u64 && payload < (from_base + used) as u64;
                         // If the payload points into the young arena at an aligned
                         // object boundary, read its class_id to identify the referent.
                         let referent = if in_young && (payload as usize - from_base) % 8 == 0 {
-                            let rh = unsafe {
-                                &*(payload as *const ObjectHeader)
-                            };
+                            let rh = unsafe { &*(payload as *const ObjectHeader) };
                             format!(
                                 "young referent class_id={} kind={} num_slots={}",
                                 rh.class_id.as_u32(),
@@ -4901,10 +4902,7 @@ impl GenerationalHeap {
                     for (i, &(woff, wsz, _, _, _, _)) in walked.iter().enumerate() {
                         if let Some(r) = crate::a2dbg::lookup_at(from_base + woff) {
                             if r.kind != 0xFF && r.size != wsz {
-                                let (wet, w0) = walked_ext
-                                    .get(i)
-                                    .copied()
-                                    .unwrap_or((255, 0));
+                                let (wet, w0) = walked_ext.get(i).copied().unwrap_or((255, 0));
                                 eprintln!(
                                     "[A2] FIRST-MISMATCH walked[{}]@{} walker_size={} walk_et={} raw0={:#018x} vs REAL(class_id={} kind={} et={} alen={} ns={} size={} seq={})",
                                     i, woff, wsz, wet, w0,

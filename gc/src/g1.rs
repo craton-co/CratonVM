@@ -70,9 +70,7 @@ unsafe fn array_element_from_unaligned_ptr(element_type: ArrayElementType, p: *c
             ArrayElementType::Long => Value::Long(std::ptr::read_unaligned(p as *const i64)),
             ArrayElementType::Float => Value::Float(std::ptr::read_unaligned(p as *const f32)),
             ArrayElementType::Double => Value::Double(std::ptr::read_unaligned(p as *const f64)),
-            ArrayElementType::Byte => {
-                Value::Int(std::ptr::read_unaligned(p as *const i8) as i32)
-            }
+            ArrayElementType::Byte => Value::Int(std::ptr::read_unaligned(p as *const i8) as i32),
             ArrayElementType::Boolean => Value::Int(std::ptr::read_unaligned(p) as i32),
             ArrayElementType::Short => Value::Int(std::ptr::read_unaligned(p as *const i16) as i32),
             ArrayElementType::Char => Value::Int(std::ptr::read_unaligned(p as *const u16) as i32),
@@ -327,8 +325,7 @@ impl<'a> SharedEvac<'a> {
             return;
         }
 
-        let mut seen: std::collections::HashSet<usize> =
-            serial_work.iter().copied().collect();
+        let mut seen: std::collections::HashSet<usize> = serial_work.iter().copied().collect();
         for region_idx in kept_regions {
             let region = &*self.regions_base.0.add(region_idx);
             if region.region_type == RegionType::Free {
@@ -440,9 +437,8 @@ impl<'a> SharedEvac<'a> {
         objs: &mut usize,
         bytes: &mut usize,
     ) -> Option<(*mut u8, bool)> {
-        let fwd_atomic = &*(std::ptr::addr_of_mut!(
-            (*(old_ptr as *mut ObjectHeader)).forwarding_ptr
-        ) as *const AtomicUsize);
+        let fwd_atomic = &*(std::ptr::addr_of_mut!((*(old_ptr as *mut ObjectHeader)).forwarding_ptr)
+            as *const AtomicUsize);
 
         // Fast path: already forwarded this cycle.
         let existing = fwd_atomic.load(Ordering::Acquire);
@@ -536,12 +532,7 @@ impl<'a> SharedEvac<'a> {
 
         // Install the forward on the OLD (from-space) header. Winner copies; a
         // loser abandons its `new_ptr` and adopts the winner's address.
-        match fwd_atomic.compare_exchange(
-            0,
-            new_addr,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ) {
+        match fwd_atomic.compare_exchange(0, new_addr, Ordering::AcqRel, Ordering::Acquire) {
             Ok(_) => {
                 forwards.push((old_ptr as usize, new_addr));
                 *objs += 1;
@@ -661,7 +652,11 @@ impl<'a> SharedEvac<'a> {
             let (kind, etype, alen, nslots, is_filler, obj_size) = {
                 let header = &*(obj_ptr as *const ObjectHeader);
                 let is_filler = is_humongous_filler(header);
-                let sz = if is_filler { 0 } else { object_total_size(header) };
+                let sz = if is_filler {
+                    0
+                } else {
+                    object_total_size(header)
+                };
                 (
                     header.kind,
                     header.element_type,
@@ -687,7 +682,8 @@ impl<'a> SharedEvac<'a> {
                             continue;
                         }
                         let ref_ptr = raw as usize as *mut u8;
-                        if let Some(ridx) = self.collector.lookup_region_for_addr(ref_ptr as usize) {
+                        if let Some(ridx) = self.collector.lookup_region_for_addr(ref_ptr as usize)
+                        {
                             if self.cset.contains(&ridx) {
                                 if let Some((new_ptr, fresh)) =
                                     self.evacuate(tlab, ref_ptr, forwards, objs, bytes)
@@ -713,7 +709,8 @@ impl<'a> SharedEvac<'a> {
                     let value = std::ptr::read(slot_ptr as *const Value);
                     if let Value::Object(Some(ref_obj)) = value {
                         let ref_ptr = ref_obj.as_ptr();
-                        if let Some(ridx) = self.collector.lookup_region_for_addr(ref_ptr as usize) {
+                        if let Some(ridx) = self.collector.lookup_region_for_addr(ref_ptr as usize)
+                        {
                             if self.cset.contains(&ridx) {
                                 if let Some((new_ptr, fresh)) =
                                     self.evacuate(tlab, ref_ptr, forwards, objs, bytes)
@@ -1365,9 +1362,7 @@ impl G1Collector {
         let arena_end = arena_base + arena.len();
 
         let regions: Vec<G1Region> = (0..num_regions)
-            .map(|i| {
-                G1Region::from_arena(arena_base + i * config.region_size, config.region_size)
-            })
+            .map(|i| G1Region::from_arena(arena_base + i * config.region_size, config.region_size))
             .collect();
 
         // Build the address-to-region lookup table (sorted by base addr).
@@ -2267,8 +2262,7 @@ impl G1Collector {
                         &mut main_forwards,
                         &mut objs,
                         &mut bytes,
-                    )
-                    {
+                    ) {
                         *root = ObjectRef::from_raw(new_ptr);
                         if fresh {
                             if new_ptr == old_ptr {
@@ -2372,10 +2366,8 @@ impl G1Collector {
             &mut main_deferred_self_forwarded,
         );
         unsafe {
-            shared.append_kept_cset_region_objects(
-                &main_forwards,
-                &mut main_deferred_self_forwarded,
-            );
+            shared
+                .append_kept_cset_region_objects(&main_forwards, &mut main_deferred_self_forwarded);
         }
 
         if !main_deferred_self_forwarded.is_empty() {
@@ -2393,8 +2385,7 @@ impl G1Collector {
 
         // Merge the per-worker forward shards into the pointer map consumed by
         // the VM root remap and Phases 4/5.
-        let mut pointer_map: HashMap<usize, usize> =
-            HashMap::with_capacity(main_forwards.len());
+        let mut pointer_map: HashMap<usize, usize> = HashMap::with_capacity(main_forwards.len());
         for (o, n) in main_forwards {
             pointer_map.insert(o, n);
         }
@@ -3359,7 +3350,9 @@ impl G1Collector {
                 }
             }
             if overlaps > 0 {
-                eprintln!("[g1][DBG-HEADERS] {overlaps} forward-destination OVERLAP(s) this collection");
+                eprintln!(
+                    "[g1][DBG-HEADERS] {overlaps} forward-destination OVERLAP(s) this collection"
+                );
             }
         }
 
@@ -3544,7 +3537,9 @@ impl G1Collector {
             }
         }
         if hits > 0 {
-            eprintln!("[g1][DBG-ZERO] {hits} reference(s) to a ZEROED (freed) object this collection");
+            eprintln!(
+                "[g1][DBG-ZERO] {hits} reference(s) to a ZEROED (freed) object this collection"
+            );
         }
     }
 
@@ -4235,12 +4230,7 @@ impl G1Collector {
     /// line(s). Called by every young/mixed evacuation path (serial + parallel)
     /// so the pause sink and the `[GC ...]` log stay in lock-step. `pause_us`
     /// is `Instant::elapsed().as_micros()` — see `G1PauseRecord`.
-    fn record_collection(
-        &self,
-        collection_type: G1CollectionType,
-        pause_us: u64,
-        stats: &GcStats,
-    ) {
+    fn record_collection(&self, collection_type: G1CollectionType, pause_us: u64, stats: &GcStats) {
         // Relaxed ordering: these are statistics counters for monitoring /
         // logging only. They guard no data and a slightly stale read is
         // harmless.
@@ -8167,7 +8157,8 @@ mod tests {
         for i in 0..n {
             let o = gc.alloc_object(ClassId::new(7), 1);
             gc.set_field(o, 0, Value::Int(i as i32));
-            gc.set_array_element(arr, i, Value::Object(Some(o))).unwrap();
+            gc.set_array_element(arr, i, Value::Object(Some(o)))
+                .unwrap();
         }
         let mut roots = vec![arr];
         let result = gc.young_collection_parallel(&mut roots, &NoopMonitors);
@@ -8180,11 +8171,7 @@ mod tests {
                 Value::Object(Some(o)) => o,
                 _ => panic!("element {i} lost"),
             };
-            assert_eq!(
-                gc.get_field(child, 0).as_int(),
-                Some(i as i32),
-                "value {i}"
-            );
+            assert_eq!(gc.get_field(child, 0).as_int(), Some(i as i32), "value {i}");
         }
     }
 
@@ -8210,7 +8197,8 @@ mod tests {
             for j in 0..s {
                 gc.set_field(parent, j, Value::Object(Some(shared[j])));
             }
-            gc.set_array_element(arr, i, Value::Object(Some(parent))).unwrap();
+            gc.set_array_element(arr, i, Value::Object(Some(parent)))
+                .unwrap();
         }
         let mut roots = vec![arr];
         let result = gc.young_collection_parallel(&mut roots, &NoopMonitors);
@@ -8422,7 +8410,11 @@ mod tests {
             "fast-path forward O->T was not recorded in pointer_map (root cannot be remapped)"
         );
         // (b) the root is remapped to T, and T is intact (not re-copied/corrupted).
-        assert_eq!(roots[0].as_ptr() as usize, t_old, "root not remapped to the forward target");
+        assert_eq!(
+            roots[0].as_ptr() as usize,
+            t_old,
+            "root not remapped to the forward target"
+        );
         assert_eq!(gc.get_field(roots[0], 0).as_int(), Some(99));
     }
 
@@ -8460,7 +8452,8 @@ mod tests {
             let parent = gc.alloc_object(ClassId::new(8), 2);
             gc.set_field(parent, 0, Value::Int(i as i32));
             gc.set_field(parent, 1, Value::Object(Some(shared[i % s])));
-            gc.set_array_element(arr, i, Value::Object(Some(parent))).unwrap();
+            gc.set_array_element(arr, i, Value::Object(Some(parent)))
+                .unwrap();
         }
         arr
     }
@@ -8595,7 +8588,10 @@ mod tests {
         let mut roots = vec![head];
         // No free region → every survivor hits evacuation failure → self-forward.
         let r = gc.young_collection(&mut roots, &NoopMonitors);
-        assert_eq!(r.stats.bytes_freed, 0, "a failed collection must free nothing");
+        assert_eq!(
+            r.stats.bytes_freed, 0,
+            "a failed collection must free nothing"
+        );
         // The whole chain must still be reachable and intact — nothing dropped.
         let mut count = 0usize;
         let mut c = roots[0];
@@ -8627,7 +8623,7 @@ mod tests {
 
         let a = gc.alloc_object(ClassId::new(1), 1);
         let mut roots = vec![a]; // B will be reachable ONLY via A.a
-        // Age A two young GCs (still a Survivor; A is older than B).
+                                 // Age A two young GCs (still a Survivor; A is older than B).
         gc.young_collection(&mut roots, &NoopMonitors);
         gc.young_collection(&mut roots, &NoopMonitors);
 
@@ -8692,7 +8688,8 @@ mod tests {
         // B is reachable ONLY via keep[0]. Wire it while B is young.
         let b = gc.alloc_object(ClassId::new(2), 1);
         gc.set_field(b, 0, Value::Int(424242));
-        gc.set_array_element(keep, 0, Value::Object(Some(b))).unwrap();
+        gc.set_array_element(keep, 0, Value::Object(Some(b)))
+            .unwrap();
         let mut roots = vec![keep]; // root reaches B only through the humongous keep
 
         // Tenure B to Old (promotion_age = 1). The humongous keep stays in place

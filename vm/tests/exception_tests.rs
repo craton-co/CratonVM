@@ -154,28 +154,40 @@ fn jit_divzero_delta(method: &str) -> i32 {
 fn test_jit_idiv_zero_no_double_side_effect() {
     require_class_files!();
     let d = jit_divzero_delta("idivDelta");
-    assert_eq!(d, 1, "idiv side effect ran {d}x (expected 1) — JIT uncommon-trap re-run regression");
+    assert_eq!(
+        d, 1,
+        "idiv side effect ran {d}x (expected 1) — JIT uncommon-trap re-run regression"
+    );
 }
 
 #[test]
 fn test_jit_irem_zero_no_double_side_effect() {
     require_class_files!();
     let d = jit_divzero_delta("iremDelta");
-    assert_eq!(d, 1, "irem side effect ran {d}x (expected 1) — JIT uncommon-trap re-run regression");
+    assert_eq!(
+        d, 1,
+        "irem side effect ran {d}x (expected 1) — JIT uncommon-trap re-run regression"
+    );
 }
 
 #[test]
 fn test_jit_ldiv_zero_no_double_side_effect() {
     require_class_files!();
     let d = jit_divzero_delta("ldivDelta");
-    assert_eq!(d, 1, "ldiv side effect ran {d}x (expected 1) — JIT uncommon-trap re-run regression");
+    assert_eq!(
+        d, 1,
+        "ldiv side effect ran {d}x (expected 1) — JIT uncommon-trap re-run regression"
+    );
 }
 
 #[test]
 fn test_jit_lrem_zero_no_double_side_effect() {
     require_class_files!();
     let d = jit_divzero_delta("lremDelta");
-    assert_eq!(d, 1, "lrem side effect ran {d}x (expected 1) — JIT uncommon-trap re-run regression");
+    assert_eq!(
+        d, 1,
+        "lrem side effect ran {d}x (expected 1) — JIT uncommon-trap re-run regression"
+    );
 }
 
 #[test]

@@ -4219,15 +4219,15 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             // would return `java/lang/Class` and report every class as java.base
             // — the original defect). Fall back to the object class only if the
             // reverse lookup misses (defensive; e.g. primitive mirrors).
-            let module_name: Option<String> = if let Some(Value::Object(Some(mirror))) = args.first()
-            {
-                let class_id = ctx
-                    .class_id_from_mirror(*mirror)
-                    .unwrap_or_else(|| ctx.class_id_of_object(*mirror));
-                ctx.module_name_of_class(class_id)
-            } else {
-                None
-            };
+            let module_name: Option<String> =
+                if let Some(Value::Object(Some(mirror))) = args.first() {
+                    let class_id = ctx
+                        .class_id_from_mirror(*mirror)
+                        .unwrap_or_else(|| ctx.class_id_of_object(*mirror));
+                    ctx.module_name_of_class(class_id)
+                } else {
+                    None
+                };
 
             // Canonical-cache hit: hand back the existing Module mirror so
             // identity comparisons across classes in the same module succeed.
@@ -4308,7 +4308,9 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     }
     fn module_pkg_arg(ctx: &dyn NativeContext, args: &[Value]) -> Option<String> {
         match args.get(1) {
-            Some(Value::Object(Some(s))) => Some(ctx.read_string(*s).unwrap_or_default().replace('.', "/")),
+            Some(Value::Object(Some(s))) => {
+                Some(ctx.read_string(*s).unwrap_or_default().replace('.', "/"))
+            }
             _ => None,
         }
     }
@@ -14805,9 +14807,7 @@ fn native_object_clone(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
                     Some(n) if n == "java/util/Properties" => {
                         let snap = crate::properties_sidetable::snapshot_sidetable(ctx, this);
                         if !snap.is_empty() {
-                            crate::properties_sidetable::replace_sidetable(
-                                ctx, clone_ref, &snap,
-                            );
+                            crate::properties_sidetable::replace_sidetable(ctx, clone_ref, &snap);
                         }
                         break;
                     }
@@ -17919,10 +17919,7 @@ fn native_class_reflection_data_init(
 /// the dangling heap slot. `newReflectionData` keeps both in sync on write, and a
 /// missing / cleared entry simply re-creates the cache (redefinedCount is always
 /// 0 in our VM, so a present referent is always current).
-fn native_class_reflection_data(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_class_reflection_data(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
@@ -17947,7 +17944,11 @@ fn native_class_reflection_data(
     // side store). `oldSoftRef` is irrelevant to our single-shot create path.
     native_class_new_reflection_data(
         ctx,
-        &[Value::Object(Some(this)), Value::Object(None), Value::Int(0)],
+        &[
+            Value::Object(Some(this)),
+            Value::Object(None),
+            Value::Int(0),
+        ],
     )
 }
 
@@ -21805,7 +21806,9 @@ mod java_replacement_tests {
     use super::{compile_anchored_cached, compile_java_regex};
 
     fn ra(text: &str, pat: &str, rep: &str) -> String {
-        compile_java_regex(pat, 0).unwrap().replace_all_java(text, rep)
+        compile_java_regex(pat, 0)
+            .unwrap()
+            .replace_all_java(text, rep)
     }
     fn rf(text: &str, pat: &str, rep: &str) -> String {
         compile_java_regex(pat, 0)
@@ -24787,9 +24790,12 @@ pub fn register_concurrent_natives(registry: &mut NativeMethodRegistry) {
             return true;
         }
         if let (Value::Object(Some(t)), Value::Object(Some(e))) = (target, elem) {
-            if let Ok(Some(Value::Int(v))) =
-                ctx.invoke_virtual(t, "equals", "(Ljava/lang/Object;)Z", &[Value::Object(Some(e))])
-            {
+            if let Ok(Some(Value::Int(v))) = ctx.invoke_virtual(
+                t,
+                "equals",
+                "(Ljava/lang/Object;)Z",
+                &[Value::Object(Some(e))],
+            ) {
                 return v != 0;
             }
         }
@@ -27839,8 +27845,7 @@ struct SemState {
     fair: i32,
 }
 
-fn sem_states_by_obj() -> &'static parking_lot::Mutex<std::collections::HashMap<usize, SemState>>
-{
+fn sem_states_by_obj() -> &'static parking_lot::Mutex<std::collections::HashMap<usize, SemState>> {
     static H: std::sync::OnceLock<parking_lot::Mutex<std::collections::HashMap<usize, SemState>>> =
         std::sync::OnceLock::new();
     H.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()))
@@ -33804,10 +33809,7 @@ fn native_fut_is_done(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
 /// slot-1's value type: a real-JDK CF has an Object `stack` (null or a Signaller
 /// chain), a synthetic CF has an Int `done`. For the real-JDK object delegate to
 /// the genuine `completeValue` + `postComplete` so waiters are released.
-pub(crate) fn native_cf_complete(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+pub(crate) fn native_cf_complete(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
@@ -34857,8 +34859,9 @@ fn native_uri_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     // rejected unconditionally even with the opt-out gate (preserves the
     // keycloak fix); the broader ASCII check is gated default-ON so it can be
     // disabled (CRATONVM_URI_STRICT_CHARS=0) if a regression surfaces.
-    let strict_uri_chars =
-        std::env::var("CRATONVM_URI_STRICT_CHARS").map(|v| v != "0").unwrap_or(true);
+    let strict_uri_chars = std::env::var("CRATONVM_URI_STRICT_CHARS")
+        .map(|v| v != "0")
+        .unwrap_or(true);
     let illegal = if strict_uri_chars {
         uri_first_illegal_index(&url_str)
     } else {

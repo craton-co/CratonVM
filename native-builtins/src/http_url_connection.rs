@@ -188,7 +188,11 @@ fn is_real_carrier(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
 }
 
 /// Mutate this real carrier's `RealReq` entry (creating it on first use).
-fn with_real_req<R>(ctx: &dyn NativeContext, this: ObjectRef, f: impl FnOnce(&mut RealReq) -> R) -> R {
+fn with_real_req<R>(
+    ctx: &dyn NativeContext,
+    this: ObjectRef,
+    f: impl FnOnce(&mut RealReq) -> R,
+) -> R {
     let key = ctx.identity_hash_code(this);
     let mut t = real_reqs().lock().expect("real_reqs poisoned");
     f(t.entry(key).or_default())
@@ -666,8 +670,7 @@ fn read_response<S: Read>(
     let mut tmp = [0u8; 8192];
     let head_end;
     loop {
-        let n = read_eof_tolerant(stream, &mut tmp)
-            .map_err(|e| read_io_err("response read", e))?;
+        let n = read_eof_tolerant(stream, &mut tmp).map_err(|e| read_io_err("response read", e))?;
         if n == 0 {
             return Err("connection closed before response head".into());
         }
@@ -1219,7 +1222,11 @@ fn huc_get_output_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
             }
         });
         let key = ctx.identity_hash_code(this);
-        if let Some(existing) = real_body_streams().lock().ok().and_then(|t| t.get(&key).copied()) {
+        if let Some(existing) = real_body_streams()
+            .lock()
+            .ok()
+            .and_then(|t| t.get(&key).copied())
+        {
             return Ok(Some(Value::Object(Some(existing))));
         }
         let baos = alloc_concurrent_synthetic(ctx, "java/io/ByteArrayOutputStream", 2);
@@ -1798,9 +1805,15 @@ fn register_one(r: &mut NativeMethodRegistry, cls: &str) {
     // `IllegalStateException("Chunked encoding streaming mode set")`. Spring's
     // `SimpleClientHttpRequest.executeInternal` calls this once `getDoOutput()` is
     // true — so it only surfaced after the doOutput fix let the body path run.
-    r.register(cls, "setFixedLengthStreamingMode", "(I)V", |_ctx, _args| Ok(None));
-    r.register(cls, "setFixedLengthStreamingMode", "(J)V", |_ctx, _args| Ok(None));
-    r.register(cls, "setChunkedStreamingMode", "(I)V", |_ctx, _args| Ok(None));
+    r.register(cls, "setFixedLengthStreamingMode", "(I)V", |_ctx, _args| {
+        Ok(None)
+    });
+    r.register(cls, "setFixedLengthStreamingMode", "(J)V", |_ctx, _args| {
+        Ok(None)
+    });
+    r.register(cls, "setChunkedStreamingMode", "(I)V", |_ctx, _args| {
+        Ok(None)
+    });
     r.register(
         cls,
         "setInstanceFollowRedirects",

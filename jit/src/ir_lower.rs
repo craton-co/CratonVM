@@ -1167,7 +1167,10 @@ impl<'a> Lowerer<'a> {
                 self.buf.emit(&[0x48, 0x63, 0xC0]); // MOVSXD RAX, EAX (sign-extend)
                 self.store_rax(slot);
             }
-            Op::FCmp { double, nan_greater } => {
+            Op::FCmp {
+                double,
+                nan_greater,
+            } => {
                 // FP 3-way compare → int {-1,0,1}, mirroring `Op::LCmp` but via
                 // `ucomis` with the JVMS NaN-unordered rule. Branchless:
                 // `result = AL - DL` where the operand order + SETcc choice put
@@ -1980,7 +1983,8 @@ impl<'a> Lowerer<'a> {
         // R10), then CMP ECX, R10D. An UNSIGNED `index < length` (JB, CF=1)
         // continues; otherwise (index >= length, OR a negative index whose
         // unsigned value is huge) deopt → AIOOBE.
-        self.buf.emit(&[0x44, 0x8B, 0x50, ARRAY_LENGTH_OFFSET as u8]); // MOV R10D,[RAX+12]
+        self.buf
+            .emit(&[0x44, 0x8B, 0x50, ARRAY_LENGTH_OFFSET as u8]); // MOV R10D,[RAX+12]
         self.buf.emit(&[0x44, 0x39, 0xD1]); // CMP ECX, R10D
         self.emit_deopt_unless(0x82, bci, DeoptReason::BoundsCheck); // JB continue
     }
@@ -2179,7 +2183,10 @@ impl<'a> Lowerer<'a> {
         // *control* node of each — the New/store nodes themselves are now
         // `Op::Dead` (unscheduled), but their captured control inputs are live
         // and carry the same block.
-        if !self.schedule.node_strictly_dominates_block(info.new_ctrl, db) {
+        if !self
+            .schedule
+            .node_strictly_dominates_block(info.new_ctrl, db)
+        {
             if dbg {
                 eprintln!(
                     "[DBG_SCALAR_DEOPT] bail new {new_id}: new_ctrl {} (block {:?}) !strict-dom deopt block {db}",
@@ -2323,7 +2330,9 @@ pub fn lower(
     // the historical byte-for-byte layout. An empty `HashMap` performs no
     // allocation until first insert.
     let empty: HashMap<usize, bool> = HashMap::new();
-    lower_inner(graph, schedule, num_params, num_locals, helpers, &empty, None)
+    lower_inner(
+        graph, schedule, num_params, num_locals, helpers, &empty, None,
+    )
 }
 
 /// `lower` with profile-guided conditional-branch layout (wire-tiered-manager
@@ -2339,7 +2348,15 @@ pub fn lower_with_branch_hints(
     helpers: &JitRuntimeHelpers,
     branch_hints: &HashMap<usize, bool>,
 ) -> Option<CompiledMethod> {
-    lower_inner(graph, schedule, num_params, num_locals, helpers, branch_hints, None)
+    lower_inner(
+        graph,
+        schedule,
+        num_params,
+        num_locals,
+        helpers,
+        branch_hints,
+        None,
+    )
 }
 
 /// As [`lower`], but with an optional [`ScalarReplacementMap`] enabling the
@@ -2357,7 +2374,9 @@ pub fn lower_with_scalar_deopt(
     sr_map: Option<&ScalarReplacementMap>,
 ) -> Option<CompiledMethod> {
     let empty: HashMap<usize, bool> = HashMap::new();
-    lower_inner(graph, schedule, num_params, num_locals, helpers, &empty, sr_map)
+    lower_inner(
+        graph, schedule, num_params, num_locals, helpers, &empty, sr_map,
+    )
 }
 
 /// Shared lowering body: both profile-guided branch hints and the optional
@@ -2606,7 +2625,10 @@ mod tests {
             .expect("lower")
             .code_bytes()
             .to_vec();
-        assert_eq!(base, other, "a hint for an unrelated PC must not change codegen");
+        assert_eq!(
+            base, other,
+            "a hint for an unrelated PC must not change codegen"
+        );
     }
 
     // ── real-frame-deopt step 2: deopt points + lookup ───────────────────
@@ -2738,14 +2760,22 @@ mod tests {
         let cond = g.add(Op::Param(0), IrType::Int, vec![start], None);
         // o = new Foo(); o.x = 7  (both controlled by c0 → block0)
         let newo = g.add(
-            Op::New { class_id: 7, num_fields: 1 },
+            Op::New {
+                class_id: 7,
+                num_fields: 1,
+            },
             IrType::Ref,
             vec![c0, mem],
             None,
         );
         let f0 = g.add(Op::Const(0), IrType::Int, vec![], None); // field index 0
         let v7 = g.add(Op::Const(7), IrType::Int, vec![], None); // field value
-        let store = g.add(Op::Store(MemKind::Int), IrType::Memory, vec![c0, mem, newo, f0, v7], None);
+        let store = g.add(
+            Op::Store(MemKind::Int),
+            IrType::Memory,
+            vec![c0, mem, newo, f0, v7],
+            None,
+        );
         let new_ctrl = c0;
         let store_ctrl = c0;
 
@@ -2828,8 +2858,8 @@ mod tests {
         // value as its field — the guard-surviving case.
         let (g, sr_map, newo) = build_sr_deopt_graph(false, false);
         let schedule = ir_schedule::schedule(&g);
-        let cm =
-            lower_with_scalar_deopt(&g, &schedule, 1, 3, &no_helpers(), Some(&sr_map)).expect("lower");
+        let cm = lower_with_scalar_deopt(&g, &schedule, 1, 3, &no_helpers(), Some(&sr_map))
+            .expect("lower");
         let locals = deopt_locals_at(&cm, 10);
         // local[1] is the object → VirtualObject{ class_id:7, field_values:[Int(7)] }.
         match &locals[1] {
@@ -2850,8 +2880,8 @@ mod tests {
         // resume falls back to a safe whole-method re-run.
         let (g, sr_map, _newo) = build_sr_deopt_graph(true, false);
         let schedule = ir_schedule::schedule(&g);
-        let cm =
-            lower_with_scalar_deopt(&g, &schedule, 1, 3, &no_helpers(), Some(&sr_map)).expect("lower");
+        let cm = lower_with_scalar_deopt(&g, &schedule, 1, 3, &no_helpers(), Some(&sr_map))
+            .expect("lower");
         let locals = deopt_locals_at(&cm, 10);
         assert_eq!(
             locals[1],
@@ -2866,8 +2896,8 @@ mod tests {
         // VirtualObject, the second is a VirtualObjectRef to its id.
         let (g, sr_map, newo) = build_sr_deopt_graph(false, true);
         let schedule = ir_schedule::schedule(&g);
-        let cm =
-            lower_with_scalar_deopt(&g, &schedule, 1, 3, &no_helpers(), Some(&sr_map)).expect("lower");
+        let cm = lower_with_scalar_deopt(&g, &schedule, 1, 3, &no_helpers(), Some(&sr_map))
+            .expect("lower");
         let locals = deopt_locals_at(&cm, 10);
         assert!(
             matches!(&locals[1], FrameValue::VirtualObject(s) if s.id == newo as usize),
@@ -3278,6 +3308,3 @@ mod tests {
         assert_eq!(frame.locals[2], FrameValue::Long(0));
     }
 }
-
-
-

@@ -98,7 +98,11 @@ fn javac_available_cached(out_dir: &Path) -> bool {
     // shell out again next build (no correctness impact).
     let _ = std::fs::write(
         &cache_path,
-        format!("{}\n{}\n", if present { "present" } else { "absent" }, fingerprint),
+        format!(
+            "{}\n{}\n",
+            if present { "present" } else { "absent" },
+            fingerprint
+        ),
     );
     present
 }

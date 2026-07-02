@@ -2318,8 +2318,12 @@ mod tests {
         let sess = "javax/net/ssl/SSLSession";
         assert!(r.find(sess, "getApplicationBufferSize", "()I").is_some());
         assert!(r.find(sess, "getPacketBufferSize", "()I").is_some());
-        assert!(r.find(sess, "getProtocol", "()Ljava/lang/String;").is_some());
-        assert!(r.find(sess, "getCipherSuite", "()Ljava/lang/String;").is_some());
+        assert!(r
+            .find(sess, "getProtocol", "()Ljava/lang/String;")
+            .is_some());
+        assert!(r
+            .find(sess, "getCipherSuite", "()Ljava/lang/String;")
+            .is_some());
         assert!(r.find(sess, "isValid", "()Z").is_some());
     }
 
@@ -3084,7 +3088,7 @@ fn default_engine_server_config(
                 let pem = trust_roots_pem(trust_roots.as_ref());
                 if pem.is_empty() {
                     return Err(
-                        "setNeedClientAuth(true) requires javax.net.ssl.trustStore".to_string(),
+                        "setNeedClientAuth(true) requires javax.net.ssl.trustStore".to_string()
                     );
                 }
                 Some(pem)
@@ -4120,8 +4124,10 @@ fn do_unwrap(
     // OVERFLOW so the caller drains its app buffer and retries (records stay in
     // src). Skipped while still handshaking: handshake records produce no app
     // plaintext, so a 0-capacity dst is normal and must not stall the handshake.
-    let handshaking = with_engine(id, |s| s.conn.as_ref().map(|c| c.is_handshaking()).unwrap_or(true))
-        .unwrap_or(true);
+    let handshaking = with_engine(id, |s| {
+        s.conn.as_ref().map(|c| c.is_handshaking()).unwrap_or(true)
+    })
+    .unwrap_or(true);
     if dst_cap == 0 && !handshaking {
         let hs = with_engine(id, |s| handshake_status_of(s)).unwrap_or(HS_NOT_HANDSHAKING_R);
         let result = alloc_engine_result(ctx, SR_BUFFER_OVERFLOW, hs, 0, 0);
@@ -4153,8 +4159,10 @@ fn do_unwrap(
                     underflow = true; // incomplete record header
                     break;
                 }
-                let b3 = ctx.get_array_element(arr, offset + 3).as_int().unwrap_or(0) as u8 as usize;
-                let b4 = ctx.get_array_element(arr, offset + 4).as_int().unwrap_or(0) as u8 as usize;
+                let b3 =
+                    ctx.get_array_element(arr, offset + 3).as_int().unwrap_or(0) as u8 as usize;
+                let b4 =
+                    ctx.get_array_element(arr, offset + 4).as_int().unwrap_or(0) as u8 as usize;
                 let rec_len = (b3 << 8) | b4;
                 let rec_end = offset + 5 + rec_len;
                 if rec_end > src_lim {
@@ -4472,7 +4480,11 @@ fn sslparams_alpn_table() -> &'static parking_lot::Mutex<HashMap<u64, Vec<String
 /// Copy an `SSLContext`'s per-context identity onto the engine `createSSLEngine`
 /// just produced, so `engine_begin` uses this engine's own keystore cert/key
 /// (server cert, or client cert for mTLS) instead of the process-global slot.
-pub(crate) fn set_engine_identity_override(engine_obj: ObjectRef, cert_pem: String, key_pem: String) {
+pub(crate) fn set_engine_identity_override(
+    engine_obj: ObjectRef,
+    cert_pem: String,
+    key_pem: String,
+) {
     let id = engine_id_or_alloc(engine_obj);
     let trust_roots = take_selected_context_trust_roots();
     with_engine(id, |s| {
@@ -4590,14 +4602,27 @@ fn register_ssl_session_real(r: &mut NativeMethodRegistry) {
     // Disambiguate by field count so both return the correct String.
     r.register(cls, "getProtocol", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let slot = if ctx.object_num_fields(this) >= 7 { 1 } else { 0 };
+        let slot = if ctx.object_num_fields(this) >= 7 {
+            1
+        } else {
+            0
+        };
         Ok(Some(ctx.get_field(this, slot)))
     });
-    r.register(cls, "getCipherSuite", "()Ljava/lang/String;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let slot = if ctx.object_num_fields(this) >= 7 { 0 } else { 1 };
-        Ok(Some(ctx.get_field(this, slot)))
-    });
+    r.register(
+        cls,
+        "getCipherSuite",
+        "()Ljava/lang/String;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let slot = if ctx.object_num_fields(this) >= 7 {
+                0
+            } else {
+                1
+            };
+            Ok(Some(ctx.get_field(this, slot)))
+        },
+    );
 
     // `isValid` flag is slot 2 only on the 7-field engine session; the 3-field
     // accept session has no flag — treat it as valid (it was just negotiated).

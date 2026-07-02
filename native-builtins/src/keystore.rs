@@ -1580,16 +1580,15 @@ fn store_identity_pem_map(
 /// `KeyManagerFactory.init(KeyStore, char[])` calls this so the keystore's
 /// identity is staged for the next `SSLContext.init` on this thread (see
 /// `t27_tls::set_pending_km_identity`).
-pub(crate) fn keystore_set_pending_km_identity(ctx: &mut dyn NativeContext, keystore_obj: ObjectRef) {
+pub(crate) fn keystore_set_pending_km_identity(
+    ctx: &mut dyn NativeContext,
+    keystore_obj: ObjectRef,
+) {
     let id = get_store_id(ctx, keystore_obj);
     if id == 0 {
         return;
     }
-    let ident = store_identity_pem_map()
-        .lock()
-        .unwrap()
-        .get(&id)
-        .cloned();
+    let ident = store_identity_pem_map().lock().unwrap().get(&id).cloned();
     if let Some((cert, key)) = ident {
         crate::t27_tls::set_pending_km_identity(cert, key);
     }

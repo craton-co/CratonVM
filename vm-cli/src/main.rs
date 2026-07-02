@@ -257,15 +257,27 @@ struct Args {
     g1_ihop: Option<String>,
 
     /// `-XX:G1HeapRegionSize=<bytes>` → G1 region size (honoured under G1).
-    #[arg(long = "XX:G1RegionSize", value_name = "SIZE", overrides_with = "g1_region_size")]
+    #[arg(
+        long = "XX:G1RegionSize",
+        value_name = "SIZE",
+        overrides_with = "g1_region_size"
+    )]
     g1_region_size: Option<String>,
 
     /// `-XX:MaxGCPauseMillis=<n>` → G1 pause target (honoured under G1).
-    #[arg(long = "XX:MaxGCPause", value_name = "MS", overrides_with = "g1_max_pause")]
+    #[arg(
+        long = "XX:MaxGCPause",
+        value_name = "MS",
+        overrides_with = "g1_max_pause"
+    )]
     g1_max_pause: Option<String>,
 
     /// `-XX:±UseStringDeduplication` → G1 String dedup (honoured under G1).
-    #[arg(long = "XX:StringDedup", value_name = "BOOL", overrides_with = "g1_string_dedup")]
+    #[arg(
+        long = "XX:StringDedup",
+        value_name = "BOOL",
+        overrides_with = "g1_string_dedup"
+    )]
     g1_string_dedup: Option<String>,
 
     /// Unified logging spec (-Xlog:tag[+tag]*[=level][:output[:decorators]]).
@@ -546,7 +558,10 @@ fn lock_staged_archive_copies(
 fn remove_staged_archive_copy(path: &std::path::Path) {
     if let Err(e) = std::fs::remove_file(path) {
         if e.kind() != std::io::ErrorKind::NotFound {
-            tracing::warn!("failed to remove staged archive copy {}: {e}", path.display());
+            tracing::warn!(
+                "failed to remove staged archive copy {}: {e}",
+                path.display()
+            );
         }
     }
 }
@@ -639,9 +654,8 @@ fn classpath_entry_for_archive(
         )
     })?;
     let copy_result = (|| -> Result<()> {
-        let mut src_file = std::fs::File::open(archive_path).with_context(|| {
-            format!("failed to open {} for staging", archive_path.display())
-        })?;
+        let mut src_file = std::fs::File::open(archive_path)
+            .with_context(|| format!("failed to open {} for staging", archive_path.display()))?;
         std::io::copy(&mut src_file, &mut dst_file).with_context(|| {
             format!(
                 "failed to stage {} as {} for classpath registration",
@@ -1943,7 +1957,9 @@ fn run() -> Result<()> {
     if let Some(s) = &args.g1_max_pause {
         match s.parse::<u64>() {
             Ok(ms) if ms > 0 => config.g1_max_gc_pause_ms = Some(ms),
-            _ => eprintln!("Warning: ignoring -XX:MaxGCPauseMillis={s} (expected a positive integer)"),
+            _ => eprintln!(
+                "Warning: ignoring -XX:MaxGCPauseMillis={s} (expected a positive integer)"
+            ),
         }
     }
     if let Some(s) = &args.g1_string_dedup {
@@ -2088,12 +2104,15 @@ fn run() -> Result<()> {
     let explicit_watchdog = matches!(args.stack_dump_on_timeout, Some(s) if s > 0);
     let ring_recording_requested = explicit_watchdog
         || std::env::var("CRATONVM_ENABLE_NATIVE_RING").ok().as_deref() == Some("1");
-    let default_watchdog_env =
-        if std::env::var("CRATONVM_DISABLE_DEFAULT_WATCHDOG").ok().as_deref() == Some("1") {
-            None
-        } else {
-            std::env::var("CRATONVM_DEFAULT_WATCHDOG_SEC").ok()
-        };
+    let default_watchdog_env = if std::env::var("CRATONVM_DISABLE_DEFAULT_WATCHDOG")
+        .ok()
+        .as_deref()
+        == Some("1")
+    {
+        None
+    } else {
+        std::env::var("CRATONVM_DEFAULT_WATCHDOG_SEC").ok()
+    };
     let effective_watchdog =
         resolve_watchdog_timeout(args.stack_dump_on_timeout, default_watchdog_env.as_deref());
     // Shared "run() completed" flag for the stack-dump watchdog. When `run()`
@@ -3565,9 +3584,7 @@ fn main() {
             use std::io::Write as _;
             match run() {
                 Ok(()) => {
-                    eprintln!(
-                        "[cratonvm] main-vm run() returned Ok — VM main exiting normally"
-                    );
+                    eprintln!("[cratonvm] main-vm run() returned Ok — VM main exiting normally");
                     let _ = std::io::stderr().flush();
                 }
                 Err(e) => {
@@ -3759,21 +3776,33 @@ mod tests {
     #[test]
     fn ergo_clamp_quarter_of_large_host() {
         // 16 GiB basis → 1/4 = 4 GiB, exactly the default cap.
-        assert_eq!(clamp_ergonomic_heap(16 * GIB, MAX_ERGONOMIC_HEAP), 4 * GIB as usize);
+        assert_eq!(
+            clamp_ergonomic_heap(16 * GIB, MAX_ERGONOMIC_HEAP),
+            4 * GIB as usize
+        );
     }
 
     #[test]
     fn ergo_clamp_capped_for_huge_host() {
         // 64 GiB basis → 1/4 = 16 GiB, capped to the 4 GiB default.
-        assert_eq!(clamp_ergonomic_heap(64 * GIB, MAX_ERGONOMIC_HEAP), 4 * GIB as usize);
+        assert_eq!(
+            clamp_ergonomic_heap(64 * GIB, MAX_ERGONOMIC_HEAP),
+            4 * GIB as usize
+        );
     }
 
     #[test]
     fn ergo_clamp_floored_small_basis() {
         // 4 GiB basis → 1/4 = 1 GiB (above the 256 MiB floor).
-        assert_eq!(clamp_ergonomic_heap(4 * GIB, MAX_ERGONOMIC_HEAP), GIB as usize);
+        assert_eq!(
+            clamp_ergonomic_heap(4 * GIB, MAX_ERGONOMIC_HEAP),
+            GIB as usize
+        );
         // 512 MiB basis → 1/4 = 128 MiB, raised to the 256 MiB floor.
-        assert_eq!(clamp_ergonomic_heap(512 * MIB, MAX_ERGONOMIC_HEAP), (256 * MIB) as usize);
+        assert_eq!(
+            clamp_ergonomic_heap(512 * MIB, MAX_ERGONOMIC_HEAP),
+            (256 * MIB) as usize
+        );
     }
 
     #[test]
@@ -3781,14 +3810,23 @@ mod tests {
         // A 256 MiB container: 1/4 = 64 MiB, the floor would push it to
         // 256 MiB — but it must never exceed the basis itself, so it stays
         // at exactly 256 MiB (not above), and a 200 MiB basis stays at 200.
-        assert_eq!(clamp_ergonomic_heap(256 * MIB, MAX_ERGONOMIC_HEAP), (256 * MIB) as usize);
-        assert_eq!(clamp_ergonomic_heap(200 * MIB, MAX_ERGONOMIC_HEAP), (200 * MIB) as usize);
+        assert_eq!(
+            clamp_ergonomic_heap(256 * MIB, MAX_ERGONOMIC_HEAP),
+            (256 * MIB) as usize
+        );
+        assert_eq!(
+            clamp_ergonomic_heap(200 * MIB, MAX_ERGONOMIC_HEAP),
+            (200 * MIB) as usize
+        );
     }
 
     #[test]
     fn ergo_clamp_custom_cap_floored() {
         // A tiny cap override can't drop the result below the 256 MiB floor.
-        assert_eq!(clamp_ergonomic_heap(16 * GIB, 64 * MIB), (256 * MIB) as usize);
+        assert_eq!(
+            clamp_ergonomic_heap(16 * GIB, 64 * MIB),
+            (256 * MIB) as usize
+        );
         // A 2 GiB cap bites on a big host (8 GiB → 1/4 = 2 GiB).
         assert_eq!(clamp_ergonomic_heap(8 * GIB, 2 * GIB), (2 * GIB) as usize);
     }
@@ -4231,11 +4269,17 @@ mod tests {
         let cleanup = cleanup.expect("non-.jar archive should be staged");
         assert_ne!(entry, archive);
         assert_eq!(entry.extension().and_then(|e| e.to_str()), Some("jar"));
-        assert!(entry.exists(), "staged copy should exist while guard is live");
+        assert!(
+            entry.exists(),
+            "staged copy should exist while guard is live"
+        );
         assert_eq!(std::fs::read(&entry).unwrap(), b"fake archive");
 
         drop(cleanup);
-        assert!(!entry.exists(), "staged copy should be removed on guard drop");
+        assert!(
+            !entry.exists(),
+            "staged copy should be removed on guard drop"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -4527,18 +4571,12 @@ mod tests {
     fn hotspot_xx_non_gc_use_flags_not_mistaken_for_selector() {
         // `-XX:+Use*` flags that do NOT end in `GC` must not become a GC
         // selector. Supported non-GC flags keep their own mapping.
-        let out = normalize_java_launcher_argv(argv(&[
-            "java",
-            "-XX:+UseStringDeduplication",
-            "Main",
-        ]));
+        let out =
+            normalize_java_launcher_argv(argv(&["java", "-XX:+UseStringDeduplication", "Main"]));
         assert_eq!(out, argv(&["java", "--XX:StringDedup", "true", "Main"]));
 
-        let out = normalize_java_launcher_argv(argv(&[
-            "java",
-            "-XX:-UseStringDeduplication",
-            "Main",
-        ]));
+        let out =
+            normalize_java_launcher_argv(argv(&["java", "-XX:-UseStringDeduplication", "Main"]));
         assert_eq!(out, argv(&["java", "--XX:StringDedup", "false", "Main"]));
 
         let out = normalize_java_launcher_argv(argv(&["java", "-XX:+UseCompressedOops", "Main"]));
@@ -4672,8 +4710,7 @@ mod tests {
         let stage2 = normalize_java_launcher_argv(stage1);
         let (stage3, _props) = extract_system_properties(stage2);
         let (stage4, _hot) = extract_hotspot_flags(stage3);
-        let parsed =
-            Args::try_parse_from(stage4).expect("clap must parse bare native-access flag");
+        let parsed = Args::try_parse_from(stage4).expect("clap must parse bare native-access flag");
 
         assert_eq!(parsed.enable_native_access.as_deref(), Some("ALL-UNNAMED"));
         assert_eq!(parsed.class_name.as_deref(), Some("Main"));

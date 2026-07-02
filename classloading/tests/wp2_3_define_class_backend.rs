@@ -598,7 +598,7 @@ fn minimal_java_lang_class_bytes(simple_name: &str) -> Vec<u8> {
     b.extend_from_slice(&[0x00, 0x00]); // minor
     b.extend_from_slice(&[0x00, 0x34]); // major 52 (Java 8)
     b.extend_from_slice(&[0x00, 0x05]); // constant_pool_count = 5 (#1..#4)
-    // #1 CONSTANT_Class -> #2
+                                        // #1 CONSTANT_Class -> #2
     b.push(7);
     b.extend_from_slice(&[0x00, 0x02]);
     // #2 CONSTANT_Utf8 this_name

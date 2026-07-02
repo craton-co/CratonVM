@@ -309,7 +309,11 @@ fn concurrent_hashmap_for_each_key_reads_forwarded_action_and_keys() {
     .unwrap();
 
     let log = ctx.invoke_virtual_log();
-    assert_eq!(log.len(), 2, "ConcurrentHashMap.forEachKey should visit two keys");
+    assert_eq!(
+        log.len(),
+        2,
+        "ConcurrentHashMap.forEachKey should visit two keys"
+    );
     assert_eq!(log[0].0, action.as_ptr() as usize);
     assert_ne!(
         log[1].0,
@@ -362,7 +366,11 @@ fn concurrent_hashmap_search_reads_forwarded_function_and_entries() {
 
     assert_eq!(result, Some(Value::Object(None)));
     let log = ctx.invoke_virtual_log();
-    assert_eq!(log.len(), 2, "ConcurrentHashMap.search should visit two entries");
+    assert_eq!(
+        log.len(),
+        2,
+        "ConcurrentHashMap.search should visit two entries"
+    );
     assert_eq!(log[0].0, function.as_ptr() as usize);
     assert_ne!(
         log[1].0,

@@ -1658,7 +1658,8 @@ pub fn native_al_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     resync_values_view(ctx, this);
     let (data, size) = al_state(ctx, this);
     if data.is_none() {
-        if let Some(r) = try_delegate_real_collection(ctx, this, "java/util/Collection", "size", "()I")
+        if let Some(r) =
+            try_delegate_real_collection(ctx, this, "java/util/Collection", "size", "()I")
         {
             return r;
         }
@@ -4391,7 +4392,8 @@ fn native_map_is_empty(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     }
     let (buckets, size, _) = map_state(ctx, this);
     if buckets.is_none() {
-        if let Some(r) = try_delegate_real_collection(ctx, this, "java/util/Map", "isEmpty", "()Z") {
+        if let Some(r) = try_delegate_real_collection(ctx, this, "java/util/Map", "isEmpty", "()Z")
+        {
             return r;
         }
     }
@@ -5292,12 +5294,8 @@ fn map_equals_entries(
                 if !matches!(other_val, Value::Object(None)) {
                     return Ok(false);
                 }
-                let has = ctx.invoke_virtual(
-                    other,
-                    "containsKey",
-                    "(Ljava/lang/Object;)Z",
-                    &[*key],
-                )?;
+                let has =
+                    ctx.invoke_virtual(other, "containsKey", "(Ljava/lang/Object;)Z", &[*key])?;
                 if !matches!(has, Some(Value::Int(1))) {
                     return Ok(false);
                 }
@@ -6694,11 +6692,13 @@ fn native_hs_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     // Ordinary (non-view) HashSet: remove from the backing only.
     let remove_args = [Value::Object(Some(backing)), elem];
     let old = native_map_remove(ctx, &remove_args)?;
-    Ok(Some(Value::Int(if !matches!(old, Some(Value::Object(None))) {
-        1
-    } else {
-        0
-    })))
+    Ok(Some(Value::Int(
+        if !matches!(old, Some(Value::Object(None))) {
+            1
+        } else {
+            0
+        },
+    )))
 }
 
 fn native_hs_contains(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -8429,9 +8429,12 @@ fn native_map_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         let a = ctx.read_native_pin(action_pin, action);
         let k = read_pinned_elem(ctx, khandles[i], keys[i]);
         let v = read_pinned_elem(ctx, vhandles[i], vals[i]);
-        if let Err(e) =
-            ctx.invoke_virtual(a, "accept", "(Ljava/lang/Object;Ljava/lang/Object;)V", &[k, v])
-        {
+        if let Err(e) = ctx.invoke_virtual(
+            a,
+            "accept",
+            "(Ljava/lang/Object;Ljava/lang/Object;)V",
+            &[k, v],
+        ) {
             result = Err(e);
             break;
         }
@@ -10192,8 +10195,7 @@ fn stream_process_chain(
     start: usize,
     state: &mut StreamPullState,
     emit: &mut StreamEmit<'_>,
-) -> Result<PullStep, MethodCallFailed>
-{
+) -> Result<PullStep, MethodCallFailed> {
     if stream_limit_saturated(chain, state, start) {
         return Ok(PullStep::Stop);
     }
@@ -10250,14 +10252,8 @@ fn stream_process_chain(
                 };
                 if let Value::Object(Some(inner_stream)) = mapped {
                     let inner_pin = ctx.pin_native_root(inner_stream);
-                    let pull = stream_pull_any_downstream(
-                        ctx,
-                        inner_stream,
-                        chain,
-                        i + 1,
-                        state,
-                        emit,
-                    );
+                    let pull =
+                        stream_pull_any_downstream(ctx, inner_stream, chain, i + 1, state, emit);
                     let inner_stream = ctx.read_native_pin(inner_pin, inner_stream);
                     let close = ctx
                         .invoke_virtual(inner_stream, "close", "()V", &[])
@@ -10280,8 +10276,7 @@ fn stream_pull_internal(
     ctx: &mut dyn NativeContext,
     this: ObjectRef,
     emit: &mut StreamEmit<'_>,
-) -> Result<PullStep, MethodCallFailed>
-{
+) -> Result<PullStep, MethodCallFailed> {
     let base = stream_source_elems(ctx, this);
     let chain = stream_read_chain(ctx, this);
     let mut state = stream_new_pull_state(chain.len());
@@ -10319,8 +10314,7 @@ fn stream_pull_iterator_downstream(
     downstream_start: usize,
     downstream_state: &mut StreamPullState,
     emit: &mut StreamEmit<'_>,
-) -> Result<PullStep, MethodCallFailed>
-{
+) -> Result<PullStep, MethodCallFailed> {
     let iterator = match ctx.invoke_virtual(stream, "iterator", "()Ljava/util/Iterator;", &[])? {
         Some(Value::Object(Some(i))) => i,
         _ => return Ok(PullStep::Continue),
@@ -10363,8 +10357,7 @@ fn stream_pull_synthetic_downstream(
     downstream_start: usize,
     downstream_state: &mut StreamPullState,
     emit: &mut StreamEmit<'_>,
-) -> Result<PullStep, MethodCallFailed>
-{
+) -> Result<PullStep, MethodCallFailed> {
     let base = stream_source_elems(ctx, stream);
     let chain = stream_read_chain(ctx, stream);
     let mut state = stream_new_pull_state(chain.len());
@@ -10412,8 +10405,7 @@ fn stream_pull_any_downstream(
     downstream_start: usize,
     downstream_state: &mut StreamPullState,
     emit: &mut StreamEmit<'_>,
-) -> Result<PullStep, MethodCallFailed>
-{
+) -> Result<PullStep, MethodCallFailed> {
     let class_name = ctx
         .class_name_of_id(ctx.class_id_of_object(stream))
         .unwrap_or_default();
@@ -11662,7 +11654,11 @@ fn native_stream_sorted(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
                 numeric_sort_key(ctx, &e).unwrap_or(0.0)
             })
             .collect();
-        idx.sort_by(|&a, &b| keys[a].partial_cmp(&keys[b]).unwrap_or(std::cmp::Ordering::Equal));
+        idx.sort_by(|&a, &b| {
+            keys[a]
+                .partial_cmp(&keys[b])
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
     } else {
         // Fallback: sort by string representation.
         let keys: Vec<String> = (0..elements.len())
@@ -11703,8 +11699,16 @@ fn native_stream_sorted_cmp(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     let (_, elem_handles) = pin_value_slice(ctx, &elems);
     let mut idx: Vec<Value> = (0..elems.len() as i32).map(Value::Int).collect();
     let sort_res = merge_sort_fallible(ctx, &mut idx, |c, a, b| {
-        let ia = if let Value::Int(v) = a { *v as usize } else { 0 };
-        let ib = if let Value::Int(v) = b { *v as usize } else { 0 };
+        let ia = if let Value::Int(v) = a {
+            *v as usize
+        } else {
+            0
+        };
+        let ib = if let Value::Int(v) = b {
+            *v as usize
+        } else {
+            0
+        };
         let ea = read_pinned_elem(c, elem_handles[ia], elems[ia]);
         let eb = read_pinned_elem(c, elem_handles[ib], elems[ib]);
         let cmp = c.read_native_pin(cmp_pin, comparator);
@@ -11716,7 +11720,11 @@ fn native_stream_sorted_cmp(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     let sorted: Vec<Value> = idx
         .iter()
         .map(|v| {
-            let i = if let Value::Int(x) = v { *x as usize } else { 0 };
+            let i = if let Value::Int(x) = v {
+                *x as usize
+            } else {
+                0
+            };
             read_pinned_elem(ctx, elem_handles[i], elems[i])
         })
         .collect();
@@ -19868,8 +19876,7 @@ fn native_lhm_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     // subclasses never evict and grow without bound — e.g.
     // `ExplicitQueryStatsMaxSizeTest` (query-plan stats trimmed at 100 entries).
     let this_cid = ctx.class_id_of_object(this);
-    let is_plain_lhm =
-        ctx.class_name_of_id(this_cid).as_deref() == Some("java/util/LinkedHashMap");
+    let is_plain_lhm = ctx.class_name_of_id(this_cid).as_deref() == Some("java/util/LinkedHashMap");
     if !is_plain_lhm {
         if let Value::Object(Some(head)) = lhm_get(ctx, this, "head", LHM_FIELD_HEAD) {
             // The overlay node is a synthetic `java/util/LinkedHashMap$Node`
@@ -21988,12 +21995,9 @@ fn collect_collection_elements(ctx: &mut dyn NativeContext, coll: ObjectRef) -> 
             };
             let mut out = Vec::with_capacity(count as usize);
             for i in 0..count {
-                if let Ok(Some(v)) = ctx.invoke_virtual(
-                    coll,
-                    "getName",
-                    "(I)Ljava/nio/file/Path;",
-                    &[Value::Int(i)],
-                ) {
+                if let Ok(Some(v)) =
+                    ctx.invoke_virtual(coll, "getName", "(I)Ljava/nio/file/Path;", &[Value::Int(i)])
+                {
                     out.push(v);
                 }
             }
@@ -26090,12 +26094,20 @@ fn native_ts_sub_set_inclusive(ctx: &mut dyn NativeContext, args: &[Value]) -> M
         for i in 0..(size as usize) {
             let e = ctx.get_array_element(data, i);
             let cmp_lo = tree_compare(ctx, &comparator, e, from_elem)?;
-            let below = if from_inclusive { cmp_lo < 0 } else { cmp_lo <= 0 };
+            let below = if from_inclusive {
+                cmp_lo < 0
+            } else {
+                cmp_lo <= 0
+            };
             if below {
                 continue;
             }
             let cmp_hi = tree_compare(ctx, &comparator, e, to_elem)?;
-            let above = if to_inclusive { cmp_hi > 0 } else { cmp_hi >= 0 };
+            let above = if to_inclusive {
+                cmp_hi > 0
+            } else {
+                cmp_hi >= 0
+            };
             if above {
                 break;
             }
@@ -27180,7 +27192,9 @@ fn register_concurrent_hashmap_natives(r: &mut NativeMethodRegistry) {
             for i in 0..keys.len() {
                 let action = ctx.read_native_pin(action_pin, action);
                 let key = read_pinned_elem(ctx, key_pins[i], keys[i]);
-                if let Err(e) = ctx.invoke_virtual(action, "accept", "(Ljava/lang/Object;)V", &[key]) {
+                if let Err(e) =
+                    ctx.invoke_virtual(action, "accept", "(Ljava/lang/Object;)V", &[key])
+                {
                     ctx.unpin_native_roots(action_pin);
                     return Err(e);
                 }
@@ -27208,7 +27222,9 @@ fn register_concurrent_hashmap_natives(r: &mut NativeMethodRegistry) {
             for i in 0..vals.len() {
                 let action = ctx.read_native_pin(action_pin, action);
                 let val = read_pinned_elem(ctx, val_pins[i], vals[i]);
-                if let Err(e) = ctx.invoke_virtual(action, "accept", "(Ljava/lang/Object;)V", &[val]) {
+                if let Err(e) =
+                    ctx.invoke_virtual(action, "accept", "(Ljava/lang/Object;)V", &[val])
+                {
                     ctx.unpin_native_roots(action_pin);
                     return Err(e);
                 }
@@ -28014,7 +28030,12 @@ fn native_chm_equals(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     // So we propagate here too (the `?`), matching HotSpot.
     for (key, value) in &our_entries {
         let other_val = ctx
-            .invoke_virtual(other, "get", "(Ljava/lang/Object;)Ljava/lang/Object;", &[*key])?
+            .invoke_virtual(
+                other,
+                "get",
+                "(Ljava/lang/Object;)Ljava/lang/Object;",
+                &[*key],
+            )?
             .unwrap_or(Value::Object(None));
         let eq = match (value, &other_val) {
             (Value::Object(Some(va)), Value::Object(Some(vb))) => map_keys_equal(ctx, *va, *vb)?,

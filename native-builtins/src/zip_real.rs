@@ -693,9 +693,7 @@ mod tests {
     fn assert_direct_deflate_unsupported(result: MethodCallResult) {
         match result {
             Err(cratonvm_types::error::MethodCallFailed::InternalError(
-                cratonvm_types::error::VmError::Runtime(RuntimeError::NotImplemented {
-                    feature,
-                }),
+                cratonvm_types::error::VmError::Runtime(RuntimeError::NotImplemented { feature }),
             )) => assert!(
                 feature.contains("direct-ByteBuffer deflate"),
                 "unexpected NotImplemented feature text: {feature}"

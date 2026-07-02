@@ -109,9 +109,9 @@ use crate::alloc_concurrent_synthetic;
 fn component_array_name(sig: &TypeSig) -> Option<String> {
     match sig {
         TypeSig::Base(ch) => Some(format!("[{}", ch)),
-        TypeSig::Class { name, type_args, .. } if type_args.is_empty() => {
-            Some(format!("[L{};", name))
-        }
+        TypeSig::Class {
+            name, type_args, ..
+        } if type_args.is_empty() => Some(format!("[L{};", name)),
         TypeSig::Class { .. } => {
             // Parameterized component (e.g. List<T>) -> erase to raw class.
             // Real JDK reifier produces a GenericArrayType here, but Spring
@@ -258,12 +258,8 @@ pub fn type_sig_to_java(ctx: &mut dyn NativeContext, sig: &TypeSig) -> Value {
                     if let Some(real) = resolve_declared_type_variable(ctx, scope, name) {
                         return real;
                     }
-                    match ctx.invoke_virtual(
-                        scope,
-                        "getDeclaringClass",
-                        "()Ljava/lang/Class;",
-                        &[],
-                    ) {
+                    match ctx.invoke_virtual(scope, "getDeclaringClass", "()Ljava/lang/Class;", &[])
+                    {
                         Ok(Some(Value::Object(Some(enclosing)))) if enclosing != scope => {
                             scope = enclosing;
                         }

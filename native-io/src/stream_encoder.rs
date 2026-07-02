@@ -236,10 +236,19 @@ fn is_high_surrogate(u: u16) -> bool {
 /// set AND the stored unit is a genuine high surrogate (defensive: a stray
 /// non-surrogate is never treated as a carry).
 fn take_pending(ctx: &dyn NativeContext, this: ObjectRef) -> Option<u16> {
-    if ctx.get_field_by_name(this, "haveLeftoverChar").as_int().unwrap_or(0) == 0 {
+    if ctx
+        .get_field_by_name(this, "haveLeftoverChar")
+        .as_int()
+        .unwrap_or(0)
+        == 0
+    {
         return None;
     }
-    let u = (ctx.get_field_by_name(this, "leftoverChar").as_int().unwrap_or(0) & 0xFFFF) as u16;
+    let u = (ctx
+        .get_field_by_name(this, "leftoverChar")
+        .as_int()
+        .unwrap_or(0)
+        & 0xFFFF) as u16;
     if is_high_surrogate(u) {
         Some(u)
     } else {

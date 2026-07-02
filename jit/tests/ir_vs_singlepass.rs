@@ -304,9 +304,9 @@ fn ir_vs_singlepass_long_two_slot_params() {
         4,
         2,
         &[
-            (vec![3, 4], 8),                              // 12 - 4
-            (vec![0x1_0000_0000, 3], 0x3_0000_0000 - 3),  // 64-bit mul
-            (vec![-2, 5], -15),                           // -10 - 5
+            (vec![3, 4], 8),                             // 12 - 4
+            (vec![0x1_0000_0000, 3], 0x3_0000_0000 - 3), // 64-bit mul
+            (vec![-2, 5], -15),                          // -10 - 5
         ],
     );
 }
@@ -343,7 +343,10 @@ fn ir_vs_singlepass_long_to_int_return() {
     for (a, b) in [(3i64, 4i64), (0x1_0000_0005, 0x1_0000_0002), (i64::MAX, 1)] {
         let r_ir = unsafe { ir.try_call(&[a, b]) }.unwrap();
         let r_sp = unsafe { sp.try_call(&[a, b]) }.unwrap();
-        assert_eq!(r_ir as i32, r_sp as i32, "l2i IR vs single-pass for ({a},{b})");
+        assert_eq!(
+            r_ir as i32, r_sp as i32,
+            "l2i IR vs single-pass for ({a},{b})"
+        );
         assert_eq!(
             r_ir as i32,
             a.wrapping_add(b) as i32,
@@ -441,8 +444,27 @@ fn compile_fp_ldc2w(
     ldc2w: &dyn Fn(u16) -> Option<(i64, bool)>,
 ) -> Option<CompiledMethod> {
     try_compile(
-        cm, None, None, None, None, None, None, None, Some(ldc2w), None, helpers, None, None, None,
-        None, optimize, false, false, true, false, true, // ir_emit_fp ON
+        cm,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some(ldc2w),
+        None,
+        helpers,
+        None,
+        None,
+        None,
+        None,
+        optimize,
+        false,
+        false,
+        true,
+        false,
+        true, // ir_emit_fp ON
     )
 }
 
@@ -468,7 +490,11 @@ fn ir_vs_singlepass_double_ldc2w_constant() {
         let r_sp = f64::from_bits(unsafe { sp.try_call(&args) }.unwrap() as u64);
         let host = a * C;
         assert_eq!(r_ir.to_bits(), host.to_bits(), "double ldc2_w IR for a={a}");
-        assert_eq!(r_sp.to_bits(), host.to_bits(), "double ldc2_w single-pass for a={a}");
+        assert_eq!(
+            r_sp.to_bits(),
+            host.to_bits(),
+            "double ldc2_w single-pass for a={a}"
+        );
     }
 }
 
@@ -581,19 +607,27 @@ fn ir_vs_singlepass_long_shifts() {
             // host: JVM masks the shift count to 6 bits (count & 0x3f) for long.
             (vec![1, 1], {
                 let a = 1i64;
-                (a << (1 & 63)).wrapping_add(a >> (1 & 63)).wrapping_add((a as u64 >> (1 & 63)) as i64)
+                (a << (1 & 63))
+                    .wrapping_add(a >> (1 & 63))
+                    .wrapping_add((a as u64 >> (1 & 63)) as i64)
             }),
             (vec![-1, 4], {
                 let a = -1i64;
-                (a << 4).wrapping_add(a >> 4).wrapping_add((a as u64 >> 4) as i64)
+                (a << 4)
+                    .wrapping_add(a >> 4)
+                    .wrapping_add((a as u64 >> 4) as i64)
             }),
             (vec![0x1234_5678_9abc_def0u64 as i64, 40], {
                 let a = 0x1234_5678_9abc_def0u64 as i64;
-                (a << (40 & 63)).wrapping_add(a >> (40 & 63)).wrapping_add((a as u64 >> (40 & 63)) as i64)
+                (a << (40 & 63))
+                    .wrapping_add(a >> (40 & 63))
+                    .wrapping_add((a as u64 >> (40 & 63)) as i64)
             }),
             (vec![i64::MIN, 1], {
                 let a = i64::MIN;
-                (a << 1).wrapping_add(a >> 1).wrapping_add((a as u64 >> 1) as i64)
+                (a << 1)
+                    .wrapping_add(a >> 1)
+                    .wrapping_add((a as u64 >> 1) as i64)
             }),
         ],
     );
@@ -616,10 +650,19 @@ fn ir_vs_singlepass_long_bitwise() {
         4,
         2,
         &[
-            (vec![0x0f0f_0f0f_0f0f_0f0fu64 as i64, 0x00ff_00ff_00ff_00ffu64 as i64], {
-                let (a, b) = (0x0f0f_0f0f_0f0f_0f0fu64 as i64, 0x00ff_00ff_00ff_00ffu64 as i64);
-                (a & b) | (a ^ b)
-            }),
+            (
+                vec![
+                    0x0f0f_0f0f_0f0f_0f0fu64 as i64,
+                    0x00ff_00ff_00ff_00ffu64 as i64,
+                ],
+                {
+                    let (a, b) = (
+                        0x0f0f_0f0f_0f0f_0f0fu64 as i64,
+                        0x00ff_00ff_00ff_00ffu64 as i64,
+                    );
+                    (a & b) | (a ^ b)
+                },
+            ),
             (vec![-1, 0], -1),
             (vec![0, -1], -1),
             (vec![i64::MIN, i64::MAX], {
@@ -1522,11 +1565,11 @@ fn compile_with_dispatch(
         None,
         None,
         None,
-        true, // optimize (C2 / IR pipeline)
-        true, // ir_emit_calls (Gap B, invokestatic)
-        true, // ir_emit_special_calls (inc 24, invokespecial — inert without 0xb7)
-        true, // ir_emit_long (inc 28 — long call args; inert for non-long callers)
-        true, // ir_emit_virtual_calls (inc 26, invokevirtual/interface)
+        true,  // optimize (C2 / IR pipeline)
+        true,  // ir_emit_calls (Gap B, invokestatic)
+        true,  // ir_emit_special_calls (inc 24, invokespecial — inert without 0xb7)
+        true,  // ir_emit_long (inc 28 — long call args; inert for non-long callers)
+        true,  // ir_emit_virtual_calls (inc 26, invokevirtual/interface)
         false, // ir_emit_fp (inc 30 — inert for these int/long callers)
     )
 }
@@ -1539,13 +1582,27 @@ fn compile_with_dispatch_fp(
     invoke_resolver: &dyn Fn(u16) -> Option<(String, String, String)>,
 ) -> Option<CompiledMethod> {
     try_compile(
-        cm, None, None, None, Some(invoke_resolver), None, None, None, None, None, helpers, None,
-        None, None, None, true, // optimize
-        true,  // ir_emit_calls
-        true,  // ir_emit_special_calls
-        true,  // ir_emit_long
-        true,  // ir_emit_virtual_calls
-        true,  // ir_emit_fp (inc 32 — D call returns)
+        cm,
+        None,
+        None,
+        None,
+        Some(invoke_resolver),
+        None,
+        None,
+        None,
+        None,
+        None,
+        helpers,
+        None,
+        None,
+        None,
+        None,
+        true, // optimize
+        true, // ir_emit_calls
+        true, // ir_emit_special_calls
+        true, // ir_emit_long
+        true, // ir_emit_virtual_calls
+        true, // ir_emit_fp (inc 32 — D call returns)
     )
 }
 
@@ -2004,7 +2061,10 @@ fn ir_vs_singlepass_invokevirtual_instance_call() {
     };
     let ir = compile_with_dispatch(&cm, &helpers, &resolver)
         .expect("IR compile of invokevirtual instance method");
-    assert!(ir.needs_context(), "an Op::Call method must report needs_context");
+    assert!(
+        ir.needs_context(),
+        "an Op::Call method must report needs_context"
+    );
     let dummy_vm = [0u8; 64];
     for (xval, n) in [(5i32, 7i64), (-3, 2), (0, 0), (i32::MAX, 1)] {
         let obj = make_object(&[xval]);
@@ -2055,7 +2115,10 @@ fn ir_vs_singlepass_invokeinterface_instance_call() {
     };
     let ir = compile_with_dispatch(&cm, &helpers, &resolver)
         .expect("IR compile of invokeinterface instance method");
-    assert!(ir.needs_context(), "an Op::Call method must report needs_context");
+    assert!(
+        ir.needs_context(),
+        "an Op::Call method must report needs_context"
+    );
     let dummy_vm = [0u8; 64];
     for (xval, n) in [(5i32, 7i64), (-3, 2), (0, 0), (i32::MAX, 1)] {
         let obj = make_object(&[xval]);
@@ -2133,11 +2196,11 @@ fn ir_vs_singlepass_fdiv_with_inf_overflow() {
         2,
         2,
         &[
-            (vec![7, 2], 3),    // 3.5 → 3 (toward zero)
-            (vec![-7, 2], -3),  // -3.5 → -3
-            (vec![10, 3], 3),   // 3.333…
-            (vec![5, 0], i32::MAX),   // +inf → INT_MAX (NaN/overflow fixup)
-            (vec![-5, 0], i32::MIN),  // -inf → INT_MIN
+            (vec![7, 2], 3),         // 3.5 → 3 (toward zero)
+            (vec![-7, 2], -3),       // -3.5 → -3
+            (vec![10, 3], 3),        // 3.333…
+            (vec![5, 0], i32::MAX),  // +inf → INT_MAX (NaN/overflow fixup)
+            (vec![-5, 0], i32::MIN), // -inf → INT_MIN
         ],
     );
 }
@@ -2155,7 +2218,7 @@ fn ir_vs_singlepass_dmul_with_overflow() {
         &[
             (vec![3, 4], 12),
             (vec![-7, 6], -42),
-            (vec![100_000, 100_000], i32::MAX), // 1e10 → INT_MAX
+            (vec![100_000, 100_000], i32::MAX),  // 1e10 → INT_MAX
             (vec![-100_000, 100_000], i32::MIN), // -1e10 → INT_MIN
         ],
     );
@@ -2179,7 +2242,12 @@ fn ir_vs_singlepass_fp_negation() {
         vec![0x1a, 0x86, 0x76, 0x8b, 0xac],
         1,
         1,
-        &[(vec![5], -5), (vec![-5], 5), (vec![0], 0), (vec![123456], -123456)],
+        &[
+            (vec![5], -5),
+            (vec![-5], 5),
+            (vec![0], 0),
+            (vec![123456], -123456),
+        ],
     );
     // int f(int a) { return (int)(-((double)a)); }  — dneg
     check_fp(
@@ -2282,13 +2350,13 @@ fn ir_fp_frem_integer_operands() {
         2,
         2,
         &[
-            (vec![7, 3], 1),    // 7 % 3 = 1
-            (vec![-7, 3], -1),  // sign of dividend
-            (vec![7, -3], 1),   // sign of dividend (not divisor)
+            (vec![7, 3], 1),   // 7 % 3 = 1
+            (vec![-7, 3], -1), // sign of dividend
+            (vec![7, -3], 1),  // sign of dividend (not divisor)
             (vec![-7, -3], -1),
             (vec![8, 4], 0),
             (vec![10, 3], 1),
-            (vec![5, 0], 0),    // x % 0 = NaN; f2i(NaN) = 0
+            (vec![5, 0], 0), // x % 0 = NaN; f2i(NaN) = 0
         ],
     );
 }
@@ -2525,8 +2593,14 @@ fn ir_fp_dastore() {
             unsafe { m.try_call(&args) }.unwrap();
             let off = HEADER_SIZE + i * 8;
             u64::from_le_bytes([
-                arr[off], arr[off + 1], arr[off + 2], arr[off + 3], arr[off + 4], arr[off + 5],
-                arr[off + 6], arr[off + 7],
+                arr[off],
+                arr[off + 1],
+                arr[off + 2],
+                arr[off + 3],
+                arr[off + 4],
+                arr[off + 5],
+                arr[off + 6],
+                arr[off + 7],
             ])
         };
         let got_sp = read_back(&sp);
@@ -2557,8 +2631,22 @@ fn ir_vs_singlepass_fcmp_ordered() {
         (vec![2, -5], 1),
     ];
     // fcmpl (0x95) and fcmpg (0x96) are identical for ordered operands.
-    check_fp("fcmpl_ord", "(II)I", vec![0x1a, 0x86, 0x1b, 0x86, 0x95, 0xac], 2, 2, ordered);
-    check_fp("fcmpg_ord", "(II)I", vec![0x1a, 0x86, 0x1b, 0x86, 0x96, 0xac], 2, 2, ordered);
+    check_fp(
+        "fcmpl_ord",
+        "(II)I",
+        vec![0x1a, 0x86, 0x1b, 0x86, 0x95, 0xac],
+        2,
+        2,
+        ordered,
+    );
+    check_fp(
+        "fcmpg_ord",
+        "(II)I",
+        vec![0x1a, 0x86, 0x1b, 0x86, 0x96, 0xac],
+        2,
+        2,
+        ordered,
+    );
 }
 
 #[test]
@@ -2571,8 +2659,22 @@ fn ir_vs_singlepass_dcmp_ordered() {
         (vec![-9, 4], -1),
         (vec![4, -9], 1),
     ];
-    check_fp("dcmpl_ord", "(II)I", vec![0x1a, 0x87, 0x1b, 0x87, 0x97, 0xac], 2, 2, ordered);
-    check_fp("dcmpg_ord", "(II)I", vec![0x1a, 0x87, 0x1b, 0x87, 0x98, 0xac], 2, 2, ordered);
+    check_fp(
+        "dcmpl_ord",
+        "(II)I",
+        vec![0x1a, 0x87, 0x1b, 0x87, 0x97, 0xac],
+        2,
+        2,
+        ordered,
+    );
+    check_fp(
+        "dcmpg_ord",
+        "(II)I",
+        vec![0x1a, 0x87, 0x1b, 0x87, 0x98, 0xac],
+        2,
+        2,
+        ordered,
+    );
 }
 
 #[test]
@@ -2580,22 +2682,78 @@ fn ir_vs_singlepass_fcmp_nan() {
     // NaN is synthesized as 0.0f/0.0f (fconst_0 fconst_0 fdiv). fcmpl → -1 and
     // fcmpg → +1 for a NaN in either position.
     // int f() { return (0/0f) fcmpl 1f; }  — NaN as LEFT operand
-    check_fp("fcmpl_nan_lhs", "()I", vec![0x0b, 0x0b, 0x6e, 0x0c, 0x95, 0xac], 0, 0, &[(vec![], -1)]);
+    check_fp(
+        "fcmpl_nan_lhs",
+        "()I",
+        vec![0x0b, 0x0b, 0x6e, 0x0c, 0x95, 0xac],
+        0,
+        0,
+        &[(vec![], -1)],
+    );
     // int f() { return (0/0f) fcmpg 1f; }
-    check_fp("fcmpg_nan_lhs", "()I", vec![0x0b, 0x0b, 0x6e, 0x0c, 0x96, 0xac], 0, 0, &[(vec![], 1)]);
+    check_fp(
+        "fcmpg_nan_lhs",
+        "()I",
+        vec![0x0b, 0x0b, 0x6e, 0x0c, 0x96, 0xac],
+        0,
+        0,
+        &[(vec![], 1)],
+    );
     // int f() { return 1f fcmpl (0/0f); }  — NaN as RIGHT operand
-    check_fp("fcmpl_nan_rhs", "()I", vec![0x0c, 0x0b, 0x0b, 0x6e, 0x95, 0xac], 0, 0, &[(vec![], -1)]);
+    check_fp(
+        "fcmpl_nan_rhs",
+        "()I",
+        vec![0x0c, 0x0b, 0x0b, 0x6e, 0x95, 0xac],
+        0,
+        0,
+        &[(vec![], -1)],
+    );
     // int f() { return 1f fcmpg (0/0f); }
-    check_fp("fcmpg_nan_rhs", "()I", vec![0x0c, 0x0b, 0x0b, 0x6e, 0x96, 0xac], 0, 0, &[(vec![], 1)]);
+    check_fp(
+        "fcmpg_nan_rhs",
+        "()I",
+        vec![0x0c, 0x0b, 0x0b, 0x6e, 0x96, 0xac],
+        0,
+        0,
+        &[(vec![], 1)],
+    );
 }
 
 #[test]
 fn ir_vs_singlepass_dcmp_nan() {
     // NaN as 0.0/0.0 (dconst_0 dconst_0 ddiv). dcmpl → -1, dcmpg → +1.
-    check_fp("dcmpl_nan_lhs", "()I", vec![0x0e, 0x0e, 0x6f, 0x0f, 0x97, 0xac], 0, 0, &[(vec![], -1)]);
-    check_fp("dcmpg_nan_lhs", "()I", vec![0x0e, 0x0e, 0x6f, 0x0f, 0x98, 0xac], 0, 0, &[(vec![], 1)]);
-    check_fp("dcmpl_nan_rhs", "()I", vec![0x0f, 0x0e, 0x0e, 0x6f, 0x97, 0xac], 0, 0, &[(vec![], -1)]);
-    check_fp("dcmpg_nan_rhs", "()I", vec![0x0f, 0x0e, 0x0e, 0x6f, 0x98, 0xac], 0, 0, &[(vec![], 1)]);
+    check_fp(
+        "dcmpl_nan_lhs",
+        "()I",
+        vec![0x0e, 0x0e, 0x6f, 0x0f, 0x97, 0xac],
+        0,
+        0,
+        &[(vec![], -1)],
+    );
+    check_fp(
+        "dcmpg_nan_lhs",
+        "()I",
+        vec![0x0e, 0x0e, 0x6f, 0x0f, 0x98, 0xac],
+        0,
+        0,
+        &[(vec![], 1)],
+    );
+    check_fp(
+        "dcmpl_nan_rhs",
+        "()I",
+        vec![0x0f, 0x0e, 0x0e, 0x6f, 0x97, 0xac],
+        0,
+        0,
+        &[(vec![], -1)],
+    );
+    check_fp(
+        "dcmpg_nan_rhs",
+        "()I",
+        vec![0x0f, 0x0e, 0x0e, 0x6f, 0x98, 0xac],
+        0,
+        0,
+        &[(vec![], 1)],
+    );
 }
 
 // ── double RETURNS — method-level dreturn + D call returns (inc 32) ──────────
@@ -2615,16 +2773,24 @@ fn ir_vs_singlepass_double_return() {
     let helpers = dummy_helpers();
     let ir = compile_fp_opt(&cm, &helpers, true)
         .expect("IR compile of double-returning method (FP gate)");
-    let sp =
-        compile_fp_opt(&cm, &helpers, false).expect("single-pass compile of double-returning method");
+    let sp = compile_fp_opt(&cm, &helpers, false)
+        .expect("single-pass compile of double-returning method");
     for x in [0i64, 5, -3, 100, -100, i32::MIN as i64] {
         // SAFETY: both bodies take one int arg and return a double whose bits
         // ride RAX; `try_call` returns that i64 (the f64 bit pattern).
         let r_ir = f64::from_bits(unsafe { ir.try_call(&[x]) }.unwrap() as u64);
         let r_sp = f64::from_bits(unsafe { sp.try_call(&[x]) }.unwrap() as u64);
         let expected = x as f64 + 1.0;
-        assert_eq!(r_ir.to_bits(), expected.to_bits(), "IR double-return for x={x}");
-        assert_eq!(r_sp.to_bits(), expected.to_bits(), "single-pass double-return for x={x}");
+        assert_eq!(
+            r_ir.to_bits(),
+            expected.to_bits(),
+            "IR double-return for x={x}"
+        );
+        assert_eq!(
+            r_sp.to_bits(),
+            expected.to_bits(),
+            "single-pass double-return for x={x}"
+        );
     }
 }
 
@@ -2684,15 +2850,23 @@ fn ir_vs_singlepass_float_return() {
     let helpers = dummy_helpers();
     let ir = compile_fp_opt(&cm, &helpers, true)
         .expect("IR compile of float-returning method (FP gate)");
-    let sp =
-        compile_fp_opt(&cm, &helpers, false).expect("single-pass compile of float-returning method");
+    let sp = compile_fp_opt(&cm, &helpers, false)
+        .expect("single-pass compile of float-returning method");
     for x in [0i64, 5, -3, 100, -100, i32::MIN as i64] {
         // float bits ride the low 32 of RAX (stale upper bits are masked).
         let r_ir = f32::from_bits(unsafe { ir.try_call(&[x]) }.unwrap() as u32);
         let r_sp = f32::from_bits(unsafe { sp.try_call(&[x]) }.unwrap() as u32);
         let expected = x as f32 + 1.0f32;
-        assert_eq!(r_ir.to_bits(), expected.to_bits(), "IR float-return for x={x}");
-        assert_eq!(r_sp.to_bits(), expected.to_bits(), "single-pass float-return for x={x}");
+        assert_eq!(
+            r_ir.to_bits(),
+            expected.to_bits(),
+            "IR float-return for x={x}"
+        );
+        assert_eq!(
+            r_sp.to_bits(),
+            expected.to_bits(),
+            "single-pass float-return for x={x}"
+        );
     }
 }
 
@@ -2792,8 +2966,16 @@ fn ir_vs_singlepass_double_param() {
         let r_ir = f64::from_bits(unsafe { ir.try_call(&args) }.unwrap() as u64);
         let r_sp = f64::from_bits(unsafe { sp.try_call(&args) }.unwrap() as u64);
         let expected = a + b as f64;
-        assert_eq!(r_ir.to_bits(), expected.to_bits(), "IR double-param a={a},b={b}");
-        assert_eq!(r_sp.to_bits(), expected.to_bits(), "single-pass double-param a={a},b={b}");
+        assert_eq!(
+            r_ir.to_bits(),
+            expected.to_bits(),
+            "IR double-param a={a},b={b}"
+        );
+        assert_eq!(
+            r_sp.to_bits(),
+            expected.to_bits(),
+            "single-pass double-param a={a},b={b}"
+        );
     }
 }
 
@@ -2811,8 +2993,16 @@ fn ir_vs_singlepass_float_param() {
         let r_ir = f32::from_bits(unsafe { ir.try_call(&args) }.unwrap() as u32);
         let r_sp = f32::from_bits(unsafe { sp.try_call(&args) }.unwrap() as u32);
         let expected = a + b as f32;
-        assert_eq!(r_ir.to_bits(), expected.to_bits(), "IR float-param a={a},b={b}");
-        assert_eq!(r_sp.to_bits(), expected.to_bits(), "single-pass float-param a={a},b={b}");
+        assert_eq!(
+            r_ir.to_bits(),
+            expected.to_bits(),
+            "IR float-param a={a},b={b}"
+        );
+        assert_eq!(
+            r_sp.to_bits(),
+            expected.to_bits(),
+            "single-pass float-param a={a},b={b}"
+        );
     }
 }
 

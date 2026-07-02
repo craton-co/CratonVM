@@ -241,10 +241,16 @@ pub struct ReadCompletion {
     outcome: ReadOutcome,
 }
 
-fn read_completion_state() -> &'static (Mutex<std::collections::VecDeque<ReadCompletion>>, Condvar) {
+fn read_completion_state() -> &'static (Mutex<std::collections::VecDeque<ReadCompletion>>, Condvar)
+{
     static S: OnceLock<(Mutex<std::collections::VecDeque<ReadCompletion>>, Condvar)> =
         OnceLock::new();
-    S.get_or_init(|| (Mutex::new(std::collections::VecDeque::new()), Condvar::new()))
+    S.get_or_init(|| {
+        (
+            Mutex::new(std::collections::VecDeque::new()),
+            Condvar::new(),
+        )
+    })
 }
 
 /// Park a completed read and wake the dispatcher.
@@ -392,7 +398,11 @@ fn deliver_failed(
         "java/nio/channels/CompletionHandler",
         "failed",
         "(Ljava/lang/Throwable;Ljava/lang/Object;)V",
-        &[Value::Object(Some(h)), Value::Object(Some(t)), Value::Object(attach)],
+        &[
+            Value::Object(Some(h)),
+            Value::Object(Some(t)),
+            Value::Object(attach),
+        ],
     );
 }
 
@@ -1391,17 +1401,16 @@ fn aio_asc_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult
 
     // Register global roots + park a completion for worker-free delivery —
     // empty-buffer and error cases that have no bytes to read.
-    let post_immediate =
-        |ctx: &mut dyn NativeContext, outcome: ReadOutcome| {
-            let hg = ctx.add_global_root(handler);
-            let ag = attachment.map(|a| ctx.add_global_root(a)).unwrap_or(0);
-            push_read_completion(ReadCompletion {
-                handler_gref: hg,
-                attachment_gref: ag,
-                buffer_gref: 0,
-                outcome,
-            });
-        };
+    let post_immediate = |ctx: &mut dyn NativeContext, outcome: ReadOutcome| {
+        let hg = ctx.add_global_root(handler);
+        let ag = attachment.map(|a| ctx.add_global_root(a)).unwrap_or(0);
+        push_read_completion(ReadCompletion {
+            handler_gref: hg,
+            attachment_gref: ag,
+            buffer_gref: 0,
+            outcome,
+        });
+    };
 
     // The channel was connected via the Future-form `connect`, which stores the
     // fd_table fd in slot 2.

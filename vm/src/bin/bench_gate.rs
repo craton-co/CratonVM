@@ -515,9 +515,7 @@ fn run(args: CliArgs) -> Result<i32, GateError> {
         return Ok(0);
     }
     let threshold = args.threshold.unwrap_or(0.15);
-    let baseline_path = args
-        .baseline
-        .unwrap_or_else(default_baseline_path);
+    let baseline_path = args.baseline.unwrap_or_else(default_baseline_path);
     let criterion_dir = args
         .criterion_dir
         .unwrap_or_else(|| PathBuf::from("target/criterion"));

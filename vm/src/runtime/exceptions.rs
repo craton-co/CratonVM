@@ -217,7 +217,10 @@ pub mod helpful_npe {
     /// The "action" half for an invoke whose receiver was null, e.g.
     /// `Cannot invoke "java.util.List.get(int)"`.
     pub fn action_invoke(owner_internal: &str, name: &str, descriptor: &str) -> String {
-        format!("Cannot invoke \"{}\"", render_method(owner_internal, name, descriptor))
+        format!(
+            "Cannot invoke \"{}\"",
+            render_method(owner_internal, name, descriptor)
+        )
     }
 
     // -- Increment 2: action halves for the remaining null-deref opcodes -----
@@ -314,10 +317,16 @@ pub mod helpful_npe {
 
     impl Producer {
         fn expr(text: String) -> Self {
-            Producer { text, is_invoke: false }
+            Producer {
+                text,
+                is_invoke: false,
+            }
         }
         fn invoke(text: String) -> Self {
-            Producer { text, is_invoke: true }
+            Producer {
+                text,
+                is_invoke: true,
+            }
         }
         /// The `because <…> is null` middle, as HotSpot renders it at the top
         /// level: a plain expression is quoted; an invoke result is phrased as
@@ -438,9 +447,9 @@ pub mod helpful_npe {
         use Instruction::*;
         let rel = |off: i64| -> usize { (pc as i64 + off).max(0) as usize };
         let v = match instr {
-            Goto(o) | Ifeq(o) | Ifne(o) | Iflt(o) | Ifge(o) | Ifgt(o) | Ifle(o)
-            | IfIcmpeq(o) | IfIcmpne(o) | IfIcmplt(o) | IfIcmpge(o) | IfIcmpgt(o) | IfIcmple(o)
-            | IfAcmpeq(o) | IfAcmpne(o) | Ifnull(o) | Ifnonnull(o) | Jsr(o) => {
+            Goto(o) | Ifeq(o) | Ifne(o) | Iflt(o) | Ifge(o) | Ifgt(o) | Ifle(o) | IfIcmpeq(o)
+            | IfIcmpne(o) | IfIcmplt(o) | IfIcmpge(o) | IfIcmpgt(o) | IfIcmple(o) | IfAcmpeq(o)
+            | IfAcmpne(o) | Ifnull(o) | Ifnonnull(o) | Jsr(o) => {
                 vec![rel(*o as i64)]
             }
             GotoW(o) | JsrW(o) => vec![rel(*o as i64)],
@@ -512,11 +521,7 @@ pub mod helpful_npe {
     /// reconstruction robust inside methods with `try/catch` / loops: the walk
     /// is straight-line within one block, so it never has to model the
     /// control-flow joins a linear from-entry walk would bail on.
-    fn simulate_to(
-        code: &[u8],
-        target_bci: usize,
-        resolver: &dyn CpResolver,
-    ) -> Option<Vec<Slot>> {
+    fn simulate_to(code: &[u8], target_bci: usize, resolver: &dyn CpResolver) -> Option<Vec<Slot>> {
         let mut stack: Vec<Slot> = Vec::new();
         let mut pc = block_start_for(code, target_bci);
         let mut guard = 0u32;
@@ -789,7 +794,11 @@ pub mod helpful_npe {
         else {
             return None;
         };
-        Some(Producer::invoke(render_method(&owner_internal, &name, &descriptor)))
+        Some(Producer::invoke(render_method(
+            &owner_internal,
+            &name,
+            &descriptor,
+        )))
     }
 
     /// Reconstruct the null-receiver expression for the invoke at
@@ -2065,7 +2074,10 @@ mod helpful_npe_tests {
             helpful_npe::render_owner("java/lang/Integer"),
             "java.lang.Integer"
         );
-        assert_eq!(helpful_npe::render_owner("java/util/List"), "java.util.List");
+        assert_eq!(
+            helpful_npe::render_owner("java/util/List"),
+            "java.util.List"
+        );
         assert_eq!(helpful_npe::render_owner("NpeProbe$Node"), "NpeProbe$Node");
         // Array owners keep descriptor form (clone() on an array).
         assert_eq!(helpful_npe::render_owner("[I"), "[I");
@@ -2182,7 +2194,10 @@ mod helpful_npe_tests {
         let code = vec![ALOAD_1, INVOKEVIRTUAL, 0x00, 0x02];
         let invoke_bci = 1;
         let mut methods = HashMap::new();
-        methods.insert(2u16, method("java/lang/String", "trim", "()Ljava/lang/String;"));
+        methods.insert(
+            2u16,
+            method("java/lang/String", "trim", "()Ljava/lang/String;"),
+        );
         let resolver = MockResolver::new(HashMap::new(), methods);
         let expr = helpful_npe::null_expr_for_invoke_receiver(&code, invoke_bci, 0, &resolver);
         assert_eq!(text(&expr), Some("<local1>"));
@@ -2285,7 +2300,10 @@ mod helpful_npe_tests {
         fields.insert(4u16, field("P", "next"));
         let mut methods = HashMap::new();
         methods.insert(1u16, method("P", "getN", "()LP;"));
-        methods.insert(2u16, method("java/lang/Object", "toString", "()Ljava/lang/String;"));
+        methods.insert(
+            2u16,
+            method("java/lang/Object", "toString", "()Ljava/lang/String;"),
+        );
         let resolver = MockResolver::new(fields, methods);
 
         let expr = helpful_npe::null_expr_for_invoke_receiver(&code, invoke_bci, 0, &resolver);

@@ -808,10 +808,8 @@ impl EventDispatchThread {
         {
             let x1 = (*dx as i64).min(*sx as i64);
             let y1 = (*dy as i64).min(*sy as i64);
-            let x2 = (*dx as i64 + (*dw).max(0) as i64)
-                .max(*sx as i64 + (*sw).max(0) as i64);
-            let y2 = (*dy as i64 + (*dh).max(0) as i64)
-                .max(*sy as i64 + (*sh).max(0) as i64);
+            let x2 = (*dx as i64 + (*dw).max(0) as i64).max(*sx as i64 + (*sw).max(0) as i64);
+            let y2 = (*dy as i64 + (*dh).max(0) as i64).max(*sy as i64 + (*sh).max(0) as i64);
             *dx = x1.clamp(i32::MIN as i64, i32::MAX as i64) as i32;
             *dy = y1.clamp(i32::MIN as i64, i32::MAX as i64) as i32;
             *dw = (x2 - x1).clamp(0, i32::MAX as i64) as i32;

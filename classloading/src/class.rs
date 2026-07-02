@@ -11,11 +11,11 @@ use std::fmt;
 use std::sync::Arc;
 
 use cratonvm_reader::class_access_flags::{ClassAccessFlags, FieldAccessFlags};
-use cratonvm_types::CompactLayout;
 use cratonvm_reader::class_file_version::ClassFileVersion;
 use cratonvm_reader::constant_pool::ConstantPool;
 use cratonvm_reader::field::ClassFileField;
 use cratonvm_reader::method::ClassFileMethod;
+use cratonvm_types::CompactLayout;
 use rustc_hash::FxHashSet;
 
 // ---------------------------------------------------------------------------

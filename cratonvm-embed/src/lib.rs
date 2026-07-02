@@ -206,20 +206,16 @@ mod tests {
         ) -> Result<ObjectRef, VmError>;
         type ReadStringFn = for<'vm> fn(&'vm Vm, ObjectRef) -> Option<String>;
         type ObjectClassNameFn = for<'vm> fn(&'vm Vm, ObjectRef) -> Option<String>;
-        type DescribeFailureFn =
-            for<'vm, 'err> fn(&'vm Vm, &'err MethodCallFailed) -> String;
-        type FieldIndexFn =
-            for<'vm, 'name> fn(&'vm Vm, ClassId, &'name str) -> Option<usize>;
+        type DescribeFailureFn = for<'vm, 'err> fn(&'vm Vm, &'err MethodCallFailed) -> String;
+        type FieldIndexFn = for<'vm, 'name> fn(&'vm Vm, ClassId, &'name str) -> Option<usize>;
         type FieldIndexDescFn = for<'vm, 'name, 'desc> fn(
             &'vm Vm,
             ClassId,
             &'name str,
             Option<&'desc str>,
         ) -> Option<usize>;
-        type GetFieldByNameFn =
-            for<'vm, 'name> fn(&'vm Vm, ObjectRef, &'name str) -> Option<Value>;
-        type SetFieldByNameFn =
-            for<'vm, 'name> fn(&'vm Vm, ObjectRef, &'name str, Value) -> bool;
+        type GetFieldByNameFn = for<'vm, 'name> fn(&'vm Vm, ObjectRef, &'name str) -> Option<Value>;
+        type SetFieldByNameFn = for<'vm, 'name> fn(&'vm Vm, ObjectRef, &'name str, Value) -> bool;
 
         let _make: MakeStringArrayFn = make_string_array;
         let _read: ReadStringFn = read_string;

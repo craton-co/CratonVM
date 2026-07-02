@@ -1960,16 +1960,17 @@ pub(crate) fn native_sb_length(ctx: &mut dyn NativeContext, args: &[Value]) -> M
 /// LATIN1 (0) iff every code unit fits in a byte, otherwise UTF16 (1). Matching
 /// that choice keeps the comparison correct: the receiver String's coder and our
 /// builder's coder agree whenever the contents do.
-pub(crate) fn native_sb_get_coder(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+pub(crate) fn native_sb_get_coder(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
     };
     let chars = sb_read_chars(ctx, this);
-    let coder = if chars.iter().all(|&u| u <= 0xFF) { 0 } else { 1 };
+    let coder = if chars.iter().all(|&u| u <= 0xFF) {
+        0
+    } else {
+        1
+    };
     Ok(Some(Value::Int(coder)))
 }
 
@@ -1981,10 +1982,7 @@ pub(crate) fn native_sb_get_coder(
 /// char, UTF16 packs two little-endian bytes per char (low byte first). The
 /// `coder` implied by this array must match [`native_sb_get_coder`] for the real
 /// `nonSyncContentEquals` path to compute correctly.
-pub(crate) fn native_sb_get_value(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+pub(crate) fn native_sb_get_value(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     use cratonvm_types::ArrayElementType;
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
@@ -4107,8 +4105,8 @@ pub(crate) fn format_arg(ctx: &mut dyn NativeContext, val: &Value, spec: char) -
                 // mis-read a Boolean's value slot and yielded "1"/"0" instead of
                 // "true"/"false" (and likewise for other non-String objects whose
                 // slot-0 happens to read as text).
-                let is_string = ctx.class_id_by_name("java/lang/String")
-                    == Some(ctx.class_id_of_object(*obj));
+                let is_string =
+                    ctx.class_id_by_name("java/lang/String") == Some(ctx.class_id_of_object(*obj));
                 if is_string {
                     if let Some(s) = ctx.read_string(*obj) {
                         return s;

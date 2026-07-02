@@ -377,8 +377,7 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
         // "pinning OOMs bt18" was reasoned for pinning the WHOLE operand stack,
         // never measured for this transient minimal set; this gate lets us
         // measure it directly.
-        let pin =
-            crate::jit::conservative_roots::shadow_pin_roots() || moving_young_osr_fallback;
+        let pin = crate::jit::conservative_roots::shadow_pin_roots() || moving_young_osr_fallback;
         // spring-bug-10 diagnostic: log this thread's shadow-stack depth at each
         // GC. A monotonically growing depth across collections means the JIT
         // `top` is DRIFTING (a push without a paired reload) — which makes the

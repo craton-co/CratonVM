@@ -92,7 +92,6 @@ pub use cratonvm_types::{
 };
 // HIB-CV-24: class-loader liveness pinning registry (shared by gen_heap marker
 // + native-builtins side-table). See `cratonvm_types::loader_pin`.
-pub use cratonvm_types::loader_pin;
 pub use collector::{GarbageCollector, MonitorCleanup, StopTheWorldToken};
 pub use compact_header::{
     CompactAllocator, CompactHeader, CompactHeaderSavingsReport, HashCodeTable, HeaderView,
@@ -100,6 +99,7 @@ pub use compact_header::{
 };
 pub use compressed_oops::{CompressedOop, CompressedOops, CompressedOopsMode, NarrowKlass};
 pub use concurrent_mark::{ConcurrentGcPhase, ConcurrentGcState, ConcurrentMarker};
+pub use cratonvm_types::loader_pin;
 pub use g1::{G1CollectionType, G1Collector, G1CollectorConfig};
 pub use g1_concurrent::{ConcurrentMarkController, ConcurrentMarkState};
 pub use gc::{

@@ -847,11 +847,7 @@ fn native_context_lookup_name(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
 }
 
 /// Shared `lookup` body for both the `String` and `Name` overloads.
-fn do_context_lookup(
-    ctx: &mut dyn NativeContext,
-    this: ObjectRef,
-    name: &str,
-) -> MethodCallResult {
+fn do_context_lookup(ctx: &mut dyn NativeContext, this: ObjectRef, name: &str) -> MethodCallResult {
     // A user-installed `InitialContextFactoryBuilder` (e.g. Spring's
     // `SimpleNamingContextBuilder`) owns the whole namespace — resolve through
     // its `Context`, exactly as the stock `InitialContext` bytecode would.

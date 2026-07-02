@@ -955,7 +955,10 @@ fn run_transformer_chain(
             }
             Ok(_) => {
                 if dbg {
-                    eprintln!("[RETRANSFORM]     transformer {:?} -> null/void (no change)", entry.transformer_ref);
+                    eprintln!(
+                        "[RETRANSFORM]     transformer {:?} -> null/void (no change)",
+                        entry.transformer_ref
+                    );
                 }
             }
             Err(MethodCallFailed::ExceptionThrown(_)) => {

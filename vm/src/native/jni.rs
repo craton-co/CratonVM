@@ -419,7 +419,11 @@ pub fn is_foreign_attached() -> bool {
 /// first instant this thread can run Java (and trip a safepoint) it is already
 /// stop-the-world-visible with a (currently empty) deposited snapshot — there is
 /// no window where it holds live oops but is invisible to `request_stw`.
-pub fn attach_foreign_thread(shared: &SharedVm, daemon: bool, name: Option<&str>) -> *mut JvmThread {
+pub fn attach_foreign_thread(
+    shared: &SharedVm,
+    daemon: bool,
+    name: Option<&str>,
+) -> *mut JvmThread {
     let tid = shared.thread_registry.next_thread_id();
     // Caller-supplied name (from `JavaVMAttachArgs.name`) when present, else the
     // JDK's default platform-thread naming `Thread-N`. A real java.lang.Thread
@@ -6423,7 +6427,11 @@ mod tests {
 
         set_destroy_vm_hook(hook);
         assert_eq!(run_destroy_vm_hook(), JNI_OK);
-        assert_eq!(CALLS.load(Ordering::SeqCst), 1, "hook must run exactly once");
+        assert_eq!(
+            CALLS.load(Ordering::SeqCst),
+            1,
+            "hook must run exactly once"
+        );
         // Second DestroyJavaVM: hook was taken, so no re-run, still JNI_OK.
         assert_eq!(run_destroy_vm_hook(), JNI_OK);
         assert_eq!(

@@ -558,9 +558,24 @@ mod tests {
     #[test]
     fn algorithm_supported_accepts_known_set() {
         for algo in [
-            "MD5", "md5", "SHA-1", "SHA1", "SHA-224", "sha-224", "SHA224", "SHA-256", "SHA256",
-            "SHA-384", "SHA-512", "SHA-512/224", "SHA-512/256", "sha-512/256", "SHA3-224",
-            "SHA3-256", "SHA3-384", "SHA3-512",
+            "MD5",
+            "md5",
+            "SHA-1",
+            "SHA1",
+            "SHA-224",
+            "sha-224",
+            "SHA224",
+            "SHA-256",
+            "SHA256",
+            "SHA-384",
+            "SHA-512",
+            "SHA-512/224",
+            "SHA-512/256",
+            "sha-512/256",
+            "SHA3-224",
+            "SHA3-256",
+            "SHA3-384",
+            "SHA3-512",
         ] {
             assert!(algorithm_supported(algo), "{algo} should be supported");
         }
