@@ -2383,12 +2383,33 @@ fn s_instantiation_strategy_instantiate(
         }
     }
 
-    if !ctx.method_exists(&class_name, "<init>", "()V") {
+    // `<init>` is never inherited (JVMS §5.4.3.3 constructors aren't looked up
+    // via the superclass chain) — `method_exists` walks the hierarchy and
+    // always finds SOME `<init>()V` at `Object`, so it never actually guards
+    // anything here. Use the exact-class-only check instead: does THIS class
+    // declare a no-arg constructor? (Spr12278Tests.componentTwoSpecificConstru
+    // ctorsNoHint expects instantiation of a class with only `(Integer)`/
+    // `(String)` constructors and no default one to fail with
+    // BeanInstantiationException, not silently succeed — mirrors real
+    // SimpleInstantiationStrategy.instantiate/BeanUtils.instantiateClass,
+    // which both throw `BeanInstantiationException(clazz, "No default
+    // constructor found", ex)` from this exact case, same as the
+    // abstract/interface delegation just above.)
+    let has_no_arg_ctor = match exact_cid.or_else(|| ctx.class_id_by_name(&class_name)) {
+        Some(cid) => ctx.class_declares_method(cid, "<init>", "()V"),
+        None => ctx.method_exists(&class_name, "<init>", "()V"),
+    };
+    if !has_no_arg_ctor {
         tracing::debug!(
-            "[spring-shim] SimpleInstantiationStrategy.instantiate: {} has no no-arg ctor, skipping",
+            "[spring-shim] SimpleInstantiationStrategy.instantiate: {} has no no-arg ctor, delegating to BeanUtils.instantiateClass for the real exception",
             class_name
         );
-        return Ok(Some(Value::Object(None)));
+        return ctx.invoke(
+            "org/springframework/beans/BeanUtils",
+            "instantiateClass",
+            "(Ljava/lang/Class;)Ljava/lang/Object;",
+            &[Value::Object(Some(mirror))],
+        );
     }
 
     // Allocate + run `<init>()V` against the EXACT class id from the mirror when
@@ -2445,6 +2466,38 @@ enum BeanClassResolution {
     NoClass,
 }
 
+/// Resolve `internal` (the plain dot-to-slash conversion of `dotted`) to a
+/// `ClassId`, retrying with a `ClassUtils.forName`-style dot-vs-dollar
+/// nested-class fallback on failure: if the segment right after the
+/// second-to-last dot starts with an uppercase letter (looks like a class
+/// name), replace only the LAST dot with `$` and retry once. Mirrors
+/// `ClassUtils.forName` (`spring-core/.../ClassUtils.java:310-323`) exactly —
+/// XML bean definitions may spell a nested class with dotted notation
+/// (`Outer.Inner`) instead of `Outer$Inner`.
+fn resolve_class_id_with_nested_retry(
+    ctx: &mut dyn NativeContext,
+    dotted: &str,
+    internal: &str,
+) -> Option<cratonvm_types::ClassId> {
+    if let Some(c) = ctx.class_id_by_name(internal) {
+        return Some(c);
+    }
+    if let Ok(c) = ctx.ensure_class_initialized(internal) {
+        return Some(c);
+    }
+    let last_dot = dotted.rfind('.')?;
+    let prev_dot = dotted[..last_dot].rfind('.')?;
+    let next_char = dotted[prev_dot + 1..].chars().next()?;
+    if !next_char.is_ascii_uppercase() {
+        return None;
+    }
+    let nested_internal = format!("{}${}", &internal[..last_dot], &internal[last_dot + 1..]);
+    if let Some(c) = ctx.class_id_by_name(&nested_internal) {
+        return Some(c);
+    }
+    ctx.ensure_class_initialized(&nested_internal).ok()
+}
+
 /// Resolve a bean's class from `AbstractBeanDefinition`/`RootBeanDefinition`'s
 /// single `beanClass` field — an `Object` holding EITHER an already-resolved
 /// `Class` mirror OR the still-unresolved `String` class name. (`setBeanClassName`
@@ -2487,22 +2540,27 @@ fn resolve_bean_class_field(ctx: &mut dyn NativeContext, recv: ObjectRef) -> Bea
         }
     };
 
-    let internal = name.replace('.', "/");
     // Resolve the name to a Class; only classes actually on the classpath
     // succeed (a named-but-unloadable class yields Missing → partial-cp skip).
-    let cid = match ctx.class_id_by_name(&internal) {
+    // Mirrors `ClassUtils.forName`'s dot-vs-dollar nested-class fallback: XML
+    // bean definitions may spell a nested class with dotted notation
+    // (`Outer.Inner` instead of `Outer$Inner`) — e.g.
+    // `DestroyMethodInferenceTests-context.xml`'s bean `x8` uses
+    // `...DestroyMethodInferenceTests.WithInheritedCloseMethod`. A naive
+    // `name.replace('.', "/")` produces a bogus internal name for that case
+    // (an extra path segment instead of a `$`), which never resolves — so we
+    // retry with only the LAST dot replaced by `$` when the segment right
+    // after the previous dot looks like a class name (starts uppercase),
+    // exactly like the real Java method.
+    let internal = name.replace('.', "/");
+    let cid = match resolve_class_id_with_nested_retry(ctx, &name, &internal) {
         Some(c) => c,
-        None => match ctx.ensure_class_initialized(&internal) {
-            Ok(c) => c,
-            Err(e) => {
-                if dbg {
-                    eprintln!(
-                        "[resolve-shim] Missing: {internal} not on classpath (ensure_class_initialized ERR: {e:?})"
-                    );
-                }
-                return BeanClassResolution::Missing;
+        None => {
+            if dbg {
+                eprintln!("[resolve-shim] Missing: {internal} not on classpath (incl. nested-class retry)");
             }
-        },
+            return BeanClassResolution::Missing;
+        }
     };
     if dbg {
         eprintln!("[resolve-shim] Resolved: {internal}");
