@@ -130,6 +130,23 @@ fn loader_aware_resolution() -> bool {
     })
 }
 
+/// Diagnostic-only gate mirroring `CRATONVM_TRACE_UNIMPLEMENTED` (see
+/// `vm/src/vm/vm_exec.rs`): when set, print one line per enterprise-prefix
+/// class (`io/smallrye/`, `io/quarkus/`, `org/jboss/`, …) that falls back to
+/// an empty synthetic stub because it was not found on any classpath entry.
+/// This case is otherwise invisible in release builds — the `tracing` crate
+/// here is built with `max_level_info`, so the existing `debug!` call just
+/// above `create_synthetic_stub` never executes — and a stubbed class whose
+/// methods are later invoked surfaces only as a confusing `NoSuchMethodError`
+/// (or, if the gap breaks a superinterface/superclass resolution, a bare
+/// `NoClassDefFoundError` with no further detail). Off by default to avoid
+/// spamming normal runs.
+fn trace_stub_fallback() -> bool {
+    use std::sync::OnceLock;
+    static GATE: OnceLock<bool> = OnceLock::new();
+    *GATE.get_or_init(|| std::env::var_os("CRATONVM_TRACE_UNIMPLEMENTED").is_some())
+}
+
 /// H5 (HIGH): return `true` if `internal_name` (a `/`-separated internal
 /// class name) lives in a runtime package that only the bootstrap loader
 /// is permitted to define classes into.
@@ -2547,6 +2564,11 @@ impl ClassManager {
                     class = name,
                     "Falling back to synthetic stub — class not found in any classpath"
                 );
+                if trace_stub_fallback() {
+                    eprintln!(
+                        "[cratonvm] stub fallback: {name} — not found on any classpath entry (enterprise-prefix stub; add the missing jar)"
+                    );
+                }
                 self.create_synthetic_stub(name)
             }
             Err(e) => Err(e),

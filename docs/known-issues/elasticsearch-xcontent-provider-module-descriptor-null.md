@@ -76,3 +76,17 @@ C:\craton\CratonVM-elasticsearch-current-suite-20260702\apps\elasticsearch-suite
 C:\craton\CratonVM-elasticsearch-full-suite-20260702\apps\elasticsearch-suite-runner\.suite\results\es-full-hotspot-20260702\hotspot-jit\results.tsv
 C:\craton\CratonVM-elasticsearch-current-suite-20260702\apps\elasticsearch-suite-runner\.suite\results\es-current-full-jiton-20260702\all-jit\logs\libs_cli-terminal.org.elasticsearch.cli.terminal.internal.EcsJsonUtilsTests.out.log
 ```
+
+## No-JIT partial evidence
+
+Run `es-nojit-full-20260702` was stopped by request after 1366 recorded
+classes. In that partial CratonVM no-JIT run:
+
+- 1194 failures contained this signature.
+- 1140 were CratonVM-only versus the HotSpot baseline.
+- The same representative class failed no-JIT at index 22 in 20.088s.
+
+```text
+C:\craton\CratonVM-elasticsearch-nojit-suite-20260702\apps\elasticsearch-suite-runner\.suite\results\es-nojit-full-20260702\all-nojit\results.tsv
+C:\craton\CratonVM-elasticsearch-nojit-suite-20260702\apps\elasticsearch-suite-runner\.suite\results\es-nojit-full-20260702\all-nojit\logs\libs_cli-terminal.org.elasticsearch.cli.terminal.internal.EcsJsonUtilsTests.out.log
+```

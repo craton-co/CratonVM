@@ -286,14 +286,31 @@ fn has_escaping_parent_segment(path: &str) -> bool {
 /// restriction that is therefore opt-in.
 static PATH_CONFINE_TO_CWD: AtomicBool = AtomicBool::new(false);
 
+#[cfg(test)]
+thread_local! {
+    static PATH_CONFINE_TO_CWD_TEST_OVERRIDE: std::cell::Cell<Option<bool>> =
+        std::cell::Cell::new(None);
+}
+
 /// Enable or disable confining canonicalized paths to the process CWD.
 /// Off by default — see [`PATH_CONFINE_TO_CWD`].
+#[cfg(not(test))]
 pub fn set_path_confine_to_cwd(enabled: bool) {
     PATH_CONFINE_TO_CWD.store(enabled, Ordering::Relaxed);
 }
 
+#[cfg(test)]
+pub fn set_path_confine_to_cwd(enabled: bool) {
+    PATH_CONFINE_TO_CWD_TEST_OVERRIDE.with(|cell| cell.set(Some(enabled)));
+}
+
 /// Returns `true` if CWD confinement is currently enabled.
 pub fn is_path_confine_to_cwd() -> bool {
+    #[cfg(test)]
+    if let Some(enabled) = PATH_CONFINE_TO_CWD_TEST_OVERRIDE.with(|cell| cell.get()) {
+        return enabled;
+    }
+
     PATH_CONFINE_TO_CWD.load(Ordering::Relaxed)
 }
 
@@ -5371,6 +5388,17 @@ fn register_nio_natives(registry: &mut NativeMethodRegistry) {
     registry.register(buf, "clear", "()Ljava/nio/Buffer;", native_bb_clear);
     registry.register(buf, "flip", "()Ljava/nio/Buffer;", native_bb_flip);
     registry.register(buf, "rewind", "()Ljava/nio/Buffer;", native_bb_rewind);
+    // `isReadOnly`/`isDirect` are abstract in every real-JDK Buffer subclass
+    // and were missing from this catch-all-on-Buffer fallback (unlike the
+    // 8 accessors above). Any typed buffer allocated straight against an
+    // abstract class name (e.g. literal `java/nio/CharBuffer`, not
+    // `HeapCharBuffer`) has no closer override to resolve to, so the
+    // interpreter's abstract-method dispatch walks all the way up to
+    // `Buffer.isReadOnly()` (no Code) and throws AbstractMethodError unless
+    // something is registered here. Mirrors `native_bb_is_read_only`'s
+    // "heap-backed, never read-only" default used for ByteBuffer.
+    registry.register(buf, "isReadOnly", "()Z", native_bb_is_read_only);
+    registry.register(buf, "isDirect", "()Z", native_bb_is_direct);
 
     // FileChannel basics
     let fc = "java/nio/channels/FileChannel";

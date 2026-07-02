@@ -44,6 +44,8 @@ if ($Until) {
 Write-Host "CratonVM crates.io dry-run checklist"
 Write-Host "Publish order: $($publishOrder -join ' -> ')"
 Write-Host "Withheld packages: $($withheld -join ', ')"
+Write-Host "Metadata gate: Craton Software Company authors, Apache-2.0 license, README, and repository/homepage/documentation links."
+Write-Host "Dependency gate: default features for publishable crates must not pull withheld packages."
 Write-Host ""
 
 function Invoke-Step {

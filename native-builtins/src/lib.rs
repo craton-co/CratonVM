@@ -39,6 +39,28 @@ pub(crate) fn bootstrap_property_fallback(key: &str) -> Option<String> {
     }
 }
 
+fn register_test_harness_natives(registry: &mut NativeMethodRegistry) {
+    registry.register(
+        "cratonvm/test/Util",
+        "tempPrint",
+        "(I)V",
+        native_temp_print_int,
+    );
+    registry.register(
+        "cratonvm/test/Util",
+        "tempPrint",
+        "(Ljava/lang/String;)V",
+        native_temp_print_string,
+    );
+    registry.register("cratonvm/Util", "tempPrint", "(I)V", native_temp_print_int);
+    registry.register(
+        "cratonvm/Util",
+        "tempPrint",
+        "(Ljava/lang/String;)V",
+        native_temp_print_string,
+    );
+}
+
 /// Native `Duration.parse(CharSequence)` for real-JDK mode.
 ///
 /// JDK 25's `Duration.parse` (Duration.java:395) drives a compiled regex
@@ -1248,6 +1270,10 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // to `Intrinsic` individually later.)
     let prev_category = registry.current_category();
     registry.set_category(cratonvm_native_api::NativeKind::Bridge);
+
+    // Integration-test harness support. These classes are not part of the JDK,
+    // but test VMs use real-JDK mode and still need the print capture natives.
+    register_test_harness_natives(registry);
 
     // JDK 25 VectorSupport declares these three ACC_NATIVE methods in
     // java.base. Keep them in the real-JDK essential path; the broader
@@ -12782,28 +12808,6 @@ pub fn register_synthetic_overrides(registry: &mut NativeMethodRegistry) {
         native_return_true,
     );
 
-    // --- Test harness: tempPrint ---
-    // Used by integration tests to capture output without needing full I/O.
-    registry.register(
-        "cratonvm/test/Util",
-        "tempPrint",
-        "(I)V",
-        native_temp_print_int,
-    );
-    registry.register(
-        "cratonvm/test/Util",
-        "tempPrint",
-        "(Ljava/lang/String;)V",
-        native_temp_print_string,
-    );
-    registry.register("cratonvm/Util", "tempPrint", "(I)V", native_temp_print_int);
-    registry.register(
-        "cratonvm/Util",
-        "tempPrint",
-        "(Ljava/lang/String;)V",
-        native_temp_print_string,
-    );
-
     // --- java.lang.Enum ---
     register_enum_natives(registry);
 
@@ -21095,13 +21099,28 @@ fn register_lock_support_natives(r: &mut NativeMethodRegistry) {
     r.set_category(__prev_cat);
 }
 
-fn native_lock_support_park(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    // args: [blocker] — blocker is ignored in our simplified implementation
+fn native_lock_support_park(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // args: [blocker]
     // JDK spec: if interrupted, park returns immediately (no exception, flag NOT cleared)
     if ctx.is_interrupted(false) {
         return Ok(None);
     }
+    // AQS-PARK-PIN: this bridge only fires when a real-JDK `LockSupport.park`
+    // overload is routed straight to us instead of running its bytecode (which
+    // would otherwise stash `blocker` into `Thread.parkBlocker` itself via
+    // `setCurrentBlocker` — see the matching fix in `NativeContextImpl::park`,
+    // vm/src/vm/vm_exec.rs). Pin the explicit argument across the block so a
+    // caller like `AbstractQueuedSynchronizer$ConditionNode.block()` (blocker =
+    // `this`) can't lose it to the JIT register-invisibility gap regardless of
+    // which path is live. Mirrors `monitor_wait_keepalive`.
+    let pin = match args.first() {
+        Some(Value::Object(Some(o))) => Some(ctx.pin_native_root(*o)),
+        _ => None,
+    };
     ctx.park(None);
+    if let Some(pin) = pin {
+        ctx.unpin_native_roots(pin);
+    }
     Ok(None)
 }
 
@@ -21120,7 +21139,15 @@ fn native_lock_support_park_nanos(ctx: &mut dyn NativeContext, args: &[Value]) -
         _ => 0,
     };
     if nanos > 0 {
+        // AQS-PARK-PIN — see `native_lock_support_park`.
+        let pin = match args.first() {
+            Some(Value::Object(Some(o))) => Some(ctx.pin_native_root(*o)),
+            _ => None,
+        };
         ctx.park(Some(std::time::Duration::from_nanos(nanos as u64)));
+        if let Some(pin) = pin {
+            ctx.unpin_native_roots(pin);
+        }
     }
     Ok(None)
 }
@@ -21145,7 +21172,15 @@ fn native_lock_support_park_until(ctx: &mut dyn NativeContext, args: &[Value]) -
             .map(|d| d.as_millis() as i64)
             .unwrap_or(0);
         let remaining = (deadline - now_ms).max(0) as u64;
+        // AQS-PARK-PIN — see `native_lock_support_park`.
+        let pin = match args.first() {
+            Some(Value::Object(Some(o))) => Some(ctx.pin_native_root(*o)),
+            _ => None,
+        };
         ctx.park(Some(std::time::Duration::from_millis(remaining)));
+        if let Some(pin) = pin {
+            ctx.unpin_native_roots(pin);
+        }
     }
     Ok(None)
 }
