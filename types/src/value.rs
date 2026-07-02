@@ -128,7 +128,9 @@ fn known_object_refs() -> &'static Mutex<HashSet<usize>> {
 }
 
 fn lock_known_object_refs() -> std::sync::MutexGuard<'static, HashSet<usize>> {
-    known_object_refs().lock().unwrap_or_else(|e| e.into_inner())
+    known_object_refs()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
 }
 
 #[inline]

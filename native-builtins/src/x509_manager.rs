@@ -3565,7 +3565,10 @@ mod tests {
         insert_anchor(&mut trust, trusted_root.clone());
         insert_anchor(&mut trust, other_root);
         let subject = parse_certificate(&trusted_root).unwrap().subject_der;
-        assert_eq!(trust.anchors.get(&subject).map(|anchors| anchors.len()), Some(2));
+        assert_eq!(
+            trust.anchors.get(&subject).map(|anchors| anchors.len()),
+            Some(2)
+        );
 
         validate_chain(&[leaf, trusted_root], &trust)
             .expect("actual stored anchor must not be hidden by same-subject roots");

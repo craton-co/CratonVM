@@ -5491,15 +5491,15 @@ mod tests {
     #[test]
     fn test_jep_matrix_compliant_count() {
         let m = JepComplianceMatrix::with_jdk25_jeps();
-        // JEP 502, 506, 510, 511, 512, 513, 519, 484, 496, 497 = 10
-        assert_eq!(m.compliant_count(), 10);
+        // JEP 502, 506, 510, 511, 512, 513, 519, 484 = 8
+        assert_eq!(m.compliant_count(), 8);
     }
 
     #[test]
     fn test_jep_matrix_partial_count() {
         let m = JepComplianceMatrix::with_jdk25_jeps();
-        // JEP 505, 507, 508 = 3
-        assert_eq!(m.partial_count(), 3);
+        // JEP 505, 507, 508, 496, 497 = 5
+        assert_eq!(m.partial_count(), 5);
     }
 
     #[test]
@@ -5553,8 +5553,8 @@ mod tests {
     fn test_jep_matrix_generate_report_summary_counts() {
         let m = JepComplianceMatrix::with_jdk25_jeps();
         let report = m.generate_report();
-        assert!(report.contains("10 Compliant"));
-        assert!(report.contains("3 Partial"));
+        assert!(report.contains("8 Compliant"));
+        assert!(report.contains("5 Partial"));
     }
 
     #[test]

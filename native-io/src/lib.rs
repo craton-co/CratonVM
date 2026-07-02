@@ -286,14 +286,31 @@ fn has_escaping_parent_segment(path: &str) -> bool {
 /// restriction that is therefore opt-in.
 static PATH_CONFINE_TO_CWD: AtomicBool = AtomicBool::new(false);
 
+#[cfg(test)]
+thread_local! {
+    static PATH_CONFINE_TO_CWD_TEST_OVERRIDE: std::cell::Cell<Option<bool>> =
+        std::cell::Cell::new(None);
+}
+
 /// Enable or disable confining canonicalized paths to the process CWD.
 /// Off by default — see [`PATH_CONFINE_TO_CWD`].
+#[cfg(not(test))]
 pub fn set_path_confine_to_cwd(enabled: bool) {
     PATH_CONFINE_TO_CWD.store(enabled, Ordering::Relaxed);
 }
 
+#[cfg(test)]
+pub fn set_path_confine_to_cwd(enabled: bool) {
+    PATH_CONFINE_TO_CWD_TEST_OVERRIDE.with(|cell| cell.set(Some(enabled)));
+}
+
 /// Returns `true` if CWD confinement is currently enabled.
 pub fn is_path_confine_to_cwd() -> bool {
+    #[cfg(test)]
+    if let Some(enabled) = PATH_CONFINE_TO_CWD_TEST_OVERRIDE.with(|cell| cell.get()) {
+        return enabled;
+    }
+
     PATH_CONFINE_TO_CWD.load(Ordering::Relaxed)
 }
 
