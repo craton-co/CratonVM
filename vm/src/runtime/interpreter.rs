@@ -473,13 +473,35 @@ fn stw_take_over_and_wait(
             warned = true;
         }
     }
+    // A4 (fork6-fjp) — helper-window coverage. The barrier is satisfied, so
+    // every remaining un-scanned root holder is a BLOCKED thread (excluded via
+    // `threads_blocked`, covered only by its `deposit_root_snapshot`, which
+    // never scans JIT frames). A worker blocked in `join()`/park under
+    // JIT-compiled `runWorker`/`doExec` frames that are the sole holder of a
+    // forked subtask would otherwise lose it to the non-moving sweep (the
+    // Fork6 stale all-zero receivers). Scan each remaining peer's register
+    // file + used stack once, contributing roots only when the stack actually
+    // carries a JIT return address. Gated to collections where the gap can
+    // exist at all: a blocked thread while some thread holds live JIT frames.
+    let mut helper_windows = 0usize;
+    if xt::helper_window_scan_enabled()
+        && shared.gc_barrier.blocked_count() > 0
+        && crate::jit::conservative_roots::any_thread_in_jit()
+    {
+        let (windows, _roots) =
+            xt::helper_window_pass(&taken, &|a| shared.heap.is_object_address(a), xt_roots);
+        helper_windows = windows;
+    }
     // Publish any reserved TLAB tails still present after the barrier is
     // satisfied. Usually only forcibly-stopped in-JIT peers have one; collecting
     // all live threads also hardens the sweep against a blocked/tearing-down
     // thread that missed its retire before it left the counted mutator set.
     // Cleared by the caller after the collection completes.
     let regions = shared.thread_registry.collect_reserved_tlab_tails();
-    if taken.count() > 0 || !regions.is_empty() {
+    if taken.count() > 0 || helper_windows > 0 || !regions.is_empty() {
+        // Helper-window roots are conservative (unprovable coverage) — the
+        // collection must stay non-moving so a false-positive candidate can
+        // only over-retain, never relocate under a live JIT/blocked frame.
         cratonvm_gc::gc_quiescence::mark_moving_young_coverage_incomplete();
         shared.heap.set_jit_tlab_skip_regions(&regions);
     }
