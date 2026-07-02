@@ -521,8 +521,11 @@ mod imp {
                     let mut off = OFF_GPR_LO;
                     let mut has_jit = false;
                     while off <= OFF_GPR_HI {
-                        // SAFETY: `ctx` is a fully-initialized CONTEXT copy.
-                        let v = unsafe { *(ctx.as_ptr().add(off) as *const u64) } as usize;
+                        // SAFETY: `ctx` is a fully-initialized CONTEXT copy;
+                        // read_unaligned because the by-value array is only
+                        // byte-aligned.
+                        let v = unsafe { (ctx.as_ptr().add(off) as *const u64).read_unaligned() }
+                            as usize;
                         if !has_jit && ranges.iter().any(|&(lo, hi)| v >= lo && v < hi) {
                             has_jit = true;
                         }
