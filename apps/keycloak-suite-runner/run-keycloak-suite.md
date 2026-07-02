@@ -5,7 +5,8 @@ or HotSpot, one process per test class. It uses the existing Keycloak harness:
 
 - Keycloak checkout: `apps\keycloak`
 - JUnit Platform runner: `apps\keycloak\kc-runner\KcRunner.class`
-- Universal classpath: `apps\keycloak\kc-universal-cp.txt`
+- Module test classpaths generated with Maven `dependency:build-classpath`
+- Universal classpath fallback: `apps\keycloak\kc-universal-cp.txt`
 
 Every class gets wall-clock timing and persisted stdout/stderr logs.
 
@@ -15,6 +16,7 @@ The Keycloak checkout must already be compiled and must have:
 
 - `apps\keycloak\kc-runner\KcRunner.class`
 - `apps\keycloak\kc-universal-cp.txt`
+- `apps\keycloak\mvnw.cmd` or `mvn` on `PATH` for module classpath generation
 - one or more `target\test-classes` directories under `apps\keycloak`
 - JDK 25 at `C:\Program Files\Java\jdk-25`, or pass `-JdkHome`
 
@@ -87,8 +89,30 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File apps\keycloak-suite-runn
 | `-MaxHeap` | heap string | `2g` | Heap passed to both VMs. |
 | `-CratonArgs` | string array | none | Extra CratonVM CLI arguments. |
 | `-RefreshLists` | switch | off | Rebuild `all-tests.tsv`, `passed.tsv`, `others.tsv`. |
+| `-RefreshClasspaths` | switch | off | Rebuild cached Maven module classpath files under `.suite\classpaths`. |
+| `-UniversalClasspath` | switch | off | Use the legacy `kc-universal-cp.txt` classpath instead of module Maven classpaths. |
 | `-ListOnly` | switch | off | Print selected classes without running. |
 | `-AllModes` | switch | off | Run four category/JIT modes concurrently. |
+
+## Classpath Model
+
+By default each test class is launched with its module's Maven test runtime
+classpath. The runner caches those generated classpaths under:
+
+```text
+.suite\classpaths\
+```
+
+When a module classpath is too long for a Windows process command line, the
+runner writes a small pathing JAR under:
+
+```text
+.suite\pathing-jars\
+```
+
+Both HotSpot and CratonVM are then launched with `-jar`/`--jar` against that
+pathing JAR, whose manifest points at `KcRunner`, the module classes, test
+classes, and dependency jars.
 
 Any `CRATONVM_*` environment variable already set in the shell is inherited by
 every CratonVM child process. Example:
