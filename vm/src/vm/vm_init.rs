@@ -273,18 +273,14 @@ fn load_startup_jvmti_agents(config: &VmConfig, env: &mut crate::jvmti::JvmtiEnv
         let (path, options) = crate::jvmti::parse_agent_arg(option);
         env.agent_registry
             .load_agent(&path, &options)
-            .unwrap_or_else(|err| {
-                panic!("failed to load JVMTI startup agent `{option}`: {err}")
-            });
+            .unwrap_or_else(|err| panic!("failed to load JVMTI startup agent `{option}`: {err}"));
     }
 }
 
 #[cfg(not(feature = "experimental-debug"))]
 fn reject_startup_jvmti_agents_when_disabled(config: &VmConfig) {
     if let Some(option) = config.jvmti_agent_options.first() {
-        panic!(
-            "failed to load JVMTI startup agent `{option}`: JVMTI support is not compiled in"
-        );
+        panic!("failed to load JVMTI startup agent `{option}`: JVMTI support is not compiled in");
     }
 }
 
@@ -5524,9 +5520,7 @@ mod tests {
 
     #[cfg(feature = "experimental-debug")]
     #[test]
-    #[should_panic(
-        expected = "-javaagent must run through runtime::agent_loader::invoke_premains"
-    )]
+    #[should_panic(expected = "-javaagent must run through runtime::agent_loader::invoke_premains")]
     fn startup_jvmti_rejects_javaagent_tokens() {
         let mut config = VmConfig::default();
         config

@@ -871,9 +871,7 @@ pub(crate) fn resolve_field_index_in_hierarchy_desc(
             if field.is_static() {
                 continue;
             }
-            if &*field.name == field_name
-                && descriptor.is_none_or(|d| &*field.descriptor == d)
-            {
+            if &*field.name == field_name && descriptor.is_none_or(|d| &*field.descriptor == d) {
                 return Some(class.first_field_index + instance_offset);
             }
             instance_offset += 1;
@@ -1382,7 +1380,11 @@ impl<'a> NativeContextImpl<'a> {
         if !fixup.is_empty() {
             // BUG-03 trace (gated): record that the blocked-wake remap ran for main.
             if self.thread.thread_id.0 == 0 && std::env::var_os("CRATONVM_DBG_BUG03").is_some() {
-                let jto = self.thread.java_thread_obj.map(|o| o.as_ptr() as usize).unwrap_or(0);
+                let jto = self
+                    .thread
+                    .java_thread_obj
+                    .map(|o| o.as_ptr() as usize)
+                    .unwrap_or(0);
                 eprintln!(
                     "[BUG03-fm] e{} path=blocked-wake(check_post_block) tid0 jto=0x{:x} jto_in_fixup={} fixup.len={}",
                     self.shared.heap.collection_count(), jto, jto != 0 && fixup.contains_key(&jto), fixup.len()
@@ -1572,7 +1574,12 @@ impl<'a> NativeContextImpl<'a> {
             &args,
         );
         // Read the live holder back (the invoke may have GC'd), then unpin.
-        let holder = self.thread.native_pin_roots.get(pin_base).copied().unwrap_or(holder);
+        let holder = self
+            .thread
+            .native_pin_roots
+            .get(pin_base)
+            .copied()
+            .unwrap_or(holder);
         self.thread.native_pin_roots.truncate(pin_base);
         init_result.ok()?;
         Some(holder)
@@ -1759,9 +1766,7 @@ impl<'a> NativeContextImpl<'a> {
             self.thread.native_pin_roots.push(thread_obj);
             let lock = self.shared.heap.alloc_object(obj_class, 0);
             let thread_obj = self.thread.native_pin_roots[pin_base];
-            self.thread
-                .native_pin_roots
-                .truncate(pin_base);
+            self.thread.native_pin_roots.truncate(pin_base);
             self.shared
                 .heap
                 .set_field(thread_obj, slot, Value::Object(Some(lock)));
@@ -5341,92 +5346,92 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                             Ok(None)
                         }
                     } else {
-                    let rcv_id_opt = match &full_args[0] {
-                        Value::Object(Some(r)) => Some(self.shared.heap.class_id_of(*r)),
-                        _ => None,
-                    };
-                    let target_class = match rcv_id_opt {
-                        Some(rcv_id) => self
-                            .shared
-                            .class_manager
-                            .read()
-                            .get_class(rcv_id)
-                            .map(|c| c.name.to_string())
-                            .unwrap_or_else(|| lcs.impl_handle.class_name.to_string()),
-                        None => lcs.impl_handle.class_name.to_string(),
-                    };
-                    // Loader-faithful (gated): dispatch on the receiver's exact
-                    // class_id when it diverges from the by-name global copy, so a
-                    // bytecode-enhanced receiver runs its own lambda body.
-                    let vov = if crate::runtime::env_cache::loader_aware_resolution() {
-                        rcv_id_opt.filter(|rcv| {
-                            *rcv != ClassId::new(0)
-                                && !self.shared.lambda_proxies.read().contains_key(rcv)
-                                && {
-                                    let cm = self.shared.class_manager.read();
-                                    cm.get_class(*rcv)
-                                        .map(|c| &*c.name == target_class.as_str())
-                                        .unwrap_or(false)
-                                        && cm.get_loaded_class_id(&target_class) != Some(*rcv)
-                                }
-                        })
-                    } else {
-                        None
-                    };
-                    let result = if let Some(rcv_cid) = vov {
-                        invoke_on_class_shared(
-                            self.shared,
-                            self.thread,
-                            rcv_cid,
-                            &lcs.impl_handle.member_name,
-                            &lcs.impl_handle.descriptor,
-                            &full_args,
-                        )
-                    } else {
-                        self.invoke_or_native(
-                            &target_class,
-                            &lcs.impl_handle.member_name,
-                            &lcs.impl_handle.descriptor,
-                            &full_args,
-                        )
-                    };
-                    // If the receiver's class didn't have the method, fall back
-                    // to the class specified in the lambda call site. This handles
-                    // objects with generic ClassId (e.g., stub Object) where the
-                    // lambda actually targets a specific class (e.g., PrintStream).
-                    //
-                    // CRIT (double-invoke): only retry when the NoSuchMethodError
-                    // is for THIS dispatch's own SAM method (i.e. the impl method
-                    // genuinely wasn't found on the receiver's runtime class). A
-                    // NoSuchMethodError for a DIFFERENT method means the SAM method
-                    // WAS found and ran, and the error bubbled up from a nested
-                    // call deep inside it — re-invoking here would run the
-                    // (side-effecting) method a SECOND time. That is exactly the
-                    // "InvocationInterceptors called invocation multiple times" /
-                    // NodeTestTask double-`prepare` corruption: a Hibernate
-                    // bytecode-enhanced `$$_hibernate_*` NSME thrown inside a JUnit
-                    // `TestTask::execute` lambda made `forEach` re-run `execute()`,
-                    // nulling `parentContext` on the second pass.
-                    match &result {
-                        Err(MethodCallFailed::InternalError(VmError::Linkage(
-                            LinkageError::NoSuchMethodError {
-                                method_name,
-                                method_descriptor,
-                                ..
-                            },
-                        ))) if target_class.as_str() != &*lcs.impl_handle.class_name
-                            && method_name.as_str() == &*lcs.impl_handle.member_name
-                            && method_descriptor.as_str() == &*lcs.impl_handle.descriptor =>
-                        {
-                            self.invoke_or_native(
-                                &lcs.impl_handle.class_name,
+                        let rcv_id_opt = match &full_args[0] {
+                            Value::Object(Some(r)) => Some(self.shared.heap.class_id_of(*r)),
+                            _ => None,
+                        };
+                        let target_class = match rcv_id_opt {
+                            Some(rcv_id) => self
+                                .shared
+                                .class_manager
+                                .read()
+                                .get_class(rcv_id)
+                                .map(|c| c.name.to_string())
+                                .unwrap_or_else(|| lcs.impl_handle.class_name.to_string()),
+                            None => lcs.impl_handle.class_name.to_string(),
+                        };
+                        // Loader-faithful (gated): dispatch on the receiver's exact
+                        // class_id when it diverges from the by-name global copy, so a
+                        // bytecode-enhanced receiver runs its own lambda body.
+                        let vov = if crate::runtime::env_cache::loader_aware_resolution() {
+                            rcv_id_opt.filter(|rcv| {
+                                *rcv != ClassId::new(0)
+                                    && !self.shared.lambda_proxies.read().contains_key(rcv)
+                                    && {
+                                        let cm = self.shared.class_manager.read();
+                                        cm.get_class(*rcv)
+                                            .map(|c| &*c.name == target_class.as_str())
+                                            .unwrap_or(false)
+                                            && cm.get_loaded_class_id(&target_class) != Some(*rcv)
+                                    }
+                            })
+                        } else {
+                            None
+                        };
+                        let result = if let Some(rcv_cid) = vov {
+                            invoke_on_class_shared(
+                                self.shared,
+                                self.thread,
+                                rcv_cid,
                                 &lcs.impl_handle.member_name,
                                 &lcs.impl_handle.descriptor,
                                 &full_args,
                             )
+                        } else {
+                            self.invoke_or_native(
+                                &target_class,
+                                &lcs.impl_handle.member_name,
+                                &lcs.impl_handle.descriptor,
+                                &full_args,
+                            )
+                        };
+                        // If the receiver's class didn't have the method, fall back
+                        // to the class specified in the lambda call site. This handles
+                        // objects with generic ClassId (e.g., stub Object) where the
+                        // lambda actually targets a specific class (e.g., PrintStream).
+                        //
+                        // CRIT (double-invoke): only retry when the NoSuchMethodError
+                        // is for THIS dispatch's own SAM method (i.e. the impl method
+                        // genuinely wasn't found on the receiver's runtime class). A
+                        // NoSuchMethodError for a DIFFERENT method means the SAM method
+                        // WAS found and ran, and the error bubbled up from a nested
+                        // call deep inside it — re-invoking here would run the
+                        // (side-effecting) method a SECOND time. That is exactly the
+                        // "InvocationInterceptors called invocation multiple times" /
+                        // NodeTestTask double-`prepare` corruption: a Hibernate
+                        // bytecode-enhanced `$$_hibernate_*` NSME thrown inside a JUnit
+                        // `TestTask::execute` lambda made `forEach` re-run `execute()`,
+                        // nulling `parentContext` on the second pass.
+                        match &result {
+                            Err(MethodCallFailed::InternalError(VmError::Linkage(
+                                LinkageError::NoSuchMethodError {
+                                    method_name,
+                                    method_descriptor,
+                                    ..
+                                },
+                            ))) if target_class.as_str() != &*lcs.impl_handle.class_name
+                                && method_name.as_str() == &*lcs.impl_handle.member_name
+                                && method_descriptor.as_str() == &*lcs.impl_handle.descriptor =>
+                            {
+                                self.invoke_or_native(
+                                    &lcs.impl_handle.class_name,
+                                    &lcs.impl_handle.member_name,
+                                    &lcs.impl_handle.descriptor,
+                                    &full_args,
+                                )
+                            }
+                            _ => result,
                         }
-                        _ => result,
-                    }
                     }
                 }
                 MethodHandleKind::InvokeSpecial => {
