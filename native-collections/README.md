@@ -7,29 +7,29 @@ Machine implemented from scratch in Rust.
 
 ## Scope
 
-Rust-backed native methods that accelerate `java.util.*` and
-`java.util.concurrent.*` operations when the `synthetic-jdk` feature is
-enabled. Real-JDK builds load these classes from JDK bytecode and execute
-them in the interpreter; this crate is the synthetic alternative used by
-the minimal test harness and by embedders who don't ship a JDK.
+Rust-backed native methods for selected `java.util.*` and
+`java.util.concurrent.*` operations. Most registrations are bridge
+intrinsics that complement real-JDK bytecode; the `synthetic-jdk` feature
+keeps additional synthetic-stub-only registrations available for the
+minimal test harness and embedders that do not ship a full JDK.
 
 ## Non-goals
 
-- Not used in the default real-JDK build path. The `register_*` entry
-  points are gated behind the `synthetic-jdk` Cargo feature.
+- Not a replacement for the full JDK collections implementation. Methods
+  without native registrations continue to run through real-JDK bytecode in
+  the default VM.
+- Synthetic-stub-only registrations remain behind the `synthetic-jdk`
+  Cargo feature.
 - No I/O, no networking, no AWT — only collection containers.
 - No `java.lang.*` natives (see `cratonvm-native-builtins`).
 
 ## Usage
 
 ```rust
-# #[cfg(feature = "synthetic-jdk")]
-# {
 use cratonvm_native_api::NativeMethodRegistry;
 
 let mut reg = NativeMethodRegistry::new();
 cratonvm_native_collections::register_collections_natives(&mut reg);
-# }
 ```
 
 ## Status

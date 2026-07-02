@@ -1,16 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2024-2026 Craton Software Company
 
-//! Synthetic native implementations for the Java Collections Framework.
+//! Native implementations for selected Java Collections Framework methods.
 //!
-//! **DEPRECATED (Session 15)**: These are Rust-backed synthetic stubs used only when
-//! `synthetic-jdk` feature is enabled. In real JDK mode, `java.util.*` classes are
-//! loaded from JDK class files and executed via the interpreter.
-//!
-//! This crate is gated behind the `synthetic-jdk` feature flag at the API level:
-//! `register_collections_natives()` and `register_builtins()` are only available
-//! when the feature is enabled. The crate still compiles for backward compatibility
-//! but is not called in the default (real JDK) build path.
+//! The default VM uses these as bridge intrinsics alongside real-JDK bytecode.
+//! The `synthetic-jdk` feature enables additional synthetic-stub-only
+//! registrations for minimal harnesses that do not load the full JDK classes.
 
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
@@ -4956,34 +4951,10 @@ fn native_map_key_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     if is_tree_map_receiver(ctx, this) {
         return native_tm_key_set(ctx, args);
     }
+    // Build the live view through the shared helper so every key, including a
+    // legal HashMap null key, is inserted through native_map_put.
     let keys = map_collect_keys(ctx, this);
-    // Build a HashSet from the keys, backed by a view backing that remembers
-    // the source map so `keySet().remove(k)` / `keySet().iterator().remove()`
-    // write through to it (live-view semantics).
-    let set = alloc_synthetic(ctx, "java/util/HashSet", HS_NUM_FIELDS);
-    let cap = std::cmp::max(keys.len().next_power_of_two(), MAP_DEFAULT_CAPACITY);
-    let backing_map = alloc_view_backing(ctx, this, VIEW_KIND_KEYSET, cap);
-    ctx.set_field(set, HS_FIELD_MAP, Value::Object(Some(backing_map)));
-
-    // Add each key
-    for key in &keys {
-        if let Value::Object(Some(k)) = key {
-            let hash = map_hash_key(ctx, *k)?;
-            let (b, size, c) = map_state(ctx, backing_map);
-            let b = b.unwrap();
-            let idx = map_bucket_index(hash, c);
-            let existing = ctx.get_array_element(b, idx);
-            let head = match existing {
-                Value::Object(obj_opt) => obj_opt,
-                _ => None,
-            };
-            let sentinel = Value::Int(1);
-            let node = map_alloc_node(ctx, *k, sentinel, hash, head);
-            ctx.set_array_element(b, idx, Value::Object(Some(node)));
-            set_map_size(ctx, backing_map, size + 1);
-        }
-    }
-
+    let set = make_view_set_of(ctx, this, VIEW_KIND_KEYSET, &keys)?;
     Ok(Some(Value::Object(Some(set))))
 }
 
@@ -33696,12 +33667,17 @@ fn pbq_ensure_capacity(ctx: &mut dyn NativeContext, this: ObjectRef, needed: usi
     ctx.set_field(this, PBQ_FIELD_DATA, Value::Object(Some(new_arr)));
 }
 
-fn native_pbq_offer(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
-        Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(Some(Value::Int(1))),
-    };
-    let elem = args.get(1).copied().unwrap_or(Value::Object(None));
+fn pbq_reject_null_element(elem: Value) -> Result<(), MethodCallFailed> {
+    if matches!(elem, Value::Object(None)) {
+        return Err(RuntimeError::NullPointerException {
+            message: Some("PriorityBlockingQueue does not permit null elements".to_string()),
+        }
+        .into());
+    }
+    Ok(())
+}
+
+fn pbq_offer_locked(ctx: &mut dyn NativeContext, this: ObjectRef, elem: Value) -> MethodCallResult {
     let size = match ctx.get_field(this, PBQ_FIELD_SIZE) {
         Value::Int(v) => v,
         _ => 0,
@@ -33711,7 +33687,7 @@ fn native_pbq_offer(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         Value::Object(Some(a)) => a,
         _ => return Ok(Some(Value::Int(1))),
     };
-    // Binary search for insertion position using natural ordering
+    // Binary search for insertion position using natural ordering.
     let comparator = Value::Object(None);
     let mut low: usize = 0;
     let mut high = size as usize;
@@ -33725,7 +33701,7 @@ fn native_pbq_offer(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
             high = mid;
         }
     }
-    // Shift elements right to make room
+    // Shift elements right to make room.
     for i in (low..(size as usize)).rev() {
         let v = ctx.get_array_element(arr, i);
         ctx.set_array_element(arr, i + 1, v);
@@ -33735,23 +33711,19 @@ fn native_pbq_offer(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     Ok(Some(Value::Int(1)))
 }
 
-fn native_pbq_poll(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
-        Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(Some(Value::Object(None))),
-    };
+fn pbq_poll_locked(ctx: &mut dyn NativeContext, this: ObjectRef) -> Value {
     let size = match ctx.get_field(this, PBQ_FIELD_SIZE) {
         Value::Int(v) => v,
         _ => 0,
     };
     if size == 0 {
-        return Ok(Some(Value::Object(None)));
+        return Value::Object(None);
     }
     let arr = match ctx.get_field(this, PBQ_FIELD_DATA) {
         Value::Object(Some(a)) => a,
-        _ => return Ok(Some(Value::Object(None))),
+        _ => return Value::Object(None),
     };
-    // Remove head (smallest element at index 0)
+    // Remove head (smallest element at index 0).
     let head = ctx.get_array_element(arr, 0);
     for i in 0..(size - 1) as usize {
         let v = ctx.get_array_element(arr, i + 1);
@@ -33759,6 +33731,33 @@ fn native_pbq_poll(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     }
     ctx.set_array_element(arr, (size - 1) as usize, Value::Object(None));
     ctx.set_field(this, PBQ_FIELD_SIZE, Value::Int(size - 1));
+    head
+}
+
+fn native_pbq_offer(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(1))),
+    };
+    let elem = args.get(1).copied().unwrap_or(Value::Object(None));
+    pbq_reject_null_element(elem)?;
+    ctx.monitor_enter(this);
+    let result = pbq_offer_locked(ctx, this, elem);
+    if result.is_ok() {
+        let _ = ctx.monitor_notify_all(this);
+    }
+    ctx.monitor_exit(this);
+    result
+}
+
+fn native_pbq_poll(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    ctx.monitor_enter(this);
+    let head = pbq_poll_locked(ctx, this);
+    ctx.monitor_exit(this);
     Ok(Some(head))
 }
 
@@ -33787,7 +33786,24 @@ fn native_pbq_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
 }
 
 fn native_pbq_take(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    native_pbq_poll(ctx, args)
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    ctx.monitor_enter(this);
+    loop {
+        let size = match ctx.get_field(this, PBQ_FIELD_SIZE) {
+            Value::Int(v) => v,
+            _ => 0,
+        };
+        if size > 0 {
+            break;
+        }
+        let _ = ctx.monitor_wait(this, Some(50));
+    }
+    let head = pbq_poll_locked(ctx, this);
+    ctx.monitor_exit(this);
+    Ok(Some(head))
 }
 
 fn native_pbq_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -34311,6 +34327,32 @@ fn cowal_bump_mod_count(ctx: &mut dyn NativeContext, this: ObjectRef) {
     }
 }
 
+fn cowal_enter_monitor(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<ObjectRef> {
+    if let Some(ls) = ctx.resolve_field_index(COWAL_CLASS, "lock") {
+        match ctx.get_field(this, ls) {
+            Value::Object(Some(lo)) => {
+                ctx.monitor_enter(lo);
+                Some(lo)
+            }
+            _ => {
+                ctx.monitor_enter(this);
+                None
+            }
+        }
+    } else {
+        ctx.monitor_enter(this);
+        None
+    }
+}
+
+fn cowal_exit_monitor(ctx: &mut dyn NativeContext, this: ObjectRef, lock_obj: Option<ObjectRef>) {
+    if let Some(lo) = lock_obj {
+        ctx.monitor_exit(lo);
+    } else {
+        ctx.monitor_exit(this);
+    }
+}
+
 fn native_cowal_add_if_absent(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
@@ -34318,12 +34360,34 @@ fn native_cowal_add_if_absent(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     };
     cowal_ensure_lock_and_array(ctx, this)?;
     let elem = args.get(1).copied().unwrap_or(Value::Object(None));
-    let present = ctx.invoke_virtual(this, "contains", "(Ljava/lang/Object;)Z", &[elem])?;
-    if matches!(present, Some(Value::Int(v)) if v != 0) {
+
+    let lock_obj = cowal_enter_monitor(ctx, this);
+    let Some((arr, len)) = cowal_read_snapshot(ctx, this) else {
+        cowal_exit_monitor(ctx, this, lock_obj);
         return Ok(Some(Value::Int(0)));
+    };
+    for i in 0..len {
+        let existing = ctx.get_array_element(arr, i);
+        if list_element_matches(ctx, &existing, &elem) {
+            cowal_exit_monitor(ctx, this, lock_obj);
+            return Ok(Some(Value::Int(0)));
+        }
     }
-    let added = ctx.invoke_virtual(this, "add", "(Ljava/lang/Object;)Z", &[elem])?;
-    Ok(added.or(Some(Value::Int(0))))
+
+    let new_arr = ctx.new_array(ArrayElementType::Reference, len + 1);
+    for i in 0..len {
+        ctx.set_array_element(new_arr, i, ctx.get_array_element(arr, i));
+    }
+    ctx.set_array_element(new_arr, len, elem);
+    if let Some(aslot) = ctx.resolve_field_index(COWAL_CLASS, "array") {
+        ctx.set_field(this, aslot, Value::Object(Some(new_arr)));
+        cowal_bump_mod_count(ctx, this);
+    } else {
+        ctx.set_field(this, 0, Value::Object(Some(new_arr)));
+        ctx.set_field(this, 1, Value::Int((len + 1) as i32));
+    }
+    cowal_exit_monitor(ctx, this, lock_obj);
+    Ok(Some(Value::Int(1)))
 }
 
 fn native_cowal_contains(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {

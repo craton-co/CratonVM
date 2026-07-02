@@ -80,24 +80,24 @@ dependencies = [
 ]
 
 [[package]]
-name = "rustjvm-native-api"
-version = "0.1.0"
+name = "cratonvm-native-api"
+version = "0.3.0"
 dependencies = [
  "parking_lot",
- "rustjvm-types",
+ "cratonvm-types",
 ]
 
 [[package]]
-name = "rustjvm-native-collections"
-version = "0.1.0"
+name = "cratonvm-native-collections"
+version = "0.3.0"
 dependencies = [
- "rustjvm-native-api",
- "rustjvm-types",
+ "cratonvm-native-api",
+ "cratonvm-types",
 ]
 
 [[package]]
-name = "rustjvm-types"
-version = "0.1.0"
+name = "cratonvm-types"
+version = "0.3.0"
 dependencies = [
  "thiserror",
 ]

@@ -11,6 +11,8 @@ use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError, Vm
 use cratonvm_types::{ObjectRef, Value};
 
 const CF: &str = "java/util/concurrent/CompletableFuture";
+const COWAL: &str = "java/util/concurrent/CopyOnWriteArrayList";
+const PBQ: &str = "java/util/concurrent/PriorityBlockingQueue";
 const SL: &str = "java/util/concurrent/locks/StampedLock";
 
 fn alloc_obj(ctx: &mut MockCtx, class_name: &str, fields: usize) -> ObjectRef {
@@ -29,6 +31,12 @@ fn new_stamped_lock(reg: &NativeMethodRegistry, ctx: &mut MockCtx) -> ObjectRef 
     let lock = alloc_obj(ctx, SL, 2);
     call(reg, ctx, SL, "<init>", "()V", &[Value::Object(Some(lock))]).unwrap();
     lock
+}
+
+fn new_priority_blocking_queue(reg: &NativeMethodRegistry, ctx: &mut MockCtx) -> ObjectRef {
+    let queue = alloc_obj(ctx, PBQ, 2);
+    call(reg, ctx, PBQ, "<init>", "()V", &[Value::Object(Some(queue))]).unwrap();
+    queue
 }
 
 fn object_result(result: MethodCallResult) -> ObjectRef {
@@ -224,6 +232,117 @@ fn cf_null_callbacks_throw_null_pointer_exception() {
             Value::Object(None),
         ],
     ));
+}
+
+#[test]
+fn cowal_add_if_absent_updates_snapshot_without_split_virtual_calls() {
+    let reg = build_registry();
+    let mut ctx = MockCtx::new();
+    let list = alloc_obj(&mut ctx, COWAL, 2);
+    let elem = boxed_int(&mut ctx, 11);
+
+    let added = call(
+        &reg,
+        &mut ctx,
+        COWAL,
+        "addIfAbsent",
+        "(Ljava/lang/Object;)Z",
+        &[Value::Object(Some(list)), elem],
+    )
+    .unwrap();
+    assert_eq!(added, Some(Value::Int(1)));
+    assert_eq!(ctx.get_field(list, 1), Value::Int(1));
+    let arr = match ctx.get_field(list, 0) {
+        Value::Object(Some(a)) => a,
+        other => panic!("CopyOnWriteArrayList array was {:?}", other),
+    };
+    assert_eq!(ctx.array_length(arr), 1);
+    assert_eq!(ctx.get_array_element(arr, 0), elem);
+    assert!(
+        ctx.invoke_virtual_log()
+            .iter()
+            .all(|(_, method, _, _)| method != "contains" && method != "add"),
+        "addIfAbsent must not split atomicity through virtual contains/add"
+    );
+
+    ctx.clear_invoke_virtual_log();
+    let duplicate = call(
+        &reg,
+        &mut ctx,
+        COWAL,
+        "addIfAbsent",
+        "(Ljava/lang/Object;)Z",
+        &[Value::Object(Some(list)), elem],
+    )
+    .unwrap();
+    assert_eq!(duplicate, Some(Value::Int(0)));
+    assert_eq!(ctx.get_field(list, 1), Value::Int(1));
+    assert!(
+        ctx.invoke_virtual_log()
+            .iter()
+            .all(|(_, method, _, _)| method != "contains" && method != "add"),
+        "duplicate addIfAbsent must rescan under the native lock"
+    );
+}
+
+#[test]
+fn priority_blocking_queue_rejects_null_offer_and_put() {
+    let reg = build_registry();
+    let mut ctx = MockCtx::new();
+    let queue = new_priority_blocking_queue(&reg, &mut ctx);
+
+    assert_npe(call(
+        &reg,
+        &mut ctx,
+        PBQ,
+        "offer",
+        "(Ljava/lang/Object;)Z",
+        &[Value::Object(Some(queue)), Value::Object(None)],
+    ));
+    assert_npe(call(
+        &reg,
+        &mut ctx,
+        PBQ,
+        "put",
+        "(Ljava/lang/Object;)V",
+        &[Value::Object(Some(queue)), Value::Object(None)],
+    ));
+    assert_eq!(ctx.get_field(queue, 1), Value::Int(0));
+}
+
+#[test]
+fn priority_blocking_queue_take_removes_available_head() {
+    let reg = build_registry();
+    let mut ctx = MockCtx::new();
+    let queue = new_priority_blocking_queue(&reg, &mut ctx);
+
+    for value in [boxed_int(&mut ctx, 30), boxed_int(&mut ctx, 10), boxed_int(&mut ctx, 20)] {
+        let offered = call(
+            &reg,
+            &mut ctx,
+            PBQ,
+            "offer",
+            "(Ljava/lang/Object;)Z",
+            &[Value::Object(Some(queue)), value],
+        )
+        .unwrap();
+        assert_eq!(offered, Some(Value::Int(1)));
+    }
+
+    let taken = call(
+        &reg,
+        &mut ctx,
+        PBQ,
+        "take",
+        "()Ljava/lang/Object;",
+        &[Value::Object(Some(queue))],
+    )
+    .unwrap();
+    match taken {
+        Some(Value::Object(Some(obj))) => assert_eq!(ctx.get_field(obj, 0), Value::Int(10)),
+        other => panic!("take returned {:?}", other),
+    }
+    assert_eq!(ctx.get_field(queue, 1), Value::Int(2));
 }
 
 #[test]
