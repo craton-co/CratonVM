@@ -326,7 +326,7 @@ impl Header {
         let locations_size = read_u32(20);
         let strings_size = read_u32(24);
 
-        if major_version != 1 {
+        if major_version != 1 || minor_version != 0 {
             return Err(JImageError::UnsupportedVersion {
                 major: major_version,
                 minor: minor_version,
@@ -1154,6 +1154,17 @@ mod tests {
         assert!(matches!(
             Header::parse(&bytes),
             Err(JImageError::UnsupportedVersion { major: 99, .. })
+        ));
+    }
+
+    #[test]
+    fn header_parse_unsupported_minor_version() {
+        let mut bytes = vec![0u8; HEADER_SIZE];
+        bytes[0..4].copy_from_slice(&JIMAGE_MAGIC.to_le_bytes());
+        bytes[4..8].copy_from_slice(&((1u32 << 16) | 1).to_le_bytes());
+        assert!(matches!(
+            Header::parse(&bytes),
+            Err(JImageError::UnsupportedVersion { major: 1, minor: 1 })
         ));
     }
 

@@ -105,6 +105,8 @@ impl ClassFileVersion {
 
     /// The maximum class file version this JVM supports.
     pub const MAX_SUPPORTED: Self = Self::JAVA_25;
+    /// Minor version used by class files that depend on preview features.
+    pub const PREVIEW_MINOR: u16 = 0xFFFF;
 
     pub fn new(major: u16, minor: u16) -> Self {
         Self { major, minor }
@@ -127,11 +129,19 @@ impl ClassFileVersion {
     }
 
     /// Returns `true` if this class file version is within the range the
-    /// JVM supports: major version 45 (Java 1.1) through 69 (Java 25)
-    /// inclusive. Versions below major 45 predate the class file format
-    /// and are rejected as spec-invalid.
+    /// JVM supports: major version 45 through 69 (Java 25) inclusive, with
+    /// minor-version rules from JVMS 4.1.
     pub fn is_supported(&self) -> bool {
-        self.major >= Self::JAVA_1.major && *self <= Self::MAX_SUPPORTED
+        if self.major < 45 || self.major > Self::MAX_SUPPORTED.major {
+            return false;
+        }
+        if self.major <= 55 {
+            return true;
+        }
+        if self.minor == 0 {
+            return true;
+        }
+        self.major == Self::MAX_SUPPORTED.major && self.minor == Self::PREVIEW_MINOR
     }
 }
 
@@ -173,7 +183,16 @@ mod tests {
         assert!(ClassFileVersion::JAVA_22.is_supported());
         assert!(ClassFileVersion::JAVA_25.is_supported());
         assert!(ClassFileVersion::JAVA_1.is_supported());
+        assert!(ClassFileVersion::new(45, u16::MAX).is_supported());
+        assert!(ClassFileVersion::new(
+            ClassFileVersion::MAX_SUPPORTED.major,
+            ClassFileVersion::PREVIEW_MINOR
+        )
+        .is_supported());
         assert!(!ClassFileVersion::new(70, 0).is_supported());
+        assert!(!ClassFileVersion::new(68, ClassFileVersion::PREVIEW_MINOR).is_supported());
+        assert!(!ClassFileVersion::new(68, 1).is_supported());
+        assert!(!ClassFileVersion::new(ClassFileVersion::MAX_SUPPORTED.major, 1).is_supported());
         // Versions below major 45 predate the class file format.
         assert!(!ClassFileVersion::new(44, 0).is_supported());
         assert!(!ClassFileVersion::new(0, 0).is_supported());
