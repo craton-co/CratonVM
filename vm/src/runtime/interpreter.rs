@@ -24645,6 +24645,59 @@ fn execute_invokevirtual_vtable_fast(
                 drop(cm);
                 return Ok(CachedCallResult::CacheMiss);
             }
+            // Dynamic-proxy default-method dispatch guard. A JDK dynamic
+            // proxy must route EVERY interface method call — including
+            // concrete default methods like `AgeHolder.age()` — through its
+            // `InvocationHandler.invoke()` (see `is_proxy_dispatch` in
+            // `execute_invoke_kind`, which does this correctly). This vtable
+            // fast path installs a direct `VirtualBytecode` target keyed by
+            // `receiver_class_id` alone; since every proxy instance sharing
+            // an interface set shares one generated `$ProxyN` class id, the
+            // FIRST call that resolves a default method here poisons the
+            // cache for that call site, so a LATER call on a *different*
+            // proxy instance of the same generated class dispatches straight
+            // to the default method's bytecode and skips the handler
+            // entirely (observed: `AspectJAutoProxyCreatorTests.twoAdviceAspectPrototype`/
+            // `twoAdviceAspectSingleton` advice silently not firing on the
+            // second proxy instance).
+            // Force the slow path for any proxy receiver so `is_proxy_dispatch`
+            // is consulted on every call; cost is zero on non-proxy dispatch.
+            //
+            // NOTE: walk the chain using the ALREADY-HELD `cm` guard rather
+            // than calling `class_chain_reaches_proxy_instance` (which takes
+            // its own `shared.class_manager.read()`) — a nested second read
+            // acquisition on the same thread self-deadlocks under
+            // parking_lot's writer-preferring fairness once any writer is
+            // queued, since the outer guard here is never dropped before the
+            // inner one blocks.
+            {
+                const MAX_DEPTH: usize = 32;
+                const PROXY_INSTANCE: &str = "java/lang/reflect/Proxy$Instance";
+                let mut current = Some(receiver_class_id);
+                let mut is_proxy = false;
+                for _ in 0..MAX_DEPTH {
+                    let cid = match current {
+                        Some(c) => c,
+                        None => break,
+                    };
+                    let class = match cm.get_class(cid) {
+                        Some(c) => c,
+                        None => break,
+                    };
+                    if &*class.name == PROXY_INSTANCE {
+                        is_proxy = true;
+                        break;
+                    }
+                    if &*class.name == "java/lang/Object" {
+                        break;
+                    }
+                    current = class.superclass;
+                }
+                if is_proxy {
+                    drop(cm);
+                    return Ok(CachedCallResult::CacheMiss);
+                }
+            }
             // `URLClassLoader.findClass` invoked on a SUBCLASS receiver (the
             // native is registered on `URLClassLoader`, not the subclass, so the
             // `find(rcv_name, …)` probe below misses and the parent walk would

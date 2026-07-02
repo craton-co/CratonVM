@@ -5060,18 +5060,17 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
         "(Lorg/springframework/beans/factory/config/ConfigurableListableBeanFactory;)V",
         |_ctx, _args| Ok(None),
     );
-    r.register(
-        "org/springframework/web/context/support/WebApplicationContextUtils",
-        "registerWebApplicationScopes",
-        "(Lorg/springframework/beans/factory/config/ConfigurableListableBeanFactory;)V",
-        |_ctx, _args| Ok(None),
-    );
-    r.register(
-        "org/springframework/web/context/support/WebApplicationContextUtils",
-        "registerWebApplicationScopes",
-        "(Lorg/springframework/beans/factory/config/ConfigurableListableBeanFactory;Ljakarta/servlet/ServletContext;)V",
-        |_ctx, _args| Ok(None),
-    );
+    // NOTE: `WebApplicationContextUtils.registerWebApplicationScopes` (both
+    // overloads) used to be blanket no-op'd here alongside the JSF guard
+    // above. That was overbroad: the real method body's `registerScope(...)`
+    // calls for "request"/"session" have nothing to do with JSF — only the
+    // trailing `if (JSF_PRESENT) FacesDependencyRegistrar...` branch does,
+    // and `JSF_PRESENT` is already forced false by the `ClassUtils.isPresent`
+    // override above. Blanket-stubbing the whole method silently dropped the
+    // request/session scope registrations, causing
+    // `IllegalStateException: No Scope registered for scope name 'session'`
+    // (aop.config.AopNamespaceHandlerScopeIntegrationTests). Let the real
+    // bytecode run instead.
     r.register(
         "org/springframework/boot/web/servlet/context/ServletWebServerApplicationContext",
         "registerWebApplicationScopes",
