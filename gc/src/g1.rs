@@ -36,6 +36,114 @@ use crate::region::{RegionType, RememberedSet};
 use crate::satb::SatbQueue;
 use cratonvm_types::{ClassId, ObjectRef, Value};
 
+#[inline]
+unsafe fn value_from_unaligned_ptr(ptr: *const u8) -> Value {
+    // SAFETY: callers only pass bytes copied from a valid `Value` slot.
+    unsafe { std::ptr::read_unaligned(ptr as *const Value) }
+}
+
+#[inline]
+unsafe fn value_to_unaligned_ptr(value: Value, ptr: *mut u8) {
+    // SAFETY: the byte buffer is large enough for one `Value`; alignment is
+    // intentionally not assumed because stack `[u8; N]` buffers are align-1.
+    unsafe { std::ptr::write_unaligned(ptr as *mut Value, value) };
+}
+
+#[inline]
+fn value_from_bytes(bytes: &[u8; SLOT_SIZE]) -> Value {
+    // SAFETY: callers only pass bytes copied from a valid `Value` slot.
+    unsafe { value_from_unaligned_ptr(bytes.as_ptr()) }
+}
+
+#[inline]
+fn value_to_bytes(value: Value, bytes: &mut [u8; SLOT_SIZE]) {
+    // SAFETY: the byte buffer is large enough for one `Value`.
+    unsafe { value_to_unaligned_ptr(value, bytes.as_mut_ptr()) };
+}
+
+#[inline]
+unsafe fn array_element_from_unaligned_ptr(element_type: ArrayElementType, p: *const u8) -> Value {
+    // SAFETY: `p` points at the native-endian bytes for one array element.
+    unsafe {
+        match element_type {
+            ArrayElementType::Int => Value::Int(std::ptr::read_unaligned(p as *const i32)),
+            ArrayElementType::Long => Value::Long(std::ptr::read_unaligned(p as *const i64)),
+            ArrayElementType::Float => Value::Float(std::ptr::read_unaligned(p as *const f32)),
+            ArrayElementType::Double => Value::Double(std::ptr::read_unaligned(p as *const f64)),
+            ArrayElementType::Byte | ArrayElementType::Boolean => {
+                Value::Int(std::ptr::read_unaligned(p as *const i8) as i32)
+            }
+            ArrayElementType::Short => Value::Int(std::ptr::read_unaligned(p as *const i16) as i32),
+            ArrayElementType::Char => Value::Int(std::ptr::read_unaligned(p as *const u16) as i32),
+            ArrayElementType::Reference => {
+                let r: u64 = std::ptr::read_unaligned(p as *const u64);
+                if r == 0 {
+                    Value::Object(None)
+                } else {
+                    Value::Object(Some(ObjectRef::from_raw(r as usize as *mut u8)))
+                }
+            }
+        }
+    }
+}
+
+#[inline]
+fn array_element_from_bytes(element_type: ArrayElementType, raw: &[u8; 8]) -> Value {
+    // SAFETY: `raw` holds the native-endian bytes for one array element.
+    unsafe { array_element_from_unaligned_ptr(element_type, raw.as_ptr()) }
+}
+
+#[inline]
+unsafe fn array_element_to_unaligned_ptr(element_type: ArrayElementType, value: Value, p: *mut u8) {
+    // SAFETY: every write is at most 8 bytes and the destination may be align-1.
+    unsafe {
+        match element_type {
+            ArrayElementType::Int => {
+                std::ptr::write_unaligned(p as *mut i32, value.as_int().unwrap_or(0))
+            }
+            ArrayElementType::Long => {
+                std::ptr::write_unaligned(p as *mut i64, value.as_long().unwrap_or(0))
+            }
+            ArrayElementType::Float => std::ptr::write_unaligned(
+                p as *mut f32,
+                match value {
+                    Value::Float(f) => f,
+                    _ => 0.0,
+                },
+            ),
+            ArrayElementType::Double => std::ptr::write_unaligned(
+                p as *mut f64,
+                match value {
+                    Value::Double(d) => d,
+                    _ => 0.0,
+                },
+            ),
+            ArrayElementType::Byte | ArrayElementType::Boolean => {
+                std::ptr::write_unaligned(p as *mut i8, value.as_int().unwrap_or(0) as i8)
+            }
+            ArrayElementType::Short => {
+                std::ptr::write_unaligned(p as *mut i16, value.as_int().unwrap_or(0) as i16)
+            }
+            ArrayElementType::Char => {
+                std::ptr::write_unaligned(p as *mut u16, value.as_int().unwrap_or(0) as u16)
+            }
+            ArrayElementType::Reference => {
+                let r: u64 = match value {
+                    Value::Object(Some(r)) => r.as_ptr() as u64,
+                    _ => 0u64,
+                };
+                std::ptr::write_unaligned(p as *mut u64, r)
+            }
+        }
+    }
+}
+
+#[inline]
+fn array_element_to_bytes(element_type: ArrayElementType, value: Value, raw: &mut [u8; 8]) {
+    // SAFETY: every write is at most 8 bytes.
+    unsafe { array_element_to_unaligned_ptr(element_type, value, raw.as_mut_ptr()) };
+}
+
 // ---------------------------------------------------------------------------
 // Configuration
 // ---------------------------------------------------------------------------
@@ -3726,8 +3834,7 @@ impl G1Collector {
                     ) {
                         continue;
                     }
-                    // SAFETY: `buf` holds an exact copy of the 16-byte Value slot.
-                    unsafe { std::ptr::read(buf.as_ptr() as *const Value) }
+                    value_from_bytes(&buf)
                 } else {
                     // SAFETY: slot_idx < num_slots, within the allocated object.
                     let slot_ptr = unsafe { obj_ptr.add(HEADER_SIZE + payload_off) };
@@ -4373,11 +4480,12 @@ impl G1Collector {
         // Use the GarbageCollector trait's alloc_object to get the raw
         // object, then populate primitive slots.
         let obj = GarbageCollector::alloc_object(self, class_id, num_fields);
-        let n = num_fields.min(descriptor_bytes.len());
-        for i in 0..n {
-            if let Some(default) = crate::heap::default_value_for_descriptor(descriptor_bytes[i]) {
-                GarbageCollector::set_field(self, obj, i, default);
-            }
+        for i in 0..num_fields {
+            let default = descriptor_bytes
+                .get(i)
+                .and_then(|desc| crate::heap::default_value_for_descriptor(*desc))
+                .unwrap_or(Value::Object(None));
+            GarbageCollector::set_field(self, obj, i, default);
         }
         obj
     }
@@ -4390,11 +4498,12 @@ impl G1Collector {
         descriptor_bytes: &[u8],
     ) -> Option<ObjectRef> {
         let obj = self.try_alloc_object(class_id, num_fields)?;
-        let n = num_fields.min(descriptor_bytes.len());
-        for i in 0..n {
-            if let Some(default) = crate::heap::default_value_for_descriptor(descriptor_bytes[i]) {
-                GarbageCollector::set_field(self, obj, i, default);
-            }
+        for i in 0..num_fields {
+            let default = descriptor_bytes
+                .get(i)
+                .and_then(|desc| crate::heap::default_value_for_descriptor(*desc))
+                .unwrap_or(Value::Object(None));
+            GarbageCollector::set_field(self, obj, i, default);
         }
         Some(obj)
     }
@@ -5088,9 +5197,7 @@ impl GarbageCollector for G1Collector {
                     SLOT_SIZE,
                     false,
                 ) {
-                    // SAFETY: `tmp` holds an exact copy of the 16-byte `Value`
-                    // slot bit pattern that was stored by `set_field`.
-                    return unsafe { std::ptr::read(tmp.as_ptr() as *const Value) };
+                    return value_from_bytes(&tmp);
                 }
                 return Value::Object(None);
             }
@@ -5157,10 +5264,7 @@ impl GarbageCollector for G1Collector {
             let regions = self.regions.lock();
             if let Some((start, total_payload)) = self.humongous_span(&regions, obj, total_size) {
                 let mut tmp = [0u8; SLOT_SIZE];
-                // SAFETY: copy the 16-byte `Value` bit pattern into a byte buf.
-                unsafe {
-                    std::ptr::write(tmp.as_mut_ptr() as *mut Value, value);
-                }
+                value_to_bytes(value, &mut tmp);
                 self.humongous_copy(
                     &regions,
                     start,
@@ -5278,29 +5382,7 @@ impl GarbageCollector for G1Collector {
                 }
             }
         }
-        let p = raw.as_ptr();
-        // SAFETY: `raw` holds `elem_size` valid bytes for `element_type`.
-        Ok(match element_type {
-            ArrayElementType::Int => Value::Int(unsafe { std::ptr::read(p as *const i32) }),
-            ArrayElementType::Long => Value::Long(unsafe { std::ptr::read(p as *const i64) }),
-            ArrayElementType::Float => Value::Float(unsafe { std::ptr::read(p as *const f32) }),
-            ArrayElementType::Double => Value::Double(unsafe { std::ptr::read(p as *const f64) }),
-            ArrayElementType::Byte | ArrayElementType::Boolean => {
-                Value::Int(unsafe { std::ptr::read(p as *const i8) } as i32)
-            }
-            ArrayElementType::Short => {
-                Value::Int(unsafe { std::ptr::read(p as *const i16) } as i32)
-            }
-            ArrayElementType::Char => Value::Int(unsafe { std::ptr::read(p as *const u16) } as i32),
-            ArrayElementType::Reference => {
-                let r: u64 = unsafe { std::ptr::read(p as *const u64) };
-                if r == 0 {
-                    Value::Object(None)
-                } else {
-                    Value::Object(Some(unsafe { ObjectRef::from_raw(r as usize as *mut u8) }))
-                }
-            }
-        })
+        Ok(array_element_from_bytes(element_type, &raw))
     }
 
     fn set_array_element(&self, obj: ObjectRef, index: usize, value: Value) -> Result<(), i32> {
@@ -5324,48 +5406,7 @@ impl GarbageCollector for G1Collector {
 
         // Encode the element value into a fixed byte buffer.
         let mut raw = [0u8; 8];
-        let p = raw.as_mut_ptr();
-        // SAFETY: each write stays within `raw`'s 8 bytes (elem_size <= 8).
-        unsafe {
-            match element_type {
-                ArrayElementType::Int => {
-                    std::ptr::write(p as *mut i32, value.as_int().unwrap_or(0))
-                }
-                ArrayElementType::Long => {
-                    std::ptr::write(p as *mut i64, value.as_long().unwrap_or(0))
-                }
-                ArrayElementType::Float => std::ptr::write(
-                    p as *mut f32,
-                    match value {
-                        Value::Float(f) => f,
-                        _ => 0.0,
-                    },
-                ),
-                ArrayElementType::Double => std::ptr::write(
-                    p as *mut f64,
-                    match value {
-                        Value::Double(d) => d,
-                        _ => 0.0,
-                    },
-                ),
-                ArrayElementType::Byte | ArrayElementType::Boolean => {
-                    std::ptr::write(p as *mut i8, value.as_int().unwrap_or(0) as i8)
-                }
-                ArrayElementType::Short => {
-                    std::ptr::write(p as *mut i16, value.as_int().unwrap_or(0) as i16)
-                }
-                ArrayElementType::Char => {
-                    std::ptr::write(p as *mut u16, value.as_int().unwrap_or(0) as u16)
-                }
-                ArrayElementType::Reference => {
-                    let r: u64 = match value {
-                        Value::Object(Some(r)) => r.as_ptr() as u64,
-                        _ => 0u64,
-                    };
-                    std::ptr::write(p as *mut u64, r)
-                }
-            }
-        }
+        array_element_to_bytes(element_type, value, &mut raw);
 
         // Write the raw bytes back — flat single-region path or humongous
         // region-translated path. Either way the write is bounds-confined.
@@ -5785,7 +5826,8 @@ mod tests {
     /// STW invariant is trivially satisfied.
     #[inline]
     fn stw() -> crate::collector::StopTheWorldToken {
-        crate::collector::StopTheWorldToken::new()
+        // SAFETY: these unit tests run the heap single-threaded.
+        unsafe { crate::collector::StopTheWorldToken::new() }
     }
 
     fn small_config() -> G1CollectorConfig {
@@ -5804,6 +5846,94 @@ mod tests {
 
     fn make_collector() -> G1Collector {
         G1Collector::new(small_config())
+    }
+
+    fn unaligned_ptr(buf: &mut [u8], align: usize) -> *mut u8 {
+        for offset in 0..align {
+            let ptr = unsafe { buf.as_mut_ptr().add(offset) };
+            if (ptr as usize) % align != 0 {
+                return ptr;
+            }
+        }
+        unreachable!("buffer base cannot be aligned to every offset")
+    }
+
+    #[test]
+    fn scratch_value_helpers_accept_unaligned_buffers() {
+        let gc = make_collector();
+        let obj = gc.alloc_object(ClassId::new(99), 0);
+        let values = [
+            Value::Int(-7),
+            Value::Long(0x0123_4567_89ab_cdef),
+            Value::Float(1.25),
+            Value::Double(-9.5),
+            Value::Object(None),
+            Value::Object(Some(obj)),
+            Value::ReturnAddress(0x1234),
+            Value::Uninitialized,
+        ];
+        let mut backing = [0u8; SLOT_SIZE + 8];
+        let ptr = unaligned_ptr(&mut backing, std::mem::align_of::<Value>());
+
+        for value in values {
+            backing.fill(0xa5);
+            unsafe {
+                value_to_unaligned_ptr(value, ptr);
+                assert_eq!(value_from_unaligned_ptr(ptr), value);
+            }
+        }
+    }
+
+    #[test]
+    fn scratch_array_element_helpers_accept_unaligned_buffers() {
+        let gc = make_collector();
+        let obj = gc.alloc_object(ClassId::new(100), 0);
+        let cases = [
+            (ArrayElementType::Int, Value::Int(-123_456)),
+            (ArrayElementType::Long, Value::Long(0x1020_3040_5060_7080)),
+            (ArrayElementType::Float, Value::Float(3.5)),
+            (ArrayElementType::Double, Value::Double(-17.25)),
+            (ArrayElementType::Byte, Value::Int(-5)),
+            (ArrayElementType::Boolean, Value::Int(1)),
+            (ArrayElementType::Short, Value::Int(-1234)),
+            (ArrayElementType::Char, Value::Int(0x03bb)),
+            (ArrayElementType::Reference, Value::Object(None)),
+            (ArrayElementType::Reference, Value::Object(Some(obj))),
+        ];
+        let mut backing = [0u8; 16];
+        let ptr = unaligned_ptr(&mut backing, std::mem::align_of::<u64>());
+
+        for (element_type, value) in cases {
+            backing.fill(0x5a);
+            unsafe {
+                array_element_to_unaligned_ptr(element_type, value, ptr);
+                assert_eq!(array_element_from_unaligned_ptr(element_type, ptr), value);
+            }
+        }
+    }
+
+    #[test]
+    fn descriptor_defaults_initialize_reference_and_tail_slots() {
+        let gc = make_collector();
+        let obj = gc.alloc_object_with_descriptors(ClassId::new(7), 4, b"IL");
+
+        assert_eq!(gc.get_field(obj, 0), Value::Int(0));
+        assert_eq!(gc.get_field(obj, 1), Value::Object(None));
+        assert_eq!(gc.get_field(obj, 2), Value::Object(None));
+        assert_eq!(gc.get_field(obj, 3), Value::Object(None));
+    }
+
+    #[test]
+    fn try_descriptor_defaults_initialize_reference_and_tail_slots() {
+        let gc = make_collector();
+        let obj = gc
+            .try_alloc_object_with_descriptors(ClassId::new(8), 4, b"JL")
+            .expect("small descriptor-aware allocation should fit");
+
+        assert_eq!(gc.get_field(obj, 0), Value::Long(0));
+        assert_eq!(gc.get_field(obj, 1), Value::Object(None));
+        assert_eq!(gc.get_field(obj, 2), Value::Object(None));
+        assert_eq!(gc.get_field(obj, 3), Value::Object(None));
     }
 
     // -- Config defaults --

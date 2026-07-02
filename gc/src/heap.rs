@@ -2435,7 +2435,8 @@ mod tests {
         /// no other mutator is touching the heap concurrently.
         #[inline]
         fn stw() -> crate::collector::StopTheWorldToken {
-            crate::collector::StopTheWorldToken::new()
+            // SAFETY: these unit tests run the heap single-threaded.
+            unsafe { crate::collector::StopTheWorldToken::new() }
         }
 
         #[test]

@@ -168,7 +168,8 @@ fn heap_reachable_after_gc(ops: &[Op], root_ids: &[usize]) -> HashSet<usize> {
                 heap.set_field(all_nodes[s], f, Value::Object(None));
             }
             Op::Gc => {
-                let stw = cratonvm_gc::collector::StopTheWorldToken::new_unchecked();
+                // SAFETY: this property test drives the heap single-threaded.
+                let stw = unsafe { cratonvm_gc::collector::StopTheWorldToken::new_unchecked() };
                 let _ = heap.collect_garbage(&stw, &mut all_nodes, &NoMonitors);
             }
         }
@@ -179,7 +180,8 @@ fn heap_reachable_after_gc(ops: &[Op], root_ids: &[usize]) -> HashSet<usize> {
     // and everything reachable MUST survive with intact internal
     // edges.
     let mut roots: Vec<ObjectRef> = root_ids.iter().map(|&i| all_nodes[i]).collect();
-    let stw = cratonvm_gc::collector::StopTheWorldToken::new_unchecked();
+    // SAFETY: this property test drives the heap single-threaded.
+    let stw = unsafe { cratonvm_gc::collector::StopTheWorldToken::new_unchecked() };
     let _ = heap.collect_garbage(&stw, &mut roots, &NoMonitors);
 
     // Walk the heap from the (now possibly remapped) roots and

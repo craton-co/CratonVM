@@ -7041,7 +7041,8 @@ mod tests {
     /// trivially satisfies the STW invariant — no other mutator exists.
     #[inline]
     fn stw() -> crate::collector::StopTheWorldToken {
-        crate::collector::StopTheWorldToken::new()
+        // SAFETY: these unit tests run the heap single-threaded.
+        unsafe { crate::collector::StopTheWorldToken::new() }
     }
 
     /// Create a small generational heap for testing.

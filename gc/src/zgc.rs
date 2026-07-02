@@ -2781,7 +2781,8 @@ mod tests {
         let before = heap.allocated_bytes();
         assert!(before > 0);
 
-        let stw = StopTheWorldToken::new();
+        // SAFETY: these unit tests run the heap single-threaded.
+        let stw = unsafe { StopTheWorldToken::new() };
         let mut roots = [live];
         let result = heap.collect_garbage(&stw, &mut roots, &NoMonitors);
 
@@ -2805,7 +2806,8 @@ mod tests {
         heap.set_field(a, 0, Value::Object(Some(b)));
         let _garbage = heap.alloc_object(ClassId::new(3), 1);
 
-        let stw = StopTheWorldToken::new();
+        // SAFETY: these unit tests run the heap single-threaded.
+        let stw = unsafe { StopTheWorldToken::new() };
         let mut roots = [a];
         let result = heap.collect_garbage(&stw, &mut roots, &NoMonitors);
 
@@ -2826,7 +2828,8 @@ mod tests {
         heap.set_array_element(arr, 0, Value::Object(Some(elem)))
             .unwrap();
 
-        let stw = StopTheWorldToken::new();
+        // SAFETY: these unit tests run the heap single-threaded.
+        let stw = unsafe { StopTheWorldToken::new() };
         let mut roots = [arr];
         let result = heap.collect_garbage(&stw, &mut roots, &NoMonitors);
 
@@ -2847,7 +2850,8 @@ mod tests {
         for _ in 0..10 {
             heap.alloc_object(ClassId::new(1), 4);
         }
-        let stw = StopTheWorldToken::new();
+        // SAFETY: these unit tests run the heap single-threaded.
+        let stw = unsafe { StopTheWorldToken::new() };
         let mut roots: [ObjectRef; 0] = [];
         heap.collect_garbage(&stw, &mut roots, &NoMonitors);
         assert_eq!(heap.allocated_bytes(), 0);
@@ -2880,7 +2884,8 @@ mod tests {
         heap.set_field(weak, 0, Value::Object(Some(referent)));
         heap.discover_reference(ReferenceType::Weak, weak, referent, None);
 
-        let stw = StopTheWorldToken::new();
+        // SAFETY: these unit tests run the heap single-threaded.
+        let stw = unsafe { StopTheWorldToken::new() };
         // Root only the Reference object; the referent is otherwise dead.
         let mut roots = [weak];
         heap.collect_garbage(&stw, &mut roots, &NoMonitors);
@@ -2897,7 +2902,8 @@ mod tests {
         heap.set_field(weak, 0, Value::Object(Some(referent)));
         heap.discover_reference(ReferenceType::Weak, weak, referent, None);
 
-        let stw = StopTheWorldToken::new();
+        // SAFETY: these unit tests run the heap single-threaded.
+        let stw = unsafe { StopTheWorldToken::new() };
         // Root both: the referent stays strongly reachable, so the weak ref
         // must NOT be cleared.
         let mut roots = [weak, referent];
@@ -2918,7 +2924,8 @@ mod tests {
         heap.set_field(phantom, 0, Value::Object(Some(referent)));
         heap.discover_reference(ReferenceType::Phantom, phantom, referent, Some(queue));
 
-        let stw = StopTheWorldToken::new();
+        // SAFETY: these unit tests run the heap single-threaded.
+        let stw = unsafe { StopTheWorldToken::new() };
         // Root the phantom Reference and its queue; the referent is dead.
         let mut roots = [phantom, queue];
         heap.collect_garbage(&stw, &mut roots, &NoMonitors);
