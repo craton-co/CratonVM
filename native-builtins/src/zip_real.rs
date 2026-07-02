@@ -434,8 +434,31 @@ fn defl_deflate_bytes_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     ))))
 }
 
-fn defl_deflate_stub(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    Ok(Some(Value::Long(0)))
+fn defl_direct_buffer_unsupported(which: &str) -> MethodCallResult {
+    Err(RuntimeError::NotImplemented {
+        feature: format!(
+            "Deflater.{which}: direct-ByteBuffer deflate is not supported \
+             (this VM has no raw-memory view of direct buffers); use an \
+             array-backed Deflater path"
+        ),
+    }
+    .into())
+}
+
+fn defl_deflate_bytes_buffer(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    // input: byte[], output: direct ByteBuffer. Cannot write the direct output
+    // buffer, so returning packed zero would make Java retry forever.
+    defl_direct_buffer_unsupported("deflateBytesBuffer")
+}
+
+fn defl_deflate_buffer_bytes(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    // input: direct ByteBuffer, output: byte[]. Cannot read the direct input.
+    defl_direct_buffer_unsupported("deflateBufferBytes")
+}
+
+fn defl_deflate_buffer_buffer(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    // Both sides are direct ByteBuffers.
+    defl_direct_buffer_unsupported("deflateBufferBuffer")
 }
 
 fn defl_get_adler(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
@@ -614,9 +637,24 @@ pub fn register_zip_real_natives(r: &mut NativeMethodRegistry) {
         "(J[BII[BIIII)J",
         defl_deflate_bytes_bytes,
     );
-    r.register(dl, "deflateBytesBuffer", "(J[BIIJIII)J", defl_deflate_stub);
-    r.register(dl, "deflateBufferBytes", "(JJI[BIIII)J", defl_deflate_stub);
-    r.register(dl, "deflateBufferBuffer", "(JJIJIII)J", defl_deflate_stub);
+    r.register(
+        dl,
+        "deflateBytesBuffer",
+        "(J[BIIJIII)J",
+        defl_deflate_bytes_buffer,
+    );
+    r.register(
+        dl,
+        "deflateBufferBytes",
+        "(JJI[BIIII)J",
+        defl_deflate_buffer_bytes,
+    );
+    r.register(
+        dl,
+        "deflateBufferBuffer",
+        "(JJIJIII)J",
+        defl_deflate_buffer_buffer,
+    );
     r.register(dl, "getAdler", "(J)I", defl_get_adler);
     r.register(dl, "reset", "(J)V", defl_reset);
     r.register(dl, "end", "(J)V", defl_end);
@@ -648,8 +686,23 @@ pub fn register_zip_real_natives(r: &mut NativeMethodRegistry) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_utils::mock_ctx;
     use flate2::{write::DeflateEncoder, Compression};
     use std::io::Write;
+
+    fn assert_direct_deflate_unsupported(result: MethodCallResult) {
+        match result {
+            Err(cratonvm_types::error::MethodCallFailed::InternalError(
+                cratonvm_types::error::VmError::Runtime(RuntimeError::NotImplemented {
+                    feature,
+                }),
+            )) => assert!(
+                feature.contains("direct-ByteBuffer deflate"),
+                "unexpected NotImplemented feature text: {feature}"
+            ),
+            other => panic!("expected direct deflate NotImplemented error, got {other:?}"),
+        }
+    }
 
     #[test]
     fn round_trip_inflate_raw() {
@@ -687,6 +740,14 @@ mod tests {
         // "abc" — CRC-32/IEEE = 0x352441C2.
         let running = crc32_step(0xFFFF_FFFF, b"abc");
         assert_eq!(!running, 0x3524_41C2);
+    }
+
+    #[test]
+    fn direct_buffer_deflate_paths_throw_instead_of_zero_progress() {
+        let mut ctx = mock_ctx();
+        assert_direct_deflate_unsupported(defl_deflate_bytes_buffer(&mut ctx, &[]));
+        assert_direct_deflate_unsupported(defl_deflate_buffer_bytes(&mut ctx, &[]));
+        assert_direct_deflate_unsupported(defl_deflate_buffer_buffer(&mut ctx, &[]));
     }
 
     /// `crc32_update_public` matches the JDK `CRC32.update*` contract:

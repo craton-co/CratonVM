@@ -4,7 +4,7 @@
 //! System, Runtime, ProcessBuilder, and Thread native method implementations.
 
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
-use cratonvm_types::error::{MethodCallResult, RuntimeError};
+use cratonvm_types::error::{LinkageError, MethodCallFailed, MethodCallResult, RuntimeError};
 use cratonvm_types::{ObjectRef, Value};
 
 use crate::{alloc_concurrent_synthetic, obj_arg, platform_lib_name};
@@ -2565,6 +2565,155 @@ pub(crate) fn native_array_multi_new_array(
     Ok(Some(Value::Object(Some(arr))))
 }
 
+const CLASS_FILE_MAGIC: [u8; 4] = [0xCA, 0xFE, 0xBA, 0xBE];
+
+fn define_class_format_error(class_name: &str, method: &str, message: String) -> MethodCallFailed {
+    LinkageError::ClassFormatError {
+        class_name: class_name.to_string(),
+        message: format!("{method}: {message}"),
+    }
+    .into()
+}
+
+fn validate_classfile_header(
+    class_name: &str,
+    method: &str,
+    bytes: &[u8],
+) -> Result<(), MethodCallFailed> {
+    if bytes.len() < 8 || bytes[0..4] != CLASS_FILE_MAGIC {
+        return Err(define_class_format_error(
+            class_name,
+            method,
+            "not a valid class file (bad magic)".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn read_define_class_nonnegative_int(
+    args: &[Value],
+    idx: usize,
+) -> Result<usize, MethodCallFailed> {
+    match args.get(idx) {
+        Some(Value::Int(v)) if *v >= 0 => Ok(*v as usize),
+        Some(Value::Int(v)) => {
+            Err(RuntimeError::ArrayIndexOutOfBoundsException { index: *v }.into())
+        }
+        _ => Ok(0),
+    }
+}
+
+fn read_byte_array_define_class_slice(
+    ctx: &dyn NativeContext,
+    array: ObjectRef,
+    offset: usize,
+    length: usize,
+) -> Result<Vec<u8>, MethodCallFailed> {
+    let arr_len = ctx.array_length(array);
+    let end = offset
+        .checked_add(length)
+        .ok_or_else(|| RuntimeError::ArrayIndexOutOfBoundsException { index: i32::MAX })?;
+    if end > arr_len {
+        return Err(RuntimeError::ArrayIndexOutOfBoundsException {
+            index: end.min(i32::MAX as usize) as i32,
+        }
+        .into());
+    }
+
+    let mut bytes = Vec::with_capacity(length);
+    for i in 0..length {
+        match ctx.get_array_element(array, offset + i) {
+            Value::Int(b) => bytes.push((b & 0xFF) as u8),
+            _ => bytes.push(0),
+        }
+    }
+    Ok(bytes)
+}
+
+fn read_byte_buffer_define_class_slice(
+    ctx: &dyn NativeContext,
+    bb: ObjectRef,
+    offset: usize,
+    length: usize,
+    class_name: &str,
+) -> Result<Vec<u8>, MethodCallFailed> {
+    let pos_slot = 1;
+    let limit_slot = 2;
+    let capacity_slot = 3;
+
+    if let Value::Object(Some(array)) = ctx.get_field(bb, 0) {
+        let pos = ctx.get_field(bb, pos_slot).as_int().unwrap_or(0).max(0) as usize;
+        let limit = ctx
+            .get_field(bb, limit_slot)
+            .as_int()
+            .unwrap_or_else(|| ctx.array_length(array) as i32)
+            .max(0) as usize;
+        let cap = ctx.array_length(array);
+        let absolute_off = pos
+            .checked_add(offset)
+            .ok_or_else(|| RuntimeError::ArrayIndexOutOfBoundsException { index: i32::MAX })?;
+        let upper = limit.min(cap);
+        let end = absolute_off
+            .checked_add(length)
+            .ok_or_else(|| RuntimeError::ArrayIndexOutOfBoundsException { index: i32::MAX })?;
+        if end > upper {
+            return Err(RuntimeError::ArrayIndexOutOfBoundsException {
+                index: end.min(i32::MAX as usize) as i32,
+            }
+            .into());
+        }
+        return read_byte_array_define_class_slice(ctx, array, absolute_off, length);
+    }
+
+    let addr = match ctx.get_field_by_name(bb, "address") {
+        Value::Long(v) => v,
+        _ => 0,
+    };
+    let pos = ctx.get_field(bb, pos_slot).as_int().unwrap_or(0).max(0) as usize;
+    let cap = ctx
+        .get_field(bb, capacity_slot)
+        .as_int()
+        .unwrap_or(0)
+        .max(0) as usize;
+    let limit = ctx
+        .get_field(bb, limit_slot)
+        .as_int()
+        .unwrap_or(cap as i32)
+        .max(0) as usize;
+    if addr == 0 {
+        return Err(define_class_format_error(
+            class_name,
+            "defineClass2",
+            "direct ByteBuffer has no native address".to_string(),
+        ));
+    }
+    let absolute_off = pos
+        .checked_add(offset)
+        .ok_or_else(|| RuntimeError::ArrayIndexOutOfBoundsException { index: i32::MAX })?;
+    let upper = limit.min(cap);
+    let end = absolute_off
+        .checked_add(length)
+        .ok_or_else(|| RuntimeError::ArrayIndexOutOfBoundsException { index: i32::MAX })?;
+    if end > upper {
+        return Err(RuntimeError::ArrayIndexOutOfBoundsException {
+            index: end.min(i32::MAX as usize) as i32,
+        }
+        .into());
+    }
+    let mut out = vec![0u8; length];
+    if length > 0 {
+        let src = addr.wrapping_add(absolute_off as i64);
+        if !ctx.copy_from_native_memory(src, &mut out) {
+            return Err(define_class_format_error(
+                class_name,
+                "defineClass2",
+                format!("direct ByteBuffer copy failed (addr={src:#x}, len={length})"),
+            ));
+        }
+    }
+    Ok(out)
+}
+
 /// `ClassLoader.defineClass1(ClassLoader, String, byte[], int, int, ProtectionDomain, String) → Class`
 ///
 /// Defines a class from a byte array. WP2.3: routes through
@@ -2687,35 +2836,18 @@ pub(crate) fn native_classloader_define_class1(
 
     let byte_array = match args.get(2) {
         Some(Value::Object(Some(arr))) => *arr,
-        _ => return Ok(Some(Value::Object(None))),
-    };
-
-    let offset = match args.get(3) {
-        Some(Value::Int(o)) if *o >= 0 => *o as usize,
-        _ => 0,
-    };
-
-    let length = match args.get(4) {
-        Some(Value::Int(l)) if *l >= 0 => *l as usize,
-        _ => 0,
-    };
-
-    // Extract bytes from the Java byte array
-    let arr_len = ctx.array_length(byte_array);
-    if offset.saturating_add(length) > arr_len {
-        return Err(RuntimeError::ArrayIndexOutOfBoundsException {
-            index: (offset + length) as i32,
+        _ => {
+            return Err(RuntimeError::NullPointerException {
+                message: Some("defineClass1: byte[] is null".to_string()),
+            }
+            .into());
         }
-        .into());
-    }
+    };
 
-    let mut bytes = Vec::with_capacity(length);
-    for i in 0..length {
-        match ctx.get_array_element(byte_array, offset + i) {
-            Value::Int(b) => bytes.push(b as u8),
-            _ => bytes.push(0),
-        }
-    }
+    let offset = read_define_class_nonnegative_int(args, 3)?;
+    let length = read_define_class_nonnegative_int(args, 4)?;
+    let bytes = read_byte_array_define_class_slice(ctx, byte_array, offset, length)?;
+    validate_classfile_header(&name, "defineClass1", &bytes)?;
 
     // Loader id from arg 0 (synthetic ClassLoader); 0 = app loader.
     let loader_id = match args.first() {
@@ -2797,7 +2929,89 @@ pub(crate) fn native_classloader_define_class1(
         }
         Err(msg) => {
             tracing::warn!("ClassLoader.defineClass1({name}) failed: {msg}");
-            Ok(Some(Value::Object(None)))
+            Err(define_class_format_error(&name, "defineClass1", msg))
+        }
+    }
+}
+
+/// `ClassLoader.defineClass2(ClassLoader, String, ByteBuffer, int, int, ProtectionDomain, String) -> Class`
+pub(crate) fn native_classloader_define_class2(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let name = match args.get(1) {
+        Some(Value::Object(Some(s))) => {
+            let n = ctx.read_string(*s).unwrap_or_default();
+            n.replace('.', "/")
+        }
+        _ => String::new(),
+    };
+
+    let byte_buffer = match args.get(2) {
+        Some(Value::Object(Some(bb))) => *bb,
+        _ => {
+            return Err(RuntimeError::NullPointerException {
+                message: Some("defineClass2: ByteBuffer is null".to_string()),
+            }
+            .into());
+        }
+    };
+
+    let offset = read_define_class_nonnegative_int(args, 3)?;
+    let length = read_define_class_nonnegative_int(args, 4)?;
+    let bytes = read_byte_buffer_define_class_slice(ctx, byte_buffer, offset, length, &name)?;
+    validate_classfile_header(&name, "defineClass2", &bytes)?;
+
+    let loader_id = match args.first() {
+        Some(Value::Object(Some(loader_obj))) => {
+            let mut lid = match ctx.get_field(*loader_obj, 6) {
+                Value::Int(v) if v > 0 => v as u32,
+                _ => 0,
+            };
+            if lid == 0 && crate::classloader::is_user_defined_loader(ctx, *loader_obj) {
+                if crate::classloader::loader_aware_resolution()
+                    || ctx.class_id_by_name(&name).is_some()
+                {
+                    lid = crate::classloader::loader_namespace_id(ctx, *loader_obj);
+                }
+            }
+            lid
+        }
+        _ => 0,
+    };
+
+    let mut pd_url: Option<String> = None;
+    if let Some(Value::Object(Some(pd))) = args.get(5) {
+        if let Value::Object(Some(cs)) = ctx.get_field(*pd, 0) {
+            if let Some(s) = ctx.read_string(cs) {
+                pd_url = Some(s);
+            } else if let Value::Object(Some(url)) = ctx.get_field(cs, 0) {
+                if let Some(s) = ctx.read_string(url) {
+                    pd_url = Some(s);
+                }
+            }
+        }
+    }
+
+    if let Some(Value::Object(Some(loader_obj))) = args.first() {
+        preload_supertypes_via_loader(ctx, *loader_obj, &bytes);
+    }
+
+    let opts = cratonvm_native_api::DefineClassFull {
+        code_source_url: pd_url,
+        ..Default::default()
+    };
+    match ctx.define_class_full(&name, &bytes, loader_id, opts) {
+        Ok(class_id) => {
+            if let Some(Value::Object(Some(loader_obj))) = args.first() {
+                crate::classloader::register_defining_loader(class_id.as_u32(), *loader_obj);
+            }
+            let mirror = ctx.get_class_mirror(class_id);
+            Ok(Some(Value::Object(Some(mirror))))
+        }
+        Err(msg) => {
+            tracing::warn!("ClassLoader.defineClass2({name}) failed: {msg}");
+            Err(define_class_format_error(&name, "defineClass2", msg))
         }
     }
 }
@@ -2824,34 +3038,18 @@ pub(crate) fn native_classloader_define_class0(
 
     let byte_array = match args.get(3) {
         Some(Value::Object(Some(arr))) => *arr,
-        _ => return Ok(Some(Value::Object(None))),
-    };
-
-    let offset = match args.get(4) {
-        Some(Value::Int(o)) if *o >= 0 => *o as usize,
-        _ => 0,
-    };
-
-    let length = match args.get(5) {
-        Some(Value::Int(l)) if *l >= 0 => *l as usize,
-        _ => 0,
-    };
-
-    let arr_len = ctx.array_length(byte_array);
-    if offset.saturating_add(length) > arr_len {
-        return Err(RuntimeError::ArrayIndexOutOfBoundsException {
-            index: (offset + length) as i32,
+        _ => {
+            return Err(RuntimeError::NullPointerException {
+                message: Some("defineClass0: byte[] is null".to_string()),
+            }
+            .into());
         }
-        .into());
-    }
+    };
 
-    let mut bytes = Vec::with_capacity(length);
-    for i in 0..length {
-        match ctx.get_array_element(byte_array, offset + i) {
-            Value::Int(b) => bytes.push(b as u8),
-            _ => bytes.push(0),
-        }
-    }
+    let offset = read_define_class_nonnegative_int(args, 4)?;
+    let length = read_define_class_nonnegative_int(args, 5)?;
+    let bytes = read_byte_array_define_class_slice(ctx, byte_array, offset, length)?;
+    validate_classfile_header(&name, "defineClass0", &bytes)?;
 
     let loader_id = match args.first() {
         Some(Value::Object(Some(loader_obj))) => {
@@ -2939,7 +3137,11 @@ pub(crate) fn native_classloader_define_class0(
         }
         Err(msg) => {
             tracing::warn!("ClassLoader.defineClass0({effective_name}) failed: {msg}");
-            Ok(Some(Value::Object(None)))
+            Err(define_class_format_error(
+                &effective_name,
+                "defineClass0",
+                msg,
+            ))
         }
     }
 }
@@ -3350,11 +3552,11 @@ mod t15_tests {
     }
 
     // -----------------------------------------------------------------------
-    // T15.1.3 — ClassLoader.defineClass1
+    // T15.1.3 — ClassLoader.defineClass0/1/2
     // -----------------------------------------------------------------------
 
     #[test]
-    fn define_class1_empty_bytes_returns_null() {
+    fn define_class1_empty_bytes_throws() {
         let mut ctx = mock_ctx();
         // Create a byte array with non-CAFEBABE bytes
         let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 4);
@@ -3375,8 +3577,68 @@ mod t15_tests {
                 Value::Object(None), // source
             ],
         );
-        // Non-CAFEBABE bytes → define_class_from_bytes returns None → null
-        assert_eq!(r.unwrap(), Some(Value::Object(None)));
+        assert!(r.is_err(), "invalid class bytes must throw, not return null");
+    }
+
+    #[test]
+    fn define_class2_reads_bytebuffer_backing_array() {
+        let mut ctx = mock_ctx();
+        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 4);
+        for i in 0..4 {
+            ctx.set_array_element(arr, i, Value::Int(0));
+        }
+        let bb = ctx.alloc_object(cratonvm_types::ClassId::new(0), 4);
+        ctx.set_field(bb, 0, Value::Object(Some(arr)));
+        ctx.set_field(bb, 1, Value::Int(0));
+        ctx.set_field(bb, 2, Value::Int(4));
+        ctx.set_field(bb, 3, Value::Int(4));
+        let name = ctx.create_string("com/example/Foo");
+        let r = native_classloader_define_class2(
+            &mut ctx,
+            &[
+                Value::Object(None),
+                Value::Object(Some(name)),
+                Value::Object(Some(bb)),
+                Value::Int(0),
+                Value::Int(4),
+                Value::Object(None),
+                Value::Object(None),
+            ],
+        );
+        match r {
+            Err(cratonvm_types::error::MethodCallFailed::InternalError(
+                cratonvm_types::error::VmError::Linkage(
+                    cratonvm_types::error::LinkageError::ClassFormatError { message, .. },
+                ),
+            )) => assert!(
+                message.contains("defineClass2"),
+                "expected defineClass2 class-format failure, got {message}"
+            ),
+            other => panic!("expected ClassFormatError from ByteBuffer handler, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn define_class0_empty_bytes_throws() {
+        let mut ctx = mock_ctx();
+        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 4);
+        let name = ctx.create_string("com/example/Foo");
+        let r = native_classloader_define_class0(
+            &mut ctx,
+            &[
+                Value::Object(None),
+                Value::Object(None),
+                Value::Object(Some(name)),
+                Value::Object(Some(arr)),
+                Value::Int(0),
+                Value::Int(4),
+                Value::Object(None),
+                Value::Int(0),
+                Value::Int(0),
+                Value::Object(None),
+            ],
+        );
+        assert!(r.is_err(), "invalid class bytes must throw, not return null");
     }
 
     #[test]
