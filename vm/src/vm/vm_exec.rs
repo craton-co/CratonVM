@@ -12255,8 +12255,29 @@ fn invoke_on_class_shared_inner(
                         );
                     }
                 }
+                // Diagnostic aid: a NoSuchMethodError against a
+                // `is_synthetic_stub` class is almost always a masked
+                // classpath gap, not a genuine method-resolution bug — the
+                // class itself was never found on any classpath entry, so
+                // `create_synthetic_stub` fabricated an empty stand-in (see
+                // `is_enterprise_stub_prefix` in classloading/class_manager.rs)
+                // and every method call against it fails here. Tag the log
+                // line so this is diagnosable without a debug rebuild
+                // (previously required `RUST_LOG=debug` to see the separate
+                // "Falling back to synthetic stub" line and correlate it).
+                let stub_hint = if shared
+                    .class_manager
+                    .read()
+                    .get_class(class_id)
+                    .map(|c| c.is_synthetic_stub)
+                    .unwrap_or(false)
+                {
+                    " [class not found on any classpath entry — synthetic stub, add the missing jar]"
+                } else {
+                    ""
+                };
                 tracing::warn!(
-                    method = format!("{class_name}.{method_name}{descriptor}"),
+                    method = format!("{class_name}.{method_name}{descriptor}{stub_hint}"),
                     caller = thread
                         .frames
                         .last()
