@@ -125,14 +125,17 @@ struct Args {
     /// The optional value (`ALL-UNNAMED` or a module name) mirrors the JDK
     /// spelling but is accepted-and-ignored: CratonVM's gate is a single
     /// coarse process-wide toggle, not a per-module grant. The flag is also
-    /// accepted with no value at all (bare `--enable-native-access`). Because
-    /// clap accepts the long name directly, the JDK single-dash invocation
-    /// (`--enable-native-access=ALL-UNNAMED`) passes through unchanged.
+    /// accepted with no value at all (bare `--enable-native-access`). Optional
+    /// values must use `=` so a following main class is not consumed as the
+    /// module name. Because clap accepts the long name directly, the JDK
+    /// invocation (`--enable-native-access=ALL-UNNAMED`) passes through
+    /// unchanged.
     #[arg(
         long = "enable-native-access",
         value_name = "MODULE",
         num_args = 0..=1,
-        default_missing_value = "ALL-UNNAMED"
+        default_missing_value = "ALL-UNNAMED",
+        require_equals = true,
     )]
     enable_native_access: Option<String>,
 
@@ -518,6 +521,149 @@ fn expand_aggregate_jars(entries: Vec<String>) -> Vec<String> {
         out.extend(substitutes);
     }
     out
+}
+
+struct StagedArchiveCleanup {
+    path: std::path::PathBuf,
+}
+
+static STAGED_ARCHIVE_COPIES: std::sync::OnceLock<std::sync::Mutex<Vec<std::path::PathBuf>>> =
+    std::sync::OnceLock::new();
+
+fn staged_archive_copies() -> &'static std::sync::Mutex<Vec<std::path::PathBuf>> {
+    STAGED_ARCHIVE_COPIES.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
+
+fn lock_staged_archive_copies(
+    registry: &'static std::sync::Mutex<Vec<std::path::PathBuf>>,
+) -> std::sync::MutexGuard<'static, Vec<std::path::PathBuf>> {
+    match registry.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+fn remove_staged_archive_copy(path: &std::path::Path) {
+    if let Err(e) = std::fs::remove_file(path) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            tracing::warn!("failed to remove staged archive copy {}: {e}", path.display());
+        }
+    }
+}
+
+fn register_staged_archive_copy(path: std::path::PathBuf) {
+    lock_staged_archive_copies(staged_archive_copies()).push(path);
+}
+
+fn unregister_staged_archive_copy(path: &std::path::Path) {
+    if let Some(registry) = STAGED_ARCHIVE_COPIES.get() {
+        let mut guard = lock_staged_archive_copies(registry);
+        guard.retain(|registered| registered.as_path() != path);
+    }
+}
+
+fn cleanup_staged_archive_copies() {
+    if let Some(registry) = STAGED_ARCHIVE_COPIES.get() {
+        let paths: Vec<_> = {
+            let mut guard = lock_staged_archive_copies(registry);
+            guard.drain(..).collect()
+        };
+        for path in paths {
+            remove_staged_archive_copy(&path);
+        }
+    }
+}
+
+impl Drop for StagedArchiveCleanup {
+    fn drop(&mut self) {
+        unregister_staged_archive_copy(&self.path);
+        remove_staged_archive_copy(&self.path);
+    }
+}
+
+fn classpath_entry_for_archive(
+    archive_path: &std::path::Path,
+) -> Result<(std::path::PathBuf, Option<StagedArchiveCleanup>)> {
+    if archive_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("jar"))
+    {
+        return Ok((archive_path.to_path_buf(), None));
+    }
+
+    // JN3: ClassPath::new only accepts entries whose extension is `.jar`
+    // (or `.jmod`/`modules`). WARs, EARs, and other Java archive types are
+    // silently dropped, so stage a temporary `.jar` copy that remains alive
+    // until the launcher returns.
+    let stem = archive_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("app");
+    let pid = std::process::id();
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let dir = std::env::temp_dir();
+    let mut tmp = dir.join(format!("cratonvm-{pid}-{now_ms}-{stem}.jar"));
+    let mut dst_file = None;
+    for attempt in 0..16 {
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+        {
+            Ok(f) => {
+                dst_file = Some(f);
+                break;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                tmp = dir.join(format!("cratonvm-{pid}-{now_ms}-{attempt}-{stem}.jar"));
+            }
+            Err(e) => {
+                return Err(anyhow::Error::new(e).context(format!(
+                    "failed to stage {} as {} for classpath registration",
+                    archive_path.display(),
+                    tmp.display()
+                )));
+            }
+        }
+    }
+    let mut dst_file = dst_file.ok_or_else(|| {
+        anyhow::anyhow!(
+            "failed to stage {} for classpath registration: \
+             could not create a unique temp file in {}",
+            archive_path.display(),
+            dir.display()
+        )
+    })?;
+    let copy_result = (|| -> Result<()> {
+        let mut src_file = std::fs::File::open(archive_path).with_context(|| {
+            format!("failed to open {} for staging", archive_path.display())
+        })?;
+        std::io::copy(&mut src_file, &mut dst_file).with_context(|| {
+            format!(
+                "failed to stage {} as {} for classpath registration",
+                archive_path.display(),
+                tmp.display()
+            )
+        })?;
+        Ok(())
+    })();
+    drop(dst_file);
+    if let Err(e) = copy_result {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+
+    tracing::debug!(
+        "JN3: staged non-.jar archive {} в†’ {} so ClassPath accepts it",
+        archive_path.display(),
+        tmp.display()
+    );
+    register_staged_archive_copy(tmp.clone());
+    Ok((tmp.clone(), Some(StagedArchiveCleanup { path: tmp })))
 }
 
 /// Launcher options that consume the *following* argv token as their value
@@ -1046,9 +1192,19 @@ fn normalize_java_launcher_argv(args: Vec<String>) -> Vec<String> {
             out.push("false".into());
             i += 1;
         }
+        // These `-XX` flags are not expressible as clap long names, so keep
+        // them verbatim for `extract_hotspot_flags`, which runs after this
+        // normalization stage.
+        else if a == "-XX:+HeapDumpOnOutOfMemoryError"
+            || a == "-XX:-HeapDumpOnOutOfMemoryError"
+            || a.starts_with("-XX:HeapDumpPath=")
+        {
+            out.push(args[i].clone());
+            i += 1;
+        }
         // Any other `-XX:...` flag is a HotSpot tuning knob CratonVM does not
         // implement (`-XX:MetaspaceSize`, `-XX:MaxMetaspaceSize`,
-        // `-XX:+ExitOnOutOfMemoryError`, `-XX:+HeapDumpOnOutOfMemoryError`, …).
+        // `-XX:+ExitOnOutOfMemoryError`, …).
         // Recognized `-XX:` flags are rewritten by the branches above;
         // everything else is silently ignored so a Maven Surefire / Gradle
         // fork — which passes these unconditionally — launches instead of clap
@@ -1254,6 +1410,19 @@ fn extract_hotspot_flags(raw: Vec<String>) -> (Vec<String>, HotspotFlags) {
     (filtered, out)
 }
 
+fn resolve_watchdog_timeout(
+    stack_dump_on_timeout: Option<u64>,
+    default_watchdog_sec: Option<&str>,
+) -> Option<u64> {
+    match stack_dump_on_timeout {
+        Some(secs) if secs > 0 => Some(secs),
+        Some(_) => None,
+        None => default_watchdog_sec
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .filter(|secs| *secs > 0),
+    }
+}
+
 fn run() -> Result<()> {
     // Initialize tracing. B6: route WARN+ diagnostics to stderr so silent
     // swallow sites surface without polluting the program's stdout (which
@@ -1276,6 +1445,7 @@ fn run() -> Result<()> {
     // wins (OnceLock), so installing it once here at the top of `run()` is
     // sufficient.
     cratonvm_native_builtins::lang_system::set_pre_exit_hook(|code| {
+        cleanup_staged_archive_copies();
         if std::env::var("CRATONVM_DBG_EXIT").ok().as_deref() == Some("1") {
             eprintln!("=== CRATONVM_DBG_EXIT: System.exit({code}) — dispatch trace ===");
             cratonvm_vm::dispatch_trace::dump_to_stderr_unconditional("pre-system-exit");
@@ -1434,7 +1604,10 @@ fn run() -> Result<()> {
         args.args = new_args;
     }
 
-    // Resolve class name and classpath based on launch mode
+    // Resolve class name and classpath based on launch mode. If a WAR/EAR is
+    // staged as a temporary `.jar` copy, keep the cleanup guard alive until
+    // `run()` exits so lazy class loading can still read it.
+    let mut _staged_archive_cleanup: Option<StagedArchiveCleanup> = None;
     let (class_name, classpath) = if let Some(jar_path_str) = &args.jar {
         // -jar mode: read Main-Class from manifest, build classpath from JAR + manifest Class-Path
         let jar_path = std::path::Path::new(jar_path_str);
@@ -1458,82 +1631,8 @@ fn run() -> Result<()> {
         // extension), and the `Class-Path` manifest header is resolved
         // relative to the original file's parent so sibling lookups still
         // work.
-        let cp_entry_for_archive = match jar_path.extension().and_then(|e| e.to_str()) {
-            Some(ext) if ext.eq_ignore_ascii_case("jar") => jar_path.to_path_buf(),
-            _ => {
-                // Copy <name>.<ext> to <tmp>/<name>.jar so ClassPath::new
-                // recognises it. The temp file lives for the process
-                // lifetime (the OS reclaims it on exit; we don't bother
-                // with explicit cleanup because the orchestrator runs
-                // short-lived CLI invocations).
-                let stem = jar_path
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("app");
-                // Disambiguate with PID + a millisecond timestamp to
-                // avoid clobbering when multiple VMs run concurrently.
-                let pid = std::process::id();
-                let now_ms = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_millis())
-                    .unwrap_or(0);
-                // Create the staged file with exclusive-create semantics
-                // (`create_new`): if a file/symlink already sits at this
-                // predictable path, the open fails instead of `fs::copy`
-                // following/clobbering it (a local-attacker arbitrary-write
-                // vector). On collision, retry with a fresh counter suffix
-                // so concurrent VMs don't fail spuriously.
-                let dir = std::env::temp_dir();
-                let mut tmp = dir.join(format!("cratonvm-{pid}-{now_ms}-{stem}.jar"));
-                let mut dst_file = None;
-                for attempt in 0..16 {
-                    match std::fs::OpenOptions::new()
-                        .write(true)
-                        .create_new(true)
-                        .open(&tmp)
-                    {
-                        Ok(f) => {
-                            dst_file = Some(f);
-                            break;
-                        }
-                        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                            tmp = dir.join(format!("cratonvm-{pid}-{now_ms}-{attempt}-{stem}.jar"));
-                        }
-                        Err(e) => {
-                            return Err(anyhow::Error::new(e).context(format!(
-                                "failed to stage {} as {} for classpath registration",
-                                jar_path.display(),
-                                tmp.display()
-                            )));
-                        }
-                    }
-                }
-                let mut dst_file = dst_file.ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "failed to stage {} for classpath registration: \
-                         could not create a unique temp file in {}",
-                        jar_path.display(),
-                        dir.display()
-                    )
-                })?;
-                let mut src_file = std::fs::File::open(jar_path).with_context(|| {
-                    format!("failed to open {} for staging", jar_path.display())
-                })?;
-                std::io::copy(&mut src_file, &mut dst_file).with_context(|| {
-                    format!(
-                        "failed to stage {} as {} for classpath registration",
-                        jar_path.display(),
-                        tmp.display()
-                    )
-                })?;
-                tracing::debug!(
-                    "JN3: staged non-.jar archive {} → {} so ClassPath accepts it",
-                    jar_path.display(),
-                    tmp.display()
-                );
-                tmp
-            }
-        };
+        let (cp_entry_for_archive, staged_cleanup) = classpath_entry_for_archive(jar_path)?;
+        _staged_archive_cleanup = staged_cleanup;
 
         // Build classpath: JAR (or staged .jar copy) itself + manifest Class-Path entries.
         // The manifest's Class-Path header is still resolved relative to the
@@ -1977,81 +2076,26 @@ fn run() -> Result<()> {
         vm.shared.thread_registry.set_tlab_addr(main_tid, main_tlab);
     }
 
-    // T19.H1 — optional watchdog that dumps every interpreter thread's
-    // frame chain and aborts the process if the main method hasn't
-    // completed within the configured deadline. Triggered by the
-    // `--stack-dump-on-timeout=SECONDS` CLI flag.
+    // T19.H1: optional watchdog that dumps interpreter frames and aborts when
+    // the user explicitly bounds execution. Normal Java programs may be
+    // long-running services, so no watchdog is armed by default. Set
+    // `--stack-dump-on-timeout=N` or `CRATONVM_DEFAULT_WATCHDOG_SEC=N` to opt
+    // in; `--stack-dump-on-timeout=0` and `CRATONVM_DISABLE_DEFAULT_WATCHDOG=1`
+    // disable the env-default path.
     //
-    // I1 — make hangs visible by default.
-    //
-    // When neither `--stack-dump-on-timeout` is supplied nor the
-    // `CRATONVM_DISABLE_DEFAULT_WATCHDOG` env var is set, install a
-    // conservative 45-second default. This guarantees a hung VM emits
-    // **something** to stderr before the surrounding harness kills the
-    // process — the previous default of "no watchdog" produced empty
-    // stderr + Windows TerminateProcess rc=-1 from the bench runners,
-    // which made hangs (e.g. CGLIB's `String.indexOf` looping inside
-    // `TypeUtils.parseSignature`) visually indistinguishable from a
-    // segfault.
-    //
-    // 45 seconds is long enough for HelloWorld, the smoke tests in
-    // tests/integration_test.rs, the wave2-* probes, and the JDK
-    // bootstrap warm-up to complete, but short enough to fire before
-    // every existing probe runner's 60s `TIMEOUT_SEC`. Long-running
-    // services (Keycloak, Quarkus, WildFly) should pass an explicit
-    // `--stack-dump-on-timeout=N` (with N suitably large) or set
-    // `CRATONVM_DISABLE_DEFAULT_WATCHDOG=1` — the same way they pass
-    // explicit `-Xmx` instead of relying on heap defaults.
-    // PERF: the native-call ring + dispatch-trace ring record on EVERY
-    // native-method entry while enabled (a relaxed AtomicBool load on the
-    // hot path, plus a parking_lot::Mutex + timestamp when on). They used
-    // to be armed whenever ANY watchdog was active — which, since the
-    // default 120s watchdog is armed for every run, meant every short-lived
-    // CLI invocation paid the per-native-call recording cost even though
-    // the rings are only ever *read* by the watchdog's "0 Java threads
-    // dumped" native-hang fallback.
-    //
-    // Gate the ring recording behind an EXPLICIT diagnostic request:
-    //   * `--stack-dump-on-timeout=N` (N>0) supplied on the CLI, or
-    //   * `CRATONVM_ENABLE_NATIVE_RING=1` for callers who want the rings
-    //     under the implicit default watchdog without changing the timeout.
-    //
-    // The implicit default watchdog keeps its core function intact: it
-    // still aborts the process and still triggers `request_stack_dump`
-    // (the Java-frame dump path is wholly independent of the rings). Only
-    // the deeper "all threads parked in native Rust" ring detail is opt-in
-    // now — and that fallback already prints the PID, the watchdog's own
-    // native backtrace, and an attach-a-debugger hint regardless.
+    // Native-call and dispatch rings are recorded only for explicit diagnostic
+    // requests because they add hot-path work on every native-method entry.
     let explicit_watchdog = matches!(args.stack_dump_on_timeout, Some(s) if s > 0);
     let ring_recording_requested = explicit_watchdog
         || std::env::var("CRATONVM_ENABLE_NATIVE_RING").ok().as_deref() == Some("1");
-    let effective_watchdog = match args.stack_dump_on_timeout {
-        Some(s) if s > 0 => Some(s),
-        Some(_) => None, // explicit `--stack-dump-on-timeout=0` disables
-        None => {
-            if std::env::var("CRATONVM_DISABLE_DEFAULT_WATCHDOG")
-                .ok()
-                .as_deref()
-                == Some("1")
-            {
-                None
-            } else {
-                Some(
-                    std::env::var("CRATONVM_DEFAULT_WATCHDOG_SEC")
-                        .ok()
-                        .and_then(|s| s.parse().ok())
-                        // Bumped from 45 → 120: WildFly bootstrap was making
-                        // forward progress through clinit cascade (64 distinct
-                        // stack snapshots dumped in the 3s grace window) but
-                        // 45s was insufficient for Module/AS/SimpleAttributeDef
-                        // chain on cold-cache JDK. 120s matches typical CI
-                        // budget for boot tests while still catching real
-                        // hangs.
-                        .unwrap_or(120),
-                )
-            }
-        }
-    };
+    let default_watchdog_env =
+        if std::env::var("CRATONVM_DISABLE_DEFAULT_WATCHDOG").ok().as_deref() == Some("1") {
+            None
+        } else {
+            std::env::var("CRATONVM_DEFAULT_WATCHDOG_SEC").ok()
+        };
+    let effective_watchdog =
+        resolve_watchdog_timeout(args.stack_dump_on_timeout, default_watchdog_env.as_deref());
     // Shared "run() completed" flag for the stack-dump watchdog. When `run()`
     // returns (normally OR via `?`/early-return), the RAII guard below sets
     // this to `true`; the watchdog checks it after its deadline sleep and
@@ -2085,8 +2129,8 @@ fn run() -> Result<()> {
         // a parking_lot::Mutex when set) is negligible per call but adds
         // up across a full run, so we only arm it when a diagnostic was
         // EXPLICITLY requested (see `ring_recording_requested` above). The
-        // implicit default watchdog still aborts + dumps Java frames; the
-        // ring detail is reserved for runs that asked for it.
+        // A watchdog armed through the env default still aborts + dumps Java
+        // frames; ring detail is reserved for runs that asked for it.
         if ring_recording_requested {
             cratonvm_native_api::native_ring::enable(true);
             // T19.H1 — also enable the dispatch-trace ring. The native-call
@@ -3749,6 +3793,24 @@ mod tests {
         assert_eq!(clamp_ergonomic_heap(8 * GIB, 2 * GIB), (2 * GIB) as usize);
     }
 
+    #[test]
+    fn watchdog_is_not_armed_by_default() {
+        assert_eq!(resolve_watchdog_timeout(None, None), None);
+    }
+
+    #[test]
+    fn watchdog_env_default_is_opt_in() {
+        assert_eq!(resolve_watchdog_timeout(None, Some("300")), Some(300));
+        assert_eq!(resolve_watchdog_timeout(None, Some("0")), None);
+        assert_eq!(resolve_watchdog_timeout(None, Some("not-a-number")), None);
+    }
+
+    #[test]
+    fn watchdog_explicit_timeout_wins_and_zero_disables() {
+        assert_eq!(resolve_watchdog_timeout(Some(7), Some("300")), Some(7));
+        assert_eq!(resolve_watchdog_timeout(Some(0), Some("300")), None);
+    }
+
     // -----------------------------------------------------------------------
     // insert_program_args_separator tests — `java`-launcher positional
     // semantics: tokens after the program selector are program args.
@@ -4081,6 +4143,25 @@ mod tests {
         assert!(flags.heap_dump_path.is_none());
     }
 
+    #[test]
+    fn heap_dump_flags_survive_full_launcher_pipeline() {
+        let argv0 = argv(&[
+            "java",
+            "-XX:+HeapDumpOnOutOfMemoryError",
+            "-XX:HeapDumpPath=/tmp/heap.hprof",
+            "Main",
+        ]);
+        let stage1 = insert_program_args_separator(argv0);
+        let stage2 = normalize_java_launcher_argv(stage1);
+        let (stage3, _props) = extract_system_properties(stage2);
+        let (stage4, flags) = extract_hotspot_flags(stage3);
+        let parsed = Args::try_parse_from(stage4).expect("clap must accept heap dump flags");
+
+        assert_eq!(parsed.class_name.as_deref(), Some("Main"));
+        assert_eq!(flags.heap_dump_on_oom, Some(true));
+        assert_eq!(flags.heap_dump_path.as_deref(), Some("/tmp/heap.hprof"));
+    }
+
     // -----------------------------------------------------------------------
     // expand_aggregate_jars tests
     // -----------------------------------------------------------------------
@@ -4137,6 +4218,24 @@ mod tests {
         let entry = aggregate.to_string_lossy().into_owned();
         let expanded = expand_aggregate_jars(vec![entry.clone()]);
         assert_eq!(expanded, vec![entry]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn non_jar_archive_staging_cleanup_removes_temp_copy() {
+        let dir = unique_temp_dir("stage-war");
+        let archive = dir.join("app.war");
+        std::fs::write(&archive, b"fake archive").unwrap();
+
+        let (entry, cleanup) = classpath_entry_for_archive(&archive).unwrap();
+        let cleanup = cleanup.expect("non-.jar archive should be staged");
+        assert_ne!(entry, archive);
+        assert_eq!(entry.extension().and_then(|e| e.to_str()), Some("jar"));
+        assert!(entry.exists(), "staged copy should exist while guard is live");
+        assert_eq!(std::fs::read(&entry).unwrap(), b"fake archive");
+
+        drop(cleanup);
+        assert!(!entry.exists(), "staged copy should be removed on guard drop");
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -4426,12 +4525,24 @@ mod tests {
 
     #[test]
     fn hotspot_xx_non_gc_use_flags_not_mistaken_for_selector() {
-        // `-XX:+Use*` flags that do NOT end in `GC` must keep their existing
-        // handling (silently ignored) and must not become a GC selector.
-        for flag in ["-XX:+UseStringDeduplication", "-XX:+UseCompressedOops"] {
-            let out = normalize_java_launcher_argv(argv(&["java", flag, "Main"]));
-            assert_eq!(out, argv(&["java", "Main"]), "{flag}");
-        }
+        // `-XX:+Use*` flags that do NOT end in `GC` must not become a GC
+        // selector. Supported non-GC flags keep their own mapping.
+        let out = normalize_java_launcher_argv(argv(&[
+            "java",
+            "-XX:+UseStringDeduplication",
+            "Main",
+        ]));
+        assert_eq!(out, argv(&["java", "--XX:StringDedup", "true", "Main"]));
+
+        let out = normalize_java_launcher_argv(argv(&[
+            "java",
+            "-XX:-UseStringDeduplication",
+            "Main",
+        ]));
+        assert_eq!(out, argv(&["java", "--XX:StringDedup", "false", "Main"]));
+
+        let out = normalize_java_launcher_argv(argv(&["java", "-XX:+UseCompressedOops", "Main"]));
+        assert_eq!(out, argv(&["java", "Main"]));
     }
 
     #[test]
@@ -4445,6 +4556,18 @@ mod tests {
         let (stage4, _hot) = extract_hotspot_flags(stage3);
         let parsed = Args::try_parse_from(stage4).expect("clap must accept -XX:+UseG1GC");
         assert_eq!(parsed.gc_selector.as_deref(), Some("G1"));
+        assert_eq!(parsed.class_name.as_deref(), Some("Main"));
+    }
+
+    #[test]
+    fn hotspot_string_dedup_reaches_clap_after_pipeline() {
+        let argv0: Vec<String> = argv(&["java", "-XX:+UseStringDeduplication", "Main"]);
+        let stage1 = insert_program_args_separator(argv0);
+        let stage2 = normalize_java_launcher_argv(stage1);
+        let (stage3, _props) = extract_system_properties(stage2);
+        let (stage4, _hot) = extract_hotspot_flags(stage3);
+        let parsed = Args::try_parse_from(stage4).expect("clap must accept string dedup flag");
+        assert_eq!(parsed.g1_string_dedup.as_deref(), Some("true"));
         assert_eq!(parsed.class_name.as_deref(), Some("Main"));
     }
 
@@ -4540,6 +4663,34 @@ mod tests {
         let parsed = Args::try_parse_from(argv(&["cratonvm", "--nojit", "Main"]))
             .expect("clap must accept --nojit");
         assert!(parsed.nojit);
+    }
+
+    #[test]
+    fn enable_native_access_bare_flag_does_not_consume_main_class() {
+        let argv0: Vec<String> = argv(&["java", "--enable-native-access", "Main", "arg"]);
+        let stage1 = insert_program_args_separator(argv0);
+        let stage2 = normalize_java_launcher_argv(stage1);
+        let (stage3, _props) = extract_system_properties(stage2);
+        let (stage4, _hot) = extract_hotspot_flags(stage3);
+        let parsed =
+            Args::try_parse_from(stage4).expect("clap must parse bare native-access flag");
+
+        assert_eq!(parsed.enable_native_access.as_deref(), Some("ALL-UNNAMED"));
+        assert_eq!(parsed.class_name.as_deref(), Some("Main"));
+        assert_eq!(parsed.args, argv(&["arg"]));
+    }
+
+    #[test]
+    fn enable_native_access_equals_value_is_still_accepted() {
+        let parsed = Args::try_parse_from(argv(&[
+            "cratonvm",
+            "--enable-native-access=java.base",
+            "Main",
+        ]))
+        .expect("clap must parse native-access value with equals");
+
+        assert_eq!(parsed.enable_native_access.as_deref(), Some("java.base"));
+        assert_eq!(parsed.class_name.as_deref(), Some("Main"));
     }
 
     #[test]
