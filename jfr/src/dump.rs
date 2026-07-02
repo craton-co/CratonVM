@@ -1411,12 +1411,19 @@ pub fn read_events(
     let mut pos = events_start;
     let mut out = Vec::new();
     while pos < events_end {
-        let (total_size, size_len) = decode_compressed_int(&data[pos..]).ok_or_else(|| {
+        let (total_size, size_len) = decode_compressed_int(&data[pos..events_end]).ok_or_else(|| {
             JfrDumpError::Io(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "record size decode failed",
             ))
         })?;
+        let min_event_header_size = size_len as u64 + 4;
+        if total_size < min_event_header_size {
+            return Err(JfrDumpError::Io(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "record too small for event header",
+            )));
+        }
         // checked_add: `total_size` is an attacker-controlled compressed-int;
         // an unchecked `+` would wrap `usize` past the bounds check below.
         let record_end = (pos as u64)
@@ -1436,7 +1443,7 @@ pub fn read_events(
         }
 
         let mut rpos = pos + size_len;
-        let (type_id_raw, tc) = decode_compressed_int(&data[rpos..]).ok_or_else(|| {
+        let (type_id_raw, tc) = decode_compressed_int(&data[rpos..record_end]).ok_or_else(|| {
             JfrDumpError::Io(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "type_id decode failed",
@@ -1445,7 +1452,7 @@ pub fn read_events(
         rpos += tc;
         let type_id = EventTypeId(type_id_raw as u32);
 
-        let (start_time_raw, sc) = decode_compressed_long(&data[rpos..]).ok_or_else(|| {
+        let (start_time_raw, sc) = decode_compressed_long(&data[rpos..record_end]).ok_or_else(|| {
             JfrDumpError::Io(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "start_time decode failed",
@@ -1462,7 +1469,7 @@ pub fn read_events(
             start_time_raw
         };
 
-        let (duration, dc) = decode_compressed_long(&data[rpos..]).ok_or_else(|| {
+        let (duration, dc) = decode_compressed_long(&data[rpos..record_end]).ok_or_else(|| {
             JfrDumpError::Io(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "duration decode failed",
@@ -1470,7 +1477,7 @@ pub fn read_events(
         })?;
         rpos += dc;
 
-        let (thread_id, tdc) = decode_compressed_long(&data[rpos..]).ok_or_else(|| {
+        let (thread_id, tdc) = decode_compressed_long(&data[rpos..record_end]).ok_or_else(|| {
             JfrDumpError::Io(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "thread_id decode failed",
@@ -1689,6 +1696,22 @@ mod tests {
                 EventField::new("count", "int", "Count"),
                 EventField::new("name", "string", "Name"),
             ],
+            has_thread: true,
+            has_stacktrace: false,
+            period: EventPeriod::None,
+            threshold: None,
+        });
+        (reg, id)
+    }
+
+    fn make_registry_with_zero_field_type() -> (EventTypeRegistry, EventTypeId) {
+        let mut reg = EventTypeRegistry::new();
+        let id = reg.register(EventType {
+            id: EventTypeId(0),
+            name: "test.EmptyEvent".into(),
+            category: vec!["Test".into()],
+            description: "empty event".into(),
+            fields: Vec::new(),
             has_thread: true,
             has_stacktrace: false,
             period: EventPeriod::None,
@@ -2176,6 +2199,61 @@ mod tests {
         assert!(
             result.is_err(),
             "checkpoint_offset past EOF must error, not panic"
+        );
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn test_read_events_rejects_record_smaller_than_event_header() {
+        let dir = std::env::temp_dir().join("jfr_test_event_header_too_small");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("event_header_too_small.jfr");
+
+        let (reg, type_id) = make_registry_with_zero_field_type();
+        let mut data = make_header_with_offsets(HEADER_SIZE + 1, HEADER_SIZE + 1);
+        data.extend_from_slice(&encode_compressed_int(1));
+        data.extend_from_slice(&encode_compressed_int(type_id.0 as u64));
+        data.extend_from_slice(&encode_compressed_long(0));
+        data.extend_from_slice(&encode_compressed_long(0));
+        data.extend_from_slice(&encode_compressed_long(0));
+        std::fs::write(&path, &data).unwrap();
+
+        let result = read_events(&path, &reg);
+        assert!(
+            result.is_err(),
+            "event record shorter than the fixed event header must be rejected"
+        );
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn test_read_events_header_decode_bounded_by_record() {
+        let dir = std::env::temp_dir().join("jfr_test_event_header_bounded");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("event_header_bounded.jfr");
+
+        let (reg, type_id) = make_registry_with_zero_field_type();
+        let mut record = Vec::new();
+        write_compressed_int_into(&mut record, 5);
+        write_compressed_int_into(&mut record, type_id.0 as u64);
+        write_compressed_long_into(&mut record, 0);
+        write_compressed_long_into(&mut record, 0);
+        record.push(0x80);
+
+        let record_end = HEADER_SIZE as usize + record.len();
+        let mut data = make_header_with_offsets(record_end as u64, record_end as u64);
+        data.extend_from_slice(&record);
+        data.push(0);
+        std::fs::write(&path, &data).unwrap();
+
+        let result = read_events(&path, &reg);
+        assert!(
+            result.is_err(),
+            "event header varints must not read past record_end"
         );
 
         let _ = std::fs::remove_file(&path);
