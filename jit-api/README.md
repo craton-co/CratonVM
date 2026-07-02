@@ -38,6 +38,16 @@ fn lookup_method(m: &CachedBytecodeMethod) {
 Pre-1.0. API stability is best-effort. Tied to the
 [CratonVM](https://github.com/craton-co/cratonvm) workspace version.
 
+`JitRuntimeHelpers` is a `#[repr(C)]` helper-table ABI with 46 `usize`
+fields: 39 required function pointers, 3 optional function pointers, and
+4 offset fields. The crate pins the field count, field classifications,
+and golden offsets in unit tests.
+
+The `gpu-lowering` feature is off by default. It exposes the optional
+`GpuLowering` trait for a future pluggable PTX backend, but current
+workspace GPU lowering uses `cratonvm-jit-cuda` directly and has no
+in-workspace trait implementor.
+
 ## License
 
 Apache-2.0. See `LICENSE` and `NOTICE` at the workspace root.

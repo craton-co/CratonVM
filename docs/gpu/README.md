@@ -226,7 +226,7 @@ The root walker visits pinned refs during collection so the JVM cannot move an a
 
 ### 7. `jit-api::gpu_lowering` (`#[cfg(feature = "gpu-lowering")]`)
 
-[`jit-api/src/gpu_lowering.rs`](../../jit-api/src/gpu_lowering.rs) — a single trait, `GpuLowering`, defining the contract any future PTX producer must satisfy. The only implementor today is `jit-cuda`'s `PtxEmitter`. The trait exists so that **if** a future story wants to add Rust-authored device helpers (parallel GC mark, atomic intrinsics) compiled via cuda-oxide and linked alongside our own emitter, it can plug in without touching `try_dispatch`. See [`cuda-oxide-evaluation.md`](cuda-oxide-evaluation.md) for the reasoning.
+[`jit-api/src/gpu_lowering.rs`](../../jit-api/src/gpu_lowering.rs) — a single optional trait, `GpuLowering`, defining the contract a future pluggable PTX producer would satisfy. There is no in-workspace implementor today: `jit-cuda` exposes its concrete analyzer/lowering entry points directly and does not enable `jit-api/gpu-lowering`. The trait exists so that **if** a future story wants to add Rust-authored device helpers (parallel GC mark, atomic intrinsics) compiled via cuda-oxide and linked alongside our own emitter, it can plug in without touching `try_dispatch`. See [`cuda-oxide-evaluation.md`](cuda-oxide-evaluation.md) for the reasoning.
 
 ## How a method actually offloads (annotated walk)
 
