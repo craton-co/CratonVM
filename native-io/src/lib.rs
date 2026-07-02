@@ -5371,6 +5371,17 @@ fn register_nio_natives(registry: &mut NativeMethodRegistry) {
     registry.register(buf, "clear", "()Ljava/nio/Buffer;", native_bb_clear);
     registry.register(buf, "flip", "()Ljava/nio/Buffer;", native_bb_flip);
     registry.register(buf, "rewind", "()Ljava/nio/Buffer;", native_bb_rewind);
+    // `isReadOnly`/`isDirect` are abstract in every real-JDK Buffer subclass
+    // and were missing from this catch-all-on-Buffer fallback (unlike the
+    // 8 accessors above). Any typed buffer allocated straight against an
+    // abstract class name (e.g. literal `java/nio/CharBuffer`, not
+    // `HeapCharBuffer`) has no closer override to resolve to, so the
+    // interpreter's abstract-method dispatch walks all the way up to
+    // `Buffer.isReadOnly()` (no Code) and throws AbstractMethodError unless
+    // something is registered here. Mirrors `native_bb_is_read_only`'s
+    // "heap-backed, never read-only" default used for ByteBuffer.
+    registry.register(buf, "isReadOnly", "()Z", native_bb_is_read_only);
+    registry.register(buf, "isDirect", "()Z", native_bb_is_direct);
 
     // FileChannel basics
     let fc = "java/nio/channels/FileChannel";
