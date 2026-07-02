@@ -11,27 +11,15 @@
 //!
 //! ## `gpu-lowering` feature status
 //!
-//! As of the round-8 audit (2026-05-24): **no consumer crate in this
-//! workspace enables `gpu-lowering`**. A workspace-wide search for
-//! `features = ["gpu-lowering"]` / `--features gpu-lowering` outside this
-//! crate's own `Cargo.toml` returns zero hits — the only documentation
-//! references live in `docs/gpu/README.md`, which describes a planned
-//! integration that never landed.
+//! The `gpu_lowering` module is an off-by-default extension point, compiled
+//! only with `--features gpu-lowering`. Current workspace GPU lowering uses
+//! `cratonvm-jit-cuda`'s concrete bytecode-to-PTX entry points directly; no
+//! workspace crate currently enables this feature or implements
+//! [`gpu_lowering::GpuLowering`].
 //!
-//! The feature gate, the `gpu_lowering` module, and the `GpuLowering`
-//! trait remain in-tree because removing them is a public-API break that
-//! is out of scope for the current soundness round.
-//!
-//! Round-10 decision: the module is **kept but is dead by default**. It
-//! is compiled only under `--features gpu-lowering` (the `default`
-//! feature set is empty), so the off-by-default CPU JIT never links it
-//! and pays nothing for it. Rather than delete the public seam — which a
-//! future GPU-offload integration is still expected to implement (see
-//! `docs/gpu/README.md`) — the error type's `Display`/`Error` impls now
-//! carry `#[cfg(test)]` coverage so the code is at least exercised when
-//! the feature is built. If `gpu-lowering` still has zero consumers when
-//! the GPU-offload plan is formally abandoned, delete the feature, this
-//! module, and `docs/gpu/` together.
+//! The trait remains in-tree as a narrow public seam for a future pluggable PTX
+//! backend. If that integration is abandoned, remove the feature, this module,
+//! and the related public GPU documentation together.
 
 #[cfg(feature = "gpu-lowering")]
 pub mod gpu_lowering;
@@ -523,8 +511,8 @@ impl JitRuntimeHelpers {
     /// fix: the previous bool-returning, dead-loop implementation
     /// silently returned `true` on a null `tlab_post_init` because the
     /// hand-maintained bulk array did not include it. The validator now
-    /// iterates the macro-generated `all_fields()` list — all 45 fields,
-    /// 38 of which are required pointers — so no field can be silently
+    /// iterates the macro-generated `all_fields()` list — all 46 fields,
+    /// 39 of which are required pointers — so no field can be silently
     /// uncovered.)
     pub fn validate(&self) -> Result<(), Vec<&'static str>> {
         let nulls = self.null_pointers();
@@ -1379,7 +1367,7 @@ mod tests {
     #[test]
     fn jit_runtime_helpers_all_required_null_reports_every_name() {
         // Zero EVERY required pointer at once: `null_pointers()` must
-        // return the complete set of 38 required-field names (and
+        // return the complete set of 39 required-field names (and
         // `validate()` must reject). This complements the per-field
         // sweep above — it proves the validator does not stop at the
         // first miss and that the offset/optional fields (left non-zero

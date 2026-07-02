@@ -9,9 +9,11 @@
 //! some future point — from a Rust-authored helper compiled via
 //! cuda-oxide.
 //!
-//! Today there is exactly one implementor: `jit_cuda::PtxEmitter`.
-//! See `docs/gpu/cuda-oxide-evaluation.md` for the reasoning behind
-//! keeping the trait but not shipping a second implementor.
+//! Today the workspace has no in-tree implementor of this trait. The
+//! `cratonvm-jit-cuda` crate exposes concrete analyzer/lowering functions
+//! directly instead of enabling the `jit-api/gpu-lowering` feature. See
+//! `docs/gpu/cuda-oxide-evaluation.md` for the reasoning behind keeping this
+//! optional seam without making it part of the active GPU path.
 
 use crate::CachedBytecodeMethod;
 
@@ -48,8 +50,8 @@ impl std::error::Error for LoweringError {}
 /// Producer of GPU kernels from a Java method's metadata.
 pub trait GpuLowering: Send + Sync {
     /// A short human-readable name for diagnostics
-    /// (e.g. `"jit-cuda PtxEmitter"`). Logged when `--print-gpu-decisions`
-    /// is on.
+    /// (e.g. `"custom PTX backend"`). Logged when `--print-gpu-decisions` is
+    /// on.
     fn name(&self) -> &'static str;
 
     /// Lower one method. Producers must return `Err(Unsupported)` for

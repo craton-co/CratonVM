@@ -58,12 +58,13 @@ cuda-oxide solves that directly.
 ## The seam we kept anyway
 
 We left one piece of optionality: the `GpuLowering` trait in
-`jit-api`. The only implementor today is `jit_cuda::PtxEmitter`. The
-trait exists so that **if** in the future we want to compile
-Rust-authored device-side helpers (parallel GC mark, atomic helpers,
-math intrinsics) into PTX modules and link them alongside our own
-emitted kernels, we can plug a second implementor in without touching
-the interpreter integration.
+`jit-api`. There is no in-workspace implementor today; `jit-cuda`
+exports concrete analyzer/lowering entry points directly and does not
+enable `jit-api/gpu-lowering`. The trait exists so that **if** in the
+future we want to compile Rust-authored device-side helpers (parallel
+GC mark, atomic helpers, math intrinsics) into PTX modules and link them
+alongside our own emitted kernels, we can plug an implementor in without
+touching the interpreter integration.
 
 We did **not** create a `CudaOxideLowering` skeleton. That would be
 the kind of synthetic stub the wider GPU plan explicitly forbids. An

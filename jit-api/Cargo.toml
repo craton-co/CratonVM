@@ -18,9 +18,9 @@ cratonvm-reader = { path = "../reader", version = "0.3.0" }
 
 [features]
 default = []
-# Expose the GpuLowering trait. The trait is referenced only by the
-# (optional) GPU-offload path in the VM; the CPU JIT does not link
-# it. Off by default to keep the CPU path's public surface unchanged.
+# Expose the GpuLowering trait for future pluggable PTX backends. The
+# active workspace GPU path uses cratonvm-jit-cuda directly today, and
+# the CPU JIT does not link this off-by-default feature.
 gpu-lowering = []
 
 [lints]
