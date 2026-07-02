@@ -3,9 +3,9 @@
 
 //! JFR binary file writer.
 //!
-//! Implements the JFR v2.0 binary format used by OpenJDK's Flight Recorder.
+//! Implements CratonVM's JFR-inspired chunk format.
 //! The format consists of:
-//!   1. A 68-byte file header
+//!   1. A 72-byte file header
 //!   2. Event records (variable-length, LEB128-encoded)
 //!   3. A checkpoint section with constant pool entries
 //!   4. A metadata section describing event types
@@ -289,6 +289,57 @@ fn intern_event_strings(pool: &mut StringPool, fields: &[EventValue]) {
             pool.intern(bytes);
         }
     }
+}
+
+fn event_is_writable(event: &EventInstance, registry: &EventTypeRegistry) -> bool {
+    let Some(event_type) = registry.get(event.type_id) else {
+        tracing::debug!(
+            type_id = event.type_id.0,
+            "dropping JFR event with unknown type id before dump"
+        );
+        return false;
+    };
+    if event.end_time < event.start_time {
+        tracing::debug!(
+            type_id = event.type_id.0,
+            start_time = event.start_time,
+            end_time = event.end_time,
+            "dropping JFR event whose end_time predates start_time"
+        );
+        return false;
+    }
+    if event.fields.len() != event_type.fields.len() {
+        tracing::debug!(
+            type_id = event.type_id.0,
+            expected = event_type.fields.len(),
+            actual = event.fields.len(),
+            "dropping JFR event with field count mismatch before dump"
+        );
+        return false;
+    }
+    for (idx, (field, value)) in event_type.fields.iter().zip(event.fields.iter()).enumerate() {
+        let Some(declared) = FieldKind::from_declared(&field.type_name) else {
+            tracing::debug!(
+                type_id = event.type_id.0,
+                field_index = idx,
+                declared = %field.type_name,
+                "dropping JFR event whose registered field type is unsupported"
+            );
+            return false;
+        };
+        let actual = FieldKind::of_value(value);
+        if !actual.matches_declared(declared) {
+            tracing::debug!(
+                type_id = event.type_id.0,
+                field_index = idx,
+                declared = ?declared,
+                actual = ?actual,
+                "dropping JFR event with field shape mismatch before dump"
+            );
+            return false;
+        }
+    }
+    true
 }
 
 /// Encode a single event field value into a byte buffer.
@@ -647,7 +698,7 @@ fn write_checkpoint_section<W: Write>(
 // File header
 // ---------------------------------------------------------------------------
 
-/// Write the 68-byte JFR file header.
+/// Write the 72-byte JFR file header.
 fn write_header<W: Write>(
     writer: &mut W,
     file_size: u64,
@@ -753,15 +804,18 @@ pub fn dump_to_file(
     //   the sort. Dumps are cold-path and trade this for a JMC-correct
     //   on-disk timeline.
     let mut extra: Vec<EventInstance> = extra_events;
-    // Filter to events whose type_id is registered. Unknown type_ids cannot be
-    // round-tripped through `read_events` (which looks up the type to decode
-    // fields), so writing them would produce unreadable records.
-    extra.retain(|e| registry.get(e.type_id).is_some());
+    // Filter to events whose metadata and payload shape are registered and
+    // decodable. Unknown type IDs, wrong field counts, mismatched field
+    // variants, and inverted timestamps cannot be round-tripped through
+    // `read_events`, so writing them would produce unreadable records. Apply
+    // the same filter to repository events below so a poisoned repository
+    // cannot corrupt the chunk while extras are cleaned.
+    extra.retain(|e| event_is_writable(e, registry));
     // Collect refs from both sources into one Vec for the merge-sort pass.
     // The repository iter and `extra` slice both borrow for the rest of the
     // function — no event-by-event clones.
     let mut chunk_events: Vec<&EventInstance> = Vec::with_capacity(repository.len() + extra.len());
-    chunk_events.extend(repository.iter());
+    chunk_events.extend(repository.iter().filter(|e| event_is_writable(e, registry)));
     chunk_events.extend(extra.iter());
     // Stable sort by `start_time` so equal-timestamp events keep their
     // per-shard relative order — this matches what JMC expects for events
@@ -2644,6 +2698,68 @@ mod tests {
             vec![100, 300, 500],
             "merge sort should produce a monotonic on-disk timeline across the repository and extra events",
         );
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn test_dump_filters_malformed_repository_and_extra_events() {
+        let (reg, type_id) = make_registry_with_one_type();
+
+        let mut repo = EventRepository::new(10);
+        repo.push(EventInstance {
+            type_id,
+            start_time: 100,
+            end_time: 110,
+            thread_id: 1,
+            fields: smallvec![EventValue::Int(1), EventValue::from_str("valid")],
+        });
+        repo.push(EventInstance {
+            type_id: EventTypeId(0xF00D),
+            start_time: 120,
+            end_time: 130,
+            thread_id: 1,
+            fields: smallvec![EventValue::Int(2), EventValue::from_str("unknown")],
+        });
+        repo.push(EventInstance {
+            type_id,
+            start_time: 140,
+            end_time: 150,
+            thread_id: 1,
+            fields: smallvec![EventValue::Int(3)],
+        });
+
+        let extra = vec![
+            EventInstance {
+                type_id,
+                start_time: 160,
+                end_time: 155,
+                thread_id: 2,
+                fields: smallvec![EventValue::Int(4), EventValue::from_str("bad-time")],
+            },
+            EventInstance {
+                type_id,
+                start_time: 180,
+                end_time: 190,
+                thread_id: 2,
+                fields: smallvec![EventValue::Double(5.0), EventValue::from_str("bad-shape")],
+            },
+        ];
+
+        let dir = std::env::temp_dir().join("jfr_test_filter_malformed");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("filter_malformed.jfr");
+        dump_to_file(&path, &repo, &reg, 0, 200, extra, false).unwrap();
+
+        let events = read_events(&path, &reg).unwrap();
+        let ours: Vec<&EventInstance> = events
+            .iter()
+            .filter(|e| e.type_id == type_id && e.start_time >= 100 && e.start_time <= 190)
+            .collect();
+        assert_eq!(ours.len(), 1);
+        assert_eq!(ours[0].start_time, 100);
+        assert!(matches!(ours[0].fields[0], EventValue::Int(1)));
 
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir(&dir);
