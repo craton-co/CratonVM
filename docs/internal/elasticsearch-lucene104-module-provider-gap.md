@@ -107,27 +107,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass `
 
 ## Results
 
-Full suite `all[1..2701]` on 2026-07-02 with `-TimeoutSec 300`:
-
-| VM | Result |
-|---|---:|
-| CratonVM JIT-on | 17 PASS, 2684 FAIL, 0 HANG, 0 CRASH |
-| HotSpot JIT-on | 2514 PASS, 169 FAIL, 2 HANG, 16 CRASH |
-
-The full-suite scan found 2394 CratonVM failures whose logs contain the
-Lucene104 provider error. Of those, 2279 are CratonVM-only failures where the
-same class passed under HotSpot. The remaining 115 overlap HotSpot baseline
-failures, hangs, or crashes and should not be counted as CratonVM-only.
-
-Representative full-suite row:
-
-```text
-index=26
-module=libs/core
-class=org.elasticsearch.common.unit.TimeValueTests
-CratonVM=FAIL, 21.499s
-HotSpot=PASS, 9.851s
-```
+The pre-fix slice runs showed the Lucene104 provider gap clearly.
 
 Slice `others[1..10]`:
 
@@ -174,6 +154,19 @@ JIT-specific. The extra no-JIT-only failure was
 with no useful suppressed stack in the JUnitCore output; keep it separate from
 this Lucene provider issue.
 
+## Current verification
+
+The later full-suite run `es-current-full-jiton-20260702` was executed after
+the fix with:
+
+```text
+C:\craton\CratonVM-elasticsearch-current-suite-20260702\target\release\cratonvm-elasticsearch-current-suite-20260702.exe
+```
+
+That run no longer contains the `Lucene104` provider-missing failure signature.
+Current Elasticsearch failures are tracked as separate open issues in
+`docs/known-issues`.
+
 ## Evidence paths
 
 ```text
@@ -196,15 +189,6 @@ HotSpot baseline copies:
 apps\elasticsearch-suite-runner\.suite\baseline\hotspot-baseline-es-bug-sweep-hotspot-20260702.tsv
 apps\elasticsearch-suite-runner\.suite\baseline\hotspot-baseline-es-bug-sweep-hotspot-20260702-b.tsv
 apps\elasticsearch-suite-runner\.suite\baseline\hotspot-baseline-latest.tsv
-```
-
-Full-suite evidence:
-
-```text
-C:\craton\CratonVM-elasticsearch-full-suite-20260702\apps\elasticsearch-suite-runner\.suite\results\es-full-jiton-20260702\all-jit\results.tsv
-C:\craton\CratonVM-elasticsearch-full-suite-20260702\apps\elasticsearch-suite-runner\.suite\results\es-full-hotspot-20260702\hotspot-jit\results.tsv
-C:\craton\CratonVM-elasticsearch-full-suite-20260702\apps\elasticsearch-suite-runner\.suite\baseline\hotspot-baseline-es-full-hotspot-20260702.tsv
-C:\craton\CratonVM-elasticsearch-full-suite-20260702\apps\elasticsearch-suite-runner\.suite\results\es-full-jiton-20260702\all-jit\logs\libs_core.org.elasticsearch.common.unit.TimeValueTests.out.log
 ```
 
 ## Notes
