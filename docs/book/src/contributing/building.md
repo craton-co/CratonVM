@@ -51,7 +51,8 @@ The default `cargo build` produces a CPU-only JVM with **no** GPU code linked.
 
 ## Linting & formatting
 
-These are the checks CI gates on, run on Linux and Windows:
+These are the lint and formatting checks CI is configured to run on Linux and
+Windows:
 
 ```bash
 cargo fmt --all --check
@@ -59,9 +60,9 @@ cargo clippy --workspace --all-targets -- -D warnings
 ```
 
 > The workspace `[lints]` table allows `dead_code`/`unused_*` and a few rustdoc
-> lints, so "zero clippy warnings" is relative to that configuration, not the
-> full default lint set. Code style follows `rustfmt` defaults with
-> `max_width = 100`.
+> lints, so `clippy -D warnings` measures the repository's configured lint
+> policy, not the full default lint set. Do not describe a branch as
+> warning-free unless the current clippy job actually passes.
 
 ## Benchmarking
 
@@ -71,8 +72,12 @@ time:
 
 ```bash
 cargo build --release -p cratonvm-cli
-cargo run --release -p cratonvm-cli -- --classpath bench QuickBench
-java -cp bench QuickBench
+mkdir -p .bench-cache/quickbench
+git show 2cea208:bench/QuickBench.java > .bench-cache/quickbench/QuickBench.java
+git show 2cea208:bench/binarytrees.java > .bench-cache/quickbench/binarytrees.java
+javac -d .bench-cache/quickbench .bench-cache/quickbench/QuickBench.java .bench-cache/quickbench/binarytrees.java
+target/release/cratonvm --classpath .bench-cache/quickbench QuickBench
+java -cp .bench-cache/quickbench QuickBench
 ```
 
 Give larger benchmarks more heap (e.g. `--Xmx 8g` for Binary Trees) and use

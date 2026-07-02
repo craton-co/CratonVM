@@ -605,14 +605,14 @@ mod tests {
                 .collect(),
         }
     }
-    fn run(metrics: &[(&str, f64)]) -> BTreeMap<String, f64> {
+    fn run_metrics(metrics: &[(&str, f64)]) -> BTreeMap<String, f64> {
         metrics.iter().map(|(k, v)| (k.to_string(), *v)).collect()
     }
 
     #[test]
     fn regression_above_threshold_fails() {
         let b = base(&[("foo", 100.0)]);
-        let r = run(&[("foo", 130.0)]); // +30%
+        let r = run_metrics(&[("foo", 130.0)]); // +30%
         let report = compare(&b, &r, 0.15);
         assert!(!report.passed);
         assert_eq!(report.entries[0].status, GateStatus::Regress);
@@ -622,7 +622,7 @@ mod tests {
     #[test]
     fn improvement_below_threshold_passes() {
         let b = base(&[("foo", 100.0)]);
-        let r = run(&[("foo", 90.0)]); // -10%
+        let r = run_metrics(&[("foo", 90.0)]); // -10%
         let report = compare(&b, &r, 0.15);
         assert!(report.passed);
         assert_eq!(report.entries[0].status, GateStatus::Ok);
@@ -632,7 +632,7 @@ mod tests {
     #[test]
     fn small_regression_within_threshold_passes() {
         let b = base(&[("foo", 100.0)]);
-        let r = run(&[("foo", 110.0)]); // +10%
+        let r = run_metrics(&[("foo", 110.0)]); // +10%
         let report = compare(&b, &r, 0.15);
         assert!(report.passed);
         assert_eq!(report.entries[0].status, GateStatus::Ok);
@@ -641,7 +641,7 @@ mod tests {
     #[test]
     fn placeholder_baseline_bootstraps() {
         let b = base(&[("foo", 0.0)]);
-        let r = run(&[("foo", 12345.0)]);
+        let r = run_metrics(&[("foo", 12345.0)]);
         let report = compare(&b, &r, 0.15);
         assert!(report.passed);
         assert_eq!(report.entries[0].status, GateStatus::Bootstrap);
@@ -650,7 +650,7 @@ mod tests {
     #[test]
     fn missing_metric_in_run_fails() {
         let b = base(&[("foo", 100.0), ("bar", 200.0)]);
-        let r = run(&[("foo", 105.0)]);
+        let r = run_metrics(&[("foo", 105.0)]);
         let report = compare(&b, &r, 0.15);
         assert!(!report.passed);
         // bar is reported as MISSING (Status::Missing)
@@ -661,7 +661,7 @@ mod tests {
     #[test]
     fn new_metric_is_reported_but_does_not_fail() {
         let b = base(&[("foo", 100.0)]);
-        let r = run(&[("foo", 100.0), ("baz", 50.0)]);
+        let r = run_metrics(&[("foo", 100.0), ("baz", 50.0)]);
         let report = compare(&b, &r, 0.15);
         assert!(report.passed);
         let baz = report.entries.iter().find(|e| e.metric == "baz").unwrap();
@@ -673,7 +673,7 @@ mod tests {
         // Two metrics: +20% and -20% → geomean ratio sqrt(1.2 * 0.8) ≈ 0.9798
         // → delta ≈ -2.02%
         let b = base(&[("a", 100.0), ("b", 100.0)]);
-        let r = run(&[("a", 120.0), ("b", 80.0)]);
+        let r = run_metrics(&[("a", 120.0), ("b", 80.0)]);
         let report = compare(&b, &r, 0.25);
         assert!((report.geomean_delta - (-2.0203)).abs() < 0.01);
     }
@@ -683,14 +683,14 @@ mod tests {
         // Each metric is +14% (within 15%) but the geomean is still 14%
         // and we tighten the threshold to 0.10 to force a fail.
         let b = base(&[("a", 100.0), ("b", 100.0)]);
-        let r = run(&[("a", 114.0), ("b", 114.0)]);
+        let r = run_metrics(&[("a", 114.0), ("b", 114.0)]);
         let report = compare(&b, &r, 0.10);
         assert!(!report.passed, "expected fail on geomean");
     }
 
     #[test]
     fn baseline_from_run_round_trips() {
-        let r = run(&[("a", 1.5), ("b", 2.5)]);
+        let r = run_metrics(&[("a", 1.5), ("b", 2.5)]);
         let b = baseline_from_run(&r, "host".into());
         assert_eq!(b.metrics.len(), 2);
         assert_eq!(b.metrics["a"].median_ns, 1.5);
@@ -701,7 +701,7 @@ mod tests {
         let dir = std::env::temp_dir().join("cratonvm-bench-gate-test");
         let _ = fs::remove_dir_all(&dir);
         let path = dir.join("baseline.json");
-        let r = run(&[("a", 1.0), ("b", 2.0)]);
+        let r = run_metrics(&[("a", 1.0), ("b", 2.0)]);
         let b = baseline_from_run(&r, "x".into());
         save_baseline(&path, &b).unwrap();
         let loaded = load_baseline(&path).unwrap();
@@ -871,7 +871,7 @@ mod tests {
     #[test]
     fn format_report_contains_metric_and_verdict() {
         let b = base(&[("foo", 100.0)]);
-        let r = run(&[("foo", 130.0)]);
+        let r = run_metrics(&[("foo", 130.0)]);
         let report = compare(&b, &r, 0.15);
         let s = format_report(&report);
         assert!(s.contains("foo"));
@@ -882,7 +882,7 @@ mod tests {
     #[test]
     fn format_report_pass_verdict() {
         let b = base(&[("foo", 100.0)]);
-        let r = run(&[("foo", 105.0)]);
+        let r = run_metrics(&[("foo", 105.0)]);
         let report = compare(&b, &r, 0.15);
         let s = format_report(&report);
         assert!(s.contains("PASS"));

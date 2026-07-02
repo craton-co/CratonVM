@@ -32,7 +32,7 @@ use cratonvm_jit_api::JitRuntimeHelpers;
 use cratonvm_types::{ArrayElementType, ObjectKind, HEADER_SIZE};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 
 /// Records every `uncommon_trap` invocation so the deopt tests can assert the
 /// inline guard bailed instead of copying. `uncommon_trap` is a fixed
@@ -45,6 +45,46 @@ static TRAP_COUNT: AtomicU64 = AtomicU64::new(0);
 /// without this lock two of them running in parallel would each observe the
 /// other's increment and the `before + 1` assertion would spuriously fail.
 static DEOPT_LOCK: Mutex<()> = Mutex::new(());
+
+fn deopt_lock() -> MutexGuard<'static, ()> {
+    DEOPT_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn clear_deopt_signals() -> u64 {
+    let _ = cratonvm_jit::deopt::take_last_deopt();
+    TRAP_COUNT.load(Ordering::SeqCst)
+}
+
+fn assert_no_deopt_after(before_traps: u64, context: &str) {
+    let trap_delta = TRAP_COUNT
+        .load(Ordering::SeqCst)
+        .saturating_sub(before_traps);
+    let frame_deopt = cratonvm_jit::deopt::take_last_deopt();
+    assert_eq!(
+        trap_delta, 0,
+        "{context} must not trigger an uncommon-trap deopt"
+    );
+    assert!(
+        frame_deopt.is_none(),
+        "{context} must not trigger a real-frame deopt"
+    );
+}
+
+fn assert_one_deopt_after(before_traps: u64, context: &str) {
+    let trap_delta = TRAP_COUNT
+        .load(Ordering::SeqCst)
+        .saturating_sub(before_traps);
+    let frame_deopt = cratonvm_jit::deopt::take_last_deopt();
+    let signal_count = trap_delta + u64::from(frame_deopt.is_some());
+    assert_eq!(
+        signal_count,
+        1,
+        "{context} must trigger exactly one deopt; legacy_traps={trap_delta}, real_frame_deopt={}",
+        frame_deopt.is_some()
+    );
+}
 
 unsafe extern "C" fn recording_uncommon_trap(_vm: i64, _reason: i64, _bci: i64) -> i64 {
     TRAP_COUNT.fetch_add(1, Ordering::SeqCst);
@@ -390,7 +430,7 @@ fn arraycopy_long_arrays_distinct() {
 
 #[test]
 fn arraycopy_empty_copy_is_a_noop() {
-    let _g = DEOPT_LOCK.lock().unwrap();
+    let _g = deopt_lock();
     let f = compile_arraycopy();
     let mut src = FakeArray::new(ArrayElementType::Int, 4, 4);
     let mut dst = FakeArray::new(ArrayElementType::Int, 4, 4);
@@ -398,14 +438,10 @@ fn arraycopy_empty_copy_is_a_noop() {
         src.set(i, 7 + i as u64);
         dst.set(i, 0xABCD_0000 + i as u64);
     }
-    let before_traps = TRAP_COUNT.load(Ordering::SeqCst);
+    let before_traps = clear_deopt_signals();
     // len == 0 with valid in-range positions: no copy, no deopt.
     f(src.ptr(), 1, dst.ptr(), 2, 0);
-    assert_eq!(
-        TRAP_COUNT.load(Ordering::SeqCst),
-        before_traps,
-        "empty copy with valid positions must not deopt"
-    );
+    assert_no_deopt_after(before_traps, "empty copy with valid positions");
     for i in 0..4 {
         assert_eq!(
             dst.get(i),
@@ -417,7 +453,7 @@ fn arraycopy_empty_copy_is_a_noop() {
 
 #[test]
 fn arraycopy_out_of_bounds_deopts_without_corruption() {
-    let _g = DEOPT_LOCK.lock().unwrap();
+    let _g = deopt_lock();
     // srcPos + len exceeds src.length. The inline bounds guard must branch
     // to the uncommon-trap deopt stub — NOT perform a partial/over-run copy.
     // The interpreter would then re-run the call via native arraycopy, which
@@ -432,14 +468,10 @@ fn arraycopy_out_of_bounds_deopts_without_corruption() {
     for i in 0..8 {
         dst.set(i, 0x5555_0000 + i as u64);
     }
-    let before = TRAP_COUNT.load(Ordering::SeqCst);
+    let before = clear_deopt_signals();
     // srcPos=2, len=5 -> 2+5 = 7 > src.length(4): out of bounds.
     f(src.ptr(), 2, dst.ptr(), 0, 5);
-    assert_eq!(
-        TRAP_COUNT.load(Ordering::SeqCst),
-        before + 1,
-        "out-of-bounds arraycopy must trigger exactly one uncommon-trap deopt"
-    );
+    assert_one_deopt_after(before, "out-of-bounds arraycopy");
     // The destination must be byte-identical to its pre-call contents.
     for i in 0..8 {
         assert_eq!(
@@ -452,7 +484,7 @@ fn arraycopy_out_of_bounds_deopts_without_corruption() {
 
 #[test]
 fn arraycopy_negative_position_deopts() {
-    let _g = DEOPT_LOCK.lock().unwrap();
+    let _g = deopt_lock();
     let f = compile_arraycopy();
     let mut src = FakeArray::new(ArrayElementType::Int, 4, 4);
     let mut dst = FakeArray::new(ArrayElementType::Int, 4, 4);
@@ -460,14 +492,10 @@ fn arraycopy_negative_position_deopts() {
         src.set(i, 9 + i as u64);
         dst.set(i, 0x3333_0000 + i as u64);
     }
-    let before = TRAP_COUNT.load(Ordering::SeqCst);
+    let before = clear_deopt_signals();
     // srcPos = -1: negative position must bail.
     f(src.ptr(), -1, dst.ptr(), 0, 2);
-    assert_eq!(
-        TRAP_COUNT.load(Ordering::SeqCst),
-        before + 1,
-        "negative srcPos must trigger an uncommon-trap deopt"
-    );
+    assert_one_deopt_after(before, "negative srcPos");
     for i in 0..4 {
         assert_eq!(dst.get(i), 0x3333_0000 + i as u64, "dst[{i}] untouched");
     }
@@ -475,7 +503,7 @@ fn arraycopy_negative_position_deopts() {
 
 #[test]
 fn arraycopy_mismatched_element_kinds_deopts() {
-    let _g = DEOPT_LOCK.lock().unwrap();
+    let _g = deopt_lock();
     // src is int[], dst is long[]: incompatible element kinds. The inline
     // element-kind guard must bail so the interpreter can throw
     // ArrayStoreException via native arraycopy.
@@ -486,13 +514,9 @@ fn arraycopy_mismatched_element_kinds_deopts() {
         src.set(i, i as u64);
         dst.set(i, 0x7777_0000 + i as u64);
     }
-    let before = TRAP_COUNT.load(Ordering::SeqCst);
+    let before = clear_deopt_signals();
     f(src.ptr(), 0, dst.ptr(), 0, 2);
-    assert_eq!(
-        TRAP_COUNT.load(Ordering::SeqCst),
-        before + 1,
-        "mismatched element kinds must trigger an uncommon-trap deopt"
-    );
+    assert_one_deopt_after(before, "mismatched element kinds");
     for i in 0..4 {
         assert_eq!(dst.get(i), 0x7777_0000 + i as u64, "dst[{i}] untouched");
     }
@@ -500,7 +524,7 @@ fn arraycopy_mismatched_element_kinds_deopts() {
 
 #[test]
 fn arraycopy_reference_array_deopts() {
-    let _g = DEOPT_LOCK.lock().unwrap();
+    let _g = deopt_lock();
     // A reference array (element_type == Reference == 0) is never inlined:
     // the GC store barrier and ArrayStoreException semantics make it unsafe.
     // The element-kind guard's "< 4" primitive check must bail.
@@ -511,13 +535,9 @@ fn arraycopy_reference_array_deopts() {
         src.set(i, 0);
         dst.set(i, 0xBEEF_0000 + i as u64);
     }
-    let before = TRAP_COUNT.load(Ordering::SeqCst);
+    let before = clear_deopt_signals();
     f(src.ptr(), 0, dst.ptr(), 0, 2);
-    assert_eq!(
-        TRAP_COUNT.load(Ordering::SeqCst),
-        before + 1,
-        "reference-array arraycopy must bail to native (one deopt)"
-    );
+    assert_one_deopt_after(before, "reference-array arraycopy");
     for i in 0..4 {
         assert_eq!(dst.get(i), 0xBEEF_0000 + i as u64, "dst[{i}] untouched");
     }

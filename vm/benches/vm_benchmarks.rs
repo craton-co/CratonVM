@@ -434,7 +434,7 @@ fn bench_gc_cycle(c: &mut Criterion) {
             }
             if shared.heap.needs_gc() {
                 // Single-threaded benchmark — no other mutator exists.
-                let stw = cratonvm_gc::collector::StopTheWorldToken::new();
+                let stw = unsafe { cratonvm_gc::collector::StopTheWorldToken::new() };
                 let _ = shared
                     .heap
                     .collect_garbage(&stw, &mut roots, &shared.monitors);

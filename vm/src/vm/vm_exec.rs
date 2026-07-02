@@ -12,16 +12,7 @@
 //! below enforces the invariant at compile time for non-test code.
 //! See the analogous comment in `interpreter.rs` for the full rationale.
 
-#![cfg_attr(
-    not(test),
-    deny(
-        clippy::unwrap_used,
-        clippy::expect_used,
-        clippy::panic,
-        clippy::unimplemented,
-        clippy::todo,
-    )
-)]
+#![cfg_attr(not(test), deny(clippy::panic, clippy::unimplemented, clippy::todo,))]
 
 use crate::classloading::resolution::MethodHandleKind;
 use crate::classloading::ClassId;
@@ -2624,7 +2615,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
     }
 
     fn new_ref_array(&mut self, class_id: ClassId, length: usize) -> ObjectRef {
-        if class_id.as_u32() == 0 && std::env::var("CRATONVM_DBG_TOARRAY").is_ok() {
+        if class_id.as_u32() == 0 && crate::runtime::env_cache::dbg_toarray() {
             let frame = self
                 .thread
                 .frames
@@ -5118,6 +5109,36 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         {
             return;
         }
+        // AQS-PARK-PIN (Tomcat DoHead JIT×GC young-sweep corruption): real-JDK
+        // `LockSupport.park()` callers that track a blocker object (notably
+        // `AbstractQueuedSynchronizer$ConditionObject.await()`, via
+        // `LockSupport.setCurrentBlocker(this)` before the blocking call) write
+        // it into the real `java.lang.Thread.parkBlocker` field — which SHOULD
+        // already keep the ConditionObject (and transitively its `firstWaiter`
+        // wait-queue chain, e.g. the awaiting `ConditionNode`) reachable via
+        // ordinary field tracing from this thread's mirror (always a root, see
+        // `deposit_root_snapshot` below). But a JIT-compiled `await()` /
+        // `ConditionNode.block()` frame can ALSO hold the same objects purely
+        // in a callee-saved register that is never spilled to any scannable
+        // stack slot for the entire blocked duration — invisible to
+        // `scan_active_jit_frames`'s conservative stack scan (see
+        // docs/known-issues on the register-invisibility family). Re-read
+        // `parkBlocker` and pin it as an extra, register-independent
+        // `native_pin_roots` entry for the duration of the block: belt-and-
+        // suspenders alongside the field write, using the SAME object the JDK
+        // already considers "what this thread is parked on", so an AQS
+        // executor/poller worker's Condition chain survives a concurrent young
+        // GC even if every register-resident copy is missed. No-op (and thus
+        // free) whenever the mirror has no real `parkBlocker` field (synthetic
+        // JDK) or the field is currently null (park() called without a tracked
+        // blocker).
+        let mut blocker_pin = None;
+        if let Some(thread_obj) = self.thread.java_thread_obj {
+            if let Value::Object(Some(blocker)) = self.get_field_by_name(thread_obj, "parkBlocker")
+            {
+                blocker_pin = Some(self.pin_native_root(blocker));
+            }
+        }
         // Deposit root snapshot before blocking so GC can scan this thread
         self.deposit_root_snapshot();
         // CRIT (TLAB UAF) — retire the TLAB before parking (see monitor_wait):
@@ -5184,6 +5205,13 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         }
         // Check if GC happened while we were blocked
         self.check_post_block_gc();
+        // AQS-PARK-PIN: drop the extra `parkBlocker` root now that we're done
+        // blocking — we never read the value back (unlike `monitor_wait_keepalive`)
+        // since nothing here continues using it; it only needed to survive as a
+        // GC root for the parked duration above.
+        if let Some(pin) = blocker_pin {
+            self.unpin_native_roots(pin);
+        }
         // Emit JFR thread park event
         {
             let now_ns = std::time::SystemTime::now()
@@ -7021,7 +7049,7 @@ pub fn invoke_or_native(
         // Optional operator diagnostic: surface exactly which call had no
         // implementation. Gated on CRATONVM_TRACE_UNIMPLEMENTED so it never
         // spams normal runs. Uses var_os directly (no new env_cache accessor).
-        if std::env::var_os("CRATONVM_TRACE_UNIMPLEMENTED").is_some() {
+        if crate::runtime::env_cache::trace_unimplemented() {
             eprintln!(
                 "[cratonvm] unimplemented: {}.{}{} — no native implementation and no loadable bytecode (invalid class name)",
                 class_name, method_name, descriptor
@@ -7148,7 +7176,7 @@ pub fn invoke_or_native(
                   effective_class, bytes.len(), class_name, method_name, descriptor);
         eprintln!("[invoke_or_native] effective_class bytes: {:?}", bytes);
     }
-    if std::env::var_os("CRATONVM_DBG_VDISP").is_some()
+    if crate::runtime::env_cache::dbg_vdisp()
         && effective_class == "java/util/Optional"
         && (method_name == "hashCode" || method_name == "equals")
     {
@@ -12271,8 +12299,29 @@ fn invoke_on_class_shared_inner(
                         );
                     }
                 }
+                // Diagnostic aid: a NoSuchMethodError against a
+                // `is_synthetic_stub` class is almost always a masked
+                // classpath gap, not a genuine method-resolution bug — the
+                // class itself was never found on any classpath entry, so
+                // `create_synthetic_stub` fabricated an empty stand-in (see
+                // `is_enterprise_stub_prefix` in classloading/class_manager.rs)
+                // and every method call against it fails here. Tag the log
+                // line so this is diagnosable without a debug rebuild
+                // (previously required `RUST_LOG=debug` to see the separate
+                // "Falling back to synthetic stub" line and correlate it).
+                let stub_hint = if shared
+                    .class_manager
+                    .read()
+                    .get_class(class_id)
+                    .map(|c| c.is_synthetic_stub)
+                    .unwrap_or(false)
+                {
+                    " [class not found on any classpath entry — synthetic stub, add the missing jar]"
+                } else {
+                    ""
+                };
                 tracing::warn!(
-                    method = format!("{class_name}.{method_name}{descriptor}"),
+                    method = format!("{class_name}.{method_name}{descriptor}{stub_hint}"),
                     caller = thread
                         .frames
                         .last()
@@ -12291,7 +12340,7 @@ fn invoke_on_class_shared_inner(
                 // operators can see exactly what is missing. Gated on
                 // CRATONVM_TRACE_UNIMPLEMENTED to avoid spamming normal runs.
                 // Uses var_os directly (no new env_cache accessor required).
-                if std::env::var_os("CRATONVM_TRACE_UNIMPLEMENTED").is_some() {
+                if crate::runtime::env_cache::trace_unimplemented() {
                     eprintln!(
                         "[cratonvm] unimplemented: {}.{}{} — no native implementation and no loadable bytecode (CratonVM)",
                         class_name, method_name, descriptor

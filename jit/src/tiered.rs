@@ -964,8 +964,18 @@ impl TieredCompilationManager {
         self.core.shutdown.store(false, Ordering::Release);
 
         let core = Arc::clone(&self.core);
+        // The default Rust thread stack (~2 MiB) has no margin for compiling
+        // methods with deep IR (heavy inlining, long expression chains from
+        // generated/framework code such as Quarkus/JUnit5 test-framework
+        // classes) — unlike the main-vm interpreter thread, which was bumped
+        // to 128 MiB after binaryTrees(18)-style recursion overflowed 64 MiB
+        // (see vm-cli/src/main.rs). Give the compiler thread the same
+        // 16 MiB headroom already used for other native-recursion-heavy
+        // worker threads (see libcratonvm's foreign-attach threads); the
+        // cost is virtual-address-space only (no commit until touched).
         let handle = std::thread::Builder::new()
             .name("cratonvm-jit-compiler".to_string())
+            .stack_size(16 * 1024 * 1024)
             .spawn(move || {
                 Self::compiler_loop(&core, compile_fn);
             })

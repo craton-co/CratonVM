@@ -9,6 +9,7 @@ license = "Apache-2.0"
 readme = "README.md"
 repository = "https://github.com/craton-co/cratonvm"
 homepage = "https://craton.com.ar"
+documentation = "https://github.com/craton-co/cratonvm/tree/main/docs"
 
 # The fuzz crate is intentionally *not* a workspace member and does NOT
 # inherit workspace lints. libFuzzer-driven `fuzz_target!` macros expand

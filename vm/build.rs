@@ -12,6 +12,7 @@
 //! 1. Legacy files: plain `javac` (no version flags).
 //! 2. Modern files (Java 21+ features like pattern matching, records, sealed
 //!    classes): `javac --release 21 --enable-preview`.
+//!
 //! A file is considered "modern" if its first 20 lines contain the marker
 //! comment `// JAVA21+`.
 

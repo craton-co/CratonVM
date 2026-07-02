@@ -867,7 +867,7 @@ mod tests {
     /// Test-only `StopTheWorldToken`. Single-threaded test harness.
     #[inline]
     fn stw() -> cratonvm_gc::collector::StopTheWorldToken {
-        cratonvm_gc::collector::StopTheWorldToken::new()
+        unsafe { cratonvm_gc::collector::StopTheWorldToken::new() }
     }
 
     #[test]

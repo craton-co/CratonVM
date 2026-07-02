@@ -40,16 +40,16 @@ standard library, so it can run with **no JDK installation, no `JAVA_HOME`, no `
 
 ### Benchmark (vs HotSpot JDK 25 C2)
 
-| Benchmark | JDK 25 C2 | CratonVM | Ratio |
-|-----------|-----------|---------|-------|
-| Arithmetic 300M | 889 ms | 1,676 ms | 1.89x |
-| Fibonacci(42) | 1,876 ms | 2,457 ms | 1.31x |
-| Sieve 100K×500 | 324 ms | 510 ms | 1.57x |
-| Matrix 500×500 | 351 ms | 518 ms | 1.48x |
-| **QuickBench TOTAL** | **3,440 ms** | **5,161 ms** | **1.50x** |
-| Binary Trees (depth=18) | 714 ms | 16,657 ms | 23.3x |
+| Benchmark               | JDK 25 C2    | CratonVM default | Default ratio | CratonVM OSR, threshold=1 | OSR ratio |
+|-------------------------|--------------|------------------|---------------|---------------------------|-----------|
+| Arithmetic 300M         | 991 ms       | 73,820 ms        | 74.5x         | 1,534 ms                  | 1.55x     |
+| Fibonacci(42)           | 2,071 ms     | 28,969 ms        | 14.0x         | 28,525 ms                 | 13.8x     |
+| Sieve 100Kx500          | 358 ms       | 31,665 ms        | 88.4x         | 466 ms                    | 1.30x     |
+| Matrix 500x500          | 336 ms       | 39,078 ms        | 116.3x        | 452 ms                    | 1.35x     |
+| **QuickBench TOTAL**    | **3,756 ms** | **173,532 ms**   | **46.2x**     | **30,977 ms**             | **8.25x** |
+| Binary Trees (depth=18) | 681 ms       | 19,737 ms        | 29.0x         | 36,665 ms                 | 53.8x     |
 
-*Measured 2026-03-31 on Windows 11, JDK 25.0.1 LTS. Round 26 JIT: OSR, loop unrolling, speculative BCE, graph-coloring regalloc.*
+*Single-run snapshot measured 2026-07-02 on Microsoft Windows 11 Home, JDK 25.0.1 LTS, CratonVM code `b80c50b5`, release build. The benchmark sources are the historical `bench/QuickBench.java` and `bench/binarytrees.java` from commit `2cea208`; `bench/` is currently untracked. The default column uses the launcher default, where OSR is disabled. The OSR column sets `CRATONVM_JIT_OSR=1 CRATONVM_JIT_THRESHOLD=1`; on this snapshot it recovers Arithmetic, Sieve, and Matrix, while Fibonacci and Binary Trees remain current regressions.*
 
 See [docs/JIT_OPTIMIZATION.md](docs/JIT_OPTIMIZATION.md) for the full 26-round JIT optimization journey.
 
@@ -296,5 +296,8 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines on how to contribute.
 ## License
 
 Licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE) for details.
+Copyright 2024-2026 Craton Software Company. Project ownership and notice
+material live in [NOTICE](NOTICE); the root license file intentionally remains
+the unmodified Apache License 2.0 text.
 
 See [TRADEMARKS.md](TRADEMARKS.md) for trademark attributions and notices.

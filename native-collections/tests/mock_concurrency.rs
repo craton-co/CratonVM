@@ -8,7 +8,7 @@ mod common;
 use common::{boxed_int, build_registry, call, MockCtx};
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError, VmError};
-use cratonvm_types::{ObjectRef, Value};
+use cratonvm_types::{ArrayElementType, ObjectRef, Value};
 
 const CF: &str = "java/util/concurrent/CompletableFuture";
 const COWAL: &str = "java/util/concurrent/CopyOnWriteArrayList";
@@ -25,6 +25,14 @@ fn new_cf(ctx: &mut MockCtx, done: i32, result: Value) -> ObjectRef {
     ctx.set_field(cf, 0, result);
     ctx.set_field(cf, 1, Value::Int(done));
     cf
+}
+
+fn cf_array(ctx: &mut MockCtx, cfs: &[ObjectRef]) -> ObjectRef {
+    let arr = ctx.new_array(ArrayElementType::Reference, cfs.len());
+    for (i, cf) in cfs.iter().enumerate() {
+        ctx.set_array_element(arr, i, Value::Object(Some(*cf)));
+    }
+    arr
 }
 
 fn new_stamped_lock(reg: &NativeMethodRegistry, ctx: &mut MockCtx) -> ObjectRef {
@@ -129,6 +137,34 @@ fn cf_pending_dependents_do_not_eagerly_invoke_callbacks_with_null() {
     ));
     assert_eq!(ctx.get_field(when_complete, 1), Value::Int(0));
     assert_eq!(callback_count(&ctx, "accept"), 0);
+}
+
+#[test]
+fn cf_static_combinators_do_not_complete_eagerly_from_pending_inputs() {
+    let reg = build_registry();
+    let mut ctx = MockCtx::new();
+    let pending = new_cf(&mut ctx, 0, Value::Object(None));
+    let inputs = cf_array(&mut ctx, &[pending]);
+
+    let all = object_result(call(
+        &reg,
+        &mut ctx,
+        CF,
+        "allOf",
+        "([Ljava/util/concurrent/CompletableFuture;)Ljava/util/concurrent/CompletableFuture;",
+        &[Value::Object(Some(inputs))],
+    ));
+    assert_eq!(ctx.get_field(all, 1), Value::Int(0));
+
+    let any = object_result(call(
+        &reg,
+        &mut ctx,
+        CF,
+        "anyOf",
+        "([Ljava/util/concurrent/CompletableFuture;)Ljava/util/concurrent/CompletableFuture;",
+        &[Value::Object(Some(inputs))],
+    ));
+    assert_eq!(ctx.get_field(any, 1), Value::Int(0));
 }
 
 #[test]

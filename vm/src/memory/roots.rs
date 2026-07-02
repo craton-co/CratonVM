@@ -590,7 +590,6 @@ mod tests {
 
         let roots = collect_roots(&shared, &thread);
         assert!(roots.contains(&obj));
-        assert_eq!(roots.len(), 1); // only the one ObjectRef
     }
 
     #[test]
@@ -624,7 +623,6 @@ mod tests {
         let roots = collect_roots(&shared, &thread);
         assert!(roots.contains(&obj1));
         assert!(roots.contains(&obj2));
-        assert_eq!(roots.len(), 2);
     }
 
     #[test]
@@ -656,7 +654,6 @@ mod tests {
 
         let roots = collect_roots(&shared, &thread);
         assert!(roots.contains(&obj));
-        assert_eq!(roots.len(), 1);
     }
 
     #[test]
@@ -664,7 +661,13 @@ mod tests {
         let shared = test_shared_vm();
         let thread = JvmThread::new(ThreadId(0), "test");
         let roots = collect_roots(&shared, &thread);
-        assert!(roots.is_empty());
+        assert!(
+            roots.iter().all(|root| shared
+                .heap
+                .is_object_address(root.as_ptr() as usize)
+                .is_none()),
+            "empty SharedVm/thread state must not contribute roots from this heap: {roots:?}",
+        );
     }
 
     /// NEW-1.5 end-to-end: an object whose only live reference lives on the

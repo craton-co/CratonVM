@@ -108,9 +108,29 @@ fn compile_top_level_fixtures(sources_dir: &Path, fixture_out_dir: &Path) -> boo
     };
     java_files.sort();
 
+    let classpath = craton_gpu_classpath();
+
+    if classpath.is_none() {
+        let mut skipped = Vec::new();
+        java_files.retain(|path| {
+            if source_requires_craton_gpu_classpath(path) {
+                skipped.push(path.display().to_string());
+                false
+            } else {
+                true
+            }
+        });
+        if !skipped.is_empty() {
+            println!(
+                "cargo:warning=skipping GPU fixtures that require craton-gpu Java API classes because craton-gpu exported no annotation/runtime classpath: {}",
+                skipped.join(", ")
+            );
+        }
+    }
+
     if java_files.is_empty() {
         println!(
-            "cargo:warning=no top-level GPU fixture Java sources found under {}; analyzer tests will panic with 'failed to read fixture'.",
+            "cargo:warning=no compilable top-level GPU fixture Java sources found under {}; analyzer tests will panic with 'failed to read fixture'.",
             sources_dir.display()
         );
         return false;
@@ -118,20 +138,6 @@ fn compile_top_level_fixtures(sources_dir: &Path, fixture_out_dir: &Path) -> boo
 
     let mut cmd = Command::new("javac");
     cmd.arg("-d").arg(fixture_out_dir);
-
-    // Phase 8 #3 - top-level fixtures may import `craton.gpu.*`
-    // (e.g. `BenchmarkExplicit.java` uses GpuExecutor). Add the
-    // craton-gpu annotations classpath if `craton-gpu`'s build.rs
-    // produced one. Same env-var-fallback rules as
-    // `compile_annotation_fixtures`.
-    let cp_dir = std::env::var("DEP_CRATON_GPU_ANNOTATIONS_ANNOTATIONS_DIR").unwrap_or_default();
-    let cp_jar = std::env::var("DEP_CRATON_GPU_ANNOTATIONS_ANNOTATIONS_JAR").unwrap_or_default();
-    let classpath: Option<String> = match (cp_jar.is_empty(), cp_dir.is_empty()) {
-        (false, false) => Some(format!("{cp_jar}{}{cp_dir}", classpath_separator())),
-        (false, true) => Some(cp_jar),
-        (true, false) => Some(cp_dir),
-        (true, true) => None,
-    };
     if let Some(cp) = &classpath {
         cmd.arg("-cp").arg(cp);
     }
@@ -151,6 +157,13 @@ fn compile_top_level_fixtures(sources_dir: &Path, fixture_out_dir: &Path) -> boo
         return false;
     }
     true
+}
+
+fn source_requires_craton_gpu_classpath(path: &Path) -> bool {
+    match fs::read_to_string(path) {
+        Ok(source) => source.contains("craton.gpu."),
+        Err(_) => false,
+    }
 }
 
 /// Compile every `*.java` under `test_classes/gpu/annotations/` with the
@@ -196,30 +209,16 @@ fn compile_annotation_fixtures(sources_dir: &Path, fixture_out_dir: &Path) {
         return;
     }
 
-    // Build classpath from craton-gpu's exported `links` metadata.
-    // Prefer the jar if present, otherwise the classes directory.
-    // Either one alone is enough to resolve `craton.gpu.*` imports.
-    // Both come in as cargo-mangled `DEP_<LINKS>_<KEY>` env vars;
-    // they're empty strings (not unset) when `craton-gpu`'s build.rs
-    // couldn't run javac/jar - hence the explicit `is_empty()` checks.
-    let cp_dir = std::env::var("DEP_CRATON_GPU_ANNOTATIONS_ANNOTATIONS_DIR").unwrap_or_default();
-    let cp_jar = std::env::var("DEP_CRATON_GPU_ANNOTATIONS_ANNOTATIONS_JAR").unwrap_or_default();
-
-    let classpath: String = match (cp_jar.is_empty(), cp_dir.is_empty()) {
-        (false, false) => format!("{cp_jar}{}{cp_dir}", classpath_separator()),
-        (false, true) => cp_jar,
-        (true, false) => cp_dir,
-        (true, true) => {
-            // Graceful fallback: craton-gpu's build.rs handles a missing
-            // javac by emitting empty strings, and so do we. Skip rather
-            // than fail so `jit-cuda` still builds on hosts without a
-            // JDK.
-            println!(
-                "cargo:warning=craton-gpu annotations not built; skipping annotation fixtures in {}",
-                annotations_dir.display()
-            );
-            return;
-        }
+    let Some(classpath) = craton_gpu_classpath() else {
+        // Graceful fallback: craton-gpu's build.rs handles a missing
+        // Java source checkout by emitting an empty classes directory,
+        // and so do we. Skip rather than fail so `jit-cuda` still
+        // builds on hosts without the optional Java API checkout.
+        println!(
+            "cargo:warning=craton-gpu annotations not built; skipping annotation fixtures in {}",
+            annotations_dir.display()
+        );
+        return;
     };
     java_files.sort();
 
@@ -250,6 +249,52 @@ fn prepare_clean_dir(dir: &Path) -> std::io::Result<()> {
         Err(e) => return Err(e),
     }
     fs::create_dir_all(dir)
+}
+
+fn craton_gpu_classpath() -> Option<String> {
+    let cp_dir = std::env::var("DEP_CRATON_GPU_ANNOTATIONS_ANNOTATIONS_DIR").unwrap_or_default();
+    let cp_jar = std::env::var("DEP_CRATON_GPU_ANNOTATIONS_ANNOTATIONS_JAR").unwrap_or_default();
+
+    let mut entries = Vec::new();
+    if classpath_jar_is_usable(Path::new(&cp_jar)) {
+        entries.push(cp_jar);
+    }
+    if classpath_dir_is_usable(Path::new(&cp_dir)) {
+        entries.push(cp_dir);
+    }
+
+    if entries.is_empty() {
+        None
+    } else {
+        Some(entries.join(classpath_separator()))
+    }
+}
+
+fn classpath_jar_is_usable(path: &Path) -> bool {
+    !path.as_os_str().is_empty()
+        && path.is_file()
+        && path.metadata().is_ok_and(|metadata| metadata.len() > 0)
+}
+
+fn classpath_dir_is_usable(path: &Path) -> bool {
+    !path.as_os_str().is_empty() && path.is_dir() && dir_contains_class_file(path)
+}
+
+fn dir_contains_class_file(dir: &Path) -> bool {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return false;
+    };
+
+    for entry in entries.filter_map(Result::ok) {
+        let path = entry.path();
+        if path.is_file() && path.extension().is_some_and(|ext| ext == "class") {
+            return true;
+        }
+        if path.is_dir() && dir_contains_class_file(&path) {
+            return true;
+        }
+    }
+    false
 }
 
 #[cfg(windows)]

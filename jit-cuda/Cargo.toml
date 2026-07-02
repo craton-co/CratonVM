@@ -9,6 +9,7 @@ description = "Java bytecode → PTX lowering for CratonVM GPU offload"
 readme = "README.md"
 repository.workspace = true
 homepage.workspace = true
+documentation.workspace = true
 keywords.workspace = true
 categories.workspace = true
 # Withheld from crates.io at 0.3.0: early-maturity GPU/platform-glue crate.

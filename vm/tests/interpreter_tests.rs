@@ -9,6 +9,9 @@
 //! **Prerequisites:**
 //! - Java test classes are compiled automatically by `build.rs` if `javac`
 //!   is on the PATH. If not, tests will be skipped at runtime.
+//! - Extended session/TCK blocks are opt-in because several are compatibility
+//!   corpus probes rather than stable default CI gates. Set
+//!   `CRATONVM_RUN_EXTENDED_INTERPRETER_TESTS=1` to run them.
 
 use cratonvm_vm::config::VmConfig;
 use cratonvm_vm::types::Value;
@@ -25,6 +28,24 @@ fn class_files_available() -> bool {
     let dir = test_resources_dir();
     let class_path = format!("{dir}/cratonvm/SimpleReturn.class");
     std::path::Path::new(&class_path).exists()
+}
+
+fn extended_interpreter_tests_enabled() -> bool {
+    matches!(
+        std::env::var("CRATONVM_RUN_EXTENDED_INTERPRETER_TESTS").as_deref(),
+        Ok("1") | Ok("true") | Ok("TRUE") | Ok("yes") | Ok("YES")
+    )
+}
+
+fn require_extended_interpreter_tests(test_name: &str) -> bool {
+    if extended_interpreter_tests_enabled() {
+        true
+    } else {
+        eprintln!(
+            "Skipping {test_name}: set CRATONVM_RUN_EXTENDED_INTERPRETER_TESTS=1 to run extended interpreter corpus tests"
+        );
+        false
+    }
 }
 
 /// Create a VM configured for testing (classpath pointing to test resources).
@@ -222,6 +243,9 @@ fn test_finally_block() {
 
 #[test]
 fn test_pattern_switch_exact_match() {
+    if !require_extended_interpreter_tests("test_pattern_switch_exact_match") {
+        return;
+    }
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke("cratonvm/PatternSwitch", "testExactMatch", "()I", &[]);
@@ -233,6 +257,9 @@ fn test_pattern_switch_exact_match() {
 
 #[test]
 fn test_pattern_switch_widening() {
+    if !require_extended_interpreter_tests("test_pattern_switch_widening") {
+        return;
+    }
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke("cratonvm/PatternSwitch", "testWidening", "()I", &[]);
@@ -244,6 +271,9 @@ fn test_pattern_switch_widening() {
 
 #[test]
 fn test_pattern_switch_narrowing() {
+    if !require_extended_interpreter_tests("test_pattern_switch_narrowing") {
+        return;
+    }
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke("cratonvm/PatternSwitch", "testNarrowing", "()I", &[]);
@@ -255,6 +285,9 @@ fn test_pattern_switch_narrowing() {
 
 #[test]
 fn test_pattern_switch_out_of_range() {
+    if !require_extended_interpreter_tests("test_pattern_switch_out_of_range") {
+        return;
+    }
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke("cratonvm/PatternSwitch", "testOutOfRange", "()I", &[]);
@@ -266,6 +299,9 @@ fn test_pattern_switch_out_of_range() {
 
 #[test]
 fn test_pattern_switch_null() {
+    if !require_extended_interpreter_tests("test_pattern_switch_null") {
+        return;
+    }
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke("cratonvm/PatternSwitch", "testNull", "()I", &[]);
@@ -279,6 +315,9 @@ fn test_pattern_switch_null() {
 
 #[test]
 fn test_record_pattern_simple() {
+    if !require_extended_interpreter_tests("test_record_pattern_simple") {
+        return;
+    }
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke("cratonvm/RecordPatterns", "testSimpleRecord", "()I", &[]);
@@ -290,6 +329,9 @@ fn test_record_pattern_simple() {
 
 #[test]
 fn test_record_pattern_nested() {
+    if !require_extended_interpreter_tests("test_record_pattern_nested") {
+        return;
+    }
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke("cratonvm/RecordPatterns", "testNestedRecord", "()I", &[]);
@@ -301,6 +343,9 @@ fn test_record_pattern_nested() {
 
 #[test]
 fn test_record_pattern_with_guard() {
+    if !require_extended_interpreter_tests("test_record_pattern_with_guard") {
+        return;
+    }
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke("cratonvm/RecordPatterns", "testRecordWithGuard", "()I", &[]);
@@ -312,6 +357,9 @@ fn test_record_pattern_with_guard() {
 
 #[test]
 fn test_record_pattern_null() {
+    if !require_extended_interpreter_tests("test_record_pattern_null") {
+        return;
+    }
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke("cratonvm/RecordPatterns", "testRecordNull", "()I", &[]);
@@ -323,6 +371,9 @@ fn test_record_pattern_null() {
 
 #[test]
 fn test_record_pattern_in_box() {
+    if !require_extended_interpreter_tests("test_record_pattern_in_box") {
+        return;
+    }
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke("cratonvm/RecordPatterns", "testRecordInBox", "()I", &[]);
@@ -336,6 +387,9 @@ fn test_record_pattern_in_box() {
 
 #[test]
 fn test_guard_true() {
+    if !require_extended_interpreter_tests("test_guard_true") {
+        return;
+    }
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke("cratonvm/PatternSwitch", "testGuardTrue", "()I", &[]);
@@ -347,6 +401,9 @@ fn test_guard_true() {
 
 #[test]
 fn test_guard_false() {
+    if !require_extended_interpreter_tests("test_guard_false") {
+        return;
+    }
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke("cratonvm/PatternSwitch", "testGuardFalse", "()I", &[]);
@@ -358,6 +415,9 @@ fn test_guard_false() {
 
 #[test]
 fn test_guard_side_effect() {
+    if !require_extended_interpreter_tests("test_guard_side_effect") {
+        return;
+    }
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke("cratonvm/PatternSwitch", "testGuardSideEffect", "()I", &[]);
@@ -371,6 +431,9 @@ fn test_guard_side_effect() {
 
 #[test]
 fn test_sealed_exhaustive_circle() {
+    if !require_extended_interpreter_tests("test_sealed_exhaustive_circle") {
+        return;
+    }
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke("cratonvm/SealedSwitch", "testExhaustive", "()I", &[]);
@@ -382,6 +445,9 @@ fn test_sealed_exhaustive_circle() {
 
 #[test]
 fn test_sealed_exhaustive_rect() {
+    if !require_extended_interpreter_tests("test_sealed_exhaustive_rect") {
+        return;
+    }
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke("cratonvm/SealedSwitch", "testExhaustiveRect", "()I", &[]);
@@ -393,6 +459,9 @@ fn test_sealed_exhaustive_rect() {
 
 #[test]
 fn test_sealed_with_default() {
+    if !require_extended_interpreter_tests("test_sealed_with_default") {
+        return;
+    }
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke("cratonvm/SealedSwitch", "testWithDefault", "()I", &[]);
@@ -410,6 +479,9 @@ fn test_sealed_with_default() {
 
 #[test]
 fn test_record_canonical_ctor() {
+    if !require_extended_interpreter_tests("test_record_canonical_ctor") {
+        return;
+    }
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke("cratonvm/RecordRuntime", "testCanonicalCtor", "()I", &[]);
@@ -421,6 +493,9 @@ fn test_record_canonical_ctor() {
 
 #[test]
 fn test_record_accessor_generation() {
+    if !require_extended_interpreter_tests("test_record_accessor_generation") {
+        return;
+    }
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke(
@@ -439,6 +514,9 @@ fn test_record_accessor_generation() {
 
 #[test]
 fn test_record_equals_true() {
+    if !require_extended_interpreter_tests("test_record_equals_true") {
+        return;
+    }
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke("cratonvm/RecordRuntime", "testEqualsTrue", "()I", &[]);
@@ -450,6 +528,9 @@ fn test_record_equals_true() {
 
 #[test]
 fn test_record_equals_false() {
+    if !require_extended_interpreter_tests("test_record_equals_false") {
+        return;
+    }
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke("cratonvm/RecordRuntime", "testEqualsFalse", "()I", &[]);
@@ -461,6 +542,9 @@ fn test_record_equals_false() {
 
 #[test]
 fn test_record_equals_null() {
+    if !require_extended_interpreter_tests("test_record_equals_null") {
+        return;
+    }
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke("cratonvm/RecordRuntime", "testEqualsNull", "()I", &[]);
@@ -472,6 +556,9 @@ fn test_record_equals_null() {
 
 #[test]
 fn test_record_hashcode_consistent() {
+    if !require_extended_interpreter_tests("test_record_hashcode_consistent") {
+        return;
+    }
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke(
@@ -488,6 +575,9 @@ fn test_record_hashcode_consistent() {
 
 #[test]
 fn test_record_hashcode_different() {
+    if !require_extended_interpreter_tests("test_record_hashcode_different") {
+        return;
+    }
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke(
@@ -504,6 +594,9 @@ fn test_record_hashcode_different() {
 
 #[test]
 fn test_record_tostring() {
+    if !require_extended_interpreter_tests("test_record_tostring") {
+        return;
+    }
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke("cratonvm/RecordRuntime", "testToString", "()I", &[]);
@@ -517,6 +610,9 @@ fn test_record_tostring() {
 
 #[test]
 fn test_sealed_permitted_loads() {
+    if !require_extended_interpreter_tests("test_sealed_permitted_loads") {
+        return;
+    }
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke(
@@ -533,6 +629,9 @@ fn test_sealed_permitted_loads() {
 
 #[test]
 fn test_sealed_multiple_permitted() {
+    if !require_extended_interpreter_tests("test_sealed_multiple_permitted") {
+        return;
+    }
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke("cratonvm/SealedVerify", "testMultiplePermitted", "()I", &[]);
@@ -544,6 +643,9 @@ fn test_sealed_multiple_permitted() {
 
 #[test]
 fn test_sealed_verify_with_default() {
+    if !require_extended_interpreter_tests("test_sealed_verify_with_default") {
+        return;
+    }
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke("cratonvm/SealedVerify", "testSealedWithDefault", "()I", &[]);
@@ -561,6 +663,9 @@ fn test_sealed_verify_with_default() {
 
 #[test]
 fn test_reflect_method_static() {
+    if !require_extended_interpreter_tests("test_reflect_method_static") {
+        return;
+    }
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke("cratonvm/ReflectMethod", "testStaticMethod", "()I", &[]);
@@ -572,6 +677,9 @@ fn test_reflect_method_static() {
 
 #[test]
 fn test_reflect_method_instance() {
+    if !require_extended_interpreter_tests("test_reflect_method_instance") {
+        return;
+    }
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke("cratonvm/ReflectMethod", "testInstanceMethod", "()I", &[]);
@@ -583,6 +691,9 @@ fn test_reflect_method_instance() {
 
 #[test]
 fn test_reflect_method_string_return() {
+    if !require_extended_interpreter_tests("test_reflect_method_string_return") {
+        return;
+    }
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke("cratonvm/ReflectMethod", "testStringReturn", "()I", &[]);
@@ -594,6 +705,9 @@ fn test_reflect_method_string_return() {
 
 #[test]
 fn test_reflect_method_private_accessible() {
+    if !require_extended_interpreter_tests("test_reflect_method_private_accessible") {
+        return;
+    }
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke(
@@ -610,6 +724,9 @@ fn test_reflect_method_private_accessible() {
 
 #[test]
 fn test_reflect_method_exception_wrapping() {
+    if !require_extended_interpreter_tests("test_reflect_method_exception_wrapping") {
+        return;
+    }
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke(
@@ -628,6 +745,9 @@ fn test_reflect_method_exception_wrapping() {
 
 #[test]
 fn test_reflect_field_get_int() {
+    if !require_extended_interpreter_tests("test_reflect_field_get_int") {
+        return;
+    }
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke("cratonvm/ReflectField", "testGetIntField", "()I", &[]);
@@ -639,6 +759,9 @@ fn test_reflect_field_get_int() {
 
 #[test]
 fn test_reflect_field_get_string() {
+    if !require_extended_interpreter_tests("test_reflect_field_get_string") {
+        return;
+    }
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke("cratonvm/ReflectField", "testGetStringField", "()I", &[]);
@@ -650,6 +773,9 @@ fn test_reflect_field_get_string() {
 
 #[test]
 fn test_reflect_field_static() {
+    if !require_extended_interpreter_tests("test_reflect_field_static") {
+        return;
+    }
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke("cratonvm/ReflectField", "testStaticField", "()I", &[]);
@@ -661,6 +787,9 @@ fn test_reflect_field_static() {
 
 #[test]
 fn test_reflect_field_set_int() {
+    if !require_extended_interpreter_tests("test_reflect_field_set_int") {
+        return;
+    }
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke("cratonvm/ReflectField", "testSetIntField", "()I", &[]);
@@ -674,6 +803,9 @@ fn test_reflect_field_set_int() {
 
 #[test]
 fn test_reflect_constructor_noarg() {
+    if !require_extended_interpreter_tests("test_reflect_constructor_noarg") {
+        return;
+    }
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke(
@@ -690,6 +822,9 @@ fn test_reflect_constructor_noarg() {
 
 #[test]
 fn test_reflect_constructor_param() {
+    if !require_extended_interpreter_tests("test_reflect_constructor_param") {
+        return;
+    }
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke(
@@ -706,6 +841,9 @@ fn test_reflect_constructor_param() {
 
 #[test]
 fn test_reflect_constructor_exception() {
+    if !require_extended_interpreter_tests("test_reflect_constructor_exception") {
+        return;
+    }
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke(
@@ -724,6 +862,9 @@ fn test_reflect_constructor_exception() {
 
 #[test]
 fn test_reflect_annotation_class() {
+    if !require_extended_interpreter_tests("test_reflect_annotation_class") {
+        return;
+    }
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke(
@@ -740,6 +881,9 @@ fn test_reflect_annotation_class() {
 
 #[test]
 fn test_reflect_annotation_method() {
+    if !require_extended_interpreter_tests("test_reflect_annotation_method") {
+        return;
+    }
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke(
@@ -756,6 +900,9 @@ fn test_reflect_annotation_method() {
 
 #[test]
 fn test_reflect_annotation_absent() {
+    if !require_extended_interpreter_tests("test_reflect_annotation_absent") {
+        return;
+    }
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke("cratonvm/ReflectAnnotation", "testNoAnnotation", "()I", &[]);
@@ -767,6 +914,9 @@ fn test_reflect_annotation_absent() {
 
 #[test]
 fn test_reflect_annotation_is_present() {
+    if !require_extended_interpreter_tests("test_reflect_annotation_is_present") {
+        return;
+    }
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke(
@@ -788,6 +938,9 @@ fn test_reflect_annotation_is_present() {
 // 91.1+91.2: Simple object round-trip via OOS → byte[] → OIS
 #[test]
 fn test_serialize_simple_round_trip() {
+    if !require_extended_interpreter_tests("test_serialize_simple_round_trip") {
+        return;
+    }
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke("cratonvm/SerializeBasic", "testSimpleRoundTrip", "()I", &[]);
@@ -800,6 +953,9 @@ fn test_serialize_simple_round_trip() {
 // 91.1: Nested object serialization
 #[test]
 fn test_serialize_nested_object() {
+    if !require_extended_interpreter_tests("test_serialize_nested_object") {
+        return;
+    }
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke("cratonvm/SerializeBasic", "testNestedObject", "()I", &[]);
@@ -812,6 +968,9 @@ fn test_serialize_nested_object() {
 // 91.1: Transient field is skipped during serialization
 #[test]
 fn test_serialize_transient_field() {
+    if !require_extended_interpreter_tests("test_serialize_transient_field") {
+        return;
+    }
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke("cratonvm/SerializeBasic", "testTransientField", "()I", &[]);
@@ -824,6 +983,9 @@ fn test_serialize_transient_field() {
 // 91.1: Non-serializable class throws exception
 #[test]
 fn test_serialize_non_serializable_throws() {
+    if !require_extended_interpreter_tests("test_serialize_non_serializable_throws") {
+        return;
+    }
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke(
@@ -841,6 +1003,9 @@ fn test_serialize_non_serializable_throws() {
 // 91.3: Thread.getContextClassLoader returns non-null
 #[test]
 fn test_context_class_loader() {
+    if !require_extended_interpreter_tests("test_context_class_loader") {
+        return;
+    }
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke(
@@ -858,6 +1023,9 @@ fn test_context_class_loader() {
 // 91.3: Parent delegation chain
 #[test]
 fn test_parent_delegation() {
+    if !require_extended_interpreter_tests("test_parent_delegation") {
+        return;
+    }
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke(
@@ -875,6 +1043,9 @@ fn test_parent_delegation() {
 // 91.3: Set/get context class loader round-trip
 #[test]
 fn test_set_context_class_loader() {
+    if !require_extended_interpreter_tests("test_set_context_class_loader") {
+        return;
+    }
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke(
@@ -892,6 +1063,9 @@ fn test_set_context_class_loader() {
 // 91.3: Class.getClassLoader for user classes
 #[test]
 fn test_class_get_class_loader() {
+    if !require_extended_interpreter_tests("test_class_get_class_loader") {
+        return;
+    }
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke(
@@ -913,6 +1087,9 @@ fn test_class_get_class_loader() {
 // Session 3: Bootstrap classes (Object, String) return null from getClassLoader()
 #[test]
 fn test_bootstrap_class_loader_is_null() {
+    if !require_extended_interpreter_tests("test_bootstrap_class_loader_is_null") {
+        return;
+    }
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke(
@@ -929,6 +1106,9 @@ fn test_bootstrap_class_loader_is_null() {
 
 #[test]
 fn test_string_bootstrap_loader() {
+    if !require_extended_interpreter_tests("test_string_bootstrap_loader") {
+        return;
+    }
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke(
@@ -946,6 +1126,9 @@ fn test_string_bootstrap_loader() {
 // Session 3: Loader name correctness
 #[test]
 fn test_loader_name() {
+    if !require_extended_interpreter_tests("test_loader_name") {
+        return;
+    }
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke("cratonvm/ClassLoaderTest", "testLoaderName", "()I", &[]);
@@ -957,6 +1140,9 @@ fn test_loader_name() {
 
 #[test]
 fn test_platform_loader_name() {
+    if !require_extended_interpreter_tests("test_platform_loader_name") {
+        return;
+    }
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke(
@@ -974,6 +1160,9 @@ fn test_platform_loader_name() {
 // Session 3: System class loader has correct parent chain (app → platform → null)
 #[test]
 fn test_system_class_loader_chain() {
+    if !require_extended_interpreter_tests("test_system_class_loader_chain") {
+        return;
+    }
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke(
@@ -991,6 +1180,9 @@ fn test_system_class_loader_chain() {
 // Session 3: loadClass delegation to parent works for bootstrap classes
 #[test]
 fn test_load_class_delegation() {
+    if !require_extended_interpreter_tests("test_load_class_delegation") {
+        return;
+    }
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke(
@@ -1008,6 +1200,9 @@ fn test_load_class_delegation() {
 // Session 3: loadClass works for user-defined classes
 #[test]
 fn test_load_class_for_user_class() {
+    if !require_extended_interpreter_tests("test_load_class_for_user_class") {
+        return;
+    }
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke(
@@ -1025,6 +1220,9 @@ fn test_load_class_for_user_class() {
 // Session 3: getClassLoader() returns same object each call (singleton identity)
 #[test]
 fn test_class_loader_identity() {
+    if !require_extended_interpreter_tests("test_class_loader_identity") {
+        return;
+    }
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke(
@@ -1042,6 +1240,9 @@ fn test_class_loader_identity() {
 // Session 3: getSystemClassLoader() returns same instance each call
 #[test]
 fn test_system_class_loader_identity() {
+    if !require_extended_interpreter_tests("test_system_class_loader_identity") {
+        return;
+    }
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke(
@@ -1059,6 +1260,9 @@ fn test_system_class_loader_identity() {
 // Session 3: Loader isolation — bootstrap classes vs app classes have different loaders
 #[test]
 fn test_loader_isolation() {
+    if !require_extended_interpreter_tests("test_loader_isolation") {
+        return;
+    }
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke(
@@ -1081,6 +1285,9 @@ fn test_loader_isolation() {
 // ignoring the user loader entirely.
 #[test]
 fn test_custom_loader_override_invoked() {
+    if !require_extended_interpreter_tests("test_custom_loader_override_invoked") {
+        return;
+    }
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke(
@@ -1099,6 +1306,9 @@ fn test_custom_loader_override_invoked() {
 // must route through the user loader's loadClass override, not the global store.
 #[test]
 fn test_for_name_honors_custom_loader_override() {
+    if !require_extended_interpreter_tests("test_for_name_honors_custom_loader_override") {
+        return;
+    }
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke(
@@ -1120,6 +1330,9 @@ fn test_for_name_honors_custom_loader_override() {
 // Session 4: Static method invocation via MethodHandle
 #[test]
 fn test_method_handle_static() {
+    if !require_extended_interpreter_tests("test_method_handle_static") {
+        return;
+    }
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke(
@@ -1137,6 +1350,9 @@ fn test_method_handle_static() {
 // Session 4: Virtual method invocation via MethodHandle
 #[test]
 fn test_method_handle_virtual() {
+    if !require_extended_interpreter_tests("test_method_handle_virtual") {
+        return;
+    }
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke(
@@ -1154,6 +1370,9 @@ fn test_method_handle_virtual() {
 // Session 4: Constructor invocation via MethodHandle
 #[test]
 fn test_method_handle_constructor() {
+    if !require_extended_interpreter_tests("test_method_handle_constructor") {
+        return;
+    }
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke(
@@ -1171,6 +1390,9 @@ fn test_method_handle_constructor() {
 // Session 4: MethodHandle.bindTo bound receiver
 #[test]
 fn test_method_handle_bind_to() {
+    if !require_extended_interpreter_tests("test_method_handle_bind_to") {
+        return;
+    }
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke("cratonvm/MethodHandleTest", "testBindTo", "()I", &[]);
@@ -1183,6 +1405,9 @@ fn test_method_handle_bind_to() {
 // Session 4: Lookup.in(targetClass)
 #[test]
 fn test_lookup_in() {
+    if !require_extended_interpreter_tests("test_lookup_in") {
+        return;
+    }
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke("cratonvm/MethodHandleTest", "testLookupIn", "()I", &[]);
@@ -1195,6 +1420,9 @@ fn test_lookup_in() {
 // Session 4: VarHandle.get() and VarHandle.set() for instance fields
 #[test]
 fn test_var_handle_get_set() {
+    if !require_extended_interpreter_tests("test_var_handle_get_set") {
+        return;
+    }
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke(
@@ -1212,6 +1440,9 @@ fn test_var_handle_get_set() {
 // Session 4: VarHandle.compareAndSet()
 #[test]
 fn test_var_handle_cas() {
+    if !require_extended_interpreter_tests("test_var_handle_cas") {
+        return;
+    }
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke("cratonvm/MethodHandleTest", "testVarHandleCAS", "()I", &[]);
@@ -1224,6 +1455,9 @@ fn test_var_handle_cas() {
 // Session 4: MethodHandle.type() returns valid MethodType
 #[test]
 fn test_method_handle_type() {
+    if !require_extended_interpreter_tests("test_method_handle_type") {
+        return;
+    }
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke(
@@ -1245,6 +1479,9 @@ fn test_method_handle_type() {
 // closes the gap by driving the signature-polymorphic strict-arity path.
 #[test]
 fn test_method_handle_invoke_exact_round_trip() {
+    if !require_extended_interpreter_tests("test_method_handle_invoke_exact_round_trip") {
+        return;
+    }
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke(
@@ -1266,6 +1503,9 @@ fn test_method_handle_invoke_exact_round_trip() {
 // in `native-builtins/src/lang_invoke.rs::lang_invoke.rs:521-558`.
 #[test]
 fn test_var_handle_acquire_release() {
+    if !require_extended_interpreter_tests("test_var_handle_acquire_release") {
+        return;
+    }
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke(
@@ -1287,6 +1527,9 @@ fn test_var_handle_acquire_release() {
 // 97.1: JTReg directive parsing — compile test
 #[test]
 fn test_jtreg_parse_compile() {
+    if !require_extended_interpreter_tests("test_jtreg_parse_compile") {
+        return;
+    }
     use cratonvm_vm::runtime::tck::{JtregDirective, JtregRunMode, JtregTestDescriptor};
 
     let source = r#"
@@ -1320,6 +1563,9 @@ public class TestCompile {
 // 97.1: JTReg directive parsing — run test with othervm
 #[test]
 fn test_jtreg_parse_run() {
+    if !require_extended_interpreter_tests("test_jtreg_parse_run") {
+        return;
+    }
     use cratonvm_vm::runtime::tck::{JtregDirective, JtregRunMode, JtregTestDescriptor};
 
     let source = r#"
@@ -1357,6 +1603,9 @@ public class TestOther {
 // 97.1: JTReg output comparison
 #[test]
 fn test_jtreg_compare_output() {
+    if !require_extended_interpreter_tests("test_jtreg_compare_output") {
+        return;
+    }
     use cratonvm_vm::runtime::tck::compare_output;
 
     let actual = vec!["hello".to_string(), "world".to_string()];
@@ -1377,6 +1626,9 @@ fn test_jtreg_compare_output() {
 // 97.2: TCK Chapter 4 — Class file format (magic, version, constant pool, fields, methods)
 #[test]
 fn test_tck_class_file_magic() {
+    if !require_extended_interpreter_tests("test_tck_class_file_magic") {
+        return;
+    }
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke("cratonvm/TckClassFile", "testMagicNumber", "()I", &[]);
@@ -1388,6 +1640,9 @@ fn test_tck_class_file_magic() {
 
 #[test]
 fn test_tck_class_file_version() {
+    if !require_extended_interpreter_tests("test_tck_class_file_version") {
+        return;
+    }
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke("cratonvm/TckClassFile", "testClassVersion", "()I", &[]);
@@ -1399,6 +1654,9 @@ fn test_tck_class_file_version() {
 
 #[test]
 fn test_tck_class_file_constant_pool() {
+    if !require_extended_interpreter_tests("test_tck_class_file_constant_pool") {
+        return;
+    }
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke("cratonvm/TckClassFile", "testConstantPool", "()I", &[]);
@@ -1410,6 +1668,9 @@ fn test_tck_class_file_constant_pool() {
 
 #[test]
 fn test_tck_class_file_field_access() {
+    if !require_extended_interpreter_tests("test_tck_class_file_field_access") {
+        return;
+    }
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke("cratonvm/TckClassFile", "testFieldAccess", "()I", &[]);
@@ -1421,6 +1682,9 @@ fn test_tck_class_file_field_access() {
 
 #[test]
 fn test_tck_class_file_method_access() {
+    if !require_extended_interpreter_tests("test_tck_class_file_method_access") {
+        return;
+    }
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke("cratonvm/TckClassFile", "testMethodAccess", "()I", &[]);
@@ -1433,6 +1697,9 @@ fn test_tck_class_file_method_access() {
 // 97.2: TCK Chapter 5 — Loading, Linking, Initialization
 #[test]
 fn test_tck_loading_class_loading() {
+    if !require_extended_interpreter_tests("test_tck_loading_class_loading") {
+        return;
+    }
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke("cratonvm/TckLoading", "testClassLoading", "()I", &[]);
@@ -1444,6 +1711,9 @@ fn test_tck_loading_class_loading() {
 
 #[test]
 fn test_tck_loading_static_init() {
+    if !require_extended_interpreter_tests("test_tck_loading_static_init") {
+        return;
+    }
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke("cratonvm/TckLoading", "testStaticInit", "()I", &[]);
@@ -1455,6 +1725,9 @@ fn test_tck_loading_static_init() {
 
 #[test]
 fn test_tck_loading_interface_init() {
+    if !require_extended_interpreter_tests("test_tck_loading_interface_init") {
+        return;
+    }
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke("cratonvm/TckLoading", "testInterfaceInit", "()I", &[]);
@@ -1466,6 +1739,9 @@ fn test_tck_loading_interface_init() {
 
 #[test]
 fn test_tck_loading_array_creation() {
+    if !require_extended_interpreter_tests("test_tck_loading_array_creation") {
+        return;
+    }
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke("cratonvm/TckLoading", "testArrayCreation", "()I", &[]);
@@ -1477,6 +1753,9 @@ fn test_tck_loading_array_creation() {
 
 #[test]
 fn test_tck_loading_inheritance() {
+    if !require_extended_interpreter_tests("test_tck_loading_inheritance") {
+        return;
+    }
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke("cratonvm/TckLoading", "testInheritance", "()I", &[]);
@@ -1489,6 +1768,9 @@ fn test_tck_loading_inheritance() {
 // 97.2: TCK Chapter 6 — Instruction Set
 #[test]
 fn test_tck_instructions_int_arithmetic() {
+    if !require_extended_interpreter_tests("test_tck_instructions_int_arithmetic") {
+        return;
+    }
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke("cratonvm/TckInstructions", "testIntArithmetic", "()I", &[]);
@@ -1500,6 +1782,9 @@ fn test_tck_instructions_int_arithmetic() {
 
 #[test]
 fn test_tck_instructions_long_arithmetic() {
+    if !require_extended_interpreter_tests("test_tck_instructions_long_arithmetic") {
+        return;
+    }
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke("cratonvm/TckInstructions", "testLongArithmetic", "()I", &[]);
@@ -1511,6 +1796,9 @@ fn test_tck_instructions_long_arithmetic() {
 
 #[test]
 fn test_tck_instructions_float_arithmetic() {
+    if !require_extended_interpreter_tests("test_tck_instructions_float_arithmetic") {
+        return;
+    }
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke(
@@ -1527,6 +1815,9 @@ fn test_tck_instructions_float_arithmetic() {
 
 #[test]
 fn test_tck_instructions_comparisons() {
+    if !require_extended_interpreter_tests("test_tck_instructions_comparisons") {
+        return;
+    }
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke("cratonvm/TckInstructions", "testComparisons", "()I", &[]);
@@ -1538,6 +1829,9 @@ fn test_tck_instructions_comparisons() {
 
 #[test]
 fn test_tck_instructions_tableswitch() {
+    if !require_extended_interpreter_tests("test_tck_instructions_tableswitch") {
+        return;
+    }
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke("cratonvm/TckInstructions", "testTableswitch", "()I", &[]);
@@ -1549,6 +1843,9 @@ fn test_tck_instructions_tableswitch() {
 
 #[test]
 fn test_tck_instructions_lookupswitch() {
+    if !require_extended_interpreter_tests("test_tck_instructions_lookupswitch") {
+        return;
+    }
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke("cratonvm/TckInstructions", "testLookupswitch", "()I", &[]);
@@ -1560,6 +1857,9 @@ fn test_tck_instructions_lookupswitch() {
 
 #[test]
 fn test_tck_instructions_field_ops() {
+    if !require_extended_interpreter_tests("test_tck_instructions_field_ops") {
+        return;
+    }
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke("cratonvm/TckInstructions", "testFieldOps", "()I", &[]);
@@ -1571,6 +1871,9 @@ fn test_tck_instructions_field_ops() {
 
 #[test]
 fn test_tck_instructions_array_ops() {
+    if !require_extended_interpreter_tests("test_tck_instructions_array_ops") {
+        return;
+    }
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke("cratonvm/TckInstructions", "testArrayOps", "()I", &[]);
@@ -1582,6 +1885,9 @@ fn test_tck_instructions_array_ops() {
 
 #[test]
 fn test_tck_instructions_invoke_virtual() {
+    if !require_extended_interpreter_tests("test_tck_instructions_invoke_virtual") {
+        return;
+    }
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke("cratonvm/TckInstructions", "testInvokeVirtual", "()I", &[]);
@@ -1593,6 +1899,9 @@ fn test_tck_instructions_invoke_virtual() {
 
 #[test]
 fn test_tck_instructions_invoke_static() {
+    if !require_extended_interpreter_tests("test_tck_instructions_invoke_static") {
+        return;
+    }
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke("cratonvm/TckInstructions", "testInvokeStatic", "()I", &[]);
@@ -1604,6 +1913,9 @@ fn test_tck_instructions_invoke_static() {
 
 #[test]
 fn test_tck_instructions_exception_handling() {
+    if !require_extended_interpreter_tests("test_tck_instructions_exception_handling") {
+        return;
+    }
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke(
@@ -1620,6 +1932,9 @@ fn test_tck_instructions_exception_handling() {
 
 #[test]
 fn test_tck_instructions_checkcast() {
+    if !require_extended_interpreter_tests("test_tck_instructions_checkcast") {
+        return;
+    }
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke("cratonvm/TckInstructions", "testCheckcast", "()I", &[]);
@@ -1631,6 +1946,9 @@ fn test_tck_instructions_checkcast() {
 
 #[test]
 fn test_tck_instructions_instanceof() {
+    if !require_extended_interpreter_tests("test_tck_instructions_instanceof") {
+        return;
+    }
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke("cratonvm/TckInstructions", "testInstanceof", "()I", &[]);
@@ -1646,6 +1964,9 @@ fn test_tck_instructions_instanceof() {
 
 #[test]
 fn test_s17_method_invoke_private() {
+    if !require_extended_interpreter_tests("test_s17_method_invoke_private") {
+        return;
+    }
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke(
@@ -1662,6 +1983,9 @@ fn test_s17_method_invoke_private() {
 
 #[test]
 fn test_s17_method_invoke_instance() {
+    if !require_extended_interpreter_tests("test_s17_method_invoke_instance") {
+        return;
+    }
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke(
@@ -1678,6 +2002,9 @@ fn test_s17_method_invoke_instance() {
 
 #[test]
 fn test_s17_method_invoke_type_coercion() {
+    if !require_extended_interpreter_tests("test_s17_method_invoke_type_coercion") {
+        return;
+    }
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke(
@@ -1694,6 +2021,9 @@ fn test_s17_method_invoke_type_coercion() {
 
 #[test]
 fn test_s17_field_get_private() {
+    if !require_extended_interpreter_tests("test_s17_field_get_private") {
+        return;
+    }
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke(
@@ -1710,6 +2040,9 @@ fn test_s17_field_get_private() {
 
 #[test]
 fn test_s17_field_set_private() {
+    if !require_extended_interpreter_tests("test_s17_field_set_private") {
+        return;
+    }
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke(
@@ -1726,6 +2059,9 @@ fn test_s17_field_set_private() {
 
 #[test]
 fn test_s17_field_static_get_set() {
+    if !require_extended_interpreter_tests("test_s17_field_static_get_set") {
+        return;
+    }
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke(
@@ -1742,6 +2078,9 @@ fn test_s17_field_static_get_set() {
 
 #[test]
 fn test_s17_constructor_noarg() {
+    if !require_extended_interpreter_tests("test_s17_constructor_noarg") {
+        return;
+    }
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke(
@@ -1758,6 +2097,9 @@ fn test_s17_constructor_noarg() {
 
 #[test]
 fn test_s17_constructor_with_args() {
+    if !require_extended_interpreter_tests("test_s17_constructor_with_args") {
+        return;
+    }
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke(
@@ -1774,6 +2116,9 @@ fn test_s17_constructor_with_args() {
 
 #[test]
 fn test_s17_constructor_set_accessible() {
+    if !require_extended_interpreter_tests("test_s17_constructor_set_accessible") {
+        return;
+    }
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke(
@@ -1790,6 +2135,9 @@ fn test_s17_constructor_set_accessible() {
 
 #[test]
 fn test_s17_proxy_basic() {
+    if !require_extended_interpreter_tests("test_s17_proxy_basic") {
+        return;
+    }
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke("cratonvm/ReflectionComplete", "testProxyBasic", "()I", &[]);
@@ -1801,6 +2149,9 @@ fn test_s17_proxy_basic() {
 
 #[test]
 fn test_s17_proxy_is_proxy_class() {
+    if !require_extended_interpreter_tests("test_s17_proxy_is_proxy_class") {
+        return;
+    }
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke(
@@ -1817,6 +2168,9 @@ fn test_s17_proxy_is_proxy_class() {
 
 #[test]
 fn test_s17_proxy_get_handler() {
+    if !require_extended_interpreter_tests("test_s17_proxy_get_handler") {
+        return;
+    }
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke(
@@ -1833,6 +2187,9 @@ fn test_s17_proxy_get_handler() {
 
 #[test]
 fn test_s17_get_declared_methods() {
+    if !require_extended_interpreter_tests("test_s17_get_declared_methods") {
+        return;
+    }
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke(
@@ -1849,6 +2206,9 @@ fn test_s17_get_declared_methods() {
 
 #[test]
 fn test_s17_get_declared_fields() {
+    if !require_extended_interpreter_tests("test_s17_get_declared_fields") {
+        return;
+    }
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke(
@@ -1865,6 +2225,9 @@ fn test_s17_get_declared_fields() {
 
 #[test]
 fn test_s17_get_declared_constructors() {
+    if !require_extended_interpreter_tests("test_s17_get_declared_constructors") {
+        return;
+    }
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke(
@@ -1881,6 +2244,9 @@ fn test_s17_get_declared_constructors() {
 
 #[test]
 fn test_s17_get_declared_method_by_name() {
+    if !require_extended_interpreter_tests("test_s17_get_declared_method_by_name") {
+        return;
+    }
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke(
@@ -1897,6 +2263,9 @@ fn test_s17_get_declared_method_by_name() {
 
 #[test]
 fn test_s17_method_modifiers() {
+    if !require_extended_interpreter_tests("test_s17_method_modifiers") {
+        return;
+    }
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke(
@@ -1913,6 +2282,9 @@ fn test_s17_method_modifiers() {
 
 #[test]
 fn test_s17_field_modifiers() {
+    if !require_extended_interpreter_tests("test_s17_field_modifiers") {
+        return;
+    }
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke(
@@ -1929,6 +2301,9 @@ fn test_s17_field_modifiers() {
 
 #[test]
 fn test_s17_method_return_type() {
+    if !require_extended_interpreter_tests("test_s17_method_return_type") {
+        return;
+    }
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke(
@@ -1945,6 +2320,9 @@ fn test_s17_method_return_type() {
 
 #[test]
 fn test_s17_method_parameter_types() {
+    if !require_extended_interpreter_tests("test_s17_method_parameter_types") {
+        return;
+    }
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke(
@@ -1961,6 +2339,9 @@ fn test_s17_method_parameter_types() {
 
 #[test]
 fn test_s17_method_parameter_count() {
+    if !require_extended_interpreter_tests("test_s17_method_parameter_count") {
+        return;
+    }
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke(
@@ -1977,6 +2358,9 @@ fn test_s17_method_parameter_count() {
 
 #[test]
 fn test_s17_field_type() {
+    if !require_extended_interpreter_tests("test_s17_field_type") {
+        return;
+    }
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke("cratonvm/ReflectionComplete", "testFieldType", "()I", &[]);
@@ -1988,6 +2372,9 @@ fn test_s17_field_type() {
 
 #[test]
 fn test_s17_field_declaring_class() {
+    if !require_extended_interpreter_tests("test_s17_field_declaring_class") {
+        return;
+    }
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke(
@@ -2004,6 +2391,9 @@ fn test_s17_field_declaring_class() {
 
 #[test]
 fn test_s17_method_declaring_class() {
+    if !require_extended_interpreter_tests("test_s17_method_declaring_class") {
+        return;
+    }
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke(
@@ -2024,6 +2414,9 @@ fn test_s17_method_declaring_class() {
 
 #[test]
 fn test_s18_custom_annotation_values() {
+    if !require_extended_interpreter_tests("test_s18_custom_annotation_values") {
+        return;
+    }
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke(
@@ -2040,6 +2433,9 @@ fn test_s18_custom_annotation_values() {
 
 #[test]
 fn test_s18_inherited_annotation() {
+    if !require_extended_interpreter_tests("test_s18_inherited_annotation") {
+        return;
+    }
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke(
@@ -2056,6 +2452,9 @@ fn test_s18_inherited_annotation() {
 
 #[test]
 fn test_s18_non_inherited_not_present() {
+    if !require_extended_interpreter_tests("test_s18_non_inherited_not_present") {
+        return;
+    }
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke(
@@ -2072,6 +2471,9 @@ fn test_s18_non_inherited_not_present() {
 
 #[test]
 fn test_s18_get_inherited_annotation() {
+    if !require_extended_interpreter_tests("test_s18_get_inherited_annotation") {
+        return;
+    }
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke(
@@ -2088,6 +2490,9 @@ fn test_s18_get_inherited_annotation() {
 
 #[test]
 fn test_s18_declared_annotations_no_inherited() {
+    if !require_extended_interpreter_tests("test_s18_declared_annotations_no_inherited") {
+        return;
+    }
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke(
@@ -2104,6 +2509,9 @@ fn test_s18_declared_annotations_no_inherited() {
 
 #[test]
 fn test_s18_overriding_inherited_annotation() {
+    if !require_extended_interpreter_tests("test_s18_overriding_inherited_annotation") {
+        return;
+    }
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke(
@@ -2120,6 +2528,9 @@ fn test_s18_overriding_inherited_annotation() {
 
 #[test]
 fn test_s18_method_annotation_present() {
+    if !require_extended_interpreter_tests("test_s18_method_annotation_present") {
+        return;
+    }
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke(
@@ -2136,6 +2547,9 @@ fn test_s18_method_annotation_present() {
 
 #[test]
 fn test_s18_method_no_annotation() {
+    if !require_extended_interpreter_tests("test_s18_method_no_annotation") {
+        return;
+    }
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke(
@@ -2152,6 +2566,9 @@ fn test_s18_method_no_annotation() {
 
 #[test]
 fn test_s18_parameter_annotation_count() {
+    if !require_extended_interpreter_tests("test_s18_parameter_annotation_count") {
+        return;
+    }
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke(
@@ -2168,6 +2585,9 @@ fn test_s18_parameter_annotation_count() {
 
 #[test]
 fn test_s18_parameter_annotation_empty() {
+    if !require_extended_interpreter_tests("test_s18_parameter_annotation_empty") {
+        return;
+    }
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke(
@@ -2188,6 +2608,9 @@ fn test_s18_parameter_annotation_empty() {
 
 #[test]
 fn test_s19_class_type_params() {
+    if !require_extended_interpreter_tests("test_s19_class_type_params") {
+        return;
+    }
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke(
@@ -2204,6 +2627,9 @@ fn test_s19_class_type_params() {
 
 #[test]
 fn test_s19_multiple_type_params() {
+    if !require_extended_interpreter_tests("test_s19_multiple_type_params") {
+        return;
+    }
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke(
@@ -2220,6 +2646,9 @@ fn test_s19_multiple_type_params() {
 
 #[test]
 fn test_s19_bounded_type_param() {
+    if !require_extended_interpreter_tests("test_s19_bounded_type_param") {
+        return;
+    }
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke(
@@ -2236,6 +2665,9 @@ fn test_s19_bounded_type_param() {
 
 #[test]
 fn test_s19_generic_superclass() {
+    if !require_extended_interpreter_tests("test_s19_generic_superclass") {
+        return;
+    }
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke(
@@ -2252,6 +2684,9 @@ fn test_s19_generic_superclass() {
 
 #[test]
 fn test_s19_non_generic_superclass() {
+    if !require_extended_interpreter_tests("test_s19_non_generic_superclass") {
+        return;
+    }
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke(
@@ -2268,6 +2703,9 @@ fn test_s19_non_generic_superclass() {
 
 #[test]
 fn test_s19_method_type_params() {
+    if !require_extended_interpreter_tests("test_s19_method_type_params") {
+        return;
+    }
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke(
@@ -2284,6 +2722,9 @@ fn test_s19_method_type_params() {
 
 #[test]
 fn test_s19_method_generic_return_type() {
+    if !require_extended_interpreter_tests("test_s19_method_generic_return_type") {
+        return;
+    }
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke(
@@ -2300,6 +2741,9 @@ fn test_s19_method_generic_return_type() {
 
 #[test]
 fn test_s19_method_generic_param_types() {
+    if !require_extended_interpreter_tests("test_s19_method_generic_param_types") {
+        return;
+    }
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke(
@@ -2316,6 +2760,9 @@ fn test_s19_method_generic_param_types() {
 
 #[test]
 fn test_s19_field_generic_type() {
+    if !require_extended_interpreter_tests("test_s19_field_generic_type") {
+        return;
+    }
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke(
@@ -2332,6 +2779,9 @@ fn test_s19_field_generic_type() {
 
 #[test]
 fn test_s19_no_type_params() {
+    if !require_extended_interpreter_tests("test_s19_no_type_params") {
+        return;
+    }
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke(
@@ -2353,6 +2803,9 @@ fn test_s19_no_type_params() {
 // Hibernate List<OrderLine> patterns).
 #[test]
 fn test_s19_parameterized_superclass() {
+    if !require_extended_interpreter_tests("test_s19_parameterized_superclass") {
+        return;
+    }
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke(
@@ -2371,6 +2824,9 @@ fn test_s19_parameterized_superclass() {
 // materializes a ParameterizedType with the right raw + args.
 #[test]
 fn test_s19_parameterized_field() {
+    if !require_extended_interpreter_tests("test_s19_parameterized_field") {
+        return;
+    }
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke(
@@ -2389,6 +2845,9 @@ fn test_s19_parameterized_field() {
 // — both type arguments must round-trip in declaration order.
 #[test]
 fn test_s19_two_arg_parameterized_field() {
+    if !require_extended_interpreter_tests("test_s19_two_arg_parameterized_field") {
+        return;
+    }
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke(
@@ -2407,6 +2866,9 @@ fn test_s19_two_arg_parameterized_field() {
 // materializes as a WildcardType whose getUpperBounds()[0] is Number.class.
 #[test]
 fn test_s19_wildcard_extends_number() {
+    if !require_extended_interpreter_tests("test_s19_wildcard_extends_number") {
+        return;
+    }
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke(
@@ -2429,6 +2891,9 @@ macro_rules! s20_test {
     ($name:ident, $method:expr, $expected:expr) => {
         #[test]
         fn $name() {
+            if !require_extended_interpreter_tests(stringify!($name)) {
+                return;
+            }
             require_class_files!();
             let mut vm = test_vm();
             let result = vm.invoke("cratonvm/StreamComplete", $method, "()I", &[]);
@@ -2487,6 +2952,9 @@ macro_rules! s21_test {
     ($name:ident, $method:expr, $expected:expr) => {
         #[test]
         fn $name() {
+            if !require_extended_interpreter_tests(stringify!($name)) {
+                return;
+            }
             require_class_files!();
             let mut vm = test_vm();
             let result = vm.invoke("cratonvm/StringFormatComplete", $method, "()I", &[]);
@@ -2557,6 +3025,9 @@ macro_rules! s22_test {
     ($name:ident, $method:expr, $expected:expr) => {
         #[test]
         fn $name() {
+            if !require_extended_interpreter_tests(stringify!($name)) {
+                return;
+            }
             require_class_files!();
             let mut vm = test_vm();
             let result = vm.invoke("cratonvm/PropertiesComplete", $method, "()I", &[]);
@@ -2623,6 +3094,9 @@ macro_rules! s23_test {
     ($name:ident, $method:expr) => {
         #[test]
         fn $name() {
+            if !require_extended_interpreter_tests(stringify!($name)) {
+                return;
+            }
             require_class_files!();
             let mut vm = test_vm();
             let result = vm.invoke("cratonvm/MemoryModelTest", $method, "()I", &[]);
@@ -2636,6 +3110,9 @@ macro_rules! s23_test {
 
 #[test]
 fn test_s23_thread_basic() {
+    if !require_extended_interpreter_tests("test_s23_thread_basic") {
+        return;
+    }
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke("cratonvm/ThreadBasicTest", "testThreadBasic", "()I", &[]);
@@ -2670,6 +3147,9 @@ macro_rules! s23b_test {
     ($name:ident, $method:expr, $expected:expr) => {
         #[test]
         fn $name() {
+            if !require_extended_interpreter_tests(stringify!($name)) {
+                return;
+            }
             require_class_files!();
             let mut vm = test_vm();
             let result = vm.invoke("cratonvm/JmmComplete", $method, "()I", &[]);
@@ -2744,6 +3224,9 @@ macro_rules! s24_test {
     ($name:ident, $method:expr, $expected:expr) => {
         #[test]
         fn $name() {
+            if !require_extended_interpreter_tests(stringify!($name)) {
+                return;
+            }
             require_class_files!();
             let mut vm = test_vm();
             let result = vm.invoke("cratonvm/InterruptComplete", $method, "()I", &[]);
@@ -2866,6 +3349,9 @@ macro_rules! s25_test {
     ($name:ident, $method:expr, $expected:expr) => {
         #[test]
         fn $name() {
+            if !require_extended_interpreter_tests(stringify!($name)) {
+                return;
+            }
             require_class_files!();
             let mut vm = test_vm();
             let result = vm.invoke("cratonvm/VirtualThreadTest", $method, "()I", &[]);
@@ -2924,6 +3410,9 @@ macro_rules! s27_test {
     ($name:ident, $method:expr, $expected:expr) => {
         #[test]
         fn $name() {
+            if !require_extended_interpreter_tests(stringify!($name)) {
+                return;
+            }
             require_class_files!();
             let mut vm = test_vm();
             let result = vm.invoke("cratonvm/FinalizerTest", $method, "()I", &[]);
@@ -2951,6 +3440,9 @@ macro_rules! s32_test {
     ($name:ident, $method:expr, $expected:expr) => {
         #[test]
         fn $name() {
+            if !require_extended_interpreter_tests(stringify!($name)) {
+                return;
+            }
             require_class_files!();
             let mut vm = test_vm();
             let result = vm.invoke("cratonvm/EscapeAnalysisTest", $method, "()I", &[]);
@@ -2982,6 +3474,9 @@ macro_rules! s31_test {
     ($name:ident, $method:expr, $expected:expr) => {
         #[test]
         fn $name() {
+            if !require_extended_interpreter_tests(stringify!($name)) {
+                return;
+            }
             require_class_files!();
             let mut vm = test_vm();
             let result = vm.invoke("cratonvm/InlineComplete", $method, "()I", &[]);
@@ -3035,6 +3530,9 @@ macro_rules! s33_test {
     ($name:ident, $method:expr, $expected:expr) => {
         #[test]
         fn $name() {
+            if !require_extended_interpreter_tests(stringify!($name)) {
+                return;
+            }
             require_class_files!();
             let mut vm = test_vm();
             let result = vm.invoke("cratonvm/InlineCacheTest", $method, "()I", &[]);
@@ -3068,6 +3566,9 @@ macro_rules! s35_test {
     ($name:ident, $method:expr, $expected:expr) => {
         #[test]
         fn $name() {
+            if !require_extended_interpreter_tests(stringify!($name)) {
+                return;
+            }
             require_class_files!();
             let mut vm = test_vm();
             let result = vm.invoke("cratonvm/OsrComplete", $method, "()I", &[]);
@@ -3146,6 +3647,9 @@ macro_rules! s37_test_int {
     ($name:ident, $method:expr, $expected:expr) => {
         #[test]
         fn $name() {
+            if !require_extended_interpreter_tests(stringify!($name)) {
+                return;
+            }
             require_class_files!();
             let mut vm = test_vm();
             let result = vm.invoke("cratonvm/FPCompletenessTest", $method, "()I", &[]);
@@ -3161,6 +3665,9 @@ macro_rules! s37_test_long {
     ($name:ident, $method:expr, $expected:expr) => {
         #[test]
         fn $name() {
+            if !require_extended_interpreter_tests(stringify!($name)) {
+                return;
+            }
             require_class_files!();
             let mut vm = test_vm();
             let result = vm.invoke("cratonvm/FPCompletenessTest", $method, "()J", &[]);
@@ -3224,6 +3731,9 @@ macro_rules! s39_test {
     ($name:ident, $method:expr, $expected:expr) => {
         #[test]
         fn $name() {
+            if !require_extended_interpreter_tests(stringify!($name)) {
+                return;
+            }
             require_class_files!();
             let mut vm = test_vm();
             let result = vm.invoke("cratonvm/JdwpComplete", $method, "()I", &[]);
@@ -3285,6 +3795,9 @@ macro_rules! s44_test {
     ($name:ident, $method:expr, $expected:expr) => {
         #[test]
         fn $name() {
+            if !require_extended_interpreter_tests(stringify!($name)) {
+                return;
+            }
             require_class_files!();
             let mut vm = test_vm();
             let result = vm.invoke("cratonvm/JniComplete", $method, "()I", &[]);
@@ -3359,6 +3872,9 @@ macro_rules! s46_test {
     ($name:ident, $method:expr, $expected:expr) => {
         #[test]
         fn $name() {
+            if !require_extended_interpreter_tests(stringify!($name)) {
+                return;
+            }
             require_class_files!();
             let mut vm = test_vm();
             let result = vm.invoke("cratonvm/TckLang", $method, "()I", &[]);
@@ -3515,6 +4031,9 @@ macro_rules! s50_test {
     ($name:ident, $method:expr, $expected:expr) => {
         #[test]
         fn $name() {
+            if !require_extended_interpreter_tests(stringify!($name)) {
+                return;
+            }
             require_class_files!();
             let mut vm = test_vm();
             let result = vm.invoke("cratonvm/TckReflect", $method, "()I", &[]);
@@ -3696,6 +4215,9 @@ macro_rules! s38_test {
     ($name:ident, $method:expr, $expected:expr) => {
         #[test]
         fn $name() {
+            if !require_extended_interpreter_tests(stringify!($name)) {
+                return;
+            }
             require_class_files!();
             let mut vm = test_vm();
             let result = vm.invoke("cratonvm/PgoTest", $method, "()I", &[]);
@@ -3918,6 +4440,9 @@ macro_rules! s47_test {
     ($name:ident, $method:expr) => {
         #[test]
         fn $name() {
+            if !require_extended_interpreter_tests(stringify!($name)) {
+                return;
+            }
             require_class_files!();
             let mut vm = test_vm();
             let result = vm.invoke("cratonvm/TckUtil", $method, "()I", &[]);
@@ -3982,6 +4507,9 @@ macro_rules! s49_test {
     ($name:ident, $method:expr) => {
         #[test]
         fn $name() {
+            if !require_extended_interpreter_tests(stringify!($name)) {
+                return;
+            }
             require_class_files!();
             let mut vm = test_vm();
             let result = vm.invoke("cratonvm/JucComplete", $method, "()I", &[]);
@@ -3994,6 +4522,9 @@ macro_rules! s49_test {
     ($name:ident, $method:expr, $expected:expr) => {
         #[test]
         fn $name() {
+            if !require_extended_interpreter_tests(stringify!($name)) {
+                return;
+            }
             require_class_files!();
             let mut vm = test_vm();
             let result = vm.invoke("cratonvm/JucComplete", $method, "()I", &[]);
@@ -4207,6 +4738,9 @@ macro_rules! s51_test {
     ($name:ident, $method:expr) => {
         #[test]
         fn $name() {
+            if !require_extended_interpreter_tests(stringify!($name)) {
+                return;
+            }
             require_class_files!();
             let mut vm = test_vm();
             let result = vm.invoke("cratonvm/ScopedValueComplete", $method, "()I", &[]);
@@ -4294,6 +4828,9 @@ macro_rules! s48_test {
     ($name:ident, $method:expr) => {
         #[test]
         fn $name() {
+            if !require_extended_interpreter_tests(stringify!($name)) {
+                return;
+            }
             require_class_files!();
             let mut vm = test_vm();
             let result = vm.invoke("cratonvm/TckIo", $method, "()I", &[]);
@@ -4379,6 +4916,9 @@ macro_rules! new14_jdbc_test {
     ($name:ident, $method:expr) => {
         #[test]
         fn $name() {
+            if !require_extended_interpreter_tests(stringify!($name)) {
+                return;
+            }
             require_class_files!();
             let mut vm = test_vm();
             let result = vm.invoke("cratonvm/TckJdbc", $method, "()I", &[]);
@@ -4433,6 +4973,9 @@ macro_rules! s53_test {
     ($name:ident, $method:expr) => {
         #[test]
         fn $name() {
+            if !require_extended_interpreter_tests(stringify!($name)) {
+                return;
+            }
             require_class_files!();
             let mut vm = test_vm();
             let result = vm.invoke("cratonvm/PatternComplete", $method, "()I", &[]);

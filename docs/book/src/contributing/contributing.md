@@ -15,7 +15,8 @@ in the repository). By participating, you agree to uphold it.
 1. Fork the repository and clone your fork.
 2. Install the prerequisites and build/test (see [Building](building.md)).
 3. Make your change on a branch.
-4. Ensure all of the following pass — CI gates each on every push and PR:
+4. Run the release-quality checks and record any known failures in the PR notes.
+   CI is configured to run these on every push and PR:
    - **Format:** `cargo fmt --all --check`
    - **Lint:** `cargo clippy --workspace --all-targets -- -D warnings`
    - **Build:** `cargo build --workspace`
@@ -26,7 +27,9 @@ in the repository). By participating, you agree to uphold it.
 ### Code style
 
 - `rustfmt` defaults with `max_width = 100`.
-- Zero clippy warnings under the workspace lint config.
+- Keep `cargo clippy --workspace --all-targets -- -D warnings` clean under the
+  workspace lint config; do not claim zero warnings unless that command passes
+  on the branch being submitted.
 - Use `thiserror` for error types and `tracing` for logging (not `println!` /
   `eprintln!` in library crates).
 - Add a `// SAFETY:` comment to every `unsafe` block explaining the invariant.

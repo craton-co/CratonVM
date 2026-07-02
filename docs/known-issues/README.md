@@ -14,11 +14,11 @@ it under `docs/internal`.
 
 After consolidation (full re-count 2026-06-18, kafka-bug-B/C status reconciled 2026-07-01),
 the ~30 docs map to **one root-cause family + ~16 distinct standalone bugs**, of which
-**9 are already FIXED on `dev`** (the 6 prior + `kafka-bug-C` and both `kafka-bug-B`
-fixes). Headline:
+**10 are already FIXED on `dev`** (the prior 9 plus the Lucene104 provider
+initialization gap). Headline:
 
-**~9 distinct OPEN defects + 1 latent** (was ~10 — family-A **A2** was fixed
-2026-06-23, `6e3ddb05`), grouped as:
+**~8 distinct OPEN defects + 1 latent** (was ~9 — the Lucene104 provider
+initialization gap was fixed 2026-07-02), grouped as:
 
 1. **Family A — GC root coverage under JIT** (one root cause, several manifestations). Open members:
    **A4** (Fork6 FJP multi-thread, gated) — the last open member. **A1/A2/A3/A5 are FIXED** — **A2**
@@ -131,13 +131,6 @@ fixes). Headline:
     + materialized elements in Rust locals across `invoke_virtual`; the moving young collector relocates them
     out from under the stale local. `-Xmx8g` passes; default heap ~50–70 % crash. Fix = `pin_native_root` /
     `read_native_pin` per native (NOT force-non-moving — that hits the HIB-CV-33 precise-root gap).
-
-20. **[Elasticsearch Lucene104 module-provider discovery gap](elasticsearch-lucene104-module-provider-gap.md)** -
-    **OPEN**. Elasticsearch JUnit classes that initialize Lucene fail under CratonVM because
-    `org.apache.lucene.codecs.Codec$Holder` cannot discover `Lucene104`. HotSpot passes the
-    same classpath. The Lucene 10.4 core jar declares
-    `provides org.apache.lucene.codecs.Codec with org.apache.lucene.codecs.lucene104.Lucene104Codec`
-    in `module-info.class`, so the blocker is a CratonVM service-provider/module-provider discovery gap.
 
 FIXED bugs whose standalone docs were **removed** from this folder (resolved; full writeups in
 `git` history or [`docs/internal/fixed-suite-bugs/`](../internal/fixed-suite-bugs/)): A1 (reflection
@@ -434,6 +427,41 @@ JIT divide-by-zero re-run) has since been fixed; the other two remain open:
 - **T11 safety-annotation coverage below thresholds**:
   [t11-safety-annotation-coverage.md](t11-safety-annotation-coverage.md). Documentation-only but
   large (~264 cast annotations in interpreter.rs); must be authored accurately, not marker-spammed.
+
+## Keycloak suite classpath (2026-07-02)
+
+- ✅ **Mixed JUnit 5.10.3/6.0.3 runtime on `kc-universal-cp.txt`** — FIXED (local
+  classpath file normalized to a single JUnit 6.0.3 stack). Caused 338 `CRASH` rows
+  (`NamespaceAwareStore.computeIfAbsent` `NoSuchMethodError`) across `tests/base`
+  and `tests/clustering`. Historical record moved to
+  [../internal/keycloak-junit-namespaceawarestore-classpath-crashes.md](../internal/keycloak-junit-namespaceawarestore-classpath-crashes.md).
+- ✅ **`Assert.assertNotNull` linkage crash (37 `CRASH` rows, `testsuite/model`)** —
+  FIXED (`smallrye-common-constraint-2.16.0.jar` was entirely absent from
+  `kc-universal-cp.txt`; added). Also added: a `CRATONVM_TRACE_UNIMPLEMENTED`-gated
+  diagnostic that names the missing class whenever CratonVM's classloader falls
+  back to an empty synthetic stub for an unresolvable `org/jboss/`, `org/wildfly/`,
+  `io/quarkus/`, `io/smallrye/`, … class, plus a hint on the terminal
+  `NoSuchMethodError` warning when the target class is such a stub — so this class
+  of masked-classpath-gap bug self-diagnoses next time instead of needing a
+  multi-hour investigation. Historical record moved to
+  [../internal/keycloak-smallrye-assertnotnull-linkage-crashes.md](../internal/keycloak-smallrye-assertnotnull-linkage-crashes.md).
+- ✅ **`SmallRyeConfigBuilder.addDefaultSources` linkage crash (3 `CRASH` rows,
+  `tests/db` + `tests/clustering`)** — FIXED (`smallrye-config`/
+  `smallrye-config-common`/`smallrye-config-core` 3.16.0 and, one layer down,
+  `microprofile-config-api-3.1.jar` were entirely absent from
+  `kc-universal-cp.txt`; both added). Historical record moved to
+  [../internal/keycloak-smallrye-configbuilder-defaultsources-linkage-crashes.md](../internal/keycloak-smallrye-configbuilder-defaultsources-linkage-crashes.md).
+- [keycloak-testframework-quarkus-config-classpath-gap.md](keycloak-testframework-quarkus-config-classpath-gap.md) —
+  🔴 open. Uncovered by the fixes above: `org.keycloak.testframework.config.Config`
+  needs `quarkus-core` (for `CharsetConverter`/`MemorySizeConverter`/
+  `InetSocketAddressConverter`, and — per the `assertNotNull` fix above —
+  `opentelemetry.runtime.config.build.SamplerType`), which is entirely absent from
+  `kc-universal-cp.txt`. Both fixes above still bottom out on this same gap one
+  layer further in (`SamplerType` for `testsuite/model` classes via
+  `KeycloakModelTest`; `CharsetConverter`'s `SRCFG00012` "not parameterized with a
+  type" for the `tests/db`/`tests/clustering` classes via
+  `SmallRyeConfigBuilder.withConverters`) — not new bugs, both covered by this
+  doc's existing next steps.
 
 ## Consolidation log
 

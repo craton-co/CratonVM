@@ -16422,6 +16422,57 @@ pub fn comparator_compare(
     let tag = match tag {
         Some(t) => t,
         None => {
+            // A descriptor-blind `thenComparing` dispatch can store a key
+            // extractor lambda directly in the secondary-comparator slot. If
+            // the receiver is one of those lambda proxies, skip the doomed
+            // `compare(Object,Object)` probe and run the corresponding
+            // `Comparator.comparing*` semantics up front.
+            let lambda_iface = ctx.lambda_functional_interface(ctx.class_id_of_object(comparator));
+            match lambda_iface.as_deref() {
+                Some("java/util/function/Function") => {
+                    return compare_with_key_function(ctx, comparator, a, b);
+                }
+                Some("java/util/function/ToIntFunction") => {
+                    let ia = comparing_key_as_i64(
+                        ctx,
+                        comparator,
+                        "applyAsInt",
+                        "(Ljava/lang/Object;)I",
+                        a,
+                    )?;
+                    let ib = comparing_key_as_i64(
+                        ctx,
+                        comparator,
+                        "applyAsInt",
+                        "(Ljava/lang/Object;)I",
+                        b,
+                    )?;
+                    return Ok(Some(Value::Int(ia.cmp(&ib) as i32)));
+                }
+                Some("java/util/function/ToLongFunction") => {
+                    let ia = comparing_key_as_i64(
+                        ctx,
+                        comparator,
+                        "applyAsLong",
+                        "(Ljava/lang/Object;)J",
+                        a,
+                    )?;
+                    let ib = comparing_key_as_i64(
+                        ctx,
+                        comparator,
+                        "applyAsLong",
+                        "(Ljava/lang/Object;)J",
+                        b,
+                    )?;
+                    return Ok(Some(Value::Int(ia.cmp(&ib) as i32)));
+                }
+                Some("java/util/function/ToDoubleFunction") => {
+                    let da = comparing_key_as_f64(ctx, comparator, a)?;
+                    let db = comparing_key_as_f64(ctx, comparator, b)?;
+                    return Ok(Some(Value::Int(double_compare(da, db))));
+                }
+                _ => {}
+            }
             // Not a factory comparator — invoke its `compare` (lambda path).
             //
             // Fallback: if `compare` does not resolve, the object is actually a
@@ -16445,27 +16496,10 @@ pub fn comparator_compare(
                 &[a, b],
             ) {
                 Ok(v) => Ok(v),
-                Err(compare_err) => {
-                    match ctx.invoke_virtual(
-                        comparator,
-                        "apply",
-                        "(Ljava/lang/Object;)Ljava/lang/Object;",
-                        &[a],
-                    ) {
-                        Ok(Some(ka)) => {
-                            let kb = ctx
-                                .invoke_virtual(
-                                    comparator,
-                                    "apply",
-                                    "(Ljava/lang/Object;)Ljava/lang/Object;",
-                                    &[b],
-                                )?
-                                .unwrap_or(Value::Object(None));
-                            natural_compare(ctx, &ka, &kb)
-                        }
-                        _ => Err(compare_err),
-                    }
-                }
+                Err(compare_err) => match compare_with_key_function(ctx, comparator, a, b) {
+                    Ok(v) => Ok(v),
+                    Err(_) => Err(compare_err),
+                },
             };
         }
     };
@@ -16560,6 +16594,31 @@ pub fn comparator_compare(
         }
         _ => Ok(Some(Value::Int(0))),
     }
+}
+
+fn compare_with_key_function(
+    ctx: &mut dyn NativeContext,
+    key_fn: ObjectRef,
+    a: Value,
+    b: Value,
+) -> MethodCallResult {
+    let ka = ctx
+        .invoke_virtual(
+            key_fn,
+            "apply",
+            "(Ljava/lang/Object;)Ljava/lang/Object;",
+            &[a],
+        )?
+        .unwrap_or(Value::Object(None));
+    let kb = ctx
+        .invoke_virtual(
+            key_fn,
+            "apply",
+            "(Ljava/lang/Object;)Ljava/lang/Object;",
+            &[b],
+        )?
+        .unwrap_or(Value::Object(None));
+    natural_compare(ctx, &ka, &kb)
 }
 
 /// Invoke a primitive key-extractor SAM (`applyAsInt`/`applyAsLong`) on `arg`
@@ -34047,6 +34106,20 @@ fn register_concurrent_completeness_natives(r: &mut NativeMethodRegistry) {
 
     // --- CompletionStage methods ---
 
+    r.register(
+        cf,
+        "thenApply",
+        "(Ljava/util/function/Function;)Ljava/util/concurrent/CompletableFuture;",
+        native_cf_then_apply_p31,
+    );
+
+    r.register(
+        cf,
+        "thenAccept",
+        "(Ljava/util/function/Consumer;)Ljava/util/concurrent/CompletableFuture;",
+        native_cf_then_accept_p31,
+    );
+
     // thenRun: run Runnable after completion, return new CF with null result
     r.register(
         cf,
@@ -35018,55 +35091,78 @@ fn native_cf_all_of(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
             );
         }
     }
-    // In our synchronous model all input CFs are already completed. allOf returns a
-    // CF<Void> that is normally done UNLESS any input completed exceptionally, in
-    // which case allOf is exceptional with that throwable (real JDK semantics — and
-    // required so KafkaFuture.allOf().whenComplete() propagates the failure).
+    // Synthetic inputs still must not make allOf complete eagerly while any source
+    // remains pending. Otherwise allOf(...).join() can observe completion before
+    // the modeled source future has reached a terminal state.
     let mut exc: Option<Value> = None;
+    let mut pending = false;
     if let Some(Value::Object(Some(arr))) = args.first() {
         let arr = *arr;
         let len = ctx.array_length(arr);
         for i in 0..len {
             if let Value::Object(Some(cf_obj)) = ctx.get_array_element(arr, i) {
-                if let CfState::Exceptional(e) = cf_read_state(ctx, cf_obj) {
-                    exc = Some(e);
-                    break;
+                match cf_read_state(ctx, cf_obj) {
+                    CfState::Exceptional(e) => {
+                        exc = Some(e);
+                        break;
+                    }
+                    CfState::Pending => pending = true,
+                    CfState::Normal(_) => {}
                 }
             }
         }
     }
-    let state = match exc {
-        Some(e) => CfState::Exceptional(e),
-        None => CfState::Normal(Value::Object(None)),
-    };
-    Ok(Some(cf_make_completed(ctx, state)))
+    match exc {
+        Some(e) => Ok(Some(cf_make_completed(ctx, CfState::Exceptional(e)))),
+        None if pending => Ok(Some(cf_make_synthetic(ctx, CfState::Pending))),
+        None => Ok(Some(cf_make_completed(
+            ctx,
+            CfState::Normal(Value::Object(None)),
+        ))),
+    }
 }
 
 fn native_cf_any_of(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    // Return the result of the first CF in the array (all are completed)
     let arr = match args.first() {
         Some(Value::Object(Some(a))) => *a,
-        _ => {
-            let cf = alloc_synthetic(ctx, "java/util/concurrent/CompletableFuture", 4);
-            ctx.set_field(cf, CF_FIELD_RESULT, Value::Object(None));
-            ctx.set_field(cf, CF_FIELD_DONE, Value::Int(1));
-            return Ok(Some(Value::Object(Some(cf))));
-        }
+        _ => return Ok(Some(cf_make_synthetic(ctx, CfState::Pending))),
     };
     let len = ctx.array_length(arr);
-    let result = if len > 0 {
-        let first = ctx.get_array_element(arr, 0);
-        match first {
-            Value::Object(Some(cf_obj)) => ctx.get_field(cf_obj, CF_FIELD_RESULT),
-            _ => Value::Object(None),
+
+    let mut any_real = false;
+    for i in 0..len {
+        if let Value::Object(Some(cf_obj)) = ctx.get_array_element(arr, i) {
+            if cf_is_real_jdk(ctx, cf_obj) {
+                any_real = true;
+                break;
+            }
         }
-    } else {
-        Value::Object(None)
-    };
-    let cf = alloc_synthetic(ctx, "java/util/concurrent/CompletableFuture", 4);
-    ctx.set_field(cf, CF_FIELD_RESULT, result);
-    ctx.set_field(cf, CF_FIELD_DONE, Value::Int(1));
-    Ok(Some(Value::Object(Some(cf))))
+    }
+    if any_real {
+        return ctx.invoke_special(
+            "java/util/concurrent/CompletableFuture",
+            "orTree",
+            "([Ljava/util/concurrent/CompletableFuture;II)Ljava/util/concurrent/CompletableFuture;",
+            &[
+                Value::Object(Some(arr)),
+                Value::Int(0),
+                Value::Int(len as i32 - 1),
+            ],
+        );
+    }
+
+    for i in 0..len {
+        if let Value::Object(Some(cf_obj)) = ctx.get_array_element(arr, i) {
+            match cf_read_state(ctx, cf_obj) {
+                CfState::Pending => {}
+                CfState::Normal(v) => return Ok(Some(cf_make_completed(ctx, CfState::Normal(v)))),
+                CfState::Exceptional(e) => {
+                    return Ok(Some(cf_make_completed(ctx, CfState::Exceptional(e))))
+                }
+            }
+        }
+    }
+    Ok(Some(cf_make_synthetic(ctx, CfState::Pending)))
 }
 
 const CF_ALT_RESULT_CLASS: &str = "java/util/concurrent/CompletableFuture$AltResult";

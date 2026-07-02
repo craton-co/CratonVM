@@ -18,8 +18,9 @@ Tests that require `javac` skip gracefully when no JDK is on the `PATH`.
 
 The CI pipeline is configured to run `cargo fmt --check`, `cargo build`,
 `cargo clippy -D warnings`, and `cargo test` across the workspace on Linux and
-Windows. Coverage, semantic difftest, and fuzz smoke jobs are advisory today;
-check the current Actions run before treating a branch as release-ready.
+Windows. Coverage, semantic difftest, real-path smoke, and fuzz-smoke jobs are
+advisory today; check the current Actions run before treating a branch as
+release-ready.
 
 ## Local CI Checklist
 
@@ -39,10 +40,10 @@ Then check the coverage target:
 pwsh scripts/check-lcov-threshold.ps1 -Path lcov.info -LineThreshold 85
 ```
 
-The repository currently treats **85% line coverage** as the release-readiness
-target. If a branch cannot produce a whole-workspace LCOV report, or reports
-below 85%, call that out explicitly instead of treating the coverage job as
-green.
+The repository currently treats **85% line coverage** as an advisory
+release-readiness target. CI does not enforce a coverage threshold today. If a
+branch cannot produce a whole-workspace LCOV report, or reports below 85%, call
+that out explicitly instead of treating the coverage job as green.
 
 ## Test layers
 
@@ -118,6 +119,7 @@ when prerequisites such as `java` or the corpus are missing.
 ## Code coverage
 
 Coverage is generated with `cargo-llvm-cov` locally and in an advisory CI job.
-Release-ready branches are expected to meet the 85% line coverage target. See
-the repository's coverage documentation for invocation details and the current
-advisory-to-blocking promotion checklist.
+Release-ready branches should meet the 85% line coverage target, but the target
+is not an enforced CI threshold today. See the repository's coverage
+documentation for invocation details and the current advisory-to-blocking
+promotion checklist.

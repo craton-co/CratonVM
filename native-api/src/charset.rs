@@ -1350,6 +1350,15 @@ fn canonical_name_static(name: &str) -> &'static str {
         "windows-1251" => "windows-1251",
         "KOI8-R" => "KOI8-R",
         "IBM850" => "IBM850",
+        "Shift_JIS" => "Shift_JIS",
+        "EUC-JP" => "EUC-JP",
+        "ISO-2022-JP" => "ISO-2022-JP",
+        "Big5" => "Big5",
+        "EUC-KR" => "EUC-KR",
+        "GBK" => "GBK",
+        "GB2312" => "GB2312",
+        "GB18030" => "GB18030",
+        "windows-1250" => "windows-1250",
         _ => "(unknown)",
     }
 }

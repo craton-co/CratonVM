@@ -771,6 +771,30 @@ mod tests {
     }
 
     #[test]
+    fn default_bulk_array_copy_validates_zero_length_operands() {
+        let mut ctx = MockNativeContext::new();
+        let src = ctx.new_array(ArrayElementType::Int, 3);
+        let dst = ctx.new_array(ArrayElementType::Int, 3);
+        fill_int_array(&ctx, dst, &[7, 8, 9]);
+
+        assert!(ctx.bulk_array_copy(src, 3, dst, 3, 0));
+        assert_eq!(read_int_array(&ctx, dst), vec![7, 8, 9]);
+
+        assert!(!ctx.bulk_array_copy(src, 4, dst, 0, 0));
+        assert!(!ctx.bulk_array_copy(src, 0, dst, 4, 0));
+
+        let non_array = ctx.alloc_object(ClassId::new(0), 0);
+        assert!(!ctx.bulk_array_copy(non_array, 0, dst, 0, 0));
+
+        let bytes = ctx.new_array(ArrayElementType::Byte, 1);
+        assert!(!ctx.bulk_array_copy(bytes, 0, dst, 0, 0));
+
+        let refs = ctx.new_ref_array(ClassId::new(0), 1);
+        assert!(!ctx.bulk_array_copy(refs, 0, refs, 0, 0));
+        assert_eq!(read_int_array(&ctx, dst), vec![7, 8, 9]);
+    }
+
+    #[test]
     fn default_bulk_array_copy_rejects_type_mismatch_and_references() {
         let mut ctx = MockNativeContext::new();
         let bytes = ctx.new_array(ArrayElementType::Byte, 2);

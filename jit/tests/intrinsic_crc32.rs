@@ -87,9 +87,10 @@ fn ref_crc32_step(mut crc: u32, data: &[u8]) -> u32 {
 
 // ---------------------------------------------------------------------------
 // Stub runtime helpers — a correctly-emitted CRC32 intrinsic invokes none of
-// them (no helper CALL on the inlined fast path). `uncommon_trap` is wired to
-// a sentinel that records it was reached, so the class-id-guard / bounds
-// deopt edges are observable from the tests.
+// them (no helper CALL on the inlined fast path). Legacy deopt stubs call
+// `uncommon_trap`; default real-frame deopt stubs stash a reconstructed frame.
+// The helpers below accept either signal so the tests track the active deopt
+// backend instead of a specific implementation detail.
 // ---------------------------------------------------------------------------
 
 /// Set by the `uncommon_trap` stub when a deopt edge is taken.
@@ -97,6 +98,26 @@ static DEOPT_TRIPPED: AtomicBool = AtomicBool::new(false);
 
 unsafe extern "C" fn uncommon_trap_stub(_vm: i64, _reason: i64, _bci: i64) {
     DEOPT_TRIPPED.store(true, Ordering::SeqCst);
+}
+
+fn clear_deopt_signals() {
+    DEOPT_TRIPPED.store(false, Ordering::SeqCst);
+    let _ = cratonvm_jit::deopt::take_last_deopt();
+}
+
+fn assert_deopt_signaled(context: &str) {
+    let legacy_trap = DEOPT_TRIPPED.load(Ordering::SeqCst);
+    let real_frame = cratonvm_jit::deopt::take_last_deopt().is_some();
+    assert!(legacy_trap || real_frame, "{context} must hit a deopt path");
+}
+
+fn assert_no_deopt_signaled(context: &str) {
+    let legacy_trap = DEOPT_TRIPPED.load(Ordering::SeqCst);
+    let real_frame = cratonvm_jit::deopt::take_last_deopt().is_some();
+    assert!(
+        !legacy_trap && !real_frame,
+        "{context} must not hit a deopt path; legacy_trap={legacy_trap}, real_frame={real_frame}"
+    );
 }
 
 fn stub_helpers() -> JitRuntimeHelpers {
@@ -567,13 +588,10 @@ fn class_id_mismatch_deopts() {
     let entry = resolve("java/util/zip/CRC32", "(I)V").expect("CRC32.update(I)V must register");
     let f = compile_update_byte(entry, CRC_CLASS_ID);
 
-    DEOPT_TRIPPED.store(false, Ordering::SeqCst);
+    clear_deopt_signals();
     let wrong = FakeReceiver::new(CRC_CLASS_ID ^ 0x1, 0xFFFF_FFFF);
     f(wrong.ptr(), b'x' as i32);
-    assert!(
-        DEOPT_TRIPPED.load(Ordering::SeqCst),
-        "class-id mismatch must hit the uncommon-trap deopt",
-    );
+    assert_deopt_signaled("class-id mismatch");
     assert_eq!(
         wrong.crc(),
         0xFFFF_FFFF,
@@ -589,13 +607,10 @@ fn null_array_deopts() {
         resolve("java/util/zip/CRC32", "([BII)V").expect("CRC32.update([BII)V must register");
     let f = compile_update_bytes(entry, CRC_CLASS_ID);
 
-    DEOPT_TRIPPED.store(false, Ordering::SeqCst);
+    clear_deopt_signals();
     let recv = FakeReceiver::new(CRC_CLASS_ID, 0xFFFF_FFFF);
     f(recv.ptr(), std::ptr::null_mut(), 0, 4);
-    assert!(
-        DEOPT_TRIPPED.load(Ordering::SeqCst),
-        "null array must hit the uncommon-trap deopt",
-    );
+    assert_deopt_signaled("null array");
     assert_eq!(recv.crc(), 0xFFFF_FFFF, "deopt must not mutate crc");
 }
 
@@ -608,25 +623,19 @@ fn out_of_bounds_range_deopts() {
     let data = b"0123456789";
 
     for &(off, len) in &[(0i32, 11i32), (8, 5), (-1, 2), (3, -1), (10, 1)] {
-        DEOPT_TRIPPED.store(false, Ordering::SeqCst);
+        clear_deopt_signals();
         let arr = FakeByteArray::new(data);
         let recv = FakeReceiver::new(CRC_CLASS_ID, 0xFFFF_FFFF);
         f(recv.ptr(), arr.ptr(), off, len);
-        assert!(
-            DEOPT_TRIPPED.load(Ordering::SeqCst),
-            "out-of-bounds (off={off}, len={len}) must deopt",
-        );
+        assert_deopt_signaled(&format!("out-of-bounds (off={off}, len={len})"));
         assert_eq!(recv.crc(), 0xFFFF_FFFF, "deopt must not mutate crc");
     }
 
     // A null receiver also deopts (the interpreter NPEs on virtual dispatch).
-    DEOPT_TRIPPED.store(false, Ordering::SeqCst);
+    clear_deopt_signals();
     let arr = FakeByteArray::new(data);
     f(std::ptr::null_mut(), arr.ptr(), 0, 4);
-    assert!(
-        DEOPT_TRIPPED.load(Ordering::SeqCst),
-        "null receiver must hit the uncommon-trap deopt",
-    );
+    assert_deopt_signaled("null receiver");
 }
 
 #[test]
@@ -638,14 +647,11 @@ fn empty_range_is_a_noop() {
             continue; // CRC32C skipped without SSE4.2
         };
         let f = compile_update_bytes(entry, CRC_CLASS_ID);
-        DEOPT_TRIPPED.store(false, Ordering::SeqCst);
+        clear_deopt_signals();
         let arr = FakeByteArray::new(b"payload");
         let recv = FakeReceiver::new(CRC_CLASS_ID, 0x1234_5678);
         f(recv.ptr(), arr.ptr(), 4, 0);
-        assert!(
-            !DEOPT_TRIPPED.load(Ordering::SeqCst),
-            "empty range must not deopt"
-        );
+        assert_no_deopt_signaled("empty range");
         assert_eq!(
             recv.crc(),
             0x1234_5678,

@@ -70,8 +70,35 @@ function ConvertTo-SafeName([string]$Value) {
   return ($Value -replace '[^A-Za-z0-9_.-]', '_')
 }
 
+function Get-LogBaseName([string]$Module, [string]$Class) {
+  $safe = ConvertTo-SafeName "$Module.$Class"
+  if ($safe.Length -le 80) { return $safe }
+
+  $sha = [System.Security.Cryptography.SHA256]::Create()
+  try {
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes("$Module`t$Class")
+    $hashBytes = $sha.ComputeHash($bytes)
+    $hash = ([System.BitConverter]::ToString($hashBytes) -replace '-', '').Substring(0, 12).ToLowerInvariant()
+  } finally {
+    $sha.Dispose()
+  }
+  return "$($safe.Substring(0, 64)).$hash"
+}
+
 function ConvertTo-InvariantString([double]$Value) {
   return $Value.ToString('F3', [System.Globalization.CultureInfo]::InvariantCulture)
+}
+
+function Add-ContentWithRetry([string]$Path, [string]$Value) {
+  for ($attempt = 1; $attempt -le 50; $attempt++) {
+    try {
+      Add-Content -LiteralPath $Path -Value $Value -Encoding ascii -ErrorAction Stop
+      return
+    } catch [System.IO.IOException] {
+      if ($attempt -eq 50) { throw }
+      Start-Sleep -Milliseconds ([Math]::Min(1000, 40 * $attempt))
+    }
+  }
 }
 
 function ConvertFrom-InvariantString([string]$Value) {
@@ -243,7 +270,7 @@ function Test-ReferenceVmRow($Row) {
 function Write-ClassList([string]$Path, [object[]]$Rows) {
   "module`tclass" | Set-Content -Path $Path -Encoding ascii
   foreach ($row in $Rows) {
-    "$($row.module)`t$($row.class)" | Add-Content -Path $Path -Encoding ascii
+    Add-ContentWithRetry -Path $Path -Value "$($row.module)`t$($row.class)"
   }
 }
 
@@ -443,7 +470,7 @@ function New-ProcessRecord {
     }
   }
 
-  $safe = ConvertTo-SafeName "$module.$class"
+  $safe = Get-LogBaseName -Module $module -Class $class
   $logDir = Join-Path $ModeOut 'logs'
   New-Item -ItemType Directory -Force -Path $logDir | Out-Null
   $outFile = Join-Path $logDir "$safe.out.log"
@@ -559,7 +586,7 @@ function Complete-ProcessRecord {
       '',
       'missing module build\craton-testcp.txt'
     ) -join "`t"
-    Add-Content -Path $ResultPath -Value $line -Encoding ascii
+    Add-ContentWithRetry -Path $ResultPath -Value $line
     $script:ResultIndex++
     Write-Host ("  [{0}] {1,-9} {2,7:N1}s {3}" -f $script:EffectiveModeName, 'NOCP', 0, $Record.class)
     return
@@ -600,7 +627,7 @@ function Complete-ProcessRecord {
     $Record.errFile,
     $note
   ) -join "`t"
-  Add-Content -Path $ResultPath -Value $line -Encoding ascii
+  Add-ContentWithRetry -Path $ResultPath -Value $line
   $script:ResultIndex++
 
   Write-Host ("  [{0}] {1,-9} {2,7:N1}s {3}" -f $script:EffectiveModeName, $classInfo.status, $Seconds, $Record.class)
@@ -830,7 +857,7 @@ if ($AllModes) {
   exit 0
 }
 
-$classes = Get-SelectedClasses
+$classes = @(Get-SelectedClasses)
 Write-Info "selected $($classes.Count) classes (category=$Category start=$Start count=$Count)"
 
 if ($ListOnly) {
