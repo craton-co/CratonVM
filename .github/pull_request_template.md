@@ -17,6 +17,7 @@ Brief description of what this PR does.
 - [ ] Known failures or skipped checks explained
 - [ ] New tests added for new functionality (if applicable)
 - [ ] `CHANGELOG.md` updated under the Unreleased section (for user-facing changes)
+- [ ] Release/package readiness checked against `docs/RELEASE_READINESS.md` (if release, packaging, license, notice, or public metadata changed)
 - [ ] Benchmarks checked with `cargo run --release -p cratonvm-cli -- --classpath bench QuickBench` (if performance-related)
 
 ## Related Issues

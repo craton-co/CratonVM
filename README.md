@@ -275,6 +275,7 @@ cratonvm/
 See [ARCHITECTURE.md](ARCHITECTURE.md) for a detailed overview of the codebase structure.
 See [BUILD_GUIDE.md](BUILD_GUIDE.md) for detailed build instructions, benchmarking, and project structure.
 See [docs/INSTALL.md](docs/INSTALL.md) for binary installation and getting started.
+See [docs/RELEASE_READINESS.md](docs/RELEASE_READINESS.md) for public release, crates.io dry-run, license/notice, and repository readiness checks.
 See [docs/CONFIG.md](docs/CONFIG.md) for all configuration options and tuning parameters.
 See [docs/SECURITY_HARDENING.md](docs/SECURITY_HARDENING.md) for the sandboxing / egress-policy / crypto-hardening reference.
 See [docs/CONTAINER.md](docs/CONTAINER.md) for container/cgroup awareness and resource defaults.
