@@ -137,14 +137,16 @@ pub struct KeyManagerState {
 
 /// Trust-manager state. A null/default `TrustManagerFactory.init` state is
 /// populated from the system trust store; an explicit caller `KeyStore` is
-/// restrictive and contains only that store's anchors. Anchors are keyed by
-/// subject-DN DER for fast chain-end matching. `anchor_ders` is the original
-/// DER bytes so `getAcceptedIssuers()` can return them as `X509Certificate[]`.
+/// restrictive and contains only that store's anchors. Anchors are grouped by
+/// subject-DN DER for fast chain-end matching, but validation still selects a
+/// concrete stored anchor by exact DER/SPKI match or by verifying the chain end
+/// against an anchor SPKI. `anchor_ders` is the original DER bytes so
+/// `getAcceptedIssuers()` can return them as `X509Certificate[]`.
 #[derive(Clone, Debug, Default)]
 pub struct TrustManagerState {
     pub keystore_id: i32,
-    /// subject_dn_der -> SPKI bytes (used to verify the chain's last cert).
-    pub anchors: HashMap<Vec<u8>, AnchorInfo>,
+    /// subject_dn_der -> trust anchors with that subject.
+    pub anchors: HashMap<Vec<u8>, Vec<AnchorInfo>>,
     /// The full DER of every trust anchor, in registration order.
     pub anchor_ders: Vec<Vec<u8>>,
     /// Whether to consult CRLs during validation. Disabled by default.
@@ -1041,14 +1043,15 @@ fn insert_anchor(state: &mut TrustManagerState, der: Vec<u8>) {
         Err(_) => return,
     };
     state.anchor_ders.push(der.clone());
-    state.anchors.insert(
-        parsed.subject_der.clone(),
-        AnchorInfo {
+    state
+        .anchors
+        .entry(parsed.subject_der.clone())
+        .or_default()
+        .push(AnchorInfo {
             subject_der: parsed.subject_der,
             spki_der: parsed.spki_der,
             full_cert_der: Some(der),
-        },
-    );
+        });
 }
 
 fn presented_cert_is_anchor(
@@ -1060,6 +1063,52 @@ fn presented_cert_is_anchor(
         Some(anchor_der) => anchor_der == presented_der,
         None => anchor.subject_der == parsed.subject_der && anchor.spki_der == parsed.spki_der,
     }
+}
+
+fn anchors_for_subject<'a>(trust: &'a TrustManagerState, subject_der: &[u8]) -> &'a [AnchorInfo] {
+    trust
+        .anchors
+        .get(subject_der)
+        .map(Vec::as_slice)
+        .unwrap_or(&[])
+}
+
+fn select_trust_anchor<'a>(
+    parsed: &'a [ParsedCert],
+    chain: &[Vec<u8>],
+    trust: &'a TrustManagerState,
+) -> Result<(&'a AnchorInfo, bool, bool), TrustError> {
+    let last_idx = parsed.len() - 1;
+    let last = &parsed[last_idx];
+    let last_der = &chain[last_idx];
+
+    for anchor in anchors_for_subject(trust, &last.subject_der) {
+        if presented_cert_is_anchor(anchor, last_der, last) {
+            return Ok((anchor, true, false));
+        }
+    }
+
+    let issuer_anchors = anchors_for_subject(trust, &last.issuer_der);
+    if issuer_anchors.is_empty() {
+        return Err(TrustError::NoTrustAnchor);
+    }
+    if last.signature_value.is_empty() {
+        return Err(TrustError::SignatureFailed { at: last_idx });
+    }
+
+    let mut first_error = None;
+    for anchor in issuer_anchors {
+        match verify_one_signature(last_idx, last, anchor.spki_der.as_slice()) {
+            Ok(()) => return Ok((anchor, false, true)),
+            Err(e) => {
+                if first_error.is_none() {
+                    first_error = Some(e);
+                }
+            }
+        }
+    }
+
+    Err(first_error.unwrap_or(TrustError::NoTrustAnchor))
 }
 
 // ---------------------------------------------------------------------------
@@ -1264,21 +1313,13 @@ pub fn validate_chain(chain: &[Vec<u8>], trust: &TrustManagerState) -> Result<()
     }
 
     // Step 5: trust anchor.
-    let last = &parsed[parsed.len() - 1];
-    let last_der = &chain[chain.len() - 1];
     // The last cert's issuer must be present in the trust set unless the last
-    // cert is the actual stored trust anchor. A same-subject certificate
-    // supplied by the peer is not enough: if its DER/SPKI differs from the
-    // anchor, verify it against the matched anchor instead of treating it as
-    // authoritative.
-    let (anchor, last_is_anchor): (&AnchorInfo, bool) = match trust.anchors.get(&last.subject_der) {
-        Some(a) if presented_cert_is_anchor(a, last_der, last) => (a, true),
-        _ => match trust.anchors.get(&last.issuer_der) {
-            Some(a) => (a, false),
-            None => return Err(TrustError::NoTrustAnchor),
-        },
-    };
-    let anchor_spki = anchor.spki_der.as_slice();
+    // cert is the actual stored trust anchor. Subject-DN equality is only an
+    // index lookup: same-subject peer certificates are verified against every
+    // candidate anchor SPKI, and only the concrete stored anchor that matches
+    // or verifies is used for the rest of validation.
+    let (anchor, last_is_anchor, last_signature_verified) =
+        select_trust_anchor(&parsed, chain, trust)?;
 
     // Step 5b: name constraints (RFC 5280 §4.2.1.10). Enforce every CA's
     // permitted/excluded subtrees against the names of each certificate it
@@ -1289,16 +1330,10 @@ pub fn validate_chain(chain: &[Vec<u8>], trust: &TrustManagerState) -> Result<()
     // Step 6: cryptographic signature verification.
     //
     // For each cert[i] in the chain we re-verify its `signatureValue` against
-    // the issuer's `SubjectPublicKeyInfo`:
-    //
-    //   * `i < parsed.len() - 1` → issuer SPKI is `parsed[i+1].spki_der`.
-    //   * `i == parsed.len() - 1` and the last cert is *not* itself the
-    //     anchor → issuer SPKI is `anchor_spki` (the matched trust anchor's
-    //     SPKI).
-    //   * `i == parsed.len() - 1` and the last cert *is* the anchor → skip;
-    //     RFC 5280 §6.1.1 (the "trust anchor information" definition) says
-    //     a trust anchor's public key is taken as authoritative without
-    //     re-verification.
+    // the issuer's `SubjectPublicKeyInfo`. Non-final certificates use the next
+    // chain cert's SPKI. The final cert is either the concrete stored anchor
+    // and skipped by RFC 5280 section 6.1.1, or was already verified against
+    // the matched anchor SPKI while resolving same-subject anchor candidates.
     //
     // The OID dispatch covers the two algorithms real-world JARs and PKIX
     // chains overwhelmingly use today; everything else maps to
@@ -1307,13 +1342,13 @@ pub fn validate_chain(chain: &[Vec<u8>], trust: &TrustManagerState) -> Result<()
         if parsed[i].signature_value.is_empty() {
             return Err(TrustError::SignatureFailed { at: i });
         }
+        if i + 1 == parsed.len() && (last_is_anchor || last_signature_verified) {
+            continue;
+        }
         let issuer_spki: &[u8] = if i + 1 < parsed.len() {
             parsed[i + 1].spki_der.as_slice()
-        } else if last_is_anchor {
-            // Anchor's signature is trusted by definition — nothing to check.
-            continue;
         } else {
-            anchor_spki
+            anchor.spki_der.as_slice()
         };
         verify_one_signature(i, &parsed[i], issuer_spki)?;
     }
@@ -3474,6 +3509,66 @@ mod tests {
             Err(TrustError::BadSignature { at }) => assert_eq!(at, 1),
             other => panic!("expected fake root signature failure, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn validate_chain_accepts_actual_anchor_when_subject_collides() {
+        let (trusted_pk, trusted_sk) = shared_rsa_root();
+        let trusted_spki = Rsa::public_key_to_der(trusted_pk);
+        let (other_pk, other_sk) = Rsa::generate_keypair(1024);
+        let other_spki = Rsa::public_key_to_der(&other_pk);
+
+        let trusted_root = mk_rsa_signed_cert(
+            &SignedCertSpec {
+                not_before_utc: "200101000000Z",
+                not_after_utc: "490101000000Z",
+                subject_cn: "Collision Root",
+                issuer_cn: "Collision Root",
+                spki_der: &trusted_spki,
+                sig_alg_oid: OID_SIG_SHA256_RSA,
+                key_usage_bits: Some(KU_KEY_CERT_SIGN | KU_DIGITAL_SIGNATURE),
+                ext_key_usages: &[],
+                basic_constraints_ca: Some(true),
+            },
+            trusted_sk,
+        );
+        let other_root = mk_rsa_signed_cert(
+            &SignedCertSpec {
+                not_before_utc: "200101000000Z",
+                not_after_utc: "490101000000Z",
+                subject_cn: "Collision Root",
+                issuer_cn: "Collision Root",
+                spki_der: &other_spki,
+                sig_alg_oid: OID_SIG_SHA256_RSA,
+                key_usage_bits: Some(KU_KEY_CERT_SIGN | KU_DIGITAL_SIGNATURE),
+                ext_key_usages: &[],
+                basic_constraints_ca: Some(true),
+            },
+            &other_sk,
+        );
+        let leaf = mk_rsa_signed_cert(
+            &SignedCertSpec {
+                not_before_utc: "200101000000Z",
+                not_after_utc: "300101000000Z",
+                subject_cn: "leaf.example.com",
+                issuer_cn: "Collision Root",
+                spki_der: &trusted_spki,
+                sig_alg_oid: OID_SIG_SHA256_RSA,
+                key_usage_bits: Some(KU_DIGITAL_SIGNATURE | KU_KEY_ENCIPHERMENT),
+                ext_key_usages: &[OID_KP_SERVER_AUTH],
+                basic_constraints_ca: Some(false),
+            },
+            trusted_sk,
+        );
+
+        let mut trust = TrustManagerState::default();
+        insert_anchor(&mut trust, trusted_root.clone());
+        insert_anchor(&mut trust, other_root);
+        let subject = parse_certificate(&trusted_root).unwrap().subject_der;
+        assert_eq!(trust.anchors.get(&subject).map(|anchors| anchors.len()), Some(2));
+
+        validate_chain(&[leaf, trusted_root], &trust)
+            .expect("actual stored anchor must not be hidden by same-subject roots");
     }
 
     #[test]
