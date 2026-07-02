@@ -21095,13 +21095,28 @@ fn register_lock_support_natives(r: &mut NativeMethodRegistry) {
     r.set_category(__prev_cat);
 }
 
-fn native_lock_support_park(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    // args: [blocker] — blocker is ignored in our simplified implementation
+fn native_lock_support_park(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // args: [blocker]
     // JDK spec: if interrupted, park returns immediately (no exception, flag NOT cleared)
     if ctx.is_interrupted(false) {
         return Ok(None);
     }
+    // AQS-PARK-PIN: this bridge only fires when a real-JDK `LockSupport.park`
+    // overload is routed straight to us instead of running its bytecode (which
+    // would otherwise stash `blocker` into `Thread.parkBlocker` itself via
+    // `setCurrentBlocker` — see the matching fix in `NativeContextImpl::park`,
+    // vm/src/vm/vm_exec.rs). Pin the explicit argument across the block so a
+    // caller like `AbstractQueuedSynchronizer$ConditionNode.block()` (blocker =
+    // `this`) can't lose it to the JIT register-invisibility gap regardless of
+    // which path is live. Mirrors `monitor_wait_keepalive`.
+    let pin = match args.first() {
+        Some(Value::Object(Some(o))) => Some(ctx.pin_native_root(*o)),
+        _ => None,
+    };
     ctx.park(None);
+    if let Some(pin) = pin {
+        ctx.unpin_native_roots(pin);
+    }
     Ok(None)
 }
 
@@ -21120,7 +21135,15 @@ fn native_lock_support_park_nanos(ctx: &mut dyn NativeContext, args: &[Value]) -
         _ => 0,
     };
     if nanos > 0 {
+        // AQS-PARK-PIN — see `native_lock_support_park`.
+        let pin = match args.first() {
+            Some(Value::Object(Some(o))) => Some(ctx.pin_native_root(*o)),
+            _ => None,
+        };
         ctx.park(Some(std::time::Duration::from_nanos(nanos as u64)));
+        if let Some(pin) = pin {
+            ctx.unpin_native_roots(pin);
+        }
     }
     Ok(None)
 }
@@ -21145,7 +21168,15 @@ fn native_lock_support_park_until(ctx: &mut dyn NativeContext, args: &[Value]) -
             .map(|d| d.as_millis() as i64)
             .unwrap_or(0);
         let remaining = (deadline - now_ms).max(0) as u64;
+        // AQS-PARK-PIN — see `native_lock_support_park`.
+        let pin = match args.first() {
+            Some(Value::Object(Some(o))) => Some(ctx.pin_native_root(*o)),
+            _ => None,
+        };
         ctx.park(Some(std::time::Duration::from_millis(remaining)));
+        if let Some(pin) = pin {
+            ctx.unpin_native_roots(pin);
+        }
     }
     Ok(None)
 }
