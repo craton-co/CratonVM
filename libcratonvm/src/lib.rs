@@ -186,6 +186,74 @@ fn vm_exists() -> bool {
     CREATED_VM.lock().map(|g| g.is_some()).unwrap_or(false)
 }
 
+/// The flat API and Invocation API both feed the VM crate's process-global JNI
+/// context. Until that lower layer has a per-handle JavaVM back-pointer, this
+/// crate must fail closed and allow only one active VM surface in a process.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FlatVmState {
+    Creating,
+    Active(usize),
+}
+
+static FLAT_VM_STATE: Mutex<Option<FlatVmState>> = Mutex::new(None);
+
+struct FlatVmCreateGuard {
+    armed: bool,
+}
+
+fn begin_flat_vm_create() -> Result<FlatVmCreateGuard, &'static str> {
+    let mut state = FLAT_VM_STATE
+        .lock()
+        .map_err(|_| "flat VM state is poisoned")?;
+    if state.is_some() {
+        return Err("a CratonVM instance is already active in this process");
+    }
+    *state = Some(FlatVmState::Creating);
+    Ok(FlatVmCreateGuard { armed: true })
+}
+
+impl FlatVmCreateGuard {
+    fn activate(&mut self, vm_key: usize) -> Result<(), &'static str> {
+        let mut state = FLAT_VM_STATE
+            .lock()
+            .map_err(|_| "flat VM state is poisoned")?;
+        if *state != Some(FlatVmState::Creating) {
+            return Err("flat VM state changed during creation");
+        }
+        *state = Some(FlatVmState::Active(vm_key));
+        self.armed = false;
+        Ok(())
+    }
+}
+
+impl Drop for FlatVmCreateGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if let Ok(mut state) = FLAT_VM_STATE.lock() {
+            if *state == Some(FlatVmState::Creating) {
+                *state = None;
+            }
+        }
+    }
+}
+
+fn release_flat_vm(vm_key: usize) {
+    if let Ok(mut state) = FLAT_VM_STATE.lock() {
+        if *state == Some(FlatVmState::Active(vm_key)) {
+            *state = None;
+        }
+    }
+}
+
+fn flat_vm_blocks_invocation_create() -> bool {
+    FLAT_VM_STATE
+        .lock()
+        .map(|state| state.is_some())
+        .unwrap_or(true)
+}
+
 // ---------------------------------------------------------------------------
 // JNI_GetDefaultJavaVMInitArgs
 // ---------------------------------------------------------------------------
@@ -415,6 +483,9 @@ pub extern "C" fn JNI_CreateJavaVM(
         if guard.is_some() {
             return JNI_EEXIST;
         }
+        if flat_vm_blocks_invocation_create() {
+            return JNI_EEXIST;
+        }
 
         // SAFETY: `args` is a valid `*const JavaVMInitArgs` or null (handled).
         let config = unsafe { config_from_args(args as *const JavaVMInitArgs) };
@@ -553,16 +624,16 @@ pub extern "C" fn cratonvm_thread_leave_native() -> JInt {
 // gives the caller an explicit owned handle (`*mut CratonVm`) whose lifetime
 // the caller controls via `cratonvm_destroy`.
 //
-// Both surfaces sit on the same machinery: `cratonvm_create` builds a `Vm`
-// (the same `Vm::new` + `bootstrap` used by `JNI_CreateJavaVM`) and publishes
-// the calling thread's JNI TLS context via `set_jni_context_arc` — so a host
-// can mix the two (e.g. take the flat handle for invocation but still reach
-// the JNIEnv table). It does **not** touch the `CREATED_VM` registry, so it is
-// independent of the one-VM-per-process Invocation-API guard; a host that uses
-// only the flat API may create and destroy handles freely. (The GC-safepoint
-// thread-registration contract for *foreign* call-in threads is owned by
-// another work item and is intentionally out of scope here — see the design
-// doc Risks; the flat API only drives the VM from the creating thread.)
+// Both surfaces sit on the same lower-level JNI machinery: `Vm::new` publishes
+// a process-global `Weak<SharedVm>`, and the JNIEnv table resolves the live VM
+// through thread-local context. Those cells do not have a per-handle back
+// pointer, so libcratonvm deliberately allows only one active VM surface per
+// process: either one Invocation-API VM or one flat `CratonVm`. Each flat API
+// entry point republishes its handle's JNI TLS context before entering the VM,
+// so stale TLS from a prior flat call cannot point at a different handle. (The
+// GC-safepoint thread-registration contract for *foreign* call-in threads is
+// owned by another work item and is intentionally out of scope here; the flat
+// API only drives the VM from the creating thread.)
 //
 // ## Handle encoding
 //
@@ -570,8 +641,8 @@ pub extern "C" fn cratonvm_thread_leave_native() -> JInt {
 // * `CratonClass` (`u64`) — a `ClassId` widened from its `u32`; `0` is a valid
 //   class id (`java/lang/Object` is id 0), so class errors are signalled by
 //   the function's return code, not a sentinel handle.
-// * `CratonRef` (`u64`) — an object/string handle: `ObjectRef::as_ptr() as
-//   u64`, with `0` == `null` (identical to the JNIEnv side's `JObject = u64`).
+// * `CratonRef` (`u64`) - an opaque object/string token validated against a
+//   per-VM table; `0` == `null`.
 //
 // ## Value marshalling
 //
@@ -595,7 +666,7 @@ pub struct CratonVm {
     vm: Vm,
 }
 
-/// A `u64` object/string/throwable handle (`ObjectRef::as_ptr()`; `0` = null).
+/// A `u64` opaque object/string/throwable token (`0` = null).
 pub type CratonRef = u64;
 /// A `u64` class handle (a widened [`ClassId`]).
 pub type CratonClass = u64;
@@ -648,17 +719,26 @@ impl CratonValue {
     }
 
     /// Convert an inbound `CratonValue` (from C) into a VM [`Value`].
-    /// Unknown tags map to `Value::Object(None)` (null) defensively. An
-    /// `OBJECT` payload is resolved through `shared`'s per-VM handle table, so
-    /// an unknown / stale token decodes to `null` rather than a raw address.
-    fn to_value(self, shared: &SharedVm) -> Value {
+    /// Unknown tags and stale object tokens are rejected rather than silently
+    /// becoming `null`; callers turn the error into the API's last-error value.
+    fn to_value(self, shared: &SharedVm) -> Result<Value, String> {
         match self.tag {
-            craton_tag::INT => Value::Int(self.payload as u32 as i32),
-            craton_tag::LONG => Value::Long(self.payload as i64),
-            craton_tag::FLOAT => Value::Float(f32::from_bits(self.payload as u32)),
-            craton_tag::DOUBLE => Value::Double(f64::from_bits(self.payload)),
-            craton_tag::OBJECT => Value::Object(resolve_handle(shared, self.payload)),
-            _ => Value::Object(None),
+            craton_tag::INT => Ok(Value::Int(self.payload as u32 as i32)),
+            craton_tag::LONG => Ok(Value::Long(self.payload as i64)),
+            craton_tag::FLOAT => Ok(Value::Float(f32::from_bits(self.payload as u32))),
+            craton_tag::DOUBLE => Ok(Value::Double(f64::from_bits(self.payload))),
+            craton_tag::OBJECT if self.payload == 0 => Ok(Value::Object(None)),
+            craton_tag::OBJECT => resolve_handle(shared, self.payload)
+                .map(|obj| Value::Object(Some(obj)))
+                .ok_or_else(|| {
+                    format!(
+                        "stale or unknown CratonRef object token 0x{:x}",
+                        self.payload
+                    )
+                }),
+            craton_tag::VOID => Err("VOID CratonValue is not valid as input".to_string()),
+            craton_tag::ERROR => Err("ERROR CratonValue is not valid as input".to_string()),
+            other => Err(format!("unknown CratonValue tag {other}")),
         }
     }
 
@@ -706,8 +786,9 @@ impl CratonValue {
 // The table is layered on top of the VM's existing `JniGlobalRefs`
 // (`shared.jni_global_refs`), which is the only channel that (a) keeps the
 // referenced object alive as a GC root and (b) has its stored `ObjectRef`s
-// rewritten by the moving collector via `update_after_gc`. We never store a raw
-// pointer ourselves; the gref handle resolves to the live, GC-updated object.
+// rewritten by the moving collector via `update_after_gc`. We never retain a
+// raw object address in this table; dedup compares against the current address
+// resolved from the GC-updated global refs.
 //
 // On top of that we add a **generation/liveness** layer keyed by a
 // monotonically increasing per-VM counter: tokens are never reused, so a token
@@ -730,8 +811,6 @@ struct VmHandleTable {
     next_token: u64,
     /// token → the `JniGlobalRefs` handle that owns the GC-rooted `ObjectRef`.
     by_token: HashMap<u64, JObject>,
-    /// object address → token, so the same live object dedups to one token.
-    by_addr: HashMap<usize, u64>,
 }
 
 /// Process-global registry of per-VM handle tables, keyed by the `SharedVm`'s
@@ -763,16 +842,22 @@ fn register_handle(shared: &SharedVm, o: Option<ObjectRef>) -> CratonRef {
         Err(_) => return 0,
     };
     let table = tables.entry(vm_key(shared)).or_default();
-    // Dedup: the same live object always maps to the same token.
-    if let Some(&tok) = table.by_addr.get(&(oref.as_ptr() as usize)) {
-        return tok;
+    let mut grefs = shared.jni_global_refs.lock();
+    // Dedup by resolving each global ref to its current post-GC address. This
+    // keeps the table correct when a moving collector rewrites the global refs.
+    for (&tok, &gref) in &table.by_token {
+        if grefs
+            .resolve(gref)
+            .is_some_and(|current| current.as_ptr() == oref.as_ptr())
+        {
+            return tok;
+        }
     }
     // Park the object as a GC root and mint a fresh, never-reused token.
-    let gref = shared.jni_global_refs.lock().add(oref);
+    let gref = grefs.add(oref);
     table.next_token = table.next_token.checked_add(1).unwrap_or(1).max(1);
     let tok = table.next_token;
     table.by_token.insert(tok, gref);
-    table.by_addr.insert(oref.as_ptr() as usize, tok);
     tok
 }
 
@@ -790,6 +875,30 @@ fn resolve_handle(shared: &SharedVm, h: CratonRef) -> Option<ObjectRef> {
     // `JniGlobalRefs::resolve` validates the gref is still live and returns the
     // current (post-GC) address.
     shared.jni_global_refs.lock().resolve(gref)
+}
+
+fn decode_craton_args(api: &str, shared: &SharedVm, args: &[CratonValue]) -> Option<Vec<Value>> {
+    let mut out = Vec::with_capacity(args.len());
+    for (idx, arg) in args.iter().copied().enumerate() {
+        match arg.to_value(shared) {
+            Ok(v) => out.push(v),
+            Err(e) => {
+                set_last_error(format!("{api}: invalid argument {idx}: {e}"));
+                return None;
+            }
+        }
+    }
+    Some(out)
+}
+
+fn decode_craton_value(api: &str, shared: &SharedVm, value: CratonValue) -> Option<Value> {
+    match value.to_value(shared) {
+        Ok(v) => Some(v),
+        Err(e) => {
+            set_last_error(format!("{api}: invalid value: {e}"));
+            None
+        }
+    }
 }
 
 /// Drop a VM's handle table (called from `cratonvm_destroy`). Releases the
@@ -838,6 +947,8 @@ fn clear_last_error() {
 /// `set_jni_context_arc` path the Invocation API uses, so the returned handle's
 /// thread may immediately invoke. Returns null on failure (and sets the
 /// thread's last error, retrievable via [`cratonvm_last_error`]).
+/// Fails if a JNI Invocation-API VM or another flat `CratonVm` is already
+/// active in this process.
 ///
 /// The returned pointer must be released with [`cratonvm_destroy`].
 ///
@@ -847,6 +958,24 @@ fn clear_last_error() {
 pub extern "C" fn cratonvm_create(args: *const JavaVMInitArgs) -> *mut CratonVm {
     let result = catch_unwind(AssertUnwindSafe(|| {
         clear_last_error();
+        let created_guard = match CREATED_VM.lock() {
+            Ok(g) => g,
+            Err(_) => {
+                set_last_error("cratonvm_create: VM registry is poisoned");
+                return std::ptr::null_mut();
+            }
+        };
+        if created_guard.is_some() {
+            set_last_error("cratonvm_create: a JNI Invocation API VM is already active");
+            return std::ptr::null_mut();
+        }
+        let mut flat_guard = match begin_flat_vm_create() {
+            Ok(g) => g,
+            Err(e) => {
+                set_last_error(format!("cratonvm_create: {e}"));
+                return std::ptr::null_mut();
+            }
+        };
         // SAFETY: caller contract — `args` is a valid `*const JavaVMInitArgs`
         // or null (handled inside `config_from_args`).
         let config = unsafe { config_from_args(args) };
@@ -856,7 +985,13 @@ pub extern "C" fn cratonvm_create(args: *const JavaVMInitArgs) -> *mut CratonVm 
         // Publish this thread's JNI context so JNIEnv-table calls on the
         // creating thread resolve this VM (parity with JNI_CreateJavaVM).
         set_jni_context_arc(vm.shared.get_arc());
-        Box::into_raw(Box::new(CratonVm { vm }))
+        let mut boxed = Box::new(CratonVm { vm });
+        let vm_key = (&mut *boxed as *mut CratonVm) as usize;
+        if let Err(e) = flat_guard.activate(vm_key) {
+            set_last_error(format!("cratonvm_create: {e}"));
+            return std::ptr::null_mut();
+        }
+        Box::into_raw(boxed)
     }));
     match result {
         Ok(ptr) => ptr,
@@ -881,6 +1016,7 @@ pub extern "C" fn cratonvm_destroy(vm: *mut CratonVm) {
         return;
     }
     let _ = catch_unwind(AssertUnwindSafe(|| {
+        let vm_key = vm as usize;
         // SAFETY: caller contract — `vm` came from `cratonvm_create` and is not
         // double-freed. Reclaim the Box and drop it.
         let boxed = unsafe { Box::from_raw(vm) };
@@ -893,6 +1029,7 @@ pub extern "C" fn cratonvm_destroy(vm: *mut CratonVm) {
         // would resolve a freed VM. Clearing drops the TLS `Arc` for this thread.
         clear_jni_context();
         drop(boxed);
+        release_flat_vm(vm_key);
     }));
 }
 
@@ -925,7 +1062,9 @@ unsafe fn with_vm<R>(vm: *mut CratonVm, err_val: R, f: impl FnOnce(&mut CratonVm
     // SAFETY: caller contract — `vm` is a live handle; the borrow guard above
     // guarantees no other `&mut CratonVm` for this handle is live, so this is
     // the unique `&mut` for the duration of `f`.
-    f(unsafe { &mut *vm })
+    let handle = unsafe { &mut *vm };
+    set_jni_context_arc(handle.vm.shared.get_arc());
+    f(handle)
 }
 
 /// Process-global set of `CratonVm` handles currently borrowed by an in-flight
@@ -1078,7 +1217,11 @@ pub extern "C" fn cratonvm_invoke_static(
                     // SAFETY: checked `args` non-null and `n_args > 0` above.
                     std::slice::from_raw_parts(args, n_args as usize)
                 };
-                let values: Vec<Value> = in_args.iter().map(|v| v.to_value(&h.vm.shared)).collect();
+                let values =
+                    match decode_craton_args("cratonvm_invoke_static", &h.vm.shared, in_args) {
+                        Some(values) => values,
+                        None => return CratonValue::error(),
+                    };
 
                 match h.vm.invoke(class, method, sig, &values) {
                     Ok(Some(v)) => CratonValue::from_value(&h.vm.shared, v),
@@ -1370,7 +1513,12 @@ pub extern "C" fn cratonvm_invoke_virtual(
                 // The receiver is arg 0 (descriptor excludes it); typed args follow.
                 let mut values: Vec<Value> = Vec::with_capacity(in_args.len() + 1);
                 values.push(Value::Object(Some(recv)));
-                values.extend(in_args.iter().map(|v| v.to_value(&h.vm.shared)));
+                let decoded_args =
+                    match decode_craton_args("cratonvm_invoke_virtual", &h.vm.shared, in_args) {
+                        Some(values) => values,
+                        None => return CratonValue::error(),
+                    };
+                values.extend(decoded_args);
 
                 match h.vm.invoke(&class_name, method, sig, &values) {
                     Ok(Some(v)) => CratonValue::from_value(&h.vm.shared, v),
@@ -1806,7 +1954,10 @@ pub extern "C" fn cratonvm_set_field(
                     ));
                     return JNI_ERR;
                 }
-                let value = value.to_value(&h.vm.shared);
+                let value = match decode_craton_value("cratonvm_set_field", &h.vm.shared, value) {
+                    Some(value) => value,
+                    None => return JNI_ERR,
+                };
                 h.vm.set_instance_field(oref, index as usize, value);
                 JNI_OK
             })
@@ -1855,7 +2006,14 @@ pub extern "C" fn cratonvm_set_field_by_name(
                 let class_id = h.vm.shared.heap.class_id_of(oref);
                 match h.vm.instance_field_index(class_id, field_name) {
                     Some(idx) => {
-                        let value = value.to_value(&h.vm.shared);
+                        let value = match decode_craton_value(
+                            "cratonvm_set_field_by_name",
+                            &h.vm.shared,
+                            value,
+                        ) {
+                            Some(value) => value,
+                            None => return JNI_ERR,
+                        };
                         h.vm.set_instance_field(oref, idx, value);
                         JNI_OK
                     }
@@ -2002,11 +2160,74 @@ mod tests {
         // this reference; a dangling pointer is only formed, never dereferenced.
         let shared: &SharedVm = unsafe { &*std::ptr::NonNull::<SharedVm>::dangling().as_ptr() };
         for c in cases {
-            let v = c.to_value(shared);
+            let v = c.to_value(shared).expect("primitive tag should decode");
             let back = CratonValue::from_value(shared, v);
             assert_eq!(back.tag, c.tag, "tag changed for {:?}", c.tag);
             assert_eq!(back.payload, c.payload, "payload changed for tag {}", c.tag);
         }
+    }
+
+    #[test]
+    fn craton_value_rejects_unknown_input_tags() {
+        clear_last_error();
+        // SAFETY: the unknown-tag path rejects before reading through `shared`.
+        let shared: &SharedVm = unsafe { &*std::ptr::NonNull::<SharedVm>::dangling().as_ptr() };
+        let bad = [CratonValue {
+            tag: 99,
+            payload: 0,
+        }];
+        assert!(decode_craton_args("test_api", shared, &bad).is_none());
+        let err = last_error_string().expect("invalid tag should set last error");
+        assert!(
+            err.contains("unknown CratonValue tag 99"),
+            "unexpected error text: {err}"
+        );
+    }
+
+    #[test]
+    fn craton_value_rejects_stale_object_tokens() {
+        clear_last_error();
+        // SAFETY: this path only uses the address of `shared` as a table key.
+        let shared: &SharedVm = unsafe { &*std::ptr::NonNull::<SharedVm>::dangling().as_ptr() };
+        let stale = CratonValue {
+            tag: craton_tag::OBJECT,
+            payload: 0xfeed,
+        };
+        assert!(decode_craton_value("test_api", shared, stale).is_none());
+        let err = last_error_string().expect("stale object token should set last error");
+        assert!(
+            err.contains("stale or unknown CratonRef object token 0xfeed"),
+            "unexpected error text: {err}"
+        );
+    }
+
+    #[test]
+    fn object_handle_dedup_uses_gc_updated_global_refs() {
+        let shared = SharedVm::new(VmConfig::default());
+        // SAFETY: these aligned fake refs are only stored in JniGlobalRefs and
+        // compared by address; the test never dereferences them as heap objects.
+        let old = unsafe { ObjectRef::from_raw(0x1000 as *mut u8) };
+        let moved = unsafe { ObjectRef::from_raw(0x2000 as *mut u8) };
+        let reused_old_address = unsafe { ObjectRef::from_raw(0x1000 as *mut u8) };
+
+        let first = register_handle(&shared, Some(old));
+        let mut pointer_map = std::collections::HashMap::new();
+        pointer_map.insert(old.as_ptr() as usize, moved.as_ptr() as usize);
+        shared.jni_global_refs.lock().update_after_gc(&pointer_map);
+
+        let after_move = register_handle(&shared, Some(moved));
+        assert_eq!(
+            after_move, first,
+            "moved object should keep its existing token"
+        );
+
+        let new_at_old_address = register_handle(&shared, Some(reused_old_address));
+        assert_ne!(
+            new_at_old_address, first,
+            "a new object at the stale pre-GC address must not inherit the token"
+        );
+
+        drop_handle_table(&shared);
     }
 
     #[test]
@@ -2237,6 +2458,53 @@ mod tests {
     fn destroy_null_is_noop() {
         // Must not panic / segfault.
         cratonvm_destroy(std::ptr::null_mut());
+    }
+
+    #[cfg(not(flat_api_live_vm))]
+    #[test]
+    fn flat_vm_state_allows_only_one_active_surface() {
+        {
+            let mut state = FLAT_VM_STATE.lock().expect("flat state lock");
+            *state = None;
+        }
+
+        {
+            let _creating = begin_flat_vm_create().expect("first flat create should claim");
+            assert!(
+                begin_flat_vm_create().is_err(),
+                "overlapping flat create must be rejected"
+            );
+            assert!(
+                flat_vm_blocks_invocation_create(),
+                "Invocation API create must be blocked while flat create is in flight"
+            );
+        }
+        assert!(
+            !flat_vm_blocks_invocation_create(),
+            "dropped in-flight flat create should release the process slot"
+        );
+
+        let mut active = begin_flat_vm_create().expect("flat create should claim again");
+        active.activate(0xabc0).expect("activation should succeed");
+        assert!(
+            begin_flat_vm_create().is_err(),
+            "active flat VM must block a second flat create"
+        );
+        assert!(
+            flat_vm_blocks_invocation_create(),
+            "active flat VM must block Invocation API create"
+        );
+
+        release_flat_vm(0xdef0);
+        assert!(
+            flat_vm_blocks_invocation_create(),
+            "wrong VM key must not release the active slot"
+        );
+        release_flat_vm(0xabc0);
+        assert!(
+            !flat_vm_blocks_invocation_create(),
+            "destroying the active flat VM should release the process slot"
+        );
     }
 
     #[test]

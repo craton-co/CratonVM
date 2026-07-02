@@ -51,6 +51,13 @@ Values are exchanged as `CratonValue` — a `#[repr(C)]` tagged POD (`tag` + 8-b
 `payload`) covering `int`/`long`/`float`/`double`/`object`. Method arguments are
 passed as a typed `CratonValue` array plus a count (not C varargs).
 
+Only one VM surface may be active in a process at a time: either one
+Invocation-API VM or one flat `CratonVm`. `cratonvm_create` returns `NULL` with
+`cratonvm_last_error()` set if another VM surface is active. `CratonRef` values
+are opaque object tokens, not heap addresses; stale/fabricated object tokens and
+unknown inbound `CratonValue` tags fail the call instead of being treated as
+`null`.
+
 Every exported `extern "C"` entry point wraps its body in `catch_unwind`, so a Rust
 panic never unwinds across the C boundary.
 
