@@ -112,12 +112,15 @@ To publish:
    still carry `publish = false`, and that no newly-added immature crate should
    join that list. Set `publish = false` on a crate's own `[package]` table to
    keep it off crates.io.
-2. **Path deps already carry versions.** Each inter-crate dependency is already
+2. **Confirm package metadata.** Each publishable crate should inherit or set
+   the Craton Software Company author, `Apache-2.0` license, repository,
+   homepage, documentation, README, and versioned path-dependency metadata.
+3. **Path deps already carry versions.** Each inter-crate dependency is already
    in the versioned form `{ path = "...", version = "X.Y.Z" }` (see §1) — local
    builds resolve by path while the published metadata carries the version that
    crates.io requires. Just keep the `version =` literals in lockstep with the
    workspace version when you bump it.
-3. **Publish in dependency order**, leaves first. Re-check this order against
+4. **Publish in dependency order**, leaves first. Re-check this order against
    the manifests before a release; a typical order is:
    `cratonvm-types` ->
    `cratonvm-reader` ->
@@ -135,7 +138,7 @@ To publish:
    `libcratonvm` ->
    `cratonvm-embed` ->
    `cratonvm-difftest`.
-4. **Dry-run each crate first**, then publish:
+5. **Dry-run each crate first**, then publish:
 
    ```sh
    cargo publish --dry-run -p <crate>

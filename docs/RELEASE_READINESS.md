@@ -42,9 +42,10 @@ Do not tag a public release or publish crates until these checks are complete:
    dependency order.
 5. No dry-run uses `--allow-dirty`, and no publish step uses `--no-verify`.
 6. `Cargo.toml` workspace metadata still names Craton Software Company as the
-   author and `Apache-2.0` as the license.
+   author, `Apache-2.0` as the license, and public repository/homepage/docs
+   links.
 7. Each publishable crate has an appropriate `README.md`, `repository`,
-   `homepage`, and versioned path dependency metadata.
+   `homepage`, `documentation`, and versioned path dependency metadata.
 8. Default features for publishable crates do not pull crates with
    `publish = false`.
 9. Binaries exposed by packages have project-specific names. The intentional
