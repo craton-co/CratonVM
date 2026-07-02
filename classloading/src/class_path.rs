@@ -894,6 +894,17 @@ pub(crate) fn is_safe_resource_name(name: &str) -> bool {
         || name.contains(".\\")) // Windows current-dir references
 }
 
+fn is_directory_resolvable_resource_name(name: &str) -> bool {
+    // HotSpot normalizes "." and ".." when a URLClassLoader probes a directory
+    // classpath root. Let directory lookups reach the canonical root check below,
+    // but keep archive/JMOD/JRT lookups on the stricter literal resource filter.
+    !(name.starts_with('/')
+        || name.starts_with('\\')
+        || name.contains('\\')
+        || name.contains('\0')
+        || name.contains(':'))
+}
+
 /// Parse a `<jar-path>!/<prefix>/` specification of the form produced by
 /// stripping `file:`/`jar:` off a `jar:file:/.../foo.jar!/some/dir/` URL.
 /// Returns `Some((jar_path, prefix_with_trailing_slash))` if the input
@@ -2424,13 +2435,18 @@ impl ClassPath {
         // NUL, leading slashes, `\\`, drive letters `:`, and `./` / `.\\`)
         // via the shared `is_safe_resource_name` helper. The canonicalize
         // check below remains the authoritative backstop.
-        if !is_safe_resource_name(name) {
+        let archive_safe = is_safe_resource_name(name);
+        let directory_safe = is_directory_resolvable_resource_name(name);
+        if !archive_safe && !directory_safe {
             return None;
         }
 
         for entry in &self.entries {
             match entry {
                 ClassPathEntry::Directory(dir) => {
+                    if !directory_safe {
+                        continue;
+                    }
                     let full_path = dir.join(Path::new(name));
                     if full_path.exists() {
                         // C35 audit fix (HIGH security): mirror
@@ -2495,6 +2511,9 @@ impl ClassPath {
                     versions_cache,
                     ..
                 } => {
+                    if !archive_safe {
+                        continue;
+                    }
                     let found = if *multi_release {
                         Self::find_in_multi_release_archive(archive, versions_cache, name)
                     } else {
@@ -2523,6 +2542,9 @@ impl ClassPath {
                     }
                 }
                 ClassPathEntry::NestedDirectory { entries_cache, .. } => {
+                    if !archive_safe {
+                        continue;
+                    }
                     if let Some(data) = entries_cache.get(name) {
                         debug!("Found resource {name} in nested directory");
                         return Some(data.clone());
@@ -2533,6 +2555,9 @@ impl ClassPath {
                     nested_path,
                     ..
                 } => {
+                    if !archive_safe {
+                        continue;
+                    }
                     if let Some(data) = Self::find_in_archive(archive, name) {
                         debug!("Found resource {name} in nested JAR {nested_path}");
                         return Some(data);
@@ -2544,6 +2569,9 @@ impl ClassPath {
                     archive,
                     ..
                 } => {
+                    if !archive_safe {
+                        continue;
+                    }
                     // Try the pre-extracted classes cache first (covers .class + resources under classes/)
                     if let Some(data) = classes_cache.get(name) {
                         debug!("Found resource {name} in JMOD {} (cached)", path.display());
@@ -2563,6 +2591,9 @@ impl ClassPath {
                     class_to_module,
                     ..
                 } => {
+                    if !archive_safe {
+                        continue;
+                    }
                     // Classes live in `class_to_module`; non-class
                     // resources live in `resource_to_modules`. Try the
                     // appropriate map based on the file extension.
@@ -2624,13 +2655,18 @@ impl ClassPath {
         let name = resource_name.trim_start_matches('/');
         // Same input filter as `find_class`/`find_resource` (see
         // `is_safe_resource_name`).
-        if !is_safe_resource_name(name) {
+        let archive_safe = is_safe_resource_name(name);
+        let directory_safe = is_directory_resolvable_resource_name(name);
+        if !archive_safe && !directory_safe {
             return Vec::new();
         }
         let mut out: Vec<Vec<u8>> = Vec::new();
         for entry in &self.entries {
             match entry {
                 ClassPathEntry::Directory(dir) => {
+                    if !directory_safe {
+                        continue;
+                    }
                     let full_path = dir.join(Path::new(name));
                     // C35 audit fix (HIGH security): fail-CLOSED on
                     // canonicalize error. The previous
@@ -2663,6 +2699,9 @@ impl ClassPath {
                     versions_cache,
                     ..
                 } => {
+                    if !archive_safe {
+                        continue;
+                    }
                     let bytes = if *multi_release {
                         Self::find_in_multi_release_archive(archive, versions_cache, name)
                     } else {
@@ -2673,11 +2712,17 @@ impl ClassPath {
                     }
                 }
                 ClassPathEntry::NestedDirectory { entries_cache, .. } => {
+                    if !archive_safe {
+                        continue;
+                    }
                     if let Some(b) = entries_cache.get(name) {
                         out.push(b.clone());
                     }
                 }
                 ClassPathEntry::NestedJar { archive, .. } => {
+                    if !archive_safe {
+                        continue;
+                    }
                     if let Some(b) = Self::find_in_archive(archive, name) {
                         out.push(b);
                     }
@@ -2687,6 +2732,9 @@ impl ClassPath {
                     archive,
                     ..
                 } => {
+                    if !archive_safe {
+                        continue;
+                    }
                     if let Some(b) = classes_cache.get(name) {
                         out.push(b.clone());
                     } else {
@@ -2702,6 +2750,9 @@ impl ClassPath {
                     class_to_module,
                     ..
                 } => {
+                    if !archive_safe {
+                        continue;
+                    }
                     let attempts: Vec<String> =
                         if let Some(class_name) = name.strip_suffix(".class") {
                             if let Some(module) = class_to_module.get(class_name) {
@@ -2732,7 +2783,9 @@ impl ClassPath {
         let name = resource_name.trim_start_matches('/');
         // Same input filter as `find_class`/`find_resource` (see
         // `is_safe_resource_name`).
-        if !is_safe_resource_name(name) {
+        let archive_safe = is_safe_resource_name(name);
+        let directory_safe = is_directory_resolvable_resource_name(name);
+        if !archive_safe && !directory_safe {
             return Vec::new();
         }
         // ES2-DBG: env-gated tracing for the classpath resource walk.
@@ -2754,6 +2807,9 @@ impl ClassPath {
         for entry in &self.entries {
             match entry {
                 ClassPathEntry::Directory(dir) => {
+                    if !directory_safe {
+                        continue;
+                    }
                     let full_path = dir.join(Path::new(name));
                     if full_path.exists() {
                         // C35 audit fix (HIGH security): fail-CLOSED on
@@ -2796,6 +2852,16 @@ impl ClassPath {
                     path,
                     ..
                 } => {
+                    if !archive_safe {
+                        if dbg {
+                            eprintln!(
+                                "[GRES-DBG]   jar {} mr={} -> skipped unsafe name",
+                                path.display(),
+                                multi_release
+                            );
+                        }
+                        continue;
+                    }
                     let direct = if *multi_release {
                         Self::find_in_multi_release_archive(archive, versions_cache, name).is_some()
                     } else {
@@ -2848,6 +2914,9 @@ impl ClassPath {
                     prefix,
                     entries_cache,
                 } => {
+                    if !archive_safe {
+                        continue;
+                    }
                     if entries_cache.contains_key(name) {
                         let p = parent_jar.to_string_lossy().replace('\\', "/");
                         let p = p.trim_start_matches('/');
@@ -2860,6 +2929,9 @@ impl ClassPath {
                     nested_path,
                     ..
                 } => {
+                    if !archive_safe {
+                        continue;
+                    }
                     if Self::find_in_archive(archive, name).is_some() {
                         let p = parent_jar.to_string_lossy().replace('\\', "/");
                         let p = p.trim_start_matches('/');
@@ -2872,6 +2944,9 @@ impl ClassPath {
                     archive,
                     ..
                 } => {
+                    if !archive_safe {
+                        continue;
+                    }
                     let found = classes_cache.contains_key(name) || {
                         let jmod_name = format!("classes/{}", name);
                         Self::find_in_archive(archive, &jmod_name).is_some()
@@ -2888,6 +2963,9 @@ impl ClassPath {
                     class_to_module,
                     ..
                 } => {
+                    if !archive_safe {
+                        continue;
+                    }
                     let attempts: Vec<String> =
                         if let Some(class_name) = name.strip_suffix(".class") {
                             if let Some(module) = class_to_module.get(class_name) {

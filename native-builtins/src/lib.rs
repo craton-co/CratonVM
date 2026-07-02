@@ -42068,10 +42068,15 @@ fn native_proxy_dispatch_invoke(ctx: &mut dyn NativeContext, args: &[Value]) -> 
             .into());
         }
     };
-    let args_arr = match args.get(2) {
+    let mut args_arr = match args.get(2) {
         Some(Value::Object(o)) => *o,
         _ => None,
     };
+    // Generated proxy bodies must pass null, not an empty Object[], for no-arg
+    // methods. Several InvocationHandler implementations distinguish the two.
+    if matches!(args_arr, Some(arr) if ctx.array_length(arr) == 0) {
+        args_arr = None;
+    }
 
     // Read InvocationHandler from proxy slot 0.
     let handler = match ctx.get_field(proxy, 0) {

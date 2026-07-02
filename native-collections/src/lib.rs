@@ -10048,6 +10048,7 @@ const LAZY_OP_MAP: i32 = 1;
 const LAZY_OP_FILTER: i32 = 2;
 const LAZY_OP_LIMIT: i32 = 3;
 const LAZY_OP_SKIP: i32 = 4;
+const LAZY_OP_FLAT_MAP: i32 = 5;
 
 /// `true` when the deferred/short-circuit synthetic Stream pipeline is active
 /// (keycloak-16 Part B). **Default ON** (HotSpot-faithful lazy semantics); opt out
@@ -10182,9 +10183,302 @@ fn stream_is_synthetic(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
     is_synthetic_stream(&cn)
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PullStep {
     Continue,
     Stop,
+}
+
+type StreamEmit<'a> =
+    dyn FnMut(&mut dyn NativeContext, Value) -> Result<PullStep, MethodCallFailed> + 'a;
+
+struct StreamPullState {
+    limit_passed: Vec<i64>,
+    skip_done: Vec<i64>,
+}
+
+fn stream_new_pull_state(chain_len: usize) -> StreamPullState {
+    StreamPullState {
+        limit_passed: vec![0i64; chain_len],
+        skip_done: vec![0i64; chain_len],
+    }
+}
+
+fn stream_limit_saturated(chain: &[LazyOp], state: &StreamPullState, start: usize) -> bool {
+    for i in start..chain.len() {
+        let op = &chain[i];
+        if op.kind == LAZY_OP_LIMIT && state.limit_passed[i] >= op.aux {
+            return true;
+        }
+    }
+    false
+}
+
+fn stream_process_chain(
+    ctx: &mut dyn NativeContext,
+    mut cur: Value,
+    chain: &[LazyOp],
+    start: usize,
+    state: &mut StreamPullState,
+    emit: &mut StreamEmit<'_>,
+) -> Result<PullStep, MethodCallFailed>
+{
+    if stream_limit_saturated(chain, state, start) {
+        return Ok(PullStep::Stop);
+    }
+
+    let mut i = start;
+    while i < chain.len() {
+        let op = &chain[i];
+        match op.kind {
+            LAZY_OP_PEEK => {
+                if let Some(l) = op.lambda {
+                    ctx.invoke_virtual(l, "accept", "(Ljava/lang/Object;)V", &[cur])?;
+                }
+            }
+            LAZY_OP_MAP => {
+                if let Some(l) = op.lambda {
+                    cur = ctx
+                        .invoke_virtual(
+                            l,
+                            "apply",
+                            "(Ljava/lang/Object;)Ljava/lang/Object;",
+                            &[cur],
+                        )?
+                        .unwrap_or(Value::Object(None));
+                }
+            }
+            LAZY_OP_FILTER => {
+                if let Some(l) = op.lambda {
+                    let t = ctx.invoke_virtual(l, "test", "(Ljava/lang/Object;)Z", &[cur])?;
+                    if !matches!(t, Some(Value::Int(x)) if x != 0) {
+                        return Ok(PullStep::Continue);
+                    }
+                }
+            }
+            LAZY_OP_LIMIT => {
+                state.limit_passed[i] += 1;
+            }
+            LAZY_OP_SKIP => {
+                if state.skip_done[i] < op.aux {
+                    state.skip_done[i] += 1;
+                    return Ok(PullStep::Continue);
+                }
+            }
+            LAZY_OP_FLAT_MAP => {
+                let mapped = if let Some(l) = op.lambda {
+                    ctx.invoke_virtual(
+                        l,
+                        "apply",
+                        "(Ljava/lang/Object;)Ljava/lang/Object;",
+                        &[cur],
+                    )?
+                    .unwrap_or(Value::Object(None))
+                } else {
+                    Value::Object(None)
+                };
+                if let Value::Object(Some(inner_stream)) = mapped {
+                    let inner_pin = ctx.pin_native_root(inner_stream);
+                    let pull = stream_pull_any_downstream(
+                        ctx,
+                        inner_stream,
+                        chain,
+                        i + 1,
+                        state,
+                        emit,
+                    );
+                    let inner_stream = ctx.read_native_pin(inner_pin, inner_stream);
+                    let close = ctx
+                        .invoke_virtual(inner_stream, "close", "()V", &[])
+                        .map(|_| ());
+                    ctx.unpin_native_roots(inner_pin);
+                    let step = pull?;
+                    close?;
+                    return Ok(step);
+                }
+                return Ok(PullStep::Continue);
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    emit(ctx, cur)
+}
+
+fn stream_pull_internal(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    emit: &mut StreamEmit<'_>,
+) -> Result<PullStep, MethodCallFailed>
+{
+    let base = stream_source_elems(ctx, this);
+    let chain = stream_read_chain(ctx, this);
+    let mut state = stream_new_pull_state(chain.len());
+    for v in base {
+        if stream_limit_saturated(&chain, &state, 0) {
+            return Ok(PullStep::Continue);
+        }
+        let mut emit_stopped = false;
+        let step = {
+            let mut wrapped_emit =
+                |c: &mut dyn NativeContext, v: Value| -> Result<PullStep, MethodCallFailed> {
+                    let step = emit(c, v)?;
+                    if step == PullStep::Stop {
+                        emit_stopped = true;
+                    }
+                    Ok(step)
+                };
+            stream_process_chain(ctx, v, &chain, 0, &mut state, &mut wrapped_emit)?
+        };
+        if step == PullStep::Stop {
+            return Ok(if emit_stopped {
+                PullStep::Stop
+            } else {
+                PullStep::Continue
+            });
+        }
+    }
+    Ok(PullStep::Continue)
+}
+
+fn stream_pull_iterator_downstream(
+    ctx: &mut dyn NativeContext,
+    stream: ObjectRef,
+    downstream_chain: &[LazyOp],
+    downstream_start: usize,
+    downstream_state: &mut StreamPullState,
+    emit: &mut StreamEmit<'_>,
+) -> Result<PullStep, MethodCallFailed>
+{
+    let iterator = match ctx.invoke_virtual(stream, "iterator", "()Ljava/util/Iterator;", &[])? {
+        Some(Value::Object(Some(i))) => i,
+        _ => return Ok(PullStep::Continue),
+    };
+    let iter_pin = ctx.pin_native_root(iterator);
+    loop {
+        if stream_limit_saturated(downstream_chain, downstream_state, downstream_start) {
+            ctx.unpin_native_roots(iter_pin);
+            return Ok(PullStep::Stop);
+        }
+        let iterator = ctx.read_native_pin(iter_pin, iterator);
+        let has_next = ctx.invoke_virtual(iterator, "hasNext", "()Z", &[])?;
+        if !matches!(has_next, Some(Value::Int(x)) if x != 0) {
+            ctx.unpin_native_roots(iter_pin);
+            return Ok(PullStep::Continue);
+        }
+        let iterator = ctx.read_native_pin(iter_pin, iterator);
+        let next = ctx
+            .invoke_virtual(iterator, "next", "()Ljava/lang/Object;", &[])?
+            .unwrap_or(Value::Object(None));
+        let step = stream_process_chain(
+            ctx,
+            next,
+            downstream_chain,
+            downstream_start,
+            downstream_state,
+            emit,
+        )?;
+        if step == PullStep::Stop {
+            ctx.unpin_native_roots(iter_pin);
+            return Ok(PullStep::Stop);
+        }
+    }
+}
+
+fn stream_pull_synthetic_downstream(
+    ctx: &mut dyn NativeContext,
+    stream: ObjectRef,
+    downstream_chain: &[LazyOp],
+    downstream_start: usize,
+    downstream_state: &mut StreamPullState,
+    emit: &mut StreamEmit<'_>,
+) -> Result<PullStep, MethodCallFailed>
+{
+    let base = stream_source_elems(ctx, stream);
+    let chain = stream_read_chain(ctx, stream);
+    let mut state = stream_new_pull_state(chain.len());
+    for v in base {
+        if stream_limit_saturated(downstream_chain, downstream_state, downstream_start) {
+            return Ok(PullStep::Stop);
+        }
+        if stream_limit_saturated(&chain, &state, 0) {
+            return Ok(PullStep::Continue);
+        }
+        let mut downstream_stopped = false;
+        let step = {
+            let mut downstream_emit =
+                |c: &mut dyn NativeContext, v: Value| -> Result<PullStep, MethodCallFailed> {
+                    let step = stream_process_chain(
+                        c,
+                        v,
+                        downstream_chain,
+                        downstream_start,
+                        downstream_state,
+                        emit,
+                    )?;
+                    if step == PullStep::Stop {
+                        downstream_stopped = true;
+                    }
+                    Ok(step)
+                };
+            stream_process_chain(ctx, v, &chain, 0, &mut state, &mut downstream_emit)?
+        };
+        if step == PullStep::Stop {
+            return Ok(if downstream_stopped {
+                PullStep::Stop
+            } else {
+                PullStep::Continue
+            });
+        }
+    }
+    Ok(PullStep::Continue)
+}
+
+fn stream_pull_any_downstream(
+    ctx: &mut dyn NativeContext,
+    stream: ObjectRef,
+    downstream_chain: &[LazyOp],
+    downstream_start: usize,
+    downstream_state: &mut StreamPullState,
+    emit: &mut StreamEmit<'_>,
+) -> Result<PullStep, MethodCallFailed>
+{
+    let class_name = ctx
+        .class_name_of_id(ctx.class_id_of_object(stream))
+        .unwrap_or_default();
+    if class_name == "org/keycloak/utils/ClosingStream" {
+        if let Value::Object(Some(delegate)) = ctx.get_field_by_name(stream, "delegate") {
+            if delegate != stream {
+                return stream_pull_any_downstream(
+                    ctx,
+                    delegate,
+                    downstream_chain,
+                    downstream_start,
+                    downstream_state,
+                    emit,
+                );
+            }
+        }
+    }
+    if is_synthetic_stream(&class_name) {
+        stream_pull_synthetic_downstream(
+            ctx,
+            stream,
+            downstream_chain,
+            downstream_start,
+            downstream_state,
+            emit,
+        )
+    } else {
+        stream_pull_iterator_downstream(
+            ctx,
+            stream,
+            downstream_chain,
+            downstream_start,
+            downstream_state,
+            emit,
+        )
+    }
 }
 
 /// Drive `this`'s SOURCE elements through its deferred op-chain, invoking `emit`
@@ -10199,65 +10493,7 @@ fn stream_pull<F>(
 where
     F: FnMut(&mut dyn NativeContext, Value) -> Result<PullStep, MethodCallFailed>,
 {
-    let base = stream_source_elems(ctx, this);
-    let chain = stream_read_chain(ctx, this);
-    let mut limit_passed = vec![0i64; chain.len()];
-    let mut skip_done = vec![0i64; chain.len()];
-    'outer: for v in base {
-        // Short-circuit: once any `limit` op has admitted its quota, the SOURCE
-        // stops — upstream ops (e.g. `peek`) must NOT run on any further element,
-        // matching HotSpot's `cancellationRequested` semantics. Checked at the top
-        // (before upstream ops) and also covers `limit(0)`.
-        for (i, op) in chain.iter().enumerate() {
-            if op.kind == LAZY_OP_LIMIT && limit_passed[i] >= op.aux {
-                break 'outer;
-            }
-        }
-        let mut cur = v;
-        for (i, op) in chain.iter().enumerate() {
-            match op.kind {
-                LAZY_OP_PEEK => {
-                    if let Some(l) = op.lambda {
-                        ctx.invoke_virtual(l, "accept", "(Ljava/lang/Object;)V", &[cur])?;
-                    }
-                }
-                LAZY_OP_MAP => {
-                    if let Some(l) = op.lambda {
-                        cur = ctx
-                            .invoke_virtual(
-                                l,
-                                "apply",
-                                "(Ljava/lang/Object;)Ljava/lang/Object;",
-                                &[cur],
-                            )?
-                            .unwrap_or(Value::Object(None));
-                    }
-                }
-                LAZY_OP_FILTER => {
-                    if let Some(l) = op.lambda {
-                        let t = ctx.invoke_virtual(l, "test", "(Ljava/lang/Object;)Z", &[cur])?;
-                        if !matches!(t, Some(Value::Int(x)) if x != 0) {
-                            continue 'outer;
-                        }
-                    }
-                }
-                LAZY_OP_LIMIT => {
-                    limit_passed[i] += 1;
-                }
-                LAZY_OP_SKIP => {
-                    if skip_done[i] < op.aux {
-                        skip_done[i] += 1;
-                        continue 'outer;
-                    }
-                }
-                _ => {}
-            }
-        }
-        match emit(ctx, cur)? {
-            PullStep::Stop => break 'outer,
-            PullStep::Continue => {}
-        }
-    }
+    let _ = stream_pull_internal(ctx, this, &mut emit)?;
     Ok(())
 }
 
@@ -11350,6 +11586,9 @@ fn native_stream_flat_map(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         Some(Value::Object(Some(r))) => *r,
         _ => return make_stream(ctx, &[]),
     };
+    if let Some(s) = stream_try_defer(ctx, this, LAZY_OP_FLAT_MAP, Some(function), 0)? {
+        return Ok(Some(s));
+    }
     let elements = stream_elements_mut(ctx, this)?;
     let fn_pin = ctx.pin_native_root(function);
     let (_, elem_handles) = pin_value_slice(ctx, &elements);
