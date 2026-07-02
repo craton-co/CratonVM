@@ -2615,7 +2615,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
     }
 
     fn new_ref_array(&mut self, class_id: ClassId, length: usize) -> ObjectRef {
-        if class_id.as_u32() == 0 && std::env::var("CRATONVM_DBG_TOARRAY").is_ok() {
+        if class_id.as_u32() == 0 && crate::runtime::env_cache::dbg_toarray() {
             let frame = self
                 .thread
                 .frames
@@ -7012,7 +7012,7 @@ pub fn invoke_or_native(
         // Optional operator diagnostic: surface exactly which call had no
         // implementation. Gated on CRATONVM_TRACE_UNIMPLEMENTED so it never
         // spams normal runs. Uses var_os directly (no new env_cache accessor).
-        if std::env::var_os("CRATONVM_TRACE_UNIMPLEMENTED").is_some() {
+        if crate::runtime::env_cache::trace_unimplemented() {
             eprintln!(
                 "[cratonvm] unimplemented: {}.{}{} — no native implementation and no loadable bytecode (invalid class name)",
                 class_name, method_name, descriptor
@@ -7139,7 +7139,7 @@ pub fn invoke_or_native(
                   effective_class, bytes.len(), class_name, method_name, descriptor);
         eprintln!("[invoke_or_native] effective_class bytes: {:?}", bytes);
     }
-    if std::env::var_os("CRATONVM_DBG_VDISP").is_some()
+    if crate::runtime::env_cache::dbg_vdisp()
         && effective_class == "java/util/Optional"
         && (method_name == "hashCode" || method_name == "equals")
     {
@@ -12275,7 +12275,7 @@ fn invoke_on_class_shared_inner(
                 // operators can see exactly what is missing. Gated on
                 // CRATONVM_TRACE_UNIMPLEMENTED to avoid spamming normal runs.
                 // Uses var_os directly (no new env_cache accessor required).
-                if std::env::var_os("CRATONVM_TRACE_UNIMPLEMENTED").is_some() {
+                if crate::runtime::env_cache::trace_unimplemented() {
                     eprintln!(
                         "[cratonvm] unimplemented: {}.{}{} — no native implementation and no loadable bytecode (CratonVM)",
                         class_name, method_name, descriptor

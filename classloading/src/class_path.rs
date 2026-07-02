@@ -10,6 +10,7 @@
 
 use cratonvm_types::error::ClassFileError;
 use parking_lot::Mutex;
+use rustc_hash::FxHashSet;
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::fs;
 use std::io::{Cursor, Read};
@@ -226,6 +227,10 @@ enum ClassPathEntry {
     JarFile {
         path: PathBuf,
         archive: Mutex<ZipArchive<Cursor<Vec<u8>>>>,
+        /// Exact central-directory entry names in this archive. This lets hot
+        /// class/resource lookup reject misses without taking the ZipArchive
+        /// lock or asking zip::ZipArchive::by_name to hash/probe its index.
+        entry_index: FxHashSet<String>,
         /// True if the JAR declares `Multi-Release: true` in its manifest (JEP 238).
         multi_release: bool,
         /// Audit-fix #7: cached set of `META-INF/versions/<N>/` directory
@@ -276,6 +281,8 @@ enum ClassPathEntry {
         nested_path: String,
         /// The extracted nested archive.
         archive: Mutex<ZipArchive<Cursor<Vec<u8>>>>,
+        /// Exact central-directory entry names in this nested archive.
+        entry_index: FxHashSet<String>,
         /// Report P1 (perf): memoized verified signer cert chain for this
         /// nested archive — see the matching field on `JarFile`. Populated
         /// once on the first signed lookup, cloned thereafter.
@@ -985,6 +992,7 @@ impl ClassPath {
     fn find_in_multi_release_archive(
         archive: &Mutex<ZipArchive<Cursor<Vec<u8>>>>,
         versions_cache: &Mutex<Option<Arc<BTreeSet<u32>>>>,
+        entry_index: Option<&FxHashSet<String>>,
         name: &str,
     ) -> Option<Vec<u8>> {
         let present = Self::ensure_versions_cache(archive, versions_cache);
@@ -994,11 +1002,39 @@ impl ClassPath {
         let max = JVM_FEATURE_VERSION;
         for &ver in present.range(9..=max).rev() {
             let versioned = format!("META-INF/versions/{ver}/{name}");
+            if entry_index.is_some_and(|idx| !idx.contains(&versioned)) {
+                continue;
+            }
             if let Some(data) = Self::find_in_archive(archive, &versioned) {
                 return Some(data);
             }
         }
         // Fall back to base entry.
+        if entry_index.is_some_and(|idx| !idx.contains(name)) {
+            return None;
+        }
+        Self::find_in_archive(archive, name)
+    }
+
+    fn build_archive_entry_index(archive: &mut ZipArchive<Cursor<Vec<u8>>>) -> FxHashSet<String> {
+        let mut index = FxHashSet::default();
+        for i in 0..archive.len() {
+            if let Ok(entry) = archive.by_index_raw(i) {
+                index.insert(entry.name().to_string());
+            }
+        }
+        index
+    }
+
+    #[inline]
+    fn find_in_indexed_archive(
+        archive: &Mutex<ZipArchive<Cursor<Vec<u8>>>>,
+        entry_index: &FxHashSet<String>,
+        name: &str,
+    ) -> Option<Vec<u8>> {
+        if !entry_index.contains(name) {
+            return None;
+        }
         Self::find_in_archive(archive, name)
     }
 
@@ -1211,10 +1247,12 @@ impl ClassPath {
                     let mr = manifest.multi_release;
                     let data = archive.into_inner().into_inner();
                     match ZipArchive::new(Cursor::new(data)) {
-                        Ok(reloaded) => {
+                        Ok(mut reloaded) => {
+                            let entry_index = Self::build_archive_entry_index(&mut reloaded);
                             entries.push(ClassPathEntry::JarFile {
                                 path: path.to_path_buf(),
                                 archive: Mutex::new(reloaded),
+                                entry_index,
                                 multi_release: mr,
                                 versions_cache: Mutex::new(None),
                                 signer_cache: OnceLock::new(),
@@ -1230,9 +1268,11 @@ impl ClassPath {
                 } else {
                     let mr = manifest.multi_release;
                     debug!("Loaded JAR: {}", path.display());
+                    let entry_index = Self::build_archive_entry_index(&mut archive);
                     entries.push(ClassPathEntry::JarFile {
                         path: path.to_path_buf(),
                         archive: Mutex::new(archive),
+                        entry_index,
                         multi_release: mr,
                         versions_cache: Mutex::new(None),
                         signer_cache: OnceLock::new(),
@@ -1392,11 +1432,13 @@ impl ClassPath {
                 if let Ok(jar_data) = read_entry_capped(&mut entry, size) {
                     let cursor = Cursor::new(jar_data);
                     match ZipArchive::new(cursor) {
-                        Ok(nested_archive) => {
+                        Ok(mut nested_archive) => {
+                            let entry_index = Self::build_archive_entry_index(&mut nested_archive);
                             entries.push(ClassPathEntry::NestedJar {
                                 parent_jar: path.to_path_buf(),
                                 nested_path: jar_name.clone(),
                                 archive: Mutex::new(nested_archive),
+                                entry_index,
                                 signer_cache: OnceLock::new(),
                             });
                             nested_count += 1;
@@ -1708,13 +1750,19 @@ impl ClassPath {
                     archive,
                     multi_release,
                     versions_cache,
+                    entry_index,
                     ..
                 } => {
                     for candidate in &archive_candidates {
                         let found = if *multi_release {
-                            Self::find_in_multi_release_archive(archive, versions_cache, candidate)
+                            Self::find_in_multi_release_archive(
+                                archive,
+                                versions_cache,
+                                Some(entry_index),
+                                candidate,
+                            )
                         } else {
-                            Self::find_in_archive(archive, candidate)
+                            Self::find_in_indexed_archive(archive, entry_index, candidate)
                         };
                         if let Some(data) = found {
                             debug!("Found class {class_name} in JAR (entry: {candidate})");
@@ -1730,11 +1778,14 @@ impl ClassPath {
                 }
                 ClassPathEntry::NestedJar {
                     archive,
+                    entry_index,
                     nested_path,
                     ..
                 } => {
                     for candidate in &archive_candidates {
-                        if let Some(data) = Self::find_in_archive(archive, candidate) {
+                        if let Some(data) =
+                            Self::find_in_indexed_archive(archive, entry_index, candidate)
+                        {
                             debug!(
                                 "Found class {class_name} in nested JAR {nested_path} \
                                  (entry: {candidate})"
@@ -1837,14 +1888,21 @@ impl ClassPath {
                     archive,
                     multi_release,
                     versions_cache,
+                    entry_index,
                     path,
                     ..
                 } => {
                     let found = if *multi_release {
-                        Self::find_in_multi_release_archive(archive, versions_cache, &relative_path)
-                            .is_some()
+                        Self::find_in_multi_release_archive(
+                            archive,
+                            versions_cache,
+                            Some(entry_index),
+                            &relative_path,
+                        )
+                        .is_some()
                     } else {
-                        Self::find_in_archive(archive, &relative_path).is_some()
+                        Self::find_in_indexed_archive(archive, entry_index, &relative_path)
+                            .is_some()
                     };
                     if found {
                         return Some(path.to_string_lossy().into_owned());
@@ -1862,10 +1920,12 @@ impl ClassPath {
                 ClassPathEntry::NestedJar {
                     parent_jar,
                     archive,
+                    entry_index,
                     nested_path,
                     ..
                 } => {
-                    if Self::find_in_archive(archive, &relative_path).is_some() {
+                    if Self::find_in_indexed_archive(archive, entry_index, &relative_path).is_some()
+                    {
                         // Return "$parent_jar!/$nested_path" style (JAR-in-JAR)
                         // so the caller can distinguish nested location
                         // layouts; Quarkus uses the outer jar path for its
@@ -1941,12 +2001,19 @@ impl ClassPath {
                     versions_cache,
                     path,
                     signer_cache,
+                    entry_index,
                 } => {
                     let found = if *multi_release {
-                        Self::find_in_multi_release_archive(archive, versions_cache, &relative_path)
-                            .is_some()
+                        Self::find_in_multi_release_archive(
+                            archive,
+                            versions_cache,
+                            Some(entry_index),
+                            &relative_path,
+                        )
+                        .is_some()
                     } else {
-                        Self::find_in_archive(archive, &relative_path).is_some()
+                        Self::find_in_indexed_archive(archive, entry_index, &relative_path)
+                            .is_some()
                     };
                     if found {
                         let abs = self
@@ -1993,8 +2060,10 @@ impl ClassPath {
                     archive,
                     nested_path,
                     signer_cache,
+                    entry_index,
                 } => {
-                    if Self::find_in_archive(archive, &relative_path).is_some() {
+                    if Self::find_in_indexed_archive(archive, entry_index, &relative_path).is_some()
+                    {
                         let outer = parent_jar.to_string_lossy().replace('\\', "/");
                         let outer = outer.trim_start_matches('/').to_string();
                         // Report P1 (perf): verify the signer blocks at most once
@@ -2420,15 +2489,21 @@ impl ClassPath {
                     archive,
                     multi_release,
                     versions_cache,
+                    entry_index,
                     ..
                 } => {
                     if !archive_safe {
                         continue;
                     }
                     let found = if *multi_release {
-                        Self::find_in_multi_release_archive(archive, versions_cache, name)
+                        Self::find_in_multi_release_archive(
+                            archive,
+                            versions_cache,
+                            Some(entry_index),
+                            name,
+                        )
                     } else {
-                        Self::find_in_archive(archive, name)
+                        Self::find_in_indexed_archive(archive, entry_index, name)
                     };
                     if let Some(data) = found {
                         debug!("Found resource {name} in JAR");
@@ -2442,9 +2517,14 @@ impl ClassPath {
                     if !name.ends_with('/') {
                         let alt = format!("{name}/");
                         let alt_found = if *multi_release {
-                            Self::find_in_multi_release_archive(archive, versions_cache, &alt)
+                            Self::find_in_multi_release_archive(
+                                archive,
+                                versions_cache,
+                                Some(entry_index),
+                                &alt,
+                            )
                         } else {
-                            Self::find_in_archive(archive, &alt)
+                            Self::find_in_indexed_archive(archive, entry_index, &alt)
                         };
                         if let Some(data) = alt_found {
                             debug!("Found resource {alt} in JAR (slash-tolerant)");
@@ -2464,12 +2544,13 @@ impl ClassPath {
                 ClassPathEntry::NestedJar {
                     archive,
                     nested_path,
+                    entry_index,
                     ..
                 } => {
                     if !archive_safe {
                         continue;
                     }
-                    if let Some(data) = Self::find_in_archive(archive, name) {
+                    if let Some(data) = Self::find_in_indexed_archive(archive, entry_index, name) {
                         debug!("Found resource {name} in nested JAR {nested_path}");
                         return Some(data);
                     }
@@ -2607,15 +2688,21 @@ impl ClassPath {
                     archive,
                     multi_release,
                     versions_cache,
+                    entry_index,
                     ..
                 } => {
                     if !archive_safe {
                         continue;
                     }
                     let bytes = if *multi_release {
-                        Self::find_in_multi_release_archive(archive, versions_cache, name)
+                        Self::find_in_multi_release_archive(
+                            archive,
+                            versions_cache,
+                            Some(entry_index),
+                            name,
+                        )
                     } else {
-                        Self::find_in_archive(archive, name)
+                        Self::find_in_indexed_archive(archive, entry_index, name)
                     };
                     if let Some(b) = bytes {
                         out.push(b);
@@ -2629,11 +2716,15 @@ impl ClassPath {
                         out.push(b.clone());
                     }
                 }
-                ClassPathEntry::NestedJar { archive, .. } => {
+                ClassPathEntry::NestedJar {
+                    archive,
+                    entry_index,
+                    ..
+                } => {
                     if !archive_safe {
                         continue;
                     }
-                    if let Some(b) = Self::find_in_archive(archive, name) {
+                    if let Some(b) = Self::find_in_indexed_archive(archive, entry_index, name) {
                         out.push(b);
                     }
                 }
@@ -2759,6 +2850,7 @@ impl ClassPath {
                     archive,
                     multi_release,
                     versions_cache,
+                    entry_index,
                     path,
                     ..
                 } => {
@@ -2773,9 +2865,15 @@ impl ClassPath {
                         continue;
                     }
                     let direct = if *multi_release {
-                        Self::find_in_multi_release_archive(archive, versions_cache, name).is_some()
+                        Self::find_in_multi_release_archive(
+                            archive,
+                            versions_cache,
+                            Some(entry_index),
+                            name,
+                        )
+                        .is_some()
                     } else {
-                        Self::find_in_archive(archive, name).is_some()
+                        Self::find_in_indexed_archive(archive, entry_index, name).is_some()
                     };
                     // HotSpot's URLClassLoader matches a request for `cnf` against
                     // a `cnf/` directory entry inside a JAR. Without the slash-
@@ -2786,10 +2884,15 @@ impl ClassPath {
                     let with_slash = if !direct && !name.ends_with('/') {
                         let alt = format!("{name}/");
                         if *multi_release {
-                            Self::find_in_multi_release_archive(archive, versions_cache, &alt)
-                                .is_some()
+                            Self::find_in_multi_release_archive(
+                                archive,
+                                versions_cache,
+                                Some(entry_index),
+                                &alt,
+                            )
+                            .is_some()
                         } else {
-                            Self::find_in_archive(archive, &alt).is_some()
+                            Self::find_in_indexed_archive(archive, entry_index, &alt).is_some()
                         }
                     } else {
                         false
@@ -2837,12 +2940,13 @@ impl ClassPath {
                     parent_jar,
                     archive,
                     nested_path,
+                    entry_index,
                     ..
                 } => {
                     if !archive_safe {
                         continue;
                     }
-                    if Self::find_in_archive(archive, name).is_some() {
+                    if Self::find_in_indexed_archive(archive, entry_index, name).is_some() {
                         let p = parent_jar.to_string_lossy().replace('\\', "/");
                         let p = p.trim_start_matches('/');
                         urls.push(format!("jar:file:/{p}!/{nested_path}!/{name}"));
@@ -2937,16 +3041,18 @@ impl ClassPath {
                     archive,
                     multi_release,
                     versions_cache,
+                    entry_index,
                     ..
                 } => {
                     let found = if *multi_release {
                         Self::find_in_multi_release_archive(
                             archive,
                             versions_cache,
+                            Some(entry_index),
                             "module-info.class",
                         )
                     } else {
-                        Self::find_in_archive(archive, "module-info.class")
+                        Self::find_in_indexed_archive(archive, entry_index, "module-info.class")
                     };
                     if let Some(data) = found {
                         debug!("Found module-info.class in JAR");
@@ -2962,9 +3068,12 @@ impl ClassPath {
                 ClassPathEntry::NestedJar {
                     archive,
                     nested_path,
+                    entry_index,
                     ..
                 } => {
-                    if let Some(data) = Self::find_in_archive(archive, "module-info.class") {
+                    if let Some(data) =
+                        Self::find_in_indexed_archive(archive, entry_index, "module-info.class")
+                    {
                         debug!("Found module-info.class in nested JAR {nested_path}");
                         results.push(data);
                     }

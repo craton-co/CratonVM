@@ -3453,7 +3453,7 @@ pub fn execute(
         // DEBUG diagnostic — print every JIT compile decision for the
         // LazyProjection.equals method while bytebuddy_probe diagnosis
         // is in progress. Remove after fix lands.
-        if std::env::var_os("CRATONVM_DBG_BBLP").is_some()
+        if crate::runtime::env_cache::dbg_bblp()
             && class_name_str.contains("LazyProjection")
             && method_name == "equals"
         {
@@ -4196,7 +4196,7 @@ pub fn execute(
                     // NO success logging — which made the Bug-4 testAdHocData JIT
                     // execution invisible to CRATONVM_DBG_JITC-based bisection.
                     if let Some(c) = &cached_result {
-                        if std::env::var_os("CRATONVM_DBG_JITC").is_some() {
+                        if crate::runtime::env_cache::dbg_jitc() {
                             eprintln!(
                                 "[cratonvm-jitc] first-compile {}.{}{} entry={:p} len={}",
                                 class_name_arc,
@@ -7313,15 +7313,10 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                     let _ = frame;
                     // invokeinterface is 5 bytes: opcode(1) + index(2) + count(1) + 0(1)
                     thread.frames[frame_idx].pc = saved_pc + 5;
-                    // T10.9.A — fast path 0: VtableManager lock-free dispatch.
-                    // Interface dispatch shares the same vtable fast-path
-                    // because the receiver's vtable already carries the
-                    // concrete (name, desc) → slot mapping regardless of
-                    // whether the call-site is invokevirtual or
-                    // invokeinterface.
-                    match execute_invokevirtual_vtable_fast(
-                        shared, thread, frame_idx, cp_index, saved_pc,
-                    ) {
+                    let cached_result = execute_invokevirtual_cached(
+                        shared, thread, frame_idx, cp_index, saved_pc, false,
+                    );
+                    match cached_result {
                         Ok(CachedCallResult::FramePushed) => {
                             frame_idx = thread.frames.len() - 1;
                             continue;
@@ -7340,10 +7335,14 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                         }
                         Err(e) => return Err(e),
                     }
-                    let cached_result = execute_invokevirtual_cached(
-                        shared, thread, frame_idx, cp_index, saved_pc, false,
-                    );
-                    match cached_result {
+                    // Miss path: interface dispatch shares the same vtable fast-path
+                    // because the receiver's vtable already carries the
+                    // concrete (name, desc) → slot mapping regardless of
+                    // whether the call-site is invokevirtual or
+                    // invokeinterface.
+                    match execute_invokevirtual_vtable_fast(
+                        shared, thread, frame_idx, cp_index, saved_pc,
+                    ) {
                         Ok(CachedCallResult::FramePushed) => {
                             frame_idx = thread.frames.len() - 1;
                             continue;
@@ -13882,7 +13881,7 @@ fn execute_ldc(
                 .push(Value::Object(Some(obj_ref)))?;
         }
         LdcValue::ClassRef(class_name) => {
-            if std::env::var("CRATONVM_DBG_TOARRAY").is_ok() {
+            if crate::runtime::env_cache::dbg_toarray() {
                 eprintln!(
                     "[DBG_TOARRAY] LDC class={:?} in {}",
                     class_name,
@@ -18356,7 +18355,7 @@ fn intercept_force_registered_native(
     method_descriptor: &str,
     args: &[Value],
 ) -> Option<Result<CachedCallResult, MethodCallFailed>> {
-    if method_name == "getTarget" && std::env::var_os("CRATONVM_DBG_CCSPROBE").is_some() {
+    if method_name == "getTarget" && crate::runtime::env_cache::dbg_ccsprobe() {
         eprintln!(
             "[ccs-probe] intercept_force_registered_native: class={} method={}{} \
              force={}",
@@ -18382,7 +18381,7 @@ fn intercept_force_registered_native(
     let cb = shared
         .native_methods
         .find(class_name, method_name, method_descriptor)?;
-    if method_name == "getTarget" && std::env::var_os("CRATONVM_DBG_CCSPROBE").is_some() {
+    if method_name == "getTarget" && crate::runtime::env_cache::dbg_ccsprobe() {
         eprintln!("[ccs-probe] intercept_force_registered_native: dispatching native callback");
     }
     let ret_type = crate::jit::return_type(method_descriptor);
@@ -19938,7 +19937,7 @@ fn execute_invokestatic_cached(
                 }
                 let recommended_tier = shared.tiered_manager.on_method_invocation(&tiered_key);
                 if let Some(tier) = recommended_tier {
-                    if std::env::var_os("CRATONVM_DBG_JITC").is_some() {
+                    if crate::runtime::env_cache::dbg_jitc() {
                         eprintln!(
                             "[cratonvm-jitc] tiered-enqueue {}.{}{} tier={:?} invoc_count={} bg={}",
                             cached.class_name,
@@ -19961,7 +19960,7 @@ fn execute_invokestatic_cached(
                     // invalidate this JIT entry too.
                     let upgrade_result =
                         try_jit_upgrade_with_gate(shared, cached, entry_gate.clone());
-                    if upgrade_result.is_none() && std::env::var_os("CRATONVM_DBG_JITC").is_some() {
+                    if upgrade_result.is_none() && crate::runtime::env_cache::dbg_jitc() {
                         eprintln!(
                             "[cratonvm-jitc] upgrade-FAIL {}.{}{} invoc_count={}",
                             cached.class_name,
@@ -20833,7 +20832,7 @@ fn compile_osr_artifact(
         None => return None,
     };
 
-    if std::env::var_os("CRATONVM_DBG_JITC").is_some() {
+    if crate::runtime::env_cache::dbg_jitc() {
         eprintln!(
             "[cratonvm-jitc] OSR-{} {}.{}{} entry_pc={} entry={:p} len={}",
             if osr_reused { "reuse" } else { "compile" },
@@ -21520,7 +21519,7 @@ fn try_jit_upgrade_with_gate(
             )
             .is_some()
         {
-            if std::env::var_os("CRATONVM_DBG_BBLP").is_some()
+            if crate::runtime::env_cache::dbg_bblp()
                 && cached.class_name.contains("LazyProjection")
                 && &*cached.method_name == "equals"
             {
@@ -21537,7 +21536,7 @@ fn try_jit_upgrade_with_gate(
             &cached.code,
             cached.code.len().saturating_sub(2),
         ) {
-            if std::env::var_os("CRATONVM_DBG_BBLP").is_some()
+            if crate::runtime::env_cache::dbg_bblp()
                 && cached.class_name.contains("LazyProjection")
                 && &*cached.method_name == "equals"
             {
@@ -21548,7 +21547,7 @@ fn try_jit_upgrade_with_gate(
             }
             return None;
         }
-        if std::env::var_os("CRATONVM_DBG_BBLP").is_some()
+        if crate::runtime::env_cache::dbg_bblp()
             && cached.class_name.contains("LazyProjection")
             && &*cached.method_name == "equals"
         {
@@ -21716,7 +21715,7 @@ fn try_jit_upgrade_with_gate(
     // == HotSpot, 802 jit + 20 differential tests green). `CRATONVM_JIT_SCALAR_NEW=0`
     // is the opt-out safety net — when off, `None` is passed and the IR builder
     // bails on `new`, restoring the single-pass backend for allocation methods.
-    let scalar_new_on = std::env::var("CRATONVM_JIT_SCALAR_NEW").map_or(true, |v| v != "0");
+    let scalar_new_on = crate::runtime::env_cache::jit_scalar_new();
     let elidable_init_resolver =
         |cp_idx: u16| -> bool { resolve_jit_elidable_init_loading(shared, class_id, cp_idx) };
     // invoke class-id resolver: maps an invoke* CP index to the class id of
@@ -21744,7 +21743,7 @@ fn try_jit_upgrade_with_gate(
             ConstantPoolEntry::Double(v) => Some((v.to_bits() as i64, true)), // Cast: JIT ABI -- float bits to i64
             _ => None,
         };
-        if std::env::var_os("CRATONVM_DBG_JIT_LDC").is_some() {
+        if crate::runtime::env_cache::dbg_jit_ldc() {
             eprintln!(
                 "[cratonvm-ldc2w] upgrade idx={} -> {:?} (f64 {})",
                 cp_idx,
@@ -22009,7 +22008,7 @@ fn try_jit_upgrade_with_gate(
         };
         // Elidable-`<init>` resolver for `new` scalar replacement, default-ON
         // (opt-out: CRATONVM_JIT_SCALAR_NEW=0).
-        let c_scalar_new_on = std::env::var("CRATONVM_JIT_SCALAR_NEW").map_or(true, |v| v != "0");
+        let c_scalar_new_on = crate::runtime::env_cache::jit_scalar_new();
         let c_elidable_init_resolver =
             |cp_idx: u16| -> bool { resolve_jit_elidable_init_loading(shared, callee_cid, cp_idx) };
         // invoke class-id resolver for the callee's constant pool — maps
@@ -22099,26 +22098,26 @@ fn try_jit_upgrade_with_gate(
             // (inc 23, soaked: bt10/14/16/18 == HotSpot + IrCall/IrCallGc
             // probes == HotSpot, ON==OFF). `CRATONVM_JIT_IR_CALL=0` is the
             // opt-out — restores single-pass dispatch for invokestatic.
-            std::env::var("CRATONVM_JIT_IR_CALL").map_or(true, |v| v != "0"),
+            crate::runtime::env_cache::jit_ir_call(),
             // inc 24/29: invokespecial → Op::Call. Now default-ON;
             // `CRATONVM_JIT_IR_CALL_SPECIAL=0` opts out.
-            std::env::var("CRATONVM_JIT_IR_CALL_SPECIAL").map_or(true, |v| v != "0"),
+            crate::runtime::env_cache::jit_ir_call_special(),
             // inc 25/29: long methods → IR path. Now default-ON; `CRATONVM_JIT_IR_LONG=0` opts out.
-            std::env::var("CRATONVM_JIT_IR_LONG").map_or(true, |v| v != "0"),
+            crate::runtime::env_cache::jit_ir_long(),
             // inc 26: invokevirtual/invokeinterface → Op::Call (dynamic
             // dispatch via the helper), gated default-OFF (its own soak).
             // `CRATONVM_JIT_IR_CALL_VIRTUAL=1` opts in.
-            std::env::var_os("CRATONVM_JIT_IR_CALL_VIRTUAL").is_some(),
+            crate::runtime::env_cache::jit_ir_call_virtual(),
             // inc 30 + Slices A/B/C: double/float XMM value tier. Now
             // default-ON — the tier is opcode-complete (frem/drem, FP arrays,
             // FP-slot deopt resume all landed) and validated == HotSpot
             // (bt10/14/16/18 checksums + FP E2E probes). `CRATONVM_JIT_IR_FP=0`
             // is the opt-out (restores the int/long/ref-only IR path).
-            std::env::var("CRATONVM_JIT_IR_FP").map_or(true, |v| v != "0"),
+            crate::runtime::env_cache::jit_ir_fp(),
         )?;
         let entry = compiled.entry_ptr() as usize; // Cast: JIT entry point to address
         let needs_ctx = compiled.needs_context();
-        if std::env::var_os("CRATONVM_DBG_JITC").is_some() {
+        if crate::runtime::env_cache::dbg_jitc() {
             eprintln!(
                 "[cratonvm-jitc] callee-compile {}.{}{} entry={:p} len={}",
                 callee_cached.class_name,
@@ -22227,17 +22226,17 @@ fn try_jit_upgrade_with_gate(
         true,
         // Gap B: int-only invokestatic → Op::Call. Now default-ON (inc 23);
         // `CRATONVM_JIT_IR_CALL=0` is the opt-out (single-pass dispatch).
-        std::env::var("CRATONVM_JIT_IR_CALL").map_or(true, |v| v != "0"),
+        crate::runtime::env_cache::jit_ir_call(),
         // inc 24/29: invokespecial → Op::Call. Now default-ON; `CRATONVM_JIT_IR_CALL_SPECIAL=0` opts out.
-        std::env::var("CRATONVM_JIT_IR_CALL_SPECIAL").map_or(true, |v| v != "0"),
+        crate::runtime::env_cache::jit_ir_call_special(),
         // inc 25/29: long methods → IR path. Now default-ON; `CRATONVM_JIT_IR_LONG=0` opts out.
-        std::env::var("CRATONVM_JIT_IR_LONG").map_or(true, |v| v != "0"),
+        crate::runtime::env_cache::jit_ir_long(),
         // inc 26: invokevirtual/invokeinterface → Op::Call (dynamic dispatch via
         // the helper), gated default-OFF (its own soak). `=1` opts in.
-        std::env::var_os("CRATONVM_JIT_IR_CALL_VIRTUAL").is_some(),
+        crate::runtime::env_cache::jit_ir_call_virtual(),
         // inc 30 + Slices A/B/C: double/float XMM value tier. Now default-ON
         // (opcode-complete + validated == HotSpot). `CRATONVM_JIT_IR_FP=0` opts out.
-        std::env::var("CRATONVM_JIT_IR_FP").map_or(true, |v| v != "0"),
+        crate::runtime::env_cache::jit_ir_fp(),
     )?;
     let ret = crate::jit::return_type(&cached.method_descriptor);
     let heap = compiled.needs_heap();
@@ -22264,7 +22263,7 @@ fn try_jit_upgrade_with_gate(
             &cached.method_descriptor,
         )?
     };
-    if std::env::var_os("CRATONVM_DBG_JITC").is_some() {
+    if crate::runtime::env_cache::dbg_jitc() {
         eprintln!(
             "[cratonvm-jitc] upgrade-OK {}.{}{} entry={:p} len={}",
             cached.class_name,
@@ -22729,7 +22728,7 @@ fn try_jit_compile_callee_slow(
     };
     // Elidable-`<init>` resolver for `new` scalar replacement, default-ON
     // (opt-out: CRATONVM_JIT_SCALAR_NEW=0).
-    let scalar_new_on = std::env::var("CRATONVM_JIT_SCALAR_NEW").map_or(true, |v| v != "0");
+    let scalar_new_on = crate::runtime::env_cache::jit_scalar_new();
     let elidable_init_resolver =
         |cp_idx: u16| -> bool { resolve_jit_elidable_init_loading(shared, cid, cp_idx) };
     // invoke class-id resolver — maps an invoke* CP index to its declared
@@ -22754,7 +22753,7 @@ fn try_jit_compile_callee_slow(
             ConstantPoolEntry::Double(v) => Some((v.to_bits() as i64, true)), // Cast: JIT ABI -- float bits to i64
             _ => None,
         };
-        if std::env::var_os("CRATONVM_DBG_JIT_LDC").is_some() {
+        if crate::runtime::env_cache::dbg_jit_ldc() {
             eprintln!(
                 "[cratonvm-ldc2w] full idx={} -> {:?} (f64 {})",
                 cp_idx,
@@ -22828,19 +22827,19 @@ fn try_jit_compile_callee_slow(
         optimize,
         // Gap B: int-only invokestatic → Op::Call. Now default-ON (inc 23);
         // `CRATONVM_JIT_IR_CALL=0` is the opt-out (single-pass dispatch).
-        std::env::var("CRATONVM_JIT_IR_CALL").map_or(true, |v| v != "0"),
+        crate::runtime::env_cache::jit_ir_call(),
         // inc 24/29: invokespecial → Op::Call. Now default-ON; `CRATONVM_JIT_IR_CALL_SPECIAL=0` opts out.
-        std::env::var("CRATONVM_JIT_IR_CALL_SPECIAL").map_or(true, |v| v != "0"),
+        crate::runtime::env_cache::jit_ir_call_special(),
         // inc 25/29: long methods → IR path. Now default-ON; `CRATONVM_JIT_IR_LONG=0` opts out.
-        std::env::var("CRATONVM_JIT_IR_LONG").map_or(true, |v| v != "0"),
+        crate::runtime::env_cache::jit_ir_long(),
         // inc 26: invokevirtual/invokeinterface → Op::Call (dynamic dispatch via
         // the helper), gated default-OFF (its own soak). `=1` opts in.
-        std::env::var_os("CRATONVM_JIT_IR_CALL_VIRTUAL").is_some(),
+        crate::runtime::env_cache::jit_ir_call_virtual(),
         // inc 30 + Slices A/B/C: double/float XMM value tier. Now default-ON
         // (opcode-complete + validated == HotSpot). `CRATONVM_JIT_IR_FP=0` opts out.
-        std::env::var("CRATONVM_JIT_IR_FP").map_or(true, |v| v != "0"),
+        crate::runtime::env_cache::jit_ir_fp(),
     )?;
-    if std::env::var_os("CRATONVM_DBG_JITC").is_some() {
+    if crate::runtime::env_cache::dbg_jitc() {
         eprintln!(
             "[cratonvm-jitc] full-compile {}.{}{} entry={:p} len={}",
             cached.class_name,
@@ -23075,7 +23074,7 @@ fn background_compile_task(
         return 0;
     }
     let optimized = crate::jit::tiered::tier_uses_optimized_backend(task.target_tier);
-    if std::env::var_os("CRATONVM_DBG_JITC").is_some() {
+    if crate::runtime::env_cache::dbg_jitc() {
         eprintln!(
             "[cratonvm-jitc] bg-compile {}.{}{} tier={:?} optimized={}{}",
             task.method_key.class_name,
@@ -23254,7 +23253,7 @@ fn resolve_inline_site(
     // compile correctly, so the failing interaction is narrower than "all
     // getstatic" — but excluding them is the safe conservative fix until it is
     // isolated. `CRATONVM_INLINE_ALLOW_STATIC=1` re-enables them for debugging.
-    let inline_no_static = std::env::var_os("CRATONVM_INLINE_ALLOW_STATIC").is_none();
+    let inline_no_static = !crate::runtime::env_cache::inline_allow_static();
     while scan_pc < code_len {
         match code[scan_pc] {
             0xaa | 0xab => return None,        // tableswitch, lookupswitch
@@ -24510,7 +24509,7 @@ fn execute_invokevirtual_vtable_fast(
         return Ok(CachedCallResult::CacheMiss);
     }
 
-    if std::env::var_os("CRATONVM_DBG_VDISP").is_some()
+    if crate::runtime::env_cache::dbg_vdisp()
         && (method_name.as_ref() == "hashCode" || method_name.as_ref() == "equals")
     {
         let cm = shared.class_manager.read();
@@ -24702,7 +24701,7 @@ fn execute_invokevirtual_vtable_fast(
                 if direct_native_shadow {
                     remember_vtable_native_shadow(thread, native_shadow_cache_key, true);
                     if &**rcv_name == "java/lang/invoke/ConstantCallSite"
-                        && std::env::var_os("CRATONVM_DBG_CCSPROBE").is_some()
+                        && crate::runtime::env_cache::dbg_ccsprobe()
                     {
                         eprintln!(
                             "[ccs-probe] vtable_fast: native found for {} {}{} — emitting CacheMiss",
@@ -24713,7 +24712,7 @@ fn execute_invokevirtual_vtable_fast(
                     return Ok(CachedCallResult::CacheMiss);
                 }
                 if &**rcv_name == "java/lang/invoke/ConstantCallSite"
-                    && std::env::var_os("CRATONVM_DBG_CCSPROBE").is_some()
+                    && crate::runtime::env_cache::dbg_ccsprobe()
                 {
                     eprintln!(
                         "[ccs-probe] vtable_fast: native NOT found for {} {}{}",
@@ -25017,7 +25016,7 @@ fn execute_invokevirtual_cached(
         }
     }
     // [PB-DIAG] one-shot dump for InfoCmp.getInfoCmp at pc 38
-    if std::env::var_os("CRATONVM_DBG_PBSTART").is_some() {
+    if crate::runtime::env_cache::dbg_pbstart() {
         let cn = thread.frames[frame_idx].class_name();
         let mn = thread.frames[frame_idx].method_name();
         if cn.ends_with("/InfoCmp") && mn == "getInfoCmp" && site_pc == 38 {
@@ -25647,7 +25646,7 @@ fn populate_virtual_invoke_cache(
             Err(_) => return,
         };
 
-    if std::env::var_os("CRATONVM_DBG_VDISP").is_some()
+    if crate::runtime::env_cache::dbg_vdisp()
         && (method_name.as_ref() == "hashCode" || method_name.as_ref() == "equals")
     {
         let cm = shared.class_manager.read();

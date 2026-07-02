@@ -499,6 +499,16 @@ cached_is_set!(dbg_jetty, "CRATONVM_DBG_JETTY");
 /// (i.e. a `GetEnvironmentVariableW` syscall on the virtual-call dispatch path).
 /// Cached.
 cached_is_set!(dbg_jetty2, "CRATONVM_DBG_JETTY2");
+// `CRATONVM_DBG_VDISP` -- virtual-dispatch diagnostic. This sits on the
+// invokevirtual/invokeinterface miss path and must not call into the process
+// environment on every dispatch.
+cached_is_set!(dbg_vdisp, "CRATONVM_DBG_VDISP");
+cached_is_set!(dbg_ccsprobe, "CRATONVM_DBG_CCSPROBE");
+cached_is_set!(dbg_pbstart, "CRATONVM_DBG_PBSTART");
+cached_is_set!(dbg_bblp, "CRATONVM_DBG_BBLP");
+cached_is_set!(dbg_jitc, "CRATONVM_DBG_JITC");
+cached_is_set!(dbg_jit_ldc, "CRATONVM_DBG_JIT_LDC");
+cached_is_set!(trace_unimplemented, "CRATONVM_TRACE_UNIMPLEMENTED");
 
 // ── Flags read via `env::var(...).is_ok()` ──────────────────────────────
 
@@ -522,6 +532,7 @@ cached_is_ok!(modstatic_dbg, "CRATONVM_DBG_MODSTATIC");
 /// putfield (the two most common opcodes in object-oriented bytecode) — a
 /// per-field-access `GetEnvironmentVariableW` syscall. Cached.
 cached_is_ok!(hashtableofint_trace, "CRATON_HASHTABLEOFINT_TRACE");
+cached_is_ok!(dbg_toarray, "CRATONVM_DBG_TOARRAY");
 /// `CRATON_BAOS_DBG` — ByteArrayOutputStream `buf`/`count` putfield diagnostic,
 /// read with an UNCACHED `std::env::var_os(...).is_some()` on EVERY putfield.
 /// Cached.
@@ -580,6 +591,48 @@ pub fn strict_swallows() -> bool {
         Ok(v) => v == "1",
         Err(_) => false,
     })
+}
+
+#[inline]
+pub fn jit_scalar_new() -> bool {
+    static CACHE: OnceLock<bool> = OnceLock::new();
+    *CACHE.get_or_init(|| std::env::var("CRATONVM_JIT_SCALAR_NEW").map_or(true, |v| v != "0"))
+}
+
+#[inline]
+pub fn jit_ir_call() -> bool {
+    static CACHE: OnceLock<bool> = OnceLock::new();
+    *CACHE.get_or_init(|| std::env::var("CRATONVM_JIT_IR_CALL").map_or(true, |v| v != "0"))
+}
+
+#[inline]
+pub fn jit_ir_call_special() -> bool {
+    static CACHE: OnceLock<bool> = OnceLock::new();
+    *CACHE.get_or_init(|| std::env::var("CRATONVM_JIT_IR_CALL_SPECIAL").map_or(true, |v| v != "0"))
+}
+
+#[inline]
+pub fn jit_ir_long() -> bool {
+    static CACHE: OnceLock<bool> = OnceLock::new();
+    *CACHE.get_or_init(|| std::env::var("CRATONVM_JIT_IR_LONG").map_or(true, |v| v != "0"))
+}
+
+#[inline]
+pub fn jit_ir_call_virtual() -> bool {
+    static CACHE: OnceLock<bool> = OnceLock::new();
+    *CACHE.get_or_init(|| std::env::var_os("CRATONVM_JIT_IR_CALL_VIRTUAL").is_some())
+}
+
+#[inline]
+pub fn jit_ir_fp() -> bool {
+    static CACHE: OnceLock<bool> = OnceLock::new();
+    *CACHE.get_or_init(|| std::env::var("CRATONVM_JIT_IR_FP").map_or(true, |v| v != "0"))
+}
+
+#[inline]
+pub fn inline_allow_static() -> bool {
+    static CACHE: OnceLock<bool> = OnceLock::new();
+    *CACHE.get_or_init(|| std::env::var_os("CRATONVM_INLINE_ALLOW_STATIC").is_some())
 }
 
 // NOTE (real-cdi-bean-container Step 3): the former `real_spring_startup()` gate

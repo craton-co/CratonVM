@@ -28,6 +28,20 @@ available from the separate worktree because `apps/` is gitignored there; a broa
 `cratonvm-vm` test build also failed before execution with MSVC linker disk-space
 errors. Keep §15–16 open until the app-level timing rerun is completed.
 
+**Recheck (2026-07-02, refreshed dev `8aa12046`):** the fixes that landed on
+`dev` did not close the remaining function sweep items: the refreshed dev
+binary `cvmisc16-dev8aa12046-20260702.exe` still reports `FunctionTests` HANG
+and `StandardFunctionTests` HANG at the 300 s harness cap. On this branch,
+`StandardFunctionTests` now completes **PASS 44/44** in 296706 ms with binary
+`cvmisc16-cmpfast-20260702.exe`; the old `Function.compare`/tagless-comparator
+failure is gone. `FunctionTests` remains live-but-too-slow at 300 s. A watchdog
+stack dump shows the late hot path in unshaded ANTLR
+`ParserATNSimulator.closureCheckingStopState` / `closure_` under
+`PredictionContext.mergeSingletons` during
+`testAggregateIndexElementWithPath`, matching the existing H4 cold HQL/ANTLR
+prediction-throughput cluster rather than a new comparator or classpath
+correctness bug.
+
 Run the sweep:
 ```
 cd C:/craton/CratonVM/apps/hib-suite-runner
@@ -42,6 +56,11 @@ CRATONVM_DISABLE_DEFAULT_WATCHDOG=1 $CV --java-home "C:/Program Files/Java/jdk-2
 ---
 
 ## Summary table
+
+**2026-07-02 summary override:** row 15 remains OPEN and is now routed to the
+existing H4 ANTLR cold-prediction/deep-recursion throughput cluster. Row 16 is
+FIXED after the comparator lambda/function dispatch fix now present on current
+`dev`; the focused branch run passes `StandardFunctionTests` 44/44.
 
 | # | Class | Symptom | Root cause | Disposition |
 |---|-------|---------|-----------|-------------|
@@ -425,6 +444,32 @@ wrong-results. The only delta is exception flavor (CratonVM surfaces
 distinct misc-correctness bug — arguably mis-classified into this tail.
 `StandardFunctionTests` should re-run on the merged binary to confirm the same
 pattern (HotSpot baseline: 29 s, `found=44 ok=41 failed=3`).
+
+### 2026-07-02 recheck after refreshed dev
+
+Refreshed `dev` at `8aa12046` still timed out both `FunctionTests` and
+`StandardFunctionTests` at the 300 s harness cap. The branch binary
+`cvmisc16-cmpfast-20260702.exe` fixes the `StandardFunctionTests` side: the
+class now completes `found=44 started=44 ok=44 failed=0 aborted=0 skipped=0`
+in 296706 ms. The bug was the comparator native treating a tagless lambda
+`java.util.function.Function` from `Comparator.comparing` as though it were a
+`Comparator` and dispatching `compare`; the fix identifies Function and
+primitive key-extractor SAMs directly and compares their extracted keys.
+
+`FunctionTests` is still not closed. With the comparator fixed it advances into
+the known H4 path: the watchdog stack for
+`testAggregateIndexElementWithPath` is in
+`ParserATNSimulator.closureCheckingStopState` / `closure_`, called through
+`ATNConfigSet.add` and `PredictionContext.mergeSingletons`. This is the same
+cold HQL/ANTLR prediction-throughput and deep-recursion problem documented in
+`docs/internal/springrepos-extension-hang-jit-throughput-and-deep-recursion.md`.
+It is not a new wrong-result or tagless-comparator correctness failure.
+
+After rebasing onto current local `dev` at `c4eb9dfa`, the comparator native
+fix is already present in `dev` and no longer appears as a delta in this branch.
+The remaining branch delta records the recheck and keeps only the miss-path
+throughput reductions that helped the focused Hibernate rerun reach the
+resolved `StandardFunctionTests` path.
 
 ### Profile (cdb sampling, `release-with-debug` binary + PDB)
 
