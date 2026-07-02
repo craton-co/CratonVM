@@ -35,6 +35,24 @@ let class_path = ClassPath::new(&["target/classes".into(), "lib/foo.jar".into()]
 Pre-1.0. API stability is best-effort. Tied to the
 [CratonVM](https://github.com/craton-co/cratonvm) workspace version.
 
+## Classpath safety
+
+Classpath JARs, JMODs, classes, and resources are read into owned memory rather
+than memory-mapped. If file metadata changes while a classpath file is being
+read, the read fails closed so concurrent deployment or mutation cannot crash
+the VM through a truncated mapping.
+
+Classpath entry names use Java/ZIP forward slashes. Lookup APIs reject host-path
+syntax including `..`, NUL bytes, drive letters, leading slashes, and any
+backslash separator such as `pkg\Foo`.
+
+## Test fixtures
+
+The compiled Java fixtures under `tests/fixtures/` are committed and included in
+the published package. They are required by the redefine and security
+integration tests, so packaged-crate test runs exercise the same fixture bytes as
+workspace test runs.
+
 ## License
 
 Apache-2.0. See `LICENSE` and `NOTICE` at the workspace root.

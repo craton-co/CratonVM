@@ -18,107 +18,40 @@ use std::sync::{Arc, OnceLock};
 use tracing::debug;
 use zip::ZipArchive;
 
-/// Round 7 audit fix (MED #12): threshold (in bytes) above which we
-/// switch from a userland `fs::read` (libc::read into a growing `Vec`)
-/// to `memmap2::Mmap` + bulk copy.
+/// Read a classpath file into owned bytes without memory-mapping it.
 ///
-/// Why a threshold at all? For tiny files (`.class` files, mostly
-/// under 4 KB), `fs::read` is faster: a single `read` syscall fills
-/// the Vec, whereas mmap incurs a `mmap` + `munmap` syscall pair plus
-/// a page-fault per page. Above ~64 KB the math flips — `fs::read`'s
-/// internal buffer doubling drives 2-3 allocations + copies, while
-/// mmap is a single bulk `memcpy` from page cache and the kernel can
-/// drop pages under memory pressure.
-///
-/// 64 KB matches the boundary `read_to_end` uses internally
-/// (`DEFAULT_BUF_SIZE = 8 KiB` × 8 grow cycles) and lines up with
-/// HotSpot's `os::map_memory()` heuristic for JAR loads.
-const MMAP_THRESHOLD_BYTES: u64 = 64 * 1024;
-
-/// Round 7 audit fix (MED #12): read an on-disk file into an owned
-/// `Vec<u8>` with mmap as the fast path for large files.
-///
-/// For files >= [`MMAP_THRESHOLD_BYTES`] we open the file, `mmap` it
-/// read-only, and `memcpy` the contents into a Vec sized exactly to
-/// the file. This skips the libc::read userland-buffer-doubling
-/// growth path inside `std::fs::read` (which for an 80 MB Spring-Boot
-/// fat JAR allocates 8K → 16K → ... → 128M = 9 reallocations and
-/// ~160 MB of copy traffic). The mmap path: one syscall pair plus
-/// one allocate + one memcpy = ~80 MB of copy traffic. Roughly 2×
-/// less work on the hot startup path.
-///
-/// For files smaller than the threshold we fall through to
-/// `fs::read`, which is faster for the per-`.class`-file probes
-/// (mmap's syscall overhead would dominate).
-///
-/// Errors surface as `io::Error` so callers can keep using the
-/// existing `?` / `map_err` / `if let Ok(data)` patterns.
-///
-/// Caveat: the mmap is dropped before this function returns, so we
-/// still produce a heap-owned `Vec<u8>`. The further refactor — to
-/// store the `Mmap` inside `ClassPathEntry::JarFile` and feed
-/// `ZipArchive` a `Cursor<Arc<Mmap>>` instead of `Cursor<Vec<u8>>`
-/// — is deferred (it requires changing the `ClassPathEntry` storage
-/// type and the `archive: Mutex<ZipArchive<...>>` generic argument
-/// everywhere, which exceeds the scope of this fix).
-///
-/// TODO(round-8 HIGH classloading): the mmap path always
-/// heap-doubles. Two viable cascades:
-///
-/// 1. Return `Arc<[u8]>` so callers share the allocation. Most
-///    consumers already take `&[u8]` and would only need an `&*arc`
-///    deref; the JAR consumers want `Cursor<Vec<u8>>` for
-///    `ZipArchive` and would need an adapter cursor type.
-/// 2. Return an `enum Bytes { Mmap(Mmap), Vec(Vec<u8>) }` with
-///    `Deref<Target = [u8]>` so producers keep ownership of the
-///    mmap. Same `ZipArchive` cursor cascade applies — the archive
-///    holds `ZipArchive<Cursor<Bytes>>` which transitively becomes
-///    generic across `ClassPathEntry` storage. Approximately 20
-///    call sites in this file plus the `Mutex<ZipArchive<…>>`
-///    fields. Round-8 deferred this for the same reason round-7
-///    did (cascading generics).
-///
-/// Round-8 HIGH (ZipArchive deep mmap): same cascade — `ZipArchive`
-/// is `ZipArchive<R: Read + Seek>`, so swapping the cursor type
-/// requires generic plumbing through every helper in this file.
-/// When this cascade is undertaken (likely as a dedicated work
-/// package), define `enum JarReader { Mmap(Cursor<Arc<Mmap>>),
-/// Vec(Cursor<Arc<[u8]>>) }` with `Read + Seek` forwarding, swap
-/// the type alias once at the top of the file, and let the type
-/// checker drive the cascade.
+/// Classpath entries are ordinary files controlled by launchers, build tools,
+/// and sometimes deployment systems. A concurrent truncate of a memory-mapped
+/// JAR can terminate the process on Unix when the mapping is touched. Keeping
+/// the read on `File::read_to_end` avoids that signal-level failure mode; if
+/// the file changes during the read, callers get an `InvalidData` error and the
+/// classpath entry is skipped/fails closed just like a corrupt archive.
 fn read_file_for_classpath(path: &Path) -> std::io::Result<Vec<u8>> {
-    let file = std::fs::File::open(path)?;
-    let metadata = file.metadata()?;
-    let size = metadata.len();
-    if size >= MMAP_THRESHOLD_BYTES {
-        // SAFETY: we only read from the mapping, never mutate. The
-        // file's contents may change on disk concurrently — but the
-        // same race exists for `fs::read`, and the resulting bytes
-        // pass through `ZipArchive::new` which surfaces a typed
-        // error for corruption. No UB if the file is truncated
-        // mid-read: the OS zero-fills past EOF for the mapped pages.
-        match unsafe { memmap2::Mmap::map(&file) } {
-            Ok(mmap) => {
-                let mut buf = Vec::with_capacity(mmap.len());
-                buf.extend_from_slice(&mmap);
-                return Ok(buf);
-            }
-            Err(_) => {
-                // mmap can fail on exotic filesystems (tmpfs on some
-                // kernels, ZFS without enough memory pressure, etc.).
-                // Fall through to `fs::read` which uses the standard
-                // `read(2)` loop and works everywhere.
-            }
-        }
-    }
-    // Small file (or mmap unavailable): plain `read_to_end`. The
-    // `File` is already open, so re-using it avoids a second
-    // `openat(2)` syscall versus a fresh `fs::read(path)`.
-    // `Read` is in scope from the file-level `use std::io::{Cursor, Read};`.
-    let mut buf = Vec::with_capacity(size as usize);
-    let mut file = file;
+    let mut file = std::fs::File::open(path)?;
+    let before = file.metadata()?;
+    let mut buf = Vec::with_capacity(safe_with_capacity(before.len()));
     file.read_to_end(&mut buf)?;
+    let after = file.metadata()?;
+    if classpath_file_metadata_changed(&before, &after) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "classpath file changed while being read: {}",
+                path.display()
+            ),
+        ));
+    }
     Ok(buf)
+}
+
+fn classpath_file_metadata_changed(before: &fs::Metadata, after: &fs::Metadata) -> bool {
+    if before.len() != after.len() {
+        return true;
+    }
+    match (before.modified(), after.modified()) {
+        (Ok(before), Ok(after)) => before != after,
+        _ => false,
+    }
 }
 
 /// Round 7 audit fix (HIGH #4): bound the canonicalize cache so a
@@ -874,8 +807,8 @@ pub(crate) fn decode_percent_path(s: &str) -> String {
 /// reinterpreted as a host path. This mirrors the input filter applied by
 /// [`ClassPath::find_class`] so that `getResource`/`getResourceAsStream`
 /// and the `find_all_resource_*` enumeration paths reject the same hostile
-/// inputs: `..` traversal, NUL bytes, leading `/` or `\\`, the alternate
-/// Windows separator `\\`, Windows drive letters (`:`), and `./` / `.\\`
+/// inputs: `..` traversal, NUL bytes, leading `/`, any Windows separator
+/// `\\`, Windows drive letters (`:`), and `./` / `.\\`
 /// current-dir references. The caller is expected to have already stripped
 /// any leading `/` (HotSpot strips one leading slash from resource names);
 /// a *remaining* leading `/` after that strip is still rejected here.
@@ -887,11 +820,21 @@ pub(crate) fn is_safe_resource_name(name: &str) -> bool {
     !(name.contains("..")
         || name.starts_with('/')
         || name.starts_with('\\')
-        || name.contains("\\\\")
+        || name.contains('\\')
         || name.contains('\0')
         || name.contains(':') // Windows drive letters (C:)
         || name.contains("./") // current-dir references
         || name.contains(".\\")) // Windows current-dir references
+}
+
+fn is_safe_class_name(name: &str) -> bool {
+    !(name.contains("..")
+        || name.starts_with('/')
+        || name.starts_with('\\')
+        || name.contains('\\')
+        || name.contains('\0')
+        || name.contains(':') // Windows drive letters (C:)
+        || name.contains("./")) // current-dir references
 }
 
 fn is_directory_resolvable_resource_name(name: &str) -> bool {
@@ -1089,9 +1032,9 @@ impl ClassPath {
                     .is_some_and(|ext| ext.eq_ignore_ascii_case("jar"))
                     && path.exists()
                 {
-                    // Round 7 audit fix (MED #12): mmap large JARs to
-                    // avoid the libc::read userland-buffer-doubling cost
-                    // on Spring-Boot fat JARs.
+                    // Read into owned bytes and reject files that mutate
+                    // during the read, so classpath JARs fail closed instead
+                    // of exposing mmap truncation hazards.
                     match read_file_for_classpath(&path) {
                         Ok(data) => {
                             Self::load_jar_data(&path, data, &mut entries);
@@ -1497,9 +1440,8 @@ impl ClassPath {
     ///
     /// Returns `None` if the JAR cannot be read or has no `MANIFEST.MF`.
     pub fn read_jar_manifest(jar_path: &Path) -> Option<ManifestInfo> {
-        // Round 7 audit fix (MED #12): JAR files are nearly always
-        // above the mmap threshold; this skips the userland buffer
-        // growth path inside `fs::read`.
+        // Read into owned bytes and reject concurrent mutation before ZIP
+        // parsing, so a changing JAR is handled as invalid input.
         let data = read_file_for_classpath(jar_path).ok()?;
         let cursor = Cursor::new(data);
         let mut archive = ZipArchive::new(cursor).ok()?;
@@ -1598,8 +1540,7 @@ impl ClassPath {
                 // fails closed (pushes no entry) when the bytes are not a valid
                 // zip, so a stray non-archive file on the classpath is harmless.
                 //
-                // Round 7 audit fix (MED #12): mmap large JARs on the dynamic-add
-                // path too (URLClassLoader, agent-injected jars, etc.).
+                // Use the same stable owned read as startup classpath JARs.
                 match read_file_for_classpath(&pb) {
                     Ok(data) => {
                         Self::load_jar_data(&pb, data, &mut self.entries);
@@ -1679,16 +1620,7 @@ impl ClassPath {
     pub fn find_class(&self, class_name: &str) -> Result<Vec<u8>, ClassFileError> {
         // Reject path traversal attempts, absolute paths, and suspicious patterns.
         // Class binary names use '/' as separator and must not escape the classpath root.
-        if class_name.contains("..")
-            || class_name.starts_with('/')
-            || class_name.starts_with('\\')
-            || class_name.contains("\\\\")
-            || class_name.contains('\0')
-            || class_name.contains(':')       // Windows drive letters (C:)
-            || class_name.contains("./")      // current-dir references
-            || class_name.contains(".\\")
-        // Windows current-dir references
-        {
+        if !is_safe_class_name(class_name) {
             return Err(ClassFileError::ClassNotFound {
                 class_name: class_name.to_string(),
             });
@@ -1762,12 +1694,8 @@ impl ClassPath {
                             });
                         }
                         debug!("Found class {class_name} at {}", full_path.display());
-                        // Round 7 audit fix (MED #12): use the mmap-or-
-                        // read helper. Most `.class` files are tiny so
-                        // the helper falls through to `fs::read`, but
-                        // some generated/proxy class files (Spring AOP,
-                        // ByteBuddy, Jackson) exceed the threshold and
-                        // benefit from mmap.
+                        // Use the stable classpath read helper so a class file
+                        // that changes mid-read is rejected as invalid input.
                         return read_file_for_classpath(&full_path).map_err(|e| {
                             ClassFileError::IoError {
                                 class_name: class_name.to_string(),
@@ -1888,15 +1816,7 @@ impl ClassPath {
         // bytes, leading slash, backslash, drive letter, dot-dot,
         // relative-dir prefixes). The previous truncated check let
         // `..\\Object` or `C:\Foo` reach the JAR-name lookups below.
-        if class_name.contains("..")
-            || class_name.starts_with('/')
-            || class_name.starts_with('\\')
-            || class_name.contains("\\\\")
-            || class_name.contains('\0')
-            || class_name.contains(':')
-            || class_name.contains("./")
-            || class_name.contains(".\\")
-        {
+        if !is_safe_class_name(class_name) {
             return None;
         }
         let relative_path = format!("{}.class", class_name);
@@ -1996,15 +1916,7 @@ impl ClassPath {
         // validation set (NUL bytes, leading slash, backslash, drive letter,
         // dot-dot, relative-dir prefixes). The previous truncated check let
         // `..\\Object` or `C:\Foo` reach the JAR-name lookups below.
-        if class_name.contains("..")
-            || class_name.starts_with('/')
-            || class_name.starts_with('\\')
-            || class_name.contains("\\\\")
-            || class_name.contains('\0')
-            || class_name.contains(':')
-            || class_name.contains("./")
-            || class_name.contains(".\\")
-        {
+        if !is_safe_class_name(class_name) {
             return None;
         }
         let relative_path = format!("{}.class", class_name);
@@ -2496,9 +2408,8 @@ impl ClassPath {
                             );
                             return None;
                         }
-                        // Round 7 audit fix (MED #12): resources can be
-                        // large (config files, embedded assets, JS
-                        // bundles); mmap when they cross the threshold.
+                        // Use the stable classpath read helper for resources
+                        // too; a file that changes mid-read is skipped.
                         if let Ok(data) = read_file_for_classpath(&full_path) {
                             debug!("Found resource {name} in directory {}", dir.display());
                             return Some(data);
@@ -2687,8 +2598,7 @@ impl ClassPath {
                     if !canon_path.starts_with(&canon_dir) {
                         continue;
                     }
-                    // Round 7 audit fix (MED #12): same mmap-or-read
-                    // helper as the single-resource path above.
+                    // Same stable read helper as the single-resource path.
                     if let Ok(bytes) = read_file_for_classpath(&full_path) {
                         out.push(bytes);
                     }
@@ -3016,11 +2926,8 @@ impl ClassPath {
             match entry {
                 ClassPathEntry::Directory(dir) => {
                     let path = dir.join("module-info.class");
-                    // Round 7 audit fix (MED #12): module-info.class is
-                    // tiny so the helper hits the `fs::read` fallback,
-                    // but the single dispatch point keeps the code
-                    // homogeneous if a large module descriptor ever
-                    // appears.
+                    // Keep directory module-info reads on the same stable
+                    // classpath file helper.
                     if let Ok(data) = read_file_for_classpath(&path) {
                         debug!("Found module-info.class in directory {}", dir.display());
                         results.push(data);
@@ -3372,10 +3279,8 @@ impl ClassPath {
     /// This is critical for debug-mode performance where deflate is extremely
     /// slow (~30s for 200 classes vs <2s with pre-extraction).
     fn load_jmod(path: &Path) -> Result<ClassPathEntry, String> {
-        // Round 7 audit fix (MED #12): JMOD files (the JDK module
-        // archives at `$JAVA_HOME/jmods/*.jmod`) are typically
-        // multi-megabyte and benefit substantially from mmap during
-        // the JDK boot scan (java.base.jmod alone is ~25 MB).
+        // JMOD files are ordinary classpath archives here; read them through
+        // the same owned, mutation-detecting helper as JARs.
         let data = read_file_for_classpath(path).map_err(|e| format!("failed to read: {e}"))?;
         if data.len() < 4 {
             return Err("file too small to be a valid JMOD".to_string());
@@ -3537,6 +3442,33 @@ mod tests {
     fn path_traversal_backslash_rejected() {
         let cp = ClassPath::new(&[]);
         assert!(cp.find_class("\\\\server\\share").is_err());
+    }
+
+    #[test]
+    fn single_windows_separator_component_rejected_everywhere() {
+        let cp = ClassPath::new(&[]);
+        assert!(cp.find_class("pkg\\Foo").is_err());
+        assert!(cp.find_class_source_path("pkg\\Foo").is_none());
+        assert!(cp.find_class_code_source_info("pkg\\Foo").is_none());
+        assert!(cp.find_resource("pkg\\config.properties").is_none());
+        assert!(cp.find_all_resource_bytes("pkg\\config.properties").is_empty());
+        assert!(cp.find_all_resource_urls("pkg\\config.properties").is_empty());
+    }
+
+    #[test]
+    fn classpath_metadata_change_detects_length_change() {
+        let dir = std::env::temp_dir().join("cratonvm_classpath_mutation_guard");
+        let _ = fs::create_dir_all(&dir);
+        let path = dir.join("guard.jar");
+
+        fs::write(&path, b"before").unwrap();
+        let before = fs::metadata(&path).unwrap();
+        fs::write(&path, b"after mutation").unwrap();
+        let after = fs::metadata(&path).unwrap();
+
+        assert!(classpath_file_metadata_changed(&before, &after));
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
