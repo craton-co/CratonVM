@@ -67,3 +67,28 @@ C:\craton\CratonVM-elasticsearch-current-suite-20260702\apps\elasticsearch-suite
 C:\craton\CratonVM-elasticsearch-current-suite-20260702\apps\elasticsearch-suite-runner\.suite\results\es-current-full-jiton-20260702\all-jit\logs\server.org.elasticsearch.index.codec.vectors.diskbbq.ES920DiskBBQBFloat16VectorsFormatTests.out.log
 C:\craton\CratonVM-elasticsearch-full-suite-20260702\apps\elasticsearch-suite-runner\.suite\results\es-full-hotspot-20260702\hotspot-jit\results.tsv
 ```
+
+## No-JIT partial evidence
+
+Run `es-nojit-full-20260702` was stopped by request after 1366 recorded
+classes. The partial no-JIT run had already found 10 CratonVM failures where
+the terminal failure was `SegmentVarHandle` foreign-memory access. All 10 were
+HotSpot PASS classes. Additional TSDB hang logs also contain
+`SegmentVarHandle` failures before the runner timeout.
+
+Representative no-JIT row:
+
+```text
+index=1339
+module=server
+class=org.elasticsearch.index.codec.vectors.diskbbq.ES920DiskBBQBFloat16VectorsFormatTests
+CratonVM no-JIT=FAIL, 37.964s
+HotSpot=PASS, 18.334s
+```
+
+Evidence:
+
+```text
+C:\craton\CratonVM-elasticsearch-nojit-suite-20260702\apps\elasticsearch-suite-runner\.suite\results\es-nojit-full-20260702\all-nojit\results.tsv
+C:\craton\CratonVM-elasticsearch-nojit-suite-20260702\apps\elasticsearch-suite-runner\.suite\results\es-nojit-full-20260702\all-nojit\logs\server.org.elasticsearch.index.codec.vectors.diskbbq.ES920DiskBB.5aed92a84366.out.log
+```

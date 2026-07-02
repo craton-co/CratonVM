@@ -68,3 +68,23 @@ C:\craton\CratonVM-elasticsearch-current-suite-20260702\apps\elasticsearch-suite
 C:\craton\CratonVM-elasticsearch-current-suite-20260702\apps\elasticsearch-suite-runner\.suite\results\es-current-full-jiton-20260702\all-jit\logs\server.org.elasticsearch.index.codec.tsdb.es819.ES819TSDBDocValuesFormatTests.err.log
 Windows Application log, Application Error source, 2026-07-02 around 15:16 and 15:17 local time, exception code 0xc0000005
 ```
+
+## No-JIT partial evidence
+
+Run `es-nojit-full-20260702` was stopped by request after 1366 recorded
+classes. In no-JIT, the same TSDB doc-values classes did not crash before the
+runner timeout; they hung and were killed at 300 seconds:
+
+```text
+index=1347 org.elasticsearch.index.codec.tsdb.es819.ES819TSDBDocValuesFormatTests HANG, 300.081s
+index=1356 org.elasticsearch.index.codec.tsdb.es95.ES95TSDBDocValuesFormatTests HANG, 300.129s
+```
+
+This suggests the JIT-on crash may be a compiled-code symptom of a path that
+can also deadlock or spin in interpreter mode.
+
+Evidence:
+
+```text
+C:\craton\CratonVM-elasticsearch-nojit-suite-20260702\apps\elasticsearch-suite-runner\.suite\results\es-nojit-full-20260702\all-nojit\results.tsv
+```

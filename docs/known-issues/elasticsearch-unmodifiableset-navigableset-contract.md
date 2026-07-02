@@ -100,3 +100,18 @@ C:\craton\CratonVM-elasticsearch-full-suite-20260702\apps\elasticsearch-suite-ru
 C:\craton\CratonVM-elasticsearch-current-suite-20260702\apps\elasticsearch-suite-runner\.suite\results\es-current-full-jiton-20260702\all-jit\logs\server.org.elasticsearch.action.admin.cluster.allocation.Transpo.d64f1184279c.out.log
 C:\craton\CratonVM-elasticsearch-current-suite-20260702\apps\elasticsearch-suite-runner\.suite\results\es-current-full-jiton-20260702\all-jit\logs\server.org.elasticsearch.index.codec.PerFieldMapperCodecTests.out.log
 ```
+
+## No-JIT partial evidence
+
+Run `es-nojit-full-20260702` was stopped by request after 1366 recorded
+classes. In that partial CratonVM no-JIT run:
+
+- 100 failures matched this collection-contract signature.
+- 99 were CratonVM-only versus the HotSpot baseline.
+- Representative rows shifted to index 222
+  `TransportDeleteDesiredBalanceActionTests` and index 248
+  `NodesReloadSecureSettingsResponseTests`.
+
+```text
+C:\craton\CratonVM-elasticsearch-nojit-suite-20260702\apps\elasticsearch-suite-runner\.suite\results\es-nojit-full-20260702\all-nojit\results.tsv
+```

@@ -70,3 +70,22 @@ C:\craton\CratonVM-elasticsearch-current-suite-20260702\apps\elasticsearch-suite
 C:\craton\CratonVM-elasticsearch-full-suite-20260702\apps\elasticsearch-suite-runner\.suite\results\es-full-hotspot-20260702\hotspot-jit\results.tsv
 C:\craton\CratonVM-elasticsearch-current-suite-20260702\apps\elasticsearch-suite-runner\.suite\results\es-current-full-jiton-20260702\all-jit\logs\server.org.elasticsearch.action.bulk.ShardBatchMapperResolveTests.err.log
 ```
+
+## No-JIT partial evidence
+
+Run `es-nojit-full-20260702` was stopped by request after 1366 recorded
+classes. The partial no-JIT run had already hit 4 CratonVM-only failures with
+this same Byte Buddy signature:
+
+```text
+index=426 org.elasticsearch.action.bulk.ShardBatchMapperResolveTests
+index=456 org.elasticsearch.action.fieldcaps.FieldCapabilitiesFilterTests
+index=753 org.elasticsearch.cluster.metadata.MetadataDataStreamsServiceTests
+index=766 org.elasticsearch.cluster.metadata.MetadataMigrateToDataStreamServiceTests
+```
+
+Evidence:
+
+```text
+C:\craton\CratonVM-elasticsearch-nojit-suite-20260702\apps\elasticsearch-suite-runner\.suite\results\es-nojit-full-20260702\all-nojit\results.tsv
+```
