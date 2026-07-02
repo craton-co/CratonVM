@@ -39,7 +39,7 @@
 A Java Virtual Machine written entirely in Rust:
 
 - **~323,000+ lines** of Rust code
-- **6,000+ tests** passing, **0** clippy warnings
+- Large Rust/Java test corpus with clippy and formatting tracked as release gates
 - **~3,100+ native method** registrations (java.lang, java.util, java.io, java.time, ...)
 - Full interpreter with 140+ fast-path bytecodes
 - Generational garbage collector with write barriers
@@ -500,8 +500,8 @@ A Java Virtual Machine written entirely in Rust:
 | JIT module LoC | **~7,200** |
 | JIT bytecodes | **~140 opcodes** |
 | JIT unit tests | **~80** |
-| Tests passing | **6,000+** |
-| Clippy warnings | **0** |
+| Test corpus | Large Rust/Java unit, integration, regression, difftest, and fuzz layers |
+| Lint status | `clippy -D warnings` is a release gate, not a baked-in metric |
 | Native methods | **~3,100+** |
 | Phases completed | **73** (0-72 + perf) |
 | Optimization rounds | **26** |

@@ -16,9 +16,10 @@ RUST_MIN_STACK=8388608 cargo test --all -- --test-threads=4
 
 Tests that require `javac` skip gracefully when no JDK is on the `PATH`.
 
-The CI pipeline gates `cargo fmt --check`, `cargo build`, `cargo clippy -D
-warnings`, and `cargo test` across the workspace on Linux and Windows. The full
-suite is **6,000+ tests**.
+The CI pipeline is configured to run `cargo fmt --check`, `cargo build`,
+`cargo clippy -D warnings`, and `cargo test` across the workspace on Linux and
+Windows. Coverage and semantic difftest jobs are advisory today; check the
+current Actions run before treating a branch as release-ready.
 
 ## Test layers
 
@@ -50,11 +51,15 @@ for what each class covers and how to add one.
 
 The `fuzz/` directory is a separate, standalone workspace (a libFuzzer harness)
 that is *not* a workspace member, because its `#![no_main]` harness trips the
-production lints. Build it on nightly:
+production lints. It currently declares 11 targets. Build it on nightly:
 
 ```bash
 cargo +nightly fuzz build
 ```
+
+The fuzz workspace is not a blocking CI gate today, and the current review
+tracks a build blocker around the `legacy-synthetic-crypto` feature until the
+native-builtins feature declarations and fuzz manifest are aligned.
 
 ## Writing tests
 
@@ -67,5 +72,6 @@ cargo +nightly fuzz build
 
 ## Code coverage
 
-Coverage is generated with `cargo-llvm-cov` locally and in a CI job. See the
-repository's coverage documentation for invocation details.
+Coverage is generated with `cargo-llvm-cov` locally and in an advisory CI job.
+No minimum coverage threshold is enforced today. See the repository's coverage
+documentation for invocation details.

@@ -35,7 +35,7 @@ features. Highlights:
 - Thread-local scratch buffer for socket read/write (no per-syscall `Vec`); O(1) maps for JNI global refs, unified-logging handles, and the regex cache; bounded JIT code-cache + deopt history; metaspace bump fast-path.
 
 #### Features
-- `cargo-llvm-cov` coverage CI job (`.github/workflows/coverage.yml`, `docs/COVERAGE.md`).
+- Advisory `cargo-llvm-cov` coverage workflow (`.github/workflows/coverage.yml`, `docs/COVERAGE.md`).
 - Container/cgroup-aware default heap sizing (`vm/src/runtime/container.rs`, `docs/CONTAINER.md`).
 - `README.md` for `libcratonvm` and `cratonvm-embed` (crates.io pages); embedding guide (`docs/EMBEDDING.md`).
 - Five L/XL design docs under `docs/feature-designs/` (precise-JIT-maps-default, deopt/OSR, concurrent-GC maturation, foreign-thread attach, differential fuzzer).
@@ -43,7 +43,7 @@ features. Highlights:
 #### Build / OSS
 - MSRV raised `1.77` → `1.80` (`Cargo.toml`, `clippy.toml`) to match the std APIs the code already uses; `gc`/`reader`/`craton-gpu` clippy cleaned.
 - Untracked the gitignored `bench/` build artifacts and stray `dd1.out` (kept on disk); test-fixture `.class` files retained.
-- Crate-count references corrected to **19** workspace members (`libcratonvm` + `cratonvm-embed` added); `docs/CRYPTO_STATUS.md` reclassified PBKDF2/ML-KEM/DESede as implemented.
+- Crate-count references corrected to **20** workspace members (`libcratonvm`, `cratonvm-embed`, and `cratonvm-difftest` present; `fuzz/` remains standalone); `docs/CRYPTO_STATUS.md` reclassified PBKDF2/ML-KEM/DESede as implemented.
 
 ---
 
@@ -93,9 +93,9 @@ A cross-crate review-driven fix orchestrator landed 50+ commits across security,
 - SPDX `Apache-2.0` headers on every Rust source file across the workspace.
 - MSRV bumped to 1.77 and synchronized across `README.md`, `BUILD_GUIDE.md`, `CONTRIBUTING.md`, and `docs/INSTALL.md`.
 - Workspace version raised to `0.3.0`; every inter-crate `path = "../<crate>"` declaration now carries `version = "0.3.0"` so `cargo publish --dry-run` accepts the manifest.
-- Per-crate `README.md` added for crates.io rendering (all 18 workspace members, incl. `fuzz`).
-- `fuzz/` is now a workspace member (still nightly-only; `publish = false`).
-- Workspace crate-count references aligned to 18 workspace members (17 plus `fuzz`) in `README.md`, `ARCHITECTURE.md`, `BUILD_GUIDE.md`.
+- Per-crate `README.md` added for crates.io rendering across the then-current publishable crates and tooling crates.
+- `fuzz/` has its own standalone nightly-only workspace and remains `publish = false`.
+- Workspace crate-count references were aligned in `README.md`, `ARCHITECTURE.md`, and `BUILD_GUIDE.md`; later workspace additions bring the current count to 20.
 - CI parked workflows reactivated with `clippy -D warnings` as a hard gate (`.github/workflows/ci.yml`).
 
 #### Known follow-ups
@@ -206,7 +206,7 @@ A cross-crate review-driven fix orchestrator landed 50+ commits across security,
 - Improved SAFETY documentation on unsafe blocks in heap allocator
 - Added checked allocation methods (`alloc_object_checked`, `alloc_array_checked`)
 - Replaced test `panic!()` calls with proper `assert!` macros in GC and JIT tests
-- Updated test count references across all documentation (6,000+)
+- Updated test documentation references across the public docs.
 
 ### Performance
 - Within 1.41x of JDK 25 C2 on QuickBench overall

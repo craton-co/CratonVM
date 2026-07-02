@@ -63,8 +63,8 @@ Tests that require `javac` skip gracefully when no JDK is on the `PATH`.
 
 ## Linting and formatting
 
-These are the same checks CI gates on (`.github/workflows/ci.yml`, run on
-`ubuntu-latest` and `windows-latest`):
+These are the same checks CI is configured to run
+(`.github/workflows/ci.yml`, on `ubuntu-latest` and `windows-latest`):
 
 ```bash
 cargo fmt --all --check
@@ -72,8 +72,8 @@ cargo clippy --all-targets --workspace -- -D warnings
 ```
 
 > Note: the workspace `[lints]` table in the root `Cargo.toml` `allow`s
-> `dead_code`/`unused_*` and a few rustdoc lints, so "0 clippy warnings" is
-> relative to that configuration, not the full default lint set.
+> `dead_code`/`unused_*` and a few rustdoc lints, so this command measures
+> the repository's configured lint policy, not the full default lint set.
 
 ## Benchmarking
 
@@ -91,8 +91,8 @@ binary-trees workload) and `--nojit` to isolate interpreter-only timings.
 
 ## Workspace layout
 
-The workspace has 19 member crates (including `libcratonvm` and `cratonvm-embed`,
-the C-ABI and Rust embedding crates); the `fuzz` harness is a separate, standalone
+The workspace has 20 member crates (including `libcratonvm`, `cratonvm-embed`,
+and `cratonvm-difftest`); the `fuzz` harness is a separate, standalone
 workspace, not a member. See [ARCHITECTURE.md](ARCHITECTURE.md) for the detailed structure and
 [CONTRIBUTING.md](CONTRIBUTING.md#project-structure) for the per-crate purpose
 table.

@@ -33,9 +33,8 @@ jobs:
       - name: Build
         run: cargo build --workspace
 
-      # CONTRIBUTING.md / README claim CI enforces a "no debug/trace prints"
-      # gate. Honour that claim: forbid reintroduction of bring-up
-      # eprintln!/println! markers ([WP*], [DIAG*], [TRACE*], …) in landed code.
+      # Forbid reintroduction of bring-up eprintln!/println! markers
+      # ([WP*], [DIAG*], [TRACE*], ...) in landed code.
       # Bash-only script, so gate to the Linux leg.
       - name: Forbid debug-trace prints
         if: matrix.os == 'ubuntu-latest'
@@ -43,11 +42,10 @@ jobs:
         run: bash scripts/check-no-diag-prints.sh
 
       - name: Clippy
-        # CONTRIBUTING.md / README claim CI enforces `-D warnings`. Honour
-        # that claim. `[workspace.lints]` in Cargo.toml already silences the
-        # noise lints (dead_code, unused_*, rustdoc broken_intra_doc_links,
-        # clippy empty_loop / while_let_loop) so this gate measures real
-        # clippy findings, not boilerplate.
+        # `[workspace.lints]` in Cargo.toml already silences the noise lints
+        # (dead_code, unused_*, rustdoc broken_intra_doc_links, clippy
+        # empty_loop / while_let_loop), so this check measures the repository's
+        # configured lint policy rather than the full default lint set.
         run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Test
@@ -181,7 +179,7 @@ jobs:
   # honors the exit-code contract (0 ok / 1 new-or-drift / 2 fixed-reopened /
   # 3 bootstrap), with the determinism pre-flight + divergence re-confirmation
   # forced on. It exits 3 (non-fatal) if `java` or the cratonvm binary is
-  # absent. A *new* CratonVM↔HotSpot divergence on a seed fails the build;
+  # absent. A *new* CratonVM/HotSpot divergence on a seed fails this job;
   # tracked `known` divergences (e.g. ExceptionId's message-parity gaps) pass.
   #
   # ADVISORY for now (`continue-on-error`): the committed difftest/ledger.json
@@ -192,7 +190,7 @@ jobs:
   # here (`difftest run --update-ledger`, mark entries `known`) and DROP
   # `continue-on-error` to make the gate blocking.
   difftest-gate:
-    name: Semantic differential gate
+    name: Semantic differential gate (advisory)
     runs-on: ubuntu-latest
     continue-on-error: true
     steps:
@@ -212,7 +210,7 @@ jobs:
       - name: Build difftest + cratonvm
         run: cargo build -p cratonvm-difftest -p cratonvm-cli
 
-      - name: Run the semantic differential gate
+      - name: Run the semantic differential gate (advisory)
         run: cargo run -p cratonvm-difftest --bin difftest -- gate --corpus difftest/seeds
 
   # Future CI hardening — not yet enabled. Uncomment once the

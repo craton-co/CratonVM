@@ -5,7 +5,8 @@ If you want to contribute, this is the place to start.
 
 ## Crate Layout
 
-The workspace has 19 member crates (the `fuzz` harness is a separate, standalone workspace, not a member):
+The workspace has 20 member crates (the `fuzz` harness is a separate,
+standalone workspace, not a member):
 
 ```
 cratonvm/
@@ -28,6 +29,7 @@ cratonvm/
   vm-cli/              cratonvm-cli                 CLI entry point
   libcratonvm/         libcratonvm                  C-ABI shared library for embedding (cdylib/staticlib libjvm substitute)
   cratonvm-embed/      cratonvm-embed               Semver-stable Rust facade for embedding CratonVM
+  difftest/            cratonvm-difftest            HotSpot differential-testing harness
 ```
 
 The `fuzz/` directory is its own standalone workspace (`cratonvm-fuzz`, nightly-only libFuzzer harness) and is *not* a member of this workspace — its `#![no_main]` `fuzz_target!` expansion trips the production lints, so it builds separately via `cargo +nightly fuzz build`.
@@ -66,7 +68,7 @@ independently to inspect `.class` files.
 
 ## vm — Virtual Machine
 
-The VM is the core of the project (~323,000+ LoC across 19 workspace member crates, plus the separate `fuzz` harness workspace). It contains six
+The VM is the core of the project (~323,000+ LoC across 20 workspace member crates, plus the separate `fuzz` harness workspace). It contains six
 major subsystems (several now extracted into their own crates):
 
 ### Runtime (`vm/src/runtime/`)

@@ -37,9 +37,11 @@ This document describes how to cut a new release of CratonVM.
        `[Unreleased]: https://github.com/craton-co/cratonvm/compare/vX.Y.Z...HEAD`.
      - Add `[X.Y.Z]: https://github.com/craton-co/cratonvm/compare/vPREV...vX.Y.Z`.
 
-2. **Wait for CI green** on the PR. `.github/workflows/ci.yml` runs
+2. **Wait for required CI green** on the PR. `.github/workflows/ci.yml` runs
    `cargo fmt --check`, `cargo build`, `cargo clippy`, and `cargo test`
-   across the workspace on Linux and Windows. All checks must pass.
+   across the workspace on Linux and Windows. Required checks must pass.
+   Coverage and semantic difftest jobs are advisory until their
+   `continue-on-error` settings are intentionally removed.
 
 3. **Merge the PR** into `main` (squash or merge — match repo policy).
 
@@ -65,23 +67,34 @@ This document describes how to cut a new release of CratonVM.
 Publish gating is **per-crate**, not workspace-wide. There is no
 `publish = false` at `[workspace.package]`; instead, the immature /
 non-shippable crates each carry their own `publish = false` in their
-`[package]` table, while every other library crate is publishable. As of
-this writing the crates fenced off with `publish = false` are:
+`[package]` table. As of this writing the crates fenced off with
+`publish = false` are:
 
-- `cuda-bridge` — thin CUDA Driver API bridge (GPU offload, opt-in/immature),
-- `jit-cuda` — Java-bytecode → PTX lowering (GPU offload, opt-in/immature),
-- `craton-gpu` — build-time GPU-offload annotation sources,
-- `native-awt` — headless AWT/Swing/Java2D peers (immature),
-- `fuzz` — the libFuzzer harness (a nightly-only internal target, never published).
+- `cratonvm-native-awt` - headless AWT/Swing/Java2D peers (immature).
+- `cratonvm-jit-cuda` - Java-bytecode-to-PTX lowering (GPU offload, opt-in/immature).
+- `cratonvm-gpu` - build-time GPU-offload annotation sources.
+- `cratonvm-cuda-bridge` - thin CUDA Driver API bridge (GPU offload, opt-in/immature).
+- `cratonvm-fuzz` - the standalone libFuzzer harness (nightly-only internal target, never published).
 
-Everything else — `cratonvm-types`, `cratonvm-reader`, `cratonvm-jit-api`,
-`cratonvm-native-api`, `cratonvm-gc`, `cratonvm-classloading`, `cratonvm-jit`,
-`cratonvm-jfr`, `cratonvm-native-collections`, `cratonvm-native-io`,
-`cratonvm-native-builtins`, `cratonvm-vm`, and `cratonvm-cli` — is publishable.
+Everything else is intended to be publishable after its package check and
+dry-run pass: `cratonvm-types`, `cratonvm-reader`, `cratonvm-native-api`,
+`cratonvm-jit-api`, `cratonvm-jit`, `cratonvm-gc`,
+`cratonvm-native-collections`, `cratonvm-native-io`,
+`cratonvm-classloading`, `cratonvm-native-builtins`, `cratonvm-jfr`,
+`cratonvm-vm`, `cratonvm-cli`, `libcratonvm`, `cratonvm-embed`, and
+`cratonvm-difftest`.
+
+Do not start a broad publish wave while default features still pull
+unpublished crates. In particular, `cratonvm-vm` defaults include `awt`,
+which reaches `cratonvm-native-awt`; downstream packages such as
+`cratonvm-cli`, `libcratonvm`, and `cratonvm-embed` inherit that edge through
+`cratonvm-vm`. Split or disable those default-feature edges before publishing
+the dependent crates, and verify with `cargo package` / `cargo publish
+--dry-run`.
 
 To publish:
 
-1. **Confirm the publish gates.** Verify the GPU/AWT crates and `fuzz` above
+1. **Confirm the publish gates.** Verify the GPU/AWT crates and `cratonvm-fuzz` above
    still carry `publish = false`, and that no newly-added immature crate should
    join that list. Set `publish = false` on a crate's own `[package]` table to
    keep it off crates.io.
@@ -90,13 +103,25 @@ To publish:
    builds resolve by path while the published metadata carries the version that
    crates.io requires. Just keep the `version =` literals in lockstep with the
    workspace version when you bump it.
-3. **Publish in dependency order**, leaves first. A typical order is:
-   `cratonvm-types` → `cratonvm-reader` → `cratonvm-jit-api` →
-   `cratonvm-native-api` → `cratonvm-gc` → `cratonvm-classloading` →
-   `cratonvm-jit` → `cratonvm-jfr` → `cratonvm-native-collections` →
-   `cratonvm-native-io` → `cratonvm-native-builtins` → `cratonvm-vm` →
-   `cratonvm-cli`.
-5. **Dry-run each crate first**, then publish:
+3. **Publish in dependency order**, leaves first. Re-check this order against
+   the manifests before a release; a typical order is:
+   `cratonvm-types` ->
+   `cratonvm-reader` ->
+   `cratonvm-native-api` ->
+   `cratonvm-jit-api` ->
+   `cratonvm-jit` ->
+   `cratonvm-gc` ->
+   `cratonvm-native-collections` ->
+   `cratonvm-native-io` ->
+   `cratonvm-classloading` ->
+   `cratonvm-native-builtins` ->
+   `cratonvm-jfr` ->
+   `cratonvm-vm` ->
+   `cratonvm-cli` ->
+   `libcratonvm` ->
+   `cratonvm-embed` ->
+   `cratonvm-difftest`.
+4. **Dry-run each crate first**, then publish:
 
    ```sh
    cargo publish --dry-run -p <crate>

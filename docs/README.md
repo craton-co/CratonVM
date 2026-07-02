@@ -26,7 +26,7 @@ and [`ARCHITECTURE.md`](../ARCHITECTURE.md) for the system design.
 - [internal/embedding.md](internal/embedding.md) — host `cratonvm-vm` inside a Rust application (internal notes).
 - [internal/gc-tuning.md](internal/gc-tuning.md) — tune heap and GC behaviour for a given workload.
 - [PROFILING.md](PROFILING.md) — measure and improve CratonVM performance.
-- [COVERAGE.md](COVERAGE.md) — generate code coverage with `cargo-llvm-cov` (local + CI).
+- [COVERAGE.md](COVERAGE.md) — generate code coverage with `cargo-llvm-cov` (local + advisory CI).
 
 ## Reference and status
 
