@@ -806,14 +806,16 @@ impl EventDispatchThread {
             },
         ) = (&mut dest.data, &src.data)
         {
-            let x1 = (*dx).min(*sx);
-            let y1 = (*dy).min(*sy);
-            let x2 = (*dx + *dw).max(*sx + *sw);
-            let y2 = (*dy + *dh).max(*sy + *sh);
-            *dx = x1;
-            *dy = y1;
-            *dw = x2 - x1;
-            *dh = y2 - y1;
+            let x1 = (*dx as i64).min(*sx as i64);
+            let y1 = (*dy as i64).min(*sy as i64);
+            let x2 = (*dx as i64 + (*dw).max(0) as i64)
+                .max(*sx as i64 + (*sw).max(0) as i64);
+            let y2 = (*dy as i64 + (*dh).max(0) as i64)
+                .max(*sy as i64 + (*sh).max(0) as i64);
+            *dx = x1.clamp(i32::MIN as i64, i32::MAX as i64) as i32;
+            *dy = y1.clamp(i32::MIN as i64, i32::MAX as i64) as i32;
+            *dw = (x2 - x1).clamp(0, i32::MAX as i64) as i32;
+            *dh = (y2 - y1).clamp(0, i32::MAX as i64) as i32;
         }
     }
 
@@ -1220,6 +1222,40 @@ mod tests {
         } = &evt.data
         {
             assert_eq!((*x, *y, *width, *height), (0, 0, 30, 30));
+        } else {
+            panic!("expected Paint");
+        }
+    }
+
+    #[test]
+    fn coalesce_extreme_paint_rects_does_not_overflow() {
+        let edt = make_edt();
+        let peer = PeerId(1);
+        edt.post_event(AwtEvent::paint(
+            event_id::PAINT,
+            peer,
+            0,
+            i32::MAX - 4,
+            i32::MAX - 4,
+            10,
+            10,
+        ));
+        edt.post_event(AwtEvent::paint(
+            event_id::PAINT,
+            peer,
+            1,
+            i32::MAX - 2,
+            i32::MAX - 2,
+            10,
+            10,
+        ));
+
+        edt.coalesce_paint_events();
+        assert_eq!(edt.queue_length(), 1);
+        let evt = edt.poll_event().unwrap();
+        if let AwtEventData::Paint { width, height, .. } = evt.data {
+            assert_eq!(width, 12);
+            assert_eq!(height, 12);
         } else {
             panic!("expected Paint");
         }

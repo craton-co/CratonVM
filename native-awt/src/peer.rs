@@ -116,24 +116,31 @@ impl ComponentPeer {
 
     /// Walk up the parent chain to compute the absolute screen position.
     pub fn absolute_position(&self, registry: &PeerRegistry) -> (i32, i32) {
-        let mut abs_x = self.x;
-        let mut abs_y = self.y;
+        let mut abs_x = self.x as i64;
+        let mut abs_y = self.y as i64;
         let mut current_parent = self.parent_id;
         while let Some(pid) = current_parent {
             if let Some(parent) = registry.get(pid) {
-                abs_x += parent.x;
-                abs_y += parent.y;
+                abs_x += parent.x as i64;
+                abs_y += parent.y as i64;
                 current_parent = parent.parent_id;
             } else {
                 break;
             }
         }
-        (abs_x, abs_y)
+        (
+            abs_x.clamp(i32::MIN as i64, i32::MAX as i64) as i32,
+            abs_y.clamp(i32::MIN as i64, i32::MAX as i64) as i32,
+        )
     }
 
     /// Test whether a point (in the peer's coordinate space) is inside bounds.
     pub fn contains_point(&self, x: i32, y: i32) -> bool {
-        x >= 0 && y >= 0 && x < self.width as i32 && y < self.height as i32
+        self.contains_point_i64(x as i64, y as i64)
+    }
+
+    fn contains_point_i64(&self, x: i64, y: i64) -> bool {
+        x >= 0 && y >= 0 && x < self.width as i64 && y < self.height as i64
     }
 
     /// Returns `true` if this peer represents a top-level window (Frame or Dialog).
@@ -300,7 +307,7 @@ impl PeerRegistry {
         // we follow the first (top-most, via `children.iter().rev()`) visible
         // child that contains the point. The stack therefore holds at most
         // one pending entry, but using a heap Vec keeps depth heap-bounded.
-        let mut stack: Vec<(PeerId, i32, i32)> = vec![(root, x, y)];
+        let mut stack: Vec<(PeerId, i64, i64)> = vec![(root, x as i64, y as i64)];
 
         while let Some((id, px, py)) = stack.pop() {
             let peer = match self.peers.get(&id) {
@@ -309,7 +316,7 @@ impl PeerRegistry {
             };
 
             // Check if point is within this peer's bounds.
-            if !peer.contains_point(px - peer.x, py - peer.y) {
+            if !peer.contains_point_i64(px - peer.x as i64, py - peer.y as i64) {
                 continue;
             }
 
@@ -318,8 +325,8 @@ impl PeerRegistry {
             // contains the point is returned, preserving the recursive
             // semantics: a peer is returned only after all its (top-most-first)
             // children have failed to contain the point.
-            let child_x = px - peer.x;
-            let child_y = py - peer.y;
+            let child_x = px - peer.x as i64;
+            let child_y = py - peer.y as i64;
 
             // The recursive version returns the FIRST top-most child whose
             // subtree contains the point, and never backtracks to a sibling
@@ -332,7 +339,8 @@ impl PeerRegistry {
                     if !child.visible {
                         continue;
                     }
-                    if child.contains_point(child_x - child.x, child_y - child.y) {
+                    if child.contains_point_i64(child_x - child.x as i64, child_y - child.y as i64)
+                    {
                         stack.push((child_id, child_x, child_y));
                         descended = true;
                         break;
@@ -543,6 +551,35 @@ mod tests {
         let (ax, ay) = reg.get(child).unwrap().absolute_position(&reg);
         assert_eq!(ax, 110);
         assert_eq!(ay, 220);
+    }
+
+    #[test]
+    fn absolute_position_saturates_extreme_coordinates() {
+        let mut reg = PeerRegistry::new();
+        let root = reg.create_peer(ComponentType::Frame);
+        let child = reg.create_peer(ComponentType::Panel);
+        reg.add_child(root, child);
+        reg.get_mut(root).unwrap().x = i32::MAX;
+        reg.get_mut(root).unwrap().y = i32::MIN;
+        reg.get_mut(child).unwrap().x = 100;
+        reg.get_mut(child).unwrap().y = -100;
+
+        let (ax, ay) = reg.get(child).unwrap().absolute_position(&reg);
+        assert_eq!(ax, i32::MAX);
+        assert_eq!(ay, i32::MIN);
+    }
+
+    #[test]
+    fn contains_point_handles_large_dimensions() {
+        let mut reg = PeerRegistry::new();
+        let id = reg.create_peer(ComponentType::Panel);
+        {
+            let peer = reg.get_mut(id).unwrap();
+            peer.width = u32::MAX;
+            peer.height = u32::MAX;
+        }
+        let peer = reg.get(id).unwrap();
+        assert!(peer.contains_point(i32::MAX, i32::MAX));
     }
 
     #[test]

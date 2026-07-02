@@ -19,7 +19,7 @@ lints.)
 | `cratonvm-native-builtins` | `native-builtins/` | `java.lang.*` (and crypto, reflection, …) natives |
 | `cratonvm-native-collections` | `native-collections/` | `java.util.*` natives |
 | `cratonvm-native-io` | `native-io/` | `java.io` / `java.nio` natives |
-| `cratonvm-native-awt` | `native-awt/` | AWT/Swing/Java2D native peers (headless) |
+| `cratonvm-native-awt` | `native-awt/` | AWT/Swing/Java2D bridge natives (headless, no OS windows) |
 | `cratonvm-jit-api` | `jit-api/` | JIT compiler API/IR types |
 | `cratonvm-jit` | `jit/` | x86-64 / AArch64 JIT compiler |
 | `cratonvm-jit-cuda` | `jit-cuda/` | Java bytecode → PTX lowering for GPU offload |
