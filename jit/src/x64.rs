@@ -1464,7 +1464,8 @@ pub fn jit_scan(code: &[u8], code_len: usize, descriptor: &str) -> Option<JitSca
                 while pc % 4 != 0 && pc < code_len {
                     pc += 1;
                 }
-                if pc + 12 > code_len {
+                let header_end = pc.checked_add(12)?;
+                if header_end > code_len {
                     return None;
                 }
                 let low =
@@ -1478,7 +1479,12 @@ pub fn jit_scan(code: &[u8], code_len: usize, descriptor: &str) -> Option<JitSca
                     Some(n) => n,
                     None => return None,
                 };
-                pc += 12 + num_offsets * 4;
+                let payload_bytes = num_offsets.checked_mul(4)?;
+                let switch_end = header_end.checked_add(payload_bytes)?;
+                if switch_end > code_len {
+                    return None;
+                }
+                pc = switch_end;
             }
             // lookupswitch — accept in scanner, emit CMP chain in compiler
             0xab => {
@@ -1486,16 +1492,22 @@ pub fn jit_scan(code: &[u8], code_len: usize, descriptor: &str) -> Option<JitSca
                 while pc % 4 != 0 && pc < code_len {
                     pc += 1;
                 }
-                if pc + 8 > code_len {
+                let header_end = pc.checked_add(8)?;
+                if header_end > code_len {
                     return None;
                 }
                 let npairs_raw =
                     i32::from_be_bytes([code[pc + 4], code[pc + 5], code[pc + 6], code[pc + 7]]);
-                if npairs_raw < 0 {
+                let npairs = match checked_lookupswitch_npairs(npairs_raw) {
+                    Some(n) => n,
+                    None => return None,
+                };
+                let payload_bytes = npairs.checked_mul(8)?;
+                let switch_end = header_end.checked_add(payload_bytes)?;
+                if switch_end > code_len {
                     return None;
                 }
-                let npairs = npairs_raw as usize; // Cast: address arithmetic
-                pc += 8 + npairs * 8;
+                pc = switch_end;
             }
             // ldc — load int/float/string constant from CP (1-byte index)
             0x12 => {
@@ -23845,20 +23857,6 @@ impl Compiler {
 // Public compilation entry point
 // ---------------------------------------------------------------------------
 
-/// Compile a JVM bytecode method to x86-64 machine code.
-///
-/// When `needs_heap` is true, the compiled code expects a heap pointer as the hidden
-/// first C argument, and Java parameters follow. This enables JIT-compiled array
-/// allocation and element access via helper call-outs.
-///
-/// Returns `Some(CompiledMethod)` on success, `None` if compilation fails.
-#[allow(clippy::too_many_arguments)]
-/// Legacy entry point: assumes `arg index == JVM slot`, which is correct only
-/// for methods whose parameters are all category-1 (no long/double). Test
-/// call sites use this; the production path (`jit/src/lib.rs::try_compile`)
-/// calls [`compile_with_param_slots`] with the real parameter layout so
-/// long/double parameters land in the slots their body reads.
-#[allow(clippy::too_many_arguments)]
 thread_local! {
     /// Compact reference-field layout: per-pc `(byte_offset, is_ref)` for the
     /// next `compile()` call, set by the interpreter's execute / OSR compile
@@ -23884,6 +23882,20 @@ pub(crate) fn set_pending_verified_max_stack(max_stack: usize) {
     PENDING_VERIFIED_MAX_STACK.with(|c| *c.borrow_mut() = Some(max_stack));
 }
 
+/// Compile a JVM bytecode method to x86-64 machine code.
+///
+/// When `needs_heap` is true, the compiled code expects a heap pointer as the
+/// hidden first C argument, and Java parameters follow. This enables
+/// JIT-compiled array allocation and element access via helper call-outs.
+///
+/// Legacy entry point: assumes `arg index == JVM slot`, which is correct only
+/// for methods whose parameters are all category-1 (no long/double). Test call
+/// sites use this; the production path (`jit/src/lib.rs::try_compile`) calls
+/// [`compile_with_param_slots`] with the real parameter layout so long/double
+/// parameters land in the slots their body reads.
+///
+/// Returns `Some(CompiledMethod)` on success, `None` if compilation fails.
+#[allow(clippy::too_many_arguments)]
 pub fn compile(
     code: &[u8],
     code_len: usize,
@@ -33637,6 +33649,32 @@ mod tests {
             HashMap::new(),
             None, // string_layout
         )
+    }
+
+    #[test]
+    fn test_jit_scan_rejects_tableswitch_payload_past_code_len() {
+        let (code, code_len) = build_tableswitch_bytecode(0, &[10], -1);
+        assert!(jit_scan(&code, code_len, "(I)I").is_some());
+
+        let truncated_len = 4 + 12 + 2; // aligned operands + header + partial entry
+        assert!(truncated_len < code_len);
+        assert!(
+            jit_scan(&code, truncated_len, "(I)I").is_none(),
+            "tableswitch payload extending past code_len must be rejected by scan"
+        );
+    }
+
+    #[test]
+    fn test_jit_scan_rejects_lookupswitch_payload_past_code_len() {
+        let (code, code_len) = build_lookupswitch_bytecode(&[(7, 10)], -1);
+        assert!(jit_scan(&code, code_len, "(I)I").is_some());
+
+        let truncated_len = 4 + 8 + 4; // aligned operands + header + partial pair
+        assert!(truncated_len < code_len);
+        assert!(
+            jit_scan(&code, truncated_len, "(I)I").is_none(),
+            "lookupswitch payload extending past code_len must be rejected by scan"
+        );
     }
 
     #[test]
