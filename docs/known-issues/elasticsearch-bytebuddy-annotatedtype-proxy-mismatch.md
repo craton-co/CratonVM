@@ -6,11 +6,11 @@ Date observed: 2026-07-02
 
 ## Summary
 
-Several Elasticsearch server tests fail under CratonVM when Mockito/Byte Buddy
-tries to create a mock that copies generic type-annotation metadata. HotSpot
-passes the same classes with the same classpath.
+Elasticsearch server tests fail under CratonVM when Mockito/Byte Buddy creates a
+mock and copies generic type-annotation metadata. HotSpot passes the same
+representative classes with the same classpath.
 
-The CratonVM failure is:
+Failure signature:
 
 ```text
 Mockito cannot mock this class: class org.elasticsearch.index.query.SearchExecutionContext.
@@ -19,29 +19,35 @@ object of type net.bytebuddy.description.type.TypeDescription$Generic$Annotation
 is not an instance of java.lang.reflect.AnnotatedType
 ```
 
-The stack reaches `jdk/proxy1/$Proxy21.getAnnotatedOwnerType`, which points at a
-reflection/proxy return-value type mismatch around `AnnotatedType` handling.
+The stack reaches `jdk/proxy1/$Proxy21.getAnnotatedOwnerType`, so the likely
+bug is in CratonVM reflection/proxy return-value handling for `AnnotatedType`.
 
-## Full-suite result
+## Current full-suite result
 
-Full suite `all[1..2701]` on 2026-07-02 with `-TimeoutSec 300` found 110
-CratonVM-only failures with this signature. HotSpot passed the same 110 classes.
+Run `es-current-full-jiton-20260702`, `all[1..2701]`, CratonVM JIT-on,
+`-TimeoutSec 300`:
+
+- 158 CratonVM failures with this signature.
+- 107 are CratonVM-only: HotSpot passed the same classes.
+- 50 overlap HotSpot baseline failures.
+- 1 overlaps a HotSpot baseline crash.
 
 Representative row:
 
 ```text
-index=432
+index=429
 module=server
 class=org.elasticsearch.action.bulk.ShardBatchMapperResolveTests
-CratonVM=FAIL, 17.713s
+CratonVM=FAIL, 18.680s
 HotSpot=PASS, 15.822s
 ```
 
-Other examples include:
+Other CratonVM-only examples:
 
 ```text
 org.elasticsearch.action.fieldcaps.FieldCapabilitiesFilterTests
 org.elasticsearch.cluster.metadata.MetadataDataStreamsServiceTests
+org.elasticsearch.index.mapper.BatchDocumentParserContextTests
 org.elasticsearch.index.mapper.blockloader.BooleanFieldBlockLoaderTests
 ```
 
@@ -50,24 +56,17 @@ org.elasticsearch.index.mapper.blockloader.BooleanFieldBlockLoaderTests
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass `
   -File apps\elasticsearch-suite-runner\run-elasticsearch-suite.ps1 `
-  -Vm craton -Category all -Jit on -Start 432 -Count 1 -Parallel 1 -TimeoutSec 300 `
+  -Vm craton -Category all -Jit on -Start 429 -Count 1 -Parallel 1 -TimeoutSec 300 `
   -RunName es-bytebuddy-annotatedtype-repro-20260702 `
   -ElasticsearchRoot C:\craton\CratonVM\apps\elasticsearch `
-  -WorkDir C:\craton\CratonVM-elasticsearch-full-suite-20260702\apps\elasticsearch-suite-runner\.suite `
-  -Exe C:\craton\CratonVM-elasticsearch-full-suite-20260702\target\release\cratonvm-elasticsearch-full-suite-20260702.exe
+  -WorkDir C:\craton\CratonVM-elasticsearch-current-suite-20260702\apps\elasticsearch-suite-runner\.suite `
+  -Exe C:\craton\CratonVM-elasticsearch-current-suite-20260702\target\release\cratonvm-elasticsearch-current-suite-20260702.exe
 ```
 
 ## Evidence
 
 ```text
-C:\craton\CratonVM-elasticsearch-full-suite-20260702\apps\elasticsearch-suite-runner\.suite\results\es-full-jiton-20260702\all-jit\results.tsv
+C:\craton\CratonVM-elasticsearch-current-suite-20260702\apps\elasticsearch-suite-runner\.suite\results\es-current-full-jiton-20260702\all-jit\results.tsv
 C:\craton\CratonVM-elasticsearch-full-suite-20260702\apps\elasticsearch-suite-runner\.suite\results\es-full-hotspot-20260702\hotspot-jit\results.tsv
-C:\craton\CratonVM-elasticsearch-full-suite-20260702\apps\elasticsearch-suite-runner\.suite\results\es-full-jiton-20260702\all-jit\logs\server.org.elasticsearch.action.bulk.ShardBatchMapperResolveTests.err.log
+C:\craton\CratonVM-elasticsearch-current-suite-20260702\apps\elasticsearch-suite-runner\.suite\results\es-current-full-jiton-20260702\all-jit\logs\server.org.elasticsearch.action.bulk.ShardBatchMapperResolveTests.err.log
 ```
-
-## Notes
-
-Many affected logs first print Elasticsearch native-access `LoaderHelper`
-warnings. HotSpot prints the same native-access warning and continues, so the
-distinct CratonVM blocker for this family is the later Byte Buddy
-`AnnotatedType` type mismatch.
