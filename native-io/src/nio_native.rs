@@ -1065,9 +1065,19 @@ fn obj_or_none(args: &[Value], idx: usize) -> Option<cratonvm_types::ObjectRef> 
     }
 }
 
+fn t16_afc_uses_real_handle(ctx: &dyn NativeContext, obj: ObjectRef) -> bool {
+    ctx.object_num_fields(obj) >= 3 && matches!(ctx.get_field(obj, 0), Value::Int(_))
+}
+
 // ---- AsynchronousFileChannel ----
 
 fn t16_afc_open(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    crate::native_afc_open(ctx, args)
+}
+
+#[cfg(any())]
+#[allow(dead_code)]
+fn t16_afc_open_legacy(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // Optional Path arg at index 0 — extract its underlying string if present.
     let path_str = match args.first() {
         Some(Value::Object(Some(path_obj))) => {
@@ -1095,6 +1105,7 @@ fn t16_afc_open(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult
 
 fn t16_afc_is_open(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     match obj_or_none(args, 0) {
+        Some(o) if t16_afc_uses_real_handle(ctx, o) => crate::native_afc_is_open(ctx, args),
         Some(o) if ctx.object_num_fields(o) >= 2 => Ok(Some(ctx.get_field(o, 1))),
         _ => Ok(Some(Value::Int(1))),
     }
@@ -1102,6 +1113,7 @@ fn t16_afc_is_open(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
 
 fn t16_afc_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     match obj_or_none(args, 0) {
+        Some(o) if t16_afc_uses_real_handle(ctx, o) => crate::native_afc_size(ctx, args),
         Some(o) if ctx.object_num_fields(o) >= 1 => {
             let path = match ctx.get_field(o, 0) {
                 Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
@@ -1132,6 +1144,9 @@ fn t16_afc_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult
 
 fn t16_afc_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     if let Some(o) = obj_or_none(args, 0) {
+        if t16_afc_uses_real_handle(ctx, o) {
+            return crate::native_afc_close(ctx, args);
+        }
         if ctx.object_num_fields(o) >= 2 {
             ctx.set_field(o, 1, Value::Int(0));
         }

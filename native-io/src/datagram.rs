@@ -714,6 +714,11 @@ pub fn register_datagram_real(r: &mut NativeMethodRegistry) {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+pub(crate) fn guarded_send_callback_for_test() -> cratonvm_native_api::NativeCallback {
+    dgram_send0
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::net::Ipv4Addr;
