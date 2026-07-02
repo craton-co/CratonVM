@@ -71,8 +71,12 @@ time:
 
 ```bash
 cargo build --release -p cratonvm-cli
-cargo run --release -p cratonvm-cli -- --classpath bench QuickBench
-java -cp bench QuickBench
+mkdir -p .bench-cache/quickbench
+git show 2cea208:bench/QuickBench.java > .bench-cache/quickbench/QuickBench.java
+git show 2cea208:bench/binarytrees.java > .bench-cache/quickbench/binarytrees.java
+javac -d .bench-cache/quickbench .bench-cache/quickbench/QuickBench.java .bench-cache/quickbench/binarytrees.java
+target/release/cratonvm --classpath .bench-cache/quickbench QuickBench
+java -cp .bench-cache/quickbench QuickBench
 ```
 
 Give larger benchmarks more heap (e.g. `--Xmx 8g` for Binary Trees) and use
