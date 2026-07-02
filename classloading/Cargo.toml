@@ -11,14 +11,9 @@ repository.workspace = true
 homepage.workspace = true
 keywords.workspace = true
 categories.workspace = true
-# Committed compiled Java fixtures (.class files under tests/fixtures/) used
-# by the redefine/security integration tests. Excluded from the published
-# package so `cargo package` does not ship opaque bytecode. Integration-test
-# .rs sources live directly under tests/ and are unaffected.
-exclude = [
-    "tests/fixtures/**",
-    "**/*.class",
-]
+# Committed compiled Java fixtures under tests/fixtures/ are intentionally
+# packaged so the redefine/security integration tests exercise the same bytes
+# from a cargo package copy as they do from the workspace checkout.
 
 [dependencies]
 cratonvm-types = { path = "../types", version = "0.3.0" }
@@ -35,14 +30,6 @@ rustc-hash.workspace = true
 # `(ClassId, &str, &str)` without paying two Arc clones per hit. std's
 # `raw_entry_mut` is still nightly-only.
 hashbrown = "0.14"
-# Round 7 audit fix (MED #12): memory-mapped JAR / .class file reads.
-# Replaces 8 `fs::read` slurp sites in class_path.rs. On Spring-Boot
-# fat-JARs (~80 MB) this avoids a per-load full-into-memory copy that
-# sits in heap-allocated RSS, in favour of a page-cache-backed mmap
-# the kernel can drop under pressure. The `zip` crate accepts `&[u8]`
-# directly, so the mmap deref is a drop-in replacement everywhere the
-# bytes feed straight into `ZipArchive::new(Cursor::new(bytes))`.
-memmap2 = "0.9"
 # Task #1/#40 — real JAR signature + trust-store verification (jar_signer.rs).
 # Both crates are ALREADY in the workspace `Cargo.lock` (pulled in by
 # `native-builtins`): `sha2` 0.10.9 and `p12` 0.6.3. Declaring them here as

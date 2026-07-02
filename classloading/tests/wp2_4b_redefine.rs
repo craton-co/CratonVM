@@ -31,6 +31,15 @@
 use cratonvm_classloading::{ClassLoaderId, ClassManager, DefineClassOptions, RedefineOptions};
 use std::path::PathBuf;
 
+const REDEFINE_FIXTURES: &[&str] = &[
+    "Foo.v1.class",
+    "Foo.v2.class",
+    "Bar.class",
+    "Foo.extra_field.class",
+    "Foo.extra_method.class",
+    "Foo.impl_serializable.class",
+];
+
 fn fixture_path(name: &str) -> PathBuf {
     let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     p.push("tests");
@@ -46,6 +55,18 @@ fn load_fixture(name: &str) -> Option<Vec<u8>> {
 
 fn fresh_manager() -> ClassManager {
     ClassManager::new(&[], &[], &[])
+}
+
+#[test]
+fn packaged_redefine_fixtures_are_present() {
+    for fixture in REDEFINE_FIXTURES {
+        let path = fixture_path(fixture);
+        assert!(
+            path.is_file(),
+            "required redefine fixture must be packaged: {}",
+            path.display()
+        );
+    }
 }
 
 // --------------------------------------------------------------------------

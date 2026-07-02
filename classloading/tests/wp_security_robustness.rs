@@ -33,6 +33,8 @@ use zip::write::SimpleFileOptions;
 use zip::CompressionMethod;
 use zip::ZipWriter;
 
+const REQUIRED_CLASS_FIXTURES: &[&str] = &["Foo.v1.class", "Foo.v2.class"];
+
 // ---------------------------------------------------------------------------
 // Shared helpers
 // ---------------------------------------------------------------------------
@@ -54,8 +56,8 @@ fn manager_with_app_classpath(dir: &Path) -> ClassManager {
 }
 
 /// Returns the bytes of the `Foo.v1.class` fixture (a 232-byte
-/// `class Foo { int foo() { return 1; } }`). Skip the test gracefully
-/// if the fixture is unavailable.
+/// `class Foo { int foo() { return 1; } }`). The package-level fixture
+/// presence test above fails if this committed fixture is missing.
 fn load_foo_v1() -> Option<Vec<u8>> {
     let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     p.push("tests");
@@ -74,6 +76,22 @@ fn load_foo_v2() -> Option<Vec<u8>> {
     p.push("wp2_4b_redefine");
     p.push("Foo.v2.class");
     fs::read(&p).ok()
+}
+
+#[test]
+fn packaged_security_fixtures_are_present() {
+    for fixture in REQUIRED_CLASS_FIXTURES {
+        let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        path.push("tests");
+        path.push("fixtures");
+        path.push("wp2_4b_redefine");
+        path.push(fixture);
+        assert!(
+            path.is_file(),
+            "required security fixture must be packaged: {}",
+            path.display()
+        );
+    }
 }
 
 /// Patch the body of `foo()I` in Foo.v1 bytes from `iconst_1; ireturn`
