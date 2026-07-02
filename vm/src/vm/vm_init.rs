@@ -1555,6 +1555,16 @@ impl SharedVm {
                 // forked test JVM continue past constructor.
                 #[cfg(feature = "experimental-jmx")]
                 cratonvm_native_builtins::jmx::register_jmx_natives(&mut native_methods);
+                // Synthetic-JDK-only: `MBeanServerFactory.createMBeanServer`/
+                // `newMBeanServer` overrides. Safe here because there is no
+                // real `java.management` module to shadow. Must NOT be
+                // called from the real-JDK branch below — see the function
+                // doc for why (it broke `getPlatformMBeanServer()` interface
+                // dispatch when it leaked into real mode).
+                #[cfg(feature = "experimental-jmx")]
+                cratonvm_native_builtins::jmx::register_mbean_server_factory_synthetic(
+                    &mut native_methods,
+                );
                 // RKC16N.11: pre-register the rest of the sun.management.*
                 // native surface so future Keycloak-boot iterations don't
                 // trip on missing-native errors as JMM init walks deeper.

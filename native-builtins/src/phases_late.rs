@@ -33285,6 +33285,100 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         // Handshake already done in createSocket
         Ok(None)
     });
+    // getSupportedCipherSuites/getEnabledCipherSuites/getSupportedProtocols/
+    // getEnabledProtocols — same AbstractMethodError family as TC0622's
+    // SSLSession buffer-size gap: the accessors above cover I/O and
+    // lifecycle, but nothing registered these on `javax/net/ssl/SSLSocket`
+    // itself, so `invokeinterface SSLSocket.getEnabledCipherSuites()`
+    // resolved to the abstract interface declaration (no Code) and threw
+    // `AbstractMethodError`. Mirrors the static suite/protocol lists already
+    // used by `SSLEngineImpl` (t27_tls.rs) for consistency; the socket's
+    // handshake already completed in `createSocket`/`accept`, so
+    // enabled == supported here (matches the JDK default before any
+    // `setEnabledCipherSuites` call — this synthetic socket has no
+    // set-side storage, so `set*` below are accepted but not persisted).
+    fn ssl_sock_supported_cipher_suites(ctx: &mut dyn NativeContext) -> ObjectRef {
+        let suites = [
+            "TLS_AES_128_GCM_SHA256",
+            "TLS_AES_256_GCM_SHA384",
+            "TLS_CHACHA20_POLY1305_SHA256",
+            "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256",
+            "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
+            "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384",
+            "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",
+            "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256",
+            "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256",
+        ];
+        let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), suites.len());
+        for (i, &s) in suites.iter().enumerate() {
+            let so = ctx.create_string(s);
+            ctx.set_array_element(arr, i, Value::Object(Some(so)));
+        }
+        arr
+    }
+    r.register(
+        ssl_sock,
+        "getSupportedCipherSuites",
+        "()[Ljava/lang/String;",
+        |ctx, _args| Ok(Some(Value::Object(Some(ssl_sock_supported_cipher_suites(ctx))))),
+    );
+    r.register(
+        ssl_sock,
+        "getEnabledCipherSuites",
+        "()[Ljava/lang/String;",
+        |ctx, _args| Ok(Some(Value::Object(Some(ssl_sock_supported_cipher_suites(ctx))))),
+    );
+    r.register(
+        ssl_sock,
+        "setEnabledCipherSuites",
+        "([Ljava/lang/String;)V",
+        |_ctx, _args| Ok(None),
+    );
+    r.register(
+        ssl_sock,
+        "getSupportedProtocols",
+        "()[Ljava/lang/String;",
+        |ctx, _args| {
+            let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), 2);
+            let s1 = ctx.create_string("TLSv1.3");
+            let s2 = ctx.create_string("TLSv1.2");
+            ctx.set_array_element(arr, 0, Value::Object(Some(s1)));
+            ctx.set_array_element(arr, 1, Value::Object(Some(s2)));
+            Ok(Some(Value::Object(Some(arr))))
+        },
+    );
+    r.register(
+        ssl_sock,
+        "getEnabledProtocols",
+        "()[Ljava/lang/String;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            // Report the protocol actually negotiated (stored on the
+            // session) alongside TLSv1.2 so callers checking membership
+            // against either standard name succeed.
+            let negotiated = if let Value::Object(Some(session)) =
+                ctx.get_field(this, NEW13_SOCK_SESSION)
+            {
+                match ctx.get_field(session, NEW13_SESS_PROTO) {
+                    Value::Object(Some(s)) => ctx.read_string(s),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            let proto = negotiated.unwrap_or_else(|| "TLSv1.3".to_string());
+            let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), 1);
+            let s = ctx.create_string(&proto);
+            ctx.set_array_element(arr, 0, Value::Object(Some(s)));
+            Ok(Some(Value::Object(Some(arr))))
+        },
+    );
+    r.register(
+        ssl_sock,
+        "setEnabledProtocols",
+        "([Ljava/lang/String;)V",
+        |_ctx, _args| Ok(None),
+    );
     r.register(
         ssl_sock,
         "getInputStream",

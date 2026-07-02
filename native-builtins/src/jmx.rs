@@ -76,6 +76,18 @@ pub fn register_jmx_natives(r: &mut NativeMethodRegistry) {
     // (pure-synthetic mode only) calls `register_mbean_server` explicitly; the
     // real-JDK boot paths deliberately skip it so real `javax.management`
     // bytecode runs end-to-end.
+    //
+    // The SAME reasoning applies to `register_mbean_server_factory_synthetic`
+    // (the `MBeanServerFactory.createMBeanServer`/`newMBeanServer` overrides,
+    // previously inlined into `register_management_factory` above and called
+    // unconditionally by `register_jmx_natives` in BOTH real- and
+    // synthetic-JDK registration branches). That was the actual live bug:
+    // it shadowed `createMBeanServer` before real bytecode could construct
+    // `JmxMBeanServer`, so `getPlatformMBeanServer()` handed out a
+    // synthetic interface-typed server even in real-JDK mode. It is now a
+    // standalone function that callers must invoke explicitly ONLY from the
+    // synthetic-JDK registration path (see `vm_init.rs`) — this function
+    // does NOT call it.
     register_vm_management_impl(r);
     r.set_category(__prev_cat);
 }
@@ -2733,21 +2745,39 @@ pub fn register_mbean_server(r: &mut NativeMethodRegistry) {
         },
     );
 
-    // -- MBeanServerFactory: produce our in-process synthetic server --
-    //
-    // `ManagementFactory.getPlatformMBeanServer()` bytecode calls
-    // `MBeanServerFactory.createMBeanServer()` (real JDK). We intentionally
-    // do NOT register `getPlatformMBeanServer` itself (the KAFKA-MBEAN note
-    // in `register_management_factory` explains why the real-JDK path must
-    // build the concrete `JmxMBeanServer`), but under `experimental-jmx`
-    // there is no real `java.management` module, so the factory call needs a
-    // server. Returning our synthetic `alloc_mbean_server` gives the full
-    // register/get/set/invoke/query flow a concrete receiver.
-    //
-    // `newMBeanServer` only builds a server; `createMBeanServer` additionally
-    // registers it so the (un-overridden, real-bytecode) `findMBeanServer`
-    // reports it — matching the JMX contract where only createMBeanServer
-    // tracks servers in the factory list.
+    r.set_category(__prev_cat);
+}
+
+/// Synthetic-JDK-only `MBeanServerFactory.createMBeanServer`/`newMBeanServer`
+/// overrides, producing our in-process server (built on the *interface*
+/// `javax/management/MBeanServer`).
+///
+/// **Must NOT be called from the real-JDK registration path.** In real-JDK
+/// mode, `ManagementFactory.getPlatformMBeanServer()` bytecode calls
+/// `MBeanServerFactory.createMBeanServer()`, whose real JDK implementation
+/// constructs a concrete `com.sun.jmx.mbeanserver.JmxMBeanServer` — a class
+/// that declares `registerMBean`/`addNotificationListener`/etc. with a Code
+/// attribute, so interface dispatch resolves correctly (the KAFKA-MBEAN note
+/// in `register_management_factory` explains why `getPlatformMBeanServer`
+/// itself is deliberately left unregistered to let that real bytecode run).
+/// If this override is *also* registered in real-JDK mode, it intercepts
+/// `createMBeanServer` before the real bytecode ever constructs
+/// `JmxMBeanServer`, handing back our synthetic interface-typed object
+/// instead — which throws `AbstractMethodError: ... has no Code attribute`
+/// on every un-overridden `MBeanServer` method (e.g.
+/// `addNotificationListener`), exactly the failure the KAFKA-MBEAN fix was
+/// meant to avoid. Under `experimental-jmx` synthetic-JDK mode there is no
+/// real `java.management` module, so the factory call needs a server —
+/// returning our synthetic `alloc_mbean_server` gives the full
+/// register/get/set/invoke/query flow a concrete receiver there.
+///
+/// `newMBeanServer` only builds a server; `createMBeanServer` additionally
+/// registers it so the (un-overridden, real-bytecode) `findMBeanServer`
+/// reports it — matching the JMX contract where only createMBeanServer
+/// tracks servers in the factory list.
+pub fn register_mbean_server_factory_synthetic(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
     let new_server: fn(&mut dyn NativeContext, &[Value]) -> MethodCallResult =
         |ctx, _args| Ok(Some(Value::Object(Some(alloc_mbean_server(ctx)))));
     let create_server: fn(&mut dyn NativeContext, &[Value]) -> MethodCallResult = |ctx, _args| {
@@ -3055,7 +3085,14 @@ mod jmx_tests {
     fn test_mbean_server_flow_methods_registered() {
         // The full in-process JMX flow must expose register / unregister /
         // get / set / invoke / query so a basic round-trip works.
-        let r = registry_with_synthetic_mbean_server();
+        let mut r = registry_with_synthetic_mbean_server();
+        // `MBeanServerFactory.createMBeanServer`/`newMBeanServer` are
+        // synthetic-JDK-only (see `register_mbean_server_factory_synthetic`'s
+        // doc for why they must never be called from the real-JDK
+        // registration path — that was the actual bug this split fixed) and
+        // so aren't part of the shared `registry_with_synthetic_mbean_server`
+        // helper; opt in explicitly here since this test asserts on them.
+        register_mbean_server_factory_synthetic(&mut r);
         let cls = "javax/management/MBeanServer";
         let methods = [
             ("registerMBean", "(Ljava/lang/Object;Ljavax/management/ObjectName;)Ljavax/management/ObjectInstance;"),
