@@ -42,14 +42,14 @@ standard library, so it can run with **no JDK installation, no `JAVA_HOME`, no `
 
 | Benchmark | JDK 25 C2 | CratonVM default | Default ratio | CratonVM OSR, threshold=1 | OSR ratio |
 |-----------|-----------|------------------|---------------|---------------------------|-----------|
-| Arithmetic 300M | 1,067 ms | 89,683 ms | 84.1x | 2,414 ms | 2.26x |
-| Fibonacci(42) | 2,237 ms | 39,040 ms | 17.5x | 45,371 ms | 20.3x |
-| Sieve 100Kx500 | 326 ms | 62,581 ms | 192.0x | 608 ms | 1.87x |
-| Matrix 500x500 | 338 ms | 92,980 ms | 275.1x | 644 ms | 1.91x |
-| **QuickBench TOTAL** | **3,968 ms** | **284,284 ms** | **71.6x** | **49,037 ms** | **12.4x** |
-| Binary Trees (depth=18) | 813 ms | 35,377 ms | 43.5x | 26,713 ms | 32.9x |
+| Arithmetic 300M | 901 ms | 76,789 ms | 85.2x | 82,534 ms | 91.6x |
+| Fibonacci(42) | 1,922 ms | 31,513 ms | 16.4x | 36,158 ms | 18.8x |
+| Sieve 100Kx500 | 290 ms | 42,858 ms | 147.8x | 609 ms | 2.10x |
+| Matrix 500x500 | 309 ms | 50,835 ms | 164.5x | 831 ms | 2.69x |
+| **QuickBench TOTAL** | **3,422 ms** | **201,995 ms** | **59.0x** | **120,132 ms** | **35.1x** |
+| Binary Trees (depth=18) | 725 ms | 24,075 ms | 33.2x | 27,151 ms | 37.4x |
 
-*Single-run snapshot measured 2026-07-02 on Microsoft Windows 11 Home, JDK 25.0.1 LTS, CratonVM `06097539`, release build. The benchmark sources are the historical `bench/QuickBench.java` and `bench/binarytrees.java` from commit `2cea208`; `bench/` is currently untracked. The default column uses the launcher default, where OSR is disabled. The OSR column sets `CRATONVM_JIT_OSR=1 CRATONVM_JIT_THRESHOLD=1`, which recovers the loop-heavy kernels but not recursive Fibonacci.*
+*Single-run snapshot measured 2026-07-02 on Microsoft Windows 11 Home, JDK 25.0.1 LTS, CratonVM code `c2b78b8a`, release build. The benchmark sources are the historical `bench/QuickBench.java` and `bench/binarytrees.java` from commit `2cea208`; `bench/` is currently untracked. The default column uses the launcher default, where OSR is disabled. The OSR column sets `CRATONVM_JIT_OSR=1 CRATONVM_JIT_THRESHOLD=1`; on this snapshot it recovers Sieve and Matrix, while Arithmetic, Fibonacci, and Binary Trees remain current regressions.*
 
 See [docs/JIT_OPTIMIZATION.md](docs/JIT_OPTIMIZATION.md) for the full 26-round JIT optimization journey.
 
