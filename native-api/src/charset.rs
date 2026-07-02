@@ -159,26 +159,49 @@ pub fn decode_bytes(name: &str, bytes: &[u8]) -> Result<Vec<u16>, CodingError> {
 /// Encode a sequence of UTF-16 code units to bytes for the given charset.
 pub fn encode_chars(name: &str, chars: &[u16]) -> Result<Vec<u8>, CodingError> {
     match name {
-        // FIX (review MEDIUM, charset.rs): the strict encode path must REPORT
-        // malformed input (a lone surrogate) rather than silently substituting
-        // U+FFFD. HotSpot's default REPORT action raises a
-        // MalformedInputException for an unpaired surrogate; the lossy callers
-        // (`encode_chars_lossy`) get the substituting variant via `encode_utf8`.
+        // The strict encode path must REPORT malformed UTF-16 input (lone
+        // surrogates) rather than silently substituting U+FFFD. HotSpot's
+        // default REPORT action raises MalformedInputException for an unpaired
+        // surrogate; lossy callers get the substituting paths below.
         "UTF-8" => encode_utf8_strict(chars),
-        "US-ASCII" => encode_ascii(chars),
-        "ISO-8859-1" => encode_latin1(chars),
-        "UTF-16" => Ok(encode_utf16_with_bom(chars)),
-        "UTF-16BE" => Ok(encode_utf16_fixed(chars, true)),
-        "UTF-16LE" => Ok(encode_utf16_fixed(chars, false)),
-        "UTF-32" => Ok(encode_utf32_with_bom(chars)),
-        "UTF-32BE" => Ok(encode_utf32_fixed(chars, true)),
-        "UTF-32LE" => Ok(encode_utf32_fixed(chars, false)),
-        "windows-1252" => encode_cp1252(chars),
-        "windows-1251" => encode_cp1251(chars),
-        "KOI8-R" => encode_koi8r(chars),
-        "ISO-8859-2" => encode_iso_8859_2(chars),
-        "ISO-8859-15" => encode_iso_8859_15(chars),
-        "IBM850" => encode_ibm850(chars),
+        "US-ASCII" => {
+            validate_utf16_units(chars, "US-ASCII")?;
+            encode_ascii(chars)
+        }
+        "ISO-8859-1" => {
+            validate_utf16_units(chars, "ISO-8859-1")?;
+            encode_latin1(chars)
+        }
+        "UTF-16" => encode_utf16_with_bom_strict(chars),
+        "UTF-16BE" => encode_utf16_fixed_strict(chars, true, "UTF-16BE"),
+        "UTF-16LE" => encode_utf16_fixed_strict(chars, false, "UTF-16LE"),
+        "UTF-32" => encode_utf32_with_bom_strict(chars),
+        "UTF-32BE" => encode_utf32_fixed_strict(chars, true, "UTF-32BE"),
+        "UTF-32LE" => encode_utf32_fixed_strict(chars, false, "UTF-32LE"),
+        "windows-1252" => {
+            validate_utf16_units(chars, "windows-1252")?;
+            encode_cp1252(chars)
+        }
+        "windows-1251" => {
+            validate_utf16_units(chars, "windows-1251")?;
+            encode_cp1251(chars)
+        }
+        "KOI8-R" => {
+            validate_utf16_units(chars, "KOI8-R")?;
+            encode_koi8r(chars)
+        }
+        "ISO-8859-2" => {
+            validate_utf16_units(chars, "ISO-8859-2")?;
+            encode_iso_8859_2(chars)
+        }
+        "ISO-8859-15" => {
+            validate_utf16_units(chars, "ISO-8859-15")?;
+            encode_iso_8859_15(chars)
+        }
+        "IBM850" => {
+            validate_utf16_units(chars, "IBM850")?;
+            encode_ibm850(chars)
+        }
         other => {
             // Legacy / CJK multi-byte charsets via encoding_rs. `encode`
             // substitutes unmappable code points with an HTML numeric character
@@ -186,7 +209,8 @@ pub fn encode_chars(name: &str, chars: &[u16]) -> Result<Vec<u8>, CodingError> {
             // requires an error instead, so surface Unmappable when that fires
             // and only return the byte string when every unit mapped cleanly.
             if let Some(enc) = multibyte_encoding(other) {
-                let s = String::from_utf16_lossy(chars);
+                validate_utf16_units(chars, canonical_name_static(name))?;
+                let s = String::from_utf16(chars).expect("surrogate pairing pre-validated");
                 let (encoded, _, had_errors) = enc.encode(&s);
                 if had_errors {
                     Err(CodingError {
@@ -259,14 +283,16 @@ pub fn encode_chars_lossy(name: &str, chars: &[u16]) -> Vec<u8> {
         // catch-all) was wrong: a `windows-1252` sink would receive UTF-8
         // multibyte sequences for any supplementary character.
         Err(_) => match name {
-            // UTF-8 / UTF-16 / UTF-32 can represent every code point, so a
-            // strict failure means malformed surrogate units; `encode_utf8`
-            // (and the UTF-16/32 encoders, reached via the Ok path) already
-            // substitute U+FFFD, so this branch is effectively unreachable for
-            // them, but keep UTF-8 as the safe representable fallback.
-            "UTF-8" | "UTF-16" | "UTF-16BE" | "UTF-16LE" | "UTF-32" | "UTF-32BE" | "UTF-32LE" => {
-                encode_utf8(chars)
-            }
+            // Unicode charsets can represent every scalar value, so strict
+            // failures here mean malformed surrogate units. Keep the bytes in
+            // the requested charset while substituting U+FFFD for bad units.
+            "UTF-8" => encode_utf8(chars),
+            "UTF-16" => encode_utf16_with_bom_lossy(chars),
+            "UTF-16BE" => encode_utf16_fixed_lossy(chars, true),
+            "UTF-16LE" => encode_utf16_fixed_lossy(chars, false),
+            "UTF-32" => encode_utf32_with_bom_lossy(chars),
+            "UTF-32BE" => encode_utf32_fixed(chars, true),
+            "UTF-32LE" => encode_utf32_fixed(chars, false),
             "US-ASCII" => chars
                 .iter()
                 .map(|&c| if c < 0x80 { c as u8 } else { REPLACEMENT_BYTE })
@@ -375,6 +401,46 @@ fn decode_utf8(bytes: &[u8]) -> Result<Vec<u16>, CodingError> {
 
 fn decode_utf8_lossy(bytes: &[u8]) -> Vec<u16> {
     String::from_utf8_lossy(bytes).encode_utf16().collect()
+}
+
+fn validate_utf16_units(chars: &[u16], charset: &'static str) -> Result<(), CodingError> {
+    let mut i = 0usize;
+    while i < chars.len() {
+        let c = chars[i];
+        if (0xD800..=0xDBFF).contains(&c) {
+            match chars.get(i + 1).copied() {
+                Some(lo) if (0xDC00..=0xDFFF).contains(&lo) => {
+                    i += 2;
+                }
+                None => {
+                    return Err(CodingError {
+                        offset: i,
+                        length: 1,
+                        kind: CodingErrorKind::Incomplete,
+                        charset,
+                    });
+                }
+                _ => {
+                    return Err(CodingError {
+                        offset: i,
+                        length: 1,
+                        kind: CodingErrorKind::Malformed,
+                        charset,
+                    });
+                }
+            }
+        } else if (0xDC00..=0xDFFF).contains(&c) {
+            return Err(CodingError {
+                offset: i,
+                length: 1,
+                kind: CodingErrorKind::Malformed,
+                charset,
+            });
+        } else {
+            i += 1;
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -640,61 +706,7 @@ fn encode_utf8(chars: &[u16]) -> Vec<u8> {
 /// surrogate (U+D800..=U+DBFF) must be immediately followed by a low surrogate
 /// (U+DC00..=U+DFFF); any other arrangement is malformed.
 fn encode_utf8_strict(chars: &[u16]) -> Result<Vec<u8>, CodingError> {
-    // Pre-validate the UTF-16 unit sequence so we can report the exact offset
-    // of a malformed surrogate. `String::from_utf16` (not `_lossy`) would also
-    // reject lone surrogates, but only with a unit-less error; we want the
-    // offset/length, so scan explicitly. The scan is O(n) and on the happy
-    // path adds only a cheap range check per unit.
-    let mut i = 0usize;
-    while i < chars.len() {
-        let c = chars[i];
-        if (0xD800..=0xDBFF).contains(&c) {
-            // High surrogate: the next unit MUST be a low surrogate.
-            let lo = chars.get(i + 1).copied();
-            match lo {
-                Some(l) if (0xDC00..=0xDFFF).contains(&l) => {
-                    i += 2; // valid surrogate pair
-                }
-                None => {
-                    // Trailing high surrogate with no following unit. This is
-                    // INCOMPLETE rather than malformed: a streaming encoder that
-                    // has not yet reached end-of-input may receive the matching
-                    // low surrogate in the next chunk, so it should buffer this
-                    // unit and report UNDERFLOW. Only at end-of-input does an
-                    // unpaired trailing surrogate become genuinely malformed.
-                    // Symmetric to the decoder's `Incomplete` truncated-trailing
-                    // sequence handling.
-                    return Err(CodingError {
-                        offset: i,
-                        length: 1,
-                        kind: CodingErrorKind::Incomplete,
-                        charset: "UTF-8",
-                    });
-                }
-                _ => {
-                    // High surrogate followed by a non-low-surrogate unit: this
-                    // can never complete, so it is malformed regardless of how
-                    // much more input arrives.
-                    return Err(CodingError {
-                        offset: i,
-                        length: 1,
-                        kind: CodingErrorKind::Malformed,
-                        charset: "UTF-8",
-                    });
-                }
-            }
-        } else if (0xDC00..=0xDFFF).contains(&c) {
-            // Lone low surrogate with no preceding high surrogate.
-            return Err(CodingError {
-                offset: i,
-                length: 1,
-                kind: CodingErrorKind::Malformed,
-                charset: "UTF-8",
-            });
-        } else {
-            i += 1;
-        }
-    }
+    validate_utf16_units(chars, "UTF-8")?;
     // All surrogates are well-paired BMP/supplementary code points: a lossless
     // `from_utf16` conversion is now guaranteed to succeed.
     Ok(String::from_utf16(chars)
@@ -830,7 +842,7 @@ fn decode_utf16_fixed(bytes: &[u8], big_endian: bool) -> Result<Vec<u16>, Coding
 
 fn decode_utf16_fixed_lossy(bytes: &[u8], big_endian: bool) -> Vec<u16> {
     let n = bytes.len() & !1;
-    let mut out = Vec::with_capacity(n / 2);
+    let mut out = Vec::with_capacity(n / 2 + if bytes.len() != n { 1 } else { 0 });
     let mut i = 0;
     while i + 1 < n {
         let u = if big_endian {
@@ -862,7 +874,19 @@ fn decode_utf16_fixed_lossy(bytes: &[u8], big_endian: bool) -> Vec<u16> {
             i += 2;
         }
     }
+    if bytes.len() != n {
+        out.push(REPLACEMENT_CHAR);
+    }
     out
+}
+
+fn encode_utf16_fixed_strict(
+    chars: &[u16],
+    big_endian: bool,
+    charset: &'static str,
+) -> Result<Vec<u8>, CodingError> {
+    validate_utf16_units(chars, charset)?;
+    Ok(encode_utf16_fixed(chars, big_endian))
 }
 
 fn encode_utf16_fixed(chars: &[u16], big_endian: bool) -> Vec<u8> {
@@ -878,6 +902,16 @@ fn encode_utf16_fixed(chars: &[u16], big_endian: bool) -> Vec<u8> {
     out
 }
 
+fn encode_utf16_fixed_lossy(chars: &[u16], big_endian: bool) -> Vec<u8> {
+    let lossy: Vec<u16> = String::from_utf16_lossy(chars).encode_utf16().collect();
+    encode_utf16_fixed(&lossy, big_endian)
+}
+
+fn encode_utf16_with_bom_strict(chars: &[u16]) -> Result<Vec<u8>, CodingError> {
+    validate_utf16_units(chars, "UTF-16")?;
+    Ok(encode_utf16_with_bom(chars))
+}
+
 fn encode_utf16_with_bom(chars: &[u16]) -> Vec<u8> {
     // HotSpot writes a BE BOM for UTF-16 output.
     let mut out = Vec::with_capacity(2 + chars.len() * 2);
@@ -885,6 +919,11 @@ fn encode_utf16_with_bom(chars: &[u16]) -> Vec<u8> {
     out.push(0xFF);
     out.extend_from_slice(&encode_utf16_fixed(chars, true));
     out
+}
+
+fn encode_utf16_with_bom_lossy(chars: &[u16]) -> Vec<u8> {
+    let lossy: Vec<u16> = String::from_utf16_lossy(chars).encode_utf16().collect();
+    encode_utf16_with_bom(&lossy)
 }
 
 // ---------------------------------------------------------------------------
@@ -944,7 +983,7 @@ fn decode_utf32_fixed(bytes: &[u8], big_endian: bool) -> Result<Vec<u16>, Coding
 
 fn decode_utf32_fixed_lossy(bytes: &[u8], big_endian: bool) -> Vec<u16> {
     let n = bytes.len() & !3;
-    let mut out = Vec::with_capacity(n / 2);
+    let mut out = Vec::with_capacity(n / 2 + if bytes.len() != n { 1 } else { 0 });
     for chunk in bytes[..n].chunks_exact(4) {
         let cp = if big_endian {
             u32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]])
@@ -957,7 +996,19 @@ fn decode_utf32_fixed_lossy(bytes: &[u8], big_endian: bool) -> Vec<u16> {
             push_code_point(&mut out, cp);
         }
     }
+    if bytes.len() != n {
+        out.push(REPLACEMENT_CHAR);
+    }
     out
+}
+
+fn encode_utf32_fixed_strict(
+    chars: &[u16],
+    big_endian: bool,
+    charset: &'static str,
+) -> Result<Vec<u8>, CodingError> {
+    validate_utf16_units(chars, charset)?;
+    Ok(encode_utf32_fixed(chars, big_endian))
 }
 
 fn encode_utf32_fixed(chars: &[u16], big_endian: bool) -> Vec<u8> {
@@ -993,7 +1044,19 @@ fn encode_utf32_fixed(chars: &[u16], big_endian: bool) -> Vec<u8> {
     out
 }
 
+fn encode_utf32_with_bom_strict(chars: &[u16]) -> Result<Vec<u8>, CodingError> {
+    validate_utf16_units(chars, "UTF-32")?;
+    Ok(encode_utf32_with_bom(chars))
+}
+
 fn encode_utf32_with_bom(chars: &[u16]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(4 + chars.len() * 4);
+    out.extend_from_slice(&[0x00, 0x00, 0xFE, 0xFF]);
+    out.extend_from_slice(&encode_utf32_fixed(chars, true));
+    out
+}
+
+fn encode_utf32_with_bom_lossy(chars: &[u16]) -> Vec<u8> {
     let mut out = Vec::with_capacity(4 + chars.len() * 4);
     out.extend_from_slice(&[0x00, 0x00, 0xFE, 0xFF]);
     out.extend_from_slice(&encode_utf32_fixed(chars, true));
@@ -1472,6 +1535,34 @@ mod tests {
     }
 
     #[test]
+    fn utf16_strict_encode_reports_lone_surrogate() {
+        let err = encode_chars("UTF-16BE", &[0xDE00, 0x0041]).unwrap_err();
+        assert_eq!(err.kind, CodingErrorKind::Malformed);
+        assert_eq!(err.charset, "UTF-16BE");
+        assert_eq!(err.offset, 0);
+
+        let err = encode_chars("UTF-16", &[0x0041, 0xD800]).unwrap_err();
+        assert_eq!(err.kind, CodingErrorKind::Incomplete);
+        assert_eq!(err.charset, "UTF-16");
+        assert_eq!(err.offset, 1);
+    }
+
+    #[test]
+    fn utf16_lossy_encode_stays_utf16_and_replaces_surrogate() {
+        let bytes = encode_chars_lossy("UTF-16BE", &[0xDE00, 0x0041]);
+        assert_eq!(bytes, &[0xFF, 0xFD, 0x00, 0x41]);
+
+        let bytes = encode_chars_lossy("UTF-16", &[0xDE00]);
+        assert_eq!(bytes, &[0xFE, 0xFF, 0xFF, 0xFD]);
+    }
+
+    #[test]
+    fn utf16_lossy_decode_replaces_trailing_byte() {
+        let decoded = decode_bytes_lossy("UTF-16BE", &[0x00, 0x41, 0x00]);
+        assert_eq!(decoded, vec![0x0041, REPLACEMENT_CHAR]);
+    }
+
+    #[test]
     fn unsupported_charset_errors() {
         let err = decode_bytes("XYZ", b"").unwrap_err();
         assert_eq!(err.kind, CodingErrorKind::UnsupportedCharset);
@@ -1502,6 +1593,34 @@ mod tests {
         assert_eq!(&b[0..4], &[0x00, 0x00, 0x00, 0x41]);
         let d = decode_bytes("UTF-32BE", &b).unwrap();
         assert_eq!(d, chars);
+    }
+
+    #[test]
+    fn utf32_strict_encode_reports_lone_surrogate() {
+        let err = encode_chars("UTF-32BE", &[0xDE00, 0x0041]).unwrap_err();
+        assert_eq!(err.kind, CodingErrorKind::Malformed);
+        assert_eq!(err.charset, "UTF-32BE");
+        assert_eq!(err.offset, 0);
+    }
+
+    #[test]
+    fn utf32_lossy_encode_stays_utf32_and_replaces_surrogate() {
+        let bytes = encode_chars_lossy("UTF-32LE", &[0xDE00, 0x0041]);
+        assert_eq!(bytes, &[0xFD, 0xFF, 0x00, 0x00, 0x41, 0x00, 0x00, 0x00]);
+    }
+
+    #[test]
+    fn utf32_lossy_decode_replaces_trailing_bytes() {
+        let decoded = decode_bytes_lossy("UTF-32BE", &[0x00, 0x00, 0x00, 0x41, 0x00, 0x00]);
+        assert_eq!(decoded, vec![0x0041, REPLACEMENT_CHAR]);
+    }
+
+    #[test]
+    fn multibyte_strict_encode_reports_malformed_utf16() {
+        let err = encode_chars("Shift_JIS", &[0xD800, 0x0041]).unwrap_err();
+        assert_eq!(err.kind, CodingErrorKind::Malformed);
+        assert_eq!(err.charset, "Shift_JIS");
+        assert_eq!(err.offset, 0);
     }
 
     #[test]
@@ -1593,7 +1712,11 @@ mod tests {
                 "A\u{FFFD}\u{FFFD}\u{FFFD}\u{FFFD}A",
             ),
             (&[0x41, 0xC0, 0xC1, 0x41], 1, "A\u{FFFD}\u{FFFD}A"),
-            (&[0x41, 0xE0, 0x80, 0xC1, 0x41], 2, "A\u{FFFD}\u{FFFD}\u{FFFD}A"),
+            (
+                &[0x41, 0xE0, 0x80, 0xC1, 0x41],
+                2,
+                "A\u{FFFD}\u{FFFD}\u{FFFD}A",
+            ),
             (
                 &[0x41, 0xF0, 0x80, 0x80, 0xC1, 0x41],
                 2,
@@ -1624,9 +1747,21 @@ mod tests {
             (&[0x61, 0xA0, 0x80, 0x61], 1, "a\u{FFFD}\u{FFFD}a"),
             (&[0x61, 0xC2, 0x00, 0x61], 2, "a\u{FFFD}\u{0000}a"),
             (&[0x61, 0xC2, 0xC0, 0x61], 2, "a\u{FFFD}\u{FFFD}a"),
-            (&[0x61, 0xE0, 0x80, 0x80, 0x61], 2, "a\u{FFFD}\u{FFFD}\u{FFFD}a"),
-            (&[0x61, 0xE0, 0x81, 0xBF, 0x61], 2, "a\u{FFFD}\u{FFFD}\u{FFFD}a"),
-            (&[0x61, 0xE0, 0x9F, 0xBF, 0x61], 2, "a\u{FFFD}\u{FFFD}\u{FFFD}a"),
+            (
+                &[0x61, 0xE0, 0x80, 0x80, 0x61],
+                2,
+                "a\u{FFFD}\u{FFFD}\u{FFFD}a",
+            ),
+            (
+                &[0x61, 0xE0, 0x81, 0xBF, 0x61],
+                2,
+                "a\u{FFFD}\u{FFFD}\u{FFFD}a",
+            ),
+            (
+                &[0x61, 0xE0, 0x9F, 0xBF, 0x61],
+                2,
+                "a\u{FFFD}\u{FFFD}\u{FFFD}a",
+            ),
             (
                 &[0x61, 0xFF, 0xFF, 0xFF, 0x61],
                 1,

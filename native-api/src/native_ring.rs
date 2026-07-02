@@ -30,6 +30,10 @@ use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const RING_SIZE: usize = 64;
+const TOKEN_SLOT_BITS: usize = 6;
+const TOKEN_SLOT_MASK: usize = RING_SIZE - 1;
+const TOKEN_GENERATION_MASK: usize = usize::MAX >> TOKEN_SLOT_BITS;
+const DISABLED_TOKEN: usize = usize::MAX;
 
 /// Master switch. When `false` (the default), `record_enter` and
 /// `record_exit` early-return after a single relaxed load. The watchdog
@@ -63,6 +67,7 @@ struct Entry {
     thread_id: u64,
     enter_ms: u128,
     exit_ms: u128,
+    generation: usize,
 }
 
 const EMPTY: Entry = Entry {
@@ -70,16 +75,19 @@ const EMPTY: Entry = Entry {
     thread_id: 0,
     enter_ms: 0,
     exit_ms: 0,
+    generation: 0,
 };
 
 struct Ring {
     entries: [Entry; RING_SIZE],
     next: usize,
+    next_generation: usize,
 }
 
 static RING: Mutex<Ring> = Mutex::new(Ring {
     entries: [EMPTY; RING_SIZE],
     next: 0,
+    next_generation: 0,
 });
 
 fn name_map() -> &'static Mutex<FxHashMap<usize, String>> {
@@ -171,7 +179,19 @@ fn now_ms() -> u128 {
         .unwrap_or(0)
 }
 
-/// Record a native-method entry. Returns a slot index for `record_exit`.
+fn make_token(slot: usize, generation: usize) -> usize {
+    ((generation & TOKEN_GENERATION_MASK) << TOKEN_SLOT_BITS) | (slot & TOKEN_SLOT_MASK)
+}
+
+fn token_slot(token: usize) -> usize {
+    token & TOKEN_SLOT_MASK
+}
+
+fn token_generation(token: usize) -> usize {
+    (token >> TOKEN_SLOT_BITS) & TOKEN_GENERATION_MASK
+}
+
+/// Record a native-method entry. Returns a token for `record_exit`.
 ///
 /// When recording is disabled (the default), this is a single relaxed
 /// atomic load + branch. Returns `usize::MAX` as a sentinel so
@@ -190,18 +210,26 @@ pub fn record_enter(cb_ptr: usize) -> usize {
     let tid = thread_id_u64();
     let mut ring = RING.lock();
     let idx = ring.next;
+    let mut generation = ring.next_generation & TOKEN_GENERATION_MASK;
+    let mut token = make_token(idx, generation);
+    if token == DISABLED_TOKEN {
+        generation = generation.wrapping_add(1) & TOKEN_GENERATION_MASK;
+        token = make_token(idx, generation);
+    }
     ring.entries[idx] = Entry {
         cb_ptr,
         thread_id: tid,
         enter_ms: now_ms(),
         exit_ms: 0,
+        generation,
     };
     ring.next = (ring.next + 1) % RING_SIZE;
-    idx
+    ring.next_generation = generation.wrapping_add(1) & TOKEN_GENERATION_MASK;
+    token
 }
 
 #[inline]
-pub fn record_exit(idx: usize) {
+pub fn record_exit(token: usize) {
     // Pop the per-thread current-native stack (see `record_enter`). Done
     // FIRST and independently of the ring's `ENABLED`/sentinel gate so the
     // stack stays balanced even if `enable`/`track` toggled mid-call.
@@ -216,13 +244,17 @@ pub fn record_exit(idx: usize) {
     // Sentinel returned by `record_enter` when disabled at entry time.
     // (Recording could have been toggled on between enter and exit; in
     // that case we skip this exit rather than write to a bogus slot.)
-    if idx == usize::MAX {
+    if token == DISABLED_TOKEN {
         return;
     }
     let now = now_ms();
     let mut ring = RING.lock();
+    let idx = token_slot(token);
+    let generation = token_generation(token);
     if let Some(slot) = ring.entries.get_mut(idx) {
-        slot.exit_ms = now;
+        if slot.generation == generation {
+            slot.exit_ms = now;
+        }
     }
 }
 
@@ -336,11 +368,35 @@ fn thread_id_u64() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::OnceLock;
 
     // Distinct high sentinel pointers, unlikely to collide with real
     // registrations in the shared process-global maps.
     const PTR_EAGER: usize = 0xDEAD_0001;
     const PTR_LAZY: usize = 0xDEAD_0002;
+    const PTR_WRAP: usize = 0xDEAD_0003;
+
+    fn ring_test_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn reset_ring_for_test() {
+        let mut ring = RING.lock();
+        ring.entries = [EMPTY; RING_SIZE];
+        ring.next = 0;
+        ring.next_generation = 0;
+        let _ = NATIVE_STACK.try_with(|s| s.borrow_mut().clear());
+    }
+
+    struct RingResetGuard;
+
+    impl Drop for RingResetGuard {
+        fn drop(&mut self) {
+            enable(false);
+            reset_ring_for_test();
+        }
+    }
 
     #[test]
     fn eager_register_resolves() {
@@ -372,5 +428,38 @@ mod tests {
     #[test]
     fn unknown_ptr_is_none() {
         assert_eq!(name_of(0x0BAD_BEEF_usize), None);
+    }
+
+    #[test]
+    fn record_exit_ignores_stale_token_after_wraparound() {
+        let _guard = ring_test_lock().lock();
+        let _reset = RingResetGuard;
+        enable(true);
+        reset_ring_for_test();
+
+        let stale = record_enter(PTR_WRAP);
+        let stale_slot = token_slot(stale);
+        let stale_generation = token_generation(stale);
+        for i in 0..RING_SIZE {
+            let _ = record_enter(0xBEEF_0000usize + i);
+        }
+
+        {
+            let ring = RING.lock();
+            let reused = ring.entries[stale_slot];
+            assert_ne!(reused.cb_ptr, PTR_WRAP);
+            assert_ne!(reused.generation, stale_generation);
+            assert_eq!(reused.exit_ms, 0);
+        }
+
+        record_exit(stale);
+
+        {
+            let ring = RING.lock();
+            let reused = ring.entries[stale_slot];
+            assert_ne!(reused.cb_ptr, PTR_WRAP);
+            assert_ne!(reused.generation, stale_generation);
+            assert_eq!(reused.exit_ms, 0);
+        }
     }
 }
