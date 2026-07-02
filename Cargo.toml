@@ -8,9 +8,9 @@ resolver = "2"
 
 [workspace.package]
 # Note: members do NOT inherit a publish gate from here (none set
-# `publish.workspace = true`), so every library crate is publishable to
-# crates.io. The only crate withheld from publication is `fuzz`, which sets
-# its own `publish = false`. (A bare `publish = false` here would be inert.)
+# `publish.workspace = true`). Crates are publishable by default unless their
+# own `[package]` table sets `publish = false`; see docs/RELEASE_READINESS.md
+# for the current crates.io dry-run checklist and fenced-off package list.
 authors = ["Craton Software Company"]
 version = "0.3.0"
 edition = "2021"

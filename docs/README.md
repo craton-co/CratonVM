@@ -33,6 +33,7 @@ and [`ARCHITECTURE.md`](../ARCHITECTURE.md) for the system design.
 - [JDK_COVERAGE.md](JDK_COVERAGE.md) — JDK class/method coverage, auto-generated from the native crates.
 - [internal/jck-compliance.md](internal/jck-compliance.md) — internal JCK compliance estimate matrix.
 - [legal.md](legal.md) — JCK licensing and legal requirements.
+- [RELEASE_READINESS.md](RELEASE_READINESS.md) - public release, crates.io dry-run, Apache-2.0 notice, and repository readiness checklist.
 - [SECURITY_HARDENING.md](SECURITY_HARDENING.md) — sandboxing, egress/SSRF policy, and crypto-hardening reference (companion to [`SECURITY.md`](../SECURITY.md)).
 - [CRYPTO_STATUS.md](CRYPTO_STATUS.md) — per-algorithm cryptographic implementation status (companion to [`SECURITY.md`](../SECURITY.md)).
 - [internal/javafx-status.md](internal/javafx-status.md) — JavaFX as an out-of-tree, non-core module.
