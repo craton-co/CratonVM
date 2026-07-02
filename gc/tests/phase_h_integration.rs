@@ -31,7 +31,8 @@ impl MonitorCleanup for NoMonitors {
 /// no other mutator exists, so the STW invariant is trivially satisfied.
 #[inline]
 fn stw() -> StopTheWorldToken {
-    StopTheWorldToken::new()
+    // SAFETY: these integration tests run the heap single-threaded.
+    unsafe { StopTheWorldToken::new() }
 }
 
 // ---------------------------------------------------------------------------

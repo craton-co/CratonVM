@@ -99,19 +99,14 @@ pub trait MonitorCleanup {
 // (after `gc_barrier.wait_for_all`) and threads it down to the heap.
 //
 // The token is intentionally `!Clone` and zero-sized; passing it by
-// reference is the canonical pattern. Construction is `pub fn new` (rather
-// than `unsafe fn`) but the doc-comment makes the caller responsibility
-// explicit: building a token without an STW pause is a soundness bug.
-//
-// Migration aid: `new_unchecked` exists for callsites that are known to be
-// orchestrated correctly today but have not yet been wired through the
-// token. Every use must be tagged `// FIXME(orchestrator)` for follow-up.
+// reference is the canonical pattern. Construction is unsafe because the GC
+// crate cannot observe the VM's safepoint barrier directly: callers must mark
+// the point where they have proved every mutator is stopped.
 /// Type-level proof that the caller has stopped every mutator thread at a
 /// safepoint and is therefore allowed to invoke a *moving* GC entry point.
 ///
-/// `StopTheWorldToken` is zero-sized and has no public fields; the only way
-/// to obtain one is [`StopTheWorldToken::new`] or
-/// [`StopTheWorldToken::new_unchecked`] (migration-only — see below).
+/// `StopTheWorldToken` is zero-sized and has no public fields; constructing
+/// one requires `unsafe` so safe public code cannot fabricate STW proof.
 ///
 /// The token is `!Clone` and `!Copy`: orchestrator code holds a single
 /// token for the duration of one STW round and passes it by reference to
@@ -134,11 +129,11 @@ pub struct StopTheWorldToken {
 }
 
 impl StopTheWorldToken {
-    /// Construct a new token.
+    /// Construct a new token after proving a real stop-the-world pause.
     ///
-    /// # Caller invariant (STW)
+    /// # Safety
     ///
-    /// You MUST have already parked every other mutator thread at a
+    /// The caller MUST have already parked every other mutator thread at a
     /// safepoint before calling this. The canonical orchestrator is
     /// `vm::runtime::interpreter`, which builds a token only after
     /// `gc_barrier.wait_for_all()` returns (every other thread is parked)
@@ -146,29 +141,24 @@ impl StopTheWorldToken {
     ///
     /// Constructing a token in any other context is a soundness bug.
     #[inline]
-    pub fn new() -> Self {
+    pub unsafe fn new() -> Self {
         Self { _priv: () }
     }
 
     /// Migration constructor — same as [`Self::new`] but the name signals
     /// that the callsite has not yet been audited for STW correctness.
     ///
-    /// Every use must be tagged with `// FIXME(orchestrator)` so it can
-    /// be re-audited and migrated to the orchestrator-threaded token.
-    ///
     /// Existing pre-token code paths that already hold STW (e.g. test
     /// harnesses that run on a single thread with no JIT) may use this
-    /// indefinitely; the FIXME marker is documentation for future
-    /// readers, not a deadline.
+    /// indefinitely.
+    ///
+    /// # Safety
+    ///
+    /// Same as [`Self::new`]: every mutator must be stopped, or there must be
+    /// no other mutator thread.
     #[inline]
-    pub fn new_unchecked() -> Self {
+    pub unsafe fn new_unchecked() -> Self {
         Self { _priv: () }
-    }
-}
-
-impl Default for StopTheWorldToken {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -222,8 +212,17 @@ impl std::fmt::Debug for StopTheWorldToken {
 ///
 /// let heap = Heap::new();
 /// let mut roots = Vec::new();
-/// let stw = StopTheWorldToken::new();
+/// // SAFETY: this doctest has no other mutator threads.
+/// let stw = unsafe { StopTheWorldToken::new() };
 /// let _ = heap.collect_garbage(&stw, &mut roots, &NoMonitors);
+/// ```
+///
+/// Safe construction of STW proof must not compile:
+///
+/// ```compile_fail
+/// use cratonvm_gc::collector::StopTheWorldToken;
+///
+/// let _stw = StopTheWorldToken::new();
 /// ```
 #[cfg(doctest)]
 #[allow(dead_code)]
