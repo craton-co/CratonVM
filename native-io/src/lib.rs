@@ -13293,7 +13293,6 @@ use notify::{
     event::{CreateKind, EventKind, ModifyKind, RemoveKind},
     RecursiveMode, Watcher as NotifyWatcher,
 };
-use std::path::PathBuf;
 use std::sync::mpsc;
 
 type NotifyResult = Result<notify::Event, notify::Error>;

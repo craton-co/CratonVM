@@ -552,7 +552,7 @@ fn maybe_gc(shared: &SharedVm, thread: &mut JvmThread) {
             // "parked" (it doesn't exist). Construct the token directly.
             // HIB-CV-24: null Weak/Phantom referents before marking (restored post-GC).
             weakref_null_referents_pre_gc(shared);
-            let stw = cratonvm_gc::collector::StopTheWorldToken::new();
+            let stw = unsafe { cratonvm_gc::collector::StopTheWorldToken::new() };
             let result = shared
                 .heap
                 .collect_garbage(&stw, &mut roots, &shared.monitors);
@@ -710,7 +710,7 @@ fn maybe_gc(shared: &SharedVm, thread: &mut JvmThread) {
                 // been forcibly stopped in JIT and conservatively scanned.
                 // HIB-CV-24: null Weak/Phantom referents before marking (restored post-GC).
                 weakref_null_referents_pre_gc(shared);
-                let stw = cratonvm_gc::collector::StopTheWorldToken::new();
+                let stw = unsafe { cratonvm_gc::collector::StopTheWorldToken::new() };
                 let result = shared
                     .heap
                     .collect_garbage(&stw, &mut roots, &shared.monitors);
@@ -791,7 +791,7 @@ fn maybe_gc_forced(shared: &SharedVm, thread: &mut JvmThread) {
         // STW invariant: single-threaded fast path — see `maybe_gc`.
         // HIB-CV-24: null Weak/Phantom referents before marking (restored post-GC).
         weakref_null_referents_pre_gc(shared);
-        let stw = cratonvm_gc::collector::StopTheWorldToken::new();
+        let stw = unsafe { cratonvm_gc::collector::StopTheWorldToken::new() };
         let result = shared
             .heap
             .collect_garbage(&stw, &mut roots, &shared.monitors);
@@ -819,7 +819,7 @@ fn maybe_gc_forced(shared: &SharedVm, thread: &mut JvmThread) {
             // stopped in JIT and conservatively scanned).
             // HIB-CV-24: null Weak/Phantom referents before marking (restored post-GC).
             weakref_null_referents_pre_gc(shared);
-            let stw = cratonvm_gc::collector::StopTheWorldToken::new();
+            let stw = unsafe { cratonvm_gc::collector::StopTheWorldToken::new() };
             let result = shared
                 .heap
                 .collect_garbage(&stw, &mut roots, &shared.monitors);
@@ -944,7 +944,7 @@ pub fn force_gc_from_native(shared: &SharedVm, thread: &mut JvmThread) {
         // STW invariant: single-threaded fast path — see `maybe_gc`.
         // HIB-CV-24: null Weak/Phantom referents before marking (restored post-GC).
         weakref_null_referents_pre_gc(shared);
-        let stw = cratonvm_gc::collector::StopTheWorldToken::new();
+        let stw = unsafe { cratonvm_gc::collector::StopTheWorldToken::new() };
         let (result, dead_finalizers) = shared.heap.collect_garbage_with_finalizers(
             &stw,
             &mut roots,
@@ -974,7 +974,7 @@ pub fn force_gc_from_native(shared: &SharedVm, thread: &mut JvmThread) {
             // stopped in JIT and conservatively scanned).
             // HIB-CV-24: null Weak/Phantom referents before marking (restored post-GC).
             weakref_null_referents_pre_gc(shared);
-            let stw = cratonvm_gc::collector::StopTheWorldToken::new();
+            let stw = unsafe { cratonvm_gc::collector::StopTheWorldToken::new() };
             let (result, dead_finalizers) = shared.heap.collect_garbage_with_finalizers(
                 &stw,
                 &mut roots,
