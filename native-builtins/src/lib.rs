@@ -32974,6 +32974,120 @@ fn native_bd_signum(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     })))
 }
 
+/// `BigDecimal.setScale` old-style rounding-mode constants (`RoundingMode`
+/// shares the same ordinals via its `oldMode` field — see
+/// `RoundingMode.setScale(int,RoundingMode)`'s bytecode, which reads
+/// `oldMode` and delegates to `setScale(int,int)`).
+const BD_ROUND_UP: i32 = 0;
+const BD_ROUND_DOWN: i32 = 1;
+const BD_ROUND_CEILING: i32 = 2;
+const BD_ROUND_FLOOR: i32 = 3;
+const BD_ROUND_HALF_UP: i32 = 4;
+const BD_ROUND_HALF_DOWN: i32 = 5;
+const BD_ROUND_HALF_EVEN: i32 = 6;
+const BD_ROUND_UNNECESSARY: i32 = 7;
+
+/// Decide whether `|quotient|` must be incremented (rounded away from zero)
+/// given the truncated `(quotient, remainder)` of `unscaled / 10^drop` and
+/// the requested rounding mode. `dividend_neg` is the sign of the original
+/// unscaled value (== the sign of a nonzero `remainder`).
+///
+/// Mirrors `java.math.BigDecimal`'s rounding semantics exactly, operating on
+/// the binary `BigInt` remainder/divisor directly (a `shl(1)` doubling and a
+/// `cmp`) instead of ever formatting through `f64` — the old
+/// `bd_read(...).parse::<f64>()` implementation both truncated precision for
+/// any unscaled value wider than ~17 significant digits AND was the
+/// dominant cost (~580us/call, measured) behind `TestUtil.nextLong`'s
+/// large-range path timing out Lucene's postings/doc-values randomized
+/// tests (`BigDecimal(double).toBigInteger()` calls `setScale(0, DOWN)`
+/// millions of times per test class).
+fn bd_round_needs_increment(
+    remainder: &crate::bigint::BigInt,
+    divisor: &crate::bigint::BigInt,
+    quotient: &crate::bigint::BigInt,
+    dividend_neg: bool,
+    mode: i32,
+) -> Result<bool, ()> {
+    if remainder.is_zero() {
+        return Ok(false);
+    }
+    Ok(match mode {
+        BD_ROUND_DOWN => false,
+        BD_ROUND_UP => true,
+        BD_ROUND_CEILING => !dividend_neg,
+        BD_ROUND_FLOOR => dividend_neg,
+        BD_ROUND_HALF_UP | BD_ROUND_HALF_DOWN | BD_ROUND_HALF_EVEN => {
+            let abs_rem = if remainder.is_neg() {
+                remainder.neg_value()
+            } else {
+                remainder.clone()
+            };
+            let twice = abs_rem.shl(1);
+            match twice.cmp(divisor) {
+                std::cmp::Ordering::Greater => true,
+                std::cmp::Ordering::Less => false,
+                std::cmp::Ordering::Equal => match mode {
+                    BD_ROUND_HALF_UP => true,
+                    BD_ROUND_HALF_DOWN => false,
+                    // HALF_EVEN: increment only if that makes the kept
+                    // digit even, i.e. the truncated quotient is odd.
+                    _ => quotient.test_bit(0),
+                },
+            }
+        }
+        BD_ROUND_UNNECESSARY => return Err(()),
+        // Unknown mode — HotSpot's own RoundingMode enum bounds this to
+        // 0..=7; be conservative and don't round rather than guess.
+        _ => false,
+    })
+}
+
+/// Shared implementation for `setScale(int)` / `setScale(int,int)` /
+/// `setScale(int,RoundingMode)` (the last two delegate to `(II)` in real
+/// bytecode). Rescales the *exact* unscaled `BigInt` — never a lossy `f64`
+/// round-trip — so both correctness (values with >17 significant digits)
+/// and performance (the old path's slow-path `f64::parse` on long decimal
+/// strings) are fixed together.
+fn bd_set_scale_impl(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    new_scale: i32,
+    mode: i32,
+) -> MethodCallResult {
+    use crate::bigint::BigInt;
+    let (unscaled, scale) = bd_unscaled_bigint(ctx, this);
+    if new_scale >= scale {
+        let padded = bigint_mul_pow10(&unscaled, new_scale - scale);
+        let result = bd_alloc_bigint(ctx, &padded, new_scale);
+        return Ok(Some(Value::Object(Some(result))));
+    }
+    let drop = (scale - new_scale) as usize;
+    let mut divisor_dec = String::with_capacity(drop + 1);
+    divisor_dec.push('1');
+    divisor_dec.push_str(&"0".repeat(drop));
+    let divisor = BigInt::from_decimal(&divisor_dec);
+    let (quotient, remainder) = unscaled.divmod(&divisor);
+    let dividend_neg = unscaled.is_neg();
+    let increment = match bd_round_needs_increment(&remainder, &divisor, &quotient, dividend_neg, mode)
+    {
+        Ok(v) => v,
+        Err(()) => {
+            return Err(RuntimeError::ArithmeticException {
+                message: "Rounding necessary".to_string(),
+            }
+            .into());
+        }
+    };
+    let rounded = if increment {
+        let one = BigInt::from_decimal(if dividend_neg { "-1" } else { "1" });
+        quotient.add(&one)
+    } else {
+        quotient
+    };
+    let result = bd_alloc_bigint(ctx, &rounded, new_scale);
+    Ok(Some(Value::Object(Some(result))))
+}
+
 fn native_bd_set_scale(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
@@ -32983,14 +33097,24 @@ fn native_bd_set_scale(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         Some(Value::Int(v)) => *v,
         _ => 0,
     };
-    let v: f64 = bd_read(ctx, this).parse().unwrap_or(0.0);
-    let s = format!("{:.prec$}", v, prec = new_scale as usize);
-    let result = bd_alloc(ctx, &s, new_scale);
-    Ok(Some(Value::Object(Some(result))))
+    // `setScale(int)` == `setScale(newScale, ROUND_UNNECESSARY)` per spec.
+    bd_set_scale_impl(ctx, this, new_scale, BD_ROUND_UNNECESSARY)
 }
 
 fn native_bd_set_scale_rounding(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    native_bd_set_scale(ctx, args) // Simplified: ignore rounding mode
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let new_scale = match args.get(1) {
+        Some(Value::Int(v)) => *v,
+        _ => 0,
+    };
+    let mode = match args.get(2) {
+        Some(Value::Int(v)) => *v,
+        _ => BD_ROUND_UNNECESSARY,
+    };
+    bd_set_scale_impl(ctx, this, new_scale, mode)
 }
 
 fn native_bd_strip_zeros(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
