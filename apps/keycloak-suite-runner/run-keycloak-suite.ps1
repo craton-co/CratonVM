@@ -889,7 +889,8 @@ function Invoke-Mode {
           Write-Info ("  [retry] {0} rc={1} with no stdout/stderr -- retrying once" -f $record.class, $code)
           try { $record.proc.Dispose() } catch {}
           $retryRow = [pscustomobject]@{ module = $record.module; class = $record.class }
-          $still.Add((New-ProcessRecord -ClassRow $retryRow -ModeOut $modeOut -Cp $cp -ExePath $craton -JavaExe $java -JdkPath $jdk -NoJit:($Jit -eq 'off') -Retries ($record.retries + 1)))
+          $retryLaunch = Get-LaunchSpec -ClassRow $retryRow
+          $still.Add((New-ProcessRecord -ClassRow $retryRow -ModeOut $modeOut -LaunchSpec $retryLaunch -ExePath $craton -JavaExe $java -JdkPath $jdk -NoJit:($Jit -eq 'off') -Retries ($record.retries + 1)))
         } else {
           Complete-ProcessRecord -Record $record -ResultPath $results -ExitCode $code -Seconds ([Math]::Round($elapsed, 3)) -Stdout $outputs.stdout -Stderr $outputs.stderr
           try { $record.proc.Dispose() } catch {}
