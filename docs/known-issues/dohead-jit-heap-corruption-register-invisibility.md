@@ -1,6 +1,54 @@
-# Tomcat `TestHttpServletDoHead*` — JIT-only young-gen heap corruption / SIGSEGV (OPEN)
+# Tomcat `TestHttpServletDoHead*` — JIT-only young-gen heap corruption / SIGSEGV (FIX LANDED)
 
-Status: **OPEN.** Root-caused to the JIT×GC root-precision family; no reliable fix
+Status: **FATAL LAYER FIXED** on branch `fix/dohead-sweep-freelist` (commit
+`928cc5b3`, 2026-07-02): the crash was NOT (only) the register-invisible root —
+that is Layer 1, survivable. The FATAL layer was the **young from-space
+walk-desync family**: an unlisted zeroed span (freed-then-reused slot whose new
+owner's header a stale register-held reference clobbered back to zero, or
+freed-but-unlisted residue) was strided as phantom 40-byte "objects" and each
+phantom RE-FREED; spans are 40+16n bytes so the final phantom window crossed
+into the next LIVE object's header — zeroing it and minting a free block inside
+a live object; `Arena::alloc` then double-served live memory (overlap → UAF).
+Seven other linear walkers still used the wedge-prone exact-match free-block
+skip; two of them WRITE while desynced (the selective-promotion evacuation walk
+installs forwarding pointers which the main sweep then trusts via
+`is_forwarded()` and zeroes+frees mid-live-object; `clear_all_mark_bits` writes
+`gc_flags`). The fix hardens EVERY walker: shared robust skip, zero-spans are
+never parsed/freed (skip to the next free-block anchor), anchor-based resync
+replaces the byte-plausibility probe (which accepted all-zero headers), the
+main sweep defers zeroing/publication and unwinds reclaim decisions collected
+since the last anchor on any anomaly, promotion defers forwarding installs and
+unwinds candidates from suspect stretches, marking/fixup walkers get
+conservative base-validated fallbacks over unparseable stretches, the overlap
+coalescer runs unconditionally, and forwarding targets are validated against
+old gen.
+
+Validation (2026-07-02, this dev base): baseline 1/12 CRASH (0xC0000005 at
+stop-churn, 73.9s) vs fix 0/12 at `-Xmx500m`/150 s; in two fix runs the new
+anomaly containment demonstrably caught a REAL corrupt header (legacy Object
+with `array_len=512` — the known JIT inline-alloc header-corruption family) and
+re-anchored without incident. Note today's baseline crash rate (1/12) is lower
+than the historically documented 2-3/6, so the A/B count is directional; the
+mechanism-level evidence (A2 breadcrumbs + the adversarially-reviewed kill
+chain) is the primary case. bt16/bt18 checksums exact (14985902 / 68332206) on
+both binaries; bt18 wall-time delta within background-load noise (73.8s base vs
+77.3s fix on a loaded box; both ~2-3× the idle-box norm — re-measure on idle).
+
+Known accepted residuals: (a) Layer 1 (register-invisible roots → survivable
+all-zero-header stale-receiver flood) is UNCHANGED — the real fix remains
+precise oop maps / shadow stack; (b) the main sweep's survivor arm still writes
+mark-clear/age (2 bytes at header offsets 20/21) on a not-yet-detected suspect
+stretch — cannot mint free blocks or dangle refs; (c) `walk_objects` omits
+objects between an unparseable span and the next anchor (heap dumps /
+histograms under-count during corruption episodes); (d) unlisted zeroed spans
+are RETAINED (never re-served) until a moving cycle resets from-space —
+bounded leak under sustained JIT.
+
+The original OPEN write-up follows for the investigation record.
+
+---
+
+Status (historical): **OPEN.** Root-caused to the JIT×GC root-precision family; no reliable fix
 landed. Both attempted conservative mitigations (full-GPR safepoint spill, shadow
 stack) were **empirically insufficient**. Documented here so the dead-ends are not
 re-walked.
