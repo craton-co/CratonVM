@@ -7,7 +7,7 @@
 //! 1. Create a Java exception object on the heap (load class, allocate, call `<init>`)
 //! 2. Convert `RuntimeError` variants into proper `MethodCallFailed::ExceptionThrown`
 
-use crate::error::{ClassFileError, MethodCallFailed, RuntimeError, VmError};
+use crate::error::{ClassFileError, LinkageError, MethodCallFailed, RuntimeError, VmError};
 use crate::threading::jvm_thread::JvmThread;
 use crate::types::{ObjectRef, Value};
 use crate::vm::{invoke_on_class_shared, try_create_java_string, SharedVm};
@@ -1427,6 +1427,83 @@ pub fn raise_no_class_def_found(
     }
 }
 
+fn linkage_throwable(error: &LinkageError) -> (&'static str, String) {
+    match error {
+        LinkageError::NoClassDefFoundError { class_name } => {
+            ("java/lang/NoClassDefFoundError", class_name.clone())
+        }
+        LinkageError::NoSuchFieldError {
+            class_name,
+            field_name,
+        } => (
+            "java/lang/NoSuchFieldError",
+            format!("{}.{}", class_name, field_name),
+        ),
+        LinkageError::NoSuchMethodError {
+            class_name,
+            method_name,
+            method_descriptor,
+        } => (
+            "java/lang/NoSuchMethodError",
+            format!("{}.{}{}", class_name, method_name, method_descriptor),
+        ),
+        LinkageError::IncompatibleClassChangeError { message } => {
+            ("java/lang/IncompatibleClassChangeError", message.clone())
+        }
+        LinkageError::AbstractMethodError {
+            class_name,
+            method_name,
+        } => (
+            "java/lang/AbstractMethodError",
+            format!("{}.{}", class_name, method_name),
+        ),
+        LinkageError::IllegalAccessError { message } => {
+            ("java/lang/IllegalAccessError", message.clone())
+        }
+        LinkageError::VerifyError {
+            class_name,
+            method_name,
+            message,
+        } => (
+            "java/lang/VerifyError",
+            format!("{}.{}: {}", class_name, method_name, message),
+        ),
+        LinkageError::ClassFormatError {
+            class_name,
+            message,
+        } => (
+            "java/lang/ClassFormatError",
+            format!("{}: {}", class_name, message),
+        ),
+        LinkageError::UnsupportedClassRedefinitionError {
+            class_name,
+            message,
+        } => (
+            "java/lang/UnsupportedOperationException",
+            format!("{}: {}", class_name, message),
+        ),
+    }
+}
+
+/// Convert a VM linkage miss/error into its Java throwable counterpart.
+///
+/// Linkage errors are ordinary `java.lang.LinkageError` subclasses from Java's
+/// perspective. They must travel through the same exception-table path as
+/// runtime exceptions so bytecode such as Surefire's `catch
+/// (NoSuchMethodError)` fallback can run.
+#[cold]
+pub fn throw_linkage_error(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    error: LinkageError,
+) -> MethodCallFailed {
+    let (class_name, detail) = linkage_throwable(&error);
+    match create_exception_object(shared, thread, class_name, Some(&detail)) {
+        Ok(obj_ref) => MethodCallFailed::ExceptionThrown(obj_ref),
+        Err(_) => MethodCallFailed::InternalError(VmError::Linkage(error)),
+    }
+}
+
 /// If `err` is a class-resolution miss, convert it to a throwable Java
 /// `NoClassDefFoundError` keyed on `class_name`. Otherwise return the original
 /// `MethodCallFailed` unchanged.
@@ -1465,43 +1542,11 @@ pub fn convert_class_not_found(
         // Convert them to throwable Java exceptions so catch(Error) / catch(Throwable)
         // blocks in user/framework code can handle them instead of crashing the VM.
         MethodCallFailed::InternalError(VmError::Linkage(
-            crate::error::LinkageError::NoSuchFieldError {
-                class_name: ref cn,
-                ref field_name,
-            },
-        )) => {
-            let msg = format!("{}.{}", cn, field_name);
-            match create_exception_object(shared, thread, "java/lang/NoSuchFieldError", Some(&msg))
-            {
-                Ok(obj_ref) => MethodCallFailed::ExceptionThrown(obj_ref),
-                Err(_) => MethodCallFailed::InternalError(VmError::Linkage(
-                    crate::error::LinkageError::NoSuchFieldError {
-                        class_name: cn.clone(),
-                        field_name: field_name.clone(),
-                    },
-                )),
-            }
-        }
-        MethodCallFailed::InternalError(VmError::Linkage(
-            crate::error::LinkageError::NoSuchMethodError {
-                class_name: ref cn,
-                ref method_name,
-                ref method_descriptor,
-            },
-        )) => {
-            let msg = format!("{}.{}{}", cn, method_name, method_descriptor);
-            match create_exception_object(shared, thread, "java/lang/NoSuchMethodError", Some(&msg))
-            {
-                Ok(obj_ref) => MethodCallFailed::ExceptionThrown(obj_ref),
-                Err(_) => MethodCallFailed::InternalError(VmError::Linkage(
-                    crate::error::LinkageError::NoSuchMethodError {
-                        class_name: cn.clone(),
-                        method_name: method_name.clone(),
-                        method_descriptor: method_descriptor.clone(),
-                    },
-                )),
-            }
-        }
+            linkage @ LinkageError::NoSuchFieldError { .. },
+        ))
+        | MethodCallFailed::InternalError(VmError::Linkage(
+            linkage @ LinkageError::NoSuchMethodError { .. },
+        )) => throw_linkage_error(shared, thread, linkage),
         other => other,
     }
 }
@@ -1532,6 +1577,24 @@ mod tests {
         };
         let result = throw_runtime_error(&vm.shared, &mut vm.main_thread, error);
         assert!(matches!(result, MethodCallFailed::InternalError(_)));
+    }
+
+    #[test]
+    fn linkage_no_such_method_error_is_throwable_or_falls_back() {
+        let mut vm = test_vm();
+        let error = LinkageError::NoSuchMethodError {
+            class_name: "org/junit/runner/Description".to_string(),
+            method_name: "createSuiteDescription".to_string(),
+            method_descriptor: "(Ljava/lang/String;)Lorg/junit/runner/Description;".to_string(),
+        };
+        let result = throw_linkage_error(&vm.shared, &mut vm.main_thread, error);
+        assert!(matches!(
+            result,
+            MethodCallFailed::ExceptionThrown(_)
+                | MethodCallFailed::InternalError(VmError::Linkage(
+                    LinkageError::NoSuchMethodError { .. }
+                ))
+        ));
     }
 
     // -----------------------------------------------------------------------

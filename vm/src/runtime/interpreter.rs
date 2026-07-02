@@ -2088,7 +2088,7 @@ pub(crate) fn update_root_snapshot(shared: &SharedVm, thread: &mut JvmThread) {
 /// Called at safepoints: allocation sites and backward branches (loop iterations).
 /// If STW is active, this thread deposits its roots and waits for GC to complete,
 /// then applies the pointer map to update its own frame references.
-fn safepoint_check(shared: &SharedVm, thread: &mut JvmThread) {
+pub(crate) fn safepoint_check(shared: &SharedVm, thread: &mut JvmThread) {
     use std::sync::atomic::Ordering;
     // bc math-ec 0x4 (CRATONVM_DBG_MEMWATCH): O(1) poll of one absolute
     // watched address at full safepoint frequency — catches the corrupting
@@ -7502,6 +7502,11 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
             {
                 let mcf =
                     crate::runtime::exceptions::throw_runtime_error(shared, thread, runtime_err);
+                Err(mcf)
+            }
+            Err(MethodCallFailed::InternalError(VmError::Linkage(linkage_err))) => {
+                let mcf =
+                    crate::runtime::exceptions::throw_linkage_error(shared, thread, linkage_err);
                 Err(mcf)
             }
             other => other,
@@ -17941,6 +17946,14 @@ fn force_native_over_real_jdk_bytecode(
     if is_typeuse_annotation_native_override(class_name, method_name, method_descriptor) {
         return true;
     }
+    // Surefire fork bootstrap/teardown: bypass ServiceLoader decoder discovery
+    // and the acknowledgedExit semaphore path, both of which rely on JDK
+    // internals CratonVM shadows with registered natives.
+    if class_name == "org/apache/maven/surefire/booter/ForkedBooter"
+        && matches!(method_name, "lookupDecoderFactory" | "acknowledgedExit")
+    {
+        return true;
+    }
     matches!(
         (class_name, method_name, method_descriptor),
         ("java/lang/ClassLoader", "setDefaultAssertionStatus", "(Z)V")
@@ -24432,7 +24445,12 @@ fn execute_invokevirtual_vtable_fast(
     // unaffected and dispatches here normally. Suppressed by
     // `intrinsics_disabled()` (the differential-test off-switch) so the
     // off-run behaves byte-for-byte like the pre-intrinsic VM.
-    if !crate::runtime::env_cache::intrinsics_disabled() {
+    if !crate::runtime::env_cache::intrinsics_disabled()
+        && cratonvm_native_builtins::intrinsics::might_have_method_descriptor(
+            &method_name,
+            &method_descriptor,
+        )
+    {
         let cm = shared.class_manager.read();
         let store = &cm.class_store;
         let is_intrinsic = crate::classloading::find_method_recursive(
@@ -25566,7 +25584,12 @@ fn populate_virtual_invoke_cache(
     //
     // `intrinsics_disabled()` suppresses population entirely — the
     // differential-test off-switch.
-    if !crate::runtime::env_cache::intrinsics_disabled() {
+    if !crate::runtime::env_cache::intrinsics_disabled()
+        && cratonvm_native_builtins::intrinsics::might_have_method_descriptor(
+            &method_name,
+            &descriptor,
+        )
+    {
         let cm = shared.class_manager.read();
         let store = &cm.class_store;
         if let Some((_method, declaring_id)) = crate::classloading::find_method_recursive(

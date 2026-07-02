@@ -501,9 +501,35 @@ pub fn safe_native_call(
     // popped from the operand stack into this Rust slice and are otherwise
     // invisible to `collect_roots` / frame scanning during a safepoint GC.
     let pin_base = thread.native_pin_roots.len();
+    let mut arg_root_indices = Vec::with_capacity(args.len());
     for a in args {
+        let before = thread.native_pin_roots.len();
         pin_value_for_native_call(shared, &mut thread.native_pin_roots, a);
+        arg_root_indices.push((thread.native_pin_roots.len() > before).then_some(before));
     }
+
+    let mut remapped_args = None;
+    if shared
+        .gc_barrier
+        .stw_requested
+        .load(std::sync::atomic::Ordering::Acquire)
+    {
+        crate::runtime::interpreter::safepoint_check(shared, thread);
+        let mut fresh = args.to_vec();
+        for (idx, root_idx) in arg_root_indices.iter().enumerate() {
+            let Some(root_idx) = root_idx else {
+                continue;
+            };
+            let remapped = thread.native_pin_roots[*root_idx];
+            match args[idx] {
+                Value::Object(Some(_)) => fresh[idx] = Value::Object(Some(remapped)),
+                Value::Long(_) => fresh[idx] = Value::Long(remapped.as_ptr() as i64),
+                _ => {}
+            }
+        }
+        remapped_args = Some(fresh);
+    }
+    let native_args = remapped_args.as_deref().unwrap_or(args);
 
     // T19.H1 — record the native into the process-global ring buffer.
     // `safe_native_call` is the central choke point for nearly every
@@ -525,7 +551,9 @@ pub fn safe_native_call(
 
     let result = {
         let mut ctx = NativeContextImpl { shared, thread };
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| callback(&mut ctx, args)))
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            callback(&mut ctx, native_args)
+        }))
     };
     if _dbg_native {
         CURRENT_NATIVE_STACK.with(|s| {
@@ -10558,7 +10586,7 @@ fn invoke_on_class_shared_inner(
                         // decoder-factory discovery, which can return null in
                         // partial-bootstrap states and NPE on connect().
                         || (class_name == "org/apache/maven/surefire/booter/ForkedBooter"
-                            && method_name == "lookupDecoderFactory")
+                            && matches!(method_name, "lookupDecoderFactory" | "acknowledgedExit"))
                         // WP6.1: Provider.getEngineName(String) вЂ” the
                         // real JDK bytecode reads `knownEngines` (a
                         // static HashMap) which `Provider.<clinit>` would
@@ -12282,13 +12310,15 @@ fn invoke_on_class_shared_inner(
                         return Err(MethodCallFailed::ExceptionThrown(exc));
                     }
                 }
-                return Err(MethodCallFailed::InternalError(VmError::Linkage(
+                return Err(crate::runtime::exceptions::throw_linkage_error(
+                    shared,
+                    thread,
                     LinkageError::NoSuchMethodError {
                         class_name,
                         method_name: method_name.to_string(),
                         method_descriptor: descriptor.to_string(),
                     },
-                )));
+                ));
             }
         }
     };
