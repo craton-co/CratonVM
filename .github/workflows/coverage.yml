@@ -1,4 +1,4 @@
-name: Coverage
+name: Coverage (advisory)
 
 on:
   push:
@@ -11,7 +11,7 @@ env:
 
 jobs:
   coverage:
-    name: cargo-llvm-cov
+    name: cargo-llvm-cov (advisory)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -35,7 +35,7 @@ jobs:
       # red-flagging the build. Once a JDK is wired in here this can become a
       # blocking gate by dropping `continue-on-error`. See the matching note on
       # the synthetic-stub census guard in ci.yml.
-      - name: Generate coverage
+      - name: Generate coverage (advisory)
         continue-on-error: true
         run: cargo llvm-cov --workspace --lcov --output-path lcov.info
 

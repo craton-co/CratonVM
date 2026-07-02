@@ -34,8 +34,8 @@ VM in another application and hacking on its internals.
   decompression-bomb caps) and **container/cgroup awareness**.
 - Opt-in **GPU offload**: Java bytecode → NVIDIA PTX lowering for CUDA.
 
-It is roughly **880,000 lines of Rust** across 20 workspace crates, and passes
-**6,000+ tests** plus a HotSpot-differential regression suite.
+It is roughly **880,000 lines of Rust** across 20 workspace crates, with a
+large Rust/Java test corpus and HotSpot-differential regression tooling.
 
 ## Status & expectations
 

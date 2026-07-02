@@ -23,10 +23,10 @@ standard library, so it can run with **no JDK installation, no `JAVA_HOME`, no `
 - **JNI & embedding** — JNI Invocation API, implicit local-reference frames, a GC pin set for critical sections, and a stable C-ABI embedding library (`libcratonvm`) + Rust facade (`cratonvm-embed`)
 - **Security hardening** — fail-closed I/O confinement, outbound-network egress policy (cloud-metadata/SSRF block + optional DNS resolution), HTTP request-body caps and anti-smuggling, and an OS-CSPRNG–backed `SecureRandom` (see [Security & sandboxing](#security--sandboxing))
 - **Container/cgroup awareness** — cgroup v1/v2 memory & CPU detection + a container-aware default-heap helper (launcher wiring is a documented follow-up; see [docs/CONTAINER.md](docs/CONTAINER.md))
-- **Observability** — Java Flight Recorder (JFR), and a `cargo-llvm-cov` coverage CI job (see [docs/COVERAGE.md](docs/COVERAGE.md))
+- **Observability** — Java Flight Recorder (JFR), plus advisory `cargo-llvm-cov` coverage reporting (see [docs/COVERAGE.md](docs/COVERAGE.md))
 - **GPU offload** (opt-in) — Java bytecode → PTX lowering for CUDA
-- **6,000+ tests**, plus a HotSpot-differential regression suite; CI enforces `cargo build`, `cargo fmt --check`, and `clippy -D warnings`
-- **~880,000 lines** of Rust across 19 workspace crates
+- A large Rust/Java test corpus plus HotSpot-differential regression tooling; CI is configured for build, fmt, clippy, and test checks, with coverage and difftest currently advisory
+- **~880,000 lines** of Rust across 20 workspace crates
 
 ### Java Version Support
 
@@ -193,6 +193,14 @@ cargo build --release -p cratonvm-cli
 # Binary at: target/release/cratonvm[.exe]
 ```
 
+The optional `java[.exe]` launcher alias is not built by default, so a normal
+Cargo install does not shadow the system JDK. Build it only when a tool requires
+the launcher basename to be `java`:
+
+```bash
+cargo build --release -p cratonvm-cli --features java-bin-alias
+```
+
 ### Running Tests
 
 ```bash
@@ -229,7 +237,8 @@ cargo fmt --all --check
 
 ## Architecture
 
-The workspace has 19 member crates (the `fuzz` harness is a separate, standalone workspace, not a member):
+The workspace has 20 member crates (the `fuzz` harness is a separate,
+standalone workspace, not a member):
 
 ```
 cratonvm/
@@ -252,7 +261,9 @@ cratonvm/
   vm-cli/              - Command-line entry point
   libcratonvm/         - C-ABI shared library for embedding (cdylib/staticlib libjvm substitute)
   cratonvm-embed/      - Semver-stable Rust facade for embedding CratonVM
-  fuzz/                - libfuzzer harness (separate workspace, nightly-only)
+  difftest/            - HotSpot differential-testing harness
+
+  fuzz/                - libfuzzer harness (separate standalone workspace, nightly-only)
 ```
 
 - **Bytecode interpreter** — fast-path dispatch with 140+ opcodes

@@ -50,7 +50,7 @@ On the project's QuickBench suite, CratonVM's x86-64 JIT runs **within about 1.5
 
 *Measured 2026-03-31 on Windows 11, JDK 25.0.1 LTS. Competitive — not a claim to beat the JDK, but to stand close to it, in a runtime that is years younger and built on a safer foundation.*
 
-Backed by **6,000+ passing tests** and a clean, warning-free codebase.
+Backed by a layered Rust/Java test strategy and HotSpot-differential tooling.
 
 ---
 

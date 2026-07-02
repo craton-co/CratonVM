@@ -203,7 +203,8 @@ The facade re-exports the VM types unchanged and adds a small set of helpers:
 | `make_string_array(vm, &["a", "b"])` | Build a `java.lang.String[]` (e.g. for `main(String[])`). |
 | `read_string(vm, obj)` | Read a `String` handle back to a Rust `String`. |
 | `object_class_name(vm, obj)` | Runtime class internal name of an object. |
-| `field_index` / `get_field_by_name` / `set_field_by_name` | Name-based instance-field access (GC-barrier correct on write). |
+| `field_index` / `field_index_desc` | Resolve instance fields by name, or by name plus descriptor when overload-style disambiguation is needed. |
+| `get_field_by_name` / `set_field_by_name` | Name-based instance-field access (GC-barrier correct on write). |
 | `describe_failure(vm, &err)` | Human-readable text for a `MethodCallFailed`. |
 
 The crate is `#![forbid(unsafe_code)]`: all unsafety stays behind the underlying

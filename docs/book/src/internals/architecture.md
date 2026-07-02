@@ -32,7 +32,7 @@ lints.)
 | `cratonvm-cli` | `vm-cli/` | Command-line entry point (the `cratonvm` binary) |
 | `libcratonvm` | `libcratonvm/` | C-ABI shared library for embedding (JNI Invocation API) |
 | `cratonvm-embed` | `cratonvm-embed/` | Curated, semver-stable Rust embedding facade |
-| `difftest` | `difftest/` | Differential-testing harness against a reference JDK |
+| `cratonvm-difftest` | `difftest/` | Differential-testing harness against a reference JDK |
 
 It is roughly **880,000 lines of Rust**. The project builds on Rust **1.80+**
 (edition 2021).
