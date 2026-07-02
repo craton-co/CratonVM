@@ -5054,27 +5054,25 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
     // Spring's FacesDependencyRegistrar probe should effectively no-op.
     // In our current runtime, that probe can escalate into hard failure via
     // NoClassDefFoundError on jakarta.faces.*. Short-circuit it.
+    //
+    // NOTE: the blanket `registerWebApplicationScopes` no-ops that used to sit
+    // here are gone (context.annotation cluster fix). They pre-dated S111r27's
+    // more surgical `ClassUtils.isPresent` fix below, which makes the real
+    // `WebApplicationContextUtils.jsfPresent` static flag correctly compute
+    // `false` for "jakarta.faces.context.FacesContext" — so the real
+    // `registerWebApplicationScopes` body already skips
+    // `FacesDependencyRegistrar` on its own and safely runs
+    // `beanFactory.registerScope(SCOPE_REQUEST/SCOPE_SESSION, ...)`. Shadowing
+    // it here was dropping those `registerScope` calls entirely, breaking
+    // every plain (non-Boot) `GenericWebApplicationContext.refresh()` with
+    // "IllegalStateException: No Scope registered for scope name 'request'/
+    // 'session'" (ClassPathBeanDefinitionScannerJsr330ScopeIntegrationTests,
+    // ClassPathBeanDefinitionScannerScopeIntegrationTests). Only the
+    // `FacesDependencyRegistrar` probe itself stays stubbed below, as a
+    // defense-in-depth backstop (it should now be unreachable).
     r.register(
         "org/springframework/web/context/support/WebApplicationContextUtils$FacesDependencyRegistrar",
         "registerFacesDependencies",
-        "(Lorg/springframework/beans/factory/config/ConfigurableListableBeanFactory;)V",
-        |_ctx, _args| Ok(None),
-    );
-    r.register(
-        "org/springframework/web/context/support/WebApplicationContextUtils",
-        "registerWebApplicationScopes",
-        "(Lorg/springframework/beans/factory/config/ConfigurableListableBeanFactory;)V",
-        |_ctx, _args| Ok(None),
-    );
-    r.register(
-        "org/springframework/web/context/support/WebApplicationContextUtils",
-        "registerWebApplicationScopes",
-        "(Lorg/springframework/beans/factory/config/ConfigurableListableBeanFactory;Ljakarta/servlet/ServletContext;)V",
-        |_ctx, _args| Ok(None),
-    );
-    r.register(
-        "org/springframework/boot/web/servlet/context/ServletWebServerApplicationContext",
-        "registerWebApplicationScopes",
         "(Lorg/springframework/beans/factory/config/ConfigurableListableBeanFactory;)V",
         |_ctx, _args| Ok(None),
     );
