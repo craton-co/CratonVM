@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
 
 /// Inline-storage capacity for `EventInstance.fields`.
@@ -82,6 +82,75 @@ pub enum EventPeriod {
     EveryChunk,
     /// Periodic per second
     EverySecond,
+}
+
+/// Validation failure for [`EventType`] metadata supplied to
+/// [`EventTypeRegistry::register`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EventTypeValidationError {
+    EmptyName,
+    InvalidName,
+    DuplicateName(String),
+    InvalidCategory(String),
+    InvalidDescription,
+    EmptyFieldName { field_index: usize },
+    InvalidFieldName { field_index: usize },
+    DuplicateFieldName(String),
+    InvalidFieldDescription { field_index: usize },
+    UnknownFieldType {
+        field_index: usize,
+        type_name: String,
+    },
+}
+
+impl std::fmt::Display for EventTypeValidationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EventTypeValidationError::EmptyName => write!(f, "event type name is empty"),
+            EventTypeValidationError::InvalidName => {
+                write!(f, "event type name contains control characters")
+            }
+            EventTypeValidationError::DuplicateName(name) => {
+                write!(f, "event type name '{}' is already registered", name)
+            }
+            EventTypeValidationError::InvalidCategory(category) => {
+                write!(f, "category '{}' contains control characters", category)
+            }
+            EventTypeValidationError::InvalidDescription => {
+                write!(f, "description contains control characters")
+            }
+            EventTypeValidationError::EmptyFieldName { field_index } => {
+                write!(f, "field {} name is empty", field_index)
+            }
+            EventTypeValidationError::InvalidFieldName { field_index } => {
+                write!(f, "field {} name contains control characters", field_index)
+            }
+            EventTypeValidationError::DuplicateFieldName(name) => {
+                write!(f, "field name '{}' is duplicated", name)
+            }
+            EventTypeValidationError::InvalidFieldDescription { field_index } => {
+                write!(
+                    f,
+                    "field {} description contains control characters",
+                    field_index
+                )
+            }
+            EventTypeValidationError::UnknownFieldType {
+                field_index,
+                type_name,
+            } => write!(
+                f,
+                "field {} declares unknown type '{}'",
+                field_index, type_name
+            ),
+        }
+    }
+}
+
+impl std::error::Error for EventTypeValidationError {}
+
+fn metadata_text_is_clean(s: &str) -> bool {
+    !s.chars().any(char::is_control)
 }
 
 /// A single recorded event instance.
@@ -260,6 +329,17 @@ impl EventTypeRegistry {
     /// `EventTypeId(u32::MAX)` is reserved as the `INVALID` sentinel and will
     /// never be assigned to a real event type.
     pub fn register(&mut self, mut event_type: EventType) -> EventTypeId {
+        if let Some(existing) = self.find_by_name(&event_type.name) {
+            return existing;
+        }
+        if let Err(err) = self.validate_new_event_type(&event_type) {
+            tracing::debug!(
+                event_type = %event_type.name,
+                error = %err,
+                "rejected invalid JFR event type metadata"
+            );
+            return EventTypeId::INVALID;
+        }
         // Guard against ever assigning the INVALID sentinel value.
         assert!(
             self.next_id < u32::MAX,
@@ -271,6 +351,61 @@ impl EventTypeRegistry {
         self.name_to_id.insert(event_type.name.clone(), id);
         self.types.insert(id, event_type);
         id
+    }
+
+    /// Validate metadata for a not-yet-registered event type.
+    ///
+    /// The dump format relies on registry metadata to decode event payloads.
+    /// Rejecting malformed descriptors here prevents bad custom event metadata
+    /// from being written into every later recording.
+    pub fn validate_new_event_type(
+        &self,
+        event_type: &EventType,
+    ) -> Result<(), EventTypeValidationError> {
+        if event_type.name.is_empty() {
+            return Err(EventTypeValidationError::EmptyName);
+        }
+        if !metadata_text_is_clean(&event_type.name) {
+            return Err(EventTypeValidationError::InvalidName);
+        }
+        if self.name_to_id.contains_key(&event_type.name) {
+            return Err(EventTypeValidationError::DuplicateName(event_type.name.clone()));
+        }
+        if !metadata_text_is_clean(&event_type.description) {
+            return Err(EventTypeValidationError::InvalidDescription);
+        }
+        for category in &event_type.category {
+            if !metadata_text_is_clean(category) {
+                return Err(EventTypeValidationError::InvalidCategory(category.clone()));
+            }
+        }
+
+        let mut field_names: FxHashSet<&str> = FxHashSet::default();
+        for (idx, field) in event_type.fields.iter().enumerate() {
+            if field.name.is_empty() {
+                return Err(EventTypeValidationError::EmptyFieldName { field_index: idx });
+            }
+            if !metadata_text_is_clean(&field.name) {
+                return Err(EventTypeValidationError::InvalidFieldName { field_index: idx });
+            }
+            if !field_names.insert(field.name.as_str()) {
+                return Err(EventTypeValidationError::DuplicateFieldName(
+                    field.name.clone(),
+                ));
+            }
+            if !metadata_text_is_clean(&field.description) {
+                return Err(EventTypeValidationError::InvalidFieldDescription {
+                    field_index: idx,
+                });
+            }
+            if FieldKind::from_declared(&field.type_name).is_none() {
+                return Err(EventTypeValidationError::UnknownFieldType {
+                    field_index: idx,
+                    type_name: field.type_name.clone(),
+                });
+            }
+        }
+        Ok(())
     }
 
     pub fn get(&self, id: EventTypeId) -> Option<&EventType> {
@@ -681,5 +816,47 @@ mod tests {
         let id = reg.register(make_event_type("jdk.ThreadStart"));
         assert_eq!(reg.find_by_name("jdk.ThreadStart"), Some(id));
         assert_eq!(reg.find_by_name("jdk.Missing"), None);
+    }
+
+    #[test]
+    fn test_registry_duplicate_name_returns_existing_id() {
+        let mut reg = EventTypeRegistry::new();
+        let id1 = reg.register(make_event_type("dup.Type"));
+        let id2 = reg.register(EventType {
+            description: "different metadata should not replace original".into(),
+            fields: vec![EventField::new("other", "long", "Other field")],
+            ..make_event_type("dup.Type")
+        });
+
+        assert_eq!(id2, id1);
+        assert_eq!(reg.len(), 1);
+        let stored = reg.get(id1).unwrap();
+        assert_eq!(stored.fields[0].name, "field1");
+        assert_eq!(stored.fields[0].type_name, "int");
+    }
+
+    #[test]
+    fn test_registry_rejects_malformed_metadata() {
+        let mut reg = EventTypeRegistry::new();
+
+        let bad_name = reg.register(make_event_type("bad\nname"));
+        assert_eq!(bad_name, EventTypeId::INVALID);
+
+        let bad_field_type = reg.register(EventType {
+            fields: vec![EventField::new("field1", "object", "unsupported")],
+            ..make_event_type("bad.FieldType")
+        });
+        assert_eq!(bad_field_type, EventTypeId::INVALID);
+
+        let duplicate_field = reg.register(EventType {
+            fields: vec![
+                EventField::new("field1", "int", "First"),
+                EventField::new("field1", "long", "Duplicate"),
+            ],
+            ..make_event_type("bad.DuplicateField")
+        });
+        assert_eq!(duplicate_field, EventTypeId::INVALID);
+
+        assert!(reg.is_empty());
     }
 }

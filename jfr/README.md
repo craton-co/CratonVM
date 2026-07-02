@@ -13,7 +13,7 @@ multi-thread aggregator (`ThreadRingRegistry`) that drains every
 producer's shard without serializing the hot emit path, the built-in
 event catalogue (GC, allocation, monitor enter, exception, etc.),
 recording lifecycle (`start`, `stop`, `dump`), and `.jfr`
-binary-format serialization compatible with JDK Mission Control.
+binary-format serialization for CratonVM's in-crate reader.
 
 ## Non-goals
 
@@ -37,10 +37,11 @@ if is_enabled() {
 
 The `.jfr` files this crate writes are **JFR v2.0 inspired**, not
 byte-for-byte identical to the format OpenJDK's Flight Recorder
-emits. JDK Mission Control (JMC) opens and renders them, but two
-writer conventions diverge from stock JFR and one chunk-level
-ordering pass was added in round 9 (2026-05-24) to keep the JMC
-timeline view monotonic.
+emits. They round-trip through `read_events` in this crate. Stock
+JDK Mission Control (JMC), `jfr print`, and
+`jdk.jfr.consumer.RecordingFile` should not be treated as supported
+consumers yet because the metadata section is still a custom compact
+encoding rather than OpenJDK's binary metadata tree.
 
 ### Wire-format divergences from stock JFR
 
@@ -67,8 +68,16 @@ timeline view monotonic.
   XML form OpenJDK ships. Field types, descriptions, and the
   `has_thread` / `has_stacktrace` flags round-trip; the rest of
   OpenJDK's metadata schema (annotations, content types, settings)
-  is currently omitted. See `write_metadata_section` in
-  `src/dump.rs`.
+  is currently omitted. This is the main blocker for stock JMC/JDK
+  tool compatibility. See `write_metadata_section` in `src/dump.rs`.
+
+### Header and metadata compatibility notes
+
+The file header is 72 bytes (`HEADER_SIZE` in `src/dump.rs`): magic,
+major/minor, seven 64-bit fields, one state byte, and seven bytes of
+padding. The metadata and checkpoint offsets in that header are valid
+for this writer/reader pair, but the metadata payload is not the stock
+JFR metadata tree that external tools expect.
 
 ### Cross-shard timestamp sort on dump (round-9 HIGH-4 fix)
 
@@ -101,6 +110,13 @@ the verifying test.
   added by round-9 CRIT-3) are exposed on the Rust API but are
   NOT yet surfaced inside the written `.jfr` file as an
   event-loss record.
+- `JfrProfile::{default_profile,detailed_profile}` and
+  `JfrProfile::apply_to` are data-model scaffolding. `apply_to`
+  can populate `RecordingSettings::enabled_events` and
+  `event_thresholds` when called explicitly, but recording startup
+  does not yet consume profiles automatically. Profile `stacktrace`
+  and `period` settings remain inert until stack capture and periodic
+  sampling are implemented.
 
 ## Status
 

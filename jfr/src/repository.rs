@@ -220,6 +220,7 @@ impl Default for EventRepository {
 /// ring is full, the oldest event is dropped (head-eviction) to keep producers
 /// non-blocking on the hot path.
 pub const DEFAULT_THREAD_RING_CAPACITY: usize = 1024;
+static NEXT_THREAD_RING_REGISTRY_ID: AtomicUsize = AtomicUsize::new(1);
 
 /// Per-thread bounded ring of pending events.
 ///
@@ -297,7 +298,7 @@ impl ThreadEventRing {
 //
 //   * The owning producer thread is the *only* writer. It is the unique caller
 //     of `SpscEventRing::push` for this shard (enforced by the thread-local
-//     `THREAD_REGISTERED_RING`).
+//     `THREAD_REGISTERED_RINGS`).
 //   * Consumers are *serialized* per ring (round-5 CRIT-fix, 2026-05-17): a
 //     `consumer_busy: AtomicBool` on each `SpscEventRing` is CAS-acquired by
 //     the would-be consumer in `try_pop`. If the CAS fails, `try_pop` returns
@@ -350,7 +351,7 @@ fn next_power_of_two(n: usize) -> usize {
 /// slots in `[tail, head)`, the consumer takes ownership when it pops.
 ///
 /// Safety contract: this type is `Sync` because (a) the producer is unique
-/// per ring (enforced by the thread-local `THREAD_REGISTERED_RING`) and
+/// per ring (enforced by the thread-local `THREAD_REGISTERED_RINGS`) and
 /// (b) consumers are *serialized* by the `consumer_busy` CAS gate inside
 /// `try_pop` — at any instant exactly one thread holds the consumer role
 /// for a given ring. Round-5 CRIT-fix (2026-05-17): the previous single-
@@ -405,7 +406,7 @@ pub struct SpscEventRing {
     /// that intentionally wedge a consumer).
     shutdown_timeout_nanos: AtomicU64,
     /// Set to `true` by the owning producer thread's `Drop` guard
-    /// (`RegisteredRingGuard` held in `THREAD_REGISTERED_RING`) when that
+    /// (`RegisteredRingGuard` held in `THREAD_REGISTERED_RINGS`) when that
     /// thread exits. A retired ring will never receive another producer push
     /// (its producer is gone), so once it has also been fully drained the
     /// registry can drop its clone and reclaim the 1024-slot shard.
@@ -436,7 +437,7 @@ pub const DEFAULT_SPSC_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 
 // SAFETY: `SpscEventRing` enforces the SPSC discipline at runtime:
 //   * The producer is unique by construction (one Arc<SpscEventRing> per
-//     producing thread, kept in `THREAD_REGISTERED_RING`).
+//     producing thread, kept in `THREAD_REGISTERED_RINGS`).
 //   * Consumers are serialized by the `consumer_busy` AtomicBool CAS in
 //     `try_pop`, so only one thread at a time reads the slot array.
 // The `UnsafeCell<MaybeUninit<EventInstance>>` slots are partitioned by
@@ -452,7 +453,7 @@ impl SpscEventRing {
     /// (minimum 1).
     ///
     /// `pub(crate)`: the `unsafe impl Sync` is sound only because the producer
-    /// is unique per ring (enforced by the thread-local `THREAD_REGISTERED_RING`
+    /// is unique per ring (enforced by the thread-local `THREAD_REGISTERED_RINGS`
     /// in `ThreadRingRegistry::register_current_thread`). Exposing construction
     /// to other crates would let callers create rings outside that discipline
     /// and `push` from two threads → data race UB. External code must obtain
@@ -528,7 +529,7 @@ impl SpscEventRing {
     /// `pub(crate)`: this is the producer half of the SPSC contract that the
     /// `unsafe impl Sync` relies on. Keeping it crate-private prevents external
     /// code from pushing concurrently from two threads (data race UB). The
-    /// single-producer invariant is enforced by `THREAD_REGISTERED_RING`.
+    /// single-producer invariant is enforced by `THREAD_REGISTERED_RINGS`.
     pub(crate) fn push(&self, ev: EventInstance) -> Result<(), EventInstance> {
         // The producer is the only writer to `head`, so a Relaxed self-load
         // is fine — we already observe our own prior stores.
@@ -544,7 +545,7 @@ impl SpscEventRing {
         //
         // SAFETY: `cached_tail` is producer-owned (only this thread reads
         // or writes it). The single-producer invariant is enforced by the
-        // thread-local `THREAD_REGISTERED_RING` (see module header).
+        // thread-local `THREAD_REGISTERED_RINGS` (see module header).
         let cached_tail = unsafe { *self.cached_tail.get() };
         let in_flight = head.wrapping_sub(cached_tail);
         let tail = if in_flight >= capacity {
@@ -912,6 +913,7 @@ impl Drop for SpscEventRing {
 /// `register_current_thread`'s fast path is a cheap clone of the same `Arc`
 /// the registry holds.
 struct RegisteredRingGuard {
+    registry_key: usize,
     ring: Arc<SpscEventRing>,
 }
 
@@ -919,6 +921,11 @@ impl RegisteredRingGuard {
     #[inline]
     fn ring(&self) -> &Arc<SpscEventRing> {
         &self.ring
+    }
+
+    #[inline]
+    fn registry_key(&self) -> usize {
+        self.registry_key
     }
 }
 
@@ -940,17 +947,24 @@ thread_local! {
     pub static THREAD_EVENT_RING: ThreadEventRing =
         ThreadEventRing::new(DEFAULT_THREAD_RING_CAPACITY);
 
-    /// Each thread's shared ring shard. Populated lazily on the first call to
-    /// `push_to_thread_ring` (or `global_ring_registry().register_current_thread()`).
-    /// The `Arc<SpscEventRing>` is also inserted into the global registry so
-    /// the dumper can find and drain it from another thread.
+    /// Each thread's shared ring shards, keyed by `ThreadRingRegistry`
+    /// identity. Populated lazily on the first call to `push_to_thread_ring`
+    /// (for the global registry) or to a specific registry's
+    /// `register_current_thread()`. The `Arc<SpscEventRing>` is also inserted
+    /// into that registry so the dumper can find and drain it from another
+    /// thread.
     ///
     /// Registry-leak fix (2026-06-17): the cell now holds a
     /// `RegisteredRingGuard` (rather than a bare `Arc<SpscEventRing>`) whose
     /// `Drop` marks the ring `retired` when the thread exits, letting
     /// `drain_all` reclaim the shard.
-    static THREAD_REGISTERED_RING: RefCell<Option<RegisteredRingGuard>> =
-        const { RefCell::new(None) };
+    ///
+    /// Registry-scope fix (2026-07-02): this is a Vec rather than one global
+    /// slot so tests and embedders can use multiple `ThreadRingRegistry`
+    /// instances on the same OS thread without leaking events across
+    /// registries.
+    static THREAD_REGISTERED_RINGS: RefCell<Vec<RegisteredRingGuard>> =
+        const { RefCell::new(Vec::new()) };
 }
 
 /// Global registry of per-thread SPSC ring shards.
@@ -986,6 +1000,7 @@ thread_local! {
 /// makes it safe for the many unsynchronized `drain_all` call sites to share
 /// a `RwLock::read()` snapshot of the shard list without violating SPSC.
 pub struct ThreadRingRegistry {
+    registry_id: usize,
     rings: RwLock<Vec<Arc<SpscEventRing>>>,
     /// Bounded capacity propagated to each newly-registered thread shard.
     /// The actual ring capacity may be rounded up to the next power of two.
@@ -998,10 +1013,21 @@ impl ThreadRingRegistry {
     /// slightly larger if `shard_capacity` is not already a power of two.
     /// Events pushed when the ring is full are dropped (drop-newest).
     pub fn new(shard_capacity: usize) -> Self {
+        let registry_id = NEXT_THREAD_RING_REGISTRY_ID
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+                next.checked_add(1)
+            })
+            .expect("thread ring registry ID overflow");
         Self {
+            registry_id,
             rings: RwLock::new(Vec::new()),
             shard_capacity: shard_capacity.max(1),
         }
+    }
+
+    #[inline]
+    fn registry_key(&self) -> usize {
+        self.registry_id
     }
 
     /// Returns the per-thread SPSC ring for the calling thread, creating
@@ -1012,12 +1038,16 @@ impl ThreadRingRegistry {
     /// it; the producer keeps its own clone in the thread-local cell for fast
     /// re-access.
     pub fn register_current_thread(&self) -> Arc<SpscEventRing> {
+        let registry_key = self.registry_key();
         // Fast path: already registered for this thread. Clone the inner Arc
         // out of the thread-local `RegisteredRingGuard` (the guard itself stays
         // in the cell so its thread-exit Drop still fires).
-        if let Some(existing) =
-            THREAD_REGISTERED_RING.with(|cell| cell.borrow().as_ref().map(|g| Arc::clone(g.ring())))
-        {
+        if let Some(existing) = THREAD_REGISTERED_RINGS.with(|cell| {
+            cell.borrow()
+                .iter()
+                .find(|g| g.registry_key() == registry_key)
+                .map(|g| Arc::clone(g.ring()))
+        }) {
             return existing;
         }
         // Slow path: allocate, install a Drop guard into the thread-local, and
@@ -1026,8 +1056,9 @@ impl ThreadRingRegistry {
         // Registry-leak fix (2026-06-17): wrap the producer's clone in a
         // `RegisteredRingGuard` so the ring is marked `retired` when this
         // thread exits, letting `drain_all` reclaim the shard later.
-        THREAD_REGISTERED_RING.with(|cell| {
-            *cell.borrow_mut() = Some(RegisteredRingGuard {
+        THREAD_REGISTERED_RINGS.with(|cell| {
+            cell.borrow_mut().push(RegisteredRingGuard {
+                registry_key,
                 ring: Arc::clone(&ring),
             });
         });
@@ -1207,11 +1238,14 @@ pub(crate) fn jfr_test_guard() -> parking_lot::MutexGuard<'static, ()> {
 /// counter, readable via `SpscEventRing::dropped_events` or the process-wide
 /// `ThreadRingRegistry::total_dropped_events`.
 pub fn push_to_thread_ring(ev: EventInstance) {
+    let registry = global_ring_registry();
+    let registry_key = registry.registry_key();
     // Fast path: borrow the thread-local shard reference in place and push
     // by value. The closure returns the event back if there is no shard yet
     // so we can install one on the slow path.
-    let leftover = THREAD_REGISTERED_RING.with(|cell| {
-        if let Some(guard) = cell.borrow().as_ref() {
+    let leftover = THREAD_REGISTERED_RINGS.with(|cell| {
+        let rings = cell.borrow();
+        if let Some(guard) = rings.iter().find(|g| g.registry_key() == registry_key) {
             // Push may fail (full); on overflow the event is dropped
             // (drop-newest) and `push` bumps the shard's dropped counter so
             // the loss is observable rather than silent.
@@ -1223,7 +1257,7 @@ pub fn push_to_thread_ring(ev: EventInstance) {
     });
     if let Some(ev) = leftover {
         // Slow path: register, install in thread-local, and push.
-        let shard = global_ring_registry().register_current_thread();
+        let shard = registry.register_current_thread();
         let _ = shard.push(ev);
     }
 }
@@ -1653,6 +1687,33 @@ mod tests {
                 expected
             );
         }
+    }
+
+    #[test]
+    fn same_thread_registries_have_independent_tls_shards() {
+        let registry_a = ThreadRingRegistry::new(8);
+        let registry_b = ThreadRingRegistry::new(8);
+
+        let ring_a = registry_a.register_current_thread();
+        ring_a.push(make_event(EventTypeId(1), 10, 11)).unwrap();
+
+        let ring_b = registry_b.register_current_thread();
+        ring_b.push(make_event(EventTypeId(2), 20, 21)).unwrap();
+
+        assert!(
+            !Arc::ptr_eq(&ring_a, &ring_b),
+            "same-thread registration in distinct registries must not reuse a TLS shard"
+        );
+        assert_eq!(registry_a.registered_thread_count(), 1);
+        assert_eq!(registry_b.registered_thread_count(), 1);
+
+        let drained_a = registry_a.drain_all();
+        let drained_b = registry_b.drain_all();
+
+        assert_eq!(drained_a.len(), 1);
+        assert_eq!(drained_a[0].type_id, EventTypeId(1));
+        assert_eq!(drained_b.len(), 1);
+        assert_eq!(drained_b[0].type_id, EventTypeId(2));
     }
 
     // Task #31: SpscEventRing::Drop must be bounded and must not leak the

@@ -338,6 +338,29 @@ impl FlightRecorder {
         crate::set_enabled(!self.running_ids.is_empty());
     }
 
+    fn running_ids_are_current(&self) -> bool {
+        let mut running_count = 0usize;
+        for rec in self.recordings.values() {
+            if rec.state == RecordingState::Running {
+                running_count += 1;
+            }
+        }
+        if running_count != self.running_ids.len() {
+            return false;
+        }
+        self.running_ids.iter().all(|id| {
+            self.recordings
+                .get(id)
+                .is_some_and(|rec| rec.state == RecordingState::Running)
+        })
+    }
+
+    fn ensure_running_ids_current(&mut self) {
+        if !self.running_ids_are_current() {
+            self.refresh_running_ids();
+        }
+    }
+
     /// Record an event from the calling thread.
     ///
     /// In the per-thread-ring design, the hot emit path pushes the event onto
@@ -363,6 +386,7 @@ impl FlightRecorder {
         // Fast path: no running recordings — drop on the floor. This mirrors
         // the previous behaviour and matches the global `JFR_ENABLED` gate
         // maintained by `refresh_running_ids`.
+        self.ensure_running_ids_current();
         if self.running_ids.is_empty() {
             return;
         }
@@ -386,6 +410,7 @@ impl FlightRecorder {
     /// but no global ordering is enforced across shards. The dumper sorts by
     /// `start_time` if a time-ordered stream is required (see `dump.rs`).
     pub fn drain_per_thread_into_repository(&mut self) {
+        self.ensure_running_ids_current();
         let drained = repository::global_ring_registry().drain_all();
         if drained.is_empty() {
             return;
@@ -488,6 +513,15 @@ impl FlightRecorder {
         self.recordings.get(&id)
     }
 
+    /// Mutable access to a recording.
+    ///
+    /// Prefer [`start_recording`](FlightRecorder::start_recording) and
+    /// [`stop_recording`](FlightRecorder::stop_recording) for lifecycle
+    /// transitions so `running_ids` and the global enabled flag are updated
+    /// immediately. Cache-dependent paths defensively resync from authoritative
+    /// recording states, so direct `rec.start()` / `rec.stop()` mutations
+    /// through this handle cannot make later drains or direct `record_event`
+    /// calls use stale running-id snapshots.
     pub fn get_recording_mut(&mut self, id: u64) -> Option<&mut Recording> {
         self.recordings.get_mut(&id)
     }
@@ -518,6 +552,7 @@ impl FlightRecorder {
     /// `extra_events` to `dump_to_file` — Bug 1 fix: re-draining the global
     /// ring inside the writer would steal events from sibling recordings.
     pub fn dump_recording(&mut self, id: u64, path: &Path) -> Result<u64, JfrDumpError> {
+        self.ensure_running_ids_current();
         // Flush any events sitting in per-thread rings into the per-recording
         // repositories before snapshotting. After this call, every running
         // recording owns its own copy of the just-drained events.
@@ -997,6 +1032,26 @@ mod tests {
         let rec = fr.get_recording_mut(id).unwrap();
         rec.start();
         assert_eq!(fr.active_recording_count(), 1);
+    }
+
+    #[test]
+    fn get_recording_mut_lifecycle_resyncs_running_cache_on_record() {
+        let _g = crate::repository::jfr_test_guard();
+        let _ = crate::repository::global_ring_registry().drain_all();
+
+        let mut fr = FlightRecorder::new();
+        let id = fr.new_recording(RecordingSettings::new("mut-start"));
+        fr.get_recording_mut(id).unwrap().start();
+
+        let unique = EventTypeId(0xC3FF_0030);
+        fr.record_event(make_event(unique, 100, 200));
+        fr.drain_per_thread_into_repository();
+
+        let rec = fr.get_recording(id).unwrap();
+        assert!(
+            rec.repository().iter().any(|e| e.type_id == unique),
+            "direct lifecycle mutation through get_recording_mut must not leave running_ids stale"
+        );
     }
 
     #[test]
