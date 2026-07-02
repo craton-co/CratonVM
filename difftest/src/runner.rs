@@ -239,8 +239,6 @@ pub struct RunnerConfig {
     pub timeout: Duration,
     /// Explicit JDK home (`--jdk`), else `DIFFTEST_JAVA_HOME` / PATH.
     pub jdk_home: Option<PathBuf>,
-    /// Allow a non-pinned JDK (`--allow-jdk-downgrade`).
-    pub allow_jdk_downgrade: bool,
     /// Ledger path (`--ledger`).
     pub ledger: PathBuf,
     /// Whether to write discovered divergences back into the ledger.
@@ -266,7 +264,6 @@ impl RunnerConfig {
             modes: vec![Mode::JitOn, Mode::NoJit],
             timeout: DEFAULT_TIMEOUT,
             jdk_home: None,
-            allow_jdk_downgrade: false,
             ledger: crate::ledger::default_ledger_path(),
             update_ledger: false,
             determinism_check: false,
@@ -402,6 +399,17 @@ pub fn run_hotspot(
     run_subprocess(cmd, timeout)
 }
 
+/// The main class name and expected `.class` path for a default-package seed.
+fn expected_class_output(file: &Path, out_dir: &Path) -> (String, PathBuf) {
+    let class_name = file
+        .file_stem()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned();
+    let expected_class = out_dir.join(format!("{class_name}.class"));
+    (class_name, expected_class)
+}
+
 /// Compile a `.java` source into `out_dir` with `javac`, returning the main
 /// class name to run (the source's file stem — our seeds declare a public
 /// class of that name in the default package).
@@ -416,6 +424,9 @@ pub fn compile_java(
         .unwrap_or_default()
         .to_string_lossy()
         .into_owned();
+    let (class_name, expected_class) = expected_class_output(file, out_dir);
+    let _ = std::fs::remove_file(&expected_class);
+
     let mut cmd = Command::new(javac_executable(jdk_home));
     cmd.arg("-d").arg(out_dir).arg(file);
     let obs = run_subprocess(cmd, timeout)?;
@@ -426,11 +437,16 @@ pub fn compile_java(
             stderr: obs.stderr,
         });
     }
-    Ok(file
-        .file_stem()
-        .unwrap_or_default()
-        .to_string_lossy()
-        .into_owned())
+    if !expected_class.is_file() {
+        return Err(RunError::CompileFailed {
+            program,
+            stderr: format!(
+                "javac exited successfully but did not produce {}",
+                expected_class.display()
+            ),
+        });
+    }
+    Ok(class_name)
 }
 
 // ---------------------------------------------------------------------------
@@ -500,6 +516,14 @@ mod tests {
             "bin/java"
         }));
         assert!(java.starts_with(home));
+    }
+
+    #[test]
+    fn expected_class_output_uses_source_stem() {
+        let (class_name, class_file) =
+            expected_class_output(Path::new("corpus/Found_0042.java"), Path::new("out"));
+        assert_eq!(class_name, "Found_0042");
+        assert_eq!(class_file, Path::new("out").join("Found_0042.class"));
     }
 
     #[test]

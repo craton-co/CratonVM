@@ -176,7 +176,7 @@ jobs:
           -- --nocapture
 
   # Semantic differential gate (difftest, design
-  # docs/feature-designs/differential-fuzzer.md §3.5). `difftest gate` diffs a
+  # docs/feature-designs/differential-fuzzer.md §3.5). `cratonvm-difftest gate` diffs a
   # fresh run of the seed corpus against the committed difftest/ledger.json and
   # honors the exit-code contract (0 ok / 1 new-or-drift / 2 fixed-reopened /
   # 3 bootstrap), with the determinism pre-flight + divergence re-confirmation
@@ -189,7 +189,7 @@ jobs:
   # Java-semantic (exception messages, no paths), so it *should* reproduce
   # byte-identically on this Linux runner — but until that's confirmed by a
   # green CI run, a platform-drift must not red-flag dev. Regenerate the ledger
-  # here (`difftest run --update-ledger`, mark entries `known`) and DROP
+  # here (`cratonvm-difftest run --update-ledger`, mark entries `known`) and DROP
   # `continue-on-error` to make the gate blocking.
   difftest-gate:
     name: Semantic differential gate
@@ -213,7 +213,7 @@ jobs:
         run: cargo build -p cratonvm-difftest -p cratonvm-cli
 
       - name: Run the semantic differential gate
-        run: cargo run -p cratonvm-difftest --bin difftest -- gate --corpus difftest/seeds
+        run: cargo run -p cratonvm-difftest --bin cratonvm-difftest -- gate --corpus difftest/seeds
 
   # Future CI hardening — not yet enabled. Uncomment once the
   # corresponding gates are ready to be enforced.

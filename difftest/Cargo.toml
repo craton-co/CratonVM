@@ -22,17 +22,16 @@ exclude = [
 ]
 
 [[bin]]
-name = "difftest"
+name = "cratonvm-difftest"
 path = "src/main.rs"
 
 [dependencies]
-# Step 0 is deliberately lightweight: the runner drives the `cratonvm` binary
+# The runner stays deliberately lightweight: it drives the `cratonvm` binary
 # and `java` as subprocesses (see docs/feature-designs/differential-fuzzer.md
 # §3.2), so it needs no VM source crate. Deps on `cratonvm-vm` /
 # `cratonvm-reader` / `cratonvm-classloading` are added only when a later step
-# wires the in-process micro-method tier (Step 1) and the bytecode verifier
-# re-check (Step 5) — keeping the scaffold's build fast and its blast radius
-# zero.
+# wires the in-process micro-method tier and the bytecode verifier re-check,
+# keeping this crate's build fast and its blast radius zero.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 clap = { version = "4", features = ["derive"] }
