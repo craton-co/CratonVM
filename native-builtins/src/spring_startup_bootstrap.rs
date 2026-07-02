@@ -1523,7 +1523,7 @@ fn abstract_bean_definition_get_bean_class_name(
     // have attempted `ensure_class_initialized`, so a class that's truly on
     // the classpath will have a ClassId by this point.
     let internal = name.replace('.', "/");
-    let loadable = ctx.class_id_by_name(&internal).is_some()
+    let mut loadable = ctx.class_id_by_name(&internal).is_some()
         || ctx.class_id_by_name(&name).is_some()
         // FIX(bug-B): a bean class can be ON the classpath but not yet LOADED —
         // lazily-resolved nested / method-injection / proxied bean classes (e.g.
@@ -1534,6 +1534,34 @@ fn abstract_bean_definition_get_bean_class_name(
         // asserted "Target object must not be null". Probe the classpath resource
         // (no clinit) so ONLY genuinely-absent classes are hidden.
         || ctx.find_resource(&format!("{internal}.class")).is_some();
+
+    // FIX: nested-class dotted convention. Spring XML/reflection allows a
+    // nested class to be named with a DOT before the nested segment (e.g.
+    // "com.example.Outer.Inner", matching `ClassUtils.forName`'s own
+    // last-dot-to-`$` fallback at ClassUtils.java:308-318) even though the
+    // real class-file path uses `$` ("com/example/Outer$Inner.class"). The
+    // naive `name.replace('.', "/")` above turns every dot into a slash,
+    // producing a resource path that never exists, so a legitimately
+    // loadable nested-class bean (e.g. an `<aop:aspect ref="testAspect">`
+    // pointing at a test's static nested aspect class) was wrongly hidden —
+    // observed as `MethodLocatingFactoryBean` throwing "Can't determine type
+    // of bean with name 'testAspect'" because `getBeanClassName()` returned
+    // null. Mirror the same single-level last-dot substitution before
+    // giving up.
+    if !loadable {
+        if let Some(last_dot) = name.rfind('.') {
+            let nested_dotted = format!("{}${}", &name[..last_dot], &name[last_dot + 1..]);
+            let nested_internal = nested_dotted.replace('.', "/");
+            if ctx.class_id_by_name(&nested_internal).is_some()
+                || ctx.class_id_by_name(&nested_dotted).is_some()
+                || ctx
+                    .find_resource(&format!("{nested_internal}.class"))
+                    .is_some()
+            {
+                loadable = true;
+            }
+        }
+    }
 
     if !loadable {
         tracing::warn!(
@@ -2495,12 +2523,29 @@ fn resolve_bean_class_field(ctx: &mut dyn NativeContext, recv: ObjectRef) -> Bea
         None => match ctx.ensure_class_initialized(&internal) {
             Ok(c) => c,
             Err(e) => {
-                if dbg {
-                    eprintln!(
-                        "[resolve-shim] Missing: {internal} not on classpath (ensure_class_initialized ERR: {e:?})"
-                    );
+                // FIX: nested-class dotted convention — see the identical
+                // fallback in `abstract_bean_definition_get_bean_class_name`.
+                // "pkg.Outer.Inner" only resolves at "pkg/Outer$Inner", not
+                // "pkg/Outer/Inner"; without this a legitimately loadable
+                // nested-class bean (e.g. a test's static nested aspect
+                // class) fails to instantiate entirely.
+                let nested_cid = name.rfind('.').and_then(|last_dot| {
+                    let nested_dotted = format!("{}${}", &name[..last_dot], &name[last_dot + 1..]);
+                    let nested_internal = nested_dotted.replace('.', "/");
+                    ctx.class_id_by_name(&nested_internal)
+                        .or_else(|| ctx.ensure_class_initialized(&nested_internal).ok())
+                });
+                match nested_cid {
+                    Some(c) => c,
+                    None => {
+                        if dbg {
+                            eprintln!(
+                                "[resolve-shim] Missing: {internal} not on classpath (ensure_class_initialized ERR: {e:?})"
+                            );
+                        }
+                        return BeanClassResolution::Missing;
+                    }
                 }
-                return BeanClassResolution::Missing;
             }
         },
     };
@@ -2775,12 +2820,36 @@ fn bdru_register_bean_definition(ctx: &mut dyn NativeContext, args: &[Value]) ->
         if let Some(cn) = ctx.read_string(s) {
             if !cn.is_empty() {
                 let internal = cn.replace('.', "/");
-                let loadable = ctx.class_id_by_name(&internal).is_some()
+                let mut loadable = ctx.class_id_by_name(&internal).is_some()
                     || ctx.class_id_by_name(&cn).is_some()
                     // FIX(bug-B): see the getBeanClassName filter above — a
                     // loaded-set miss is NOT proof of absence; probe the classpath
                     // resource before dropping a legitimately-loadable bean.
                     || ctx.find_resource(&format!("{internal}.class")).is_some();
+                // FIX: nested-class dotted convention (see the identical
+                // fallback in `abstract_bean_definition_get_bean_class_name`
+                // above for the full rationale) — a bean class name like
+                // "pkg.Outer.Inner" is only loadable at "pkg/Outer$Inner",
+                // not "pkg/Outer/Inner". Without this, a legitimately
+                // loadable nested-class aspect bean (e.g.
+                // `<aop:aspect ref="testAspect">` pointing at a test's
+                // static nested aspect class) never even gets its
+                // `BeanDefinition` registered, so later lookups fail with
+                // "Can't determine type of bean" / NoSuchBeanDefinitionException.
+                if !loadable {
+                    if let Some(last_dot) = cn.rfind('.') {
+                        let nested_dotted = format!("{}${}", &cn[..last_dot], &cn[last_dot + 1..]);
+                        let nested_internal = nested_dotted.replace('.', "/");
+                        if ctx.class_id_by_name(&nested_internal).is_some()
+                            || ctx.class_id_by_name(&nested_dotted).is_some()
+                            || ctx
+                                .find_resource(&format!("{nested_internal}.class"))
+                                .is_some()
+                        {
+                            loadable = true;
+                        }
+                    }
+                }
                 if !loadable {
                     tracing::warn!(
                         "[bean-orphan] SKIP registering '{}' (class '{}' not loadable)",

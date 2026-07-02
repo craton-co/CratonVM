@@ -6120,8 +6120,31 @@ fn declared_methods_with_synthetic(
     // finds it; `native_method_invoke` builds the SerializedLambda when it is
     // actually called. (Private + declared on the proxy class itself, matching
     // the real lambda, so `getInheritableMethod` accepts it.)
-    if is_lambda_proxy_id(class_id) && ctx.lambda_proxy_host(class_id).is_some() {
-        if !methods.iter().any(|m| m.name == "writeReplace") {
+    if is_lambda_proxy_id(class_id) {
+        // The SAM method itself (e.g. `Supplier.get()`) has no real bytecode
+        // on the synthetic lambda proxy class, so it never shows up in
+        // `ctx.declared_methods`. Reflective callers that enumerate methods
+        // to find advisable targets — notably AspectJ pointcut matching
+        // during Spring autoproxying (`execution(* ...Supplier+.get())`) —
+        // see an empty candidate set and conclude no advisor applies, so the
+        // lambda is never wrapped in a proxy at all (`AopUtils.isAopProxy`
+        // false). Synthesize the entry the same way `getInterfaces()` already
+        // synthesizes `[SAM]` for lambda proxies (see above).
+        if let Some(meta) = ctx.lambda_proxy_serial_metadata(class_id) {
+            let already_present = methods
+                .iter()
+                .any(|m| m.name == meta.sam_method_name && m.descriptor == meta.sam_descriptor);
+            if !already_present {
+                methods.push(MethodMetadata {
+                    name: meta.sam_method_name,
+                    descriptor: meta.sam_descriptor,
+                    access_flags: 0x0001, // ACC_PUBLIC
+                    declaring_class_id: class_id,
+                    exceptions: Vec::new(),
+                });
+            }
+        }
+        if ctx.lambda_proxy_host(class_id).is_some() && !methods.iter().any(|m| m.name == "writeReplace") {
             methods.push(MethodMetadata {
                 name: "writeReplace".to_string(),
                 descriptor: "()Ljava/lang/Object;".to_string(),
