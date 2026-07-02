@@ -31075,6 +31075,24 @@ fn register_biginteger_arithmetic_overrides(registry: &mut NativeMethodRegistry)
     registry.register(bi, "toString", "()Ljava/lang/String;", native_bi_to_string);
     registry.register(bi, "intValue", "()I", native_bi_int_value);
     registry.register(bi, "longValue", "()J", native_bi_long_value);
+    // `pow` — the real bytecode delegates to interpreted square/multiply
+    // loops over int[] (squareToLen has no shadowable call boundary).
+    // `new BigDecimal(double)` computes 5^(-exponent) through here (52+
+    // squarings per ctor for a random double), which made Lucene
+    // TestUtil.nextLong's large-range branch time out ES codec tests.
+    // The native is spec-exact limb square-and-multiply.
+    registry.register(bi, "pow", "(I)Ljava/math/BigInteger;", native_bi_pow);
+    // `valueOf(long)` — constructors are JIT-banned (skip_list A1.4), so the
+    // real bytecode's `new BigInteger(long)` runs interpreted on every call;
+    // the valueOf→<init>(J)→Number.<init> frame chain was ~26% of watchdog
+    // samples in the ES doc-values timeout. Fresh instances are
+    // spec-compliant (the JDK's -16..16 cache is an optional optimization).
+    registry.register(
+        bi,
+        "valueOf",
+        "(J)Ljava/math/BigInteger;",
+        native_bi_value_of,
+    );
     // `compareTo` — the JDK 25 bytecode walks `mag:[I` word-by-word and uses
     // `Integer.compareUnsigned`. Our `mag:[I` is populated by `bi_alloc` for
     // values constructed via Rust natives, but BigIntegers that originate from
@@ -31146,6 +31164,45 @@ fn register_bigdecimal_arithmetic_overrides(registry: &mut NativeMethodRegistry)
     registry.register(bd, "intValue", "()I", native_bd_int_value);
     registry.register(bd, "longValue", "()J", native_bd_long_value);
     registry.register(bd, "doubleValue", "()D", native_bd_double_value);
+    // `setScale`/`toBigInteger` — the real bytecode routes through
+    // `divideAndRound` → MutableBigInteger long division, all interpreted;
+    // these natives are exact limb divmod + RoundingMode semantics
+    // (verified against HotSpot across every mode). `setScale(int,
+    // RoundingMode)` needs no entry: its bytecode reads `oldMode` and
+    // delegates to `(II)`, which lands here.
+    registry.register(
+        bd,
+        "setScale",
+        "(I)Ljava/math/BigDecimal;",
+        native_bd_set_scale,
+    );
+    registry.register(
+        bd,
+        "setScale",
+        "(II)Ljava/math/BigDecimal;",
+        native_bd_set_scale_rounding,
+    );
+    registry.register(
+        bd,
+        "toBigInteger",
+        "()Ljava/math/BigInteger;",
+        native_bd_to_big_integer,
+    );
+    // Hot constructors — `<init>` is JIT-banned (skip_list A1.4), so the
+    // real ctor bytecode runs interpreted on every allocation. Both natives
+    // are exact: `(D)` produces the double's exact binary expansion
+    // (sign/exponent/significand decomposition, matching the real ctor
+    // digit-for-digit — verified vs HotSpot incl. 0.1's 55-digit form),
+    // `(BigInteger)` mirrors the compactValFor split. `<init>` natives are
+    // dispatched in real-JDK mode (java/util/Random's seeded ctor already
+    // relies on this).
+    registry.register(bd, "<init>", "(D)V", native_bd_init_double);
+    registry.register(
+        bd,
+        "<init>",
+        "(Ljava/math/BigInteger;)V",
+        native_bd_init_bigint,
+    );
     registry.set_category(__prev_cat);
 }
 
@@ -31715,7 +31772,10 @@ fn native_bi_value_of(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(Value::Long(l)) => *l,
         _ => 0,
     };
-    let result = bi_alloc(ctx, &v.to_string());
+    // Fresh limb-backed object, no decimal round-trip. The JDK's -16..16
+    // constant cache is an optional optimization (the spec allows fresh
+    // instances), and value-equality is what all JDK bytecode relies on.
+    let result = bi_alloc_int(ctx, &bigint_from_i64(v));
     Ok(Some(Value::Object(Some(result))))
 }
 
@@ -31813,15 +31873,9 @@ fn native_bi_negate(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let a = bi_read(ctx, this);
-    let negated = if let Some(stripped) = a.strip_prefix('-') {
-        stripped.to_string()
-    } else if a == "0" {
-        "0".to_string()
-    } else {
-        format!("-{}", a)
-    };
-    let result = bi_alloc(ctx, &negated);
+    // Word-based limb path — sign flip only, no decimal round-trip.
+    let a = bi_read_int(ctx, this);
+    let result = bi_alloc_int(ctx, &a.neg_value());
     Ok(Some(Value::Object(Some(result))))
 }
 
@@ -31849,9 +31903,16 @@ fn native_bi_compare_to(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let a = bi_read(ctx, this);
-    let b = bi_read(ctx, other);
-    Ok(Some(Value::Int(bi_compare(&a, &b))))
+    // Word-based limb compare — the decimal path paid two O(words^2)
+    // mag->decimal conversions per call, and compareTo is on the hot path of
+    // both BC field arithmetic and Lucene's TestUtil.nextLong.
+    let a = bi_read_int(ctx, this);
+    let b = bi_read_int(ctx, other);
+    Ok(Some(Value::Int(match a.cmp(&b) {
+        std::cmp::Ordering::Less => -1,
+        std::cmp::Ordering::Equal => 0,
+        std::cmp::Ordering::Greater => 1,
+    })))
 }
 
 fn native_bi_equals(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -31863,8 +31924,10 @@ fn native_bi_equals(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let a = bi_read(ctx, this);
-    let b = bi_read(ctx, other);
+    // BigInt is normalized (no trailing zero limbs, canonical zero), so
+    // structural equality is value equality.
+    let a = bi_read_int(ctx, this);
+    let b = bi_read_int(ctx, other);
     Ok(Some(Value::Int(if a == b { 1 } else { 0 })))
 }
 
@@ -31873,9 +31936,10 @@ fn native_bi_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
-    // RBIGDEC.1 — `bi_read` already handles both the real-JDK and synthetic
-    // layouts; allocate a fresh Java string from the decimal representation.
-    let s = bi_read(ctx, this);
+    // Limb read + chunked (10^9-per-division) decimal conversion — same
+    // output as the old digit-at-a-time `bi_read`, one word-division per 9
+    // digits instead of one per digit.
+    let s = bi_read_int(ctx, this).to_decimal();
     let java_str = ctx.create_string(&s);
     Ok(Some(Value::Object(Some(java_str))))
 }
@@ -32098,6 +32162,7 @@ fn native_bi_hash_code(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
 }
 
 fn native_bi_pow(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    use crate::bigint::BigInt;
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
@@ -32106,12 +32171,33 @@ fn native_bi_pow(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
         Some(Value::Int(v)) => *v,
         _ => 0,
     };
-    let base = bi_read(ctx, this);
-    let mut result = "1".to_string();
-    for _ in 0..exp {
-        result = bi_mul_str(&result, &base);
+    // JDK: pow(negative) throws; pow(0) == ONE (even for a zero base).
+    if exp < 0 {
+        return Err(RuntimeError::ArithmeticException {
+            message: "Negative exponent".to_string(),
+        }
+        .into());
     }
-    let obj = bi_alloc(ctx, &result);
+    // Square-and-multiply on binary limbs. The old implementation was an
+    // O(exp) loop of decimal-string schoolbook multiplies with a full
+    // BigInteger heap allocation per step — `new BigDecimal(double)` runs
+    // 5^52 through here (real-JDK bytecode delegates to BigInteger.pow), so
+    // that O(exp) loop was a measured ~114us per BigDecimal(double) ctor in
+    // Lucene's TestUtil.nextLong hot path (ES codec/doc-values test hangs).
+    let base = bi_read_int(ctx, this);
+    let mut result = BigInt::from_decimal("1");
+    let mut sq = base;
+    let mut e = exp as u32;
+    while e > 0 {
+        if e & 1 == 1 {
+            result = result.mul(&sq);
+        }
+        e >>= 1;
+        if e > 0 {
+            sq = sq.mul(&sq);
+        }
+    }
+    let obj = bi_alloc_int(ctx, &result);
     Ok(Some(Value::Object(Some(obj))))
 }
 
@@ -32340,6 +32426,12 @@ fn register_bigdecimal_natives(registry: &mut NativeMethodRegistry) {
     registry.register(bd, "longValue", "()J", native_bd_long_value);
     registry.register(bd, "doubleValue", "()D", native_bd_double_value);
     registry.register(bd, "floatValue", "()F", native_bd_float_value);
+    registry.register(
+        bd,
+        "toBigInteger",
+        "()Ljava/math/BigInteger;",
+        native_bd_to_big_integer,
+    );
     registry.register(bd, "scale", "()I", native_bd_scale);
     registry.register(bd, "precision", "()I", native_bd_precision);
     registry.register(bd, "negate", "()Ljava/math/BigDecimal;", native_bd_negate);
@@ -32392,7 +32484,11 @@ fn bd_read_parts(ctx: &dyn NativeContext, this: ObjectRef) -> Option<(String, i3
         int_compact.to_string()
     } else {
         match ctx.get_field(this, iv_i) {
-            Value::Object(Some(bi)) => bi_read(ctx, bi),
+            // Chunked limb→decimal conversion (10^9 per division) — the
+            // digit-at-a-time `bi_read` path costs one long-division per
+            // digit and shows up on every toString/toPlainString of an
+            // inflated value.
+            Value::Object(Some(bi)) => bi_read_int(ctx, bi).to_decimal(),
             _ => "0".to_string(),
         }
     };
@@ -32566,7 +32662,78 @@ fn bd_write_into(ctx: &mut dyn NativeContext, this: ObjectRef, value: &str, scal
     ctx.unpin_native_roots(h);
 }
 
+/// Populate an existing real-layout `BigDecimal` from an exact
+/// `(unscaled, scale, precision)` triple — the write-into twin of
+/// `bd_alloc_bigint` (same compact/inflated split, same lazy-`precision`
+/// convention when the caller passes 0). Falls back to the decimal-string
+/// `bd_write_into` for the synthetic layout.
+fn bd_write_into_bigint(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    unscaled: &crate::bigint::BigInt,
+    scale: i32,
+    precision: i32,
+) {
+    if let Some((iv_i, sc_i, pr_i, ic_i)) = bd_layout(ctx) {
+        let le = unscaled.mag_le();
+        let compact: Option<i64> = if le.len() <= 2 {
+            let mag = (le.first().copied().unwrap_or(0) as u64)
+                | ((le.get(1).copied().unwrap_or(0) as u64) << 32);
+            if mag <= i64::MAX as u64 {
+                Some(if unscaled.is_neg() {
+                    -(mag as i64)
+                } else {
+                    mag as i64
+                })
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        if let Some(ic) = compact {
+            ctx.set_field(this, iv_i, Value::Object(None));
+            ctx.set_field(this, ic_i, Value::Long(ic));
+            ctx.set_field(this, sc_i, Value::Int(scale));
+            ctx.set_field(this, pr_i, Value::Int(precision));
+            return;
+        }
+        // Inflated: pin `this` across the BigInteger allocation (GC-SAFETY —
+        // see `bd_write_into`).
+        let h = ctx.pin_native_root(this);
+        let bi = bi_alloc_int(ctx, unscaled);
+        let this = ctx.read_native_pin(h, this);
+        ctx.set_field(this, iv_i, Value::Object(Some(bi)));
+        ctx.set_field(this, ic_i, Value::Long(BD_INFLATED));
+        ctx.set_field(this, sc_i, Value::Int(scale));
+        ctx.set_field(this, pr_i, Value::Int(precision));
+        ctx.unpin_native_roots(h);
+        return;
+    }
+    let value = apply_scale(&unscaled.to_decimal(), scale);
+    bd_write_into(ctx, this, &value, scale);
+}
+
+/// `5^n` as a limb `BigInt` via square-and-multiply.
+fn bigint_pow5(n: u32) -> crate::bigint::BigInt {
+    use crate::bigint::BigInt;
+    let mut result = BigInt::from_decimal("1");
+    let mut sq = BigInt::from_decimal("5");
+    let mut e = n;
+    while e > 0 {
+        if e & 1 == 1 {
+            result = result.mul(&sq);
+        }
+        e >>= 1;
+        if e > 0 {
+            sq = sq.mul(&sq);
+        }
+    }
+    result
+}
+
 fn native_bd_init_double(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    use crate::bigint::BigInt;
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
@@ -32575,9 +32742,113 @@ fn native_bd_init_double(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         Some(Value::Double(v)) => *v,
         _ => 0.0,
     };
-    let s = format!("{}", d);
-    let scale = s.find('.').map(|p| (s.len() - p - 1) as i32).unwrap_or(0);
-    bd_write_into(ctx, this, &s, scale);
+    // Exact JDK `BigDecimal(double)` semantics: the value is the double's
+    // EXACT binary expansion (`0.1` → the 55-digit decimal), never the
+    // shortest round-trip rendering `format!` produces. Mirrors the real
+    // ctor bytecode: sign/exponent/significand decomposition, normalize the
+    // significand to odd, then unscaled = sig<<exp (exp>0) or sig*5^-exp
+    // with scale=-exp (exp<0). Registered as a real-JDK override because
+    // constructors are JIT-banned (skip_list A1.4) so the real ctor runs
+    // interpreted forever — it dominated Lucene TestUtil.nextLong's
+    // large-range branch even after `BigInteger.pow` went native.
+    if !d.is_finite() {
+        return Err(RuntimeError::NumberFormatException {
+            message: "Infinite or NaN".to_string(),
+        }
+        .into());
+    }
+    let bits = d.to_bits();
+    let neg = (bits >> 63) != 0;
+    let biased = ((bits >> 52) & 0x7ff) as i32;
+    let frac = bits & ((1u64 << 52) - 1);
+    let (mut sig, mut exp) = if biased == 0 {
+        (frac << 1, -1075i32)
+    } else {
+        (frac | (1u64 << 52), biased - 1075)
+    };
+    if sig == 0 {
+        // JDK: intVal = BigInteger.ZERO, intCompact = 0, scale = 0,
+        // precision = 1 (also covers -0.0).
+        let h = ctx.pin_native_root(this);
+        let zero = bi_alloc_int(ctx, &BigInt::zero());
+        let this = ctx.read_native_pin(h, this);
+        if let Some((iv_i, sc_i, pr_i, ic_i)) = bd_layout(ctx) {
+            ctx.set_field(this, iv_i, Value::Object(Some(zero)));
+            ctx.set_field(this, ic_i, Value::Long(0));
+            ctx.set_field(this, sc_i, Value::Int(0));
+            ctx.set_field(this, pr_i, Value::Int(1));
+        } else {
+            let s = ctx.create_string("0");
+            ctx.set_field(this, BD_FIELD_VALUE, Value::Object(Some(s)));
+            ctx.set_field(this, BD_FIELD_SCALE, Value::Int(0));
+            ctx.set_field(this, BD_FIELD_PRECISION, Value::Int(1));
+        }
+        ctx.unpin_native_roots(h);
+        return Ok(None);
+    }
+    while sig & 1 == 0 {
+        sig >>= 1;
+        exp += 1;
+    }
+    let mag = BigInt::from_le_words(false, vec![sig as u32, (sig >> 32) as u32]);
+    let (unscaled, scale) = if exp == 0 {
+        (mag, 0)
+    } else if exp > 0 {
+        (mag.shl(exp as u32), 0)
+    } else {
+        (mag.mul(&bigint_pow5((-exp) as u32)), -exp)
+    };
+    let unscaled = if neg { unscaled.neg_value() } else { unscaled };
+    bd_write_into_bigint(ctx, this, &unscaled, scale, 0);
+    Ok(None)
+}
+
+/// `BigDecimal(BigInteger)` — intVal = the argument (kept only when
+/// inflated, like the JDK's `compactValFor` split), scale 0, lazy precision.
+/// Registered as a real-JDK override for the same ctor-JIT-ban reason as
+/// `<init>(D)`.
+fn native_bd_init_bigint(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    let bi_obj = match args.get(1) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => {
+            return Err(RuntimeError::NullPointerException { message: None }.into());
+        }
+    };
+    let v = bi_read_int(ctx, bi_obj);
+    if let Some((iv_i, sc_i, pr_i, ic_i)) = bd_layout(ctx) {
+        let le = v.mag_le();
+        let compact: Option<i64> = if le.len() <= 2 {
+            let mag = (le.first().copied().unwrap_or(0) as u64)
+                | ((le.get(1).copied().unwrap_or(0) as u64) << 32);
+            if mag <= i64::MAX as u64 {
+                Some(if v.is_neg() { -(mag as i64) } else { mag as i64 })
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        match compact {
+            Some(ic) => {
+                ctx.set_field(this, iv_i, Value::Object(None));
+                ctx.set_field(this, ic_i, Value::Long(ic));
+            }
+            None => {
+                // Inflated: store the caller's BigInteger itself, like the
+                // real ctor (no copy, no fresh allocation).
+                ctx.set_field(this, iv_i, Value::Object(Some(bi_obj)));
+                ctx.set_field(this, ic_i, Value::Long(BD_INFLATED));
+            }
+        }
+        ctx.set_field(this, sc_i, Value::Int(0));
+        ctx.set_field(this, pr_i, Value::Int(0));
+        return Ok(None);
+    }
+    bd_write_into_bigint(ctx, this, &v, 0, 0);
     Ok(None)
 }
 
@@ -32634,6 +32905,12 @@ fn native_bd_value_of_double(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
 /// scale (Rust `{}`-formatting strips trailing zeros: `10.0` → "10") and
 /// precision (an `f64` holds ~15-16 significant digits). Prefers the real-JDK
 /// `intCompact`/`intVal` layout, falling back to the synthetic decimal string.
+/// Build a limb `BigInt` from an `i64` without a decimal round-trip.
+fn bigint_from_i64(v: i64) -> crate::bigint::BigInt {
+    let mag = v.unsigned_abs();
+    crate::bigint::BigInt::from_le_words(v < 0, vec![mag as u32, (mag >> 32) as u32])
+}
+
 fn bd_unscaled_bigint(ctx: &dyn NativeContext, this: ObjectRef) -> (crate::bigint::BigInt, i32) {
     use crate::bigint::BigInt;
     let scale = bd_scale_of(ctx, this);
@@ -32643,7 +32920,7 @@ fn bd_unscaled_bigint(ctx: &dyn NativeContext, this: ObjectRef) -> (crate::bigin
             _ => BD_INFLATED,
         };
         if ic != BD_INFLATED {
-            return (BigInt::from_decimal(&ic.to_string()), scale);
+            return (bigint_from_i64(ic), scale);
         }
         if let Value::Object(Some(bi)) = ctx.get_field(this, iv_i) {
             return (bi_read_int(ctx, bi), scale);
@@ -32674,11 +32951,61 @@ fn bigint_mul_pow10(bi: &crate::bigint::BigInt, n: i32) -> crate::bigint::BigInt
 
 /// Construct a `BigDecimal` from an exact `(unscaled, scale)` pair (the inverse
 /// of `bd_unscaled_bigint`).
+///
+/// Real-JDK layout: write `intCompact`/`intVal`/`scale` directly from the limb
+/// value — no decimal rendering. `precision` is written as the JDK's lazy `0`
+/// sentinel (real bytecode leaves it 0 too; `native_bd_precision` computes and
+/// caches on demand), and `intVal` stays null on the compact path exactly as
+/// `BigDecimal.valueOf(long, int)` leaves it — every JDK bytecode read goes
+/// through `inflated()`, which handles null. The old implementation rendered
+/// the value to a decimal string and re-parsed it (digit count, `i64` parse,
+/// `decimal_to_mag_words`) on every arithmetic result.
 fn bd_alloc_bigint(
     ctx: &mut dyn NativeContext,
     unscaled: &crate::bigint::BigInt,
     scale: i32,
 ) -> ObjectRef {
+    if let Some((iv_i, sc_i, pr_i, ic_i)) = bd_layout(ctx) {
+        // Compact iff |unscaled| <= i64::MAX (Long.MIN_VALUE is the INFLATED
+        // sentinel, so exactly -2^63 must stay inflated, matching the JDK's
+        // compactValFor).
+        let le = unscaled.mag_le();
+        let compact: Option<i64> = if le.len() <= 2 {
+            let mag = (le.first().copied().unwrap_or(0) as u64)
+                | ((le.get(1).copied().unwrap_or(0) as u64) << 32);
+            if mag <= i64::MAX as u64 {
+                Some(if unscaled.is_neg() {
+                    -(mag as i64)
+                } else {
+                    mag as i64
+                })
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let obj = alloc_concurrent_synthetic(ctx, "java/math/BigDecimal", 3);
+        if let Some(ic) = compact {
+            ctx.set_field(obj, iv_i, Value::Object(None));
+            ctx.set_field(obj, ic_i, Value::Long(ic));
+            ctx.set_field(obj, sc_i, Value::Int(scale));
+            ctx.set_field(obj, pr_i, Value::Int(0));
+            return obj;
+        }
+        // Inflated: allocate the backing BigInteger. Pin `obj` across that
+        // allocation (GC-SAFETY — see `bd_alloc`).
+        let h = ctx.pin_native_root(obj);
+        let bi = bi_alloc_int(ctx, unscaled);
+        let obj = ctx.read_native_pin(h, obj);
+        ctx.set_field(obj, iv_i, Value::Object(Some(bi)));
+        ctx.set_field(obj, ic_i, Value::Long(BD_INFLATED));
+        ctx.set_field(obj, sc_i, Value::Int(scale));
+        ctx.set_field(obj, pr_i, Value::Int(0));
+        ctx.unpin_native_roots(h);
+        return obj;
+    }
+    // Synthetic-stub layout: fall back to the decimal-string path.
     let value = apply_scale(&unscaled.to_decimal(), scale);
     bd_alloc(ctx, &value, scale)
 }
@@ -32846,14 +33173,50 @@ fn native_bd_to_plain_string(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     Ok(Some(Value::Object(Some(java_str))))
 }
 
+/// The unscaled value with the fraction dropped (truncation toward zero) —
+/// the integer part `BigDecimal.toBigInteger()` returns. Shared by
+/// `toBigInteger`/`longValue`/`intValue`.
+fn bd_truncated_bigint(ctx: &dyn NativeContext, this: ObjectRef) -> crate::bigint::BigInt {
+    use crate::bigint::BigInt;
+    let (u, scale) = bd_unscaled_bigint(ctx, this);
+    if scale == 0 {
+        return u;
+    }
+    if scale < 0 {
+        return bigint_mul_pow10(&u, -scale);
+    }
+    let mut divisor_dec = String::with_capacity(scale as usize + 1);
+    divisor_dec.push('1');
+    divisor_dec.push_str(&"0".repeat(scale as usize));
+    u.div(&BigInt::from_decimal(&divisor_dec))
+}
+
+/// Low `bits` of a `BigInt`'s two's-complement representation — the
+/// narrowing `BigInteger.intValue()`/`longValue()` semantics.
+fn bigint_low_twos_complement(v: &crate::bigint::BigInt, bits: u32) -> u64 {
+    let le = v.mag_le();
+    let low = (le.first().copied().unwrap_or(0) as u64)
+        | ((le.get(1).copied().unwrap_or(0) as u64) << 32);
+    let low = if v.is_neg() { low.wrapping_neg() } else { low };
+    if bits >= 64 {
+        low
+    } else {
+        low & ((1u64 << bits) - 1)
+    }
+}
+
 fn native_bd_int_value(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let s = bd_read(ctx, this);
-    let v: f64 = s.parse().unwrap_or(0.0);
-    Ok(Some(Value::Int(v as i32)))
+    // JDK narrowing conversion: toBigInteger().intValue() — the low 32
+    // two's-complement bits of the truncated value. The old f64 path both
+    // saturated (f64→i32 casts clamp) and lost precision past 2^53.
+    let t = bd_truncated_bigint(ctx, this);
+    Ok(Some(Value::Int(
+        bigint_low_twos_complement(&t, 32) as u32 as i32
+    )))
 }
 
 fn native_bd_long_value(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -32861,8 +33224,24 @@ fn native_bd_long_value(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Long(0))),
     };
-    let v: f64 = bd_read(ctx, this).parse().unwrap_or(0.0);
-    Ok(Some(Value::Long(v as i64)))
+    // JDK narrowing conversion: low 64 two's-complement bits — see intValue.
+    let t = bd_truncated_bigint(ctx, this);
+    Ok(Some(Value::Long(bigint_low_twos_complement(&t, 64) as i64)))
+}
+
+/// `BigDecimal.toBigInteger()` — truncate the fraction (setScale(0, DOWN))
+/// and return the integer part. Registered as a real-JDK override because the
+/// real bytecode path (`setScale(0,1)` → `divideAndRound` → MutableBigInteger
+/// long division, all interpreted) dominates Lucene `TestUtil.nextLong`'s
+/// large-range branch (ES codec/doc-values test timeouts).
+fn native_bd_to_big_integer(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let t = bd_truncated_bigint(ctx, this);
+    let obj = bi_alloc_int(ctx, &t);
+    Ok(Some(Value::Object(Some(obj))))
 }
 
 fn native_bd_double_value(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {

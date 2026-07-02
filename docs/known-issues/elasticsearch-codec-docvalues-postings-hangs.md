@@ -96,60 +96,97 @@ C:\craton\CratonVM-elasticsearch-nojit-suite-20260702\apps\elasticsearch-suite-r
 This family bundles **at least two distinct root causes**, not one. Diagnosed
 with `--stack-dump-on-timeout N` against a worktree build
 (`C:\craton\CratonVM-escodechang`, binary `cratonvm-escodechang.exe`).
+Watchdog-sample histograms (thousands of dumps per run) were used as a poor
+man's profiler throughout; frames parked at `pc=0` = threads caught at frame
+entry = interpreter call overhead dominating.
 
-### Cause 1 (doc-values classes): `BigDecimal.setScale` — real bug, partially fixed
+### Registration discovery that reframed the whole fix
+
+The full `register_biginteger_natives`/`register_bigdecimal_natives` blocks
+(including `pow`, `setScale`, and every `<init>`) live inside
+`register_synthetic_overrides`, which **only runs under `--synthetic-jdk`**.
+In the default real-JDK mode, only the lean
+`register_biginteger_arithmetic_overrides`/`register_bigdecimal_arithmetic_overrides`
+sets are dispatched. So in real mode `BigInteger.pow`, `BigDecimal.setScale`,
+and all BigDecimal constructors were running **real JDK bytecode,
+interpreted** — and constructors are JIT-banned wholesale (`vm/src/jit/
+skip_list.rs`, the A1.4 `<init>` ban), so they can never warm up. Any fix
+placed in the synthetic-only block is inert in every suite run.
+
+### Cause 1 (doc-values classes): interpreted `java.math` hot path — FIXED
 
 `DocValuesForUtilTests.testEncodeDecode` calls
-`org.apache.lucene.tests.util.TestUtil.nextLong(random(), 0, PackedInts.maxValue(bpv))`
-up to `iterations × NUMERIC_BLOCK_SIZE` times (up to ~8M calls for large
-`bpv`/block sizes). Whenever the requested range exceeds `Integer.MAX_VALUE`
-(roughly half of all calls, `bpv >= 32`), `TestUtil.nextLong` falls back to
+`TestUtil.nextLong(random(), 0, PackedInts.maxValue(bpv))` up to
+`iterations × NUMERIC_BLOCK_SIZE` times (up to ~8M). For ranges >
+`Integer.MAX_VALUE` (~half the calls), `TestUtil.nextLong` runs
 `new BigDecimal(range).multiply(new BigDecimal(random.nextDouble())).toBigInteger()`.
-`BigDecimal.toBigInteger()` calls `setScale(0, ROUND_DOWN)`.
+On CratonVM that pipeline cost **~945µs per call** (HotSpot: ~1.6µs), from:
 
-**Found:** `native_bd_set_scale`/`native_bd_set_scale_rounding`
-(`native-builtins/src/lib.rs`) read the BigDecimal's exact decimal string,
-**parsed it as `f64`**, then reformatted with `format!("{:.prec$}", v, ...)`.
-This is two bugs in one:
+- `new BigDecimal(double)` (interpreted ctor) → `BigInteger.pow` computing
+  `5^(-exponent)` (~52 squarings per random double) — pow itself interpreted.
+- `toBigInteger()` → `setScale(0, DOWN)` → interpreted `divideAndRound` →
+  `MutableBigInteger` long division.
+- `BigInteger.valueOf(J)` → interpreted `new BigInteger(long)` 3-4× per call
+  (the `valueOf`→`<init>(J)`→`Number.<init>` frame chain alone was ~26% of
+  watchdog samples).
+- The *active* lean natives `compareTo`/`equals`/`negate`/`toString` still
+  paid an O(words²) mag→decimal-string conversion per call, and
+  `setScale`/`intValue`/`longValue` (synthetic-block versions) round-tripped
+  through `f64` — silently wrong beyond ~17 significant digits on top of slow.
 
-1. **Correctness** — `f64` has ~17 significant decimal digits; any unscaled
-   value wider than that (routine for `BigDecimal(double)`, whose exact
-   decimal expansion can run to dozens of digits) silently lost precision.
-   `123456789012345678901234567890.5.setScale(0, HALF_UP)` returned the wrong
-   answer.
-2. **Performance** — Rust's `f64::from_str` falls into a slow arbitrary-
-   precision path for long decimal strings. Measured **~580µs per call**
-   (vs HotSpot's ~1.6µs) — roughly 360×, and this path runs up to ~4M times
-   in `testEncodeDecode`'s worst case.
+**Fix (all in `native-builtins/src/lib.rs`, registered in the real-JDK lean
+override sets):**
 
-**Fix:** rewrote both natives to operate on the existing binary limb-based
-`crate::bigint::BigInt` (the read/write boundary already used by
-`negate`/`abs`/`signum`/`precision` — see
-`docs/internal/gaps/biginteger-limb-rewrite-scope.md`), implementing exact
-Java `RoundingMode` semantics (UP/DOWN/CEILING/FLOOR/HALF_UP/HALF_DOWN/
-HALF_EVEN/UNNECESSARY) via `divmod`+`shl`+`test_bit`, never touching `f64`.
-Verified byte-for-byte against HotSpot across 21 cases (all rounding modes,
-negative values, a 31-significant-digit operand) and against the crate's
-8 `bigint::tests::*` differential tests (`cargo test -p cratonvm-native-builtins
---lib bigint::`, all pass).
+- New exact natives: `BigInteger.pow` (limb square-and-multiply),
+  `BigDecimal.setScale(I)`/`(II)` (limb divmod + exact RoundingMode
+  semantics incl. UNNECESSARY-throws), `BigDecimal.toBigInteger`,
+  `BigInteger.valueOf(J)`, `BigDecimal.<init>(D)` (exact binary expansion via
+  sign/exponent/significand decomposition — `0.1` produces the 55-digit
+  form), `BigDecimal.<init>(BigInteger)` (compactValFor split, stores the
+  caller's BigInteger only when inflated). `<init>` natives are dispatched
+  in real-JDK mode — `java.util.Random(J)`'s seeded LCG ctor already
+  depends on that.
+- Migrated to the limb `BigInt` path: `compareTo`/`equals`/`negate`/
+  `toString` (BigInteger), `intValue`/`longValue` (BigDecimal — now correct
+  two's-complement narrowing), `bd_alloc_bigint`/`bd_write_into_bigint`
+  (direct `intCompact`/`intVal` field writes, JDK-lazy `precision=0`, null
+  `intVal` on the compact path exactly like `BigDecimal.valueOf(long,int)`).
 
-**Measured impact:** `setScale(0, DOWN)` on a ~56-digit operand: 580µs → 408µs
-per call (~30% faster). Full `BigInteger.valueOf(MAX).multiply(...).toBigInteger()`
-pipeline: 946µs → 774µs per call (~18% faster).
+**Verified:** three Java differential batteries run byte-identical to
+HotSpot 25 — `SetScaleCorrect` (21 cases, every rounding mode, 31-digit
+operand), `MathCorrect` (pow edge cases incl. `0^0`/negative-exponent
+message, toBigInteger/longValue narrowing, a 50-round seeded
+`TestUtil.nextLong`-dance checksum, `new BigDecimal(0.1)`'s exact 55-digit
+expansion), `BdCanary` (serialization round-trip of a natively-built
+compact BigDecimal, HashMap/TreeMap equals-vs-compareTo semantics, lazy
+`precision()`, `valueOf` value semantics). The crate's 8
+`bigint::tests::*` differential tests pass.
 
-**Not sufficient alone.** `DocValuesForUtilTests` still does not complete
-within 290s after this fix (confirmed via a full untimed rerun). A further
-microbenchmark (`new BigInteger("123456789012345678901234567890")` in a
-tight loop, no arithmetic) measured **~400-770µs per plain BigInteger
-construction** — i.e. the *allocation and native-dispatch* cost alone, not
-any decimal-string arithmetic, dominates. This is the same class of gap
-`docs/internal/gaps/biginteger-limb-rewrite-scope.md` already scopes for
-BigInteger's own hot ops (mul/div/mod/modPow, already migrated to
-`BigInt` in dev commits `eb0d06b2`/`607393d4`) — `BigDecimal`'s remaining
-natives (`add`/`subtract`/`multiply`/`divide`/`intValue`/`longValue`/
-`doubleValue`, still decimal-string-based) and the general per-object
-native-allocation path are the likely next-highest-value targets, but a
-full close of the ~300-500× gap is out of scope for a single fix.
+**Measured (2000-iteration microbenches, same machine, same run):**
+`5.pow(53)` 228ms → **8ms**; `setScale(0,DOWN)` on ~50-digit operands
+1161ms → **7ms**; the full nextLong pipeline 1891ms → **38ms** (~945µs →
+~15µs per call, stable at 20k iterations — no JIT warmup dependence).
+
+**Residual for this class:** after the fix, watchdog samples show the
+math work is gone from the profile entirely; **100% of deep leaves are the
+`random()` chain** — `RandomizedContext.context` →
+`WeakHashMap.getTable`/`getPerThread`. `CRATONVM_DBG_JITC=1` shows why:
+`RandomizedContext.context` (a `static synchronized` method) hits a
+permanent `compile-bail backend_attempted=true`, and
+`WeakHashMap.getTable`/`expungeStaleEntries` `bg-compile` at C1 but never
+publish code (no `full-compile` line, silently). So the per-iteration
+`random()` calls run interpreted forever. That is carrotsearch/Lucene
+framework code — not shadowable with natives under the project's
+JDK-intrinsics-only rule; the fix belongs to the JIT workstream
+(synchronized-method compilation + the silent bg-compile no-publish).
+
+End-to-end after the fix (seed `B17AC9D3E1F2A0C4`): the class no longer
+hard-hangs — it runs to randomizedtesting's own 580s suite timeout
+(`-Dtests.timeoutSuite=580000` from the runner), `testEncodeDecode` is
+abandoned there while `testEncodeDecodeBitsPerValue` PASSES, and the
+process exits cleanly at 603s total (was: killed by the runner at 300s
+with no test completing). The remaining gap to the 300s envelope is the
+interpreted `random()` chain above.
 
 ### Cause 2 (postings classes): general interpreter throughput, NOT a deadlock
 
@@ -163,23 +200,20 @@ full close of the ~300-500× gap is out of scope for a single fix.
 over the run show the thread's call site continuously advancing through
 normal indexing/flush code (`invertTerm` → `addTerm` → `finishDocument` →
 `doAfterDocument` → `ramBytesUsed` → back into `updateDocuments` for the
-next document, etc. — never stuck at one PC). The lock frames
-(`ConcurrentApproximatePriorityQueue.add`/`ReentrantLock`) are transient,
-not stuck. This class is simply CPU-bound interpreted-execution work
+next document, etc. — never stuck at one PC). The lock frames are
+transient, not stuck. This class is CPU-bound interpreted-execution work
 (document indexing, term inversion, flush bookkeeping) that HotSpot's JIT
-finishes in ~54s and CratonVM's current interpreter/allocation throughput
-cannot finish within 300s. `RandomPostingsTester.testTerms` (used by
-`BasePostingsFormatTestCase.testRandom`, inherited by all three postings
-classes in this family) also spawns 2+ raw `Thread`s per invocation and
-`.join()`s them — investigated as a possible deadlock source, but CratonVM's
-`thread_start`/`thread_join` completion path (`vm/src/vm/vm_exec.rs`) already
-handles both normal-return and uncaught-exception thread termination
-through the same `mark_dead` + termination-monitor-notify path, so this is
-not implicated here.
+finishes in ~54s. `RandomPostingsTester.testTerms` (used by
+`testRandom` in all three postings classes) spawns raw `Thread`s and
+`.join()`s them — investigated as a deadlock candidate and ruled out
+(`thread_start`/`thread_join` in `vm/src/vm/vm_exec.rs` handle both
+normal-return and uncaught-exception termination through the same
+`mark_dead` + termination-monitor-notify path).
 
-**Status:** still open. Cause 1 has a landed, verified, low-risk partial fix
-(the `setScale` correctness bug is real and fixed regardless of whether it
-alone resolves the timeout). Cause 2 needs no code fix identified yet — it
-needs the same broader interpreter/allocation throughput work as Cause 1's
-residual. Full resolution of all 7 classes requires that broader effort, not
-a single native-function patch.
+**Status:** still open as a *suite result* (the classes don't pass within
+300s yet), but the `java.math` layer is fixed, verified, and a large
+across-the-board win for anything BigDecimal/BigInteger-heavy. The
+remaining work items are both JIT-workstream items, not math natives:
+(a) `static synchronized` methods permanently bail the JIT backend;
+(b) some C1 bg-compiles never publish (`WeakHashMap.getTable`);
+(c) the indexing-pipeline throughput gap behind the postings classes.
