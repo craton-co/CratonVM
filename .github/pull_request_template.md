@@ -14,6 +14,9 @@ Brief description of what this PR does.
 - [ ] `cargo clippy --workspace --all-targets -- -D warnings` run
 - [ ] `cargo fmt --all --check` run
 - [ ] `cargo test --workspace` run
+- [ ] Coverage checked or intentionally deferred; release-ready branches should meet the 85% line coverage target
+- [ ] Semantic difftest smoke checked or intentionally deferred
+- [ ] Fuzz build smoke checked or intentionally deferred
 - [ ] Known failures or skipped checks explained
 - [ ] New tests added for new functionality (if applicable)
 - [ ] `CHANGELOG.md` updated under the Unreleased section (for user-facing changes)

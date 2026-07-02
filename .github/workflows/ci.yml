@@ -213,6 +213,27 @@ jobs:
       - name: Run the semantic differential gate (advisory)
         run: cargo run -p cratonvm-difftest --bin cratonvm-difftest -- gate --corpus difftest/seeds
 
+  # Fuzz build smoke. This is intentionally advisory until the standalone fuzz
+  # workspace and native-builtins feature set are aligned; keeping it visible in
+  # CI prevents the fuzz harness from drifting silently.
+  fuzz-smoke:
+    name: Fuzz build smoke (advisory)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install nightly Rust
+        uses: dtolnay/rust-toolchain@nightly
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-fuzz
+        uses: taiki-e/install-action@cargo-fuzz
+
+      - name: Build fuzz targets (advisory)
+        run: cargo +nightly fuzz build
+
   # Future CI hardening — not yet enabled. Uncomment once the
   # corresponding gates are ready to be enforced.
   #

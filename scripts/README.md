@@ -32,6 +32,7 @@ capture-hotspot-baseline.sh - Captures HotSpot C2 median performance for 24 benc
 capture-hotspot-baseline.ps1 - PowerShell port of the above, byte-identical JSON output for same inputs. Used on Windows for local baseline refresh.
 check-no-diag-prints.sh - Forbids debug-trace eprintln!/println! markers ([WP*], [DIAG*], [TRACE*], etc.) in landed code. Excludes [cratonvm], tracing macros, test code, and env-gated diagnostics.
 release-crates-dry-run.ps1 - Prints, or with -Execute runs, the crates.io package-list/package/publish-dry-run checklist in dependency order. See docs/RELEASE_READINESS.md.
+check-lcov-threshold.ps1 - Reads an LCOV report and fails if line coverage is below the requested threshold. CI uses it in advisory mode for the 85% coverage target.
 jck-matrix.sh - Regenerates docs/jck-compliance.md from JavaTest-format JCK report summary.txt. Computes Pass% per API section. Supports --merge to preserve hand-curated Open-bugs column.
 pgo.sh - Profile-guided optimization recipe: 1) instrumented build (profile-generate), 2) run bench suite, 3) merge profiles (llvm-profdata), 4) optimized rebuild (profile-use). Uses +sse4.2,+pclmulqdq target features.
 pgo.cmd - Windows companion to pgo.sh with identical 4-phase flow.

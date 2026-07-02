@@ -39,6 +39,11 @@ jobs:
         continue-on-error: true
         run: cargo llvm-cov --workspace --lcov --output-path lcov.info
 
+      - name: Check 85% line coverage target (advisory)
+        continue-on-error: true
+        shell: pwsh
+        run: scripts/check-lcov-threshold.ps1 -Path lcov.info -LineThreshold 85 -AllowMissing
+
       - name: Upload coverage report
         uses: actions/upload-artifact@v4
         with:
