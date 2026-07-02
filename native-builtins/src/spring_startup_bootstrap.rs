@@ -1041,12 +1041,19 @@ pub fn register(registry: &mut NativeMethodRegistry) {
 
     // sportme: the actual throw site is `AbstractBeanDefinition.getBeanClass()`,
     // which throws ISE("Bean class name [%s] has not been resolved into an
-    // actual Class") when beanClass is a String (not yet resolved). Intercept
-    // to return Object.class as a placeholder, which causes Spring to skip
-    // instantiation later because Object can't be a configuration class. Better:
-    // try to read beanClass field; if it's a Class mirror, return it. If it's
-    // a String, return null (the caller in Spring usually handles null
-    // gracefully — for sportme, RedisHttpSessionConfiguration is then skipped).
+    // actual Class") when beanClass is a String (not yet resolved). This used
+    // to unconditionally return null for a String beanClass WITHOUT ever
+    // attempting resolution — tolerant for sportme's partial classpath (an
+    // unresolvable class silently skips the bean), but it also meant a
+    // perfectly loadable class whose name just hadn't been resolved YET (no
+    // prior `resolveBeanClass()` call happened to run first) permanently
+    // read as "no class", surfacing as "No bean class specified on bean
+    // definition" downstream (DestroyMethodInferenceTests::xml()'s `x8`,
+    // Spr16022Tests' `bean1` — both dotted-nested-class XML bean
+    // definitions). Delegate to the same `resolve_bean_class_field` used by
+    // `resolveBeanClass()` (dot-vs-dollar nested-class retry included) so a
+    // genuinely loadable class resolves here too; still return null (not an
+    // ISE) on `Missing`/`NoClass` to preserve the sportme-tolerant behavior.
     registry.register(
         "org/springframework/beans/factory/support/AbstractBeanDefinition",
         "getBeanClass",
@@ -1056,25 +1063,11 @@ pub fn register(registry: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(Some(Value::Object(None))),
             };
-            // Try field-by-name lookup; in Spring the field is named "beanClass"
-            // and is private. If the field holds a Class mirror, return it.
-            // If it's a String (resolved bean class name), return null so the
-            // caller can fall back to other resolution paths.
-            let v = ctx.get_field_by_name(this, "beanClass");
-            match v {
-                Value::Object(Some(o)) => {
-                    let cid = ctx.class_id_of_object(o);
-                    let name = ctx.class_name_of_id(cid).unwrap_or_default();
-                    if name == "java/lang/Class" {
-                        Ok(Some(Value::Object(Some(o))))
-                    } else {
-                        // String or other — bean class name not yet resolved.
-                        // Return null instead of throwing ISE so Spring skips
-                        // the bean during preInstantiateSingletons.
-                        Ok(Some(Value::Object(None)))
-                    }
+            match resolve_bean_class_field(ctx, this) {
+                BeanClassResolution::Resolved(mirror) => Ok(Some(Value::Object(Some(mirror)))),
+                BeanClassResolution::Missing | BeanClassResolution::NoClass => {
+                    Ok(Some(Value::Object(None)))
                 }
-                _ => Ok(Some(Value::Object(None))),
             }
         },
     );
