@@ -3981,6 +3981,9 @@ impl JitCache {
             method_name,
             descriptor,
         };
+        if let Some((_old_key, old_cm)) = self.methods.get(&h) {
+            unregister_jit_code_range(old_cm.entry_ptr() as usize);
+        }
         let arc = Arc::new(compiled);
         // Stage 5 — register this method's code range for the GC RBP-chain
         // walker. Enabled when the precise gate is on (the registry is consulted
@@ -6152,6 +6155,7 @@ fn try_compile_inner(
         cached.class_name, cached.method_name, cached.method_descriptor
     );
 
+    x64::set_pending_verified_max_stack(cached.max_stack as usize);
     let mut compiled = x64::compile_with_param_slots(
         code,
         code_len,
@@ -8812,6 +8816,44 @@ mod tests {
 
         let result = cache.get(&class, &method, &desc);
         assert!(result.is_some());
+    }
+
+    #[test]
+    fn test_jit_cache_put_replacement_unregisters_old_code_range() {
+        let mut cache = JitCache::new();
+        let class: Arc<str> = Arc::from("ReplaceClass");
+        let method: Arc<str> = Arc::from("replaceMethod");
+        let desc: Arc<str> = Arc::from("()V");
+
+        let mut old_buf = ExecutableBuffer::new(64).expect("alloc failed");
+        old_buf.emit(&[0xC3]); // RET
+        cache.put(
+            class.clone(),
+            method.clone(),
+            desc.clone(),
+            CompiledMethod::new(old_buf),
+        );
+        let old = cache
+            .get(&class, &method, &desc)
+            .expect("old compiled method");
+        let old_entry = old.entry_ptr() as usize;
+        register_jit_code_range(old_entry, old.code_len(), Arc::as_ptr(&old) as usize);
+        assert!(lookup_jit_code_range(old_entry).is_some());
+
+        let mut new_buf = ExecutableBuffer::new(64).expect("alloc failed");
+        new_buf.emit(&[0xC3]); // RET
+        cache.put(
+            class.clone(),
+            method.clone(),
+            desc.clone(),
+            CompiledMethod::new(new_buf),
+        );
+
+        assert!(lookup_jit_code_range(old_entry).is_none());
+        unregister_jit_code_range(old_entry);
+        if let Some(new_cm) = cache.get(&class, &method, &desc) {
+            unregister_jit_code_range(new_cm.entry_ptr() as usize);
+        }
     }
 
     #[test]
