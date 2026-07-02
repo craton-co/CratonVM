@@ -145,6 +145,16 @@ pub enum Reason {
     /// Reject upstream until the analyzer learns to resolve the CP
     /// entry or the emitter grows a numeric-only `ldc` arm.
     LoadConstant,
+    /// Direct annotation API users can pass `MethodAnnotations` with
+    /// `gpu_exclude` set; that opt-out takes precedence over any
+    /// `gpu_kernel` hint.
+    GpuExcluded,
+    /// `frem` / `drem` require IEEE remainder lowering; the PTX emitter
+    /// rejects them defensively, so reject them at admission too.
+    FloatRemainder,
+    /// `lcmp` / `fcmp*` / `dcmp*` push `-1/0/1` and have no lowering in
+    /// the element-wise subset.
+    Compare,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -166,16 +176,17 @@ pub fn analyze(method: &ClassFileMethod) -> OffloadVerdict {
 /// loosen specific rejection reasons (see §2.4 of the GPU phase-1
 /// spec).
 ///
-/// When `annotations.gpu_kernel` is `None`, this function is identical
-/// in behaviour to [`analyze`]. When a `GpuKernelAttrs` is present, the
-/// associated [`AdmissionHint`] selectively relaxes the bytecode scan:
+/// When `annotations` is the default value, this function is identical
+/// in behaviour to [`analyze`]. If `annotations.gpu_exclude` is present,
+/// the method is rejected before any other checks. When a `GpuKernelAttrs`
+/// is present, the associated [`AdmissionHint`] selectively relaxes the
+/// bytecode scan:
 ///
 /// - `AdmissionHint::Strict`           — no loosening.
 /// - `AdmissionHint::AllowAllocation`  — `newarray` of a primitive
 ///   component whose size comes from a method parameter is accepted.
-/// - `AdmissionHint::AllowDivByZero`   — the analyzer never injects a
-///   zero-divisor guard today; this hint is plumbed through for
-///   completeness and for Phase-2 lowering to read.
+/// - `AdmissionHint::AllowDivByZero`   — recorded in the
+///   [`KernelSignature`] so lowering skips integer zero-divisor guards.
 /// - `AdmissionHint::AllowIntrinsicCalls` — `invokestatic` is accepted
 ///   on the assumption that the lowering layer will handle the
 ///   intrinsics listed in §2.4 (`Math.sqrt`/`sin`/`cos`/`exp`/`log`).
@@ -183,6 +194,10 @@ pub fn analyze_with_annotations(
     method: &ClassFileMethod,
     annotations: &MethodAnnotations,
 ) -> OffloadVerdict {
+    if annotations.gpu_exclude.is_some() {
+        return OffloadVerdict::Rejected(Reason::GpuExcluded);
+    }
+
     // Phase 9 #2 — non-static methods are now admitted if their body
     // uses `aload_0` only as the immediate-getfield-receiver
     // pattern. The receiver's accessed fields become extra kernel
@@ -318,6 +333,7 @@ pub fn analyze_with_annotations(
         // instead of a racing plain `st.global.<suffix>` for the scalar
         // return. See `KernelSignature::is_reduction` for the contract.
         is_reduction: is_dot_reduction,
+        allow_div_by_zero: matches!(hint, AdmissionHint::AllowDivByZero),
     })
 }
 
@@ -388,23 +404,11 @@ fn scan_bytecode(
     // fallback) are acceptable, false-positives (a wrong `atom.add`) are
     // not. Anything we cannot prove falls back to a plain map / CPU.
     //
-    // `acc_slots` collects every slot that has a proven `*load S; …;
-    // *add; *store S` accumulation; `returned_slot` is the slot of a
+    // `ReductionDataflow` collects every slot that has a proven
+    // `*load S; ...; *add; *store S` accumulation and the slot of a
     // trailing `*load S; *return`. The two must intersect for the body
     // to be a recognised reduction.
-    let mut acc_slots: Vec<u16> = Vec::new();
-    let mut returned_slot: Option<u16> = None;
-    // Slots loaded since the last store, used to confirm that a
-    // `*store S` writing the result of a `*add` is writing back a slot
-    // that the same expression read (the `acc = acc + x` self-feed).
-    let mut loaded_since_store: Vec<u16> = Vec::new();
-    // True while the value on top of the operand stack was produced by an
-    // arithmetic `*add` and not yet consumed by a store — lets the next
-    // `*store S` recognise the `acc = acc + x` shape.
-    let mut add_result_live = false;
-    // The slot of the most-recent `*load` (for the `*load S; *return`
-    // trailing pattern).
-    let mut last_load_slot: Option<u16> = None;
+    let mut reduction = ReductionDataflow::default();
     // Literal loop-bound recovery for the work estimate. The canonical
     // counted loop compares the induction variable against its bound with
     // a forward `if_icmp*` (`iload iv; <bound>; if_icmpge exit`). When the
@@ -433,44 +437,7 @@ fn scan_bytecode(
         // Decode the local slot read/written by integer/long/float/double
         // load/store opcodes so we can prove the `acc = acc + x` self-feed
         // and the `*load acc; *return` link.
-        if let Some(slot) = load_slot(bytes, pc) {
-            // A `*load` after the latest `*store` that may feed an `*add`.
-            loaded_since_store.push(slot);
-            last_load_slot = Some(slot);
-            // Loading anything other than the live add-result clears the
-            // "add result is on top of stack" flag conservatively.
-            add_result_live = false;
-        } else if (0x60..=0x63).contains(&op) {
-            // `*add` consumes two stack values and leaves the sum on top.
-            add_result_live = true;
-        } else if let Some(slot) = store_slot(bytes, pc) {
-            // `*store S` where the stored value came from an `*add` AND S
-            // was itself loaded earlier in this straight-line run is the
-            // `acc = acc + x` accumulation. Record S as an accumulator.
-            if add_result_live && loaded_since_store.contains(&slot) {
-                if !acc_slots.contains(&slot) {
-                    acc_slots.push(slot);
-                }
-            }
-            // A store starts a fresh load window and consumes the value.
-            loaded_since_store.clear();
-            add_result_live = false;
-            last_load_slot = None;
-        } else if (0xAC..=0xAF).contains(&op) {
-            // `*return` of a scalar: the value on top of the stack is what
-            // the method returns. If it came directly from a `*load S`
-            // (the immediately-preceding op), S is the returned slot.
-            if prev_op.map(is_load_op).unwrap_or(false) {
-                returned_slot = last_load_slot;
-            }
-        } else {
-            // Any other opcode that touches the operand stack invalidates
-            // our cheap "add result on top" assumption. Be conservative:
-            // only opcodes we explicitly model (loads/stores/adds/returns)
-            // keep `add_result_live`; everything else clears it so a later
-            // `*store` cannot be mistaken for an accumulation.
-            add_result_live = false;
-        }
+        reduction.observe(bytes, pc, prev_op);
 
         // Track literal integer pushes so a forward exit-comparison can
         // recover its bound operand for the work estimate.
@@ -584,9 +551,7 @@ fn scan_bytecode(
     // conservative over-approximation: if we cannot prove the link the
     // method falls back to the non-atomic serial path (false-negatives are
     // safe, false-positives are not).
-    let accumulator_feeds_return = returned_slot
-        .map(|s| acc_slots.contains(&s))
-        .unwrap_or(false);
+    let accumulator_feeds_return = reduction.accumulator_feeds_return();
     let is_dot_product_reduction = has_backward
         && body_has_array_load
         && body_has_add
@@ -598,6 +563,87 @@ fn scan_bytecode(
         has_backward,
         is_dot_product_reduction,
     ))
+}
+
+#[derive(Default)]
+struct ReductionDataflow {
+    acc_slots: Vec<u16>,
+    returned_slot: Option<u16>,
+    loaded_since_store: Vec<u16>,
+    add_result_live: bool,
+    last_load_slot: Option<u16>,
+}
+
+impl ReductionDataflow {
+    fn observe(&mut self, bytes: &[u8], pc: usize, prev_op: Option<u8>) {
+        let op = bytes[pc];
+        if let Some(slot) = load_slot(bytes, pc) {
+            // A scalar `*load` after the latest store may feed a later
+            // `*add`.
+            self.loaded_since_store.push(slot);
+            self.last_load_slot = Some(slot);
+            self.add_result_live = false;
+        } else if is_add_op(op) {
+            // `*add` consumes two stack values and leaves the sum on top.
+            self.add_result_live = true;
+            self.last_load_slot = None;
+        } else if let Some(slot) = store_slot(bytes, pc) {
+            let is_accumulation = self.add_result_live && self.loaded_since_store.contains(&slot);
+            if is_accumulation {
+                if !self.acc_slots.contains(&slot) {
+                    self.acc_slots.push(slot);
+                }
+            } else {
+                // A plain overwrite invalidates any earlier accumulator
+                // proof for this slot.
+                self.acc_slots.retain(|&s| s != slot);
+            }
+            self.clear_expression_candidates();
+        } else if (0xAC..=0xAF).contains(&op) {
+            // `*return` of a scalar: if it came directly from `*load S`,
+            // record S as the returned slot.
+            if prev_op.map(is_load_op).unwrap_or(false) {
+                self.returned_slot = self.last_load_slot;
+            }
+            self.add_result_live = false;
+        } else if is_reduction_candidate_barrier(op) {
+            self.acc_slots.clear();
+            self.clear_expression_candidates();
+        } else if is_reduction_expression_barrier(op) {
+            self.clear_expression_candidates();
+        } else {
+            // Arithmetic/conversion/array-load opcodes may still be part
+            // of `acc = acc + f(a[i])`; they do not clear the loaded-slot
+            // candidates, but the top-of-stack add result is no longer
+            // live unless the current opcode was itself an add.
+            self.add_result_live = false;
+            self.last_load_slot = None;
+        }
+    }
+
+    fn accumulator_feeds_return(&self) -> bool {
+        self.returned_slot
+            .map(|s| self.acc_slots.contains(&s))
+            .unwrap_or(false)
+    }
+
+    fn clear_expression_candidates(&mut self) {
+        self.loaded_since_store.clear();
+        self.add_result_live = false;
+        self.last_load_slot = None;
+    }
+}
+
+fn is_add_op(op: u8) -> bool {
+    (0x60..=0x63).contains(&op)
+}
+
+fn is_reduction_candidate_barrier(op: u8) -> bool {
+    matches!(op, 0x3A | 0x4B..=0x5F)
+}
+
+fn is_reduction_expression_barrier(op: u8) -> bool {
+    matches!(op, 0x94..=0xA7 | 0xC6..=0xC8)
 }
 
 enum OpClass {
@@ -627,6 +673,8 @@ fn classify(op: u8, hint: AdmissionHint, prev_op: Option<u8>) -> OpClass {
         // wasting work. Reject upstream with the precise reason; see
         // `Reason::LoadConstant`.
         0x12 | 0x13 | 0x14 => OpClass::Reject(Reason::LoadConstant),
+        0x72 | 0x73 => OpClass::Reject(Reason::FloatRemainder),
+        0x94..=0x98 => OpClass::Reject(Reason::Compare),
         0xB2..=0xB5 => OpClass::Reject(Reason::FieldAccess),
         // Invokes: the AllowIntrinsicCalls hint loosens `invokestatic`
         // (0xB8) so that the lowering layer can recognise the small set
@@ -655,12 +703,10 @@ fn classify(op: u8, hint: AdmissionHint, prev_op: Option<u8>) -> OpClass {
         0xC2 | 0xC3 => OpClass::Reject(Reason::Monitor),
         // Permitted bands. Note: `wide` (0xC4) is OK; size handled below.
         //
-        // `AdmissionHint::AllowDivByZero` is a no-op here: the current
-        // analyzer never injects a zero-divisor guard around
-        // idiv/ldiv/irem/lrem (opcodes 0x6C/0x6D/0x70/0x71), all of
-        // which already fall in the permitted `0x60..=0x83` band. The
-        // hint is still threaded through so Phase-2 lowering can pick
-        // it up without re-plumbing the analyzer.
+        // `AdmissionHint::AllowDivByZero` is not an admission loosening:
+        // idiv/ldiv/irem/lrem are already part of the supported integer
+        // arithmetic band. The hint is copied into `KernelSignature` so
+        // lowering can skip its explicit zero-divisor guards.
         0x00..=0x31
         | 0x33..=0x52
         | 0x54..=0xA4
@@ -803,7 +849,7 @@ fn instruction_size(bytes: &[u8], pc: usize) -> Result<usize, Reason> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::annotations::GpuKernelAttrs;
+    use crate::annotations::{GpuExcludeAttrs, GpuKernelAttrs};
     use crate::test_support::load_method;
 
     /// Build a `MethodAnnotations` carrying a `GpuKernelAttrs` with the
@@ -821,6 +867,25 @@ mod tests {
             }),
             gpu_exclude: None,
         }
+    }
+
+    fn assert_classify_rejects(op: u8, expected: Reason) {
+        match classify(op, AdmissionHint::Strict, None) {
+            OpClass::Reject(actual) => assert_eq!(actual, expected),
+            OpClass::Ok => panic!("opcode 0x{op:02x} was unexpectedly accepted"),
+        }
+    }
+
+    fn track_reduction_ops(bytes: &[u8]) -> ReductionDataflow {
+        let mut tracker = ReductionDataflow::default();
+        let mut pc = 0usize;
+        let mut prev_op = None;
+        while pc < bytes.len() {
+            tracker.observe(bytes, pc, prev_op);
+            prev_op = Some(bytes[pc]);
+            pc += instruction_size(bytes, pc).expect("test bytecode must be well-shaped");
+        }
+        tracker
     }
 
     #[test]
@@ -890,6 +955,28 @@ mod tests {
                 );
             }
             v => panic!("expected Eligible, got {v:?}"),
+        }
+    }
+
+    #[test]
+    fn reject_float_remainder_before_lowering() {
+        let frem = load_method("FloatRemainder", "fremScalar", "(FF)F");
+        assert_eq!(
+            analyze(&frem),
+            OffloadVerdict::Rejected(Reason::FloatRemainder)
+        );
+
+        let drem = load_method("FloatRemainder", "dremScalar", "(DD)D");
+        assert_eq!(
+            analyze(&drem),
+            OffloadVerdict::Rejected(Reason::FloatRemainder)
+        );
+    }
+
+    #[test]
+    fn reject_compare_opcodes_before_lowering() {
+        for op in 0x94..=0x98 {
+            assert_classify_rejects(op, Reason::Compare);
         }
     }
 
@@ -1060,6 +1147,44 @@ mod tests {
         }
     }
 
+    #[test]
+    fn gpu_exclude_overrides_kernel_for_direct_api_users() {
+        let method = load_method("EligibleVectorAdd", "vectorAdd", "([I[I[I)V");
+        let annotations = MethodAnnotations {
+            gpu_kernel: Some(GpuKernelAttrs::default()),
+            gpu_exclude: Some(GpuExcludeAttrs {
+                reason: "test opt-out".to_string(),
+            }),
+        };
+
+        assert_eq!(
+            analyze_with_annotations(&method, &annotations),
+            OffloadVerdict::Rejected(Reason::GpuExcluded)
+        );
+    }
+
+    #[test]
+    fn allow_div_by_zero_is_carried_to_signature() {
+        let method = load_method("EligibleStraightLine", "constReturn", "()I");
+
+        match analyze(&method) {
+            OffloadVerdict::Eligible(sig) => assert!(
+                !sig.allow_div_by_zero,
+                "strict/default analysis must keep divisor-zero guards enabled"
+            ),
+            v => panic!("expected strict Eligible, got {v:?}"),
+        }
+
+        let loose = annotate(AdmissionHint::AllowDivByZero);
+        match analyze_with_annotations(&method, &loose) {
+            OffloadVerdict::Eligible(sig) => assert!(
+                sig.allow_div_by_zero,
+                "AllowDivByZero must reach lowering through KernelSignature"
+            ),
+            v => panic!("expected AllowDivByZero Eligible, got {v:?}"),
+        }
+    }
+
     /// A method that is eligible under the existing `analyze` path
     /// must remain eligible when called through
     /// `analyze_with_annotations` with the default (no-annotations)
@@ -1141,5 +1266,53 @@ mod tests {
         assert!(!is_load_op(0x2A)); // aload_0
         assert!(!is_load_op(0x2D)); // aload_3
         assert!(!is_load_op(0xAC)); // ireturn
+    }
+
+    #[test]
+    fn reduction_tracker_keeps_genuine_accumulation() {
+        // lload_2; lload_0; ladd; lstore_2; lload_2; lreturn
+        let tracker = track_reduction_ops(&[0x20, 0x1E, 0x61, 0x41, 0x20, 0xAD]);
+        assert!(
+            tracker.accumulator_feeds_return(),
+            "load/add/store of the returned slot must still prove a reduction"
+        );
+    }
+
+    #[test]
+    fn reduction_tracker_clears_candidates_on_pop() {
+        // lload_2; pop2; lload_0; lload_1; ladd; lstore_2; lload_2; lreturn
+        //
+        // Without clearing the loaded-slot window at pop2, the later
+        // unrelated ladd would inherit stale slot 2 and falsely prove
+        // `lstore_2` as an accumulator update.
+        let tracker = track_reduction_ops(&[0x20, 0x58, 0x1E, 0x1F, 0x61, 0x41, 0x20, 0xAD]);
+        assert!(
+            !tracker.accumulator_feeds_return(),
+            "pop2 must clear stale reduction candidates"
+        );
+    }
+
+    #[test]
+    fn reduction_tracker_clears_proven_candidate_on_late_pop() {
+        // lload_2; lload_0; lload_1; ladd; lstore_2; pop2; lload_2; lreturn
+        //
+        // The lstore_2 initially looks like an accumulator update because
+        // slot 2 was loaded earlier, but the following pop2 proves that
+        // old value was still on the stack and did not feed the ladd.
+        let tracker = track_reduction_ops(&[0x20, 0x1E, 0x1F, 0x61, 0x41, 0x58, 0x20, 0xAD]);
+        assert!(
+            !tracker.accumulator_feeds_return(),
+            "late pop2 must clear a falsely proven accumulator candidate"
+        );
+    }
+
+    #[test]
+    fn reduction_tracker_drops_overwritten_accumulator_slot() {
+        // lload_2; lload_0; ladd; lstore_2; lconst_0; lstore_2; lload_2; lreturn
+        let tracker = track_reduction_ops(&[0x20, 0x1E, 0x61, 0x41, 0x09, 0x41, 0x20, 0xAD]);
+        assert!(
+            !tracker.accumulator_feeds_return(),
+            "a non-accumulating store must invalidate the earlier accumulator proof"
+        );
     }
 }
