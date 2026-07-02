@@ -30,6 +30,7 @@ param(
   [string]$KeycloakRoot = '',
   [string]$WorkDir = '',
   [string]$RefCsv = '',
+  [string]$ClassList = '',
   [string]$Exe = '',
   [string]$JdkHome = '',
   [string]$MaxHeap = '2g',
@@ -71,6 +72,22 @@ function Get-PowerShellExe {
 
 function ConvertTo-SafeName([string]$Value) {
   return ($Value -replace '[^A-Za-z0-9_.-]', '_')
+}
+
+function ConvertTo-SafeFileStem([string]$Value) {
+  $safe = ConvertTo-SafeName $Value
+  $maxLength = 96
+  if ($safe.Length -le $maxLength) { return $safe }
+
+  $sha = [System.Security.Cryptography.SHA256]::Create()
+  try {
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes($safe)
+    $hash = ([System.BitConverter]::ToString($sha.ComputeHash($bytes)) -replace '-', '').Substring(0, 12).ToLowerInvariant()
+  } finally {
+    $sha.Dispose()
+  }
+  $prefixLength = $maxLength - $hash.Length - 1
+  return "$($safe.Substring(0, $prefixLength))-$hash"
 }
 
 function ConvertTo-InvariantString([double]$Value) {
@@ -189,6 +206,26 @@ function Import-ResultRows([string]$Path) {
   return @(Import-Csv -Path $Path -Delimiter $delimiter)
 }
 
+function Import-ClassRows([string]$Path) {
+  if (-not (Test-Path $Path)) { Die "class list not found: $Path" }
+  $rows = @(Import-ResultRows $Path)
+  foreach ($row in $rows) {
+    if (-not ($row.PSObject.Properties.Name -contains 'module') -or -not ($row.PSObject.Properties.Name -contains 'class')) {
+      Die "class list must contain module and class columns: $Path"
+    }
+  }
+  return $rows
+}
+
+function Select-ClassRange([object[]]$List) {
+  $list = @($List)
+  $from = [Math]::Max(1, $Start) - 1
+  if ($from -ge $list.Count) { return @() }
+  $end = $list.Count
+  if ($Count -gt 0) { $end = [Math]::Min($list.Count, $from + $Count) }
+  return @($list[$from..($end - 1)])
+}
+
 function Resolve-ReferenceFile {
   if ($RefCsv -and (Test-Path $RefCsv)) { return $RefCsv }
   $candidates = @(
@@ -229,6 +266,7 @@ function Build-ClassLists {
   $allPath = Join-Path $script:WorkRoot 'all-tests.tsv'
   $passedPath = Join-Path $script:WorkRoot 'passed.tsv'
   $othersPath = Join-Path $script:WorkRoot 'others.tsv'
+  $testClassPatterns = @('*Test.class', '*Tests.class', '*IT.class', '*ITCase.class')
 
   $records = New-Object System.Collections.Generic.List[object]
   $dirs = Get-ChildItem -Path $script:KeycloakDir -Recurse -Directory -Filter 'test-classes' -ErrorAction SilentlyContinue |
@@ -237,9 +275,13 @@ function Build-ClassLists {
 
   foreach ($dir in $dirs) {
     $module = ConvertTo-RepoRelativeModule $script:KeycloakDir $dir.FullName
-    $classes = Get-ChildItem -Path $dir.FullName -Recurse -File -Filter '*Test.class' -ErrorAction SilentlyContinue |
+    $classes = @(
+      foreach ($pattern in $testClassPatterns) {
+        Get-ChildItem -Path $dir.FullName -Recurse -File -Filter $pattern -ErrorAction SilentlyContinue
+      }
+    ) |
       Where-Object { $_.Name -notlike '*$*' } |
-      Sort-Object FullName
+      Sort-Object FullName -Unique
 
     foreach ($classFile in $classes) {
       $rel = $classFile.FullName.Substring($dir.FullName.Length + 1)
@@ -287,6 +329,10 @@ function Get-SelectedClasses {
   $passedPath = Join-Path $script:WorkRoot 'passed.tsv'
   $othersPath = Join-Path $script:WorkRoot 'others.tsv'
 
+  if ($ClassList) {
+    return Select-ClassRange (Import-ClassRows $ClassList)
+  }
+
   if ($RefreshLists -or -not (Test-Path $allPath)) {
     Build-ClassLists
   }
@@ -308,14 +354,12 @@ function Get-SelectedClasses {
   if (-not (Test-Path $source)) { Die "class list not found: $source" }
 
   $list = @(Import-Csv -Path $source -Delimiter "`t")
-  $from = [Math]::Max(1, $Start) - 1
-  if ($from -ge $list.Count) { return @() }
-  $end = $list.Count
-  if ($Count -gt 0) { $end = [Math]::Min($list.Count, $from + $Count) }
-  return @($list[$from..($end - 1)])
+  return Select-ClassRange $list
 }
 
 function Get-Classpath {
+  param([object[]]$Classes = @())
+
   $runnerDir = Join-Path $script:KeycloakDir 'kc-runner'
   $cpFile = Join-Path $script:KeycloakDir 'kc-universal-cp.txt'
   if (-not (Test-Path $runnerDir)) { Die "missing KcRunner directory: $runnerDir" }
@@ -324,7 +368,37 @@ function Get-Classpath {
 
   $cp = (Get-Content -Path $cpFile -Raw).Trim()
   if (-not $cp) { Die "empty classpath file: $cpFile" }
-  return "$runnerDir;$cp"
+
+  $separator = [string][System.IO.Path]::PathSeparator
+  $seen = @{}
+  foreach ($entry in (@($runnerDir) + ($cp -split [regex]::Escape($separator)))) {
+    if (-not $entry) { continue }
+    try {
+      $key = [System.IO.Path]::GetFullPath($entry).ToLowerInvariant()
+    } catch {
+      $key = $entry.ToLowerInvariant()
+    }
+    $seen[$key] = $true
+  }
+
+  $extraEntries = New-Object System.Collections.Generic.List[string]
+  foreach ($row in $Classes) {
+    $module = [string]$row.module
+    if (-not $module) { continue }
+    $modulePath = $module -replace '/', '\'
+    $testClassesDir = Join-Path (Join-Path $script:KeycloakDir $modulePath) 'target\test-classes'
+    if (-not (Test-Path $testClassesDir)) { continue }
+    $full = [System.IO.Path]::GetFullPath($testClassesDir)
+    $key = $full.ToLowerInvariant()
+    if (-not $seen.ContainsKey($key)) {
+      $extraEntries.Add($full)
+      $seen[$key] = $true
+    }
+  }
+  if ($extraEntries.Count -gt 0) {
+    Write-Info "added selected module test classpath entries: $($extraEntries.Count)"
+  }
+  return ((@($runnerDir) + @($extraEntries) + @($cp)) -join $separator)
 }
 
 function Resolve-CratonExe {
@@ -372,7 +446,7 @@ function New-ProcessRecord {
 
   $module = [string]$ClassRow.module
   $class = [string]$ClassRow.class
-  $safe = ConvertTo-SafeName "$module.$class"
+  $safe = ConvertTo-SafeFileStem "$module.$class"
   $logDir = Join-Path $ModeOut 'logs'
   New-Item -ItemType Directory -Force -Path $logDir | Out-Null
   $outFile = Join-Path $logDir "$safe.out.log"
@@ -514,7 +588,7 @@ function Complete-ProcessRecord {
 function Invoke-Mode {
   param([object[]]$Classes)
 
-  $cp = Get-Classpath
+  $cp = Get-Classpath -Classes $Classes
   $jdk = Resolve-Jdk
   $java = Join-Path $jdk 'bin\java.exe'
   if (-not (Test-Path $java)) { Die "HotSpot java.exe not found: $java" }
@@ -682,6 +756,7 @@ function Invoke-AllModes {
     )
     if ($Exe) { $args += @('-Exe', $Exe) }
     if ($RefCsv) { $args += @('-RefCsv', $RefCsv) }
+    if ($ClassList) { $args += @('-ClassList', $ClassList) }
     if ($CratonArgs.Count -gt 0) {
       foreach ($extra in $CratonArgs) { $args += @('-CratonArgs', $extra) }
     }
