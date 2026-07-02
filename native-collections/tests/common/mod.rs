@@ -794,6 +794,37 @@ impl NativeContext for MockCtx {
                 a.to_vec(),
             ));
         }
+        match (m, d) {
+            ("complete", "(Ljava/lang/Object;)Z") => {
+                let val = a.first().copied().unwrap_or(Value::Object(None));
+                let stored = if matches!(val, Value::Object(None)) {
+                    let cid = self
+                        .ensure_class_initialized(
+                            "java/util/concurrent/CompletableFuture$AltResult",
+                        )
+                        .unwrap();
+                    let alt = self.alloc_object(cid, 1);
+                    self.set_field(alt, 0, Value::Object(None));
+                    Value::Object(Some(alt))
+                } else {
+                    val
+                };
+                self.set_field(r, 0, stored);
+                return Ok(Some(Value::Int(1)));
+            }
+            ("obtrudeException", "(Ljava/lang/Throwable;)V") => {
+                let exc = a.first().copied().unwrap_or(Value::Object(None));
+                let cid = self
+                    .ensure_class_initialized("java/util/concurrent/CompletableFuture$AltResult")
+                    .unwrap();
+                let alt = self.alloc_object(cid, 1);
+                self.set_field(alt, 0, exc);
+                self.set_field(r, 0, Value::Object(Some(alt)));
+                return Ok(None);
+            }
+            ("postComplete", "()V") => return Ok(None),
+            _ => {}
+        }
         let slot = unsafe { &mut *self.invoke_virtual_result.get() };
         let result = if let Some(r) = slot.take() {
             r

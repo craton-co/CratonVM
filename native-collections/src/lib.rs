@@ -33142,6 +33142,7 @@ fn native_cslm_key_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
 
 const SL_FIELD_STATE: usize = 0; // 0=free, 1=write-locked, >=2 means (state-1) readers
 const SL_FIELD_STAMP: usize = 1; // monotonic stamp counter
+const SL_SPIN_LIMIT: usize = 1000;
 #[allow(dead_code)]
 const SL_NUM_FIELDS: usize = 2;
 
@@ -33219,7 +33220,7 @@ fn native_sl_read_lock(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     };
     // Wait for write lock to be released (bounded spin)
     let mut spins = 0;
-    while state == 1 && spins < 1000 {
+    while state == 1 && spins < SL_SPIN_LIMIT {
         ctx.monitor_exit(this);
         std::thread::yield_now();
         ctx.monitor_enter(this);
@@ -33229,12 +33230,12 @@ fn native_sl_read_lock(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         };
         spins += 1;
     }
+    if state == 1 {
+        ctx.monitor_exit(this);
+        return Ok(Some(Value::Long(0)));
+    }
     // state >= 2 means readers present; state == 0 means free
-    let new_state = if state == 0 || state == 1 {
-        2
-    } else {
-        state + 1
-    };
+    let new_state = if state == 0 { 2 } else { state + 1 };
     ctx.set_field(this, SL_FIELD_STATE, Value::Int(new_state));
     let stamp = sl_next_stamp(ctx, this);
     ctx.monitor_exit(this);
@@ -33254,6 +33255,9 @@ fn native_sl_unlock_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     if state >= 2 {
         let new_state = if state == 2 { 0 } else { state - 1 };
         ctx.set_field(this, SL_FIELD_STATE, Value::Int(new_state));
+        if new_state == 0 {
+            let _ = ctx.monitor_notify_all(this);
+        }
     }
     ctx.monitor_exit(this);
     Ok(None)
@@ -33271,7 +33275,7 @@ fn native_sl_write_lock(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         _ => 0,
     };
     let mut spins = 0;
-    while state != 0 && spins < 1000 {
+    while state != 0 && spins < SL_SPIN_LIMIT {
         ctx.monitor_exit(this);
         std::thread::yield_now();
         ctx.monitor_enter(this);
@@ -33280,6 +33284,10 @@ fn native_sl_write_lock(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
             _ => 0,
         };
         spins += 1;
+    }
+    if state != 0 {
+        ctx.monitor_exit(this);
+        return Ok(Some(Value::Long(0)));
     }
     ctx.set_field(this, SL_FIELD_STATE, Value::Int(1));
     let stamp = sl_next_stamp(ctx, this);
@@ -33295,6 +33303,7 @@ fn native_sl_unlock_write(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     ctx.monitor_enter(this);
     ctx.set_field(this, SL_FIELD_STATE, Value::Int(0));
     sl_next_stamp(ctx, this);
+    let _ = ctx.monitor_notify_all(this);
     ctx.monitor_exit(this);
     Ok(None)
 }
@@ -34569,15 +34578,31 @@ fn native_cf_then_run(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     };
     let runnable = match args.get(1) {
         Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(Some(Value::Object(None))),
+        _ => return cf_null_callback("thenRun"),
     };
-    // Wait for this to be done (in our model, always synchronous)
-    let _done = ctx.get_field(this, CF_FIELD_DONE);
-    let _ = ctx.invoke_virtual(runnable, "run", "()V", &[]);
-    let cf = alloc_synthetic(ctx, "java/util/concurrent/CompletableFuture", 4);
-    ctx.set_field(cf, CF_FIELD_RESULT, Value::Object(None));
-    ctx.set_field(cf, CF_FIELD_DONE, Value::Int(1));
-    Ok(Some(Value::Object(Some(cf))))
+    if cf_is_real_jdk(ctx, this) {
+        return ctx.invoke_special(
+            "java/util/concurrent/CompletableFuture",
+            "uniRunStage",
+            "(Ljava/util/concurrent/Executor;Ljava/lang/Runnable;)Ljava/util/concurrent/CompletableFuture;",
+            &[
+                Value::Object(Some(this)),
+                Value::Object(None),
+                Value::Object(Some(runnable)),
+            ],
+        );
+    }
+    match cf_read_state(ctx, this) {
+        CfState::Exceptional(e) => Ok(Some(cf_make_completed(ctx, CfState::Exceptional(e)))),
+        CfState::Pending => Ok(Some(cf_make_synthetic(ctx, CfState::Pending))),
+        CfState::Normal(_) => match ctx.invoke_virtual(runnable, "run", "()V", &[]) {
+            Ok(_) => Ok(Some(cf_make_completed(
+                ctx,
+                CfState::Normal(Value::Object(None)),
+            ))),
+            Err(err) => Ok(Some(cf_callback_failed(ctx, err))),
+        },
+    }
 }
 
 fn native_cf_then_compose(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -34587,7 +34612,7 @@ fn native_cf_then_compose(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     };
     let func = match args.get(1) {
         Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(Some(Value::Object(None))),
+        _ => return cf_null_callback("thenCompose"),
     };
     // BUG-17: real-JDK CF — delegate to the real private `uniComposeStage(null, fn)`
     // (== public `thenCompose(fn)`). The synthetic eager path below reads `result`
@@ -34609,25 +34634,27 @@ fn native_cf_then_compose(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
             ],
         );
     }
-    let val = ctx.get_field(this, CF_FIELD_RESULT);
-    let result_cf = ctx.invoke_virtual(
-        func,
-        "apply",
-        "(Ljava/lang/Object;)Ljava/lang/Object;",
-        &[val],
-    )?;
-    // The result should be a CompletableFuture; return it directly
-    match result_cf {
-        Some(Value::Object(Some(cf_obj))) => {
-            // It's already a CF; return it as-is
-            Ok(Some(Value::Object(Some(cf_obj))))
-        }
-        other => {
-            // Wrap the result in a completed CF
-            let cf = alloc_synthetic(ctx, "java/util/concurrent/CompletableFuture", 4);
-            ctx.set_field(cf, CF_FIELD_RESULT, other.unwrap_or(Value::Object(None)));
-            ctx.set_field(cf, CF_FIELD_DONE, Value::Int(1));
-            Ok(Some(Value::Object(Some(cf))))
+    match cf_read_state(ctx, this) {
+        CfState::Exceptional(e) => Ok(Some(cf_make_completed(ctx, CfState::Exceptional(e)))),
+        CfState::Pending => Ok(Some(cf_make_synthetic(ctx, CfState::Pending))),
+        CfState::Normal(val) => {
+            let result_cf = match ctx.invoke_virtual(
+                func,
+                "apply",
+                "(Ljava/lang/Object;)Ljava/lang/Object;",
+                &[val],
+            ) {
+                Ok(result) => result,
+                Err(err) => return Ok(Some(cf_callback_failed(ctx, err))),
+            };
+            // The result should be a CompletableFuture; return it directly.
+            match result_cf {
+                Some(Value::Object(Some(cf_obj))) => Ok(Some(Value::Object(Some(cf_obj)))),
+                other => Ok(Some(cf_make_completed(
+                    ctx,
+                    CfState::Normal(other.unwrap_or(Value::Object(None))),
+                ))),
+            }
         }
     }
 }
@@ -34639,27 +34666,101 @@ fn native_cf_then_combine(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     };
     let other_cf = match args.get(1) {
         Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(Some(Value::Object(None))),
+        _ => {
+            return Err(RuntimeError::NullPointerException {
+                message: Some("CompletableFuture.thenCombine other stage is null".to_string()),
+            }
+            .into())
+        }
     };
     let bi_func = match args.get(2) {
         Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(Some(Value::Object(None))),
+        _ => return cf_null_callback("thenCombine"),
     };
-    let val1 = ctx.get_field(this, CF_FIELD_RESULT);
-    let val2 = ctx.get_field(other_cf, CF_FIELD_RESULT);
-    let result = ctx.invoke_virtual(
-        bi_func,
-        "apply",
-        "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
-        &[val1, val2],
-    )?;
-    let cf = alloc_synthetic(ctx, "java/util/concurrent/CompletableFuture", 4);
-    ctx.set_field(cf, CF_FIELD_RESULT, result.unwrap_or(Value::Object(None)));
-    ctx.set_field(cf, CF_FIELD_DONE, Value::Int(1));
-    Ok(Some(Value::Object(Some(cf))))
+    if cf_is_real_jdk(ctx, this) {
+        return ctx.invoke_special(
+            "java/util/concurrent/CompletableFuture",
+            "biApplyStage",
+            "(Ljava/util/concurrent/Executor;Ljava/util/concurrent/CompletionStage;Ljava/util/function/BiFunction;)Ljava/util/concurrent/CompletableFuture;",
+            &[
+                Value::Object(Some(this)),
+                Value::Object(None),
+                Value::Object(Some(other_cf)),
+                Value::Object(Some(bi_func)),
+            ],
+        );
+    }
+    let left = cf_read_state(ctx, this);
+    let right = cf_read_state(ctx, other_cf);
+    match (left, right) {
+        (CfState::Exceptional(e), _) | (_, CfState::Exceptional(e)) => {
+            Ok(Some(cf_make_completed(ctx, CfState::Exceptional(e))))
+        }
+        (CfState::Pending, _) | (_, CfState::Pending) => {
+            Ok(Some(cf_make_synthetic(ctx, CfState::Pending)))
+        }
+        (CfState::Normal(val1), CfState::Normal(val2)) => {
+            let result = match ctx.invoke_virtual(
+                bi_func,
+                "apply",
+                "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+                &[val1, val2],
+            ) {
+                Ok(result) => result,
+                Err(err) => return Ok(Some(cf_callback_failed(ctx, err))),
+            };
+            Ok(Some(cf_make_completed(
+                ctx,
+                CfState::Normal(result.unwrap_or(Value::Object(None))),
+            )))
+        }
+    }
 }
 
 fn native_cf_exceptionally(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let handler = match args.get(1) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return cf_null_callback("exceptionally"),
+    };
+    if cf_is_real_jdk(ctx, this) {
+        return ctx.invoke_special(
+            "java/util/concurrent/CompletableFuture",
+            "uniExceptionallyStage",
+            "(Ljava/util/concurrent/Executor;Ljava/util/function/Function;)Ljava/util/concurrent/CompletableFuture;",
+            &[
+                Value::Object(Some(this)),
+                Value::Object(None),
+                Value::Object(Some(handler)),
+            ],
+        );
+    }
+    match cf_read_state(ctx, this) {
+        CfState::Exceptional(exc) => {
+            let result = match ctx.invoke_virtual(
+                handler,
+                "apply",
+                "(Ljava/lang/Object;)Ljava/lang/Object;",
+                &[exc],
+            ) {
+                Ok(result) => result,
+                Err(err) => return Ok(Some(cf_callback_failed(ctx, err))),
+            };
+            Ok(Some(cf_make_completed(
+                ctx,
+                CfState::Normal(result.unwrap_or(Value::Object(None))),
+            )))
+        }
+        CfState::Pending => Ok(Some(cf_make_synthetic(ctx, CfState::Pending))),
+        CfState::Normal(v) => Ok(Some(cf_make_completed(ctx, CfState::Normal(v)))),
+    }
+}
+
+#[allow(dead_code)]
+fn native_cf_exceptionally_legacy(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
@@ -34698,7 +34799,7 @@ fn native_cf_handle(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     };
     let bi_func = match args.get(1) {
         Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(Some(Value::Object(None))),
+        _ => return cf_null_callback("handle"),
     };
     // BUG-17: a real-JDK CF may still be asynchronously PENDING here (e.g. supplyAsync
     // on a worker; reactor's `Mono.fromFuture` subscribes via `handle()`). Delegate to
@@ -34724,14 +34825,17 @@ fn native_cf_handle(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     let (val, exc) = match cf_read_state(ctx, this) {
         CfState::Normal(v) => (v, Value::Object(None)),
         CfState::Exceptional(e) => (Value::Object(None), e),
-        CfState::Pending => (Value::Object(None), Value::Object(None)),
+        CfState::Pending => return Ok(Some(cf_make_synthetic(ctx, CfState::Pending))),
     };
-    let result = ctx.invoke_virtual(
+    let result = match ctx.invoke_virtual(
         bi_func,
         "apply",
         "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
         &[val, exc],
-    )?;
+    ) {
+        Ok(result) => result,
+        Err(err) => return Ok(Some(cf_callback_failed(ctx, err))),
+    };
     // handle always produces a normal completion with the function's result.
     Ok(Some(cf_make_completed(
         ctx,
@@ -34746,7 +34850,7 @@ fn native_cf_when_complete(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     };
     let consumer = match args.get(1) {
         Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(Some(Value::Object(None))),
+        _ => return cf_null_callback("whenComplete"),
     };
     // BUG-17: real-JDK CF — delegate to the real private `uniWhenCompleteStage(null, c)`
     // (== public `whenComplete(c)`) so the dependent registers NON-blockingly and fires
@@ -34768,17 +34872,22 @@ fn native_cf_when_complete(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     // source state layout-agnostically is what makes KafkaFuture.all()/allOf complete its
     // dependent KafkaFutureImpl exceptionally instead of leaving it pending (which
     // made get() block forever — bug-08). The returned CF mirrors the source.
-    let (val, exc) = match cf_read_state(ctx, this) {
-        CfState::Normal(v) => (v, Value::Object(None)),
-        CfState::Exceptional(e) => (Value::Object(None), e),
-        CfState::Pending => (Value::Object(None), Value::Object(None)),
+    let (val, exc, source_exceptional) = match cf_read_state(ctx, this) {
+        CfState::Normal(v) => (v, Value::Object(None), false),
+        CfState::Exceptional(e) => (Value::Object(None), e, true),
+        CfState::Pending => return Ok(Some(cf_make_synthetic(ctx, CfState::Pending))),
     };
-    let _ = ctx.invoke_virtual(
+    if let Err(err) = ctx.invoke_virtual(
         consumer,
         "accept",
         "(Ljava/lang/Object;Ljava/lang/Object;)V",
         &[val.clone(), exc.clone()],
-    );
+    ) {
+        if source_exceptional {
+            return Ok(Some(cf_make_completed(ctx, CfState::Exceptional(exc))));
+        }
+        return Ok(Some(cf_callback_failed(ctx, err)));
+    }
     let mirror = if matches!(exc, Value::Object(None)) {
         CfState::Normal(val)
     } else {
@@ -34953,6 +35062,68 @@ fn cf_read_state(ctx: &dyn NativeContext, this: ObjectRef) -> CfState {
     }
 }
 
+fn cf_make_synthetic(ctx: &mut dyn NativeContext, state: CfState) -> Value {
+    let cf = alloc_synthetic(ctx, "java/util/concurrent/CompletableFuture", 4);
+    match state {
+        CfState::Normal(v) => {
+            ctx.set_field(cf, CF_FIELD_RESULT, v);
+            ctx.set_field(cf, CF_FIELD_DONE, Value::Int(1));
+        }
+        CfState::Exceptional(e) => {
+            ctx.set_field(cf, CF_FIELD_RESULT, e);
+            ctx.set_field(cf, CF_FIELD_DONE, Value::Int(2));
+        }
+        CfState::Pending => {
+            ctx.set_field(cf, CF_FIELD_DONE, Value::Int(0));
+        }
+    }
+    Value::Object(Some(cf))
+}
+
+fn cf_null_callback(method: &str) -> MethodCallResult {
+    Err(RuntimeError::NullPointerException {
+        message: Some(format!("CompletableFuture.{method} callback is null")),
+    }
+    .into())
+}
+
+fn cf_throwable_for_failure(ctx: &mut dyn NativeContext, err: MethodCallFailed) -> Value {
+    match err {
+        MethodCallFailed::ExceptionThrown(obj) => Value::Object(Some(obj)),
+        MethodCallFailed::InternalError(vm_err) => {
+            let class_name = match &vm_err {
+                cratonvm_types::error::VmError::Runtime(RuntimeError::NullPointerException {
+                    ..
+                }) => "java/lang/NullPointerException",
+                cratonvm_types::error::VmError::Runtime(
+                    RuntimeError::IllegalArgumentException { .. },
+                ) => "java/lang/IllegalArgumentException",
+                cratonvm_types::error::VmError::Runtime(RuntimeError::IllegalStateException {
+                    ..
+                }) => "java/lang/IllegalStateException",
+                cratonvm_types::error::VmError::Runtime(RuntimeError::ClassCastException {
+                    ..
+                }) => "java/lang/ClassCastException",
+                _ => "java/lang/RuntimeException",
+            };
+            let msg = ctx.create_string(&vm_err.to_string());
+            match ctx.new_object_initialized(
+                class_name,
+                "(Ljava/lang/String;)V",
+                &[Value::Object(Some(msg))],
+            ) {
+                Ok(Some(Value::Object(Some(obj)))) => Value::Object(Some(obj)),
+                _ => Value::Object(Some(msg)),
+            }
+        }
+    }
+}
+
+fn cf_callback_failed(ctx: &mut dyn NativeContext, err: MethodCallFailed) -> Value {
+    let throwable = cf_throwable_for_failure(ctx, err);
+    cf_make_completed(ctx, CfState::Exceptional(throwable))
+}
+
 /// Allocate a REAL `java.util.concurrent.CompletableFuture` already completed with
 /// `state`, using the un-intercepted `complete`/`obtrudeException` bytecode (which
 /// store genuine values/`AltResult`s) so the result is fully compatible with the
@@ -35111,25 +35282,41 @@ fn native_cf_then_apply_p31(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     };
     let func = match args.get(1) {
         Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(Some(Value::Object(None))),
+        _ => return cf_null_callback("thenApply"),
     };
+    if cf_is_real_jdk(ctx, this) {
+        return ctx.invoke_special(
+            "java/util/concurrent/CompletableFuture",
+            "uniApplyStage",
+            "(Ljava/util/concurrent/Executor;Ljava/util/function/Function;)Ljava/util/concurrent/CompletableFuture;",
+            &[
+                Value::Object(Some(this)),
+                Value::Object(None),
+                Value::Object(Some(func)),
+            ],
+        );
+    }
     // thenApply: if the source completed exceptionally, propagate the exception
     // WITHOUT calling the function (real CompletionStage semantics); otherwise
     // apply the function to the source value.
     match cf_read_state(ctx, this) {
         CfState::Exceptional(e) => Ok(Some(cf_make_completed(ctx, CfState::Exceptional(e)))),
+        CfState::Pending => Ok(Some(cf_make_synthetic(ctx, CfState::Pending))),
         state => {
             let val = match state {
                 CfState::Normal(v) => v,
-                CfState::Pending => Value::Object(None),
                 CfState::Exceptional(_) => unreachable!(),
+                CfState::Pending => unreachable!(),
             };
-            let result = ctx.invoke_virtual(
+            let result = match ctx.invoke_virtual(
                 func,
                 "apply",
                 "(Ljava/lang/Object;)Ljava/lang/Object;",
                 &[val],
-            )?;
+            ) {
+                Ok(result) => result,
+                Err(err) => return Ok(Some(cf_callback_failed(ctx, err))),
+            };
             Ok(Some(cf_make_completed(
                 ctx,
                 CfState::Normal(result.unwrap_or(Value::Object(None))),
@@ -35145,14 +35332,35 @@ fn native_cf_then_accept_p31(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     };
     let consumer = match args.get(1) {
         Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(Some(Value::Object(None))),
+        _ => return cf_null_callback("thenAccept"),
     };
-    let val = ctx.get_field(this, CF_FIELD_RESULT);
-    let _ = ctx.invoke_virtual(consumer, "accept", "(Ljava/lang/Object;)V", &[val]);
-    let cf = alloc_synthetic(ctx, "java/util/concurrent/CompletableFuture", 4);
-    ctx.set_field(cf, CF_FIELD_RESULT, Value::Object(None));
-    ctx.set_field(cf, CF_FIELD_DONE, Value::Int(1));
-    Ok(Some(Value::Object(Some(cf))))
+    if cf_is_real_jdk(ctx, this) {
+        return ctx.invoke_special(
+            "java/util/concurrent/CompletableFuture",
+            "uniAcceptStage",
+            "(Ljava/util/concurrent/Executor;Ljava/util/function/Consumer;)Ljava/util/concurrent/CompletableFuture;",
+            &[
+                Value::Object(Some(this)),
+                Value::Object(None),
+                Value::Object(Some(consumer)),
+            ],
+        );
+    }
+    match cf_read_state(ctx, this) {
+        CfState::Exceptional(e) => Ok(Some(cf_make_completed(ctx, CfState::Exceptional(e)))),
+        CfState::Pending => Ok(Some(cf_make_synthetic(ctx, CfState::Pending))),
+        CfState::Normal(val) => {
+            if let Err(err) =
+                ctx.invoke_virtual(consumer, "accept", "(Ljava/lang/Object;)V", &[val])
+            {
+                return Ok(Some(cf_callback_failed(ctx, err)));
+            }
+            Ok(Some(cf_make_completed(
+                ctx,
+                CfState::Normal(Value::Object(None)),
+            )))
+        }
+    }
 }
 
 // --- ThreadPoolExecutor stat methods ---
