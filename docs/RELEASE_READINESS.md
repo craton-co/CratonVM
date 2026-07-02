@@ -5,6 +5,18 @@ releases, GitHub binary releases, and crates.io dry-runs. It complements the
 root `RELEASING.md` process with the package and open-source checks that must be
 true before a broad publish wave.
 
+## Current status
+
+As of the 2026-07-02 scoped review, CratonVM is **not** ready for a public
+release tag, blocking CI gate claim, or broad crates.io publish wave. The
+review recorded failing format, workspace test, clippy, fuzz, and packaged-crate
+checks, plus default-feature edges from publishable crates to crates marked
+`publish = false`.
+
+Treat the checklist below as the bar that must be met before release. Do not
+describe a branch as release-ready, warning-free, fully covered, or crates.io
+ready unless the exact release commit has evidence for those claims.
+
 Current owner and license metadata:
 
 - Owner: Craton Software Company.
@@ -21,18 +33,19 @@ Do not tag a public release or publish crates until these checks are complete:
 1. Required CI checks are green on the release PR for the exact commit being
    tagged.
 2. Advisory jobs are reviewed, with any known failures recorded in the release
-   notes. Today this includes coverage and semantic difftest jobs while they
-   remain explicitly advisory in `.github/workflows/coverage.yml` and
-   `.github/workflows/ci.yml`.
+   notes. Today this includes coverage, semantic difftest, real-path smoke, and
+   fuzz-smoke jobs while they remain explicitly advisory in
+   `.github/workflows/coverage.yml` and `.github/workflows/ci.yml`.
 3. Package contents are inspected with `cargo package --list` for every crate in
    the publish set.
 4. `cargo package` and `cargo publish --dry-run` pass for every crate in
    dependency order.
 5. No dry-run uses `--allow-dirty`, and no publish step uses `--no-verify`.
 6. `Cargo.toml` workspace metadata still names Craton Software Company as the
-   author and `Apache-2.0` as the license.
+   author, `Apache-2.0` as the license, and public repository/homepage/docs
+   links.
 7. Each publishable crate has an appropriate `README.md`, `repository`,
-   `homepage`, and versioned path dependency metadata.
+   `homepage`, `documentation`, and versioned path dependency metadata.
 8. Default features for publishable crates do not pull crates with
    `publish = false`.
 9. Binaries exposed by packages have project-specific names. The intentional
@@ -152,7 +165,8 @@ Before a public open-source release:
 - Confirm issue templates, `SECURITY.md`, `SUPPORT.md`, `CODE_OF_CONDUCT.md`,
   `GOVERNANCE.md`, `MAINTAINERS.md`, and `TRADEMARKS.md` are current.
 - Confirm the release notes do not claim warning-free builds, complete coverage,
-  or blocking advisory gates unless the current workflow state proves it.
+  enforced coverage thresholds, or blocking advisory gates unless the current
+  workflow state proves it.
 - Confirm generated artifacts attached by `.github/workflows/release.yml` carry
   the expected binary names and include license/notice files where distribution
   format requires them.

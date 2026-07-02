@@ -16,9 +16,10 @@
 //!
 //! For `Value::Object(Some(_))` the underlying `ObjectRef` wraps a raw
 //! pointer; the codec only round-trips bit-exactly when the pointer is
-//! non-null and 8-byte aligned. Both `decode_value` and
-//! `CompactValue::to_value` deliberately degrade null/unaligned pointers
-//! to `Value::Object(None)` rather than panicking. The strategy below
+//! non-null, 8-byte aligned, above the null guard page, and known through
+//! prior `ObjectRef` construction. `decode_value` degrades rejected object
+//! payloads to `Value::Object(None)`, while `CompactValue::to_value` preserves
+//! rejected `SUB_OBJECT` payloads as bit-exact longs. The strategy below
 //! generates only well-formed object pointers — anything else is covered
 //! by the dedicated degradation tests inside `src/value.rs` and
 //! `src/compact_value.rs`.
@@ -35,11 +36,11 @@ fn arbitrary_value() -> impl Strategy<Value = Value> {
         any::<u32>().prop_map(|bits| Value::Float(f32::from_bits(bits))),
         any::<u64>().prop_map(|bits| Value::Double(f64::from_bits(bits))),
         // Well-formed (non-null, 8-byte aligned) object pointers.  The
-        // 8-byte multiplier keeps the alignment invariant; the +8 base
-        // keeps it non-null.  Capped well within the 47-bit address space
-        // that `CompactValue` also tolerates.
-        (1u64..(1u64 << 40)).prop_map(|n| {
-            let raw = (n * 8) as *mut u8;
+        // The lower bound stays above the null guard page, and clearing the
+        // low bits keeps the 8-byte alignment invariant. Capped well within
+        // the 47-bit address space that `CompactValue` also tolerates.
+        (0x1000u64..(1u64 << 40)).prop_map(|n| {
+            let raw = (n & !0x7) as *mut u8;
             // SAFETY: `raw` is non-null and 8-byte aligned by construction.
             Value::Object(Some(unsafe { ObjectRef::from_raw(raw) }))
         }),

@@ -67,13 +67,13 @@ unafraid to rethink the runtime from first principles.
 Single-run snapshot measured 2026-07-02 on Windows 11, JDK 25.0.1 LTS, and
 CratonVM code `b80c50b5`.
 
-| Benchmark | JDK 25 C2 | CratonVM default | Default ratio | CratonVM OSR, threshold=1 | OSR ratio |
-|-----------|-----------|------------------|---------------|---------------------------|-----------|
-| Arithmetic (300M) | 991 ms | 73,820 ms | 74.5x | 1,534 ms | 1.55x |
-| Fibonacci(42) | 2,071 ms | 28,969 ms | 14.0x | 28,525 ms | 13.8x |
-| Sieve (100K x 500) | 358 ms | 31,665 ms | 88.4x | 466 ms | 1.30x |
-| Matrix 500x500 | 336 ms | 39,078 ms | 116.3x | 452 ms | 1.35x |
-| **QuickBench total** | **3,756 ms** | **173,532 ms** | **46.2x** | **30,977 ms** | **8.25x** |
+| Benchmark            | JDK 25 C2    | CratonVM default | Default ratio | CratonVM OSR, threshold=1 | OSR ratio |
+|----------------------|--------------|------------------|---------------|---------------------------|-----------|
+| Arithmetic (300M)    | 991 ms       | 73,820 ms        | 74.5x         | 1,534 ms                  | 1.55x     |
+| Fibonacci(42)        | 2,071 ms     | 28,969 ms        | 14.0x         | 28,525 ms                 | 13.8x     |
+| Sieve (100K x 500)   | 358 ms       | 31,665 ms        | 88.4x         | 466 ms                    | 1.30x     |
+| Matrix 500x500       | 336 ms       | 39,078 ms        | 116.3x        | 452 ms                    | 1.35x     |
+| **QuickBench total** | **3,756 ms** | **173,532 ms**   | **46.2x**     | **30,977 ms**             | **8.25x** |
 
 The OSR column sets `CRATONVM_JIT_OSR=1 CRATONVM_JIT_THRESHOLD=1`. Default
 launcher settings leave these one-shot hot loops mostly interpreted.

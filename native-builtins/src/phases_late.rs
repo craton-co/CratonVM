@@ -9442,6 +9442,93 @@ pub(crate) fn register_phase57_process(r: &mut NativeMethodRegistry) {
         },
     );
 
+    // `alloc_concurrent_synthetic(ctx, "java/lang/Process", ...)` can yield a
+    // VM synthetic wrapper whose runtime class is reported as
+    // `cratonvm/synthetic/Process`. Virtual dispatch then probes the native
+    // registry with that receiver class, not `java/lang/Process`, so mirror the
+    // Process surface needed by WildFly's launcher checks.
+    let synthetic_proc = "cratonvm/synthetic/Process";
+    r.register(synthetic_proc, "waitFor", "()I", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        Ok(Some(ctx.get_field(this, PROC_FIELD_EXIT)))
+    });
+    r.register(synthetic_proc, "exitValue", "()I", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        Ok(Some(ctx.get_field(this, PROC_FIELD_EXIT)))
+    });
+    r.register(synthetic_proc, "isAlive", "()Z", |_ctx, _args| {
+        Ok(Some(Value::Int(0)))
+    });
+    r.register(synthetic_proc, "destroy", "()V", |_ctx, _args| Ok(None));
+    r.register(
+        synthetic_proc,
+        "destroyForcibly",
+        "()Ljava/lang/Process;",
+        |_ctx, args| Ok(Some(args[0])),
+    );
+    r.register(synthetic_proc, "pid", "()J", |_ctx, _args| {
+        Ok(Some(Value::Long(std::process::id() as i64)))
+    });
+    r.register(
+        synthetic_proc,
+        "waitFor",
+        "(JLjava/util/concurrent/TimeUnit;)Z",
+        |_ctx, _args| Ok(Some(Value::Int(1))),
+    );
+    r.register(
+        synthetic_proc,
+        "getInputStream",
+        "()Ljava/io/InputStream;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let stdout_bytes = match ctx.get_field(this, PROC_FIELD_STDOUT) {
+                Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default().into_bytes(),
+                _ => Vec::new(),
+            };
+            let bais = alloc_concurrent_synthetic(ctx, "java/io/ByteArrayInputStream", 4);
+            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, stdout_bytes.len());
+            for (i, &b) in stdout_bytes.iter().enumerate() {
+                ctx.set_array_element(arr, i, Value::Int(b as i8 as i32));
+            }
+            ctx.set_field(bais, 0, Value::Object(Some(arr)));
+            ctx.set_field(bais, 1, Value::Int(0));
+            ctx.set_field(bais, 2, Value::Int(0));
+            ctx.set_field(bais, 3, Value::Int(stdout_bytes.len() as i32));
+            Ok(Some(Value::Object(Some(bais))))
+        },
+    );
+    r.register(
+        synthetic_proc,
+        "getErrorStream",
+        "()Ljava/io/InputStream;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let stderr_bytes = match ctx.get_field(this, PROC_FIELD_STDERR) {
+                Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default().into_bytes(),
+                _ => Vec::new(),
+            };
+            let bais = alloc_concurrent_synthetic(ctx, "java/io/ByteArrayInputStream", 4);
+            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, stderr_bytes.len());
+            for (i, &b) in stderr_bytes.iter().enumerate() {
+                ctx.set_array_element(arr, i, Value::Int(b as i8 as i32));
+            }
+            ctx.set_field(bais, 0, Value::Object(Some(arr)));
+            ctx.set_field(bais, 1, Value::Int(0));
+            ctx.set_field(bais, 2, Value::Int(0));
+            ctx.set_field(bais, 3, Value::Int(stderr_bytes.len() as i32));
+            Ok(Some(Value::Object(Some(bais))))
+        },
+    );
+    r.register(
+        synthetic_proc,
+        "getOutputStream",
+        "()Ljava/io/OutputStream;",
+        |ctx, _args| {
+            let os = alloc_concurrent_synthetic(ctx, "java/io/OutputStream", 0);
+            Ok(Some(Value::Object(Some(os))))
+        },
+    );
+
     // ProcessHandle stub
     r.register(
         "java/lang/ProcessHandle",

@@ -424,6 +424,41 @@ JIT divide-by-zero re-run) has since been fixed; the other two remain open:
   [t11-safety-annotation-coverage.md](t11-safety-annotation-coverage.md). Documentation-only but
   large (~264 cast annotations in interpreter.rs); must be authored accurately, not marker-spammed.
 
+## Keycloak suite classpath (2026-07-02)
+
+- ✅ **Mixed JUnit 5.10.3/6.0.3 runtime on `kc-universal-cp.txt`** — FIXED (local
+  classpath file normalized to a single JUnit 6.0.3 stack). Caused 338 `CRASH` rows
+  (`NamespaceAwareStore.computeIfAbsent` `NoSuchMethodError`) across `tests/base`
+  and `tests/clustering`. Historical record moved to
+  [../internal/keycloak-junit-namespaceawarestore-classpath-crashes.md](../internal/keycloak-junit-namespaceawarestore-classpath-crashes.md).
+- ✅ **`Assert.assertNotNull` linkage crash (37 `CRASH` rows, `testsuite/model`)** —
+  FIXED (`smallrye-common-constraint-2.16.0.jar` was entirely absent from
+  `kc-universal-cp.txt`; added). Also added: a `CRATONVM_TRACE_UNIMPLEMENTED`-gated
+  diagnostic that names the missing class whenever CratonVM's classloader falls
+  back to an empty synthetic stub for an unresolvable `org/jboss/`, `org/wildfly/`,
+  `io/quarkus/`, `io/smallrye/`, … class, plus a hint on the terminal
+  `NoSuchMethodError` warning when the target class is such a stub — so this class
+  of masked-classpath-gap bug self-diagnoses next time instead of needing a
+  multi-hour investigation. Historical record moved to
+  [../internal/keycloak-smallrye-assertnotnull-linkage-crashes.md](../internal/keycloak-smallrye-assertnotnull-linkage-crashes.md).
+- ✅ **`SmallRyeConfigBuilder.addDefaultSources` linkage crash (3 `CRASH` rows,
+  `tests/db` + `tests/clustering`)** — FIXED (`smallrye-config`/
+  `smallrye-config-common`/`smallrye-config-core` 3.16.0 and, one layer down,
+  `microprofile-config-api-3.1.jar` were entirely absent from
+  `kc-universal-cp.txt`; both added). Historical record moved to
+  [../internal/keycloak-smallrye-configbuilder-defaultsources-linkage-crashes.md](../internal/keycloak-smallrye-configbuilder-defaultsources-linkage-crashes.md).
+- [keycloak-testframework-quarkus-config-classpath-gap.md](keycloak-testframework-quarkus-config-classpath-gap.md) —
+  🔴 open. Uncovered by the fixes above: `org.keycloak.testframework.config.Config`
+  needs `quarkus-core` (for `CharsetConverter`/`MemorySizeConverter`/
+  `InetSocketAddressConverter`, and — per the `assertNotNull` fix above —
+  `opentelemetry.runtime.config.build.SamplerType`), which is entirely absent from
+  `kc-universal-cp.txt`. Both fixes above still bottom out on this same gap one
+  layer further in (`SamplerType` for `testsuite/model` classes via
+  `KeycloakModelTest`; `CharsetConverter`'s `SRCFG00012` "not parameterized with a
+  type" for the `tests/db`/`tests/clustering` classes via
+  `SmallRyeConfigBuilder.withConverters`) — not new bugs, both covered by this
+  doc's existing next steps.
+
 ## Consolidation log
 
 - **2026-06-17:** Merged `precise-jit-stack-maps-multithread-fjp-worker-testcase.md`

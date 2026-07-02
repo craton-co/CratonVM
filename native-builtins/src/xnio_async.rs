@@ -87,15 +87,18 @@ const OPT_NAME: usize = 1; // String — name e.g. "WORKER_IO_THREADS"
 const OPT_TYPE_CLASS: usize = 2; // Class<?> — the T bound
 
 /// `org.xnio.OptionMap` — 1 field.
-// TRAILING extra slot (slot 1, beyond the real fields) when synthetic layouts
-// can be widened. Real-JDK mode may clamp instances to the loaded class's real
-// one-field layout, so the Rust handle is also stored in a GC-stable side table.
+// TRAILING extra slot (slot 1, beyond the real fields). In real-JDK mode
+// `org.xnio.OptionMap` is the loaded class whose slot 0 is the Object field
+// `value` (a Map); a Long written there does not round-trip (read back as an
+// Object → as_long() None → handle 0 → "stale handle"). Mirrors the
+// ServiceController `_mscId` trailing-slot pattern. Allocate with 2 slots.
 const OM_ENTRIES_HANDLE: usize = 1; // long id → `Arc<OptionMapInner>` in registry
 
 /// `org.xnio.OptionMap$Builder` — 1 field.
-// Same trailing-slot + side-table arrangement as OptionMap. Real
-// `OptionMap$Builder` slot 0 is the Object field `list`; writing a Long there
-// would not round-trip, and some loaded layouts do not admit the trailing slot.
+// TRAILING extra slot (slot 1, beyond the real fields). Real `OptionMap$Builder`
+// slot 0 is the Object field `list`; a Long there reads back as Object →
+// as_long() None → handle 0 → "stale or unknown handle" at the first
+// `Builder.set` (WildFly `ManagementWorkerService.installService`). Allocate 2 slots.
 const OMB_PENDING_HANDLE: usize = 1; // long id → `Arc<BuilderInner>` in registry
 
 /// `org.xnio.IoFuture` — 3 fields.

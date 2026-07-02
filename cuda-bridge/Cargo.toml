@@ -9,6 +9,7 @@ description = "Thin CUDA Driver API bridge for CratonVM GPU offload"
 readme = "README.md"
 repository.workspace = true
 homepage.workspace = true
+documentation.workspace = true
 keywords = ["cuda", "ffi", "gpu", "nvidia"]
 categories = ["api-bindings", "external-ffi-bindings"]
 # Withheld from crates.io at 0.3.0: early-maturity GPU/platform-glue crate.

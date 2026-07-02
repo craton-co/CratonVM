@@ -24,7 +24,7 @@
 //! `length()`/`isEmpty()` compute `value.length >> coder`; `charAt` decodes a
 //! LATIN1 byte (zero-extend) or a UTF-16 little-endian byte pair; `hashCode`
 //! runs the `h = 31*h + c` polynomial. Out-of-bounds `charAt` indices and
-//! null receivers branch to the uncommon-trap deopt stub.
+//! null receivers branch to the deopt stub.
 
 use cratonvm_jit::x64::compile;
 use cratonvm_jit::{try_resolve_string_intrinsic, JitDirectCall, StringFieldLayout};
@@ -32,18 +32,42 @@ use cratonvm_jit_api::JitRuntimeHelpers;
 use cratonvm_types::{ArrayElementType, ObjectKind, HEADER_SIZE, SLOT_SIZE};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 
-/// Counts every `uncommon_trap` invocation so the deopt tests can assert the
-/// inline guard bailed. `uncommon_trap` is a fixed `extern "C"` pointer baked
-/// into every compiled method, so the counter is process-global; `DEOPT_LOCK`
-/// serialises the deopt tests.
+/// Counts legacy `uncommon_trap` invocations. With default real-frame deopt,
+/// failed guards stash a reconstructed frame instead, so the test helpers below
+/// accept either signal while still verifying that the inline guard bailed.
 static TRAP_COUNT: AtomicU64 = AtomicU64::new(0);
 static DEOPT_LOCK: Mutex<()> = Mutex::new(());
 
 unsafe extern "C" fn recording_uncommon_trap(_vm: i64, _reason: i64, _bci: i64) -> i64 {
     TRAP_COUNT.fetch_add(1, Ordering::SeqCst);
     0 // deopt action code; the JIT stub then returns i64::MIN itself
+}
+
+fn deopt_lock() -> MutexGuard<'static, ()> {
+    DEOPT_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn clear_deopt_signals() -> u64 {
+    let _ = cratonvm_jit::deopt::take_last_deopt();
+    TRAP_COUNT.load(Ordering::SeqCst)
+}
+
+fn assert_one_deopt_after(before_traps: u64, context: &str) {
+    let trap_delta = TRAP_COUNT
+        .load(Ordering::SeqCst)
+        .saturating_sub(before_traps);
+    let frame_deopt = cratonvm_jit::deopt::take_last_deopt();
+    let signal_count = trap_delta + u64::from(frame_deopt.is_some());
+    assert_eq!(
+        signal_count,
+        1,
+        "{context} must trigger exactly one deopt; legacy_traps={trap_delta}, real_frame_deopt={}",
+        frame_deopt.is_some()
+    );
 }
 
 fn helpers() -> JitRuntimeHelpers {
@@ -447,25 +471,21 @@ fn string_char_at_utf16() {
 
 #[test]
 fn string_char_at_out_of_bounds_deopts() {
-    let _guard = DEOPT_LOCK.lock().unwrap();
+    let _guard = deopt_lock();
     let f = compile_char_at();
     let (bytes, coder) = encode("abc");
     let arr = make_byte_array(&bytes);
     let strobj = make_string(arr.ptr(), coder, 0);
     // index == length and a negative index must both trap, not read OOB.
     for bad in [3i32, -1, 999] {
-        let before = TRAP_COUNT.load(Ordering::SeqCst);
+        let before = clear_deopt_signals();
         let r = f(strobj.ptr(), bad);
         assert_eq!(
             r,
             i64::MIN,
             "OOB charAt({bad}) must return the deopt sentinel"
         );
-        assert_eq!(
-            TRAP_COUNT.load(Ordering::SeqCst),
-            before + 1,
-            "OOB charAt({bad}) must fire exactly one uncommon trap",
-        );
+        assert_one_deopt_after(before, &format!("OOB charAt({bad})"));
     }
 }
 
@@ -511,20 +531,16 @@ fn string_hash_code_returns_cached_value() {
 
 #[test]
 fn string_length_null_receiver_deopts() {
-    let _guard = DEOPT_LOCK.lock().unwrap();
+    let _guard = deopt_lock();
     let f = compile_unary("length", "()I").expect("length must register");
-    let before = TRAP_COUNT.load(Ordering::SeqCst);
+    let before = clear_deopt_signals();
     let r = f(0); // null receiver
     assert_eq!(
         r,
         i64::MIN,
         "null-receiver length must return the deopt sentinel"
     );
-    assert_eq!(
-        TRAP_COUNT.load(Ordering::SeqCst),
-        before + 1,
-        "null-receiver length must fire exactly one uncommon trap",
-    );
+    assert_one_deopt_after(before, "null-receiver length");
 }
 
 // --- CharSequence-typed call sites (receiver class-id guard) ---------------
@@ -662,7 +678,7 @@ fn charseq_char_at_string_receiver_decodes() {
 
 #[test]
 fn charseq_char_at_non_string_receiver_deopts() {
-    let _guard = DEOPT_LOCK.lock().unwrap();
+    let _guard = deopt_lock();
     let f = compile_charseq_char_at();
     let (bytes, coder) = encode("hello");
     let arr = make_byte_array(&bytes);
@@ -670,30 +686,22 @@ fn charseq_char_at_non_string_receiver_deopts() {
     // CharSequence (e.g. StringBuilder). The receiver-class-id guard must fail
     // and deopt rather than decode foreign field memory.
     let foreign = make_string_with_cid(arr.ptr(), coder, 0, NON_STRING_CLASS_ID);
-    let before = TRAP_COUNT.load(Ordering::SeqCst);
+    let before = clear_deopt_signals();
     let r = f(foreign.ptr(), 0);
     assert_eq!(
         r,
         i64::MIN,
         "a non-String CharSequence receiver must return the deopt sentinel",
     );
-    assert_eq!(
-        TRAP_COUNT.load(Ordering::SeqCst),
-        before + 1,
-        "the class-id guard must fire exactly one uncommon trap",
-    );
+    assert_one_deopt_after(before, "CharSequence class-id guard");
 }
 
 #[test]
 fn charseq_char_at_null_receiver_deopts() {
-    let _guard = DEOPT_LOCK.lock().unwrap();
+    let _guard = deopt_lock();
     let f = compile_charseq_char_at();
-    let before = TRAP_COUNT.load(Ordering::SeqCst);
+    let before = clear_deopt_signals();
     let r = f(0, 0); // null receiver — null check precedes the class-id guard
     assert_eq!(r, i64::MIN, "null CharSequence receiver must deopt");
-    assert_eq!(
-        TRAP_COUNT.load(Ordering::SeqCst),
-        before + 1,
-        "null-receiver CharSequence.charAt must fire exactly one uncommon trap",
-    );
+    assert_one_deopt_after(before, "null-receiver CharSequence.charAt");
 }

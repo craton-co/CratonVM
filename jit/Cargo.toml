@@ -9,6 +9,7 @@ description = "x86-64 JIT compiler for CratonVM"
 readme = "README.md"
 repository.workspace = true
 homepage.workspace = true
+documentation.workspace = true
 keywords.workspace = true
 categories.workspace = true
 

@@ -1225,6 +1225,19 @@ mod tests {
     }
 
     #[test]
+    fn i32_min_redirect_for_existing_bucket_is_absent_not_overflow() {
+        let path = "/java.base/java/lang/String.class";
+        let mut data = test_builder::build_simple(&sample_resources());
+        let table_len = u32::from_le_bytes(data[16..20].try_into().unwrap()) as usize;
+        let bucket = (jimage_hash(path, HASH_MULTIPLIER) as usize) % table_len;
+        let redirect_offset = HEADER_SIZE + bucket * 4;
+        data[redirect_offset..redirect_offset + 4].copy_from_slice(&i32::MIN.to_le_bytes());
+
+        let reader = JImageReader::from_bytes(data).unwrap();
+        assert!(reader.find_resource(path).unwrap().is_none());
+    }
+
+    #[test]
     fn find_resource_reconstructs_path_exactly() {
         let data = test_builder::build_simple(&sample_resources());
         let reader = JImageReader::from_bytes(data).unwrap();

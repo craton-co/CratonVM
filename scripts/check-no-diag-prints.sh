@@ -21,7 +21,9 @@
 
 set -euo pipefail
 
-cd "$(dirname "$0")/.."
+script_path=${BASH_SOURCE[0]//\\//}
+script_dir=$(cd -- "$(dirname -- "$script_path")" && pwd)
+cd -- "$script_dir/.."
 
 verbose=0
 if [[ "${1:-}" == "--verbose" ]]; then
@@ -31,9 +33,9 @@ fi
 # Forbidden bracket-tag prefixes after `eprintln!("` / `println!("`.
 # Anchored to the literal `"[<prefix>` start so we don't false-match on
 # legitimate strings that happen to mention `WP` mid-message.
-PATTERN='(println|eprintln)!\s*\(\s*"\[(WP|DIAG|TRACE|SB-TRACE|BUFFER|CV|FJP|FUT)'
+PATTERN='(println|eprintln)![[:space:]]*\([[:space:]]*"\[(WP|DIAG|TRACE|SB-TRACE|BUFFER|CV|FJP|FUT)'
 
-# Use ripgrep when available (fast, respects .gitignore); fall back to grep -R.
+# Use ripgrep when available (fast, respects .gitignore); fall back to find+grep.
 if command -v rg >/dev/null 2>&1; then
     search() {
         rg --no-heading --line-number \
@@ -45,12 +47,11 @@ if command -v rg >/dev/null 2>&1; then
     }
 else
     search() {
-        grep -R --line-number --include='*.rs' -E \
-            "$PATTERN" \
-            . 2>/dev/null | \
-            grep -v '^\./target' | \
-            grep -v '^\./scripts/' | \
-            grep -v '/tests/' || true
+        find . \
+            \( -path './.git' -o -path './target' -o -path '*/target' -o -path '*/tests' \) -prune \
+            -o -type f -name '*.rs' \
+            -exec grep --line-number --with-filename -E -- "$PATTERN" {} + \
+            2>/dev/null || true
     }
 fi
 

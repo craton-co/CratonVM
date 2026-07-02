@@ -17,23 +17,16 @@ Failure:
 java.lang.AssertionError: expected null, but was:<>
 ```
 
-The assertion is:
+## Current full-suite result
 
-```text
-client\rest\src\test\java\org\elasticsearch\client\RequestOptionsTests.java:78
-assertNull(e.getMessage());
-```
-
-## Full-suite result
-
-Full suite `all[1..2701]` on 2026-07-02 with `-TimeoutSec 300` found this as a
-single CratonVM-only failure. HotSpot passed the class.
+Run `es-current-full-jiton-20260702`, `all[1..2701]`, CratonVM JIT-on,
+`-TimeoutSec 300` found this as a single CratonVM-only failure.
 
 ```text
 index=12
 module=client/rest
 class=org.elasticsearch.client.RequestOptionsTests
-CratonVM=FAIL, 7.006s
+CratonVM=FAIL, 8.479s
 HotSpot=PASS, 3.217s
 ```
 
@@ -45,13 +38,13 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass `
   -Vm craton -Category all -Jit on -Start 12 -Count 1 -Parallel 1 -TimeoutSec 300 `
   -RunName es-requestoptions-header-message-repro-20260702 `
   -ElasticsearchRoot C:\craton\CratonVM\apps\elasticsearch `
-  -WorkDir C:\craton\CratonVM-elasticsearch-full-suite-20260702\apps\elasticsearch-suite-runner\.suite `
-  -Exe C:\craton\CratonVM-elasticsearch-full-suite-20260702\target\release\cratonvm-elasticsearch-full-suite-20260702.exe
+  -WorkDir C:\craton\CratonVM-elasticsearch-current-suite-20260702\apps\elasticsearch-suite-runner\.suite `
+  -Exe C:\craton\CratonVM-elasticsearch-current-suite-20260702\target\release\cratonvm-elasticsearch-current-suite-20260702.exe
 ```
 
 ## Evidence
 
 ```text
-C:\craton\CratonVM-elasticsearch-full-suite-20260702\apps\elasticsearch-suite-runner\.suite\results\es-full-jiton-20260702\all-jit\logs\client_rest.org.elasticsearch.client.RequestOptionsTests.out.log
+C:\craton\CratonVM-elasticsearch-current-suite-20260702\apps\elasticsearch-suite-runner\.suite\results\es-current-full-jiton-20260702\all-jit\logs\client_rest.org.elasticsearch.client.RequestOptionsTests.out.log
 C:\craton\CratonVM-elasticsearch-full-suite-20260702\apps\elasticsearch-suite-runner\.suite\results\es-full-hotspot-20260702\hotspot-jit\results.tsv
 ```

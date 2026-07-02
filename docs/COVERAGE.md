@@ -9,16 +9,16 @@ not Java-level coverage of the programs CratonVM runs.
 
 ## Coverage Target
 
-Release-ready branches are expected to demonstrate **at least 85% line
-coverage** for the Rust workspace. The current CI coverage job is still
-advisory because workspace tests and JDK-dependent paths are not yet stable
-enough to make the threshold blocking on hosted runners.
+Release-ready branches should demonstrate **at least 85% line coverage** for
+the Rust workspace, but this is an advisory target today. The current CI
+coverage job runs a target checker, yet both generation and target-check steps
+are marked `continue-on-error`; no coverage threshold is enforced by CI.
 
 Use this posture until the gate is promoted:
 
 - Treat coverage below 85% as a readiness gap that needs a note in the PR.
-- Treat missing or incomplete coverage output as a failed readiness check for
-  release branches, even though CI currently reports it as advisory.
+- Treat missing or incomplete coverage output as a release-readiness blocker,
+  even though CI currently reports it as advisory.
 - Promote the CI job to blocking only after workspace tests compile/run
   reliably under coverage and the hosted runner has the required JDK setup.
 
@@ -50,7 +50,7 @@ cargo llvm-cov --workspace --html
 (`reader`, `vm`, `jit`, the `native-*` crates, etc.). To scope to one crate,
 swap `--workspace` for `-p <crate>`, e.g. `cargo llvm-cov -p reader`.
 
-## Checking The 85% Target
+## Checking The 85% Advisory Target
 
 For local or CI LCOV output, use the repository checker:
 
@@ -58,8 +58,9 @@ For local or CI LCOV output, use the repository checker:
 pwsh scripts/check-lcov-threshold.ps1 -Path lcov.info -LineThreshold 85
 ```
 
-`cargo-llvm-cov` can also enforce the threshold directly when the coverage run
-itself is healthy enough to be blocking:
+`cargo-llvm-cov` can also enforce the target directly in a local or future
+blocking job when the coverage run itself is healthy enough to be treated as a
+gate:
 
 ```bash
 cargo llvm-cov --workspace --fail-under-lines 85
@@ -87,7 +88,7 @@ need to be separate steps, such as the current advisory workflow.
   `llvm-tools-preview`, installs `cargo-llvm-cov`, then runs
   `cargo llvm-cov --workspace --lcov --output-path lcov.info`.
 - **Checks** `lcov.info` with `scripts/check-lcov-threshold.ps1` against the
-  85% line coverage target.
+  85% line coverage target in advisory mode.
 - **Uploads** `lcov.info` as a build artifact so you can inspect coverage for a
   given commit.
 
@@ -100,8 +101,8 @@ turn the build red yet.
 The reason: some workspace tests boot the VM and run real Java, which needs a
 JDK runtime image and stable test compilation under coverage. Once the hosted
 job has those prerequisites and produces stable results, remove
-`continue-on-error` from both coverage steps and keep the 85% threshold as the
-blocking line-coverage gate.
+`continue-on-error` from both coverage steps before describing 85% line coverage
+as a blocking gate.
 
 The normal correctness gates (format, clippy, build, test) still run separately
 in `.github/workflows/ci.yml`; see
@@ -115,6 +116,6 @@ in `.github/workflows/ci.yml`; see
 - **The app gauntlet is not covered.** Coverage measures Rust tests only. The
   upstream Java applications CratonVM is validated against run through the CLI,
   not the Rust test harness.
-- **Line coverage is the readiness threshold.** Prefer region coverage when
-  hunting for untested branches, but use line coverage for the 85% gate until a
-  region threshold is explicitly adopted.
+- **Line coverage is the advisory readiness target.** Prefer region coverage
+  when hunting for untested branches, but do not describe any coverage threshold
+  as enforced until CI is promoted out of advisory mode.

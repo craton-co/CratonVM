@@ -39,7 +39,7 @@ use cratonvm_jit_api::JitRuntimeHelpers;
 use cratonvm_types::{ArrayElementType, ObjectKind, HEADER_SIZE, SLOT_SIZE};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 
 static TRAP_COUNT: AtomicU64 = AtomicU64::new(0);
 static DEOPT_LOCK: Mutex<()> = Mutex::new(());
@@ -47,6 +47,31 @@ static DEOPT_LOCK: Mutex<()> = Mutex::new(());
 unsafe extern "C" fn recording_uncommon_trap(_vm: i64, _reason: i64, _bci: i64) -> i64 {
     TRAP_COUNT.fetch_add(1, Ordering::SeqCst);
     0
+}
+
+fn deopt_lock() -> MutexGuard<'static, ()> {
+    DEOPT_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn clear_deopt_signals() -> u64 {
+    let _ = cratonvm_jit::deopt::take_last_deopt();
+    TRAP_COUNT.load(Ordering::SeqCst)
+}
+
+fn assert_one_deopt_after(before_traps: u64, context: &str) {
+    let trap_delta = TRAP_COUNT
+        .load(Ordering::SeqCst)
+        .saturating_sub(before_traps);
+    let frame_deopt = cratonvm_jit::deopt::take_last_deopt();
+    let signal_count = trap_delta + u64::from(frame_deopt.is_some());
+    assert_eq!(
+        signal_count,
+        1,
+        "{context} must trigger exactly one deopt; legacy_traps={trap_delta}, real_frame_deopt={}",
+        frame_deopt.is_some()
+    );
 }
 
 fn helpers() -> JitRuntimeHelpers {
@@ -465,17 +490,13 @@ fn string_compare_to_differential() {
 
 #[test]
 fn string_compare_to_null_argument_deopts() {
-    let _guard = DEOPT_LOCK.lock().unwrap();
+    let _guard = deopt_lock();
     let f = compile_obj_arg("compareTo", "(Ljava/lang/String;)I");
     let (a, _aa) = string_of("hello");
-    let before = TRAP_COUNT.load(Ordering::SeqCst);
+    let before = clear_deopt_signals();
     // null argument → deopt (the native re-run throws NullPointerException).
     assert_eq!(f(a.ptr(), 0), i64::MIN, "null argument must deopt");
-    assert_eq!(
-        TRAP_COUNT.load(Ordering::SeqCst),
-        before + 1,
-        "null argument must fire exactly one uncommon trap",
-    );
+    assert_one_deopt_after(before, "compareTo null argument");
 }
 
 // --- indexOf(I) -----------------------------------------------------------
@@ -520,11 +541,11 @@ fn string_index_of_char_differential() {
 
 #[test]
 fn string_index_of_char_null_receiver_deopts() {
-    let _guard = DEOPT_LOCK.lock().unwrap();
+    let _guard = deopt_lock();
     let f = compile_index_of_char();
-    let before = TRAP_COUNT.load(Ordering::SeqCst);
+    let before = clear_deopt_signals();
     assert_eq!(f(0, 'a' as i64), i64::MIN, "null receiver must deopt");
-    assert_eq!(TRAP_COUNT.load(Ordering::SeqCst), before + 1);
+    assert_one_deopt_after(before, "indexOf(I) null receiver");
 }
 
 // --- indexOf(String) ------------------------------------------------------
@@ -632,7 +653,7 @@ fn string_equals_utf16_strings() {
 
 #[test]
 fn string_equals_non_string_argument_deopts() {
-    let _guard = DEOPT_LOCK.lock().unwrap();
+    let _guard = deopt_lock();
     let f = compile_equals();
     let (a, _aa) = string_of("hello");
     // `other` has a different class id (a non-String object). The class-id
@@ -640,23 +661,19 @@ fn string_equals_non_string_argument_deopts() {
     let (bytes, coder) = encode("hello");
     let arr = make_byte_array(&bytes);
     let other = make_object(OTHER_CLASS_ID, arr.ptr(), coder, 0);
-    let before = TRAP_COUNT.load(Ordering::SeqCst);
+    let before = clear_deopt_signals();
     let r = f(a.ptr(), other.ptr());
     assert_eq!(
         r,
         i64::MIN,
         "non-String argument must return the deopt sentinel"
     );
-    assert_eq!(
-        TRAP_COUNT.load(Ordering::SeqCst),
-        before + 1,
-        "non-String argument must fire exactly one uncommon trap",
-    );
+    assert_one_deopt_after(before, "non-String equals argument");
 }
 
 #[test]
 fn string_equals_coder_mismatch_deopts() {
-    let _guard = DEOPT_LOCK.lock().unwrap();
+    let _guard = deopt_lock();
     let f = compile_equals();
     // Two Strings with different `coder` values must trap (the inline byte
     // compare is only valid for matching coders; native equals decodes).
@@ -664,12 +681,8 @@ fn string_equals_coder_mismatch_deopts() {
     let (bytes, _coder) = encode("hi");
     let arr = make_byte_array(&bytes);
     let b = make_object(STRING_CLASS_ID, arr.ptr(), 1, 0); // coder forced to 1
-    let before = TRAP_COUNT.load(Ordering::SeqCst);
+    let before = clear_deopt_signals();
     let r = f(a.ptr(), b.ptr());
     assert_eq!(r, i64::MIN, "coder mismatch must return the deopt sentinel");
-    assert_eq!(
-        TRAP_COUNT.load(Ordering::SeqCst),
-        before + 1,
-        "coder mismatch must fire exactly one uncommon trap",
-    );
+    assert_one_deopt_after(before, "equals coder mismatch");
 }
