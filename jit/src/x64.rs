@@ -8922,8 +8922,8 @@ impl Compiler {
                 self.emit_mov_reg_reg(R8, r); // arg2 = reloaded value
                 self.emit_mov_reg_reg(R9, R11); // arg3 = actual read address
                 self.emit_sub_rsp_imm(0x28); // shadow space + 16B align (after push rax)
-                                             // Cast: non-negative index/count to usize
-                self.emit_call_absolute(jit_dbg_shadow_reload_log as usize);
+                                             // Cast through a raw pointer before converting the helper address to an integer.
+                self.emit_call_absolute(jit_dbg_shadow_reload_log as *const () as usize);
                 self.buf.emit(&[0x48, 0x83, 0xC4, 0x28]); // add rsp, 0x28
                 self.buf.emit_byte(0x58); // pop rax
                 self.patch_rel32_to_here(skip2);
