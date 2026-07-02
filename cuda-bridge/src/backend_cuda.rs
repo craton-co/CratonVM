@@ -456,6 +456,11 @@ impl DeviceModuleInner {
                 }
             }
         }
+        let kernel_done = if needs_d2h_sync && !last_write_slots.is_empty() {
+            Some(std::sync::Arc::new(self.make_unrecorded_event(ctx)?))
+        } else {
+            None
+        };
         self.launch_raw_on_stream_inner(&ctx.compute, kernel, cfg, args)?;
         // AUDIT 2026-05-17 (PERF Fix 1): after the launch is submitted,
         // record the post-kernel event so a subsequent D→H copy can wait
@@ -471,34 +476,41 @@ impl DeviceModuleInner {
         // external pipeline that may wait on it, but the per-buffer
         // event is the authoritative ordering primitive now.
         if needs_d2h_sync {
-            unsafe {
-                cudarc::driver::result::event::record(ctx.barriers.e_k, ctx.compute.stream)
-                    .map_err(map_err("cuEventRecord e_k"))?;
-            }
-            if !last_write_slots.is_empty() {
-                // Build a CratonVM `Event` wrapping a fresh CUevent and
-                // record it on the compute stream the kernel ran on.
-                let kernel_done = std::sync::Arc::new(self.make_compute_event(ctx)?);
+            if let Some(kernel_done) = kernel_done {
+                if let Err(err) = self.record_compute_event(ctx, &kernel_done) {
+                    return self.recover_after_compute_completion_event_failure(
+                        ctx,
+                        &last_write_slots,
+                        err,
+                    );
+                }
                 for slot in &last_write_slots {
                     *slot.lock().unwrap_or_else(|p| p.into_inner()) = Some(kernel_done.clone());
                 }
+            }
+            unsafe {
+                cudarc::driver::result::event::record(ctx.barriers.e_k, ctx.compute.stream)
+                    .map_err(map_err("cuEventRecord e_k"))?;
             }
         }
         Ok(())
     }
 
-    /// AUDIT 2026-05-29 (H10b fix): create a fresh `crate::Event` and
-    /// record it on the context's `compute` stream. Used by
-    /// `launch_raw_inner` to give every device-ptr arg buffer a
-    /// per-buffer kernel-completion event (replacing reliance on the
-    /// clobbered context-wide `e_k`).
-    fn make_compute_event(&self, ctx: &DeviceContextInner) -> Result<crate::Event> {
+    /// Create a fresh `crate::Event` before kernel submission so an
+    /// event-allocation failure cannot happen after the kernel has
+    /// already been queued.
+    fn make_unrecorded_event(&self, ctx: &DeviceContextInner) -> Result<crate::Event> {
         // `crate::Event::new` needs a `&DeviceContext`; reconstruct a
         // cheap clone wrapper around this inner context. `DeviceContext`
         // is a newtype over `DeviceContextInner` and `Clone`, so this is
         // an Arc bump, not a new driver context.
         let ctx_pub = crate::DeviceContext::from_inner(ctx.clone());
-        let event = crate::Event::new(&ctx_pub)?;
+        crate::Event::new(&ctx_pub)
+    }
+
+    /// Record a per-buffer completion event on the compute stream after
+    /// a kernel launch has been submitted.
+    fn record_compute_event(&self, ctx: &DeviceContextInner, event: &crate::Event) -> Result<()> {
         // BUGFIX 2026-06-17 (cuda-backend SOUND): explicitly bind the
         // primary context to THIS thread before `cuEventRecord`. The
         // `unsafe impl Send + Sync` across the bridge is sound only when
@@ -518,7 +530,33 @@ impl DeviceModuleInner {
             cudarc::driver::result::event::record(event.cu_event_raw(), ctx.compute.stream)
                 .map_err(map_err("cuEventRecord kernel_done (compute)"))?;
         }
-        Ok(event)
+        Ok(())
+    }
+
+    fn recover_after_compute_completion_event_failure(
+        &self,
+        ctx: &DeviceContextInner,
+        last_write_slots: &[crate::LastWriteSlot],
+        err: DeviceError,
+    ) -> Result<()> {
+        if let Err(bind_err) = ctx.bind_to_thread() {
+            return Err(DeviceError::Launch(format!(
+                "kernel completion event recording failed ({err}); bind_to_thread cleanup failed \
+                 ({bind_err})"
+            )));
+        }
+        match unsafe { cudarc::driver::result::stream::synchronize(ctx.compute.stream) } {
+            Ok(()) => {
+                for slot in last_write_slots {
+                    *slot.lock().unwrap_or_else(|p| p.into_inner()) = None;
+                }
+                Err(err)
+            }
+            Err(sync_err) => Err(DeviceError::Launch(format!(
+                "kernel completion event recording failed ({err}); compute stream synchronize \
+                 cleanup failed ({sync_err:?})"
+            ))),
+        }
     }
 
     /// AUDIT 2026-05-24 (C32 stream-port fix): real per-stream launch.
@@ -758,7 +796,7 @@ unsafe fn upload_via_copy_h2d_stream<T: bytemuck::Pod + DeviceRepr + Send + Sync
 /// stream. Returns *without* host-synchronising.
 ///
 /// This is the correctly-async upload used by
-/// `DeviceBuffer::from_host_async`. Because the DMA and the recorded
+/// `DeviceBuffer::from_host_async_unchecked`. Because the DMA and the recorded
 /// event both live on the user stream, the documented lifetime
 /// contract — "the host slice need only outlive `stream.synchronize()`"
 /// — actually holds: a sync on the user stream orders (and thus
@@ -768,7 +806,7 @@ unsafe fn upload_via_copy_h2d_stream<T: bytemuck::Pod + DeviceRepr + Send + Sync
 ///
 /// SAFETY: `cuMemcpyHtoDAsync` does NOT retain `host` past the call,
 /// but the device read from `host` is still in flight when the call
-/// returns. The caller (`DeviceBuffer::from_host_async`) MUST keep
+/// returns. The caller (`DeviceBuffer::from_host_async_unchecked`) MUST keep
 /// `host` valid and un-moved until `upload_stream` has synchronised
 /// (the documented contract). `last_write_event` is recorded on
 /// `upload_stream` so any later `cuStreamWaitEvent(other, last_write)`
@@ -964,7 +1002,7 @@ impl<
     /// caller-supplied `upload_stream` (the user's [`crate::Stream`])
     /// and records the buffer's per-buffer `last_write_event` on that
     /// same stream, then returns *without* host-synchronising. The
-    /// caller (`DeviceBuffer::from_host_async`) MUST keep `host` alive —
+    /// caller (`DeviceBuffer::from_host_async_unchecked`) MUST keep `host` alive —
     /// and not move/mutate it — until `upload_stream` has synchronised.
     ///
     /// Previously this routed through `upload_via_copy_h2d_stream`,
@@ -975,13 +1013,13 @@ impl<
     /// freed host memory — a latent host-buffer use-after-free. Routing
     /// the copy onto `upload_stream` makes the documented contract
     /// sound.
-    pub(crate) fn from_host_async_unchecked(
+    pub(crate) unsafe fn from_host_async_unchecked(
         ctx: &DeviceContextInner,
         host: &[T],
         upload_stream: cudarc::driver::sys::CUstream,
         last_write_event: cudarc::driver::sys::CUevent,
     ) -> Result<Self> {
-        // SAFETY: the caller (`DeviceBuffer::from_host_async`) is
+        // SAFETY: the caller (`DeviceBuffer::from_host_async_unchecked`) is
         // responsible for the host-buffer lifetime; see this method's
         // doc comment. `last_write_event` is owned by the caller's
         // `Arc<Event>` and only borrowed for the FFI call.

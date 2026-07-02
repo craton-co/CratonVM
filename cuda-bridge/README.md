@@ -69,23 +69,22 @@ let stream = Stream::new(&ctx)?;
 let buf = DeviceBuffer::<f32>::from_host_async(&ctx, &host[..], &stream)?;
 module.launch_on_stream(&ctx, "vector_add", &cfg, args, &stream)?;
 let mut out = vec![0.0f32; host.len()];
-buf.to_host_async(&mut out, &stream)?;
-stream.synchronize()?;          // block until all three steps done
+buf.to_host_async(&mut out, &stream)?; // scoped safe download synchronizes
 ```
 
-`from_host_async`, `to_host_async`, and `launch_on_stream` mirror the
-synchronous variants but enqueue work onto the given stream instead of the
-context's default stream.
+`from_host_async`, `to_host_async`, and `launch_on_stream` order work on the
+given stream instead of the context's default stream. The safe memcpy APIs do
+not borrow caller-owned host slices across a returned async boundary:
 
-**Host-buffer lifetime contract.** The host slice passed to
-`from_host_async` (and the destination slice passed to `to_host_async`)
-must outlive the *signalling* of the buffer's `last_write` event — i.e.
-the point at which all the device-side work the slice participates in
-has retired. `stream.synchronize()` is the only host-side primitive
-that observably guarantees this: after it returns, every event recorded
-on `stream` (including the upload event installed by `from_host_async`
-and every kernel-completion event installed by `launch_on_stream`) has
-fired, so the host slice may be safely dropped or reused.
+- `from_host_async` copies the source slice into owned staging retained by the
+  returned `DeviceBuffer`, then enqueues the upload.
+- `to_host_async` downloads into owned staging, synchronizes the stream, and
+  copies into the caller's destination before returning.
+
+For fully non-blocking borrowed host buffers, use the unsafe
+`from_host_async_unchecked` and `to_host_async_unchecked` variants. Their host
+buffers must remain allocated at the same address and not reused until
+`stream.synchronize()` or an equivalent event wait proves the DMA has retired.
 
 **Cross-stream ordering.** The bridge installs an upload-completion
 event on the buffer when `from_host_async` returns; subsequent
