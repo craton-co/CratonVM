@@ -10,8 +10,9 @@ Machine implemented from scratch in Rust.
 Analyses `@Parallel` / `@GpuKernel`-annotated static Java methods to
 decide GPU eligibility (see `analyzer::OffloadVerdict`), and emits a
 PTX text module (`emitter::PtxModule`) the `cuda-bridge` crate can load
-and launch. Tests load real `.class` files from `test_classes/gpu/`
-rather than synthetic bytecode arrays.
+and launch. Tests compile real `.java` fixtures from `../test_classes/gpu/`
+into `OUT_DIR/gpu-fixtures` and load those generated `.class` files rather
+than synthetic bytecode arrays.
 
 ## Non-goals
 
@@ -23,7 +24,7 @@ rather than synthetic bytecode arrays.
 ## Usage
 
 ```rust
-use jit_cuda::{analyze, OffloadVerdict};
+use cratonvm_jit_cuda::{analyze, OffloadVerdict};
 
 let verdict = analyze(&method);
 if matches!(verdict, OffloadVerdict::Eligible { .. }) {
@@ -31,6 +32,23 @@ if matches!(verdict, OffloadVerdict::Eligible { .. }) {
     // then ship the PtxModule to cuda-bridge for load + launch.
 }
 ```
+
+## Fixtures and GPU-toolchain checks
+
+`build.rs` requires `javac` on `PATH` to compile the Java fixture set. When
+`javac` is missing, source discovery fails, or compilation fails, the build
+emits a `cargo:warning=` and the generated fixture directory remains empty;
+fixture-dependent tests then fail loudly with `failed to read fixture` instead
+of passing against stale checked-in `.class` files.
+
+The optional `gpu-it` feature enables the `ptxas` round-trip test that is
+ignored by default:
+
+```sh
+cargo test -p cratonvm-jit-cuda --features gpu-it ptxas_round_trip_vector_add
+```
+
+Set `PTXAS=/path/to/ptxas` if the NVIDIA assembler is not on `PATH`.
 
 ## Status
 

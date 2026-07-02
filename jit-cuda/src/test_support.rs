@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2024-2026 Craton Software Company
 
-//! Test helpers — load real `.class` files compiled by `build.rs` from
-//! `test_classes/gpu/`.
+//! Test helpers - load real `.class` files compiled by `build.rs` into
+//! the crate's generated fixture directory.
 //!
 //! **No synthetic bytecode** anywhere in this module. The whole point
 //! of this fixture set is to exercise the real reader/analyzer/emitter
@@ -16,7 +16,7 @@ use cratonvm_reader::class_reader::read_class;
 use cratonvm_reader::method::ClassFileMethod;
 
 /// Load `class_name.class` from the fixtures directory and return the
-/// named method. Panics if the class or method cannot be found — tests
+/// named method. Panics if the class or method cannot be found - tests
 /// that depend on a fixture should fail loudly when it goes missing.
 ///
 /// The reader builds every attribute as a `LazyAttribute::Raw` and
@@ -64,13 +64,6 @@ pub fn load_method(class_name: &str, method_name: &str, descriptor: &str) -> Cla
 }
 
 fn fixture_path(class_name: &str) -> std::path::PathBuf {
-    // CARGO_MANIFEST_DIR points at jit-cuda/. Fixtures live one level
-    // up under test_classes/gpu/.
-    let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    std::path::Path::new(manifest_dir)
-        .parent()
-        .expect("workspace root is jit-cuda/..")
-        .join("test_classes")
-        .join("gpu")
-        .join(format!("{class_name}.class"))
+    let fixture_dir = env!("JIT_CUDA_FIXTURE_DIR");
+    std::path::Path::new(fixture_dir).join(format!("{class_name}.class"))
 }

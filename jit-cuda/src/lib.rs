@@ -13,8 +13,9 @@
 //! - **No `cudarc` / `libcuda` references.** This crate produces
 //!   `String` PTX. The runtime lives elsewhere.
 //! - **No JVM heap access.** Marshalling is in `vm/runtime/gpu_marshal.rs`.
-//! - **No synthetic stubs.** Tests load real `.class` files from
-//!   `test_classes/gpu/`, compiled by the workspace `build.rs`.
+//! - **No synthetic stubs.** Tests compile real `.java` fixtures from
+//!   `../test_classes/gpu/` into `OUT_DIR/gpu-fixtures` and load those
+//!   generated `.class` files.
 
 pub mod analyzer;
 pub mod annotations;

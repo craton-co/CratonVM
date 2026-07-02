@@ -125,6 +125,7 @@ fn main() {
             );
         }
     }
+    sources.sort();
 
     // Re-run when any individual `.java` source changes. The directory
     // `rerun-if-changed` above is not enough: on many platforms a directory's

@@ -26,12 +26,15 @@ craton-gpu = { path = "../craton-gpu", version = "0.3.0", package = "cratonvm-gp
 thiserror = { workspace = true }
 
 [dev-dependencies]
-# Real .class files live in test_classes/gpu/. Tests parse them
-# through cratonvm-reader — no synthetic bytecode arrays.
+# Real .class files are generated from ../test_classes/gpu/*.java by
+# build.rs into OUT_DIR/gpu-fixtures. Tests parse them through
+# cratonvm-reader - no synthetic bytecode arrays.
 
 [features]
 default = []
-# Tests requiring an attached GPU (assembled by `ptxas`).
+# Run CUDA-toolchain integration checks such as the ptxas round trip.
+# This does not add runtime dependencies; the host must provide the
+# external NVIDIA tools.
 gpu-it = []
 
 [lints]
