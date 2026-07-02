@@ -31,7 +31,8 @@ A successful `JNI_CreateJavaVM` hands back a `JavaVM*` (invocation table) and a
 `CallStaticVoidMethod`, …). Mirroring HotSpot, **at most one VM per process** is
 allowed; a second create returns `JNI_EEXIST`. The init args accept the common
 HotSpot option forms: `-Xmx<size>`, `-cp` / `-classpath` / `--class-path`, and
-`-D<key>=<value>`.
+`-D<key>=<value>`. Unsupported JNI versions fail with `JNI_EVERSION`; unknown or
+malformed options fail with `JNI_ERR` unless `ignoreUnrecognized` is non-zero.
 
 ### 2. Flat opaque-handle C API (`cratonvm_*`)
 
@@ -39,11 +40,13 @@ A curated convenience surface over opaque handles + POD, for hosts that prefer
 not to drive the raw JNIEnv table by slot index:
 
 - **Lifecycle:** `cratonvm_create`, `cratonvm_destroy`
+- **References:** `cratonvm_release_ref`
 - **Classes:** `cratonvm_load_class`, `cratonvm_class_name`, `cratonvm_object_class`
 - **Invocation:** `cratonvm_invoke_static`, `cratonvm_invoke_virtual`
 - **Strings:** `cratonvm_new_string`, `cratonvm_string_utf8`, `cratonvm_free_string`
-- **Fields:** `cratonvm_field_count`, `cratonvm_field_index`, `cratonvm_get_field`,
-  `cratonvm_get_field_by_name`, `cratonvm_set_field`, `cratonvm_set_field_by_name`
+- **Fields:** `cratonvm_field_count`, `cratonvm_field_index`, `cratonvm_field_index_desc`,
+  `cratonvm_get_field`, `cratonvm_get_field_by_name`, `cratonvm_set_field`,
+  `cratonvm_set_field_by_name`
 - **Errors:** `cratonvm_last_error`, `cratonvm_clear_error` (thread-local, mirroring
   JNI's per-thread pending exception)
 
@@ -56,7 +59,8 @@ Invocation-API VM or one flat `CratonVm`. `cratonvm_create` returns `NULL` with
 `cratonvm_last_error()` set if another VM surface is active. `CratonRef` values
 are opaque object tokens, not heap addresses; stale/fabricated object tokens and
 unknown inbound `CratonValue` tags fail the call instead of being treated as
-`null`.
+`null`. Each nonzero `CratonRef` returned by the API pins a JNI global ref until
+the host calls `cratonvm_release_ref` for that returned token or destroys the VM.
 
 Every exported `extern "C"` entry point wraps its body in `catch_unwind`, so a Rust
 panic never unwinds across the C boundary.
@@ -77,6 +81,7 @@ CratonValue r = cratonvm_invoke_static(
     "(Ljava/lang/String;)I", &arg, 1);
 /* r.tag == 1 (INT), r.payload == 42 */
 
+cratonvm_release_ref(vm, s);
 cratonvm_destroy(vm);
 ```
 

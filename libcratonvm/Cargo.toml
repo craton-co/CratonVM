@@ -26,8 +26,20 @@ build = "build.rs"
 # downstream Rust crates can depend on it normally.
 crate-type = ["cdylib", "staticlib", "rlib"]
 
-[dependencies]
-cratonvm-vm = { path = "../vm", version = "0.3.0" }
+# Keep libcratonvm publishable: cratonvm-vm's default feature set includes
+# `awt`, which pulls the unpublished cratonvm-native-awt crate. Mirror the
+# remaining default VM support features explicitly and leave AWT opt-out here.
+[dependencies.cratonvm-vm]
+path = "../vm"
+version = "0.3.0"
+default-features = false
+features = [
+    "experimental-tls",
+    "experimental-jmx",
+    "experimental-serialization",
+    "experimental-aot",
+    "experimental-debug",
+]
 
 [lints]
 workspace = true
