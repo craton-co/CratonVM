@@ -327,12 +327,9 @@ const DEFAULT_HEAP_FLOOR: u64 = 16 * 1024 * 1024;
 /// pass an explicit `-Xmx`; an explicit maximum must still take precedence
 /// in the caller.
 ///
-/// TODO(wiring): call this from the VM heap-sizing path
-/// (`VmConfig`/`vm_init.rs`) to seed `max_heap_size` when the user did not
-/// specify `-Xmx`, e.g.:
-/// `config.max_heap_size = container::suggested_default_max_heap(&info, config.max_heap_size);`
-/// guarded by "no explicit -Xmx provided". Kept separate here so this stays
-/// a behavior-preserving pure addition.
+/// `SharedVm::new` uses this to seed `max_heap_size` only while the config is
+/// still at the built-in default. Callers that set a non-default heap size keep
+/// their configured value.
 pub fn suggested_default_max_heap(info: &ContainerInfo, fixed_default: usize) -> usize {
     match info.memory_limit {
         Some(limit) => {
