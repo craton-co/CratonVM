@@ -8812,6 +8812,24 @@ fn sort_with_comparator(
         ctx.set_array_element(data, out, val);
     }
     ctx.unpin_native_roots(data_pin);
+    // Detach from `Map.values()` live-view semantics. Real `Map.values()`'s
+    // return type doesn't implement `List` (no `.sort()` possible on it at
+    // all on HotSpot) — reaching this native means whatever called
+    // sort()/Collections.sort() already treated this object as a plain,
+    // independent `List`, e.g. `DefaultListableBeanFactory
+    // .resolveMultipleBeanCollection`'s `@Order`-based `List<T>` autowiring,
+    // which builds the list from `matchingBeans.values()`. Left unfixed, the
+    // very next `iterator()`/`toString()`-adjacent call sees the live-view
+    // marker (`values_view_source`) still present and silently discards the
+    // sort by resyncing from the ORIGINAL (unsorted) backing map — exactly
+    // what broke `Spr11310Tests`/`Spr12636Tests`. Mirrors the same
+    // null-the-marker fix already applied to `native_al_retain_all`.
+    if values_view_source(ctx, list).is_some() {
+        let dlen = ctx.array_length(data) as usize;
+        if dlen > 0 {
+            ctx.set_array_element(data, dlen - 1, Value::Object(None));
+        }
+    }
     Ok(None)
 }
 

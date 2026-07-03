@@ -24616,7 +24616,9 @@ fn execute_invokevirtual_vtable_fast(
     }
 
     if crate::runtime::env_cache::dbg_vdisp()
-        && (method_name.as_ref() == "hashCode" || method_name.as_ref() == "equals")
+        && (method_name.as_ref() == "hashCode"
+            || method_name.as_ref() == "equals"
+            || method_name.as_ref() == "run")
     {
         let cm = shared.class_manager.read();
         let caller = cm
@@ -24627,15 +24629,18 @@ fn execute_invokevirtual_vtable_fast(
             .get_class(receiver_class_id)
             .map(|c| c.name.to_string())
             .unwrap_or_default();
-        let declaring = crate::classloading::find_method_recursive(
+        let found = crate::classloading::find_method_recursive(
             receiver_class_id,
             &method_name,
             &method_descriptor,
             &cm.class_store,
-        )
-        .and_then(|(_m, did)| cm.class_store.get(did).map(|c| c.name.to_string()))
-        .unwrap_or_default();
-        eprintln!("[vdisp] VTFAST caller={caller} method={method_name}{method_descriptor} receiver_class={rcv} declaring={declaring}");
+        );
+        let declaring = found
+            .and_then(|(_m, did)| cm.class_store.get(did).map(|c| c.name.to_string()))
+            .unwrap_or_default();
+        let is_abstract = found.map(|(m, _)| m.is_abstract()).unwrap_or(false);
+        let has_code = found.map(|(m, _)| m.code().is_some()).unwrap_or(false);
+        eprintln!("[vdisp] VTFAST caller={caller} method={method_name}{method_descriptor} receiver_class={rcv} declaring={declaring} is_abstract={is_abstract} has_code={has_code}");
     }
 
     // Interpreter intrinsic shadowing guard.
@@ -25806,7 +25811,9 @@ fn populate_virtual_invoke_cache(
         };
 
     if crate::runtime::env_cache::dbg_vdisp()
-        && (method_name.as_ref() == "hashCode" || method_name.as_ref() == "equals")
+        && (method_name.as_ref() == "hashCode"
+            || method_name.as_ref() == "equals"
+            || method_name.as_ref() == "run")
     {
         let cm = shared.class_manager.read();
         let caller = cm
@@ -25822,15 +25829,18 @@ fn populate_virtual_invoke_cache(
             .and_then(|_| resolve_method_ref(shared, caller_class_id, cp_index).ok())
             .map(|(cn, _, _, _)| cn.to_string())
             .unwrap_or_default();
-        let declaring = crate::classloading::find_method_recursive(
+        let found = crate::classloading::find_method_recursive(
             receiver_class_id,
             &method_name,
             &descriptor,
             &cm.class_store,
-        )
-        .and_then(|(_m, did)| cm.class_store.get(did).map(|c| c.name.to_string()))
-        .unwrap_or_default();
-        eprintln!("[vdisp] POPULATE caller={caller} cp_static={cp_static} method={method_name}{descriptor} receiver_class={rcv} declaring={declaring}");
+        );
+        let declaring = found
+            .and_then(|(_m, did)| cm.class_store.get(did).map(|c| c.name.to_string()))
+            .unwrap_or_default();
+        let is_abstract = found.map(|(m, _)| m.is_abstract()).unwrap_or(false);
+        let has_code = found.map(|(m, _)| m.code().is_some()).unwrap_or(false);
+        eprintln!("[vdisp] POPULATE caller={caller} cp_static={cp_static} method={method_name}{descriptor} receiver_class={rcv} declaring={declaring} is_abstract={is_abstract} has_code={has_code}");
     }
 
     // Interpreter intrinsic probe (invokevirtual/invokeinterface).
