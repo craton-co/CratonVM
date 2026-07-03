@@ -4352,6 +4352,13 @@ impl GenerationalHeap {
                     if header.gc_flags & GC_FLAG_MARKED != 0 && aged && !pinned.contains(&addr) {
                         match old_gen.alloc(total_size, 8) {
                             Some(dst) => {
+                                // gcstress face-1 hunt (no-op unless gated).
+                                crate::heap::cell_watch_check(
+                                    dst as usize,
+                                    total_size,
+                                    "selective-promote-evac",
+                                    &(src as usize),
+                                );
                                 // SAFETY: src/dst are valid, non-overlapping, total_size bytes.
                                 unsafe { std::ptr::copy_nonoverlapping(src, dst, total_size) };
                                 // Replicate the atomic mark_word through atomic ops
@@ -6370,6 +6377,13 @@ impl GenerationalHeap {
         };
 
         // Copy the entire object
+        // gcstress face-1 hunt (no-op unless gated).
+        crate::heap::cell_watch_check(
+            new_ptr as usize,
+            total_size,
+            "cheney-copy",
+            &(old_ptr as usize),
+        );
         // SAFETY: `old_ptr` and `new_ptr` are valid, non-overlapping regions of `total_size` bytes.
         unsafe {
             std::ptr::copy_nonoverlapping(old_ptr, new_ptr, total_size);
@@ -7664,6 +7678,8 @@ unsafe fn read_slot(ptr: *mut u8) -> Value {
 // SAFETY: caller guarantees `ptr` points to a valid Value slot within a heap object.
 #[inline]
 unsafe fn write_slot(ptr: *mut u8, value: Value) {
+    // gcstress face-1 hunt (no-op unless CRATONVM_DBG_WATCH_CELL is set).
+    crate::heap::cell_watch_check(ptr as usize, 16, "write_slot", &value);
     std::ptr::write(ptr as *mut Value, value);
 }
 

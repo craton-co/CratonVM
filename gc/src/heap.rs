@@ -1562,12 +1562,56 @@ pub unsafe fn read_prim_element(base: *mut u8, index: usize, et: ArrayElementTyp
     }
 }
 
+/// gcstress residual face-1 hunt (`CRATONVM_DBG_WATCH_CELL=<hex addr>`) — a
+/// software write-watch over the heap write primitives. Every instrumented
+/// writer calls [`cell_watch_check`] with its destination range; a range that
+/// covers the watched address prints the site, the range, and a backtrace.
+/// Unlike a DR hardware watchpoint this covers BULK copies (range overlap)
+/// and needs no per-thread arming. `0` = disabled (single cached load + cmp
+/// on the hot paths).
+#[inline]
+pub fn cell_watch_addr() -> usize {
+    static A: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *A.get_or_init(|| {
+        std::env::var("CRATONVM_DBG_WATCH_CELL")
+            .ok()
+            .and_then(|s| {
+                let s = s.trim();
+                let s = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")).unwrap_or(s);
+                usize::from_str_radix(s, 16).ok()
+            })
+            .unwrap_or(0)
+    })
+}
+
+/// See [`cell_watch_addr`]. `extra` carries the value/context being written.
+#[inline]
+pub fn cell_watch_check(dst: usize, len: usize, site: &str, extra: &dyn std::fmt::Debug) {
+    let w = cell_watch_addr();
+    if w != 0 && dst <= w && w.wrapping_sub(dst) < len {
+        eprintln!(
+            "[CELLWATCH] {site}: write [{dst:#x} +{len}) covers watch {w:#x} value={extra:?}\n{}",
+            std::backtrace::Backtrace::force_capture(),
+        );
+    }
+}
+
 /// Write an array element to compact storage.
 ///
 /// # Safety
 /// `base` must point to the start of the array data area (header + HEADER_SIZE).
 #[inline]
 pub unsafe fn write_prim_element(base: *mut u8, index: usize, et: ArrayElementType, value: Value) {
+    // gcstress face-1 hunt (no-op unless CRATONVM_DBG_WATCH_CELL is set).
+    if cell_watch_addr() != 0 {
+        let width: usize = match et {
+            ArrayElementType::Byte | ArrayElementType::Boolean => 1,
+            ArrayElementType::Char | ArrayElementType::Short => 2,
+            ArrayElementType::Int | ArrayElementType::Float => 4,
+            _ => 8,
+        };
+        cell_watch_check(base as usize + index * width, width, "write_prim_element", &value);
+    }
     match et {
         ArrayElementType::Int => {
             let v = match value {
