@@ -172,7 +172,11 @@ fn dbg() -> bool {
 #[derive(Default)]
 pub struct TakenOver {
     handles: Vec<isize>,
-    tids: Vec<u32>,
+    /// OS tids of the frozen peers, parallel to `handles`. `pub(crate)` so
+    /// the initiator's identity-based barrier excusal (xt-hardening
+    /// 2026-07-03) can check each newly-frozen tid against the counted-set
+    /// snapshot.
+    pub(crate) tids: Vec<u32>,
 }
 
 impl TakenOver {

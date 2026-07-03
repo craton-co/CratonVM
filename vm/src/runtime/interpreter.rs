@@ -451,6 +451,7 @@ fn mtroots_selfcheck(thread: &JvmThread, heap: &crate::memory::VmHeap, location:
 fn stw_take_over_and_wait(
     shared: &SharedVm,
     xt_roots: &mut Vec<ObjectRef>,
+    counted_os_tids: &[u32],
 ) -> crate::jit::xt_root_scan::TakenOver {
     use crate::jit::xt_root_scan as xt;
     // The forcible take-over is only sound on a heap whose young collection is
@@ -470,17 +471,38 @@ fn stw_take_over_and_wait(
     let mut rounds = 0u32;
     let mut warned = false;
     loop {
+        let tids_before = taken.tids.len();
         let newly = xt::take_over_pass(&mut taken, &|a| shared.heap.is_object_address(a), xt_roots);
         if newly > 0 {
-            // TODO(xt-hardening follow-up): this blind numeric reduction can
-            // over-reduce when the frozen peer was spawned AFTER
-            // `request_stw_counted` computed `expected` (it was never
-            // counted) — the barrier then releases while a genuinely counted
-            // mutator still runs, racing the collection. Identity-based
-            // excusal (track counted tids at request time; only excuse
-            // members) is the proper fix; needs gc_barrier surgery. See
-            // docs/known-issues/xt-takeover-activation-young-corruption.md.
-            shared.gc_barrier.reduce_expected(newly as u32);
+            // xt-hardening (2026-07-03): identity-based excusal. Only excuse
+            // frozen peers that were actually COUNTED in the barrier's
+            // `expected` (the OS-tid snapshot is taken atomically with the
+            // expected computation, under the same registry lock). Excusing
+            // an uncounted newcomer — a thread spawned after the snapshot
+            // that reached JIT code during the takeover loop — over-reduces
+            // `expected`, releasing the barrier while a genuinely counted
+            // mutator still runs: mutation concurrent with mark+sweep. An
+            // uncounted frozen peer stays frozen and scanned but excuses
+            // nobody (the barrier never expected it).
+            let mut excuse = 0u32;
+            for &tid in &taken.tids[tids_before..] {
+                if counted_os_tids.contains(&tid) {
+                    excuse += 1;
+                } else {
+                    static N: std::sync::atomic::AtomicUsize =
+                        std::sync::atomic::AtomicUsize::new(0);
+                    if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
+                        tracing::warn!(
+                            os_tid = tid,
+                            "xt takeover froze an uncounted newcomer thread — \
+                             scanned but not excused from the barrier"
+                        );
+                    }
+                }
+            }
+            if excuse > 0 {
+                shared.gc_barrier.reduce_expected(excuse);
+            }
         }
         rounds += 1;
         if shared.gc_barrier.wait_for_all_timeout(WAIT_SLICE) {
@@ -736,14 +758,24 @@ fn maybe_gc(shared: &SharedVm, thread: &mut JvmThread) {
             run_finalizers(shared, thread);
         } else {
             // Multi-threaded path: coordinate via GC barrier
-            if shared.gc_barrier.request_stw_counted(thread.thread_id, || {
-                u32::try_from(shared.thread_registry.alive_count()).unwrap_or(u32::MAX)
-            }) {
+            let mut counted_os_tids: Vec<u32> = Vec::new();
+            if {
+                // xt-hardening (2026-07-03): snapshot the counted alive
+                // set's OS tids atomically with the expected computation
+                // (same closure, same barrier lock) for identity-based
+                // takeover excusal.
+                counted_os_tids.clear();
+                shared.gc_barrier.request_stw_counted(thread.thread_id, || {
+                    let (n, tids) = shared.thread_registry.alive_count_and_os_tids();
+                    counted_os_tids = tids;
+                    u32::try_from(n).unwrap_or(u32::MAX)
+                })
+            } {
                 // We are the GC initiator. BUG-03 — forcibly stop in-JIT
                 // peers and conservatively scan them before waiting for the
                 // cooperative mutators.
                 let mut xt_roots: Vec<ObjectRef> = Vec::new();
-                let taken = stw_take_over_and_wait(shared, &mut xt_roots);
+                let taken = stw_take_over_and_wait(shared, &mut xt_roots, &counted_os_tids);
 
                 // Collect roots: current thread + all snapshots + shared state
                 let mut roots = collect_roots(shared, thread);
@@ -860,12 +892,20 @@ fn maybe_gc_forced(shared: &SharedVm, thread: &mut JvmThread) {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         note_gc_productivity(shared, before_live);
     } else {
-        if shared.gc_barrier.request_stw_counted(thread.thread_id, || {
-            u32::try_from(shared.thread_registry.alive_count()).unwrap_or(u32::MAX)
-        }) {
+        let mut counted_os_tids: Vec<u32> = Vec::new();
+        if {
+            // xt-hardening (2026-07-03): see maybe_gc — atomic counted-set
+            // snapshot for identity-based takeover excusal.
+            counted_os_tids.clear();
+            shared.gc_barrier.request_stw_counted(thread.thread_id, || {
+                let (n, tids) = shared.thread_registry.alive_count_and_os_tids();
+                counted_os_tids = tids;
+                u32::try_from(n).unwrap_or(u32::MAX)
+            })
+        } {
             // BUG-03 — forcibly stop + conservatively scan in-JIT peers.
             let mut xt_roots: Vec<ObjectRef> = Vec::new();
-            let taken = stw_take_over_and_wait(shared, &mut xt_roots);
+            let taken = stw_take_over_and_wait(shared, &mut xt_roots, &counted_os_tids);
             let mut roots = collect_roots(shared, thread);
             let snapshot_roots = shared.thread_registry.collect_all_root_snapshots();
             roots.extend(snapshot_roots);
@@ -1017,12 +1057,20 @@ pub fn force_gc_from_native(shared: &SharedVm, thread: &mut JvmThread) {
             shared.finalizer_thread.enqueue(*new_addr);
         }
     } else {
-        if shared.gc_barrier.request_stw_counted(thread.thread_id, || {
-            u32::try_from(shared.thread_registry.alive_count()).unwrap_or(u32::MAX)
-        }) {
+        let mut counted_os_tids: Vec<u32> = Vec::new();
+        if {
+            // xt-hardening (2026-07-03): see maybe_gc — atomic counted-set
+            // snapshot for identity-based takeover excusal.
+            counted_os_tids.clear();
+            shared.gc_barrier.request_stw_counted(thread.thread_id, || {
+                let (n, tids) = shared.thread_registry.alive_count_and_os_tids();
+                counted_os_tids = tids;
+                u32::try_from(n).unwrap_or(u32::MAX)
+            })
+        } {
             // BUG-03 — forcibly stop + conservatively scan in-JIT peers.
             let mut xt_roots: Vec<ObjectRef> = Vec::new();
-            let taken = stw_take_over_and_wait(shared, &mut xt_roots);
+            let taken = stw_take_over_and_wait(shared, &mut xt_roots, &counted_os_tids);
             let mut roots = collect_roots(shared, thread);
             let snapshot_roots = shared.thread_registry.collect_all_root_snapshots();
             roots.extend(snapshot_roots);
