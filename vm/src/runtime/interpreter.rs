@@ -533,8 +533,19 @@ fn stw_take_over_and_wait(
         && shared.gc_barrier.blocked_count() > 0
         && crate::jit::conservative_roots::any_thread_in_jit()
     {
-        let (windows, _roots) =
-            xt::helper_window_pass(&taken, &|a| shared.heap.is_object_address(a), xt_roots);
+        // xt-hardening follow-up (2026-07-03): scope the pass to threads
+        // ACTUALLY in a blocked region (the only gap it exists to close —
+        // see helper_window_pass's doc comment). A cooperatively-arrived
+        // mutator already published its JIT roots via update_root_snapshot;
+        // re-scanning it only widens the conservative-candidate volume that
+        // feeds the mark-phase writer, with zero coverage benefit.
+        let blocked_os_tids = shared.thread_registry.blocked_os_tids();
+        let (windows, _roots) = xt::helper_window_pass(
+            &taken,
+            &|a| shared.heap.is_object_address(a),
+            xt_roots,
+            &blocked_os_tids,
+        );
         helper_windows = windows;
     }
     // Publish any reserved TLAB tails still present after the barrier is
