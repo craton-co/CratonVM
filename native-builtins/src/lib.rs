@@ -29902,13 +29902,40 @@ fn native_charset_for_name(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     };
     let normalized = normalize_charset_name(&name);
     if normalized.is_empty() {
-        return Err(RuntimeError::IllegalArgumentException {
-            message: format!("Unsupported charset: {}", name),
-        }
-        .into());
+        // Real `Charset.forName` throws the specific `UnsupportedCharsetException`
+        // subclass (NOT a bare `IllegalArgumentException`) for a syntactically
+        // valid but unsupported name. `ResourceBundleMessageSourceTests.
+        // resourceBundleMessageSourceWithInvalidDefaultCharsetName` asserts the
+        // concrete type via `assertThatExceptionOfType(UnsupportedCharsetException
+        // .class)`, which a plain `IllegalArgumentException` fails even though
+        // `UnsupportedCharsetException` is itself an `IllegalArgumentException`
+        // subclass — the assertion requires the exact/more-specific type.
+        return Err(throw_unsupported_charset_exception(ctx, &name));
     }
     let charset = charset_alloc(ctx, &normalized);
     Ok(Some(Value::Object(Some(charset))))
+}
+
+/// Construct and throw a real `java.nio.charset.UnsupportedCharsetException`
+/// via its public `(String charsetName)` constructor, matching real JDK's
+/// `Charset.forName` contract for a syntactically valid but unsupported name.
+fn throw_unsupported_charset_exception(ctx: &mut dyn NativeContext, name: &str) -> MethodCallFailed {
+    match ctx.new_object("java/nio/charset/UnsupportedCharsetException") {
+        Ok(Some(Value::Object(Some(exc)))) => {
+            let name_str = ctx.create_string(name);
+            let _ = ctx.invoke(
+                "java/nio/charset/UnsupportedCharsetException",
+                "<init>",
+                "(Ljava/lang/String;)V",
+                &[Value::Object(Some(exc)), Value::Object(Some(name_str))],
+            );
+            MethodCallFailed::ExceptionThrown(exc)
+        }
+        _ => RuntimeError::IllegalArgumentException {
+            message: format!("Unsupported charset: {}", name),
+        }
+        .into(),
+    }
 }
 
 fn native_charset_default(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
@@ -30039,9 +30066,17 @@ fn native_std_charset_latin1(ctx: &mut dyn NativeContext, _args: &[Value]) -> Me
 pub(crate) fn normalize_charset_name(name: &str) -> String {
     match name.to_uppercase().replace(['-', '_'], "").as_str() {
         "UTF8" => "UTF-8".to_string(),
-        "UTF16" => "UTF-16".to_string(),
-        "UTF16BE" => "UTF-16BE".to_string(),
-        "UTF16LE" => "UTF-16LE".to_string(),
+        // "unicode" is the JDK's own alias for UTF-16 (`sun.nio.cs.UTF_16`'s
+        // alias list is `{"UTF16", "utf16", "unicode", "UnicodeBig"}`), and
+        // "UnicodeBigUnmarked"/"UnicodeLittleUnmarked" alias the no-BOM
+        // BE/LE variants. Missing "unicode" made
+        // `Charset.forName("unicode")` — a legal charset name on real
+        // JDK — throw `UnsupportedCharsetException` here instead
+        // (`ResourceBundleMessageSourceTests.
+        // reloadableResourceBundleMessageSourceWithInappropriateDefaultCharsetName`).
+        "UTF16" | "UNICODE" | "UNICODEBIG" => "UTF-16".to_string(),
+        "UTF16BE" | "UNICODEBIGUNMARKED" => "UTF-16BE".to_string(),
+        "UTF16LE" | "UNICODELITTLEUNMARKED" => "UTF-16LE".to_string(),
         "UTF32" => "UTF-32".to_string(),
         "UTF32BE" => "UTF-32BE".to_string(),
         "UTF32LE" => "UTF-32LE".to_string(),
