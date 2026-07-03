@@ -61,66 +61,6 @@ fn register_test_harness_natives(registry: &mut NativeMethodRegistry) {
     );
 }
 
-fn init_wrapper_type(
-    ctx: &mut dyn NativeContext,
-    wrapper_name: &str,
-    primitive_name: &str,
-) -> MethodCallResult {
-    let mirror = ctx.primitive_class_mirror(primitive_name);
-    if let Some(class_id) = ctx.class_id_by_name(wrapper_name) {
-        ctx.set_static_field(class_id, 0, Value::Object(Some(mirror)));
-    }
-    Ok(None)
-}
-
-fn clinit_integer_type(ctx: &mut dyn NativeContext, _: &[Value]) -> MethodCallResult {
-    init_wrapper_type(ctx, "java/lang/Integer", "int")
-}
-
-fn clinit_long_type(ctx: &mut dyn NativeContext, _: &[Value]) -> MethodCallResult {
-    init_wrapper_type(ctx, "java/lang/Long", "long")
-}
-
-fn clinit_float_type(ctx: &mut dyn NativeContext, _: &[Value]) -> MethodCallResult {
-    init_wrapper_type(ctx, "java/lang/Float", "float")
-}
-
-fn clinit_double_type(ctx: &mut dyn NativeContext, _: &[Value]) -> MethodCallResult {
-    init_wrapper_type(ctx, "java/lang/Double", "double")
-}
-
-fn clinit_boolean_type(ctx: &mut dyn NativeContext, _: &[Value]) -> MethodCallResult {
-    init_wrapper_type(ctx, "java/lang/Boolean", "boolean")
-}
-
-fn clinit_char_type(ctx: &mut dyn NativeContext, _: &[Value]) -> MethodCallResult {
-    init_wrapper_type(ctx, "java/lang/Character", "char")
-}
-
-fn clinit_byte_type(ctx: &mut dyn NativeContext, _: &[Value]) -> MethodCallResult {
-    init_wrapper_type(ctx, "java/lang/Byte", "byte")
-}
-
-fn clinit_short_type(ctx: &mut dyn NativeContext, _: &[Value]) -> MethodCallResult {
-    init_wrapper_type(ctx, "java/lang/Short", "short")
-}
-
-fn clinit_void_type(ctx: &mut dyn NativeContext, _: &[Value]) -> MethodCallResult {
-    init_wrapper_type(ctx, "java/lang/Void", "void")
-}
-
-fn register_primitive_wrapper_type_clinits(registry: &mut NativeMethodRegistry) {
-    registry.register("java/lang/Integer", "<clinit>", "()V", clinit_integer_type);
-    registry.register("java/lang/Long", "<clinit>", "()V", clinit_long_type);
-    registry.register("java/lang/Float", "<clinit>", "()V", clinit_float_type);
-    registry.register("java/lang/Double", "<clinit>", "()V", clinit_double_type);
-    registry.register("java/lang/Boolean", "<clinit>", "()V", clinit_boolean_type);
-    registry.register("java/lang/Character", "<clinit>", "()V", clinit_char_type);
-    registry.register("java/lang/Byte", "<clinit>", "()V", clinit_byte_type);
-    registry.register("java/lang/Short", "<clinit>", "()V", clinit_short_type);
-    registry.register("java/lang/Void", "<clinit>", "()V", clinit_void_type);
-}
-
 /// Native `Duration.parse(CharSequence)` for real-JDK mode.
 ///
 /// JDK 25's `Duration.parse` (Duration.java:395) drives a compiled regex
@@ -1334,11 +1274,6 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // Integration-test harness support. These classes are not part of the JDK,
     // but test VMs use real-JDK mode and still need the print capture natives.
     register_test_harness_natives(registry);
-
-    // Default-feature synthetic tests still use `register_essential_natives`.
-    // Keep wrapper TYPE fields (`boolean.class`, `int.class`, ...) wired to the
-    // same cached primitive mirrors that reflection returns.
-    register_primitive_wrapper_type_clinits(registry);
 
     // JDK 25 VectorSupport declares these three ACC_NATIVE methods in
     // java.base. Keep them in the real-JDK essential path; the broader
@@ -46195,29 +46130,6 @@ fn register_pd_structured_concurrency(r: &mut NativeMethodRegistry) {
 #[cfg(test)]
 mod vector_support_essential_tests {
     use super::*;
-
-    #[test]
-    fn register_essential_includes_wrapper_type_clinits() {
-        let mut registry = NativeMethodRegistry::new();
-        register_essential_natives(&mut registry);
-
-        for wrapper in [
-            "java/lang/Integer",
-            "java/lang/Long",
-            "java/lang/Float",
-            "java/lang/Double",
-            "java/lang/Boolean",
-            "java/lang/Character",
-            "java/lang/Byte",
-            "java/lang/Short",
-            "java/lang/Void",
-        ] {
-            assert!(
-                registry.find(wrapper, "<clinit>", "()V").is_some(),
-                "{wrapper}.<clinit>()V should initialize TYPE in essentials"
-            );
-        }
-    }
 
     #[test]
     fn register_essential_includes_jdk25_vector_support_natives() {

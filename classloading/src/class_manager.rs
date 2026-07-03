@@ -2844,6 +2844,46 @@ impl ClassManager {
                     },
                 ));
             }
+
+            // A synthetic stub for this exact name may already exist under a
+            // built-in loader (`create_synthetic_stub` always registers under
+            // `ClassLoaderId::Bootstrap` — see `is_enterprise_stub_prefix`).
+            // This happens when code deliberately probes for a not-yet-generated
+            // class via `ClassLoader.loadClass`/`Class.forName` expecting
+            // `ClassNotFoundException` and then dynamically generates + defines
+            // the real bytecode itself (e.g. SmallRye Config's `@ConfigMapping`
+            // `<iface>$$CMImpl` runtime generation via
+            // `MethodHandles.Lookup.defineClass`). The `reflective_probe` gate
+            // only forces a proper CNFE for `Class.forName`-style existence
+            // probes, not plain `ClassLoader.loadClass`, so the first lookup
+            // fabricates a Bootstrap stub instead.
+            //
+            // If we minted a brand-new ClassId here instead, it would be
+            // permanently shadowed: `get_loaded_class_id` (used by every
+            // subsequent by-name resolution — Class.forName, loadClass,
+            // MethodHandles.Lookup.findStatic/findConstructor, constant-pool
+            // resolution, ...) always prefers the first-registered built-in
+            // loader in delegation order, i.e. the empty Bootstrap stub, never
+            // the real class just defined. Upgrade the existing stub in place
+            // instead (same mechanism `load_class` uses when a stub's real
+            // `.class` file later appears on the classpath), reusing its
+            // ClassId so it becomes visible to every future lookup.
+            if let Some(existing_id) = self.get_loaded_class_id(&stored_name_preview) {
+                let is_stub = self
+                    .class_store
+                    .get(existing_id)
+                    .map(|c| c.is_synthetic_stub)
+                    .unwrap_or(false);
+                if is_stub {
+                    self.upgrade_synthetic_class(
+                        existing_id,
+                        &stored_name_preview,
+                        bytes,
+                        loader_id,
+                    )?;
+                    return Ok(existing_id);
+                }
+            }
         }
 
         // Mark this class as currently loading to detect circular hierarchies.
