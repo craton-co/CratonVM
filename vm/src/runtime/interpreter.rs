@@ -14267,13 +14267,72 @@ fn is_global_resolution_namespace(name: &str) -> bool {
 /// a class a loader has itself defined, or a prior validated initiating result.
 /// This is the half of loader-faithful resolution that needs no `&mut thread`,
 /// so it is safe to call from the hot field/method-owner resolvers.
+/// Whether `referencing_class_id`'s DEFINING loader is a `groovy.lang.
+/// GroovyClassLoader` (or a subtype, e.g. `GroovyClassLoader$InnerLoader` —
+/// the per-`parseClass`-call loader Groovy mints internally). Used to widen
+/// the loader-initiated resolution trigger (below) to Groovy scripts
+/// unconditionally, without touching the global `CRATONVM_LOADER_AWARE_
+/// RESOLUTION` gate's default (which stays off pending the full Tomcat /
+/// Hibernate / WildFly custom-loader soak it was written for — see
+/// `docs/known-issues/hib-proxyclassreuse-loader-blind-class-resolution.md`).
+///
+/// Rationale (context.groovy bug cluster): `GroovyShell.evaluate` compiles
+/// each script through its own fresh `GroovyClassLoader$InnerLoader`
+/// instance, and Groovy names every closure literal in a script
+/// positionally (`<Script>$_run_closure1`, `$_run_closure2`, …) — so two
+/// different scripts loaded in the same process routinely produce two
+/// DIFFERENT classes sharing an identical name. With the gate off, `new
+/// <closure>(...)` / `checkcast` / similar `CONSTANT_Class` resolution from
+/// the SECOND script's own bytecode resolved through the flat global class
+/// store (`load_class_concurrent`) and silently collapsed onto whichever
+/// same-named closure a DIFFERENT script's `InnerLoader` had registered
+/// first — no exception, just the wrong compiled bytecode running (e.g.
+/// Spring's `GroovyBeanDefinitionReader` executing an earlier script's
+/// closure body and registering none of the beans the current script
+/// declared). A real type check here (subtype of `GroovyClassLoader`, not a
+/// class-NAME string match) keeps the blast radius to Groovy's own loader
+/// hierarchy: Hibernate's ByteBuddy/CGLIB isolating loaders, Tomcat's
+/// `WebappClassLoader`, and WildFly's module loaders are never
+/// `GroovyClassLoader` instances, so their resolution order is completely
+/// unaffected by this check.
+fn is_groovy_class_loader(shared: &SharedVm, loader_obj: cratonvm_types::ObjectRef) -> bool {
+    let cm = shared.class_manager.read();
+    let loader_class_id = shared.heap.class_id_of(loader_obj);
+    match cm.get_loaded_class_id("groovy/lang/GroovyClassLoader") {
+        Some(groovy_cl_id) => {
+            loader_class_id == groovy_cl_id || cm.is_subclass_of(loader_class_id, groovy_cl_id)
+        }
+        // `groovy/lang/GroovyClassLoader` not loaded at all in this process
+        // (no Groovy on the classpath) => trivially not a Groovy loader.
+        None => false,
+    }
+}
+
+/// Whether loader-initiated (JVMS §5.4.3 initiating-loader) `CONSTANT_Class`
+/// resolution should run for a reference from `referencing_class_id`: either
+/// the global gate is on, or the referencing class was defined by a
+/// `GroovyClassLoader` (see [`is_groovy_class_loader`]'s doc comment for the
+/// full rationale — this is the narrow, type-checked carve-out for the
+/// context.groovy bug cluster that does not touch the gate's default).
+#[inline]
+fn should_use_loader_initiated_resolution(shared: &SharedVm, referencing_class_id: ClassId) -> bool {
+    if crate::runtime::env_cache::loader_aware_resolution() {
+        return true;
+    }
+    match cratonvm_native_builtins::classloader::defining_loader_for(referencing_class_id.as_u32())
+    {
+        Some(loader_obj) => is_groovy_class_loader(shared, loader_obj),
+        None => false,
+    }
+}
+
 #[inline]
 fn lookup_loader_initiated(
     shared: &SharedVm,
     referencing_class_id: ClassId,
     name: &str,
 ) -> Option<ClassId> {
-    if !crate::runtime::env_cache::loader_aware_resolution() {
+    if !should_use_loader_initiated_resolution(shared, referencing_class_id) {
         return None;
     }
     let loader = match shared
@@ -14334,7 +14393,7 @@ fn resolve_class_loader_aware(
     // (gate off / built-in loader / JDK or array name) or the loader is
     // user-defined but has not yet resolved this name. Only the latter takes the
     // cold loadClass path below; everything else resolves globally.
-    let user_loader = if crate::runtime::env_cache::loader_aware_resolution()
+    let user_loader = if should_use_loader_initiated_resolution(shared, referencing_class_id)
         && !name.starts_with('[')
         && !is_global_resolution_namespace(name)
     {

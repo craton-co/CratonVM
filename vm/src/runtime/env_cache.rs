@@ -123,27 +123,74 @@ pub fn osr_backedge_enabled() -> bool {
 /// `CRATONVM_LOADER_AWARE_RESOLUTION` — loader-faithful `CONSTANT_Class`
 /// resolution (ProxyClassReuseTest / IsoProbe family).
 ///
-/// **Default: OFF.** When ON, an implicit class-constant reference (`ldc X.class`,
-/// `new X`, `checkcast`/`instanceof X`, `anewarray X`, and field/method owner
-/// resolution) reached from bytecode defined by a *user-defined* class loader is
-/// resolved through that loader as the JVMS §5.4.3 *initiating* loader — i.e. by
-/// invoking its `loadClass` — instead of through CratonVM's flat global class
-/// store. This makes two isolating loaders that each define their own copy of a
-/// class `X` resolve `X` to their *own* copy (HotSpot semantics) rather than
-/// collapsing both to the first-loaded (application) copy.
+/// **Default: ON** (flipped from off during the `context.groovy` bug-cluster
+/// fix — see below). When on, an implicit class-constant reference (`ldc
+/// X.class`, `new X`, `checkcast`/`instanceof X`, `anewarray X`, and
+/// field/method owner resolution) reached from bytecode defined by a
+/// *user-defined* class loader is resolved through that loader as the JVMS
+/// §5.4.3 *initiating* loader — i.e. by invoking its `loadClass` — instead of
+/// through CratonVM's flat global class store. This makes two isolating
+/// loaders that each define their own copy of a class `X` resolve `X` to
+/// their *own* copy (HotSpot semantics) rather than collapsing both to the
+/// first-loaded (application) copy.
 ///
 /// Built-in-loader (bootstrap/extension/application) references keep the exact
-/// global fast path, so the new behavior only engages for classes defined by
-/// custom loaders — but that still covers web-app / OSGi / proxy loaders broadly,
-/// so the change ships gated until soaked on the full app gauntlet. Empty or
-/// `"0"` ⇒ disabled (the safe default); any other value ⇒ enabled. Read once and
-/// cached.
+/// global fast path, so this only engages for classes defined by custom
+/// loaders — but that still covers web-app / OSGi / proxy loaders broadly,
+/// which is why this shipped gated (default off) pending an app-gauntlet
+/// soak; see `docs/known-issues/hib-proxyclassreuse-loader-blind-class-
+/// resolution.md`.
+///
+/// **Why the default flipped:** every Apache Groovy dynamic-DSL script run
+/// (e.g. Spring's `GroovyBeanDefinitionReader`/`GenericGroovyApplicationContext`)
+/// compiles each script through its own fresh `GroovyClassLoader$InnerLoader`
+/// instance, but every closure literal in a script is named positionally
+/// (`<ScriptClass>$_run_closure1`, `$_run_closure2`, …) — so two *different*
+/// scripts loaded in the same process very commonly produce two DIFFERENT
+/// classes with the textually IDENTICAL name. With this gate off, the
+/// interpreter's implicit class-constant resolution (the `new`/`checkcast`
+/// opcodes emitted for the closure's own instantiation, and its `doCall`
+/// dispatch) resolved through the flat global store and silently collapsed
+/// to whichever same-named closure class was registered FIRST — the SECOND
+/// script's closure body then ran the FIRST script's compiled bytecode with
+/// no exception, e.g. `beans { framework String, 'Grails' }` running some
+/// unrelated earlier script's closure and registering zero of the beans the
+/// current script actually declared (`NoSuchBeanDefinitionException: No bean
+/// named 'framework' available` even though the resource loaded successfully
+/// and `GroovyBeanDefinitionReader` reported no error). Confirmed via a
+/// minimal repro (two `GroovyShell.evaluate(script, "beans")` calls, same
+/// script `name` argument, different closure bodies): with the gate off,
+/// `inner1.getClass() == inner2.getClass()` was `true` and the second
+/// closure's `call()` ran the first closure's println; with the gate on,
+/// they compare unequal and each dispatches its own body, matching HotSpot.
+///
+/// Regression check before flipping the default: ran the 3 target
+/// `context.groovy` classes plus `scripting.bsh.{BshScriptEvaluatorTests,
+/// BshScriptFactoryTests}` and `scripting.groovy.{GroovyAspectIntegrationTests,
+/// GroovyAspectTests,GroovyClassLoadingTests,GroovyScriptEvaluatorTests,
+/// GroovyScriptFactoryTests}` gate-off vs gate-on: every class was either
+/// unchanged or strictly improved with the gate on (no new failures observed
+/// in this slice). `GroovyApplicationContextTests` and
+/// `GroovyApplicationContextDynamicBeanPropertyTests` go fully green
+/// (byte-for-byte HotSpot match); `GroovyAspectTests` gains one more pass.
+/// This is NOT the full "app gauntlet" soak the known-issues doc calls for
+/// (Hibernate/Tomcat/WildFly custom-loader-heavy suites were not re-run here)
+/// — if a broader regression turns up, revert this default flip (the env var
+/// still overrides either way: `CRATONVM_LOADER_AWARE_RESOLUTION=0` to force
+/// off) rather than reverting the loader-aware resolution logic itself, which
+/// is independently correct.
+///
+/// Empty or `"0"` ⇒ disabled; any other value ⇒ enabled. Read once and cached.
 #[inline]
 pub fn loader_aware_resolution() -> bool {
     static CACHE: OnceLock<bool> = OnceLock::new();
     *CACHE.get_or_init(|| match std::env::var("CRATONVM_LOADER_AWARE_RESOLUTION") {
+        // Explicitly set: preserve the original opt-out semantics (empty or
+        // "0" disables; anything else enables) so `CRATONVM_LOADER_AWARE_
+        // RESOLUTION=0` still forces the old (gate-off) behavior verbatim.
         Ok(v) => !v.is_empty() && v != "0",
-        Err(_) => false,
+        // Unset: new default is enabled (see doc comment above).
+        Err(_) => true,
     })
 }
 
