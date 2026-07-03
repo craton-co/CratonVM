@@ -157,16 +157,35 @@ fn validate_module_name(name: &str) -> Result<(), RuntimeError> {
 ///   slot 0: `boot` boolean flag (1 for the boot layer, 0 for user layers)
 const MODULE_LAYER_FIELD_COUNT: usize = 2;
 
-/// Field layout for our synthetic Module:
+/// Field count requested when allocating a Module here. `alloc_concurrent_synthetic`
+/// resolves `"java/lang/Module"` to the REAL bytecode class (9 declared instance
+/// fields: layer, name, loader, descriptor, enableNativeAccess, reads,
+/// openPackages, exportedPackages, moduleInfoClass — see javap), so this
+/// small count only matters as a floor; the real total always wins.
 ///
-///   slot 0: name (String)
-///   slot 1: layer (ModuleLayer or null)
-///   slot 2: packages (Set<String>)
-///   slot 3: descriptor (ModuleDescriptor or null)
-///   slot 4: loader (ClassLoader or null)
+/// `name`/`layer` below are read/written by REAL field name (`get_field_by_name`/
+/// `set_field_by_name`), NOT by a hand-picked slot index. A prior version of
+/// this file assumed a private 5-field layout (name=0, layer=1, packages=2,
+/// descriptor=3, loader=4) and wrote/read those slots directly — but every
+/// Module object here is actually an instance of the real class (real layout:
+/// layer=0, name=1, loader=2, descriptor=3, …), so that raw slot-1 write
+/// intended for "layer" was silently landing on the REAL `name` field. On the
+/// single canonical unnamed-module mirror shared across every class with no
+/// declared module (cached by `Class.getModule()` in `lib.rs`), any call to
+/// `Module.getLayer()` overwrote that shared instance's `name` field with a
+/// `ModuleLayer` object — so a LATER `Module.getDescriptor()` on the SAME
+/// object read back a `ModuleLayer` where it expected the module name,
+/// breaking Elasticsearch's `ProviderLocator.checkUses` with a
+/// `NullPointerException` several call frames away from this file. See
+/// `native-builtins::lib::register_essential_natives`'s `Class.getModule()`
+/// and `Module.getDescriptor()` overrides.
 const MODULE_FIELD_COUNT: usize = 5;
-const MODULE_SLOT_NAME: usize = 0;
-const MODULE_SLOT_LAYER: usize = 1;
+/// `packages` has no real `java.lang.Module` field of that name (real
+/// `getPackages()` is computed, not stored) — slot 2 aliases the real
+/// `loader` field. Retained as a raw slot for now (existing JBoss-Modules
+/// behavior); calling `Module.getPackages()` on a Module built outside
+/// `build_module` below is a latent, not-yet-observed analog of the
+/// name/layer bug fixed here.
 const MODULE_SLOT_PACKAGES: usize = 2;
 
 /// Build the singleton boot ModuleLayer.
@@ -199,8 +218,8 @@ fn build_package_set(ctx: &mut dyn NativeContext, packages: &[&str]) -> ObjectRe
 fn build_module(ctx: &mut dyn NativeContext, name: &str, layer: ObjectRef) -> ObjectRef {
     let module = alloc_concurrent_synthetic(ctx, "java/lang/Module", MODULE_FIELD_COUNT);
     let name_str = ctx.create_string(name);
-    ctx.set_field(module, MODULE_SLOT_NAME, Value::Object(Some(name_str)));
-    ctx.set_field(module, MODULE_SLOT_LAYER, Value::Object(Some(layer)));
+    ctx.set_field_by_name(module, "name", Value::Object(Some(name_str)));
+    ctx.set_field_by_name(module, "layer", Value::Object(Some(layer)));
     // Only `java.base` gets the full JDK package set; other synthetic
     // modules get an empty set (callers check `contains` before acting).
     let packages = if name == "java.base" {
@@ -263,7 +282,8 @@ pub(crate) fn native_module_layer_find_module(
     Ok(Some(Value::Object(Some(opt))))
 }
 
-/// `Module.getName()` — return the String stored at slot 0.
+/// `Module.getName()` — return the real `name` field (resolved by field
+/// name, not a hardcoded slot — see the field-count doc comment above).
 pub(crate) fn native_module_get_name(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -272,7 +292,7 @@ pub(crate) fn native_module_get_name(
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
-    Ok(Some(ctx.get_field(this, MODULE_SLOT_NAME)))
+    Ok(Some(ctx.get_field_by_name(this, "name")))
 }
 
 /// `Module.getPackages()` — return the Set at slot 2, lazily populated
@@ -301,8 +321,9 @@ pub(crate) fn native_module_get_packages(
     Ok(Some(Value::Object(Some(packages))))
 }
 
-/// `Module.getLayer()` — return the ModuleLayer at slot 1, or the boot
-/// layer as a safe default.
+/// `Module.getLayer()` — return the real `layer` field (resolved by field
+/// name — see the field-count doc comment above), lazily seeded with the
+/// boot layer as a safe default if unset.
 pub(crate) fn native_module_get_layer(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -314,12 +335,12 @@ pub(crate) fn native_module_get_layer(
             return Ok(Some(Value::Object(Some(layer))));
         }
     };
-    let existing = ctx.get_field(this, MODULE_SLOT_LAYER);
+    let existing = ctx.get_field_by_name(this, "layer");
     if let Value::Object(Some(_)) = existing {
         return Ok(Some(existing));
     }
     let layer = build_boot_layer(ctx);
-    ctx.set_field(this, MODULE_SLOT_LAYER, Value::Object(Some(layer)));
+    ctx.set_field_by_name(this, "layer", Value::Object(Some(layer)));
     Ok(Some(Value::Object(Some(layer))))
 }
 
