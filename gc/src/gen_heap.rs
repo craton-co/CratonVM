@@ -4467,6 +4467,31 @@ impl GenerationalHeap {
                     if header.gc_flags & GC_FLAG_MARKED != 0 && aged && !pinned.contains(&addr) {
                         match old_gen.alloc(total_size, 8) {
                             Some(dst) => {
+                                // gcstress face-1 hunt (no-op unless gated):
+                                // validate the SOURCE body before promoting —
+                                // catching a corrupt cell here pins the
+                                // corruption to BEFORE promotion and reports
+                                // the victim's stable young address.
+                                validate_copy_source_cells(src, header, "promote-src");
+                                {
+                                    let w = crate::heap::cell_watch_addr();
+                                    let d = dst as usize;
+                                    if w != 0 && d <= w && w.wrapping_sub(d) < total_size {
+                                        let src_at = src as usize + (w - d);
+                                        // SAFETY: src object spans total_size bytes.
+                                        let pair =
+                                            unsafe { std::ptr::read(src_at as *const [u64; 2]) };
+                                        crate::heap::cell_watch_check(
+                                            d,
+                                            total_size,
+                                            "selective-promote-evac",
+                                            &format!(
+                                                "src=0x{:x} src[watch]=0x{:016x},0x{:016x}",
+                                                src as usize, pair[0], pair[1]
+                                            ),
+                                        );
+                                    }
+                                }
                                 // SAFETY: src/dst are valid, non-overlapping, total_size bytes.
                                 unsafe { std::ptr::copy_nonoverlapping(src, dst, total_size) };
                                 // Replicate the atomic mark_word through atomic ops
@@ -6616,6 +6641,30 @@ impl GenerationalHeap {
         };
 
         // Copy the entire object
+        // gcstress face-1 hunt (no-op unless gated): validate the source body
+        // (see promote-src) and dump the SOURCE qword pair at the watched
+        // offset, so a copy that IMPORTS corrupt content is distinguishable
+        // from one that copies a clean cell.
+        // SAFETY: `old_ptr` is the live source object under STW.
+        validate_copy_source_cells(old_ptr, unsafe { &*(old_ptr as *const ObjectHeader) }, "cheney-src");
+        {
+            let w = crate::heap::cell_watch_addr();
+            let dst = new_ptr as usize;
+            if w != 0 && dst <= w && w.wrapping_sub(dst) < total_size {
+                let src_at = old_ptr as usize + (w - dst);
+                // SAFETY: src object spans total_size bytes; src_at is within it.
+                let pair = unsafe { std::ptr::read(src_at as *const [u64; 2]) };
+                crate::heap::cell_watch_check(
+                    dst,
+                    total_size,
+                    "cheney-copy",
+                    &format!(
+                        "src=0x{:x} src[watch]=0x{:016x},0x{:016x}",
+                        old_ptr as usize, pair[0], pair[1]
+                    ),
+                );
+            }
+        }
         // SAFETY: `old_ptr` and `new_ptr` are valid, non-overlapping regions of `total_size` bytes.
         unsafe {
             std::ptr::copy_nonoverlapping(old_ptr, new_ptr, total_size);
@@ -7117,11 +7166,22 @@ impl GenerationalHeap {
             self.young_from.lock().contains(holder_addr as *const u8),
             self.old_gen.lock().contains(holder_addr as *const u8),
         );
+        // Neighbor window: a misaligned-by-8 tagged Value write (the bc
+        // math-ec "0x4" family — receiver pointer off by 8) leaves its
+        // discriminant in the PREVIOUS cell's payload word and its payload in
+        // THIS cell's discriminant word; the ±2-cell dump makes that pattern
+        // (small disc at odd word positions) directly visible.
+        // SAFETY: the window lies within the holder's body ± one cell; the
+        // holder is a live validated object and heap arenas pad allocations,
+        // so the reads stay inside mapped arena memory.
+        let win: [u64; 8] = unsafe { std::ptr::read((cell_ptr as usize - 16) as *const [u64; 8]) };
         eprintln!(
             "[CELLCORRUPT] holder=0x{holder_addr:x} (young_from={hyf} old={hog}) \
              class_id={} class={class_name} kind=0x{:02x} num_slots={} array_len={} \
              gc_flags=0x{:x} index={index} raw0=0x{:016x} raw1=0x{:016x} | \
-             raw0-target: young_from={yf} young_to={yt} old={og}\n{}",
+             raw0-target: young_from={yf} young_to={yt} old={og}\n\
+             [CELLCORRUPT]   window cell-1..cell+2: {:016x},{:016x} | {:016x},{:016x} | \
+             {:016x},{:016x} | {:016x},{:016x}\n{}",
             header.class_id.as_u32(),
             header.kind as u8,
             header.num_slots,
@@ -7129,8 +7189,48 @@ impl GenerationalHeap {
             header.gc_flags,
             raw[0],
             raw[1],
+            win[0],
+            win[1],
+            win[2],
+            win[3],
+            win[4],
+            win[5],
+            win[6],
+            win[7],
             std::backtrace::Backtrace::force_capture(),
         );
+        // Shift test — the neighbor windows show corrupt cells decoding as an
+        // 8-BYTE-SHIFTED body ({payload_k, disc_k+1}). Mechanically test: do
+        // this holder's cells parse as valid Values when read at ±8? A
+        // consistent hit means the body content sits 8 bytes off its slots
+        // (overlapping/shifted allocation — the A2 double-serve family), not
+        // a per-cell stray write.
+        {
+            let n = (header.num_slots as usize).min(8);
+            let base = holder_addr + HEADER_SIZE;
+            let mut plus8 = 0usize;
+            let mut minus8 = 0usize;
+            let mut aligned = 0usize;
+            for k in 0..n {
+                let c = base + k * SLOT_SIZE;
+                // SAFETY: within the holder body ±8; arena-mapped.
+                unsafe {
+                    if cratonvm_types::read_value_checked(c as *const Value).is_some() {
+                        aligned += 1;
+                    }
+                    if cratonvm_types::read_value_checked((c + 8) as *const Value).is_some() {
+                        plus8 += 1;
+                    }
+                    if cratonvm_types::read_value_checked((c - 8) as *const Value).is_some() {
+                        minus8 += 1;
+                    }
+                }
+            }
+            eprintln!(
+                "[CELLCORRUPT]   shift-test over {n} cells: valid@aligned={aligned} \
+                 valid@+8={plus8} valid@-8={minus8}",
+            );
+        }
         // If the stale target is still inside a CURRENT generation, dump its
         // header too — its identity often names the mis-writing code path.
         if yf || og {
@@ -7158,6 +7258,41 @@ impl GenerationalHeap {
 fn cell_corrupt_diag_enabled() -> bool {
     static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *G.get_or_init(|| std::env::var_os("CRATONVM_DBG_CELLCORRUPT").is_some())
+}
+
+/// gcstress residual face-1 hunt (`CRATONVM_DBG_CELLCORRUPT`) — validate a
+/// legacy object's Value cells at a GC copy SOURCE. A corrupt cell caught
+/// here proves the corruption happened before this copy and reports the
+/// victim's pre-copy (young, often bootstrap-page-stable) address — the
+/// address a follow-up `CRATONVM_DBG_WATCH_CELL` run must watch to catch the
+/// forming write. Rate-capped; no-op unless the gate is set.
+fn validate_copy_source_cells(obj_ptr: *const u8, header: &ObjectHeader, site: &str) {
+    if !cell_corrupt_diag_enabled()
+        || header.kind != ObjectKind::Object
+        || is_compact_object(header)
+    {
+        return;
+    }
+    static HITS: AtomicUsize = AtomicUsize::new(0);
+    for k in 0..header.num_slots as usize {
+        let c = obj_ptr as usize + HEADER_SIZE + k * SLOT_SIZE;
+        // SAFETY: within the source object's body (walk-validated under STW).
+        if unsafe { cratonvm_types::read_value_checked(c as *const Value) }.is_none() {
+            if HITS.fetch_add(1, Ordering::Relaxed) < 16 {
+                // SAFETY: same cell, raw read.
+                let raw = unsafe { std::ptr::read(c as *const [u64; 2]) };
+                eprintln!(
+                    "[CELLCORRUPT:{site}] PRE-COPY corrupt cell: src_obj=0x{:x} class_id={} \
+                     num_slots={} slot={k} cell=0x{c:x} raw={:016x},{:016x}",
+                    obj_ptr as usize,
+                    header.class_id.as_u32(),
+                    header.num_slots,
+                    raw[0],
+                    raw[1],
+                );
+            }
+        }
+    }
 }
 
 impl Default for GenerationalHeap {
@@ -7672,6 +7807,16 @@ pub(crate) unsafe fn forward_ref_slots(
                 let raw: u64 = std::ptr::read(s as *const u64);
                 if raw != 0 {
                     if let Some(n) = forward(raw as usize as *mut u8) {
+                        // gcstress face-1 hunt (no-op unless gated) — a RAW
+                        // 8-byte pointer write; on a MISREAD header (walk
+                        // overshoot family) this arm would spray pointers
+                        // over legacy 16-byte cells.
+                        crate::heap::cell_watch_check(
+                            s as usize,
+                            8,
+                            "forward_ref_slots-refarray",
+                            &(n as usize),
+                        );
                         std::ptr::write(s as *mut u64, n as u64);
                     }
                 }
@@ -7687,6 +7832,13 @@ pub(crate) unsafe fn forward_ref_slots(
             let raw: u64 = std::ptr::read(s as *const u64);
             if raw != 0 {
                 if let Some(n) = forward(raw as usize as *mut u8) {
+                    // gcstress face-1 hunt (no-op unless gated).
+                    crate::heap::cell_watch_check(
+                        s as usize,
+                        8,
+                        "forward_ref_slots-compact",
+                        &(n as usize),
+                    );
                     std::ptr::write(s as *mut u64, n as u64);
                 }
             }
@@ -7696,6 +7848,13 @@ pub(crate) unsafe fn forward_ref_slots(
             let s = obj_ptr.add(HEADER_SIZE + slot_idx * SLOT_SIZE);
             if let Value::Object(Some(r)) = std::ptr::read(s as *const Value) {
                 if let Some(n) = forward(r.as_ptr()) {
+                    // gcstress face-1 hunt (no-op unless gated).
+                    crate::heap::cell_watch_check(
+                        s as usize,
+                        16,
+                        "forward_ref_slots-legacy",
+                        &(n as usize),
+                    );
                     std::ptr::write(s as *mut Value, Value::Object(Some(ObjectRef::from_raw(n))));
                 }
             }
@@ -7970,6 +8129,8 @@ unsafe fn read_slot(ptr: *mut u8) -> Value {
 // SAFETY: caller guarantees `ptr` points to a valid Value slot within a heap object.
 #[inline]
 unsafe fn write_slot(ptr: *mut u8, value: Value) {
+    // gcstress face-1 hunt (no-op unless CRATONVM_DBG_WATCH_CELL is set).
+    crate::heap::cell_watch_check(ptr as usize, 16, "write_slot", &value);
     std::ptr::write(ptr as *mut Value, value);
 }
 
