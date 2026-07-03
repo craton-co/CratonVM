@@ -2005,10 +2005,25 @@ impl G1Collector {
         // Dedup source indices so we walk each source region at most once.
         // JIT-pinned regions are scanned as sources too: their objects stay in
         // place (excluded from the CSet) but may reference objects that ARE in
-        // the CSet, and young→young references carry no remembered set, so the
-        // pinned region must be walked explicitly to evacuate and fix up those
-        // referents. Without this, a list/tree straddling pinned and CSet
-        // regions loses the CSet-side nodes (SIGSEGV / wrong checksum).
+        // the CSet, and JIT-compiled code may have installed those references
+        // through stores the collector cannot assume went through
+        // `post_write_barrier_rset`, so the pinned region is walked wholesale
+        // as defense-in-depth. Without this, a list/tree straddling pinned and
+        // CSet regions loses the CSet-side nodes (SIGSEGV / wrong checksum).
+        //
+        // NOTE (audited): JNI-pinned regions (`r.pinned`, GetPrimitiveArray-
+        // Critical) do NOT need this treatment. Interpreter/native ref stores
+        // all funnel through `post_write_barrier_rset`, which records EVERY
+        // cross-region edge (young→young included — an earlier revision of
+        // this comment claimed otherwise), and Phase 4's
+        // `collect_outgoing_cross_region_edges` re-records edges the
+        // evacuation itself rewrites. A CSet object whose only referent sits
+        // in a JNI-pinned region is therefore reached via that region's RSet
+        // membership — pinned regions are ordinary RSet sources. Regression:
+        // `jni_pinned_young_region_holder_keeps_cset_referent_alive{,_parallel}`.
+        // Deliberately NOT added wholesale here: an unconditional walk of
+        // pinned regions would resurrect their dead objects' referents every
+        // pause (the documented "undead" compounding) for no soundness gain.
         let mut unique_sources: std::collections::HashSet<usize> = rset_sources
             .iter()
             .flat_map(|(_, srcs)| srcs.iter().copied())
@@ -7608,6 +7623,105 @@ mod tests {
 
         gc.unpin_region(idx);
         assert!(!gc.is_pinned(idx));
+    }
+
+    /// A JNI-pinned young region is excluded from the CSet but its objects may
+    /// hold the ONLY reference to objects that ARE collected. Coverage comes
+    /// from the remembered set: the cross-region ref store recorded the
+    /// pinned holder's region in the target's RSet, so Phase 2's source walk
+    /// visits the pinned region, evacuates the referent, and rewrites the
+    /// holder's slot in place. (Spotted during the marking-soundness audit as
+    /// a suspected gap — this test pins the invariant that makes it a
+    /// non-gap. If the RSet ever starts filtering young→young edges, or a
+    /// store path skips `post_write_barrier_rset`, this fails with Q freed
+    /// under P.)
+    #[test]
+    fn jni_pinned_young_region_holder_keeps_cset_referent_alive() {
+        let gc = make_collector();
+        // P — the holder — lands in the current Eden region.
+        let p = gc.alloc_object(ClassId::new(1), 1);
+        let p_region = {
+            let regions = gc.regions.lock();
+            gc.region_for_ptr(&regions, p.as_ptr()).unwrap()
+        };
+        // Allocate until a NEW Eden region opens so Q is cross-region from P.
+        let mut q = gc.alloc_object(ClassId::new(2), 1);
+        loop {
+            let q_region = {
+                let regions = gc.regions.lock();
+                gc.region_for_ptr(&regions, q.as_ptr()).unwrap()
+            };
+            if q_region != p_region {
+                break;
+            }
+            q = gc.alloc_object(ClassId::new(2), 1);
+        }
+        gc.set_field(q, 0, Value::Int(4242));
+        // The ONLY path to Q: a field of P (cross-region ref store → the
+        // post-write barrier records P's region in Q's region's RSet).
+        gc.set_field(p, 0, Value::Object(Some(q)));
+
+        // JNI critical section pins P's region (GetPrimitiveArrayCritical
+        // shape: the pin covers the whole region, holder objects included).
+        gc.pin_region(p_region);
+
+        // Young collection with NO roots: P's region is excluded from the
+        // CSet by the pin; Q must still be evacuated and P's slot rewritten.
+        let mut roots: Vec<ObjectRef> = vec![];
+        let result = gc.young_collection(&mut roots, &NoopMonitors);
+
+        let q_new = result
+            .pointer_map
+            .get(&(q.as_ptr() as usize))
+            .copied()
+            .expect("Q, referenced only from the pinned region, must be evacuated");
+        let q_new_ref = unsafe { ObjectRef::from_raw(q_new as *mut u8) };
+        assert_eq!(
+            gc.get_field(p, 0),
+            Value::Object(Some(q_new_ref)),
+            "pinned holder's slot must be rewritten to Q's new location"
+        );
+        assert_eq!(gc.get_field(q_new_ref, 0).as_int(), Some(4242));
+        gc.unpin_region(p_region);
+    }
+
+    /// Parallel-evacuator twin of
+    /// [`jni_pinned_young_region_holder_keeps_cset_referent_alive`].
+    #[test]
+    fn jni_pinned_young_region_holder_keeps_cset_referent_alive_parallel() {
+        let gc = G1Collector::new(parallel_config(2, 8));
+        let p = gc.alloc_object(ClassId::new(1), 1);
+        let p_region = {
+            let regions = gc.regions.lock();
+            gc.region_for_ptr(&regions, p.as_ptr()).unwrap()
+        };
+        let mut q = gc.alloc_object(ClassId::new(2), 1);
+        loop {
+            let q_region = {
+                let regions = gc.regions.lock();
+                gc.region_for_ptr(&regions, q.as_ptr()).unwrap()
+            };
+            if q_region != p_region {
+                break;
+            }
+            q = gc.alloc_object(ClassId::new(2), 1);
+        }
+        gc.set_field(q, 0, Value::Int(2424));
+        gc.set_field(p, 0, Value::Object(Some(q)));
+        gc.pin_region(p_region);
+
+        let mut roots: Vec<ObjectRef> = vec![];
+        let result = gc.young_collection_parallel(&mut roots, &NoopMonitors);
+
+        let q_new = result
+            .pointer_map
+            .get(&(q.as_ptr() as usize))
+            .copied()
+            .expect("Q, referenced only from the pinned region, must be evacuated (parallel)");
+        let q_new_ref = unsafe { ObjectRef::from_raw(q_new as *mut u8) };
+        assert_eq!(gc.get_field(p, 0), Value::Object(Some(q_new_ref)));
+        assert_eq!(gc.get_field(q_new_ref, 0).as_int(), Some(2424));
+        gc.unpin_region(p_region);
     }
 
     #[test]
