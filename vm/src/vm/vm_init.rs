@@ -10877,11 +10877,15 @@ mod tests {
     // Session 16: Iterative Interpreter Refactor
     // =======================================================================
 
-    /// S16: Default max_stack_depth increased to 1024.
+    /// Default max_stack_depth raised to 8192 (see the doc comment on
+    /// `VmConfig::default`'s `max_stack_depth` field in config.rs for the
+    /// root-cause rationale — `DefaultListableBeanFactoryTests
+    /// .extensiveCircularReference` needs >1024 frames for a 99-bean
+    /// circular-reference chain that HotSpot handles trivially).
     #[test]
-    fn s16_default_max_stack_depth_is_1024() {
+    fn s16_default_max_stack_depth_is_8192() {
         let config = crate::config::VmConfig::default();
-        assert_eq!(config.max_stack_depth, 1024);
+        assert_eq!(config.max_stack_depth, 8192);
     }
 
     /// S16: Frame has monitor_on_exit field for stackless synchronized dispatch.
