@@ -29,7 +29,11 @@
 //! index-conditions to be pruned — which matches real-JDK behaviour).
 
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
-use cratonvm_types::Value;
+use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
+use cratonvm_types::{ClassId, ObjectRef, Value};
+
+const H2_ROOT_REFERENCE: &str = "org/h2/mvstore/RootReference";
+const H2_TRANSACTION: &str = "org/h2/mvstore/tx/Transaction";
 
 /// Register Thread.threadState / Thread.getState overrides so the real-JDK
 /// bytecode path does not dereference the null `holder` FieldHolder.
@@ -120,6 +124,925 @@ pub fn register_h2_table_filter_prepare(registry: &mut NativeMethodRegistry) {
     // bytecode runs. `registry` is unused in that configuration.
     #[cfg(not(feature = "app-stubs"))]
     let _ = registry;
+}
+
+/// Hibernate's schema setup/teardown drives H2's SQL parser thousands of times.
+/// These are bytecode-equivalent cursor/accessor intrinsics for the tiny parser
+/// methods that show up at the 300 s FunctionTests watchdog.
+pub fn register_h2_parser_fastpaths(registry: &mut NativeMethodRegistry) {
+    let __prev_cat = registry.current_category();
+    registry.set_category(cratonvm_native_api::NativeKind::Intrinsic);
+
+    registry.register("org/h2/command/ParserBase", "read", "()V", h2_parser_read);
+    registry.register(
+        "org/h2/command/ParserBase",
+        "setTokenIndex",
+        "(I)V",
+        h2_parser_set_token_index,
+    );
+    registry.register(
+        "org/h2/constraint/ConstraintReferential",
+        "checkExistingData",
+        "(Lorg/h2/engine/SessionLocal;)V",
+        h2_constraint_check_existing_data,
+    );
+    registry.register(
+        "org/h2/mvstore/type/LongDataType",
+        "binarySearch",
+        "(Ljava/lang/Long;Ljava/lang/Object;II)I",
+        h2_long_data_type_binary_search,
+    );
+    registry.register(
+        "org/h2/mvstore/type/LongDataType",
+        "binarySearch",
+        "(Ljava/lang/Object;Ljava/lang/Object;II)I",
+        h2_long_data_type_binary_search,
+    );
+    registry.register(
+        H2_ROOT_REFERENCE,
+        "updateRootPage",
+        "(Lorg/h2/mvstore/Page;J)Lorg/h2/mvstore/RootReference;",
+        h2_root_reference_update_root_page,
+    );
+    registry.register(
+        H2_TRANSACTION,
+        "<init>",
+        "(Lorg/h2/mvstore/tx/TransactionStore;IJILjava/lang/String;JIILorg/h2/engine/IsolationLevel;Lorg/h2/mvstore/tx/TransactionStore$RollbackListener;)V",
+        h2_transaction_init,
+    );
+
+    for class_name in [
+        "org/h2/command/Token",
+        "org/h2/command/Token$KeywordToken",
+        "org/h2/command/Token$KeywordOrIdentifierToken",
+        "org/h2/command/Token$IdentifierToken",
+        "org/h2/command/Token$ParameterToken",
+        "org/h2/command/Token$EndOfInputToken",
+        "org/h2/command/Token$LiteralToken",
+        "org/h2/command/Token$CharacterStringToken",
+        "org/h2/command/Token$BinaryStringToken",
+        "org/h2/command/Token$BigintToken",
+        "org/h2/command/Token$IntegerToken",
+        "org/h2/command/Token$ValueToken",
+    ] {
+        registry.register(class_name, "tokenType", "()I", h2_token_type_native);
+        registry.register(
+            class_name,
+            "asIdentifier",
+            "()Ljava/lang/String;",
+            h2_token_as_identifier_native,
+        );
+        registry.register(class_name, "isQuoted", "()Z", h2_token_is_quoted_native);
+    }
+
+    registry.set_category(__prev_cat);
+}
+
+fn h2_object_arg(args: &[Value], idx: usize, label: &str) -> Result<ObjectRef, MethodCallFailed> {
+    match args.get(idx) {
+        Some(Value::Object(Some(obj))) => Ok(*obj),
+        _ => Err(RuntimeError::NullPointerException {
+            message: Some(label.to_string()),
+        }
+        .into()),
+    }
+}
+
+fn h2_optional_object_arg(args: &[Value], idx: usize) -> Option<ObjectRef> {
+    match args.get(idx) {
+        Some(Value::Object(obj)) => *obj,
+        _ => None,
+    }
+}
+
+fn h2_int_arg(args: &[Value], idx: usize, label: &str) -> Result<i32, MethodCallFailed> {
+    match args.get(idx) {
+        Some(Value::Int(v)) => Ok(*v),
+        Some(Value::Long(v)) => Ok(*v as i32),
+        _ => Err(RuntimeError::IllegalArgumentException {
+            message: label.to_string(),
+        }
+        .into()),
+    }
+}
+
+fn h2_long_arg(args: &[Value], idx: usize, label: &str) -> Result<i64, MethodCallFailed> {
+    match args.get(idx) {
+        Some(Value::Long(v)) => Ok(*v),
+        Some(Value::Int(v)) => Ok(*v as i64),
+        _ => Err(RuntimeError::IllegalArgumentException {
+            message: label.to_string(),
+        }
+        .into()),
+    }
+}
+
+fn h2_read_optional_pin(
+    ctx: &mut dyn NativeContext,
+    pin: Option<(usize, ObjectRef)>,
+) -> Option<ObjectRef> {
+    pin.map(|(handle, fallback)| ctx.read_native_pin(handle, fallback))
+}
+
+fn h2_new_empty_hashmap(ctx: &mut dyn NativeContext) -> Result<ObjectRef, MethodCallFailed> {
+    let map = match ctx.new_object("java/util/HashMap")? {
+        Some(Value::Object(Some(obj))) => obj,
+        _ => {
+            return Err(RuntimeError::IllegalStateException {
+                message: "HashMap allocation returned null".to_string(),
+            }
+            .into())
+        }
+    };
+    // HashMap() bytecode is AbstractMap.<init>() plus loadFactor = 0.75f.
+    // AbstractMap only leaves nullable view fields at their defaults.
+    ctx.set_field_by_name(map, "loadFactor", Value::Float(0.75));
+    Ok(map)
+}
+
+fn h2_int_field(ctx: &mut dyn NativeContext, obj: ObjectRef, field: &str) -> i32 {
+    match ctx.get_field_by_name(obj, field) {
+        Value::Int(v) => v,
+        Value::Long(v) => v as i32,
+        _ => 0,
+    }
+}
+
+fn h2_object_field(ctx: &mut dyn NativeContext, obj: ObjectRef, field: &str) -> Option<ObjectRef> {
+    match ctx.get_field_by_name(obj, field) {
+        Value::Object(obj) => obj,
+        _ => None,
+    }
+}
+
+fn h2_transaction_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = h2_object_arg(args, 0, "Transaction.<init> receiver is null")?;
+    let store = h2_optional_object_arg(args, 1);
+    let transaction_id = h2_int_arg(args, 2, "Transaction.<init> transaction id must be int")?;
+    let sequence_num = h2_long_arg(args, 3, "Transaction.<init> sequence number must be long")?;
+    let status = h2_int_arg(args, 4, "Transaction.<init> status must be int")?;
+    let name = h2_optional_object_arg(args, 5);
+    let log_id = h2_long_arg(args, 6, "Transaction.<init> log id must be long")?;
+    let timeout_millis = h2_int_arg(args, 7, "Transaction.<init> timeout millis must be int")?;
+    let owner_id = h2_int_arg(args, 8, "Transaction.<init> owner id must be int")?;
+    let isolation_level = h2_optional_object_arg(args, 9);
+    let listener = h2_optional_object_arg(args, 10);
+
+    let this_pin = ctx.pin_native_root(this);
+    let store_pin = store.map(|obj| (ctx.pin_native_root(obj), obj));
+    let name_pin = name.map(|obj| (ctx.pin_native_root(obj), obj));
+    let isolation_pin = isolation_level.map(|obj| (ctx.pin_native_root(obj), obj));
+    let listener_pin = listener.map(|obj| (ctx.pin_native_root(obj), obj));
+
+    let result = (|| {
+        let transaction_maps = h2_new_empty_hashmap(ctx)?;
+        let maps_pin = ctx.pin_native_root(transaction_maps);
+
+        let status_and_log_id = ((status as i64) << 41) | log_id;
+        let status_atomic = match ctx.new_object_initialized(
+            "java/util/concurrent/atomic/AtomicLong",
+            "(J)V",
+            &[Value::Long(status_and_log_id)],
+        )? {
+            Some(Value::Object(Some(obj))) => obj,
+            _ => {
+                return Err(RuntimeError::IllegalStateException {
+                    message: "AtomicLong allocation returned null".to_string(),
+                }
+                .into())
+            }
+        };
+        let status_pin = ctx.pin_native_root(status_atomic);
+
+        let this = ctx.read_native_pin(this_pin, this);
+        let transaction_maps = ctx.read_native_pin(maps_pin, transaction_maps);
+        let status_atomic = ctx.read_native_pin(status_pin, status_atomic);
+        let store = h2_read_optional_pin(ctx, store_pin);
+        let name = h2_read_optional_pin(ctx, name_pin);
+        let isolation_level = h2_read_optional_pin(ctx, isolation_pin);
+        let listener = h2_read_optional_pin(ctx, listener_pin);
+
+        ctx.set_field_by_name(
+            this,
+            "transactionMaps",
+            Value::Object(Some(transaction_maps)),
+        );
+        ctx.set_field_by_name(this, "store", Value::Object(store));
+        ctx.set_field_by_name(this, "transactionId", Value::Int(transaction_id));
+        ctx.set_field_by_name(this, "sequenceNum", Value::Long(sequence_num));
+        ctx.set_field_by_name(this, "statusAndLogId", Value::Object(Some(status_atomic)));
+        ctx.set_field_by_name(this, "name", Value::Object(name));
+
+        let timeout = if timeout_millis > 0 {
+            timeout_millis
+        } else {
+            let store = store.ok_or_else(|| RuntimeError::NullPointerException {
+                message: Some("Transaction.<init> store is null".to_string()),
+            })?;
+            h2_int_field(ctx, store, "timeoutMillis")
+        };
+        ctx.set_field_by_name(this, "timeoutMillis", Value::Int(timeout));
+        ctx.set_field_by_name(this, "ownerId", Value::Int(owner_id));
+        ctx.set_field_by_name(this, "isolationLevel", Value::Object(isolation_level));
+        ctx.set_field_by_name(this, "listener", Value::Object(listener));
+        Ok(None)
+    })();
+    ctx.unpin_native_roots(this_pin);
+    result
+}
+
+fn h2_root_reference_update_root_page(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = h2_object_arg(args, 0, "RootReference.updateRootPage receiver is null")?;
+    let page = h2_object_arg(args, 1, "RootReference.updateRootPage page is null")?;
+    let attempt_counter = h2_long_arg(
+        args,
+        2,
+        "RootReference.updateRootPage attempt counter must be long",
+    )?;
+
+    if h2_int_field(ctx, this, "holdCount") != 0 {
+        return Ok(Some(Value::Object(None)));
+    }
+
+    let this_pin = ctx.pin_native_root(this);
+    let page_pin = ctx.pin_native_root(page);
+    let result = (|| {
+        let this = ctx.read_native_pin(this_pin, this);
+        let page = ctx.read_native_pin(page_pin, page);
+        let old_root = match h2_object_field(ctx, this, "root") {
+            Some(root) => root,
+            None => return Ok(Some(Value::Object(None))),
+        };
+        let old_root_pin = ctx.pin_native_root(old_root);
+        let new_ref = match ctx.new_object_initialized(
+            H2_ROOT_REFERENCE,
+            "(Lorg/h2/mvstore/RootReference;Lorg/h2/mvstore/Page;J)V",
+            &[
+                Value::Object(Some(this)),
+                Value::Object(Some(page)),
+                Value::Long(attempt_counter),
+            ],
+        )? {
+            Some(Value::Object(Some(obj))) => obj,
+            _ => return Ok(Some(Value::Object(None))),
+        };
+        let new_pin = ctx.pin_native_root(new_ref);
+
+        let old_root = ctx.read_native_pin(old_root_pin, old_root);
+        let map = match h2_object_field(ctx, old_root, "map") {
+            Some(map) => map,
+            None => return Ok(Some(Value::Object(None))),
+        };
+        let map_pin = ctx.pin_native_root(map);
+        let this = ctx.read_native_pin(this_pin, this);
+        let new_ref = ctx.read_native_pin(new_pin, new_ref);
+        let map = ctx.read_native_pin(map_pin, map);
+        let updated = matches!(
+            ctx.invoke_virtual(
+                map,
+                "compareAndSetRoot",
+                "(Lorg/h2/mvstore/RootReference;Lorg/h2/mvstore/RootReference;)Z",
+                &[Value::Object(Some(this)), Value::Object(Some(new_ref))],
+            )?,
+            Some(Value::Int(v)) if v != 0
+        );
+        let new_ref = ctx.read_native_pin(new_pin, new_ref);
+        Ok(Some(Value::Object(if updated {
+            Some(new_ref)
+        } else {
+            None
+        })))
+    })();
+    ctx.unpin_native_roots(this_pin);
+    result
+}
+
+fn h2_boxed_long_value(
+    ctx: &mut dyn NativeContext,
+    obj: ObjectRef,
+) -> Result<i64, MethodCallFailed> {
+    match ctx.get_field(obj, 0) {
+        Value::Long(v) => Ok(v),
+        Value::Int(v) => Ok(v as i64),
+        _ => match ctx.invoke_virtual(obj, "longValue", "()J", &[])? {
+            Some(Value::Long(v)) => Ok(v),
+            Some(Value::Int(v)) => Ok(v as i64),
+            _ => Err(RuntimeError::IllegalArgumentException {
+                message: "LongDataType.binarySearch expected java.lang.Long".to_string(),
+            }
+            .into()),
+        },
+    }
+}
+
+fn h2_long_data_type_binary_search(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let key = match args.get(1) {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => {
+            return Err(RuntimeError::NullPointerException {
+                message: Some("LongDataType.binarySearch key is null".to_string()),
+            }
+            .into());
+        }
+    };
+    let storage = match args.get(2) {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => {
+            return Err(RuntimeError::NullPointerException {
+                message: Some("LongDataType.binarySearch storage is null".to_string()),
+            }
+            .into());
+        }
+    };
+    let size = match args.get(3) {
+        Some(Value::Int(v)) => *v,
+        _ => 0,
+    };
+    let initial_guess = match args.get(4) {
+        Some(Value::Int(v)) => *v,
+        _ => 0,
+    };
+
+    let key_value = h2_boxed_long_value(ctx, key)?;
+    let mut low = 0i32;
+    let mut high = size - 1;
+    let mut x = initial_guess - 1;
+    if x < 0 || x > high {
+        x = ((high as u32) >> 1) as i32;
+    }
+
+    while low <= high {
+        if x < 0 || x as usize >= ctx.array_length(storage) {
+            return Err(RuntimeError::ArrayIndexOutOfBoundsException { index: x }.into());
+        }
+        let element = match ctx.get_array_element(storage, x as usize) {
+            Value::Object(Some(obj)) => obj,
+            _ => {
+                return Err(RuntimeError::NullPointerException {
+                    message: Some("LongDataType.binarySearch element is null".to_string()),
+                }
+                .into());
+            }
+        };
+        let current = h2_boxed_long_value(ctx, element)?;
+        if key_value > current {
+            low = x + 1;
+        } else if key_value < current {
+            high = x - 1;
+        } else {
+            return Ok(Some(Value::Int(x)));
+        }
+        x = (((low as i64 + high as i64) as u64) >> 1) as i32;
+    }
+
+    Ok(Some(Value::Int(low ^ -1)))
+}
+
+fn h2_constraint_check_existing_data(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    let session = match args.get(1) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+
+    let db = match ctx.invoke_virtual(session, "getDatabase", "()Lorg/h2/engine/Database;", &[])? {
+        Some(Value::Object(Some(o))) => o,
+        _ => return Ok(None),
+    };
+    if matches!(
+        ctx.invoke_virtual(db, "isStarting", "()Z", &[])?,
+        Some(Value::Int(v)) if v != 0
+    ) {
+        return Ok(None);
+    }
+
+    let table = match ctx.get_field_by_name(this, "table") {
+        Value::Object(Some(o)) => o,
+        _ => return Ok(None),
+    };
+    if matches!(
+        ctx.invoke_virtual(
+            table,
+            "getRowCount",
+            "(Lorg/h2/engine/SessionLocal;)J",
+            &[Value::Object(Some(session))],
+        )?,
+        Some(Value::Long(0))
+    ) {
+        return Ok(None);
+    }
+
+    h2_constraint_run_existing_data_query(ctx, this, session)
+}
+
+fn h2_constraint_run_existing_data_query(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    session: ObjectRef,
+) -> MethodCallResult {
+    let table = match ctx.get_field_by_name(this, "table") {
+        Value::Object(Some(o)) => o,
+        _ => return Ok(None),
+    };
+    let ref_table = match ctx.get_field_by_name(this, "refTable") {
+        Value::Object(Some(o)) => o,
+        _ => return Ok(None),
+    };
+    let columns = match ctx.get_field_by_name(this, "columns") {
+        Value::Object(Some(o)) => o,
+        _ => return Ok(None),
+    };
+    let ref_columns = match ctx.get_field_by_name(this, "refColumns") {
+        Value::Object(Some(o)) => o,
+        _ => return Ok(None),
+    };
+
+    let column_sql = h2_index_columns_sql(ctx, columns, None)?;
+    let table_sql = h2_sql_fragment(ctx, table)?;
+    let ref_table_sql = h2_sql_fragment(ctx, ref_table)?;
+    let not_null = h2_index_columns_is_not_null(ctx, columns)?;
+    let ref_join = h2_index_column_join_sql(ctx, columns, ref_columns)?;
+
+    let sql = format!(
+        "SELECT 1 FROM (SELECT {column_sql} FROM {table_sql} WHERE {not_null} ORDER BY {column_sql}) C WHERE NOT EXISTS(SELECT 1 FROM {ref_table_sql} P WHERE {ref_join})"
+    );
+    let sql_obj = ctx.create_string(&sql);
+
+    ctx.invoke_virtual(
+        session,
+        "startStatementWithinTransaction",
+        "(Lorg/h2/command/Command;)V",
+        &[Value::Object(None)],
+    )?;
+
+    let result = (|| -> MethodCallResult {
+        let prepared = match ctx.invoke_virtual(
+            session,
+            "prepare",
+            "(Ljava/lang/String;)Lorg/h2/command/Prepared;",
+            &[Value::Object(Some(sql_obj))],
+        )? {
+            Some(Value::Object(Some(o))) => o,
+            _ => return Ok(None),
+        };
+        let result = match ctx.invoke_virtual(
+            prepared,
+            "query",
+            "(J)Lorg/h2/result/ResultInterface;",
+            &[Value::Long(1)],
+        )? {
+            Some(Value::Object(Some(o))) => o,
+            _ => return Ok(None),
+        };
+        let has_bad_row = matches!(
+            ctx.invoke_virtual(result, "next", "()Z", &[])?,
+            Some(Value::Int(v)) if v != 0
+        );
+        let close_result = ctx.invoke_virtual(result, "close", "()V", &[]);
+        if let Err(e) = close_result {
+            return Err(e);
+        }
+        if has_bad_row {
+            let desc = match ctx.invoke_special(
+                "org/h2/constraint/ConstraintReferential",
+                "getShortDescription",
+                "(Lorg/h2/index/Index;Lorg/h2/result/SearchRow;)Ljava/lang/String;",
+                &[
+                    Value::Object(Some(this)),
+                    Value::Object(None),
+                    Value::Object(None),
+                ],
+            )? {
+                Some(Value::Object(Some(o))) => o,
+                _ => ctx.create_string("Referential constraint violation"),
+            };
+            match ctx.invoke(
+                "org/h2/message/DbException",
+                "get",
+                "(ILjava/lang/String;)Lorg/h2/message/DbException;",
+                &[Value::Int(23506), Value::Object(Some(desc))],
+            ) {
+                Ok(Some(Value::Object(Some(exc)))) => {
+                    return Err(MethodCallFailed::ExceptionThrown(exc));
+                }
+                Ok(_) => {
+                    return Err(RuntimeError::IllegalArgumentException {
+                        message: "Referential constraint violation".to_string(),
+                    }
+                    .into());
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(None)
+    })();
+
+    let end_result = ctx.invoke_virtual(session, "endStatement", "()V", &[]);
+    match (result, end_result) {
+        (Err(e), _) => Err(e),
+        (Ok(_), Err(e)) => Err(e),
+        (Ok(v), Ok(_)) => Ok(v),
+    }
+}
+
+fn h2_index_columns_sql(
+    ctx: &mut dyn NativeContext,
+    columns: ObjectRef,
+    prefix: Option<&str>,
+) -> Result<String, MethodCallFailed> {
+    let mut out = String::new();
+    let len = ctx.array_length(columns);
+    for i in 0..len {
+        if i > 0 {
+            out.push_str(", ");
+        }
+        if let Some(prefix) = prefix {
+            out.push_str(prefix);
+        }
+        let col = h2_index_column(ctx, columns, i)?;
+        out.push_str(&h2_sql_fragment(ctx, col)?);
+    }
+    Ok(out)
+}
+
+fn h2_index_columns_is_not_null(
+    ctx: &mut dyn NativeContext,
+    columns: ObjectRef,
+) -> Result<String, MethodCallFailed> {
+    let mut out = String::new();
+    let len = ctx.array_length(columns);
+    for i in 0..len {
+        if i > 0 {
+            out.push_str(" AND ");
+        }
+        let col = h2_index_column(ctx, columns, i)?;
+        out.push_str(&h2_sql_fragment(ctx, col)?);
+        out.push_str(" IS NOT NULL");
+    }
+    Ok(out)
+}
+
+fn h2_index_column_join_sql(
+    ctx: &mut dyn NativeContext,
+    columns: ObjectRef,
+    ref_columns: ObjectRef,
+) -> Result<String, MethodCallFailed> {
+    let mut out = String::new();
+    let len = ctx.array_length(columns).min(ctx.array_length(ref_columns));
+    for i in 0..len {
+        if i > 0 {
+            out.push_str(" AND ");
+        }
+        let col = h2_index_column(ctx, columns, i)?;
+        let ref_col = h2_index_column(ctx, ref_columns, i)?;
+        out.push_str("C.");
+        out.push_str(&h2_sql_fragment(ctx, col)?);
+        out.push_str("=P.");
+        out.push_str(&h2_sql_fragment(ctx, ref_col)?);
+    }
+    Ok(out)
+}
+
+fn h2_index_column(
+    ctx: &dyn NativeContext,
+    columns: ObjectRef,
+    index: usize,
+) -> Result<ObjectRef, MethodCallFailed> {
+    let index_column = match ctx.get_array_element(columns, index) {
+        Value::Object(Some(o)) => o,
+        _ => {
+            return Err(RuntimeError::NullPointerException {
+                message: Some("IndexColumn".to_string()),
+            }
+            .into())
+        }
+    };
+    match ctx.get_field_by_name(index_column, "column") {
+        Value::Object(Some(o)) => Ok(o),
+        _ => Err(RuntimeError::NullPointerException {
+            message: Some("IndexColumn.column".to_string()),
+        }
+        .into()),
+    }
+}
+
+fn h2_sql_fragment(
+    ctx: &mut dyn NativeContext,
+    obj: ObjectRef,
+) -> Result<String, MethodCallFailed> {
+    let sb = match ctx.new_object_initialized("java/lang/StringBuilder", "()V", &[])? {
+        Some(Value::Object(Some(o))) => o,
+        _ => {
+            return Err(RuntimeError::IllegalArgumentException {
+                message: "could not allocate StringBuilder".to_string(),
+            }
+            .into())
+        }
+    };
+    ctx.invoke_virtual(
+        obj,
+        "getSQL",
+        "(Ljava/lang/StringBuilder;I)Ljava/lang/StringBuilder;",
+        &[Value::Object(Some(sb)), Value::Int(0)],
+    )?;
+    let s = match ctx.invoke_virtual(sb, "toString", "()Ljava/lang/String;", &[])? {
+        Some(Value::Object(Some(o))) => o,
+        _ => return Ok(String::new()),
+    };
+    Ok(ctx.read_string(s).unwrap_or_default())
+}
+
+fn h2_parser_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    let old_index = match ctx.get_field_by_name(this, "tokenIndex") {
+        Value::Int(i) => i,
+        _ => -1,
+    };
+    let new_index = old_index.saturating_add(1);
+    let tokens = match ctx.get_field_by_name(this, "tokens") {
+        Value::Object(Some(o)) => o,
+        _ => return Err(h2_syntax_error(ctx, this)),
+    };
+    let size = h2_arraylist_size(ctx, tokens);
+    if new_index < 0 || new_index as usize >= size {
+        return Err(h2_syntax_error(ctx, this));
+    }
+
+    h2_parser_advance_to(ctx, this, new_index)?;
+    let current_token = ctx.get_field_by_name(this, "currentToken");
+    if let Value::Object(Some(s_obj)) = current_token {
+        if ctx
+            .read_string(s_obj)
+            .is_some_and(|s| s.chars().count() > 256)
+        {
+            let preview = ctx
+                .read_string(s_obj)
+                .map(|s| s.chars().take(32).collect::<String>())
+                .unwrap_or_default();
+            return Err(h2_db_exception(
+                ctx,
+                42622,
+                &[preview.as_str(), "256"],
+                "Identifier is too long",
+            ));
+        }
+    }
+
+    if matches!(
+        ctx.get_field_by_name(this, "currentTokenType"),
+        Value::Int(94)
+    ) {
+        ctx.invoke_special(
+            "org/h2/command/ParserBase",
+            "checkLiterals",
+            "()V",
+            &[Value::Object(Some(this))],
+        )?;
+    }
+
+    Ok(None)
+}
+
+fn h2_parser_set_token_index(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    let index = match args.get(1) {
+        Some(Value::Int(i)) => *i,
+        _ => return Ok(None),
+    };
+    h2_parser_advance_to(ctx, this, index)
+}
+
+fn h2_parser_advance_to(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    index: i32,
+) -> MethodCallResult {
+    let old_index = match ctx.get_field_by_name(this, "tokenIndex") {
+        Value::Int(i) => i,
+        _ => -1,
+    };
+    if index == old_index {
+        return Ok(None);
+    }
+
+    if let Value::Object(Some(expected)) = ctx.get_field_by_name(this, "expectedList") {
+        cratonvm_native_collections::native_al_clear(ctx, &[Value::Object(Some(expected))])?;
+    }
+
+    let tokens = match ctx.get_field_by_name(this, "tokens") {
+        Value::Object(Some(o)) => o,
+        _ => {
+            return Err(RuntimeError::NullPointerException {
+                message: Some("ParserBase.tokens".to_string()),
+            }
+            .into())
+        }
+    };
+    if index < 0 || index as usize >= h2_arraylist_size(ctx, tokens) {
+        return Err(RuntimeError::ArrayIndexOutOfBoundsException { index }.into());
+    }
+    let token = match h2_arraylist_get(ctx, tokens, index as usize) {
+        Some(Value::Object(Some(o))) => o,
+        _ => {
+            return Err(RuntimeError::NullPointerException {
+                message: Some("ParserBase.token".to_string()),
+            }
+            .into())
+        }
+    };
+
+    let token_type = h2_token_type_value(ctx, token);
+    let identifier = h2_token_as_identifier_value(ctx, token);
+    ctx.set_field_by_name(this, "token", Value::Object(Some(token)));
+    ctx.set_field_by_name(this, "tokenIndex", Value::Int(index));
+    ctx.set_field_by_name(this, "currentTokenType", Value::Int(token_type));
+    ctx.set_field_by_name(this, "currentToken", identifier);
+    Ok(None)
+}
+
+fn h2_token_type_native(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let token = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    Ok(Some(Value::Int(h2_token_type_value(ctx, token))))
+}
+
+fn h2_token_as_identifier_native(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let token = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    Ok(Some(h2_token_as_identifier_value(ctx, token)))
+}
+
+fn h2_token_is_quoted_native(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let token = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let quoted = if h2_class_name(ctx, token)
+        .as_deref()
+        .is_some_and(|n| n == "org/h2/command/Token$IdentifierToken")
+    {
+        matches!(ctx.get_field_by_name(token, "quoted"), Value::Int(v) if v != 0)
+    } else {
+        false
+    };
+    Ok(Some(Value::Int(i32::from(quoted))))
+}
+
+fn h2_token_type_value(ctx: &dyn NativeContext, token: ObjectRef) -> i32 {
+    let Some(name) = h2_class_name(ctx, token) else {
+        return 0;
+    };
+    match name.as_str() {
+        "org/h2/command/Token$KeywordToken" | "org/h2/command/Token$KeywordOrIdentifierToken" => {
+            match ctx.get_field_by_name(token, "type") {
+                Value::Int(t) => t,
+                _ => 0,
+            }
+        }
+        "org/h2/command/Token$IdentifierToken" => 2,
+        "org/h2/command/Token$ParameterToken" => 92,
+        "org/h2/command/Token$EndOfInputToken" => 93,
+        "org/h2/command/Token$LiteralToken"
+        | "org/h2/command/Token$CharacterStringToken"
+        | "org/h2/command/Token$BinaryStringToken"
+        | "org/h2/command/Token$BigintToken"
+        | "org/h2/command/Token$IntegerToken"
+        | "org/h2/command/Token$ValueToken" => 94,
+        _ => 0,
+    }
+}
+
+fn h2_token_as_identifier_value(ctx: &mut dyn NativeContext, token: ObjectRef) -> Value {
+    let Some(name) = h2_class_name(ctx, token) else {
+        return Value::Object(None);
+    };
+    match name.as_str() {
+        "org/h2/command/Token$KeywordToken" => {
+            let token_type = match ctx.get_field_by_name(token, "type") {
+                Value::Int(t) => t,
+                _ => return Value::Object(None),
+            };
+            h2_keyword_token_string(ctx, token_type).unwrap_or(Value::Object(None))
+        }
+        "org/h2/command/Token$KeywordOrIdentifierToken"
+        | "org/h2/command/Token$IdentifierToken" => ctx.get_field_by_name(token, "identifier"),
+        "org/h2/command/Token$ParameterToken" => Value::Object(Some(ctx.create_string("?"))),
+        _ => Value::Object(None),
+    }
+}
+
+fn h2_keyword_token_string(ctx: &dyn NativeContext, token_type: i32) -> Option<Value> {
+    if token_type < 0 {
+        return None;
+    }
+    let token_class = ctx.class_id_by_name("org/h2/command/Token")?;
+    let tokens_field = ctx.static_field_index_by_name(token_class, "TOKENS")?;
+    let tokens = match ctx.get_static_field(token_class, tokens_field) {
+        Value::Object(Some(o)) => o,
+        _ => return None,
+    };
+    let index = token_type as usize;
+    if index >= ctx.array_length(tokens) {
+        return None;
+    }
+    Some(ctx.get_array_element(tokens, index))
+}
+
+fn h2_arraylist_size(ctx: &dyn NativeContext, list: ObjectRef) -> usize {
+    if let Some(size_slot) = ctx.resolve_field_index("java/util/ArrayList", "size") {
+        if let Value::Int(size) = ctx.get_field(list, size_slot) {
+            return size.max(0) as usize;
+        }
+    }
+    match ctx.get_field_by_name(list, "size") {
+        Value::Int(size) => size.max(0) as usize,
+        _ => 0,
+    }
+}
+
+fn h2_arraylist_get(ctx: &dyn NativeContext, list: ObjectRef, index: usize) -> Option<Value> {
+    let data_slot = ctx.resolve_field_index("java/util/ArrayList", "elementData")?;
+    let data = match ctx.get_field(list, data_slot) {
+        Value::Object(Some(o)) => o,
+        _ => return None,
+    };
+    if index >= ctx.array_length(data) {
+        return None;
+    }
+    Some(ctx.get_array_element(data, index))
+}
+
+fn h2_class_name(ctx: &dyn NativeContext, obj: ObjectRef) -> Option<String> {
+    ctx.class_name_of_id(ctx.class_id_of_object(obj))
+}
+
+fn h2_syntax_error(ctx: &mut dyn NativeContext, this: ObjectRef) -> MethodCallFailed {
+    match ctx.invoke_special(
+        "org/h2/command/ParserBase",
+        "getSyntaxError",
+        "()Lorg/h2/message/DbException;",
+        &[Value::Object(Some(this))],
+    ) {
+        Ok(Some(Value::Object(Some(exc)))) => MethodCallFailed::ExceptionThrown(exc),
+        Ok(_) => RuntimeError::IllegalArgumentException {
+            message: "H2 parser syntax error".to_string(),
+        }
+        .into(),
+        Err(e) => e,
+    }
+}
+
+fn h2_db_exception(
+    ctx: &mut dyn NativeContext,
+    code: i32,
+    args: &[&str],
+    fallback: &str,
+) -> MethodCallFailed {
+    let string_class = ctx
+        .ensure_class_initialized("java/lang/String")
+        .ok()
+        .or_else(|| ctx.class_id_by_name("java/lang/String"))
+        .unwrap_or_else(|| ClassId::new(0));
+    let arg_array = ctx.new_ref_array(string_class, args.len());
+    for (i, arg) in args.iter().enumerate() {
+        let s = ctx.create_string(arg);
+        ctx.set_array_element(arg_array, i, Value::Object(Some(s)));
+    }
+    match ctx.invoke(
+        "org/h2/message/DbException",
+        "get",
+        "(I[Ljava/lang/String;)Lorg/h2/message/DbException;",
+        &[Value::Int(code), Value::Object(Some(arg_array))],
+    ) {
+        Ok(Some(Value::Object(Some(exc)))) => MethodCallFailed::ExceptionThrown(exc),
+        Ok(_) => RuntimeError::IllegalArgumentException {
+            message: fallback.to_string(),
+        }
+        .into(),
+        Err(e) => e,
+    }
 }
 
 #[cfg_attr(not(feature = "app-stubs"), allow(dead_code))]
@@ -286,4 +1209,43 @@ fn table_filter_prepare_on(
     }
 
     Ok(None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn h2_long_data_type_binary_search_is_registered() {
+        let mut registry = NativeMethodRegistry::new();
+        register_h2_parser_fastpaths(&mut registry);
+        assert!(registry
+            .find(
+                "org/h2/mvstore/type/LongDataType",
+                "binarySearch",
+                "(Ljava/lang/Long;Ljava/lang/Object;II)I",
+            )
+            .is_some());
+        assert!(registry
+            .find(
+                "org/h2/mvstore/type/LongDataType",
+                "binarySearch",
+                "(Ljava/lang/Object;Ljava/lang/Object;II)I",
+            )
+            .is_some());
+        assert!(registry
+            .find(
+                H2_ROOT_REFERENCE,
+                "updateRootPage",
+                "(Lorg/h2/mvstore/Page;J)Lorg/h2/mvstore/RootReference;",
+            )
+            .is_some());
+        assert!(registry
+            .find(
+                H2_TRANSACTION,
+                "<init>",
+                "(Lorg/h2/mvstore/tx/TransactionStore;IJILjava/lang/String;JIILorg/h2/engine/IsolationLevel;Lorg/h2/mvstore/tx/TransactionStore$RollbackListener;)V",
+            )
+            .is_some());
+    }
 }
