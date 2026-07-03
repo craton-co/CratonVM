@@ -681,6 +681,28 @@ impl ThreadRegistry {
             .unwrap_or_default()
     }
 
+    /// xt-hardening follow-up (2026-07-03): OS tids of alive threads
+    /// currently `in_blocked_region` (excluded from the barrier, covered
+    /// only by `deposit_root_snapshot` — which never scans the JIT band on
+    /// the native stack). This is the ONLY gap `helper_window_pass` exists
+    /// to close (its own doc comment says so); a cooperatively-arrived
+    /// mutator already published its JIT roots via `update_root_snapshot`
+    /// before parking at the barrier, so re-scanning it is pure redundant
+    /// over-retention risk. Threads with `os_tid == 0` (registered but not
+    /// yet started) cannot be blocked, so they never contribute a false 0.
+    pub fn blocked_os_tids(&self) -> Vec<u32> {
+        let threads = self.threads.lock();
+        threads
+            .values()
+            .filter(|e| {
+                e.alive.load(Ordering::Acquire)
+                    && e.gc_block_state.in_blocked_region.load(Ordering::Acquire)
+            })
+            .map(|e| e.os_tid.load(Ordering::Acquire))
+            .filter(|&t| t != 0)
+            .collect()
+    }
+
     /// DBG (CRATONVM_DBG_MTROOTS): per-thread (tid, in_blocked_region,
     /// snapshot_len) for every alive thread. Used at an STW to see whether a
     /// thread that holds a reclaimed live oop was counted BLOCKED (excluded from

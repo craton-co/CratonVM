@@ -4078,6 +4078,18 @@ impl GenerationalHeap {
                     }
                     return;
                 }
+                // xt-hardening follow-up (2026-07-03): a non-zero-word0
+                // candidate whose always-zero header fields are non-zero is
+                // still corrupt garbage that happened to satisfy the
+                // field-bound + extent checks above — route it through the
+                // same non-writing side path rather than trusting it enough
+                // to header-write.
+                if !header_reserved_fields_plausible(header) {
+                    if side_marks.insert(addr) {
+                        worklist.push(ptr);
+                    }
+                    return;
+                }
                 if header.gc_flags & GC_FLAG_MARKED == 0 {
                     header.gc_flags |= GC_FLAG_MARKED;
                     worklist.push(ptr);
@@ -5754,15 +5766,75 @@ impl GenerationalHeap {
 
         let mut worklist: Vec<*mut u8> = Vec::new();
 
-        // Seed: root ObjectRefs that point into old gen
+        // Seed: root ObjectRefs that point into old gen.
+        //
+        // xt-hardening follow-up (2026-07-03): `roots` includes CONSERVATIVE
+        // candidates (register/stack-scanned guesses — the same `xt_roots`
+        // whose flood exposed the young-gen `mark_young` header-write
+        // corruptor). `OldGen::contains` is a bare bounds check (no
+        // alignment, no header validation), so before this fix ANY garbage
+        // address landing inside old gen's byte range got `gc_flags` blindly
+        // RMW'd — the exact same corruption family, on the OTHER generation.
+        // Reject implausible candidates instead of marking them: mirrors the
+        // already-established pattern in `scan_object_for_old_refs`'s extent
+        // check (skip-on-implausible, never corrupt) — old-gen compaction
+        // decides liveness purely from `gc_flags & GC_FLAG_MARKED`, so unlike
+        // the young sweep there is no side-mark-set escape hatch; the safe
+        // choice for an address that fails these checks is to not mark it
+        // (over-retention is not even at stake here — a failing candidate
+        // was never a valid object to begin with).
+        //
+        // NOTE this predicate deliberately does NOT require a non-zero first
+        // header word (unlike `mark_young`'s zero-word0 side-mark split):
+        // `ClassId(0)` ad-hoc containers (class_id=0, kind=Object=0,
+        // element_type=Reference=0, `_padding`=0) are a first-class supported
+        // shape whose word0 is legitimately all-zero — rejecting them here
+        // broke real promoted objects (major_gc_frees_old_gen_garbage et al).
+        // A zero-word0 candidate additionally passes through
+        // `victim8_neighbor_explains_zero_prefix` — a targeted check for the
+        // dominant real-world shape of this ambiguity, `candidate = victim
+        // − 8`: if the 8 bytes at `candidate` are just the tail
+        // zero-padding/hash-prefix of a SEPARATE, independently-plausible
+        // object starting at `candidate + 8`, `candidate` itself is not a
+        // real header and is rejected. A genuine zero-hash `ClassId(0)`
+        // container's successor 8 bytes are its own body/next-object data,
+        // essentially never a coincidentally-valid, independently-fitting
+        // header — false rejects of real containers are not expected. Old
+        // gen has no side-mark-set escape hatch (compaction PHYSICALLY
+        // SLIDES live objects; treating an unrelated garbage candidate as
+        // live would copy garbage over/into a real neighbor during the
+        // slide — strictly worse than skipping), so reject is the only safe
+        // response to a candidate that fails this check; verified this
+        // session (disassembly + byte-exact match on the fabricated
+        // pointer `0x0000020000000000` = hash(0)‖array_length(512) read
+        // from a corrupted victim's header) to be the mechanism behind the
+        // pre-xt-activation background DoHead crash face.
         for root in roots.iter() {
             let ptr = root.as_ptr();
-            if old_gen.contains(ptr) {
-                // SAFETY: `ptr` is a root ObjectRef in old gen (verified by `contains` above); its header is valid.
+            if (ptr as usize) & 0x7 == 0 && old_gen.contains(ptr) {
+                // SAFETY: `ptr` is 8-aligned and inside old gen (verified by
+                // `contains` above); reading its header is in-bounds.
                 let header = unsafe { &mut *(ptr as *mut ObjectHeader) };
-                if header.gc_flags & GC_FLAG_MARKED == 0 {
-                    header.gc_flags |= GC_FLAG_MARKED;
-                    worklist.push(ptr);
+                let kind_byte = header.kind as u8;
+                let is_array = header.kind == ObjectKind::Array;
+                let word0 = unsafe { *(ptr as *const u64) };
+                let plausible = kind_byte <= 1
+                    && (is_array || header.num_slots <= (1 << 24))
+                    && (!is_array || header.array_length <= i32::MAX as u32)
+                    && header_reserved_fields_plausible(header)
+                    && (word0 != 0
+                        || !victim8_neighbor_explains_zero_prefix(ptr, old_gen));
+                if plausible {
+                    let total = gen_object_total_size(header);
+                    let fits = total >= HEADER_SIZE
+                        // SAFETY: total >= HEADER_SIZE was just checked; the
+                        // addition stays within a sane pointer range for a
+                        // plausibility probe (no dereference here).
+                        && old_gen.contains(unsafe { ptr.add(total - 1) });
+                    if fits && header.gc_flags & GC_FLAG_MARKED == 0 {
+                        header.gc_flags |= GC_FLAG_MARKED;
+                        worklist.push(ptr);
+                    }
                 }
             }
         }
@@ -7338,6 +7410,66 @@ fn seedhunt_scan_young(
         cur += size;
     }
     count
+}
+
+/// xt-hardening follow-up (2026-07-03): reject a conservative candidate
+/// whose header's ALWAYS-ZERO fields are non-zero. `ObjectHeader::new`
+/// (types/src/heap_types.rs) unconditionally zero-initializes `_padding`
+/// (offset 6-7) and `_gc_reserved` (offset 22-23), and every relocation copy
+/// site (region.rs) and the JIT inline-alloc fast path (x64.rs
+/// `emit_inline_tlab_new`, which explicitly zeroes offset 4-7 as a single
+/// dword even on its fast path — see the "Defensively zero offset 4" comment
+/// there) preserve that invariant; nothing in the codebase ever writes a
+/// non-zero byte into either field. `gc_flags` similarly has only 3 defined
+/// bits (`GC_FLAG_OLD_GEN`/`MARKED`/`COMPACT`); any other bit set is
+/// definitionally corrupt. This closes the residual (rarer, non-zero-word0)
+/// slice of the `mark_young` conservative-candidate false-positive family
+/// that the zero-word0 side-mark-set fix (2026-07-03, same session) does not
+/// cover — a candidate whose garbage predecessor bytes happen to satisfy the
+/// kind/num_slots/array_length/extent bounds but fail this near-free check.
+/// Four bytes of near-uniform-random garbage failing this check is a ~1/2^29
+/// false-negative-on-garbage rate (2 padding bytes + 2 reserved bytes + 5
+/// undefined gc_flags bits); real objects always pass.
+#[inline]
+fn header_reserved_fields_plausible(header: &ObjectHeader) -> bool {
+    header._padding == [0, 0]
+        && header._gc_reserved == [0, 0]
+        && header.gc_flags & !(GC_FLAG_OLD_GEN | GC_FLAG_MARKED | GC_FLAG_COMPACT) == 0
+}
+
+/// xt-hardening follow-up (2026-07-03): targeted defense against the
+/// `candidate = victim − 8` corruptor shape for a zero-word0 old-gen root
+/// candidate — see the call site's comment for the full rationale. Returns
+/// `true` if `candidate + 8` looks like the start of a genuine, independently
+/// plausible object (in which case `candidate`'s all-zero 8 bytes are almost
+/// certainly that object's own leading padding/hash bytes, not a real header
+/// of its own).
+#[inline]
+fn victim8_neighbor_explains_zero_prefix(candidate: *mut u8, old_gen: &OldGen) -> bool {
+    // SAFETY: caller has already verified `candidate` is 8-aligned and
+    // inside old gen; `candidate + 8` stays 8-aligned. Bounds-check before
+    // dereferencing.
+    let neighbor = unsafe { candidate.add(8) };
+    if !old_gen.contains(neighbor) {
+        return false;
+    }
+    // SAFETY: bounds-checked above.
+    let nheader = unsafe { &*(neighbor as *const ObjectHeader) };
+    let nword0 = unsafe { *(neighbor as *const u64) };
+    let kind_byte = nheader.kind as u8;
+    let is_array = nheader.kind == ObjectKind::Array;
+    let plausible = nword0 != 0
+        && kind_byte <= 1
+        && (is_array || nheader.num_slots <= (1 << 24))
+        && (!is_array || nheader.array_length <= i32::MAX as u32)
+        && header_reserved_fields_plausible(nheader);
+    if !plausible {
+        return false;
+    }
+    let total = gen_object_total_size(nheader);
+    total >= HEADER_SIZE
+        // SAFETY: total >= HEADER_SIZE was just checked.
+        && old_gen.contains(unsafe { neighbor.add(total - 1) })
 }
 
 fn gen_object_total_size(header: &ObjectHeader) -> usize {
