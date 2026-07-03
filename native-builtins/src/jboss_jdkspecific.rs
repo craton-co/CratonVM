@@ -180,13 +180,50 @@ const MODULE_LAYER_FIELD_COUNT: usize = 2;
 /// `native-builtins::lib::register_essential_natives`'s `Class.getModule()`
 /// and `Module.getDescriptor()` overrides.
 const MODULE_FIELD_COUNT: usize = 5;
-/// `packages` has no real `java.lang.Module` field of that name (real
-/// `getPackages()` is computed, not stored) — slot 2 aliases the real
-/// `loader` field. Retained as a raw slot for now (existing JBoss-Modules
-/// behavior); calling `Module.getPackages()` on a Module built outside
-/// `build_module` below is a latent, not-yet-observed analog of the
-/// name/layer bug fixed here.
-const MODULE_SLOT_PACKAGES: usize = 2;
+
+/// Off-object storage for the package set `build_module` seeds and
+/// `native_module_get_packages` reads back, keyed by `identity_hash_code`
+/// (same pattern as `mac_state_table` in `phases_late.rs`).
+///
+/// `packages` has no real `java.lang.Module` field of that name — real
+/// `getPackages()` is computed, not stored. A prior version of this file
+/// aliased slot 2 for it, which is the REAL `loader` field on every Module
+/// object here (same bug class as the name/layer collision documented on
+/// `MODULE_FIELD_COUNT` above): any `Module.getPackages()` call on a Module
+/// not built by `build_module` below — e.g. the canonical shared mirror
+/// `Class.getModule()` caches — would have silently corrupted that object's
+/// real `loader` field. Storing the plain package-name `Vec<String>` here
+/// (not a `java.util.Set` object reference) also sidesteps needing a GC root
+/// for a value cached across native calls — `native_module_get_packages`
+/// rebuilds a fresh `HashSet` from it on every call.
+const MODULE_PACKAGES_MAX_ENTRIES: usize = 4096;
+
+fn module_packages_table() -> &'static std::sync::Mutex<std::collections::HashMap<i32, Vec<String>>>
+{
+    static T: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<i32, Vec<String>>>,
+    > = std::sync::OnceLock::new();
+    T.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Bound the table before inserting a fresh entry, mirroring
+/// `mac_state_evict_if_needed` — a long-running app that repeatedly builds
+/// short-lived synthetic Modules (via `ModuleLayer.findModule`) must not
+/// retain an entry per call forever. `keep` is the id about to be inserted
+/// and is never evicted. Best-effort eviction (lowest ids first); these are
+/// abandoned Module handles whose Java objects are unreachable.
+fn module_packages_evict_if_needed(t: &mut std::collections::HashMap<i32, Vec<String>>, keep: i32) {
+    if t.len() < MODULE_PACKAGES_MAX_ENTRIES {
+        return;
+    }
+    let target = MODULE_PACKAGES_MAX_ENTRIES / 2;
+    let mut ids: Vec<i32> = t.keys().copied().filter(|&k| k != keep).collect();
+    ids.sort_unstable();
+    let to_remove = t.len().saturating_sub(target);
+    for id in ids.into_iter().take(to_remove) {
+        t.remove(&id);
+    }
+}
 
 /// Build the singleton boot ModuleLayer.
 fn build_boot_layer(ctx: &mut dyn NativeContext) -> ObjectRef {
@@ -195,23 +232,27 @@ fn build_boot_layer(ctx: &mut dyn NativeContext) -> ObjectRef {
     layer
 }
 
-/// Build a `java.util.HashSet<String>` pre-populated with `packages`.
+/// Build a `java.util.HashSet<String>` pre-populated with `packages`, backed
+/// by the REAL HashMap-wrapped layout (`crate::build_real_layout_string_hashset`
+/// in `lib.rs`) rather than a hand-rolled (array, size, capacity) synthetic
+/// shape.
+///
+/// Real `java.util.HashSet` has exactly one instance field —
+/// `transient HashMap<E, Object> map;` (see `javap java.util.HashSet`) — so a
+/// (array, size, capacity) 3-slot convention here writes an `Object[]` into
+/// what real bytecode's `size()`/`iterator()`/`stream()` (all delegating to
+/// `this.map`) expect to be an actual `HashMap`. Confirmed via a direct
+/// Java-level probe (`getModule().getPackages().size()`): the prior version
+/// returned `0` regardless of how many packages were seeded, with
+/// `gen_heap::read_slot: corrupt Value cell` GC-guard errors logged during
+/// the call — the same "assumes a private synthetic layout on a class that's
+/// actually real bytecode" bug class as the Module field-slot fixes above,
+/// just on `HashSet` instead of `Module`. The real-layout helper builds an
+/// actual `HashMap` with real `HashMap$Node` buckets, so unforced real
+/// bytecode reads it correctly with no detection/adaptation needed.
 fn build_package_set(ctx: &mut dyn NativeContext, packages: &[&str]) -> ObjectRef {
-    let set = alloc_concurrent_synthetic(ctx, "java/util/HashSet", 3);
-    // Seed a descriptive default layout so cratonvm's synthetic HashSet
-    // paths don't misread null slots: slot 0 = backing array or null
-    // marker, slot 1 = size (Int), slot 2 = capacity (Int).
-    ctx.set_field(set, 0, Value::Object(None));
-    ctx.set_field(set, 1, Value::Int(packages.len() as i32));
-    ctx.set_field(set, 2, Value::Int(16));
-    // Actual element storage: an Object[] array referenced from slot 0.
-    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, packages.len());
-    for (i, pkg) in packages.iter().enumerate() {
-        let s = ctx.create_string(pkg);
-        ctx.set_array_element(arr, i, Value::Object(Some(s)));
-    }
-    ctx.set_field(set, 0, Value::Object(Some(arr)));
-    set
+    let keys: Vec<ObjectRef> = packages.iter().map(|pkg| ctx.create_string(pkg)).collect();
+    crate::build_real_layout_string_hashset(ctx, &keys)
 }
 
 /// Build a synthetic Module for `name`, bound to the boot layer.
@@ -222,12 +263,19 @@ fn build_module(ctx: &mut dyn NativeContext, name: &str, layer: ObjectRef) -> Ob
     ctx.set_field_by_name(module, "layer", Value::Object(Some(layer)));
     // Only `java.base` gets the full JDK package set; other synthetic
     // modules get an empty set (callers check `contains` before acting).
-    let packages = if name == "java.base" {
-        build_package_set(ctx, BOOT_JDK_PACKAGES)
+    // Recorded off-object in `module_packages_table` (see its doc comment)
+    // instead of a field slot — `native_module_get_packages` reads it back
+    // the same way.
+    let packages: Vec<String> = if name == "java.base" {
+        BOOT_JDK_PACKAGES.iter().map(|s| s.to_string()).collect()
     } else {
-        build_package_set(ctx, &[])
+        Vec::new()
     };
-    ctx.set_field(module, MODULE_SLOT_PACKAGES, Value::Object(Some(packages)));
+    let id = ctx.identity_hash_code(module);
+    let mut t = module_packages_table().lock().unwrap();
+    module_packages_evict_if_needed(&mut t, id);
+    t.insert(id, packages);
+    drop(t);
     module
 }
 
@@ -295,8 +343,12 @@ pub(crate) fn native_module_get_name(
     Ok(Some(ctx.get_field_by_name(this, "name")))
 }
 
-/// `Module.getPackages()` — return the Set at slot 2, lazily populated
-/// if the Module object was built elsewhere without pre-seeded packages.
+/// `Module.getPackages()` — return a fresh `Set<String>` built from whatever
+/// `build_module` recorded for this Module in `module_packages_table` (see
+/// its doc comment), or the full JDK package set as a permissive default for
+/// any Module this file didn't construct. Callers already check
+/// `.contains(...)` so an over-inclusive default set is fine; an
+/// under-inclusive one would not be, hence the fallback direction.
 pub(crate) fn native_module_get_packages(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -310,15 +362,16 @@ pub(crate) fn native_module_get_packages(
             .into());
         }
     };
-    let existing = ctx.get_field(this, MODULE_SLOT_PACKAGES);
-    if let Value::Object(Some(_)) = existing {
-        return Ok(Some(existing));
-    }
-    // Slot not populated — seed with the full JDK package set. Callers
-    // already check `.contains(...)` so an over-inclusive set is fine.
-    let packages = build_package_set(ctx, BOOT_JDK_PACKAGES);
-    ctx.set_field(this, MODULE_SLOT_PACKAGES, Value::Object(Some(packages)));
-    Ok(Some(Value::Object(Some(packages))))
+    let id = ctx.identity_hash_code(this);
+    let recorded = module_packages_table().lock().unwrap().get(&id).cloned();
+    let set = match recorded {
+        Some(names) => {
+            let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+            build_package_set(ctx, &refs)
+        }
+        None => build_package_set(ctx, BOOT_JDK_PACKAGES),
+    };
+    Ok(Some(Value::Object(Some(set))))
 }
 
 /// `Module.getLayer()` — return the real `layer` field (resolved by field
@@ -679,12 +732,11 @@ mod tests {
     #[test]
     fn module_get_packages_lazily_populates_empty_module() {
         let mut ctx = MockNativeContext::new();
-        // Build a module with empty packages slot by using a name that
-        // isn't java.base (so build_module seeds empty).
+        // build_module records an EMPTY package list for any non-java.base
+        // name (module_packages_table) — getPackages() must still return a
+        // valid (non-null) Set, not null/panic.
         let layer = build_boot_layer(&mut ctx);
         let module = build_module(&mut ctx, "java.sql", layer);
-        // Overwrite packages to null to simulate lazy-load path.
-        ctx.set_field(module, MODULE_SLOT_PACKAGES, Value::Object(None));
         let result = native_module_get_packages(&mut ctx, &[Value::Object(Some(module))])
             .unwrap()
             .unwrap();
@@ -757,10 +809,14 @@ mod tests {
     }
 
     #[test]
-    fn t19_h12_module_get_classloader_returns_null_even_for_packages_slot_set() {
-        // Defense in depth: even if the synthetic Module's slot 2 (packages)
-        // holds a HashSet — which is what triggered the real-world NSME —
-        // our native must NOT return that HashSet as the classloader.
+    fn t19_h12_module_get_classloader_returns_null_even_with_recorded_packages() {
+        // Defense in depth: getClassLoader must not be affected by (or leak)
+        // whatever `build_module` recorded for this module's packages in
+        // `module_packages_table` — the historical bug this guarded against
+        // was a raw field slot double-booked for both purposes; that's no
+        // longer possible now that packages are stored off-object entirely,
+        // but keep the regression coverage that getClassLoader is correct
+        // for a module with real recorded package data.
         let mut r = NativeMethodRegistry::new();
         register_jboss_jdkspecific(&mut r);
         let cb = r
@@ -772,21 +828,23 @@ mod tests {
             .expect("Module.getClassLoader must be registered");
         let mut ctx = MockNativeContext::new();
         let layer = build_boot_layer(&mut ctx);
-        // Build a fully-populated module (slot 2 = HashSet of packages).
+        // Build a fully-populated module (java.base records the full JDK package list).
         let module = build_module(&mut ctx, "java.base", layer);
-        // Confirm slot 2 IS a HashSet (this is the bug condition).
-        let pkgs = ctx.get_field(module, MODULE_SLOT_PACKAGES);
+        // Sanity: getPackages() reflects the recorded data for this module.
+        let pkgs = native_module_get_packages(&mut ctx, &[Value::Object(Some(module))])
+            .unwrap()
+            .unwrap();
         assert!(
             matches!(pkgs, Value::Object(Some(_))),
-            "slot 2 should be a Set"
+            "getPackages() should return a populated Set"
         );
-        // Native must NOT route through slot 2.
+        // getClassLoader must NOT be affected by any of this.
         let result = cb(&mut ctx, &[Value::Object(Some(module))])
             .unwrap()
             .unwrap();
         assert!(
             matches!(result, Value::Object(None)),
-            "Module.getClassLoader must not leak the packages HashSet, got {:?}",
+            "Module.getClassLoader must not leak packages data, got {:?}",
             result
         );
     }
