@@ -457,7 +457,10 @@ pub fn update_all_roots(
     //     under a moving collector their addresses change and we must
     //     remap them here, otherwise the next cache lookup returns a
     //     stale pointer.
-    cratonvm_native_builtins::lang_math::gc_update_value_of_cache_refs(pointer_map);
+    cratonvm_native_builtins::lang_math::gc_update_value_of_cache_refs(
+        shared.vm_identity,
+        pointer_map,
+    );
 
     // 15a. Unsafe / Class$Atomic synthetic-offset side stores (scanned in
     //      `roots.rs` step 15a). A moving collection relocates the stored refs

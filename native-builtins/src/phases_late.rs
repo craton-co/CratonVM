@@ -20516,7 +20516,12 @@ pub(crate) fn register_p59_module(r: &mut NativeMethodRegistry) {
     // (real bytecode) vs. `true` on real HotSpot (every module implicitly
     // reads java.base) and on this native (which correctly queries the
     // readability graph's mandated java.base edge).
-    r.register(m, "canRead", "(Ljava/lang/Module;)Z", native_module_can_read);
+    r.register(
+        m,
+        "canRead",
+        "(Ljava/lang/Module;)Z",
+        native_module_can_read,
+    );
 
     // Module.addReads(Module) → Module (returns this)
     // Adds a dynamic read edge in the ModuleRegistry.
@@ -52517,7 +52522,9 @@ mod essential_vs_synthetic_jdk_coverage_audit {
     use crate::register_essential_natives;
     use std::collections::BTreeSet;
 
-    fn dump_triples(f: impl FnOnce(&mut NativeMethodRegistry)) -> BTreeSet<(String, String, String)> {
+    fn dump_triples(
+        f: impl FnOnce(&mut NativeMethodRegistry),
+    ) -> BTreeSet<(String, String, String)> {
         let mut r = NativeMethodRegistry::new();
         f(&mut r);
         r.dump_registrations()

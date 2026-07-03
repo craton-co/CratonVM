@@ -6229,6 +6229,12 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // 2026-06-20 review finding `nb-lang / StrictMath delegates to platform libm`.
     lang_math::register_math_natives(registry, "java/lang/Math");
     lang_math::register_math_natives(registry, "java/lang/StrictMath");
+    // Test fixtures and real-JDK bytecode in default mode still emit standard
+    // autoboxing calls such as Integer.valueOf(int). These are bytecode methods
+    // in the JDK, not ACC_NATIVE, but the interpreter's static dispatch probes
+    // the native registry for non-object primitive receivers; keep the exact
+    // wrapper valueOf/intValue surface available in the essential registry.
+    lang_math::register_wrapper_natives(registry);
 
     // --- sun/misc/Unsafe + jdk/internal/misc/Unsafe ---
     register_unsafe_natives(registry);

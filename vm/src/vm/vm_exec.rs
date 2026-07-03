@@ -2118,6 +2118,10 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         }
     }
 
+    fn vm_identity(&self) -> usize {
+        self.shared.vm_identity
+    }
+
     fn register_var_handle_root(&mut self, vh: ObjectRef) {
         // B-J: keep VarHandles alive (and copied into the GC pointer-map) so
         // their `static final` holder slots remap correctly across a move.
