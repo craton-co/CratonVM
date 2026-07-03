@@ -512,6 +512,10 @@ cached_is_set!(trace_unimplemented, "CRATONVM_TRACE_UNIMPLEMENTED");
 
 // ── Flags read via `env::var(...).is_ok()` ──────────────────────────────
 
+/// `CRATONVM_NO_LOCAL_LIVENESS` — disable the per-bci local-variable
+/// liveness filter in the interpreter frame GC root scan (restores the
+/// scan-every-object-typed-slot behaviour; see `runtime::local_liveness`).
+cached_is_ok!(no_local_liveness, "CRATONVM_NO_LOCAL_LIVENESS");
 cached_is_ok!(trace_sb_filter, "CRATONVM_TRACE_SB_FILTER");
 cached_is_ok!(nsee_trace, "CRATONVM_NSEE_TRACE");
 cached_is_ok!(iae_trace, "CRATONVM_IAE_TRACE");

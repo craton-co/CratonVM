@@ -1290,7 +1290,31 @@ impl Frame {
     /// filter unchanged; long-bit-patterns whose lower 47 bits don't point
     /// at a live heap object are correctly excluded.
     pub fn scan_local_objects(&self, roots: &mut Vec<ObjectRef>, heap: &crate::memory::VmHeap) {
+        // Per-bci local liveness (HotSpot interpreter-oop-map equivalent): a
+        // slot whose value can never be read again under bytecode semantics
+        // is NOT a root. Without this, a scoped-out local (e.g. a loop
+        // construction temp) retains its last referent for the frame's whole
+        // lifetime — unbounded retention on linked structures (the
+        // SteadyChurn `node[4095]` anchor, `CRATONVM_G1_DBG_ROOTCENSUS=1`).
+        // The analysis is conservative (all-live on anything it cannot fully
+        // model), both the current and last-started instruction pcs are
+        // unioned, and slot 0 is always kept. Opt out with
+        // `CRATONVM_NO_LOCAL_LIVENESS=1`. The NON-MOVING conservative scan
+        // (`scan_locals_conservative`) is intentionally unfiltered.
+        let live_mask = if crate::runtime::env_cache::no_local_liveness() {
+            crate::runtime::local_liveness::ALL_LIVE
+        } else {
+            crate::runtime::local_liveness::live_locals_mask(
+                &self.code,
+                self.exception_table(),
+                self.max_locals,
+                [self.pc, self.last_instr_pc],
+            )
+        };
         for (i, cv) in self.locals.iter().enumerate() {
+            if i < 64 && live_mask & (1u64 << i) == 0 {
+                continue;
+            }
             // A primitive `long` / `double` is never a heap reference — not
             // even when its NaN-boxed bits collide with the SUB_OBJECT tag
             // (BC F2m `LongArray` `0xfffd_…` words). The `is_heap_addr` filter
@@ -1799,13 +1823,17 @@ mod tests {
         // to `CompactValue::object(addr)`, but it is a *value*, not a pointer.
         let collision_bits = CompactValue::object(addr).raw_bits();
 
+        // Bytecode that READS both slots at pc 0 so the per-bci liveness
+        // filter (which correctly drops never-read-again slots) keeps them:
+        // this test is about tag-collision semantics, not liveness.
+        //   0: lload_0 ; 1: pop2 ; 2: aload_1 ; 3: pop ; 4: return
         let mut frame = Frame::new(
             ClassId::new(0),
             "T".to_string(),
             "m".to_string(),
             "()V".to_string(),
             None,
-            vec![0xb1],
+            vec![0x1e, 0x58, 0x2b, 0x57, 0xb1],
             vec![],
             10,
             4,
