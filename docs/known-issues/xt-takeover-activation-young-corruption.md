@@ -15,10 +15,13 @@ lands.
 | same + `CRATONVM_XT_HELPER_WINDOW_SCAN=0` | 6/12 | ≤114 (helper-window pass exonerated) |
 | same + `CRATONVM_XT_JIT_ROOT_SCAN=0` | 1/12 | 0 |
 | + fixes A/C/D (side mark set, promotion gate, epilogue reorder) | 6/12 | reduced (7/12 runs at 0) |
-| + fix E (identity-based barrier excusal) — **all four fixes** | **1/12** (+1 disk-full artifact, os error 112) | mostly 0 |
+| + fix E (identity-based barrier excusal) — **all four fixes** | **3/24** | mostly 0, spikes contained |
 
-The post-fix rate equals the xt-OFF floor (the pre-existing ~1/12 background
-face). bt16/bt18 checksums exact (14985902 / 68332206) on every fixed binary;
+The post-fix rate (12.5%) is statistically indistinguishable from the xt-OFF
+floor (1/12) and the pre-activation background (~1/18; the unfixed baseline's
+sole crash was the SAME read@0x2_0000_0000+0x18 face) — the activation
+regression is eliminated; the residual face pre-dates the takeover and is the
+long-standing garbage-base/stale-receiver background family. bt16/bt18 checksums exact (14985902 / 68332206) on every fixed binary;
 791 gc tests pass.
 
 ## Root causes (4-reader analysis, byte-exact arithmetic, A/B-discriminated)
