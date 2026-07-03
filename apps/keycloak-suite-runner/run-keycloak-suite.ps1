@@ -211,10 +211,16 @@ function ConvertTo-RepoRelativeModule([string]$Root, [string]$TestClassesDir) {
 }
 
 function Resolve-MavenExe {
-  $cmd = Join-Path $script:KeycloakDir 'mvnw.cmd'
-  if (Test-Path $cmd) { return [System.IO.Path]::GetFullPath($cmd) }
   $sh = Join-Path $script:KeycloakDir 'mvnw'
-  if (Test-Path $sh) { return [System.IO.Path]::GetFullPath($sh) }
+  $cmd = Join-Path $script:KeycloakDir 'mvnw.cmd'
+  $candidates = if ([System.Environment]::OSVersion.Platform -eq [System.PlatformID]::Win32NT) {
+    @($cmd, $sh)
+  } else {
+    @($sh, $cmd)
+  }
+  foreach ($candidate in $candidates) {
+    if (Test-Path $candidate) { return [System.IO.Path]::GetFullPath($candidate) }
+  }
   return 'mvn'
 }
 
@@ -256,14 +262,18 @@ function Add-InferredJUnitRuntimeEntries {
   foreach ($entry in $snapshot) {
     if ($entry -match 'junit-platform-engine[\\/](?<version>[^\\/]+)[\\/]junit-platform-engine-[^\\/]+\.jar$') {
       $version = $Matches.version
-      $launcher = $entry -replace 'junit-platform-engine[\\/][^\\/]+[\\/]junit-platform-engine-[^\\/]+\.jar$', "junit-platform-launcher\$version\junit-platform-launcher-$version.jar"
+      $artifactDir = Split-Path (Split-Path $entry -Parent) -Parent
+      $groupDir = Split-Path $artifactDir -Parent
+      $launcher = Join-Path (Join-Path (Join-Path $groupDir 'junit-platform-launcher') $version) "junit-platform-launcher-$version.jar"
       if (Test-Path $launcher) {
         Add-UniqueClasspathEntry -Entries $Entries -Seen $Seen -Entry $launcher
       }
     }
     if ($entry -match 'junit-jupiter-api[\\/](?<version>[^\\/]+)[\\/]junit-jupiter-api-[^\\/]+\.jar$') {
       $version = $Matches.version
-      $engine = $entry -replace 'junit-jupiter-api[\\/][^\\/]+[\\/]junit-jupiter-api-[^\\/]+\.jar$', "junit-jupiter-engine\$version\junit-jupiter-engine-$version.jar"
+      $artifactDir = Split-Path (Split-Path $entry -Parent) -Parent
+      $groupDir = Split-Path $artifactDir -Parent
+      $engine = Join-Path (Join-Path (Join-Path $groupDir 'junit-jupiter-engine') $version) "junit-jupiter-engine-$version.jar"
       if (Test-Path $engine) {
         Add-UniqueClasspathEntry -Entries $Entries -Seen $Seen -Entry $engine
       }
@@ -276,7 +286,7 @@ function ConvertTo-ManifestClasspathUrl([string]$Entry) {
   if ((Test-Path $full -PathType Container) -and -not ($full.EndsWith('\') -or $full.EndsWith('/'))) {
     $full += [System.IO.Path]::DirectorySeparatorChar
   }
-  return ([System.Uri]$full).AbsoluteUri
+  return ([System.Uri]::new($full, [System.UriKind]::Absolute)).AbsoluteUri
 }
 
 function Split-ManifestLine([string]$Line) {
@@ -305,7 +315,7 @@ function New-PathingJar {
 
   $pathingDir = Join-Path $script:WorkRoot 'pathing-jars'
   New-Item -ItemType Directory -Force -Path $pathingDir | Out-Null
-  $signature = (($Entries | ForEach-Object { [System.IO.Path]::GetFullPath($_) }) -join "`n")
+  $signature = 'pathing-jar-manifest-url-v2' + "`n" + (($Entries | ForEach-Object { [System.IO.Path]::GetFullPath($_) }) -join "`n")
   $hash = (Get-Sha256Hex $signature).Substring(0, 16)
   $stem = ConvertTo-SafeFileStem $(if ($Module) { $Module } else { 'universal' })
   $jarPath = Join-Path $pathingDir "$stem-$hash.jar"
@@ -613,7 +623,8 @@ function Get-LaunchSpec {
   $entries = @(Get-ModuleClasspathEntries -Module $module)
   $separator = [string][System.IO.Path]::PathSeparator
   $cp = ($entries -join $separator)
-  if ($cp.Length -gt 24000) {
+  $usePathingJar = ([System.Environment]::OSVersion.Platform -eq [System.PlatformID]::Win32NT) -and ($cp.Length -gt 24000)
+  if ($usePathingJar) {
     $jar = New-PathingJar -Module $module -Entries $entries
     return [pscustomobject]@{ kind = 'jar'; value = $jar; entries = $entries.Count; length = $cp.Length }
   }
@@ -881,8 +892,9 @@ function Invoke-Mode {
   param([object[]]$Classes)
 
   $jdk = Resolve-Jdk
-  $java = Join-Path $jdk 'bin\java.exe'
-  if (-not (Test-Path $java)) { Die "HotSpot java.exe not found: $java" }
+  $javaBin = Join-Path $jdk 'bin'
+  $java = @((Join-Path $javaBin 'java.exe'), (Join-Path $javaBin 'java')) | Where-Object { Test-Path $_ } | Select-Object -First 1
+  if (-not $java) { Die "HotSpot java executable not found under: $javaBin" }
   $craton = ''
   if ($Vm -eq 'craton') { $craton = Resolve-CratonExe }
 
