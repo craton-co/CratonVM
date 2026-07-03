@@ -83,7 +83,7 @@ foreign-layout Module object would corrupt `loader` the same way.
 
 ## Fix commits
 
-Branch `fix/module-getdescriptor-uses-null-20260703` (2 commits):
+Branch `fix/module-getdescriptor-uses-null-20260703` (3 commits):
 
 - `af51f317` — `fix(module): populate Module.getDescriptor() instead of
   returning null` (bug 1: `native-api/src/registry.rs`,
@@ -91,7 +91,11 @@ Branch `fix/module-getdescriptor-uses-null-20260703` (2 commits):
   `vm/src/runtime/interpreter.rs`, `vm/src/vm/vm_exec.rs`)
 - `6717d333` — `fix(module): stop JBoss-Modules Module natives from
   corrupting real Module field layout` (bug 2:
-  `native-builtins/src/jboss_jdkspecific.rs`)
+  `native-builtins/src/jboss_jdkspecific.rs`, `Module.getName()`/`getLayer()`)
+- `b0b6e545` — `fix(module): stop Module.getPackages() aliasing the real
+  loader field` (bug 3, same file, `Module.getPackages()` — see below;
+  not confirmed live in the original XContentProvider chain, found while
+  auditing the rest of this file for the same bug class)
 
 Bug 1's fix alone did **not** resolve the Elasticsearch failures — bug 2 had
 to be found and fixed too. This was confirmed the hard way: after bug 1
@@ -99,6 +103,44 @@ landed, the exact same NPE with the exact same signature still reproduced;
 extensive field-level tracing (dumping raw field slots, resolved field
 indices, and the concrete class of the object stored in the "name" field) is
 what surfaced bug 2.
+
+**Bug 3 — `Module.getPackages()`, same collision, different field, plus a
+second nested bug it exposed.** `native_module_get_packages` hardcoded field
+slot 2 for the package list. Real `java.lang.Module` has no field literally
+named "packages" (real `getPackages()` is computed, not stored); slot 2 is
+actually the real `loader` field. Any Module object not built by this file's
+own `build_module` (e.g. the same canonical shared unnamed-module mirror
+implicated in bug 2) would have its real `loader` field silently overwritten
+with a `Set` the first time `getPackages()` was called on it. Confirmed live
+via a direct Java-level probe (`getModule().getPackages()` does dispatch to
+this native in the default build, despite `getPackages` not being in
+`force_native_over_real_jdk_bytecode` — reachability isn't only decided by
+that list). Fixed by moving the package list off-object into an
+identity-hash-keyed side table (`module_packages_table`, same bounded pattern
+as `mac_state_table` in `phases_late.rs`), storing a plain `Vec<String>`
+rather than a `java.util.Set` reference to avoid needing a GC root for a
+value cached across native calls.
+
+Verifying bug 3 end-to-end (calling `.getPackages().size()` from Java)
+surfaced a **second, independent bug**: `build_package_set` built the
+returned `HashSet` using a hand-rolled `(array, size, capacity)` synthetic
+layout, but real `java.util.HashSet` has exactly one field
+(`transient HashMap<E,Object> map`) — the mismatch corrupted real
+`size()`/`iterator()`/`stream()` bytecode, observed directly as `.size()`
+always returning `0` plus `gen_heap::read_slot: corrupt Value cell`
+GC-guard errors in the log. Fixed by switching to the existing, already
+-correct `build_real_layout_string_hashset` helper (`native-builtins/src/
+lib.rs`), used elsewhere for the identical bug class (its own `S111r11+`
+comment on `Properties.stringPropertyNames` describes fixing the same thing
+for a different caller). Verified via direct probe: package-set size now
+correctly matches `BOOT_JDK_PACKAGES`'s length (63) with no corruption
+errors, for both a real named module (`java.base`) and the unnamed module.
+
+`native_module_get_packages`'s `HashSet` layout bug was general — any other
+caller elsewhere in the codebase building a `HashSet` via the same
+`(array, size, capacity)` convention on a class whose real bytecode is
+loaded (rather than a fully synthetic stand-in) could hit the identical
+corruption. Not audited beyond this file's own `build_package_set`.
 
 ## Verification
 
@@ -141,6 +183,21 @@ Both newly-exposed failures (`NodeRoleSettings` `NoClassDefFoundError`, the
 Jackson `StreamReadConstraints` `NoSuchMethodError`) are separate,
 pre-existing CratonVM gaps that this NPE was masking — not regressions from
 this fix. They are not yet filed as their own known-issues docs.
+
+Re-ran the same 6-class repro after bug 3's fix (`b0b6e545`) landed on top —
+identical results, confirming no regression:
+
+```text
+PASS   Retry2Tests
+PASS   RetryTests
+PASS   ShardBatchIndexerCanUseBatchTests
+FAIL   ShardBatchIndexerTests            (unrelated: NoClassDefFoundError NodeRoleSettings)
+FAIL   ShardBatchMapperParseTests        (unrelated: NoClassDefFoundError NodeRoleSettings)
+PASS   ShardBatchMapperResolveTests
+```
+
+Full `native-builtins` unit test suite after all 3 commits: 2749 passed, 0
+failed, 5 ignored (unchanged from before this branch).
 
 ## Historical repro (pre-fix)
 
