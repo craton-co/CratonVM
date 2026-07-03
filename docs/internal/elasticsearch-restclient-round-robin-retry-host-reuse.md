@@ -1,6 +1,31 @@
 # Elasticsearch REST round-robin retry host reuse
 
-Status: open
+Status: FIXED (2026-07-02, branch `fix/es-restclient-suite-bugs-20260702`)
+
+## Fix
+
+Root cause: `native_collections_min`/`native_collections_max`
+(`native-collections/src/lib.rs`, `Collections.min`/`Collections.max`)
+compared elements via a string-decode helper (`val_to_string`, effectively
+`read_string()`) instead of dispatching real `Comparable.compareTo`. For any
+element that isn't a `java.lang.String` — e.g. `RestClient`'s internal
+`DeadNode` (wraps `DeadHostState`, compared by `deadUntilNanos`) —
+`read_string()` returns `None`/`""` for every element, so the `>`/`<`
+string comparison was always false and `Collections.min`/`max` silently
+returned element 0 regardless of true ordering. `RestClient.selectNodes`'s
+`Collections.min(selectedDeadNodes)` dead-host revival pick therefore always
+"revived" the first-registered host instead of the one with the lowest
+`deadUntilNanos`, producing the "host used multiple times" failure.
+
+Fix: replaced both functions with a shared `native_collections_extreme`
+that dispatches via the existing `compare_via_compare_to` helper (real
+`Comparable.compareTo`, already used by `Arrays.sort`/`Collections.sort`).
+Also fixed empty-collection behavior to throw `NoSuchElementException`
+(matches real JDK javadoc; previously silently returned `null`).
+
+Verified: `RestClientMultipleHostsTests` PASSES against a fresh build,
+5/5 runs across different random seeds (the test's `numNodes`/`numIters`
+are randomized per JUnit seed).
 
 Date observed: 2026-07-02
 

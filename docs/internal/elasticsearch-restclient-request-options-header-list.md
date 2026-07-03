@@ -1,6 +1,24 @@
 # Elasticsearch REST RequestOptions header list exception message mismatch
 
-Status: open
+Status: FIXED (2026-07-02, branch `fix/es-restclient-suite-bugs-20260702`)
+
+## Fix
+
+Root cause: `native-collections/src/lib.rs`'s generic `unsupported_op()` helper
+(used by every `Collections.unmodifiable*`/`List.of` view wrapper's blocked
+mutator) built `RuntimeError::UnsupportedOperationException` with
+`message: String::new()`. `vm/src/runtime/exceptions.rs`'s exception
+materializer treated ANY message — including an empty string — as
+`Some(msg)`, which calls the `(Ljava/lang/String;)V` constructor and sets a
+non-null empty-string `detailMessage`, instead of the no-arg `()V`
+constructor real JDK's `Collections$UnmodifiableCollection.add()` uses (null
+`detailMessage`). Fixed by treating an empty message as "no message" in the
+exception-materialization match arm — verified no other call site of
+`UnsupportedOperationException` passes an empty string (all ~20 others carry
+real, non-empty descriptions), so this is a fully scoped fix.
+
+Verified: `RequestOptionsTests` PASSES against a fresh build (real ES suite
+run, not just isolated repro).
 
 Date observed: 2026-07-02
 
