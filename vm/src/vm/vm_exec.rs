@@ -11933,8 +11933,17 @@ fn invoke_on_class_shared_inner(
                         || class_name.starts_with("java/lang/invoke/MethodHandle")
                         || (class_name.starts_with("java/lang/invoke/")
                             && class_name.contains("MethodHandle"));
+                    // Recognise any java/lang/invoke class carrying "VarHandle" in
+                    // its name, not just ones literally prefixed "VarHandle" — the
+                    // JEP 454 FFM API's `SegmentVarHandle` (used by
+                    // `MemorySegment.get/set`) is a top-level class that does NOT
+                    // share that prefix, and previously fell through to normal
+                    // method resolution and threw NoSuchMethodError. Mirrors the
+                    // analogous `is_mh` broadening above.
                     let is_vh = class_name == "java/lang/invoke/VarHandle"
-                        || class_name.starts_with("java/lang/invoke/VarHandle");
+                        || class_name.starts_with("java/lang/invoke/VarHandle")
+                        || (class_name.starts_with("java/lang/invoke/")
+                            && class_name.contains("VarHandle"));
                     if is_mh || is_vh {
                         let base = if is_mh {
                             "java/lang/invoke/MethodHandle"
