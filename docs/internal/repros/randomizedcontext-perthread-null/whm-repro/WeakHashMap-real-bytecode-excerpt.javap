@@ -1,0 +1,100 @@
+  private static java.lang.Object maskNull(java.lang.Object);
+    Code:
+         0: aload_0
+         1: ifnonnull     10
+         4: getstatic     #99                 // Field NULL_KEY:Ljava/lang/Object;
+         7: goto          11
+        10: aload_0
+        11: areturn
+
+  static java.lang.Object unmaskNull(java.lang.Object);
+    Code:
+         0: aload_0
+         1: getstatic     #99                 // Field NULL_KEY:Ljava/lang/Object;
+         4: if_acmpne     11
+         7: aconst_null
+         8: goto          12
+        11: aload_0
+        12: areturn
+
+  private boolean matchesKey(java.util.WeakHashMap$Entry<K, V>, java.lang.Object);
+    Code:
+         0: aload_1
+         1: aload_2
+         2: invokevirtual #103                // Method java/util/WeakHashMap$Entry.refersTo:(Ljava/lang/Object;)Z
+         5: ifeq          10
+         8: iconst_1
+         9: ireturn
+        10: aload_1
+        11: invokevirtual #107                // Method java/util/WeakHashMap$Entry.get:()Ljava/lang/Object;
+        14: astore_3
+        15: aload_3
+        16: ifnull        31
+        19: aload_2
+        20: aload_3
+        21: invokevirtual #111                // Method java/lang/Object.equals:(Ljava/lang/Object;)Z
+        24: ifeq          31
+        27: iconst_1
+        28: goto          32
+        31: iconst_0
+        32: ireturn
+
+  final int hash(java.lang.Object);
+    Code:
+         0: aload_1
+         1: invokevirtual #116                // Method java/lang/Object.hashCode:()I
+         4: istore_2
+         5: iload_2
+         6: iload_2
+         7: bipush        20
+         9: iushr
+        10: iload_2
+        11: bipush        12
+        13: iushr
+        14: ixor
+        15: ixor
+        16: istore_2
+        17: iload_2
+        18: iload_2
+        19: bipush        7
+        21: iushr
+        22: ixor
+        23: iload_2
+        24: iconst_4
+        25: iushr
+        26: ixor
+        27: ireturn
+
+  private static int indexFor(int, int);
+    Code:
+         0: iload_0
+         1: iload_1
+         2: iconst_1
+         3: isub
+         4: iand
+         5: ireturn
+
+  private void expungeStaleEntries();
+    Code:
+         0: aload_0
+         1: getfield      #12                 // Field queue:Ljava/lang/ref/ReferenceQueue;
+         4: invokevirtual #119                // Method java/lang/ref/ReferenceQueue.poll:()Ljava/lang/ref/Reference;
+         7: dup
+         8: astore_1
+         9: ifnull        138
+        12: aload_0
+        13: getfield      #12                 // Field queue:Ljava/lang/ref/ReferenceQueue;
+        16: dup
+        17: astore_2
+        18: monitorenter
+        19: aload_1
+        20: checkcast     #1                  // class java/util/WeakHashMap$Entry
+        23: astore_3
+        24: aload_3
+        25: getfield      #123                // Field java/util/WeakHashMap$Entry.hash:I
+        28: aload_0
+        29: getfield      #61                 // Field table:[Ljava/util/WeakHashMap$Entry;
+        32: arraylength
+        33: invokestatic  #126                // Method indexFor:(II)I
+        36: istore        4
+        38: aload_0

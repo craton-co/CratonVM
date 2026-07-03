@@ -31022,7 +31022,31 @@ fn native_collections_disjoint(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     Ok(Some(Value::Int(1)))
 }
 
-fn native_collections_max(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+/// `Collections.max(Collection)` / `Collections.min(Collection)` share this
+/// natural-ordering scan: pick element 0, then walk the rest comparing via
+/// `Comparable.compareTo` (the real JDK contract — `max`/`min` are literally
+/// specified in terms of `compareTo`), replacing the running candidate when
+/// `cmp() > 0` (max) or `cmp() < 0` (min). Ties keep the earliest element,
+/// matching `Collections.max`/`min`'s documented "first of equal maximums"
+/// behavior.
+///
+/// The previous implementation compared `val_to_string(elem)` — i.e. each
+/// element's `read_string()` decode — which only means something for actual
+/// `java.lang.String` elements. For any other `Comparable` (e.g. a
+/// `DeadNode`/custom class), `read_string` returns `None` for a non-String
+/// object, so every element degraded to the same empty string and the `>`/`<`
+/// comparison was *always false* — silently returning element 0 regardless of
+/// true ordering. That produced a deterministic-but-wrong "minimum" for
+/// `RestClient.selectNodes`'s `Collections.min(selectedDeadNodes)` dead-host
+/// revival pick, always resurrecting the first-registered host instead of the
+/// one with the lowest `deadUntilNanos` (RestClientMultipleHostsTests.
+/// testRoundRobinRetryErrors: "host [...] not found, most likely used
+/// multiple times").
+fn native_collections_extreme(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    want_max: bool,
+) -> MethodCallResult {
     let coll = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
@@ -31033,54 +31057,28 @@ fn native_collections_max(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         None => return Ok(Some(Value::Object(None))),
     };
     if size == 0 {
-        return Ok(Some(Value::Object(None)));
+        return Err(cratonvm_types::error::RuntimeError::NoSuchElementException {
+            message: String::new(),
+        }
+        .into());
     }
-    let mut max_val = ctx.get_array_element(data, 0);
-    let mut max_str = val_to_string(ctx, &max_val);
+    let mut best = ctx.get_array_element(data, 0);
     for i in 1..size as usize {
         let elem = ctx.get_array_element(data, i);
-        let s = val_to_string(ctx, &elem);
-        if s > max_str {
-            max_val = elem;
-            max_str = s;
+        let cmp = compare_via_compare_to(ctx, &elem, &best)?;
+        if (want_max && cmp > 0) || (!want_max && cmp < 0) {
+            best = elem;
         }
     }
-    Ok(Some(max_val))
+    Ok(Some(best))
+}
+
+fn native_collections_max(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    native_collections_extreme(ctx, args, true)
 }
 
 fn native_collections_min(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let coll = match args.first() {
-        Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(Some(Value::Object(None))),
-    };
-    let (data, size) = al_state(ctx, coll);
-    let data = match data {
-        Some(d) => d,
-        None => return Ok(Some(Value::Object(None))),
-    };
-    if size == 0 {
-        return Ok(Some(Value::Object(None)));
-    }
-    let mut min_val = ctx.get_array_element(data, 0);
-    let mut min_str = val_to_string(ctx, &min_val);
-    for i in 1..size as usize {
-        let elem = ctx.get_array_element(data, i);
-        let s = val_to_string(ctx, &elem);
-        if s < min_str {
-            min_val = elem;
-            min_str = s;
-        }
-    }
-    Ok(Some(min_val))
-}
-
-fn val_to_string(ctx: &mut dyn NativeContext, val: &Value) -> String {
-    match val {
-        Value::Object(Some(o)) => ctx.read_string(*o).unwrap_or_default(),
-        Value::Int(v) => v.to_string(),
-        Value::Long(v) => v.to_string(),
-        _ => String::new(),
-    }
+    native_collections_extreme(ctx, args, false)
 }
 
 fn native_collections_swap(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {

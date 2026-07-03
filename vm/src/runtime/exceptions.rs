@@ -1314,7 +1314,17 @@ pub fn throw_runtime_error(
         }
         RuntimeError::UnsupportedOperationException { message } => (
             "java/lang/UnsupportedOperationException",
-            Some(message.as_str()),
+            // An empty message means "no message" (e.g. the blocked-mutator
+            // helper for Collections.unmodifiable*/List.of view wrappers,
+            // matching the real JDK's `new UnsupportedOperationException()`
+            // no-arg constructor) — must produce a null `getMessage()`, not a
+            // non-null empty string. `Some("")` would call the
+            // `(Ljava/lang/String;)V` ctor and set detailMessage to "".
+            if message.is_empty() {
+                None
+            } else {
+                Some(message.as_str())
+            },
         ),
         RuntimeError::IllegalStateException { message } => {
             ("java/lang/IllegalStateException", Some(message.as_str()))
