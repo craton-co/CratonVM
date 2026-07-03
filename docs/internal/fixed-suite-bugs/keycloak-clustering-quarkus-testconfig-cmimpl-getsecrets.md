@@ -1,4 +1,4 @@
-# Keycloak clustering Quarkus TestConfig config-mapping implementation missing getSecrets
+# Keycloak Quarkus config-mapping implementation stubs missing getSecrets
 
 Status: FIXED (2026-07-03, branch `fix/keycloak-testconfig-cmimpl-getsecrets-20260703`)
 
@@ -6,9 +6,12 @@ Date observed: 2026-07-03
 
 ## Summary
 
-Both `tests/clustering` Keycloak classes crashed under CratonVM during JUnit
-launcher session startup with a method-resolution failure on Quarkus'
-runtime-generated SmallRye config-mapping implementation:
+Keycloak classes crashed or failed under CratonVM during JUnit launcher /
+test-framework startup with method-resolution failures on Quarkus'
+runtime-generated SmallRye config-mapping implementations.
+
+The first observed bucket was both `tests/clustering` classes, failing on
+`TestConfig$$CMImpl`:
 
 ```text
 NoSuchMethodError
@@ -32,11 +35,38 @@ org.keycloak.tests.clustering.JdbcPingCustomSchemaTest
 org.keycloak.tests.compatibility.ClusteredOAuthClientTest
 ```
 
+The later non-passed rerun also exposed the same root cause as 345 `FAIL` rows
+in the Keycloak JUnit 5 test-framework modules, failing on
+`LogBuildTimeConfig$$CMImpl` during `LogHandler.initializeQuarkusLogging`:
+
+```text
+NoSuchMethodError
+method="io/quarkus/runtime/logging/LogBuildTimeConfig$$CMImpl.getSecrets()Ljava/util/Set;
+[class not found on any classpath entry - synthetic stub, add the missing jar]"
+caller="io/smallrye/config/ConfigMappingLoader.configMappingSecrets(Ljava/lang/Class;)Ljava/util/Set; @pc=16"
+```
+
+Affected rows in `craton-nonpassed-dev-20260703-01 / others-jit`:
+
+```text
+tests/base       341
+tests/webauthn     4
+total            345
+```
+
+Representative rerun logs:
+
+```text
+C:\craton\CratonVM-keycloak-nonpassed-rerun-20260703-01\apps\keycloak-suite-runner\.suite\results\craton-nonpassed-dev-20260703-01\others-jit\logs\tests_base.org.keycloak.tests.account.AccountConsoleDisabledTest.err.log
+C:\craton\CratonVM-keycloak-nonpassed-rerun-20260703-01\apps\keycloak-suite-runner\.suite\results\craton-nonpassed-dev-20260703-01\others-jit\logs\tests_webauthn.org.keycloak.tests.webauthn.WebAuthnRegisterAndLoginTest.err.log
+```
+
 ## Root cause (confirmed via bytecode disassembly of the real
 `smallrye-config-core-3.16.0.jar`)
 
-`io.quarkus.deployment.dev.testing.TestConfig$$CMImpl` is **not** a class that
-ships in any jar. It is generated **at runtime** by SmallRye Config's
+Classes such as `io.quarkus.deployment.dev.testing.TestConfig$$CMImpl` and
+`io.quarkus.runtime.logging.LogBuildTimeConfig$$CMImpl` are **not** classes
+that ship in any jar. They are generated **at runtime** by SmallRye Config's
 `ConfigMappingLoader`, via a well-defined, deliberate two-step protocol:
 
 1. `ConfigMappingLoader.loadImplementation`/`loadClass` first call

@@ -1010,65 +1010,95 @@ pub fn pre_init_class_statics(shared: &SharedVm) {
 ///   Integer→"int", Long→"long", Boolean→"boolean", Byte→"byte",
 ///   Short→"short", Character→"char", Float→"float", Double→"double",
 ///   Void→"void"
-pub fn pre_init_wrapper_type_fields(shared: &SharedVm) {
-    let wrappers: &[(&str, &str)] = &[
-        ("java/lang/Integer", "int"),
-        ("java/lang/Long", "long"),
-        ("java/lang/Boolean", "boolean"),
-        ("java/lang/Byte", "byte"),
-        ("java/lang/Short", "short"),
-        ("java/lang/Character", "char"),
-        ("java/lang/Float", "float"),
-        ("java/lang/Double", "double"),
-        ("java/lang/Void", "void"),
-    ];
+fn wrapper_primitive_name(wrapper_name: &str) -> Option<&'static str> {
+    match wrapper_name {
+        "java/lang/Integer" => Some("int"),
+        "java/lang/Long" => Some("long"),
+        "java/lang/Boolean" => Some("boolean"),
+        "java/lang/Byte" => Some("byte"),
+        "java/lang/Short" => Some("short"),
+        "java/lang/Character" => Some("char"),
+        "java/lang/Float" => Some("float"),
+        "java/lang/Double" => Some("double"),
+        "java/lang/Void" => Some("void"),
+        _ => None,
+    }
+}
 
-    // Phase 1: Collect (class_id, static_field_index, prim_name) while holding read lock.
-    let mut to_init: Vec<(ClassId, usize, &str)> = Vec::new();
-    {
-        let cm = shared.class_manager.read();
-        for &(wrapper_name, prim_name) in wrappers {
-            let class_id = match cm.get_loaded_class_id(wrapper_name) {
-                Some(id) => id,
-                None => continue,
-            };
-            let cls = match cm.get_class(class_id) {
-                Some(c) => c,
-                None => continue,
-            };
-            if cls.is_synthetic_stub {
-                continue;
+fn wrapper_type_static_index(class: &crate::classloading::Class) -> Option<usize> {
+    let mut static_idx = 0usize;
+    for field in &class.fields {
+        if field.is_static() {
+            if &*field.name == "TYPE" {
+                return Some(static_idx);
             }
-
-            // Find the "TYPE" static field index
-            let mut static_idx = 0usize;
-            let mut type_idx = None;
-            for field in &cls.fields {
-                if field.is_static() {
-                    if &*field.name == "TYPE" {
-                        type_idx = Some(static_idx);
-                        break;
-                    }
-                    static_idx += 1;
-                }
-            }
-
-            if let Some(idx) = type_idx {
-                to_init.push((class_id, idx, prim_name));
-            }
+            static_idx += 1;
         }
-    } // cm read lock dropped
+    }
+    None
+}
 
-    // Phase 2: Create primitive mirrors and set TYPE fields (no read lock held).
-    for (class_id, idx, prim_name) in &to_init {
-        let mirror = get_or_create_primitive_mirror(shared, prim_name);
-        set_static_shared(shared, *class_id, *idx, Value::Object(Some(mirror)));
+/// Pre-initialize one primitive-wrapper `TYPE` static when the class is already loaded.
+///
+/// Synthetic stubs created through `ensure_synthetic_class` can already be in
+/// `ClassState::Initialized`, so they never execute the native wrapper
+/// `<clinit>` that would normally populate `Integer.TYPE`, `Boolean.TYPE`, etc.
+/// This helper repairs that already-initialized path and is idempotent.
+pub fn pre_init_wrapper_type_field_for_class(shared: &SharedVm, class_id: ClassId) -> bool {
+    let (type_idx, prim_name) = {
+        let cm = shared.class_manager.read();
+        let Some(cls) = cm.get_class(class_id) else {
+            return false;
+        };
+        let Some(prim_name) = wrapper_primitive_name(&cls.name) else {
+            return false;
+        };
+        let Some(type_idx) = wrapper_type_static_index(cls) else {
+            return false;
+        };
+        (type_idx, prim_name)
+    };
+
+    if matches!(
+        get_static_shared(shared, class_id, type_idx),
+        Value::Object(Some(_))
+    ) {
+        return false;
     }
 
-    if !to_init.is_empty() {
+    let mirror = get_or_create_primitive_mirror(shared, prim_name);
+    set_static_shared(shared, class_id, type_idx, Value::Object(Some(mirror)));
+    true
+}
+
+pub fn pre_init_wrapper_type_fields(shared: &SharedVm) {
+    let class_ids: Vec<ClassId> = {
+        let cm = shared.class_manager.read();
+        [
+            "java/lang/Integer",
+            "java/lang/Long",
+            "java/lang/Boolean",
+            "java/lang/Byte",
+            "java/lang/Short",
+            "java/lang/Character",
+            "java/lang/Float",
+            "java/lang/Double",
+            "java/lang/Void",
+        ]
+        .iter()
+        .filter_map(|wrapper_name| cm.get_loaded_class_id(wrapper_name))
+        .collect()
+    };
+
+    let initialized = class_ids
+        .into_iter()
+        .filter(|&class_id| pre_init_wrapper_type_field_for_class(shared, class_id))
+        .count();
+
+    if initialized > 0 {
         tracing::info!(
             "Pre-initialized TYPE fields for {} wrapper classes",
-            to_init.len()
+            initialized
         );
     }
 }

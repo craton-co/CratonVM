@@ -85,6 +85,15 @@ struct ThreadEntry {
     /// before dropping). `AtomicUsize` so the owning thread sets/clears it
     /// lock-free.
     tlab_addr: std::sync::atomic::AtomicUsize,
+    /// xt-hardening (2026-07-03): the OS thread id of the thread executing
+    /// this entry, published by the thread itself at startup (next to its
+    /// TLAB address). `0` = not yet published. The GC initiator snapshots
+    /// the alive set's OS tids atomically with the barrier's `expected`
+    /// computation so the cross-thread JIT takeover only excuses
+    /// (`reduce_expected`) frozen peers that were actually COUNTED —
+    /// excusing an uncounted newcomer releases the barrier while a counted
+    /// mutator still runs, racing the collection.
+    os_tid: std::sync::atomic::AtomicU32,
 }
 
 /// Global registry of all JVM threads.
@@ -185,6 +194,7 @@ impl ThreadRegistry {
             gc_block_state: Arc::new(GcBlockState::new()),
             async_exception_slot: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             tlab_addr: std::sync::atomic::AtomicUsize::new(0),
+            os_tid: std::sync::atomic::AtomicU32::new(0),
         };
         self.threads.lock().insert(thread_id, entry);
         if let Some(obj) = java_thread_obj {
@@ -919,6 +929,51 @@ impl ThreadRegistry {
             .values()
             .filter(|e| e.alive.load(Ordering::Acquire))
             .count()
+    }
+
+    /// xt-hardening (2026-07-03): publish the calling thread's OS thread id
+    /// for `thread_id` (see `ThreadEntry::os_tid`). Called by the thread
+    /// itself at startup, before it can execute any Java/JIT code.
+    pub fn set_os_tid_current(&self, thread_id: ThreadId) {
+        #[cfg(windows)]
+        {
+            #[link(name = "kernel32")]
+            unsafe extern "system" {
+                fn GetCurrentThreadId() -> u32;
+            }
+            let os_tid = unsafe { GetCurrentThreadId() };
+            let threads = self.threads.lock();
+            if let Some(entry) = threads.get(&thread_id) {
+                entry.os_tid.store(os_tid, Ordering::Release);
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = thread_id; // takeover machinery is Windows-only
+        }
+    }
+
+    /// xt-hardening (2026-07-03): alive-thread count PLUS the published OS
+    /// tids of those alive threads, read under one registry lock so the GC
+    /// barrier's `expected` and the takeover's counted-set snapshot cannot
+    /// disagree about which threads exist. A thread whose OS tid is still 0
+    /// (registered, not yet started) is counted but yields no tid — it
+    /// cannot be executing JIT code yet, so it can never be frozen, and the
+    /// missing tid cannot cause a missed excusal deadlock.
+    pub fn alive_count_and_os_tids(&self) -> (usize, Vec<u32>) {
+        let threads = self.threads.lock();
+        let mut n = 0usize;
+        let mut tids = Vec::with_capacity(threads.len());
+        for e in threads.values() {
+            if e.alive.load(Ordering::Acquire) {
+                n += 1;
+                let t = e.os_tid.load(Ordering::Acquire);
+                if t != 0 {
+                    tids.push(t);
+                }
+            }
+        }
+        (n, tids)
     }
 
     /// Get Java Thread objects for all alive threads (up to `max` entries).
