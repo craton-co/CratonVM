@@ -1,22 +1,42 @@
 # Keycloak non-passed rerun: missing PreviewFeatures.isPreviewEnabled native
 
-## Status
+## Status: FIXED (2026-07-03)
 
-Open CratonVM bug. Reproduced on 2026-07-03 on the Azure host
-`victor@20.84.156.31`, remote worktree
-`/home/victor/wt-keycloak-azure-nonpassed-20260703-01`, branch
-`codex/keycloak-azure-nonpassed-20260703-01`, dev base `6dacc944f`.
+Added a native implementation for `jdk/internal/misc/PreviewFeatures.isPreviewEnabled()Z`
+in `native-builtins/src/lib.rs` (`register_essential_natives`, next to the
+`jdk/internal/misc/CDS` block), returning `false` — matching HotSpot's
+no-`--enable-preview` default. CratonVM does not parse `--enable-preview` yet
+(tracked separately in the roadmap), so this only covers the default case;
+a true preview-enabled launch would need that flag wired through first.
+
+Verified on the local Windows build (JDK 25.0.1, since `Class.isUnnamedClass()`
+from the original probe is JDK21-preview-era API no longer present on JDK 25 —
+`jdk.internal.misc.PreviewFeatures.isEnabled()` was used instead via reflection,
+which still exercises the same `<clinit>` → `isPreviewEnabled()` native call):
+
+- Pre-fix binary: reproduces the exact reported crash —
+  `UnsatisfiedLinkError: jdk/internal/misc/PreviewFeatures.isPreviewEnabled()Z`.
+- Post-fix binary: returns `false`, matching HotSpot, `main-vm run()` exits `Ok`.
+
+The full 1044-class Azure rerun with this fix has not been re-executed yet;
+that is the natural follow-up to close out the Keycloak Azure non-passed
+batch. Original report follows.
 
 ## Symptom
+
+Reproduced on 2026-07-03 on the Azure host
+`victor@20.84.156.31`, remote worktree
+`/home/victor/wt-keycloak-azure-nonpassed-20260703-01`, branch
+`codex/keycloak-azure-nonpassed-20260703-01`, branch head `819948842`.
 
 A rerun of the 1044 Keycloak classes that were non-passing in the prior
 `others` run completed with 1044 crashes and no passes/failures:
 
-- Run name: `craton-azure-nonpassed-dev-20260703-03`
+- Run name: `craton-azure-nonpassed-dev-20260703-04`
 - Mode: `others-jit`, `-Vm craton`, `-Jit on`
 - CratonVM binary: `target/release/cratonvm-keycloak-azure-nonpassed-20260703-01`
-- Results: `apps/keycloak-suite-runner/.suite/results/craton-azure-nonpassed-dev-20260703-03/others-jit/results.tsv`
-- Summary: `apps/keycloak-suite-runner/.suite/results/craton-azure-nonpassed-dev-20260703-03/others-jit/summary.md`
+- Results: `apps/keycloak-suite-runner/.suite/results/craton-azure-nonpassed-dev-20260703-04/others-jit/results.tsv`
+- Summary: `apps/keycloak-suite-runner/.suite/results/craton-azure-nonpassed-dev-20260703-04/others-jit/summary.md`
 
 Status count:
 
@@ -139,5 +159,7 @@ not be counted as CratonVM suite bugs:
 - CratonVM did not load `KcRunner` through the pathing-JAR manifest classpath,
   so the runner now uses direct `-cp` on non-Windows systems.
 
-The valid run above is `craton-azure-nonpassed-dev-20260703-03`; earlier runs
-`01` and `02` are invalid setup attempts and should be ignored.
+The final evidence run above is `craton-azure-nonpassed-dev-20260703-04`.
+Earlier runs `01` and `02` are invalid setup attempts and should be ignored.
+Run `03` was the first valid run and produced the same 1044-crash breakdown,
+but run `04` is the fresh rerun after fixing the local doc link.

@@ -6476,6 +6476,19 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         native_noop,
     );
 
+    // --- jdk/internal/misc/PreviewFeatures ---
+    // <clinit> calls this once to cache the `ENABLED` constant. It's reached
+    // any time `Class.isUnnamedClass()` is used (e.g. JUnit's launcher during
+    // discovery), which otherwise aborts every real-JDK run with
+    // UnsatisfiedLinkError before a single test executes. We don't parse
+    // `--enable-preview` yet (see roadmap), so mirror HotSpot's default: off.
+    registry.register(
+        "jdk/internal/misc/PreviewFeatures",
+        "isPreviewEnabled",
+        "()Z",
+        |_ctx, _args| Ok(Some(Value::Int(0))),
+    );
+
     // jdk/internal/misc/ScopedMemoryAccess — JEP 471 panama foreign memory.
     // registerNatives is called from <clinit>. We don't support scoped memory
     // natives yet (they're used by Vector API and Foreign Memory API), but

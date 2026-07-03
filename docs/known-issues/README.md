@@ -5,10 +5,6 @@ suites. The docs had grown to describe the **same underlying bug from several
 angles**; this index is the consolidated map. Read it first.
 
 
-## 2026-07-03 Keycloak Azure non-passed rerun
-
-- [Keycloak non-passed rerun: missing `PreviewFeatures.isPreviewEnabled` native](keycloak-previewfeatures-ispreviewenabled-native.md) - 1044/1044 rerun rows crashed before tests executed; all direct and wrapped signatures reduce to missing `jdk/internal/misc/PreviewFeatures.isPreviewEnabled()Z`.
-
 ## Bug-document lifecycle
 
 Every unresolved bug document belongs under `docs/known-issues`. Once the bug
