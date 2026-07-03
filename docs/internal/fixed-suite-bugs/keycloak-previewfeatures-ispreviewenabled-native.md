@@ -1,13 +1,33 @@
 # Keycloak non-passed rerun: missing PreviewFeatures.isPreviewEnabled native
 
-## Status
+## Status: FIXED (2026-07-03)
 
-Open CratonVM bug. Reproduced on 2026-07-03 on the Azure host
+Added a native implementation for `jdk/internal/misc/PreviewFeatures.isPreviewEnabled()Z`
+in `native-builtins/src/lib.rs` (`register_essential_natives`, next to the
+`jdk/internal/misc/CDS` block), returning `false` — matching HotSpot's
+no-`--enable-preview` default. CratonVM does not parse `--enable-preview` yet
+(tracked separately in the roadmap), so this only covers the default case;
+a true preview-enabled launch would need that flag wired through first.
+
+Verified on the local Windows build (JDK 25.0.1, since `Class.isUnnamedClass()`
+from the original probe is JDK21-preview-era API no longer present on JDK 25 —
+`jdk.internal.misc.PreviewFeatures.isEnabled()` was used instead via reflection,
+which still exercises the same `<clinit>` → `isPreviewEnabled()` native call):
+
+- Pre-fix binary: reproduces the exact reported crash —
+  `UnsatisfiedLinkError: jdk/internal/misc/PreviewFeatures.isPreviewEnabled()Z`.
+- Post-fix binary: returns `false`, matching HotSpot, `main-vm run()` exits `Ok`.
+
+The full 1044-class Azure rerun with this fix has not been re-executed yet;
+that is the natural follow-up to close out the Keycloak Azure non-passed
+batch. Original report follows.
+
+## Symptom
+
+Reproduced on 2026-07-03 on the Azure host
 `victor@20.84.156.31`, remote worktree
 `/home/victor/wt-keycloak-azure-nonpassed-20260703-01`, branch
 `codex/keycloak-azure-nonpassed-20260703-01`, branch head `819948842`.
-
-## Symptom
 
 A rerun of the 1044 Keycloak classes that were non-passing in the prior
 `others` run completed with 1044 crashes and no passes/failures:
