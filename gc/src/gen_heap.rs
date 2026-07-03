@@ -6947,6 +6947,38 @@ impl GenerationalHeap {
             win[7],
             std::backtrace::Backtrace::force_capture(),
         );
+        // Shift test — the neighbor windows show corrupt cells decoding as an
+        // 8-BYTE-SHIFTED body ({payload_k, disc_k+1}). Mechanically test: do
+        // this holder's cells parse as valid Values when read at ±8? A
+        // consistent hit means the body content sits 8 bytes off its slots
+        // (overlapping/shifted allocation — the A2 double-serve family), not
+        // a per-cell stray write.
+        {
+            let n = (header.num_slots as usize).min(8);
+            let base = holder_addr + HEADER_SIZE;
+            let mut plus8 = 0usize;
+            let mut minus8 = 0usize;
+            let mut aligned = 0usize;
+            for k in 0..n {
+                let c = base + k * SLOT_SIZE;
+                // SAFETY: within the holder body ±8; arena-mapped.
+                unsafe {
+                    if cratonvm_types::read_value_checked(c as *const Value).is_some() {
+                        aligned += 1;
+                    }
+                    if cratonvm_types::read_value_checked((c + 8) as *const Value).is_some() {
+                        plus8 += 1;
+                    }
+                    if cratonvm_types::read_value_checked((c - 8) as *const Value).is_some() {
+                        minus8 += 1;
+                    }
+                }
+            }
+            eprintln!(
+                "[CELLCORRUPT]   shift-test over {n} cells: valid@aligned={aligned} \
+                 valid@+8={plus8} valid@-8={minus8}",
+            );
+        }
         // If the stale target is still inside a CURRENT generation, dump its
         // header too — its identity often names the mis-writing code path.
         if yf || og {
