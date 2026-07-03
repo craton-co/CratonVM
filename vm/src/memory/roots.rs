@@ -168,13 +168,21 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
         }
     }
 
-    // 7. System streams (System.out, System.err)
+    // 7. System streams (System.out, System.err, System.in)
     {
         if let Some(out_ref) = *shared.system_out.read() {
             roots.push(out_ref);
         }
         if let Some(err_ref) = *shared.system_err.read() {
             roots.push(err_ref);
+        }
+        // gcstress residual face fix — `system_in` was missing from both this
+        // root scan and the update_all_roots remap (out/err had both): the
+        // cached System.in FileInputStream went stale on the first moving
+        // young GC after `ensure_system_stdin_object` populated it, and every
+        // later use of the cache served a dangling ObjectRef.
+        if let Some(in_ref) = *shared.system_in.read() {
+            roots.push(in_ref);
         }
     }
 

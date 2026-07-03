@@ -286,6 +286,18 @@ pub fn update_all_roots(
                 *obj_ref = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
             }
         }
+        // gcstress residual face fix — remap `system_in` too (it was missing
+        // from this step AND from the roots.rs scan while out/err had both,
+        // so the cached System.in went stale on the first moving GC).
+        let mut sin = shared.system_in.write();
+        if let Some(ref mut obj_ref) = *sin {
+            let old_addr = obj_ref.as_ptr() as usize;
+            if let Some(&new_addr) = pointer_map.get(&old_addr) {
+                // Safety: same contract as out/err above.
+                debug_assert!(new_addr != 0, "GC pointer map contains null address");
+                *obj_ref = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+            }
+        }
     }
 
     // 8. Primitive type Class mirrors

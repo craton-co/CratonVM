@@ -2195,6 +2195,30 @@ impl GenerationalHeap {
         }
         let header = self.get_header(obj_ref);
         debug_assert_eq!(header.kind, ObjectKind::Array);
+        // gcstress residual face-1 diagnostics (CRATONVM_DBG_CELLCORRUPT) —
+        // the debug_assert above is a no-op in release: an array-element
+        // write through a STALE array reference whose address is now occupied
+        // by a plain object would write a raw 8-byte pointer into the middle
+        // of that object's 16-byte Value cells (the observed {ptr, 0} corrupt
+        // cells). Trap it with the holder identity + backtrace. The bounds
+        // check below usually deflects such writes (a plain object has
+        // array_length=0), so this logs the attempt either way.
+        if cell_corrupt_diag_enabled() && header.kind != ObjectKind::Array {
+            let class_name = crate::gc::resolve_class_info(header.class_id.as_u32())
+                .map(|(n, _)| n)
+                .unwrap_or_else(|| "<unresolved>".to_string());
+            eprintln!(
+                "[CELLCORRUPT:set_array_element-on-NON-ARRAY] obj=0x{:x} class_id={} \
+                 class={class_name} kind=0x{:02x} num_slots={} array_len={} index={index} \
+                 value={value:?}\n{}",
+                obj_ref.as_ptr() as usize,
+                header.class_id.as_u32(),
+                header.kind as u8,
+                header.num_slots,
+                header.array_length,
+                std::backtrace::Backtrace::force_capture(),
+            );
+        }
         if index >= header.array_length as usize {
             return Err(index as i32);
         }
