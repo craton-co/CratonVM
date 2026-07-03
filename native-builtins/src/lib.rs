@@ -61,6 +61,66 @@ fn register_test_harness_natives(registry: &mut NativeMethodRegistry) {
     );
 }
 
+fn init_wrapper_type(
+    ctx: &mut dyn NativeContext,
+    wrapper_name: &str,
+    primitive_name: &str,
+) -> MethodCallResult {
+    let mirror = ctx.primitive_class_mirror(primitive_name);
+    if let Some(class_id) = ctx.class_id_by_name(wrapper_name) {
+        ctx.set_static_field(class_id, 0, Value::Object(Some(mirror)));
+    }
+    Ok(None)
+}
+
+fn clinit_integer_type(ctx: &mut dyn NativeContext, _: &[Value]) -> MethodCallResult {
+    init_wrapper_type(ctx, "java/lang/Integer", "int")
+}
+
+fn clinit_long_type(ctx: &mut dyn NativeContext, _: &[Value]) -> MethodCallResult {
+    init_wrapper_type(ctx, "java/lang/Long", "long")
+}
+
+fn clinit_float_type(ctx: &mut dyn NativeContext, _: &[Value]) -> MethodCallResult {
+    init_wrapper_type(ctx, "java/lang/Float", "float")
+}
+
+fn clinit_double_type(ctx: &mut dyn NativeContext, _: &[Value]) -> MethodCallResult {
+    init_wrapper_type(ctx, "java/lang/Double", "double")
+}
+
+fn clinit_boolean_type(ctx: &mut dyn NativeContext, _: &[Value]) -> MethodCallResult {
+    init_wrapper_type(ctx, "java/lang/Boolean", "boolean")
+}
+
+fn clinit_char_type(ctx: &mut dyn NativeContext, _: &[Value]) -> MethodCallResult {
+    init_wrapper_type(ctx, "java/lang/Character", "char")
+}
+
+fn clinit_byte_type(ctx: &mut dyn NativeContext, _: &[Value]) -> MethodCallResult {
+    init_wrapper_type(ctx, "java/lang/Byte", "byte")
+}
+
+fn clinit_short_type(ctx: &mut dyn NativeContext, _: &[Value]) -> MethodCallResult {
+    init_wrapper_type(ctx, "java/lang/Short", "short")
+}
+
+fn clinit_void_type(ctx: &mut dyn NativeContext, _: &[Value]) -> MethodCallResult {
+    init_wrapper_type(ctx, "java/lang/Void", "void")
+}
+
+fn register_primitive_wrapper_type_clinits(registry: &mut NativeMethodRegistry) {
+    registry.register("java/lang/Integer", "<clinit>", "()V", clinit_integer_type);
+    registry.register("java/lang/Long", "<clinit>", "()V", clinit_long_type);
+    registry.register("java/lang/Float", "<clinit>", "()V", clinit_float_type);
+    registry.register("java/lang/Double", "<clinit>", "()V", clinit_double_type);
+    registry.register("java/lang/Boolean", "<clinit>", "()V", clinit_boolean_type);
+    registry.register("java/lang/Character", "<clinit>", "()V", clinit_char_type);
+    registry.register("java/lang/Byte", "<clinit>", "()V", clinit_byte_type);
+    registry.register("java/lang/Short", "<clinit>", "()V", clinit_short_type);
+    registry.register("java/lang/Void", "<clinit>", "()V", clinit_void_type);
+}
+
 /// Native `Duration.parse(CharSequence)` for real-JDK mode.
 ///
 /// JDK 25's `Duration.parse` (Duration.java:395) drives a compiled regex
@@ -1275,6 +1335,11 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // but test VMs use real-JDK mode and still need the print capture natives.
     register_test_harness_natives(registry);
 
+    // Default-feature synthetic tests still use `register_essential_natives`.
+    // Keep wrapper TYPE fields (`boolean.class`, `int.class`, ...) wired to the
+    // same cached primitive mirrors that reflection returns.
+    register_primitive_wrapper_type_clinits(registry);
+
     // JDK 25 VectorSupport declares these three ACC_NATIVE methods in
     // java.base. Keep them in the real-JDK essential path; the broader
     // incubator Vector API shims remain synthetic-only overrides.
@@ -2133,6 +2198,47 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
                 .into()),
             }
         },
+    );
+
+    // `java/lang/Module.canRead(Module)` — same essential-vs-synthetic-jdk
+    // coverage gap as `canUse` immediately above: `register_p59_module`
+    // (native-builtins/src/phases_late.rs) ALSO registers this triple, but
+    // that function is only reachable via the `synthetic-jdk`-feature-gated
+    // `register_synthetic_overrides` — dead code in the default `cratonvm-cli`
+    // build. Unlike `canUse`/`getDescriptor`, real bytecode doesn't NPE here;
+    // it silently returns the wrong boolean (confirmed: `m.canRead(javaBase)`
+    // returned `false` via real bytecode vs. `true` on real HotSpot — every
+    // module implicitly reads `java.base`). Register the shared
+    // `native_module_can_read` fn (phases_late.rs) here too so the correct,
+    // readability-graph-backed answer is reachable in the default build.
+    registry.register(
+        "java/lang/Module",
+        "canRead",
+        "(Ljava/lang/Module;)Z",
+        crate::phases_late::native_module_can_read,
+    );
+
+    // `Module.addExports(String, Module)` / `addOpens(String, Module)` — same
+    // essential-vs-synthetic-jdk gap, but worse than `canRead`: real bytecode
+    // (`implAddExportsOrOpens`, Module.java) directly reads
+    // `this.descriptor.isOpen()` (a field, not the overridden `getDescriptor()`
+    // accessor), and that field is never populated — so a direct call NPEs
+    // ("Cannot invoke ... because \"this.descriptor\" is null") instead of
+    // silently returning a wrong answer. Register the shared
+    // `native_module_add_exports`/`native_module_add_opens` fns
+    // (phases_late.rs) here too so the mutation reaches the boot
+    // `ModuleRegistry` without ever touching the null field.
+    registry.register(
+        "java/lang/Module",
+        "addExports",
+        "(Ljava/lang/String;Ljava/lang/Module;)Ljava/lang/Module;",
+        crate::phases_late::native_module_add_exports,
+    );
+    registry.register(
+        "java/lang/Module",
+        "addOpens",
+        "(Ljava/lang/String;Ljava/lang/Module;)Ljava/lang/Module;",
+        crate::phases_late::native_module_add_opens,
     );
 
     registry.register(
@@ -4333,6 +4439,21 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // `if (!isNamed()) return true;` short-circuit. The Java API uses dot-format
     // package names; the registry is keyed on slash-format.
     fn module_name_of_mirror(ctx: &dyn NativeContext, m: ObjectRef) -> String {
+        // Real-bytecode `Module.isNamed()`/`getName()` read the real `name`
+        // field, which is what actually determines named-ness for a Module
+        // built through any path other than this file's `Class.getModule()`
+        // override (e.g. one that dual-writes only the real field, not the
+        // legacy synthetic slot 0). Check it FIRST so isExported/isOpen/
+        // getDescriptor agree with `isNamed()` — otherwise a Module whose
+        // slot 0 was never populated reads back as unnamed here even though
+        // `isNamed()` (and everyone else) sees it as named, which silently
+        // over-permits isExported/isOpen and NPEs getDescriptor's callers
+        // (observed via Elasticsearch's `ProviderLocator.checkUses`, whose
+        // `caller.getModule()` mirror had a null slot 0 but a populated real
+        // `name` field).
+        if let Value::Object(Some(s)) = ctx.get_field_by_name(m, "name") {
+            return ctx.read_string(s).unwrap_or_default();
+        }
         match ctx.get_field(m, 0) {
             Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
             _ => String::new(), // unnamed module
@@ -4412,6 +4533,64 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             };
             let ok = ctx.is_package_open_to(&module_name, &pkg, &to_module);
             Ok(Some(Value::Int(ok as i32)))
+        },
+    );
+    // Module.getDescriptor() → ModuleDescriptor
+    //
+    // Real HotSpot: `descriptor` is null iff the module is unnamed — a named
+    // module is always constructed with a non-null descriptor. `getModule()`
+    // above returns a named Module mirror with a NULL `descriptor` field (see
+    // its comment above), so the real bytecode's `return this.descriptor;`
+    // NPEs any caller that only calls `getDescriptor()` after checking
+    // `isNamed()` — e.g. Elasticsearch's `ProviderLocator.checkUses`:
+    // `caller.isNamed() && caller.getDescriptor().uses()...`, which breaks
+    // `XContentProvider$Holder`'s static init and cascades into thousands of
+    // Elasticsearch suite failures via `NoClassDefFoundError`. Force-listed
+    // in `force_native_over_real_jdk_bytecode` alongside isExported/isOpen
+    // above. Answers from the same boot `ModuleRegistry` (accurate `uses`
+    // parsed from each module-info), dual-written onto the real `name`/`uses`
+    // fields (via `set_field_by_name`) so any *other*, non-forced
+    // `ModuleDescriptor` accessor called on this same instance still sees
+    // correct data.
+    registry.register(
+        "java/lang/Module",
+        "getDescriptor",
+        "()Ljava/lang/module/ModuleDescriptor;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let module_name = module_name_of_mirror(ctx, this);
+            if module_name.is_empty() {
+                // Unnamed module — matches real Module.getDescriptor()'s null.
+                return Ok(Some(Value::Object(None)));
+            }
+            // Dot-format binary class names, matching `Class.getName()` (the
+            // boot `ModuleRegistry` stores JVM-internal slash format parsed
+            // straight from the module-info `uses` directives).
+            let uses: Vec<String> = ctx
+                .module_uses(&module_name)
+                .into_iter()
+                .map(|s| s.replace('/', "."))
+                .collect();
+            let desc = alloc_concurrent_synthetic(ctx, "java/lang/module/ModuleDescriptor", 2);
+            // GC-safety: pin `desc` across the allocations inside
+            // `build_string_set` (same pattern as `getModule()` above).
+            let pin = ctx.pin_native_root(desc);
+            let uses_set = crate::phases_late::build_string_set(ctx, uses);
+            let desc = ctx.read_native_pin(pin, desc);
+            // `this` is a live incoming argument for the duration of this
+            // native call, so re-reading its field here (after the
+            // allocations above) is GC-safe without a separate pin.
+            let name_val = ctx.get_field_by_name(this, "name");
+            let name_val = match name_val {
+                Value::Object(Some(_)) => name_val,
+                _ => ctx.get_field(this, 0),
+            };
+            ctx.set_field(desc, 0, name_val); // legacy synthetic slot
+            ctx.set_field(desc, 1, Value::Int(0)); // legacy synthetic slot
+            ctx.set_field_by_name(desc, "name", name_val);
+            ctx.set_field_by_name(desc, "uses", Value::Object(Some(uses_set)));
+            ctx.unpin_native_roots(pin);
+            Ok(Some(Value::Object(Some(desc))))
         },
     );
     // `static native void addReads0(Module from, Module to)` — the VM-sync hook
@@ -4820,14 +4999,32 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     );
     registry.register(
         "java/lang/Class",
+        "getDeclaredFields",
+        "()[Ljava/lang/reflect/Field;",
+        lang_class::native_class_get_declared_fields,
+    );
+    registry.register(
+        "java/lang/Class",
         "getDeclaredMethods0",
         "(Z)[Ljava/lang/reflect/Method;",
         lang_class::native_class_get_declared_methods,
     );
     registry.register(
         "java/lang/Class",
+        "getDeclaredMethods",
+        "()[Ljava/lang/reflect/Method;",
+        lang_class::native_class_get_declared_methods,
+    );
+    registry.register(
+        "java/lang/Class",
         "getDeclaredConstructors0",
         "(Z)[Ljava/lang/reflect/Constructor;",
+        lang_class::native_class_get_declared_constructors,
+    );
+    registry.register(
+        "java/lang/Class",
+        "getDeclaredConstructors",
+        "()[Ljava/lang/reflect/Constructor;",
         lang_class::native_class_get_declared_constructors,
     );
     registry.register(
@@ -45983,6 +46180,29 @@ mod vector_support_essential_tests {
     use super::*;
 
     #[test]
+    fn register_essential_includes_wrapper_type_clinits() {
+        let mut registry = NativeMethodRegistry::new();
+        register_essential_natives(&mut registry);
+
+        for wrapper in [
+            "java/lang/Integer",
+            "java/lang/Long",
+            "java/lang/Float",
+            "java/lang/Double",
+            "java/lang/Boolean",
+            "java/lang/Character",
+            "java/lang/Byte",
+            "java/lang/Short",
+            "java/lang/Void",
+        ] {
+            assert!(
+                registry.find(wrapper, "<clinit>", "()V").is_some(),
+                "{wrapper}.<clinit>()V should initialize TYPE in essentials"
+            );
+        }
+    }
+
+    #[test]
     fn register_essential_includes_jdk25_vector_support_natives() {
         let mut registry = NativeMethodRegistry::new();
         register_essential_natives(&mut registry);
@@ -45997,6 +46217,71 @@ mod vector_support_essential_tests {
         assert!(registry
             .find(vector_support, "getMaxLaneCount", "(Ljava/lang/Class;)I")
             .is_some());
+    }
+}
+
+#[cfg(test)]
+mod module_can_read_essential_tests {
+    use super::*;
+
+    /// `register_p59_module` (phases_late.rs) also registers this triple, but
+    /// that function is only reachable via the `synthetic-jdk`-feature-gated
+    /// `register_synthetic_overrides` — dead code in the default `cratonvm-cli`
+    /// build. `register_essential_natives` is what real-JDK-mode boot
+    /// actually uses, so THIS is the registration that has to exist for
+    /// `Module.canRead(Module)` to answer correctly instead of silently
+    /// returning the wrong boolean via real bytecode (confirmed:
+    /// `m.canRead(javaBaseModule)` returned `false` via real bytecode vs.
+    /// `true` on real HotSpot).
+    #[test]
+    fn register_essential_includes_module_can_read() {
+        let mut registry = NativeMethodRegistry::new();
+        register_essential_natives(&mut registry);
+        assert!(
+            registry
+                .find("java/lang/Module", "canRead", "(Ljava/lang/Module;)Z")
+                .is_some(),
+            "Module.canRead(Module) must be registered in the essential \
+             (real-JDK) native path, not just the synthetic-jdk-only \
+             register_p59_module"
+        );
+    }
+
+    /// Same gap as `canRead` above, but with a crash instead of a wrong
+    /// answer: real bytecode (`implAddExportsOrOpens`) reads
+    /// `this.descriptor.isOpen()` directly, and that field is never
+    /// populated, so a direct `Module.addExports`/`addOpens` call NPEs
+    /// ("Cannot invoke ... because \"this.descriptor\" is null") when only
+    /// `register_p59_module` (synthetic-jdk-only, dead in the default build)
+    /// has the registration.
+    #[test]
+    fn register_essential_includes_module_add_exports_and_opens() {
+        let mut registry = NativeMethodRegistry::new();
+        register_essential_natives(&mut registry);
+        assert!(
+            registry
+                .find(
+                    "java/lang/Module",
+                    "addExports",
+                    "(Ljava/lang/String;Ljava/lang/Module;)Ljava/lang/Module;"
+                )
+                .is_some(),
+            "Module.addExports(String, Module) must be registered in the \
+             essential (real-JDK) native path, not just the \
+             synthetic-jdk-only register_p59_module"
+        );
+        assert!(
+            registry
+                .find(
+                    "java/lang/Module",
+                    "addOpens",
+                    "(Ljava/lang/String;Ljava/lang/Module;)Ljava/lang/Module;"
+                )
+                .is_some(),
+            "Module.addOpens(String, Module) must be registered in the \
+             essential (real-JDK) native path, not just the \
+             synthetic-jdk-only register_p59_module"
+        );
     }
 }
 

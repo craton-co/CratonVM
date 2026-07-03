@@ -20210,7 +20210,7 @@ fn read_module_name(ctx: &dyn NativeContext, module_obj: ObjectRef) -> String {
 }
 
 /// Helper: build a `HashSet<String>` Java object from a Vec of Rust strings.
-fn build_string_set(ctx: &mut dyn NativeContext, items: Vec<String>) -> ObjectRef {
+pub(crate) fn build_string_set(ctx: &mut dyn NativeContext, items: Vec<String>) -> ObjectRef {
     use cratonvm_types::ArrayElementType;
     let len = items.len();
     let arr = ctx.new_array(ArrayElementType::Reference, len);
@@ -20223,6 +20223,88 @@ fn build_string_set(ctx: &mut dyn NativeContext, items: Vec<String>) -> ObjectRe
     ctx.set_field(set, 1, Value::Int(len as i32));
     ctx.set_field(set, 2, Value::Int(16)); // initial capacity marker
     set
+}
+
+/// `Module.canRead(Module)` → boolean.
+///
+/// A named top-level fn (not an inline closure) so it can be registered from
+/// TWO places: `register_p59_module` below (the `synthetic-jdk`-feature-gated
+/// path) and `register_essential_natives` (native-builtins/src/lib.rs, the
+/// path the default `cratonvm-cli` build actually uses — `register_p59_module`
+/// is unreachable there, since its only caller chain is entirely
+/// `#[cfg(feature = "synthetic-jdk")]`-gated; see `native_module_get_descriptor`
+/// or `Module.canUse` in lib.rs for the fuller writeup of this recurring
+/// essential-vs-synthetic-jdk gap).
+///
+/// Unlike `getDescriptor`, real bytecode doesn't NPE for `canRead` — it
+/// silently returns the WRONG boolean instead, which is easy to miss in a
+/// suite scan. Confirmed via a standalone probe: on the default build (real
+/// bytecode, this native unreachable), `someModule.canRead(javaBaseModule)`
+/// returned `false`; real HotSpot returns `true` (every module implicitly
+/// reads `java.base`, JVMS/JLS mandated). This native queries the boot
+/// `ModuleRegistry`'s readability graph, which already seeds every module
+/// with a read edge to java.base (`build_readability_graph`,
+/// classloading/src/module.rs) — the logic itself was already correct, it
+/// just wasn't reachable.
+pub(crate) fn native_module_can_read(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let reader = read_module_name(ctx, this);
+    let provider = match args.get(1) {
+        Some(Value::Object(Some(m))) => read_module_name(ctx, *m),
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let can = ctx.reads_module(&reader, &provider);
+    Ok(Some(Value::Int(if can { 1 } else { 0 })))
+}
+
+/// `java/lang/Module.addExports(String, Module)` — same essential-vs-
+/// synthetic-jdk gap as `canRead`/`getDescriptor` above: real bytecode
+/// (`implAddExportsOrOpens`, Module.java) reads `this.descriptor.isOpen()`
+/// directly (a field, not the overridden `getDescriptor()` accessor), and
+/// that field is never populated on CratonVM's classpath-only Module
+/// objects — so any direct call NPEs before ever reaching this native.
+/// Registering here bypasses that bytecode entirely, exactly like `canRead`.
+pub(crate) fn native_module_add_exports(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let module_name = read_module_name(ctx, this);
+    let pkg_name = match args.get(1) {
+        Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+        _ => return Ok(Some(Value::Object(Some(this)))),
+    };
+    let target = match args.get(2) {
+        Some(Value::Object(Some(m))) => read_module_name(ctx, *m),
+        _ => String::new(),
+    };
+    let pkg_slash = pkg_name.replace('.', "/");
+    ctx.module_add_exports(&module_name, &pkg_slash, &target);
+    Ok(Some(Value::Object(Some(this))))
+}
+
+/// `java/lang/Module.addOpens(String, Module)` — same gap as
+/// `native_module_add_exports` immediately above.
+pub(crate) fn native_module_add_opens(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let module_name = read_module_name(ctx, this);
+    let pkg_name = match args.get(1) {
+        Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+        _ => return Ok(Some(Value::Object(Some(this)))),
+    };
+    let target = match args.get(2) {
+        Some(Value::Object(Some(m))) => read_module_name(ctx, *m),
+        _ => String::new(),
+    };
+    let pkg_slash = pkg_name.replace('.', "/");
+    ctx.module_add_opens(&module_name, &pkg_slash, &target);
+    Ok(Some(Value::Object(Some(this))))
 }
 
 pub(crate) fn register_p59_module(r: &mut NativeMethodRegistry) {
@@ -20421,16 +20503,20 @@ pub(crate) fn register_p59_module(r: &mut NativeMethodRegistry) {
 
     // Module.canRead(Module) → boolean
     // Queries the real readability graph in the ModuleRegistry.
-    r.register(m, "canRead", "(Ljava/lang/Module;)Z", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let reader = read_module_name(ctx, this);
-        let provider = match args.get(1) {
-            Some(Value::Object(Some(m))) => read_module_name(ctx, *m),
-            _ => return Ok(Some(Value::Int(0))),
-        };
-        let can = ctx.reads_module(&reader, &provider);
-        Ok(Some(Value::Int(if can { 1 } else { 0 })))
-    });
+    //
+    // Same essential-vs-synthetic-jdk coverage gap as `getDescriptor` (see
+    // `native_module_get_descriptor`'s doc comment): this closure is
+    // registered here AND in `register_essential_natives`
+    // (native-builtins/src/lib.rs) via the shared `native_module_can_read`
+    // fn — this function's own registration only takes effect in
+    // `synthetic-jdk`-feature builds. Unlike `getDescriptor`, the real
+    // bytecode fallback doesn't NPE here (so this shipped silently wrong
+    // rather than crashing) — confirmed via a standalone probe:
+    // `test.mod.canRead(java.base)` returned `false` on the default build
+    // (real bytecode) vs. `true` on real HotSpot (every module implicitly
+    // reads java.base) and on this native (which correctly queries the
+    // readability graph's mandated java.base edge).
+    r.register(m, "canRead", "(Ljava/lang/Module;)Z", native_module_can_read);
 
     // Module.addReads(Module) → Module (returns this)
     // Adds a dynamic read edge in the ModuleRegistry.
@@ -20456,21 +20542,7 @@ pub(crate) fn register_p59_module(r: &mut NativeMethodRegistry) {
         m,
         "addExports",
         "(Ljava/lang/String;Ljava/lang/Module;)Ljava/lang/Module;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            let module_name = read_module_name(ctx, this);
-            let pkg_name = match args.get(1) {
-                Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
-                _ => return Ok(Some(Value::Object(Some(this)))),
-            };
-            let target = match args.get(2) {
-                Some(Value::Object(Some(m))) => read_module_name(ctx, *m),
-                _ => String::new(),
-            };
-            let pkg_slash = pkg_name.replace('.', "/");
-            ctx.module_add_exports(&module_name, &pkg_slash, &target);
-            Ok(Some(Value::Object(Some(this))))
-        },
+        native_module_add_exports,
     );
 
     // Module.addOpens(String, Module) → Module
@@ -20479,21 +20551,7 @@ pub(crate) fn register_p59_module(r: &mut NativeMethodRegistry) {
         m,
         "addOpens",
         "(Ljava/lang/String;Ljava/lang/Module;)Ljava/lang/Module;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            let module_name = read_module_name(ctx, this);
-            let pkg_name = match args.get(1) {
-                Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
-                _ => return Ok(Some(Value::Object(Some(this)))),
-            };
-            let target = match args.get(2) {
-                Some(Value::Object(Some(m))) => read_module_name(ctx, *m),
-                _ => String::new(),
-            };
-            let pkg_slash = pkg_name.replace('.', "/");
-            ctx.module_add_opens(&module_name, &pkg_slash, &target);
-            Ok(Some(Value::Object(Some(this))))
-        },
+        native_module_add_opens,
     );
 
     // =================================================================
@@ -52470,5 +52528,109 @@ mod cert_verify_bounds_security_tests {
         assert!(r2
             .find("java/util/zip/ZipOutputStream", "write", "([BII)V")
             .is_some());
+    }
+}
+
+#[cfg(test)]
+mod essential_vs_synthetic_jdk_coverage_audit {
+    use super::*;
+    use crate::register_essential_natives;
+    use std::collections::BTreeSet;
+
+    fn dump_triples(f: impl FnOnce(&mut NativeMethodRegistry)) -> BTreeSet<(String, String, String)> {
+        let mut r = NativeMethodRegistry::new();
+        f(&mut r);
+        r.dump_registrations()
+            .into_iter()
+            .map(|(c, m, d, _k)| (c.to_string(), m.to_string(), d.to_string()))
+            .collect()
+    }
+
+    /// Diffs the (class, method, descriptor) triples reachable from
+    /// `register_p59_module` (synthetic-jdk-only — dead code in the default
+    /// `cratonvm-cli` build) against `register_essential_natives` (the
+    /// real-JDK path the default build actually uses). Anything in the
+    /// former but not the latter has the same "silently missing from the
+    /// build that matters" shape that broke `Module.getDescriptor()`.
+    ///
+    /// Every entry below was individually triaged against a real-HotSpot
+    /// probe (see task history / `reference_essential_vs_synthetic_jdk_registration_split`
+    /// memory); this is not a blanket allowlist, it's a closed list of the
+    /// exact 8 candidates this audit originally surfaced:
+    ///
+    /// - `canRead`, `addExports`, `addOpens` — FIXED on this branch
+    ///   (registered above via `native_module_can_read`/
+    ///   `native_module_add_exports`/`native_module_add_opens`), so they no
+    ///   longer appear in the diff at all and are not listed here.
+    /// - `getDescriptor` — already fixed on the separate, not-yet-merged
+    ///   `fix/es-module-getdescriptor-null` branch (registers the same shape
+    ///   of essential-native override there). Not duplicated here to avoid
+    ///   two divergent implementations existing pre-merge.
+    /// - `isNamed`, `toString` — probe-verified to already match real
+    ///   HotSpot via the real-bytecode fallback (real bytecode reads a
+    ///   dual-written `name` field for `isNamed`, and `toString`'s basic
+    ///   "module X" format doesn't touch the null `descriptor`/`reads`
+    ///   fields). No essential registration needed.
+    /// - `addReads` (the public instance method, distinct from the
+    ///   already-essential-registered `addReads0`) — real bytecode's
+    ///   `implAddReads` delegates to `addReads0`, which is already reachable
+    ///   in the essential path and correctly updates the `ModuleRegistry`;
+    ///   probe-verified round-trip (`addReads` then `canRead`) matches
+    ///   HotSpot. No separate registration needed.
+    /// - `ModuleDescriptor.isAutomatic()`/`isOpen()` — trivial field reads
+    ///   (`return automatic;`/`return open;`); correctness is contingent on
+    ///   the `getDescriptor` fix above populating those fields, so this
+    ///   resolves once that branch merges. Not independently testable here
+    ///   since this worktree doesn't have that fix (`getDescriptor()`
+    ///   returns null).
+    ///
+    /// If this test starts failing again with an entry NOT in the list
+    /// above, that's a genuinely new candidate — triage it the same way
+    /// (real-HotSpot probe comparison) before deciding fix vs. no-op.
+    #[test]
+    fn phase59_module_vs_essential_natives() {
+        let p59 = dump_triples(|r| register_p59_module(r));
+        let essential = dump_triples(|r| register_essential_natives(r));
+
+        let already_triaged: BTreeSet<(String, String, String)> = [
+            (
+                "java/lang/Module",
+                "getDescriptor",
+                "()Ljava/lang/module/ModuleDescriptor;",
+            ),
+            ("java/lang/Module", "isNamed", "()Z"),
+            ("java/lang/Module", "toString", "()Ljava/lang/String;"),
+            (
+                "java/lang/Module",
+                "addReads",
+                "(Ljava/lang/Module;)Ljava/lang/Module;",
+            ),
+            ("java/lang/module/ModuleDescriptor", "isAutomatic", "()Z"),
+            ("java/lang/module/ModuleDescriptor", "isOpen", "()Z"),
+        ]
+        .into_iter()
+        .map(|(c, m, d)| (c.to_string(), m.to_string(), d.to_string()))
+        .collect();
+
+        let missing: Vec<_> = p59
+            .difference(&essential)
+            .filter(|t| !already_triaged.contains(*t))
+            .collect();
+        if !missing.is_empty() {
+            let report = missing
+                .iter()
+                .map(|(c, m, d)| format!("{c}.{m}{d}"))
+                .collect::<Vec<_>>()
+                .join("\n  ");
+            panic!(
+                "\n{} NEW triple(s) registered in register_p59_module but NOT \
+                 in register_essential_natives, and not in the already-triaged \
+                 allowlist above (candidates for the same class of gap that \
+                 broke Module.getDescriptor() — triage against a real-HotSpot \
+                 probe before fixing or allowlisting):\n  {}\n",
+                missing.len(),
+                report
+            );
+        }
     }
 }

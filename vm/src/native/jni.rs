@@ -2548,6 +2548,13 @@ extern "C" fn jni_set_long_field(_env: JNIEnv, obj: JObject, field_id: JFieldID,
     with_shared_vm(|shared| {
         let oref = jobject_to_obj(obj)?;
         let (_, field_index) = decode_field_id(field_id);
+        // Long-smuggle mint chokepoint: native code storing a raw jobject
+        // handle into a Java long field (see smuggled_longs). Strict probe so
+        // ordinary numeric stores don't register.
+        let bits = val as u64;
+        if bits != 0 && bits & 0x7 == 0 && shared.heap.is_object_address(bits as usize).is_some() {
+            crate::memory::smuggled_longs::record_minted_long(bits);
+        }
         shared.heap.set_field(oref, field_index, Value::Long(val));
         Some(())
     });
@@ -3388,7 +3395,45 @@ set_array_region!(jni_set_short_array_region, JShort, |v: JShort| Value::Int(
     v as i32
 )); // 210
 set_array_region!(jni_set_int_array_region, JInt, |v: JInt| Value::Int(v)); // 211
-set_array_region!(jni_set_long_array_region, JLong, |v: JLong| Value::Long(v)); // 212
+
+// Index 212: SetLongArrayRegion — hand-unrolled (vs the macro) to add the
+// long-smuggle mint chokepoint: native code bulk-storing raw jobject handles
+// into a long[] (see smuggled_longs). Strict object-start probe per element,
+// so ordinary numeric bulk stores register nothing.
+extern "C" fn jni_set_long_array_region(
+    _env: JNIEnv,
+    array: JArray,
+    start: JSize,
+    len: JSize,
+    buf: *const JLong,
+) {
+    if array == 0 || buf.is_null() || start < 0 || len < 0 {
+        return;
+    }
+    with_shared_vm(|shared| {
+        let oref = jobject_to_obj(array)?;
+        // JNI contract: validate the requested window against the array
+        // length BEFORE writing; raise AIOOBE on a bad range so no
+        // partial / out-of-range store is performed.
+        if !region_bounds_ok(start, len, shared.heap.array_length(oref)) {
+            return None;
+        }
+        for i in 0..len as usize {
+            let val = unsafe { *buf.add(i) };
+            let bits = val as u64;
+            if bits != 0
+                && bits & 0x7 == 0
+                && shared.heap.is_object_address(bits as usize).is_some()
+            {
+                crate::memory::smuggled_longs::record_minted_long(bits);
+            }
+            let _ = shared
+                .heap
+                .set_array_element(oref, start as usize + i, Value::Long(val));
+        }
+        Some(())
+    });
+}
 set_array_region!(
     jni_set_float_array_region,
     JFloat,
@@ -4394,7 +4439,27 @@ pub unsafe fn dispatch_jni_native(
         b'C' => Value::Int(raw_result as u16 as i32),
         b'S' => Value::Int(raw_result as i16 as i32),
         b'I' => Value::Int(raw_result as i32),
-        b'J' => Value::Long(raw_result as i64),
+        b'J' => {
+            // Long-smuggle mint chokepoint: a native that received a raw
+            // jobject handle (obj_to_jobject = the object's address) may echo
+            // it back as its jlong return — the classic long-as-jobject
+            // smuggle. Register the exact value so the GC's value-stack
+            // rewrite arm can distinguish this genuine handle from a
+            // primitive long that merely collides with a heap address (which
+            // must NOT be rewritten). Strict object-start probe: only real
+            // handles register; ordinary numeric returns don't look like
+            // aligned live object bases.
+            let bits = raw_result;
+            if bits != 0 && bits & 0x7 == 0 {
+                with_shared_vm(|shared| {
+                    if shared.heap.is_object_address(bits as usize).is_some() {
+                        crate::memory::smuggled_longs::record_minted_long(bits);
+                    }
+                    Some(())
+                });
+            }
+            Value::Long(raw_result as i64)
+        }
         b'F' => Value::Float(f32::from_bits(raw_result as u32)),
         b'D' => Value::Double(f64::from_bits(raw_result)),
         _ => match jobject_to_obj(raw_result) {

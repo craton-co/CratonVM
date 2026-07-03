@@ -4568,6 +4568,22 @@ const METHOD_EXTRA_OFFSET_DESC: usize = 0;
 const METHOD_EXTRA_OFFSET_PARAM_COUNT: usize = 1;
 const METHOD_EXTRA_OFFSET_ACCESSIBLE: usize = 2;
 
+// Legacy synthetic Method mirror slots used when `java/lang/reflect/Method`
+// has no real JDK field metadata (synthetic-JDK mode). These mirror the
+// MockNativeContext mapping in `test_utils.rs`.
+const METHOD_LEGACY_SLOT_CLAZZ: usize = 0;
+const METHOD_LEGACY_SLOT_NAME: usize = 1;
+const METHOD_LEGACY_SLOT_RETURN_TYPE: usize = 2;
+const METHOD_LEGACY_SLOT_MODIFIERS: usize = 3;
+const METHOD_LEGACY_SLOT_SLOT: usize = 4;
+const METHOD_LEGACY_SLOT_OVERRIDE: usize = 6;
+const METHOD_LEGACY_SLOT_PARAMETER_TYPES: usize = 7;
+const METHOD_LEGACY_SLOT_CALLER_SENSITIVE: usize = 8;
+const METHOD_LEGACY_SLOT_EXCEPTION_TYPES: usize = 9;
+const METHOD_LEGACY_SLOT_ANNOTATIONS: usize = 10;
+const METHOD_LEGACY_SLOT_PARAMETER_ANNOTATIONS: usize = 11;
+const METHOD_LEGACY_SLOT_ANNOTATION_DEFAULT: usize = 12;
+
 /// Legacy synthetic Method width — kept as a floor so the allocated
 /// object is always large enough to host the synthetic writes made by
 /// tests (via MockNativeContext which maps field names to these slots)
@@ -4718,6 +4734,62 @@ pub(crate) fn create_method_object(
     ctx.set_field_by_name(obj, "parameterAnnotations", Value::Object(None));
     ctx.set_field_by_name(obj, "annotationDefault", Value::Object(None));
 
+    // Synthetic-JDK mode can load `java/lang/reflect/Method` without any real
+    // field table. Production `set_field_by_name` silently skips those writes,
+    // while Method.getName()/getReturnType()/toString() still need readable
+    // mirror state. Fall back to the legacy flat mirror layout only when the
+    // named JDK layout did not land; real-JDK Method objects keep their normal
+    // inherited-field offsets untouched.
+    let named_method_layout_landed = matches!(
+        ctx.get_field_by_name(obj, "name"),
+        Value::Object(Some(actual)) if actual == name_str
+    ) && matches!(
+        ctx.get_field_by_name(obj, "clazz"),
+        Value::Object(Some(actual)) if actual == class_mirror
+    );
+    if !named_method_layout_landed {
+        ctx.set_field(
+            obj,
+            METHOD_LEGACY_SLOT_CLAZZ,
+            Value::Object(Some(class_mirror)),
+        );
+        ctx.set_field(obj, METHOD_LEGACY_SLOT_NAME, Value::Object(Some(name_str)));
+        ctx.set_field(
+            obj,
+            METHOD_LEGACY_SLOT_RETURN_TYPE,
+            Value::Object(Some(ret_mirror)),
+        );
+        ctx.set_field(
+            obj,
+            METHOD_LEGACY_SLOT_PARAMETER_TYPES,
+            Value::Object(Some(param_arr)),
+        );
+        ctx.set_field(
+            obj,
+            METHOD_LEGACY_SLOT_EXCEPTION_TYPES,
+            Value::Object(Some(exception_arr)),
+        );
+        ctx.set_field(
+            obj,
+            METHOD_LEGACY_SLOT_MODIFIERS,
+            Value::Int(meta.access_flags as i32),
+        );
+        ctx.set_field(obj, METHOD_LEGACY_SLOT_SLOT, Value::Int(0));
+        ctx.set_field(obj, METHOD_LEGACY_SLOT_CALLER_SENSITIVE, Value::Int(0));
+        ctx.set_field(obj, METHOD_LEGACY_SLOT_OVERRIDE, Value::Int(0));
+        ctx.set_field(obj, METHOD_LEGACY_SLOT_ANNOTATIONS, Value::Object(None));
+        ctx.set_field(
+            obj,
+            METHOD_LEGACY_SLOT_PARAMETER_ANNOTATIONS,
+            Value::Object(None),
+        );
+        ctx.set_field(
+            obj,
+            METHOD_LEGACY_SLOT_ANNOTATION_DEFAULT,
+            Value::Object(None),
+        );
+    }
+
     // WP2.1: populate the JDK `signature` field from the JVMS §4.7.9 Signature
     // attribute when the method is generic. The real JDK `Method.getGenericReturnType()`
     // / `getGenericParameterTypes()` are pure-Java methods that read this field
@@ -4808,12 +4880,12 @@ fn compose_method_descriptor_from_type_fields(
     // (`Cannot invoke discover on null`). Default missing return to
     // `java.lang.Object` (still correct for `void`: the invoke path returns
     // `None` before boxing).
-    let ret_token = match ctx.get_field_by_name(method_obj, "returnType") {
+    let ret_token = match method_return_type_value(ctx, method_obj) {
         Value::Object(Some(m)) => mirror_to_jvm_descriptor_token(ctx, m),
         _ => "Ljava/lang/Object;".to_string(),
     };
 
-    let params_arr = match ctx.get_field_by_name(method_obj, "parameterTypes") {
+    let params_arr = match method_parameter_types_value(ctx, method_obj) {
         Value::Object(Some(arr)) => arr,
         _ => return format!("(){ret_token}"),
     };
@@ -4903,7 +4975,9 @@ fn read_method_param_count(ctx: &dyn NativeContext, method_obj: cratonvm_types::
 fn read_method_accessible(ctx: &dyn NativeContext, method_obj: cratonvm_types::ObjectRef) -> bool {
     // Check the JDK `override` field first — this is what JDK 25's
     // AccessibleObject.setAccessible writes via Java bytecode.
-    if let Value::Int(v) = ctx.get_field_by_name(method_obj, "override") {
+    if let Value::Int(v) =
+        method_int_field_value_or_legacy(ctx, method_obj, "override", METHOD_LEGACY_SLOT_OVERRIDE)
+    {
         if v != 0 {
             return true;
         }
@@ -4930,6 +5004,16 @@ pub(crate) fn write_method_accessible(
         base + METHOD_EXTRA_OFFSET_ACCESSIBLE,
         Value::Int(if value { 1 } else { 0 }),
     );
+    if matches!(
+        ctx.get_field_by_name(method_obj, "override"),
+        Value::Object(None)
+    ) {
+        ctx.set_field(
+            method_obj,
+            METHOD_LEGACY_SLOT_OVERRIDE,
+            Value::Int(if value { 1 } else { 0 }),
+        );
+    }
 }
 
 /// Public wrapper used by `lang_reflect::native_method_try_set_accessible`.
@@ -4942,6 +5026,97 @@ pub(crate) fn write_method_accessible_external(
 }
 
 // --- Method getters ---
+
+fn method_object_field_value_or_legacy(
+    ctx: &dyn NativeContext,
+    method_obj: cratonvm_types::ObjectRef,
+    field_name: &str,
+    legacy_slot: usize,
+) -> Value {
+    let named = ctx.get_field_by_name(method_obj, field_name);
+    if matches!(named, Value::Object(Some(_))) {
+        return named;
+    }
+    let legacy = ctx.get_field(method_obj, legacy_slot);
+    if matches!(legacy, Value::Object(Some(_))) {
+        return legacy;
+    }
+    named
+}
+
+fn method_int_field_value_or_legacy(
+    ctx: &dyn NativeContext,
+    method_obj: cratonvm_types::ObjectRef,
+    field_name: &str,
+    legacy_slot: usize,
+) -> Value {
+    let named = ctx.get_field_by_name(method_obj, field_name);
+    if matches!(named, Value::Int(_)) {
+        return named;
+    }
+    let legacy = ctx.get_field(method_obj, legacy_slot);
+    if matches!(legacy, Value::Int(_)) {
+        return legacy;
+    }
+    named
+}
+
+pub(crate) fn method_clazz_value(
+    ctx: &dyn NativeContext,
+    method_obj: cratonvm_types::ObjectRef,
+) -> Value {
+    method_object_field_value_or_legacy(ctx, method_obj, "clazz", METHOD_LEGACY_SLOT_CLAZZ)
+}
+
+pub(crate) fn method_name_value(
+    ctx: &dyn NativeContext,
+    method_obj: cratonvm_types::ObjectRef,
+) -> Value {
+    method_object_field_value_or_legacy(ctx, method_obj, "name", METHOD_LEGACY_SLOT_NAME)
+}
+
+pub(crate) fn method_return_type_value(
+    ctx: &dyn NativeContext,
+    method_obj: cratonvm_types::ObjectRef,
+) -> Value {
+    method_object_field_value_or_legacy(
+        ctx,
+        method_obj,
+        "returnType",
+        METHOD_LEGACY_SLOT_RETURN_TYPE,
+    )
+}
+
+pub(crate) fn method_parameter_types_value(
+    ctx: &dyn NativeContext,
+    method_obj: cratonvm_types::ObjectRef,
+) -> Value {
+    method_object_field_value_or_legacy(
+        ctx,
+        method_obj,
+        "parameterTypes",
+        METHOD_LEGACY_SLOT_PARAMETER_TYPES,
+    )
+}
+
+pub(crate) fn method_exception_types_value(
+    ctx: &dyn NativeContext,
+    method_obj: cratonvm_types::ObjectRef,
+) -> Value {
+    method_object_field_value_or_legacy(
+        ctx,
+        method_obj,
+        "exceptionTypes",
+        METHOD_LEGACY_SLOT_EXCEPTION_TYPES,
+    )
+}
+
+pub(crate) fn method_modifiers_value(
+    ctx: &dyn NativeContext,
+    method_obj: cratonvm_types::ObjectRef,
+) -> Value {
+    method_int_field_value_or_legacy(ctx, method_obj, "modifiers", METHOD_LEGACY_SLOT_MODIFIERS)
+}
 
 pub(crate) fn native_method_get_name(
     ctx: &mut dyn NativeContext,
@@ -4962,7 +5137,7 @@ pub(crate) fn native_method_get_return_type(
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
-    Ok(Some(ctx.get_field_by_name(this, "returnType")))
+    Ok(Some(method_return_type_value(ctx, this)))
 }
 
 pub(crate) fn native_method_get_parameter_types(
@@ -4973,7 +5148,7 @@ pub(crate) fn native_method_get_parameter_types(
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
-    Ok(Some(ctx.get_field_by_name(this, "parameterTypes")))
+    Ok(Some(method_parameter_types_value(ctx, this)))
 }
 
 pub(crate) fn native_method_get_modifiers(
@@ -4984,7 +5159,7 @@ pub(crate) fn native_method_get_modifiers(
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
     };
-    Ok(Some(ctx.get_field_by_name(this, "modifiers")))
+    Ok(Some(method_modifiers_value(ctx, this)))
 }
 
 pub(crate) fn native_method_get_declaring_class(
@@ -4995,7 +5170,7 @@ pub(crate) fn native_method_get_declaring_class(
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
-    Ok(Some(ctx.get_field_by_name(this, "clazz")))
+    Ok(Some(method_clazz_value(ctx, this)))
 }
 
 pub(crate) fn native_method_get_parameter_count(
@@ -5158,7 +5333,7 @@ pub(crate) fn native_method_invoke(
     let is_static = (modifiers & ACC_STATIC) != 0;
 
     // Get declaring class name
-    let declaring_mirror = match ctx.get_field_by_name(this, "clazz") {
+    let declaring_mirror = match method_clazz_value(ctx, this) {
         Value::Object(Some(m)) => m,
         other => {
             // CRATONVM_DBG_MINVOKE=1 — dump everything knowable about the
@@ -5166,7 +5341,7 @@ pub(crate) fn native_method_invoke(
             // (observed: Gradle DefaultServiceRegistry configure-method
             // dispatch receiving a Method whose clazz slot reads null).
             if std::env::var_os("CRATONVM_DBG_MINVOKE").is_some() {
-                let name = match ctx.get_field_by_name(this, "name") {
+                let name = match method_name_value(ctx, this) {
                     Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
                     _ => "<no name>".to_string(),
                 };
@@ -5186,7 +5361,7 @@ pub(crate) fn native_method_invoke(
     let class_name = mirror_class_name(ctx, declaring_mirror).unwrap_or_default();
 
     // Get method name
-    let method_name = match ctx.get_field_by_name(this, "name") {
+    let method_name = match method_name_value(ctx, this) {
         Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
         _ => String::new(),
     };
@@ -9759,12 +9934,18 @@ pub(crate) fn method_class_name_desc(
     ctx: &dyn NativeContext,
     method_obj: ObjectRef,
 ) -> Option<(ClassId, String, String)> {
-    let mirror = match ctx.get_field_by_name(method_obj, "clazz") {
+    let mirror = match method_clazz_value(ctx, method_obj) {
         Value::Object(Some(m)) => m,
         _ => return None,
     };
     let class_id = mirror_class_id(ctx, mirror)?;
-    let name = match ctx.get_field_by_name(method_obj, "name") {
+    let receiver_class = ctx.class_name_of_id(ctx.class_id_of_object(method_obj));
+    let name_value = if receiver_class.as_deref() == Some("java/lang/reflect/Constructor") {
+        ctx.get_field_by_name(method_obj, "name")
+    } else {
+        method_name_value(ctx, method_obj)
+    };
+    let name = match name_value {
         Value::Object(Some(s)) => ctx.read_string(s)?,
         _ => {
             // `java.lang.reflect.Constructor` has no `name` field (its
@@ -9777,8 +9958,7 @@ pub(crate) fn method_class_name_desc(
             // otherwise constructor annotations fall through to real JDK
             // bytecode that reads raw `annotations`/`parameterAnnotations`
             // byte[] fields CratonVM never populates (Jackson "no Creators").
-            let cls = ctx.class_name_of_id(ctx.class_id_of_object(method_obj));
-            if cls.as_deref() == Some("java/lang/reflect/Constructor") {
+            if receiver_class.as_deref() == Some("java/lang/reflect/Constructor") {
                 "<init>".to_string()
             } else {
                 return None;
@@ -10456,7 +10636,7 @@ pub(crate) fn native_method_get_generic_param_types(
         }
     }
     // Fallback: return raw parameter types from the JDK `parameterTypes` field.
-    let param_types = ctx.get_field_by_name(this, "parameterTypes");
+    let param_types = method_parameter_types_value(ctx, this);
     Ok(Some(param_types))
 }
 
@@ -10487,7 +10667,7 @@ pub(crate) fn native_method_get_generic_return_type(
         }
     }
     // Fallback: return raw return type from the JDK `returnType` field.
-    Ok(Some(ctx.get_field_by_name(this, "returnType")))
+    Ok(Some(method_return_type_value(ctx, this)))
 }
 
 /// Method.getTypeParameters() — returns TypeVariable[] from method signature.

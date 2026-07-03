@@ -187,6 +187,17 @@ fn longroot_strict() -> bool {
     *G.get_or_init(|| std::env::var_os("CRATONVM_LONGROOT_STRICT").is_some())
 }
 
+/// Cached `CRATONVM_LONGREWRITE_LOOSE` escape hatch: restore the pre-registry
+/// behavior of rewriting ANY Long/Double slot on a pointer-map hit (see the
+/// mint-provenance gate in `update_object_refs`). Use only to diagnose an
+/// unregistered mint path; the loose mode can silently corrupt a primitive
+/// long that collides with a moved object's address.
+fn longrewrite_loose() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| std::env::var_os("CRATONVM_LONGREWRITE_LOOSE").is_some())
+}
+
 /// Cached `CRATONVM_DBG_LONGROOT` gate: log every rooting the O1 hybrid
 /// branch performs (value bits + kind mark).
 #[inline]
@@ -1378,6 +1389,16 @@ impl ValueStack {
                     // authoritative relocation record (and the exact criterion
                     // `verify_no_stale_refs` checks).
                     if let Some(&new_addr) = pointer_map.get(&(old_ptr as usize)) {
+                        // Record construction provenance for the relocated
+                        // address (2026-07-03): `update_object_ptr_unchecked`
+                        // writes raw bits, so without this a context-free
+                        // decode of the rewritten slot can hit a provenance
+                        // MISS on `new_addr` and degrade a live reference to
+                        // Long/null (observed in the rewrites_pointer test).
+                        // The `from_raw` round-trip is the canonical recorder.
+                        // SAFETY: `new_addr` is a live moved object's address
+                        // from the GC pointer map; only its bits are used.
+                        let _ = unsafe { crate::types::ObjectRef::from_raw(new_addr as *mut u8) };
                         // SAFETY: `new_addr` comes from a `HashMap<usize,
                         // usize>` of live-heap pointers populated by the GC
                         // compactor; every entry is the moved address of a
@@ -1437,7 +1458,47 @@ impl ValueStack {
                         // CRATONVM_LONGROOT_STRICT resolves precisely.) The object
                         // arm above already gates on pointer_map membership for
                         // the same reason (H2 stale-stack crash).
-                        if heap.is_heap_addr(new_addr).is_some() {
+                        // Mint-provenance corroboration (2026-07-03): a
+                        // pointer-map hit alone cannot distinguish a genuine
+                        // smuggled handle from a primitive long whose value
+                        // coincidentally equals a moved object's from-space
+                        // address — the collision target is a real object, so
+                        // construction provenance always passes. Only MINT
+                        // provenance discriminates: genuine smuggles are
+                        // created at a handful of chokepoints (generic-JNI 'J'
+                        // returns, SetLongField/SetLongArrayRegion, JVMTI
+                        // GetLocal) which register the exact value in
+                        // `smuggled_longs`; the registry is remapped through
+                        // every pointer map, so check BOTH the old bits (same
+                        // pause, pre-remap consumers) and the relocation
+                        // target (safepoint peers and blocked-thread wakes
+                        // applying composed multi-GC fixups after the
+                        // registry was remapped). A colliding primitive is
+                        // left untouched. `CRATONVM_LONGREWRITE_LOOSE=1`
+                        // restores the old rewrite-on-any-map-hit behavior
+                        // (escape hatch for an unregistered mint path; such a
+                        // block is logged under CRATONVM_DBG_LONGROOT).
+                        let minted = crate::memory::smuggled_longs::is_minted(bits)
+                            || crate::memory::smuggled_longs::is_minted(new_addr as u64);
+                        if !minted && !longrewrite_loose() {
+                            if longroot_dbg() {
+                                use std::sync::atomic::{AtomicUsize, Ordering};
+                                static N: AtomicUsize = AtomicUsize::new(0);
+                                let k = N.fetch_add(1, Ordering::Relaxed);
+                                if k < 40 {
+                                    eprintln!(
+                                        "[longroot] #{k} rewrite BLOCKED slot[{i}] bits=0x{bits:x} -> 0x{new_addr:x} (not a minted handle; preserving primitive)",
+                                    );
+                                }
+                            }
+                        } else if heap.is_heap_addr(new_addr).is_some() {
+                            // Record construction provenance for the moved
+                            // address (see the Object arm above): the raw-bits
+                            // write below bypasses `from_raw`, and a later
+                            // decode of this slot must not provenance-MISS.
+                            // SAFETY: live moved address; only bits are used.
+                            let _ =
+                                unsafe { crate::types::ObjectRef::from_raw(new_addr as *mut u8) };
                             // Preserve the slot's raw-bits encoding (the
                             // smuggle stores the pointer verbatim as the slot's
                             // bits, for both the tagged-`Long` and untagged-
@@ -1841,6 +1902,9 @@ mod tests {
         // slot). `push_long` marks the slot `KIND_LONG`; a low heap address is
         // not NaN-tagged, so the slot reports `CompactTag::Double` raw bits —
         // exactly the shape `scan_object_refs`'s hybrid branch roots.
+        // Mint-provenance (2026-07-03): the rewrite arm only remaps values
+        // registered at a mint chokepoint — model the JNI mint explicitly.
+        crate::memory::smuggled_longs::record_minted_long(old_addr);
         let mut stack = ValueStack::new(4);
         stack.push_long(old_addr as i64).unwrap();
 
@@ -1894,6 +1958,15 @@ mod tests {
             "new_addr must be a live relocated object"
         );
 
+        // Mint-provenance (2026-07-03): register the handle as a JNI mint
+        // would have; the `from_raw` round-trip ALSO records construction
+        // provenance, making this test independent of cross-test
+        // provenance-bitmap granule pollution (old_addr=0x1_0000 previously
+        // passed `jlong_bits_as_aligned_object_ptr` only when another test in
+        // the same process happened to record provenance in that granule).
+        // SAFETY: the pointer is only used for its bits (never dereferenced).
+        let _ = unsafe { cratonvm_types::ObjectRef::from_raw(old_addr as *mut u8) };
+        crate::memory::smuggled_longs::record_minted_long(old_addr);
         let mut stack = ValueStack::new(4);
         stack.push_long(old_addr as i64).unwrap();
         let mut map = HashMap::new();
@@ -1904,6 +1977,45 @@ mod tests {
             stack.peek_compact().to_bits(),
             new_addr,
             "smuggle must be remapped even though old_addr's region was freed (G1)"
+        );
+    }
+
+    /// Mint-provenance gate (2026-07-03): a genuine primitive long whose bits
+    /// coincidentally equal a moved object's from-space address must NOT be
+    /// rewritten — the collision case the provenance-of-construction check
+    /// can never discriminate (the moved object is always a real,
+    /// once-constructed object).
+    #[test]
+    fn colliding_primitive_long_is_not_rewritten() {
+        use crate::memory::VmHeap;
+        use cratonvm_gc::GcBackend;
+        use cratonvm_types::ClassId;
+        use std::collections::HashMap;
+
+        let heap = VmHeap::new(GcBackend::Generational, 16 * 1024 * 1024);
+        let a = heap.alloc_object(ClassId::new(0), 0);
+        let b = heap.alloc_object(ClassId::new(0), 0);
+        let old_addr = a.as_ptr() as u64;
+        let new_addr = b.as_ptr() as u64;
+
+        // The primitive's value equals A's address, but it was NEVER minted
+        // as a handle (no record_minted_long). Guard against cross-test
+        // registry pollution (the registry is process-global and another
+        // test's heap could have handed out an identical address).
+        if crate::memory::smuggled_longs::is_minted(old_addr) {
+            return;
+        }
+        let mut stack = ValueStack::new(4);
+        stack.push_long(old_addr as i64).unwrap();
+
+        let mut map = HashMap::new();
+        map.insert(old_addr as usize, new_addr as usize);
+        stack.update_object_refs(&map, &heap);
+
+        assert_eq!(
+            stack.peek_compact().to_bits(),
+            old_addr,
+            "an un-minted primitive long colliding with a moved address must be preserved"
         );
     }
 
@@ -2659,6 +2771,10 @@ mod tests {
         let obj = heap.alloc_object(ClassId::new(0), 0);
         let old_ptr = obj.as_ptr() as usize;
         let new_ptr: usize = old_ptr + 64;
+        // Mint-provenance (2026-07-03): raw pointer-shaped slots are only
+        // rewritten when the value was registered at a mint chokepoint —
+        // model the JNI mint this test's smuggle represents.
+        crate::memory::smuggled_longs::record_minted_long(old_ptr as u64);
         let mut stack = ValueStack::new(4);
         stack.push_compact(CompactValue::from_bits(old_ptr as u64));
 

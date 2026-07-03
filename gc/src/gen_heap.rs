@@ -182,6 +182,17 @@ pub static SWEEP_ZERO_SPAN_HITS: AtomicU64 = AtomicU64::new(0);
 /// instead of zeroed+freed.
 pub static SWEEP_BAD_FORWARD_HITS: AtomicU64 = AtomicU64::new(0);
 
+/// DoHead comb-7 fix (2026-07-03) — count of mark-phase candidates rejected
+/// because the header's claimed EXTENT (`gen_object_total_size`) does not fit
+/// inside its generation at that address. The per-field plausibility gate
+/// admits `array_length` up to i32::MAX, and the mark BFS scan iterates that
+/// count with the header as its only bound — a corrupt header (e.g. packed
+/// pointer bytes misparsed as `kind=Array, array_length=<pointer low 32>`) ran
+/// the scan tens of MB off the mapped arena (observed SIGSEGV at the region
+/// boundary). A real object's extent always fits inside the arena it was
+/// allocated from, so out-of-extent headers are rejected without marking.
+pub static SWEEP_BAD_EXTENT_HITS: AtomicU64 = AtomicU64::new(0);
+
 /// DoHead walk-desync hardening — count of selective-promotion UNWIND events:
 /// the evacuation walk saw a grid anomaly (zero span, implausible header,
 /// free-block overshoot, or a span crossing a free hole) and dropped the
@@ -1685,6 +1696,18 @@ impl GenerationalHeap {
         // object's allocated region. `read_slot` reads a `Value` from that address.
         unsafe {
             let ptr = slot_ptr(obj_ref, index);
+            // gcstress residual face-1 diagnostics (CRATONVM_DBG_CELLCORRUPT):
+            // identify the HOLDER of a corrupt Value cell before `read_slot`
+            // masks it with a benign null. The holder's class/kind/layout — and
+            // whether the stale raw0 pointer lands in current young-from,
+            // young-to, old gen, or nowhere — discriminates the candidate
+            // mechanisms (8-vs-16-byte slot-layout confusion vs un-remapped
+            // holder after a moving young GC vs stale freed arena after grow).
+            if cell_corrupt_diag_enabled()
+                && cratonvm_types::read_value_checked(ptr as *const Value).is_none()
+            {
+                self.dump_corrupt_cell_holder(obj_ref, header, index, ptr);
+            }
             read_slot(ptr)
         }
     }
@@ -2183,6 +2206,30 @@ impl GenerationalHeap {
         }
         let header = self.get_header(obj_ref);
         debug_assert_eq!(header.kind, ObjectKind::Array);
+        // gcstress residual face-1 diagnostics (CRATONVM_DBG_CELLCORRUPT) —
+        // the debug_assert above is a no-op in release: an array-element
+        // write through a STALE array reference whose address is now occupied
+        // by a plain object would write a raw 8-byte pointer into the middle
+        // of that object's 16-byte Value cells (the observed {ptr, 0} corrupt
+        // cells). Trap it with the holder identity + backtrace. The bounds
+        // check below usually deflects such writes (a plain object has
+        // array_length=0), so this logs the attempt either way.
+        if cell_corrupt_diag_enabled() && header.kind != ObjectKind::Array {
+            let class_name = crate::gc::resolve_class_info(header.class_id.as_u32())
+                .map(|(n, _)| n)
+                .unwrap_or_else(|| "<unresolved>".to_string());
+            eprintln!(
+                "[CELLCORRUPT:set_array_element-on-NON-ARRAY] obj=0x{:x} class_id={} \
+                 class={class_name} kind=0x{:02x} num_slots={} array_len={} index={index} \
+                 value={value:?}\n{}",
+                obj_ref.as_ptr() as usize,
+                header.class_id.as_u32(),
+                header.kind as u8,
+                header.num_slots,
+                header.array_length,
+                std::backtrace::Backtrace::force_capture(),
+            );
+        }
         if index >= header.array_length as usize {
             return Err(index as i32);
         }
@@ -3956,6 +4003,50 @@ impl GenerationalHeap {
                 || (!is_array && header.num_slots > (1 << 24))
                 || (is_array && header.array_length > i32::MAX as u32)
             {
+                return;
+            }
+            // DoHead comb-7 fix (2026-07-03): also validate the object's
+            // EXTENT. The field bounds above still admit a corrupt header
+            // claiming millions of elements (array_length is only capped at
+            // i32::MAX), and the BFS scan (`for_each_ref_slot`) iterates
+            // that count with the header as its ONLY bound — a claimed
+            // extent past from-space ran the scan off the mapped arena
+            // (observed: main-vm SIGSEGV at the region boundary, corrupt
+            // header claiming array_length=7,775,429 — the JIT inline-alloc
+            // kind/array_length fault family). A real object's extent always
+            // fits inside the arena it was allocated from, so an
+            // out-of-extent header is definitionally corrupt: never mark or
+            // scan it (its "referents" would be garbage reads anyway).
+            let total = gen_object_total_size(header);
+            if total < HEADER_SIZE || addr + total > from_end {
+                let n = SWEEP_BAD_EXTENT_HITS.fetch_add(1, Ordering::Relaxed);
+                if n < 8 {
+                    // Attribution diagnostic: dump the words around the
+                    // rejected "header" so the upstream corruptor face is
+                    // identifiable (stale packed-pointer reuse shows heap
+                    // pointers; a clobbered real header shows a torn mix).
+                    let lo = addr.saturating_sub(32).max(from_base);
+                    let mut hex = String::new();
+                    let mut w = lo;
+                    while w + 8 <= (addr + 48).min(from_end) {
+                        // SAFETY: `[from_base, from_end)` is mapped arena
+                        // memory and `w` is 8-aligned within it.
+                        let v = unsafe { *((w & !7) as *const u64) };
+                        hex.push_str(&format!("{:#x}:{:016x} ", w & !7, v));
+                        w += 8;
+                    }
+                    tracing::warn!(
+                        "mark_young: rejecting object at {:#x} with implausible extent \
+                         {} (kind={}, array_len={}, num_slots={}) — corrupt header, \
+                         not marked/scanned; context {}",
+                        addr,
+                        total,
+                        kind_byte,
+                        header.array_length,
+                        header.num_slots,
+                        hex,
+                    );
+                }
                 return;
             }
             if header.gc_flags & GC_FLAG_MARKED == 0 {
@@ -5760,6 +5851,27 @@ impl GenerationalHeap {
     fn scan_object_for_old_refs(obj_ptr: *mut u8, old_gen: &OldGen, worklist: &mut Vec<*mut u8>) {
         // SAFETY: `obj_ptr` is a live old-gen object from the mark worklist; its header is valid.
         let header = unsafe { &*(obj_ptr as *const ObjectHeader) };
+        // DoHead comb-7 fix (2026-07-03): validate the claimed extent before
+        // scanning — the young-mark twin of this check caught a corrupt
+        // header whose `array_length` was pointer bytes; scanning that count
+        // of slots runs off the mapped region (SIGSEGV). An old object whose
+        // extent leaves old gen is definitionally corrupt: skip the scan.
+        let total = gen_object_total_size(header);
+        if total < HEADER_SIZE || !old_gen.contains(unsafe { obj_ptr.add(total - 1) }) {
+            let n = SWEEP_BAD_EXTENT_HITS.fetch_add(1, Ordering::Relaxed);
+            if n < 8 {
+                tracing::warn!(
+                    "old-gen mark: rejecting object at {:p} with implausible extent {} \
+                     (kind={}, array_len={}, num_slots={}) — corrupt header, not scanned",
+                    obj_ptr,
+                    total,
+                    header.kind as u8,
+                    header.array_length,
+                    header.num_slots,
+                );
+            }
+            return;
+        }
         // Mark every old-gen referent (arrays + compact objects: 8-byte pointers;
         // legacy objects: 16-byte Value cells).
         // SAFETY: `obj_ptr`/`header` are a valid live object.
@@ -6805,6 +6917,77 @@ impl GenerationalHeap {
         }
         out
     }
+
+    /// gcstress residual face-1 diagnostics (`CRATONVM_DBG_CELLCORRUPT`) —
+    /// dump everything known about the HOLDER of a corrupt Value cell plus a
+    /// generation-containment probe of the stale pointer the cell carries.
+    /// Cold path: runs only when the gate is set AND the cell already failed
+    /// `read_value_checked`.
+    fn dump_corrupt_cell_holder(
+        &self,
+        obj_ref: ObjectRef,
+        header: &ObjectHeader,
+        index: usize,
+        cell_ptr: *mut u8,
+    ) {
+        // SAFETY: `cell_ptr` is a readable 16-byte slot (get_field bounds-checked).
+        let raw = unsafe { std::ptr::read(cell_ptr as *const [u64; 2]) };
+        let class_name = crate::gc::resolve_class_info(header.class_id.as_u32())
+            .map(|(n, _)| n)
+            .unwrap_or_else(|| "<unresolved>".to_string());
+        let target = raw[0] as usize;
+        let t = target as *const u8;
+        let (yf, yt, og) = (
+            self.young_from.lock().contains(t),
+            self.young_to.lock().contains(t),
+            self.old_gen.lock().contains(t),
+        );
+        let holder_addr = obj_ref.as_ptr() as usize;
+        let (hyf, hog) = (
+            self.young_from.lock().contains(holder_addr as *const u8),
+            self.old_gen.lock().contains(holder_addr as *const u8),
+        );
+        eprintln!(
+            "[CELLCORRUPT] holder=0x{holder_addr:x} (young_from={hyf} old={hog}) \
+             class_id={} class={class_name} kind=0x{:02x} num_slots={} array_len={} \
+             gc_flags=0x{:x} index={index} raw0=0x{:016x} raw1=0x{:016x} | \
+             raw0-target: young_from={yf} young_to={yt} old={og}\n{}",
+            header.class_id.as_u32(),
+            header.kind as u8,
+            header.num_slots,
+            header.array_length,
+            header.gc_flags,
+            raw[0],
+            raw[1],
+            std::backtrace::Backtrace::force_capture(),
+        );
+        // If the stale target is still inside a CURRENT generation, dump its
+        // header too — its identity often names the mis-writing code path.
+        if yf || og {
+            // SAFETY: `target` is inside a live arena (checked above); the
+            // first 40 header bytes of any in-arena address are readable.
+            let th = unsafe { std::ptr::read(target as *const ObjectHeader) };
+            let tname = crate::gc::resolve_class_info(th.class_id.as_u32())
+                .map(|(n, _)| n)
+                .unwrap_or_else(|| "<unresolved>".to_string());
+            eprintln!(
+                "[CELLCORRUPT]   target-header: class_id={} class={tname} kind=0x{:02x} \
+                 num_slots={} array_len={} gc_flags=0x{:x}",
+                th.class_id.as_u32(),
+                th.kind as u8,
+                th.num_slots,
+                th.array_length,
+                th.gc_flags,
+            );
+        }
+    }
+}
+
+/// gcstress residual face-1 gate — see `dump_corrupt_cell_holder`.
+#[inline]
+fn cell_corrupt_diag_enabled() -> bool {
+    static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *G.get_or_init(|| std::env::var_os("CRATONVM_DBG_CELLCORRUPT").is_some())
 }
 
 impl Default for GenerationalHeap {

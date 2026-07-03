@@ -696,7 +696,9 @@ impl Default for SharedResolutionState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
+
+    static RESOLVE_CACHE_ENV_LOCK: Mutex<()> = Mutex::new(());
     use std::thread;
 
     fn sample_target(class_id: u64) -> ResolvedTarget {
@@ -1313,6 +1315,7 @@ mod tests {
         // Single test owns the env var across all its assertions so it does
         // not race other tests on the process-global environment. Restored
         // on every exit path.
+        let _guard = RESOLVE_CACHE_ENV_LOCK.lock().unwrap();
         const VAR: &str = "CRATONVM_RESOLVE_CACHE_CAP";
         let prev = std::env::var(VAR).ok();
 
@@ -1342,6 +1345,7 @@ mod tests {
         // Drive the *public* insert paths through a small env cap and prove
         // all three shared maps stay bounded while a key-minting workload
         // floods distinct keys. Owns the env var for the whole test.
+        let _guard = RESOLVE_CACHE_ENV_LOCK.lock().unwrap();
         const VAR: &str = "CRATONVM_RESOLVE_CACHE_CAP";
         let prev = std::env::var(VAR).ok();
         std::env::set_var(VAR, "16");
@@ -1395,6 +1399,7 @@ mod tests {
     fn shared_cache_recache_existing_key_does_not_evict() {
         // Re-caching an already-present key must not trigger eviction (the
         // `contains_key` guard) — capacity is for *new* keys only.
+        let _guard = RESOLVE_CACHE_ENV_LOCK.lock().unwrap();
         const VAR: &str = "CRATONVM_RESOLVE_CACHE_CAP";
         let prev = std::env::var(VAR).ok();
         std::env::set_var(VAR, "4");

@@ -518,15 +518,28 @@ pub(crate) fn alloc_classloader(ctx: &mut dyn NativeContext, loader_type: i32) -
 }
 
 /// Get the unique loader ID from a ClassLoader object, lazily assigning one if needed.
+///
+/// Delegates to [`loader_namespace_id`], which is mode-aware: in
+/// synthetic-JDK mode `CL_LOADER_ID` (slot 6) is a CratonVM-owned bookkeeping
+/// field, safe to read/write directly; in real-JDK mode that same slot index
+/// is the REAL `java.lang.ClassLoader.classes` field (a private final
+/// `ArrayList<Class<?>>` -- confirmed via `javap` against the JDK 25
+/// `ClassLoader.class`: instance fields in declaration order are `parent`(0)
+/// `name`(1) `unnamedModule`(2) `nameAndId`(3) `parallelLockMap`(4)
+/// `package2certs`(5) `classes`(6)). This function used to write
+/// `Value::Int(lid)` straight into that slot unconditionally, silently
+/// clobbering the real `classes` ArrayList reference with a bare integer on
+/// every `ClassLoader.defineClass(...)` call in real-JDK mode -- harmless
+/// only as long as nothing ever reads `classes` back (e.g. `addClass`,
+/// reflection over loader-owned classes), but a real type-confusion bug
+/// regardless of whether anything currently exercises it. `loader_namespace_id`
+/// already keys real-JDK-mode ids by the loader's stable identity hash in a
+/// side table instead of touching the field, so delegating to it fixes the
+/// corruption for free while preserving identical id-assignment semantics
+/// (same `allocate_loader_id()` counter, same "0 = application/built-in
+/// loader" convention `loader_id_for`'s null-loader callers already rely on).
 fn get_or_assign_loader_id(ctx: &mut dyn NativeContext, cl: ObjectRef) -> u32 {
-    match ctx.get_field(cl, CL_LOADER_ID) {
-        Value::Int(v) if v > 0 => v as u32,
-        _ => {
-            let lid = ctx.allocate_loader_id();
-            ctx.set_field(cl, CL_LOADER_ID, Value::Int(lid as i32));
-            lid
-        }
-    }
+    loader_namespace_id(ctx, cl)
 }
 
 fn alloc_url_classloader(ctx: &mut dyn NativeContext) -> ObjectRef {

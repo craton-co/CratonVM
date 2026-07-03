@@ -103,49 +103,133 @@ public class Wp72JdbcCoreTypes {
      * Reflection sanity check #1: every Method on Connection has a
      * non-null name and a non-NPE toString().
      *
-     * Best-effort under the synthetic-stub path: if
-     * {@code getDeclaredMethods()} is itself a baseline gap, this
-     * fixture method returns 0 and the matching Rust test
-     * {@code connection_methods_carry_signatures} treats that as
-     * "skip" (per its comment). The Rust-side registry assertion in
-     * {@code class_get_declared_methods_native_registered} is the
-     * load-bearing acceptance proof.
+     * Hard assertion under the synthetic-stub path: the Rust-side registry
+     * assertion proves the native is registered, while this fixture proves
+     * real bytecode can dispatch {@code Class.getDeclaredMethods()} and read
+     * usable Method mirrors. Negative return codes identify the failing stage.
      */
     public static int connection_methods_have_signatures() {
         try {
             Class<?> c = Connection.class;
-            Method[] ms = c.getDeclaredMethods();
-            if (ms == null || ms.length == 0) return 0;
+            Method[] ms;
+            try {
+                ms = c.getDeclaredMethods();
+            } catch (NullPointerException t) {
+                return -11;
+            } catch (NoClassDefFoundError t) {
+                return -12;
+            } catch (ExceptionInInitializerError t) {
+                return -13;
+            } catch (NoSuchMethodError t) {
+                return -141;
+            } catch (AbstractMethodError t) {
+                return -142;
+            } catch (UnsatisfiedLinkError t) {
+                return -143;
+            } catch (VerifyError t) {
+                return -144;
+            } catch (IncompatibleClassChangeError t) {
+                return -145;
+            } catch (ClassFormatError t) {
+                return -146;
+            } catch (LinkageError t) {
+                return -14;
+            } catch (RuntimeException t) {
+                return -15;
+            } catch (Error t) {
+                return -16;
+            } catch (Throwable t) {
+                return -10;
+            }
+            if (ms == null) return -1;
+            if (ms.length == 0) return -2;
             for (Method m : ms) {
-                String n = m.getName();
-                if (n == null || n.length() == 0) return 0;
-                String s = m.toString();
-                if (s == null) return 0;
+                String n;
+                try {
+                    n = m.getName();
+                } catch (Throwable t) {
+                    return -20;
+                }
+                if (n == null) return -3;
+                if (n.length() == 0) return -4;
+                String s;
+                try {
+                    s = m.toString();
+                } catch (Throwable t) {
+                    return -30;
+                }
+                if (s == null) return -5;
             }
             return 1;
         } catch (Throwable t) {
-            return 0;
+            return -100;
         }
     }
 
     /**
-     * Reflection sanity check #2: ResultSet declares a recognizable
-     * surface. Best-effort, see comment on
-     * {@link #connection_methods_have_signatures}.
+     * Reflection sanity check #2: ResultSet declares a recognizable surface,
+     * including a zero-argument {@code next()} Method whose return type is the
+     * canonical {@code boolean.class} primitive mirror.
      */
     public static int resultSet_next_is_boolean() {
         try {
             Class<?> c = ResultSet.class;
-            Method[] ms = c.getDeclaredMethods();
-            if (ms == null || ms.length == 0) return 0;
+            Method[] ms;
+            try {
+                ms = c.getDeclaredMethods();
+            } catch (NullPointerException t) {
+                return -11;
+            } catch (NoClassDefFoundError t) {
+                return -12;
+            } catch (ExceptionInInitializerError t) {
+                return -13;
+            } catch (NoSuchMethodError t) {
+                return -141;
+            } catch (AbstractMethodError t) {
+                return -142;
+            } catch (UnsatisfiedLinkError t) {
+                return -143;
+            } catch (VerifyError t) {
+                return -144;
+            } catch (IncompatibleClassChangeError t) {
+                return -145;
+            } catch (ClassFormatError t) {
+                return -146;
+            } catch (LinkageError t) {
+                return -14;
+            } catch (RuntimeException t) {
+                return -15;
+            } catch (Error t) {
+                return -16;
+            } catch (Throwable t) {
+                return -10;
+            }
+            if (ms == null) return -1;
+            if (ms.length == 0) return -2;
             for (Method m : ms) {
-                if ("next".equals(m.getName()) && m.getParameterCount() == 0) {
-                    return m.getReturnType() == boolean.class ? 1 : 0;
+                String n;
+                try {
+                    n = m.getName();
+                } catch (Throwable t) {
+                    return -20;
+                }
+                int params;
+                try {
+                    params = m.getParameterCount();
+                } catch (Throwable t) {
+                    return -30;
+                }
+                if ("next".equals(n) && params == 0) {
+                    try {
+                        return m.getReturnType() == boolean.class ? 1 : -3;
+                    } catch (Throwable t) {
+                        return -40;
+                    }
                 }
             }
-            return c.getName().equals("java.sql.ResultSet") ? 1 : 0;
+            return c.getName().equals("java.sql.ResultSet") ? 1 : -4;
         } catch (Throwable t) {
-            return 0;
+            return -100;
         }
     }
 
