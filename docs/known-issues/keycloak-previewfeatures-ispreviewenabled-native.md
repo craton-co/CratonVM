@@ -5,18 +5,18 @@
 Open CratonVM bug. Reproduced on 2026-07-03 on the Azure host
 `victor@20.84.156.31`, remote worktree
 `/home/victor/wt-keycloak-azure-nonpassed-20260703-01`, branch
-`codex/keycloak-azure-nonpassed-20260703-01`, dev base `6dacc944f`.
+`codex/keycloak-azure-nonpassed-20260703-01`, branch head `819948842`.
 
 ## Symptom
 
 A rerun of the 1044 Keycloak classes that were non-passing in the prior
 `others` run completed with 1044 crashes and no passes/failures:
 
-- Run name: `craton-azure-nonpassed-dev-20260703-03`
+- Run name: `craton-azure-nonpassed-dev-20260703-04`
 - Mode: `others-jit`, `-Vm craton`, `-Jit on`
 - CratonVM binary: `target/release/cratonvm-keycloak-azure-nonpassed-20260703-01`
-- Results: `apps/keycloak-suite-runner/.suite/results/craton-azure-nonpassed-dev-20260703-03/others-jit/results.tsv`
-- Summary: `apps/keycloak-suite-runner/.suite/results/craton-azure-nonpassed-dev-20260703-03/others-jit/summary.md`
+- Results: `apps/keycloak-suite-runner/.suite/results/craton-azure-nonpassed-dev-20260703-04/others-jit/results.tsv`
+- Summary: `apps/keycloak-suite-runner/.suite/results/craton-azure-nonpassed-dev-20260703-04/others-jit/summary.md`
 
 Status count:
 
@@ -139,5 +139,7 @@ not be counted as CratonVM suite bugs:
 - CratonVM did not load `KcRunner` through the pathing-JAR manifest classpath,
   so the runner now uses direct `-cp` on non-Windows systems.
 
-The valid run above is `craton-azure-nonpassed-dev-20260703-03`; earlier runs
-`01` and `02` are invalid setup attempts and should be ignored.
+The final evidence run above is `craton-azure-nonpassed-dev-20260703-04`.
+Earlier runs `01` and `02` are invalid setup attempts and should be ignored.
+Run `03` was the first valid run and produced the same 1044-crash breakdown,
+but run `04` is the fresh rerun after fixing the local doc link.
