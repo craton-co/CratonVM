@@ -10503,6 +10503,20 @@ pub(crate) fn pbkdf2_prf_code(alg: &str) -> Option<i32> {
     }
 }
 
+/// Crate-visible PBKDF2 entry point (dispatches to the right 64-byte-block
+/// PRF by [`pbkdf2_prf_code`] code) for callers outside this module — used by
+/// `jca::cipher`'s PBES2 (`PBEWithHmacSHA*AndAES_*`) key derivation, which
+/// needs the same math `pbkdf2_generate_secret` already does but driven from
+/// a `Cipher.init(..., AlgorithmParameters)` call instead of a
+/// `SecretKeyFactory.generateSecret(PBEKeySpec)` call.
+pub(crate) fn pbkdf2_derive_for(prf: i32, pw: &[u8], salt: &[u8], iters: u32, dklen: usize) -> Vec<u8> {
+    match prf {
+        1 => pbkdf2_derive::<sha1::Sha1>(pw, salt, iters, dklen),
+        224 => pbkdf2_derive::<sha2::Sha224>(pw, salt, iters, dklen),
+        _ => pbkdf2_derive::<sha2::Sha256>(pw, salt, iters, dklen),
+    }
+}
+
 /// Opt-in gate for the native PKCS#5 v1.5 PBE `SecretKeyFactory` family
 /// (`PBEWith*`, e.g. `PBEWithMD5AndDES`). Default-OFF: when unset, every
 /// non-PBKDF2 `SecretKeyFactory.getInstance` keeps throwing the same
@@ -10548,7 +10562,20 @@ fn is_pbe_keyfactory_alg(alg: &str) -> bool {
 fn is_known_pbe_keyfactory_alg(alg: &str) -> bool {
     matches!(
         alg,
-        "PBEWithMD5AndDES"
+        // Bare "PBE" — the literal algorithm name `PKCS12KeyStore.getPBEKey`
+        // requests via `SecretKeyFactory.getInstance("PBE")` to derive the
+        // keystore's HMAC integrity-check key (see `PKCS12KeyStore.java`
+        // bytecode: `ldc "PBE"` right before the `getInstance` call). SunJCE
+        // registers this as an alias resolving to the same `PBEKeyFactory`
+        // family (password-bytes, no derivation) as `PBEWithMD5AndDES` etc.
+        // Without it, `KeyStore.setKeyEntry`/`.load` on ANY PKCS12 keystore
+        // (the JDK default keystore type) throws
+        // `IOException("getSecretKey failed: PBE SecretKeyFactory not
+        // available")` from `getPBEKey` — hit while building a test
+        // `SSLContext` from a JKS/PKCS12 truststore+keystore
+        // (`RestClientBuilderIntegTests`).
+        "PBE"
+            | "PBEWithMD5AndDES"
             | "PBEWithMD5AndTripleDES"
             | "PBEWithSHA1AndDESede"
             | "PBEWithSHA1AndRC2_40"
