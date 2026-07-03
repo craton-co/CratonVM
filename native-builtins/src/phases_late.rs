@@ -45534,11 +45534,26 @@ fn introspector_get_bean_info(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     // Class.getMethods() (all public methods incl. inherited interface methods);
     // the old code walked only `superclass_of` and missed default-method props
     // (jakarta.el.TestBeanELResolver.testGetDefaultValue: property `valueC`).
+    // G2-fix parity (see `collect_public_methods` in lang_class.rs): every
+    // interface's constant-pool `super_class` entry points at
+    // `java/lang/Object` per JVMS, but interfaces do NOT semantically inherit
+    // from Object. Walking `superclass_of` unconditionally here pulled
+    // Object's declared methods (including `getClass`) into the scan for any
+    // interface target, which then synthesized a spurious "class" property
+    // below on top of the *explicit* one — HotSpot's Introspector does not
+    // add "class" (or any Object member) when introspecting a bare interface
+    // (PropertyDescriptorUtilsPropertyResolutionTests.
+    // determineBasicPropertiesWithUnresolvedGenericsInInterface). Only walk
+    // the superclass chain for non-interface classes.
     let mut scan_cids: Vec<cratonvm_types::ClassId> = Vec::new();
     let mut sc = Some(class_id);
     while let Some(cid) = sc {
         scan_cids.push(cid);
-        sc = ctx.superclass_of(cid);
+        sc = if ctx.is_interface_class(cid) {
+            None
+        } else {
+            ctx.superclass_of(cid)
+        };
     }
     {
         let mut seen_if: std::collections::HashSet<cratonvm_types::ClassId> =
@@ -45759,8 +45774,13 @@ fn introspector_get_bean_info(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
 
     // Always include the synthetic "class" property (java.beans includes it
     // because every Object has `getClass()`). Spring's reflection caches key
-    // off PD presence, so omitting it can mislead callers.
-    if !properties.iter().any(|(n, ..)| n == "class") {
+    // off PD presence, so omitting it can mislead callers. EXCEPT for
+    // interfaces: `getClass()` is inherited from Object, not the interface
+    // itself, and HotSpot's Introspector does not surface it (or any other
+    // Object member) when introspecting a bare interface type — see the
+    // `is_interface_class` gate on `scan_cids` above for the matching
+    // rationale.
+    if !ctx.is_interface_class(class_id) && !properties.iter().any(|(n, ..)| n == "class") {
         let class_class_mirror = match ctx.ensure_class_initialized("java/lang/Class") {
             Ok(cid) => ctx.get_class_mirror(cid),
             Err(_) => class_mirror,
