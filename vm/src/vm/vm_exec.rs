@@ -27,6 +27,43 @@ use super::SharedVm;
 use crate::classloading::ClassStore;
 use crate::native::registry::NativeCallback;
 
+/// DBG (CRATONVM_DBG_WATCHREF, extended): RandomizedContext WeakHashMap
+/// residual investigation — logs a `[watchref]` line ONLY when a given
+/// thread's OWN `Thread.currentThread()` mirror address or identity hash
+/// code CHANGES from what was last observed for that `ThreadId`. A change
+/// here would mean a `WeakHashMap<Thread,...>` keyed on an earlier snapshot
+/// of `Thread.currentThread()` could no longer find its own entry — either
+/// because the mirror's ADDRESS moved without the map's cached hash bucket
+/// being consulted correctly, or because the STAMPED identity hash
+/// (assigned once at allocation via `next_hash()`, expected to be preserved
+/// verbatim across every GC relocation path) was not actually preserved.
+/// Silent under normal operation (dedup keyed by thread_id, so a stable
+/// thread logs at most once).
+fn debug_log_thread_mirror_identity(shared: &SharedVm, thread_id: u64, obj: ObjectRef) {
+    use std::sync::OnceLock;
+    static SEEN: OnceLock<parking_lot::Mutex<std::collections::HashMap<u64, (usize, i32)>>> =
+        OnceLock::new();
+    let hash = shared.heap.identity_hash_code(obj);
+    let addr = obj.as_ptr() as usize;
+    let map = SEEN.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
+    let mut m = map.lock();
+    match m.get(&thread_id) {
+        Some(&(prev_addr, prev_hash)) if prev_addr == addr && prev_hash == hash => {}
+        Some(&(prev_addr, prev_hash)) => {
+            eprintln!(
+                "[watchref] THREAD MIRROR IDENTITY CHANGED tid={thread_id} addr=0x{prev_addr:x}->0x{addr:x} hash={prev_hash}->{hash}"
+            );
+            m.insert(thread_id, (addr, hash));
+        }
+        None => {
+            eprintln!(
+                "[watchref] thread mirror first-seen tid={thread_id} addr=0x{addr:x} hash={hash}"
+            );
+            m.insert(thread_id, (addr, hash));
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // CP-resolved-interface plumbing for the default-method rescue
 // ---------------------------------------------------------------------------
@@ -1207,6 +1244,14 @@ impl<'a> NativeContextImpl<'a> {
     /// roots without heap validation (its file is restricted from edits), and
     /// the resulting bogus addresses crash the GC at the next mark/move.
     pub(crate) fn deposit_root_snapshot(&self) {
+        // fork6 GC_STRESS fix — flush this thread's SATB buffer before it
+        // blocks. A concurrent old-gen remark drains only the GLOBAL queue;
+        // a thread that logged pre-barrier entries (overwritten refs during
+        // the concurrent-mark phase) and then parked would otherwise keep up
+        // to ~256 entries invisible in its thread-local buffer for the whole
+        // blocked duration, and the sweep would free those still-live
+        // targets. Cheap no-op whenever no marking cycle is active.
+        self.shared.heap.flush_thread_satb();
         // Throttle-hang fix (ConcurrencyThrottleInterceptorTests, 2026-07-02):
         // this deposit is a GC-AUTHORITATIVE root publish — it is the ONLY view
         // a cross-thread STW collector has of this thread's roots for as long
@@ -2428,12 +2473,19 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                     let (cb_addr, culprit) = CURRENT_NATIVE_STACK
                         .with(|s| s.borrow().last().cloned())
                         .unwrap_or((0, "<unknown>".to_string()));
+                    // RVA is a Windows-debugging convenience (module-relative
+                    // address is easier to correlate with a .pdb/disassembly);
+                    // `GetModuleHandleW` doesn't exist on other platforms, so
+                    // fall back to reporting the raw (module_base=0) address.
+                    #[cfg(windows)]
                     let module_base = unsafe {
                         extern "system" {
                             fn GetModuleHandleW(name: *const u16) -> *mut core::ffi::c_void;
                         }
                         GetModuleHandleW(core::ptr::null()) as usize
                     };
+                    #[cfg(not(windows))]
+                    let module_base: usize = 0;
                     let rva = cb_addr.wrapping_sub(module_base);
                     eprintln!(
                         "[straystack-native] #{k} STRAY ctx.set_field recv@0x{:x} cid={} num_slots={} kind={} idx={} value={:?} CULPRIT-NATIVE={} RVA=0x{:X}",
@@ -4296,6 +4348,9 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
 
     fn current_thread_object(&mut self) -> ObjectRef {
         if let Some(obj) = self.thread.java_thread_obj {
+            if std::env::var_os("CRATONVM_DBG_WATCHREF").is_some() {
+                debug_log_thread_mirror_identity(self.shared, self.thread.thread_id.0, obj);
+            }
             return obj;
         }
         // Use the real java/lang/Thread class ID so virtual dispatch works.
@@ -11902,8 +11957,17 @@ fn invoke_on_class_shared_inner(
                         || class_name.starts_with("java/lang/invoke/MethodHandle")
                         || (class_name.starts_with("java/lang/invoke/")
                             && class_name.contains("MethodHandle"));
+                    // Recognise any java/lang/invoke class carrying "VarHandle" in
+                    // its name, not just ones literally prefixed "VarHandle" — the
+                    // JEP 454 FFM API's `SegmentVarHandle` (used by
+                    // `MemorySegment.get/set`) is a top-level class that does NOT
+                    // share that prefix, and previously fell through to normal
+                    // method resolution and threw NoSuchMethodError. Mirrors the
+                    // analogous `is_mh` broadening above.
                     let is_vh = class_name == "java/lang/invoke/VarHandle"
-                        || class_name.starts_with("java/lang/invoke/VarHandle");
+                        || class_name.starts_with("java/lang/invoke/VarHandle")
+                        || (class_name.starts_with("java/lang/invoke/")
+                            && class_name.contains("VarHandle"));
                     if is_mh || is_vh {
                         let base = if is_mh {
                             "java/lang/invoke/MethodHandle"

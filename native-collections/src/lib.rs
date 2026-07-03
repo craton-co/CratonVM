@@ -8812,6 +8812,24 @@ fn sort_with_comparator(
         ctx.set_array_element(data, out, val);
     }
     ctx.unpin_native_roots(data_pin);
+    // Detach from `Map.values()` live-view semantics. Real `Map.values()`'s
+    // return type doesn't implement `List` (no `.sort()` possible on it at
+    // all on HotSpot) — reaching this native means whatever called
+    // sort()/Collections.sort() already treated this object as a plain,
+    // independent `List`, e.g. `DefaultListableBeanFactory
+    // .resolveMultipleBeanCollection`'s `@Order`-based `List<T>` autowiring,
+    // which builds the list from `matchingBeans.values()`. Left unfixed, the
+    // very next `iterator()`/`toString()`-adjacent call sees the live-view
+    // marker (`values_view_source`) still present and silently discards the
+    // sort by resyncing from the ORIGINAL (unsorted) backing map — exactly
+    // what broke `Spr11310Tests`/`Spr12636Tests`. Mirrors the same
+    // null-the-marker fix already applied to `native_al_retain_all`.
+    if values_view_source(ctx, list).is_some() {
+        let dlen = ctx.array_length(data) as usize;
+        if dlen > 0 {
+            ctx.set_array_element(data, dlen - 1, Value::Object(None));
+        }
+    }
     Ok(None)
 }
 
@@ -16219,6 +16237,28 @@ fn hashmap_table_size_for(cap: i32) -> i32 {
     n |= n >> 8;
     n |= n >> 16;
     if (n as i64) + 1 >= (1i64 << 30) {
+        1 << 30
+    } else {
+        (n + 1) as i32
+    }
+}
+
+/// `u64`-domain sibling of [`hashmap_table_size_for`] for callers (like the
+/// `ConcurrentHashMap(int)` constructor) that pre-inflate the requested
+/// capacity by more than 2x and could otherwise overflow `i32` before the
+/// `tableSizeFor` cap kicks in. Same JDK `MAXIMUM_CAPACITY` (1<<30) ceiling.
+fn hashmap_table_size_for_u64(cap: u64) -> i32 {
+    if cap <= 1 {
+        return 1;
+    }
+    let mut n = cap - 1;
+    n |= n >> 1;
+    n |= n >> 2;
+    n |= n >> 4;
+    n |= n >> 8;
+    n |= n >> 16;
+    n |= n >> 32;
+    if n + 1 >= (1u64 << 30) {
         1 << 30
     } else {
         (n + 1) as i32
@@ -26916,7 +26956,57 @@ fn chm_all_segments(ctx: &dyn NativeContext, this: ObjectRef) -> Vec<ObjectRef> 
     result
 }
 
-/// Collect all entries from all segments.
+/// Compute the total live bucket capacity across all segments — the sum of
+/// each segment's own bucket-array length. Used as a proxy for "what a real
+/// flat-table JDK `ConcurrentHashMap` would currently be sized to", so that
+/// `chm_virtual_bucket` can reorder entries to match HotSpot's single-table
+/// iteration order (see `chm_reorder_by_virtual_bucket`).
+fn chm_total_capacity(ctx: &dyn NativeContext, this: ObjectRef) -> usize {
+    let mut total = 0usize;
+    for seg in chm_all_segments(ctx, this) {
+        let (_buckets, _size, cap) = map_state(ctx, seg);
+        total += cap.max(0) as usize;
+    }
+    total.max(1)
+}
+
+/// Reorder entries collected from CratonVM's segmented storage (iterated
+/// segment-major, bucket-minor) into the order a real flat-table JDK
+/// `ConcurrentHashMap` would yield them in (bucket-major over a single
+/// table sized to the map's current total capacity).
+///
+/// CratonVM's `ConcurrentHashMap` is backed by `CHM_DEFAULT_SEGMENTS` (16)
+/// independently-hashed+resized bucket tables rather than the one flat table
+/// real JDK uses, so a segment-major walk visits entries in a fundamentally
+/// different order than `aliasMap.forEach` on HotSpot. Callers that only
+/// care about *membership* (the overwhelming majority) are unaffected, but
+/// order-sensitive callers — notably `SimpleAliasRegistry.retrieveAliases`
+/// (`aliasMap.forEach`), which feeds `getAliases()`'s returned array order —
+/// broke `XmlBeanDefinitionReaderTests`/`XmlBeanFactoryTests`'
+/// `containsExactly("myalias", "youralias")` assertions.
+///
+/// Since every bucket node already stores its full (spread) hash
+/// (`NODE_FIELD_HASH`), and `native_chm_init_capacity` now sizes the total
+/// bucket count to match real JDK's `tableSizeFor` formula, we can recover
+/// HotSpot's order by a *stable* sort keyed on `hash & (total_capacity - 1)`
+/// — the bucket index a flat table of that size would use. Ties (distinct
+/// CratonVM segments/buckets that alias to the same virtual bucket) keep
+/// their relative collection order, which is the best available
+/// approximation of JDK's intra-bucket chain order without also replicating
+/// its incremental resize-and-split history exactly.
+fn chm_reorder_by_virtual_bucket<T>(
+    ctx: &dyn NativeContext,
+    this: ObjectRef,
+    mut items: Vec<(i32, T)>,
+) -> Vec<T> {
+    let total_cap = chm_total_capacity(ctx, this).next_power_of_two().max(1);
+    let mask = (total_cap - 1) as u32;
+    items.sort_by_key(|(hash, _)| (*hash as u32) & mask);
+    items.into_iter().map(|(_, v)| v).collect()
+}
+
+/// Collect all entries from all segments, reordered to match real JDK
+/// `ConcurrentHashMap` iteration order (see `chm_reorder_by_virtual_bucket`).
 fn chm_collect_all_entries(ctx: &dyn NativeContext, this: ObjectRef) -> Vec<(Value, Value)> {
     // Walk each segment's bucket table DIRECTLY (via `map_state` +
     // `get_node_key`/`get_node_value`), symmetrically with
@@ -26939,18 +27029,23 @@ fn chm_collect_all_entries(ctx: &dyn NativeContext, this: ObjectRef) -> Vec<(Val
             for i in 0..(cap as usize) {
                 let mut node_val = ctx.get_array_element(b, i);
                 while let Value::Object(Some(node)) = node_val {
+                    let hash = match ctx.get_field(node, NODE_FIELD_HASH) {
+                        Value::Int(h) => h,
+                        _ => 0,
+                    };
                     let key = get_node_key(ctx, node);
                     let value = get_node_value(ctx, node);
-                    entries.push((key, value));
+                    entries.push((hash, (key, value)));
                     node_val = ctx.get_field(node, NODE_FIELD_NEXT);
                 }
             }
         }
     }
-    entries
+    chm_reorder_by_virtual_bucket(ctx, this, entries)
 }
 
-/// Collect all keys from all segments.
+/// Collect all keys from all segments, reordered to match real JDK
+/// `ConcurrentHashMap` iteration order (see `chm_reorder_by_virtual_bucket`).
 ///
 /// Uses the layout-aware `get_node_key` helper rather than a hardcoded
 /// `NODE_FIELD_KEY` slot: CHM segment bucket nodes can use either the legacy
@@ -26970,16 +27065,21 @@ fn chm_collect_all_keys(ctx: &dyn NativeContext, this: ObjectRef) -> Vec<Value> 
             for i in 0..(cap as usize) {
                 let mut node_val = ctx.get_array_element(b, i);
                 while let Value::Object(Some(node)) = node_val {
-                    keys.push(get_node_key(ctx, node));
+                    let hash = match ctx.get_field(node, NODE_FIELD_HASH) {
+                        Value::Int(h) => h,
+                        _ => 0,
+                    };
+                    keys.push((hash, get_node_key(ctx, node)));
                     node_val = ctx.get_field(node, NODE_FIELD_NEXT);
                 }
             }
         }
     }
-    keys
+    chm_reorder_by_virtual_bucket(ctx, this, keys)
 }
 
-/// Collect all values from all segments.
+/// Collect all values from all segments, reordered to match real JDK
+/// `ConcurrentHashMap` iteration order (see `chm_reorder_by_virtual_bucket`).
 ///
 /// See `chm_collect_all_keys` — uses the layout-aware `get_node_value` helper
 /// so JDK-layout bucket nodes (hash@0,key@1,val@2) are read correctly.
@@ -26991,13 +27091,17 @@ fn chm_collect_all_values(ctx: &dyn NativeContext, this: ObjectRef) -> Vec<Value
             for i in 0..(cap as usize) {
                 let mut node_val = ctx.get_array_element(b, i);
                 while let Value::Object(Some(node)) = node_val {
-                    vals.push(get_node_value(ctx, node));
+                    let hash = match ctx.get_field(node, NODE_FIELD_HASH) {
+                        Value::Int(h) => h,
+                        _ => 0,
+                    };
+                    vals.push((hash, get_node_value(ctx, node)));
                     node_val = ctx.get_field(node, NODE_FIELD_NEXT);
                 }
             }
         }
     }
-    vals
+    chm_reorder_by_virtual_bucket(ctx, this, vals)
 }
 
 /// Initialize a CHM with segments.
@@ -27395,12 +27499,24 @@ fn native_chm_init_capacity(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         Some(Value::Int(v)) => (*v).max(1) as usize,
         _ => CHM_DEFAULT_SEGMENTS * CHM_DEFAULT_SEGMENT_CAP,
     };
-    // Bug 4: same load-factor adjustment as `native_map_init_capacity`.
-    // CHM's documented default load factor is also 0.75, so inflate the
-    // requested capacity by 4/3 before splitting across segments so the
-    // total bucket count actually accommodates the caller's hint without
-    // an immediate resize.
-    let adjusted_total = (total_cap as u64).saturating_mul(4).div_ceil(3) as usize;
+    // Match real JDK `ConcurrentHashMap(int initialCapacity)` exactly:
+    //   cap = tableSizeFor(initialCapacity + (initialCapacity >>> 1) + 1)
+    // i.e. inflate by 1.5x + 1 (NOT the naive 4/3 used previously), then
+    // round up to a power of two. The previous `ceil(cap*4/3)` formula
+    // undershot real JDK's table size (e.g. requested 16 -> adjusted 22 ->
+    // /16 segments -> cap_per_seg 1 -> total buckets 16, whereas real JDK
+    // sizes `new ConcurrentHashMap<>(16)`'s table to 32 buckets: 16 + 8 + 1
+    // = 25 -> tableSizeFor(25) = 32). The mismatched total bucket count
+    // shifted every key's virtual JDK-table bucket index, which broke
+    // `SimpleAliasRegistry.getAliases()` (backed by a `ConcurrentHashMap<>(16)`)
+    // — its `aliasMap.forEach` iteration order no longer matched HotSpot's,
+    // so `XmlBeanDefinitionReaderTests`/`XmlBeanFactoryTests`'
+    // `containsExactly("myalias", "youralias")` assertions failed.
+    let total_cap_u64 = total_cap as u64;
+    let jdk_adjusted = total_cap_u64
+        .saturating_add(total_cap_u64 >> 1)
+        .saturating_add(1);
+    let adjusted_total = hashmap_table_size_for_u64(jdk_adjusted) as usize;
     let cap_per_seg = (adjusted_total / CHM_DEFAULT_SEGMENTS)
         .max(1)
         .next_power_of_two();
@@ -30899,7 +31015,31 @@ fn native_collections_disjoint(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     Ok(Some(Value::Int(1)))
 }
 
-fn native_collections_max(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+/// `Collections.max(Collection)` / `Collections.min(Collection)` share this
+/// natural-ordering scan: pick element 0, then walk the rest comparing via
+/// `Comparable.compareTo` (the real JDK contract — `max`/`min` are literally
+/// specified in terms of `compareTo`), replacing the running candidate when
+/// `cmp() > 0` (max) or `cmp() < 0` (min). Ties keep the earliest element,
+/// matching `Collections.max`/`min`'s documented "first of equal maximums"
+/// behavior.
+///
+/// The previous implementation compared `val_to_string(elem)` — i.e. each
+/// element's `read_string()` decode — which only means something for actual
+/// `java.lang.String` elements. For any other `Comparable` (e.g. a
+/// `DeadNode`/custom class), `read_string` returns `None` for a non-String
+/// object, so every element degraded to the same empty string and the `>`/`<`
+/// comparison was *always false* — silently returning element 0 regardless of
+/// true ordering. That produced a deterministic-but-wrong "minimum" for
+/// `RestClient.selectNodes`'s `Collections.min(selectedDeadNodes)` dead-host
+/// revival pick, always resurrecting the first-registered host instead of the
+/// one with the lowest `deadUntilNanos` (RestClientMultipleHostsTests.
+/// testRoundRobinRetryErrors: "host [...] not found, most likely used
+/// multiple times").
+fn native_collections_extreme(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    want_max: bool,
+) -> MethodCallResult {
     let coll = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
@@ -30910,54 +31050,30 @@ fn native_collections_max(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         None => return Ok(Some(Value::Object(None))),
     };
     if size == 0 {
-        return Ok(Some(Value::Object(None)));
+        return Err(
+            cratonvm_types::error::RuntimeError::NoSuchElementException {
+                message: String::new(),
+            }
+            .into(),
+        );
     }
-    let mut max_val = ctx.get_array_element(data, 0);
-    let mut max_str = val_to_string(ctx, &max_val);
+    let mut best = ctx.get_array_element(data, 0);
     for i in 1..size as usize {
         let elem = ctx.get_array_element(data, i);
-        let s = val_to_string(ctx, &elem);
-        if s > max_str {
-            max_val = elem;
-            max_str = s;
+        let cmp = compare_via_compare_to(ctx, &elem, &best)?;
+        if (want_max && cmp > 0) || (!want_max && cmp < 0) {
+            best = elem;
         }
     }
-    Ok(Some(max_val))
+    Ok(Some(best))
+}
+
+fn native_collections_max(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    native_collections_extreme(ctx, args, true)
 }
 
 fn native_collections_min(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let coll = match args.first() {
-        Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(Some(Value::Object(None))),
-    };
-    let (data, size) = al_state(ctx, coll);
-    let data = match data {
-        Some(d) => d,
-        None => return Ok(Some(Value::Object(None))),
-    };
-    if size == 0 {
-        return Ok(Some(Value::Object(None)));
-    }
-    let mut min_val = ctx.get_array_element(data, 0);
-    let mut min_str = val_to_string(ctx, &min_val);
-    for i in 1..size as usize {
-        let elem = ctx.get_array_element(data, i);
-        let s = val_to_string(ctx, &elem);
-        if s < min_str {
-            min_val = elem;
-            min_str = s;
-        }
-    }
-    Ok(Some(min_val))
-}
-
-fn val_to_string(ctx: &mut dyn NativeContext, val: &Value) -> String {
-    match val {
-        Value::Object(Some(o)) => ctx.read_string(*o).unwrap_or_default(),
-        Value::Int(v) => v.to_string(),
-        Value::Long(v) => v.to_string(),
-        _ => String::new(),
-    }
+    native_collections_extreme(ctx, args, false)
 }
 
 fn native_collections_swap(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {

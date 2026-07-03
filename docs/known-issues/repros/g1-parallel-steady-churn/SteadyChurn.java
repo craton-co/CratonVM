@@ -52,10 +52,13 @@ public final class SteadyChurn {
 
         Node head = new Node(0);
         Node tail = head;
+        // Temp-free on purpose — see SteadyChurnLight.java: a construction
+        // temp here becomes a stale scoped-out local slot that CratonVM's
+        // liveness-imprecise interpreter roots retain for main's lifetime,
+        // anchoring the entire appended chain (unbounded retention).
         for (int i = 1; i < LIVE; i++) {
-            Node node = new Node(i);
-            tail.next = node;
-            tail = node;
+            tail.next = new Node(i);
+            tail = tail.next;
         }
 
         long churn = 0;

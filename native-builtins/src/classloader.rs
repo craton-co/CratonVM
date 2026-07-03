@@ -945,23 +945,44 @@ pub(crate) fn find_loaded_class_for_loader(
 ) -> Option<ObjectRef> {
     if !is_user_defined_loader(ctx, this) {
         return ctx.class_id_by_name(internal_name).and_then(|cid| {
+            // A generated proxy is checked via `proxy_hidden_from` — loader-identity
+            // and delegation aware — REGARDLESS of `loader_id_of_class(cid)`. Proxy
+            // classes get a fresh per-generation internal loader/module id (e.g. the
+            // `jdk/proxy1/…` numbering) even when their defining loader is a
+            // BUILT-IN loader (the application loader itself), so `loader_id_of_class`
+            // is > 2 for a proxy the app loader legitimately just defined. Running the
+            // blanket "> 2 -> hide" check first (as before) hid every generated proxy
+            // from `findLoadedClass`/`Class.forName(name, false, loader)` even when
+            // `this` WAS the recorded defining loader: a fresh `Class.forName` on a
+            // proxy class the app loader had itself just created via
+            // `Proxy.newProxyInstance` reported it as not found, throwing
+            // ClassNotFoundException. That broke AspectJ's reflection-based pointcut
+            // matching, which resolves a scratch composite-interface proxy class by
+            // name via `Class.forName` to inspect its superclass: the lookup failure
+            // surfaced as `ReflectionWorldException: can't determine superclass of
+            // missing type jdk.proxyN.$ProxyM`, silently dropping the advisor
+            // (Spring's `AspectJExpressionPointcut` catches the exception and falls
+            // back to a "never matches" verdict) — reproduced by Spring's
+            // `AspectJAutoProxyCreatorTests` (an `@Around` advice on an inherited
+            // default interface method never fired).
+            if is_generated_proxy_name(internal_name) {
+                if proxy_hidden_from(ctx, this, internal_name, cid) {
+                    return None;
+                }
+                return Some(ctx.get_class_mirror(cid));
+            }
             // JVMS §5.3: a built-in loader (bootstrap/platform/app) never counts
             // as having loaded a class that a *user-defined* loader defined.
             // CratonVM's flat global store would otherwise let the app loader
-            // report a child loader's generated proxy as "already loaded" — and
-            // since `loadClass` delegates parent-first, a sibling custom loader
-            // then resolves it too (`ClassUtilsTests.isCacheSafe`:
-            // `child2.loadClass` of child1's `jdk.proxy1.$Proxy0`).
+            // report a child loader's class as "already loaded" — and since
+            // `loadClass` delegates parent-first, a sibling custom loader then
+            // resolves it too (`ClassUtilsTests.isCacheSafe`).
             //
             // Actual user-loader namespace hits are not visible to built-in
             // loaders. Application-namespace classes that merely record a
             // user-defined defining loader still keep their app-loader
             // visibility below.
             if ctx.loader_id_of_class(cid) > 2 {
-                return None;
-            }
-            if is_generated_proxy_name(internal_name) && defining_loader_for(cid.as_u32()).is_some()
-            {
                 return None;
             }
             Some(ctx.get_class_mirror(cid))

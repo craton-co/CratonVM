@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2024-2026 Craton Software Company
 
+#![cfg(feature = "synthetic-jdk")]
+// These tests exercise the legacy synthetic JDK native surface. The default VM
+// build is real-JDK mode and intentionally does not compile those natives.
+
 //! I/O bootstrap tests (Session 12).
 //!
 //! Tests cover: FileInputStream, FileOutputStream, BufferedReader,
@@ -8,6 +12,9 @@
 //! and the java.io class hierarchy.
 
 use cratonvm_vm::config::VmConfig;
+use cratonvm_vm::error::{MethodCallFailed, MethodCallResult};
+use cratonvm_vm::memory::ArrayElementType;
+use cratonvm_vm::types::ObjectRef;
 use cratonvm_vm::types::Value;
 use cratonvm_vm::vm::Vm;
 
@@ -26,6 +33,81 @@ fn test_vm() -> Vm {
     Vm::new(config)
 }
 
+fn read_test_java_string(vm: &Vm, obj: ObjectRef) -> Option<String> {
+    let heap = &vm.shared.heap;
+    let value_array = match heap.get_field(obj, 0) {
+        Value::Object(Some(arr)) => arr,
+        _ => return None,
+    };
+
+    match heap.array_element_type(value_array) {
+        Some(ArrayElementType::Byte) => {
+            let coder = match heap.get_field(obj, 1) {
+                Value::Int(value) => value,
+                _ => 0,
+            };
+            let bytes: Vec<u8> = (0..heap.array_length(value_array))
+                .filter_map(|i| match heap.get_array_element(value_array, i).ok()? {
+                    Value::Int(value) => Some(value as u8),
+                    _ => None,
+                })
+                .collect();
+            if coder == 1 {
+                let units: Vec<u16> = bytes
+                    .chunks_exact(2)
+                    .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+                    .collect();
+                Some(String::from_utf16_lossy(&units))
+            } else {
+                Some(bytes.into_iter().map(char::from).collect())
+            }
+        }
+        Some(ArrayElementType::Char) => {
+            let units: Vec<u16> = (0..heap.array_length(value_array))
+                .filter_map(|i| match heap.get_array_element(value_array, i).ok()? {
+                    Value::Int(value) => Some(value as u16),
+                    _ => None,
+                })
+                .collect();
+            Some(String::from_utf16_lossy(&units))
+        }
+        _ => None,
+    }
+}
+
+fn throwable_detail_message(vm: &Vm, exc: ObjectRef) -> Option<String> {
+    let class_id = vm.shared.heap.class_id_of(exc);
+    let msg_ref = vm
+        .instance_field_index(class_id, "detailMessage")
+        .and_then(|idx| match vm.shared.heap.get_field(exc, idx) {
+            Value::Object(Some(msg)) => Some(msg),
+            _ => None,
+        })?;
+    read_test_java_string(vm, msg_ref)
+}
+
+fn describe_result(vm: &Vm, result: &MethodCallResult) -> String {
+    match result {
+        Err(MethodCallFailed::ExceptionThrown(exc)) => {
+            let class_id = vm.shared.heap.class_id_of(*exc);
+            let class_name = vm
+                .shared
+                .class_manager
+                .read()
+                .get_class(class_id)
+                .map(|class| class.name.to_string())
+                .unwrap_or_else(|| format!("<unknown class {:?}>", class_id));
+            match throwable_detail_message(vm, *exc) {
+                Some(message) => {
+                    format!("Err(ExceptionThrown({class_name}: {message}, {exc:?}))")
+                }
+                None => format!("Err(ExceptionThrown({class_name}, {exc:?}))"),
+            }
+        }
+        other => format!("{other:?}"),
+    }
+}
+
 macro_rules! require_class_files {
     () => {
         if !class_files_available() {
@@ -42,7 +124,7 @@ fn invoke_expect_int(method: &str, expected: i32) {
         Ok(Some(Value::Int(v))) => {
             assert_eq!(v, expected, "{method} returned {v}, expected {expected}")
         }
-        other => panic!("{method} failed: {other:?}"),
+        other => panic!("{method} failed: {}", describe_result(&vm, &other)),
     }
 }
 

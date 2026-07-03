@@ -556,7 +556,15 @@ impl<'a> LocalVariableProvider for VmLocalVariableProvider<'a> {
             crate::types::Value::Long(v) => v,
             crate::types::Value::Float(v) => f32::to_bits(v) as i64,
             crate::types::Value::Double(v) => f64::to_bits(v) as i64,
-            crate::types::Value::Object(Some(r)) => r.as_ptr() as i64,
+            crate::types::Value::Object(Some(r)) => {
+                // Long-smuggle mint chokepoint: an agent reading an object
+                // local receives its raw address as i64 and may re-inject it
+                // (set_local) or hold it in Java-visible longs. Register the
+                // exact value (definitionally an object start) so the GC
+                // rewrite arm treats it as a genuine handle.
+                crate::memory::smuggled_longs::record_minted_long(r.as_ptr() as u64);
+                r.as_ptr() as i64
+            }
             crate::types::Value::Object(None) => 0,
             crate::types::Value::Uninitialized => return None,
             crate::types::Value::ReturnAddress(addr) => addr as i64,

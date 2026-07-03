@@ -931,6 +931,45 @@ fn seed_sunec_services() {
     }
 }
 
+/// Mirror the SunJCE PKCS#12 PBES2 `AlgorithmParameters` service table so
+/// `AlgorithmParameters.getInstance("PBEWithHmacSHA256AndAES_256")` (the
+/// default PKCS12 keystore entry-protection algorithm since JDK 8u+) resolves
+/// instead of dead-ending in "no AlgorithmParameters ... implementation in
+/// any provider". Without this, loading ANY password-protected PKCS12
+/// keystore entry (`KeyStore.setKeyEntry`/`KeyStore.load` on the default
+/// keystore type) throws that error, which happens on a NON-main JUnit
+/// worker thread for test fixtures like
+/// `RestClientBuilderIntegTests.getSslContext()` — surfacing not as a clean
+/// test failure but as the whole suite hanging (the uncaught native error
+/// escapes the worker thread without the usual Java exception unwinding the
+/// test framework's synchronization expects). Every subclass here has the
+/// no-arg public ctor JCA requires and is pure ASN.1/DER parsing (no native
+/// methods), verified via `javap` on JDK 25 (`com.sun.crypto.provider.
+/// PBES2Parameters$HmacSHA*AndAES_*`).
+fn seed_sunjce_pbe_services() {
+    const P: &str = "SunJCE";
+    const HASHES: &[&str] = &[
+        "SHA1",
+        "SHA224",
+        "SHA256",
+        "SHA384",
+        "SHA512",
+        "SHA512_224",
+        "SHA512_256",
+    ];
+    const KEYSIZES: &[&str] = &["128", "256"];
+    for hash in HASHES {
+        for keysize in KEYSIZES {
+            let algo = format!("PBEWithHmac{hash}AndAES_{keysize}");
+            // The nested class name drops the "PBEWith" prefix, e.g.
+            // `PBES2Parameters$HmacSHA256AndAES_256` (verified via `javap`),
+            // NOT `PBES2Parameters$PBEWithHmacSHA256AndAES_256`.
+            let cls = format!("com.sun.crypto.provider.PBES2Parameters$Hmac{hash}AndAES_{keysize}");
+            put_service(P, "AlgorithmParameters", &algo, &cls);
+        }
+    }
+}
+
 /// Mirror the real SunJSSE + SUN provider TLS service tables so that the
 /// no-provider `getInstance` search resolves the genuine JDK SPI classes for
 /// the TLS engines Tomcat's JSSE connector needs (`KeyManagerFactory`,
@@ -1866,6 +1905,10 @@ pub(crate) fn register(r: &mut NativeMethodRegistry) {
         // XMLSignatureFactory/KeyInfoFactory/TransformService.getInstance("DOM")
         // resolve the real DOM SPIs (keycloak SAML XMLSignatureUtil.<clinit>).
         seed_xmldsig_services();
+        // Mirror the SunJCE PKCS#12 PBES2 AlgorithmParameters service table so
+        // loading a password-protected PKCS12 keystore entry doesn't dead-end
+        // (RestClientBuilderIntegTests HTTPS suite-timeout).
+        seed_sunjce_pbe_services();
         let gi = "sun/security/jca/GetInstance";
         r.register(
             gi,

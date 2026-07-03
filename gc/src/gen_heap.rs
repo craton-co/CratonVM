@@ -182,6 +182,17 @@ pub static SWEEP_ZERO_SPAN_HITS: AtomicU64 = AtomicU64::new(0);
 /// instead of zeroed+freed.
 pub static SWEEP_BAD_FORWARD_HITS: AtomicU64 = AtomicU64::new(0);
 
+/// DoHead comb-7 fix (2026-07-03) — count of mark-phase candidates rejected
+/// because the header's claimed EXTENT (`gen_object_total_size`) does not fit
+/// inside its generation at that address. The per-field plausibility gate
+/// admits `array_length` up to i32::MAX, and the mark BFS scan iterates that
+/// count with the header as its only bound — a corrupt header (e.g. packed
+/// pointer bytes misparsed as `kind=Array, array_length=<pointer low 32>`) ran
+/// the scan tens of MB off the mapped arena (observed SIGSEGV at the region
+/// boundary). A real object's extent always fits inside the arena it was
+/// allocated from, so out-of-extent headers are rejected without marking.
+pub static SWEEP_BAD_EXTENT_HITS: AtomicU64 = AtomicU64::new(0);
+
 /// DoHead walk-desync hardening — count of selective-promotion UNWIND events:
 /// the evacuation walk saw a grid anomaly (zero span, implausible header,
 /// free-block overshoot, or a span crossing a free hole) and dropped the
@@ -192,6 +203,18 @@ pub static SWEEP_BAD_FORWARD_HITS: AtomicU64 = AtomicU64::new(0);
 /// verified stretches still promote, so a persistent unparseable span cannot
 /// starve promotion.
 pub static SWEEP_PROMOTION_ABORT_HITS: AtomicU64 = AtomicU64::new(0);
+
+/// DBG (CRATONVM_DBG_WATCHREF): trace the RandomizedContext WeakHashMap fix —
+/// which sweep path ran, which kept-in-place survivors matched a watched
+/// Weak/Soft/Phantom referent, and whether each was found alive or dead.
+/// Cached (checked once, not per-object-visited) so enabling it cannot itself
+/// perturb GC timing enough to mask/create the races it's meant to diagnose.
+#[inline]
+fn watchref_dbg() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| std::env::var_os("CRATONVM_DBG_WATCHREF").is_some())
+}
 
 /// DBG: optional young-GC stress threshold (bytes). Read from
 /// `CRATONVM_DBG_GC_STRESS`, or `CRATONVM_GC_STRESS` as an accepted alias
@@ -1673,6 +1696,18 @@ impl GenerationalHeap {
         // object's allocated region. `read_slot` reads a `Value` from that address.
         unsafe {
             let ptr = slot_ptr(obj_ref, index);
+            // gcstress residual face-1 diagnostics (CRATONVM_DBG_CELLCORRUPT):
+            // identify the HOLDER of a corrupt Value cell before `read_slot`
+            // masks it with a benign null. The holder's class/kind/layout — and
+            // whether the stale raw0 pointer lands in current young-from,
+            // young-to, old gen, or nowhere — discriminates the candidate
+            // mechanisms (8-vs-16-byte slot-layout confusion vs un-remapped
+            // holder after a moving young GC vs stale freed arena after grow).
+            if cell_corrupt_diag_enabled()
+                && cratonvm_types::read_value_checked(ptr as *const Value).is_none()
+            {
+                self.dump_corrupt_cell_holder(obj_ref, header, index, ptr);
+            }
             read_slot(ptr)
         }
     }
@@ -2171,6 +2206,30 @@ impl GenerationalHeap {
         }
         let header = self.get_header(obj_ref);
         debug_assert_eq!(header.kind, ObjectKind::Array);
+        // gcstress residual face-1 diagnostics (CRATONVM_DBG_CELLCORRUPT) —
+        // the debug_assert above is a no-op in release: an array-element
+        // write through a STALE array reference whose address is now occupied
+        // by a plain object would write a raw 8-byte pointer into the middle
+        // of that object's 16-byte Value cells (the observed {ptr, 0} corrupt
+        // cells). Trap it with the holder identity + backtrace. The bounds
+        // check below usually deflects such writes (a plain object has
+        // array_length=0), so this logs the attempt either way.
+        if cell_corrupt_diag_enabled() && header.kind != ObjectKind::Array {
+            let class_name = crate::gc::resolve_class_info(header.class_id.as_u32())
+                .map(|(n, _)| n)
+                .unwrap_or_else(|| "<unresolved>".to_string());
+            eprintln!(
+                "[CELLCORRUPT:set_array_element-on-NON-ARRAY] obj=0x{:x} class_id={} \
+                 class={class_name} kind=0x{:02x} num_slots={} array_len={} index={index} \
+                 value={value:?}\n{}",
+                obj_ref.as_ptr() as usize,
+                header.class_id.as_u32(),
+                header.kind as u8,
+                header.num_slots,
+                header.array_length,
+                std::backtrace::Backtrace::force_capture(),
+            );
+        }
         if index >= header.array_length as usize {
             return Err(index as i32);
         }
@@ -2692,6 +2751,11 @@ impl GenerationalHeap {
         let divert_non_moving = (has_conservative_roots && !moving_young_requested)
             || honor_promotion_oom_risk
             || divert_for_incomplete_moving_coverage;
+        if watchref_dbg() {
+            eprintln!(
+                "[watchref] collect_garbage_inner: has_conservative_roots={has_conservative_roots} moving_young_requested={moving_young_requested} divert_non_moving={divert_non_moving} force_moving={force_moving}"
+            );
+        }
         if divert_non_moving && (!force_moving || divert_for_incomplete_moving_coverage) {
             if divert_for_incomplete_moving_coverage {
                 let n = crate::gc_quiescence::record_moving_young_coverage_fallback();
@@ -3864,6 +3928,9 @@ impl GenerationalHeap {
         roots: &[ObjectRef],
         finalizer_addrs: &[usize],
     ) -> (GcResult, Vec<usize>) {
+        if watchref_dbg() {
+            eprintln!("[watchref] sweep_young_non_moving ENTRY (non-moving path taken)");
+        }
         let mut young_from = self.young_from.lock();
         let mut old_gen = self.old_gen.lock();
 
@@ -3936,6 +4003,50 @@ impl GenerationalHeap {
                 || (!is_array && header.num_slots > (1 << 24))
                 || (is_array && header.array_length > i32::MAX as u32)
             {
+                return;
+            }
+            // DoHead comb-7 fix (2026-07-03): also validate the object's
+            // EXTENT. The field bounds above still admit a corrupt header
+            // claiming millions of elements (array_length is only capped at
+            // i32::MAX), and the BFS scan (`for_each_ref_slot`) iterates
+            // that count with the header as its ONLY bound — a claimed
+            // extent past from-space ran the scan off the mapped arena
+            // (observed: main-vm SIGSEGV at the region boundary, corrupt
+            // header claiming array_length=7,775,429 — the JIT inline-alloc
+            // kind/array_length fault family). A real object's extent always
+            // fits inside the arena it was allocated from, so an
+            // out-of-extent header is definitionally corrupt: never mark or
+            // scan it (its "referents" would be garbage reads anyway).
+            let total = gen_object_total_size(header);
+            if total < HEADER_SIZE || addr + total > from_end {
+                let n = SWEEP_BAD_EXTENT_HITS.fetch_add(1, Ordering::Relaxed);
+                if n < 8 {
+                    // Attribution diagnostic: dump the words around the
+                    // rejected "header" so the upstream corruptor face is
+                    // identifiable (stale packed-pointer reuse shows heap
+                    // pointers; a clobbered real header shows a torn mix).
+                    let lo = addr.saturating_sub(32).max(from_base);
+                    let mut hex = String::new();
+                    let mut w = lo;
+                    while w + 8 <= (addr + 48).min(from_end) {
+                        // SAFETY: `[from_base, from_end)` is mapped arena
+                        // memory and `w` is 8-aligned within it.
+                        let v = unsafe { *((w & !7) as *const u64) };
+                        hex.push_str(&format!("{:#x}:{:016x} ", w & !7, v));
+                        w += 8;
+                    }
+                    tracing::warn!(
+                        "mark_young: rejecting object at {:#x} with implausible extent \
+                         {} (kind={}, array_len={}, num_slots={}) — corrupt header, \
+                         not marked/scanned; context {}",
+                        addr,
+                        total,
+                        kind_byte,
+                        header.array_length,
+                        header.num_slots,
+                        hex,
+                    );
+                }
                 return;
             }
             if header.gc_flags & GC_FLAG_MARKED == 0 {
@@ -4194,8 +4305,7 @@ impl GenerationalHeap {
                 }
                 while cursor < used && !old_full {
                     {
-                        let (resynced, overshot) =
-                            skip_free_blocks(&mut cursor, &mut free_iter);
+                        let (resynced, overshot) = skip_free_blocks(&mut cursor, &mut free_iter);
                         if overshot {
                             // The stride that crossed into the block was
                             // mis-sized: candidates since the last anchor are
@@ -4226,10 +4336,7 @@ impl GenerationalHeap {
                         // SAFETY: offset 4 lies within the >=8-byte gap.
                         let gap = unsafe { std::ptr::read((src as *const u8).add(4) as *const u32) }
                             as usize;
-                        if (8..HEADER_SIZE).contains(&gap)
-                            && gap & 7 == 0
-                            && cursor + gap <= used
-                        {
+                        if (8..HEADER_SIZE).contains(&gap) && gap & 7 == 0 && cursor + gap <= used {
                             cursor += gap;
                             continue;
                         }
@@ -4242,14 +4349,21 @@ impl GenerationalHeap {
                     let word0 = unsafe { *(src as *const u64) };
                     let mut anomaly = false;
                     if word0 == 0 {
-                        let limit =
-                            free_iter.peek().map(|&&(off, _)| off).unwrap_or(used).min(used);
+                        let limit = free_iter
+                            .peek()
+                            .map(|&&(off, _)| off)
+                            .unwrap_or(used)
+                            .min(used);
                         let run_end = zero_run_end(from_base, cursor, limit);
                         if run_end - cursor >= HEADER_SIZE {
                             anomaly = true;
                         }
                     }
-                    let total_size = if anomaly { 0 } else { gen_object_total_size(header) };
+                    let total_size = if anomaly {
+                        0
+                    } else {
+                        gen_object_total_size(header)
+                    };
                     if anomaly || total_size < HEADER_SIZE || cursor + total_size > used {
                         unwind_evac(
                             &mut fwd_installs,
@@ -4472,7 +4586,10 @@ impl GenerationalHeap {
                             let gap =
                                 unsafe { std::ptr::read((obj as *const u8).add(4) as *const u32) }
                                     as usize;
-                            if (8..HEADER_SIZE).contains(&gap) && gap & 7 == 0 && cursor + gap <= used {
+                            if (8..HEADER_SIZE).contains(&gap)
+                                && gap & 7 == 0
+                                && cursor + gap <= used
+                            {
                                 cursor += gap;
                                 continue;
                             }
@@ -4490,8 +4607,11 @@ impl GenerationalHeap {
                                 anomaly = true;
                             }
                         }
-                        let total_size =
-                            if anomaly { 0 } else { gen_object_total_size(header) };
+                        let total_size = if anomaly {
+                            0
+                        } else {
+                            gen_object_total_size(header)
+                        };
                         if anomaly || total_size < HEADER_SIZE || cursor + total_size > used {
                             let stretch_lo = cursor;
                             let resynced = resync_to_next_free_block(&mut cursor, &mut free_iter);
@@ -4948,7 +5068,11 @@ impl GenerationalHeap {
             // free-block anchor and resume on-grid there.
             let word0 = unsafe { *(obj_ptr as *const u64) };
             if word0 == 0 {
-                let limit = free_iter.peek().map(|&&(off, _)| off).unwrap_or(used).min(used);
+                let limit = free_iter
+                    .peek()
+                    .map(|&&(off, _)| off)
+                    .unwrap_or(used)
+                    .min(used);
                 let run_end = zero_run_end(from_base, cursor, limit);
                 if run_end - cursor >= HEADER_SIZE {
                     let n = SWEEP_ZERO_SPAN_HITS.fetch_add(1, Ordering::Relaxed);
@@ -5266,6 +5390,12 @@ impl GenerationalHeap {
                 // (or header corruption) — retain the span instead of zeroing
                 // and freeing what may be a live object's interior.
                 let fwd = header.forwarding_ptr;
+                if watchref_dbg() && crate::gc_quiescence::is_watched_referent(obj_ptr as usize) {
+                    eprintln!(
+                        "[watchref] non-moving sweep: watched address @0x{:x} was EVACUATED to old gen @{:p} (should already be in evac_map from selective promotion)",
+                        obj_ptr as usize, fwd
+                    );
+                }
                 if !old_gen.contains(fwd) {
                     let n = SWEEP_BAD_FORWARD_HITS.fetch_add(1, Ordering::Relaxed);
                     if n < 8 {
@@ -5292,7 +5422,30 @@ impl GenerationalHeap {
                 header.gc_flags &= !GC_FLAG_MARKED;
                 header.gc_age = header.gc_age.saturating_add(1);
                 objects_live += 1;
+                // RandomizedContext WeakHashMap<Thread,...> fix (see
+                // gc_quiescence::is_watched_referent): this survivor is kept
+                // in place at its ORIGINAL address, so selective promotion
+                // never gives it a `pointer_map` entry (nothing moved). If a
+                // live Weak/Soft/Phantom reference is currently watching this
+                // exact address, record an identity mapping so post-GC
+                // reference processing's `is_marked` check recognizes it as
+                // having survived instead of wrongly clearing the reference.
+                let addr = obj_ptr as usize;
+                if crate::gc_quiescence::is_watched_referent(addr) {
+                    if watchref_dbg() {
+                        eprintln!(
+                            "[watchref] non-moving sweep: watched survivor kept in place @0x{addr:x} — identity-mapped"
+                        );
+                    }
+                    evac_map.insert(addr, addr);
+                }
             } else {
+                if watchref_dbg() && crate::gc_quiescence::is_watched_referent(obj_ptr as usize) {
+                    eprintln!(
+                        "[watchref] non-moving sweep: watched address @0x{:x} was DEAD (unmarked) — zeroing",
+                        obj_ptr as usize
+                    );
+                }
                 // Dead: record the span for reclamation. Zeroing (so a later
                 // conservative root scan cannot resurrect a stale header
                 // inside the hole) and free-list publication are deferred to
@@ -5624,13 +5777,21 @@ impl GenerationalHeap {
             let word0 = unsafe { *(obj_ptr as *const u64) };
             let mut anomaly = false;
             if word0 == 0 {
-                let limit = free_iter.peek().map(|&&(off, _)| off).unwrap_or(used).min(used);
+                let limit = free_iter
+                    .peek()
+                    .map(|&&(off, _)| off)
+                    .unwrap_or(used)
+                    .min(used);
                 let run_end = zero_run_end(base, cursor, limit);
                 if run_end - cursor >= HEADER_SIZE {
                     anomaly = true;
                 }
             }
-            let total_size = if anomaly { 0 } else { gen_object_total_size(header) };
+            let total_size = if anomaly {
+                0
+            } else {
+                gen_object_total_size(header)
+            };
             if anomaly || total_size < HEADER_SIZE || cursor + total_size > used {
                 let stretch_lo = cursor;
                 let resynced = resync_to_next_free_block(&mut cursor, &mut free_iter);
@@ -5690,6 +5851,27 @@ impl GenerationalHeap {
     fn scan_object_for_old_refs(obj_ptr: *mut u8, old_gen: &OldGen, worklist: &mut Vec<*mut u8>) {
         // SAFETY: `obj_ptr` is a live old-gen object from the mark worklist; its header is valid.
         let header = unsafe { &*(obj_ptr as *const ObjectHeader) };
+        // DoHead comb-7 fix (2026-07-03): validate the claimed extent before
+        // scanning — the young-mark twin of this check caught a corrupt
+        // header whose `array_length` was pointer bytes; scanning that count
+        // of slots runs off the mapped region (SIGSEGV). An old object whose
+        // extent leaves old gen is definitionally corrupt: skip the scan.
+        let total = gen_object_total_size(header);
+        if total < HEADER_SIZE || !old_gen.contains(unsafe { obj_ptr.add(total - 1) }) {
+            let n = SWEEP_BAD_EXTENT_HITS.fetch_add(1, Ordering::Relaxed);
+            if n < 8 {
+                tracing::warn!(
+                    "old-gen mark: rejecting object at {:p} with implausible extent {} \
+                     (kind={}, array_len={}, num_slots={}) — corrupt header, not scanned",
+                    obj_ptr,
+                    total,
+                    header.kind as u8,
+                    header.array_length,
+                    header.num_slots,
+                );
+            }
+            return;
+        }
         // Mark every old-gen referent (arrays + compact objects: 8-byte pointers;
         // legacy objects: 16-byte Value cells).
         // SAFETY: `obj_ptr`/`header` are a valid live object.
@@ -5765,13 +5947,21 @@ impl GenerationalHeap {
             let word0 = unsafe { *(obj_ptr as *const u64) };
             let mut anomaly = false;
             if word0 == 0 {
-                let limit = free_iter.peek().map(|&&(off, _)| off).unwrap_or(used).min(used);
+                let limit = free_iter
+                    .peek()
+                    .map(|&&(off, _)| off)
+                    .unwrap_or(used)
+                    .min(used);
                 let run_end = zero_run_end(base, cursor, limit);
                 if run_end - cursor >= HEADER_SIZE {
                     anomaly = true;
                 }
             }
-            let total_size = if anomaly { 0 } else { gen_object_total_size(header) };
+            let total_size = if anomaly {
+                0
+            } else {
+                gen_object_total_size(header)
+            };
             if anomaly || total_size < HEADER_SIZE || cursor + total_size > used {
                 let stretch_lo = cursor;
                 let resynced = resync_to_next_free_block(&mut cursor, &mut free_iter);
@@ -6573,6 +6763,21 @@ impl GenerationalHeap {
     /// Returns a Vec of (raw pointer, total byte size) for each object.
     /// Must be called during a GC safepoint (all mutator threads paused).
     pub fn walk_objects(&self) -> Vec<(*mut u8, usize)> {
+        let mut result = self.walk_young_objects();
+
+        // Walk old generation
+        {
+            let old = self.old_gen.lock();
+            result.extend(old.walk_objects());
+        }
+
+        result
+    }
+
+    /// Walk all objects in the young from-space only (to-space is GC scratch).
+    /// Returns a Vec of (raw pointer, total byte size) for each object.
+    /// Must be called during a GC safepoint (all mutator threads paused).
+    pub fn walk_young_objects(&self) -> Vec<(*mut u8, usize)> {
         let mut result = Vec::new();
 
         // Walk young generation (from-space only — to-space is GC scratch).
@@ -6643,8 +6848,11 @@ impl GenerationalHeap {
                 let word0 = unsafe { *(ptr as *const u64) };
                 let mut anomaly = false;
                 if word0 == 0 {
-                    let limit =
-                        free_iter.peek().map(|&&(off, _)| off).unwrap_or(used).min(used);
+                    let limit = free_iter
+                        .peek()
+                        .map(|&&(off, _)| off)
+                        .unwrap_or(used)
+                        .min(used);
                     let run_end = zero_run_end(base, offset, limit);
                     if run_end - offset >= HEADER_SIZE {
                         anomaly = true;
@@ -6654,7 +6862,11 @@ impl GenerationalHeap {
                 // implausible length or a kind=Object header with a non-zero
                 // array_length / oversized num_slots; the `< HEADER_SIZE` check
                 // below then re-anchors the walk (matching the sweep).
-                let total_size = if anomaly { 0 } else { gen_object_total_size(header) };
+                let total_size = if anomaly {
+                    0
+                } else {
+                    gen_object_total_size(header)
+                };
                 if anomaly || total_size < HEADER_SIZE || offset + total_size > used {
                     if resync_to_next_free_block(&mut offset, &mut free_iter) {
                         continue;
@@ -6666,14 +6878,116 @@ impl GenerationalHeap {
             }
         }
 
-        // Walk old generation
-        {
-            let old = self.old_gen.lock();
-            result.extend(old.walk_objects());
-        }
-
         result
     }
+
+    /// Collect every young-gen object's reference to an OLD-gen object.
+    ///
+    /// fork6 GC_STRESS fix — these are mandatory roots for the concurrent
+    /// old-gen mark (`ConcurrentMarker::initial_mark` / `remark`): those
+    /// phases filter the thread-root list with `old_gen.contains`, so an old
+    /// object whose only path from a root goes THROUGH a young object
+    /// (root → young holder → old target) was invisible and the concurrent
+    /// sweep freed it live. Selective promotion mass-produces exactly that
+    /// shape (it tenures a young object's children while the pinned holder
+    /// stays young), so under allocation pressure the old cycle reclaimed
+    /// live promoted objects — the all-zero-header `class_id=0` receivers
+    /// and silently-dropped static writes in the Fork6Hard GC_STRESS lane.
+    ///
+    /// Walks ALL young objects (live or dead): a dead young holder's old refs
+    /// only over-retain (floating garbage until the next cycle), never corrupt.
+    /// Must be called during a GC safepoint (all mutator threads paused, so
+    /// young object bodies are stable to read).
+    pub fn collect_young_to_old_roots(&self) -> Vec<usize> {
+        let young_objs = self.walk_young_objects();
+        let mut out = Vec::new();
+        let old = self.old_gen.lock();
+        for (ptr, _sz) in young_objs {
+            // SAFETY: `ptr` came from the hardened young walk above; the
+            // header and body are readable, and no mutator runs (STW).
+            let header = unsafe { &*(ptr as *const ObjectHeader) };
+            // SAFETY: `ptr`/`header` are a valid young object under STW.
+            unsafe {
+                for_each_ref_slot(ptr, header, |r, _| {
+                    if old.contains(r as *const u8) {
+                        out.push(r as usize);
+                    }
+                });
+            }
+        }
+        out
+    }
+
+    /// gcstress residual face-1 diagnostics (`CRATONVM_DBG_CELLCORRUPT`) —
+    /// dump everything known about the HOLDER of a corrupt Value cell plus a
+    /// generation-containment probe of the stale pointer the cell carries.
+    /// Cold path: runs only when the gate is set AND the cell already failed
+    /// `read_value_checked`.
+    fn dump_corrupt_cell_holder(
+        &self,
+        obj_ref: ObjectRef,
+        header: &ObjectHeader,
+        index: usize,
+        cell_ptr: *mut u8,
+    ) {
+        // SAFETY: `cell_ptr` is a readable 16-byte slot (get_field bounds-checked).
+        let raw = unsafe { std::ptr::read(cell_ptr as *const [u64; 2]) };
+        let class_name = crate::gc::resolve_class_info(header.class_id.as_u32())
+            .map(|(n, _)| n)
+            .unwrap_or_else(|| "<unresolved>".to_string());
+        let target = raw[0] as usize;
+        let t = target as *const u8;
+        let (yf, yt, og) = (
+            self.young_from.lock().contains(t),
+            self.young_to.lock().contains(t),
+            self.old_gen.lock().contains(t),
+        );
+        let holder_addr = obj_ref.as_ptr() as usize;
+        let (hyf, hog) = (
+            self.young_from.lock().contains(holder_addr as *const u8),
+            self.old_gen.lock().contains(holder_addr as *const u8),
+        );
+        eprintln!(
+            "[CELLCORRUPT] holder=0x{holder_addr:x} (young_from={hyf} old={hog}) \
+             class_id={} class={class_name} kind=0x{:02x} num_slots={} array_len={} \
+             gc_flags=0x{:x} index={index} raw0=0x{:016x} raw1=0x{:016x} | \
+             raw0-target: young_from={yf} young_to={yt} old={og}\n{}",
+            header.class_id.as_u32(),
+            header.kind as u8,
+            header.num_slots,
+            header.array_length,
+            header.gc_flags,
+            raw[0],
+            raw[1],
+            std::backtrace::Backtrace::force_capture(),
+        );
+        // If the stale target is still inside a CURRENT generation, dump its
+        // header too — its identity often names the mis-writing code path.
+        if yf || og {
+            // SAFETY: `target` is inside a live arena (checked above); the
+            // first 40 header bytes of any in-arena address are readable.
+            let th = unsafe { std::ptr::read(target as *const ObjectHeader) };
+            let tname = crate::gc::resolve_class_info(th.class_id.as_u32())
+                .map(|(n, _)| n)
+                .unwrap_or_else(|| "<unresolved>".to_string());
+            eprintln!(
+                "[CELLCORRUPT]   target-header: class_id={} class={tname} kind=0x{:02x} \
+                 num_slots={} array_len={} gc_flags=0x{:x}",
+                th.class_id.as_u32(),
+                th.kind as u8,
+                th.num_slots,
+                th.array_length,
+                th.gc_flags,
+            );
+        }
+    }
+}
+
+/// gcstress residual face-1 gate — see `dump_corrupt_cell_holder`.
+#[inline]
+fn cell_corrupt_diag_enabled() -> bool {
+    static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *G.get_or_init(|| std::env::var_os("CRATONVM_DBG_CELLCORRUPT").is_some())
 }
 
 impl Default for GenerationalHeap {
@@ -7250,8 +7564,7 @@ fn zero_run_end(base: usize, start: usize, limit: usize) -> usize {
     if r < limit && limit - r < 8 {
         // Sub-word tail before `limit`: absorb it only if fully zero, so a
         // run ending exactly at a free-block boundary is reported as such.
-        let all_zero =
-            (r..limit).all(|i| unsafe { *((base + i) as *const u8) } == 0);
+        let all_zero = (r..limit).all(|i| unsafe { *((base + i) as *const u8) } == 0);
         if all_zero {
             r = limit;
         }
@@ -7336,13 +7649,21 @@ fn clear_all_mark_bits_in_arena(arena: &mut Arena) {
         let word0 = unsafe { *(obj_ptr as *const u64) };
         let mut anomaly = false;
         if word0 == 0 {
-            let limit = free_iter.peek().map(|&&(off, _)| off).unwrap_or(used).min(used);
+            let limit = free_iter
+                .peek()
+                .map(|&&(off, _)| off)
+                .unwrap_or(used)
+                .min(used);
             let run_end = zero_run_end(base, cursor, limit);
             if run_end - cursor >= HEADER_SIZE {
                 anomaly = true;
             }
         }
-        let total_size = if anomaly { 0 } else { gen_object_total_size(header) };
+        let total_size = if anomaly {
+            0
+        } else {
+            gen_object_total_size(header)
+        };
         if anomaly || total_size < HEADER_SIZE || cursor + total_size > used {
             // Corruption — same defence as the sweep loop: re-anchor at the
             // next free block rather than risk parsing arbitrary bytes as a
@@ -7545,6 +7866,59 @@ mod tests {
     fn small_gen_heap() -> GenerationalHeap {
         // 4KB young semi-space, 8KB old gen
         GenerationalHeap::with_sizes(4 * 1024, 8 * 1024)
+    }
+
+    /// fork6 GC_STRESS fix — a young object's reference to an old-gen object
+    /// must be reported by `collect_young_to_old_roots` (the concurrent
+    /// old-gen mark treats these as mandatory roots; without them an old
+    /// object reachable only through a young holder was swept while live).
+    #[test]
+    fn collect_young_to_old_roots_finds_young_held_old_target() {
+        let heap = small_gen_heap();
+
+        // Young holder with one reference field.
+        let holder = heap.alloc_object(ClassId::new(1), 1);
+        assert!(heap.is_in_young(holder.as_ptr()));
+
+        // Old-gen target, allocated directly in old gen (as selective
+        // promotion would).
+        let size = HEADER_SIZE + SLOT_SIZE;
+        let old_ptr = {
+            let mut og = heap.old_gen_lock();
+            let p = og.alloc(size, 8).unwrap();
+            // SAFETY: freshly allocated old-gen block of `size` bytes.
+            unsafe {
+                let h = &mut *(p as *mut ObjectHeader);
+                h.class_id = ClassId::new(2);
+                h.kind = ObjectKind::Object;
+                h.num_slots = 1;
+                h.gc_flags = GC_FLAG_OLD_GEN;
+            }
+            p
+        };
+
+        // holder.field[0] = old target (the ONLY reference to it).
+        // SAFETY: `old_ptr` is a valid, fully-initialized old-gen object.
+        let old_ref = unsafe { ObjectRef::from_raw(old_ptr) };
+        heap.set_field(holder, 0, Value::Object(Some(old_ref)));
+
+        let roots = heap.collect_young_to_old_roots();
+        assert!(
+            roots.contains(&(old_ptr as usize)),
+            "young→old edge must be collected as an old-marking root \
+             (got {} roots)",
+            roots.len(),
+        );
+
+        // A young→young edge must NOT be reported: repoint the field at a
+        // young object and re-collect.
+        let young_target = heap.alloc_object(ClassId::new(3), 0);
+        heap.set_field(holder, 0, Value::Object(Some(young_target)));
+        let roots2 = heap.collect_young_to_old_roots();
+        assert!(
+            !roots2.contains(&(old_ptr as usize)),
+            "an old object no longer young-referenced must not be re-reported",
+        );
     }
 
     /// Regression: `with_capacity` MUST scale the young semi-space linearly
@@ -8005,6 +8379,58 @@ mod tests {
             }
             other => panic!("live chain corrupted after hole reuse: {other:?}"),
         }
+    }
+
+    /// RandomizedContext WeakHashMap<Thread,...> fix regression: a
+    /// kept-in-place (non-promoted) young survivor that is a WATCHED
+    /// referent (`gc_quiescence::set_watched_referents`) must get an
+    /// IDENTITY `pointer_map` entry, so post-GC reference processing's
+    /// `is_marked` check recognizes it as alive instead of wrongly clearing
+    /// a live Weak/Soft/Phantom reference to it. An UNWATCHED survivor must
+    /// still produce an empty pointer_map, exactly like
+    /// `non_moving_sweep_when_jit_active` — this fix must not start
+    /// recording every survivor, only watched ones (bounded cost).
+    #[test]
+    fn non_moving_sweep_records_identity_map_for_watched_survivor() {
+        let heap = small_gen_heap();
+        let monitors = NoOpMonitors;
+
+        let obj_a = heap.alloc_object(ClassId::new(1), 1);
+        let obj_unwatched = heap.alloc_object(ClassId::new(2), 1);
+        heap.set_field(obj_a, 0, Value::Int(7));
+        heap.set_field(obj_unwatched, 0, Value::Int(9));
+
+        let a_ptr = obj_a.as_ptr();
+        let unwatched_ptr = obj_unwatched.as_ptr();
+
+        // Watch `obj_a`'s address only (simulating a live WeakReference whose
+        // referent is this object) — mirrors what
+        // `weakref_null_referents_pre_gc` publishes before a real collection.
+        crate::gc_quiescence::set_watched_referents(&[a_ptr as usize]);
+
+        crate::gc_quiescence::enter();
+        assert!(crate::gc_quiescence::is_active());
+
+        // Both objects are roots (so both survive as kept-in-place,
+        // non-promoted survivors); only `obj_a` is watched.
+        let mut roots = vec![obj_a, obj_unwatched];
+        let result = heap.collect_garbage(&stw(), &mut roots, &monitors);
+
+        crate::gc_quiescence::leave();
+        crate::gc_quiescence::set_watched_referents(&[]);
+
+        assert_eq!(roots[0].as_ptr(), a_ptr, "survivor must not move");
+        assert_eq!(roots[1].as_ptr(), unwatched_ptr, "survivor must not move");
+
+        assert_eq!(
+            result.pointer_map.get(&(a_ptr as usize)),
+            Some(&(a_ptr as usize)),
+            "watched survivor must get an identity pointer_map entry"
+        );
+        assert!(
+            !result.pointer_map.contains_key(&(unwatched_ptr as usize)),
+            "unwatched survivor must NOT get a pointer_map entry (bounded cost)"
+        );
     }
 
     /// A5 fix regression: the `unregistered_jit_frame_on_stack` flag must force

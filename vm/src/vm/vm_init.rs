@@ -307,6 +307,18 @@ pub struct SharedVm {
     /// Object/array heap — generational GC with young + old gen.
     pub heap: VmHeap,
 
+    /// fork6 GC_STRESS fix — SATB queue shared between the heap's write
+    /// barrier (`satb_barrier`, attached via `enable_concurrent_gc` at
+    /// construction) and every concurrent old-gen cycle's marker
+    /// (`ConcurrentMarker::with_shared` in `maybe_concurrent_gc`). Without
+    /// this shared instance the barrier logs nowhere and remark drains
+    /// nothing — the concurrent mark had no write barrier.
+    pub concurrent_satb: std::sync::Arc<cratonvm_gc::SatbQueue>,
+    /// Concurrent old-gen cycle phase state, shared with the heap for the
+    /// `satb_barrier` `is_marking_active()` fast-path gate (see
+    /// `concurrent_satb`).
+    pub concurrent_gc_state: std::sync::Arc<cratonvm_gc::ConcurrentGcState>,
+
     /// Lock-free cache of the shared `cratonvm/synthetic/AnonymousObject$N`
     /// ClassId, indexed by field count `N` (slot 0 is unused — `num_fields > 0`
     /// always on this path). `0` means "not yet resolved" — a valid sentinel
@@ -1139,7 +1151,19 @@ impl SharedVm {
             max_gc_pause_ms: config.g1_max_gc_pause_ms,
             string_dedup: config.g1_string_dedup,
         };
-        let heap = VmHeap::new_with_overrides(gc_backend, config.max_heap_size, g1_overrides);
+        let mut heap = VmHeap::new_with_overrides(gc_backend, config.max_heap_size, g1_overrides);
+        // fork6 GC_STRESS fix — wire the SATB write barrier to the concurrent
+        // old-gen cycle. `enable_concurrent_gc` previously had NO production
+        // caller: the heap's `concurrent_gc_state` stayed `None`, so
+        // `satb_barrier` was a hard no-op in every run, and each
+        // `maybe_concurrent_gc` cycle's marker drained its own private,
+        // never-written queue — the concurrent mark ran against live mutators
+        // with no write barrier at all, and the sweep freed old-gen objects
+        // whose only reference moved mid-cycle. These handles are shared with
+        // every cycle's marker via `ConcurrentMarker::with_shared`.
+        let concurrent_satb = std::sync::Arc::new(cratonvm_gc::SatbQueue::new());
+        let concurrent_gc_state = std::sync::Arc::new(cratonvm_gc::ConcurrentGcState::new());
+        heap.enable_concurrent_gc(concurrent_satb.clone(), concurrent_gc_state.clone());
 
         // Reset singleton classloader instances from any previous VM
         cratonvm_native_builtins::classloader::reset_loader_singletons();
@@ -2467,6 +2491,8 @@ impl SharedVm {
             offload_registry,
             class_manager: RwLock::new(class_manager),
             heap,
+            concurrent_satb,
+            concurrent_gc_state,
             anon_class_cache: std::array::from_fn(|_| AtomicU32::new(0)),
             native_methods,
             native_method_cache: parking_lot::RwLock::new(
@@ -10877,11 +10903,15 @@ mod tests {
     // Session 16: Iterative Interpreter Refactor
     // =======================================================================
 
-    /// S16: Default max_stack_depth increased to 1024.
+    /// Default max_stack_depth raised to 8192 (see the doc comment on
+    /// `VmConfig::default`'s `max_stack_depth` field in config.rs for the
+    /// root-cause rationale — `DefaultListableBeanFactoryTests
+    /// .extensiveCircularReference` needs >1024 frames for a 99-bean
+    /// circular-reference chain that HotSpot handles trivially).
     #[test]
-    fn s16_default_max_stack_depth_is_1024() {
+    fn s16_default_max_stack_depth_is_8192() {
         let config = crate::config::VmConfig::default();
-        assert_eq!(config.max_stack_depth, 1024);
+        assert_eq!(config.max_stack_depth, 8192);
     }
 
     /// S16: Frame has monitor_on_exit field for stackless synchronized dispatch.

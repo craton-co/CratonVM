@@ -2843,7 +2843,33 @@ impl ClassPath {
                         let p = canon_path.to_string_lossy().replace('\\', "/");
                         let p = p.strip_prefix("//?/").unwrap_or(&p);
                         let p = p.trim_start_matches('/');
-                        urls.push(format!("file:/{p}"));
+                        // A directory resource (e.g. a package path queried via
+                        // `ClassLoader.getResources("com/example/pkg/")`) must
+                        // keep its trailing slash — real `URLClassLoader`
+                        // preserves it, and Spring's
+                        // `PathMatchingResourcePatternResolver` relies on it:
+                        // its `rootDirCache` collapses sibling directory scans
+                        // onto a shared parent `Resource` and reconstructs
+                        // child paths via `createRelative`/
+                        // `StringUtils.applyRelativePath`, which treats a
+                        // no-trailing-slash URL as a FILE path and strips the
+                        // last segment when appending a relative child —
+                        // silently resolving to a sibling directory instead of
+                        // a subdirectory. That broke any SECOND differently-
+                        // pathed scan against the same resolver instance, e.g.
+                        // a `@ComponentScan`-discovered `@Configuration` class
+                        // whose OWN `@ComponentScan` scans a sibling package
+                        // (ComponentScanAnnotationRecursionTests, 2+ levels of
+                        // recursive `@ComponentScan`). Matches the established
+                        // unconditional-slash pattern in
+                        // `find_class_code_source_info` above, but here it
+                        // must be conditional since this function also serves
+                        // plain (non-directory) resource lookups.
+                        if canon_path.is_dir() && !p.ends_with('/') {
+                            urls.push(format!("file:/{p}/"));
+                        } else {
+                            urls.push(format!("file:/{p}"));
+                        }
                     }
                 }
                 ClassPathEntry::JarFile {

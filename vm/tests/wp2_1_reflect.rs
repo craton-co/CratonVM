@@ -145,6 +145,7 @@ fn class_get_record_components_register() {
 }
 
 #[test]
+#[cfg(feature = "synthetic-jdk")]
 fn record_component_natives_register() {
     // RecordComponent layout (lang_misc::register_p60_record): slot 0=name, 1=type, 2=declaringRecord
     let mut r = NativeMethodRegistry::new();

@@ -4,9 +4,11 @@
 
 CratonVM runs Java SE 8-25 bytecode on a custom x86-64 JIT with 26 optimization
 rounds, but current QuickBench performance has regressed from the March 2026
-Round 26 snapshot. The 2026-07-02 `b80c50b5` measurement is 46.2x slower than
-HotSpot C2 by default and 8.25x slower with `CRATONVM_JIT_OSR=1
-CRATONVM_JIT_THRESHOLD=1`. All Java LTS versions through Java 25 are supported:
+Round 26 snapshot. The 2026-07-02 `b80c50b5` QuickBench measurement is 46.2x
+slower than HotSpot C2 by default and 8.25x slower with `CRATONVM_JIT_OSR=1
+CRATONVM_JIT_THRESHOLD=1`; the 2026-07-03 Binary Trees recheck at `8292ec9c`
+is 53.6x slower by default and 54.3x slower with OSR forced. All Java LTS
+versions through Java 25 are supported:
 
 - **Java 11:** Nest-based access control
 - **Java 17:** Records, sealed classes
@@ -23,9 +25,9 @@ CRATONVM_JIT_THRESHOLD=1`. All Java LTS versions through Java 25 are supported:
 | Sieve 100Kx500          | 358 ms       | 31,665 ms        | 88.4x         | 466 ms                    | 1.30x     |
 | Matrix 500x500          | 336 ms       | 39,078 ms        | 116.3x        | 452 ms                    | 1.35x     |
 | **QuickBench TOTAL**    | **3,756 ms** | **173,532 ms**   | **46.2x**     | **30,977 ms**             | **8.25x** |
-| Binary Trees (depth=18) | 681 ms       | 19,737 ms        | 29.0x         | 36,665 ms                 | 53.8x     |
+| Binary Trees (depth=18) | 681 ms       | 36,525 ms        | 53.6x         | 36,983 ms                 | 54.3x     |
 
-*Measured 2026-07-02 on Windows 11, JDK 25.0.1 LTS vs CratonVM release build `b80c50b5`. The benchmark sources are the historical `bench/QuickBench.java` and `bench/binarytrees.java` from commit `2cea208`; `bench/` is currently untracked.*
+*Measured on Windows 11, JDK 25.0.1 LTS vs CratonVM release builds. QuickBench rows are from CratonVM code `b80c50b5` on 2026-07-02. The Binary Trees CratonVM columns were rechecked on 2026-07-03 at `8292ec9c`, using the same 681 ms HotSpot baseline from the 2026-07-02 JDK run. The benchmark sources are the historical `bench/QuickBench.java` and `bench/binarytrees.java` from commit `2cea208`; `bench/` is currently untracked.*
 
 Historical Round 26 added: loop unrolling, speculative bounds check elimination, OSR with JIT cache fast-path, graph-coloring register allocation.
 
@@ -36,7 +38,7 @@ Historical Round 26 added: loop unrolling, speculative bounds check elimination,
 | **No `java.util.stream` collect()** | Streams-heavy code stack-overflows | Phase 16.1 (Iterative Interpreter) |
 | **JIT crashes on FP math** | Any double-precision computation segfaults | Phase 16.2 (JIT FP Codegen) |
 | **JIT miscompilation on complex control flow** | Wrong results on permutation/branch-heavy code | Phase 16.3 (JIT Control Flow) |
-| **GC/allocation throughput gap on allocation-heavy workloads** | Binary Trees, real-world object creation (29.0x default in 2026-07-02 snapshot) | Phase 16.4 (GC Fast Path) |
+| **GC/allocation throughput gap on allocation-heavy workloads** | Binary Trees, real-world object creation (53.6x default in 2026-07-03 recheck) | Phase 16.4 (GC Fast Path) |
 | **No reflection-based frameworks** | Spring, Hibernate, Jackson unusable | Phase 3 + Phase 4 |
 | **No networking/sockets** | Server apps, HTTP clients unusable | Phase 9 |
 | **No JDBC** | Database apps unusable | Phase 4 |
@@ -78,7 +80,7 @@ These are the **immediate blockers** preventing CratonVM from running any non-tr
 
 ### ✅ Phase J: Beyond 1.0x — Beat C2 Consistently
 
-The March 2026 Round 26 snapshot briefly showed near-C2 loop kernels, but the current 2026-07-02 snapshot is no longer matching C2 overall. The strongest current loop kernels under `CRATONVM_JIT_OSR=1 CRATONVM_JIT_THRESHOLD=1` are Arithmetic (1.55x), Sieve (1.30x), and Matrix (1.35x); Fibonacci (13.8x) and Binary Trees (29.0x default) are the highest-priority performance gaps.
+The March 2026 Round 26 snapshot briefly showed near-C2 loop kernels, but the current refreshed snapshot is no longer matching C2 overall. The strongest current loop kernels under `CRATONVM_JIT_OSR=1 CRATONVM_JIT_THRESHOLD=1` are Arithmetic (1.55x), Sieve (1.30x), and Matrix (1.35x); Fibonacci (13.8x) and Binary Trees (53.6x default, 54.3x OSR) are the highest-priority performance gaps.
 
 #### J1: Method Inlining (Target: -30% total time)
 - **What:** Inline small methods (< 35 bytecodes) at JIT call sites

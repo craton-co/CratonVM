@@ -44,7 +44,8 @@ are aiming at, and may shift as priorities change.
   (46.2x default, 8.25x with `CRATONVM_JIT_OSR=1 CRATONVM_JIT_THRESHOLD=1`
   in the 2026-07-02 snapshot) toward <=1.2x of JDK 25 C2 runtime, with no
   single QuickBench micro above 1.5x. Bring Binary Trees (depth=18), currently
-  29.0x in default mode, under 5x through GC throughput work.
+  53.6x in default mode and 54.3x with OSR forced in the 2026-07-03 recheck,
+  under 5x through GC throughput work.
 - **Bytecode verifier** - reach 100% of the structural/type checks needed to
   verify the pre-Java-7 split-verifier class-file corpus without `--noverify`.
 - **JCK / compliance** - target >=90% pass rate on a single chosen JCK area,

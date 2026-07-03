@@ -831,12 +831,21 @@ pub fn jit_code_range_count() -> usize {
 /// `CRATONVM_XT_JIT_ROOT_SCAN`). Mirrors `cratonvm_vm::jit::xt_root_scan::
 /// enabled` (the jit crate cannot depend on the vm crate); kept in sync via
 /// the same env var. Cached on first read.
+///
+/// A4 (fork6-fjp) — default ON (opt-OUT), matching the vm-side gate. The two
+/// sides had diverged when the vm side flipped to default-on: this mirror
+/// stayed opt-IN, so `CompiledMethodCache::put` never registered JIT code
+/// ranges in a default-env process, `jit_code_ranges_snapshot()` was always
+/// empty, and the "default-on" takeover classified every suspended peer as
+/// "not in JIT" — the whole cross-thread STW JIT root scan (and the
+/// helper-window pass) was silently inert unless the env var was set to `1`
+/// explicitly. Keep the polarity identical to `xt_root_scan::enabled`.
 pub fn xt_jit_root_scan_enabled() -> bool {
     static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *CACHE.get_or_init(|| {
-        matches!(
+        !matches!(
             std::env::var("CRATONVM_XT_JIT_ROOT_SCAN").as_deref(),
-            Ok("1") | Ok("true") | Ok("on")
+            Ok("0") | Ok("false") | Ok("off")
         )
     })
 }
@@ -4556,6 +4565,22 @@ pub fn jit_bail_list_size() -> usize {
     jit_bail_list().read().len()
 }
 
+/// Parsed `CRATONVM_JIT_DENY` filter (see the `try_compile` call site).
+/// `None` = disabled.
+fn jit_deny_filter() -> Option<&'static Vec<String>> {
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<Option<Vec<String>>> = OnceLock::new();
+    CACHE
+        .get_or_init(|| {
+            let v = std::env::var("CRATONVM_JIT_DENY").ok()?;
+            if v.is_empty() {
+                return None;
+            }
+            Some(v.split(',').map(|s| s.trim().to_string()).collect())
+        })
+        .as_ref()
+}
+
 /// Diagnostic: number of `try_compile` calls short-circuited because
 /// the method was already bail-listed.  Each short-circuit saves the
 /// ~50µs we'd otherwise have spent re-running scan/IR/lowering only to
@@ -4799,6 +4824,19 @@ pub fn try_compile(
         &cached.method_descriptor,
     ) {
         JIT_BAIL_SHORTCIRCUITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return None;
+    }
+
+    // DBG (RandomizedContext WeakHashMap JIT investigation, 2026-07-02):
+    // `CRATONVM_JIT_DENY` — comma-separated substrings matched against
+    // `Class.method`; a matching method is force-interpreted (never
+    // JIT-compiled) so a single suspect compiled method can be isolated
+    // from the rest of a workload's JIT-compiled code, without disabling
+    // JIT wholesale. No-op unless the env var is set.
+    if jit_deny_filter().is_some_and(|filter| {
+        let sig = format!("{}.{}", cached.class_name, cached.method_name);
+        filter.iter().any(|f| sig.contains(f.as_str()))
+    }) {
         return None;
     }
 

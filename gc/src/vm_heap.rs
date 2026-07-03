@@ -1009,6 +1009,18 @@ impl VmHeap {
         }
     }
 
+    /// Collect every young-gen object's reference to an old-gen object
+    /// (mandatory concurrent old-gen marking roots — see
+    /// `GenerationalHeap::collect_young_to_old_roots`). Generational only;
+    /// empty for G1 (its concurrent marking has its own remembered sets).
+    /// Must be called during a GC safepoint.
+    pub fn collect_young_to_old_roots(&self) -> Vec<usize> {
+        match self {
+            VmHeap::Generational(h) => h.collect_young_to_old_roots(),
+            VmHeap::G1(_) => Vec::new(),
+        }
+    }
+
     /// Enable concurrent GC support (generational only).
     pub fn enable_concurrent_gc(
         &mut self,

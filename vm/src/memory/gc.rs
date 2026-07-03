@@ -38,6 +38,13 @@ pub fn update_all_roots(
     // the cache rather than forcing a full rebuild. Opt-in/default-OFF + no-op
     // unless the rootsnap cache is enabled. See `remap_rs_cache_after_gc`.
     crate::runtime::interpreter::remap_rs_cache_after_gc(thread, pointer_map, &shared.heap);
+    // Long-smuggle mint registry: relocate registered handles through this
+    // cycle's pointer map and drop entries whose referent died. BEFORE the
+    // empty-map early return so non-relocating sweeps still sweep dead
+    // entries (a reclaimed address must not stay registered — a future
+    // primitive long colliding with the reused address would otherwise pass
+    // the rewrite gate).
+    crate::memory::smuggled_longs::remap_and_sweep(pointer_map, &shared.heap);
     if pointer_map.is_empty() {
         return;
     }
@@ -262,28 +269,71 @@ pub fn update_all_roots(
         }
     }
 
-    // 7. System streams (System.out, System.err)
+    // 6c. Pre-allocated singleton OutOfMemoryError. The root scan keeps it
+    //     ALIVE (memory/roots.rs step 8c), but the holder is a bare
+    //     `SharedVm` field no other remap step covers — without this, the
+    //     first relocating GC that moves the singleton leaves
+    //     `shared.singleton_oom` dangling, and a later true OOM throws a
+    //     reclaimed/zeroed object that surfaces as the unreadable
+    //     `Exception in thread "main" unknown` (observed deterministically on
+    //     the SteadyChurn recreation under sustained G1 churn).
     {
-        let mut out = shared.system_out.write();
-        if let Some(ref mut obj_ref) = *out {
+        let mut oom = shared.singleton_oom.write();
+        if let Some(ref mut obj_ref) = *oom {
             let old_addr = obj_ref.as_ptr() as usize;
             if let Some(&new_addr) = pointer_map.get(&old_addr) {
-                // Safety: new_addr was produced by the GC's pointer map and
-                // should point into the to-space. The debug_assert verifies
-                // this during development.
                 debug_assert!(new_addr != 0, "GC pointer map contains null address");
                 *obj_ref = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
             }
         }
-        let mut err = shared.system_err.write();
-        if let Some(ref mut obj_ref) = *err {
-            let old_addr = obj_ref.as_ptr() as usize;
-            if let Some(&new_addr) = pointer_map.get(&old_addr) {
-                // Safety: new_addr was produced by the GC's pointer map and
-                // should point into the to-space. The debug_assert verifies
-                // this during development.
-                debug_assert!(new_addr != 0, "GC pointer map contains null address");
-                *obj_ref = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+    }
+
+    // 7. System streams (System.out, System.err)
+    // 7. System streams (System.out, System.err, System.in)
+    //
+    // try_write, NOT write: the singleton initializers (e.g.
+    // `ensure_system_stdin_object`) hold the WRITE guard across allocating
+    // calls, and an allocation-triggered GC on that same thread would
+    // self-deadlock on the non-reentrant RwLock (mirrors the try_read in
+    // roots.rs step 7). A locked slot is mid-initialization: it holds None
+    // (populated only at the end, from a pinned — hence already remapped —
+    // local), so there is nothing to remap.
+    {
+        if let Some(mut out) = shared.system_out.try_write() {
+            if let Some(ref mut obj_ref) = *out {
+                let old_addr = obj_ref.as_ptr() as usize;
+                if let Some(&new_addr) = pointer_map.get(&old_addr) {
+                    // Safety: new_addr was produced by the GC's pointer map and
+                    // should point into the to-space. The debug_assert verifies
+                    // this during development.
+                    debug_assert!(new_addr != 0, "GC pointer map contains null address");
+                    *obj_ref = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+                }
+            }
+        }
+        if let Some(mut err) = shared.system_err.try_write() {
+            if let Some(ref mut obj_ref) = *err {
+                let old_addr = obj_ref.as_ptr() as usize;
+                if let Some(&new_addr) = pointer_map.get(&old_addr) {
+                    // Safety: new_addr was produced by the GC's pointer map and
+                    // should point into the to-space. The debug_assert verifies
+                    // this during development.
+                    debug_assert!(new_addr != 0, "GC pointer map contains null address");
+                    *obj_ref = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+                }
+            }
+        }
+        // gcstress residual face fix — remap `system_in` too (it was missing
+        // from this step AND from the roots.rs scan while out/err had both,
+        // so the cached System.in went stale on the first moving GC).
+        if let Some(mut sin) = shared.system_in.try_write() {
+            if let Some(ref mut obj_ref) = *sin {
+                let old_addr = obj_ref.as_ptr() as usize;
+                if let Some(&new_addr) = pointer_map.get(&old_addr) {
+                    // Safety: same contract as out/err above.
+                    debug_assert!(new_addr != 0, "GC pointer map contains null address");
+                    *obj_ref = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+                }
             }
         }
     }

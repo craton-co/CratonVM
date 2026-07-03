@@ -21,6 +21,7 @@
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::Arc;
 
 use parking_lot::Mutex;
 
@@ -376,20 +377,66 @@ pub struct ConcurrentMarker {
     /// Work queue of gray objects to scan.
     pub queue: MarkQueue,
     /// Global SATB queue for write barrier entries.
-    pub satb_queue: SatbQueue,
-    /// Phase tracker.
-    pub state: ConcurrentGcState,
+    ///
+    /// fork6 GC_STRESS fix — MUST be the same instance the heap's
+    /// `satb_barrier` logs into (`GenerationalHeap::enable_concurrent_gc`),
+    /// or the write barrier feeds a queue nobody drains while `remark`
+    /// drains a queue nobody fills. A marker built via [`Self::new`] gets a
+    /// private queue (tests); production cycles use [`Self::with_shared`]
+    /// with the heap's handles.
+    pub satb_queue: Arc<SatbQueue>,
+    /// Phase tracker. Same sharing requirement as `satb_queue`: the heap's
+    /// `satb_barrier` fast-path gates on `is_marking_active()` of the
+    /// instance attached via `enable_concurrent_gc`.
+    pub state: Arc<ConcurrentGcState>,
 }
 
 impl ConcurrentMarker {
-    /// Create a new concurrent marker for a heap region.
+    /// Create a new concurrent marker for a heap region with PRIVATE SATB
+    /// queue + phase state (tests / single-threaded callers only — mutator
+    /// write barriers cannot see these instances; see [`Self::with_shared`]).
     pub fn new(old_gen_base: usize, old_gen_size: usize) -> Self {
+        Self::with_shared(
+            old_gen_base,
+            old_gen_size,
+            Arc::new(SatbQueue::new()),
+            Arc::new(ConcurrentGcState::new()),
+        )
+    }
+
+    /// Create a concurrent marker wired to the heap's shared SATB queue and
+    /// phase state (the instances registered via
+    /// `GenerationalHeap::enable_concurrent_gc`), so mutator `satb_barrier`
+    /// logs are visible to this cycle's `remark`.
+    pub fn with_shared(
+        old_gen_base: usize,
+        old_gen_size: usize,
+        satb_queue: Arc<SatbQueue>,
+        state: Arc<ConcurrentGcState>,
+    ) -> Self {
         Self {
             bitmap: MarkBitmap::new(old_gen_base, old_gen_size),
             queue: MarkQueue::new(),
-            satb_queue: SatbQueue::new(),
-            state: ConcurrentGcState::new(),
+            satb_queue,
+            state,
         }
+    }
+
+    /// Abort the cycle WITHOUT sweeping — the mark bitmap is not final (e.g.
+    /// the remark STW could not be acquired). Deactivates the SATB barrier
+    /// (discarding the drained entries — they only matter to a sweep that is
+    /// no longer happening) and returns the phase to Idle so the write
+    /// barrier stops logging. The next `old_gen_needs_gc` trigger starts a
+    /// fresh cycle.
+    pub fn abort_cycle(&self) {
+        let _ = self.satb_queue.deactivate_and_drain();
+        self.queue.clear();
+        self.state.set_phase(ConcurrentGcPhase::Idle);
+    }
+
+    /// Mark the cycle complete after the sweep: phase back to Idle.
+    pub fn finish_cycle(&self) {
+        self.state.set_phase(ConcurrentGcPhase::Idle);
     }
 
     /// Phase 1: Initial Mark (called during brief STW pause).
@@ -1439,5 +1486,80 @@ mod tests {
         // Sanity: the only addresses that can possibly be marked are A and B.
         // (B is the sole non-null value the writer ever stores.)
         let _ = b_addr; // referenced for clarity; marking B is permitted, not required.
+    }
+
+    /// fork6 GC_STRESS fix — `with_shared` must adopt the caller's SATB queue
+    /// + phase state (the heap-attached instances the write barrier reaches),
+    /// and a pre-barrier log flushed into that SHARED queue must be marked by
+    /// remark. With the old per-cycle private queue this plumbing did not
+    /// exist and the logged target was swept while live.
+    #[test]
+    fn with_shared_marker_marks_satb_entries_from_shared_queue() {
+        // One object, reachable ONLY via the (simulated) overwritten ref.
+        let mut og2 = OldGen::new(65536);
+        let size = HEADER_SIZE + SLOT_SIZE;
+        let live = og2.alloc(size, 8).unwrap();
+        unsafe {
+            let h = &mut *(live as *mut ObjectHeader);
+            h.class_id = ClassId::new(7);
+            h.kind = ObjectKind::Object;
+            h.num_slots = 1;
+            h.gc_flags = 0x01;
+        }
+
+        let satb = Arc::new(SatbQueue::new());
+        let state = Arc::new(ConcurrentGcState::new());
+        let marker = ConcurrentMarker::with_shared(
+            og2.base_ptr() as usize,
+            og2.capacity(),
+            satb.clone(),
+            state.clone(),
+        );
+        // The marker must hold the SAME instances (not copies).
+        assert!(Arc::ptr_eq(&marker.satb_queue, &satb));
+        assert!(Arc::ptr_eq(&marker.state, &state));
+
+        // Initial mark with NO roots: `live` is invisible to the trace.
+        marker.initial_mark(&[], &og2);
+        assert!(
+            satb.is_active(),
+            "initial_mark must activate the shared queue"
+        );
+        assert!(state.is_marking_active());
+
+        // Simulate the write barrier on another code path: a mutator
+        // overwrote the only reference to `live` during concurrent mark and
+        // the pre-barrier logged the old value into the SHARED queue.
+        crate::satb::satb_thread_local_log(&satb, live as usize);
+        crate::satb::flush_thread_satb_buffer(&satb);
+
+        marker.concurrent_mark(&og2);
+        marker.remark(&[], &og2);
+
+        assert!(
+            marker.bitmap.is_marked(live as usize),
+            "remark must mark targets logged into the SHARED SATB queue"
+        );
+    }
+
+    /// fork6 GC_STRESS fix — a cycle whose remark STW could not be acquired
+    /// must be abortable: `abort_cycle` deactivates the (shared) SATB barrier
+    /// and returns the phase to Idle so the write barrier stops logging and
+    /// the next trigger starts fresh. The caller skips the sweep entirely.
+    #[test]
+    fn abort_cycle_deactivates_barrier_and_resets_phase() {
+        let (og, ptr) = make_old_gen_with_object(1);
+        let marker = ConcurrentMarker::new(og.base_ptr() as usize, og.capacity());
+
+        marker.initial_mark(&[ptr], &og);
+        assert!(marker.satb_queue.is_active());
+        assert_eq!(marker.state.phase(), ConcurrentGcPhase::ConcurrentMark);
+
+        marker.abort_cycle();
+        assert!(
+            !marker.satb_queue.is_active(),
+            "abort must deactivate the barrier"
+        );
+        assert_eq!(marker.state.phase(), ConcurrentGcPhase::Idle);
     }
 }

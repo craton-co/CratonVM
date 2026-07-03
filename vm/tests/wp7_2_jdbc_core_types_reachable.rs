@@ -38,10 +38,9 @@
 //!      probes that every `T.class` literal LDCs successfully and
 //!      `Class.getName()` round-trips through the bootstrap classloader.
 //!   4. `connection_methods_carry_signatures` /
-//!      `result_set_next_reflects_with_boolean_return` — best-effort
-//!      reflection-deep probes that log a SKIP if the synthetic stub
-//!      does not declare `Class.getDeclaredMethods` in its method table
-//!      (a baseline gap shared with WP7.1). Registry pins still hold.
+//!      `result_set_next_reflects_with_boolean_return` — hard
+//!      reflection-deep probes that drive `Class.getDeclaredMethods()`
+//!      through real fixture bytecode and assert usable Method mirrors.
 //!
 //! The Java fixture lives at
 //! `vm/tests/resources/cratonvm/Wp72JdbcCoreTypes.java` and is auto-compiled
@@ -120,13 +119,16 @@ fn class_get_declared_methods_native_registered() {
             "getDeclaredMethods0",
             "(Z)[Ljava/lang/reflect/Method;"
         )
-        .is_some()
-            || r.find(
-                "java/lang/Class",
-                "getDeclaredMethods",
-                "()[Ljava/lang/reflect/Method;"
-            )
-            .is_some(),
+        .is_some(),
+        "Class.getDeclaredMethods0 must be registered for WP7.2"
+    );
+    assert!(
+        r.find(
+            "java/lang/Class",
+            "getDeclaredMethods",
+            "()[Ljava/lang/reflect/Method;"
+        )
+        .is_some(),
         "Class.getDeclaredMethods must be registered for WP7.2"
     );
 }

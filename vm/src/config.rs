@@ -362,11 +362,32 @@ impl Default for VmConfig {
         Self {
             max_heap_size: 256 * 1024 * 1024,    // 256 MB
             initial_heap_size: 16 * 1024 * 1024, // 16 MB
+            // Default raised from 1024 to 8192 (root-cause fix for
+            // DefaultListableBeanFactoryTests.extensiveCircularReference):
+            // real JDK's default `-Xss` comfortably supports several thousand
+            // to tens of thousands of frames for typical (non-huge-frame)
+            // methods, but this JVM-level frame-count guard was hardcoded far
+            // below that regardless of the actual native stack available.
+            // Spring's `preInstantiateSingletons()` over a long chain of
+            // circularly-referencing beans (bean0->bean1->...->bean99->bean0)
+            // recurses roughly 10 Java frames deep per bean through
+            // `getBean`/`doGetBean`/`createBean`/`populateBean`/
+            // `resolveReference`, so ~99 beans in the cycle landed right at
+            // the 1024-frame ceiling and threw a spurious `StackOverflowError`
+            // (masked by `BeanCreationException` wrapping) where HotSpot
+            // succeeds outright. 8192 stays well under the native-stack-size
+            // -derived safety ceilings that actually guard against a hard,
+            // uncatchable process abort (see `EXEC_DEPTH_CEILING` /
+            // `derive_exec_depth_ceiling` in `runtime/interpreter.rs`, ~8192
+            // levels on the 128 MiB main-vm thread, ~512 on an 8 MiB worker
+            // carrier) — those ceilings remain the actual backstop on smaller
+            // stacks and will trip first there, so raising this default adds
+            // no new crash risk.
             max_stack_depth: std::env::var("RJ_MAX_STACK_DEPTH")
                 .ok()
                 .and_then(|s| s.parse::<usize>().ok())
                 .filter(|n| *n >= 64 && *n <= 65536)
-                .unwrap_or(1024),
+                .unwrap_or(8192),
             classpath: Vec::new(),
             launcher_jar: None,
             boot_classpath: Vec::new(),
@@ -961,7 +982,7 @@ mod tests {
     fn default_config() {
         let config = VmConfig::default();
         assert_eq!(config.max_heap_size, 256 * 1024 * 1024);
-        assert_eq!(config.max_stack_depth, 1024);
+        assert_eq!(config.max_stack_depth, 8192);
         assert!(config.classpath.is_empty());
         assert!(config.boot_classpath.is_empty());
         assert!(config.ext_classpath.is_empty());
@@ -1114,7 +1135,7 @@ mod tests {
         assert_eq!(config.max_heap_size, 1024);
         // Other fields remain default
         assert_eq!(config.initial_heap_size, 16 * 1024 * 1024);
-        assert_eq!(config.max_stack_depth, 1024);
+        assert_eq!(config.max_stack_depth, 8192);
     }
 
     #[test]

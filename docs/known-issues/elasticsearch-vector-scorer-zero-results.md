@@ -46,6 +46,52 @@ org.elasticsearch.search.vectors.IVFKnnFloatVectorQueryTests
 org.elasticsearch.search.vectors.DiversifyingChildrenIVFKnnFloatVectorQueryTests
 ```
 
+## Update 2026-07-03 — confirmed independent of SegmentVarHandle (now fixed)
+
+`SegmentVarHandle.get/set` (see
+[elasticsearch-vector-segmentvarhandle-memorysegment.md](../internal/elasticsearch-vector-segmentvarhandle-memorysegment.md),
+now fixed on `dev` — both the original `NoSuchMethodError` and a follow-up
+off-by-16 heap-addressing bug found while verifying it) was previously
+masking this bug on several classes. With it fully fixed,
+`ES818BinaryQuantizedVectorsFormatTests` runs far enough to hit these same
+zero-score assertions directly:
+
+```text
+1) testRescoreUsesRawVectorSlice(...ES818BinaryQuantizedVectorsFormatTests)
+java.lang.AssertionError: expected:<0.7245078> but was:<0.0>
+2) testMismatchedFields(...)
+java.lang.AssertionError: expected:<1.0> but was:<0.0>
+4) testSortedIndex(...)
+java.lang.AssertionError: expected:<-1.0> but was:<0.0>
+5) testAddIndexesDirectory01(...)
+java.lang.AssertionError: expected:<1.0> but was:<0.0>
+```
+
+All four expect *different* nonzero values but all get exactly `0.0` —
+consistent with the scoring computation returning a hard zero (e.g. a
+defensive early-return or null/uninitialized quantization state) rather than
+reading corrupted/random vector bytes (which would more likely produce
+random nonzero garbage). The `SegmentVarHandle` memory-access arithmetic was
+separately verified correct against real JDK 25 across off-heap `Arena`,
+heap `MemorySegment.ofArray`, sliced-heap, and real memory-mapped-file
+segments — so this zero-score bug is confirmed to live elsewhere (likely
+BBQ/binary-quantization dot-product or quantization-state setup), not in the
+segment memory-access path.
+
+Two more failures in the same run look unrelated to scoring:
+`testKnnVectorFieldMissingFromOneSegment` →
+`IllegalArgumentException: Not a supported array class: byte[]`, and
+`testMultiClose` → `FileAlreadyExistsException`.
+
+This run also separately hit the Lucene randomizedtesting framework's own
+internal ~580s suite timeout (this class takes ~610s under CratonVM JIT-on)
+— a residual interpreter-performance characteristic, not a correctness
+issue; see the performance note in the internal `SegmentVarHandle` doc
+linked above.
+
+Evidence:
+`C:\craton\CratonVM-elasticsearch-current-suite-20260702\apps\elasticsearch-suite-runner\.suite\results\es-segvh-verify-es818-20260703\all-jit\logs\server.org.elasticsearch.index.codec.vectors.es818.ES818BinaryQu.29ee1bcc736c.out.log`
+
 ## Repro
 
 ```powershell
