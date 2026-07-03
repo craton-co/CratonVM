@@ -3942,10 +3942,30 @@ impl GenerationalHeap {
         // seed). Marking uses `GC_FLAG_MARKED` in the object header.
         let mut worklist: Vec<*mut u8> = Vec::new();
 
+        // xt-hardening (2026-07-03): per-cycle SIDE mark set for candidates
+        // that must never be header-written. The mark write
+        // (`gc_flags |= GC_FLAG_MARKED` at candidate+21) through a
+        // conservative FALSE POSITIVE is itself a heap corruptor: a candidate
+        // at (live_object_start - 8) — trivially plausible whenever the
+        // preceding 8 bytes are zero and the victim's identity hash is
+        // un-minted — lands the write at victim+13, flipping bit 9 of the
+        // victim's `array_length` to EXACTLY 512 (the observed
+        // "kind=Object but array_length=512" corrupt-header face, whose
+        // volume exploded when the xt cross-thread takeover started feeding
+        // whole frozen-peer register files and stack bands into the root
+        // set). Real objects always have a non-zero first header word
+        // (class_id|kind|element_type); the only legal zero-word0 shape is a
+        // fresh zero-hash `ClassId(0)` container, which the side set handles
+        // correctly (pinned + traced, never written). Zero-word0 candidates
+        // are the overwhelming false-positive volume — routing them here
+        // removes the writer from the entire zeroed-span/misalign family.
+        let mut side_marks: FxHashSet<usize> = FxHashSet::default();
         // mark_if_young: mark a candidate young pointer and enqueue it.
         // SAFETY contract: `ptr` is only dereferenced after `in_young`
         // confirms it lands inside the live from-space region.
-        let mut mark_young = |ptr: *mut u8, worklist: &mut Vec<*mut u8>| {
+        let mut mark_young = |ptr: *mut u8,
+                              worklist: &mut Vec<*mut u8>,
+                              side_marks: &mut FxHashSet<usize>| {
             let addr = ptr as usize;
             if !in_young(addr) {
                 return;
@@ -4013,6 +4033,16 @@ impl GenerationalHeap {
                 }
                 return;
             }
+            // Zero first-header-word candidates take the SIDE path: alive and
+            // traced, but the header is NEVER written (see side_marks above).
+            // SAFETY: `addr` is 8-aligned inside mapped from-space.
+            let word0 = unsafe { *(ptr as *const u64) };
+            if word0 == 0 {
+                if side_marks.insert(addr) {
+                    worklist.push(ptr);
+                }
+                return;
+            }
             if header.gc_flags & GC_FLAG_MARKED == 0 {
                 header.gc_flags |= GC_FLAG_MARKED;
                 worklist.push(ptr);
@@ -4021,12 +4051,12 @@ impl GenerationalHeap {
 
         // Seed: precise + conservative roots gathered by the caller.
         for root in roots.iter() {
-            mark_young(root.as_ptr(), &mut worklist);
+            mark_young(root.as_ptr(), &mut worklist, &mut side_marks);
         }
 
         // Seed: finalizable objects — keep them alive so finalize() runs.
         for &addr in finalizer_addrs {
-            mark_young(addr as *mut u8, &mut worklist);
+            mark_young(addr as *mut u8, &mut worklist, &mut side_marks);
         }
 
         // Seed: old→young references from dirty cards. Reuse the existing
@@ -4059,7 +4089,7 @@ impl GenerationalHeap {
                 // SAFETY: `slot_ptr` is a valid 8-byte ref element.
                 let raw: u64 = unsafe { std::ptr::read(slot_ptr as *const u64) };
                 if raw != 0 {
-                    mark_young(raw as usize as *mut u8, &mut worklist);
+                    mark_young(raw as usize as *mut u8, &mut worklist, &mut side_marks);
                 }
             } else if is_compact_object(header) {
                 // Compact object: `slot_idx` is the BYTE OFFSET of an 8-byte
@@ -4068,7 +4098,7 @@ impl GenerationalHeap {
                 let slot_ptr = unsafe { old_obj.as_ptr().add(HEADER_SIZE + slot_idx) };
                 let raw: u64 = unsafe { std::ptr::read(slot_ptr as *const u64) };
                 if raw != 0 {
-                    mark_young(raw as usize as *mut u8, &mut worklist);
+                    mark_young(raw as usize as *mut u8, &mut worklist, &mut side_marks);
                 }
             } else {
                 // SAFETY: `slot_idx` is within `num_slots` (from card scan).
@@ -4076,7 +4106,7 @@ impl GenerationalHeap {
                 // SAFETY: `slot_ptr` is a valid Value-sized slot.
                 let value = unsafe { std::ptr::read(slot_ptr as *const Value) };
                 if let Value::Object(Some(ref_obj)) = value {
-                    mark_young(ref_obj.as_ptr(), &mut worklist);
+                    mark_young(ref_obj.as_ptr(), &mut worklist, &mut side_marks);
                 }
             }
         }
@@ -4097,7 +4127,7 @@ impl GenerationalHeap {
                 let oh = unsafe { &*(op as *const ObjectHeader) };
                 // SAFETY: `op`/`oh` are a valid live old-gen object.
                 unsafe {
-                    for_each_ref_slot(op, oh, |r, _| mark_young(r, &mut worklist));
+                    for_each_ref_slot(op, oh, |r, _| mark_young(r, &mut worklist, &mut side_marks));
                 }
             }
         }
@@ -4115,7 +4145,7 @@ impl GenerationalHeap {
             // SAFETY: `obj_ptr`/`header` are a validated young object.
             unsafe {
                 for_each_ref_slot(obj_ptr, header, |ref_ptr, _| {
-                    mark_young(ref_ptr, &mut worklist);
+                    mark_young(ref_ptr, &mut worklist, &mut side_marks);
                 });
             }
             // HIB-CV-24: also mark this object's defining ClassLoader so a live
@@ -4124,10 +4154,16 @@ impl GenerationalHeap {
                 if let Some(loader_addr) =
                     cratonvm_types::loader_pin::loader_pin_addr(header.class_id.as_u32())
                 {
-                    mark_young(loader_addr as *mut u8, &mut worklist);
+                    mark_young(loader_addr as *mut u8, &mut worklist, &mut side_marks);
                 }
             }
         }
+
+        // Sorted view of the side mark set for O(1)-amortized lockstep checks
+        // in the linear walks below (same pattern as the free-block skip).
+        // ABSOLUTE addresses.
+        let mut side_sorted: Vec<usize> = side_marks.iter().copied().collect();
+        side_sorted.sort_unstable();
 
         // ----- Selective promotion -----------------------------------------
         //
@@ -4169,7 +4205,20 @@ impl GenerationalHeap {
         // `CRATONVM_SELECTIVE_PROMOTE` gate is now redundant (always-on) but kept
         // accepted for compatibility. This path runs only here, in the JIT-active
         // non-moving sweep, so it never affects the no-JIT moving Cheney.
-        let selective_on = std::env::var_os("CRATONVM_NO_SELECTIVE_PROMOTE").is_none();
+        // xt-hardening (2026-07-03): do NOT evacuate on cycles where the JIT
+        // root coverage is known-incomplete (forcibly-frozen peers, helper
+        // windows, or reserved TLAB tails present — the VM marks the cycle
+        // via `mark_moving_young_coverage_incomplete`). A frozen peer's
+        // registers can hold ONLY a derived/interior pointer to an object
+        // whose base is reachable via precise heap edges: the base is not
+        // pin-by-value protected (interior addresses don't resolve to roots),
+        // gets evacuated, its young source zeroed and re-served, and the
+        // resumed peer keeps loading/storing through the stale derived
+        // pointer. Retention for one cycle is always safe; the flag is
+        // per-cycle so ordinary (single-threaded / cooperative) collections
+        // keep the bt18-critical drain.
+        let selective_on = std::env::var_os("CRATONVM_NO_SELECTIVE_PROMOTE").is_none()
+            && !crate::gc_quiescence::moving_young_coverage_incomplete();
         if selective_on {
             let is_y = |a: usize| -> bool { a >= from_base && a < from_end && (a & 0x7) == 0 };
 
@@ -4516,6 +4565,9 @@ impl GenerationalHeap {
                     let mut free_iter = sweep_free_blocks.iter().peekable();
                     let used = sweep_used;
                     let mut cursor = 0usize;
+                    // xt-hardening (2026-07-03): lockstep over side-marked
+                    // survivors (see the fixup condition below).
+                    let mut side_iter_3a = side_sorted.iter().peekable();
                     // Conservative fallback for a stretch this walk cannot
                     // parse (the evacuation walk resynced over the same
                     // stretch, so survivors inside it were not evacuated —
@@ -4586,7 +4638,27 @@ impl GenerationalHeap {
                             }
                             break;
                         }
-                        if header.gc_flags & GC_FLAG_MARKED != 0 && !header.is_forwarded() {
+                        // xt-hardening (2026-07-03): side-marked survivors
+                        // (kept alive without a header write — see
+                        // `side_marks`) also need their references to
+                        // evacuated objects rewritten; they are unmarked by
+                        // construction so the MARKED gate alone would skip
+                        // them (dangling refs once the main sweep frees the
+                        // forwarded sources).
+                        let side_hit = {
+                            let abs = from_base + cursor;
+                            while let Some(&&a) = side_iter_3a.peek() {
+                                if a < abs {
+                                    side_iter_3a.next();
+                                } else {
+                                    break;
+                                }
+                            }
+                            side_iter_3a.peek().is_some_and(|&&a| a == abs)
+                        };
+                        if (header.gc_flags & GC_FLAG_MARKED != 0 || side_hit)
+                            && !header.is_forwarded()
+                        {
                             fixup_object_fields(obj, header, &fwd_of, &is_y, None);
                         }
                         cursor += total_size;
@@ -4942,6 +5014,11 @@ impl GenerationalHeap {
         let mut cursor: usize = 0;
         let used = young_from.used();
         let mut free_iter = existing_free.iter().peekable();
+        // xt-hardening (2026-07-03): lockstep iterator over the side mark
+        // set (absolute addrs, sorted) — side-marked objects are survivors
+        // whose headers were never written; the walk must retain them
+        // without touching gc_flags/gc_age.
+        let mut side_iter = side_sorted.iter().peekable();
         // Debug diag: keep a short ring buffer of (offset, size, class_id, kind,
         // num_slots, array_length) for the last 6 objects walked. When the
         // implausible-header break fires we dump it so we can pin down which
@@ -5378,6 +5455,24 @@ impl GenerationalHeap {
                         header.kind as u8,
                     ));
                 }
+            } else if {
+                // xt-hardening (2026-07-03): side-marked survivor check
+                // (lockstep, absolute addrs). These candidates were kept
+                // alive WITHOUT a header write; retain them without writing
+                // gc_flags/gc_age either (their "header" may be a zero span
+                // or a legal zero-word0 container — never write through it).
+                let abs = from_base + cursor;
+                while let Some(&&a) = side_iter.peek() {
+                    if a < abs {
+                        side_iter.next();
+                    } else {
+                        break;
+                    }
+                }
+                side_iter.peek().is_some_and(|&&a| a == abs)
+            } {
+                // Side-marked survivor: pure retention, no header writes.
+                objects_live += 1;
             } else if header.gc_flags & GC_FLAG_MARKED != 0 {
                 // Survivor: clear the mark, keep in place, and age it so the
                 // next sweep can tenure it once it reaches PROMOTION_AGE

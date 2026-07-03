@@ -472,6 +472,14 @@ fn stw_take_over_and_wait(
     loop {
         let newly = xt::take_over_pass(&mut taken, &|a| shared.heap.is_object_address(a), xt_roots);
         if newly > 0 {
+            // TODO(xt-hardening follow-up): this blind numeric reduction can
+            // over-reduce when the frozen peer was spawned AFTER
+            // `request_stw_counted` computed `expected` (it was never
+            // counted) — the barrier then releases while a genuinely counted
+            // mutator still runs, racing the collection. Identity-based
+            // excusal (track counted tids at request time; only excuse
+            // members) is the proper fix; needs gc_barrier surgery. See
+            // docs/known-issues/xt-takeover-activation-young-corruption.md.
             shared.gc_barrier.reduce_expected(newly as u32);
         }
         rounds += 1;
@@ -514,11 +522,20 @@ fn stw_take_over_and_wait(
     // Cleared by the caller after the collection completes.
     let regions = shared.thread_registry.collect_reserved_tlab_tails();
     if taken.count() > 0 || helper_windows > 0 || !regions.is_empty() {
+        shared.heap.set_jit_tlab_skip_regions(&regions);
+    }
+    if taken.count() > 0 || helper_windows > 0 {
         // Helper-window roots are conservative (unprovable coverage) — the
         // collection must stay non-moving so a false-positive candidate can
         // only over-retain, never relocate under a live JIT/blocked frame.
+        // xt-hardening (2026-07-03): this flag now ALSO disables selective
+        // promotion for the cycle (a frozen peer's registers can hold only a
+        // derived/interior pointer whose base would otherwise be evacuated
+        // from under it, then zeroed and re-served). Scoped to cycles with
+        // actually-frozen/scanned peers — reserved TLAB tails alone freeze
+        // nobody, and gating on them would starve promotion on every
+        // cooperative multi-threaded cycle.
         cratonvm_gc::gc_quiescence::mark_moving_young_coverage_incomplete();
-        shared.heap.set_jit_tlab_skip_regions(&regions);
     }
     taken
 }
@@ -758,13 +775,22 @@ fn maybe_gc(shared: &SharedVm, thread: &mut JvmThread) {
                     result.stats.bytes_freed,
                 );
 
-                // Signal all threads with the pointer map
-                shared.gc_barrier.complete_gc(result.pointer_map);
-                // BUG-03 — resume the forcibly-stopped in-JIT peers now that
-                // the heap is consistent again (non-moving sweep → their
-                // pointers are unchanged) and drop the TLAB skip regions.
+                // BUG-03 — drop the TLAB skip regions and resume the
+                // forcibly-stopped in-JIT peers now that the heap is
+                // consistent again (non-moving sweep → their pointers are
+                // unchanged). xt-hardening (2026-07-03): BOTH must happen
+                // BEFORE `complete_gc` reopens the world — a released mutator
+                // could otherwise win the NEXT STW, re-freeze the
+                // still-suspended peers and publish fresh skip regions that
+                // THIS initiator's late clear would wipe, letting the next
+                // sweep walk (and free-list) the frozen peers' reserved
+                // tails. A resumed peer that immediately requests the next
+                // GC blocks until `complete_gc` anyway (the barrier is still
+                // closed here), so the reorder introduces no new window.
                 shared.heap.clear_jit_tlab_skip_regions();
                 crate::jit::xt_root_scan::resume(taken);
+                // Signal all threads with the pointer map
+                shared.gc_barrier.complete_gc(result.pointer_map);
 
                 // T19.3.G1 — bump the cycle counter (multi-threaded
                 // path, fires only on the GC initiator).
@@ -862,10 +888,12 @@ fn maybe_gc_forced(shared: &SharedVm, thread: &mut JvmThread) {
             // initiator path was missing it, so a relocating G1 evacuation left
             // ec_watch holders stale and the watchpoint read moved-away memory.
             crate::runtime::ec_watch::remap(&result.pointer_map);
-            shared.gc_barrier.complete_gc(result.pointer_map);
+            // xt-hardening (2026-07-03): clear regions + resume BEFORE
+            // complete_gc (see maybe_gc's epilogue for the race rationale).
             shared.heap.clear_jit_tlab_skip_regions(); // BUG-03
             crate::jit::xt_root_scan::resume(taken); // BUG-03 resume frozen peers
-                                                     // T19.3.G1 — count forced cycles (multi-threaded initiator).
+            shared.gc_barrier.complete_gc(result.pointer_map);
+            // T19.3.G1 — count forced cycles (multi-threaded initiator).
             shared
                 .gc_cycle_count
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1020,9 +1048,11 @@ pub fn force_gc_from_native(shared: &SharedVm, thread: &mut JvmThread) {
             for new_addr in &dead_finalizers {
                 shared.finalizer_thread.enqueue(*new_addr);
             }
-            shared.gc_barrier.complete_gc(result.pointer_map);
+            // xt-hardening (2026-07-03): clear regions + resume BEFORE
+            // complete_gc (see maybe_gc's epilogue for the race rationale).
             shared.heap.clear_jit_tlab_skip_regions(); // BUG-03
             crate::jit::xt_root_scan::resume(taken); // BUG-03 resume frozen peers
+            shared.gc_barrier.complete_gc(result.pointer_map);
         } else {
             safepoint_check(shared, thread);
         }
