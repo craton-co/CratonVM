@@ -648,6 +648,141 @@ fn h5_rejects_prohibited_package_for_ordinary_define() {
     );
 }
 
+/// Build a minimal-but-valid class file with `this_class` = `name`,
+/// `super_class` = `java/lang/Object`, no fields, and ONE public static
+/// no-arg method `getSecrets()Ljava/util/Set;` whose body is just
+/// `aconst_null; areturn` — enough to distinguish "real bytecode" from an
+/// empty synthetic stub (which has zero methods).
+fn minimal_class_with_static_method(name: &str, method_name: &str) -> Vec<u8> {
+    let super_name = "java/lang/Object";
+    let descriptor = "()Ljava/util/Set;";
+    let code_attr_name = "Code";
+    let mut b: Vec<u8> = Vec::new();
+    b.extend_from_slice(&[0xCA, 0xFE, 0xBA, 0xBE]); // magic
+    b.extend_from_slice(&[0x00, 0x00]); // minor
+    b.extend_from_slice(&[0x00, 0x34]); // major 52 (Java 8)
+    b.extend_from_slice(&[0x00, 0x08]); // constant_pool_count = 8 (#1..#7)
+                                        // #1 CONSTANT_Class -> #2 (this_class)
+    b.push(7);
+    b.extend_from_slice(&[0x00, 0x02]);
+    // #2 CONSTANT_Utf8 this_name
+    b.push(1);
+    b.extend_from_slice(&(name.len() as u16).to_be_bytes());
+    b.extend_from_slice(name.as_bytes());
+    // #3 CONSTANT_Class -> #4 (super_class)
+    b.push(7);
+    b.extend_from_slice(&[0x00, 0x04]);
+    // #4 CONSTANT_Utf8 super_name
+    b.push(1);
+    b.extend_from_slice(&(super_name.len() as u16).to_be_bytes());
+    b.extend_from_slice(super_name.as_bytes());
+    // #5 CONSTANT_Utf8 method_name
+    b.push(1);
+    b.extend_from_slice(&(method_name.len() as u16).to_be_bytes());
+    b.extend_from_slice(method_name.as_bytes());
+    // #6 CONSTANT_Utf8 descriptor
+    b.push(1);
+    b.extend_from_slice(&(descriptor.len() as u16).to_be_bytes());
+    b.extend_from_slice(descriptor.as_bytes());
+    // #7 CONSTANT_Utf8 "Code"
+    b.push(1);
+    b.extend_from_slice(&(code_attr_name.len() as u16).to_be_bytes());
+    b.extend_from_slice(code_attr_name.as_bytes());
+
+    b.extend_from_slice(&[0x00, 0x21]); // access_flags = ACC_PUBLIC|ACC_SUPER
+    b.extend_from_slice(&[0x00, 0x01]); // this_class = #1
+    b.extend_from_slice(&[0x00, 0x03]); // super_class = #3
+    b.extend_from_slice(&[0x00, 0x00]); // interfaces_count
+    b.extend_from_slice(&[0x00, 0x00]); // fields_count
+
+    // methods_count = 1
+    b.extend_from_slice(&[0x00, 0x01]);
+    // method_info: public static getSecrets()Ljava/util/Set;
+    b.extend_from_slice(&[0x00, 0x09]); // access_flags = ACC_PUBLIC|ACC_STATIC
+    b.extend_from_slice(&[0x00, 0x05]); // name_index = #5
+    b.extend_from_slice(&[0x00, 0x06]); // descriptor_index = #6
+    b.extend_from_slice(&[0x00, 0x01]); // attributes_count = 1
+                                        // Code attribute
+    b.extend_from_slice(&[0x00, 0x07]); // attribute_name_index = #7 ("Code")
+    let code_bytes: [u8; 2] = [0x01, 0xb0]; // aconst_null; areturn
+    let attr_len: u32 = 2 + 2 + 4 + code_bytes.len() as u32 + 2 + 2;
+    b.extend_from_slice(&attr_len.to_be_bytes()); // attribute_length
+    b.extend_from_slice(&[0x00, 0x01]); // max_stack
+    b.extend_from_slice(&[0x00, 0x00]); // max_locals
+    b.extend_from_slice(&(code_bytes.len() as u32).to_be_bytes()); // code_length
+    b.extend_from_slice(&code_bytes); // code
+    b.extend_from_slice(&[0x00, 0x00]); // exception_table_length
+    b.extend_from_slice(&[0x00, 0x00]); // attributes_count (of Code)
+
+    b.extend_from_slice(&[0x00, 0x00]); // class attributes_count
+    b
+}
+
+/// Regression for keycloak-clustering-quarkus-testconfig-cmimpl-getsecrets:
+/// a class name under an enterprise-stub-eligible prefix (`io/quarkus/...`)
+/// that isn't on the classpath first gets fabricated as an empty synthetic
+/// stub (mirrors `ClassLoader.loadClass(implClassName)` probing for a
+/// not-yet-generated SmallRye `@ConfigMapping` `$$CMImpl`), and REAL
+/// bytecode for that exact name is defined afterwards (mirrors SmallRye's
+/// own ASM-generated implementation via `MethodHandles.Lookup.defineClass`).
+///
+/// Before the fix, `define_class_with_options` minted a brand-new,
+/// permanently-shadowed `ClassId` for the real bytecode (because the
+/// existing stub lived under `ClassLoaderId::Bootstrap`, a different loader
+/// than the real define), so every subsequent by-name lookup kept resolving
+/// the empty stub and any call against its (non-existent) real methods blew
+/// up with `NoSuchMethodError`. The fix upgrades the existing stub in place.
+#[test]
+fn defining_real_bytecode_upgrades_existing_enterprise_stub_in_place() {
+    let name = "io/quarkus/deployment/dev/testing/FakeCMImpl";
+    let mut cm = fresh_manager();
+
+    // Step 1: a failed lookup (mirroring `ClassLoader.loadClass`) fabricates
+    // an empty synthetic stub for this name, since it matches
+    // `is_enterprise_stub_prefix` and isn't on the (empty) classpath.
+    let stub_id = cm.load_class(name).expect("stub fallback must succeed");
+    {
+        let stub = cm.class_store.get(stub_id).expect("stub registered");
+        assert!(stub.is_synthetic_stub, "must be fabricated as a stub");
+        assert!(
+            stub.methods.is_empty(),
+            "synthetic stub must have no real methods"
+        );
+    }
+
+    // Step 2: real bytecode for the SAME name is defined afterwards (as
+    // SmallRye's runtime ConfigMapping generator does via
+    // `MethodHandles.Lookup.defineClass`).
+    let bytes = minimal_class_with_static_method(name, "getSecrets");
+    let real_id = cm
+        .define_class_with_options(name, &bytes, ClassLoaderId::Application, DefineClassOptions::default())
+        .expect("defining real bytecode over an existing stub must succeed");
+
+    // The stub must be upgraded IN PLACE (same ClassId), not shadowed by a
+    // second, unreachable-by-name registration.
+    assert_eq!(
+        real_id, stub_id,
+        "real define must upgrade the existing stub's ClassId, not mint a new shadowed one"
+    );
+
+    let real = cm.class_store.get(real_id).expect("class exists");
+    assert!(
+        !real.is_synthetic_stub,
+        "class must no longer be a synthetic stub after upgrade"
+    );
+    assert!(
+        real.methods.iter().any(|m| &*m.name == "getSecrets"),
+        "upgraded class must expose the real getSecrets method"
+    );
+
+    // Any subsequent by-name lookup must observe the REAL class, matching
+    // what `MethodHandles.Lookup.findStatic(cls, "getSecrets", ...)` needs.
+    let relooked = cm.get_loaded_class_id(name).expect("still loaded");
+    assert_eq!(relooked, real_id);
+    let relooked_class = cm.class_store.get(relooked).unwrap();
+    assert!(!relooked_class.is_synthetic_stub);
+}
+
 /// BUG-10 — a PRIVILEGED define (`Unsafe.defineClass`) bypasses the H5 guard,
 /// matching HotSpot, so ByteBuddy/CGLIB can inject an accessor such as
 /// `java.lang.ClassLoader$ByteBuddyAccessor$V1`. Same bytes, same loader, only
