@@ -22,27 +22,59 @@ run failing is not by itself evidence against a fix.
 
 ## Residual faces
 
-1. **Stale bootstrap-era raw pointer in Value cells.** Recurring
-   `gen_heap::read_slot: corrupt Value cell` with `raw0=0x1463f0088` (or
-   `0x1463f00f0`) and `raw1=0` — the same one-or-two bootstrap-arena
-   addresses appearing as raw 8-byte pointers inside 16-byte Value cells at
-   young (`0x80…`) and old (`0x102…`) holders, long after the young arena
-   has grown away from `0x1463f…`. Suspects: young-arena grow (realloc)
-   remap gap for some holder class, or an 8-vs-16-byte slot-layout confusion
-   writing a compact ref into a legacy Value cell.
+> **2026-07-03 investigation round (branch `fix/gcstress-residual-diag-20260703`,
+> binaries `cvmp-residual-diag{,2,3}-20260703.exe` with symbols
+> [`strip="none"`+`debug="line-tables-only"`, local Cargo.toml tweak, not
+> committed]):** new `CRATONVM_DBG_CELLCORRUPT` holder-identification
+> diagnostics landed, TWO more real bugs fixed, face 3 root-caused and
+> CLOSED, and face 1 narrowed to a specific writer hunt. Details below.
+
+1. **Stale bootstrap-era raw pointer in Value cells — NARROWED, writer still
+   unidentified.** `CRATONVM_DBG_CELLCORRUPT` identifies the holders: real,
+   live objects (`Fork6Hard$StrTask` num_slots=6 at indexes 0/2/4/5;
+   `ForkJoinWorkerThread$InnocuousForkJoinWorkerThread` Thread mirror
+   num_slots=22 at index 19 ≈ `Thread.holder`) whose 16-byte Value cells
+   contain `{raw 8-byte pointer, 0}` where the pointer targets a REAL early
+   bootstrap object (a `java/lang/String`, plain Objects) — usually in the
+   FLIPPED young semispace (`young_to`), i.e. a pre-Cheney address. The
+   tagged reader rejects the untagged cell → returns null → the
+   `nullchild` / "Cannot read field threadStatus because holder is null" /
+   NPE faces; remap walkers can't decode the cell either, so it stays stale
+   forever. Corruption happens while the holder is YOUNG; promotion then
+   copies the corrupt cell verbatim to old gen.
+   **Excluded writers:** `set_array_element` on a stale array ref (a
+   CELLCORRUPT-gated non-array trap was live in the run that produced a
+   corrupt cell and did not fire); the `ensure_system_stdin_object` stale
+   write (fixed, see below — removed SOME producers: post-fix runs show
+   fewer/none in some windows, but the face still reproduces).
+   **Remaining suspects:** raw 8-byte writers — `write_prim_element`
+   callers outside set_array_element, `Unsafe.putLong/putReference*` byte-
+   vs-slot offset translation, arraycopy fast paths. Next: write-side trap
+   in `write_prim_element` (Reference writes with holder-header check) or a
+   memory watchpoint on a corrupt-cell address (they are deterministic).
 2. **JIT lost-tag int-in-ref-slot.** `JIT dispatch into ForkJoinTask.doExec
    failed: expected object reference, got int(512)` + walker headers like
    `kind=Object array_length=512 num_slots=4 class_id=6` — an A4-family
    tag/layout confusion under JIT, distinct from GC reclamation. May be
    related to the still-open fork6-fjp A4 register-only residual (see
    [fork6-fjp-multithread-jit-root-reclamation.md](fork6-fjp-multithread-jit-root-reclamation.md)) —
-   unconfirmed.
-3. **Bootstrap `set_field` OOB write-drop** at `obj=0x1023f1328` (a 0-field
-   `ClassId(0)` ad-hoc container written at index 0) — present as the FIRST
-   log line of every stress run, pre- and post-fix, JIT and `--nojit`.
-   Possibly a benign pre-existing bootstrap quirk, but a silently dropped
-   write is a latent-null source and should be identified before being
-   dismissed.
+   unconfirmed. Untouched this round (all diagnosis ran `--nojit`).
+3. **Bootstrap `set_field` OOB write-drop — ROOT-CAUSED AND FIXED
+   (2026-07-03).** The `CRATONVM_DBG_OOBFIELD=Object` backtrace named
+   `ensure_system_stdin_object` (vm_util.rs): the freshly allocated
+   System.in FileInputStream was held in a Rust local across the
+   FileDescriptor class-load/`<clinit>`/alloc window (the A1 "Rust local
+   across allocating calls" family); a stress-triggered MOVING young GC in
+   the window relocated it and the subsequent `set_field` wrote through the
+   stale pre-move address — then cached the stale ref in
+   `shared.system_in`, which was ALSO missing from both the root scan and
+   the GC remap (out/err had both), poisoning every later use. Fixed
+   (pin + re-read via `native_pin_roots`; `system_in` rooted + remapped;
+   plus a latent RwLock self-deadlock found & fixed in the process: the GC
+   paths now `try_read`/`try_write` the stream caches because the
+   initializers hold the write guard across allocating calls — the naive
+   `read()` wedged instantly, 0-output). Post-fix, the bootstrap write-drop
+   is gone from all runs (0 hits vs deterministic-first-line before).
 
 ## Diagnostics available
 
