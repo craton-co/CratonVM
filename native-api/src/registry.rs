@@ -2379,6 +2379,15 @@ pub trait NativeContext {
         vec![]
     }
 
+    /// Return the `uses` service-type binary names (slash format) declared by
+    /// `module_name`'s `module-info.class` `uses` directives. Empty for the
+    /// unnamed module, an unregistered module, or a module whose descriptor
+    /// declares no `uses`.
+    fn module_uses(&self, module_name: &str) -> Vec<String> {
+        let _ = module_name;
+        vec![]
+    }
+
     /// Return all registered module names.
     fn all_module_names(&self) -> Vec<String> {
         vec![]
