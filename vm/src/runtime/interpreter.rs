@@ -14315,7 +14315,10 @@ fn is_groovy_class_loader(shared: &SharedVm, loader_obj: cratonvm_types::ObjectR
 /// full rationale — this is the narrow, type-checked carve-out for the
 /// context.groovy bug cluster that does not touch the gate's default).
 #[inline]
-fn should_use_loader_initiated_resolution(shared: &SharedVm, referencing_class_id: ClassId) -> bool {
+fn should_use_loader_initiated_resolution(
+    shared: &SharedVm,
+    referencing_class_id: ClassId,
+) -> bool {
     if crate::runtime::env_cache::loader_aware_resolution() {
         return true;
     }

@@ -64,13 +64,24 @@ fn test_resources_dir() -> String {
     format!("{manifest_dir}/tests/resources")
 }
 
+fn test_classpath() -> Vec<String> {
+    let mut cp = Vec::new();
+    if let Some(compiled) = option_env!("CRATONVM_TEST_CLASSES_DIR") {
+        cp.push(compiled.to_string());
+    }
+    cp.push(test_resources_dir());
+    cp
+}
+
 fn fixture_compiled() -> bool {
-    let path = format!("{}/cratonvm/Wp72JdbcCoreTypes.class", test_resources_dir());
-    std::path::Path::new(&path).exists()
+    test_classpath().into_iter().any(|dir| {
+        let path = format!("{dir}/cratonvm/Wp72JdbcCoreTypes.class");
+        std::path::Path::new(&path).exists()
+    })
 }
 
 fn fresh_vm() -> Vm {
-    let config = VmConfig::new().with_classpath(vec![test_resources_dir()]);
+    let config = VmConfig::new().with_classpath(test_classpath());
     Vm::new(config)
 }
 

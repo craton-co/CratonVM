@@ -755,7 +755,12 @@ fn defining_real_bytecode_upgrades_existing_enterprise_stub_in_place() {
     // `MethodHandles.Lookup.defineClass`).
     let bytes = minimal_class_with_static_method(name, "getSecrets");
     let real_id = cm
-        .define_class_with_options(name, &bytes, ClassLoaderId::Application, DefineClassOptions::default())
+        .define_class_with_options(
+            name,
+            &bytes,
+            ClassLoaderId::Application,
+            DefineClassOptions::default(),
+        )
         .expect("defining real bytecode over an existing stub must succeed");
 
     // The stub must be upgraded IN PLACE (same ClassId), not shadowed by a

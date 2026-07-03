@@ -221,7 +221,16 @@ public class Wp72JdbcCoreTypes {
                 }
                 if ("next".equals(n) && params == 0) {
                     try {
-                        return m.getReturnType() == boolean.class ? 1 : -3;
+                        Class<?> rt = m.getReturnType();
+                        Class<?> bc = boolean.class;
+                        if (rt == bc) return 1;
+                        if (bc == null) return -31;
+                        if (!"boolean".equals(bc.getName())) return -32;
+                        if (!bc.isPrimitive()) return -33;
+                        if (rt == null) return -34;
+                        if (!rt.isPrimitive()) return -35;
+                        if ("boolean".equals(rt.getName())) return -36;
+                        return -3;
                     } catch (Throwable t) {
                         return -40;
                     }

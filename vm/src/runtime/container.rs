@@ -231,7 +231,7 @@ mod platform {
 
 #[cfg(not(target_os = "linux"))]
 mod platform {
-    use super::{ContainerInfo, calculate_effective_cpus};
+    use super::{calculate_effective_cpus, ContainerInfo};
 
     pub fn detect_container() -> ContainerInfo {
         ContainerInfo::non_containerized()

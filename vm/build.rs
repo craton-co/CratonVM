@@ -241,7 +241,13 @@ fn main() {
     // we fall back to plain javac which handles modern syntax on JDK
     // 21+ toolchains.
     if !modern.is_empty()
-        && !compile_files(&javac_path, &modern, &output_dir, &["--release", "21"], false)
+        && !compile_files(
+            &javac_path,
+            &modern,
+            &output_dir,
+            &["--release", "21"],
+            false,
+        )
     {
         compile_files(&javac_path, &modern, &output_dir, &[], true);
     }

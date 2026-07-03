@@ -1,4 +1,4 @@
-# HIB-CV-38 — `DynamicBatchFetchTest` SIGSEGV: possible regression / reopening of HIB-CV-37
+# HIB-CV-39 — `DynamicBatchFetchTest` SIGSEGV: possible regression / reopening of HIB-CV-37
 
 **Status:** OPEN — single occurrence, needs reproduction before treating as confirmed.
 **Mode:** real-JDK, JIT on. Dev at time of observation: `d9cb7be8`.
