@@ -2200,6 +2200,47 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         },
     );
 
+    // `java/lang/Module.canRead(Module)` — same essential-vs-synthetic-jdk
+    // coverage gap as `canUse` immediately above: `register_p59_module`
+    // (native-builtins/src/phases_late.rs) ALSO registers this triple, but
+    // that function is only reachable via the `synthetic-jdk`-feature-gated
+    // `register_synthetic_overrides` — dead code in the default `cratonvm-cli`
+    // build. Unlike `canUse`/`getDescriptor`, real bytecode doesn't NPE here;
+    // it silently returns the wrong boolean (confirmed: `m.canRead(javaBase)`
+    // returned `false` via real bytecode vs. `true` on real HotSpot — every
+    // module implicitly reads `java.base`). Register the shared
+    // `native_module_can_read` fn (phases_late.rs) here too so the correct,
+    // readability-graph-backed answer is reachable in the default build.
+    registry.register(
+        "java/lang/Module",
+        "canRead",
+        "(Ljava/lang/Module;)Z",
+        crate::phases_late::native_module_can_read,
+    );
+
+    // `Module.addExports(String, Module)` / `addOpens(String, Module)` — same
+    // essential-vs-synthetic-jdk gap, but worse than `canRead`: real bytecode
+    // (`implAddExportsOrOpens`, Module.java) directly reads
+    // `this.descriptor.isOpen()` (a field, not the overridden `getDescriptor()`
+    // accessor), and that field is never populated — so a direct call NPEs
+    // ("Cannot invoke ... because \"this.descriptor\" is null") instead of
+    // silently returning a wrong answer. Register the shared
+    // `native_module_add_exports`/`native_module_add_opens` fns
+    // (phases_late.rs) here too so the mutation reaches the boot
+    // `ModuleRegistry` without ever touching the null field.
+    registry.register(
+        "java/lang/Module",
+        "addExports",
+        "(Ljava/lang/String;Ljava/lang/Module;)Ljava/lang/Module;",
+        crate::phases_late::native_module_add_exports,
+    );
+    registry.register(
+        "java/lang/Module",
+        "addOpens",
+        "(Ljava/lang/String;Ljava/lang/Module;)Ljava/lang/Module;",
+        crate::phases_late::native_module_add_opens,
+    );
+
     registry.register(
         "java/lang/String",
         "trim",
@@ -46103,6 +46144,71 @@ mod vector_support_essential_tests {
         assert!(registry
             .find(vector_support, "getMaxLaneCount", "(Ljava/lang/Class;)I")
             .is_some());
+    }
+}
+
+#[cfg(test)]
+mod module_can_read_essential_tests {
+    use super::*;
+
+    /// `register_p59_module` (phases_late.rs) also registers this triple, but
+    /// that function is only reachable via the `synthetic-jdk`-feature-gated
+    /// `register_synthetic_overrides` — dead code in the default `cratonvm-cli`
+    /// build. `register_essential_natives` is what real-JDK-mode boot
+    /// actually uses, so THIS is the registration that has to exist for
+    /// `Module.canRead(Module)` to answer correctly instead of silently
+    /// returning the wrong boolean via real bytecode (confirmed:
+    /// `m.canRead(javaBaseModule)` returned `false` via real bytecode vs.
+    /// `true` on real HotSpot).
+    #[test]
+    fn register_essential_includes_module_can_read() {
+        let mut registry = NativeMethodRegistry::new();
+        register_essential_natives(&mut registry);
+        assert!(
+            registry
+                .find("java/lang/Module", "canRead", "(Ljava/lang/Module;)Z")
+                .is_some(),
+            "Module.canRead(Module) must be registered in the essential \
+             (real-JDK) native path, not just the synthetic-jdk-only \
+             register_p59_module"
+        );
+    }
+
+    /// Same gap as `canRead` above, but with a crash instead of a wrong
+    /// answer: real bytecode (`implAddExportsOrOpens`) reads
+    /// `this.descriptor.isOpen()` directly, and that field is never
+    /// populated, so a direct `Module.addExports`/`addOpens` call NPEs
+    /// ("Cannot invoke ... because \"this.descriptor\" is null") when only
+    /// `register_p59_module` (synthetic-jdk-only, dead in the default build)
+    /// has the registration.
+    #[test]
+    fn register_essential_includes_module_add_exports_and_opens() {
+        let mut registry = NativeMethodRegistry::new();
+        register_essential_natives(&mut registry);
+        assert!(
+            registry
+                .find(
+                    "java/lang/Module",
+                    "addExports",
+                    "(Ljava/lang/String;Ljava/lang/Module;)Ljava/lang/Module;"
+                )
+                .is_some(),
+            "Module.addExports(String, Module) must be registered in the \
+             essential (real-JDK) native path, not just the \
+             synthetic-jdk-only register_p59_module"
+        );
+        assert!(
+            registry
+                .find(
+                    "java/lang/Module",
+                    "addOpens",
+                    "(Ljava/lang/String;Ljava/lang/Module;)Ljava/lang/Module;"
+                )
+                .is_some(),
+            "Module.addOpens(String, Module) must be registered in the \
+             essential (real-JDK) native path, not just the \
+             synthetic-jdk-only register_p59_module"
+        );
     }
 }
 
