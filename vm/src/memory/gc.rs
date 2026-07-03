@@ -269,6 +269,26 @@ pub fn update_all_roots(
         }
     }
 
+    // 6c. Pre-allocated singleton OutOfMemoryError. The root scan keeps it
+    //     ALIVE (memory/roots.rs step 8c), but the holder is a bare
+    //     `SharedVm` field no other remap step covers — without this, the
+    //     first relocating GC that moves the singleton leaves
+    //     `shared.singleton_oom` dangling, and a later true OOM throws a
+    //     reclaimed/zeroed object that surfaces as the unreadable
+    //     `Exception in thread "main" unknown` (observed deterministically on
+    //     the SteadyChurn recreation under sustained G1 churn).
+    {
+        let mut oom = shared.singleton_oom.write();
+        if let Some(ref mut obj_ref) = *oom {
+            let old_addr = obj_ref.as_ptr() as usize;
+            if let Some(&new_addr) = pointer_map.get(&old_addr) {
+                debug_assert!(new_addr != 0, "GC pointer map contains null address");
+                *obj_ref = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+            }
+        }
+    }
+
+    // 7. System streams (System.out, System.err)
     // 7. System streams (System.out, System.err, System.in)
     //
     // try_write, NOT write: the singleton initializers (e.g.

@@ -56,7 +56,7 @@ impl ContainerInfo {
 
 #[cfg(target_os = "linux")]
 mod platform {
-    use super::ContainerInfo;
+    use super::{calculate_effective_cpus, ContainerInfo};
     use std::fs;
     use std::path::Path;
 
