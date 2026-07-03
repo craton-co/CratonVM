@@ -1,113 +1,111 @@
 # Spring AOP: lambda beans not auto-proxied (hidden-class pointcut matching)
 
-**Status:** OPEN (UNFIXED)
+**Status:** ✅ RESOLVED
 
 ## Symptom
 
 `org.springframework.aop.aspectj.autoproxy.AspectJAutoProxyCreatorTests` — 3 of 22
-test methods fail on CratonVM real-JDK jit-on mode vs HotSpot:
+test methods failed on CratonVM real-JDK jit-on mode vs HotSpot:
 
 - `nullAdviceIsSkipped()`
 - `lambdaIsAlwaysProxiedWithJdkProxy(Class)` — both parameterizations
   (`ProxyTargetClassFalseConfig`, `ProxyTargetClassTrueConfig`)
 
-All three fail at `AopUtils.isAopProxy(supplier)` returning `false`: Spring's
-`AnnotationAwareAspectJAutoProxyCreator` decides NOT to proxy a `Supplier<String>`
-lambda bean at all, because it finds no eligible advisor for it. (Two sibling
+All three failed at `AopUtils.isAopProxy(supplier)` returning `false`: Spring's
+`AnnotationAwareAspectJAutoProxyCreator` decided NOT to proxy a `Supplier<String>`
+lambda bean at all, because it found no eligible advisor for it. (Two sibling
 tests in the same class — `twoAdviceAspectPrototype`/`twoAdviceAspectSingleton` —
-were a *different* bug, already fixed; see
-`fix(classloader): findLoadedClass proxy visibility for own defining loader`.)
+were a *different*, already-fixed bug: `find_loaded_class_for_loader` hiding a
+generated JDK proxy from its own built-in defining loader. See dev commit
+`99cc206b`.)
 
-## Root-cause trail
+## Root cause
 
-1. `AopUtils.canApply(pointcut, lambdaClass)` (spring-aop) iterates the lambda's
-   own class methods *and* its interfaces, testing each against the pointcut
-   `execution(* java.util.function.Supplier+.get())`.
-2. For the lambda's own concrete `get()` method (declaring class = the lambda's
-   hidden class, e.g. `Foo$$Lambda/0x80000000`), `AspectJExpressionPointcut`
-   (via aspectjweaver 1.9.25's `PointcutExpression.matchesMethodExecution`)
-   throws `ReflectionWorld$ReflectionWorldException: can't determine superclass
-   of missing type Foo$$Lambda.0x80000000` (note: aspectjweaver's own internal
-   `/` → `.` "make dotted" conversion corrupts the literal `/0x...` suffix in
-   the hidden-class name into `.0x...`, which cannot resolve back to the real
-   class either way).
-3. **This same exception reproduces identically on real HotSpot** when calling
-   the raw `aspectjweaver` API directly (`PointcutParser` +
-   `matchesMethodExecution`) — confirmed via an isolated repro using the exact
-   same `PointcutParser` factory method, primitive set, and
-   `pointcutDeclarationScope` that Spring's `AspectJExpressionPointcut` uses
-   internally. So the underlying aspectjweaver limitation with hidden/lambda
-   classes is **not CratonVM-specific**.
-4. Yet Spring's `AopUtils.canApply` — going through the *real*
-   `AspectJExpressionPointcut.matches(Method, Class, boolean)` wrapper (not the
-   raw aspectjweaver API) — returns `true` on HotSpot and `false` on CratonVM
-   for the **exact same inputs** (same lambda class, same declaring method, same
-   `getMostSpecificMethod` resolution — verified identical on both JVMs).
-   `AspectJExpressionPointcut.getShadowMatch()` catches
-   `ReflectionWorldException` and has fallback logic
-   (`getFallbackPointcutExpression` + a retry against the "original" method
-   before `AopUtils.getMostSpecificMethod` resolution) — but in this scenario
-   `targetMethod == originalMethod` already (the lambda's own `get()` IS already
-   the most-specific method), so the "retry with original method" branch never
-   fires on either JVM. Despite identical control flow up to this point, the
-   final `shadowMatch` verdict differs between JVMs.
+`Class.getGenericInterfaces()` returned an **empty array** for lambda-proxy
+classes on CratonVM (`native_class_get_generic_interfaces`,
+`native-builtins/src/lang_class.rs`), while HotSpot correctly returns
+`[interface java.util.function.Supplier]` for the same lambda's `Class` object.
 
-## What's ruled out (verified, not the cause)
+`native_class_get_interfaces()` (backing `Class.getInterfaces()`) already had a
+special case for lambda-proxy classes — CratonVM doesn't register a lambda's
+synthetic class in the class manager, so it looks up the lambda's SAM
+(functional) interface via `ctx.lambda_functional_interface(class_id)` and
+returns `[SAM]`. `native_class_get_generic_interfaces()` was missing this exact
+same special case: with no generic `Signature` attribute (lambdas don't have
+one) it fell through to the generic fallback `ctx.class_interfaces(class_id)`,
+which — like everything else keyed off the class manager — returns empty for a
+class id that was never registered there.
 
-- **Not** a `Class.getName()` / `Method.toString()` bug: `Class.getTypeName()`
-  and `Class.getName()` both return the fully-correct dotted lambda class name
-  on CratonVM, matching HotSpot exactly, including through
-  `Method.getDeclaringClass().getTypeName()`. (There IS a separate, purely
-  cosmetic bug where `Method.toString()`'s own native implementation
-  (`native_method_to_string` in `native-builtins/src/lang_reflect.rs:815`) prints
-  an *empty* declaring-class prefix for lambda-proxy classes — because it reads
-  the name via `mirror_class_name()`, which does not special-case lambda-proxy
-  `ClassId`s the way `native_class_get_name` does via `lambda_proxy_class_name()`
-  — but this is display-only and does not affect `getTypeName()`/`getName()`,
-  which lambda-proxy classes DO special-case correctly. Worth fixing separately
-  as a cosmetic follow-up: route `mirror_class_name`/`mirror_class_name_strict`
-  through the same `lambda_proxy_class_name()` check as `native_class_get_name`.)
-- **Not** a Class-mirror identity/duplication bug: `Method.getDeclaringClass() ==
-  lambdaClass` is `true` on CratonVM (single canonical mirror, not duplicated).
-- **Not** a `getMostSpecificMethod` resolution difference: identical result
-  (returns the lambda's own method, unchanged) on both JVMs.
-- **Not** a `ShadowMatchUtils` cache-collision artifact from `canApply`'s
-  iteration order (own-class methods enumerated before interface methods, so a
-  degenerate self-match get cached under the same key AspectJ later reuses for
-  the interface method): reproduced the exact 2-step call sequence on a single
-  shared `AspectJExpressionPointcut` instance and the FIRST call
-  (`matches(lambdaOwnGet, lambdaClass)`, the "trivial"/degenerate case with no
-  fallback-retry involved at all) *already* disagrees between JVMs — HotSpot
-  `true`, CratonVM `false` — before the cache-collision theory is even relevant.
+A related bug in the same vein: `Class.getPackageName()`
+(`native_class_get_package_name`) also returned an **empty string** for
+lambda-proxy classes (vs HotSpot's correct host-class package), for the exact
+same reason — it resolves the package via `class_name_of_id`/`mirror_class_name`,
+both of which miss the class-manager lookup for a lambda-proxy id.
 
-## Where to look next
+Spring's `AspectJExpressionPointcut`/`AopUtils.canApply` — via aspectjweaver's
+reflection-based pointcut matching for `execution(* java.util.function.Supplier+.get())`
+— consults `getGenericInterfaces()` (not just `getInterfaces()`) when resolving
+a method's declaring-class supertype closure for subtype ("+") matching. With
+an empty interfaces array, AspectJ concluded the lambda implemented no
+interfaces at all and returned `neverMatches()` for every candidate method —
+`AopUtils.canApply` found no eligible advisor, so
+`AnnotationAwareAspectJAutoProxyCreator` never wrapped the lambda bean in a
+proxy.
 
-The divergence must be inside `ReflectionWorld`/`ShadowMatchImpl` construction
-for the `MissingResolvedTypeWithKnownSignature` placeholder AspectJ falls back to
-after the "missing type" exception — specifically why
-`JoinPointSignatureIterator`/`SignaturePattern.matches` ultimately produces a
-positive "maybe/always matches" verdict on HotSpot from a supposedly-failed type
-resolution, but a firm "never matches" on CratonVM from the *same* failed
-resolution. Plausible next steps:
-- Instrument (temporarily) `ShadowMatchImpl`/`MissingResolvedTypeWithKnownSignature`
-  inside aspectjweaver itself (decompile/patch a local copy, or attach a debugger)
-  to see exactly which `FuzzyBoolean` value it derives post-exception on each JVM.
-- Check whether CratonVM's `is_class_hidden()` (native-builtins) correctly
-  reports lambda-proxy classes as hidden (`Class.isHidden()`), and whether
-  aspectjweaver has version-gated special-casing for `Class.isHidden()` that
-  takes a different path than the generic "missing type" placeholder — if so,
-  the CratonVM divergence might be in some OTHER reflective query (annotations,
-  generic signature, interfaces-of-declaring-class) that aspectjweaver consults
-  when constructing the placeholder's fallback answer, not in name resolution
-  at all.
+## Fix
+
+Added the same `ctx.lambda_functional_interface(class_id)` special case to
+`native_class_get_generic_interfaces()` that `native_class_get_interfaces()`
+already had (return `[SAM]` as a plain, non-generic `Class[]`/`Type[]`, matching
+the JDK contract that `getGenericInterfaces()` returns the raw interface list
+when there's no generic signature to parse).
+
+Added a lambda-proxy special case to `native_class_get_package_name()`: derive
+the package from the lambda's host class name (via `ctx.lambda_proxy_host`)
+instead of falling through to the class-manager-backed lookup that has no entry
+for a lambda-proxy id.
+
+## Investigation trail (for context — dead ends ruled out before finding the real cause)
+
+Before finding the actual bug, several plausible-looking hypotheses were tested
+and ruled out via a ground-truth harness (a locally patched, recompiled copy of
+`AspectJExpressionPointcut` with debug tracing added to `getShadowMatch`,
+shadowing the real class earlier on the classpath) — confirming that
+`PointcutExpression.matchesMethodExecution()` does **not** throw when called
+through Spring's real code path, and directly returns `neverMatches()` on
+CratonVM vs `alwaysMatches()` on HotSpot for the identical `Method` object.
+Ruled out along the way:
+
+- **Not** a `Class.getName()` / `getTypeName()` bug — both return the correct
+  dotted lambda class name on CratonVM, matching HotSpot exactly.
+- **Not** a Class-mirror identity/duplication bug — `Method.getDeclaringClass()
+  == lambdaClass` is `true` on CratonVM.
+- **Not** a `getMostSpecificMethod` resolution difference — identical on both
+  JVMs.
+- **Not** `Class.isHidden()` misreporting — both JVMs correctly report `true`,
+  and `Class.forName` correctly throws `ClassNotFoundException` for the hidden
+  class on both (per JVMS §5.3, hidden classes are never discoverable by name).
+- A raw, standalone `aspectjweaver` `PointcutParser` reproduction (bypassing
+  Spring's `AspectJExpressionPointcut` entirely) threw a `ReflectionWorldException`
+  identically on both JVMs — this turned out to be an artifact of the simplified
+  reproduction not matching Spring's exact `PointcutExpression` construction
+  (missing `BeanPointcutDesignatorHandler` registration and/or other setup), and
+  was a dead end / not representative of the actual code path Spring uses.
+
+There is also a separate, minor **cosmetic** bug (not fixed here, low priority):
+`Method.toString()` (`native_method_to_string`, `native-builtins/src/lang_reflect.rs`)
+prints an empty declaring-class prefix for a lambda-proxy method (e.g.
+`public java.lang.Object .get()` instead of `public java.lang.Object
+Foo$$Lambda/0x....get()`), because it reads the name via `mirror_class_name()`,
+which — unlike `native_class_get_name()` — doesn't special-case lambda-proxy
+class ids via `lambda_proxy_class_name()`. Does not affect `getName()`/
+`getTypeName()`, which already handle lambda proxies correctly, so it's display
+-only.
 
 ## Repro
 
-`apps/spring-suite-runner`; `CRATONVM_BIN=<built-vm> KRUN_STACK=1 ./run-suite.sh
-run --jdk real --jit on --batch 1 --only 'AspectJAutoProxyCreatorTests'`.
-
-Isolated Java repro (no suite needed) used during this investigation constructed
-a fresh standalone `Supplier<String> lambda = () -> "x"` (bypassing Spring
-entirely) and called `AopUtils.canApply(pointcut, lambda.getClass())` directly —
-reproduces `false` on CratonVM / `true` on HotSpot with zero Spring machinery
-involved beyond `spring-aop`'s own `AopUtils`/`AspectJExpressionPointcut`.
+`apps/spring-suite-runner`; `CRATONVM_BIN=<built-vm> ./run-suite.sh run --jdk
+real --jit on --batch 1 --only 'AspectJAutoProxyCreatorTests'` — 22/22 passing
+after the fix (0 known regressions; spring-aop module regression sweep, plus
+`SerializableTypeWrapperTests`/`MethodInvokingFactoryBeanTests` spot checks, all
+clean).
