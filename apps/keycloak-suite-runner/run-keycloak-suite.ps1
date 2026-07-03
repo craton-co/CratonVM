@@ -562,7 +562,25 @@ function Get-ModuleClasspathEntries {
     ) -WorkingDirectory $script:KeycloakDir -StdoutPath $outLog -StderrPath $errLog
     $exit = Complete-RedirectedProcess $record
     if ($exit -ne 0) {
-      Die "Maven dependency:build-classpath failed for $Module (exit $exit). Logs: $outLog $errLog"
+      $outText = (Get-Content -Path $outLog -Raw -ErrorAction SilentlyContinue)
+      $errText = (Get-Content -Path $errLog -Raw -ErrorAction SilentlyContinue)
+      if (($outText + $errText) -match 'Could not find the selected project in the reactor') {
+        $moduleOutLog = Join-Path $cacheDir "$safe.module.maven.out.log"
+        $moduleErrLog = Join-Path $cacheDir "$safe.module.maven.err.log"
+        Write-Info "module is not selectable from root reactor, building Maven test classpath from module directory: $Module"
+        $record = Start-RedirectedProcess -FilePath $mvn -Arguments @(
+          '-DincludeScope=test',
+          "-Dmdep.outputFile=$cpFile",
+          '-DskipTests',
+          'dependency:build-classpath'
+        ) -WorkingDirectory $moduleRoot -StdoutPath $moduleOutLog -StderrPath $moduleErrLog
+        $exit = Complete-RedirectedProcess $record
+        if ($exit -ne 0) {
+          Die "Maven dependency:build-classpath failed for $Module from module directory (exit $exit). Logs: $moduleOutLog $moduleErrLog"
+        }
+      } else {
+        Die "Maven dependency:build-classpath failed for $Module (exit $exit). Logs: $outLog $errLog"
+      }
     }
   }
 
