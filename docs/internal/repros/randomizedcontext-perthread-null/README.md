@@ -92,6 +92,74 @@ This means: **the residual failure is not an "incorrectly cleared while
 still alive" bug of the class this fix addresses.** Something else — not yet
 identified — is producing the same NPE.
 
+## Session 2 (2026-07-02, later): GC exonerated, narrowed to a JIT bug
+
+Follow-up investigation after the pointer_map-completeness fix above did not
+resolve the deterministic `MappingStatsTests` failure. Summary of the
+evidence chain (full detail in the known-issues doc's "Residual: root cause
+NARROWED to a JIT bug" section):
+
+1. Added `[watchref] THREAD MIRROR IDENTITY CHANGED` tracing to
+   `current_thread_object` — zero identity changes across 20 threads in a
+   full failing run. Rules out mirror-address or identity-hash instability.
+2. In the same trace, only ONE young GC ran in the entire ~38s/14-test run,
+   and it happened before the suite thread's watched-referent address ever
+   appeared in a published watch-list — i.e. before `RandomizedContext.
+   create()` plausibly ran. No GC occurred in the relevant window at all in
+   this run. GC cannot explain a failure with no GC present.
+3. **`--nojit` does not reproduce the NPE** — it hits an unrelated
+   `ClassCastException` in `testConcurrentSerialization` instead. This is the
+   key finding: JIT compilation is *necessary* to reproduce the bug.
+4. `CRATONVM_DBG_DUMP_JIT=LIST` on a failing run shows exactly four
+   `java/util/WeakHashMap` methods get JIT-compiled: `hash`, `indexFor`,
+   `matchesKey`, `maskNull` — precisely the bucket-lookup/key-match
+   primitives behind `get()`/`getEntry()`. `matchesKey`'s compiled body is
+   979 bytes (`CRATONVM_DBG_DUMP_JIT=matchesKey`), unusually large, with 3-4
+   near-duplicate code blocks (not yet disassembled/verified).
+5. Ruled out as the SPECIFIC cause: `CRATONVM_DISABLE_SCALAR_REPLACEMENT`,
+   `CRATONVM_DISABLE_AALOAD_LICM`, `CRATONVM_DISABLE_ARITH_LICM`,
+   `CRATONVM_DISABLE_UNROLL`, `CRATONVM_NO_IR_BRANCHY` — individually and all
+   together, the NPE still reproduces. Not one specific, already-toggleable
+   optimization pass.
+6. Four isolated `.java` repros in `whm-repro/` (single-threaded stress,
+   interleaved resize, multi-threaded synchronized contention, thread
+   start/join cycles) — none reproduced a single miss after millions of
+   `get()` calls each. The bug needs either the ES workload's full scale (165
+   total JIT-compiled methods, not just the four `WeakHashMap` ones) or a
+   timing window these simplified repros don't hit.
+
+### Repro commands for this session's findings
+
+`--nojit` comparison (from `C:\craton\CratonVM\apps\elasticsearch`, same args
+as the main Repro section, plus `--nojit`):
+
+```powershell
+& <cratonvm.exe> --java-home "C:\Program Files\Java\jdk-25" ... --nojit -cp $cp `
+  org.junit.runner.JUnitCore org.elasticsearch.action.admin.cluster.stats.MappingStatsTests
+```
+
+List every JIT-compiled method in a failing run:
+
+```powershell
+$env:CRATONVM_DBG_DUMP_JIT = "LIST"
+& <cratonvm.exe> ... # same command, JIT on
+# stderr contains one "[JIT_COMPILED] Class.methodName(desc)" line per compile
+```
+
+Dump one suspect method's machine code:
+
+```powershell
+$env:CRATONVM_DBG_DUMP_JIT = "matchesKey"
+& <cratonvm.exe> ...
+# stderr contains "[JIT_DUMP] ..." with the raw hex bytes
+```
+
+Isolated repros (`whm-repro/*.java`) — compile with `javac`, run under this
+VM with `-cp .`, no special flags needed; they exercise `WeakHashMap` get/put
+under JIT-compilation-forcing iteration counts, both single- and
+multi-threaded. All four passed cleanly (0 misses) against the build that
+still fails the full ES repro.
+
 ## Old-gen `is_addr_live` masking note
 
 `GenerationalHeap::is_old_gen_addr(addr)` is a coarse region-bounds check

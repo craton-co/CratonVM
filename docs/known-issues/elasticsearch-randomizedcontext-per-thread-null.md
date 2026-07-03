@@ -1,11 +1,14 @@
 # Elasticsearch RandomizedContext per-thread state is null
 
-Status: open (partial fix landed — see "Confirmed root cause #1 (fixed)"; the
-exact repro below still fails via a residual cause, not yet root-caused)
+Status: open (one real GC bug found + fixed, see "Confirmed root cause #1
+(fixed)"; the exact repro below still fails via a SEPARATE, JIT-related
+residual — narrowed to 4 suspect JIT-compiled `WeakHashMap` methods, see
+"Residual: root cause NARROWED to a JIT bug — not GC")
 
 Date observed: 2026-07-02
-Date partially fixed: 2026-07-02 (branch `fix/es-randomizedcontext-per-thread-null`,
-worktree `C:\craton\CratonVM-randctx-perthread`, NOT YET MERGED)
+Date partially fixed / JIT lead identified: 2026-07-02 (branch
+`fix/es-randomizedcontext-per-thread-null`, worktree
+`C:\craton\CratonVM-randctx-perthread`, NOT YET MERGED)
 
 ## Summary
 
@@ -118,64 +121,140 @@ non-moving sweep ran.
 - `gc/src/old_gen.rs::tests::compact_records_identity_map_for_watched_stationary_survivor`
   — same shape, for the old-gen compactor.
 
-## Residual: the exact repro below still fails — root cause NOT yet found
+## Residual: root cause NARROWED to a JIT bug — not GC (2026-07-02, later session)
 
-With both fixes applied, `MappingStatsTests` (see Repro) still fails
-**deterministically** with the identical NPE signature, now reported as a
-JUnit **class-level** failure (`1) org.elasticsearch.action.admin.cluster.stats.MappingStatsTests`,
-not a specific `@Test` method) after all 14 test methods pass — i.e. during
-`RandomizedRunner`/`ThreadLeakControl` teardown, on whichever thread runs
-that teardown.
+With both GC fixes applied, `MappingStatsTests` (see Repro) still fails
+**deterministically** with the identical NPE signature, reported as a JUnit
+**class-level** failure (`1) org.elasticsearch.action.admin.cluster.stats.MappingStatsTests`,
+not a specific `@Test` method) after all 14 test methods pass.
 
-**`CRATONVM_DBG_WATCHREF` evidence rules out an incorrect clear-decision as
-the cause of this specific failure**: in the final relevant GC cycle(s)
-before the crash, every `[watchref] weak CLEAR`/`"was DEAD"` event
-cross-references to an address that was independently confirmed dead
-elsewhere in the same trace — none correlate to an object that should have
-survived. The fix above is doing its job; something else is producing this
-NPE.
+`javap` disassembly of `RandomizedRunner.class` (from
+`randomizedtesting-runner-2.8.2.jar`) confirms the exact threading shape:
+`runSuite(RunNotifier)` creates ONE dedicated `RunnerThreadGroup` + suite
+thread (`new Thread(threadGroup, runnable, name); .start(); .join();`),
+which runs `RandomizedContext.create(...)` (→ `perThreadResources.put(
+Thread.currentThread(), new PerThreadResources())`, ONE call, at the very
+start), then all 14 test methods (each independently confirmed passing),
+then `popAndDestroy()` (→ `getPerThread()` → `perThreadResources.get(
+Thread.currentThread())`, the call that returns null) at the very end. The
+`put()` and the failing `get()` are on the *same* thread, `Thread.
+currentThread()` in between.
 
-A **separate, non-deterministic** failure was also observed in some (not
-all) runs: `testConcurrentSerialization` fails mid-test via
+### GC is now fully exonerated for this specific failure
+
+1. **No incorrect clear.** `CRATONVM_DBG_WATCHREF` tracing showed every
+   `weak CLEAR`/`"was DEAD"` event in a full run correlates only to
+   independently-confirmed-dead objects — never to something that should
+   have survived.
+2. **Thread mirror identity is stable.** New tracing added to
+   `vm/src/vm/vm_exec.rs::current_thread_object` (`[watchref] THREAD MIRROR
+   IDENTITY CHANGED`, gated by `CRATONVM_DBG_WATCHREF`) logs whenever a given
+   OS thread's own `Thread.currentThread()` mirror address or identity hash
+   changes between calls. Across a full failing run (20 distinct threads,
+   including the suite thread), **zero** changes were observed — every
+   thread's own mirror is address- and hash-stable for its entire life. This
+   also indirectly confirms `next_hash()` (the monotonic-counter identity
+   hash stamped once at allocation in `alloc_object`) is correctly preserved
+   across every relocation path checked (moving-young Cheney copy —
+   explicit field-by-field preservation at `gen_heap.rs` `forward_object_impl`
+   line ~6066; selective-promotion evacuation and old-gen compaction — both
+   full-object `std::ptr::copy`/`copy_nonoverlapping`, which preserves the
+   header byte-for-byte).
+3. **No GC ran during the relevant window, at least in some failing runs.**
+   In one fully-traced deterministic failure, `CRATONVM_DBG_WATCHREF` recorded
+   exactly ONE young-GC cycle for the entire ~38s / 14-test run, and it
+   occurred early — before the suite thread's own watched-referent address
+   ever appeared in a published watch-list (i.e., before `RandomizedContext.
+   create()`'s `put()` plausibly ran). No GC of any kind (young, concurrent
+   old-gen mark-sweep via `maybe_concurrent_gc`, or otherwise) is recorded
+   between `put()` and the failing `get()` in this run. A bug that requires a
+   GC to fire cannot explain a failure with no GC in the relevant window.
+
+### Confirmed: JIT-only reproduction
+
+Re-running the identical repro with `--nojit` **does not reproduce this NPE
+at all** — it hits a different, unrelated `ClassCastException` inside
+`testConcurrentSerialization` instead
+(`java.lang.Object cannot be cast to org.elasticsearch.common.io.stream.Writeable`,
+a distinct pre-existing bug, out of scope here). This is strong, direct
+evidence that **JIT compilation is necessary to reproduce the
+`RandomizedContext` NPE** — the bug is in JIT-compiled code, not in GC, not
+in the interpreter.
+
+`CRATONVM_DBG_DUMP_JIT=LIST` (env var, prints every JIT-compiled method sig)
+on a failing run shows exactly four `java/util/WeakHashMap` methods get
+JIT-compiled during the run:
 
 ```text
-java.util.concurrent.ExecutionException: java.lang.NullPointerException: Cannot read field "randomnesses" because the return value of "com.carrotsearch.randomizedtesting.RandomizedContext.getPerThread()" is null
+java/util/WeakHashMap.maskNull(Ljava/lang/Object;)Ljava/lang/Object;
+java/util/WeakHashMap.indexFor(II)I
+java/util/WeakHashMap.hash(Ljava/lang/Object;)I
+java/util/WeakHashMap.matchesKey(Ljava/util/WeakHashMap$Entry;Ljava/lang/Object;)Z
 ```
 
-— i.e. the identical NPE, but thrown from inside a worker thread's task
-(`Future.get()` unwrapping it), not from suite teardown. This did not
-reproduce on every run with the same seed, consistent with a genuine timing
-race rather than the deterministic pointer_map gap fixed above.
+These are precisely the bucket-lookup/key-matching primitives behind
+`WeakHashMap.get()`/`getEntry()`. `matchesKey` in particular is the
+strongest suspect: it dereferences an `Entry`'s `WeakReference.get()` and
+compares against the query key — a JIT codegen bug there (wrong register
+compared, a spilled value read after being clobbered, etc.) would produce
+exactly this symptom: an entry present in the correct bucket that the
+lookup fails to recognize as a match, so `getEntry()`/`get()` returns null
+even though the entry was never actually cleared. `matchesKey`'s compiled
+body is unusually large for its Java source (979 bytes; dumped via
+`CRATONVM_DBG_DUMP_JIT=matchesKey`) with 3-4 near-duplicate code blocks,
+consistent with the method being inlined at multiple call sites — not yet
+manually verified against expected semantics (needs a proper disassembler
+pass, not just hex inspection).
 
-### Leads for further investigation (not yet pursued)
+**Ruled out**: the bug is NOT one specific, already-toggleable JIT
+optimization pass. Re-running with `CRATONVM_DISABLE_SCALAR_REPLACEMENT=1`
+alone, and then with all of `CRATONVM_DISABLE_SCALAR_REPLACEMENT`,
+`CRATONVM_DISABLE_AALOAD_LICM`, `CRATONVM_DISABLE_ARITH_LICM`,
+`CRATONVM_DISABLE_UNROLL`, and `CRATONVM_NO_IR_BRANCHY` set together, the
+NPE still reproduces deterministically. Whatever is wrong is either in base
+JIT codegen/register allocation (not a specific optimization pass) or in a
+JIT-adjacent subsystem (calling convention into `Reference.get()`, GC-root
+interaction with JIT-compiled `WeakHashMap` methods, or similar).
 
-- `com.carrotsearch.randomizedtesting.ThreadLeakControl.forkTimeoutingTask`
-  appeared in a class-init stack trace during this investigation — each test
-  method's `Statement` chain (and possibly the whole suite) may run on a
-  **forked** thread, distinct from the thread JUnitCore started on. If the
-  suite/teardown thread spends most of its life **blocked** (`Future.get()`,
-  `join()`) waiting on these forked/worker threads, its own `java_thread_obj`
-  root depends on the blocking-native root-snapshot deposit path
-  (`NativeContextImpl::deposit_root_snapshot`, `vm/src/vm/vm_exec.rs`) — the
-  exact mechanism [[reference_thread_mirror_snapshot_root]] fixed for a
-  different symptom (Tomcat `TestDigestAuthenticator`, commit 34f9f68b /
-  merge b109248e). That fix should already cover this, but has not been
-  independently re-verified for the RandomizedContext/ThreadLeakControl
-  threading shape specifically — worth confirming rather than assuming.
+**Isolated repro attempts did NOT reproduce it** (see
+`docs/internal/repros/randomizedcontext-perthread-null/whm-repro/` for the
+four `.java` files tried): (1) single-threaded, 2M `get()` calls on a stable
+key against a 2000-entry map; (2) interleaved growth/resize with 50 `get()`
+checks between each of 40000 `put()`s; (3) 8 concurrent threads under a
+shared `synchronized` lock, each `put`ting and `get`ting its own key 20000
+times plus periodic churn `put`s, then a final check from `main` after
+`join`ing; (4) 500 rounds of `new Thread().start().join()` with a `get()`
+check on the stable "self" key after each round. None reproduced a single
+miss. The real failure needs either the full ES/RandomizedContext workload's
+scale (165 total JIT-compiled methods interacting, not just the four
+`WeakHashMap` ones in isolation) or a timing window not yet captured by
+these simplified repros — worth another isolated-repro attempt that more
+closely matches ES's exact allocation/thread-churn pattern, or a proper
+disassembly-level review of the four suspect compiled methods.
+
+### Leads for further investigation
+
+- **Primary lead**: disassemble and manually verify
+  `WeakHashMap.matchesKey`/`hash`/`indexFor`/`maskNull`'s JIT-compiled output
+  against expected semantics (a real x86-64 disassembler, not hex-by-eye).
+  Reproduce via `CRATONVM_DBG_DUMP_JIT=matchesKey` (or `hash`/`indexFor`/
+  `maskNull`) against the Repro command below.
+- The blocked-thread root-snapshot mechanism (`reference_thread_mirror_
+  snapshot_root` in memory — the Tomcat `TestDigestAuthenticator` fix,
+  commit 34f9f68b / merge b109248e) was a leading theory earlier in this
+  investigation but is now directly ruled out by the "Thread mirror identity
+  is stable" evidence above (zero identity changes observed across every
+  thread in a full failing run) — do not re-open it without new evidence.
 - The non-deterministic `testConcurrentSerialization` worker-thread failure
-  suggests a **newly-spawned** thread mid-task, not a long-lived one — worth
-  checking whether a just-`Thread.start()`ed worker can observe a transient
-  state (e.g. the pre-GC referent-null / post-GC restore window in
-  `weakref_null_referents_pre_gc` / `process_references_after_gc`) if it is
-  not yet fully participating in the STW barrier when GC begins.
-- `RandomizedContext$PerThreadResources` entries are seeded via a
-  `cloneFor(Thread)`-shaped method (confirmed via `javap` disassembly of
-  `com.carrotsearch.randomizedtesting.RandomizedContext.class` from
-  `randomizedtesting-runner-2.8.2.jar`) called from the *parent* thread
-  before a worker starts — `getPerThread()`/`push()` themselves have **no**
-  lazy-creation fallback, so a null return always means either (a) the entry
-  was cleared after being legitimately created, or (b) `cloneFor` was never
-  called for that thread in the first place. Worth confirming which.
+  (mid-test `ExecutionException` wrapping the identical NPE, seen in some but
+  not all runs) is presumably the same JIT bug hitting a different thread's
+  entry at a different point — not independently re-investigated after the
+  JIT-vs-nojit finding above.
+- A tighter isolated repro: try scaling up the isolated `WhmRepro*.java`
+  tests' total JIT-compiled-method count (e.g. by adding unrelated hot loops
+  elsewhere in the same process) to see if register/codegen pressure from
+  *other* JIT-compiled code is a necessary ingredient, not just
+  `WeakHashMap`'s own methods in isolation.
 
 ### Related symptom: duplicate `createTempDir()` paths → node-lock cascade
 
