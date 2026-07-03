@@ -438,7 +438,10 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     //     invisible to the GC root scanner — under a moving collector the
     //     cached ObjectRefs would point at relocated or reclaimed memory
     //     after the first compaction.
-    cratonvm_native_builtins::lang_math::gc_scan_value_of_cache_roots(&mut roots);
+    cratonvm_native_builtins::lang_math::gc_scan_value_of_cache_roots(
+        shared.vm_identity,
+        &mut roots,
+    );
 
     // 15a. Unsafe / Class$Atomic synthetic-offset side stores. These hold live
     //      `ObjectRef`s that exist in NO heap slot (the synthetic-offset scheme

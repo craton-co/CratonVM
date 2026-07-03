@@ -16,10 +16,10 @@
 //! data-loss is still observed (entries 12+ become unreachable after first
 //! resize — see follow-up `WP4.6-FOLLOWUP-A`).
 //!
-//! `test_chm_pre_resize_put_get` used to be the smallest passing baseline:
+//! `test_chm_pre_resize_put_get` is the smallest no-resize baseline:
 //! 11 puts stays under the 0.75 × 16 = 12 entry resize threshold so transfer()
-//! is never invoked. It now exposes the boxed-value CHM gap tracked in
-//! `docs/known-issues/wp4-6-chm-boxed-values.md`.
+//! is never invoked. It also pins the default-mode autoboxing surface used by
+//! CHM's boxed `Integer` values.
 //!
 //! Sibling probes verify resize, mutation cycles, and clear/isEmpty invariants
 //! on the same JDK 25 ConcurrentHashMap.
@@ -29,6 +29,9 @@
 //! See `apps/chm_stress/ChmStress.java` for the contention stress probe.
 
 use cratonvm_vm::config::VmConfig;
+use cratonvm_vm::error::{MethodCallFailed, MethodCallResult};
+use cratonvm_vm::memory::ArrayElementType;
+use cratonvm_vm::types::ObjectRef;
 use cratonvm_vm::types::Value;
 use cratonvm_vm::vm::Vm;
 
@@ -38,16 +41,102 @@ fn test_resources_dir() -> String {
     format!("{manifest_dir}/tests/resources")
 }
 
-/// Check whether the build.rs has compiled the JDK21+ test fixtures.
+fn test_classpath() -> Vec<String> {
+    let mut cp = Vec::new();
+    if let Some(compiled) = option_env!("CRATONVM_TEST_CLASSES_DIR") {
+        cp.push(compiled.to_string());
+    }
+    cp.push(test_resources_dir());
+    cp
+}
+
+/// Check whether build.rs compiled the JDK21+ fixtures or committed fallback
+/// classes are present.
 fn class_files_available() -> bool {
-    let dir = test_resources_dir();
-    let class_path = format!("{dir}/cratonvm/ChmBasicProbe.class");
-    std::path::Path::new(&class_path).exists()
+    test_classpath().into_iter().any(|dir| {
+        let class_path = format!("{dir}/cratonvm/ChmBasicProbe.class");
+        std::path::Path::new(&class_path).exists()
+    })
 }
 
 fn test_vm() -> Vm {
-    let config = VmConfig::new().with_classpath(vec![test_resources_dir()]);
+    let config = VmConfig::new().with_classpath(test_classpath());
     Vm::new(config)
+}
+
+fn read_test_java_string(vm: &Vm, obj: ObjectRef) -> Option<String> {
+    let heap = &vm.shared.heap;
+    let value_array = match heap.get_field(obj, 0) {
+        Value::Object(Some(arr)) => arr,
+        _ => return None,
+    };
+
+    match heap.array_element_type(value_array) {
+        Some(ArrayElementType::Byte) => {
+            let coder = match heap.get_field(obj, 1) {
+                Value::Int(value) => value,
+                _ => 0,
+            };
+            let bytes: Vec<u8> = (0..heap.array_length(value_array))
+                .filter_map(|i| match heap.get_array_element(value_array, i).ok()? {
+                    Value::Int(value) => Some(value as u8),
+                    _ => None,
+                })
+                .collect();
+            if coder == 1 {
+                let units: Vec<u16> = bytes
+                    .chunks_exact(2)
+                    .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+                    .collect();
+                Some(String::from_utf16_lossy(&units))
+            } else {
+                Some(bytes.into_iter().map(char::from).collect())
+            }
+        }
+        Some(ArrayElementType::Char) => {
+            let units: Vec<u16> = (0..heap.array_length(value_array))
+                .filter_map(|i| match heap.get_array_element(value_array, i).ok()? {
+                    Value::Int(value) => Some(value as u16),
+                    _ => None,
+                })
+                .collect();
+            Some(String::from_utf16_lossy(&units))
+        }
+        _ => None,
+    }
+}
+
+fn throwable_detail_message(vm: &Vm, exc: ObjectRef) -> Option<String> {
+    let class_id = vm.shared.heap.class_id_of(exc);
+    let msg_ref = vm
+        .instance_field_index(class_id, "detailMessage")
+        .and_then(|idx| match vm.shared.heap.get_field(exc, idx) {
+            Value::Object(Some(msg)) => Some(msg),
+            _ => None,
+        })?;
+    read_test_java_string(vm, msg_ref)
+}
+
+fn describe_result(vm: &Vm, result: &MethodCallResult) -> String {
+    match result {
+        Err(MethodCallFailed::ExceptionThrown(exc)) => {
+            let class_id = vm.shared.heap.class_id_of(*exc);
+            let class_name = vm
+                .shared
+                .class_manager
+                .read()
+                .get_class(class_id)
+                .map(|class| class.name.to_string())
+                .unwrap_or_else(|| format!("<unknown class {:?}>", class_id));
+            match throwable_detail_message(vm, *exc) {
+                Some(message) => {
+                    format!("Err(ExceptionThrown({class_name}: {message}, {exc:?}))")
+                }
+                None => format!("Err(ExceptionThrown({class_name}, {exc:?}))"),
+            }
+        }
+        other => format!("{other:?}"),
+    }
 }
 
 macro_rules! require_class_files {
@@ -59,10 +148,9 @@ macro_rules! require_class_files {
     };
 }
 
-/// Baseline without resize: 11 entries → no `transfer()` path.
-/// Currently fails because boxed values do not round-trip through this CHM path.
+/// Baseline without resize: 11 entries -> no `transfer()` path.
+/// Pins boxed `Integer` put/get through default-mode autoboxing.
 #[test]
-#[ignore = "WP4.6 boxed-value CHM put/get gap; see docs/known-issues/wp4-6-chm-boxed-values.md"]
 fn test_chm_pre_resize_put_get() {
     require_class_files!();
     let mut vm = test_vm();
@@ -75,7 +163,10 @@ fn test_chm_pre_resize_put_get() {
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => {
-            panic!("ChmBasicProbe.testChmPreResizePutGet expected Ok(Some(Int(1))), got: {other:?}")
+            panic!(
+                "ChmBasicProbe.testChmPreResizePutGet expected Ok(Some(Int(1))), got: {}",
+                describe_result(&vm, &other)
+            )
         }
     }
 }
@@ -97,7 +188,10 @@ fn test_chm_basic_put_get() {
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => {
-            panic!("ChmBasicProbe.testChmBasicPutGet expected Ok(Some(Int(1))), got: {other:?}")
+            panic!(
+                "ChmBasicProbe.testChmBasicPutGet expected Ok(Some(Int(1))), got: {}",
+                describe_result(&vm, &other)
+            )
         }
     }
 }
@@ -113,15 +207,17 @@ fn test_chm_resize_path() {
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => {
-            panic!("ChmBasicProbe.testChmResizePath expected Ok(Some(Int(1))), got: {other:?}")
+            panic!(
+                "ChmBasicProbe.testChmResizePath expected Ok(Some(Int(1))), got: {}",
+                describe_result(&vm, &other)
+            )
         }
     }
 }
 
-/// Single-key mutation cycle — fits in one bucket, no resize.
-/// Currently fails with the same boxed-value CHM gap as the pre-resize probe.
+/// Single-key mutation cycle -> fits in one bucket, no resize.
+/// Pins boxed values through putIfAbsent/replace/remove.
 #[test]
-#[ignore = "WP4.6 boxed-value CHM mutation gap; see docs/known-issues/wp4-6-chm-boxed-values.md"]
 fn test_chm_mutation_cycle() {
     require_class_files!();
     let mut vm = test_vm();
@@ -129,7 +225,47 @@ fn test_chm_mutation_cycle() {
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => {
-            panic!("ChmBasicProbe.testChmMutationCycle expected Ok(Some(Int(1))), got: {other:?}")
+            panic!(
+                "ChmBasicProbe.testChmMutationCycle expected Ok(Some(Int(1))), got: {}",
+                describe_result(&vm, &other)
+            )
+        }
+    }
+}
+
+/// Regression pin for VM-scoped wrapper caches: boxed Integer cache entries
+/// from one VM instance must not be reused by the next VM in the same Rust test
+/// process.
+#[test]
+fn test_chm_boxed_cache_is_vm_scoped() {
+    require_class_files!();
+
+    let mut first_vm = test_vm();
+    let first = first_vm.invoke("cratonvm/ChmBasicProbe", "testChmMutationCycle", "()I", &[]);
+    match first {
+        Ok(Some(Value::Int(1))) => {}
+        other => {
+            panic!(
+                "first VM ChmBasicProbe.testChmMutationCycle expected Ok(Some(Int(1))), got: {}",
+                describe_result(&first_vm, &other)
+            )
+        }
+    }
+
+    let mut second_vm = test_vm();
+    let second = second_vm.invoke(
+        "cratonvm/ChmBasicProbe",
+        "testChmPreResizePutGet",
+        "()I",
+        &[],
+    );
+    match second {
+        Ok(Some(Value::Int(1))) => {}
+        other => {
+            panic!(
+                "second VM ChmBasicProbe.testChmPreResizePutGet expected Ok(Some(Int(1))), got: {}",
+                describe_result(&second_vm, &other)
+            )
         }
     }
 }
@@ -146,7 +282,10 @@ fn test_chm_clear_empty() {
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => {
-            panic!("ChmBasicProbe.testChmClearEmpty expected Ok(Some(Int(1))), got: {other:?}")
+            panic!(
+                "ChmBasicProbe.testChmClearEmpty expected Ok(Some(Int(1))), got: {}",
+                describe_result(&vm, &other)
+            )
         }
     }
 }

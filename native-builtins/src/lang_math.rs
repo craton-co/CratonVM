@@ -2394,50 +2394,30 @@ pub(crate) fn native_math_get_exponent_double(
 // ---------------------------------------------------------------------------
 // Cached wrapper ClassIds
 //
-// Every autobox (Integer.valueOf, Boolean.valueOf, Long.valueOf, …) used
-// to call `ctx.ensure_class_initialized("java/lang/Integer")` per
-// invocation. Class init resolution is hashmap-by-name; once initialized,
-// the ClassId never changes for the process lifetime. The 9 wrapper
-// types are looked up tens of millions of times during JDK boot —
-// caching their ClassIds in process-wide atomics removes the per-call
-// name lookup.
-//
-// We store `AtomicU32` (sentinel 0 = "not cached yet") rather than
-// `OnceLock<ClassId>` so a single relaxed-read fast-path replaces the
-// `OnceLock::get` + Mutex check; resolution is idempotent and racing
-// stores both compute the same value.
-struct WrapperClassIdCache {
-    integer: std::sync::atomic::AtomicU32,
-    long: std::sync::atomic::AtomicU32,
-    float: std::sync::atomic::AtomicU32,
-    double: std::sync::atomic::AtomicU32,
-    boolean: std::sync::atomic::AtomicU32,
-    byte: std::sync::atomic::AtomicU32,
-    short: std::sync::atomic::AtomicU32,
-    character: std::sync::atomic::AtomicU32,
+// Every autobox (Integer.valueOf, Boolean.valueOf, Long.valueOf, ...) would
+// otherwise call `ctx.ensure_class_initialized("java/lang/Integer")` per
+// invocation. Cache the resolved ClassIds per VM/heap identity: Rust tests can
+// create multiple independent `Vm` instances in one process, and a ClassId from
+// one VM must not be reused in another.
+type WrapperCidCache = std::collections::HashMap<(usize, &'static str), u32>;
+
+static WRAPPER_CIDS: std::sync::OnceLock<parking_lot::Mutex<WrapperCidCache>> =
+    std::sync::OnceLock::new();
+
+fn wrapper_cids() -> &'static parking_lot::Mutex<WrapperCidCache> {
+    WRAPPER_CIDS.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()))
 }
 
-static WRAPPER_CIDS: WrapperClassIdCache = WrapperClassIdCache {
-    integer: std::sync::atomic::AtomicU32::new(0),
-    long: std::sync::atomic::AtomicU32::new(0),
-    float: std::sync::atomic::AtomicU32::new(0),
-    double: std::sync::atomic::AtomicU32::new(0),
-    boolean: std::sync::atomic::AtomicU32::new(0),
-    byte: std::sync::atomic::AtomicU32::new(0),
-    short: std::sync::atomic::AtomicU32::new(0),
-    character: std::sync::atomic::AtomicU32::new(0),
-};
-
-fn wrapper_cid_slot(class_name: &str) -> Option<&'static std::sync::atomic::AtomicU32> {
+fn wrapper_cid_key(class_name: &str) -> Option<&'static str> {
     match class_name {
-        "java/lang/Integer" => Some(&WRAPPER_CIDS.integer),
-        "java/lang/Long" => Some(&WRAPPER_CIDS.long),
-        "java/lang/Float" => Some(&WRAPPER_CIDS.float),
-        "java/lang/Double" => Some(&WRAPPER_CIDS.double),
-        "java/lang/Boolean" => Some(&WRAPPER_CIDS.boolean),
-        "java/lang/Byte" => Some(&WRAPPER_CIDS.byte),
-        "java/lang/Short" => Some(&WRAPPER_CIDS.short),
-        "java/lang/Character" => Some(&WRAPPER_CIDS.character),
+        "java/lang/Integer" => Some("java/lang/Integer"),
+        "java/lang/Long" => Some("java/lang/Long"),
+        "java/lang/Float" => Some("java/lang/Float"),
+        "java/lang/Double" => Some("java/lang/Double"),
+        "java/lang/Boolean" => Some("java/lang/Boolean"),
+        "java/lang/Byte" => Some("java/lang/Byte"),
+        "java/lang/Short" => Some("java/lang/Short"),
+        "java/lang/Character" => Some("java/lang/Character"),
         _ => None,
     }
 }
@@ -2446,16 +2426,21 @@ fn wrapper_cid_slot(class_name: &str) -> Option<&'static std::sync::atomic::Atom
 /// Falls back to ClassId(0) with 1 field if the class can't be loaded.
 ///
 /// For the 8 well-known wrapper classes (Integer, Long, Float, Double,
-/// Boolean, Byte, Short, Character) the resolved ClassId is cached in a
-/// process-wide atomic after the first successful `ensure_class_initialized`,
-/// so subsequent autoboxes skip the name lookup entirely.
+/// Boolean, Byte, Short, Character) the resolved ClassId is cached by VM
+/// identity after the first successful `ensure_class_initialized`, so repeated
+/// autoboxes in the same VM skip the name lookup.
 pub(crate) fn alloc_wrapper(
     ctx: &mut dyn NativeContext,
     class_name: &str,
 ) -> cratonvm_types::ObjectRef {
-    // Fast path: hit the wrapper-CID cache for the 8 well-known names.
-    if let Some(slot) = wrapper_cid_slot(class_name) {
-        let cached = slot.load(std::sync::atomic::Ordering::Relaxed);
+    // Fast path: hit the VM-scoped wrapper-CID cache for well-known names.
+    if let Some(key) = wrapper_cid_key(class_name) {
+        let scope = ctx.vm_identity();
+        let cached = wrapper_cids()
+            .lock()
+            .get(&(scope, key))
+            .copied()
+            .unwrap_or(0);
         if cached != 0 {
             return ctx.alloc_object(cratonvm_types::ClassId::new(cached), 1);
         }
@@ -2465,7 +2450,7 @@ pub(crate) fn alloc_wrapper(
             // cache it (it would defeat the cache miss path).
             let raw = class_id.as_u32();
             if raw != 0 {
-                slot.store(raw, std::sync::atomic::Ordering::Relaxed);
+                wrapper_cids().lock().insert((scope, key), raw);
             }
             return ctx.alloc_object(class_id, 1);
         }
@@ -2478,115 +2463,136 @@ pub(crate) fn alloc_wrapper(
     }
 }
 
-// Round-9 CRIT GC-correctness fix: BOOLEAN_CACHE and INTEGER_CACHE must
-// live process-global, NOT thread-local. Two reasons:
+// Round-9 CRIT GC-correctness fix: BOOLEAN_CACHE and INTEGER_CACHE must be
+// shared across threads, NOT thread-local. WP4.6 additionally scopes the cached
+// ObjectRefs by VM identity because Rust tests can create multiple independent
+// heaps in one process. Two reasons:
 //   (1) JLS § 5.1.7 requires `Boolean.TRUE == Boolean.TRUE` and
 //       `Integer.valueOf(n) == Integer.valueOf(n)` for n in [-128,127]
-//       across ALL threads (the boxing conversion produces one canonical
-//       cached instance per primitive value). A thread-local cache makes
+//       across ALL threads in the same VM (the boxing conversion produces one
+//       canonical cached instance per primitive value). A thread-local cache makes
 //       these identity comparisons fail when the two operands come from
 //       different threads.
 //   (2) Under a moving GC, thread-local ObjectRefs that are *not* scanned
 //       as roots on every thread point at stale (collected or relocated)
-//       addresses. We now (a) hold the cache process-wide and (b) wire
+//       addresses. We now (a) hold the cache in a VM-scoped process table and
+//       (b) wire
 //       `gc_scan_value_of_cache_roots` / `gc_update_value_of_cache_refs`
 //       into `vm/src/memory/{roots.rs,gc.rs}` so the cached entries are
 //       both kept live and re-pointed after compaction.
-static INTEGER_CACHE: std::sync::OnceLock<
-    parking_lot::Mutex<[Option<cratonvm_types::ObjectRef>; 256]>,
-> = std::sync::OnceLock::new();
+type ScopedValueCache<const N: usize> =
+    std::collections::HashMap<usize, [Option<cratonvm_types::ObjectRef>; N]>;
 
-fn integer_cache() -> &'static parking_lot::Mutex<[Option<cratonvm_types::ObjectRef>; 256]> {
-    INTEGER_CACHE.get_or_init(|| parking_lot::Mutex::new([None; 256]))
+static INTEGER_CACHE: std::sync::OnceLock<parking_lot::Mutex<ScopedValueCache<256>>> =
+    std::sync::OnceLock::new();
+
+fn integer_cache() -> &'static parking_lot::Mutex<ScopedValueCache<256>> {
+    INTEGER_CACHE.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()))
 }
 
-static BOOLEAN_CACHE: std::sync::OnceLock<
-    parking_lot::Mutex<[Option<cratonvm_types::ObjectRef>; 2]>,
-> = std::sync::OnceLock::new();
+static BOOLEAN_CACHE: std::sync::OnceLock<parking_lot::Mutex<ScopedValueCache<2>>> =
+    std::sync::OnceLock::new();
 
-fn boolean_cache() -> &'static parking_lot::Mutex<[Option<cratonvm_types::ObjectRef>; 2]> {
-    BOOLEAN_CACHE.get_or_init(|| parking_lot::Mutex::new([None; 2]))
+fn boolean_cache() -> &'static parking_lot::Mutex<ScopedValueCache<2>> {
+    BOOLEAN_CACHE.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()))
 }
 
 /// `LongCache` for `Long.valueOf(long)` — JLS §5.1.7 mandates the canonical
 /// cached instance for values in [-128, 127] so `Long.valueOf(x) ==
-/// Long.valueOf(x)` holds. Process-wide (not thread-local) and GC-scanned for
-/// the same reasons documented above for `INTEGER_CACHE`.
-static LONG_CACHE: std::sync::OnceLock<
-    parking_lot::Mutex<[Option<cratonvm_types::ObjectRef>; 256]>,
-> = std::sync::OnceLock::new();
+/// Long.valueOf(x)` holds. Shared across threads but VM-scoped and GC-scanned
+/// for the same reasons documented above for `INTEGER_CACHE`.
+static LONG_CACHE: std::sync::OnceLock<parking_lot::Mutex<ScopedValueCache<256>>> =
+    std::sync::OnceLock::new();
 
-fn long_cache() -> &'static parking_lot::Mutex<[Option<cratonvm_types::ObjectRef>; 256]> {
-    LONG_CACHE.get_or_init(|| parking_lot::Mutex::new([None; 256]))
+fn long_cache() -> &'static parking_lot::Mutex<ScopedValueCache<256>> {
+    LONG_CACHE.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()))
 }
 
 /// GC root scan hook — called from `vm/src/memory/roots.rs::collect_roots`.
-/// Reports every cached Integer/Boolean ObjectRef so the GC keeps it live.
-pub fn gc_scan_value_of_cache_roots(out: &mut Vec<cratonvm_types::ObjectRef>) {
+/// Reports cached wrapper ObjectRefs for the active VM so the GC keeps them live.
+pub fn gc_scan_value_of_cache_roots(vm_identity: usize, out: &mut Vec<cratonvm_types::ObjectRef>) {
     {
         let cache = integer_cache().lock();
-        for slot in cache.iter() {
-            if let Some(o) = slot {
-                out.push(*o);
+        if let Some(entries) = cache.get(&vm_identity) {
+            for slot in entries.iter() {
+                if let Some(o) = slot {
+                    out.push(*o);
+                }
             }
         }
     }
     {
         let cache = boolean_cache().lock();
-        for slot in cache.iter() {
-            if let Some(o) = slot {
-                out.push(*o);
+        if let Some(entries) = cache.get(&vm_identity) {
+            for slot in entries.iter() {
+                if let Some(o) = slot {
+                    out.push(*o);
+                }
             }
         }
     }
     {
         let cache = long_cache().lock();
-        for slot in cache.iter() {
-            if let Some(o) = slot {
-                out.push(*o);
+        if let Some(entries) = cache.get(&vm_identity) {
+            for slot in entries.iter() {
+                if let Some(o) = slot {
+                    out.push(*o);
+                }
             }
         }
     }
 }
 
 /// GC post-compaction hook — called from `vm/src/memory/gc.rs::update_all_roots`.
-/// Remaps every cached entry through the GC's pointer map.
-pub fn gc_update_value_of_cache_refs(pointer_map: &std::collections::HashMap<usize, usize>) {
+/// Remaps every cached entry for the active VM through the GC's pointer map.
+pub fn gc_update_value_of_cache_refs(
+    vm_identity: usize,
+    pointer_map: &std::collections::HashMap<usize, usize>,
+) {
     if pointer_map.is_empty() {
         return;
     }
     {
         let mut cache = integer_cache().lock();
-        for slot in cache.iter_mut() {
-            if let Some(obj_ref) = slot {
-                let old_addr = obj_ref.as_ptr() as usize;
-                if let Some(&new_addr) = pointer_map.get(&old_addr) {
-                    debug_assert!(new_addr != 0, "GC pointer map contains null address");
-                    *obj_ref = unsafe { cratonvm_types::ObjectRef::from_raw(new_addr as *mut u8) };
+        if let Some(entries) = cache.get_mut(&vm_identity) {
+            for slot in entries.iter_mut() {
+                if let Some(obj_ref) = slot {
+                    let old_addr = obj_ref.as_ptr() as usize;
+                    if let Some(&new_addr) = pointer_map.get(&old_addr) {
+                        debug_assert!(new_addr != 0, "GC pointer map contains null address");
+                        *obj_ref =
+                            unsafe { cratonvm_types::ObjectRef::from_raw(new_addr as *mut u8) };
+                    }
                 }
             }
         }
     }
     {
         let mut cache = boolean_cache().lock();
-        for slot in cache.iter_mut() {
-            if let Some(obj_ref) = slot {
-                let old_addr = obj_ref.as_ptr() as usize;
-                if let Some(&new_addr) = pointer_map.get(&old_addr) {
-                    debug_assert!(new_addr != 0, "GC pointer map contains null address");
-                    *obj_ref = unsafe { cratonvm_types::ObjectRef::from_raw(new_addr as *mut u8) };
+        if let Some(entries) = cache.get_mut(&vm_identity) {
+            for slot in entries.iter_mut() {
+                if let Some(obj_ref) = slot {
+                    let old_addr = obj_ref.as_ptr() as usize;
+                    if let Some(&new_addr) = pointer_map.get(&old_addr) {
+                        debug_assert!(new_addr != 0, "GC pointer map contains null address");
+                        *obj_ref =
+                            unsafe { cratonvm_types::ObjectRef::from_raw(new_addr as *mut u8) };
+                    }
                 }
             }
         }
     }
     {
         let mut cache = long_cache().lock();
-        for slot in cache.iter_mut() {
-            if let Some(obj_ref) = slot {
-                let old_addr = obj_ref.as_ptr() as usize;
-                if let Some(&new_addr) = pointer_map.get(&old_addr) {
-                    debug_assert!(new_addr != 0, "GC pointer map contains null address");
-                    *obj_ref = unsafe { cratonvm_types::ObjectRef::from_raw(new_addr as *mut u8) };
+        if let Some(entries) = cache.get_mut(&vm_identity) {
+            for slot in entries.iter_mut() {
+                if let Some(obj_ref) = slot {
+                    let old_addr = obj_ref.as_ptr() as usize;
+                    if let Some(&new_addr) = pointer_map.get(&old_addr) {
+                        debug_assert!(new_addr != 0, "GC pointer map contains null address");
+                        *obj_ref =
+                            unsafe { cratonvm_types::ObjectRef::from_raw(new_addr as *mut u8) };
+                    }
                 }
             }
         }
@@ -2603,10 +2609,11 @@ pub(crate) fn native_integer_value_of(
     };
     if (-128..=127).contains(&val) {
         let idx = (val + 128) as usize;
+        let scope = ctx.vm_identity();
         // Fast path: lock, read, drop lock before any heap allocation.
         if let Some(cached) = {
             let c = integer_cache().lock();
-            c[idx]
+            c.get(&scope).and_then(|entries| entries[idx])
         } {
             return Ok(Some(Value::Object(Some(cached))));
         }
@@ -2617,10 +2624,11 @@ pub(crate) fn native_integer_value_of(
         // (the loser allocation is collectible — but the race is rare and
         // it preserves the JLS identity invariant).
         let mut cache = integer_cache().lock();
-        if let Some(existing) = cache[idx] {
+        let entries = cache.entry(scope).or_insert([None; 256]);
+        if let Some(existing) = entries[idx] {
             return Ok(Some(Value::Object(Some(existing))));
         }
-        cache[idx] = Some(obj);
+        entries[idx] = Some(obj);
         return Ok(Some(Value::Object(Some(obj))));
     }
     let obj = alloc_wrapper(ctx, "java/lang/Integer");
@@ -2881,10 +2889,11 @@ pub(crate) fn native_long_value_of(
     };
     if (-128..=127).contains(&val) {
         let idx = (val + 128) as usize;
+        let scope = ctx.vm_identity();
         // Fast path: lock, read, drop lock before any heap allocation.
         if let Some(cached) = {
             let c = long_cache().lock();
-            c[idx]
+            c.get(&scope).and_then(|entries| entries[idx])
         } {
             return Ok(Some(Value::Object(Some(cached))));
         }
@@ -2895,10 +2904,11 @@ pub(crate) fn native_long_value_of(
         // (the loser allocation is collectible — but the race is rare and
         // it preserves the JLS identity invariant).
         let mut cache = long_cache().lock();
-        if let Some(existing) = cache[idx] {
+        let entries = cache.entry(scope).or_insert([None; 256]);
+        if let Some(existing) = entries[idx] {
             return Ok(Some(Value::Object(Some(existing))));
         }
-        cache[idx] = Some(obj);
+        entries[idx] = Some(obj);
         return Ok(Some(Value::Object(Some(obj))));
     }
     let obj = alloc_wrapper(ctx, "java/lang/Long");
@@ -3034,19 +3044,21 @@ pub(crate) fn native_boolean_value_of(
     // Fallback (Boolean class somehow unavailable / fields not yet set):
     // keep the canonical-cache behaviour so repeated calls are at least
     // self-consistent.
+    let scope = ctx.vm_identity();
     if let Some(o) = {
         let c = boolean_cache().lock();
-        c[idx]
+        c.get(&scope).and_then(|entries| entries[idx])
     } {
         return Ok(Some(Value::Object(Some(o))));
     }
     let obj = alloc_wrapper(ctx, "java/lang/Boolean");
     ctx.set_field(obj, 0, Value::Int(idx as i32));
     let mut cache = boolean_cache().lock();
-    if let Some(existing) = cache[idx] {
+    let entries = cache.entry(scope).or_insert([None; 2]);
+    if let Some(existing) = entries[idx] {
         return Ok(Some(Value::Object(Some(existing))));
     }
-    cache[idx] = Some(obj);
+    entries[idx] = Some(obj);
     Ok(Some(Value::Object(Some(obj))))
 }
 

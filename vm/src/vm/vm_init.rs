@@ -6,6 +6,8 @@
 /// Maximum number of lambda proxy classes before new registrations are silently dropped.
 pub(crate) const MAX_LAMBDA_PROXIES: usize = 100_000;
 
+static NEXT_VM_IDENTITY: AtomicUsize = AtomicUsize::new(1);
+
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicI32, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
@@ -285,6 +287,13 @@ fn reject_startup_jvmti_agents_when_disabled(config: &VmConfig) {
 }
 
 pub struct SharedVm {
+    /// Process-unique identity for this VM/heap lifetime.
+    ///
+    /// Native caches that store heap `ObjectRef`s use this as their scope key.
+    /// It must not be the `SharedVm` address because allocators may recycle that
+    /// address after a test drops one VM and creates another in the same process.
+    pub vm_identity: usize,
+
     /// VM configuration (immutable after construction).
     pub config: VmConfig,
 
@@ -2486,6 +2495,7 @@ impl SharedVm {
             std::sync::Arc::new(crate::runtime::offload::OffloadCacheRegistry::new());
 
         let vm = Self {
+            vm_identity: NEXT_VM_IDENTITY.fetch_add(1, Ordering::Relaxed),
             config,
             #[cfg(feature = "gpu-offload")]
             offload_registry,

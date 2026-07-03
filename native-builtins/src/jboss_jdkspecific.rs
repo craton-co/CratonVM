@@ -200,9 +200,8 @@ const MODULE_PACKAGES_MAX_ENTRIES: usize = 4096;
 
 fn module_packages_table() -> &'static std::sync::Mutex<std::collections::HashMap<i32, Vec<String>>>
 {
-    static T: std::sync::OnceLock<
-        std::sync::Mutex<std::collections::HashMap<i32, Vec<String>>>,
-    > = std::sync::OnceLock::new();
+    static T: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<i32, Vec<String>>>> =
+        std::sync::OnceLock::new();
     T.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
