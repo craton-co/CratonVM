@@ -6273,6 +6273,16 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             .packages_of(module_name)
     }
 
+    fn module_uses(&self, module_name: &str) -> Vec<String> {
+        self.shared
+            .class_manager
+            .read()
+            .module_registry
+            .get(module_name)
+            .map(|d| d.uses.clone())
+            .unwrap_or_default()
+    }
+
     fn all_module_names(&self) -> Vec<String> {
         self.shared
             .class_manager

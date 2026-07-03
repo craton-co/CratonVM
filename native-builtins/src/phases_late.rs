@@ -20210,7 +20210,7 @@ fn read_module_name(ctx: &dyn NativeContext, module_obj: ObjectRef) -> String {
 }
 
 /// Helper: build a `HashSet<String>` Java object from a Vec of Rust strings.
-fn build_string_set(ctx: &mut dyn NativeContext, items: Vec<String>) -> ObjectRef {
+pub(crate) fn build_string_set(ctx: &mut dyn NativeContext, items: Vec<String>) -> ObjectRef {
     use cratonvm_types::ArrayElementType;
     let len = items.len();
     let arr = ctx.new_array(ArrayElementType::Reference, len);
