@@ -182,6 +182,17 @@ pub static SWEEP_ZERO_SPAN_HITS: AtomicU64 = AtomicU64::new(0);
 /// instead of zeroed+freed.
 pub static SWEEP_BAD_FORWARD_HITS: AtomicU64 = AtomicU64::new(0);
 
+/// DoHead comb-7 fix (2026-07-03) — count of mark-phase candidates rejected
+/// because the header's claimed EXTENT (`gen_object_total_size`) does not fit
+/// inside its generation at that address. The per-field plausibility gate
+/// admits `array_length` up to i32::MAX, and the mark BFS scan iterates that
+/// count with the header as its only bound — a corrupt header (e.g. packed
+/// pointer bytes misparsed as `kind=Array, array_length=<pointer low 32>`) ran
+/// the scan tens of MB off the mapped arena (observed SIGSEGV at the region
+/// boundary). A real object's extent always fits inside the arena it was
+/// allocated from, so out-of-extent headers are rejected without marking.
+pub static SWEEP_BAD_EXTENT_HITS: AtomicU64 = AtomicU64::new(0);
+
 /// DoHead walk-desync hardening — count of selective-promotion UNWIND events:
 /// the evacuation walk saw a grid anomaly (zero span, implausible header,
 /// free-block overshoot, or a span crossing a free hole) and dropped the
@@ -3938,6 +3949,50 @@ impl GenerationalHeap {
             {
                 return;
             }
+            // DoHead comb-7 fix (2026-07-03): also validate the object's
+            // EXTENT. The field bounds above still admit a corrupt header
+            // claiming millions of elements (array_length is only capped at
+            // i32::MAX), and the BFS scan (`for_each_ref_slot`) iterates
+            // that count with the header as its ONLY bound — a claimed
+            // extent past from-space ran the scan off the mapped arena
+            // (observed: main-vm SIGSEGV at the region boundary, corrupt
+            // header claiming array_length=7,775,429 — the JIT inline-alloc
+            // kind/array_length fault family). A real object's extent always
+            // fits inside the arena it was allocated from, so an
+            // out-of-extent header is definitionally corrupt: never mark or
+            // scan it (its "referents" would be garbage reads anyway).
+            let total = gen_object_total_size(header);
+            if total < HEADER_SIZE || addr + total > from_end {
+                let n = SWEEP_BAD_EXTENT_HITS.fetch_add(1, Ordering::Relaxed);
+                if n < 8 {
+                    // Attribution diagnostic: dump the words around the
+                    // rejected "header" so the upstream corruptor face is
+                    // identifiable (stale packed-pointer reuse shows heap
+                    // pointers; a clobbered real header shows a torn mix).
+                    let lo = addr.saturating_sub(32).max(from_base);
+                    let mut hex = String::new();
+                    let mut w = lo;
+                    while w + 8 <= (addr + 48).min(from_end) {
+                        // SAFETY: `[from_base, from_end)` is mapped arena
+                        // memory and `w` is 8-aligned within it.
+                        let v = unsafe { *((w & !7) as *const u64) };
+                        hex.push_str(&format!("{:#x}:{:016x} ", w & !7, v));
+                        w += 8;
+                    }
+                    tracing::warn!(
+                        "mark_young: rejecting object at {:#x} with implausible extent \
+                         {} (kind={}, array_len={}, num_slots={}) — corrupt header, \
+                         not marked/scanned; context {}",
+                        addr,
+                        total,
+                        kind_byte,
+                        header.array_length,
+                        header.num_slots,
+                        hex,
+                    );
+                }
+                return;
+            }
             if header.gc_flags & GC_FLAG_MARKED == 0 {
                 header.gc_flags |= GC_FLAG_MARKED;
                 worklist.push(ptr);
@@ -5690,6 +5745,29 @@ impl GenerationalHeap {
     fn scan_object_for_old_refs(obj_ptr: *mut u8, old_gen: &OldGen, worklist: &mut Vec<*mut u8>) {
         // SAFETY: `obj_ptr` is a live old-gen object from the mark worklist; its header is valid.
         let header = unsafe { &*(obj_ptr as *const ObjectHeader) };
+        // DoHead comb-7 fix (2026-07-03): validate the claimed extent before
+        // scanning — the young-mark twin of this check caught a corrupt
+        // header whose `array_length` was pointer bytes; scanning that count
+        // of slots runs off the mapped region (SIGSEGV). An old object whose
+        // extent leaves old gen is definitionally corrupt: skip the scan.
+        let total = gen_object_total_size(header);
+        if total < HEADER_SIZE
+            || !old_gen.contains(unsafe { obj_ptr.add(total - 1) })
+        {
+            let n = SWEEP_BAD_EXTENT_HITS.fetch_add(1, Ordering::Relaxed);
+            if n < 8 {
+                tracing::warn!(
+                    "old-gen mark: rejecting object at {:p} with implausible extent {} \
+                     (kind={}, array_len={}, num_slots={}) — corrupt header, not scanned",
+                    obj_ptr,
+                    total,
+                    header.kind as u8,
+                    header.array_length,
+                    header.num_slots,
+                );
+            }
+            return;
+        }
         // Mark every old-gen referent (arrays + compact objects: 8-byte pointers;
         // legacy objects: 16-byte Value cells).
         // SAFETY: `obj_ptr`/`header` are a valid live object.
