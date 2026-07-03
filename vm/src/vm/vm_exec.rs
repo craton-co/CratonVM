@@ -11868,6 +11868,51 @@ fn invoke_on_class_shared_inner(
                             class_name,
                             method_name,
                             descriptor,
+                        )
+                        || crate::runtime::interpreter::is_antlr_prediction_context_native_override(
+                            class_name,
+                            method_name,
+                            descriptor,
+                        )
+                        || crate::runtime::interpreter::is_bytebuddy_method_token_native_override(
+                            class_name,
+                            method_name,
+                            descriptor,
+                        )
+                        || crate::runtime::interpreter::is_hibernate_testing_util_native_override(
+                            class_name,
+                            method_name,
+                            descriptor,
+                        )
+                        || crate::runtime::interpreter::is_hibernate_models_native_override(
+                            class_name,
+                            method_name,
+                            descriptor,
+                        )
+                        || crate::runtime::interpreter::is_bitset_native_override(
+                            class_name,
+                            method_name,
+                            descriptor,
+                        )
+                        || crate::runtime::interpreter::is_h2_parser_native_override(
+                            class_name,
+                            method_name,
+                            descriptor,
+                        )
+                        || crate::runtime::interpreter::is_jdk_string_native_override(
+                            class_name,
+                            method_name,
+                            descriptor,
+                        )
+                        || crate::runtime::interpreter::is_time_native_override(
+                            class_name,
+                            method_name,
+                            descriptor,
+                        )
+                        || crate::runtime::interpreter::is_jdk_wrapper_math_native_override(
+                            class_name,
+                            method_name,
+                            descriptor,
                         );
                     if check_override
                         && shared
