@@ -6626,6 +6626,21 @@ impl GenerationalHeap {
     /// Returns a Vec of (raw pointer, total byte size) for each object.
     /// Must be called during a GC safepoint (all mutator threads paused).
     pub fn walk_objects(&self) -> Vec<(*mut u8, usize)> {
+        let mut result = self.walk_young_objects();
+
+        // Walk old generation
+        {
+            let old = self.old_gen.lock();
+            result.extend(old.walk_objects());
+        }
+
+        result
+    }
+
+    /// Walk all objects in the young from-space only (to-space is GC scratch).
+    /// Returns a Vec of (raw pointer, total byte size) for each object.
+    /// Must be called during a GC safepoint (all mutator threads paused).
+    pub fn walk_young_objects(&self) -> Vec<(*mut u8, usize)> {
         let mut result = Vec::new();
 
         // Walk young generation (from-space only — to-space is GC scratch).
@@ -6719,13 +6734,44 @@ impl GenerationalHeap {
             }
         }
 
-        // Walk old generation
-        {
-            let old = self.old_gen.lock();
-            result.extend(old.walk_objects());
-        }
-
         result
+    }
+
+    /// Collect every young-gen object's reference to an OLD-gen object.
+    ///
+    /// fork6 GC_STRESS fix — these are mandatory roots for the concurrent
+    /// old-gen mark (`ConcurrentMarker::initial_mark` / `remark`): those
+    /// phases filter the thread-root list with `old_gen.contains`, so an old
+    /// object whose only path from a root goes THROUGH a young object
+    /// (root → young holder → old target) was invisible and the concurrent
+    /// sweep freed it live. Selective promotion mass-produces exactly that
+    /// shape (it tenures a young object's children while the pinned holder
+    /// stays young), so under allocation pressure the old cycle reclaimed
+    /// live promoted objects — the all-zero-header `class_id=0` receivers
+    /// and silently-dropped static writes in the Fork6Hard GC_STRESS lane.
+    ///
+    /// Walks ALL young objects (live or dead): a dead young holder's old refs
+    /// only over-retain (floating garbage until the next cycle), never corrupt.
+    /// Must be called during a GC safepoint (all mutator threads paused, so
+    /// young object bodies are stable to read).
+    pub fn collect_young_to_old_roots(&self) -> Vec<usize> {
+        let young_objs = self.walk_young_objects();
+        let mut out = Vec::new();
+        let old = self.old_gen.lock();
+        for (ptr, _sz) in young_objs {
+            // SAFETY: `ptr` came from the hardened young walk above; the
+            // header and body are readable, and no mutator runs (STW).
+            let header = unsafe { &*(ptr as *const ObjectHeader) };
+            // SAFETY: `ptr`/`header` are a valid young object under STW.
+            unsafe {
+                for_each_ref_slot(ptr, header, |r, _| {
+                    if old.contains(r as *const u8) {
+                        out.push(r as usize);
+                    }
+                });
+            }
+        }
+        out
     }
 }
 
@@ -7598,6 +7644,59 @@ mod tests {
     fn small_gen_heap() -> GenerationalHeap {
         // 4KB young semi-space, 8KB old gen
         GenerationalHeap::with_sizes(4 * 1024, 8 * 1024)
+    }
+
+    /// fork6 GC_STRESS fix — a young object's reference to an old-gen object
+    /// must be reported by `collect_young_to_old_roots` (the concurrent
+    /// old-gen mark treats these as mandatory roots; without them an old
+    /// object reachable only through a young holder was swept while live).
+    #[test]
+    fn collect_young_to_old_roots_finds_young_held_old_target() {
+        let heap = small_gen_heap();
+
+        // Young holder with one reference field.
+        let holder = heap.alloc_object(ClassId::new(1), 1);
+        assert!(heap.is_in_young(holder.as_ptr()));
+
+        // Old-gen target, allocated directly in old gen (as selective
+        // promotion would).
+        let size = HEADER_SIZE + SLOT_SIZE;
+        let old_ptr = {
+            let mut og = heap.old_gen_lock();
+            let p = og.alloc(size, 8).unwrap();
+            // SAFETY: freshly allocated old-gen block of `size` bytes.
+            unsafe {
+                let h = &mut *(p as *mut ObjectHeader);
+                h.class_id = ClassId::new(2);
+                h.kind = ObjectKind::Object;
+                h.num_slots = 1;
+                h.gc_flags = GC_FLAG_OLD_GEN;
+            }
+            p
+        };
+
+        // holder.field[0] = old target (the ONLY reference to it).
+        // SAFETY: `old_ptr` is a valid, fully-initialized old-gen object.
+        let old_ref = unsafe { ObjectRef::from_raw(old_ptr) };
+        heap.set_field(holder, 0, Value::Object(Some(old_ref)));
+
+        let roots = heap.collect_young_to_old_roots();
+        assert!(
+            roots.contains(&(old_ptr as usize)),
+            "young→old edge must be collected as an old-marking root \
+             (got {} roots)",
+            roots.len(),
+        );
+
+        // A young→young edge must NOT be reported: repoint the field at a
+        // young object and re-collect.
+        let young_target = heap.alloc_object(ClassId::new(3), 0);
+        heap.set_field(holder, 0, Value::Object(Some(young_target)));
+        let roots2 = heap.collect_young_to_old_roots();
+        assert!(
+            !roots2.contains(&(old_ptr as usize)),
+            "an old object no longer young-referenced must not be re-reported",
+        );
     }
 
     /// Regression: `with_capacity` MUST scale the young semi-space linearly

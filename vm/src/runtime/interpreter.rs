@@ -2507,8 +2507,22 @@ fn maybe_concurrent_gc(shared: &SharedVm, thread: &mut JvmThread) {
 
     let (old_gen_base, old_gen_size) = shared.heap.old_gen_info();
 
-    // Create a temporary concurrent marker for this cycle
-    let marker = cratonvm_gc::ConcurrentMarker::new(old_gen_base, old_gen_size);
+    // Create a temporary concurrent marker for this cycle.
+    //
+    // fork6 GC_STRESS fix — build it on the heap's SHARED SATB queue + phase
+    // state (attached via `enable_concurrent_gc` at SharedVm construction).
+    // The previous `ConcurrentMarker::new` created a private queue + state per
+    // cycle while the heap's `satb_barrier` gated on the HEAP's (formerly
+    // never-attached) instances: the write barrier was a hard no-op, nothing
+    // ever reached this cycle's remark, and the concurrent mark effectively
+    // ran against live mutators with no write barrier — the sweep then freed
+    // old objects whose only reference moved during the concurrent phase.
+    let marker = cratonvm_gc::ConcurrentMarker::with_shared(
+        old_gen_base,
+        old_gen_size,
+        shared.concurrent_satb.clone(),
+        shared.concurrent_gc_state.clone(),
+    );
 
     // Phase 1: Initial Mark — brief STW pause
     let initial_mark_done = shared.gc_barrier.brief_stw_counted(
@@ -2518,11 +2532,27 @@ fn maybe_concurrent_gc(shared: &SharedVm, thread: &mut JvmThread) {
             // Collect root pointers for old-gen marking
             let roots = collect_roots(shared, thread);
             let snapshot_roots = shared.thread_registry.collect_all_root_snapshots();
-            let root_ptrs: Vec<*mut u8> = roots
+            let mut root_ptrs: Vec<*mut u8> = roots
                 .iter()
                 .chain(snapshot_roots.iter())
                 .map(|r| r.as_ptr())
                 .collect();
+            // fork6 GC_STRESS fix — young→old references are mandatory
+            // old-marking roots. `initial_mark` filters this list with
+            // `old_gen.contains`, so an old object whose only path from a
+            // root goes THROUGH a young object (root → young holder → old
+            // target) was invisible and the sweep freed it live. Selective
+            // promotion mass-produces exactly that shape (it tenures a
+            // pinned young holder's children), which is why the Fork6Hard
+            // GC_STRESS lane corrupted even single-threaded during clinit.
+            // Safe here: brief STW, mutators quiesced, TLABs retired.
+            root_ptrs.extend(
+                shared
+                    .heap
+                    .collect_young_to_old_roots()
+                    .into_iter()
+                    .map(|a| a as *mut u8),
+            );
             if let Some(guard) = shared.heap.old_gen_lock() {
                 marker.initial_mark(&root_ptrs, &*guard);
             }
@@ -2539,7 +2569,7 @@ fn maybe_concurrent_gc(shared: &SharedVm, thread: &mut JvmThread) {
     }
 
     // Phase 3: Remark — brief STW pause
-    shared.gc_barrier.brief_stw_counted(
+    let remark_done = shared.gc_barrier.brief_stw_counted(
         thread.thread_id,
         || u32::try_from(shared.thread_registry.alive_count()).unwrap_or(u32::MAX),
         || {
@@ -2550,16 +2580,40 @@ fn maybe_concurrent_gc(shared: &SharedVm, thread: &mut JvmThread) {
             shared.heap.flush_thread_satb();
             let roots = collect_roots(shared, thread);
             let snapshot_roots = shared.thread_registry.collect_all_root_snapshots();
-            let root_ptrs: Vec<*mut u8> = roots
+            let mut root_ptrs: Vec<*mut u8> = roots
                 .iter()
                 .chain(snapshot_roots.iter())
                 .map(|r| r.as_ptr())
                 .collect();
+            // fork6 GC_STRESS fix — refresh the young→old roots at remark
+            // too: a young→old edge created during the concurrent phase
+            // (e.g. a promoted child stored into a fresh young holder) must
+            // be in the final bitmap before the sweep.
+            root_ptrs.extend(
+                shared
+                    .heap
+                    .collect_young_to_old_roots()
+                    .into_iter()
+                    .map(|a| a as *mut u8),
+            );
             if let Some(guard) = shared.heap.old_gen_lock() {
                 marker.remark(&root_ptrs, &*guard);
             }
         },
     );
+
+    // fork6 GC_STRESS fix — the remark STW is NOT optional. If another
+    // thread's STW won the race (`brief_stw_counted` returned false — a
+    // near-certainty under allocation storms, where a young-GC request is
+    // always pending), the closure never ran: the SATB queue is undrained
+    // and the roots were never rescanned, so the mark bitmap is NOT final.
+    // The old code fell through to the sweep anyway and freed live objects.
+    // Abort the cycle instead (deactivate the barrier, discard the bitmap);
+    // the next `old_gen_needs_gc` trigger starts over.
+    if !remark_done {
+        marker.abort_cycle();
+        return;
+    }
 
     // Phase 4: Concurrent Sweep
     if let Some(mut guard) = shared.heap.old_gen_lock() {
@@ -2568,6 +2622,11 @@ fn maybe_concurrent_gc(shared: &SharedVm, thread: &mut JvmThread) {
             tracing::debug!("Concurrent GC: swept {} old-gen objects", swept,);
         }
     }
+    // Cycle complete — phase back to Idle (the write barrier's
+    // `is_marking_active()` gate is already false after remark, but leaving
+    // the shared state at `ConcurrentSweep` would misreport the VM as
+    // mid-cycle to any observer).
+    marker.finish_cycle();
 }
 
 // ---------------------------------------------------------------------------

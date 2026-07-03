@@ -1244,6 +1244,14 @@ impl<'a> NativeContextImpl<'a> {
     /// roots without heap validation (its file is restricted from edits), and
     /// the resulting bogus addresses crash the GC at the next mark/move.
     pub(crate) fn deposit_root_snapshot(&self) {
+        // fork6 GC_STRESS fix — flush this thread's SATB buffer before it
+        // blocks. A concurrent old-gen remark drains only the GLOBAL queue;
+        // a thread that logged pre-barrier entries (overwritten refs during
+        // the concurrent-mark phase) and then parked would otherwise keep up
+        // to ~256 entries invisible in its thread-local buffer for the whole
+        // blocked duration, and the sweep would free those still-live
+        // targets. Cheap no-op whenever no marking cycle is active.
+        self.shared.heap.flush_thread_satb();
         let mut snapshot = self.thread.root_snapshot.lock();
         snapshot.clear();
         // Multi-thread non-moving-sweep root hardening (Fork6): see
