@@ -608,12 +608,25 @@ impl ReferenceProcessor {
     // -- Phase 2: WeakReferences -------------------------------------------
 
     fn process_weak_refs(&mut self, is_marked: &dyn Fn(usize) -> bool) {
+        let dbg = std::env::var_os("CRATONVM_DBG_WATCHREF").is_some();
         for entry in &mut self.weak_refs {
             if entry.cleared {
                 continue;
             }
             if is_marked(entry.referent) {
+                if dbg {
+                    eprintln!(
+                        "[watchref] weak KEEP ref_obj=0x{:x} referent=0x{:x}",
+                        entry.reference_obj, entry.referent
+                    );
+                }
                 continue;
+            }
+            if dbg {
+                eprintln!(
+                    "[watchref] weak CLEAR ref_obj=0x{:x} referent=0x{:x}",
+                    entry.reference_obj, entry.referent
+                );
             }
             entry.cleared = true;
             self.stats.weak_refs_cleared += 1;

@@ -673,6 +673,23 @@ impl OldGen {
 
             if obj_ptr != dest {
                 pointer_map.insert(obj_ptr as usize, dest as usize);
+            } else if crate::gc_quiescence::is_watched_referent(obj_ptr as usize) {
+                // RandomizedContext WeakHashMap<Thread,...> fix (same class of
+                // bug as gen_heap.rs's non-moving young sweep — see
+                // gc_quiescence::is_watched_referent doc comment): this live
+                // object happened not to move during sliding compaction, so
+                // it gets no `pointer_map` entry ("objects that stay in place
+                // are NOT included in the map", by design, above). Post-GC
+                // reference processing's `is_marked` check treats an address
+                // absent from `pointer_map` as "did not survive" — correct
+                // for a moved object, wrong for one that simply stayed put.
+                // A long-lived object (e.g. a test suite's own `Thread`
+                // mirror, promoted to old gen after surviving many young
+                // GCs) is exactly the kind of object likely to stay at a
+                // stable position across compactions. Record an identity
+                // entry so a live Weak/Soft/Phantom reference watching this
+                // address is not wrongly cleared.
+                pointer_map.insert(obj_ptr as usize, dest as usize);
             }
             live_objects.push((obj_ptr, total_size, dest));
             write_cursor = aligned + total_size;
@@ -1175,5 +1192,53 @@ mod tests {
             assert!(b_hdr.forwarding_ptr.is_null());
             assert_eq!(b_hdr.gc_flags & GC_FLAG_MARKED, 0);
         }
+    }
+
+    /// RandomizedContext WeakHashMap<Thread,...> fix regression: a live
+    /// old-gen object that stays in place during sliding compaction (the
+    /// lowest-address survivor, exactly like object A in
+    /// `compact_promotes_unmarked_target_of_live_ref` above) gets NO
+    /// `pointer_map` entry by design — but if it is a WATCHED referent
+    /// (`gc_quiescence::set_watched_referents`), it must get an IDENTITY
+    /// entry so post-GC reference processing's `is_marked` check can
+    /// recognize it as alive. An unwatched object that also stays in place
+    /// must still get no entry at all (bounded cost — this must not start
+    /// recording every stationary survivor).
+    #[test]
+    fn compact_records_identity_map_for_watched_stationary_survivor() {
+        let mut og = OldGen::new(4096);
+
+        // Object A: lowest address, stays in place after compaction.
+        let a_size = HEADER_SIZE + SLOT_SIZE;
+        let a = og.alloc(a_size, 8).unwrap();
+        unsafe {
+            let a_hdr = &mut *(a as *mut ObjectHeader);
+            a_hdr.num_slots = 1;
+            a_hdr.gc_flags |= GC_FLAG_MARKED;
+        }
+
+        // Object B: also stays in place (contiguous with A, nothing to
+        // reclaim between them) — left UNWATCHED as a control.
+        let b_size = HEADER_SIZE + SLOT_SIZE;
+        let b = og.alloc(b_size, 8).unwrap();
+        unsafe {
+            let b_hdr = &mut *(b as *mut ObjectHeader);
+            b_hdr.num_slots = 1;
+            b_hdr.gc_flags |= GC_FLAG_MARKED;
+        }
+
+        crate::gc_quiescence::set_watched_referents(&[a as usize]);
+        let map = og.compact();
+        crate::gc_quiescence::set_watched_referents(&[]);
+
+        assert_eq!(
+            map.get(&(a as usize)),
+            Some(&(a as usize)),
+            "watched stationary survivor must get an identity pointer_map entry"
+        );
+        assert!(
+            !map.contains_key(&(b as usize)),
+            "unwatched stationary survivor must NOT get a pointer_map entry (bounded cost)"
+        );
     }
 }

@@ -380,6 +380,64 @@ pub fn pinned_jit_root_count() -> usize {
     PINNED_JIT_ROOTS.with(|s| s.borrow().len())
 }
 
+// ---------------------------------------------------------------------------
+// Watched Weak/Soft/Phantom reference referents (non-moving-sweep pointer_map
+// completeness — RandomizedContext WeakHashMap<Thread,...> fix, 2026-07-02).
+//
+// `GenerationalHeap::sweep_young_non_moving` keeps every non-promoted
+// survivor in young gen AT ITS ORIGINAL ADDRESS: selective promotion only
+// evacuates survivors old enough to tenure (or explicitly un-pinned), so the
+// large majority of any cycle's survivors are simply left in place with NO
+// `pointer_map` entry (nothing moved, nothing to remap). Post-GC reference
+// processing (`process_references_after_gc`'s `is_marked` closure in the VM)
+// treats an address absent from `pointer_map` — and not resident in old gen —
+// as "did not survive this collection". That is correct for a MOVING
+// collector (every survivor is relocated and therefore recorded), but wrong
+// here: a live Weak/Soft/PhantomReference whose referent is a young,
+// not-yet-promoted survivor gets incorrectly cleared out from under a still-
+// running mutator. Observed as `com.carrotsearch.randomizedtesting.
+// RandomizedContext.getPerThread()` returning null for its OWN WeakHashMap
+// key — the running suite thread's `java.lang.Thread` mirror — well after
+// the entry was legitimately created (see
+// docs/known-issues/elasticsearch-randomizedcontext-per-thread-null.md).
+//
+// Fix: the VM publishes the currently-registered Weak/Soft/Phantom referent
+// addresses here immediately before a collection (same thread that will run
+// `collect_garbage`, mirroring `PINNED_JIT_ROOTS` above). The non-moving
+// sweep checks this set for every KEPT-IN-PLACE survivor it visits and, on a
+// hit, adds an IDENTITY (`addr -> addr`) entry to the `pointer_map` it
+// returns — enough for `is_marked` to recognize the object as having
+// survived. Bounded by the number of live Reference objects registered with
+// the VM's reference processor, NOT by the size of the young generation, so
+// this does not reintroduce the O(live-set) cost selective promotion exists
+// to avoid (see the `sweep_young_non_moving` module comments on bt18).
+thread_local! {
+    static WATCHED_REFERENTS: std::cell::RefCell<std::collections::HashSet<usize>> =
+        std::cell::RefCell::new(std::collections::HashSet::new());
+}
+
+/// Replace the watched-referent set for the upcoming collection. Called by
+/// the VM immediately before `collect_garbage`, right after nulling the
+/// Java-visible referent fields (`weakref_null_referents_pre_gc`) so the
+/// mark phase's normal field scan cannot ALSO keep these referents alive —
+/// this set exists purely to answer "did address X survive the collection
+/// some OTHER way", not to influence marking. Always call this before a
+/// collection (with an empty slice if there is nothing to watch this cycle)
+/// so a stale entry from a previous cycle can never leak into this one.
+pub fn set_watched_referents(addrs: &[usize]) {
+    WATCHED_REFERENTS.with(|s| {
+        let mut s = s.borrow_mut();
+        s.clear();
+        s.extend(addrs.iter().copied());
+    });
+}
+
+/// Is `addr` a currently-registered Weak/Soft/Phantom referent this cycle?
+/// Consulted by the non-moving young sweep for each kept-in-place survivor.
+pub fn is_watched_referent(addr: usize) -> bool {
+    WATCHED_REFERENTS.with(|s| s.borrow().contains(&addr))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -158,6 +158,21 @@ pub fn weakref_null_referents_pre_gc(shared: &SharedVm) {
         let rp = shared.ref_processor.lock();
         rp.weak_phantom_active_pairs()
     };
+    // RandomizedContext WeakHashMap<Thread,...> fix: publish this cycle's
+    // referent addresses so the non-moving young sweep can recognize a
+    // kept-in-place (unpromoted) survivor as having genuinely survived (see
+    // gc_quiescence::is_watched_referent). Unconditional — even an empty
+    // list must be published so a previous cycle's entries can never leak
+    // into this one.
+    let watch_addrs: Vec<usize> = pairs.iter().map(|&(_, referent)| referent).collect();
+    if std::env::var_os("CRATONVM_DBG_WATCHREF").is_some() {
+        eprintln!(
+            "[watchref] publishing {} watched referent(s): {:x?}",
+            watch_addrs.len(),
+            watch_addrs
+        );
+    }
+    cratonvm_gc::gc_quiescence::set_watched_referents(&watch_addrs);
     if pairs.is_empty() {
         return;
     }
