@@ -9,6 +9,19 @@ flip PASS (OSR off) → FAIL (OSR on)**; a further 7 shuffle between two
 already-broken statuses (FAIL/HANG/CRASH) in both modes — non-deterministic,
 not attributable to OSR.
 
+**CORRECTION (found investigating the wider FAIL bucket, same session):** the
+wrong-vtable-dispatch signature in #1 below is **NOT exclusive to OSR** — two
+more classes hit the exact same `NoSuchMethodError: java/lang/Object.<method>`
+pattern with `CRATONVM_JIT_OSR` OFF: `jpa.criteria.InPredicateTest`
+(`Object.removeEldestEntry`) and `lob.JpaLargeBlobTest` (`Object.read()I`).
+So this is a **broader, pre-existing JIT wrong-receiver-type bug** that OSR
+makes MORE likely to trigger (it compiles hot loops mid-execution that
+wouldn't otherwise reach the normal JIT threshold, giving the buggy path more
+chances to fire) but does not itself cause. Fix scope should cover the general
+JIT virtual-dispatch path, not just the OSR entry/deopt stub specifically —
+though the OSR entry point is still the most likely place the receiver-type
+info gets lost for classes that only fail with OSR on.
+
 ## Confirmed OSR regressions (OFF=PASS, ON=FAIL)
 
 ### 1. `org.hibernate.orm.test.boot.models.xml.XmlProcessingSmokeTests`
@@ -17,7 +30,8 @@ java.lang.NoSuchMethodError: java/lang/Object.removeEldestEntry(Ljava/util/Map$E
 ```
 `removeEldestEntry` is declared on `LinkedHashMap`, never on `Object` — this is
 the classic signature of a **JIT wrong-receiver-type / corrupted vtable
-dispatch**. Under OSR, a hot loop gets recompiled mid-execution using the
+dispatch** (see correction above — the same signature also occurs without
+OSR on other classes). Under OSR, a hot loop gets recompiled mid-execution using the
 on-stack-replacement entry path; something in that path is capturing or
 propagating the wrong receiver class for a virtual call inside the loop,
 causing the call to resolve against `Object` instead of the real subclass.
