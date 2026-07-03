@@ -5943,6 +5943,52 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;)Ljava/lang/String;",
         |_ctx, _args| Ok(Some(Value::Object(None))),
     );
+    // `NativeLibraries.load(NativeLibraryImpl impl, String name, boolean isBuiltin,
+    // boolean throwExceptionIfFail)` — the classic JNI native-library loader behind
+    // `System.loadLibrary`/`ClassLoader.loadLibrary`. Not previously registered
+    // anywhere: on Windows the classes exercised so far apparently resolve via a
+    // different bootstrap route, but on Linux real-JDK static init (e.g.
+    // Inflater/zip, or JUnit's own bootstrap) calls this directly and an
+    // unregistered ACC_NATIVE method throws `UnsatisfiedLinkError` at class-init
+    // time, before any test body runs — a hard, platform-specific blocker.
+    //
+    // Unlike `RawNativeLibraries.load0` (panama.rs) — which backs FFM downcalls
+    // into genuine third-party libraries CratonVM does NOT reimplement, e.g.
+    // Tomcat's openssl_h needing the real libssl/libcrypto — the libraries this
+    // classic path loads are the JDK's OWN internals (zip, net, nio,
+    // management, ...), whose Java-visible behavior CratonVM already
+    // reimplements as native methods intercepted directly by this registry.
+    // A real `dlopen` here is actively counterproductive: the JDK's own
+    // `libzip.so` etc. are built to run inside HotSpot's `libjvm.so` process
+    // and fail to load standalone (`libjvm.so: cannot open shared object
+    // file`) since CratonVM is not that architecture. Try a real load first
+    // (some names may resolve, e.g. genuine third-party JNI libs on the
+    // classpath), but never let a failure here be fatal — the callers that
+    // matter get their functionality from CratonVM's own natives regardless
+    // of whether the underlying .so actually loaded, exactly like the
+    // adjacent `findBuiltinLib` stub's "not a built-in, but proceed anyway"
+    // contract.
+    registry.register(
+        "jdk/internal/loader/NativeLibraries",
+        "load",
+        "(Ljdk/internal/loader/NativeLibraries$NativeLibraryImpl;Ljava/lang/String;ZZ)Z",
+        |ctx, args| {
+            let impl_obj = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(Some(Value::Int(1))),
+            };
+            let name = match args.get(1) {
+                Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+                _ => String::new(),
+            };
+            let handle = match ctx.load_native_library(&name) {
+                Ok(lib_index) => lib_index + 1,
+                Err(_) => 0,
+            };
+            ctx.set_field_by_name(impl_obj, "handle", Value::Long(handle));
+            Ok(Some(Value::Int(1)))
+        },
+    );
     registry.register(
         "jdk/internal/loader/BootLoader",
         "setBootLoaderUnnamedModule0",
