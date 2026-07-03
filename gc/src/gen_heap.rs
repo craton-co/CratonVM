@@ -4352,13 +4352,28 @@ impl GenerationalHeap {
                     if header.gc_flags & GC_FLAG_MARKED != 0 && aged && !pinned.contains(&addr) {
                         match old_gen.alloc(total_size, 8) {
                             Some(dst) => {
-                                // gcstress face-1 hunt (no-op unless gated).
-                                crate::heap::cell_watch_check(
-                                    dst as usize,
-                                    total_size,
-                                    "selective-promote-evac",
-                                    &(src as usize),
-                                );
+                                // gcstress face-1 hunt (no-op unless gated):
+                                // dump the source qword pair too (see
+                                // cheney-copy).
+                                {
+                                    let w = crate::heap::cell_watch_addr();
+                                    let d = dst as usize;
+                                    if w != 0 && d <= w && w.wrapping_sub(d) < total_size {
+                                        let src_at = src as usize + (w - d);
+                                        // SAFETY: src object spans total_size bytes.
+                                        let pair =
+                                            unsafe { std::ptr::read(src_at as *const [u64; 2]) };
+                                        crate::heap::cell_watch_check(
+                                            d,
+                                            total_size,
+                                            "selective-promote-evac",
+                                            &format!(
+                                                "src=0x{:x} src[watch]=0x{:016x},0x{:016x}",
+                                                src as usize, pair[0], pair[1]
+                                            ),
+                                        );
+                                    }
+                                }
                                 // SAFETY: src/dst are valid, non-overlapping, total_size bytes.
                                 unsafe { std::ptr::copy_nonoverlapping(src, dst, total_size) };
                                 // Replicate the atomic mark_word through atomic ops
@@ -6377,13 +6392,27 @@ impl GenerationalHeap {
         };
 
         // Copy the entire object
-        // gcstress face-1 hunt (no-op unless gated).
-        crate::heap::cell_watch_check(
-            new_ptr as usize,
-            total_size,
-            "cheney-copy",
-            &(old_ptr as usize),
-        );
+        // gcstress face-1 hunt (no-op unless gated): also dump the SOURCE
+        // qword pair at the watched offset, so a copy that IMPORTS corrupt
+        // content is distinguishable from one that copies a clean cell.
+        {
+            let w = crate::heap::cell_watch_addr();
+            let dst = new_ptr as usize;
+            if w != 0 && dst <= w && w.wrapping_sub(dst) < total_size {
+                let src_at = old_ptr as usize + (w - dst);
+                // SAFETY: src object spans total_size bytes; src_at is within it.
+                let pair = unsafe { std::ptr::read(src_at as *const [u64; 2]) };
+                crate::heap::cell_watch_check(
+                    dst,
+                    total_size,
+                    "cheney-copy",
+                    &format!(
+                        "src=0x{:x} src[watch]=0x{:016x},0x{:016x}",
+                        old_ptr as usize, pair[0], pair[1]
+                    ),
+                );
+            }
+        }
         // SAFETY: `old_ptr` and `new_ptr` are valid, non-overlapping regions of `total_size` bytes.
         unsafe {
             std::ptr::copy_nonoverlapping(old_ptr, new_ptr, total_size);
@@ -7380,6 +7409,16 @@ pub(crate) unsafe fn forward_ref_slots(
                 let raw: u64 = std::ptr::read(s as *const u64);
                 if raw != 0 {
                     if let Some(n) = forward(raw as usize as *mut u8) {
+                        // gcstress face-1 hunt (no-op unless gated) — a RAW
+                        // 8-byte pointer write; on a MISREAD header (walk
+                        // overshoot family) this arm would spray pointers
+                        // over legacy 16-byte cells.
+                        crate::heap::cell_watch_check(
+                            s as usize,
+                            8,
+                            "forward_ref_slots-refarray",
+                            &(n as usize),
+                        );
                         std::ptr::write(s as *mut u64, n as u64);
                     }
                 }
@@ -7395,6 +7434,13 @@ pub(crate) unsafe fn forward_ref_slots(
             let raw: u64 = std::ptr::read(s as *const u64);
             if raw != 0 {
                 if let Some(n) = forward(raw as usize as *mut u8) {
+                    // gcstress face-1 hunt (no-op unless gated).
+                    crate::heap::cell_watch_check(
+                        s as usize,
+                        8,
+                        "forward_ref_slots-compact",
+                        &(n as usize),
+                    );
                     std::ptr::write(s as *mut u64, n as u64);
                 }
             }
@@ -7404,6 +7450,13 @@ pub(crate) unsafe fn forward_ref_slots(
             let s = obj_ptr.add(HEADER_SIZE + slot_idx * SLOT_SIZE);
             if let Value::Object(Some(r)) = std::ptr::read(s as *const Value) {
                 if let Some(n) = forward(r.as_ptr()) {
+                    // gcstress face-1 hunt (no-op unless gated).
+                    crate::heap::cell_watch_check(
+                        s as usize,
+                        16,
+                        "forward_ref_slots-legacy",
+                        &(n as usize),
+                    );
                     std::ptr::write(s as *mut Value, Value::Object(Some(ObjectRef::from_raw(n))));
                 }
             }
