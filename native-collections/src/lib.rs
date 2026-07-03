@@ -3454,7 +3454,17 @@ fn map_alloc_node(
     hash: i32,
     next: Option<ObjectRef>,
 ) -> ObjectRef {
+    // gcstress residual face-1 fix — `alloc_object` can move the `key`/`value`/
+    // `next` object args; writing the bare (stale) refs into the node below
+    // would store dangling references. Pin+re-read across the allocation.
+    let key_pin = ctx.pin_native_root(key);
+    let value_pin = pin_value(ctx, value);
+    let next_pin = next.map(|n| ctx.pin_native_root(n));
     let node = ctx.alloc_object(cratonvm_types::ClassId::new(0), NODE_NUM_FIELDS);
+    let key = ctx.read_native_pin(key_pin, key);
+    let value = read_pinned_elem(ctx, value_pin, value);
+    let next = next.map(|n| ctx.read_native_pin(next_pin.unwrap(), n));
+    ctx.unpin_native_roots(key_pin);
     ctx.set_field(node, NODE_FIELD_KEY, Value::Object(Some(key)));
     ctx.set_field(node, NODE_FIELD_VALUE, value);
     ctx.set_field(node, NODE_FIELD_HASH, Value::Int(hash));
