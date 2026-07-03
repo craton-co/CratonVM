@@ -1,0 +1,207 @@
+[cratonvm-jit-disasm] full java/util/WeakHashMap.matchesKey(Ljava/util/WeakHashMap$Entry;Ljava/lang/Object;)Z entry=0x41d0000 len=979
+       0: 55                       push rbp
+       1: 4889e5                   mov rbp,rsp
+       4: 8b842440feffff           mov eax,[rsp-1C0h]
+       b: 4881ecc0010000           sub rsp,1C0h
+      12: 8b842400f0ffff           mov eax,[rsp-1000h]
+      19: 4c896580                 mov [rbp-80h],r12
+      1d: 4c89ad78ffffff           mov [rbp-88h],r13
+      24: 4c89b570ffffff           mov [rbp-90h],r14
+      2b: 48894dd8                 mov [rbp-28h],rcx
+      2f: 4c8bf2                   mov r14,rdx
+      32: 4d8be0                   mov r12,r8
+      35: 4d8be9                   mov r13,r9
+      38: 4c8965d0                 mov [rbp-30h],r12
+      3c: 4c896dc8                 mov [rbp-38h],r13
+      40: 488b45d0                 mov rax,[rbp-30h]
+      44: 488945b8                 mov [rbp-48h],rax
+      48: 488b45c8                 mov rax,[rbp-38h]
+      4c: 488945c0                 mov [rbp-40h],rax
+      50: 49ba007e328000000000     mov r10,80327E00h
+      5a: 488b4dd8                 mov rcx,[rbp-28h]
+      5e: 488b55b8                 mov rdx,[rbp-48h]
+      62: 4c8b45c0                 mov r8,[rbp-40h]
+      66: 4885d2                   test rdx,rdx
+      69: 0f845c000000             je near 00000000041D00CBh
+      6f: 8b02                     mov eax,[rdx]
+      71: 413b02                   cmp eax,[r10]
+      74: 7517                     jne short 00000000041D008Dh
+      76: 41807a2800               cmp byte [r10+28h],0
+      7b: 0f844a000000             je near 00000000041D00CBh
+      81: 4d8b5a10                 mov r11,[r10+10h]
+      85: 41ffd3                   call r11
+      88: e991000000               jmp 00000000041D011Eh
+      8d: 413b4204                 cmp eax,[r10+4]
+      91: 7517                     jne short 00000000041D00AAh
+      93: 41807a2900               cmp byte [r10+29h],0
+      98: 0f842d000000             je near 00000000041D00CBh
+      9e: 4d8b5a18                 mov r11,[r10+18h]
+      a2: 41ffd3                   call r11
+      a5: e974000000               jmp 00000000041D011Eh
+      aa: 413b4208                 cmp eax,[r10+8]
+      ae: 0f8517000000             jne near 00000000041D00CBh
+      b4: 41807a2a00               cmp byte [r10+2Ah],0
+      b9: 0f840c000000             je near 00000000041D00CBh
+      bf: 4d8b5a20                 mov r11,[r10+20h]
+      c3: 41ffd3                   call r11
+      c6: e953000000               jmp 00000000041D011Eh
+      cb: 488b4dd8                 mov rcx,[rbp-28h]
+      cf: 48ba00cb288000000000     mov rdx,8028CB00h
+      d9: 4c8d45b8                 lea r8,[rbp-48h]
+      dd: 49c7c102000000           mov r9,2
+      e4: 4c8975f8                 mov [rbp-8],r14
+      e8: 4c8965f0                 mov [rbp-10h],r12
+      ec: 4c896de8                 mov [rbp-18h],r13
+      f0: 4c8965e0                 mov [rbp-20h],r12
+      f4: 48b880cb288000000000     mov rax,8028CB80h
+      fe: 4889442420               mov [rsp+20h],rax
+     103: 48b8007e328000000000     mov rax,80327E00h
+     10d: 4889442428               mov [rsp+28h],rax
+     112: 48b8e0d7e255f67f0000     mov rax,7FF655E2D7E0h
+     11c: ffd0                     call rax
+     11e: 49ba0000000000000080     mov r10,8000000000000000h
+     128: 4c39d0                   cmp rax,r10
+     12b: 0f847d020000             je near 00000000041D03AEh
+     131: 488945d0                 mov [rbp-30h],rax
+     135: 488b4dd0                 mov rcx,[rbp-30h]
+     139: 85c9                     test ecx,ecx
+     13b: 0f842a000000             je near 00000000041D016Bh
+     141: 48c7c001000000           mov rax,1
+     148: 488945d0                 mov [rbp-30h],rax
+     14c: 488b45d0                 mov rax,[rbp-30h]
+     150: 4c8b6580                 mov r12,[rbp-80h]
+     154: 4c8bad78ffffff           mov r13,[rbp-88h]
+     15b: 4c8bb570ffffff           mov r14,[rbp-90h]
+     162: 4881c4c0010000           add rsp,1C0h
+     169: 5d                       pop rbp
+     16a: c3                       ret
+     16b: 4c8965d0                 mov [rbp-30h],r12
+     16f: 488b45d0                 mov rax,[rbp-30h]
+     173: 488945c8                 mov [rbp-38h],rax
+     177: 49bac07e328000000000     mov r10,80327EC0h
+     181: 488b4dd8                 mov rcx,[rbp-28h]
+     185: 488b55c8                 mov rdx,[rbp-38h]
+     189: 4885d2                   test rdx,rdx
+     18c: 0f845c000000             je near 00000000041D01EEh
+     192: 8b02                     mov eax,[rdx]
+     194: 413b02                   cmp eax,[r10]
+     197: 7517                     jne short 00000000041D01B0h
+     199: 41807a2800               cmp byte [r10+28h],0
+     19e: 0f844a000000             je near 00000000041D01EEh
+     1a4: 4d8b5a10                 mov r11,[r10+10h]
+     1a8: 41ffd3                   call r11
+     1ab: e991000000               jmp 00000000041D0241h
+     1b0: 413b4204                 cmp eax,[r10+4]
+     1b4: 7517                     jne short 00000000041D01CDh
+     1b6: 41807a2900               cmp byte [r10+29h],0
+     1bb: 0f842d000000             je near 00000000041D01EEh
+     1c1: 4d8b5a18                 mov r11,[r10+18h]
+     1c5: 41ffd3                   call r11
+     1c8: e974000000               jmp 00000000041D0241h
+     1cd: 413b4208                 cmp eax,[r10+8]
+     1d1: 0f8517000000             jne near 00000000041D01EEh
+     1d7: 41807a2a00               cmp byte [r10+2Ah],0
+     1dc: 0f840c000000             je near 00000000041D01EEh
+     1e2: 4d8b5a20                 mov r11,[r10+20h]
+     1e6: 41ffd3                   call r11
+     1e9: e953000000               jmp 00000000041D0241h
+     1ee: 488b4dd8                 mov rcx,[rbp-28h]
+     1f2: 48ba40cc288000000000     mov rdx,8028CC40h
+     1fc: 4c8d45c8                 lea r8,[rbp-38h]
+     200: 49c7c101000000           mov r9,1
+     207: 4c8975f8                 mov [rbp-8],r14
+     20b: 4c8965f0                 mov [rbp-10h],r12
+     20f: 4c896de8                 mov [rbp-18h],r13
+     213: 4c8965e0                 mov [rbp-20h],r12
+     217: 48b880cc288000000000     mov rax,8028CC80h
+     221: 4889442420               mov [rsp+20h],rax
+     226: 48b8c07e328000000000     mov rax,80327EC0h
+     230: 4889442428               mov [rsp+28h],rax
+     235: 48b8e0d7e255f67f0000     mov rax,7FF655E2D7E0h
+     23f: ffd0                     call rax
+     241: 49ba0000000000000080     mov r10,8000000000000000h
+     24b: 4c39d0                   cmp rax,r10
+     24e: 0f845a010000             je near 00000000041D03AEh
+     254: 488945d0                 mov [rbp-30h],rax
+     258: 488b45d0                 mov rax,[rbp-30h]
+     25c: 4c8be0                   mov r12,rax
+     25f: 4c8965d0                 mov [rbp-30h],r12
+     263: 488b4dd0                 mov rcx,[rbp-30h]
+     267: 4885c9                   test rcx,rcx
+     26a: 0f8419010000             je near 00000000041D0389h
+     270: 4c896dd0                 mov [rbp-30h],r13
+     274: 4c8965c8                 mov [rbp-38h],r12
+     278: 488b45d0                 mov rax,[rbp-30h]
+     27c: 488945b8                 mov [rbp-48h],rax
+     280: 488b45c8                 mov rax,[rbp-38h]
+     284: 488945c0                 mov [rbp-40h],rax
+     288: 49ba807f328000000000     mov r10,80327F80h
+     292: 488b4dd8                 mov rcx,[rbp-28h]
+     296: 488b55b8                 mov rdx,[rbp-48h]
+     29a: 4c8b45c0                 mov r8,[rbp-40h]
+     29e: 4885d2                   test rdx,rdx
+     2a1: 0f845c000000             je near 00000000041D0303h
+     2a7: 8b02                     mov eax,[rdx]
+     2a9: 413b02                   cmp eax,[r10]
+     2ac: 7517                     jne short 00000000041D02C5h
+     2ae: 41807a2800               cmp byte [r10+28h],0
+     2b3: 0f844a000000             je near 00000000041D0303h
+     2b9: 4d8b5a10                 mov r11,[r10+10h]
+     2bd: 41ffd3                   call r11
+     2c0: e991000000               jmp 00000000041D0356h
+     2c5: 413b4204                 cmp eax,[r10+4]
+     2c9: 7517                     jne short 00000000041D02E2h
+     2cb: 41807a2900               cmp byte [r10+29h],0
+     2d0: 0f842d000000             je near 00000000041D0303h
+     2d6: 4d8b5a18                 mov r11,[r10+18h]
+     2da: 41ffd3                   call r11
+     2dd: e974000000               jmp 00000000041D0356h
+     2e2: 413b4208                 cmp eax,[r10+8]
+     2e6: 0f8517000000             jne near 00000000041D0303h
+     2ec: 41807a2a00               cmp byte [r10+2Ah],0
+     2f1: 0f840c000000             je near 00000000041D0303h
+     2f7: 4d8b5a20                 mov r11,[r10+20h]
+     2fb: 41ffd3                   call r11
+     2fe: e953000000               jmp 00000000041D0356h
+     303: 488b4dd8                 mov rcx,[rbp-28h]
+     307: 48bac0cc288000000000     mov rdx,8028CCC0h
+     311: 4c8d45b8                 lea r8,[rbp-48h]
+     315: 49c7c102000000           mov r9,2
+     31c: 4c8975f8                 mov [rbp-8],r14
+     320: 4c8965f0                 mov [rbp-10h],r12
+     324: 4c896de8                 mov [rbp-18h],r13
+     328: 4c8965e0                 mov [rbp-20h],r12
+     32c: 48b800cd288000000000     mov rax,8028CD00h
+     336: 4889442420               mov [rsp+20h],rax
+     33b: 48b8807f328000000000     mov rax,80327F80h
+     345: 4889442428               mov [rsp+28h],rax
+     34a: 48b8e0d7e255f67f0000     mov rax,7FF655E2D7E0h
+     354: ffd0                     call rax
+     356: 49ba0000000000000080     mov r10,8000000000000000h
+     360: 4c39d0                   cmp rax,r10
+     363: 0f8445000000             je near 00000000041D03AEh
+     369: 488945d0                 mov [rbp-30h],rax
+     36d: 488b4dd0                 mov rcx,[rbp-30h]
+     371: 85c9                     test ecx,ecx
+     373: 0f8410000000             je near 00000000041D0389h
+     379: 48c7c001000000           mov rax,1
+     380: 488945d0                 mov [rbp-30h],rax
+     384: e906000000               jmp 00000000041D038Fh
+     389: 31c0                     xor eax,eax
+     38b: 488945d0                 mov [rbp-30h],rax
+     38f: 488b45d0                 mov rax,[rbp-30h]
+     393: 4c8b6580                 mov r12,[rbp-80h]
+     397: 4c8bad78ffffff           mov r13,[rbp-88h]
+     39e: 4c8bb570ffffff           mov r14,[rbp-90h]
+     3a5: 4881c4c0010000           add rsp,1C0h
+     3ac: 5d                       pop rbp
+     3ad: c3                       ret
+     3ae: 48b80000000000000080     mov rax,8000000000000000h
+     3b8: 4c8b6580                 mov r12,[rbp-80h]
+     3bc: 4c8bad78ffffff           mov r13,[rbp-88h]
+     3c3: 4c8bb570ffffff           mov r14,[rbp-90h]
+     3ca: 4881c4c0010000           add rsp,1C0h
+     3d1: 5d                       pop rbp
+     3d2: c3                       ret
+
+[cratonvm] System.exit(1) called — process terminating
