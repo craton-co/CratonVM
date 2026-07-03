@@ -7464,8 +7464,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                     }
                 }
             }
-            let result = p57_alloc_path(ctx, &p);
-            Ok(Some(Value::Object(Some(result))))
+            p57_alloc_path_checked(ctx, &p)
         },
     );
 
@@ -8153,6 +8152,76 @@ fn path_owned_by_virtual_fs(ctx: &mut dyn NativeContext, path_obj: ObjectRef) ->
     } else {
         false
     }
+}
+
+/// Windows `Path` syntax validation for the `Paths.get` factory — the ONLY
+/// p57 entry point that builds a `Path` directly from unvalidated caller
+/// input (every other `p57_alloc_path` call site here derives its string
+/// from an already-validated `Path`, e.g. `getParent`/`resolve`/`normalize`).
+/// A colon is only legal as the second character of a drive specifier
+/// (`C:...`) — anywhere else (including a bare `scheme:rest` string like
+/// Spring's `ping:foo` `ProtocolResolver` probe) it's illegal, matching real
+/// `sun.nio.fs.WindowsPathParser`. Mirrors `native-io`'s
+/// `validate_windows_path` (duplicated rather than shared: this is a
+/// separate crate, and this specific "mixed real-JDK mode" registration
+/// (`register_phase57_nio_file`) runs AFTER — and overwrites — `native-io`'s
+/// `Paths.get` registration for the same method key).
+fn p57_validate_windows_path(s: &str) -> Result<(), &'static str> {
+    if !cfg!(windows) {
+        return Ok(());
+    }
+    let bytes = s.as_bytes();
+    if bytes.len() >= 4
+        && (bytes[0] == b'\\' || bytes[0] == b'/')
+        && (bytes[1] == b'\\' || bytes[1] == b'/')
+        && bytes[2] == b'?'
+    {
+        return Ok(());
+    }
+    let drive_colon = if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+        Some(1usize)
+    } else {
+        None
+    };
+    for (i, &b) in bytes.iter().enumerate() {
+        if b == b':' && Some(i) != drive_colon {
+            return Err("Illegal char <:>");
+        }
+        if b < 0x20 || matches!(b, b'<' | b'>' | b'"' | b'|' | b'?' | b'*') {
+            return Err("Illegal char");
+        }
+    }
+    Ok(())
+}
+
+/// Validate `path` before wrapping it in a synthetic p57 `Path` object;
+/// throws a real `java.nio.file.InvalidPathException` (matching real JDK)
+/// instead of silently accepting any string. See [`p57_validate_windows_path`].
+fn p57_alloc_path_checked(ctx: &mut dyn NativeContext, path: &str) -> MethodCallResult {
+    if let Err(reason) = p57_validate_windows_path(path) {
+        return match ctx.new_object("java/nio/file/InvalidPathException") {
+            Ok(Some(Value::Object(Some(exc)))) => {
+                let input_str = ctx.create_string(path);
+                let reason_str = ctx.create_string(reason);
+                let _ = ctx.invoke(
+                    "java/nio/file/InvalidPathException",
+                    "<init>",
+                    "(Ljava/lang/String;Ljava/lang/String;)V",
+                    &[
+                        Value::Object(Some(exc)),
+                        Value::Object(Some(input_str)),
+                        Value::Object(Some(reason_str)),
+                    ],
+                );
+                Err(MethodCallFailed::ExceptionThrown(exc))
+            }
+            _ => Err(RuntimeError::IllegalArgumentException {
+                message: format!("{reason}: {path}"),
+            }
+            .into()),
+        };
+    }
+    Ok(Some(Value::Object(Some(p57_alloc_path(ctx, path)))))
 }
 
 fn p57_alloc_path(ctx: &mut dyn NativeContext, path: &str) -> ObjectRef {
@@ -11681,9 +11750,44 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
     });
 
     // toPath and toURI
+    //
+    // Validate the path first — real `File.toPath()` delegates to
+    // `FileSystems.getDefault().getPath(...)`, which throws
+    // `InvalidPathException` for Windows-illegal syntax (e.g. a bare colon
+    // outside a drive specifier, as in Spring's `ping:foo`
+    // `ProtocolResolver` probe: `GenericApplicationContextTests.
+    // getResourceWithCustomResourceLoader` relies on `FileSystemResource`'s
+    // `this.file.toPath()` throwing for exactly this). See
+    // `p57_validate_windows_path` (registered alongside `Paths.get` above)
+    // for the same check — duplicated here rather than shared because this
+    // registration builds a differently-shaped synthetic Path (2 fields via
+    // `alloc_concurrent_synthetic` directly, not `p57_alloc_path`).
     r.register(file, "toPath", "()Ljava/nio/file/Path;", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let path = file_read_path(ctx, this);
+        if let Err(reason) = p57_validate_windows_path(&path) {
+            return match ctx.new_object("java/nio/file/InvalidPathException") {
+                Ok(Some(Value::Object(Some(exc)))) => {
+                    let input_str = ctx.create_string(&path);
+                    let reason_str = ctx.create_string(reason);
+                    let _ = ctx.invoke(
+                        "java/nio/file/InvalidPathException",
+                        "<init>",
+                        "(Ljava/lang/String;Ljava/lang/String;)V",
+                        &[
+                            Value::Object(Some(exc)),
+                            Value::Object(Some(input_str)),
+                            Value::Object(Some(reason_str)),
+                        ],
+                    );
+                    Err(MethodCallFailed::ExceptionThrown(exc))
+                }
+                _ => Err(RuntimeError::IllegalArgumentException {
+                    message: format!("{reason}: {path}"),
+                }
+                .into()),
+            };
+        }
         let p = alloc_concurrent_synthetic(ctx, "java/nio/file/Path", 2);
         let s = ctx.create_string(&path);
         ctx.set_field(p, 0, Value::Object(Some(s)));

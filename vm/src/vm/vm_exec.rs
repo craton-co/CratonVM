@@ -4051,6 +4051,11 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             shared_arc
                 .thread_registry
                 .set_tlab_addr(tid, &jvm_thread.tlab as *const cratonvm_gc::Tlab as usize);
+            // xt-hardening (2026-07-03): publish this worker's OS thread id
+            // so the takeover's counted-set excusal can identify it (see
+            // ThreadRegistry::set_os_tid_current). Must precede any Java/JIT
+            // execution on this thread.
+            shared_arc.thread_registry.set_os_tid_current(tid);
             // WP4.8: For real-JDK virtual threads (e.g.
             // `java.lang.ThreadBuilders$BoundVirtualThread`), `Thread.run()`
             // is overridden вЂ” `BoundVirtualThread.run()` invokes the user's

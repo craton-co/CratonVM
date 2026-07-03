@@ -85,6 +85,15 @@ struct ThreadEntry {
     /// before dropping). `AtomicUsize` so the owning thread sets/clears it
     /// lock-free.
     tlab_addr: std::sync::atomic::AtomicUsize,
+    /// xt-hardening (2026-07-03): the OS thread id of the thread executing
+    /// this entry, published by the thread itself at startup (next to its
+    /// TLAB address). `0` = not yet published. The GC initiator snapshots
+    /// the alive set's OS tids atomically with the barrier's `expected`
+    /// computation so the cross-thread JIT takeover only excuses
+    /// (`reduce_expected`) frozen peers that were actually COUNTED —
+    /// excusing an uncounted newcomer releases the barrier while a counted
+    /// mutator still runs, racing the collection.
+    os_tid: std::sync::atomic::AtomicU32,
 }
 
 /// Global registry of all JVM threads.
@@ -185,6 +194,7 @@ impl ThreadRegistry {
             gc_block_state: Arc::new(GcBlockState::new()),
             async_exception_slot: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             tlab_addr: std::sync::atomic::AtomicUsize::new(0),
+            os_tid: std::sync::atomic::AtomicU32::new(0),
         };
         self.threads.lock().insert(thread_id, entry);
         if let Some(obj) = java_thread_obj {
@@ -671,6 +681,28 @@ impl ThreadRegistry {
             .unwrap_or_default()
     }
 
+    /// xt-hardening follow-up (2026-07-03): OS tids of alive threads
+    /// currently `in_blocked_region` (excluded from the barrier, covered
+    /// only by `deposit_root_snapshot` — which never scans the JIT band on
+    /// the native stack). This is the ONLY gap `helper_window_pass` exists
+    /// to close (its own doc comment says so); a cooperatively-arrived
+    /// mutator already published its JIT roots via `update_root_snapshot`
+    /// before parking at the barrier, so re-scanning it is pure redundant
+    /// over-retention risk. Threads with `os_tid == 0` (registered but not
+    /// yet started) cannot be blocked, so they never contribute a false 0.
+    pub fn blocked_os_tids(&self) -> Vec<u32> {
+        let threads = self.threads.lock();
+        threads
+            .values()
+            .filter(|e| {
+                e.alive.load(Ordering::Acquire)
+                    && e.gc_block_state.in_blocked_region.load(Ordering::Acquire)
+            })
+            .map(|e| e.os_tid.load(Ordering::Acquire))
+            .filter(|&t| t != 0)
+            .collect()
+    }
+
     /// DBG (CRATONVM_DBG_MTROOTS): per-thread (tid, in_blocked_region,
     /// snapshot_len) for every alive thread. Used at an STW to see whether a
     /// thread that holds a reclaimed live oop was counted BLOCKED (excluded from
@@ -919,6 +951,51 @@ impl ThreadRegistry {
             .values()
             .filter(|e| e.alive.load(Ordering::Acquire))
             .count()
+    }
+
+    /// xt-hardening (2026-07-03): publish the calling thread's OS thread id
+    /// for `thread_id` (see `ThreadEntry::os_tid`). Called by the thread
+    /// itself at startup, before it can execute any Java/JIT code.
+    pub fn set_os_tid_current(&self, thread_id: ThreadId) {
+        #[cfg(windows)]
+        {
+            #[link(name = "kernel32")]
+            unsafe extern "system" {
+                fn GetCurrentThreadId() -> u32;
+            }
+            let os_tid = unsafe { GetCurrentThreadId() };
+            let threads = self.threads.lock();
+            if let Some(entry) = threads.get(&thread_id) {
+                entry.os_tid.store(os_tid, Ordering::Release);
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = thread_id; // takeover machinery is Windows-only
+        }
+    }
+
+    /// xt-hardening (2026-07-03): alive-thread count PLUS the published OS
+    /// tids of those alive threads, read under one registry lock so the GC
+    /// barrier's `expected` and the takeover's counted-set snapshot cannot
+    /// disagree about which threads exist. A thread whose OS tid is still 0
+    /// (registered, not yet started) is counted but yields no tid — it
+    /// cannot be executing JIT code yet, so it can never be frozen, and the
+    /// missing tid cannot cause a missed excusal deadlock.
+    pub fn alive_count_and_os_tids(&self) -> (usize, Vec<u32>) {
+        let threads = self.threads.lock();
+        let mut n = 0usize;
+        let mut tids = Vec::with_capacity(threads.len());
+        for e in threads.values() {
+            if e.alive.load(Ordering::Acquire) {
+                n += 1;
+                let t = e.os_tid.load(Ordering::Acquire);
+                if t != 0 {
+                    tids.push(t);
+                }
+            }
+        }
+        (n, tids)
     }
 
     /// Get Java Thread objects for all alive threads (up to `max` entries).

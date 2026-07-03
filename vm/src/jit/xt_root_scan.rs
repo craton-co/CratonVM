@@ -172,7 +172,11 @@ fn dbg() -> bool {
 #[derive(Default)]
 pub struct TakenOver {
     handles: Vec<isize>,
-    tids: Vec<u32>,
+    /// OS tids of the frozen peers, parallel to `handles`. `pub(crate)` so
+    /// the initiator's identity-based barrier excusal (xt-hardening
+    /// 2026-07-03) can check each newly-frozen tid against the counted-set
+    /// snapshot.
+    pub(crate) tids: Vec<u32>,
 }
 
 impl TakenOver {
@@ -487,12 +491,13 @@ mod imp {
         taken: &TakenOver,
         is_obj: &F,
         roots: &mut Vec<ObjectRef>,
+        blocked_os_tids: &[u32],
     ) -> (usize, usize)
     where
         F: Fn(usize) -> Option<ObjectRef>,
     {
         let ranges = crate::jit::jit_code_ranges_snapshot();
-        if ranges.is_empty() {
+        if ranges.is_empty() || blocked_os_tids.is_empty() {
             return (0, 0);
         }
         let self_tid = unsafe { GetCurrentThreadId() };
@@ -513,7 +518,22 @@ mod imp {
         let mut ok = unsafe { Thread32First(snap, &mut e) };
         while ok != 0 {
             let tid = e.th32_thread_id;
-            if e.th32_owner_process_id == pid && tid != self_tid && !taken.contains(tid) {
+            // xt-hardening follow-up (2026-07-03): this pass exists ONLY to
+            // close the BLOCKED-thread coverage gap (deposit_root_snapshot
+            // never scans the JIT band) — a cooperatively-arrived mutator
+            // already published its JIT roots via update_root_snapshot
+            // before parking at the barrier. Scanning it again is pure
+            // redundant over-retention risk (a false-positive conservative
+            // candidate can only ever help correctness for a REAL gap;
+            // widening the candidate volume for threads that need no help
+            // just adds corruption surface). Skip any peer not in the
+            // blocked-tid snapshot — this also skips the suspend/resume
+            // round-trip entirely for the (large majority) non-blocked case.
+            if e.th32_owner_process_id == pid
+                && tid != self_tid
+                && !taken.contains(tid)
+                && blocked_os_tids.contains(&tid)
+            {
                 if let Some((ctx, band_len)) = unsafe { snapshot_peer(tid, &mut band) } {
                     candidates.clear();
                     // Integer registers: a callee-saved register can still
@@ -676,6 +696,7 @@ pub fn helper_window_pass<F>(
     _taken: &TakenOver,
     _is_obj: &F,
     _roots: &mut Vec<ObjectRef>,
+    _blocked_os_tids: &[u32],
 ) -> (usize, usize)
 where
     F: Fn(usize) -> Option<ObjectRef>,

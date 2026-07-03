@@ -662,6 +662,135 @@ fn try_class_bundle(
     result
 }
 
+/// Read a `Locale`'s language/country/variant via its public accessors, so it
+/// works for both our synthetic Locales and the JDK's predefined constants
+/// (`Locale.FRENCH`, …) whose codes live in `BaseLocale`, not the synthetic
+/// side table.
+fn decompose_locale(ctx: &mut dyn NativeContext, loc: ObjectRef) -> (String, String, String) {
+    let lang = match ctx.invoke_virtual(loc, "getLanguage", "()Ljava/lang/String;", &[]) {
+        Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s).unwrap_or_default(),
+        _ => String::new(),
+    };
+    let country = match ctx.invoke_virtual(loc, "getCountry", "()Ljava/lang/String;", &[]) {
+        Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s).unwrap_or_default(),
+        _ => String::new(),
+    };
+    let variant = match ctx.invoke_virtual(loc, "getVariant", "()Ljava/lang/String;", &[]) {
+        Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s).unwrap_or_default(),
+        _ => String::new(),
+    };
+    (lang, country, variant)
+}
+
+/// Candidate chain, LEAST specific (ROOT) first, merged in order so a
+/// more-specific locale variant overrides — and inherited keys present only
+/// in a parent bundle still resolve (the JDK parent-chain fallback, flattened
+/// into one map). The most-specific variant that actually exists tags the
+/// bundle's locale (so getLocale() reports it).
+fn build_locale_chain(
+    bundle_name: &str,
+    lang: &str,
+    country: &str,
+    variant: &str,
+) -> Vec<(String, String, String)> {
+    let mut chain: Vec<(String, String, String)> = Vec::new();
+    chain.push((bundle_name.to_string(), String::new(), String::new()));
+    if !lang.is_empty() {
+        chain.push((format!("{bundle_name}_{lang}"), lang.to_string(), String::new()));
+    }
+    if !lang.is_empty() && !country.is_empty() {
+        chain.push((
+            format!("{bundle_name}_{lang}_{country}"),
+            lang.to_string(),
+            country.to_string(),
+        ));
+    }
+    // Locale variant (e.g. `en_GB_GLASGOW` -> `..._en_GB_GLASGOW.properties`).
+    // The JDK's candidate chain includes the variant as its most-specific
+    // entry; without it Spring's `ResourceBundleEditor` (which round-trips
+    // `name_en_GB_GLASGOW` through `parseLocaleString`) misses the bundle.
+    if !lang.is_empty() && !country.is_empty() && !variant.is_empty() {
+        chain.push((
+            format!("{bundle_name}_{lang}_{country}_{variant}"),
+            lang.to_string(),
+            country.to_string(),
+        ));
+    }
+    chain
+}
+
+/// Determine the JDK fallback locale for a `ResourceBundle.getBundle` call
+/// whose requested-locale candidate chain didn't resolve anything more
+/// specific than the root bundle. Mirrors
+/// `ResourceBundle.Control.getFallbackLocale`: consult a caller-supplied
+/// `Control` argument (if any) via virtual dispatch so subclass overrides
+/// (e.g. Spring's `ResourceBundleMessageSource.MessageSourceControl`, which
+/// returns `null` when `fallbackToSystemLocale=false`) are honored; otherwise
+/// replicate the JDK default `Control`'s behavior of falling back to
+/// `Locale.getDefault()` when it differs from the requested locale.
+fn resolve_fallback_locale(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    bundle_name: &str,
+    requested_locale_obj: Option<ObjectRef>,
+    lang: &str,
+    country: &str,
+    variant: &str,
+) -> Option<(String, String, String)> {
+    let control_obj = ctx
+        .class_id_by_name("java/util/ResourceBundle$Control")
+        .and_then(|control_cid| {
+            args.iter().skip(1).find_map(|a| match a {
+                Value::Object(Some(o))
+                    if ctx.is_subclass(ctx.class_id_of_object(*o), control_cid) =>
+                {
+                    Some(*o)
+                }
+                _ => None,
+            })
+        });
+
+    if let Some(control) = control_obj {
+        // Need a Locale object to pass to getFallbackLocale; use the one that
+        // was actually requested, or Locale.getDefault() when the overload
+        // took no explicit Locale (e.g. `getBundle(String, Control)`).
+        let locale_obj = match requested_locale_obj {
+            Some(o) => o,
+            None => match ctx.invoke("java/util/Locale", "getDefault", "()Ljava/util/Locale;", &[]) {
+                Ok(Some(Value::Object(Some(o)))) => o,
+                _ => return None,
+            },
+        };
+        let name_obj = ctx.create_string(bundle_name);
+        let fallback = match ctx.invoke_virtual(
+            control,
+            "getFallbackLocale",
+            "(Ljava/lang/String;Ljava/util/Locale;)Ljava/util/Locale;",
+            &[
+                Value::Object(Some(name_obj)),
+                Value::Object(Some(locale_obj)),
+            ],
+        ) {
+            Ok(Some(Value::Object(Some(loc)))) => loc,
+            _ => return None,
+        };
+        return Some(decompose_locale(ctx, fallback));
+    }
+
+    // No Control argument: standard JDK default-Control behavior — fall back
+    // to Locale.getDefault() when it differs from the requested locale.
+    let default_obj = match ctx.invoke("java/util/Locale", "getDefault", "()Ljava/util/Locale;", &[]) {
+        Ok(Some(Value::Object(Some(o)))) => o,
+        _ => return None,
+    };
+    let (d_lang, d_country, d_variant) = decompose_locale(ctx, default_obj);
+    if d_lang == lang && d_country == country && d_variant == variant {
+        None
+    } else {
+        Some((d_lang, d_country, d_variant))
+    }
+}
+
 fn rb_get_bundle(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let bundle_name = match args.first() {
         Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
@@ -673,31 +802,20 @@ fn rb_get_bundle(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
 
     // Resolve the requested locale from a Locale argument (getBundle(String,
     // Locale[, ClassLoader|Control])). Other shapes (or a Control in slot 1)
-    // fall back to the ROOT chain.
+    // fall back to the ROOT chain. Keep the Locale ObjectRef too (not just its
+    // decomposed strings) — `resolve_fallback_locale` below needs it to
+    // consult a caller-supplied Control's `getFallbackLocale` override.
+    let mut requested_locale_obj: Option<ObjectRef> = None;
     let (lang, country, variant) = match args.get(1) {
         Some(Value::Object(Some(loc))) => {
             let cid = ctx.class_id_of_object(*loc);
             if ctx.class_name_of_id(cid).as_deref() == Some("java/util/Locale") {
+                requested_locale_obj = Some(*loc);
                 // Read via getLanguage()/getCountry()/getVariant() so it works
                 // for both our synthetic Locales and the JDK's predefined
                 // constants (Locale.FRENCH, …) whose codes live in BaseLocale,
                 // not the synthetic side table.
-                let lang =
-                    match ctx.invoke_virtual(*loc, "getLanguage", "()Ljava/lang/String;", &[]) {
-                        Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s).unwrap_or_default(),
-                        _ => String::new(),
-                    };
-                let country =
-                    match ctx.invoke_virtual(*loc, "getCountry", "()Ljava/lang/String;", &[]) {
-                        Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s).unwrap_or_default(),
-                        _ => String::new(),
-                    };
-                let variant =
-                    match ctx.invoke_virtual(*loc, "getVariant", "()Ljava/lang/String;", &[]) {
-                        Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s).unwrap_or_default(),
-                        _ => String::new(),
-                    };
-                (lang, country, variant)
+                decompose_locale(ctx, *loc)
             } else {
                 (String::new(), String::new(), String::new())
             }
@@ -705,34 +823,7 @@ fn rb_get_bundle(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
         _ => (String::new(), String::new(), String::new()),
     };
 
-    // Candidate chain, LEAST specific (ROOT) first, merged in order so a
-    // more-specific locale variant overrides — and inherited keys present only
-    // in a parent bundle still resolve (the JDK parent-chain fallback, flattened
-    // into one map). The most-specific variant that actually exists tags the
-    // bundle's locale (so getLocale() reports it).
-    let mut chain: Vec<(String, String, String)> = Vec::new();
-    chain.push((bundle_name.clone(), String::new(), String::new()));
-    if !lang.is_empty() {
-        chain.push((format!("{bundle_name}_{lang}"), lang.clone(), String::new()));
-    }
-    if !lang.is_empty() && !country.is_empty() {
-        chain.push((
-            format!("{bundle_name}_{lang}_{country}"),
-            lang.clone(),
-            country.clone(),
-        ));
-    }
-    // Locale variant (e.g. `en_GB_GLASGOW` -> `..._en_GB_GLASGOW.properties`).
-    // The JDK's candidate chain includes the variant as its most-specific
-    // entry; without it Spring's `ResourceBundleEditor` (which round-trips
-    // `name_en_GB_GLASGOW` through `parseLocaleString`) misses the bundle.
-    if !lang.is_empty() && !country.is_empty() && !variant.is_empty() {
-        chain.push((
-            format!("{bundle_name}_{lang}_{country}_{variant}"),
-            lang.clone(),
-            country.clone(),
-        ));
-    }
+    let mut chain = build_locale_chain(&bundle_name, &lang, &country, &variant);
 
     let obj = alloc_concurrent_synthetic(ctx, "java/util/ResourceBundle", 2);
     let map = alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3);
@@ -746,6 +837,41 @@ fn rb_get_bundle(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
         if let Some(bytes) = ctx.find_resource(&path) {
             parse_props_into_map(ctx, map, &bytes);
             matched = Some((m_lang.clone(), m_country.clone()));
+        }
+    }
+
+    // JDK fallback-locale semantics: when the requested locale's own
+    // candidate chain doesn't resolve anything more specific than the root
+    // bundle, the JDK retries with the `Control`'s fallback locale — the
+    // caller-supplied Control's override if one was passed (e.g. Spring's
+    // `ResourceBundleMessageSource`, which disables this via
+    // `fallbackToSystemLocale=false`), or `Locale.getDefault()` for the
+    // standard no-Control overloads. Verified against real JDK 25: requesting
+    // "en" with no `messages_en.properties` on the classpath but a
+    // `messages_de.properties` present resolves to the "de" bundle when the
+    // JVM default locale is German — but a requested locale with its own
+    // matching file always wins over the fallback (so this only kicks in
+    // when the primary chain found nothing beyond root).
+    let beyond_root = matched.as_ref().is_some_and(|(l, _)| !l.is_empty());
+    if !beyond_root {
+        if let Some((f_lang, f_country, f_variant)) = resolve_fallback_locale(
+            ctx,
+            args,
+            &bundle_name,
+            requested_locale_obj,
+            &lang,
+            &country,
+            &variant,
+        ) {
+            let fallback_chain = build_locale_chain(&bundle_name, &f_lang, &f_country, &f_variant);
+            for (cand, m_lang, m_country) in &fallback_chain {
+                let path = format!("{}.properties", cand.replace('.', "/"));
+                if let Some(bytes) = ctx.find_resource(&path) {
+                    parse_props_into_map(ctx, map, &bytes);
+                    matched = Some((m_lang.clone(), m_country.clone()));
+                }
+            }
+            chain.extend(fallback_chain);
         }
     }
 
@@ -925,6 +1051,46 @@ fn rb_get_object(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
                 exc,
             ));
         }
+
+        // Not a ListResourceBundle-style class (getContents() unavailable) —
+        // fall back to the REAL `getObject()` contract: call the receiver's own
+        // `handleGetObject` override virtually. Covers general custom
+        // ResourceBundle subclasses like Spring's `MessageSourceResourceBundle`
+        // (overrides handleGetObject directly — delegates to a MessageSource —
+        // and has neither `getContents()` nor a `lookup` field), which
+        // previously fell through to the synthetic-bundle "field 0 as map" hack
+        // below and silently misread its `messageSource` field as a Map,
+        // returning null for every key
+        // (ResourceBundleMessageSourceTests.messageSourceResourceBundle).
+        // `handleGetObject` is abstract on `ResourceBundle`, so any concrete
+        // subclass reaching this branch necessarily declares its own override —
+        // virtual dispatch resolves there, never recursing back into this
+        // native (which is registered on the more general `ResourceBundle`).
+        if let Ok(Some(val)) = ctx.invoke_virtual(
+            this,
+            "handleGetObject",
+            "(Ljava/lang/String;)Ljava/lang/Object;",
+            &[Value::Object(Some(key))],
+        ) {
+            if !matches!(val, Value::Object(None)) {
+                return Ok(Some(val));
+            }
+        }
+        if let Value::Object(Some(parent)) = ctx.get_field_by_name(this, "parent") {
+            return rb_get_object(
+                ctx,
+                &[Value::Object(Some(parent)), Value::Object(Some(key))],
+            );
+        }
+        let exc = alloc_concurrent_synthetic(ctx, "java/util/MissingResourceException", 8);
+        let msg = ctx.create_string(&format!(
+            "Can't find resource for key {}",
+            key_str.unwrap_or_default()
+        ));
+        ctx.set_field_by_name(exc, "detailMessage", Value::Object(Some(msg)));
+        return Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(
+            exc,
+        ));
     }
 
     let map = match ctx.get_field(this, 0) {

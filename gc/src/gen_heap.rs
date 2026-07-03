@@ -3978,91 +3978,132 @@ impl GenerationalHeap {
         // seed). Marking uses `GC_FLAG_MARKED` in the object header.
         let mut worklist: Vec<*mut u8> = Vec::new();
 
+        // xt-hardening (2026-07-03): per-cycle SIDE mark set for candidates
+        // that must never be header-written. The mark write
+        // (`gc_flags |= GC_FLAG_MARKED` at candidate+21) through a
+        // conservative FALSE POSITIVE is itself a heap corruptor: a candidate
+        // at (live_object_start - 8) — trivially plausible whenever the
+        // preceding 8 bytes are zero and the victim's identity hash is
+        // un-minted — lands the write at victim+13, flipping bit 9 of the
+        // victim's `array_length` to EXACTLY 512 (the observed
+        // "kind=Object but array_length=512" corrupt-header face, whose
+        // volume exploded when the xt cross-thread takeover started feeding
+        // whole frozen-peer register files and stack bands into the root
+        // set). Real objects always have a non-zero first header word
+        // (class_id|kind|element_type); the only legal zero-word0 shape is a
+        // fresh zero-hash `ClassId(0)` container, which the side set handles
+        // correctly (pinned + traced, never written). Zero-word0 candidates
+        // are the overwhelming false-positive volume — routing them here
+        // removes the writer from the entire zeroed-span/misalign family.
+        let mut side_marks: FxHashSet<usize> = FxHashSet::default();
         // mark_if_young: mark a candidate young pointer and enqueue it.
         // SAFETY contract: `ptr` is only dereferenced after `in_young`
         // confirms it lands inside the live from-space region.
-        let mut mark_young = |ptr: *mut u8, worklist: &mut Vec<*mut u8>| {
-            let addr = ptr as usize;
-            if !in_young(addr) {
-                return;
-            }
-            // SAFETY: `in_young` confirmed `addr` is an 8-byte-aligned
-            // address inside the live from-space region, so reading an
-            // ObjectHeader there is valid.
-            let header = unsafe { &mut *(ptr as *mut ObjectHeader) };
-            // Reject implausible headers — a conservative root may point
-            // at a non-object word. `is_object_address`-style sanity.
-            // Multi-array reloc fix (2026-05-22): `num_slots` mirrors
-            // `array_length` for arrays, so a legitimate 256 MB int[] has
-            // num_slots = 2^26 > 1<<24 and would be skipped (then swept as
-            // garbage, despite being a live root). Gate num_slots on
-            // non-arrays; bound array_length at the JVM ceiling.
-            let kind_byte = header.kind as u8;
-            let is_array = header.kind == ObjectKind::Array;
-            if kind_byte > 1
-                || (!is_array && header.num_slots > (1 << 24))
-                || (is_array && header.array_length > i32::MAX as u32)
-            {
-                return;
-            }
-            // DoHead comb-7 fix (2026-07-03): also validate the object's
-            // EXTENT. The field bounds above still admit a corrupt header
-            // claiming millions of elements (array_length is only capped at
-            // i32::MAX), and the BFS scan (`for_each_ref_slot`) iterates
-            // that count with the header as its ONLY bound — a claimed
-            // extent past from-space ran the scan off the mapped arena
-            // (observed: main-vm SIGSEGV at the region boundary, corrupt
-            // header claiming array_length=7,775,429 — the JIT inline-alloc
-            // kind/array_length fault family). A real object's extent always
-            // fits inside the arena it was allocated from, so an
-            // out-of-extent header is definitionally corrupt: never mark or
-            // scan it (its "referents" would be garbage reads anyway).
-            let total = gen_object_total_size(header);
-            if total < HEADER_SIZE || addr + total > from_end {
-                let n = SWEEP_BAD_EXTENT_HITS.fetch_add(1, Ordering::Relaxed);
-                if n < 8 {
-                    // Attribution diagnostic: dump the words around the
-                    // rejected "header" so the upstream corruptor face is
-                    // identifiable (stale packed-pointer reuse shows heap
-                    // pointers; a clobbered real header shows a torn mix).
-                    let lo = addr.saturating_sub(32).max(from_base);
-                    let mut hex = String::new();
-                    let mut w = lo;
-                    while w + 8 <= (addr + 48).min(from_end) {
-                        // SAFETY: `[from_base, from_end)` is mapped arena
-                        // memory and `w` is 8-aligned within it.
-                        let v = unsafe { *((w & !7) as *const u64) };
-                        hex.push_str(&format!("{:#x}:{:016x} ", w & !7, v));
-                        w += 8;
-                    }
-                    tracing::warn!(
-                        "mark_young: rejecting object at {:#x} with implausible extent \
+        let mut mark_young =
+            |ptr: *mut u8, worklist: &mut Vec<*mut u8>, side_marks: &mut FxHashSet<usize>| {
+                let addr = ptr as usize;
+                if !in_young(addr) {
+                    return;
+                }
+                // SAFETY: `in_young` confirmed `addr` is an 8-byte-aligned
+                // address inside the live from-space region, so reading an
+                // ObjectHeader there is valid.
+                let header = unsafe { &mut *(ptr as *mut ObjectHeader) };
+                // Reject implausible headers — a conservative root may point
+                // at a non-object word. `is_object_address`-style sanity.
+                // Multi-array reloc fix (2026-05-22): `num_slots` mirrors
+                // `array_length` for arrays, so a legitimate 256 MB int[] has
+                // num_slots = 2^26 > 1<<24 and would be skipped (then swept as
+                // garbage, despite being a live root). Gate num_slots on
+                // non-arrays; bound array_length at the JVM ceiling.
+                let kind_byte = header.kind as u8;
+                let is_array = header.kind == ObjectKind::Array;
+                if kind_byte > 1
+                    || (!is_array && header.num_slots > (1 << 24))
+                    || (is_array && header.array_length > i32::MAX as u32)
+                {
+                    return;
+                }
+                // DoHead comb-7 fix (2026-07-03): also validate the object's
+                // EXTENT. The field bounds above still admit a corrupt header
+                // claiming millions of elements (array_length is only capped at
+                // i32::MAX), and the BFS scan (`for_each_ref_slot`) iterates
+                // that count with the header as its ONLY bound — a claimed
+                // extent past from-space ran the scan off the mapped arena
+                // (observed: main-vm SIGSEGV at the region boundary, corrupt
+                // header claiming array_length=7,775,429 — the JIT inline-alloc
+                // kind/array_length fault family). A real object's extent always
+                // fits inside the arena it was allocated from, so an
+                // out-of-extent header is definitionally corrupt: never mark or
+                // scan it (its "referents" would be garbage reads anyway).
+                let total = gen_object_total_size(header);
+                if total < HEADER_SIZE || addr + total > from_end {
+                    let n = SWEEP_BAD_EXTENT_HITS.fetch_add(1, Ordering::Relaxed);
+                    if n < 8 {
+                        // Attribution diagnostic: dump the words around the
+                        // rejected "header" so the upstream corruptor face is
+                        // identifiable (stale packed-pointer reuse shows heap
+                        // pointers; a clobbered real header shows a torn mix).
+                        let lo = addr.saturating_sub(32).max(from_base);
+                        let mut hex = String::new();
+                        let mut w = lo;
+                        while w + 8 <= (addr + 48).min(from_end) {
+                            // SAFETY: `[from_base, from_end)` is mapped arena
+                            // memory and `w` is 8-aligned within it.
+                            let v = unsafe { *((w & !7) as *const u64) };
+                            hex.push_str(&format!("{:#x}:{:016x} ", w & !7, v));
+                            w += 8;
+                        }
+                        tracing::warn!(
+                            "mark_young: rejecting object at {:#x} with implausible extent \
                          {} (kind={}, array_len={}, num_slots={}) — corrupt header, \
                          not marked/scanned; context {}",
-                        addr,
-                        total,
-                        kind_byte,
-                        header.array_length,
-                        header.num_slots,
-                        hex,
-                    );
+                            addr,
+                            total,
+                            kind_byte,
+                            header.array_length,
+                            header.num_slots,
+                            hex,
+                        );
+                    }
+                    return;
                 }
-                return;
-            }
-            if header.gc_flags & GC_FLAG_MARKED == 0 {
-                header.gc_flags |= GC_FLAG_MARKED;
-                worklist.push(ptr);
-            }
-        };
+                // Zero first-header-word candidates take the SIDE path: alive and
+                // traced, but the header is NEVER written (see side_marks above).
+                // SAFETY: `addr` is 8-aligned inside mapped from-space.
+                let word0 = unsafe { *(ptr as *const u64) };
+                if word0 == 0 {
+                    if side_marks.insert(addr) {
+                        worklist.push(ptr);
+                    }
+                    return;
+                }
+                // xt-hardening follow-up (2026-07-03): a non-zero-word0
+                // candidate whose always-zero header fields are non-zero is
+                // still corrupt garbage that happened to satisfy the
+                // field-bound + extent checks above — route it through the
+                // same non-writing side path rather than trusting it enough
+                // to header-write.
+                if !header_reserved_fields_plausible(header) {
+                    if side_marks.insert(addr) {
+                        worklist.push(ptr);
+                    }
+                    return;
+                }
+                if header.gc_flags & GC_FLAG_MARKED == 0 {
+                    header.gc_flags |= GC_FLAG_MARKED;
+                    worklist.push(ptr);
+                }
+            };
 
         // Seed: precise + conservative roots gathered by the caller.
         for root in roots.iter() {
-            mark_young(root.as_ptr(), &mut worklist);
+            mark_young(root.as_ptr(), &mut worklist, &mut side_marks);
         }
 
         // Seed: finalizable objects — keep them alive so finalize() runs.
         for &addr in finalizer_addrs {
-            mark_young(addr as *mut u8, &mut worklist);
+            mark_young(addr as *mut u8, &mut worklist, &mut side_marks);
         }
 
         // Seed: old→young references from dirty cards. Reuse the existing
@@ -4095,7 +4136,7 @@ impl GenerationalHeap {
                 // SAFETY: `slot_ptr` is a valid 8-byte ref element.
                 let raw: u64 = unsafe { std::ptr::read(slot_ptr as *const u64) };
                 if raw != 0 {
-                    mark_young(raw as usize as *mut u8, &mut worklist);
+                    mark_young(raw as usize as *mut u8, &mut worklist, &mut side_marks);
                 }
             } else if is_compact_object(header) {
                 // Compact object: `slot_idx` is the BYTE OFFSET of an 8-byte
@@ -4104,7 +4145,7 @@ impl GenerationalHeap {
                 let slot_ptr = unsafe { old_obj.as_ptr().add(HEADER_SIZE + slot_idx) };
                 let raw: u64 = unsafe { std::ptr::read(slot_ptr as *const u64) };
                 if raw != 0 {
-                    mark_young(raw as usize as *mut u8, &mut worklist);
+                    mark_young(raw as usize as *mut u8, &mut worklist, &mut side_marks);
                 }
             } else {
                 // SAFETY: `slot_idx` is within `num_slots` (from card scan).
@@ -4112,7 +4153,7 @@ impl GenerationalHeap {
                 // SAFETY: `slot_ptr` is a valid Value-sized slot.
                 let value = unsafe { std::ptr::read(slot_ptr as *const Value) };
                 if let Value::Object(Some(ref_obj)) = value {
-                    mark_young(ref_obj.as_ptr(), &mut worklist);
+                    mark_young(ref_obj.as_ptr(), &mut worklist, &mut side_marks);
                 }
             }
         }
@@ -4133,7 +4174,7 @@ impl GenerationalHeap {
                 let oh = unsafe { &*(op as *const ObjectHeader) };
                 // SAFETY: `op`/`oh` are a valid live old-gen object.
                 unsafe {
-                    for_each_ref_slot(op, oh, |r, _| mark_young(r, &mut worklist));
+                    for_each_ref_slot(op, oh, |r, _| mark_young(r, &mut worklist, &mut side_marks));
                 }
             }
         }
@@ -4151,7 +4192,7 @@ impl GenerationalHeap {
             // SAFETY: `obj_ptr`/`header` are a validated young object.
             unsafe {
                 for_each_ref_slot(obj_ptr, header, |ref_ptr, _| {
-                    mark_young(ref_ptr, &mut worklist);
+                    mark_young(ref_ptr, &mut worklist, &mut side_marks);
                 });
             }
             // HIB-CV-24: also mark this object's defining ClassLoader so a live
@@ -4160,10 +4201,16 @@ impl GenerationalHeap {
                 if let Some(loader_addr) =
                     cratonvm_types::loader_pin::loader_pin_addr(header.class_id.as_u32())
                 {
-                    mark_young(loader_addr as *mut u8, &mut worklist);
+                    mark_young(loader_addr as *mut u8, &mut worklist, &mut side_marks);
                 }
             }
         }
+
+        // Sorted view of the side mark set for O(1)-amortized lockstep checks
+        // in the linear walks below (same pattern as the free-block skip).
+        // ABSOLUTE addresses.
+        let mut side_sorted: Vec<usize> = side_marks.iter().copied().collect();
+        side_sorted.sort_unstable();
 
         // ----- Selective promotion -----------------------------------------
         //
@@ -4205,7 +4252,20 @@ impl GenerationalHeap {
         // `CRATONVM_SELECTIVE_PROMOTE` gate is now redundant (always-on) but kept
         // accepted for compatibility. This path runs only here, in the JIT-active
         // non-moving sweep, so it never affects the no-JIT moving Cheney.
-        let selective_on = std::env::var_os("CRATONVM_NO_SELECTIVE_PROMOTE").is_none();
+        // xt-hardening (2026-07-03): do NOT evacuate on cycles where the JIT
+        // root coverage is known-incomplete (forcibly-frozen peers, helper
+        // windows, or reserved TLAB tails present — the VM marks the cycle
+        // via `mark_moving_young_coverage_incomplete`). A frozen peer's
+        // registers can hold ONLY a derived/interior pointer to an object
+        // whose base is reachable via precise heap edges: the base is not
+        // pin-by-value protected (interior addresses don't resolve to roots),
+        // gets evacuated, its young source zeroed and re-served, and the
+        // resumed peer keeps loading/storing through the stale derived
+        // pointer. Retention for one cycle is always safe; the flag is
+        // per-cycle so ordinary (single-threaded / cooperative) collections
+        // keep the bt18-critical drain.
+        let selective_on = std::env::var_os("CRATONVM_NO_SELECTIVE_PROMOTE").is_none()
+            && !crate::gc_quiescence::moving_young_coverage_incomplete();
         if selective_on {
             let is_y = |a: usize| -> bool { a >= from_base && a < from_end && (a & 0x7) == 0 };
 
@@ -4552,6 +4612,9 @@ impl GenerationalHeap {
                     let mut free_iter = sweep_free_blocks.iter().peekable();
                     let used = sweep_used;
                     let mut cursor = 0usize;
+                    // xt-hardening (2026-07-03): lockstep over side-marked
+                    // survivors (see the fixup condition below).
+                    let mut side_iter_3a = side_sorted.iter().peekable();
                     // Conservative fallback for a stretch this walk cannot
                     // parse (the evacuation walk resynced over the same
                     // stretch, so survivors inside it were not evacuated —
@@ -4622,7 +4685,27 @@ impl GenerationalHeap {
                             }
                             break;
                         }
-                        if header.gc_flags & GC_FLAG_MARKED != 0 && !header.is_forwarded() {
+                        // xt-hardening (2026-07-03): side-marked survivors
+                        // (kept alive without a header write — see
+                        // `side_marks`) also need their references to
+                        // evacuated objects rewritten; they are unmarked by
+                        // construction so the MARKED gate alone would skip
+                        // them (dangling refs once the main sweep frees the
+                        // forwarded sources).
+                        let side_hit = {
+                            let abs = from_base + cursor;
+                            while let Some(&&a) = side_iter_3a.peek() {
+                                if a < abs {
+                                    side_iter_3a.next();
+                                } else {
+                                    break;
+                                }
+                            }
+                            side_iter_3a.peek().is_some_and(|&&a| a == abs)
+                        };
+                        if (header.gc_flags & GC_FLAG_MARKED != 0 || side_hit)
+                            && !header.is_forwarded()
+                        {
                             fixup_object_fields(obj, header, &fwd_of, &is_y, None);
                         }
                         cursor += total_size;
@@ -4978,6 +5061,11 @@ impl GenerationalHeap {
         let mut cursor: usize = 0;
         let used = young_from.used();
         let mut free_iter = existing_free.iter().peekable();
+        // xt-hardening (2026-07-03): lockstep iterator over the side mark
+        // set (absolute addrs, sorted) — side-marked objects are survivors
+        // whose headers were never written; the walk must retain them
+        // without touching gc_flags/gc_age.
+        let mut side_iter = side_sorted.iter().peekable();
         // Debug diag: keep a short ring buffer of (offset, size, class_id, kind,
         // num_slots, array_length) for the last 6 objects walked. When the
         // implausible-header break fires we dump it so we can pin down which
@@ -5376,6 +5464,25 @@ impl GenerationalHeap {
                 *(obj_ptr as *const u64)
             }));
 
+            let side_marked_survivor = if !header.is_forwarded() {
+                // xt-hardening (2026-07-03): side-marked survivor check
+                // (lockstep, absolute addrs). These candidates were kept
+                // alive WITHOUT a header write; retain them without writing
+                // gc_flags/gc_age either (their "header" may be a zero span
+                // or a legal zero-word0 container — never write through it).
+                let abs = from_base + cursor;
+                while let Some(&&a) = side_iter.peek() {
+                    if a < abs {
+                        side_iter.next();
+                    } else {
+                        break;
+                    }
+                }
+                side_iter.peek().is_some_and(|&&a| a == abs)
+            } else {
+                false
+            };
+
             if header.is_forwarded() {
                 // Evacuated to old gen by selective promotion: the live copy is
                 // in old gen and references were redirected in the fixup pass;
@@ -5414,6 +5521,9 @@ impl GenerationalHeap {
                         header.kind as u8,
                     ));
                 }
+            } else if side_marked_survivor {
+                // Side-marked survivor: pure retention, no header writes.
+                objects_live += 1;
             } else if header.gc_flags & GC_FLAG_MARKED != 0 {
                 // Survivor: clear the mark, keep in place, and age it so the
                 // next sweep can tenure it once it reaches PROMOTION_AGE
@@ -5656,15 +5766,75 @@ impl GenerationalHeap {
 
         let mut worklist: Vec<*mut u8> = Vec::new();
 
-        // Seed: root ObjectRefs that point into old gen
+        // Seed: root ObjectRefs that point into old gen.
+        //
+        // xt-hardening follow-up (2026-07-03): `roots` includes CONSERVATIVE
+        // candidates (register/stack-scanned guesses — the same `xt_roots`
+        // whose flood exposed the young-gen `mark_young` header-write
+        // corruptor). `OldGen::contains` is a bare bounds check (no
+        // alignment, no header validation), so before this fix ANY garbage
+        // address landing inside old gen's byte range got `gc_flags` blindly
+        // RMW'd — the exact same corruption family, on the OTHER generation.
+        // Reject implausible candidates instead of marking them: mirrors the
+        // already-established pattern in `scan_object_for_old_refs`'s extent
+        // check (skip-on-implausible, never corrupt) — old-gen compaction
+        // decides liveness purely from `gc_flags & GC_FLAG_MARKED`, so unlike
+        // the young sweep there is no side-mark-set escape hatch; the safe
+        // choice for an address that fails these checks is to not mark it
+        // (over-retention is not even at stake here — a failing candidate
+        // was never a valid object to begin with).
+        //
+        // NOTE this predicate deliberately does NOT require a non-zero first
+        // header word (unlike `mark_young`'s zero-word0 side-mark split):
+        // `ClassId(0)` ad-hoc containers (class_id=0, kind=Object=0,
+        // element_type=Reference=0, `_padding`=0) are a first-class supported
+        // shape whose word0 is legitimately all-zero — rejecting them here
+        // broke real promoted objects (major_gc_frees_old_gen_garbage et al).
+        // A zero-word0 candidate additionally passes through
+        // `victim8_neighbor_explains_zero_prefix` — a targeted check for the
+        // dominant real-world shape of this ambiguity, `candidate = victim
+        // − 8`: if the 8 bytes at `candidate` are just the tail
+        // zero-padding/hash-prefix of a SEPARATE, independently-plausible
+        // object starting at `candidate + 8`, `candidate` itself is not a
+        // real header and is rejected. A genuine zero-hash `ClassId(0)`
+        // container's successor 8 bytes are its own body/next-object data,
+        // essentially never a coincidentally-valid, independently-fitting
+        // header — false rejects of real containers are not expected. Old
+        // gen has no side-mark-set escape hatch (compaction PHYSICALLY
+        // SLIDES live objects; treating an unrelated garbage candidate as
+        // live would copy garbage over/into a real neighbor during the
+        // slide — strictly worse than skipping), so reject is the only safe
+        // response to a candidate that fails this check; verified this
+        // session (disassembly + byte-exact match on the fabricated
+        // pointer `0x0000020000000000` = hash(0)‖array_length(512) read
+        // from a corrupted victim's header) to be the mechanism behind the
+        // pre-xt-activation background DoHead crash face.
         for root in roots.iter() {
             let ptr = root.as_ptr();
-            if old_gen.contains(ptr) {
-                // SAFETY: `ptr` is a root ObjectRef in old gen (verified by `contains` above); its header is valid.
+            if (ptr as usize) & 0x7 == 0 && old_gen.contains(ptr) {
+                // SAFETY: `ptr` is 8-aligned and inside old gen (verified by
+                // `contains` above); reading its header is in-bounds.
                 let header = unsafe { &mut *(ptr as *mut ObjectHeader) };
-                if header.gc_flags & GC_FLAG_MARKED == 0 {
-                    header.gc_flags |= GC_FLAG_MARKED;
-                    worklist.push(ptr);
+                let kind_byte = header.kind as u8;
+                let is_array = header.kind == ObjectKind::Array;
+                let word0 = unsafe { *(ptr as *const u64) };
+                let plausible = kind_byte <= 1
+                    && (is_array || header.num_slots <= (1 << 24))
+                    && (!is_array || header.array_length <= i32::MAX as u32)
+                    && header_reserved_fields_plausible(header)
+                    && (word0 != 0
+                        || !victim8_neighbor_explains_zero_prefix(ptr, old_gen));
+                if plausible {
+                    let total = gen_object_total_size(header);
+                    let fits = total >= HEADER_SIZE
+                        // SAFETY: total >= HEADER_SIZE was just checked; the
+                        // addition stays within a sane pointer range for a
+                        // plausibility probe (no dereference here).
+                        && old_gen.contains(unsafe { ptr.add(total - 1) });
+                    if fits && header.gc_flags & GC_FLAG_MARKED == 0 {
+                        header.gc_flags |= GC_FLAG_MARKED;
+                        worklist.push(ptr);
+                    }
                 }
             }
         }
@@ -7240,6 +7410,66 @@ fn seedhunt_scan_young(
         cur += size;
     }
     count
+}
+
+/// xt-hardening follow-up (2026-07-03): reject a conservative candidate
+/// whose header's ALWAYS-ZERO fields are non-zero. `ObjectHeader::new`
+/// (types/src/heap_types.rs) unconditionally zero-initializes `_padding`
+/// (offset 6-7) and `_gc_reserved` (offset 22-23), and every relocation copy
+/// site (region.rs) and the JIT inline-alloc fast path (x64.rs
+/// `emit_inline_tlab_new`, which explicitly zeroes offset 4-7 as a single
+/// dword even on its fast path — see the "Defensively zero offset 4" comment
+/// there) preserve that invariant; nothing in the codebase ever writes a
+/// non-zero byte into either field. `gc_flags` similarly has only 3 defined
+/// bits (`GC_FLAG_OLD_GEN`/`MARKED`/`COMPACT`); any other bit set is
+/// definitionally corrupt. This closes the residual (rarer, non-zero-word0)
+/// slice of the `mark_young` conservative-candidate false-positive family
+/// that the zero-word0 side-mark-set fix (2026-07-03, same session) does not
+/// cover — a candidate whose garbage predecessor bytes happen to satisfy the
+/// kind/num_slots/array_length/extent bounds but fail this near-free check.
+/// Four bytes of near-uniform-random garbage failing this check is a ~1/2^29
+/// false-negative-on-garbage rate (2 padding bytes + 2 reserved bytes + 5
+/// undefined gc_flags bits); real objects always pass.
+#[inline]
+fn header_reserved_fields_plausible(header: &ObjectHeader) -> bool {
+    header._padding == [0, 0]
+        && header._gc_reserved == [0, 0]
+        && header.gc_flags & !(GC_FLAG_OLD_GEN | GC_FLAG_MARKED | GC_FLAG_COMPACT) == 0
+}
+
+/// xt-hardening follow-up (2026-07-03): targeted defense against the
+/// `candidate = victim − 8` corruptor shape for a zero-word0 old-gen root
+/// candidate — see the call site's comment for the full rationale. Returns
+/// `true` if `candidate + 8` looks like the start of a genuine, independently
+/// plausible object (in which case `candidate`'s all-zero 8 bytes are almost
+/// certainly that object's own leading padding/hash bytes, not a real header
+/// of its own).
+#[inline]
+fn victim8_neighbor_explains_zero_prefix(candidate: *mut u8, old_gen: &OldGen) -> bool {
+    // SAFETY: caller has already verified `candidate` is 8-aligned and
+    // inside old gen; `candidate + 8` stays 8-aligned. Bounds-check before
+    // dereferencing.
+    let neighbor = unsafe { candidate.add(8) };
+    if !old_gen.contains(neighbor) {
+        return false;
+    }
+    // SAFETY: bounds-checked above.
+    let nheader = unsafe { &*(neighbor as *const ObjectHeader) };
+    let nword0 = unsafe { *(neighbor as *const u64) };
+    let kind_byte = nheader.kind as u8;
+    let is_array = nheader.kind == ObjectKind::Array;
+    let plausible = nword0 != 0
+        && kind_byte <= 1
+        && (is_array || nheader.num_slots <= (1 << 24))
+        && (!is_array || nheader.array_length <= i32::MAX as u32)
+        && header_reserved_fields_plausible(nheader);
+    if !plausible {
+        return false;
+    }
+    let total = gen_object_total_size(nheader);
+    total >= HEADER_SIZE
+        // SAFETY: total >= HEADER_SIZE was just checked.
+        && old_gen.contains(unsafe { neighbor.add(total - 1) })
 }
 
 fn gen_object_total_size(header: &ObjectHeader) -> usize {

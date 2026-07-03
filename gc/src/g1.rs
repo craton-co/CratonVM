@@ -4322,7 +4322,8 @@ impl G1Collector {
     /// in the VM does not spin forever on a cycle nobody is driving.
     pub fn abort_concurrent_mark(&self) {
         self.mark_worklist.lock().clear();
-        self.mark_worklist_overflowed.store(false, Ordering::Relaxed);
+        self.mark_worklist_overflowed
+            .store(false, Ordering::Relaxed);
         let _ = self.satb_queue.deactivate_and_drain();
         self.gc_state.set_phase(ConcurrentGcPhase::Idle);
     }

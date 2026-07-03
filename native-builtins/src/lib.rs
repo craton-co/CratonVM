@@ -5943,6 +5943,52 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;)Ljava/lang/String;",
         |_ctx, _args| Ok(Some(Value::Object(None))),
     );
+    // `NativeLibraries.load(NativeLibraryImpl impl, String name, boolean isBuiltin,
+    // boolean throwExceptionIfFail)` — the classic JNI native-library loader behind
+    // `System.loadLibrary`/`ClassLoader.loadLibrary`. Not previously registered
+    // anywhere: on Windows the classes exercised so far apparently resolve via a
+    // different bootstrap route, but on Linux real-JDK static init (e.g.
+    // Inflater/zip, or JUnit's own bootstrap) calls this directly and an
+    // unregistered ACC_NATIVE method throws `UnsatisfiedLinkError` at class-init
+    // time, before any test body runs — a hard, platform-specific blocker.
+    //
+    // Unlike `RawNativeLibraries.load0` (panama.rs) — which backs FFM downcalls
+    // into genuine third-party libraries CratonVM does NOT reimplement, e.g.
+    // Tomcat's openssl_h needing the real libssl/libcrypto — the libraries this
+    // classic path loads are the JDK's OWN internals (zip, net, nio,
+    // management, ...), whose Java-visible behavior CratonVM already
+    // reimplements as native methods intercepted directly by this registry.
+    // A real `dlopen` here is actively counterproductive: the JDK's own
+    // `libzip.so` etc. are built to run inside HotSpot's `libjvm.so` process
+    // and fail to load standalone (`libjvm.so: cannot open shared object
+    // file`) since CratonVM is not that architecture. Try a real load first
+    // (some names may resolve, e.g. genuine third-party JNI libs on the
+    // classpath), but never let a failure here be fatal — the callers that
+    // matter get their functionality from CratonVM's own natives regardless
+    // of whether the underlying .so actually loaded, exactly like the
+    // adjacent `findBuiltinLib` stub's "not a built-in, but proceed anyway"
+    // contract.
+    registry.register(
+        "jdk/internal/loader/NativeLibraries",
+        "load",
+        "(Ljdk/internal/loader/NativeLibraries$NativeLibraryImpl;Ljava/lang/String;ZZ)Z",
+        |ctx, args| {
+            let impl_obj = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(Some(Value::Int(1))),
+            };
+            let name = match args.get(1) {
+                Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+                _ => String::new(),
+            };
+            let handle = match ctx.load_native_library(&name) {
+                Ok(lib_index) => lib_index + 1,
+                Err(_) => 0,
+            };
+            ctx.set_field_by_name(impl_obj, "handle", Value::Long(handle));
+            Ok(Some(Value::Int(1)))
+        },
+    );
     registry.register(
         "jdk/internal/loader/BootLoader",
         "setBootLoaderUnnamedModule0",
@@ -29908,13 +29954,40 @@ fn native_charset_for_name(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     };
     let normalized = normalize_charset_name(&name);
     if normalized.is_empty() {
-        return Err(RuntimeError::IllegalArgumentException {
-            message: format!("Unsupported charset: {}", name),
-        }
-        .into());
+        // Real `Charset.forName` throws the specific `UnsupportedCharsetException`
+        // subclass (NOT a bare `IllegalArgumentException`) for a syntactically
+        // valid but unsupported name. `ResourceBundleMessageSourceTests.
+        // resourceBundleMessageSourceWithInvalidDefaultCharsetName` asserts the
+        // concrete type via `assertThatExceptionOfType(UnsupportedCharsetException
+        // .class)`, which a plain `IllegalArgumentException` fails even though
+        // `UnsupportedCharsetException` is itself an `IllegalArgumentException`
+        // subclass — the assertion requires the exact/more-specific type.
+        return Err(throw_unsupported_charset_exception(ctx, &name));
     }
     let charset = charset_alloc(ctx, &normalized);
     Ok(Some(Value::Object(Some(charset))))
+}
+
+/// Construct and throw a real `java.nio.charset.UnsupportedCharsetException`
+/// via its public `(String charsetName)` constructor, matching real JDK's
+/// `Charset.forName` contract for a syntactically valid but unsupported name.
+fn throw_unsupported_charset_exception(ctx: &mut dyn NativeContext, name: &str) -> MethodCallFailed {
+    match ctx.new_object("java/nio/charset/UnsupportedCharsetException") {
+        Ok(Some(Value::Object(Some(exc)))) => {
+            let name_str = ctx.create_string(name);
+            let _ = ctx.invoke(
+                "java/nio/charset/UnsupportedCharsetException",
+                "<init>",
+                "(Ljava/lang/String;)V",
+                &[Value::Object(Some(exc)), Value::Object(Some(name_str))],
+            );
+            MethodCallFailed::ExceptionThrown(exc)
+        }
+        _ => RuntimeError::IllegalArgumentException {
+            message: format!("Unsupported charset: {}", name),
+        }
+        .into(),
+    }
 }
 
 fn native_charset_default(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
@@ -30045,9 +30118,17 @@ fn native_std_charset_latin1(ctx: &mut dyn NativeContext, _args: &[Value]) -> Me
 pub(crate) fn normalize_charset_name(name: &str) -> String {
     match name.to_uppercase().replace(['-', '_'], "").as_str() {
         "UTF8" => "UTF-8".to_string(),
-        "UTF16" => "UTF-16".to_string(),
-        "UTF16BE" => "UTF-16BE".to_string(),
-        "UTF16LE" => "UTF-16LE".to_string(),
+        // "unicode" is the JDK's own alias for UTF-16 (`sun.nio.cs.UTF_16`'s
+        // alias list is `{"UTF16", "utf16", "unicode", "UnicodeBig"}`), and
+        // "UnicodeBigUnmarked"/"UnicodeLittleUnmarked" alias the no-BOM
+        // BE/LE variants. Missing "unicode" made
+        // `Charset.forName("unicode")` — a legal charset name on real
+        // JDK — throw `UnsupportedCharsetException` here instead
+        // (`ResourceBundleMessageSourceTests.
+        // reloadableResourceBundleMessageSourceWithInappropriateDefaultCharsetName`).
+        "UTF16" | "UNICODE" | "UNICODEBIG" => "UTF-16".to_string(),
+        "UTF16BE" | "UNICODEBIGUNMARKED" => "UTF-16BE".to_string(),
+        "UTF16LE" | "UNICODELITTLEUNMARKED" => "UTF-16LE".to_string(),
         "UTF32" => "UTF-32".to_string(),
         "UTF32BE" => "UTF-32BE".to_string(),
         "UTF32LE" => "UTF-32LE".to_string(),

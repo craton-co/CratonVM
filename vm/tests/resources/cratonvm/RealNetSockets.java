@@ -4,8 +4,6 @@ import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.ServerSocket;
 import java.net.Socket;
-import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.TimeUnit;
 
 /**
  * Smoke test for the CRATONVM_REAL_NET_SOCKETS real-path gate.
@@ -17,37 +15,27 @@ import java.util.concurrent.TimeUnit;
  */
 public class RealNetSockets {
     public static void main(String[] args) throws Exception {
-        CountDownLatch serverDone = new CountDownLatch(1);
-        byte[] received = {0};
+        int received;
 
-        ServerSocket ss = new ServerSocket(0);
-        int port = ss.getLocalPort();
+        try (ServerSocket ss = new ServerSocket(0)) {
+            ss.setSoTimeout(10_000);
+            int port = ss.getLocalPort();
 
-        Thread server = new Thread(() -> {
-            try (Socket conn = ss.accept()) {
-                received[0] = (byte) conn.getInputStream().read();
-                serverDone.countDown();
-            } catch (Exception e) {
-                e.printStackTrace();
-            } finally {
-                try { ss.close(); } catch (Exception ignored) {}
+            try (Socket client = new Socket("127.0.0.1", port);
+                 Socket conn = ss.accept()) {
+                conn.setSoTimeout(10_000);
+
+                OutputStream out = client.getOutputStream();
+                out.write(0x42);
+                out.flush();
+
+                InputStream in = conn.getInputStream();
+                received = in.read();
             }
-        });
-        server.setDaemon(true);
-        server.start();
 
-        try (Socket client = new Socket("127.0.0.1", port)) {
-            client.getOutputStream().write(0x42);
-            client.getOutputStream().flush();
+            System.out.println("r:port_positive=" + (port > 0));
         }
-
-        if (!serverDone.await(10, TimeUnit.SECONDS)) {
-            throw new RuntimeException("server thread timed out");
-        }
-        server.join(5_000);
-
-        System.out.println("r:port_positive=" + (port > 0));
-        System.out.println("r:received=" + Integer.toHexString(received[0] & 0xFF));
+        System.out.println("r:received=" + Integer.toHexString(received & 0xFF));
         System.out.println("REAL_NET_SOCKETS_OK 2");
     }
 }
