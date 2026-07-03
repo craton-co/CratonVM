@@ -1851,14 +1851,6 @@ fn is_factory_bean_type(ctx: &mut dyn NativeContext, return_internal: &str) -> b
     false
 }
 
-/// Scan the `@Configuration` class for `@Bean` factory methods that the
-/// enhancer can safely override with shared-singleton interception. We only
-/// take **instance, no-arg, reference-returning, non-final** methods — the
-/// case the override bytecode handles (S03's `engine`/`car1`/`car2`/`widget`).
-/// `@Bean` methods with parameters, primitive/void/array returns, or
-/// static/final/private modifiers are left un-overridden (they run the real
-/// body directly, i.e. the `proxyBeanMethods=false` trade-off), which never
-/// regresses behaviour relative to the previous no-override enhancer.
 /// Internal package name (everything before the last `/`, empty for the
 /// unnamed/default package) of a loaded class.
 fn package_of(ctx: &dyn NativeContext, class_id: cratonvm_types::ClassId) -> String {
