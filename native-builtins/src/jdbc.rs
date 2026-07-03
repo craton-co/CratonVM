@@ -9,7 +9,7 @@
 //! through the standard `ServiceLoader` SPI by listing one or more
 //! provider class names in `META-INF/services/java.sql.Driver`.
 //!
-//! `register_jdbc_driver_natives` wires three pieces:
+//! `register_jdbc_driver_natives` wires the JDBC discovery and SQL date/time pieces:
 //!
 //!   1. The proper, classpath-scanning `ServiceLoader` natives from
 //!      `service_loader.rs`. Without this entry point the
@@ -43,7 +43,7 @@
 
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult, VmError};
-use cratonvm_types::Value;
+use cratonvm_types::{ObjectRef, Value};
 
 /// Public entry: register every native that WP7.1 owns. Idempotent —
 /// safe to call from both `register_essential_natives` and
@@ -65,7 +65,119 @@ pub fn register_jdbc_driver_natives(registry: &mut NativeMethodRegistry) {
     registry.set_category(cratonvm_native_api::NativeKind::Bridge);
     register_jdbc_service_loader(registry);
     register_jdbc_driver_helpers(registry);
+    register_sql_datetime_natives(registry);
     registry.set_category(__prev_cat);
+}
+
+fn register_sql_datetime_natives(registry: &mut NativeMethodRegistry) {
+    for class_name in ["java/sql/Date", "java/sql/Time", "java/sql/Timestamp"] {
+        registry.register(class_name, "<init>", "(J)V", native_sql_datetime_init);
+        registry.register(class_name, "getTime", "()J", native_sql_datetime_get_time);
+        registry.register(
+            class_name,
+            "toString",
+            "()Ljava/lang/String;",
+            native_sql_datetime_to_string,
+        );
+    }
+}
+
+fn native_sql_datetime_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = crate::obj_arg(args, 0)?;
+    let millis = match args.get(1) {
+        Some(Value::Long(v)) => *v,
+        Some(Value::Int(v)) => *v as i64,
+        _ => 0,
+    };
+    ctx.set_field(this, 0, Value::Long(millis));
+    Ok(None)
+}
+
+fn native_sql_datetime_get_time(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = crate::obj_arg(args, 0)?;
+    Ok(Some(Value::Long(sql_datetime_millis(ctx, this))))
+}
+
+fn native_sql_datetime_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = crate::obj_arg(args, 0)?;
+    let millis = sql_datetime_millis(ctx, this);
+    let (year, month, day, hour, minute, second) = sql_datetime_parts(millis);
+    let class_name = ctx
+        .class_name_of_id(ctx.class_id_of_object(this))
+        .unwrap_or_default();
+    let text = match class_name.as_str() {
+        "java/sql/Time" => format!("{hour:02}:{minute:02}:{second:02}"),
+        "java/sql/Timestamp" => {
+            format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02}.0")
+        }
+        _ => format!("{year:04}-{month:02}-{day:02}"),
+    };
+    let s = ctx.create_string(&text);
+    Ok(Some(Value::Object(Some(s))))
+}
+
+fn sql_datetime_millis(ctx: &dyn NativeContext, obj: ObjectRef) -> i64 {
+    match ctx.get_field(obj, 0) {
+        Value::Long(v) => v,
+        _ => 0,
+    }
+}
+
+fn sql_datetime_parts(millis: i64) -> (i32, i32, i32, i32, i32, i32) {
+    const MILLIS_PER_DAY: i64 = 86_400_000;
+    let epoch_day = millis.div_euclid(MILLIS_PER_DAY);
+    let millis_of_day = millis.rem_euclid(MILLIS_PER_DAY);
+    let (year, month, day) = from_epoch_day(epoch_day);
+    let total_seconds = millis_of_day / 1_000;
+    let hour = (total_seconds / 3_600) as i32;
+    let minute = ((total_seconds % 3_600) / 60) as i32;
+    let second = (total_seconds % 60) as i32;
+    (year, month, day, hour, minute, second)
+}
+
+fn from_epoch_day(epoch_day: i64) -> (i32, i32, i32) {
+    let abs_day = epoch_day + 719_528;
+    let mut y = ((abs_day * 400) / 146_097) as i32;
+    loop {
+        let year_start = year_start_day(y);
+        if year_start >= abs_day {
+            y -= 1;
+        } else if year_start_day(y + 1) < abs_day {
+            y += 1;
+        } else {
+            break;
+        }
+    }
+
+    let mut remaining = (abs_day - year_start_day(y)) as i32;
+    let mut month = 1;
+    loop {
+        let dim = days_in_month(y, month);
+        if remaining <= dim {
+            break;
+        }
+        remaining -= dim;
+        month += 1;
+    }
+    (y, month, remaining)
+}
+
+fn year_start_day(year: i32) -> i64 {
+    let y = year as i64;
+    365 * y + y / 4 - y / 100 + y / 400
+}
+
+fn days_in_month(year: i32, month: i32) -> i32 {
+    const DAYS: [i32; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    if month == 2 && is_leap_year(year) {
+        29
+    } else {
+        DAYS[(month - 1) as usize]
+    }
+}
+
+fn is_leap_year(year: i32) -> bool {
+    (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)
 }
 
 /// Wire the WP1.8 classpath-walking ServiceLoader natives. Split out

@@ -5935,6 +5935,9 @@ fn jdk_superclass(name: &str) -> &'static str {
         | "java/lang/Float" | "java/lang/Double" => "java/lang/Number",
         "java/lang/Number" => "java/lang/Object",
 
+        // JDBC legacy date/time wrappers extend java.util.Date.
+        "java/sql/Date" | "java/sql/Time" | "java/sql/Timestamp" => "java/util/Date",
+
         // Record hierarchy (JEP 395, Java 16+)
         "java/lang/Record" => "java/lang/Object",
 
@@ -6615,6 +6618,8 @@ fn synthetic_stub_fields(name: &str) -> Vec<cratonvm_reader::field::ClassFileFie
         "java/util/Random" => instance_fields(2),
         // UUID = 2 fields (msb, lsb)
         "java/util/UUID" => instance_fields(2),
+        // Date = 1 field (millis since epoch). java.sql date/time subclasses inherit it.
+        "java/util/Date" => instance_fields(1),
         // Properties = 4 fields
         "java/util/Properties" => instance_fields(4),
         // Formatter = 2 fields (output=0, locale=1)
@@ -8852,6 +8857,22 @@ fn synthetic_stub_ctor_methods(name: &str) -> Vec<ClassFileMethod> {
             descriptor: cratonvm_types::intern_arc("()V"),
             attributes: vec![],
         });
+    }
+    if matches!(
+        name,
+        "java/sql/Date" | "java/sql/Time" | "java/sql/Timestamp"
+    ) {
+        let mk = |method: &str, descriptor: &str| ClassFileMethod {
+            access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::NATIVE,
+            name: cratonvm_types::intern_arc(method),
+            descriptor: cratonvm_types::intern_arc(descriptor),
+            attributes: vec![],
+        };
+        out.extend([
+            mk("<init>", "(J)V"),
+            mk("getTime", "()J"),
+            mk("toString", "()Ljava/lang/String;"),
+        ]);
     }
     if name == "java/io/InputStreamReader" {
         out.extend([

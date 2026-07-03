@@ -37,10 +37,11 @@ use cratonvm_types::{ClassId, ObjectRef, Value};
 
 use crate::lang_class::{
     annotation_element_to_java, box_value, create_constructor_object, create_field_object,
-    create_method_object, descriptor_to_class_mirror, method_class_name_desc,
-    method_descriptor_for_invoke, mirror_class_id, mirror_class_name, native_method_invoke,
-    parse_descriptor_param_and_return, read_constructor_descriptor, read_field_meta,
-    read_method_descriptor,
+    create_method_object, descriptor_to_class_mirror, method_class_name_desc, method_clazz_value,
+    method_descriptor_for_invoke, method_exception_types_value, method_modifiers_value,
+    method_name_value, method_parameter_types_value, method_return_type_value, mirror_class_id,
+    mirror_class_name, native_method_invoke, parse_descriptor_param_and_return,
+    read_constructor_descriptor, read_field_meta, read_method_descriptor,
 };
 use crate::obj_arg;
 
@@ -151,7 +152,7 @@ fn can_access_member(
         _ => return false,
     };
 
-    let declaring = match ctx.get_field_by_name(member, "clazz") {
+    let declaring = match method_clazz_value(ctx, member) {
         Value::Object(Some(m)) => m,
         _ => return false,
     };
@@ -170,7 +171,7 @@ pub(crate) fn native_method_can_access(
     args: &[Value],
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    let modifiers = match ctx.get_field_by_name(this, "modifiers") {
+    let modifiers = match method_modifiers_value(ctx, this) {
         Value::Int(v) => v,
         _ => 0,
     };
@@ -638,7 +639,7 @@ pub(crate) fn native_method_is_varargs(
     args: &[Value],
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    let modifiers = match ctx.get_field_by_name(this, "modifiers") {
+    let modifiers = match method_modifiers_value(ctx, this) {
         Value::Int(v) => v,
         _ => 0,
     };
@@ -651,7 +652,7 @@ pub(crate) fn native_method_is_bridge(
     args: &[Value],
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    let modifiers = match ctx.get_field_by_name(this, "modifiers") {
+    let modifiers = match method_modifiers_value(ctx, this) {
         Value::Int(v) => v,
         _ => 0,
     };
@@ -664,7 +665,7 @@ pub(crate) fn native_method_is_synthetic(
     args: &[Value],
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    let modifiers = match ctx.get_field_by_name(this, "modifiers") {
+    let modifiers = match method_modifiers_value(ctx, this) {
         Value::Int(v) => v,
         _ => 0,
     };
@@ -680,7 +681,7 @@ pub(crate) fn native_method_is_default(
     // interface. We need: declaring class is interface AND method is not
     // abstract AND not static.
     let this = obj_arg(args, 0)?;
-    let modifiers = match ctx.get_field_by_name(this, "modifiers") {
+    let modifiers = match method_modifiers_value(ctx, this) {
         Value::Int(v) => v,
         _ => 0,
     };
@@ -690,7 +691,7 @@ pub(crate) fn native_method_is_default(
         return Ok(Some(Value::Int(0)));
     }
 
-    let declaring = match ctx.get_field_by_name(this, "clazz") {
+    let declaring = match method_clazz_value(ctx, this) {
         Value::Object(Some(m)) => m,
         _ => return Ok(Some(Value::Int(0))),
     };
@@ -732,7 +733,7 @@ pub(crate) fn native_method_get_exception_types(
     // clone, but reflection callers don't mutate the array, so handing
     // back the cached reference is safe and matches what we do for
     // `getParameterTypes` / `getReturnType`.
-    Ok(Some(ctx.get_field_by_name(this, "exceptionTypes")))
+    Ok(Some(method_exception_types_value(ctx, this)))
 }
 
 /// Constructor.getExceptionTypes — mirrors the Method native. CGLib's
@@ -762,21 +763,21 @@ pub(crate) fn native_method_get_generic_exception_types(
     args: &[Value],
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    let mirror = match ctx.get_field_by_name(this, "clazz") {
+    let mirror = match method_clazz_value(ctx, this) {
         Value::Object(Some(m)) => m,
-        _ => return Ok(Some(ctx.get_field_by_name(this, "exceptionTypes"))),
+        _ => return Ok(Some(method_exception_types_value(ctx, this))),
     };
     let class_id = match mirror_class_id(ctx, mirror) {
         Some(id) => id,
-        None => return Ok(Some(ctx.get_field_by_name(this, "exceptionTypes"))),
+        None => return Ok(Some(method_exception_types_value(ctx, this))),
     };
-    let method_name = match ctx.get_field_by_name(this, "name") {
+    let method_name = match method_name_value(ctx, this) {
         Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
-        _ => return Ok(Some(ctx.get_field_by_name(this, "exceptionTypes"))),
+        _ => return Ok(Some(method_exception_types_value(ctx, this))),
     };
     let descriptor = match read_method_descriptor(ctx, this) {
         Some(d) => d,
-        None => return Ok(Some(ctx.get_field_by_name(this, "exceptionTypes"))),
+        None => return Ok(Some(method_exception_types_value(ctx, this))),
     };
 
     if let Some(sig_str) = ctx.method_signature(class_id, &method_name, &descriptor) {
@@ -801,7 +802,7 @@ pub(crate) fn native_method_get_generic_exception_types(
     // pin to the raw `exceptionTypes` array. WP2.8 will revisit deep
     // generic Type proxy support; today's surface is "raw Class for
     // every throws-type".
-    Ok(Some(ctx.get_field_by_name(this, "exceptionTypes")))
+    Ok(Some(method_exception_types_value(ctx, this)))
 }
 
 /// Method.toString() — builds the canonical JDK string:
@@ -818,7 +819,7 @@ pub(crate) fn native_method_to_string(
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
 
-    let modifiers = match ctx.get_field_by_name(this, "modifiers") {
+    let modifiers = match method_modifiers_value(ctx, this) {
         Value::Int(v) => v,
         _ => 0,
     };
@@ -856,7 +857,7 @@ pub(crate) fn native_method_to_string(
 
     // Return type — `getTypeName()` style: dotted class name, primitive
     // bare names ("int"), array suffix `[]`.
-    let ret_mirror = match ctx.get_field_by_name(this, "returnType") {
+    let ret_mirror = match method_return_type_value(ctx, this) {
         Value::Object(Some(m)) => Some(m),
         _ => None,
     };
@@ -867,7 +868,7 @@ pub(crate) fn native_method_to_string(
     s.push(' ');
 
     // Declaring class
-    let decl_mirror = match ctx.get_field_by_name(this, "clazz") {
+    let decl_mirror = match method_clazz_value(ctx, this) {
         Value::Object(Some(m)) => Some(m),
         _ => None,
     };
@@ -878,7 +879,7 @@ pub(crate) fn native_method_to_string(
     s.push('.');
 
     // Method name
-    let name = match ctx.get_field_by_name(this, "name") {
+    let name = match method_name_value(ctx, this) {
         Value::Object(Some(sref)) => ctx.read_string(sref).unwrap_or_default(),
         _ => String::new(),
     };
@@ -886,7 +887,7 @@ pub(crate) fn native_method_to_string(
 
     // Parameter types
     s.push('(');
-    if let Value::Object(Some(arr)) = ctx.get_field_by_name(this, "parameterTypes") {
+    if let Value::Object(Some(arr)) = method_parameter_types_value(ctx, this) {
         let len = ctx.array_length(arr);
         for i in 0..len {
             if i > 0 {
@@ -901,7 +902,7 @@ pub(crate) fn native_method_to_string(
     s.push(')');
 
     // Exception types (throws ...)
-    if let Value::Object(Some(arr)) = ctx.get_field_by_name(this, "exceptionTypes") {
+    if let Value::Object(Some(arr)) = method_exception_types_value(ctx, this) {
         let len = ctx.array_length(arr);
         if len > 0 {
             s.push_str(" throws ");

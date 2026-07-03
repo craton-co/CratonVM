@@ -5821,9 +5821,7 @@ impl GenerationalHeap {
         // of slots runs off the mapped region (SIGSEGV). An old object whose
         // extent leaves old gen is definitionally corrupt: skip the scan.
         let total = gen_object_total_size(header);
-        if total < HEADER_SIZE
-            || !old_gen.contains(unsafe { obj_ptr.add(total - 1) })
-        {
+        if total < HEADER_SIZE || !old_gen.contains(unsafe { obj_ptr.add(total - 1) }) {
             let n = SWEEP_BAD_EXTENT_HITS.fetch_add(1, Ordering::Relaxed);
             if n < 8 {
                 tracing::warn!(
