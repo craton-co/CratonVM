@@ -10369,6 +10369,31 @@ pub(crate) fn native_class_get_generic_interfaces(
             }
         }
     }
+    // Synthetic lambda proxies aren't in the class store (so `class_interfaces`
+    // is empty below), but a lambda's concrete class implements exactly its
+    // functional (SAM) interface. Mirror `native_class_get_interfaces`'s
+    // special case so `getGenericInterfaces()` — which must return the same
+    // raw `[SAM]` per the JDK contract when there's no generic Signature —
+    // doesn't silently fall through to an empty array. An empty array here
+    // broke AspectJ's `execution(* Supplier+.get())` pointcut matching against
+    // a lambda's own SAM-method Method object: AspectJ's reflection-based
+    // world consults `getGenericInterfaces()` (not just `getInterfaces()`)
+    // when resolving the declaring class's supertype closure, concluded the
+    // lambda implemented no interfaces at all, and returned "never matches" —
+    // silently skipping the advisor (Spring's `AnnotationAwareAspectJAutoProxyCreator`
+    // then never proxies the lambda bean at all).
+    if let Some(iface_name) = ctx.lambda_functional_interface(class_id) {
+        if let Some(iface_id) = ctx.class_id_by_name(&iface_name) {
+            let mirror = ctx.get_class_mirror(iface_id);
+            let elem = ctx
+                .class_id_by_name("java/lang/Class")
+                .unwrap_or_else(|| ClassId::new(0));
+            let arr = ctx.new_ref_array(elem, 1);
+            ctx.set_array_element(arr, 0, Value::Object(Some(mirror)));
+            return Ok(Some(Value::Object(Some(arr))));
+        }
+    }
+
     // Fallback (no generic Signature, or it had no interfaces): per the JDK
     // contract, `getGenericInterfaces()` returns the RAW direct superinterfaces
     // (the same `Class[]` as `getInterfaces()`), NOT an empty array. Returning
@@ -10946,6 +10971,21 @@ pub(crate) fn native_class_get_package_name(
     if let Some(class_id) = ctx.class_id_from_mirror(this) {
         if let Some(arc) = cache_get(&PACKAGE_NAME_CACHE, class_id) {
             return Ok(Some(Value::Object(Some(ctx.create_string(&arc)))));
+        }
+        // Synthetic lambda proxies aren't in the class store, so
+        // `class_name_of_id` below misses them and this whole branch used to
+        // fall through to the empty-string fallback further down (which reads
+        // via the same class-store-backed `mirror_class_name` and gets nothing
+        // either). Derive the package from the lambda's HOST class instead —
+        // matches HotSpot, whose hidden lambda class lives in the host's
+        // package. See `lambda_proxy_class_name` for the analogous `getName()`
+        // special case.
+        if let Some(host) = ctx.lambda_proxy_host(class_id) {
+            let pkg = match host.rfind('/') {
+                Some(pos) => host[..pos].replace('/', "."),
+                None => String::new(),
+            };
+            return Ok(Some(Value::Object(Some(ctx.create_string(&pkg)))));
         }
         if let Some(name) = ctx.class_name_of_id(class_id) {
             let pkg = package_name_of(class_id, &name);
