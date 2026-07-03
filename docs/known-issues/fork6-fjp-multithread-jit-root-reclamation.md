@@ -1,6 +1,89 @@
 # Fork6 — multi-thread (ForkJoinPool worker) JIT-root reclamation
 
-**Status:** 🟡 OPEN. Non-stress `Fork6`/`Fork6Hard` remains non-reproducing on current `dev`, but the 2026-07-01 aggressive `GC_STRESS` retry still reproduces stale `ForkJoinTask` / `Fork6Hard$StrTask` receivers and heap-walk corruption. The bug remains under `docs/known-issues`.
+**Status:** 🟡 OPEN (fix landed on `fix/fork6-xt-helper-window-20260702`, validation in progress). Non-stress `Fork6`/`Fork6Hard` remains non-reproducing on current `dev`. The 2026-07-01 aggressive `GC_STRESS` failures are now shown to be a **different, JIT-free bug** (see 2026-07-02 section) — they occur with zero live JIT frames and zero compiled JIT code, so they cannot be this A4 root gap and need their own tracking.
+
+> ## Fix 2026-07-02 — the "default-on" takeover was silently inert; + an initiator-side blocked/helper-window scan; stress lane re-scoped as a separate JIT-free bug
+>
+> Branch `fix/fork6-xt-helper-window-20260702`, worktree `CratonVM-fork6-helper-20260702`,
+> based on dev `69086772`. Unique binaries: `cvmp-fork6-helper-20260702.exe` (fix 1 only),
+> `cvmp-fork6-hw2-20260702.exe` (both fixes), `cvmp-fork6-base-69086772.exe` (baseline).
+>
+> **Fix 1 (the substantive one) — the whole cross-thread STW JIT machinery has been
+> a NO-OP in every default-env run.** `CompiledMethodCache::put` registers JIT code
+> ranges only when `precise_jit_maps_enabled()` (opt-IN) `||
+> cratonvm_jit::xt_jit_root_scan_enabled()`. That jit-crate mirror stayed **opt-IN**
+> when the vm-side `xt_root_scan::enabled()` flipped to default-ON: with the env var
+> unset, NO code range was ever registered, `jit_code_ranges_snapshot()` was always
+> empty, and `take_over_pass` classified every suspended peer as "not in JIT" — the
+> takeover, the A5 unregistered-frame fallback inside `scan_active_jit_frames`
+> (`native_stack_has_jit_frame` matches against the same empty registry), and the
+> cross-thread gap detector were ALL inert. Observed live: `CRATONVM_DBG_XT_JIT_ROOT_SCAN`
+> printed `0 code ranges … jit_gate=false` on all 177 STW passes of a Fork6Hard run
+> while the vm-side gate reported enabled. Any "default-on takeover" validation that
+> did not explicitly set `CRATONVM_XT_JIT_ROOT_SCAN=1` (the Tomcat DoHead runs did
+> set it) validated a placebo. Fixed by aligning the mirror's polarity (default ON,
+> opt-out `0`/`false`/`off`). After the fix, ranges register as methods compile
+> (verified live: 0→1→2 ranges during a Fork6 run, `jit_gate=true`).
+>
+> **Correction to the 2026-06-29 "precisely located gap": `deposit_root_snapshot`
+> DOES scan JIT frames on current dev.** The blocking-deposit path gained the same
+> `scan_active_jit_frames` fold as the safepoint path (vm_exec.rs ~1308, landed with
+> the Tomcat AQS/ConditionObject work), so a worker that parks via the standard
+> deposit protocol (join/park/wait/clinit-wait) publishes its JIT band conservatively.
+> The 2026-06-29 audit text below is retained for history but its "deposit does NOT"
+> claim is stale. Note `Thread.sleep` is NOT a blocked region at all (raw pump loop,
+> stays counted) — the barrier waits for a sleeper, so it has no root gap either.
+>
+> **Fix 2 (defense-in-depth) — initiator-side helper-window pass.** After the STW
+> barrier is satisfied, `helper_window_pass` (`vm/src/jit/xt_root_scan.rs`) suspends
+> each remaining peer just long enough to copy its register context + used stack
+> into a pre-allocated buffer (never allocating while a peer is frozen — it may sit
+> mid-`malloc` inside a helper), resumes it, then classifies offline; only stacks
+> carrying a JIT return address contribute conservative roots, and any contribution
+> forces the cycle non-moving. This is OS-ground-truth redundancy for the
+> deposit-time chain bookkeeping (the chain-desync bug family), NOT the primary
+> cover: with the deposit fold present it is normally redundant. Runs only when
+> `blocked_count() > 0 && any_thread_in_jit()`. Kill switch:
+> `CRATONVM_XT_HELPER_WINDOW_SCAN=0`. Counters: `XT_HELPER_WINDOWS_SCANNED` /
+> `XT_HELPER_WINDOW_ROOTS`. Unlike the reverted 2026-06-19b deposit-side scan
+> (per-deposit, whole-stack, persistent snapshot growth), this is once-per-collection
+> and its roots live only for that collection.
+>
+> **New deterministic repro: `repros/A4-fork6/HwBlocked.java`** — parks a thread
+> (LockSupport.parkNanos, the real blocked protocol; NOT sleep) under a JIT-compiled
+> frame whose spill slot is the sole holder of a young String, while sibling threads
+> hammer `System.gc()` and churn-allocate token-shaped objects to force freed-block
+> reuse. Requires `CRATONVM_JIT_THRESHOLD=100 CRATONVM_BG_COMPILE=0` (the default
+> BG-compile pipeline publishes nothing for this shape — see [[project_wire_tiered_manager]];
+> also avoid string-concat/`invokedynamic` and train both branches or the method
+> deopts). With both fixes: helper-window fires every parked GC (60 windows/run,
+> ~30 KB band, ~55 roots) and the run is ALL-OK. With the kill switch off it STILL
+> passes — because the deposit fold already roots the token — so this repro
+> validates ENGAGEMENT, not failure; A4 remains Java-unvalidatable, as 2026-06-29
+> concluded.
+>
+> **The GC_STRESS lane failures are NOT this bug.** The
+> `CRATONVM_DBG_GC_STRESS=65536` Fork6Hard rep-0 failure reproduces while
+> `any_thread_in_jit=false` at EVERY STW of the run (`GLOBAL_JIT_DEPTH == 0`: no
+> live `JitEntryGuard` anywhere — so no live JIT frame existed, blocked-under-JIT
+> included) and with zero compiled JIT code. The stale all-zero receivers /
+> `class_id=0` OOB reads under stress come from an interpreter/GC-side mechanism
+> (young collections every 64 KiB with real-FJP workers parked in `join()`; prime
+> suspect: the blocked-thread pointer-map fold/wake-remap chain under
+> multi-GC-while-blocked composition). Lane behavior is unchanged by these fixes:
+> rep-0 `ExecutionException: NullPointerException` + `class_id=0` reads, or a
+> CPU-pegged wedge (observed ≥7 min on the 2-rep lane, ~40 min on a 5-rep debug
+> run), on fix-1-only and both-fixes binaries alike. This supersedes the 2026-07-01
+> framing ("this or an adjacent JIT-root coverage failure") the same way 2026-06-29
+> re-scoped holder-null: aggressive GC_STRESS keeps finding *adjacent* JIT-free
+> bugs; this one needs its own repro + doc.
+>
+> **Validation (both-fixes binary `cvmp-fork6-hw2-20260702.exe`, real-FJP gate):**
+> plain `Fork6` ALL-OK; `Fork6Hard 256 40` ALL-OK; 8-way concurrent `Fork6` 8/8
+> ALL-OK; `HwBlocked` ALL-OK with helper-window engaging; bt16 checksum golden
+> (14985902). bt16 wall-time vs same-toolchain dev-`69086772` baseline: measured
+> under heavy box contention; v2 ≈ v2-gate-off (xt paths add no measurable
+> single-thread cost — bintrees never enters the multi-thread STW path).
 
 > ## Re-audit 2026-06-29 (fresh release build off dev HEAD `9928052c`, binary `cvmpjfinish.exe`, JDK-25 oracle)
 >
