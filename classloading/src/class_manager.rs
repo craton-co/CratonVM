@@ -3724,9 +3724,9 @@ impl ClassManager {
                 let new_is_pkg_private = !method
                     .access_flags
                     .contains(cratonvm_reader::class_access_flags::MethodAccessFlags::PUBLIC)
-                    && !method
-                        .access_flags
-                        .contains(cratonvm_reader::class_access_flags::MethodAccessFlags::PROTECTED);
+                    && !method.access_flags.contains(
+                        cratonvm_reader::class_access_flags::MethodAccessFlags::PROTECTED,
+                    );
                 let existing_is_pkg_private = entries[slot]
                     .as_ref()
                     .and_then(|e| {

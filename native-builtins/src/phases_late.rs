@@ -32928,21 +32928,120 @@ const NEW13_SESS_TLSID: usize = 2;
 /// verification by default — which, combined with native-tls's handshake,
 /// gives the same security posture as the reference JDK's default path.
 ///
-/// When the Java caller supplied a non-null `TrustManager[]` or
-/// `KeyManager[]` to `SSLContext.init`, we currently still use the system
-/// connector: wiring Java-side trust callbacks into native-tls is not
-/// supported by the crate (only rustls offers pluggable verifiers). The
-/// roadmap explicitly accepts this as the NEW-13 definition of done because
-/// (a) the platform trust store is strictly safer than a user-supplied TM
-/// that blindly accepts everything, and (b) the overwhelming majority of
-/// JDK HTTPS clients pass null/default managers anyway. The Java-side
-/// arguments are still validated for arity/type in `SSLContext.init` so
-/// that incorrect usage throws the same exceptions as the reference JDK.
-fn new13_build_connector() -> Result<native_tls::TlsConnector, String> {
-    native_tls::TlsConnector::builder()
-        .min_protocol_version(Some(native_tls::Protocol::Tlsv12))
+/// FIX (es-restclient-https): when the Java caller supplied a non-null
+/// `TrustManager[]` to `SSLContext.init` that was produced by a
+/// `TrustManagerFactory` bound to an explicit (non-default) `KeyStore` —
+/// e.g. a test truststore holding a self-signed/test-CA certificate — the
+/// connector must ALSO trust those anchors, or every handshake against a
+/// server presenting that certificate fails with `UnknownIssuer` even
+/// though the JDK caller correctly built and wired a custom trust store
+/// (`RestClientBuilderIntegTests`/`HttpsServer` pattern: one `SSLContext`
+/// built from a JKS truststore, used for both the server and the client).
+/// The previous comment here ("NEW-13 roadmap accepts ignoring custom
+/// TrustManagers") was predicated on native-tls having no pluggable trust
+/// hook at all; that's true for arbitrary Java `TrustManager` callback
+/// logic, but a KeyStore-derived anchor set is just extra root certs, which
+/// `TlsConnectorBuilder::add_root_certificate` supports on every native-tls
+/// 0.2 backend (SChannel/SecureTransport/OpenSSL). We ADD these roots to
+/// (not replace) the platform trust store — every native-tls backend's
+/// verifier lets a chain be valid if it reaches home to ANY trusted root,
+/// so this does not weaken validation of servers using ordinary publicly
+/// trusted certs; it only additionally allows a caller-configured private
+/// CA/self-signed leaf, which mirrors the reference JDK's restrictive
+/// custom-truststore semantics closely enough to make the common
+/// self-signed-test-cert pattern actually work.
+fn new13_build_connector(extra_root_ders: &[Vec<u8>]) -> Result<native_tls::TlsConnector, String> {
+    let mut builder = native_tls::TlsConnector::builder();
+    builder.min_protocol_version(Some(native_tls::Protocol::Tlsv12));
+    for der in extra_root_ders {
+        match native_tls::Certificate::from_der(der) {
+            Ok(cert) => {
+                builder.add_root_certificate(cert);
+            }
+            Err(e) => {
+                tracing::debug!(
+                    target: "phases_late::tls",
+                    "SSLContext: skipping unparseable custom trust anchor DER: {}",
+                    e
+                );
+            }
+        }
+    }
+    builder
         .build()
         .map_err(|e| format!("TlsConnector build failed: {}", e))
+}
+
+/// FIX (es-restclient-https): per-`SSLContext` custom trust anchors, keyed by
+/// the context object's identity (raw pointer — stable across GC per the
+/// `ObjectRef` conventions already used by the object-identity side-tables
+/// elsewhere in this file, e.g. `zo_buf_key`). Populated by `SSLContext.init`
+/// from a `TrustManagerFactory`-produced `TrustManager[]` that is bound to an
+/// explicit KeyStore (see `tls.rs::register_trust_manager_factory` /
+/// `x509_manager::build_trust_manager_state`); consumed by `getSocketFactory`
+/// so the returned `SSLSocketFactory` carries the same trust scope into
+/// `createSocket`.
+fn p68_ctx_trust_roots_table(
+) -> &'static parking_lot::Mutex<std::collections::HashMap<usize, Vec<Vec<u8>>>> {
+    static T: std::sync::OnceLock<
+        parking_lot::Mutex<std::collections::HashMap<usize, Vec<Vec<u8>>>>,
+    > = std::sync::OnceLock::new();
+    T.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Extract the keystore-bound trust anchors (DER, restrictive — i.e. NOT
+/// merged with system roots) from a `TrustManager[]`, if any element is the
+/// real `javax.net.ssl.X509TrustManager` produced by
+/// `TrustManagerFactory.getTrustManagers()` (stamped with the bound keystore
+/// id via the `cratonvm$x509tm$id` field / slot 0 fallback — same convention
+/// `tls.rs::read_trust_manager_id_from_obj` reads). Returns `None` when the
+/// array is null/empty or every element resolves to keystore id 0 (the
+/// default/system trust store — nothing extra to add).
+fn p68_extract_trust_manager_roots(
+    ctx: &mut dyn NativeContext,
+    tm_arg: Value,
+) -> Option<Vec<Vec<u8>>> {
+    let Value::Object(Some(tm_arr)) = tm_arg else {
+        return None;
+    };
+    let len = ctx.array_length(tm_arr);
+    for i in 0..len {
+        if let Value::Object(Some(tm)) = ctx.get_array_element(tm_arr, i) {
+            let ks_id = match ctx.get_field_by_name(tm, "cratonvm$x509tm$id") {
+                Value::Int(id) if id != 0 => id,
+                _ => match ctx.object_num_fields(tm) {
+                    n if n > 0 => match ctx.get_field(tm, 0) {
+                        Value::Int(id) if id != 0 => id,
+                        _ => continue,
+                    },
+                    _ => continue,
+                },
+            };
+            let state = crate::x509_manager::build_trust_manager_state(ks_id);
+            if !state.anchor_ders.is_empty() {
+                return Some(state.anchor_ders);
+            }
+        }
+    }
+    None
+}
+
+/// FIX (es-restclient-https): look up the custom trust anchors (if any)
+/// stashed on `args[0]` (the `SSLSocketFactory` `this`) by `getSocketFactory`.
+/// Returns an empty Vec when the factory carries no custom scope (the common
+/// case — every existing default-trust `createSocket` caller is unaffected).
+fn p68_factory_trust_roots(args: &[Value]) -> Vec<Vec<u8>> {
+    match args.first() {
+        Some(Value::Object(Some(this))) => {
+            let key = this.as_ptr() as usize;
+            p68_ctx_trust_roots_table()
+                .lock()
+                .get(&key)
+                .cloned()
+                .unwrap_or_default()
+        }
+        _ => Vec::new(),
+    }
 }
 
 /// NEW-13: allocate an `SSLSession` synthetic object populated from the
@@ -32966,9 +33065,14 @@ fn new13_alloc_ssl_session(ctx: &mut dyn NativeContext, tls_id: i32) -> ObjectRe
 }
 
 /// NEW-13: common body for the two `SSLSocketFactory.createSocket` overloads.
-fn new13_do_create_socket(ctx: &mut dyn NativeContext, host: &str, port: u16) -> MethodCallResult {
-    let connector =
-        new13_build_connector().map_err(|msg| RuntimeError::IOException { message: msg })?;
+fn new13_do_create_socket(
+    ctx: &mut dyn NativeContext,
+    host: &str,
+    port: u16,
+    extra_root_ders: &[Vec<u8>],
+) -> MethodCallResult {
+    let connector = new13_build_connector(extra_root_ders)
+        .map_err(|msg| RuntimeError::IOException { message: msg })?;
     let tls_id = crate::servlet::s2_tls_connect(&connector, host, port).map_err(|e| {
         RuntimeError::IOException {
             message: e.to_string(),
@@ -33077,11 +33181,25 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
                 let _ = ctx.array_length(tm_arr);
             }
 
+            // FIX (es-restclient-https): if the supplied TrustManager[] is
+            // bound to an explicit KeyStore (a custom truststore, not the
+            // default), capture its trust anchors keyed by THIS SSLContext's
+            // identity so getSocketFactory()/createSocket can add them to
+            // the native-tls connector. See `p68_extract_trust_manager_roots`.
+            let extra_roots = p68_extract_trust_manager_roots(ctx, tm_arg);
+            let ctx_key = this.as_ptr() as usize;
+            if let Some(roots) = extra_roots.clone() {
+                p68_ctx_trust_roots_table().lock().insert(ctx_key, roots);
+            } else {
+                p68_ctx_trust_roots_table().lock().remove(&ctx_key);
+            }
+
             // Prove we can build a real native-tls connector with the
-            // platform trust store under the currently-requested protocol.
-            // A failure here surfaces immediately to the caller as a
-            // KeyManagementException-shaped IOException.
-            if let Err(msg) = new13_build_connector() {
+            // platform trust store (plus any custom anchors) under the
+            // currently-requested protocol. A failure here surfaces
+            // immediately to the caller as a KeyManagementException-shaped
+            // IOException.
+            if let Err(msg) = new13_build_connector(extra_roots.as_deref().unwrap_or(&[])) {
                 return Err(RuntimeError::IOException {
                     message: format!("SSLContext.init: {}", msg),
                 }
@@ -33099,8 +33217,21 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         ctx_class,
         "getSocketFactory",
         "()Ljavax/net/ssl/SSLSocketFactory;",
-        |ctx, _args| {
+        |ctx, args| {
             let obj = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSocketFactory", 0);
+            // FIX (es-restclient-https): carry this SSLContext's custom trust
+            // anchors (if any) forward onto the factory so createSocket can
+            // find them — createSocket only has `this` = the factory, not
+            // the originating SSLContext.
+            if let Ok(this) = obj_arg(args, 0) {
+                let ctx_key = this.as_ptr() as usize;
+                if let Some(roots) = p68_ctx_trust_roots_table().lock().get(&ctx_key).cloned() {
+                    let factory_key = obj.as_ptr() as usize;
+                    p68_ctx_trust_roots_table()
+                        .lock()
+                        .insert(factory_key, roots);
+                }
+            }
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -33232,7 +33363,8 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
                 }
                 .into());
             }
-            new13_do_create_socket(ctx, &host, port_i as u16)
+            let extra_roots = p68_factory_trust_roots(args);
+            new13_do_create_socket(ctx, &host, port_i as u16, &extra_roots)
         },
     );
     // createSocket(Socket s, String host, int port, boolean autoClose) — we
@@ -33266,7 +33398,8 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
                 }
                 .into());
             }
-            new13_do_create_socket(ctx, &host, port_i as u16)
+            let extra_roots = p68_factory_trust_roots(args);
+            new13_do_create_socket(ctx, &host, port_i as u16, &extra_roots)
         },
     );
 
@@ -33320,13 +33453,21 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         ssl_sock,
         "getSupportedCipherSuites",
         "()[Ljava/lang/String;",
-        |ctx, _args| Ok(Some(Value::Object(Some(ssl_sock_supported_cipher_suites(ctx))))),
+        |ctx, _args| {
+            Ok(Some(Value::Object(Some(ssl_sock_supported_cipher_suites(
+                ctx,
+            )))))
+        },
     );
     r.register(
         ssl_sock,
         "getEnabledCipherSuites",
         "()[Ljava/lang/String;",
-        |ctx, _args| Ok(Some(Value::Object(Some(ssl_sock_supported_cipher_suites(ctx))))),
+        |ctx, _args| {
+            Ok(Some(Value::Object(Some(ssl_sock_supported_cipher_suites(
+                ctx,
+            )))))
+        },
     );
     r.register(
         ssl_sock,
@@ -33356,16 +33497,15 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             // Report the protocol actually negotiated (stored on the
             // session) alongside TLSv1.2 so callers checking membership
             // against either standard name succeed.
-            let negotiated = if let Value::Object(Some(session)) =
-                ctx.get_field(this, NEW13_SOCK_SESSION)
-            {
-                match ctx.get_field(session, NEW13_SESS_PROTO) {
-                    Value::Object(Some(s)) => ctx.read_string(s),
-                    _ => None,
-                }
-            } else {
-                None
-            };
+            let negotiated =
+                if let Value::Object(Some(session)) = ctx.get_field(this, NEW13_SOCK_SESSION) {
+                    match ctx.get_field(session, NEW13_SESS_PROTO) {
+                        Value::Object(Some(s)) => ctx.read_string(s),
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
             let proto = negotiated.unwrap_or_else(|| "TLSv1.3".to_string());
             let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), 1);
             let s = ctx.create_string(&proto);
@@ -33786,6 +33926,28 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             // walk it at verification time. A null here is legitimate and
             // means "use platform default trust store".
             ctx.set_field(this, 1, args.get(1).copied().unwrap_or(Value::Object(None)));
+        }
+        // FIX (es-restclient-https): this `TrustManagerFactory.init(KeyStore)`
+        // is the one that actually wins (registered last in the lib.rs wiring,
+        // shadowing `tls.rs::register_trust_manager_factory`'s otherwise
+        // equivalent native — see that function's own matching fix). Without
+        // this, an SSLContext built from a caller-supplied truststore (e.g. a
+        // test JKS holding a self-signed/test-CA cert — the
+        // `HttpsServer`+`RestClient` pattern in
+        // `RestClientBuilderIntegTests`) only ever validated peers against the
+        // platform root store, so the handshake failed with `UnknownIssuer`
+        // even though the JDK caller correctly wired a custom trust store.
+        // Stage the keystore's trust anchors on the `t27_tls` per-thread slot
+        // so the next real `SSLContext.init` (`net_phase_e.rs`, the winning
+        // rustls-backed native) scopes trust to them.
+        if let Some(Value::Object(Some(ks))) = args.get(1) {
+            let ks_id = crate::tls::read_keystore_registry_id(ctx, *ks);
+            if ks_id != 0 {
+                let state = crate::x509_manager::build_trust_manager_state(ks_id);
+                if !state.anchor_ders.is_empty() {
+                    crate::t27_tls::set_pending_tm_trust_roots(state.anchor_ders);
+                }
+            }
         }
         Ok(None)
     });
@@ -50042,8 +50204,22 @@ mod new13_tests {
         // NEW-13.2 DoD: the default connector build (no custom KM/TM) must
         // succeed on every platform supported by native-tls, otherwise
         // SSLContext.init would fail even for the trivial null-TM path.
-        let c = new13_build_connector();
+        let c = new13_build_connector(&[]);
         assert!(c.is_ok(), "connector build failed: {:?}", c.err());
+    }
+
+    #[test]
+    fn new13_build_connector_tolerates_unparseable_extra_root() {
+        // FIX (es-restclient-https): a garbage "DER" (e.g. from a corrupt or
+        // unexpected TrustManager) must be skipped rather than failing the
+        // whole connector build — `new13_build_connector` logs and continues.
+        let garbage = vec![0xFFu8, 0x00, 0x01, 0x02];
+        let c = new13_build_connector(&[garbage]);
+        assert!(
+            c.is_ok(),
+            "connector build must tolerate an unparseable extra root: {:?}",
+            c.err()
+        );
     }
 }
 

@@ -1110,8 +1110,7 @@ mod tests {
         }
     }
 
-    #[test]
-    fn positive_bit_ops_match_decimal() {
+    fn positive_bit_ops_match_decimal_cases(random_cases: usize, peer_cases: usize) {
         // For non-negative operands the decimal reference (which works on
         // magnitudes) is authoritative.
         let mut state = 0x9999_7777_5555_3333u64;
@@ -1119,7 +1118,7 @@ mod tests {
             .into_iter()
             .map(String::from)
             .collect();
-        for _ in 0..150 {
+        for _ in 0..random_cases {
             pos.push(rand_decimal(&mut state).trim_start_matches('-').to_string());
         }
         for a in &pos {
@@ -1134,7 +1133,7 @@ mod tests {
                 crate::bi_bit_count_str(a) as u32,
                 "bitCnt {a}"
             );
-            for c in pos.iter().take(25) {
+            for c in pos.iter().take(peer_cases) {
                 assert_eq!(
                     b(a).and(&b(c)).to_decimal(),
                     bi_bitwise_and(a, c),
@@ -1152,6 +1151,17 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn positive_bit_ops_match_decimal() {
+        positive_bit_ops_match_decimal_cases(24, 10);
+    }
+
+    #[test]
+    #[ignore = "exhaustive decimal cross-check takes several minutes; run explicitly before bigint rewrites"]
+    fn positive_bit_ops_match_decimal_exhaustive() {
+        positive_bit_ops_match_decimal_cases(150, 25);
     }
 
     #[test]

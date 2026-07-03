@@ -6509,6 +6509,12 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         "()Ljava/lang/Class;",
         lang_class::native_method_get_declaring_class,
     );
+    registry.register(
+        "java/lang/reflect/Method",
+        "getParameterCount",
+        "()I",
+        lang_class::native_method_get_parameter_count,
+    );
     // WP2.2: Method.invoke is non-native in real JDK 25 (delegates to
     // MethodHandle-based DirectMethodHandleAccessor which performs primitive
     // box/unbox via .asType(genericMethodType(...))). Our MH .asType is a
@@ -32860,7 +32866,11 @@ fn native_bd_init_bigint(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
             let mag = (le.first().copied().unwrap_or(0) as u64)
                 | ((le.get(1).copied().unwrap_or(0) as u64) << 32);
             if mag <= i64::MAX as u64 {
-                Some(if v.is_neg() { -(mag as i64) } else { mag as i64 })
+                Some(if v.is_neg() {
+                    -(mag as i64)
+                } else {
+                    mag as i64
+                })
             } else {
                 None
             }
@@ -33482,16 +33492,16 @@ fn bd_set_scale_impl(
     let divisor = BigInt::from_decimal(&divisor_dec);
     let (quotient, remainder) = unscaled.divmod(&divisor);
     let dividend_neg = unscaled.is_neg();
-    let increment = match bd_round_needs_increment(&remainder, &divisor, &quotient, dividend_neg, mode)
-    {
-        Ok(v) => v,
-        Err(()) => {
-            return Err(RuntimeError::ArithmeticException {
-                message: "Rounding necessary".to_string(),
+    let increment =
+        match bd_round_needs_increment(&remainder, &divisor, &quotient, dividend_neg, mode) {
+            Ok(v) => v,
+            Err(()) => {
+                return Err(RuntimeError::ArithmeticException {
+                    message: "Rounding necessary".to_string(),
+                }
+                .into());
             }
-            .into());
-        }
-    };
+        };
     let rounded = if increment {
         let one = BigInt::from_decimal(if dividend_neg { "-1" } else { "1" });
         quotient.add(&one)
@@ -35299,6 +35309,52 @@ pub(crate) fn uri_store_named(ctx: &mut dyn NativeContext, this: ObjectRef, full
     }
 }
 
+/// Returns `(index, reason)` if `java.net.URI`'s single-string parser would
+/// throw a scheme-name `URISyntaxException` before ever reaching the
+/// scheme-specific-part / illegal-character checks below. Mirrors the real
+/// JDK `Parser.parse`: scan from index 0 for the first `:`, `/`, `?`, or `#`.
+/// If a stop char other than `:` is hit first (or no `:` appears at all), the
+/// input is a scheme-less relative reference — not an error here. If `:` is
+/// hit first:
+///   * at index 0 (no characters before it) → "Expected scheme name" at 0
+///     (e.g. `::http:///`, `:path`).
+///   * with a non-letter first character → "Illegal character in scheme
+///     name" at 0 (e.g. `12:30`, `1abc:path` — a scheme must start ALPHA).
+///   * with any character in `1..p` outside `ALPHA / DIGIT / "+" / "-" / "."`
+///     → same message at that character's index (e.g.
+///     `scheme_with_underscore:path`, underscore is not a legal scheme char).
+/// Without this check `RestClient.buildUri`'s malformed-endpoint guard never
+/// fires: `new URI("::http:///")` silently parsed with `scheme=null` instead
+/// of throwing, so `InternalRequest`'s constructor didn't fail before
+/// `nextNodes()` ran — surfacing an unrelated `NodeSelector` NPE instead of
+/// the expected `IllegalArgumentException`.
+fn uri_scheme_name_fail_index(s: &str) -> Option<(usize, &'static str)> {
+    let bytes = s.as_bytes();
+    let mut p = 0usize;
+    while p < bytes.len() {
+        match bytes[p] {
+            b'/' | b'?' | b'#' => return None,
+            b':' => break,
+            _ => p += 1,
+        }
+    }
+    if p >= bytes.len() {
+        return None;
+    }
+    if p == 0 {
+        return Some((0, "Expected scheme name"));
+    }
+    if !bytes[0].is_ascii_alphabetic() {
+        return Some((0, "Illegal character in scheme name"));
+    }
+    for (i, &b) in bytes.iter().enumerate().take(p).skip(1) {
+        if !(b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.')) {
+            return Some((i, "Illegal character in scheme name"));
+        }
+    }
+    None
+}
+
 /// Returns the byte index of the first character that `java.net.URI`'s
 /// single-string parser would reject as illegal, or `None` if every character
 /// is permitted. Mirrors the JDK parser's legal-character set for US-ASCII:
@@ -35388,6 +35444,23 @@ fn native_uri_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         Some(Value::Object(Some(o))) => ctx.read_string(*o).unwrap_or_default(),
         _ => String::new(),
     };
+    // Reject a malformed scheme name before any other check — the real JDK
+    // parser validates this first (see `uri_scheme_name_fail_index`).
+    if let Some((pos, reason)) = uri_scheme_name_fail_index(&url_str) {
+        let input = ctx.create_string(&url_str);
+        let reason_str = ctx.create_string(reason);
+        if let Ok(Some(Value::Object(Some(exc)))) = ctx.new_object_initialized(
+            "java/net/URISyntaxException",
+            "(Ljava/lang/String;Ljava/lang/String;I)V",
+            &[
+                Value::Object(Some(input)),
+                Value::Object(Some(reason_str)),
+                Value::Int(pos as i32),
+            ],
+        ) {
+            return Err(MethodCallFailed::ExceptionThrown(exc));
+        }
+    }
     // Reject illegal characters like java.net.URI's single-string parser does —
     // `new URI(String)` must throw URISyntaxException for them. Our parser was
     // lenient and accepted anything, so malformed input slipped through:

@@ -1014,6 +1014,36 @@ fn alloc_inet_socket_address(ctx: &mut dyn NativeContext, host: &str, port: i32)
     isa
 }
 
+/// Like [`alloc_inet_socket_address`], but populates the holder's `addr`
+/// field with a REAL resolved `InetAddress` (`ip`) instead of leaving it
+/// null. Real JDK's `ServerSocket`/`HttpServer.getAddress()` always returns
+/// a fully-resolved address reflecting what the socket is actually bound to
+/// (HotSpot: `/127.0.0.1:PORT`, both `getHostString()` and `getAddress()`
+/// populated) — an unresolved echo (`hostString` = the raw ctor string,
+/// `getAddress()` = null) breaks any caller that reconnects using the
+/// server's own reported address (e.g. `RestClient.builder(new
+/// HttpHost(address.getHostString(), ...))`): `getHostString()` on an
+/// unresolved address returns the original hostname, and a caller-side TLS
+/// connect that re-resolves it can land somewhere else entirely.
+fn alloc_inet_socket_address_resolved(
+    ctx: &mut dyn NativeContext,
+    host: &str,
+    ip: &str,
+    port: i32,
+) -> ObjectRef {
+    let isa = alloc_concurrent_synthetic(ctx, "java/net/InetSocketAddress", 2);
+    let holder =
+        alloc_concurrent_synthetic(ctx, "java/net/InetSocketAddress$InetSocketAddressHolder", 3);
+    let h = ctx.create_string(host);
+    let addr = alloc_inet_address(ctx, host, ip);
+    ctx.set_field(holder, 0, Value::Object(Some(h)));
+    ctx.set_field(holder, 1, Value::Object(Some(addr)));
+    ctx.set_field(holder, 2, Value::Int(port));
+    ctx.set_field(isa, ISA_HOST, Value::Object(Some(holder)));
+    ctx.set_field(isa, ISA_PORT, Value::Int(port));
+    isa
+}
+
 fn resolve_host(host: &str) -> Result<IpAddr, cratonvm_types::error::MethodCallFailed> {
     if host.is_empty() || host == "localhost" {
         return Ok(IpAddr::V4(Ipv4Addr::LOCALHOST));
@@ -3918,15 +3948,14 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
             // and `JarURLConnection.getJarFile` below for the same ambiguity.
             let raw_rest = rest;
             let trimmed_rest = rest.trim_start_matches('/');
-            let rest = if std::path::Path::new(
-                trimmed_rest.split("!/").next().unwrap_or(trimmed_rest),
-            )
-            .exists()
-            {
-                trimmed_rest
-            } else {
-                raw_rest
-            };
+            let rest =
+                if std::path::Path::new(trimmed_rest.split("!/").next().unwrap_or(trimmed_rest))
+                    .exists()
+                {
+                    trimmed_rest
+                } else {
+                    raw_rest
+                };
             let (outer_jar, inner_path) = match rest.find("!/") {
                 Some(i) => (&rest[..i], &rest[i + 2..]),
                 None => {
@@ -8236,10 +8265,9 @@ fn register_re10_http_server(r: &mut NativeMethodRegistry) {
             // Non-blocking so the accept loop polls `running` (and so it can be
             // closed promptly by stop()).
             listener.set_nonblocking(true).ok();
-            let bound_port = listener
-                .local_addr()
-                .map(|a| a.port() as i32)
-                .unwrap_or(port);
+            let bound_addr = listener.local_addr().ok();
+            let bound_port = bound_addr.map(|a| a.port() as i32).unwrap_or(port);
+            let bound_ip = bound_addr.map(|a| a.ip()).unwrap_or(ip);
             let server_id = next_server_id();
             let state = std::sync::Arc::new(ServerState {
                 listener: Mutex::new(Some(listener)),
@@ -8249,7 +8277,12 @@ fn register_re10_http_server(r: &mut NativeMethodRegistry) {
             });
             server_registry().lock().insert(server_id, state);
             let srv = alloc_concurrent_synthetic(ctx, "com/sun/net/httpserver/HttpServer", 5);
-            let sa_echo = alloc_inet_socket_address(ctx, &host, bound_port);
+            // Fully-resolved echo (matches HotSpot: `getAddress()` returns
+            // the socket's ACTUAL bound address, not the caller's original
+            // hostname string) — see `alloc_inet_socket_address_resolved`.
+            let bound_ip_str = bound_ip.to_string();
+            let sa_echo =
+                alloc_inet_socket_address_resolved(ctx, &bound_ip_str, &bound_ip_str, bound_port);
             ctx.set_field(srv, HS_ADDRESS, Value::Object(Some(sa_echo)));
             ctx.set_field(srv, HS_STARTED, Value::Int(0));
             ctx.set_field(srv, HS_CONTEXTS, Value::Object(None));

@@ -868,7 +868,7 @@ fn register_ssl_parameters(r: &mut NativeMethodRegistry) {
 /// from `keystore.rs` that reuses `get_store_id` over the `keyStoreSpi`
 /// delegate; this helper should prefer that once it exists. Flagged for
 /// keystore.rs.
-fn read_keystore_registry_id(ctx: &mut dyn NativeContext, ks_obj: ObjectRef) -> i32 {
+pub(crate) fn read_keystore_registry_id(ctx: &mut dyn NativeContext, ks_obj: ObjectRef) -> i32 {
     // (1) directly on the KeyStore object.
     if let Value::Int(i) = ctx.get_field_by_name(ks_obj, "cratonvm$keystore$storeId") {
         if i != 0 {
@@ -940,6 +940,24 @@ fn register_trust_manager_factory(r: &mut NativeMethodRegistry) {
     // (slot 2). A null KeyStore means "use the default trust store" — real-JDK
     // loads the platform cacerts; we record id 0, which
     // build_trust_manager_state(0) resolves to system roots only.
+    //
+    // FIX (es-restclient-https): this is the ONLY `TrustManagerFactory.init`
+    // the public `TrustManagerFactory.getInstance(...).init(ks)` call resolves
+    // to (the SPI-level `engineInit` in `x509_manager.rs` is a different,
+    // not-reached-from-here entry point). Previously this native never told
+    // `t27_tls`'s per-`SSLContext` trust scope
+    // (`set_pending_tm_trust_roots`/`attach_pending_identity_to_ctx`, consumed
+    // by the REAL rustls-backed `SSLContext.init` in `net_phase_e.rs`) about a
+    // custom KeyStore-bound truststore. So building an `SSLContext` from a
+    // caller-supplied truststore (e.g. a test JKS holding a self-signed/test-CA
+    // cert — the `HttpsServer`+`RestClient` pattern) still validated the peer
+    // against ONLY the platform root store, and every such handshake failed
+    // with `UnknownIssuer` even though the JDK caller correctly built and
+    // wired a custom trust store. Feed the same keystore-derived anchor DERs
+    // into `set_pending_tm_trust_roots` here so the next `SSLContext.init` on
+    // this thread scopes trust to them (restrictively, matching the reference
+    // JDK's custom-truststore semantics) instead of silently falling back to
+    // system roots only.
     r.register(cls, "init", "(Ljava/security/KeyStore;)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let ks_id = match args.get(1) {
@@ -950,6 +968,12 @@ fn register_trust_manager_factory(r: &mut NativeMethodRegistry) {
         ctx.set_field(this, 2, Value::Int(ks_id));
         // slot 1 = initialized flag.
         ctx.set_field(this, 1, Value::Int(1));
+        if ks_id != 0 {
+            let state = crate::x509_manager::build_trust_manager_state(ks_id);
+            if !state.anchor_ders.is_empty() {
+                crate::t27_tls::set_pending_tm_trust_roots(state.anchor_ders);
+            }
+        }
         Ok(None)
     });
 
