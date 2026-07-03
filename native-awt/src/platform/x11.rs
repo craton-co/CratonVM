@@ -13,6 +13,10 @@ use x11rb::connection::Connection;
 use x11rb::protocol::xproto::*;
 use x11rb::protocol::Event as X11Event;
 use x11rb::rust_connection::RustConnection;
+// x11rb 0.13: `change_property8`/`change_property32` live on the wrapper
+// trait, not the xproto one; import anonymously to avoid shadowing
+// `xproto::ConnectionExt` from the glob above.
+use x11rb::wrapper::ConnectionExt as _;
 
 use super::backend::*;
 use crate::font::{global_glyph_atlas, GlyphKey};
@@ -148,13 +152,13 @@ impl X11Backend {
             X11Event::MotionNotify(e) => {
                 let id = *self.xid_to_wid.get(&e.event)?;
                 let buttons = e.state;
-                let any_button = buttons.contains(ButtonMask::BUTTON1)
-                    || buttons.contains(ButtonMask::BUTTON2)
-                    || buttons.contains(ButtonMask::BUTTON3);
+                let any_button = buttons.contains(KeyButMask::BUTTON1)
+                    || buttons.contains(KeyButMask::BUTTON2)
+                    || buttons.contains(KeyButMask::BUTTON3);
                 if any_button {
-                    let button = if buttons.contains(ButtonMask::BUTTON1) {
+                    let button = if buttons.contains(KeyButMask::BUTTON1) {
                         1
-                    } else if buttons.contains(ButtonMask::BUTTON3) {
+                    } else if buttons.contains(KeyButMask::BUTTON3) {
                         3
                     } else {
                         2
