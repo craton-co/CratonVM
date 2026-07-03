@@ -2102,6 +2102,9 @@ fn run() -> Result<()> {
         let main_tlab = &vm.main_thread.tlab as *const _ as usize;
         let main_tid = vm.main_thread.thread_id;
         vm.shared.thread_registry.set_tlab_addr(main_tid, main_tlab);
+        // xt-hardening (2026-07-03): publish main's OS thread id for the
+        // takeover's counted-set excusal (workers publish at their start).
+        vm.shared.thread_registry.set_os_tid_current(main_tid);
     }
 
     // T19.H1: optional watchdog that dumps interpreter frames and aborts when
