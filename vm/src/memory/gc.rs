@@ -262,40 +262,51 @@ pub fn update_all_roots(
         }
     }
 
-    // 7. System streams (System.out, System.err)
+    // 7. System streams (System.out, System.err, System.in)
+    //
+    // try_write, NOT write: the singleton initializers (e.g.
+    // `ensure_system_stdin_object`) hold the WRITE guard across allocating
+    // calls, and an allocation-triggered GC on that same thread would
+    // self-deadlock on the non-reentrant RwLock (mirrors the try_read in
+    // roots.rs step 7). A locked slot is mid-initialization: it holds None
+    // (populated only at the end, from a pinned — hence already remapped —
+    // local), so there is nothing to remap.
     {
-        let mut out = shared.system_out.write();
-        if let Some(ref mut obj_ref) = *out {
-            let old_addr = obj_ref.as_ptr() as usize;
-            if let Some(&new_addr) = pointer_map.get(&old_addr) {
-                // Safety: new_addr was produced by the GC's pointer map and
-                // should point into the to-space. The debug_assert verifies
-                // this during development.
-                debug_assert!(new_addr != 0, "GC pointer map contains null address");
-                *obj_ref = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+        if let Some(mut out) = shared.system_out.try_write() {
+            if let Some(ref mut obj_ref) = *out {
+                let old_addr = obj_ref.as_ptr() as usize;
+                if let Some(&new_addr) = pointer_map.get(&old_addr) {
+                    // Safety: new_addr was produced by the GC's pointer map and
+                    // should point into the to-space. The debug_assert verifies
+                    // this during development.
+                    debug_assert!(new_addr != 0, "GC pointer map contains null address");
+                    *obj_ref = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+                }
             }
         }
-        let mut err = shared.system_err.write();
-        if let Some(ref mut obj_ref) = *err {
-            let old_addr = obj_ref.as_ptr() as usize;
-            if let Some(&new_addr) = pointer_map.get(&old_addr) {
-                // Safety: new_addr was produced by the GC's pointer map and
-                // should point into the to-space. The debug_assert verifies
-                // this during development.
-                debug_assert!(new_addr != 0, "GC pointer map contains null address");
-                *obj_ref = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+        if let Some(mut err) = shared.system_err.try_write() {
+            if let Some(ref mut obj_ref) = *err {
+                let old_addr = obj_ref.as_ptr() as usize;
+                if let Some(&new_addr) = pointer_map.get(&old_addr) {
+                    // Safety: new_addr was produced by the GC's pointer map and
+                    // should point into the to-space. The debug_assert verifies
+                    // this during development.
+                    debug_assert!(new_addr != 0, "GC pointer map contains null address");
+                    *obj_ref = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+                }
             }
         }
         // gcstress residual face fix — remap `system_in` too (it was missing
         // from this step AND from the roots.rs scan while out/err had both,
         // so the cached System.in went stale on the first moving GC).
-        let mut sin = shared.system_in.write();
-        if let Some(ref mut obj_ref) = *sin {
-            let old_addr = obj_ref.as_ptr() as usize;
-            if let Some(&new_addr) = pointer_map.get(&old_addr) {
-                // Safety: same contract as out/err above.
-                debug_assert!(new_addr != 0, "GC pointer map contains null address");
-                *obj_ref = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+        if let Some(mut sin) = shared.system_in.try_write() {
+            if let Some(ref mut obj_ref) = *sin {
+                let old_addr = obj_ref.as_ptr() as usize;
+                if let Some(&new_addr) = pointer_map.get(&old_addr) {
+                    // Safety: same contract as out/err above.
+                    debug_assert!(new_addr != 0, "GC pointer map contains null address");
+                    *obj_ref = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+                }
             }
         }
     }
