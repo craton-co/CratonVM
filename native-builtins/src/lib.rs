@@ -4571,6 +4571,11 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
                 .into_iter()
                 .map(|s| s.replace('/', "."))
                 .collect();
+            // `is_open` mirrors the real `ACC_MODULE_OPEN` flag parsed off
+            // module-info.class (classloading/src/module.rs), so it's a
+            // faithful per-module fact — unlike `automatic` below, which is
+            // intentionally NOT surfaced here.
+            let is_open = ctx.module_is_open(&module_name);
             let desc = alloc_concurrent_synthetic(ctx, "java/lang/module/ModuleDescriptor", 2);
             // GC-safety: pin `desc` across the allocations inside
             // `build_string_set` (same pattern as `getModule()` above).
@@ -4589,6 +4594,18 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             ctx.set_field(desc, 1, Value::Int(0)); // legacy synthetic slot
             ctx.set_field_by_name(desc, "name", name_val);
             ctx.set_field_by_name(desc, "uses", Value::Object(Some(uses_set)));
+            ctx.set_field_by_name(desc, "open", Value::Int(if is_open { 1 } else { 0 }));
+            // `automatic` deliberately left at its Java default (`false`) and
+            // NOT wired to `ModuleRegistry`'s internal `automatic` flag: that
+            // flag means "classpath-loaded, given lenient JPMS-automatic
+            // ACCESS semantics" (CratonVM has no real module path), which is
+            // a different concept from the real `ModuleDescriptor.isAutomatic()`
+            // — true automatic descriptors are synthesized for plain jars
+            // with NO module-info.class at all (empty exports/uses/provides),
+            // which never reaches this code path (`try_register_module_info`,
+            // class_manager.rs, only registers modules it successfully parsed
+            // a real module-info.class for). So `isAutomatic()` is correctly
+            // `false` here for every module this native ever sees.
             ctx.unpin_native_roots(pin);
             Ok(Some(Value::Object(Some(desc))))
         },

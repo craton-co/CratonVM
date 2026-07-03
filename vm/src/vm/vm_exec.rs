@@ -6283,6 +6283,15 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             .unwrap_or_default()
     }
 
+    fn module_is_open(&self, module_name: &str) -> bool {
+        self.shared
+            .class_manager
+            .read()
+            .module_registry
+            .get(module_name)
+            .is_some_and(|d| d.is_open)
+    }
+
     fn all_module_names(&self) -> Vec<String> {
         self.shared
             .class_manager

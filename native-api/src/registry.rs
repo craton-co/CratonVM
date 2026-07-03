@@ -2388,6 +2388,14 @@ pub trait NativeContext {
         vec![]
     }
 
+    /// True if `module_name`'s `module-info.class` declared `open module ...`
+    /// (the real `ACC_MODULE_OPEN` flag). `false` for the unnamed module, an
+    /// unregistered module, or a module that isn't open.
+    fn module_is_open(&self, module_name: &str) -> bool {
+        let _ = module_name;
+        false
+    }
+
     /// Return all registered module names.
     fn all_module_names(&self) -> Vec<String> {
         vec![]
