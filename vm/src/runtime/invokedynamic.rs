@@ -211,6 +211,18 @@ pub fn execute_invokedynamic(
         }
     }; // cm read lock dropped here
 
+    if std::env::var_os("CRATONVM_DBG_INDY_ALL").is_some() {
+        let caller_name = {
+            let cm = shared.class_manager.read();
+            cm.get_class(current_class_id)
+                .map(|c| c.name.to_string())
+                .unwrap_or_default()
+        };
+        eprintln!(
+            "[indy-all] caller={caller_name} bsm={}.{} target={}{}",
+            info.bsm_class, info.bsm_method, info.target_name, info.target_descriptor
+        );
+    }
     if info.bsm_class == STRING_CONCAT_FACTORY && info.bsm_method == MAKE_CONCAT_WITH_CONSTANTS {
         // Cache the StringConcat call site
         let site = ResolvedCallSite::StringConcat {
@@ -566,6 +578,13 @@ fn bootstrap_generic(
     }
 
     // --- Invoke the bootstrap method → CallSite. ---
+    let dbg = std::env::var_os("CRATONVM_DBG_INDY_GENERIC").is_some();
+    if dbg {
+        eprintln!(
+            "[indy-generic] bootstrap {bsm_class}.{bsm_method} target={}{}",
+            info.target_name, info.target_descriptor
+        );
+    }
     let callsite_val = crate::vm::invoke_shared(
         shared,
         thread,
@@ -575,6 +594,9 @@ fn bootstrap_generic(
         &bsm_args,
     )?;
     thread.native_pin_roots.truncate(pin_base); // bootstrap args no longer needed
+    if dbg {
+        eprintln!("[indy-generic] bootstrap result = {callsite_val:?}");
+    }
 
     let callsite = match callsite_val {
         Some(Value::Object(Some(cs))) => cs,
@@ -648,6 +670,13 @@ fn bootstrap_generic(
     let mut invoke_args: Vec<Value> = Vec::with_capacity(dyn_args.len() + 1);
     invoke_args.push(Value::Object(Some(target_mh)));
     invoke_args.extend_from_slice(&dyn_args);
+    if dbg {
+        eprintln!(
+            "[indy-generic] invoking target MH with {} dyn args: {:?}",
+            dyn_args.len(),
+            dyn_args
+        );
+    }
     let result = crate::vm::invoke_shared(
         shared,
         thread,
@@ -657,6 +686,9 @@ fn bootstrap_generic(
         &invoke_args,
     )?;
     thread.native_pin_roots.truncate(pin_base);
+    if dbg {
+        eprintln!("[indy-generic] target MH invoke result = {result:?}");
+    }
 
     // --- Push the result, coerced to the call-site return type. ---
     let ret_byte = info

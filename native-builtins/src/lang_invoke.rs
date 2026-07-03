@@ -4007,6 +4007,27 @@ pub(crate) const MH_KIND_FILTER: i32 = 18;
 /// proxy is created with no interfaces (its SAM method then 404s).
 pub(crate) const MH_KIND_FOLD: i32 = 19;
 
+/// "Invoker" handle produced by `MethodHandles.exactInvoker(type)` /
+/// `MethodHandles.invoker(type)` / `MethodHandles.spreadInvoker(type, N)`.
+/// No `MH_BOUND` wrapper is needed: per the JDK contract, invoking this
+/// handle as `invoker.invoke(target, arg1, arg2, ...)` is equivalent to
+/// `target.invokeExact(arg1, arg2, ...)` — the target handle is supplied as
+/// the FIRST argument at each call, not captured at creation time. Apache
+/// Groovy's `IndyInterface.<clinit>` builds exactly one of these
+/// (`CACHED_INVOKER = MethodHandles.exactInvoker(methodType(Object.class,
+/// Object[].class))`) and every generic (non-special-cased) Groovy
+/// `invokedynamic` call site funnels through it: the JIT-produced call-site
+/// bytecode does `insertArguments`/`foldArguments` chains that ultimately
+/// invoke `CACHED_INVOKER` with the real dispatch target (built by
+/// `fromCacheHandle`/`selectMethodHandle`) as its leading argument. Before
+/// this handle existed, `exactInvoker`/`invoker`/`spreadInvoker` returned an
+/// inert stub with no `MH_KIND` set, so `mh_dispatch` on it hit the
+/// `mh_read_class == None` fast-fail and silently returned `null` — the
+/// closure body of every Groovy `beans { ... }`-style dynamic DSL call
+/// (Spring's `GroovyBeanDefinitionReader`) never actually ran, registering
+/// zero beans with no visible exception.
+pub(crate) const MH_KIND_INVOKER: i32 = 20;
+
 // ---------------------------------------------------------------------------
 // Round-9 perf: LambdaMetafactory CallSite cache.
 // ---------------------------------------------------------------------------
@@ -5063,6 +5084,36 @@ pub(crate) fn mh_dispatch(
         }
         MH_KIND_FILTER => mh_dispatch_filter(ctx, bound, extra_args),
         MH_KIND_FOLD => mh_dispatch_fold(ctx, bound, extra_args),
+        MH_KIND_INVOKER => {
+            // `MethodHandles.exactInvoker`/`invoker`/`spreadInvoker`: the
+            // target handle is the FIRST incoming argument (not captured at
+            // creation time — see MH_KIND_INVOKER's doc comment), the rest
+            // are its arguments. `spreadInvoker` additionally packs its
+            // trailing N args into a single Object[] before the target sees
+            // them (N is stashed in MH_NAME as a decimal string by the
+            // `spreadInvoker` factory; absent/unparseable => plain invoker).
+            let target = match extra_args.first() {
+                Some(Value::Object(Some(t))) => *t,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            let rest = &extra_args[1..];
+            let spread_n: Option<usize> = mh_read_name(ctx, mh).and_then(|s| s.parse().ok());
+            let full: Vec<Value> = match spread_n {
+                Some(n) if n <= rest.len() => {
+                    let leading = rest.len() - n;
+                    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, n);
+                    for i in 0..n {
+                        ctx.set_array_element(arr, i, rest[leading + i]);
+                    }
+                    let mut v = Vec::with_capacity(leading + 1);
+                    v.extend_from_slice(&rest[..leading]);
+                    v.push(Value::Object(Some(arr)));
+                    v
+                }
+                _ => rest.to_vec(),
+            };
+            mh_dispatch(ctx, target, &full)
+        }
         MH_KIND_SPREAD => {
             // asSpreader(arrayType, count): the trailing argument is an array;
             // spread its elements into positional args, then dispatch target.
@@ -6492,14 +6543,23 @@ pub fn register_t28_method_handle_completeness(r: &mut NativeMethodRegistry) {
             Ok(Some(args.first().copied().unwrap_or(Value::Object(None))))
         },
     );
+    // `exactInvoker`/`invoker`/`spreadInvoker` all return a live
+    // MH_KIND_INVOKER handle now (see that constant's doc comment for why
+    // this matters: Apache Groovy's `IndyInterface.CACHED_INVOKER` is an
+    // `exactInvoker` handle that every generic Groovy indy call site
+    // dispatches through). Previously these returned an inert stub with no
+    // `MH_KIND` set, so `mh_dispatch` silently no-opped on invocation —
+    // e.g. every Groovy `beans { ... }`-DSL closure body (Spring's
+    // `GroovyBeanDefinitionReader`) never ran, registering zero beans with
+    // no exception.
     r.register(
         mhs,
         "exactInvoker",
         "(Ljava/lang/invoke/MethodType;)Ljava/lang/invoke/MethodHandle;",
         |ctx, args| {
+            let mh = alloc_method_handle(ctx, "", "", "", MH_KIND_INVOKER);
             // C19: propagate the caller's MethodType into the real-JDK
             // `type` field so `mh.type()` / `parameterSlotCount` do not NPE.
-            let mh = alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodHandle", 17);
             if let Some(Value::Object(Some(mt))) = args.first() {
                 ctx.set_field_by_name(mh, "type", Value::Object(Some(*mt)));
             }
@@ -6511,7 +6571,7 @@ pub fn register_t28_method_handle_completeness(r: &mut NativeMethodRegistry) {
         "invoker",
         "(Ljava/lang/invoke/MethodType;)Ljava/lang/invoke/MethodHandle;",
         |ctx, args| {
-            let mh = alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodHandle", 17);
+            let mh = alloc_method_handle(ctx, "", "", "", MH_KIND_INVOKER);
             if let Some(Value::Object(Some(mt))) = args.first() {
                 ctx.set_field_by_name(mh, "type", Value::Object(Some(*mt)));
             }
@@ -6523,9 +6583,18 @@ pub fn register_t28_method_handle_completeness(r: &mut NativeMethodRegistry) {
         "spreadInvoker",
         "(Ljava/lang/invoke/MethodType;I)Ljava/lang/invoke/MethodHandle;",
         |ctx, args| {
-            let mh = alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodHandle", 17);
+            let mh = alloc_method_handle(ctx, "", "", "", MH_KIND_INVOKER);
             if let Some(Value::Object(Some(mt))) = args.first() {
                 ctx.set_field_by_name(mh, "type", Value::Object(Some(*mt)));
+            }
+            // Spread count N: the trailing N leading-arguments (after the
+            // target handle) are supplied packed into a single Object[]
+            // instead of flat. Encode N (decimal) in MH_NAME — unused by
+            // MH_KIND_INVOKER otherwise — mirroring MH_KIND_DROP's reuse of
+            // MH_CLASS for its position encoding.
+            if let Some(Value::Int(n)) = args.get(1) {
+                let s = ctx.create_string(&n.to_string());
+                ctx.set_field(mh, MH_NAME, Value::Object(Some(s)));
             }
             Ok(Some(Value::Object(Some(mh))))
         },
