@@ -376,7 +376,10 @@ pub fn ensure_class_initialized_shared(
         };
 
         match effective_state {
-            ClassState::Initialized => return Ok(()),
+            ClassState::Initialized => {
+                super::vm_object::pre_init_wrapper_type_field_for_class(shared, class_id);
+                return Ok(());
+            }
 
             ClassState::Initializing => {
                 if init_thread == Some(current_thread_id) {
@@ -640,6 +643,9 @@ fn finalize_class_init(shared: &SharedVm, class_id: ClassId, new_state: ClassSta
         if matches!(new_state, ClassState::Initialized) {
             cm.set_class_init_state(class_id, cratonvm_classloading::CLASS_INIT_INITIALIZED);
         }
+    }
+    if matches!(new_state, ClassState::Initialized) {
+        super::vm_object::pre_init_wrapper_type_field_for_class(shared, class_id);
     }
     // Remove waiter and notify all blocked threads.
     let removed = shared.class_init_waiters.lock().remove(&class_id);
