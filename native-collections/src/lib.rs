@@ -4672,12 +4672,19 @@ fn native_map_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     let this_pin = ctx.pin_native_root(this);
     let buckets_pin = ctx.pin_native_root(buckets);
     let tail_pin = tail_node.map(|t| ctx.pin_native_root(t));
+    // `key_val`/`value` are also consumed AFTER the alloc (into new_node's
+    // slots); the bare local copies would go stale even though the natives
+    // args are pinned by safe_native_call, so pin+re-read them too.
+    let key_pin = pin_value(ctx, key_val);
+    let value_pin = pin_value(ctx, value);
     // Create node — for null keys, store Value::Object(None) in key field
     let new_node = ctx.alloc_object(cratonvm_types::ClassId::new(0), NODE_NUM_FIELDS);
     // Re-read the pinned roots at their post-GC addresses.
     let this = ctx.read_native_pin(this_pin, this);
     let buckets = ctx.read_native_pin(buckets_pin, buckets);
     let tail_node = tail_node.map(|t| ctx.read_native_pin(tail_pin.unwrap(), t));
+    let key_val = read_pinned_elem(ctx, key_pin, key_val);
+    let value = read_pinned_elem(ctx, value_pin, value);
     ctx.set_field(new_node, NODE_FIELD_HASH, Value::Int(hash));
     ctx.set_field(new_node, NODE_FIELD_KEY, key_val);
     ctx.set_field(new_node, NODE_FIELD_VALUE, value);
@@ -19480,7 +19487,20 @@ fn lhm_state(ctx: &dyn NativeContext, this: ObjectRef) -> (Option<ObjectRef>, i3
 }
 
 fn lhm_alloc_node(ctx: &mut dyn NativeContext, key: Value, value: Value, hash: i32) -> ObjectRef {
+    // gcstress residual face-1 fix — `alloc_synthetic` can trigger a moving
+    // young GC that relocates the `key`/`value` object args; writing the bare
+    // (stale) Value copies into the node below would store a dangling ref.
+    // Pin+re-read them across the allocation.
+    let key_pin = pin_value(ctx, key);
+    let value_pin = pin_value(ctx, value);
     let node = alloc_synthetic(ctx, "java/util/LinkedHashMap$Node", LHM_NODE_NUM_FIELDS);
+    let key = read_pinned_elem(ctx, key_pin, key);
+    let value = read_pinned_elem(ctx, value_pin, value);
+    if key_pin != usize::MAX {
+        ctx.unpin_native_roots(key_pin);
+    } else if value_pin != usize::MAX {
+        ctx.unpin_native_roots(value_pin);
+    }
     ctx.set_field(node, LHM_NODE_KEY, key);
     ctx.set_field(node, LHM_NODE_VALUE, value);
     ctx.set_field(node, LHM_NODE_HASH, Value::Int(hash));
@@ -19986,7 +20006,17 @@ fn native_lhm_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     };
     let idx = map_bucket_index(hash, cap);
 
+    // gcstress residual face-1 fix — `lhm_alloc_node` allocates and can
+    // trigger a moving young GC that relocates `this` and `buckets` (bare
+    // Rust locals captured above). The stale addresses would make the
+    // head-insert `set_array_element(buckets, ..)` and the `this` writes below
+    // land in freed-and-reused storage (same corrupt-cell family as
+    // native_map_put). Pin both across the alloc and re-read after.
+    let this_pin = ctx.pin_native_root(this);
+    let buckets_pin = ctx.pin_native_root(buckets);
     let new_node = lhm_alloc_node(ctx, key_val, value, hash);
+    let this = ctx.read_native_pin(this_pin, this);
+    let buckets = ctx.read_native_pin(buckets_pin, buckets);
 
     // Insert at head of bucket chain
     let head = ctx.get_array_element(buckets, idx);
@@ -19999,6 +20029,7 @@ fn native_lhm_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     lhm_link_tail(ctx, this, new_node);
 
     lhm_set(ctx, this, "size", LHM_FIELD_SIZE, Value::Int(size + 1));
+    ctx.unpin_native_roots(this_pin); // gcstress residual face-1 fix
 
     // Replicate `LinkedHashMap.afterNodeInsertion(true)`: after a NEW node is
     // inserted, consult the (overridable) `removeEldestEntry` hook on the
@@ -24136,7 +24167,12 @@ fn native_tm_init_comparator(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
 }
 
 fn native_tm_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    // gcstress residual face-1 fix — `this` is re-read after the two
+    // allocating calls in the array-mode path (alloc_ref_array on first
+    // insert, tm_ensure_capacity on grow); a moving young GC there would
+    // otherwise leave the `tm_set_slot(this, ..)` writes hitting stale
+    // storage (the native_map_put corrupt-cell family). Hence `mut`.
+    let mut this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
@@ -24178,7 +24214,11 @@ fn native_tm_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     let data = match data_opt {
         Some(d) => d,
         None => {
+            // gcstress face-1 fix: re-read `this` across the array alloc.
+            let this_pin = ctx.pin_native_root(this);
             let buf = alloc_ref_array(ctx, TM_DEFAULT_CAPACITY * 2);
+            this = ctx.read_native_pin(this_pin, this);
+            ctx.unpin_native_roots(this_pin);
             tm_set_slot(ctx, this, TM_FIELD_DATA, Value::Object(Some(buf)));
             buf
         }
@@ -24192,8 +24232,19 @@ fn native_tm_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
             Ok(Some(old))
         }
         Err(pos) => {
-            // Key not found — insert at pos
+            // Key not found — insert at pos. gcstress face-1 fix: pin `this`
+            // and `key`/`value` across tm_ensure_capacity (which reallocs the
+            // data array on grow → can move a moving-GC survivor). `data` is
+            // returned fresh; `this` is re-read; key/value refs are re-read so
+            // tm_insert_at stores their current addresses.
+            let this_pin = ctx.pin_native_root(this);
+            let kh = pin_value(ctx, key);
+            let vh = pin_value(ctx, value);
             let data = tm_ensure_capacity(ctx, this, size, data);
+            this = ctx.read_native_pin(this_pin, this);
+            let key = read_pinned_elem(ctx, kh, key);
+            let value = read_pinned_elem(ctx, vh, value);
+            ctx.unpin_native_roots(this_pin);
             tm_insert_at(ctx, data, size, pos, key, value);
             tm_set_slot(ctx, this, TM_FIELD_SIZE, Value::Int(size + 1));
             Ok(Some(Value::Object(None)))
