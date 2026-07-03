@@ -831,12 +831,21 @@ pub fn jit_code_range_count() -> usize {
 /// `CRATONVM_XT_JIT_ROOT_SCAN`). Mirrors `cratonvm_vm::jit::xt_root_scan::
 /// enabled` (the jit crate cannot depend on the vm crate); kept in sync via
 /// the same env var. Cached on first read.
+///
+/// A4 (fork6-fjp) — default ON (opt-OUT), matching the vm-side gate. The two
+/// sides had diverged when the vm side flipped to default-on: this mirror
+/// stayed opt-IN, so `CompiledMethodCache::put` never registered JIT code
+/// ranges in a default-env process, `jit_code_ranges_snapshot()` was always
+/// empty, and the "default-on" takeover classified every suspended peer as
+/// "not in JIT" — the whole cross-thread STW JIT root scan (and the
+/// helper-window pass) was silently inert unless the env var was set to `1`
+/// explicitly. Keep the polarity identical to `xt_root_scan::enabled`.
 pub fn xt_jit_root_scan_enabled() -> bool {
     static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *CACHE.get_or_init(|| {
-        matches!(
+        !matches!(
             std::env::var("CRATONVM_XT_JIT_ROOT_SCAN").as_deref(),
-            Ok("1") | Ok("true") | Ok("on")
+            Ok("0") | Ok("false") | Ok("off")
         )
     })
 }
